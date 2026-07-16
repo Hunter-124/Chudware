@@ -598,8 +598,11 @@ void coloredRowWash(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding,
     const float rnd = ImClamp(rr, 0.0f, ImMin(W, H) * 0.5f);
     auto mixAt = [&](float t) { return dye(aL * (1.0f - t) + aR * t); };
 
-    const float x0 = mn.x + rnd, x1 = mx.x - rnd;
-    const float y0 = mn.y + rnd, y1 = mx.y - rnd;
+    // Interior slab boundaries snapped to whole pixels: at a fractional shared edge, two
+    // translucent fills each cover the seam pixel PARTIALLY and composite lighter than one full
+    // fill — a visible hairline. Integer edges tile exactly.
+    const float x0 = IM_ROUND(mn.x + rnd), x1 = IM_ROUND(mx.x - rnd);
+    const float y0 = IM_ROUND(mn.y + rnd), y1 = IM_ROUND(mx.y - rnd);
     if (x1 > x0) {
         const float tA = rnd / W, tB = (W - rnd) / W;
         if (y1 > y0)  // middle slab: full width, straight-side region
@@ -611,16 +614,20 @@ void coloredRowWash(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding,
             dl->AddRectFilledMultiColor(ImVec2(x0, y1), ImVec2(x1, mx.y),
                                         mixAt(tA), mixAt(tB), mixAt(tB), mixAt(tA));
             // Corner quarter-discs, local ramp colour (ramp error across rnd px is invisible).
-            // PathArcToFast quadrants: 0=+x, 3=+y(down), 6=-x, 9=-y(up).
-            auto wedge = [&](ImVec2 c, int q0, int q1, ImU32 col) {
-                dl->PathLineTo(c);
+            // PathArcToFast quadrants: 0=+x, 3=+y(down), 6=-x, 9=-y(up). The apex is nudged ~0.75px
+            // INTO the slab region (diagonal `bias`): PathFillConvex feathers its straight edges,
+            // and an exactly-abutting unfeathered rect underpaints ~half a pixel — the overlap
+            // buries that hairline under the slabs' full coverage.
+            auto wedge = [&](ImVec2 c, ImVec2 bias, int q0, int q1, ImU32 col) {
+                dl->PathLineTo(ImVec2(c.x + bias.x, c.y + bias.y));
                 dl->PathArcToFast(c, rnd, q0, q1);
                 dl->PathFillConvex(col);
             };
-            wedge(ImVec2(x0, y0), 6, 9,  mixAt(tA * 0.5f));          // top-left
-            wedge(ImVec2(x1, y0), 9, 12, mixAt((tB + 1.0f) * 0.5f)); // top-right
-            wedge(ImVec2(x1, y1), 0, 3,  mixAt((tB + 1.0f) * 0.5f)); // bottom-right
-            wedge(ImVec2(x0, y1), 3, 6,  mixAt(tA * 0.5f));          // bottom-left
+            const float ov = 0.75f;
+            wedge(ImVec2(x0, y0), ImVec2(+ov, +ov), 6, 9,  mixAt(tA * 0.5f));          // top-left
+            wedge(ImVec2(x1, y0), ImVec2(-ov, +ov), 9, 12, mixAt((tB + 1.0f) * 0.5f)); // top-right
+            wedge(ImVec2(x1, y1), ImVec2(-ov, -ov), 0, 3,  mixAt((tB + 1.0f) * 0.5f)); // bottom-right
+            wedge(ImVec2(x0, y1), ImVec2(+ov, -ov), 3, 6,  mixAt(tA * 0.5f));          // bottom-left
         }
     } else {
         dl->AddRectFilled(mn, mx, dye(aL), rnd);  // too narrow for the slabs

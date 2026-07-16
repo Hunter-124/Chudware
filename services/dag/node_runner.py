@@ -137,10 +137,35 @@ def make_default_agent_fn(ledger=None,
     if mission_dispatch is None and ledger is not None:
         try:
             from services.agent.mission_dispatch import MissionDispatch  # noqa: PLC0415
+            from services.agent.corporate import get_org_chart  # noqa: PLC0415
+            rid = getattr(ledger, "run_id", "") or ""
+            org = get_org_chart(rid, create=False) if rid else None
+            if org is not None:
+                if on_event is not None and org.on_event is None:
+                    org.on_event = on_event
+                if provider is not None and org.provider is None:
+                    org.provider = provider
             mission_dispatch = MissionDispatch(
-                run_id=getattr(ledger, "run_id", "") or "", ledger=ledger,
+                run_id=rid, ledger=ledger,
                 delegation_tree=delegation_tree, provider=provider,
-                on_event=on_event)
+                on_event=on_event, org_chart=org)
+            # Live-hire heads once a real dispatch+tree exists (gap 2).
+            if (
+                org is not None
+                and getattr(org, "active", False)
+                and delegation_tree is not None
+            ):
+                try:
+                    forming = [
+                        s for s in org.seats.values()
+                        if s.rank == "head" and (
+                            s.status == "forming" or not s.delegation_node
+                        )
+                    ]
+                    if forming:
+                        org.seat_heads(delegate_fn=mission_dispatch.delegate)
+                except Exception:  # noqa: BLE001
+                    pass
         except Exception:  # noqa: BLE001 — mission layer optional
             mission_dispatch = None
 

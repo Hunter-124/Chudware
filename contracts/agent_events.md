@@ -212,3 +212,8 @@ Structure per run: director (depth 0) → department heads (depth 1, one per der
 Channels (enforced): `dept:<id>` = head+workers(+lead); `heads` = heads+director. Worker→director → status=rejected.
 Meetings: every `meeting_cadence` worker completions or on blockage, head posts MeetingDigest {done,in_progress,blocked,risks,trigger,worker_completions} to heads; director review is template-first, LLM steering note only on misalignment/blockage.
 Tools: corporate_activate, channel_post, channel_read, chart, spawn_worker, hold_meeting, record_completion.
+
+## aicad.corporate/1 stream events (2026-07-16, additive)
+`kind:"corporate"`, `corp_event ∈ org_built|hire|team_lead|meeting|steering|route_rejected|wind_down`, `run_id`, `ts`, optional `chart_revision`/`dept`/`agent`, `payload` per event: org_built {chart_revision,director_id,departments[],mission_goals}; hire {role,rank,parent_id,dept_id,brief?,model?,live?}; team_lead {worker_id,dept_id,previous_rank}; meeting = MeetingDigest + counts; steering {text,to_dept,needs_llm,aligned,notes,llm_refined?}; route_rejected {from,channel,reason,from_rank}; wind_down {summary,success,departments_done,artifact_path?,digests}.
+Emission seam: services.agent.corporate.emit_corporate_event → agent_events.emit_event. GUI consumer: legacy_chat feedTurnActivity (rowKinds 4–8).
+Effective depth rule (binding): team-lead→worker spawns use effective_cap = max(agent.max_subagent_depth, 3) computed ONLY inside the corporate spawn path; the global key is never mutated and still governs flat delegation.

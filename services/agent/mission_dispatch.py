@@ -1402,12 +1402,14 @@ class MissionDispatch:
         tasks: list | None = None,
         mission_goals: list | None = None,
         force: bool | None = None,
+        seat_heads: bool = True,
         **_ignored: Any,
     ) -> dict:
         """Build/activate the corporate org chart for this run from *tasks*.
 
         No-ops (active=False) when corporate_mode is off or tasks span <2
-        departments — flat delegation remains unchanged.
+        departments — flat delegation remains unchanged. When active, seats
+        department heads as live subagents (if a delegation tree is bound).
         """
         try:
             from services.agent.corporate import build_corporate_org  # noqa: PLC0415
@@ -1418,6 +1420,10 @@ class MissionDispatch:
                 brief = self.graph.get("brief") or self.graph.get("goal") or ""
                 if brief:
                     goals = [str(brief)]
+
+            def _delegate(**kwargs: Any) -> Any:
+                return self.delegate(**kwargs)
+
             result = build_corporate_org(
                 self.run_id,
                 tasks or [],
@@ -1425,12 +1431,26 @@ class MissionDispatch:
                 board=self.coordination_board,
                 mission_goals=list(goals or []) or None,
                 force=force,
+                on_event=self.on_event,
+                provider=self.provider,
+                seat_heads=bool(seat_heads),
+                delegate_fn=_delegate if self.delegation_tree is not None else None,
             )
             if result.get("active") and result.get("chart"):
                 from services.agent.corporate import get_org_chart  # noqa: PLC0415
-                self.org_chart = get_org_chart(self.run_id, create=False)
-                if self.org_chart is not None and not self.corporate_agent_id:
-                    self.corporate_agent_id = self.org_chart.director_id
+                self.org_chart = get_org_chart(
+                    self.run_id,
+                    create=False,
+                    on_event=self.on_event,
+                    provider=self.provider,
+                )
+                if self.org_chart is not None:
+                    if self.org_chart.on_event is None:
+                        self.org_chart.on_event = self.on_event
+                    if self.org_chart.provider is None:
+                        self.org_chart.provider = self.provider
+                    if not self.corporate_agent_id:
+                        self.corporate_agent_id = self.org_chart.director_id
             if self.ledger is not None:
                 try:
                     self.ledger.append("agent", "artifact", {
@@ -1444,6 +1464,73 @@ class MissionDispatch:
             return result
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": f"corporate_activate failed: {exc}"}
+
+    def maybe_auto_activate_corporate(
+        self,
+        tasks: list | None = None,
+        mission_goals: list | None = None,
+        **_ignored: Any,
+    ) -> dict:
+        """Mission-start hook: auto-activate when mode on and ≥2 departments.
+
+        Never force-activates. Single-dept missions stay flat.
+        """
+        try:
+            from services.agent.corporate import auto_activate_corporate  # noqa: PLC0415
+            from services.agent import config as agent_config  # noqa: PLC0415
+            cfg = agent_config.load_config()
+            goals = mission_goals
+            if not goals and isinstance(self.graph, dict):
+                brief = self.graph.get("brief") or self.graph.get("goal") or ""
+                if brief:
+                    goals = [str(brief)]
+
+            def _delegate(**kwargs: Any) -> Any:
+                return self.delegate(**kwargs)
+
+            result = auto_activate_corporate(
+                self.run_id,
+                tasks or [],
+                cfg=cfg,
+                board=self.coordination_board,
+                mission_goals=list(goals or []) or None,
+                on_event=self.on_event,
+                provider=self.provider,
+                delegate_fn=_delegate if self.delegation_tree is not None else None,
+                seat_heads=True,
+            )
+            if result.get("active"):
+                from services.agent.corporate import get_org_chart  # noqa: PLC0415
+                self.org_chart = get_org_chart(
+                    self.run_id,
+                    create=False,
+                    on_event=self.on_event,
+                    provider=self.provider,
+                )
+                if self.org_chart is not None and not self.corporate_agent_id:
+                    self.corporate_agent_id = self.org_chart.director_id
+            return result
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"auto_activate failed: {exc}"}
+
+    def corporate_wind_down(
+        self,
+        success: bool = True,
+        summary: str = "",
+        **_ignored: Any,
+    ) -> dict:
+        """Tear down the corporate org at run finish (success or failure)."""
+        try:
+            from services.agent.corporate import wind_down_corporate  # noqa: PLC0415
+            out = wind_down_corporate(
+                self.run_id,
+                success=bool(success),
+                summary=str(summary or ""),
+            )
+            self.org_chart = None
+            return out
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"corporate_wind_down failed: {exc}"}
 
     def corporate_chart_snapshot(self, **_ignored: Any) -> dict:
         """Return the corporate org chart snapshot for this run."""

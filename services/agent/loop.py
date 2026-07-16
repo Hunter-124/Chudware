@@ -2131,6 +2131,51 @@ def run_mission(
         manifest, graph_id=run_id, org_layer=flags.org_layer,
         default_autonomy=autonomy_default)
 
+    # --- Corporate Roles auto-activate (aicad.corporate/1) -------------------
+    # When agent.corporate_mode is on and the mission decomposes into ≥2
+    # departments, build the org + seat heads without requiring the model to
+    # call corporate_activate. Single-dept stays flat. Best-effort: never
+    # blocks the mission.
+    _corp_tasks: list[dict] = []
+    try:
+        for n in (graph or {}).get("nodes") or []:
+            if not isinstance(n, dict):
+                continue
+            inp = n.get("inputs") if isinstance(n.get("inputs"), dict) else {}
+            _corp_tasks.append({
+                "id": n.get("id"),
+                "role": n.get("role") or inp.get("role"),
+                "task_class": n.get("task_class") or inp.get("task_class"),
+                "stage": n.get("phase") or n.get("stage") or inp.get("stage"),
+                "brief": n.get("label") or n.get("brief") or inp.get("brief") or "",
+                "kind": n.get("kind") or inp.get("kind"),
+            })
+        if not _corp_tasks:
+            for d in (manifest or {}).get("deliverables") or []:
+                if not isinstance(d, dict):
+                    continue
+                _corp_tasks.append({
+                    "id": d.get("id"),
+                    "role": d.get("role") or d.get("owner_role"),
+                    "task_class": d.get("kind") or d.get("type"),
+                    "brief": d.get("name") or d.get("description") or "",
+                    "kind": d.get("kind"),
+                })
+        if _corp_tasks:
+            from services.agent.corporate import auto_activate_corporate  # noqa: PLC0415
+            from services.agent import config as _agent_cfg  # noqa: PLC0415
+            auto_activate_corporate(
+                run_id,
+                _corp_tasks,
+                cfg=_agent_cfg.load_config(),
+                mission_goals=[request] if request else None,
+                on_event=on_event,
+                provider=provider,
+                seat_heads=True,
+            )
+    except Exception:  # noqa: BLE001 — corporate is opt-in overlay
+        pass
+
     # --- Run the DAG (Phases 2–7 as role nodes) ----------------------------
     dag_result: dict | None = None
     if execute_dag:
@@ -2240,6 +2285,17 @@ def run_mission(
     reached, status, stop_reason = _drive_phases_from_dag(
         machine, manifest, graph, dag_result, completed, _emit_phase, Phase,
         ledger=ledger, on_event=on_event, run_id=run_id)
+
+    # Corporate org wind-down (success or failure) — final digests + artifact.
+    try:
+        from services.agent.corporate import wind_down_corporate  # noqa: PLC0415
+        wind_down_corporate(
+            run_id,
+            success=(status == "done"),
+            summary=f"mission {status}" + (f" ({stop_reason})" if stop_reason else ""),
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
     return MissionRun(
         request=request, run_id=run_id, phase=reached, status=status,

@@ -613,6 +613,447 @@ static std::string friendlyStageTitle(const std::string& stage) {
     return t.empty() ? std::string("Working") : t;
 }
 
+// ============================ Corporate Roles (aicad.corporate/1) ============================
+// Additive kind="corporate" events (corp_event ∈ org_built|hire|team_lead|meeting|steering|
+// route_rejected|wind_down). Stored as ActivityItem rows with rowKind 4–8 so we never touch
+// integrator-owned app_state.h. Org chart updates in place; meetings/steering are compact cards;
+// route rejections are muted one-liners. Missing fields degrade silently.
+//
+// rowKind 4 = org chart (stage "corp:org", detail = JSON snapshot)
+// rowKind 5 = meeting digest (stage "corp:meet:<n>", detail = JSON digest)
+// rowKind 6 = steering note (stage "corp:steer:<n>", reason = text)
+// rowKind 7 = route rejected (stage "corp:rej:<n>", reason = muted line)
+// rowKind 8 = wind-down summary (stage "corp:wind", reason = final line)
+
+static const nlohmann::json& corpPayloadObj(const nlohmann::json& data) {
+    static const nlohmann::json kEmpty = nlohmann::json::object();
+    if (data.is_object() && data.contains("payload") && data["payload"].is_object())
+        return data["payload"];
+    // Tolerate flat envelopes (fields at top level) — additive streams may omit nesting.
+    return data.is_object() ? data : kEmpty;
+}
+
+static std::string corpDeptLabel(const nlohmann::json& data, const nlohmann::json& payload) {
+    if (data.is_object() && data.contains("dept")) {
+        const auto& d = data["dept"];
+        if (d.is_string()) return d.get<std::string>();
+        if (d.is_object()) {
+            std::string n = jstr(d, "name");
+            if (n.empty()) n = jstr(d, "id");
+            return n;
+        }
+    }
+    std::string n = jstr(payload, "name");
+    if (n.empty()) n = jstr(payload, "dept_id");
+    if (n.empty()) n = jstr(payload, "to_dept");
+    if (n.empty()) n = jstr(payload, "digest_dept");
+    return n;
+}
+
+static std::string corpAgentId(const nlohmann::json& data, const nlohmann::json& payload) {
+    std::string a = jstr(data, "agent");
+    if (a.empty()) a = jstr(payload, "agent");
+    if (a.empty()) a = jstr(payload, "agent_id");
+    if (a.empty()) a = jstr(payload, "worker_id");
+    if (a.empty()) a = jstr(payload, "from");
+    return a;
+}
+
+// Short seat id for display (drop run-id suffixes when long).
+static std::string corpShortId(const std::string& id) {
+    if (id.size() <= 28) return id;
+    return id.substr(0, 24) + "\xe2\x80\xa6";
+}
+
+static int corpWorkerCount(const nlohmann::json& dept) {
+    if (!dept.is_object()) return 0;
+    if (dept.contains("workers") && dept["workers"].is_array())
+        return (int)dept["workers"].size();
+    if (dept.contains("worker_count") && dept["worker_count"].is_number_integer())
+        return dept["worker_count"].get<int>();
+    if (dept.contains("workers") && dept["workers"].is_number_integer())
+        return dept["workers"].get<int>();
+    return 0;
+}
+
+static std::string corpDeptHead(const nlohmann::json& dept) {
+    std::string h = jstr(dept, "head");
+    if (h.empty()) h = jstr(dept, "head_id");
+    return h;
+}
+
+static std::string corpDeptLead(const nlohmann::json& dept) {
+    std::string l = jstr(dept, "lead");
+    if (l.empty()) l = jstr(dept, "team_lead");
+    if (l.empty()) l = jstr(dept, "team_lead_id");
+    return l;
+}
+
+static std::string corpDeptNameOf(const nlohmann::json& dept) {
+    std::string n = jstr(dept, "name");
+    if (n.empty()) n = jstr(dept, "id");
+    if (n.empty()) n = "department";
+    return n;
+}
+
+// Normalize any payload departments array into a compact chart JSON for the org card.
+static nlohmann::json corpNormalizeChart(const nlohmann::json& payload) {
+    nlohmann::json chart = nlohmann::json::object();
+    std::string dir = jstr(payload, "director_id");
+    if (dir.empty()) dir = jstr(payload, "director");
+    chart["director"] = dir;
+    const nlohmann::json* src = nullptr;
+    if (payload.contains("departments") && payload["departments"].is_array())
+        src = &payload["departments"];
+    else if (payload.contains("chart") && payload["chart"].is_object()) {
+        const auto& c = payload["chart"];
+        if (dir.empty()) {
+            dir = jstr(c, "director_id");
+            if (dir.empty()) dir = jstr(c, "director");
+            chart["director"] = dir;
+        }
+        if (c.contains("departments") && c["departments"].is_array())
+            src = &c["departments"];
+    }
+    nlohmann::json depts = nlohmann::json::array();
+    if (src) {
+        for (const auto& d : *src) {
+            if (!d.is_object()) continue;
+            nlohmann::json row = nlohmann::json::object();
+            row["id"] = jstr(d, "id");
+            row["name"] = corpDeptNameOf(d);
+            row["head"] = corpDeptHead(d);
+            row["lead"] = corpDeptLead(d);
+            int wc = corpWorkerCount(d);
+            row["workers"] = wc;
+            // Keep worker ids when present so hire can de-dupe.
+            if (d.contains("workers") && d["workers"].is_array())
+                row["worker_ids"] = d["workers"];
+            depts.push_back(std::move(row));
+        }
+    }
+    chart["departments"] = std::move(depts);
+    return chart;
+}
+
+static std::string corpOrgReason(const nlohmann::json& chart) {
+    int nDepts = 0, nWorkers = 0;
+    if (chart.contains("departments") && chart["departments"].is_array()) {
+        nDepts = (int)chart["departments"].size();
+        for (const auto& d : chart["departments"])
+            nWorkers += corpWorkerCount(d);
+    }
+    std::string dir = jstr(chart, "director");
+    char buf[160];
+    if (!dir.empty())
+        std::snprintf(buf, sizeof(buf), "Director \xc2\xb7 %d dept%s \xc2\xb7 %d worker%s",
+                      nDepts, nDepts == 1 ? "" : "s", nWorkers, nWorkers == 1 ? "" : "s");
+    else
+        std::snprintf(buf, sizeof(buf), "%d dept%s \xc2\xb7 %d worker%s",
+                      nDepts, nDepts == 1 ? "" : "s", nWorkers, nWorkers == 1 ? "" : "s");
+    return std::string(buf);
+}
+
+static ActivityItem* corpFindOrg(ChatMsg& m) {
+    for (auto it = m.activity.rbegin(); it != m.activity.rend(); ++it)
+        if (it->rowKind == 4 && it->stage == "corp:org") return &*it;
+    return nullptr;
+}
+
+static ActivityItem& corpEnsureOrg(ChatMsg& m) {
+    if (ActivityItem* a = corpFindOrg(m)) return *a;
+    ActivityItem ni;
+    ni.rowKind = 4;
+    ni.stage = "corp:org";
+    ni.title = "Corporate org";
+    ni.status = "done";
+    m.activity.push_back(std::move(ni));
+    return m.activity.back();
+}
+
+static nlohmann::json corpParseChart(const ActivityItem& a) {
+    if (a.detail.empty()) return nlohmann::json::object({{"departments", nlohmann::json::array()}});
+    try {
+        auto j = nlohmann::json::parse(a.detail);
+        if (j.is_object()) return j;
+    } catch (...) {}
+    return nlohmann::json::object({{"departments", nlohmann::json::array()}});
+}
+
+static void corpApplyOrgBuilt(ChatMsg& m, const nlohmann::json& payload) {
+    ActivityItem& a = corpEnsureOrg(m);
+    nlohmann::json chart = corpNormalizeChart(payload);
+    a.detail = chart.dump();
+    a.reason = corpOrgReason(chart);
+    a.title = "Corporate org";
+    a.status = "done";
+}
+
+// Patch the in-place org card on hire / team_lead when a full departments[] is absent.
+static void corpPatchOrgSeat(ChatMsg& m, const nlohmann::json& data, const nlohmann::json& payload,
+                             bool asTeamLead) {
+    // Prefer full chart replacement when the backend includes departments.
+    if ((payload.contains("departments") && payload["departments"].is_array()) ||
+        (payload.contains("chart") && payload["chart"].is_object())) {
+        corpApplyOrgBuilt(m, payload);
+        return;
+    }
+    ActivityItem& a = corpEnsureOrg(m);
+    nlohmann::json chart = corpParseChart(a);
+    if (!chart.contains("departments") || !chart["departments"].is_array())
+        chart["departments"] = nlohmann::json::array();
+
+    std::string did = jstr(payload, "dept_id");
+    std::string dname = corpDeptLabel(data, payload);
+    if (did.empty() && !dname.empty()) did = dname;
+    std::string agent = corpAgentId(data, payload);
+    std::string role = jstr(payload, "role");
+    if (agent.empty() && !role.empty()) agent = role;
+
+    nlohmann::json* row = nullptr;
+    for (auto& d : chart["departments"]) {
+        if (!d.is_object()) continue;
+        if ((!did.empty() && (jstr(d, "id") == did || jstr(d, "name") == did)) ||
+            (!dname.empty() && (jstr(d, "name") == dname || jstr(d, "id") == dname))) {
+            row = &d;
+            break;
+        }
+    }
+    if (!row) {
+        nlohmann::json nd = nlohmann::json::object();
+        nd["id"] = did;
+        nd["name"] = dname.empty() ? (did.empty() ? "department" : did) : dname;
+        nd["head"] = jstr(payload, "parent_id");
+        nd["lead"] = "";
+        nd["workers"] = 0;
+        nd["worker_ids"] = nlohmann::json::array();
+        chart["departments"].push_back(std::move(nd));
+        row = &chart["departments"].back();
+    }
+
+    if (!agent.empty()) {
+        if (!row->contains("worker_ids") || !(*row)["worker_ids"].is_array())
+            (*row)["worker_ids"] = nlohmann::json::array();
+        bool found = false;
+        for (const auto& w : (*row)["worker_ids"])
+            if (w.is_string() && w.get<std::string>() == agent) { found = true; break; }
+        if (!found) {
+            (*row)["worker_ids"].push_back(agent);
+            (*row)["workers"] = (int)(*row)["worker_ids"].size();
+        } else {
+            (*row)["workers"] = (int)(*row)["worker_ids"].size();
+        }
+        if (asTeamLead || jstr(payload, "rank") == "team_lead")
+            (*row)["lead"] = agent;
+    } else if (asTeamLead) {
+        std::string lead = jstr(payload, "worker_id");
+        if (lead.empty()) lead = jstr(payload, "team_lead_id");
+        if (!lead.empty()) (*row)["lead"] = lead;
+    }
+
+    a.detail = chart.dump();
+    a.reason = corpOrgReason(chart);
+    a.status = "done";
+}
+
+static int corpListCount(const nlohmann::json& o, const char* key) {
+    if (!o.is_object() || !o.contains(key)) return 0;
+    const auto& v = o[key];
+    if (v.is_array()) return (int)v.size();
+    if (v.is_number_integer()) return v.get<int>();
+    if (v.is_number_float()) return (int)v.get<double>();
+    return 0;
+}
+
+static std::string corpJoinRisks(const nlohmann::json& payload) {
+    if (!payload.contains("risks")) return {};
+    const auto& r = payload["risks"];
+    if (r.is_string()) return r.get<std::string>();
+    if (!r.is_array()) return {};
+    std::string out;
+    for (const auto& item : r) {
+        std::string s;
+        if (item.is_string()) s = item.get<std::string>();
+        if (s.empty()) continue;
+        if (!out.empty()) out += "; ";
+        out += s;
+        if (out.size() > 160) { out.resize(157); out += "\xe2\x80\xa6"; break; }
+    }
+    return out;
+}
+
+static void corpApplyMeeting(ChatMsg& m, const nlohmann::json& data, const nlohmann::json& payload) {
+    ActivityItem ni;
+    ni.rowKind = 5;
+    ni.stage = "corp:meet:" + std::to_string(m.activity.size());
+    std::string dept = corpDeptLabel(data, payload);
+    if (dept.empty()) dept = jstr(payload, "dept_id");
+    ni.title = dept.empty() ? "Meeting" : ("Meeting \xc2\xb7 " + dept);
+
+    int done = corpListCount(payload, "done");
+    int prog = corpListCount(payload, "in_progress");
+    if (prog == 0) prog = corpListCount(payload, "in-progress");
+    int blocked = corpListCount(payload, "blocked");
+    // Prefer explicit counts when backend sends them alongside lists.
+    if (payload.contains("done_count") && payload["done_count"].is_number_integer())
+        done = payload["done_count"].get<int>();
+    if (payload.contains("in_progress_count") && payload["in_progress_count"].is_number_integer())
+        prog = payload["in_progress_count"].get<int>();
+    if (payload.contains("blocked_count") && payload["blocked_count"].is_number_integer())
+        blocked = payload["blocked_count"].get<int>();
+
+    char line[192];
+    std::snprintf(line, sizeof(line), "done %d \xc2\xb7 in progress %d \xc2\xb7 blocked %d",
+                  done, prog, blocked);
+    ni.reason = line;
+    std::string risks = corpJoinRisks(payload);
+    if (!risks.empty()) {
+        ni.reason += "\nRisks: " + risks;
+    }
+    // Pack counts for the card renderer (no app_state fields).
+    ni.tokensIn = done;
+    ni.tokensOut = prog;
+    ni.opsCount = blocked;
+    ni.status = blocked > 0 ? "warn" : "done";
+    ni.expanded = false;
+
+    nlohmann::json dig = nlohmann::json::object();
+    dig["dept"] = dept;
+    dig["done"] = done;
+    dig["in_progress"] = prog;
+    dig["blocked"] = blocked;
+    dig["risks"] = risks;
+    dig["trigger"] = jstr(payload, "trigger");
+    dig["worker_completions"] = jint(payload, "worker_completions");
+    // Preserve list bodies for expand.
+    if (payload.contains("done") && payload["done"].is_array()) dig["done_items"] = payload["done"];
+    if (payload.contains("in_progress") && payload["in_progress"].is_array())
+        dig["in_progress_items"] = payload["in_progress"];
+    if (payload.contains("blocked") && payload["blocked"].is_array())
+        dig["blocked_items"] = payload["blocked"];
+    ni.detail = dig.dump();
+    m.activity.push_back(std::move(ni));
+}
+
+static void corpApplySteering(ChatMsg& m, const nlohmann::json& data, const nlohmann::json& payload) {
+    ActivityItem ni;
+    ni.rowKind = 6;
+    ni.stage = "corp:steer:" + std::to_string(m.activity.size());
+    std::string dept = corpDeptLabel(data, payload);
+    ni.title = dept.empty() ? "Director steering" : ("Director steering \xc2\xb7 " + dept);
+    std::string text = jstr(payload, "text");
+    if (text.empty()) text = jstr(payload, "steering");
+    if (text.empty()) text = jstr(payload, "note");
+    if (text.empty() && payload.contains("notes") && payload["notes"].is_array()) {
+        for (const auto& n : payload["notes"]) {
+            if (!n.is_string()) continue;
+            if (!text.empty()) text += " ";
+            text += n.get<std::string>();
+        }
+    }
+    ni.reason = text;
+    ni.detail = text;
+    ni.status = "done";
+    m.activity.push_back(std::move(ni));
+}
+
+static void corpApplyRouteRejected(ChatMsg& m, const nlohmann::json& data,
+                                   const nlohmann::json& payload) {
+    ActivityItem ni;
+    ni.rowKind = 7;
+    ni.stage = "corp:rej:" + std::to_string(m.activity.size());
+    std::string from = jstr(payload, "from");
+    if (from.empty()) from = corpAgentId(data, payload);
+    std::string to = jstr(payload, "to");
+    if (to.empty()) to = jstr(payload, "channel");
+    std::string reason = jstr(payload, "reason");
+    // Prefer a backend-provided line; else compose the design-doc muted form.
+    std::string line = jstr(payload, "line");
+    if (line.empty()) line = jstr(payload, "message");
+    if (line.empty()) {
+        if (!from.empty() && (to.find("director") != std::string::npos ||
+                              reason.find("director") != std::string::npos ||
+                              reason.find("heads") != std::string::npos ||
+                              to.empty())) {
+            line = "worker " + corpShortId(from) +
+                   " \xe2\x86\x92 director blocked \xe2\x80\x94 routed to head";
+        } else if (!from.empty()) {
+            line = corpShortId(from) + " route blocked";
+            if (!to.empty()) line += " \xe2\x86\x92 " + to;
+            if (!reason.empty()) line += " \xe2\x80\x94 " + reason;
+        } else {
+            line = reason.empty() ? "route rejected" : reason;
+        }
+    }
+    ni.reason = line;
+    ni.title = line;
+    ni.status = "done";
+    m.activity.push_back(std::move(ni));
+}
+
+static void corpApplyWindDown(ChatMsg& m, const nlohmann::json& data,
+                              const nlohmann::json& payload) {
+    (void)data;
+    ActivityItem ni;
+    ni.rowKind = 8;
+    ni.stage = "corp:wind";
+    ni.title = "Org wind-down";
+    std::string summary = jstr(payload, "summary");
+    if (summary.empty()) summary = jstr(payload, "text");
+    if (summary.empty()) summary = jstr(payload, "message");
+    int done = 0;
+    if (payload.contains("departments_done")) {
+        if (payload["departments_done"].is_array())
+            done = (int)payload["departments_done"].size();
+        else if (payload["departments_done"].is_number_integer())
+            done = payload["departments_done"].get<int>();
+    }
+    if (summary.empty()) {
+        if (done > 0) {
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), "Corporate org finished \xc2\xb7 %d department%s",
+                          done, done == 1 ? "" : "s");
+            summary = buf;
+        } else {
+            summary = "Corporate org finished";
+        }
+    }
+    // Also refresh the org card summary line if present.
+    if (ActivityItem* org = corpFindOrg(m)) {
+        if (!summary.empty()) org->reason = summary;
+        org->status = "done";
+    }
+    ni.reason = summary;
+    ni.detail = summary;
+    ni.status = "done";
+    m.activity.push_back(std::move(ni));
+}
+
+static void feedCorporateEvent(ChatMsg& m, const nlohmann::json& data) {
+    const nlohmann::json& payload = corpPayloadObj(data);
+    std::string ce = jstr(data, "corp_event");
+    if (ce.empty()) ce = jstr(data, "event");
+    if (ce.empty()) ce = jstr(payload, "corp_event");
+    if (ce.empty()) return;  // unknown / incomplete — silent no-op
+
+    if (ce == "org_built") {
+        corpApplyOrgBuilt(m, payload);
+    } else if (ce == "hire") {
+        corpPatchOrgSeat(m, data, payload, /*asTeamLead=*/false);
+    } else if (ce == "team_lead") {
+        corpPatchOrgSeat(m, data, payload, /*asTeamLead=*/true);
+    } else if (ce == "meeting") {
+        corpApplyMeeting(m, data, payload);
+    } else if (ce == "steering") {
+        corpApplySteering(m, data, payload);
+    } else if (ce == "route_rejected") {
+        corpApplyRouteRejected(m, data, payload);
+    } else if (ce == "wind_down") {
+        corpApplyWindDown(m, data, payload);
+    }
+    // Unknown corp_event values: ignore (forward-compatible).
+}
+
 void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json& data) {
     // Inside a mission, sub-run stage keys (intake/model/...) repeat per task — namespace them by
     // the current task index so task 2's "model" row doesn't reopen task 1's. Outside a mission
@@ -801,6 +1242,10 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         const bool ok = !data.is_object() || data.value("ok", true);
         ni.status     = ok ? "done" : "fail";
         m.activity.push_back(std::move(ni));
+    } else if (kind == "corporate") {                               // Corporate Roles live UI
+        // Additive aicad.corporate/1 stream: corp_event + optional dept/agent/payload.
+        // Same drain as stage/tool events (app.cpp strips orch_ prefix).
+        feedCorporateEvent(m, data);
     }
 }
 
@@ -1577,6 +2022,252 @@ static void drawToolCallRow(ActivityItem& a, const ui::Fonts& fonts) {
     }
 }
 
+// ============================ Corporate Roles timeline cards ============================
+// Compact glass cards for org chart / meetings / steering; muted one-liners for route rejections
+// and wind-down. Colors only via ui::palette + semanticOnGlass. Right-click Copy via existing
+// chatOpenCopyPopup path.
+
+static void drawCorpOrgCard(ActivityItem& a, const ui::Fonts& fonts) {
+    const auto& pal = ui::palette;
+    const float sc = ui::uiScale;
+    const ui::AdaptiveSurface& surf = chatSurf();
+    ImGui::Dummy(ImVec2(0, 2 * sc));
+    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
+    ImGui::BeginChild("##corporg", ImVec2(0, 0),
+                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+
+    ui::IconUV iv = ui::getIcon("team", 20);
+    if (iv.valid) {
+        float gz = ImGui::GetTextLineHeight();
+        ImVec4 tint = semanticOnGlass(pal.accent, surf);
+        ImGui::Image(iv.texId, ImVec2(gz, gz), iv.uv0, iv.uv1, tint);
+        ImGui::SameLine(0, 6 * sc);
+    }
+    ImGui::PushFont(fonts.medium);
+    ImGui::TextColored(semanticOnGlass(pal.accent, surf), "%s",
+                       a.title.empty() ? "Corporate org" : a.title.c_str());
+    ImGui::PopFont();
+    if (!a.reason.empty()) {
+        ImGui::SameLine(0, 8 * sc);
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+        ImGui::TextUnformatted(a.reason.c_str());
+        ImGui::PopStyleColor();
+    }
+
+    nlohmann::json chart = corpParseChart(a);
+    std::string dir = jstr(chart, "director");
+    if (!dir.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+        ImGui::Text("Director  %s", corpShortId(dir).c_str());
+        ImGui::PopStyleColor();
+    }
+    if (chart.contains("departments") && chart["departments"].is_array()) {
+        for (const auto& d : chart["departments"]) {
+            if (!d.is_object()) continue;
+            std::string name = corpDeptNameOf(d);
+            std::string head = corpDeptHead(d);
+            std::string lead = corpDeptLead(d);
+            int wc = corpWorkerCount(d);
+            if (wc == 0 && d.contains("worker_ids") && d["worker_ids"].is_array())
+                wc = (int)d["worker_ids"].size();
+            char line[256];
+            if (!lead.empty()) {
+                std::snprintf(line, sizeof(line),
+                              "  %s  \xc2\xb7 head %s  \xc2\xb7 lead %s  \xc2\xb7 %d worker%s",
+                              name.c_str(),
+                              corpShortId(head).c_str(),
+                              corpShortId(lead).c_str(),
+                              wc, wc == 1 ? "" : "s");
+            } else {
+                std::snprintf(line, sizeof(line),
+                              "  %s  \xc2\xb7 head %s  \xc2\xb7 %d worker%s",
+                              name.c_str(),
+                              head.empty() ? "\xe2\x80\x94" : corpShortId(head).c_str(),
+                              wc, wc == 1 ? "" : "s");
+            }
+            ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+            ImGui::TextUnformatted(line);
+            ImGui::PopStyleColor();
+        }
+    }
+
+    ImGui::EndChild();
+    ImRect cardRect = endGlassBubble(gb);
+    {
+        // Prefer human summary over the JSON detail stash.
+        std::string copyTxt = a.title.empty() ? "Corporate org" : a.title;
+        if (!a.reason.empty()) { copyTxt += "\n"; copyTxt += a.reason; }
+        if (!dir.empty()) { copyTxt += "\nDirector  "; copyTxt += dir; }
+        if (chart.contains("departments") && chart["departments"].is_array()) {
+            for (const auto& d : chart["departments"]) {
+                if (!d.is_object()) continue;
+                copyTxt += "\n- ";
+                copyTxt += corpDeptNameOf(d);
+                std::string head = corpDeptHead(d);
+                if (!head.empty()) { copyTxt += "  head="; copyTxt += head; }
+                std::string lead = corpDeptLead(d);
+                if (!lead.empty()) { copyTxt += "  lead="; copyTxt += lead; }
+                int wc = corpWorkerCount(d);
+                if (wc == 0 && d.contains("worker_ids") && d["worker_ids"].is_array())
+                    wc = (int)d["worker_ids"].size();
+                copyTxt += "  workers=";
+                copyTxt += std::to_string(wc);
+            }
+        }
+        chatOpenCopyPopup(cardRect, "##corp_org_copy");
+        chatDrawCopyPopup("##corp_org_copy", copyTxt);
+    }
+}
+
+static void drawCorpMeetingCard(ActivityItem& a, const ui::Fonts& fonts) {
+    const auto& pal = ui::palette;
+    const float sc = ui::uiScale;
+    const ui::AdaptiveSurface& surf = chatSurf();
+    const bool blocked = a.opsCount > 0 || a.status == "warn";
+
+    ImGui::Dummy(ImVec2(0, 2 * sc));
+    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
+    ImGui::BeginChild("##corpmeet", ImVec2(0, 0),
+                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+
+    ui::IconUV iv = ui::getIcon("milestone_flag", 20);
+    if (!iv.valid) iv = ui::getIcon("team", 20);
+    if (iv.valid) {
+        float gz = ImGui::GetTextLineHeight();
+        ImVec4 tint = blocked ? semanticOnGlass(pal.statusWarn, surf)
+                              : semanticOnGlass(pal.accent, surf);
+        ImGui::Image(iv.texId, ImVec2(gz, gz), iv.uv0, iv.uv1, tint);
+        ImGui::SameLine(0, 6 * sc);
+    }
+    ImGui::PushFont(fonts.medium);
+    ImGui::TextColored(blocked ? semanticOnGlass(pal.statusWarn, surf) : surf.textPrimary,
+                       "%s", a.title.empty() ? "Meeting" : a.title.c_str());
+    ImGui::PopFont();
+
+    // Collapsible body: counts always visible; risks + item lists when expanded.
+    if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+    if (ImGui::IsItemClicked()) a.expanded = !a.expanded;
+    ImGui::SameLine(0, 6 * sc);
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+    ImGui::TextUnformatted(a.expanded ? "(hide)" : "(details)");
+    ImGui::PopStyleColor();
+    if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+    if (ImGui::IsItemClicked()) a.expanded = !a.expanded;
+
+    // First line of reason = counts.
+    std::string counts = a.reason;
+    std::string risks;
+    size_t nl = counts.find('\n');
+    if (nl != std::string::npos) {
+        risks = counts.substr(nl + 1);
+        counts.resize(nl);
+    }
+    if (!counts.empty()) dimText(counts.c_str());
+    if (!risks.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text,
+                              blocked ? semanticOnGlass(pal.statusWarn, surf) : surf.textSecondary);
+        ImGui::TextWrapped("%s", risks.c_str());
+        ImGui::PopStyleColor();
+    }
+
+    if (a.expanded && !a.detail.empty()) {
+        try {
+            auto dig = nlohmann::json::parse(a.detail);
+            auto listLine = [&](const char* label, const char* key) {
+                if (!dig.contains(key) || !dig[key].is_array() || dig[key].empty()) return;
+                ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+                ImGui::TextUnformatted(label);
+                ImGui::PopStyleColor();
+                for (const auto& it : dig[key]) {
+                    if (!it.is_string()) continue;
+                    ImGui::Bullet();
+                    ImGui::SameLine();
+                    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+                    ImGui::TextWrapped("%s", it.get<std::string>().c_str());
+                    ImGui::PopStyleColor();
+                }
+            };
+            listLine("Done", "done_items");
+            listLine("In progress", "in_progress_items");
+            listLine("Blocked", "blocked_items");
+        } catch (...) {
+            // detail may be non-JSON — ignore expand body
+        }
+    }
+
+    ImGui::EndChild();
+    ImRect cardRect = endGlassBubble(gb);
+    if (blocked) {
+        ImGui::GetWindowDrawList()->AddRect(
+            cardRect.Min, cardRect.Max, ui::Palette::toU32(pal.statusWarn),
+            8.0f * sc, 0, ui::metrics::stroke(1.5f));
+    }
+    {
+        const std::string copyTxt = chatActivityCopyText(a);
+        chatOpenCopyPopup(cardRect, "##corp_meet_copy");
+        chatDrawCopyPopup("##corp_meet_copy", copyTxt);
+    }
+}
+
+static void drawCorpSteeringCard(const ActivityItem& a, const ui::Fonts& fonts) {
+    const auto& pal = ui::palette;
+    const float sc = ui::uiScale;
+    const ui::AdaptiveSurface& surf = chatSurf();
+    ImGui::Dummy(ImVec2(0, 2 * sc));
+    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
+    ImGui::BeginChild("##corpsteer", ImVec2(0, 0),
+                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+
+    ui::IconUV iv = ui::getIcon("poly_star", 20);
+    if (!iv.valid) iv = ui::getIcon("milestone_flag", 20);
+    if (iv.valid) {
+        float gz = ImGui::GetTextLineHeight() * 0.95f;
+        ImVec4 tint = semanticOnGlass(pal.accent, surf);
+        ImGui::Image(iv.texId, ImVec2(gz, gz), iv.uv0, iv.uv1, tint);
+        ImGui::SameLine(0, 6 * sc);
+    }
+    ImGui::PushFont(fonts.medium);
+    ImGui::TextColored(semanticOnGlass(pal.accent, surf), "%s",
+                       a.title.empty() ? "Director steering" : a.title.c_str());
+    ImGui::PopFont();
+    const std::string& note = !a.reason.empty() ? a.reason : a.detail;
+    if (!note.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+        ImGui::TextWrapped("%s", note.c_str());
+        ImGui::PopStyleColor();
+    }
+
+    ImGui::EndChild();
+    ImRect cardRect = endGlassBubble(gb);
+    {
+        const std::string copyTxt = chatActivityCopyText(a);
+        chatOpenCopyPopup(cardRect, "##corp_steer_copy");
+        chatDrawCopyPopup("##corp_steer_copy", copyTxt);
+    }
+}
+
+// Muted single-line activity (route rejection / wind-down summary).
+static void drawCorpMutedLine(const ActivityItem& a, const ui::Fonts& fonts) {
+    const float sc = ui::uiScale;
+    const ui::AdaptiveSurface& surf = chatSurf();
+    ImGui::Dummy(ImVec2(0, 1 * sc));
+    const std::string& line = !a.reason.empty() ? a.reason
+                            : !a.title.empty()  ? a.title
+                                                : a.detail;
+    if (line.empty()) return;
+    ImGui::PushFont(fonts.body);
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+    ImGui::TextWrapped("%s", line.c_str());
+    ImGui::PopStyleColor();
+    ImGui::PopFont();
+    {
+        const ImRect r(ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+        chatOpenCopyPopup(r, "##corp_mute_copy");
+        chatDrawCopyPopup("##corp_mute_copy", line);
+    }
+}
+
+
 // The agent timeline: dispatch each activity row to a thinking block or an action card, computing
 // the thinking auto-collapse (a thinking row collapses once a later stage reaches a verdict).
 // Typed /2 transparency rows (M12-M14) dispatch by rowKind first, at their arrival position.
@@ -1594,6 +2285,14 @@ static void drawAgentTimeline(ChatMsg& m, const ui::Fonts& fonts, float logW, bo
             drawThoughtBox(a, fonts, showThinking);
         } else if (a.rowKind == 3) {
             drawToolCallRow(a, fonts);
+        } else if (a.rowKind == 4) {
+            drawCorpOrgCard(a, fonts);
+        } else if (a.rowKind == 5) {
+            drawCorpMeetingCard(a, fonts);
+        } else if (a.rowKind == 6) {
+            drawCorpSteeringCard(a, fonts);
+        } else if (a.rowKind == 7 || a.rowKind == 8) {
+            drawCorpMutedLine(a, fonts);
         } else if (isThinkingItem(a)) {
             bool laterDone = false;
             for (size_t j = i + 1; j < m.activity.size(); ++j) {

@@ -192,7 +192,9 @@ class AnthropicSubProvider(Provider):
         # the parameter is kept for call-site symmetry and future use.
         return {
             "Authorization": f"Bearer {self._cred['access_token']}",
-            "Accept-Encoding": "gzip, deflate, br, zstd",
+            # Do NOT advertise gzip/br/zstd: urllib does not auto-decompress when
+            # Accept-Encoding is set manually, which produced UnicodeDecodeError
+            # on 0x8b (gzip magic) in complete_ex. Identity keeps the body UTF-8 JSON.
             "Connection": "keep-alive",
             "Content-Type": "application/json",
             "anthropic-version": "2023-06-01",

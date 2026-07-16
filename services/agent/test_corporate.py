@@ -10,6 +10,7 @@ Proofs:
 """
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -548,3 +549,259 @@ class TestRegistry:
         assert c1 is c2
         drop_org_chart("r_reg")
         assert get_org_chart("r_reg", create=False) is None
+
+
+# ---------------------------------------------------------------------------
+# Gap 1: auto-activate ≥2 depts / flat when 1
+# ---------------------------------------------------------------------------
+
+class TestAutoActivate:
+    def test_auto_activate_multi_dept(self, tmp_path):
+        events: list[dict] = []
+
+        def on_event(data, *args):
+            if args:
+                # (kind, payload)
+                events.append({"kind": data, **(args[0] if isinstance(args[0], dict) else {})})
+            elif isinstance(data, dict):
+                events.append(data)
+
+        from services.agent.corporate import auto_activate_corporate
+
+        out = auto_activate_corporate(
+            "r_auto_multi",
+            _mixed_tasks(),
+            cfg=_cfg_on(),
+            mission_goals=["bracket with FEA and CAM"],
+            on_event=on_event,
+            runs_dir=tmp_path,
+            seat_heads=True,
+            delegate_fn=None,  # chart-only hire path still marks heads active
+        )
+        assert out["ok"] is True
+        assert out["active"] is True
+        assert out["departments_found"] >= 2
+        chart = get_org_chart("r_auto_multi", create=False)
+        assert chart is not None and chart.active
+        # org_built event present
+        kinds = [e.get("corp_event") for e in chart._events]
+        assert "org_built" in kinds
+        # heads hired (status active after seat_heads)
+        heads = [s for s in chart.seats.values() if s.rank == "head"]
+        assert heads
+        assert all(h.status == "active" for h in heads)
+
+    def test_auto_activate_single_dept_stays_flat(self):
+        from services.agent.corporate import auto_activate_corporate
+
+        out = auto_activate_corporate(
+            "r_auto_one",
+            [{"role": "feature_modeler"}, {"role": "sketcher"}],
+            cfg=_cfg_on(),
+            seat_heads=True,
+        )
+        assert out["ok"] is True
+        assert out["active"] is False
+        assert get_org_chart("r_auto_one", create=False) is None or not (
+            get_org_chart("r_auto_one", create=False) or type("X", (), {"active": False})()
+        ).active
+
+    def test_mission_dispatch_maybe_auto_activate(self):
+        md = MissionDispatch(run_id="r_md_auto", on_event=None)
+        # Force path via corporate_activate with mode-on cfg is separate; here
+        # maybe_auto_activate respects real config — use force via activate.
+        out = md.corporate_activate(
+            tasks=_mixed_tasks(),
+            mission_goals=["multi domain"],
+            force=True,
+            seat_heads=True,
+        )
+        assert out["active"] is True
+        assert md.org_chart is not None
+
+
+# ---------------------------------------------------------------------------
+# Gap 2 + depth: lead→worker at effective cap 3 with global cap 2
+# ---------------------------------------------------------------------------
+
+class TestEffectiveDepthAndLiveHeads:
+    def test_lead_to_worker_allowed_at_effective_cap_3(self):
+        """Global max_subagent_depth=2 is NOT mutated; lead→worker uses max(2,3)=3."""
+        chart = OrgChart(
+            "r_eff_depth",
+            cfg=_cfg_on(team_leads=True),
+            team_leads=True,
+            max_subagent_depth=2,
+        )
+        chart.build_from_tasks(_mixed_tasks())
+        geo = next(d for d in chart.departments if d["id"] == "geometry")
+        head_id = geo["head_id"]
+        # Promote a team lead explicitly
+        lead = chart.spawn_worker(
+            head_id=head_id,
+            role="feature_modeler",
+            worker_id="lead_geo",
+            as_team_lead=True,
+        )
+        assert lead["ok"], lead
+        assert lead["seat"]["rank"] == "team_lead"
+        # Global cap still 2
+        assert chart.max_subagent_depth == 2
+        # Lead may spawn worker at effective depth 3
+        w = chart.spawn_worker(
+            head_id="lead_geo",
+            role="sketcher",
+            worker_id="under_lead",
+        )
+        assert w["ok"] is True, w
+        assert w["depth"] == 3
+        assert w["effective_depth_cap"] == 3
+        assert w["global_max_subagent_depth"] == 2
+        # Global field still untouched
+        assert chart.max_subagent_depth == 2
+
+    def test_seat_heads_marks_live_and_emits_hire(self):
+        chart = OrgChart(
+            "r_heads",
+            cfg=_cfg_on(),
+            max_subagent_depth=2,
+        )
+        chart.build_from_tasks(_mixed_tasks())
+        delegated: list[dict] = []
+
+        def fake_delegate(**kwargs):
+            nid = f"n_{kwargs.get('role')}_{len(delegated)}"
+            rec = {"id": nid, **kwargs}
+            delegated.append(rec)
+            return rec
+
+        out = chart.seat_heads(delegate_fn=fake_delegate)
+        assert out["ok"] is True
+        assert out["count"] >= 2
+        assert len(delegated) == out["count"]
+        for h in out["hired"]:
+            assert h["seat"]["status"] == "active"
+            assert h["delegation"] is not None
+        hire_evs = [e for e in chart._events if e.get("corp_event") == "hire"]
+        assert len(hire_evs) >= 2
+
+
+# ---------------------------------------------------------------------------
+# Gap 4: LLM steering only on blockage / needs_llm
+# ---------------------------------------------------------------------------
+
+class TestLlmSteering:
+    def test_steering_llm_only_on_blockage(self):
+        calls: list[tuple] = []
+
+        class Prov:
+            def complete(self, system, messages, max_tokens=400):
+                calls.append((system, messages, max_tokens))
+                return "LLM STEERING: unblock regen then re-align to FEA goal."
+
+        chart = OrgChart(
+            "r_llm",
+            cfg=_cfg_on(director_review=True),
+            mission_goals=["bracket FEA pass"],
+            director_review=True,
+            max_subagent_depth=2,
+            provider=Prov(),
+        )
+        chart.build_from_tasks(_mixed_tasks())
+        # Aligned meeting → no LLM
+        ok_mtg = chart.hold_meeting(
+            "geometry",
+            done=["boss extrude"],
+            in_progress=["fillets"],
+            blocked=[],
+            risks=[],
+            trigger="completion",
+        )
+        assert ok_mtg["ok"]
+        rev_ok = ok_mtg["director_review"]
+        assert rev_ok is not None
+        # Template-aligned → no LLM call
+        if rev_ok.get("aligned"):
+            assert len(calls) == 0
+            assert rev_ok.get("needs_llm") is False
+
+        # Blockage → needs_llm → one complete()
+        n_before = len(calls)
+        bad = chart.hold_meeting(
+            "geometry",
+            done=[],
+            in_progress=["fillets"],
+            blocked=["regen failure on cut-extrude"],
+            risks=["unclear stock"],
+            trigger="blockage",
+        )
+        assert bad["ok"]
+        rev = bad["director_review"]
+        assert rev["needs_llm"] is True
+        assert rev["aligned"] is False
+        assert len(calls) == n_before + 1
+        assert "LLM STEERING" in rev["steering"] or "STEERING" in rev["steering"]
+        steer_evs = [
+            e for e in chart._events if e.get("corp_event") == "steering"
+        ]
+        assert steer_evs
+        assert steer_evs[-1]["payload"].get("needs_llm") is True
+
+
+# ---------------------------------------------------------------------------
+# Gap 5: wind-down artifact + events order
+# ---------------------------------------------------------------------------
+
+class TestWindDownAndEvents:
+    def test_wind_down_writes_artifact_and_events_order(self, tmp_path):
+        chart = OrgChart(
+            "r_wind",
+            cfg=_cfg_on(),
+            mission_goals=["ship it"],
+            max_subagent_depth=2,
+            runs_dir=tmp_path,
+        )
+        chart.build_from_tasks(_mixed_tasks())
+        geo = next(d for d in chart.departments if d["id"] == "geometry")
+        chart.spawn_worker(
+            head_id=geo["head_id"], role="feature_modeler", worker_id="w_wind",
+        )
+        # Force a rejection event
+        chart.post_message("w_wind", CHANNEL_HEADS, "hey director", kind="question")
+
+        out = chart.wind_down(success=True, summary="done", drop=True)
+        assert out["ok"] is True
+        assert out["artifact_path"]
+        p = Path(out["artifact_path"])
+        assert p.exists()
+        data = json.loads(p.read_text(encoding="utf-8"))
+        assert data["event"] == "corporate_org_finished"
+        assert data["success"] is True
+        assert data["schema"] == CORPORATE_SCHEMA
+
+        # Chart dropped from registry
+        assert get_org_chart("r_wind", create=False) is None
+
+        # Event order: org_built … hire … route_rejected … wind_down
+        corp_events = [e.get("corp_event") for e in data["events"]]
+        assert corp_events[0] == "org_built"
+        assert "hire" in corp_events
+        assert "route_rejected" in corp_events
+        assert corp_events[-1] == "wind_down"
+        assert corp_events.index("org_built") < corp_events.index("hire")
+        assert corp_events.index("hire") < corp_events.index("route_rejected")
+        assert corp_events.index("route_rejected") < corp_events.index("wind_down")
+
+    def test_route_rejected_event_on_worker_director(self):
+        chart = OrgChart("r_rej", cfg=_cfg_on(), max_subagent_depth=2)
+        chart.build_from_tasks(_mixed_tasks())
+        geo = next(d for d in chart.departments if d["id"] == "geometry")
+        chart.spawn_worker(
+            head_id=geo["head_id"], role="sketcher", worker_id="w_rej",
+        )
+        r = chart.post_message("w_rej", CHANNEL_HEADS, "help", kind="question")
+        assert r.get("status") == "rejected"
+        rejs = [e for e in chart._events if e.get("corp_event") == "route_rejected"]
+        assert rejs
+        assert rejs[-1]["payload"]["from"] == "w_rej"
+        assert rejs[-1]["kind"] == "corporate"

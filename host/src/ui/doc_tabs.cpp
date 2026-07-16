@@ -257,20 +257,52 @@ static float measureOverflowChipW(int count, float s) {
 
 // Clean alpha fade at a truncated tab edge — neutral surface tone ramping to transparent, NOT a
 // saturated accent gradient block. `fromRight` true: opaque at the right edge, transparent leftward.
+//
+// AddRectFilledMultiColor is SQUARE-cornered. Drawn full-height at the band edge it produced the
+// bright vertical strip / square-corner fleck (same class of bug as coloredRowWash / ribbon_vGrad
+// — MultiColor poking past the rounded glass outline, plus a near-opaque light-tint wall at the
+// solid edge). Keep the MultiColor strictly inside the band's rounded outline and use a soft
+// two-stop dissolve so the title reads as dissolving, not as a bright bar.
 static void drawTabEdgeFade(ImDrawList* dl, float edgeX, float y0, float y1, float fadeW,
-                            bool fromRight, const ui::AdaptiveSurface& surf) {
+                            bool fromRight, const ui::AdaptiveSurface& surf, float cornerR) {
     if (fadeW < 1.0f) return;
     const float lo = fromRight ? (edgeX - fadeW) : edgeX;
     const float hi = fromRight ? edgeX : (edgeX + fadeW);
+    if (hi - lo < 1.0f) return;
+
+    const float H = y1 - y0;
+    // MultiColor is square-cornered — pull it off the band's outer rounded outline so it never
+    // leaves bright corner flecks (same class of fix as coloredRowWash). A light vertical inset
+    // is enough: the text baseline sits in the middle of the bar, and over-insetting by the full
+    // corner radius left hard-clipped glyphs at the top/bottom of the fade.
+    const float rnd = ImClamp(std::min(cornerR, 3.0f * (H / 26.0f)), 0.0f, H * 0.35f);
+    const float yA = y0 + rnd;
+    const float yB = y1 - rnd;
+    if (yB <= yA + 0.5f) return;
+
     // Match the band's glass scrim so the fade reads as the title dissolving, not a blue smear.
+    // Cap well below opaque — near-1 alpha on a light-theme tint was the bright vertical strip.
     const ImVec4 base = surf.tint;
-    const float aEdge = std::min(0.92f, 0.55f + surf.scrim);
-    const ImU32 solid = ImGui::ColorConvertFloat4ToU32(ImVec4(base.x, base.y, base.z, aEdge));
-    const ImU32 clear = ImGui::ColorConvertFloat4ToU32(ImVec4(base.x, base.y, base.z, 0.0f));
-    if (fromRight)
-        dl->AddRectFilledMultiColor(ImVec2(lo, y0), ImVec2(hi, y1), clear, solid, solid, clear);
-    else
-        dl->AddRectFilledMultiColor(ImVec2(lo, y0), ImVec2(hi, y1), solid, clear, clear, solid);
+    const float aEdge = std::min(0.62f, 0.28f + surf.scrim * 0.55f);
+    const float aMid  = aEdge * 0.38f;
+    const ImU32 cSolid = ImGui::ColorConvertFloat4ToU32(ImVec4(base.x, base.y, base.z, aEdge));
+    const ImU32 cMid   = ImGui::ColorConvertFloat4ToU32(ImVec4(base.x, base.y, base.z, aMid));
+    const ImU32 cClear = ImGui::ColorConvertFloat4ToU32(ImVec4(base.x, base.y, base.z, 0.0f));
+
+    // Two-stop L→R (or R→L) ramp: solid at the scroll edge, soft mid, clear inward. Interior only
+    // — never a full-height square rect that meets the band's rounded corners.
+    const float mid = fromRight ? (edgeX - fadeW * 0.42f) : (edgeX + fadeW * 0.42f);
+    if (fromRight) {
+        if (mid > lo + 0.5f)
+            dl->AddRectFilledMultiColor(ImVec2(lo, yA), ImVec2(mid, yB), cClear, cMid, cMid, cClear);
+        if (hi > mid + 0.5f)
+            dl->AddRectFilledMultiColor(ImVec2(mid, yA), ImVec2(hi, yB), cMid, cSolid, cSolid, cMid);
+    } else {
+        if (mid > lo + 0.5f)
+            dl->AddRectFilledMultiColor(ImVec2(lo, yA), ImVec2(mid, yB), cSolid, cMid, cMid, cSolid);
+        if (hi > mid + 0.5f)
+            dl->AddRectFilledMultiColor(ImVec2(mid, yA), ImVec2(hi, yB), cMid, cClear, cClear, cMid);
+    }
 }
 
 // Dedicated overflow "+N" glass chip in its own reserved slot (never painted over a tab title).
@@ -644,11 +676,14 @@ float drawDocTabs(AppState& st, float availW) {
         drawOneTab(st, i, x, y0, barH, surf);
     }
     // Clean alpha fade on truncated edges (drawn inside the tab clip so it only covers tab content).
+    // MultiColor stays inset past the band's 8dp corner radius — same square-corner guard as
+    // coloredRowWash / ribbon_vGradRounded.
     const float fadeW = 28.0f * s;
+    const float bandRdp = 8.0f * s;
     if (overflow && s_scrollX > 0.5f)
-        drawTabEdgeFade(dl, tabsL, y0, y0 + barH, fadeW, /*fromRight=*/false, surf);
+        drawTabEdgeFade(dl, tabsL, y0, y0 + barH, fadeW, /*fromRight=*/false, surf, bandRdp);
     if (overflow && s_scrollX < maxScroll - 0.5f)
-        drawTabEdgeFade(dl, tabsR, y0, y0 + barH, fadeW, /*fromRight=*/true, surf);
+        drawTabEdgeFade(dl, tabsR, y0, y0 + barH, fadeW, /*fromRight=*/true, surf, bandRdp);
     dl->PopClipRect();
 
     // Reserved-slot overflow chips — never over a tab title.

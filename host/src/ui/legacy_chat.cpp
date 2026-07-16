@@ -4,8 +4,9 @@
 // ~12dp margins (geometry from ui::viewportBackdrop(); invisible left-edge drag zone to resize;
 // the docked task-pane layout is gone — this is the only layout). Top-down: a slim header (logo
 // + status + Sessions + settings gear), the conversation log with a per-turn transparent activity
-// timeline (what the AI is doing / thinking, expandable), and a bottom composer (Design/Edit/Ask
-// dropdown + context meter; transparent prompt with an in-box send button; model/thinking toolbar).
+// timeline (what the AI is doing / thinking, expandable), and a bottom composer (compact Design/
+// Edit/Ask dropdown + context meter; transparent prompt with in-box send; equal-width segmented
+// model/thinking/paperclip/cube/New toolbar).
 // Header gear swaps the chat area for a compact AI-settings overlay (horizontal top tabs for
 // Agents/Prompts/Skills/Permissions/Accounts). The full form lives in the Settings modal AI tab.
 // Bubbles/cards (user prompt, prose, thinking, action, plan, error) and the composer are painted
@@ -5420,22 +5421,23 @@ static void drawComposerPrelude(AppState& st, bool /*busy*/) {
     const bool hasDoc = st.docMirror.hasDoc();
     const ui::AdaptiveSurface& surf = chatSurf();
 
-    // Vertically center combo label + items via symmetric FramePadding.
-    const float comboH = ImGui::GetFrameHeight();
-    const float padY = ImMax(2.0f * sc, (comboH - ImGui::GetFontSize()) * 0.5f);
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f * sc, padY));
+    // Compact frame height matching the toolbar chips (model / thinking / New).
+    // Arrow button uses ImGuiCol_Button — keep it identical to FrameBg so the caret
+    // well is not shaded differently from the combo body.
+    const ImVec4 frameBg(
+        surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.08f);
+    const ImVec4 frameHov(
+        surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.12f);
+    const ImVec4 frameAct(
+        surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.16f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f * sc, 3.0f * sc));
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, ui::metrics::rounding(6.0f));
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-        ImVec4(pal.buttonHovered[0], pal.buttonHovered[1], pal.buttonHovered[2], 0.55f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive,
-        ImVec4(pal.buttonActive[0], pal.buttonActive[1], pal.buttonActive[2], 0.60f));
-    ImGui::PushStyleColor(ImGuiCol_FrameBg,
-        ImVec4(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.08f));
-    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered,
-        ImVec4(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.12f));
-    ImGui::PushStyleColor(ImGuiCol_FrameBgActive,
-        ImVec4(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.16f));
+    ImGui::PushStyleColor(ImGuiCol_Button, frameBg);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, frameHov);
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, frameAct);
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, frameBg);
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, frameHov);
+    ImGui::PushStyleColor(ImGuiCol_FrameBgActive, frameAct);
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
     ImGui::PushStyleColor(ImGuiCol_PopupBg,
         ImVec4(pal.popupBg[0], pal.popupBg[1], pal.popupBg[2], pal.popupBg[3]));
@@ -5450,7 +5452,7 @@ static void drawComposerPrelude(AppState& st, bool /*busy*/) {
     float modeW = 0.0f;
     for (const char* m : modes)
         modeW = ImMax(modeW, ImGui::CalcTextSize(m).x);
-    modeW += ImGui::GetFrameHeight() + 16.0f * sc;  // caret + padding
+    modeW += ImGui::GetFrameHeight() + 12.0f * sc;  // caret + compact padding
     ImGui::SetNextItemWidth(modeW);
     if (ImGui::BeginCombo("##aimode", modes[mode], ImGuiComboFlags_HeightSmall)) {
         for (int i = 0; i < 3; ++i) {
@@ -5480,7 +5482,7 @@ static void drawComposerPrelude(AppState& st, bool /*busy*/) {
 
     ImGui::PopStyleColor(8);
     ImGui::PopStyleVar(2);
-    ImGui::Dummy(ImVec2(0, ui::metrics::U(0.5f)));
+    // Tight gap to the prompt — prelude sits closer to the input box.
 }
 
 // ============================ Subscription usage box (copilot) ============================
@@ -5693,46 +5695,49 @@ static void drawCopilotUsageBox(AppState& st) {
 }
 
 }  // namespace
-
-// Toolbar row below the prompt: [model][thinking] ........ [paperclip][context-cube][new].
-// Left group left-aligned, right group right-aligned, expanding spacer between (no dead gap).
-// The send/stop control moved INSIDE the input box (drawComposerSendStop).
+// Toolbar row below the prompt: [model | thinking | paperclip | context-cube | New]
+// Even end-to-end distribution with overlapping rounded corners (connected segmented look).
+// The send/stop control lives inside the input box (drawComposerSendStop).
 static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
     const ui::AdaptiveSurface& surf = chatSurf();
 
     ImVec2 rowMin = ImGui::GetCursorScreenPos();
-    const float rowH = ImGui::GetFrameHeight() + 4 * sc;
     const float availW = ImGui::GetContentRegionAvail().x;
-    ImVec2 rowMax(rowMin.x + availW, rowMin.y + rowH);
     ImDrawList* bgDl = ImGui::GetWindowDrawList();
     if (embedded) {
         // Hairline divider from the surface's own ink so it reads on any backdrop.
         bgDl->AddLine(ImVec2(rowMin.x + 8.0f * sc, rowMin.y),
-                      ImVec2(rowMax.x - 8.0f * sc, rowMin.y),
+                      ImVec2(rowMin.x + availW - 8.0f * sc, rowMin.y),
                       ImGui::ColorConvertFloat4ToU32(ImVec4(surf.textTertiary.x,
                           surf.textTertiary.y, surf.textTertiary.z, 0.40f)),
                       ui::metrics::stroke(1.0f));
     } else {
-        ui::glassPanel(bgDl, ImRect(rowMin, rowMax), ui::GlassLevel::Thin, 4.0f, surf);
+        const float rowH = ImGui::GetFrameHeight() + 4 * sc;
+        ui::glassPanel(bgDl, ImRect(rowMin, ImVec2(rowMin.x + availW, rowMin.y + rowH)),
+                       ui::GlassLevel::Thin, 4.0f, surf);
     }
 
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8 * sc, 4 * sc));
-    // Even chip gaps on this row (the composer stack zeroes ItemSpacing.y; keep that).
-    const float gap = ui::metrics::U(1.5f);
+    // Compact chip height matches the Design combo above.
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6 * sc, 3 * sc));
+    // Negative spacing so adjacent rounded chips overlap into a segmented strip.
+    const float overlap = -2.0f * sc;
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
-                        ImVec2(gap, ImGui::GetStyle().ItemSpacing.y));
-    // Translucent chips over the glass composer (opaque fills fought the adaptive text).
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-        ImVec4(pal.buttonHovered[0], pal.buttonHovered[1], pal.buttonHovered[2], 0.55f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive,
-        ImVec4(pal.buttonActive[0], pal.buttonActive[1], pal.buttonActive[2], 0.60f));
+                        ImVec2(overlap, ImGui::GetStyle().ItemSpacing.y));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, ui::metrics::rounding(6.0f));
+    // Shared translucent chip fill (opaque fills fought the adaptive text).
+    const ImVec4 chipBg(0, 0, 0, 0);
+    const ImVec4 chipHov(
+        pal.buttonHovered[0], pal.buttonHovered[1], pal.buttonHovered[2], 0.55f);
+    const ImVec4 chipAct(
+        pal.buttonActive[0], pal.buttonActive[1], pal.buttonActive[2], 0.60f);
+    ImGui::PushStyleColor(ImGuiCol_Button, chipBg);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, chipHov);
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, chipAct);
 
-    // Thinking effort — ALWAYS present (it used to vanish for models without a native effort
-    // control and on narrow rows). Models without options get a generic Low/Medium/High set;
-    // s.reasoningEffort rides every agent RPC whenever non-empty (agentProviderOverride).
+    // Thinking effort — ALWAYS present. Show just the level (no "Thinking: " prefix)
+    // so the model label has room to extend left.
     Settings& s = st.settings;
     const char* effLabels[8] = {};
     const char* effValues[8] = {};
@@ -5746,24 +5751,22 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
     int effIdx = -1;
     for (int i = 0; i < nEff; ++i)
         if (std::strcmp(s.reasoningEffort, effValues[i]) == 0) effIdx = i;
-    char effBtn[48];
-    std::snprintf(effBtn, sizeof(effBtn), "Thinking: %s",
-                  effIdx >= 0 ? effLabels[effIdx] : "Default");
+    const char* effBtn = effIdx >= 0 ? effLabels[effIdx] : "Default";
 
-    // Right-group width: paperclip + context-cube + new (icon buttons + text new).
-    // Left group (model, thinking) ellipsizes the model label first when the row is tight.
-    const ImGuiStyle& style = ImGui::GetStyle();
-    const float padX2  = style.FramePadding.x * 2.0f;
-    const float iconSz = ImGui::GetFrameHeight();
-    const float newW   = ImGui::CalcTextSize("New").x + padX2;
-    const float rightW = iconSz + gap + iconSz + gap + newW;
-    const float effW   = ImGui::CalcTextSize(effBtn).x + padX2;
+    // Five segments fill the row edge-to-edge with equal widths.
+    // Overlapping corners: each segment is slightly wider so rounded ends stack.
+    const int nSeg = 5;
+    const float segH = ImGui::GetFrameHeight();
+    const float iconSz = segH;
+    // Total overlap across (nSeg-1) joins is absorbed into equal segment widths.
+    const float join = -overlap;  // positive join thickness per boundary
+    const float segW = (availW + join * (float)(nSeg - 1)) / (float)nSeg;
 
     char modelLabel[160];
     composerModelLabel(st.settings, modelLabel, sizeof(modelLabel));
     {
-        const float maxModelW =
-            availW - rightW - effW - 2.0f * gap - padX2 - ui::metrics::U(2);
+        // Ellipsize model text to fit inside its equal segment.
+        const float maxModelW = segW - ImGui::GetStyle().FramePadding.x * 2.0f;
         if (maxModelW > 0.0f && ImGui::CalcTextSize(modelLabel).x > maxModelW) {
             const float dotsW = ImGui::CalcTextSize("...").x;
             size_t len = std::strlen(modelLabel);
@@ -5776,15 +5779,16 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
         }
     }
 
-    // ---- LEFT group: model + thinking ----
+    // ---- 1/5 model ----
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
-    if (ImGui::Button(modelLabel)) ImGui::OpenPopup("##modeldropdown");
+    if (ImGui::Button(modelLabel, ImVec2(segW, segH))) ImGui::OpenPopup("##modeldropdown");
     ImGui::PopStyleColor();
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Model — click to search and switch.");
 
+    // ---- 2/5 thinking effort (level only) ----
     ImGui::SameLine();
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
-    if (ImGui::Button(effBtn)) ImGui::OpenPopup("##cmpeffort");
+    if (ImGui::Button(effBtn, ImVec2(segW, segH))) ImGui::OpenPopup("##cmpeffort");
     ImGui::PopStyleColor();
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Thinking effort for the selected model.");
@@ -5798,19 +5802,10 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
         ImGui::EndPopup();
     }
 
-    // ---- Expanding spacer then RIGHT group: paperclip | context-cube | New ----
-    // Anchor the right cluster at the row's trailing edge so the toolbar fills the width.
+    // ---- 3/5 paperclip ----
+    ImGui::SameLine();
     {
-        const float rightStart = ImGui::GetContentRegionMax().x - rightW;
-        if (rightStart > ImGui::GetCursorPosX() + gap)
-            ImGui::SameLine(rightStart);
-        else
-            ImGui::SameLine();
-    }
-
-    // Paperclip — attach files (M23). Uses remade atlas glyph when available.
-    {
-        if (ImGui::Button("##attach", ImVec2(iconSz, iconSz))) {
+        if (ImGui::Button("##attach", ImVec2(segW, segH))) {
             if (std::getenv("AI_CAD_NO_FILE_DIALOGS")) {
                 st.toast(ui::ToastLevel::Info,
                          "File dialogs are disabled (AI_CAD_NO_FILE_DIALOGS).");
@@ -5857,7 +5852,7 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
         }
     }
 
-    // Context-cube — arm/disarm entity pick into pendingContextRefs (Wave4).
+    // ---- 4/5 context-cube ----
     ImGui::SameLine();
     {
         const bool armed = st.contextPickActive;
@@ -5870,7 +5865,7 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
             ImGui::PushStyleColor(ImGuiCol_ButtonActive,
                 ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 0.50f));
         }
-        if (ImGui::Button("##ctxcube", ImVec2(iconSz, iconSz))) {
+        if (ImGui::Button("##ctxcube", ImVec2(segW, segH))) {
             st.contextPickActive = !st.contextPickActive;
         }
         if (armed) ImGui::PopStyleColor(3);
@@ -5884,7 +5879,6 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
             const ImVec2 cmn = ImGui::GetItemRectMin(), cmx = ImGui::GetItemRectMax();
             const ImVec2 cc((cmn.x + cmx.x) * 0.5f, (cmn.y + cmx.y) * 0.5f);
             const float isz = iconSz * 0.55f;
-            // Black outline lines on transparent bg — use primary ink so light theme stays readable.
             const ImU32 ink = ImGui::ColorConvertFloat4ToU32(surf.textPrimary);
             IconUV cube = ui::getIcon("context_cube", 20);
             if (cube.valid) {
@@ -5919,12 +5913,12 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
         }
     }
 
-    // New session — compact text button, rightmost.
+    // ---- 5/5 New session — same height as the other segments ----
     ImGui::SameLine();
     {
         if (busy) ImGui::BeginDisabled();
         ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
-        if (ImGui::Button("New", ImVec2(newW, iconSz))) {
+        if (ImGui::Button("New", ImVec2(segW, segH))) {
             newConversation(st);
             st.prompt[0] = 0;
             st.pendingAttachments.clear();
@@ -5939,7 +5933,7 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
     }
 
     ImGui::PopStyleColor(3);   // button base / hovered / active
-    ImGui::PopStyleVar(2);     // FramePadding + row ItemSpacing
+    ImGui::PopStyleVar(3);     // FramePadding + ItemSpacing + FrameRounding
 
     // Clamp the dropdown to the Copilot column's width (minus a small inset) so a narrow column
     // never overhangs the pinned bubble; 300dp stays the cap for wide columns.
@@ -6001,8 +5995,10 @@ static void drawComposerSendStop(AppState& st, const ImVec2& inMin, const ImVec2
     const float sc = ui::uiScale;
     const float sz = ImGui::GetFrameHeight();
     const float inset = 6.0f * sc;   // clear of the composer's rounded border
-    // Bottom-right anchor; a short (one-row) input centers the button vertically instead.
-    float y0 = inMax.y - sz;
+    // Bottom-right anchor, nudged slightly lower so the control sits deeper in the box.
+    // A short (one-row) input still centers the button vertically.
+    const float drop = 3.0f * sc;
+    float y0 = inMax.y - sz + drop;
     if (y0 < inMin.y) y0 = (inMin.y + inMax.y - sz) * 0.5f;
     const ImVec2 bMin(rightEdgeX - inset - sz, y0);
     const ImVec2 bMax(bMin.x + sz, bMin.y + sz);
@@ -6234,8 +6230,8 @@ static void drawComposer(AppState& st, bool busy, bool canRun) {
     ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(0, 0, 0, 0));
     ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 0.0f);
-    // Symmetric glass padding: match the toolbar's bottom breathing room above the input.
-    ImGui::Dummy(ImVec2(0, ui::metrics::U(1)));
+    // Minimal top pad so the Design dropdown + context meter sit close to the input.
+    ImGui::Dummy(ImVec2(0, ui::metrics::U(0.25f)));
     // Reserve the in-box send button's footprint on the input's right so text never runs under it.
     const float sendSz    = ImGui::GetFrameHeight();
     const float sendInset = 6.0f * ui::uiScale;
@@ -6248,7 +6244,7 @@ static void drawComposer(AppState& st, bool busy, bool canRun) {
     drawComposerSendStop(st, ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
                          composerMin.x + composerW, canRun, canStart, active, submit, stopReq);
 
-    drawCopilotUsageBox(st);
+    // No usage/provider id strip above the toolbar — model lives in the toolbar chip.
     drawComposerToolbar(st, busy, true);
     ImGui::PopStyleVar();
 

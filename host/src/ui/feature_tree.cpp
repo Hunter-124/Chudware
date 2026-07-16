@@ -1772,6 +1772,33 @@ static std::string importDisplayName(const nlohmann::json& f) {
     }
     return n.empty() ? std::string("Imported Part") : n;
 }
+// Canonical group key for shared-source instance grouping (assembly components use the
+// same idea; multi-body import features group here). Empty path => no grouping.
+static std::string sourcePathGroupKey(const std::string& absPath) {
+    if (absPath.empty()) return {};
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::path want = fs::weakly_canonical(fs::path(absPath), ec);
+    if (ec) want = fs::path(absPath).lexically_normal();
+    return want.string();
+}
+// Strip a trailing "_123" instance counter so "Wheel_1"/"Wheel_2" share "Wheel".
+static std::string stripTrailingInstanceCounter(std::string name) {
+    if (name.size() < 3) return name;
+    size_t i = name.size();
+    while (i > 0 && name[i - 1] >= '0' && name[i - 1] <= '9') --i;
+    if (i > 0 && i < name.size() && name[i - 1] == '_' && i >= 2)
+        return name.substr(0, i - 1);
+    return name;
+}
+// Shared part name for a multi-import group folder (no per-instance counter).
+static std::string importSharedDisplayName(const nlohmann::json& f) {
+    std::string orig = featureParamString(f, "original_name");
+    if (!orig.empty()) return stripTrailingInstanceCounter(orig);
+    std::string n = jfld(f, "name");
+    if (n.empty()) n = "Imported Part";
+    return stripTrailingInstanceCounter(n);
+}
 // True when this transform merely places/copies an import body (absorbed under the import row).
 static bool isImportPlacementTransform(
     const nlohmann::json& f,
@@ -4075,6 +4102,60 @@ void drawFeatureTreeBody(AppState& st,
                         // Still expand so Material / File / source status is reachable.
                         return !abs.empty();
                     };
+                    // Wave 6: group import features that share the same resolved source_path
+                    // under one collapsible folder "<PartName> xN" (count >= 2 only). Key =
+                    // weakly_canonical(import.params.source_path); empty path stays singleton.
+                    // Followers of a multi-instance group are skipped in the flat walk and
+                    // rendered under the leader's folder so the shared name is not repeated.
+                    struct ImportSrcGroup {
+                        std::string key;
+                        std::string absPath;
+                        std::string sharedName;
+                        std::vector<const nlohmann::json*> members;  // first-seen order
+                    };
+                    std::vector<ImportSrcGroup> importSrcGroups;
+                    std::unordered_map<std::string, size_t> importSrcGroupIndex;  // key -> groups idx
+                    std::unordered_set<std::string> importGroupFollowers;  // non-leader import fids
+                    std::unordered_map<std::string, std::string> importInstanceLabel;  // fid -> label
+                    std::unordered_map<std::string, size_t> importGroupLeaderIdx;  // leader fid -> groups idx
+                    for (const auto& f : *feat) {
+                        if (!f.is_object() || jfld(f, "type") != "import") continue;
+                        const std::string id = jfld(f, "id");
+                        if (id.empty()) continue;
+                        const std::string abs = importFeatureSourceAbs(f);
+                        const std::string key = sourcePathGroupKey(abs);
+                        if (key.empty()) continue;  // unresolved → never group
+                        auto it = importSrcGroupIndex.find(key);
+                        if (it == importSrcGroupIndex.end()) {
+                            importSrcGroupIndex[key] = importSrcGroups.size();
+                            ImportSrcGroup g;
+                            g.key = key;
+                            g.absPath = abs;
+                            g.sharedName = importSharedDisplayName(f);
+                            g.members.push_back(&f);
+                            importSrcGroups.push_back(std::move(g));
+                        } else {
+                            importSrcGroups[it->second].members.push_back(&f);
+                        }
+                    }
+                    for (size_t gi = 0; gi < importSrcGroups.size(); ++gi) {
+                        ImportSrcGroup& g = importSrcGroups[gi];
+                        if (g.members.size() < 2) continue;  // singleton stays a normal row
+                        for (size_t mi = 0; mi < g.members.size(); ++mi) {
+                            const nlohmann::json* mf = g.members[mi];
+                            if (!mf) continue;
+                            const std::string mid = jfld(*mf, "id");
+                            if (mid.empty()) continue;
+                            // Instance label: shared name + <k> (1-based) — folder owns the base name.
+                            importInstanceLabel[mid] =
+                                g.sharedName + " <" + std::to_string(mi + 1) + ">";
+                            if (mi == 0)
+                                importGroupLeaderIdx[mid] = gi;
+                            else
+                                importGroupFollowers.insert(mid);
+                        }
+                    }
+
 
 
                     // Reorder op: drop draggedId before beforeId. A "@after:<id>" sentinel means drop
@@ -4123,7 +4204,12 @@ void drawFeatureTreeBody(AppState& st,
                         // W2-ref: axes live under References only — skip in Features history.
                         if (ftype == "axis" || ftype == "datum_axis") return true;
                         // Item 9: show the component/part name, not Place_* or a raw instance id.
-                        if (ftype == "import") fname = importDisplayName(f);
+                        // Multi-source groups use "Name <k>" so the folder owns the base name.
+                        if (ftype == "import") {
+                            auto il = importInstanceLabel.find(fid);
+                            fname = (il != importInstanceLabel.end()) ? il->second
+                                                                      : importDisplayName(f);
+                        }
                         if (fname.empty()) fname = ftype + "·" + fid;  // C37-E: stable fid, not index
                         if (s_fmFilter[0] && !fm_icontains(fname.c_str(), s_fmFilter) &&
                             !fm_icontains(ftype.c_str(), s_fmFilter))
@@ -4386,6 +4472,38 @@ void drawFeatureTreeBody(AppState& st,
                     // ---- walk the feature list ----
                     std::string openFolder;
                     bool folderOpen = false;
+
+                    // Expand one import row: nested source history + absorbed Place_* transforms.
+                    auto expandImportRow = [&](const nlohmann::json& imp, bool rowIsOpen) {
+                        if (!rowIsOpen) return;
+                        const std::string impId = jfld(imp, "id");
+                        const std::string absPath = importFeatureSourceAbs(imp);
+                        if (!absPath.empty()) {
+                            const ui::NestedDocument& nestedDoc =
+                                ui::featureTreeNestedDocument(absPath);
+                            std::unordered_set<std::string> pathStack;
+                            pathStack.insert(absPath);
+                            // Reuse the assembly nested renderer: material/file info +
+                            // feature history when the source is a native .step+ with
+                            // document.json. Dumb STEP/mesh imports show the info row +
+                            // "no editable feature history" (NestedDocumentState::External).
+                            drawNestedDocumentContents(st, "import_" + impId, impId, absPath,
+                                                       nestedDoc, pathStack, 0);
+                        } else {
+                            ImGui::PushStyleColor(ImGuiCol_Text,
+                                ImVec4(pal.textDim[0], pal.textDim[1],
+                                       pal.textDim[2], 0.72f));
+                            ImGui::TextUnformatted("  (no source path on import)");
+                            ImGui::PopStyleColor();
+                        }
+                        auto places = placeChildrenOf.find(impId);
+                        if (places != placeChildrenOf.end()) {
+                            for (const nlohmann::json* pf : places->second) {
+                                if (pf) drawOneRow(*pf, /*nested=*/true);
+                            }
+                        }
+                    };
+
                     for (int i = 0; i < (int)feat->size(); ++i) {
                         const auto& f = (*feat)[i];
                         if (!f.is_object()) continue;
@@ -4397,6 +4515,9 @@ void drawFeatureTreeBody(AppState& st,
                         if (ftype == "sketch" && isNestedSketch(fid)) continue;
                         // Item 9: Place_*/import-placement transforms nest under their import body.
                         if (nestedPlacementIds.count(fid)) continue;
+                        // Wave 6: non-leader members of a multi-import source group render under
+                        // the leader's folder (not as siblings that re-state the same part name).
+                        if (importGroupFollowers.count(fid)) continue;
 
                         // Folder grouping (C37-E item 2: ImGui id from the folder NAME, stable across
                         // reorders, not a per-frame counter).
@@ -4432,6 +4553,72 @@ void drawFeatureTreeBody(AppState& st,
                         }
                         if (!openFolder.empty() && !folderOpen) continue;
 
+
+                        // Wave 6 multi-import source group: one folder "<Name> xN" wrapping every
+                        // instance that shares the same resolved source_path. Open Part on the
+                        // folder targets the shared source; each instance keeps its own row/menu.
+                        auto leaderIt = importGroupLeaderIdx.find(fid);
+                        if (leaderIt != importGroupLeaderIdx.end() &&
+                            leaderIt->second < importSrcGroups.size()) {
+                            const ImportSrcGroup& g = importSrcGroups[leaderIt->second];
+                            const std::string folderLabel =
+                                g.sharedName + " x" + std::to_string(g.members.size());
+                            const std::string folderId = "impgrp_" + g.key;
+
+                            FmRowRect grpRect = fmRowPill();
+                            treeIcon("body_folder", "[F]", 16.0f);
+                            ImGui::SameLine(0, 4 * ui::uiScale);
+                            const bool groupOpen = ImGui::TreeNodeEx(
+                                (folderLabel + "##" + folderId).c_str(),
+                                ImGuiTreeNodeFlags_SpanFullWidth |
+                                ImGuiTreeNodeFlags_FramePadding |
+                                ImGuiTreeNodeFlags_OpenOnArrow |
+                                ImGuiTreeNodeFlags_DefaultOpen);
+                            // Folder context: Open Part once for the shared source file.
+                            pushTreePopupGlass();
+                            if (ImGui::BeginPopupContextItem(("##igctx_" + folderId).c_str())) {
+                                const bool canOpen = !g.absPath.empty();
+                                if (!canOpen) ImGui::BeginDisabled();
+                                if (ImGui::MenuItem("Open Part"))
+                                    openComponentPart(st, g.absPath);
+                                if (!canOpen) ImGui::EndDisabled();
+                                ImGui::EndPopup();
+                            }
+                            popTreePopupGlass();
+                            if (ImGui::IsItemHovered() && !g.absPath.empty())
+                                ImGui::SetTooltip("%s", g.absPath.c_str());
+                            // Double-click folder → open the shared part (same as Open Part).
+                            if (ImGui::IsItemHovered() &&
+                                ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) &&
+                                !g.absPath.empty())
+                                openComponentPart(st, g.absPath);
+                            fmRowPillEnd(grpRect);
+
+                            if (groupOpen) {
+                                for (const nlohmann::json* mf : g.members) {
+                                    if (!mf) continue;
+                                    const std::string mfid = jfld(*mf, "id");
+                                    const bool rowOpen = drawOneRow(*mf, /*nested=*/false);
+                                    // Nested-sketch children under this instance (rare on imports).
+                                    auto kids = childrenOf.find(mfid);
+                                    if (rowOpen && kids != childrenOf.end()) {
+                                        for (const auto& skId : kids->second) {
+                                            for (const auto& sf : *feat)
+                                                if (sf.is_object() && jfld(sf, "id") == skId) {
+                                                    drawOneRow(sf, /*nested=*/true);
+                                                    break;
+                                                }
+                                        }
+                                    }
+                                    expandImportRow(*mf, rowOpen);
+                                    if (!barFid.empty() && mfid == barFid)
+                                        drawRollbackBarLine(st, canDocTree, barFid);
+                                }
+                                ImGui::TreePop();
+                            }
+                            continue;
+                        }
+
                         const bool rowOpen = drawOneRow(f, /*nested=*/false);
 
                         // Nested-sketch children: render absorbed sketches indented under this row,
@@ -4448,33 +4635,8 @@ void drawFeatureTreeBody(AppState& st,
                         }
 
                         // Item 9: expand imported component → source history + placement transforms.
-                        if (rowOpen && ftype == "import") {
-                            const std::string absPath = importFeatureSourceAbs(f);
-                            if (!absPath.empty()) {
-                                const ui::NestedDocument& nestedDoc =
-                                    ui::featureTreeNestedDocument(absPath);
-                                std::unordered_set<std::string> pathStack;
-                                pathStack.insert(absPath);
-                                // Reuse the assembly nested renderer: material/file info +
-                                // feature history when the source is a native .step+ with
-                                // document.json. Dumb STEP/mesh imports show the info row +
-                                // "no editable feature history" (NestedDocumentState::External).
-                                drawNestedDocumentContents(st, "import_" + fid, fid, absPath,
-                                                           nestedDoc, pathStack, 0);
-                            } else {
-                                ImGui::PushStyleColor(ImGuiCol_Text,
-                                    ImVec4(pal.textDim[0], pal.textDim[1],
-                                           pal.textDim[2], 0.72f));
-                                ImGui::TextUnformatted("  (no source path on import)");
-                                ImGui::PopStyleColor();
-                            }
-                            auto places = placeChildrenOf.find(fid);
-                            if (places != placeChildrenOf.end()) {
-                                for (const nlohmann::json* pf : places->second) {
-                                    if (pf) drawOneRow(*pf, /*nested=*/true);
-                                }
-                            }
-                        }
+                        if (ftype == "import")
+                            expandImportRow(f, rowOpen);
 
                         if (!barFid.empty() && fid == barFid)
                             drawRollbackBarLine(st, canDocTree, barFid);

@@ -3,8 +3,9 @@
 // (logo + status + Sessions), conversation log with a per-turn transparent activity timeline
 // (what the AI is doing / thinking, expandable) whose cards are translucent adaptive glass
 // bubbles over the live viewport backdrop (GlassGroup::Copilot, host contract H5), and a bottom
-// composer (prelude: Design/Edit/Ask dropdown + context meter; transparent prompt; toolbar:
-// model + thinking | paperclip + context-cube + New) painted over the same glass surface. The AI
+// composer (prelude: compact Design/Edit/Ask dropdown + context meter; transparent prompt with
+// in-box send; segmented toolbar: model + thinking | paperclip + context-cube + New, equal-width
+// overlapping chips) painted over the same glass surface. The AI
 // settings live in an inline view inside the column (opened by the header Settings control).
 #pragma once
 

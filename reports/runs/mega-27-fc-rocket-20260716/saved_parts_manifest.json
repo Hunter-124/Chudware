@@ -1,0 +1,121 @@
+{
+  "schema": "aicad.saved_parts/1",
+  "run_id": "mega-27-fc-rocket-20260716",
+  "status": "done",
+  "stop_reason": "mission_complete",
+  "saved": [
+    {
+      "doc_id": "doc-cpp00000001",
+      "name": "rocket_plane_airframe",
+      "origin_kind": "mcp",
+      "paths": [
+        "/home/hunter/Repositories/CAD/reports/runs/mega-27-fc-rocket-20260716/parts/rocket_plane_airframe_-cpp00000001.step+",
+        "/home/hunter/Documents/AI-CAD/rocket_plane_airframe_-cpp00000001.step+"
+      ],
+      "bytes": [
+        122871,
+        122871
+      ]
+    },
+    {
+      "doc_id": "doc-cpp00000005",
+      "name": "boost_glide_airframe",
+      "origin_kind": "mcp",
+      "paths": [
+        "/home/hunter/Repositories/CAD/reports/runs/mega-27-fc-rocket-20260716/parts/boost_glide_airframe_-cpp00000005.step+",
+        "/home/hunter/Documents/AI-CAD/boost_glide_airframe_-cpp00000005.step+"
+      ],
+      "bytes": [
+        24719,
+        24719
+      ]
+    },
+    {
+      "doc_id": "doc-cpp0000000e",
+      "name": "rocket_plane_airframe2",
+      "origin_kind": "mcp",
+      "paths": [
+        "/home/hunter/Repositories/CAD/reports/runs/mega-27-fc-rocket-20260716/parts/rocket_plane_airframe2_-cpp0000000e.step+",
+        "/home/hunter/Documents/AI-CAD/rocket_plane_airframe2_-cpp0000000e.step+"
+      ],
+      "bytes": [
+        68160,
+        68160
+      ]
+    },
+    {
+      "doc_id": "doc-cpp00000012",
+      "name": "rocket_plane_airframe3",
+      "origin_kind": "mcp",
+      "paths": [
+        "/home/hunter/Repositories/CAD/reports/runs/mega-27-fc-rocket-20260716/parts/rocket_plane_airframe3_-cpp00000012.step+",
+        "/home/hunter/Documents/AI-CAD/rocket_plane_airframe3_-cpp00000012.step+"
+      ],
+      "bytes": [
+        117524,
+        117524
+      ]
+    }
+  ],
+  "closed": [
+    {
+      "doc_id": "doc-cpp00000001",
+      "closed": true,
+      "detached": false
+    },
+    {
+      "doc_id": "doc-cpp00000005",
+      "closed": true,
+      "detached": false
+    },
+    {
+      "doc_id": "doc-cpp0000000e",
+      "closed": true,
+      "detached": false
+    },
+    {
+      "doc_id": "doc-cpp00000012",
+      "closed": true,
+      "detached": false
+    }
+  ],
+  "skipped": [
+    {
+      "doc_id": "362b53f881f4",
+      "reason": "save_failed",
+      "name": "flight_computer",
+      "errors": [
+        "save artifact 362b53f881f4: no such document: 362b53f881f4",
+        "save workspace 362b53f881f4: no such document: 362b53f881f4"
+      ]
+    },
+    {
+      "doc_id": "63574f13004d",
+      "reason": "save_failed",
+      "name": null,
+      "errors": [
+        "save artifact 63574f13004d: no such document: 63574f13004d",
+        "save workspace 63574f13004d: no such document: 63574f13004d"
+      ]
+    },
+    {
+      "doc_id": "6411541845e3",
+      "reason": "save_failed",
+      "name": null,
+      "errors": [
+        "save artifact 6411541845e3: no such document: 6411541845e3",
+        "save workspace 6411541845e3: no such document: 6411541845e3"
+      ]
+    }
+  ],
+  "errors": [
+    "save artifact 362b53f881f4: no such document: 362b53f881f4",
+    "save workspace 362b53f881f4: no such document: 362b53f881f4",
+    "save artifact 63574f13004d: no such document: 63574f13004d",
+    "save workspace 63574f13004d: no such document: 63574f13004d",
+    "save artifact 6411541845e3: no such document: 6411541845e3",
+    "save workspace 6411541845e3: no such document: 6411541845e3"
+  ],
+  "parts_dir": "/home/hunter/Repositories/CAD/reports/runs/mega-27-fc-rocket-20260716/parts",
+  "workspace_dir": "/home/hunter/Documents/AI-CAD"
+}

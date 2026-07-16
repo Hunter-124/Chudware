@@ -3808,6 +3808,76 @@ def _ecad_nets_ready_for_board(
     return _ecad_has_cross_wire(calls)
 
 
+def _ecad_n_placed(calls: list) -> int:
+    """Count successful schematic place_symbol calls (component count proxy)."""
+    return sum(
+        1 for c in (calls or [])
+        if c.get("ok") and c.get("tool") == "ecad_place_symbol"
+    )
+
+
+def _ecad_outline_sizing(
+    calls: list,
+    *,
+    area_mult: float = 3.0,
+    grow: float = 1.0,
+) -> dict:
+    """Compute generous board outline room for force-time board_from_schematic.
+
+    mega-27 AC4: default AUTO-OUTLINE (margin=5 around packed parts) leaves no
+    routing room for 0.2mm clearance. Size the placeable board so outline area
+    is at least ``area_mult`` × estimated component bbox area, then optionally
+    grow by ``grow`` (retry ladder uses 1.5).
+
+    Returns a dict with MCP-safe knobs + diagnostic area fields for call records
+    / C27 grade evidence (outline_area_mm2, component_bbox_area_mm2, ratio).
+    """
+    import math
+
+    n = max(1, _ecad_n_placed(calls))
+    # Per-part cell matches place.py density (~8–12 mm). Use 10 mm for a mid estimate.
+    cell = 10.0
+    cols = max(4, int(math.ceil(math.sqrt(float(n)))))
+    rows = max(3, int(math.ceil(float(n) / float(cols))))
+    # Component bbox ≈ packed footprint field (no routing margin).
+    comp_w = max(20.0, cols * cell * 0.6)
+    comp_h = max(15.0, rows * cell * 0.6)
+    component_bbox_area = float(comp_w * comp_h)
+
+    mult = max(3.0, float(area_mult or 3.0))
+    g = max(1.0, float(grow or 1.0))
+    # Base room at area_mult, floored to place defaults; THEN apply grow so the
+    # retry ladder always expands even when floors dominate small designs.
+    target_area = component_bbox_area * mult
+    aspect = comp_w / max(comp_h, 1e-6)
+    h = max(60.0, math.sqrt(target_area / max(aspect, 1e-6)))
+    w = max(80.0, h * aspect)
+    if w * h < target_area:
+        scale = math.sqrt(target_area / max(w * h, 1e-6))
+        w *= scale
+        h *= scale
+    if g > 1.0 + 1e-9:
+        # Linear size scale so area multiplies by g.
+        lin = math.sqrt(g)
+        w *= lin
+        h *= lin
+    outline_area = float(w * h)
+    ratio = outline_area / max(component_bbox_area, 1e-6)
+    # margin >=15 is an alternate C27 pass path (engine-margin equivalent).
+    outline_margin = max(15.0, 5.0 * mult * 0.5)
+
+    return {
+        "board_size": [round(w, 1), round(h, 1)],
+        "outline_margin": round(outline_margin, 1),
+        "outline_area_mm2": round(outline_area, 2),
+        "component_bbox_area_mm2": round(component_bbox_area, 2),
+        "outline_area_ratio": round(ratio, 3),
+        "n_components": int(n),
+        "area_mult": float(mult),
+        "outline_grow": float(g),
+    }
+
+
 def _ecad_forced_tool_args(need: str, calls: list) -> dict:
     """Minimal honest args for a forced chain step (never invents success).
 
@@ -4022,6 +4092,39 @@ def _ecad_forced_tool_args(need: str, calls: list) -> dict:
         if sch_id:
             out["doc_id"] = sch_id
             out["sch_doc_id"] = sch_id
+        # mega-27 C27: explicit generous outline (>=3x component bbox area).
+        # MCP board_from_schematic now accepts board_size / outline_margin;
+        # diagnostics stay on the call record for grade axes.
+        grow = 1.0
+        if _ecad_last_drc_has_clearance(calls):
+            # Dirty post-opt DRC → outline-grow ×1.5 (retry ladder).
+            prior_grow = 1.0
+            for c in reversed(calls or []):
+                if c.get("tool") not in (
+                    "board_from_schematic", "ecad_make_board",
+                ):
+                    continue
+                args = c.get("args") if isinstance(c.get("args"), dict) else {}
+                try:
+                    prior_grow = max(
+                        prior_grow, float(args.get("outline_grow") or 1.0)
+                    )
+                except (TypeError, ValueError):
+                    pass
+                break
+            grow = max(1.5, prior_grow * 1.5)
+            out["force_outline"] = True
+            if board_id:
+                out["pcb_doc_id"] = board_id
+        sizing = _ecad_outline_sizing(calls, area_mult=3.0, grow=grow)
+        out["board_size"] = list(sizing["board_size"])
+        out["outline_margin"] = float(sizing["outline_margin"])
+        out["outline_area_mm2"] = float(sizing["outline_area_mm2"])
+        out["component_bbox_area_mm2"] = float(sizing["component_bbox_area_mm2"])
+        out["outline_area_ratio"] = float(sizing["outline_area_ratio"])
+        out["n_components"] = int(sizing["n_components"])
+        out["outline_grow"] = float(sizing["outline_grow"])
+        out["min_clearance_mm"] = 0.2
         return out
 
     if need == "ecad_run_erc":
@@ -4298,6 +4401,9 @@ def _ecad_dispatch_forced_step(
         "resolved_net", "resolved_net_source", "source_net",
         "min_clearance_mm", "clearance_retry", "skip_teardrops",
         "u1_stubbed_ideal_regulator",
+        # mega-27 diagnostics on call records (not MCP kwargs)
+        "outline_area_mm2", "component_bbox_area_mm2", "outline_area_ratio",
+        "n_components", "outline_grow", "area_mult", "pcb_doc_id",
     )
     if tool == "ecad_simulate" and isinstance(call_args, dict):
         dispatch_args = {
@@ -4318,6 +4424,17 @@ def _ecad_dispatch_forced_step(
         dispatch_args = {
             k: v for k, v in call_args.items()
             if k in ("doc_id", "pitch", "diff_pairs", "ripup_passes")
+        }
+    elif tool in ("board_from_schematic", "ecad_make_board") and isinstance(call_args, dict):
+        # mega-27: pass outline room knobs; strip pure diagnostics.
+        _keep = (
+            "doc_id", "sch_doc_id", "optimize",
+            "board_size", "outline_margin", "outline_area_scale",
+            "outline", "force_outline",
+        )
+        dispatch_args = {
+            k: v for k, v in call_args.items()
+            if k in _keep and k not in _strip_meta
         }
     try:
         _log(ledger, actor or "agent_turn", {
@@ -4509,15 +4626,75 @@ def _ecad_force_chain_cascade(
                 # Still attempt simulate if budget remains and need persists.
                 if tool_calls_made >= cascade_budget or steps >= max_steps:
                     break
-        # mega-22 Q22 + mega-25 Z25: when DRC after optimize is still dirty
-        # (chain_need returns re-optimize OR we are about to re-DRC), do one
-        # clearance-aware re-route/re-optimize + re-DRC, then honest FAIL.
+        # mega-22 Q22 + mega-25 Z25 + mega-27 C27/D27: when DRC after optimize
+        # is still dirty, one bounded clearance retry:
+        #   outline-grow (×1.5 board_from_schematic) + autoroute(pitch=0.3)
+        #   + re-opt + re-DRC, then honest FAIL if still dirty.
         _dirty_retry = (
             int(_ecad_last_drc_errors(calls) or 0) > 0
             and _ecad_drc_after_optimize(calls)
             and _ecad_optimize_retry_count(calls) < 1
         )
         if need in ("ecad_run_drc", "ecad_optimize_traces") and _dirty_retry:
+            # mega-27: grow board outline first so router has room for 0.2mm.
+            if (
+                _ecad_last_drc_has_clearance(calls)
+                and (
+                    "board_from_schematic" in allow_set
+                    or "ecad_make_board" in allow_set
+                )
+            ):
+                brd_tool = (
+                    "board_from_schematic"
+                    if "board_from_schematic" in allow_set
+                    else "ecad_make_board"
+                )
+                # Seed a prior board-size marker so _ecad_forced_tool_args grows ×1.5.
+                if not any(
+                    (c.get("args") or {}).get("outline_grow")
+                    for c in (calls or [])
+                    if c.get("tool") in ("board_from_schematic", "ecad_make_board")
+                    and isinstance(c.get("args"), dict)
+                ):
+                    # Tag last board call so grow path engages.
+                    for c in reversed(calls or []):
+                        if c.get("tool") in (
+                            "board_from_schematic", "ecad_make_board",
+                        ):
+                            args0 = c.get("args")
+                            if isinstance(args0, dict):
+                                args0.setdefault("outline_grow", 1.0)
+                            break
+                brd_args = _ecad_forced_tool_args(brd_tool, calls)
+                # Ensure grow is at least 1.5 even if no prior marker.
+                if float(brd_args.get("outline_grow") or 1.0) < 1.5:
+                    sizing = _ecad_outline_sizing(calls, area_mult=3.0, grow=1.5)
+                    brd_args["board_size"] = list(sizing["board_size"])
+                    brd_args["outline_margin"] = float(sizing["outline_margin"])
+                    brd_args["outline_area_mm2"] = float(sizing["outline_area_mm2"])
+                    brd_args["component_bbox_area_mm2"] = float(
+                        sizing["component_bbox_area_mm2"]
+                    )
+                    brd_args["outline_area_ratio"] = float(sizing["outline_area_ratio"])
+                    brd_args["outline_grow"] = 1.5
+                    brd_args["force_outline"] = True
+                calls, tool_calls_made, _brec, _bok = (
+                    _ecad_dispatch_forced_step(
+                        tool=brd_tool,
+                        args=brd_args,
+                        calls=calls,
+                        dispatch=dispatch,
+                        ledger=ledger,
+                        actor=actor,
+                        messages=messages,
+                        reason=f"{reason}:outline_grow",
+                        tool_calls_made=tool_calls_made,
+                        budget=cascade_budget,
+                    )
+                )
+                steps += 1
+                if tool_calls_made >= cascade_budget or steps >= max_steps:
+                    break
             # Prefer wider-pitch autoroute when clearance-class residual.
             if (
                 _ecad_last_drc_has_clearance(calls)

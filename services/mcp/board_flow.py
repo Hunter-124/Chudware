@@ -151,16 +151,22 @@ def _routing_snapshot(board: dict) -> list[tuple]:
     return rows
 
 
-def _ensure_outline(pcb, report: dict, warnings: list) -> None:
-    """Add a closed rectangular Edge.Cuts outline enclosing placed parts if absent.
+def _rect_outline_shapes(x0: float, y0: float, x1: float, y1: float) -> list[dict]:
+    """Closed rectangular Edge.Cuts outline as four line shapes."""
+    corners = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+    return [
+        {
+            "type": "line",
+            "p1": corners[i],
+            "p2": corners[(i + 1) % 4],
+            "layer": "Edge.Cuts",
+        }
+        for i in range(4)
+    ]
 
-    ecad_to_3d and zone fill both need a closed Edge.Cuts loop; ecad_make_board sets one
-    but the one-call board_from_schematic did not (found by the flight-computer benchmark).
-    """
-    doc = pcb.doc
-    if (doc.get("outline") or {}).get("shapes"):
-        report["steps"].append({"step": "set_outline", "ok": True, "kept": True})
-        return
+
+def _parts_bbox(doc: dict) -> tuple[float, float, float, float] | None:
+    """Bounding box of placed footprints (origins + pad offsets), or None."""
     xs: list[float] = []
     ys: list[float] = []
     for fp in doc.get("footprints", []) or []:
@@ -172,27 +178,141 @@ def _ensure_outline(pcb, report: dict, warnings: list) -> None:
         for pad in fp.get("pads", []) or []:
             off = pad.get("pos") or pad.get("at") or pad.get("offset")
             if isinstance(off, (list, tuple)) and len(off) >= 2:
-                xs.append(fx + float(off[0])); ys.append(fy + float(off[1])); added = True
+                xs.append(fx + float(off[0]))
+                ys.append(fy + float(off[1]))
+                added = True
         if not added:
-            xs.append(fx); ys.append(fy)
-    margin, min_side = 5.0, 20.0
+            xs.append(fx)
+            ys.append(fy)
     if not xs or not ys:
-        x0, y0, x1, y1 = 0.0, 0.0, min_side, min_side
+        return None
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _ensure_outline(
+    pcb,
+    report: dict,
+    warnings: list,
+    *,
+    margin: float = 5.0,
+    min_side: float = 20.0,
+    board_size: list | tuple | None = None,
+    outline: list | None = None,
+    area_scale: float = 1.0,
+    force: bool = False,
+) -> None:
+    """Add a closed rectangular Edge.Cuts outline enclosing placed parts if absent.
+
+    mega-27: tight AUTO-OUTLINE (margin=5) packs components so the router cannot
+    meet 0.2mm clearance. Honor explicit ``outline``, ``board_size``, larger
+    ``margin``, and ``area_scale`` (>=1) so force-chain can request >=3x component
+    bbox area. ``force=True`` replaces an existing outline (outline-grow retry).
+    """
+    doc = pcb.doc
+    if (doc.get("outline") or {}).get("shapes") and not force and outline is None:
+        report["steps"].append({"step": "set_outline", "ok": True, "kept": True})
+        return
+
+    x0 = y0 = x1 = y1 = 0.0
+    used = "auto"
+    if isinstance(outline, list) and len(outline) >= 3:
+        # Explicit polygon [[x,y],...] — convert to line chain.
+        shapes = []
+        for i in range(len(outline)):
+            p1 = outline[i]
+            p2 = outline[(i + 1) % len(outline)]
+            if not (isinstance(p1, (list, tuple)) and isinstance(p2, (list, tuple))):
+                continue
+            shapes.append({
+                "type": "line",
+                "p1": [float(p1[0]), float(p1[1])],
+                "p2": [float(p2[0]), float(p2[1])],
+                "layer": "Edge.Cuts",
+            })
+        if len(shapes) >= 3:
+            xs = [float(p[0]) for p in outline if isinstance(p, (list, tuple)) and len(p) >= 2]
+            ys = [float(p[1]) for p in outline if isinstance(p, (list, tuple)) and len(p) >= 2]
+            x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
+            used = "explicit"
+            try:
+                ecad_session.apply_ops(
+                    pcb, pcb.revision,
+                    [{"op": "pcb_set_outline", "shapes": shapes, "closed": True}])
+                outline_area = max(0.0, (x1 - x0) * (y1 - y0))
+                report["steps"].append({
+                    "step": "set_outline", "ok": True, "used": used,
+                    "size_mm": [round(x1 - x0, 1), round(y1 - y0, 1)],
+                    "outline_area_mm2": round(outline_area, 2),
+                })
+                report["outline_area_mm2"] = round(outline_area, 2)
+                report["outline_size_mm"] = [round(x1 - x0, 1), round(y1 - y0, 1)]
+            except Exception as e:  # noqa: BLE001
+                report["steps"].append({
+                    "step": "set_outline", "ok": False,
+                    "error": f"{type(e).__name__}: {e}",
+                })
+                warnings.append(f"set_outline failed: {type(e).__name__}: {e}")
+            return
+
+    if board_size is not None and len(board_size) >= 2:
+        w = max(float(board_size[0]), float(min_side))
+        h = max(float(board_size[1]), float(min_side))
+        ox, oy = doc.get("origin") or [0.0, 0.0]
+        x0, y0 = float(ox), float(oy)
+        x1, y1 = x0 + w, y0 + h
+        used = "board_size"
     else:
-        x0, y0, x1, y1 = min(xs) - margin, min(ys) - margin, max(xs) + margin, max(ys) + margin
-        if x1 - x0 < min_side:
-            cx = (x0 + x1) / 2.0; x0, x1 = cx - min_side / 2.0, cx + min_side / 2.0
-        if y1 - y0 < min_side:
-            cy = (y0 + y1) / 2.0; y0, y1 = cy - min_side / 2.0, cy + min_side / 2.0
-    corners = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
-    shapes = [{"type": "line", "p1": corners[i], "p2": corners[(i + 1) % 4],
-               "layer": "Edge.Cuts"} for i in range(4)]
+        ext = _parts_bbox(doc)
+        m = max(0.0, float(margin))
+        if ext is None:
+            x0, y0, x1, y1 = 0.0, 0.0, float(min_side), float(min_side)
+        else:
+            x0, y0, x1, y1 = ext
+            x0 -= m
+            y0 -= m
+            x1 += m
+            y1 += m
+            if x1 - x0 < min_side:
+                cx = (x0 + x1) / 2.0
+                x0, x1 = cx - min_side / 2.0, cx + min_side / 2.0
+            if y1 - y0 < min_side:
+                cy = (y0 + y1) / 2.0
+                y0, y1 = cy - min_side / 2.0, cy + min_side / 2.0
+        used = "parts+margin"
+
+    # area_scale expands about center (mega-27 outline-grow / >=3x room).
+    scale = max(1.0, float(area_scale or 1.0))
+    if scale > 1.0 + 1e-9:
+        cx = (x0 + x1) / 2.0
+        cy = (y0 + y1) / 2.0
+        hw = (x1 - x0) * (scale ** 0.5) / 2.0
+        hh = (y1 - y0) * (scale ** 0.5) / 2.0
+        x0, y0, x1, y1 = cx - hw, cy - hh, cx + hw, cy + hh
+        used = f"{used}*scale{scale:g}"
+
+    shapes = _rect_outline_shapes(x0, y0, x1, y1)
+    outline_area = max(0.0, (x1 - x0) * (y1 - y0))
+    parts = _parts_bbox(doc)
+    parts_area = 0.0
+    if parts is not None:
+        parts_area = max(0.0, (parts[2] - parts[0]) * (parts[3] - parts[1]))
     try:
         ecad_session.apply_ops(
             pcb, pcb.revision,
             [{"op": "pcb_set_outline", "shapes": shapes, "closed": True}])
-        report["steps"].append({"step": "set_outline", "ok": True,
-                                "size_mm": [round(x1 - x0, 1), round(y1 - y0, 1)]})
+        report["steps"].append({
+            "step": "set_outline",
+            "ok": True,
+            "used": used,
+            "size_mm": [round(x1 - x0, 1), round(y1 - y0, 1)],
+            "outline_area_mm2": round(outline_area, 2),
+            "component_bbox_area_mm2": round(parts_area, 2),
+            "margin_mm": float(margin),
+            "area_scale": float(scale),
+        })
+        report["outline_area_mm2"] = round(outline_area, 2)
+        report["component_bbox_area_mm2"] = round(parts_area, 2)
+        report["outline_size_mm"] = [round(x1 - x0, 1), round(y1 - y0, 1)]
     except Exception as e:  # noqa: BLE001
         report["steps"].append({"step": "set_outline", "ok": False,
                                 "error": f"{type(e).__name__}: {e}"})
@@ -226,6 +346,11 @@ def board_from_schematic(
             optimize_opts / targets: dict  # forwarded to optimize_traces
             prune: bool = False            # update_from_sch prune flag
             place_origin: [x, y]           # update_from_sch place_origin
+            board_size: [w, h]             # mega-27: placeable area + outline size (mm)
+            outline_margin: float = 5.0    # mega-27: Edge.Cuts margin beyond parts
+            outline_area_scale: float = 1  # mega-27: expand outline area about center
+            outline: [[x,y], ...]          # mega-27: explicit closed polygon outline
+            force_outline: bool = False    # mega-27: replace existing outline (grow)
 
     Returns
     -------
@@ -313,6 +438,25 @@ def board_from_schematic(
     # ---- 2. connectivity-aware placement (E1) ------------------------------
     place_opts = dict(opts.get("place_opts") or {})
     place_opts.setdefault("seed", seed)
+    # mega-27: top-level board_size also drives the placer when no outline yet.
+    if opts.get("board_size") is not None and "board_size" not in place_opts:
+        place_opts["board_size"] = opts["board_size"]
+    # Pre-seed outline BEFORE place when an explicit size/polygon is given so
+    # the placer's placeable bbox is the generous room (not the default grid).
+    _pre_outline = opts.get("outline")
+    _pre_board_size = opts.get("board_size") or place_opts.get("board_size")
+    if _pre_outline is not None or _pre_board_size is not None:
+        try:
+            _ensure_outline(
+                pcb, report, warnings,
+                margin=float(opts.get("outline_margin", 5.0) or 5.0),
+                board_size=_pre_board_size,
+                outline=_pre_outline if isinstance(_pre_outline, list) else None,
+                area_scale=float(opts.get("outline_area_scale", 1.0) or 1.0),
+                force=bool(opts.get("force_outline", False)),
+            )
+        except Exception as e:  # noqa: BLE001
+            warnings.append(f"pre_outline failed: {type(e).__name__}: {e}")
     try:
         place_result = place_mod.place_board(pcb.doc, place_opts)
         placed_doc = place_result["doc"]
@@ -352,7 +496,15 @@ def board_from_schematic(
     n_placed = len(pcb.doc.get("footprints") or [])
 
     # ---- 2b. ensure a closed Edge.Cuts outline (ecad_to_3d / fill need it) --
-    _ensure_outline(pcb, report, warnings)
+    # If pre-outline already set a generous board, keep it unless force_outline.
+    _ensure_outline(
+        pcb, report, warnings,
+        margin=float(opts.get("outline_margin", 5.0) or 5.0),
+        board_size=opts.get("board_size") or place_opts.get("board_size"),
+        outline=opts.get("outline") if isinstance(opts.get("outline"), list) else None,
+        area_scale=float(opts.get("outline_area_scale", 1.0) or 1.0),
+        force=bool(opts.get("force_outline", False)),
+    )
 
     # Count airwires after placement (ratsnest_before for the route step).
     try:
@@ -491,6 +643,10 @@ def board_from_schematic(
         "routing": _routing_snapshot(pcb.doc),
         "n_tracks": n_tracks,
         "n_footprints": n_placed,
+        # mega-27 C27: outline room evidence for AC4 grade axes
+        "outline_area_mm2": report.get("outline_area_mm2"),
+        "component_bbox_area_mm2": report.get("component_bbox_area_mm2"),
+        "outline_size_mm": report.get("outline_size_mm"),
     }
 
 

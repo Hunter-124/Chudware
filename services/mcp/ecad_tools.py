@@ -3510,7 +3510,12 @@ def register_ecad_tools(mcp) -> None:
 
     @mcp.tool()
     def board_from_schematic(sch_doc_id: str = "", optimize: bool = True,
-                             doc_id: str = "") -> str:
+                             doc_id: str = "",
+                             board_size: Optional[list] = None,
+                             outline_margin: float = 0.0,
+                             outline_area_scale: float = 0.0,
+                             outline: Optional[list] = None,
+                             force_outline: bool = False) -> str:
         """ONE-CALL schematic -> preliminary PCB: sync footprints, place (connectivity-aware),
         autoroute, then (by default) optimize traces (arc corners / teardrops / impedance).
 
@@ -3522,6 +3527,14 @@ def register_ecad_tools(mcp) -> None:
         Residual DRC violations are listed honestly in ``residual_drc`` (never hidden). Use
         ``optimize=False`` to skip the post-route polish pass. ``doc_id`` is accepted as an
         alias for ``sch_doc_id`` (same meaning as on other ecad tools).
+
+        mega-27 outline room knobs (optional; defaults keep prior AUTO-OUTLINE behaviour)::
+
+          * ``board_size`` ``[w, h]`` mm — placeable area + Edge.Cuts rectangle size
+          * ``outline_margin`` mm — Edge.Cuts pad beyond parts (default engine 5.0)
+          * ``outline_area_scale`` — expand outline area about center (>=1)
+          * ``outline`` ``[[x,y],...]`` — explicit closed polygon Edge.Cuts
+          * ``force_outline`` — replace an existing outline (outline-grow retry)
 
         Typical agent path: ecad_design / capture schematic -> ecad_simulate (gate) ->
         board_from_schematic -> ecad_run_drc / ecad_run_dfm / ecad_run_pdn / thermal checks.
@@ -3554,11 +3567,24 @@ def register_ecad_tools(mcp) -> None:
 
         _autosave_all_open_ecad()
 
+        flow_opts: dict = {
+            "optimize": bool(optimize),
+            "seed": 0,
+            "pcb_name": "Board1",
+        }
+        if board_size is not None and isinstance(board_size, (list, tuple)) and len(board_size) >= 2:
+            flow_opts["board_size"] = [float(board_size[0]), float(board_size[1])]
+        if outline_margin and float(outline_margin) > 0:
+            flow_opts["outline_margin"] = float(outline_margin)
+        if outline_area_scale and float(outline_area_scale) > 0:
+            flow_opts["outline_area_scale"] = float(outline_area_scale)
+        if outline is not None and isinstance(outline, list) and len(outline) >= 3:
+            flow_opts["outline"] = outline
+        if force_outline:
+            flow_opts["force_outline"] = True
+
         def _flow() -> dict:
-            return _bf.board_from_schematic(
-                sch_sess,
-                {"optimize": bool(optimize), "seed": 0, "pcb_name": "Board1"},
-            )
+            return _bf.board_from_schematic(sch_sess, flow_opts)
 
         status, result = _run_with_budget(_flow)
         if status == "timeout":
@@ -3640,6 +3666,13 @@ def register_ecad_tools(mcp) -> None:
             "residual_drc": residual,
             "residual_drc_lines": residual_lines,
             "drc_errors": n_err,
+            # mega-27 C27 evidence: outline room vs component bbox
+            "outline_area_mm2": result.get("outline_area_mm2") or rep.get("outline_area_mm2"),
+            "component_bbox_area_mm2": (
+                result.get("component_bbox_area_mm2")
+                or rep.get("component_bbox_area_mm2")
+            ),
+            "outline_size_mm": result.get("outline_size_mm") or rep.get("outline_size_mm"),
             "report": {
                 "ratsnest_before": rn_before,
                 "ratsnest_after": rn_after,
@@ -3649,6 +3682,12 @@ def register_ecad_tools(mcp) -> None:
                 "drc_errors": n_err,
                 "seed": rep.get("seed", 0),
                 "steps": rep.get("steps") or [],
+                "outline_area_mm2": result.get("outline_area_mm2") or rep.get("outline_area_mm2"),
+                "component_bbox_area_mm2": (
+                    result.get("component_bbox_area_mm2")
+                    or rep.get("component_bbox_area_mm2")
+                ),
+                "outline_size_mm": result.get("outline_size_mm") or rep.get("outline_size_mm"),
             },
             "warnings": list(result.get("warnings") or []) + residual_lines[:3],
             "summary": head,

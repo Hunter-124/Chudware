@@ -1,0 +1,26 @@
+{
+  "run_id": "mega-27-fc-rocket-20260716",
+  "generated_at": "2026-07-16T00:54:21Z",
+  "parts_dir": "reports/runs/mega-27-fc-rocket-20260716",
+  "files": [
+    "reports/runs/mega-27-fc-rocket-20260716/saved_parts_manifest.json",
+    "reports/runs/mega-27-fc-rocket-20260716/parts/rocket_plane_airframe_-cpp00000001.step+",
+    "reports/runs/mega-27-fc-rocket-20260716/parts/boost_glide_airframe_-cpp00000005.step+",
+    "reports/runs/mega-27-fc-rocket-20260716/parts/rocket_plane_airframe2_-cpp0000000e.step+",
+    "reports/runs/mega-27-fc-rocket-20260716/parts/rocket_plane_airframe3_-cpp00000012.step+"
+  ],
+  "n_files": 5,
+  "ledger": "reports/runs/mega-27/ledger.json",
+  "criteria": [
+    "criterion_AC1.json",
+    "criterion_AC2.json",
+    "criterion_AC3.json",
+    "criterion_AC4.json",
+    "criterion_AC5.json",
+    "criterion_AC6.json",
+    "criterion_AC7.json",
+    "criterion_AC8.json",
+    "criterion_AC9.json",
+    "criterion_BATTERY.json"
+  ]
+}

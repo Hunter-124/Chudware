@@ -454,3 +454,18 @@ graduate only on ablation evidence; C-freedom regressions are harness bugs.
   Residual: AC4 layout still sub-0.2mm after bounded retry (goal 9/9 open).
   Findings: `reports/runs/mega-26/findings.md`.
 
+
+- 2026-07-15/16 mega-27 (WS5): close FINAL AC4 residual (board routing room) under
+  `reports/runs/mega-27/` (primary a1 `mega-27-fc-rocket-20260716`).
+  Baseline `dce2e872`. Fixer27 AshamedLungfish: **C27** force-time
+  `board_size`/`outline_margin≥15` so outline area ≥3× component bbox (MCP +
+  board_flow plumb; call-record area diagnostics); **D27** clearance grow×1.5 +
+  autoroute(pitch=0.3) ladder then honest FAIL; offline FINAL_OFFLINE_OK + gate
+  **237p**. Preflight PASS: account `06dc3359`, hard→xai-sub grok-4.5, mid
+  deepseek, leaf ollama, mega27_bound. **a1** wall **654s** terminal
+  `done`/`mission_complete` live AC **8**/9 (AC1–3,5–9) — AC4 FAIL clearance×**6**
+  (was 23). **C27 PASS** (outline_area/margin evidence; ratio/margin room).
+  **D27 PASS** (errors reduced 23→6 honest FAIL). A26/B26/Y25/Z25/S23/P22/U24/
+  V24/T23/Q22/G18 PASS; battery `doc-cpp00000005` PASS. Residual: AC4 still
+  errors≠0 after room+grow (goal 9/9 open). Findings:
+  `reports/runs/mega-27/findings.md`.

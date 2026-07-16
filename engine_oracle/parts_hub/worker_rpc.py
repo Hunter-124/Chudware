@@ -123,6 +123,13 @@ try:
 except Exception:  # noqa: BLE001 — optional seam; core methods still register
     pass
 
+# Context-injection triggers (aicad.trigger/1) — GUI Context Injection tab.
+try:
+    from ..parts_hub.triggers_rpc import TRIGGERS_METHODS as _TRIGGERS_METHODS
+    WORKER_METHODS.update(_TRIGGERS_METHODS)
+except Exception:  # noqa: BLE001 — optional seam; core methods still register
+    pass
+
 # PLM lightweight branching (wave-2) — create / list / switch / merge.
 try:
     from ..parts_hub.plm_branch_rpc import PLM_BRANCH_METHODS as _PLM_BRANCH_METHODS

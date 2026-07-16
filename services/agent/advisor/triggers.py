@@ -25,12 +25,22 @@ Public API
 ----------
 - :func:`match_triggers` — evaluate all triggers against an observation turn;
   returns a list of injected ``Finding``-shaped dicts and a list of ledger events.
-- :func:`load_table` — parse ``triggers.yaml`` (cached after first call).
+- :func:`load_table` — parse shipped + user override table (cached; call
+  :func:`clear_cache` after saves).
+- :func:`list_triggers` / :func:`get_trigger` / :func:`save_trigger` /
+  :func:`delete_trigger` — GUI/RPC CRUD over the merged table (user overrides
+  never rewrite shipped ``triggers.yaml``).
+- :func:`get_pack` / :func:`save_pack` / :func:`list_packs` — context-pack
+  bodies (user packs shadow shipped packs of the same name).
 """
 from __future__ import annotations
 
-import re
+import copy
+import json
+import os
 import pathlib
+import re
+import sys
 from typing import Any, Optional
 
 _YAML_PATH = pathlib.Path(__file__).parent / "triggers.yaml"   # spec file (human-readable)
@@ -369,54 +379,280 @@ _NOMINAL_MM_RE = re.compile(
 # ---------------------------------------------------------------------------
 
 _TABLE: Optional[list[dict]] = None
+_RAW_MERGED: Optional[list[dict]] = None
+_CACHE_TRIGGERS_MTIME: float = -1.0
+_CACHE_PACKS_MTIME: float = -1.0
+
+_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_\-]{0,63}$")
+_PACK_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_\-]{0,63}$")
+
+
+def user_context_dir() -> pathlib.Path:
+    """``~/.local/share/AI-CAD/context_injection`` (Windows: %APPDATA%/AI-CAD/...).
+
+    Override with ``AICAD_CONTEXT_INJECTION_DIR`` (tests).
+    """
+    override = os.environ.get("AICAD_CONTEXT_INJECTION_DIR")
+    if override:
+        return pathlib.Path(override)
+    if sys.platform.startswith("win"):
+        base = os.environ.get("APPDATA") or os.path.expanduser(r"~\AppData\Roaming")
+    else:
+        base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    return pathlib.Path(base) / "AI-CAD" / "context_injection"
+
+
+def user_triggers_path() -> pathlib.Path:
+    return user_context_dir() / "triggers.json"
+
+
+def user_packs_dir() -> pathlib.Path:
+    return user_context_dir() / "packs"
+
+
+def clear_cache() -> None:
+    """Drop compiled + merged caches so the next load re-reads disk."""
+    global _TABLE, _RAW_MERGED, _CACHE_TRIGGERS_MTIME, _CACHE_PACKS_MTIME
+    _TABLE = None
+    _RAW_MERGED = None
+    _CACHE_TRIGGERS_MTIME = -1.0
+    _CACHE_PACKS_MTIME = -1.0
+
+
+def _path_mtime(path: pathlib.Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _packs_dir_mtime() -> float:
+    """Max mtime over the user packs dir (0 if absent)."""
+    d = user_packs_dir()
+    if not d.is_dir():
+        return 0.0
+    latest = _path_mtime(d)
+    try:
+        for p in d.iterdir():
+            try:
+                latest = max(latest, p.stat().st_mtime)
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return latest
+
+
+def _ensure_cache_fresh() -> None:
+    """Invalidate in-process caches when the GUI (or another process) wrote user data.
+
+    ``match_triggers`` runs in the agent loop process; saves land via the worker
+    RPC process. A single ``stat`` of triggers.json (+ packs dir) per call keeps
+    the two in sync without IPC.
+    """
+    global _TABLE, _RAW_MERGED, _CACHE_TRIGGERS_MTIME, _CACHE_PACKS_MTIME
+    t_mt = _path_mtime(user_triggers_path())
+    p_mt = _packs_dir_mtime()
+    if _RAW_MERGED is None:
+        _CACHE_TRIGGERS_MTIME = t_mt
+        _CACHE_PACKS_MTIME = p_mt
+        return
+    if t_mt != _CACHE_TRIGGERS_MTIME or p_mt != _CACHE_PACKS_MTIME:
+        _TABLE = None
+        _RAW_MERGED = None
+        _CACHE_TRIGGERS_MTIME = t_mt
+        _CACHE_PACKS_MTIME = p_mt
+
+
+def _deep_copy_trigger(t: dict) -> dict:
+    return copy.deepcopy(t)
+
+
+def _normalize_trigger(raw: dict) -> Optional[dict]:
+    """Return a sanitized trigger dict, or None if unusable."""
+    if not isinstance(raw, dict):
+        return None
+    tid = str(raw.get("id") or "").strip()
+    if not tid or not _ID_RE.match(tid):
+        return None
+    match = raw.get("match") if isinstance(raw.get("match"), dict) else {}
+    inject = raw.get("inject") if isinstance(raw.get("inject"), dict) else {}
+    keywords = [str(k) for k in (match.get("keywords") or []) if str(k).strip()]
+    tools = [str(t) for t in (match.get("tools") or []) if str(t).strip()]
+    events = [str(e) for e in (match.get("events") or []) if str(e).strip()]
+    prerun = inject.get("prerun_calcs") if isinstance(inject.get("prerun_calcs"), list) else []
+    pack = str(inject.get("context_pack") or "").strip()
+    exemplar = str(inject.get("exemplar") or "").strip()
+    purpose = str(raw.get("purpose") or "").strip() or exemplar
+    try:
+        budget = int(raw.get("budget_tokens", 250))
+    except (TypeError, ValueError):
+        budget = 250
+    try:
+        cooldown = int(raw.get("cooldown_turns", 8))
+    except (TypeError, ValueError):
+        cooldown = 8
+    budget = max(50, min(budget, 4000))
+    cooldown = max(0, min(cooldown, 64))
+    enabled = raw.get("enabled", True)
+    if not isinstance(enabled, bool):
+        enabled = str(enabled).strip().lower() not in ("0", "false", "no", "off")
+    return {
+        "id": tid,
+        "enabled": enabled,
+        "purpose": purpose,
+        "match": {
+            "keywords": keywords,
+            "tools": tools,
+            "events": events,
+        },
+        "inject": {
+            "context_pack": pack,
+            "prerun_calcs": copy.deepcopy(prerun),
+            "exemplar": exemplar,
+        },
+        "budget_tokens": budget,
+        "cooldown_turns": cooldown,
+    }
+
+
+def _shipped_triggers() -> list[dict]:
+    """Shipped table: triggers.yaml when parseable, else the builtin mirror."""
+    try:
+        import yaml  # type: ignore
+        data = yaml.safe_load(_YAML_PATH.read_text(encoding="utf-8"))
+        entries = data.get("triggers", []) if isinstance(data, dict) else []
+        out: list[dict] = []
+        for e in entries or []:
+            n = _normalize_trigger(e)
+            if n:
+                out.append(n)
+        if out:
+            return out
+    except Exception:  # noqa: BLE001 — fail soft to the builtin mirror
+        pass
+    out = []
+    for e in _BUILTIN_TRIGGERS:
+        n = _normalize_trigger(e)
+        if n:
+            out.append(n)
+    return out
+
+
+def _load_user_triggers() -> list[dict]:
+    path = user_triggers_path()
+    if not path.is_file():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return []
+    entries = data.get("triggers", data) if isinstance(data, dict) else data
+    if not isinstance(entries, list):
+        return []
+    out: list[dict] = []
+    for e in entries:
+        n = _normalize_trigger(e if isinstance(e, dict) else {})
+        if n:
+            out.append(n)
+    return out
+
+
+def _write_user_triggers(entries: list[dict]) -> None:
+    path = user_triggers_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema": "aicad.trigger/1",
+        "triggers": [_normalize_trigger(e) for e in entries if _normalize_trigger(e)],
+    }
+    # Drop Nones from normalize failures
+    payload["triggers"] = [t for t in payload["triggers"] if t]
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def _merge_raw_triggers() -> list[dict]:
+    """Shipped first, then user overrides by id (and user-only new ids)."""
+    shipped = {_t["id"]: _deep_copy_trigger(_t) for _t in _shipped_triggers()}
+    shipped_order = [t["id"] for t in _shipped_triggers()]
+    user = _load_user_triggers()
+    user_only: list[dict] = []
+    for u in user:
+        tid = u["id"]
+        if tid in shipped:
+            # Full replace of editable fields; keep id.
+            base = shipped[tid]
+            base.update({
+                "enabled": u.get("enabled", base.get("enabled", True)),
+                "purpose": u.get("purpose") or base.get("purpose") or "",
+                "match": u.get("match") or base.get("match") or {},
+                "inject": u.get("inject") or base.get("inject") or {},
+                "budget_tokens": u.get("budget_tokens", base.get("budget_tokens", 250)),
+                "cooldown_turns": u.get("cooldown_turns", base.get("cooldown_turns", 8)),
+            })
+            # Mark source on the raw for list_triggers (stripped at compile time)
+            base["_source"] = "override"
+            shipped[tid] = base
+        else:
+            u = _deep_copy_trigger(u)
+            u["_source"] = "user"
+            user_only.append(u)
+    merged: list[dict] = []
+    for tid in shipped_order:
+        t = shipped[tid]
+        t.setdefault("_source", "builtin")
+        merged.append(t)
+    merged.extend(user_only)
+    return merged
 
 
 def _raw_triggers() -> list[dict]:
-    """triggers.yaml is the runtime table when PyYAML is available (contract
-    §20: the table is user-editable data); the builtin mirror is the fallback
-    for yaml-less environments."""
-    try:
-        import yaml  # type: ignore
-        data = yaml.safe_load(_YAML_PATH.read_text())
-        entries = data.get("triggers", []) if isinstance(data, dict) else []
-        if entries:
-            return entries
-    except Exception:  # noqa: BLE001 — fail soft to the builtin mirror
-        pass
-    return _BUILTIN_TRIGGERS
+    """Merged shipped + user override table (cached; auto-invalidates on disk change)."""
+    global _RAW_MERGED
+    _ensure_cache_fresh()
+    if _RAW_MERGED is None:
+        _RAW_MERGED = _merge_raw_triggers()
+    return _RAW_MERGED
 
 
 def load_table() -> list[dict]:
     """Compile the trigger table and cache it.
 
-    Runtime source: ``triggers.yaml`` when parseable (user-editable per
-    contract §20), else :data:`_BUILTIN_TRIGGERS` (an exact mirror).
+    Runtime source: shipped ``triggers.yaml`` / builtin mirror, merged with
+    user overrides from ``~/.local/share/AI-CAD/context_injection/triggers.json``.
+    Disabled triggers are compiled but skipped by :func:`match_triggers`.
 
-    Each entry is compiled from the raw dict into a matcher-ready form with
-    pre-compiled ``re.Pattern`` objects.
+    Each entry is compiled into a matcher-ready form with pre-compiled
+    ``re.Pattern`` objects. Cache auto-invalidates when the user override
+    file or packs dir mtime changes (cross-process GUI saves).
     """
     global _TABLE
+    _ensure_cache_fresh()
     if _TABLE is not None:
         return _TABLE
 
     compiled: list[dict] = []
     for t in _raw_triggers():
-        match_spec = t.get("match", {})
+        match_spec = t.get("match", {}) or {}
         kw_patterns: list[re.Pattern] = []
-        for kw in match_spec.get("keywords", []):
+        for kw in match_spec.get("keywords", []) or []:
             try:
-                kw_patterns.append(re.compile(kw, re.IGNORECASE))
+                kw_patterns.append(re.compile(str(kw), re.IGNORECASE))
             except re.error:
                 pass  # skip malformed patterns silently
 
         compiled.append({
             "id": t["id"],
+            "enabled": bool(t.get("enabled", True)),
             "kw_patterns": kw_patterns,
-            "tool_names": set(match_spec.get("tools", [])),
-            "events": set(match_spec.get("events", [])),
-            "inject": t.get("inject", {}),
+            "tool_names": set(match_spec.get("tools", []) or []),
+            "events": set(match_spec.get("events", []) or []),
+            "inject": t.get("inject", {}) or {},
             "budget_tokens": int(t.get("budget_tokens", 250)),
             "cooldown_turns": int(t.get("cooldown_turns", 8)),
+            "purpose": str(t.get("purpose") or ""),
+            "source": str(t.get("_source") or "builtin"),
         })
 
     _TABLE = compiled
@@ -428,8 +664,16 @@ def load_table() -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def _load_pack(pack_name: str, budget_tokens: int) -> str:
-    """Read a context pack file and truncate to *budget_tokens* whole lines."""
-    pack_path = _PACKS_DIR / f"{pack_name}.md"
+    """Read a context pack file and truncate to *budget_tokens* whole lines.
+
+    User packs (``context_injection/packs/<name>.md``) shadow shipped packs of
+    the same name so GUI edits take effect without rewriting the repo.
+    """
+    if not pack_name:
+        return ""
+    user_path = user_packs_dir() / f"{pack_name}.md"
+    shipped_path = _PACKS_DIR / f"{pack_name}.md"
+    pack_path = user_path if user_path.is_file() else shipped_path
     try:
         text = pack_path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -599,6 +843,10 @@ def match_triggers(
     for trigger in load_table():
         tid = trigger["id"]
 
+        # Disabled via GUI / user override — never inject.
+        if not trigger.get("enabled", True):
+            continue
+
         # ── cooldown check ──────────────────────────────────────────────────
         if cooldown_state is not None:
             last = cooldown_state.get(tid, -9999)
@@ -673,3 +921,180 @@ def match_triggers(
         })
 
     return context_items, ledger_events
+
+
+# ---------------------------------------------------------------------------
+# GUI / RPC CRUD (user overrides; never rewrites shipped triggers.yaml)
+# ---------------------------------------------------------------------------
+
+def list_triggers() -> list[dict]:
+    """Merged catalog for the Context Injection settings tab.
+
+    Each row is JSON-serializable (no compiled regexes) and includes:
+    ``id, enabled, purpose, match, inject, budget_tokens, cooldown_turns, source``.
+    """
+    out: list[dict] = []
+    for t in _raw_triggers():
+        row = _normalize_trigger(t) or {}
+        if not row:
+            continue
+        row["source"] = str(t.get("_source") or "builtin")
+        out.append(row)
+    return out
+
+
+def get_trigger(trigger_id: str) -> dict[str, Any]:
+    """Full trigger + pack body for the editor."""
+    tid = str(trigger_id or "").strip()
+    if not tid:
+        return {"ok": False, "reason": "id required"}
+    for t in _raw_triggers():
+        if t.get("id") != tid:
+            continue
+        row = _normalize_trigger(t) or {}
+        row["source"] = str(t.get("_source") or "builtin")
+        pack_name = (row.get("inject") or {}).get("context_pack") or ""
+        pack = get_pack(pack_name) if pack_name else {"ok": True, "name": "", "body": "", "source": ""}
+        return {
+            "ok": True,
+            "trigger": row,
+            "pack": pack if pack.get("ok") else {"ok": True, "name": pack_name, "body": "", "source": "missing"},
+        }
+    return {"ok": False, "reason": f"trigger not found: {tid!r}"}
+
+
+def save_trigger(trigger: dict) -> dict[str, Any]:
+    """Create/update a user override (or user-only trigger).
+
+    Shipped triggers are never rewritten — user edits land in
+    ``triggers.json`` and win on merge. Clears the runtime cache so the next
+    ``match_triggers`` call sees the change.
+    """
+    norm = _normalize_trigger(trigger if isinstance(trigger, dict) else {})
+    if not norm:
+        return {"ok": False, "reason": "invalid trigger (id must match [A-Za-z][A-Za-z0-9_-]{0,63})"}
+    tid = norm["id"]
+    # Validate keyword regexes early so the GUI can surface the error.
+    for kw in norm["match"]["keywords"]:
+        try:
+            re.compile(str(kw), re.IGNORECASE)
+        except re.error as exc:
+            return {"ok": False, "reason": f"bad keyword regex {kw!r}: {exc}"}
+
+    user = _load_user_triggers()
+    replaced = False
+    for i, u in enumerate(user):
+        if u.get("id") == tid:
+            user[i] = norm
+            replaced = True
+            break
+    if not replaced:
+        user.append(norm)
+    try:
+        _write_user_triggers(user)
+    except OSError as exc:
+        return {"ok": False, "reason": f"write failed: {exc}"}
+    clear_cache()
+    source = "override" if any(s.get("id") == tid for s in _shipped_triggers()) else "user"
+    return {"ok": True, "id": tid, "source": source}
+
+
+def delete_trigger(trigger_id: str) -> dict[str, Any]:
+    """Remove a user override (restores shipped) or a user-only trigger.
+
+    Builtin rows cannot be deleted — only their overrides can be cleared.
+    """
+    tid = str(trigger_id or "").strip()
+    if not tid:
+        return {"ok": False, "reason": "id required"}
+    user = _load_user_triggers()
+    kept = [u for u in user if u.get("id") != tid]
+    if len(kept) == len(user):
+        # Nothing to delete — if it's a shipped id, say so; else not found.
+        if any(s.get("id") == tid for s in _shipped_triggers()):
+            return {"ok": False, "reason": "no user override to clear (shipped trigger stays)"}
+        return {"ok": False, "reason": f"trigger not found: {tid!r}"}
+    try:
+        _write_user_triggers(kept)
+    except OSError as exc:
+        return {"ok": False, "reason": f"write failed: {exc}"}
+    clear_cache()
+    restored = any(s.get("id") == tid for s in _shipped_triggers())
+    return {"ok": True, "id": tid, "restored_builtin": restored}
+
+
+def list_packs() -> list[dict]:
+    """Shipped + user pack names (user shadows shipped)."""
+    names: dict[str, str] = {}
+    if _PACKS_DIR.is_dir():
+        for p in sorted(_PACKS_DIR.glob("*.md")):
+            names[p.stem] = "builtin"
+    ud = user_packs_dir()
+    if ud.is_dir():
+        for p in sorted(ud.glob("*.md")):
+            names[p.stem] = "user" if names.get(p.stem) != "builtin" else "override"
+    return [{"name": n, "source": s} for n, s in sorted(names.items())]
+
+
+def get_pack(name: str) -> dict[str, Any]:
+    """Return pack body; user pack shadows shipped."""
+    pack = str(name or "").strip()
+    if not pack or not _PACK_RE.match(pack):
+        return {"ok": False, "reason": f"invalid pack name: {name!r}"}
+    user_path = user_packs_dir() / f"{pack}.md"
+    shipped_path = _PACKS_DIR / f"{pack}.md"
+    if user_path.is_file():
+        try:
+            body = user_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            return {"ok": False, "reason": str(exc)}
+        source = "override" if shipped_path.is_file() else "user"
+        return {"ok": True, "name": pack, "body": body, "source": source}
+    if shipped_path.is_file():
+        try:
+            body = shipped_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            return {"ok": False, "reason": str(exc)}
+        return {"ok": True, "name": pack, "body": body, "source": "builtin"}
+    return {"ok": False, "reason": f"pack not found: {pack!r}"}
+
+
+def save_pack(name: str, body: str) -> dict[str, Any]:
+    """Write/overwrite a user pack body (never rewrites shipped packs)."""
+    pack = str(name or "").strip()
+    if not pack or not _PACK_RE.match(pack):
+        return {"ok": False, "reason": f"invalid pack name: {name!r}"}
+    if not isinstance(body, str):
+        return {"ok": False, "reason": "body must be a string"}
+    dest = user_packs_dir() / f"{pack}.md"
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_suffix(".md.tmp")
+        tmp.write_text(body, encoding="utf-8")
+        tmp.replace(dest)
+    except OSError as exc:
+        return {"ok": False, "reason": f"write failed: {exc}"}
+    # Pack text is read live by _load_pack — no compile cache for bodies —
+    # but clear anyway so list_packs / get_trigger refresh source chips.
+    clear_cache()
+    source = "override" if (_PACKS_DIR / f"{pack}.md").is_file() else "user"
+    return {"ok": True, "name": pack, "source": source}
+
+
+def delete_pack(name: str) -> dict[str, Any]:
+    """Delete a user pack (restores shipped body if one exists)."""
+    pack = str(name or "").strip()
+    if not pack or not _PACK_RE.match(pack):
+        return {"ok": False, "reason": f"invalid pack name: {name!r}"}
+    path = user_packs_dir() / f"{pack}.md"
+    if not path.is_file():
+        if (_PACKS_DIR / f"{pack}.md").is_file():
+            return {"ok": False, "reason": "no user pack to clear (shipped pack stays)"}
+        return {"ok": False, "reason": f"pack not found: {pack!r}"}
+    try:
+        path.unlink()
+    except OSError as exc:
+        return {"ok": False, "reason": f"delete failed: {exc}"}
+    clear_cache()
+    restored = (_PACKS_DIR / f"{pack}.md").is_file()
+    return {"ok": True, "name": pack, "restored_builtin": restored}

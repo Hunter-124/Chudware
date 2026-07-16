@@ -382,6 +382,9 @@ Renderer::~Renderer() {
     if (fbo_) glDeleteFramebuffers(1, &fbo_);
     if (colorTex_) glDeleteTextures(1, &colorTex_);
     if (depthRbo_) glDeleteRenderbuffers(1, &depthRbo_);
+#ifdef BILLET_GLES3
+    if (colorRbo_) glDeleteRenderbuffers(1, &colorRbo_);
+#endif
     if (resolveFbo_) glDeleteFramebuffers(1, &resolveFbo_);
     if (resolvedTex_) glDeleteTextures(1, &resolvedTex_);
     // C27-D: View Selector preview thumbnail target (lazily created; may be 0).
@@ -554,16 +557,66 @@ void Renderer::allocTargets() {
     if (!depthRbo_) glGenRenderbuffers(1, &depthRbo_);
     if (!resolveFbo_) glGenFramebuffers(1, &resolveFbo_);
     if (!resolvedTex_) glGenTextures(1, &resolvedTex_);
+#ifdef BILLET_GLES3
+    if (!colorRbo_) glGenRenderbuffers(1, &colorRbo_);
+#endif
 
-    glBindTexture(GL_TEXTURE_2D, colorTex_);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, sw_, sh_, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    // Final-size resolve target (ImGui samples this). Always a single-sample texture.
+    glBindTexture(GL_TEXTURE_2D, resolvedTex_);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w_, h_, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
-    glBindTexture(GL_TEXTURE_2D, resolvedTex_);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w_, h_, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+#ifdef BILLET_GLES3
+    // WebGL2: prefer a multisampled offscreen FBO at final size (SS=1). Clamp samples to
+    // min(4, GL_MAX_SAMPLES). If MSAA FBO fails completeness, fall back to single-sample.
+    GLint maxSamples = 0;
+    glGetIntegerv(GL_MAX_SAMPLES, &maxSamples);
+    int samples = 4;
+    if (maxSamples > 0 && samples > maxSamples) samples = maxSamples;
+    if (samples < 1) samples = 1;
+
+    msaaSamples_ = 0;
+    if (samples > 1) {
+        glBindRenderbuffer(GL_RENDERBUFFER, colorRbo_);
+        glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples, GL_RGBA8, w_, h_);
+        glBindRenderbuffer(GL_RENDERBUFFER, depthRbo_);
+        glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples, GL_DEPTH24_STENCIL8, w_, h_);
+
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, colorRbo_);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER,
+                                  depthRbo_);
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+            msaaSamples_ = samples;
+            // Keep colorTex_ as a 1x1 placeholder so resolve's null-check stays simple;
+            // MSAA resolve uses glBlitFramebuffer, not the texture sample path.
+            glBindTexture(GL_TEXTURE_2D, colorTex_);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        }
+    }
+    if (msaaSamples_ <= 0) {
+        // Single-sample fallback (no MSAA available / incomplete FBO).
+        glBindTexture(GL_TEXTURE_2D, colorTex_);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, sw_, sh_, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glBindRenderbuffer(GL_RENDERBUFFER, depthRbo_);
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, sw_, sh_);
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, colorTex_, 0);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER,
+                                  depthRbo_);
+    }
+#else
+    glBindTexture(GL_TEXTURE_2D, colorTex_);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, sw_, sh_, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -577,6 +630,7 @@ void Renderer::allocTargets() {
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, colorTex_, 0);
     glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER,
                               depthRbo_);
+#endif
     glBindFramebuffer(GL_FRAMEBUFFER, resolveFbo_);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, resolvedTex_, 0);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -2061,7 +2115,23 @@ void Renderer::renderOrbit(float yawDeg, float pitchDeg, float zoom, const float
 }
 
 void Renderer::resolveColorTexture() const {
-    if (!resolvedDirty_ || !resolveFbo_ || !resolvedTex_ || !colorTex_ || !resolveProg_) return;
+    if (!resolvedDirty_ || !resolveFbo_ || !resolvedTex_) return;
+#ifdef BILLET_GLES3
+    // Multisampled path: resolve via blit (WebGL2 requires NEAREST for MSAA resolve).
+    if (msaaSamples_ > 0) {
+        GLint prevFbo = 0;
+        glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFbo);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo_);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, resolveFbo_);
+        glBlitFramebuffer(0, 0, w_, h_, 0, 0, w_, h_, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
+        resolvedDirty_ = false;
+        backdropDirty_ = true;
+        return;
+    }
+    // Single-sample fallback (SS==1): 1:1 box filter via resolveProg_.
+#endif
+    if (!colorTex_ || !resolveProg_) return;
 
     GLint prevFbo = 0, prevViewport[4] = {0, 0, 0, 0}, prevProgram = 0;
     GLint prevActiveTex = 0, prevTex0 = 0;

@@ -425,11 +425,23 @@ private:
     void pollLumaPbos() const;           // non-blocking glClientWaitSync poll of the ring
     void reduceLumaPbo(int slot) const;  // map -> Rec.709 reduce -> staging -> published swap
 
+    // Desktop: 3x supersample + box-filter resolve for crisp edges.
+    // WebGL2/GLES: SS=1 + multisampled color/depth renderbuffers (see allocTargets);
+    // 3x SS blows common WebGL MAX_TEXTURE_SIZE budgets and costs 9x fill. MSAA is the
+    // WebGL-legal AA path; samples clamped to min(4, GL_MAX_SAMPLES) at alloc time.
+#ifdef BILLET_GLES3
+    static constexpr int SS = 1;
+#else
     static constexpr int SS = 3;  // supersample factor for anti-aliasing (3x for crisp thin edges)
+#endif
     static constexpr int kBlurPasses = 4;  // 4-tap Kawase passes (GLASS_DESIGN_SPEC)
     int w_ = 0, h_ = 0;           // final size
-    int sw_ = 0, sh_ = 0;         // supersampled size
+    int sw_ = 0, sh_ = 0;         // supersampled size (sw_==w_ under BILLET_GLES3)
     unsigned int fbo_ = 0, colorTex_ = 0, depthRbo_ = 0;
+#ifdef BILLET_GLES3
+    unsigned int colorRbo_ = 0;   // multisampled color (0 when falling back to single-sample tex)
+    int msaaSamples_ = 0;        // active sample count; 0 = single-sample colorTex_ path
+#endif
     mutable unsigned int resolveFbo_ = 0, resolvedTex_ = 0;
     unsigned int resolveProg_ = 0;
     mutable bool resolvedDirty_ = true;

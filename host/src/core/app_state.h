@@ -421,9 +421,10 @@ PlanState parsePlanState(const nlohmann::json& p);
 PlanState planStateFromPlanInfo(const PlanInfo& plan);
 
 // ---------------- small ui helpers ----------------
-// A caption button (minimize / maximize-restore / close) drawn with a crisp vector glyph
-// and a full-height hover fill — close hovers red, the others a soft white wash.
-enum WinBtn { BTN_MIN, BTN_MAX, BTN_CLOSE };
+// A caption button (minimize / maximize-restore / fullscreen / close) drawn with a crisp
+// vector glyph and a full-height hover fill — close hovers red, the others a soft wash.
+// For BTN_MAX the `maximized` arg is maximize-state; for BTN_FULL it is fullscreen-state.
+enum WinBtn { BTN_MIN, BTN_MAX, BTN_FULL, BTN_CLOSE };
 bool windowButton(const char* id, WinBtn kind, float h, bool maximized);
 
 bool primaryButton(const char* label, const ImVec2& size);
@@ -1284,6 +1285,8 @@ struct AppState {
     int  aiInteraction = 0;
     bool focusActivityTab = false;  // one-shot: select the Activity tab (e.g. when a v2 run starts)
     bool showAbout = false, designStarted = false;
+    // Exclusive / browser fullscreen (title-bar fullscreen button). Distinct from GLFW maximize.
+    bool isFullscreen = false;
     int frame = 0;
 
     // ---- ribbon (C14) ----

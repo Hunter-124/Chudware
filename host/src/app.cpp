@@ -850,28 +850,14 @@ namespace ui { namespace parts { void startLoginWizard(AppState&, const std::str
 
 
 #ifdef __EMSCRIPTEN__
-// Under PROXY_TO_PTHREAD + OffscreenCanvas the drawing buffer stays at the
-// HTMLCanvasElement default (300x150) unless we explicitly size it from CSS.
-static void wasmSyncCanvasSize(GLFWwindow* win) {
-    double cssW = 0, cssH = 0;
-    if (emscripten_get_element_css_size("#canvas", &cssW, &cssH) != EMSCRIPTEN_RESULT_SUCCESS) {
-        cssW = 1280; cssH = 800;
-    }
-    if (cssW < 64) cssW = 64;
-    if (cssH < 64) cssH = 64;
-    double dpr = emscripten_get_device_pixel_ratio();
-    if (dpr < 0.5) dpr = 1.0;
-    if (dpr > 3.0) dpr = 3.0;
-    const int fbW = (int)(cssW * dpr + 0.5);
-    const int fbH = (int)(cssH * dpr + 0.5);
-    static int sLastW = 0, sLastH = 0;
-    if (fbW == sLastW && fbH == sLastH) return;
-    sLastW = fbW; sLastH = fbH;
-    emscripten_set_canvas_element_size("#canvas", fbW, fbH);
-    // Do NOT call glfwSetWindowSize every resize — under emscripten/contrib.glfw3 it can
-    // re-enter framebuffer callbacks and stack-blow. Size the drawing buffer only; ImGui
-    // reads CSS size via the GLFW emscripten path / DisplaySize later.
-    WASM_BOOT_LOG("[wasm-boot] canvas size css=%.0fx%.0f dpr=%.2f fb=%dx%d\n", cssW, cssH, dpr, fbW, fbH);
+#include <GLFW/emscripten_glfw3.h>
+// One-time: hand canvas sizing to the contrib.glfw3 port. With target "window" it keeps the
+// canvas CSS size, the drawing-buffer (backing store, DPR-scaled), and the GLFW window size all
+// synced to the browser viewport, firing normal framebuffer-size callbacks — so ImGui
+// io.DisplaySize and the ribbon/dockspace layout always span the full window, and it survives
+// fullscreen transitions. Replaces manual innerWidth polling / canvas pinning.
+static void wasmSetupCanvasResize(GLFWwindow* win) {
+    emscripten_glfw_make_canvas_resizable(win, "window", nullptr);
 }
 #endif
 
@@ -897,6 +883,10 @@ WASM_BOOT_LOG("[wasm-boot] run_gui enter\n");
     glfwWindowHint(GLFW_CLIENT_API, GLFW_OPENGL_ES_API);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
+    // Default-framebuffer antialias fallback (contrib.glfw3 maps GLFW_SAMPLES -> WebGL
+    // context attribute `antialias`). Scene AA is the offscreen MSAA FBO in renderer.cpp;
+    // this still smooths any default-FB draws (ImGui) if the browser honors it.
+    glfwWindowHint(GLFW_SAMPLES, 4);
     // Do not request CORE_PROFILE — that is desktop-GL and confuses WebGL.
 #else
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
@@ -945,7 +935,7 @@ WASM_BOOT_LOG("[wasm-boot] run_gui enter\n");
 #endif
 #ifdef __EMSCRIPTEN__
     std::fprintf(stderr, "[wasm-boot] GL context current\n");
-    wasmSyncCanvasSize(win);
+    wasmSetupCanvasResize(win);
 #endif
 
     // CEF (when the cef backend is selected) is initialised early in main(),
@@ -2293,7 +2283,7 @@ WASM_BOOT_LOG("[wasm-boot] entering main loop\n");
         static int s_wasmFrames = 0;
         ++s_wasmFrames;
         if (s_wasmFrames <= 3) WASM_BOOT_LOG("[wasm-boot] frame %d\n", s_wasmFrames);
-        wasmSyncCanvasSize(win);
+        // canvas sizing handled by wasmSetupCanvasResize (port tracks the window)
         // First frames: minimal paint only — full UI path is too deep for ASYNCIFY
         // until the rewind stack has settled after a few yields.
         if (s_wasmFrames <= 2) {

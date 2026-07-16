@@ -73,16 +73,20 @@ length mirrors the drawn length (seam-fixed by integrator at gate if mismatched)
 ## Gate 2
 Same gates + any core tests J touches -> commit+push.
 
-## Final
-Full build green, deliver user verification checklist.
-
-## Known pre-existing failures (do NOT fix)
-- core/tests/test_document.cpp:2694 eval_mass tessellation volume assert (fails on clean master).
-
 ## Status log
 - [x] Setup: master pulled, plan written.
-- [ ] Wave 1 dispatched / collected
-- [ ] Gate 1 green + pushed
-- [ ] Wave 2 dispatched / collected
-- [ ] Gate 2 green + pushed
-- [ ] Checklist delivered
+- [x] Wave 1 dispatched / collected (A B C D E G H I L + glitch item added)
+- [x] Gate 1 green + pushed (0d717a1a): host+core build, profile_extrude+insert_component pass,
+      theme+icon lint clean. Integrator patches: axesUserToggled eye, Assembly tab hidden,
+      RT_Assembly->RT_Features retargets, insert_component test fixes.
+- [x] Wave 2 dispatched / collected (F unit defaults, J revolve perf, K startup+status, M glitches)
+- [x] Gate 2 green + pushed (ba9b1f77): host+core build, profile_extrude+insert_component pass,
+      theme+icon lint clean, m1 boot scenario ok. Integrator patch: sim_manager force/pressure
+      unit-native seed (50 lbf / 100 psi). Pre-existing document.cpp:2694 confirmed unrelated.
+- [x] Checklist delivered
+
+## Deferred (documented gaps, need engine/contract work — not GUI-fixable this session)
+- Item 9 full nested history for imported parts: only native .step+ sources expose feature
+  history (read off-disk via source_path). Plain STEP/mesh imports and embedded-brep-only
+  imports have NO parametric history to show; a doc_import_feature_tree RPC would be needed.
+- Item 5b/6b contract note (feature_params.md) left un-appended (optional; GUI-only defaults).

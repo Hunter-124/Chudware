@@ -1144,15 +1144,28 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                 pass
         # mega-20 B: board-scoped tools must never carry the schematic doc_id.
         # Live AC4: DRC ran against sch cd7516… ("is a sch, not a board").
+        # mega-25 Y25: SPICE/ERC/capture must never carry the board doc_id
+        # (mirror of B20 — live AC5: simulate on PCB 767f… "is a pcb").
         if tool in (
             "ecad_run_drc", "ecad_autoroute", "ecad_to_3d", "ecad_run_pdn",
-            "ecad_export",
+            "ecad_export", "ecad_optimize_traces",
         ):
             try:
                 board_id = _ecad_board_doc_id(calls)
                 if board_id:
                     args = dict(args or {})
                     args["doc_id"] = board_id
+            except Exception:  # noqa: BLE001
+                pass
+        if tool in (
+            "ecad_simulate", "ecad_run_erc", "ecad_place_symbol",
+            "ecad_wire", "ecad_add_power", "ecad_label",
+        ):
+            try:
+                sch_id = _ecad_sch_doc_id(calls)
+                if sch_id:
+                    args = dict(args or {})
+                    args["doc_id"] = sch_id
             except Exception:  # noqa: BLE001
                 pass
         if _blocked is not None:
@@ -1710,6 +1723,63 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
     )
     if bootstrapped_only:
         wrote = False
+    # mega-25 thrash rebind: BUILD DL3 hit budget after schematic+place+orphan
+    # power with ZERO force-inject (find_part thrash burned the turn). Before
+    # returning max_iters/no_code on an incomplete ECAD product chain, force-
+    # EXECUTE the remaining needs (wire→board→opt→drc→erc→sim) with cascade
+    # budget headroom — same class as hard_gate_cap, at end-of-turn.
+    try:
+        if (
+            last_reason in (_RETRY, "phase_step_cap", _NOCODE)
+            and callable(dispatch)
+            and tool_calls_made > 0
+        ):
+            _need_eot = _ecad_chain_need(calls, allow)
+            _allow_eot = set(allow or set())
+            if _need_eot == "ecad_optimize_traces":
+                _allow_eot |= {"ecad_optimize_traces", "ecad_autoroute"}
+            if (
+                _need_eot
+                and (
+                    _need_eot in _allow_eot
+                    or _need_eot in (
+                        "ecad_optimize_traces", "ecad_autoroute",
+                    )
+                )
+            ):
+                _before = tool_calls_made
+                calls, tool_calls_made = _ecad_force_chain_cascade(
+                    calls=calls,
+                    allow=_allow_eot,
+                    dispatch=dispatch,
+                    ledger=ledger,
+                    actor=actor,
+                    messages=messages,
+                    tool_calls_made=tool_calls_made,
+                    budget=max(int(budget or 0), tool_calls_made + 12),
+                    reason="end_of_turn_ecad_force",
+                    max_steps=12,
+                )
+                if tool_calls_made > _before:
+                    # Re-evaluate product completeness after force.
+                    wrote = any(
+                        c.get("ok") and c.get("tool") in _PRODUCTIVE_TOOLS
+                        for c in calls
+                    )
+                    boot_why = _bootstrap_incomplete(calls, allow)
+                    bootstrapped_only = bool(boot_why) or (
+                        not wrote
+                        and any(
+                            c.get("ok") and c.get("tool") in _BOOTSTRAP_ONLY
+                            for c in calls
+                        )
+                    )
+                    if bootstrapped_only:
+                        wrote = False
+                    if wrote and not bootstrapped_only:
+                        last_reason = _RETRY  # allow auto-complete path
+    except Exception:  # noqa: BLE001 — force never breaks the turn
+        pass
     if (tool_calls_made > 0
             and last_reason in (_RETRY, "phase_step_cap", _NOCODE)
             and wrote):
@@ -2830,6 +2900,43 @@ def _ecad_last_drc_errors(calls: list) -> int | None:
     return None
 
 
+def _ecad_last_drc_has_clearance(calls: list) -> bool:
+    """True when the latest successful DRC reports clearance-class violations.
+
+    mega-25 Z25: mega-24 AC4 live shape was clearance×6 at 0.1296 < 0.2mm.
+    Re-polish alone does not widen spacing — clearance-class dirty DRC must
+    trigger a bounded re-route/re-opt with wider spacing intent.
+    """
+    for c in reversed(calls or []):
+        if not (c.get("ok") and c.get("tool") == "ecad_run_drc"):
+            continue
+        blob = json.dumps(
+            {"r": c.get("result"), "a": c.get("args")},
+            default=str,
+        ).lower()
+        if "clearance" in blob:
+            return True
+        res = _ecad_parse_result(c.get("result"))
+        for key in ("violations", "residual_drc", "by_rule", "warnings"):
+            items = res.get(key)
+            if not isinstance(items, list):
+                continue
+            for v in items:
+                if not isinstance(v, dict):
+                    if isinstance(v, str) and "clearance" in v.lower():
+                        return True
+                    continue
+                rule = str(v.get("rule") or v.get("check") or "").lower()
+                msg = str(v.get("message") or v.get("detail") or "").lower()
+                if "clearance" in rule or "clearance" in msg:
+                    return True
+        verdict = str(res.get("verdict") or res.get("hint") or "").lower()
+        if "clearance" in verdict:
+            return True
+        return False
+    return False
+
+
 def _ecad_drc_after_optimize(calls: list) -> bool:
     """True when a successful DRC appears after the latest optimize_traces."""
     last_opt = -1
@@ -2853,11 +2960,11 @@ def _ecad_last_optimize_idx(calls: list) -> int:
 
 
 def _ecad_optimize_retry_count(calls: list) -> int:
-    """How many *extra* optimize passes ran after a dirty post-opt DRC.
+    """How many *extra* optimize/re-route passes ran after a dirty post-opt DRC.
 
     First board→optimize→DRC is the baseline (returns 0 even if dirty).
-    Each subsequent optimize after a dirty DRC increments the count.
-    Cap consumers at <1 so only one re-polish is forced.
+    Each subsequent optimize OR clearance re-route after a dirty DRC increments.
+    Cap consumers at <1 so only one re-polish/re-route is forced.
     """
     n_opt = 0
     n_dirty_after_opt = 0
@@ -2866,7 +2973,19 @@ def _ecad_optimize_retry_count(calls: list) -> int:
         if not c.get("ok"):
             continue
         tool = c.get("tool")
-        if tool == "ecad_optimize_traces":
+        if tool in ("ecad_optimize_traces", "ecad_autoroute"):
+            # Count autoroute only when it is a post-DRC clearance retry.
+            if tool == "ecad_autoroute":
+                args = c.get("args") if isinstance(c.get("args"), dict) else {}
+                fr = str(c.get("force_reason") or "")
+                if not (
+                    c.get("clearance_retry")
+                    or ("clearance" in fr)
+                    or args.get("clearance_retry")
+                    or float(args.get("pitch") or 0) >= 0.3
+                ):
+                    last_was_opt = False
+                    continue
             n_opt += 1
             last_was_opt = True
         elif tool == "ecad_run_drc":
@@ -3791,16 +3910,40 @@ def _ecad_forced_tool_args(need: str, calls: list) -> dict:
         return args
 
     # mega-19 B: board-chain tools must carry board doc_id.
+    # mega-25 Z25: optimize/autoroute carry min clearance intent (>=0.2mm).
     board_id = _ecad_board_doc_id(calls)
     sch_id = _ecad_sch_doc_id(calls)
 
     if need in (
-        "ecad_run_drc", "ecad_autoroute", "ecad_to_3d", "ecad_run_pdn",
-        "ecad_export", "ecad_optimize_traces",
+        "ecad_run_drc", "ecad_to_3d", "ecad_run_pdn",
+        "ecad_export",
     ):
         out: dict = {}
         if board_id:
             out["doc_id"] = board_id
+        return out
+
+    if need == "ecad_optimize_traces":
+        out: dict = {}
+        if board_id:
+            out["doc_id"] = board_id
+        # Engine optimize_traces has no min_clearance param (checked mega-25);
+        # stash intent on the call record for diagnostics / future engine knobs.
+        # DRC residual clearance is handled by bounded re-route retry.
+        out["min_clearance_mm"] = 0.2
+        if _ecad_last_drc_has_clearance(calls):
+            out["clearance_retry"] = True
+            out["skip_teardrops"] = True
+        return out
+
+    if need == "ecad_autoroute":
+        out = {}
+        if board_id:
+            out["doc_id"] = board_id
+        # Wider grid / coarser pitch for clearance-class residual (Z25).
+        out["pitch"] = 0.3
+        out["min_clearance_mm"] = 0.2
+        out["clearance_retry"] = True
         return out
 
     if need == "ecad_new_schematic":
@@ -4056,17 +4199,53 @@ def _ecad_dispatch_forced_step(
     # mega-24: ecad_wire MCP signature is (from_ref, from_pin, to_ref, to_pin,
     # doc_id) — no ``net``. S23 still stashes net on the call record for
     # topology harvest / GND return intent, but must not TypeError the tool.
+    # mega-25 Y25/Z25: strip clearance/metadata kwargs MCP signatures reject;
+    # rewrite doc_id (board tools → board; SPICE/ERC/capture → schematic).
     call_args = dict(args) if isinstance(args, dict) else (args or {})
+    try:
+        if tool in (
+            "ecad_run_drc", "ecad_autoroute", "ecad_to_3d", "ecad_run_pdn",
+            "ecad_export", "ecad_optimize_traces",
+        ):
+            board_id = _ecad_board_doc_id(calls)
+            if board_id:
+                call_args = dict(call_args)
+                call_args["doc_id"] = board_id
+        elif tool in (
+            "ecad_simulate", "ecad_run_erc", "ecad_place_symbol",
+            "ecad_wire", "ecad_add_power", "ecad_label",
+        ):
+            sch_id = _ecad_sch_doc_id(calls)
+            if sch_id:
+                call_args = dict(call_args)
+                call_args["doc_id"] = sch_id
+    except Exception:  # noqa: BLE001
+        pass
     dispatch_args = call_args
+    _strip_meta = (
+        "resolved_net", "resolved_net_source", "source_net",
+        "min_clearance_mm", "clearance_retry", "skip_teardrops",
+    )
     if tool == "ecad_simulate" and isinstance(call_args, dict):
         dispatch_args = {
-            k: v for k, v in call_args.items()
-            if k not in (
-                "resolved_net", "resolved_net_source", "source_net",
-            )
+            k: v for k, v in call_args.items() if k not in _strip_meta
         }
     elif tool == "ecad_wire" and isinstance(call_args, dict):
-        dispatch_args = {k: v for k, v in call_args.items() if k != "net"}
+        dispatch_args = {
+            k: v for k, v in call_args.items()
+            if k != "net" and k not in _strip_meta
+        }
+    elif tool == "ecad_optimize_traces" and isinstance(call_args, dict):
+        # MCP accepts only targets + doc_id today.
+        dispatch_args = {
+            k: v for k, v in call_args.items()
+            if k in ("doc_id", "targets")
+        }
+    elif tool == "ecad_autoroute" and isinstance(call_args, dict):
+        dispatch_args = {
+            k: v for k, v in call_args.items()
+            if k in ("doc_id", "pitch", "diff_pairs", "ripup_passes")
+        }
     try:
         _log(ledger, actor or "agent_turn", {
             "event": "ecad_chain_force_inject",
@@ -4215,9 +4394,15 @@ def _ecad_force_chain_cascade(
             break
         # mega-22 Q22: optimize is part of the board product chain — allow
         # force even when the actor allow-list omitted the tool name.
+        # mega-25 Z25: same for clearance re-route via autoroute.
         if need == "ecad_optimize_traces" and need not in allow_set:
             if "ecad_run_drc" in allow_set or "board_from_schematic" in allow_set:
-                allow_set = set(allow_set) | {"ecad_optimize_traces"}
+                allow_set = set(allow_set) | {"ecad_optimize_traces", "ecad_autoroute"}
+            else:
+                break
+        if need == "ecad_autoroute" and need not in allow_set:
+            if "ecad_run_drc" in allow_set or "ecad_optimize_traces" in allow_set:
+                allow_set = set(allow_set) | {"ecad_autoroute"}
             else:
                 break
         if need not in allow_set:
@@ -4226,6 +4411,7 @@ def _ecad_force_chain_cascade(
         if need not in (
             "ecad_add_power", "ecad_wire", "ecad_place_symbol",
             "board_from_schematic", "ecad_make_board", "ecad_optimize_traces",
+            "ecad_autoroute",
             "ecad_run_drc", "ecad_run_erc", "ecad_simulate",
         ):
             break
@@ -4250,16 +4436,45 @@ def _ecad_force_chain_cascade(
                 # Still attempt simulate if budget remains and need persists.
                 if tool_calls_made >= cascade_budget or steps >= max_steps:
                     break
-        # mega-22 Q22: after optimize, if DRC still dirty, one re-optimize+re-DRC.
-        if need == "ecad_run_drc":
-            errs = _ecad_last_drc_errors(calls)
+        # mega-22 Q22 + mega-25 Z25: when DRC after optimize is still dirty
+        # (chain_need returns re-optimize OR we are about to re-DRC), do one
+        # clearance-aware re-route/re-optimize + re-DRC, then honest FAIL.
+        _dirty_retry = (
+            int(_ecad_last_drc_errors(calls) or 0) > 0
+            and _ecad_drc_after_optimize(calls)
+            and _ecad_optimize_retry_count(calls) < 1
+        )
+        if need in ("ecad_run_drc", "ecad_optimize_traces") and _dirty_retry:
+            # Prefer wider-pitch autoroute when clearance-class residual.
             if (
-                errs is not None
-                and errs > 0
-                and _ecad_drc_after_optimize(calls)
-                and _ecad_optimize_retry_count(calls) < 1
+                _ecad_last_drc_has_clearance(calls)
+                and (
+                    "ecad_autoroute" in allow_set
+                    or "ecad_run_drc" in allow_set
+                )
             ):
+                ar_args = _ecad_forced_tool_args("ecad_autoroute", calls)
+                calls, tool_calls_made, _arec, _aok = (
+                    _ecad_dispatch_forced_step(
+                        tool="ecad_autoroute",
+                        args=ar_args,
+                        calls=calls,
+                        dispatch=dispatch,
+                        ledger=ledger,
+                        actor=actor,
+                        messages=messages,
+                        reason=f"{reason}:clearance_reroute",
+                        tool_calls_made=tool_calls_made,
+                        budget=cascade_budget,
+                    )
+                )
+                steps += 1
+                if tool_calls_made >= cascade_budget or steps >= max_steps:
+                    break
+            # Always re-optimize once after dirty (or after clearance re-route).
+            if need == "ecad_optimize_traces" or _ecad_last_drc_has_clearance(calls):
                 opt_args = _ecad_forced_tool_args("ecad_optimize_traces", calls)
+                clr = _ecad_last_drc_has_clearance(calls)
                 calls, tool_calls_made, _orec, _ook = _ecad_dispatch_forced_step(
                     tool="ecad_optimize_traces",
                     args=opt_args,
@@ -4268,13 +4483,20 @@ def _ecad_force_chain_cascade(
                     ledger=ledger,
                     actor=actor,
                     messages=messages,
-                    reason=f"{reason}:reoptimize_after_dirty_drc",
+                    reason=(
+                        f"{reason}:clearance_reoptimize"
+                        if clr
+                        else f"{reason}:reoptimize_after_dirty_drc"
+                    ),
                     tool_calls_made=tool_calls_made,
                     budget=cascade_budget,
                 )
                 steps += 1
                 if tool_calls_made >= cascade_budget or steps >= max_steps:
                     break
+                # After forced re-opt, continue loop so need advances to re-DRC.
+                if need == "ecad_optimize_traces":
+                    continue
         args = _ecad_forced_tool_args(need, calls)
         calls, tool_calls_made, _rec, _ok = _ecad_dispatch_forced_step(
             tool=need,

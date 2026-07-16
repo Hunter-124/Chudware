@@ -1,0 +1,12 @@
+{
+  "state": "starting",
+  "run_id": "mega-25-fc-rocket-20260715",
+  "tier": "openrouter:deepseek/deepseek-chat-v3.1",
+  "pid": 2220390,
+  "started_wall": 1784158624.4727607,
+  "cycle": "mega-25",
+  "conservation": true,
+  "baseline_commit": "871e0fb9",
+  "spend_before_usd": 0.22370784,
+  "spend_guard_usd": 8.0
+}

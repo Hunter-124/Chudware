@@ -354,26 +354,36 @@ def _resolve_provider(context_pack: dict[str, Any], provider=None):
                     import os as _os  # noqa: PLC0415
                     or_key = or_key or _os.environ.get("OPENROUTER_API_KEY")
                     if or_key:
-                        try:
-                            cfg_or = dict(cfg)
-                            cfg_or["api_key"] = or_key
-                            cfg_or["model"] = "mistralai/mistral-small:free"
-                            cfg_or["openrouter"] = {**or_cfg, "api_key": or_key}
-                            prov = agent_config.get_provider(
-                                name="openrouter", cfg=cfg_or)
+                        # mega-25 rebind: mistralai/mistral-small:free is dead
+                        # (404 no endpoints). Prefer paid deepseek mid, then
+                        # free models that still resolve (mega-24 hold).
+                        for mid in (
+                            "deepseek/deepseek-chat-v3.1",
+                            "google/gemma-3-27b-it:free",
+                            "nvidia/nemotron-ultra:free",
+                        ):
                             try:
-                                context_pack["role_model"] = {
-                                    **(context_pack.get("role_model") or {}),
-                                    "provider": "openrouter",
-                                    "model": cfg_or["model"],
-                                    "degraded_from": assignment.provider,
-                                    "degrade_reason": str(exc)[:200],
+                                cfg_or = dict(cfg)
+                                cfg_or["api_key"] = or_key
+                                cfg_or["model"] = mid
+                                cfg_or["openrouter"] = {
+                                    **or_cfg, "api_key": or_key,
                                 }
+                                prov = agent_config.get_provider(
+                                    name="openrouter", cfg=cfg_or)
+                                try:
+                                    context_pack["role_model"] = {
+                                        **(context_pack.get("role_model") or {}),
+                                        "provider": "openrouter",
+                                        "model": mid,
+                                        "degraded_from": assignment.provider,
+                                        "degrade_reason": str(exc)[:200],
+                                    }
+                                except Exception:  # noqa: BLE001
+                                    pass
+                                return prov
                             except Exception:  # noqa: BLE001
-                                pass
-                            return prov
-                        except Exception:  # noqa: BLE001
-                            pass
+                                continue
                 # fall through to injected / tier / ambient
     except Exception:  # noqa: BLE001 — never block node on role_models
         pass
@@ -669,8 +679,11 @@ def _maybe_run_cheap_leaf_oneshot(
 def _frontier_fallback_provider(context_pack: dict[str, Any], injected=None):
     """After a cheap-leaf oneshot miss, pick a non-local provider for tool-loop.
 
-    Order: openrouter free (if keyed) → injected mission provider (if non-cheap)
-    → None (keep current; ambient tool-loop still runs).
+    Order: openrouter paid mid / free (if keyed) → injected mission provider
+    (if non-cheap) → None (keep current; ambient tool-loop still runs).
+
+    mega-25 rebind: never use mistralai/mistral-small:free (404 no endpoints
+    thrash on INTAKE/DELIVER after leaf_oneshot_miss).
     """
     try:
         from services.agent import config as agent_config  # noqa: PLC0415
@@ -684,23 +697,33 @@ def _frontier_fallback_provider(context_pack: dict[str, Any], injected=None):
             or _os.environ.get("OPENROUTER_API_KEY")
         )
         if or_key:
-            cfg_or = dict(cfg)
-            cfg_or["api_key"] = or_key
-            cfg_or["model"] = "mistralai/mistral-small:free"
-            cfg_or["openrouter"] = {**or_cfg, "api_key": or_key}
-            prov = agent_config.get_provider(name="openrouter", cfg=cfg_or)
-            try:
-                context_pack["role_model"] = {
-                    **(context_pack.get("role_model") or {}),
-                    "provider": "openrouter",
-                    "model": cfg_or["model"],
-                    "degraded_from": (context_pack.get("role_model") or {}).get(
-                        "provider"),
-                    "degrade_reason": "leaf_oneshot_miss",
-                }
-            except Exception:  # noqa: BLE001
-                pass
-            return prov
+            for mid in (
+                "deepseek/deepseek-chat-v3.1",
+                "google/gemma-3-27b-it:free",
+                "nvidia/nemotron-ultra:free",
+            ):
+                try:
+                    cfg_or = dict(cfg)
+                    cfg_or["api_key"] = or_key
+                    cfg_or["model"] = mid
+                    cfg_or["openrouter"] = {**or_cfg, "api_key": or_key}
+                    prov = agent_config.get_provider(
+                        name="openrouter", cfg=cfg_or)
+                    try:
+                        context_pack["role_model"] = {
+                            **(context_pack.get("role_model") or {}),
+                            "provider": "openrouter",
+                            "model": mid,
+                            "degraded_from": (
+                                context_pack.get("role_model") or {}
+                            ).get("provider"),
+                            "degrade_reason": "leaf_oneshot_miss",
+                        }
+                    except Exception:  # noqa: BLE001
+                        pass
+                    return prov
+                except Exception:  # noqa: BLE001
+                    continue
         if injected is not None:
             p_name = str(getattr(injected, "name", "") or "")
             p_model = str(getattr(injected, "model", "") or "")

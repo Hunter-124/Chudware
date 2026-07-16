@@ -1,0 +1,92 @@
+{
+  "schema": "aicad.saved_parts/1",
+  "run_id": "mega-25-fc-rocket-20260715",
+  "status": "needs_correction",
+  "stop_reason": "verify_failed: ['AC4', 'AC5']",
+  "saved": [
+    {
+      "doc_id": "doc-cpp00000001",
+      "name": "layout_skeleton",
+      "origin_kind": "mcp",
+      "paths": [
+        "/home/hunter/Repositories/CAD/reports/runs/mega-25-fc-rocket-20260715/parts/layout_skeleton_-cpp00000001.step+",
+        "/home/hunter/Documents/AI-CAD/layout_skeleton_-cpp00000001.step+"
+      ],
+      "bytes": [
+        24673,
+        24673
+      ]
+    },
+    {
+      "doc_id": "doc-cpp00000005",
+      "name": "layout_skeleton2",
+      "origin_kind": "mcp",
+      "paths": [
+        "/home/hunter/Repositories/CAD/reports/runs/mega-25-fc-rocket-20260715/parts/layout_skeleton2_-cpp00000005.step+",
+        "/home/hunter/Documents/AI-CAD/layout_skeleton2_-cpp00000005.step+"
+      ],
+      "bytes": [
+        13574,
+        13574
+      ]
+    },
+    {
+      "doc_id": "doc-cpp00000007",
+      "name": "rocket_plane_airframe",
+      "origin_kind": "mcp",
+      "paths": [
+        "/home/hunter/Repositories/CAD/reports/runs/mega-25-fc-rocket-20260715/parts/rocket_plane_airframe_-cpp00000007.step+",
+        "/home/hunter/Documents/AI-CAD/rocket_plane_airframe_-cpp00000007.step+"
+      ],
+      "bytes": [
+        68198,
+        68198
+      ]
+    }
+  ],
+  "closed": [
+    {
+      "doc_id": "doc-cpp00000001",
+      "closed": true,
+      "detached": false
+    },
+    {
+      "doc_id": "doc-cpp00000005",
+      "closed": true,
+      "detached": false
+    },
+    {
+      "doc_id": "doc-cpp00000007",
+      "closed": true,
+      "detached": false
+    }
+  ],
+  "skipped": [
+    {
+      "doc_id": "f9ec35394c6c",
+      "reason": "save_failed",
+      "name": "flight_computer",
+      "errors": [
+        "save artifact f9ec35394c6c: no such document: f9ec35394c6c",
+        "save workspace f9ec35394c6c: no such document: f9ec35394c6c"
+      ]
+    },
+    {
+      "doc_id": "7c4fae119443",
+      "reason": "save_failed",
+      "name": null,
+      "errors": [
+        "save artifact 7c4fae119443: no such document: 7c4fae119443",
+        "save workspace 7c4fae119443: no such document: 7c4fae119443"
+      ]
+    }
+  ],
+  "errors": [
+    "save artifact f9ec35394c6c: no such document: f9ec35394c6c",
+    "save workspace f9ec35394c6c: no such document: f9ec35394c6c",
+    "save artifact 7c4fae119443: no such document: 7c4fae119443",
+    "save workspace 7c4fae119443: no such document: 7c4fae119443"
+  ],
+  "parts_dir": "/home/hunter/Repositories/CAD/reports/runs/mega-25-fc-rocket-20260715/parts",
+  "workspace_dir": "/home/hunter/Documents/AI-CAD"
+}

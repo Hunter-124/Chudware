@@ -1,0 +1,17 @@
+{
+  "id": "AC8",
+  "result": "PASS",
+  "check_tool": "fw_sim_run",
+  "pass_rule": "PASS|SKIP(renode)",
+  "detail": "tool ok/passed/success=true",
+  "evidence": {
+    "passed": true,
+    "uart_log": "\nCannot determine the text encoding for the assembly location: \ufffd*\ufffdd\u0005/Renode.exe\nPlease add the correct encoding to MONO_EXTERNAL_ENCODINGS and try again.\n",
+    "gpio_states": {},
+    "assertion_results": [],
+    "ms": 307.22,
+    "gpio_events": [],
+    "trace_path": "/tmp/AI-CAD/firmware/2e4f181159ba/build/firmware.elf.trace.json",
+    "source": "live"
+  }
+}

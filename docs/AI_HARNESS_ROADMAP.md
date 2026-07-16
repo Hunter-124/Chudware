@@ -422,3 +422,19 @@ graduate only on ablation evidence; C-freedom regressions are harness bugs.
   (simulate on PCB doc). **U24/V24 PASS**. Battery `doc-cpp00000005` PASS.
   Residuals: AC4 clearance×6; AC5 schematic doc routing. Findings:
   `reports/runs/mega-24/findings.md`.
+
+- 2026-07-15 mega-25 (WS5): close mega-24 AC4/AC5 residuals under
+  `reports/runs/mega-25/` (primary a2 `mega-25-fc-rocket-20260715`).
+  Baseline `871e0fb9`. Fixer25 ExcellentPiranha: **Y25** simulate/ERC →
+  schematic doc (reviewer_exec + agent_turn mirror of B20; live mega-24
+  ledger fixture); **Z25** clearance-aware opt (`min_clearance_mm=0.2`) +
+  bounded autoroute retry intent; thrash rebind a1→a2 (end_of_turn_ecad_force
+  + drop dead mistral fallback; offline_proof FINAL_OK; gate 218p). Preflight
+  PASS: account `06dc3359`, hard→xai-sub grok-4.5, mid deepseek, leaf ollama,
+  mega25_bound. **a1** thrash-kill (fails=4, no force). **a2** wall **902s**
+  terminal `needs_correction`/`verify_failed:[AC4,AC5]` live AC **7**/9
+  (AC1–3,6–9). **Y25 PARTIAL** (sim on sch `f9ec…`, V(3V3)=0.0 not in-band).
+  **Z25 PASS** (min_clearance=0.2; honest DRC clearance×27 FAIL; retry not
+  fired). U24/V24/T23/Q22/M21/R22/G18/Y/Z1 PASS; battery `doc-cpp00000007`
+  PASS. Residuals: AC5 rail drive (P22); AC4 autoroute clearance-retry fire.
+  Findings: `reports/runs/mega-25/findings.md`.

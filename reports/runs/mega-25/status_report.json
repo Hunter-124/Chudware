@@ -1,0 +1,77 @@
+{
+  "run_id": "mega-25-fc-rocket-20260715",
+  "wall_s": 901.92,
+  "terminal": {
+    "status": "needs_correction",
+    "stop_reason": "verify_failed: ['AC4', 'AC5']",
+    "phase": "correct"
+  },
+  "live_pass": {
+    "ids": [
+      "AC1",
+      "AC2",
+      "AC3",
+      "AC6",
+      "AC7",
+      "AC8",
+      "AC9"
+    ],
+    "count": 7,
+    "live_ac": {
+      "AC1": "PASS",
+      "AC2": "PASS",
+      "AC3": "PASS",
+      "AC4": "FAIL",
+      "AC5": "FAIL",
+      "AC6": "PASS",
+      "AC7": "PASS",
+      "AC8": "PASS",
+      "AC9": "PASS"
+    }
+  },
+  "axes": {
+    "R_AC5_SPICE_wired_netlist": "PASS",
+    "T_AC5_SPICE_wired_netlist": "PASS",
+    "X_AC5_SPICE_wired_netlist": "PASS",
+    "Y_auto_pick_openrouter_paid_when_xai_blocked": "PASS",
+    "Z1_terminal_grading_unconditional": "PASS",
+    "Z3_AC5_SPICE_on_wired_netlist": "PASS",
+    "G18_grok45_full_revalidation": "PASS",
+    "B20_board_doc_id_threading": "PARTIAL",
+    "M21_mech_deliver_gate_force_chain": "PASS",
+    "P22_spice_driven_rail_topology": "PARTIAL",
+    "Q22_board_optimize_traces_drc_chain": "PASS",
+    "R22_measure_between_valid_faces": "PASS",
+    "S23_spice_v3v3_vector_readback": "PARTIAL",
+    "T23_measure_between_nonzero_score": "PASS",
+    "U24_root_cause_mega23_thrash": "PASS",
+    "V24_live_build_tool_loop": "PASS",
+    "Y25_simulate_schematic_doc_id": "PARTIAL",
+    "Z25_clearance_aware_trace_opt": "PASS",
+    "E_battery": "PASS"
+  },
+  "residuals": [
+    {
+      "id": "AC5",
+      "axis": "Y25",
+      "note": "simulate doc routing FIXED (sch f9ec35394c6c, not board); V(3V3)=0.0 finite but not in-band \u2014 rail not driven (device_count=2, U1 no sim model)"
+    },
+    {
+      "id": "AC4",
+      "axis": "Z25",
+      "note": "clearance-aware opt min_clearance_mm=0.2 present; DRC still 27 clearance errors (~0.13mm); no clearance_retry/autoroute re-route fired (retry_n=0); Z25 PASS as honest clearance FAIL"
+    }
+  ],
+  "attempts": {
+    "a1": "thrash-kill attempt-thrash-20260715T234708Z (fails=4, no force chain)",
+    "a2": "graded 7/9 wall 901.92s after thrash rebind (end_of_turn_ecad_force + no mistral)"
+  },
+  "baseline_commit": "871e0fb9",
+  "frontier": "xai-sub grok-4.5 @ 06dc3359",
+  "pair": {
+    "MegaRun25": "PresentClam",
+    "Fixer25": "ExcellentPiranha"
+  },
+  "target": ">=8/9 goal 9/9",
+  "result": "7/9 \u2014 miss by 1 for target"
+}

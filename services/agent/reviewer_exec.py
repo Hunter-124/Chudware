@@ -1702,6 +1702,12 @@ def _resolve_domain_doc_id(tool: str, ledger) -> str | None:
     Mechanical CAD ids must never reach ECAD/fw tools. When the BUILD leg
     already opened a schematic/board, re-grade with that explicit id so live
     ``ecad_simulate`` / DRC does not depend on process-global "current".
+
+    mega-25 Y25: ``ecad_simulate`` / ERC / place / wire / power MUST receive
+    the SCHEMATIC doc (netlist holder). Never the board minted later by
+    board_from_schematic. Live mega-24 AC5: force-inject args on optimize/DRC
+    carried board id and the generic ``ecad_*`` fallback promoted that board
+    id to "schematic" — SPICE then failed ``doc is a pcb, not a schematic``.
     """
     t = str(tool or "")
     if t.startswith("fw_") or t == "report_card":
@@ -1712,10 +1718,23 @@ def _resolve_domain_doc_id(tool: str, ledger) -> str | None:
         return None
 
     # Prefer board docs for board/DRC tools; schematic otherwise.
+    # Note: "drc" must not match via substring of unrelated tools; check
+    # whole-token style via explicit tool classes.
     prefer_board = any(tok in t for tok in (
         "drc", "board", "autoroute", "optimize_traces", "make_board",
         "to_3d", "export", "pdn",
     )) or t == "board_from_schematic"
+    # SPICE / ERC / capture always want the schematic (Y25).
+    prefer_sch = (
+        "simulate" in t
+        or t in (
+            "ecad_run_erc", "ecad_new_schematic", "ecad_place_symbol",
+            "ecad_wire", "ecad_add_power", "ecad_label", "ecad_status",
+        )
+        or ("erc" in t and "drc" not in t)
+    )
+    if prefer_sch:
+        prefer_board = False
 
     try:
         events = list(getattr(ledger, "events", None) or [])
@@ -1724,6 +1743,31 @@ def _resolve_domain_doc_id(tool: str, ledger) -> str | None:
 
     sch_id: str | None = None
     board_id: str | None = None
+    known_board: set[str] = set()
+    known_sch: set[str] = set()
+
+    def _mark_board(cid: str | None) -> None:
+        nonlocal board_id
+        if not cid or _is_mechanical_cad_doc_id(cid):
+            return
+        c = str(cid).strip()
+        if not c:
+            return
+        known_board.add(c)
+        if board_id is None:
+            board_id = c
+
+    def _mark_sch(cid: str | None) -> None:
+        nonlocal sch_id
+        if not cid or _is_mechanical_cad_doc_id(cid):
+            return
+        c = str(cid).strip()
+        if not c or c in known_board:
+            return
+        known_sch.add(c)
+        if sch_id is None:
+            sch_id = c
+
     for ev in reversed(events):
         if not isinstance(ev, dict):
             continue
@@ -1732,6 +1776,7 @@ def _resolve_domain_doc_id(tool: str, ledger) -> str | None:
         tool_name = p.get("tool") or p.get("tool_name") or ""
         if kind == "agent_turn" and p.get("event") == "tool_call":
             tool_name = p.get("tool") or tool_name
+        # Force-inject records have args but no result — still harvest ids.
         res = p.get("result")
         if res is None and isinstance(p.get("doc_id"), str):
             res = p
@@ -1756,6 +1801,19 @@ def _resolve_domain_doc_id(tool: str, ledger) -> str | None:
                     res = recovered
         norm = _normalize_result(_as_dict(res) if res is not None else {})
         args = p.get("args") if isinstance(p.get("args"), dict) else {}
+        tn = str(tool_name or "").lower()
+        kind_field = str(norm.get("kind") or "").lower()
+
+        # Explicit field harvest first (never confuse board/sch).
+        if norm.get("board_doc_id"):
+            _mark_board(str(norm.get("board_doc_id")))
+        if norm.get("sch_doc_id"):
+            _mark_sch(str(norm.get("sch_doc_id")))
+        if args.get("sch_doc_id"):
+            _mark_sch(str(args.get("sch_doc_id")))
+        if args.get("board_doc_id"):
+            _mark_board(str(args.get("board_doc_id")))
+
         did = (
             norm.get("board_doc_id")
             or norm.get("doc_id")
@@ -1767,58 +1825,97 @@ def _resolve_domain_doc_id(tool: str, ledger) -> str | None:
         did_s = str(did).strip()
         if not did_s or _is_mechanical_cad_doc_id(did_s):
             continue
-        kind_field = str(norm.get("kind") or "").lower()
-        tn = str(tool_name or "").lower()
-        is_board = (
+
+        is_board_tool = (
             kind_field in ("pcb", "board")
             or "board" in tn
             or "drc" in tn
+            or "autoroute" in tn
+            or "optimize_traces" in tn
+            or "to_3d" in tn
+            or "pdn" in tn
             or tn == "board_from_schematic"
             or bool(norm.get("board_doc_id"))
-            # mega-18: board tool result doc_id is the board even when sch_doc
-            # is also present.
-            or (
-                tn == "board_from_schematic"
-                and bool(norm.get("doc_id") or norm.get("board_doc_id"))
-            )
         )
-        is_sch = (
+        is_sch_tool = (
             kind_field in ("sch", "schematic")
             or "schematic" in tn
+            or "place_symbol" in tn
             or "place" in tn
             or "wire" in tn
-            or "erc" in tn
+            or ("erc" in tn and "drc" not in tn)
             or "simulate" in tn
+            or "add_power" in tn
+            or "label" in tn
             or bool(norm.get("sch_doc_id"))
+            or tn == "ecad_new_schematic"
         )
-        # Prefer explicit board_doc_id field over sch when both present.
-        board_field = norm.get("board_doc_id")
-        if board_field and not _is_mechanical_cad_doc_id(str(board_field)):
-            if board_id is None:
-                board_id = str(board_field).strip()
-        if is_board and board_id is None:
-            board_id = did_s
-        if is_sch and sch_id is None:
-            # Don't treat board_doc_id as sch.
-            sch_candidate = norm.get("sch_doc_id") or (
-                did_s if not board_field else None
-            )
-            if sch_candidate and not (
-                board_id and str(sch_candidate) == board_id
+
+        # board_from_schematic INPUT args.doc_id is the schematic; the BOARD
+        # id lives only on the successful result (board_doc_id / result.doc_id).
+        # Never mark args.doc_id as board for that tool (mega-25 Y25 live).
+        if tn == "board_from_schematic":
+            # result board fields already harvested; args.sch_doc_id / args.doc_id
+            # are schematic.
+            if args.get("doc_id") and not norm.get("board_doc_id"):
+                # Pre-result force-inject: args.doc_id is schematic.
+                _mark_sch(str(args.get("doc_id")))
+            if norm.get("doc_id") and not norm.get("board_doc_id"):
+                # Some envelopes only set doc_id on the board result.
+                # If sch_doc_id differs, doc_id is board; if only one id, need
+                # kind/board_doc_id. Prefer board_doc_id path already done.
+                pass
+            if norm.get("doc_id") and (
+                norm.get("board_doc_id")
+                or kind_field in ("pcb", "board")
+                or (norm.get("sch_doc_id") and str(norm.get("doc_id"))
+                    != str(norm.get("sch_doc_id")))
             ):
-                sch_id = str(sch_candidate).strip()
-        # Generic ECAD tool with doc_id: treat as schematic unless board-ish.
-        if not is_board and not is_sch and tn.startswith("ecad_") and sch_id is None:
-            sch_id = did_s
-        if prefer_board and board_id:
-            return board_id
-        if not prefer_board and sch_id:
-            return sch_id
-        if board_id and sch_id:
-            break
+                _mark_board(str(norm.get("doc_id")))
+            elif norm.get("doc_id") and not norm.get("sch_doc_id"):
+                # board_from_schematic result with only doc_id → board.
+                _mark_board(str(norm.get("doc_id")))
+        elif is_board_tool:
+            # Board tools: doc_id is the board; sch only from sch_doc_id field.
+            if not norm.get("board_doc_id") and not args.get("board_doc_id"):
+                if tn in (
+                    "ecad_make_board", "ecad_new_pcb",
+                    "ecad_run_drc", "ecad_optimize_traces", "ecad_autoroute",
+                    "ecad_to_3d", "ecad_run_pdn", "ecad_export",
+                ) or kind_field in ("pcb", "board"):
+                    _mark_board(did_s)
+            # Never promote board tool args.doc_id to schematic.
+        if is_sch_tool and not is_board_tool:
+            # Pure schematic tools: doc_id is the schematic.
+            if did_s not in known_board:
+                _mark_sch(did_s)
+        elif is_sch_tool and is_board_tool and tn != "board_from_schematic":
+            pass
+        elif (
+            not is_board_tool
+            and not is_sch_tool
+            and tn.startswith("ecad_")
+            and did_s not in known_board
+        ):
+            # Ambiguous ecad_* with a non-board id → schematic candidate only
+            # when we have no board evidence for this id.
+            _mark_sch(did_s)
+
+    # Drop any sch id that later proved to be a board.
+    if sch_id and sch_id in known_board:
+        known_sch.discard(sch_id)
+        sch_id = next(iter(known_sch), None) if known_sch else None
+        # Prefer any remaining known sch not in board set.
+        for cand in known_sch:
+            if cand not in known_board:
+                sch_id = cand
+                break
 
     if prefer_board:
         return board_id or sch_id
+    # Y25: schematic-preferring tools must NOT fall back to board.
+    if prefer_sch:
+        return sch_id
     return sch_id or board_id
 
 def _resolve_fw_project_id(ledger) -> str | None:

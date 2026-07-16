@@ -159,6 +159,12 @@ struct CompleteResult {
 // every call site knowing about RunEvents. Thread-local; nullptr = no emit.
 void set_provider_call_emitter(std::function<void(const json&)> emit);
 std::function<void(const json&)>& provider_call_emitter();
+// Optional live sink for incremental token deltas from a STREAMING completion.
+// emit(delta, kind) is called per chunk with kind "text" or "thinking". Set for the
+// duration of a run so the GUI can show continuous output; nullptr = no streaming
+// callback (the completion still streams over the wire, just not forwarded live).
+void set_provider_delta_emitter(std::function<void(const std::string&, const std::string&)> emit);
+std::function<void(const std::string&, const std::string&)>& provider_delta_emitter();
 CompleteResult complete(const std::string& provider, const json& cfg, const std::string& system,
                         const json& messages, int max_tokens = 8000);
 

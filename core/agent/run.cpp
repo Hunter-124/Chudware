@@ -408,6 +408,39 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
     struct ProviderEmitGuard {
         ~ProviderEmitGuard() { set_provider_call_emitter(nullptr); }
     } provider_emit_guard;
+    // Forward streaming token deltas to the run event stream so the GUI shows the
+    // model's continuous output live (channel "text" | "thinking"). Deltas are
+    // COALESCED per channel (flush at >=120 chars or on a newline) so we don't reopen
+    // events.jsonl per token — grok emits thousands. The final assistant message is
+    // persisted separately, so a trailing sub-flush buffer is not authoritative.
+    struct DeltaCoalescer {
+        RunEvents* ev;
+        std::string buf_text, buf_think;
+        std::string& chan(const std::string& kind) {
+            return kind == "thinking" ? buf_think : buf_text;
+        }
+        void flush(const std::string& kind) {
+            std::string& b = chan(kind);
+            if (b.empty()) return;
+            ev->emit("assistant_delta", json{{"text", b}, {"channel", kind}});
+            b.clear();
+        }
+        void push(const std::string& d, const std::string& kind) {
+            std::string& b = chan(kind);
+            b += d;
+            if (b.size() >= 120 || b.find('\n') != std::string::npos) flush(kind);
+        }
+        void flush_all() { flush("text"); flush("thinking"); }
+    };
+    auto coalescer = std::make_shared<DeltaCoalescer>();
+    coalescer->ev = &events;
+    set_provider_delta_emitter([coalescer](const std::string& delta, const std::string& kind) {
+        coalescer->push(delta, kind);
+    });
+    struct ProviderDeltaGuard {
+        std::shared_ptr<DeltaCoalescer> c;
+        ~ProviderDeltaGuard() { if (c) c->flush_all(); set_provider_delta_emitter(nullptr); }
+    } provider_delta_guard{coalescer};
 
     // ONE provider instance for the whole run (per-role scripted queues must persist).
     ProviderFn provider = make_provider(provider_cfg);

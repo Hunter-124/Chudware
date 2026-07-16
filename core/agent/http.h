@@ -7,6 +7,7 @@
 // non-streaming `messages.create` / `chat.completions.create` calls).
 #pragma once
 
+#include <functional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -38,6 +39,20 @@ HttpResponse http_post(const std::string& url,
 HttpResponse http_get(const std::string& url,
                       const std::vector<std::pair<std::string, std::string>>& headers,
                       int timeout_ms = 8000);
+
+// Streaming HTTPS POST. `on_chunk(ptr,len)` is invoked for each received buffer as
+// it arrives (e.g. Server-Sent-Events `data:` frames from an LLM `stream:true`
+// completion). The full concatenated body is ALSO returned in HttpResponse.body so
+// callers can fall back to a whole-body parse. Instead of a hard total-transfer cap
+// (which kills a long-but-active generation), this uses an IDLE timeout: the request
+// is aborted only when NO bytes arrive for `idle_timeout_ms` (a true stall). A live
+// token stream resets the idle timer continuously, so long completions survive.
+using HttpChunkCb = std::function<void(const char* data, size_t len)>;
+HttpResponse http_post_stream(const std::string& url,
+                              const std::vector<std::pair<std::string, std::string>>& headers,
+                              const std::string& body,
+                              const HttpChunkCb& on_chunk,
+                              int idle_timeout_ms = 120000);
 
 }  // namespace agent
 }  // namespace aicad

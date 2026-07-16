@@ -23,6 +23,52 @@ namespace {
 // Per-thread sink so a design/micro run can observe every HTTP completion without
 // threading RunEvents through complete()'s call graph.
 thread_local std::function<void(const json&)> g_provider_call_emitter;
+// Per-thread sink for incremental token deltas (streaming completions). kind is
+// "text" or "thinking". nullptr = no live streaming (behaviour == pre-streaming).
+thread_local std::function<void(const std::string&, const std::string&)> g_provider_delta_emitter;
+
+// Incremental Server-Sent-Events accumulator for OpenAI-compatible `stream:true`
+// chat completions. feed() is called per received network buffer; it reassembles
+// `data:` lines across buffer boundaries, accumulates content + reasoning deltas,
+// and forwards each delta to the live emitter as it arrives.
+struct SseAccum {
+    std::string text;
+    std::string thinking;
+    std::string carry;
+    void reset() { text.clear(); thinking.clear(); carry.clear(); }
+    void feed(const char* data, size_t len,
+              const std::function<void(const std::string&, const std::string&)>& emit) {
+        carry.append(data, len);
+        size_t nl;
+        while ((nl = carry.find('\n')) != std::string::npos) {
+            std::string line = carry.substr(0, nl);
+            carry.erase(0, nl + 1);
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.rfind("data:", 0) != 0) continue;  // skip ':' comments / event: / blanks
+            std::string payload = line.substr(5);
+            const size_t s = payload.find_first_not_of(' ');
+            if (s == std::string::npos) continue;
+            payload = payload.substr(s);
+            if (payload == "[DONE]") continue;
+            json j = json::parse(payload, nullptr, false);
+            if (j.is_discarded() || !j.contains("choices") || !j["choices"].is_array() ||
+                j["choices"].empty())
+                continue;
+            const json& d = j["choices"][0].value("delta", json::object());
+            if (d.contains("content") && d["content"].is_string()) {
+                const std::string c = d["content"].get<std::string>();
+                if (!c.empty()) { text += c; if (emit) emit(c, "text"); }
+            }
+            for (const char* k : {"reasoning_content", "reasoning"}) {
+                if (d.contains(k) && d[k].is_string()) {
+                    const std::string c = d[k].get<std::string>();
+                    if (!c.empty()) { thinking += c; if (emit) emit(c, "thinking"); }
+                    break;
+                }
+            }
+        }
+    }
+};
 
 std::string truncate_excerpt(std::string s, size_t n = 200) {
     // Collapse whitespace so a multi-line JSON error body becomes one chat-friendly line.
@@ -90,6 +136,13 @@ void set_provider_call_emitter(std::function<void(const json&)> emit) {
     g_provider_call_emitter = std::move(emit);
 }
 std::function<void(const json&)>& provider_call_emitter() { return g_provider_call_emitter; }
+
+void set_provider_delta_emitter(std::function<void(const std::string&, const std::string&)> emit) {
+    g_provider_delta_emitter = std::move(emit);
+}
+std::function<void(const std::string&, const std::string&)>& provider_delta_emitter() {
+    return g_provider_delta_emitter;
+}
 
 
 const char* kAnthropicDefaultModel = "claude-opus-4-8";
@@ -1195,50 +1248,74 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
         for (auto& h : req.headers)
             if (h.first == "Authorization")
                 h.second = "Bearer " + (api_key.empty() ? std::string("not-needed") : api_key);
-        RetryResult rr = http_post_retry(req.url, req.headers, req.body);
-        res.endpoint = req.url;
-        res.model = model;
-        res.attempt = rr.attempt;
-        res.http_status = static_cast<int>(rr.hr.status);
-        res.request_id = request_id_from_body(rr.hr.body);
-        if (!rr.hr.error.empty()) {
-            res.error = rr.hr.error;
-            res.error_excerpt = truncate_excerpt(rr.hr.error);
-            return finish(std::move(res));
-        }
         const char* err_name =
             (provider == "xai" || provider == "xai-sub")
                 ? (provider == "xai-sub" ? "xai-sub" : "xai")
                 : "openai";
-        if (rr.hr.status < 200 || rr.hr.status >= 300) {
-            res.error = concise_http_error(err_name, rr.hr.status, rr.hr.body);
-            res.error_excerpt = truncate_excerpt(rr.hr.body.empty() ? res.error : rr.hr.body);
+        // STREAM the completion: token deltas flow continuously so the idle timeout
+        // never kills a long-but-active generation (the old 120s hard-cap death), and
+        // each delta is forwarded live to the run's sink for the GUI's continuous
+        // output. openai_build_request stays pure (parity-tested); we add stream:true
+        // to the built body only here.
+        json sbody = req.body_json;
+        sbody["stream"] = true;
+        const std::string stream_body = sbody.dump();
+        std::vector<std::pair<std::string, std::string>> sheaders = req.headers;
+        sheaders.push_back({"Accept", "text/event-stream"});
+        SseAccum acc;
+        auto& delta_emit = g_provider_delta_emitter;
+        HttpChunkCb on_chunk = [&](const char* data, size_t len) {
+            acc.feed(data, len, delta_emit);
+        };
+        // Retry transient 429/503 (mirrors http_post_retry) but only when nothing has
+        // streamed yet — never discard a partially-received completion.
+        HttpResponse hr;
+        int attempt = 1;
+        int delay_ms = 1000;
+        for (;;) {
+            acc.reset();
+            hr = http_post_stream(req.url, sheaders, stream_body, on_chunk);
+            const bool streamed = !acc.text.empty() || !acc.thinking.empty();
+            const bool retryable = hr.error.empty() && !streamed &&
+                                   (hr.status == 429 || hr.status == 503);
+            if (!retryable || attempt >= 5 || is_daily_quota_exhausted(hr)) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+            delay_ms *= 2;
+            ++attempt;
+        }
+        const bool streamed = !acc.text.empty() || !acc.thinking.empty();
+        res.endpoint = req.url;
+        res.model = model;
+        res.attempt = attempt;
+        res.http_status = static_cast<int>(hr.status);
+        res.request_id = request_id_from_body(hr.body);
+        if (!hr.error.empty() && !streamed) {
+            res.error = hr.error;
+            res.error_excerpt = truncate_excerpt(hr.error);
             return finish(std::move(res));
         }
-        json parsed = json::parse(rr.hr.body, nullptr, false);
-        ParsedReply pr = openai_parse_response(parsed);
-        if (pr.text.empty()) {
-            // Grok reasoning variants may put CoT only in reasoning_content.
-            if (parsed.contains("choices") && parsed["choices"].is_array() &&
-                !parsed["choices"].empty()) {
-                const auto& msg = parsed["choices"][0].value("message", json::object());
-                if (msg.contains("reasoning_content") && msg["reasoning_content"].is_string())
-                    pr.text = msg["reasoning_content"].get<std::string>();
-                else if (msg.contains("reasoning") && msg["reasoning"].is_string())
-                    pr.text = msg["reasoning"].get<std::string>();
-            }
-            if (pr.text.empty()) {
-                if (!parsed.contains("choices") || !parsed["choices"].is_array() ||
-                    parsed["choices"].empty()) {
-                    res.error = std::string(err_name) + " endpoint returned no completion";
-                    res.error_excerpt =
-                        truncate_excerpt(rr.hr.body.empty() ? res.error : rr.hr.body);
-                    return finish(std::move(res));
-                }
-            }
+        if ((hr.status < 200 || hr.status >= 300) && !streamed) {
+            res.error = concise_http_error(err_name, hr.status, hr.body);
+            res.error_excerpt = truncate_excerpt(hr.body.empty() ? res.error : hr.body);
+            return finish(std::move(res));
         }
-        res.text = pr.text;
-        res.thinking = pr.thinking;
+        std::string text = acc.text;
+        std::string thinking = acc.thinking;
+        if (text.empty() && thinking.empty()) {
+            // Endpoint ignored stream:true and returned one JSON object — whole-body parse.
+            json parsed = json::parse(hr.body, nullptr, false);
+            ParsedReply pr = openai_parse_response(parsed);
+            text = pr.text;
+            thinking = pr.thinking;
+        }
+        if (text.empty() && !thinking.empty()) text = thinking;  // CoT-only fallback
+        if (text.empty()) {
+            res.error = std::string(err_name) + " endpoint returned no completion";
+            res.error_excerpt = truncate_excerpt(hr.body.empty() ? res.error : hr.body);
+            return finish(std::move(res));
+        }
+        res.text = text;
+        res.thinking = thinking;
         return finish(std::move(res));
     }
 

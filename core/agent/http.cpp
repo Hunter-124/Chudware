@@ -266,6 +266,20 @@ HttpResponse http_get(const std::string& url,
     return out;
 }
 
+HttpResponse http_post_stream(const std::string& url,
+                              const std::vector<std::pair<std::string, std::string>>& headers,
+                              const std::string& body,
+                              const HttpChunkCb& on_chunk,
+                              int idle_timeout_ms) {
+    // WinHTTP path: no incremental SSE parsing here (Linux/daemon is the streaming
+    // target). Do a blocking POST, then deliver the whole body once so callers that
+    // parse SSE still receive it. idle_timeout_ms maps to the receive timeout.
+    HttpResponse r = http_post(url, headers, body,
+                               idle_timeout_ms > 0 ? idle_timeout_ms : 120000);
+    if (on_chunk && !r.body.empty()) on_chunk(r.body.data(), r.body.size());
+    return r;
+}
+
 }  // namespace agent
 }  // namespace aicad
 
@@ -351,6 +365,66 @@ HttpResponse curl_request(const std::string& url,
     return out;
 }
 
+// Streaming variant of curl_request: emits each received buffer via on_chunk as it
+// arrives, and uses an IDLE timeout (low-speed) instead of a hard total cap so a
+// long-but-active LLM generation is never killed mid-stream.
+struct StreamCtx {
+    std::string* body;
+    const HttpChunkCb* cb;
+};
+size_t stream_write_cb(char* ptr, size_t size, size_t nmemb, void* userdata) {
+    auto* ctx = static_cast<StreamCtx*>(userdata);
+    const size_t n = size * nmemb;
+    ctx->body->append(ptr, n);
+    if (ctx->cb && *ctx->cb) (*ctx->cb)(ptr, n);
+    return n;
+}
+HttpResponse curl_stream_request(const std::string& url,
+                                 const std::vector<std::pair<std::string, std::string>>& headers,
+                                 const std::string& body, const HttpChunkCb& on_chunk,
+                                 int idle_timeout_ms) {
+    HttpResponse out;
+    (void)curl_global();
+    CURL* curl = curl_easy_init();
+    if (!curl) { out.error = "curl_easy_init failed"; return out; }
+    struct curl_slist* hdrs = nullptr;
+    for (const auto& h : headers) {
+        const std::string line = h.first + ": " + h.second;
+        hdrs = curl_slist_append(hdrs, line.c_str());
+    }
+    hdrs = curl_slist_append(hdrs, "Expect:");
+    StreamCtx ctx{&out.body, &on_chunk};
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    if (hdrs) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "aicad-agent/1.0");
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, stream_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ctx);
+    // IDLE timeout: abort only when < 1 byte/sec is sustained for idle_timeout_ms
+    // (a true stall). A live token stream resets this continuously.
+    const long idle_s = idle_timeout_ms > 0 ? (idle_timeout_ms + 999) / 1000 : 120;
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, idle_s);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 30000L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 0L);  // no hard total-transfer cap
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.data());
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(body.size()));
+    const CURLcode res = curl_easy_perform(curl);
+    if (res != CURLE_OK) {
+        // Keep any partial body (accumulated SSE) so the caller can salvage text.
+        out.error = std::string("curl_easy_perform failed: ") + curl_easy_strerror(res);
+    } else {
+        long status = 0;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+        out.status = status;
+    }
+    if (hdrs) curl_slist_free_all(hdrs);
+    curl_easy_cleanup(curl);
+    return out;
+}
+
 }  // namespace
 
 HttpResponse http_post(const std::string& url,
@@ -363,6 +437,13 @@ HttpResponse http_get(const std::string& url,
                       const std::vector<std::pair<std::string, std::string>>& headers,
                       int timeout_ms) {
     return curl_request(url, headers, nullptr, timeout_ms);
+}
+
+HttpResponse http_post_stream(const std::string& url,
+                              const std::vector<std::pair<std::string, std::string>>& headers,
+                              const std::string& body, const HttpChunkCb& on_chunk,
+                              int idle_timeout_ms) {
+    return curl_stream_request(url, headers, body, on_chunk, idle_timeout_ms);
 }
 
 }  // namespace agent

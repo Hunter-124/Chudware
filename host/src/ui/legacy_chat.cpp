@@ -8,7 +8,7 @@
 // Edit/Ask dropdown + context meter; transparent prompt with in-box send; graduated-width segmented
 // model/thinking/paperclip/cube/New toolbar — model biggest, icons smallest).
 // Header gear swaps the chat area for a compact AI-settings overlay (horizontal top tabs for
-// Agents/Prompts/Skills/Permissions/Accounts). The full form lives in the Settings modal AI tab.
+// Agents/Prompts/Skills/Permissions/Providers). The full form lives in the Settings modal AI tab.
 // Bubbles/cards (user prompt, prose, thinking, action, plan, error) and the composer are painted
 // as translucent adaptive Liquid-Glass bubbles over the live viewport backdrop (host contract
 // H5, GlassGroup::Copilot; see chatSurf()/GlassBubble/semanticOnGlass below) so every ink tone
@@ -3864,7 +3864,7 @@ bool drawProviderModelPicker(AppState& st, bool busy, bool slim) {
 
 // AI-settings OVERLAY body — fills the Copilot chat area when the header gear is
 // toggled (same in-column swap as Sessions). Wrapping top tabs + Interwebz glass
-// groups for Agents / Prompts / Skills / Permissions / Accounts.
+// groups for Agents / Prompts / Skills / Permissions / Providers.
 // Esc / gear / "< Chat" style back returns to the conversation.
 namespace {
 // Forward decl — definition lives with the subscription usage strip below.
@@ -3875,6 +3875,9 @@ struct OvRoleAssign {
     bool isAuto = true;
     std::string provider;
     std::string model;
+    // Per-role reasoning effort: "auto" | "low" | "medium" | "high" (default auto).
+    // Same ai_roles.<role>.thinking key the Settings modal Model-roles table writes.
+    std::string thinking = "auto";
 };
 struct OvRolePick {
     bool isAuto = false;
@@ -3931,6 +3934,7 @@ static void ovEnsureDefaultRoles() {
         if (s_ovRoles.roles.find(kOvRoleKeys[i]) == s_ovRoles.roles.end()) {
             OvRoleAssign a;
             a.isAuto = true;
+            a.thinking = "auto";
             s_ovRoles.roles[kOvRoleKeys[i]] = a;
         }
     }
@@ -4003,16 +4007,22 @@ static void ovPollRoles(AppState& st, bool force) {
         for (int i = 0; i < kOvRoleCount; ++i) {
             OvRoleAssign a;
             a.isAuto = true;
+            a.thinking = "auto";
             auto it = roles.find(kOvRoleKeys[i]);
             if (it != roles.end()) {
                 if (it->is_string()) {
                     std::string v = it->get<std::string>();
                     a.isAuto = (v == "auto" || v.empty());
                 } else if (it->is_object()) {
-                    a.isAuto = false;
                     a.provider = it->value("provider", std::string());
                     a.model = it->value("model", std::string());
-                    if (a.provider.empty() && a.model.empty()) a.isAuto = true;
+                    const std::string mode = it->value("mode", std::string());
+                    a.isAuto = (mode == "auto") || (a.provider.empty() && a.model.empty());
+                    // thinking: auto|low|medium|high (default auto).
+                    std::string th = it->value("thinking", std::string("auto"));
+                    if (th != "low" && th != "medium" && th != "high" && th != "auto")
+                        th = "auto";
+                    a.thinking = th;
                 }
             }
             s_ovRoles.roles[kOvRoleKeys[i]] = std::move(a);
@@ -4025,11 +4035,19 @@ static void ovSetRole(AppState& st, const char* roleKey, const OvRoleAssign& a) 
     s_ovRoles.roles[roleKey] = a;
     nlohmann::json p;
     nlohmann::json roles = nlohmann::json::object();
+    // Always object form so thinking rides alongside model auto/fixed
+    // (mirrors settings_modal.cpp setRoleAssign → ai_roles_set).
+    nlohmann::json entry = nlohmann::json::object();
     if (a.isAuto) {
-        roles[roleKey] = "auto";
+        entry["mode"] = "auto";
     } else {
-        roles[roleKey] = nlohmann::json{{"provider", a.provider}, {"model", a.model}};
+        entry["provider"] = a.provider;
+        entry["model"] = a.model;
     }
+    std::string th = a.thinking.empty() ? "auto" : a.thinking;
+    if (th != "low" && th != "medium" && th != "high" && th != "auto") th = "auto";
+    entry["thinking"] = th;
+    roles[roleKey] = std::move(entry);
     p["roles"] = roles;
     s_ovRoles.saveInFlight = true;
     st.rpc.call("ai_roles_set", p, [](const core::RpcResult& r) {
@@ -4044,12 +4062,18 @@ static void ovSetRole(AppState& st, const char* roleKey, const OvRoleAssign& a) 
                 auto it = roles.find(kOvRoleKeys[i]);
                 if (it == roles.end()) continue;
                 OvRoleAssign a;
+                a.thinking = "auto";
                 if (it->is_string()) {
                     a.isAuto = (it->get<std::string>() == "auto");
                 } else if (it->is_object()) {
-                    a.isAuto = false;
                     a.provider = it->value("provider", std::string());
                     a.model = it->value("model", std::string());
+                    const std::string mode = it->value("mode", std::string());
+                    a.isAuto = (mode == "auto") || (a.provider.empty() && a.model.empty());
+                    std::string th = it->value("thinking", std::string("auto"));
+                    if (th != "low" && th != "medium" && th != "high" && th != "auto")
+                        th = "auto";
+                    a.thinking = th;
                 }
                 s_ovRoles.roles[kOvRoleKeys[i]] = a;
             }
@@ -4281,6 +4305,8 @@ static void ovApplyProviderDefaults(Settings& s) {
     }
 }
 
+static void drawOvCorporateRolesBox(float S);
+
 static void drawOvAgentsTab(AppState& st, float S, bool& changed) {
     Settings& s = st.settings;
     ovPollRoles(st, /*force=*/false);
@@ -4292,7 +4318,8 @@ static void drawOvAgentsTab(AppState& st, float S, bool& changed) {
     if (ui::InterwebzGroupBegin("##ov_roles", "Role models", ImVec2(0, colH))) {
         ImGui::PushStyleColor(ImGuiCol_Text,
             ImVec4(ui::palette.textDim[0], ui::palette.textDim[1], ui::palette.textDim[2], 1));
-        ImGui::TextWrapped("Per-role assignment. Auto picks from rankings within enabled providers.");
+        ImGui::TextWrapped("Per-role model + thinking. Auto model from rankings; "
+                           "Thinking Auto = classifier/dispatcher.");
         ImGui::PopStyleColor();
         if (s_ovRoles.rpcMissing) {
             ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusWarn));
@@ -4356,9 +4383,11 @@ static void drawOvAgentsTab(AppState& st, float S, bool& changed) {
             int comboSel = sel;
             if (ui::InterwebzCombo("##role_model", &comboSel, labels.data(), (int)labels.size()) &&
                 comboSel >= 0 && comboSel < (int)picks.size()) {
-                OvRoleAssign next;
+                OvRoleAssign next = a;  // preserve thinking
                 if (picks[comboSel].isAuto) {
                     next.isAuto = true;
+                    next.provider.clear();
+                    next.model.clear();
                 } else {
                     next.isAuto = false;
                     next.provider = ovRoleProviderWire(picks[comboSel].provider);
@@ -4371,9 +4400,34 @@ static void drawOvAgentsTab(AppState& st, float S, bool& changed) {
                     ovSetRole(st, key, next);
                 }
             }
+            // Thinking effort: Auto / Low / Medium / High (same ai_roles.<role>.thinking).
+            static const char* kThinkLabels[] = {"Auto", "Low", "Medium", "High"};
+            static const char* kThinkValues[] = {"auto", "low", "medium", "high"};
+            int thinkSel = 0;
+            for (int ti = 0; ti < 4; ++ti) {
+                if (a.thinking == kThinkValues[ti]) { thinkSel = ti; break; }
+            }
+            ImGui::SetNextItemWidth(ImMax(72.0f * S, ImGui::GetContentRegionAvail().x * 0.42f));
+            if (ui::InterwebzCombo("Thinking", &thinkSel, kThinkLabels, 4) &&
+                thinkSel >= 0 && thinkSel < 4) {
+                OvRoleAssign next = a;
+                next.thinking = kThinkValues[thinkSel];
+                ovSetRole(st, key, next);
+            }
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                if (std::strcmp(key, "default") == 0) {
+                    ImGui::SetTooltip(
+                        "Auto: chat classifier assigns effort per prompt.\n"
+                        "Low/Medium/High: force that level for Default-role calls.");
+                } else {
+                    ImGui::SetTooltip(
+                        "Auto: dispatcher assigns effort by task complexity.\n"
+                        "Low/Medium/High: force that level for this role's calls.");
+                }
+            }
             if (ro) ImGui::EndDisabled();
             ImGui::PopID();
-            ImGui::Dummy(ImVec2(0, 2.0f * S));
+            ImGui::Dummy(ImVec2(0, 1.0f * S));
         }
     }
     ui::InterwebzGroupEnd();
@@ -4530,6 +4584,204 @@ static void drawOvAgentsTab(AppState& st, float S, bool& changed) {
     }
     ui::InterwebzGroupEnd();
     ui::InterwebzTwoColumnEnd();
+
+    // Corporate Roles — opt-in org structure for copilot subagents (below Role models).
+    // Persists agent.corporate_mode + agent.corporate via the same config.json path as
+    // Permissions' agent.max_subagent_depth (load-modify-write, no RPC).
+    ImGui::Dummy(ImVec2(0, ui::metrics::U(1.0f)));
+    drawOvCorporateRolesBox(S);
+}
+
+// ---- Corporate Roles (agent.corporate_mode + agent.corporate) -----------------
+struct OvCorporateCfg {
+    bool mode = false;
+    int maxDepartments = 3;
+    bool teamLeads = true;
+    int meetingCadence = 5;
+    bool directorReview = true;
+};
+
+static void ovClampCorporate(OvCorporateCfg& c) {
+    if (c.maxDepartments < 1) c.maxDepartments = 1;
+    if (c.maxDepartments > 6) c.maxDepartments = 6;
+    if (c.meetingCadence < 1) c.meetingCadence = 1;
+    if (c.meetingCadence > 20) c.meetingCadence = 20;
+}
+
+static OvCorporateCfg ovLoadCorporate() {
+    // agent.corporate_mode (bool, default false) + agent.corporate object:
+    // max_departments (1-6, def 3), team_leads (bool, def true),
+    // meeting_cadence (1-20 completions, def 5), director_review (bool, def true).
+    OvCorporateCfg c;
+    try {
+        std::ifstream in(configPath());
+        if (in) {
+            nlohmann::json j;
+            in >> j;
+            if (j.is_object()) {
+                auto agent = j.value("agent", nlohmann::json::object());
+                if (agent.is_object()) {
+                    if (agent.contains("corporate_mode") && agent["corporate_mode"].is_boolean())
+                        c.mode = agent["corporate_mode"].get<bool>();
+                    auto corp = agent.value("corporate", nlohmann::json::object());
+                    if (corp.is_object()) {
+                        if (corp.contains("max_departments") &&
+                            corp["max_departments"].is_number_integer())
+                            c.maxDepartments = corp["max_departments"].get<int>();
+                        if (corp.contains("team_leads") && corp["team_leads"].is_boolean())
+                            c.teamLeads = corp["team_leads"].get<bool>();
+                        if (corp.contains("meeting_cadence") &&
+                            corp["meeting_cadence"].is_number_integer())
+                            c.meetingCadence = corp["meeting_cadence"].get<int>();
+                        if (corp.contains("director_review") &&
+                            corp["director_review"].is_boolean())
+                            c.directorReview = corp["director_review"].get<bool>();
+                    }
+                }
+            }
+        }
+    } catch (...) {}
+    ovClampCorporate(c);
+    return c;
+}
+
+static void ovSaveCorporate(const OvCorporateCfg& cfg) {
+    OvCorporateCfg c = cfg;
+    ovClampCorporate(c);
+    try {
+        nlohmann::json j = nlohmann::json::object();
+        {
+            std::ifstream in(configPath());
+            if (in) {
+                nlohmann::json old;
+                in >> old;
+                if (old.is_object()) j = std::move(old);
+            }
+        }
+        if (!j.contains("agent") || !j["agent"].is_object())
+            j["agent"] = nlohmann::json::object();
+        j["agent"]["corporate_mode"] = c.mode;
+        nlohmann::json corp = nlohmann::json::object();
+        if (j["agent"].contains("corporate") && j["agent"]["corporate"].is_object())
+            corp = j["agent"]["corporate"];
+        corp["max_departments"] = c.maxDepartments;
+        corp["team_leads"] = c.teamLeads;
+        corp["meeting_cadence"] = c.meetingCadence;
+        corp["director_review"] = c.directorReview;
+        j["agent"]["corporate"] = std::move(corp);
+        const std::string path = configPath();
+        const std::string tmp = path + ".tmp";
+        std::ofstream(tmp) << j.dump(2);
+        std::filesystem::rename(tmp, path);
+    } catch (...) {}
+}
+
+static void drawOvCorporateRolesBox(float S) {
+    static bool s_loaded = false;
+    static OvCorporateCfg s_corp;
+    if (!s_loaded) {
+        s_corp = ovLoadCorporate();
+        s_loaded = true;
+    }
+
+    // Content-height glass box (AutoResizeY so the box hugs content — no empty
+    // glass / nested scrollbar growth). Title row matches InterwebzGroupBegin
+    // and carries the on/off toggle bound to agent.corporate_mode.
+    {
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(ui::palette.accent[0], ui::palette.accent[1],
+                   ui::palette.accent[2], 1.0f));
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("Corporate Roles");
+        ImGui::PopStyleColor();
+        {
+            const ImVec2 p0 = ImGui::GetItemRectMin();
+            const ImVec2 p1 = ImGui::GetItemRectMax();
+            ImGui::GetWindowDrawList()->AddLine(
+                ImVec2(p0.x, p1.y + 1.0f * S), ImVec2(p1.x, p1.y + 1.0f * S),
+                ImGui::GetColorU32(ImVec4(ui::palette.accent[0], ui::palette.accent[1],
+                                          ui::palette.accent[2], 0.60f)),
+                1.0f * S);
+        }
+        ImGui::SameLine();
+        bool mode = s_corp.mode;
+        if (ui::InterwebzCheckbox("On", &mode)) {
+            s_corp.mode = mode;
+            ovSaveCorporate(s_corp);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Opt-in company structure for copilot subagents.\n"
+                "Persists as agent.corporate_mode (default off).");
+        ImGui::Dummy(ImVec2(0, 4.0f * S));
+    }
+
+    ui::pushGlassChildStyle(8.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14.0f * S, 12.0f * S));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f * S, 8.0f * S));
+    if (ImGui::BeginChild("##ov_corporate", ImVec2(0, 0),
+                          ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY,
+                          ImGuiWindowFlags_NoScrollbar)) {
+        if (s_corp.mode) {
+            ImGui::SetNextItemWidth(ImMax(120.0f * S, ImGui::GetContentRegionAvail().x * 0.85f));
+            int depts = s_corp.maxDepartments;
+            if (ui::InterwebzSliderInt("Max departments", &depts, 1, 6, "%d")) {
+                s_corp.maxDepartments = depts;
+                ovClampCorporate(s_corp);
+                ovSaveCorporate(s_corp);
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(
+                    "How many departments the director may open (1-6).\n"
+                    "Persists as agent.corporate.max_departments (default 3).");
+
+            bool leads = s_corp.teamLeads;
+            if (ui::InterwebzCheckbox("Team leads", &leads)) {
+                s_corp.teamLeads = leads;
+                ovSaveCorporate(s_corp);
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(
+                    "Department heads may appoint a team lead for intra-dept sync.\n"
+                    "Persists as agent.corporate.team_leads (default on).");
+
+            ImGui::SetNextItemWidth(ImMax(120.0f * S, ImGui::GetContentRegionAvail().x * 0.85f));
+            int cadence = s_corp.meetingCadence;
+            if (ui::InterwebzSliderInt("Meeting cadence", &cadence, 1, 20, "%d")) {
+                s_corp.meetingCadence = cadence;
+                ovClampCorporate(s_corp);
+                ovSaveCorporate(s_corp);
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(
+                    "Worker task-completions between head status meetings (1-20).\n"
+                    "Persists as agent.corporate.meeting_cadence (default 5).");
+
+            bool review = s_corp.directorReview;
+            if (ui::InterwebzCheckbox("Director review", &review)) {
+                s_corp.directorReview = review;
+                ovSaveCorporate(s_corp);
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(
+                    "Director reviews department alignment after head meetings.\n"
+                    "Persists as agent.corporate.director_review (default on).");
+        }
+
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
+                   ui::palette.textDim[2], 1));
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x);
+        ImGui::TextUnformatted(
+            "Departments with heads that hire their own worker subagents; heads meet to "
+            "sync status; a director oversees alignment. Workers never talk to the "
+            "director directly.");
+        ImGui::PopTextWrapPos();
+        ImGui::PopStyleColor();
+    }
+    ImGui::EndChild();
+    ImGui::PopStyleVar(2);
+    ui::popGlassChildStyle();
 }
 
 static void drawOvPromptsTab(AppState& st, float S, bool& changed) {
@@ -4760,31 +5012,58 @@ static void drawOvSkillsTab(AppState& st, float S) {
     ui::InterwebzTwoColumnEnd();
 }
 
+static int ovLoadMaxSubagentDepth() {
+    // agent.max_subagent_depth — nesting levels of subagent-spawning-subagent
+    // (not concurrency). Root chat = depth 0. Default 2, GUI clamp 0-4.
+    // Enforced by AgentCoord (delegation.py / mission_dispatch.py).
+    int depth = 2;
+    try {
+        std::ifstream in(configPath());
+        if (in) {
+            nlohmann::json j;
+            in >> j;
+            if (j.is_object()) {
+                auto agent = j.value("agent", nlohmann::json::object());
+                if (agent.is_object() && agent.contains("max_subagent_depth") &&
+                    agent["max_subagent_depth"].is_number_integer()) {
+                    depth = agent["max_subagent_depth"].get<int>();
+                }
+            }
+        }
+    } catch (...) {}
+    if (depth < 0) depth = 0;
+    if (depth > 4) depth = 4;
+    return depth;
+}
+static void ovSaveMaxSubagentDepth(int depth) {
+    if (depth < 0) depth = 0;
+    if (depth > 4) depth = 4;
+    try {
+        nlohmann::json j = nlohmann::json::object();
+        {
+            std::ifstream in(configPath());
+            if (in) {
+                nlohmann::json old;
+                in >> old;
+                if (old.is_object()) j = std::move(old);
+            }
+        }
+        if (!j.contains("agent") || !j["agent"].is_object())
+            j["agent"] = nlohmann::json::object();
+        j["agent"]["max_subagent_depth"] = depth;
+        const std::string path = configPath();
+        const std::string tmp = path + ".tmp";
+        std::ofstream(tmp) << j.dump(2);
+        std::filesystem::rename(tmp, path);
+    } catch (...) {}
+}
+
 static void drawOvPermissionsTab(AppState& st, float S, bool& changed) {
     Settings& s = st.settings;
-    // Single-column stacked groups so narrow copilot width doesn't clip checkbox labels.
-    // (Two-column layout was clipping InterwebzCheckbox text when col_w < label width.)
-    const float gapY = ui::metrics::U(2.0f);
-    if (ui::InterwebzGroupBegin("##ov_privacy", "Privacy", ImVec2(0, 0))) {
-        // Shorter labels + wrap-friendly wording so text is never cut at the glass edge.
-        if (ui::InterwebzCheckbox("Offline mode (local only)", &s.offlineMode))
-            changed = true;
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip(
-                "Refuse cloud providers. Only a local loopback endpoint is allowed.");
-        ui::InterwebzCheckbox("Show assistant thoughts", &gShowThinking);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Show the AI's reasoning steps inline.");
-        ImGui::Dummy(ImVec2(0, 4.0f * S));
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(ui::palette.textDim[0], ui::palette.textDim[1], ui::palette.textDim[2], 1));
-        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x);
-        ImGui::TextUnformatted("Telemetry is not collected \xe2\x80\x94 Billet does not phone home.");
-        ImGui::PopTextWrapPos();
-        ImGui::PopStyleColor();
-    }
-    ui::InterwebzGroupEnd();
-    ImGui::Dummy(ImVec2(0, gapY));
+    // Run permissions first, then compact Privacy. Single column so narrow
+    // copilot width never clips InterwebzCheckbox labels.
+    const float gapY = ui::metrics::U(1.0f);
+
     if (ui::InterwebzGroupBegin("##ov_run", "Run permissions", ImVec2(0, 0))) {
         if (ui::InterwebzCheckbox("Supervised (plan + clarify)", &s.planMode))
             changed = true;
@@ -4794,7 +5073,6 @@ static void drawOvPermissionsTab(AppState& st, float S, bool& changed) {
         if (ui::InterwebzCheckbox("Vision (send screenshots)", &s.vision))
             changed = true;
         int iters = s.maxIters;
-        // Give the slider enough width for label + value at any uiScale.
         ImGui::SetNextItemWidth(ImMax(120.0f * S, ImGui::GetContentRegionAvail().x * 0.85f));
         if (ui::InterwebzSliderInt("Refine-pass cap", &iters, 0, 32, "%d")) {
             if (iters < 0) iters = 0;
@@ -4803,54 +5081,560 @@ static void drawOvPermissionsTab(AppState& st, float S, bool& changed) {
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("0 = automatic refine-pass budget.");
+
+        // Nesting depth of subagent-spawning-subagent (not concurrency).
+        static int s_maxDepth = -1;
+        if (s_maxDepth < 0) s_maxDepth = ovLoadMaxSubagentDepth();
+        int depth = s_maxDepth;
+        ImGui::SetNextItemWidth(ImMax(120.0f * S, ImGui::GetContentRegionAvail().x * 0.85f));
+        if (ui::InterwebzSliderInt("Max subagent nesting", &depth, 0, 4, "%d")) {
+            if (depth < 0) depth = 0;
+            if (depth > 4) depth = 4;
+            s_maxDepth = depth;
+            ovSaveMaxSubagentDepth(depth);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "How deep a subagent may spawn further subagents (0-4).\n"
+                "Root chat is depth 0. Not a concurrency limit.\n"
+                "Persists as agent.max_subagent_depth (default 2).");
+
         ui::InterwebzKeyValueRow("Mode", s.planMode ? "Supervised" : "Autopilot");
         ui::InterwebzKeyValueRow("Offline", s.offlineMode ? "on" : "off");
     }
     ui::InterwebzGroupEnd();
+    ImGui::Dummy(ImVec2(0, gapY));
+
+    // Privacy is content-height only — no fixed tall box wasting empty glass.
+    if (ui::InterwebzGroupBegin("##ov_privacy", "Privacy", ImVec2(0, 0))) {
+        if (ui::InterwebzCheckbox("Offline mode (local only)", &s.offlineMode))
+            changed = true;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Refuse cloud providers. Only a local loopback endpoint is allowed.");
+        ui::InterwebzCheckbox("Show assistant thoughts", &gShowThinking);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Show the AI's reasoning steps inline.");
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(ui::palette.textDim[0], ui::palette.textDim[1], ui::palette.textDim[2], 1));
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x);
+        ImGui::TextUnformatted("Telemetry is not collected \xe2\x80\x94 Billet does not phone home.");
+        ImGui::PopTextWrapPos();
+        ImGui::PopStyleColor();
+    }
+    ui::InterwebzGroupEnd();
 }
 
-static void drawOvAccountsTab(AppState& st, float S) {
-    const float colH = ImMax(180.0f * S, ImGui::GetContentRegionAvail().y - 8.0f * S);
-    ui::InterwebzTwoColumnBegin(12.0f);
-    if (ui::InterwebzGroupBegin("##ov_acct_usage", "Active subscription", ImVec2(0, colH))) {
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(ui::palette.textDim[0], ui::palette.textDim[1], ui::palette.textDim[2], 1));
-        ImGui::TextWrapped("Usage for the active provider. Polls subscription_usage.");
+// ---- Providers tab (merged Accounts: sign-in state, accounts, usage) ----
+struct OvSubUsageWindow {
+    std::string window;
+    std::string label;
+    float usedFraction = 0.f;
+    bool hasFraction = false;
+    std::string resetsAt;
+    std::string status;
+};
+struct OvSubAccountRow {
+    std::string provider;
+    std::string accountId;
+    std::string label;
+    std::string displayName;
+    std::string plan;
+    bool active = false;
+    bool connected = false;
+    bool hasUsage = false;
+    std::vector<OvSubUsageWindow> usage;
+};
+struct OvSubLoginProgress {
+    bool inProgress = false;
+    bool browserOpened = false;
+    std::string userCode;
+    std::string verifyUrl;
+    std::string stage;
+    std::string lastError;
+};
+struct OvSubAccountsUi {
+    std::vector<OvSubAccountRow> rows;
+    std::map<std::string, OvSubLoginProgress> login;
+    double lastAccountsPoll = -1e9;
+    double lastUsagePoll = -1e9;
+    bool accountsPollInFlight = false;
+    bool usagePollInFlight = false;
+    bool usageRpcMissing = false;
+    int  lastDrawnFrame = -100;
+    std::string lastError;
+};
+static OvSubAccountsUi s_ovSub;
+
+static const char* kOvSubProviders[] = {"xai", "claude", "codex", "cursor"};
+static const char* kOvSubProviderLabels[] = {
+    "xAI Grok", "Claude", "ChatGPT / Codex", "Cursor"};
+static constexpr double kOvUsagePollSec = 5.0 * 60.0;
+static constexpr double kOvAccountsPollSec = 1.5;
+
+static std::string ovOptStr(const nlohmann::json& obj, const char* key) {
+    auto it = obj.find(key);
+    return it != obj.end() && it->is_string() ? it->get<std::string>() : std::string();
+}
+static void ovParseUsageWindows(const nlohmann::json& src, OvSubAccountRow& row) {
+    row.usage.clear();
+    row.hasUsage = false;
+    auto it = src.find("usage");
+    if (it == src.end() || !it->is_array()) return;
+    row.hasUsage = true;
+    for (const auto& u : *it) {
+        if (!u.is_object()) continue;
+        OvSubUsageWindow w;
+        w.window = ovOptStr(u, "window");
+        w.label  = ovOptStr(u, "label");
+        if (w.label.empty()) w.label = w.window.empty() ? "Usage" : w.window;
+        if (u.contains("used_fraction") && u["used_fraction"].is_number()) {
+            w.usedFraction = (float)std::clamp(u["used_fraction"].get<double>(), 0.0, 1.0);
+            w.hasFraction = true;
+        }
+        w.resetsAt = ovOptStr(u, "resets_at");
+        w.status   = ovOptStr(u, "status");
+        if (w.status.empty()) w.status = "unknown";
+        row.usage.push_back(std::move(w));
+    }
+}
+static void ovParseAccountIdentity(const nlohmann::json& a, OvSubAccountRow& row) {
+    row.displayName = ovOptStr(a, "display_name");
+    row.plan        = ovOptStr(a, "plan");
+    row.label = ovOptStr(a, "email");
+    if (row.label.empty()) row.label = ovOptStr(a, "label");
+    if (!row.label.empty() && row.label == row.accountId) row.label.clear();
+    if (!row.displayName.empty() && row.displayName == row.accountId) row.displayName.clear();
+    ovParseUsageWindows(a, row);
+}
+static std::string ovShortAccountId(const std::string& id) {
+    if (id.empty()) return "(account)";
+    if (id.size() <= 10) return id;
+    return id.substr(0, 8) + "\xe2\x80\xa6";
+}
+static std::string ovAccountPrimaryLabel(const OvSubAccountRow& row) {
+    if (!row.displayName.empty()) return row.displayName;
+    if (!row.label.empty()) return row.label;
+    return ovShortAccountId(row.accountId);
+}
+static void ovMergeUsageRows(const nlohmann::json& rows) {
+    if (!rows.is_array()) return;
+    for (const auto& r : rows) {
+        if (!r.is_object()) continue;
+        const std::string prov = ovOptStr(r, "provider");
+        const std::string aid  = ovOptStr(r, "account_id");
+        for (auto& row : s_ovSub.rows) {
+            if (row.provider != prov) continue;
+            if (!aid.empty() && row.accountId != aid) continue;
+            if (r.contains("display_name") && r["display_name"].is_string()) {
+                const std::string dn = r["display_name"].get<std::string>();
+                if (!dn.empty() && dn != row.accountId) row.displayName = dn;
+            }
+            if (r.contains("email") && r["email"].is_string()) {
+                const std::string em = r["email"].get<std::string>();
+                if (!em.empty() && em != row.accountId) row.label = em;
+            } else if (r.contains("label") && r["label"].is_string()) {
+                const std::string lb = r["label"].get<std::string>();
+                if (!lb.empty() && lb != row.accountId && row.label.empty())
+                    row.label = lb;
+            }
+            if (r.contains("plan") && r["plan"].is_string()) {
+                const std::string pl = r["plan"].get<std::string>();
+                if (!pl.empty()) row.plan = pl;
+            }
+            ovParseUsageWindows(r, row);
+            if (aid.empty()) break;
+        }
+    }
+}
+static const float* ovUsageStatusColor(const std::string& status, float frac) {
+    if (status == "blocked") return ui::palette.statusErr;
+    if (status == "warn")    return ui::palette.statusWarn;
+    if (status == "ok")      return ui::palette.statusOk;
+    if (frac >= 0.95f) return ui::palette.statusErr;
+    if (frac >= 0.75f) return ui::palette.statusWarn;
+    return ui::palette.statusOk;
+}
+static void ovDrawCompactUsage(const OvSubUsageWindow& w, float sc) {
+    if (!w.hasFraction) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
+        ImGui::Text("%s \xe2\x80\x94 %s", w.label.c_str(),
+                    w.status == "needs_login" ? "sign in" :
+                    w.status == "blocked" ? "verify" : "n/a");
         ImGui::PopStyleColor();
-        // Reuse the compact usage strip (same cache as the composer toolbar).
-        drawCopilotUsageBox(st);
-        // If the box hid itself, show a quiet empty state.
-        if (ImGui::GetCursorPosY() < 8.0f * S) {
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
-                       ui::palette.textDim[2], 1));
-            ImGui::TextWrapped("No subscription usage for this provider.");
+        return;
+    }
+    const auto& pal = ui::palette;
+    const float* role = ovUsageStatusColor(w.status, w.usedFraction);
+    char pctBuf[32];
+    std::snprintf(pctBuf, sizeof(pctBuf), "%s %.0f%%", w.label.c_str(), w.usedFraction * 100.0f);
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(role[0], role[1], role[2], 1.0f));
+    ImGui::TextUnformatted(pctBuf);
+    ImGui::PopStyleColor();
+    const float barH = 4.0f * sc;
+    const float barW = ImGui::GetContentRegionAvail().x;
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(p, ImVec2(p.x + barW, p.y + barH),
+                      ui::Palette::toU32(pal.accentSoft), 2.0f * sc);
+    if (w.usedFraction > 0.f) {
+        dl->AddRectFilled(p, ImVec2(p.x + barW * w.usedFraction, p.y + barH),
+                          ImGui::ColorConvertFloat4ToU32(
+                              ImVec4(role[0], role[1], role[2], 0.95f)),
+                          2.0f * sc);
+    }
+    ImGui::Dummy(ImVec2(barW, barH + 2.0f * sc));
+}
+static void ovPollSubUsage(AppState& st, bool force) {
+    if (s_ovSub.usageRpcMissing) return;
+    const double now = ImGui::GetTime();
+    if (!force && (now - s_ovSub.lastUsagePoll) < kOvUsagePollSec) return;
+    if (s_ovSub.usagePollInFlight) return;
+    s_ovSub.lastUsagePoll = now;
+    s_ovSub.usagePollInFlight = true;
+    st.rpc.call("subscription_usage", nlohmann::json::object(),
+                [](const core::RpcResult& r) {
+        s_ovSub.usagePollInFlight = false;
+        if (!r.ok) {
+            const std::string& err = r.err;
+            if (err.find("unknown_method") != std::string::npos ||
+                err.find("unknown method") != std::string::npos ||
+                err.find("not found") != std::string::npos)
+                s_ovSub.usageRpcMissing = true;
+            return;
+        }
+        if (!r.result.is_object() || r.result.value("ok", true) == false) return;
+        ovMergeUsageRows(r.result.value("rows", nlohmann::json::array()));
+    });
+}
+static void ovPollSubAccounts(AppState& st, bool force) {
+    const double now = ImGui::GetTime();
+    if (!force && (now - s_ovSub.lastAccountsPoll) < kOvAccountsPollSec) return;
+    if (s_ovSub.accountsPollInFlight) return;
+    s_ovSub.lastAccountsPoll = now;
+    s_ovSub.accountsPollInFlight = true;
+    st.rpc.call("subscription_accounts", nlohmann::json::object(),
+                [](const core::RpcResult& r) {
+        s_ovSub.accountsPollInFlight = false;
+        if (!r.ok || !r.result.is_object()) {
+            if (!r.ok && s_ovSub.lastError.empty())
+                s_ovSub.lastError = r.err.empty() ? "subscription_accounts unavailable"
+                                                  : r.err;
+            return;
+        }
+        if (r.result.value("ok", true) == false) {
+            auto reason = ovOptStr(r.result, "reason");
+            s_ovSub.lastError = reason.empty() ? "accounts failed" : reason;
+            return;
+        }
+        s_ovSub.lastError.clear();
+        std::map<std::string, OvSubAccountRow> prevByKey;
+        for (const auto& prev : s_ovSub.rows)
+            prevByKey[prev.provider + "\n" + prev.accountId] = prev;
+        s_ovSub.rows.clear();
+        auto arr = r.result.value("accounts", nlohmann::json::array());
+        if (!arr.is_array()) return;
+        for (const auto& a : arr) {
+            if (!a.is_object()) continue;
+            OvSubAccountRow row;
+            row.provider  = ovOptStr(a, "provider");
+            row.accountId = ovOptStr(a, "account_id");
+            row.active    = a.value("active", false);
+            row.connected = a.value("connected", true);
+            ovParseAccountIdentity(a, row);
+            if (!row.hasUsage) {
+                auto it = prevByKey.find(row.provider + "\n" + row.accountId);
+                if (it != prevByKey.end() && it->second.hasUsage) {
+                    row.hasUsage = true;
+                    row.usage = it->second.usage;
+                    if (row.displayName.empty()) row.displayName = it->second.displayName;
+                    if (row.plan.empty())        row.plan = it->second.plan;
+                }
+            }
+            s_ovSub.rows.push_back(std::move(row));
+        }
+    });
+    st.rpc.call("subscription_status", nlohmann::json::object(),
+                [](const core::RpcResult& r) {
+        if (!r.ok || !r.result.is_object()) return;
+        auto providers = r.result.value("providers", nlohmann::json::object());
+        if (!providers.is_object()) return;
+        for (auto it = providers.begin(); it != providers.end(); ++it) {
+            if (!it.value().is_object()) continue;
+            OvSubLoginProgress& p = s_ovSub.login[it.key()];
+            const auto& x = it.value();
+            const bool wasInProgress = p.inProgress;
+            p.inProgress = x.value("login_in_progress", false);
+            p.browserOpened = x.value("browser_opened", false);
+            p.userCode = ovOptStr(x, "user_code");
+            p.verifyUrl = ovOptStr(x, "verification_url");
+            if (p.verifyUrl.empty())
+                p.verifyUrl = ovOptStr(x, "verification_uri");
+            p.stage = ovOptStr(x, "login_stage");
+            p.lastError = ovOptStr(x, "last_error");
+            // Also fold connected into empty-account providers via login map stage.
+            if (x.value("connected", false) && p.stage.empty())
+                p.stage = "connected";
+            if (wasInProgress && !p.inProgress) {
+                s_ovSub.lastAccountsPoll = -1e9;
+                s_ovSub.lastUsagePoll = -1e9;
+            }
+        }
+    });
+}
+
+static void drawOvProvidersTab(AppState& st, float S) {
+    const int frame = ImGui::GetFrameCount();
+    const bool justOpened = (frame - s_ovSub.lastDrawnFrame) > 1;
+    s_ovSub.lastDrawnFrame = frame;
+    ovPollSubAccounts(st, false);
+    ovPollSubUsage(st, justOpened);
+
+    ImGui::PushStyleColor(ImGuiCol_Text,
+        ImVec4(ui::palette.textDim[0], ui::palette.textDim[1], ui::palette.textDim[2], 1));
+    ImGui::TextWrapped("Sign-in state, accounts, and usage per provider.");
+    ImGui::PopStyleColor();
+
+    if (!s_ovSub.lastError.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusWarn));
+        ImGui::TextWrapped("%s", s_ovSub.lastError.c_str());
+        ImGui::PopStyleColor();
+    }
+
+    // Autoscale: only scroll when account lists get long.
+    const float listH = ImMax(120.0f * S, ImGui::GetContentRegionAvail().y - 4.0f * S);
+    ImGui::BeginChild("##ov_prov_list", ImVec2(0, listH), ImGuiChildFlags_None);
+
+    for (int pi = 0; pi < 4; ++pi) {
+        const char* prov = kOvSubProviders[pi];
+        const char* plabel = kOvSubProviderLabels[pi];
+        ImGui::PushID(prov);
+
+        // Provider header + sign-in state chip.
+        bool anyAcct = false;
+        bool anyConnected = false;
+        for (const auto& row : s_ovSub.rows) {
+            if (row.provider != prov) continue;
+            anyAcct = true;
+            if (row.connected) anyConnected = true;
+        }
+        OvSubLoginProgress& prog = s_ovSub.login[prov];
+        if (!anyConnected && prog.stage == "connected") anyConnected = true;
+
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(ui::palette.accent[0], ui::palette.accent[1], ui::palette.accent[2], 1.0f));
+        ImGui::TextUnformatted(plabel);
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        {
+            const char* state = prog.inProgress ? "signing in\xe2\x80\xa6"
+                              : anyAcct ? (anyConnected ? "signed in" : "disconnected")
+                              : "not signed in";
+            const float* scc = prog.inProgress ? ui::palette.statusWarn
+                             : anyAcct && anyConnected ? ui::palette.statusOk
+                             : ui::palette.textDim;
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(scc[0], scc[1], scc[2], 1));
+            ImGui::TextUnformatted(state);
             ImGui::PopStyleColor();
         }
-        ui::InterwebzKeyValueRow("Provider", ui::providerLabel(st.settings.provider));
-    }
-    ui::InterwebzGroupEnd();
-    ui::InterwebzTwoColumnNext();
-    if (ui::InterwebzGroupBegin("##ov_acct_mgmt", "Accounts", ImVec2(0, colH))) {
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(ui::palette.textDim[0], ui::palette.textDim[1], ui::palette.textDim[2], 1));
-        ImGui::TextWrapped("Manage sign-in, switch accounts, and full usage tables in Settings.");
-        ImGui::PopStyleColor();
-        if (ImGui::Button("Open AI settings\xe2\x80\xa6", ImVec2(-1, 0))) {
-            st.openSettings = true;
-            st.openSettingsTab = 2;
-            st.showAISettingsOverlay = false;
+
+        // Compact account rows.
+        for (size_t i = 0; i < s_ovSub.rows.size(); ++i) {
+            OvSubAccountRow& row = s_ovSub.rows[i];
+            if (row.provider != prov) continue;
+            ImGui::PushID((int)i);
+
+            bool active = row.active;
+            if (ImGui::RadioButton("##act", active)) {
+                if (!active) {
+                    nlohmann::json p;
+                    p["provider"] = prov;
+                    p["account_id"] = row.accountId;
+                    st.rpc.call("subscription_switch", p, [](const core::RpcResult& r) {
+                        const bool rejected = r.result.is_object() &&
+                                              r.result.value("ok", true) == false;
+                        if (!r.ok || rejected) {
+                            auto reason = rejected ? ovOptStr(r.result, "reason") : r.err;
+                            s_ovSub.lastError =
+                                reason.empty() ? "account switch failed" : reason;
+                        }
+                        s_ovSub.lastAccountsPoll = -1e9;
+                        s_ovSub.lastUsagePoll = -1e9;
+                    });
+                    for (auto& r2 : s_ovSub.rows)
+                        if (r2.provider == prov) r2.active = false;
+                    s_ovSub.rows[i].active = true;
+                }
+            }
+            ImGui::SameLine(0, 6.0f * S);
+
+            const char* soLabel = "Out";
+            const float soW = ImGui::CalcTextSize(soLabel).x
+                + ImGui::GetStyle().FramePadding.x * 2.0f;
+            const float gap = 6.0f * S;
+            std::string primary = ovAccountPrimaryLabel(row);
+            if (!row.plan.empty()) primary += " \xc2\xb7 " + row.plan;
+            if (!row.connected) primary += " (off)";
+
+            const float labelMaxW = std::max(48.0f * S,
+                ImGui::GetContentRegionAvail().x - soW - gap);
+            ImGui::AlignTextToFramePadding();
+            {
+                const ImVec2 ts = ImGui::CalcTextSize(primary.c_str());
+                if (ts.x > labelMaxW) {
+                    ImDrawList* dl = ImGui::GetWindowDrawList();
+                    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+                    const char* ell = "\xe2\x80\xa6";
+                    const float ellW = ImGui::CalcTextSize(ell).x;
+                    const float clipW = std::max(ellW + 4.0f * S, labelMaxW);
+                    dl->PushClipRect(p0,
+                        ImVec2(p0.x + clipW - ellW, p0.y + ts.y + 2.0f * S), true);
+                    dl->AddText(p0, ImGui::GetColorU32(ImGuiCol_Text), primary.c_str());
+                    dl->PopClipRect();
+                    dl->AddText(ImVec2(p0.x + clipW - ellW, p0.y),
+                                ImGui::GetColorU32(ImGuiCol_Text), ell);
+                    ImGui::Dummy(ImVec2(labelMaxW,
+                                        std::max(ts.y, ImGui::GetTextLineHeight())));
+                } else {
+                    ImGui::TextUnformatted(primary.c_str());
+                }
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) &&
+                    !row.accountId.empty())
+                    ImGui::SetTooltip("%s", row.accountId.c_str());
+            }
+
+            ImGui::SameLine(0, 0.0f);
+            {
+                const float avail = ImGui::GetContentRegionAvail().x;
+                if (avail > soW + 2.0f * S)
+                    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + avail - soW);
+            }
+            if (ImGui::SmallButton(soLabel)) {
+                nlohmann::json p;
+                p["provider"] = prov;
+                p["account_id"] = row.accountId;
+                st.rpc.call("subscription_logout", p, [](const core::RpcResult& r) {
+                    const bool rejected = r.result.is_object() &&
+                                          r.result.value("ok", true) == false;
+                    if (!r.ok || rejected) {
+                        auto reason = rejected ? ovOptStr(r.result, "reason") : r.err;
+                        s_ovSub.lastError =
+                            reason.empty() ? "sign out failed" : reason;
+                    }
+                    s_ovSub.lastAccountsPoll = -1e9;
+                    s_ovSub.lastUsagePoll = -1e9;
+                });
+                s_ovSub.rows.erase(s_ovSub.rows.begin() + (long)i);
+                ImGui::PopID();
+                break;
+            }
+
+            // Compact usage under the identity row.
+            ImGui::Indent(ImGui::GetFrameHeight() + gap);
+            if (row.hasUsage && !row.usage.empty()) {
+                for (size_t wi = 0; wi < row.usage.size(); ++wi) {
+                    ImGui::PushID((int)wi);
+                    ovDrawCompactUsage(row.usage[wi], S);
+                    ImGui::PopID();
+                }
+            }
+            ImGui::Unindent(ImGui::GetFrameHeight() + gap);
+            ImGui::PopID();
         }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Full form + accounts + leaderboard.");
-        if (ImGui::Button("Repair / install runtime", ImVec2(-1, 0)) &&
-            !st.setupRunning.load() && !st.job.running.load()) {
-            st.startSetup(true);
+
+        if (!anyAcct && !prog.inProgress) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
+            ImGui::TextUnformatted("No accounts");
+            ImGui::PopStyleColor();
         }
+
+        // Login progress / Add account.
+        if (prog.inProgress) {
+            if (prog.userCode.empty() && prog.verifyUrl.empty()) {
+                ImGui::TextUnformatted("Opening browser\xe2\x80\xa6");
+            } else {
+                if (prog.browserOpened)
+                    ImGui::TextUnformatted("Browser open \xe2\x80\x94 approve access\xe2\x80\xa6");
+                else
+                    ImGui::TextUnformatted("Open the link to approve:");
+                if (!prog.userCode.empty()) {
+                    ImGui::Text("Code: %s", prog.userCode.c_str());
+                    ImGui::SameLine();
+                    char copyId[64];
+                    std::snprintf(copyId, sizeof(copyId), "Copy##%s", prov);
+                    if (ImGui::SmallButton(copyId))
+                        ImGui::SetClipboardText(prog.userCode.c_str());
+                }
+                const std::string fallbackUrl =
+                    prog.verifyUrl.empty()
+                        ? (std::string(prov) == "xai" ? "https://accounts.x.ai/activate"
+                                                      : prog.verifyUrl)
+                        : prog.verifyUrl;
+                if (!fallbackUrl.empty()) {
+                    ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
+                    ImGui::TextWrapped("%s", fallbackUrl.c_str());
+                    ImGui::PopStyleColor();
+                    char openId[64];
+                    std::snprintf(openId, sizeof(openId), "Open##%s", prov);
+                    if (ImGui::SmallButton(openId)) {
+#if defined(_WIN32)
+                        std::system(("start \"\" \"" + fallbackUrl + "\"").c_str());
+#elif defined(__APPLE__)
+                        std::system(("open '" + fallbackUrl + "'").c_str());
+#else
+                        std::system(("xdg-open '" + fallbackUrl + "' >/dev/null 2>&1 &").c_str());
+#endif
+                    }
+                }
+            }
+            ovPollSubAccounts(st, true);
+        } else {
+            char addId[64];
+            std::snprintf(addId, sizeof(addId),
+                          anyAcct ? "Add account##%s" : "Sign in##%s", prov);
+            if (ImGui::SmallButton(addId)) {
+                prog.inProgress = true;
+                prog.lastError.clear();
+                prog.userCode.clear();
+                prog.verifyUrl.clear();
+                prog.browserOpened = false;
+                prog.stage = "start";
+                nlohmann::json p;
+                p["provider"] = prov;
+                if (std::string(prov) == "xai")
+                    p["device"] = true;
+                st.rpc.call("subscription_login", p, [prov](const core::RpcResult& r) {
+                    OvSubLoginProgress& pr = s_ovSub.login[prov];
+                    if (!r.ok) {
+                        pr.inProgress = false;
+                        pr.lastError = r.err.empty() ? "login failed" : r.err;
+                    } else if (r.result.is_object() && r.result.value("ok", true) == false) {
+                        pr.inProgress = false;
+                        auto reason = ovOptStr(r.result, "reason");
+                        auto hint = ovOptStr(r.result, "hint");
+                        pr.lastError = reason.empty() ? "login failed" : reason;
+                        if (!hint.empty()) pr.lastError += " \xe2\x80\x94 " + hint;
+                    }
+                    s_ovSub.lastAccountsPoll = -1e9;
+                    s_ovSub.lastUsagePoll = -1e9;
+                });
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Add a %s subscription account (browser OAuth).", plabel);
+        }
+        if (!prog.lastError.empty() && !prog.inProgress) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusErr));
+            ImGui::TextWrapped("%s", prog.lastError.c_str());
+            ImGui::PopStyleColor();
+        }
+
+        ImGui::Dummy(ImVec2(0, 4.0f * S));
+        ImGui::PopID();
     }
-    ui::InterwebzGroupEnd();
-    ui::InterwebzTwoColumnEnd();
+
+    ImGui::EndChild();
 }
+
 
 }  // namespace
 
@@ -4877,16 +5661,16 @@ static void drawAISettingsBody(AppState& st, bool busy) {
     ImGui::TextUnformatted("AI Settings");
     ImGui::PopFont();
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-    ImGui::TextWrapped("Agents, prompts, skills, permissions, accounts.");
+    ImGui::TextWrapped("Agents, prompts, skills, permissions, providers.");
     ImGui::PopStyleColor();
     // Clear vertical separation so the tab strip never overlaps the title block.
-    ImGui::Dummy(ImVec2(0, ui::metrics::U(1.25f)));
+    ImGui::Dummy(ImVec2(0, ui::metrics::U(1.0f)));
 
     // Wrapping top tabs — all five must stay visible in the narrow copilot column
-    // (no horizontal scrollbar that clips Permissions/Accounts).
+    // (no horizontal scrollbar that clips Permissions/Providers).
     static int s_aiSettingsRail = 0;
     static const char* kRailLabels[] = {
-        "Agents", "Prompts", "Skills", "Permissions", "Accounts",
+        "Agents", "Prompts", "Skills", "Permissions", "Providers",
     };
     const int nTabs = 5;
     const float availW = ImGui::GetContentRegionAvail().x;
@@ -4980,7 +5764,7 @@ static void drawAISettingsBody(AppState& st, bool busy) {
     case 1: drawOvPromptsTab(st, S, changed); break;
     case 2: drawOvSkillsTab(st, S); break;
     case 3: drawOvPermissionsTab(st, S, changed); break;
-    case 4: drawOvAccountsTab(st, S); break;
+    case 4: drawOvProvidersTab(st, S); break;
     default: break;
     }
     ImGui::PopStyleVar();

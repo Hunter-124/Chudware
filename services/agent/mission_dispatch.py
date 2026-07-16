@@ -157,20 +157,33 @@ class MissionDispatch:
     """
 
     #: The run-scoped tool families this layer serves (T-W32 DoD list + the
-    #: Parts Library V2 sourcing surface — workstream 5).
+    #: Parts Library V2 sourcing surface — workstream 5) + coordination board
+    #: + corporate org mode (aicad.corporate/1).
     TOOLS = ("ledger_get", "ledger_note", "dag_plan", "ask_user",
              "delegate", "part_search",
              "parts_taxonomy", "part_get", "part_source", "match_model",
              "reverse_engineer_product", "vendors_health",
              "scrape_enqueue", "scrape_queue_status", "import_artifact",
-             "cam_tool_import")
+             "cam_tool_import",
+             # Coordination board (shared claims / progress across sub-agents)
+             "coordinate_claim", "coordinate_release",
+             "coordinate_progress", "coordinate_board",
+             # Corporate org mode channels / meetings / head spawn
+             "corporate_channel_post", "corporate_channel_read",
+             "corporate_chart", "corporate_spawn_worker",
+             "corporate_hold_meeting", "corporate_record_completion",
+             "corporate_activate")
+
 
     def __init__(self, *, run_id: str, ledger=None, autonomy: str = "auto",
                  graph: dict | None = None, delegation_tree=None,
                  doc_id: str | None = None, provider=None, on_event=None,
                  capability=None, tier: str | None = None,
                  phase: str | None = None,
-                 task_class: str | None = None) -> None:
+                 task_class: str | None = None,
+                 coordination_board=None,
+                 org_chart=None,
+                 corporate_agent_id: str | None = None) -> None:
         self.run_id = run_id
         self.ledger = ledger
         self.autonomy = autonomy
@@ -190,6 +203,21 @@ class MissionDispatch:
         self.tier = tier
         self.phase = phase
         self.task_class = task_class
+        # Shared per-run coordination board (claims + progress notes).
+        if coordination_board is not None:
+            self.coordination_board = coordination_board
+        else:
+            try:
+                from services.agent.coordination import get_board  # noqa: PLC0415
+                self.coordination_board = get_board(run_id) if run_id else None
+            except Exception:  # noqa: BLE001
+                self.coordination_board = None
+        # Corporate org chart (aicad.corporate/1) — optional; activated when
+        # agent.corporate_mode is on and the mission has ≥2 departments.
+        self.org_chart = org_chart
+        # Identity of the agent currently using this dispatch (for corporate
+        # channel posts / spawn authority). Root/director when unset.
+        self.corporate_agent_id = corporate_agent_id
         self._handlers: dict[str, Callable[..., Any]] = {
             "ledger_get": self.ledger_get,
             "ledger_note": self.ledger_note,
@@ -207,7 +235,19 @@ class MissionDispatch:
             "scrape_queue_status": self.scrape_queue_status,
             "import_artifact": self.import_artifact,
             "cam_tool_import": self.cam_tool_import,
+            "coordinate_claim": self.coordinate_claim,
+            "coordinate_release": self.coordinate_release,
+            "coordinate_progress": self.coordinate_progress,
+            "coordinate_board": self.coordinate_board_snapshot,
+            "corporate_channel_post": self.corporate_channel_post,
+            "corporate_channel_read": self.corporate_channel_read,
+            "corporate_chart": self.corporate_chart_snapshot,
+            "corporate_spawn_worker": self.corporate_spawn_worker,
+            "corporate_hold_meeting": self.corporate_hold_meeting,
+            "corporate_record_completion": self.corporate_record_completion,
+            "corporate_activate": self.corporate_activate,
         }
+
 
     # ------------------------------------------------------------------ resolve
     def resolve(self, tool: str) -> Optional[Callable[..., Any]]:
@@ -613,6 +653,73 @@ class MissionDispatch:
                 except Exception:  # noqa: BLE001
                     system_prompt = card.system_prompt
             allowed = card.concrete_tools if card is not None else None
+            # Always expose coordination board tools to sub-agents so they can
+            # claim/release resources and post progress without clobbering peers.
+            _COORD_TOOLS = (
+                "coordinate_claim", "coordinate_release",
+                "coordinate_progress", "coordinate_board",
+            )
+            if allowed is None:
+                allowed = list(_COORD_TOOLS)
+            else:
+                allowed = list(allowed)
+                for t in _COORD_TOOLS:
+                    if t not in allowed:
+                        allowed.append(t)
+            # Corporate org tools + preamble when this run has an active chart.
+            org = getattr(self, "org_chart", None)
+            corp_agent = (
+                str(node.get("corporate_agent_id") or "")
+                or str(node.get("id") or "")
+                or str(getattr(self, "corporate_agent_id", None) or "")
+            )
+            if org is not None and getattr(org, "active", False):
+                try:
+                    # Prefer an already-seated corporate id on the node.
+                    seat = None
+                    if corp_agent:
+                        seat = org.seat_for(corp_agent)
+                    if seat is None:
+                        # Map role → first matching seat (head/worker)
+                        for s in org.seats.values():
+                            if s.role == role and s.rank != "director":
+                                seat = s
+                                corp_agent = s.agent_id
+                                break
+                    if seat is not None:
+                        for t in org.tools_for(seat.agent_id):
+                            if t not in allowed:
+                                allowed.append(t)
+                        corp_pre = org.preamble_for(seat.agent_id)
+                        if corp_pre:
+                            if system_prompt:
+                                system_prompt = (
+                                    system_prompt.rstrip() + "\n\n" + corp_pre
+                                )
+                            else:
+                                system_prompt = corp_pre
+                        # Stash so corporate_* tools know who is calling.
+                        self.corporate_agent_id = seat.agent_id
+                        if isinstance(node, dict):
+                            node["corporate_agent_id"] = seat.agent_id
+                            node["corporate_rank"] = seat.rank
+                            node["corporate_dept"] = seat.dept_id
+                except Exception:  # noqa: BLE001
+                    pass
+            # Inject a live board snapshot into the system preamble so the child
+            # sees existing claims before it starts editing.
+            board = getattr(self, "coordination_board", None)
+            if board is not None:
+                try:
+                    preamble = board.preamble_text()
+                    if preamble:
+                        if system_prompt:
+                            system_prompt = system_prompt.rstrip() + "\n\n" + preamble
+                        else:
+                            system_prompt = preamble
+                except Exception:  # noqa: BLE001
+                    pass
+
             # mega-6: if a geometry role card somehow lost mutators, re-seed them
             # so the first mutating call is always enableable.
             if allowed is not None:
@@ -1181,6 +1288,331 @@ class MissionDispatch:
             return cam_tool_import_impl(part_id, number, material)
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": f"cam_tool_import failed: {exc}"}
+
+
+    # ---------------------------------------------------------- coordination
+    def _coord_agent_id(self, agent_id: str | None = None) -> str:
+        """Resolve the claiming agent id (explicit > subagent node > run)."""
+        if agent_id and str(agent_id).strip():
+            return str(agent_id).strip()
+        return str(self.run_id or "mission")
+
+    def _board_or_error(self) -> tuple[Any, dict | None]:
+        board = getattr(self, "coordination_board", None)
+        if board is None:
+            return None, {
+                "ok": False,
+                "error": "no coordination board bound to this mission run",
+            }
+        return board, None
+
+    def coordinate_claim(
+        self,
+        resources: list | None = None,
+        intent: str = "",
+        agent_id: str | None = None,
+        **_ignored: Any,
+    ) -> dict:
+        """Claim exclusive ownership of resources (doc/feature/file ids).
+
+        Returns ok+claims on success, or status=CONFLICT with holder+intent when
+        another agent already holds a resource. Never hard-deadlocks — narrow
+        scope or wait for the holder to release_claim / coordinate_release.
+        """
+        board, err = self._board_or_error()
+        if err is not None:
+            return err
+        aid = self._coord_agent_id(agent_id)
+        res = resources if isinstance(resources, list) else (
+            [resources] if resources else []
+        )
+        out = board.register_claim(aid, res, intent)
+        # Surface conflicts as spawn-side warnings without blocking siblings.
+        if isinstance(out, dict) and out.get("status") == "CONFLICT":
+            out.setdefault(
+                "warning",
+                "claim conflict — wait or narrow scope; do not hard-deadlock",
+            )
+        return out
+
+    def coordinate_release(
+        self,
+        resources: list | None = None,
+        agent_id: str | None = None,
+        claim_ids: list | None = None,
+        **_ignored: Any,
+    ) -> dict:
+        """Release claims held by this agent (all, or listed resources/claim_ids)."""
+        board, err = self._board_or_error()
+        if err is not None:
+            return err
+        aid = self._coord_agent_id(agent_id)
+        res = resources if isinstance(resources, list) else (
+            [resources] if resources else None
+        )
+        return board.release_claim(aid, res, claim_ids=claim_ids)
+
+    def coordinate_progress(
+        self,
+        note: str = "",
+        agent_id: str | None = None,
+        **_ignored: Any,
+    ) -> dict:
+        """Post a short progress note to the shared board for peer awareness."""
+        board, err = self._board_or_error()
+        if err is not None:
+            return err
+        aid = self._coord_agent_id(agent_id)
+        return board.post_progress(aid, note)
+
+    def coordinate_board_snapshot(self, **_ignored: Any) -> dict:
+        """Return active claims + recent progress notes for this run."""
+        board, err = self._board_or_error()
+        if err is not None:
+            return err
+        snap = board.board_snapshot()
+        return {"ok": True, **snap}
+
+    # ---------------------------------------------------------- corporate org
+    def _org_or_error(self) -> tuple[Any, dict | None]:
+        org = getattr(self, "org_chart", None)
+        if org is None:
+            return None, {
+                "ok": False,
+                "error": "no corporate org chart bound to this mission run",
+                "hint": (
+                    "Call corporate_activate with the mission task list when "
+                    "agent.corporate_mode is on, or bind org_chart on MissionDispatch."
+                ),
+            }
+        return org, None
+
+    def _corporate_caller(self, agent_id: str | None = None) -> str:
+        if agent_id and str(agent_id).strip():
+            return str(agent_id).strip()
+        if self.corporate_agent_id and str(self.corporate_agent_id).strip():
+            return str(self.corporate_agent_id).strip()
+        org = getattr(self, "org_chart", None)
+        if org is not None:
+            return str(getattr(org, "director_id", "") or self.run_id or "mission")
+        return str(self.run_id or "mission")
+
+    def corporate_activate(
+        self,
+        tasks: list | None = None,
+        mission_goals: list | None = None,
+        force: bool | None = None,
+        **_ignored: Any,
+    ) -> dict:
+        """Build/activate the corporate org chart for this run from *tasks*.
+
+        No-ops (active=False) when corporate_mode is off or tasks span <2
+        departments — flat delegation remains unchanged.
+        """
+        try:
+            from services.agent.corporate import build_corporate_org  # noqa: PLC0415
+            from services.agent import config as agent_config  # noqa: PLC0415
+            cfg = agent_config.load_config()
+            goals = mission_goals
+            if not goals and isinstance(self.graph, dict):
+                brief = self.graph.get("brief") or self.graph.get("goal") or ""
+                if brief:
+                    goals = [str(brief)]
+            result = build_corporate_org(
+                self.run_id,
+                tasks or [],
+                cfg=cfg,
+                board=self.coordination_board,
+                mission_goals=list(goals or []) or None,
+                force=force,
+            )
+            if result.get("active") and result.get("chart"):
+                from services.agent.corporate import get_org_chart  # noqa: PLC0415
+                self.org_chart = get_org_chart(self.run_id, create=False)
+                if self.org_chart is not None and not self.corporate_agent_id:
+                    self.corporate_agent_id = self.org_chart.director_id
+            if self.ledger is not None:
+                try:
+                    self.ledger.append("agent", "artifact", {
+                        "event": "corporate_org",
+                        "active": bool(result.get("active")),
+                        "reason": result.get("reason"),
+                        "departments_found": result.get("departments_found"),
+                    })
+                except Exception:  # noqa: BLE001
+                    pass
+            return result
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"corporate_activate failed: {exc}"}
+
+    def corporate_chart_snapshot(self, **_ignored: Any) -> dict:
+        """Return the corporate org chart snapshot for this run."""
+        org, err = self._org_or_error()
+        if err is not None:
+            return err
+        snap = org.snapshot()
+        return {"ok": True, **snap}
+
+    def corporate_channel_post(
+        self,
+        channel: str = "",
+        body: str = "",
+        kind: str = "info",
+        agent_id: str | None = None,
+        meta: dict | None = None,
+        **_ignored: Any,
+    ) -> dict:
+        """Post to a corporate channel (membership + rank rules enforced).
+
+        Workers may only post to their dept channel; worker→director is rejected.
+        """
+        org, err = self._org_or_error()
+        if err is not None:
+            return err
+        aid = self._corporate_caller(agent_id)
+        return org.post_message(aid, channel, body, kind=kind, meta=meta)
+
+    def corporate_channel_read(
+        self,
+        channel: str = "",
+        agent_id: str | None = None,
+        limit: int = 50,
+        **_ignored: Any,
+    ) -> dict:
+        """Read recent messages on a corporate channel (membership enforced)."""
+        org, err = self._org_or_error()
+        if err is not None:
+            return err
+        aid = self._corporate_caller(agent_id)
+        return org.read_channel(channel, agent_id=aid, limit=limit)
+
+    def corporate_spawn_worker(
+        self,
+        role: str = "",
+        brief: str = "",
+        head_id: str | None = None,
+        budget_tokens: int = 0,
+        as_team_lead: bool = False,
+        **_ignored: Any,
+    ) -> dict:
+        """Department head spawns a worker seat (within max_subagent_depth).
+
+        Also requests a delegation node when a tree is bound. Workers get
+        coordinate_* + dept channel tools via _run_subagent.
+        """
+        org, err = self._org_or_error()
+        if err is not None:
+            return err
+        if not getattr(org, "active", False):
+            return {
+                "ok": False,
+                "error": "corporate org is not active on this run",
+            }
+        caller = self._corporate_caller(head_id)
+        seat = org.seat_for(caller)
+        if seat is None or seat.rank not in ("head", "team_lead"):
+            return {
+                "ok": False,
+                "status": "rejected",
+                "error": (
+                    f"only department heads/team leads may spawn workers; "
+                    f"caller={caller!r} rank="
+                    f"{getattr(seat, 'rank', None)!r}"
+                ),
+            }
+        # Seat on the org chart first (depth check).
+        seated = org.spawn_worker(
+            head_id=caller,
+            role=role,
+            brief=brief,
+            as_team_lead=bool(as_team_lead),
+        )
+        if not seated.get("ok"):
+            return seated
+
+        # Optional live delegation + execution through the existing path.
+        node_out: dict[str, Any] | None = None
+        if self.delegation_tree is not None and role:
+            parent_node = seat.delegation_node
+            try:
+                node_out = self.delegate(
+                    role=role,
+                    brief=brief or f"corporate worker in dept {seat.dept_id}",
+                    budget_tokens=budget_tokens or 4000,
+                    kind="worker",
+                    parent_id=parent_node,
+                )
+                if isinstance(node_out, dict) and node_out.get("id"):
+                    # Bind delegation node id onto the corporate seat.
+                    worker_seat = org.seat_for(seated["seat"]["agent_id"])
+                    if worker_seat is not None:
+                        worker_seat.delegation_node = str(node_out.get("id"))
+                        # Tag node so _run_subagent finds the corporate seat.
+                        node_out["corporate_agent_id"] = worker_seat.agent_id
+                        node_out["corporate_rank"] = worker_seat.rank
+                        node_out["corporate_dept"] = worker_seat.dept_id
+            except Exception as exc:  # noqa: BLE001
+                seated["delegation_error"] = str(exc)
+
+        seated["delegation"] = node_out
+        return seated
+
+    def corporate_hold_meeting(
+        self,
+        dept_id: str = "",
+        done: list | None = None,
+        in_progress: list | None = None,
+        blocked: list | None = None,
+        risks: list | None = None,
+        trigger: str = "manual",
+        **_ignored: Any,
+    ) -> dict:
+        """Department head posts a structured status digest to the heads channel."""
+        org, err = self._org_or_error()
+        if err is not None:
+            return err
+        did = str(dept_id or "").strip()
+        if not did:
+            caller = self._corporate_caller()
+            seat = org.seat_for(caller)
+            if seat is not None and seat.dept_id:
+                did = seat.dept_id
+        if not did:
+            return {"ok": False, "error": "dept_id required for hold_meeting"}
+        return org.hold_meeting(
+            did,
+            done=done,
+            in_progress=in_progress,
+            blocked=blocked,
+            risks=risks,
+            trigger=trigger or "manual",
+        )
+
+    def corporate_record_completion(
+        self,
+        dept_id: str = "",
+        summary: str = "",
+        blocked: bool = False,
+        agent_id: str | None = None,
+        **_ignored: Any,
+    ) -> dict:
+        """Record a worker task completion; may trigger a cadence meeting."""
+        org, err = self._org_or_error()
+        if err is not None:
+            return err
+        aid = self._corporate_caller(agent_id)
+        seat = org.seat_for(aid)
+        did = str(dept_id or "").strip()
+        if not did and seat is not None:
+            did = seat.dept_id or ""
+        if not did:
+            return {"ok": False, "error": "dept_id required (or call as a dept seat)"}
+        return org.record_worker_completion(
+            did,
+            worker_id=aid,
+            summary=summary,
+            blocked=bool(blocked),
+        )
 
 
 # --------------------------------------------------------------------------- helpers

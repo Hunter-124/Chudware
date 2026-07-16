@@ -201,3 +201,14 @@ On `run_finished` / terminal `status` (phase done|error|failed|cancelled) and th
 - `stop_reason` — short enum-ish string (confirmed|stabilized|refine_cap|max_iters|no_code|failed|provider_error|provider_auth|provider_unavailable|phase_step_cap|terminated_by_user|…)
 - `error_detail` — human sentence, secret-scrubbed, ≤~300 chars; empty on normal completion. Prefer over legacy `error`.
 GUI renders error bubbles as `stopped: <stop_reason> — <error_detail>` when present.
+
+## Subagent governance (2026-07-16, additive)
+- Config `agent.max_subagent_depth` (int, default 2, root chat = depth 0): hard cap on subagent nesting LAYERS (not concurrency); spawn past cap → DelegationError "max subagent nesting depth (N) reached".
+- Coordination board (`services/agent/coordination.py`, per run_id, JSON sidecar `{runs_dir}/{run_id}.coordination.json`): `register_claim(agent_id, resources, intent) -> claim|CONFLICT(holder,intent)`, `release_claim`, `post_progress`, `board_snapshot`. Subagent tools: `coordinate_claim/release/progress/board`; board preamble injected into subagent prompts.
+
+## aicad.corporate/1 (2026-07-16, additive)
+Opt-in org mode. Config: `agent.corporate_mode` (bool, default false); `agent.corporate` {max_departments:3, team_leads:true, meeting_cadence:5, director_review:true}.
+Structure per run: director (depth 0) → department heads (depth 1, one per derived department, capped/merged) → workers (depth 2, head-spawned; team lead auto-promoted >3 workers).
+Channels (enforced): `dept:<id>` = head+workers(+lead); `heads` = heads+director. Worker→director → status=rejected.
+Meetings: every `meeting_cadence` worker completions or on blockage, head posts MeetingDigest {done,in_progress,blocked,risks,trigger,worker_completions} to heads; director review is template-first, LLM steering note only on misalignment/blockage.
+Tools: corporate_activate, channel_post, channel_read, chart, spawn_worker, hold_meeting, record_completion.

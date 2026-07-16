@@ -81,6 +81,109 @@ def workspace_dir(cfg: dict | None = None) -> "Path":
         pass
     return d
 
+# --------------------------------------------------------------------------- agent nesting depth
+# GUI Settings → Permissions writes ``agent.max_subagent_depth`` (int, default 2,
+# GUI clamp 0–4). Root chat = depth 0. 0 means depth-1 subagents may not spawn
+# further subagents. Enforced in delegation.DelegationTree.request_delegation.
+
+DEFAULT_MAX_SUBAGENT_DEPTH: int = 2
+AGENT_CONFIG_KEY = "agent"
+MAX_SUBAGENT_DEPTH_KEY = "max_subagent_depth"
+
+
+def get_max_subagent_depth(cfg: dict | None = None) -> int:
+    """Return ``agent.max_subagent_depth`` (int ≥ 0, default 2).
+
+    Nested config shape written by the copilot Permissions tab::
+
+        {"agent": {"max_subagent_depth": 2}}
+
+    Non-int / missing values fall back to :data:`DEFAULT_MAX_SUBAGENT_DEPTH`.
+    Negative values clamp to 0 (no subagent may spawn further subagents).
+    """
+    c = cfg if cfg is not None else load_config()
+    if not isinstance(c, dict):
+        return DEFAULT_MAX_SUBAGENT_DEPTH
+    agent = c.get(AGENT_CONFIG_KEY)
+    if not isinstance(agent, dict):
+        return DEFAULT_MAX_SUBAGENT_DEPTH
+    raw = agent.get(MAX_SUBAGENT_DEPTH_KEY, DEFAULT_MAX_SUBAGENT_DEPTH)
+    try:
+        depth = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_SUBAGENT_DEPTH
+    return max(0, depth)
+
+# --------------------------------------------------------------------------- corporate org mode
+# GUI Settings → Agents writes ``agent.corporate_mode`` (bool) and
+# ``agent.corporate`` object. When on, complex missions organize as a company
+# (director + departments + heads + workers) instead of flat delegation.
+# See aicad.corporate/1.
+
+CORPORATE_MODE_KEY = "corporate_mode"
+CORPORATE_KEY = "corporate"
+DEFAULT_CORPORATE_MODE: bool = False
+DEFAULT_CORPORATE_MAX_DEPARTMENTS: int = 3
+DEFAULT_CORPORATE_TEAM_LEADS: bool = True
+DEFAULT_CORPORATE_MEETING_CADENCE: int = 5
+DEFAULT_CORPORATE_DIRECTOR_REVIEW: bool = True
+
+
+def corporate_mode_enabled(cfg: dict | None = None) -> bool:
+    """Return ``agent.corporate_mode`` (bool, default False).
+
+    Nested config shape written by the copilot Agents tab::
+
+        {"agent": {"corporate_mode": true, "corporate": {...}}}
+    """
+    c = cfg if cfg is not None else load_config()
+    if not isinstance(c, dict):
+        return DEFAULT_CORPORATE_MODE
+    agent = c.get(AGENT_CONFIG_KEY)
+    if not isinstance(agent, dict):
+        return DEFAULT_CORPORATE_MODE
+    return bool(agent.get(CORPORATE_MODE_KEY, DEFAULT_CORPORATE_MODE))
+
+
+def get_corporate_config(cfg: dict | None = None) -> dict:
+    """Return normalized ``agent.corporate`` settings.
+
+    Keys (with defaults):
+      max_departments (int, default 3, clamped ≥ 1)
+      team_leads (bool, default True)
+      meeting_cadence (int, default 5, clamped ≥ 1) — worker completions
+        between department-head meetings
+      director_review (bool, default True)
+    """
+    c = cfg if cfg is not None else load_config()
+    agent: dict = {}
+    if isinstance(c, dict):
+        raw_agent = c.get(AGENT_CONFIG_KEY)
+        if isinstance(raw_agent, dict):
+            agent = raw_agent
+    raw = agent.get(CORPORATE_KEY) if isinstance(agent.get(CORPORATE_KEY), dict) else {}
+
+    def _int(key: str, default: int, *, min_v: int = 1) -> int:
+        try:
+            v = int(raw.get(key, default))  # type: ignore[union-attr]
+        except (TypeError, ValueError):
+            v = default
+        return max(min_v, v)
+
+    def _bool(key: str, default: bool) -> bool:
+        if key not in raw:  # type: ignore[operator]
+            return default
+        return bool(raw.get(key))  # type: ignore[union-attr]
+
+    return {
+        "max_departments": _int("max_departments", DEFAULT_CORPORATE_MAX_DEPARTMENTS),
+        "team_leads": _bool("team_leads", DEFAULT_CORPORATE_TEAM_LEADS),
+        "meeting_cadence": _int("meeting_cadence", DEFAULT_CORPORATE_MEETING_CADENCE),
+        "director_review": _bool("director_review", DEFAULT_CORPORATE_DIRECTOR_REVIEW),
+    }
+
+
+
 
 
 DEFAULT_LOCAL_MODEL = "gemma-4-e4b"

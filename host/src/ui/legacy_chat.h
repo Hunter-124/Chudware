@@ -6,7 +6,7 @@
 // composer (prelude: compact Design/Edit/Ask dropdown + context meter; transparent prompt with
 // in-box send; graduated segmented toolbar: model biggest, thinking, New, paperclip+cube icons
 // smallest — overlapping chips, drop-up model picker) painted over the same glass surface. The AI
-// settings live in an inline view inside the column (opened by the header Settings control).
+// settings live in an inline view (Agents|Prompts|Skills|Permissions|Providers).
 #pragma once
 
 struct AppState;

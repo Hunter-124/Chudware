@@ -28,12 +28,14 @@ Approval chain (contract §12)
     - deeper worker: requires the mission overseer's approval (trigger=manual,
       scope=delegation) or human, per approval_policy in routing.yaml.
 
-Recursion rails (T-DP9, Hunter directive)
-    There is NO hard depth cap — an overseer/lead may spawn sub-agents, and those
-    sub-agents may spawn their own with approval from the overseer that called them,
-    recursively.  The only rails are:
+Recursion rails
+    Hard nesting cap is ``agent.max_subagent_depth`` (config.json, default 2;
+    root chat = depth 0). Spawns whose child depth would exceed the cap raise
+    ``DelegationError`` with ``max subagent nesting depth (N) reached``.
+    Additional rails:
       1. ``soft_depth_limit`` (config, default 8): reaching or exceeding this depth
-         emits a ``delegation_depth_warning`` advisory event and allows the spawn.
+         emits a ``delegation_depth_warning`` advisory event and allows the spawn
+         (until the hard nesting cap refuses).
          The overseer-approval requirement at depth>1 is the human-visible gate.
       2. ``max_agents`` (config, default 64): reaching this count emits a
          ``delegation_agent_limit_warning`` event and allows the spawn.  The kill-
@@ -45,9 +47,8 @@ Recursion rails (T-DP9, Hunter directive)
          root, sets ``killed=True``, and rejects all subsequent spawn requests.
 
     ``DEPTH_CAP`` is kept as a module-level constant for backward compatibility with
-    any external readers (e.g. ``agent_inspector_view.h``), but it is NO LONGER
-    enforced.  The artifact still emits ``soft_depth_limit`` in place of the old
-    hard cap so consumers can distinguish the two semantics.
+    any external readers (e.g. ``agent_inspector_view.h``).  The active hard nesting
+    limit is ``max_subagent_depth`` (from agent.max_subagent_depth).
 
 Budget inheritance (contract §12)
     Child spend accrues to ALL ancestors (single counter tree).  The harness calls
@@ -84,14 +85,18 @@ from services.agent.routing import Resolution, RoutingTable
 DELEGATION_SCHEMA = "aicad.delegation/1"
 
 # DEPTH_CAP is kept for backward compatibility (artifact readers, inspector UI).
-# It is NO LONGER enforced as a hard limit — see T-DP9.  The tree uses
-# ``soft_depth_limit`` (config) as an advisory warning only.
+# Soft advisory limit remains soft_depth_limit (config / routing.yaml).
+# Hard nesting cap is agent.max_subagent_depth (config.json, default 2) —
+# layers of subagent-spawning-subagent; root chat = depth 0.
 DEPTH_CAP = 3
 
 # Default soft limits — configurable via routing.yaml ``delegation:`` block or
 # DelegationTree constructor kwargs (soft_depth_limit / max_agents).
 DEFAULT_SOFT_DEPTH_LIMIT: int = 8
 DEFAULT_MAX_AGENTS: int = 64
+# Default hard nesting depth (agent.max_subagent_depth). 2 = root may spawn
+# depth-1, those may spawn depth-2; depth-2 may not spawn further.
+DEFAULT_MAX_SUBAGENT_DEPTH: int = 2
 
 # Node statuses (contract §12).
 STATUSES = frozenset({"pending", "approved", "running", "done", "failed", "revoked"})
@@ -161,14 +166,12 @@ class Budget:
 class BudgetMeter:
     """Human-visible tree-wide budget meter (T-DP9).
 
-    Tracks tokens and agent count across the WHOLE delegation tree so the UI and
-    kill-switch logic have a single, always-current summary.
-
-    ``tokens_granted``  — orchestrator root's initial grant (the tree ceiling).
+    ``tokens_granted``  — root orchestrator grant.
     ``tokens_spent``    — total tokens accrued across all nodes (mirrors root.budget.tokens_spent).
     ``agents_spawned``  — total non-root delegation nodes ever created in this tree.
     ``max_agents``      — config soft cap on agent count (advisory, not enforced hard).
     ``soft_depth_limit``— config advisory depth threshold; exceeding emits a warning event.
+    ``max_subagent_depth`` — hard nesting cap (agent.max_subagent_depth); spawn past it refuses.
     ``killed``          — True after kill() has been called; all subsequent spawns are rejected.
     """
     tokens_granted: int
@@ -176,6 +179,7 @@ class BudgetMeter:
     agents_spawned: int = 0
     max_agents: int = DEFAULT_MAX_AGENTS
     soft_depth_limit: int = DEFAULT_SOFT_DEPTH_LIMIT
+    max_subagent_depth: int = DEFAULT_MAX_SUBAGENT_DEPTH
     killed: bool = False
 
     @property
@@ -211,6 +215,7 @@ class BudgetMeter:
             "max_agents": self.max_agents,
             "agent_pct": round(self.agent_pct, 4),
             "soft_depth_limit": self.soft_depth_limit,
+            "max_subagent_depth": self.max_subagent_depth,
             "killed": self.killed,
         }
 
@@ -284,8 +289,10 @@ class DelegationTree:
     ``ledger`` and ``routing`` are injected (test-mockable).  Both may be None:
     a None ledger means events are captured in ``_pending_events`` only; a None
     routing means model assignment is deferred (unresolved).
-
-    T-DP9 rails (no hard depth cap):
+    T-DP9 rails + hard nesting cap:
+      ``max_subagent_depth`` — hard cap from agent.max_subagent_depth (default 2).
+          Spawns whose child depth would exceed this raise DelegationError with a
+          clear refusal: "max subagent nesting depth (N) reached".
       ``soft_depth_limit`` — depth at which a ``delegation_depth_warning`` advisory
           event is emitted; spawn is still allowed.  Default: DEFAULT_SOFT_DEPTH_LIMIT.
       ``max_agents`` — agent count at which a ``delegation_agent_limit_warning``
@@ -304,6 +311,7 @@ class DelegationTree:
         overseer: Any | None = None,
         soft_depth_limit: int = DEFAULT_SOFT_DEPTH_LIMIT,
         max_agents: int = DEFAULT_MAX_AGENTS,
+        max_subagent_depth: int | None = None,
         on_event: Any | None = None,
     ) -> None:
         self._run_id = run_id or f"r_{uuid.uuid4().hex[:8]}"
@@ -325,10 +333,22 @@ class DelegationTree:
                 self._ev_journal = None
 
         # Tree-wide budget meter (T-DP9) — always current, serialised in every flush.
+        # Hard nesting cap: explicit kwarg > config.json agent.max_subagent_depth > default.
+        if max_subagent_depth is None:
+            try:
+                from services.agent.config import get_max_subagent_depth  # noqa: PLC0415
+                max_subagent_depth = get_max_subagent_depth()
+            except Exception:  # noqa: BLE001
+                max_subagent_depth = DEFAULT_MAX_SUBAGENT_DEPTH
+        try:
+            max_subagent_depth = max(0, int(max_subagent_depth))
+        except (TypeError, ValueError):
+            max_subagent_depth = DEFAULT_MAX_SUBAGENT_DEPTH
         self._meter = BudgetMeter(
             tokens_granted=orchestrator_budget,
             max_agents=max_agents,
             soft_depth_limit=soft_depth_limit,
+            max_subagent_depth=max_subagent_depth,
         )
 
         # Root orchestrator node (depth=0).
@@ -390,6 +410,8 @@ class DelegationTree:
           - kill() has been called on this tree (killed=True).
           - Parent node not found or not in a spawnable status.
           - Requested budget exceeds any ancestor's total grant.
+          - Child depth would exceed max_subagent_depth
+            ("max subagent nesting depth (N) reached").
 
         Soft advisories (ledger events, spawn still proceeds):
           - depth >= soft_depth_limit  → ``delegation_depth_warning`` event.
@@ -425,6 +447,15 @@ class DelegationTree:
 
         depth = parent.depth + 1
 
+        # Hard nesting cap (agent.max_subagent_depth): refuse spawns past the limit.
+        # Root = depth 0; this limits LAYERS of subagent-spawning-subagent, not count.
+        max_depth = int(self._meter.max_subagent_depth)
+        if depth > max_depth:
+            raise DelegationError(
+                f"max subagent nesting depth ({max_depth}) reached "
+                f"(attempted depth {depth}; root chat is depth 0)"
+            )
+
         # Soft depth advisory (T-DP9): emit warning event but allow the spawn.
         if depth >= self._meter.soft_depth_limit:
             self._emit_event(
@@ -434,6 +465,7 @@ class DelegationTree:
                     "schema": DELEGATION_SCHEMA,
                     "depth": depth,
                     "soft_depth_limit": self._meter.soft_depth_limit,
+                    "max_subagent_depth": max_depth,
                     "message": (
                         f"Delegation at depth {depth} reached soft limit "
                         f"{self._meter.soft_depth_limit}. "
@@ -687,12 +719,12 @@ class DelegationTree:
         T-DP9 additive fields (backward-compatible):
           ``budget_meter``     — tree-wide token+agent meter snapshot.
           ``soft_depth_limit`` — config advisory depth threshold.
+          ``max_subagent_depth`` — hard nesting cap (agent.max_subagent_depth).
           ``killed``           — True after kill() was called.
 
         ``depth_cap`` is retained for backward compatibility with artifact
-        readers (e.g. agent_inspector_view.h) but is now the legacy constant
-        value, not an enforcement limit.  Readers that want the active limit
-        should use ``soft_depth_limit``.
+        readers (e.g. agent_inspector_view.h).  Readers that want the active
+        hard nesting limit should use ``max_subagent_depth``.
         """
         return {
             "schema": DELEGATION_SCHEMA,
@@ -700,6 +732,7 @@ class DelegationTree:
             "nodes": [n.to_dict() for n in self._nodes.values()],
             "depth_cap": DEPTH_CAP,               # kept for backward compat
             "soft_depth_limit": self._meter.soft_depth_limit,
+            "max_subagent_depth": self._meter.max_subagent_depth,
             "budget_meter": self._meter.to_dict(),
             "killed": self._meter.killed,
         }
@@ -898,7 +931,7 @@ def register_delegation_tools(registry: Any, tree: DelegationTree | None = None)
     the live tree through the context mechanism.
 
     Registered tools:
-      ``delegate``            — spawn a sub-agent (unchanged API, no depth cap).
+      ``delegate``            — spawn a sub-agent (hard-capped by max_subagent_depth).
       ``kill_delegation_tree``— human kill-switch: halt the whole tree immediately.
       ``delegation_budget``   — read the live budget meter (tokens + agent count).
     """
@@ -945,12 +978,13 @@ def register_delegation_tools(registry: Any, tree: DelegationTree | None = None)
             _delegate_tool,
             description=(
                 "Spawn a sub-agent role with an isolated brief and token budget. "
-                "There is no hard depth cap — sub-agents may spawn their own sub-agents "
-                "with approval from the overseer that called them, recursively. "
+                "Nesting is hard-capped by agent.max_subagent_depth (default 2; "
+                "root chat = depth 0). Spawns past the limit refuse with "
+                "'max subagent nesting depth (N) reached'. "
                 "depth-1 sub-agents are auto-approved; deeper ones require overseer approval. "
-                "'ponder' kind is auto-approved at any depth (read-only + budget-bounded). "
+                "'ponder' kind is auto-approved at any allowed depth (read-only + budget-bounded). "
                 "A depth_warning or agent_limit_warning advisory is emitted when soft limits "
-                "are reached, but the spawn still proceeds. "
+                "are reached, but the spawn still proceeds (until the hard nesting cap). "
                 "Optional 'effort' (low|medium|high): when the subagent role's Thinking is "
                 "Auto, the dispatcher uses this as reasoning effort; omit to let the harness "
                 "judge complexity (default medium). "

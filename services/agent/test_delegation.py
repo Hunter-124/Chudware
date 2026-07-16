@@ -29,6 +29,7 @@ from services.agent.delegation import (
     DEPTH_CAP,
     DEFAULT_SOFT_DEPTH_LIMIT,
     DEFAULT_MAX_AGENTS,
+    DEFAULT_MAX_SUBAGENT_DEPTH,
     DELEGATION_SCHEMA,
     BudgetMeter,
     DelegationError,
@@ -333,6 +334,9 @@ class TestDelegationApprovalMatrix(unittest.TestCase):
             orchestrator_budget=100_000,
             ledger=self.ledger,
             routing=self.routing,
+            # Approval-matrix tests exercise depth-3 ponder; hard nesting
+            # cap is covered separately in TestMaxSubagentDepth.
+            max_subagent_depth=8,
         )
 
     def test_depth1_worker_auto_approved(self):
@@ -407,11 +411,13 @@ class TestDelegationApprovalMatrix(unittest.TestCase):
             self.tree.request_delegation("sketcher", "Bad kind", 500, kind="supervisor")
 
     def test_soft_depth_limit_warning_not_error(self):
-        """T-DP9: No hard depth cap.  Spawning past the soft limit emits a
-        delegation_depth_warning event but the spawn SUCCEEDS (does not raise).
-        The old DEPTH_CAP=3 constant is kept for backward compat but not enforced.
+        """Soft depth advisory still fires; hard nesting cap is separate.
+
+        With max_subagent_depth high enough, spawning past soft_depth_limit
+        emits delegation_depth_warning but the spawn SUCCEEDS.
         """
         # Use a tree with soft_depth_limit=3 to hit the boundary quickly.
+        # Raise max_subagent_depth so the hard cap does not refuse first.
         ledger = _MockLedger()
         tree = DelegationTree(
             run_id="r_softcap",
@@ -419,6 +425,7 @@ class TestDelegationApprovalMatrix(unittest.TestCase):
             ledger=ledger,
             routing=_two_source_routing(),
             soft_depth_limit=3,
+            max_subagent_depth=8,
         )
         parent_id = tree.root_id
         # Spawn through the soft limit — all should succeed (ponder = auto-approved).
@@ -591,11 +598,12 @@ class TestDelegateTool(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
 
     def test_depth_past_old_cap_via_tool_succeeds(self):
-        """T-DP9: delegate() allows spawning past the old DEPTH_CAP without error.
-        The call never raises — soft-limit advisory events are emitted instead.
+        """Soft-limit advisory events fire; spawn succeeds when under hard cap.
+
+        The call never raises for soft limits — only max_subagent_depth refuses.
         """
-        # Use a tree with soft_depth_limit=3 (same as old hard cap) to prove
-        # the difference: the tool returns an approved node, not an error dict.
+        # Use a tree with soft_depth_limit=3 and a high hard nesting cap so we
+        # can prove soft-limit warnings do not produce an error dict.
         ledger = _MockLedger()
         tree = DelegationTree(
             run_id="r_tool_depth",
@@ -603,6 +611,7 @@ class TestDelegateTool(unittest.TestCase):
             ledger=ledger,
             routing=_two_source_routing(),
             soft_depth_limit=3,
+            max_subagent_depth=8,
         )
         parent_id = tree.root_id
         for depth in range(1, DEPTH_CAP + 2):   # one past the old hard cap
@@ -638,7 +647,8 @@ class TestArtifactShape(unittest.TestCase):
         self.assertFalse(art["killed"])
         meter = art["budget_meter"]
         for key in ("tokens_granted", "tokens_spent", "tokens_remaining",
-                    "agents_spawned", "max_agents", "soft_depth_limit", "killed"):
+                    "agents_spawned", "max_agents", "soft_depth_limit",
+                    "max_subagent_depth", "killed"):
             self.assertIn(key, meter, f"budget_meter missing field {key!r}")
 
     def test_node_dict_has_required_fields(self):
@@ -893,7 +903,7 @@ class TestSoftLimitAdvisory(unittest.TestCase):
         ledger = _MockLedger()
         tree = DelegationTree(run_id="r_soft1", orchestrator_budget=100_000,
                               ledger=ledger, routing=_two_source_routing(),
-                              soft_depth_limit=3)
+                              soft_depth_limit=3, max_subagent_depth=8)
         parent_id = tree.root_id
         for depth in range(1, 5):  # spawn to depth 4, past limit of 3
             node = tree.request_delegation(
@@ -953,7 +963,8 @@ class TestSoftLimitAdvisory(unittest.TestCase):
         ledger = _MockLedger()
         tree = DelegationTree(run_id="r_soft5", orchestrator_budget=100_000,
                               ledger=ledger, routing=_two_source_routing(),
-                              soft_depth_limit=1, max_agents=1)
+                              soft_depth_limit=1, max_agents=1,
+                              max_subagent_depth=8)
         # Both limits hit immediately — spawn must still succeed.
         node = tree.request_delegation("sketcher", "first task", 500, kind="ponder")
         self.assertEqual(node.status, "approved")
@@ -1000,6 +1011,172 @@ class TestRoutingDelegationConfig(unittest.TestCase):
         self.assertIsInstance(rt.max_agents, int)
         self.assertGreater(rt.max_agents, 0)
 
+
+
+# ---------------------------------------------------------------------------
+# agent.max_subagent_depth hard nesting cap
+# ---------------------------------------------------------------------------
+
+class TestMaxSubagentDepth(unittest.TestCase):
+    """Hard nesting depth (agent.max_subagent_depth) refuses past the limit."""
+
+    def test_depth_refusal_at_limit(self):
+        """With max_subagent_depth=2, depth-1 and depth-2 succeed; depth-3 refuses."""
+        tree = DelegationTree(
+            run_id="r_hardcap",
+            orchestrator_budget=100_000,
+            routing=_two_source_routing(),
+            max_subagent_depth=2,
+            soft_depth_limit=99,
+        )
+        d1 = tree.request_delegation("sketcher", "depth 1", 500, kind="ponder")
+        self.assertEqual(d1.depth, 1)
+        d2 = tree.request_delegation(
+            "sketcher", "depth 2", 200, parent_id=d1.id, kind="ponder",
+        )
+        self.assertEqual(d2.depth, 2)
+        with self.assertRaises(DelegationError) as ctx:
+            tree.request_delegation(
+                "sketcher", "depth 3", 100, parent_id=d2.id, kind="ponder",
+            )
+        msg = str(ctx.exception)
+        self.assertIn("max subagent nesting depth (2) reached", msg)
+
+    def test_depth_zero_blocks_all_spawns(self):
+        """max_subagent_depth=0: root may not spawn any subagent (depth 1 refused)."""
+        tree = DelegationTree(
+            run_id="r_zero",
+            orchestrator_budget=10_000,
+            routing=_two_source_routing(),
+            max_subagent_depth=0,
+        )
+        with self.assertRaises(DelegationError) as ctx:
+            tree.request_delegation("sketcher", "nope", 100, kind="ponder")
+        self.assertIn("max subagent nesting depth (0) reached", str(ctx.exception))
+
+    def test_delegate_tool_returns_error_dict_at_limit(self):
+        tree = DelegationTree(
+            run_id="r_tool_hard",
+            orchestrator_budget=50_000,
+            routing=_two_source_routing(),
+            max_subagent_depth=1,
+        )
+        r1 = delegate("sketcher", "ok", 200, tree=tree, kind="ponder")
+        self.assertNotIn("error", r1)
+        r2 = delegate(
+            "sketcher", "too deep", 100,
+            tree=tree, parent_id=r1["id"], kind="ponder",
+        )
+        self.assertIn("error", r2)
+        self.assertEqual(r2["status"], "failed")
+        self.assertIn("max subagent nesting depth (1) reached", r2["error"])
+
+    def test_artifact_includes_max_subagent_depth(self):
+        tree = DelegationTree(
+            run_id="r_art",
+            orchestrator_budget=1000,
+            max_subagent_depth=3,
+        )
+        art = tree.to_artifact()
+        self.assertEqual(art["max_subagent_depth"], 3)
+        self.assertEqual(art["budget_meter"]["max_subagent_depth"], 3)
+
+    def test_default_constant(self):
+        self.assertEqual(DEFAULT_MAX_SUBAGENT_DEPTH, 2)
+
+
+# ---------------------------------------------------------------------------
+# Coordination board
+# ---------------------------------------------------------------------------
+
+class TestCoordinationBoard(unittest.TestCase):
+    """Claim conflict detection, release frees, progress notes."""
+
+    def setUp(self):
+        from services.agent.coordination import (
+            CoordinationBoard,
+            clear_boards,
+        )
+        clear_boards()
+        self.board = CoordinationBoard(
+            "r_coord_test", persist=False,
+        )
+
+    def tearDown(self):
+        from services.agent.coordination import clear_boards
+        clear_boards()
+
+    def test_claim_success(self):
+        out = self.board.register_claim(
+            "agent_a", ["doc_1", "feature_x"], "editing boss",
+        )
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["status"], "claimed")
+        self.assertEqual(len(out["claims"]), 2)
+
+    def test_claim_conflict_detection(self):
+        self.board.register_claim("agent_a", ["doc_1"], "first claim")
+        out = self.board.register_claim(
+            "agent_b", ["doc_1", "doc_2"], "second claim",
+        )
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["status"], "CONFLICT")
+        self.assertEqual(len(out["conflicts"]), 1)
+        self.assertEqual(out["conflicts"][0]["resource"], "doc_1")
+        self.assertEqual(out["conflicts"][0]["holder"], "agent_a")
+        self.assertEqual(out["conflicts"][0]["intent"], "first claim")
+        # Conflicting claim must NOT partially grant remaining resources.
+        snap = self.board.board_snapshot()
+        resources = {c["resource"] for c in snap["claims"]}
+        self.assertIn("doc_1", resources)
+        self.assertNotIn("doc_2", resources)
+
+    def test_release_frees_for_other_agent(self):
+        self.board.register_claim("agent_a", ["doc_1"], "hold")
+        rel = self.board.release_claim("agent_a", ["doc_1"])
+        self.assertTrue(rel["ok"])
+        self.assertEqual(rel["released"], ["doc_1"])
+        out = self.board.register_claim("agent_b", ["doc_1"], "now free")
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["status"], "claimed")
+
+    def test_same_agent_reclaim_ok(self):
+        self.board.register_claim("agent_a", ["doc_1"], "v1")
+        out = self.board.register_claim("agent_a", ["doc_1"], "v2 refresh")
+        self.assertTrue(out["ok"])
+        snap = self.board.board_snapshot()
+        self.assertEqual(snap["claims"][0]["intent"], "v2 refresh")
+
+    def test_post_progress_and_snapshot(self):
+        self.board.register_claim("agent_a", ["f1"], "work")
+        prog = self.board.post_progress("agent_a", "sketch closed")
+        self.assertTrue(prog["ok"])
+        snap = self.board.board_snapshot()
+        self.assertEqual(snap["claim_count"], 1)
+        self.assertEqual(snap["progress_count"], 1)
+        self.assertEqual(snap["progress"][0]["note"], "sketch closed")
+
+    def test_release_all_for_agent(self):
+        self.board.register_claim("agent_a", ["a", "b", "c"], "batch")
+        rel = self.board.release_claim("agent_a")
+        self.assertEqual(rel["count"], 3)
+        self.assertEqual(self.board.board_snapshot()["claim_count"], 0)
+
+    def test_get_board_registry(self):
+        from services.agent.coordination import get_board, drop_board
+        b1 = get_board("r_shared", persist=False)
+        b2 = get_board("r_shared", persist=False)
+        self.assertIs(b1, b2)
+        b1.register_claim("x", ["r"], "i")
+        self.assertEqual(b2.board_snapshot()["claim_count"], 1)
+        drop_board("r_shared")
+
+    def test_preamble_text_mentions_claims(self):
+        self.board.register_claim("agent_a", ["doc_z"], "editing")
+        text = self.board.preamble_text()
+        self.assertIn("doc_z", text)
+        self.assertIn("agent_a", text)
+        self.assertIn("coordinate_claim", text)
 
 if __name__ == "__main__":
     unittest.main()

@@ -314,34 +314,17 @@ static ChipResult drawChipAt(const char* btnId,
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 p1(p0.x + chipW, p0.y + chipH);
 
-    // ONE continuous liquid-glass pill background across the whole chip.
-    // Do NOT use coloredRowWash here: its left-cap / MultiColor / right-cap construction
-    // reads as three distinct vertical bands on these short title-bar pills. Instead:
-    // frosted base + a single left→right MultiColor wash over the full rounded rect.
-    // Active glow is applied once (glassRowBackground(selected=false) so we own the glow).
+    // ONE continuous liquid-glass pill background across the whole chip: frosted base +
+    // ui::coloredRowWash (seamless 3-slab L→R gradient, no corner bleed, no cap seams).
+    // Active glow is applied once below (glassRowBackground(selected=false) so we own the glow).
     const float sChip = ui::uiScale;
     float tint[3] = { ui::palette.accent[0], ui::palette.accent[1], ui::palette.accent[2] };
     ui::glassRowBackground(dl, p0, p1, rnd, /*stripe*/false, /*selected*/false, /*washAlpha*/0.42f);
     {
-        // Match glassRowBackground / coloredRowWash self-inset so the wash sits on the frost.
-        const float inset = 2.0f * sChip;
-        ImVec2 mn(p0.x + inset, p0.y + inset);
-        ImVec2 mx(p1.x - inset, p1.y - inset);
-        if (mx.x > mn.x && mx.y > mn.y) {
-            const float strength = isActive ? 0.40f : (hovered ? 0.30f : 0.18f);
-            const float aL = strength;
-            const float aR = ImMax(0.02f, strength * 0.15f);
-            // rnd is already screen-px for chips (barH fraction); clamp to the inset rect.
-            const float W = mx.x - mn.x, H = mx.y - mn.y;
-            const float rr = ImClamp(rnd, 0.0f, ImMin(W, H) * 0.5f);
-            auto dye = [&](float a) {
-                return ImGui::ColorConvertFloat4ToU32(ImVec4(tint[0], tint[1], tint[2], a));
-            };
-            // Continuous L→R: rounded base in the faint right colour, then one full-width
-            // MultiColor. No left/mid/right segment caps — those were the visible vertical seams.
-            dl->AddRectFilled(mn, mx, dye(aR), rr);
-            dl->AddRectFilledMultiColor(mn, mx, dye(aL), dye(aR), dye(aR), dye(aL));
-        }
+        const float strength = isActive ? 0.40f : (hovered ? 0.30f : 0.18f);
+        // coloredRowWash multiplies rounding by uiScale and self-insets by 2dp; chips carry rnd in
+        // screen px, so hand it back in dp.
+        ui::coloredRowWash(dl, p0, p1, rnd / sChip, tint, strength, /*selected*/false);
     }
     if (isActive)
         ui::glassSelectionGlow(dl, p0, p1, rnd, ui::palette.accent);

@@ -585,13 +585,12 @@ void coloredRowWash(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding,
     };
     // Translucent left->right tint over the frosted glass, bounded to the rounded pill: bright at
     // the left edge (`strength`), fading to a faint right edge (~15% of strength, min 0.02).
-    // Rounded-cap + full-height band construction (no margin ring, no corner pips):
-    //   - base fill owns every rounded corner (faint right colour);
-    //   - LEFT/RIGHT rounded caps are 2·rnd wide, so ImGui's radius clamp (min(w,h)/2) never
-    //     collapses their corner arc into square pips (the width==rnd bug);
-    //   - the square-cornered MultiColor band spans the FULL height BETWEEN the caps — its
-    //     corners land at x=±2·rnd, inside the straight top/bottom edges (arcs end at rnd),
-    //     so nothing pokes past the outline and no faint margin ring is left inside it.
+    // PAINT-ONCE construction (translucent fills compound alpha, so NO base rect under slabs):
+    //   - MIDDLE slab (y inset by rnd) spans the FULL width — the sides are straight there;
+    //   - TOP/BOTTOM slabs span x∈[rnd, W-rnd] with endpoint colours sampled from the same linear
+    //     ramp, so all three slabs share one gradient slope — boundaries are colour-continuous;
+    //   - the 4 corner arc wedges are quarter-disc path fills in the LOCAL ramp colour.
+    // Every pixel is painted exactly once: no seams, no corner bleed, no compounded alpha.
     const float aL = strength;
     const float aR = std::max(0.02f, strength * 0.15f);
     const float W  = mx.x - mn.x;
@@ -599,19 +598,32 @@ void coloredRowWash(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding,
     const float rnd = ImClamp(rr, 0.0f, ImMin(W, H) * 0.5f);
     auto mixAt = [&](float t) { return dye(aL * (1.0f - t) + aR * t); };
 
-    dl->AddRectFilled(mn, mx, dye(aR), rnd);
-    const float capW = ImMin(2.0f * rnd, W * 0.45f);
-    const float xa = mn.x + capW, xb = mx.x - capW;
-    if (xb > xa && capW > 0.5f) {
-        const float tA = capW / W, tB = (W - capW) / W;
-        dl->AddRectFilled(mn, ImVec2(xa, mx.y), mixAt(tA * 0.5f), rnd,
-                          ImDrawFlags_RoundCornersLeft);
-        dl->AddRectFilledMultiColor(ImVec2(xa, mn.y), ImVec2(xb, mx.y),
-                                    mixAt(tA), mixAt(tB), mixAt(tB), mixAt(tA));
-        dl->AddRectFilled(ImVec2(xb, mn.y), mx, mixAt((tB + 1.0f) * 0.5f), rnd,
-                          ImDrawFlags_RoundCornersRight);
+    const float x0 = mn.x + rnd, x1 = mx.x - rnd;
+    const float y0 = mn.y + rnd, y1 = mx.y - rnd;
+    if (x1 > x0) {
+        const float tA = rnd / W, tB = (W - rnd) / W;
+        if (y1 > y0)  // middle slab: full width, straight-side region
+            dl->AddRectFilledMultiColor(ImVec2(mn.x, y0), ImVec2(mx.x, y1),
+                                        dye(aL), dye(aR), dye(aR), dye(aL));
+        if (rnd > 0.5f) {
+            dl->AddRectFilledMultiColor(ImVec2(x0, mn.y), ImVec2(x1, y0),
+                                        mixAt(tA), mixAt(tB), mixAt(tB), mixAt(tA));
+            dl->AddRectFilledMultiColor(ImVec2(x0, y1), ImVec2(x1, mx.y),
+                                        mixAt(tA), mixAt(tB), mixAt(tB), mixAt(tA));
+            // Corner quarter-discs, local ramp colour (ramp error across rnd px is invisible).
+            // PathArcToFast quadrants: 0=+x, 3=+y(down), 6=-x, 9=-y(up).
+            auto wedge = [&](ImVec2 c, int q0, int q1, ImU32 col) {
+                dl->PathLineTo(c);
+                dl->PathArcToFast(c, rnd, q0, q1);
+                dl->PathFillConvex(col);
+            };
+            wedge(ImVec2(x0, y0), 6, 9,  mixAt(tA * 0.5f));          // top-left
+            wedge(ImVec2(x1, y0), 9, 12, mixAt((tB + 1.0f) * 0.5f)); // top-right
+            wedge(ImVec2(x1, y1), 0, 3,  mixAt((tB + 1.0f) * 0.5f)); // bottom-right
+            wedge(ImVec2(x0, y1), 3, 6,  mixAt(tA * 0.5f));          // bottom-left
+        }
     } else {
-        dl->AddRectFilled(mn, mx, dye(aL), rnd);  // too narrow for caps+band
+        dl->AddRectFilled(mn, mx, dye(aL), rnd);  // too narrow for the slabs
     }
 
     if (selected) {

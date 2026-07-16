@@ -258,6 +258,12 @@ public:
     // the drag flows through the SAME edit path as typing in the field (one source of truth, the PM's
     // OK/Cancel owns the commit/undo). Returns true if a visible+enabled Dim field `key` took it.
     bool dragSetDim(const std::string& key, double value);
+    // Same Instant3D path for Check fields (e.g. extrude "flip" / Reverse direction). Dragging the
+    // depth arrow past the sketch plane auto-toggles flip; this writes the checkbox + schedules the
+    // same immediate preview as dragSetDim. Returns true if a visible+enabled Check field took it.
+    bool dragSetCheck(const std::string& key, bool value);
+    // Read a visible+enabled Check field's current value (for flip_at_press capture). False if absent.
+    bool dragGetCheck(const std::string& key, bool& out) const;
     // True once the create-mode preview feature exists or in edit mode — i.e. there is a concrete
     // feature whose dimensions the viewport may show drag handles for.
     bool hasPreviewTarget() const { return active_ && !targetId_.empty(); }

@@ -913,6 +913,31 @@ bool PropertyManager::dragSetDim(const std::string& key, double value) {
     return false;
 }
 
+bool PropertyManager::dragSetCheck(const std::string& key, bool value) {
+    if (!active_) return false;
+    for (auto& f : fields_) {
+        if (f.def->kind != PMFieldKind::Check || !f.def->key || key != f.def->key) continue;
+        if (!fieldVisible(*f.def, fields_) || !fieldEnabled(*f.def, fields_)) return false;
+        if (f.checkValue == value) return true;  // already set — still a hit for the caller
+        f.checkValue = value;
+        dirty_ = true;
+        lastEditTime_ = ImGui::GetTime() - kDebounceSec;  // preview immediately (like dragSetDim)
+        return true;
+    }
+    return false;
+}
+
+bool PropertyManager::dragGetCheck(const std::string& key, bool& out) const {
+    if (!active_) return false;
+    for (const auto& f : fields_) {
+        if (f.def->kind != PMFieldKind::Check || !f.def->key || key != f.def->key) continue;
+        if (!fieldVisible(*f.def, fields_) || !fieldEnabled(*f.def, fields_)) return false;
+        out = f.checkValue;
+        return true;
+    }
+    return false;
+}
+
 void PropertyManager::loadFromTree(AppState& st, const nlohmann::json& feature) {
     (void)st;
     nlohmann::json params = feature.value("params", nlohmann::json::object());
@@ -3632,10 +3657,44 @@ void PropertyManager::drawBody(AppState& st) {
                 break;
             }
             case PMFieldKind::Check: {
-                // Widgets audit: Check rows join the same label-column grid as Dim/Combo rows —
-                // label in the left column (full text in its hover tooltip when clipped), box at
-                // the field column — so forms read as two clean columns instead of ragged rows.
-                pmCompactLabel(f.def->label, "", pal, enabled);
+                // Check rows: label uses the full content width minus the checkbox, checkbox is
+                // right-aligned at the trailing edge. Unlike Dim/Combo (fixed label column + field),
+                // checkboxes are small so the label gets the remaining budget — "Reverse direction"
+                // and similar must stay fully readable without the box landing on the text tail.
+                const float avail = ImGui::GetContentRegionAvail().x;
+                const float gap = ImGui::GetStyle().ItemInnerSpacing.x;
+                // Square checkbox frame ≈ GetFrameHeight() (ImGui Checkbox size).
+                const float chkW = ImGui::GetFrameHeight();
+                const float labelBudget = std::max(0.0f, avail - chkW - gap);
+
+                const ui::AdaptiveSurface& surf = pmSurf();
+                pushTextColorV(enabled ? surf.textPrimary : surf.textSecondary);
+                const char* full = f.def->label ? f.def->label : "";
+                std::string shown = full;
+                bool clipped = false;
+                if (labelBudget > 0.0f &&
+                    ImGui::CalcTextSize(shown.c_str()).x > labelBudget) {
+                    clipped = true;
+                    const char* ell = "\xE2\x80\xA6";  // U+2026 ellipsis
+                    const float ellW = ImGui::CalcTextSize(ell).x;
+                    while (!shown.empty() &&
+                           ImGui::CalcTextSize(shown.c_str()).x + ellW > labelBudget)
+                        shown.pop_back();
+                    shown += ell;
+                }
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextUnformatted(shown.c_str());
+                ImGui::PopStyleColor();
+                if (clipped && ImGui::IsItemHovered())
+                    pmTooltip("%s", full);
+
+                // Right-align the checkbox at the trailing edge (same pattern as pick-hint).
+                ImGui::SameLine(0.0f, 0.0f);
+                {
+                    const float remain = ImGui::GetContentRegionAvail().x;
+                    if (remain > chkW)
+                        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + remain - chkW);
+                }
                 bool val = f.checkValue;
                 if (ImGui::Checkbox("##chk", &val)) {
                     if (enabled) { f.checkValue = val; dirty_ = true; lastEditTime_ = ImGui::GetTime(); }

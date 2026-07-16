@@ -2559,6 +2559,45 @@ float polyAreaUV(const std::vector<ImVec2>& p) {
         a += (p[j].x + p[i].x) * (p[j].y - p[i].y);
     return std::fabs(a) * 0.5f;
 }
+// Representative interior point: circle centre, else polygon centroid (shoelace).
+ImVec2 loopCentroidUV(const std::vector<ImVec2>& poly, bool isCircle,
+                      float cx0, float cy0) {
+    if (isCircle) return ImVec2(cx0, cy0);
+    if (poly.size() < 3) return ImVec2(0, 0);
+    float a = 0.0f, cx = 0.0f, cy = 0.0f;
+    for (size_t i = 0, j = poly.size() - 1; i < poly.size(); j = i++) {
+        float cross = poly[j].x * poly[i].y - poly[i].x * poly[j].y;
+        a += cross;
+        cx += (poly[j].x + poly[i].x) * cross;
+        cy += (poly[j].y + poly[i].y) * cross;
+    }
+    if (std::fabs(a) < 1e-12f) {
+        float sx = 0, sy = 0;
+        for (const auto& p : poly) { sx += p.x; sy += p.y; }
+        return ImVec2(sx / (float)poly.size(), sy / (float)poly.size());
+    }
+    return ImVec2(cx / (3.0f * a), cy / (3.0f * a));
+}
+// Does outer strictly contain inner? Circle-in-circle uses radius containment
+// (mirrors core/geom/profile.cpp loop_contains); mixed/poly cases use point-in-poly.
+bool loopContainsUV(bool outerIsCircle, float oCx, float oCy, float oR,
+                    const std::vector<ImVec2>& outerPoly,
+                    bool innerIsCircle, float iCx, float iCy, float iR,
+                    const std::vector<ImVec2>& innerPoly) {
+    const float kEps = 1e-3f;
+    if (outerIsCircle && oR > kEps) {
+        if (innerIsCircle && iR > kEps) {
+            float dx = iCx - oCx, dy = iCy - oCy;
+            float d = std::sqrt(dx * dx + dy * dy);
+            return d + iR < oR - kEps;
+        }
+        ImVec2 c = loopCentroidUV(innerPoly, innerIsCircle, iCx, iCy);
+        float dx = c.x - oCx, dy = c.y - oCy;
+        return (dx * dx + dy * dy) < oR * oR;
+    }
+    ImVec2 c = loopCentroidUV(innerPoly, innerIsCircle, iCx, iCy);
+    return pointInPolyUV(outerPoly, c.x, c.y);
+}
 bool ptInRect(const ImVec2& p, const ImVec2& lo, const ImVec2& hi) {
     return p.x >= lo.x && p.x <= hi.x && p.y >= lo.y && p.y <= hi.y;
 }
@@ -2685,7 +2724,12 @@ void SketchMode::rebuildRegions() {
             clean.pop_back();
         r.poly.swap(clean);
         if (r.poly.size() < 3) return;
-        r.area = polyAreaUV(r.poly);
+        // Circles use exact pi r^2 (matches profile.cpp loop_area) so concentric nesting
+        // compares radii rather than tessellated shoelace noise.
+        if (r.isCircle && r.circleRadius > 1e-6f)
+            r.area = 3.14159265f * r.circleRadius * r.circleRadius;
+        else
+            r.area = polyAreaUV(r.poly);
         if (r.area < 1e-4f) return;   // degenerate
         regions_.push_back(std::move(r));
     };
@@ -2695,6 +2739,12 @@ void SketchMode::rebuildRegions() {
         if (e.construction) continue;
         if (e.type == "circle" || e.type == "ellipse" || e.type == "slot" || e.type == "arc_slot") {
             SketchRegion r; r.ids.push_back(e.id);
+            if (e.type == "circle" && e.radius > 1e-6f) {
+                r.isCircle = true;
+                r.circleCenter[0] = e.center[0];
+                r.circleCenter[1] = e.center[1];
+                r.circleRadius = e.radius;
+            }
             bool cl; entityBoundaryUV(e, r.poly, cl);
             finish(std::move(r));
         }
@@ -2740,18 +2790,72 @@ void SketchMode::rebuildRegions() {
         }
         if (closedLoop) finish(std::move(r));
     }
+
+    // 3) Even-odd nesting (mirrors core/geom/profile.cpp nest_loops): parent = smallest-area
+    // enclosing loop; depth = # of enclosers; isMaterial = (depth % 2 == 0). Direct children of
+    // a material region are holes to punch when shading.
+    const size_t n = regions_.size();
+    for (size_t i = 0; i < n; ++i) {
+        float bestArea = 0.0f;
+        int best = -1;
+        int depth = 0;
+        for (size_t j = 0; j < n; ++j) {
+            if (i == j || regions_[j].area <= regions_[i].area) continue;
+            const auto& O = regions_[j];
+            const auto& I = regions_[i];
+            if (loopContainsUV(O.isCircle, O.circleCenter[0], O.circleCenter[1], O.circleRadius,
+                               O.poly,
+                               I.isCircle, I.circleCenter[0], I.circleCenter[1], I.circleRadius,
+                               I.poly)) {
+                depth++;
+                if (best < 0 || O.area < bestArea) {
+                    bestArea = O.area;
+                    best = (int)j;
+                }
+            }
+        }
+        regions_[i].parent = best;
+        regions_[i].depth = depth;
+        regions_[i].isMaterial = (depth % 2 == 0);
+        regions_[i].holeChildren.clear();
+    }
+    for (size_t i = 0; i < n; ++i) {
+        int p = regions_[i].parent;
+        if (p >= 0 && regions_[p].isMaterial && !regions_[i].isMaterial)
+            regions_[p].holeChildren.push_back((int)i);
+    }
 }
 
-// Smallest-area region whose polygon contains the screen point (innermost wins), or -1.
+// Material-region hit under the screen point. Among material loops containing the point, the
+// smallest (innermost wall) wins. A point inside a void (odd-depth hole) is NOT a solid-profile
+// hit — return -1 so loop-select does not treat the hole interior as filled material.
 int SketchMode::hitTestRegion(const ImVec2& s) const {
     float u, v; screenToUV(s, u, v);
     int hit = -1; float best = 1e30f;
+    bool inVoid = false;
     for (size_t i = 0; i < regions_.size(); ++i) {
-        if (pointInPolyUV(regions_[i].poly, u, v) && regions_[i].area < best) {
-            best = regions_[i].area; hit = (int)i;
+        const auto& rg = regions_[i];
+        bool inside = false;
+        if (rg.isCircle && rg.circleRadius > 1e-6f) {
+            float dx = u - rg.circleCenter[0], dy = v - rg.circleCenter[1];
+            inside = (dx * dx + dy * dy) < rg.circleRadius * rg.circleRadius;
+        } else {
+            inside = pointInPolyUV(rg.poly, u, v);
+        }
+        if (!inside) continue;
+        if (!rg.isMaterial) {
+            // Innermost void wins over any larger material that also contains the point.
+            if (rg.area < best) { best = rg.area; hit = -1; inVoid = true; }
+            continue;
+        }
+        // Smaller material wins (island inside a void, or wall of a washer).
+        if (rg.area < best) {
+            best = rg.area;
+            hit = (int)i;
+            inVoid = false;
         }
     }
-    return hit;
+    return inVoid ? -1 : hit;
 }
 
 // The MULTI-entity loop (rectangle/polygon/custom chain) that entId is part of, or -1. Single-entity
@@ -5625,26 +5729,45 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             dl->AddLine(sa, sb, canvasAccent(), 3.5f * ui::uiScale);
         }
     }
-
     // ---- C51: closed-profile region shading (under the entities) ----
     // Loops detected from the live geometry are filled faintly so a closed profile reads as a
     // selectable face; the one the cursor has dwelled in (hotRegion_) brightens + gets an outline,
     // signalling that a click will grab its whole loop. Drawn BEFORE the entities so the boundary
-    // lines stay crisp on top. The fill uses ImGui's AddConcavePolyFilled so concave profiles
-    // (L-brackets etc.) shade as one clean solid translucent region with no triangle-seam streaks
-    // (rebuildRegions() only emits simple, non-self-intersecting loops, which it handles).
+    // lines stay crisp on top. ONLY material (even-depth) regions are shaded; each direct child
+    // hole is punched with an opaque canvas fill so concentric loops read as washers (hollow
+    // white center matching the sketch background). AddConcavePolyFilled handles L-brackets etc.
     rebuildRegions();
     if (hotRegion_ >= (int)regions_.size()) hotRegion_ = -1;
     {
         const ImU32 fillCol = col(pal.accent, 0.13f);
         const ImU32 hotFill = col(pal.accent, 0.28f);
         const ImU32 hotEdge = col(pal.accent, 0.65f);
-        for (size_t ri = 0; ri < regions_.size(); ++ri) {
-            const auto& rg = regions_[ri];
-            bool hot = (tool_ == SketchTool::None && (int)ri == hotRegion_);
+        // Opaque canvas punch — viewportTop is the light sketch/canvas tone (not accent).
+        const ImU32 holePunch = col(pal.viewportTop, 1.0f);
+        // Draw shallow material first so deeper islands land on top of outer hole punches
+        // (triple-nested: outer ring / void / island).
+        std::vector<int> matOrder;
+        matOrder.reserve(regions_.size());
+        for (size_t ri = 0; ri < regions_.size(); ++ri)
+            if (regions_[ri].isMaterial) matOrder.push_back((int)ri);
+        std::sort(matOrder.begin(), matOrder.end(), [&](int a, int b) {
+            return regions_[(size_t)a].depth < regions_[(size_t)b].depth;
+        });
+        for (int ri : matOrder) {
+            const auto& rg = regions_[(size_t)ri];
+            bool hot = (tool_ == SketchTool::None && ri == hotRegion_);
             std::vector<ImVec2> sp; sp.reserve(rg.poly.size());
             for (const auto& p : rg.poly) sp.push_back(uvToScreen(p.x, p.y));
             dl->AddConcavePolyFilled(sp.data(), (int)sp.size(), hot ? hotFill : fillCol);
+            // Punch each direct child hole with opaque canvas so the center reads hollow/white.
+            for (int hi : rg.holeChildren) {
+                if (hi < 0 || hi >= (int)regions_.size()) continue;
+                const auto& hole = regions_[(size_t)hi];
+                std::vector<ImVec2> hp; hp.reserve(hole.poly.size());
+                for (const auto& p : hole.poly) hp.push_back(uvToScreen(p.x, p.y));
+                if (hp.size() >= 3)
+                    dl->AddConcavePolyFilled(hp.data(), (int)hp.size(), holePunch);
+            }
             if (hot) dl->AddPolyline(sp.data(), (int)sp.size(), hotEdge, ImDrawFlags_Closed,
                                      1.5f * ui::uiScale);
         }

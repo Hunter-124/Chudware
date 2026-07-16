@@ -557,6 +557,15 @@ struct DimDrag {
     float       worldPerPx = 1.0f;    // mm per screen px along the measured world direction
     float       degPerPx   = 0.5f;    // deg per screen px (angle dims)
     bool        haveReadout = false;  // show the readout chip
+    // Extrude-like depth + Reverse direction: when the PM has a "flip" Check, dragging the depth
+    // arrow past the sketch plane toggles flip and keeps depth = |signed| (engine requires depth>0).
+    // flipAtPress is the stable origin so multiple zero-crossings stay consistent; the press-time
+    // screen axis is frozen (no per-frame re-derive) so the arrow reorient after flip doesn't invert
+    // the delta mid-drag.
+    bool        autoFlip = false;
+    bool        flipAtPress = false;
+    bool        curFlip = false;
+    bool        lastFlipApplied = false;
     void reset() { *this = DimDrag{}; }
 };
 static DimDrag s_dim;
@@ -2117,6 +2126,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 s_dim.reset();
             } else if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
                 st.propertyManager->dragSetDim(s_dim.param, s_dim.curValue);
+                if (s_dim.autoFlip)
+                    st.propertyManager->dragSetCheck("flip", s_dim.curFlip);
                 s_dim.active = false;
                 s_dim.haveReadout = false;
             }
@@ -2871,17 +2882,35 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                         s_dim.worldPerPx = wpp; s_dim.degPerPx = dpp;
                         s_dim.haveReadout = true;
                         s_dim.clamped = false;
+                        // Depth + Reverse direction: if the open PM has a "flip" Check, drag past
+                        // the sketch plane auto-toggles flip and keeps depth = |signed| (>0). Only
+                        // the primary "depth" handle (Direction 1) — depth2 has no paired flip.
+                        if (!c.angle && c.param == "depth" && st.propertyManager) {
+                            bool flip = false;
+                            if (st.propertyManager->dragGetCheck("flip", flip)) {
+                                s_dim.autoFlip = true;
+                                s_dim.flipAtPress = flip;
+                                s_dim.curFlip = flip;
+                                s_dim.lastFlipApplied = flip;
+                                // Freeze the UNFLIPPED plane-normal screen axis: the drawn arrow
+                                // already honours params.flip, so undo that so px delta is signed
+                                // relative to the sketch plane (stable across zero crossings).
+                                if (flip) { s_dim.dsx = -s_dim.dsx; s_dim.dsy = -s_dim.dsy; }
+                            }
+                        }
                         break;   // one handle per press
                     }
                 }
 
                 // Drag: convert cursor motion to an absolute value and push it into the PM field.
                 // Length dims re-derive (dsx,dsy,worldPerPx) from the drawn arrow endpoints each
-                // frame so the handle moves with the cursor (same invariant as push-pull).
+                // frame so the handle moves with the cursor (same invariant as push-pull) — except
+                // autoFlip depth, which freezes the press-time plane-normal axis so a flip-driven
+                // arrow reorient mid-drag cannot invert the signed delta.
                 if (s_dim.active && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
                     st.requestCursor(ui::CursorKind::Crosshair);
                     cancelCameraAnimation();
-                    if (!s_dim.angle) {
+                    if (!s_dim.angle && !s_dim.autoFlip) {
                         auto cands = dimCandidates(st, s_dim.featureId);
                         for (const auto& c : cands) {
                             if (c.param != s_dim.param) continue;
@@ -2913,7 +2942,16 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     // is valid floor at 0; signed offsets carry rangeMin = -1e9 and go negative).
                     // Flag clamped so the readout shows the limit.
                     s_dim.clamped = false;
-                    if (s_dim.rangeMax > s_dim.rangeMin) {
+                    if (s_dim.autoFlip && !s_dim.angle) {
+                        // Signed depth relative to the sketch plane: positive = flipAtPress side.
+                        // Crossing zero toggles Reverse direction; depth stays |signed| (>= 0.1).
+                        double signed0 = s_dim.flipAtPress ? -s_dim.oldValue : s_dim.oldValue;
+                        double signedVal = signed0 + (double)px * (double)s_dim.worldPerPx;
+                        bool flip = signedVal < 0.0;
+                        newVal = std::fabs(signedVal);
+                        if (newVal < 0.1) { newVal = 0.1; s_dim.clamped = true; }
+                        s_dim.curFlip = flip;
+                    } else if (s_dim.rangeMax > s_dim.rangeMin) {
                         if (newVal < s_dim.rangeMin) { newVal = s_dim.rangeMin; s_dim.clamped = true; }
                         if (newVal > s_dim.rangeMax) { newVal = s_dim.rangeMax; s_dim.clamped = true; }
                     } else if (s_dim.angle) {
@@ -2928,17 +2966,27 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     }
                     s_dim.curValue = newVal;
                     // Throttle: only update the PM field when the value moved enough to matter (angles
-                    // a touch coarser). The PM's debounced preview rebuilds from the field.
+                    // a touch coarser). The PM's debounced preview rebuilds from the field. Auto-flip
+                    // also pushes when the Reverse checkbox must change.
                     double thresh = s_dim.angle ? 0.25 : 0.05;
-                    if (std::fabs(newVal - s_dim.lastApplied) >= thresh &&
-                        st.propertyManager->dragSetDim(s_dim.param, newVal))
-                        s_dim.lastApplied = newVal;
+                    bool flipChanged = s_dim.autoFlip && (s_dim.curFlip != s_dim.lastFlipApplied);
+                    if (flipChanged || std::fabs(newVal - s_dim.lastApplied) >= thresh) {
+                        bool ok = st.propertyManager->dragSetDim(s_dim.param, newVal);
+                        if (ok && s_dim.autoFlip)
+                            st.propertyManager->dragSetCheck("flip", s_dim.curFlip);
+                        if (ok) {
+                            s_dim.lastApplied = newVal;
+                            s_dim.lastFlipApplied = s_dim.curFlip;
+                        }
+                    }
                 }
 
                 // Release: leave the final value in the PM field (its OK button commits it). The drag
                 // never wrote a doc op of its own, so there is nothing to commit/undo here.
                 if (s_dim.active && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
                     st.propertyManager->dragSetDim(s_dim.param, s_dim.curValue);
+                    if (s_dim.autoFlip)
+                        st.propertyManager->dragSetCheck("flip", s_dim.curFlip);
                     s_dim.active = false;
                     s_dim.haveReadout = false;
                 }
@@ -3381,7 +3429,11 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 else if (s_dim.active) {
                     // Cancel the in-progress dim drag: restore the field to its press-time value
                     // (the PM re-previews) and end the drag. The PM itself stays open.
-                    if (st.propertyManager) st.propertyManager->dragSetDim(s_dim.param, s_dim.oldValue);
+                    if (st.propertyManager) {
+                        st.propertyManager->dragSetDim(s_dim.param, s_dim.oldValue);
+                        if (s_dim.autoFlip)
+                            st.propertyManager->dragSetCheck("flip", s_dim.flipAtPress);
+                    }
                     s_dim.reset();
                 } else if (st.contextPickActive) {
                     // Wave4: Esc finishes context-pick mode (composer cube). Keep selection.

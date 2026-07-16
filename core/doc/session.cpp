@@ -9903,6 +9903,12 @@ struct RegEdge {
     bool closed = false;
     // densely sampled 2D polyline of the edge (for outer/holes overlay), start..end.
     std::vector<Eigen::Vector2d> samples;
+    // Exact full-circle params (type=="circle"). Nesting uses these for area /
+    // containment so concentric washers classify without sample-ring centroid
+    // ambiguity (both centroids at the shared centre → ray-cast fails).
+    bool is_circle = false;
+    Eigen::Vector2d circle_center{0, 0};
+    double circle_radius = 0.0;
 };
 
 constexpr double kRegEps = 1e-6;
@@ -9939,6 +9945,9 @@ bool reg_build_edge(const json& ent, const aicad::geom::SketchPlane& pl, RegEdge
             BRepBuilderAPI_MakeEdge mk(gp_Circ(ax, r));
             if (!mk.IsDone()) return false;
             out.edge = mk.Edge(); out.p_start = c; out.p_end = c; out.closed = true;
+            out.is_circle = true;
+            out.circle_center = c;
+            out.circle_radius = r;
             int n = 64;
             for (int i = 0; i < n; ++i) {
                 double a = 2.0 * M_PI * i / n;
@@ -9976,6 +9985,10 @@ bool reg_build_edge(const json& ent, const aicad::geom::SketchPlane& pl, RegEdge
 struct RegLoop {
     std::vector<TopoDS_Edge> edges;
     std::vector<Eigen::Vector2d> poly;  // ordered loop polyline (2D, for containment + overlay)
+    // Exact circle params when this loop is a single full-circle edge (washer nesting).
+    bool is_circle = false;
+    Eigen::Vector2d circle_center{0, 0};
+    double circle_radius = 0.0;
 };
 
 double reg_signed_area(const std::vector<Eigen::Vector2d>& p) {
@@ -10023,6 +10036,39 @@ bool reg_point_in_poly(const Eigen::Vector2d& pt, const std::vector<Eigen::Vecto
     return inside;
 }
 
+// Loop area for nesting: exact pi r^2 for full circles, shoelace otherwise.
+double reg_loop_area(const RegLoop& lp) {
+    if (lp.is_circle && lp.circle_radius > kRegEps)
+        return M_PI * lp.circle_radius * lp.circle_radius;
+    return std::abs(reg_signed_area(lp.poly));
+}
+
+// Representative interior point: circle centre, else polygon centroid.
+Eigen::Vector2d reg_loop_centroid(const RegLoop& lp) {
+    if (lp.is_circle) return lp.circle_center;
+    return reg_poly_centroid(lp.poly);
+}
+
+// Does loop `outer` strictly contain the representative point of `inner`?
+// Circle-in-circle uses radii (inner fully inside outer when |c_i - c_o| + r_i < r_o).
+// Mixed/poly cases fall back to point-in-poly — mirrors geom/profile.cpp::loop_contains.
+bool reg_loop_contains(const RegLoop& outer, const RegLoop& inner) {
+    if (outer.is_circle && outer.circle_radius > kRegEps) {
+        if (inner.is_circle && inner.circle_radius > kRegEps) {
+            const double dx = inner.circle_center.x() - outer.circle_center.x();
+            const double dy = inner.circle_center.y() - outer.circle_center.y();
+            const double d = std::sqrt(dx * dx + dy * dy);
+            // Strict containment: inner disc fully inside outer (positive wall thickness).
+            return d + inner.circle_radius < outer.circle_radius - kRegEps;
+        }
+        const Eigen::Vector2d c = reg_loop_centroid(inner);
+        const double dx = c.x() - outer.circle_center.x();
+        const double dy = c.y() - outer.circle_center.y();
+        return (dx * dx + dy * dy) < outer.circle_radius * outer.circle_radius;
+    }
+    return reg_point_in_poly(reg_loop_centroid(inner), outer.poly);
+}
+
 std::vector<RegLoop> reg_detect_loops(const std::vector<RegEdge>& edges) {
     std::vector<RegLoop> loops;
     const size_t n = edges.size();
@@ -10033,6 +10079,11 @@ std::vector<RegLoop> reg_detect_loops(const std::vector<RegEdge>& edges) {
         RegLoop lp;
         lp.edges.push_back(edges[i].edge);
         lp.poly = edges[i].samples;
+        if (edges[i].is_circle) {
+            lp.is_circle = true;
+            lp.circle_center = edges[i].circle_center;
+            lp.circle_radius = edges[i].circle_radius;
+        }
         loops.push_back(std::move(lp));
     }
     for (size_t start = 0; start < n; ++start) {
@@ -10196,17 +10247,13 @@ json sketch_regions_locked(Session& s, const std::string& sketch_fid) {
     const size_t n = loops.size();
 
     std::vector<double> areas(n);
-    std::vector<Eigen::Vector2d> cents(n);
-    for (size_t i = 0; i < n; ++i) {
-        areas[i] = std::abs(reg_signed_area(loops[i].poly));
-        cents[i] = reg_poly_centroid(loops[i].poly);
-    }
     std::vector<int> depth(n, 0), parent(n, -1);
+    for (size_t i = 0; i < n; ++i) areas[i] = reg_loop_area(loops[i]);
     for (size_t i = 0; i < n; ++i) {
         double best_area = 0.0; int best = -1;
         for (size_t j = 0; j < n; ++j) {
             if (i == j || areas[j] <= areas[i]) continue;
-            if (reg_point_in_poly(cents[i], loops[j].poly)) {
+            if (reg_loop_contains(loops[j], loops[i])) {
                 depth[i]++;
                 if (best < 0 || areas[j] < best_area) { best_area = areas[j]; best = (int)j; }
             }

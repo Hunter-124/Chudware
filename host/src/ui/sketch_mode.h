@@ -630,7 +630,17 @@ private:
     struct SketchRegion {
         std::vector<std::string> ids;   // entity ids forming the closed loop
         std::vector<ImVec2> poly;       // boundary polygon in sketch (u,v), CCW-ish, not closed-dup
-        float area = 0.0f;              // |signed area| in uv (innermost-region tie-break)
+        float area = 0.0f;              // |signed area| (or pi r^2 for circles) for nesting
+        // Even-odd nesting (mirrors core/geom/profile.cpp nest_loops): parent = smallest-area
+        // enclosing loop, depth = # of enclosers, isMaterial = (depth % 2 == 0). Direct child
+        // holes are punched when shading material regions so concentric loops read as washers.
+        int parent = -1;
+        int depth = 0;
+        bool isMaterial = true;
+        std::vector<int> holeChildren;  // direct child region indices (voids to punch)
+        bool isCircle = false;          // true for single-entity full circle (radius containment)
+        float circleCenter[2] = {0, 0};
+        float circleRadius = 0.0f;
     };
     std::vector<SketchRegion> regions_;
     void rebuildRegions();                            // refill regions_ from ents_

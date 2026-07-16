@@ -3390,6 +3390,11 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 std::optional<Eigen::Vector3d> explicit_dir = opt_vec3(feat, "dir");
                 const bool dir_was_explicit = explicit_dir.has_value();
                 Eigen::Vector3d dir = explicit_dir.value_or(src.plane.normal);
+                // Reverse direction checkbox: negate the resolved dir after plane normal /
+                // explicit dir so drag and PM share one truth. Must run before start-shift
+                // and depth so offsets follow the flipped side.
+                const bool flip = feat.value("flip", false);
+                if (flip) dir = -dir;
 
                 // For a cut / through_all we size against the current body.
                 const std::string tgt_id = is_cut ? current_solid_id() : std::string();
@@ -3652,10 +3657,12 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     // both ways (mid_plane), so it is unaffected. Only flips when the first
                     // try removed nothing AND the flip removes something — never weakens a
                     // legitimately-directed cut.
+                    // Also skip when the user set Reverse direction (`flip`): that is an
+                    // explicit side choice and must not be silently undone by this heuristic.
                     const bool simple_blind = !mid_plane && !trim_to_plane &&
                         end2 == "none" && std::abs(taper_deg) <= 1e-9 && !thin;
                     if (std::abs(cut_mass - base_mass) < 1e-9 &&
-                        !dir_was_explicit && simple_blind) {
+                        !dir_was_explicit && !flip && simple_blind) {
                         TopoDS_Shape flipped;
                         for (const TopoDS_Face& f : faces) {
                             TopoDS_Shape pr = ::geom::extrude_face(f, -dir, depth, false);

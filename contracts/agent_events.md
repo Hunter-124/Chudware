@@ -237,3 +237,7 @@ Host passes its ChatMsg transcript as messages[]; RPCs are pure transforms, host
 - session_shake {messages, mode(elide|images), aggressive?} -> {ok, messages, saved_tokens, notice}
 - session_handoff {messages, focus?, provider, model} -> {ok, document} (## Goal/Constraints/Progress/Key Decisions/Critical Context/Next Steps; new-session is host-side)
 - session_btw {messages, question, provider, model} -> {ok, answer} (ephemeral; never mutates history)
+
+## plan_state (batch 2c, additive; C++ agent harness)
+Event `kind:"plan_state"` { shape:"build_plan"|"checklist"|"phased_todo"|"objectives"|"dag", title, summary?, revision, items:[{id, title(<=10 words), desc(tooltip: purpose/dims/assignment), status:"pending"|"running"|"pass"|"fail"|"done"|"abandoned", kind:"part"|"step"|"task"|"objective"|"node"|"subagent", phase?, parent_id?, meta?}], edges?:[{from,to}] (dag only) }
+Producers: core/agent/machine.cpp (build_plan after plan pass; checklist from plan_steps live; objectives when plan JSON has objectives/acceptance/success_criteria); core/agent/run.cpp mission loop (phased_todo). DAG not emitted from C++ (host reads buildgraph sidecar/RPC). Back-compat: kind:"plan"+PlanInfo kept; host normalizes PlanInfo→plan_state build_plan when planState empty. Raw plan_steps/model_step/mission_* remain. GUI: copilot Plan/Objectives section (tiles+hover tooltips, todos tree, subagents) above the activity timeline.

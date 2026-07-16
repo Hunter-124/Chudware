@@ -1808,12 +1808,10 @@ void Renderer::drawRefDatums(const Mat4& mvp, bool axesOnly) {
                 // The synthetic WORLD ORIGIN ("point.origin", injected in app.cpp) gets the full
                 // CAD-convention treatment instead of the plain cross: color-coded axes (X=red,
                 // Y=green, Z=blue), a solid arrow on the positive direction, and a dimmer DASHED
-                // tail on the negative direction. The +X/+Y/+Z text labels are screen-space and
-                // live in viewport_panel.cpp (kOriginAxisLen there must match os/e here).
+                // tail on the negative direction. No screen-space +/- axis letter labels.
                 if (d.id == "point.origin") {
                     const float os = e * 0.06f;   // positive axis length (issue #19: much shorter,
-                                                  // arrowheads removed; the label constant in
-                                                  // viewport_panel.cpp must stay in sync with this)
+                                                  // arrowheads removed)
                     const float ns = os * 0.80f;  // negative tail length (shorter, subdued)
                     static const Vec3 kDirs[3] = {Vec3(1, 0, 0), Vec3(0, 1, 0), Vec3(0, 0, 1)};
                     static const float kAxCol[3][3] = {{0.90f, 0.25f, 0.25f},   // X red

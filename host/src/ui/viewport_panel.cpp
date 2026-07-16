@@ -1988,36 +1988,6 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             }
         }
 
-        // ---- in-context component-edit banner (SolidWorks "Edit Component") ----
-        // While a component's model is the active doc (assembly drawn as a dimmed ghost behind it),
-        // show a compact glass HUD banner "Editing model: <componentId>" with a "Return to assembly"
-        // button that exits back to the assembly doc. Mirrors the gizmo-HUD glass panel styling above.
-        if (st.inComponentEdit()) {
-            const float s = ui::uiScale;
-            const auto& palC = ui::palette;
-            ImGui::PushStyleColor(ImGuiCol_ChildBg,
-                ImVec4(palC.overlayBg[0], palC.overlayBg[1], palC.overlayBg[2], palC.overlayBg[3]));
-            ImGui::PushStyleColor(ImGuiCol_Border,
-                ImVec4(palC.accent[0], palC.accent[1], palC.accent[2], 0.55f));
-            ImGui::BeginChild("##compEditHud", ImVec2(300 * s, 0),
-                              ImGuiChildFlags_Border | ImGuiChildFlags_AutoResizeY,
-                              ImGuiWindowFlags_NoScrollbar);
-            const std::string& cid = st.componentEdit.componentId;
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                ImVec4(palC.overlayText[0], palC.overlayText[1], palC.overlayText[2], 1.0f));
-            ImGui::Text("Editing model: %s", cid.empty() ? "(component)" : cid.c_str());
-            ImGui::PopStyleColor();
-            ImGui::Spacing();
-            ImGui::PushStyleColor(ImGuiCol_Button,
-                ImVec4(palC.accentDim[0], palC.accentDim[1], palC.accentDim[2], 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-                ImVec4(palC.accent[0], palC.accent[1], palC.accent[2], 1.0f));
-            if (ImGui::Button("Return to assembly", ImVec2(0, 0)))
-                st.exitComponentEdit();
-            ImGui::PopStyleColor(2);
-            ImGui::EndChild();
-            ImGui::PopStyleColor(2);
-        }
 
         // ---- assembly fit readout + parts list (multi-part builds only) ----
         if (!st.asmParts.empty()) {
@@ -4615,76 +4585,6 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                         st.planeEmphasis = p;
                     }
                 }
-            }
-        }
-
-        // ---- world-origin axis labels (+X/+Y/+Z, dim -X/-Y/-Z) ----
-        // Screen-space companions to the color-coded origin axes drawRefDatums draws at the world
-        // origin (X=red, Y=green, Z=blue; solid arrow on +, dashed tail on -). Gated on originVisEff
-        // (same single source of truth as the renderer + FM eye + pick) so labels never float without
-        // their arrows and never lag auto-show/auto-hide. The world lengths (0.22 / 0.80 of scene
-        // radius) must match the renderer's origin-axis case.
-        if (!inSketch && renderer.hasDatum("point.origin") && st.originVisEff) {
-            const float* m = renderer.camera().mvp.m;  // column-major model->clip
-            auto project = [&](float wx, float wy, float wz, ImVec2& out) -> bool {
-                float x = m[0]*wx + m[4]*wy + m[8]*wz  + m[12];
-                float y = m[1]*wx + m[5]*wy + m[9]*wz  + m[13];
-                float wc= m[3]*wx + m[7]*wy + m[11]*wz + m[15];
-                if (wc <= 1e-4f) return false;  // behind the camera
-                out.x = vr0.x + (x / wc * 0.5f + 0.5f) * (vr1.x - vr0.x);
-                out.y = vr0.y + (1.0f - (y / wc * 0.5f + 0.5f)) * (vr1.y - vr0.y);
-                return true;
-            };
-            const float e  = renderer.effectiveSceneRadius();
-            const float os = e * 0.06f;   // positive axis length (issue #19: matches drawRefDatums)
-            const float ns = os * 0.80f;  // negative tail length
-            static const float kAxis[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
-            static const ImU32 kAxCol[3] = {IM_COL32(230, 64, 64, 255),    // X red
-                                            IM_COL32(56, 200, 72, 255),    // Y green
-                                            IM_COL32(84, 118, 245, 255)};  // Z blue
-            static const char* kPosL[3]  = {"+X", "+Y", "+Z"};
-            static const char* kNegL[3]  = {"-X", "-Y", "-Z"};
-            static const char* kPosId[3] = {"vp_org_px", "vp_org_py", "vp_org_pz"};
-            static const char* kNegId[3] = {"vp_org_nx", "vp_org_ny", "vp_org_nz"};
-            ImVec2 so;
-            const bool haveO = project(0, 0, 0, so);
-            auto axisLabel = [&](const char* id, const char* txt, float wx, float wy, float wz,
-                                 ImU32 col, float fs) {
-                ImVec2 sp;
-                if (!project(wx, wy, wz, sp)) return;
-                // Push the label outward (away from the origin on screen) past the arrowhead.
-                if (haveO) {
-                    float dx = sp.x - so.x, dy = sp.y - so.y;
-                    float len = std::sqrt(dx * dx + dy * dy);
-                    if (len > 1e-3f) {
-                        sp.x += dx / len * 5.0f * ui::uiScale;
-                        sp.y += dy / len * 5.0f * ui::uiScale;
-                    }
-                }
-                ImFont* f = ImGui::GetFont();
-                ImVec2 ts = f->CalcTextSizeA(fs, 1e30f, 0.0f, txt);
-                ImVec2 p(sp.x - ts.x * 0.5f, sp.y - ts.y * 0.5f);
-                // Contrast halo (light AND dark themes): sample the backdrop under the label and
-                // ring the glyphs with the opposite tone, same trick as the HUD chips.
-                const ui::AdaptiveSurface& lsurf = ui::adaptivePanel(
-                    ui::panelId(id), ImRect(p, ImVec2(p.x + ts.x, p.y + ts.y)),
-                    ui::GlassGroup::Hud);
-                const ImU32 halo = ui::glassIconHalo(lsurf);
-                static const float off[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
-                for (int k = 0; k < 4; ++k)
-                    vdl->AddText(f, fs,
-                                 ImVec2(p.x + off[k][0] * ui::uiScale,
-                                        p.y + off[k][1] * ui::uiScale),
-                                 halo, txt);
-                vdl->AddText(f, fs, p, col, txt);
-            };
-            const float fsP = ImGui::GetFontSize() * 0.75f;   // issue #19: smaller origin labels
-            const float fsN = fsP * 0.85f;
-            for (int ai = 0; ai < 3; ++ai) {
-                const float* d = kAxis[ai];
-                axisLabel(kPosId[ai], kPosL[ai], d[0] * os, d[1] * os, d[2] * os, kAxCol[ai], fsP);
-                const ImU32 dim = (kAxCol[ai] & 0x00FFFFFF) | 0x8C000000u;  // ~55% alpha
-                axisLabel(kNegId[ai], kNegL[ai], -d[0] * ns, -d[1] * ns, -d[2] * ns, dim, fsN);
             }
         }
 

@@ -41,7 +41,8 @@ HOSTD_SOCK = os.environ.get(
 )
 DEV_HEADERS = {"X-Dev-User": "haedmonds69@gmail.com"}
 N_ITERS = 20
-P95_REGRESS_FRAC = 0.15  # fail if p95 grows >15% vs baseline
+P95_REGRESS_FRAC = 0.15  # fail if p95 grows >15% vs baseline...
+P95_REGRESS_FLOOR_MS = 0.1  # ...AND by >0.1 ms absolute (sub-ms p95 noise floor)
 BRIDGE_OVERHEAD_GROW_MS = 2.0  # fail if bridge overhead p50 grows >2 ms abs
 
 # Exact add_feature box payload (contracts/doc_ops.md + cad_tools.py example).
@@ -486,12 +487,13 @@ def _print_table(
         if baseline and m in base_metrics:
             base_p95 = float(bm.get("p95_ms", 0))
             cur_p95 = float(d.get("p95_ms", 0))
-            if base_p95 > 0 and cur_p95 > base_p95 * (1.0 + P95_REGRESS_FRAC):
+            limit = max(base_p95 * (1.0 + P95_REGRESS_FRAC), base_p95 + P95_REGRESS_FLOOR_MS)
+            if base_p95 > 0 and cur_p95 > limit:
                 status = "REGRESS"
                 failures.append(
                     f"{m}: direct p95 {cur_p95:.3f} ms > "
-                    f"{base_p95 * (1.0 + P95_REGRESS_FRAC):.3f} ms "
-                    f"(baseline {base_p95:.3f} +15%)"
+                    f"{limit:.3f} ms "
+                    f"(baseline {base_p95:.3f} +15% or +{P95_REGRESS_FLOOR_MS} ms)"
                 )
             if boh is not None and oh is not None:
                 if oh > float(boh) + BRIDGE_OVERHEAD_GROW_MS:

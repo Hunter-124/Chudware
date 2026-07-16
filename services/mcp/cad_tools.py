@@ -5083,6 +5083,10 @@ def register_cad_tools(mcp: FastMCP) -> None:
     def undo(doc_id: Optional[str] = None) -> str:
         """Undo the last edit on the current part.
 
+        Multi-user note: from mcp/agent connections the daemon rejects this with
+        code ``undo_denied`` (agents use doc_checkpoint/doc_revert or PLM rollback).
+        Set env ``AICAD_UNDO_AGENTS=1`` only as a deliberate kill-switch.
+
         VERIFY LOOP: after undo, call render_part()/render_views() (and inspect_feature on the
         affected region) to confirm the rolled-back state, then verify_battery before done.
         """
@@ -5097,6 +5101,10 @@ def register_cad_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     def redo(doc_id: Optional[str] = None) -> str:
         """Redo the last undone edit on the current part.
+
+        Multi-user note: from mcp/agent connections the daemon rejects this with
+        code ``undo_denied`` (agents use doc_checkpoint/doc_revert or PLM rollback).
+        Set env ``AICAD_UNDO_AGENTS=1`` only as a deliberate kill-switch.
 
         VERIFY LOOP: after redo, call render_part()/render_views() to SEE the restored state
         and verify_battery before declaring done.

@@ -34,6 +34,14 @@
 #include <iomanip>
 #include <optional>
 #include <sstream>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
 
 #include <BRepMesh_IncrementalMesh.hxx>
 #include <BRepBuilderAPI_MakeEdge.hxx>
@@ -157,6 +165,10 @@ struct SketchState {
     long drag_ctx_revision = -1;
 };
 
+// Forward decls — defined with the undo-journal helpers below Session.
+static void drop_history_entry(const std::string& entry);
+static void wipe_undo_journal(const std::string& doc_id);
+
 struct Session {
     // T-PERF5: per-doc mutex. Locked by DocLock::acquire / require_session; never
     // touched while holding g_registry_mtx (pin-then-lock). Non-copyable/non-movable
@@ -164,6 +176,10 @@ struct Session {
     std::mutex mtx;
 
     std::string doc_id;
+    // True only for sessions registered in g_sessions. Scratch/temp sessions
+    // (dry-run clones that copy live doc_id) leave this false so ~Session must
+    // NEVER wipe the live doc's undo journal.
+    bool owns_journal = false;
     json doc;
     long revision = 0;
     std::vector<std::string> undo_stack;  // JSON snapshots (newest at back)
@@ -210,6 +226,14 @@ struct Session {
     }
 
     Session() = default;
+    ~Session() {
+        // Clean shutdown / last shared_ptr drop: free any spilled undo journal.
+        // Scratch/temp sessions (owns_journal=false) must not touch the live dir.
+        if (!owns_journal) return;
+        for (const std::string& e : undo_stack) drop_history_entry(e);
+        for (const std::string& e : redo_stack) drop_history_entry(e);
+        wipe_undo_journal(doc_id);
+    }
     Session(const Session&) = delete;
     Session& operator=(const Session&) = delete;
     Session(Session&&) = delete;
@@ -222,8 +246,121 @@ constexpr std::size_t kUndoLimit = 100;
 // would pin hundreds of MB of process RSS indefinitely. Bound history in BYTES
 // too, and cap the PM-cancel checkpoint map (which minted one full-doc snapshot
 // per PropertyManager open and was NEVER freed on commit — an unbounded leak).
+// Entries that would push past the byte budget are spilled to disk as
+// hostd_undo/<instance-key>/<doc_id>/<seq>.json stubs (see trim_history) so
+// depth stays 100 without pinning multi-GB of RSS.
 constexpr std::size_t kUndoByteBudget = 256u * 1024u * 1024u;  // per stack
 constexpr std::size_t kCheckpointLimit = 32;                   // PM-cancel snapshots
+
+// ---- Undo disk journal (P2 multi-user / long sessions) -----------------------
+// Path: <stateDir>/hostd_undo/<instance-key>/<doc_id>/<seq>.json
+// stateDir mirrors services/ipc/ipc_discovery stateDir() without linking it
+// (libaicad must not pull the hostd IPC layer).
+static std::string undo_state_dir() {
+    if (const char* x = std::getenv("XDG_DATA_HOME"); x && *x)
+        return std::string(x) + "/AI-CAD";
+    if (const char* h = std::getenv("HOME"); h && *h)
+        return std::string(h) + "/.local/share/AI-CAD";
+#ifdef _WIN32
+    if (const char* a = std::getenv("APPDATA"); a && *a)
+        return std::string(a) + "\\AI-CAD";
+#endif
+    return "AI-CAD";
+}
+
+static std::string undo_instance_key() {
+    if (const char* k = std::getenv("AICAD_INSTANCE_KEY"); k && *k) return k;
+    // Per-process fallback so two daemons without AICAD_INSTANCE_KEY never share
+    // hostd_undo/ (doc ids are sequential and would collide across processes).
+    // The real instance key is fnv1a(hostd realpath) — libaicad cannot see that
+    // path, so isolate by pid instead.
+#ifdef _WIN32
+    return "inproc-" + std::to_string(static_cast<unsigned long>(::GetCurrentProcessId()));
+#else
+    return "inproc-" + std::to_string(static_cast<long>(::getpid()));
+#endif
+}
+
+static std::filesystem::path undo_journal_dir(const std::string& doc_id) {
+    return std::filesystem::path(undo_state_dir()) / "hostd_undo" / undo_instance_key() /
+           doc_id;
+}
+
+static void wipe_undo_journal(const std::string& doc_id) {
+    if (doc_id.empty()) return;
+    std::error_code ec;
+    std::filesystem::remove_all(undo_journal_dir(doc_id), ec);
+}
+
+// Monotonic spill sequence per process (file names only need uniqueness).
+static std::atomic<std::uint64_t> g_undo_spill_seq{1};
+
+// True when the stack entry is a disk stub: {"@file":"<path>"} (compact form).
+static bool is_undo_stub(const std::string& entry) {
+    // Fast reject: stubs are short and start with '{'.
+    if (entry.size() < 12 || entry[0] != '{') return false;
+    if (entry.find("\"@file\"") == std::string::npos) return false;
+    try {
+        json j = json::parse(entry);
+        return j.is_object() && j.contains("@file") && j["@file"].is_string();
+    } catch (...) {
+        return false;
+    }
+}
+
+static std::string undo_stub_path(const std::string& entry) {
+    try {
+        json j = json::parse(entry);
+        if (j.is_object() && j.contains("@file") && j["@file"].is_string())
+            return j["@file"].get<std::string>();
+    } catch (...) {
+    }
+    return {};
+}
+
+// Materialize a stack entry to a full doc-JSON string (load stub from disk).
+static std::string materialize_history_entry(const std::string& entry) {
+    if (!is_undo_stub(entry)) return entry;
+    const std::string path = undo_stub_path(entry);
+    if (path.empty()) return entry;
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return entry;
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    return ss.str();
+}
+
+// Spill a full-JSON entry to the journal and return a compact stub string.
+// On I/O failure returns the original entry (caller may still drop it on count
+// trim — better to lose oldest than pin RAM forever).
+static std::string spill_history_entry(const std::string& doc_id, const std::string& entry) {
+    if (doc_id.empty() || is_undo_stub(entry)) return entry;
+    std::error_code ec;
+    const auto dir = undo_journal_dir(doc_id);
+    std::filesystem::create_directories(dir, ec);
+    if (ec) return entry;
+    const std::uint64_t seq = g_undo_spill_seq.fetch_add(1, std::memory_order_relaxed);
+    const auto path = dir / (std::to_string(seq) + ".json");
+    {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        if (!out) return entry;
+        out.write(entry.data(), static_cast<std::streamsize>(entry.size()));
+        if (!out) {
+            std::filesystem::remove(path, ec);
+            return entry;
+        }
+    }
+    return json{{"@file", path.string()}}.dump();
+}
+
+static void drop_history_entry(const std::string& entry) {
+    // Free any on-disk spill when an entry leaves the stack entirely (count trim).
+    if (!is_undo_stub(entry)) return;
+    const std::string path = undo_stub_path(entry);
+    if (path.empty()) return;
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+}
 
 // =============================================================================
 // T-PERF5 — per-doc engine locking
@@ -3179,23 +3316,53 @@ json ops_response(Session& s, const CompileResult& r, const json& id_map, bool w
     }
     return resp;
 }
-
 // Bound an undo/redo history stack (oldest at front) by BOTH count and cumulative
 // bytes. Always keeps the newest entry even if it alone exceeds the byte budget —
 // dropping the just-captured state would corrupt undo/redo.
-void trim_history(std::vector<std::string>& stack) {
-    while (stack.size() > kUndoLimit) stack.erase(stack.begin());
-    std::size_t total = 0;
-    for (const std::string& e : stack) total += e.size();
-    while (stack.size() > 1 && total > kUndoByteBudget) {
-        total -= stack.front().size();
+// Byte-budget pressure spills oldest full-JSON entries to disk as {"@file":path}
+// stubs (hostd_undo/<instance>/<doc_id>/<seq>.json) so depth stays up to kUndoLimit
+// without pinning multi-GB of RSS. Count overflow permanently drops the oldest
+// entry (and deletes its journal file if it was a stub).
+void trim_history(const std::string& doc_id, std::vector<std::string>& stack) {
+    while (stack.size() > kUndoLimit) {
+        drop_history_entry(stack.front());
         stack.erase(stack.begin());
+    }
+    // Byte accounting: stubs are small; full dumps count their true size. When
+    // over budget, spill the oldest still-resident full entry (front-most non-stub
+    // that is not the newest) into a disk stub rather than discarding it.
+    auto stack_bytes = [&]() {
+        std::size_t total = 0;
+        for (const std::string& e : stack) total += e.size();
+        return total;
+    };
+    while (stack.size() > 1 && stack_bytes() > kUndoByteBudget) {
+        // Find the oldest full (non-stub) entry; spill it. If every older entry is
+        // already a stub and we are still over budget (pathological: newest alone
+        // exceeds budget), stop — we always keep the newest entry intact.
+        // On I/O failure (spill returns the original full entry) break rather than
+        // spin forever with stack_bytes never dropping.
+        bool progressed = false;
+        for (std::size_t i = 0; i + 1 < stack.size(); ++i) {
+            if (is_undo_stub(stack[i])) continue;
+            std::string spilled = spill_history_entry(doc_id, stack[i]);
+            if (!is_undo_stub(spilled)) {
+                // Disk write failed — cannot reduce RAM; abandon further spill.
+                return;
+            }
+            stack[i] = std::move(spilled);
+            progressed = true;
+            break;
+        }
+        if (!progressed) break;
     }
 }
 
 void push_undo(Session& s) {
     s.undo_stack.push_back(s.doc.dump());
-    trim_history(s.undo_stack);
+    trim_history(s.doc_id, s.undo_stack);
+    // Clearing redo drops any journal files those entries pointed at.
+    for (const std::string& e : s.redo_stack) drop_history_entry(e);
     s.redo_stack.clear();
 }
 
@@ -3613,6 +3780,7 @@ Session& new_part_session_locked(const std::string& name) {
     const std::string id = s->doc_id;
     {
         std::lock_guard<std::mutex> reg(g_registry_mtx);
+        s->owns_journal = true;
         g_sessions[id] = s;
     }
     // Lock the brand-new session on this thread's DocLock (no contention possible).
@@ -4078,6 +4246,7 @@ json doc_new(const std::string& kind, const std::string& name) {
         const std::string id = sp->doc_id;
         {
             std::lock_guard<std::mutex> reg(g_registry_mtx);
+            sp->owns_journal = true;
             g_sessions[id] = sp;
         }
         Session& stored = lk.acquire(id);
@@ -4169,9 +4338,17 @@ json doc_undo(const std::string& doc_id) {
     if (s.undo_stack.empty())
         throw OpError("invalid_op", "nothing to undo", {{"reason", "empty undo stack"}});
     s.redo_stack.push_back(s.doc.dump());
-    trim_history(s.redo_stack);
-    s.doc = json::parse(s.undo_stack.back());
+    trim_history(s.doc_id, s.redo_stack);
+    // Materialize stubs on demand (disk journal for large history entries).
+    const std::string entry = s.undo_stack.back();
+    const std::string snap = materialize_history_entry(entry);
+    if (is_undo_stub(entry) && is_undo_stub(snap))
+        throw OpError("io_error", "history entry lost (undo journal unreadable)",
+                      {{"reason", "stub materialize failed"},
+                       {"path", undo_stub_path(entry)}});
+    drop_history_entry(entry);  // free journal file if it was a stub
     s.undo_stack.pop_back();
+    s.doc = json::parse(snap);
     s.revision += 1;  // undo bumps the revision forward (Python contract)
     s.dirty = true;
     // C50: drop warm sketch state so the next solve COLD-solves the restored seeds
@@ -4192,9 +4369,16 @@ json doc_redo(const std::string& doc_id) {
     if (s.redo_stack.empty())
         throw OpError("invalid_op", "nothing to redo", {{"reason", "empty redo stack"}});
     s.undo_stack.push_back(s.doc.dump());
-    trim_history(s.undo_stack);
-    s.doc = json::parse(s.redo_stack.back());
+    trim_history(s.doc_id, s.undo_stack);
+    const std::string entry = s.redo_stack.back();
+    const std::string snap = materialize_history_entry(entry);
+    if (is_undo_stub(entry) && is_undo_stub(snap))
+        throw OpError("io_error", "history entry lost (redo journal unreadable)",
+                      {{"reason", "stub materialize failed"},
+                       {"path", undo_stub_path(entry)}});
+    drop_history_entry(entry);
     s.redo_stack.pop_back();
+    s.doc = json::parse(snap);
     s.revision += 1;
     s.dirty = true;
     if (s.active_sketch) s.active_sketch->solve_state.reset();  // C50 (see doc_undo)
@@ -4205,6 +4389,18 @@ json doc_redo(const std::string& doc_id) {
     }
     CompileResult r = compile_session(s);
     return warm_and_respond(s, std::move(r), json::object(), /*with_tess=*/true);
+}
+
+json doc_clear_history(const std::string& doc_id) {
+    DocLock lk;
+    Session& s = require_session(doc_id);
+    for (const std::string& e : s.undo_stack) drop_history_entry(e);
+    for (const std::string& e : s.redo_stack) drop_history_entry(e);
+    s.undo_stack.clear();
+    s.redo_stack.clear();
+    wipe_undo_journal(doc_id);
+    // No revision bump — save baseline, not an edit.
+    return json{{"ok", true}, {"doc_id", doc_id}};
 }
 
 json doc_tree(const std::string& doc_id) {
@@ -4541,9 +4737,14 @@ bool doc_close(const std::string& doc_id) {
     }
     {
         std::lock_guard<std::mutex> doc(pin->mtx);
+        // Drop any on-disk undo journal stubs for this doc before the session dies.
+        for (const std::string& e : pin->undo_stack) drop_history_entry(e);
+        for (const std::string& e : pin->redo_stack) drop_history_entry(e);
+        pin->undo_stack.clear();
+        pin->redo_stack.clear();
         // Session teardown happens when `pin` goes out of scope after this unlock.
-        (void)doc_id;
     }
+    wipe_undo_journal(doc_id);
     // T-PERF10: free AICM shared-memory objects for this doc (all revisions).
     aicad::aicm_handoff::release_doc(doc_id);
     return true;
@@ -4621,7 +4822,8 @@ json doc_revert(const std::string& doc_id, const std::string& checkpoint_id) {
     // One undo entry of the pre-revert state (a single undo restores it); clear redo
     // like any edit. Then swap in the snapshot, rebuild, and bump the revision.
     s.undo_stack.push_back(s.doc.dump());
-    trim_history(s.undo_stack);
+    trim_history(s.doc_id, s.undo_stack);
+    for (const std::string& e : s.redo_stack) drop_history_entry(e);
     s.redo_stack.clear();
     // Consume the checkpoint: every caller mints a fresh one per PM open and reverts
     // it at most once (sketch3d_mode, doc_mirror), so freeing it here reclaims the
@@ -8675,7 +8877,8 @@ json doc_push_pull(const std::string& doc_id, int body_id, int topo_id, double d
     // Commit pushes ONE undo entry of the pre-edit doc; a transient preview pushes none.
     if (commit) {
         s.undo_stack.push_back(pre_snapshot);
-        trim_history(s.undo_stack);
+        trim_history(s.doc_id, s.undo_stack);
+        for (const std::string& e : s.redo_stack) drop_history_entry(e);
         s.redo_stack.clear();
     }
     s.doc = std::move(working);
@@ -9273,6 +9476,7 @@ json doc_open(const std::string& path, bool as_solid, bool detach_path) {
     const std::string sid = sp->doc_id;
     {
         std::lock_guard<std::mutex> reg(g_registry_mtx);
+        sp->owns_journal = true;
         g_sessions[sid] = sp;
     }
     Session& stored = lk.acquire(sid);

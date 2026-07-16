@@ -28,6 +28,10 @@ public:
     struct Options {
         std::string hostdBin;   // spawn candidate; "" = env/discovery only
         std::string clientKind = "test";  // "gui" | "mcp" | "agent" | "test"
+        // Optional multi-user identity (web bridge / multi-seat). Sent in hello
+        // as params.user = {id, display} when userId is non-empty.
+        std::string userId;
+        std::string userDisplay;
         int spawnBudgetMs = 15000;        // total connect-or-spawn budget
         bool allowSpawn = true;           // false = attach-only (never spawn)
     };
@@ -94,6 +98,8 @@ private:
     nlohmann::json serverInfo_;
     std::string sockPath_;
     std::string clientKind_;             // saved for the reconnect re-handshake
+    std::string userId_;                 // saved with clientKind_ for reconnect hello
+    std::string userDisplay_;
     int nextId_ = 1;
     std::atomic<uint64_t> reconnectGen_{0};  // bumped by reconnectLocked (see accessor)
 };

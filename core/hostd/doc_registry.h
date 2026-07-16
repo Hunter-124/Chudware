@@ -63,16 +63,25 @@ public:
 
     // Policy gate before an engine passthrough. May MUTATE params (base_revision
     // injection). Returns false with err filled ({"code","message",...}) when the
-    // call must be rejected (read_only / busy_preview).
-    // `warning` (when set) is appended to the successful result by the caller —
-    // the implicit-attach "doc has another writer" path.
-    bool preCall(int clientId, const std::string& kind, const std::string& method,
+    // call must be rejected (read_only / busy_preview / undo_denied).
+    // `userId`/`userDisplay` are the connection's optional multi-user identity
+    // (from hello params.user); empty when unset. `warning` (when set) is appended
+    // to the successful result by the caller — the implicit-attach "doc has
+    // another writer" path.
+    bool preCall(int clientId, const std::string& kind, const std::string& userId,
+                 const std::string& userDisplay, const std::string& method,
                  nlohmann::json& params, nlohmann::json& err, std::string& warning);
 
     // Response post-processing after a SUCCESSFUL engine call: revision sniff,
     // implicit attach of minted docs, event fanout, _foreign_edits injection.
-    void postCall(int clientId, const std::string& kind, const std::string& method,
+    // Records lastWriterUser{Id,Display} on writes and includes them on doc.changed.
+    void postCall(int clientId, const std::string& kind, const std::string& userId,
+                  const std::string& userDisplay, const std::string& method,
                   const nlohmann::json& params, nlohmann::json& result);
+
+    // Fan out doc.history_cleared to ALL subscribers of `docId` (including the
+    // saver — exceptClient is -1 so every GUI greys undo/redo).
+    void notifyHistoryCleared(const std::string& docId, int sourceClientId);
 
     // Stamp each doc_list entry with "origin_kind" (the kind of the client that
     // MINTED the doc: gui|mcp|agent|test, or "unknown"). Lets a GUI that connected
@@ -127,6 +136,10 @@ private:
         int lastWriterClient = -1;
         std::string lastWriterKind;
         std::string lastWriterMethod;
+        // Multi-user identity of the last writer (from hello params.user). Empty
+        // strings when the writer did not declare a user (local single-seat).
+        std::string lastWriterUserId;
+        std::string lastWriterUserDisplay;
         // Kind of the client that minted this doc (gui|mcp|agent|test). Immutable
         // once set — the origin of ownership (user vs AI). Empty = unknown.
         std::string originKind;

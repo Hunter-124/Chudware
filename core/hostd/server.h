@@ -28,6 +28,10 @@ namespace hostd {
 struct ClientConn {
     int id = 0;
     std::string kind;  // gui | mcp | agent | test (from hello)
+    // Optional multi-user identity from hello params.user {id, display}.
+    // Empty when the client did not send a user (local single-seat default).
+    std::string userId;
+    std::string userDisplay;
     long pid = 0;
     aicad_ipc::IpcConn conn;
     std::mutex writeMtx;  // response writes and (Phase 3) event pushes interleave

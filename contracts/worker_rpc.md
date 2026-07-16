@@ -452,3 +452,42 @@ crash cannot corrupt a session (host restarts it on demand).
   from events. Host-side timeout: none for sim (cancel is explicit), 120 s default elsewhere.
 - The host owns process lifecycle: doc worker at startup (existing flow), sim worker lazily,
   restart on crash with a console notice.
+
+## 5. Multi-user identity & history (append-only, 2026-07-16)
+
+### 5.1 `hello` user param (hostd)
+
+Daemon clients may declare seat identity on the first `hello` handshake:
+
+```json
+{"method":"hello","params":{
+  "client":"gui"|"mcp"|"agent"|"test"|"control",
+  "pid": 1234,
+  "proto": 1,
+  "user": {"id": "alice@example.com", "display": "Alice"}   // optional
+}}
+```
+
+- Wire field for client kind remains `client` (values gui|mcp|agent|test|control), **not** `kind`.
+- `user` is optional. When present, both `id` and `display` are strings (empty string allowed).
+- The daemon stores `{id,display}` on the per-connection state and stamps them onto subsequent
+  `doc.changed` events as `data.user`. Local single-seat GUIs omit `user` and events carry empty
+  strings.
+
+### 5.2 `doc_clear_history`
+
+| method | params → result |
+|---|---|
+| `doc_clear_history` | `{doc_id}` → `{ok:true, doc_id}` — clears that doc's undo_stack + redo_stack and wipes its on-disk undo journal. **No revision bump.** Invoked automatically by hostd after a successful `doc_save` from a **gui**-kind client; agent/mcp saves do **not** clear. |
+
+### 5.3 Agent undo gating
+
+`doc_undo` / `doc_redo` from a connection whose `client` kind is `mcp` or `agent` are rejected with:
+
+```json
+{"code":"undo_denied","message":"agents use doc_checkpoint/doc_revert or PLM rollback"}
+```
+
+unless env `AICAD_UNDO_AGENTS=1` is set (kill-switch restoring free undo for agents). Agents keep
+`doc_checkpoint` / `doc_revert` and PLM rollback for intentional rollback.
+

@@ -270,6 +270,13 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
     if (method == "hello") {
         c.kind = params.value("client", "unknown");
         c.pid = params.value("pid", 0L);
+        // Optional multi-user identity: params.user = {id, display}.
+        c.userId.clear();
+        c.userDisplay.clear();
+        if (params.contains("user") && params["user"].is_object()) {
+            c.userId = params["user"].value("id", std::string());
+            c.userDisplay = params["user"].value("display", std::string());
+        }
         return json{{"proto", 1},
                     {"abi", core::cpp_core().abiVersion()},
                     {"git_rev", buildId_},
@@ -367,7 +374,7 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
             }
             // Route through the registry so the caller attaches rw and every
             // mirror gets doc.opened — same envelope as a client doc_open.
-            registry_.postCall(c.id, c.kind, "doc_open", p2, result);
+            registry_.postCall(c.id, c.kind, c.userId, c.userDisplay, "doc_open", p2, result);
             const std::string newId = result.value("doc_id", std::string());
             // The original id (pre-crash) lives in the entry meta: record the
             // rebind so a reconnecting client's hello resolves its old handle, and
@@ -450,12 +457,14 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
     }
 
     // Registry policy gate: ro-attach rejection, edit-hold busy_preview, overlap
-    // CAS (base_revision injection when >1 writer). May mutate the params copy.
+    // CAS (base_revision injection when >1 writer), agent undo gating. May mutate
+    // the params copy.
     json p = params;
     std::string attachWarning;
     {
         json policyErr;
-        if (!registry_.preCall(c.id, c.kind, method, p, policyErr, attachWarning)) {
+        if (!registry_.preCall(c.id, c.kind, c.userId, c.userDisplay, method, p, policyErr,
+                              attachWarning)) {
             isError = true;
             return policyErr;
         }
@@ -478,7 +487,7 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
         return e;
     }
     // Revision sniff, minted-doc implicit attach, event fanout, _foreign_edits.
-    registry_.postCall(c.id, c.kind, method, p, result);
+    registry_.postCall(c.id, c.kind, c.userId, c.userDisplay, method, p, result);
     // Stamp origin_kind onto each doc_list entry so a GUI that connected after a
     // doc was minted can recover user-vs-AI ownership on bootstrap.
     if (method == "doc_list") registry_.annotateDocList(result);
@@ -486,6 +495,18 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
     // artifacts so it can never resurrect on the next daemon start.
     if (method == "doc_close" && autosave_)
         autosave_->onDocClosed(p.value("doc_id", std::string()));
+    // Human (gui) save clears that doc's undo/redo history (session stacks +
+    // disk journal) and fans out doc.history_cleared so other GUIs grey undo.
+    // Agent/mcp saves deliberately keep history so AI rollback paths still work.
+    if (method == "doc_save" && c.kind == "gui") {
+        const std::string docId = p.value("doc_id", std::string());
+        if (!docId.empty()) {
+            json clr;
+            std::string e2;
+            if (core::cpp_core().call("doc_clear_history", json{{"doc_id", docId}}, clr, e2))
+                registry_.notifyHistoryCleared(docId, c.id);
+        }
+    }
     if (!attachWarning.empty() && result.is_object() && !result.contains("warning"))
         result["warning"] = attachWarning;
     return result;

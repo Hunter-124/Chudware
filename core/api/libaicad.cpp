@@ -2601,6 +2601,9 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                 return emit(aicad::doc::doc_undo(params.value("doc_id", std::string())), out_json, 0);
             if (m == "doc_redo")
                 return emit(aicad::doc::doc_redo(params.value("doc_id", std::string())), out_json, 0);
+            if (m == "doc_clear_history")
+                return emit(aicad::doc::doc_clear_history(params.value("doc_id", std::string())),
+                            out_json, 0);
             if (m == "doc_tree")
                 return emit(aicad::doc::doc_tree(params.value("doc_id", std::string())), out_json, 0);
             if (m == "doc_rebuild")

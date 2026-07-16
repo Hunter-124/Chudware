@@ -78,6 +78,10 @@ nlohmann::json doc_dry_run_ops(const std::string& doc_id, const nlohmann::json& 
 
 nlohmann::json doc_undo(const std::string& doc_id);     // bumps revision +1
 nlohmann::json doc_redo(const std::string& doc_id);     // bumps revision +1
+// Clear undo_stack + redo_stack (+ disk journal) for a doc without bumping
+// revision. Used after a human (gui) doc_save so interactive undo resets at the
+// saved baseline. Returns {"ok": true, "doc_id": ...}.
+nlohmann::json doc_clear_history(const std::string& doc_id);
 nlohmann::json doc_tree(const std::string& doc_id);     // no rebuild, no rev bump
 nlohmann::json doc_rebuild(const std::string& doc_id);  // forced rebuild, no rev bump
 // Cheap tab-switch activation (viewport switch perf): serve the session's read-cache

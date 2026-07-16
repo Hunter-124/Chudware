@@ -333,3 +333,42 @@ these reject the whole batch with no state change (§2).
 
 `stale_revision` is the optimistic-concurrency signal: the GUI must resync (`doc_tree`) and replay
 user intent. Rebuild failures are NOT errors (see §2.3).
+
+## 6. Multi-user events & history (append-only, 2026-07-16)
+
+### 6.1 `doc.changed` user field
+
+Every `doc.changed` fanout payload gains:
+
+```json
+{"event":"doc.changed","data":{
+  "doc_id":"…", "revision":N, "source_client":1, "source_kind":"gui",
+  "method":"doc_apply_ops",
+  "user":{"id":"…","display":"…"},
+  "aicm_path":"…", "tree":{…}, …
+}}
+```
+
+`user.id` / `user.display` are empty strings when the writer did not declare identity on hello.
+
+### 6.2 `doc.history_cleared`
+
+After a successful **gui** `doc_save`, hostd clears that doc's undo/redo history and fans:
+
+```json
+{"event":"doc.history_cleared","data":{"doc_id":"…"}}
+```
+
+to **all** subscribers (including the saver). GUIs grey local undo/redo until a subsequent edit.
+
+### 6.3 `doc_clear_history` RPC
+
+Engine method `{doc_id}` → `{ok:true, doc_id}`: empties undo_stack + redo_stack and deletes
+`<stateDir>/hostd_undo/<instance-key>/<doc_id>/`. No revision bump. See worker_rpc §5.2.
+
+### 6.4 `undo_denied` error code
+
+`doc_undo` / `doc_redo` from mcp/agent clients return
+`{"code":"undo_denied","message":"agents use doc_checkpoint/doc_revert or PLM rollback"}`
+unless `AICAD_UNDO_AGENTS=1`. Added to the error envelope vocabulary of §5.
+

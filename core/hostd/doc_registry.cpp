@@ -35,7 +35,8 @@ bool DocRegistry::isReadOnlyMethod(const std::string& m) {
         "doc_sketch_regions", "doc_compile_cpp",
         // doc_save serializes to disk but does not modify the model — allowing
         // it means an ro viewer can still snapshot what it sees.
-        "doc_save", "doc_export_step",
+        // doc_clear_history empties undo stacks only (no revision bump / no model edit).
+        "doc_save", "doc_export_step", "doc_clear_history",
         // misc reads
         "asm_world_bodies", "config_list", "sim_study_list", "weld_cut_list",
         "sketch_health", "sketch3d_health", "sketch_probe",
@@ -327,8 +328,23 @@ bool DocRegistry::handleMethod(int clientId, const std::string& kind,
 
 // -------------------------------------------------------------- policy gate
 
-bool DocRegistry::preCall(int clientId, const std::string& kind, const std::string& method,
+bool DocRegistry::preCall(int clientId, const std::string& kind, const std::string& /*userId*/,
+                          const std::string& /*userDisplay*/, const std::string& method,
                           json& params, json& err, std::string& warning) {
+    // Agent undo gating (P2 multi-user): interactive undo/redo is human-only.
+    // Agents keep doc_checkpoint/doc_revert + autosave/PLM for rollback. Kill-switch
+    // AICAD_UNDO_AGENTS=1 restores the old free-for-all behaviour.
+    if ((method == "doc_undo" || method == "doc_redo") &&
+        (kind == "mcp" || kind == "agent")) {
+        const char* allow = std::getenv("AICAD_UNDO_AGENTS");
+        if (!(allow && std::string(allow) == "1")) {
+            err = json{{"code", "undo_denied"},
+                       {"message",
+                        "agents use doc_checkpoint/doc_revert or PLM rollback"}};
+            return false;
+        }
+    }
+
     if (isReadOnlyMethod(method)) return true;
     const std::string docId =
         params.is_object() ? params.value("doc_id", std::string()) : std::string();
@@ -407,7 +423,8 @@ bool DocRegistry::preCall(int clientId, const std::string& kind, const std::stri
 
 // -------------------------------------------------------- response sniffing
 
-void DocRegistry::postCall(int clientId, const std::string& kind, const std::string& method,
+void DocRegistry::postCall(int clientId, const std::string& kind, const std::string& userId,
+                           const std::string& userDisplay, const std::string& method,
                            const json& params, json& result) {
     std::vector<PendingEvent> pending;
     {
@@ -454,6 +471,8 @@ void DocRegistry::postCall(int clientId, const std::string& kind, const std::str
             d.lastWriterClient = clientId;
             d.lastWriterKind = kind;
             d.lastWriterMethod = method;
+            d.lastWriterUserId = userId;
+            d.lastWriterUserDisplay = userDisplay;
             d.originKind = kind;  // who created it — user (gui) vs AI (mcp/agent)
             json evt = {{"event", "doc.opened"},
                         {"data", {{"doc_id", docId},
@@ -461,7 +480,8 @@ void DocRegistry::postCall(int clientId, const std::string& kind, const std::str
                                   {"source_client", clientId},
                                   {"source_kind", kind},
                                   {"origin_kind", kind},
-                                  {"method", method}}}};
+                                  {"method", method},
+                                  {"user", {{"id", userId}, {"display", userDisplay}}}}}};
             fanoutLocked(docId, evt, clientId, pending);
             flush(pending);
             return;
@@ -478,7 +498,9 @@ void DocRegistry::postCall(int clientId, const std::string& kind, const std::str
                 {"doc_id", docId},
                 {"revision", d.revision},
                 {"source_kind", d.lastWriterKind},
-                {"method", d.lastWriterMethod}}});
+                {"method", d.lastWriterMethod},
+                {"user", {{"id", d.lastWriterUserId},
+                          {"display", d.lastWriterUserDisplay}}}}});
         }
 
         if (rev >= 0) {
@@ -489,11 +511,14 @@ void DocRegistry::postCall(int clientId, const std::string& kind, const std::str
                 d.lastWriterClient = clientId;
                 d.lastWriterKind = kind;
                 d.lastWriterMethod = method;
+                d.lastWriterUserId = userId;
+                d.lastWriterUserDisplay = userDisplay;
                 json data = {{"doc_id", docId},
                              {"revision", rev},
                              {"source_client", clientId},
                              {"source_kind", kind},
-                             {"method", method}};
+                             {"method", method},
+                             {"user", {{"id", userId}, {"display", userDisplay}}}};
                 if (result.contains("tess") && result["tess"].is_object() &&
                     result["tess"].contains("aicm_path"))
                     data["aicm_path"] = result["tess"]["aicm_path"];
@@ -516,6 +541,19 @@ void DocRegistry::postCall(int clientId, const std::string& kind, const std::str
         } else if (a.lastSeenRev < 0) {
             a.lastSeenRev = d.revision;  // first touch via a rev-less response
         }
+    }
+    flush(pending);
+}
+
+void DocRegistry::notifyHistoryCleared(const std::string& docId, int /*sourceClientId*/) {
+    // Fan to every subscriber, including the saver: every GUI must grey undo/redo
+    // for this doc after a human save. exceptClient = -1 => no exclusion.
+    std::vector<PendingEvent> pending;
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        json evt = {{"event", "doc.history_cleared"},
+                    {"data", {{"doc_id", docId}}}};
+        fanoutLocked(docId, evt, /*exceptClient=*/-1, pending);
     }
     flush(pending);
 }

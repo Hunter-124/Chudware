@@ -52,6 +52,10 @@ bool pidGone(long pid) {
 // hello.git_rev (the RUNNING daemon's configure-time id) vs what a fresh spawn
 // of the on-disk binary would report.
 std::string diskBuildId(const std::string& bin) {
+#ifdef __EMSCRIPTEN__
+    (void)bin;
+    return "";  // no hostd binary / no popen in the browser
+#else
     if (bin.empty()) return "";
     std::error_code ec;
     const auto t = std::filesystem::last_write_time(bin, ec);
@@ -88,6 +92,7 @@ std::string diskBuildId(const std::string& bin) {
     std::lock_guard<std::mutex> lk(m);
     cache[bin] = {mtime, out};
     return out;
+#endif  // !__EMSCRIPTEN__
 }
 }  // namespace
 
@@ -104,6 +109,9 @@ bool EngineClient::hello(const std::string& kind, std::string& err) {
     json params = {{"client", kind},
                    {"pid", selfPid()},
                    {"proto", 1}};
+    // Optional multi-user identity — only when the client set Options.userId.
+    if (!userId_.empty())
+        params["user"] = {{"id", userId_}, {"display", userDisplay_}};
     json result;
     // Engine may still be loading; hello is a daemon-level method and answers
     // immediately with state=loading|ready — that's fine for the handshake.
@@ -153,6 +161,8 @@ bool EngineClient::connectOrSpawn(const Options& opts, std::string& err) {
 bool EngineClient::connectInner(const Options& opts, std::string& err) {
     const std::string key = instanceKey(opts.hostdBin);
     clientKind_ = opts.clientKind;
+    userId_ = opts.userId;
+    userDisplay_ = opts.userDisplay;
     sockPath_ = socketPath(key);
     if (sockPath_.empty()) {
         err = "no runtime dir for hostd socket";
@@ -251,10 +261,12 @@ bool EngineClient::reconnectLocked(std::string& err) {
     // Inline hello — hello() goes through call(), which would re-lock mtx_.
     // Bounded: a reconnect must never reintroduce an unbounded wait.
     const int id = nextId_++;
+    json hparams = {{"client", clientKind_}, {"pid", selfPid()}, {"proto", 1}};
+    if (!userId_.empty())
+        hparams["user"] = {{"id", userId_}, {"display", userDisplay_}};
     json req = {{"id", id},
                 {"method", "hello"},
-                {"params",
-                 {{"client", clientKind_}, {"pid", selfPid()}, {"proto", 1}}}};
+                {"params", hparams}};
     if (!conn_.writeLine(req.dump())) {
         err = "daemon write failed (reconnect hello)";
         return false;

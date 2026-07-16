@@ -1616,7 +1616,7 @@ if(AICAD_WITH_OCCT)
     ${CMAKE_CURRENT_SOURCE_DIR}/../services/worker/cpp_core.cpp)
   target_include_directories(aicad-hostd PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/hostd_gen)
-  target_link_libraries(aicad-hostd PRIVATE nlohmann_json::nlohmann_json)
+  target_link_libraries(aicad-hostd PRIVATE nlohmann_json::nlohmann_json aicad_miniz)
   if(WIN32)
     # advapi32: pipe DACL (SetEntriesInAclW), token/SID (OpenProcessToken,
     # ConvertSidToStringSidW, CreateWellKnownSid). Everything else (named pipes,

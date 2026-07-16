@@ -210,8 +210,14 @@ bool Server::gcCloseDoc(const std::string& docId, const char* reason) {
                 const std::string path = d.contains("path") && d["path"].is_string()
                                              ? d["path"].get<std::string>()
                                              : std::string();
-                needRetire = path.empty() || d.value("dirty", false) ||
-                             autosave_->isAutosavePath(path);
+                // Blank/default docs (no features) are never recovery-worthy —
+                // close them without writing an orphan artifact.
+                if (d.value("empty", false)) {
+                    needRetire = false;
+                } else {
+                    needRetire = path.empty() || d.value("dirty", false) ||
+                                 autosave_->isAutosavePath(path);
+                }
                 break;
             }
         }

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -19,10 +20,54 @@
 #include "../../services/worker/cpp_core.h"
 #include "hostd_log.h"
 
+#include <miniz.h>
+
 namespace hostd {
 
 namespace fs = std::filesystem;
 using nlohmann::json;
+
+// True when a document JSON has no authored content worth recovering.
+// Material/name alone do not count. Assemblies need zero components AND mates
+// AND features. Parts need zero features (sketches live under features).
+static bool documentJsonIsEmpty(const json& doc) {
+    if (!doc.is_object()) return true;
+    auto arrSize = [&](const char* key) -> int {
+        if (!doc.contains(key) || !doc[key].is_array()) return 0;
+        return (int)doc[key].size();
+    };
+    const int features = arrSize("features");
+    const std::string schema = doc.value("schema", std::string());
+    if (schema == "aicad.asm/1") {
+        return features == 0 && arrSize("components") == 0 && arrSize("mates") == 0;
+    }
+    return features == 0;
+}
+
+// Peek document.json inside a .step+ ZIP without opening it in the engine.
+// Returns true when the file is missing/unreadable/corrupt OR the doc is empty.
+// Prefer false only when we can prove the part has content (fail-closed for recovery).
+static bool stepPlusFileIsEmpty(const std::string& path) {
+    mz_zip_archive zip;
+    memset(&zip, 0, sizeof(zip));
+    if (!mz_zip_reader_init_file(&zip, path.c_str(), 0)) return true;
+    size_t size = 0;
+    void* data = mz_zip_reader_extract_file_to_heap(&zip, "document.json", &size, 0);
+    mz_zip_reader_end(&zip);
+    if (!data || size == 0) {
+        if (data) mz_free(data);
+        return true;
+    }
+    bool empty = true;
+    try {
+        const json doc = json::parse(std::string(static_cast<const char*>(data), size));
+        empty = documentJsonIsEmpty(doc);
+    } catch (...) {
+        empty = true;  // unreadable document.json — not worth recovering
+    }
+    mz_free(data);
+    return empty;
+}
 
 static long long fileMtimeMs(const fs::path& p) {
     std::error_code ec;
@@ -129,6 +174,16 @@ void Autosave::recoverPriorSession() {
     int recovered = 0;
     for (const auto& e : fs::directory_iterator(dir, ec)) {
         if (e.path().extension() != ".step+") continue;
+        // Empty/default docs (fresh AI parts with no features) are not worth
+        // recovering — drop them instead of flooding the Recover? prompt.
+        if (stepPlusFileIsEmpty(e.path().string())) {
+            log().line("crash recovery: discarding empty doc %s",
+                       e.path().filename().string().c_str());
+            fs::remove(e.path(), ec);
+            fs::remove(dir + "/" + e.path().stem().string() + ".json", ec);
+            ec.clear();
+            continue;
+        }
         const std::string oldId = e.path().stem().string();
         std::string name = oldId;
         {
@@ -172,6 +227,8 @@ void Autosave::recoverPriorSession() {
                    "recovery tier (awaiting recovery_open)",
                    recovered, latest.c_str());
     }
+    // Also scrub any pre-existing empty orphans left by older builds.
+    (void)recoveryList();
 }
 
 void Autosave::saveDirtyDocs() {
@@ -183,6 +240,9 @@ void Autosave::saveDirtyDocs() {
     std::error_code ec;
     for (const auto& d : docs["docs"]) {
         if (!d.is_object() || !d.value("dirty", false)) continue;
+        // Never autosave a blank/default doc — that is what filled the recovery
+        // tier with dozens of empty "AI part" tabs.
+        if (d.value("empty", false)) continue;
         const std::string id = d.value("doc_id", std::string());
         if (id.empty()) continue;
         const long rev = d.contains("revision") && d["revision"].is_number()
@@ -243,6 +303,28 @@ void Autosave::noteRecoveredRemap(const std::string& oldId, const std::string& n
 
 bool Autosave::retireDoc(const std::string& docId, const std::string& name) {
     if (docId.empty()) return false;
+    // Peek live doc_list for the empty flag before writing an orphan artifact.
+    {
+        json docs;
+        std::string err;
+        if (core::cpp_core().call("doc_list", json::object(), docs, err) &&
+            docs.is_object() && docs.contains("docs")) {
+            for (const auto& d : docs["docs"]) {
+                if (!d.is_object() || d.value("doc_id", std::string()) != docId) continue;
+                if (d.value("empty", false)) {
+                    log().line("doc-gc: not retiring empty doc %s ('%s')", docId.c_str(),
+                               name.c_str());
+                    // Still purge any prior session autosave for this id.
+                    std::error_code ec2;
+                    fs::remove(sessionDir_ + "/" + docId + ".step+", ec2);
+                    fs::remove(sessionDir_ + "/" + docId + ".json", ec2);
+                    { std::lock_guard<std::mutex> lk(revMtx_); lastSavedRev_.erase(docId); }
+                    return true;  // "success" so gcCloseDoc proceeds to close
+                }
+                break;
+            }
+        }
+    }
     std::error_code ec;
     fs::create_directories(orphanDir_, ec);
     const long long nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -295,6 +377,14 @@ json Autosave::recoveryList() {
     std::sort(files.begin(), files.end(), std::greater<>());  // newest stamp first
     for (const auto& p : files) {
         const std::string stem = p.stem().string();
+        // Auto-purge empty/default orphans so the Recover? prompt never offers them.
+        if (stepPlusFileIsEmpty(p.string())) {
+            std::lock_guard<std::mutex> lk(orphanMtx_);
+            fs::remove(p, ec);
+            fs::remove(orphanDir_ + "/" + stem + ".json", ec);
+            log().line("recovery: discarded empty orphan %s", stem.c_str());
+            continue;
+        }
         json meta = json::object();
         {
             std::lock_guard<std::mutex> lk(orphanMtx_);

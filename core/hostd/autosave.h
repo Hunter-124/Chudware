@@ -36,6 +36,12 @@
 //  {old_id: new_id} (noteRecoveredRemap) so hello can rebind a reconnecting
 //  client. This keeps closed / cleanly-quit parts from flooding back while still
 //  catching genuine crashes.
+//
+//  EMPTY DOCS ARE NEVER RECOVERED (2026-07-16): a part/assembly with no features
+//  (and for assemblies, no components/mates) is discarded at every boundary —
+//  autosave skip, retireDoc no-op, crash-tier register skip, recovery_list purge.
+//  Fresh AI-minted blank parts used to fill the Recover? prompt with dozens of
+//  empty "AI part" tabs; those are garbage, not user work.
 #pragma once
 
 #include <atomic>

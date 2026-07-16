@@ -4565,13 +4565,34 @@ json doc_list() {
         std::lock_guard<std::mutex> doc(sp->mtx);
         const std::string schema =
             sp->doc.is_object() ? sp->doc.value("schema", std::string()) : std::string();
+        const bool isAsm = schema == "aicad.asm/1";
+        int feature_count = 0;
+        int component_count = 0;
+        if (sp->doc.is_object()) {
+            if (sp->doc.contains("features") && sp->doc["features"].is_array())
+                feature_count = (int)sp->doc["features"].size();
+            if (sp->doc.contains("components") && sp->doc["components"].is_array())
+                component_count = (int)sp->doc["components"].size();
+        }
+        // Empty = no authored content worth recovering. Material/name alone don't count.
+        // Assemblies also need no components and no mates.
+        bool empty = feature_count == 0;
+        if (isAsm) {
+            int mate_count = 0;
+            if (sp->doc.is_object() && sp->doc.contains("mates") && sp->doc["mates"].is_array())
+                mate_count = (int)sp->doc["mates"].size();
+            empty = feature_count == 0 && component_count == 0 && mate_count == 0;
+        }
         docs.push_back({
             {"doc_id", sp->doc_id},
             {"name", sp->doc.is_object() ? sp->doc.value("name", sp->doc_id) : sp->doc_id},
-            {"kind", schema == "aicad.asm/1" ? "assembly" : "part"},
+            {"kind", isAsm ? "assembly" : "part"},
             {"path", sp->path.empty() ? json(nullptr) : json(sp->path)},
             {"revision", sp->revision},
             {"dirty", sp->dirty},
+            {"feature_count", feature_count},
+            {"component_count", component_count},
+            {"empty", empty},
         });
     }
     return json{{"docs", docs}};

@@ -30,7 +30,7 @@ max_iters?, plan?}` · `get_prompts` · `shutdown`
 | `doc_open` | `{path}` → ops-response + `doc_id` + `warnings:[…]` |
 | `doc_save` | `{doc_id, path?}` → `{path}` (`.step+` writer; path omitted = current) |
 | `doc_close` | `{doc_id}` → `{closed: true}` (discards unsaved state) |
-| `doc_list` | `{}` → `{docs:[{doc_id, name, kind, path, revision, dirty}]}` |
+| `doc_list` | `{}` → `{docs:[{doc_id, name, kind, path, revision, dirty, feature_count, component_count, empty}]}` — `empty` is true when the doc has no authored content (part: zero features; assembly: zero features+components+mates). Appended 2026-07-16 (empty recovery auto-discard) |
 | `doc_apply_ops` | doc_ops §1 envelope → ops-response (incl. `owner_map`) |
 | `doc_undo` / `doc_redo` | `{doc_id}` → ops-response |
 | `doc_tree` | `{doc_id}` → `{revision, tree, owner_map}` (no rebuild; uses the last build) |

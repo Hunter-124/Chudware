@@ -2464,7 +2464,7 @@ static void applyOpenedDoc(AppState& st, const std::string& path) {
     std::string base = pathBaseName(path);
     // FAST PATH: the doc_open response itself carried the mesh (DocMirror::open now keeps
     // tess.aicm_path + volume + feature_status/owner_map instead of discarding them). Load it
-    // directly and skip the forced doc_rebuild below — that rebuild is a FULL recompile
+    // directly and skip the engine activation below — the forced-rebuild variant recompiled
     // whenever the open was served from the .step+'s embedded cache, i.e. every AI-handoff
     // refresh paid for the part twice. Fallback (empty aicm) keeps the historical path.
     if (!st.docMirror.lastOpenedAicm().empty()) {
@@ -2486,7 +2486,7 @@ static void applyOpenedDoc(AppState& st, const std::string& path) {
     // result drains can't load THIS doc's mesh / tree into whatever doc is foreground by then.
     const std::string openDocId = st.docMirror.docId();
     ++st.rebuildsInFlight;
-    st.rpc.call("doc_rebuild", {{"doc_id", openDocId}},
+    st.rpc.call("doc_activate", {{"doc_id", openDocId}},
         [&st, base, openDocId](const core::RpcResult& r) {
             --st.rebuildsInFlight;
             if (st.docMirror.docId() != openDocId) {

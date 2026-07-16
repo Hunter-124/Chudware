@@ -152,8 +152,10 @@ aicad_ipc::EngineClient* client() {
     return daemonMode() ? g_client : nullptr;
 }
 
-bool call(const std::string& method, const json& params, json& result, std::string& err,
-          int timeoutMs) {
+// Inner dispatch: daemon socket round-trip (with loading-wait and ro-upgrade retries) or
+// the in-process DLL call. Split out so the doc_activate compat shim below can re-enter.
+static bool callDispatch(const std::string& method, const json& params, json& result,
+                         std::string& err, int timeoutMs) {
     // timeoutMs only bounds the daemon round trip; the in-process DLL call is
     // synchronous and can't be interrupted (matches the pre-daemon behavior).
     if (!daemonMode()) return core::cpp_core().call(method, params, result, err);
@@ -175,6 +177,26 @@ bool call(const std::string& method, const json& params, json& result, std::stri
             if (g_client->call("attach_doc",
                                json{{"doc_id", params["doc_id"]}, {"mode", "rw"}}, ar, ae))
                 ok = g_client->call(method, params, result, err, timeoutMs);
+        }
+    }
+    return ok;
+}
+
+bool call(const std::string& method, const json& params, json& result, std::string& err,
+          int timeoutMs) {
+    bool ok = callDispatch(method, params, result, err, timeoutMs);
+    // Compat shim: doc_activate (cheap tab-switch activation, cached-serve) is served by
+    // this tree's engine, but a long-lived hostd daemon may predate it. On "unknown
+    // method" fall back ONCE to the historical forced doc_rebuild — identical response
+    // shape, just slower — so a new GUI against an old daemon degrades instead of breaking.
+    if (!ok && method == "doc_activate") {
+        const bool unknown =
+            err.find("unknown method") != std::string::npos ||
+            (result.is_object() && result.value("message", std::string())
+                                        .find("unknown method") != std::string::npos);
+        if (unknown) {
+            err.clear();
+            ok = callDispatch("doc_rebuild", params, result, err, timeoutMs);
         }
     }
     return ok;

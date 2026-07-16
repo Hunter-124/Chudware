@@ -92,31 +92,37 @@ void openMirrorTab(AppState& st, const std::string& docId) {
         if (t.aiHandoff) anyMirror = true;
     const bool takeFocus = !anyMirror;
 
-    // Display name from the doc tree (doc.opened doesn't carry one). Read-only
-    // + cheap; tolerate failure (title falls back until first activation).
-    std::string name;
-    {
-        json tr;
-        std::string te;
-        if (c->call("doc_tree", json{{"doc_id", docId}}, tr, te) && tr.is_object()) {
-            if (tr.contains("tree") && tr["tree"].is_object())
-                name = tr["tree"].value("name", std::string());
-            if (name.empty()) name = tr.value("name", std::string());
-        }
-    }
+    // Display name from the doc tree (doc.opened doesn't carry one). ASYNC via st.rpc:
+    // doc_tree takes the doc's engine lock, and with an agent mid-op on that doc a sync
+    // call here parked the whole GL thread (multiplied by every doc at bootstrap when a
+    // swarm has dozens open). The tab appears immediately with a fallback title; the
+    // callback (a later frame's drain) fills the real name in. Tolerate failure.
+    st.rpc.call("doc_tree", json{{"doc_id", docId}},
+                [&st, docId](const core::RpcResult& r) {
+                    if (!r.ok || !r.result.is_object()) return;
+                    std::string name;
+                    if (r.result.contains("tree") && r.result["tree"].is_object())
+                        name = r.result["tree"].value("name", std::string());
+                    if (name.empty()) name = r.result.value("name", std::string());
+                    if (name.empty()) return;
+                    const int i = tabIndexForDoc(st, docId);
+                    if (i < 0) return;
+                    AppState::DocTab& t = st.docTabs[i];
+                    if (t.title.empty() || t.title == "AI part") t.title = name;
+                    if (t.handoffName.empty()) t.handoffName = name;
+                }, 30000);
 
     AppState::DocTab t;
     t.kind = AppState::DocTab::TabKind::Part;
     t.docId = docId;
-    t.title = name.empty() ? std::string("AI part") : name;
+    t.title = "AI part";   // async doc_tree above fills the real name in
     t.aiHandoff = true;
     t.handoffDocId = docId;
-    t.handoffName = name;
     st.docTabs.push_back(std::move(t));
     const int idx = (int)st.docTabs.size() - 1;
-    st.addLog("[daemon] mirror tab opened for " + docId + (name.empty() ? "" : " ('" + name + "')"));
+    st.addLog("[daemon] mirror tab opened for " + docId);
     if (takeFocus) {
-        st.switchToTab(idx);  // activates: doc_rebuild (ro-allowed) -> tree + mesh
+        st.switchToTab(idx);  // activates: doc_activate (ro-allowed) -> tree + mesh
         st.toast(ui::ToastLevel::Info,
                  "Live view of the AI's part — it updates as it builds");
     } else {

@@ -151,8 +151,8 @@ bool prof_is_modeling_method(const std::string& m) {
     // INTERACTIVE read paths (open a doc, resolve a viewport pick, expand a face into its edges,
     // push-pull-probe a face) also do real kernel work — they were the slow paths reported when
     // clicking a surface / opening a big assembly — so sample them too by default.
-    static const std::array<const char*, 20> kModeling = {{
-        "doc_compile_cpp", "doc_apply_ops", "doc_dry_run_ops", "doc_rebuild",
+    static const std::array<const char*, 21> kModeling = {{
+        "doc_compile_cpp", "doc_apply_ops", "doc_dry_run_ops", "doc_rebuild", "doc_activate",
         "doc_solve_mates", "doc_tree", "doc_new", "doc_checkpoint", "doc_undo",
         "doc_redo", "doc_render_png", "doc_render_view", "doc_render_contact_sheet",
         "doc_export", "doc_import", "asm_world_bodies",
@@ -2603,6 +2603,8 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                 return emit(aicad::doc::doc_tree(params.value("doc_id", std::string())), out_json, 0);
             if (m == "doc_rebuild")
                 return emit(aicad::doc::doc_rebuild(params.value("doc_id", std::string())), out_json, 0);
+            if (m == "doc_activate")
+                return emit(aicad::doc::doc_activate(params.value("doc_id", std::string())), out_json, 0);
             if (m == "doc_solve_mates")
                 return emit(aicad::doc::doc_solve_mates(
                                 params.value("doc_id", std::string()),

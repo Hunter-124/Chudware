@@ -80,6 +80,13 @@ nlohmann::json doc_undo(const std::string& doc_id);     // bumps revision +1
 nlohmann::json doc_redo(const std::string& doc_id);     // bumps revision +1
 nlohmann::json doc_tree(const std::string& doc_id);     // no rebuild, no rev bump
 nlohmann::json doc_rebuild(const std::string& doc_id);  // forced rebuild, no rev bump
+// Cheap tab-switch activation (viewport switch perf): serve the session's read-cache
+// compile (`compiled` at `compiled_rev == revision` — kept warm by every mutating op's
+// warm_and_respond) as a full ops-response with a freshly published tess.aicm_path,
+// WITHOUT recompiling or re-tessellating. Falls back to doc_rebuild's forced path when
+// the cache is cold/stale (fresh daemon restart, disabled read cache). Assembly docs
+// reuse the retained asm_result the same way. Never bumps the revision; never mutates.
+nlohmann::json doc_activate(const std::string& doc_id);
 bool doc_close(const std::string& doc_id);
 
 // Live source tree + equation env for an associative re-pull by a drawing / derived

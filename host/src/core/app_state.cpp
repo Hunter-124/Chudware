@@ -894,8 +894,15 @@ void meshLoaderMain() {
             std::unique_lock<std::mutex> lk(g_meshMtx);
             g_meshCv.wait(lk, [] { return g_meshQuit || !g_meshQueue.empty(); });
             if (g_meshQuit && g_meshQueue.empty()) return;
-            job = std::move(g_meshQueue.front());
-            g_meshQueue.pop_front();
+            // Priority: a VISIBLE load (the doc the user just switched to) never waits behind
+            // queued background prewarms — with an AI swarm pushing revisions to many mirror
+            // tabs, the cacheOnly parse backlog used to hold the active viewport empty for the
+            // whole backlog's parse time. Pick the first non-cacheOnly job, else the front.
+            auto it = std::find_if(g_meshQueue.begin(), g_meshQueue.end(),
+                                   [](const MeshLoadJob& j) { return !j.cacheOnly; });
+            if (it == g_meshQueue.end()) it = g_meshQueue.begin();
+            job = std::move(*it);
+            g_meshQueue.erase(it);
         }
         job.ok = render::loadAicmFile(job.path, job.doc, job.err);
         {
@@ -1011,6 +1018,13 @@ void AppState::drainMeshLoads() {
     }
     const uint64_t cur = meshGen_.load();
     // Inactive pushed revisions prewarm their parsed+GPU caches without touching the viewport.
+    // Cap the GPU uploads per frame: with an AI swarm pushing revisions to dozens of mirror
+    // tabs, committing every parsed prewarm in one drain stacked that many full-mesh uploads
+    // into a single frame and visibly hitched the viewport. Deferred jobs go back to the
+    // ready queue (front, order kept) and commit on the following frames.
+    constexpr int kMaxPrewarmCommitsPerFrame = 2;
+    int prewarmCommits = 0;
+    std::vector<MeshLoadJob> deferred;
     for (auto& j : ready) {
         if (!j.cacheOnly) continue;
         if (!j.ok) {
@@ -1027,6 +1041,11 @@ void AppState::drainMeshLoads() {
             }
         }
         if (!cachedTab) continue;  // tab closed or a newer pushed revision superseded this parse
+        if (prewarmCommits >= kMaxPrewarmCommitsPerFrame) {
+            deferred.push_back(std::move(j));
+            continue;
+        }
+        ++prewarmCommits;
         DocSession* session = cachedTab->session.get();
         const auto parts = rendererPartsFromDoc(*this, j.doc);
         renderer->cacheMeshes(j.docId, j.revision, parts);
@@ -1039,6 +1058,12 @@ void AppState::drainMeshLoads() {
         addLog(perf);
         std::fprintf(stderr, "%s\n", perf.c_str());
         std::fflush(stderr);
+    }
+    if (!deferred.empty()) {
+        std::lock_guard<std::mutex> lk(g_meshMtx);
+        g_meshReady.insert(g_meshReady.begin(),
+                           std::make_move_iterator(deferred.begin()),
+                           std::make_move_iterator(deferred.end()));
     }
     // Apply only the newest visible job that still matches meshGen_.
     MeshLoadJob* best = nullptr;

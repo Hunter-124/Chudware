@@ -1553,7 +1553,7 @@ static void aiVcRefreshMirror(AppState& st, const nlohmann::json& res) {
     st.docMirror.resync(st.worker);
     nlohmann::json p;
     p["doc_id"] = docId;
-    st.rpc.call("doc_rebuild", p, [&st](const core::RpcResult& r) {
+    st.rpc.call("doc_activate", p, [&st](const core::RpcResult& r) {
         if (!r.ok || !r.result.is_object()) return;
         std::string aicm = r.result.value("aicm_path", std::string());
         if (aicm.empty() && r.result.contains("tess") && r.result["tess"].is_object())

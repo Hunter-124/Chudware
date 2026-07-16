@@ -361,7 +361,10 @@ void AppState::switchToTabCore(int idx) {
         return;
     }
     if (!ok) {
-        // Async rebuild path: finish the tab UI shell now, apply tree/mesh when rebuild drains.
+        // Async activation path: finish the tab UI shell now, apply tree/mesh when the call
+        // drains. doc_activate serves the daemon's warm read-cache compile (no recompile /
+        // re-tess when the doc is unchanged — the shared-daemon AI-audit case); it falls back
+        // to the full forced rebuild inside the engine only when that cache is cold.
         const std::string rebuildDocId = dst.docId;
         const int rebuildTabIdx = idx;
         if (loadingToastInFlight.insert(rebuildDocId).second)   // dedup: one toast per rebuild
@@ -385,81 +388,7 @@ void AppState::switchToTabCore(int idx) {
             rebuildQueuedAt - switchStarted).count();
         logTabPerf(*this, "[perf] tab_switch doc=" + rebuildDocId +
                    " path=async-rebuild shell=" + std::to_string(shellMs) + "ms");
-        rpc.call("doc_rebuild", nlohmann::json{{"doc_id", rebuildDocId}},
-                 [this, rebuildDocId, rebuildTabIdx, rebuildQueuedAt](const core::RpcResult& r) {
-                     --rebuildsInFlight;
-                     const double rebuildMs = std::chrono::duration<double, std::milli>(
-                         std::chrono::steady_clock::now() - rebuildQueuedAt).count();
-                     logTabPerf(*this, "[perf] tab_switch_rebuild doc=" + rebuildDocId +
-                                      " total=" + std::to_string(rebuildMs) + "ms");
-                     loadingToastInFlight.erase(rebuildDocId);
-                     if (rebuildTabIdx < 0 || rebuildTabIdx >= (int)docTabs.size() ||
-                         docTabs[rebuildTabIdx].docId != rebuildDocId) {
-                         addLog("[tabs] async rebuild for " + rebuildDocId +
-                                " ignored — tab closed/changed");
-                         return;
-                     }
-                     if (activeTab != rebuildTabIdx) {
-                         // User switched away — still update that tab's session cache when possible.
-                         addLog("[tabs] async rebuild for " + rebuildDocId +
-                                " completed off-screen");
-                     }
-                     std::string aicm, e2;
-                     if (!r.ok) {
-                         toast(ui::ToastLevel::Error, "Couldn't switch document: " + r.err);
-                         return;
-                     }
-                     // Only adopt into the live mirror if this tab is still active.
-                     if (activeTab == rebuildTabIdx) {
-                         suppressTabDirty = true;
-                         if (!docMirror.adoptActivateResponse(rebuildDocId, r.result, aicm, e2)) {
-                             suppressTabDirty = false;
-                             toast(ui::ToastLevel::Error, "Couldn't switch document: " + e2);
-                             return;
-                         }
-                         suppressTabDirty = false;
-                         DocTab& d = docTabs[rebuildTabIdx];
-                         d.isAssembly = docMirror.tree().is_object() &&
-                                        (jtab(docMirror.tree(), "schema") == "aicad.asm/1");
-                         d.title = docTitle(docMirror.tree(), d.isAssembly);
-                         if (!aicm.empty()) {
-                             std::string lerr;
-                             if (!loadDocMesh(aicm, lerr) && !lerr.empty())
-                                 addLog("[tabs] loadDocMesh on switch: " + lerr);
-                         } else {
-                             unloadDocMesh();
-                             renderer->setActiveMeshIdentity(rebuildDocId, docMirror.revision());
-                             d.session->cachedMirror = docMirror.snapshot();
-                             d.session->cachedDocMesh = std::make_shared<render::DocMesh>();
-                         }
-                         d.session->cachedAicmPath = aicm;
-                         d.session->cachedRevision = docMirror.revision();
-                         d.meshCacheInvalidated = false;
-                         selection.mutableItems() = std::move(d.session->selItems);
-                         d.session->selItems.clear();
-                         hover = d.session->hover;
-                         pickStatus = std::move(d.session->pickStatus);
-                         if (d.camValid) {
-                             yaw = d.yaw; pitch = d.pitch; zoom = d.zoom;
-                             pan[0] = d.pan[0]; pan[1] = d.pan[1]; pan[2] = d.pan[2];
-                         }
-                         if (d.isAssembly) { showRibbon = true; ribbonTab = RT_Assembly; }
-                         else if (ribbonTab == RT_Assembly || ribbonTab == RT_PCB)
-                             ribbonTab = RT_Features;
-                     } else {
-                         // Park mesh path on the session so the next switch can use the fast path.
-                         std::string aicmPark;
-                         if (r.result.contains("tess") && r.result["tess"].is_object())
-                             aicmPark = r.result["tess"].value("aicm_path", std::string());
-                         if (!aicmPark.empty() && docTabs[rebuildTabIdx].session) {
-                             docTabs[rebuildTabIdx].session->cachedAicmPath = aicmPark;
-                             if (r.result.contains("revision") &&
-                                 r.result["revision"].is_number_integer())
-                                 docTabs[rebuildTabIdx].session->cachedRevision =
-                                     r.result["revision"].get<int>();
-                         }
-                     }
-                 }, 120000);
+        activateTabDocAsync(rebuildDocId, rebuildTabIdx, rebuildQueuedAt);
         return;
     }
 
@@ -541,6 +470,87 @@ void AppState::switchToTabCore(int idx) {
         std::chrono::steady_clock::now() - switchStarted).count();
     logTabPerf(*this, "[perf] tab_switch doc=" + dst.docId + " path=gpu-cache mesh=" +
                        std::to_string(meshBindMs) + "ms total=" + std::to_string(totalMs) + "ms");
+}
+
+void AppState::activateTabDocAsync(const std::string& docId, int tabIdx,
+                                   std::chrono::steady_clock::time_point queuedAt) {
+    // doc_activate serves the engine's warm read-cache compile (no recompile / re-tess when
+    // the doc is unchanged); a stale hostd that predates the method is handled below this
+    // layer — engine::call falls back to the forced doc_rebuild on "unknown method".
+    rpc.call("doc_activate", nlohmann::json{{"doc_id", docId}},
+             [this, docId, tabIdx, queuedAt](const core::RpcResult& r) {
+                 --rebuildsInFlight;
+                 const double rebuildMs = std::chrono::duration<double, std::milli>(
+                     std::chrono::steady_clock::now() - queuedAt).count();
+                 logTabPerf(*this, "[perf] tab_switch_rebuild doc=" + docId +
+                                  " total=" + std::to_string(rebuildMs) + "ms");
+                 loadingToastInFlight.erase(docId);
+                 if (tabIdx < 0 || tabIdx >= (int)docTabs.size() ||
+                     docTabs[tabIdx].docId != docId) {
+                     addLog("[tabs] async activation for " + docId +
+                            " ignored — tab closed/changed");
+                     return;
+                 }
+                 if (activeTab != tabIdx) {
+                     // User switched away — still update that tab's session cache when possible.
+                     addLog("[tabs] async activation for " + docId + " completed off-screen");
+                 }
+                 std::string aicm, e2;
+                 if (!r.ok) {
+                     toast(ui::ToastLevel::Error, "Couldn't switch document: " + r.err);
+                     return;
+                 }
+                 // Only adopt into the live mirror if this tab is still active.
+                 if (activeTab == tabIdx) {
+                     suppressTabDirty = true;
+                     if (!docMirror.adoptActivateResponse(docId, r.result, aicm, e2)) {
+                         suppressTabDirty = false;
+                         toast(ui::ToastLevel::Error, "Couldn't switch document: " + e2);
+                         return;
+                     }
+                     suppressTabDirty = false;
+                     DocTab& d = docTabs[tabIdx];
+                     d.isAssembly = docMirror.tree().is_object() &&
+                                    (jtab(docMirror.tree(), "schema") == "aicad.asm/1");
+                     d.title = docTitle(docMirror.tree(), d.isAssembly);
+                     if (!aicm.empty()) {
+                         std::string lerr;
+                         if (!loadDocMesh(aicm, lerr) && !lerr.empty())
+                             addLog("[tabs] loadDocMesh on switch: " + lerr);
+                     } else {
+                         unloadDocMesh();
+                         renderer->setActiveMeshIdentity(docId, docMirror.revision());
+                         d.session->cachedMirror = docMirror.snapshot();
+                         d.session->cachedDocMesh = std::make_shared<render::DocMesh>();
+                     }
+                     d.session->cachedAicmPath = aicm;
+                     d.session->cachedRevision = docMirror.revision();
+                     d.meshCacheInvalidated = false;
+                     selection.mutableItems() = std::move(d.session->selItems);
+                     d.session->selItems.clear();
+                     hover = d.session->hover;
+                     pickStatus = std::move(d.session->pickStatus);
+                     if (d.camValid) {
+                         yaw = d.yaw; pitch = d.pitch; zoom = d.zoom;
+                         pan[0] = d.pan[0]; pan[1] = d.pan[1]; pan[2] = d.pan[2];
+                     }
+                     if (d.isAssembly) { showRibbon = true; ribbonTab = RT_Assembly; }
+                     else if (ribbonTab == RT_Assembly || ribbonTab == RT_PCB)
+                         ribbonTab = RT_Features;
+                 } else {
+                     // Park mesh path on the session so the next switch can use the fast path.
+                     std::string aicmPark;
+                     if (r.result.contains("tess") && r.result["tess"].is_object())
+                         aicmPark = r.result["tess"].value("aicm_path", std::string());
+                     if (!aicmPark.empty() && docTabs[tabIdx].session) {
+                         docTabs[tabIdx].session->cachedAicmPath = aicmPark;
+                         if (r.result.contains("revision") &&
+                             r.result["revision"].is_number_integer())
+                             docTabs[tabIdx].session->cachedRevision =
+                                 r.result["revision"].get<int>();
+                     }
+                 }
+             }, 120000);
 }
 
 void AppState::closeDocTab(int idx, bool detachOnly) {

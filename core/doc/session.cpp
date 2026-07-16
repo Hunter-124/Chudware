@@ -4236,6 +4236,33 @@ json doc_live_source(const std::string& doc_id) {
     Session& s = lk.acquire(doc_id);
     return json{{"tree", s.doc}, {"env", env_from_doc(s.doc)}, {"revision", s.revision}};
 }
+// Viewport tab-switch activation: identical response shape to doc_rebuild, but served from
+// the session's read-cache compile whenever it is valid (`compiled_rev == revision` — every
+// mutating op leaves it warm via warm_and_respond, and every mutation bumps the revision, so
+// a valid cache is never stale). ops_response republishes the retained AICM blob (shm write,
+// no tessellation), so switching the GUI onto a doc the daemon already built — the shared-
+// daemon AI-audit case — costs a JSON serialize instead of a full recompile + re-tess.
+// Cold/stale cache falls back to the exact doc_rebuild body below.
+json doc_activate(const std::string& doc_id) {
+    DocLock lk;
+    Session& s = require_session(doc_id);
+    if (s.is_assembly()) {
+        if (!s.asm_result) rebuild_assembly(s);
+        return ops_response_assembly(s, json::object());
+    }
+    if (s.compiled && s.compiled_rev == s.revision)
+        return ops_response(s, *s.compiled, json::object(), /*with_tess=*/true);
+    CompileCache* cache = inc_rebuild_enabled() ? s.compile_cache.get() : nullptr;
+    try {
+        refresh_sketch_external_refs(s.doc, cache);
+    } catch (...) { /* keep last-good projections */ }
+    try {
+        refresh_sketch3d_external_refs(s.doc, cache);
+    } catch (...) { /* keep last-good ground points */ }
+    CompileResult r = compile_session(s);
+    return warm_and_respond(s, std::move(r), json::object(), /*with_tess=*/true);
+}
+
 
 json doc_rebuild(const std::string& doc_id) {
     DocLock lk;

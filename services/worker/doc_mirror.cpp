@@ -492,11 +492,12 @@ bool DocMirror::activate(WorkerClient& w, const std::string& docId, std::string&
     aicmPath.clear();
     if (docId.empty()) { err = "empty doc id"; return false; }
     nlohmann::json res;
-    // A forced doc_rebuild does NOT bump the revision (session.rebuild) and returns the full
-    // ops-response: tree / revision / rebuild.feature_status / tess.aicm_path / owner_map. It is
-    // the one call that hands us a fresh mesh path for an arbitrary already-open doc, so the
-    // viewport can refresh on switch. (doc_tree alone has no tess block.)
-    if (!w.call("doc_rebuild", {{"doc_id", docId}}, res, err, 60000)) return false;
+    // doc_activate returns the full ops-response (tree / revision / rebuild.feature_status /
+    // tess.aicm_path / owner_map) WITHOUT recompiling when the engine's read-cache compile is
+    // warm — the one cheap call that hands us a fresh mesh path for an arbitrary already-open
+    // doc. (doc_tree has no tess block; a stale daemon falls back to doc_rebuild in
+    // engine::call.) Never bumps the revision.
+    if (!w.call("doc_activate", {{"doc_id", docId}}, res, err, 60000)) return false;
     if (res.contains("code")) { err = jstr(res, "message"); return false; }
     docId_ = docId;
     revision_ = jint(res, "revision");

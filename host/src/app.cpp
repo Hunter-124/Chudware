@@ -2214,9 +2214,11 @@ int run_gui(const char* screenshotPath, const char* openPath) {
                 st.agentV2Running = false;
                 if (!openedNewDoc && !madeDrawing && !madeCam && st.docMirror.hasDoc() &&
                     st.job.error.empty()) {
-                    // C39: doc_rebuild can take tens of seconds on a heavy doc — the old sync
-                    // call froze the window right after the agent finished. Queue it async;
+                    // C39: a forced rebuild can take tens of seconds on a heavy doc — the old
+                    // sync call froze the window right after the agent finished. Queue async;
                     // the callback (a later frame's drain, GL thread) resyncs and reloads.
+                    // doc_activate: the agent's final apply_ops left the engine's read-cache
+                    // compile warm, so this serves the tree + mesh path without recompiling.
                     st.livePhase = "Refreshing model...";
                     // Multi-document: capture the doc this rebuild targets. If the user switches to
                     // another tab before the async result drains, the callback must NOT resync /
@@ -2225,7 +2227,7 @@ int run_gui(const char* screenshotPath, const char* openPath) {
                     // + mesh when its tab is reactivated (switchToTab re-activates + reloads).
                     const std::string rebuildDocId = st.docMirror.docId();
                     ++st.rebuildsInFlight;
-                    st.rpc.call("doc_rebuild", {{"doc_id", rebuildDocId}},
+                    st.rpc.call("doc_activate", {{"doc_id", rebuildDocId}},
                         [&st, rebuildDocId](const core::RpcResult& r) {
                             --st.rebuildsInFlight;
                             st.livePhase.clear();
@@ -2240,7 +2242,7 @@ int run_gui(const char* screenshotPath, const char* openPath) {
                                 // fast call) pulls the new tree + revision + owner map and fires
                                 // the listener so the tree repaints with what the agent built.
                                 st.docMirror.resync(st.worker);
-                                // C40: doc_rebuild is an ops-response — the mesh path lives at
+                                // C40: doc_activate is an ops-response — the mesh path lives at
                                 // tess.aicm_path (the old top-level read was always empty, so
                                 // the viewport NEVER refreshed after a v2 agent run).
                                 std::string aicmPath;
@@ -2250,10 +2252,10 @@ int run_gui(const char* screenshotPath, const char* openPath) {
                                     aicmPath = r.result.value("aicm_path", "");
                                 if (!aicmPath.empty())
                                     st.loadDocMeshAsync(aicmPath);  // T-PERF3
-                                st.addLog("[v2] doc_rebuild + resync after run: rev=" +
+                                st.addLog("[v2] doc_activate + resync after run: rev=" +
                                           std::to_string(st.docMirror.revision()));
                             } else {
-                                st.addLog("[err] doc_rebuild after v2 run: " + r.err);
+                                st.addLog("[err] doc_activate after v2 run: " + r.err);
                                 st.toast(ui::ToastLevel::Error,
                                          "Agent run finished but the model couldn't refresh");
                             }

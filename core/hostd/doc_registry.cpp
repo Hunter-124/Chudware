@@ -28,7 +28,9 @@ bool DocRegistry::isReadOnlyMethod(const std::string& m) {
         // doc_rebuild recomputes + re-tessellates but never edits the model —
         // an ro GUI mirror tab activates via forced doc_rebuild (Phase 4:
         // DocMirror::activate), so viewers must be allowed to run it.
-        "doc_rebuild",
+        // doc_activate is its cached-serve fast path (tab-switch perf) — same
+        // read-only semantics, so viewers may run it too.
+        "doc_rebuild", "doc_activate",
         "doc_dep_query", "doc_drawing_views", "doc_sketch_overview",
         "doc_sketch_regions", "doc_compile_cpp",
         // doc_save serializes to disk but does not modify the model — allowing

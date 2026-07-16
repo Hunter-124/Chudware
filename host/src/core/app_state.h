@@ -8,6 +8,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -787,12 +788,18 @@ struct AppState {
     // current doc id from docMirror.
     void addDocTab(bool isAssembly);
     // Switch the active document to docTabs[idx]: safely exits any in-progress sketch/PM form,
-    // saves the leaving tab's camera, re-points DocMirror at idx's doc (doc_rebuild → tree+mesh),
+    // saves the leaving tab's camera, re-points DocMirror at idx's doc (doc_activate → tree+mesh),
     // resets per-doc caches/selection/tree transients, reloads the mesh, restores idx's camera.
     void switchToTab(int idx);
     // The switch body. switchToTab() wraps this to auto-close a leaving AI mirror tab whose agent
     // has finished and that the user never adopted (see switchToTab in doc_tabs.cpp).
     void switchToTabCore(int idx);
+    // Async engine activation for a tab switch (the cold-cache path of switchToTabCore): issues
+    // doc_activate on st.rpc and adopts the ops-response on drain (mirror + mesh + selection +
+    // camera). doc_activate serves the engine's warm read-cache compile without recompiling;
+    // a stale daemon predating it is translated to doc_rebuild inside engine::call.
+    void activateTabDocAsync(const std::string& docId, int tabIdx,
+                             std::chrono::steady_clock::time_point queuedAt);
     // Close docTabs[idx] (with the worker doc_close). If it was active, activates a neighbor; if it
     // was the last tab, returns to the empty start state. Does NOT prompt — the caller decides.
     // detachOnly (aiHandoff tabs, daemon mode): drop only THIS client's view (detach_doc) instead of

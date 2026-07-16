@@ -318,9 +318,10 @@ public:
 
     // Route a datum-AXIS feature reference into the active axis-accepting well (called by the
     // viewport axis picker). `fid` is the datum-axis feature id; `label` is the chip text (the
-    // datum's name). Stores a {"kind":"datum","feature":fid} selector — the engine's revolve /
-    // pattern axis slots resolve it via resolve_axis_ref. Re-picking the same axis toggles it off.
-    bool routeDatumAxis(const std::string& fid, const std::string& label);
+    // datum's name). Reserved axis.x/y/z + user features store {"kind":"datum","feature":fid};
+    // host-only auto plane-intersection axes store explicit {"kind":"axis",point,axis} geometry
+    // (document.cpp axis_from_explicit). Re-picking the same axis toggles it off.
+    bool routeDatumAxis(AppState& st, const std::string& fid, const std::string& label);
     // T-BL37: route origin/point-datum into a SelectorWell that has selKinds.point=true.
     bool routeDatumPoint(const std::string& fid, const std::string& label = "");
     bool activeWellWantsPoint() const;  // T-BL37

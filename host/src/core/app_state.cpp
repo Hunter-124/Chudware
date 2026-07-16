@@ -1150,6 +1150,9 @@ static bool commitDocMeshFromParsed(AppState& st, render::DocMesh& doc, std::str
         st.docMeshHasScalar = false;
         st.docMeshHasDisp = false;
         st.hasDocMesh = false;   // the empty-doc fallback (datum planes + camera) takes over
+        // Keep plane auto-hide in sync for sketch-only / rolled-back docs (no solid mesh).
+        if (st.docMirror.hasDoc())
+            st.applyDocDrivenVisibility(st.docMirror.tree());
         return true;
     }
 
@@ -1382,9 +1385,18 @@ void AppState::clearViewportForNewDoc() {
     hiddenFeatures.clear();
     autoHiddenPlanes.clear();
     datumPlanesUserToggled.clear();
+    // W2-ref: axes start clean on tab/new-doc; refilled by inject path next rebuild.
+    // Seed default axes as hidden (and into axisDatumIds so force-show works pre-inject).
+    axisDatumIds.clear();
     // T-BL37: origin point glyph is hidden by default (matches planes' hidden-by-default
     // behavior). The FM eye toggle removes this entry to show it.
     hiddenFeatures.insert("point.origin");
+    hiddenFeatures.insert("axis.x");
+    hiddenFeatures.insert("axis.y");
+    hiddenFeatures.insert("axis.z");
+    axisDatumIds.insert("axis.x");
+    axisDatumIds.insert("axis.y");
+    axisDatumIds.insert("axis.z");
     applyBodyVisibility();
     applyDatumVisibility();
     asmParts.clear();
@@ -1692,6 +1704,14 @@ void AppState::applyDocDrivenVisibility(const nlohmann::json& tree) {
     if (!tree.is_object()) return;
     const bool isAsm = tree.value("schema", std::string()) == "aicad.asm/1";
 
+    // Shared hasContent signal (mirrors viewport origin auto-hide): any feature (incl. sketch)
+    // or any assembly component means the doc is non-empty for reference-plane auto-hide.
+    bool hasContent = false;
+    auto fi = tree.find("features");
+    if (fi != tree.end() && fi->is_array() && !fi->empty()) hasContent = true;
+    auto ciAll = tree.find("components");
+    if (ciAll != tree.end() && ciAll->is_array() && !ciAll->empty()) hasContent = true;
+
     if (isAsm) {
         // Assembly: re-derive the per-component hide mask from document.json. The engine builds one
         // body per NON-suppressed component, 1-based ordinal == body_id (assembly.cpp).
@@ -1712,8 +1732,18 @@ void AppState::applyDocDrivenVisibility(const nlohmann::json& tree) {
         // Do not return: assembly-level features can consume datum planes too.
     }
 
-    auto fi = tree.find("features");
-    if (fi == tree.end() || !fi->is_array()) return;
+    // No features array: still apply default-plane hasContent rule (e.g. components-only asm).
+    if (fi == tree.end() || !fi->is_array()) {
+        if (!planesUserToggled) {
+            static const char* kDefaultPlanes[3] = {"plane.front", "plane.top", "plane.right"};
+            if (hasContent) {
+                for (const char* p : kDefaultPlanes) autoHiddenPlanes.insert(p);
+            } else {
+                for (const char* p : kDefaultPlanes) autoHiddenPlanes.erase(p);
+            }
+        }
+        return;
+    }
 
     // Build the ACTIVE graph only: suppressed and rolled-back features do not consume anything.
     std::unordered_map<std::string, const nlohmann::json*> activeFeatures;
@@ -1784,6 +1814,21 @@ void AppState::applyDocDrivenVisibility(const nlohmann::json& tree) {
             autoHiddenPlanes.insert(plane);
         }
     }
+
+    // W2-ref: default planes hide whenever the open doc has content (any feature/sketch or
+    // assembly component), independent of consumption. MUST run AFTER the consumption erase
+    // loop above — that loop drops every autoHiddenPlanes entry not in consumedPlanes, which
+    // would undo an earlier insert for unreferenced default planes (e.g. sketch-only docs).
+    // Empty docs: ensure the three are NOT in autoHiddenPlanes so they stay visible.
+    if (!planesUserToggled) {
+        static const char* kDefaultPlanes[3] = {"plane.front", "plane.top", "plane.right"};
+        if (hasContent) {
+            for (const char* p : kDefaultPlanes) autoHiddenPlanes.insert(p);
+        } else {
+            for (const char* p : kDefaultPlanes) autoHiddenPlanes.erase(p);
+        }
+    }
+
     if (datumVisibilityChanged) applyDatumVisibility();
 }
 

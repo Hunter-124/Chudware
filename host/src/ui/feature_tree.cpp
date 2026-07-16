@@ -2610,6 +2610,11 @@ static void applyOpenedDoc(AppState& st, const std::string& path) {
         // pristine (the user opened instead of modeling in it). Keeps the just-opened tab.
         st.dropBlankStarterTabs(st.activeTab);
     }
+    // W2-ref: one-shot Zoom-to-Fit after the next mesh commit for a real file open.
+    // Skipped for AI handoff quiet reopens (watching the AI build must not re-frame every step).
+    // Sibling RefVisibility consumes + clears the flag once geometry with a known radius exists.
+    if (!st.handoffQuietOpen)
+        st.fitViewOnNextMeshCommit = true;
     st.addLog("[doc] opened: " + path + "  rev=" + std::to_string(st.docMirror.revision()));
     if (!st.handoffQuietOpen)   // silent on a live MCP-handoff refresh (would toast every build step)
         st.toast(ui::ToastLevel::Info, "Opened " + pathBaseName(path));
@@ -3611,6 +3616,134 @@ void drawFeatureTreeBody(AppState& st,
                 }
             }
 
+            // W2-ref: default X/Y/Z axes + every other axis in st.axisDatumIds (auto plane-
+            // intersection + user-created) under References. Eyes write hiddenFeatures; body
+            // click selects / routes into an active axis well. Axes no longer appear in Features.
+            {
+                struct AxisRow { std::string id; std::string name; };
+                std::vector<AxisRow> axes;
+                axes.push_back({"axis.x", "X Axis"});
+                axes.push_back({"axis.y", "Y Axis"});
+                axes.push_back({"axis.z", "Z Axis"});
+                // Auto + user axes currently injected (skip the three defaults already listed).
+                for (const auto& aid : st.axisDatumIds) {
+                    if (aid == "axis.x" || aid == "axis.y" || aid == "axis.z") continue;
+                    std::string name = aid;
+                    if (aid.rfind("axis.auto:", 0) == 0) {
+                        // "axis.auto:<a>|<b>" → "Axis <a> ∩ <b>" with short reserved labels.
+                        auto shortPlane = [](std::string p) -> std::string {
+                            if (p == "plane.front") return "Front";
+                            if (p == "plane.top")   return "Top";
+                            if (p == "plane.right") return "Right";
+                            // Prefer the feature's display name when it's a user plane.
+                            return p;
+                        };
+                        const std::string pair = aid.substr(std::string("axis.auto:").size());
+                        const auto bar = pair.find('|');
+                        if (bar != std::string::npos) {
+                            std::string a = pair.substr(0, bar), b = pair.substr(bar + 1);
+                            // Resolve user-plane names from the live tree when possible.
+                            auto planeName = [&](const std::string& pid) -> std::string {
+                                if (pid == "plane.front" || pid == "plane.top" ||
+                                    pid == "plane.right")
+                                    return shortPlane(pid);
+                                if (tree.is_object() && tree.contains("features") &&
+                                    tree["features"].is_array()) {
+                                    for (const auto& f : tree["features"]) {
+                                        if (!f.is_object()) continue;
+                                        if (jfld(f, "id") == pid) {
+                                            std::string n = jfld(f, "name");
+                                            return n.empty() ? pid : n;
+                                        }
+                                    }
+                                }
+                                return pid;
+                            };
+                            name = "Axis " + planeName(a) + " \u2229 " + planeName(b);
+                        }
+                    } else {
+                        // User-created axis feature: prefer its feature name.
+                        if (tree.is_object() && tree.contains("features") &&
+                            tree["features"].is_array()) {
+                            for (const auto& f : tree["features"]) {
+                                if (!f.is_object()) continue;
+                                if (jfld(f, "id") == aid) {
+                                    std::string n = jfld(f, "name");
+                                    if (!n.empty()) name = n;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    axes.push_back({aid, name});
+                }
+                // Stable order: defaults first (already), then auto, then others by id.
+                std::stable_sort(axes.begin() + 3, axes.end(),
+                    [](const AxisRow& a, const AxisRow& b) { return a.id < b.id; });
+
+                for (const auto& ar : axes) {
+                    // Skip if this synthetic/default id is not currently injected (no doc yet).
+                    if (!st.axisDatumIds.count(ar.id) &&
+                        ar.id != "axis.x" && ar.id != "axis.y" && ar.id != "axis.z")
+                        continue;
+                    // Still list defaults even before first inject so an empty part shows them.
+                    const bool listed =
+                        st.axisDatumIds.empty()
+                            ? (ar.id == "axis.x" || ar.id == "axis.y" || ar.id == "axis.z")
+                            : (bool)st.axisDatumIds.count(ar.id);
+                    if (!listed) continue;
+
+                    ImGuiTreeNodeFlags af = ImGuiTreeNodeFlags_Leaf |
+                                            ImGuiTreeNodeFlags_NoTreePushOnOpen |
+                                            ImGuiTreeNodeFlags_SpanFullWidth |
+                                            ImGuiTreeNodeFlags_FramePadding;
+                    const bool axisSel = (st.selectedFeatureId == ar.id);
+                    const bool axisHidden = st.hiddenFeatures.count(ar.id) > 0;
+                    FmRowRect axisRect = fmRowPill(axisSel);
+                    if (axisHidden)
+                        ImGui::PushStyleColor(ImGuiCol_Text,
+                            ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.85f));
+                    ImVec2 axisRowPos = ImGui::GetCursorScreenPos();
+                    ImGui::TreeNodeEx((ar.name + "##refaxis_" + ar.id).c_str(), af);
+                    treeIconInArrowSlot(axisRowPos, "ref_axis", "[A]",
+                                        axisHidden ? 0.45f : 1.0f);
+                    if (axisHidden) ImGui::PopStyleColor();
+                    fmRowPillEnd(axisRect, axisSel);
+
+                    ImVec2 aNodeMin = ImGui::GetItemRectMin();
+                    ImVec2 aNodeMax = ImGui::GetItemRectMax();
+                    float  aEyeSz = 14.0f * ui::uiScale, aEyePad = 6.0f * ui::uiScale;
+                    ImVec2 aEyeMin(aNodeMax.x - aEyeSz - aEyePad,
+                                   aNodeMin.y + (aNodeMax.y - aNodeMin.y - aEyeSz) * 0.5f);
+                    ImVec2 aEyeMax(aEyeMin.x + aEyeSz, aEyeMin.y + aEyeSz);
+                    bool   aOverEye = ImGui::IsMouseHoveringRect(aEyeMin, aEyeMax);
+                    {
+                        ImDrawList* adl = ImGui::GetWindowDrawList();
+                        drawEyeGlyph(adl, aEyeMin, aEyeMax, !axisHidden, aOverEye, fmSurf());
+                        if (aOverEye) {
+                            ImGui::SetTooltip(axisHidden ? "Show %s" : "Hide %s", ar.name.c_str());
+                            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                                if (axisHidden) st.hiddenFeatures.erase(ar.id);
+                                else {
+                                    st.hiddenFeatures.insert(ar.id);
+                                    if (axisSel) st.selectedFeatureId.clear();
+                                }
+                                st.applyDatumVisibility();
+                            }
+                        }
+                    }
+                    if (!aOverEye && ImGui::IsItemClicked()) {
+                        st.selection.clear();
+                        st.selectedFeatureId = ar.id;
+                        if (st.propertyManager && st.propertyManager->active() &&
+                            st.propertyManager->activeWellWantsAxis())
+                            st.propertyManager->routeDatumAxis(st, ar.id, ar.name);
+                    }
+                    if (ImGui::IsItemHovered() && !aOverEye)
+                        ImGui::SetTooltip("%s", ar.name.c_str());
+                }
+            }
+
             ImGui::Unindent(kSecIndent);
         }   // end References section
 
@@ -3661,8 +3794,14 @@ void drawFeatureTreeBody(AppState& st,
                                              selectedFeatureId == "plane.right";
                         // T-BL37: "point.origin" is a synthetic ref like the planes — not a feature.
                         bool isOriginPoint = selectedFeatureId == "point.origin";
+                        // W2-ref: default/auto/user axes listed under References (axisDatumIds).
+                        bool isRefAxis = st.axisDatumIds.count(selectedFeatureId) > 0 ||
+                                         selectedFeatureId == "axis.x" ||
+                                         selectedFeatureId == "axis.y" ||
+                                         selectedFeatureId == "axis.z" ||
+                                         selectedFeatureId.rfind("axis.auto:", 0) == 0;
                         if (!selectedFeatureId.empty() && !live.count(selectedFeatureId) &&
-                            !isOriginPlane && !isOriginPoint) {
+                            !isOriginPlane && !isOriginPoint && !isRefAxis) {
                             selectedFeatureId.clear();
                             clearFeatureHighlight(st);
                         }
@@ -3799,6 +3938,8 @@ void drawFeatureTreeBody(AppState& st,
                         std::string fid    = jfld(f, "id");
                         std::string fname  = jfld(f, "name");
                         std::string ftype  = jfld(f, "type");
+                        // W2-ref: axes live under References only — skip in Features history.
+                        if (ftype == "axis" || ftype == "datum_axis") return true;
                         if (fname.empty()) fname = ftype + "·" + fid;  // C37-E: stable fid, not index
                         if (s_fmFilter[0] && !fm_icontains(fname.c_str(), s_fmFilter) &&
                             !fm_icontains(ftype.c_str(), s_fmFilter))

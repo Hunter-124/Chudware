@@ -9,6 +9,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <unordered_set>
 
 #include "imgui.h"
 #include "imgui_internal.h"   // GetWindowDockNode + DockNodeBeginAmendTabBar (tab-bar "+" New file)
@@ -1980,10 +1981,33 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             frameBBox(st, st.zoomToBBoxMin, st.zoomToBBoxMax);
         }
 
+        // W2-ref: one-shot Zoom-to-Fit after open/new once real mesh geometry exists.
+        // Skip empty docs (no mesh / radius 0); clear so rebuilds never re-fire.
+        if (st.fitViewOnNextMeshCommit && st.hasDocMesh && renderer.modelRadius() > 0.0f) {
+            st.fitViewOnNextMeshCommit = false;
+            applyViewPreset(st, ViewPreset::ZoomFit);
+        }
+
+        // Shared hasContent signal (same definition as AppState::applyDocDrivenVisibility):
+        // any feature (incl. sketch) OR any assembly component => non-empty doc for
+        // reference-plane/origin auto-hide. Planes use autoHiddenPlanes; origin uses this
+        // flag so the two never diverge.
+        bool hasContent = false;
+        if (st.docMirror.hasDoc()) {
+            const auto& tree = st.docMirror.tree();
+            if (tree.is_object()) {
+                auto tfi = tree.find("features");
+                if (tfi != tree.end() && tfi->is_array() && !tfi->empty()) hasContent = true;
+                auto tci = tree.find("components");
+                if (tci != tree.end() && tci->is_array() && !tci->empty()) hasContent = true;
+            }
+        }
+
         // Reference planes: hidden while sketching (the sketch grid owns the view), else user state.
         // Until the user takes control, each default plane stays visible until a downstream 3D
         // feature consumes it. AppState records those transitive dependency hits alongside consumed
         // user-created planes; this replaces the old all-or-nothing "any body hides all planes".
+        // W2-ref: also auto-hides all three whenever hasContent (any feature/sketch/component).
         bool effPlane[3] = {st.showPlane[0], st.showPlane[1], st.showPlane[2]};
         if (st.docMirror.hasDoc() && !st.planesUserToggled) {
             static const char* kPlaneFids[3] = {"plane.front", "plane.top", "plane.right"};
@@ -2013,19 +2037,38 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // hitTestOriginPlane) gate on what is actually DRAWN, not the raw showPlane toggle. Without
         // this, a force-shown plane renders but stays unclickable (issues #20/#21).
         for (int pv = 0; pv < 3; ++pv) st.planeVisEff[pv] = effPlane[pv];
-        // Origin gizmo auto-hide (issue #30): like the planes, show the origin while there's no
-        // solid body and auto-hide it once one exists — overlaid on hiddenFeatures each frame so it
-        // never clobbers the user's set. Skipped once the user explicitly toggles origin visibility.
-        if (!st.originUserToggled) {
+
+        // Origin gizmo + axis force-show: build one effective hidden-datums set per frame.
+        // Origin auto-hide (issue #30 / W2-ref): show only on empty docs; hide once hasContent.
+        // Skipped once the user explicitly toggles origin visibility via the FM eye.
+        // Axis force-show: while a PM axis well is active, unhide every axis in axisDatumIds
+        // (and any "axis.*" id) so revolve/circular-pattern axis picking can see them drawn.
+        bool pmWantsAxis = !inSketch && st.propertyManager && st.propertyManager->active() &&
+                           st.propertyManager->activeWellWantsAxis();
+        if (!st.originUserToggled || pmWantsAxis) {
             std::unordered_set<std::string> effDatums = st.hiddenFeatures;
-            if (st.hasDocMesh) effDatums.insert("point.origin");
-            else               effDatums.erase("point.origin");
-            renderer.setHiddenDatums(effDatums);
-            // Auto mode: drawn iff there's no body (auto-show empty, auto-hide once a solid exists).
-            st.originVisEff = !st.hasDocMesh;
+            if (!st.originUserToggled) {
+                if (hasContent) effDatums.insert("point.origin");
+                else            effDatums.erase("point.origin");
+                st.originVisEff = !hasContent;
+            } else {
+                st.originVisEff = !st.hiddenFeatures.count("point.origin");
+            }
+            if (pmWantsAxis) {
+                for (const auto& id : st.axisDatumIds) effDatums.erase(id);
+                for (auto it = effDatums.begin(); it != effDatums.end(); ) {
+                    if (it->size() >= 5 && it->compare(0, 5, "axis.") == 0)
+                        it = effDatums.erase(it);
+                    else
+                        ++it;
+                }
+            }
+            renderer.setHiddenDatums(std::move(effDatums));
         } else {
-            // User took control: the renderer draws from hiddenFeatures (pushed by applyDatumVisibility
-            // on the eye toggle), so effective visibility is just the hidden-set membership.
+            // User took control of origin and no axis well: resync renderer to hiddenFeatures so
+            // a just-closed axis well doesn't leave force-shown axes drawn (Escape/cancel has no
+            // rebuild to call applyDatumVisibility). Does not mutate hiddenFeatures.
+            renderer.setHiddenDatums(st.hiddenFeatures);
             st.originVisEff = !st.hiddenFeatures.count("point.origin");
         }
         if (inSketch) { bool none[3] = {false,false,false}; renderer.setPlanes(none, -1); }

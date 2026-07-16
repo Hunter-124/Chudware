@@ -1116,6 +1116,15 @@ struct AppState {
     // (reference for the first sketch), auto-hide once a body exists — until the user explicitly
     // toggles origin visibility via the FeatureManager eye, after which hiddenFeatures is honored.
     bool originUserToggled = false;
+    // W2-ref: ids of every reference-axis datum currently injected (default axis.x/y/z +
+    // GUI-derived plane-intersection axes). Seeded hidden on a fresh doc; consulted by the
+    // viewport to FORCE-SHOW every axis while a Revolve/axis PropertyManager well is active,
+    // and by the FeatureManager to list them under References. Recomputed each rebuild.
+    std::unordered_set<std::string> axisDatumIds;
+    // W2-ref: one-shot request to animate Zoom-to-Fit after the next real mesh commit for the
+    // active doc (set on file open / new doc; consumed + cleared once by the viewport when
+    // geometry with a known model radius exists, so rebuilds/tab switches never re-fit).
+    bool fitViewOnNextMeshCommit = false;
     int  planeEmphasis = -1;
     // C25 W3-J: viewport display/visibility state.
     int  displayStyle  = 1;          // mirrors DisplayStyle enum; 0=Shaded 1=ShadedEdges(default) 2=HLR 3=HLV 4=Wire

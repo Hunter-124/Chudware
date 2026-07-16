@@ -9,6 +9,7 @@
 #include <cstring>
 #include <functional>
 #include <set>
+#include <unordered_set>
 
 #include "../core/app_state.h"
 #include "../renderer.h"
@@ -4777,15 +4778,16 @@ bool SketchMode::drawPlanePicker(AppState& st, ImGuiIO& io, const ImVec2& imgMin
 // datum-axis picker for feature PM wells (revolve / circular-pattern axis)
 // ---------------------------------------------------------------------------
 
-// Hit-test the displayed datum-axis lines (docMirror::refDatums kind=="axis") in screen space.
+// Hit-test the displayed datum-axis lines in screen space. Sources:
+//   - user-created axes from docMirror::refDatums (kind=="axis")
+//   - W2-ref synthetic defaults (axis.x/y/z) + auto plane-intersection axes (same geometry
+//     the DocMirror listener injects into the renderer in app.cpp)
 // Returns true + the hovered axis's screen endpoints + feature id/name when the cursor is within the
 // pick radius. Shared by the PM axis picker (route into a well) and general datum selection. The
 // endpoints use L = radius*1.6 so the clickable segment coincides with the drawn dashed amber line.
 static bool hitTestDatumAxis(AppState& st, ImVec2 mouse, const ImVec2& imgMin, int vw, int vh,
                              ImVec2& outA, ImVec2& outB, std::string& outFid, std::string& outName) {
     if (!st.renderer || !st.docMirror.hasDoc()) return false;
-    const nlohmann::json& datums = st.docMirror.refDatums();
-    if (!datums.is_array() || datums.empty()) return false;
     const Renderer& r = *st.renderer;
     const auto& cam = r.camera();
     // Match the DRAWN axis length exactly: drawRefDatums uses e=(radius_>0?radius_:kEmptySceneRadius)
@@ -4801,24 +4803,113 @@ static bool hitTestDatumAxis(AppState& st, ImVec2 mouse, const ImVec2& imgMin, i
         float dx = a.x + t * vx - p.x, dy = a.y + t * vy - p.y;
         return std::sqrt(dx * dx + dy * dy);
     };
+
+    // While a PM axis well is active, hidden axes stay pickable (force-show for picking).
+    // Non-axis wells / general selection keep the hide-skip behavior.
+    auto* pm = st.propertyManager;
+    const bool forcePickHidden =
+        pm && pm->active() && pm->activeWellWantsAxis();
+
+    struct AxisCand { std::string id, name; Vec3 P, D; };
+    std::vector<AxisCand> cands;
+    std::unordered_set<std::string> seen;
+
+    auto addCand = [&](const std::string& id, const std::string& name,
+                       const Vec3& P, const Vec3& D) {
+        if (id.empty() || seen.count(id)) return;
+        if (!forcePickHidden && st.hiddenFeatures.count(id)) return;
+        Vec3 dir = D;
+        if (length(dir) < 1e-9f) return;
+        dir = normalize(dir);
+        cands.push_back({id, name.empty() ? id : name, P, dir});
+        seen.insert(id);
+    };
+
+    // 1) User-created / engine-shipped axes from the mirror.
+    const nlohmann::json& datums = st.docMirror.refDatums();
+    if (datums.is_array()) {
+        for (const auto& d : datums) {
+            if (!d.is_object() || d.value("kind", std::string()) != "axis") continue;
+            const auto& pj = d.contains("point") ? d["point"] : nlohmann::json();
+            const auto& dj = d.contains("dir") ? d["dir"] : nlohmann::json();
+            if (!pj.is_array() || pj.size() < 3 || !dj.is_array() || dj.size() < 3) continue;
+            Vec3 P((float)pj[0].get<double>(), (float)pj[1].get<double>(),
+                   (float)pj[2].get<double>());
+            Vec3 D((float)dj[0].get<double>(), (float)dj[1].get<double>(),
+                   (float)dj[2].get<double>());
+            addCand(d.value("id", std::string()), d.value("name", std::string()), P, D);
+        }
+    }
+
+    // 2) Reserved world axes (GUI-synthetic; may already be occupied by a user feature).
+    addCand("axis.x", "X Axis", Vec3(0, 0, 0), Vec3(1, 0, 0));
+    addCand("axis.y", "Y Axis", Vec3(0, 0, 0), Vec3(0, 1, 0));
+    addCand("axis.z", "Z Axis", Vec3(0, 0, 0), Vec3(0, 0, 1));
+
+    // 3) Auto plane-intersection axes — same normals/ids as app.cpp inject
+    //    (front=−Y, top=+Z, right=+X; id "axis.auto:<a>|<b>" with a,b sorted).
+    {
+        struct PlaneSrc { std::string id; std::string name; Vec3 origin; Vec3 normal; };
+        std::vector<PlaneSrc> planes;
+        planes.push_back({"plane.front", "Front", Vec3(0, 0, 0), Vec3(0, -1, 0)});
+        planes.push_back({"plane.top",   "Top",   Vec3(0, 0, 0), Vec3(0,  0, 1)});
+        planes.push_back({"plane.right", "Right", Vec3(0, 0, 0), Vec3(1,  0, 0)});
+        if (datums.is_array()) {
+            for (const auto& d : datums) {
+                if (!d.is_object() || d.value("kind", std::string()) != "plane") continue;
+                const std::string pid = d.value("id", std::string());
+                if (pid.empty() || pid == "plane.front" || pid == "plane.top" ||
+                    pid == "plane.right")
+                    continue;
+                const auto& oj = d.contains("origin") ? d["origin"] : nlohmann::json();
+                const auto& nj = d.contains("normal") ? d["normal"] : nlohmann::json();
+                if (!oj.is_array() || oj.size() < 3 || !nj.is_array() || nj.size() < 3) continue;
+                Vec3 o((float)oj[0].get<double>(), (float)oj[1].get<double>(),
+                       (float)oj[2].get<double>());
+                Vec3 n((float)nj[0].get<double>(), (float)nj[1].get<double>(),
+                       (float)nj[2].get<double>());
+                if (length(n) < 1e-9f) continue;
+                planes.push_back({pid, d.value("name", pid), o, normalize(n)});
+            }
+        }
+        const float kParEps = 1e-6f;
+        for (size_t i = 0; i < planes.size(); ++i) {
+            for (size_t j = i + 1; j < planes.size(); ++j) {
+                const PlaneSrc& a = planes[i];
+                const PlaneSrc& b = planes[j];
+                Vec3 dir = cross(a.normal, b.normal);
+                const float dirLen = length(dir);
+                if (dirLen < kParEps) continue;
+                dir = dir * (1.0f / dirLen);
+                const float d1 = dot(a.normal, a.origin);
+                const float d2 = dot(b.normal, b.origin);
+                const float det2 = dirLen * dirLen;
+                Vec3 pt = (cross(b.normal, dir * dirLen) * d1 +
+                           cross(dir * dirLen, a.normal) * d2) * (1.0f / det2);
+                std::string idA = a.id, idB = b.id;
+                if (idB < idA) std::swap(idA, idB);
+                const std::string aid = "axis.auto:" + idA + "|" + idB;
+                const std::string aname = "Axis " + a.name + " \u2229 " + b.name;
+                addCand(aid, aname, pt, dir);
+            }
+        }
+    }
+
     float best = 9.0f * ui::uiScale;   // pixel pick radius around the line
     bool found = false;
-    for (const auto& d : datums) {
-        if (!d.is_object() || d.value("kind", std::string()) != "axis") continue;
-        if (st.hiddenFeatures.count(d.value("id", std::string()))) continue;  // hidden datum: not pickable
-        const auto& pj = d.contains("point") ? d["point"] : nlohmann::json();
-        const auto& dj = d.contains("dir") ? d["dir"] : nlohmann::json();
-        if (!pj.is_array() || pj.size() < 3 || !dj.is_array() || dj.size() < 3) continue;
-        Vec3 P((float)pj[0].get<double>(), (float)pj[1].get<double>(), (float)pj[2].get<double>());
-        Vec3 D((float)dj[0].get<double>(), (float)dj[1].get<double>(), (float)dj[2].get<double>());
+    for (const auto& c : cands) {
         ImVec2 sa, sb;
-        if (!worldToScreen(cam, imgMin, vw, vh, P.x - D.x * L, P.y - D.y * L, P.z - D.z * L, sa)) continue;
-        if (!worldToScreen(cam, imgMin, vw, vh, P.x + D.x * L, P.y + D.y * L, P.z + D.z * L, sb)) continue;
+        if (!worldToScreen(cam, imgMin, vw, vh,
+                           c.P.x - c.D.x * L, c.P.y - c.D.y * L, c.P.z - c.D.z * L, sa))
+            continue;
+        if (!worldToScreen(cam, imgMin, vw, vh,
+                           c.P.x + c.D.x * L, c.P.y + c.D.y * L, c.P.z + c.D.z * L, sb))
+            continue;
         float dist = distToSeg(mouse, sa, sb);
         if (dist < best) {
             best = dist; found = true; outA = sa; outB = sb;
-            outFid = d.value("id", std::string());
-            outName = d.value("name", outFid);
+            outFid = c.id;
+            outName = c.name;
         }
     }
     return found;
@@ -4842,7 +4933,7 @@ bool SketchMode::drawAxisPicker(AppState& st, ImGuiIO& io, const ImVec2& imgMin,
     wdl->PopClipRect();
 
     st.requestCursor(ui::CursorKind::Hand);
-    if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) pm->routeDatumAxis(fid, name);
+    if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) pm->routeDatumAxis(st, fid, name);
     return true;
 }
 

@@ -390,7 +390,9 @@ private:
     void drawCurrent(float yawDeg, float pitchDeg, float zoom);
     void drawGroundShadow(const Mat4& mvp, const Vec3& eye, const Vec3& up);  // soft contact blob
     void drawReferencePlanes(const Mat4& mvp);   // translucent datum planes (after the opaque pass)
-    void drawRefDatums(const Mat4& mvp);         // feature datum axes/planes/points (reference geom)
+    // Feature datum overlays. axesOnly=true draws only Kind::Axis (call BEFORE planes so plane
+    // fill composites over axes); axesOnly=false draws every non-axis datum (planes/points/csys/curves).
+    void drawRefDatums(const Mat4& mvp, bool axesOnly);
     void drawSectionCap(const Mat4& mvp, int planeIdx);  // C28-C: cap for one plane, clipped by others
     void planeCorners(int plane, float e, Vec3 out[4]) const;  // 4 world corners of plane quad
     void freeSubs();

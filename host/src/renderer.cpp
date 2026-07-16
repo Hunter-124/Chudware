@@ -1222,10 +1222,14 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
         glBindVertexArray(0);
     }
 
-    // ---- translucent reference planes (after the opaque pass so they test against geometry) ----
+    // ---- reference overlays (translucent; depthMask off so they never occlude solids) ----
+    // Axes first, then default planes, then other datums. Planes write no depth, so draw order
+    // alone decides compositing: plane fill must land ON TOP of axes or axes paint solidly
+    // through the translucent quads. Non-axis datums (feature planes / points / csys / curves)
+    // stay after so they remain readable over the origin planes.
+    drawRefDatums(mvp, /*axesOnly=*/true);
     drawReferencePlanes(mvp);
-    // Feature datum geometry (created axes / planes / points / csys) — same blended overlay pass.
-    drawRefDatums(mvp);
+    drawRefDatums(mvp, /*axesOnly=*/false);
 
     endGpuTimer(sceneTimer_, sceneMs_, sceneTimingValid_);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -1619,9 +1623,12 @@ void Renderer::drawReferencePlanes(const Mat4& mvp) {
 // from doc_mirror::refDatums). Reuses the flat uMVP+uColor plane shader. Datums depth-TEST against
 // the solid (depthMask off so they never occlude it) — same contract as the origin planes. Polygon
 // offset matches the shaded-pass offset so we don't always win GL_LESS against pushed solid depths
-// (origin triad bleed-through when force-shown over a body). Amber/green keeps them distinct from
-// the blue origin planes.
-void Renderer::drawRefDatums(const Mat4& mvp) {
+// (origin triad bleed-through when force-shown over a body).
+//
+// Two-pass draw from drawCurrent: axesOnly=true BEFORE the translucent origin planes (so plane fill
+// composites over the dashed axes — planes write no depth), axesOnly=false AFTER for feature
+// planes/points/csys/curves. Soft grey axes stay distinct from the light-blue origin planes.
+void Renderer::drawRefDatums(const Mat4& mvp, bool axesOnly) {
     if (refDatums_.empty() || planeProg_ == 0) return;
     const float e = (radius_ > 0.0f) ? radius_ : kEmptySceneRadius;
 
@@ -1645,26 +1652,34 @@ void Renderer::drawRefDatums(const Mat4& mvp) {
     };
     auto setCol = [&](float r, float g, float b, float a) { glUniform4f(colLoc, r, g, b, a); };
 
-    // Amber datum line (axis), green-ish datum plane, white point marker, RGB csys triad.
-    const float L = e * 1.6f;     // half-length of an axis line
+    // Soft grey datum line (axis), green-ish datum plane, white point marker, RGB csys triad.
+    const float L = e * 1.6f;     // half-length of an axis line (matches hit-test)
     const float ps = e * 0.55f;   // half-extent of a datum-plane quad (smaller than origin planes)
     const float ms = e * 0.04f;   // half-size of a point marker cross
     const float cs = e * 0.35f;   // csys axis length
 
     for (const auto& d : refDatums_) {
         if (!d.id.empty() && hiddenDatums_.count(d.id)) continue;  // FeatureManager eye hid this datum
+        const bool isAxis = (d.kind == RefDatum::Kind::Axis);
+        if (axesOnly != isAxis) continue;  // split pass: axes before planes, rest after
         const bool selected = !selectedDatumId_.empty() && d.id == selectedDatumId_;
         switch (d.kind) {
             case RefDatum::Kind::Axis: {
-                // Thick DASHED amber line (brighter + thicker when selected). The dashes are split on
-                // the CPU into cells and every other cell drawn, since core-profile GL has no line
-                // stipple. Endpoints match the axis picker's hit-test (L = radius*1.6).
-                Vec3 A = d.origin - d.dir * L, B = d.origin + d.dir * L;
+                // Soft grey DASHED line (slightly brighter + thicker when selected). The dashes are
+                // split on the CPU into cells and every other cell drawn, since core-profile GL has
+                // no line stipple. Endpoints match the axis picker's hit-test (L = radius*1.6).
+                // Normalize dir so a non-unit inject never collapses the segment; skip only true
+                // zero-length directions (all three axes inject as unit vectors).
+                Vec3 dir = d.dir;
+                const float dlen = std::sqrt(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
+                if (dlen < 1e-8f) break;
+                dir = dir * (1.0f / dlen);
+                Vec3 A = d.origin - dir * L, B = d.origin + dir * L;
                 Vec3 AB = B - A;
                 const int cells = 40;   // 20 visible dashes
-                glLineWidth(selected ? 4.5f : 3.0f);
-                if (selected) setCol(1.0f, 0.72f, 0.20f, 1.0f);
-                else          setCol(0.88f, 0.56f, 0.14f, 0.95f);
+                glLineWidth(selected ? 3.5f : 2.25f);
+                if (selected) setCol(0.72f, 0.74f, 0.78f, 0.70f);
+                else          setCol(0.58f, 0.60f, 0.64f, 0.42f);
                 for (int i = 0; i < cells; i += 2) {
                     float t0 = (float)i / cells, t1 = (float)(i + 1) / cells;
                     Vec3 p0 = A + AB * t0, p1 = A + AB * t1;

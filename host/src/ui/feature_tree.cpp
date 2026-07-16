@@ -3617,8 +3617,9 @@ void drawFeatureTreeBody(AppState& st,
             }
 
             // W2-ref: default X/Y/Z axes + every other axis in st.axisDatumIds (auto plane-
-            // intersection + user-created) under References. Eyes write hiddenFeatures; body
-            // click selects / routes into an active axis well. Axes no longer appear in Features.
+            // intersection + user-created) under a collapsible Axes folder inside Reference.
+            // Eyes write hiddenFeatures; body click selects / routes into an active axis well.
+            // Axes no longer appear in Features.
             {
                 struct AxisRow { std::string id; std::string name; };
                 std::vector<AxisRow> axes;
@@ -3681,66 +3682,79 @@ void drawFeatureTreeBody(AppState& st,
                 std::stable_sort(axes.begin() + 3, axes.end(),
                     [](const AxisRow& a, const AxisRow& b) { return a.id < b.id; });
 
-                for (const auto& ar : axes) {
-                    // Skip if this synthetic/default id is not currently injected (no doc yet).
-                    if (!st.axisDatumIds.count(ar.id) &&
-                        ar.id != "axis.x" && ar.id != "axis.y" && ar.id != "axis.z")
-                        continue;
-                    // Still list defaults even before first inject so an empty part shows them.
-                    const bool listed =
-                        st.axisDatumIds.empty()
-                            ? (ar.id == "axis.x" || ar.id == "axis.y" || ar.id == "axis.z")
-                            : (bool)st.axisDatumIds.count(ar.id);
-                    if (!listed) continue;
+                // Axes folder header — same body_folder + fmRowPill pattern as component
+                // Reference / Dress-up folders. DefaultOpen so X/Y/Z stay one click away.
+                FmRowRect axesFldRect = fmRowPill();
+                treeIcon("body_folder", "[F]", 16.0f);
+                ImGui::SameLine(0, 4 * ui::uiScale);
+                const bool axesOpen = ImGui::TreeNodeEx(
+                    "Axes##ref_axes_folder",
+                    ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_SpanFullWidth |
+                    ImGuiTreeNodeFlags_FramePadding);
+                fmRowPillEnd(axesFldRect);
+                if (axesOpen) {
+                    for (const auto& ar : axes) {
+                        // Skip if this synthetic/default id is not currently injected (no doc yet).
+                        if (!st.axisDatumIds.count(ar.id) &&
+                            ar.id != "axis.x" && ar.id != "axis.y" && ar.id != "axis.z")
+                            continue;
+                        // Still list defaults even before first inject so an empty part shows them.
+                        const bool listed =
+                            st.axisDatumIds.empty()
+                                ? (ar.id == "axis.x" || ar.id == "axis.y" || ar.id == "axis.z")
+                                : (bool)st.axisDatumIds.count(ar.id);
+                        if (!listed) continue;
 
-                    ImGuiTreeNodeFlags af = ImGuiTreeNodeFlags_Leaf |
-                                            ImGuiTreeNodeFlags_NoTreePushOnOpen |
-                                            ImGuiTreeNodeFlags_SpanFullWidth |
-                                            ImGuiTreeNodeFlags_FramePadding;
-                    const bool axisSel = (st.selectedFeatureId == ar.id);
-                    const bool axisHidden = st.hiddenFeatures.count(ar.id) > 0;
-                    FmRowRect axisRect = fmRowPill(axisSel);
-                    if (axisHidden)
-                        ImGui::PushStyleColor(ImGuiCol_Text,
-                            ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.85f));
-                    ImVec2 axisRowPos = ImGui::GetCursorScreenPos();
-                    ImGui::TreeNodeEx((ar.name + "##refaxis_" + ar.id).c_str(), af);
-                    treeIconInArrowSlot(axisRowPos, "ref_axis", "[A]",
-                                        axisHidden ? 0.45f : 1.0f);
-                    if (axisHidden) ImGui::PopStyleColor();
-                    fmRowPillEnd(axisRect, axisSel);
+                        ImGuiTreeNodeFlags af = ImGuiTreeNodeFlags_Leaf |
+                                                ImGuiTreeNodeFlags_NoTreePushOnOpen |
+                                                ImGuiTreeNodeFlags_SpanFullWidth |
+                                                ImGuiTreeNodeFlags_FramePadding;
+                        const bool axisSel = (st.selectedFeatureId == ar.id);
+                        const bool axisHidden = st.hiddenFeatures.count(ar.id) > 0;
+                        FmRowRect axisRect = fmRowPill(axisSel);
+                        if (axisHidden)
+                            ImGui::PushStyleColor(ImGuiCol_Text,
+                                ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.85f));
+                        ImVec2 axisRowPos = ImGui::GetCursorScreenPos();
+                        ImGui::TreeNodeEx((ar.name + "##refaxis_" + ar.id).c_str(), af);
+                        treeIconInArrowSlot(axisRowPos, "ref_axis", "[A]",
+                                            axisHidden ? 0.45f : 1.0f);
+                        if (axisHidden) ImGui::PopStyleColor();
+                        fmRowPillEnd(axisRect, axisSel);
 
-                    ImVec2 aNodeMin = ImGui::GetItemRectMin();
-                    ImVec2 aNodeMax = ImGui::GetItemRectMax();
-                    float  aEyeSz = 14.0f * ui::uiScale, aEyePad = 6.0f * ui::uiScale;
-                    ImVec2 aEyeMin(aNodeMax.x - aEyeSz - aEyePad,
-                                   aNodeMin.y + (aNodeMax.y - aNodeMin.y - aEyeSz) * 0.5f);
-                    ImVec2 aEyeMax(aEyeMin.x + aEyeSz, aEyeMin.y + aEyeSz);
-                    bool   aOverEye = ImGui::IsMouseHoveringRect(aEyeMin, aEyeMax);
-                    {
-                        ImDrawList* adl = ImGui::GetWindowDrawList();
-                        drawEyeGlyph(adl, aEyeMin, aEyeMax, !axisHidden, aOverEye, fmSurf());
-                        if (aOverEye) {
-                            ImGui::SetTooltip(axisHidden ? "Show %s" : "Hide %s", ar.name.c_str());
-                            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-                                if (axisHidden) st.hiddenFeatures.erase(ar.id);
-                                else {
-                                    st.hiddenFeatures.insert(ar.id);
-                                    if (axisSel) st.selectedFeatureId.clear();
+                        ImVec2 aNodeMin = ImGui::GetItemRectMin();
+                        ImVec2 aNodeMax = ImGui::GetItemRectMax();
+                        float  aEyeSz = 14.0f * ui::uiScale, aEyePad = 6.0f * ui::uiScale;
+                        ImVec2 aEyeMin(aNodeMax.x - aEyeSz - aEyePad,
+                                       aNodeMin.y + (aNodeMax.y - aNodeMin.y - aEyeSz) * 0.5f);
+                        ImVec2 aEyeMax(aEyeMin.x + aEyeSz, aEyeMin.y + aEyeSz);
+                        bool   aOverEye = ImGui::IsMouseHoveringRect(aEyeMin, aEyeMax);
+                        {
+                            ImDrawList* adl = ImGui::GetWindowDrawList();
+                            drawEyeGlyph(adl, aEyeMin, aEyeMax, !axisHidden, aOverEye, fmSurf());
+                            if (aOverEye) {
+                                ImGui::SetTooltip(axisHidden ? "Show %s" : "Hide %s", ar.name.c_str());
+                                if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                                    if (axisHidden) st.hiddenFeatures.erase(ar.id);
+                                    else {
+                                        st.hiddenFeatures.insert(ar.id);
+                                        if (axisSel) st.selectedFeatureId.clear();
+                                    }
+                                    st.applyDatumVisibility();
                                 }
-                                st.applyDatumVisibility();
                             }
                         }
+                        if (!aOverEye && ImGui::IsItemClicked()) {
+                            st.selection.clear();
+                            st.selectedFeatureId = ar.id;
+                            if (st.propertyManager && st.propertyManager->active() &&
+                                st.propertyManager->activeWellWantsAxis())
+                                st.propertyManager->routeDatumAxis(st, ar.id, ar.name);
+                        }
+                        if (ImGui::IsItemHovered() && !aOverEye)
+                            ImGui::SetTooltip("%s", ar.name.c_str());
                     }
-                    if (!aOverEye && ImGui::IsItemClicked()) {
-                        st.selection.clear();
-                        st.selectedFeatureId = ar.id;
-                        if (st.propertyManager && st.propertyManager->active() &&
-                            st.propertyManager->activeWellWantsAxis())
-                            st.propertyManager->routeDatumAxis(st, ar.id, ar.name);
-                    }
-                    if (ImGui::IsItemHovered() && !aOverEye)
-                        ImGui::SetTooltip("%s", ar.name.c_str());
+                    ImGui::TreePop();
                 }
             }
 

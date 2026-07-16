@@ -22,6 +22,31 @@ log = logging.getLogger("billet-web.auth")
 
 PUBLIC_PATHS = frozenset({"/healthz"})
 
+# Any email at these domains (or their subdomains) is auto-approved as a STANDARD user
+# (role="user", never admin) without needing an explicit users.yaml entry. University of
+# Alabama: ua.edu, crimson.ua.edu, and any *.ua.edu subdomain.
+AUTO_APPROVE_DOMAINS = ("ua.edu",)
+
+
+def _domain_auto_user(email: str, directory: "UserDirectory") -> "User | None":
+    """Synthesize a standard (non-admin) User for an allowed email domain, else None."""
+    email = email.strip().lower()
+    at = email.rfind("@")
+    if at < 0:
+        return None
+    domain = email[at + 1:]
+    ok = any(domain == d or domain.endswith("." + d) for d in AUTO_APPROVE_DOMAINS)
+    if not ok:
+        return None
+    return User(
+        email=email,
+        display=email[:at],
+        role="user",       # NEVER admin — domain users are standard only
+        heavy=False,
+        project="",         # inherits site-wide default_project
+        doc="",
+    )
+
 
 @dataclass(frozen=True)
 class User:
@@ -344,7 +369,7 @@ class AuthMiddleware:
                     email=None,
                 )
             email = email.strip().lower()
-            user = self.directory.get(email)
+            user = self.directory.get(email) or _domain_auto_user(email, self.directory)
             if user is None:
                 raise AuthError("not on the list", status=403, email=email)
             return user, (email if from_query else None)
@@ -381,7 +406,7 @@ class AuthMiddleware:
         if not email or "@" not in email:
             raise AuthError("token missing email claim", status=401)
 
-        user = self.directory.get(email)
+        user = self.directory.get(email) or _domain_auto_user(email, self.directory)
         if user is None:
             raise AuthError("not on the list", status=403, email=email)
         return user, None

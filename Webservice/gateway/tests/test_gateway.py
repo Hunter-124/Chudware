@@ -136,6 +136,24 @@ def test_not_on_list_html(client):
     assert "not on the list" in r.text.lower()
 
 
+def test_auth_allow_ua_domain_as_standard_user(client):
+    """Any @ua.edu / @crimson.ua.edu email is auto-approved as a STANDARD user."""
+    for email in ("student42@crimson.ua.edu", "Prof.Smith@UA.EDU"):
+        r = client.get("/api/sessions", headers=_auth(email))
+        assert r.status_code == 200, (email, r.status_code, r.text)
+
+
+def test_ua_domain_user_is_never_admin(client):
+    """Domain-auto users must resolve to role='user', never admin."""
+    from gateway.auth import _domain_auto_user, UserDirectory
+    d = UserDirectory(settings.users_file)
+    u = _domain_auto_user("someone@crimson.ua.edu", d)
+    assert u is not None and u.role == "user" and u.heavy is False
+    # A lookalike/spoof domain must NOT be approved.
+    assert _domain_auto_user("evil@ua.edu.attacker.com", d) is None
+    assert _domain_auto_user("rando@gmail.com", d) is None
+
+
 def test_dev_user_query_sets_cookie(client):
     """?dev_user= authenticates and Set-Cookies for subsequent subresources."""
     r = client.get("/api/sessions", params={"dev_user": "demo@example.com"})

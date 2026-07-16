@@ -76,7 +76,8 @@ class TestAppServe:
         assert rw.headers["content-type"].startswith("application/wasm")
         assert rw.headers["cross-origin-opener-policy"] == "same-origin"
         assert rw.headers["cross-origin-embedder-policy"] == "require-corp"
-        assert rw.headers.get("cache-control") == "max-age=3600"
+        # Unhashed bundle files must be no-cache so js/wasm never skew across deploys.
+        assert rw.headers.get("cache-control") == "no-cache"
 
         rd = client.get("/app/billet.data", headers=DEV_HEADERS)
         assert rd.status_code == 200

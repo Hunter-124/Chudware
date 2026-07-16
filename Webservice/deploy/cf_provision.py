@@ -61,6 +61,20 @@ def find(items: list[dict], key: str, value: str) -> dict | None:
     return next((i for i in items if i.get(key) == value), None)
 
 
+# Whole-domain auto-approval: anyone with an email at these domains is allowed through
+# CF Access (as a standard user; the gateway assigns role="user", never admin). Keep in
+# sync with AUTO_APPROVE_DOMAINS in Webservice/gateway/auth.py. CF email_domain is an
+# EXACT match (no subdomain wildcard), so each domain must be listed explicitly.
+ACCESS_DOMAINS = ["ua.edu", "crimson.ua.edu"]
+
+
+def _include_list(emails: list[str]) -> list[dict]:
+    """Access policy include = explicit allowlisted emails + whole-domain rules."""
+    inc: list[dict] = [{"email": {"email": e}} for e in emails]
+    inc += [{"email_domain": {"domain": d}} for d in ACCESS_DOMAINS]
+    return inc
+
+
 def upsert_env(updates: dict[str, str]) -> None:
     ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
     lines: dict[str, str] = {}
@@ -110,7 +124,7 @@ def sync_users(host: str) -> None:
     pols = api("GET", f"/accounts/{ACCOUNT_ID}/access/apps/{app['id']}/policies")
     pol_body = {
         "name": "billet-users", "decision": "allow", "precedence": 1,
-        "include": [{"email": {"email": e}} for e in emails],
+        "include": _include_list(emails),
     }
     pol = find(pols, "name", "billet-users")
     if pol:
@@ -184,7 +198,7 @@ def main() -> None:
     pols = api("GET", f"/accounts/{ACCOUNT_ID}/access/apps/{app['id']}/policies")
     pol_body = {
         "name": "billet-users", "decision": "allow", "precedence": 1,
-        "include": [{"email": {"email": e}} for e in emails],
+        "include": _include_list(emails),
     }
     pol = find(pols, "name", "billet-users")
     if pol:

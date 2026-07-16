@@ -238,7 +238,7 @@ FmRowRect fmRowPill(bool selected, const float* tint) {
     // else the neutral app accent so every row shares the same tinted-background language. Glow
     // border marks selection, dyed the same color.
     const float* eff = tint ? tint : ui::palette.accent;   // accent is float[4]; wash reads [0..2]
-    const float strength = tint ? (selected ? 0.34f : 0.20f) : (selected ? 0.22f : 0.11f);
+    const float strength = tint ? (selected ? 0.40f : 0.28f) : (selected ? 0.22f : 0.11f);
     // Same outer rect as the frosted base — coloredRowWash self-insets by the identical 2dp
     // (and keeps MultiColor inside the rounded outline — see ui_theme.cpp).
     ui::coloredRowWash(dl, rowMin, rowMax, 3.5f, eff, strength, selected);
@@ -1699,12 +1699,15 @@ static const char* featureFallback(const std::string& type) {
 //   hole                       → statusWarn (amber)
 //   fillet/chamfer/shell/...   → sketchExternal (violet dress-up)
 //   patterns / mirror          → camPlunge (cyan)
-//   datums (plane/axis/point)  → axisZ (blue); axes keep axisX/Y/Z at call site
+//   helix / curves             → camArc (violet-blue)
+//   split                      → camCut (blue)
+//   boolean                    → sketchExternal (violet)
+//   datums (plane/axis/point)  → axisZ (blue); axes/planes keep RGB at call site
 //   import / components        → textDim (neutral slate)
 //   sheet-metal (sm_*)         → statusWarn (amber)
 //   weldment (weld_*)          → simLoad (coral)
-//   surface (surf_*)           → axisY (green)
-//   boolean                    → sketchExternal (violet)
+//   surface (surf_*)           → axisY (green) / camLead family
+//   script                     → statusWarn (amber)
 //   sketch-in-error            → statusErr (caller passes isError)
 static const float* featureKindTint(const std::string& type, bool isCut,
                                     bool isError) {
@@ -1719,6 +1722,9 @@ static const float* featureKindTint(const std::string& type, bool isCut,
         type == "mirror" || type == "curve_pattern" || type == "fill_pattern" ||
         type == "table_pattern" || type == "sketch_pattern")
         return p.camPlunge;
+    if (type == "helix") return p.camArc;
+    if (type == "split") return p.camCut;
+    if (type == "boolean") return p.sketchExternal;
     if (type == "plane" || type == "datum_plane" || type == "ref_plane" ||
         type == "axis"  || type == "datum_axis"  || type == "ref_axis" ||
         type == "point" || type == "datum_point" || type == "ref_point" ||
@@ -1726,7 +1732,7 @@ static const float* featureKindTint(const std::string& type, bool isCut,
         return p.axisZ;
     if (type == "import" || type == "component" || type == "transform")
         return p.textDim;
-    if (type == "boolean") return p.sketchExternal;
+    if (type == "script") return p.statusWarn;
     if (type.size() >= 3 && type[0] == 's' && type[1] == 'm' && type[2] == '_')
         return p.statusWarn;
     if (type.size() >= 5 && type[0] == 'w' && type[1] == 'e' && type[2] == 'l' &&
@@ -3912,7 +3918,7 @@ void drawFeatureTreeBody(AppState& st,
                                             ImGuiTreeNodeFlags_NoTreePushOnOpen |
                                             ImGuiTreeNodeFlags_SpanFullWidth |
                                             ImGuiTreeNodeFlags_FramePadding;
-                    FmRowRect originRect = fmRowPill(originSelected);
+                    FmRowRect originRect = fmRowPill(originSelected, ui::palette.textDim);
                     if (!originShown)
                         ImGui::PushStyleColor(ImGuiCol_Text,
                             ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.85f));
@@ -3964,7 +3970,7 @@ void drawFeatureTreeBody(AppState& st,
                                                 ImGuiTreeNodeFlags_NoTreePushOnOpen |
                                                 ImGuiTreeNodeFlags_SpanFullWidth |
                                                 ImGuiTreeNodeFlags_FramePadding;
-                        FmRowRect urect = fmRowPill(pSel);
+                        FmRowRect urect = fmRowPill(pSel, ui::palette.textDim);
                         if (pHidden)
                             ImGui::PushStyleColor(ImGuiCol_Text,
                                 ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.85f));
@@ -4086,7 +4092,11 @@ void drawFeatureTreeBody(AppState& st,
                         // Pill FIRST (at the row's true left edge — drawing it after the icon left
                         // a misaligned slab starting right of the indent), then the node, then the
                         // icon into the leaf arrow slot. Hidden planes keep a readable dim state.
-                        FmRowRect planeRect = fmRowPill(st.planeEmphasis == pi);
+                        // Z-up normals: Front=Y green, Top=Z blue, Right=X red (match axis washes).
+                        const float* planeTint = (pi == 0) ? ui::palette.axisY
+                                              : (pi == 1) ? ui::palette.axisZ
+                                                          : ui::palette.axisX;
+                        FmRowRect planeRect = fmRowPill(st.planeEmphasis == pi, planeTint);
                         if (hidden)
                             ImGui::PushStyleColor(ImGuiCol_Text,
                                 ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.85f));
@@ -4154,7 +4164,7 @@ void drawFeatureTreeBody(AppState& st,
                                                 ImGuiTreeNodeFlags_NoTreePushOnOpen |
                                                 ImGuiTreeNodeFlags_SpanFullWidth |
                                                 ImGuiTreeNodeFlags_FramePadding;
-                        FmRowRect urect = fmRowPill(pSel);
+                        FmRowRect urect = fmRowPill(pSel, featureKindTint(up.type, false));
                         if (pHidden)
                             ImGui::PushStyleColor(ImGuiCol_Text,
                                 ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.85f));
@@ -4743,7 +4753,7 @@ void drawFeatureTreeBody(AppState& st,
                             float catTint[3]; categoryColorRGB(ftype, catIsCut, catTint, catIsErr);
                             // Same outer rect as the base — coloredRowWash self-insets.
                             ui::coloredRowWash(rowDl, rowMin, rowMax, 3.5f, catTint,
-                                               sel ? 0.34f : 0.20f, sel);
+                                               sel ? 0.40f : 0.28f, sel);
                         }
                         if (suppressed) {
                             // Inset + rounded to match the pill (square full-rect fill poked

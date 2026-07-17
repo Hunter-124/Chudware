@@ -8,3 +8,7 @@ Description=Re-install billet-webd after engine rebuild
 Type=oneshot
 ExecStartPre=/bin/sleep 10
 ExecStart=%h/Repositories/CAD/Webservice/deploy/install_webd.sh --restart
+# install_webd.sh --restart defers the daemon restart while web users are
+# connected (polls the gateway, up to BILLET_WEBD_RESTART_MAX_WAIT=600s). The
+# oneshot must be allowed to wait that out instead of being timeout-killed.
+TimeoutStartSec=900

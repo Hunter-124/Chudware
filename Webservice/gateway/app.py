@@ -45,12 +45,12 @@ except ImportError:
     from auth import UserDirectory
 
 try:
-    from .engine_bridge import router as engine_router
+    from .engine_bridge import router as engine_router, active_bridge_count
     from .workspace import router as workspace_router
     from .appserve import router as appserve_router
     from .perf_client import router as perf_router
 except ImportError:
-    from engine_bridge import router as engine_router
+    from engine_bridge import router as engine_router, active_bridge_count
     from workspace import router as workspace_router
     from appserve import router as appserve_router
     from perf_client import router as perf_router
@@ -665,6 +665,7 @@ async def healthz() -> dict[str, Any]:
         "vram": _nvidia_vram(),
         "presence": presence_n,
         "dev_mode": settings.dev_mode,
+        "engine_bridges": active_bridge_count(),
     }
 
 

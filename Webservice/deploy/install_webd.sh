@@ -125,10 +125,45 @@ echo "[webd] unit installed: billet-hostd.service"
 echo "[webd] unit installed: billet-webd-sync.path (+ .service)"
 
 if [ "$RESTART" = 1 ]; then
-    systemctl --user restart billet-hostd.service
-    sleep 1
-    AICAD_INSTANCE_KEY=$KEY "$BIN/aicad-hostd" --status || {
-        echo "[webd] ERROR: daemon failed to come up"; exit 1; }
+    # The billet-webd-sync.path unit fires this on EVERY dev/harness rebuild of
+    # aicad-hostd. A plain `systemctl restart` here tears down every connected web
+    # user's engine bridge at once — the dominant cause of the "web service is very
+    # unstable" reports (10+ restarts in a 2h dev window). Two guards make the shared
+    # daemon stop flapping under active development:
+    #   1. sha-skip: if the staged binary is byte-identical to what we last restarted
+    #      onto (burst builds re-trigger the path unit; a manual re-run), do nothing.
+    #   2. idle-wait: while the gateway reports live engine bridges, DEFER the restart
+    #      (poll /healthz) up to BILLET_WEBD_RESTART_MAX_WAIT so the swap lands in a
+    #      natural lull instead of mid-edit. The sync .service TimeoutStartSec covers
+    #      this wait. Override the URL/cap via env for dev gateways.
+    STAMP="$BIN/.webd_running_sha"
+    NEW_SHA="$(sha256sum "$BIN/aicad-hostd" | awk '{print $1}')"
+    RUNNING=0
+    systemctl --user is-active --quiet billet-hostd.service && RUNNING=1
+    if [ "$RUNNING" = 1 ] && [ "$(cat "$STAMP" 2>/dev/null)" = "$NEW_SHA" ]; then
+        echo "[webd] staged binary unchanged (sha ${NEW_SHA:0:12}) and daemon live — no restart"
+    else
+        GW="${BILLET_WEB_GATEWAY_URL:-http://127.0.0.1:8300}"
+        MAXW="${BILLET_WEBD_RESTART_MAX_WAIT:-600}"
+        if [ "$RUNNING" = 1 ]; then
+            waited=0
+            while [ "$waited" -lt "$MAXW" ]; do
+                n="$(curl -fs --max-time 3 "$GW/healthz" 2>/dev/null \
+                        | sed -n 's/.*"engine_bridges"[: ]*\([0-9]*\).*/\1/p')"
+                # Empty => gateway unreachable/old (no one can be connected) — restart now.
+                [ -z "$n" ] && break
+                [ "$n" = "0" ] && break
+                echo "[webd] $n web session(s) active — deferring restart (${waited}s/${MAXW}s)"
+                sleep 5; waited=$((waited + 5))
+            done
+        fi
+        systemctl --user restart billet-hostd.service
+        sleep 1
+        AICAD_INSTANCE_KEY=$KEY "$BIN/aicad-hostd" --status || {
+            echo "[webd] ERROR: daemon failed to come up"; exit 1; }
+        echo "$NEW_SHA" > "$STAMP"
+        echo "[webd] restarted billet-hostd (sha ${NEW_SHA:0:12})"
+    fi
 else
     echo "[webd] start it with: systemctl --user start billet-hostd.service"
 fi

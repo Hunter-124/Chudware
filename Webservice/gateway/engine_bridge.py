@@ -25,6 +25,16 @@ log = logging.getLogger("billet-web.engine")
 
 router = APIRouter()
 
+# Live engine-bridge count (one per connected web client). Read by /healthz so the
+# deploy path (install_webd.sh --restart) can hold off restarting the SHARED daemon
+# while users are mid-session — a restart tears every bridge down at once.
+_active_bridges = 0
+
+
+def active_bridge_count() -> int:
+    return _active_bridges
+
+
 # Engine responses can carry whole doc-JSON snapshots; the default 64 KiB
 # StreamReader limit would kill the bridge mid-session.
 _LINE_LIMIT = 256 * 1024 * 1024
@@ -59,6 +69,8 @@ async def engine_ws(ws: WebSocket) -> None:
         await ws.close(code=1013, reason="engine unavailable")
         return
     log.info("engine bridge open: %s -> %s", user.email, sock)
+    global _active_bridges
+    _active_bridges += 1
 
     async def ws_to_daemon() -> None:
         while True:
@@ -106,4 +118,5 @@ async def engine_ws(ws: WebSocket) -> None:
                 await ws.close(code=1012)  # daemon gone: client should reconnect
             except Exception:
                 pass  # peer vanished mid-close
-        log.info("engine bridge closed: %s", user.email)
+        _active_bridges -= 1
+        log.info("engine bridge closed: %s (%d active)", user.email, _active_bridges)

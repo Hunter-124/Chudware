@@ -188,6 +188,19 @@ class TestEngineBridge:
                 ws.receive_text()
         assert exc.value.code == 1013
 
+    def test_active_bridge_count_tracked(self, daemon, client):
+        from gateway import engine_bridge
+
+        assert engine_bridge.active_bridge_count() == 0
+        assert client.get("/healthz").json()["engine_bridges"] == 0
+        with client.websocket_connect("/engine", headers=DEV_HEADERS) as ws:
+            _rpc(ws, 1, "hello")
+            assert engine_bridge.active_bridge_count() == 1
+            assert client.get("/healthz").json()["engine_bridges"] == 1
+        # Closing the socket must decrement — the deploy idle-wait relies on this
+        # returning to 0, else it would defer restarts forever.
+        assert engine_bridge.active_bridge_count() == 0
+
 
 class TestWorkspaceApi:
     def test_list_and_download(self, workspace, client):

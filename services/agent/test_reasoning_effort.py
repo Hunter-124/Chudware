@@ -38,11 +38,11 @@ def test_deepseek_reasoner_high_only_chat_omit():
     assert w("openai", "deepseek-chat", "https://api.deepseek.com/v1", "high") == {}
 
 
-def test_qwen_dashscope_omits_reasoning_effort():
+def test_qwen_dashscope_enable_thinking():
     assert w(
         "openai", "qwen3-max",
         "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", "high",
-    ) == {}
+    ) == {"extra_body": {"enable_thinking": True}}
 
 
 def test_openrouter_uses_reasoning_object_and_beats_model_prefix():

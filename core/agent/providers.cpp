@@ -659,7 +659,7 @@ BuiltRequest openai_build_request(const std::string& model, const std::string& s
 //   xAI grok-4.5/4.3/-fast/3-mini reasoning_effort: low|medium|high (original grok-4: omit)
 //   Moonshot kimi-k3          reasoning_effort: "max" ONLY         (kimi-k2.x: omit -> thinking)
 //   DeepSeek reasoner/v4      reasoning_effort: high|max           -> "high" (deepseek-chat: omit)
-//   Alibaba Qwen (DashScope)  enable_thinking (extra_body) not reasoning_effort -> omit
+//   Alibaba Qwen (DashScope)  enable_thinking:true (top-level bool; no low/med/high level)
 //   OpenRouter                reasoning:{effort: low|medium|high}
 //   local / unknown           omit (never 400 on an unsupported param)
 json openai_reasoning_patch(const std::string& provider, const std::string& model,
@@ -699,8 +699,8 @@ json openai_reasoning_patch(const std::string& provider, const std::string& mode
             return json{{"reasoning_effort", "high"}};
         return json::object();  // deepseek-chat: non-thinking
     }
-    if (has(b, "aliyuncs") || has(b, "dashscope"))  // Qwen uses enable_thinking, not reasoning_effort
-        return json::object();
+    if (has(b, "aliyuncs") || has(b, "dashscope"))  // Qwen (DashScope): hybrid thinking is a
+        return json{{"enable_thinking", true}};      // top-level bool (no low/med/high level)
     if (has(b, "openai.com")) {  // OpenAI proper: only gpt-5+/o-series accept reasoning_effort
         if (m.rfind("gpt-5", 0) == 0 || m.rfind("o1", 0) == 0 || m.rfind("o3", 0) == 0 ||
             m.rfind("o4", 0) == 0)
@@ -722,7 +722,7 @@ json openai_reasoning_patch(const std::string& provider, const std::string& mode
         return json::object();
     }
     if (m.rfind("qwen", 0) == 0)
-        return json::object();
+        return json{{"enable_thinking", true}};
     if (p == "openai" && b.empty() &&
         (m.rfind("gpt-5", 0) == 0 || m.rfind("o1", 0) == 0 || m.rfind("o3", 0) == 0 ||
          m.rfind("o4", 0) == 0))

@@ -38,7 +38,7 @@ def wire_reasoning_effort(name: str, model: str, base_url: str | None,
       xAI grok-4.5/4.3/-fast/3-mini reasoning_effort: low|medium|high  (original grok-4: omit)
       Moonshot kimi-k3            reasoning_effort: "max" only         (kimi-k2.x: omit)
       DeepSeek reasoner/v4        reasoning_effort: high|max -> "high" (deepseek-chat: omit)
-      Alibaba Qwen (DashScope)    enable_thinking (extra_body) -> omit reasoning_effort
+      Alibaba Qwen (DashScope)    extra_body={"enable_thinking": True}  (bool; no level)
       OpenRouter                  extra_body={"reasoning":{"effort":...}}
       local / unknown             omit
     Returns kwargs to splat into create(): {} | {"reasoning_effort": v} | {"extra_body": {...}}.
@@ -71,8 +71,8 @@ def wire_reasoning_effort(name: str, model: str, base_url: str | None,
         if "reasoner" in m or "v4-pro" in m or "v4-flash" in m or "deepseek-v4" in m:
             return {"reasoning_effort": "high"}
         return {}
-    if "aliyuncs" in b or "dashscope" in b:
-        return {}
+    if "aliyuncs" in b or "dashscope" in b:  # Qwen (DashScope): hybrid thinking bool, no level
+        return {"extra_body": {"enable_thinking": True}}
     if "openai.com" in b:
         return {"reasoning_effort": lmh()} if m.startswith(("gpt-5", "o1", "o3", "o4")) else {}
     # No endpoint match: fall back to model-name heuristics (bare provider name / empty base).
@@ -85,7 +85,7 @@ def wire_reasoning_effort(name: str, model: str, base_url: str | None,
             return {"reasoning_effort": "high"}
         return {}
     if m.startswith("qwen"):
-        return {}
+        return {"extra_body": {"enable_thinking": True}}
     if p == "openai" and not b and m.startswith(("gpt-5", "o1", "o3", "o4")):
         return {"reasoning_effort": lmh()}
     return {}

@@ -861,9 +861,10 @@ TEST_CASE("openai_reasoning_patch: per-provider/model reasoning-effort gating") 
               .value("reasoning_effort", std::string()) == "high");
     CHECK(openai_reasoning_patch("openai", "deepseek-chat", "https://api.deepseek.com/v1", "high")
               .empty());
-    // Alibaba Qwen (DashScope) uses enable_thinking, not reasoning_effort -> omit.
+    // Alibaba Qwen (DashScope): hybrid thinking is a top-level enable_thinking bool.
     CHECK(openai_reasoning_patch("openai", "qwen3-max",
-              "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", "high").empty());
+              "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", "high")
+              .value("enable_thinking", false) == true);
     // OpenRouter -> unified reasoning object.
     {
         json p = openai_reasoning_patch("openai", "qwen/qwen3-max",

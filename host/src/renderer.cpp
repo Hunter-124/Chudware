@@ -2447,10 +2447,11 @@ void Renderer::issueLumaPboRead(unsigned int srcFbo, int srcW, int srcH) const {
     // washes out light-on-light. srcFbo is normally the quarter-res blur target, so this read
     // is tiny; issueLumaReadback already throttles the full-res fallback to every 8th frame.
     if (srcW <= 0 || srcH <= 0) return;
-    // A synchronous glReadPixels forces a GPU pipeline flush, so throttle to every 8th frame
-    // (the backdrop luma changes slowly and the tone hysteresis smooths it). Always read the
-    // FIRST time so glass text isn't washed for the first ~8 boot frames.
-    if (lumaEverRead_ && (++lumaWebCounter_ % 8) != 0) return;
+    // A synchronous glReadPixels forces a GPU pipeline flush (measurable jank on weak iGPUs),
+    // so throttle to every 32nd frame — the backdrop luma changes slowly (camera/panel motion)
+    // and the tone hysteresis smooths it, so ~1 read/sec is ample. Always read the FIRST time
+    // (lumaEverRead_ guard) so glass text isn't washed for the first frames after boot.
+    if (lumaEverRead_ && (++lumaWebCounter_ % 32) != 0) return;
     const size_t need = (size_t)srcW * (size_t)srcH * 4;
     if (lumaCpuBuf_.size() < need) lumaCpuBuf_.resize(need);
     glBindFramebuffer(GL_FRAMEBUFFER, srcFbo);

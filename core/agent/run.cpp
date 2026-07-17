@@ -11,6 +11,7 @@
 #include <set>
 #include <sstream>
 
+#include "agent/complexity.h"
 #include "agent/config.h"
 #include "agent/events.h"
 #include "agent/logging_provider.h"
@@ -377,6 +378,21 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
     // Resume after Plan approve: execute the approved plan (do not stop at plan_ready).
     if (has_approved_plan) plan_only = false;
 
+    // Deterministic complexity router: a Solo request (one simple/standard part)
+    // skips the LLM planner and runs as a single model loop; Standard/Complex keep
+    // the plan stage. Honour an explicit override in options["complexity"].
+    ComplexityVerdict cx = classify_complexity(request);
+    if (options.contains("complexity") && options["complexity"].is_string()) {
+        const std::string forced = options["complexity"].get<std::string>();
+        if (forced == "solo") cx = {Complexity::Solo, "forced by options"};
+        else if (forced == "standard") cx = {Complexity::Standard, "forced by options"};
+        else if (forced == "complex") cx = {Complexity::Complex, "forced by options"};
+    }
+    // A Solo build skips the planner unless the host explicitly wants a plan
+    // (plan_only / approved plan / swarm-forced structure).
+    const bool solo_skip_plan =
+        cx.level == Complexity::Solo && !plan_only && !has_approved_plan && !corporate_force;
+
     // Advisor seam: reserved. C++ has no foreman battery — leave empty (no fabricated
     // advisories). Host/Python may later push text via options.advisory_text.
     clear_context_advisory();
@@ -603,9 +619,15 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         edit_scope_directive = ss.str();
     }
 
-    json stages = json::array({"intake", "plan", "model", "review", "fix", "memory"});
+    json stages = solo_skip_plan
+                      ? json::array({"intake", "model", "review", "fix", "memory"})
+                      : json::array({"intake", "plan", "model", "review", "fix", "memory"});
     events.emit("run_started",
                 json{{"request", request}, {"doc_id", state.doc_id}, {"stages", stages}});
+    // Complexity routing decision (GUI shows which structure was chosen + why).
+    events.emit("complexity", json{{"level", cx.label()},
+                                   {"reason", cx.reason},
+                                   {"skip_plan", solo_skip_plan}});
 
     // ----------------------------------------------------------------- actions
     StageActions actions;
@@ -684,6 +706,13 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
             o.reason = "approved_plan (re-plan skipped)";
             o.parsed_ok = true;
             return o;
+        }
+        if (solo_skip_plan) {
+            StageOutcome o;
+            o.verdict = "pass";
+            o.reason = "solo (planner skipped: " + cx.reason + ")";
+            o.parsed_ok = true;
+            return o;  // st.plan stays null -> plan_steps() -> single default step
         }
         AgentCall ac = agent_call(provider, st, "planner", prompts_dir, call_budget, vision, ctx_cap);
         ojson p = extract_json_obj(ac.reply);

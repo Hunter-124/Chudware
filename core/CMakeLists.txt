@@ -570,6 +570,7 @@ add_library(aicad_agent STATIC
   agent/micro.cpp
   agent/ask.cpp
   agent/clarify.cpp
+  agent/complexity.cpp
   agent/pm_assist.cpp)
 target_include_directories(aicad_agent PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(aicad_agent PUBLIC nlohmann_json::nlohmann_json)
@@ -601,6 +602,15 @@ target_link_libraries(test_machine PRIVATE aicad_agent)
 set_target_properties(test_machine PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME machine COMMAND test_machine)
+
+# complexity router (agent/complexity.cpp). OCCT-free, links aicad_agent.
+add_executable(test_complexity
+  tests/test_complexity.cpp)
+target_include_directories(test_complexity PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_complexity PRIVATE aicad_agent)
+set_target_properties(test_complexity PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME complexity COMMAND test_complexity)
 
 add_executable(test_aicm
   tests/test_aicm_writer.cpp)

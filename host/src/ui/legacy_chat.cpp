@@ -3440,8 +3440,20 @@ static void drawThoughtBox(ActivityItem& a, const ui::Fonts& fonts, bool showThi
     if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
     if (ImGui::IsItemClicked()) a.expanded = !open;
     if (open) {
-        if (!a.detail.empty())
-            drawProseBox("##thoughttxt", stripMdMarks(a.detail), ui::metrics::copilotProseMaxH());
+        if (!a.detail.empty()) {
+            if (isOutput && a.streaming) {
+                // Live stream: render inline (primary ink) so the box GROWS with the text and the
+                // OUTER chat log's auto-scroll keeps the newest tokens pinned just above the
+                // composer. A fixed-height inner scroller would show the TOP and hide the latest
+                // output. Finished output falls back to the capped scrolling box so history stays
+                // compact yet fully readable.
+                ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+                ImGui::TextWrapped("%s", stripMdMarks(a.detail).c_str());
+                ImGui::PopStyleColor();
+            } else {
+                drawProseBox("##thoughttxt", stripMdMarks(a.detail), ui::metrics::copilotProseMaxH());
+            }
+        }
     } else if (!a.detail.empty()) {
         // Collapsed: a dim one-line preview (first line, ellipsized).
         std::string prev = a.detail.substr(0, a.detail.find('\n'));

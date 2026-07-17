@@ -2308,6 +2308,28 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             a->streaming = false;
             a->status    = "done";
         }
+    } else if (kind == "assistant_delta") {  // live token stream (C++ SSE deltas)
+        // Both channels coalesce into ONE growing collapsible box each in the timeline
+        // (Thinking = reasoning, Output = the model's generated ops/prose), so the user
+        // sees continuous output while working. Boxes finalize at stage/run end.
+        const std::string chan = jstr(data, "channel");
+        const std::string txt = jstr(data, "text");
+        const bool think = (chan == "thinking");
+        const std::string key = think ? "thought:stream" : "stream:out";
+        ActivityItem* a = nullptr;
+        for (auto it = m.activity.rbegin(); it != m.activity.rend(); ++it)
+            if (it->rowKind == 2 && it->stage == key && it->streaming) { a = &*it; break; }
+        if (!a) {
+            ActivityItem ni;
+            ni.rowKind = 2;
+            ni.stage   = key;
+            ni.title   = think ? "Thinking" : "Output";
+            m.activity.push_back(std::move(ni));
+            a = &m.activity.back();
+        }
+        a->detail += txt;
+        a->streaming = true;
+        a->status    = "running";
     } else if (kind == "agent.tool_call") {                          // M14 — tool call row
         ActivityItem ni;
         ni.rowKind = 3;

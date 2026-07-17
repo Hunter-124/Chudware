@@ -9609,7 +9609,7 @@ static void submitTurn(AppState& st, const std::string& text) {
 
     // Sync persisted settings.copilotMode with live dropdown.
     st.settings.copilotMode = st.aiInteraction;
-    const CopilotMode mode = (st.aiInteraction >= 0 && st.aiInteraction <= 4)
+    const CopilotMode mode = (st.aiInteraction >= 0 && st.aiInteraction <= 5)
                                  ? (CopilotMode)st.aiInteraction
                                  : CopilotMode::Agent;
     const bool editMode  = (mode == CopilotMode::Edit);
@@ -9617,6 +9617,8 @@ static void submitTurn(AppState& st, const std::string& text) {
     const bool planMode  = (mode == CopilotMode::Plan);
     const bool swarmMode = (mode == CopilotMode::Swarm);
     const bool agentMode = (mode == CopilotMode::Agent);
+    const bool engFirmMode = (mode == CopilotMode::EngFirm);
+    (void)agentMode;
 
     auto withOptions = [&](nlohmann::json base, nlohmann::json opts) -> nlohmann::json {
         if (!opts.is_object()) opts = nlohmann::json::object();
@@ -9830,6 +9832,32 @@ static void submitTurn(AppState& st, const std::string& text) {
         nlohmann::json extras = withOptions(turnExtras, {
             {"mode", "swarm"},
             {"corporate_force", true},
+            {"advisor", true}});
+        bool needFresh = true;
+        if (st.docMirror.hasDoc()) {
+            const nlohmann::json& tree = st.docMirror.tree();
+            bool hasFeatures = tree.is_object() && tree.contains("features") &&
+                               tree["features"].is_array() && !tree["features"].empty();
+            if (hasFeatures && (has("edit ") || has("change ") || has("modify ") ||
+                                has("update ") || has("fix ") || has("on this")))
+                needFresh = false;
+        }
+        launchMissionRunChat(st, sendText, needFresh, extras);
+        return;
+    }
+
+    if (engFirmMode) {
+        // Engineering-firm org: the heaviest structure — specialist roles + contractor
+        // firms bidding on tasks within a $ budget. Routes through the mission path with
+        // the eng_firm org flag + the configured budget so the C++ harness assembles the
+        // firm structure (corporate_force guarantees multi-agent execution).
+        st.addLog("[..] eng.firm: " + text);
+        nlohmann::json extras = withOptions(turnExtras, {
+            {"mode", "eng_firm"},
+            {"org", "eng_firm"},
+            {"corporate_force", true},
+            {"execute_as", "eng_firm"},
+            {"budget_usd", st.settings.companyBudgetUsd},
             {"advisor", true}});
         bool needFresh = true;
         if (st.docMirror.hasDoc()) {
@@ -10239,15 +10267,18 @@ static void drawComposerPrelude(AppState& st, bool /*busy*/) {
 
     // Agent / Plan / Swarm / Edit / Ask — drop-UP menu that propagates upward like the model
     // picker, with an atlas icon + glass row styling per entry.
-    static const char* modes[]     = {"Agent", "Plan", "Swarm", "Edit", "Ask"};
-    static const char* modeIcons[] = {"ai_panel", "plan_board", "team", "msg_edit", "ask"};
+    static const char* modes[]     = {"Agent", "Plan", "Swarm", "Edit", "Ask", "Eng. Firm"};
+    static const char* modeIcons[] = {"ai_panel", "plan_board", "team", "msg_edit", "ask",
+                                      "eng_firm"};
     static const char* modeTips[]  = {
         "Agent — full tools; auto-routes (may plan, swarm, or edit).",
         "Plan — draft a plan only; approve before building.",
         "Swarm — force multi-agent / corporate mission execution.",
         "Edit — change the open part (scoped to selection when set).",
-        "Ask — questions about the part; nothing changes."};
-    int mode = (st.aiInteraction >= 0 && st.aiInteraction <= 4) ? st.aiInteraction : 0;
+        "Ask — questions about the part; nothing changes.",
+        "Eng. Firm — engineering firm: specialist roles + contractor firms bid on tasks "
+        "within a $ budget for the heaviest jobs."};
+    int mode = (st.aiInteraction >= 0 && st.aiInteraction <= 5) ? st.aiInteraction : 0;
     // Trigger chip: icon + longest label + up-caret. Custom-drawn (InvisibleButton + glass wash)
     // so the leading atlas icon sits inline, matching the composer's other chips.
     const float fh = ImGui::GetFontSize();
@@ -10299,7 +10330,7 @@ static void drawComposerPrelude(AppState& st, bool /*busy*/) {
     ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0, 0, 0, 0));
     if (ImGui::BeginPopup("##aimodemenu",
                           ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysAutoResize)) {
-        for (int i = 0; i < 5; ++i) {
+        for (int i = 0; i < 6; ++i) {
             const bool needDoc = (i == (int)CopilotMode::Edit && !hasDoc);
             if (modeMenuRow(modeIcons[i], modes[i], mode == i, needDoc, i)) {
                 st.aiInteraction = i;
@@ -10930,7 +10961,7 @@ static void drawComposer(AppState& st, bool busy, bool canRun) {
         st.aiInteraction = (int)CopilotMode::Agent;
         st.settings.copilotMode = (int)CopilotMode::Agent;
     }
-    if (st.aiInteraction < 0 || st.aiInteraction > 4) st.aiInteraction = 0;
+    if (st.aiInteraction < 0 || st.aiInteraction > 5) st.aiInteraction = 0;
     // agentV2 flag: any mutating orchestrator mode (Agent/Plan/Swarm/Edit). Ask is one-shot.
     st.agentV2 = (st.aiInteraction != (int)CopilotMode::Ask);
     // One-shot: seed live mode from persisted settings after loadSettings.

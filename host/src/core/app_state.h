@@ -73,14 +73,15 @@ enum JobKind { JOB_BUILD, JOB_DESIGN, JOB_CHAT };
 enum class Units { MMGS = 0, IPS = 1 };
 
 // ---------------- settings (AI provider) -> %APPDATA%/AI-CAD/config.json ----------------
-// Copilot composer interaction mode (Agent | Plan | Swarm | Edit | Ask).
+// Copilot composer interaction mode (Agent | Plan | Swarm | Edit | Ask | Eng. Firm).
 // Integer values match Settings::copilotMode / AppState::aiInteraction for persistence.
 enum class CopilotMode : int {
-    Agent = 0,
-    Plan  = 1,
-    Swarm = 2,
-    Edit  = 3,
-    Ask   = 4,
+    Agent   = 0,
+    Plan    = 1,
+    Swarm   = 2,
+    Edit    = 3,
+    Ask     = 4,
+    EngFirm = 5,  // engineering-firm org: roles, contractor firms, budget + token-bid dispatch
 };
 
 struct Settings {
@@ -107,7 +108,10 @@ struct Settings {
     bool planMode = true;
     // Copilot composer mode: Agent | Plan | Swarm | Edit | Ask. Persisted as "copilot_mode".
     // Values match AppState::aiInteraction / CopilotMode.
-    int copilotMode = 0;         // 0=Agent 1=Plan 2=Swarm 3=Edit 4=Ask
+    int copilotMode = 0;         // 0=Agent 1=Plan 2=Swarm 3=Edit 4=Ask 5=EngFirm
+    // Eng. Firm mode: max spend (USD) the orchestrator/firms must complete the job within.
+    // Contractor firms bid in predicted tokens, converted to $, against this ceiling.
+    double companyBudgetUsd = 25.0;
     int maxIters = 0;            // refine-pass cap per turn; 0 = automatic
     int maxTokens = 0;           // max output tokens per model call; 0 = automatic (per-provider
                                  // default). Raise this if a reasoning model returns "no JSON ops"
@@ -1698,3 +1702,10 @@ struct AppState {
     core::OpsResponse docUndo();
     core::OpsResponse docRedo();
 };
+
+// One active working directory (PLM/VCS integration): point the PLM project, the
+// Explorer root, and the built-in agent at *absDir* in one call — sets
+// plmProjectDir + workspaceDir + settings.workspaceDir, persists it, invalidates
+// the PLM caches, and fires plm_record_outside to capture drift since last
+// session. Empty *absDir* is a no-op (cancelled dialog). Defined in app_state.cpp.
+void setActiveProjectDir(AppState& st, const std::string& absDir);

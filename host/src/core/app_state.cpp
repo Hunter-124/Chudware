@@ -34,6 +34,7 @@
 
 #include "../ui/feature_tree.h"  // W1-B: ui::featureTreeResetTransient (clear tree statics on doc change)
 #include "../ui/sketch_mode.h"   // ui::SketchMode::clearEntitySelection (clearSelection)
+#include "../ui/plm/plm_hub.h"   // ui::plmInvalidate (unified working-dir switch)
 
 const char* kStarterCode =
     "# build123d is imported. Assign the final solid to `result`.\n"
@@ -199,11 +200,13 @@ void loadSettings(Settings& s) {
                     else if (m == "swarm") cm = 2;
                     else if (m == "edit") cm = 3;
                     else if (m == "ask" || m == "chat") cm = 4;
+                    else if (m == "eng_firm") cm = 5;
                 }
             }
-            if (cm < 0 || cm > 4) cm = 0;
+            if (cm < 0 || cm > 5) cm = 0;
             s.copilotMode = cm;
         }
+        s.companyBudgetUsd = j.value("company_budget_usd", 25.0);
         s.maxIters = j.value("max_iters", 0);
         s.maxTokens = j.value("max_output_tokens", 0);
         s.contextWindow = j.value("context_window", 0);
@@ -373,11 +376,12 @@ void saveSettings(const Settings& s) {
     j["offline_mode"] = s.offlineMode;
     j["plan_mode"] = s.planMode;
     {
-        static const char* kModeNames[] = {"agent", "plan", "swarm", "edit", "ask"};
+        static const char* kModeNames[] = {"agent", "plan", "swarm", "edit", "ask", "eng_firm"};
         int cm = s.copilotMode;
-        if (cm < 0 || cm > 4) cm = 0;
+        if (cm < 0 || cm > 5) cm = 0;
         j["copilot_mode"] = kModeNames[cm];
     }
+    j["company_budget_usd"] = s.companyBudgetUsd;
     if (s.maxIters > 0) j["max_iters"] = s.maxIters;
     if (s.maxTokens > 0) j["max_output_tokens"] = s.maxTokens;
     if (s.contextWindow > 0) j["context_window"] = s.contextWindow;
@@ -2169,4 +2173,19 @@ std::string AppState::pickLabel(const render::PickHit& h) const {
     }
     return std::string(kind) + " " + std::to_string(h.topo_id) + " of Body" +
            std::to_string(h.body_id);
+}
+
+void setActiveProjectDir(AppState& st, const std::string& absDir) {
+    if (absDir.empty()) return;  // cancelled dialog → no-op
+    st.plmProjectDir = absDir;
+    st.workspaceDir = absDir;
+    st.settings.workspaceDir = absDir;
+    saveSettings(st.settings);   // persist workspace_dir into config.json
+    ui::plmInvalidate();         // drop PLM caches → refetch against the new dir
+    // Capture drift since last session (files copied in / edited outside). Best
+    // effort — a failure must never block the switch.
+    nlohmann::json p;
+    p["path"] = absDir;
+    p["project_dir"] = absDir;
+    st.rpc.call("plm_record_outside", p, [](const core::RpcResult&) {});
 }

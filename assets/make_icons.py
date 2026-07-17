@@ -107,8 +107,8 @@ CONTRACT_NAMES: list[str] = [
     "thread",
     # ---- Chat context refs (Wave 4, append-only): composer attach + context picker ----
     "paperclip", "context_cube",
-    # ---- Copilot modes (append-only): mode-picker Ask glyph ----
-    "ask",
+    # ---- Copilot modes (append-only): mode-picker Ask + Eng. Firm glyphs ----
+    "ask", "eng_firm",
 ]
 
 # FM + ribbon-adjacent refresh scope (Agent 3 — fm_copilot_gui_rectify).
@@ -2321,6 +2321,26 @@ def draw_ask(d, cell, p):
     # Dot under the stem.
     filled_circle(d, cx, s * 0.58, max(1, int(lw * 0.85)), p.accent)
 
+
+@icon("eng_firm")
+def draw_eng_firm(d, cell, p):
+    """Classical portico (pediment + columns) — the engineering-firm org mode."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    # Pediment (roof triangle) over the columns.
+    d.line(
+        [(s * 0.12, s * 0.34), (s * 0.50, s * 0.12), (s * 0.88, s * 0.34)],
+        fill=p.accent,
+        width=lw,
+        joint="curve",
+    )
+    # Architrave (horizontal beam under the pediment).
+    d.line([(s * 0.14, s * 0.40), (s * 0.86, s * 0.40)], fill=p.stroke, width=lw)
+    # Three columns.
+    for cx in (s * 0.26, s * 0.50, s * 0.74):
+        d.line([(cx, s * 0.44), (cx, s * 0.78)], fill=p.stroke, width=lw)
+    # Base / stylobate.
+    d.line([(s * 0.12, s * 0.82), (s * 0.88, s * 0.82)], fill=p.stroke, width=lw)
 
 
 @icon("copy")

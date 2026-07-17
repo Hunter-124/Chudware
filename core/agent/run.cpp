@@ -331,7 +331,7 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
     // (host keeps mode=plan while re-sending the approved plan to execute).
     bool plan_only = options.value("plan_only", false) || copilot_mode == "plan";
     const bool corporate_force = options.value("corporate_force", false) ||
-                                 copilot_mode == "swarm";
+                                 copilot_mode == "swarm" || copilot_mode == "eng_firm";
     const std::string execute_as = options.value("execute_as", std::string());
     // advisor defaults ON; only an explicit false disables the seam.
     const bool advisor_on = !options.contains("advisor") ? true : options.value("advisor", true);

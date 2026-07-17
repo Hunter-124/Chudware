@@ -5285,8 +5285,23 @@ void persistChatHistory(AppState& st) {
         const std::vector<ChatMsg>& msgs = (i == st.activeConv) ? st.chat : st.conversations[i].msgs;
         nlohmann::json jm = nlohmann::json::array();
         for (const auto& m : msgs) {
-            if (m.text.empty()) continue;  // skip running/placeholder turns with no content yet
-            nlohmann::json entry = {{"u", m.fromUser}, {"t", m.text}, {"e", m.errKind}};
+            std::string body = m.text;
+            if (body.empty() && !m.fromUser && !m.activity.empty()) {
+                // Design/build turns put their result in the activity timeline, not
+                // m.text — persist a concise summary so the turn survives reload
+                // instead of vanishing (the whole session used to disappear).
+                int steps = 0;
+                std::string lastReason;
+                for (const auto& a : m.activity) {
+                    if (a.rowKind == 0 && !a.missionHeader) ++steps;
+                    if (!a.reason.empty()) lastReason = a.reason;
+                }
+                body = !lastReason.empty()
+                           ? lastReason
+                           : ("(design run \xc2\xb7 " + std::to_string(steps) + " steps)");
+            }
+            if (body.empty()) continue;  // truly empty placeholder (still-running / no content)
+            nlohmann::json entry = {{"u", m.fromUser}, {"t", body}, {"e", m.errKind}};
             if (!m.fromUser && !m.model.empty()) entry["m"] = m.model;
             jm.push_back(std::move(entry));
         }

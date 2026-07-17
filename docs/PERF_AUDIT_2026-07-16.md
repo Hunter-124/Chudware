@@ -107,3 +107,26 @@ to `$DST/agent/prompts` and stamps `AI_CAD_PROMPTS_DIR` into the unit. Verified:
 3. ✅ Agent prompts deploy (§5) — shipped, agent build verified.
 4. Frame pacing (§3) — profile with `glassTimings()` first, then adaptive quality. Its own task;
    needs representative hardware for the full-quality path and the FBO-realloc safety work.
+
+## 7. Web reliability (2026-07-16 addendum — Chudware rebrand session)
+
+**SHIPPED — daemon restart SIGABRT hang.** `hostd::Server::~Server` closed each client conn
+then joined its thread, but Linux `close()` does not wake a thread already parked in `poll()`
+inside `IpcConn::readLine`, so `join()` hung to `TimeoutStopSec` → SIGABRT on every
+binary-triggered restart with a client connected. Fix: `IpcConn::shutdown()` (POSIX
+`shutdown(SHUT_RDWR)` / Win `CancelIoEx` / wasm WS teardown) called before join. Verified: stop
+with a parked client is now instant + clean (was 30 s + `status=6/ABRT`). This was the primary
+cause of the user's "crashed on the other end" + multi-second modelling stalls.
+
+**SHIPPED — boot "worker not started" race.** On web `workerStarted` is set synthetically at
+boot to unlock the UI, so `ensureStarterDoc` fired `doc_new` before the daemon WS connected →
+transient toast. Gated the starter on a new `daemonEverConnected` latch (set after the first
+successful bootstrap, which also runs the orphan-recovery check) + the recovery modal not being
+open. Verified: clean boot log, no error toast.
+
+**DEFERRED — recovery_open is a synchronous GL-thread call** (`app.cpp:4063`,
+`c->call("recovery_open", {all:true})`). The acute "insane latency" was the daemon shutdown
+hang above (now fixed) + the boot race; the sync call itself only blocks briefly for a healthy
+daemon rebuilding a couple of parts. A true async refactor is deferred: on web there are no
+threads (single-thread + ASYNCIFY), so it needs a request/poll-across-frames pattern, not a
+worker thread. Do it if recovery of many/large parts still stalls the frame loop.

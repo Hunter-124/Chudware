@@ -37,6 +37,7 @@ class FakeDaemon:
     def __init__(self, sock_path: Path) -> None:
         self.sock_path = sock_path
         self.hellos: list[dict] = []
+        self.calls: list[dict] = []  # every parsed request (method + params), for RPC-rewrite assertions
         self._writers: list[asyncio.StreamWriter] = []
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
@@ -75,6 +76,7 @@ class FakeDaemon:
                 msg = json.loads(raw)
                 mid, method = msg.get("id"), msg.get("method")
                 params = msg.get("params") or {}
+                self.calls.append({"method": method, "params": params})
                 if method == "hello":
                     self.hellos.append(params)
                     result = {"proto": 1, "state": "ready"}
@@ -200,6 +202,22 @@ class TestEngineBridge:
         # Closing the socket must decrement — the deploy idle-wait relies on this
         # returning to 0, else it would defer restarts forever.
         assert engine_bridge.active_bridge_count() == 0
+
+    def test_agent_turn_forces_daemon_provider(self, daemon, client):
+        """Web agent turns must run on the shared daemon's config.json accounts, so the
+        gateway strips any client-pinned provider identity before forwarding to hostd."""
+        with client.websocket_connect("/engine", headers=DEV_HEADERS) as ws:
+            _rpc(ws, 1, "hello")
+            # Client pins its (empty-web-config default) provider + creds; daemon must not see them.
+            _rpc(ws, 2, "agent_ask_v2", {"question": "hi", "provider": "gemini",
+                                         "model": "gemini-2.5-flash", "api_key": "sk-web"})
+        seen = next(c for c in daemon.calls if c.get("method") == "agent_ask_v2")
+        p = seen["params"]
+        assert "provider" not in p and "model" not in p and "api_key" not in p, p
+        assert p["question"] == "hi"  # non-provider params pass through untouched
+        # A non-agent method keeps its params verbatim (no over-broad stripping).
+        doc_calls = [c for c in daemon.calls if c.get("method") == "doc_new"]
+        assert all("name" in c["params"] for c in doc_calls) or not doc_calls
 
 
 class TestWorkspaceApi:

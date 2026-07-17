@@ -57,6 +57,41 @@ def _inject_identity(line: str, email: str, display: str) -> str:
     return json.dumps(msg, separators=(",", ":"))
 
 
+# Agent-turn RPCs arrive with a provider/model (and sometimes credentials) pinned from
+# the web user's LOCAL settings — but on web that config lives in the browser's throwaway
+# /tmp and is empty/default, so the turn would spend the WRONG account (the seeded Gemini
+# key) or none. The shared daemon already holds Hunter's real config.json with his signed-in
+# subscription accounts. Strip the client's provider identity from these turns so the daemon's
+# resolve_provider() falls back to ITS config.json — i.e. every web user transparently spends
+# Hunter's active account. (The web Settings account picker is empty on web and thus cosmetic;
+# all web turns run on the daemon's configured provider.)
+_FORCE_DAEMON_PROVIDER_METHODS = frozenset({
+    "agent_run_v2", "agent_ask_v2", "agent_clarify_v1", "agent_mission_v1",
+    "session_btw", "session_handoff",
+})
+_STRIP_PROVIDER_FIELDS = ("provider", "model", "api_key", "base_url",
+                          "auth_mode", "fallback_api_keys")
+
+
+def _force_daemon_provider(line: str) -> str:
+    """Drop client-pinned provider identity from agent-turn RPCs so the shared daemon
+    resolves the provider (+ subscription accounts) from its own config.json."""
+    try:
+        msg = json.loads(line)
+    except ValueError:
+        return line
+    if not isinstance(msg, dict) or msg.get("method") not in _FORCE_DAEMON_PROVIDER_METHODS:
+        return line
+    params = msg.get("params")
+    if not isinstance(params, dict):
+        return line
+    if not any(k in params for k in _STRIP_PROVIDER_FIELDS):
+        return line
+    for k in _STRIP_PROVIDER_FIELDS:
+        params.pop(k, None)
+    return json.dumps(msg, separators=(",", ":"))
+
+
 @router.websocket("/engine")
 async def engine_ws(ws: WebSocket) -> None:
     user = ws.state.user  # AuthMiddleware closed 4401/4403 already if unauthenticated
@@ -75,9 +110,13 @@ async def engine_ws(ws: WebSocket) -> None:
     async def ws_to_daemon() -> None:
         while True:
             line = await ws.receive_text()
-            # Cheap pre-filter; _inject_identity re-checks method properly.
-            if '"hello"' in line[:64]:
+            # Cheap pre-filters (method sits near the front of the JSON-RPC line);
+            # the helpers re-check the method properly before rewriting.
+            head = line[:96]
+            if '"hello"' in head:
                 line = _inject_identity(line, user.email, user.display)
+            elif '"agent_' in head or '"session_btw"' in head or '"session_handoff"' in head:
+                line = _force_daemon_provider(line)
             writer.write(line.encode("utf-8") + b"\n")
             await writer.drain()
 

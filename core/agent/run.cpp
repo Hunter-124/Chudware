@@ -15,6 +15,7 @@
 #include "agent/config.h"
 #include "agent/domain.h"
 #include "agent/events.h"
+#include "agent/firm_bid.h"
 #include "agent/logging_provider.h"
 #include "agent/machine.h"
 #include "agent/mission.h"
@@ -1649,6 +1650,45 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
     events.emit("mission_started", json{{"request", request},
                                         {"task_count", static_cast<int>(tasks.size())},
                                         {"tasks", task_list}});
+
+    // Eng. Firm org: collect deterministic contractor-firm bids (predicted tokens ->
+    // USD) for the job and surface them + the winning firm. The budget ceiling and
+    // blended token rate come from the host; 0 budget = unlimited.
+    const std::string org = options.value("org", options.value("mode", std::string()));
+    if (org == "eng_firm") {
+        const double budget_usd = options.value("budget_usd", 0.0);
+        const double usd_per_1k = options.value("usd_per_1k", 3.0);
+        ComplexityVerdict mcx = classify_complexity(request);
+        DomainVerdict mdom = classify_domain(request);
+        std::vector<Bid> bids = collect_bids(request, mcx.level, mdom.domain, usd_per_1k, budget_usd);
+        json jbids = json::array();
+        std::string winner_id, winner_name;
+        double winner_usd = 0.0;
+        long winner_tokens = 0;
+        for (const auto& b : bids) {
+            jbids.push_back(json{{"firm_id", b.firm_id},
+                                 {"firm", b.firm_name},
+                                 {"in_scope", b.in_scope},
+                                 {"tokens", b.tokens},
+                                 {"usd", b.usd},
+                                 {"within_budget", b.within_budget}});
+            if (winner_id.empty() && b.in_scope && b.within_budget) {
+                winner_id = b.firm_id;
+                winner_name = b.firm_name;
+                winner_usd = b.usd;
+                winner_tokens = b.tokens;
+            }
+        }
+        events.emit("firm_bids", json{{"domain", mdom.label()},
+                                      {"complexity", mcx.label()},
+                                      {"budget_usd", budget_usd},
+                                      {"usd_per_1k", usd_per_1k},
+                                      {"bids", jbids},
+                                      {"awarded_firm_id", winner_id},
+                                      {"awarded_firm", winner_name},
+                                      {"awarded_tokens", winner_tokens},
+                                      {"awarded_usd", winner_usd}});
+    }
     // Additive plan_state for the copilot Plan section (phased_todo under "Mission").
     // Statuses update on mission_task_started / mission_task_result.
     int mission_plan_rev = 1;

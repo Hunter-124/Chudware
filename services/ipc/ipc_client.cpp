@@ -292,6 +292,31 @@ bool EngineClient::tryReconnect(std::string& err) {
     return reconnectLocked(err);
 }
 
+// Non-blocking twin of tryReconnect for the wasm render thread — see the header.
+// try_to_lock: a failed acquire means a call() is mid-flight; return false so the
+// frame loop skips this tick (keeping the browser event loop alive) instead of
+// hard-blocking, which would deadlock against the WS onclose that must run on this
+// same thread. Bootstraps sockPath_ so it also serves the very first connect.
+bool EngineClient::tryReconnectNonBlocking(std::string& err, bool* deferred) {
+    std::unique_lock<std::mutex> lk(mtx_, std::try_to_lock);
+    if (!lk.owns_lock()) {
+        err = "reconnect deferred (engine call in flight)";
+        if (deferred) *deferred = true;
+        return false;
+    }
+    if (conn_.valid() && !conn_.eof()) return true;
+    if (sockPath_.empty()) {
+        // First use: establish the instance key + socket path reconnectLocked needs.
+        // The wasm transport ignores the path (it dials the gateway WS) but
+        // reconnectLocked guards on a non-empty sockPath_. clientKind_ is "gui";
+        // the gateway asserts the real per-user identity into the hello anyway.
+        clientKind_ = "gui";
+        sockPath_ = socketPath(instanceKey(std::string()));
+        if (sockPath_.empty()) sockPath_ = "ws://engine";  // sentinel; path unused in wasm
+    }
+    return reconnectLocked(err);
+}
+
 bool EngineClient::pollAlive() {
     // try_lock: same rule as drainEvents — never block the GUI behind a long RPC.
     std::unique_lock<std::mutex> lk(mtx_, std::try_to_lock);

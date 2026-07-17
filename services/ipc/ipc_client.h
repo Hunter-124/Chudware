@@ -80,6 +80,24 @@ public:
     // try_locks — never stalls the render thread behind a long call().
     bool pollAlive();
 
+    // Non-blocking reconnect for the wasm GUI frame loop. Acquires mtx_ with
+    // try_to_lock ONCE on the render thread; if a call() is already in flight it
+    // returns false immediately (skip this tick) rather than hard-blocking.
+    //
+    // Why this exists: under ASYNCIFY (no PROXY_TO_PTHREAD) the browser WebSocket
+    // onclose/onmessage callbacks run on the MAIN (render) thread. If the render
+    // thread hard-blocks in a lock_guard(mtx_) behind an AsyncRpc-worker call that
+    // is stuck reading a dead socket, that socket's onclose can never fire to set
+    // eof — the worker never returns, mtx_ is never released: permanent freeze
+    // (the "page stops responding" seen after a daemon restart). Because the lock
+    // is taken only via try_to_lock and the whole connect+hello runs inline under
+    // that single held lock (never a second blocking acquire), the render thread
+    // can never stall on it. Bootstraps sockPath_ on first use so it works for the
+    // initial connect too. Bumps reconnectGeneration() on success. Never spawns.
+    // *deferred (optional) is set true when the attempt was skipped because a
+    // call() held mtx_ (not a failure — retry next frame without backoff).
+    bool tryReconnectNonBlocking(std::string& err, bool* deferred = nullptr);
+
 private:
     bool connectInner(const Options& opts, std::string& err);
     bool tryConnect(std::string& err);

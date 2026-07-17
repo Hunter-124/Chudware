@@ -263,15 +263,18 @@ DaemonConnState maintainConnection() {
 
     std::string err;
 #ifdef __EMSCRIPTEN__
-    // First connect (or full re-handshake): connectOrSpawn with allowSpawn=false.
-    // tryReconnect alone needs a prior sockPath_ from connectOrSpawn.
-    aicad_ipc::EngineClient::Options opts;
-    opts.hostdBin.clear();
-    opts.clientKind = "gui";
-    opts.allowSpawn = false;
-    const bool ok = g_client->connected()
-                        ? g_client->tryReconnect(err)
-                        : g_client->connectOrSpawn(opts, err);
+    // Browser: the render thread MUST NOT hard-block acquiring the client mutex.
+    // Under ASYNCIFY (no PROXY_TO_PTHREAD) the WebSocket onclose/onmessage
+    // callbacks run on THIS thread; a lock_guard wait behind an AsyncRpc-worker
+    // call stuck on a dead socket would stop those callbacks from ever firing,
+    // wedging the tab. tryReconnectNonBlocking try_locks and, when a call is in
+    // flight, sets `deferred` and returns false — that is NOT a failure: keep the
+    // backoff counter untouched so we retry next frame the instant the lock frees
+    // (the stuck call drains as soon as the event loop runs). It also does connect
+    // + hello inline (no spawn) and bootstraps the socket path for the first connect.
+    bool deferred = false;
+    const bool ok = g_client->tryReconnectNonBlocking(err, &deferred);
+    if (!ok && deferred) return DaemonConnState::Unreachable;  // skip tick, no backoff
 #else
     const bool ok = g_client->tryReconnect(err);
 #endif

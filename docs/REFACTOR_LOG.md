@@ -1434,3 +1434,32 @@ col/row from the ruled ASCII + `index`. Files: `services/mcp/ascii2d.py`,
 `services/mcp/ecad_tools.py` (schematic mutation readbacks), `test_ascii2d.py`.
 Deferred: live sketch apply path still depends on core bridge; full ERC-backed
 schematic findings stay on `ecad_run_erc`.
+
+## 2026-07-16 — CAD link graph (graphify-for-CAD) + PLM/VCS integration
+
+Two deliverables. **(1) CAD link graph.** Extended `services/plm/cad_graph.py`:
+`equation` nodes from `equations.globals`; expression-driven `DERIVES_FROM`
+(feature/sketch dim `{value, expr}` → equation, eq→eq, cross-doc `derived_from`);
+external-ref `REFERENCES`; mate dimension `value/unit/expr` on nodes + `MATES`
+edges; `MANUFACTURES` for CAM docs; the shared name+value heuristic is now
+`origin=inferred`. New `services/plm/graph_links.py` overlay
+(`.plm/graph_links.json`, `aicad.cad_graph_links/1`) + `cad_graph_link_add/remove/
+list` RPCs (`engine_oracle/parts_hub/cad_graph_rpc.py`). New MCP `services/mcp/
+graph_tools.py` (`cad_graph`, `cad_graph_link`, `assembly_plan_review`) over a new
+`assembly_advice()`. GUI `host/src/ui/plm/graph_tab.cpp`: edge meta + value
+labels, kind-filter chips + "Links only", edge selection/side-panel, link
+authoring (arm → target → kind/note popup), manual/ai origin styles, `equation`
+legend, `plmGraphFocus`. **(2) PLM/VCS.** `snapshot.py` strips `cache.*` at the
+vault boundary (never commits solved caches); `vault.py` scans containers
+recursively (nested rel paths, dot-dir skip) + `auto_commit`/`repack` accessors +
+`auto_commit` in `status()`; `worker_rpc.py` `plm_record_outside` + repack-every-25
+counter + `auto_commit` in settings. `services/agent/config.list_workspace_files`
++ loop.py working-dir roster block. GUI: `setActiveProjectDir` (unified working
+dir; app_state.h/.cpp) wired to PLM hub + File>Open Project Folder + explorer
+context menu; `plmAutoRecordSave` on every `saveDocTab` success path;
+FeatureManager rev badge + graph jump; PLM pages (Overview record-outside,
+Files Open, Settings auto-record toggle, History save pill). Contracts:
+`cad_graph.md` + `plm.md` addenda (additive). Deferred: no automatic remote sync
+(`plm_sync` stays manual); external edits captured on project-open + the explicit
+button, not a live watcher. Gotcha: a concurrent repo process swept the worktree
+into master mid-session — all work landed on `origin/master` regardless.

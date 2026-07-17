@@ -528,3 +528,31 @@ commits only, §5) and is never carried forward.
 `plm_history` additionally accepts an OPTIONAL `scope` (`design`\|`planning`\|`all`,
 default `design`); `plm_compare` returns `mode:"generic"` (with an optional
 `text_diff`) for generic items instead of `doc_diff`. Reason codes unchanged (§7).
+
+**B.4 Derived-cache exclusion, auto-record, and recursive tracking (2026-07 VCS
+integration).** All additive; schema string stays `aicad.plm/1`.
+
+- **Derived container caches are excluded from the shadow tree.** The engine
+  embeds `cache.brep`, `cache.aicm`, and the `cache.json` header into the live
+  `.step+`/`.ecad+` working file (`core/doc/session.cpp`) for a cold-open fast
+  path. These are derived + recomputable (like `geometry.step`) and are stripped
+  at the vault boundary — `explode_container` skips any entry whose name starts
+  with `cache.` — so they are **never committed**. Restore reassembles a
+  cache-less container and the engine rebuilds them on open. Old history entries
+  that already contain cache blobs keep them (history is never rewritten, §3.3);
+  the size relief applies to new commits.
+- **`auto_commit`** — an OPTIONAL manifest key (`bool`, default `true`,
+  forward-tolerant `m.get("auto_commit", True)`), persisted like `ai_mode` (§4).
+  Surfaced in the `plm_settings_get` / `plm_settings_set` payloads and in
+  `plm_status` (`auto_commit` field). When true, the GUI records each save into
+  history automatically.
+- **Recursive working-directory tracking.** Container auto-registration scans the
+  project folder **recursively** (skipping any dot-prefixed path component:
+  `.aicadvault`, `.plm`, `.git`, …). Manifest item `path` is the POSIX path
+  relative to the project root (e.g. `sub/deep/Part.step+`); restore recreates the
+  nested directory.
+- **B.4 additive tool slot:**
+
+| tool | request | response |
+|---|---|---|
+| `plm_record_outside` | `{path}` | `{ok, committed}` (+`commit, entry` when committed) — cut ONE `auto` entry capturing on-disk changes made outside the editor; no-op (`committed:false`) when the working tree already matches history |

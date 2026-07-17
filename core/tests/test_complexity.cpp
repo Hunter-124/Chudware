@@ -20,6 +20,17 @@ TEST_CASE("bare catalog parts are SOLO") {
     CHECK(classify_complexity("a 20mm cube").level == Complexity::Solo);
 }
 
+TEST_CASE("a single primitive with two dimensions stays SOLO (dimensional 'and')") {
+    // The ' and ' chains a DIMENSION ("...diameter and 30mm tall"), not a second object, so a
+    // plain primitive must not be over-planned. (Regression: these routed STANDARD before.)
+    CHECK(classify_complexity("a cylinder 20mm in diameter and 30mm tall").level == Complexity::Solo);
+    CHECK(classify_complexity("a hexagonal prism 16mm across flats and 20mm tall").level ==
+          Complexity::Solo);
+    CHECK(classify_complexity("a cone 30mm base and 50mm tall").level == Complexity::Solo);
+    // a REAL second object still forces a plan
+    CHECK(classify_complexity("a plate 50mm wide and a matching cover").level != Complexity::Solo);
+}
+
 TEST_CASE("assemblies and mechanisms are COMPLEX") {
     CHECK(classify_complexity("a two-stage planetary gearbox assembly").level ==
           Complexity::Complex);

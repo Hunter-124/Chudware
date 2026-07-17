@@ -2504,7 +2504,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                     if (!canSetup) ImGui::EndDisabled();
                     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
                         ImGui::SetTooltip("Rebuild the local Python/CAD runtime (same as "
-                                          "Billet \xe2\x86\x92 Repair / install runtime).");
+                                          "Chudware \xe2\x86\x92 Repair / install runtime).");
                     if (st.setupRunning.load()) {
                         ImGui::SameLine();
                         dimText("Running\xe2\x80\xa6");
@@ -2877,18 +2877,18 @@ void drawSettingsModal(AppState& st, bool busy) {
 
     // ---------- About modal ----------
     if (st.showAbout) {
-        ImGui::OpenPopup("About Billet");
+        ImGui::OpenPopup("About Chudware");
         st.showAbout = false;
     }
     ImGui::SetNextWindowSize(ImVec2(380.0f * sc, 0), ImGuiCond_Appearing);
-    if (ImGui::BeginPopupModal("About Billet", nullptr, ImGuiWindowFlags_NoResize)) {
+    if (ImGui::BeginPopupModal("About Chudware", nullptr, ImGuiWindowFlags_NoResize)) {
         const Tex& wm = (ui::activeTheme == ui::Theme::Light && st.wordmarkDark.id)
                             ? st.wordmarkDark : st.wordmark;
         if (wm.id) {
             ImGui::Image((ImTextureID)(intptr_t)wm.id,
                          ImVec2(190.0f * sc, 190.0f * sc * (float)wm.h / wm.w));
         } else {
-            sectionHeader(st.fonts.h1, "Billet");
+            sectionHeader(st.fonts.h1, "Chudware");
         }
         dimText("Parametric CAD, driven by AI.");
         ImGui::Dummy(ImVec2(0, 4 * sc));

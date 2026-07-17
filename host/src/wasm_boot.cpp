@@ -76,8 +76,8 @@ void frame() {
 
     ImGui::SetNextWindowPos(ImVec2(24.0f, 24.0f), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(420.0f, 180.0f), ImGuiCond_FirstUseEver);
-    if (ImGui::Begin("Billet (WASM)")) {
-        ImGui::TextUnformatted("Billet web client — toolchain bring-up");
+    if (ImGui::Begin("Chudware (WASM)")) {
+        ImGui::TextUnformatted("Chudware web client — toolchain bring-up");
         ImGui::Separator();
         ImGui::TextWrapped("%s", gStatus);
         ImGui::Spacing();
@@ -116,7 +116,7 @@ bool initGlfw() {
 
     emscripten_glfw_set_next_window_canvas_selector("#canvas");
 
-    gWin = glfwCreateWindow(1280, 800, "Billet", nullptr, nullptr);
+    gWin = glfwCreateWindow(1280, 800, "Chudware", nullptr, nullptr);
     if (!gWin) {
         std::fprintf(stderr, "[wasm] glfwCreateWindow failed\n");
         setPageStatus("glfwCreateWindow failed");

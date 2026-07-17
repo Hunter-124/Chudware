@@ -5022,7 +5022,7 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     const float collapseW = lh;
     const float collapseGap = ui::metrics::asmHeaderIconGap();
 
-    // ---- Row 1: [Tasks d/t] .. centered Billet cube+wordmark .. [Artifacts] ----
+    // ---- Row 1: [Tasks d/t] .. centered Chudware cube+wordmark .. [Artifacts] ----
     {
         const float colW = ImGui::GetContentRegionAvail().x;
         const float logoGap = 3.0f * sc;
@@ -6445,7 +6445,7 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
     ImGui::Checkbox("Show assistant thoughts", &gShowThinking);
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Show the AI's reasoning steps inline in the conversation.");
-    dimText("Telemetry is not collected \xe2\x80\x94 Billet does not phone home.");
+    dimText("Telemetry is not collected \xe2\x80\x94 Chudware does not phone home.");
 
     };
 
@@ -8451,7 +8451,7 @@ static void drawOvPermissionsTab(AppState& st, float S, bool& changed) {
         ImGui::PushStyleColor(ImGuiCol_Text,
             ImVec4(ui::palette.textDim[0], ui::palette.textDim[1], ui::palette.textDim[2], 1));
         ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x);
-        ImGui::TextUnformatted("Telemetry is not collected \xe2\x80\x94 Billet does not phone home.");
+        ImGui::TextUnformatted("Telemetry is not collected \xe2\x80\x94 Chudware does not phone home.");
         ImGui::PopTextWrapPos();
         ImGui::PopStyleColor();
     }

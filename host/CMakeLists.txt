@@ -334,6 +334,11 @@ if(EMSCRIPTEN)
   set_target_properties(Billet PROPERTIES
     SUFFIX ".html"
     OUTPUT_NAME "Billet")
+  # The Emscripten shell is embedded at LINK time via --shell-file, but that flag is
+  # NOT a tracked input — without this, editing shell.html silently fails to relink
+  # (stale <title>/boot text ship). Declare it so ninja relinks on shell changes.
+  set_property(TARGET Billet APPEND PROPERTY LINK_DEPENDS
+    ${CMAKE_CURRENT_SOURCE_DIR}/wasm/shell.html)
 else()
   target_include_directories(Billet PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src

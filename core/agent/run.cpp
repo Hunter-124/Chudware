@@ -16,6 +16,7 @@
 #include "agent/domain.h"
 #include "agent/events.h"
 #include "agent/firm_bid.h"
+#include "agent/firm_team.h"
 #include "agent/logging_provider.h"
 #include "agent/machine.h"
 #include "agent/mission.h"
@@ -1688,6 +1689,18 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
                                       {"awarded_firm", winner_name},
                                       {"awarded_tokens", winner_tokens},
                                       {"awarded_usd", winner_usd}});
+        // Assemble the delivery team: lead specialist for the primary domain + a
+        // subcontractor per secondary discipline the request also needs.
+        std::vector<TeamMember> team = assemble_team(request, mdom.domain);
+        json jteam = json::array();
+        for (const auto& tm : team)
+            jteam.push_back(json{{"firm_id", tm.firm_id},
+                                 {"firm", tm.firm_name},
+                                 {"role", tm.role_title},
+                                 {"scope", DomainVerdict{tm.scope, ""}.label()},
+                                 {"lead", tm.lead},
+                                 {"subcontractor", tm.subcontractor}});
+        events.emit("firm_team", json{{"members", jteam}});
     }
     // Additive plan_state for the copilot Plan section (phased_todo under "Mission").
     // Statuses update on mission_task_started / mission_task_result.

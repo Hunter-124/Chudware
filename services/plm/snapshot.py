@@ -44,6 +44,13 @@ _META = "meta.json"  # container-level meta (NOT the PLM meta.json — kept unde
 # so the PLM meta.json (history metadata) never collides with it.
 _KNOWN_CONTAINER_ENTRIES = {_DOCUMENT, _THUMBNAIL}
 
+# Derived / recomputable caches embedded in the live .step+ by the engine
+# (core/doc/session.cpp: cache.brep, cache.aicm, and the cache.json header).
+# Like build artifacts, they are stripped at the VAULT BOUNDARY — never committed
+# to history — and the engine rebuilds them on the next open (the cold-open fast
+# path is a property of the live working file, not of the vault).
+_DERIVED_CACHE_PREFIX = "cache."
+
 
 @dataclass
 class ExplodedItem:
@@ -67,6 +74,8 @@ def explode_container(raw: bytes) -> ExplodedItem:
 
     with zipfile.ZipFile(io.BytesIO(raw), "r") as zf:
         for name in zf.namelist():
+            if name.startswith(_DERIVED_CACHE_PREFIX):
+                continue  # derived cache — never committed to history (rebuilds)
             data = zf.read(name)
             if name == _DOCUMENT:
                 doc_bytes = data

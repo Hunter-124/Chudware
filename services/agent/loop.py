@@ -1345,6 +1345,26 @@ def _generate(session: Session, provider: Provider, on_event: EventFn | None,
             base_prompt = base_prompt.rstrip() + "\n\n" + "\n\n".join(_active)
     except Exception:  # noqa: BLE001
         pass
+    # Working-directory roster (VCS integration): name the shared working folder
+    # and its files so the agent opens them by path and traverses structure with
+    # the CAD graph tools. try/except-guarded; unreadable dir → path line only.
+    try:
+        _wd = agent_config.workspace_dir()
+        if _wd and str(_wd).strip():
+            _lines = [
+                "## Working directory",
+                str(_wd),
+                "Files (open with import_part / plm tools by path; traverse "
+                "structure with cad_graph / assembly_plan_review):",
+            ]
+            try:
+                _files = agent_config.list_workspace_files(_wd, limit=200)
+            except Exception:  # noqa: BLE001
+                _files = []
+            _lines += [f"- {f}" for f in _files]
+            base_prompt = base_prompt.rstrip() + "\n\n" + "\n".join(_lines)
+    except Exception:  # noqa: BLE001
+        pass
     for level in range(_MAX_COMPACT_PASSES + 1):
         compact = session.compact or level > 0
         system = SYSTEM_PROMPT_COMPACT if compact else base_prompt

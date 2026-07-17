@@ -490,3 +490,54 @@ def test_manifest_rejects_future_major():
     bad = json.dumps({"schema": "aicad.plm/2", "items": []}).encode()
     with pytest.raises(ValueError):
         manifest.loads(bad)
+
+
+# ---------------------------------------------------------------------------
+# 2A/2B — derived caches excluded from history; recursive nested tracking
+# ---------------------------------------------------------------------------
+
+
+def test_derived_caches_excluded_from_history(tmp_path):
+    _write(tmp_path, "Bracket.step+", _part(),
+           extras={"cache.brep": b"SOLVED-BREP",
+                   "cache.aicm": b"SOLVED-AICM",
+                   "cache.json": b'{"hdr":1}',
+                   "netlist.json": b'{"nets":[]}'})
+    v = Vault.open(tmp_path)
+    try:
+        r = v.save()
+        tree = v._bind.read_tree(r["commit"])
+        assert not any("/extra/cache." in p or p.endswith("/cache.brep")
+                       for p in tree), list(tree)
+        # a non-derived extra is still preserved
+        assert any(p.endswith("/extra/netlist.json") for p in tree), list(tree)
+        # restore yields a cache-less container; document.json survives intact
+        item_id = v.manifest()["items"][0]["item_id"]
+        v.restore(r["commit"], item_id)
+        raw = (tmp_path / "Bracket.step+").read_bytes()
+        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+            names = set(zf.namelist())
+        assert not any(n.startswith("cache.") for n in names), names
+        assert "netlist.json" in names
+        assert _doc_from_container(raw)["id"] == "uuid-part-1"
+    finally:
+        v.close()
+
+
+def test_nested_container_tracked_and_restored(tmp_path):
+    sub = tmp_path / "sub" / "deep"
+    sub.mkdir(parents=True)
+    (sub / "Part.step+").write_bytes(_container(_part()))
+    v = Vault.open(tmp_path)
+    try:
+        items = v.manifest()["items"]
+        assert [it["path"] for it in items] == ["sub/deep/Part.step+"]
+        r = v.save()
+        # delete the working file, then restore it to the SAME nested path
+        (sub / "Part.step+").unlink()
+        v.restore(r["commit"], items[0]["item_id"])
+        assert (sub / "Part.step+").is_file()
+        assert _doc_from_container((sub / "Part.step+").read_bytes())["id"] \
+            == "uuid-part-1"
+    finally:
+        v.close()

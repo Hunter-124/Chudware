@@ -81,6 +81,57 @@ def workspace_dir(cfg: dict | None = None) -> "Path":
         pass
     return d
 
+
+# CAD/ECAD/doc extensions surfaced first in the working-directory roster so the
+# agent sees the parts before build detritus. Order = priority.
+_WORKSPACE_EXT_PRIORITY = (
+    ".step+", ".ecad+", ".step", ".stp", ".dxf", ".dwg", ".stl",
+    ".pdf", ".md", ".csv",
+)
+
+
+def list_workspace_files(root: "Path", limit: int = 200) -> list[str]:
+    """Relative POSIX paths of interesting files under *root* (recursive).
+
+    Skips dot-directories (``.plm``, ``.aicadvault``, ``.git``, …). CAD/ECAD/doc
+    files sort first (``_WORKSPACE_EXT_PRIORITY``), everything else after, each
+    group lexicographic. Truncates to *limit*, appending ``"… (+N more)"`` when
+    more remain. Best-effort — an unreadable tree yields ``[]``.
+    """
+    from pathlib import Path  # noqa: PLC0415
+
+    root = Path(root)
+    prio: list[str] = []
+    rest: list[str] = []
+    try:
+        for p in root.rglob("*"):
+            if not p.is_file():
+                continue
+            rel = p.relative_to(root)
+            if any(part.startswith(".") for part in rel.parts):
+                continue
+            posix = rel.as_posix()
+            name = p.name.lower()
+            if any(name.endswith(ext) for ext in _WORKSPACE_EXT_PRIORITY):
+                prio.append(posix)
+            else:
+                rest.append(posix)
+    except OSError:
+        return []
+
+    def _key(rel: str) -> tuple[int, str]:
+        low = rel.lower()
+        for i, ext in enumerate(_WORKSPACE_EXT_PRIORITY):
+            if low.endswith(ext):
+                return (i, rel)
+        return (len(_WORKSPACE_EXT_PRIORITY), rel)
+
+    ordered = sorted(prio, key=_key) + sorted(rest)
+    if len(ordered) <= limit:
+        return ordered
+    extra = len(ordered) - limit
+    return ordered[:limit] + [f"… (+{extra} more)"]
+
 # --------------------------------------------------------------------------- agent nesting depth
 # GUI Settings → Permissions writes ``agent.max_subagent_depth`` (int, default 2,
 # GUI clamp 0–4). Root chat = depth 0. 0 means depth-1 subagents may not spawn

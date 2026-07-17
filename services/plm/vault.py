@@ -252,6 +252,23 @@ class Vault:
         self._commit_manifest_change(m)
         return mode
 
+    def auto_commit(self) -> bool:
+        """Whether saves are auto-recorded to history (default true).
+
+        Forward-tolerant: absent key reads as enabled. Lives in ``manifest.json``
+        so the choice follows the project like ``ai_mode``.
+        """
+        return bool(self.manifest().get("auto_commit", True))
+
+    def set_auto_commit(self, enabled: bool) -> bool:
+        """Persist the auto-record-on-save flag for this project."""
+        m = self.manifest()
+        if bool(m.get("auto_commit", True)) == bool(enabled):
+            return bool(enabled)
+        m["auto_commit"] = bool(enabled)
+        self._commit_manifest_change(m)
+        return bool(enabled)
+
     # -- item registry (T-R4, contract §4) ----------------------------------
 
     def set_part_number(self, item_id: str, part_number: str) -> dict[str, Any]:
@@ -602,7 +619,9 @@ class Vault:
             except KeyError:
                 continue  # item not present at that point (e.g. added later)
             container = snapshot.reassemble_container(exploded)
-            (self.project_dir / it["path"]).write_bytes(container)
+            dst = self.project_dir / it["path"]
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(container)
 
         # Append a new forward restore entry (never rewrite). Plain-language
         # "when" — no git vocabulary, no hashes (contract §8.1).
@@ -753,9 +772,15 @@ class Vault:
 
     def _project_containers(self) -> list[Path]:
         out: list[Path] = []
-        for p in sorted(self.project_dir.iterdir()):
-            if p.is_file() and any(p.name.endswith(s) for s in _CONTAINER_SUFFIXES):
-                out.append(p)
+        for p in sorted(self.project_dir.rglob("*")):
+            if not (p.is_file() and any(p.name.endswith(s)
+                                        for s in _CONTAINER_SUFFIXES)):
+                continue
+            # skip anything inside a dot-prefixed dir (.aicadvault/.plm/.git/…)
+            rel = p.relative_to(self.project_dir)
+            if any(part.startswith(".") for part in rel.parts):
+                continue
+            out.append(p)
         return out
 
     def _explode_project_into_shadow(
@@ -791,7 +816,7 @@ class Vault:
             import json as _json
             doc = _json.loads(exploded.document_json.decode("utf-8"))
             doc_uuid = doc.get("id", "")
-            rel = path.name
+            rel = path.relative_to(self.project_dir).as_posix()
             item = manifest.find_item_by_path(m, rel)
             schema_kind = _kind_from_schema(doc.get("schema", ""))
             if item is None:

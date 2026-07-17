@@ -312,3 +312,58 @@ def test_draft_release_mode(project):
 def test_draft_invalid_mode(project):
     out = _call("plm_draft", path=str(project), mode="banana")
     assert out["ok"] is False and out["reason"] == "invalid_mode"
+
+
+# ---------------------------------------------------------------------------
+# 2C — auto_commit setting, plm_record_outside, packing
+# ---------------------------------------------------------------------------
+
+
+def test_auto_commit_roundtrip(project):
+    got = worker_rpc.WORKER_METHODS["plm_settings_get"](
+        {"path": str(project)}, _emit)
+    assert got["ok"] and got["auto_commit"] is True  # default on
+    setr = worker_rpc.WORKER_METHODS["plm_settings_set"](
+        {"path": str(project), "auto_commit": False}, _emit)
+    assert setr["ok"] and setr["auto_commit"] is False
+    again = worker_rpc.WORKER_METHODS["plm_settings_get"](
+        {"path": str(project)}, _emit)
+    assert again["auto_commit"] is False
+
+
+def test_record_outside_noop_when_clean(project):
+    out = worker_rpc.WORKER_METHODS["plm_record_outside"](
+        {"path": str(project)}, _emit)
+    assert out["ok"] is True and out["committed"] is False
+
+
+def test_record_outside_commits_disk_change(project):
+    _write(project, "Bracket.step+", _part(wall=9.0))  # external re-save
+    out = worker_rpc.WORKER_METHODS["plm_record_outside"](
+        {"path": str(project)}, _emit)
+    assert out["ok"] is True and out["committed"] is True
+    assert out["commit"]
+    # a second call with no further change no-ops
+    out2 = worker_rpc.WORKER_METHODS["plm_record_outside"](
+        {"path": str(project)}, _emit)
+    assert out2["committed"] is False
+
+
+def test_record_outside_tracks_new_container(project):
+    _write(project, "Plate.step+",
+           {"schema": "aicad.part/1", "id": "uuid-part-2", "name": "Plate",
+            "features": []})
+    out = worker_rpc.WORKER_METHODS["plm_record_outside"](
+        {"path": str(project)}, _emit)
+    assert out["committed"] is True
+    st = worker_rpc.WORKER_METHODS["plm_status"]({"path": str(project)}, _emit)
+    assert any(it["path"] == "Plate.step+" for it in st["items"])
+
+
+def test_repack_after_many_saves(project):
+    for i in range(30):
+        _write(project, "Bracket.step+", _part(wall=float(i)))
+        r = worker_rpc.WORKER_METHODS["plm_save"]({"path": str(project)}, _emit)
+        assert r["ok"], r
+    packs = list((project / ".aicadvault").rglob("*.pack"))
+    assert packs, "expected a packfile after >= 25 auto-commits"

@@ -76,6 +76,23 @@ def _with_vault(params: dict, fn: Callable[[Any], dict]) -> dict:
                 "hint": f"{type(e).__name__}: {e}"}
 
 
+# Anti-bulk: loose git objects don't delta-compress until packed. Under frequent
+# auto-commits they accumulate, so pack every _REPACK_EVERY commits.
+_REPACK_EVERY = 25
+_commit_count = 0
+
+
+def _bump_and_maybe_repack(v: Any) -> None:
+    """Count a fresh commit; pack loose objects when the threshold is reached."""
+    global _commit_count
+    _commit_count += 1
+    if _commit_count >= _REPACK_EVERY:
+        _commit_count = 0
+        try:
+            v.repack()
+        except Exception:  # noqa: BLE001 — packing never blocks a save
+            pass
+
 # ---------------------------------------------------------------------------
 # core surface (MCP twins)
 # ---------------------------------------------------------------------------
@@ -83,6 +100,7 @@ def _with_vault(params: dict, fn: Callable[[Any], dict]) -> dict:
 def _plm_open(params: dict, _emit: Callable) -> dict:
     """Open (auto-creating) the vault for a project folder — zero-config."""
     def run(v: Any) -> dict:
+        v.repack()  # pack loose objects once on open (long-lived accumulation)
         m = v.manifest()
         return {"ok": True, "project_id": m["project"]["id"], "manifest": m}
     return _with_vault(params, run)
@@ -142,6 +160,7 @@ def _plm_save(params: dict, _emit: Callable) -> dict:
 
     def run(v: Any) -> dict:
         res = v.save(kind)
+        _bump_and_maybe_repack(v)
         return {"ok": True, "commit": res["commit"], "entry": res["entry"]}
     return _with_vault(params, run)
 
@@ -151,6 +170,7 @@ def _plm_checkpoint(params: dict, _emit: Callable) -> dict:
     def run(v: Any) -> dict:
         res = v.checkpoint(str((params or {}).get("message", "") or ""),
                            item_id=(params or {}).get("item_id") or None)
+        _bump_and_maybe_repack(v)
         return {"ok": True, "commit": res["commit"], "entry": res["entry"]}
     return _with_vault(params, run)
 
@@ -283,20 +303,51 @@ def _plm_overview(params: dict, _emit: Callable) -> dict:
 
 
 def _plm_settings_get(params: dict, _emit: Callable) -> dict:
-    """Per-machine vault-local settings (visible columns, last page, …)."""
+    """Per-machine vault-local settings + the project auto-record flag."""
     def run(v: Any) -> dict:
-        return {"ok": True, "settings": v.get_local_config()}
+        return {"ok": True, "settings": v.get_local_config(),
+                "auto_commit": v.auto_commit()}
     return _with_vault(params, run)
 
 
 def _plm_settings_set(params: dict, _emit: Callable) -> dict:
-    """Merge a patch into the vault-local settings."""
+    """Merge a patch into the vault-local settings; set ``auto_commit`` when given."""
     def run(v: Any) -> dict:
-        patch = (params or {}).get("settings")
-        if not isinstance(patch, dict):
-            return {"ok": False, "reason": "invalid_mode",
-                    "hint": "settings must be an object"}
-        return {"ok": True, "settings": v.set_local_config(patch)}
+        p = params or {}
+        if "auto_commit" in p:
+            v.set_auto_commit(bool(p.get("auto_commit")))
+        patch = p.get("settings")
+        settings = v.get_local_config()
+        if patch is not None:
+            if not isinstance(patch, dict):
+                return {"ok": False, "reason": "invalid_mode",
+                        "hint": "settings must be an object"}
+            settings = v.set_local_config(patch)
+        return {"ok": True, "settings": settings, "auto_commit": v.auto_commit()}
+    return _with_vault(params, run)
+
+
+def _plm_record_outside(params: dict, _emit: Callable) -> dict:
+    """Capture on-disk changes made outside the editor (e.g. files copied in, an
+    external tool re-saved a part) as one auto history entry. No-op when the
+    working tree already matches history — returns ``committed:false``."""
+    def run(v: Any) -> dict:
+        m = v.manifest()
+        tracked = {it["path"] for it in m.get("items", [])}
+        # unregistered containers = new files not yet in the manifest
+        try:
+            on_disk = {p.relative_to(v.project_dir).as_posix()
+                       for p in v._project_containers()}
+        except Exception:  # noqa: BLE001
+            on_disk = set()
+        new_containers = on_disk - tracked
+        dirty = v.status().get("dirty") or []
+        if not dirty and not new_containers:
+            return {"ok": True, "committed": False}
+        res = v.save("auto")
+        _bump_and_maybe_repack(v)
+        return {"ok": True, "committed": True,
+                "commit": res["commit"], "entry": res["entry"]}
     return _with_vault(params, run)
 
 
@@ -698,6 +749,7 @@ WORKER_METHODS = {
     "plm_overview": _plm_overview,
     "plm_settings_get": _plm_settings_get,
     "plm_settings_set": _plm_settings_set,
+    "plm_record_outside": _plm_record_outside,
     "plm_scheme_set": _plm_scheme_set,
     "plm_discard_draft": _plm_discard_draft,
     "plm_draft": _plm_draft,

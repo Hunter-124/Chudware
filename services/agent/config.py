@@ -661,6 +661,10 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
         raise OfflineModeError(
             f"offline mode is enabled (config '{OFFLINE_SETTING}': true): the xAI "
             f"cloud provider is refused. Use a local (loopback) model server instead.")
+    if offline and name == "moonshot":
+        raise OfflineModeError(
+            f"offline mode is enabled (config '{OFFLINE_SETTING}': true): the Moonshot (Kimi) "
+            f"cloud provider is refused. Use a local (loopback) model server instead.")
     if offline and name in ("anthropic", "openai") and name != "":
         if name == "anthropic":
             raise OfflineModeError(
@@ -825,6 +829,36 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
             supports_vision=bool(vision),
             timeout=float(xc.get("timeout", 120.0)),
             base_url=xc.get("base_url") or BASE_URL,
+        )
+        return _attach_catalog_meta(prov, caps)
+
+    if name == "moonshot":
+        # Moonshot AI (Kimi K3) — OpenAI-compatible at https://api.moonshot.ai/v1.
+        # Key precedence mirrors openrouter: cfg.moonshot.api_key / cfg.api_key /
+        # keys.moonshot / MOONSHOT_API_KEY.
+        from .providers.moonshot_provider import MoonshotProvider, DEFAULT_MODEL, BASE_URL
+
+        mc = cfg.get("moonshot", {}) or {}
+        keys_map = cfg.get("keys") or {}
+        key = (
+            (mc.get("api_key") if isinstance(mc, dict) else None)
+            or cfg.get("api_key")
+            or (keys_map.get("moonshot") if isinstance(keys_map, dict) else None)
+            or os.environ.get("MOONSHOT_API_KEY")
+        )
+        if not key:
+            raise ValueError(
+                "moonshot provider requires an API key "
+                "(config moonshot.api_key / keys.moonshot / MOONSHOT_API_KEY)")
+        model = cfg.get("model", DEFAULT_MODEL)
+        caps = _catalog_caps("moonshot", model, cfg)
+        vision = mc["vision"] if isinstance(mc, dict) and "vision" in mc else caps.get("vision", True)
+        prov = MoonshotProvider(
+            api_key=key,
+            model=model,
+            supports_vision=bool(vision),
+            timeout=float(mc.get("timeout", 300.0)) if isinstance(mc, dict) else 300.0,
+            base_url=mc.get("base_url") or BASE_URL,
         )
         return _attach_catalog_meta(prov, caps)
 

@@ -76,6 +76,7 @@ _COST_CLASS: dict[str, int] = {
     "anthropic": 5,
     "openai": 5,
     "gemini": 5,
+    "moonshot": 5,   # Kimi K3 metered frontier ($3/$15 per 1M)
     "openrouter": 4,  # free models may override via model id suffix
     "mock": 0,
 }
@@ -1087,6 +1088,11 @@ def _enabled_providers(cfg: Mapping[str, Any] | None) -> list[dict[str, str]]:
         _add("gemini", str((cfg.get("gemini") or {}).get("model") or "gemini-2.5-pro"))
     if (cfg.get("xai") or {}).get("api_key") or cfg.get("xai_api_key"):
         _add("xai", str((cfg.get("xai") or {}).get("model") or "grok-4.5"))
+    keys_map = cfg.get("keys") or {}
+    if (cfg.get("moonshot") or {}).get("api_key") or (
+        isinstance(keys_map, Mapping) and keys_map.get("moonshot")
+    ):
+        _add("moonshot", str((cfg.get("moonshot") or {}).get("model") or "kimi-k3"))
 
     sub = cfg.get("subscription_auth") or {}
     if isinstance(sub, Mapping):

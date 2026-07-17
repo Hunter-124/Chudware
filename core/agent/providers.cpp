@@ -1225,30 +1225,46 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
         return finish(std::move(res));
     }
 
-    // OpenAI-compatible family: openai / llamacpp / xai / xai-sub.
+    // OpenAI-compatible family: openai / llamacpp / xai / xai-sub / moonshot.
     // billet's Python XAISubProvider posts to /v1/chat/completions with Bearer
     // (OAuth access_token or API key). C++ never refreshes OAuth tokens.
     if (provider == "openai" || provider == "llamacpp" || provider == "xai" ||
-        provider == "xai-sub") {
+        provider == "xai-sub" || provider == "moonshot") {
         std::string def = (provider == "llamacpp") ? std::string("local-gguf")
                           : (provider == "xai" || provider == "xai-sub")
                               ? std::string("grok-4.5")
-                              : std::string(kOpenAIDefaultModel);
+                              : (provider == "moonshot") ? std::string("kimi-k3")
+                                                         : std::string(kOpenAIDefaultModel);
         std::string model = str_or(cfg, "model", def);
         if (model == "grok-4-5") model = "grok-4.5";  // normalize hyphen alias
+        // Moonshot (Kimi K3): the API accepts only `kimi-k3`. `kimi-k3-256k` is our
+        // context-capped profile (see moonshot_provider.py) — normalize to the wire id.
+        if (provider == "moonshot" &&
+            (model == "kimi-k3-256k" || model == "kimi-k3-1m" || model == "kimi-latest" ||
+             model == "moonshotai/kimi-k3"))
+            model = "kimi-k3";
         if ((provider == "xai" || provider == "xai-sub") && base_url.empty())
             base_url = "https://api.x.ai/v1";
+        if (provider == "moonshot" && base_url.empty())
+            base_url = "https://api.moonshot.ai/v1";
         if (api_key.empty() && (provider == "xai" || provider == "xai-sub")) {
             res.error = "xai: missing access_token/api_key (sign in via Settings → Accounts)";
             res.model = model;
             res.endpoint = base_url.empty() ? "https://api.x.ai/v1" : base_url;
             return finish(std::move(res));
         }
+        if (api_key.empty() && provider == "moonshot") {
+            res.error = "moonshot: missing api_key (config keys.moonshot / MOONSHOT_API_KEY)";
+            res.model = model;
+            res.endpoint = base_url.empty() ? "https://api.moonshot.ai/v1" : base_url;
+            return finish(std::move(res));
+        }
         BuiltRequest req = openai_build_request(model, system, messages, max_tokens, base_url);
         const char* err_name =
             (provider == "xai" || provider == "xai-sub")
                 ? (provider == "xai-sub" ? "xai-sub" : "xai")
-                : "openai";
+                : (provider == "moonshot") ? "moonshot"
+                                           : "openai";
         // STREAM the completion: token deltas flow continuously so the idle timeout
         // never kills a long-but-active generation (the old 120s hard-cap death), and
         // each delta is forwarded live to the run's sink. openai_build_request stays

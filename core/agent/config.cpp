@@ -28,6 +28,7 @@ int default_context_window(const std::string& name) {
     if (name == "anthropic" || name == "anthropic-sub") return 200000;
     if (name == "gemini") return 1048576;
     if (name == "openai" || name == "xai" || name == "xai-sub") return 128000;
+    if (name == "moonshot") return 1048576;  // Kimi K3 1M window (kimi-k3-256k caps via cfg)
     return 8192;  // local / unknown — conservative
 }
 
@@ -237,7 +238,8 @@ bool provider_offline_safe(const json& provider) {
     if (name == "mock" || name == "mock-roles" || name == "base") return true;
     if (name == "anthropic" || name == "anthropic-sub") return false;
     if (name == "gemini") return false;  // always cloud (generativelanguage API)
-    if (name == "xai" || name == "xai-sub" || name == "cursor" || name == "cursor-sub")
+    if (name == "xai" || name == "xai-sub" || name == "cursor" || name == "cursor-sub" ||
+        name == "moonshot")
         return false;
     std::optional<std::string> base_url;
     if (provider.contains("base_url") && provider["base_url"].is_string())
@@ -271,7 +273,8 @@ json resolve_provider(const std::optional<std::string>& name_arg, const json& cf
 
     // Offline refusals BEFORE constructing anything (security-critical path).
     if (offline && (name == "gemini" || name == "xai" || name == "xai-sub" ||
-                    name == "anthropic-sub" || name == "cursor" || name == "cursor-sub"))
+                    name == "anthropic-sub" || name == "cursor" || name == "cursor-sub" ||
+                    name == "moonshot"))
         return refusal(
             std::string("offline mode is enabled (config '") + kOfflineSetting +
             "': true): the cloud provider '" + name +

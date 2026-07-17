@@ -56,6 +56,21 @@ models:
     rank: 5
     source: shipped
     notes: "mega-16 paid openrouter frontier alias (stem)"
+  - id: kimi-k3
+    provider: moonshot
+    rank: 5
+    source: shipped
+    notes: "Moonshot Kimi K3 flagship (1M ctx, $3/$15); public evals 2026-07"
+  - id: kimi-k3-256k
+    provider: moonshot
+    rank: 5
+    source: shipped
+    notes: "Kimi K3 with a 256k context cap (same wire model, fewer packed tokens)"
+  - id: kimi-k2.6
+    provider: moonshot
+    rank: 4
+    source: shipped
+    notes: "Moonshot Kimi K2.6 (256K ctx, $0.95/$4) — the genuinely cheaper Kimi for lighter assignments"
 
 
   # Rank 4 — strong mid / free strong

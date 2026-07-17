@@ -21,6 +21,11 @@
 #include <unistd.h>
 #endif
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>            // emscripten_sleep
+#include <emscripten/threading.h>  // emscripten_is_main_runtime_thread
+#endif
+
 #include "ipc_discovery.h"
 
 namespace {
@@ -334,7 +339,23 @@ bool EngineClient::pollAlive() {
 
 bool EngineClient::call(const std::string& method, const json& params, json& result,
                         std::string& err, int timeoutMs) {
+#ifdef __EMSCRIPTEN__
+    // Browser MAIN thread: a hard mutex wait would busy-block the event loop, so the
+    // AsyncRpc-worker call currently holding mtx_ can never receive its WS onmessage to
+    // finish and release — permanent deadlock (the "drag the arrow → page freezes/crashes"
+    // class: an interactive main-thread sync call — checkpoint/push_pull probe/revert —
+    // contends mtx_ with an in-flight preview). Spin with emscripten_sleep so the event
+    // loop keeps pumping; the worker drains and releases, then we acquire. Worker/other
+    // threads (which do NOT own the event loop) still hard-block normally.
+    std::unique_lock<std::mutex> lk(mtx_, std::defer_lock);
+    if (emscripten_is_main_runtime_thread()) {
+        while (!lk.try_lock()) emscripten_sleep(1);
+    } else {
+        lk.lock();
+    }
+#else
     std::lock_guard<std::mutex> lk(mtx_);
+#endif
     if ((!conn_.valid() || conn_.eof()) && !reconnectLocked(err)) return false;
     const int id = nextId_++;
     json req = {{"id", id}, {"method", method}, {"params", params}};

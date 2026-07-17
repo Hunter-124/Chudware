@@ -1245,43 +1245,53 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
             return finish(std::move(res));
         }
         BuiltRequest req = openai_build_request(model, system, messages, max_tokens, base_url);
-        for (auto& h : req.headers)
-            if (h.first == "Authorization")
-                h.second = "Bearer " + (api_key.empty() ? std::string("not-needed") : api_key);
         const char* err_name =
             (provider == "xai" || provider == "xai-sub")
                 ? (provider == "xai-sub" ? "xai-sub" : "xai")
                 : "openai";
         // STREAM the completion: token deltas flow continuously so the idle timeout
         // never kills a long-but-active generation (the old 120s hard-cap death), and
-        // each delta is forwarded live to the run's sink for the GUI's continuous
-        // output. openai_build_request stays pure (parity-tested); we add stream:true
-        // to the built body only here.
+        // each delta is forwarded live to the run's sink. openai_build_request stays
+        // pure (parity-tested); stream:true is added to the built body only here.
         json sbody = req.body_json;
         sbody["stream"] = true;
         const std::string stream_body = sbody.dump();
-        std::vector<std::pair<std::string, std::string>> sheaders = req.headers;
-        sheaders.push_back({"Accept", "text/event-stream"});
+        // Keys to try: the resolved api_key first, then any signed-in fallback accounts
+        // (xai-sub multi-account rotation on a 403 Heavy-only tier gate). Read-only.
+        std::vector<std::string> keys = {api_key.empty() ? std::string("not-needed") : api_key};
+        if (cfg.contains("fallback_api_keys") && cfg["fallback_api_keys"].is_array())
+            for (const auto& k : cfg["fallback_api_keys"])
+                if (k.is_string() && !k.get<std::string>().empty())
+                    keys.push_back(k.get<std::string>());
         SseAccum acc;
         auto& delta_emit = g_provider_delta_emitter;
         HttpChunkCb on_chunk = [&](const char* data, size_t len) {
             acc.feed(data, len, delta_emit);
         };
-        // Retry transient 429/503 (mirrors http_post_retry) but only when nothing has
-        // streamed yet — never discard a partially-received completion.
         HttpResponse hr;
         int attempt = 1;
-        int delay_ms = 1000;
-        for (;;) {
-            acc.reset();
-            hr = http_post_stream(req.url, sheaders, stream_body, on_chunk);
-            const bool streamed = !acc.text.empty() || !acc.thinking.empty();
-            const bool retryable = hr.error.empty() && !streamed &&
-                                   (hr.status == 429 || hr.status == 503);
-            if (!retryable || attempt >= 5 || is_daily_quota_exhausted(hr)) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
-            delay_ms *= 2;
-            ++attempt;
+        for (size_t ki = 0; ki < keys.size(); ++ki) {
+            std::vector<std::pair<std::string, std::string>> sheaders = req.headers;
+            for (auto& h : sheaders)
+                if (h.first == "Authorization") h.second = "Bearer " + keys[ki];
+            sheaders.push_back({"Accept", "text/event-stream"});
+            int delay_ms = 1000;
+            for (;;) {  // transient 429/503 backoff (only while nothing has streamed)
+                acc.reset();
+                hr = http_post_stream(req.url, sheaders, stream_body, on_chunk);
+                const bool streamed_now = !acc.text.empty() || !acc.thinking.empty();
+                const bool retryable = hr.error.empty() && !streamed_now &&
+                                       (hr.status == 429 || hr.status == 503);
+                if (!retryable || attempt >= 5 || is_daily_quota_exhausted(hr)) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+                delay_ms *= 2;
+                ++attempt;
+            }
+            const bool streamed_now = !acc.text.empty() || !acc.thinking.empty();
+            const bool tier_gate = !streamed_now && hr.status == 403 &&
+                                   hr.body.find("denied") != std::string::npos;
+            if (tier_gate && ki + 1 < keys.size()) continue;  // rotate to next account
+            break;
         }
         const bool streamed = !acc.text.empty() || !acc.thinking.empty();
         res.endpoint = req.url;

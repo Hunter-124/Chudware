@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
+#include <vector>
 
 #include "agent/paths.h"
 #include "agent/state.h"  // kContextTokenCap (the lean input-cap ceiling for big windows)
@@ -59,6 +60,38 @@ std::string subscription_access_token(const json& cfg, const char* provider_id) 
     if (entry.contains("access_token") && entry["access_token"].is_string())
         return entry["access_token"].get<std::string>();
     return {};
+}
+
+// All access tokens for *provider_id*, ACTIVE account first, for 403/tier-gate
+// rotation. Read-only (no refresh); complete() tries the next signed-in account when
+// one returns a permission-denied (Heavy-only tier gate).
+std::vector<std::string> all_subscription_access_tokens(const json& cfg, const char* provider_id) {
+    std::vector<std::string> out;
+    if (!cfg.is_object() || !cfg.contains("subscription_auth") ||
+        !cfg["subscription_auth"].is_object())
+        return out;
+    const json& sa = cfg["subscription_auth"];
+    auto it = sa.find(provider_id);
+    if (it == sa.end() || !it->is_object()) return out;
+    const json& entry = *it;
+    auto add = [&](const json& ac) {
+        if (ac.is_object() && ac.contains("access_token") && ac["access_token"].is_string()) {
+            std::string t = ac["access_token"].get<std::string>();
+            if (!t.empty() && std::find(out.begin(), out.end(), t) == out.end())
+                out.push_back(t);
+        }
+    };
+    if (entry.contains("accounts") && entry["accounts"].is_object()) {
+        std::string active;
+        if (entry.contains("active") && entry["active"].is_string())
+            active = entry["active"].get<std::string>();
+        auto af = entry["accounts"].find(active);
+        if (af != entry["accounts"].end()) add(*af);  // active first
+        for (auto& [k, v] : entry["accounts"].items()) add(v);
+    } else {
+        add(entry);
+    }
+    return out;
 }
 }  // namespace
 
@@ -432,7 +465,15 @@ json resolve_provider(const std::optional<std::string>& name_arg, const json& cf
             {"supports_vision", true},
             {"api_key", key},
         };
-        if (oauth) desc["auth_mode"] = "oauth";
+        if (oauth) {
+            desc["auth_mode"] = "oauth";
+            // Multi-account fallback: on a 403 tier-gate, complete() rotates to the
+            // next signed-in xai-sub account (read-only; Python owns refresh).
+            json fb = json::array();
+            for (const auto& t : all_subscription_access_tokens(cfg, "xai-sub"))
+                if (t != key) fb.push_back(t);
+            if (!fb.empty()) desc["fallback_api_keys"] = fb;
+        }
     } else if (name == "cursor" || name == "cursor-sub") {
         // Cursor auth is stored (subscription_auth.cursor) but there is NO REST
         // completions transport in C++ or Python — Cursor's agent backend is

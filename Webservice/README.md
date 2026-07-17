@@ -1,4 +1,4 @@
-# Billet Web (scootware.us)
+# Chudware Web (chudware.com)
 
 Browser-native Billet: the ImGui GUI (`host/`) compiled to WASM/Emscripten, served by the
 FastAPI gateway (`gateway/`, uvicorn on 127.0.0.1:8300 behind the `billet-cloudflared`
@@ -22,7 +22,7 @@ attribution.
 ## IP note — before any PUBLIC deployment
 
 The WASM bundle ships the full GUI as downloadable bytecode. Behind the current
-Cloudflare Access whitelist that is acceptable; **revisit before opening scootware.us
+Cloudflare Access whitelist that is acceptable; **revisit before opening chudware.com
 to the general public** (options: keep Access-gated, obfuscate/split, or move rendering
 server-side). The engine itself stays on the server — only the client UI is exposed.
 

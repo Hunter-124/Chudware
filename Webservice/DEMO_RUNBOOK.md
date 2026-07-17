@@ -11,12 +11,11 @@
 Use this exact URL (bookmark it):
 
 ```
-https://cad.scootware.us/app/
+https://chudware.com/app/
 ```
 
 Notes:
 
-- Apex `https://scootware.us/app/` **301s to** `https://cad.scootware.us/` (root, **not** `/app`). Do not send stakeholders to apex.
 - Local fallback (no CF Access):  
   `http://127.0.0.1:8399/app/?dev_user=haedmonds69@gmail.com`  
   (dev uvicorn with `BILLET_WEB_DEV=1` only — not the public path.)
@@ -25,8 +24,8 @@ Notes:
 
 ## Login (Cloudflare Access)
 
-1. Open `https://cad.scootware.us/app/` in **Chrome** (preferred) or Firefox.
-2. Cloudflare Access interstitial: **Sign in · Cloudflare Access** for host `cad.scootware.us`.
+1. Open `https://chudware.com/app/` in **Chrome** (preferred) or Firefox.
+2. Cloudflare Access interstitial: **Sign in · Cloudflare Access** for host `chudware.com`.
 3. Authenticate with an allowlisted email (OTP and/or Google IdP if configured).
    - Hunter admin emails: `haedmonds69@gmail.com`, `haedmonds@crimson.ua.edu`
    - Allowlist lives in `~/billet-web-data/users.yaml` and CF Access policy `billet-users`.
@@ -95,8 +94,8 @@ curl -sI -X GET 'http://127.0.0.1:8399/app/Billet.wasm?dev_user=haedmonds69@gmai
 #   content-type: application/wasm   (for Billet.wasm)
 
 # 4) Public path reaches Access (unauthenticated)
-curl -sI https://cad.scootware.us/app/ | head -15
-# Expect 302 → bruh234324.cloudflareaccess.com/.../login/cad.scootware.us
+curl -sI https://chudware.com/app/ | head -15
+# Expect 302 → bruh234324.cloudflareaccess.com/.../login/chudware.com
 ```
 
 Bundle on disk (served from `BILLET_WEB_APP_DIR` default `~/billet-web/app/`):

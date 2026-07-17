@@ -8,7 +8,7 @@ writes TUNNEL token / team domain / AUD into the gateway env file.
 Secrets: reads the API token from $CF_API_TOKEN or Webservice/Cloudflare-info.txt
 (gitignored). Writes secrets ONLY to ~/billet-web-data/gateway.env (0600).
 
-Usage: python3 cf_provision.py [--hostname cad.scootware.us] [--emails a@x,b@y]
+Usage: python3 cf_provision.py [--hostname chudware.com] [--emails a@x,b@y]
 """
 
 from __future__ import annotations
@@ -71,7 +71,7 @@ ACCESS_DOMAINS = ["ua.edu", "crimson.ua.edu"]
 # One app => one AUD => the gateway's single BILLET_WEB_CF_AUD keeps validating; a
 # separate per-domain app would mint a different AUD and break JWT validation. So new
 # public domains go HERE (added to the app's self_hosted_domains), never as a new app.
-EXTRA_HOSTS = ["chudware.com", "www.chudware.com"]
+EXTRA_HOSTS = ["www.chudware.com"]
 
 
 def _include_list(emails: list[str]) -> list[dict]:
@@ -144,7 +144,7 @@ def sync_users(host: str) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--hostname", default="cad.scootware.us")
+    ap.add_argument("--hostname", default="chudware.com")
     ap.add_argument("--emails", default="haedmonds69@gmail.com",
                     help="comma-separated allowlist for the Access policy")
     ap.add_argument("--sync-users", action="store_true",

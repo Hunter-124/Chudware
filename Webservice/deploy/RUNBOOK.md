@@ -1,7 +1,7 @@
 # billet-web RUNBOOK (Hunter)
 
 Host: Fedora 44, rootless podman, gateway `127.0.0.1:8300`, data `~/billet-web-data/`.
-Public: `https://cad.scootware.us` via Cloudflare Tunnel + Access.
+Public: `https://chudware.com` via Cloudflare Tunnel + Access.
 
 ---
 
@@ -13,7 +13,7 @@ Public: `https://cad.scootware.us` via Cloudflare Tunnel + Access.
 
 1. **Cloudflare API token**
    - Dashboard → My Profile → API Tokens → find/revoke the leaked token.
-   - Create a replacement with least privilege needed for `cf_provision.py` (Access apps, tunnels, DNS on `scootware.us`).
+   - Create a replacement with least privilege needed for `cf_provision.py` (Access apps, tunnels, DNS on `chudware.com`).
    - Store the new token **only** outside git (password manager / `~/billet-web-data/secrets/`). Never re-commit.
 
 2. **R2 Access Key ID + Secret**
@@ -50,10 +50,10 @@ Do **not** hand-create these if provision already ran:
 | Zero Trust org | exists |
 | Team domain | `https://bruh234324.cloudflareaccess.com` |
 | One-Time PIN IdP | already enabled |
-| Zone | `scootware.us` active |
+| Zone | `chudware.com` active |
 | Tunnel | `billet-web` (remotely-managed) |
-| Public hostname | `cad.scootware.us` → `http://127.0.0.1:8300` (WSS over same HTTPS) |
-| Access application | self-hosted app for `cad.scootware.us` |
+| Public hostname | `chudware.com` → `http://127.0.0.1:8300` (WSS over same HTTPS) |
+| Access application | self-hosted app for `chudware.com` |
 
 `cf_provision.py` is **driver-owned** and lands beside these deploy files — DeployOps does not implement it. It should write into **`~/billet-web-data/gateway.env`** (never committed):
 
@@ -125,7 +125,7 @@ users:
 - [ ] Optional warm seat: start one session as admin, leave idle for fast first guest.
 - [ ] `curl -sS http://127.0.0.1:8300/healthz` — sessions, free RAM, VRAM, image bit look sane.
 - [ ] Access allowlist + `users.yaml` include every demo attendee email.
-- [ ] Browser smoke: `https://cad.scootware.us` → Access challenge → portal → stream iframe.
+- [ ] Browser smoke: `https://chudware.com` → Access challenge → portal → stream iframe.
 - [ ] Know the “not on the list” path (Access deny vs portal allowlist page).
 - [ ] Confirm `REFUSE_NEW` is absent unless disk is actually critical: `ls ~/billet-web-data/REFUSE_NEW`.
 
@@ -207,7 +207,7 @@ sudo loginctl enable-linger "$USER"
 
 ### /admin live ops (added post-v1)
 
-`https://cad.scootware.us/admin` (admin role) now shows, above the allowlist:
+`https://chudware.com/admin` (admin role) now shows, above the allowlist:
 
 - **Live sessions** — per seat: screenshot thumbnail (refreshes ~10 s), status,
   uptime, idle, CPU/mem (`podman stats`), and a **Stop** button. **Click a

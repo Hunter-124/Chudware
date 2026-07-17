@@ -916,6 +916,22 @@ void refresh_sketch_external_refs(json& doc, CompileCache* cache = nullptr);
 void refresh_sketch3d_external_refs(json& doc, CompileCache* cache = nullptr);
 void op_sketch_delete_entity(json& doc, const json& op, const json& id_map);
 
+// Sketch entities/constraints take PLAIN numbers, but models often wrap scalars as
+// {"value":N,"expr":null} (the feature-param convention) -> "must be a number"
+// validation rejects. Unwrap that exact shape to the bare number, recursively, so both
+// conventions validate identically. Only the {value:number(,expr)} shape is unwrapped.
+void unwrap_value_scalars(json& j) {
+    if (j.is_object()) {
+        if (j.contains("value") && j["value"].is_number() &&
+            (j.size() == 1 || (j.size() == 2 && j.contains("expr")))) {
+            j = j["value"];
+            return;
+        }
+        for (auto& el : j.items()) unwrap_value_scalars(el.value());
+    } else if (j.is_array()) {
+        for (auto& el : j) unwrap_value_scalars(el);
+    }
+}
 void op_sketch_add_entity(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
     json& sk = require_sketch_feature(doc, op, id_map);
     json ent;
@@ -934,6 +950,7 @@ void op_sketch_add_entity(json& doc, const json& op, std::size_t idx, IdGen& gen
         throw OpError("invalid_op",
                       "sketch_add_entity: 'entity' object (or a top-level 'type') required");
     }
+    unwrap_value_scalars(ent);  // accept {value:N} scalars in sketch entities
 
     // Leniency for weak local models: a spline's points sometimes arrive DOUBLE-WRAPPED as
     // [[[x,y],[x,y],...]] (one extra array level). Unwrap that single wrapping so the curve
@@ -1117,6 +1134,7 @@ void op_sketch_add_constraint(json& doc, const json& op, std::size_t idx, IdGen&
         throw OpError("invalid_op",
                       "sketch_add_constraint: 'constraint' object (or a top-level 'type') required");
     }
+    unwrap_value_scalars(c);  // accept {value:N} scalars in sketch constraints
     resolve_placeholders_deep(c, id_map);
     const std::string cid = gen.next("c");
     c["id"] = cid;

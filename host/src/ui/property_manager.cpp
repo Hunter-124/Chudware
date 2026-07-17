@@ -33,6 +33,11 @@ namespace ui {
 
 // C37-F: Debounce window for live preview (was 0.40 s; reduced for snappier feel).
 static const double kDebounceSec = 0.25;
+// A live drag/keystroke preview is disposable: cap its engine round-trip so a pathological or
+// very slow rebuild can't freeze the form — or machine-gun the shared daemon — for the full 120 s
+// default. On timeout the preview drops to an inline error and the GUI stays responsive; the
+// OK/commit path (committing_) keeps the patient default so a real commit never aborts early.
+static const int kPreviewTimeoutMs = 20000;
 
 // ---- Phase 4: daemon edit-hold helpers (no-ops in legacy in-process mode) ----
 // Take/refresh the exclusive edit-hold on `docId` so foreign clients (MCP
@@ -2368,6 +2373,8 @@ bool PropertyManager::applyPreview(AppState& st) {
     ++st.rebuildsInFlight;
     const bool coalesce = previewUndoGroupStarted_;
     const bool blendCap = blend;
+    // Disposable live preview -> short timeout; a genuine commit -> patient default (never abort).
+    const int timeoutMs = committing_ ? 120000 : kPreviewTimeoutMs;
     st.docMirror.applyOpsAsync(st.rpc, st.worker, ops,
         [this, &st, blendCap](const core::OpsResponse& resp, bool applied) {
             previewInFlight_ = false;
@@ -2427,7 +2434,7 @@ bool PropertyManager::applyPreview(AppState& st) {
                     }
                 }
             }
-        }, coalesce);
+        }, coalesce, timeoutMs);
     return true;
 }
 

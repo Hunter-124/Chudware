@@ -556,6 +556,7 @@ struct DimDrag {
     double      oldValue = 0.0;       // value before the drag
     double      curValue = 0.0;       // current applied value
     double      lastApplied = 1e30;   // last value actually sent (skip dup samples)
+    double      lastFireT = -1e9;     // last time a drag sample fired a preview (rate throttle)
     bool        clamped  = false;     // last sample hit the min/range clamp
     ImVec2      pressPos = {0, 0};    // screen pos at press (drag origin)
     float       dsx = 0, dsy = 0;     // unit screen-space drag direction (value grows along this)
@@ -3103,18 +3104,26 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                         if (newVal < lo)    { newVal = lo;    s_dim.clamped = true; }
                     }
                     s_dim.curValue = newVal;
-                    // Throttle: only update the PM field when the value moved enough to matter (angles
-                    // a touch coarser). The PM's debounced preview rebuilds from the field. Auto-flip
-                    // also pushes when the Reverse checkbox must change.
+                    // Throttle: push to the PM field (which fires a live-preview rebuild) only when
+                    // the value moved enough to matter (angles a touch coarser) AND at most ~20 Hz.
+                    // Each field write backdates the PM debounce to rebuild immediately; on the shared
+                    // daemon an unthrottled drag machine-guns edit_feature rebuilds (one-in-flight only
+                    // bounds concurrency, not rate), so a slow rebuild stacks into multi-second stalls.
+                    // A flip toggle bypasses the rate gate (direction must feel instant); the release
+                    // always pushes the final value (below), so the committed depth is never throttled off.
+                    const double nowT = ImGui::GetTime();
                     double thresh = s_dim.angle ? 0.25 : 0.05;
                     bool flipChanged = s_dim.autoFlip && (s_dim.curFlip != s_dim.lastFlipApplied);
-                    if (flipChanged || std::fabs(newVal - s_dim.lastApplied) >= thresh) {
+                    bool moved  = std::fabs(newVal - s_dim.lastApplied) >= thresh;
+                    bool rateOk = (nowT - s_dim.lastFireT) >= 0.05;   // ~20 previews/sec ceiling
+                    if (flipChanged || (moved && rateOk)) {
                         bool ok = st.propertyManager->dragSetDim(s_dim.param, newVal);
                         if (ok && s_dim.autoFlip)
                             st.propertyManager->dragSetCheck("flip", s_dim.curFlip);
                         if (ok) {
                             s_dim.lastApplied = newVal;
                             s_dim.lastFlipApplied = s_dim.curFlip;
+                            s_dim.lastFireT = nowT;
                         }
                     }
                 }

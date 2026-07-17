@@ -150,7 +150,9 @@ Per-doc locking (T-PERF5 `DocLock`) means a pathological rebuild wedges only its
 genuinely-hung interactive rebuild was unrecoverable without a manual `aicad-hostd --stop --force`.
 `core/hostd/server.cpp` now tracks the in-flight engine RPC per client thread; a background thread
 force-restarts the daemon (`std::_Exit(70)` → systemd `Restart=on-failure`, ~2 s) if a WATCHDOGGED
-call exceeds the ceiling (default 180 s, env `AICAD_HOSTD_ENGINE_WATCHDOG_S`, 0=off). Only fast
+call exceeds the ceiling (default **90 s** — above any healthy interactive rebuild yet below the
+120 s client RPC timeout, so a wedge self-heals before the client shows a raw timeout; env
+`AICAD_HOSTD_ENGINE_WATCHDOG_S`, 0=off). Only fast
 interactive RPCs are guarded (`doc_apply_ops`/`rebuild`/`undo`/`redo`/`activate`/`regen`); long-
 running RPCs (`run_fea_*`/`run_cfd_*`/`agent_*`/`cam_*`/`export_*`/`import_*`/`doc_open`/`doc_save`/
 `reverse_*`) are exempt (`engine_watchdog.h` policy). Recovery is explicit/user-gated (orphan tier)
@@ -158,11 +160,23 @@ and `stepplus_save` is atomic (tmp+replace), so the restart cannot auto-replay-l
 recovery data. Verified: unit test + end-to-end (6 s stall self-heals at 2.09 s vs a 2 s ceiling;
 500 ms stall returns ok, daemon survives).
 
-**DEFERRED — root-cause the slow rebuild itself (engine).** The watchdog is a safety net, not a
-cure: the specific rebuild is pathologically slow. Repro recipe: box + through-hole, sketch a
-circle on the top face, extrude it as a **Boss ("Whole sketch")** with **Reverse direction**, sweep
-the depth across ~10→26 mm. Suspect an OCCT boolean pathology when the boss face lands coincident
-with an existing face (depth == wall thickness) — the classic coplanar-face fuse slow path. Fixing
-it (or bounding it inside `compile_document`) would stop the freeze at the source so the watchdog
-never has to fire.
+**ROOT-CAUSED — it was NOT a slow rebuild.** Recovered the actual failing doc from the billetweb
+crash-orphan autosave (`~/.local/share/AI-CAD/hostd_autosave/billetweb/orphaned/…-doc-cpp00000003.step+`):
+two features — a sketch (rectangle + a concentric non-construction circle → an annular region) on
+`plane.top`, and a `flip` boss `extrude` at depth 25.7 (a block with a through-hole; the screenshot
+"ellipses" are the depth-drag manipulator ring + the hole, not a slow feature). The cached rebuild
+was **0.74 ms**. Replaying the exact tree in an isolated daemon and sweeping depth 0.5→30 mm @0.25
+(and 40 rapid edits) → **max 5 ms, zero slow rebuilds**. So the coplanar/coincident-face hypothesis
+is **falsified**; this geometry is trivial at every depth.
+
+The 120 s the user saw was the **client RPC timeout on an in-flight `doc_apply_ops` that the daemon
+never answered** — the orphaned session shows the daemon crashed/restarted mid-drag. Trivial
+geometry (0.74 ms) cannot produce a 120 s compute; an unanswered call across a daemon disconnect
+can. The relevant fixes are the ones already shipped: the shutdown SIGABRT crash-fix (removes the
+30 s join-hang that delayed EOF propagation), the watchdog (restarts a truly-wedged daemon so its
+socket closes → gateway closes the WS → client fast-fails), and the client drag throttle + short
+preview timeout. The wasm transport already fails a pending `readLine` the moment the WS closes
+(`ipc_transport_wasm.cpp` eof/closed check), and the gateway already closes the WS on daemon EOF
+(`engine_bridge.py` `daemon_to_ws` break → `ws.close(1012)`). Remaining possible hardening (not
+yet needed): a gateway heartbeat to detect a daemon that is alive-but-silent WITHOUT a socket EOF.
 

@@ -120,7 +120,12 @@ private:
     std::mutex inflightMtx_;
     std::map<int, InflightCall> inflight_;   // clientId -> current engine call (absent = idle)
     std::thread watchdog_;
-    long long engineWatchdogMs_ = 180000;    // 0 = disabled (env AICAD_HOSTD_ENGINE_WATCHDOG_S)
+    // 90s: safely above any healthy interactive rebuild (they're milliseconds — a pathological
+    // one could not even be reproduced) yet BELOW the 120s client RPC timeout, so a wedged
+    // interactive op self-heals (restart -> socket close -> gateway closes the WS) before the
+    // client gives up with a raw "engine call timed out" — the client reconnects instead.
+    // 0 = disabled. Env override: AICAD_HOSTD_ENGINE_WATCHDOG_S.
+    long long engineWatchdogMs_ = 90000;
 };
 
 }  // namespace hostd

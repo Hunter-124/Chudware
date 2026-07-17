@@ -808,6 +808,14 @@ void op_add_feature(json& doc, const json& op, std::size_t idx, IdGen& gen, json
             if (feat.contains(k) && !env["params"].contains(k)) env["params"][k] = feat[k];
         }
     }
+    // A sketch feature's entities/constraints often arrive at the FEATURE top level rather than
+    // under params — grok emits {feature:{type:sketch, entities:[...], constraints:[...]}} with no
+    // params wrapper ~half the time. The generic option-hoist above skips them, so without this
+    // the sketch is stored EMPTY and dry-run rejects it ("params.entities required for sketch").
+    if (env["type"] == "sketch" && env["params"].is_object()) {
+        for (const char* k : {"entities", "constraints"})
+            if (feat.contains(k) && !env["params"].contains(k)) env["params"][k] = feat[k];
+    }
     // Normalize inline sketch entities the SAME way sketch_add_entity does, so a hexagon /
     // airfoil / {value:N} scalar authored INLINE (grok emits sketches this way ~half the time)
     // expands + validates identically — instead of reaching the geometry kernel as a raw
@@ -949,6 +957,141 @@ void unwrap_value_scalars(json& j) {
         for (auto& el : j) unwrap_value_scalars(el);
     }
 }
+// Normalize + expand ONE inline sketch entity into the concrete entities the geometry kernel
+// understands. Applied on BOTH ingestion paths — the sketch_add_entity op AND a sketch feature's
+// inline params.entities (op_add_feature) — so a hexagon / airfoil / {value:N} scalar builds
+// identically however the model phrases it. Convenience types (airfoil, regular polygon) expand
+// to several lines/splines; any other entity passes through. Every returned entity carries an
+// "id" (the model's own if it supplied one — inline constraints reference it — else a fresh id)
+// and a "construction" flag.
+std::vector<json> expand_sketch_entity(json ent, IdGen& gen) {
+    unwrap_value_scalars(ent);  // accept {value:N} scalars in sketch entities
+
+    // Weak-model shape: a spline's points arrive DOUBLE-WRAPPED [[[x,y],...]] — unwrap one level.
+    if (ent.value("type", std::string()) == "spline" && ent.contains("points") &&
+        ent["points"].is_array() && ent["points"].size() == 1 && ent["points"][0].is_array() &&
+        !ent["points"][0].empty() && ent["points"][0][0].is_array()) {
+        ent["points"] = ent["points"][0];
+    }
+
+    const bool constr = ent.value("construction", false);
+    std::vector<json> out;
+
+    // AIRFOIL convenience entity -> upper + lower splines (+ a trailing-edge line for an open TE).
+    if (ent.value("type", std::string()) == "airfoil") {
+        const std::string naca = ent.value("naca", std::string());
+        const std::string dat = ent.value("dat", std::string());
+        const double chord = ent.value("chord", 100.0);
+        const double aoa = ent.value("aoa", 0.0);
+        const int pts = ent.value("points", 60);
+        const bool closedTE = ent.value("closedTE", true);
+        aicad::geom::AirfoilProfile prof =
+            aicad::geom::airfoil_profile(naca, dat, chord, aoa, pts, closedTE);
+        if (!prof.error.empty()) throw OpError("invalid_op", "airfoil: " + prof.error);
+        if (prof.upper.size() < 2 || prof.lower.size() < 2)
+            throw OpError("invalid_op", "airfoil: profile produced too few points");
+        auto push_spline = [&](const std::vector<std::array<double, 2>>& pl) {
+            json s;
+            s["type"] = "spline";
+            json arr = json::array();
+            for (const auto& q : pl) arr.push_back(json::array({q[0], q[1]}));
+            s["points"] = arr;
+            s["id"] = gen.next("e");
+            s["construction"] = constr;
+            out.push_back(std::move(s));
+        };
+        push_spline(prof.upper);  // LE -> TE (shares the LE point with `lower`)
+        push_spline(prof.lower);  // LE -> TE
+        if (!prof.sharpTE) {      // close the open trailing edge with a short line TE_u -> TE_l
+            json ln;
+            ln["type"] = "line";
+            ln["p1"] = json::array({prof.upper.back()[0], prof.upper.back()[1]});
+            ln["p2"] = json::array({prof.lower.back()[0], prof.lower.back()[1]});
+            ln["id"] = gen.next("e");
+            ln["construction"] = constr;
+            out.push_back(std::move(ln));
+        }
+        return out;
+    }
+
+    // REGULAR POLYGON convenience entity -> N closed line segments (hexagons, nuts, bolt-heads,
+    // prisms). A named n-gon implies its side count; an explicit "sides" overrides. Size from ONE
+    // of across_flats (wrench size) / circumradius / inradius / diameter.
+    {
+        const std::string et = ent.value("type", std::string());
+        auto named_sides = [](const std::string& t) -> int {
+            if (t == "triangle" || t == "equilateral_triangle" || t == "trigon") return 3;
+            if (t == "pentagon")                  return 5;
+            if (t == "hexagon"   || t == "hex")   return 6;
+            if (t == "heptagon"  || t == "septagon") return 7;
+            if (t == "octagon"   || t == "oct")   return 8;
+            if (t == "nonagon"   || t == "enneagon") return 9;
+            if (t == "decagon")                   return 10;
+            if (t == "hendecagon" || t == "undecagon") return 11;
+            if (t == "dodecagon")                 return 12;
+            return 0;
+        };
+        const int named = named_sides(et);
+        if (et == "polygon" || et == "regular_polygon" || et == "ngon" || named > 0) {
+            int n = named;
+            for (const char* k : {"sides", "n", "num_sides", "count"})
+                if (ent.contains(k) && ent[k].is_number_integer()) { n = ent[k].get<int>(); break; }
+            if (n < 3) throw OpError("invalid_op",
+                                     "polygon: needs 'sides' >= 3 (e.g. {\"type\":\"polygon\","
+                                     "\"sides\":6,\"across_flats\":12})");
+            double cx = 0.0, cy = 0.0;
+            if (ent.contains("center") && ent["center"].is_array() && ent["center"].size() >= 2) {
+                cx = ent["center"][0].get<double>();
+                cy = ent["center"][1].get<double>();
+            }
+            auto getnum = [&](std::initializer_list<const char*> keys, double* o) -> bool {
+                for (const char* k : keys)
+                    if (ent.contains(k) && ent[k].is_number()) { *o = ent[k].get<double>(); return true; }
+                return false;
+            };
+            const double apo = std::cos(M_PI / n);  // inradius / circumradius
+            double v = 0.0, R = 0.0;
+            if (getnum({"circumradius", "radius", "r", "vertex_radius"}, &v)) R = v;
+            else if (getnum({"across_flats", "width_across_flats", "af", "wrench", "flats",
+                             "flat_to_flat", "width"}, &v)) R = (v * 0.5) / apo;
+            else if (getnum({"inradius", "apothem"}, &v)) R = v / apo;
+            else if (getnum({"diameter"}, &v)) R = v * 0.5;  // circum-diameter
+            if (!(R > 0.0))
+                throw OpError("invalid_op",
+                              "polygon: needs a size — 'across_flats' (wrench size), 'circumradius', "
+                              "or 'inradius' (mm)");
+            double rot = 0.0;
+            for (const char* k : {"rotation", "angle"})
+                if (ent.contains(k) && ent[k].is_number()) { rot = ent[k].get<double>(); break; }
+            rot *= M_PI / 180.0;
+            std::vector<std::array<double, 2>> verts;
+            for (int i = 0; i < n; ++i) {
+                double a = rot + 2.0 * M_PI * i / n;
+                verts.push_back({cx + R * std::cos(a), cy + R * std::sin(a)});
+            }
+            for (int i = 0; i < n; ++i) {
+                const auto& a = verts[i];
+                const auto& b = verts[(i + 1) % n];
+                json ln;
+                ln["type"] = "line";
+                ln["p1"] = json::array({a[0], a[1]});
+                ln["p2"] = json::array({b[0], b[1]});
+                ln["id"] = gen.next("e");
+                ln["construction"] = constr;
+                out.push_back(std::move(ln));
+            }
+            return out;
+        }
+    }
+
+    // Ordinary entity: keep the model's id if it gave one (inline constraints reference it),
+    // otherwise mint a fresh one; default construction:false.
+    if (!ent.contains("id") || !ent["id"].is_string()) ent["id"] = gen.next("e");
+    else gen.note(ent["id"].get<std::string>());  // record it so an id-less sibling can't collide
+    if (!ent.contains("construction")) ent["construction"] = false;
+    out.push_back(std::move(ent));
+    return out;
+}
 void op_sketch_add_entity(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
     json& sk = require_sketch_feature(doc, op, id_map);
     json ent;
@@ -967,152 +1110,14 @@ void op_sketch_add_entity(json& doc, const json& op, std::size_t idx, IdGen& gen
         throw OpError("invalid_op",
                       "sketch_add_entity: 'entity' object (or a top-level 'type') required");
     }
-    unwrap_value_scalars(ent);  // accept {value:N} scalars in sketch entities
-
-    // Leniency for weak local models: a spline's points sometimes arrive DOUBLE-WRAPPED as
-    // [[[x,y],[x,y],...]] (one extra array level). Unwrap that single wrapping so the curve
-    // builds instead of failing validation. Only fires on the exact double-wrap shape.
-    if (ent.value("type", std::string()) == "spline" && ent.contains("points") &&
-        ent["points"].is_array() && ent["points"].size() == 1 && ent["points"][0].is_array() &&
-        !ent["points"][0].empty() && ent["points"][0][0].is_array()) {
-        ent["points"] = ent["points"][0];
-    }
-
-    // AIRFOIL convenience entity: {type:"airfoil", naca:"2412"|dat:"<path>", chord, aoa,
-    // points, closedTE} expands to the upper-spline + lower-spline (+ a trailing-edge line for
-    // an open TE) — one closed aerofoil loop the agent can extrude/loft. Standard splines from
-    // here on, so downstream (solver, region detect, profile.cpp) needs no airfoil awareness.
-    if (ent.value("type", std::string()) == "airfoil") {
-        const std::string naca = ent.value("naca", std::string());
-        const std::string dat = ent.value("dat", std::string());
-        const double chord = ent.value("chord", 100.0);
-        const double aoa = ent.value("aoa", 0.0);
-        const int pts = ent.value("points", 60);
-        const bool closedTE = ent.value("closedTE", true);
-        aicad::geom::AirfoilProfile prof =
-            aicad::geom::airfoil_profile(naca, dat, chord, aoa, pts, closedTE);
-        if (!prof.error.empty()) throw OpError("invalid_op", "airfoil: " + prof.error);
-        if (prof.upper.size() < 2 || prof.lower.size() < 2)
-            throw OpError("invalid_op", "airfoil: profile produced too few points");
-        const bool constr = ent.value("construction", false);
-        std::vector<std::string> ids;
-        auto push_spline = [&](const std::vector<std::array<double, 2>>& pl) {
-            json s;
-            s["type"] = "spline";
-            json arr = json::array();
-            for (const auto& q : pl) arr.push_back(json::array({q[0], q[1]}));
-            s["points"] = arr;
-            s["id"] = gen.next("e");
-            s["construction"] = constr;
-            ids.push_back(s["id"].get<std::string>());
-            sk["params"]["entities"].push_back(std::move(s));
-        };
-        push_spline(prof.upper);  // LE -> TE (shares the LE point with `lower`)
-        push_spline(prof.lower);  // LE -> TE
-        if (!prof.sharpTE) {      // close the open trailing edge with a short line TE_u -> TE_l
-            json ln;
-            ln["type"] = "line";
-            ln["p1"] = json::array({prof.upper.back()[0], prof.upper.back()[1]});
-            ln["p2"] = json::array({prof.lower.back()[0], prof.lower.back()[1]});
-            ln["id"] = gen.next("e");
-            ln["construction"] = constr;
-            ids.push_back(ln["id"].get<std::string>());
-            sk["params"]["entities"].push_back(std::move(ln));
-        }
-        id_map["$" + std::to_string(idx)] = ids.empty() ? std::string() : ids[0];
-        for (std::size_t k = 1; k < ids.size(); ++k)
-            id_map["$" + std::to_string(idx) + "#" + std::to_string(k)] = ids[k];
-        return;
-    }
-
-    // REGULAR POLYGON convenience entity: {type:"polygon"|"regular_polygon"|"hexagon"|..., center:[x,y],
-    // sides:N, and ONE size — across_flats (wrench/spanner size), circumradius/radius (centre->vertex),
-    // or inradius/apothem} expands to N closed line segments. A small local model can't reliably draw
-    // a closed hexagon as a spline (it emits an OPEN spline -> no region -> "extrude produced no
-    // solid"); this gives it a clean closed hex/nut/bolt-head profile in one entity. A NAMED polygon
-    // type (triangle/pentagon/hexagon/heptagon/octagon/nonagon/decagon/dodecagon) implies its side
-    // count; an explicit "sides" still overrides it. Plain lines downstream, so the solver /
-    // region-detect / profile.cpp need no polygon awareness — same trick as the airfoil entity above.
-    {
-        const std::string et = ent.value("type", std::string());
-        // Named regular-polygon shorthands -> implied side count (0 = not a named ngon). Mirrors the
-        // "hexagon" convenience so a model can say {"type":"octagon",...} just like {"type":"hexagon"}.
-        auto named_sides = [](const std::string& t) -> int {
-            if (t == "triangle" || t == "equilateral_triangle" || t == "trigon") return 3;
-            if (t == "pentagon")                  return 5;
-            if (t == "hexagon"   || t == "hex")   return 6;
-            if (t == "heptagon"  || t == "septagon") return 7;
-            if (t == "octagon"   || t == "oct")   return 8;
-            if (t == "nonagon"   || t == "enneagon") return 9;
-            if (t == "decagon")                   return 10;
-            if (t == "hendecagon" || t == "undecagon") return 11;
-            if (t == "dodecagon")                 return 12;
-            return 0;
-        };
-        const int named = named_sides(et);
-        if (et == "polygon" || et == "regular_polygon" || et == "ngon" || named > 0) {
-            int n = named;  // named type implies a side count; generic types start at 0 (need "sides")
-            for (const char* k : {"sides", "n", "num_sides", "count"})
-                if (ent.contains(k) && ent[k].is_number_integer()) { n = ent[k].get<int>(); break; }
-            if (n < 3) throw OpError("invalid_op",
-                                     "polygon: needs 'sides' >= 3 (e.g. {\"type\":\"polygon\","
-                                     "\"sides\":6,\"across_flats\":12})");
-            double cx = 0.0, cy = 0.0;
-            if (ent.contains("center") && ent["center"].is_array() && ent["center"].size() >= 2) {
-                cx = ent["center"][0].get<double>();
-                cy = ent["center"][1].get<double>();
-            }
-            auto getnum = [&](std::initializer_list<const char*> keys, double* out) -> bool {
-                for (const char* k : keys)
-                    if (ent.contains(k) && ent[k].is_number()) { *out = ent[k].get<double>(); return true; }
-                return false;
-            };
-            const double apo = std::cos(M_PI / n);  // inradius / circumradius
-            double v = 0.0, R = 0.0;
-            if (getnum({"circumradius", "radius", "r", "vertex_radius"}, &v)) R = v;
-            else if (getnum({"across_flats", "width_across_flats", "af", "wrench", "flats",
-                             "flat_to_flat", "width"}, &v)) R = (v * 0.5) / apo;
-            else if (getnum({"inradius", "apothem"}, &v)) R = v / apo;
-            else if (getnum({"diameter"}, &v)) R = v * 0.5;  // circum-diameter
-            if (!(R > 0.0))
-                throw OpError("invalid_op",
-                              "polygon: needs a size — 'across_flats' (wrench size), 'circumradius', "
-                              "or 'inradius' (mm)");
-            double rot = 0.0;
-            for (const char* k : {"rotation", "angle"})
-                if (ent.contains(k) && ent[k].is_number()) { rot = ent[k].get<double>(); break; }
-            rot *= M_PI / 180.0;
-            const bool constr = ent.value("construction", false);
-            std::vector<std::array<double, 2>> verts;
-            for (int i = 0; i < n; ++i) {
-                double a = rot + 2.0 * M_PI * i / n;
-                verts.push_back({cx + R * std::cos(a), cy + R * std::sin(a)});
-            }
-            std::vector<std::string> ids;
-            for (int i = 0; i < n; ++i) {
-                const auto& a = verts[i];
-                const auto& b = verts[(i + 1) % n];
-                json ln;
-                ln["type"] = "line";
-                ln["p1"] = json::array({a[0], a[1]});
-                ln["p2"] = json::array({b[0], b[1]});
-                ln["id"] = gen.next("e");
-                ln["construction"] = constr;
-                ids.push_back(ln["id"].get<std::string>());
-                sk["params"]["entities"].push_back(std::move(ln));
-            }
-            id_map["$" + std::to_string(idx)] = ids.empty() ? std::string() : ids[0];
-            for (std::size_t k = 1; k < ids.size(); ++k)
-                id_map["$" + std::to_string(idx) + "#" + std::to_string(k)] = ids[k];
-            return;
-        }
-    }
-
-    const std::string eid = gen.next("e");
-    ent["id"] = eid;
-    if (!ent.contains("construction")) ent["construction"] = false;
-    sk["params"]["entities"].push_back(ent);
+    std::vector<json> new_ents = expand_sketch_entity(std::move(ent), gen);
+    for (const json& e : new_ents) sk["params"]["entities"].push_back(e);
+    const std::string eid =
+        new_ents.empty() ? std::string() : new_ents.front().value("id", std::string());
     id_map["$" + std::to_string(idx)] = eid;
+    for (std::size_t k = 1; k < new_ents.size(); ++k)
+        id_map["$" + std::to_string(idx) + "#" + std::to_string(k)] =
+            new_ents[k].value("id", std::string());
     // Inline constraints: "$self" -> the new entity id; ids cN.
     if (op.contains("constraints") && op["constraints"].is_array()) {
         for (const json& c0 : op["constraints"]) {

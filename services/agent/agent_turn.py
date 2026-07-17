@@ -1548,6 +1548,8 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
             except Exception:  # noqa: BLE001 — retry never breaks the turn
                 pass
         # M20: stream the tool call to the live GUI + persist to events.jsonl.
+        # 2026-07-17: tool_call_event auto-derives artifacts (image/mesh/file
+        # paths) from render/export results so the GUI can expand the row.
         if _turn_span is not None:
             try:
                 from services.agent import agent_events as _ae  # noqa: PLC0415

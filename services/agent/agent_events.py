@@ -152,6 +152,7 @@ def tool_call_event(
     ok: bool, latency_ms: float, span_id: str | None = None,
     parent_id: str | None = None, actor: str | None = None,
     args_preview: str | None = None,
+    artifacts: list[dict] | None = None,
 ) -> tuple[str, dict]:
     payload = _linkage(node_id, span_id=span_id or new_span_id(),
                        parent_id=parent_id, actor=actor)
@@ -172,7 +173,162 @@ def tool_call_event(
             preview = str(args)
     if preview:
         payload["args_preview"] = _cap(preview, 2048)
+    # Additive (2026-07-17): filesystem paths of render/export deliverables so the
+    # GUI can expand a tool-call row inline. Cap 8; omit when none.
+    arts = artifacts
+    if arts is None:
+        try:
+            arts = derive_artifacts(result)
+        except Exception:  # noqa: BLE001
+            arts = None
+    if arts:
+        payload["artifacts"] = arts[:8]
     return "agent.tool_call", payload
+
+
+def derive_artifacts(result: Any, *, limit: int = 8) -> list[dict]:
+    """Best-effort extract of produced file paths from a tool result.
+
+    Contract (2026-07-17 additive): ``[{path, kind}]`` with
+    ``kind in image|mesh|file``. Looks at common keys (path / contact_sheet /
+    stl_path / step_path / paths), Image-like objects with a ``.path``, list
+    returns from render tools, and JSON-encoded dict/list results. Returns []
+    when nothing legible — callers omit the field.
+    """
+    out: list[dict] = []
+    seen: set[str] = set()
+
+    def _kind_for(path: str) -> str:
+        low = path.lower()
+        if low.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")):
+            return "image"
+        if low.endswith((".stl", ".3mf", ".obj", ".ply")):
+            return "mesh"
+        return "file"
+
+    def _add(path: Any) -> None:
+        if path is None:
+            return
+        if not isinstance(path, str):
+            # mcp.server.fastmcp.Image (or any object with a filesystem path)
+            path = getattr(path, "path", None)
+            if not isinstance(path, str):
+                return
+        p = path.strip()
+        if not p or p in seen:
+            return
+        # Only treat path-looking strings as artifacts (absolute/relative file paths).
+        if not (p.startswith("/") or p.startswith(".") or (len(p) > 2 and p[1] == ":")
+                or "/" in p or "\\" in p or p.lower().endswith(
+                    (".png", ".jpg", ".jpeg", ".webp", ".stl", ".step", ".stp",
+                     ".step+", ".3mf", ".obj", ".ply", ".iges", ".igs", ".brep",
+                     ".pdf", ".dxf", ".dwg", ".gltf", ".glb"))):
+            return
+        seen.add(p)
+        out.append({"path": p, "kind": _kind_for(p)})
+
+    def _walk(obj: Any, depth: int = 0) -> None:
+        if len(out) >= limit or depth > 4 or obj is None:
+            return
+        if isinstance(obj, str):
+            s = obj.strip()
+            if not s:
+                return
+            # JSON-encoded payload from MCP tools that return dumps(...)
+            if (s.startswith("{") and s.endswith("}")) or (
+                    s.startswith("[") and s.endswith("]")):
+                try:
+                    _walk(json.loads(s), depth + 1)
+                    return
+                except Exception:  # noqa: BLE001
+                    pass
+            _add(s)
+            return
+        if isinstance(obj, dict):
+            # Prefer well-known deliverable keys first.
+            for key in (
+                "contact_sheet", "path", "stl_path", "step_path", "png_path",
+                "out_path", "image_path", "file_path", "paths",
+            ):
+                if key not in obj:
+                    continue
+                val = obj[key]
+                if isinstance(val, (list, tuple)):
+                    for item in val:
+                        _add(item)
+                        if len(out) >= limit:
+                            return
+                else:
+                    _add(val)
+                    if len(out) >= limit:
+                        return
+            # Nested common containers.
+            for key in ("result", "artifact", "artifacts", "output", "data"):
+                if key in obj:
+                    _walk(obj[key], depth + 1)
+                    if len(out) >= limit:
+                        return
+            return
+        if isinstance(obj, (list, tuple)):
+            for item in obj:
+                # Image object or path string; skip free-form captions.
+                if hasattr(item, "path") or isinstance(item, str):
+                    _add(item)
+                elif isinstance(item, (dict, list, tuple)):
+                    _walk(item, depth + 1)
+                if len(out) >= limit:
+                    return
+            return
+        # Bare Image-like object.
+        if hasattr(obj, "path"):
+            _add(obj)
+
+    try:
+        _walk(result)
+    except Exception:  # noqa: BLE001
+        return []
+    return out[:limit]
+
+
+def classification_event(
+    node_id: str, *,
+    task_class: str = "unknown",
+    scaffold_level: str = "",
+    tier: str = "",
+    reason: str = "",
+    request_snippet: str = "",
+    picked_model: str | None = None,
+    picked_provider: str | None = None,
+    span_id: str | None = None,
+    parent_id: str | None = None,
+    actor: str | None = None,
+) -> tuple[str, dict]:
+    """Emit pre-flight task classification (2026-07-17 additive).
+
+    Mirrors ``workflow_router.RouterResult``. Emitted ONCE at request entry,
+    BEFORE dispatch/routing, so the GUI can show a Routing card while work starts.
+    Optional ``picked_model`` / ``picked_provider`` only when already resolved.
+    """
+    payload = _linkage(node_id, span_id=span_id or new_span_id(),
+                       parent_id=parent_id, actor=actor)
+    # Enums (TaskClass / ScaffoldLevel) may arrive as str or .value-bearing.
+    def _val(v: Any) -> str:
+        if v is None:
+            return ""
+        return str(getattr(v, "value", v) or "")
+
+    payload.update({
+        "task_class": _val(task_class) or "unknown",
+        "scaffold_level": _val(scaffold_level),
+        "tier": _val(tier),
+        "reason": _cap(reason, 160),
+        "request_snippet": _cap(request_snippet, 120),
+    })
+    if picked_model:
+        payload["picked_model"] = str(picked_model)
+    if picked_provider:
+        payload["picked_provider"] = str(picked_provider)
+    return "agent.classification", payload
 
 
 def thought_event(

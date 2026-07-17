@@ -1398,6 +1398,44 @@ def run_turn(session: Session, request: str, provider: Provider,
     *capability* / *tier* (WI-3/10): A forces plan_first + rigid template and caps refine
     passes; C freeform + untouched refine budget.
     Streams progress via ``on_event`` and returns an AgentRun."""
+    # 2026-07-17: emit agent.classification ONCE at request entry, BEFORE any
+    # plan/dispatch work, so the GUI can show a pre-flight Routing card.
+    try:
+        from services.agent import agent_events as _ae_cls  # noqa: PLC0415
+        from services.agent.pipeline.workflow_router import route as _route  # noqa: PLC0415
+        _tier_for_route = tier
+        if not _tier_for_route:
+            try:
+                from services.agent.tiers import detect_tier_from_env as _dte  # noqa: PLC0415
+                _tier_for_route = _dte() or "local-24k"
+            except Exception:  # noqa: BLE001
+                _tier_for_route = "local-24k"
+        _rr = _route(request or "", str(_tier_for_route), capability=capability)
+        _picked_model = getattr(provider, "model", None) or None
+        _picked_provider = getattr(provider, "name", None) or None
+        _k_cls, _p_cls = _ae_cls.classification_event(
+            getattr(session, "name", None) or "design",
+            task_class=_rr.task_class,
+            scaffold_level=_rr.scaffold_level,
+            tier=_rr.tier,
+            reason=_rr.reason,
+            request_snippet=_rr.request_snippet or (request or "")[:120],
+            picked_model=_picked_model,
+            picked_provider=_picked_provider,
+            actor=getattr(session, "name", None) or "design",
+        )
+        _j_cls = None
+        try:
+            _rid_cls = getattr(session, "run_id", None)
+            if _rid_cls:
+                from services.dag.event_journal import EventJournal  # noqa: PLC0415
+                _j_cls = EventJournal(_rid_cls)
+        except Exception:  # noqa: BLE001
+            _j_cls = None
+        _ae_cls.emit_event(_k_cls, _p_cls, live=on_event, journal=_j_cls)
+    except Exception:  # noqa: BLE001 — classification emit never blocks the turn
+        pass
+
     # Resolve capability for scaffolds (default C = no scaffold tax).
     _cap = capability
     if _cap is None:
@@ -2009,6 +2047,44 @@ def run_mission(
     flags = PipelineFlags.from_env()
     # Dual-arity event sink: accept (dict) and (str, dict); never raise into dag_error.
     on_event = normalize_on_event(on_event)
+    # 2026-07-17: emit agent.classification ONCE at mission entry, BEFORE intake
+    # / dispatch, so the GUI can show a pre-flight Routing card.
+    try:
+        from services.agent import agent_events as _ae_cls  # noqa: PLC0415
+        from services.agent.pipeline.workflow_router import route as _route  # noqa: PLC0415
+        _tier_for_route = None
+        try:
+            from services.agent.tiers import detect_tier_from_env as _dte  # noqa: PLC0415
+            _tier_for_route = _dte()
+        except Exception:  # noqa: BLE001
+            _tier_for_route = None
+        if not _tier_for_route:
+            _tier_for_route = "local-24k"
+        _rr = _route(request or "", str(_tier_for_route))
+        _picked_model = getattr(provider, "model", None) or None
+        _picked_provider = getattr(provider, "name", None) or None
+        # run_id already minted above; use it as node_id for tree grouping.
+        _k_cls, _p_cls = _ae_cls.classification_event(
+            run_id,
+            task_class=_rr.task_class,
+            scaffold_level=_rr.scaffold_level,
+            tier=_rr.tier,
+            reason=_rr.reason,
+            request_snippet=_rr.request_snippet or (request or "")[:120],
+            picked_model=_picked_model,
+            picked_provider=_picked_provider,
+            actor="mission",
+        )
+        _j_cls = None
+        try:
+            from services.dag.event_journal import EventJournal  # noqa: PLC0415
+            _j_cls = EventJournal(run_id)
+        except Exception:  # noqa: BLE001
+            _j_cls = None
+        _ae_cls.emit_event(_k_cls, _p_cls, live=on_event, journal=_j_cls)
+    except Exception:  # noqa: BLE001 — classification emit never blocks the mission
+        pass
+
     # Ledger — the mission's durable state (best-effort creation).
     ledger = None
     if _LEDGER_ENABLED:

@@ -442,6 +442,72 @@ static void drawStatusGlyph(const std::string& status, float box) {
     ImGui::Dummy(ImVec2(box, box));
 }
 
+// Animated hammer striking an anvil — the "AI is working" busy affordance for the chat column.
+// ImDrawList-only, driven by GetTime(); colors via palette / chatSurf (theme lint).
+// Sized to `box` (logical height of the glyph cell). Caller places it with Dummy/SetCursor.
+static void drawForgingAnimation(float box) {
+    const auto& pal = ui::palette;
+    const ui::AdaptiveSurface& surf = chatSurf();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    const ImVec2 c(p0.x + box * 0.5f, p0.y + box * 0.5f);
+    const float sc = box / 28.0f;
+    const float t = (float)ImGui::GetTime();
+    // Strike cycle ~2.4 Hz: hammer rises, then snaps down onto the anvil.
+    const float cycle = std::fmod(t * 2.4f, 1.0f);
+    const bool striking = cycle > 0.55f;
+    const float lift = striking
+        ? (1.0f - (cycle - 0.55f) / 0.45f) * 0.15f   // snap down
+        : (cycle / 0.55f) * 0.85f;                    // rise
+    const float ang = striking
+        ? (-0.55f + (1.0f - (cycle - 0.55f) / 0.45f) * 0.95f)
+        : (-0.55f - (cycle / 0.55f) * 0.85f);
+
+    ImU32 anvilCol = ImGui::ColorConvertFloat4ToU32(semanticOnGlass(pal.accentMid, surf));
+    ImU32 hammerCol = ImGui::ColorConvertFloat4ToU32(semanticOnGlass(pal.accent, surf));
+    ImU32 sparkCol = ImGui::ColorConvertFloat4ToU32(semanticOnGlass(pal.statusWarn, surf));
+    ImU32 dimCol = ImGui::ColorConvertFloat4ToU32(surf.textTertiary);
+
+    // Anvil body (base + horn).
+    const float baseY = c.y + 7.0f * sc;
+    dl->AddRectFilled(ImVec2(c.x - 9.0f * sc, baseY - 2.0f * sc),
+                      ImVec2(c.x + 9.0f * sc, baseY + 3.0f * sc), anvilCol, 1.5f * sc);
+    dl->AddRectFilled(ImVec2(c.x - 6.0f * sc, baseY + 3.0f * sc),
+                      ImVec2(c.x + 6.0f * sc, baseY + 7.0f * sc), anvilCol, 1.0f * sc);
+    dl->AddTriangleFilled(ImVec2(c.x + 9.0f * sc, baseY - 2.0f * sc),
+                          ImVec2(c.x + 14.0f * sc, baseY - 1.0f * sc),
+                          ImVec2(c.x + 9.0f * sc, baseY + 2.0f * sc), anvilCol);
+
+    // Hammer pivot above the face; head + handle rotate about the pivot.
+    const ImVec2 pivot(c.x - 2.0f * sc, c.y - 2.0f * sc - lift * 10.0f * sc);
+    const float ca = std::cos(ang), sa = std::sin(ang);
+    auto rot = [&](float x, float y) -> ImVec2 {
+        return ImVec2(pivot.x + x * ca - y * sa, pivot.y + x * sa + y * ca);
+    };
+    // Handle
+    dl->AddLine(rot(0.0f, 0.0f), rot(0.0f, -11.0f * sc), dimCol, ui::metrics::stroke(2.2f));
+    // Head
+    ImVec2 h0 = rot(-4.5f * sc, -11.0f * sc);
+    ImVec2 h1 = rot( 4.5f * sc, -11.0f * sc);
+    ImVec2 h2 = rot( 4.5f * sc, -7.0f * sc);
+    ImVec2 h3 = rot(-4.5f * sc, -7.0f * sc);
+    dl->AddQuadFilled(h0, h1, h2, h3, hammerCol);
+
+    // Sparks on impact.
+    if (striking && cycle < 0.78f) {
+        const float sp = (cycle - 0.55f) / 0.23f;
+        for (int i = 0; i < 5; ++i) {
+            float a = -1.2f + i * 0.55f;
+            float d = (3.0f + i * 1.2f) * sc * (0.4f + sp);
+            ImU32 scc = (sparkCol & 0x00FFFFFFu) | ((ImU32)((1.0f - sp) * 220) << 24);
+            dl->AddCircleFilled(ImVec2(c.x + std::cos(a) * d, baseY - 2.0f * sc - std::sin(a) * d * 0.6f),
+                                1.1f * sc, scc);
+        }
+    }
+    ImGui::Dummy(ImVec2(box, box));
+}
+
+
 // A "bubble" = an auto-height child painted over an explicit glassPanel fill, ported from
 // ui/imgui/src/ui/agent_panel.cpp's GlassBubble. The child's true height is only known after
 // EndChild(), so the PARENT draw list is channel-split: content goes to channel 1, and
@@ -1369,7 +1435,7 @@ static std::string friendlyStageTitle(const std::string& stage) {
     if (stage == "memory")  return "Saving notes";
     std::string t = stage;            // Title-case fallback for any unknown stage
     if (!t.empty()) t[0] = (char)std::toupper((unsigned char)t[0]);
-    return t.empty() ? std::string("Working") : t;
+    return t.empty() ? std::string("\xe2\x80\xa6") : t;  // ellipsis — never a fake "Working"
 }
 
 // ============================ Corporate Roles (aicad.corporate/1) ============================
@@ -2351,7 +2417,61 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         ni.durationMs = jint(data, "latency_ms");
         const bool ok = !data.is_object() || data.value("ok", true);
         ni.status     = ok ? "done" : "fail";
+        // Optional artifacts:[{path,kind}] — pack image paths into detail after a delimiter so
+        // drawToolCallRow can expand them without new ActivityItem fields (app_state.h is
+        // integrator-owned). Delimiter is unlikely in args JSON: "\n\x1eART\x1e\n".
+        if (data.contains("artifacts") && data["artifacts"].is_array()) {
+            std::string arts;
+            int n = 0;
+            for (const auto& art : data["artifacts"]) {
+                if (!art.is_object() || n >= 8) break;
+                std::string path = jstr(art, "path");
+                std::string kindA = jstr(art, "kind");
+                if (path.empty()) continue;
+                if (kindA != "image" && kindA != "mesh" && kindA != "file") kindA = "file";
+                if (!arts.empty()) arts += "\n";
+                arts += kindA;
+                arts += '\t';
+                arts += path;
+                ++n;
+            }
+            if (!arts.empty()) {
+                if (!ni.detail.empty()) ni.detail += "\n\x1eART\x1e\n";
+                else ni.detail = "\x1eART\x1e\n";
+                ni.detail += arts;
+            }
+        }
         m.activity.push_back(std::move(ni));
+    } else if (kind == "agent.classification") {
+        // Pre-request routing card (emitted once at entry). Pack into ActivityItem without new
+        // fields: rowKind 10, stage "class:<n>", title=task_class, reason=reason, detail=JSON
+        // of optional fields (picked_model/provider, scaffold_level, tier, request_snippet).
+        ActivityItem ni;
+        ni.rowKind = 10;
+        ni.stage   = "class:" + std::to_string(m.activity.size());
+        ni.title   = jstr(data, "task_class");
+        if (ni.title.empty()) ni.title = "task";
+        ni.reason  = jstr(data, "reason");
+        nlohmann::json meta = nlohmann::json::object();
+        std::string pm = jstr(data, "picked_model");
+        std::string pp = jstr(data, "picked_provider");
+        std::string sl = jstr(data, "scaffold_level");
+        std::string tier = jstr(data, "tier");
+        std::string snip = jstr(data, "request_snippet");
+        if (!pm.empty()) meta["picked_model"] = pm;
+        if (!pp.empty()) meta["picked_provider"] = pp;
+        if (!sl.empty()) meta["scaffold_level"] = sl;
+        if (!tier.empty()) meta["tier"] = tier;
+        if (!snip.empty()) meta["request_snippet"] = snip;
+        // Also tolerate non-string scaffold_level / tier (numbers/enums).
+        if (sl.empty() && data.contains("scaffold_level") && !data["scaffold_level"].is_null())
+            meta["scaffold_level"] = data["scaffold_level"];
+        if (tier.empty() && data.contains("tier") && !data["tier"].is_null())
+            meta["tier"] = data["tier"];
+        ni.detail = meta.dump();
+        ni.status = "done";
+        // Insert at front so the Routing card sits at the TOP of the activity timeline.
+        m.activity.insert(m.activity.begin(), std::move(ni));
     } else if (kind == "provider_call") {
         // In-depth provider HTTP call log (InAppDiag / core agent). One row per attempt.
         // rowKind 9; fields packed into existing ActivityItem slots so we never touch
@@ -3471,7 +3591,8 @@ static void drawThoughtBox(ActivityItem& a, const ui::Fonts& fonts, bool showThi
 }
 
 // M14 — one inline row per tool call ("Doing"): ok/fail glyph + tool icon + tool name + latency,
-// with the human-readable target as a dim wrapped line. Args preview expands on click when present.
+// with the human-readable target as a dim wrapped line. Args preview + image artifacts expand
+// on click. Artifact image paths are packed into detail after "\n\x1eART\x1e\n" by feedTurnActivity.
 static void drawToolCallRow(ActivityItem& a, const ui::Fonts& fonts) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
@@ -3497,7 +3618,24 @@ static void drawToolCallRow(ActivityItem& a, const ui::Fonts& fonts) {
                            "%s", doingTitle.c_str());
     }
     ImGui::PopFont();
-    if (!a.detail.empty()) {   // args_preview / detail — expandable Doing drawer
+
+    // Split detail into args_preview body + optional packed artifacts.
+    std::string argsBody = a.detail;
+    std::string artsBlob;
+    {
+        const char* kArtMark = "\n\x1eART\x1e\n";
+        const char* kArtMarkBare = "\x1eART\x1e\n";
+        size_t mark = argsBody.find(kArtMark);
+        if (mark != std::string::npos) {
+            artsBlob = argsBody.substr(mark + std::strlen(kArtMark));
+            argsBody = argsBody.substr(0, mark);
+        } else if (argsBody.rfind(kArtMarkBare, 0) == 0) {
+            artsBlob = argsBody.substr(std::strlen(kArtMarkBare));
+            argsBody.clear();
+        }
+    }
+    const bool hasDrawer = !argsBody.empty() || !artsBlob.empty();
+    if (hasDrawer) {
         if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
         if (ImGui::IsItemClicked()) a.expanded = !a.expanded;
         ImGui::SameLine(0, 6 * sc);
@@ -3522,8 +3660,50 @@ static void drawToolCallRow(ActivityItem& a, const ui::Fonts& fonts) {
         ImGui::PopStyleColor();
     }
     if (!a.reason.empty()) dimText(a.reason.c_str());   // the human target — "what it acts on"
-    if (a.expanded && !a.detail.empty())
-        drawProseBox("##tooldetail", stripMdMarks(a.detail), ui::metrics::copilotProseMaxH());
+    if (a.expanded && hasDrawer) {
+        if (!argsBody.empty())
+            drawProseBox("##tooldetail", stripMdMarks(argsBody), ui::metrics::copilotProseMaxH());
+        // Inline image artifacts (lazy GL upload; same path as drawAgentStep contact sheets).
+        if (!artsBlob.empty()) {
+            const float logW = ImGui::GetContentRegionAvail().x;
+            // Session-local texture cache keyed by path (tool rows are redrawn every frame).
+            static std::unordered_map<std::string, Tex> s_artTex;
+            std::istringstream iss(artsBlob);
+            std::string line;
+            int imgI = 0;
+            while (std::getline(iss, line)) {
+                if (line.empty()) continue;
+                size_t tab = line.find('\t');
+                std::string kindA = (tab == std::string::npos) ? "file" : line.substr(0, tab);
+                std::string path  = (tab == std::string::npos) ? line : line.substr(tab + 1);
+                if (path.empty()) continue;
+                if (kindA == "image") {
+                    auto it = s_artTex.find(path);
+                    if (it == s_artTex.end()) {
+                        Tex t = loadTexture(path);
+                        it = s_artTex.emplace(path, t).first;
+                    }
+                    if (it->second.id) {
+                        float maxTw = ui::metrics::copilotThumbW();
+                        float tw = logW < maxTw ? logW : maxTw;
+                        float th = tw * (float)it->second.h / (float)std::max(1, it->second.w);
+                        ImGui::PushID(imgI++);
+                        ImGui::Image((ImTextureID)(intptr_t)it->second.id, ImVec2(tw, th));
+                        ImGui::PopID();
+                    } else {
+                        ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+                        ImGui::TextWrapped("image: %s", path.c_str());
+                        ImGui::PopStyleColor();
+                    }
+                } else {
+                    // mesh / file — show path as a dim line (no inline preview).
+                    ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+                    ImGui::TextWrapped("%s: %s", kindA.c_str(), path.c_str());
+                    ImGui::PopStyleColor();
+                }
+            }
+        }
+    }
     ImGui::EndChild();
     ImRect rowRect = endGlassBubble(gb);
     if (fail)
@@ -3786,6 +3966,85 @@ static void drawCorpMutedLine(const ActivityItem& a, const ui::Fonts& fonts) {
 // The agent timeline: dispatch each activity row to a thinking block or an action card, computing
 // the thinking auto-collapse (a thinking row collapses once a later stage reaches a verdict).
 // Typed /2 transparency rows (M12-M14) dispatch by rowKind first, at their arrival position.
+// Routing / classification card — distinct glass card at the top of the activity timeline.
+// rowKind 10; title=task_class, reason=reason, detail=JSON of optional picked_model/etc.
+static void drawClassificationCard(const ActivityItem& a, const ui::Fonts& fonts) {
+    const auto& pal = ui::palette;
+    const float sc = ui::uiScale;
+    const ui::AdaptiveSurface& surf = chatSurf();
+    ImGui::Dummy(ImVec2(0, 2 * sc));
+    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
+    ImGui::BeginChild("##classcard", ImVec2(0, 0),
+                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+
+    ui::IconUV iv = ui::getIcon("milestone_flag", 20);
+    if (!iv.valid) iv = ui::getIcon("bookmark", 20);
+    if (iv.valid) {
+        float gz = ImGui::GetTextLineHeight() * 0.95f;
+        ImVec4 tint = semanticOnGlass(pal.accent, surf);
+        ImGui::Image(iv.texId, ImVec2(gz, gz), iv.uv0, iv.uv1, tint);
+        ImGui::SameLine(0, 6 * sc);
+    }
+    ImGui::PushFont(fonts.medium);
+    ImGui::TextColored(semanticOnGlass(pal.accent, surf), "Routing");
+    ImGui::PopFont();
+    ImGui::SameLine(0, 6 * sc);
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+    ImGui::TextUnformatted(a.title.empty() ? "task" : a.title.c_str());
+    ImGui::PopStyleColor();
+
+    // Optional picked_model (and provider) from packed detail JSON.
+    std::string model, provider, scaffold, tier;
+    if (!a.detail.empty()) {
+        try {
+            auto j = nlohmann::json::parse(a.detail);
+            if (j.is_object()) {
+                if (j.contains("picked_model") && j["picked_model"].is_string())
+                    model = j["picked_model"].get<std::string>();
+                if (j.contains("picked_provider") && j["picked_provider"].is_string())
+                    provider = j["picked_provider"].get<std::string>();
+                if (j.contains("scaffold_level")) {
+                    if (j["scaffold_level"].is_string())
+                        scaffold = j["scaffold_level"].get<std::string>();
+                    else scaffold = j["scaffold_level"].dump();
+                }
+                if (j.contains("tier")) {
+                    if (j["tier"].is_string()) tier = j["tier"].get<std::string>();
+                    else tier = j["tier"].dump();
+                }
+            }
+        } catch (...) {}
+    }
+    if (!model.empty() || !provider.empty()) {
+        std::string line;
+        if (!provider.empty() && !model.empty()) line = provider + " \xc2\xb7 " + shortModelName(model);
+        else if (!model.empty()) line = shortModelName(model);
+        else line = provider;
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+        ImGui::TextWrapped("%s", line.c_str());
+        ImGui::PopStyleColor();
+    }
+    if (!scaffold.empty() || !tier.empty()) {
+        std::string meta;
+        if (!scaffold.empty()) meta = "scaffold " + scaffold;
+        if (!tier.empty()) {
+            if (!meta.empty()) meta += " \xc2\xb7 ";
+            meta += "tier " + tier;
+        }
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+        ImGui::TextUnformatted(meta.c_str());
+        ImGui::PopStyleColor();
+    }
+    if (!a.reason.empty()) dimText(a.reason.c_str());
+
+    ImGui::EndChild();
+    ImRect cardRect = endGlassBubble(gb);
+    {
+        const std::string copyTxt = chatActivityCopyText(a);
+        chatCopyContext(cardRect, "##class_copy", copyTxt);
+    }
+}
+
 static void drawAgentTimeline(ChatMsg& m, const ui::Fonts& fonts, float logW, bool showThinking) {
     if (m.activity.empty()) return;
     ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
@@ -3801,6 +4060,8 @@ static void drawAgentTimeline(ChatMsg& m, const ui::Fonts& fonts, float logW, bo
             drawThoughtBox(a, fonts, showThinking);
         } else if (a.rowKind == 3) {
             drawToolCallRow(a, fonts);
+        } else if (a.rowKind == 10) {
+            drawClassificationCard(a, fonts);
         } else if (a.rowKind == 4) {
             drawCorpOrgCard(a, fonts);
         } else if (a.rowKind == 5) {
@@ -4746,7 +5007,6 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
                               int msgIdx = -1, int turnNum = 0) {
     const auto& pal = ui::palette;
     const ui::AdaptiveSurface& turnSurf = chatSurf();
-    const ImVec4 accentCol = semanticOnGlass(pal.accent, turnSurf);
     const float sc = ui::uiScale;
 
     // Author label tight above the turn content (mirrors the You-row tight gap). Prefer the
@@ -4818,34 +5078,27 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
         ImGui::PopID();
     }
 
-    // (6) Live spinner + compact "Saying" narration + model line + progress (while running).
+    // (6) While running the live activity stream (timeline thoughts/tools/output) is the
+    // primary content — no fake "Saying · working..." bar. Only fall back to a minimal
+    // liveStatus line when the timeline is still empty (zero content yet).
     if (m.running) {
-        ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
-        static const char* kSpin[] = {"|", "/", "-", "\\"};
-        int sp = (int)(ImGui::GetTime() * 8.0) & 3;
-        ImGui::TextColored(accentCol, "%s", kSpin[sp]);
-        ImGui::SameLine();
-        const ui::AdaptiveSurface& surf = chatSurf();
-        {
-            std::string say = m.liveStatus.empty() ? "working..." : m.liveStatus;
-            ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-            ImGui::TextWrapped("Saying \xc2\xb7 %s", say.c_str());
-            ImGui::PopStyleColor();
+        bool hasLiveContent = false;
+        for (const auto& a : m.activity) {
+            if (a.stage == "__stop_meta__" || a.rowKind == 9) continue;
+            hasLiveContent = true;
+            break;
         }
-        // Which model(s) are driving this turn — transparency about what's actually running.
-        {
-            std::string line = "Command model: " + shortModelName(st.settings.model);
-            if (st.settings.expVisionReview && st.settings.expVisionModel[0])
-                line += "   \xc2\xb7   Vision: " + shortModelName(st.settings.expVisionModel);
+        if (!hasLiveContent && !m.text.empty()) hasLiveContent = true;
+        if (!hasLiveContent) {
+            ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
+            const ui::AdaptiveSurface& surf = chatSurf();
+            std::string say = m.liveStatus;
+            if (say.empty() || say == "Working" || say == "working...")
+                say = "\xe2\x80\xa6";  // minimal ellipsis — never "Saying · Working"
             ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
-            ImGui::TextWrapped("%s", line.c_str());
+            ImGui::TextWrapped("%s", say.c_str());
             ImGui::PopStyleColor();
         }
-        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ui::Palette::toU32(pal.accent));
-        ImGui::PushStyleColor(ImGuiCol_FrameBg, ui::Palette::toU32(pal.accentSoft));
-        float frac = 0.15f + 0.35f * (float)(0.5 + 0.5 * std::sin(ImGui::GetTime() * 2.2));
-        ImGui::ProgressBar(frac, ImVec2(-1, 3.0f * ui::uiScale), "");
-        ImGui::PopStyleColor(2);
     } else {
         // (7) Usage footer — tokens + wall-time for the finished turn, dim (DESIGN §5).
         int tin = 0, tout = 0, tms = 0;
@@ -5017,7 +5270,6 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     const float sessW = measureBtn("Sessions", "history");
     const float gearW = measureBtn("Settings", "settings");
     const float gap   = style.ItemSpacing.x;
-    const float dotW  = lh;
     const float rightInset = ui::metrics::U(0.5f);
     const float collapseW = lh;
     const float collapseGap = ui::metrics::asmHeaderIconGap();
@@ -5032,19 +5284,20 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         if (wordF) ImGui::PopFont();
         const float logoW = cubeSz + logoGap + wmW;
         const float rowTop1 = ImGui::GetCursorPosY();
-        const float bh = lh + 4.0f * sc;   // real header-button height (drawHeaderTextButton pushes FramePadding.y=2sc) so the flanking buttons center on the wordmark band
+        const float bh = lh + 4.0f * sc;   // real header-button height
         auto cy1 = [&](float h) { ImGui::SetCursorPosY(rowTop1 + (wordLh - h) * 0.5f); };
 
-        // Task-list button — aligned directly ABOVE the Chat button below (same X as row 2's
-        // Chat = collapse chevron width + gap). Shows deterministic d/t done.
+        // Task-list button — nudged inward from the far left so it balances against the
+        // right-side Artifacts button (not flush in the corner).
         int tlDone = 0, tlTotal = 0;
         copilotTaskProgress(st, tlDone, tlTotal);
         char tlLabel[24];
         std::snprintf(tlLabel, sizeof(tlLabel), "%d/%d", tlDone, tlTotal);
         const float tlW = measureBtn(tlLabel, "plan_board");
         const float artW = measureBtn("Artifacts", "team");
+        const float tasksInset = collapseW + collapseGap + 10.0f * sc;
         cy1(bh);
-        ImGui::SetCursorPosX(collapseW + collapseGap);
+        ImGui::SetCursorPosX(tasksInset);
         if (busy) ImGui::BeginDisabled();
         if (drawHeaderTextButton("##hdr_tasks", tlLabel, st.showTaskList, tlW, "plan_board")) {
             const bool open = !st.showTaskList;
@@ -5055,20 +5308,38 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Tasks \xc2\xb7 %d of %d done \xc2\xb7 click for the task list", tlDone, tlTotal);
 
+        // Run status fused into the centered Chudware cube (fill color = Idle/Running/Error).
+        const float* statusCol = pal.accentMid;  const char* statusTip = "Idle";
+        if (st.statusKind == 2) { statusCol = pal.statusErr; statusTip = "Error"; }
+        else if (busy || st.agentV2Running || activeConversationRunning(st)) {
+            statusCol = pal.accent; statusTip = "Running";
+        }
+
         // Logo — CENTERED (kept clear of the flanking buttons).
         float logoLeft = (colW - logoW) * 0.5f;
-        logoLeft = std::max(collapseW + collapseGap + tlW + 6.0f * sc, logoLeft);
+        logoLeft = std::max(tasksInset + tlW + 6.0f * sc, logoLeft);
         ImGui::SameLine(logoLeft);
         {
             IconUV cube = ui::getIcon("context_cube", 20);
+            cy1(cubeSz);
+            const ImVec2 cubeP0 = ImGui::GetCursorScreenPos();
+            // Interior fill behind the cube glyph carries the run status color.
+            {
+                ImDrawList* cdl = ImGui::GetWindowDrawList();
+                ImVec4 fill = semanticOnGlass(statusCol, chatSurf());
+                fill.w = statusCol[3] * 0.55f;
+                const float pad = cubeSz * 0.12f;
+                cdl->AddRectFilled(ImVec2(cubeP0.x + pad, cubeP0.y + pad),
+                                   ImVec2(cubeP0.x + cubeSz - pad, cubeP0.y + cubeSz - pad),
+                                   ImGui::ColorConvertFloat4ToU32(fill), 3.0f * sc);
+            }
             if (cube.valid) {
-                cy1(cubeSz);
                 ImGui::Image(cube.texId, ImVec2(cubeSz, cubeSz), cube.uv0, cube.uv1,
                              chatSurf().textPrimary);
             } else {
-                cy1(cubeSz);
                 ImGui::Dummy(ImVec2(cubeSz, cubeSz));
             }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", statusTip);
             ImGui::SameLine(0, logoGap);
         }
         if (wordF) ImGui::PushFont(wordF);
@@ -5093,7 +5364,8 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         ImGui::SetCursorPosY(rowTop1 + wordLh);
     }
 
-    // ---- Row 2: collapse | Chat (left) | Sessions (center) | Settings (right) | status ----
+    // ---- Row 2: collapse | Chat (left) | Sessions (center) | Settings (right) ----
+    // Status is fused into the Chudware cube above; no separate status dot.
     const float rowH   = std::max(lh, ImGui::GetFrameHeight());
     const float rowTop = ImGui::GetCursorPosY();
     auto centerY = [&](float h) { ImGui::SetCursorPosY(rowTop + (rowH - h) * 0.5f); };
@@ -5128,9 +5400,9 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         ImGui::SameLine(0, collapseGap);
     }
 
-    // Left edge for Chat (after collapse). Right cluster = Settings + status.
+    // Left edge for Chat (after collapse). Right = Settings (no status-dot reservation).
     const float leftX = ImGui::GetCursorPosX();
-    const float settingsX = rightEdge - gearW - gap - dotW;
+    const float settingsX = rightEdge - gearW;
     float sessionsX = (leftX + rightEdge) * 0.5f - sessW * 0.5f;
     // Keep Sessions from overlapping Chat/Settings.
     sessionsX = std::max(sessionsX, leftX + chatW + gap);
@@ -5162,7 +5434,7 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         ImGui::SetTooltip(sessionsOpen ? "Sessions list is open."
                                        : "Sessions — switch between chats.");
 
-    // Settings — RIGHT aligned (status dot follows).
+    // Settings — RIGHT aligned. Status lives in the cube above.
     centerY(lh);
     ImGui::SetCursorPosX(settingsX);
     if (drawHeaderTextButton("##hdr_gear", "Settings", settingsOpen, gearW, "settings")) {
@@ -5174,21 +5446,6 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         ImGui::SetTooltip(settingsOpen ? "Settings is open."
                                        : "AI settings — provider, model, privacy.");
 
-    ImGui::SameLine(0, gap);
-    centerY(lh);
-    const float* dot = pal.accentMid;  const char* tip = "Idle";
-    if (st.statusKind == 2) { dot = pal.statusErr; tip = "Error"; }
-    else if (busy || st.agentV2Running || activeConversationRunning(st)) {
-        dot = pal.accent; tip = "Running";
-    }
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    ImVec2 cp = ImGui::GetCursorScreenPos();
-    ImVec4 dotCol = semanticOnGlass(dot, chatSurf());
-    dotCol.w = dot[3];
-    dl->AddCircleFilled(ImVec2(cp.x + lh * 0.5f, cp.y + lh * 0.5f), lh * 0.30f,
-                        ImGui::ColorConvertFloat4ToU32(dotCol));
-    ImGui::Dummy(ImVec2(lh, lh));
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
     // Close the row at its full shared height so the divider below sits under the tallest element.
     ImGui::SetCursorPosY(std::max(ImGui::GetCursorPosY(), rowTop + rowH));
 }
@@ -11226,6 +11483,20 @@ static void drawComposerSendStop(AppState& st, const ImVec2& inMin, const ImVec2
 // ---- the composer: a rounded input box (in-box send) + inline toolbar (model, thinking, +) ----
 // Submits on Enter or the in-box send button. Returns nothing; runs the turn directly.
 static void drawComposer(AppState& st, bool busy, bool canRun) {
+    // Forging busy affordance — pinned just above the input while the agent is working.
+    // Shared by the docked Copilot column and the AI workspace (via chatDrawComposer).
+    {
+        const bool forging = busy || st.agentV2Running || activeConversationRunning(st);
+        if (forging) {
+            const float sc = ui::uiScale;
+            const float box = 28.0f * sc;
+            const float avail = ImGui::GetContentRegionAvail().x;
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, (avail - box) * 0.5f));
+            drawForgingAnimation(box);
+            ImGui::Dummy(ImVec2(0, 2.0f * sc));
+        }
+    }
+
     const bool hasDoc = st.docMirror.hasDoc();
 
     // Keep mode valid + sync settings.copilotMode (persisted).

@@ -114,3 +114,6 @@ Composer copilot toolbar icons for the chat context-reference feature:
 - `ask` — General/copilot: speech bubble with question mark for Copilot Ask mode
   (read-only Q&A). Procedural line-art; no baked plate.
 
+- `eng_firm` — General/copilot: classical portico (pediment + three columns + base)
+  for the Copilot **Eng. Firm** org mode. Procedural line-art (accent pediment,
+  stroke columns); no baked plate. @32/@20.

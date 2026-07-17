@@ -757,10 +757,22 @@ json& require_sketch_feature(json& doc, const json& op, const json& id_map) {
 
 // ----------------------------------------------------------------- op handlers
 void op_add_feature(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
-    if (!op.contains("feature") || !op["feature"].is_object())
+    json feat;
+    if (op.contains("feature") && op["feature"].is_object()) {
+        feat = op["feature"];
+    } else if (op.contains("type") && op["type"].is_string()) {
+        // Lenient FLAT form: models frequently emit {op:add_feature, type, name,
+        // params, ...} with the feature fields at the TOP LEVEL instead of nested under
+        // "feature" (grok-4.5 does this ~half the time, failing dry-run validation and
+        // forcing a wasteful model retry). Accept it by hoisting the top-level fields
+        // into a synthesized feature — fixes it for EVERY feature type at once.
+        feat = json::object();
+        for (auto& [k, v] : op.items())
+            if (k != "op" && k != "before" && k != "after") feat[k] = v;
+    } else {
         throw OpError("invalid_op", "add_feature: 'feature' object required");
+    }
     const std::string fid = gen.next("f");
-    json feat = op["feature"];
     json env;
     env["id"] = fid;
     env["type"] = feat.value("type", std::string());

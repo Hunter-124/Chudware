@@ -130,3 +130,29 @@ hang above (now fixed) + the boot race; the sync call itself only blocks briefly
 daemon rebuilding a couple of parts. A true async refactor is deferred: on web there are no
 threads (single-thread + ASYNCIFY), so it needs a request/poll-across-frames pattern, not a
 worker thread. Do it if recovery of many/large parts still stalls the frame loop.
+
+## 8. Live-preview drag freeze (2026-07-16 addendum — extrude-drag report)
+
+**SHIPPED — bounded preview timeout + drag-rate throttle.** Dragging a feature's depth/dim
+arrow (`viewport_panel.cpp` `s_dim`) pushed the new value into the PM field on every ≥0.05 mm
+move, and `dragSetDim` backdates the debounce so each push fires an `edit_feature` live-preview
+rebuild through `DocMirror::applyOpsAsync` — at the **120 s default timeout**. `previewInFlight_`
+bounds concurrency (one in flight) but NOT rate, so on the shared daemon a fast drag machine-guns
+rebuilds; a single pathologically slow rebuild then makes the GUI wait the full 120 s and surface
+the raw `engine call timed out after 120000ms` toast (user: extrude depth drag "killed the core").
+Fix: live previews use `kPreviewTimeoutMs` (20 s); only the OK/commit path (`committing_`) keeps
+the patient 120 s. Drag pushes to the PM field are gated to ~20 Hz (flip toggles bypass; the
+release always pushes the final value). Native + web identical, no `#ifdef`.
+
+**DEFERRED — the rebuild itself is pathologically slow, and hostd can't recover a stuck call.**
+The client fix caps the *wait* and the *rate*, but the daemon's engine calls are serialised and
+non-interruptible (`engine_backend.h`: "a call into the loaded DLL can't be timed out") and there
+is no per-call watchdog in `core/hostd`, so a genuinely-hung rebuild still wedges the shared
+daemon until `aicad-hostd --stop --force` + restart. Two follow-ups:
+  1. **Engine:** root-cause the slow rebuild. Repro recipe: box + through-hole, sketch a circle on
+     the top face, extrude it as a **Boss ("Whole sketch")** with **Reverse direction**, sweep the
+     depth across ~10→26 mm. Suspect an OCCT boolean pathology when the boss face lands coincident
+     with an existing face (depth == wall thickness) — the classic coplanar-face fuse slow path.
+  2. **Daemon:** a stuck-rebuild recovery path (run rebuilds on a killable worker + watchdog, or
+     detect a call exceeding N s and respawn the engine) so one bad op can't wedge every client.
+

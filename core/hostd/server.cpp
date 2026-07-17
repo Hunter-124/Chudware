@@ -85,6 +85,8 @@ std::string Server::detachSocketForFlockRelease() {
 }
 
 Server::~Server() {
+    // Client loops must not re-enter readLine once we start tearing down.
+    stopping_ = true;
     // If detachSocketForFlockRelease already ran, path is empty and close is a no-op
     // on the fd; otherwise fall back to the historical unlink-on-close behavior.
     listener_.close(/*unlink_path=*/true);
@@ -93,9 +95,15 @@ Server::~Server() {
         std::lock_guard<std::mutex> lk(clientsMtx_);
         for (auto& [id, c] : clients_) live.push_back(c);
     }
-    for (auto& c : live) c->conn.close();
+    // Interrupt any thread parked in readLine()'s poll() BEFORE joining. A bare close()
+    // does NOT wake a thread already blocked in poll() on Linux, so the join below hung
+    // until systemd's TimeoutStopSec fired and SIGABRT'd the daemon (the "crashed on the
+    // other end" restart hang). shutdown() delivers POLLHUP so readLine returns at once;
+    // close() after the join reclaims the fd.
+    for (auto& c : live) c->conn.shutdown();
     for (auto& c : live)
         if (c->thread.joinable()) c->thread.join();
+    for (auto& c : live) c->conn.close();
 }
 
 void Server::touch() { status_.lastActivityMs = monoMs(); }

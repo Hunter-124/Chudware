@@ -182,6 +182,12 @@ void IpcConn::close() {
     // The shared_ptr drops when this IpcConn is destroyed or moved-from.
 }
 
+void IpcConn::shutdown() {
+    // Browser client is never the daemon side (no ~Server in wasm), but define the
+    // symbol for ABI parity: tearing down the socket wakes any pending readLine.
+    if (ws_) destroySocket(*ws_);
+}
+
 bool IpcConn::readLine(std::string& line, int timeoutMs) {
     if (!ws_) return false;
     auto& st = *ws_;

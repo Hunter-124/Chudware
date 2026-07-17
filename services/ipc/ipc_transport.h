@@ -70,6 +70,12 @@ public:
     bool eof() const { return eof_.load(std::memory_order_acquire); }
 #endif
     void close();
+    // Wake a peer thread blocked in readLine()'s poll/read WITHOUT closing the fd:
+    // half-closes the connection (POSIX shutdown / Windows CancelIoEx) so a blocking
+    // readLine returns promptly. The daemon shutdown path calls this before join()ing
+    // the per-client threads — close() alone does NOT interrupt a thread already parked
+    // in poll() on Linux, which hung ~Server to the systemd stop timeout (SIGABRT).
+    void shutdown();
 #if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
     int fd() const { return fd_; }
 #endif

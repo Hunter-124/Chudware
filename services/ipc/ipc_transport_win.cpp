@@ -126,6 +126,13 @@ void IpcConn::close() {
     }
 }
 
+void IpcConn::shutdown() {
+    // Wake a peer thread parked in an overlapped readLine WITHOUT closing the handle
+    // (the owning thread still closes it). Mirrors the POSIX shutdown() interrupt used
+    // by the daemon shutdown path before join().
+    if (h_) CancelIoEx((HANDLE)h_, nullptr);
+}
+
 bool IpcConn::readLine(std::string& line, int timeoutMs) {
     if (!h_ || !ev_) return false;
     const ULONGLONG start = GetTickCount64();

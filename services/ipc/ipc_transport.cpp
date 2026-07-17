@@ -51,6 +51,14 @@ void IpcConn::close() {
     }
 }
 
+void IpcConn::shutdown() {
+    // Half-close so a peer thread parked in readLine()'s poll() wakes immediately
+    // (POLLHUP). Deliberately does NOT touch fd_ — the owning thread still closes it
+    // — so this is safe to call cross-thread from the daemon shutdown path. shutdown()
+    // on an already-closed/errored fd is a harmless EBADF/ENOTCONN.
+    if (fd_ >= 0) ::shutdown(fd_, SHUT_RDWR);
+}
+
 bool IpcConn::readLine(std::string& line, int timeoutMs) {
     if (fd_ < 0) return false;
     const auto start = std::chrono::steady_clock::now();

@@ -67,6 +67,12 @@ def find(items: list[dict], key: str, value: str) -> dict | None:
 # EXACT match (no subdomain wildcard), so each domain must be listed explicitly.
 ACCESS_DOMAINS = ["ua.edu", "crimson.ua.edu"]
 
+# Additional hostnames served by the SAME tunnel and gated by the SAME Access app.
+# One app => one AUD => the gateway's single BILLET_WEB_CF_AUD keeps validating; a
+# separate per-domain app would mint a different AUD and break JWT validation. So new
+# public domains go HERE (added to the app's self_hosted_domains), never as a new app.
+EXTRA_HOSTS = ["chudware.com", "www.chudware.com"]
+
 
 def _include_list(emails: list[str]) -> list[dict]:
     """Access policy include = explicit allowlisted emails + whole-domain rules."""
@@ -161,11 +167,10 @@ def main() -> None:
 
     # 2. ingress config
     api("PUT", f"/accounts/{ACCOUNT_ID}/cfd_tunnel/{tid}/configurations", {
-        "config": {"ingress": [
-            {"hostname": host, "service": GATEWAY_SERVICE},
-            {"service": "http_status:404"},
-        ]}})
-    print(f"ingress: {host} -> {GATEWAY_SERVICE}")
+        "config": {"ingress":
+            [{"hostname": h, "service": GATEWAY_SERVICE} for h in [host] + EXTRA_HOSTS]
+            + [{"service": "http_status:404"}]}})
+    print(f"ingress: {[host] + EXTRA_HOSTS} -> {GATEWAY_SERVICE}")
 
     # 3. DNS CNAME (proxied)
     zone = find(api("GET", "/zones"), "name", zone_name)
@@ -179,11 +184,27 @@ def main() -> None:
     else:
         api("POST", f"/zones/{zone['id']}/dns_records", rec_body)
     print(f"dns: {host} CNAME {tid}.cfargotunnel.com (proxied)")
+    # Extra hosts live in their own zones — resolve each and upsert a proxied CNAME.
+    for eh in EXTRA_HOSTS:
+        ez = find(api("GET", "/zones"), "name", ".".join(eh.split(".")[-2:]))
+        if ez is None:
+            print(f"  warn: zone for {eh} not on account — skipping DNS")
+            continue
+        erecs = api("GET", f"/zones/{ez['id']}/dns_records?name={eh}")
+        ebody = {"type": "CNAME", "name": eh,
+                 "content": f"{tid}.cfargotunnel.com", "proxied": True}
+        if erecs:
+            api("PUT", f"/zones/{ez['id']}/dns_records/{erecs[0]['id']}", ebody)
+        else:
+            api("POST", f"/zones/{ez['id']}/dns_records", ebody)
+        print(f"dns: {eh} CNAME {tid}.cfargotunnel.com (proxied)")
 
     # 4. Access application
     apps = api("GET", f"/accounts/{ACCOUNT_ID}/access/apps")
     app_body = {
         "name": APP_NAME, "type": "self_hosted", "domain": host,
+        # All domains on ONE app => ONE shared AUD (see EXTRA_HOSTS note above).
+        "self_hosted_domains": [host] + EXTRA_HOSTS,
         "session_duration": "24h", "skip_interstitial": True,
         "auto_redirect_to_identity": False,
     }

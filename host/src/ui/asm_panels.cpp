@@ -444,7 +444,7 @@ std::vector<InsertCandidate> buildInsertCandidates(AppState& st) {
 // Filter for Browse… (component source files the engine can load).
 static const char* kInsertFilter =
     "All CAD & mesh files\0*.step+;*.step;*.stp;*.iges;*.igs;*.brep;*.stl;*.3mf;*.obj;*.ply\0"
-    "Billet part (*.step+)\0*.step+\0"
+    "Chudware part (*.step+)\0*.step+\0"
     "STEP (*.step;*.stp)\0*.step;*.stp\0"
     "All files (*.*)\0*.*\0";
 }  // namespace

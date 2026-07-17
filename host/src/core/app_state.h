@@ -1613,6 +1613,14 @@ struct AppState {
     // parts?" modal next frame; the modal consumes it. "Later" just dismisses — the daemon keeps
     // the entries, so the prompt returns on the next app start.
     int recoveryPromptCount = 0;      // raise the orphan-recovery modal next frame (0 = none)
+    bool recoveryModalOpen = false;   // the orphan-recovery modal is currently showing (promoted
+                                      // from a run_gui static so ensureStarterDoc can defer the
+                                      // blank starter while the user is choosing recover/discard).
+    // Web only: the shared daemon has connected AND its first bootstrap (doc-list mirror +
+    // orphan-recovery check) has run. workerStarted is set synthetically at boot to unlock the UI,
+    // so it is NOT a safe signal that daemon RPCs will succeed — gate boot-time daemon actions
+    // (the starter part) on this instead to avoid transient "worker not started" failures.
+    bool daemonEverConnected = false;
     // De-dup + cap (most-recent-first) + persist a path into recentFiles. Defined in app_state.cpp.
     void pushRecentFile(const std::string& path);
 

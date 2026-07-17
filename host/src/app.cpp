@@ -808,6 +808,14 @@ static void onFileDrop(GLFWwindow* win, int count, const char** paths) {
 static void ensureStarterDoc(AppState& st, bool shot) {
     if (shot || st.starterTried) return;
     if (!st.workerStarted || st.docMirror.hasDoc() || !st.docTabs.empty() || st.designStarted) return;
+    // Never drop a blank starter next to parts the daemon is offering for crash recovery.
+    if (st.recoveryPromptCount > 0 || st.recoveryModalOpen) return;
+#ifdef __EMSCRIPTEN__
+    // Web: workerStarted is synthetic (set at boot to unlock the UI); the daemon WS may not be
+    // connected yet, so a doc_new here would fail with a transient "worker not started" toast
+    // (the exact boot error users hit). Wait for the first successful bootstrap.
+    if (engine::daemonMode() && !st.daemonEverConnected) return;
+#endif
     static int s_readyFrame = -1;
     if (s_readyFrame < 0) s_readyFrame = ImGui::GetFrameCount();
     if (ImGui::GetFrameCount() < s_readyFrame + 1) {
@@ -922,7 +930,7 @@ WASM_BOOT_LOG("[wasm-boot] run_gui enter\n");
             winW = w; winH = h; winSized = true;
         }
     }
-    GLFWwindow* win = glfwCreateWindow(winW, winH, "Billet", nullptr, nullptr);
+    GLFWwindow* win = glfwCreateWindow(winW, winH, "Chudware", nullptr, nullptr);
 #ifdef __EMSCRIPTEN__
     WASM_BOOT_LOG("[wasm-boot] glfwCreateWindow %s\n", win?"ok":"FAIL");
 #endif
@@ -2007,7 +2015,7 @@ WASM_BOOT_LOG("[wasm-boot] loadIcons done\n");
             st.suppressToasts = true;
         else
             st.toast(ui::ToastLevel::Info,
-                     "Billet: live view of the AI's part — it updates as it builds");
+                     "Chudware: live view of the AI's part — it updates as it builds");
         if (const char* tabEnv = std::getenv("AI_CAD_TAB")) {
             int t = std::atoi(tabEnv);
             if (t >= 0 && t <= AppState::RT_Manufacture) st.ribbonTab = t;
@@ -2314,9 +2322,9 @@ WASM_BOOT_LOG("[wasm-boot] entering main loop\n");
             ImGui_ImplGlfw_NewFrame();
             ImGui::NewFrame();
             ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_Always);
-            ImGui::Begin("Billet WASM", nullptr,
+            ImGui::Begin("Chudware WASM", nullptr,
                          ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse);
-            ImGui::Text("Billet WASM boot — frame %d", s_wasmFrames);
+            ImGui::Text("Chudware WASM boot — frame %d", s_wasmFrames);
             ImGui::Text("ASYNCIFY warmup (full UI next)");
             ImGui::End();
             ImGui::Render();
@@ -2713,7 +2721,7 @@ WASM_BOOT_LOG("[wasm-boot] entering main loop\n");
                                      full.find("No module named") != std::string::npos;
                 if (missingModule && !st.importRepairTried && !st.setupRunning.load()) {
                     st.importRepairTried = true;
-                    st.addLog("[..] runtime module missing — auto-repairing (use Billet > Repair runtime if this persists)...");
+                    st.addLog("[..] runtime module missing — auto-repairing (use Chudware > Repair runtime if this persists)...");
                     st.startSetup(true);
                     assistant = "A required module is missing from the runtime — repairing now (may take a minute). Try again once the console shows setup complete.";
                 } else {
@@ -3555,9 +3563,9 @@ WASM_BOOT_LOG("[wasm-boot] entering main loop\n");
                 const auto& tab = st.docTabs[st.activeTab];
                 title = tab.title.empty() ? "Untitled" : tab.title;
                 if (tab.dirty) title += "*";
-                title += " \xe2\x80\x94 Billet";                 // " — Billet"
+                title += " \xe2\x80\x94 Chudware";                 // " — Chudware"
             } else {
-                title = "Billet";
+                title = "Chudware";
             }
             static std::string lastTitle;
             if (title != lastTitle) { lastTitle = title; glfwSetWindowTitle(win, title.c_str()); }
@@ -3979,12 +3987,12 @@ WASM_BOOT_LOG("[wasm-boot] entering main loop\n");
         {
             static bool s_quitModalOpen = false;
             if (st.wantQuitConfirm) { st.wantQuitConfirm = false; s_quitModalOpen = true; }
-            if (s_quitModalOpen) ImGui::OpenPopup("Quit Billet?##appquit");
+            if (s_quitModalOpen) ImGui::OpenPopup("Quit Chudware?##appquit");
             ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + vp->Size.x * 0.5f,
                                            vp->Pos.y + vp->Size.y * 0.5f),
                                     ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
             bool open = true;
-            if (ImGui::BeginPopupModal("Quit Billet?##appquit", &open,
+            if (ImGui::BeginPopupModal("Quit Chudware?##appquit", &open,
                                        ImGuiWindowFlags_AlwaysAutoResize |
                                            ImGuiWindowFlags_NoSavedSettings)) {
                 // Only USER-owned docs (own tabs + adopted AI mirrors) are the user's to save —
@@ -4035,14 +4043,13 @@ WASM_BOOT_LOG("[wasm-boot] entering main loop\n");
         // appear via the normal doc.opened mirror path); Discard drops them daemon-side; Later just
         // dismisses — the daemon keeps the entries, so the prompt returns on the next app start.
         {
-            static bool s_recoveryModalOpen = false;
             static int  s_recoveryCount = 0;
             if (st.recoveryPromptCount > 0) {
                 s_recoveryCount = st.recoveryPromptCount;
                 st.recoveryPromptCount = 0;
-                s_recoveryModalOpen = true;
+                st.recoveryModalOpen = true;
             }
-            if (s_recoveryModalOpen) ImGui::OpenPopup("Recover unsaved parts?##recovery");
+            if (st.recoveryModalOpen) ImGui::OpenPopup("Recover unsaved parts?##recovery");
             ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + vp->Size.x * 0.5f,
                                            vp->Pos.y + vp->Size.y * 0.5f),
                                     ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
@@ -4083,7 +4090,7 @@ WASM_BOOT_LOG("[wasm-boot] entering main loop\n");
                             st.toast(ui::ToastLevel::Error, "Recovery failed: " + e);
                         }
                     }
-                    s_recoveryModalOpen = false;
+                    st.recoveryModalOpen = false;
                     ImGui::CloseCurrentPopup();
                 }
                 ImGui::SameLine();
@@ -4094,17 +4101,17 @@ WASM_BOOT_LOG("[wasm-boot] entering main loop\n");
                         if (!c->call("recovery_discard", nlohmann::json{{"all", true}}, r, e))
                             st.toast(ui::ToastLevel::Error, "Discard failed: " + e);
                     }
-                    s_recoveryModalOpen = false;
+                    st.recoveryModalOpen = false;
                     ImGui::CloseCurrentPopup();
                 }
                 ImGui::SameLine();
                 if (ImGui::Button("Later", ImVec2(90.0f * scale, 0))) {
-                    s_recoveryModalOpen = false;
+                    st.recoveryModalOpen = false;
                     ImGui::CloseCurrentPopup();
                 }
                 ImGui::EndPopup();
             }
-            if (!ropen) s_recoveryModalOpen = false;   // title-bar X = Later
+            if (!ropen) st.recoveryModalOpen = false;   // title-bar X = Later
         }
 
         // ---------- mesh-export tessellation options ----------

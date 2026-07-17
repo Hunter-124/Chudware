@@ -432,7 +432,7 @@ void startLoginWizard(AppState& st, const std::string& site) {
                     }
             }
             st.toast(ui::ToastLevel::Error,
-                     "In-app browser unavailable (CEF init failed). Restart Billet, or use "
+                     "In-app browser unavailable (CEF init failed). Restart Chudware, or use "
                      "Desktop browser on a vendor row.");
             return;
         }

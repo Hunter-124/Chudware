@@ -192,7 +192,7 @@ def not_on_list_html(email: str | None = None) -> str:
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>Not on the list — billet-web</title>
+  <title>Not on the list — Chudware</title>
   <style>
     body {{ font-family: system-ui, sans-serif; background: #0f1419; color: #e7ecf1;
            display: flex; min-height: 100vh; align-items: center; justify-content: center; margin: 0; }}
@@ -207,7 +207,7 @@ def not_on_list_html(email: str | None = None) -> str:
 <body>
   <div class="card">
     <h1>You're not on the list</h1>
-    <p>{who} authenticated successfully, but is not authorized for billet-web.</p>
+    <p>{who} authenticated successfully, but is not authorized for Chudware.</p>
     <p>Ask the operator (Hunter) to add your email to
        <code>Webservice/gateway/users.yaml</code> and re-deploy the Access policy if needed.</p>
     <p>Contact: the host operator for this instance.</p>

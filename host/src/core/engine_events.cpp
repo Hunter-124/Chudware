@@ -467,6 +467,10 @@ void engineEventsTick(AppState& st) {
         if (now - lastBootstrapTry >= std::chrono::milliseconds(500)) {
             lastBootstrapTry = now;
             bootstrapped = tryBootstrap(st, *c);
+            // First successful bootstrap = daemon connected, doc list mirrored, and the
+            // orphan-recovery check has run. This is the safe point to let boot-time daemon
+            // actions (the starter part) fire on web (see ensureStarterDoc).
+            if (bootstrapped) st.daemonEverConnected = true;
         }
     }
 

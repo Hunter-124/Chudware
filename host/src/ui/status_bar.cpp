@@ -230,7 +230,7 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip(
                 "The engine host daemon (aicad-hostd) is not reachable.\n"
-                "Billet will keep retrying (1s, 2s, 5s, then every 10s).\n"
+                "Chudware will keep retrying (1s, 2s, 5s, then every 10s).\n"
                 "Agent/shared docs reappear automatically on reconnect.");
         ImGui::PopStyleColor();
     }

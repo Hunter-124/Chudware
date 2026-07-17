@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Billet — browser-native CAD</title>
-  <link rel="icon" type="image/png" href="/static/logo_wordmark_dark.png" />
+  <title>Chudware — Cad Harness Ultimate Design softWare</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cg fill='none' stroke='%234f8cff' stroke-width='4' stroke-linejoin='round' stroke-linecap='round'%3E%3Cpath d='M56.2 18 L32 4 L7.8 18 L7.8 46 L32 60 L56.2 46 Z'/%3E%3Cpath d='M32 32 L32 4 M32 32 L7.8 46 M32 32 L56.2 46'/%3E%3C/g%3E%3C/svg%3E" />
   <style>
     :root {
       --bg: #0f1418;
@@ -36,10 +36,16 @@
     header {
       display: flex;
       align-items: center;
-      gap: 10px;
+      gap: 11px;
       padding: 18px 28px;
     }
-    header img { height: 34px; width: auto; display: block; }
+    header .logo { width: 30px; height: 30px; display: block; }
+    header .wordmark {
+      font-size: 20px;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+      color: var(--text);
+    }
     header .tag {
       font-size: 11px;
       letter-spacing: 0.18em;
@@ -59,24 +65,33 @@
     }
     .hero {
       width: 100%;
-      max-width: 560px;
+      max-width: 620px;
       text-align: center;
       display: flex;
       flex-direction: column;
       align-items: center;
       gap: 22px;
     }
+    .hero .bigcube { width: 76px; height: 76px; margin-bottom: 2px; filter: drop-shadow(0 6px 20px rgba(79,140,255,0.35)); }
     .hero h1 {
       margin: 0;
-      font-size: clamp(2rem, 4vw, 3rem);
+      font-size: clamp(2.1rem, 4.4vw, 3.1rem);
       font-weight: 700;
       letter-spacing: -0.02em;
-      line-height: 1.1;
+      line-height: 1.08;
     }
     .hero h1 .accent { color: var(--teal); }
+    .hero .expand {
+      margin: 0;
+      font-size: 0.82rem;
+      letter-spacing: 0.13em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .hero .expand b { color: var(--accent-hi); font-weight: 700; }
     .hero p.lead {
       margin: 0;
-      max-width: 460px;
+      max-width: 480px;
       font-size: 1.05rem;
       line-height: 1.55;
       color: var(--muted);
@@ -129,19 +144,32 @@
 </head>
 <body>
   <header>
-    <img src="/static/logo_wordmark_dark.png" alt="Billet" />
+    <svg class="logo" viewBox="0 0 64 64" aria-label="Chudware">
+      <g fill="none" stroke="#4f8cff" stroke-width="4" stroke-linejoin="round" stroke-linecap="round">
+        <path d="M56.2 18 L32 4 L7.8 18 L7.8 46 L32 60 L56.2 46 Z"/>
+        <path d="M32 32 L32 4 M32 32 L7.8 46 M32 32 L56.2 46"/>
+      </g>
+    </svg>
+    <span class="wordmark">Chudware</span>
     <span class="tag">Web</span>
   </header>
 
   <main>
     <section class="hero">
+      <svg class="bigcube" viewBox="0 0 64 64" aria-hidden="true">
+        <g fill="none" stroke="#4f8cff" stroke-width="3.4" stroke-linejoin="round" stroke-linecap="round">
+          <path d="M56.2 18 L32 4 L7.8 18 L7.8 46 L32 60 L56.2 46 Z"/>
+          <path d="M32 32 L32 4 M32 32 L7.8 46 M32 32 L56.2 46"/>
+        </g>
+      </svg>
       <h1>Design in the browser,<br><span class="accent">together</span>.</h1>
+      <p class="expand"><b>C</b>ad <b>H</b>arness <b>U</b>ltimate <b>D</b>esign soft<b>W</b>are</p>
       <p class="lead">
-        The full Billet CAD suite runs natively in your browser on the shared team
+        The full Chudware CAD suite runs natively in your browser on the shared team
         workspace — no install. Everyone sees the same models update live.
       </p>
       <a class="cta" href="/app/">
-        Open Billet
+        Open Chudware
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
       </a>
       <div class="features">

@@ -86,8 +86,8 @@ fi
 cat > "$APPS/Billet.desktop" <<EOF
 [Desktop Entry]
 Type=Application
-Name=Billet
-Comment=AI-native parametric CAD
+Name=Chudware
+Comment=Chudware — AI-native parametric CAD
 Exec=$BIN %F
 Icon=Billet
 Categories=Graphics;Engineering;

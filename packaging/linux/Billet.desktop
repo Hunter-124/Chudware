@@ -1,13 +1,16 @@
 [Desktop Entry]
 Type=Application
-Name=Billet
-Comment=AI-native parametric CAD
+Name=Chudware
+Comment=Chudware — AI-native parametric CAD
 Exec=Billet %F
 Icon=Billet
 Categories=Graphics;Engineering;
 Terminal=false
 # Must match the window class set via glfwWindowHintString(GLFW_X11_CLASS_NAME/…) in
 # host/src/app.cpp so the shell binds the live window to this entry (taskbar icon).
+# WM_CLASS deliberately stays "Billet" (internal plumbing) even though the display
+# brand is now Chudware — do NOT "fix" this to Chudware without also changing the
+# glfwWindowHintString calls, or the taskbar icon binding breaks.
 StartupWMClass=Billet
 X-BinaryName=Billet
 # NOTE: binary is built from host/ — cmake -S host -B host/build-linux + ninja Billet.

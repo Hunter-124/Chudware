@@ -1829,7 +1829,7 @@ void ScenarioRunner::runDrawing(AppState& st) {
             nlohmann::json r3;
             st.worker.call("drawing_set_titleblock",
                            {{"doc_id", tab.drawingDocId}, {"sheet_id", "s1"},
-                            {"fields", {{"title", "PLATE"}, {"drawn_by", "Billet"},
+                            {"fields", {{"title", "PLATE"}, {"drawn_by", "Chudware"},
                                         {"material", "AL 6061"}, {"scale", "1:1"}, {"rev", "A"}}}},
                            r3, err);
             st.refreshDrawingTab(st.activeTab);

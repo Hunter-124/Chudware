@@ -546,7 +546,7 @@ struct FilMenuDrawer {
             st.settings.copilotMode = (int)CopilotMode::Ask;
             saveSettings(st.settings);
         }
-        if (ImGui::MenuItem("About Billet")) st.showAbout = true;
+        if (ImGui::MenuItem("About Chudware")) st.showAbout = true;
         ImGui::Separator();
         // Repair/install runtime
         if (ImGui::MenuItem("Repair / install runtime", nullptr, false,

@@ -688,9 +688,9 @@ async def portal_index():
         return FileResponse(index)
     return HTMLResponse(
         """<!DOCTYPE html>
-<html><head><title>billet-web</title></head>
+<html><head><title>Chudware</title></head>
 <body style="font-family:system-ui;background:#0f1419;color:#e7ecf1;padding:2rem">
-  <h1>billet-web</h1>
+  <h1>Chudware</h1>
   <p>Portal static files not installed yet (waiting for static/index.html).</p>
   <p>API: <code>/api/sessions</code> · <code>/healthz</code> · <code>/ws/chat</code></p>
 </body></html>""",

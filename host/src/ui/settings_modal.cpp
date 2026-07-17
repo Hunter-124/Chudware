@@ -968,6 +968,9 @@ static std::string benchTierForSource(const Settings& s, int source) {
     }
     if (p == ui::PROV_LOCAL || p == ui::PROV_LLAMACPP) return "local-24k";
     if (p == ui::PROV_CLOUDCOMPAT && model[0]) {
+        // Moonshot first-class wire provider when the cloud base is api.moonshot.ai.
+        if (std::strstr(s.baseUrl, "moonshot"))
+            return std::string("moonshot:") + model;
         // OpenRouter path when base looks like openrouter.
         if (std::strstr(s.baseUrl, "openrouter") || std::strstr(model, "/"))
             return std::string("openrouter:") + model;
@@ -1077,14 +1080,23 @@ static void pollBenchCategories(AppState& st, bool force) {
 }
 
 // Wire provider name used by role/ranking RPCs (matches routing / config conventions).
-static const char* roleProviderWire(int prov) {
+// For PROV_CLOUDCOMPAT, Moonshot presets map to first-class "moonshot"; others stay "openrouter".
+static const char* roleProviderWire(int prov, const std::string& model = {}) {
+    if (prov == ui::PROV_CLOUDCOMPAT) {
+        // Moonshot is first-class ("moonshot"); other cloud presets stay "openrouter".
+        for (const auto& p : ui::cloudPresets()) {
+            if (p.id == model &&
+                std::strcmp(ui::cloudServiceKey(p.baseUrl), "moonshot") == 0)
+                return "moonshot";
+        }
+        return "openrouter";
+    }
     switch (prov) {
         case ui::PROV_ANTHROPIC:   return "anthropic";
         case ui::PROV_OPENAI:      return "openai";
         case ui::PROV_LOCAL:       return "local";
         case ui::PROV_LLAMACPP:    return "llamacpp";
         case ui::PROV_GEMINI:      return "gemini";
-        case ui::PROV_CLOUDCOMPAT: return "openrouter";
         case ui::PROV_XAI:         return "xai";
         case ui::PROV_CURSOR:      return "cursor";
         default: return "local";
@@ -1097,7 +1109,8 @@ static int roleProviderFromWire(const std::string& w) {
     if (w == "local") return ui::PROV_LOCAL;
     if (w == "llamacpp") return ui::PROV_LLAMACPP;
     if (w == "gemini") return ui::PROV_GEMINI;
-    if (w == "openrouter" || w == "cloud" || w == "cloudcompat") return ui::PROV_CLOUDCOMPAT;
+    if (w == "openrouter" || w == "cloud" || w == "cloudcompat" || w == "moonshot")
+        return ui::PROV_CLOUDCOMPAT;
     if (w == "xai" || w == "xai-sub") return ui::PROV_XAI;
     if (w == "cursor" || w == "cursor-sub") return ui::PROV_CURSOR;
     return -1;
@@ -1682,7 +1695,7 @@ static void drawModelRolesSection(AppState& st, float sc) {
                 for (int pi = 1; pi < (int)picks.size(); ++pi) {
                     if (picks[pi].model == a.model &&
                         (wantProv < 0 || picks[pi].provider == wantProv ||
-                         roleProviderWire(picks[pi].provider) == a.provider)) {
+                         roleProviderWire(picks[pi].provider, picks[pi].model) == a.provider)) {
                         sel = pi;
                         break;
                     }
@@ -1719,7 +1732,7 @@ static void drawModelRolesSection(AppState& st, float sc) {
                             next.model.clear();
                         } else {
                             next.isAuto = false;
-                            next.provider = roleProviderWire(picks[pi].provider);
+                            next.provider = roleProviderWire(picks[pi].provider, picks[pi].model);
                             next.model = picks[pi].model;
                         }
                         // Hard-enforce redaction local-only client-side too.

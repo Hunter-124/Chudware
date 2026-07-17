@@ -88,6 +88,7 @@ inline const char* cloudServiceKey(const std::string& base_url) {
     if (base_url.find("openrouter.ai") != std::string::npos) return "openrouter";
     if (base_url.find("aliyuncs.com") != std::string::npos) return "alibaba";
     if (base_url.find("deepseek.com") != std::string::npos) return "deepseek";
+    if (base_url.find("moonshot.ai") != std::string::npos) return "moonshot";
     return "cloud";
 }
 
@@ -99,6 +100,7 @@ inline const char* categoryLabel(const std::string& key) {
     if (key == "openrouter") return "OpenRouter";
     if (key == "alibaba") return "Alibaba Cloud (Qwen)";
     if (key == "deepseek") return "DeepSeek";
+    if (key == "moonshot") return "Moonshot (Kimi)";
     if (key == "xai") return "xAI (Grok)";
     if (key == "cursor") return "Cursor";
     return "Cloud API";
@@ -185,6 +187,7 @@ inline const std::vector<LocalPreset>& cloudPresets() {
     static const std::string kDashScope = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1";
     static const std::string kDeepSeek = "https://api.deepseek.com/v1";
     static const std::string kOpenRouter = "https://openrouter.ai/api/v1";
+    static const std::string kMoonshot = "https://api.moonshot.ai/v1";
     static const std::vector<LocalPreset> kPresets = {
         // OpenRouter — one key, many models (Qwen / DeepSeek / open-weight). ":free" tiers cost
         // nothing but are rate-limited upstream; paid slugs are cheap and reliable (needs credit /
@@ -216,6 +219,11 @@ inline const std::vector<LocalPreset>& cloudPresets() {
          "Official DeepSeek API. Strong general/coding model.", kDeepSeek},
         {"deepseek-reasoner", "DeepSeek R1 (reasoner)", false,
          "Official DeepSeek API reasoning model (R1).", kDeepSeek},
+        // Moonshot (Kimi) — first-class "moonshot" wire provider (keys.moonshot).
+        {"kimi-k3", "Moonshot \xc2\xb7 Kimi K3 (1M, $3/$15)", true,
+         "Moonshot flagship; 1M context, native vision, always-reasons.", kMoonshot},
+        {"kimi-k2.6", "Moonshot \xc2\xb7 Kimi K2.6 (256K, $0.95/$4)", true,
+         "Cheaper Kimi for lighter/leaf assignments; 256K context, vision.", kMoonshot},
     };
     return kPresets;
 }
@@ -258,6 +266,9 @@ inline int defaultContextWindowForModel(int provider, const std::string& id,
     if (has("gpt-4o") || has("gpt-4-turbo") || has("4o-mini")) return 128000;
     if (has("gpt-3.5")) return 16385;
     if (has("qwen") || has("deepseek")) return 128000;
+    // Moonshot Kimi — check 256k / k2 BEFORE bare kimi-k3 (kimi-k3-256k contains "kimi-k3").
+    if (has("kimi-k3-256k") || has("kimi-k2")) return 262144;
+    if (has("kimi-k3")) return 1048576;
     // Grok 4.5 ships with a 500k context window; older grok-4.x is ~128k.
     if (has("grok-4.5") || has("grok-4-5")) return 500000;
     if (has("grok")) return 131072;

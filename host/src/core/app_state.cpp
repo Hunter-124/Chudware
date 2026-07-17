@@ -148,12 +148,22 @@ void loadSettings(Settings& s) {
         else if (prov == "llamacpp" || prov == "llama.cpp" || prov == "llama-cpp") s.provider = 3;
         else if (prov == "xai" || prov == "xai-sub") s.provider = 6;  // PROV_XAI
         else if (prov == "cursor" || prov == "cursor-sub") s.provider = 7;  // PROV_CURSOR
+        else if (prov == "moonshot") {
+            // First-class Moonshot (Kimi) wire provider — GUI still uses the cloud-compat slot
+            // (PROV_CLOUDCOMPAT=5) so the model picker / base_url path stays shared.
+            s.provider = 5;
+            if (!hasBase) {
+                base = "https://api.moonshot.ai/v1";
+                hasBase = true;
+            }
+        }
         else if (hasBase) s.provider = baseLoopback ? 2 : 5;  // 2=Local, 5=Cloud OpenAI-compatible
         else s.provider = 1;                                   // 1=OpenAI cloud (api.openai.com)
         std::string model = j.value("model", "");
         if (s.provider == 3) model = llama.value("model_path", model);
         if (s.provider == 3 && model.empty()) model = kDefaultLlamaModelPath;
         if (s.provider == 6 && model.empty()) model = "grok-4.5";
+        if (prov == "moonshot" && model.empty()) model = "kimi-k3";
         copyStr(s.model, sizeof(s.model), model);
         std::string activeKey = j.value("api_key", "");
         copyStr(s.apiKey, sizeof(s.apiKey), activeKey);
@@ -164,6 +174,7 @@ void loadSettings(Settings& s) {
         copyStr(s.anthropicKey, sizeof(s.anthropicKey), keys.value("anthropic", std::string()));
         copyStr(s.openaiKey, sizeof(s.openaiKey), keys.value("openai", std::string()));
         copyStr(s.cloudKey, sizeof(s.cloudKey), keys.value("cloud_compat", std::string()));
+        copyStr(s.moonshotKey, sizeof(s.moonshotKey), keys.value("moonshot", std::string()));
         copyStr(s.xaiKey, sizeof(s.xaiKey), keys.value("xai", std::string()));
         // Back-compat: fold the active provider's top-level api_key into its per-provider slot.
         if (!activeKey.empty()) {
@@ -171,6 +182,7 @@ void loadSettings(Settings& s) {
             else if (prov == "anthropic" && !s.anthropicKey[0]) copyStr(s.anthropicKey, sizeof(s.anthropicKey), activeKey);
             else if (prov == "openai" && !hasBase && !s.openaiKey[0]) copyStr(s.openaiKey, sizeof(s.openaiKey), activeKey);
             else if (prov == "openai" && hasBase && !baseLoopback && !s.cloudKey[0]) copyStr(s.cloudKey, sizeof(s.cloudKey), activeKey);
+            else if (prov == "moonshot" && !s.moonshotKey[0]) copyStr(s.moonshotKey, sizeof(s.moonshotKey), activeKey);
             else if ((prov == "xai" || prov == "xai-sub") && !s.xaiKey[0]) copyStr(s.xaiKey, sizeof(s.xaiKey), activeKey);
         }
         // Seed the shipped Gemini key on first run so the copilot works out of the box.
@@ -331,15 +343,27 @@ void saveSettings(const Settings& s) {
         j["api_key"] = s.apiKey[0] ? s.apiKey : "lm-studio";
         j["openai"] = {{"base_url", s.baseUrl}, {"vision", s.vision}};
     } else if (s.provider == 5) {
-        // Cloud OpenAI-compatible API (DashScope / DeepSeek / ...). Same wire shape as a local
-        // openai endpoint but with a CLOUD base_url, so resolve_provider's offline guard refuses it
-        // under ITAR mode while local stays allowed.
-        j["provider"] = "openai";
-        j["model"] = s.model[0] ? s.model : "qwen-max";
-        j["api_key"] = s.cloudKey;
-        j["openai"] = {{"base_url", s.baseUrl[0] ? s.baseUrl
-                                                 : "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"},
-                       {"vision", s.vision}};
+        // Cloud OpenAI-compatible API (DashScope / DeepSeek / OpenRouter / Moonshot).
+        // Moonshot is a first-class wire provider ("moonshot") with keys.moonshot; other cloud
+        // slots still resolve as provider "openai" + a cloud base_url so the offline (ITAR)
+        // guard refuses them while local stays allowed.
+        const bool isMoonshot =
+            std::string(s.baseUrl).find("moonshot.ai") != std::string::npos;
+        if (isMoonshot) {
+            j["provider"] = "moonshot";
+            j["model"] = s.model[0] ? s.model : "kimi-k3";
+            j["api_key"] = s.moonshotKey;
+            j["openai"] = {{"base_url", s.baseUrl[0] ? s.baseUrl
+                                                     : "https://api.moonshot.ai/v1"},
+                           {"vision", s.vision}};
+        } else {
+            j["provider"] = "openai";
+            j["model"] = s.model[0] ? s.model : "qwen-max";
+            j["api_key"] = s.cloudKey;
+            j["openai"] = {{"base_url", s.baseUrl[0] ? s.baseUrl
+                                                     : "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"},
+                           {"vision", s.vision}};
+        }
     } else if (s.provider == 6) {
         // xAI Grok. Prefer API-key path when xaiKey is set; otherwise wire as xai-sub so the
         // agent uses the SuperGrok / X Premium+ OAuth credential from subscription_auth.
@@ -368,6 +392,7 @@ void saveSettings(const Settings& s) {
     keysOut["anthropic"] = s.anthropicKey;
     keysOut["openai"] = s.openaiKey;
     keysOut["cloud_compat"] = s.cloudKey;
+    keysOut["moonshot"] = s.moonshotKey;
     keysOut["xai"] = s.xaiKey;
     j["keys"] = std::move(keysOut);
     // Reasoning effort applies only to reasoning-capable models; resolve_provider passes it

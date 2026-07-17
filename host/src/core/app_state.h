@@ -97,6 +97,7 @@ struct Settings {
     char anthropicKey[256] = "";
     char openaiKey[256] = "";
     char cloudKey[256] = "";       // cloud OpenAI-compatible API key (DashScope / DeepSeek / etc.)
+    char moonshotKey[256] = "";    // Moonshot (Kimi) API key — keys.moonshot / MOONSHOT_API_KEY
     char xaiKey[256] = "";         // xAI (Grok) API key — console.x.ai; empty when using xai-sub OAuth
     char reasoningEffort[16] = "high";  // off|low|medium|high — only used by reasoning models
     char baseUrl[256] = "http://localhost:1234/v1";

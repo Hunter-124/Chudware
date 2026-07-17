@@ -1,6 +1,8 @@
-# Billet (formerly AI-CAD)
+# Chudware (formerly Billet / AI-CAD)
 
-The GUI binary is `Billet` (formerly `AI-CAD`); an `AI-CAD` symlink ships beside it for compatibility.
+The product **displays as Chudware** everywhere users see it (window title, boot shell,
+dialogs, wordmark, web landing). The GUI binary/target name stays `Billet` (formerly
+`AI-CAD`) as an internal identifier — an `AI-CAD` symlink ships beside it for compatibility.
 
 A **SolidWorks-class parametric CAD application** — native C++ desktop app (ribbon UI,
 FeatureManager tree, constraint-solver sketcher) on the **OpenCASCADE** B-rep kernel, with an
@@ -144,7 +146,7 @@ bash scripts/gate.sh    # check.py + core build/ctest + ui tests
 scripts/install_desktop.sh                   # once: ~/.local/share applications + hicolor icons
 ./host/build-linux/bin/Billet                # run
 ```
-`install_desktop.sh` writes `Billet.desktop` (`Name=Billet`, `StartupWMClass=Billet`,
+`install_desktop.sh` writes `Billet.desktop` (`Name=Chudware`, `StartupWMClass=Billet`,
 `Icon=Billet`) and resizes `assets/logo_icon.png` into the user hicolor theme — no root.
 The running window sets `WM_CLASS=Billet` (and Wayland `app_id`) so the taskbar / alt-tab /
 task manager bind to that entry. Verify: `xprop WM_CLASS` on the window should report

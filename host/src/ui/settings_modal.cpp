@@ -1883,6 +1883,100 @@ static void drawModelRolesSection(AppState& st, float sc) {
     }
 }
 
+// Copilot mode → default harness structure + one-line description. Single source of
+// truth for Settings → AI → Harness organization (index matches CopilotMode).
+struct HarnessModeInfo {
+    const char* label;       // Agent | Plan | Swarm | Edit | Ask | Eng. Firm
+    const char* structure;   // default execution structure
+    const char* description; // one-line what it does
+};
+static const HarnessModeInfo kHarnessModes[] = {
+    {"Agent",    "auto",
+     "Solo for simple, plan/subagent for standard, DAG/company for complex."},
+    {"Plan",     "plan-only",
+     "Drafts a plan only; no mutation until you approve."},
+    {"Swarm",    "multi-agent parallel",
+     "Forces a multi-agent / corporate mission with parallel specialists."},
+    {"Edit",     "scoped single-doc edit",
+     "Changes the open part (scoped to selection when set)."},
+    {"Ask",      "read-only Q&A",
+     "Questions about the part; nothing changes."},
+    {"Eng. Firm","multi-agent + contractor firms",
+     "Specialist roles + contractor firms bid on tasks under a $ budget."},
+};
+static constexpr int kHarnessModeCount =
+    (int)(sizeof(kHarnessModes) / sizeof(kHarnessModes[0]));
+
+// Settings → AI: unified harness-organization map + per-mode viewing panel.
+// Read-only display; mode is chosen in the composer. Eng. Firm budget stays on Agent.
+static void drawHarnessOrganizationSection(const Settings& settings, float sc) {
+    dimText("Composer mode picks the org structure. Defaults below; pick a mode to inspect "
+            "its structure and role. Mode is switched from the copilot composer.");
+
+    ImGui::Dummy(ImVec2(0, 2.0f * sc));
+    ImGui::TextUnformatted("Mode defaults");
+    for (int i = 0; i < kHarnessModeCount; ++i) {
+        const auto& m = kHarnessModes[i];
+        ImGui::Bullet();
+        ImGui::SameLine(0, 4.0f * sc);
+        ImGui::Text("%s", m.label);
+        ImGui::SameLine(0, 6.0f * sc);
+        dimText("\xe2\x86\x92");
+        ImGui::SameLine(0, 6.0f * sc);
+        ImGui::TextUnformatted(m.structure);
+    }
+
+    ImGui::Dummy(ImVec2(0, 6.0f * sc));
+    ImGui::TextUnformatted("Mode viewer");
+    dimText("Select a mode to see its execution structure and what it does.");
+
+    // Prefer live composer mode (settings.copilotMode); clamp to table.
+    // When the active composer mode changes, re-center the viewer on it.
+    int active = settings.copilotMode;
+    if (active < 0 || active >= kHarnessModeCount) active = 0;
+    static int s_viewMode = -1;
+    static int s_lastActive = -1;
+    if (s_viewMode < 0 || s_viewMode >= kHarnessModeCount || s_lastActive != active) {
+        s_viewMode = active;
+        s_lastActive = active;
+    }
+
+    const float listH = (ImGui::GetTextLineHeightWithSpacing() + 2.0f * sc) *
+                        (float)kHarnessModeCount + 8.0f * sc;
+    if (ImGui::BeginChild("##harness_mode_list", ImVec2(0, listH),
+                          ImGuiChildFlags_Borders)) {
+        for (int i = 0; i < kHarnessModeCount; ++i) {
+            const bool sel = (s_viewMode == i);
+            char row[96];
+            std::snprintf(row, sizeof(row), "%s  \xc2\xb7  %s",
+                          kHarnessModes[i].label, kHarnessModes[i].structure);
+            if (ImGui::Selectable(row, sel))
+                s_viewMode = i;
+            // Soft highlight for the currently-active composer mode.
+            if (i == active && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("Active composer mode");
+        }
+    }
+    ImGui::EndChild();
+
+    if (s_viewMode >= 0 && s_viewMode < kHarnessModeCount) {
+        const auto& m = kHarnessModes[s_viewMode];
+        ImGui::Dummy(ImVec2(0, 4.0f * sc));
+        ImGui::TextUnformatted(m.label);
+        ImGui::SameLine(0, 8.0f * sc);
+        dimText(m.structure);
+        if (s_viewMode == active) {
+            ImGui::SameLine(0, 8.0f * sc);
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(ui::palette.accent[0], ui::palette.accent[1],
+                       ui::palette.accent[2], 1.0f));
+            ImGui::TextUnformatted("(active)");
+            ImGui::PopStyleColor();
+        }
+        dimText(m.description);
+    }
+}
+
 }  // anonymous namespace
 
 // ---- kSettingsEntries: unified command search table (command_search.cpp) ----
@@ -1931,6 +2025,11 @@ const SettingsEntry kSettingsEntries[] = {
     { "Model roles",              "AI",           2 },
     { "Model rankings",           "AI",           2 },
     { "Hidden models",            "AI",           2 },
+    { "Harness organization",     "AI",           2 },
+    { "Copilot mode",             "AI",           2 },
+    { "Mode defaults",            "AI",           2 },
+    { "Eng. Firm",                "AI",           2 },
+    { "Swarm",                    "AI",           2 },
     // Benchmarks (tab 3)
     { "Benchmarks",               "Benchmarks",   3 },
     { "Model leaderboard",        "Benchmarks",   3 },
@@ -1950,6 +2049,8 @@ const SettingsEntry kSettingsEntries[] = {
     { "Refine-pass cap",          "Agent",        5 },
     { "Max iters",                "Agent",        5 },
     { "Iteration budget",         "Agent",        5 },
+    { "Eng. Firm budget",         "Agent",        5 },
+    { "Company budget",           "Agent",        5 },
     // Experimental (tab 6)
     { "Vision review model",      "Experimental", 6 },
     { "Model routing",            "Experimental", 6 },
@@ -2382,6 +2483,10 @@ void drawSettingsModal(AppState& st, bool busy) {
                 drawModelRolesSection(st, sc);
                 settingsGlassSectionEnd();
 
+                settingsGlassSectionBegin("##ai_harness_org", "Harness organization");
+                drawHarnessOrganizationSection(settings, sc);
+                settingsGlassSectionEnd();
+
                 settingsGlassSectionBegin("##ai_maintenance", "Maintenance");
                 dimText("Repair the local CAD engine runtime, or trim which models appear in the "
                         "composer's model picker.");
@@ -2610,15 +2715,13 @@ void drawSettingsModal(AppState& st, bool busy) {
                                      settings.maxIters == 0 ? "automatic" : "%d passes");
                 }
                 dimText("0 = automatic (stops once the render matches)");
-                settingsSectionHeader("Harness organization");
-                dimText("The composer mode picks the org structure: Agent auto-routes; "
-                        "Plan drafts first; Swarm forces a multi-agent mission; Eng. Firm runs "
-                        "the heaviest firm structure (specialist roles + contractor firms that "
-                        "bid on tasks in predicted tokens against a $ budget); Ask is read-only.");
+                settingsSectionHeader("Eng. Firm budget");
+                dimText("Used when the composer is in Eng. Firm mode (see Settings \xe2\x86\x92 AI "
+                        "\xe2\x86\x92 Harness organization for all mode defaults).");
                 {
                     const float labelW = 200.0f * sc;
                     ImGui::AlignTextToFramePadding();
-                    ImGui::TextUnformatted("Eng. Firm budget (USD)");
+                    ImGui::TextUnformatted("Budget (USD)");
                     ImGui::SameLine(labelW);
                     ImGui::SetNextItemWidth(160.0f * sc);
                     double b = settings.companyBudgetUsd;

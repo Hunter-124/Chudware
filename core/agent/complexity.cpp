@@ -135,5 +135,25 @@ ComplexityVerdict classify_complexity(const std::string& request) {
     return {Complexity::Standard, "multi-feature part or joined objects"};
 }
 
+ExecStructure recommend_structure(Complexity level, bool cross_discipline) {
+    switch (level) {
+        case Complexity::Solo:     return ExecStructure::Solo;
+        case Complexity::Standard: return ExecStructure::Subagent;
+        case Complexity::Complex:  return cross_discipline ? ExecStructure::Company
+                                                          : ExecStructure::Dag;
+    }
+    return ExecStructure::Subagent;
+}
+
+const char* structure_label(ExecStructure s) {
+    switch (s) {
+        case ExecStructure::Solo:     return "solo";
+        case ExecStructure::Subagent: return "subagent";
+        case ExecStructure::Dag:      return "dag";
+        case ExecStructure::Company:  return "company";
+    }
+    return "subagent";
+}
+
 }  // namespace agent
 }  // namespace aicad

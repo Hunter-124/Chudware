@@ -6,6 +6,9 @@
 
 using aicad::agent::classify_complexity;
 using aicad::agent::Complexity;
+using aicad::agent::ExecStructure;
+using aicad::agent::recommend_structure;
+using aicad::agent::structure_label;
 
 TEST_CASE("canonical standoff is SOLO (skips planner)") {
     // THE user's example: dimension-clause commas must NOT count as object joiners.
@@ -56,4 +59,30 @@ TEST_CASE("a normal multi-feature part is STANDARD") {
 TEST_CASE("label strings are stable") {
     CHECK(std::string(classify_complexity("a nut").label()) == "solo");
     CHECK(std::string(classify_complexity("a gearbox assembly").label()) == "complex");
+}
+
+TEST_CASE("structure recommendation tracks complexity") {
+    // Solo part -> Solo structure
+    auto solo = classify_complexity("a nut");
+    CHECK(solo.level == Complexity::Solo);
+    CHECK(recommend_structure(solo.level) == ExecStructure::Solo);
+    CHECK(std::string(structure_label(recommend_structure(solo.level))) == "solo");
+
+    // Standard multi-feature part -> Subagent
+    auto standard = classify_complexity(
+        "a control panel faceplate with a display cutout, four M3 mounting holes, "
+        "chamfered edges and an engraved logo");
+    CHECK(standard.level == Complexity::Standard);
+    CHECK(recommend_structure(standard.level) == ExecStructure::Subagent);
+    CHECK(std::string(structure_label(recommend_structure(standard.level))) == "subagent");
+
+    // Complex assembly -> Dag by default, Company when cross-discipline
+    auto complex = classify_complexity("a two-stage planetary gearbox assembly");
+    CHECK(complex.level == Complexity::Complex);
+    CHECK(recommend_structure(complex.level, /*cross_discipline=*/false) == ExecStructure::Dag);
+    CHECK(std::string(structure_label(
+              recommend_structure(complex.level, /*cross_discipline=*/false))) == "dag");
+    CHECK(recommend_structure(complex.level, /*cross_discipline=*/true) == ExecStructure::Company);
+    CHECK(std::string(structure_label(
+              recommend_structure(complex.level, /*cross_discipline=*/true))) == "company");
 }

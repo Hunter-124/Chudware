@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <thread>
 
 #ifdef _WIN32
 #include <process.h>  // _getpid
@@ -41,6 +42,9 @@ Server::Server(aicad_ipc::IpcListener listener, std::string buildId)
         touch();  // a child exit restarts the linger countdown
     });
     touch();
+    // Engine-call watchdog ceiling (interactive RPCs only; see engine_watchdog.h). 0 disables.
+    if (const char* w = std::getenv("AICAD_HOSTD_ENGINE_WATCHDOG_S"); w && *w)
+        engineWatchdogMs_ = (long long)std::max(0, std::atoi(w)) * 1000;
 }
 
 void Server::sendEventToAll(const std::string& line) {
@@ -87,6 +91,8 @@ std::string Server::detachSocketForFlockRelease() {
 Server::~Server() {
     // Client loops must not re-enter readLine once we start tearing down.
     stopping_ = true;
+    // The watchdog thread polls stopping_ every 500ms; join it before tearing down.
+    if (watchdog_.joinable()) watchdog_.join();
     // If detachSocketForFlockRelease already ran, path is empty and close is a no-op
     // on the fd; otherwise fall back to the historical unlink-on-close behavior.
     listener_.close(/*unlink_path=*/true);
@@ -154,6 +160,8 @@ bool Server::idleExpired(int lingerSecs) {
 
 void Server::run(int lingerSecs) {
     children_.start();
+    if (engineWatchdogMs_ > 0)
+        watchdog_ = std::thread([this] { watchdogLoop(); });
     while (!stopping_) {
         aicad_ipc::IpcConn conn = listener_.accept(500);
         if (conn.valid()) {
@@ -301,6 +309,16 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
                     {"recovery_pending", autosave_ ? autosave_->orphanCount() : 0}};
     }
     if (method == "ping") return json{{"ok", true}};
+    // TEST-ONLY (env-gated; "__hostd_test_stall" is never a real client RPC): register an
+    // in-flight engine call and sleep, to exercise the watchdog end-to-end. Returns ok if the
+    // ceiling exceeds the sleep; otherwise the watchdog restarts the daemon mid-sleep.
+    if (const char* sm = std::getenv("AICAD_HOSTD_TEST_STALL_MS");
+        sm && *sm && method == "__hostd_test_stall") {
+        beginInflight(c.id, method);
+        std::this_thread::sleep_for(std::chrono::milliseconds(std::max(0, std::atoi(sm))));
+        endInflight(c.id);
+        return json{{"ok", true}, {"slept_ms", std::atoi(sm)}};
+    }
     if (method == "daemon_status") {
         json st{{"state", stateNames[status_.engineState.load()]},
                 {"clients", status_.clients.load()},
@@ -480,7 +498,10 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
 
     json result;
     std::string err;
-    if (!core::cpp_core().call(method, p, result, err)) {
+    beginInflight(c.id, method);
+    const bool engineOk = core::cpp_core().call(method, p, result, err);
+    endInflight(c.id);
+    if (!engineOk) {
         isError = true;
         // Normalize: clients (CoreError mapping) rely on a "message" field. Keep
         // whatever in-band payload the engine produced ({"error":...}, OpError
@@ -518,6 +539,51 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
     if (!attachWarning.empty() && result.is_object() && !result.contains("warning"))
         result["warning"] = attachWarning;
     return result;
+}
+
+void Server::beginInflight(int clientId, const std::string& method) {
+    std::lock_guard<std::mutex> lk(inflightMtx_);
+    inflight_[clientId] = InflightCall{method, monoMs()};
+}
+
+void Server::endInflight(int clientId) {
+    std::lock_guard<std::mutex> lk(inflightMtx_);
+    inflight_.erase(clientId);
+}
+
+// Background watchdog: force-restart the daemon if a watchdogged interactive engine call runs
+// past engineWatchdogMs_. An OCCT call cannot be interrupted in-process, so a genuine hang is
+// only recoverable by ending the process; systemd (Restart=on-failure) respawns and docs recover
+// from autosave (explicit/user-gated — no auto-replay loop). Only interactive rebuilds are
+// guarded; sims/agents/exports/imports/opens/saves run long by design and are exempt.
+void Server::watchdogLoop() {
+    while (!stopping_.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        if (stopping_.load()) break;
+        const long long now = monoMs();
+        std::string method;
+        long long elapsed = 0;
+        int clientId = 0;
+        {
+            std::lock_guard<std::mutex> lk(inflightMtx_);
+            for (const auto& [cid, call] : inflight_) {
+                if (engineCallOverdue(call.method, now - call.startMs, engineWatchdogMs_)) {
+                    method = call.method;
+                    elapsed = now - call.startMs;
+                    clientId = cid;
+                    break;
+                }
+            }
+        }
+        if (!method.empty()) {
+            log().line("FATAL: engine call '%s' (client #%d) stuck %lldms > %lldms ceiling — "
+                       "self-healing via restart; docs recover from autosave on next start",
+                       method.c_str(), clientId, elapsed, engineWatchdogMs_);
+            std::fflush(stdout);
+            std::fflush(stderr);
+            std::_Exit(70);
+        }
+    }
 }
 
 }  // namespace hostd

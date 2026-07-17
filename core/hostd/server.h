@@ -22,6 +22,7 @@
 #include "autosave.h"
 #include "child_supervisor.h"
 #include "doc_registry.h"
+#include "engine_watchdog.h"
 
 namespace hostd {
 
@@ -84,6 +85,12 @@ private:
     void touch();
     bool idleExpired(int lingerSecs);
     void staleBinaryTick();
+    // Engine-call watchdog: track the in-flight engine RPC per client thread (one at a time —
+    // clientLoop is sequential) so a background thread can detect a wedged interactive rebuild
+    // and self-heal via restart. See engine_watchdog.h for the policy.
+    void beginInflight(int clientId, const std::string& method);
+    void endInflight(int clientId);
+    void watchdogLoop();
     // DISCARD an abandoned doc: close it in the engine and purge its autosave
     // artifacts (onDocClosed) so it never resurrects. Used by doc-GC (grace
     // expired, reason "gc") and explicit user discard (reason "discarded") —
@@ -108,6 +115,12 @@ private:
     std::string selfBinary_;
     long long lastStaleCheckMs_ = 0;
     std::map<std::string, long long> watchBaselineMs_;  // path -> first-seen mtime
+    // Engine-call watchdog state.
+    struct InflightCall { std::string method; long long startMs = 0; };
+    std::mutex inflightMtx_;
+    std::map<int, InflightCall> inflight_;   // clientId -> current engine call (absent = idle)
+    std::thread watchdog_;
+    long long engineWatchdogMs_ = 180000;    // 0 = disabled (env AICAD_HOSTD_ENGINE_WATCHDOG_S)
 };
 
 }  // namespace hostd

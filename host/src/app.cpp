@@ -2283,6 +2283,28 @@ WASM_BOOT_LOG("[wasm-boot] entering main loop\n");
         static int s_wasmFrames = 0;
         ++s_wasmFrames;
         if (s_wasmFrames <= 3) WASM_BOOT_LOG("[wasm-boot] frame %d\n", s_wasmFrames);
+        // Self-healing canvas sync: the drawing buffer MUST equal the ACTUAL displayed CSS size,
+        // or the canvas is stretched. In element-fullscreen the UA `:fullscreen{width:100%
+        // !important}` rule (important user-agent — outranks the port's important-author inline
+        // width) stretches the canvas ELEMENT to fill the screen; if the GLFW logical size lagged
+        // at the windowed value the backing store stays small and is upscaled to the screen — the
+        // "zoomed / wrong-resolution / squished" fullscreen bug. Force the GLFW logical size to the
+        // real rendered CSS size each frame: glfwSetWindowSize -> setCanvasSize resizes the backing
+        // (bypasses the resize() fullscreen guard), so backing == display in every state. No-op in
+        // windowed mode (the port already keeps them equal); a 1px deadband prevents sub-pixel
+        // resize thrash; self-heals ESC exits and any resize-event timing race.
+        {
+            double cssW = 0.0, cssH = 0.0;
+            if (emscripten_get_element_css_size("#canvas", &cssW, &cssH) == EMSCRIPTEN_RESULT_SUCCESS) {
+                const int tW = (int)(cssW + 0.5), tH = (int)(cssH + 0.5);
+                int winW = 0, winH = 0;
+                glfwGetWindowSize(win, &winW, &winH);
+                const int dW = tW > winW ? tW - winW : winW - tW;
+                const int dH = tH > winH ? tH - winH : winH - tH;
+                if (tW > 0 && tH > 0 && (dW > 1 || dH > 1))
+                    glfwSetWindowSize(win, tW, tH);
+            }
+        }
         // canvas sizing handled by wasmSetupCanvasResize (port tracks the window)
         // First frames: minimal paint only — full UI path is too deep for ASYNCIFY
         // until the rewind stack has settled after a few yields.

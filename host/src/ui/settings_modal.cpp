@@ -1149,9 +1149,9 @@ static std::vector<RolePickEntry> buildRolePickList(AppState& st, bool localOnly
     }
     // Cloud OpenRouter / DashScope / DeepSeek presets.
     for (const auto& p : ui::cloudPresets()) {
-        char buf[256];
-        std::snprintf(buf, sizeof(buf), "OpenRouter / Cloud \xc2\xb7 %s", p.label.c_str());
-        add(ui::PROV_CLOUDCOMPAT, p.id, buf);
+        // Preset labels already self-qualify their service (e.g. "Moonshot \xc2\xb7 Kimi K3"), so show
+        // them as-is; the old "OpenRouter / Cloud" prefix mislabeled Moonshot/DeepSeek presets.
+        add(ui::PROV_CLOUDCOMPAT, p.id, p.label);
     }
     // Local presets + live-probed local models.
     for (const auto& p : ui::localPresets()) {

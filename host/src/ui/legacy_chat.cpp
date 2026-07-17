@@ -2324,6 +2324,10 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             ni.rowKind = 2;
             ni.stage   = key;
             ni.title   = think ? "Thinking" : "Output";
+            // The OUTPUT stream box defaults open and stays open (expanded) so the model's live
+            // text is visible while it streams AND remains in place in history after the turn
+            // finishes; only the reasoning ("Thinking") box auto-collapses on completion.
+            ni.expanded = !think;
             m.activity.push_back(std::move(ni));
             a = &m.activity.back();
         }
@@ -3409,7 +3413,11 @@ static void drawThoughtBox(ActivityItem& a, const ui::Fonts& fonts, bool showThi
     const float sc = ui::uiScale;
     const ui::AdaptiveSurface& surf = chatSurf();
     ImGui::Dummy(ImVec2(0, 2 * sc));
-    if (!showThinking) {
+    // The streamed model OUTPUT ("Output" channel / stage "stream:out") rides the same rowKind-2
+    // box as reasoning, but it IS the model's actual work text — never hide it behind the "show
+    // thinking" switch. Only the reasoning box collapses to a one-liner when thoughts are hidden.
+    const bool isOutput = (a.stage == "stream:out" || a.title == "Output");
+    if (!showThinking && !isOutput) {
         ImGui::PushFont(fonts.body);
         ImGui::TextColored(surf.textSecondary, "Thinking");
         ImGui::PopFont();
@@ -3420,7 +3428,8 @@ static void drawThoughtBox(ActivityItem& a, const ui::Fonts& fonts, bool showThi
     ImGui::BeginChild("##thoughtbox", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
     ImGui::PushFont(fonts.body);
-    ImGui::TextColored(surf.textSecondary, "%s", a.streaming ? "Thinking\xe2\x80\xa6" : "Thinking");
+    const char* boxLabel = a.title.empty() ? "Thinking" : a.title.c_str();
+    ImGui::TextColored(surf.textSecondary, "%s%s", boxLabel, a.streaming ? "\xe2\x80\xa6" : "");
     ImGui::PopFont();
     if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
     if (ImGui::IsItemClicked()) a.expanded = !open;
@@ -5007,11 +5016,11 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         const float logoGap = 3.0f * sc;
         const float cubeSz = std::min(lh, wordLh) * 0.95f;
         if (wordF) ImGui::PushFont(wordF);
-        const float wmW = ImGui::CalcTextSize("Billet").x;
+        const float wmW = ImGui::CalcTextSize("Chudware").x;
         if (wordF) ImGui::PopFont();
         const float logoW = cubeSz + logoGap + wmW;
         const float rowTop1 = ImGui::GetCursorPosY();
-        const float bh = lh;
+        const float bh = lh + 4.0f * sc;   // real header-button height (drawHeaderTextButton pushes FramePadding.y=2sc) so the flanking buttons center on the wordmark band
         auto cy1 = [&](float h) { ImGui::SetCursorPosY(rowTop1 + (wordLh - h) * 0.5f); };
 
         // Task-list button — LEFT-aligned with the logo. Shows deterministic d/t done.
@@ -5052,12 +5061,12 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         if (wordF) ImGui::PushFont(wordF);
         cy1(wordLh);
         ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textPrimary);
-        ImGui::TextUnformatted("Billet");
+        ImGui::TextUnformatted("Chudware");
         ImGui::PopStyleColor();
         if (wordF) ImGui::PopFont();
 
         // Session Artifacts button — RIGHT-aligned with the logo.
-        ImGui::SameLine(std::max(logoLeft + logoW + 6.0f * sc, colW - artW));
+        ImGui::SameLine(std::max(logoLeft + logoW + 6.0f * sc, colW - rightInset - artW));
         cy1(bh);
         if (busy) ImGui::BeginDisabled();
         if (drawHeaderTextButton("##hdr_arts", "Artifacts", st.showArtifacts, artW, "team")) {
@@ -9324,8 +9333,25 @@ static void drawModelDropdown(AppState& st, bool busy) {
         for (const auto& p : ui::cloudPresets()) {
             std::string key = ui::cloudServiceKey(p.baseUrl);
             if (key == "openrouter") continue;  // handled above (live)
+            if (key == "moonshot") continue;    // handled below via its own key gate
             if (catOff(key)) continue;
             if (modelHidden(st, p.id) || !matchq(p.label, key)) continue;
+            ++shown;
+            if (modelRow(st, ui::PROV_CLOUDCOMPAT, p.id, p.label, true, uid++)) {
+                st.settings.provider = ui::PROV_CLOUDCOMPAT;
+                std::strncpy(st.settings.model, p.id.c_str(), sizeof(st.settings.model) - 1);
+                std::strncpy(st.settings.baseUrl, p.baseUrl.c_str(), sizeof(st.settings.baseUrl) - 1);
+                st.settings.vision = p.vision;
+                picked = true;
+            }
+        }
+    }
+    // Moonshot (Kimi) — first-class wire provider gated on its OWN key (keys.moonshot), so Kimi
+    // shows in the composer picker whenever a Moonshot key is set, even with no generic cloud key.
+    if (st.settings.moonshotKey[0] && !catOff("moonshot")) {
+        for (const auto& p : ui::cloudPresets()) {
+            if (std::strcmp(ui::cloudServiceKey(p.baseUrl), "moonshot") != 0) continue;
+            if (modelHidden(st, p.id) || !matchq(p.label, "moonshot kimi")) continue;
             ++shown;
             if (modelRow(st, ui::PROV_CLOUDCOMPAT, p.id, p.label, true, uid++)) {
                 st.settings.provider = ui::PROV_CLOUDCOMPAT;

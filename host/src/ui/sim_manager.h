@@ -73,6 +73,9 @@ struct Study {
     std::string name;
 
     // FEA
+    // materialKey mirrors the ACTIVE part material (doc.material.key via set_material). UI + run
+    // re-resolve from the doc so studies don't hold a throwaway override; changing the combo writes
+    // set_material. Still persisted on the study JSON for back-compat / offline display.
     std::string materialKey;        // material key (e.g. "steel_1018"); "" = none
     SimWell fixtures;
     std::vector<SimLoad> loads;

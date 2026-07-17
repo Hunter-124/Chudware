@@ -18,6 +18,7 @@
 #include "metrics.h"
 #include "icons.h"
 #include "feature_tree.h"       // fmRowPill/fmTreeIcon/fmSectionDivider — FM-grade row styling
+#include "appearance_common.h"  // materialAppearance / kPhysicalMaterials — set_material recolour
 #include "property_manager.h"   // PropertyManager::active() — mutual-exclusion pick guard
 #include "widgets/ribbon.h"     // setRibbonDisabledPrefix — EM tab gating
 #include "../core/app_state.h"
@@ -381,6 +382,61 @@ int SimManager::materialIndexByKey(const std::string& key) {
     const auto& mats = materials();
     for (int i = 0; i < (int)mats.size(); ++i) if (mats[i].key == key) return i;
     return -1;
+}
+
+// Read the active part's material key from DocMirror (doc["material"]["key"]). Empty when unset.
+static std::string docMaterialKey(const AppState& st) {
+    if (!st.docMirror.hasDoc()) return {};
+    const nlohmann::json& tr = st.docMirror.tree();
+    if (!tr.is_object() || !tr.contains("material") || !tr["material"].is_object()) return {};
+    return tr["material"].value("key", std::string());
+}
+
+// Re-seed s.materialKey from the part's active material (doc.material.key). Empty when the part
+// has no material so canRun still requires an explicit pick (which then set_material's the part).
+// Call before run / material UI so the study tracks the one shared part material.
+static void resolveStudyMaterialFromDoc(AppState& st, Study& s) {
+    if (isFlowFamily(s.type)) return;  // Flow/Thermal never consume materialKey
+    s.materialKey = docMaterialKey(st);
+}
+
+// Write set_material (+ derived set_appearance recolour) to the ACTIVE part via DocMirror, same seam
+// the FeatureManager Material menu uses. Also mirrors the key onto the study and persists it so the
+// study JSON stays in sync for reloads. No-op without a live doc/worker.
+static void applyPartMaterial(AppState& st, Study& s, const std::string& key) {
+    s.materialKey = key;
+    if (!st.docMirror.hasDoc() || !st.workerStarted) {
+        // Still persist the study-local mirror so a later open has something.
+        return;
+    }
+    std::vector<uint32_t> bodies = st.docBodyIds;
+    if (bodies.empty()) bodies.push_back(1);
+    float col[3]; float mtl = 0.0f, rgh = 0.5f;
+    materialAppearance(key, col, mtl, rgh);
+    nlohmann::json ops = nlohmann::json::array();
+    ops.push_back({{"op", "set_material"}, {"key", key}});
+    for (uint32_t bid : bodies)
+        ops.push_back({{"op", "set_appearance"},
+                       {"id", "b" + std::to_string(bid)},
+                       {"color", {col[0], col[1], col[2]}},
+                       {"metallic", mtl}, {"roughness", rgh}});
+    ++st.rebuildsInFlight;
+    st.docMirror.applyOpsAsync(st.rpc, st.worker, ops,
+        [&st](const core::OpsResponse& resp, bool applied) {
+            --st.rebuildsInFlight;
+            if (!applied) return;
+            if (resp.ok && !resp.aicm_path.empty()) {
+                st.loadDocMeshAsync(resp.aicm_path);
+            } else if (!resp.ok) {
+                st.addLog(std::string("[err] set_material: ") + resp.error_message);
+                if (resp.error_code != "transport")
+                    st.toast(ui::ToastLevel::Error,
+                             std::string("set_material failed: ") +
+                             (resp.error_message.empty() ? resp.error_code
+                                                         : resp.error_message));
+            }
+            if (resp.ok) st.markActiveTabDirty();
+        });
 }
 
 SimManager::UnitSys SimManager::unitSys(const AppState& st) {
@@ -822,16 +878,11 @@ void SimManager::newStudy(AppState& st, StudyType t) {
     // Structural & frequency studies need a material (stiffness/density/yield). Flow/Thermal run the
     // OpenFOAM pipeline and never read materialKey, so leave it unset for them — the tree hides the
     // Material node and nothing in runFlow consumes the record.
-    if (!isFlowFamily(t) && !materials().empty()) {
-        // Prefer the part's PHYSICAL material (set via the FeatureManager Material node -> set_material,
-        // stored as doc["material"]["key"]) so a study inherits what the user assigned; fall back to the
-        // first library material otherwise.
-        std::string partKey;
-        const nlohmann::json& tr = st.docMirror.tree();
-        if (tr.is_object() && tr.contains("material") && tr["material"].is_object())
-            partKey = tr["material"].value("key", std::string());
-        s.materialKey = (!partKey.empty() && materialIndexByKey(partKey) >= 0)
-                            ? partKey : materials()[0].key;
+    if (!isFlowFamily(t)) {
+        // Prefer the part's PHYSICAL material (doc.material.key via set_material). No fallback to a
+        // library default — if the part has no material the study starts unset and canRun blocks
+        // until the user picks one (which writes set_material on the part).
+        resolveStudyMaterialFromDoc(st, s);
     }
     // A Thermal study IS the OpenFOAM heat-transfer pipeline — force the solver + thermal on so
     // the form opens straight into the thermal setup (no LBM, no aero-only fallback).
@@ -1496,12 +1547,11 @@ void SimManager::drawEmPanel(AppState& st) {
 void SimManager::configureActive(AppState& st, float density, const std::string& materialKey) {
     if (sel_ < 0 || sel_ >= (int)studies_.size()) return;
     studies_[sel_].meshFineness = density;  // density and fineness share the higher=finer sense
-    if (!materialKey.empty()) studies_[sel_].materialKey = materialKey;
+    if (!materialKey.empty()) applyPartMaterial(st, studies_[sel_], materialKey);
     persist(st, studies_[sel_]);
 }
 
-void SimManager::configureActiveFlow(AppState& st, int fluid, float aoaDeg, float sideslipDeg,
-                                     int preset) {
+void SimManager::configureActiveFlow(AppState& st, int fluid, float aoaDeg, float sideslipDeg, int preset) {
     if (sel_ < 0 || sel_ >= (int)studies_.size()) return;
     Study& s = studies_[sel_];
     s.flowFluid = fluid;
@@ -2483,6 +2533,8 @@ nlohmann::json SimManager::facePointsFor(AppState& st, const nlohmann::json& sel
 }
 
 void SimManager::run(AppState& st, Study& s) {
+    // Always re-seed material from the part so a FeatureManager / Mass Props change is honored.
+    resolveStudyMaterialFromDoc(st, s);
     if (s.type == StudyType::Motion)         runMotion(st, s);
     else if (isFlowFamily(s.type))           runFlow(st, s);
     else if (s.type == StudyType::Fatigue)   runFatigue(st, s);
@@ -3388,6 +3440,7 @@ bool SimManager::drawPanelHeader(AppState& st, Study& s) {
 
 void SimManager::drawStudyRow(AppState& st, int i) {
     Study& s = studies_[i];
+    resolveStudyMaterialFromDoc(st, s);
     ImGui::PushID(i);
     const bool selStudy = (sel_ == i);
 
@@ -3462,7 +3515,9 @@ void SimManager::drawStudyRow(AppState& st, int i) {
 
         const std::string matName = [&]{
             int mi = materialIndexByKey(s.materialKey);
-            return mi >= 0 ? materials()[mi].name : std::string("(not set)");
+            if (mi >= 0) return materials()[mi].name;
+            if (!s.materialKey.empty()) return materialDisplayName(s.materialKey);
+            return std::string("(not set)");
         }();
         // Material drives stiffness/density/yield for structural & frequency studies. Flow/Thermal
         // run the OpenFOAM pipeline (flowSolidKappa is set directly in the form) and never read
@@ -3575,7 +3630,8 @@ void SimManager::drawCustomMaterialPopup(AppState& st, Study& s) {
             m.name = cmName_; m.E_mpa = cmE_; m.nu = cmNu_;
             m.density_g_cm3 = cmDensity_; m.yield_mpa = cmYield_;
             m.ultimate_mpa = cmUlt_; m.endurance_mpa = cmEnd_;
-            s.materialKey = addCustomMaterial(m);
+            // Custom material becomes the part's active material (set_material) too.
+            applyPartMaterial(st, s, addCustomMaterial(m));
             persist(st, s);
             ImGui::CloseCurrentPopup();
         }
@@ -3588,11 +3644,14 @@ void SimManager::drawCustomMaterialPopup(AppState& st, Study& s) {
 }
 
 void SimManager::drawMaterialCombo(AppState& st, Study& s) {
+    // Live-resolve from the part so FeatureManager / Mass Props material changes show here.
+    resolveStudyMaterialFromDoc(st, s);
     const float S = ui::uiScale;
     const float fh = ImGui::GetFrameHeight();   // square +-button matches the combo height
     const auto& mats = materials();
     int mi = materialIndexByKey(s.materialKey);
-    const char* cur = mi >= 0 ? mats[mi].name.c_str() : "(select material)";
+    const char* cur = mi >= 0 ? mats[mi].name.c_str()
+                    : (!s.materialKey.empty() ? s.materialKey.c_str() : "(select material)");
     ImGui::SetNextItemWidth(-(fh + 6.0f * S));
     if (ImGui::BeginCombo("##material", cur)) {
         bool customHeader = false;
@@ -3603,13 +3662,17 @@ void SimManager::drawMaterialCombo(AppState& st, Study& s) {
                 customHeader = true;
             }
             if (ImGui::Selectable(mats[i].name.c_str(), mi == i)) {
-                s.materialKey = mats[i].key; persist(st, s);
+                // Write set_material on the part (one shared material) and mirror onto the study.
+                applyPartMaterial(st, s, mats[i].key);
+                persist(st, s);
             }
+            if (mi == i) ImGui::SetItemDefaultFocus();
         }
         ImGui::EndCombo();
     }
     simTip("Material defines stiffness (E), Poisson ratio, density and yield strength used for the "
-           "stress / factor-of-safety solve.");
+           "stress / factor-of-safety solve. Changing it updates the part's active material "
+           "(FeatureManager Material row + Mass Properties).");
     ImGui::SameLine(0, 4.0f * S);
     if (ImGui::Button("+##newmat", ImVec2(fh, fh))) {
         // Seed the editor from the current pick (or sensible aluminum defaults) and open.
@@ -3629,6 +3692,11 @@ void SimManager::drawMaterialCombo(AppState& st, Study& s) {
         pushDimText();
         ImGui::TextWrapped("E %.0f MPa  -  nu %.2f  -  yield %.0f MPa  -  rho %.2f g/cm3",
                            m.E_mpa, m.nu, m.yield_mpa, m.density_g_cm3);
+        popDimText();
+    } else if (!s.materialKey.empty()) {
+        pushDimText();
+        ImGui::TextWrapped("Part material '%s' is not in the library — pick a library material.",
+                           s.materialKey.c_str());
         popDimText();
     }
 }
@@ -3931,6 +3999,7 @@ void SimManager::drawMeshForm(AppState& st, Study& s) {
 void SimManager::drawFatigueForm(AppState& st, Study& s) {
     const float S = ui::uiScale;
     UnitSys u = unitSys(st);
+    resolveStudyMaterialFromDoc(st, s);
     const int mati = materialIndexByKey(s.materialKey);
     const double matSut = mati >= 0 ? materials()[mati].ultimate_mpa : 0.0;
     const double matSe = mati >= 0 ? materials()[mati].endurance_mpa : 0.0;
@@ -4992,6 +5061,8 @@ void SimManager::drawStudyChecklist(AppState& st, Study& s) {
 
 void SimManager::drawForm(AppState& st, Study& s) {
     const float S = ui::uiScale;
+    // Keep study materialKey in lockstep with the part's active material.
+    resolveStudyMaterialFromDoc(st, s);
 
     // Header: study name (editable).
     ImGui::PushFont(st.fonts.medium);

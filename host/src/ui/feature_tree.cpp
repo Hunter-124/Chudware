@@ -689,6 +689,237 @@ static void flushPendingTreeOps(AppState& st) {
     applyTreeOpsNow(st, batch, labels.c_str());
 }
 
+// ---- Nested component "Assign Material" (assembly FeatureManager) ----
+// The part Material node routes through applyTreeOps on the ACTIVE doc. Nested component rows
+// display a READ of a foreign part's document.json (mtime-cached NestedDocument), so assigning
+// must open THAT part by path, apply set_material (+ derived set_appearance), save, and close —
+// never touch the assembly. When the component is already the active edit target (enterComponentEdit
+// / openComponentPart), apply on that live mirror instead of double-opening.
+// Menu selection only ENQUEUES (same UAF hazard as applyTreeOps while the tree walks NestedDocument
+// / assembly tree json); flushPendingNestedMaterial applies after the walk.
+struct PendingNestedMaterial {
+    std::string absPath;
+    std::string key;   // empty => Remove Material (set_material key:null)
+    bool        remove = false;
+};
+static std::vector<PendingNestedMaterial> s_pendingNestedMaterial;
+
+static std::string canonicalDocPath(const std::string& path) {
+    if (path.empty()) return {};
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::path want = fs::weakly_canonical(fs::path(path), ec);
+    if (ec) want = fs::path(path).lexically_normal();
+    return want.string();
+}
+
+static bool pathsMatchCanonical(const std::string& a, const std::string& b) {
+    if (a.empty() || b.empty()) return false;
+    return canonicalDocPath(a) == canonicalDocPath(b);
+}
+
+// Build set_material + per-body set_appearance ops matching the part Material menu.
+static nlohmann::json nestedMaterialOps(const std::string& key, bool remove,
+                                        const std::vector<uint32_t>& bodiesIn) {
+    nlohmann::json ops = nlohmann::json::array();
+    if (remove || key.empty()) {
+        ops.push_back({{"op", "set_material"}, {"key", nullptr}});
+        return ops;
+    }
+    float col[3]; float mtl = 0.0f, rgh = 0.5f;
+    materialAppearance(key, col, mtl, rgh);
+    ops.push_back({{"op", "set_material"}, {"key", key}});
+    std::vector<uint32_t> bodies = bodiesIn;
+    if (bodies.empty()) bodies.push_back(1);
+    for (uint32_t bid : bodies)
+        ops.push_back({{"op", "set_appearance"},
+                       {"id", "b" + std::to_string(bid)},
+                       {"color", {col[0], col[1], col[2]}},
+                       {"metallic", mtl}, {"roughness", rgh}});
+    return ops;
+}
+
+// Collect AICM body ordinals from an ops-response / open envelope (owner_map or tess.bodies).
+static std::vector<uint32_t> bodyIdsFromWorkerEnvelope(const nlohmann::json& res) {
+    std::vector<uint32_t> bodies;
+    auto pushId = [&](uint32_t id) {
+        if (id == 0) return;
+        if (std::find(bodies.begin(), bodies.end(), id) == bodies.end())
+            bodies.push_back(id);
+    };
+    if (res.contains("owner_map") && res["owner_map"].is_object()) {
+        for (auto it = res["owner_map"].begin(); it != res["owner_map"].end(); ++it) {
+            if (!it.value().is_object()) continue;
+            auto b = it.value().find("bodies");
+            if (b == it.value().end() || !b->is_array()) continue;
+            for (const auto& e : *b)
+                if (e.is_number_integer()) pushId((uint32_t)e.get<long long>());
+        }
+    }
+    if (bodies.empty() && res.contains("tess") && res["tess"].is_object()) {
+        const auto& tess = res["tess"];
+        if (tess.contains("bodies") && tess["bodies"].is_array()) {
+            for (const auto& b : tess["bodies"]) {
+                if (b.is_object() && b.contains("id") && b["id"].is_number_integer())
+                    pushId((uint32_t)b["id"].get<long long>());
+                else if (b.is_number_integer())
+                    pushId((uint32_t)b.get<long long>());
+            }
+        }
+        if (bodies.empty() && tess.contains("body_count") && tess["body_count"].is_number_integer()) {
+            int n = tess["body_count"].get<int>();
+            for (int i = 1; i <= n; ++i) pushId((uint32_t)i);
+        }
+    }
+    if (bodies.empty()) bodies.push_back(1);
+    return bodies;
+}
+
+// Apply material to a component part that is ALREADY the active DocMirror (in-context edit or
+// openComponentPart tab). Does NOT save — the user owns that file; the live tree Material node
+// updates immediately via applyTreeOpsNow (safe: we only call this from post-walk flush).
+// NestedDocument re-reads on next save/exit (mtime-keyed cache).
+static void applyNestedMaterialOnActiveMirror(AppState& st, const std::string& key, bool remove) {
+    if (!st.docMirror.hasDoc() || !st.workerStarted) return;
+    std::vector<uint32_t> bodies = st.docBodyIds;
+    if (bodies.empty()) bodies.push_back(1);
+    applyTreeOpsNow(st, nestedMaterialOps(key, remove, bodies), "set_material");
+}
+
+// Open component .step+ off-mirror, apply set_material (+ appearances), save, close. Leaves the
+// assembly mirror untouched. Invalidates the NestedDocument cache so the row re-reads material.
+static void applyNestedMaterialOnDisk(AppState& st, const std::string& absPath,
+                                      const std::string& key, bool remove) {
+    if (!st.workerStarted || absPath.empty()) return;
+    nlohmann::json openRes;
+    std::string err;
+    if (!st.worker.call("doc_open", nlohmann::json{{"path", absPath}}, openRes, err)) {
+        st.addLog("[material] open component failed: " + err);
+        st.toast(ui::ToastLevel::Error, "Assign Material: open failed");
+        return;
+    }
+    if (openRes.contains("code")) {
+        const std::string msg = openRes.value("message", std::string("open failed"));
+        st.addLog("[material] open component failed: " + msg);
+        st.toast(ui::ToastLevel::Error, "Assign Material: " + msg);
+        return;
+    }
+    const std::string did = openRes.value("doc_id", std::string());
+    if (did.empty()) {
+        st.toast(ui::ToastLevel::Error, "Assign Material: open returned no doc_id");
+        return;
+    }
+    // Never steal the assembly's active doc_id — if open re-bound an already-open tab doc, bail
+    // without applying (the live-mirror path should have caught this). Close only when the id is
+    // distinct from every open tab AND the active mirror.
+    auto isLiveDocId = [&](const std::string& id) -> bool {
+        if (id.empty()) return false;
+        if (st.docMirror.docId() == id) return true;
+        for (const auto& t : st.docTabs)
+            if (t.docId == id) return true;
+        return false;
+    };
+    const bool alreadyLive = isLiveDocId(did);
+    if (alreadyLive) {
+        // Component is open as a tab/mirror but path matching missed (or handoff). Apply via
+        // mirror only when it IS the active doc; otherwise refuse rather than mutating a parked
+        // tab's worker doc without activating it.
+        if (st.docMirror.docId() == did) {
+            applyNestedMaterialOnActiveMirror(st, key, remove);
+            return;
+        }
+        st.toast(ui::ToastLevel::Warn,
+                 "Assign Material: open the component part first (or Edit Model)");
+        return;
+    }
+
+    const int rev = openRes.value("revision", 0);
+    const std::vector<uint32_t> bodies = bodyIdsFromWorkerEnvelope(openRes);
+    const nlohmann::json ops = nestedMaterialOps(key, remove, bodies);
+    nlohmann::json applyRes;
+    if (!st.worker.call("doc_apply_ops",
+            nlohmann::json{{"doc_id", did}, {"base_revision", rev}, {"ops", ops}},
+            applyRes, err)) {
+        st.addLog("[material] apply on component failed: " + err);
+        st.toast(ui::ToastLevel::Error, "Assign Material failed: " + err);
+        nlohmann::json cl; std::string cerr;
+        st.worker.call("doc_close", nlohmann::json{{"doc_id", did}}, cl, cerr);
+        return;
+    }
+    if (applyRes.contains("code")) {
+        const std::string msg = applyRes.value("message", std::string("apply failed"));
+        st.addLog("[material] apply on component failed: " + msg);
+        st.toast(ui::ToastLevel::Error, "Assign Material failed: " + msg);
+        nlohmann::json cl; std::string cerr;
+        st.worker.call("doc_close", nlohmann::json{{"doc_id", did}}, cl, cerr);
+        return;
+    }
+    nlohmann::json saveRes;
+    if (!st.worker.call("doc_save",
+            nlohmann::json{{"doc_id", did}, {"path", absPath}}, saveRes, err) ||
+        saveRes.contains("code")) {
+        const std::string msg = saveRes.contains("code")
+            ? saveRes.value("message", std::string("save failed")) : err;
+        st.addLog("[material] save component failed: " + msg);
+        st.toast(ui::ToastLevel::Error, "Assign Material: save failed");
+        nlohmann::json cl; std::string cerr;
+        st.worker.call("doc_close", nlohmann::json{{"doc_id", did}}, cl, cerr);
+        return;
+    }
+    nlohmann::json cl; std::string cerr;
+    st.worker.call("doc_close", nlohmann::json{{"doc_id", did}}, cl, cerr);
+
+    // Force NestedDocument re-parse: save bumps mtime, but also drop the slot so a same-frame
+    // re-draw (or coarse FS mtime) cannot keep "not specified".
+    ui::invalidateFeatureTreeNestedDocument(absPath);
+    (void)ui::featureTreeNestedDocument(absPath);
+
+    const char* label = "removed";
+    if (!remove && !key.empty()) {
+        label = key.c_str();
+        for (int i = 0; i < kPhysicalMaterialsCount; ++i)
+            if (key == kPhysicalMaterials[i].key) { label = kPhysicalMaterials[i].name; break; }
+    }
+    st.addLog(std::string("[material] component ") + absPath + " -> " + label);
+    st.toast(ui::ToastLevel::Info,
+             remove ? "Material removed from component"
+                    : (std::string("Material: ") + label));
+}
+
+static void queueNestedMaterial(const std::string& absPath, const std::string& key, bool remove) {
+    if (absPath.empty()) return;
+    s_pendingNestedMaterial.push_back({absPath, key, remove});
+}
+
+static void flushPendingNestedMaterial(AppState& st) {
+    if (s_pendingNestedMaterial.empty()) return;
+    auto pending = std::move(s_pendingNestedMaterial);
+    s_pendingNestedMaterial.clear();
+    for (const auto& p : pending) {
+        if (p.absPath.empty()) continue;
+        // Prefer the live mirror when this component is the active edit target.
+        bool useMirror = false;
+        if (st.docMirror.hasDoc()) {
+            if (st.inComponentEdit() &&
+                pathsMatchCanonical(st.componentEdit.sourcePath, p.absPath))
+                useMirror = true;
+            else {
+                // Active tab path matches the component source (user Open Part'd it).
+                if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size()) {
+                    const auto& tab = st.docTabs[st.activeTab];
+                    if (!tab.path.empty() && pathsMatchCanonical(tab.path, p.absPath) &&
+                        tab.docId == st.docMirror.docId())
+                        useMirror = true;
+                }
+            }
+        }
+        if (useMirror)
+            applyNestedMaterialOnActiveMirror(st, p.key, p.remove);
+        else
+            applyNestedMaterialOnDisk(st, p.absPath, p.key, p.remove);
+    }
+}
+
 // Inline-rename state: which feature id is being renamed + its edit buffer.
 static std::string s_renamingId;
 static char        s_renameBuf[128] = {0};
@@ -2259,12 +2490,67 @@ static void drawNestedDocumentContents(AppState& st, const std::string& idPrefix
                                        std::unordered_set<std::string>& pathStack,
                                        int depth) {
     // Material-only info row (no part filename — the parent component row already owns that).
+    // Right-click Assign Material writes the component PART file (not the assembly): open by path,
+    // set_material + derived set_appearance, save, close. Unresolved path stays display-only.
     {
-        const std::string mat = nestedMaterialLabel(document.materialKey);
+        const std::string matKey = document.materialKey;
+        const std::string mat = nestedMaterialLabel(matKey);
         std::string tip = "Material: " + mat;
         if (!document.path.empty()) tip += "\n" + document.path;
         else if (!document.fileName.empty()) tip += "\n" + document.fileName;
-        drawNestedInfoRow(idPrefix + "_info", mat, "material", "[i]", tip);
+        const std::string rowId = idPrefix + "_info";
+        // Prefer NestedDocument.path (absolute source) over the caller's sourcePath when both set.
+        const std::string componentPath =
+            !document.path.empty() ? document.path : sourcePath;
+        const bool canAssign = !componentPath.empty() &&
+            document.state == ui::NestedDocumentState::Ready &&
+            st.workerStarted;
+
+        FmRowRect rect = fmRowPill();
+        const ImVec2 rowPos = ImGui::GetCursorScreenPos();
+        const float iconReserve = ImGui::GetTreeNodeToLabelSpacing() + 8.0f * ui::uiScale;
+        const float maxW = std::max(8.0f, ImGui::GetContentRegionAvail().x - iconReserve);
+        const std::string clipped = fmEllipsize(mat, maxW);
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(fmPalette().textDim[0], fmPalette().textDim[1],
+                   fmPalette().textDim[2], 0.72f));
+        ImGui::TreeNodeEx((clipped + "##" + rowId).c_str(),
+            ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen |
+            ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_FramePadding);
+        ImGui::PopStyleColor();
+        treeIconInArrowSlot(rowPos, "material", "[i]", 0.72f);
+        fmRowPillEnd(rect);
+
+        if (canAssign) {
+            // Mirror the part Material node menu (feature_tree ~3703): curated keys + Remove.
+            // Selection is deferred via queueNestedMaterial — flush after the tree walk.
+            pushTreePopupGlass();
+            if (ImGui::BeginPopupContextItem(("##nmat_ctx_" + rowId).c_str())) {
+                ImGui::TextDisabled("Assign Material");
+                ImGui::Separator();
+                for (int i = 0; i < kPhysicalMaterialsCount; ++i) {
+                    const auto& pm = kPhysicalMaterials[i];
+                    const bool cur = (matKey == pm.key);
+                    if (ImGui::MenuItem(pm.name, nullptr, cur))
+                        queueNestedMaterial(componentPath, pm.key, /*remove=*/false);
+                }
+                if (!matKey.empty()) {
+                    ImGui::Separator();
+                    if (ImGui::MenuItem("Remove Material"))
+                        queueNestedMaterial(componentPath, {}, /*remove=*/true);
+                }
+                ImGui::EndPopup();
+            }
+            popTreePopupGlass();
+        }
+
+        if (ImGui::IsItemHovered()) {
+            if (canAssign && matKey.empty())
+                ImGui::SetTooltip("No material assigned — right-click to assign\n%s",
+                                 tip.c_str());
+            else
+                ImGui::SetTooltip("%s", tip.c_str());
+        }
     }
 
     // Nested children (feature history + sub-components) sit one indent step under the parent
@@ -5435,6 +5721,9 @@ void drawFeatureTreeBody(AppState& st,
     // Wave 4C: run any copy/cut/paste requested from a row context menu (deferred to here because
     // the copy's DocMirror call replaces the tree json the menu was drawn over).
     flushPendingClipboard(st);
+    // Nested component Assign Material: open/apply/save/close the component part by path (or apply
+    // on the live mirror when Edit Model / Open Part has that part active). Deferred like tree ops.
+    flushPendingNestedMaterial(st);
 
     ImGui::PopStyleVar();  // compact ItemSpacing (pushed at top of body)
 }

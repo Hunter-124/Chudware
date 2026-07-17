@@ -49,4 +49,9 @@ struct NestedDocument {
 // steady frames while a save from an in-context edit is picked up immediately.
 const NestedDocument& featureTreeNestedDocument(const std::string& absPath);
 
+// Drop a path from the nested-document cache (or the whole cache when absPath is empty). Call after
+// an out-of-band save of a component .step+ so the next tree draw re-reads material/features even if
+// the filesystem mtime granularity would otherwise keep the prior slot for one more frame.
+void invalidateFeatureTreeNestedDocument(const std::string& absPath = {});
+
 }  // namespace ui

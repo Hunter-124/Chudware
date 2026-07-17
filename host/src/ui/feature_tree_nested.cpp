@@ -182,4 +182,15 @@ const NestedDocument& featureTreeNestedDocument(const std::string& inputPath) {
     return slots.insert_or_assign(absPath, std::move(slot)).first->second.doc;
 }
 
+void invalidateFeatureTreeNestedDocument(const std::string& absPath) {
+    auto& slots = cache();
+    if (absPath.empty()) {
+        slots.clear();
+        return;
+    }
+    const std::string key = normalizePath(absPath);
+    if (key.empty()) return;
+    slots.erase(key);
+}
+
 }  // namespace ui

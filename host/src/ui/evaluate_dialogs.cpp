@@ -234,8 +234,10 @@ void EvaluateDialogs::clearFieldColormap(AppState& st) {
 void EvaluateDialogs::seedMassFromDoc(AppState& st) {
     massDocKey_.clear();
     massDocName_ = "(not set)";
-    massDensity_ = 7.85f;
-    massMaterial_ = 1;  // Steel preset after Document slot
+    // Density falls back to steel only when the part has no material and the user has not set a
+    // custom override. Callers that open the window clear massCustomDensity_ first so this seeds
+    // the live density from the part material.
+    if (!massCustomDensity_) massDensity_ = 7.85f;
     if (!st.docMirror.hasDoc()) return;
     const auto& tree = st.docMirror.tree();
     if (!tree.is_object()) return;
@@ -245,8 +247,7 @@ void EvaluateDialogs::seedMassFromDoc(AppState& st) {
     if (key.empty()) return;
     massDocKey_ = key;
     massDocName_ = materialDisplayName(key);
-    massDensity_ = materialDensityGcm3(key);
-    massMaterial_ = 0;  // Document material row
+    if (!massCustomDensity_) massDensity_ = materialDensityGcm3(key);
 }
 
 // C39: evals run async on st.rpc — heavy methods (interference, thickness on a dense model)
@@ -1184,6 +1185,7 @@ void EvaluateDialogs::tickSectionDrag(AppState& st) {
 
 bool EvaluateDialogs::handleCommand(AppState& st, const std::string& cmdId) {
     if (cmdId == "eval_mass_props") {
+        massCustomDensity_ = false;
         seedMassFromDoc(st);
         designSections_ = nlohmann::json::array({nullptr, nullptr, nullptr});
         designSectionsDirty_ = false;
@@ -1305,62 +1307,103 @@ void EvaluateDialogs::drawMassWindow(AppState& st) {
             ui::adaptivePanel(ui::panelId("host_eval_mass_glass"), winRect, ui::GlassGroup::Global);
         ui::glassPanel(ImGui::GetWindowDrawList(), winRect, ui::GlassLevel::Regular, 12.0f, surf);
         ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
-
-        static const struct {
-            const char* name;
-            float d;
-        } kPresets[] = {
-            {"Steel", 7.85f},      {"Stainless", 8.00f}, {"Aluminum", 2.70f},
-            {"Titanium", 4.51f},   {"Brass", 8.50f},     {"ABS plastic", 1.05f},
-            {"PLA", 1.24f},        {"Custom", 0.0f},
+        // Material combo lists curated physical materials (same keys as FeatureManager Material).
+        // Selecting one WRITES set_material (+ derived set_appearance) so mass, sim, and the tree
+        // all share ONE active part material. Density follows that key unless the user has set an
+        // explicit advanced density override below.
+        auto applyMassMaterial = [&](const std::string& key) {
+            if (!st.docMirror.hasDoc() || !st.workerStarted) return;
+            std::vector<uint32_t> bodies = st.docBodyIds;
+            if (bodies.empty()) bodies.push_back(1);
+            float col[3]; float mtl = 0.0f, rgh = 0.5f;
+            materialAppearance(key, col, mtl, rgh);
+            nlohmann::json ops = nlohmann::json::array();
+            ops.push_back({{"op", "set_material"}, {"key", key}});
+            for (uint32_t bid : bodies)
+                ops.push_back({{"op", "set_appearance"},
+                               {"id", "b" + std::to_string(bid)},
+                               {"color", {col[0], col[1], col[2]}},
+                               {"metallic", mtl}, {"roughness", rgh}});
+            // Optimistic local update so density re-evals immediately; DocMirror listener
+            // will confirm via the tree once applyOpsAsync drains.
+            massDocKey_ = key;
+            massDocName_ = materialDisplayName(key);
+            massCustomDensity_ = false;
+            massDensity_ = materialDensityGcm3(key);
+            ++st.rebuildsInFlight;
+            st.docMirror.applyOpsAsync(st.rpc, st.worker, ops,
+                [&st](const core::OpsResponse& resp, bool applied) {
+                    --st.rebuildsInFlight;
+                    if (!applied) return;
+                    if (resp.ok && !resp.aicm_path.empty()) {
+                        st.loadDocMeshAsync(resp.aicm_path);
+                    } else if (!resp.ok) {
+                        st.addLog(std::string("[err] set_material: ") + resp.error_message);
+                        if (resp.error_code != "transport")
+                            st.toast(ui::ToastLevel::Error,
+                                     std::string("set_material failed: ") +
+                                     (resp.error_message.empty() ? resp.error_code
+                                                                 : resp.error_message));
+                    }
+                    if (resp.ok) st.markActiveTabDirty();
+                });
+            runMassEval(st, {{"density_g_cm3", (double)massDensity_}});
         };
-        const int kPresetN = (int)(sizeof(kPresets) / sizeof(kPresets[0]));
-        const int kCustom = kPresetN;
+
+        // Live re-seed from doc while open (FeatureManager / sim may have changed the material).
+        // Skip when a custom density override is active so we don't clobber the user's override.
+        {
+            std::string liveKey;
+            if (st.docMirror.hasDoc()) {
+                const auto& tree = st.docMirror.tree();
+                if (tree.is_object() && tree.contains("material") && tree["material"].is_object())
+                    liveKey = tree["material"].value("key", std::string());
+            }
+            if (liveKey != massDocKey_) {
+                massDocKey_ = liveKey;
+                massDocName_ = materialDisplayName(liveKey);
+                if (!massCustomDensity_) {
+                    massDensity_ = liveKey.empty() ? 7.85f : materialDensityGcm3(liveKey);
+                    if (!massPending_)
+                        runMassEval(st, {{"density_g_cm3", (double)massDensity_}});
+                }
+            }
+        }
 
         if (!massDocKey_.empty())
-            ImGui::Text("Document: %s", massDocName_.c_str());
+            ImGui::Text("Part material: %s", massDocName_.c_str());
         else
-            ImGui::TextDisabled("Document material: not set");
+            ImGui::TextDisabled("Part material: not set");
 
         ImGui::SetNextItemWidth(180 * ui::uiScale);
-        int comboIdx = massMaterial_;
-        std::string comboLabel;
-        if (comboIdx == 0 && !massDocKey_.empty())
-            comboLabel = "Document: " + massDocName_;
-        else if (comboIdx >= 1 && comboIdx <= kPresetN)
-            comboLabel = kPresets[comboIdx - 1].name;
-        else
-            comboLabel = "Custom";
+        const std::string comboLabel = massDocKey_.empty()
+            ? std::string("(select material)")
+            : massDocName_;
         if (ImGui::BeginCombo("Material", comboLabel.c_str())) {
-            if (!massDocKey_.empty()) {
-                bool sel = (massMaterial_ == 0);
-                if (ImGui::Selectable(("Document: " + massDocName_).c_str(), sel)) {
-                    massMaterial_ = 0;
-                    massDensity_ = materialDensityGcm3(massDocKey_);
-                    runMassEval(st, {{"density_g_cm3", (double)massDensity_}});
-                }
-                if (sel) ImGui::SetItemDefaultFocus();
-            }
-            for (int i = 0; i < kPresetN; ++i) {
-                int idx = i + 1;
-                bool sel = (massMaterial_ == idx);
-                if (ImGui::Selectable(kPresets[i].name, sel)) {
-                    massMaterial_ = idx;
-                    if (i != kPresetN - 1) {
-                        massDensity_ = kPresets[i].d;
-                        runMassEval(st, {{"density_g_cm3", (double)massDensity_}});
-                    }
-                }
+            for (int i = 0; i < kPhysicalMaterialsCount; ++i) {
+                const auto& pm = kPhysicalMaterials[i];
+                bool sel = (massDocKey_ == pm.key);
+                if (ImGui::Selectable(pm.name, sel)) applyMassMaterial(pm.key);
                 if (sel) ImGui::SetItemDefaultFocus();
             }
             ImGui::EndCombo();
         }
         ImGui::SetNextItemWidth(140 * ui::uiScale);
-        if (ImGui::DragFloat("Density", &massDensity_, 0.01f, 0.0f, 25.0f, "%.3f g/cm3",
-                             ImGuiSliderFlags_AlwaysClamp))
-            massMaterial_ = kCustom;
+        if (ImGui::DragFloat("Density (override)", &massDensity_, 0.01f, 0.0f, 25.0f,
+                             "%.3f g/cm3", ImGuiSliderFlags_AlwaysClamp))
+            massCustomDensity_ = true;
         if (ImGui::IsItemDeactivatedAfterEdit())
             runMassEval(st, {{"density_g_cm3", (double)massDensity_}});
+        if (massCustomDensity_ && !massDocKey_.empty()) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Reset##mass_dens")) {
+                massCustomDensity_ = false;
+                massDensity_ = materialDensityGcm3(massDocKey_);
+                runMassEval(st, {{"density_g_cm3", (double)massDensity_}});
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Restore density from the part material");
+        }
 
         if (!massErrorText_.empty()) {
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(gpal.statusErr[0], gpal.statusErr[1],

@@ -4,11 +4,12 @@
 // Curvature) return an {aicm_path} overlay that is loaded into the viewport with the result colormap
 // + legend on (reusing the C19 renderer scalar pass).
 //
-// Measure is live (re-evals on selection change). Mass Properties seeds density from the document
-// material key, exposes COM / section I / polar J / axial k, and drives viewport markers + body
+// Measure is live (re-evals on selection change). Mass Properties density DERIVES from the document
+// material key (doc.material.key via set_material) by default; the Material combo WRITES set_material
+// so changing it updates the part's active material. A manual density DragFloat is the only local
+// advanced override. Exposes COM / section I / polar J / axial k, and drives viewport markers + body
 // translucency via the overlay accessors below. Interference view tints bodies + overlap meshes;
 // Measure color-codes refs with viewport highlights + callouts.
-//
 // Wave 3: massMarkers_ carry COM + bending-I value chips (unit-aware); sectionPlanes_ expose three
 // draggable orthogonal cutting planes with live section-prop re-eval. Field tools dock into the
 // Evaluate ribbon dead-space strip (ui::evalRibbonDock).
@@ -160,10 +161,10 @@ private:
     std::string sectionErrorText_;
 
 
-    // Mass Properties material override: combo index into the density preset table + the live
-    // density (g/cm3) sent to eval_mass. Changing either re-runs the evaluation.
-    // massMaterial_ 0 = Document material (when key non-empty), else first preset.
-    int   massMaterial_ = 0;
+    // Mass Properties material: default density follows the active part material (doc.material.key).
+    // massCustomDensity_ is an explicit advanced override that does NOT change the part material.
+    // Changing the Material combo writes set_material (and derived set_appearance) to the doc.
+    bool  massCustomDensity_ = false;
     float massDensity_  = 7.85f;
     std::string massDocKey_;
     std::string massDocName_;

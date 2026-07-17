@@ -76,8 +76,66 @@ def _cad_graph_path(params: dict, _emit: Callable) -> dict:
                 "hint": "", "path": []}
 
 
+def _cad_graph_link_add(params: dict, _emit: Callable) -> dict:
+    """``cad_graph_link_add {project_dir, src, dst, kind, note?, origin?}``."""
+    try:
+        from services.plm import graph_links as gl
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"graph_links unavailable: {exc}", "hint": ""}
+    try:
+        p = params or {}
+        project_dir = p.get("project_dir") or p.get("path") or ""
+        if not project_dir:
+            return {"ok": False, "reason": "project_dir required", "hint": ""}
+        return gl.add_link(
+            project_dir,
+            str(p.get("src") or ""), str(p.get("dst") or ""),
+            str(p.get("kind") or ""),
+            note=str(p.get("note") or ""),
+            origin=str(p.get("origin") or "manual"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"cad_graph_link_add failed: {exc}", "hint": ""}
+
+
+def _cad_graph_link_remove(params: dict, _emit: Callable) -> dict:
+    """``cad_graph_link_remove {project_dir, link_id}``."""
+    try:
+        from services.plm import graph_links as gl
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"graph_links unavailable: {exc}", "hint": ""}
+    try:
+        p = params or {}
+        project_dir = p.get("project_dir") or p.get("path") or ""
+        if not project_dir:
+            return {"ok": False, "reason": "project_dir required", "hint": ""}
+        return gl.remove_link(project_dir, str(p.get("link_id") or ""))
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"cad_graph_link_remove failed: {exc}", "hint": ""}
+
+
+def _cad_graph_link_list(params: dict, _emit: Callable) -> dict:
+    """``cad_graph_link_list {project_dir} -> {ok, links}``."""
+    try:
+        from services.plm import graph_links as gl
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"graph_links unavailable: {exc}", "hint": ""}
+    try:
+        p = params or {}
+        project_dir = p.get("project_dir") or p.get("path") or ""
+        if not project_dir:
+            return {"ok": False, "reason": "project_dir required", "hint": "", "links": []}
+        return {"ok": True, "links": gl.list_links(project_dir)}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"cad_graph_link_list failed: {exc}",
+                "hint": "", "links": []}
+
+
 CAD_GRAPH_METHODS: dict[str, Callable[..., Any]] = {
     "cad_graph_get": _cad_graph_get,
     "cad_graph_blast": _cad_graph_blast,
     "cad_graph_path": _cad_graph_path,
+    "cad_graph_link_add": _cad_graph_link_add,
+    "cad_graph_link_remove": _cad_graph_link_remove,
+    "cad_graph_link_list": _cad_graph_link_list,
 }

@@ -328,6 +328,10 @@ register_doc_diff_tools(mcp)
 # Engine: services/plm/. Zero user-facing git vocabulary (contract §8).
 from mcp_server.plm_tools import register_plm_tools
 register_plm_tools(mcp)
+# CAD link graph (1D): cad_graph traversal + cad_graph_link (AI overlay) +
+# assembly_plan_review. Over services/plm/cad_graph.py + graph_links.py.
+from mcp_server.graph_tools import register_graph_tools
+register_graph_tools(_reg.view(mcp, "cad"))
 # Requirements (aicad.req/1): CRUD + markdown projection for design briefs.
 # Schema: contracts/requirements.md  Brain: engine_oracle/requirements/requirements.py
 from mcp_server.req_tools import register_req_tools

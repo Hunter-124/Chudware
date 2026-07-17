@@ -321,6 +321,7 @@ def test_rpc_methods_registered():
     from engine_oracle.parts_hub.cad_graph_rpc import CAD_GRAPH_METHODS
     assert set(CAD_GRAPH_METHODS) == {
         "cad_graph_get", "cad_graph_blast", "cad_graph_path",
+        "cad_graph_link_add", "cad_graph_link_remove", "cad_graph_link_list",
     }
     from engine_oracle.parts_hub import worker_rpc
     for name in CAD_GRAPH_METHODS:
@@ -349,3 +350,151 @@ def test_rpc_get_and_blast(project: Path):
 
     bad = CAD_GRAPH_METHODS["cad_graph_blast"]({}, _emit)
     assert bad["ok"] is False
+
+
+# ---------------------------------------------------------------------------
+# 1A — expression-driven links, equation nodes, mate values, cross-doc derive
+# ---------------------------------------------------------------------------
+
+
+def _expr_doc() -> dict:
+    return {
+        "schema": "aicad.part/1",
+        "id": "11111111-1111-4111-8111-111111111111",
+        "name": "P",
+        "equations": {"globals": [
+            {"name": "W", "expr": "6", "value": 6.0},
+            {"name": "W2", "expr": "W*2", "value": 12.0},
+        ]},
+        "features": [
+            {"id": "f1", "type": "box",
+             "params": {"width": {"value": 12, "expr": "W2"}}},
+        ],
+    }
+
+
+def test_equation_nodes_and_expr_links():
+    g = cad_graph.build_graph(None, open_docs={"d1": _expr_doc()}, force=True)
+    nodes = {n["id"]: n for n in g["nodes"]}
+    eqs = [n for n in nodes.values() if n["kind"] == "equation"]
+    assert {n["label"] for n in eqs} == {"W", "W2"}, eqs
+    # feature width expr "W2" → DERIVES_FROM the W2 equation node
+    df = [e for e in g["edges"] if e["kind"] == "DERIVES_FROM"]
+    assert any(e["meta"].get("dim", "").endswith("width")
+               and nodes[e["dst"]]["label"] == "W2"
+               and e["origin"] == "extracted" for e in df), df
+    # W2 expr "W*2" → DERIVES_FROM the W equation node
+    assert any(nodes[e["src"]]["label"] == "W2"
+               and nodes[e["dst"]]["label"] == "W"
+               and e["meta"].get("via") == "equation" for e in df), df
+
+
+def test_mate_value_edge_meta():
+    asm = {
+        "schema": "aicad.asm/1", "id": "22222222-2222-4222-8222-222222222222",
+        "name": "A",
+        "components": [
+            {"id": "k1", "name": "x", "source": {"path": "x.step+"}},
+            {"id": "k2", "name": "y", "source": {"path": "y.step+"}},
+        ],
+        "mates": [
+            {"id": "m1", "type": "distance",
+             "value": {"value": 25, "expr": None},
+             "refs": [{"component": "k1"}, {"component": "k2"}]},
+        ],
+    }
+    g = cad_graph.build_graph(None, open_docs={"d1": asm}, force=True)
+    mate = next(n for n in g["nodes"] if n["kind"] == "mate")
+    assert mate["meta"]["value"] == 25
+    medges = [e for e in g["edges"] if e["kind"] == "MATES"]
+    assert medges and all(e["meta"].get("value") == 25 for e in medges), medges
+
+
+def test_cross_doc_derives_from_resolved():
+    doc_a = {
+        "schema": "aicad.part/1", "id": "aaaaaaaa-1111-4111-8111-111111111111",
+        "name": "Master",
+        "features": [{"id": "f1", "type": "box", "params": {"w": 10}}],
+    }
+    doc_b = {
+        "schema": "aicad.part/1", "id": "bbbbbbbb-2222-4222-8222-222222222222",
+        "name": "Derived",
+        "features": [{"id": "f1", "type": "box", "params": {"w": 10},
+                      "derived_from": {
+                          "doc_id": "aaaaaaaa-1111-4111-8111-111111111111",
+                          "feature": "f1"}}],
+    }
+    g = cad_graph.build_graph(
+        None, open_docs={"a": doc_a, "b": doc_b}, force=True)
+    nodes = {n["id"]: n for n in g["nodes"]}
+    df = [e for e in g["edges"] if e["kind"] == "DERIVES_FROM"
+          and e["meta"].get("via") == "derived_from"]
+    assert df, [e for e in g["edges"] if e["kind"] == "DERIVES_FROM"]
+    assert any(nodes[e["dst"]]["label"] == "Master" for e in df), df
+
+
+def test_shared_value_edges_now_inferred(project: Path):
+    g = cad_graph.build_graph(project, force=True)
+    shared = [e for e in g["edges"] if e["kind"] == "REFERENCES"
+              and e["meta"].get("via") == "shared_value"]
+    assert shared, "expected shared-value REFERENCES edges"
+    assert all(e["origin"] == "inferred" for e in shared), shared
+
+
+# ---------------------------------------------------------------------------
+# 1D — assembly_advice best-practice advisor
+# ---------------------------------------------------------------------------
+
+
+def _adv_graph() -> dict:
+    nodes = [{"id": "project:root", "kind": "project", "label": "p"}]
+    edges = []
+
+    def N(nid, kind, label):
+        nodes.append({"id": nid, "kind": kind, "label": label})
+
+    def E(s, d, k):
+        edges.append({"src": s, "dst": d, "kind": k, "meta": {},
+                      "origin": "extracted"})
+
+    # assembly A: 5 components, 3 tightly mated (i1,i2,i3), 2 loose
+    N("doc:A", "assembly", "MainAsm")
+    for i in range(1, 6):
+        N(f"instance:doc:A:i{i}", "doc", f"Comp{i}")
+        E("doc:A", f"instance:doc:A:i{i}", "CONTAINS")
+    for mi, (a, b) in enumerate([(1, 2), (2, 3), (1, 3)], start=1):
+        N(f"mate:doc:A:m{mi}", "mate", "coincident")
+        E("doc:A", f"mate:doc:A:m{mi}", "CONTAINS")
+        E(f"mate:doc:A:m{mi}", f"instance:doc:A:i{a}", "MATES")
+        E(f"mate:doc:A:m{mi}", f"instance:doc:A:i{b}", "MATES")
+    # flat assembly B: 13 components, no mates
+    N("doc:B", "assembly", "FlatAsm")
+    for i in range(1, 14):
+        N(f"instance:doc:B:j{i}", "doc", f"Part{i}")
+        E("doc:B", f"instance:doc:B:j{i}", "CONTAINS")
+    # multi-body part C: 3 bodies
+    N("doc:C", "part", "Chunk")
+    for i in range(1, 4):
+        N(f"body:doc:C:b{i}", "body", f"Body{i}")
+        E("doc:C", f"body:doc:C:b{i}", "CONTAINS")
+    return {"nodes": nodes, "edges": edges}
+
+
+def test_assembly_advice_suggestions():
+    out = cad_graph.assembly_advice(_adv_graph())
+    assert out["ok"] is True
+    kinds = {s["kind"] for s in out["suggestions"]}
+    assert "extract_subassembly" in kinds, out
+    assert "group_into_subassemblies" in kinds, out
+    assert "split_multibody" in kinds, out
+    ex = next(s for s in out["suggestions"]
+              if s["kind"] == "extract_subassembly")
+    assert len(ex["components"]) == 3
+    assert out["narrative"]
+
+
+def test_assembly_advice_clean():
+    g = {"nodes": [{"id": "doc:A", "kind": "assembly", "label": "A"}],
+         "edges": []}
+    out = cad_graph.assembly_advice(g)
+    assert out["ok"] and out["suggestions"] == []

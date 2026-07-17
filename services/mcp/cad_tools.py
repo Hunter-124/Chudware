@@ -2858,6 +2858,13 @@ TRUE-ASSEMBLY WORKFLOW
   7. save_part(path) the assembly .step+; simulate_motion drives a dimensional mate for
      kinematics + swept-clash.
 
+BEST PRACTICE (structure)
+  * Build DEEP products as SUBASSEMBLIES — each its own .step+, mated into the parent —
+    never one monolithic file. It keeps mates, interference checks, and the BOM legible.
+  * Before a large assembly build call assembly_plan_review (extract-subassembly / group /
+    split-multibody advice) and use cad_graph to TRAVERSE an existing assembly's structure
+    and dimensional links.
+
 GOTCHAS
   * asm_* ops REQUIRE an assembly doc (new_assembly) — they are rejected on a part doc.
   * Components reference their source FILES: keep the .step+ files where the assembly can

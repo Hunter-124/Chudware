@@ -23,6 +23,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import time
 import zipfile
 from pathlib import Path
@@ -31,9 +32,15 @@ from typing import Any, Iterable
 ORIGIN_EXTRACTED = "extracted"
 ORIGIN_INFERRED = "inferred"
 
+# assembly best-practice advisor thresholds (assembly_advice)
+_SUBASM_MIN_CLUSTER = 3
+_FLAT_ASM_MAX = 12
+_MULTIBODY_MAX = 2
+
 NODE_KINDS = frozenset({
     "project", "doc", "part", "assembly", "body", "feature", "sketch",
     "mate", "bom_item", "drawing", "sim_study", "board", "firmware",
+    "equation",
 })
 EDGE_KINDS = frozenset({
     "CONTAINS", "DEPENDS_ON", "MATES", "INSTANCE_OF", "REFERENCES",
@@ -161,8 +168,47 @@ def build_graph(
         if doc_uuid:
             uuid_to_doc_node[doc_uuid] = dnode_id
 
+        # equations → equation nodes + shared-dim index (must precede the
+        # feature loop so expression-driven DERIVES_FROM edges can resolve).
+        eq_nodes: dict[str, str] = {}
+        globals_ = (doc.get("equations") or {}).get("globals") or []
+        for eq in globals_:
+            if not isinstance(eq, dict):
+                continue
+            ename = str(eq.get("name") or "")
+            if not ename:
+                continue
+            eexpr = eq.get("expr")
+            eval_ = eq.get("value", eexpr)
+            unit = eq.get("unit")
+            enode = f"eq:{dnode_id}:{ename}"
+            add_node({
+                "id": enode, "kind": "equation", "label": ename,
+                "path": rel or None, "doc_id": doc_id,
+                "meta": {"expr": eexpr, "value": eq.get("value"), "unit": unit},
+                "origin": ORIGIN_EXTRACTED,
+            })
+            add_edge(dnode_id, enode, "CONTAINS")
+            eq_nodes[ename] = enode
+            # keep the cross-doc shared-value index keyed by bare name
+            eq_index.setdefault(ename, []).append((dnode_id, eval_, unit))
+        # eq → eq DERIVES_FROM for globals that reference other globals
+        for eq in globals_:
+            if not isinstance(eq, dict):
+                continue
+            ename = str(eq.get("name") or "")
+            src_node = eq_nodes.get(ename)
+            if not src_node:
+                continue
+            for ref in _expr_names(eq.get("expr")):
+                tgt = eq_nodes.get(ref)
+                if tgt and tgt != src_node:
+                    add_edge(src_node, tgt, "DERIVES_FROM",
+                             meta={"expr": eq.get("expr"), "via": "equation"})
+
         # features + sketches
         feat_nodes: dict[str, str] = {}
+        pending_ext: list[tuple[str, Any, Any, bool]] = []
         for feat in doc.get("features") or []:
             if not isinstance(feat, dict):
                 continue
@@ -197,17 +243,45 @@ def build_graph(
                              meta={"via": "ref"})
             df = feat.get("derived_from")
             if isinstance(df, dict) and df.get("feature"):
-                # cross-doc derived — resolve later if possible
+                # cross-doc derived — resolved by the __resolve__ second pass
                 src_doc = df.get("doc_id") or df.get("doc_name")
                 src_feat = df.get("feature") or df.get("source_feature")
                 if src_doc and src_feat:
-                    # store as DERIVES_FROM to a synthetic key; resolve after
-                    pass  # resolved in second pass via meta
-            # dim ownership for shared-dim REFERENCES
-            for dkey, dval, dunit in _feature_dims(feat):
+                    edges.append({
+                        "src": fnode, "dst": f"__resolve__:{src_doc}",
+                        "kind": "DERIVES_FROM",
+                        "meta": {"feature": src_feat, "via": "derived_from"},
+                        "origin": ORIGIN_EXTRACTED,
+                    })
+            # dimensional links: shared-value index + expression-driven edges
+            for dkey, dval, dunit, dexpr in _feature_dims(feat):
                 dim_owners.setdefault(dkey, []).append(fnode)
-                # also index under equation-style name
                 eq_index.setdefault(dkey, []).append((fnode, dval, dunit))
+                if dexpr:
+                    for ref in _expr_names(dexpr):
+                        tgt = eq_nodes.get(ref)
+                        if tgt:
+                            add_edge(fnode, tgt, "DERIVES_FROM",
+                                     meta={"dim": dkey, "expr": dexpr,
+                                           "value": dval, "unit": dunit})
+            # external refs (associative convert-entities) → REFERENCES
+            fparams = feat.get("params") if isinstance(feat.get("params"), dict) else {}
+            ext = fparams.get("external_refs")
+            if not isinstance(ext, list):
+                ext = feat.get("external_refs")
+            if isinstance(ext, list):
+                for xr in ext:
+                    if not isinstance(xr, dict):
+                        continue
+                    xsrc = xr.get("source")
+                    if not isinstance(xsrc, dict):
+                        continue
+                    sel = xsrc.get("selector")
+                    owner = sel.get("owner_feature") if isinstance(sel, dict) else None
+                    owner = owner or xsrc.get("feature") or xsrc.get("owner_feature")
+                    cross = xsrc.get("doc") or xsrc.get("doc_id") or xsrc.get("path")
+                    pending_ext.append(
+                        (fnode, owner, cross, bool(xr.get("stale"))))
 
         # history order DEPENDS_ON (feature N depends on N-1) — inferred
         feat_list = [f for f in (doc.get("features") or []) if isinstance(f, dict) and f.get("id")]
@@ -220,6 +294,19 @@ def build_graph(
                            for e in edges):
                     add_edge(a, b, "DEPENDS_ON",
                              meta={"via": "history"}, origin=ORIGIN_INFERRED)
+
+        # resolve external refs now that this doc's feat_nodes is complete
+        for xfnode, xowner, xcross, xstale in pending_ext:
+            if xowner and str(xowner) in feat_nodes:
+                add_edge(xfnode, feat_nodes[str(xowner)], "REFERENCES",
+                         meta={"via": "external_ref", "stale": xstale})
+            elif xcross:
+                edges.append({
+                    "src": xfnode, "dst": f"__resolve__:{xcross}",
+                    "kind": "REFERENCES",
+                    "meta": {"via": "external_ref", "stale": xstale},
+                    "origin": ORIGIN_EXTRACTED,
+                })
 
         # bodies
         for body in doc.get("bodies") or []:
@@ -242,18 +329,6 @@ def build_graph(
                 add_edge(feat_nodes[str(owner)], bnode, "CONTAINS",
                          meta={"via": "owns_topo"})
 
-        # equations → dim index for cross-doc REFERENCES
-        globals_ = (doc.get("equations") or {}).get("globals") or []
-        for eq in globals_:
-            if not isinstance(eq, dict):
-                continue
-            ename = str(eq.get("name") or "")
-            if not ename:
-                continue
-            eval_ = eq.get("value", eq.get("expr"))
-            unit = eq.get("unit")
-            eq_index.setdefault(ename, []).append((dnode_id, eval_, unit))
-
         # mates (assemblies)
         for mate in doc.get("mates") or []:
             if not isinstance(mate, dict):
@@ -262,6 +337,15 @@ def build_graph(
             if not mid:
                 continue
             mtype = str(mate.get("type") or mate.get("kind") or "mate")
+            mval_raw = mate.get("value")
+            if isinstance(mval_raw, dict):
+                mval = mval_raw.get("value")
+                mexpr = mval_raw.get("expr")
+                munit = mval_raw.get("unit") or mate.get("unit")
+            elif isinstance(mval_raw, (int, float)):
+                mval, mexpr, munit = mval_raw, None, mate.get("unit")
+            else:
+                mval, mexpr, munit = None, None, mate.get("unit")
             mnode = f"mate:{dnode_id}:{mid}"
             add_node({
                 "id": mnode, "kind": "mate", "label": mtype,
@@ -270,6 +354,7 @@ def build_graph(
                     "mate_id": mid, "type": mtype,
                     "suppressed": bool(mate.get("suppressed")),
                     "refs": mate.get("refs") or [],
+                    "value": mval, "unit": munit, "expr": mexpr,
                 },
                 "origin": ORIGIN_EXTRACTED,
             })
@@ -287,7 +372,17 @@ def build_graph(
                         "origin": ORIGIN_INFERRED,
                     })
                     add_edge(dnode_id, cnode, "CONTAINS", origin=ORIGIN_INFERRED)
-                add_edge(mnode, cnode, "MATES", meta={"type": mtype})
+                add_edge(mnode, cnode, "MATES",
+                         meta={"type": mtype, "value": mval,
+                               "unit": munit, "expr": mexpr})
+            # mate expr referencing a global → DERIVES_FROM
+            if mexpr:
+                for ref in _expr_names(mexpr):
+                    tgt = eq_nodes.get(ref)
+                    if tgt:
+                        add_edge(mnode, tgt, "DERIVES_FROM",
+                                 meta={"expr": mexpr, "value": mval,
+                                       "unit": munit})
 
         # components → INSTANCE_OF + BOM
         bom_counts: dict[str, int] = {}
@@ -346,18 +441,32 @@ def build_graph(
                 "origin": ORIGIN_EXTRACTED,
             })
 
-        # drawing → DOCUMENTS source
-        for key in ("source", "source_doc", "part"):
-            sref = doc.get(key)
-            if isinstance(sref, dict):
-                sref = sref.get("path") or sref.get("doc_id")
-            if isinstance(sref, str) and sref:
-                edges.append({
-                    "src": dnode_id, "dst": f"__resolve__:{sref}",
-                    "kind": "DOCUMENTS",
-                    "meta": {"via": key}, "origin": ORIGIN_EXTRACTED,
-                })
-                break
+        # drawing → DOCUMENTS source / cam → MANUFACTURES source
+        if str(schema).split("/", 1)[0] == "aicad.cam":
+            for key in ("source", "source_doc", "part", "stock"):
+                sref = doc.get(key)
+                if isinstance(sref, dict):
+                    sref = (sref.get("from_solid") if key == "stock"
+                            else (sref.get("path") or sref.get("doc_id")))
+                if isinstance(sref, str) and sref:
+                    edges.append({
+                        "src": dnode_id, "dst": f"__resolve__:{sref}",
+                        "kind": "MANUFACTURES",
+                        "meta": {"via": key}, "origin": ORIGIN_EXTRACTED,
+                    })
+                    break
+        else:
+            for key in ("source", "source_doc", "part"):
+                sref = doc.get(key)
+                if isinstance(sref, dict):
+                    sref = sref.get("path") or sref.get("doc_id")
+                if isinstance(sref, str) and sref:
+                    edges.append({
+                        "src": dnode_id, "dst": f"__resolve__:{sref}",
+                        "kind": "DOCUMENTS",
+                        "meta": {"via": key}, "origin": ORIGIN_EXTRACTED,
+                    })
+                    break
 
         # studies inside document.json
         for study in doc.get("studies") or []:
@@ -423,12 +532,28 @@ def build_graph(
                 val = json.loads(val_s)
             except Exception:  # noqa: BLE001
                 val = val_s
-            # fully connect (undirected as bidirectional REFERENCES)
+            # heuristic name+value coincidence — inferred, not extracted truth
             for i, a in enumerate(uniq):
                 for b in uniq[i + 1:]:
-                    meta = {"dim": ename, "value": val, "unit": unit}
-                    add_edge(a, b, "REFERENCES", meta=meta)
-                    add_edge(b, a, "REFERENCES", meta=meta)
+                    meta = {"dim": ename, "value": val, "unit": unit,
+                            "via": "shared_value"}
+                    add_edge(a, b, "REFERENCES", meta=meta, origin=ORIGIN_INFERRED)
+                    add_edge(b, a, "REFERENCES", meta=meta, origin=ORIGIN_INFERRED)
+
+    # --- manual / AI-authored overlay links --------------------------------
+    if root is not None:
+        try:
+            from services.plm import graph_links as _gl
+            for lk in _gl.list_links(root):
+                lsrc = lk.get("src")
+                ldst = lk.get("dst")
+                if lsrc in node_ids and ldst in node_ids:
+                    add_edge(lsrc, ldst, str(lk.get("kind")),
+                             meta={"note": lk.get("note") or "",
+                                   "link_id": lk.get("id")},
+                             origin=str(lk.get("origin") or "manual"))
+        except Exception:  # noqa: BLE001
+            pass
 
     generated_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     graph = {
@@ -586,6 +711,119 @@ def find_path(src: str, dst: str, graph: dict[str, Any] | None = None,
         path.append(p)
     path.reverse()
     return {"ok": True, "path": path}
+
+
+def assembly_advice(graph: dict[str, Any]) -> dict[str, Any]:
+    """Deterministic assembly best-practice advisor over a built graph.
+
+    Rules:
+      * a cluster of >= _SUBASM_MIN_CLUSTER components tied by >= 2 internal
+        mates (and not the whole assembly) -> extract a subassembly;
+      * a flat assembly with > _FLAT_ASM_MAX direct components -> group them;
+      * a part with > _MULTIBODY_MAX bodies -> split into parts + assembly.
+    Returns ``{ok, suggestions, narrative}``.
+    """
+    nodes = {n["id"]: n for n in graph.get("nodes") or []}
+    edges = graph.get("edges") or []
+    children: dict[str, list[str]] = {}
+    mate_insts: dict[str, list[str]] = {}
+    for e in edges:
+        if e.get("kind") == "CONTAINS":
+            children.setdefault(e["src"], []).append(e["dst"])
+        elif e.get("kind") == "MATES":
+            mate_insts.setdefault(e["src"], []).append(e["dst"])
+
+    suggestions: list[dict[str, Any]] = []
+
+    def _label(nid: str) -> str:
+        return str(nodes.get(nid, {}).get("label") or nid)
+
+    for nid, n in nodes.items():
+        if n.get("kind") != "assembly":
+            continue
+        kids = children.get(nid, [])
+        comp_ids = [c for c in kids
+                    if str(c).startswith("instance:")
+                    and nodes.get(c, {}).get("kind") == "doc"]
+        mate_ids = [c for c in kids if nodes.get(c, {}).get("kind") == "mate"]
+
+        if len(comp_ids) > _FLAT_ASM_MAX:
+            suggestions.append({
+                "kind": "group_into_subassemblies",
+                "components": [_label(c) for c in comp_ids],
+                "reason": (f"{len(comp_ids)} components sit directly in one "
+                           f"assembly (> {_FLAT_ASM_MAX}); group related parts "
+                           "into subassemblies for clearer structure and BOM."),
+            })
+
+        # union-find over component instances via shared mates
+        parent = {c: c for c in comp_ids}
+
+        def _find(x: str) -> str:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        for m in mate_ids:
+            insts = [i for i in mate_insts.get(m, []) if i in parent]
+            for other in insts[1:]:
+                ra, rb = _find(insts[0]), _find(other)
+                if ra != rb:
+                    parent[ra] = rb
+
+        clusters: dict[str, list[str]] = {}
+        for c in comp_ids:
+            clusters.setdefault(_find(c), []).append(c)
+        internal_mates: dict[str, int] = {}
+        for m in mate_ids:
+            insts = [i for i in mate_insts.get(m, []) if i in parent]
+            roots = {_find(i) for i in insts}
+            if insts and len(roots) == 1:
+                r = next(iter(roots))
+                internal_mates[r] = internal_mates.get(r, 0) + 1
+
+        for root, members in clusters.items():
+            if (len(members) >= _SUBASM_MIN_CLUSTER
+                    and internal_mates.get(root, 0) >= 2
+                    and len(members) < len(comp_ids)):
+                suggestions.append({
+                    "kind": "extract_subassembly",
+                    "components": [_label(c) for c in members],
+                    "reason": (f"{len(members)} components with "
+                               f"{internal_mates[root]} internal mates form a "
+                               "tightly-coupled group — extract them into their "
+                               "own subassembly (.step+) mated into the parent."),
+                })
+
+    for nid, n in nodes.items():
+        if n.get("kind") != "part":
+            continue
+        bodies = [c for c in children.get(nid, [])
+                  if nodes.get(c, {}).get("kind") == "body"]
+        mated = {e["dst"] for e in edges
+                 if e.get("kind") == "MATES" and e["dst"] in set(bodies)}
+        ref = mated or set(bodies)
+        if len(ref) > _MULTIBODY_MAX:
+            suggestions.append({
+                "kind": "split_multibody",
+                "components": [_label(b) for b in ref],
+                "reason": (f"{len(ref)} bodies live in one part — split into "
+                           "separate parts + an assembly for clearer mates, "
+                           "interference checks, and BOM lines."),
+            })
+
+    if suggestions:
+        parts = [f"{s['kind']} ({len(s['components'])} items)"
+                 for s in suggestions]
+        narrative = ("Assembly review found "
+                     f"{len(suggestions)} suggestion(s): " + "; ".join(parts)
+                     + ". Prefer deep products built as subassemblies over one "
+                     "monolithic file.")
+    else:
+        narrative = ("No structural issues found — the assembly hierarchy "
+                     "looks reasonable.")
+    return {"ok": True, "suggestions": suggestions, "narrative": narrative}
 
 
 def on_ai_vc_checkpoint(
@@ -851,6 +1089,30 @@ def _safe(s: str) -> str:
     return "".join(c if c.isalnum() or c in "-_." else "_" for c in s)
 
 
+# equation grammar built-ins (contracts/doc_schema.md §4 whitelist) — never link
+# these tokens as global refs.
+_EQ_FUNCS = frozenset({
+    "sin", "cos", "tan", "asin", "acos", "atan",
+    "sqrt", "abs", "min", "max", "floor", "ceil", "pi",
+})
+_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _expr_names(expr: Any) -> list[str]:
+    """Identifiers referenced by an equation/dimension expression, minus the
+    §4 built-in function/const names. Order-preserving, de-duplicated."""
+    if not isinstance(expr, str) or not expr:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for tok in _IDENT_RE.findall(expr):
+        if tok in _EQ_FUNCS or tok in seen:
+            continue
+        seen.add(tok)
+        out.append(tok)
+    return out
+
+
 def _shallow_params(params: Any) -> dict[str, Any]:
     if not isinstance(params, dict):
         return {}
@@ -916,20 +1178,28 @@ def _collect_feature_ids(v: Any) -> list[str]:
     return []
 
 
-def _feature_dims(feat: dict[str, Any]) -> list[tuple[str, Any, str | None]]:
-    """Yield (dim_name, value, unit) from feature params."""
-    out: list[tuple[str, Any, str | None]] = []
+def _feature_dims(
+    feat: dict[str, Any],
+) -> list[tuple[str, Any, str | None, str | None]]:
+    """Yield (dim_name, value, unit, expr) from feature params.
+
+    The qualified ``fid.k`` entry carries the raw ``expr`` (so callers can build
+    expression-driven DERIVES_FROM edges); the bare-name duplicate used for
+    cross-doc shared-value matching carries ``expr=None`` to avoid double edges.
+    """
+    out: list[tuple[str, Any, str | None, str | None]] = []
     params = feat.get("params") if isinstance(feat.get("params"), dict) else {}
     fid = str(feat.get("id") or "")
     for k, v in params.items():
         if k in ("entities", "constraints", "external_refs", "code", "text"):
             continue
         if isinstance(v, (int, float)):
-            out.append((f"{fid}.{k}", v, None))
-            out.append((k, v, None))  # bare name for cross-doc match
+            out.append((f"{fid}.{k}", v, None, None))
+            out.append((k, v, None, None))  # bare name for cross-doc match
         elif isinstance(v, dict) and "value" in v:
-            out.append((f"{fid}.{k}", v.get("value"), v.get("unit")))
-            out.append((k, v.get("value"), v.get("unit")))
+            expr = v.get("expr")
+            out.append((f"{fid}.{k}", v.get("value"), v.get("unit"), expr))
+            out.append((k, v.get("value"), v.get("unit"), None))
     # sketch dimension constraints
     if isinstance(params.get("constraints"), list):
         for c in params["constraints"]:
@@ -937,11 +1207,12 @@ def _feature_dims(feat: dict[str, Any]) -> list[tuple[str, Any, str | None]]:
                 continue
             if c.get("type") in ("distance", "length", "angle", "radius", "diameter"):
                 val = c.get("value")
+                cid = c.get("id", "dim")
                 if isinstance(val, dict):
-                    out.append((f"{fid}.{c.get('id', 'dim')}", val.get("value"),
-                                val.get("unit")))
+                    out.append((f"{fid}.{cid}", val.get("value"),
+                                val.get("unit"), val.get("expr")))
                 elif isinstance(val, (int, float)):
-                    out.append((f"{fid}.{c.get('id', 'dim')}", val, None))
+                    out.append((f"{fid}.{cid}", val, None, None))
     return out
 
 

@@ -13,6 +13,11 @@ ExecStart=@BIN@/aicad-hostd --foreground
 Environment=AICAD_INSTANCE_KEY=billetweb
 # A shared team daemon must not self-exit between working sessions.
 Environment=AICAD_HOSTD_LINGER_SECS=86400
+# The C++ agent (agent_run_v2) reads its role prompts (intake/decomposer/executor/...)
+# from AI_CAD_PROMPTS_DIR; without it the daemon resolves the relative "agent/prompts"
+# against its CWD (none here) and every agent run throws "role prompt unreadable/empty".
+# install_webd.sh deploys the prompt tree to @PROMPTS@ and stamps this path.
+Environment=AI_CAD_PROMPTS_DIR=@PROMPTS@
 Restart=on-failure
 RestartSec=2
 # Final autosave on stop needs a moment on big docs.

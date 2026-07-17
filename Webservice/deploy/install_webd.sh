@@ -61,6 +61,26 @@ echo "[webd] installed $staged file(s) from $SRC"
 # --- sanity: pinned daemon must at least answer --version -------------------
 "$BIN/aicad-hostd" --version >/dev/null || { echo "[webd] ERROR: installed daemon won't run"; exit 1; }
 
+# --- agent role prompts (agent_run_v2 reads these; env-pinned in the unit) ---
+# The daemon has no WorkingDirectory, so the relative "agent/prompts" fallback in
+# roles.cpp resolves against $HOME/'/' and every agent run throws "role prompt
+# unreadable/empty". Deploy the tree next to the daemon and point AI_CAD_PROMPTS_DIR
+# at it (stamped into the unit below). Text files, re-read per run — a plain tree
+# swap is safe (no live-mmap SIGBUS hazard like the .so files).
+PROMPTS_SRC="$ROOT/agent/prompts"
+PROMPTS_DST="$DST/agent/prompts"
+if [ -d "$PROMPTS_SRC" ]; then
+  mkdir -p "$DST/agent"
+  tmp_p="$DST/agent/.prompts.tmp.$$"
+  rm -rf "$tmp_p"
+  cp -r "$PROMPTS_SRC" "$tmp_p"
+  rm -rf "$PROMPTS_DST"
+  mv "$tmp_p" "$PROMPTS_DST"
+  echo "[webd] deployed agent role prompts -> $PROMPTS_DST ($(find "$PROMPTS_DST" -name '*.md' | wc -l) md files)"
+else
+  echo "[webd] WARNING: $PROMPTS_SRC missing — agent_run_v2 will fail (role prompts)"
+fi
+
 # --- socket path (verbatim instance-key override => deterministic name) ----
 RUNDIR="${XDG_RUNTIME_DIR:-/tmp/aicad-$(id -u)}"
 SOCK="$RUNDIR/aicad/hostd-$KEY.sock"
@@ -90,7 +110,8 @@ echo "[webd] wrote $DST/billet-shared.sh"
 # --- systemd user unit -------------------------------------------------------
 UNIT_DIR="$HOME/.config/systemd/user"
 mkdir -p "$UNIT_DIR"
-sed "s|@BIN@|$BIN|g" "$ROOT/Webservice/deploy/billet-hostd.service" > "$UNIT_DIR/billet-hostd.service"
+sed -e "s|@BIN@|$BIN|g" -e "s|@PROMPTS@|$PROMPTS_DST|g" \
+  "$ROOT/Webservice/deploy/billet-hostd.service" > "$UNIT_DIR/billet-hostd.service"
 # Auto-reinstall path unit: watches the build-tree aicad-hostd and re-runs
 # this script --restart. Enabling is idempotent; path watches the SOURCE
 # binary (not $BIN), so the install itself cannot re-trigger the path unit.

@@ -144,15 +144,25 @@ Fix: live previews use `kPreviewTimeoutMs` (20 s); only the OK/commit path (`com
 the patient 120 s. Drag pushes to the PM field are gated to ~20 Hz (flip toggles bypass; the
 release always pushes the final value). Native + web identical, no `#ifdef`.
 
-**DEFERRED — the rebuild itself is pathologically slow, and hostd can't recover a stuck call.**
-The client fix caps the *wait* and the *rate*, but the daemon's engine calls are serialised and
-non-interruptible (`engine_backend.h`: "a call into the loaded DLL can't be timed out") and there
-is no per-call watchdog in `core/hostd`, so a genuinely-hung rebuild still wedges the shared
-daemon until `aicad-hostd --stop --force` + restart. Two follow-ups:
-  1. **Engine:** root-cause the slow rebuild. Repro recipe: box + through-hole, sketch a circle on
-     the top face, extrude it as a **Boss ("Whole sketch")** with **Reverse direction**, sweep the
-     depth across ~10→26 mm. Suspect an OCCT boolean pathology when the boss face lands coincident
-     with an existing face (depth == wall thickness) — the classic coplanar-face fuse slow path.
-  2. **Daemon:** a stuck-rebuild recovery path (run rebuilds on a killable worker + watchdog, or
-     detect a call exceeding N s and respawn the engine) so one bad op can't wedge every client.
+**SHIPPED — hostd engine-call watchdog (daemon can no longer stay frozen on a wedged rebuild).**
+Per-doc locking (T-PERF5 `DocLock`) means a pathological rebuild wedges only its own doc's thread
+— the daemon keeps serving other docs — but an OCCT call is non-interruptible in-process, so a
+genuinely-hung interactive rebuild was unrecoverable without a manual `aicad-hostd --stop --force`.
+`core/hostd/server.cpp` now tracks the in-flight engine RPC per client thread; a background thread
+force-restarts the daemon (`std::_Exit(70)` → systemd `Restart=on-failure`, ~2 s) if a WATCHDOGGED
+call exceeds the ceiling (default 180 s, env `AICAD_HOSTD_ENGINE_WATCHDOG_S`, 0=off). Only fast
+interactive RPCs are guarded (`doc_apply_ops`/`rebuild`/`undo`/`redo`/`activate`/`regen`); long-
+running RPCs (`run_fea_*`/`run_cfd_*`/`agent_*`/`cam_*`/`export_*`/`import_*`/`doc_open`/`doc_save`/
+`reverse_*`) are exempt (`engine_watchdog.h` policy). Recovery is explicit/user-gated (orphan tier)
+and `stepplus_save` is atomic (tmp+replace), so the restart cannot auto-replay-loop or lose the
+recovery data. Verified: unit test + end-to-end (6 s stall self-heals at 2.09 s vs a 2 s ceiling;
+500 ms stall returns ok, daemon survives).
+
+**DEFERRED — root-cause the slow rebuild itself (engine).** The watchdog is a safety net, not a
+cure: the specific rebuild is pathologically slow. Repro recipe: box + through-hole, sketch a
+circle on the top face, extrude it as a **Boss ("Whole sketch")** with **Reverse direction**, sweep
+the depth across ~10→26 mm. Suspect an OCCT boolean pathology when the boss face lands coincident
+with an existing face (depth == wall thickness) — the classic coplanar-face fuse slow path. Fixing
+it (or bounding it inside `compile_document`) would stop the freeze at the source so the watchdog
+never has to fire.
 

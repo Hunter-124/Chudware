@@ -2032,70 +2032,74 @@ json extract_entities(const VectorXd& x, const json& entities_list,
                       const VarMap& var_map) {
     json out = json::object();
     for (const auto& e : entities_list) {
-        std::string id = e["id"];
-        const std::string t = e["type"];
-        const std::vector<int>& v = var_map.at(id);
+        if (!e.is_object() || !e.contains("id") || !e["id"].is_string()) continue;
+        const std::string id = e["id"].get<std::string>();
+        const std::string t = e.value("type", std::string());
+        auto vit = var_map.find(id);
+        if (vit == var_map.end()) { out[id] = e; continue; }  // no vars -> raw pass-through
+        const std::vector<int>& v = vit->second;
+        // Bounds-safe read: a malformed var_map (too few vars for the type, or an index
+        // past x) previously drove an UNCHECKED Eigen/std::vector out-of-bounds read ->
+        // SIGSEGV crashing the whole daemon on some sketches. Return 0 for any
+        // out-of-range slot instead. Valid entities are unaffected (g(k) == x(v[k])).
+        auto g = [&](std::size_t k) -> double {
+            return (k < v.size() && v[k] >= 0 && v[k] < x.size()) ? x(v[k]) : 0.0;
+        };
         json o;
         o["type"] = t;
         if (t == "point") {
-            o["p"] = {x(v[0]), x(v[1])};
+            o["p"] = {g(0), g(1)};
         } else if (t == "line") {
-            o["p1"] = {x(v[0]), x(v[1])};
-            o["p2"] = {x(v[2]), x(v[3])};
+            o["p1"] = {g(0), g(1)};
+            o["p2"] = {g(2), g(3)};
         } else if (t == "circle") {
-            o["center"] = {x(v[0]), x(v[1])};
-            o["radius"] = x(v[2]);
+            o["center"] = {g(0), g(1)};
+            o["radius"] = g(2);
         } else if (t == "arc") {
-            o["center"] = {x(v[0]), x(v[1])};
-            o["radius"] = x(v[2]);
-            o["start"] = x(v[3]);
-            o["end"] = x(v[4]);
-            // Preserve the sweep-direction flag: the solver only varies the geometric
-            // DOFs (center/radius/start/end), but `ccw` is a discrete attribute that
-            // selects the minor vs major arc between the same two angles. Dropping it
-            // here made every downstream consumer (wire_from_solved_sketch / sweep path,
-            // faces_from_solved_sketch) default to ccw:true, so a CW arc silently became
-            // its CCW complement regardless of the input (Bug N-2). Carry it through.
+            o["center"] = {g(0), g(1)};
+            o["radius"] = g(2);
+            o["start"] = g(3);
+            o["end"] = g(4);
             o["ccw"] = e.value("ccw", true);
         } else if (t == "ellipse") {
-            o["center"] = {x(v[0]), x(v[1])};
-            o["rx"] = x(v[2]);
-            o["ry"] = x(v[3]);
-            o["rot"] = x(v[4]);
+            o["center"] = {g(0), g(1)};
+            o["rx"] = g(2);
+            o["ry"] = g(3);
+            o["rot"] = g(4);
         } else if (t == "ellipse_arc") {
-            o["center"] = {x(v[0]), x(v[1])};
-            o["rx"] = x(v[2]);
-            o["ry"] = x(v[3]);
-            o["rot"] = x(v[4]);
-            o["a0"] = x(v[5]);
-            o["a1"] = x(v[6]);
+            o["center"] = {g(0), g(1)};
+            o["rx"] = g(2);
+            o["ry"] = g(3);
+            o["rot"] = g(4);
+            o["a0"] = g(5);
+            o["a1"] = g(6);
         } else if (t == "parabola") {
-            o["vertex"] = {x(v[0]), x(v[1])};
-            o["focus"] = {x(v[2]), x(v[3])};
-            o["t0"] = x(v[4]);
-            o["t1"] = x(v[5]);
+            o["vertex"] = {g(0), g(1)};
+            o["focus"] = {g(2), g(3)};
+            o["t0"] = g(4);
+            o["t1"] = g(5);
         } else if (t == "conic") {
-            o["p0"] = {x(v[0]), x(v[1])};
-            o["p1"] = {x(v[2]), x(v[3])};
-            o["apex"] = {x(v[4]), x(v[5])};
-            o["rho"] = x(v[6]);
+            o["p0"] = {g(0), g(1)};
+            o["p1"] = {g(2), g(3)};
+            o["apex"] = {g(4), g(5)};
+            o["rho"] = g(6);
         } else if (t == "slot") {
-            o["p1"] = {x(v[0]), x(v[1])};
-            o["p2"] = {x(v[2]), x(v[3])};
-            o["width"] = x(v[4]);
+            o["p1"] = {g(0), g(1)};
+            o["p2"] = {g(2), g(3)};
+            o["width"] = g(4);
         } else if (t == "arc_slot") {
-            o["center"] = {x(v[0]), x(v[1])};
-            o["radius"] = x(v[2]);
-            o["a0"] = x(v[3]);
-            o["a1"] = x(v[4]);
-            o["width"] = x(v[5]);
+            o["center"] = {g(0), g(1)};
+            o["radius"] = g(2);
+            o["a0"] = g(3);
+            o["a1"] = g(4);
+            o["width"] = g(5);
         } else if (t == "spline" || t == "style_spline") {
             int n = static_cast<int>(v.size()) / 2;
             json pts = json::array();
-            for (int i = 0; i < n; ++i) pts.push_back({x(v[2 * i]), x(v[2 * i + 1])});
+            for (int i = 0; i < n; ++i) pts.push_back({g(2 * i), g(2 * i + 1)});
             o["points"] = pts;
         } else if (t == "text") {
-            o["p"] = {x(v[0]), x(v[1])};
+            o["p"] = {g(0), g(1)};
         } else {
             o = e;  // pass through unknown types unchanged
         }

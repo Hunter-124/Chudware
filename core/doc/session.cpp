@@ -918,7 +918,22 @@ void op_sketch_delete_entity(json& doc, const json& op, const json& id_map);
 
 void op_sketch_add_entity(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
     json& sk = require_sketch_feature(doc, op, id_map);
-    json ent = op.at("entity");
+    json ent;
+    if (op.contains("entity") && op["entity"].is_object()) {
+        ent = op["entity"];
+    } else if (op.contains("type") && op["type"].is_string()) {
+        // Lenient FLAT form: models emit {op:sketch_add_entity, sketch, type, center,
+        // radius, ...} with entity fields at the top level instead of nested under
+        // "entity" — an unguarded op.at("entity") crashed the whole op batch (json
+        // out_of_range), the root cause of failed tube/prism/sketch builds. Hoist the
+        // top-level fields (minus op/sketch routing keys) so both forms behave the same.
+        ent = json::object();
+        for (auto& [k, v] : op.items())
+            if (k != "op" && k != "sketch") ent[k] = v;
+    } else {
+        throw OpError("invalid_op",
+                      "sketch_add_entity: 'entity' object (or a top-level 'type') required");
+    }
 
     // Leniency for weak local models: a spline's points sometimes arrive DOUBLE-WRAPPED as
     // [[[x,y],[x,y],...]] (one extra array level). Unwrap that single wrapping so the curve
@@ -1087,7 +1102,21 @@ void op_sketch_add_entity(json& doc, const json& op, std::size_t idx, IdGen& gen
 
 void op_sketch_add_constraint(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
     json& sk = require_sketch_feature(doc, op, id_map);
-    json c = op.at("constraint");
+    json c;
+    if (op.contains("constraint") && op["constraint"].is_object()) {
+        c = op["constraint"];
+    } else if (op.contains("type") && op["type"].is_string()) {
+        // Lenient FLAT form: {op:sketch_add_constraint, sketch, type, entities, ...}
+        // with constraint fields at the top level instead of nested under "constraint"
+        // (same json-crash class as sketch_add_entity — broke concentric/coincident in
+        // grok's tube/prism builds). Hoist top-level fields minus the routing keys.
+        c = json::object();
+        for (auto& [k, v] : op.items())
+            if (k != "op" && k != "sketch") c[k] = v;
+    } else {
+        throw OpError("invalid_op",
+                      "sketch_add_constraint: 'constraint' object (or a top-level 'type') required");
+    }
     resolve_placeholders_deep(c, id_map);
     const std::string cid = gen.next("c");
     c["id"] = cid;

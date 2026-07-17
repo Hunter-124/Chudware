@@ -1272,6 +1272,8 @@ struct AppState {
     bool showAIPanel = true;
     bool showSessionsPicker = false;  // Copilot: hide chat log, show the Sessions list/dropdown
     bool showAISettingsOverlay = false;  // Copilot: hide chat log, show compact AI settings (gear toggle; mutually exclusive with showSessionsPicker)
+    bool showTaskList = false;   // Copilot: hide chat log, show the task/plan list (logo-left button)
+    bool showArtifacts = false;  // Copilot: hide chat log, show Session Artifacts (logo-right button)
     // Design Table panel (SolidWorks Design Table). Dockable "Design Table" window in the right
     // task pane; View > Design Table toggles it. An editable grid (rows=configs, columns=driven
     // params + per-feature suppression) over the same config_* RPCs the Configurations panel reads.

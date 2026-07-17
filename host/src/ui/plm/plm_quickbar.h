@@ -8,6 +8,8 @@
 // item on document change (event-driven — never a per-frame RPC).
 #pragma once
 
+#include <string>
+
 struct AppState;
 
 namespace ui {
@@ -16,5 +18,18 @@ namespace ui {
 // readout). No-op in the PLM workspace (the hub is already showing) and when no
 // project folder is resolvable.
 void drawPlmQuickChip(AppState& st);
+
+// Record a just-completed save into project history when auto-record is on
+// (contract plm.md auto_commit). Guards: a resolvable project folder + the saved
+// path under it + the cached auto_commit flag. Async, never blocks or fails the
+// save; a failure surfaces one Warn toast. *savedAbsPath* is the absolute path
+// that was just written.
+void plmAutoRecordSave(AppState& st, const std::string& savedAbsPath);
+
+// Active document's PLM state for the FeatureManager badge. Returns true and
+// fills rev/lifecycle/dirty when the active doc is a tracked item; false (and
+// leaves the outputs untouched) when it is not tracked.
+bool plmActiveDocPlmState(AppState& st, std::string& rev, std::string& lifecycle,
+                          bool& dirty);
 
 }  // namespace ui

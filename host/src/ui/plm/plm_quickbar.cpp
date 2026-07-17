@@ -239,4 +239,33 @@ void drawPlmQuickChip(AppState& st) {
     }
 }
 
+void plmAutoRecordSave(AppState& st, const std::string& savedAbsPath) {
+    if (!st.workerStarted) return;
+    const std::string proj = st.plmProjectPath();
+    if (proj.empty() || savedAbsPath.empty()) return;
+    if (!g_plmHub.autoCommit) return;  // cached; default true before first fetch
+    // The saved file must live under the project folder.
+    std::string a = savedAbsPath, p = proj;
+    for (char& c : a) if (c == '\\') c = '/';
+    for (char& c : p) if (c == '\\') c = '/';
+    if (!p.empty() && p.back() != '/') p += '/';
+    if (a.rfind(p, 0) != 0) return;  // file must sit inside the project folder
+    nlohmann::json params; params["path"] = proj;
+    st.rpc.call("plm_save", params, [&st](const core::RpcResult& r) {
+        std::string h;
+        if (plmOk(r, h)) { refetch(); plmInvalidate(); return; }
+        st.toast(ui::ToastLevel::Warn, "Couldn't record history: " + h);
+    });
+}
+
+bool plmActiveDocPlmState(AppState& st, std::string& rev, std::string& lifecycle,
+                          bool& dirty) {
+    resolve(st);
+    if (!q.haveItem) return false;
+    rev = !q.rev.empty() ? q.rev : q.workingRev;
+    lifecycle = q.lifecycle;
+    dirty = q.dirty;
+    return true;
+}
+
 }  // namespace ui

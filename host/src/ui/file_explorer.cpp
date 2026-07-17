@@ -392,6 +392,7 @@ static void drawDirNode(AppState& st, const std::string& root, const std::string
         if (ImGui::MenuItem("New Folder")) {
             createNewFolder(st, root, dir);
         }
+        if (ImGui::MenuItem("Set as working folder")) setActiveProjectDir(st, dir);
         if (ImGui::MenuItem("Paste", "Ctrl+V", false, !s_clipboardPath.empty()))
             doPaste(st, root, dir);
         if (!isRoot) {

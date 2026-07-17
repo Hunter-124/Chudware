@@ -264,7 +264,7 @@ static void drawNavFolderButton(AppState& st, float rowStartX, float fullW) {
     ImVec2 p1(p0.x + w, p0.y + h);
     if (ImGui::InvisibleButton("##folder", ImVec2(w, h))) {
         std::string abs = ui::openFolderDialog();
-        if (!abs.empty()) { st.plmProjectDir = abs; plmInvalidate(); }
+        if (!abs.empty()) setActiveProjectDir(st, abs);
     }
     const bool hov = ImGui::IsItemHovered(), held = ImGui::IsItemActive();
     ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -320,8 +320,7 @@ static void drawOnboarding(AppState& st) {
         ImGui::PushStyleColor(ImGuiCol_Button,
             ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 0.85f));
         if (ImGui::Button("Use my workspace folder", ImVec2(bw, 0))) {
-            st.plmProjectDir = st.workspaceDir;
-            plmInvalidate();
+            setActiveProjectDir(st, st.workspaceDir);
         }
         ImGui::PopStyleColor();
     }
@@ -341,7 +340,7 @@ void drawPlmWorkspace(AppState& st) {
 
     if (!st.workerStarted) {
         plmEmptyState("[V]", "Project history unavailable",
-                      "The Billet service is not running.");
+                      "The Chudware service is not running.");
         return;
     }
 

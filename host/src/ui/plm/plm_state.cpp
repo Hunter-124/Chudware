@@ -267,6 +267,9 @@ void plmEnsureSettings(AppState& st) {
         H.setErr.clear();
         H.partPrefix = getStr(r.result, "part_number_prefix");
         H.aiMode     = getStr(r.result, "ai_mode");
+        if (auto it = r.result.find("auto_commit");
+            it != r.result.end() && it->is_boolean())
+            H.autoCommit = it->get<bool>();
     });
 }
 

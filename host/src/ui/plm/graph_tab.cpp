@@ -39,6 +39,9 @@ struct GNode {
 
 struct GEdge {
     std::string src, dst, kind, origin;
+    std::string metaSummary;   // short key=val dump for label/panel
+    std::string dimLabel;      // compact value label for dimensional edges
+    nlohmann::json meta;       // full meta for the side panel
 };
 
 struct GraphTabState {
@@ -60,6 +63,17 @@ struct GraphTabState {
     bool wasAppFocusLost = false;
     double lastFetch = -1e9;
     int layoutToken = 0;  // bumps when nodes/edges replace → re-layout
+    // edge kind filter — hidden kinds skip drawing (all visible by default)
+    std::unordered_set<std::string> hiddenKinds;
+    // edge selection (when no node is under the cursor)
+    int selectedEdge = -1;
+    // link authoring
+    std::string linkArmSrc;   // node id armed as the link source
+    bool linkPopupOpen = false;
+    std::string linkPopupDst; // node id chosen as the target
+    int linkKindIdx = 4;      // default REFERENCES (see kEdgeKinds)
+    char linkNote[192] = {};
+    std::string focusPending; // plmGraphFocus request to apply on next draw
 };
 
 GraphTabState& S() {
@@ -130,7 +144,7 @@ int kindRing(const std::string& k) {
     if (k == "assembly" || k == "doc") return 1;
     if (k == "part") return 2;
     if (k == "body" || k == "bom_item") return 3;
-    if (k == "feature" || k == "sketch" || k == "mate") return 4;
+    if (k == "feature" || k == "sketch" || k == "mate" || k == "equation") return 4;
     if (k == "drawing" || k == "sim_study" || k == "board" || k == "firmware") return 5;
     return 3;
 }
@@ -142,6 +156,7 @@ ImU32 kindColor(const std::string& k, float a = 1.0f) {
     else if (k == "assembly" || k == "doc")          c = palette.axisZ;
     else if (k == "part" || k == "body")             c = palette.axisY;
     else if (k == "feature" || k == "sketch")        c = palette.sketchUnder;
+    else if (k == "equation")                        c = palette.statusOk;
     else if (k == "mate")                            c = palette.axisX;
     else if (k == "bom_item")                        c = palette.statusWarn;
     else if (k == "drawing")                         c = palette.diffHunk;
@@ -179,7 +194,48 @@ const char* kindShort(const std::string& k) {
     if (k == "sim_study") return "SIM";
     if (k == "board") return "PCB";
     if (k == "firmware") return "FW";
+    if (k == "equation") return "EQ";
     return "NODE";
+}
+
+// Canonical edge-kind vocabulary (contracts/cad_graph.md) — filter chips + the
+// link-authoring combo iterate this. Index 4 == REFERENCES (linkKindIdx default).
+static const char* kEdgeKinds[] = {
+    "CONTAINS", "DEPENDS_ON", "MATES", "INSTANCE_OF", "REFERENCES",
+    "DERIVES_FROM", "DOCUMENTS", "SIMULATES", "MANUFACTURES",
+};
+
+// Compact value label for a dimensional edge, e.g. "width=12mm" or "25mm".
+std::string edgeDimLabel(const nlohmann::json& meta) {
+    if (!meta.is_object()) return "";
+    std::string dim;
+    if (auto it = meta.find("dim"); it != meta.end() && it->is_string())
+        dim = it->get<std::string>();
+    std::string val;
+    if (auto it = meta.find("value"); it != meta.end() && !it->is_null()) {
+        if (it->is_number_integer()) val = std::to_string(it->get<long long>());
+        else if (it->is_number_float()) {
+            char b[32];
+            std::snprintf(b, sizeof(b), "%.4g", it->get<double>());
+            val = b;
+        } else if (it->is_string()) val = it->get<std::string>();
+    }
+    std::string unit;
+    if (auto it = meta.find("unit"); it != meta.end() && it->is_string())
+        unit = it->get<std::string>();
+    if (val.empty() && dim.empty()) return "";
+    std::string out;
+    if (!dim.empty()) {
+        // trim a "fid." prefix so the label reads as the dimension name
+        auto dot = dim.rfind('.');
+        out = (dot == std::string::npos) ? dim : dim.substr(dot + 1);
+    }
+    if (!val.empty()) {
+        if (!out.empty()) out += "=";
+        out += val;
+        out += unit;
+    }
+    return out;
 }
 
 // Deterministic layered-ring layout. Same input → same positions.
@@ -347,12 +403,20 @@ void requestGraph(AppState& st, bool force) {
                 e.kind   = jstr(je, "kind");
                 e.origin = jstr(je, "origin");
                 if (e.origin.empty()) e.origin = "extracted";
+                if (auto m = je.find("meta"); m != je.end() && m->is_object()) {
+                    e.meta = *m;
+                    e.metaSummary = summarizeMeta(*m);
+                    if (e.kind == "DERIVES_FROM" || e.kind == "REFERENCES" ||
+                        e.kind == "MATES")
+                        e.dimLabel = edgeDimLabel(*m);
+                }
                 if (e.src.empty() || e.dst.empty()) continue;
                 G.edges.push_back(std::move(e));
             }
         }
         G.layoutDirty = true;
         G.layoutToken++;
+        G.selectedEdge = -1;  // edge indices are invalidated by the reload
         // Keep selection if it still exists.
         if (!G.selectedId.empty()) {
             bool found = false;
@@ -390,6 +454,39 @@ void requestBlast(AppState& st, const std::string& nodeId) {
                 if (a.is_string()) G.blast.insert(a.get<std::string>());
             }
         }
+    });
+}
+
+void requestLinkAdd(AppState& st, const std::string& src, const std::string& dst,
+                    const std::string& kind, const std::string& note) {
+    auto& G = S();
+    if (!G.available || src.empty() || dst.empty()) return;
+    nlohmann::json p;
+    p["project_dir"] = st.plmProjectPath();
+    p["path"] = st.plmProjectPath();
+    p["src"] = src;
+    p["dst"] = dst;
+    p["kind"] = kind;
+    p["note"] = note;
+    p["origin"] = "manual";
+    st.rpc.call("cad_graph_link_add", p, [](const core::RpcResult& r) {
+        if (isAbsent(r)) { S().available = false; return; }
+        // Rebuild on the next frame so the new edge appears.
+        S().lastFetch = -1e9;
+    });
+}
+
+void requestLinkRemove(AppState& st, const std::string& linkId) {
+    auto& G = S();
+    if (!G.available || linkId.empty()) return;
+    nlohmann::json p;
+    p["project_dir"] = st.plmProjectPath();
+    p["path"] = st.plmProjectPath();
+    p["link_id"] = linkId;
+    st.rpc.call("cad_graph_link_remove", p, [](const core::RpcResult& r) {
+        if (isAbsent(r)) { S().available = false; return; }
+        S().selectedEdge = -1;
+        S().lastFetch = -1e9;
     });
 }
 
@@ -469,9 +566,12 @@ void drawLegend(ImDrawList* dl, ImVec2 origin) {
     const Row rows[] = {
         {"extracted", edgeColor("CONTAINS", 0.85f), false, false},
         {"inferred",  edgeColor("DEPENDS_ON", 0.85f), true,  false},
+        {"manual",    kindColor("project", 0.90f), false, false},
+        {"ai link",   kindColor("project", 0.90f), true,  false},
         {"part",      kindColor("part"), false, true},
         {"assembly",  kindColor("assembly"), false, true},
         {"feature",   kindColor("feature"), false, true},
+        {"equation",  kindColor("equation"), false, true},
         {"mate",      kindColor("mate"), false, true},
         {"drawing",   kindColor("drawing"), false, true},
     };
@@ -503,6 +603,81 @@ void drawSidePanel(AppState& st, float panelW) {
     ImGui::BeginChild("##graph_side", ImVec2(panelW, 0), ImGuiChildFlags_Borders);
     ui::popGlassChildStyle();
 
+    auto row = [](const char* k, const std::string& v) {
+        if (v.empty()) return;
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(palette.textDisabled[0], palette.textDisabled[1],
+                   palette.textDisabled[2], 1.0f));
+        ImGui::TextUnformatted(k);
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
+        ImGui::TextWrapped("%s", v.c_str());
+        ImGui::PopStyleColor();
+    };
+    auto nodeLabel = [&](const std::string& id) -> std::string {
+        for (const auto& n : G.nodes) if (n.id == id) return n.label;
+        return id;
+    };
+
+    // --- an edge is selected: the "properties that link the parts" readout ---
+    if (G.selectedEdge >= 0 && G.selectedEdge < (int)G.edges.size()) {
+        const GEdge& e = G.edges[G.selectedEdge];
+        plmSectionHeader("Link", "mesh");
+        ImGui::Dummy(ImVec2(0, 4 * S));
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImGui::ColorConvertU32ToFloat4(edgeColor(e.kind, 1.0f)));
+        ImGui::Text("[%s]", e.kind.c_str());
+        ImGui::PopStyleColor();
+        ImGui::Dummy(ImVec2(0, 4 * S));
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(palette.textDisabled[0], palette.textDisabled[1],
+                   palette.textDisabled[2], 1.0f));
+        ImGui::TextUnformatted("from");
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        if (ImGui::SmallButton((nodeLabel(e.src) + "##lnksrc").c_str())) {
+            G.selectedId = e.src; G.selectedEdge = -1; G.blast.clear();
+        }
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(palette.textDisabled[0], palette.textDisabled[1],
+                   palette.textDisabled[2], 1.0f));
+        ImGui::TextUnformatted("to");
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        if (ImGui::SmallButton((nodeLabel(e.dst) + "##lnkdst").c_str())) {
+            G.selectedId = e.dst; G.selectedEdge = -1; G.blast.clear();
+        }
+        ImGui::Dummy(ImVec2(0, 4 * S));
+        row("origin", e.origin);
+        if (e.meta.is_object()) {
+            for (auto it = e.meta.begin(); it != e.meta.end(); ++it) {
+                std::string v = it->is_string() ? it->get<std::string>()
+                    : (it->is_null() ? std::string() : it->dump());
+                row(it.key().c_str(), v);
+            }
+        }
+        ImGui::Dummy(ImVec2(0, 8 * S));
+        bool authored = (e.origin == "manual" || e.origin == "ai");
+        if (authored) {
+            std::string linkId = e.meta.is_object()
+                ? e.meta.value("link_id", std::string()) : "";
+            if (graphGlassButton("##rmlink", "Remove link", true, -1.0f)
+                    && !linkId.empty())
+                requestLinkRemove(st, linkId);
+        } else {
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(palette.textDim[0], palette.textDim[1],
+                       palette.textDim[2], 1.0f));
+            ImGui::TextWrapped("Derived from the model — edit the model to change it.");
+            ImGui::PopStyleColor();
+        }
+        ImGui::EndChild();
+        ImGui::PopStyleVar();
+        return;
+    }
+
     plmSectionHeader("Node", "mesh");
     ImGui::Dummy(ImVec2(0, 4 * S));
 
@@ -513,7 +688,11 @@ void drawSidePanel(AppState& st, float panelW) {
     if (!sel) {
         ImGui::PushStyleColor(ImGuiCol_Text,
             ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
-        ImGui::TextWrapped("Click a node to inspect it and run blast radius.");
+        if (!G.linkArmSrc.empty())
+            ImGui::TextWrapped("Click the target node to link it — or Esc to cancel.");
+        else
+            ImGui::TextWrapped("Click a node to inspect it, or a link to see its "
+                               "properties.");
         ImGui::PopStyleColor();
         ImGui::EndChild();
         ImGui::PopStyleVar();
@@ -531,19 +710,6 @@ void drawSidePanel(AppState& st, float panelW) {
     ImGui::PopStyleColor();
 
     ImGui::Dummy(ImVec2(0, 4 * S));
-    auto row = [](const char* k, const std::string& v) {
-        if (v.empty()) return;
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(palette.textDisabled[0], palette.textDisabled[1],
-                   palette.textDisabled[2], 1.0f));
-        ImGui::TextUnformatted(k);
-        ImGui::PopStyleColor();
-        ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
-        ImGui::TextWrapped("%s", v.c_str());
-        ImGui::PopStyleColor();
-    };
     row("kind", sel->kind);
     row("id", sel->id);
     row("origin", sel->origin);
@@ -555,6 +721,18 @@ void drawSidePanel(AppState& st, float panelW) {
     if (graphGlassButton("##blast", G.blastLoading ? "Blasting…" : "Blast radius",
                          true, -1.0f) && !G.blastLoading) {
         requestBlast(st, sel->id);
+    }
+    // Link authoring: arm this node as a link source.
+    ImGui::Dummy(ImVec2(0, 4 * S));
+    if (G.linkArmSrc == sel->id) {
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 1.0f));
+        ImGui::TextWrapped("Click the target node…");
+        ImGui::PopStyleColor();
+        if (graphGlassButton("##armcancel", "Cancel", false, -1.0f))
+            G.linkArmSrc.clear();
+    } else if (graphGlassButton("##armlink", "Link from here…", false, -1.0f)) {
+        G.linkArmSrc = sel->id;
     }
     if (!G.blast.empty()) {
         ImGui::Dummy(ImVec2(0, 4 * S));
@@ -652,26 +830,41 @@ void drawCanvas(AppState& st, ImVec2 canvasSz) {
     for (int i = 0; i < (int)G.nodes.size(); ++i) idx[G.nodes[i].id] = i;
 
     // Edges under nodes.
-    for (const auto& e : G.edges) {
+    for (int ei = 0; ei < (int)G.edges.size(); ++ei) {
+        const GEdge& e = G.edges[ei];
+        if (G.hiddenKinds.count(e.kind)) continue;
         auto si = idx.find(e.src), di = idx.find(e.dst);
         if (si == idx.end() || di == idx.end()) continue;
         const GNode& a = G.nodes[si->second];
         const GNode& b = G.nodes[di->second];
-        bool dim = filtering && !matchIds.count(a.id) && !matchIds.count(b.id);
+        bool dimf = filtering && !matchIds.count(a.id) && !matchIds.count(b.id);
         bool blastEdge = !G.blast.empty() &&
                          (G.blast.count(a.id) || G.blast.count(b.id));
-        float alpha = dim ? 0.12f : (blastEdge ? 0.95f : 0.55f);
+        bool selEdge = (ei == G.selectedEdge);
+        bool authored = (e.origin == "manual" || e.origin == "ai");
+        float alpha = dimf ? 0.12f : (selEdge ? 1.0f : blastEdge ? 0.95f : 0.55f);
         ImU32 col = edgeColor(e.kind, alpha);
-        if (blastEdge && !dim)
+        if (authored && !dimf)
+            col = ImGui::GetColorU32(ImVec4(palette.accent[0], palette.accent[1],
+                                            palette.accent[2], selEdge ? 1.0f : 0.85f));
+        else if (blastEdge && !dimf)
             col = ImGui::GetColorU32(ImVec4(palette.statusWarn[0], palette.statusWarn[1],
                                            palette.statusWarn[2], 0.90f));
         ImVec2 p0 = toScreen(a.lx, a.ly);
         ImVec2 p1 = toScreen(b.lx, b.ly);
-        float thick = (blastEdge && !dim ? 2.2f : 1.3f) * S;
-        if (e.origin == "inferred")
+        float thick = (selEdge ? 3.0f : (blastEdge && !dimf ? 2.2f : 1.3f)) * S;
+        // extracted = solid, inferred = dashed, manual = solid accent, ai = dashed accent
+        if (e.origin == "inferred" || e.origin == "ai")
             drawDashedLine(dl, p0, p1, col, thick, 7 * S, 4 * S);
         else
             dl->AddLine(p0, p1, col, thick);
+        // Dimensional value label at the edge midpoint when zoomed in.
+        if (!dimf && !e.dimLabel.empty() && G.zoom >= 0.8f) {
+            ImVec2 midp((p0.x + p1.x) * 0.5f, (p0.y + p1.y) * 0.5f);
+            ImVec2 ts = ImGui::CalcTextSize(e.dimLabel.c_str());
+            dl->AddText(ImVec2(midp.x - ts.x * 0.5f, midp.y - ts.y * 0.5f),
+                        Palette::toU32(palette.textDim), e.dimLabel.c_str());
+        }
     }
 
     // Hit-test nearest node under cursor.
@@ -691,10 +884,41 @@ void drawCanvas(AppState& st, ImVec2 canvasSz) {
         }
     }
 
-    // Click select.
+    // Click select (nodes) — also completes an armed link.
     if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !G.hoverId.empty()) {
-        G.selectedId = G.hoverId;
-        G.blast.clear();
+        if (!G.linkArmSrc.empty() && G.hoverId != G.linkArmSrc) {
+            G.linkPopupDst = G.hoverId;
+            G.linkPopupOpen = true;
+        } else {
+            G.selectedId = G.hoverId;
+            G.selectedEdge = -1;
+            G.blast.clear();
+        }
+    }
+
+    // Nearest-edge pick when no node is under the cursor (< 6px, screen space).
+    if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && G.hoverId.empty()
+        && G.linkArmSrc.empty()) {
+        int bestEdge = -1;
+        float bestEd = 6.0f * 6.0f;
+        for (int ei = 0; ei < (int)G.edges.size(); ++ei) {
+            const GEdge& e = G.edges[ei];
+            if (G.hiddenKinds.count(e.kind)) continue;
+            auto si = idx.find(e.src), di = idx.find(e.dst);
+            if (si == idx.end() || di == idx.end()) continue;
+            ImVec2 p0 = toScreen(G.nodes[si->second].lx, G.nodes[si->second].ly);
+            ImVec2 p1 = toScreen(G.nodes[di->second].lx, G.nodes[di->second].ly);
+            float vx = p1.x - p0.x, vy = p1.y - p0.y;
+            float wx = mp.x - p0.x, wy = mp.y - p0.y;
+            float len2 = vx * vx + vy * vy;
+            float t = len2 > 0 ? std::clamp((wx * vx + wy * vy) / len2, 0.0f, 1.0f) : 0.0f;
+            float ex = p0.x + t * vx, ey = p0.y + t * vy;
+            float dx = mp.x - ex, dy = mp.y - ey;
+            float d2 = dx * dx + dy * dy;
+            if (d2 < bestEd) { bestEd = d2; bestEdge = ei; }
+        }
+        G.selectedEdge = bestEdge;
+        if (bestEdge >= 0) { G.selectedId.clear(); G.blast.clear(); }
     }
 
     // Nodes.
@@ -795,7 +1019,7 @@ void drawCanvas(AppState& st, ImVec2 canvasSz) {
     }
 
     // Legend bottom-left of canvas.
-    drawLegend(dl, ImVec2(origin.x + 12 * S, origin.y + canvasSz.y - 130 * S));
+    drawLegend(dl, ImVec2(origin.x + 12 * S, origin.y + canvasSz.y - 186 * S));
 
     dl->PopClipRect();
 
@@ -833,7 +1057,21 @@ void plmGraphOnProjectChanged() {
     G.lastFetch = -1e9;
     G.panX = G.panY = 0.0f;
     G.zoom = 1.0f;
+    G.selectedEdge = -1;
+    G.hiddenKinds.clear();
+    G.linkArmSrc.clear();
+    G.linkPopupOpen = false;
+    G.linkPopupDst.clear();
+    G.linkNote[0] = 0;
     // Keep available flag — method absence is session-wide, not per-project.
+}
+
+void plmGraphFocus(const std::string& query) {
+    auto& G = S();
+    std::snprintf(G.search, sizeof(G.search), "%s", query.c_str());
+    G.focusPending = query;
+    G.centerPending = !query.empty();
+    G.lastFetch = -1e9;  // force a refetch on the next draw
 }
 
 void plmDrawGraphPage(AppState& st) {
@@ -843,7 +1081,7 @@ void plmDrawGraphPage(AppState& st) {
     if (!G.available) {
         // Should not be reached (rail hides us); belt-and-suspenders.
         plmEmptyState("[ ]", "Graph unavailable",
-                      "This Billet build does not expose the CAD graph service.");
+                      "This Chudware build does not expose the CAD graph service.");
         return;
     }
 
@@ -893,6 +1131,25 @@ void plmDrawGraphPage(AppState& st) {
         plmError(G.err);
     }
 
+    // ---- edge-kind filter row -----------------------------------------------
+    if (graphGlassButton("##links_only", "Links only", false, 0.0f)) {
+        G.hiddenKinds.clear();
+        G.hiddenKinds.insert("CONTAINS");  // hide containment → the link web
+    }
+    ImGui::SameLine();
+    if (graphGlassButton("##all_kinds", "All", false, 0.0f))
+        G.hiddenKinds.clear();
+    for (const char* k : kEdgeKinds) {
+        ImGui::SameLine();
+        bool vis = !G.hiddenKinds.count(k);
+        ImU32 tc = vis ? edgeColor(k, 1.0f) : Palette::toU32(palette.textDisabled);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(tc));
+        if (ImGui::SmallButton(k)) {
+            if (vis) G.hiddenKinds.insert(k); else G.hiddenKinds.erase(k);
+        }
+        ImGui::PopStyleColor();
+    }
+
     ImGui::Dummy(ImVec2(0, 4 * S));
 
     // ---- body: canvas + side panel ------------------------------------------
@@ -915,6 +1172,39 @@ void plmDrawGraphPage(AppState& st) {
     drawSidePanel(st, sideW);
 
     ImGui::EndChild();
+
+    // ---- link authoring popup (outside the canvas child) --------------------
+    if (G.linkPopupOpen) {
+        ImGui::OpenPopup("Add link##graph_link");
+        G.linkPopupOpen = false;  // consume: the popup now owns its lifetime
+    }
+    if (ImGui::BeginPopup("Add link##graph_link")) {
+        ImGui::TextUnformatted("New link");
+        ImGui::SetNextItemWidth(180 * S);
+        ImGui::Combo("kind##lk", &G.linkKindIdx, kEdgeKinds,
+                     IM_ARRAYSIZE(kEdgeKinds));
+        ImGui::SetNextItemWidth(220 * S);
+        ImGui::InputTextWithHint("##lknote", "note (optional)",
+                                 G.linkNote, sizeof(G.linkNote));
+        if (ImGui::Button("Create")) {
+            int ki = std::clamp(G.linkKindIdx, 0,
+                                (int)IM_ARRAYSIZE(kEdgeKinds) - 1);
+            requestLinkAdd(st, G.linkArmSrc, G.linkPopupDst, kEdgeKinds[ki],
+                           G.linkNote);
+            G.linkArmSrc.clear(); G.linkPopupDst.clear(); G.linkNote[0] = 0;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) {
+            G.linkArmSrc.clear(); G.linkPopupDst.clear();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+    // Esc cancels an armed link when no popup is open.
+    if (!G.linkArmSrc.empty() && !ImGui::IsPopupOpen("Add link##graph_link") &&
+        ImGui::IsKeyPressed(ImGuiKey_Escape))
+        G.linkArmSrc.clear();
 }
 
 }  // namespace ui

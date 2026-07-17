@@ -23,6 +23,7 @@
 #include "feature_tree.h"   // featureTreeSaveDoc — save-then-close from the unsaved-changes prompt
 #include "file_dialog.h"    // saveFileDialog — ECAD Save-As from the unsaved-changes prompt
 #include "icons.h"
+#include "plm/plm_quickbar.h"  // ui::plmAutoRecordSave — auto-record on save
 #include "metrics.h"
 
 #include "../core/app_state.h"
@@ -404,6 +405,7 @@ TabSaveResult saveDocTab(AppState& st, int idx, bool forceDialog) {
                 t.dirty = false;
                 st.clearDrawingDirtyForSource(t.docId);   // the save embedded this part's drawings
                 st.pushRecentFile(t.path);
+                ui::plmAutoRecordSave(st, t.path);
                 return TabSaveResult::Saved;
             }
             st.addLog("[tabs] save failed for " + t.path + ": " + err);
@@ -413,7 +415,11 @@ TabSaveResult saveDocTab(AppState& st, int idx, bool forceDialog) {
         // Never saved (or forced) → Save-As (featureTreeSaveDoc records path + clears active dirty +
         // doSaveDoc clears this part's drawing siblings).
         std::string saved = ui::featureTreeSaveDoc(st, /*saveAs=*/forceDialog);
-        if (!saved.empty()) { st.pushRecentFile(saved); return TabSaveResult::Saved; }
+        if (!saved.empty()) {
+            st.pushRecentFile(saved);
+            ui::plmAutoRecordSave(st, saved);
+            return TabSaveResult::Saved;
+        }
         return TabSaveResult::Cancelled;
     }
 
@@ -444,6 +450,7 @@ TabSaveResult saveDocTab(AppState& st, int idx, bool forceDialog) {
         st.pushRecentFile(saved);
         st.addLog("[tabs] ecad saved -> " + saved);
         st.toast(ui::ToastLevel::Info, "Saved " + t.displayTitle());
+        ui::plmAutoRecordSave(st, saved);
         return TabSaveResult::Saved;
     }
 

@@ -28,6 +28,7 @@
 #include "icons.h"             // ui::getIcon (raster workspace-tab tiles)
 #include "metrics.h"           // ui::metrics::stroke / titleFramePad tokens
 #include "doc_tabs.h"          // ui::openNewDocChooser (File > New)
+#include "file_dialog.h"       // ui::openFolderDialog (File > Open Project Folder)
 #include "firmware/fw_workspace.h"  // T-FIN5: ui::firmwareTabVisible
 #include "feature_tree.h"      // ui::featureTreeActivePath (Save vs. Save As gating)
 #include "property_manager.h"  // PropertyManager::active() (used in View sub-menu)
@@ -449,6 +450,10 @@ struct FilMenuDrawer {
         }
         if (ImGui::MenuItem("Open...", "Ctrl+O")) st.requestOpenDialog = true;
         if (ImGui::MenuItem("Import...")) st.requestOpenDialog = true;
+        if (ImGui::MenuItem("Open Project Folder...")) {
+            std::string abs = ui::openFolderDialog();
+            if (!abs.empty()) setActiveProjectDir(st, abs);
+        }
         ImGui::Separator();
         if (ImGui::MenuItem("Save", "Ctrl+S", false, hasDoc)) st.requestSave = true;
         if (ImGui::MenuItem("Save As...", "Ctrl+Shift+S", false, hasDoc)) st.requestSaveAs = true;

@@ -116,6 +116,7 @@ struct PlmHubState {
     // settings (part-number scheme, ai mode)
     int         setGen = -1; bool setLoading = false; std::string setErr;
     std::string partPrefix, aiMode;
+    bool        autoCommit = true;        // record saves to history automatically
 
     // git (Git page) — real git / GitHub client
     int         gitGen = -1; bool gitLoading = false; std::string gitErr;

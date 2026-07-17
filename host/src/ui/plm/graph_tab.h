@@ -5,6 +5,8 @@
 // asks whether the tab is available (degrades to hidden on unknown_method).
 #pragma once
 
+#include <string>
+
 struct AppState;
 
 namespace ui {
@@ -18,5 +20,9 @@ void plmGraphOnProjectChanged();
 
 // Page body for PlmPage::Graph.
 void plmDrawGraphPage(AppState& st);
+
+// Pre-fill the graph search with a doc's file stem and jump focus there — the
+// FeatureManager "show this part's links" entry point.
+void plmGraphFocus(const std::string& query);
 
 }  // namespace ui

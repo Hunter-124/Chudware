@@ -119,6 +119,7 @@ class Vault:
             "head": head,
             "dirty": self._dirty_items(m),
             "ai_mode": m.get("ai_mode", "assisted"),
+            "auto_commit": self.auto_commit(),
             "items": [self._item_view(it) for it in m["items"]],
             "remotes": m.get("remotes", []),
             "locks": [],  # lock manifest lives on refs/aicad/locks (T-R7)

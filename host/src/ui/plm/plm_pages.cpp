@@ -334,6 +334,21 @@ void doCheckpoint(AppState& st) {
     });
 }
 
+void doRecordOutside(AppState& st) {
+    auto& H = g_plmHub;
+    if (H.busy) return;
+    H.busy = true; H.actionErr.clear(); H.actionOk.clear();
+    st.rpc.call("plm_record_outside", pathParam(st), [&st](const core::RpcResult& r) {
+        auto& H = g_plmHub;
+        H.busy = false;
+        if (!plmOk(r, H.actionErr)) return;
+        bool committed = r.result.is_object() && r.result.value("committed", false);
+        H.actionOk = committed ? "Recorded outside changes." : "Already up to date.";
+        st.toast(ui::ToastLevel::Success, H.actionOk);
+        plmInvalidate();
+    });
+}
+
 }  // namespace
 
 void plmDrawOverviewPage(AppState& st) {
@@ -436,6 +451,10 @@ void plmDrawOverviewPage(AppState& st) {
                 ImGui::AlignTextToFramePadding();
                 ImGui::TextWrapped("%s", it.path.c_str());
             }
+            ImGui::Dummy(ImVec2(0, 4 * S));
+            if (plmGlassButton("##rec_outside", "Record outside changes", "save",
+                               true) && !H.busy)
+                doRecordOutside(st);
         }
     };
 
@@ -593,7 +612,7 @@ void drawFilesTab(AppState& st) {
     // link a GitHub / Git repo (kept under version control externally; its issues
     // are tracked here in the project). Optional local checkout enables pinning.
     ImGui::Dummy(ImVec2(0, 6 * S));
-    dimText("Link a GitHub / Git repo (version-controlled outside Billet).");
+    dimText("Link a GitHub / Git repo (version-controlled outside Chudware).");
     ImGui::Spacing();
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6 * S, 4 * S));
     ImGui::SetNextItemWidth(-1);
@@ -714,6 +733,15 @@ void drawFilesTab(AppState& st) {
                              n ? (std::to_string(n) + " place(s) use this")
                                : "Not used elsewhere");
                 });
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Open")) {
+                std::string abs = st.plmProjectPath();
+                if (!abs.empty() && abs.back() != '/' && abs.back() != '\\')
+                    abs += '/';
+                abs += it.path;
+                for (char& c : abs) if (c == '\\') c = '/';
+                st.requestOpenPath = abs;
             }
             ImGui::SameLine();
             ImGui::PushStyleColor(ImGuiCol_Button,
@@ -842,9 +870,17 @@ void plmDrawHistoryPage(AppState& st) {
             ImGui::PopStyleColor();
             ImGui::SameLine();
         }
+        else if (e.kind == "auto") {
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 0.85f));
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted("save");
+            ImGui::PopStyleColor();
+            ImGui::SameLine();
+        }
         std::string headline = !e.message.empty() ? e.message
                              : (!e.summary.empty() ? e.summary : "(saved)");
-        plmItemTitle(headline, nullptr, /*alignFrame=*/rel);   // wraps long messages
+        plmItemTitle(headline, nullptr, /*alignFrame=*/rel || e.kind == "auto");
         dimText("%s  \xc2\xb7  %s", e.author.c_str(), plmNiceTime(e.authoredAt).c_str());
         if (sel) {
             ImGui::PushStyleColor(ImGuiCol_Button,
@@ -1102,6 +1138,28 @@ void plmDrawSettingsPage(AppState& st) {
             });
         }
         ImGui::PopStyleColor();
+    }
+    ImGui::Dummy(ImVec2(0, 8 * S));
+    dimText("Automatically record every save into project history.");
+    bool ac = H.autoCommit;
+    if (ImGui::Checkbox("Automatically record saves to history", &ac) && !H.busy) {
+        H.busy = true;
+        H.autoCommit = ac;  // optimistic — plmAutoRecordSave honors it at once
+        nlohmann::json p = pathParam(st);
+        p["auto_commit"] = ac;
+        st.rpc.call("plm_settings_set", p, [&st, ac](const core::RpcResult& r) {
+            g_plmHub.busy = false;
+            std::string h;
+            if (!plmOk(r, h)) {
+                g_plmHub.autoCommit = !ac;
+                st.toast(ui::ToastLevel::Error, h);
+                return;
+            }
+            st.toast(ui::ToastLevel::Info,
+                     ac ? "Saves will be recorded to history"
+                        : "Auto-record turned off");
+            plmInvalidate();
+        });
     }
     plmPanelEnd();
 

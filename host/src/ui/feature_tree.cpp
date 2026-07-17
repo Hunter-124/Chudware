@@ -32,6 +32,9 @@
 #include "property_manager.h"  // sweep/loft PATH pick from the tree (routePathFeature)
 #include "appearance_common.h"  // W1-B (item 9): shared MaterialPreset table + appearance picker
 #include "cursors.h"        // C37-E: ResizeV cursor over the rollback bar
+#include "plm/plm_hub.h"       // g_plmHub, PlmPage, plmLifecycleBadge (FM PLM badge)
+#include "plm/plm_quickbar.h"  // ui::plmActiveDocPlmState
+#include "plm/graph_tab.h"     // ui::plmGraphFocus (jump to this part's links)
 
 #include "../core/app_state.h"
 #include "../core/doc_mirror.h"
@@ -2829,7 +2832,7 @@ void fmPaneHeaderChip(AppState& st, const char* title, const char* titleIcon, fl
 // Save As writes the native .step+ ONLY — non-native formats live under File > Export (the Win32
 // dialog appends the default extension regardless of the chosen filter, so a multi-format Save As
 // silently wrote .step+ anyway).
-static const char* kStepPlusFilter = "Billet part (*.step+)\0*.step+\0All files (*.*)\0*.*\0";
+static const char* kStepPlusFilter = "Chudware part (*.step+)\0*.step+\0All files (*.*)\0*.*\0";
 
 // F4: Open/Import filter — every format the engine can import (see engine/doc/formats.py
 // FORMAT_REGISTRY / doc_formats RPC, the future dynamic source). A leading aggregate entry lets
@@ -2838,7 +2841,7 @@ static const char* kStepPlusFilter = "Billet part (*.step+)\0*.step+\0All files 
 // (the C string literal's own trailing NUL supplies the final one).
 static const char* kImportFilter =
     "All CAD & mesh files\0*.step+;*.step;*.stp;*.iges;*.igs;*.brep;*.stl;*.3mf;*.obj;*.ply;*.gltf;*.glb;*.3dm;*.sldprt;*.sldasm;*.x_t;*.x_b\0"
-    "Billet part (*.step+)\0*.step+\0"
+    "Chudware part (*.step+)\0*.step+\0"
     "STEP (*.step;*.stp)\0*.step;*.stp\0"
     "IGES (*.iges;*.igs)\0*.iges;*.igs\0"
     "BREP (*.brep)\0*.brep\0"
@@ -3575,6 +3578,28 @@ void drawFeatureTreeBody(AppState& st,
         const bool fileOpenBefore = s_fileSecOpen;
         fmSectionDividerCollapse(docName.c_str(), &s_fileSecOpen, &fileRightClicked);
         if (s_fileSecOpen != fileOpenBefore) sec.fileUserToggled = true;
+        // PLM: revision badge + a jump-to-this-part's-links button on the title row.
+        {
+            std::string plmRev, plmLife; bool plmDirty = false;
+            if (ui::plmActiveDocPlmState(st, plmRev, plmLife, plmDirty)) {
+                const float S = ui::uiScale;
+                const float badgeW = 64.0f * S;
+                const float btnW = ImGui::CalcTextSize("links").x + 12.0f * S;
+                const float rightX =
+                    ImGui::GetContentRegionMax().x - badgeW - btnW - 10.0f * S;
+                if (rightX > ImGui::GetCursorPosX()) ImGui::SameLine(rightX);
+                else ImGui::SameLine();
+                if (ImGui::SmallButton("links##fm_graph")) {
+                    st.activeWorkspace = AppState::Workspace::PLM;
+                    g_plmHub.page = PlmPage::Graph;
+                    ui::plmGraphFocus(docName);
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Show this part's links in the project graph");
+                ImGui::SameLine();
+                ui::plmLifecycleBadge(plmLife, plmRev);
+            }
+        }
 
         // C26: filename "Appearance…" — sets the primary body's color (the common single-body
         // case). Body key "b1" matches the engine's per-body appearance key (session._write_aicm).
@@ -5591,7 +5616,7 @@ void pollAiCadHandoff(AppState& st) {
                 }
                 shownRev[docId] = hd.rev;
                 if (takeFocus)
-                    st.toast(ui::ToastLevel::Info, "Billet: live view of the AI's part — it updates as it builds");
+                    st.toast(ui::ToastLevel::Info, "Chudware: live view of the AI's part — it updates as it builds");
                 done.push_back(docId);
             } else if (!opened) {
                 // Open failed. This is often TRANSIENT — the agent may have swapped the .step+ a

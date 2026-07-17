@@ -4950,6 +4950,23 @@ static bool s_cpCollapsed = false;
 // defined below with the picker helpers, hosted by the header Settings button.
 static void drawAISettingsBody(AppState& st, bool busy);
 
+// Aggregate task/plan progress (done/total) from the active conversation's most recent
+// assistant turn. DETERMINISTIC: statuses come from engine stage/mission events, not the
+// model claiming completion (no cheating). Excludes subagent/objective rows.
+static void copilotTaskProgress(AppState& st, int& done, int& total) {
+    done = 0;
+    total = 0;
+    for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it) {
+        if (it->fromUser || !it->planState.present || it->planState.items.empty()) continue;
+        for (const auto& pi : it->planState.items) {
+            if (pi.kind == "subagent" || pi.kind == "objective") continue;
+            ++total;
+            if (pi.status == "done" || pi.status == "pass") ++done;
+        }
+        if (total > 0) break;  // newest turn that has a plan wins
+    }
+}
+
 static void drawCopilotHeader(AppState& st, bool busy) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
@@ -4984,7 +5001,7 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     const float collapseW = lh;
     const float collapseGap = ui::metrics::asmHeaderIconGap();
 
-    // ---- Row 1: Billet cube + wordmark, horizontally centered in the column ----
+    // ---- Row 1: [Tasks d/t] .. centered Billet cube+wordmark .. [Artifacts] ----
     {
         const float colW = ImGui::GetContentRegionAvail().x;
         const float logoGap = 3.0f * sc;
@@ -4993,31 +5010,65 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         const float wmW = ImGui::CalcTextSize("Billet").x;
         if (wordF) ImGui::PopFont();
         const float logoW = cubeSz + logoGap + wmW;
-        float logoLeft = (colW - logoW) * 0.5f;
-        logoLeft = std::max(0.0f, logoLeft);
+        const float rowTop1 = ImGui::GetCursorPosY();
+        const float bh = lh;
+        auto cy1 = [&](float h) { ImGui::SetCursorPosY(rowTop1 + (wordLh - h) * 0.5f); };
 
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + logoLeft);
+        // Task-list button — LEFT-aligned with the logo. Shows deterministic d/t done.
+        int tlDone = 0, tlTotal = 0;
+        copilotTaskProgress(st, tlDone, tlTotal);
+        char tlLabel[24];
+        std::snprintf(tlLabel, sizeof(tlLabel), "%d/%d", tlDone, tlTotal);
+        const float tlW = measureBtn(tlLabel, "plan_board");
+        const float artW = measureBtn("Artifacts", "team");
+        cy1(bh);
+        ImGui::SetCursorPosX(0.0f);
+        if (busy) ImGui::BeginDisabled();
+        if (drawHeaderTextButton("##hdr_tasks", tlLabel, st.showTaskList, tlW, "plan_board")) {
+            const bool open = !st.showTaskList;
+            st.showTaskList = open;
+            if (open) { st.showArtifacts = st.showSessionsPicker = st.showAISettingsOverlay = false; }
+        }
+        if (busy) ImGui::EndDisabled();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Tasks \xc2\xb7 %d of %d done \xc2\xb7 click for the task list", tlDone, tlTotal);
+
+        // Logo — CENTERED (kept clear of the flanking buttons).
+        float logoLeft = (colW - logoW) * 0.5f;
+        logoLeft = std::max(tlW + 6.0f * sc, logoLeft);
+        ImGui::SameLine(logoLeft);
         {
             IconUV cube = ui::getIcon("context_cube", 20);
             if (cube.valid) {
-                const ImVec4 tint = chatSurf().textPrimary;
-                const float dy = (wordLh - cubeSz) * 0.5f;
-                if (dy > 0.0f) ImGui::SetCursorPosY(ImGui::GetCursorPosY() + dy);
-                ImGui::Image(cube.texId, ImVec2(cubeSz, cubeSz), cube.uv0, cube.uv1, tint);
-                if (dy > 0.0f) ImGui::SetCursorPosY(ImGui::GetCursorPosY() - dy);
+                cy1(cubeSz);
+                ImGui::Image(cube.texId, ImVec2(cubeSz, cubeSz), cube.uv0, cube.uv1,
+                             chatSurf().textPrimary);
             } else {
+                cy1(cubeSz);
                 ImGui::Dummy(ImVec2(cubeSz, cubeSz));
             }
             ImGui::SameLine(0, logoGap);
         }
         if (wordF) ImGui::PushFont(wordF);
+        cy1(wordLh);
         ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textPrimary);
         ImGui::TextUnformatted("Billet");
         ImGui::PopStyleColor();
         if (wordF) ImGui::PopFont();
 
-        // Minimal logo → controls gap.
-        ImGui::Dummy(ImVec2(0, 0.0f));
+        // Session Artifacts button — RIGHT-aligned with the logo.
+        ImGui::SameLine(std::max(logoLeft + logoW + 6.0f * sc, colW - artW));
+        cy1(bh);
+        if (busy) ImGui::BeginDisabled();
+        if (drawHeaderTextButton("##hdr_arts", "Artifacts", st.showArtifacts, artW, "team")) {
+            const bool open = !st.showArtifacts;
+            st.showArtifacts = open;
+            if (open) { st.showTaskList = st.showSessionsPicker = st.showAISettingsOverlay = false; }
+        }
+        if (busy) ImGui::EndDisabled();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Session Artifacts \xc2\xb7 subagents, plan, documents");
+        ImGui::SetCursorPosY(rowTop1 + wordLh);
     }
 
     // ---- Row 2: collapse | Chat (left) | Sessions (center) | Settings (right) | status ----
@@ -5236,6 +5287,114 @@ static void drawSessionsPanel(AppState& st, bool busy) {
         ImGui::SetCursorScreenPos(ImVec2(rowMin.x, rowMax.y + rowGap));
         ImGui::PopID();
         if (doDel) { closeConversation(st, i); break; }
+    }
+}
+
+// Task-list panel — replaces the chat log; the deterministic plan/checklist for the
+// active conversation's most recent turn (statuses from engine events, not the model).
+static void drawTaskListPanel(AppState& st, bool busy) {
+    (void)busy;
+    const float sc = ui::uiScale;
+    const ui::AdaptiveSurface& surf = chatSurf();
+    const PlanState* ps = nullptr;
+    for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
+        if (!it->fromUser && it->planState.present && !it->planState.items.empty()) {
+            ps = &it->planState; break;
+        }
+    int done = 0, total = 0;
+    copilotTaskProgress(st, done, total);
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+    ImGui::TextUnformatted(ps && !ps->title.empty() ? ps->title.c_str() : "Task list");
+    ImGui::PopStyleColor();
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+    ImGui::Text("%d of %d complete", done, total);
+    if (ps && !ps->summary.empty()) ImGui::TextWrapped("%s", ps->summary.c_str());
+    ImGui::PopStyleColor();
+    ImGui::Dummy(ImVec2(0, 4 * sc));
+    if (!ps) {
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+        ImGui::TextWrapped("No task list yet — start a build and the agent's plan appears here.");
+        ImGui::PopStyleColor();
+        return;
+    }
+    for (const auto& pi : ps->items) {
+        if (pi.kind == "subagent") continue;
+        const bool ok = (pi.status == "done" || pi.status == "pass");
+        const bool run = (pi.status == "running");
+        const bool fail = (pi.status == "fail");
+        const char* glyph = ok ? "[x]" : run ? "[~]" : fail ? "[!]" : "[ ]";
+        ImVec4 gc = surf.textSecondary;
+        if (ok) { gc = semanticOnGlass(ui::palette.accent, surf); gc.w = 1.0f; }
+        else if (fail) { gc = semanticOnGlass(ui::palette.statusErr, surf); gc.w = 1.0f; }
+        ImGui::PushStyleColor(ImGuiCol_Text, gc);
+        ImGui::TextUnformatted(glyph);
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Text, ok ? surf.textSecondary : surf.textPrimary);
+        ImGui::TextWrapped("%s", pi.title.empty() ? "(task)" : pi.title.c_str());
+        ImGui::PopStyleColor();
+    }
+}
+
+// Session Artifacts panel — subagents, the plan, and session documents for this session.
+static void drawArtifactsPanel(AppState& st, bool busy) {
+    (void)busy;
+    const float sc = ui::uiScale;
+    const ui::AdaptiveSurface& surf = chatSurf();
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+    ImGui::TextUnformatted("Session Artifacts");
+    ImGui::PopStyleColor();
+    ImGui::Dummy(ImVec2(0, 4 * sc));
+    bool any = false;
+    // Subagents (from plan_state subagent rows + agent.spawn activity).
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+    ImGui::TextUnformatted("Subagents");
+    ImGui::PopStyleColor();
+    for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it) {
+        if (it->fromUser) continue;
+        if (it->planState.present)
+            for (const auto& pi : it->planState.items)
+                if (pi.kind == "subagent") {
+                    any = true;
+                    ImGui::BulletText("%s%s", pi.title.c_str(),
+                                      pi.status.empty() ? "" : (" \xc2\xb7 " + pi.status).c_str());
+                }
+        for (const auto& a : it->activity)
+            if (a.stage.rfind("agent:", 0) == 0 || a.title.rfind("Subagent", 0) == 0) {
+                any = true;
+                ImGui::BulletText("%s", a.title.empty() ? a.stage.c_str() : a.title.c_str());
+            }
+    }
+    if (!any) { ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+                ImGui::TextWrapped("  (none)"); ImGui::PopStyleColor(); }
+    ImGui::Dummy(ImVec2(0, 6 * sc));
+    // Plan.
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+    ImGui::TextUnformatted("Plan");
+    ImGui::PopStyleColor();
+    const PlanState* ps = nullptr;
+    for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
+        if (!it->fromUser && it->planState.present) { ps = &it->planState; break; }
+    if (ps) {
+        int d = 0, t = 0; copilotTaskProgress(st, d, t);
+        ImGui::BulletText("%s (%d/%d)", ps->title.empty() ? "build plan" : ps->title.c_str(), d, t);
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+        ImGui::TextWrapped("  (none)"); ImGui::PopStyleColor();
+    }
+    ImGui::Dummy(ImVec2(0, 6 * sc));
+    // Documents (open doc tabs = the session's parts/drawings).
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+    ImGui::TextUnformatted("Documents");
+    ImGui::PopStyleColor();
+    if (st.docTabs.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+        ImGui::TextWrapped("  (none)"); ImGui::PopStyleColor();
+    } else {
+        for (const auto& t : st.docTabs)
+            ImGui::BulletText("%s", t.title.empty()
+                                        ? (t.path.empty() ? t.docId.c_str() : t.path.c_str())
+                                        : t.title.c_str());
     }
 }
 
@@ -11470,6 +11629,10 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         ImGui::BeginChild("chatlog", ImVec2(0, chatH), ImGuiChildFlags_None);
         if (st.showAISettingsOverlay) {
             drawAISettingsBody(st, busy);
+        } else if (st.showTaskList) {
+            drawTaskListPanel(st, busy);
+        } else if (st.showArtifacts) {
+            drawArtifactsPanel(st, busy);
         } else if (st.showSessionsPicker) {
             drawSessionsPanel(st, busy);
         } else {

@@ -2926,9 +2926,10 @@ TEST_CASE("op-path: extrude flip puts solid on the opposite side of the sketch p
     CHECK(zf1 - zf0 == doctest::Approx(D).epsilon(0.05));
 }
 
-// Wave 3 Evaluate: blank PART docs default to Aluminium 6061-T6
-// (registry key aluminum_6061_t6). Assemblies stay material-free.
-TEST_CASE("blank part defaults material key to aluminum_6061_t6") {
+// Wave 3 Evaluate: blank PART docs default to Aluminium 6061-T6. The key MUST be the sim/GUI
+// key `alu_6061` (engine/sim/materials.json + kPhysicalMaterials) — the same key the FeatureManager
+// "set material" writes and that FEA/mass/appearance resolve. Assemblies stay material-free.
+TEST_CASE("blank part defaults material key to alu_6061 (6061-T6 aluminum)") {
     using aicad::doc::doc_new;
     using aicad::doc::doc_tree;
     json nr = doc_new("part", "DefaultMat");
@@ -2938,7 +2939,7 @@ TEST_CASE("blank part defaults material key to aluminum_6061_t6") {
     const json& mat = tree["tree"]["material"];
     REQUIRE(mat.is_object());
     REQUIRE(mat.contains("key"));
-    CHECK(mat["key"].get<std::string>() == "aluminum_6061_t6");
+    CHECK(mat["key"].get<std::string>() == "alu_6061");
 
     // Density path: a 10×10×10 mm cube at 2.70 g/cm³ → mass = 2.70 g.
     using aicad::doc::doc_apply_ops;

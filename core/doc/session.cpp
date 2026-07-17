@@ -615,7 +615,11 @@ json blank_part(const std::string& doc_id, const std::string& name) {
         {"id", doc_id},
         {"name", name.empty() ? std::string("Part1") : name},
         {"units", {{"system", "MMGS"}}},
-        {"material", {{"key", "aluminum_6061_t6"}}},
+        // Default material: 6061-T6 aluminum. MUST be the canonical engine key `alu_6061`
+        // (engine/sim/materials.json + kPhysicalMaterials) — the old `aluminum_6061_t6`
+        // resolved NOWHERE, so mass fell back to 7.85 g/cm^3 steel and the FeatureManager
+        // showed the raw key instead of "Aluminum 6061-T6".
+        {"material", {{"key", "alu_6061"}}},
         {"equations", {{"globals", json::array()}}},
         {"features", json::array()},
     };

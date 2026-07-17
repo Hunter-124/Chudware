@@ -2,7 +2,7 @@
 
 Contract (AI_HARNESS_ROADMAP WS2 + wave Contract):
   * config.json ``ai_roles`` maps role → ``{provider, model}`` | ``"auto"``
-    for: advisor | task | planning | default | plm | redaction.
+    for: advisor | task | planning | vision | default | plm | redaction.
   * Each role entry MAY also carry ``thinking``: ``"auto"|"low"|"medium"|"high"``
     (default ``"auto"``). Concrete levels pin that role's LLM reasoning effort;
     ``auto`` on default/main lets the prompt classifier assign effort, and on
@@ -42,6 +42,7 @@ KNOWN_ROLES = (
     "advisor",
     "task",
     "planning",
+    "vision",
     "default",
     "plm",
     "redaction",
@@ -1662,6 +1663,24 @@ def parse_leaf_envelope_text(text: str) -> tuple[dict[str, Any] | None, list[str
 
 
 
+def _vision_capability_tier(provider: str, model: str) -> int:
+    """Vision-preference sort tier for auto-pick.
+
+    0 = known vision-capable, 1 = unknown (catalog miss / error),
+    2 = known non-vision. Unknown is permissive: kept as fallback above
+    known-non-vision so we never hard-exclude unresolved models.
+    """
+    try:
+        from services.agent.model_catalog import lookup_model  # noqa: PLC0415
+
+        row = lookup_model(provider, model)
+    except Exception:  # noqa: BLE001
+        return 1
+    if not isinstance(row, Mapping) or "vision" not in row:
+        return 1
+    return 0 if bool(row.get("vision")) else 2
+
+
 def auto_pick_model(
     *,
     cfg: Mapping[str, Any] | None = None,
@@ -1672,12 +1691,19 @@ def auto_pick_model(
     rankings: Mapping[str, ModelRank] | None = None,
     enabled: Iterable[Mapping[str, str]] | None = None,
     require_loopback: bool = False,
+    prefer_vision: bool = False,
 ) -> RoleModelAssignment:
     """Pick cheapest enabled provider+model meeting the rank threshold.
 
     Prefer subscription/free/local over metered. Unknown models (no ranking
     entry) are treated as rank 2 so they remain usable but don't outrank
     measured/shipped frontier picks for hard tasks.
+
+    When *prefer_vision* is True (vision harness role auto-pick), candidates
+    are ordered vision-capable first, then unknown capability, then known
+    non-vision — each tier still uses the normal cost/rank ordering. If no
+    vision-capable model is enabled the pick falls through to the remaining
+    pool (never empty/crash solely for lack of vision).
     """
     cfg = cfg or {}
     ranks = rankings if rankings is not None else load_rankings(cfg)
@@ -1718,11 +1744,19 @@ def auto_pick_model(
             model_rank = max(model_rank, _FRONTIER_MEASURED_FLOOR)
         if model_rank < threshold:
             continue
-        sort_key = (
-            _cost_key(prov, model)[0],
-            -model_rank,
-            f"{prov}/{model}",
-        )
+        if prefer_vision:
+            sort_key = (
+                _vision_capability_tier(prov, model),
+                _cost_key(prov, model)[0],
+                -model_rank,
+                f"{prov}/{model}",
+            )
+        else:
+            sort_key = (
+                _cost_key(prov, model)[0],
+                -model_rank,
+                f"{prov}/{model}",
+            )
         candidates.append((sort_key, dict(c), mr))
 
     if not candidates:
@@ -1742,7 +1776,15 @@ def auto_pick_model(
                 f"auto_pick_model: no enabled providers meet min_rank={threshold}"
                 + (" with loopback constraint" if require_loopback else "")
             )
-        fallback.sort(key=lambda c: _cost_key(str(c["provider"]), str(c["model"])))
+        if prefer_vision:
+            fallback.sort(
+                key=lambda c: (
+                    _vision_capability_tier(str(c["provider"]), str(c["model"])),
+                    _cost_key(str(c["provider"]), str(c["model"])),
+                )
+            )
+        else:
+            fallback.sort(key=lambda c: _cost_key(str(c["provider"]), str(c["model"])))
         pick = fallback[0]
         mr = ranks.get(str(pick["model"]))
         return RoleModelAssignment(
@@ -1859,6 +1901,7 @@ def resolve_role_model(
             rankings=rank_table,
             enabled=enabled,
             require_loopback=require_loopback,
+            prefer_vision=(role_s == "vision"),
         )
     except RoleModelError:
         if require_loopback:

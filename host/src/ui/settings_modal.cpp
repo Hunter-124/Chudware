@@ -949,10 +949,10 @@ struct ModelRolesUi {
 static ModelRolesUi s_roles;
 
 static const char* kRoleKeys[] = {
-    "advisor", "task", "planning", "default", "plm", "redaction"};
+    "advisor", "task", "planning", "vision", "default", "plm", "redaction"};
 static const char* kRoleLabels[] = {
-    "Advisor", "Task", "Planning", "Default", "PLM", "Redaction"};
-static constexpr int kRoleCount = 6;
+    "Advisor", "Task", "Planning", "Vision", "Default", "PLM", "Redaction"};
+static constexpr int kRoleCount = 7;
 
 static std::string benchTierForSource(const Settings& s, int source) {
     if (source == 1) return "xai:grok-4-5";
@@ -1677,6 +1677,12 @@ static void drawModelRolesSection(AppState& st, float sc) {
             ImGui::TableNextColumn();
             ImGui::AlignTextToFramePadding();
             ImGui::TextUnformatted(kRoleLabels[i]);
+            if (std::strcmp(key, "vision") == 0) {
+                // Dim "(?)" info marker — same helpMarker helper used elsewhere in Settings.
+                helpMarker("Vision role: image & geometry understanding \xe2\x80\x94 translating "
+                           "3D geometry to text and validating models from renderings/screenshots. "
+                           "Point this at your most capable vision model.");
+            }
             if (isRedaction) {
                 ImGui::SameLine();
                 ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusWarn));

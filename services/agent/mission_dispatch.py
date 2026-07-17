@@ -867,7 +867,9 @@ class MissionDispatch:
                     pass
                 if role in ("overseer", "orchestrator", "department_manager"):
                     harness_role = "planning"
-                elif role in ("advisor", "reviewer"):
+                elif role == "reviewer":
+                    harness_role = "vision"
+                elif role == "advisor":
                     harness_role = "advisor"
                 cfg = dict(agent_config.load_config() or {})
                 min_rank = policy.get("min_rank")

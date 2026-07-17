@@ -1,0 +1,20 @@
+# bench_run mode=diag tiers=['xai:grok-4-5'] cycle=gui-diag-1784201986
+# cwd=/home/hunter/Repositories/CAD
+# cmd=/home/hunter/.local/share/AI-CAD/runtime/venv/bin/python -m tools.flywheel.bench.gym.cli diag --tiers xai:grok-4-5
+
+[gym] re-exec into /home/hunter/.local/share/AI-CAD/mcp-venv/bin/python
+      (this interpreter lacks langgraph.checkpoint.sqlite; real DAG runs would die at PLAN — see T-DP19)
+diag: tiers=['xai:grok-4-5'] axes=['tool_validity', 'vision_fix', 'feature_id', 'vc_hygiene'] mock=False
+  grok-4.5: {'tool_validity': 1.0, 'vision_fix': 0.8, 'feature_id': 1.0, 'vc_hygiene': 0.8}
+  wrote: /home/hunter/Repositories/CAD/tools/flywheel/bench/gym/reports/diag/diag-latest.json
+
+# leaderboard build
+# cmd=/home/hunter/.local/share/AI-CAD/runtime/venv/bin/python -m tools.flywheel.bench.gym.leaderboard build
+leaderboard written: /home/hunter/Repositories/CAD/benchmarks/leaderboard/leaderboard.json
+  schema:     aicad.leaderboard/1
+  task_suite: gym-C1..C15 + diag-v1
+  models:     4
+    - gemma3-4b-qat (local/llamacpp): pass=0.000 (0/3) axes={'tool_validity': None, 'vision_fix': None, 'feature_id': None, 'vc_hygiene': None, 'discipline_index': 0.8889, 'verify_efficacy': 1.0, 'checkpoint_util': 0.0}
+    - grok-4.5 (paid/xai-sub): pass=0.000 (0/15) axes={'tool_validity': 1.0, 'vision_fix': 0.8, 'feature_id': 1.0, 'vc_hygiene': 0.8, 'discipline_index': 0.8889, 'verify_efficacy': 1.0, 'checkpoint_util': 0.0}
+    - llama3.2:latest (local/ollama): pass=0.000 (0/3) axes={'tool_validity': None, 'vision_fix': None, 'feature_id': None, 'vc_hygiene': None, 'discipline_index': 0.8889, 'verify_efficacy': 1.0, 'checkpoint_util': 0.0}
+    - qwen3-4b (local/llamacpp): pass=0.347 (17/49) axes={'tool_validity': None, 'vision_fix': None, 'feature_id': None, 'vc_hygiene': None, 'discipline_index': 0.8889, 'verify_efficacy': 1.0, 'checkpoint_util': 0.0}

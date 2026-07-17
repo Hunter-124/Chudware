@@ -1,12 +1,25 @@
 {
   "running": false,
-  "stage": "running",
-  "started": null,
-  "finished": null,
+  "stage": "done",
+  "started": "2026-07-16T11:39:46Z",
+  "finished": "2026-07-16T11:41:05Z",
   "last_error": null,
-  "last_result_path": null,
-  "mode": null,
-  "tiers": [],
-  "pid": 2673074,
-  "exit_code": null
+  "last_result_path": "/home/hunter/Repositories/CAD/benchmarks/leaderboard/leaderboard.json",
+  "mode": "diag",
+  "tiers": [
+    "xai:grok-4-5"
+  ],
+  "category": null,
+  "pid": 1666520,
+  "exit_code": 0,
+  "cycle": "gui-diag-1784201986",
+  "cmd": [
+    "/home/hunter/.local/share/AI-CAD/runtime/venv/bin/python",
+    "-m",
+    "tools.flywheel.bench.gym.cli",
+    "diag",
+    "--tiers",
+    "xai:grok-4-5"
+  ],
+  "log_path": "/home/hunter/Repositories/CAD/tools/flywheel/bench/gym/reports/gui_bench/gui-diag-1784201986.log"
 }

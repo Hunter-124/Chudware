@@ -11,6 +11,9 @@ shape to the feature (see the cheatsheet's "PICK THE RIGHT FEATURE" guide):
   - constant section along a path (pipe, rail, spring/thread) -> sketch a profile + SWEEP.
   - aerofoil / wing section -> the AIRFOIL sketch entity, then extrude or loft it.
   - flat 2D outline extruded (bracket, plate, rib) -> sketch + EXTRUDE; repeats -> PATTERN; symmetry -> MIRROR.
+  - regular polygon / hexagon / nut / bolt-head / hex prism -> ONE polygon sketch entity:
+    {type:"hexagon","across_flats":N} (or {type:"polygon","sides":N,"circumradius":R}), then EXTRUDE.
+    NEVER hand-draw the sides as separate lines — that is slow and usually fails to close the loop.
 NEVER approximate a curved or organic shape with a stack of boxes. A plain rectangular/cylindrical
 block may use a primitive. Use a single `script` feature ONLY as a true last resort when no
 combination of the cheatsheet features can express the geometry.

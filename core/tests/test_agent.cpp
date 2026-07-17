@@ -7,6 +7,7 @@
 #include "agent/machine.h"
 #include "agent/state.h"
 #include "agent/events.h"
+#include "agent/ops_emit.h"
 
 
 using namespace aicad::agent;
@@ -797,4 +798,41 @@ TEST_CASE("run_machine no plan leaves plan_state absent") {
     CHECK_FALSE(has_build);
     // Blank default step does not emit a plan_state checklist card (off/no-plan unchanged).
     CHECK_FALSE(has_checklist);
+}
+
+TEST_CASE("extract_ops_last_nonempty: reasoning-channel ops fallback") {
+    // grok-4.5 leaves the content channel empty/`[]` and writes the real ops in reasoning.
+    // The fallback must skip DRAFT arrays + coordinate fragments and return the FINAL block.
+    SUBCASE("content bare [] yields nothing; reasoning last fenced block wins") {
+        // extract_ops on a bare empty array returns an (empty) ops array -> caller checks empty.
+        OpsResult content = extract_ops("```json\n[]\n```");
+        CHECK((!content.ops || content.ops->empty()));
+        std::string reasoning =
+            "Let me sketch it. First a draft:\n"
+            "```json\n[{\"op\":\"add_feature\",\"type\":\"sketch\"}]\n```\n"
+            "Actually the points are [-8, 0], [-4, 6.9] ... let me redo.\n"
+            "Final answer:\n"
+            "```json\n[{\"op\":\"add_feature\",\"type\":\"sketch\"},"
+            "{\"op\":\"sketch_add_entity\",\"type\":\"circle\",\"radius\":10},"
+            "{\"op\":\"add_feature\",\"type\":\"extrude\"}]\n```\n";
+        OpsResult r = extract_ops_last_nonempty(reasoning);
+        REQUIRE(r.ops.has_value());
+        CHECK(r.ops->size() == 3);  // the LAST fenced block, not the 1-op draft
+        CHECK((*r.ops)[1]["type"] == "circle");
+    }
+    SUBCASE("coordinate fragments never match as ops") {
+        // No fenced block; only a bare coordinate array present -> must NOT be taken as ops.
+        OpsResult r = extract_ops_last_nonempty("the hexagon corner is at [-8, 0] across flats");
+        CHECK_FALSE(r.ops.has_value());
+    }
+    SUBCASE("empty reasoning -> no ops") {
+        OpsResult r = extract_ops_last_nonempty("just prose, no json at all");
+        CHECK_FALSE(r.ops.has_value());
+    }
+    SUBCASE("bare fenced ops with no draft still resolves") {
+        OpsResult r = extract_ops_last_nonempty(
+            "```json\n[{\"op\":\"add_feature\",\"type\":\"box\"}]\n```");
+        REQUIRE(r.ops.has_value());
+        CHECK(r.ops->size() == 1);
+    }
 }

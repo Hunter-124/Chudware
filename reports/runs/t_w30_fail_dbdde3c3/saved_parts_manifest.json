@@ -1,0 +1,62 @@
+{
+  "schema": "aicad.saved_parts/1",
+  "run_id": "t_w30_fail_dbdde3c3",
+  "status": "needs_correction",
+  "stop_reason": "verify_failed: ['AC1']",
+  "saved": [
+    {
+      "doc_id": "doc-cpp0000000a",
+      "name": "rocket_plane_airframe",
+      "origin_kind": "unknown",
+      "paths": [
+        "/home/hunter/Repositories/CAD/reports/runs/t_w30_fail_dbdde3c3/parts/rocket_plane_airframe_-cpp0000000a.step+",
+        "/home/hunter/Documents/AI-CAD/rocket_plane_airframe_-cpp0000000a.step+"
+      ],
+      "bytes": [
+        35857,
+        35857
+      ]
+    }
+  ],
+  "closed": [
+    {
+      "doc_id": "doc-cpp0000000a",
+      "closed": true,
+      "detached": false
+    }
+  ],
+  "skipped": [
+    {
+      "doc_id": "9c0f5caad07a",
+      "reason": "save_failed",
+      "name": "flight_computer",
+      "errors": [
+        "save artifact 9c0f5caad07a: no such document: 9c0f5caad07a",
+        "save workspace 9c0f5caad07a: no such document: 9c0f5caad07a"
+      ]
+    },
+    {
+      "doc_id": "40ff237531b2",
+      "reason": "save_failed",
+      "name": null,
+      "errors": [
+        "save artifact 40ff237531b2: no such document: 40ff237531b2",
+        "save workspace 40ff237531b2: no such document: 40ff237531b2"
+      ]
+    },
+    {
+      "doc_id": "doc-cpp00000001",
+      "reason": "no_geometry",
+      "name": "link_dim_probe",
+      "origin_kind": "unknown"
+    }
+  ],
+  "errors": [
+    "save artifact 9c0f5caad07a: no such document: 9c0f5caad07a",
+    "save workspace 9c0f5caad07a: no such document: 9c0f5caad07a",
+    "save artifact 40ff237531b2: no such document: 40ff237531b2",
+    "save workspace 40ff237531b2: no such document: 40ff237531b2"
+  ],
+  "parts_dir": "/home/hunter/Repositories/CAD/reports/runs/t_w30_fail_dbdde3c3/parts",
+  "workspace_dir": "/home/hunter/Documents/AI-CAD"
+}

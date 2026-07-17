@@ -872,6 +872,13 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
             return o;
         }
         OpsResult ores = extract_ops(ac.reply);
+        // grok-4.5 (and other CoT models) sometimes emit the ops array in the reasoning
+        // stream, leaving the content channel empty or a bare `[]`. When content yields no
+        // usable ops, harvest them from the reasoning channel (last non-empty ops array).
+        if ((!ores.ops || ores.ops->empty()) && !ac.thinking.empty()) {
+            OpsResult tres = extract_ops_last_nonempty(ac.thinking);
+            if (tres.ops && !tres.ops->empty()) ores = std::move(tres);
+        }
         if (!ores.ops) {
             std::string perr = ores.error.value_or("");
             o.verdict = "retry";
@@ -1011,6 +1018,11 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
             return o;
         }
         OpsResult ores = extract_ops(ac.reply);
+        // Same reasoning-channel fallback as the model stage (grok emits fix ops in CoT).
+        if ((!ores.ops || ores.ops->empty()) && !ac.thinking.empty()) {
+            OpsResult tres = extract_ops_last_nonempty(ac.thinking);
+            if (tres.ops && !tres.ops->empty()) ores = std::move(tres);
+        }
         if (!ores.ops) {
             std::string perr = ores.error.value_or("");
             o.verdict = "retry";

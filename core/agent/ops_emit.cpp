@@ -202,6 +202,46 @@ OpsResult extract_ops(const std::string& reply) {
     return r;
 }
 
+OpsResult extract_ops_last_nonempty(const std::string& reply) {
+    FenceSpec json_spec;
+    json_spec.tags = {"json", "JSON"};
+    // Return the LAST candidate that is a non-empty array of OBJECTS (ops are {op:...};
+    // requiring object elements rejects coordinate/number fragments like [-8, 0] that a
+    // reasoning stream is full of).
+    auto pick = [](const std::vector<std::string>& cands) -> std::optional<json> {
+        std::optional<json> best;
+        for (const std::string& blob : cands) {
+            auto data = try_load(blob);
+            if (!data) continue;
+            const json* arr = nullptr;
+            if (data->is_array()) {
+                arr = &*data;
+            } else if (data->is_object() && data->contains("ops") && (*data)["ops"].is_array()) {
+                arr = &(*data)["ops"];
+            }
+            if (arr && !arr->empty() && arr->front().is_object()) best = *arr;
+        }
+        return best;
+    };
+    std::vector<std::string> fenced;
+    for (const std::string& body : find_fenced_bodies(reply, json_spec))
+        fenced.push_back(py_strip(body));
+    OpsResult r;
+    if (auto ops = pick(fenced)) {  // fenced blocks are the authoritative source
+        r.ops = *ops;
+        return r;
+    }
+    // Only when NO fenced block yielded ops: the first bare balanced [...] (drafts in a
+    // reasoning stream are usually fenced, so the bare span is the model's single answer).
+    if (auto bare = first_balanced(reply, '[', ']'))
+        if (auto ops = pick({*bare})) {
+            r.ops = *ops;
+            return r;
+        }
+    r.error = "no non-empty ops array in reasoning";
+    return r;
+}
+
 bool extract_revert(const std::string& reply) {
     FenceSpec json_spec;
     json_spec.tags = {"json", "JSON"};

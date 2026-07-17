@@ -30,6 +30,13 @@ struct OpsResult {
 };
 OpsResult extract_ops(const std::string& reply);
 
+// Reasoning-channel fallback. grok-4.5 (and other CoT models) sometimes emit the
+// FINAL ops array in their reasoning stream while the content channel is empty or a
+// bare `[]`. This scans every fenced/bare JSON candidate and returns the LAST
+// non-empty ops array (earlier arrays in a reasoning stream are drafts/fragments).
+// Only call this when extract_ops(content) yielded no usable (non-empty) ops.
+OpsResult extract_ops_last_nonempty(const std::string& reply);
+
 // True if the reply carries a {"revert": true} verdict (fenced or bare {..}).
 bool extract_revert(const std::string& reply);
 

@@ -756,6 +756,10 @@ json& require_sketch_feature(json& doc, const json& op, const json& id_map) {
 }
 
 // ----------------------------------------------------------------- op handlers
+// Normalize + expand ONE inline sketch entity (defined below, after unwrap_value_scalars).
+// Used by BOTH op_add_feature (inline params.entities) and op_sketch_add_entity.
+std::vector<json> expand_sketch_entity(json ent, IdGen& gen);
+
 void op_add_feature(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
     json feat;
     if (op.contains("feature") && op["feature"].is_object()) {
@@ -803,6 +807,19 @@ void op_add_feature(json& doc, const json& op, std::size_t idx, IdGen& gen, json
                               "positions"}) {
             if (feat.contains(k) && !env["params"].contains(k)) env["params"][k] = feat[k];
         }
+    }
+    // Normalize inline sketch entities the SAME way sketch_add_entity does, so a hexagon /
+    // airfoil / {value:N} scalar authored INLINE (grok emits sketches this way ~half the time)
+    // expands + validates identically — instead of reaching the geometry kernel as a raw
+    // "hexagon" entity that builds no region and fails the extrude.
+    if (env["type"] == "sketch" && env["params"].is_object() &&
+        env["params"].contains("entities") && env["params"]["entities"].is_array()) {
+        json norm = json::array();
+        for (json& e : env["params"]["entities"]) {
+            if (!e.is_object()) { norm.push_back(e); continue; }
+            for (json& x : expand_sketch_entity(e, gen)) norm.push_back(std::move(x));
+        }
+        env["params"]["entities"] = std::move(norm);
     }
     resolve_placeholders_deep(env["params"], id_map);
     resolve_placeholders_deep(env["refs"], id_map);

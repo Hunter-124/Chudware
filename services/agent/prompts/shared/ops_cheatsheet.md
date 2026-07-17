@@ -254,6 +254,24 @@ sketching ON a face, `offset` lifts along that face's outward normal.
 sketch_add_entity   {"op":"sketch_add_entity","sketch":"$0","entity":{...}}
                     Add a line/circle/arc/spline/polygon/airfoil/point entity to a sketch.
 
+                    REGULAR POLYGON (hexagons, nuts, bolt-heads, prisms) — ALWAYS use this ONE
+                    entity; never hand-draw the sides as separate lines (slow + usually fails to
+                    close). It expands to N closed segments for you:
+                      {"op":"sketch_add_entity","sketch":"$0",
+                       "type":"hexagon","center":[0,0],"across_flats":16}
+                    - type: "polygon"/"ngon" (needs "sides":N) OR a named n-gon that implies its
+                      count: triangle, pentagon, hexagon, heptagon, octagon, nonagon, decagon,
+                      dodecagon (an explicit "sides" still overrides).
+                    - size — give exactly ONE: "across_flats" (wrench/spanner size, flat-to-flat =
+                      the usual way hex stock/nuts are specified), "circumradius" (centre→vertex),
+                      or "inradius"/"apothem" (centre→edge). "rotation":<deg> optional (default: a
+                      vertex on +X; use rotation:90 to put a flat on top).
+                    e.g. a hex prism 16mm across flats, 20mm tall:
+                      [{"op":"add_feature","type":"sketch","refs":{"plane":"plane.top"}},
+                       {"op":"sketch_add_entity","sketch":"$0","type":"hexagon","across_flats":16},
+                       {"op":"add_feature","type":"extrude","params":{"mode":"boss","end":"blind",
+                        "depth":20},"refs":{"profile":[{"kind":"region","sketch":"$0","hint_index":0}]}}]
+
 sketch_convert      {"op":"sketch_convert","sketch":"<sketch-fid>","refs":[Ref,...],"construction":false,"fix":true}
                     Project external geometry INTO an existing sketch (SolidWorks "Convert Entities").
                     Each Ref is {"datum":"front"|"top"|"right"} for a datum plane (intersection line)

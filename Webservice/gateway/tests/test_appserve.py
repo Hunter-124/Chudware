@@ -124,3 +124,77 @@ class TestPerfClient:
         assert r.status_code == 413
         log_path = traces_dir / "client.jsonl"
         assert not log_path.exists() or log_path.read_text(encoding="utf-8") == ""
+
+class TestContentEncoding:
+    """Precompressed .br/.gz variant negotiation (appserve._negotiate + HTTP)."""
+
+    def _req(self, accept):
+        import types
+
+        return types.SimpleNamespace(headers={"accept-encoding": accept})
+
+    def test_prefers_brotli_over_gzip(self, app_tree):
+        from gateway import appserve
+
+        target = app_tree / "billet.wasm"
+        (app_tree / "billet.wasm.br").write_bytes(b"BR")
+        (app_tree / "billet.wasm.gz").write_bytes(b"GZ")
+        served, enc = appserve._negotiate(target, self._req("gzip, br"))
+        assert enc == "br"
+        assert served.name == "billet.wasm.br"
+
+    def test_gzip_when_brotli_not_accepted(self, app_tree):
+        from gateway import appserve
+
+        target = app_tree / "billet.wasm"
+        (app_tree / "billet.wasm.gz").write_bytes(b"GZ")
+        served, enc = appserve._negotiate(target, self._req("gzip, deflate"))
+        assert enc == "gzip"
+        assert served.name == "billet.wasm.gz"
+
+    def test_raw_when_no_variant(self, app_tree):
+        from gateway import appserve
+
+        target = app_tree / "billet.wasm"
+        served, enc = appserve._negotiate(target, self._req("br, gzip"))
+        assert enc is None
+        assert served == target
+
+    def test_raw_when_encoding_not_accepted(self, app_tree):
+        from gateway import appserve
+
+        target = app_tree / "billet.wasm"
+        (app_tree / "billet.wasm.br").write_bytes(b"BR")
+        served, enc = appserve._negotiate(target, self._req("identity"))
+        assert enc is None
+        assert served == target
+
+    def test_stale_variant_ignored(self, app_tree):
+        # A .br older than the original (restaged wasm, missed precompress) MUST fall
+        # back to raw — never serve outdated compressed bytes (the js/wasm-skew hazard).
+        import os
+
+        from gateway import appserve
+
+        target = app_tree / "billet.wasm"
+        variant = app_tree / "billet.wasm.br"
+        variant.write_bytes(b"BR")
+        old = target.stat().st_mtime - 100
+        os.utime(variant, (old, old))
+        served, enc = appserve._negotiate(target, self._req("br"))
+        assert enc is None
+        assert served == target
+
+    def test_http_serves_gzip_with_headers(self, client, app_tree):
+        # End-to-end: stdlib-gzip variant, fresh mtime → server sets Content-Encoding
+        # + Vary and httpx transparently decodes back to the original bytes.
+        import gzip as _gz
+
+        raw = (app_tree / "index.html").read_bytes()
+        (app_tree / "index.html.gz").write_bytes(_gz.compress(raw, 9))
+        r = client.get("/app/", headers={**DEV_HEADERS, "Accept-Encoding": "gzip"})
+        assert r.status_code == 200
+        assert r.headers.get("content-encoding") == "gzip"
+        assert "accept-encoding" in (r.headers.get("vary", "").lower())
+        assert r.headers.get("cache-control") == "no-cache"  # policy keys on original suffix
+        assert "billet" in r.text  # decoded transparently

@@ -106,6 +106,19 @@ build_wasm() {
         done
         echo "[build] cache-busted bundle URLs (v=$VER)"
     fi
+    # Precompress the bundle so the gateway (appserve.py) can serve .br/.gz variants:
+    # wasm 9.4MB -> ~2.1MB brotli over the wire = far faster first load on real networks.
+    # Generated AFTER the cache-bust sed so index.html variants carry the versioned URLs;
+    # freshly written (mtime > original) so appserve's staleness guard always accepts them.
+    if command -v brotli >/dev/null 2>&1 || command -v gzip >/dev/null 2>&1; then
+        for cf in "$stage"/Billet.wasm "$stage"/Billet.js "$stage"/Billet.data \
+                  "$stage"/index.html "$stage"/Billet.html "$stage"/coi-serviceworker.js; do
+            [ -f "$cf" ] || continue
+            command -v brotli >/dev/null 2>&1 && brotli -f -q 11 -o "$cf.br" "$cf"
+            command -v gzip  >/dev/null 2>&1 && gzip  -f -k -9 "$cf"
+        done
+        echo "[build] precompressed bundle (.br/.gz) for gateway content-encoding"
+    fi
     echo "[build] WASM bundle ready: $stage  (serve with: python3 host/wasm/coop_server.py)"
 }
 

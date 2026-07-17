@@ -102,11 +102,44 @@ def _resolve_under_app(rel: str) -> Path:
     return target
 
 
-def _file_response(target: Path) -> FileResponse:
+# Precompressed-variant negotiation. build.sh stages .br/.gz siblings next to the
+# big bundle files; serving them cuts the wasm first-load from ~9.4 MB to ~2.1 MB
+# (brotli) over the wire. The variant carries the ORIGINAL media type + a
+# Content-Encoding header; Vary: Accept-Encoding keeps shared caches correct.
+def _fresh_variant(target: Path, suffix: str) -> Path | None:
+    """A precompressed sibling, but only if it isn't stale w.r.t. the original.
+    Guards the js/wasm-skew failure mode: a restaged bundle whose .br/.gz wasn't
+    regenerated must fall back to raw, never serve outdated compressed bytes."""
+    v = target.with_name(target.name + suffix)
+    try:
+        if v.is_file() and v.stat().st_mtime >= target.stat().st_mtime:
+            return v
+    except OSError:
+        return None
+    return None
+
+
+def _negotiate(target: Path, request: Request) -> tuple[Path, str | None]:
+    accept = request.headers.get("accept-encoding", "")
+    if "br" in accept:
+        br = _fresh_variant(target, ".br")
+        if br is not None:
+            return br, "br"
+    if "gzip" in accept:
+        gz = _fresh_variant(target, ".gz")
+        if gz is not None:
+            return gz, "gzip"
+    return target, None
+def _file_response(target: Path, request: Request) -> FileResponse:
+    served, encoding = _negotiate(target, request)
+    headers = _coop_headers(target)  # cache policy keys on the ORIGINAL suffix
+    if encoding:
+        headers["Content-Encoding"] = encoding
+        headers["Vary"] = "Accept-Encoding"
     return FileResponse(
-        path=str(target),
-        media_type=_media_type(target),
-        headers=_coop_headers(target),
+        path=str(served),
+        media_type=_media_type(target),  # original type, not .br/.gz
+        headers=headers,
     )
 
 
@@ -114,13 +147,13 @@ def _file_response(target: Path) -> FileResponse:
 @router.get("/app/", response_model=None)
 async def app_index(request: Request) -> Response:
     """Serve the WASM client entry (index.html)."""
-    return _file_response(_resolve_under_app(""))
+    return _file_response(_resolve_under_app(""), request)
 
 
 @router.get("/app/{asset_path:path}", response_model=None)
 async def app_asset(asset_path: str, request: Request) -> Response:
     """Serve a file from the WASM client tree."""
-    return _file_response(_resolve_under_app(asset_path))
+    return _file_response(_resolve_under_app(asset_path), request)
 
 
 __all__ = ["router"]

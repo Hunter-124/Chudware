@@ -2597,6 +2597,25 @@ void drawSettingsModal(AppState& st, bool busy) {
                                      settings.maxIters == 0 ? "automatic" : "%d passes");
                 }
                 dimText("0 = automatic (stops once the render matches)");
+                settingsSectionHeader("Harness organization");
+                dimText("The composer mode picks the org structure: Agent auto-routes; "
+                        "Plan drafts first; Swarm forces a multi-agent mission; Eng. Firm runs "
+                        "the heaviest firm structure (specialist roles + contractor firms that "
+                        "bid on tasks in predicted tokens against a $ budget); Ask is read-only.");
+                {
+                    const float labelW = 200.0f * sc;
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::TextUnformatted("Eng. Firm budget (USD)");
+                    ImGui::SameLine(labelW);
+                    ImGui::SetNextItemWidth(160.0f * sc);
+                    double b = settings.companyBudgetUsd;
+                    if (ImGui::InputDouble("##engfirmbudget", &b, 5.0, 25.0, "$%.2f")) {
+                        if (b < 0.0) b = 0.0;
+                        settings.companyBudgetUsd = b;
+                    }
+                }
+                dimText("Max spend the firm must complete the job within; contractor firms "
+                        "bid in predicted tokens (converted to $) under this ceiling.");
                 settingsTabBodyEnd();
                 ImGui::EndTabItem();
             }

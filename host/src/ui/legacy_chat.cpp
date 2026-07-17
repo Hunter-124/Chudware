@@ -5430,6 +5430,34 @@ static void ensureConversations(AppState& st) {
     st.activeConv = 0;  // st.chat remains the active buffer
 }
 
+// Serialize PlanState for chat_history.json — shape matches parsePlanState().
+static nlohmann::json planStateToJson(const PlanState& ps) {
+    nlohmann::json j = nlohmann::json::object();
+    j["shape"] = ps.shape;
+    j["title"] = ps.title;
+    j["summary"] = ps.summary;
+    j["revision"] = ps.revision;
+    j["from_event"] = ps.fromEvent;
+    nlohmann::json items = nlohmann::json::array();
+    for (const auto& it : ps.items) {
+        items.push_back({{"id", it.id},
+                         {"title", it.title},
+                         {"desc", it.desc},
+                         {"status", it.status},
+                         {"kind", it.kind},
+                         {"phase", it.phase},
+                         {"parent_id", it.parent_id}});
+    }
+    j["items"] = std::move(items);
+    if (!ps.edges.empty()) {
+        nlohmann::json edges = nlohmann::json::array();
+        for (const auto& e : ps.edges)
+            edges.push_back({{"from", e.from}, {"to", e.to}});
+        j["edges"] = std::move(edges);
+    }
+    return j;
+}
+
 void persistChatHistory(AppState& st) {
     if (st.activeConv < 0 || st.activeConv >= (int)st.conversations.size()) return;
     if (st.chatDocKey.empty()) return;
@@ -5459,9 +5487,11 @@ void persistChatHistory(AppState& st) {
                            ? lastReason
                            : ("(design run \xc2\xb7 " + std::to_string(steps) + " steps)");
             }
-            if (body.empty()) continue;  // truly empty placeholder (still-running / no content)
+            // Keep turns that only carry a plan (no text body) so the task list survives reload.
+            if (body.empty() && !m.planState.present) continue;
             nlohmann::json entry = {{"u", m.fromUser}, {"t", body}, {"e", m.errKind}};
             if (!m.fromUser && !m.model.empty()) entry["m"] = m.model;
+            if (m.planState.present) entry["plan_state"] = planStateToJson(m.planState);
             jm.push_back(std::move(entry));
         }
         convs.push_back({{"id", st.conversations[i].id},
@@ -5535,6 +5565,14 @@ static void loadChatHistoryForKey(AppState& st, const std::string& key) {
                 cm.text = m.value("t", std::string());
                 cm.errKind = m.value("e", 0);
                 if (!cm.fromUser) cm.model = m.value("m", std::string());
+                // Restore plan/task-list state when present (legacy sessions omit the key).
+                if (m.contains("plan_state") && m["plan_state"].is_object()) {
+                    cm.planState = parsePlanState(m["plan_state"]);
+                    // parsePlanState marks fromEvent=true; honor the persisted provenance flag
+                    // so derived normalizers don't clobber a restored event plan.
+                    cm.planState.fromEvent =
+                        m["plan_state"].value("from_event", true);
+                }
                 cm.running = false;
                 c.msgs.push_back(std::move(cm));
             }

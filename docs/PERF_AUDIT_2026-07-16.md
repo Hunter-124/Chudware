@@ -180,3 +180,24 @@ preview timeout. The wasm transport already fails a pending `readLine` the momen
 (`engine_bridge.py` `daemon_to_ws` break → `ws.close(1012)`). Remaining possible hardening (not
 yet needed): a gateway heartbeat to detect a daemon that is alive-but-silent WITHOUT a socket EOF.
 
+## 9. Web UI parity + reconnect verification (2026-07-16)
+
+Drove the live web client (dev gateway → shared daemon) end-to-end and confirmed parity with the
+desktop app across: boot + full ribbon (all groups) + every workspace tab; ribbon-tab switching;
+workspace switching (Model/Drawing/Simulate — panels + ribbon swap correctly); New Sketch → plane
+pick → sketch mode; sketch drawing with the constraint solver reporting DOF; Finish Sketch; the
+Extrude PropertyManager with live preview; the recovery modal (render + dismiss). **Depth-arrow
+drag: previews apply live (rev-by-rev `live_mesh_refresh`, ~11–137 ms) AND the page main thread
+stays responsive throughout (probe pings 2–265 ms) — no freeze.** The async-RPC worker thread keeps
+the UI thread free even when the backend is slow/unreachable, so the original "drag froze it"
+report does not reproduce.
+
+**Reconnect self-heal (verified):** after a single clean daemon restart (the watchdog/real-user
+case) the wasm client auto-reconnects — `[engine] daemon reconnected (gen 0→1)` — re-bootstraps, and
+offers the recovery modal, with NO manual page reload. `maintainConnection` retries indefinitely on
+a capped backoff (1→2→5→10 s), logging only at attempt 1 and every 5th, so a transient "unreachable"
+line is not a dead loop. A rapid restart STORM (e.g. repeatedly rebuilding the daemon, which trips
+`billet-webd-sync.path`) can make the client appear wedged only because it reconnects and drops in
+lockstep; it recovers the moment restarts stop. A genuine crash-LOOP keeps clients down until it
+stops — mitigated because recovery is user-gated (no auto-replay) and the watchdog ceiling (90 s) is
+far above any healthy op, so it never loops on normal work.

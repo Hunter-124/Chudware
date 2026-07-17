@@ -5035,7 +5035,8 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         const float bh = lh + 4.0f * sc;   // real header-button height (drawHeaderTextButton pushes FramePadding.y=2sc) so the flanking buttons center on the wordmark band
         auto cy1 = [&](float h) { ImGui::SetCursorPosY(rowTop1 + (wordLh - h) * 0.5f); };
 
-        // Task-list button — LEFT-aligned with the logo. Shows deterministic d/t done.
+        // Task-list button — aligned directly ABOVE the Chat button below (same X as row 2's
+        // Chat = collapse chevron width + gap). Shows deterministic d/t done.
         int tlDone = 0, tlTotal = 0;
         copilotTaskProgress(st, tlDone, tlTotal);
         char tlLabel[24];
@@ -5043,7 +5044,7 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         const float tlW = measureBtn(tlLabel, "plan_board");
         const float artW = measureBtn("Artifacts", "team");
         cy1(bh);
-        ImGui::SetCursorPosX(0.0f);
+        ImGui::SetCursorPosX(collapseW + collapseGap);
         if (busy) ImGui::BeginDisabled();
         if (drawHeaderTextButton("##hdr_tasks", tlLabel, st.showTaskList, tlW, "plan_board")) {
             const bool open = !st.showTaskList;
@@ -5056,7 +5057,7 @@ static void drawCopilotHeader(AppState& st, bool busy) {
 
         // Logo — CENTERED (kept clear of the flanking buttons).
         float logoLeft = (colW - logoW) * 0.5f;
-        logoLeft = std::max(tlW + 6.0f * sc, logoLeft);
+        logoLeft = std::max(collapseW + collapseGap + tlW + 6.0f * sc, logoLeft);
         ImGui::SameLine(logoLeft);
         {
             IconUV cube = ui::getIcon("context_cube", 20);

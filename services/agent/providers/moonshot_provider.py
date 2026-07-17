@@ -44,7 +44,7 @@ class MoonshotProvider(OpenAIProvider):
 
     def __init__(self, api_key: str | None = None, model: str = DEFAULT_MODEL,
                  supports_vision: bool = True, timeout: float = 300.0,
-                 base_url: str | None = None):
+                 base_url: str | None = None, reasoning_effort: str | None = None):
         # Normalize the -256k / -1m / vendor-prefixed aliases to the wire id.
         super().__init__(
             api_key=api_key,
@@ -52,4 +52,5 @@ class MoonshotProvider(OpenAIProvider):
             base_url=base_url or BASE_URL,
             supports_vision=supports_vision,
             timeout=timeout,
+            reasoning_effort=reasoning_effort,
         )

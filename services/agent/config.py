@@ -776,7 +776,8 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
         prov = OpenAIProvider(api_key=key, model=model,
                               base_url=oai.get("base_url"),
                               supports_vision=bool(vision),
-                              timeout=float(oai.get("timeout", 120.0)))
+                              timeout=float(oai.get("timeout", 120.0)),
+                              reasoning_effort=cfg.get("reasoning_effort"))
         return _attach_catalog_meta(prov, caps)
 
     if name == "openrouter":
@@ -811,7 +812,8 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
         timeout = float(oc.get("timeout", 120.0)) if isinstance(oc, dict) else 120.0
         prov = OpenRouterProvider(api_key=key, model=model,
                                   supports_vision=bool(vision),
-                                  timeout=timeout)
+                                  timeout=timeout,
+                                  reasoning_effort=cfg.get("reasoning_effort"))
         return _attach_catalog_meta(prov, caps)
 
     if name == "xai":
@@ -829,6 +831,7 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
             supports_vision=bool(vision),
             timeout=float(xc.get("timeout", 120.0)),
             base_url=xc.get("base_url") or BASE_URL,
+            reasoning_effort=cfg.get("reasoning_effort"),
         )
         return _attach_catalog_meta(prov, caps)
 
@@ -859,6 +862,7 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
             supports_vision=bool(vision),
             timeout=float(mc.get("timeout", 300.0)) if isinstance(mc, dict) else 300.0,
             base_url=mc.get("base_url") or BASE_URL,
+            reasoning_effort=cfg.get("reasoning_effort"),
         )
         return _attach_catalog_meta(prov, caps)
 

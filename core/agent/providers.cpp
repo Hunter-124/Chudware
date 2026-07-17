@@ -651,6 +651,85 @@ BuiltRequest openai_build_request(const std::string& model, const std::string& s
     return r;
 }
 
+// Reasoning-effort wire mapping for the OpenAI-compatible family. The GUI sends ONE effort
+// level (off/low/medium/high); each provider/model accepts a DIFFERENT set and sending an
+// unsupported value 400s. Returns a JSON object to MERGE into the request body (empty = omit).
+// Verified against live provider docs (2026-07):
+//   OpenAI gpt-5*/o1/o3/o4    reasoning_effort: low|medium|high   (non-reasoning gpt-4*: omit)
+//   xAI grok-4.5/4.3/-fast/3-mini reasoning_effort: low|medium|high (original grok-4: omit)
+//   Moonshot kimi-k3          reasoning_effort: "max" ONLY         (kimi-k2.x: omit -> thinking)
+//   DeepSeek reasoner/v4      reasoning_effort: high|max           -> "high" (deepseek-chat: omit)
+//   Alibaba Qwen (DashScope)  enable_thinking (extra_body) not reasoning_effort -> omit
+//   OpenRouter                reasoning:{effort: low|medium|high}
+//   local / unknown           omit (never 400 on an unsupported param)
+json openai_reasoning_patch(const std::string& provider, const std::string& model,
+                            const std::string& base_url, const std::string& effort) {
+    auto low = [](std::string s) {
+        for (auto& c : s) c = static_cast<char>(std::tolower((unsigned char)c));
+        return s;
+    };
+    std::string lvl = low(effort);
+    if (lvl.empty() || lvl == "off" || lvl == "none") return json::object();
+    const std::string m = low(model), b = low(base_url), p = low(provider);
+    auto has = [](const std::string& h, const char* n) { return h.find(n) != std::string::npos; };
+    // GUI level -> the low|medium|high set most reasoning models accept.
+    auto lmh = [&]() -> std::string {
+        if (lvl == "low" || lvl == "medium" || lvl == "high") return lvl;
+        if (lvl == "minimal") return "low";
+        return "high";  // xhigh / max / any other on-value -> high
+    };
+    // Local endpoints have no reasoning_effort knob.
+    if (has(b, "localhost") || has(b, "127.0.0.1") || has(b, "::1") || has(b, "0.0.0.0"))
+        return json::object();
+    // --- ENDPOINT-identified services (base_url or explicit provider name) win over model-name
+    // heuristics, so a vendor-prefixed OpenRouter slug (deepseek/*, qwen/*, moonshotai/*) routes
+    // by its ENDPOINT, not the slug prefix. ---
+    if (has(b, "openrouter"))  // OpenRouter unified reasoning object (ignored per non-reasoning model)
+        return json{{"reasoning", json{{"effort", lmh()}}}};
+    if (p == "moonshot" || has(b, "moonshot.ai")) {
+        if (has(m, "kimi-k3")) return json{{"reasoning_effort", "max"}};  // K3: only "max"
+        return json::object();  // kimi-k2.x uses the `thinking` field, not reasoning_effort
+    }
+    if (p == "xai" || p == "xai-sub" || has(b, "x.ai")) {
+        if (m == "grok-4" || m == "grok-4-0709") return json::object();  // original grok-4: no knob
+        return json{{"reasoning_effort", lmh()}};
+    }
+    if (has(b, "deepseek.com")) {  // DeepSeek official API: only high|max valid
+        if (has(m, "reasoner") || has(m, "v4-pro") || has(m, "v4-flash") || has(m, "deepseek-v4"))
+            return json{{"reasoning_effort", "high"}};
+        return json::object();  // deepseek-chat: non-thinking
+    }
+    if (has(b, "aliyuncs") || has(b, "dashscope"))  // Qwen uses enable_thinking, not reasoning_effort
+        return json::object();
+    if (has(b, "openai.com")) {  // OpenAI proper: only gpt-5+/o-series accept reasoning_effort
+        if (m.rfind("gpt-5", 0) == 0 || m.rfind("o1", 0) == 0 || m.rfind("o3", 0) == 0 ||
+            m.rfind("o4", 0) == 0)
+            return json{{"reasoning_effort", lmh()}};
+        return json::object();
+    }
+    // --- No endpoint match: fall back to MODEL-NAME heuristics (bare provider name / empty base). ---
+    if (m.rfind("kimi", 0) == 0) {
+        if (has(m, "kimi-k3")) return json{{"reasoning_effort", "max"}};
+        return json::object();
+    }
+    if (m.rfind("grok", 0) == 0) {
+        if (m == "grok-4" || m == "grok-4-0709") return json::object();
+        return json{{"reasoning_effort", lmh()}};
+    }
+    if (m.rfind("deepseek", 0) == 0) {
+        if (has(m, "reasoner") || has(m, "v4-pro") || has(m, "v4-flash"))
+            return json{{"reasoning_effort", "high"}};
+        return json::object();
+    }
+    if (m.rfind("qwen", 0) == 0)
+        return json::object();
+    if (p == "openai" && b.empty() &&
+        (m.rfind("gpt-5", 0) == 0 || m.rfind("o1", 0) == 0 || m.rfind("o3", 0) == 0 ||
+         m.rfind("o4", 0) == 0))
+        return json{{"reasoning_effort", lmh()}};
+    return json::object();  // unknown OpenAI-compatible endpoint: omit (safe)
+}
+
 ParsedReply openai_parse_response(const json& resp) {
     ParsedReply out;  // text default ""
     auto it = resp.find("choices");
@@ -1270,6 +1349,14 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
         // each delta is forwarded live to the run's sink. openai_build_request stays
         // pure (parity-tested); stream:true is added to the built body only here.
         json sbody = req.body_json;
+        // Per-model reasoning-effort: merge the capability-gated field(s) into the streamed
+        // body ONLY when the target model accepts them (see openai_reasoning_patch).
+        {
+            json rpatch = openai_reasoning_patch(provider, model, base_url,
+                                                 str_or(cfg, "reasoning_effort"));
+            for (auto it = rpatch.begin(); it != rpatch.end(); ++it)
+                sbody[it.key()] = it.value();
+        }
         sbody["stream"] = true;
         const std::string stream_body = sbody.dump();
         // Keys to try: the resolved api_key first, then any signed-in fallback accounts

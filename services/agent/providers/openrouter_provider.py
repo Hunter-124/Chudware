@@ -19,8 +19,10 @@ class OpenRouterProvider(OpenAIProvider):
     name = "openrouter"
 
     def __init__(self, api_key: str | None = None, model: str = DEFAULT_MODEL,
-                 supports_vision: bool = True, timeout: float = 120.0):
+                 supports_vision: bool = True, timeout: float = 120.0,
+                 reasoning_effort: str | None = None):
         # base_url is fixed to OpenRouter; the parent handles the OpenAI-compatible wire form,
         # timeouts, and the empty-choices / reasoning-content degradations.
         super().__init__(api_key=api_key, model=model, base_url=BASE_URL,
-                         supports_vision=supports_vision, timeout=timeout)
+                         supports_vision=supports_vision, timeout=timeout,
+                         reasoning_effort=reasoning_effort)

@@ -477,6 +477,27 @@ json resolve_provider(const std::optional<std::string>& name_arg, const json& cf
                 if (t != key) fb.push_back(t);
             if (!fb.empty()) desc["fallback_api_keys"] = fb;
         }
+    } else if (name == "moonshot") {
+        // Moonshot (Kimi) — OpenAI-compatible chat completions at api.moonshot.ai/v1. Key
+        // precedence: cfg.api_key -> keys.moonshot -> MOONSHOT_API_KEY. Kimi K3 / K2.6 are
+        // native-vision, so supports_vision follows the openai.vision override (default true).
+        std::string key = py_or(cfg_str(cfg, "api_key"),
+                                env_get(env, "MOONSHOT_API_KEY").value_or(""));
+        if (key.empty() && cfg.contains("keys") && cfg["keys"].is_object() &&
+            cfg["keys"].contains("moonshot") && cfg["keys"]["moonshot"].is_string())
+            key = cfg["keys"]["moonshot"].get<std::string>();
+        if (key.empty())
+            return refusal(
+                "Moonshot (Kimi) not configured. Add a key from platform.moonshot.ai "
+                "(Settings -> AI), stored as keys.moonshot / MOONSHOT_API_KEY.");
+        std::string model = py_or(cfg_str(cfg, "model"), std::string("kimi-k3"));
+        desc = json{
+            {"name", "moonshot"},
+            {"model", model},
+            {"base_url", py_or(oai_cfg("base_url"), std::string("https://api.moonshot.ai/v1"))},
+            {"supports_vision", oai_vision},
+            {"api_key", key},
+        };
     } else if (name == "cursor" || name == "cursor-sub") {
         // Cursor auth is stored (subscription_auth.cursor) but there is NO REST
         // completions transport in C++ or Python — Cursor's agent backend is

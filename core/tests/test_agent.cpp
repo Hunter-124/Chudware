@@ -836,3 +836,41 @@ TEST_CASE("extract_ops_last_nonempty: reasoning-channel ops fallback") {
         CHECK(r.ops->size() == 1);
     }
 }
+
+TEST_CASE("openai_reasoning_patch: per-provider/model reasoning-effort gating") {
+    // off / empty -> omit everywhere (model uses its own default).
+    CHECK(openai_reasoning_patch("openai", "gpt-5.6", "", "off").empty());
+    CHECK(openai_reasoning_patch("openai", "gpt-5.6", "", "").empty());
+    // OpenAI reasoning models pass low/medium/high; non-reasoning gpt-4* omit.
+    CHECK(openai_reasoning_patch("openai", "gpt-5.6", "https://api.openai.com/v1", "high")
+              .value("reasoning_effort", std::string()) == "high");
+    CHECK(openai_reasoning_patch("openai", "o3", "https://api.openai.com/v1", "medium")
+              .value("reasoning_effort", std::string()) == "medium");
+    CHECK(openai_reasoning_patch("openai", "gpt-4.1", "https://api.openai.com/v1", "high").empty());
+    // xAI grok-4.5 passes low/medium/high; the original grok-4 has no knob.
+    CHECK(openai_reasoning_patch("xai", "grok-4.5", "https://api.x.ai/v1", "low")
+              .value("reasoning_effort", std::string()) == "low");
+    CHECK(openai_reasoning_patch("xai", "grok-4", "https://api.x.ai/v1", "high").empty());
+    // Moonshot: kimi-k3 -> only "max"; kimi-k2.6 -> omit (uses `thinking`).
+    CHECK(openai_reasoning_patch("moonshot", "kimi-k3", "https://api.moonshot.ai/v1", "low")
+              .value("reasoning_effort", std::string()) == "max");
+    CHECK(openai_reasoning_patch("moonshot", "kimi-k2.6", "https://api.moonshot.ai/v1", "high")
+              .empty());
+    // DeepSeek reasoner/v4 -> "high" only; deepseek-chat omit.
+    CHECK(openai_reasoning_patch("openai", "deepseek-reasoner", "https://api.deepseek.com/v1", "low")
+              .value("reasoning_effort", std::string()) == "high");
+    CHECK(openai_reasoning_patch("openai", "deepseek-chat", "https://api.deepseek.com/v1", "high")
+              .empty());
+    // Alibaba Qwen (DashScope) uses enable_thinking, not reasoning_effort -> omit.
+    CHECK(openai_reasoning_patch("openai", "qwen3-max",
+              "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", "high").empty());
+    // OpenRouter -> unified reasoning object.
+    {
+        json p = openai_reasoning_patch("openai", "qwen/qwen3-max",
+                                        "https://openrouter.ai/api/v1", "medium");
+        REQUIRE(p.contains("reasoning"));
+        CHECK(p["reasoning"].value("effort", std::string()) == "medium");
+    }
+    // Local endpoint -> omit even for a reasoning-capable id.
+    CHECK(openai_reasoning_patch("openai", "gpt-5", "http://localhost:1234/v1", "high").empty());
+}

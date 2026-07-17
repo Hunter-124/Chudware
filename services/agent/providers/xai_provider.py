@@ -22,7 +22,7 @@ class XAIProvider(OpenAIProvider):
 
     def __init__(self, api_key: str | None = None, model: str = DEFAULT_MODEL,
                  supports_vision: bool = True, timeout: float = 120.0,
-                 base_url: str | None = None):
+                 base_url: str | None = None, reasoning_effort: str | None = None):
         # base_url is fixed to xAI unless explicitly overridden (tests / proxies).
         super().__init__(
             api_key=api_key,
@@ -30,4 +30,5 @@ class XAIProvider(OpenAIProvider):
             base_url=base_url or BASE_URL,
             supports_vision=supports_vision,
             timeout=timeout,
+            reasoning_effort=reasoning_effort,
         )

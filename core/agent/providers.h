@@ -78,6 +78,10 @@ BuiltRequest openai_build_request(const std::string& model, const std::string& s
                                   const json& messages, int max_tokens,
                                   const std::string& base_url);
 ParsedReply openai_parse_response(const json& resp);
+// Per-model reasoning-effort wire mapping (OpenAI-compatible family). Returns a JSON object to
+// merge into the request body, or an empty object to omit (capability-gated; see providers.cpp).
+json openai_reasoning_patch(const std::string& provider, const std::string& model,
+                            const std::string& base_url, const std::string& effort);
 
 // --- gemini (Google generativelanguage REST) --------------------------------
 extern const char* kGeminiDefaultModel;  // "gemini-2.5-pro"

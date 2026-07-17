@@ -1494,3 +1494,29 @@ user's `agent_ask_v2` spends his provider creds (verified live, `xai-sub`). Cave
 long desktop-offline stretch could stale the token; stable `keys.xai` exists but
 the active `xai-sub` name doesn't fall back to it. Portal: removed the
 `@ua.edu`/`@crimson.ua.edu` sign-in footer (`gateway/static/index.html`).
+
+## 2026-07-17 — billet-web: main-thread engine-call deadlock (drag/interactive freeze)
+
+Follow-up to the reconnect-deadlock fix, same class, broader trigger. Dragging an
+on-canvas manipulator (push-pull face arrow, Instant3D dim handles) — and "many
+such cases with other tools" — went unresponsive and crashed the tab on web while
+typing a value worked. Root cause (`services/ipc/ipc_client.cpp` `EngineClient::call`):
+interactive gestures make a SYNCHRONOUS engine call on the browser MAIN thread
+(push-pull press: `checkpoint` + `pushPull` probe + `revert`; PM open/cancel:
+`checkpoint`/`revert`; asm-drag + component-hide: `checkpoint`/`revert`/`applyOps` —
+all in `viewport_panel.cpp`/`property_manager.cpp`) while an AsyncRpc-worker preview
+is in flight holding `mtx_`. The main thread's `lock_guard(mtx_)` is a HARD futex
+wait that busy-blocks the event loop, so the worker's WebSocket `onmessage` can never
+deliver its response → worker never releases `mtx_` → permanent deadlock → freeze +
+crash. Native shared-memory IPC hides it (worker call returns in µs); web latency
+holds `mtx_` long enough that the race fires on nearly every drag. Fix: on the main
+thread (wasm only, `emscripten_is_main_runtime_thread()`), acquire `mtx_` with
+`try_to_lock` + `emscripten_sleep(1)` instead of a hard `lock_guard`, so the event
+loop keeps pumping, the in-flight worker call drains and releases, then we proceed.
+One surgical change covers every interactive sync call site; worker/other threads
+still hard-block; native path unchanged. Verified: WASM builds green, app boots/
+renders/orbits/mirror-syncs on the fixed bundle with no regression; the identical
+reconnect-deadlock twin was behaviorally verified (restart under a live session,
+8–192ms polls, no freeze). Residual (not a crash): the sync call still hitches the
+render thread for its round-trip; converting those call sites to AsyncRpc would make
+the drag smoother — deferred (bigger change; the reported crash is resolved).

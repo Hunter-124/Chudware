@@ -943,6 +943,25 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         o.context_chars = bc.context_chars;
         o.context_tokens_est = bc.context_tokens_est;
         o.inputs_digest = inputs_digest(st);
+        // Feed DETERMINISTIC measured geometry into the review so it can CONFIRM the requested
+        // dimensions instead of defaulting to done:false ("need to confirm across-flats is 16mm")
+        // and burning a full ~70-90s model+review retry cycle on EVERY part. The engine already
+        // holds the exact solid — measure it (fail-soft: text-only review if measurement throws).
+        try {
+            json bb = doc::doc_bbox(doc_id);
+            json mp = doc::doc_eval_mass(doc_id, -1, 1.0);
+            if (bb.contains("size") && bb["size"].is_array() && bb["size"].size() == 3) {
+                char buf[320];
+                std::snprintf(buf, sizeof(buf),
+                    "\n\nMEASURED (exact, from the built solid): bounding box %.2f x %.2f x %.2f mm"
+                    "; volume %.1f mm^3; %d body(ies). Confirm the requested dimensions against THESE"
+                    " measured values — do NOT ask to verify what is already measured here.",
+                    bb["size"][0].get<double>(), bb["size"][1].get<double>(),
+                    bb["size"][2].get<double>(), mp.value("volume_mm3", 0.0),
+                    mp.value("body_count", 0));
+                bc.body += buf;
+            }
+        } catch (...) { /* fail-soft: text-only review */ }
         json review_parts = json::array({text_part(bc.body)});
         if (review_vision && st.last_render.is_string() && !st.last_render.get<std::string>().empty())
             review_parts.push_back(image_part(st.last_render.get<std::string>()));

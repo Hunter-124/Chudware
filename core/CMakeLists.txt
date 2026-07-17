@@ -571,6 +571,7 @@ add_library(aicad_agent STATIC
   agent/ask.cpp
   agent/clarify.cpp
   agent/complexity.cpp
+  agent/domain.cpp
   agent/pm_assist.cpp)
 target_include_directories(aicad_agent PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(aicad_agent PUBLIC nlohmann_json::nlohmann_json)
@@ -611,6 +612,15 @@ target_link_libraries(test_complexity PRIVATE aicad_agent)
 set_target_properties(test_complexity PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME complexity COMMAND test_complexity)
+
+# domain classifier + tool-class registry (agent/domain.cpp). OCCT-free.
+add_executable(test_domain
+  tests/test_domain.cpp)
+target_include_directories(test_domain PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_domain PRIVATE aicad_agent)
+set_target_properties(test_domain PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME domain COMMAND test_domain)
 
 add_executable(test_aicm
   tests/test_aicm_writer.cpp)

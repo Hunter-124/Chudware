@@ -13,6 +13,7 @@
 
 #include "agent/complexity.h"
 #include "agent/config.h"
+#include "agent/domain.h"
 #include "agent/events.h"
 #include "agent/logging_provider.h"
 #include "agent/machine.h"
@@ -382,6 +383,7 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
     // skips the LLM planner and runs as a single model loop; Standard/Complex keep
     // the plan stage. Honour an explicit override in options["complexity"].
     ComplexityVerdict cx = classify_complexity(request);
+    DomainVerdict dom = classify_domain(request);
     if (options.contains("complexity") && options["complexity"].is_string()) {
         const std::string forced = options["complexity"].get<std::string>();
         if (forced == "solo") cx = {Complexity::Solo, "forced by options"};
@@ -628,6 +630,21 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
     events.emit("complexity", json{{"level", cx.label()},
                                    {"reason", cx.reason},
                                    {"skip_plan", solo_skip_plan}});
+    // Task-domain routing: the scoped tool classes + on-topic context for this
+    // request's domain, so the host can narrow the toolset (modeling task ->
+    // modeling/sketch/sourcing, not CAM/ECAD/sim) instead of loading everything.
+    {
+        json tclasses = json::array();
+        for (const auto& t : tool_classes_for_domain(dom.domain)) tclasses.push_back(t);
+        json sheets = json::array();
+        for (const auto& s : context_sheets_for_domain(dom.domain)) sheets.push_back(s);
+        events.emit("task_route", json{{"domain", dom.label()},
+                                       {"reason", dom.reason},
+                                       {"tool_classes", tclasses},
+                                       {"context_sheets", sheets},
+                                       {"complexity", cx.label()},
+                                       {"structure", solo_skip_plan ? "solo" : "planned"}});
+    }
 
     // ----------------------------------------------------------------- actions
     StageActions actions;

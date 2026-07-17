@@ -572,6 +572,7 @@ add_library(aicad_agent STATIC
   agent/clarify.cpp
   agent/complexity.cpp
   agent/domain.cpp
+  agent/firm_bid.cpp
   agent/pm_assist.cpp)
 target_include_directories(aicad_agent PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(aicad_agent PUBLIC nlohmann_json::nlohmann_json)
@@ -621,6 +622,15 @@ target_link_libraries(test_domain PRIVATE aicad_agent)
 set_target_properties(test_domain PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME domain COMMAND test_domain)
+
+# firm bid estimator + roster (agent/firm_bid.cpp). OCCT-free.
+add_executable(test_firm_bid
+  tests/test_firm_bid.cpp)
+target_include_directories(test_firm_bid PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_firm_bid PRIVATE aicad_agent)
+set_target_properties(test_firm_bid PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME firm_bid COMMAND test_firm_bid)
 
 add_executable(test_aicm
   tests/test_aicm_writer.cpp)

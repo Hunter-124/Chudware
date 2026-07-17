@@ -1463,3 +1463,34 @@ Files Open, Settings auto-record toggle, History save pill). Contracts:
 (`plm_sync` stays manual); external edits captured on project-open + the explicit
 button, not a live watcher. Gotcha: a concurrent repo process swept the worktree
 into master mid-session — all work landed on `origin/master` regardless.
+
+## 2026-07-17 — billet-web stability: reconnect deadlock + restart-flapping
+
+Two root-caused stability fixes for the shared web service (chudware.com) plus a
+portal tweak. **(1) Render-thread reconnect deadlock (`services/ipc/ipc_client.*`,
+`services/worker/engine_backend.cpp`).** After a daemon restart the wasm frame
+loop's `maintainConnection` took the client `mtx_` with a blocking `lock_guard`
+(`connectOrSpawn`/`tryReconnect` → `hello` → `call`). Under ASYNCIFY (no
+PROXY_TO_PTHREAD) the browser WebSocket `onclose`/`onmessage` callbacks run on that
+same render thread, so an AsyncRpc-worker call stuck reading the just-dead socket
+could never see `eof` (its `onclose` couldn't fire) → `mtx_` never released → tab
+froze permanently (the latency-amplified "page stops responding"). New
+`EngineClient::tryReconnectNonBlocking()` acquires `mtx_` with `try_to_lock` and
+runs connect+hello inline under that single held lock; on contention it sets
+`*deferred` and returns so the frame loop skips the tick (no backoff) and keeps the
+event loop alive. Native path (`tryReconnect`) unchanged. **(2) Restart-flapping
+(`Webservice/deploy/install_webd.sh`, `billet-webd-sync.service`,
+`Webservice/gateway/engine_bridge.py` + `app.py`).** `billet-webd-sync.path`
+restarted the live shared daemon on EVERY dev/harness rebuild (10+ restarts/2h),
+dropping every connected user. `install_webd.sh --restart` now sha-skips redundant
+re-fires and defers the restart while the gateway reports live engine bridges
+(polls `/healthz.engine_bridges`, up to `BILLET_WEBD_RESTART_MAX_WAIT=600s`); sync
+`.service` `TimeoutStartSec=900` covers the wait. Verified: browser survived a live
+daemon restart with 8–192ms poll latency (no freeze) + `daemon reconnected (gen=2)`.
+Provider-sharing confirmed already-correct: the shared daemon reads Hunter's
+`~/.local/share/AI-CAD/config.json` per turn with no per-user isolation — a web
+user's `agent_ask_v2` spends his provider creds (verified live, `xai-sub`). Caveat:
+`xai-sub` is OAuth and C++ never refreshes it (`core/agent/config.cpp:438`), so a
+long desktop-offline stretch could stale the token; stable `keys.xai` exists but
+the active `xai-sub` name doesn't fall back to it. Portal: removed the
+`@ua.edu`/`@crimson.ua.edu` sign-in footer (`gateway/static/index.html`).

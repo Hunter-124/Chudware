@@ -195,13 +195,20 @@ def not_on_list_html(email: str | None = None) -> str:
   <title>Not on the list — Chudware</title>
   <style>
     body {{ font-family: system-ui, sans-serif; background: #0f1419; color: #e7ecf1;
-           display: flex; min-height: 100vh; align-items: center; justify-content: center; margin: 0; }}
-    .card {{ max-width: 32rem; padding: 2rem; border-radius: 12px; background: #1a2332;
-             border: 1px solid #2a3a4e; box-shadow: 0 8px 32px rgba(0,0,0,.4); }}
+           display: flex; min-height: 100vh; min-height: 100dvh; align-items: center; justify-content: center;
+           margin: 0; padding: max(16px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right))
+                    max(16px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
+           box-sizing: border-box; }}
+    .card {{ max-width: 32rem; width: 100%; padding: 2rem; border-radius: 12px; background: #1a2332;
+             border: 1px solid #2a3a4e; box-shadow: 0 8px 32px rgba(0,0,0,.4); box-sizing: border-box; }}
     h1 {{ margin: 0 0 .75rem; font-size: 1.35rem; }}
     p {{ line-height: 1.5; color: #b0bcc8; }}
-    code {{ background: #0f1419; padding: .1rem .35rem; border-radius: 4px; }}
+    code {{ background: #0f1419; padding: .1rem .35rem; border-radius: 4px; word-break: break-all; }}
     a {{ color: #6cb6ff; }}
+    @media (max-width: 480px) {{
+      .card {{ padding: 1.25rem; }}
+      h1 {{ font-size: 1.2rem; }}
+    }}
   </style>
 </head>
 <body>

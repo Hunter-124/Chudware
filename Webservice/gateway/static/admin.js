@@ -141,6 +141,8 @@
     state.defaultDoc = data.default_doc || "";
     renderDocRow();
     rows.innerHTML = "";
+    var cards = document.getElementById("user-cards");
+    if (cards) cards.innerHTML = "";
     data.users.forEach(function (u) {
       var tr = document.createElement("tr");
       tr.innerHTML =
@@ -162,34 +164,68 @@
           refresh();
         } catch (e) { setStatus(String(e.message || e), true); }
       }
-      tr.querySelector(".edit-role").addEventListener("click", function () {
-        var to = u.role === "admin" ? "user" : "admin";
-        if (confirm("Make " + u.email + " " + (to === "admin" ? "an ADMIN (full ops + allowlist control)?" : "a regular user?")))
-          patch({ role: to }, u.email + " is now " + to + ".");
-      });
-      tr.querySelector(".edit-heavy").addEventListener("click", function () {
-        patch({ heavy: !u.heavy }, u.email + (u.heavy ? " lost" : " got") + " the GPU seat.");
-      });
-      tr.querySelector(".edit-project").addEventListener("click", function () {
-        var v = prompt("Project for " + u.email + " (PLM name or host folder path; empty = inherit site default):",
-                       u.project || "");
-        if (v !== null) patch({ project: v.trim() }, "Project updated.");
-      });
-      var btn = document.createElement("button");
-      btn.className = "rm-btn";
-      btn.textContent = "remove";
-      btn.addEventListener("click", async function () {
-        if (!confirm("Remove " + u.email + " from the allowlist?")) return;
-        setStatus("Removing " + u.email + "…");
-        try {
-          var r = await api("/api/admin/users/" + encodeURIComponent(u.email), { method: "DELETE" });
-          setStatus("Removed. Access policy: " + (r.access_policy.synced ? "synced" : "SYNC FAILED — " + r.access_policy.detail),
-                    !r.access_policy.synced);
-          refresh();
-        } catch (e) { setStatus(String(e.message || e), true); }
-      });
-      tr.lastElementChild.appendChild(btn);
+      function bindRole(el) {
+        el.addEventListener("click", function () {
+          var to = u.role === "admin" ? "user" : "admin";
+          if (confirm("Make " + u.email + " " + (to === "admin" ? "an ADMIN (full ops + allowlist control)?" : "a regular user?")))
+            patch({ role: to }, u.email + " is now " + to + ".");
+        });
+      }
+      function bindHeavy(el) {
+        el.addEventListener("click", function () {
+          patch({ heavy: !u.heavy }, u.email + (u.heavy ? " lost" : " got") + " the GPU seat.");
+        });
+      }
+      function bindProject(el) {
+        el.addEventListener("click", function () {
+          var v = prompt("Project for " + u.email + " (PLM name or host folder path; empty = inherit site default):",
+                         u.project || "");
+          if (v !== null) patch({ project: v.trim() }, "Project updated.");
+        });
+      }
+      function makeRemoveBtn() {
+        var btn = document.createElement("button");
+        btn.className = "rm-btn";
+        btn.textContent = "remove";
+        btn.addEventListener("click", async function () {
+          if (!confirm("Remove " + u.email + " from the allowlist?")) return;
+          setStatus("Removing " + u.email + "…");
+          try {
+            var r = await api("/api/admin/users/" + encodeURIComponent(u.email), { method: "DELETE" });
+            setStatus("Removed. Access policy: " + (r.access_policy.synced ? "synced" : "SYNC FAILED — " + r.access_policy.detail),
+                      !r.access_policy.synced);
+            refresh();
+          } catch (e) { setStatus(String(e.message || e), true); }
+        });
+        return btn;
+      }
+      bindRole(tr.querySelector(".edit-role"));
+      bindHeavy(tr.querySelector(".edit-heavy"));
+      bindProject(tr.querySelector(".edit-project"));
+      tr.lastElementChild.appendChild(makeRemoveBtn());
       rows.appendChild(tr);
+
+      if (cards) {
+        var card = document.createElement("div");
+        card.className = "user-card";
+        var projectLabel = u.project ? esc(baseName(u.project))
+          : state.defaultProject ? esc(baseName(state.defaultProject)) + " (default)"
+          : "—";
+        card.innerHTML =
+          "<div class='uc-email'>" + esc(u.email) + "</div>" +
+          "<div class='uc-meta'>" + (u.display ? esc(u.display) : "No display name") + "</div>" +
+          "<div class='uc-row'>" +
+            "<span class='pill " + (u.role === "admin" ? "admin" : "user") + " edit-role' style='cursor:pointer'>" + esc(u.role) + "</span>" +
+            "<span class='pill heavy edit-heavy' style='cursor:pointer" + (u.heavy ? "" : ";opacity:.35") + "'>GPU</span>" +
+          "</div>" +
+          "<div class='uc-meta edit-project' style='cursor:pointer'>Project: " + projectLabel + "</div>" +
+          "<div class='uc-actions'></div>";
+        bindRole(card.querySelector(".edit-role"));
+        bindHeavy(card.querySelector(".edit-heavy"));
+        bindProject(card.querySelector(".edit-project"));
+        card.querySelector(".uc-actions").appendChild(makeRemoveBtn());
+        cards.appendChild(card);
+      }
     });
   }
 

@@ -2,7 +2,7 @@
 <html lang="en-us">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
   <title>Chudware</title>
   <!-- Cross-origin isolation insurance: re-adds COOP/COEP client-side if a proxy strips
        them, so SharedArrayBuffer/pthreads work. No-ops when already crossOriginIsolated. -->
@@ -17,18 +17,32 @@
       background: #12181c;
       color: #e6edf3;
       font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+      /* Safe-area for notched phones (fullscreen PWA / iOS Safari). */
+      padding: env(safe-area-inset-top) env(safe-area-inset-right)
+               env(safe-area-inset-bottom) env(safe-area-inset-left);
+      box-sizing: border-box;
+      touch-action: none;
+      -webkit-user-select: none;
+      user-select: none;
     }
     #canvas {
       display: block;
+      width: 100%;
+      height: 100%;
+      /* Fill the content box after safe-area padding so the GL surface
+         doesn't sit under the notch/home indicator. */
       width: 100vw;
       height: 100vh;
+      width: 100dvw;
+      height: 100dvh;
       background: #0f1418;
       outline: none;
+      touch-action: none;
     }
     #status {
       position: fixed;
-      left: 12px;
-      bottom: 12px;
+      left: max(12px, env(safe-area-inset-left));
+      bottom: max(12px, env(safe-area-inset-bottom));
       padding: 6px 10px;
       border-radius: 6px;
       background: rgba(0, 0, 0, 0.55);
@@ -37,11 +51,86 @@
       z-index: 10;
     }
     #status.error { color: #ff8a8a; }
+
+    /* On-screen camera HUD — only shown on narrow / touch viewports. */
+    #mobile-hud {
+      display: none;
+      position: fixed;
+      z-index: 20;
+      right: max(10px, env(safe-area-inset-right));
+      bottom: max(16px, env(safe-area-inset-bottom));
+      flex-direction: column;
+      gap: 8px;
+      pointer-events: none;
+    }
+    #mobile-hud.visible { display: flex; }
+    #mobile-hud .hud-row {
+      display: flex;
+      gap: 8px;
+      justify-content: flex-end;
+      pointer-events: none;
+    }
+    #mobile-hud button {
+      pointer-events: auto;
+      width: 48px;
+      height: 48px;
+      min-width: 48px;
+      min-height: 48px;
+      border-radius: 14px;
+      border: 1px solid rgba(66, 236, 206, 0.28);
+      background: rgba(18, 24, 30, 0.78);
+      color: #e6edf3;
+      font-size: 13px;
+      font-weight: 650;
+      letter-spacing: 0.02em;
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+      touch-action: manipulation;
+      -webkit-tap-highlight-color: transparent;
+      cursor: pointer;
+      padding: 0;
+      line-height: 1;
+    }
+    #mobile-hud button:active {
+      transform: translateY(1px);
+      background: rgba(48, 216, 190, 0.22);
+      border-color: rgba(48, 216, 190, 0.5);
+      color: #42ecce;
+    }
+    #mobile-hud button.active {
+      background: rgba(48, 216, 190, 0.28);
+      border-color: rgba(48, 216, 190, 0.55);
+      color: #42ecce;
+    }
+    #mobile-hud button.wide {
+      width: auto;
+      min-width: 48px;
+      padding: 0 14px;
+      font-size: 12px;
+    }
+    @media (max-width: 900px), (pointer: coarse) {
+      #mobile-hud { display: flex; }
+    }
   </style>
 </head>
 <body>
   <canvas id="canvas" tabindex="0" oncontextmenu="event.preventDefault()"></canvas>
   <div id="status">Loading Chudware…</div>
+  <div id="mobile-hud" aria-label="Camera controls">
+    <div class="hud-row">
+      <button type="button" data-cmd="menu" class="wide" title="Toggle panels">Menu</button>
+      <button type="button" data-cmd="undo" title="Undo">↶</button>
+    </div>
+    <div class="hud-row">
+      <button type="button" data-cmd="orbit" class="active" title="Orbit mode">Orbit</button>
+      <button type="button" data-cmd="pan" title="Pan mode">Pan</button>
+    </div>
+    <div class="hud-row">
+      <button type="button" data-cmd="zoom_in" title="Zoom in">＋</button>
+      <button type="button" data-cmd="zoom_out" title="Zoom out">－</button>
+    </div>
+  </div>
   <script type="text/javascript">
     window.__billetLogs = [];
     function billetLog(kind, text) {
@@ -57,6 +146,217 @@
       statusEl.textContent = text;
       statusEl.className = isError ? 'error' : '';
     }
+
+    // ---- DPR-aware canvas sizing helpers ----------------------------------------
+    function syncCanvasBackingStore(c) {
+      if (!c) return;
+      try {
+        var r = c.getBoundingClientRect();
+        var dpr = window.devicePixelRatio || 1;
+        var w = Math.max(64, Math.floor(r.width * dpr));
+        var h = Math.max(64, Math.floor(r.height * dpr));
+        if (c.width !== w) c.width = w;
+        if (c.height !== h) c.height = h;
+      } catch (e) {}
+    }
+
+    // ---- Touch → pointer bridge for ImGui (single finger = left click/drag) ----
+    // Multitouch (2+ fingers) is handled natively in app.cpp; we only synthesize
+    // mouse-like pointer events for the single-finger case so ImGui receives input.
+    (function installTouchBridge() {
+      var canvas = document.getElementById('canvas');
+      if (!canvas) return;
+      var activeId = null;
+      var lastX = 0, lastY = 0;
+      var multi = false;
+
+      function clientToCanvas(t) {
+        var r = canvas.getBoundingClientRect();
+        return {
+          x: t.clientX - r.left,
+          y: t.clientY - r.top,
+          clientX: t.clientX,
+          clientY: t.clientY
+        };
+      }
+      function fire(type, x, y, clientX, clientY, buttons) {
+        // Prefer PointerEvent so ImGui_ImplGlfw (pointer path) sees it; fall back to MouseEvent.
+        var opts = {
+          bubbles: true,
+          cancelable: true,
+          view: window,
+          clientX: clientX,
+          clientY: clientY,
+          screenX: clientX,
+          screenY: clientY,
+          button: 0,
+          buttons: buttons,
+          pointerId: 1,
+          pointerType: 'touch',
+          isPrimary: true,
+          width: 1,
+          height: 1,
+          pressure: buttons ? 0.5 : 0
+        };
+        try {
+          if (typeof PointerEvent === 'function') {
+            canvas.dispatchEvent(new PointerEvent(type, opts));
+            return;
+          }
+        } catch (e) {}
+        var mtype = type === 'pointerdown' ? 'mousedown'
+                  : type === 'pointerup' || type === 'pointercancel' ? 'mouseup'
+                  : 'mousemove';
+        try {
+          canvas.dispatchEvent(new MouseEvent(mtype, opts));
+        } catch (e2) {}
+      }
+
+      canvas.addEventListener('touchstart', function(ev) {
+        if (ev.touches.length >= 2) {
+          // Hand multitouch to C++ (gesture); cancel any single-finger synthetic press.
+          multi = true;
+          if (activeId !== null) {
+            fire('pointerup', lastX, lastY, lastX, lastY, 0);
+            activeId = null;
+          }
+          // Still preventDefault so the page doesn't scroll/zoom under us.
+          if (ev.cancelable) ev.preventDefault();
+          return;
+        }
+        multi = false;
+        var t = ev.changedTouches[0];
+        activeId = t.identifier;
+        var p = clientToCanvas(t);
+        lastX = p.clientX; lastY = p.clientY;
+        canvas.focus();
+        fire('pointerdown', p.x, p.y, p.clientX, p.clientY, 1);
+        if (ev.cancelable) ev.preventDefault();
+      }, { passive: false });
+
+      canvas.addEventListener('touchmove', function(ev) {
+        if (multi || ev.touches.length >= 2) {
+          multi = true;
+          if (ev.cancelable) ev.preventDefault();
+          return;
+        }
+        if (activeId === null) return;
+        var t = null;
+        for (var i = 0; i < ev.changedTouches.length; ++i) {
+          if (ev.changedTouches[i].identifier === activeId) { t = ev.changedTouches[i]; break; }
+        }
+        if (!t) return;
+        var p = clientToCanvas(t);
+        lastX = p.clientX; lastY = p.clientY;
+        fire('pointermove', p.x, p.y, p.clientX, p.clientY, 1);
+        if (ev.cancelable) ev.preventDefault();
+      }, { passive: false });
+
+      function endTouch(ev) {
+        if (ev.touches && ev.touches.length >= 2) {
+          multi = true;
+          if (ev.cancelable) ev.preventDefault();
+          return;
+        }
+        if (activeId === null) {
+          // Leaving multitouch back to zero fingers — just clear multi flag.
+          if (!ev.touches || ev.touches.length === 0) multi = false;
+          if (ev.cancelable) ev.preventDefault();
+          return;
+        }
+        var t = null;
+        for (var i = 0; i < ev.changedTouches.length; ++i) {
+          if (ev.changedTouches[i].identifier === activeId) { t = ev.changedTouches[i]; break; }
+        }
+        if (!t) {
+          // Another finger ended; if no fingers left, cancel synthetic press.
+          if (!ev.touches || ev.touches.length === 0) {
+            fire('pointerup', lastX, lastY, lastX, lastY, 0);
+            activeId = null;
+            multi = false;
+          }
+          if (ev.cancelable) ev.preventDefault();
+          return;
+        }
+        var p = clientToCanvas(t);
+        fire('pointerup', p.x, p.y, p.clientX, p.clientY, 0);
+        activeId = null;
+        multi = (ev.touches && ev.touches.length >= 2);
+        if (ev.cancelable) ev.preventDefault();
+      }
+      canvas.addEventListener('touchend', endTouch, { passive: false });
+      canvas.addEventListener('touchcancel', endTouch, { passive: false });
+    })();
+
+    // ---- Mobile HUD → WASM ccall -------------------------------------------------
+    function callBillet(name, sig, args) {
+      try {
+        if (typeof Module !== 'undefined' && typeof Module.ccall === 'function') {
+          return Module.ccall(name, null, sig || [], args || []);
+        }
+        // Fallback: direct underscore export (KEEPALIVE symbols).
+        var fn = (typeof Module !== 'undefined') ? Module['_' + name] : null;
+        if (typeof fn === 'function') return fn.apply(null, args || []);
+      } catch (e) {
+        billetLog('err', 'hud call ' + name + ': ' + e);
+      }
+      return null;
+    }
+
+    (function installHud() {
+      var hud = document.getElementById('mobile-hud');
+      if (!hud) return;
+      function setMode(mode) {
+        var orbit = hud.querySelector('[data-cmd="orbit"]');
+        var pan = hud.querySelector('[data-cmd="pan"]');
+        if (orbit) orbit.classList.toggle('active', mode === 0);
+        if (pan) pan.classList.toggle('active', mode === 1);
+      }
+      // Show HUD on coarse pointer / narrow CSS width (CSS media also gates it).
+      function refreshHudVisibility() {
+        var narrow = window.matchMedia('(max-width: 900px)').matches;
+        var coarse = window.matchMedia('(pointer: coarse)').matches;
+        hud.classList.toggle('visible', narrow || coarse);
+      }
+      refreshHudVisibility();
+      window.addEventListener('resize', refreshHudVisibility);
+      window.addEventListener('orientationchange', refreshHudVisibility);
+
+      hud.addEventListener('pointerdown', function(ev) {
+        // Stop the synthetic events from also hitting the canvas underneath.
+        ev.stopPropagation();
+      });
+      hud.addEventListener('click', function(ev) {
+        var btn = ev.target.closest('button[data-cmd]');
+        if (!btn) return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        var cmd = btn.getAttribute('data-cmd');
+        switch (cmd) {
+          case 'orbit':
+            callBillet('billet_mobile_set_drag_mode', ['number'], [0]);
+            setMode(0);
+            break;
+          case 'pan':
+            callBillet('billet_mobile_set_drag_mode', ['number'], [1]);
+            setMode(1);
+            break;
+          case 'zoom_in':
+            callBillet('billet_mobile_zoom_step', ['number'], [1]);
+            break;
+          case 'zoom_out':
+            callBillet('billet_mobile_zoom_step', ['number'], [-1]);
+            break;
+          case 'undo':
+            callBillet('billet_mobile_undo', [], []);
+            break;
+          case 'menu':
+            callBillet('billet_mobile_toggle_menu', [], []);
+            break;
+        }
+      });
+    })();
+
     var Module = {
       // Cache-bust wasm/data fetches so a browser never pairs a fresh Billet.js with a
       // stale Billet.wasm/.data (fatal LinkError). __BILLET_VER__ is replaced at stage time
@@ -65,12 +365,7 @@
       canvas: (function() {
         var c = document.getElementById('canvas');
         // Size the drawing buffer to CSS × DPR before first GL frame.
-        try {
-          var r = c.getBoundingClientRect();
-          var dpr = window.devicePixelRatio || 1;
-          c.width = Math.max(64, Math.floor(r.width * dpr));
-          c.height = Math.max(64, Math.floor(r.height * dpr));
-        } catch (e) {}
+        syncCanvasBackingStore(c);
         c.addEventListener('webglcontextlost', function(e) {
           e.preventDefault();
           setStatus('WebGL context lost', true);
@@ -102,7 +397,10 @@
         setStatus('Runtime ready');
         billetLog('out', 'onRuntimeInitialized');
         var c = document.getElementById('canvas');
-        if (c) c.focus();
+        if (c) {
+          syncCanvasBackingStore(c);
+          c.focus();
+        }
       }
     };
     window.onerror = function(msg) {

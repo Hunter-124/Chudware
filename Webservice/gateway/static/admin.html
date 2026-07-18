@@ -6,33 +6,89 @@
 <title>Chudware — Admin</title>
 <link rel="stylesheet" href="/static/portal.css">
 <style>
-  .admin-wrap { max-width: 760px; margin: 40px auto; padding: 0 16px; }
+  .admin-wrap {
+    max-width: 760px;
+    margin: 40px auto;
+    padding: 0 max(16px, env(safe-area-inset-right)) max(24px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
+  }
   .admin-card { background: var(--panel, #16181d); border: 1px solid var(--border, #2a2e36);
                 border-radius: 12px; padding: 20px 24px; margin-bottom: 20px; }
   .admin-card h2 { margin: 0 0 14px; font-size: 1.05rem; }
   table.users { width: 100%; border-collapse: collapse; font-size: .92rem; }
   table.users th, table.users td { text-align: left; padding: 8px 10px;
-                border-bottom: 1px solid var(--border, #2a2e36); }
+                border-bottom: 1px solid var(--border, #2a2e36); vertical-align: top; }
   table.users th { color: var(--muted, #8b93a3); font-weight: 500; }
-  .pill { display: inline-block; padding: 1px 9px; border-radius: 999px; font-size: .78rem; }
+  .pill { display: inline-block; padding: 4px 10px; border-radius: 999px; font-size: .78rem;
+          min-height: 28px; line-height: 1.4; }
   .pill.admin { background: #3d2f10; color: #eeba4a; }
   .pill.user { background: #14301f; color: #55d98a; }
   .pill.heavy { background: #17253d; color: #6aa8ff; margin-left: 6px; }
   .rm-btn { background: none; border: 1px solid #55303a; color: #e07a8a;
-            border-radius: 8px; padding: 3px 10px; cursor: pointer; }
-  .rm-btn:hover { background: #2a1a20; }
+            border-radius: 8px; padding: 8px 14px; min-height: 40px; cursor: pointer;
+            touch-action: manipulation; }
+  .rm-btn:hover, .rm-btn:focus-visible { background: #2a1a20; }
   form.add-user { display: grid; grid-template-columns: 1.8fr 1.2fr 1.2fr auto auto auto;
                   gap: 10px; align-items: center; }
   .admin-wrap input[type=text], .admin-wrap input[type=email] {
       background: var(--bg, #0e1013); color: var(--fg, #e8eaf0);
       border: 1px solid var(--border, #2a2e36);
-      border-radius: 8px; padding: 8px 10px; }
-  form.add-user label { font-size: .85rem; color: var(--muted, #8b93a3); white-space: nowrap; }
-  form.add-user button { padding: 8px 18px; }
+      border-radius: 8px; padding: 10px 12px; min-height: 44px; width: 100%;
+      font-size: 16px; }
+  form.add-user label { font-size: .85rem; color: var(--muted, #8b93a3); white-space: nowrap;
+                        min-height: 44px; display: inline-flex; align-items: center; gap: 8px; }
+  form.add-user button { padding: 10px 18px; min-height: 44px; }
   #admin-status { margin-top: 12px; font-size: .85rem; color: var(--muted, #8b93a3);
                   white-space: pre-wrap; }
   #admin-status.err { color: #e07a8a; }
-  .back { color: var(--muted, #8b93a3); text-decoration: none; font-size: .9rem; }
+  .back { color: var(--muted, #8b93a3); text-decoration: none; font-size: .9rem;
+          display: inline-flex; align-items: center; min-height: 44px; }
+  #default-form { display: flex; gap: 10px; align-items: center; margin: 0 0 6px; flex-wrap: wrap; }
+  #user-cards { display: none; flex-direction: column; gap: 10px; }
+  .user-card {
+    border: 1px solid var(--border, #2a2e36);
+    border-radius: 12px;
+    background: var(--bg, #0e1013);
+    padding: 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .user-card .uc-email { font-weight: 600; word-break: break-all; }
+  .user-card .uc-meta { color: var(--muted, #8b93a3); font-size: .88rem; }
+  .user-card .uc-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .user-card .uc-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+  .user-card .uc-actions .btn, .user-card .uc-actions .rm-btn { flex: 1 1 auto; min-height: 44px; }
+  #browse-modal > div {
+    max-width: 640px;
+    margin: 8vh auto;
+    background: var(--panel, #16181d);
+    border: 1px solid var(--border, #2a2e36);
+    border-radius: 12px;
+    padding: 18px 22px;
+    max-height: 78vh;
+    display: flex;
+    flex-direction: column;
+  }
+  @media (max-width: 720px) {
+    .admin-wrap { margin: 20px auto; }
+    .admin-card { padding: 16px; }
+    form.add-user {
+      grid-template-columns: 1fr;
+      gap: 12px;
+      align-items: stretch;
+    }
+    form.add-user label { white-space: normal; }
+    form.add-user button { width: 100%; }
+    #default-form { flex-direction: column; align-items: stretch; }
+    #default-form .btn { width: 100%; min-height: 44px; }
+    table.users { display: none; }
+    #user-cards { display: flex; }
+    #browse-modal > div {
+      margin: max(12px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right)) max(12px, env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left));
+      max-height: calc(100dvh - 24px);
+      padding: 16px;
+    }
+  }
 </style>
 </head>
 <body>
@@ -52,7 +108,7 @@
       policy, so new people can log in immediately (email OTP or Google).
       <code>example.com</code> entries are dev-only and never pushed to Access.
     </p>
-    <form id="default-form" style="display:flex;gap:10px;align-items:center;margin:0 0 6px">
+    <form id="default-form">
       <label style="white-space:nowrap;font-size:.9rem">Default project for everyone:</label>
       <input type="text" id="f-default-project" placeholder="(none)" list="project-list" style="flex:1;min-width:0">
       <button type="button" id="btn-browse" class="btn ghost" style="white-space:nowrap">Browse host…</button>
@@ -63,6 +119,7 @@
       <thead><tr><th>Email</th><th>Name</th><th>Role</th><th>Project</th><th></th></tr></thead>
       <tbody id="user-rows"></tbody>
     </table>
+    <div id="user-cards" aria-live="polite"></div>
   </div>
   <div class="admin-card">
     <h2>Add someone</h2>
@@ -88,7 +145,7 @@
   </div>
 </div>
 <div id="browse-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:50">
-  <div style="max-width:640px;margin:8vh auto;background:var(--panel,#16181d);border:1px solid var(--border,#2a2e36);border-radius:12px;padding:18px 22px;max-height:78vh;display:flex;flex-direction:column">
+  <div>
     <h2 style="margin:0 0 6px;font-size:1rem">Pick a project folder on this machine</h2>
     <div style="font-size:.82rem;color:var(--muted,#8b93a3);margin-bottom:10px">
       Click folders to navigate. Click a part file to auto-open it for everyone; or just
@@ -96,12 +153,12 @@
     </div>
     <div id="browse-path" style="font-family:monospace;font-size:.82rem;margin-bottom:8px;word-break:break-all"></div>
     <div id="browse-list" style="flex:1;overflow-y:auto;border:1px solid var(--border,#2a2e36);border-radius:8px;padding:6px 0;min-height:200px"></div>
-    <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:12px">
+    <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:12px;flex-wrap:wrap">
       <button type="button" id="browse-cancel" class="btn ghost">Cancel</button>
       <button type="button" id="browse-use" class="btn primary">Use this folder</button>
     </div>
   </div>
 </div>
-<script src="/static/admin.js?v=5"></script>
+<script src="/static/admin.js?v=6"></script>
 </body>
 </html>

@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdint>
 #include <fstream>
+#include <map>
 #include <optional>
 #include <regex>
 #include <set>
@@ -504,24 +505,53 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
     }
     // A Solo build skips the planner unless the host explicitly wants a plan
     // (plan_only / approved plan / swarm-forced structure).
+    // Edit mode: same Solo default (no plan); Standard/Complex keep the plan stage.
     const bool solo_skip_plan =
         cx.level == Complexity::Solo && !plan_only && !has_approved_plan && !corporate_force;
 
+    // execution_style: decide BEFORE drafting. recommend_structure → edit|swarm;
+    // explicit mode swarm/eng_firm overrides. eng_firm is never auto-recommended.
+    const bool cross_discipline =
+        (dom.domain == Domain::Ecad || dom.domain == Domain::Cam ||
+         dom.domain == Domain::Simulation);
+    ExecStructure rec_struct = recommend_structure(cx.level, cross_discipline);
+    std::string execution_style = execution_style_from_structure(structure_label(rec_struct));
+    if (copilot_mode == "swarm" || execute_as == "swarm")
+        execution_style = "swarm";
+    else if (copilot_mode == "eng_firm" || execute_as == "eng_firm")
+        execution_style = "eng_firm";
+    else if (copilot_mode == "edit")
+        execution_style = "edit";
+    // options.execution_style explicit override (host resume / tests).
+    if (options.contains("execution_style") && options["execution_style"].is_string()) {
+        const std::string es = options["execution_style"].get<std::string>();
+        if (es == "edit" || es == "swarm" || es == "eng_firm") execution_style = es;
+    }
+
+    // Nested sub-run depth (delegate / swarm unit). Cap at 2.
+    const int run_depth = options.value("run_depth", 0);
+    const bool is_sub_run = options.value("is_sub_run", false) || run_depth > 0;
+
     // Advisor seam: reserved. C++ has no foreman battery — leave empty (no fabricated
     // advisories). Host/Python may later push text via options.advisory_text.
+    // Nested runs inherit advisory_text if the parent set one for firm team seeds.
     clear_context_advisory();
     if (advisor_on) {
         std::string adv_text;
         if (options.contains("advisory_text") && options["advisory_text"].is_string())
             adv_text = options["advisory_text"].get<std::string>();
+        // Firm-team role seeds PREFIX the sub-run prompt when provided.
+        if (options.contains("firm_role_seed") && options["firm_role_seed"].is_string()) {
+            const std::string seed = options["firm_role_seed"].get<std::string>();
+            if (!seed.empty())
+                adv_text = adv_text.empty() ? seed : (seed + "\n\n" + adv_text);
+        }
         if (!adv_text.empty()) set_context_advisory(adv_text);
         // else: seam armed but empty → no ADVISORY block (legacy-identical body).
     }
     struct AdvisoryGuard {
         ~AdvisoryGuard() { clear_context_advisory(); }
     } advisory_guard;
-    (void)corporate_force;  // stamped for host/Python; C++ stage path has no swarm spawn
-    (void)execute_as;
 
     RunEvents events(run_id, emit);
     // Live provider_call debug events (endpoint/status/latency) land on the same
@@ -722,6 +752,11 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
     state.complexity_set = true;
     state.domain = dom.domain;
     state.domain_set = true;
+    state.execution_style = execution_style;
+    state.copilot_mode = copilot_mode;
+    state.run_depth = run_depth;
+    state.is_sub_run = is_sub_run;
+    state.advisor_calls = 0;
     // Pre-seed domain cheatsheet classes so Sheetmetal (etc.) starts with sm_* ops
     // without burning a modeler turn on request_tools(["sheetmetal"]).
     if (dom.domain == Domain::Sheetmetal) state.tool_scope_classes.insert("sheetmetal");
@@ -785,7 +820,9 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         // Complexity routing decision (GUI shows which structure was chosen + why).
         events.emit("complexity", json{{"level", cx.label()},
                                        {"reason", cx.reason},
-                                       {"skip_plan", solo_skip_plan}});
+                                       {"skip_plan", solo_skip_plan},
+                                       {"structure", structure_label(rec_struct)},
+                                       {"execution_style", execution_style}});
         // Task-domain routing: the scoped tool classes + on-topic context for this
         // request's domain, so the host can narrow the toolset (modeling task ->
         // modeling/sketch/sourcing, not CAM/ECAD/sim) instead of loading everything.
@@ -794,12 +831,16 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
             for (const auto& t : tool_classes_for_domain(dom.domain)) tclasses.push_back(t);
             json sheets = json::array();
             for (const auto& s : context_sheets_for_domain(dom.domain)) sheets.push_back(s);
+            // structure field: recommended structure label; execution_style is the copilot mode stamp.
+            const char* struct_field =
+                solo_skip_plan ? "solo" : structure_label(rec_struct);
             events.emit("task_route", json{{"domain", dom.label()},
                                            {"reason", dom.reason},
                                            {"tool_classes", tclasses},
                                            {"context_sheets", sheets},
                                            {"complexity", cx.label()},
-                                           {"structure", solo_skip_plan ? "solo" : "planned"}});
+                                           {"structure", struct_field},
+                                           {"execution_style", execution_style}});
         }
     }
 
@@ -817,6 +858,166 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         o.thinking = ac.thinking;
         o.model = ac.model;
         o.sent = ac.sent_prompt;
+    };
+
+    // ---- request_advice peel handler (cap 3 / run) ----
+    // Returns true when the caller should free-retry (advice injected for next turn).
+    auto handle_request_advice = [&](DesignState& st, AdviceRequest& ar, StageOutcome& o,
+                                     const char* stage_tag) -> bool {
+        if (!ar.had_request) return false;
+        constexpr int kAdvisorCap = 3;
+        if (!advisor_on) {
+            st.last_errors.push_back("request_advice ignored (advisor disabled)");
+            return false;  // continue with remaining ops
+        }
+        if (st.advisor_calls >= kAdvisorCap) {
+            events.emit("run_note",
+                        json{{"note", "request_advice ignored: cap of 3 advisor calls reached"},
+                             {"stage", stage_tag}});
+            st.last_errors.push_back(
+                "request_advice ignored: advisor call cap (3) reached for this run");
+            return false;
+        }
+        if (ar.question.empty()) {
+            st.last_errors.push_back("request_advice missing question");
+            return false;
+        }
+        ++st.advisor_calls;
+        // Build a focused advisor state: measured doc + stage + question.
+        DesignState adv_st = st;
+        adv_st.request = std::string("STAGE: ") + stage_tag + "\nQUESTION: " + ar.question;
+        if (!ar.context.empty()) adv_st.request += "\nCONTEXT: " + ar.context;
+        if (!st.tree_digest.empty())
+            adv_st.request += "\nFEATURE TREE:\n" + st.tree_digest;
+        if (!st.last_errors.empty()) {
+            adv_st.request += "\nERRORS:";
+            for (const auto& e : st.last_errors) adv_st.request += "\n- " + e;
+        }
+        AgentCall ac =
+            agent_call(provider, adv_st, "advisor", prompts_dir, call_budget, false, ctx_cap);
+        AdvisorAdvice advice = parse_advisor_advice(ac.reply);
+        std::string advice_text = advice.ok ? advice.advice
+                                            : (ac.has_call_error ? ("advisor error: " + ac.call_error)
+                                                                : "advisor returned no advice");
+        events.emit("advisor", json{{"kind", "advisor"},
+                                    {"stage", stage_tag},
+                                    {"question", ar.question},
+                                    {"advice", advice_text},
+                                    {"confidence", advice.confidence},
+                                    {"call", st.advisor_calls}});
+        // Inject into next turn via advisory seam.
+        set_context_advisory(advice_text);
+        // Pure advice peel (no remaining ops) → free retry so modeler re-prompts with advice.
+        if (ar.remaining.empty() || (ar.remaining.is_array() && ar.remaining.empty())) {
+            o.verdict = "retry";
+            o.reason = "request_advice: injected";
+            o.parsed_ok = true;
+            o.free_retry = true;
+            o.has_ops_count = true;
+            o.ops_count = 0;
+            return true;
+        }
+        return false;  // mixed batch: advice injected; continue with remaining ops
+    };
+
+    // ---- delegate peel handler (edit/plan/agent; HARD-disabled Solo + sub-runs) ----
+    // Returns true when the peel was consumed (either ran a nested design or refused).
+    auto handle_delegate = [&](DesignState& st, DelegateRequest& dr, StageOutcome& o,
+                               const char* stage_tag) -> bool {
+        if (!dr.had_request) return false;
+        auto refuse = [&](const std::string& why) {
+            events.emit("run_note",
+                        json{{"note", "delegate refused: " + why}, {"stage", stage_tag}});
+            st.last_errors.push_back("delegate refused: " + why);
+            if (dr.remaining.empty() || (dr.remaining.is_array() && dr.remaining.empty())) {
+                o.verdict = "retry";
+                o.reason = "delegate refused: " + why;
+                o.parsed_ok = true;
+                o.free_retry = false;
+                o.has_ops_count = true;
+                o.ops_count = 0;
+                return true;
+            }
+            return false;  // mixed: note and continue with remaining
+        };
+        // Mode gate: only edit/plan/agent (or legacy empty mode).
+        const bool mode_ok = copilot_mode.empty() || copilot_mode == "edit" ||
+                             copilot_mode == "plan" || copilot_mode == "agent";
+        if (!mode_ok) return refuse("mode '" + copilot_mode + "' disallows delegate");
+        if (st.complexity_set && st.complexity == Complexity::Solo)
+            return refuse("Solo complexity cannot delegate");
+        if (st.is_sub_run || st.run_depth >= 2)
+            return refuse("delegate depth cap (2) exceeded");
+        if (dr.task.empty()) return refuse("missing task");
+
+        const std::string sub_id = run_id + "-d" + std::to_string(st.run_depth + 1);
+        events.emit("sub_run", json{{"kind", "sub_run"},
+                                    {"id", sub_id},
+                                    {"purpose", dr.task},
+                                    {"parent_stage", stage_tag},
+                                    {"status", "running"}});
+        json sub_opts = options.is_object() ? options : json::object();
+        sub_opts["run_id"] = sub_id;
+        sub_opts["run_depth"] = st.run_depth + 1;
+        sub_opts["is_sub_run"] = true;
+        sub_opts["outer_run_started"] = true;  // share parent's routing card
+        sub_opts.erase("approved_plan");
+        sub_opts.erase("plan_only");
+        // Nested run on the SAME doc_id; share emit sink.
+        json rr = run_design(dr.task, doc_id, provider_cfg, emit, sub_opts);
+        // Refresh parent state from live doc after child mutates it.
+        try {
+            json tree_now = doc::doc_tree(doc_id);
+            st.update_revision(tree_now.value("revision", st.revision));
+            st.update_tree(
+                tree_to_ojson(tree_now.contains("tree") ? tree_now["tree"] : json::object()));
+        } catch (...) {
+        }
+        const std::string child_status = rr.value("status", std::string("done"));
+        events.emit("sub_run", json{{"kind", "sub_run"},
+                                    {"id", sub_id},
+                                    {"purpose", dr.task},
+                                    {"parent_stage", stage_tag},
+                                    {"status", child_status == "done" ? "done" : child_status}});
+        if (dr.remaining.empty() || (dr.remaining.is_array() && dr.remaining.empty())) {
+            o.verdict = (child_status == "done" || child_status == "plan_ready") ? "pass" : "retry";
+            o.reason = "delegate: " + child_status;
+            o.parsed_ok = true;
+            o.has_ops_count = true;
+            o.ops_count = 0;
+            return true;
+        }
+        return false;  // mixed: child ran; continue with remaining ops
+    };
+
+    // Agent-decided plan advisor review (non-plan_only). Returns:
+    //   "approve" | "revise" | "escalate". On revise, note is the revision instruction.
+    // Emits advisor{stage:"plan"} with the verdict.
+    auto advisor_review_plan = [&](DesignState& st, const ojson& plan,
+                                   std::string& note_out) -> std::string {
+        note_out.clear();
+        if (!advisor_on) return "approve";
+        // Build review prompt: plan + request + execution_style.
+        DesignState adv_st = st;
+        std::string plan_s = plan.is_null() ? "{}" : py_json_dumps_indent0(plan);
+        adv_st.request =
+            std::string("STAGE: plan\n") +
+            "Review this BUILD PLAN for execution_style='" + execution_style + "'.\n" +
+            "Return verdict approve|revise|escalate with a note.\n\n" +
+            "REQUEST:\n" + request + "\n\nPLAN:\n" + plan_s;
+        AgentCall ac =
+            agent_call(provider, adv_st, "advisor", prompts_dir, call_budget, false, ctx_cap);
+        AdvisorPlanVerdict v = parse_advisor_plan_verdict(ac.reply);
+        note_out = v.note;
+        events.emit("advisor", json{{"kind", "advisor"},
+                                    {"stage", "plan"},
+                                    {"question", "review build plan"},
+                                    {"advice", v.verdict + (v.note.empty() ? "" : (": " + v.note))},
+                                    {"verdict", v.verdict},
+                                    {"note", v.note},
+                                    {"confidence", v.confidence},
+                                    {"execution_style", execution_style}});
+        return v.verdict;
     };
 
     // _apply(ops): doc_apply_ops at state.revision; update rev + tree; collect status errors.
@@ -915,6 +1116,8 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
 
     // ---- PLAN ----
     // When approved_plan was seeded, skip the planner LLM call (host Plan-mode resume).
+    // Agent-decided plans (non-plan_only) get an advisor approve/revise/escalate after draft.
+    // revise → ONE revision pass then continue (no second review). escalate → needs_user_decision.
     actions.plan = [&](DesignState& st, int) -> StageOutcome {
         if (has_approved_plan && !st.plan.is_null()) {
             StageOutcome o;
@@ -930,7 +1133,14 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
             o.parsed_ok = true;
             return o;  // st.plan stays null -> plan_steps() -> single default step
         }
-        AgentCall ac = agent_call(provider, st, "planner", prompts_dir, call_budget, vision, ctx_cap);
+        // Tell the planner the chosen execution_style so the plan fits it.
+        const std::string style_dir =
+            "[execution_style: " + execution_style +
+            "] Structure the plan for this style. "
+            "swarm → multi-part units with clear deps; eng_firm → discipline-scoped jobs; "
+            "edit → lean single-body feature sequence.";
+        AgentCall ac = agent_call(provider, st, "planner", prompts_dir, call_budget, vision, ctx_cap,
+                                  style_dir);
         ojson p = extract_json_obj(ac.reply);
         StageOutcome o;
         fill_meta(o, ac);
@@ -947,19 +1157,65 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         }
         bool ok = !p.is_null() && p.contains("parts") && p["parts"].is_array() &&
                   !p["parts"].empty();
-        if (ok) {
-            st.plan = p;
-            o.verdict = "pass";
-            o.reason = "plan parsed";
-            o.parsed_ok = true;
-        } else {
+        if (!ok) {
             // Plan is optional: a failure DEGRADES (retry -> exhaust -> non-fatal).
             o.verdict = "retry";
             o.reason = "plan not parseable";
             o.parsed_ok = false;
             o.has_parse_error = true;
             o.parse_error = "no plan json";
+            return o;
         }
+        st.plan = p;
+
+        // Manual plan_only: no advisor gate — host shows the approve card.
+        if (plan_only) {
+            o.verdict = "pass";
+            o.reason = "plan parsed (plan_only)";
+            o.parsed_ok = true;
+            return o;
+        }
+
+        // Agent-decided plan: advisor reviews. Sub-runs skip (parent already approved).
+        if (st.is_sub_run || !advisor_on) {
+            o.verdict = "pass";
+            o.reason = "plan parsed";
+            o.parsed_ok = true;
+            return o;
+        }
+
+        std::string adv_note;
+        std::string verdict = advisor_review_plan(st, st.plan, adv_note);
+        if (verdict == "escalate") {
+            o.verdict = "fail";
+            o.reason = adv_note.empty() ? "advisor escalated plan to user" : adv_note;
+            o.parsed_ok = true;
+            o.has_error = true;
+            o.error = "needs_user_decision";
+            return o;
+        }
+        if (verdict == "revise") {
+            // ONE revision pass with the note; then continue (no second review).
+            const std::string rev_dir =
+                style_dir + "\n\n[PLAN REVISION REQUIRED]\n" +
+                (adv_note.empty() ? "Revise the plan for clarity and executability." : adv_note);
+            AgentCall rac =
+                agent_call(provider, st, "planner", prompts_dir, call_budget, vision, ctx_cap,
+                           rev_dir);
+            ojson rp = extract_json_obj(rac.reply);
+            bool rok = !rp.is_null() && rp.contains("parts") && rp["parts"].is_array() &&
+                       !rp["parts"].empty();
+            if (rok) st.plan = rp;
+            // Continue either way — do not block on a failed revision parse.
+            o.verdict = "pass";
+            o.reason = rok ? "plan revised per advisor" : "plan revision unparseable; keeping prior";
+            o.parsed_ok = true;
+            return o;
+        }
+        // approve (default)
+        o.verdict = "pass";
+        o.reason = "plan parsed (advisor approved)";
+        o.parsed_ok = true;
         return o;
     };
 
@@ -1185,9 +1441,16 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
             return o;
         }
         json ops = filter_ops_to_scope(*ores.ops);
+        // Meta-ops first: request_tools, request_advice, delegate (never reach doc_apply).
         ToolScopeRequest tsr = peel_request_tools(ops);
         if (handle_tool_scope(st, tsr, o, "model")) return o;
         ops = tsr.remaining;
+        AdviceRequest ar = peel_request_advice(ops);
+        if (handle_request_advice(st, ar, o, "model")) return o;
+        ops = ar.remaining;
+        DelegateRequest dr = peel_delegate(ops);
+        if (handle_delegate(st, dr, o, "model")) return o;
+        ops = dr.remaining;
         if (ops.empty()) {
             // Empty ops on a non-empty build step while the tree is still empty is NOT a
             // genuine "no ops needed" pass — the model bailed. Retry with feedback. Keep
@@ -1390,6 +1653,12 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         ToolScopeRequest tsr = peel_request_tools(ops);
         if (handle_tool_scope(st, tsr, o, "fix")) return o;
         ops = tsr.remaining;
+        AdviceRequest ar = peel_request_advice(ops);
+        if (handle_request_advice(st, ar, o, "fix")) return o;
+        ops = ar.remaining;
+        DelegateRequest dr = peel_delegate(ops);
+        if (handle_delegate(st, dr, o, "fix")) return o;
+        ops = dr.remaining;
         if (ops.empty()) {
             o.verdict = "pass";
             o.reason = "fix: no change";
@@ -1631,19 +1900,25 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
             !plan_j["parts"].empty();
         // Provider hard-fail on plan with nothing usable → failed; else plan_ready
         // (even a degraded/empty plan is returned so the host can still present UI).
+        // Manual plan mode stop_reason is awaiting_plan_approval (host approve card);
+        // legacy plan_only flag keeps "plan_only" for older callers.
         std::string status = "plan_ready";
-        std::string stop = "plan_only";
+        std::string stop = (copilot_mode == "plan") ? "awaiting_plan_approval" : "plan_only";
         if (plan_v == "fail" && !have_plan) {
             status = "failed";
             stop = "plan_failed";
         }
         events.emit("run_finished",
-                    json{{"status", status}, {"stop_reason", stop}, {"revision", revision}});
+                    json{{"status", status},
+                         {"stop_reason", stop},
+                         {"revision", revision},
+                         {"execution_style", execution_style}});
         json out = json{{"run_id", run_id},
                         {"status", status},
                         {"stop_reason", stop},
                         {"revision", revision},
-                        {"doc_id", state.doc_id}};
+                        {"doc_id", state.doc_id},
+                        {"execution_style", execution_style}};
         if (have_plan) out["plan"] = plan_j;
         else if (!state.plan.is_null()) out["plan"] = state.plan;
         else out["plan"] = nullptr;
@@ -1704,7 +1979,8 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
     {
         json fin = json{{"status", result["status"]},
                        {"stop_reason", result["stop_reason"]},
-                       {"revision", revision}};
+                       {"revision", revision},
+                       {"execution_style", execution_style}};
         // Surface provider HTTP detail on the phase card (never "budget exhausted").
         if (result.contains("error_detail") && result["error_detail"].is_string() &&
             !result["error_detail"].get<std::string>().empty())
@@ -1712,6 +1988,8 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         if (result.contains("error_human") && result["error_human"].is_string() &&
             !result["error_human"].get<std::string>().empty())
             fin["error_human"] = result["error_human"];
+        if (result.contains("reason") && result["reason"].is_string())
+            fin["reason"] = result["reason"];
         events.emit("run_finished", fin);
     }
 
@@ -1719,7 +1997,8 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
                     {"status", result["status"]},
                     {"stop_reason", result["stop_reason"]},
                     {"revision", revision},
-                    {"doc_id", state.doc_id}};
+                    {"doc_id", state.doc_id},
+                    {"execution_style", execution_style}};
     if (!captured_part_name.empty()) out["part_name"] = captured_part_name;
     if (!copilot_mode.empty()) out["mode"] = copilot_mode;
     if (result.contains("error_detail") && result["error_detail"].is_string() &&
@@ -1728,6 +2007,10 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
     if (result.contains("error_human") && result["error_human"].is_string() &&
         !result["error_human"].get<std::string>().empty())
         out["error_human"] = result["error_human"];
+    // Advisor escalate / plan_ready from machine — forward plan + reason.
+    if (result.contains("plan")) out["plan"] = result["plan"];
+    if (result.contains("reason") && result["reason"].is_string())
+        out["reason"] = result["reason"];
     return out;
 }
 
@@ -1766,6 +2049,22 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
     }
     const bool assembly_plausible =
         cx.level == Complexity::Complex || dom.domain == Domain::Assembly;
+    const bool cross_discipline =
+        (dom.domain == Domain::Ecad || dom.domain == Domain::Cam ||
+         dom.domain == Domain::Simulation);
+    ExecStructure rec_struct = recommend_structure(cx.level, cross_discipline);
+    std::string execution_style = execution_style_from_structure(structure_label(rec_struct));
+    {
+        const std::string mode = options.value("mode", std::string());
+        const std::string execute_as = options.value("execute_as", std::string());
+        if (mode == "swarm" || execute_as == "swarm") execution_style = "swarm";
+        else if (mode == "eng_firm" || execute_as == "eng_firm") execution_style = "eng_firm";
+        else if (mode == "edit") execution_style = "edit";
+        if (options.contains("execution_style") && options["execution_style"].is_string()) {
+            const std::string es = options["execution_style"].get<std::string>();
+            if (es == "edit" || es == "swarm" || es == "eng_firm") execution_style = es;
+        }
+    }
     if (!assembly_plausible) {
         // Confident single-part (Solo/Standard + non-Assembly domain): no probe.
         return run_design(request, doc_id, provider_cfg, emit, options);
@@ -1790,7 +2089,9 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
     events.emit("complexity", json{{"level", cx.label()},
                                    {"reason", cx.reason},
                                    {"skip_plan", false},
-                                   {"assembly_probe", true}});
+                                   {"assembly_probe", true},
+                                   {"structure", structure_label(rec_struct)},
+                                   {"execution_style", execution_style}});
     {
         json tclasses = json::array();
         for (const auto& t : tool_classes_for_domain(dom.domain)) tclasses.push_back(t);
@@ -1801,7 +2102,8 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
                                        {"tool_classes", tclasses},
                                        {"context_sheets", sheets},
                                        {"complexity", cx.label()},
-                                       {"structure", "assembly_probe"}});
+                                       {"structure", structure_label(rec_struct)},
+                                       {"execution_style", execution_style}});
     }
 
     // 1) Probe: intake + planner to learn parts + whether it's an assembly.
@@ -2152,71 +2454,282 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
     const int ctx_cap = cb.input_cap;
     RunEvents events(run_id, emit);
 
-    // 1) Decompose the request into an ordered task list. Normally this costs one
-    //    mission_planner call; on any parse failure / offline provider it degrades to a
-    //    single design task, so a plain "make a bracket" still builds exactly as before.
-    //    E4 (AI-experience plan): an explicit options.capability lets a caller (the in-app
-    //    Copilot "Reverse-engineer import" chip) route straight to one capability without
-    //    depending on the mission_planner prompt recognizing wording it was never taught
-    //    about (that prompt template is outside this node's write-set) -- deterministic
-    //    instead of hoping an LLM infers "reverse_engineer" from prose.
+    // ---- Mode / execution_style (before drafting) ----
+    const std::string copilot_mode = options.value("mode", std::string());
+    const std::string org = options.value("org", copilot_mode);
+    const std::string execute_as = options.value("execute_as", std::string());
+    const bool plan_only = options.value("plan_only", false) || copilot_mode == "plan";
+    const bool advisor_on = !options.contains("advisor") ? true : options.value("advisor", true);
+
+    ComplexityVerdict mcx = classify_complexity(request);
+    DomainVerdict mdom = classify_domain(request);
+    if (options.contains("complexity") && options["complexity"].is_string()) {
+        const std::string forced = options["complexity"].get<std::string>();
+        if (forced == "solo") mcx = {Complexity::Solo, "forced by options"};
+        else if (forced == "standard") mcx = {Complexity::Standard, "forced by options"};
+        else if (forced == "complex") mcx = {Complexity::Complex, "forced by options"};
+    }
+    const bool cross_discipline =
+        (mdom.domain == Domain::Ecad || mdom.domain == Domain::Cam ||
+         mdom.domain == Domain::Simulation);
+    ExecStructure rec_struct = recommend_structure(mcx.level, cross_discipline);
+    std::string execution_style = execution_style_from_structure(structure_label(rec_struct));
+    if (copilot_mode == "swarm" || org == "swarm" || execute_as == "swarm")
+        execution_style = "swarm";
+    else if (copilot_mode == "eng_firm" || org == "eng_firm" || execute_as == "eng_firm")
+        execution_style = "eng_firm";
+    else if (copilot_mode == "edit")
+        execution_style = "edit";
+    if (options.contains("execution_style") && options["execution_style"].is_string()) {
+        const std::string es = options["execution_style"].get<std::string>();
+        if (es == "edit" || es == "swarm" || es == "eng_firm") execution_style = es;
+    }
+    const bool swarm_mode = (execution_style == "swarm");
+    const bool eng_firm_mode = (execution_style == "eng_firm");
+    const bool needs_plan_gate = swarm_mode || eng_firm_mode;
+
+    // approved_plan: host-approved or previously advisor-approved mission plan.
+    ojson approved_plan = nullptr;
+    if (options.contains("approved_plan") && !options["approved_plan"].is_null()) {
+        const auto& ap = options["approved_plan"];
+        if (ap.is_object()) approved_plan = ojson::parse(ap.dump());
+        else if (ap.is_string()) {
+            const std::string& s = ap.get_ref<const std::string&>();
+            if (!s.empty()) {
+                ojson parsed = ojson::parse(s, nullptr, false);
+                if (!parsed.is_discarded() && parsed.is_object()) approved_plan = std::move(parsed);
+            }
+        }
+    }
+    const bool has_approved_plan = !approved_plan.is_null() && approved_plan.is_object() &&
+                                   approved_plan.contains("tasks") &&
+                                   approved_plan["tasks"].is_array() &&
+                                   !approved_plan["tasks"].empty();
+
+    events.emit("task_route", json{{"domain", mdom.label()},
+                                   {"reason", mdom.reason},
+                                   {"complexity", mcx.label()},
+                                   {"structure", structure_label(rec_struct)},
+                                   {"execution_style", execution_style}});
+    events.emit("complexity", json{{"level", mcx.label()},
+                                   {"reason", mcx.reason},
+                                   {"structure", structure_label(rec_struct)},
+                                   {"execution_style", execution_style}});
+
+    // 1) Decompose the request into an ordered task list.
     struct Task {
-        std::string capability, title, req, target;
+        std::string capability, title, req, target, id, discipline;
+        std::vector<std::string> deps;
     };
     static const std::set<std::string> kCaps = {
         "design",  "assembly", "simulate_flow", "simulate_fea",
         "drawing", "evaluate", "report",        "reverse_engineer"};
+
+    auto parse_tasks_from_plan = [&](const ojson& plan) -> std::vector<Task> {
+        std::vector<Task> out;
+        if (plan.is_null() || !plan.is_object() || !plan.contains("tasks") ||
+            !plan["tasks"].is_array())
+            return out;
+        int idx = 0;
+        for (const auto& t : plan["tasks"]) {
+            if (!t.is_object()) continue;
+            Task tk;
+            tk.capability = t.value("capability", std::string());
+            tk.title = t.value("title", std::string());
+            tk.req = t.value("request", std::string());
+            tk.target = t.value("target", std::string("previous"));
+            tk.id = t.value("id", std::string());
+            if (tk.id.empty()) tk.id = "u" + std::to_string(idx + 1);
+            tk.discipline = t.value("discipline", std::string());
+            if (t.contains("deps") && t["deps"].is_array()) {
+                for (const auto& d : t["deps"])
+                    if (d.is_string()) tk.deps.push_back(d.get<std::string>());
+            }
+            if (tk.capability.empty()) continue;
+            if (tk.req.empty()) tk.req = request;
+            out.push_back(std::move(tk));
+            ++idx;
+            if (out.size() >= 8) break;
+        }
+        return out;
+    };
+
     std::vector<Task> tasks;
+    ojson mission_plan_obj = nullptr;
     const std::string capability_override = options.value("capability", std::string());
-    if (!capability_override.empty() && kCaps.count(capability_override)) {
-        tasks.push_back(Task{capability_override, "Reverse-engineer import", request, "active"});
+
+    if (has_approved_plan) {
+        mission_plan_obj = approved_plan;
+        tasks = parse_tasks_from_plan(approved_plan);
+    } else if (!capability_override.empty() && kCaps.count(capability_override)) {
+        tasks.push_back(Task{capability_override, "Reverse-engineer import", request, "active",
+                             "u1", "", {}});
     } else {
         DesignState mstate;
         mstate.request = request;
         mstate.doc_id = doc_id;
-        AgentCall ma =
-            agent_call(provider, mstate, "mission_planner", prompts_dir, budget, false, ctx_cap);
+        mstate.execution_style = execution_style;
+        const std::string style_dir =
+            "[execution_style: " + execution_style + "] " +
+            (swarm_mode
+                 ? "Structure tasks as swarm units with id+deps (parts first, assembly last)."
+                 : (eng_firm_mode
+                        ? "Structure tasks as eng_firm discipline jobs (optional discipline field)."
+                        : "Minimal capability sequence."));
+        AgentCall ma = agent_call(provider, mstate, "mission_planner", prompts_dir, budget, false,
+                                  ctx_cap, style_dir);
         ojson plan = extract_json_obj(ma.reply);
-        if (!plan.is_null() && plan.is_object() && plan.contains("tasks") &&
-            plan["tasks"].is_array()) {
-            for (const auto& t : plan["tasks"]) {
-                if (!t.is_object()) continue;
-                Task tk;
-                tk.capability = t.value("capability", std::string());
-                tk.title = t.value("title", std::string());
-                tk.req = t.value("request", std::string());
-                tk.target = t.value("target", std::string("previous"));
-                if (tk.capability.empty()) continue;
-                if (tk.req.empty()) tk.req = request;  // defensive: hand the modeler something
-                tasks.push_back(std::move(tk));
-                if (tasks.size() >= 8) break;  // hard cap (planner is asked for <=6)
-            }
+        if (!plan.is_null() && plan.is_object()) {
+            mission_plan_obj = plan;
+            tasks = parse_tasks_from_plan(plan);
         }
         if (tasks.empty())
-            tasks.push_back(Task{"design", "Build the model", request, "active"});
+            tasks.push_back(Task{"design", "Build the model", request, "active", "u1", "", {}});
+    }
+
+    // ---- Plan gate for swarm/eng_firm: advisor-approve draft when no approved_plan ----
+    if (needs_plan_gate && !has_approved_plan && !plan_only) {
+        // Build a plan object if the planner only emitted tasks.
+        if (mission_plan_obj.is_null() || !mission_plan_obj.is_object()) {
+            mission_plan_obj = ojson::object();
+            mission_plan_obj["mission"] = request;
+        }
+        ojson tarr = ojson::array();
+        for (const auto& tk : tasks) {
+            ojson t = ojson{{"capability", tk.capability},
+                            {"title", tk.title},
+                            {"request", tk.req},
+                            {"target", tk.target},
+                            {"id", tk.id}};
+            if (!tk.deps.empty()) {
+                ojson deps = ojson::array();
+                for (const auto& d : tk.deps) deps.push_back(d);
+                t["deps"] = deps;
+            }
+            if (!tk.discipline.empty()) t["discipline"] = tk.discipline;
+            tarr.push_back(t);
+        }
+        mission_plan_obj["tasks"] = tarr;
+
+        if (advisor_on) {
+            DesignState adv_st;
+            adv_st.request =
+                std::string("STAGE: plan\nReview this MISSION PLAN for execution_style='") +
+                execution_style + "'.\nReturn verdict approve|revise|escalate with a note.\n\n" +
+                "REQUEST:\n" + request + "\n\nPLAN:\n" + py_json_dumps_indent0(mission_plan_obj);
+            AgentCall ac =
+                agent_call(provider, adv_st, "advisor", prompts_dir, budget, false, ctx_cap);
+            AdvisorPlanVerdict v = parse_advisor_plan_verdict(ac.reply);
+            events.emit("advisor", json{{"kind", "advisor"},
+                                        {"stage", "plan"},
+                                        {"question", "review mission plan"},
+                                        {"advice", v.verdict + (v.note.empty() ? "" : (": " + v.note))},
+                                        {"verdict", v.verdict},
+                                        {"note", v.note},
+                                        {"confidence", v.confidence},
+                                        {"execution_style", execution_style}});
+            if (v.verdict == "escalate") {
+                json plan_j = mission_plan_obj;
+                events.emit("mission_finished",
+                            json{{"status", "plan_ready"},
+                                 {"stop_reason", "needs_user_decision"},
+                                 {"execution_style", execution_style}});
+                return json{{"run_id", run_id},
+                            {"status", "plan_ready"},
+                            {"stop_reason", "needs_user_decision"},
+                            {"plan", plan_j},
+                            {"reason", v.note},
+                            {"execution_style", execution_style},
+                            {"doc_id", doc_id},
+                            {"revision", 0},
+                            {"tasks", json::array()}};
+            }
+            if (v.verdict == "revise") {
+                // ONE revision pass, then continue (no second review).
+                DesignState mstate;
+                mstate.request = request;
+                mstate.doc_id = doc_id;
+                const std::string rev_dir =
+                    std::string("[execution_style: ") + execution_style +
+                    "]\n[PLAN REVISION REQUIRED]\n" +
+                    (v.note.empty() ? "Revise the mission plan." : v.note);
+                AgentCall ma = agent_call(provider, mstate, "mission_planner", prompts_dir, budget,
+                                          false, ctx_cap, rev_dir);
+                ojson rp = extract_json_obj(ma.reply);
+                if (!rp.is_null() && rp.is_object()) {
+                    mission_plan_obj = rp;
+                    auto revised = parse_tasks_from_plan(rp);
+                    if (!revised.empty()) tasks = std::move(revised);
+                }
+            }
+            // approve → fall through to execution
+        }
+    }
+
+    // Manual plan_only on mission: return plan_ready for the host.
+    if (plan_only) {
+        if (mission_plan_obj.is_null() || !mission_plan_obj.is_object()) {
+            mission_plan_obj = ojson::object();
+            mission_plan_obj["mission"] = request;
+            ojson tarr = ojson::array();
+            for (const auto& tk : tasks)
+                tarr.push_back(ojson{{"capability", tk.capability},
+                                     {"title", tk.title},
+                                     {"request", tk.req},
+                                     {"target", tk.target},
+                                     {"id", tk.id}});
+            mission_plan_obj["tasks"] = tarr;
+        }
+        json plan_j = mission_plan_obj;
+        json task_list = json::array();
+        for (const auto& tk : tasks)
+            task_list.push_back(json{{"capability", tk.capability}, {"title", tk.title},
+                                     {"id", tk.id}, {"status", "pending"}});
+        emit_plan_state(events, "phased_todo", "Mission", "", 1,
+                        plan_state_items_from_mission(task_list, "Mission"));
+        events.emit("mission_finished",
+                    json{{"status", "plan_ready"},
+                         {"stop_reason", "awaiting_plan_approval"},
+                         {"execution_style", execution_style}});
+        return json{{"run_id", run_id},
+                    {"status", "plan_ready"},
+                    {"stop_reason", "awaiting_plan_approval"},
+                    {"plan", plan_j},
+                    {"execution_style", execution_style},
+                    {"doc_id", doc_id},
+                    {"revision", 0},
+                    {"tasks", task_list}};
     }
 
     json task_list = json::array();
     for (const auto& tk : tasks)
-        task_list.push_back(json{{"capability", tk.capability}, {"title", tk.title}});
+        task_list.push_back(json{{"capability", tk.capability},
+                                 {"title", tk.title},
+                                 {"id", tk.id},
+                                 {"status", "pending"}});
     events.emit("mission_started", json{{"request", request},
                                         {"task_count", static_cast<int>(tasks.size())},
-                                        {"tasks", task_list}});
+                                        {"tasks", task_list},
+                                        {"execution_style", execution_style}});
 
-    // Eng. Firm org: collect deterministic contractor-firm bids (predicted tokens ->
-    // USD) for the job and surface them + the winning firm. The budget ceiling and
-    // blended token rate come from the host; 0 budget = unlimited.
-    const std::string org = options.value("org", options.value("mode", std::string()));
-    if (org == "eng_firm") {
-        const double budget_usd = options.value("budget_usd", 0.0);
-        const double usd_per_1k = options.value("usd_per_1k", 3.0);
-        ComplexityVerdict mcx = classify_complexity(request);
-        DomainVerdict mdom = classify_domain(request);
-        std::vector<Bid> bids = collect_bids(request, mcx.level, mdom.domain, usd_per_1k, budget_usd);
+    // ---- Eng. Firm: firm_bids + firm_team telemetry (roster once) ----
+    std::vector<TeamMember> firm_team_members;
+    std::string awarded_firm_id, awarded_firm_name;
+    double awarded_usd = 0.0;
+    double budget_usd = options.value("budget_usd", 0.0);
+    const double usd_per_1k = options.value("usd_per_1k", 3.0);
+    json firm_ledger = json::array();  // in-memory per-run ledger
+    double spent_usd = 0.0;
+
+    if (eng_firm_mode) {
+        // Default budget from firm_bid estimate when host did not set one.
+        if (budget_usd <= 0.0) {
+            auto est = estimate_task_tokens(request, mcx.level, mdom.domain);
+            budget_usd = tokens_to_usd(est.total_tokens, usd_per_1k);
+        }
+        std::vector<Bid> bids =
+            collect_bids(request, mcx.level, mdom.domain, usd_per_1k, budget_usd);
         json jbids = json::array();
-        std::string winner_id, winner_name;
-        double winner_usd = 0.0;
-        long winner_tokens = 0;
         for (const auto& b : bids) {
             jbids.push_back(json{{"firm_id", b.firm_id},
                                  {"firm", b.firm_name},
@@ -2224,11 +2737,10 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
                                  {"tokens", b.tokens},
                                  {"usd", b.usd},
                                  {"within_budget", b.within_budget}});
-            if (winner_id.empty() && b.in_scope && b.within_budget) {
-                winner_id = b.firm_id;
-                winner_name = b.firm_name;
-                winner_usd = b.usd;
-                winner_tokens = b.tokens;
+            if (awarded_firm_id.empty() && b.in_scope && b.within_budget) {
+                awarded_firm_id = b.firm_id;
+                awarded_firm_name = b.firm_name;
+                awarded_usd = b.usd;
             }
         }
         events.emit("firm_bids", json{{"domain", mdom.label()},
@@ -2236,49 +2748,108 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
                                       {"budget_usd", budget_usd},
                                       {"usd_per_1k", usd_per_1k},
                                       {"bids", jbids},
-                                      {"awarded_firm_id", winner_id},
-                                      {"awarded_firm", winner_name},
-                                      {"awarded_tokens", winner_tokens},
-                                      {"awarded_usd", winner_usd}});
-        // Assemble the delivery team: lead specialist for the primary domain + a
-        // subcontractor per secondary discipline the request also needs.
-        std::vector<TeamMember> team = assemble_team(request, mdom.domain);
+                                      {"awarded_firm_id", awarded_firm_id},
+                                      {"awarded_firm", awarded_firm_name},
+                                      {"awarded_usd", awarded_usd}});
+        firm_team_members = assemble_team(request, mdom.domain);
         json jteam = json::array();
-        for (const auto& tm : team)
+        for (const auto& tm : firm_team_members)
             jteam.push_back(json{{"firm_id", tm.firm_id},
                                  {"firm", tm.firm_name},
                                  {"role", tm.role_title},
                                  {"scope", DomainVerdict{tm.scope, ""}.label()},
                                  {"lead", tm.lead},
                                  {"subcontractor", tm.subcontractor}});
-        events.emit("firm_team", json{{"members", jteam}});
+        events.emit("firm_team", json{{"kind", "firm_team"}, {"members", jteam}});
     }
-    // Additive plan_state for the copilot Plan section (phased_todo under "Mission").
-    // Statuses update on mission_task_started / mission_task_result.
+
+    // Additive plan_state (mission:-namespaced via plan_state_items_from_mission).
     int mission_plan_rev = 1;
-    json mission_plan_tasks = task_list;  // mutable status mirror
-    for (auto& t : mission_plan_tasks)
-        if (t.is_object()) t["status"] = "pending";
+    json mission_plan_tasks = task_list;
     emit_plan_state(events, "phased_todo", "Mission", /*summary=*/"", mission_plan_rev,
                     plan_state_items_from_mission(mission_plan_tasks, "Mission"));
 
-    // 2) Execute tasks in order, threading the working document forward.
-    std::string current_doc = doc_id;  // "previous" target resolves to this
+    // ---- Wave decomposition for swarm (deps → sequential waves) ----
+    // v1: waves run sequentially; units within a wave also sequential.
+    std::vector<std::vector<size_t>> waves;
+    if (swarm_mode) {
+        std::map<std::string, size_t> id_to_idx;
+        for (size_t i = 0; i < tasks.size(); ++i) id_to_idx[tasks[i].id] = i;
+        std::vector<int> indeg(tasks.size(), 0);
+        std::vector<std::vector<size_t>> adj(tasks.size());
+        for (size_t i = 0; i < tasks.size(); ++i) {
+            for (const auto& d : tasks[i].deps) {
+                auto it = id_to_idx.find(d);
+                if (it == id_to_idx.end()) continue;
+                adj[it->second].push_back(i);
+                indeg[i] += 1;
+            }
+        }
+        std::vector<size_t> ready;
+        for (size_t i = 0; i < tasks.size(); ++i)
+            if (indeg[i] == 0) ready.push_back(i);
+        std::vector<bool> placed(tasks.size(), false);
+        while (!ready.empty()) {
+            waves.push_back(ready);
+            std::vector<size_t> next;
+            for (size_t u : ready) {
+                placed[u] = true;
+                for (size_t v : adj[u]) {
+                    if (--indeg[v] == 0) next.push_back(v);
+                }
+            }
+            ready.swap(next);
+        }
+        // Orphans / cycles: append any unplaced in original order as final wave.
+        std::vector<size_t> rest;
+        for (size_t i = 0; i < tasks.size(); ++i)
+            if (!placed[i]) rest.push_back(i);
+        if (!rest.empty()) waves.push_back(rest);
+    } else {
+        // Non-swarm: one unit per sequential "wave" (preserves prior linear order).
+        for (size_t i = 0; i < tasks.size(); ++i) waves.push_back({i});
+    }
+
+    // 2) Execute tasks (wave-ordered), threading the working document forward.
+    std::string current_doc = doc_id;
     std::string final_doc = doc_id;
     bool created_doc = false;
     std::string asm_path;
     int components = 0;
     int revision = 0;
-    bool any_built = false;  // geometry was produced (drives stop_reason + tab-open)
-    bool any_ok = false;     // any task completed (drives the mission's done/failed status)
+    bool any_built = false;
+    bool any_ok = false;
     bool reported = false;
+    bool budget_exceeded = false;
     ojson sim_results = ojson::array();
     std::string design_summary;
     std::string verdict;
-    json re_report = json::object();  // populated by the "reverse_engineer" capability
+    json re_report = json::object();
     json task_results = json::array();
+    std::vector<std::string> task_status(tasks.size(), "pending");
 
-    for (size_t i = 0; i < tasks.size(); ++i) {
+    auto set_task_plan_status = [&](size_t i, const std::string& st, const std::string& sum) {
+        if (i < mission_plan_tasks.size() && mission_plan_tasks[i].is_object()) {
+            mission_plan_tasks[i]["status"] = st;
+            if (!sum.empty()) mission_plan_tasks[i]["summary"] = sum;
+        }
+        ++mission_plan_rev;
+        emit_plan_state(events, "phased_todo", "Mission", "", mission_plan_rev,
+                        plan_state_items_from_mission(mission_plan_tasks, "Mission"));
+    };
+
+    auto run_one_task = [&](size_t i) -> void {
+        if (budget_exceeded) {
+            task_status[i] = "abandoned";
+            set_task_plan_status(i, "abandoned", "budget_exceeded");
+            task_results.push_back(json{{"capability", tasks[i].capability},
+                                        {"title", tasks[i].title},
+                                        {"id", tasks[i].id},
+                                        {"status", "abandoned"},
+                                        {"doc_id", current_doc},
+                                        {"summary", "budget_exceeded"}});
+            return;
+        }
         const Task& tk = tasks[i];
         std::string target_doc = (tk.target == "active") ? doc_id : current_doc;
         events.emit("mission_task_started",
@@ -2286,13 +2857,78 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
                          {"total", static_cast<int>(tasks.size())},
                          {"capability", tk.capability},
                          {"title", tk.title},
+                         {"id", tk.id},
                          {"doc_id", target_doc}});
-        // Mark this task running in plan_state.
-        if (i < mission_plan_tasks.size() && mission_plan_tasks[i].is_object())
-            mission_plan_tasks[i]["status"] = "running";
-        ++mission_plan_rev;
-        emit_plan_state(events, "phased_todo", "Mission", "", mission_plan_rev,
-                        plan_state_items_from_mission(mission_plan_tasks, "Mission"));
+        set_task_plan_status(i, "running", "");
+
+        // Eng-firm per-task bid/award + team seeds + ledger.
+        std::string firm_role_seed;
+        double task_bid_usd = 0.0;
+        if (eng_firm_mode) {
+            ComplexityVerdict tcx = classify_complexity(tk.req);
+            DomainVerdict tdom = classify_domain(tk.req);
+            std::vector<Bid> tbids =
+                collect_bids(tk.req, tcx.level, tdom.domain, usd_per_1k, budget_usd - spent_usd);
+            std::string win_id = awarded_firm_id, win_name = awarded_firm_name;
+            double win_usd = 0.0;
+            for (const auto& b : tbids) {
+                if (b.in_scope && b.within_budget) {
+                    win_id = b.firm_id;
+                    win_name = b.firm_name;
+                    win_usd = b.usd;
+                    break;
+                }
+            }
+            if (win_usd <= 0.0) {
+                auto est = estimate_task_tokens(tk.req, tcx.level, tdom.domain);
+                win_usd = tokens_to_usd(est.total_tokens, usd_per_1k);
+            }
+            task_bid_usd = win_usd;
+            events.emit("firm_award", json{{"kind", "firm_award"},
+                                           {"firm", win_name.empty() ? win_id : win_name},
+                                           {"firm_id", win_id},
+                                           {"bid_usd", win_usd},
+                                           {"reason", "lowest in-scope bid within remaining budget"},
+                                           {"task_id", tk.id},
+                                           {"title", tk.title}});
+            // firm:-namespaced plan_state item for the award.
+            {
+                json firm_items = json::array();
+                firm_items.push_back(json{{"id", "firm:" + tk.id},
+                                          {"title", plan_item_title(tk.title)},
+                                          {"desc", "awarded " + (win_name.empty() ? win_id : win_name)},
+                                          {"status", "running"},
+                                          {"kind", "task"}});
+                emit_plan_state(events, "checklist", "Firm awards", "", mission_plan_rev + 1000,
+                                firm_items);
+            }
+            // Role seeds: lead + subcontractors PREFIX the sub-run prompt.
+            std::vector<TeamMember> team =
+                firm_team_members.empty() ? assemble_team(tk.req, tdom.domain) : firm_team_members;
+            std::ostringstream seed;
+            std::string lead_name, lead_role;
+            for (const auto& tm : team) {
+                const DisciplineRole& role = role_for_domain(tm.scope);
+                if (tm.lead) {
+                    lead_name = tm.firm_name;
+                    lead_role = tm.role_title;
+                    seed << "[LEAD " << tm.role_title << " @ " << tm.firm_name << "]\n"
+                         << role.system_seed << "\n";
+                } else if (tm.subcontractor) {
+                    seed << "[SUB " << tm.role_title << " @ " << tm.firm_name << "]\n"
+                         << role.system_seed << "\n";
+                }
+            }
+            // Ledger context so far.
+            if (!firm_ledger.empty())
+                seed << "\n[FIRM LEDGER SO FAR]\n" << firm_ledger.dump() << "\n";
+            firm_role_seed = seed.str();
+            events.emit("firm_comm",
+                        json{{"kind", "firm_comm"},
+                             {"from", "orchestrator"},
+                             {"to", lead_name.empty() ? win_name : lead_name},
+                             {"text", "Starting task '" + tk.title + "' (" + tk.capability + ")"}});
+        }
 
         std::string status = "skipped";
         std::string summary;
@@ -2302,6 +2938,14 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
         } else if (tk.capability == "design" || tk.capability == "assembly") {
             json sub_opts = options;
             sub_opts["run_id"] = run_id + "-t" + std::to_string(i);
+            sub_opts["is_sub_run"] = true;
+            sub_opts["run_depth"] = 1;
+            sub_opts["execution_style"] = "edit";  // unit itself is a solo design
+            // Don't recurse into swarm/eng_firm for child units.
+            sub_opts.erase("mode");
+            sub_opts.erase("org");
+            sub_opts.erase("approved_plan");
+            if (!firm_role_seed.empty()) sub_opts["firm_role_seed"] = firm_role_seed;
             json rr = run_assembly_design(tk.req, target_doc, provider_cfg, emit, sub_opts);
             status = rr.value("status", std::string("done"));
             summary = rr.value("stop_reason", std::string());
@@ -2311,7 +2955,7 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
                 asm_path = rr.value("asm_path", asm_path);
                 components = rr.value("components", components);
             } else {
-                current_doc = target_doc;  // design mutated the target doc in place
+                current_doc = target_doc;
             }
             final_doc = current_doc;
             revision = rr.value("revision", revision);
@@ -2336,22 +2980,6 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
             status = "done";
             summary = verdict;
         } else if (tk.capability == "reverse_engineer") {
-            // WS-E E4 (AI-experience plan): keep the import doc (target_doc) as a READ-ONLY
-            // reference, build the reconstruction into a fresh doc, then verify with the real
-            // doc_eval_compare geometric comparison and surface match_pct in both the task
-            // summary and a dedicated event.
-            //
-            // FALLBACK TAKEN (pre-decided in the plan): full per-stage plumbing would mean
-            // threading compare feedback into the reviewer/fixer BuiltContext at EVERY
-            // modeler/review/fix iteration inside run_design's ~500-line stage loop -- a loop
-            // shared with "design"/"assembly", and whose prompt templates (reviewer.md/
-            // fixer.md, under services/agent/prompts/) would need to learn to read an injected
-            // compare block. Both are outside this node's write-set and out of proportion for
-            // one capability branch. Instead: run the normal design loop once into a new doc
-            // (a real, not per-stage, verification pass), compare with the reference via the
-            // actual eval_compare RPC (never a canned number), and hand back one explicit
-            // follow-up instruction so a second copilot turn can close any residual gap via its
-            // normal add_features / eval_compare op path.
             const std::string ref_doc = target_doc;
             std::string new_doc_id;
             try {
@@ -2372,6 +3000,10 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
                     "single dumb import.";
                 json sub_opts = options;
                 sub_opts["run_id"] = run_id + "-t" + std::to_string(i);
+                sub_opts["is_sub_run"] = true;
+                sub_opts["run_depth"] = 1;
+                sub_opts.erase("mode");
+                sub_opts.erase("org");
                 json rr = run_assembly_design(augmented, new_doc_id, provider_cfg, emit, sub_opts);
                 status = rr.value("status", std::string("done"));
                 summary = rr.value("stop_reason", std::string());
@@ -2383,8 +3015,10 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
                     design_summary = doc_design_summary(current_doc);
                 }
                 try {
-                    json cmp = doc::doc_eval_compare(json{{"doc_a", current_doc}, {"doc_b", ref_doc}});
-                    re_report = json{{"new_doc_id", current_doc}, {"ref_doc_id", ref_doc},
+                    json cmp =
+                        doc::doc_eval_compare(json{{"doc_a", current_doc}, {"doc_b", ref_doc}});
+                    re_report = json{{"new_doc_id", current_doc},
+                                     {"ref_doc_id", ref_doc},
                                      {"compare", cmp}};
                     events.emit("reverse_engineer_compare", re_report);
                     if (cmp.value("degraded", false)) {
@@ -2406,48 +3040,126 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
                 }
             }
         } else {
-            // simulate_fea / drawing / evaluate — recognized but not yet executed here.
             summary = "capability '" + tk.capability + "' is not yet wired into missions";
         }
 
+        if (eng_firm_mode) {
+            spent_usd += task_bid_usd;
+            firm_ledger.push_back(json{{"task_id", tk.id},
+                                       {"title", tk.title},
+                                       {"status", status},
+                                       {"bid_usd", task_bid_usd},
+                                       {"summary", summary}});
+            events.emit("firm_comm",
+                        json{{"kind", "firm_comm"},
+                             {"from", awarded_firm_name.empty() ? "lead" : awarded_firm_name},
+                             {"to", "orchestrator"},
+                             {"text", "Finished '" + tk.title + "': " + status +
+                                          (summary.empty() ? "" : (" — " + summary))}});
+            // firm: item done/fail
+            {
+                json firm_items = json::array();
+                firm_items.push_back(json{{"id", "firm:" + tk.id},
+                                          {"title", plan_item_title(tk.title)},
+                                          {"desc", summary.empty() ? status : summary},
+                                          {"status", status == "done" ? "done" : "fail"},
+                                          {"kind", "task"}});
+                emit_plan_state(events, "checklist", "Firm awards", "", mission_plan_rev + 1000,
+                                firm_items);
+            }
+            if (budget_usd > 0.0 && spent_usd > budget_usd + 1e-9) {
+                budget_exceeded = true;
+                events.emit("run_note",
+                            json{{"note", "budget_exceeded"},
+                                 {"spent_usd", spent_usd},
+                                 {"budget_usd", budget_usd}});
+            }
+        }
+
         if (status == "done") any_ok = true;
+        task_status[i] = status;
         events.emit("mission_task_result", json{{"index", static_cast<int>(i)},
                                                  {"capability", tk.capability},
+                                                 {"id", tk.id},
                                                  {"status", status},
                                                  {"doc_id", current_doc},
                                                  {"summary", summary}});
-        if (i < mission_plan_tasks.size() && mission_plan_tasks[i].is_object()) {
-            mission_plan_tasks[i]["status"] = status;
-            if (!summary.empty()) mission_plan_tasks[i]["summary"] = summary;
-        }
-        ++mission_plan_rev;
-        emit_plan_state(events, "phased_todo", "Mission", "", mission_plan_rev,
-                        plan_state_items_from_mission(mission_plan_tasks, "Mission"));
+        set_task_plan_status(i, status, summary);
         task_results.push_back(json{{"capability", tk.capability},
                                     {"title", tk.title},
+                                    {"id", tk.id},
                                     {"status", status},
                                     {"doc_id", current_doc},
                                     {"summary", summary}});
+    };
+
+    // Drive waves.
+    const int total_waves = static_cast<int>(waves.size());
+    for (int wi = 0; wi < total_waves; ++wi) {
+        if (budget_exceeded) break;
+        const auto& wave = waves[wi];
+        if (swarm_mode) {
+            json wave_tasks = json::array();
+            for (size_t idx : wave) {
+                wave_tasks.push_back(json{{"id", tasks[idx].id},
+                                          {"title", tasks[idx].title},
+                                          {"status", "pending"}});
+            }
+            events.emit("swarm_wave", json{{"kind", "swarm_wave"},
+                                           {"wave", wi + 1},
+                                           {"total_waves", total_waves},
+                                           {"tasks", wave_tasks}});
+        }
+        // Sequential units within the wave (v1).
+        for (size_t idx : wave) {
+            if (budget_exceeded) break;
+            run_one_task(idx);
+            // Update swarm_wave task status after each unit.
+            if (swarm_mode) {
+                json wave_tasks = json::array();
+                for (size_t j : wave) {
+                    wave_tasks.push_back(json{{"id", tasks[j].id},
+                                              {"title", tasks[j].title},
+                                              {"status", task_status[j]}});
+                }
+                events.emit("swarm_wave", json{{"kind", "swarm_wave"},
+                                               {"wave", wi + 1},
+                                               {"total_waves", total_waves},
+                                               {"tasks", wave_tasks}});
+            }
+        }
     }
 
-    // If the mission ran a sim but the planner forgot an explicit report task, still produce a
-    // verdict — that is the whole point of "prove it's a good design".
     if (!reported && sim_results.is_array() && !sim_results.empty())
         verdict = build_verdict(provider, prompts_dir, budget, ctx_cap, request, design_summary,
                                 sim_results);
 
-    std::string stop_reason = any_built ? (created_doc ? "assembled" : "built")
-                                        : (any_ok ? "done" : "planned");
-    std::string status = any_ok ? "done" : "failed";
+    std::string stop_reason;
+    std::string status;
+    if (budget_exceeded) {
+        status = "failed";
+        stop_reason = "budget_exceeded";
+    } else {
+        stop_reason = any_built ? (created_doc ? "assembled" : "built")
+                                : (any_ok ? "done" : "planned");
+        status = any_ok ? "done" : "failed";
+    }
     events.emit("mission_finished", json{{"status", status},
                                           {"stop_reason", stop_reason},
                                           {"doc_id", final_doc},
-                                          {"verdict", verdict}});
+                                          {"verdict", verdict},
+                                          {"execution_style", execution_style},
+                                          {"spent_usd", spent_usd},
+                                          {"budget_usd", budget_usd}});
 
-    json result = json{{"run_id", run_id},     {"status", status},
-                       {"stop_reason", stop_reason}, {"doc_id", final_doc},
-                       {"revision", revision},  {"verdict", verdict},
-                       {"tasks", task_results}};
+    json result = json{{"run_id", run_id},
+                       {"status", status},
+                       {"stop_reason", stop_reason},
+                       {"doc_id", final_doc},
+                       {"revision", revision},
+                       {"verdict", verdict},
+                       {"tasks", task_results},
+                       {"execution_style", execution_style}};
     if (created_doc) {
         result["created_doc"] = true;
         result["assembly"] = true;
@@ -2455,8 +3167,14 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
         result["components"] = components;
     }
     if (!re_report.empty()) result["reverse_engineer"] = re_report;
+    if (eng_firm_mode) {
+        result["spent_usd"] = spent_usd;
+        result["budget_usd"] = budget_usd;
+        result["firm_ledger"] = firm_ledger;
+    }
     return result;
 }
+
 
 }  // namespace agent
 }  // namespace aicad

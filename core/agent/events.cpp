@@ -443,7 +443,7 @@ json plan_state_items_from_mission(const json& tasks, const std::string& phase) 
         } else if (t.contains("req") && t["req"].is_string()) {
             desc = t["req"].get<std::string>();
         }
-        json item = json{{"id", "mission-" + std::to_string(i)},
+        json item = json{{"id", "mission:" + std::to_string(i)},
                          {"title", plan_item_title(title)},
                          {"desc", desc.empty() ? title : desc},
                          {"status", status},

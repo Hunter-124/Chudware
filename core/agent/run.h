@@ -48,19 +48,26 @@ using EmitFn = std::function<void(const json&)>;
 // emit          optional event callback (may be empty).
 // options       {run_id?, budgets?, prompts_dir?, offline?, prewalk?, prewalk_target?,
 //                capability?, cam?,
-//                // Copilot mode overhaul (agent|plan|swarm|edit|ask):
-//                mode?,            // "agent"|"plan"|"swarm"|"edit"|"ask" (absent = legacy)
+//                // Copilot mode overhaul (agent|plan|swarm|edit|ask|eng_firm):
+//                mode?,            // "agent"|"plan"|"swarm"|"edit"|"ask"|"eng_firm"
 //                plan_only?,       // bool: intake+plan then STOP (status plan_ready)
 //                approved_plan?,   // string|object: skip re-plan; seed DesignState.plan
-//                execute_as?,      // "agent"|"swarm" (host resume after plan approve)
-//                corporate_force?, // bool: force swarm/corporate (Python mission path)
+//                execute_as?,      // "agent"|"swarm"|"eng_firm" (host resume after plan approve)
+//                corporate_force?, // bool: force swarm/corporate
 //                scope?,           // {doc_id?, feature_ids?:[], selection?:[], section?}
-//                advisor?          // bool, default true — advisory inject seam (no-op if empty)
+//                advisor?,         // bool, default true — advisory inject + plan review
+//                advisory_text?,   // optional pre-seeded advisory block
+//                execution_style?, // "edit"|"swarm"|"eng_firm" (overrides recommend_structure)
+//                budget_usd?,      // eng_firm spend ceiling (default = firm_bid estimate)
+//                run_depth?,       // nested sub-run depth (delegate / swarm unit)
+//                is_sub_run?,      // true inside nested units (disables further delegate)
+//                firm_role_seed?   // specialist prompt prefix for eng_firm sub-runs
 //               }. run_id overrides the generated uuid hex[:12]; prompts_dir overrides
 //               AI_CAD_PROMPTS_DIR (the gate points both engines at the same agent/prompts).
 //
-// Returns {run_id, status, stop_reason, revision, doc_id} — or on plan_only success
-// {status:"plan_ready", plan, stop_reason:"plan_only", ...}.
+// Returns {run_id, status, stop_reason, revision, doc_id, execution_style?} — or on plan_only
+// success {status:"plan_ready", plan, stop_reason:"plan_only"|"awaiting_plan_approval", ...}.
+// Advisor escalate: {status:"plan_ready", stop_reason:"needs_user_decision", plan, reason}.
 json run_design(const std::string& request, const std::string& doc_id, const json& provider_cfg,
                 EmitFn emit = nullptr, const json& options = json::object());
 

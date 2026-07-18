@@ -38,6 +38,17 @@ Rules:
 - Order matters: build first, analyze the result, report last.
 - At most 6 tasks.
 
+- When the user message (or an ADVISORY / style stamp) says execution_style is "swarm", structure
+  the plan for PARALLELIZABLE units: prefer design/assembly tasks that each cover ONE part or
+  cohesive unit, and add optional fields on each task:
+    "id"   — stable short id (u1, u2, …)
+    "deps" — array of task ids that must finish before this one (empty = wave 0)
+  A final assembly/report task should depend on the part units. Keep the same capability set.
+- When execution_style is "eng_firm", structure tasks as discipline-scoped jobs the firm will bid
+  on. Prefer capability labels that match the work (design / assembly / simulate_* / drawing /
+  evaluate / report) and put the discipline focus in title+request (mechanical, structural,
+  thermal, …). Optional per-task "discipline" string is allowed.
+
 Reply with EXACTLY one ```json block, no prose outside it, shaped:
 {
   "mission": "one-line restatement of the whole request",

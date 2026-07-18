@@ -102,6 +102,20 @@ struct DesignState {
     // Dynamic attr the model action sets (stagnation signal); see machine.py.
     bool last_no_progress = false;
 
+    // ---- Exec-mode run stamps (set by run.cpp; machine/actions read them) ----
+    // Recommended or mode-forced execution style label: "edit"|"swarm"|"eng_firm".
+    // Distinct from complexity structure_label (solo|subagent|dag|company).
+    std::string execution_style;
+    // Copilot mode string (agent|plan|swarm|edit|ask|eng_firm); empty = legacy.
+    std::string copilot_mode;
+    // Nested run_design depth (0 = top-level). HARD-caps delegate at 2.
+    int run_depth = 0;
+    // request_advice peels honored this run (cap 3; further peels noted + ignored).
+    int advisor_calls = 0;
+    // True when this run is a nested sub-run (delegate child or swarm/eng_firm unit).
+    // Disables further delegate peels.
+    bool is_sub_run = false;
+
     void update_tree(const ojson& tree);
     void update_revision(int rev) { revision = rev; }
 };

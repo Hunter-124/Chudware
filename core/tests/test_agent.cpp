@@ -10,6 +10,7 @@
 #include "agent/ops_emit.h"
 #include "agent/complexity.h"
 #include "agent/domain.h"
+#include "agent/firm_bid.h"
 
 
 using namespace aicad::agent;
@@ -1128,4 +1129,325 @@ TEST_CASE("assembly_plausible gate: single-part skips probe, multi-part probes")
     CHECK_FALSE(plausible("M6 washer 12mm OD 1mm thick"));
     CHECK(plausible("two brackets that bolt together with M5"));
     CHECK(plausible("assemble the gearbox and add mates"));
+}
+
+// ---------------------------------------------------------------------------
+// Exec-mode semantics (advisor / delegate / peels / structure / budget)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("peel_request_advice extracts question and strips meta-ops") {
+    json ops = json::array({
+        json{{"op", "request_advice"}, {"question", "wall thickness?"}, {"context", "FDM"}},
+        json{{"op", "add_feature"}, {"feature", {{"type", "box"}}}},
+    });
+    AdviceRequest ar = peel_request_advice(ops);
+    CHECK(ar.had_request);
+    CHECK(ar.question == "wall thickness?");
+    CHECK(ar.context == "FDM");
+    REQUIRE(ar.remaining.is_array());
+    CHECK(ar.remaining.size() == 1);
+    CHECK(ar.remaining[0]["op"] == "add_feature");
+}
+
+TEST_CASE("peel_delegate extracts task and why") {
+    json ops = json::array({
+        json{{"op", "delegate"}, {"task", "add mounting holes"}, {"why", "sub-scope"}},
+    });
+    DelegateRequest dr = peel_delegate(ops);
+    CHECK(dr.had_request);
+    CHECK(dr.task == "add mounting holes");
+    CHECK(dr.why == "sub-scope");
+    CHECK(dr.remaining.empty());
+}
+
+TEST_CASE("parse_advisor_plan_verdict approve revise escalate") {
+    {
+        auto v = parse_advisor_plan_verdict("```json\n{\"verdict\":\"approve\",\"note\":\"ok\"}\n```");
+        CHECK(v.ok);
+        CHECK(v.verdict == "approve");
+        CHECK(v.note == "ok");
+    }
+    {
+        auto v = parse_advisor_plan_verdict(
+            "{\"verdict\":\"revise\",\"note\":\"split the gearbox housing\"}");
+        CHECK(v.ok);
+        CHECK(v.verdict == "revise");
+        CHECK(v.note.find("gearbox") != std::string::npos);
+    }
+    {
+        auto v = parse_advisor_plan_verdict(
+            "{\"verdict\":\"escalate\",\"note\":\"pick aluminum or steel\"}");
+        CHECK(v.ok);
+        CHECK(v.verdict == "escalate");
+    }
+    {
+        // Unparseable → approve (do not block the run).
+        auto v = parse_advisor_plan_verdict("not json at all");
+        CHECK_FALSE(v.ok);
+        CHECK(v.verdict == "approve");
+    }
+}
+
+TEST_CASE("parse_advisor_advice confidence") {
+    auto a = parse_advisor_advice(
+        "```json\n{\"advice\":\"use 2mm walls\",\"confidence\":\"high\"}\n```");
+    CHECK(a.ok);
+    CHECK(a.advice == "use 2mm walls");
+    CHECK(a.confidence == "high");
+}
+
+TEST_CASE("execution_style_from_structure maps structure labels") {
+    CHECK(std::string(execution_style_from_structure("solo")) == "edit");
+    CHECK(std::string(execution_style_from_structure("subagent")) == "edit");
+    CHECK(std::string(execution_style_from_structure("dag")) == "swarm");
+    CHECK(std::string(execution_style_from_structure("company")) == "swarm");
+    // recommend_structure → style chain
+    auto solo = recommend_structure(Complexity::Solo);
+    CHECK(std::string(execution_style_from_structure(structure_label(solo))) == "edit");
+    auto complex = recommend_structure(Complexity::Complex, /*cross_discipline=*/false);
+    CHECK(std::string(execution_style_from_structure(structure_label(complex))) == "swarm");
+    auto company = recommend_structure(Complexity::Complex, /*cross_discipline=*/true);
+    CHECK(std::string(execution_style_from_structure(structure_label(company))) == "swarm");
+}
+
+TEST_CASE("run_machine advisor escalate returns plan_ready needs_user_decision") {
+    DesignState st;
+    st.request = "ambiguous mechanism";
+    st.execution_style = "edit";
+    st.plan = ojson{{"name", "Mech"},
+                    {"summary", "unclear"},
+                    {"parts", ojson::array({ojson{{"name", "body"},
+                                                  {"purpose", "main"},
+                                                  {"dimensions", ojson::object()},
+                                                  {"features", ojson::array()}}})}};
+
+    int model_n = 0;
+    StageActions actions = bare_pass_actions();
+    actions.plan = [&](DesignState& s, int) {
+        // Simulate advisor escalate after drafting (plan already on state).
+        (void)s;
+        StageOutcome o;
+        o.verdict = "fail";
+        o.reason = "pick aluminum or steel";
+        o.has_error = true;
+        o.error = "needs_user_decision";
+        o.parsed_ok = true;
+        return o;
+    };
+    actions.model = [&](DesignState&, int) {
+        ++model_n;
+        return pass_outcome();
+    };
+
+    std::vector<json> seen;
+    RunEvents events("adv-escalate-ut", [&](const json& ev) { seen.push_back(ev); });
+    json result = run_machine(st, actions, events,
+                              json{{"intake", 1}, {"plan", 1}, {"model", 1},
+                                   {"review", 1}, {"fix", 1}, {"memory", 1}});
+    CHECK(result["status"] == "plan_ready");
+    CHECK(result["stop_reason"] == "needs_user_decision");
+    CHECK(result.value("reason", std::string()) == "pick aluminum or steel");
+    CHECK(result.contains("plan"));
+    CHECK(result.value("execution_style", std::string()) == "edit");
+    CHECK(model_n == 0);  // must not proceed to model
+}
+
+TEST_CASE("run_machine advisor approve continues into model") {
+    DesignState st;
+    st.request = "bracket";
+    st.execution_style = "edit";
+    int model_n = 0;
+    StageActions actions = bare_pass_actions();
+    actions.plan = [](DesignState& s, int) {
+        s.plan = ojson{{"name", "Bracket"},
+                       {"summary", "ok"},
+                       {"parts", ojson::array({ojson{{"name", "body"},
+                                                     {"purpose", "main"},
+                                                     {"dimensions", ojson{{"l", 60}}},
+                                                     {"features", ojson::array()}}})}};
+        StageOutcome o;
+        o.verdict = "pass";
+        o.reason = "plan parsed (advisor approved)";
+        o.parsed_ok = true;
+        return o;
+    };
+    actions.model = [&](DesignState& s, int) {
+        ++model_n;
+        s.revision += 1;
+        s.tree_digest = "f1:box";
+        return pass_outcome("modeled");
+    };
+    RunEvents events("adv-approve-ut", nullptr);
+    json result = run_machine(st, actions, events,
+                              json{{"intake", 1}, {"plan", 1}, {"model", 1},
+                                   {"review", 1}, {"fix", 1}, {"memory", 1}});
+    CHECK(result["status"] == "done");
+    CHECK(model_n == 1);
+}
+
+TEST_CASE("run_machine advisor revise one pass then continue") {
+    // Pure seam: plan action does one internal revision then passes (mirrors run.cpp).
+    DesignState st;
+    st.request = "gearbox";
+    int plan_calls = 0;
+    int model_n = 0;
+    StageActions actions = bare_pass_actions();
+    actions.plan = [&](DesignState& s, int) {
+        ++plan_calls;
+        // First "draft"
+        s.plan = ojson{{"name", "Gearbox"},
+                       {"summary", "v1"},
+                       {"parts", ojson::array({ojson{{"name", "housing"},
+                                                     {"purpose", "case"},
+                                                     {"dimensions", ojson::object()},
+                                                     {"features", ojson::array()}}})}};
+        // Simulate revise → one rewrite → continue (no second review).
+        s.plan["summary"] = "v2 revised";
+        StageOutcome o;
+        o.verdict = "pass";
+        o.reason = "plan revised per advisor";
+        o.parsed_ok = true;
+        return o;
+    };
+    actions.model = [&](DesignState& s, int) {
+        ++model_n;
+        s.revision += 1;
+        s.tree_digest = "f1:box";
+        return pass_outcome();
+    };
+    RunEvents events("adv-revise-ut", nullptr);
+    json result = run_machine(st, actions, events,
+                              json{{"intake", 1}, {"plan", 1}, {"model", 1},
+                                   {"review", 1}, {"fix", 1}, {"memory", 1}});
+    CHECK(result["status"] == "done");
+    CHECK(plan_calls == 1);  // one plan stage invocation (revision is inside the Action)
+    CHECK(model_n == 1);
+    CHECK(st.plan["summary"] == "v2 revised");
+}
+
+TEST_CASE("request_advice peel cap is 3") {
+    // Pure counter seam mirroring run.cpp handle_request_advice.
+    DesignState st;
+    st.advisor_calls = 0;
+    constexpr int kCap = 3;
+    auto honor = [&](bool had) -> bool {
+        if (!had) return false;
+        if (st.advisor_calls >= kCap) return false;  // ignored
+        ++st.advisor_calls;
+        return true;
+    };
+    CHECK(honor(true));
+    CHECK(honor(true));
+    CHECK(honor(true));
+    CHECK_FALSE(honor(true));  // 4th ignored
+    CHECK(st.advisor_calls == 3);
+}
+
+TEST_CASE("delegate depth cap and Solo refusal") {
+    auto refuse = [](const DesignState& st, const std::string& mode) -> std::string {
+        const bool mode_ok = mode.empty() || mode == "edit" || mode == "plan" || mode == "agent";
+        if (!mode_ok) return "mode";
+        if (st.complexity_set && st.complexity == Complexity::Solo) return "solo";
+        if (st.is_sub_run || st.run_depth >= 2) return "depth";
+        return "";
+    };
+    DesignState solo;
+    solo.complexity = Complexity::Solo;
+    solo.complexity_set = true;
+    CHECK(refuse(solo, "edit") == "solo");
+
+    DesignState deep;
+    deep.complexity = Complexity::Standard;
+    deep.complexity_set = true;
+    deep.run_depth = 2;
+    CHECK(refuse(deep, "agent") == "depth");
+
+    DesignState sub;
+    sub.complexity = Complexity::Standard;
+    sub.complexity_set = true;
+    sub.is_sub_run = true;
+    CHECK(refuse(sub, "agent") == "depth");
+
+    DesignState ok;
+    ok.complexity = Complexity::Standard;
+    ok.complexity_set = true;
+    ok.run_depth = 0;
+    CHECK(refuse(ok, "agent").empty());
+    CHECK(refuse(ok, "swarm") == "mode");
+}
+
+TEST_CASE("swarm plan gate requires approved_plan or advisor path") {
+    // Pure contract: mode swarm/eng_firm without approved_plan must NOT jump to execution.
+    auto needs_gate = [](const std::string& mode, bool has_ap) {
+        const bool style_gate = (mode == "swarm" || mode == "eng_firm");
+        return style_gate && !has_ap;
+    };
+    CHECK(needs_gate("swarm", false));
+    CHECK(needs_gate("eng_firm", false));
+    CHECK_FALSE(needs_gate("swarm", true));
+    CHECK_FALSE(needs_gate("agent", false));
+    CHECK_FALSE(needs_gate("edit", false));
+}
+
+TEST_CASE("eng_firm budget_exceeded abort condition") {
+    // Meter: spent accumulates per-task bid; abort when spent > budget.
+    double budget = 10.0;
+    double spent = 0.0;
+    std::vector<double> bids = {4.0, 4.0, 4.0};  // third exceeds
+    int completed = 0;
+    bool exceeded = false;
+    for (double b : bids) {
+        if (exceeded) break;
+        spent += b;
+        ++completed;
+        if (budget > 0.0 && spent > budget + 1e-9) exceeded = true;
+    }
+    CHECK(exceeded);
+    CHECK(completed == 3);          // third task ran then tripped
+    CHECK(spent > budget);
+    // Remaining tasks would be abandoned (not run).
+    int remaining = static_cast<int>(bids.size()) - completed;
+    CHECK(remaining == 0);
+    // With a tighter budget the third never starts:
+    budget = 7.0;
+    spent = 0.0;
+    completed = 0;
+    exceeded = false;
+    int abandoned = 0;
+    for (double b : bids) {
+        if (exceeded) {
+            ++abandoned;
+            continue;
+        }
+        spent += b;
+        ++completed;
+        if (budget > 0.0 && spent > budget + 1e-9) exceeded = true;
+    }
+    CHECK(exceeded);
+    CHECK(completed == 2);
+    CHECK(abandoned == 1);
+}
+
+TEST_CASE("plan_state mission ids use mission: namespace") {
+    json tasks = json::array({json{{"capability", "design"}, {"title", "Build"}}});
+    json items = plan_state_items_from_mission(tasks, "Mission");
+    REQUIRE(items.size() == 1);
+    CHECK(items[0]["id"] == "mission:0");
+}
+
+TEST_CASE("mode override forces execution_style over recommend_structure") {
+    // Mirrors run.cpp: explicit swarm/eng_firm overrides recommendation.
+    auto resolve = [](Complexity cx, const std::string& mode) {
+        ExecStructure rec = recommend_structure(cx, false);
+        std::string style = execution_style_from_structure(structure_label(rec));
+        if (mode == "swarm") style = "swarm";
+        else if (mode == "eng_firm") style = "eng_firm";
+        else if (mode == "edit") style = "edit";
+        return style;
+    };
+    // Solo would recommend edit, but mode=swarm forces swarm.
+    CHECK(resolve(Complexity::Solo, "swarm") == "swarm");
+    CHECK(resolve(Complexity::Solo, "eng_firm") == "eng_firm");
+    CHECK(resolve(Complexity::Complex, "edit") == "edit");
+    CHECK(resolve(Complexity::Solo, "") == "edit");
 }

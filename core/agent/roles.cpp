@@ -23,7 +23,7 @@ namespace agent {
 
 const std::vector<std::string> kRoles = {
     "intake", "planner", "modeler", "reviewer", "fixer", "memory",
-    "decomposer", "executor", "mission_planner", "reporter"};
+    "decomposer", "executor", "mission_planner", "reporter", "advisor"};
 
 namespace {
 

@@ -52,6 +52,49 @@ struct ToolScopeRequest {
 };
 ToolScopeRequest peel_request_tools(const json& ops);
 
+// Peel leading/sole request_advice meta-ops (never sent to doc_apply_ops):
+//   {"op":"request_advice","question":"...","context":"..."?}
+// `remaining` strips every request_advice entry. First non-empty question wins.
+struct AdviceRequest {
+    std::string question;
+    std::string context;   // optional free-form context from the model
+    bool had_request = false;
+    json remaining = json::array();
+};
+AdviceRequest peel_request_advice(const json& ops);
+
+// Peel leading/sole delegate meta-ops (never sent to doc_apply_ops):
+//   {"op":"delegate","task":"...","why":"..."?}
+// First non-empty task wins. Cap/mode refusal is the caller's job.
+struct DelegateRequest {
+    std::string task;
+    std::string why;
+    bool had_request = false;
+    json remaining = json::array();
+};
+DelegateRequest peel_delegate(const json& ops);
+
+// Parse advisor role JSON from a model reply (fenced or bare object).
+struct AdvisorAdvice {
+    std::string advice;
+    std::string confidence;  // "high"|"med"|"low" (empty if absent)
+    bool ok = false;         // true when advice non-empty
+};
+AdvisorAdvice parse_advisor_advice(const std::string& reply);
+
+struct AdvisorPlanVerdict {
+    std::string verdict;     // "approve"|"revise"|"escalate" (default approve if unparseable)
+    std::string note;
+    std::string confidence;
+    bool ok = false;         // true when a recognized verdict was present
+};
+AdvisorPlanVerdict parse_advisor_plan_verdict(const std::string& reply);
+
+// Map complexity structure → copilot execution_style ("edit"|"swarm").
+// eng_firm is never recommended — only set by explicit mode.
+// Solo/Subagent → edit; Dag/Company → swarm.
+const char* execution_style_from_structure(const char* structure_label);
+
 // True if the reply carries a {"revert": true} verdict (fenced or bare {..}).
 bool extract_revert(const std::string& reply);
 

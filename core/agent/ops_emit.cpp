@@ -12,6 +12,7 @@
 #include "agent/ops_emit.h"
 
 #include <cctype>
+#include <cstring>
 #include <set>
 #include <vector>
 
@@ -300,6 +301,160 @@ ToolScopeRequest peel_request_tools(const json& ops) {
         }
     }
     return out;
+}
+
+AdviceRequest peel_request_advice(const json& ops) {
+    AdviceRequest out;
+    if (!ops.is_array()) {
+        out.remaining = ops;
+        return out;
+    }
+    for (const auto& op : ops) {
+        if (!op.is_object()) {
+            out.remaining.push_back(op);
+            continue;
+        }
+        const std::string name = op.value("op", std::string());
+        if (name != "request_advice") {
+            out.remaining.push_back(op);
+            continue;
+        }
+        out.had_request = true;
+        if (out.question.empty()) {
+            if (op.contains("question") && op["question"].is_string())
+                out.question = op["question"].get<std::string>();
+            else if (op.contains("q") && op["q"].is_string())
+                out.question = op["q"].get<std::string>();
+            if (op.contains("context") && op["context"].is_string())
+                out.context = op["context"].get<std::string>();
+        }
+    }
+    return out;
+}
+
+DelegateRequest peel_delegate(const json& ops) {
+    DelegateRequest out;
+    if (!ops.is_array()) {
+        out.remaining = ops;
+        return out;
+    }
+    for (const auto& op : ops) {
+        if (!op.is_object()) {
+            out.remaining.push_back(op);
+            continue;
+        }
+        const std::string name = op.value("op", std::string());
+        if (name != "delegate") {
+            out.remaining.push_back(op);
+            continue;
+        }
+        out.had_request = true;
+        if (out.task.empty()) {
+            if (op.contains("task") && op["task"].is_string())
+                out.task = op["task"].get<std::string>();
+            else if (op.contains("request") && op["request"].is_string())
+                out.task = op["request"].get<std::string>();
+            if (op.contains("why") && op["why"].is_string())
+                out.why = op["why"].get<std::string>();
+        }
+    }
+    return out;
+}
+
+namespace {
+
+// First fenced/bare JSON object from a reply (advisor payloads are objects).
+std::optional<json> first_json_object(const std::string& reply) {
+    FenceSpec json_spec;
+    json_spec.tags = {"json", "JSON"};
+    for (const std::string& body : find_fenced_bodies(reply, json_spec)) {
+        auto data = try_load(py_strip(body));
+        if (data && data->is_object()) return data;
+    }
+    FenceSpec any_spec;
+    any_spec.any_tag = true;
+    for (const std::string& body : find_fenced_bodies(reply, any_spec)) {
+        auto data = try_load(py_strip(body));
+        if (data && data->is_object()) return data;
+    }
+    auto obj = first_balanced(reply, '{', '}');
+    if (obj) {
+        auto data = try_load(*obj);
+        if (data && data->is_object()) return data;
+    }
+    return std::nullopt;
+}
+
+std::string lower_ascii(std::string s) {
+    for (char& c : s) {
+        unsigned char u = static_cast<unsigned char>(c);
+        if (u >= 'A' && u <= 'Z') c = static_cast<char>(u - 'A' + 'a');
+    }
+    return s;
+}
+
+}  // namespace
+
+AdvisorAdvice parse_advisor_advice(const std::string& reply) {
+    AdvisorAdvice out;
+    auto data = first_json_object(reply);
+    if (!data) return out;
+    if ((*data).contains("advice") && (*data)["advice"].is_string())
+        out.advice = (*data)["advice"].get<std::string>();
+    else if ((*data).contains("note") && (*data)["note"].is_string() &&
+             !(*data).contains("verdict"))
+        out.advice = (*data)["note"].get<std::string>();
+    if ((*data).contains("confidence") && (*data)["confidence"].is_string())
+        out.confidence = lower_ascii((*data)["confidence"].get<std::string>());
+    out.ok = !out.advice.empty();
+    return out;
+}
+
+AdvisorPlanVerdict parse_advisor_plan_verdict(const std::string& reply) {
+    AdvisorPlanVerdict out;
+    auto data = first_json_object(reply);
+    if (!data) {
+        // Unparseable → approve (do not block the run on a bad advisor reply).
+        out.verdict = "approve";
+        out.note = "advisor reply unparseable; continuing";
+        return out;
+    }
+    std::string v;
+    if ((*data).contains("verdict") && (*data)["verdict"].is_string())
+        v = lower_ascii((*data)["verdict"].get<std::string>());
+    else if ((*data).contains("decision") && (*data)["decision"].is_string())
+        v = lower_ascii((*data)["decision"].get<std::string>());
+    if (v == "approve" || v == "approved" || v == "ok" || v == "pass") {
+        out.verdict = "approve";
+        out.ok = true;
+    } else if (v == "revise" || v == "revision" || v == "reject" || v == "retry") {
+        out.verdict = "revise";
+        out.ok = true;
+    } else if (v == "escalate" || v == "escalation" || v == "user" || v == "human") {
+        out.verdict = "escalate";
+        out.ok = true;
+    } else {
+        out.verdict = "approve";
+        out.note = "unrecognized verdict; continuing";
+        return out;
+    }
+    if ((*data).contains("note") && (*data)["note"].is_string())
+        out.note = (*data)["note"].get<std::string>();
+    else if ((*data).contains("reason") && (*data)["reason"].is_string())
+        out.note = (*data)["reason"].get<std::string>();
+    else if ((*data).contains("advice") && (*data)["advice"].is_string())
+        out.note = (*data)["advice"].get<std::string>();
+    if ((*data).contains("confidence") && (*data)["confidence"].is_string())
+        out.confidence = lower_ascii((*data)["confidence"].get<std::string>());
+    return out;
+}
+
+const char* execution_style_from_structure(const char* structure_lab) {
+    if (!structure_lab) return "edit";
+    // solo/subagent → edit; dag/company → swarm. eng_firm never recommended.
+    if (std::strcmp(structure_lab, "dag") == 0 || std::strcmp(structure_lab, "company") == 0)
+        return "swarm";
+    return "edit";
 }
 
 bool extract_revert(const std::string& reply) {

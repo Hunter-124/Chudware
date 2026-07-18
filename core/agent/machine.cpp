@@ -199,6 +199,9 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
     bool last_was_free_retry = false;
     // Intake explicit reject (verdict=fail + error=unintelligible_request).
     bool last_was_unintelligible = false;
+    // Plan-stage advisor escalate (verdict=fail + error=needs_user_decision).
+    bool last_was_needs_user_decision = false;
+    std::string last_escalate_note;
     // Run-level provider error (MODEL stage terminal) — returned as stop_reason.
     std::string run_provider_error;
 
@@ -243,6 +246,10 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
         emit_call_events(events, stage, role, attempt, outcome);
         last_was_unintelligible =
             outcome.has_error && outcome.error == "unintelligible_request";
+        if (outcome.has_error && outcome.error == "needs_user_decision") {
+            last_was_needs_user_decision = true;
+            last_escalate_note = outcome.reason;
+        }
 
         if (outcome.has_error && !outcome.free_retry) {
             int streak = state.ledger.note_sig(stage, err_sig(outcome.error));
@@ -330,6 +337,8 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
         last_was_parse_error = false;
         last_was_free_retry = false;
         last_was_unintelligible = false;
+        last_was_needs_user_decision = false;
+        last_escalate_note.clear();
         if (budget <= 0) return "skip";
         int free_retries = 0;
         constexpr int kMaxFreeRetries = 4;  // full_ops + 3 domain classes
@@ -419,6 +428,26 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
                        {"stop_reason", "provider_error"},
                        {"error_detail", detail},
                        {"error_human", humanize_provider_error(detail)}};
+        }
+        // Advisor escalate during plan review: surface plan_ready for the host approve card.
+        // The plan Action stamps error=needs_user_decision and leaves state.plan intact.
+        if (plan_v == "fail" && last_was_needs_user_decision) {
+            json out = json{{"status", "plan_ready"},
+                           {"stop_reason", "needs_user_decision"},
+                           {"reason", last_escalate_note}};
+            if (!state.plan.is_null() && state.plan.is_object()) out["plan"] = state.plan;
+            if (!state.execution_style.empty()) out["execution_style"] = state.execution_style;
+            // Still emit plan_state so the host Plan section has content.
+            if (!state.plan.is_null() && state.plan.is_object() && state.plan.contains("parts") &&
+                state.plan["parts"].is_array() && !state.plan["parts"].empty()) {
+                json plan_j = state.plan;
+                std::string title, summary;
+                plan_display_meta(state.plan, title, summary);
+                json part_items = plan_state_items_from_build_plan(plan_j, "pending");
+                emit_plan_state(events, "build_plan", title, summary, /*revision=*/1, part_items);
+                events.emit("plan", json{{"plan", plan_j}, {"title", title}, {"summary", summary}});
+            }
+            return out;
         }
         // After a successful plan stage, surface plan_state(build_plan) so the copilot
         // Plan section fills on the default C++ path (Python already emits kind:plan).

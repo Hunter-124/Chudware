@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <mutex>
 #include <map>
 #include <set>
 #include <string>
@@ -209,6 +210,48 @@ void handleEvent(AppState& st, const json& evt) {
     const json& d = evt.contains("data") && evt["data"].is_object() ? evt["data"]
                                                                     : json::object();
     const std::string docId = d.value("doc_id", std::string());
+
+    // Live agent-run streaming (daemon mode): hostd pushes each emitted run event as
+    // {"event":"agent.event","data":<ev>}. Route it into the active job's event queue with the
+    // same "orch_" prefix launchAgentRunV2's in-proc onEvent uses, so the app.cpp drain renders
+    // the timeline LIVE (classifier decision, stages, assistant_delta, model I/O) instead of a
+    // frozen "Classifying request…" box until the batched result.
+    if (name == "agent.event") {
+        AgentEvent e;
+        const std::string origKind = d.value("kind", std::string());
+        e.kind = "orch_" + origKind;
+        e.text = d.dump();
+        const std::string stage = d.value("stage", std::string());
+        const std::string role = d.value("role", std::string());
+        if (origKind == "stage_started") {
+            e.notes = stage + " > " + role + " attempt " +
+                      std::to_string(d.value("attempt", 0) + 1) + "...";
+        } else if (origKind == "run_finished") {
+            e.notes = "run " + d.value("status", std::string());
+            const std::string sr = d.value("stop_reason", std::string());
+            std::string ed = d.value("error_detail", std::string());
+            if (ed.empty()) ed = d.value("error", std::string());
+            if (ed.empty()) ed = d.value("error_human", std::string());
+            if (!sr.empty() || !ed.empty()) {
+                std::lock_guard<std::mutex> jlk(st.job.mtx);
+                if (!sr.empty() && st.job.stopReason.empty()) st.job.stopReason = sr;
+                if (!ed.empty() && st.job.errorDetail.empty()) st.job.errorDetail = ed;
+            }
+        } else if (origKind == "provider_call") {
+            const std::string prov = d.value("provider", std::string());
+            const std::string model = d.value("model", std::string());
+            const int http = d.value("http_status", 0);
+            const int lat = d.value("latency_ms", 0);
+            e.notes = prov + " \xc2\xb7 " + model +
+                      (http > 0 ? " HTTP " + std::to_string(http) : std::string(" transport")) +
+                      " " + std::to_string(lat) + "ms";
+        }
+        {
+            std::lock_guard<std::mutex> lk(st.job.evMtx);
+            st.job.events.push_back(std::move(e));
+        }
+        return;
+    }
 
     if (name == "doc.opened") {
         if (!docId.empty()) openMirrorTab(st, docId);

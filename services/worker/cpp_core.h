@@ -45,6 +45,15 @@ public:
     bool call(const std::string& method, const nlohmann::json& params,
               nlohmann::json& result, std::string& err);
 
+    // Live event streaming (transparency): register a THREAD-LOCAL callback the core invokes
+    // with each agent-run event's JSON (UTF-8) as it is emitted. Call with cb=nullptr to clear.
+    // No-op if the loaded engine predates the aicad_set_event_sink export. Set on the SAME
+    // thread that then calls call() for an agent_* method.
+    void setEventSink(void (*cb)(const char* event_json, void* ud), void* ud);
+    // True iff the loaded engine exports aicad_set_event_sink (live streaming supported).
+    // Callers use this to decide whether live events will fire (else fall back to batched).
+    bool hasEventSink();
+
 private:
     std::mutex mtx_;
     bool tried_ = false;
@@ -56,6 +65,7 @@ private:
     int (*call_)(const char*, const char*, char**) = nullptr;
     void (*free_)(char*) = nullptr;
     const char* (*abi_fn_)(void) = nullptr;
+    void (*set_event_sink_)(void (*)(const char*, void*), void*) = nullptr;  // optional export
 };
 
 // Process-wide singleton. The diagnostic seam is dev-only and gated behind an env

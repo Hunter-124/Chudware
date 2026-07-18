@@ -535,6 +535,20 @@ AICAD_API const char* aicad_build_id(void) { return AICAD_HOSTD_BUILD_ID; }
 
 AICAD_API void aicad_free(char* s) { std::free(s); }
 
+// Live event streaming: bridge the flat C callback to the core's thread-local run-event sink
+// (agent::set_stream_event_sink). Called on the host/daemon dispatch thread right before an
+// agent_* aicad_call so run events surface AS THEY HAPPEN; cleared (cb=NULL) right after.
+AICAD_API void aicad_set_event_sink(void (*cb)(const char* event_json, void* ud), void* ud) {
+    if (cb) {
+        aicad::agent::set_stream_event_sink([cb, ud](const nlohmann::json& ev) {
+            const std::string s = ev.dump();
+            cb(s.c_str(), ud);
+        });
+    } else {
+        aicad::agent::set_stream_event_sink({});
+    }
+}
+
 // ---- CAM program recipe (deterministic, request-aware, no LLM) ------------------
 // Build a complete CAM machining JOB from the CURRENT PART and post it to G-code,
 // reusing the exact cam_* engine the GUI and MCP drive. This is the offline "make me a

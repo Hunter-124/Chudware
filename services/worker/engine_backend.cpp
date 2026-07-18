@@ -168,17 +168,18 @@ aicad_ipc::EngineClient* client() {
 // Inner dispatch: daemon socket round-trip (with loading-wait and ro-upgrade retries) or
 // the in-process DLL call. Split out so the doc_activate compat shim below can re-enter.
 static bool callDispatch(const std::string& method, const json& params, json& result,
-                         std::string& err, int timeoutMs) {
+                         std::string& err, int timeoutMs,
+                         const std::function<void(const json&)>& onEvent) {
     // timeoutMs only bounds the daemon round trip; the in-process DLL call is
     // synchronous and can't be interrupted (matches the pre-daemon behavior).
     if (!daemonMode()) return core::cpp_core().call(method, params, result, err);
-    bool ok = g_client->call(method, params, result, err, timeoutMs);
+    bool ok = g_client->call(method, params, result, err, timeoutMs, onEvent);
     if (!ok && result.is_object()) {
         const std::string code = result.value("code", std::string());
         if (code == "loading") {
             std::string werr;
             if (waitEngineReady(*g_client, werr))
-                ok = g_client->call(method, params, result, err, timeoutMs);
+                ok = g_client->call(method, params, result, err, timeoutMs, onEvent);
             else if (err.empty())
                 err = werr;
         } else if (code == "read_only" && params.is_object() && params.contains("doc_id")) {
@@ -196,8 +197,8 @@ static bool callDispatch(const std::string& method, const json& params, json& re
 }
 
 bool call(const std::string& method, const json& params, json& result, std::string& err,
-          int timeoutMs) {
-    bool ok = callDispatch(method, params, result, err, timeoutMs);
+          int timeoutMs, const std::function<void(const json&)>& onEvent) {
+    bool ok = callDispatch(method, params, result, err, timeoutMs, onEvent);
     // Compat shim: doc_activate (cheap tab-switch activation, cached-serve) is served by
     // this tree's engine, but a long-lived hostd daemon may predate it. On "unknown
     // method" fall back ONCE to the historical forced doc_rebuild — identical response
@@ -209,7 +210,7 @@ bool call(const std::string& method, const json& params, json& result, std::stri
                                         .find("unknown method") != std::string::npos);
         if (unknown) {
             err.clear();
-            ok = callDispatch("doc_rebuild", params, result, err, timeoutMs);
+            ok = callDispatch("doc_rebuild", params, result, err, timeoutMs, {});
         }
     }
     return ok;

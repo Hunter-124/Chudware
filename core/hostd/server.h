@@ -100,6 +100,11 @@ private:
     bool gcCloseDoc(const std::string& docId, const char* reason = "gc");
     void sendEventTo(int clientId, const std::string& line);
     void sendEventToAll(const std::string& line);
+    // Live agent-event streaming (transparency): push one emitted run event to a client as a
+    // {"event":"agent.event","data":<ev>} notification. streamThunk is the C sink registered
+    // with the engine (aicad_set_event_sink); its `ud` is a StreamCtx{this, clientId}.
+    void sendAgentEvent(int clientId, const char* eventJson);
+    static void streamThunk(const char* eventJson, void* ud);
 
     aicad_ipc::IpcListener listener_;
     std::string buildId_;

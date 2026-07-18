@@ -30,6 +30,58 @@ using nlohmann::json;
 
 namespace {
 
+// In-process live event streaming (desktop InProcCore path): bridge cpp_core's thread-local C
+// event sink to the current call's EventFn so agent-run events reach the Copilot/timeline AS THEY
+// HAPPEN instead of a batched replay after the (multi-minute) run. Daemon mode streams via hostd's
+// agent.event push (engine_events) instead, so this in-proc sink is used only when !daemonMode().
+thread_local WorkerClient::EventFn t_inproc_event_sink;
+void inprocEventThunk(const char* ev_json, void*) {
+    if (!t_inproc_event_sink || !ev_json) return;
+    try {
+        t_inproc_event_sink(nlohmann::json::parse(ev_json));
+    } catch (...) {
+    }
+}
+// Run an in-process agent engine::call with live streaming to onEvent. `streamedLive` reports
+// whether events fired live (so the caller skips the batched replay to avoid doubles). RAII-clears
+// the sink even if engine::call throws.
+bool callAgentStreaming(const std::string& coreMethod, const json& p, json& cppResult,
+                        std::string& cerr, int timeoutMs, const WorkerClient::EventFn& onEvent,
+                        bool& streamedLive) {
+    if (engine::daemonMode()) {
+        // Daemon: hostd pushes {"event":"agent.event","data":<ev>}; engine::call fires our router
+        // LIVE (mid-call, on this worker thread) for each. `fired` tells us whether the daemon
+        // actually streamed (a same-build daemon does) so an OLD daemon that only returns the
+        // batched result["events"] still falls back to the caller's replay.
+        bool fired = false;
+        auto router = [&](const json& evt) {
+            if (onEvent && evt.is_object() && evt.contains("data") && evt["data"].is_object()) {
+                fired = true;
+                onEvent(evt["data"]);
+            }
+        };
+        bool ok = engine::call(coreMethod, p, cppResult, cerr, timeoutMs, router);
+        streamedLive = fired;
+        return ok;
+    }
+    // In-process: the cpp_core thread-local sink fires each event live -> onEvent.
+    streamedLive = static_cast<bool>(onEvent) && core::cpp_core().hasEventSink();
+    struct Guard {
+        bool on;
+        ~Guard() {
+            if (on) {
+                core::cpp_core().setEventSink(nullptr, nullptr);
+                t_inproc_event_sink = {};
+            }
+        }
+    } guard{streamedLive};
+    if (streamedLive) {
+        t_inproc_event_sink = onEvent;
+        core::cpp_core().setEventSink(&inprocEventThunk, nullptr);
+    }
+    return engine::call(coreMethod, p, cppResult, cerr, timeoutMs);
+}
+
 // --- P16: per-document cutover routing to the pure-C++ core (libaicad) -------
 // Opt-in via env AI_CAD_CPP_DOCS (non-empty, not "0"). A document CREATED in the C++
 // core gets a "doc-cpp..." id, so every subsequent doc_* call carrying that id routes
@@ -635,11 +687,14 @@ bool WorkerClient::callImpl(const std::string& method, const json& params, json&
                 }
             }
             if (!options.empty()) p["options"] = options;
-            ok = engine::call("agent_run", p, cppResult, cerr, timeoutMs);
-            // Replay captured events through onEvent so the Copilot/Activity pane updates.
-            // (Batched after the run for this opt-in v1 — live streaming is a later step.)
-            if (ok && onEvent && cppResult.is_object() && cppResult.contains("events") &&
-                cppResult["events"].is_array()) {
+            bool streamedLive = false;
+            ok = callAgentStreaming("agent_run", p, cppResult, cerr, timeoutMs, onEvent,
+                                    streamedLive);
+            // Batched replay ONLY when events did NOT stream live (old engine w/o the sink export).
+            // When streamedLive, onEvent already fired per-event during the run — replaying the
+            // batched cppResult["events"] would double every card.
+            if (!streamedLive && ok && onEvent && cppResult.is_object() &&
+                cppResult.contains("events") && cppResult["events"].is_array()) {
                 for (const auto& ev : cppResult["events"]) onEvent(ev);
             }
         } else if (method == "agent_mission_v1") {
@@ -661,11 +716,11 @@ bool WorkerClient::callImpl(const std::string& method, const json& params, json&
                 }
             }
             if (!options.empty()) p["options"] = options;
-            ok = engine::call("agent_mission_v1", p, cppResult, cerr, timeoutMs);
-            // Replay captured events (mission_* + sub-run stage events) — batched after the run
-            // for this opt-in v1, exactly like agent_run_v2.
-            if (ok && onEvent && cppResult.is_object() && cppResult.contains("events") &&
-                cppResult["events"].is_array()) {
+            bool streamedLive = false;
+            ok = callAgentStreaming("agent_mission_v1", p, cppResult, cerr, timeoutMs, onEvent,
+                                    streamedLive);
+            if (!streamedLive && ok && onEvent && cppResult.is_object() &&
+                cppResult.contains("events") && cppResult["events"].is_array()) {
                 for (const auto& ev : cppResult["events"]) onEvent(ev);
             }
         } else if (method == "agent_ask_v2") {

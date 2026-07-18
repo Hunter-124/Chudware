@@ -128,6 +128,9 @@ path_ = winner;
 // build id, surfaced by hostd as engine_build_id for staleness checks.
 if (auto bid = reinterpret_cast<const char* (*)(void)>(dlsym(h, "aicad_build_id")))
     build_id_ = bid();
+// Optional streaming export (older engines predate it): resolved best-effort, no-op if absent.
+set_event_sink_ = reinterpret_cast<void (*)(void (*)(const char*, void*), void*)>(
+    dlsym(h, "aicad_set_event_sink"));
 loaded_ = true;
 // One-shot startup diagnostic: which lib actually serves in-proc agent runs.
 std::fprintf(stderr,
@@ -224,6 +227,9 @@ return true;
     if (auto bid = reinterpret_cast<const char* (*)(void)>(
             GetProcAddress(h, "aicad_build_id")))
         build_id_ = bid();
+    // Optional streaming export (older engines predate it): resolved best-effort.
+    set_event_sink_ = reinterpret_cast<void (*)(void (*)(const char*, void*), void*)>(
+        GetProcAddress(h, "aicad_set_event_sink"));
     loaded_ = true;
     return true;
 #endif
@@ -255,6 +261,17 @@ bool CppCore::call(const std::string& method, const nlohmann::json& params,
         return false;
     }
     return true;
+}
+
+void CppCore::setEventSink(void (*cb)(const char* event_json, void* ud), void* ud) {
+    std::string e;
+    if (!ensureLoaded(e)) return;
+    if (set_event_sink_) set_event_sink_(cb, ud);
+}
+
+bool CppCore::hasEventSink() {
+    std::string e;
+    return ensureLoaded(e) && set_event_sink_ != nullptr;
 }
 
 CppCore& cpp_core() {

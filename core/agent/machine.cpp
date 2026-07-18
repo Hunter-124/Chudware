@@ -151,6 +151,7 @@ void emit_call_events(RunEvents& events, const std::string& stage, const std::st
     out["role"] = role;
     out["attempt"] = attempt;
     out["raw"] = cap_raw(o.raw);
+    out["sent"] = o.sent;
     out["raw_path"] = sidecar;
     out["parsed_ok"] = o.parsed_ok;
     out["parse_error"] = o.has_parse_error ? json(o.parse_error) : json(nullptr);

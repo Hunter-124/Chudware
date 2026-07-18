@@ -459,6 +459,15 @@ RunEvents::RunEvents(const std::string& run_id) : run_id_(run_id) {
     // (best-effort; ignore failure to match Python's try/except pass)
 }
 
+// Thread-local live-stream sink (see events.h). Thread-local so concurrent runs on different
+// daemon dispatch threads never cross streams.
+namespace {
+thread_local std::function<void(const json&)> t_stream_sink;
+}
+void set_stream_event_sink(std::function<void(const json&)> sink) {
+    t_stream_sink = std::move(sink);
+}
+
 RunEvents::RunEvents(const std::string& run_id, Callback cb)
     : run_id_(run_id), cb_(std::move(cb)) {
     dir_ = run_dir(run_id);
@@ -482,6 +491,13 @@ json RunEvents::emit(const std::string& kind, const json& data) {
             cb_(ev);
         } catch (...) {
             // match Python try/except pass — a sink failure never breaks the run.
+        }
+    }
+    if (t_stream_sink) {
+        try {
+            t_stream_sink(ev);
+        } catch (...) {
+            // a streaming-sink failure never breaks the run (same contract as cb_).
         }
     }
     return ev;

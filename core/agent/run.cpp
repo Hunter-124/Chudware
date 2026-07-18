@@ -238,6 +238,7 @@ std::string fallback_part_name(const std::string& request) {
 // A reply + duration + meta, exactly like run.py _agent_call returns.
 struct AgentCall {
     std::string reply;
+    std::string sent_prompt;  // exact system+user prompt sent to the model (capped)
     std::string thinking;
     std::string model;
     int duration_ms = 0;
@@ -316,6 +317,13 @@ AgentCall agent_call(const ProviderFn& provider, const DesignState& state, const
     // so the context + the parity gate are unchanged). Used by cad_sequence_mode to nudge the
     // modeler toward an editable parametric feature sequence.
     std::string body = extra_directive.empty() ? bc.body : (bc.body + "\n\n" + extra_directive);
+
+    // Capture the exact prompt text for agent_output transparency (capped ~4k).
+    ac.sent_prompt = system + "\n\n" + body;
+    if (ac.sent_prompt.size() > 4000) {
+        ac.sent_prompt.resize(4000);
+        ac.sent_prompt += "\n\u2026[truncated]";
+    }
 
     // Vision: when the provider supports images and a render of the current model exists,
     // attach it so the model can SEE the geometry (reviewer/fixer self-correction).
@@ -743,6 +751,7 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         o.duration_ms = ac.duration_ms;
         o.thinking = ac.thinking;
         o.model = ac.model;
+        o.sent = ac.sent_prompt;
     };
 
     // _apply(ops): doc_apply_ops at state.revision; update rev + tree; collect status errors.
@@ -1057,6 +1066,11 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         o.model = rep.model;
         std::string reply = rep.has_error ? std::string() : rep.text;
         o.raw = reply;
+        o.sent = bc.system + "\n\n" + bc.body;
+        if (o.sent.size() > 4000) {
+            o.sent.resize(4000);
+            o.sent += "\n\u2026[truncated]";
+        }
         ojson verdict = extract_json_obj(reply);
         if (verdict.is_null()) {
             o.verdict = "retry";

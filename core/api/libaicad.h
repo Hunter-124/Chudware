@@ -56,6 +56,13 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
 // Release a string previously returned by aicad_call's out_json.
 AICAD_API void aicad_free(char* s);
 
+// Live event streaming (transparency). Register a THREAD-LOCAL callback the core invokes with
+// each agent-run event's JSON (null-terminated UTF-8) synchronously as it is emitted, so a host
+// can surface the run live instead of only the batched result["events"]. The string is owned by
+// the core and valid only for the duration of the call — copy it if you keep it. Pass cb=NULL to
+// clear. `ud` is passed back verbatim. Set on the SAME thread that will call aicad_call.
+AICAD_API void aicad_set_event_sink(void (*cb)(const char* event_json, void* ud), void* ud);
+
 // A monotonically-increasing ABI version string (e.g. "1"). Lets the host detect
 // a stale/incompatible libaicad.dll before routing real calls to it.
 AICAD_API const char* aicad_abi_version(void);

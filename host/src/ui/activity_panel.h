@@ -37,6 +37,8 @@ private:
         std::string promptFile;
         int contextChars = 0;
         int contextTokensEst = 0;
+        std::string sentPrompt;  // exact system+user prompt sent to the model (agent_output.sent)
+        std::string reply;       // raw model reply text (agent_output.raw)
         int durationMs = 0;
         std::string verdict;   // "pass" | "retry" | "fail" | "skip" | ""
         std::string reason;

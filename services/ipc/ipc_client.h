@@ -13,6 +13,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -53,8 +54,13 @@ public:
     // timeout is a transport failure (false, err only, no {code} in result) and
     // invalidates the connection (the response is still in flight on the wire) —
     // the next call() reconnects, mirroring daemon_bridge.py's reconnect-on-EOF.
+    // `onEvent`, when set, is invoked LIVE (on the calling thread, mid-call) for each
+    // {"event":"agent.event",...} push that arrives while awaiting the response — so a blocking
+    // agent run streams its events instead of buffering them until the call returns. Other event
+    // kinds (doc.*) still queue for drainEvents(). Empty = today's buffer-only behavior.
     bool call(const std::string& method, const nlohmann::json& params,
-              nlohmann::json& result, std::string& err, int timeoutMs = -1);
+              nlohmann::json& result, std::string& err, int timeoutMs = -1,
+              const std::function<void(const nlohmann::json&)>& onEvent = {});
 
     // Move any queued push events out (non-blocking; also polls the socket).
     std::vector<nlohmann::json> drainEvents();
@@ -108,7 +114,8 @@ private:
     // Read lines until a response with `id` arrives; queue event lines seen on
     // the way. timeoutMs bounds the whole wait; on timeout the connection is
     // closed (mid-response, unusable) and false/err returned.
-    bool readResponse(int id, nlohmann::json& out, std::string& err, int timeoutMs);
+    bool readResponse(int id, nlohmann::json& out, std::string& err, int timeoutMs,
+                      const std::function<void(const nlohmann::json&)>& onEvent = {});
 
     IpcConn conn_;
     std::mutex mtx_;                     // serialize call()s + event queue access

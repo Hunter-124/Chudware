@@ -91,6 +91,8 @@ void ActivityPanel::onEvent(const std::string& kind, const nlohmann::json& data)
             while ((int)sn.attempts.size() <= attempt) sn.attempts.emplace_back();
             auto& an       = sn.attempts[attempt];
             an.rawOutput   = jstr(data, "raw");
+            an.sentPrompt  = jstr(data, "sent");
+            an.reply       = an.rawOutput;
             an.parsedOk    = jbool(data, "parsed_ok");
             an.parseError  = jstr(data, "parse_error");
             an.durationMs  = jint(data, "duration_ms");
@@ -245,6 +247,8 @@ ActivityPanel::RunNode ActivityPanel::parseEvents(const std::vector<nlohmann::js
                 while ((int)s.attempts.size() <= attempt) s.attempts.emplace_back();
                 auto& an       = s.attempts[attempt];
                 an.rawOutput   = jstr(*d, "raw");
+                an.sentPrompt  = jstr(*d, "sent");
+                an.reply       = an.rawOutput;
                 an.parsedOk    = jbool(*d, "parsed_ok");
                 an.parseError  = jstr(*d, "parse_error");
                 an.durationMs  = jint(*d, "duration_ms");
@@ -374,23 +378,29 @@ void ActivityPanel::drawAttempt(AppState& st, AttemptNode& attempt, int idx) {
             ImGui::TextWrapped("Parse error: %s", attempt.parseError.c_str());
             ImGui::PopStyleColor();
         }
-        // Raw output (collapsible, capped scroll)
-        if (!attempt.rawOutput.empty()) {
-            char rawId[64];
-            std::snprintf(rawId, sizeof(rawId), "Raw output##ro%p", (void*)&attempt);
-            if (toggleChip(attempt.showRaw ? "Hide output" : "Show output", attempt.showRaw))
-                attempt.showRaw = !attempt.showRaw;
-            if (attempt.showRaw) {
-                ImGui::PushStyleColor(ImGuiCol_ChildBg,
-                    ImVec4(p.blockActionBg[0], p.blockActionBg[1], p.blockActionBg[2], p.blockActionBg[3]));
-                float rawH = 140.0f;
-                ImGui::BeginChild(rawId, ImVec2(0, rawH), ImGuiChildFlags_Border,
-                                  ImGuiWindowFlags_HorizontalScrollbar);
-                if (st.fonts.mono) ImGui::PushFont(st.fonts.mono);
-                ImGui::TextUnformatted(attempt.rawOutput.c_str());
-                if (st.fonts.mono) ImGui::PopFont();
-                ImGui::EndChild();
-                ImGui::PopStyleColor();
+        // Model I/O — expandable sent prompt + raw reply (drawProseBox scrollable body)
+        if (!attempt.sentPrompt.empty()) {
+            char sentId[64];
+            std::snprintf(sentId, sizeof(sentId), "Sent to model##sent%p", (void*)&attempt);
+            if (ImGui::TreeNodeEx(sentId, ImGuiTreeNodeFlags_SpanAvailWidth)) {
+                char boxId[64];
+                std::snprintf(boxId, sizeof(boxId), "##sentbox%p", (void*)&attempt);
+                drawProseBox(boxId, attempt.sentPrompt, ui::metrics::copilotProseMaxH());
+                ImGui::TreePop();
+            }
+        }
+        {
+            const std::string& replyTxt =
+                !attempt.reply.empty() ? attempt.reply : attempt.rawOutput;
+            if (!replyTxt.empty()) {
+                char replyId[64];
+                std::snprintf(replyId, sizeof(replyId), "Model reply##reply%p", (void*)&attempt);
+                if (ImGui::TreeNodeEx(replyId, ImGuiTreeNodeFlags_SpanAvailWidth)) {
+                    char boxId[64];
+                    std::snprintf(boxId, sizeof(boxId), "##replybox%p", (void*)&attempt);
+                    drawProseBox(boxId, replyTxt, ui::metrics::copilotProseMaxH());
+                    ImGui::TreePop();
+                }
             }
         }
         ImGui::TreePop();

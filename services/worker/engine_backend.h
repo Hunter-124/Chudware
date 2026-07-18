@@ -20,6 +20,7 @@
 #pragma once
 
 #include <string>
+#include <functional>
 
 #include <nlohmann/json.hpp>
 
@@ -45,8 +46,13 @@ aicad_ipc::EngineClient* client();
 // timeoutMs < 0 blocks forever; >= 0 bounds each daemon round trip (a timeout
 // surfaces as a transport failure: false + err, no {code} in result). Ignored
 // on the in-process backend — a call into the loaded DLL can't be timed out.
+// `onEvent`, when set, streams {"event":"agent.event",...} pushes LIVE (mid-call) to the callback
+// instead of buffering them for drainEvents() — used by the agent path so a blocking run's events
+// surface as they happen on the daemon backend. No-op on the in-process backend (which streams via
+// the cpp_core event sink set by the caller).
 bool call(const std::string& method, const nlohmann::json& params,
-          nlohmann::json& result, std::string& err, int timeoutMs = -1);
+          nlohmann::json& result, std::string& err, int timeoutMs = -1,
+          const std::function<void(const nlohmann::json&)>& onEvent = {});
 
 // Backend availability probes with InProcCore semantics (routing predicates in
 // worker_client.cpp use these instead of core::cpp_core() directly). In daemon

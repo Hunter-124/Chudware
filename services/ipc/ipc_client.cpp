@@ -206,7 +206,8 @@ bool EngineClient::connectInner(const Options& opts, std::string& err) {
     }
 }
 
-bool EngineClient::readResponse(int id, json& out, std::string& err, int timeoutMs) {
+bool EngineClient::readResponse(int id, json& out, std::string& err, int timeoutMs,
+                                const std::function<void(const json&)>& onEvent) {
     // One deadline for the WHOLE response wait: event lines arriving on the way
     // must not restart the clock.
     const auto deadline = std::chrono::steady_clock::now() +
@@ -237,7 +238,14 @@ bool EngineClient::readResponse(int id, json& out, std::string& err, int timeout
         json msg = json::parse(line, nullptr, /*allow_exceptions=*/false);
         if (msg.is_discarded()) continue;  // tolerate stray non-JSON lines
         if (msg.contains("event")) {
-            events_.push_back(std::move(msg));
+            // Live agent-event streaming: fire onEvent NOW (mid-call) for agent.event so a
+            // blocking agent run streams instead of buffering until it returns. Other events
+            // (doc.*) still queue for the GUI-thread drainEvents().
+            if (onEvent && msg.value("event", std::string()) == "agent.event") {
+                try { onEvent(msg); } catch (...) {}
+            } else {
+                events_.push_back(std::move(msg));
+            }
             continue;
         }
         if (msg.value("id", -1) == id) {
@@ -338,7 +346,8 @@ bool EngineClient::pollAlive() {
 }
 
 bool EngineClient::call(const std::string& method, const json& params, json& result,
-                        std::string& err, int timeoutMs) {
+                        std::string& err, int timeoutMs,
+                        const std::function<void(const json&)>& onEvent) {
 #ifdef __EMSCRIPTEN__
     // Browser MAIN thread: a hard mutex wait would busy-block the event loop, so the
     // AsyncRpc-worker call currently holding mtx_ can never receive its WS onmessage to
@@ -364,7 +373,7 @@ bool EngineClient::call(const std::string& method, const json& params, json& res
         return false;
     }
     json resp;
-    if (!readResponse(id, resp, err, timeoutMs)) return false;
+    if (!readResponse(id, resp, err, timeoutMs, onEvent)) return false;
     if (resp.contains("result")) {
         result = resp["result"];
         return true;

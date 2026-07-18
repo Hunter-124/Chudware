@@ -2236,6 +2236,20 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         if (a) {
             std::string raw = jstr(data, "raw");
             if (!raw.empty()) a->detail = raw;     // keep the latest attempt's thoughts/output
+            // Pack sent prompt after a delimiter so drawActionCard can expand it without new
+            // ActivityItem fields (app_state.h is integrator-owned). Same pattern as ART packing.
+            std::string sent = jstr(data, "sent");
+            if (!sent.empty()) {
+                // Strip any previous SENT trailer before re-packing (latest attempt wins).
+                const char* kSentMark = "\n\x1e" "SENT\x1e\n";
+                const char* kSentMarkBare = "\x1e" "SENT\x1e\n";
+                size_t mark = a->detail.find(kSentMark);
+                if (mark != std::string::npos) a->detail.resize(mark);
+                else if (a->detail.rfind(kSentMarkBare, 0) == 0) a->detail.clear();
+                if (!a->detail.empty()) a->detail += "\n\x1e" "SENT\x1e\n";
+                else a->detail = "\x1e" "SENT\x1e\n";
+                a->detail += sent;
+            }
             a->durationMs = jint(data, "duration_ms");
             a->opsCount   = jint(data, "ops_count");
             if (data.contains("tokens") && data["tokens"].is_object()) {
@@ -3388,7 +3402,22 @@ static void drawThinkingBlock(ActivityItem& a, const ui::Fonts& fonts, bool show
     }
 
     const bool open = a.expanded || !laterDone;   // forced open while it is the active frontier
-    const bool hasDetail = !a.detail.empty();
+    // Split detail into reply body + optional packed sent-prompt trailer.
+    std::string replyBody = a.detail;
+    std::string sentBody;
+    {
+        const char* kSentMark = "\n\x1e" "SENT\x1e\n";
+        const char* kSentMarkBare = "\x1e" "SENT\x1e\n";
+        size_t mark = replyBody.find(kSentMark);
+        if (mark != std::string::npos) {
+            sentBody = replyBody.substr(mark + std::strlen(kSentMark));
+            replyBody = replyBody.substr(0, mark);
+        } else if (replyBody.rfind(kSentMarkBare, 0) == 0) {
+            sentBody = replyBody.substr(std::strlen(kSentMarkBare));
+            replyBody.clear();
+        }
+    }
+    const bool hasDetail = !replyBody.empty() || !sentBody.empty();
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
     ImGui::BeginChild("##thinkblk", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
@@ -3407,8 +3436,21 @@ static void drawThinkingBlock(ActivityItem& a, const ui::Fonts& fonts, bool show
         if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
         if (ImGui::IsItemClicked()) a.expanded = !open;
     }
-    if (open && hasDetail)
-        drawProseBox("##thinkdetail", stripMdMarks(a.detail), ui::metrics::copilotProseMaxH());
+    if (open && hasDetail) {
+        if (!sentBody.empty()) {
+            if (ImGui::TreeNodeEx("Sent to model##thinksent", ImGuiTreeNodeFlags_SpanAvailWidth)) {
+                drawProseBox("##thinksentbox", sentBody, ui::metrics::copilotProseMaxH());
+                ImGui::TreePop();
+            }
+        }
+        if (!replyBody.empty()) {
+            if (ImGui::TreeNodeEx("Model reply##thinkreply", ImGuiTreeNodeFlags_SpanAvailWidth)) {
+                drawProseBox("##thinkreplybox", stripMdMarks(replyBody),
+                             ui::metrics::copilotProseMaxH());
+                ImGui::TreePop();
+            }
+        }
+    }
 
     ImGui::EndChild();
     ImRect thinkRect = endGlassBubble(gb);
@@ -3452,9 +3494,24 @@ static void drawActionCard(ActivityItem& a, AgentStep* step, const ui::Fonts& fo
     ImGui::TextColored(titleCol, "%s", a.title.c_str());
     ImGui::PopFont();
 
+    // Split detail into reply body + optional packed sent-prompt trailer.
+    std::string replyBody = a.detail;
+    std::string sentBody;
+    {
+        const char* kSentMark = "\n\x1e" "SENT\x1e\n";
+        const char* kSentMarkBare = "\x1e" "SENT\x1e\n";
+        size_t mark = replyBody.find(kSentMark);
+        if (mark != std::string::npos) {
+            sentBody = replyBody.substr(mark + std::strlen(kSentMark));
+            replyBody = replyBody.substr(0, mark);
+        } else if (replyBody.rfind(kSentMarkBare, 0) == 0) {
+            sentBody = replyBody.substr(std::strlen(kSentMarkBare));
+            replyBody.clear();
+        }
+    }
     const bool hasDrawer = (step && (!step->thinking.empty() || !step->code.empty() ||
                                      !step->diff.empty() || !step->contactSheet.empty())) ||
-                           !a.detail.empty();
+                           !replyBody.empty() || !sentBody.empty();
     if (hasDrawer) {
         if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
         if (ImGui::IsItemClicked()) a.expanded = !a.expanded;
@@ -3501,7 +3558,21 @@ static void drawActionCard(ActivityItem& a, AgentStep* step, const ui::Fonts& fo
                     ImGui::Image((ImTextureID)(intptr_t)step->thumb.id, ImVec2(tw, th));
                 }
             }
-        } else if (!a.detail.empty()) {
+        }
+        // Model I/O: Sent to model + Model reply (drawProseBox scrollable bodies).
+        if (!sentBody.empty()) {
+            if (ImGui::TreeNodeEx("Sent to model##actsent", ImGuiTreeNodeFlags_SpanAvailWidth)) {
+                drawProseBox("##actsentbox", sentBody, ui::metrics::copilotProseMaxH());
+                ImGui::TreePop();
+            }
+        }
+        if (!replyBody.empty()) {
+            if (ImGui::TreeNodeEx("Model reply##actreply", ImGuiTreeNodeFlags_SpanAvailWidth)) {
+                drawProseBox("##actreplybox", stripMdMarks(replyBody), ui::metrics::copilotProseMaxH());
+                ImGui::TreePop();
+            }
+        } else if (step == nullptr && !a.detail.empty() && sentBody.empty()) {
+            // Fallback: no SENT packing, show detail as before.
             drawProseBox("##actdetail", stripMdMarks(a.detail), ui::metrics::copilotProseMaxH());
         }
     }

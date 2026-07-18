@@ -54,6 +54,13 @@ private:
     Callback cb_;
 };
 
+// Live streaming sink (transparency): a thread-local callback invoked with EVERY event this
+// thread emits (right after the per-run Callback + jsonl persist), so a host/daemon can stream
+// events AS THEY HAPPEN instead of only the batched result["events"]. Fired synchronously on the
+// emitting thread; a throw is swallowed. Set to {} to clear. Both consumers register it: the
+// desktop host (in-process -> onEvent live) and hostd (-> JSON-RPC notification to the web client).
+void set_stream_event_sink(std::function<void(const json&)> sink);
+
 // Emit agent.thought when text is non-empty (no-op if empty). Additive stream field
 // for model reasoning that CompleteResult already parses but used to drop.
 json emit_agent_thought(RunEvents& ev,

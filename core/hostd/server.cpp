@@ -80,6 +80,23 @@ void Server::sendEventTo(int clientId, const std::string& line) {
     if (wlk.owns_lock()) c->conn.writeLine(line);
 }
 
+// Live agent-event streaming context: the C sink `ud`. Thread-local per dispatch thread; the
+// StreamCtx lives on the dispatch stack for the duration of the (synchronous) engine call.
+namespace { struct StreamCtx { hostd::Server* srv; int clientId; }; }
+
+void Server::sendAgentEvent(int clientId, const char* eventJson) {
+    if (!eventJson) return;
+    std::string line = "{\"event\":\"agent.event\",\"data\":";
+    line += eventJson;
+    line += "}";
+    sendEventTo(clientId, line);
+}
+
+void Server::streamThunk(const char* eventJson, void* ud) {
+    auto* ctx = static_cast<StreamCtx*>(ud);
+    if (ctx && ctx->srv) ctx->srv->sendAgentEvent(ctx->clientId, eventJson);
+}
+
 std::string Server::detachSocketForFlockRelease() {
     // Close the listen fd so new connects fail, but leave the sock file for
     // SingleInstance to unlink when it drops the flock (T-PERF10).
@@ -499,6 +516,19 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
     json result;
     std::string err;
     beginInflight(c.id, method);
+    // Live streaming (transparency): for agent-turn methods, push each emitted run event to THIS
+    // client as it happens instead of only the batched result. The thread-local sink fires on
+    // this dispatch thread during the synchronous engine call; cleared immediately after.
+    const bool streamThis = method.rfind("agent_", 0) == 0 ||
+                            method == "session_btw" || method == "session_handoff";
+    StreamCtx sctx{this, c.id};
+    // RAII: clear the thread-local sink on ANY exit (incl. a throw from call()), before sctx
+    // leaves scope — sctx is declared first so it outlives this guard's destructor.
+    struct SinkGuard {
+        bool on;
+        ~SinkGuard() { if (on) core::cpp_core().setEventSink(nullptr, nullptr); }
+    } sinkGuard{streamThis};
+    if (streamThis) core::cpp_core().setEventSink(&Server::streamThunk, &sctx);
     const bool engineOk = core::cpp_core().call(method, p, result, err);
     endInflight(c.id);
     if (!engineOk) {
@@ -515,6 +545,10 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
         if (!e.contains("code")) e["code"] = "engine_error";
         return e;
     }
+    // Live-streamed above (streamThis) -> the batched result["events"] copy is now redundant.
+    // Drop it so a streaming client (which renders the live agent.event push) never double-
+    // renders the run. (Same-build deploy: every client understands the push.)
+    if (streamThis && core::cpp_core().hasEventSink() && result.is_object()) result.erase("events");
     // Revision sniff, minted-doc implicit attach, event fanout, _foreign_edits.
     registry_.postCall(c.id, c.kind, c.userId, c.userDisplay, method, p, result);
     // Stamp origin_kind onto each doc_list entry so a GUI that connected after a

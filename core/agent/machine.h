@@ -54,6 +54,7 @@ struct StageOutcome {
     std::string error;
     bool done = false;
     std::string raw;
+    std::string sent;  // exact system+user prompt sent for this call (capped)
     bool parsed_ok = true;
     bool has_parse_error = false;
     std::string parse_error;

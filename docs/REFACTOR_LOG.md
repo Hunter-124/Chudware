@@ -1520,3 +1520,32 @@ reconnect-deadlock twin was behaviorally verified (restart under a live session,
 8–192ms polls, no freeze). Residual (not a crash): the sync call still hitches the
 render thread for its round-trip; converting those call sites to AsyncRpc would make
 the drag smoother — deferred (bigger change; the reported crash is resolved).
+
+## 2026-07-17 — Materials unify + copilot transparency + AI-settings + webservice (multi-wave swarm)
+Two-wave orchestrated session. Wave 1 (commits on master): (a) assembly feature-tree
+component rows gained a right-click Assign-Material menu that opens/apply/save `set_material`
+(+derived `set_appearance`) on the *component part* doc and force-refreshes the nested cache
+(feature_tree.cpp, feature_tree_nested.*); (b) Simulation studies + Mass Properties now
+live-resolve density/material from `doc.material.key` and WRITE `set_material` back through the
+same DocMirror seam the FeatureManager uses, so all three surfaces edit ONE active part material
+(sim_manager.*, evaluate_dialogs.*); (c) copilot chat now renders the real streamed
+thoughts/tool-calls/model text (no more "Saying: Working"), a bottom forging/anvil animation
+while running, expandable tool-call rows that show render images inline, and a top-of-timeline
+Routing card — fed by two additive agent_events/2 fields I added to contracts/agent_events.md
+(`agent.tool_call.artifacts`, new `agent.classification`) emitted from services/agent
+(agent_events.py classification_event/derive_artifacts, loop.py entry, agent_turn.py); the
+overlay header fuses run-status color into the Chudware cube (with hover tooltip) and moved the
+Tasks button (legacy_chat.cpp). Wave 2: AI-Settings Model-Role tooltips + Vision role surfaced
+in the overlay + a dormant Moonshot/Kimi key field (legacy_chat.cpp, settings_modal.cpp,
+model_registry.h); webservice — full file-action routing on the WASM client (workspace Open/
+SaveAs/folder browser, recursive copy, durable recents; the browse dialog JS lives in
+host/wasm/billet_web_dialogs.js via --js-library to dodge the EM_ASM CPP quote/comma trap),
+local provider sign-in sharing (engine_bridge forwards provider/model selection but strips
+secrets; new read-only GET /api/providers), and a mobile version (responsive gateway pages +
+WASM touch HUD/multitouch orbit-pan-pinch + narrow-viewport layout, all under #ifdef
+__EMSCRIPTEN__). Gotchas fixed mid-flight: `"\x1eART"` hex-escape greediness (split literal) and
+EM_ASM top-level commas in app.cpp (GCC tolerated, clang/em++ errored). Verified: linux build,
+`./build.sh wasm`, gui_lint theme+icons, mega24 offline gate (22), event/router pytest (347;
+5 pre-existing fails unrelated), /api/providers no-secret-leak smoke, and workspaces+asm headless
+crash-check smokes. Deferred to user: live-turn visuals (forging anim, tool-image expansion,
+routing card) need a real model; gateway pytest needs the deploy venv (fastapi absent here).

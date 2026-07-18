@@ -213,6 +213,12 @@ const std::map<string, FeatureSpec> FEATURE_TYPES = {
     {"weld_end_cap", {{}, {{"face", RefForm::SelOrDatum, true}}}},
     {"script", {{"code"}, {}}},
     {"import", {{"source_path", "format"}, {}}},
+    // Macro: expands at apply-time into the parts catalog generator's op sequence
+    // (same path as parts_make RPC). Never reaches the geometry compiler as itself —
+    // op_add_feature expands it to cylinder/sketch/extrude/… features first. Params
+    // are validated by the expander (family/size/length_mm); none are universally
+    // required at the schema level so dry-run can surface the expander's message.
+    {"standard_part", {{}, {}}},
     {"rib", {{}, {{"profile", RefForm::SelList, true}}}},
     {"split", {{}, {{"tool", RefForm::SelOrDatum, true}}}},
     {"asm_linear_pattern", {{"count1", "spacing1"}, {{"dir1", RefForm::SelOrDatum, true},

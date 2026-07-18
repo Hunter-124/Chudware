@@ -1,11 +1,15 @@
-// Unit tests for agent/complexity.cpp (the deterministic task-complexity router).
+// Unit tests for agent/complexity.cpp (the deterministic task-complexity router)
+// and the domain casual-mention guard used alongside it.
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
 #include "agent/complexity.h"
+#include "agent/domain.h"
 
 using aicad::agent::classify_complexity;
+using aicad::agent::classify_domain;
 using aicad::agent::Complexity;
+using aicad::agent::Domain;
 using aicad::agent::ExecStructure;
 using aicad::agent::recommend_structure;
 using aicad::agent::structure_label;
@@ -14,6 +18,8 @@ TEST_CASE("canonical standoff is SOLO (skips planner)") {
     // THE user's example: dimension-clause commas must NOT count as object joiners.
     auto v = classify_complexity("a knurled hex standoff, 22mm tall, M3 clearance bore");
     CHECK(v.level == Complexity::Solo);
+    CHECK(classify_domain("a knurled hex standoff, 22mm tall, M3 clearance bore").domain ==
+          Domain::Modeling);
 }
 
 TEST_CASE("bare catalog parts are SOLO") {
@@ -85,4 +91,48 @@ TEST_CASE("structure recommendation tracks complexity") {
     CHECK(recommend_structure(complex.level, /*cross_discipline=*/true) == ExecStructure::Company);
     CHECK(std::string(structure_label(
               recommend_structure(complex.level, /*cross_discipline=*/true))) == "company");
+}
+
+// ---- wave hardening -------------------------------------------------------
+
+TEST_CASE("coordinate system and state machine are not COMPLEX false positives") {
+    // Bare substring "system"/"machine" used to force Complex; word-boundary + bigram
+    // exclusions keep these modeling/software phrases off the assembly path.
+    CHECK(classify_complexity("align the part to the coordinate system origin").level !=
+          Complexity::Complex);
+    CHECK(classify_complexity("a bracket for the state machine enclosure panel").level !=
+          Complexity::Complex);
+    // Real multi-part "system" / "machine" still hit Complex.
+    CHECK(classify_complexity("a cooling system with pump and reservoir").level ==
+          Complexity::Complex);
+    CHECK(classify_complexity("design a packaging machine").level == Complexity::Complex);
+}
+
+TEST_CASE("multi-part intent phrasing is COMPLEX") {
+    CHECK(classify_complexity("two brackets that bolt together").level == Complexity::Complex);
+    CHECK(classify_complexity("plates that screw together with M3 hardware").level ==
+          Complexity::Complex);
+    CHECK(classify_complexity("a clevis that mounts to the frame rail").level == Complexity::Complex);
+    CHECK(classify_complexity("a cover that attaches to the housing").level == Complexity::Complex);
+}
+
+TEST_CASE("solo noun expansions stay SOLO") {
+    // kSoloNouns additions: bushing, knob, bracket, cap, plug, flange (+ existing standoff/spacer).
+    CHECK(classify_complexity("an M8 bronze bushing").level == Complexity::Solo);
+    CHECK(classify_complexity("a knurled thumb knob").level == Complexity::Solo);
+    CHECK(classify_complexity("a simple L bracket").level == Complexity::Solo);
+    CHECK(classify_complexity("an end cap 20mm diameter").level == Complexity::Solo);
+    CHECK(classify_complexity("a rubber plug 12mm").level == Complexity::Solo);
+    CHECK(classify_complexity("a pipe flange 50mm").level == Complexity::Solo);
+    CHECK(classify_complexity("a hex standoff 16mm AF").level == Complexity::Solo);
+}
+
+TEST_CASE("bare stress or load stays Modeling; analyze intent routes Simulation") {
+    // Casual strength talk must not drag a modeling request into the FEA toolset.
+    CHECK(classify_domain("a bracket that can handle stress").domain == Domain::Modeling);
+    CHECK(classify_domain("a plate under heavy load").domain == Domain::Modeling);
+    // Paired with analyze/simulate/fea words (or other sim-core terms) still routes Sim.
+    CHECK(classify_domain("run a static stress FEA at 200N").domain == Domain::Simulation);
+    CHECK(classify_domain("analyze the stress on this arm").domain == Domain::Simulation);
+    CHECK(classify_domain("what is the factor of safety under load").domain == Domain::Simulation);
 }

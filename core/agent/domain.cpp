@@ -70,10 +70,20 @@ DomainVerdict classify_domain(const std::string& request) {
         r.find("cam job") != std::string::npos)
         return {Domain::Cam, "CAM/machining terms"};
 
-    if (any_word(r, {"fea", "cfd", "stress", "strain", "thermal", "modal", "buckling",
-                     "fatigue", "simulation", "simulate", "deflection", "displacement",
-                     "airflow", "aerodynamic", "factor of safety"}))
-        return {Domain::Simulation, "simulation/analysis terms"};
+    // "stress"/"load" alone are casual strength talk ("bracket that can handle stress") —
+    // only route Simulation when paired with an analyze/simulate/fea intent word.
+    {
+        const bool sim_core = any_word(r, {"fea", "cfd", "strain", "thermal", "modal", "buckling",
+                                          "fatigue", "simulation", "simulate", "deflection",
+                                          "displacement", "airflow", "aerodynamic",
+                                          "factor of safety"});
+        const bool stress_or_load = any_word(r, {"stress", "load"});
+        const bool analyze_intent =
+            any_word(r, {"analyze", "analyse", "analysis", "simulate", "simulation", "fea",
+                         "cfd"});
+        if (sim_core || (stress_or_load && analyze_intent))
+            return {Domain::Simulation, "simulation/analysis terms"};
+    }
 
     if (any_word(r, {"drawing", "dimension", "gd&t", "gdt", "titleblock", "section view",
                      "detail view", "annotate", "tolerance callout"}) ||

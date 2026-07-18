@@ -781,25 +781,38 @@ json run_micro_design(const std::string& request, const std::string& doc_id,
     } provider_emit_guard;
     // Forward streaming token deltas to the run event stream so the GUI shows the
     // model's continuous output live (channel "text" | "thinking"). Deltas are
-    // COALESCED per channel (flush at >=120 chars or on a newline) so we don't reopen
-    // events.jsonl per token — grok emits thousands. The final assistant message is
-    // persisted separately, so a trailing sub-flush buffer is not authoritative.
+    // COALESCED per channel (flush at >=48 chars, newline, or >=60ms since last
+    // flush) so we don't reopen events.jsonl per token — grok emits thousands.
+    // The final assistant message is persisted separately, so a trailing sub-flush
+    // buffer is not authoritative.
     struct DeltaCoalescer {
         RunEvents* ev;
         std::string buf_text, buf_think;
+        std::chrono::steady_clock::time_point last_flush_text =
+            std::chrono::steady_clock::now();
+        std::chrono::steady_clock::time_point last_flush_think =
+            std::chrono::steady_clock::now();
         std::string& chan(const std::string& kind) {
             return kind == "thinking" ? buf_think : buf_text;
+        }
+        std::chrono::steady_clock::time_point& last_flush(const std::string& kind) {
+            return kind == "thinking" ? last_flush_think : last_flush_text;
         }
         void flush(const std::string& kind) {
             std::string& b = chan(kind);
             if (b.empty()) return;
             ev->emit("assistant_delta", json{{"text", b}, {"channel", kind}});
             b.clear();
+            last_flush(kind) = std::chrono::steady_clock::now();
         }
         void push(const std::string& d, const std::string& kind) {
             std::string& b = chan(kind);
             b += d;
-            if (b.size() >= 120 || b.find('\n') != std::string::npos) flush(kind);
+            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - last_flush(kind))
+                                .count();
+            if (b.size() >= 48 || b.find('\n') != std::string::npos || ms >= 60)
+                flush(kind);
         }
         void flush_all() { flush("text"); flush("thinking"); }
     };
@@ -999,7 +1012,12 @@ json run_micro_design(const std::string& request, const std::string& doc_id,
             OpsResult ores = extract_ops(ecall.reply);
             if (!ores.ops) {
                 std::string perr = ores.error.value_or("");
-                last_err = "no ops array in reply (" + perr + ")";
+                last_err =
+                    std::string("REPLY FORMAT ERROR: your previous reply did not contain a "
+                                "valid ```json ops array. Reply with ONLY a fenced ```json "
+                                "code block containing the ops array — no prose before or "
+                                "after.\n") +
+                    perr;
                 events.emit("agent_output",
                             json{{"stage", "execute"}, {"role", "executor"}, {"attempt", attempt},
                                  {"step_index", i}, {"raw", utf8_prefix(ecall.reply, 4000)},
@@ -1009,6 +1027,21 @@ json run_micro_design(const std::string& request, const std::string& doc_id,
             }
             const json& ops = *ores.ops;
             if (ops.empty()) {
+                // Empty ops while the doc still has no features is not a real pass on a
+                // build step — force a retry with explicit feedback.
+                if (!doc_has_features(doc_summary) && !step.desc.empty()) {
+                    last_err =
+                        "you emitted an empty ops array but nothing has been built; emit the "
+                        "ops for this step";
+                    events.emit("agent_output",
+                                json{{"stage", "execute"}, {"role", "executor"},
+                                     {"attempt", attempt}, {"step_index", i},
+                                     {"raw", utf8_prefix(ecall.reply, 4000)}, {"raw_path", sc},
+                                     {"parsed_ok", true}, {"ops_count", 0},
+                                     {"duration_ms", ecall.duration_ms},
+                                     {"parse_error", last_err}});
+                    continue;
+                }
                 events.emit("agent_output",
                             json{{"stage", "execute"}, {"role", "executor"}, {"attempt", attempt},
                                  {"step_index", i}, {"raw", utf8_prefix(ecall.reply, 4000)},
@@ -1053,6 +1086,12 @@ json run_micro_design(const std::string& request, const std::string& doc_id,
                     }
                 emit_agent_tool_call(events, /*tool_name=*/"", /*target=*/"", ops, ok, lat,
                                      /*parent_id=*/"", /*actor=*/"executor");
+                std::string aicm_path;
+                if (resp.contains("tess") && resp["tess"].is_object())
+                    aicm_path = resp["tess"].value("aicm_path", std::string());
+                if (!aicm_path.empty())
+                    emit_doc_preview(events, doc_id, resp.value("revision", cur.revision),
+                                     aicm_path);
                 break;
             } catch (const std::exception& e) {
                 last_err = std::string("apply failed: ") + e.what();
@@ -1095,7 +1134,7 @@ json run_micro_design(const std::string& request, const std::string& doc_id,
     std::string status = (applied_ok > 0 && has_solid) ? "done" : "failed";
     std::string stop_reason = (status == "done")
                                   ? "completed"
-                                  : (has_solid ? "all_steps_failed" : "no_geometry_built");
+                                  : (has_solid ? "all_steps_failed" : "no_geometry");
     events.emit("run_finished", json{{"status", status}, {"stop_reason", stop_reason},
                                      {"revision", revision}, {"steps_applied", applied_ok},
                                      {"steps_total", n}});

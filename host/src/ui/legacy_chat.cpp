@@ -19,6 +19,7 @@
 // because the Copilot pane is their primary user, and are shared with the other panels via the
 // header.
 #include <algorithm>
+#include <chrono>
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
@@ -59,6 +60,11 @@
 #include "../ui_theme.h"
 
 #include "../worker_client.h"
+
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#include <emscripten/fetch.h>
+#endif
 
 // ============================ shared small-UI helpers ============================
 bool primaryButton(const char* label, const ImVec2& size) {
@@ -1898,6 +1904,193 @@ static void feedCorporateEvent(ChatMsg& m, const nlohmann::json& data) {
     // Unknown corp_event values: ignore (forward-compatible).
 }
 
+// ---- stream:out ops-JSON detection (F1) ----
+// Classify the accumulated Output stream as model ops/tool JSON once the first non-whitespace
+// char is '{' or '[', OR a ``` / ```json fence appears whose body starts with { or [.
+// Returns byte offset where the ops blob begins (0 = whole stream is ops; npos = prose).
+// No streaming JSON parser — line-based prefix / fence scan only.
+static size_t findOpsJsonStart(const std::string& s) {
+    size_t i = 0;
+    while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r' || s[i] == '\n')) ++i;
+    if (i >= s.size()) return std::string::npos;
+    if (s[i] == '{' || s[i] == '[') return i;
+    // Scan for a markdown fence (at line start) whose body opens with { or [.
+    // Handles mixed content: prose before the fence stays as prose.
+    for (size_t p = i; p + 3 <= s.size(); ++p) {
+        if (s.compare(p, 3, "```") != 0) continue;
+        // Fence must be at start or after a newline (allow spaces before fence on its line).
+        if (p > 0) {
+            size_t q = p;
+            while (q > 0 && (s[q - 1] == ' ' || s[q - 1] == '\t')) --q;
+            if (q > 0 && s[q - 1] != '\n' && s[q - 1] != '\r') continue;
+        }
+        size_t j = p + 3;
+        while (j < s.size() && s[j] != '\n' && s[j] != '\r') ++j;  // skip lang tag
+        while (j < s.size() && (s[j] == '\n' || s[j] == '\r' || s[j] == ' ' || s[j] == '\t')) ++j;
+        if (j < s.size() && (s[j] == '{' || s[j] == '[')) return p;
+    }
+    return std::string::npos;
+}
+
+// Best-effort op count from a JSON prefix: count top-level objects in an array, or 1 for object.
+// Falls back to -1 when not parseable yet (caller shows byte count).
+static int countOpsInJsonPrefix(const std::string& s) {
+    size_t i = 0;
+    while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r' || s[i] == '\n')) ++i;
+    if (i >= s.size()) return -1;
+    // Strip optional fence wrapper for counting.
+    std::string body = s;
+    if (s.compare(i, 3, "```") == 0) {
+        size_t j = i + 3;
+        while (j < s.size() && s[j] != '\n' && s[j] != '\r') ++j;
+        while (j < s.size() && (s[j] == '\n' || s[j] == '\r')) ++j;
+        size_t end = s.rfind("```");
+        if (end != std::string::npos && end > j)
+            body = s.substr(j, end - j);
+        else
+            body = s.substr(j);
+        i = 0;
+        while (i < body.size() && (body[i] == ' ' || body[i] == '\t' || body[i] == '\r' || body[i] == '\n')) ++i;
+    } else {
+        body = s;
+    }
+    if (i >= body.size()) return -1;
+    try {
+        auto j = nlohmann::json::parse(body, nullptr, false);
+        if (j.is_discarded()) {
+            // Incomplete stream: count rough object starts in an array prefix.
+            if (body[i] == '[') {
+                int n = 0;
+                int depth = 0;
+                bool inStr = false, esc = false;
+                for (size_t k = i; k < body.size(); ++k) {
+                    char c = body[k];
+                    if (inStr) {
+                        if (esc) esc = false;
+                        else if (c == '\\') esc = true;
+                        else if (c == '"') inStr = false;
+                        continue;
+                    }
+                    if (c == '"') { inStr = true; continue; }
+                    if (c == '{' ) {
+                        if (depth == 1) ++n;  // top-level array element object
+                        ++depth;
+                    } else if (c == '}') {
+                        if (depth > 0) --depth;
+                    } else if (c == '[') {
+                        ++depth;
+                    } else if (c == ']') {
+                        if (depth > 0) --depth;
+                    }
+                }
+                return n > 0 ? n : -1;
+            }
+            return -1;
+        }
+        if (j.is_array()) return (int)j.size();
+        if (j.is_object()) {
+            // Prefer an "ops" array field when present.
+            if (j.contains("ops") && j["ops"].is_array()) return (int)j["ops"].size();
+            if (j.contains("tool_calls") && j["tool_calls"].is_array())
+                return (int)j["tool_calls"].size();
+            return 1;
+        }
+    } catch (...) {}
+    return -1;
+}
+
+// Finalize a thought/output box: stop streaming. Auto-collapse Thinking (and keep ops JSON
+// collapsed) once unless the user pinned it. Prose Output keeps the user's last expanded state
+// (defaults open while streaming).
+static void finalizeThoughtBox(ActivityItem& a) {
+    a.streaming = false;
+    if (a.status == "running" || a.status.empty()) a.status = "done";
+    const bool isOps = (a.stage == "stream:out" && a.opsCount > 0) ||
+                       (a.title.find("Building ops") != std::string::npos);
+    const bool isProseOut = !isOps && (a.stage == "stream:out" || a.title == "Output");
+    if (isProseOut) return;  // leave expanded as-is
+    if (!a.userToggled) a.expanded = false;
+}
+
+// Find or create the single rowKind-10 routing card (always kept at front).
+static ActivityItem* findOrCreateRoutingCard(ChatMsg& m) {
+    for (auto& a : m.activity)
+        if (a.rowKind == 10) return &a;
+    ActivityItem ni;
+    ni.rowKind = 10;
+    ni.stage   = "class:0";
+    ni.title   = "task";
+    ni.status  = "done";
+    ni.detail  = "{}";
+    m.activity.insert(m.activity.begin(), std::move(ni));
+    return &m.activity.front();
+}
+
+// Merge routing-related fields into the packed detail JSON + title/reason on the card.
+static void mergeRoutingFields(ActivityItem& card, const nlohmann::json& data, const std::string& kind) {
+    nlohmann::json meta = nlohmann::json::object();
+    if (!card.detail.empty()) {
+        try {
+            auto j = nlohmann::json::parse(card.detail, nullptr, false);
+            if (!j.is_discarded() && j.is_object()) meta = std::move(j);
+        } catch (...) {}
+    }
+    auto putStr = [&](const char* key, const std::string& v) {
+        if (!v.empty()) meta[key] = v;
+    };
+    auto putAny = [&](const char* key, const char* srcKey) {
+        if (!data.contains(srcKey) || data[srcKey].is_null()) return;
+        meta[key] = data[srcKey];
+    };
+
+    if (kind == "agent.classification") {
+        std::string tc = jstr(data, "task_class");
+        if (!tc.empty()) card.title = tc;
+        std::string reason = jstr(data, "reason");
+        if (!reason.empty()) card.reason = reason;
+        putStr("picked_model", jstr(data, "picked_model"));
+        putStr("picked_provider", jstr(data, "picked_provider"));
+        putStr("request_snippet", jstr(data, "request_snippet"));
+        std::string sl = jstr(data, "scaffold_level");
+        if (!sl.empty()) meta["scaffold_level"] = sl;
+        else putAny("scaffold_level", "scaffold_level");
+        std::string tier = jstr(data, "tier");
+        if (!tier.empty()) meta["tier"] = tier;
+        else putAny("tier", "tier");
+    } else if (kind == "complexity") {
+        std::string level = jstr(data, "level");
+        if (!level.empty()) {
+            meta["scaffold_level"] = level;
+            meta["complexity"] = level;
+        }
+        std::string reason = jstr(data, "reason");
+        if (!reason.empty() && card.reason.empty()) card.reason = reason;
+        if (data.contains("skip_plan") && !data["skip_plan"].is_null())
+            meta["skip_plan"] = data["skip_plan"];
+    } else if (kind == "task_route") {
+        std::string domain = jstr(data, "domain");
+        if (!domain.empty()) {
+            card.title = domain;
+            meta["domain"] = domain;
+        }
+        std::string reason = jstr(data, "reason");
+        if (!reason.empty()) card.reason = reason;
+        std::string cx = jstr(data, "complexity");
+        if (!cx.empty()) {
+            meta["complexity"] = cx;
+            if (!meta.contains("scaffold_level")) meta["scaffold_level"] = cx;
+        }
+        putStr("structure", jstr(data, "structure"));
+        if (data.contains("tool_classes") && !data["tool_classes"].is_null())
+            meta["tool_classes"] = data["tool_classes"];
+        if (data.contains("context_sheets") && !data["context_sheets"].is_null())
+            meta["context_sheets"] = data["context_sheets"];
+    }
+    card.detail = meta.dump();
+    card.status = "done";
+}
+
+
 void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json& data) {
     // Inside a mission, sub-run stage keys (intake/model/...) repeat per task — namespace them by
     // the current task index so task 2's "model" row doesn't reopen task 1's. Outside a mission
@@ -2109,6 +2302,12 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         ps.present = true;
     }
 
+
+    if (kind == "run_started") {
+        // Instant chrome before classification lands (F3).
+        if (m.running && m.liveStatus.empty())
+            m.liveStatus = "Routing\xe2\x80\xa6";
+    } else
     if (kind == "mission_started") {
         m.curMissionTask = -1;  // task rows arrive via mission_task_started
         // Normalize mission task list into a checklist/phased PlanState when no plan_state yet.
@@ -2201,8 +2400,17 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         }
     } else if (kind == "mission_finished") {
         m.curMissionTask = -1;
-        for (auto& a : m.activity)
-            if (a.status == "running" || a.status.empty()) { a.status = "done"; a.streaming = false; }
+        for (auto& a : m.activity) {
+            if (a.rowKind == 2) {
+                if (a.streaming || a.status == "running" || a.status.empty())
+                    finalizeThoughtBox(a);
+                continue;
+            }
+            if (a.status == "running" || a.status.empty()) {
+                a.status = "done";
+                a.streaming = false;
+            }
+        }
         if (m.planState.present) {
             for (auto& it : m.planState.items)
                 if (it.status == "running" || it.status == "pending" || it.status.empty())
@@ -2273,12 +2481,20 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
                     ni.rowKind = 2;
                     ni.stage   = key;
                     ni.title   = "Thinking";
+                    ni.expanded = true;   // open while the turn may still be running
                     m.activity.push_back(std::move(ni));
                     ta = &m.activity.back();
                 }
                 ta->detail = thinking;
-                ta->streaming = false;
-                ta->status = "done";
+                // Batch path: content arrives complete. Keep open only while turn runs and
+                // user hasn't toggled; collapse once at turn end via run_finished unless pinned.
+                if (m.running) {
+                    ta->streaming = true;
+                    ta->status = "running";
+                    if (!ta->userToggled) ta->expanded = true;
+                } else {
+                    finalizeThoughtBox(*ta);
+                }
             }
         }
     } else if (kind == "stage_result") {
@@ -2293,11 +2509,19 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         // A sub-run finished (one mission task) OR a single-run completed. Close only the rows
         // for the CURRENT task; mission_finished does the final sweep. Outside a mission this
         // closes everything, as before.
-        for (auto& a : m.activity)
-            if ((a.status == "running" || a.status.empty()) && !a.missionHeader) {
-                a.status = "done";
-                a.streaming = false;  // finalize any still-open thought box (M13)
+        for (auto& a : m.activity) {
+            if (a.missionHeader) continue;
+            if (a.rowKind == 2) {
+                // Thought/output boxes: stop streaming; auto-collapse once unless user pinned.
+                if (a.streaming || a.status == "running" || a.status.empty())
+                    finalizeThoughtBox(a);
+                continue;
             }
+            if (a.status == "running" || a.status.empty()) {
+                a.status = "done";
+                a.streaming = false;
+            }
+        }
         // Capture additive early-stop fields (ErrorDetail / contracts): stop_reason +
         // error_detail. Prefer error_detail over legacy `error`. Stashed as a meta activity
         // row so the error card can render "stopped: <reason> — <detail>" without touching
@@ -2392,6 +2616,7 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             ni.rowKind = 2;
             ni.stage   = key;
             ni.title   = "Thinking";
+            ni.expanded = true;  // open + populating live
             m.activity.push_back(std::move(ni));
             a = &m.activity.back();
         }
@@ -2399,50 +2624,100 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             a->detail += jstr(data, "text");
             a->streaming = true;
             a->status    = "running";
+            if (!a->userToggled) a->expanded = true;
         } else {
             // Completed block: authoritative text replaces any delta accumulation (same content,
-            // possibly truncated per contract), then the box finalizes + auto-collapses.
+            // possibly truncated per contract), then finalize — collapse once unless user pinned.
             std::string txt = jstr(data, "text");
             if (!txt.empty() || a->detail.empty()) a->detail = txt;
-            a->streaming = false;
-            a->status    = "done";
+            finalizeThoughtBox(*a);
         }
     } else if (kind == "assistant_delta") {  // live token stream (C++ SSE deltas)
         // Both channels coalesce into ONE growing collapsible box each in the timeline
         // (Thinking = reasoning, Output = the model's generated ops/prose), so the user
         // sees continuous output while working. Boxes finalize at stage/run end.
-        // channel=="text" ALSO appends into the primary chat bubble (m.text waterfall);
-        // channel=="thinking" stays in the Thinking activity box only. Tool-call JSON
-        // never enters m.text (agent.tool_call is a separate row path).
+        // channel=="text" ALSO appends into the primary chat bubble (m.text waterfall) —
+        // UNLESS the stream is classified as ops/tool JSON (F1): then m.text is left alone
+        // (and any already-appended JSON blob is stripped from its tail).
+        // channel=="thinking" stays in the Thinking activity box only.
         const std::string chan = jstr(data, "channel");
         const std::string txt = jstr(data, "text");
         const bool think = (chan == "thinking");
-        if (!think && !txt.empty()) {
-            // Live waterfall into the primary assistant bubble (text channel only).
-            m.text += txt;
-            m.uiCachedH = -1.0f;  // height grows as prose streams
-        }
-        // Thinking stays in the activity drawer; text also keeps an Output box for the
-        // expandable timeline, but the primary bubble is the main surface for prose.
         const std::string key = think ? "thought:stream" : "stream:out";
         ActivityItem* a = nullptr;
         for (auto it = m.activity.rbegin(); it != m.activity.rend(); ++it)
             if (it->rowKind == 2 && it->stage == key && it->streaming) { a = &*it; break; }
+        // tokensIn on stream:out = byte offset into m.text where THIS segment began (for
+        // stripping JSON that already leaked into the prose bubble when classification flips).
+        // opsCount > 0  => classified as OPS JSON (Building ops… mode).
+        const size_t mTextBefore = m.text.size();
         if (!a) {
             ActivityItem ni;
             ni.rowKind = 2;
             ni.stage   = key;
             ni.title   = think ? "Thinking" : "Output";
-            // The OUTPUT stream box defaults open and stays open (expanded) so the model's live
-            // text is visible while it streams AND remains in place in history after the turn
-            // finishes; only the reasoning ("Thinking") box auto-collapses on completion.
-            ni.expanded = !think;
+            // Thinking AND Output open while streaming; thought auto-collapses on complete
+            // unless userToggled. Output prose stays user-expandable.
+            ni.expanded = true;
+            if (!think) ni.tokensIn = (int)mTextBefore;  // segment start in m.text
             m.activity.push_back(std::move(ni));
             a = &m.activity.back();
         }
-        a->detail += txt;
-        a->streaming = true;
-        a->status    = "running";
+
+        if (think) {
+            if (!txt.empty()) a->detail += txt;
+            a->streaming = true;
+            a->status    = "running";
+            if (!a->userToggled) a->expanded = true;
+        } else {
+            // Text channel: append into the Output box always; gate m.text on ops-JSON class.
+            if (!txt.empty()) a->detail += txt;
+            a->streaming = true;
+            a->status    = "running";
+
+            const bool wasOps = (a->opsCount > 0);
+            const size_t opsAt = wasOps ? 0 : findOpsJsonStart(a->detail);
+            const bool isOps = wasOps || (opsAt != std::string::npos);
+            if (isOps) {
+                if (!wasOps) {
+                    // Classification just flipped. Keep any prose BEFORE the ops blob in m.text;
+                    // strip only the ops portion that already leaked into the bubble.
+                    const size_t segStart = (a->tokensIn > 0) ? (size_t)a->tokensIn : 0;
+                    // How much of this segment is prose (before opsAt in detail)?
+                    const size_t proseLen = (opsAt == std::string::npos) ? 0 : opsAt;
+                    const size_t keepEnd = segStart + proseLen;
+                    if (keepEnd <= m.text.size()) m.text.resize(keepEnd);
+                    else if (segStart <= m.text.size()) m.text.resize(segStart);
+                    a->title = "Building ops\xe2\x80\xa6";  // "Building ops…"
+                    a->expanded = false;  // summary collapsed; raw only in expander
+                    a->opsCount = 1;      // flag: ops-JSON mode (updated with real count below)
+                    // If detail still holds leading prose, drop it from the ops box body so the
+                    // expander shows JSON only (prose already lives in m.text).
+                    if (opsAt != std::string::npos && opsAt > 0 && opsAt <= a->detail.size())
+                        a->detail.erase(0, opsAt);
+                }
+                // Refresh one-line summary into reason; keep raw JSON in detail.
+                int nOps = countOpsInJsonPrefix(a->detail);
+                if (nOps > 0) a->opsCount = nOps;
+                if (nOps > 0) {
+                    char buf[64];
+                    std::snprintf(buf, sizeof(buf), "%d op%s", nOps, nOps == 1 ? "" : "s");
+                    a->reason = buf;
+                } else {
+                    char buf[64];
+                    std::snprintf(buf, sizeof(buf), "%zu bytes", a->detail.size());
+                    a->reason = buf;
+                }
+                // Do NOT append this delta (or any further ops JSON) to m.text.
+                m.uiCachedH = -1.0f;
+            } else {
+                // Prose: waterfall into the primary assistant bubble.
+                if (!txt.empty()) {
+                    m.text += txt;
+                    m.uiCachedH = -1.0f;
+                }
+            }
+        }
     } else if (kind == "agent.tool_call") {                          // M14 — tool call row
         ActivityItem ni;
         ni.rowKind = 3;
@@ -2484,37 +2759,41 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
                 ni.detail += arts;
             }
         }
+        // Pretty Doing card lands — close any live "Building ops…" stream:out so the
+        // transcript shows the card, not both actively (F1 companion).
+        for (auto& existing : m.activity) {
+            if (existing.rowKind != 2) continue;
+            if (existing.stage != "stream:out") continue;
+            if (existing.opsCount <= 0 && existing.title.find("Building ops") == std::string::npos)
+                continue;
+            existing.streaming = false;
+            existing.status = "done";
+            existing.expanded = false;
+        }
         m.activity.push_back(std::move(ni));
-    } else if (kind == "agent.classification") {
-        // Pre-request routing card (emitted once at entry). Pack into ActivityItem without new
-        // fields: rowKind 10, stage "class:<n>", title=task_class, reason=reason, detail=JSON
-        // of optional fields (picked_model/provider, scaffold_level, tier, request_snippet).
-        ActivityItem ni;
-        ni.rowKind = 10;
-        ni.stage   = "class:" + std::to_string(m.activity.size());
-        ni.title   = jstr(data, "task_class");
-        if (ni.title.empty()) ni.title = "task";
-        ni.reason  = jstr(data, "reason");
-        nlohmann::json meta = nlohmann::json::object();
-        std::string pm = jstr(data, "picked_model");
-        std::string pp = jstr(data, "picked_provider");
-        std::string sl = jstr(data, "scaffold_level");
-        std::string tier = jstr(data, "tier");
-        std::string snip = jstr(data, "request_snippet");
-        if (!pm.empty()) meta["picked_model"] = pm;
-        if (!pp.empty()) meta["picked_provider"] = pp;
-        if (!sl.empty()) meta["scaffold_level"] = sl;
-        if (!tier.empty()) meta["tier"] = tier;
-        if (!snip.empty()) meta["request_snippet"] = snip;
-        // Also tolerate non-string scaffold_level / tier (numbers/enums).
-        if (sl.empty() && data.contains("scaffold_level") && !data["scaffold_level"].is_null())
-            meta["scaffold_level"] = data["scaffold_level"];
-        if (tier.empty() && data.contains("tier") && !data["tier"].is_null())
-            meta["tier"] = data["tier"];
-        ni.detail = meta.dump();
-        ni.status = "done";
-        // Insert at front so the Routing card sits at the TOP of the activity timeline.
-        m.activity.insert(m.activity.begin(), std::move(ni));
+    } else if (kind == "agent.classification" || kind == "complexity" || kind == "task_route") {
+        // Routing card UPSERT (F3): appears on the FIRST of these events and enriches as the
+        // rest land. Shared rowKind 10 at the front of the timeline.
+        ActivityItem* card = findOrCreateRoutingCard(m);
+        // Keep card at front if something else was inserted first.
+        if (!m.activity.empty() && m.activity.front().rowKind != 10) {
+            ActivityItem tmp = *card;
+            // erase the found card (may have shifted)
+            for (auto it = m.activity.begin(); it != m.activity.end(); ++it) {
+                if (it->rowKind == 10) { m.activity.erase(it); break; }
+            }
+            m.activity.insert(m.activity.begin(), std::move(tmp));
+            card = &m.activity.front();
+        }
+        mergeRoutingFields(*card, data, kind);
+        if (m.running && (m.liveStatus.empty() || m.liveStatus == "Routing\xe2\x80\xa6" ||
+                          m.liveStatus == "Classifying request...")) {
+            // Prefer a short live chrome once we know something concrete.
+            if (!card->title.empty() && card->title != "task")
+                m.liveStatus = "Routing \xc2\xb7 " + card->title;
+            else if (m.liveStatus.empty())
+                m.liveStatus = "Routing\xe2\x80\xa6";
+        }
     } else if (kind == "provider_call") {
         // In-depth provider HTTP call log (InAppDiag / core agent). One row per attempt.
         // rowKind 9; fields packed into existing ActivityItem slots so we never touch
@@ -2614,6 +2893,23 @@ static void closeConversation(AppState& st, int idx);
 static void submitTurn(AppState& st, const std::string& text);
 static bool aiTurnActive(AppState& st);
 static bool activeConversationRunning(AppState& st);
+static std::string chatHistoryPath();
+static std::string convDocKey(AppState& st);
+static void loadChatHistoryForKey(AppState& st, const std::string& key,
+                                  const std::string& migrateFrom = {});
+// Defined here (before drawSessionsPanel) — rekey erase + Sessions "Other" pin.
+static std::string s_chatKeyToErase;
+static std::string s_chatKeyHold;
+#ifdef __EMSCRIPTEN__
+// Shared workspace chat (GET/PUT /workspace/chat). IDBFS remains local cache/fallback.
+// Fetch callbacks stash results; merge runs on the UI thread via syncChatToDoc.
+static bool s_chatShareFetchStarted = false;
+static bool s_chatShareHasPending = false;
+static nlohmann::json s_chatSharePending = nlohmann::json::object();
+static void wasmPutSharedChat(const std::string& key, const nlohmann::json& entry);
+static void wasmKickSharedChatFetch();
+static void wasmApplySharedChatPending(AppState& st);
+#endif
 
 // ============================ W3-H: unified AI Copilot pane ============================
 // One pane, top-down: header -> input -> mode pills -> conversation (with inline live run
@@ -3628,45 +3924,70 @@ static void drawContextChip(const ActivityItem& a, const ui::Fonts& fonts) {
 
 // M13 — the model's thoughts in a collapsible textbox. While deltas stream (a.streaming) the box
 // stays open so tokens appear live; a completed block auto-collapses to a one-line preview unless
-// the user pinned it open. `showThinking` off -> a single dim one-liner (matches drawThinkingBlock).
+// the user pinned it open (userToggled). `showThinking` off -> a single dim one-liner.
+// stream:out classified as ops JSON ("Building ops…") always shows a one-line summary by default;
+// raw JSON lives only inside the expander (never expanded-by-default mid-stream).
 static void drawThoughtBox(ActivityItem& a, const ui::Fonts& fonts, bool showThinking) {
     const float sc = ui::uiScale;
     const ui::AdaptiveSurface& surf = chatSurf();
     ImGui::Dummy(ImVec2(0, 2 * sc));
-    // The streamed model OUTPUT ("Output" channel / stage "stream:out") rides the same rowKind-2
-    // box as reasoning, but it IS the model's actual work text — never hide it behind the "show
-    // thinking" switch. Only the reasoning box collapses to a one-liner when thoughts are hidden.
-    const bool isOutput = (a.stage == "stream:out" || a.title == "Output");
+    // Ops-JSON Output box OR plain prose Output — never hide behind the "show thinking" switch.
+    const bool isOpsJson = (a.stage == "stream:out" && a.opsCount > 0) ||
+                           (a.title.find("Building ops") != std::string::npos);
+    const bool isOutput = isOpsJson || a.stage == "stream:out" || a.title == "Output";
     if (!showThinking && !isOutput) {
         ImGui::PushFont(fonts.body);
         ImGui::TextColored(surf.textSecondary, "Thinking");
         ImGui::PopFont();
         return;
     }
-    const bool open = a.expanded || a.streaming;
+    // Ops JSON: only open when the user expanded it (never force-open while streaming).
+    // Thinking / prose Output: open while streaming OR user-expanded.
+    const bool open = isOpsJson ? a.expanded : (a.expanded || a.streaming);
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
     ImGui::BeginChild("##thoughtbox", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
     ImGui::PushFont(fonts.body);
     const char* boxLabel = a.title.empty() ? "Thinking" : a.title.c_str();
-    ImGui::TextColored(surf.textSecondary, "%s%s", boxLabel, a.streaming ? "\xe2\x80\xa6" : "");
+    ImGui::TextColored(surf.textSecondary, "%s%s", boxLabel,
+                       (!isOpsJson && a.streaming) ? "\xe2\x80\xa6" : "");
     ImGui::PopFont();
     if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-    if (ImGui::IsItemClicked()) a.expanded = !open;
+    if (ImGui::IsItemClicked()) {
+        a.expanded = !open;
+        a.userToggled = true;
+    }
     ImGui::SameLine(0, 6 * sc);
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
-    ImGui::TextUnformatted(open ? "(hide)" : "(show)");
+    ImGui::TextUnformatted(open ? "(hide)" : (isOpsJson ? "(raw)" : "(show)"));
     ImGui::PopStyleColor();
     if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-    if (ImGui::IsItemClicked()) a.expanded = !open;
+    if (ImGui::IsItemClicked()) {
+        a.expanded = !open;
+        a.userToggled = true;
+    }
+
+    // Ops JSON collapsed (default): one-line summary from reason (op count / byte count).
+    if (isOpsJson && !open) {
+        std::string sum = a.reason;
+        if (sum.empty()) {
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "%zu bytes", a.detail.size());
+            sum = buf;
+        }
+        ImGui::SameLine(0, 8 * sc);
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+        ImGui::TextUnformatted(sum.c_str());
+        ImGui::PopStyleColor();
+    }
+
     if (open) {
         if (!a.detail.empty()) {
-            if (isOutput && a.streaming) {
-                // Live stream: render inline (primary ink) so the box GROWS with the text and the
-                // OUTER chat log's auto-scroll keeps the newest tokens pinned just above the
-                // composer. A fixed-height inner scroller would show the TOP and hide the latest
-                // output. Finished output falls back to the capped scrolling box so history stays
-                // compact yet fully readable.
+            if (isOpsJson) {
+                // Raw JSON only inside the expander.
+                drawProseBox("##opsraw", a.detail, ui::metrics::copilotProseMaxH());
+            } else if (isOutput && a.streaming) {
+                // Live prose stream: render inline so the box grows with the text.
                 ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
                 ImGui::TextWrapped("%s", stripMdMarks(a.detail).c_str());
                 ImGui::PopStyleColor();
@@ -3674,8 +3995,8 @@ static void drawThoughtBox(ActivityItem& a, const ui::Fonts& fonts, bool showThi
                 drawProseBox("##thoughttxt", stripMdMarks(a.detail), ui::metrics::copilotProseMaxH());
             }
         }
-    } else if (!a.detail.empty()) {
-        // Collapsed: a dim one-line preview (first line, ellipsized).
+    } else if (!isOpsJson && !a.detail.empty()) {
+        // Collapsed thinking/prose: dim one-line preview (first line, ellipsized).
         std::string prev = a.detail.substr(0, a.detail.find('\n'));
         if (prev.size() > 110) { prev.resize(110); prev += "\xe2\x80\xa6"; }
         else if (prev.size() < a.detail.size()) prev += " \xe2\x80\xa6";
@@ -3687,7 +4008,6 @@ static void drawThoughtBox(ActivityItem& a, const ui::Fonts& fonts, bool showThi
     ImRect thoughtRect = endGlassBubble(gb);
     const std::string thoughtCopy = chatActivityCopyText(a);
     chatCopyContext(thoughtRect, "##thought_copy", thoughtCopy);
-
 }
 
 // M14 — one inline row per tool call ("Doing"): ok/fail glyph + tool icon + tool name + latency,
@@ -4093,8 +4413,8 @@ static void drawClassificationCard(const ActivityItem& a, const ui::Fonts& fonts
     ImGui::TextUnformatted(a.title.empty() ? "task" : a.title.c_str());
     ImGui::PopStyleColor();
 
-    // Optional picked_model (and provider) from packed detail JSON.
-    std::string model, provider, scaffold, tier;
+    // Optional fields from packed detail JSON (classification + complexity + task_route merge).
+    std::string model, provider, scaffold, tier, structure, domain;
     if (!a.detail.empty()) {
         try {
             auto j = nlohmann::json::parse(a.detail);
@@ -4107,11 +4427,19 @@ static void drawClassificationCard(const ActivityItem& a, const ui::Fonts& fonts
                     if (j["scaffold_level"].is_string())
                         scaffold = j["scaffold_level"].get<std::string>();
                     else scaffold = j["scaffold_level"].dump();
+                } else if (j.contains("complexity")) {
+                    if (j["complexity"].is_string())
+                        scaffold = j["complexity"].get<std::string>();
+                    else scaffold = j["complexity"].dump();
                 }
                 if (j.contains("tier")) {
                     if (j["tier"].is_string()) tier = j["tier"].get<std::string>();
                     else tier = j["tier"].dump();
                 }
+                if (j.contains("structure") && j["structure"].is_string())
+                    structure = j["structure"].get<std::string>();
+                if (j.contains("domain") && j["domain"].is_string())
+                    domain = j["domain"].get<std::string>();
             }
         } catch (...) {}
     }
@@ -4124,15 +4452,25 @@ static void drawClassificationCard(const ActivityItem& a, const ui::Fonts& fonts
         ImGui::TextWrapped("%s", line.c_str());
         ImGui::PopStyleColor();
     }
-    if (!scaffold.empty() || !tier.empty()) {
+    if (!scaffold.empty() || !tier.empty() || !structure.empty()) {
         std::string meta;
         if (!scaffold.empty()) meta = "scaffold " + scaffold;
+        if (!structure.empty()) {
+            if (!meta.empty()) meta += " \xc2\xb7 ";
+            meta += structure;
+        }
         if (!tier.empty()) {
             if (!meta.empty()) meta += " \xc2\xb7 ";
             meta += "tier " + tier;
         }
         ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
         ImGui::TextUnformatted(meta.c_str());
+        ImGui::PopStyleColor();
+    }
+    // If title is task_class but domain differs, show domain as a secondary chip line.
+    if (!domain.empty() && domain != a.title) {
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+        ImGui::TextUnformatted(("domain " + domain).c_str());
         ImGui::PopStyleColor();
     }
     if (!a.reason.empty()) dimText(a.reason.c_str());
@@ -5690,6 +6028,115 @@ static void drawSessionsPanel(AppState& st, bool busy) {
         ImGui::PopID();
         if (doDel) { closeConversation(st, i); break; }
     }
+
+    // ---- Other sessions: orphaned keys in chat_history.json (not the active doc) ----
+    // Keeps doc:* / other-file histories visible after an autosave rekey or tab switch.
+    struct OtherSess {
+        std::string key;
+        std::string label;
+        std::string snippet;
+        int nConvs = 0;
+    };
+    std::vector<OtherSess> others;
+    {
+        nlohmann::json root = nlohmann::json::object();
+        try {
+            std::ifstream in(chatHistoryPath());
+            if (in) in >> root;
+        } catch (...) {
+            root = nlohmann::json::object();
+        }
+        if (root.is_object()) {
+            for (auto it = root.begin(); it != root.end(); ++it) {
+                if (!it.value().is_object()) continue;
+                const std::string& k = it.key();
+                if (k == st.chatDocKey) continue;
+                OtherSess o;
+                o.key = k;
+                // Label = key tail (basename for file:, id for doc:, else raw).
+                if (k.rfind("file:", 0) == 0) {
+                    std::string p = k.substr(5);
+                    size_t slash = p.find_last_of("/\\");
+                    o.label = slash == std::string::npos ? p : p.substr(slash + 1);
+                } else if (k.rfind("doc:", 0) == 0) {
+                    o.label = "unsaved " + k.substr(4);
+                    if (o.label.size() > 28) o.label = o.label.substr(0, 25) + "...";
+                } else {
+                    o.label = k;
+                }
+                const auto& convs = it.value().value("conversations", nlohmann::json::array());
+                o.nConvs = (int)convs.size();
+                // First user-message snippet across conversations.
+                for (const auto& jc : convs) {
+                    for (const auto& m : jc.value("msgs", nlohmann::json::array())) {
+                        if (m.value("u", false)) {
+                            o.snippet = m.value("t", std::string());
+                            break;
+                        }
+                    }
+                    if (!o.snippet.empty()) break;
+                }
+                if (o.snippet.size() > 60) o.snippet = o.snippet.substr(0, 57) + "...";
+                // Skip totally empty orphan buckets.
+                if (o.nConvs == 0 && o.snippet.empty()) continue;
+                others.push_back(std::move(o));
+            }
+        }
+    }
+    if (!others.empty()) {
+        ImGui::Dummy(ImVec2(0, ui::metrics::U(2)));
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+        ImGui::TextUnformatted("Other sessions");
+        ImGui::PopStyleColor();
+        ImGui::Dummy(ImVec2(0, ui::metrics::U(0.5f)));
+        for (int oi = 0; oi < (int)others.size(); ++oi) {
+            const OtherSess& o = others[oi];
+            ImGui::PushID(10000 + oi);
+            const ImVec2 rowMin = ImGui::GetCursorScreenPos();
+            const float  rowW   = ImGui::GetContentRegionAvail().x;
+            const ImVec2 rowMax(rowMin.x + rowW, rowMin.y + rowH);
+            bool picked = ImGui::InvisibleButton("##pickother", ImVec2(std::max(1.0f, rowW), rowH));
+            bool rowHov = ImGui::IsItemHovered();
+            if (picked && !busy) {
+                // Read-only browse: load that key's sessions into view and pin so
+                // syncChatToDoc doesn't immediately bounce back to the live doc key.
+                if (!st.chatDocKey.empty()) persistChatHistory(st);
+                loadChatHistoryForKey(st, o.key);
+                st.chatDocKey = o.key;
+                s_chatKeyHold = o.key;
+                st.showSessionsPicker = false;
+                st.showAISettingsOverlay = false;
+            }
+            float wash = rowHov ? 0.42f : 0.22f;
+            ui::glassRowBackground(dl, rowMin, rowMax, 8.0f * sc, (oi % 2) == 1, false, wash);
+            const float titleY = rowMin.y + padY;
+            ImU32 ink = ImGui::ColorConvertFloat4ToU32(surf.textPrimary);
+            dl->AddText(ImVec2(rowMin.x + padX, titleY), ink, o.label.c_str());
+            char sub[160];
+            if (!o.snippet.empty())
+                std::snprintf(sub, sizeof(sub), "%s", o.snippet.c_str());
+            else if (o.nConvs == 1)
+                std::snprintf(sub, sizeof(sub), "1 session");
+            else
+                std::snprintf(sub, sizeof(sub), "%d sessions", o.nConvs);
+            dl->AddText(ImVec2(rowMin.x + padX, titleY + titleH + 2.0f * sc),
+                        ImGui::ColorConvertFloat4ToU32(surf.textSecondary), sub);
+            ImGui::SetCursorScreenPos(ImVec2(rowMin.x, rowMax.y + rowGap));
+            ImGui::PopID();
+        }
+    }
+    // If we're browsing a held foreign key, offer a one-click return to the live doc.
+    if (!s_chatKeyHold.empty()) {
+        ImGui::Dummy(ImVec2(0, ui::metrics::U(1)));
+        if (ImGui::Button("Back to current document", ImVec2(-1, 0))) {
+            if (!st.chatDocKey.empty()) persistChatHistory(st);
+            s_chatKeyHold.clear();
+            const std::string live = convDocKey(st);
+            loadChatHistoryForKey(st, live);
+            st.chatDocKey = live;
+            st.showSessionsPicker = false;
+        }
+    }
 }
 
 // Task-list panel — replaces the chat log; the deterministic plan/checklist for the
@@ -5863,11 +6310,43 @@ static nlohmann::json planStateToJson(const PlanState& ps) {
 void persistChatHistory(AppState& st) {
     if (st.activeConv < 0 || st.activeConv >= (int)st.conversations.size()) return;
     if (st.chatDocKey.empty()) return;
+    namespace fs = std::filesystem;
+    const std::string path = chatHistoryPath();
     nlohmann::json root = nlohmann::json::object();
+    bool hadNontrivialFile = false;
+    bool parseOk = false;
     {
-        std::ifstream in(chatHistoryPath());
-        if (in) { try { in >> root; } catch (...) { root = nlohmann::json::object(); } }
-        if (!root.is_object()) root = nlohmann::json::object();
+        std::ifstream in(path, std::ios::binary);
+        if (in) {
+            // Probe size first so a corrupt-but-non-trivial file can be preserved.
+            in.seekg(0, std::ios::end);
+            const auto sz = in.tellg();
+            in.seekg(0, std::ios::beg);
+            hadNontrivialFile = (sz > 2);
+            try {
+                in >> root;
+                parseOk = root.is_object();
+            } catch (...) {
+                root = nlohmann::json::object();
+                parseOk = false;
+            }
+            if (!parseOk) root = nlohmann::json::object();
+        }
+    }
+    // Corrupt existing store: rename aside for recovery before we write a fresh object.
+    // Never silently clobber multi-key history with an empty root.
+    if (hadNontrivialFile && !parseOk) {
+        try {
+            const auto ts = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+            const std::string bak = path + ".corrupt-" + std::to_string(static_cast<long long>(ts));
+            std::error_code ec;
+            fs::rename(path, bak, ec);
+            if (ec) {
+                // Fallback copy+remove if rename across devices fails.
+                fs::copy_file(path, bak, fs::copy_options::overwrite_existing, ec);
+            }
+        } catch (...) {
+        }
     }
     nlohmann::json convs = nlohmann::json::array();
     for (int i = 0; i < (int)st.conversations.size(); ++i) {
@@ -5901,11 +6380,35 @@ void persistChatHistory(AppState& st) {
                          {"title", st.conversations[i].title},
                          {"msgs", jm}});
     }
+    // Load-modify-write: only replace this doc key; every other key stays intact.
     root[st.chatDocKey] = {{"active", st.activeConv}, {"conversations", convs}};
+    // Rekey migration cleanup: drop the pre-autosave doc:<id> key once the entry lives at file:.
+    if (!s_chatKeyToErase.empty() && s_chatKeyToErase != st.chatDocKey) {
+        root.erase(s_chatKeyToErase);
+        s_chatKeyToErase.clear();
+    }
     try {
-        std::filesystem::create_directories(appdataAppDir());
-        std::ofstream out(chatHistoryPath());
-        if (out) out << root.dump(1);
+        fs::create_directories(appdataAppDir());
+        // Atomic write (tmp + rename) — same pattern as saveSettings/config.json.
+        const std::string tmp = path + ".tmp";
+        {
+            std::ofstream out(tmp);
+            if (!out) return;
+            out << root.dump(1);
+        }
+        std::error_code ec;
+        fs::rename(tmp, path, ec);
+        if (ec) {
+            // Windows sometimes needs remove-then-rename; last-resort non-atomic.
+            fs::remove(path, ec);
+            fs::rename(tmp, path, ec);
+        }
+        appstatePersistSync();  // WASM: flush IDBFS; no-op on desktop
+#ifdef __EMSCRIPTEN__
+        // Also push this key to the shared workspace store (async; never block UI thread).
+        if (root.contains(st.chatDocKey) && root[st.chatDocKey].is_object())
+            wasmPutSharedChat(st.chatDocKey, root[st.chatDocKey]);
+#endif
     } catch (...) {
     }
 }
@@ -5945,53 +6448,79 @@ void pollChatOpenFoam(AppState& st) {
     st.statusKind = err.empty() ? 0 : 2;
 }
 
+// Apply one chat_history.json entry object into st.conversations/chat.
+static void applyChatEntry(AppState& st, const nlohmann::json& e) {
+    freeChatTextures(st.chat);
+    st.chat.clear();
+    st.conversations.clear();
+    for (const auto& jc : e.value("conversations", nlohmann::json::array())) {
+        Conversation c;
+        c.id = jc.value("id", newConvId(st));
+        c.title = jc.value("title", std::string("Chat"));
+        for (const auto& m : jc.value("msgs", nlohmann::json::array())) {
+            ChatMsg cm;
+            cm.fromUser = m.value("u", false);
+            cm.text = m.value("t", std::string());
+            cm.errKind = m.value("e", 0);
+            if (!cm.fromUser) cm.model = m.value("m", std::string());
+            cm.copilotMode = m.value("cm", -1);  // -1 when absent (legacy sessions)
+            // Restore plan/task-list state when present (legacy sessions omit the key).
+            if (m.contains("plan_state") && m["plan_state"].is_object()) {
+                cm.planState = parsePlanState(m["plan_state"]);
+                // parsePlanState marks fromEvent=true; honor the persisted provenance flag
+                // so derived normalizers don't clobber a restored event plan.
+                cm.planState.fromEvent =
+                    m["plan_state"].value("from_event", true);
+            }
+            cm.running = false;
+            c.msgs.push_back(std::move(cm));
+        }
+        st.conversations.push_back(std::move(c));
+    }
+    if (st.conversations.empty()) { st.activeConv = -1; ensureConversations(st); return; }
+    int act = e.value("active", 0);
+    if (act < 0 || act >= (int)st.conversations.size()) act = 0;
+    st.activeConv = act;
+    st.chat = std::move(st.conversations[act].msgs);
+    st.lastContextTokens = st.conversations[act].lastContextTokens;
+    st.queuedPrompts = std::move(st.conversations[act].queuedPrompts);
+    st.conversations[act].msgs.clear();
+    st.conversations[act].queuedPrompts.clear();
+}
+
+
 // Replace conversations/chat with the saved set for `key` (or a fresh empty chat if none).
-static void loadChatHistoryForKey(AppState& st, const std::string& key) {
+// migrateFrom: on miss for `key`, adopt migrateFrom's entry (file or still-in-memory) so an
+// autosave rekey (doc:<id> -> file:<path>) never clears the visible conversation list.
+static void loadChatHistoryForKey(AppState& st, const std::string& key,
+                                  const std::string& migrateFrom) {
     nlohmann::json root = nlohmann::json::object();
     {
         std::ifstream in(chatHistoryPath());
         if (in) { try { in >> root; } catch (...) {} }
     }
-    bool found = root.is_object() && root.contains(key) && root[key].is_object();
-    if (found) {
-        freeChatTextures(st.chat);
-        st.chat.clear();
-        st.conversations.clear();
-        const nlohmann::json& e = root[key];
-        for (const auto& jc : e.value("conversations", nlohmann::json::array())) {
-            Conversation c;
-            c.id = jc.value("id", newConvId(st));
-            c.title = jc.value("title", std::string("Chat"));
-            for (const auto& m : jc.value("msgs", nlohmann::json::array())) {
-                ChatMsg cm;
-                cm.fromUser = m.value("u", false);
-                cm.text = m.value("t", std::string());
-                cm.errKind = m.value("e", 0);
-                if (!cm.fromUser) cm.model = m.value("m", std::string());
-                cm.copilotMode = m.value("cm", -1);  // -1 when absent (legacy sessions)
-                // Restore plan/task-list state when present (legacy sessions omit the key).
-                if (m.contains("plan_state") && m["plan_state"].is_object()) {
-                    cm.planState = parsePlanState(m["plan_state"]);
-                    // parsePlanState marks fromEvent=true; honor the persisted provenance flag
-                    // so derived normalizers don't clobber a restored event plan.
-                    cm.planState.fromEvent =
-                        m["plan_state"].value("from_event", true);
-                }
-                cm.running = false;
-                c.msgs.push_back(std::move(cm));
-            }
-            st.conversations.push_back(std::move(c));
+    auto hasEntry = [&](const std::string& k) {
+        return root.is_object() && root.contains(k) && root[k].is_object();
+    };
+    if (hasEntry(key)) {
+        applyChatEntry(st, root[key]);
+        return;
+    }
+    // Rekey migration: new key empty, but old key has history (disk or live memory).
+    if (!migrateFrom.empty() && migrateFrom != key) {
+        if (hasEntry(migrateFrom)) {
+            applyChatEntry(st, root[migrateFrom]);
+            s_chatKeyToErase = migrateFrom;  // drop old key on next persist under new key
+            return;
         }
-        if (st.conversations.empty()) { st.activeConv = -1; ensureConversations(st); return; }
-        int act = e.value("active", 0);
-        if (act < 0 || act >= (int)st.conversations.size()) act = 0;
-        st.activeConv = act;
-        st.chat = std::move(st.conversations[act].msgs);
-        st.lastContextTokens = st.conversations[act].lastContextTokens;
-        st.queuedPrompts = std::move(st.conversations[act].queuedPrompts);
-        st.conversations[act].msgs.clear();
-        st.conversations[act].queuedPrompts.clear();
-    } else if (st.conversations.empty() && st.activeConv < 0) {
+        // In-memory still holds the outgoing doc's conversations (persist just wrote them
+        // under migrateFrom). Keep them bound to the new key instead of clearing.
+        if (!st.conversations.empty() && st.activeConv >= 0) {
+            s_chatKeyToErase = migrateFrom;
+            return;
+        }
+    }
+    if (st.conversations.empty() && st.activeConv < 0) {
         ensureConversations(st);  // first init: adopt current st.chat (welcome) as conversation 1
     } else {
         freeChatTextures(st.chat);  // switching to a different doc with no history: fresh chat
@@ -6004,13 +6533,179 @@ static void loadChatHistoryForKey(AppState& st, const std::string& key) {
     }
 }
 
+#ifdef __EMSCRIPTEN__
+// Count messages in one chat_history entry (all conversations) — merge tie-break.
+static int wasmChatEntryMsgCount(const nlohmann::json& e) {
+    int n = 0;
+    if (!e.is_object()) return 0;
+    const auto& convs = e.value("conversations", nlohmann::json::array());
+    if (!convs.is_array()) return 0;
+    for (const auto& c : convs) {
+        const auto& msgs = c.value("msgs", nlohmann::json::array());
+        if (msgs.is_array()) n += (int)msgs.size();
+    }
+    return n;
+}
+
+// Fire-and-forget async PUT of one (or few) keys — copy of fs_backend saveRecents pattern.
+// Heap-owns the payload until the fetch callback frees it. Never EMSCRIPTEN_FETCH_SYNCHRONOUS.
+static void wasmPutSharedChat(const std::string& key, const nlohmann::json& entry) {
+    if (key.empty() || !entry.is_object()) return;
+    nlohmann::json body = nlohmann::json::object();
+    body[key] = entry;
+    const std::string payload = body.dump();
+    char* buf = static_cast<char*>(std::malloc(payload.size()));
+    if (!buf) return;
+    std::memcpy(buf, payload.data(), payload.size());
+    emscripten_fetch_attr_t attr;
+    emscripten_fetch_attr_init(&attr);
+    std::strcpy(attr.requestMethod, "PUT");
+    attr.attributes = EMSCRIPTEN_FETCH_LOAD_TO_MEMORY;  // async
+    static const char* headers[] = {"Content-Type", "application/json", nullptr};
+    attr.requestHeaders = headers;
+    attr.requestData = buf;
+    attr.requestDataSize = payload.size();
+    attr.userData = buf;
+    attr.onsuccess = [](emscripten_fetch_t* f) {
+        std::free(f->userData);
+        emscripten_fetch_close(f);
+    };
+    attr.onerror = [](emscripten_fetch_t* f) {
+        std::free(f->userData);
+        emscripten_fetch_close(f);
+    };
+    emscripten_fetch(&attr, "/workspace/chat");
+}
+
+// One-shot async GET of the full shared store. Result stashed for syncChatToDoc merge.
+static void wasmKickSharedChatFetch() {
+    if (s_chatShareFetchStarted) return;
+    s_chatShareFetchStarted = true;
+    emscripten_fetch_attr_t attr;
+    emscripten_fetch_attr_init(&attr);
+    std::strcpy(attr.requestMethod, "GET");
+    attr.attributes = EMSCRIPTEN_FETCH_LOAD_TO_MEMORY;  // async
+    attr.onsuccess = [](emscripten_fetch_t* f) {
+        try {
+            if (f->status >= 200 && f->status < 300 && f->data && f->numBytes > 0) {
+                auto j = nlohmann::json::parse(f->data, f->data + f->numBytes);
+                if (j.is_object()) {
+                    s_chatSharePending = std::move(j);
+                    s_chatShareHasPending = true;
+                }
+            } else if (f->status >= 200 && f->status < 300) {
+                // Empty body / {} — still a successful empty store.
+                s_chatSharePending = nlohmann::json::object();
+                s_chatShareHasPending = true;
+            }
+        } catch (...) {
+        }
+        emscripten_fetch_close(f);
+    };
+    attr.onerror = [](emscripten_fetch_t* f) {
+        emscripten_fetch_close(f);
+    };
+    emscripten_fetch(&attr, "/workspace/chat");
+}
+
+// Merge server store into local IDBFS chat_history.json.
+// Rule: server wins for keys local lacks; when both have a key, prefer more messages.
+// If the active key's entry changes, reload the visible conversation list.
+static void wasmApplySharedChatPending(AppState& st) {
+    if (!s_chatShareHasPending) return;
+    s_chatShareHasPending = false;
+    nlohmann::json server = std::move(s_chatSharePending);
+    s_chatSharePending = nlohmann::json::object();
+    if (!server.is_object()) return;
+
+    namespace fs = std::filesystem;
+    const std::string path = chatHistoryPath();
+    nlohmann::json local = nlohmann::json::object();
+    {
+        std::ifstream in(path);
+        if (in) {
+            try {
+                in >> local;
+            } catch (...) {
+                local = nlohmann::json::object();
+            }
+        }
+    }
+    if (!local.is_object()) local = nlohmann::json::object();
+
+    const std::string curKey = st.chatDocKey;
+    const bool hadCur = !curKey.empty() && local.contains(curKey) && local[curKey].is_object();
+    const std::string prevDump = hadCur ? local[curKey].dump() : std::string();
+
+    bool dirty = false;
+    for (auto it = server.begin(); it != server.end(); ++it) {
+        if (!it.value().is_object()) continue;
+        const std::string& k = it.key();
+        if (!local.contains(k) || !local[k].is_object()) {
+            local[k] = it.value();
+            dirty = true;
+            continue;
+        }
+        const int sn = wasmChatEntryMsgCount(it.value());
+        const int ln = wasmChatEntryMsgCount(local[k]);
+        if (sn > ln) {
+            local[k] = it.value();
+            dirty = true;
+        }
+    }
+    if (!dirty) {
+        // Still reload current if server filled a key we only had in-memory empty.
+        if (!curKey.empty() && local.contains(curKey) && local[curKey].is_object()) {
+            const std::string nowDump = local[curKey].dump();
+            if (nowDump != prevDump) applyChatEntry(st, local[curKey]);
+        }
+        return;
+    }
+
+    try {
+        fs::create_directories(appdataAppDir());
+        const std::string tmp = path + ".tmp";
+        {
+            std::ofstream out(tmp);
+            if (!out) return;
+            out << local.dump(1);
+        }
+        std::error_code ec;
+        fs::rename(tmp, path, ec);
+        if (ec) {
+            fs::remove(path, ec);
+            fs::rename(tmp, path, ec);
+        }
+        appstatePersistSync();
+    } catch (...) {
+        return;
+    }
+
+    if (!curKey.empty() && local.contains(curKey) && local[curKey].is_object()) {
+        const std::string nowDump = local[curKey].dump();
+        if (nowDump != prevDump) applyChatEntry(st, local[curKey]);
+    }
+}
+#endif
+
 // Detect a document change and swap the chat history accordingly (called each frame).
 static void syncChatToDoc(AppState& st) {
+#ifdef __EMSCRIPTEN__
+    wasmKickSharedChatFetch();       // once: async GET full shared store
+    wasmApplySharedChatPending(st);  // merge when the GET lands
+#endif
+    // Sessions "Other" browse pins a foreign key until the user returns.
+    if (!s_chatKeyHold.empty()) { ensureConversations(st); return; }
     std::string key = convDocKey(st);
     if (key == st.chatDocKey) { ensureConversations(st); return; }
-    if (!st.chatDocKey.empty()) persistChatHistory(st);  // save the outgoing doc's conversations
-    loadChatHistoryForKey(st, key);
+    const std::string prev = st.chatDocKey;
+    if (!prev.empty()) persistChatHistory(st);  // save the outgoing doc's conversations
+    loadChatHistoryForKey(st, key, prev);       // migrate prev -> key when autosave rekeys
     st.chatDocKey = key;
+    // Migration wrote history under migrateFrom only; mirror it to the new key immediately
+    // and drop the old key (s_chatKeyToErase) so a crash doesn't orphan the conversation.
+    if (!s_chatKeyToErase.empty())
+        persistChatHistory(st);
 }
 
 static void parkActiveConversation(AppState& st) {

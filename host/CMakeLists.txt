@@ -299,6 +299,7 @@ if(EMSCRIPTEN)
   target_link_options(Billet PRIVATE
     "SHELL:--use-port=contrib.glfw3"
     "SHELL:-lwebsocket.js"
+    "SHELL:-lidbfs.js"
     "SHELL:-sWASM=1"
     "SHELL:-pthread"
     "SHELL:-sPTHREAD_POOL_SIZE=8"

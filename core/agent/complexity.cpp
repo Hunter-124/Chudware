@@ -95,14 +95,29 @@ ComplexityVerdict classify_complexity(const std::string& request) {
     const int words = word_count(r);
 
     // --- COMPLEX: assemblies, mechanisms, multi-body systems, whole devices ----
-    static const std::array<const char*, 22> kComplex = {
+    // "system" / "machine" are word-bounded and exclude common false-positive
+    // bigrams ("coordinate system", "state machine") that are not multi-part builds.
+    static const std::array<const char*, 20> kComplex = {
         "assembly", "assemblies", "mechanism", "gearbox", "gear train", "linkage",
-        "enclosure with", "housing with", "system", "machine", "robot", "drone",
+        "enclosure with", "housing with", "robot", "drone",
         "actuator", "transmission", "chassis", "subsystem", "multiple parts",
         "several parts", "mount and", "assemble", "mating", "moving parts"};
     for (const char* k : kComplex)
         if (r.find(k) != std::string::npos)
             return {Complexity::Complex, std::string("mentions '") + k + "' (assembly/mechanism)"};
+
+    // Multi-part intent phrasing (two bodies that fasten / attach).
+    static const std::array<const char*, 4> kMultiPart = {
+        "that bolt together", "that screw together", "mounts to", "attaches to"};
+    for (const char* k : kMultiPart)
+        if (r.find(k) != std::string::npos)
+            return {Complexity::Complex, std::string("mentions '") + k + "' (multi-part intent)"};
+
+    // Word-bounded "system" / "machine", skipping benign bigrams.
+    if (has_word(r, "system") && r.find("coordinate system") == std::string::npos)
+        return {Complexity::Complex, "mentions 'system' (assembly/mechanism)"};
+    if (has_word(r, "machine") && r.find("state machine") == std::string::npos)
+        return {Complexity::Complex, "mentions 'machine' (assembly/mechanism)"};
 
     // conjunction density: " A and B ", "A; B", "A plus B" join multiple OBJECTS. Bare commas are
     // NOT counted — dimension/attribute lists ("22mm tall, M3 bore") use non-joining commas. A
@@ -111,11 +126,11 @@ ComplexityVerdict classify_complexity(const std::string& request) {
     const int conjunctions = count_object_conjunctions(r);
 
     // --- SOLO: a single recognizable primitive / catalog part, tersely stated ---
-    static const std::array<const char*, 38> kSoloNouns = {
+    static const std::array<const char*, 39> kSoloNouns = {
         "standoff", "spacer", "screw", "bolt", "nut", "washer", "shim", "bearing",
         "o-ring", "oring", "dowel", "pin", "bushing", "insert", "grommet", "plug",
         "cap", "bracket", "plate", "block", "cube", "cylinder", "disc", "disk",
-        "rod", "tube", "ring", "hook", "knob", "peg",
+        "rod", "tube", "ring", "hook", "knob", "peg", "flange",
         // single geometric primitives (one sketch+extrude/revolve — no plan needed)
         "prism", "cone", "sphere", "pyramid", "wedge", "torus", "hexagon", "polygon"};
     bool solo_noun = false;

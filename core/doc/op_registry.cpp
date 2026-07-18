@@ -229,7 +229,7 @@ std::string doc_ops_cheatsheet_snippet() {
            "Common types: ";
     const char* common[] = {"box", "cylinder", "sphere", "sketch", "extrude",
                             "revolve", "fillet", "chamfer", "hole", "mirror",
-                            "linear_pattern", "circular_pattern"};
+                            "linear_pattern", "circular_pattern", "standard_part"};
     for (std::size_t i = 0; i < sizeof(common) / sizeof(common[0]); ++i) {
         if (i) oss << ", ";
         oss << common[i];

@@ -183,6 +183,18 @@ json emit_agent_tool_call(RunEvents& ev,
     return ev.emit("agent.tool_call", data);
 }
 
+json emit_doc_preview(RunEvents& ev,
+                      const std::string& doc_id,
+                      int revision,
+                      const std::string& aicm_path) {
+    if (aicm_path.empty()) return json(nullptr);
+    json data = json::object();
+    data["doc_id"] = doc_id;
+    data["revision"] = revision;
+    data["aicm_path"] = aicm_path;
+    return ev.emit("doc.preview", data);
+}
+
 // ---------------------------------------------------------------------------
 // plan_state helpers
 // ---------------------------------------------------------------------------

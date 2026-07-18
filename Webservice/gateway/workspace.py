@@ -2,9 +2,9 @@
 
 /workspace/* is rooted at settings.workspace_root (the team CAD_Build dir) and
 serves the browser file dialog: list/upload/download/mkdir/rename/delete/copy +
-durable recents. The daemon reads and writes the SAME paths directly
-(doc_open/doc_save take server-side paths) — bytes only cross the wire for
-import/export.
+durable recents + shared copilot chat history. The daemon reads and writes the
+SAME paths directly (doc_open/doc_save take server-side paths) — bytes only
+cross the wire for import/export.
 
 /files/aicm serves tessellation payloads the daemon publishes for its clients:
 either plain files (tmp aicad_cpp_docs / state dir / workspace) or POSIX shm
@@ -41,6 +41,9 @@ _SHM_URI_PREFIX = "aicm-shm://"
 # Durable recent-files list for the WASM client (config.json lives in /tmp there).
 _RECENTS_NAME = ".billet_recents.json"
 _RECENTS_MAX = 10
+# Shared copilot chat store (same shape as client chat_history.json: root[key] = entry).
+_CHAT_NAME = ".billet_chat_history.json"
+_CHAT_MAX_BODY = 5 * 1024 * 1024  # reject PUT bodies larger than 5 MiB
 
 
 def _ws_root() -> Path:
@@ -226,6 +229,84 @@ async def workspace_recents_put(request: Request, body: dict[str, Any]) -> dict[
     path.write_text(json.dumps({"files": files}, indent=2), encoding="utf-8")
     log.info("workspace recents: wrote %d entries", len(files))
     return {"ok": True, "files": files}
+
+
+def _chat_path() -> Path:
+    return _ws_root() / _CHAT_NAME
+
+
+def _load_chat_store() -> dict[str, Any]:
+    """Load the shared chat store; missing/corrupt → empty object."""
+    path = _chat_path()
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        log.warning("chat store read failed: %s", e)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
+    """Write JSON via tmp + replace so readers never see a partial file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+@router.get("/workspace/chat")
+async def workspace_chat_get(request: Request) -> dict[str, Any]:
+    """Full shared chat_history store (workspace-root .billet_chat_history.json).
+
+    Shape matches the WASM/desktop client file: root[docKey] = {active, conversations}.
+    Missing file → empty object so clients can merge cleanly.
+    """
+    return _load_chat_store()
+
+
+@router.put("/workspace/chat")
+async def workspace_chat_put(request: Request) -> dict[str, Any]:
+    """Merge a partial {key: entry} map into the shared chat store.
+
+    Client PUTs one or a few keys; server deep-replaces only those keys
+    (load → update → atomic write). Never replaces the whole store from the body.
+    """
+    cl = request.headers.get("content-length")
+    if cl is not None:
+        try:
+            n = int(cl)
+        except ValueError:
+            n = -1
+        if n > _CHAT_MAX_BODY:
+            raise HTTPException(status_code=413, detail="chat body too large (max 5MB)")
+    raw = await request.body()
+    if len(raw) > _CHAT_MAX_BODY:
+        raise HTTPException(status_code=413, detail="chat body too large (max 5MB)")
+    if not raw:
+        raise HTTPException(status_code=400, detail="empty body")
+    try:
+        body = json.loads(raw)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"invalid JSON: {e}") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="body must be a JSON object")
+    # Only accept object-valued entries (skip null / scalar noise).
+    patch: dict[str, Any] = {}
+    for k, v in body.items():
+        if not isinstance(k, str) or not k:
+            continue
+        if isinstance(v, dict):
+            patch[k] = v
+    if not patch:
+        raise HTTPException(status_code=400, detail="no valid chat entries in body")
+    store = _load_chat_store()
+    for k, v in patch.items():
+        store[k] = v  # replace key wholesale (entry object)
+    _atomic_write_json(_chat_path(), store)
+    log.info("workspace chat: merged %d key(s), store size %d", len(patch), len(store))
+    return {"ok": True, "merged": list(patch.keys()), "keys": len(store)}
 
 
 def _aicm_allowlist() -> list[Path]:

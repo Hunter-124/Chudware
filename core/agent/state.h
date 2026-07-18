@@ -9,6 +9,8 @@
 // ": "),indent=0) spec/plan formatting is replicated by py_json_dumps_indent0.
 #pragma once
 
+#include "agent/complexity.h"
+
 #include <functional>
 #include <map>
 #include <string>
@@ -76,6 +78,11 @@ struct DesignState {
     ojson memory = ojson::object();   // dict
     AttemptLedger ledger;
     std::string current_step;
+    // Complexity of this run (set by run.cpp after classify / options override).
+    // When complexity_set is false, build_context re-classifies from request so
+    // solo modeler/fixer prompts pick the slim ops cheatsheet.
+    Complexity complexity = Complexity::Standard;
+    bool complexity_set = false;
 
     // Dynamic attr the model action sets (stagnation signal); see machine.py.
     bool last_no_progress = false;

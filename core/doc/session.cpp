@@ -117,6 +117,7 @@
 #include "doc/drawing_session.h"  // W12+ drawing embed/restore on save/open
 #include "doc/stepplus.h"
 #include "doc/validate.h"
+#include "parts/parts.h"
 #include "geom/aicm.h"
 #include "geom/booleans.h"  // fuse_many — doc_eval_compare's default whole-doc shape
 #include "geom/plane.h"
@@ -763,6 +764,164 @@ json& require_sketch_feature(json& doc, const json& op, const json& id_map) {
 // Normalize + expand ONE inline sketch entity (defined below, after unwrap_value_scalars).
 // Used by BOTH op_add_feature (inline params.entities) and op_sketch_add_entity.
 std::vector<json> expand_sketch_entity(json ent, IdGen& gen);
+void apply_one(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map);
+
+
+// Expand add_feature{type:"standard_part"} into the parts catalog generator's
+// op sequence (same code path as the parts_make RPC) and apply each expanded
+// op into the CURRENT document. The generator emits $N placeholders relative to
+// its own sub-batch (index 0); we remap them onto the outer batch id_map under
+// synthetic keys so sketch_add_entity / extrude refs resolve correctly. The
+// macro itself never lands as a feature in the tree — only the produced
+// cylinder/sketch/extrude/… features do (editable, saved in .step+).
+void expand_standard_part(json& doc, const json& feat, std::size_t idx,
+                          IdGen& gen, json& id_map) {
+    const json params = feat.contains("params") && feat["params"].is_object()
+                            ? feat["params"]
+                            : json::object();
+
+    auto param_str = [&](std::initializer_list<const char*> keys) -> std::string {
+        for (const char* k : keys) {
+            if (!params.contains(k)) continue;
+            const json& v = params[k];
+            if (v.is_string()) return v.get<std::string>();
+            if (v.is_number_integer()) return std::to_string(v.get<long long>());
+            if (v.is_number()) {
+                // Pretty integer when whole (dowel "3"), else default dump.
+                const double d = v.get<double>();
+                if (std::floor(d) == d) return std::to_string(static_cast<long long>(d));
+                return std::to_string(d);
+            }
+            // Dim-shaped {value:N, expr:null} — accept as a size token.
+            if (v.is_object() && v.contains("value")) {
+                const json& vv = v["value"];
+                if (vv.is_string()) return vv.get<std::string>();
+                if (vv.is_number_integer()) return std::to_string(vv.get<long long>());
+                if (vv.is_number()) {
+                    const double d = vv.get<double>();
+                    if (std::floor(d) == d) return std::to_string(static_cast<long long>(d));
+                    return std::to_string(d);
+                }
+            }
+        }
+        return {};
+    };
+    auto param_len = [&]() -> double {
+        for (const char* k : {"length_mm", "length", "L"}) {
+            if (!params.contains(k)) continue;
+            const json& v = params[k];
+            if (v.is_number()) return v.get<double>();
+            if (v.is_object() && v.contains("value") && v["value"].is_number())
+                return v["value"].get<double>();
+            if (v.is_string()) {
+                char* end = nullptr;
+                const double d = std::strtod(v.get_ref<const std::string&>().c_str(), &end);
+                if (end && end != v.get_ref<const std::string&>().c_str()) return d;
+            }
+        }
+        return 0.0;
+    };
+
+    const std::string family = param_str({"family", "kind", "type"});
+    // size / thread / designation — models often say "thread":"m3".
+    const std::string size = param_str({"size", "thread", "designation", "bore"});
+    const double length_mm = param_len();
+    json options = json::object();
+    if (params.contains("options") && params["options"].is_object())
+        options = params["options"];
+
+    if (family.empty()) {
+        throw OpError("invalid_op",
+                      "standard_part: params.family required; valid families: " +
+                          aicad::parts::family_keys_csv(),
+                      {{"index", idx}, {"reason", "missing family"}});
+    }
+
+    aicad::parts::PartBuild pb;
+    try {
+        pb = aicad::parts::build(family, size, length_mm, options);
+    } catch (const std::invalid_argument& e) {
+        throw OpError("invalid_op",
+                      std::string("standard_part: ") + e.what(),
+                      {{"index", idx}, {"reason", e.what()},
+                       {"families", aicad::parts::family_keys_csv()}});
+    } catch (const std::exception& e) {
+        throw OpError("invalid_op",
+                      std::string("standard_part: ") + e.what(),
+                      {{"index", idx}, {"reason", e.what()}});
+    }
+
+    if (!pb.ops.is_array() || pb.ops.empty()) {
+        throw OpError("invalid_op",
+                      "standard_part: generator produced no ops for family '" + family + "'",
+                      {{"index", idx}});
+    }
+
+    // Optional display name override on the feature envelope.
+    const std::string override_name = feat.value("name", std::string());
+
+    // Apply each generated op. The generator's $N placeholders are relative to ITS
+    // own sub-batch (0-based). Seed a local id_map so "$0" inside the expansion
+    // resolves to whatever feature the first expanded add_feature minted, then
+    // mirror the primary body id onto the OUTER batch's $<idx> so a subsequent
+    // op in the caller's batch can still reference the macro.
+    json local_map = json::object();
+    std::string first_fid;
+    std::string last_body_fid;
+    for (std::size_t j = 0; j < pb.ops.size(); ++j) {
+        json sub = pb.ops[j];  // deep copy
+        // Merge outer + local maps so generator-local $N resolve, while any
+        // outer-batch placeholders the expansion doesn't use stay available.
+        json sub_map = id_map;
+        for (auto it = local_map.begin(); it != local_map.end(); ++it)
+            sub_map[it.key()] = it.value();
+
+        const std::size_t n_before =
+            (doc.contains("features") && doc["features"].is_array()) ? doc["features"].size()
+                                                                    : 0;
+
+        // apply_one records minted ids under $<j> in sub_map.
+        apply_one(doc, sub, /*idx=*/j, gen, sub_map);
+
+        const std::string key = "$" + std::to_string(j);
+        if (sub_map.contains(key)) {
+            local_map[key] = sub_map[key];
+            for (auto it = sub_map.begin(); it != sub_map.end(); ++it) {
+                const std::string& k = it.key();
+                if (k.size() > key.size() && k.compare(0, key.size(), key) == 0 &&
+                    k[key.size()] == '#')
+                    local_map[k] = it.value();
+            }
+        }
+        if (sub.value("op", "") == "add_feature" &&
+            doc.contains("features") && doc["features"].is_array() &&
+            doc["features"].size() > n_before) {
+            const json& nf = doc["features"].back();
+            const std::string fid = nf.value("id", std::string());
+            if (!fid.empty()) {
+                if (first_fid.empty()) first_fid = fid;
+                // Body-ish types (not a bare sketch used as a hex profile).
+                const std::string t = nf.value("type", std::string());
+                if (t != "sketch" && t != "sketch3d" && t != "plane" && t != "axis" &&
+                    t != "point" && t != "csys")
+                    last_body_fid = fid;
+            }
+        }
+    }
+
+    if (!override_name.empty() && !last_body_fid.empty()) {
+        if (json* f = find_feature(doc, last_body_fid)) (*f)["name"] = override_name;
+    } else if (!override_name.empty() && !first_fid.empty()) {
+        if (json* f = find_feature(doc, first_fid)) (*f)["name"] = override_name;
+    }
+
+    // Expose the primary body (or first feature) under the outer batch's $<idx>
+    // so subsequent ops can reference the macro result.
+    const std::string exposed =
+        !last_body_fid.empty() ? last_body_fid
+                               : (!first_fid.empty() ? first_fid : std::string());
+    if (!exposed.empty()) id_map["$" + std::to_string(idx)] = exposed;
+}
 
 void op_add_feature(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
     json feat;
@@ -780,10 +939,27 @@ void op_add_feature(json& doc, const json& op, std::size_t idx, IdGen& gen, json
     } else {
         throw OpError("invalid_op", "add_feature: 'feature' object required");
     }
+    // Capture type early — standard_part is a MACRO that expands into a sub-batch
+    // of real features (via aicad::parts::build, same as parts_make). It must NOT
+    // be stored as a feature itself (no compiler, would fail validation).
+    const std::string ftype_early = feat.value("type", std::string());
+    if (ftype_early == "standard_part") {
+        // Models often put family/size/thread/length at the feature TOP LEVEL
+        // (same shape as parts_make RPC fields) rather than nested under params.
+        if (!feat.contains("params") || !feat["params"].is_object())
+            feat["params"] = json::object();
+        for (const char* k : {"family", "size", "thread", "designation", "bore",
+                              "length_mm", "length", "L", "options", "kind"}) {
+            if (feat.contains(k) && !feat["params"].contains(k))
+                feat["params"][k] = feat[k];
+        }
+        expand_standard_part(doc, feat, idx, gen, id_map);
+        return;
+    }
     const std::string fid = gen.next("f");
     json env;
     env["id"] = fid;
-    env["type"] = feat.value("type", std::string());
+    env["type"] = ftype_early;
     env["name"] = feat.value("name", fid);
     env["suppressed"] = feat.value("suppressed", false);
     env["params"] = feat.contains("params") ? feat["params"] : json::object();

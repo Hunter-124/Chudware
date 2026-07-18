@@ -48,6 +48,13 @@ std::string jstr(const JsonT& j, const char* key, const std::string& d = std::st
 // default (the old value of 2 made the agent bail to a canned script on anything non-trivial).
 constexpr int kEscapeAfter = 4;
 
+// Prepended to ERRORS on ops-parse failures so the next modeler attempt gets an
+// explicit format directive (not just the underlying parse error string).
+const char* kOpsParseFormatDirective =
+    "REPLY FORMAT ERROR: your previous reply did not contain a valid ```json ops array. "
+    "Reply with ONLY a fenced ```json code block containing the ops array — no prose "
+    "before or after.";
+
 // Per-call output-token budget by provider + reasoning effort. The hardcoded 4096 throttled
 // capable cloud models (a complex part is one modeler call → truncation → parse fail → escape
 // hatch). Capable cloud backends get real headroom; local models stay modest.
@@ -499,25 +506,38 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
     } provider_emit_guard;
     // Forward streaming token deltas to the run event stream so the GUI shows the
     // model's continuous output live (channel "text" | "thinking"). Deltas are
-    // COALESCED per channel (flush at >=120 chars or on a newline) so we don't reopen
-    // events.jsonl per token — grok emits thousands. The final assistant message is
-    // persisted separately, so a trailing sub-flush buffer is not authoritative.
+    // COALESCED per channel (flush at >=48 chars, newline, or >=60ms since last
+    // flush) so we don't reopen events.jsonl per token — grok emits thousands.
+    // The final assistant message is persisted separately, so a trailing sub-flush
+    // buffer is not authoritative.
     struct DeltaCoalescer {
         RunEvents* ev;
         std::string buf_text, buf_think;
+        std::chrono::steady_clock::time_point last_flush_text =
+            std::chrono::steady_clock::now();
+        std::chrono::steady_clock::time_point last_flush_think =
+            std::chrono::steady_clock::now();
         std::string& chan(const std::string& kind) {
             return kind == "thinking" ? buf_think : buf_text;
+        }
+        std::chrono::steady_clock::time_point& last_flush(const std::string& kind) {
+            return kind == "thinking" ? last_flush_think : last_flush_text;
         }
         void flush(const std::string& kind) {
             std::string& b = chan(kind);
             if (b.empty()) return;
             ev->emit("assistant_delta", json{{"text", b}, {"channel", kind}});
             b.clear();
+            last_flush(kind) = std::chrono::steady_clock::now();
         }
         void push(const std::string& d, const std::string& kind) {
             std::string& b = chan(kind);
             b += d;
-            if (b.size() >= 120 || b.find('\n') != std::string::npos) flush(kind);
+            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - last_flush(kind))
+                                .count();
+            if (b.size() >= 48 || b.find('\n') != std::string::npos || ms >= 60)
+                flush(kind);
         }
         void flush_all() { flush("text"); flush("thinking"); }
     };
@@ -664,6 +684,8 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
     state.request = request;
     state.doc_id = doc_id;
     state.revision = tree0.value("revision", 0);
+    state.complexity = cx.level;
+    state.complexity_set = true;
     // Per-part notes (ai_notes) persisted in the .step+ by a prior session's memory stage:
     // load them so intake understands an EXISTING part on a follow-up run ("come back to the
     // part"). Empty object for a fresh doc or a doc that never earned notes (Solo one-offs).
@@ -755,7 +777,8 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
     };
 
     // _apply(ops): doc_apply_ops at state.revision; update rev + tree; collect status errors.
-    // On success (and on apply-with-status-errors) emit synthetic agent.tool_call Doing row.
+    // On success (and on apply-with-status-errors) emit synthetic agent.tool_call Doing row
+    // plus a live doc.preview so the host viewport can paint intermediate geometry.
     auto apply_ops = [&](DesignState& st, const json& ops) -> std::vector<std::string> {
         auto t0 = std::chrono::steady_clock::now();
         json resp = doc::doc_apply_ops(doc_id, st.revision, ops, /*coalesce=*/false);
@@ -770,6 +793,11 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         std::vector<std::string> errs = status_errors(fs);
         emit_agent_tool_call(events, /*tool_name=*/"", /*target=*/"", ops,
                              /*ok=*/errs.empty(), lat, /*parent_id=*/"", /*actor=*/"modeler");
+        std::string aicm_path;
+        if (resp.contains("tess") && resp["tess"].is_object())
+            aicm_path = resp["tess"].value("aicm_path", std::string());
+        if (!aicm_path.empty())
+            emit_doc_preview(events, doc_id, resp.value("revision", st.revision), aicm_path);
         return errs;
     };
 
@@ -972,6 +1000,9 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         }
         if (!ores.ops) {
             std::string perr = ores.error.value_or("");
+            // Strengthen retry feedback: explicit format directive first, then the
+            // underlying parse error (flows into build_context ERRORS block).
+            st.last_errors = {std::string(kOpsParseFormatDirective), perr};
             o.verdict = "retry";
             o.reason = "no ops: " + perr;
             o.parsed_ok = false;
@@ -983,6 +1014,31 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         }
         json ops = filter_ops_to_scope(*ores.ops);
         if (ops.empty()) {
+            // Empty ops on a non-empty build step while the tree is still empty is NOT a
+            // genuine "no ops needed" pass — the model bailed. Retry with feedback. Keep
+            // true no-op passes for edit-requests on existing geometry.
+            bool step_nonempty = false;
+            {
+                const std::string& cs = st.current_step;
+                size_t a = cs.find_first_not_of(" \t\r\n\f\v");
+                step_nonempty = (a != std::string::npos);
+            }
+            const bool empty_tree =
+                st.tree_digest.empty() || st.tree_digest.rfind("(empty", 0) == 0;
+            if (step_nonempty && empty_tree) {
+                const std::string msg =
+                    "you emitted an empty ops array but nothing has been built; emit the "
+                    "ops for this step";
+                st.last_errors = {msg};
+                o.verdict = "retry";
+                o.reason = msg;
+                o.parsed_ok = true;
+                o.has_ops_count = true;
+                o.ops_count = 0;
+                o.has_error = true;
+                o.error = "model: " + msg;
+                return o;
+            }
             st.last_no_progress = true;
             o.verdict = "pass";
             o.reason = "no ops needed for step";
@@ -1140,6 +1196,7 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         }
         if (!ores.ops) {
             std::string perr = ores.error.value_or("");
+            st.last_errors = {std::string(kOpsParseFormatDirective), perr};
             o.verdict = "retry";
             o.reason = "fix: no ops (" + perr + ")";
             o.parsed_ok = false;
@@ -1437,8 +1494,8 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
                     {"status", result["status"]},
                     {"stop_reason", result["stop_reason"]},
                     {"revision", revision},
-                    {"doc_id", state.doc_id},
-                    {"part_name", captured_part_name}};
+                    {"doc_id", state.doc_id}};
+    if (!captured_part_name.empty()) out["part_name"] = captured_part_name;
     if (!copilot_mode.empty()) out["mode"] = copilot_mode;
     if (result.contains("error_detail") && result["error_detail"].is_string() &&
         !result["error_detail"].get<std::string>().empty())

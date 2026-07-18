@@ -82,6 +82,13 @@ json emit_agent_tool_call(RunEvents& ev,
                           const std::string& parent_id = "",
                           const std::string& actor = "");
 
+// Live viewport preview after a successful ops apply. Emits kind "doc.preview" with
+// {doc_id, revision, aicm_path}. No-op (returns null) when aicm_path is empty.
+json emit_doc_preview(RunEvents& ev,
+                      const std::string& doc_id,
+                      int revision,
+                      const std::string& aicm_path);
+
 // ---------------------------------------------------------------------------
 // plan_state — additive multi-shape plan surface for the copilot Plan section.
 // shape: build_plan | checklist | phased_todo | objectives | dag

@@ -2812,6 +2812,12 @@ WASM_BOOT_LOG("[wasm-boot] entering main loop\n");
             }
         }
 
+        // Live-preview monotonic guard: shared by orch_doc.preview consume (below) and the
+        // end-of-run path so we skip the sticky "Refreshing model..." pill when the mesh is
+        // already current (last previewed revision == run final revision).
+        static int s_lastPreviewRev = 0;
+        static std::string s_lastPreviewDocId;
+
         // Drain streamed agent progress into the active (running) assistant message so the
         // conversation updates live, iteration by iteration (texture loads stay on this thread).
         {
@@ -2848,8 +2854,11 @@ WASM_BOOT_LOG("[wasm-boot] entering main loop\n");
                             // Context meter: reset at run start; track the peak context estimate
                             // across calls. C++ agent_output always has tokens:null, so prefer
                             // agent_call.context_tokens_est (the real per-call size).
-                            if (orchKind == "run_started") st.lastContextTokens = 0;
-                            else if (orchKind == "agent_call") {
+                            if (orchKind == "run_started") {
+                                st.lastContextTokens = 0;
+                                s_lastPreviewRev = 0;
+                                s_lastPreviewDocId.clear();
+                            } else if (orchKind == "agent_call") {
                                 int est = 0;
                                 if (data.contains("context_tokens_est") &&
                                     data["context_tokens_est"].is_number_integer())
@@ -2868,6 +2877,32 @@ WASM_BOOT_LOG("[wasm-boot] entering main loop\n");
                                 if (!pn.empty()) {
                                     std::lock_guard<std::mutex> lk(st.job.mtx);
                                     st.job.partName = std::move(pn);
+                                }
+                            } else if (orchKind == "doc.preview") {
+                                // Live viewport preview: agent successfully applied ops.
+                                // data = {doc_id, revision, aicm_path}. Monotonic rev guard +
+                                // mid-edit skip (same gate as engine_events doc.changed).
+                                const std::string prevDocId = data.value("doc_id", std::string());
+                                const int prevRev = data.value("revision", 0);
+                                const std::string aicm = data.value("aicm_path", std::string());
+                                if (prevDocId != s_lastPreviewDocId) {
+                                    s_lastPreviewDocId = prevDocId;
+                                    s_lastPreviewRev = 0;
+                                }
+                                const bool midEdit =
+                                    (st.sketchMode && st.sketchMode->active()) ||
+                                    (st.propertyManager && st.propertyManager->active());
+                                // Match the run's target: active DocMirror doc (launch always
+                                // targets the then-active doc; switching away must not clobber).
+                                if (!midEdit && !prevDocId.empty() &&
+                                    prevDocId == st.docMirror.docId() &&
+                                    prevRev > s_lastPreviewRev && !aicm.empty()) {
+                                    s_lastPreviewRev = prevRev;
+                                    st.loadDocMeshAsync(aicm);
+                                    st.livePhase = "Building\xe2\x80\xa6 rev " +
+                                                   std::to_string(prevRev);
+                                    if (active)
+                                        active->liveStatus = st.livePhase;
                                 }
                             }
                         } catch (...) {}
@@ -2973,7 +3008,18 @@ WASM_BOOT_LOG("[wasm-boot] entering main loop\n");
                     // the callback (a later frame's drain, GL thread) resyncs and reloads.
                     // doc_activate: the agent's final apply_ops left the engine's read-cache
                     // compile warm, so this serves the tree + mesh path without recompiling.
-                    st.livePhase = "Refreshing model...";
+                    // When live previews already landed the final revision, mesh is current —
+                    // skip the sticky "Refreshing model..." pill (still resync the tree).
+                    const int finalRev = st.job.finalRevision;
+                    const bool meshAlreadyCurrent =
+                        s_lastPreviewRev > 0 &&
+                        s_lastPreviewDocId == st.docMirror.docId() &&
+                        finalRev > 0 &&
+                        s_lastPreviewRev == finalRev;
+                    if (!meshAlreadyCurrent)
+                        st.livePhase = "Refreshing model...";
+                    else
+                        st.livePhase.clear();
                     // Multi-document: capture the doc this rebuild targets. If the user switches to
                     // another tab before the async result drains, the callback must NOT resync /
                     // reload the FOREGROUND doc with this (background) doc's result — the foreground
@@ -2982,7 +3028,7 @@ WASM_BOOT_LOG("[wasm-boot] entering main loop\n");
                     const std::string rebuildDocId = st.docMirror.docId();
                     ++st.rebuildsInFlight;
                     st.rpc.call("doc_activate", {{"doc_id", rebuildDocId}},
-                        [&st, rebuildDocId](const core::RpcResult& r) {
+                        [&st, rebuildDocId, meshAlreadyCurrent](const core::RpcResult& r) {
                             --st.rebuildsInFlight;
                             st.livePhase.clear();
                             if (st.docMirror.docId() != rebuildDocId) {
@@ -3001,17 +3047,20 @@ WASM_BOOT_LOG("[wasm-boot] entering main loop\n");
                                 // the auto-save below lands).
                                 st.syncActiveTabTitle();
                                 // C40: doc_activate is an ops-response — the mesh path lives at
-                                // tess.aicm_path (the old top-level read was always empty, so
-                                // the viewport NEVER refreshed after a v2 agent run).
-                                std::string aicmPath;
-                                if (r.result.contains("tess") && r.result["tess"].is_object())
-                                    aicmPath = r.result["tess"].value("aicm_path", "");
-                                if (aicmPath.empty())
-                                    aicmPath = r.result.value("aicm_path", "");
-                                if (!aicmPath.empty())
-                                    st.loadDocMeshAsync(aicmPath);  // T-PERF3
+                                // tess.aicm_path. Skip reload when live previews already showed
+                                // this revision (meshAlreadyCurrent).
+                                if (!meshAlreadyCurrent) {
+                                    std::string aicmPath;
+                                    if (r.result.contains("tess") && r.result["tess"].is_object())
+                                        aicmPath = r.result["tess"].value("aicm_path", "");
+                                    if (aicmPath.empty())
+                                        aicmPath = r.result.value("aicm_path", "");
+                                    if (!aicmPath.empty())
+                                        st.loadDocMeshAsync(aicmPath);  // T-PERF3
+                                }
                                 st.addLog("[v2] doc_activate + resync after run: rev=" +
-                                          std::to_string(st.docMirror.revision()));
+                                          std::to_string(st.docMirror.revision()) +
+                                          (meshAlreadyCurrent ? " (mesh already current)" : ""));
                             } else {
                                 st.addLog("[err] doc_activate after v2 run: " + r.err);
                                 st.toast(ui::ToastLevel::Error,
@@ -3023,7 +3072,8 @@ WASM_BOOT_LOG("[wasm-boot] entering main loop\n");
                 // Engine already renamed the doc (doc_set_name); we mirror that into the tab
                 // and persist so displayTitle() / Feature Manager / viewport all agree.
                 if (!openedNewDoc && !madeDrawing && !madeCam && st.docMirror.hasDoc() &&
-                    st.job.error.empty() && !st.job.partName.empty()) {
+                    st.job.error.empty() && !st.job.partName.empty() &&
+                    st.job.finalRevision > 0) {
                     const std::string partName = st.job.partName;
                     // Optimistic title so the strip updates even before async resync lands.
                     if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
@@ -3056,7 +3106,7 @@ WASM_BOOT_LOG("[wasm-boot] entering main loop\n");
                     }
                     const std::string savePath = candidate.string();
                     st.addLog("[v2] auto-saving named part -> " + savePath);
-                    ui::featureTreeSaveDocToPath(st, savePath);
+                    ui::featureTreeSaveDocToPath(st, savePath, /*requireNonEmpty=*/true);
                 }
             }
             // --- end C22b ---

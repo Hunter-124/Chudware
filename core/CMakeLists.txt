@@ -1176,6 +1176,7 @@ if(AICAD_WITH_OCCT)
     aicad_geom_occt aicad_sketch aicad_geom aicad_util aicad_sim
     aicad_mate
     aicad_miniz
+    aicad_parts
     nlohmann_json::nlohmann_json)
   if(AICAD_WITH_OPENNURBS)
     if(WIN32)

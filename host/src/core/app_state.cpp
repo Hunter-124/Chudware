@@ -8,6 +8,7 @@
 #include "stb_image_resize2.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cctype>
 #include <condition_variable>
@@ -23,6 +24,7 @@
 
 #include "app_state.h"
 #ifdef __EMSCRIPTEN__
+#include <emscripten.h>
 #include "fs_backend.h"
 #endif
 
@@ -51,7 +53,9 @@ const char* kStarterCode =
 // ---------------- settings (AI provider) ----------------
 std::string appdataDir() {
 #ifdef __EMSCRIPTEN__
-    return "/tmp";
+    // Durable IDBFS mount (see appstateInitPersist). Path is stable before mount
+    // completes; first load/save waits on appstatePersistReady().
+    return "/persist";
 #elif defined(_WIN32)
     const char* a = std::getenv("APPDATA");
     return std::string(a ? a : ".");
@@ -84,6 +88,65 @@ std::string appdataAppDir() {
     return cached;
 }
 std::string configPath() { return appdataAppDir() + "/config.json"; }
+
+#ifdef __EMSCRIPTEN__
+// IDBFS at /persist so config.json + chat_history.json survive page reloads.
+// Mount + populate once before any appdata read; flush (debounced) after writes.
+static std::atomic<bool> g_persistReady{false};
+
+void appstateInitPersist() {
+    if (g_persistReady.load(std::memory_order_acquire)) return;
+    EM_ASM({
+        try {
+            var root = '/persist';
+            Module.__billetPersistReady = false;
+            try { FS.mkdir(root); } catch (e) {}
+            try { FS.mount(IDBFS, {}, root); } catch (e) {
+                // Already mounted on a hot restart — keep going and re-populate.
+                console.warn('[billet] IDBFS mount:', e);
+            }
+            FS.syncfs(true, function(err) {
+                if (err) console.warn('[billet] IDBFS populate failed:', err);
+                else console.log('[billet] IDBFS populated at /persist');
+                // Ensure Billet appdata subdir exists after populate (empty store).
+                try { FS.mkdir(root + '/Billet'); } catch (e2) {}
+                Module.__billetPersistReady = true;
+            });
+        } catch (e) {
+            console.error('[billet] IDBFS init failed:', e);
+            Module.__billetPersistReady = true;  // fail open so boot continues
+        }
+    });
+    // ASYNCIFY: spin until the populate callback fires so loadSettings/chat never
+    // race an empty in-memory mount and clobber IndexedDB on the first write.
+    while (!EM_ASM_INT({ return Module.__billetPersistReady ? 1 : 0; })) {
+        emscripten_sleep(10);
+    }
+    g_persistReady.store(true, std::memory_order_release);
+}
+
+bool appstatePersistReady() {
+    return g_persistReady.load(std::memory_order_acquire);
+}
+
+void appstatePersistSync() {
+    if (!g_persistReady.load(std::memory_order_acquire)) return;
+    // Debounce in JS: coalesce rapid saveSettings/persistChatHistory bursts.
+    EM_ASM({
+        if (Module.__billetPersistSyncTimer) clearTimeout(Module.__billetPersistSyncTimer);
+        Module.__billetPersistSyncTimer = setTimeout(function() {
+            Module.__billetPersistSyncTimer = null;
+            FS.syncfs(false, function(err) {
+                if (err) console.warn('[billet] IDBFS flush failed:', err);
+            });
+        }, 50);
+    });
+}
+#else
+void appstateInitPersist() {}
+bool appstatePersistReady() { return true; }
+void appstatePersistSync() {}
+#endif
 
 // Default workspace dir under Documents — same alias rule: an existing Documents/AI-CAD
 // keeps being used; otherwise the default is Documents/Billet (created on first use by
@@ -129,7 +192,7 @@ void loadSettings(Settings& s) {
     std::ifstream f(configPath());
     if (!f) {
 #ifdef __EMSCRIPTEN__
-        // Web: no /tmp config yet — still hydrate recents from the workspace.
+        // Web: no config yet under IDBFS — still hydrate recents from the workspace.
         std::string rerr;
         auto durable = billet::fsBackend().loadRecents(rerr);
         if (!durable.empty()) s.recentFiles = std::move(durable);
@@ -278,7 +341,7 @@ void loadSettings(Settings& s) {
             for (const auto& e : *it)
                 if (e.is_string()) s.recentFiles.push_back(e.get<std::string>());
 #ifdef __EMSCRIPTEN__
-        // Web: config.json is /tmp-ephemeral. Prefer durable workspace recents.
+        // Web: prefer durable workspace recents when present (legacy path; IDBFS now holds config).
         {
             std::string rerr;
             auto durable = billet::fsBackend().loadRecents(rerr);
@@ -463,7 +526,7 @@ void saveSettings(const Settings& s) {
     if (!s.workspaceDir.empty()) j["workspace_dir"] = s.workspaceDir;
     j["recent_files"] = s.recentFiles;
 #ifdef __EMSCRIPTEN__
-    // Web: also write durable recents under the workspace (survives /tmp config).
+    // Web: also write durable recents under the workspace (belt-and-suspenders with IDBFS config).
     {
         std::string rerr;
         billet::fsBackend().saveRecents(s.recentFiles, rerr);
@@ -499,6 +562,7 @@ void saveSettings(const Settings& s) {
         const std::string tmp = path + ".tmp";
         std::ofstream(tmp) << j.dump(2);
         std::filesystem::rename(tmp, path);
+        appstatePersistSync();  // WASM: flush IDBFS; no-op on desktop
     } catch (...) {
     }
 }

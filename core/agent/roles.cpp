@@ -103,8 +103,9 @@ fs::path override_path(const std::string& role) {
     return override_dir() / (role + ".md");
 }
 
-std::string read_cheatsheet_shared(const std::string& prompts_dir) {
-    return read_text(builtin_dir(prompts_dir) / "shared" / "ops_cheatsheet.md");
+std::string read_cheatsheet_shared(const std::string& prompts_dir, bool solo) {
+    const char* name = solo ? "ops_cheatsheet_solo.md" : "ops_cheatsheet.md";
+    return read_text(builtin_dir(prompts_dir) / "shared" / name);
 }
 
 std::string read_hardware_catalog(const std::string& prompts_dir) {
@@ -132,7 +133,8 @@ bool is_role(const std::string& role) {
 }  // namespace
 
 std::pair<std::string, std::string> load_prompt(const std::string& role,
-                                                const std::string& prompts_dir) {
+                                                const std::string& prompts_dir,
+                                                bool solo) {
     if (!is_role(role)) throw std::runtime_error("unknown role " + role);
     fs::path ov = override_path(role);
     std::string ov_text;
@@ -150,7 +152,10 @@ std::pair<std::string, std::string> load_prompt(const std::string& role,
             throw std::runtime_error("role prompt unreadable/empty: " + source);
     }
     if (is_ops_role(role)) {
-        std::string cs = read_cheatsheet_shared(prompts_dir);
+        // Solo single-part runs get the slim cheatsheet; Standard/Complex keep full.
+        std::string cs = read_cheatsheet_shared(prompts_dir, solo);
+        // Fall back to the full sheet if the solo file is missing (older installs).
+        if (cs.empty() && solo) cs = read_cheatsheet_shared(prompts_dir, /*solo=*/false);
         if (!cs.empty()) text = py_rstrip(text) + "\n\n---\n" + cs;
     }
     if (is_catalog_role(role)) {

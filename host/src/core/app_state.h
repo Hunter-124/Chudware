@@ -183,6 +183,11 @@ std::string defaultWorkspaceDir();
 std::string configPath();
 void loadSettings(Settings& s);
 void saveSettings(const Settings& s);
+// WASM IDBFS: mount /persist early, populate before first config/chat load, flush after writes.
+// No-ops on desktop. appdataDir() returns "/persist" under EMSCRIPTEN once mounted.
+void appstateInitPersist();
+bool appstatePersistReady();
+void appstatePersistSync();
 
 // The Gemini API key shipped as the out-of-box default (user-provided). Seeded into
 // config.json on first run when no Gemini key is configured, so the copilot works
@@ -349,6 +354,9 @@ struct JobState {
     // streamed part_named event and/or the agent_run result's part_name field. The GL drain uses
     // it to refresh the tab title and auto-save <name>.step+ into the workspace.
     std::string partName;
+    // Final doc revision from a successful agent_run_v2 result. Host autosave gates on
+    // partName set AND finalRevision > 0 so a zero-progress / no_geometry run never writes.
+    int finalRevision = 0;
     // Mission orchestrator: a multi-capability run (design -> CFD -> verdict). isMission marks the
     // job so the drain uses missionVerdict (the report stage's prose) as the final chat bubble
     // instead of the generic design summary; createdDocPath still carries any assembly tab to open.
@@ -512,6 +520,8 @@ struct ActivityItem {
                             // turn's usage footer — it is not model I/O)
     bool streaming = false; // rowKind 2: agent.thought.delta chunks still arriving; finalized
                             // (and auto-collapsed) by the matching completed agent.thought
+    bool userToggled = false; // rowKind 2: user clicked the thought/output header; suppresses
+                              // one-shot auto-collapse when the stream completes
 };
 
 struct ChatMsg {

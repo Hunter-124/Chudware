@@ -176,6 +176,9 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
             if (it.value().is_number_integer() || it.value().is_number_unsigned())
                 budgets[it.key()] = it.value().get<int>();
 
+    // Starting revision — used to detect zero-progress (no successful applies).
+    const int start_revision = state.revision;
+
     int global_calls = 0;
     auto over_global_cap = [&] { return global_calls >= kGlobalIterCap; };
     auto cancelled = [&] { return control.cancelled(); };
@@ -190,6 +193,7 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
     // real provider HTTP error on the phase card instead of "budget exhausted (N)".
     std::string last_fail_reason;
     bool last_was_provider_error = false;
+    bool last_was_parse_error = false;
     // Run-level provider error (MODEL stage terminal) — returned as stop_reason.
     std::string run_provider_error;
 
@@ -218,6 +222,7 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
         if (over_global_cap()) {
             last_fail_reason = "global iteration cap reached";
             last_was_provider_error = false;
+            last_was_parse_error = false;
             events.emit("stage_result", json{{"stage", stage},
                                              {"attempt", attempt},
                                              {"verdict", "fail"},
@@ -237,6 +242,7 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
                 last_fail_reason =
                     "identical failure x" + std::to_string(streak) + ": " + err_sig(outcome.error);
                 last_was_provider_error = looks_like_provider_error(outcome);
+                last_was_parse_error = outcome.has_parse_error;
                 // Prefer the raw provider message on the phase card when it's a provider error.
                 std::string reason = last_was_provider_error && !outcome.reason.empty()
                                          ? outcome.reason
@@ -244,16 +250,23 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
                 if (last_was_provider_error) {
                     last_fail_reason = reason;
                     run_provider_error = reason;
+                } else if (last_was_parse_error) {
+                    reason = "the model kept replying in an invalid format";
+                    last_fail_reason = reason;
                 }
                 json sr = json{{"stage", stage},
                               {"attempt", attempt},
                               {"verdict", "fail"},
                               {"reason", reason},
                               {"stop_reason", last_was_provider_error ? "provider_error"
-                                                                     : "identical_failure"}};
+                                                   : (last_was_parse_error ? "parse_error"
+                                                                          : "identical_failure")}};
                 if (last_was_provider_error) {
                     sr["error_detail"] = reason;
                     sr["error_human"] = humanize_provider_error(reason);
+                } else if (last_was_parse_error) {
+                    sr["error_detail"] = reason;
+                    sr["error_human"] = reason;
                 }
                 events.emit("stage_result", sr);
                 return last_was_provider_error ? "provider_error" : "fail";
@@ -266,11 +279,19 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
         // can re-emit it instead of "budget exhausted (N)".
         if (looks_like_provider_error(outcome)) {
             last_was_provider_error = true;
+            last_was_parse_error = false;
             last_fail_reason = !outcome.reason.empty()
                                    ? outcome.reason
                                    : (outcome.has_error ? outcome.error : std::string("provider error"));
+        } else if (outcome.has_parse_error) {
+            last_was_provider_error = false;
+            last_was_parse_error = true;
+            last_fail_reason = !outcome.reason.empty()
+                                   ? outcome.reason
+                                   : (outcome.has_error ? outcome.error : outcome.parse_error);
         } else {
             last_was_provider_error = false;
+            last_was_parse_error = false;
             last_fail_reason = outcome.reason;
         }
 
@@ -287,6 +308,7 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
         int budget = budget_of(stage);
         last_fail_reason.clear();
         last_was_provider_error = false;
+        last_was_parse_error = false;
         for (int attempt = 1; attempt <= budget; ++attempt) {
             std::string v = run_attempt(stage, action, role, attempt, budget);
             if (v == "cancelled" || v == "pass" || v == "fail" || v == "skip" ||
@@ -296,24 +318,33 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
             if (attempt >= budget) {
                 // Provider/API failures must NOT masquerade as a budget problem — the GUI
                 // phase card renders stage_result.reason. Surface the real HTTP error.
+                // Parse failures get a plain user-facing message (not silent "Done").
                 std::string reason;
+                std::string stop;
                 if (last_was_provider_error && !last_fail_reason.empty()) {
                     reason = last_fail_reason;
+                    stop = "provider_error";
+                } else if (last_was_parse_error) {
+                    reason = "the model kept replying in an invalid format";
+                    stop = "parse_error";
                 } else {
                     reason = "stage retry budget exhausted (" + std::to_string(attempt) + " of " +
                              std::to_string(budget) + ")";
                     if (!last_fail_reason.empty()) reason += ": " + last_fail_reason;
+                    stop = "budget_exhausted";
                 }
                 json sr = json{{"stage", stage},
                               {"attempt", attempt},
                               {"verdict", "fail"},
                               {"reason", reason},
-                              {"stop_reason", last_was_provider_error ? "provider_error"
-                                                                     : "budget_exhausted"}};
+                              {"stop_reason", stop}};
                 if (last_was_provider_error) {
                     run_provider_error = reason;
                     sr["error_detail"] = reason;
                     sr["error_human"] = humanize_provider_error(reason);
+                } else if (last_was_parse_error) {
+                    sr["error_detail"] = reason;
+                    sr["error_human"] = reason;
                 }
                 events.emit("stage_result", sr);
                 return last_was_provider_error ? "provider_error" : "fail";
@@ -429,6 +460,13 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
                                 plan_state_items_from_steps(steps, /*running_index=*/-1,
                                                             /*all_done=*/false, step_index));
             }
+            if (last_was_parse_error) {
+                const std::string msg = "the model kept replying in an invalid format";
+                return json{{"status", "failed"},
+                           {"stop_reason", "parse_error"},
+                           {"error_detail", msg},
+                           {"error_human", msg}};
+            }
             return json{{"status", "failed"}, {"stop_reason", "model_failed"}};
         }
         ++step_index;
@@ -480,7 +518,31 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
         if (fix_v == "provider_error" || fix_v == "fail") break;
     }
 
-    // ---- MEMORY ----
+    // ---- MEMORY (part naming) ----
+    // Skip naming when the run produced no geometry: revision never advanced past the
+    // starting revision AND the feature tree is still empty. Fail with no_geometry so
+    // the host does not autosave an empty part_named result.
+    {
+        const bool rev_advanced = state.revision > start_revision;
+        const bool has_features =
+            !state.tree_digest.empty() && state.tree_digest.rfind("(empty", 0) != 0;
+        if (!rev_advanced && !has_features) {
+            const std::string msg =
+                "model produced no valid geometry — nothing was built";
+            events.emit("stage_result",
+                        json{{"stage", "memory"},
+                             {"attempt", 0},
+                             {"verdict", "fail"},
+                             {"reason", msg},
+                             {"stop_reason", "no_geometry"},
+                             {"text", msg}});
+            if (cancelled()) return cancel_result();
+            return json{{"status", "failed"},
+                       {"stop_reason", "no_geometry"},
+                       {"error_detail", msg},
+                       {"error_human", msg}};
+        }
+    }
     if (!cancelled()) run_stage("memory", actions.memory, "memory");
 
     if (cancelled()) return cancel_result();

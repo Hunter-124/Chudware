@@ -6017,10 +6017,43 @@ std::string featureTreeSaveDoc(AppState& st, bool saveAs) {
 // "Save As" vs. "Save" correctly and lets the Explorer highlight the open file.
 std::string featureTreeActivePath() { return s_docPath; }
 
-void featureTreeSaveDocToPath(AppState& st, const std::string& path) {
+// True when the mirrored tree has assembly components or any non-reference feature (extrude,
+// revolve, fillet, import, …). Sketches/datums alone do not count — matches the viewport's
+// hasSolidContent policy so an empty/sketch-only agent run is refused by requireNonEmpty.
+static bool mirrorHasSolidContent(const AppState& st) {
+    if (!st.docBodyIds.empty()) return true;  // viewport already shows solid bodies
+    const nlohmann::json& tree = st.docMirror.tree();
+    if (!tree.is_object()) return false;
+    auto ci = tree.find("components");
+    if (ci != tree.end() && ci->is_array() && !ci->empty()) return true;
+    auto fi = tree.find("features");
+    if (fi == tree.end() || !fi->is_array()) return false;
+    auto isRefOnly = [](const std::string& type) {
+        return type == "plane" || type == "datum_plane" || type == "ref_plane" ||
+               type == "axis" || type == "datum_axis" || type == "ref_axis" ||
+               type == "point" || type == "datum_point" || type == "ref_point" ||
+               type == "csys" || type == "coordinate_system" || type == "ref_csys" ||
+               type == "sketch" || type == "sketch3d";
+    };
+    for (const auto& f : *fi) {
+        if (!f.is_object()) continue;
+        if (f.value("suppressed", false)) continue;
+        const std::string type = f.value("type", std::string());
+        if (type.empty()) continue;
+        if (!isRefOnly(type)) return true;
+    }
+    return false;
+}
+
+void featureTreeSaveDocToPath(AppState& st, const std::string& path, bool requireNonEmpty) {
     if (path.empty() || !st.docMirror.hasDoc() || !st.workerStarted) return;
     const std::string docId = st.docMirror.docId();
     if (docId.empty()) return;
+    if (requireNonEmpty && !mirrorHasSolidContent(st)) {
+        st.toast(ui::ToastLevel::Warn, "Not saving: part is empty");
+        st.addLog("[doc] auto-save refused — part is empty");
+        return;
+    }
     const std::string pathCopy = path;
     st.toast(ui::ToastLevel::Info, "Saving " + pathBaseName(pathCopy) + "\xe2\x80\xa6");
     ++st.rebuildsInFlight;

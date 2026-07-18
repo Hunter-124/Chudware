@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "bootstrap.h"
+#include "core/app_state.h"  // appstateInitPersist (WASM IDBFS)
 #include "mesh.h"
 #include "renderer.h"
 #include "worker_client.h"
@@ -364,6 +365,9 @@ int main(int argc, char** argv) {
     });
     std::fprintf(stderr, "[wasm-boot] main enter\n");
     std::fflush(stderr);
+    // Mount IDBFS at /persist and populate from IndexedDB BEFORE any appdata
+    // read (loadSettings / chat_history). Blocks via ASYNCIFY until ready.
+    appstateInitPersist();
     propagateBilletEnv();
     ensurePromptsDir();
     EM_ASM({

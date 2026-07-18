@@ -22,8 +22,11 @@ extern const std::vector<std::string> kRoles;  // 8 roles, in order.
 
 // (text, source). source is the absolute path the text came from. Ops roles get
 // the ops cheatsheet appended. `prompts_dir` overrides AI_CAD_PROMPTS_DIR.
+// When `solo` is true, modeler/fixer get the slim ops_cheatsheet_solo.md instead
+// of the full ~28KB sheet (Standard/Complex keep the full sheet).
 std::pair<std::string, std::string> load_prompt(const std::string& role,
-                                                const std::string& prompts_dir = "");
+                                                const std::string& prompts_dir = "",
+                                                bool solo = false);
 
 // sha256(text utf-8).hexdigest()[:12].
 std::string prompt_hash(const std::string& text);

@@ -141,7 +141,9 @@ std::string featureTreeActivePath();
 // Silent save of the active DocMirror doc to an absolute .step+ path (no dialog). Used by the
 // agent run-finish path to auto-save a freshly named part. No-op if no doc / empty path / worker
 // down. On success updates the active tab's path, clears dirty, and records Recent (async).
-void featureTreeSaveDocToPath(AppState& st, const std::string& path);
+// When requireNonEmpty is true, refuses (toast "Not saving: part is empty") unless the mirrored
+// tree has at least one solid feature/body — keeps zero-progress agent runs from writing empties.
+void featureTreeSaveDocToPath(AppState& st, const std::string& path, bool requireNonEmpty = false);
 
 // Open a component's source part in a document tab. Dedups by canonical path: if a tab
 // already has that file open, switches to it; otherwise requests a new open. Used by the

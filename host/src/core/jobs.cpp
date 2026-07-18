@@ -86,6 +86,7 @@ void launchAgentRunV2(WorkerClient& w, JobState& job,
         job.drawingDocId.clear(); job.drawingName.clear(); job.drawingSourceId.clear();
         job.camDocId.clear();
         job.partName.clear();
+        job.finalRevision = 0;
     }
     { std::lock_guard<std::mutex> lk(job.evMtx); job.events.clear(); }
 
@@ -234,6 +235,12 @@ void launchAgentRunV2(WorkerClient& w, JobState& job,
                     std::string pn = result.value("part_name", std::string());
                     if (!pn.empty()) job.partName = std::move(pn);
                 }
+                // Final doc revision (0 when the run produced no geometry / never advanced).
+                // Host autosave gates on this so empty/no_geometry runs never write a file.
+                if (result.contains("revision") && result["revision"].is_number_integer())
+                    job.finalRevision = result["revision"].get<int>();
+                else
+                    job.finalRevision = result.value("revision", 0);
             }
         }
         job.ready = true;
@@ -261,6 +268,7 @@ void launchAgentDesign(WorkerClient& w, JobState& job,
         job.drawingDocId.clear(); job.drawingName.clear(); job.drawingSourceId.clear();
         job.camDocId.clear();
         job.partName.clear();
+        job.finalRevision = 0;
         job.isMission = false; job.missionVerdict.clear();
     }
     { std::lock_guard<std::mutex> lk(job.evMtx); job.events.clear(); }
@@ -443,6 +451,7 @@ void launchMissionRun(WorkerClient& w, JobState& job,
         job.createdDocPath.clear();
         job.isMission = true; job.missionVerdict.clear();
         job.partName.clear();
+        job.finalRevision = 0;
     }
     { std::lock_guard<std::mutex> lk(job.evMtx); job.events.clear(); }
 

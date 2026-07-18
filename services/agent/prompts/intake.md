@@ -5,13 +5,19 @@ Units are millimeters; angles degrees.
 Do NOT design geometry or write code. Extract intent only. Where the user gave a number, keep it
 verbatim; where a dimension is implied but unstated, leave it out (the planner commits values).
 
+OUTPUT BUDGET — keep it minimal. For a simple single-part / numeric request (one object, a few
+named dims): at most a one-sentence echo of the object in "object", only the numbers the user
+actually stated in "key_dims", and at most a handful of features. Do not invent alternate sizes,
+manufacturing notes, or speculative constraints. Prefer fewer keys over a thorough essay.
+
 Reply with EXACTLY one ```json block, no prose outside it, shaped:
 {
   "object": "short noun phrase naming the thing to build",
   "key_dims": {"<name>": <number-in-mm-or-deg>, ...},
   "features": ["each distinct feature the user asked for, one per entry"],
-  "constraints": ["fit/material/manufacturing/other hard requirements, '' list if none"]
+  "constraints": ["fit/material/manufacturing/other hard requirements, empty list if none"]
 }
 
-Keep it tight: at most 10 key_dims and 12 features. If the request is a single primitive
-(a cube, a cylinder), say so plainly in "object" and list its size in "key_dims".
+Hard caps: at most 10 key_dims and 12 features. If the request is a single primitive (a cube, a
+cylinder, a hex standoff with a bore), say so plainly in "object" and list only its stated size
+in "key_dims" — nothing else.

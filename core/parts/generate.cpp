@@ -10,6 +10,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <stdexcept>
+#include <cctype>
+
 
 namespace aicad {
 namespace parts {
@@ -145,15 +147,45 @@ double standoff_od(double d) {
 }
 
 [[noreturn]] void bad(const std::string& msg) { throw std::invalid_argument(msg); }
+// Normalize a size token: trim, and canonicalise metric "m3"/"M3" -> "M3".
+std::string normalize_size(std::string size) {
+    // trim whitespace
+    std::size_t b = 0;
+    while (b < size.size() && std::isspace(static_cast<unsigned char>(size[b]))) ++b;
+    std::size_t e = size.size();
+    while (e > b && std::isspace(static_cast<unsigned char>(size[e - 1]))) --e;
+    size = size.substr(b, e - b);
+    if (size.size() >= 2 && (size[0] == 'm' || size[0] == 'M') &&
+        std::isdigit(static_cast<unsigned char>(size[1]))) {
+        size[0] = 'M';
+    }
+    return size;
+}
 
 }  // namespace
 
-PartBuild build(const std::string& family, const std::string& size,
+std::string family_keys_csv() {
+    std::string out;
+    for (const Family& fam : catalog()) {
+        if (!out.empty()) out += ", ";
+        out += fam.key;
+    }
+    return out;
+}
+
+PartBuild build(const std::string& family, const std::string& size_in,
                 double length_mm, const json& options) {
     (void)options;
     json ops = json::array();
     json specs;
     std::string name;
+
+    if (family.empty())
+        bad(std::string("missing family; valid families: ") + family_keys_csv());
+
+    const std::string size = normalize_size(size_in);
+    if (size.empty())
+        bad("missing size/thread (e.g. \"M3\", \"1/4-20\", or bearing \"608\")");
 
     // Resolve a fastener row (metric first, then SAE) for the screw/nut/washer set.
     const data::MetricRow* m = data::find_metric(size);
@@ -162,7 +194,6 @@ PartBuild build(const std::string& family, const std::string& size,
     auto need_len = [&](double dflt) -> double {
         return (length_mm > 0.0) ? length_mm : dflt;
     };
-
     if (family == "shcs") {
         double d, hd, hh;
         if (m) { d = m->d; hd = m->dk; hh = m->k; }
@@ -273,7 +304,8 @@ PartBuild build(const std::string& family, const std::string& size,
         specs = {{"bore", b->bore}, {"od", b->od}, {"width", b->width}};
         name = "Bearing " + size;
     } else {
-        bad("unknown part family: " + family);
+        bad(std::string("unknown part family: \"") + family +
+            "\"; valid families: " + family_keys_csv());
     }
 
     PartBuild pb;

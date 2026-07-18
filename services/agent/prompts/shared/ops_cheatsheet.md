@@ -190,6 +190,13 @@ for the common machining features; they take a face in plain words and need no p
           face query (defaults to the top face). e.g. 6×⌀5 on a 40mm circle:
           {"type":"bolt_circle","params":{"diameter":5,"count":6,"pcd":40},"refs":{"face":{"of":"face","side":"top"}}}
   rib    — a thin web from an open sketch profile. refs.profile = [region]. (See sheet if present.)
+  standard_part — a catalog HARDWARE part expanded into normal editable tree features (same
+          generators as parts_make). PREFER over hand-modeling stock hardware. params {family
+          (required), size|thread ("M3", "1/4-20", bearing "608"), length_mm (screws/standoffs/
+          rod/dowel/insert; nuts/washers/bearings ignore it)}. Families: shcs, bhcs, fhcs,
+          hex_bolt, hex_nut, washer_flat, washer_lock, standoff_round, standoff_hex,
+          threaded_rod, dowel_pin, heat_set_insert, bearing. Invalid family → error lists keys.
+          {"type":"standard_part","name":"Standoff","params":{"family":"standoff_hex","thread":"M3","length_mm":22}}
 
 ADVANCED FEATURE FAMILIES — three families the engine fully supports (watertight geometry). Each has
 its own detailed cheatsheet; the essentials to invoke them:

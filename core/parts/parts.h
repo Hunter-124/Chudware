@@ -42,6 +42,9 @@ std::vector<Family> catalog();
 // standard,description,needs_length,sizes,lengths_mm}, ...]}.
 json catalog_json();
 
+// Comma-separated catalog family keys (e.g. "shcs, bhcs, …") for error strings.
+std::string family_keys_csv();
+
 // The generated ops + metadata for one concrete part.
 struct PartBuild {
     std::string name;  // display / file name, e.g. "SHCS M3x10"

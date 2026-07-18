@@ -681,7 +681,13 @@ void plan_display_meta(const ojson& plan, std::string& title_out, std::string& s
 BuiltContext build_context(const DesignState& state, const std::string& role,
                            const std::string& prompts_dir, int context_cap) {
     if (context_cap < 256) context_cap = 256;  // a floor so the math below stays sane
-    auto pr = load_prompt(role, prompts_dir);
+    // Solo modeler/fixer get the slim ops cheatsheet (~6KB vs ~28KB full). Prefer the
+    // stamped run complexity; fall back to re-classifying the request so callers that
+    // have not stamped DesignState still pick the right sheet.
+    Complexity cx = state.complexity_set ? state.complexity
+                                         : classify_complexity(state.request).level;
+    const bool solo_sheet = (cx == Complexity::Solo);
+    auto pr = load_prompt(role, prompts_dir, solo_sheet);
     std::string system = pr.first;
     bool trimmed = false;
 

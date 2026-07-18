@@ -560,43 +560,87 @@ void add_point_on_arc(System& sys, const std::string& cid, const std::vector<int
 // ------------------------------------------------------------ constraint wiring
 void add_constraint(System& sys, const json& c, const EntMap& entities,
                     const VarMap& vm, const json& env) {
-    const std::string ctype = c.at("type");
+    if (!c.is_object() || !c.contains("type") || !c["type"].is_string())
+        throw std::runtime_error("constraint missing type");
+    const std::string ctype = c.at("type").get<std::string>();
     std::vector<std::string> refs;
-    if (c.contains("refs"))
-        for (const auto& r : c["refs"]) refs.push_back(r.get<std::string>());
+    if (c.contains("refs") && c["refs"].is_array()) {
+        for (const auto& r : c["refs"]) {
+            if (!r.is_string())
+                throw std::runtime_error(ctype + " constraint: refs must be strings");
+            refs.push_back(r.get<std::string>());
+        }
+    }
     const std::string cid = c.value("id", std::string());
     if (c.value("driven", false)) return;  // reference dims are measured, not enforced
 
+    auto need = [&](std::size_t n) {
+        if (refs.size() < n) {
+            std::string got;
+            for (std::size_t i = 0; i < refs.size(); ++i) {
+                if (i) got += ", ";
+                got += "'" + refs[i] + "'";
+            }
+            if (got.empty()) got = "(none)";
+            throw std::runtime_error(ctype + " constraint needs " + std::to_string(n) +
+                                     " ref(s) (got " + std::to_string(refs.size()) +
+                                     "): " + got +
+                                     (cid.empty() ? std::string() : " [" + cid + "]"));
+        }
+    };
+
     if (ctype == "coincident") {
-        add_coincident(sys, cid, refs.at(0), refs.at(1), entities, vm);
+        need(2);
+        add_coincident(sys, cid, refs[0], refs[1], entities, vm);
     } else if (ctype == "fix") {
-        add_fix(sys, cid, refs.at(0), entities, vm);
+        need(1);
+        add_fix(sys, cid, refs[0], entities, vm);
     } else if (ctype == "distance") {
-        double d = resolve_dim(c, env);
-        // [point, point] or [point, <bare line entity id>].
-        const std::string& h1 = refs.at(1);
-        bool line_ref = h1.find('.') == std::string::npos && entities.count(h1) &&
-                        entities.at(h1).value("type", std::string()) == "line";
-        Handle3 p = resolve_point_handle(refs.at(0), entities, vm);
-        if (line_ref)
-            add_point_line_distance(sys, cid, p.idx, line_vars(h1, entities, vm), d);
-        else
-            add_point_point_distance(sys, cid, p.idx,
-                                     resolve_point_handle(h1, entities, vm).idx, d);
+        // 1 bare line ref → length; 2 refs → point-point / point-line.
+        if (refs.size() == 1) {
+            const std::string& h = refs[0];
+            bool line_ref = h.find('.') == std::string::npos && entities.count(h) &&
+                            entities.at(h).value("type", std::string()) == "line";
+            if (!line_ref)
+                throw std::runtime_error(
+                    "distance constraint needs 2 refs (got 1): '" + h + "'" +
+                    (cid.empty() ? std::string() : " [" + cid + "]") +
+                    " — single-ref distance is only valid on a bare line (line length)");
+            std::vector<int> l = line_vars(h, entities, vm);
+            add_point_point_distance(sys, cid, {l[0], l[1], l[2]}, {l[3], l[4], l[5]},
+                                     resolve_dim(c, env));
+        } else {
+            need(2);
+            double d = resolve_dim(c, env);
+            const std::string& h1 = refs[1];
+            bool line_ref = h1.find('.') == std::string::npos && entities.count(h1) &&
+                            entities.at(h1).value("type", std::string()) == "line";
+            Handle3 p = resolve_point_handle(refs[0], entities, vm);
+            if (line_ref)
+                add_point_line_distance(sys, cid, p.idx, line_vars(h1, entities, vm), d);
+            else
+                add_point_point_distance(sys, cid, p.idx,
+                                         resolve_point_handle(h1, entities, vm).idx, d);
+        }
     } else if (ctype == "length") {
-        std::vector<int> l = line_vars(refs.at(0), entities, vm);
+        need(1);
+        std::vector<int> l = line_vars(refs[0], entities, vm);
         add_point_point_distance(sys, cid, {l[0], l[1], l[2]}, {l[3], l[4], l[5]},
                                  resolve_dim(c, env));
     } else if (ctype == "parallel") {
-        add_parallel(sys, cid, line_vars(refs.at(0), entities, vm),
-                     line_vars(refs.at(1), entities, vm));
+        need(2);
+        add_parallel(sys, cid, line_vars(refs[0], entities, vm),
+                     line_vars(refs[1], entities, vm));
     } else if (ctype == "perpendicular") {
-        add_perpendicular(sys, cid, line_vars(refs.at(0), entities, vm),
-                          line_vars(refs.at(1), entities, vm));
+        need(2);
+        add_perpendicular(sys, cid, line_vars(refs[0], entities, vm),
+                          line_vars(refs[1], entities, vm));
     } else if (ctype == "angle") {
-        add_angle(sys, cid, line_vars(refs.at(0), entities, vm),
-                  line_vars(refs.at(1), entities, vm), resolve_dim(c, env));
+        need(2);
+        add_angle(sys, cid, line_vars(refs[0], entities, vm),
+                  line_vars(refs[1], entities, vm), resolve_dim(c, env));
     } else if (ctype == "along_axis") {
+        need(1);
         Vector3d u(0, 0, 1);
         if (c.contains("axis") && c["axis"].is_string()) {
             std::string a = c["axis"].get<std::string>();
@@ -608,10 +652,11 @@ void add_constraint(System& sys, const json& c, const EntMap& entities,
             u = pt3(c["dir"]);
             if (u.norm() < 1e-12) throw std::runtime_error("along_axis: zero dir");
         }
-        add_along_axis(sys, cid, line_vars(refs.at(0), entities, vm), u);
+        add_along_axis(sys, cid, line_vars(refs[0], entities, vm), u);
     } else if (ctype == "point_on") {
-        Handle3 p = resolve_point_handle(refs.at(0), entities, vm);
-        const std::string eid = eid_of(refs.at(1));
+        need(2);
+        Handle3 p = resolve_point_handle(refs[0], entities, vm);
+        const std::string eid = eid_of(refs[1]);
         auto eit = entities.find(eid);
         if (eit == entities.end()) throw std::runtime_error("point_on: unknown entity");
         const std::string t = eit->second.value("type", std::string());

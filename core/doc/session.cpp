@@ -1005,9 +1005,42 @@ void op_add_feature(json& doc, const json& op, std::size_t idx, IdGen& gen, json
         json norm = json::array();
         for (json& e : env["params"]["entities"]) {
             if (!e.is_object()) { norm.push_back(e); continue; }
-            for (json& x : expand_sketch_entity(e, gen)) norm.push_back(std::move(x));
+            for (json& x : expand_sketch_entity(e, gen)) {
+                // Register modeler aliases so same-batch constraints (and later
+                // sketch_add_constraint) can resolve "l0"/"l5" etc.
+                if (x.contains("_alias") && x["_alias"].is_string() &&
+                    x.contains("id") && x["id"].is_string()) {
+                    id_map[x["_alias"].get<std::string>()] = x["id"].get<std::string>();
+                    x.erase("_alias");
+                }
+                norm.push_back(std::move(x));
+            }
         }
         env["params"]["entities"] = std::move(norm);
+        // Remap any inline constraints that still name the modeler aliases.
+        if (env["params"].contains("constraints") && env["params"]["constraints"].is_array()) {
+            std::map<std::string, std::string> aliases;
+            // Prefer id_map bare-alias entries (just registered above).
+            for (auto it = id_map.begin(); it != id_map.end(); ++it) {
+                if (!it.key().empty() && it.key()[0] != '$' && it.value().is_string())
+                    aliases[it.key()] = it.value().get<std::string>();
+            }
+            for (json& c : env["params"]["constraints"]) {
+                if (!c.is_object() || !c.contains("refs") || !c["refs"].is_array()) continue;
+                for (json& rref : c["refs"]) {
+                    if (!rref.is_string()) continue;
+                    std::string s = rref.get<std::string>();
+                    std::string base = s, sub;
+                    auto dot = s.find('.');
+                    if (dot != std::string::npos) {
+                        base = s.substr(0, dot);
+                        sub = s.substr(dot);
+                    }
+                    auto ait = aliases.find(base);
+                    if (ait != aliases.end()) rref = ait->second + sub;
+                }
+            }
+        }
     }
     resolve_placeholders_deep(env["params"], id_map);
     resolve_placeholders_deep(env["refs"], id_map);
@@ -1264,14 +1297,76 @@ std::vector<json> expand_sketch_entity(json ent, IdGen& gen) {
         }
     }
 
-    // Ordinary entity: keep the model's id if it gave one (inline constraints reference it),
-    // otherwise mint a fresh one; default construction:false.
-    if (!ent.contains("id") || !ent["id"].is_string()) ent["id"] = gen.next("e");
-    else gen.note(ent["id"].get<std::string>());  // record it so an id-less sibling can't collide
+    // Ordinary entity: keep a CANONICAL e<N> id. Models often emit "l0"/"p1"/etc.;
+    // schema validate requires e\d+, so rewrite non-canonical ids here and stash the
+    // original under "_alias" so sketch_add_entity can remap later constraint refs.
+    if (!ent.contains("id") || !ent["id"].is_string() ||
+        ent["id"].get<std::string>().empty()) {
+        ent["id"] = gen.next("e");
+    } else {
+        const std::string raw = ent["id"].get<std::string>();
+        static const std::regex kEntIdRe("^e\\d+$");
+        if (std::regex_match(raw, kEntIdRe)) {
+            gen.note(raw);  // record it so an id-less sibling can't collide
+        } else {
+            ent["_alias"] = raw;
+            ent["id"] = gen.next("e");
+        }
+    }
     if (!ent.contains("construction")) ent["construction"] = false;
     out.push_back(std::move(ent));
     return out;
 }
+// Build alias -> canonical-eN map from entities that still carry "_alias" (or
+// already-stripped ones that were registered into id_map as bare alias keys).
+// Also strips residual "_alias" keys so they never reach validate/schema.
+std::map<std::string, std::string> sketch_entity_aliases(json& sk) {
+    std::map<std::string, std::string> m;
+    if (!sk.contains("params") || !sk["params"].is_object()) return m;
+    if (!sk["params"].contains("entities") || !sk["params"]["entities"].is_array()) return m;
+    for (json& e : sk["params"]["entities"]) {
+        if (!e.is_object()) continue;
+        if (e.contains("_alias") && e["_alias"].is_string() &&
+            e.contains("id") && e["id"].is_string()) {
+            m[e["_alias"].get<std::string>()] = e["id"].get<std::string>();
+            e.erase("_alias");
+        }
+    }
+    return m;
+}
+
+// Rewrite constraint refs that name a modeler alias (e.g. "l5", "l0.end") onto the
+// canonical eN id minted at entity-add time. Unknown refs are left alone so the
+// solver/validate path can still emit a precise error.
+void remap_constraint_refs(json& c, const std::map<std::string, std::string>& aliases,
+                           const json& id_map) {
+    if (!c.contains("refs") || !c["refs"].is_array()) return;
+    for (json& rref : c["refs"]) {
+        if (!rref.is_string()) continue;
+        std::string s = rref.get<std::string>();
+        // Prefer batch placeholders already resolved by resolve_placeholders_deep.
+        if (!s.empty() && s[0] == '$' && id_map.contains(s)) {
+            rref = id_map[s];
+            continue;
+        }
+        std::string base = s, sub;
+        auto dot = s.find('.');
+        if (dot != std::string::npos) {
+            base = s.substr(0, dot);
+            sub = s.substr(dot);  // includes leading '.'
+        }
+        auto it = aliases.find(base);
+        if (it != aliases.end()) {
+            rref = it->second + sub;
+            continue;
+        }
+        // Also accept bare alias keys stashed on id_map by sketch_add_entity.
+        if (id_map.contains(base) && id_map[base].is_string()) {
+            rref = id_map[base].get<std::string>() + sub;
+        }
+    }
+}
+
 void op_sketch_add_entity(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
     json& sk = require_sketch_feature(doc, op, id_map);
     json ent;
@@ -1291,15 +1386,32 @@ void op_sketch_add_entity(json& doc, const json& op, std::size_t idx, IdGen& gen
                       "sketch_add_entity: 'entity' object (or a top-level 'type') required");
     }
     std::vector<json> new_ents = expand_sketch_entity(std::move(ent), gen);
-    for (const json& e : new_ents) sk["params"]["entities"].push_back(e);
-    const std::string eid =
-        new_ents.empty() ? std::string() : new_ents.front().value("id", std::string());
-    id_map["$" + std::to_string(idx)] = eid;
-    for (std::size_t k = 1; k < new_ents.size(); ++k)
-        id_map["$" + std::to_string(idx) + "#" + std::to_string(k)] =
-            new_ents[k].value("id", std::string());
+    for (json& e : new_ents) {
+        // Register modeler alias -> canonical id so later constraints can resolve "l5".
+        if (e.contains("_alias") && e["_alias"].is_string() &&
+            e.contains("id") && e["id"].is_string()) {
+            id_map[e["_alias"].get<std::string>()] = e["id"].get<std::string>();
+            e.erase("_alias");
+        }
+        sk["params"]["entities"].push_back(std::move(e));
+    }
+    // Front id is the primary entity for $N / $self; multi-entity expands
+    // (polygon/airfoil) expose siblings as $N#k.
+    std::string eid;
+    if (!new_ents.empty()) {
+        const std::size_t n = new_ents.size();
+        const std::size_t total = sk["params"]["entities"].size();
+        eid = sk["params"]["entities"][total - n].value("id", std::string());
+        id_map["$" + std::to_string(idx)] = eid;
+        for (std::size_t k = 1; k < n; ++k)
+            id_map["$" + std::to_string(idx) + "#" + std::to_string(k)] =
+                sk["params"]["entities"][total - n + k].value("id", std::string());
+    } else {
+        id_map["$" + std::to_string(idx)] = std::string();
+    }
     // Inline constraints: "$self" -> the new entity id; ids cN.
     if (op.contains("constraints") && op["constraints"].is_array()) {
+        auto aliases = sketch_entity_aliases(sk);
         for (const json& c0 : op["constraints"]) {
             json c = c0;
             // resolve $self (and $self.sub) in refs to the new entity id.
@@ -1312,6 +1424,7 @@ void op_sketch_add_entity(json& doc, const json& op, std::size_t idx, IdGen& gen
                     }
                 }
                 resolve_placeholders_deep(c["refs"], id_map);
+                remap_constraint_refs(c, aliases, id_map);
             }
             c["id"] = gen.next("c");
             sk["params"]["constraints"].push_back(c);
@@ -1337,7 +1450,71 @@ void op_sketch_add_constraint(json& doc, const json& op, std::size_t idx, IdGen&
                       "sketch_add_constraint: 'constraint' object (or a top-level 'type') required");
     }
     unwrap_value_scalars(c);  // accept {value:N} scalars in sketch constraints
+    // Dimensional constraints must store value as {value, expr} for schema validate.
+    // unwrap_value_scalars flattens {value:40, expr:null} → 40; re-wrap bare numbers
+    // (and leave already-object dims alone). Solver resolve_dim accepts both shapes.
+    if (c.contains("type") && c["type"].is_string()) {
+        const std::string ct = c["type"].get<std::string>();
+        if ((ct == "distance" || ct == "length" || ct == "angle" || ct == "radius" ||
+             ct == "diameter") &&
+            c.contains("value") && c["value"].is_number()) {
+            c["value"] = json{{"value", c["value"].get<double>()}, {"expr", nullptr}};
+        }
+    }
     resolve_placeholders_deep(c, id_map);
+    // Remap modeler entity aliases (l0/l5/...) onto canonical eN ids BEFORE validate
+    // and before the solver sees the constraint. Without this, "l5" fails schema
+    // (handle must be e\d+) and "distance{refs:[l5]}" never reaches the length path.
+    {
+        auto aliases = sketch_entity_aliases(sk);
+        remap_constraint_refs(c, aliases, id_map);
+    }
+    // Defensive arity check at the op boundary so a bad model reply becomes a clean
+    // OpError instead of a later solver crash. Mirrors CONSTRAINT_SPECS lo bounds.
+    if (c.contains("type") && c["type"].is_string()) {
+        const std::string ctype = c["type"].get<std::string>();
+        std::size_t nrefs = 0;
+        if (c.contains("refs") && c["refs"].is_array()) nrefs = c["refs"].size();
+        auto bad = [&](std::size_t need, const char* why) {
+            std::string got;
+            if (c.contains("refs") && c["refs"].is_array()) {
+                for (std::size_t i = 0; i < c["refs"].size(); ++i) {
+                    if (i) got += ", ";
+                    if (c["refs"][i].is_string())
+                        got += "'" + c["refs"][i].get<std::string>() + "'";
+                    else
+                        got += c["refs"][i].dump();
+                }
+            }
+            if (got.empty()) got = "(none)";
+            throw OpError("invalid_op",
+                          std::string(ctype) + " constraint needs " + std::to_string(need) +
+                              " ref(s) (got " + std::to_string(nrefs) + "): " + got +
+                              (why ? std::string(" — ") + why : std::string()));
+        };
+        if (ctype == "coincident" || ctype == "parallel" || ctype == "perpendicular" ||
+            ctype == "tangent" || ctype == "collinear" || ctype == "equal" ||
+            ctype == "concentric" || ctype == "coradial" || ctype == "midpoint" ||
+            ctype == "point_on" || ctype == "angle") {
+            if (nrefs < 2) bad(2, nullptr);
+        } else if (ctype == "symmetric") {
+            if (nrefs < 3) bad(3, nullptr);
+        } else if (ctype == "fix" || ctype == "radius" || ctype == "diameter" ||
+                   ctype == "length") {
+            if (nrefs < 1) bad(1, nullptr);
+        } else if (ctype == "horizontal" || ctype == "vertical") {
+            if (nrefs < 1) bad(1, nullptr);
+        } else if (ctype == "distance") {
+            // 1 ref = line length (bare line/slot); 2 refs = point-point / point-line.
+            if (nrefs < 1)
+                bad(2, "distance needs 2 geometric refs, or 1 bare line for length");
+            if (nrefs == 1 && c["refs"][0].is_string()) {
+                const std::string h = c["refs"][0].get<std::string>();
+                if (h.find('.') != std::string::npos)
+                    bad(2, "single-ref distance is only valid on a bare line/slot");
+            }
+        }
+    }
     const std::string cid = gen.next("c");
     c["id"] = cid;
     sk["params"]["constraints"].push_back(c);

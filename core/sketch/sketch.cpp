@@ -747,8 +747,12 @@ Handle resolve_handle(const std::string& handle, const EntMap& entities,
 
     if (t == "point") return ident_point(vidx);
     if (t == "line") {
-        if (sub.empty() || sub == "p1") return ident_point(pick(vidx, {0, 1}));
-        if (sub == "p2") return ident_point(pick(vidx, {2, 3}));
+        // start/end are the modeler's common aliases for p1/p2 (session trim/extend
+        // already treat them that way; without this, coincident on "l0.end" silently
+        // failed via the unresolved-handle throw → skipped constraint).
+        if (sub.empty() || sub == "p1" || sub == "start")
+            return ident_point(pick(vidx, {0, 1}));
+        if (sub == "p2" || sub == "end") return ident_point(pick(vidx, {2, 3}));
         if (sub == "mid") {
             Handle h;
             h.idx = vidx;
@@ -1545,6 +1549,37 @@ void add_radius_like(System& sys, const std::string& cid, const std::string& ref
     }
 }
 
+// Line (or slot spine) length residual: |p2 - p1| == d. Used by type "length"
+// and by the common modeler shorthand distance{refs:[line]} (= line-length dim).
+void add_line_length(System& sys, const std::string& cid, const std::string& line_h,
+                     double d, const EntMap& entities, const VarMap& var_map) {
+    const std::string eid = eid_of(line_h);
+    auto it = entities.find(eid);
+    if (it == entities.end())
+        throw std::runtime_error("length constraint: unknown entity '" + eid + "'");
+    const std::string t = it->second.value("type", std::string());
+    if (t != "line" && t != "slot")
+        throw std::runtime_error("length constraint needs a line/slot ref (got '" + t +
+                                 "': '" + line_h + "')");
+    auto vit = var_map.find(eid);
+    if (vit == var_map.end() || vit->second.size() < 4)
+        throw std::runtime_error("length constraint: entity '" + eid + "' has no line vars");
+    std::vector<int> idx = pick(vit->second, {0, 1, 2, 3});
+    sys.add_residual(
+        [d](const VectorXd& xs) {
+            return r1(std::hypot(xs(2) - xs(0), xs(3) - xs(1)) - d);
+        },
+        idx,
+        [](const VectorXd& xs) {
+            double ax = xs(0), ay = xs(1), bx = xs(2), by = xs(3);
+            double L = std::max(std::hypot(bx - ax, by - ay), 1e-12);
+            MatrixXd J(1, 4);
+            J << -(bx - ax) / L, -(by - ay) / L, (bx - ax) / L, (by - ay) / L;
+            return J;
+        },
+        cid);
+}
+
 void add_whole_line_hv(System& sys, const std::string& cid, const std::string& eid,
                        bool horizontal, const VarMap& var_map) {
     // horizontal: p1y==p2y (vars [1,3]); vertical: p1x==p2x (vars [0,2]).
@@ -1913,50 +1948,137 @@ void add_symmetric(System& sys, const std::string& cid, const std::string& h0,
 void add_constraint(System& sys, const json& c, const EntMap& entities,
                     const VarMap& var_map, const json& env,
                     bool interactive = false) {
-    const std::string ctype = c.at("type");
+    if (!c.is_object() || !c.contains("type") || !c["type"].is_string())
+        throw std::runtime_error("constraint missing type");
+    const std::string ctype = c.at("type").get<std::string>();
     std::vector<std::string> refs;
-    if (c.contains("refs"))
-        for (const auto& r : c["refs"]) refs.push_back(r.get<std::string>());
+    if (c.contains("refs") && c["refs"].is_array()) {
+        for (const auto& r : c["refs"]) {
+            if (!r.is_string())
+                throw std::runtime_error(ctype + " constraint: refs must be strings");
+            refs.push_back(r.get<std::string>());
+        }
+    }
     const std::string cid = c.value("id", std::string());
     if (c.value("driven", false)) return;  // reference dims measured after solve
 
+    // Bound-safe ref access. Every branch MUST go through this (or an explicit
+    // refs.size() check) before indexing — a bad modeler payload used to
+    // SIGSEGV hostd on refs[1] of a 1-element distance.
+    auto need = [&](std::size_t n) {
+        if (refs.size() < n) {
+            std::string got;
+            for (std::size_t i = 0; i < refs.size(); ++i) {
+                if (i) got += ", ";
+                got += "'" + refs[i] + "'";
+            }
+            if (got.empty()) got = "(none)";
+            throw std::runtime_error(ctype + " constraint needs " + std::to_string(n) +
+                                     " ref(s) (got " + std::to_string(refs.size()) +
+                                     "): " + got +
+                                     (cid.empty() ? std::string() : " [" + cid + "]"));
+        }
+    };
+    auto known_entity = [&](const std::string& h) {
+        const std::string eid = eid_of(h);
+        if (eid == "origin") return;
+        if (!entities.count(eid))
+            throw std::runtime_error(ctype + " constraint: unknown entity '" + eid +
+                                     "' (ref '" + h + "')" +
+                                     (cid.empty() ? std::string() : " [" + cid + "]"));
+        if (!var_map.count(eid) && eid != "origin")
+            throw std::runtime_error(ctype + " constraint: entity '" + eid +
+                                     "' has no solver vars" +
+                                     (cid.empty() ? std::string() : " [" + cid + "]"));
+    };
+
     if (ctype == "coincident") {
+        need(2);
+        known_entity(refs[0]);
+        known_entity(refs[1]);
         add_two_point(sys, cid, refs[0], refs[1], 0, entities, var_map);
     } else if (ctype == "horizontal" || ctype == "vertical") {
+        need(1);
         bool horiz = ctype == "horizontal";
         if (refs.size() >= 2) {
+            known_entity(refs[0]);
+            known_entity(refs[1]);
             add_two_point(sys, cid, refs[0], refs[1], horiz ? 1 : 2, entities, var_map);
         } else if (refs[0].find('.') == std::string::npos) {
+            known_entity(refs[0]);
             std::string eid = refs[0];
             std::string et = entities.at(eid).at("type");
             // line and slot both store [p1x,p1y,p2x,p2y,...]; whole-entity h/v
             // enforces p1y==p2y (h) or p1x==p2x (v).
             if (et == "line" || et == "slot")
                 add_whole_line_hv(sys, cid, eid, horiz, var_map);
+            else
+                throw std::runtime_error(ctype +
+                                         " constraint on a single ref needs a line/slot "
+                                         "(got '" + et + "': '" + eid + "')");
+        } else {
+            // Single point-handle form is not meaningful for h/v; require 2.
+            need(2);
         }
     } else if (ctype == "parallel") {
+        need(2);
+        known_entity(refs[0]);
+        known_entity(refs[1]);
         add_parallel(sys, cid, refs[0], refs[1], var_map);
     } else if (ctype == "perpendicular") {
+        need(2);
+        known_entity(refs[0]);
+        known_entity(refs[1]);
         add_perpendicular(sys, cid, refs[0], refs[1], var_map);
     } else if (ctype == "concentric") {
+        need(2);
+        known_entity(refs[0]);
+        known_entity(refs[1]);
         add_concentric(sys, cid, refs[0], refs[1], var_map);
     } else if (ctype == "collinear") {
+        need(2);
+        known_entity(refs[0]);
+        known_entity(refs[1]);
         add_collinear(sys, cid, refs[0], refs[1], var_map);
     } else if (ctype == "coradial") {
+        need(2);
+        known_entity(refs[0]);
+        known_entity(refs[1]);
         add_coradial(sys, cid, refs[0], refs[1], var_map);
     } else if (ctype == "equal") {
+        need(2);
+        known_entity(refs[0]);
+        known_entity(refs[1]);
         add_equal(sys, cid, refs[0], refs[1], entities, var_map);
     } else if (ctype == "midpoint") {
+        need(2);
+        known_entity(refs[0]);
+        known_entity(refs[1]);
         add_midpoint(sys, cid, refs[0], refs[1], entities, var_map);
     } else if (ctype == "symmetric") {
+        need(3);
+        known_entity(refs[0]);
+        known_entity(refs[1]);
+        known_entity(refs[2]);
         add_symmetric(sys, cid, refs[0], refs[1], refs[2], entities, var_map);
     } else if (ctype == "angle") {
+        need(2);
+        known_entity(refs[0]);
+        known_entity(refs[1]);
         add_angle(sys, cid, refs[0], refs[1], resolve_dim(c, env), var_map);
     } else if (ctype == "fix") {
+        need(1);
+        known_entity(refs[0]);
         add_fix(sys, cid, refs[0], entities, var_map);
     } else if (ctype == "point_on") {
+        need(2);
+        known_entity(refs[0]);
+        known_entity(refs[1]);
         add_point_on(sys, cid, refs[0], refs[1], entities, var_map);
     } else if (ctype == "tangent") {
+        need(2);
+        known_entity(refs[0]);
+        known_entity(refs[1]);
         std::string e0 = eid_of(refs[0]), e1 = eid_of(refs[1]);
         std::string t0 = entities.at(e0).at("type"), t1 = entities.at(e1).at("type");
         auto is_curved = [](const std::string& t) { return t == "circle" || t == "arc"; };
@@ -1989,17 +2111,45 @@ void add_constraint(System& sys, const json& c, const EntMap& entities,
             add_tangent_curve_curve(sys, cid, e0, e1, entities, var_map, interactive);
         // line-line tangent (ill-defined) stays deferred; skip.
     } else if (ctype == "distance") {
-        std::string axis;
-        if (c.contains("axis") && c["axis"].is_string()) axis = c["axis"].get<std::string>();
-        std::string cond0, cond1;
-        if (c.contains("cond") && c["cond"].is_array()) {
-            const json& cd = c["cond"];
-            if (cd.size() > 0 && cd[0].is_string()) cond0 = cd[0].get<std::string>();
-            if (cd.size() > 1 && cd[1].is_string()) cond1 = cd[1].get<std::string>();
+        // SEMANTIC: a single bare line/slot ref is a LINE-LENGTH dimension
+        // (SolidWorks-style "select edge → Smart Dimension"). Two-ref form is
+        // the classic point-point / point-line distance. Anything else is an error.
+        if (refs.size() == 1) {
+            known_entity(refs[0]);
+            if (is_line_ref(refs[0], entities) ||
+                (refs[0].find('.') == std::string::npos && entities.count(refs[0]) &&
+                 entities.at(refs[0]).value("type", std::string()) == "slot")) {
+                add_line_length(sys, cid, refs[0], resolve_dim(c, env), entities, var_map);
+            } else {
+                throw std::runtime_error(
+                    "distance constraint needs 2 refs (got 1): '" + refs[0] + "'" +
+                    (cid.empty() ? std::string() : " [" + cid + "]") +
+                    " — single-ref distance is only valid on a bare line/slot (line length)");
+            }
+        } else {
+            need(2);
+            known_entity(refs[0]);
+            known_entity(refs[1]);
+            std::string axis;
+            if (c.contains("axis") && c["axis"].is_string())
+                axis = c["axis"].get<std::string>();
+            std::string cond0, cond1;
+            if (c.contains("cond") && c["cond"].is_array()) {
+                const json& cd = c["cond"];
+                if (cd.size() > 0 && cd[0].is_string()) cond0 = cd[0].get<std::string>();
+                if (cd.size() > 1 && cd[1].is_string()) cond1 = cd[1].get<std::string>();
+            }
+            add_distance(sys, cid, refs[0], refs[1], resolve_dim(c, env), entities, var_map,
+                         axis, cond0, cond1);
         }
-        add_distance(sys, cid, refs[0], refs[1], resolve_dim(c, env), entities, var_map,
-                     axis, cond0, cond1);
+    } else if (ctype == "length") {
+        // Explicit line-length constraint (matches sketch3d "length").
+        need(1);
+        known_entity(refs[0]);
+        add_line_length(sys, cid, refs[0], resolve_dim(c, env), entities, var_map);
     } else if (ctype == "radius" || ctype == "diameter") {
+        need(1);
+        known_entity(refs[0]);
         std::string eid = eid_of(refs[0]);
         std::string et = entities.at(eid).at("type");
         double val = resolve_dim(c, env);
@@ -2021,6 +2171,9 @@ void add_constraint(System& sys, const json& c, const EntMap& entities,
                     return j;
                 },
                 cid);
+        } else {
+            throw std::runtime_error(ctype + " constraint needs a circle/arc/slot ref (got '" +
+                                     et + "': '" + refs[0] + "')");
         }
     }
     // unknown -> skip (forward-tolerant)
@@ -2168,7 +2321,7 @@ std::map<std::string, std::string> compute_statuses(
 // helpers return std::nullopt where the Python returns None (dangling refs).
 
 const std::set<std::string> kDimensionalTypes = {"distance", "angle", "radius",
-                                                 "diameter"};
+                                                 "diameter", "length"};
 
 // World (x, y) of a point handle against SOLVED entity coords. nullopt if it cannot
 // be resolved (dangling). Port of _handle_point.
@@ -2190,16 +2343,16 @@ std::optional<Vector2d> handle_point(const std::string& handle, const json& coor
     auto as_pt = [](const json& a) { return Vector2d(num(a[0]), num(a[1])); };
     if (et == "point") return as_pt(ent.at("p"));
     if (et == "line") {
-        if (!has_sub || sub == "p1") return as_pt(ent.at("p1"));
-        if (sub == "p2") return as_pt(ent.at("p2"));
+        if (!has_sub || sub == "p1" || sub == "start") return as_pt(ent.at("p1"));
+        if (sub == "p2" || sub == "end") return as_pt(ent.at("p2"));
         if (sub == "mid") {
             Vector2d a = as_pt(ent.at("p1")), b = as_pt(ent.at("p2"));
             return Vector2d((a(0) + b(0)) * 0.5, (a(1) + b(1)) * 0.5);
         }
     }
+    bool has_center = ent.contains("center");
     if (et == "circle" || et == "arc" || et == "ellipse" || et == "ellipse_arc" ||
         et == "arc_slot") {
-        bool has_center = ent.contains("center");
         if ((!has_sub || sub == "center") && has_center) return as_pt(ent.at("center"));
         if (et == "arc" && (sub == "start" || sub == "end")) {
             double cx = num(ent["center"][0]), cy = num(ent["center"][1]);
@@ -2210,8 +2363,8 @@ std::optional<Vector2d> handle_point(const std::string& handle, const json& coor
         }
     }
     if (et == "slot") {
-        if (!has_sub || sub == "p1") return as_pt(ent.at("p1"));
-        if (sub == "p2") return as_pt(ent.at("p2"));
+        if (!has_sub || sub == "p1" || sub == "start") return as_pt(ent.at("p1"));
+        if (sub == "p2" || sub == "end") return as_pt(ent.at("p2"));
     }
     return std::nullopt;
 }
@@ -2853,7 +3006,25 @@ std::optional<double> measure_constraint(const json& constraint,
         return m;
     }
 
-    if (ctype == "distance") {
+    if (ctype == "distance" || ctype == "length") {
+        // 1 bare line/slot ref → line length (Smart-Dimension / type "length").
+        if (refs.size() == 1) {
+            auto le = line_endpoints(refs[0], entity_coords);
+            if (!le) {
+                std::string eid = refs[0].substr(0, refs[0].find('.'));
+                if (entity_coords.contains(eid)) {
+                    const json& ent = entity_coords.at(eid);
+                    if (ent.value("type", std::string()) == "slot" &&
+                        ent.contains("p1") && ent.contains("p2")) {
+                        double ax = num(ent["p1"][0]), ay = num(ent["p1"][1]);
+                        double bx = num(ent["p2"][0]), by = num(ent["p2"][1]);
+                        return std::hypot(bx - ax, by - ay);
+                    }
+                }
+                return std::nullopt;
+            }
+            return std::hypot(le->second(0) - le->first(0), le->second(1) - le->first(1));
+        }
         if (refs.size() < 2) return std::nullopt;
         auto is_line = [&](const std::string& h) {
             std::string eid = h.substr(0, h.find('.'));

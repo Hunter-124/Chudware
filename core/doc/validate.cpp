@@ -82,7 +82,7 @@ const std::map<string, vector<string>> ENTITY_FIELDS = {
 // Entity type -> point sub-handles it exposes.
 const std::map<string, std::set<string>> ENTITY_SUBS = {
     {"point", {"p"}},
-    {"line", {"p1", "p2", "mid"}},
+    {"line", {"p1", "p2", "mid", "start", "end"}},
     {"circle", {"center"}},
     {"arc", {"center", "start", "end"}},
     {"ellipse", {"center"}},
@@ -113,7 +113,10 @@ const std::map<string, ConstraintSpec> CONSTRAINT_SPECS = {
     {"symmetric", {3, 3, false}},
     {"fix", {1, 1, false}},
     {"point_on", {2, 2, false}},
-    {"distance", {2, 2, true}},
+    // distance: 2 refs = point-point/point-line; 1 bare line/slot ref = line length
+    // (modeler Smart-Dimension shorthand). "length" is the explicit 1-ref form.
+    {"distance", {1, 2, true}},
+    {"length", {1, 1, true}},
     {"angle", {2, 2, true}},
     {"radius", {1, 1, true}},
     {"diameter", {1, 1, true}},
@@ -1059,6 +1062,17 @@ vector<string> validate_constraint(const json& c, const string& where,
                 if (ent_present && et == "line" && !has_dot) {
                     errs.push_back(where + ".axis: not allowed for a point-line distance");
                 }
+            }
+        }
+    }
+    // Single-ref distance / length must name a bare line or slot entity.
+    if ((ctype == "distance" && refs.size() == 1) || ctype == "length") {
+        if (!refs.empty()) {
+            auto [has_dot, et] = ent_type_of(refs[0]);
+            bool ent_present = (et != "<<noent>>");
+            if (has_dot || (ent_present && et != "line" && et != "slot")) {
+                errs.push_back(where + ".refs[0]: " + ctype +
+                               " with 1 ref needs a bare line/slot entity id (line length)");
             }
         }
     }

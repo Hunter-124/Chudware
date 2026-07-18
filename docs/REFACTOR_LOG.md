@@ -1681,3 +1681,68 @@ double-render). Gotcha/deferred: deploying restarts the shared daemon (kills in-
 this is what froze a user's rocket build mid-run); a graceful drain that waits for / cancels the
 in-flight provider call before restart is a separate fix. The daemon shutdown-drain STILL SIGABRTs
 when a provider HTTP call is in flight (coredump on redeploy) — not addressed here.
+
+### Harness fix waves + web/local parity + grok battery (session handoff)
+Large multi-wave effort on the C++ copilot (core/agent/), the daemon, and the shared host
+GUI (desktop + WASM). Landed + pushed on master: 5f210a5c (live event streaming),
+f81fcc1c (data-loss guards / live doc.preview / display polish / solo token diet /
+standard_part macro / shared web chat), 07c65d5e (web parity + fast switch + tool-scope
+escalation), plus this commit (sketch crash fix + battery fixtures + handoff).
+
+**Shipped & verified (build.sh all green; targeted ctests green):**
+- Data loss: atomic chat persist + corrupt-file preservation + doc:->file: key migration
+  (sessions no longer vanish on autosave rekey); WASM IDBFS /persist; zero-progress runs
+  fail no_geometry + skip naming + host autosave gate (finalRevision>0 + non-empty tree).
+- Live preview: doc.preview event {doc_id,revision,aicm_path} after every apply →
+  loadDocMeshAsync (revision-monotonic) on desktop + web.
+- Fast switch: web AICM immutable Cache-Control + client 8/64MB LRU; desktop cold switch
+  async (no GL-thread sync parse); skip doc_activate when cache valid; meshCache_ LRU=6.
+- Display: raw ops JSON suppressed from prose bubble (Building ops… card); thinking blocks
+  auto-expand while streaming; routing card upserts on classification/complexity/task_route.
+- Solo token diet: ops_cheatsheet_solo.md (6.4KB) for Solo modeler/fixer (~33KB→~10.5KB).
+- standard_part macro: 13 hardware families expand via parts_make generators from ops JSON.
+- Tool-scope escalation: model emits {op:request_tools,classes:[...]} to upgrade its
+  cheatsheet mid-run (free retry); auto-escalates on unknown-op validation failure.
+- Web/local parity: FEA (SimClient starts in daemon mode; server-side STEP paths; async
+  overlay; thermal routed; unsupported studies gated), CAM (cam_extract_from_doc server-side
+  extract; Download NC; async long RPCs), file I/O (all main-thread SYNC emscripten_fetch
+  removed; async open + dedup; browser drop→upload; server-owned agent autosave), shared web
+  chat (gateway /workspace/chat per-key merge).
+- Sketch crash: single-line `distance` constraint (line-length Smart Dimension) SIGSEGV'd
+  hostd via OOB refs[1]. Fixed: add_constraint arity/known-entity guards on every branch
+  (2D+3D), single-line distance routes to add_line_length, op-boundary OpError, entity-id
+  alias remap (l0/l5→eN). Repro fixture: corpora/agent_ops_fixtures/sketch_single_line_distance_crash.json.
+
+**Grok-4.5 battery findings (round 1, scratch daemons) — OPEN, for next session:**
+- Classification correct across Solo/Standard/Complex + edges (coordinate-system NOT Complex,
+  multi-part "bolt together" Complex, sheetmetal domain gets sm_* ops without escalation).
+- BUG: garbage prompt "asdf qwerty blah blah" → intake did NOT reject; model invented a 50mm
+  cube, status=done, part_named "Centered Cube Body". Fix: intake must reject non-design input
+  (return status=failed/unintelligible) BEFORE the model stage invents geometry. The
+  no_geometry guard misses it because a cube IS geometry.
+- BUG: complexity.skip_plan=true but the plan stage still runs (0-token stub) — Solo not lean.
+  And a Solo standoff ran intake+plan+model+review+6×fix+memory (~150s). Fix: actually skip
+  plan on Solo; cap/parameterize the fix loop (6 iterations is runaway); make review a
+  deterministic early-exit when measured dims match (reviewer approval token is {"done":true}).
+- BUG (top UX): ~20-24s of dead silence BEFORE run_started fires on every run (classification
+  is instant AFTER run_started). Investigate what agent_run_v2 does between socket receipt and
+  the first emit (doc/notes bootstrap? provider warmup? model pick network call?) — this is the
+  latency the user perceives as "not immediate".
+- standard_part macro works live (standoff_hex emitted + applied). assistant_delta still
+  streams raw ops JSON on the wire (UI suppresses it; acceptable). agent.tool_call uses
+  tool_name/target (not tool) — naive consumers see null.
+
+**Exec-modes (edit/plan/swarm/eng-firm + advisor-on-demand) — SCOUTED, NOT built:**
+recommend_structure is test-only; corporate_force is (void)'d; GUI Swarm/Eng.Firm hit C++
+agent_mission_v1 (sequential, telemetry-only firm_bid/firm_team). CRITICAL deployment fact:
+the shared hostd daemon is pure C++ and this box (and the shared daemon) has NO Python venv /
+build123d — the Python corporate/DAG/delegation stack (services/agent/, services/dag/) is only
+in full session containers, NOT reachable from the shared agent_run_v2/agent_mission_v1 path.
+So exec-modes must be implemented C++-native (reuse firm_bid/firm_team + run_assembly_design
+per-part execution + std::thread waves with mutex'd RunEvents::emit + an advisor-role LLM call
+behind a request_advice op), NOT bridged to Python. Plan/spec gates for swarm & eng_firm and
+advisor-on-demand for all modes are the remaining user asks. Full scout inventory: history
+of ModesScout this session.
+
+**Deferred:** daemon shutdown-drain SIGABRT when a provider HTTP call is in flight (redeploy
+kills in-flight web runs); a graceful drain is a separate fix.

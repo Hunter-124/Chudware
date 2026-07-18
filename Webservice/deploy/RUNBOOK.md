@@ -228,6 +228,32 @@ Portal users get a **Paste text…** button in the stream bar — types text int
 the focused widget inside their seat via `xdotool` (the browser clipboard can't
 reach the container's X clipboard). 20k char cap, argv-passed (no shell).
 
+### Shared /admin terminal (tmux-backed)
+
+The `/admin` browser terminal is now **shared, saved, and concurrent**. Each
+session is a named **tmux** session on the gateway host (socket
+`$BILLET_TMUX_SOCKET`, default `billet`), so it survives browser disconnects
+*and* a gateway restart, and several admins can attach to the same session at
+once — they see and drive the same `omp` instance, which makes it easy to keep
+track of the actual work in flight.
+
+- **Shared-sessions picker** (top of the terminal pane) lists every session
+  with a live client count; click one to attach, `+ New session` to start one,
+  the `×` on a pill to kill it. A browser **tab** is just this browser's
+  attachment: closing it (or `Ctrl+Alt+W`) only **detaches** — the session
+  keeps running. `Ctrl+Alt+T` starts a new session.
+- REST (admin-only): `GET/POST /api/admin/terminal/sessions`,
+  `DELETE /api/admin/terminal/sessions/{name}`. WS `/admin/terminal?name=<s>`
+  attaches (creating on demand).
+- **Host dependency:** `tmux` must be installed (`dnf install -y tmux`). The
+  first session starts the tmux server inside a `systemd-run --user --scope`
+  unit so heavy `omp` builds live outside the gateway's MemoryMax cgroup; if the
+  user bus is missing the create retries unscoped. Without tmux the terminal
+  falls back to the old private, per-connection shell (not shared or saved).
+- Sessions persist with zero clients (`destroy-unattached off`); they die only
+  on an explicit kill or when the shell/`omp` in them exits. List/inspect from a
+  shell with `tmux -L billet ls`.
+
 ### Nightly backups
 
 `billet-backup.timer` (03:30 + jitter, `Persistent=true`) runs

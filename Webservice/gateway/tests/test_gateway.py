@@ -685,3 +685,66 @@ def test_admin_refuse_new_toggle(client, _admin_env, _isolate):
     assert r3.status_code == 200 and r3.json()["refuse_new"] is False and not flag.exists()
     ops = client.get("/api/admin/ops", headers=_auth("boss@example.com")).json()
     assert ops["refuse_new"] is False and "units" in ops["host"]
+
+
+# ------------------------------------------------------ shared admin terminal
+@pytest.fixture
+def _tmux_env(monkeypatch):
+    """Isolated tmux socket + no-op omp; skip when tmux is unavailable."""
+    import gateway.terminal as term
+
+    if term._TMUX is None:
+        pytest.skip("tmux not installed on host")
+    monkeypatch.setattr(term, "_SOCKET", "billet-pytest")
+    monkeypatch.setenv("BILLET_OMP_CMD", "true")
+    # Start the tmux server directly (no systemd user scope) so the test is
+    # hermetic on boxes without a user systemd bus.
+    real_which = term.shutil.which
+    monkeypatch.setattr(
+        term.shutil, "which",
+        lambda n: None if n == "systemd-run" else real_which(n),
+    )
+    term._run_tmux("kill-server")
+    yield term
+    term._run_tmux("kill-server")
+
+
+def test_terminal_sessions_shared_lifecycle(client, _admin_env, _tmux_env):
+    # admin-gated
+    assert client.get("/api/admin/terminal/sessions",
+                      headers=_auth("demo@example.com")).status_code == 403
+
+    body = client.get("/api/admin/terminal/sessions",
+                      headers=_auth("boss@example.com")).json()
+    assert body["tmux"] is True and body["sessions"] == []
+
+    # create a named shared session
+    r = client.post("/api/admin/terminal/sessions",
+                    headers=_auth("boss@example.com"), json={"name": "Work 1!"})
+    assert r.status_code == 200, r.text
+    assert r.json()["name"] == "work-1"  # slugged
+
+    # it now shows up for every admin (shared/saved with zero clients attached)
+    sessions = client.get("/api/admin/terminal/sessions",
+                          headers=_auth("boss@example.com")).json()["sessions"]
+    names = {s["name"]: s for s in sessions}
+    assert "work-1" in names and names["work-1"]["clients"] == 0
+
+    # non-admins cannot create or kill
+    assert client.post("/api/admin/terminal/sessions",
+                       headers=_auth("demo@example.com"), json={}).status_code == 403
+    assert client.delete("/api/admin/terminal/sessions/work-1",
+                         headers=_auth("demo@example.com")).status_code == 403
+
+    # auto-named create when no name given
+    auto = client.post("/api/admin/terminal/sessions",
+                       headers=_auth("boss@example.com"), json={}).json()["name"]
+    assert auto and auto != "work-1"
+
+    # explicit kill removes it
+    r = client.delete("/api/admin/terminal/sessions/work-1",
+                      headers=_auth("boss@example.com"))
+    assert r.status_code == 200 and r.json()["ok"] is True
+    left = {s["name"] for s in client.get("/api/admin/terminal/sessions",
+            headers=_auth("boss@example.com")).json()["sessions"]}
+    assert "work-1" not in left and auto in left

@@ -117,6 +117,64 @@
   #term-host .xterm { height: 100%; }
   #term-host .xterm-viewport { overflow-y: auto !important; }
 
+  /* ---- shared session picker (all sessions on the host) ---- */
+  .term-picker {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 6px 8px;
+    background: #0e1117;
+    border-bottom: 1px solid var(--border, #2a2e36);
+    flex-shrink: 0;
+  }
+  .term-picker-label {
+    font-size: .72rem;
+    text-transform: uppercase;
+    letter-spacing: .05em;
+    color: var(--muted, #8b93a3);
+    margin-right: 4px;
+  }
+  .term-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 8px;
+    border-radius: 999px;
+    border: 1px solid var(--border, #2a2e36);
+    background: #151922;
+    color: var(--fg, #e8eaf0);
+    font-size: .78rem;
+    cursor: pointer;
+    white-space: nowrap;
+    touch-action: manipulation;
+  }
+  .term-pill:hover { border-color: var(--teal-hi, #42ecce); }
+  .term-pill.open { border-color: var(--teal-hi, #42ecce); background: #17202a; }
+  .term-pill .term-pill-clients {
+    font-size: .68rem;
+    color: var(--muted, #8b93a3);
+  }
+  .term-pill .term-pill-clients.live { color: var(--teal-hi, #42ecce); }
+  .term-pill .term-pill-kill {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    border-radius: 999px;
+    opacity: .6;
+    font-size: .8rem;
+    line-height: 1;
+  }
+  .term-pill .term-pill-kill:hover { opacity: 1; background: rgba(255,107,122,.2); color: #ff6b7a; }
+  .term-pill-new {
+    border-style: dashed;
+    color: var(--muted, #8b93a3);
+  }
+  .term-pill-new:hover { color: var(--fg, #e8eaf0); }
+  .term-picker-empty { font-size: .76rem; color: var(--muted, #8b93a3); }
+
   /* ---- right: admin cards ---- */
   .admin-side {
     flex: 0 0 380px;
@@ -254,8 +312,12 @@
 <body>
 <div class="admin-wrap">
   <div class="admin-term-pane">
-    <div class="term-tabs" id="term-tabs" role="tablist" aria-label="Terminal tabs">
-      <button type="button" class="term-tab-new" id="term-new" title="New terminal (Ctrl+Alt+T)" aria-label="New terminal">+</button>
+    <div class="term-picker" id="term-picker" aria-label="Shared sessions">
+      <span class="term-picker-label">Shared sessions</span>
+      <span class="term-picker-empty" id="term-picker-empty">loading…</span>
+    </div>
+    <div class="term-tabs" id="term-tabs" role="tablist" aria-label="Open terminals">
+      <button type="button" class="term-tab-new" id="term-new" title="New shared session (Ctrl+Alt+T)" aria-label="New shared session">+</button>
     </div>
     <div id="term-host"></div>
   </div>
@@ -333,6 +395,6 @@
 <script src="/static/admin.js?v=6"></script>
 <script src="/static/vendor/xterm.js"></script>
 <script src="/static/vendor/xterm-addon-fit.js"></script>
-<script src="/static/admin_terminal.js?v=1"></script>
+<script src="/static/admin_terminal.js?v=2"></script>
 </body>
 </html>

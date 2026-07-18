@@ -1549,3 +1549,25 @@ EM_ASM top-level commas in app.cpp (GCC tolerated, clang/em++ errored). Verified
 5 pre-existing fails unrelated), /api/providers no-secret-leak smoke, and workspaces+asm headless
 crash-check smokes. Deferred to user: live-turn visuals (forging anim, tool-image expansion,
 routing card) need a real model; gateway pytest needs the deploy venv (fastapi absent here).
+
+## 2026-07-17 — billet-web /admin terminal: shared, saved, concurrent (tmux)
+The `/admin` browser terminal is no longer a private, ephemeral per-connection shell.
+It's now backed by named **tmux** sessions on the gateway host (socket
+`$BILLET_TMUX_SOCKET`, default `billet`): sessions survive browser disconnects *and*
+gateway restarts, and multiple admins can attach to the same session at once and drive
+the same `omp` — so the team can watch/pick up the actual work in flight. Each WS is one
+`tmux attach` client (its own PTY); closing a tab only detaches (SIGHUP the client), the
+session lives on (`destroy-unattached off`, `status off` for full-screen omp). Explicit
+kill via `DELETE /api/admin/terminal/sessions/{name}`. New REST (admin-only):
+`GET/POST /api/admin/terminal/sessions`; WS `/admin/terminal?name=<s>` creates-on-attach.
+First session plants the tmux server in a `systemd-run --user --scope` unit (omp builds
+stay out of the gateway cgroup); create verifies existence, logs stderr, retries unscoped
+if the user bus is absent, else raises → 500. `admin.html` gains a shared-sessions picker
+(live client counts, attach/kill pills); `admin_terminal.js?v=2` rewritten (picker, session
+labels via a `{type:"session"}` frame, bounded auto-reconnect that does NOT resurrect a
+killed session). Files: `Webservice/gateway/terminal.py` (rewrite), `static/admin_terminal.js`,
+`static/admin.html`, `tests/test_gateway.py` (+`test_terminal_sessions_shared_lifecycle`).
+No tmux → falls back to the old private shell. **Host dep:** `dnf install -y tmux`.
+Verified: create→attach(×1)→detach(persists)→kill and 2-client concurrent smoke; gateway
+pytest terminal+admin 11/11 (10 pre-existing failures unrelated — env "not_on_list", identical
+on stashed tree).

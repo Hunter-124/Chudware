@@ -1,8 +1,25 @@
-"""WS /admin/terminal — admin-only browser terminal running omp in the CAD repo.
+"""WS /admin/terminal — admin-only shared browser terminals running omp.
 
-Spawns an interactive login shell in a detached systemd user scope (so omp's
-builds cannot OOM-kill the gateway cgroup), auto-launches `omp`, and pumps
-raw PTY bytes over the WebSocket.
+Sessions are backed by a persistent **tmux** server (socket ``$BILLET_TMUX_SOCKET``,
+default ``billet``) started inside its own systemd user scope, so:
+
+  * they survive browser disconnects *and* gateway restarts (**saved**);
+  * multiple admins can attach to the same named session at once and see/drive
+    the same omp instance (**shared** + **concurrent**), which makes it easy to
+    keep track of the actual work in flight.
+
+Each WebSocket is one tmux *client* (its own PTY). Closing a WebSocket only
+detaches that client — the session keeps running. Killing a session is explicit
+(``DELETE /api/admin/terminal/sessions/{name}``) or happens when the whole tmux
+session is destroyed (e.g. the shell exits).
+
+REST (all admin-only):
+  GET    /api/admin/terminal/sessions          -> {tmux, sessions:[...]}
+  POST   /api/admin/terminal/sessions {name?}  -> {name}
+  DELETE /api/admin/terminal/sessions/{name}   -> {ok}
+
+Without tmux the gateway falls back to a private, ephemeral per-connection shell
+(the previous behaviour): still functional, just not shared or persistent.
 """
 
 from __future__ import annotations
@@ -13,15 +30,23 @@ import json
 import logging
 import os
 import pty
+import re
 import select
 import shutil
 import signal
 import struct
+import subprocess
 import termios
 from pathlib import Path
+from typing import Any
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
+
+try:
+    from .auth import get_current_user
+except ImportError:  # uvicorn app:app from package dir
+    from auth import get_current_user
 
 log = logging.getLogger("billet-web.terminal")
 
@@ -31,6 +56,18 @@ _DEFAULT_COLS = 80
 _DEFAULT_ROWS = 24
 _READ_SIZE = 65536
 _KILL_GRACE_S = 0.5
+
+# tmux backing --------------------------------------------------------------
+_TMUX = shutil.which("tmux")
+_SOCKET = (os.environ.get("BILLET_TMUX_SOCKET") or "billet").strip() or "billet"
+# tmux session-name prefix so the shared pool never collides with a personal
+# tmux and is trivially filterable in list-sessions.
+_PREFIX = "billet-"
+_NAME_RE = re.compile(r"[^a-z0-9-]+")
+_LS_FMT = (
+    "#{session_name}\t#{session_windows}\t#{session_attached}"
+    "\t#{session_created}\t#{session_activity}"
+)
 
 
 def _repo_dir() -> Path:
@@ -65,8 +102,190 @@ def _set_winsize(fd: int, rows: int, cols: int) -> None:
         log.debug("TIOCSWINSZ failed: %s", exc)
 
 
+def _child_env(repo: Path) -> dict[str, str]:
+    """Env for a forked child (shell or tmux client)."""
+    env = os.environ.copy()
+    env["TERM"] = "xterm-256color"
+    # Ensure ~/.local/bin is on PATH even before login-shell rc files run.
+    home = env.get("HOME") or str(Path.home())
+    local_bin = str(Path(home) / ".local" / "bin")
+    path = env.get("PATH") or ""
+    if local_bin not in path.split(":"):
+        env["PATH"] = f"{local_bin}:{path}" if path else local_bin
+    return env
+
+
+# --- shared session name helpers -------------------------------------------
+def _slug(name: str) -> str:
+    s = _NAME_RE.sub("-", (name or "").strip().lower()).strip("-")
+    return s[:40]
+
+
+def _tmux_name(slug: str) -> str:
+    return _PREFIX + slug
+
+
+def _display(tmux_name: str) -> str:
+    return tmux_name[len(_PREFIX):] if tmux_name.startswith(_PREFIX) else tmux_name
+
+
+def _tmux_cmd(*args: str) -> list[str]:
+    return [_TMUX, "-L", _SOCKET, *args]
+
+
+def _run_tmux(*args: str, timeout: float = 10.0) -> subprocess.CompletedProcess:
+    """Run a tmux control command (client-side, returns quickly)."""
+    return subprocess.run(  # noqa: S603
+        _tmux_cmd(*args),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def _server_running() -> bool:
+    if not _TMUX:
+        return False
+    return _run_tmux("list-sessions").returncode == 0
+
+
+def _session_exists(tmux_name: str) -> bool:
+    if not _TMUX:
+        return False
+    return _run_tmux("has-session", "-t", f"={tmux_name}").returncode == 0
+
+
+def _list_sessions() -> list[dict[str, Any]]:
+    """Shared sessions in our pool, oldest first. Empty when no server/tmux."""
+    if not _TMUX:
+        return []
+    cp = _run_tmux("list-sessions", "-F", _LS_FMT)
+    if cp.returncode != 0:  # no server running yet
+        return []
+    out: list[dict[str, Any]] = []
+    for line in cp.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 5:
+            continue
+        name = parts[0]
+        if not name.startswith(_PREFIX):
+            continue
+
+        def _int(v: str) -> int:
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return 0
+
+        out.append(
+            {
+                "name": _display(name),
+                "windows": _int(parts[1]),
+                "clients": _int(parts[2]),
+                "created": _int(parts[3]),
+                "activity": _int(parts[4]),
+            }
+        )
+    out.sort(key=lambda s: s["created"])
+    return out
+
+
+def _next_name() -> str:
+    """Pick the lowest free ``omp-N`` display name."""
+    existing = {s["name"] for s in _list_sessions()}
+    i = 1
+    while f"omp-{i}" in existing:
+        i += 1
+    return f"omp-{i}"
+
+
+def _create_session(tmux_name: str, cols: int, rows: int, repo: Path) -> None:
+    """Create a detached tmux session running omp in the repo.
+
+    The very first session also starts the tmux server; that command is wrapped
+    in a systemd user scope so the server (and every omp it hosts) lives outside
+    the gateway's MemoryMax cgroup — a heavy build can't OOM-kill the gateway.
+    Later sessions attach to the existing server and inherit that scope.
+    """
+    env = _child_env(repo)
+    base = _tmux_cmd(
+        "new-session",
+        "-d",
+        "-s",
+        tmux_name,
+        "-x",
+        str(cols),
+        "-y",
+        str(rows),
+        "-c",
+        str(repo),
+        "/bin/bash",
+        "-il",
+    )
+    scoped: list[str] | None = None
+    if not _server_running() and shutil.which("systemd-run"):
+        scoped = ["systemd-run", "--user", "--scope", "--quiet", "--collect", *base]
+    cp = subprocess.run(  # noqa: S603
+        scoped or base, env=env, capture_output=True, text=True, timeout=20, check=False
+    )
+    if not _session_exists(tmux_name):
+        # systemd-run --user needs a user bus; if it's absent the scoped create
+        # fails silently. Retry unscoped so the terminal still works (just inside
+        # the gateway cgroup), then give up loudly rather than returning a phantom
+        # session that the WS attach would immediately report as "ended".
+        if scoped is not None:
+            log.warning(
+                "scoped tmux create failed (rc=%s): %s — retrying without systemd-run",
+                cp.returncode,
+                (cp.stderr or "").strip()[-300:],
+            )
+            cp = subprocess.run(  # noqa: S603
+                base, env=env, capture_output=True, text=True, timeout=20, check=False
+            )
+        if not _session_exists(tmux_name):
+            detail = (cp.stderr or cp.stdout or "").strip()[-300:] or f"rc={cp.returncode}"
+            raise RuntimeError(f"tmux session create failed: {detail}")
+    target = f"={tmux_name}"
+    # Clean full-screen omp for shared viewing; keep the session alive with zero
+    # attached clients so work is never lost when everyone closes their browser.
+    _run_tmux("set-option", "-t", target, "status", "off")
+    _run_tmux("set-option", "-t", target, "destroy-unattached", "off")
+    # Launch omp in the pane. send-keys buffers into the pane pty; bash reads it
+    # at its first prompt, so no settle/injection dance is needed.
+    _run_tmux("send-keys", "-t", target, _omp_cmd(), "Enter")
+    log.info("terminal session created name=%s repo=%s", _display(tmux_name), repo)
+
+
+def _kill_session(tmux_name: str) -> bool:
+    if not _TMUX:
+        return False
+    return _run_tmux("kill-session", "-t", f"={tmux_name}").returncode == 0
+
+
+def _spawn_attach(tmux_name: str, cols: int, rows: int) -> tuple[int, int]:
+    """Fork a PTY and exec ``tmux attach`` (plain attach → multi-client)."""
+    argv = _tmux_cmd("attach", "-t", f"={tmux_name}")
+    child_env = _child_env(_repo_dir())
+    pid, master_fd = pty.fork()
+    if pid == 0:
+        try:
+            _set_winsize(0, rows, cols)
+        except Exception:
+            pass
+        try:
+            os.execvpe(argv[0], argv, child_env)
+        except OSError:
+            os._exit(127)
+        os._exit(127)
+    _set_winsize(master_fd, rows, cols)
+    log.info("terminal attach pid=%d master=%d session=%s", pid, master_fd, _display(tmux_name))
+    return pid, master_fd
+
+
+# --- legacy (no tmux): private ephemeral shell -----------------------------
 def _build_shell_argv(repo: Path) -> list[str]:
-    """Return argv for the child process (post-pty.fork).
+    """Argv for the fallback child process (post-pty.fork).
 
     Preferred: systemd-run --user --scope so the shell (and omp) live outside
     the gateway's MemoryMax cgroup. Fallback: bare interactive login bash.
@@ -87,26 +306,13 @@ def _build_shell_argv(repo: Path) -> list[str]:
 
 
 def _spawn_shell(repo: Path, cols: int, rows: int) -> tuple[int, int]:
-    """Fork a PTY + interactive shell. Returns (pid, master_fd).
-
-    Child either execs systemd-run (scope outside gateway cgroup) or chdirs to
-    the repo and execs bash directly.
-    """
+    """Fork a PTY + interactive shell (fallback path). Returns (pid, master_fd)."""
     argv = _build_shell_argv(repo)
     use_systemd = argv[0] == "systemd-run"
-    # Snapshot env for the child before fork.
-    child_env = os.environ.copy()
-    child_env["TERM"] = "xterm-256color"
-    # Ensure ~/.local/bin is on PATH even before login-shell rc files run.
-    home = child_env.get("HOME") or str(Path.home())
-    local_bin = str(Path(home) / ".local" / "bin")
-    path = child_env.get("PATH") or ""
-    if local_bin not in path.split(":"):
-        child_env["PATH"] = f"{local_bin}:{path}" if path else local_bin
+    child_env = _child_env(repo)
 
     pid, master_fd = pty.fork()
     if pid == 0:
-        # Child — set winsize on the slave (stdin), then exec.
         try:
             _set_winsize(0, rows, cols)
         except Exception:
@@ -119,7 +325,6 @@ def _spawn_shell(repo: Path, cols: int, rows: int) -> tuple[int, int]:
         try:
             os.execvpe(argv[0], argv, child_env)
         except OSError:
-            # Last-ditch: bare bash so the PTY is not empty.
             try:
                 os.chdir(repo)
             except OSError:
@@ -127,15 +332,8 @@ def _spawn_shell(repo: Path, cols: int, rows: int) -> tuple[int, int]:
             os.execvpe("/bin/bash", ["/bin/bash", "-il"], child_env)
         os._exit(127)
 
-    # Parent — keep master blocking; reads run in an executor thread.
     _set_winsize(master_fd, rows, cols)
-    log.info(
-        "terminal spawned pid=%d master=%d repo=%s argv=%s",
-        pid,
-        master_fd,
-        repo,
-        argv,
-    )
+    log.info("terminal spawned pid=%d master=%d repo=%s argv=%s", pid, master_fd, repo, argv)
     return pid, master_fd
 
 
@@ -156,9 +354,7 @@ def _wait_readable(master_fd: int, timeout: float = 0.05) -> bool:
 
 
 async def _inject_omp(master_fd: int, loop: asyncio.AbstractEventLoop) -> None:
-    """Let the shell settle, then type `omp` + Enter so omp starts in-repo."""
-    # Brief settle + optional drain so the injection lands near a prompt.
-    # Discarded banner bytes are fine — omp's TUI will repaint the screen.
+    """Let the shell settle, then type `omp` + Enter (legacy path only)."""
     deadline = loop.time() + 0.4
     while loop.time() < deadline:
         ready = await loop.run_in_executor(None, _wait_readable, master_fd, 0.05)
@@ -196,7 +392,11 @@ def _reap(pid: int) -> int | None:
 
 
 async def _kill_child(pid: int, master_fd: int | None) -> int | None:
-    """SIGHUP → grace → SIGKILL, close master, reap. Returns exit code if known."""
+    """SIGHUP → grace → SIGKILL, close master, reap. Returns exit code if known.
+
+    For a tmux attach client this just detaches it (the shared session lives on);
+    for the legacy private shell it tears the whole thing down.
+    """
     code: int | None = None
     if pid > 0:
         try:
@@ -226,6 +426,61 @@ async def _kill_child(pid: int, master_fd: int | None) -> int | None:
     return code
 
 
+# --- REST: shared session management ---------------------------------------
+def _require_admin(request: Request):
+    user = get_current_user(request)
+    if getattr(user, "role", None) != "admin":
+        raise HTTPException(status_code=403, detail="admin only")
+    return user
+
+
+@router.get("/api/admin/terminal/sessions")
+async def list_terminal_sessions(request: Request) -> dict[str, Any]:
+    _require_admin(request)
+    loop = asyncio.get_running_loop()
+    sessions = await loop.run_in_executor(None, _list_sessions)
+    return {"tmux": _TMUX is not None, "sessions": sessions}
+
+
+@router.post("/api/admin/terminal/sessions")
+async def create_terminal_session(request: Request) -> dict[str, Any]:
+    _require_admin(request)
+    if not _TMUX:
+        raise HTTPException(status_code=400, detail="tmux not available on host")
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    slug = _slug((body or {}).get("name") or "") if isinstance(body, dict) else ""
+    loop = asyncio.get_running_loop()
+    if not slug:
+        slug = await loop.run_in_executor(None, _next_name)
+    tmux_name = _tmux_name(slug)
+    exists = await loop.run_in_executor(None, _session_exists, tmux_name)
+    if not exists:
+        try:
+            await loop.run_in_executor(
+                None, _create_session, tmux_name, _DEFAULT_COLS, _DEFAULT_ROWS, _repo_dir()
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("terminal session create failed: %s", exc)
+            raise HTTPException(status_code=500, detail=f"could not create session: {exc}")
+    return {"name": _display(tmux_name), "created": not exists}
+
+
+@router.delete("/api/admin/terminal/sessions/{name}")
+async def kill_terminal_session(name: str, request: Request) -> dict[str, Any]:
+    _require_admin(request)
+    if not _TMUX:
+        raise HTTPException(status_code=400, detail="tmux not available on host")
+    slug = _slug(name)
+    if not slug:
+        raise HTTPException(status_code=400, detail="bad session name")
+    loop = asyncio.get_running_loop()
+    ok = await loop.run_in_executor(None, _kill_session, _tmux_name(slug))
+    return {"ok": ok}
+
+
 @router.websocket("/admin/terminal")
 async def admin_terminal(ws: WebSocket) -> None:
     await ws.accept()
@@ -240,6 +495,9 @@ async def admin_terminal(ws: WebSocket) -> None:
 
     cols, rows = _parse_size(ws)
     repo = _repo_dir()
+    loop = asyncio.get_running_loop()
+    shared = _TMUX is not None
+    tmux_name: str | None = None
     pid = -1
     master_fd = -1
     pump_task: asyncio.Task | None = None
@@ -247,9 +505,23 @@ async def admin_terminal(ws: WebSocket) -> None:
     shell_died = False
 
     try:
-        pid, master_fd = await asyncio.get_running_loop().run_in_executor(
-            None, _spawn_shell, repo, cols, rows
-        )
+        if shared:
+            req = _slug(ws.query_params.get("name") or "")
+            if not req:
+                req = await loop.run_in_executor(None, _next_name)
+            tmux_name = _tmux_name(req)
+            exists = await loop.run_in_executor(None, _session_exists, tmux_name)
+            if not exists:
+                await loop.run_in_executor(
+                    None, _create_session, tmux_name, cols, rows, repo
+                )
+            pid, master_fd = await loop.run_in_executor(
+                None, _spawn_attach, tmux_name, cols, rows
+            )
+        else:
+            pid, master_fd = await loop.run_in_executor(
+                None, _spawn_shell, repo, cols, rows
+            )
     except Exception as exc:  # noqa: BLE001
         log.exception("terminal spawn failed: %s", exc)
         try:
@@ -258,7 +530,17 @@ async def admin_terminal(ws: WebSocket) -> None:
             pass
         return
 
-    loop = asyncio.get_running_loop()
+    # Tell the client which shared session it landed on (for tab labels).
+    if shared and tmux_name and ws.client_state == WebSocketState.CONNECTED:
+        try:
+            await ws.send_text(
+                json.dumps(
+                    {"type": "session", "name": _display(tmux_name)},
+                    separators=(",", ":"),
+                )
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     async def pty_to_ws() -> None:
         nonlocal exit_code, shell_died
@@ -269,7 +551,6 @@ async def admin_terminal(ws: WebSocket) -> None:
                     shell_died = True
                     exit_code = _reap(pid)
                     if exit_code is None:
-                        # EOF without reaped child yet — brief wait.
                         await asyncio.sleep(0.05)
                         exit_code = _reap(pid)
                     break
@@ -285,8 +566,9 @@ async def admin_terminal(ws: WebSocket) -> None:
                 exit_code = _reap(pid)
 
     try:
-        # Inject omp after a short settle so bash is ready for input.
-        await _inject_omp(master_fd, loop)
+        # The tmux path launches omp itself; only the legacy shell needs injection.
+        if not shared:
+            await _inject_omp(master_fd, loop)
         pump_task = asyncio.create_task(pty_to_ws(), name="term-pty-to-ws")
 
         while True:
@@ -304,7 +586,6 @@ async def admin_terminal(ws: WebSocket) -> None:
                 except (asyncio.CancelledError, Exception):  # noqa: BLE001
                     pass
             if pump_task in done:
-                # Drain recv if it also finished; ignore errors.
                 if recv_task in done:
                     try:
                         recv_task.result()
@@ -350,7 +631,8 @@ async def admin_terminal(ws: WebSocket) -> None:
     except Exception as exc:  # noqa: BLE001
         log.debug("terminal handler error: %s", exc)
     finally:
-        # Close/kill first so a blocked os.read in the pump unblocks.
+        # Close/kill first so a blocked os.read in the pump unblocks. In shared
+        # mode this only detaches the tmux client; the session keeps running.
         code = await _kill_child(pid if pid > 0 else 0, master_fd if master_fd >= 0 else None)
         if exit_code is None:
             exit_code = code
@@ -367,6 +649,8 @@ async def admin_terminal(ws: WebSocket) -> None:
             except Exception:  # noqa: BLE001
                 pass
 
+        # Only report an exit when the pty actually ended (session gone / shell
+        # exit) while the browser is still watching — not on a plain detach.
         if shell_died and ws.client_state == WebSocketState.CONNECTED:
             try:
                 await ws.send_text(
@@ -383,8 +667,9 @@ async def admin_terminal(ws: WebSocket) -> None:
             except Exception:  # noqa: BLE001
                 pass
         log.info(
-            "terminal closed email=%s pid=%s exit=%s",
+            "terminal closed email=%s session=%s pid=%s exit=%s",
             getattr(user, "email", "?"),
+            _display(tmux_name) if tmux_name else "(private)",
             pid,
             exit_code,
         )

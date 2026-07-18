@@ -18,6 +18,7 @@
 #include "agent/domain.h"
 #include "agent/events.h"
 #include "agent/firm_bid.h"
+#include "agent/iface_plan.h"
 #include "agent/firm_team.h"
 #include "agent/logging_provider.h"
 #include "agent/machine.h"
@@ -2224,15 +2225,109 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
                                 {"assembly", true},
                                 {"part_count", static_cast<int>(parts.size())}});
 
+    // Interface ledger from the planner plan (interfaces:[{between,kind,seed,holes,...}]).
+    // Drives build order (seed before dependent), advisory injection, and pre-assemble verify.
+    json plan_j_for_iface = plan.is_null() ? json::object() : json::parse(plan.dump());
+    InterfaceLedger iface_ledger = parse_interface_ledger(plan_j_for_iface);
+    if (!iface_ledger.interfaces.empty()) {
+        json iface_arr = json::array();
+        for (const auto& is : iface_ledger.interfaces) {
+            json row = json{{"id", is.id},
+                           {"kind", is.kind},
+                           {"seed", is.seed},
+                           {"between", is.between},
+                           {"summary", is.raw_summary}};
+            if (!is.params.empty()) row["params"] = is.params;
+            iface_arr.push_back(std::move(row));
+        }
+        events.emit("run_note", json{{"note", "interface_ledger"},
+                                    {"interfaces", iface_arr},
+                                    {"count", static_cast<int>(iface_ledger.interfaces.size())}});
+    }
+
+    // Existing-assembly follow-up: seed the measured map from the open doc when it already
+    // has features (the already-built parts are seeds; new mating parts consume their dims).
+    std::map<std::string, MeasuredInterface> built_ifaces;
+    try {
+        json tree0 = doc::doc_tree(doc_id);
+        json tree_body = tree0.contains("tree") ? tree0["tree"] : json::object();
+        bool has_feats = tree_body.is_object() && tree_body.contains("features") &&
+                         tree_body["features"].is_array() && !tree_body["features"].empty();
+        if (has_feats) {
+            json bb = json::object();
+            try {
+                bb = doc::doc_bbox(doc_id);
+            } catch (...) {
+            }
+            std::string existing_name = "existing";
+            try {
+                // Prefer the live doc's display name when present on the tree payload.
+                if (tree0.contains("name") && tree0["name"].is_string())
+                    existing_name = tree0["name"].get<std::string>();
+            } catch (...) {
+            }
+            MeasuredInterface em =
+                measure_interface_from_tree(existing_name, tree_body, bb);
+            em.doc_id = doc_id;
+            built_ifaces[existing_name] = em;
+            // Also alias under each plan part name that is NOT about to be rebuilt when
+            // the request looks like an add-to-assembly (single new part). Heuristic: if
+            // planner listed a part matching the existing doc name, bind it.
+            for (const auto& p : parts) {
+                if (!p.is_object() || !p.contains("name") || !p["name"].is_string()) continue;
+                std::string pn = p["name"].get<std::string>();
+                if (iface_norm_name(pn) == iface_norm_name(existing_name))
+                    built_ifaces[pn] = em;
+            }
+            events.emit("run_note",
+                        json{{"note", "existing_assembly_seed_measured"},
+                             {"part", existing_name},
+                             {"summary", em.summary}});
+        }
+    } catch (...) {
+    }
+
     // 2) Build each part in its OWN child doc (full run_design), then save it to a .step+ file.
-    struct SavedPart { std::string path, name; double pos[3]; double rot[3]; };
-    std::vector<SavedPart> saved;
-    int idx = 0;
-    for (const auto& p : parts) {
+    // Order by interface deps: SEED parts first so dependents receive measured mate geometry.
+    struct SavedPart {
+        std::string path, name, doc_id;
+        double pos[3];
+        double rot[3];
+        size_t plan_index = 0;
+    };
+    std::vector<std::string> part_names;
+    part_names.reserve(parts.size());
+    for (size_t pi = 0; pi < parts.size(); ++pi) {
+        const auto& p = parts[pi];
         std::string name = (p.contains("name") && p["name"].is_string())
-                               ? p["name"].get<std::string>() : ("part" + std::to_string(idx + 1));
+                               ? p["name"].get<std::string>()
+                               : ("part" + std::to_string(pi + 1));
+        part_names.push_back(name);
+    }
+    std::vector<size_t> build_order = order_parts_by_interfaces(part_names, iface_ledger);
+    if (build_order.size() != part_names.size()) {
+        build_order.clear();
+        for (size_t i = 0; i < part_names.size(); ++i) build_order.push_back(i);
+    }
+    {
+        json order_j = json::array();
+        for (size_t oi : build_order) order_j.push_back(part_names[oi]);
+        events.emit("run_note", json{{"note", "interface_build_order"}, {"order", order_j}});
+    }
+
+    std::vector<SavedPart> saved;
+    // Track child docs by part name for mismatch re-fix.
+    std::map<std::string, std::string> part_doc_ids;
+    std::map<std::string, std::string> part_reqs;
+
+    int built_count = 0;
+    for (size_t oi = 0; oi < build_order.size(); ++oi) {
+        const size_t idx = build_order[oi];
+        const auto& p = parts[idx];
+        std::string name = part_names[idx];
         std::string purpose = (p.contains("purpose") && p["purpose"].is_string())
-                                  ? p["purpose"].get<std::string>() : "";
+                                  ? p["purpose"].get<std::string>()
+                                  : "";
         std::string dim_s;
         if (p.contains("dimensions") && p["dimensions"].is_object())
             for (auto it = p["dimensions"].begin(); it != p["dimensions"].end(); ++it) {
@@ -2245,10 +2340,7 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
                 if (!feats.empty()) feats += "; ";
                 feats += py_scalar_str(f);
             }
-        // Placement: position (mm) + rotation (Euler degrees about X, then Y, then Z). Rotation
-        // lets a control surface be assembled DEFLECTED (e.g. an aileron rotated about its hinge
-        // axis) so a downstream CFD run sees the deflected configuration — the planner emits
-        // placement.rot per part. A missing rot is no rotation (identity), the common case.
+        // Placement: position (mm) + rotation (Euler degrees about X, then Y, then Z).
         double pos[3] = {0, 0, 0};
         double rot[3] = {0, 0, 0};
         if (p.contains("placement") && p["placement"].is_object()) {
@@ -2261,48 +2353,179 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
                     if (pl["rot"][k].is_number()) rot[k] = pl["rot"][k].get<double>();
         }
 
-        events.emit("part_started", json{{"index", idx},
+        events.emit("part_started", json{{"index", static_cast<int>(built_count)},
+                                         {"plan_index", static_cast<int>(idx)},
                                          {"total", static_cast<int>(parts.size())},
                                          {"name", name}});
 
-        std::string part_req = "Build ONLY this single standalone part, centered at the origin (it "
-                               "will be positioned in an assembly afterward). Part: '" + name +
-                               "' — " + purpose + ". Dimensions: " + dim_s +
-                               ". Features: " + feats;
+        std::string part_req =
+            "Build ONLY this single standalone part, centered at the origin (it "
+            "will be positioned in an assembly afterward). Part: '" +
+            name + "' — " + purpose + ". Dimensions: " + dim_s + ". Features: " + feats;
+        part_reqs[name] = part_req;
+
+        // Interface advisory: measured mate if built, else binding seed / plan standard.
+        std::string iface_adv = build_interface_advisory(name, iface_ledger, built_ifaces);
+        if (!iface_adv.empty()) {
+            events.emit("run_note", json{{"note", "interface_advisory"},
+                                        {"part", name},
+                                        {"chars", static_cast<int>(iface_adv.size())}});
+        }
+
         std::string child;
         try {
             json nd = doc::doc_new("part", name);
             child = jstr(nd, "doc_id");
         } catch (const std::exception& e) {
             events.emit("part_skipped",
-                        json{{"index", idx}, {"name", name}, {"reason", e.what()}});
+                        json{{"index", static_cast<int>(idx)},
+                             {"name", name},
+                             {"reason", e.what()}});
         } catch (...) {
             events.emit("part_skipped",
-                        json{{"index", idx}, {"name", name}, {"reason", "doc_new failed"}});
+                        json{{"index", static_cast<int>(idx)},
+                             {"name", name},
+                             {"reason", "doc_new failed"}});
         }
-        if (child.empty()) { ++idx; continue; }
+        if (child.empty()) continue;
 
         json sub_opts = options;
         sub_opts["run_id"] = run_id + "-p" + std::to_string(idx);
+        sub_opts["is_sub_run"] = true;
+        // Inject via the same advisory_text seam used by advisor/spec/firm seeds.
+        if (!iface_adv.empty()) {
+            std::string combined = iface_adv;
+            if (sub_opts.contains("advisory_text") && sub_opts["advisory_text"].is_string()) {
+                const std::string prior = sub_opts["advisory_text"].get<std::string>();
+                if (!prior.empty()) combined = prior + "\n\n" + iface_adv;
+            }
+            sub_opts["advisory_text"] = combined;
+            // Ensure advisor path is on so run_design applies the advisory block.
+            if (!sub_opts.contains("advisor")) sub_opts["advisor"] = true;
+        }
         run_design(part_req, child, provider_cfg, emit, sub_opts);
 
-        std::filesystem::path path = run_dir(run_id) / ("part_" + std::to_string(idx) + ".step+");
+        // Measure built interface geometry for downstream dependents + verify.
+        try {
+            json tree_now = doc::doc_tree(child);
+            json tree_body = tree_now.contains("tree") ? tree_now["tree"] : json::object();
+            json bb = json::object();
+            try {
+                bb = doc::doc_bbox(child);
+            } catch (...) {
+            }
+            MeasuredInterface mi = measure_interface_from_tree(name, tree_body, bb);
+            mi.doc_id = child;
+            built_ifaces[name] = mi;
+            part_doc_ids[name] = child;
+            events.emit("run_note", json{{"note", "part_interface_measured"},
+                                        {"part", name},
+                                        {"summary", mi.summary}});
+        } catch (...) {
+            part_doc_ids[name] = child;
+        }
+
+        std::filesystem::path path =
+            run_dir(run_id) / ("part_" + std::to_string(idx) + ".step+");
         try {
             doc::doc_save(child, path.string());
             SavedPart sp;
             sp.path = std::filesystem::absolute(path).string();
             sp.name = name;
-            sp.pos[0] = pos[0]; sp.pos[1] = pos[1]; sp.pos[2] = pos[2];
-            sp.rot[0] = rot[0]; sp.rot[1] = rot[1]; sp.rot[2] = rot[2];
+            sp.doc_id = child;
+            sp.pos[0] = pos[0];
+            sp.pos[1] = pos[1];
+            sp.pos[2] = pos[2];
+            sp.rot[0] = rot[0];
+            sp.rot[1] = rot[1];
+            sp.rot[2] = rot[2];
+            sp.plan_index = idx;
             saved.push_back(sp);
         } catch (const std::exception& e) {
             events.emit("part_skipped",
-                        json{{"index", idx}, {"name", name}, {"reason", e.what()}});
+                        json{{"index", static_cast<int>(idx)},
+                             {"name", name},
+                             {"reason", e.what()}});
         } catch (...) {
             events.emit("part_skipped",
-                        json{{"index", idx}, {"name", name}, {"reason", "doc_save failed"}});
+                        json{{"index", static_cast<int>(idx)},
+                             {"name", name},
+                             {"reason", "doc_save failed"}});
         }
-        ++idx;
+        ++built_count;
+    }
+
+    // 2b) Assembly-time interface verification — seed dims win; route fix to DEPENDENT.
+    if (!iface_ledger.interfaces.empty() && built_ifaces.size() >= 2) {
+        std::vector<InterfaceMismatch> mismatches =
+            verify_interfaces(iface_ledger, built_ifaces);
+        if (!mismatches.empty()) {
+            json mm_j = json::array();
+            std::set<std::string> deps_to_fix;
+            for (const auto& mm : mismatches) {
+                mm_j.push_back(json{{"interface_id", mm.interface_id},
+                                    {"kind", mm.kind},
+                                    {"seed", mm.seed_part},
+                                    {"dependent", mm.dependent_part},
+                                    {"detail", mm.detail},
+                                    {"expected", mm.expected},
+                                    {"actual", mm.actual}});
+                deps_to_fix.insert(mm.dependent_part);
+            }
+            events.emit("run_note", json{{"note", "interface_mismatch"},
+                                        {"count", static_cast<int>(mismatches.size())},
+                                        {"mismatches", mm_j}});
+            // Targeted fix: re-run ONLY the dependent part with mismatch advisory.
+            for (const std::string& dep : deps_to_fix) {
+                auto dit = part_doc_ids.find(dep);
+                if (dit == part_doc_ids.end() || dit->second.empty()) continue;
+                std::string fix_adv = build_mismatch_fix_advisory(mismatches, dep);
+                if (fix_adv.empty()) continue;
+                // Also re-include measured seed interface so the fixer has exact targets.
+                std::string full_adv =
+                    fix_adv + "\n" + build_interface_advisory(dep, iface_ledger, built_ifaces);
+                events.emit("run_note", json{{"note", "interface_fix_dependent"},
+                                            {"part", dep},
+                                            {"doc_id", dit->second}});
+                json fix_opts = options;
+                fix_opts["run_id"] = run_id + "-iface-fix-" + dep;
+                fix_opts["is_sub_run"] = true;
+                fix_opts["advisor"] = true;
+                fix_opts["advisory_text"] = full_adv;
+                std::string req = part_reqs.count(dep) ? part_reqs[dep]
+                                                       : ("Fix interface on part '" + dep + "'");
+                req += "\n\nINTERFACE FIX REQUIRED: match the SEED part's measured interface. "
+                       "Do not change the seed.";
+                run_design(req, dit->second, provider_cfg, emit, fix_opts);
+                // Re-measure + re-save the fixed dependent.
+                try {
+                    json tree_now = doc::doc_tree(dit->second);
+                    json tree_body =
+                        tree_now.contains("tree") ? tree_now["tree"] : json::object();
+                    json bb = json::object();
+                    try {
+                        bb = doc::doc_bbox(dit->second);
+                    } catch (...) {
+                    }
+                    MeasuredInterface mi = measure_interface_from_tree(dep, tree_body, bb);
+                    mi.doc_id = dit->second;
+                    built_ifaces[dep] = mi;
+                    // Update saved path for this part if present.
+                    for (auto& sp : saved) {
+                        if (sp.name != dep) continue;
+                        try {
+                            doc::doc_save(dit->second, sp.path);
+                        } catch (...) {
+                        }
+                        break;
+                    }
+                } catch (...) {
+                }
+            }
+        } else {
+            events.emit("run_note", json{{"note", "interface_verify_ok"},
+                                        {"parts", static_cast<int>(built_ifaces.size())}});
+        }
     }
 
     if (saved.empty()) {
@@ -2608,10 +2831,15 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
         const std::string style_dir =
             "[execution_style: " + execution_style + "] " +
             (swarm_mode
-                 ? "Structure tasks as swarm units with id+deps (parts first, assembly last)."
+                 ? "Structure tasks as swarm units with id+deps (parts first, assembly last). "
+                   "For EVERY mating pair declare top-level interfaces:[{between:[partA,partB],"
+                   "kind,seed,holes/fit...}] and put the SEED part unit in an earlier wave "
+                   "(dependent deps includes seed id)."
                  : (eng_firm_mode
-                        ? "Structure tasks as eng_firm discipline jobs (optional discipline field)."
-                        : "Minimal capability sequence."));
+                        ? "Structure tasks as eng_firm discipline jobs (optional discipline field). "
+                          "Include interfaces:[{between,kind,seed,...}] for mating parts."
+                        : "Minimal capability sequence. If multi-part with mates, still emit "
+                          "interfaces:[{between,kind,seed,holes/fit}]."));
         AgentCall ma = agent_call(provider, mstate, "mission_planner", prompts_dir, budget, false,
                                   ctx_cap, style_dir);
         ojson plan = extract_json_obj(ma.reply);
@@ -2862,42 +3090,90 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
     emit_plan_state(events, "phased_todo", "Mission", /*summary=*/"", mission_plan_rev,
                     plan_state_items_from_mission(mission_plan_tasks, "Mission"));
 
+    // ---- Interface-aware deps (mission plan.interfaces) + wave decomposition ----
+    // Fold interface seed→dependent edges into task.deps so a mating part never
+    // lands in the same (or earlier) swarm wave as its seed.
+    InterfaceLedger mission_ifaces;
+    if (!mission_plan_obj.is_null() && mission_plan_obj.is_object()) {
+        json mpj = json::parse(mission_plan_obj.dump());
+        mission_ifaces = parse_interface_ledger(mpj);
+    }
+    if (!mission_ifaces.interfaces.empty()) {
+        // Build a JSON task array with id/title/request/deps for the folder.
+        json tasks_j = json::array();
+        for (const auto& tk : tasks) {
+            json t = json{{"id", tk.id},
+                         {"title", tk.title},
+                         {"request", tk.req},
+                         {"capability", tk.capability}};
+            json deps = json::array();
+            for (const auto& d : tk.deps) deps.push_back(d);
+            t["deps"] = deps;
+            tasks_j.push_back(std::move(t));
+        }
+        json folded = fold_interface_deps_into_tasks(tasks_j, mission_ifaces);
+        // Write folded deps back onto Task structs.
+        for (size_t i = 0; i < tasks.size() && i < folded.size(); ++i) {
+            if (!folded[i].is_object() || !folded[i].contains("deps") ||
+                !folded[i]["deps"].is_array())
+                continue;
+            tasks[i].deps.clear();
+            for (const auto& d : folded[i]["deps"])
+                if (d.is_string()) tasks[i].deps.push_back(d.get<std::string>());
+        }
+        events.emit("run_note",
+                    json{{"note", "mission_interface_deps_folded"},
+                         {"interfaces", static_cast<int>(mission_ifaces.interfaces.size())}});
+    }
+
     // ---- Wave decomposition for swarm (deps → sequential waves) ----
     // v1: waves run sequentially; units within a wave also sequential.
+    // Prefer the shared helper so interface-folded deps stay consistent with tests.
     std::vector<std::vector<size_t>> waves;
     if (swarm_mode) {
-        std::map<std::string, size_t> id_to_idx;
-        for (size_t i = 0; i < tasks.size(); ++i) id_to_idx[tasks[i].id] = i;
-        std::vector<int> indeg(tasks.size(), 0);
-        std::vector<std::vector<size_t>> adj(tasks.size());
-        for (size_t i = 0; i < tasks.size(); ++i) {
-            for (const auto& d : tasks[i].deps) {
-                auto it = id_to_idx.find(d);
-                if (it == id_to_idx.end()) continue;
-                adj[it->second].push_back(i);
-                indeg[i] += 1;
-            }
+        json tasks_for_waves = json::array();
+        for (const auto& tk : tasks) {
+            json t = json{{"id", tk.id}};
+            json deps = json::array();
+            for (const auto& d : tk.deps) deps.push_back(d);
+            t["deps"] = deps;
+            tasks_for_waves.push_back(std::move(t));
         }
-        std::vector<size_t> ready;
-        for (size_t i = 0; i < tasks.size(); ++i)
-            if (indeg[i] == 0) ready.push_back(i);
-        std::vector<bool> placed(tasks.size(), false);
-        while (!ready.empty()) {
-            waves.push_back(ready);
-            std::vector<size_t> next;
-            for (size_t u : ready) {
-                placed[u] = true;
-                for (size_t v : adj[u]) {
-                    if (--indeg[v] == 0) next.push_back(v);
+        waves = waves_from_task_deps(tasks_for_waves);
+        if (waves.empty() && !tasks.empty()) {
+            // Fallback identical to prior Kahn loop.
+            std::map<std::string, size_t> id_to_idx;
+            for (size_t i = 0; i < tasks.size(); ++i) id_to_idx[tasks[i].id] = i;
+            std::vector<int> indeg(tasks.size(), 0);
+            std::vector<std::vector<size_t>> adj(tasks.size());
+            for (size_t i = 0; i < tasks.size(); ++i) {
+                for (const auto& d : tasks[i].deps) {
+                    auto it = id_to_idx.find(d);
+                    if (it == id_to_idx.end()) continue;
+                    adj[it->second].push_back(i);
+                    indeg[i] += 1;
                 }
             }
-            ready.swap(next);
+            std::vector<size_t> ready;
+            for (size_t i = 0; i < tasks.size(); ++i)
+                if (indeg[i] == 0) ready.push_back(i);
+            std::vector<bool> placed(tasks.size(), false);
+            while (!ready.empty()) {
+                waves.push_back(ready);
+                std::vector<size_t> next;
+                for (size_t u : ready) {
+                    placed[u] = true;
+                    for (size_t v : adj[u]) {
+                        if (--indeg[v] == 0) next.push_back(v);
+                    }
+                }
+                ready.swap(next);
+            }
+            std::vector<size_t> rest;
+            for (size_t i = 0; i < tasks.size(); ++i)
+                if (!placed[i]) rest.push_back(i);
+            if (!rest.empty()) waves.push_back(rest);
         }
-        // Orphans / cycles: append any unplaced in original order as final wave.
-        std::vector<size_t> rest;
-        for (size_t i = 0; i < tasks.size(); ++i)
-            if (!placed[i]) rest.push_back(i);
-        if (!rest.empty()) waves.push_back(rest);
     } else {
         // Non-swarm: one unit per sequential "wave" (preserves prior linear order).
         for (size_t i = 0; i < tasks.size(); ++i) waves.push_back({i});
@@ -2922,6 +3198,8 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
     std::string verdict;
     json re_report = json::object();
     json task_results = json::array();
+    // Measured interface geometry from completed design/assembly units (seed → dependent).
+    std::map<std::string, MeasuredInterface> mission_built_ifaces;
     std::vector<std::string> task_status(tasks.size(), "pending");
 
     auto set_task_plan_status = [&](size_t i, const std::string& st, const std::string& sum) {
@@ -3094,6 +3372,58 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
             sub_opts.erase("corporate_force");
             sub_opts.erase("approved_plan");
             if (!firm_role_seed.empty()) sub_opts["firm_role_seed"] = firm_role_seed;
+            // Interface injection for multi-unit mating: if this unit's title/request names a
+            // part in the mission interface ledger, push measured-or-plan advisory_text.
+            if (!mission_ifaces.interfaces.empty()) {
+                // Prefer an explicit part name match from title, else try each interface participant.
+                std::string part_hint = tk.title;
+                std::string adv;
+                for (const auto& iface : mission_ifaces.interfaces) {
+                    for (const auto& pn : iface.between) {
+                        if (iface_norm_name(tk.title).find(iface_norm_name(pn)) != std::string::npos ||
+                            iface_norm_name(tk.req).find(iface_norm_name(pn)) != std::string::npos ||
+                            iface_norm_name(tk.id) == iface_norm_name(pn)) {
+                            part_hint = pn;
+                            break;
+                        }
+                    }
+                }
+                adv = build_interface_advisory(part_hint, mission_ifaces, mission_built_ifaces);
+                // If hint didn't participate, still try each between-name that looks like this unit.
+                if (adv.empty()) {
+                    for (const auto& iface : mission_ifaces.interfaces) {
+                        for (const auto& pn : iface.between) {
+                            std::string a =
+                                build_interface_advisory(pn, mission_ifaces, mission_built_ifaces);
+                            if (!a.empty() &&
+                                (iface_norm_name(tk.title).find(iface_norm_name(pn)) !=
+                                     std::string::npos ||
+                                 iface_norm_name(tk.req).find(iface_norm_name(pn)) !=
+                                     std::string::npos)) {
+                                adv = a;
+                                part_hint = pn;
+                                break;
+                            }
+                        }
+                        if (!adv.empty()) break;
+                    }
+                }
+                if (!adv.empty()) {
+                    std::string combined = adv;
+                    if (sub_opts.contains("advisory_text") &&
+                        sub_opts["advisory_text"].is_string()) {
+                        const std::string prior = sub_opts["advisory_text"].get<std::string>();
+                        if (!prior.empty()) combined = prior + "\n\n" + adv;
+                    }
+                    sub_opts["advisory_text"] = combined;
+                    sub_opts["advisor"] = true;
+                    events.emit("run_note",
+                                json{{"note", "mission_interface_advisory"},
+                                     {"task_id", tk.id},
+                                     {"part", part_hint},
+                                     {"chars", static_cast<int>(adv.size())}});
+                }
+            }
             json rr = run_assembly_design(tk.req, target_doc, provider_cfg, emit, sub_opts);
             status = rr.value("status", std::string("done"));
             summary = rr.value("stop_reason", std::string());
@@ -3120,6 +3450,39 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
             if (status == "done") {
                 any_built = true;
                 design_summary = doc_design_summary(current_doc);
+                // Record measured interface for later dependent units.
+                try {
+                    json tree_now = doc::doc_tree(current_doc);
+                    json tree_body =
+                        tree_now.contains("tree") ? tree_now["tree"] : json::object();
+                    json bb = json::object();
+                    try {
+                        bb = doc::doc_bbox(current_doc);
+                    } catch (...) {
+                    }
+                    // Key under every interface part name that matches this task.
+                    std::vector<std::string> keys;
+                    keys.push_back(tk.title);
+                    keys.push_back(tk.id);
+                    for (const auto& iface : mission_ifaces.interfaces) {
+                        for (const auto& pn : iface.between) {
+                            if (iface_norm_name(tk.title).find(iface_norm_name(pn)) !=
+                                    std::string::npos ||
+                                iface_norm_name(tk.req).find(iface_norm_name(pn)) !=
+                                    std::string::npos ||
+                                iface_norm_name(tk.id) == iface_norm_name(pn)) {
+                                keys.push_back(pn);
+                            }
+                        }
+                    }
+                    for (const auto& k : keys) {
+                        if (k.empty()) continue;
+                        MeasuredInterface mi = measure_interface_from_tree(k, tree_body, bb);
+                        mi.doc_id = current_doc;
+                        mission_built_ifaces[k] = mi;
+                    }
+                } catch (...) {
+                }
             }
         } else if (tk.capability == "simulate_flow") {
             if (sim) {

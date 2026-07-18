@@ -44,29 +44,58 @@ Rules:
     "id"   — stable short id (u1, u2, …)
     "deps" — array of task ids that must finish before this one (empty = wave 0)
   A final assembly/report task should depend on the part units. Keep the same capability set.
+  INTERFACE-FIRST (required when parts mate): also emit a top-level "interfaces" array on the
+  mission plan. For EVERY mating pair:
+    {"between": ["bracket_a","bracket_b"], "kind":"bolted_joint", "seed":"bracket_a",
+     "holes":{"count":2,"dia":5.5,"pattern":"line","spacing":60}, "fit":"clearance", "bolt":"M5"}
+  `seed` is the part that fixes the standard (catalog/hardware carrier). The dependent task's
+  "deps" MUST include the seed task's id so they never share a swarm wave — seed builds first,
+  dependent builds with the seed as reference. Never put two mating parts in the same wave.
 - When execution_style is "eng_firm", structure tasks as discipline-scoped jobs the firm will bid
   on. Prefer capability labels that match the work (design / assembly / simulate_* / drawing /
   evaluate / report) and put the discipline focus in title+request (mechanical, structural,
-  thermal, …). Optional per-task "discipline" string is allowed.
+  thermal, …). Optional per-task "discipline" string is allowed. Still emit "interfaces" for any
+  mating pairs so the builder can order seeds before dependents.
 
 Reply with EXACTLY one ```json block, no prose outside it, shaped:
 {
   "mission": "one-line restatement of the whole request",
+  "interfaces": [
+    {"between": ["part_a", "part_b"], "kind": "bolted_joint", "seed": "part_a",
+     "holes": {"count": 2, "dia": 5.5, "pattern": "line", "spacing": 60}, "fit": "clearance"}
+  ],
   "tasks": [
     {"capability": "design", "title": "Model the parts", "request": "<verbatim build instruction>", "target": "active"},
     {"capability": "simulate_flow", "title": "Wind-tunnel it", "request": "CFD at 15 m/s, 4 deg AoA in air", "target": "previous"},
     {"capability": "report", "title": "Verdict", "request": "judge L/D and drag; is this a good design?", "target": "previous"}
   ]
 }
+Omit "interfaces" (or use []) when there are no mating pairs. When parts mate, interfaces is REQUIRED
+and swarm deps must put each seed task before its dependent.
 
 Worked example — request: "make a model airplane whose control surfaces are driven by MG90S servos
 using M2.5-M5 hardware, then run a CFD simulation and prove it's a good design":
 {
   "mission": "build a servo-driven model airplane and validate it aerodynamically",
+  "interfaces": [],
   "tasks": [
     {"capability": "assembly", "title": "Model the airplane", "request": "a model airplane: fuselage, two wings with ailerons, and a tail with elevator+rudder; the control surfaces are driven by MG90S servos mounted with M2.5-M5 hardware", "target": "active"},
     {"capability": "simulate_flow", "title": "Wind-tunnel the airframe", "request": "CFD in air at 15 m/s, 4 deg angle of attack", "target": "previous"},
     {"capability": "report", "title": "Prove the design", "request": "assess lift, drag, and lift-to-drag ratio — is this a sound aircraft design?", "target": "previous"}
+  ]
+}
+
+Worked example — request: "two L-brackets bolted back to back with M5 hardware" (swarm):
+{
+  "mission": "two L-brackets bolted back-to-back with M5 hardware",
+  "interfaces": [
+    {"between": ["bracket_a", "bracket_b"], "kind": "bolted_joint", "seed": "bracket_a",
+     "holes": {"count": 2, "dia": 5.5, "pattern": "line", "spacing": 40}, "fit": "clearance", "bolt": "M5"}
+  ],
+  "tasks": [
+    {"capability": "design", "id": "u1", "deps": [], "title": "L-bracket A (seed)", "request": "L-bracket A with M5 clearance holes per interface", "target": "active"},
+    {"capability": "design", "id": "u2", "deps": ["u1"], "title": "L-bracket B (match A)", "request": "L-bracket B matching bracket_a interface exactly", "target": "active"},
+    {"capability": "assembly", "id": "u3", "deps": ["u1", "u2"], "title": "Bolt back to back", "request": "assemble the two L-brackets back to back with M5 hardware", "target": "previous"}
   ]
 }
 

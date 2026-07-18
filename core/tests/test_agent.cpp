@@ -11,6 +11,7 @@
 #include "agent/complexity.h"
 #include "agent/domain.h"
 #include "agent/firm_bid.h"
+#include "agent/iface_plan.h"
 
 
 using namespace aicad::agent;
@@ -1869,4 +1870,225 @@ TEST_CASE("mission planner degraded stub flag") {
     // Real single-task plan from a successful planner is NOT degraded.
     CHECK_FALSE(is_degraded(true, 1));
     CHECK(task_count(true, 1) == 1);
+}
+
+// ---------------------------------------------------------------------------
+// Interface-aware assembly planning (iface_plan)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+json iface_bolted_plan(const char* seed = "bracket_a", double dia = 5.5, int count = 2) {
+    json holes = json::object();
+    holes["count"] = count;
+    holes["dia"] = dia;
+    holes["pattern"] = "line";
+    holes["spacing"] = 60;
+
+    json iface = json::object();
+    iface["between"] = json::array({"bracket_a", "bracket_b"});
+    iface["kind"] = "bolted_joint";
+    iface["seed"] = seed;
+    iface["holes"] = holes;
+    iface["fit"] = "clearance";
+    iface["bolt"] = "M5";
+
+    json plan = json::object();
+    plan["interfaces"] = json::array({iface});
+    return plan;
+}
+
+json hole_feature_tree(double diameter, int count) {
+    json params = json::object();
+    params["diameter"] = diameter;
+    params["count"] = count;
+    json feat = json::object();
+    feat["id"] = "h1";
+    feat["type"] = "hole";
+    feat["params"] = params;
+    json tree = json::object();
+    tree["features"] = json::array({feat});
+    return tree;
+}
+
+}  // namespace
+
+TEST_CASE("interface ledger parses planner interfaces and seed") {
+    json plan = iface_bolted_plan("bracket_a", 5.5, 2);
+    plan["name"] = "back_to_back_brackets";
+    plan["assembly"] = true;
+    plan["parts"] = json::array({json{{"name", "bracket_b"}}, json{{"name", "bracket_a"}},
+                                 json{{"name", "m5_bolt"}}});
+
+    InterfaceLedger led = parse_interface_ledger(plan);
+    REQUIRE(led.interfaces.size() == 1);
+    CHECK(led.interfaces[0].kind == "bolted_joint");
+    CHECK(led.interfaces[0].seed == "bracket_a");
+    REQUIRE(led.interfaces[0].between.size() == 2);
+    CHECK(led.interfaces[0].params.contains("holes"));
+    const double dia = led.interfaces[0].params["holes"]["dia"].get<double>();
+    CHECK(dia == doctest::Approx(5.5));
+    // bracket_b depends on seed bracket_a
+    REQUIRE(led.part_deps.count("bracket_b") == 1);
+    REQUIRE_FALSE(led.part_deps["bracket_b"].empty());
+    CHECK(led.part_deps["bracket_b"][0] == "bracket_a");
+    CHECK(led.is_seed["bracket_a"]);
+}
+
+TEST_CASE("interface build order puts seed before dependent") {
+    // Planner listed dependent first; interface order must still seed-first.
+    std::vector<std::string> names = {"bracket_b", "bracket_a", "spacer"};
+    InterfaceLedger led = parse_interface_ledger(iface_bolted_plan());
+    std::vector<size_t> order = order_parts_by_interfaces(names, led);
+    REQUIRE(order.size() == 3);
+    size_t pos_a = 99, pos_b = 99, pos_s = 99;
+    for (size_t i = 0; i < order.size(); ++i) {
+        if (names[order[i]] == "bracket_a") pos_a = i;
+        if (names[order[i]] == "bracket_b") pos_b = i;
+        if (names[order[i]] == "spacer") pos_s = i;
+    }
+    CHECK(pos_a < pos_b);  // seed before dependent
+    CHECK(pos_s != static_cast<size_t>(99));
+}
+
+TEST_CASE("interface deps fold into swarm waves — dependent later wave") {
+    // Two part units with empty deps + one interface: after fold, dependent cannot share wave 0.
+    json t1 = json::object();
+    t1["id"] = "u1";
+    t1["title"] = "L-bracket A (seed)";
+    t1["request"] = "build bracket_a";
+    t1["deps"] = json::array();
+    json t2 = json::object();
+    t2["id"] = "u2";
+    t2["title"] = "L-bracket B";
+    t2["request"] = "build bracket_b matching A";
+    t2["deps"] = json::array();
+    json t3 = json::object();
+    t3["id"] = "u3";
+    t3["title"] = "Assemble";
+    t3["request"] = "assemble brackets";
+    t3["deps"] = json::array({"u1", "u2"});
+    json tasks = json::array({t1, t2, t3});
+
+    InterfaceLedger led = parse_interface_ledger(iface_bolted_plan());
+    json folded = fold_interface_deps_into_tasks(tasks, led);
+
+    bool u2_deps_u1 = false;
+    for (const auto& t : folded) {
+        if (!t.is_object()) continue;
+        if (t.value("id", std::string()) != "u2") continue;
+        REQUIRE(t.contains("deps"));
+        for (const auto& d : t["deps"]) {
+            if (d.is_string() && d.get<std::string>() == "u1") u2_deps_u1 = true;
+        }
+    }
+    CHECK(u2_deps_u1);
+
+    auto waves = waves_from_task_deps(folded);
+    REQUIRE(waves.size() >= 2);
+    auto wave_of = [&](const std::string& id) -> int {
+        for (size_t w = 0; w < waves.size(); ++w) {
+            for (size_t idx : waves[w]) {
+                if (folded[idx].value("id", std::string()) == id) return static_cast<int>(w);
+            }
+        }
+        return -1;
+    };
+    const int w1 = wave_of("u1");
+    const int w2 = wave_of("u2");
+    const int w3 = wave_of("u3");
+    CHECK(w1 >= 0);
+    CHECK(w2 > w1);  // dependent later than seed — never same wave
+    const bool asm_after = (w3 > w2) || (w3 > w1);
+    CHECK(asm_after);
+}
+
+TEST_CASE("interface advisory injects measured mate for dependent") {
+    InterfaceLedger led = parse_interface_ledger(iface_bolted_plan());
+
+    json tree = hole_feature_tree(5.5, 2);
+    json bbox = json::object();
+    bbox["size"] = json::array({80.0, 40.0, 5.0});
+    MeasuredInterface seed_m = measure_interface_from_tree("bracket_a", tree, bbox);
+    std::map<std::string, MeasuredInterface> built;
+    built["bracket_a"] = seed_m;
+
+    const std::string dep_adv = build_interface_advisory("bracket_b", led, built);
+    REQUIRE_FALSE(dep_adv.empty());
+    const bool has_exists = dep_adv.find("ALREADY EXISTS") != std::string::npos;
+    const bool has_exact = dep_adv.find("match them EXACTLY") != std::string::npos;
+    const bool has_mate = dep_adv.find("bracket_a") != std::string::npos;
+    const bool has_dia = dep_adv.find("5.5") != std::string::npos;
+    CHECK(has_exists);
+    CHECK(has_exact);
+    CHECK(has_mate);
+    CHECK(has_dia);
+
+    // Seed advisory when mate not built: BINDING standard from plan.
+    std::map<std::string, MeasuredInterface> empty_built;
+    const std::string seed_adv = build_interface_advisory("bracket_a", led, empty_built);
+    REQUIRE_FALSE(seed_adv.empty());
+    const bool seed_label = seed_adv.find("you are the SEED") != std::string::npos;
+    const bool seed_bind = seed_adv.find("BINDING") != std::string::npos;
+    const bool seed_dia = seed_adv.find("5.5") != std::string::npos;
+    CHECK(seed_label);
+    CHECK(seed_bind);
+    CHECK(seed_dia);
+}
+
+TEST_CASE("interface mismatch routes fix to dependent not seed") {
+    InterfaceLedger led = parse_interface_ledger(iface_bolted_plan());
+    json tree_seed = hole_feature_tree(5.5, 2);
+    json tree_dep = hole_feature_tree(4.2, 2);
+    std::map<std::string, MeasuredInterface> built;
+    built["bracket_a"] = measure_interface_from_tree("bracket_a", tree_seed);
+    built["bracket_b"] = measure_interface_from_tree("bracket_b", tree_dep);
+
+    auto mms = verify_interfaces(led, built, /*dia_tol_mm=*/0.15);
+    REQUIRE_FALSE(mms.empty());
+    for (const auto& mm : mms) {
+        CHECK(mm.dependent_part == "bracket_b");
+        CHECK(mm.seed_part == "bracket_a");
+        const bool dep_is_not_seed = mm.dependent_part != mm.seed_part;
+        CHECK(dep_is_not_seed);
+    }
+    const std::string fix_dep = build_mismatch_fix_advisory(mms, "bracket_b");
+    REQUIRE_FALSE(fix_dep.empty());
+    const bool mentions_dep_role =
+        fix_dep.find("DEPENDENT") != std::string::npos ||
+        fix_dep.find("dependent") != std::string::npos;
+    const bool mentions_part = fix_dep.find("bracket_b") != std::string::npos;
+    const bool protects_seed =
+        fix_dep.find("do NOT modify") != std::string::npos ||
+        fix_dep.find("SEED") != std::string::npos;
+    CHECK(mentions_dep_role);
+    CHECK(mentions_part);
+    CHECK(protects_seed);
+    // Seed must not receive a fix advisory targeted at it as dependent.
+    const std::string fix_seed = build_mismatch_fix_advisory(mms, "bracket_a");
+    CHECK(fix_seed.empty());
+}
+
+TEST_CASE("interface advisory present in modeler context via advisory seam") {
+    // Mirrors run_design: options.advisory_text → set_context_advisory → build_context body.
+    clear_context_advisory();
+    InterfaceLedger led = parse_interface_ledger(iface_bolted_plan());
+    json tree = hole_feature_tree(5.5, 2);
+    std::map<std::string, MeasuredInterface> built;
+    built["bracket_a"] = measure_interface_from_tree("bracket_a", tree);
+    const std::string adv = build_interface_advisory("bracket_b", led, built);
+    REQUIRE_FALSE(adv.empty());
+    set_context_advisory(adv);
+    DesignState st;
+    st.request = "Build bracket_b matching mate";
+    st.complexity = Complexity::Standard;
+    st.complexity_set = true;
+    BuiltContext bc = build_context(st, "modeler", /*prompts_dir=*/"", /*context_cap=*/8000);
+    const bool has_adv = bc.body.find("ADVISORY:") != std::string::npos;
+    const bool has_exists = bc.body.find("ALREADY EXISTS") != std::string::npos;
+    const bool has_exact = bc.body.find("match them EXACTLY") != std::string::npos;
+    CHECK(has_adv);
+    CHECK(has_exists);
+    CHECK(has_exact);
+    clear_context_advisory();
 }

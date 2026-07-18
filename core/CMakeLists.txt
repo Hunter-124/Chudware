@@ -574,6 +574,7 @@ add_library(aicad_agent STATIC
   agent/domain.cpp
   agent/firm_bid.cpp
   agent/firm_team.cpp
+  agent/iface_plan.cpp
   agent/pm_assist.cpp)
 target_include_directories(aicad_agent PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(aicad_agent PUBLIC nlohmann_json::nlohmann_json)

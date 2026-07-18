@@ -513,10 +513,21 @@ void AppState::activateTabDocAsync(const std::string& docId, int tabIdx,
                      d.isAssembly = docMirror.tree().is_object() &&
                                     (jtab(docMirror.tree(), "schema") == "aicad.asm/1");
                      d.title = docTitle(docMirror.tree(), d.isAssembly);
-                     if (!aicm.empty()) {
-                         std::string lerr;
-                         if (!loadDocMesh(aicm, lerr) && !lerr.empty())
-                             addLog("[tabs] loadDocMesh on switch: " + lerr);
+                    if (!aicm.empty()) {
+#ifdef __EMSCRIPTEN__
+                        // Web: loadAicmFile does a SYNCHRONOUS emscripten_fetch. This callback
+                        // runs on the browser main thread during rpc.drain(); a synchronous fetch
+                        // from here doesn't complete, so the switched-to doc never renders (initial
+                        // open + edits work because they use loadDocMeshAsync). Route through the
+                        // async loader (runs on the loader pthread) like every other mesh-load
+                        // site — drainMeshLoads() commits + fills cachedMirror/cachedDocMesh next
+                        // frame; cachedAicmPath/cachedRevision are also set just below.
+                        loadDocMeshAsync(aicm);
+#else
+                        std::string lerr;
+                        if (!loadDocMesh(aicm, lerr) && !lerr.empty())
+                            addLog("[tabs] loadDocMesh on switch: " + lerr);
+#endif
                      } else {
                          unloadDocMesh();
                          renderer->setActiveMeshIdentity(docId, docMirror.revision());

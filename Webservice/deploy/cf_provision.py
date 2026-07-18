@@ -21,6 +21,8 @@ import sys
 import urllib.request
 from pathlib import Path
 
+import yaml
+
 API = "https://api.cloudflare.com/client/v4"
 ACCOUNT_ID = "9a800a5f674233fe127cdb44b395ebfa"
 TUNNEL_NAME = "billet-web"
@@ -98,7 +100,11 @@ def _users_yaml_emails() -> list[str]:
     """Read the gateway allowlist (single source of truth for people).
 
     Prefers the runtime file ($BILLET_WEB_USERS_FILE, or the data-root copy the
-    /admin page edits) over the repo template.
+    /admin page edits) over the repo template. Parsed as real YAML (not line
+    scraping): a quoted, flow-style, or mixed-case entry must never silently
+    drop someone from the Access policy, because a missing or malformed email
+    means Cloudflare simply never sends that person a One-Time PIN. Emails are
+    lowercased and de-duplicated; example.com rows are dev-only and skipped.
     """
     candidates = [
         os.environ.get("BILLET_WEB_USERS_FILE"),
@@ -106,12 +112,21 @@ def _users_yaml_emails() -> list[str]:
         str(Path(__file__).resolve().parents[1] / "gateway" / "users.yaml"),
     ]
     users_file = next(Path(c) for c in candidates if c and Path(c).is_file())
+    data = yaml.safe_load(users_file.read_text()) or {}
+    rows = data.get("users") if isinstance(data, dict) else data
+    if not isinstance(rows, list):
+        rows = []
     emails: list[str] = []
-    for line in users_file.read_text().splitlines():
-        line = line.strip()
-        if line.startswith("- email:") or line.startswith("email:"):
-            emails.append(line.split(":", 1)[1].strip())
-    return [e for e in emails if "@" in e and not e.endswith("example.com")]
+    seen: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        email = str(row.get("email", "")).strip().lower()
+        if "@" not in email or email.endswith("example.com") or email in seen:
+            continue
+        seen.add(email)
+        emails.append(email)
+    return emails
 
 
 def sync_users(host: str) -> None:

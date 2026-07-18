@@ -748,3 +748,55 @@ def test_terminal_sessions_shared_lifecycle(client, _admin_env, _tmux_env):
     left = {s["name"] for s in client.get("/api/admin/terminal/sessions",
             headers=_auth("boss@example.com")).json()["sessions"]}
     assert "work-1" not in left and auto in left
+
+# --- Access-policy allowlist sync (cf_provision) ---------------------------
+#
+# The allowlist -> Cloudflare Access policy path is what decides whether a
+# person ever receives a One-Time PIN: CF silently drops the OTP email for any
+# address not in an Allow policy. A parser that drops or mangles an email =
+# that user never gets a code. These lock the parser against the shapes real
+# users.yaml files take (quoted values, flow style, mixed case, duplicates).
+
+def _load_cf_provision():
+    import importlib.util
+
+    path = GATEWAY_DIR.parent / "deploy" / "cf_provision.py"
+    spec = importlib.util.spec_from_file_location("cf_provision", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_users_yaml_emails_robust_parse(tmp_path, monkeypatch):
+    cf = _load_cf_provision()
+    users = tmp_path / "users.yaml"
+    users.write_text(
+        "users:\n"
+        '  - email: "Quoted.User@gmail.com"\n'   # quoted + mixed case
+        "  - email: plain@ua.edu\n"
+        "  - email: PLAIN@ua.edu\n"               # duplicate (case-fold)
+        "  - email: demo@example.com\n"           # dev-only, never synced
+        "  - display: no-email-row\n"             # malformed row, ignored
+    )
+    monkeypatch.setenv("BILLET_WEB_USERS_FILE", str(users))
+    assert cf._users_yaml_emails() == ["quoted.user@gmail.com", "plain@ua.edu"]
+
+
+def test_users_yaml_emails_flow_style(tmp_path, monkeypatch):
+    cf = _load_cf_provision()
+    users = tmp_path / "users.yaml"
+    users.write_text("users: [{email: brother@gmail.com, role: user}]\n")
+    monkeypatch.setenv("BILLET_WEB_USERS_FILE", str(users))
+    assert cf._users_yaml_emails() == ["brother@gmail.com"]
+
+
+def test_include_list_never_quotes_email(tmp_path, monkeypatch):
+    cf = _load_cf_provision()
+    users = tmp_path / "users.yaml"
+    users.write_text('users:\n  - email: "brother@gmail.com"\n')
+    monkeypatch.setenv("BILLET_WEB_USERS_FILE", str(users))
+    inc = cf._include_list(cf._users_yaml_emails())
+    emails = [r["email"]["email"] for r in inc if "email" in r]
+    # A stray-quote email can never match in CF Access -> silently no OTP.
+    assert emails == ["brother@gmail.com"]
+    assert all('"' not in e for e in emails)

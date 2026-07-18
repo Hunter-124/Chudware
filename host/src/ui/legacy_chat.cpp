@@ -362,6 +362,25 @@ static ImVec4 semanticOnGlass(const float role[4], const ui::AdaptiveSurface& su
     return semanticOnTone(role, surf.darkText);
 }
 
+// Per-message mode accent for chat borders (CopilotMode 0..5). mode < 0 → 0 (no border).
+// Agent=blue/accent, Plan=amber, Swarm=teal/cyan, Edit=green, Ask=neutral-gray, Eng.Firm=violet.
+static ImU32 modeBorderColor(int mode) {
+    if (mode < 0 || mode > 5) return 0;
+    const auto& pal = ui::palette;
+    auto withA = [](const float c[4], float a) -> ImU32 {
+        return ImGui::ColorConvertFloat4ToU32(ImVec4(c[0], c[1], c[2], a));
+    };
+    switch (mode) {
+        case 0: return withA(pal.accent, 0.70f);                              // Agent — accent/blue
+        case 1: return withA(pal.statusWarn, 0.75f);                          // Plan — amber
+        case 2: return IM_COL32(40, 190, 200, 180);                           // Swarm — teal/cyan
+        case 3: return withA(pal.statusOk, 0.70f);                            // Edit — green
+        case 4: return IM_COL32(150, 155, 165, 160);                          // Ask — neutral gray
+        case 5: return IM_COL32(150, 90, 220, 180);                           // Eng.Firm — violet
+        default: return 0;
+    }
+}
+
 // Fit/interference readout: a green ("fits") or red ("clash") status line; when detailed,
 // the per-pair overlap volumes (red) and clearance gaps (dim) below it.
 // Tone-matches the CALLER's current ink rather than chatSurf() — this helper is shared with the
@@ -2378,9 +2397,19 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         // Both channels coalesce into ONE growing collapsible box each in the timeline
         // (Thinking = reasoning, Output = the model's generated ops/prose), so the user
         // sees continuous output while working. Boxes finalize at stage/run end.
+        // channel=="text" ALSO appends into the primary chat bubble (m.text waterfall);
+        // channel=="thinking" stays in the Thinking activity box only. Tool-call JSON
+        // never enters m.text (agent.tool_call is a separate row path).
         const std::string chan = jstr(data, "channel");
         const std::string txt = jstr(data, "text");
         const bool think = (chan == "thinking");
+        if (!think && !txt.empty()) {
+            // Live waterfall into the primary assistant bubble (text channel only).
+            m.text += txt;
+            m.uiCachedH = -1.0f;  // height grows as prose streams
+        }
+        // Thinking stays in the activity drawer; text also keeps an Output box for the
+        // expandable timeline, but the primary bubble is the main surface for prose.
         const std::string key = think ? "thought:stream" : "stream:out";
         ActivityItem* a = nullptr;
         for (auto it = m.activity.rbegin(); it != m.activity.rend(); ++it)
@@ -4269,7 +4298,13 @@ static void aiVcRollback(AppState& st, const std::string& to, const std::string&
     const std::string docId = aiVcActiveDocId(st);
     if (!docId.empty()) p["doc_id"] = docId;
     p["to"] = to;
-    st.rpc.call("plm_rollback", p, [&st, okToast](const core::RpcResult& r) {
+    // Capture msg:N target so we can always clear chat below on success even when the
+    // backend omits chat_truncate_to (confirmed user-msg rewind must never leave a tail).
+    int msgTruncateTo = -1;
+    if (to.rfind("msg:", 0) == 0) {
+        try { msgTruncateTo = std::stoi(to.substr(4)); } catch (...) { msgTruncateTo = -1; }
+    }
+    st.rpc.call("plm_rollback", p, [&st, okToast, msgTruncateTo](const core::RpcResult& r) {
         s_aiVc.busy = false;
         std::string hint;
         if (!aiVcOk(r, hint)) {
@@ -4277,7 +4312,17 @@ static void aiVcRollback(AppState& st, const std::string& to, const std::string&
             return;
         }
         aiVcRefreshMirror(st, r.result);
-        aiVcApplyChatTruncate(st, r.result);
+        // Prefer backend chat_truncate_to; if absent and this was a msg:N rewind, synthesize.
+        bool hadTruncate = r.result.is_object() && r.result.contains("chat_truncate_to") &&
+                           !r.result["chat_truncate_to"].is_null();
+        if (hadTruncate) {
+            aiVcApplyChatTruncate(st, r.result);
+        } else if (msgTruncateTo >= 0) {
+            nlohmann::json synth = {{"chat_truncate_to", msgTruncateTo}};
+            aiVcApplyChatTruncate(st, synth);
+        } else {
+            aiVcApplyChatTruncate(st, r.result);
+        }
         st.toast(ui::ToastLevel::Success,
                  okToast.empty() ? std::string("Restored checkpoint") : okToast);
         s_aiVc.lastFetch = 0.0;  // force timeline refresh next open
@@ -4796,9 +4841,16 @@ static void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts
     const ImGuiID textId = chatDrawSelectableText("##umsg_sel", userBody, chatSurf().textPrimary);
     ImGui::EndChild();
     ImRect bubble = endGlassBubble(gb);
-    ImGui::GetWindowDrawList()->AddRect(bubble.Min, bubble.Max,
-        ImGui::ColorConvertFloat4ToU32(ImVec4(accentCol.x, accentCol.y, accentCol.z, 0.55f)),
-        8.0f * ui::uiScale, 0, ui::metrics::stroke(1.0f));
+    {
+        ImU32 border = modeBorderColor(m.copilotMode);
+        if (border == 0) {
+            // Unstamped: keep legacy accent border.
+            border = ImGui::ColorConvertFloat4ToU32(
+                ImVec4(accentCol.x, accentCol.y, accentCol.z, 0.55f));
+        }
+        ImGui::GetWindowDrawList()->AddRect(bubble.Min, bubble.Max, border,
+            8.0f * ui::uiScale, 0, ui::metrics::stroke(1.0f));
+    }
     const std::string sel = chatInputSelection(textId);
     chatCopyContext(bubble, "##umsg_copy", userBody, userBody, sel);
     chatHoverCopyGlyph(bubble, userBody);
@@ -5770,6 +5822,7 @@ void persistChatHistory(AppState& st) {
             if (body.empty() && !m.planState.present) continue;
             nlohmann::json entry = {{"u", m.fromUser}, {"t", body}, {"e", m.errKind}};
             if (!m.fromUser && !m.model.empty()) entry["m"] = m.model;
+            if (m.copilotMode >= 0) entry["cm"] = m.copilotMode;
             if (m.planState.present) entry["plan_state"] = planStateToJson(m.planState);
             jm.push_back(std::move(entry));
         }
@@ -5844,6 +5897,7 @@ static void loadChatHistoryForKey(AppState& st, const std::string& key) {
                 cm.text = m.value("t", std::string());
                 cm.errKind = m.value("e", 0);
                 if (!cm.fromUser) cm.model = m.value("m", std::string());
+                cm.copilotMode = m.value("cm", -1);  // -1 when absent (legacy sessions)
                 // Restore plan/task-list state when present (legacy sessions omit the key).
                 if (m.contains("plan_state") && m["plan_state"].is_object()) {
                     cm.planState = parsePlanState(m["plan_state"]);
@@ -10198,6 +10252,7 @@ static void submitTurn(AppState& st, const std::string& text) {
     if (!contextRefs.empty()) turnExtras["context_refs"] = contextRefs;
     {
         ChatMsg u; u.fromUser = true; u.text = text;
+        u.copilotMode = st.aiInteraction;  // stamp composer mode for colored border
         if (!attachments.empty()) {
             u.text += "\n[attached:";
             for (const auto& a : attachments) u.text += " " + a.value("name", std::string());
@@ -10214,7 +10269,13 @@ static void submitTurn(AppState& st, const std::string& text) {
         }
         st.chat.push_back(u);
     }
-    { ChatMsg a; a.running = true; if (st.settings.model[0]) a.model = st.settings.model; st.chat.push_back(a); }
+    {
+        ChatMsg a;
+        a.running = true;
+        a.copilotMode = st.aiInteraction;  // stamp; auto-switch may update to Agent
+        if (st.settings.model[0]) a.model = st.settings.model;
+        st.chat.push_back(a);
+    }
     st.designStarted = true;   // conversation is now active (kept for shot scenarios)
 
     // Name the conversation tab after its first prompt; persist so the turn survives a restart.
@@ -10273,6 +10334,21 @@ static void submitTurn(AppState& st, const std::string& text) {
     std::transform(lo.begin(), lo.end(), lo.begin(),
                    [](unsigned char c) { return (char)std::tolower(c); });
     auto has = [&](const char* k) { return lo.find(k) != std::string::npos; };
+
+    // Shared intent classifiers (Agent auto-router + Ask promote-to-build).
+    // Eng. Firm is NEVER auto-invoked — only the explicit engFirmMode branch may set eng_firm.
+    const bool buildIntent = has("make ") || has("model ") || has("build ") || has("design ") ||
+                             has("create ") || has("generate ") || has("give me") || has("add ") ||
+                             has("cut ") || has("draw ");
+    const bool changeIntent = has("edit ") || has("change ") || has("modify ") || has("update ") ||
+                              has("fix ") || has("on this") || has("this part") || has("the part");
+    const bool questionIntent = !buildIntent && !changeIntent &&
+        (lo.find('?') != std::string::npos ||
+         lo.rfind("what ", 0) == 0 || lo.find(" what ") != std::string::npos ||
+         lo.rfind("how ", 0) == 0 || lo.find(" how ") != std::string::npos ||
+         lo.rfind("why ", 0) == 0 || lo.find(" why ") != std::string::npos ||
+         lo.rfind("which ", 0) == 0 || lo.find(" which ") != std::string::npos ||
+         has("is it") || has("should i") || has("can you tell") || has("explain "));
 
     // MISSION intent: Agent mode only.
     auto looksLikeMission = [&]() -> bool {
@@ -10397,6 +10473,57 @@ static void submitTurn(AppState& st, const std::string& text) {
     }
 
     if (askMode) {
+        // Build/change intent in Ask → auto-promote to Agent (never dead-end with
+        // "switch modes"). Eng. Firm is NEVER auto-invoked from this path.
+        if (buildIntent || changeIntent) {
+            if (st.agentV2Running) {
+                if (!st.chat.empty() && st.chat.back().running && !st.chat.back().fromUser) {
+                    st.chat.back().running = false;
+                    st.chat.back().text = "A design/edit run is still in progress - "
+                                          "ask me again when it finishes.";
+                }
+                return;
+            }
+            st.addLog("[..] ask→agent (build/change intent): " + text);
+            for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it) {
+                if (!it->fromUser && it->running) {
+                    it->copilotMode = (int)CopilotMode::Agent;  // border reflects effective mode
+                    it->liveStatus = "Auto-switched to Agent to build this";
+                    break;
+                }
+            }
+            // Route exactly like Agent default: edit-in-place if features+change, else design.
+            bool hasFeatures = false;
+            if (st.docMirror.hasDoc()) {
+                const nlohmann::json& tree = st.docMirror.tree();
+                hasFeatures = tree.is_object() && tree.contains("features") &&
+                              tree["features"].is_array() && !tree["features"].empty();
+            }
+            if (hasFeatures && changeIntent) {
+                st.addLog("[..] agent edit-in-place: " + text);
+                st.status = "Editing...";  st.statusKind = 0;
+                st.agentV2Running = true;
+                st.agentV2 = true;
+                if (st.activityPanel) st.activityPanel->clearLive();
+                nlohmann::json extra = provOverride;
+                for (auto it = turnExtras.begin(); it != turnExtras.end(); ++it)
+                    extra[it.key()] = it.value();
+                nlohmann::json opts = {{"mode", "agent"}, {"advisor", true},
+                                       {"scope", buildEditScope()}};
+                extra["options"] = std::move(opts);
+                launchAgentRunV2(st.worker, st.job, sendText, st.docMirror.docId(),
+                                 st.ribbonTab == AppState::RT_Manufacture, extra);
+                return;
+            }
+            nlohmann::json agentExtras =
+                withOptions(turnExtras, {{"mode", "agent"}, {"advisor", true}});
+            for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
+                if (!it->fromUser && it->running) { it->liveStatus = "Building..."; break; }
+            st.status = "Building...";  st.statusKind = 0;
+            launchDesignRun(st, sendText, agentExtras);
+            return;
+        }
+        // Genuine questions stay on agent_ask_v2.
         if (st.agentV2Running) {
             if (!st.chat.empty() && st.chat.back().running && !st.chat.back().fromUser) {
                 st.chat.back().running = false;
@@ -10465,6 +10592,8 @@ static void submitTurn(AppState& st, const std::string& text) {
     }
 
     if (engFirmMode) {
+        // USER-ONLY: Eng. Firm is never auto-invoked by Agent/Ask auto-routing.
+        // Only this explicit composer-mode branch may set mode/org/execute_as eng_firm.
         // Engineering-firm org: the heaviest structure — specialist roles + contractor
         // firms bidding on tasks within a $ budget. Routes through the mission path with
         // the eng_firm org flag + the configured budget so the C++ harness assembles the
@@ -10482,8 +10611,7 @@ static void submitTurn(AppState& st, const std::string& text) {
             const nlohmann::json& tree = st.docMirror.tree();
             bool hasFeatures = tree.is_object() && tree.contains("features") &&
                                tree["features"].is_array() && !tree["features"].empty();
-            if (hasFeatures && (has("edit ") || has("change ") || has("modify ") ||
-                                has("update ") || has("fix ") || has("on this")))
+            if (hasFeatures && changeIntent)
                 needFresh = false;
         }
         launchMissionRunChat(st, sendText, needFresh, extras);
@@ -10530,7 +10658,8 @@ static void submitTurn(AppState& st, const std::string& text) {
         return;
     }
 
-    // Agent (default)
+    // Agent (default) — smart auto-router: pure questions → ask; edit-in-place when
+    // features+change; else design/clarify. Never sets mode/org eng_firm.
     st.designStarted = true;
     {
         bool hasFeatures = false;
@@ -10539,9 +10668,63 @@ static void submitTurn(AppState& st, const std::string& text) {
             hasFeatures = tree.is_object() && tree.contains("features") &&
                           tree["features"].is_array() && !tree["features"].empty();
         }
-        const bool changeIntent = has("edit ") || has("change ") || has("modify ") ||
-                                  has("update ") || has("fix ") || has("on this") ||
-                                  has("this part") || has("the part");
+        // Pure question (no build/change) → agent_ask_v2 so Agent auto-invokes Ask.
+        if (questionIntent && !(hasFeatures && changeIntent)) {
+            if (st.agentV2Running) {
+                if (!st.chat.empty() && st.chat.back().running && !st.chat.back().fromUser) {
+                    st.chat.back().running = false;
+                    st.chat.back().text = "A design/edit run is still in progress - "
+                                          "ask me again when it finishes.";
+                }
+                return;
+            }
+            st.addLog("[..] agent→ask (question intent): " + text);
+            for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it) {
+                if (!it->fromUser && it->running) {
+                    // Keep Agent border (user picked Agent); liveStatus notes the ask path.
+                    it->liveStatus = "Answering...";
+                    break;
+                }
+            }
+            st.status = "Answering...";  st.statusKind = 0;
+            nlohmann::json params = {
+                {"doc_id", st.docMirror.hasDoc() ? st.docMirror.docId() : std::string()},
+                {"question", sendText},
+                {"options", {{"mode", "ask"}, {"advisor", true}}}};
+            for (auto it = provOverride.begin(); it != provOverride.end(); ++it)
+                params[it.key()] = it.value();
+            for (auto it = turnExtras.begin(); it != turnExtras.end(); ++it)
+                if (it.key() != "options") params[it.key()] = it.value();
+            st.rpc.call("agent_ask_v2", params, [&st](const core::RpcResult& r) {
+                ChatMsg* msg = nullptr;
+                for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
+                    if (!it->fromUser && it->running) { msg = &*it; break; }
+                std::string err;
+                if (!r.ok)
+                    err = r.err.empty() ? "worker call failed" : r.err;
+                else if (r.result.is_object() && r.result.contains("code"))
+                    err = r.result.value("message", std::string("worker error"));
+                if (msg) {
+                    msg->running = false;
+                    msg->liveStatus.clear();
+                    if (!err.empty()) {
+                        msg->errKind = ERR_SYSTEM;
+                        msg->text = "I couldn't answer that: " + err;
+                    } else {
+                        msg->text = r.result.value("answer", std::string());
+                        if (msg->text.empty()) msg->text = "(no answer)";
+                    }
+                }
+                if (!err.empty()) {
+                    st.addLog("[err] ask: " + err);
+                    st.status = "Ask failed.";  st.statusKind = 2;
+                } else {
+                    st.status = "Ready.";  st.statusKind = 0;
+                }
+            }, 300000);
+            return;
+        }
+        // Shared changeIntent (above) — edit-in-place when doc has features.
         if (hasFeatures && changeIntent) {
             st.addLog("[..] agent edit-in-place: " + text);
             st.status = "Editing...";  st.statusKind = 0;
@@ -11860,6 +12043,17 @@ static void drawChatLogWindowed(AppState& st) {
             ImGui::Dummy(ImVec2(0, 8 * ui::uiScale));
         }
         ImGui::EndGroup();
+        // Mode-colored left accent bar on assistant turns (user bubbles already border-tint).
+        if (!m.fromUser) {
+            const ImU32 barCol = modeBorderColor(m.copilotMode);
+            if (barCol != 0) {
+                const ImVec2 rmin = ImGui::GetItemRectMin();
+                const ImVec2 rmax = ImGui::GetItemRectMax();
+                const float barW = 3.0f * ui::uiScale;
+                ImGui::GetWindowDrawList()->AddRectFilled(
+                    rmin, ImVec2(rmin.x + barW, rmax.y), barCol);
+            }
+        }
         m.uiCachedH = ImGui::GetItemRectSize().y;
         m.uiCachedW = logW;
         ImGui::PopID();

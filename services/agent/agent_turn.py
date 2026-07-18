@@ -575,6 +575,11 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
         if narrowed is not None:
             allow = set(narrowed)
             allowed_tools = list(narrowed)
+            # Restricted floor: always expose category meta-tools so the model
+            # can pull more packs without the full catalog in the prompt.
+            allow.add("enable_tools")
+            allow.add("list_tool_categories")
+            allowed_tools = sorted(allow)
     except Exception:  # noqa: BLE001 — mode gate never breaks a turn
         pass
     actor = actor or name
@@ -1154,6 +1159,106 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                     continue
             last_reason = _NOCODE
             break
+
+        # Model-requestable tool categories (anti-context-flood). Handle before
+        # the allow deny-check so meta-tools always run when present on the floor.
+        if tool in ("enable_tools", "list_tool_categories"):
+            tool_calls_made += 1
+            meta_result: dict
+            try:
+                from services.agent.tool_categories import (  # noqa: PLC0415
+                    category_catalog,
+                    resolve_categories,
+                )
+                if tool == "list_tool_categories":
+                    meta_result = {
+                        "ok": True,
+                        "categories": [
+                            {"name": n, "description": d}
+                            for n, d in category_catalog()
+                        ],
+                    }
+                else:
+                    # enable_tools
+                    raw_cats = (args or {}).get("categories") if isinstance(args, dict) else None
+                    if raw_cats is None and isinstance(args, dict):
+                        raw_cats = args.get("category") or args.get("names")
+                    if isinstance(raw_cats, str):
+                        raw_cats = [raw_cats]
+                    cats = [str(c) for c in (raw_cats or []) if c]
+                    if not allow:
+                        # agent/swarm unrestricted — already full access
+                        meta_result = {
+                            "ok": True,
+                            "enabled": [],
+                            "categories": cats,
+                            "note": "already full access (unrestricted mode)",
+                        }
+                    else:
+                        expanded = resolve_categories(cats)
+                        newly = sorted(expanded - allow)
+                        allow |= expanded
+                        allow.add("enable_tools")
+                        allow.add("list_tool_categories")
+                        # Mirror into live tool_registry policy when active.
+                        try:
+                            from services.mcp import tool_registry as _tr  # noqa: PLC0415
+                            cur = _tr._current_allow()
+                            if cur is not None:
+                                _tr.set_policy(
+                                    allow=sorted(set(cur) | allow),
+                                    deny_risk=_tr._current_deny_risk(),
+                                )
+                        except Exception:  # noqa: BLE001
+                            pass
+                        # Re-render tools block so subsequent steps see new schemas.
+                        try:
+                            from services.agent.tool_schemas import (  # noqa: PLC0415
+                                render_tools_block,
+                            )
+                            _resolver = resolver_for(mission_dispatch)
+                            new_text, _meta = render_tools_block(
+                                sorted(allow), resolver=_resolver,
+                            )
+                            if new_text:
+                                if tools_text and tools_text in system:
+                                    system = system.replace(tools_text, new_text, 1)
+                                elif "\nAllowed tools: " in system and not tools_text:
+                                    # Replace bare name list with full block.
+                                    import re as _re  # noqa: PLC0415
+                                    system = _re.sub(
+                                        r"\nAllowed tools: [^\n]*",
+                                        "\n\n" + new_text,
+                                        system,
+                                        count=1,
+                                    )
+                                else:
+                                    system = system.rstrip() + "\n\n" + new_text
+                                tools_text = new_text
+                        except Exception:  # noqa: BLE001
+                            pass
+                        meta_result = {
+                            "ok": True,
+                            "enabled": newly,
+                            "categories": cats,
+                            "allow_size": len(allow),
+                        }
+            except Exception as exc:  # noqa: BLE001 — meta tool never crashes turn
+                meta_result = {"ok": False, "error": str(exc)}
+            call_rec = {
+                "tool": tool, "args": args, "ok": bool(meta_result.get("ok")),
+                "result": meta_result,
+            }
+            calls.append(call_rec)
+            _log(ledger, actor, {
+                "event": "tool_call",
+                "tool": tool, "args": args, "ok": call_rec["ok"],
+                "result": _truncate(meta_result),
+            })
+            messages.append({"role": "user", "content": _parts(
+                f"Result of {tool}:\n{_as_text(meta_result)}"
+            )})
+            continue
 
         if allow and tool not in allow:
             note = {"tool": tool, "error": f"tool {tool!r} not in allowed list"}

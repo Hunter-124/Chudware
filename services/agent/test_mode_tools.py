@@ -1,8 +1,10 @@
 """Offline tests for copilot mode → tools / roles / advisor defaults.
 
-Covers work items C3/D/E/F (Python path):
-  * allowlist per mode (ask read-only, plan no mutation, edit no new_part,
-    agent/swarm full)
+Covers work items C3/D/E/F (Python path) + shared-defaults / tool-categories:
+  * SHARED_DEFAULT_TOOLS ⊆ every restricted mode allowlist (ask/plan/edit)
+  * agent/swarm unrestricted (None)
+  * enable_tools / list_tool_categories always allowed
+  * resolve_categories expands packs with a cap
   * role_for_copilot_mode mapping
   * advisor_enabled default True (+ env override)
   * mode_options_from_mapping couples swarm→corporate_force, plan→plan_only
@@ -17,6 +19,7 @@ import pytest
 from services.agent import config as agent_config
 from services.agent import copilot_mode_tools as cmt
 from services.agent import role_models as rm
+from services.agent import tool_categories as tcat
 
 
 # ---------------------------------------------------------------------------
@@ -56,32 +59,51 @@ class TestRoleForCopilotMode:
 
 
 class TestModeToolAllowlists:
-    def test_ask_read_only_excludes_add_features(self):
+    def test_shared_defaults_subset_of_restricted_modes(self):
+        """SHARED_DEFAULT_TOOLS is a floor for every restricted mode allowlist."""
+        for mode in ("ask", "plan", "edit"):
+            out = cmt.apply_mode_tools(mode, None)
+            assert out is not None, mode
+            for name in cmt.SHARED_DEFAULT_TOOLS:
+                assert name in out, f"{name} missing from {mode}"
+
+    def test_ask_keeps_reads_and_shared_floor(self):
         tools = cmt.tools_for_mode("ask")
         assert tools is not None
         assert "describe_part" in tools
         assert "measure_part" in tools
         assert "cad_guide" in tools
         assert "research_web_search" in tools
+        # Mode card still excludes feature mutators; shared floor re-adds doc lifecycle.
         assert "add_features" not in tools
-        assert "new_part" not in tools
         assert "edit_feature" not in tools
+        out = cmt.apply_mode_tools("ask", None)
+        assert out is not None
+        assert "new_part" in out
+        assert "save_part" in out
+        assert "close_part" in out
+        assert "import_part" in out
+        assert "export_part" in out
+        assert "advise" in out
+        assert "ask_user" in out
+        assert "enable_tools" in out
+        assert "list_tool_categories" in out
+        assert "add_features" not in out
+        assert "edit_feature" not in out
 
-    def test_plan_excludes_mutation(self):
+    def test_plan_broad_with_shared_doc_lifecycle(self):
+        """Plan = agent-broad minus geometry mutators + SHARED_DEFAULT_TOOLS."""
         tools = cmt.tools_for_mode("plan")
         assert tools is not None
         assert "buildgraph_plan" in tools
         assert "dag_plan" in tools
         assert "ledger_get" in tools
         assert "describe_part" in tools
+        # Mode card excludes feature mutators.
         assert "add_features" not in tools
-        assert "new_part" not in tools
         assert "edit_feature" not in tools
-
-    def test_plan_is_broad_non_mutator(self):
-        """Plan = agent-broad minus commit mutators (not a locked-down read set)."""
-        tools = cmt.tools_for_mode("plan")
-        assert tools is not None
+        out = cmt.apply_mode_tools("plan", None)
+        assert out is not None
         for name in (
             "run_fea_static",
             "run_cfd_flow",
@@ -95,24 +117,30 @@ class TestModeToolAllowlists:
             "bom_rollup",
             "layout_plan",
             "preflight_ops",
+            # Shared floor (plan can build simple parts)
+            "new_part",
+            "save_part",
+            "close_part",
+            "import_part",
+            "export_part",
+            "advise",
+            "enable_tools",
         ):
-            assert name in tools, name
-        # Commit mutators must never appear in the mode set.
+            assert name in out, name
+        # Geometry commit mutators still excluded (not in shared floor).
         for name in (
             "add_features",
-            "new_part",
             "new_assembly",
             "edit_feature",
             "asm_add_component",
             "cam_generate",
             "ecad_place_symbol",
         ):
-            assert name not in tools, name
-            assert name not in cmt.PLAN_TOOLS
+            assert name not in out, name
 
-    def test_plan_role_card_does_not_intersect_narrow_set(self):
-        # Role card may include mutators; plan strips them but keeps the rest
-        # (no intersection with a locked-down PLAN_TOOLS).
+    def test_plan_role_card_strips_mutators_keeps_shared(self):
+        # Role card may include mutators; plan strips them but shared floor
+        # re-adds new_part / close / import etc.
         role = [
             "describe_part",
             "add_features",
@@ -129,19 +157,32 @@ class TestModeToolAllowlists:
         assert "delegate" in out
         assert "research_web_search" in out
         assert "add_features" not in out
-        assert "new_part" not in out
         assert "edit_feature" not in out
+        # Shared floor restores new_part even though stripped as mutator.
+        assert "new_part" in out
+        assert "enable_tools" in out
 
-    def test_edit_excludes_new_part(self):
+    def test_edit_has_features_and_shared_doc_lifecycle(self):
         tools = cmt.tools_for_mode("edit")
         assert tools is not None
         assert "add_features" in tools
         assert "edit_feature" in tools
         assert "measure_part" in tools
         assert "describe_part" in tools
+        # Mode card excludes new_part; shared floor re-adds it.
         assert "new_part" not in tools
-        assert "new_assembly" not in tools
         assert "corporate_activate" not in tools
+        out = cmt.apply_mode_tools("edit", None)
+        assert out is not None
+        assert "add_features" in out
+        assert "new_part" in out
+        assert "close_part" in out
+        assert "import_part" in out
+        assert "export_part" in out
+        assert "save_part" in out
+        assert "advise" in out
+        assert "enable_tools" in out
+        assert "corporate_activate" not in out
 
     def test_agent_unrestricted(self):
         assert cmt.tools_for_mode("agent") is None
@@ -158,18 +199,20 @@ class TestModeToolAllowlists:
         assert "delegate" in out
         assert "corporate_activate" in out
 
-    def test_apply_intersects_role_with_ask(self):
+    def test_apply_intersects_role_with_ask_plus_shared(self):
         role = ["describe_part", "add_features", "new_part", "measure_part"]
         out = cmt.apply_mode_tools("ask", role)
         assert out is not None
         assert "describe_part" in out
         assert "measure_part" in out
         assert "add_features" not in out
-        assert "new_part" not in out
+        # Shared floor restores new_part (doc lifecycle).
+        assert "new_part" in out
+        assert "enable_tools" in out
 
     def test_plan_only_forces_plan_tools(self):
         # Even under agent mode, plan_only uses plan semantics (strip mutators;
-        # keep non-mutators from the role card — no narrow PLAN_TOOLS intersect).
+        # keep non-mutators from the role card) + shared floor.
         out = cmt.apply_mode_tools(
             "agent",
             ["add_features", "describe_part", "buildgraph_plan", "new_part",
@@ -182,15 +225,19 @@ class TestModeToolAllowlists:
         assert "run_fea_static" in out
         assert "delegate" in out
         assert "add_features" not in out
-        assert "new_part" not in out
+        assert "new_part" in out  # shared floor
 
     def test_is_tool_allowed(self):
         assert cmt.is_tool_allowed("describe_part", "ask") is True
         assert cmt.is_tool_allowed("add_features", "ask") is False
         assert cmt.is_tool_allowed("add_features", "edit") is True
-        assert cmt.is_tool_allowed("new_part", "edit") is False
+        # Shared floor: new_part allowed in edit/ask/plan.
+        assert cmt.is_tool_allowed("new_part", "edit") is True
+        assert cmt.is_tool_allowed("new_part", "ask") is True
         assert cmt.is_tool_allowed("new_part", "agent") is True
         assert cmt.is_tool_allowed("delegate", "swarm") is True
+        assert cmt.is_tool_allowed("enable_tools", "ask") is True
+        assert cmt.is_tool_allowed("list_tool_categories", "plan") is True
 
     def test_is_tool_allowed_plan_broad(self):
         assert cmt.is_tool_allowed("run_fea_static", "plan") is True
@@ -199,13 +246,58 @@ class TestModeToolAllowlists:
         assert cmt.is_tool_allowed("part_source", "plan") is True
         assert cmt.is_tool_allowed("ask_user", "plan") is True
         assert cmt.is_tool_allowed("inspect_part", "plan") is True
+        assert cmt.is_tool_allowed("new_part", "plan") is True  # shared floor
         assert cmt.is_tool_allowed("add_features", "plan") is False
-        assert cmt.is_tool_allowed("new_part", "plan") is False
         assert cmt.is_tool_allowed("edit_feature", "plan") is False
         assert cmt.is_tool_allowed("new_assembly", "plan") is False
         assert cmt.is_tool_allowed("asm_mate", "plan") is False
         assert cmt.is_tool_allowed("cam_generate", "plan") is False
         assert cmt.is_tool_allowed("ecad_place_symbol", "plan") is False
+
+
+class TestToolCategories:
+    def test_category_packs_cover_required(self):
+        required = {
+            "modeling", "sketch", "measure", "inspect", "research", "sim",
+            "cam", "ecad", "assembly", "sourcing", "drawing", "advisor",
+            "delegate", "sheetmetal",
+        }
+        assert required <= set(tcat.CATEGORY_PACKS.keys())
+
+    def test_resolve_categories_expands_and_caps(self):
+        got = tcat.resolve_categories(["research", "measure"])
+        assert "research_web_search" in got
+        assert "measure_part" in got
+        assert "cad_guide" in got
+        # Cap is respected even when requesting everything.
+        all_names = list(tcat.CATEGORY_PACKS.keys())
+        capped = tcat.resolve_categories(all_names, cap=5)
+        assert len(capped) <= 5
+
+    def test_category_catalog_shape(self):
+        cat = tcat.category_catalog()
+        assert cat
+        assert all(isinstance(n, str) and isinstance(d, str) for n, d in cat)
+        names = {n for n, _ in cat}
+        assert "modeling" in names
+        assert "research" in names
+
+    def test_meta_tools_always_allowed_in_registry(self):
+        from services.mcp import tool_registry as reg
+        reg.ensure_meta_tools()
+        assert "enable_tools" in reg.catalog()
+        assert "list_tool_categories" in reg.catalog()
+        assert reg.catalog()["enable_tools"]["family"] == "workspace"
+        assert reg.catalog()["enable_tools"]["risk"] == "read"
+        # Even under a tight allow-list policy, meta tools are permitted.
+        reg.set_policy(allow=["describe_part"], deny_risk=None)
+        try:
+            assert reg.is_allowed("enable_tools") is True
+            assert reg.is_allowed("list_tool_categories") is True
+            assert reg.is_allowed("describe_part") is True
+            assert reg.is_allowed("add_features") is False
+        finally:
+            reg.reset_policy()
 
 
 # ---------------------------------------------------------------------------

@@ -1,21 +1,23 @@
 """copilot_mode_tools.py — per-mode tool allowlists for Agent|Plan|Swarm|Edit|Ask.
 
-Contract (mode-overhaul):
+Contract (mode-overhaul + shared floor):
   options.mode ∈ agent|plan|swarm|edit|ask
   Mode gates the tool set applied at agent_turn.run_turn (intersected with any
   role-card allowlist the caller already computed).
 
 Policies:
-  * ask   — read-only Q&A (describe/measure/research/cad_guide)
-  * plan  — agent-broad tool access MINUS geometry/document commit mutators;
-            plan_only run gate blocks commits, not a locked-down allowlist.
-            open-ended ask_user + delegate stay available.
-  * edit  — doc-scoped mutating tools; NO new_part / mission / broad corporate
+  * ask/plan/edit — restricted mode lists UNION SHARED_DEFAULT_TOOLS (doc
+    lifecycle, web, advisor, ask_user, baseline read/help) plus meta-tools
+    enable_tools / list_tool_categories so the model can pull more categories.
+  * plan  — agent-broad tool access MINUS geometry commit mutators; shared
+            defaults (incl. make/save/open/close) stay so plan can build.
+  * edit  — doc-scoped mutating tools; shared defaults still include new_part
+            / close / import so edit can finish a simple part.
   * agent — full (None = unrestricted at mode layer; role card still applies)
   * swarm — full + explicit corporate/delegate tools kept in the set
 
-Subagents (``delegate``) stay available in agent/swarm/edit/plan. Ask is the
-only mode that excludes them.
+Subagents (``delegate``) stay available in agent/swarm/edit/plan. Ask also
+gets shared defaults (doc lifecycle + advise + web) so it never dead-ends.
 """
 from __future__ import annotations
 
@@ -24,6 +26,29 @@ from typing import Any, Iterable, Optional
 # Canonical mode vocabulary (frozen with host/core).
 COPILOT_MODES = frozenset({"agent", "plan", "swarm", "edit", "ask"})
 DEFAULT_MODE = "agent"
+
+# Always-available floor across restricted modes so the agent can get work done,
+# talk to the user, reach the advisor, search the web, and manage docs.
+SHARED_DEFAULT_TOOLS: frozenset[str] = frozenset({
+    # Doc lifecycle (make / save / open / close)
+    "new_part",
+    "save_part",
+    "close_part",
+    "import_part",
+    "export_part",
+    # Web + advisor + interaction
+    "research_web_search",
+    "advise",
+    "ask_user",
+    # Baseline read / help
+    "cad_guide",
+    "list_parts",
+    "describe_part",
+    "measure_part",
+    # Meta: request more tool categories mid-turn
+    "enable_tools",
+    "list_tool_categories",
+})
 
 # ---------------------------------------------------------------------------
 # Allowlists (None = no mode-level restriction)
@@ -287,7 +312,7 @@ def apply_mode_tools(
     *,
     plan_only: bool | None = None,
 ) -> Optional[list[str]]:
-    """Intersect *role_tools* with the mode allowlist.
+    """Intersect *role_tools* with the mode allowlist, then floor with shared defaults.
 
     Returns:
       * None  — no restriction (agent mode with no role card, or empty inputs
@@ -296,11 +321,10 @@ def apply_mode_tools(
 
     Rules:
       * ``plan_only=True`` forces plan semantics even if mode is agent.
-      * plan = agent-broad minus commit mutators (never a narrow read-only
-        intersection). Empty role → broad ``PLAN_TOOLS``; non-empty role →
-        that set with mutators stripped (callers that need full plan breadth
-        should pass role_tools=None).
-      * When *role_tools* is None/empty and mode is restricted → mode list.
+      * plan = agent-broad minus geometry commit mutators, then UNION
+        :data:`SHARED_DEFAULT_TOOLS` (doc lifecycle stays so plan can build).
+      * ask / edit: mode list ∩ role (or mode list), mode denylists applied,
+        then UNION shared defaults (shared wins over denylists for the floor).
       * When *role_tools* is None/empty and mode is open → None (unrestricted).
       * swarm unions SWARM_EXTRA_TOOLS onto the role set (or leaves unrestricted).
     """
@@ -325,15 +349,17 @@ def apply_mode_tools(
             return None
         return sorted(role_set)
 
-    # Plan: open like agent minus geometry/doc commit mutators. Do NOT
-    # intersect a role card with the (legacy narrow) plan set — that was the
-    # over-restriction. Empty role → broad PLAN_TOOLS denylist form.
+    # Plan: open like agent minus geometry commit mutators (add_features etc.),
+    # then floor with SHARED_DEFAULT_TOOLS so make/save/open/close stay.
     if m == "plan":
-        _plan_deny = _MUTATING_TOOLS | {"new_part", "new_assembly", "edit_feature"}
+        _plan_deny = _MUTATING_TOOLS | {"new_assembly", "edit_feature"}
+        # new_part / close_part / import_part live in SHARED_DEFAULT_TOOLS and
+        # are re-added below (product: plan can build simple parts).
         if role_set:
             allowed = role_set - _plan_deny
         else:
             allowed = set(PLAN_TOOLS) - _plan_deny
+        allowed |= SHARED_DEFAULT_TOOLS
         return sorted(allowed)
 
     # Restricted modes: ask / edit
@@ -348,6 +374,9 @@ def apply_mode_tools(
     if m == "ask":
         allowed -= _MUTATING_TOOLS
 
+    # Shared floor always wins for restricted modes (doc lifecycle + advise +
+    # web + meta enable_tools / list_tool_categories).
+    allowed |= SHARED_DEFAULT_TOOLS
     return sorted(allowed)
 
 

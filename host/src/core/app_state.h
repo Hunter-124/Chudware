@@ -530,6 +530,9 @@ struct ChatMsg {
     bool planApprovePending = false;
     std::string planApproveRequest;   // original user request to re-launch with approved_plan
     nlohmann::json planApproveExtras = nlohmann::json::object();  // attachments/context_refs
+    // Per-message copilot mode stamp (CopilotMode 0..5). -1 = unstamped / no mode border.
+    // Set at submitTurn from st.aiInteraction; auto-switch (Ask→Agent) updates the assistant.
+    int copilotMode = -1;
     // ---- M19 render-windowing cache (GUI-only, not persisted) ----
     // Height this message occupied last time it was actually drawn at uiCachedW width. Lets the
     // chat log emit a same-height Dummy for messages far outside the scroll viewport instead of

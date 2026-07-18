@@ -1011,6 +1011,8 @@ class MissionDispatch:
             except Exception:  # noqa: BLE001 — never block subagent on role_models
                 provider = self.provider
             # Mode → tools: intersect role allowlist with copilot mode policy.
+            # apply_mode_tools unions SHARED_DEFAULT_TOOLS (advise, ask_user,
+            # doc lifecycle, enable_tools / list_tool_categories, …).
             try:
                 from services.agent.copilot_mode_tools import (  # noqa: PLC0415
                     apply_mode_tools,
@@ -1022,35 +1024,31 @@ class MissionDispatch:
                 )
                 if mode_allowed is not None:
                     allowed = list(mode_allowed)
-                    # Re-render tools_text against the narrowed set.
+                    # Re-render tools_text against the narrowed set (+ category menu).
                     if allowed:
                         try:
                             from services.agent.tool_schemas import (  # noqa: PLC0415
                                 render_tools_block,
                             )
                             tools_text, _meta = render_tools_block(
-                                allowed, resolver=_at.resolver_for(self))
+                                allowed, resolver=_at.resolver_for(self),
+                            )
                         except Exception:  # noqa: BLE001
                             pass
             except Exception:  # noqa: BLE001 — mode gate is best-effort
                 pass
-            # Advisor default-on for subagents: ensure advisor role is resolvable
-            # and advise helper stays reachable when advisor is enabled.
+            # Restricted allowlists (mode or role card): ensure meta-tools so the
+            # model can expand categories. advise folds into SHARED_DEFAULT_TOOLS
+            # for ask/plan/edit; for agent/swarm role cards inject when advisor on.
             try:
-                from services.agent.config import advisor_enabled  # noqa: PLC0415
-                adv_on = bool(getattr(self, "advisor", True))
-                if adv_on and advisor_enabled():
-                    if allowed is not None and "advise" not in allowed:
-                        # Keep allowlist small: only inject when not plan/ask-restricted
-                        # without advise already in mode set.
-                        from services.agent.copilot_mode_tools import (  # noqa: PLC0415
-                            normalize_mode,
-                        )
-                        _m = normalize_mode(getattr(self, "mode", None))
-                        if _m not in ("ask",) and "advise" not in (allowed or []):
-                            # Prefer not bloating ask; plan/edit/agent/swarm may use advise.
-                            if _m in ("plan", "edit", "agent", "swarm"):
-                                allowed = list(allowed or []) + ["advise"]
+                if allowed is not None:
+                    for _meta in ("enable_tools", "list_tool_categories"):
+                        if _meta not in allowed:
+                            allowed = list(allowed) + [_meta]
+                    from services.agent.config import advisor_enabled  # noqa: PLC0415
+                    adv_on = bool(getattr(self, "advisor", True))
+                    if adv_on and advisor_enabled() and "advise" not in allowed:
+                        allowed = list(allowed) + ["advise"]
             except Exception:  # noqa: BLE001
                 pass
             result = _at.run_turn(

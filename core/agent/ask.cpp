@@ -1,4 +1,4 @@
-// core/agent/ask.cpp — see ask.h. Mirrors agent/ask.py byte-for-byte.
+// core/agent/ask.cpp — see ask.h. C++-only (Python agent/ask.py mirror removed).
 #include "agent/ask.h"
 
 #include <vector>
@@ -13,8 +13,8 @@ const char* kAskSystem =
     "Be concise and concrete: quote the real feature names, ids and dimensions from the document "
     "context below your instructions (units are stated there; the default MMGS means millimeters, "
     "grams, seconds). You never modify the document in this mode — if the user asks for a change, "
-    "tell them briefly to switch to Edit mode (scoped changes on the open part) or Agent mode "
-    "(full design/build) so the change is applied as validated document ops. "
+    "briefly confirm what you would change and note that the assistant can apply it directly "
+    "(the harness will auto-switch to build it). "
     "If no document is open, answer as a general CAD / AI-CAD usage assistant.";
 
 namespace {

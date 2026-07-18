@@ -88,6 +88,7 @@ def render_tools_block(
     resolver: Callable[[str], Callable[..., Any] | None],
     budget_tokens: int | None = None,
     trim: bool = True,
+    include_category_menu: bool | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Render the §9.1 tools slot for *allowed_tools* and MEASURE its cost.
 
@@ -98,10 +99,15 @@ def render_tools_block(
             so the rendered schema is dispatch-faithful.
         budget_tokens: the tier's ``budgets.tools`` (default: local-24k's 2500).
         trim: the tier's ``tool_schema_trim`` dial.
+        include_category_menu: when True, append a compact category pack menu +
+            enable_tools / list_tool_categories meta schemas (anti-context-flood).
+            Default: auto when the allowlist looks restricted (contains the meta
+            tools or is a finite floor, not the full catalog).
 
     Returns:
         ``(text, meta)`` where meta = {tokens, budget_tokens, rendered, omitted,
-        unresolved, trimmed} — tokens is the MEASURED count of the returned text.
+        unresolved, trimmed, categories} — tokens is the MEASURED count of the
+        returned text.
     """
     budget = int(budget_tokens) if budget_tokens else DEFAULT_TOOLS_BUDGET_TOKENS
     lines: list[str] = ["[TOOLS] Call tools with EXACTLY these kwargs:"]
@@ -110,14 +116,35 @@ def render_tools_block(
     omitted: list[str] = []
     used = _count_tokens(lines[0])
 
-    for tool in allowed_tools or []:
+    allow_list = list(allowed_tools or [])
+    # Auto: show category menu for restricted floors that already carry meta tools
+    # (SHARED_DEFAULT_TOOLS) — never flood unrestricted / huge role cards.
+    if include_category_menu is None:
+        include_category_menu = (
+            "enable_tools" in allow_list or "list_tool_categories" in allow_list
+        )
+
+    for tool in allow_list:
         fn = None
         try:
             fn = resolver(tool)
         except Exception:  # noqa: BLE001 — a broken resolver entry is unresolved
             fn = None
         if fn is None:
-            entry = f"- {tool}(…)  # schema unavailable"
+            # Built-in meta-tool schemas when no live callable is registered yet.
+            if tool == "enable_tools":
+                entry = (
+                    "- enable_tools(categories: list[str])\n"
+                    "    Request more tool categories mid-turn "
+                    "(see [TOOL CATEGORIES] menu)."
+                )
+            elif tool == "list_tool_categories":
+                entry = (
+                    "- list_tool_categories()\n"
+                    "    List requestable tool category packs (name + one line)."
+                )
+            else:
+                entry = f"- {tool}(…)  # schema unavailable"
         else:
             schema = describe_callable(tool, fn)
             desc = _description_line(schema["description"], trim=trim)
@@ -130,10 +157,37 @@ def render_tools_block(
             continue
         lines.append(entry)
         used += cost
-        if fn is None:
+        if fn is None and tool not in ("enable_tools", "list_tool_categories"):
             unresolved.append(tool)
         else:
             rendered.append(tool)
+
+    categories_listed: list[str] = []
+    if include_category_menu:
+        try:
+            from services.agent.tool_categories import (  # noqa: PLC0415
+                category_catalog,
+            )
+            cat_lines = ["[TOOL CATEGORIES] Call enable_tools(categories=[...]) to unlock:"]
+            for name, desc in category_catalog():
+                cat_lines.append(f"- {name}: {desc}")
+                categories_listed.append(name)
+            cat_block = "\n".join(cat_lines)
+            cost = _count_tokens(cat_block)
+            if used + cost <= budget:
+                lines.append(cat_block)
+                used += cost
+            else:
+                # Budget tight: keep a one-line pointer only.
+                tail = (
+                    "[TOOL CATEGORIES] enable_tools(categories=[...]) — "
+                    f"{len(categories_listed)} packs (list_tool_categories for full menu)"
+                )
+                if used + _count_tokens(tail) <= budget:
+                    lines.append(tail)
+                    used += _count_tokens(tail)
+        except Exception:  # noqa: BLE001 — menu is best-effort
+            categories_listed = []
 
     if omitted:
         tail = f"(+{len(omitted)} allowed tools omitted for budget: {', '.join(omitted)})"
@@ -148,5 +202,6 @@ def render_tools_block(
         "omitted": omitted,
         "unresolved": unresolved,
         "trimmed": bool(trim),
+        "categories": categories_listed,
     }
     return text, meta

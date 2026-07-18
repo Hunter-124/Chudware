@@ -3142,7 +3142,15 @@ WASM_BOOT_LOG("[wasm-boot] entering main loop\n");
                     active->running = false;
                     active->liveStatus.clear();
                     active->errKind = assistantErr;
-                    if (!assistant.empty()) active->text = assistant;
+                    // Replace (never append) so a streamed waterfall isn't duplicated.
+                    // Prefer authoritative final text when present; keep streamed text if
+                    // the job produced no summary (non-v2 / empty assistant).
+                    if (!assistant.empty()) {
+                        // If stream already equals or contains the final prose, still
+                        // replace with the authoritative final so partial streams finalize cleanly.
+                        active->text = assistant;
+                    }
+                    // else: leave active->text as-is (streamed deltas or empty)
                 } else if (!assistant.empty()) {
                     ChatMsg m; m.text = assistant; m.errKind = assistantErr;
                     st.chat.push_back(m);

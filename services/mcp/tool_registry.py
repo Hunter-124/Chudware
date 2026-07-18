@@ -77,14 +77,30 @@ def catalog() -> dict[str, dict]:
 
 
 def clear_catalog() -> None:
-    """Reset the catalog (tests)."""
+    """Reset the catalog (tests), then re-record always-on meta-tools."""
     _CATALOG.clear()
+    ensure_meta_tools()
 
 
 def record(name: str, family: str, risk: str | None = None) -> dict:
     entry = {"family": family, "risk": risk or classify_risk(name)}
     _CATALOG[name] = entry
     return entry
+
+# Meta-tools for mid-turn category expansion. Always recorded + always allowed
+# (family=workspace, risk=read) so the risk guard never blocks them.
+_META_TOOLS = (
+    ("enable_tools", "workspace", RISK_READ),
+    ("list_tool_categories", "workspace", RISK_READ),
+)
+for _meta_name, _meta_fam, _meta_risk in _META_TOOLS:
+    record(_meta_name, _meta_fam, _meta_risk)
+
+
+def ensure_meta_tools() -> None:
+    """Idempotently re-record enable_tools / list_tool_categories (tests)."""
+    for name, fam, risk in _META_TOOLS:
+        record(name, fam, risk)
 
 
 # --------------------------------------------------------------------------- policy
@@ -151,6 +167,9 @@ def is_allowed(name: str) -> bool:
 
 def deny_reason(name: str) -> str | None:
     """None if allowed; else a human reason string for the refusal."""
+    # Meta-tools are always permitted (request more surface / list packs).
+    if name in ("enable_tools", "list_tool_categories"):
+        return None
     risk = (_CATALOG.get(name) or {}).get("risk") or classify_risk(name)
     deny_risk = _current_deny_risk()
     if deny_risk and risk in deny_risk:

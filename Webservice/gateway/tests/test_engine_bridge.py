@@ -203,17 +203,25 @@ class TestEngineBridge:
         # returning to 0, else it would defer restarts forever.
         assert engine_bridge.active_bridge_count() == 0
 
-    def test_agent_turn_forces_daemon_provider(self, daemon, client):
-        """Web agent turns must run on the shared daemon's config.json accounts, so the
-        gateway strips any client-pinned provider identity before forwarding to hostd."""
+    def test_agent_turn_keeps_provider_strips_secrets(self, daemon, client):
+        """Web agent turns may select provider/model; credentials stay server-side.
+
+        The gateway forwards provider + model so hostd can resolve host config keys
+        by name, but strips api_key / base_url / fallback secrets from the browser.
+        """
         with client.websocket_connect("/engine", headers=DEV_HEADERS) as ws:
             _rpc(ws, 1, "hello")
-            # Client pins its (empty-web-config default) provider + creds; daemon must not see them.
+            # Client pins provider/model selection + a browser-side secret; only
+            # the secret must be dropped before hostd sees the turn.
             _rpc(ws, 2, "agent_ask_v2", {"question": "hi", "provider": "gemini",
-                                         "model": "gemini-2.5-flash", "api_key": "sk-web"})
+                                         "model": "gemini-2.5-flash", "api_key": "sk-web",
+                                         "base_url": "https://evil.example",
+                                         "fallback_api_keys": ["sk-other"]})
         seen = next(c for c in daemon.calls if c.get("method") == "agent_ask_v2")
         p = seen["params"]
-        assert "provider" not in p and "model" not in p and "api_key" not in p, p
+        assert p.get("provider") == "gemini", p
+        assert p.get("model") == "gemini-2.5-flash", p
+        assert "api_key" not in p and "base_url" not in p and "fallback_api_keys" not in p, p
         assert p["question"] == "hi"  # non-provider params pass through untouched
         # A non-agent method keeps its params verbatim (no over-broad stripping).
         doc_calls = [c for c in daemon.calls if c.get("method") == "doc_new"]

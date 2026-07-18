@@ -1623,3 +1623,24 @@ bubble-streaming compile clean but want a human visual pass in the running app.
 (5) Pre-existing, NOT introduced here: `feature_surface_audit` red in check.py; the
 `test_sourcing_subagent`/`test_subagent_registry`/`test_roles` failures need a real
 `XAI_API_KEY` (config uses xai-sub OAuth) and fail environmentally.
+
+### AI part naming (memory stage repurposed) + name propagation + context meter
+Repurposed the C++ design run's final MEMORY stage into a lightweight PART-NAMING step
+(`core/agent/run.cpp`): one model call now returns a short name (`services/agent/prompts/memory.md`),
+applied in-engine via new `doc_set_name(doc_id,name)` (`core/doc/session.{h,cpp}` + `aicad_call`
+dispatch in `core/api/libaicad.cpp`); the stage emits a `part_named` event and threads `part_name`
+into the run result. It NO LONGER writes `cache/runs/<run_id>/memory.json` — that summary was never
+reloaded (`state.memory` starts empty), so it was pure per-build token waste. Host side
+(`host/src/app.cpp` run-finish drain, `jobs.cpp`, `feature_tree.{h,cpp}`, `app_state.h`): on finish it
+applies `part_name` via `syncActiveTabTitle()` (so viewport + Feature Manager + tab strip match) and
+auto-saves `<name>.step+` into the workspace (`featureTreeSaveDocToPath`). The context meter
+(`legacy_chat.cpp` ~10808) now reads `agent_call.context_tokens_est` (the C++ agent's `agent_output`
+events always have `tokens:null`, which is why 0/500k never moved); label "Saving notes" -> "Naming part".
+Verified e2e on a scratch daemon built from `build/linux-core`: `doc_set_name` renames the doc,
+`agent_run_v2` returns `part_name`, emits `part_named`, renames the doc, writes no memory.json.
+Deferred/gotchas: (1) the HOST/WASM half needs a web WASM rebuild+deploy to reach chudware.com — the
+native `./build.sh` auto-synced only the daemon (libaicad) to `~/billet-web/bin` via billet-webd-sync,
+so the core naming is live but the tab-title/auto-save/meter changes are not until WASM ships. (2) The
+`ai/memory.json` entry in `contracts/stepplus.md` is now aspirational-only for the C++ path (optional
+field, readers tolerate absence) — left in place per append-only. (3) `contracts/doc_ops.md` was NOT
+extended for `doc_set_name` (integrator-owned); add it there if it should be a first-class doc method.

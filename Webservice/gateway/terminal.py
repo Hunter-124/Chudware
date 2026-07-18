@@ -148,13 +148,27 @@ def _run_tmux(*args: str, timeout: float = 10.0) -> subprocess.CompletedProcess:
 
 
 def _ensure_scroll_defaults() -> None:
-    """Turn on the global tmux mouse option so the wheel / two-finger swipe drive
-    copy-mode scrolling. Global + idempotent, so attaching to a session that was
-    created before this existed (or a server born without our -f config) still
-    picks up the fix live, without needing to be killed and recreated."""
+    """Apply the mouse/scroll tmux options + wheel bindings globally so the wheel
+    and two-finger swipe drive copy-mode (reviewing the omp transcript) instead
+    of the app (never arrow keys). Global + idempotent, so attaching to a session
+    created before this existed — or a server born without our -f config — picks
+    up the fix live, without needing to be killed and recreated."""
     if not _TMUX or not _server_running():
         return
     _run_tmux("set-option", "-g", "mouse", "on")
+    _run_tmux("set-option", "-g", "window-size", "latest")
+    _run_tmux(
+        "bind-key", "-n", "WheelUpPane",
+        "if-shell", "-F", "#{pane_in_mode}",
+        "send -X -N3 scroll-up",
+        "copy-mode -e ; send -X -N3 scroll-up",
+    )
+    _run_tmux(
+        "bind-key", "-n", "WheelDownPane",
+        "if-shell", "-F", "#{pane_in_mode}",
+        "send -X -N3 scroll-down",
+        "",
+    )
 
 
 def _server_running() -> bool:

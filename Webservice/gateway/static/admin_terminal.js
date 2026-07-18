@@ -238,9 +238,80 @@
     persistLayoutSoon();
   }
 
-  // --------------------------------------------------------------- layout API
-  // wired by the persistence layer (Wave 2)
-  function persistLayoutSoon() {}
+  // --------------------------------------------------------- layout persistence
+  // The window layout is a single shared doc on the server, so every admin opens
+  // the same workspace and can see work-in-flight. Saves are debounced; a light
+  // idle poll reconciles other admins' changes without a manual refresh.
+  var LAYOUT_URL = "/api/admin/terminal/layout";
+  var _layoutMtime = null; // newest mtime we have applied or saved
+  var _saveTimer = null;
+  var _saveEcho = 0; // our own last write, so the poll can ignore the echo
+  var _applyingLayout = false;
+
+  function saveLayoutNow() {
+    _saveTimer = null;
+    if (!isDesktop()) return;
+    api(LAYOUT_URL, { method: "PUT", body: JSON.stringify({ layout: collectLayout() }) })
+      .then(function (r) {
+        if (r && typeof r.mtime === "number") {
+          _layoutMtime = r.mtime;
+          _saveEcho = r.mtime;
+        }
+      })
+      .catch(function () {});
+  }
+
+  function persistLayoutSoon() {
+    if (_applyingLayout || !isDesktop()) return;
+    clearTimeout(_saveTimer);
+    _saveTimer = setTimeout(saveLayoutNow, 700);
+  }
+
+  function applyServerLayout(doc) {
+    if (!doc || !doc.layout) return;
+    _applyingLayout = true;
+    try {
+      applyLayout(doc.layout);
+    } catch (_) {}
+    // Let the open/move settle before debounced saves resume.
+    setTimeout(function () {
+      _applyingLayout = false;
+    }, 60);
+  }
+
+  function restoreLayout() {
+    return api(LAYOUT_URL)
+      .then(function (doc) {
+        if (doc && typeof doc.mtime === "number") _layoutMtime = doc.mtime;
+        var wins = (doc && doc.layout && doc.layout.windows) || [];
+        if (!wins.length || !isDesktop()) return false;
+        applyServerLayout(doc);
+        for (var i = 0; i < tabs.length; i++) {
+          if (tabs[i].wb) return true;
+        }
+        return false;
+      })
+      .catch(function () {
+        return false;
+      });
+  }
+
+  function pollLayout() {
+    if (!isDesktop() || _applyingLayout) return;
+    if (document.body.classList.contains("wb-lock")) return; // mid drag/resize
+    api(LAYOUT_URL)
+      .then(function (doc) {
+        if (!doc || typeof doc.mtime !== "number") return;
+        if (_layoutMtime != null && doc.mtime <= _layoutMtime) return;
+        if (doc.mtime === _saveEcho) {
+          _layoutMtime = doc.mtime;
+          return;
+        }
+        _layoutMtime = doc.mtime;
+        applyServerLayout(doc);
+      })
+      .catch(function () {});
+  }
 
   function wmRootRect() {
     if (!wmRoot) {
@@ -326,6 +397,8 @@
 
   function clampToRoot(wb) {
     if (!wb || wb.max || wb.min || wb.full) return;
+    // maximize() adds .max before flipping wb.max; don't fight that transition.
+    if (wb.g && wb.g.classList && wb.g.classList.contains("max")) return;
     applyWbBounds(wb);
     var r = wmRootRect();
     var rw = r.width;
@@ -615,6 +688,7 @@
     var tab = findTab(id);
     if (!tab) return;
     tab._closed = true;
+    unobserveWindowSize(tab);
     var idx = tabs.indexOf(tab);
 
     // Tear down WinBox first (suppress recursive onclose → closeTab).
@@ -956,6 +1030,7 @@
 
   function mountMobile(tab) {
     if (!tab || !tab.el) return;
+    unobserveWindowSize(tab);
     // Detach from any WinBox without disposing the session.
     if (tab.wb) {
       var wb = tab.wb;
@@ -978,6 +1053,32 @@
     tab.el.style.height = "";
     tab.el.style.position = "";
     tab.el.style.inset = "";
+  }
+
+  // Refit deterministically whenever a window's body actually changes size
+  // (open, mount, maximize/restore after layout settles, edge-resize, snap) —
+  // rAF alone races WinBox's style/layout, leaving the xterm grid stale.
+  function observeWindowSize(tab) {
+    if (typeof ResizeObserver === "undefined" || !tab || tab._ro || !tab.el) return;
+    var timer = null;
+    tab._ro = new ResizeObserver(function () {
+      clearTimeout(timer);
+      timer = setTimeout(function () {
+        if (!tab._closed && tab.wb) fit(tab);
+      }, 60);
+    });
+    try {
+      tab._ro.observe(tab.el);
+    } catch (_) {}
+  }
+
+  function unobserveWindowSize(tab) {
+    if (tab && tab._ro) {
+      try {
+        tab._ro.disconnect();
+      } catch (_) {}
+      tab._ro = null;
+    }
   }
 
   function mountWindow(tab, rect) {
@@ -1096,6 +1197,7 @@
     });
 
     tab.wb = wb;
+    observeWindowSize(tab);
 
     // Fill the WinBox body.
     try {
@@ -1346,13 +1448,29 @@
     for (var i = 0; i < layout.windows.length; i++) {
       var w = layout.windows[i];
       if (!w || !w.session || !live[w.session]) continue;
-      openWindowForSession(w.session, {
-        x: w.x,
-        y: w.y,
-        width: w.width,
-        height: w.height,
-        max: !!w.max,
-      });
+      var ex = findTabByName(w.session);
+      if (ex && ex.wb) {
+        // Reposition the existing window in place — never spawn a 2nd WinBox.
+        try {
+          if (w.max) {
+            if (!ex.wb.max) ex.wb.maximize();
+          } else {
+            if (ex.wb.max) ex.wb.restore();
+            var vp = toViewport({ x: w.x, y: w.y, width: w.width, height: w.height });
+            ex.wb.resize(vp.width, vp.height).move(vp.x, vp.y);
+            clampToRoot(ex.wb);
+          }
+          fit(ex);
+        } catch (_) {}
+      } else {
+        openWindowForSession(w.session, {
+          x: w.x,
+          y: w.y,
+          width: w.width,
+          height: w.height,
+          max: !!w.max,
+        });
+      }
     }
   }
 
@@ -1505,6 +1623,7 @@
 
   // Poll the shared-session list so client counts / new sessions stay current.
   setInterval(refreshSessions, 5000);
+  setInterval(pollLayout, 5000);
 
   // Public WM integration surface (also local fns above).
   var __wm = {
@@ -1516,15 +1635,19 @@
   };
   window.__wm = __wm;
 
-  // On load: join the most-recently-active session if any, else start one.
+  // On load: restore the shared window layout; if none applies, join the
+  // most-recently-active session, else start a fresh one.
   refreshSessions().then(function (list) {
-    if (list && list.length) {
-      var latest = list.slice().sort(function (a, b) {
-        return (b.activity || 0) - (a.activity || 0);
-      })[0];
-      openWindowForSession(latest.name, null);
-    } else {
-      newSession();
-    }
+    return restoreLayout().then(function (restored) {
+      if (restored) return;
+      if (list && list.length) {
+        var latest = list.slice().sort(function (a, b) {
+          return (b.activity || 0) - (a.activity || 0);
+        })[0];
+        openWindowForSession(latest.name, null);
+      } else {
+        newSession();
+      }
+    });
   });
 })();

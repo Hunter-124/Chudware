@@ -9,6 +9,7 @@ inside the shell scripts; the Python side also gates on deploy-status.json.
 from __future__ import annotations
 
 import json
+import fcntl
 import logging
 import os
 import shutil
@@ -71,8 +72,44 @@ def _scripts_dir() -> Path:
     return _repo_dir() / "Webservice" / "deploy"
 
 
+_STALE_GRACE_S = 20  # gap between our pre-write and the script taking the flock
+
+
 def _default_status() -> dict[str, Any]:
     return {"running": False, "kind": None, "started_at": None, "last": None}
+
+
+def _lock_is_free() -> bool:
+    """True if no live deploy holds the flock. flock() is released automatically
+    when the holding process dies, so a free lock is a reliable liveness probe."""
+    try:
+        fd = os.open(str(_lock_path()), os.O_CREAT | os.O_RDWR, 0o644)
+    except OSError:
+        return False  # can't tell — assume something may hold it
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def _clear_stale(prev: dict[str, Any]) -> dict[str, Any]:
+    """A run marked running=true whose flock is free (process died without its
+    EXIT trap) would 409 the Deploy card forever — self-heal to idle."""
+    healed = _default_status()
+    healed["last"] = prev.get("last")
+    path = _status_path()
+    try:
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(healed) + "\n")
+        tmp.replace(path)
+    except OSError:
+        pass
+    log.info("cleared stale deploy status (lock free, no live run)")
+    return healed
 
 
 def _read_status() -> dict[str, Any]:
@@ -91,6 +128,9 @@ def _read_status() -> dict[str, Any]:
     out["started_at"] = started if isinstance(started, (int, float)) else None
     last = raw.get("last")
     out["last"] = last if isinstance(last, dict) else None
+    if out["running"] and (time.time() - (out["started_at"] or 0)) > _STALE_GRACE_S \
+            and _lock_is_free():
+        return _clear_stale(out)
     return out
 
 
@@ -122,9 +162,12 @@ def _write_status_starting(kind: str) -> None:
 def _launch_detached(argv: list[str], *, delay: float = 0, logfile: Path | None = None) -> None:
     """Fire-and-forget: return immediately; child runs outside this process tree.
 
-    Prefer ``systemd-run --user --scope`` (optionally ``--on-active=Ns``) so the
-    job survives the gateway cgroup. Fall back to setsid/nohup + Popen with
-    ``start_new_session=True`` when systemd-run is missing or fails.
+    Prefer a transient ``systemd-run --user`` *service* (NOT ``--scope``): a
+    service returns immediately and supports ``--on-active`` timers, whereas
+    ``--scope`` blocks until the wrapped command exits and rejects timers (a long
+    build would then hit the subprocess timeout and get orphaned/double-launched).
+    Fall back to setsid/nohup + Popen(start_new_session=True) when systemd-run is
+    missing or fails (no user bus).
     """
     if not argv:
         raise ValueError("empty argv")
@@ -133,7 +176,24 @@ def _launch_detached(argv: list[str], *, delay: float = 0, logfile: Path | None 
 
     sd = shutil.which("systemd-run")
     if sd:
-        cmd = [sd, "--user", "--scope", "--quiet", "--collect"]
+        # Force BILLET_WEB_DATA to the SAME root Python reads (settings.data_root)
+        # so the scripts write status/log/lock exactly where the API reads them.
+        # They otherwise key off different env names (BILLET_WEB_DATA in the
+        # scripts vs BILLET_WEB_DATA_ROOT in config.py) that coincide only by
+        # default path in prod — relocating the data root would silently split them.
+        setenv = {}
+        for key in ("HOME", "PATH"):
+            val = os.environ.get(key)
+            if val:
+                setenv[key] = val
+        for key, val in os.environ.items():
+            if key.startswith("BILLET_") and val:
+                setenv[key] = val
+        setenv["BILLET_WEB_DATA"] = str(settings.data_root)
+        cmd = [sd, "--user", "--collect", "--quiet",
+               f"--working-directory={_repo_dir()}"]
+        for key, val in setenv.items():
+            cmd.append(f"--setenv={key}={val}")
         if delay_s > 0:
             cmd.append(f"--on-active={delay_s}s")
         cmd.append("--")
@@ -145,10 +205,9 @@ def _launch_detached(argv: list[str], *, delay: float = 0, logfile: Path | None 
                 text=True,
                 timeout=15,
                 check=False,
-                cwd=str(_repo_dir()),
             )
             if cp.returncode == 0:
-                log.info("deploy launched via systemd-run: %s", " ".join(argv))
+                log.info("deploy launched via systemd-run service: %s", " ".join(argv))
                 return
             log.warning(
                 "systemd-run failed (rc=%s): %s — falling back to setsid/nohup",
@@ -182,6 +241,7 @@ def _launch_detached(argv: list[str], *, delay: float = 0, logfile: Path | None 
     else:
         final = inner
 
+    child_env = {**os.environ, "BILLET_WEB_DATA": str(settings.data_root)}
     try:
         subprocess.Popen(  # noqa: S603
             final,
@@ -189,6 +249,7 @@ def _launch_detached(argv: list[str], *, delay: float = 0, logfile: Path | None 
             stdout=log_fh,
             stderr=subprocess.STDOUT,
             cwd=str(_repo_dir()),
+            env=child_env,
             start_new_session=True,
             close_fds=True,
         )

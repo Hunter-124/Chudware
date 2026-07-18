@@ -4,6 +4,12 @@
  * Mobile  (<=720px): original tabbed #term-host stack.
  */
 
+/* No open/resize/maximize animation: instant is better terminal UX and avoids
+ * the xterm grid refitting against a mid-transition body size. */
+.winbox {
+  transition: none !important;
+}
+
 /* ---- mode visibility (toggled via <html class="wm-desktop|wm-mobile">) ---- */
 html.wm-desktop #term-tabs,
 html.wm-desktop #term-host {

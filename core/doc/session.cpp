@@ -6684,6 +6684,22 @@ json doc_get_meta(const std::string& doc_id, const std::string& key) {
     return json{{"ok", true}, {"key", key}, {"value", v}};
 }
 
+json doc_set_name(const std::string& doc_id, const std::string& name) {
+    DocLock lk;
+    Session& s = require_session(doc_id);
+    // Trim whitespace; empty after trim leaves the existing name untouched.
+    std::size_t a = name.find_first_not_of(" \t\r\n\f\v");
+    if (a != std::string::npos) {
+        std::size_t b = name.find_last_not_of(" \t\r\n\f\v");
+        std::string trimmed = name.substr(a, b - a + 1);
+        if (!trimmed.empty()) {
+            s.doc["name"] = trimmed;
+            s.dirty = true;
+        }
+    }
+    return json{{"ok", true}, {"name", s.doc.value("name", std::string())}};
+}
+
 json doc_face_points(const std::string& doc_id, const json& selector, int max_n) {
     DocLock lk;
     Session& s = require_session(doc_id);

@@ -2970,6 +2970,11 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                                 params.value("doc_id", std::string()),
                                 params.value("key", std::string())),
                             out_json, 0);
+            if (m == "doc_set_name") {
+                std::string did = jstr(params, "doc_id");
+                std::string nm = jstr(params, "name");
+                return emit(aicad::doc::doc_set_name(did, nm), out_json, 0);
+            }
             // --- C18 interactive sketch mode (engine/doc/session.py sketch_*) ---
             // The worker passes the sketch feature id under "sketch".
             if (m == "sketch_enter")

@@ -345,6 +345,10 @@ struct JobState {
     // CAM: the run built a machining job (its own cam doc id) from the current part. The drain
     // loads it into the Manufacture workspace panel; the active part doc was NOT mutated.
     std::string camDocId;             // non-empty => load this CAM job into the panel on success
+    // Part-naming stage (ex-memory): AI-chosen display name for the built part. Set from the
+    // streamed part_named event and/or the agent_run result's part_name field. The GL drain uses
+    // it to refresh the tab title and auto-save <name>.step+ into the workspace.
+    std::string partName;
     // Mission orchestrator: a multi-capability run (design -> CFD -> verdict). isMission marks the
     // job so the drain uses missionVerdict (the report stage's prose) as the final chat bubble
     // instead of the generic design summary; createdDocPath still carries any assembly tab to open.

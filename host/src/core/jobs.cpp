@@ -85,6 +85,7 @@ void launchAgentRunV2(WorkerClient& w, JobState& job,
         job.createdDocPath.clear();
         job.drawingDocId.clear(); job.drawingName.clear(); job.drawingSourceId.clear();
         job.camDocId.clear();
+        job.partName.clear();
     }
     { std::lock_guard<std::mutex> lk(job.evMtx); job.events.clear(); }
 
@@ -228,6 +229,11 @@ void launchAgentRunV2(WorkerClient& w, JobState& job,
                 // doc id). The drain loads it into the Manufacture workspace; the part was untouched.
                 if (result.value("created_cam", false) && result.value("status", "") == "done")
                     job.camDocId = result.value("cam_doc_id", std::string());
+                // Part-naming stage: AI-chosen display name for the built part.
+                {
+                    std::string pn = result.value("part_name", std::string());
+                    if (!pn.empty()) job.partName = std::move(pn);
+                }
             }
         }
         job.ready = true;
@@ -254,6 +260,7 @@ void launchAgentDesign(WorkerClient& w, JobState& job,
         job.createdDocPath.clear();
         job.drawingDocId.clear(); job.drawingName.clear(); job.drawingSourceId.clear();
         job.camDocId.clear();
+        job.partName.clear();
         job.isMission = false; job.missionVerdict.clear();
     }
     { std::lock_guard<std::mutex> lk(job.evMtx); job.events.clear(); }
@@ -435,6 +442,7 @@ void launchMissionRun(WorkerClient& w, JobState& job,
         job.converged = true; job.stopReason.clear(); job.errorDetail.clear();
         job.createdDocPath.clear();
         job.isMission = true; job.missionVerdict.clear();
+        job.partName.clear();
     }
     { std::lock_guard<std::mutex> lk(job.evMtx); job.events.clear(); }
 

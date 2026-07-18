@@ -10,7 +10,9 @@
 // parse the reply (ops_emit / _extract_json_obj), validate via doc_dry_run_ops,
 // and commit via doc_apply_ops. The MODEL stage carries the dry-run retry + the
 // build123d script ESCAPE HATCH (after _ESCAPE_AFTER failures); REVIEW->FIX is a
-// bounded re-review loop; MEMORY persists to cache/runs/<run_id>/memory.json.
+// bounded re-review loop; the final MEMORY stage is repurposed as a lightweight
+// PART-NAMING step (sets the doc name via doc_set_name + emits part_named; it no
+// longer writes cache/runs/<run_id>/memory.json).
 //
 // REVIEW vision-rendering (_render_review in Python) is DISPLAY/host tooling
 // (engine.render + pyvista + build123d export) and is DEFERRED to the host

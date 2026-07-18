@@ -2,6 +2,7 @@
 #include "agent/run.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -162,14 +163,74 @@ std::string default_step(const DesignState& state) {
     return "Build the requested object: " + obj;
 }
 
-// ----------------------------------------------------------------- memory persistence
+// ----------------------------------------------------------------- part naming
 
-// _store_memory: write to run_dir(run_id)/memory.json (the session-attr/extra-entry
-// embed is a save-time host concern — we store to disk + keep on the in-memory state).
-void store_memory(const std::string& run_id, const ojson& mem) {
-    std::filesystem::path p = run_dir(run_id) / "memory.json";
-    std::ofstream fh(p, std::ios::binary | std::ios::trunc);
-    if (fh) fh << mem.dump(2);
+// Sanitize a model-chosen part name into a short filename-safe display title.
+// Illegal path chars stripped; whitespace collapsed; capped at 48 chars.
+std::string sanitize_part_name(std::string name) {
+    // Trim ends.
+    auto not_ws = [](unsigned char c) { return !std::isspace(c); };
+    name.erase(name.begin(), std::find_if(name.begin(), name.end(), not_ws));
+    name.erase(std::find_if(name.rbegin(), name.rend(), not_ws).base(), name.end());
+    // Strip illegal filename characters: / \ : * ? " < > |
+    std::string cleaned;
+    cleaned.reserve(name.size());
+    for (unsigned char c : name) {
+        if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' ||
+            c == '>' || c == '|')
+            continue;
+        cleaned.push_back(static_cast<char>(c));
+    }
+    // Collapse whitespace runs to a single space.
+    std::string out;
+    out.reserve(cleaned.size());
+    bool prev_ws = false;
+    for (unsigned char c : cleaned) {
+        if (std::isspace(c)) {
+            if (!prev_ws && !out.empty()) out.push_back(' ');
+            prev_ws = true;
+        } else {
+            out.push_back(static_cast<char>(c));
+            prev_ws = false;
+        }
+    }
+    // Trailing space from collapse (shouldn't, but belt+suspenders).
+    while (!out.empty() && out.back() == ' ') out.pop_back();
+    if (out.size() > 48) {
+        out.resize(48);
+        while (!out.empty() && out.back() == ' ') out.pop_back();
+    }
+    return out;
+}
+
+// Deterministic fallback name from the user request: first ~4 words, title-cased.
+std::string fallback_part_name(const std::string& request) {
+    std::string acc;
+    acc.reserve(48);
+    int words = 0;
+    bool in_word = false;
+    bool word_start = true;
+    for (unsigned char c : request) {
+        if (std::isalnum(c) || c == '-' || c == '_') {
+            if (!in_word) {
+                if (words >= 4) break;
+                if (!acc.empty()) acc.push_back(' ');
+                ++words;
+                in_word = true;
+                word_start = true;
+            }
+            if (word_start) {
+                acc.push_back(static_cast<char>(std::toupper(c)));
+                word_start = false;
+            } else {
+                acc.push_back(static_cast<char>(std::tolower(c)));
+            }
+        } else {
+            in_word = false;
+        }
+    }
+    if (acc.empty()) acc = "Part";
+    return sanitize_part_name(acc);
 }
 
 // ----------------------------------------------------------------- provider call
@@ -1098,26 +1159,32 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         return o;
     };
 
-    // ---- MEMORY ----
+    // ---- MEMORY (repurposed: lightweight PART NAMING) ----
+    // Captured name is threaded into the run result as part_name and emitted as
+    // a part_named event so the host can refresh the tab title + auto-save.
+    std::string captured_part_name;
     actions.memory = [&](DesignState& st, int) -> StageOutcome {
         AgentCall ac = agent_call(provider, st, "memory", prompts_dir, call_budget, vision, ctx_cap);
         StageOutcome o;
         fill_meta(o, ac);
         o.raw = ac.reply;
-        ojson mem = extract_json_obj(ac.reply);
-        if (mem.is_null()) {
-            o.verdict = "pass";
-            o.reason = "memory: nothing recorded";
-            o.parsed_ok = false;
-            o.has_parse_error = true;
-            o.parse_error = "no memory json";
-            return o;
+        ojson parsed = extract_json_obj(ac.reply);
+        std::string name;
+        if (parsed.is_object() && parsed.contains("name") && parsed["name"].is_string())
+            name = parsed["name"].get<std::string>();
+        name = sanitize_part_name(name);
+        if (name.empty()) name = fallback_part_name(st.request);
+        // Apply in-engine so doc_tree / Feature Manager see the new display name.
+        try {
+            doc::doc_set_name(st.doc_id, name);
+        } catch (...) {
+            // Naming must never fail the run — keep going with the chosen label.
         }
-        store_memory(run_id, mem);
-        st.memory = mem;
+        events.emit("part_named", json{{"name", name}, {"doc_id", st.doc_id}});
+        captured_part_name = name;
         o.verdict = "pass";
-        o.reason = "memory recorded";
-        o.parsed_ok = true;
+        o.reason = "named: " + name;
+        o.parsed_ok = !name.empty();
         return o;
     };
 
@@ -1317,7 +1384,8 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
                     {"status", result["status"]},
                     {"stop_reason", result["stop_reason"]},
                     {"revision", revision},
-                    {"doc_id", state.doc_id}};
+                    {"doc_id", state.doc_id},
+                    {"part_name", captured_part_name}};
     if (!copilot_mode.empty()) out["mode"] = copilot_mode;
     if (result.contains("error_detail") && result["error_detail"].is_string() &&
         !result["error_detail"].get<std::string>().empty())

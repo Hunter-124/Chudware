@@ -269,6 +269,11 @@ nlohmann::json doc_set_meta(const std::string& doc_id, const std::string& key,
                             const nlohmann::json& value);
 nlohmann::json doc_get_meta(const std::string& doc_id, const std::string& key);
 
+// doc_set_name: set the document display name (doc["name"]) under the doc lock so
+// doc_tree / Feature Manager / viewport title see it. Does NOT bump revision or
+// touch geometry. Empty/whitespace name is a no-op. Returns {ok:true, name:<applied>}.
+nlohmann::json doc_set_name(const std::string& doc_id, const std::string& name);
+
 // Weldment cut list — group every weld_member structural member into a SolidWorks
 // "Weldment Cut List" (port of engine/doc/cutlist.py::cut_list_for_session). Forces a
 // FRESH compile so the weld_member compiler repopulates the CompileResult.weld_members

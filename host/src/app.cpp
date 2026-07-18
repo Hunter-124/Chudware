@@ -2845,13 +2845,30 @@ WASM_BOOT_LOG("[wasm-boot] entering main loop\n");
                             // Fold the event into the running turn's inline activity timeline so
                             // the conversation transparently shows what the AI is doing/thinking.
                             if (active) feedTurnActivity(*active, orchKind, data);
-                            // Context meter: reset at run start; track the latest call's input-token
-                            // estimate (how full the model's context is right now).
+                            // Context meter: reset at run start; track the peak context estimate
+                            // across calls. C++ agent_output always has tokens:null, so prefer
+                            // agent_call.context_tokens_est (the real per-call size).
                             if (orchKind == "run_started") st.lastContextTokens = 0;
-                            else if (orchKind == "agent_output" && data.contains("tokens") &&
-                                     data["tokens"].is_object()) {
+                            else if (orchKind == "agent_call") {
+                                int est = 0;
+                                if (data.contains("context_tokens_est") &&
+                                    data["context_tokens_est"].is_number_integer())
+                                    est = data["context_tokens_est"].get<int>();
+                                if (est <= 0) est = data.value("context_tokens_est", 0);
+                                if (est > 0)
+                                    st.lastContextTokens = std::max(st.lastContextTokens, est);
+                            } else if (orchKind == "agent_output" && data.contains("tokens") &&
+                                       data["tokens"].is_object()) {
                                 int in = data["tokens"].value("in", 0);
                                 if (in > 0) st.lastContextTokens = in;
+                            } else if (orchKind == "part_named") {
+                                // Naming stage: stash the AI-chosen part name for the run-finish
+                                // path (title refresh + auto-save). Result part_name is a backup.
+                                std::string pn = data.value("name", std::string());
+                                if (!pn.empty()) {
+                                    std::lock_guard<std::mutex> lk(st.job.mtx);
+                                    st.job.partName = std::move(pn);
+                                }
                             }
                         } catch (...) {}
                         // Also update the compact status line in the chat
@@ -2979,6 +2996,10 @@ WASM_BOOT_LOG("[wasm-boot] entering main loop\n");
                                 // fast call) pulls the new tree + revision + owner map and fires
                                 // the listener so the tree repaints with what the agent built.
                                 st.docMirror.resync(st.worker);
+                                // Naming stage: tree now carries the AI name — refresh tab title
+                                // so viewport + Feature Manager match (path basename wins once
+                                // the auto-save below lands).
+                                st.syncActiveTabTitle();
                                 // C40: doc_activate is an ops-response — the mesh path lives at
                                 // tess.aicm_path (the old top-level read was always empty, so
                                 // the viewport NEVER refreshed after a v2 agent run).
@@ -2997,6 +3018,45 @@ WASM_BOOT_LOG("[wasm-boot] entering main loop\n");
                                          "Agent run finished but the model couldn't refresh");
                             }
                         }, 60000);
+                }
+                // Part naming: refresh title + auto-save <name>.step+ into the workspace.
+                // Engine already renamed the doc (doc_set_name); we mirror that into the tab
+                // and persist so displayTitle() / Feature Manager / viewport all agree.
+                if (!openedNewDoc && !madeDrawing && !madeCam && st.docMirror.hasDoc() &&
+                    st.job.error.empty() && !st.job.partName.empty()) {
+                    const std::string partName = st.job.partName;
+                    // Optimistic title so the strip updates even before async resync lands.
+                    if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
+                        st.docTabs[st.activeTab].docId == st.docMirror.docId()) {
+                        st.docTabs[st.activeTab].title = partName;
+                    }
+                    st.syncActiveTabTitle();
+                    // Sanitize to a filesystem-safe stem (match drawing export style).
+                    std::string stem;
+                    stem.reserve(partName.size());
+                    for (unsigned char c : partName) {
+                        if (c == ' ') stem.push_back('_');
+                        else if (std::isalnum(c) || c == '_' || c == '-')
+                            stem.push_back((char)c);
+                    }
+                    if (stem.empty()) stem = "Part";
+                    ui::ensureWorkspaceDir(st);
+                    std::string dir = st.workspaceDir;
+                    if (dir.empty()) dir = defaultWorkspaceDir();
+                    namespace fs = std::filesystem;
+                    std::error_code ec;
+                    fs::create_directories(dir, ec);  // idempotent
+                    fs::path candidate = fs::path(dir) / (stem + ".step+");
+                    if (fs::exists(candidate, ec)) {
+                        for (int n = 2; n < 10000; ++n) {
+                            fs::path alt =
+                                fs::path(dir) / (stem + "_" + std::to_string(n) + ".step+");
+                            if (!fs::exists(alt, ec)) { candidate = alt; break; }
+                        }
+                    }
+                    const std::string savePath = candidate.string();
+                    st.addLog("[v2] auto-saving named part -> " + savePath);
+                    ui::featureTreeSaveDocToPath(st, savePath);
                 }
             }
             // --- end C22b ---

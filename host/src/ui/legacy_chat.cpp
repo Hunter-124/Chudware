@@ -1451,7 +1451,7 @@ static std::string friendlyStageTitle(const std::string& stage) {
     if (stage == "edit")    return "Editing the model";
     if (stage == "review")  return "Reviewing the result";
     if (stage == "fix")     return "Fixing issues";
-    if (stage == "memory")  return "Saving notes";
+    if (stage == "memory")  return "Naming part";
     std::string t = stage;            // Title-case fallback for any unknown stage
     if (!t.empty()) t[0] = (char)std::toupper((unsigned char)t[0]);
     return t.empty() ? std::string("\xe2\x80\xa6") : t;  // ellipsis — never a fake "Working"

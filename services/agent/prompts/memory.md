@@ -1,15 +1,4 @@
-You are the MEMORY scribe. Summarize what this design turn accomplished into durable notes that a
-future session (working on the same document) can reuse. Keep it factual and compact — no prose,
-no salesmanship.
+You are naming the finished part. Pick a short, descriptive display name for what was just built.
 
-Record: the object built, the key dimensions that were committed, any design decisions worth
-remembering (a chosen wall thickness, a fit clearance, a deviation from the plan and why), and any
-known issues left unresolved.
-
-Reply with EXACTLY one ```json block, no prose outside it:
-{
-  "summary": "one sentence: what was built this turn",
-  "decisions": ["each durable decision or committed dimension, one per entry"],
-  "open_issues": ["each unresolved problem, '' list if none"]
-}
-Keep it to at most 8 decisions and 4 open_issues.
+Reply with EXACTLY one ```json block and nothing else:
+{"name": "<2-5 word descriptive part name, no dimensions, no file extension>"}

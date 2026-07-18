@@ -6017,4 +6017,43 @@ std::string featureTreeSaveDoc(AppState& st, bool saveAs) {
 // "Save As" vs. "Save" correctly and lets the Explorer highlight the open file.
 std::string featureTreeActivePath() { return s_docPath; }
 
+void featureTreeSaveDocToPath(AppState& st, const std::string& path) {
+    if (path.empty() || !st.docMirror.hasDoc() || !st.workerStarted) return;
+    const std::string docId = st.docMirror.docId();
+    if (docId.empty()) return;
+    const std::string pathCopy = path;
+    st.toast(ui::ToastLevel::Info, "Saving " + pathBaseName(pathCopy) + "\xe2\x80\xa6");
+    ++st.rebuildsInFlight;
+    st.rpc.call("doc_save",
+                nlohmann::json{{"doc_id", docId}, {"path", pathCopy}},
+                [&st, pathCopy, docId](const core::RpcResult& r) {
+                    --st.rebuildsInFlight;
+                    if (st.docMirror.docId() != docId) {
+                        st.addLog("[doc] auto-save for " + docId +
+                                  " ignored — active doc changed");
+                        return;
+                    }
+                    if (!r.ok) {
+                        st.addLog("[err] auto-save: " + r.err);
+                        st.toast(ui::ToastLevel::Error, "Save failed: " + r.err);
+                        return;
+                    }
+                    if (r.result.is_object() && r.result.contains("code")) {
+                        std::string msg = jfld(r.result, "message");
+                        st.addLog("[err] auto-save: " + msg);
+                        st.toast(ui::ToastLevel::Error, "Save failed: " + msg);
+                        return;
+                    }
+                    s_docPath = pathCopy;
+                    st.clearActiveTabDirty();
+                    if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size())
+                        st.docTabs[st.activeTab].path = pathCopy;
+                    st.clearDrawingDirtyForSource(docId);
+                    st.pushRecentFile(pathCopy);
+                    ui::plmAutoRecordSave(st, pathCopy);
+                    st.addLog("[doc] auto-saved: " + pathCopy);
+                    st.toast(ui::ToastLevel::Info, "Saved " + pathBaseName(pathCopy));
+                }, 120000);
+}
+
 }  // namespace ui

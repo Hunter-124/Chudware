@@ -442,6 +442,15 @@ void launchMissionRun(WorkerClient& w, JobState& job,
         nlohmann::json result;
         std::string err;
 
+        // Refresh stale subscription tokens BEFORE agent_mission_v1 (C++ reads tokens
+        // read-only; Python is the single writer). Same pre-run hook as agent_run_v2 /
+        // design — without it a mission/swarm/eng-firm run 403s on an expired OAuth token.
+        if (!ensureSubscriptionFreshBeforeRun(w, job, extra)) {
+            job.ready = true;
+            job.running = false;
+            return;
+        }
+
         WorkerClient::EventFn onEvent = [&job](const nlohmann::json& d) {
             AgentEvent e;
             std::string origKind = jstr(d, "kind");

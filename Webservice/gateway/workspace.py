@@ -1,9 +1,10 @@
 """Shared-workspace file API + aicm mesh fetch for the web-native client.
 
 /workspace/* is rooted at settings.workspace_root (the team CAD_Build dir) and
-serves the browser file dialog: list/upload/download/mkdir/rename/delete. The
-daemon reads and writes the SAME paths directly (doc_open/doc_save take
-server-side paths) — bytes only cross the wire for import/export.
+serves the browser file dialog: list/upload/download/mkdir/rename/delete/copy +
+durable recents. The daemon reads and writes the SAME paths directly
+(doc_open/doc_save take server-side paths) — bytes only cross the wire for
+import/export.
 
 /files/aicm serves tessellation payloads the daemon publishes for its clients:
 either plain files (tmp aicad_cpp_docs / state dir / workspace) or POSIX shm
@@ -12,6 +13,7 @@ allowlist is the security boundary, the client clamp is only UX.
 """
 
 from __future__ import annotations
+import json
 
 import logging
 import re
@@ -35,6 +37,10 @@ router = APIRouter()
 # POSIX shm objects published by aicm_handoff (shm_object_name: "aicad_" + sanitized key).
 _SHM_NAME_RE = re.compile(r"^aicad_[A-Za-z0-9_.\-]{1,200}$")
 _SHM_URI_PREFIX = "aicm-shm://"
+
+# Durable recent-files list for the WASM client (config.json lives in /tmp there).
+_RECENTS_NAME = ".billet_recents.json"
+_RECENTS_MAX = 10
 
 
 def _ws_root() -> Path:
@@ -143,6 +149,83 @@ async def workspace_delete(request: Request, body: dict[str, Any]) -> dict[str, 
     else:
         target.unlink()
     return {"ok": True}
+
+
+@router.post("/workspace/copy")
+async def workspace_copy(request: Request, body: dict[str, Any]) -> dict[str, Any]:
+    """Copy a file or (when recursive) a directory tree within the workspace."""
+    src = _resolve(str(body.get("src", "")))
+    dst = _resolve(str(body.get("dst", "")), must_exist=False)
+    recursive = bool(body.get("recursive", True))
+    if src == _ws_root():
+        raise HTTPException(status_code=400, detail="refusing to copy root")
+    if dst == _ws_root() or dst == src:
+        raise HTTPException(status_code=400, detail="bad destination")
+    if src.is_dir():
+        if not recursive:
+            raise HTTPException(status_code=400, detail="directory copy requires recursive=true")
+        if dst.exists():
+            raise HTTPException(status_code=409, detail="destination exists")
+        # Ensure parent of dst exists; copytree creates dst itself.
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(src, dst)
+    else:
+        if not src.is_file():
+            raise HTTPException(status_code=400, detail="not a file")
+        if dst.exists() and dst.is_dir():
+            dst = dst / src.name
+            if _ws_root() not in dst.resolve().parents and dst.resolve() != _ws_root():
+                raise HTTPException(status_code=400, detail="path escapes workspace")
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+    root = _ws_root()
+    log.info("workspace copy: %s -> %s", src, dst)
+    return {"ok": True, "path": str(dst.relative_to(root)), "abs_path": str(dst)}
+
+
+@router.get("/workspace/recents")
+async def workspace_recents_get(request: Request) -> dict[str, Any]:
+    """Load durable recent-files list (workspace-root .billet_recents.json)."""
+    path = _ws_root() / _RECENTS_NAME
+    if not path.is_file():
+        return {"files": []}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        log.warning("recents read failed: %s", e)
+        return {"files": []}
+    files: list[str] = []
+    raw = data.get("files", []) if isinstance(data, dict) else []
+    if isinstance(raw, list):
+        for e in raw:
+            if isinstance(e, str) and e.strip():
+                files.append(e.strip())
+            if len(files) >= _RECENTS_MAX:
+                break
+    return {"files": files}
+
+
+@router.put("/workspace/recents")
+async def workspace_recents_put(request: Request, body: dict[str, Any]) -> dict[str, Any]:
+    """Persist durable recent-files list under the workspace root."""
+    raw = body.get("files", []) if isinstance(body, dict) else []
+    files: list[str] = []
+    if isinstance(raw, list):
+        seen: set[str] = set()
+        for e in raw:
+            if not isinstance(e, str):
+                continue
+            p = e.strip()
+            if not p or p in seen:
+                continue
+            seen.add(p)
+            files.append(p)
+            if len(files) >= _RECENTS_MAX:
+                break
+    path = _ws_root() / _RECENTS_NAME
+    path.write_text(json.dumps({"files": files}, indent=2), encoding="utf-8")
+    log.info("workspace recents: wrote %d entries", len(files))
+    return {"ok": True, "files": files}
 
 
 def _aicm_allowlist() -> list[Path]:

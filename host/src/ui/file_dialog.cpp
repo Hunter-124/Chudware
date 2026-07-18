@@ -2,8 +2,8 @@
 // Windows: the common dialogs (GetSaveFileNameW / GetOpenFileNameW).
 // Other (Linux/macOS): shell out to kdialog (KDE) or zenity (GTK), parsing the same
 // NUL-separated Win32 filter into the chosen tool's syntax.
-// Emscripten: browser <input type=file> + gateway /workspace/upload for open;
-//             filename prompt under the server workspace for save; afterFileWritten
+// Emscripten: workspace tree browser via /workspace/list (Open/Save/Folder) with an
+//             optional browser <input type=file> upload path for Open; afterFileWritten
 //             triggers a browser download of the server path.
 
 #ifdef __EMSCRIPTEN__
@@ -81,8 +81,12 @@ std::string s_lastDir;
 
 std::string saveFileDialog(const char* /*filter*/, const char* defExt, const char* suggestedName) {
     std::string suggest = (suggestedName && *suggestedName) ? suggestedName : "untitled";
+    // Prefer basename only for the name box.
+    {
+        size_t cut = suggest.find_last_of("/\\");
+        if (cut != std::string::npos) suggest = suggest.substr(cut + 1);
+    }
     if (defExt && *defExt) {
-        // ensure suggest has the extension so the prompt shows it
         size_t slash = suggest.find_last_of('/');
         size_t dot = suggest.find_last_of('.');
         bool hasExt = dot != std::string::npos && (slash == std::string::npos || dot > slash);
@@ -91,58 +95,71 @@ std::string saveFileDialog(const char* /*filter*/, const char* defExt, const cha
             suggest += defExt;
         }
     }
-    std::string name = billet::promptSaveFilename(suggest.c_str());
-    if (name.empty()) return {};
-    // Strip any client-side directories from the typed name.
-    size_t cut = name.find_last_of("/\\");
-    if (cut != std::string::npos) name = name.substr(cut + 1);
-    if (name.empty() || name[0] == '.') return {};
-    name = ensureExt(name, defExt);
 
-    auto& fsb = billet::fsBackend();
-    std::string root = s_lastDir.empty() ? fsb.defaultRoot() : s_lastDir;
-    if (root.empty() || root == "/") {
-        // Prefer abs root once known.
-        root = fsb.defaultRoot();
-    }
-    std::string path = pathJoinWs(root, name);
-    s_lastDir = root;
+    // Folder browser + filename (server abs path under workspace).
+    std::string path = billet::browseWorkspace(billet::WorkspaceBrowseMode::SaveAs,
+                                               /*accept=*/nullptr, suggest.c_str());
+    if (path.empty()) return {};
+    path = ensureExt(path, defExt);
+    // Remember parent for next dialog.
+    size_t cut = path.find_last_of('/');
+    if (cut != std::string::npos && cut > 0) s_lastDir = path.substr(0, cut);
     return path;
 }
 
 std::string openFileDialog(const char* filter) {
+    std::string accept = filterToAccept(filter);
+
+    // Workspace tree browser first (pick existing server file OR choose upload).
+    std::string chosen = billet::browseWorkspace(billet::WorkspaceBrowseMode::OpenFile,
+                                                 accept.c_str(), /*suggestedName=*/nullptr);
+    if (chosen.empty()) return {};  // cancel
+
+    if (chosen != "__UPLOAD__") {
+        // Existing workspace file — return server abs path for doc_open.
+        size_t cut = chosen.find_last_of('/');
+        if (cut != std::string::npos && cut > 0) s_lastDir = chosen.substr(0, cut);
+        return chosen;
+    }
+
+    // Fall through: browser local upload into the workspace.
     billet::PickedFile picked;
     std::string err;
-    std::string accept = filterToAccept(filter);
     if (!billet::pickFile(accept.c_str(), picked, err) || picked.name.empty()) {
         return {};  // cancel or error
     }
-    // Upload into the workspace root (or last dir).
     auto& fsb = billet::fsBackend();
     std::string root = s_lastDir.empty() ? fsb.defaultRoot() : s_lastDir;
     // Gateway wants a relative dir under the workspace; "" = root.
+    // Upload into last-browsed folder when known, else workspace root.
     std::string dirRel;
     if (!root.empty() && root != "/") {
-        // If root is the abs workspace root, upload dir is "".
-        // If user had a subfolder, strip abs root — best-effort: use "".
-        dirRel = "";
+        // Best-effort: if root is a subfolder of the workspace abs root, strip it.
+        std::string absRoot = fsb.defaultRoot();
+        if (!absRoot.empty() && root.size() > absRoot.size() &&
+            root.compare(0, absRoot.size(), absRoot) == 0 &&
+            (root[absRoot.size()] == '/' || root[absRoot.size()] == '\\')) {
+            dirRel = root.substr(absRoot.size() + 1);
+        } else if (root != absRoot) {
+            // Already relative-looking.
+            if (!root.empty() && root[0] != '/') dirRel = root;
+        }
     }
     std::string upErr;
     std::string abs = billet::fsUpload(dirRel, picked.name, picked.data.data(),
                                        picked.data.size(), upErr);
     if (abs.empty()) return {};
-    // Remember parent for next dialog.
     size_t cut = abs.find_last_of('/');
     if (cut != std::string::npos && cut > 0) s_lastDir = abs.substr(0, cut);
     return abs;
 }
 
 std::string openFolderDialog() {
-    // No folder picker in the browser; return the workspace root.
-    auto& fsb = billet::fsBackend();
-    std::string root = fsb.defaultRoot();
-    s_lastDir = root;
-    return root;
+    std::string chosen = billet::browseWorkspace(billet::WorkspaceBrowseMode::OpenFolder,
+                                                 /*accept=*/nullptr, /*suggestedName=*/nullptr);
+    if (chosen.empty()) return {};
+    s_lastDir = chosen;
+    return chosen;
 }
 
 int promptImportMeshAsSolid() {

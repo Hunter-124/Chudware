@@ -320,6 +320,7 @@ if(EMSCRIPTEN)
     "SHELL:-sSTACK_OVERFLOW_CHECK=1"
     "SHELL:-sEXPORTED_RUNTIME_METHODS=['ccall','cwrap']"
     "SHELL:--shell-file=${CMAKE_CURRENT_SOURCE_DIR}/wasm/shell.html"
+    "SHELL:--js-library=${CMAKE_CURRENT_SOURCE_DIR}/wasm/billet_web_dialogs.js"
     "SHELL:--preload-file=${_WASM_ASSETS}/fonts@/assets/fonts"
     "SHELL:--preload-file=${_WASM_ASSETS}/icons/atlas.json@/assets/icons/atlas.json"
     "SHELL:--preload-file=${_WASM_ASSETS}/icons/atlas_dark.png@/assets/icons/atlas_dark.png"
@@ -339,6 +340,8 @@ if(EMSCRIPTEN)
   # (stale <title>/boot text ship). Declare it so ninja relinks on shell changes.
   set_property(TARGET Billet APPEND PROPERTY LINK_DEPENDS
     ${CMAKE_CURRENT_SOURCE_DIR}/wasm/shell.html)
+  set_property(TARGET Billet APPEND PROPERTY LINK_DEPENDS
+    ${CMAKE_CURRENT_SOURCE_DIR}/wasm/billet_web_dialogs.js)
 else()
   target_include_directories(Billet PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src

@@ -22,6 +22,9 @@
 #include <thread>
 
 #include "app_state.h"
+#ifdef __EMSCRIPTEN__
+#include "fs_backend.h"
+#endif
 
 #include "../bootstrap.h"
 #include "cpp_core.h"  // in-process C++ core (libaicad) — the backend when no Python runtime
@@ -124,7 +127,15 @@ void loadSettings(Settings& s) {
     // before the file check so a fresh install (no config.json yet) still has a working key.
     if (!s.geminiKey[0]) copyStr(s.geminiKey, sizeof(s.geminiKey), kSeededGeminiKey);
     std::ifstream f(configPath());
-    if (!f) return;
+    if (!f) {
+#ifdef __EMSCRIPTEN__
+        // Web: no /tmp config yet — still hydrate recents from the workspace.
+        std::string rerr;
+        auto durable = billet::fsBackend().loadRecents(rerr);
+        if (!durable.empty()) s.recentFiles = std::move(durable);
+#endif
+        return;
+    }
     try {
         nlohmann::json j;
         f >> j;
@@ -266,6 +277,14 @@ void loadSettings(Settings& s) {
         if (auto it = j.find("recent_files"); it != j.end() && it->is_array())
             for (const auto& e : *it)
                 if (e.is_string()) s.recentFiles.push_back(e.get<std::string>());
+#ifdef __EMSCRIPTEN__
+        // Web: config.json is /tmp-ephemeral. Prefer durable workspace recents.
+        {
+            std::string rerr;
+            auto durable = billet::fsBackend().loadRecents(rerr);
+            if (!durable.empty()) s.recentFiles = std::move(durable);
+        }
+#endif
         // Chat-picker model visibility (opt-out hidden set).
         s.hiddenModels.clear();
         if (auto it = j.find("hidden_models"); it != j.end() && it->is_array())
@@ -443,6 +462,13 @@ void saveSettings(const Settings& s) {
     // Wave 3: File Explorer workspace + Recent files.
     if (!s.workspaceDir.empty()) j["workspace_dir"] = s.workspaceDir;
     j["recent_files"] = s.recentFiles;
+#ifdef __EMSCRIPTEN__
+    // Web: also write durable recents under the workspace (survives /tmp config).
+    {
+        std::string rerr;
+        billet::fsBackend().saveRecents(s.recentFiles, rerr);
+    }
+#endif
     if (!s.hiddenModels.empty())
         j["hidden_models"] = std::vector<std::string>(s.hiddenModels.begin(), s.hiddenModels.end());
     if (!s.disabledProviders.empty())

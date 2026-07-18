@@ -427,15 +427,27 @@ public:
 
     bool copy(const std::string& src, const std::string& dst, bool recursive,
               std::string& err) override {
-        (void)recursive;
-        // Single-file only on web: download bytes then re-upload under the dest name.
         ensureRoot(err);
+        nlohmann::json out;
+        // Prefer a single server-side copy (handles dirs recursively).
+        if (postJson("/workspace/copy",
+                     nlohmann::json{{"src", toRel(src)},
+                                    {"dst", toRel(dst)},
+                                    {"recursive", recursive}},
+                     out, err)) {
+            return true;
+        }
+        // Fallback for older gateways: single-file download+upload only.
+        if (recursive) {
+            // Directory copy without /workspace/copy is not supported by this fallback.
+            return false;
+        }
+        std::string fallbackErr;
         const std::string srcRel = toRel(src);
         const std::string url = std::string("/workspace/download?path=") + urlEncode(srcRel);
-        std::string fetchErr;
-        auto bytes = webFetch(url, fetchErr);
-        if (bytes.empty() && !fetchErr.empty()) {
-            err = fetchErr;
+        auto bytes = webFetch(url, fallbackErr);
+        if (bytes.empty() && !fallbackErr.empty()) {
+            err = fallbackErr;
             return false;
         }
         const std::string destName = pathFilename(dst);
@@ -444,6 +456,58 @@ public:
         std::string abs = fsUpload(destParent, destName, bytes.data(), bytes.size(), upErr);
         if (abs.empty()) {
             err = upErr.empty() ? "upload failed" : upErr;
+            return false;
+        }
+        err.clear();
+        return true;
+    }
+
+    std::vector<std::string> loadRecents(std::string& err) override {
+        err.clear();
+        auto bytes = webFetch("/workspace/recents", err);
+        if (bytes.empty() && !err.empty()) return {};
+        err.clear();
+        try {
+            auto j = nlohmann::json::parse(bytes.begin(), bytes.end());
+            std::vector<std::string> out;
+            if (j.contains("files") && j["files"].is_array()) {
+                for (const auto& e : j["files"]) {
+                    if (e.is_string()) out.push_back(e.get<std::string>());
+                }
+            }
+            return out;
+        } catch (const std::exception& e) {
+            err = std::string("recents JSON: ") + e.what();
+            return {};
+        }
+    }
+
+    bool saveRecents(const std::vector<std::string>& files, std::string& err) override {
+        // PUT JSON body — emscripten_fetch supports PUT.
+        err.clear();
+        nlohmann::json body = {{"files", files}};
+        const std::string payload = body.dump();
+        emscripten_fetch_attr_t attr;
+        emscripten_fetch_attr_init(&attr);
+        std::strcpy(attr.requestMethod, "PUT");
+        attr.attributes = EMSCRIPTEN_FETCH_LOAD_TO_MEMORY | EMSCRIPTEN_FETCH_SYNCHRONOUS;
+        const char* headers[] = {"Content-Type", "application/json", nullptr};
+        attr.requestHeaders = headers;
+        attr.requestData = payload.data();
+        attr.requestDataSize = payload.size();
+        emscripten_fetch_t* fetch = emscripten_fetch(&attr, "/workspace/recents");
+        if (!fetch) {
+            err = "emscripten_fetch PUT /workspace/recents failed";
+            return false;
+        }
+        const int status = fetch->status;
+        std::string text;
+        if (fetch->data && fetch->numBytes > 0)
+            text.assign(fetch->data, fetch->data + fetch->numBytes);
+        emscripten_fetch_close(fetch);
+        if (status < 200 || status >= 300) {
+            err = "HTTP " + std::to_string(status) + " for /workspace/recents";
+            if (!text.empty()) err += ": " + text.substr(0, 200);
             return false;
         }
         return true;

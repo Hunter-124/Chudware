@@ -1,4 +1,4 @@
-// Browser file picker — see web_file_pick.h.
+// Browser file picker + workspace browser — see web_file_pick.h.
 #include "web_file_pick.h"
 
 #include <cstdlib>
@@ -25,6 +25,14 @@ struct PickState {
 };
 
 static PickState g_pick;
+
+// Workspace-browser result (path only — no file bytes).
+struct BrowseState {
+    volatile int done = 0;  // 0=pending, 1=ok, -1=cancel
+    char         path[2048] = {0};
+};
+
+static BrowseState g_browse;
 
 // Called from JS on the main thread once the user picks or cancels.
 extern "C" EMSCRIPTEN_KEEPALIVE void billet_file_pick_done(
@@ -59,6 +67,22 @@ extern "C" EMSCRIPTEN_KEEPALIVE void billet_file_pick_done(
         g_pick.done = -1;
     }
 }
+
+// Called from JS when the workspace browser finishes (ok=1 + path, or cancel).
+extern "C" EMSCRIPTEN_KEEPALIVE void billet_ws_browse_done(int ok, const char* path) {
+    if (ok && path && path[0]) {
+        std::strncpy(g_browse.path, path, sizeof(g_browse.path) - 1);
+        g_browse.path[sizeof(g_browse.path) - 1] = '\0';
+        g_browse.done = 1;
+    } else {
+        g_browse.path[0] = '\0';
+        g_browse.done = -1;
+    }
+}
+
+// JS-library entry (host/wasm/billet_web_dialogs.js) — runs on main thread via __proxy:sync.
+extern "C" void billet_ws_browse(int mode, const char* accept, const char* suggested);
+
 
 bool pickFile(const char* accept, PickedFile& out, std::string& err) {
     err.clear();
@@ -177,6 +201,24 @@ std::string promptSaveFilename(const char* suggested) {
     return std::string(buf);
 }
 
+std::string browseWorkspace(WorkspaceBrowseMode mode,
+                            const char* accept,
+                            const char* suggestedName) {
+    g_browse.done = 0;
+    g_browse.path[0] = '\0';
+    const int modeInt = static_cast<int>(mode);
+    const char* acc = (accept && *accept) ? accept : "";
+    const char* sug = (suggestedName && *suggestedName) ? suggestedName : "";
+
+    billet_ws_browse(modeInt, acc, sug);
+
+    while (g_browse.done == 0) {
+        emscripten_thread_sleep(20);
+    }
+    if (g_browse.done < 0 || !g_browse.path[0]) return {};
+    return std::string(g_browse.path);
+}
+
 #else  // !__EMSCRIPTEN__
 
 bool pickFile(const char* /*accept*/, PickedFile& out, std::string& err) {
@@ -186,6 +228,12 @@ bool pickFile(const char* /*accept*/, PickedFile& out, std::string& err) {
 }
 
 std::string promptSaveFilename(const char* /*suggested*/) {
+    return {};
+}
+
+std::string browseWorkspace(WorkspaceBrowseMode /*mode*/,
+                            const char* /*accept*/,
+                            const char* /*suggestedName*/) {
     return {};
 }
 

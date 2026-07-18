@@ -60,9 +60,21 @@ public:
     // ---- convenience (implemented in terms of the above where possible) ----
 
     // Copy file or (when recursive) directory tree. Desktop uses std::filesystem;
-    // web copies a single file via download+upload (dirs: err).
+    // web posts /workspace/copy (recursive server-side).
     virtual bool copy(const std::string& src, const std::string& dst, bool recursive,
                       std::string& err) = 0;
+
+    // Web-only: load/save durable recents from workspace .billet_recents.json.
+    // Desktop no-ops (returns empty / true) — desktop uses config.json.
+    virtual std::vector<std::string> loadRecents(std::string& err) {
+        (void)err;
+        return {};
+    }
+    virtual bool saveRecents(const std::vector<std::string>& files, std::string& err) {
+        (void)files;
+        (void)err;
+        return true;
+    }
 
     bool exists(const std::string& path) {
         std::string e;

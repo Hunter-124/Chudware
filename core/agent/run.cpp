@@ -2776,13 +2776,16 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
     }
 
     // ---- Eng. Firm: firm_bids + firm_team telemetry (roster once) ----
+    // Mission-level award is FIRM SELECTION only (telemetry + default lead).
+    // It does NOT reserve/debit budget. spent_usd accumulates only when a task
+    // is actually awarded and executed; per-task remaining = budget - spent.
     std::vector<TeamMember> firm_team_members;
     std::string awarded_firm_id, awarded_firm_name;
-    double awarded_usd = 0.0;
+    double awarded_usd = 0.0;  // selection telemetry; NEVER added to spent_usd
     double budget_usd = options.value("budget_usd", 0.0);
     const double usd_per_1k = options.value("usd_per_1k", 3.0);
     json firm_ledger = json::array();  // in-memory per-run ledger
-    double spent_usd = 0.0;
+    double spent_usd = 0.0;            // actual task spend only; starts at 0
 
     if (eng_firm_mode) {
         // Default budget from firm_bid estimate when host did not set one.
@@ -2800,7 +2803,7 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
                                  {"tokens", b.tokens},
                                  {"usd", b.usd},
                                  {"within_budget", b.within_budget}});
-            // Cheapest in-scope within budget wins (bids already sorted cheapest-first).
+            // Cheapest in-scope within TOTAL budget wins selection (not spend).
             if (awarded_firm_id.empty() && b.in_scope && b.within_budget) {
                 awarded_firm_id = b.firm_id;
                 awarded_firm_name = b.firm_name;
@@ -2955,29 +2958,48 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
         set_task_plan_status(i, "running", "");
 
         // Eng-firm per-task bid/award + team seeds + ledger.
+        // remaining = TOTAL budget minus ACTUAL prior task spend (not mission selection).
         std::string firm_role_seed;
         double task_bid_usd = 0.0;
         if (eng_firm_mode) {
             ComplexityVerdict tcx = classify_complexity(tk.req);
             DomainVerdict tdom = classify_domain(tk.req);
             const double remaining = budget_usd - spent_usd;
+            // Ceiling for collect_bids is remaining actual budget (spent starts 0).
             std::vector<Bid> tbids =
                 collect_bids(tk.req, tcx.level, tdom.domain, usd_per_1k, remaining);
-            // Pick cheapest in-scope bid within remaining budget ONLY — never award over ceiling.
             std::string win_id, win_name;
             double win_usd = 0.0;
             bool awarded = false;
-            for (const auto& b : tbids) {
-                if (b.in_scope && b.within_budget) {
-                    win_id = b.firm_id;
-                    win_name = b.firm_name;
-                    win_usd = b.usd;
-                    awarded = true;
+            // Prefer the mission-selected firm when their bid fits remaining —
+            // even if task-domain reclassification dropped them out of scope.
+            // Mission selection already cleared the TOTAL budget gate.
+            if (!awarded_firm_id.empty()) {
+                for (const auto& b : tbids) {
+                    if (b.firm_id != awarded_firm_id) continue;
+                    if (b.usd <= remaining + 1e-9) {
+                        win_id = b.firm_id;
+                        win_name = b.firm_name.empty() ? awarded_firm_name : b.firm_name;
+                        win_usd = b.usd;
+                        awarded = true;
+                    }
                     break;
                 }
             }
+            // Else: cheapest in-scope bid within remaining budget.
             if (!awarded) {
-                // No affordable firm for this task → abandon remaining work.
+                for (const auto& b : tbids) {
+                    if (b.in_scope && b.within_budget) {
+                        win_id = b.firm_id;
+                        win_name = b.firm_name;
+                        win_usd = b.usd;
+                        awarded = true;
+                        break;
+                    }
+                }
+            }
+            if (!awarded) {
+                // No affordable firm for this task against remaining actual budget.
                 budget_exceeded = true;
                 task_status[i] = "abandoned";
                 set_task_plan_status(i, "abandoned", "budget_exceeded");
@@ -2995,11 +3017,8 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
                                             {"summary", "budget_exceeded"}});
                 return;
             }
-            // Prefer the mission-level winner's name when it still matches, else the per-task winner.
-            if (win_name.empty() && !win_id.empty()) {
-                // Defensive: roster always sets firm_name; recover from mission award if needed.
-                if (win_id == awarded_firm_id) win_name = awarded_firm_name;
-            }
+            if (win_name.empty()) win_name = awarded_firm_name;
+            if (win_name.empty() && win_id == awarded_firm_id) win_name = awarded_firm_name;
             task_bid_usd = win_usd;
             events.emit("firm_award", json{{"kind", "firm_award"},
                                            {"firm", win_name},
@@ -3220,7 +3239,14 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
             }
         }
 
-        if (status == "done") any_ok = true;
+        if (status == "done") {
+            any_ok = true;
+        } else if (status != "abandoned" && status != "pending" && status != "skipped") {
+            // Real unit failure (failed / model_failed / provider_error / …).
+            if (first_fail_reason.empty()) {
+                first_fail_reason = !summary.empty() ? summary : status;
+            }
+        }
         task_status[i] = status;
         events.emit("mission_task_result", json{{"index", static_cast<int>(i)},
                                                  {"capability", tk.capability},
@@ -3278,43 +3304,75 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
         verdict = build_verdict(provider, prompts_dir, budget, ctx_cap, request, design_summary,
                                 sim_results);
 
+    // Tally task outcomes for partial vs done vs failed.
+    int tasks_completed = 0;
+    int tasks_failed = 0;
+    int tasks_abandoned = 0;
+    for (const auto& tr : task_results) {
+        if (!tr.is_object()) continue;
+        const std::string st = tr.value("status", std::string());
+        if (st == "done")
+            ++tasks_completed;
+        else if (st == "abandoned")
+            ++tasks_abandoned;
+        else if (st != "pending" && st != "skipped")
+            ++tasks_failed;
+    }
+    const bool any_failed = tasks_failed > 0;
+
     std::string stop_reason;
     std::string status;
-    if (budget_exceeded) {
+    // Resolve failure reason once (used by partial + full-fail paths).
+    auto resolve_fail_reason = [&]() -> std::string {
+        if (!first_fail_reason.empty()) return first_fail_reason;
+        for (auto it = task_results.rbegin(); it != task_results.rend(); ++it) {
+            if (!it->is_object()) continue;
+            const std::string s = it->value("summary", std::string());
+            const std::string st = it->value("status", std::string());
+            if (st != "done" && st != "pending" && st != "skipped" && !s.empty()) return s;
+        }
+        return "mission_failed";
+    };
+
+    if (budget_exceeded && !any_built && !any_ok) {
+        // Pure budget abort with no usable work.
         status = "failed";
         stop_reason = "budget_exceeded";
-    } else if (any_built) {
+    } else if (budget_exceeded && (any_built || any_ok)) {
+        // Some units finished before the budget wall — preserve work as partial.
+        status = "partial";
+        stop_reason = "budget_exceeded";
+    } else if (any_failed && (any_built || any_ok || tasks_completed > 0)) {
+        // Mixed outcomes: keep completed geometry, surface the first unit failure.
+        // e.g. u1 design done + u2 assembly model_failed → partial / model_failed
+        // (NOT done/built — that masked the failed primary goal).
+        status = "partial";
+        stop_reason = resolve_fail_reason();
+    } else if (any_built && !any_failed) {
         status = "done";
         stop_reason = created_doc ? "assembled" : "built";
-    } else if (any_ok) {
+    } else if (any_ok && !any_failed) {
         status = "done";
         stop_reason = "done";
     } else {
-        // Failed mission: surface the real unit cause, never opaque "planned".
+        // Total failure: surface the real unit cause, never opaque "planned".
         status = "failed";
-        if (!first_fail_reason.empty())
-            stop_reason = first_fail_reason;
-        else if (!task_results.empty()) {
-            // Fall back to last non-empty task summary.
-            for (auto it = task_results.rbegin(); it != task_results.rend(); ++it) {
-                if (!it->is_object()) continue;
-                const std::string s = it->value("summary", std::string());
-                const std::string st = it->value("status", std::string());
-                if (st != "done" && !s.empty()) {
-                    stop_reason = s;
-                    break;
-                }
-            }
-        }
-        if (stop_reason.empty()) stop_reason = "mission_failed";
+        stop_reason = resolve_fail_reason();
     }
-    events.emit("mission_finished", json{{"status", status},
-                                          {"stop_reason", stop_reason},
-                                          {"doc_id", final_doc},
-                                          {"verdict", verdict},
-                                          {"execution_style", execution_style},
-                                          {"spent_usd", spent_usd},
-                                          {"budget_usd", budget_usd}});
+
+    json fin = json{{"status", status},
+                    {"stop_reason", stop_reason},
+                    {"doc_id", final_doc},
+                    {"verdict", verdict},
+                    {"execution_style", execution_style},
+                    {"spent_usd", spent_usd},
+                    {"budget_usd", budget_usd},
+                    {"tasks_completed", tasks_completed},
+                    {"tasks_failed", tasks_failed},
+                    {"tasks_abandoned", tasks_abandoned}};
+    if (status == "partial" && !first_fail_reason.empty())
+        fin["first_fail_reason"] = first_fail_reason;
+    events.emit("mission_finished", fin);
 
     json result = json{{"run_id", run_id},
                        {"status", status},
@@ -3323,7 +3381,12 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
                        {"revision", revision},
                        {"verdict", verdict},
                        {"tasks", task_results},
-                       {"execution_style", execution_style}};
+                       {"execution_style", execution_style},
+                       {"tasks_completed", tasks_completed},
+                       {"tasks_failed", tasks_failed},
+                       {"tasks_abandoned", tasks_abandoned}};
+    if (status == "partial" && !first_fail_reason.empty())
+        result["first_fail_reason"] = first_fail_reason;
     if (created_doc) {
         result["created_doc"] = true;
         result["assembly"] = true;

@@ -362,6 +362,12 @@ struct JobState {
     // instead of the generic design summary; createdDocPath still carries any assembly tab to open.
     bool isMission = false;
     std::string missionVerdict;       // the report/verdict prose to show as the assistant reply
+    // status=="partial": some tasks built, at least one failed. NOT an error — geometry is kept.
+    // Drain shows a warning-accent "Partially complete" card; doc stays open.
+    bool missionPartial = false;
+    int missionTasksCompleted = 0;
+    int missionTasksFailed = 0;
+    int missionTasksTotal = 0;        // completed+failed+abandoned when known; else 0
     // Plan gate: ONLY when the user must decide — stop_reason awaiting_plan_approval
     // (manual Plan mode) or needs_user_decision (advisor escalate). Agent-decided plans
     // are advisor-approved in-core and do NOT set this (run continues normally).
@@ -470,7 +476,7 @@ struct AgentStep {
     bool showThinking = false, showCode = false, showDiff = false, showError = false;
 };
 
-enum ErrKind { ERR_NONE = 0, ERR_CAD = 1, ERR_SYSTEM = 2 };
+enum ErrKind { ERR_NONE = 0, ERR_CAD = 1, ERR_SYSTEM = 2, ERR_PARTIAL = 3 };
 
 // ---------------- pre-flight clarify gate ----------------
 // Before a Design run, agent_clarify_v1 returns the build-critical questions (or ready=true).
@@ -567,6 +573,8 @@ struct ChatMsg {
     std::string planExecutionStyle;
     // Optional escalate/advisor reason shown on the approve card (needs_user_decision).
     std::string planApproveReason;
+    // Mission status=="partial": warning-accent result card (not error). Geometry kept.
+    bool resultPartial = false;
     // Per-message copilot mode stamp (CopilotMode 0..5). -1 = unstamped / no mode border.
     // Set at submitTurn from st.aiInteraction; auto-switch (Ask→Agent) updates the assistant.
     int copilotMode = -1;

@@ -1389,6 +1389,22 @@ if(AICAD_WITH_OCCT)
   # Same OCCT DLL PATH prepend so the test can load TKernel et al.
   set_tests_properties(polygon PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
+  # --- Rectangle convenience entity (center+width/height and two-corner forms) ---
+  # Drives sketch_add_entity with {type:"rectangle",...} through doc_apply_ops, asserting
+  # it expands to 4 closed CCW lines, extrudes to the right area, and rejects malformed
+  # input with a clear OpError. Mirrors test_polygon.
+  add_executable(test_rectangle
+    tests/test_rectangle.cpp)
+  target_include_directories(test_rectangle PRIVATE
+    ${doctest_SOURCE_DIR}
+    ${OpenCASCADE_INCLUDE_DIR})
+  target_link_libraries(test_rectangle PRIVATE
+    aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
+  set_target_properties(test_rectangle PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME rectangle COMMAND test_rectangle)
+  set_tests_properties(rectangle PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+
   # --- GD&T + custom-section drawing coverage (annot_draw + section modes) ------
   # Builds a real holed block, makes a drawing, adds every GD&T element + a half
   # section, and asserts the shared annotation compiler emits primitives, the section

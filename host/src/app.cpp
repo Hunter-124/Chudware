@@ -3350,6 +3350,41 @@ WASM_BOOT_LOG("[wasm-boot] entering main loop\n");
                 st.statusKind = 0;
                 if (!st.job.missionVerdict.empty())
                     assistant = st.job.missionVerdict;
+            } else if (wasV2 && st.job.isMission && st.job.missionPartial &&
+                       st.job.error.empty()) {
+                // status=="partial": some tasks built, at least one failed. Geometry is real —
+                // keep the doc, show warning-accent card (NOT error, NOT full done).
+                st.status = "Partially complete";
+                st.statusKind = 1;  // warning
+                int n = st.job.missionTasksCompleted;
+                int m = st.job.missionTasksTotal > 0
+                            ? st.job.missionTasksTotal
+                            : (n + st.job.missionTasksFailed);
+                std::string reason = !st.job.errorDetail.empty()
+                                         ? st.job.errorDetail
+                                         : st.job.stopReason;
+                if (reason.empty()) reason = "unknown";
+                char head[320];
+                if (m > 0)
+                    std::snprintf(head, sizeof(head),
+                                  "Partially complete — %d/%d tasks built (first failure: %s)",
+                                  n, m, reason.c_str());
+                else
+                    std::snprintf(head, sizeof(head),
+                                  "Partially complete (first failure: %s)", reason.c_str());
+                // Prefer composed head as the card body; append mission verdict if it adds more.
+                assistant = head;
+                if (!st.job.missionVerdict.empty() &&
+                    st.job.missionVerdict.find("Partially complete") == std::string::npos) {
+                    assistant += "\n\n";
+                    assistant += st.job.missionVerdict;
+                } else if (!st.job.missionVerdict.empty() &&
+                           st.job.missionVerdict != assistant) {
+                    // missionVerdict already has the head-shaped text — use it.
+                    assistant = st.job.missionVerdict;
+                }
+                assistantErr = ERR_PARTIAL;
+                st.addLog(std::string("[mission] partial: ") + head);
             } else if (wasV2 && st.job.isMission && !st.job.missionVerdict.empty() &&
                        st.job.error.empty()) {
                 // Mission run: the report/verdict prose IS the assistant's reply (it already
@@ -3401,6 +3436,7 @@ WASM_BOOT_LOG("[wasm-boot] entering main loop\n");
                     active->running = false;
                     active->liveStatus.clear();
                     active->errKind = assistantErr;
+                    active->resultPartial = st.job.missionPartial && (assistantErr == ERR_PARTIAL);
                     // User-facing plan gate only (manual Plan / needs_user_decision).
                     if (st.job.planReady && assistantErr == ERR_NONE) {
                         active->planApprovePending = true;
@@ -3473,6 +3509,7 @@ WASM_BOOT_LOG("[wasm-boot] entering main loop\n");
                     // else: leave active->text as-is (streamed deltas or empty)
                 } else if (!assistant.empty() && !st.job.planReady) {
                     ChatMsg m; m.text = assistant; m.errKind = assistantErr;
+                    m.resultPartial = (assistantErr == ERR_PARTIAL);
                     st.chat.push_back(m);
                 }
             }

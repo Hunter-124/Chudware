@@ -53,7 +53,10 @@ using SimFn = std::function<json(const std::string& doc_id, const std::string& r
 // options       {run_id?, prompts_dir?, budgets?} — forwarded to sub-runs.
 //
 // Returns {run_id, status, stop_reason, doc_id, revision, created_doc?, asm_path?,
-// components?, verdict, tasks:[{capability,title,status,doc_id,summary}]}.
+// components?, verdict, tasks:[{capability,title,status,doc_id,summary}],
+// tasks_completed?, tasks_failed?, tasks_abandoned?, first_fail_reason?}.
+// status: "done" (all ok) | "partial" (some tasks done + some failed; geometry kept;
+// stop_reason = first unit failure) | "failed" | "plan_ready".
 json run_mission(const std::string& request, const std::string& doc_id, const json& provider_cfg,
                  EmitFn emit = nullptr, SimFn sim = nullptr, const json& options = json::object());
 

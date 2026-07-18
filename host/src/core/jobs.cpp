@@ -82,6 +82,10 @@ void launchAgentRunV2(WorkerClient& w, JobState& job,
         job.errorIsCad = false;
         job.converged = true; job.stopReason.clear(); job.errorDetail.clear();
         job.isMission = false; job.missionVerdict.clear();
+        job.missionPartial = false;
+        job.missionTasksCompleted = 0;
+        job.missionTasksFailed = 0;
+        job.missionTasksTotal = 0;
         job.planReady = false; job.planReadyJson.clear();
         job.createdDocPath.clear();
         job.drawingDocId.clear(); job.drawingName.clear(); job.drawingSourceId.clear();
@@ -300,6 +304,10 @@ void launchAgentDesign(WorkerClient& w, JobState& job,
         job.partName.clear();
         job.finalRevision = 0;
         job.isMission = false; job.missionVerdict.clear();
+        job.missionPartial = false;
+        job.missionTasksCompleted = 0;
+        job.missionTasksFailed = 0;
+        job.missionTasksTotal = 0;
         job.planReady = false; job.planReadyJson.clear();
     }
     { std::lock_guard<std::mutex> lk(job.evMtx); job.events.clear(); }
@@ -481,6 +489,10 @@ void launchMissionRun(WorkerClient& w, JobState& job,
         job.converged = true; job.stopReason.clear(); job.errorDetail.clear();
         job.createdDocPath.clear();
         job.isMission = true; job.missionVerdict.clear();
+        job.missionPartial = false;
+        job.missionTasksCompleted = 0;
+        job.missionTasksFailed = 0;
+        job.missionTasksTotal = 0;
         job.planReady = false; job.planReadyJson.clear();
         job.partName.clear();
         job.finalRevision = 0;
@@ -620,12 +632,105 @@ void launchMissionRun(WorkerClient& w, JobState& job,
                     if (v.empty()) v = result.value("summary", std::string());
                     if (v.empty()) v = reason;
                     job.missionVerdict = std::move(v);
+                } else if (status == "partial") {
+                    // Mixed outcomes: some tasks built, at least one failed. Keep geometry;
+                    // do NOT set job.error (not a hard fail). Drain shows warning card.
+                    job.missionPartial = true;
+                    job.converged = false;
+                    if (!sr.empty()) job.stopReason = sr;
+                    // Prefer first_fail_reason; fall back to stop_reason / error fields.
+                    std::string failReason = result.value("first_fail_reason", std::string());
+                    if (failReason.empty()) failReason = sr;
+                    if (failReason.empty()) failReason = result.value("error_detail", std::string());
+                    if (failReason.empty()) failReason = result.value("error", std::string());
+                    if (!failReason.empty()) job.errorDetail = failReason;
+                    // Task counts — accept several field names defensively.
+                    auto countField = [&](const char* a, const char* b) -> int {
+                        if (result.contains(a) && result[a].is_number_integer())
+                            return result[a].get<int>();
+                        if (result.contains(a) && result[a].is_number())
+                            return (int)result[a].get<double>();
+                        if (b && result.contains(b) && result[b].is_number_integer())
+                            return result[b].get<int>();
+                        if (b && result.contains(b) && result[b].is_number())
+                            return (int)result[b].get<double>();
+                        return 0;
+                    };
+                    job.missionTasksCompleted = countField("tasks_completed", "completed");
+                    job.missionTasksFailed = countField("tasks_failed", "failed");
+                    int abandoned = countField("tasks_abandoned", "abandoned");
+                    job.missionTasksTotal = job.missionTasksCompleted + job.missionTasksFailed +
+                                           abandoned;
+                    // Tally from tasks[] when counts missing.
+                    if (job.missionTasksTotal == 0 && result.contains("tasks") &&
+                        result["tasks"].is_array()) {
+                        int done = 0, fail = 0, tot = 0;
+                        for (const auto& t : result["tasks"]) {
+                            if (!t.is_object()) continue;
+                            ++tot;
+                            std::string ts = t.value("status", std::string());
+                            if (ts == "done" || ts == "ok" || ts == "pass") ++done;
+                            else if (ts != "pending" && ts != "skipped" && ts != "abandoned")
+                                ++fail;
+                        }
+                        job.missionTasksCompleted = done;
+                        job.missionTasksFailed = fail;
+                        job.missionTasksTotal = tot;
+                    }
+                    // Verdict line surfaces the failure reason (user-visible).
+                    std::string v = result.value("verdict", std::string());
+                    if (v.empty()) {
+                        char buf[256];
+                        int n = job.missionTasksCompleted;
+                        int m = job.missionTasksTotal > 0
+                                    ? job.missionTasksTotal
+                                    : (n + job.missionTasksFailed);
+                        if (m > 0 && !failReason.empty())
+                            std::snprintf(buf, sizeof(buf),
+                                          "Partially complete — %d/%d tasks built "
+                                          "(first failure: %s)",
+                                          n, m, failReason.c_str());
+                        else if (m > 0)
+                            std::snprintf(buf, sizeof(buf),
+                                          "Partially complete — %d/%d tasks built", n, m);
+                        else if (!failReason.empty())
+                            std::snprintf(buf, sizeof(buf),
+                                          "Partially complete (first failure: %s)",
+                                          failReason.c_str());
+                        else
+                            std::snprintf(buf, sizeof(buf), "Partially complete");
+                        v = buf;
+                    } else if (!failReason.empty() &&
+                               v.find(failReason) == std::string::npos) {
+                        v += "\nFirst failure: ";
+                        v += failReason;
+                    }
+                    job.missionVerdict = std::move(v);
+                    // Keep any assembly/doc that was built.
+                    if (result.value("created_doc", false))
+                        job.createdDocPath = result.value("asm_path", std::string());
                 } else {
                     job.converged = (status == "done");
                     if (!sr.empty()) job.stopReason = sr;
                     std::string ed = result.value("error_detail", std::string());
                     if (ed.empty()) ed = result.value("error", std::string());
                     if (!ed.empty()) job.errorDetail = ed;
+                    // Full mission failure (status failed) — surface as error so the drain
+                    // doesn't treat empty verdict as a soft early-stop.
+                    if (status == "failed") {
+                        job.converged = false;
+                        if (job.error.empty()) {
+                            std::string why = !ed.empty() ? ed : sr;
+                            if (why.empty()) why = "mission_failed";
+                            job.error = why;
+                            job.errorDetail = why;
+                            // Unit failures are CAD-shaped, not app crashes.
+                            job.errorIsCad = (sr == "failed" || sr == "model_failed" ||
+                                              sr == "no_geometry" || sr == "no_code" ||
+                                              sr == "max_iters" || sr == "decompose_failed" ||
+                                              sr == "budget_exceeded" || sr.empty());
+                        }
+                    }
                     job.missionVerdict = result.value("verdict", std::string());
                     if (result.value("created_doc", false))
                         job.createdDocPath = result.value("asm_path", std::string());

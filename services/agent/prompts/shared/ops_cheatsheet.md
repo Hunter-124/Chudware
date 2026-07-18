@@ -60,9 +60,12 @@ SKETCH + a 2D-profile feature — this is how you make anything that is not a ba
   2) sketch_add_entity ops (refer to the sketch as "$<its op index>"). Entity types:
         circle {center:[x,y], radius}      line {p1:[x,y], p2:[x,y]}
         arc {center:[x,y], radius, start:<deg>, end:<deg>, ccw:<bool>}      point {p:[x,y]}
+        rectangle {center:[x,y], width, height}  — PREFERRED way to make a rectangle (1 op,
+                expands to 4 closed lines). Also {corner1:[x1,y1], corner2:[x2,y2]}. width/height
+                accept bare numbers or {"value":N,"expr":null}. (4 separate lines still work.)
         spline {points:[[x,y],[x,y],...]}  — a smooth curve THROUGH the points (use for organic /
                 aerofoil / cam outlines). Close a region by making the first and last point meet
-                another edge. A rectangle = 4 lines (there is no "rect" entity).
+                another edge.
         airfoil {naca:"2412" OR dat:"<path>", chord:<mm>, aoa:<deg>, points:50, closedTE:true}
                 — expands to the upper+lower aerofoil splines as one closed loop (see airfoil sheet).
   3) Turn the sketch into a solid with ONE of:
@@ -259,7 +262,7 @@ sketching ON a face, `offset` lifts along that face's outward normal.
 ----------------------------------------------------------------- SKETCH OPS (append to an existing sketch feature)
 
 sketch_add_entity   {"op":"sketch_add_entity","sketch":"$0","entity":{...}}
-                    Add a line/circle/arc/spline/polygon/airfoil/point entity to a sketch.
+                    Add a line/circle/arc/spline/polygon/rectangle/airfoil/point entity to a sketch.
 
                     REGULAR POLYGON (hexagons, nuts, bolt-heads, prisms) — ALWAYS use this ONE
                     entity; never hand-draw the sides as separate lines (slow + usually fails to
@@ -278,6 +281,15 @@ sketch_add_entity   {"op":"sketch_add_entity","sketch":"$0","entity":{...}}
                        {"op":"sketch_add_entity","sketch":"$0","type":"hexagon","across_flats":16},
                        {"op":"add_feature","type":"extrude","params":{"mode":"boss","end":"blind",
                         "depth":20},"refs":{"profile":[{"kind":"region","sketch":"$0","hint_index":0}]}}]
+
+                    RECTANGLE — PREFERRED over 4 hand-drawn lines (1 op, always closes):
+                      {"op":"sketch_add_entity","sketch":"$0",
+                       "entity":{"type":"rectangle","center":[0,0],"width":80,"height":50}}
+                    - center-form: center:[x,y] (default [0,0]), width, height (both > 0). Dims
+                      may be bare numbers or {"value":N,"expr":null}. Optional rotation:<deg>.
+                    - two-corner form: corner1:[x1,y1], corner2:[x2,y2] (order-independent).
+                    - alias type "rect" also accepted. Expands to 4 CCW line segments.
+                    4 separate line entities remain valid if you already have corners pinned.
 
 sketch_convert      {"op":"sketch_convert","sketch":"<sketch-fid>","refs":[Ref,...],"construction":false,"fix":true}
                     Project external geometry INTO an existing sketch (SolidWorks "Convert Entities").

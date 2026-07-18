@@ -6737,10 +6737,32 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
         }
     }
 
-    // (8) Error block — a distinct red-bordered glass card carrying the real reason (DESIGN §5).
-    // Prefer full multi-line detail from stop_reason / error_detail (stashed on a hidden
-    // __stop_meta__ activity row by feedTurnActivity). When detail is absent, keep m.text.
-    if (m.errKind != ERR_NONE) {
+    // (8) Result / error block.
+    // ERR_PARTIAL: warning-accent "Partially complete" card (mission mixed outcomes) —
+    // geometry is kept; NOT a hard error. ERR_CAD/ERR_SYSTEM: red-bordered error card.
+    if (m.errKind == ERR_PARTIAL || m.resultPartial) {
+        std::string body = stripMdMarks(m.text);
+        if (body.empty()) body = "Partially complete";
+        ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
+        GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin,
+                                          8.0f);
+        ImGui::BeginChild("##partialcard", ImVec2(0, 0),
+                          ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+        const ImVec4 warnCol = semanticOnGlass(pal.statusWarn, chatSurf());
+        ImGui::PushFont(fonts.medium);
+        ImGui::TextColored(warnCol, "Partially complete");
+        ImGui::PopFont();
+        // Body is the selectable detail (counts + first failure / verdict).
+        const ImGuiID textId = chatDrawSelectableText("##partial_sel", body, chatSurf().textPrimary);
+        ImGui::EndChild();
+        ImRect cardRect = endGlassBubble(gb);
+        ImGui::GetWindowDrawList()->AddRect(
+            cardRect.Min, cardRect.Max, ui::Palette::toU32(pal.statusWarn),
+            8.0f * ui::uiScale, 0, ui::metrics::stroke(1.5f));
+        const std::string sel = chatInputSelection(textId);
+        chatCopyContext(cardRect, "##partial_copy", body, body, sel);
+        chatHoverCopyGlyph(cardRect, body);
+    } else if (m.errKind != ERR_NONE) {
         std::string stopReason, errorDetail;
         for (const auto& a : m.activity) {
             if (a.stage != "__stop_meta__") continue;

@@ -25,6 +25,10 @@ RELATIONAL `at`: `at:{"of":"face","side":"top"}` centres on a face; `at_offset:[
 2) sketch_add_entity (sketch = "$<idx>"):
      circle {center:[x,y], radius}      line {p1:[x,y], p2:[x,y]}
      arc {center:[x,y], radius, start:<deg>, end:<deg>, ccw:<bool>}
+     RECTANGLE — PREFERRED (1 op, expands to 4 closed lines):
+       {"op":"sketch_add_entity","sketch":"$0",
+        "entity":{"type":"rectangle","center":[0,0],"width":80,"height":50}}
+       also corner1/corner2 form; width/height may be {"value":N,"expr":null}.
      REGULAR POLYGON / HEX — ONE entity, never hand-draw sides:
        {"op":"sketch_add_entity","sketch":"$0","type":"hexagon","center":[0,0],"across_flats":16}
        type "polygon"/"ngon" needs "sides":N; named: hexagon, octagon, …

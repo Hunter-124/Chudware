@@ -1576,16 +1576,16 @@ TEST_CASE("eng_firm budget filter excludes over-ceiling bids") {
 }
 
 TEST_CASE("eng_firm budget_exceeded abort before overspend") {
-    // Pre-check: if no firm is affordable under remaining budget, abort without awarding.
-    // Post-check: spent never exceeds ceiling via over-budget award.
+    // Per-task metering: remaining = total budget - actual spent (starts 0).
+    // Mission-level award is selection only — never pre-debits spent.
     double budget = 10.0;
-    double spent = 0.0;
+    double spent = 0.0;  // selection awarded_usd is NOT seeded here
     std::vector<double> bids = {4.0, 4.0, 4.0};  // third would exceed if awarded
     int completed = 0;
     int abandoned = 0;
     bool exceeded = false;
     auto try_award = [&](double bid_usd) -> bool {
-        // Filter: refuse award that would exceed remaining budget.
+        // Filter: refuse award that would exceed remaining actual budget.
         if (budget > 0.0 && spent + bid_usd > budget + 1e-9) return false;
         spent += bid_usd;
         return true;
@@ -1608,30 +1608,189 @@ TEST_CASE("eng_firm budget_exceeded abort before overspend") {
     CHECK(spent <= budget + 1e-9);
 }
 
-TEST_CASE("mission stop_reason propagates real unit failure") {
-    // Mirrors run_mission finish: never emit opaque "planned" on failure.
-    auto resolve_stop = [](bool budget_exceeded, bool any_built, bool any_ok, bool created_doc,
-                           const std::string& first_fail,
-                           const std::vector<std::string>& summaries) -> std::string {
-        if (budget_exceeded) return "budget_exceeded";
-        if (any_built) return created_doc ? "assembled" : "built";
-        if (any_ok) return "done";
-        if (!first_fail.empty()) return first_fail;
-        for (auto it = summaries.rbegin(); it != summaries.rend(); ++it)
-            if (!it->empty()) return *it;
-        return "mission_failed";
+TEST_CASE("eng_firm single-task mission budget accounting") {
+    // Mission-level selection bid does NOT reserve budget. Per-task award checks
+    // the task estimate against remaining = budget - spent (spent starts 0).
+    // Single-task whose estimate fits total budget must execute; over-total aborts.
+    auto mission_then_task = [](double budget, double selection_bid, double task_bid)
+        -> std::pair<bool /*execute*/, double /*spent*/> {
+        // Mission selection: record firm, do NOT debit spent.
+        double awarded_usd = selection_bid;  // telemetry only
+        double spent = 0.0;
+        (void)awarded_usd;
+        // Prefer mission firm if task bid fits remaining actual budget.
+        const double remaining = budget - spent;
+        if (task_bid <= remaining + 1e-9) {
+            spent += task_bid;  // debit only on actual task award
+            return {true, spent};
+        }
+        // No affordable firm → abort before execution.
+        return {false, spent};
     };
-    CHECK(resolve_stop(true, false, false, false, "", {}) == "budget_exceeded");
-    CHECK(resolve_stop(false, true, true, false, "", {}) == "built");
-    CHECK(resolve_stop(false, true, true, true, "", {}) == "assembled");
-    CHECK(resolve_stop(false, false, true, false, "", {}) == "done");
-    CHECK(resolve_stop(false, false, false, false, "provider_error", {"provider_error"}) ==
-          "provider_error");
-    CHECK(resolve_stop(false, false, false, false, "no_geometry", {}) == "no_geometry");
-    CHECK(resolve_stop(false, false, false, false, "", {"", "parse_error"}) == "parse_error");
-    CHECK(resolve_stop(false, false, false, false, "", {}) == "mission_failed");
-    // Critical: never "planned" on a failed mission.
-    CHECK(resolve_stop(false, false, false, false, "provider_error", {}) != "planned");
+
+    // Live spot: estimate ≈ 15.06, budget 25 → must execute (not abort at spent=0).
+    {
+        auto [ok, spent] = mission_then_task(25.0, 15.06, 15.06);
+        CHECK(ok);
+        CHECK(spent == doctest::Approx(15.06));
+        CHECK(spent <= 25.0 + 1e-9);
+    }
+    // Same estimate, budget 10 → budget_exceeded before any task spend.
+    {
+        auto [ok, spent] = mission_then_task(10.0, 15.06, 15.06);
+        CHECK_FALSE(ok);
+        CHECK(spent == doctest::Approx(0.0));
+    }
+    // Multi-task: selection bid ignored; successive tasks debit remaining.
+    {
+        double budget = 30.0;
+        double spent = 0.0;
+        double selection = 15.06;  // NOT reserved
+        (void)selection;
+        std::vector<double> tasks = {12.0, 12.0, 12.0};
+        int ran = 0;
+        for (double t : tasks) {
+            if (spent + t > budget + 1e-9) break;
+            spent += t;
+            ++ran;
+        }
+        CHECK(ran == 2);
+        CHECK(spent == doctest::Approx(24.0));
+        // Third task would need 12 against remaining 6 → refused.
+        CHECK(spent + 12.0 > budget);
+    }
+}
+
+TEST_CASE("mission stop_reason propagates real unit failure") {
+    // Mirrors run_mission finish: never emit opaque "planned" on failure;
+    // mixed success+failure → partial (not done/built).
+    struct Outcome {
+        std::string status;
+        std::string stop_reason;
+    };
+    auto resolve = [](bool budget_exceeded, bool any_built, bool any_ok, bool created_doc,
+                      bool any_failed, const std::string& first_fail,
+                      const std::vector<std::string>& fail_summaries) -> Outcome {
+        auto fail_r = [&]() -> std::string {
+            if (!first_fail.empty()) return first_fail;
+            for (auto it = fail_summaries.rbegin(); it != fail_summaries.rend(); ++it)
+                if (!it->empty()) return *it;
+            return "mission_failed";
+        };
+        if (budget_exceeded && !any_built && !any_ok)
+            return {"failed", "budget_exceeded"};
+        if (budget_exceeded && (any_built || any_ok))
+            return {"partial", "budget_exceeded"};
+        if (any_failed && (any_built || any_ok))
+            return {"partial", fail_r()};
+        if (any_built && !any_failed)
+            return {"done", created_doc ? "assembled" : "built"};
+        if (any_ok && !any_failed) return {"done", "done"};
+        return {"failed", fail_r()};
+    };
+    // Pure budget abort.
+    {
+        auto o = resolve(true, false, false, false, false, "", {});
+        CHECK(o.status == "failed");
+        CHECK(o.stop_reason == "budget_exceeded");
+    }
+    // All-success build / assemble.
+    {
+        auto o = resolve(false, true, true, false, false, "", {});
+        CHECK(o.status == "done");
+        CHECK(o.stop_reason == "built");
+    }
+    {
+        auto o = resolve(false, true, true, true, false, "", {});
+        CHECK(o.status == "done");
+        CHECK(o.stop_reason == "assembled");
+    }
+    // Total failure surfaces real cause (never "planned").
+    {
+        auto o = resolve(false, false, false, false, true, "provider_error", {"provider_error"});
+        CHECK(o.status == "failed");
+        CHECK(o.stop_reason == "provider_error");
+        CHECK(o.stop_reason != "planned");
+    }
+    {
+        auto o = resolve(false, false, false, false, true, "no_geometry", {});
+        CHECK(o.status == "failed");
+        CHECK(o.stop_reason == "no_geometry");
+    }
+    {
+        auto o = resolve(false, false, false, false, true, "", {"", "parse_error"});
+        CHECK(o.status == "failed");
+        CHECK(o.stop_reason == "parse_error");
+    }
+}
+
+TEST_CASE("mission partial when some tasks fail after success") {
+    // Live bug: u1 design done + u2 assembly model_failed must NOT be done/built.
+    // status=partial preserves u1 geometry; stop_reason carries u2's failure.
+    struct Outcome {
+        std::string status;
+        std::string stop_reason;
+        int completed = 0;
+        int failed = 0;
+    };
+    auto finish = [](const std::vector<std::pair<std::string, std::string>>& tasks) -> Outcome {
+        // tasks: {status, summary}
+        Outcome o;
+        bool any_built = false;
+        bool any_ok = false;
+        std::string first_fail;
+        for (const auto& t : tasks) {
+            if (t.first == "done") {
+                ++o.completed;
+                any_ok = true;
+                any_built = true;  // design/assembly done counts as built work
+            } else if (t.first != "abandoned" && t.first != "pending" && t.first != "skipped") {
+                ++o.failed;
+                if (first_fail.empty())
+                    first_fail = !t.second.empty() ? t.second : t.first;
+            }
+        }
+        const bool any_failed = o.failed > 0;
+        if (any_failed && (any_built || any_ok || o.completed > 0)) {
+            o.status = "partial";
+            o.stop_reason = first_fail.empty() ? "mission_failed" : first_fail;
+        } else if (any_built && !any_failed) {
+            o.status = "done";
+            o.stop_reason = "built";
+        } else if (any_ok && !any_failed) {
+            o.status = "done";
+            o.stop_reason = "done";
+        } else {
+            o.status = "failed";
+            o.stop_reason = first_fail.empty() ? "mission_failed" : first_fail;
+        }
+        return o;
+    };
+
+    // The spot failure: u1 done, u2 model_failed.
+    {
+        auto o = finish({{"done", "built"}, {"failed", "model_failed"}});
+        CHECK(o.status == "partial");
+        CHECK(o.stop_reason == "model_failed");
+        CHECK(o.completed == 1);
+        CHECK(o.failed == 1);
+        CHECK(o.status != "done");
+        CHECK(o.stop_reason != "built");
+    }
+    // All done → done/built.
+    {
+        auto o = finish({{"done", "built"}, {"done", "assembled"}});
+        CHECK(o.status == "done");
+        CHECK(o.stop_reason == "built");
+        CHECK(o.failed == 0);
+    }
+    // All failed → failed (not partial).
+    {
+        auto o = finish({{"failed", "provider_error"}, {"failed", "model_failed"}});
+        CHECK(o.status == "failed");
+        CHECK(o.stop_reason == "provider_error");
+        CHECK(o.completed == 0);
+    }
 }
 
 TEST_CASE("execution_style inheritance for sub-runs") {

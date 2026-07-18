@@ -39,12 +39,10 @@ This takes TWO batches because the bend edge has to be queried off the just-buil
 PHASE 1 — sketch the 80x50 rectangle and make the base flange (one doc_apply_ops batch):
 [
  {"op":"add_feature","feature":{"type":"sketch","name":"Base","params":{"entities":[],"constraints":[]},"refs":{"plane":"plane.top"}}},
- {"op":"sketch_add_entity","sketch":"$0","entity":{"type":"line","p1":[-40,-25],"p2":[40,-25]}},
- {"op":"sketch_add_entity","sketch":"$0","entity":{"type":"line","p1":[40,-25],"p2":[40,25]}},
- {"op":"sketch_add_entity","sketch":"$0","entity":{"type":"line","p1":[40,25],"p2":[-40,25]}},
- {"op":"sketch_add_entity","sketch":"$0","entity":{"type":"line","p1":[-40,25],"p2":[-40,-25]}},
+ {"op":"sketch_add_entity","sketch":"$0","entity":{"type":"rectangle","center":[0,0],"width":80,"height":50}},
  {"op":"add_feature","feature":{"type":"sm_base_flange","name":"Flange","params":{"thickness":{"value":2,"expr":null}},"refs":{"profile":[{"kind":"region","sketch":"$0","centroid":[0,0],"hint_index":0}]}}}
 ]
+ (4 separate line entities for the same outline remain valid; rectangle is preferred.)
 
 PHASE 2 — find the +X top-rim edge, then bend a 20mm wall up 90°. The top face sits at z=2, so the
 +X rim edge's midpoint is [40,0,2]. query_geometry returns the RESOLVED selector; pass it as refs.edge:

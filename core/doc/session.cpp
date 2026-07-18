@@ -1172,11 +1172,11 @@ void unwrap_value_scalars(json& j) {
 }
 // Normalize + expand ONE inline sketch entity into the concrete entities the geometry kernel
 // understands. Applied on BOTH ingestion paths — the sketch_add_entity op AND a sketch feature's
-// inline params.entities (op_add_feature) — so a hexagon / airfoil / {value:N} scalar builds
-// identically however the model phrases it. Convenience types (airfoil, regular polygon) expand
-// to several lines/splines; any other entity passes through. Every returned entity carries an
-// "id" (the model's own if it supplied one — inline constraints reference it — else a fresh id)
-// and a "construction" flag.
+// inline params.entities (op_add_feature) — so a hexagon / rectangle / airfoil / {value:N} scalar
+// builds identically however the model phrases it. Convenience types (airfoil, regular polygon,
+// rectangle) expand to several lines/splines; any other entity passes through. Every returned
+// entity carries an "id" (the model's own if it supplied one — inline constraints reference it —
+// else a fresh id) and a "construction" flag.
 std::vector<json> expand_sketch_entity(json ent, IdGen& gen) {
     unwrap_value_scalars(ent);  // accept {value:N} scalars in sketch entities
 
@@ -1297,6 +1297,133 @@ std::vector<json> expand_sketch_entity(json ent, IdGen& gen) {
         }
     }
 
+    // RECTANGLE convenience entity -> 4 closed CCW line segments. Models emit this constantly
+    // (center+width+height); expanding here kills the old "not a sketch entity type" reject loop.
+    // Forms:
+    //   center:  {"type":"rectangle","center":[x,y],"width":W,"height":H}  (center defaults [0,0])
+    //   corners: {"type":"rectangle","corner1":[x1,y1],"corner2":[x2,y2]}
+    // width/height accept bare numbers or {"value":N,"expr":null} (unwrap_value_scalars above).
+    // Aliases: "rect". Optional "rotation" degrees about center (center-form only).
+    {
+        const std::string et = ent.value("type", std::string());
+        if (et == "rectangle" || et == "rect") {
+            auto getnum = [&](std::initializer_list<const char*> keys, double* o) -> bool {
+                for (const char* k : keys)
+                    if (ent.contains(k) && ent[k].is_number()) {
+                        *o = ent[k].get<double>();
+                        return true;
+                    }
+                return false;
+            };
+            auto is_xy = [](const json& j) -> bool {
+                return j.is_array() && j.size() >= 2 && j[0].is_number() && j[1].is_number();
+            };
+            double x0 = 0.0, y0 = 0.0, x1 = 0.0, y1 = 0.0;
+            bool have_box = false;
+
+            // Two-corner form first (corner1/corner2, or p1/p2, or min/max).
+            json c1 = json(), c2 = json();
+            if (ent.contains("corner1") && is_xy(ent["corner1"])) c1 = ent["corner1"];
+            else if (ent.contains("p1") && is_xy(ent["p1"])) c1 = ent["p1"];
+            else if (ent.contains("min") && is_xy(ent["min"])) c1 = ent["min"];
+            if (ent.contains("corner2") && is_xy(ent["corner2"])) c2 = ent["corner2"];
+            else if (ent.contains("p2") && is_xy(ent["p2"])) c2 = ent["p2"];
+            else if (ent.contains("max") && is_xy(ent["max"])) c2 = ent["max"];
+            if (!c1.is_null() && !c2.is_null()) {
+                x0 = std::min(c1[0].get<double>(), c2[0].get<double>());
+                x1 = std::max(c1[0].get<double>(), c2[0].get<double>());
+                y0 = std::min(c1[1].get<double>(), c2[1].get<double>());
+                y1 = std::max(c1[1].get<double>(), c2[1].get<double>());
+                have_box = true;
+            } else {
+                // Center + width/height form (the common model emission).
+                double cx = 0.0, cy = 0.0;
+                if (ent.contains("center") && is_xy(ent["center"])) {
+                    cx = ent["center"][0].get<double>();
+                    cy = ent["center"][1].get<double>();
+                }
+                double w = 0.0, h = 0.0;
+                const bool got_w = getnum({"width", "w", "dx", "length"}, &w);
+                const bool got_h = getnum({"height", "h", "dy", "depth"}, &h);
+                if (!got_w || !got_h) {
+                    throw OpError(
+                        "invalid_op",
+                        "rectangle: expected center-form "
+                        "{\"type\":\"rectangle\",\"center\":[x,y],\"width\":W,\"height\":H} "
+                        "or two-corner form "
+                        "{\"type\":\"rectangle\",\"corner1\":[x1,y1],\"corner2\":[x2,y2]} "
+                        "(width/height may be bare numbers or {\"value\":N,\"expr\":null})");
+                }
+                if (!(w > 0.0) || !(h > 0.0)) {
+                    throw OpError("invalid_op",
+                                  "rectangle: width and height must be > 0 (got width=" +
+                                      std::to_string(w) + ", height=" + std::to_string(h) + ")");
+                }
+                double rot = 0.0;
+                for (const char* k : {"rotation", "angle"})
+                    if (ent.contains(k) && ent[k].is_number()) {
+                        rot = ent[k].get<double>();
+                        break;
+                    }
+                const double hw = w * 0.5, hh = h * 0.5;
+                if (std::fabs(rot) < 1e-12) {
+                    x0 = cx - hw;
+                    x1 = cx + hw;
+                    y0 = cy - hh;
+                    y1 = cy + hh;
+                    have_box = true;
+                } else {
+                    // Rotated about center: emit verts directly (axis-aligned box path skipped).
+                    rot *= M_PI / 180.0;
+                    const double cr = std::cos(rot), sr = std::sin(rot);
+                    auto rotp = [&](double lx, double ly) -> std::array<double, 2> {
+                        return {cx + lx * cr - ly * sr, cy + lx * sr + ly * cr};
+                    };
+                    // CCW from bottom-left in local frame.
+                    const std::array<double, 2> v0 = rotp(-hw, -hh);
+                    const std::array<double, 2> v1 = rotp(+hw, -hh);
+                    const std::array<double, 2> v2 = rotp(+hw, +hh);
+                    const std::array<double, 2> v3 = rotp(-hw, +hh);
+                    const std::array<double, 2> verts[4] = {v0, v1, v2, v3};
+                    for (int i = 0; i < 4; ++i) {
+                        const auto& a = verts[i];
+                        const auto& b = verts[(i + 1) % 4];
+                        json ln;
+                        ln["type"] = "line";
+                        ln["p1"] = json::array({a[0], a[1]});
+                        ln["p2"] = json::array({b[0], b[1]});
+                        ln["id"] = gen.next("e");
+                        ln["construction"] = constr;
+                        out.push_back(std::move(ln));
+                    }
+                    return out;
+                }
+            }
+            if (!have_box || !(x1 > x0) || !(y1 > y0)) {
+                throw OpError(
+                    "invalid_op",
+                    "rectangle: degenerate box — width and height must be > 0 "
+                    "(center-form needs width/height; corner-form needs distinct corners)");
+            }
+            // CCW winding: BL -> BR -> TR -> TL -> BL (consistent with polygon expand).
+            const std::array<double, 2> verts[4] = {
+                {x0, y0}, {x1, y0}, {x1, y1}, {x0, y1},
+            };
+            for (int i = 0; i < 4; ++i) {
+                const auto& a = verts[i];
+                const auto& b = verts[(i + 1) % 4];
+                json ln;
+                ln["type"] = "line";
+                ln["p1"] = json::array({a[0], a[1]});
+                ln["p2"] = json::array({b[0], b[1]});
+                ln["id"] = gen.next("e");
+                ln["construction"] = constr;
+                out.push_back(std::move(ln));
+            }
+            return out;
+        }
+    }
+
     // Ordinary entity: keep a CANONICAL e<N> id. Models often emit "l0"/"p1"/etc.;
     // schema validate requires e\d+, so rewrite non-canonical ids here and stash the
     // original under "_alias" so sketch_add_entity can remap later constraint refs.
@@ -1396,7 +1523,7 @@ void op_sketch_add_entity(json& doc, const json& op, std::size_t idx, IdGen& gen
         sk["params"]["entities"].push_back(std::move(e));
     }
     // Front id is the primary entity for $N / $self; multi-entity expands
-    // (polygon/airfoil) expose siblings as $N#k.
+    // (polygon/rectangle/airfoil) expose siblings as $N#k.
     std::string eid;
     if (!new_ents.empty()) {
         const std::size_t n = new_ents.size();

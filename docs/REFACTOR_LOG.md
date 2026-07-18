@@ -1656,3 +1656,28 @@ refreshed even on a Solo-classified follow-up edit (`want_notes = cx!=Solo || !s
 so revisit context never goes stale. Files: `core/agent/run.cpp`, `services/agent/prompts/memory.md`.
 Verified on a scratch daemon: washer -> name only/no notes; bracket -> name + ai_notes; fillet-edit
 follow-up -> notes refreshed.
+
+### Live agent-event streaming + expandable model I/O (desktop + web)
+The agent run timeline was BATCHED on the web/daemon path — hostd ran the whole agent_run
+synchronously and returned every event in result["events"] only at completion, so the copilot
+showed a frozen "Classifying request…" box for the whole (multi-minute) run with nothing to
+inspect. Now events stream LIVE and each stage is expandable to show the exact prompt sent + raw
+reply received. Mechanism (one C-ABI seam serves both desktop in-proc and web daemon):
+`RunEvents::emit` fires a thread-local stream sink for every event (core/agent/events.*); new
+append-only export `aicad_set_event_sink(cb,ud)` (core/api/libaicad.*) registers it; `agent_output`
+events gained `sent` (system+prompt, capped) beside `raw`. Daemon (core/hostd/server.cpp) sets the
+sink around agent-turn calls and pushes each event as `{"event":"agent.event","data":…}` to the
+calling client, then strips the redundant batched `result["events"]` (gated on
+`cpp_core().hasEventSink()`). The load-bearing web fix: `EngineClient::call`/`readResponse` gained
+an `onEvent` hook that fires `agent.event` LIVE mid-call — `drainEvents` try-locks and could never
+run while `call()` holds `mtx_` across the ~70s RPC, so buffering-until-return was the whole bug.
+`engine::call` threads the hook; `worker_client.cpp callAgentStreaming` routes it to the turn's
+onEvent on the daemon path and registers the in-process `cpp_core` sink on the desktop path,
+skipping the batched replay when live (fallback kept for an old engine). GUI: `activity_panel` +
+the typed-block timeline gained "Sent to model" / "Model reply" expanders (drawProseBox).
+Verified: scratch daemon streamed 268 events live (first at 8.8s of an 85s run); a standalone
+EngineClient harness confirmed the router fires mid-call with `result["events"]` stripped (no
+double-render). Gotcha/deferred: deploying restarts the shared daemon (kills in-flight web runs —
+this is what froze a user's rocket build mid-run); a graceful drain that waits for / cancels the
+in-flight provider call before restart is a separate fix. The daemon shutdown-drain STILL SIGABRTs
+when a provider HTTP call is in flight (coredump on redeploy) — not addressed here.

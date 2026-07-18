@@ -8,6 +8,8 @@
 #include "agent/state.h"
 #include "agent/events.h"
 #include "agent/ops_emit.h"
+#include "agent/complexity.h"
+#include "agent/domain.h"
 
 
 using namespace aicad::agent;
@@ -606,7 +608,7 @@ TEST_CASE("plan_state checklist step statuses") {
     REQUIRE(pending.size() == 3);
     CHECK(pending[0]["status"] == "pending");
     CHECK(pending[0]["kind"] == "step");
-    CHECK(pending[0]["id"] == "step-0");
+    CHECK(pending[0]["id"] == "model:0");
     CHECK(pending[0]["title"] == "Build base solid");
 
     json running = plan_state_items_from_steps(steps, 1);
@@ -879,4 +881,251 @@ TEST_CASE("openai_reasoning_patch: per-provider/model reasoning-effort gating") 
     }
     // Local endpoint -> omit even for a reasoning-capable id.
     CHECK(openai_reasoning_patch("openai", "gpt-5", "http://localhost:1234/v1", "high").empty());
+}
+
+// --------------------------------------------------------------------------- harness fixes (battery r1)
+namespace {
+
+StageOutcome pass_outcome(const char* reason = "ok") {
+    StageOutcome o;
+    o.verdict = "pass";
+    o.reason = reason;
+    return o;
+}
+
+StageActions bare_pass_actions() {
+    StageActions a;
+    auto pass = [](DesignState&, int) { return pass_outcome(); };
+    a.intake = pass;
+    a.plan = pass;
+    a.model = [](DesignState& s, int) {
+        s.revision += 1;
+        s.tree_digest = "f1:box";
+        return pass_outcome("modeled");
+    };
+    a.review = pass;
+    a.fix = pass;
+    a.memory = pass;
+    a.plan_steps = [](DesignState&) { return std::vector<std::string>{""}; };
+    return a;
+}
+
+}  // namespace
+
+TEST_CASE("run_machine intake reject stops with unintelligible_request") {
+    DesignState st;
+    st.request = "asdf qwerty blah blah";
+    int plan_n = 0, model_n = 0;
+    StageActions actions = bare_pass_actions();
+    actions.intake = [](DesignState&, int) {
+        StageOutcome o;
+        o.verdict = "fail";
+        o.reason = "not a CAD design request";
+        o.has_error = true;
+        o.error = "unintelligible_request";
+        o.parsed_ok = true;
+        return o;
+    };
+    actions.plan = [&](DesignState&, int) {
+        ++plan_n;
+        return pass_outcome();
+    };
+    actions.model = [&](DesignState&, int) {
+        ++model_n;
+        return pass_outcome();
+    };
+
+    std::vector<json> seen;
+    RunEvents events("intake-reject-ut", [&](const json& ev) { seen.push_back(ev); });
+    json result = run_machine(st, actions, events,
+                              json{{"intake", 1}, {"plan", 1}, {"model", 1},
+                                   {"review", 1}, {"fix", 1}, {"memory", 1}});
+    CHECK(result["status"] == "failed");
+    CHECK(result["stop_reason"] == "unintelligible_request");
+    CHECK(result.value("error_detail", std::string()) == "not a CAD design request");
+    CHECK(plan_n == 0);
+    CHECK(model_n == 0);
+    // stage_result for intake fail was emitted by the machine.
+    bool saw_intake_fail = false;
+    for (const auto& ev : seen) {
+        if (ev.value("kind", "") == "stage_result" && ev.value("stage", "") == "intake" &&
+            ev.value("verdict", "") == "fail")
+            saw_intake_fail = true;
+    }
+    CHECK(saw_intake_fail);
+}
+
+TEST_CASE("run_machine empty normalized request rejects same path") {
+    DesignState st;
+    st.request = "   ";
+    int plan_n = 0, model_n = 0;
+    StageActions actions = bare_pass_actions();
+    actions.intake = [](DesignState&, int) {
+        // Mirrors run.cpp empty-spec belt: fail + unintelligible_request.
+        StageOutcome o;
+        o.verdict = "fail";
+        o.reason = "normalized request is empty";
+        o.has_error = true;
+        o.error = "unintelligible_request";
+        o.parsed_ok = true;
+        return o;
+    };
+    actions.plan = [&](DesignState&, int) {
+        ++plan_n;
+        return pass_outcome();
+    };
+    actions.model = [&](DesignState&, int) {
+        ++model_n;
+        return pass_outcome();
+    };
+
+    RunEvents events("intake-empty-ut", nullptr);
+    json result = run_machine(st, actions, events,
+                              json{{"intake", 1}, {"plan", 1}, {"model", 1},
+                                   {"review", 1}, {"fix", 1}, {"memory", 1}});
+    CHECK(result["status"] == "failed");
+    CHECK(result["stop_reason"] == "unintelligible_request");
+    CHECK(result.value("error_detail", std::string()) == "normalized request is empty");
+    CHECK(plan_n == 0);
+    CHECK(model_n == 0);
+}
+
+TEST_CASE("run_machine solo_skip_plan omits plan action entirely") {
+    DesignState st;
+    st.request = "50mm cube";
+    int plan_n = 0;
+    StageActions actions = bare_pass_actions();
+    actions.plan = [&](DesignState&, int) {
+        ++plan_n;
+        return pass_outcome("should not run");
+    };
+
+    std::vector<json> seen;
+    RunEvents events("solo-skip-plan-ut", [&](const json& ev) { seen.push_back(ev); });
+    // budgets.plan=0 is the solo_skip_plan contract from run.cpp.
+    json result = run_machine(st, actions, events,
+                              json{{"intake", 1}, {"plan", 0}, {"model", 1},
+                                   {"review", 1}, {"fix", 2}, {"memory", 1}});
+    CHECK(result["status"] == "done");
+    CHECK(plan_n == 0);
+    // No plan stage_started / stage_result events.
+    for (const auto& ev : seen) {
+        const std::string kind = ev.value("kind", std::string());
+        if (kind == "stage_started" || kind == "stage_result")
+            CHECK(ev.value("stage", std::string()) != "plan");
+    }
+    // Deterministic stage checklist (no LLM) with namespaced ids.
+    bool saw_stage_checklist = false;
+    json last_check;
+    for (const auto& ev : seen) {
+        if (ev.value("kind", "") != "plan_state") continue;
+        if (ev.value("shape", "") != "checklist") continue;
+        saw_stage_checklist = true;
+        last_check = ev;
+    }
+    CHECK(saw_stage_checklist);
+    REQUIRE(last_check.is_object());
+    REQUIRE(last_check["items"].is_array());
+    bool has_model = false, has_review = false, has_memory = false;
+    for (const auto& it : last_check["items"]) {
+        const std::string id = it.value("id", std::string());
+        if (id == "model:") {
+            has_model = true;
+            CHECK(it["status"] == "done");
+        } else if (id == "review:") {
+            has_review = true;
+            CHECK(it["status"] == "done");
+        } else if (id == "memory:") {
+            has_memory = true;
+            CHECK(it["status"] == "done");
+        }
+        // Must not collide with mission:/firm: namespaces.
+        CHECK(id.rfind("mission:", 0) != 0);
+        CHECK(id.rfind("firm:", 0) != 0);
+    }
+    CHECK(has_model);
+    CHECK(has_review);
+    CHECK(has_memory);
+}
+
+TEST_CASE("run_machine fix budget is a run-level cap under always-fail review") {
+    DesignState st;
+    st.request = "bracket";
+    int fix_n = 0;
+    const int kFixBudget = 2;  // Solo default
+    StageActions actions = bare_pass_actions();
+    actions.review = [](DesignState&, int) {
+        StageOutcome o;
+        o.verdict = "retry";
+        o.reason = "review: 1 issue(s)";
+        o.parsed_ok = true;
+        return o;
+    };
+    actions.fix = [&](DesignState&, int) {
+        ++fix_n;
+        // Pass so the loop would re-review; the run-level cap must still hold.
+        return pass_outcome("fixed");
+    };
+
+    RunEvents events("fix-budget-ut", nullptr);
+    json result = run_machine(st, actions, events,
+                              json{{"intake", 1}, {"plan", 0}, {"model", 1},
+                                   {"review", 8}, {"fix", kFixBudget}, {"memory", 1}});
+    // Run completes (memory names the part) even if review never passed.
+    CHECK(result["status"] == "done");
+    CHECK(fix_n == kFixBudget);
+}
+
+TEST_CASE("run_machine first review pass runs zero fix iterations") {
+    // Documents that review early-exit already worked (and still does).
+    DesignState st;
+    st.request = "washer";
+    int fix_n = 0;
+    StageActions actions = bare_pass_actions();
+    actions.review = [](DesignState&, int) { return pass_outcome("review: done"); };
+    actions.fix = [&](DesignState&, int) {
+        ++fix_n;
+        return pass_outcome();
+    };
+    RunEvents events("review-early-exit-ut", nullptr);
+    json result = run_machine(st, actions, events,
+                              json{{"intake", 1}, {"plan", 0}, {"model", 1},
+                                   {"review", 4}, {"fix", 6}, {"memory", 1}});
+    CHECK(result["status"] == "done");
+    CHECK(fix_n == 0);
+}
+
+TEST_CASE("DesignState domain seed grants sheetmetal tool_scope_classes") {
+    // Mirrors run_design's post-classify seed (Domain::Sheetmetal → "sheetmetal").
+    DesignState st;
+    st.request = "sheetmetal enclosure 200x120x60mm";
+    DomainVerdict dom = classify_domain(st.request);
+    CHECK(dom.domain == Domain::Sheetmetal);
+    st.domain = dom.domain;
+    st.domain_set = true;
+    if (dom.domain == Domain::Sheetmetal) st.tool_scope_classes.insert("sheetmetal");
+    CHECK(st.tool_scope_classes.count("sheetmetal") == 1);
+    // Modeling does not seed a domain class.
+    DesignState m;
+    m.request = "50mm cube";
+    DomainVerdict md = classify_domain(m.request);
+    CHECK(md.domain == Domain::Modeling);
+    m.domain = md.domain;
+    m.domain_set = true;
+    // no seed for Modeling
+    CHECK(m.tool_scope_classes.empty());
+}
+
+TEST_CASE("assembly_plausible gate: single-part skips probe, multi-part probes") {
+    // Pure classifier contract used by run_assembly_design's skip-the-probe path.
+    auto plausible = [](const std::string& req) {
+        auto cx = classify_complexity(req);
+        auto dm = classify_domain(req);
+        return cx.level == Complexity::Complex || dm.domain == Domain::Assembly;
+    };
+    CHECK_FALSE(plausible("50mm cube"));
+    CHECK_FALSE(plausible("sheetmetal enclosure 200x120x60mm, 1.5mm steel"));
+    CHECK_FALSE(plausible("M6 washer 12mm OD 1mm thick"));
+    CHECK(plausible("two brackets that bolt together with M5"));
+    CHECK(plausible("assemble the gearbox and add mates"));
 }

@@ -136,3 +136,77 @@ TEST_CASE("bare stress or load stays Modeling; analyze intent routes Simulation"
     CHECK(classify_domain("analyze the stress on this arm").domain == Domain::Simulation);
     CHECK(classify_domain("what is the factor of safety under load").domain == Domain::Simulation);
 }
+
+// ---- grok-4.5 battery round-1 corpus (locked) ------------------------------
+// Every row asserts BOTH complexity level AND domain. Keep in lockstep with
+// the battery table; classifier changes must keep this matrix green.
+
+TEST_CASE("battery corpus: knurled hex standoff is Solo/Modeling") {
+    const char* p = "a knurled hex standoff, 22mm tall, M3 clearance bore";
+    CHECK(classify_complexity(p).level == Complexity::Solo);
+    CHECK(classify_domain(p).domain == Domain::Modeling);
+}
+
+TEST_CASE("battery corpus: M6 washer is Solo/Modeling") {
+    const char* p = "M6 washer, 1.5mm thick";
+    CHECK(classify_complexity(p).level == Complexity::Solo);
+    CHECK(classify_domain(p).domain == Domain::Modeling);
+}
+
+TEST_CASE("battery corpus: chamfer edit follow-up is Solo/Modeling") {
+    const char* p = "chamfer the top edges (edit follow-up, existing doc)";
+    CHECK(classify_complexity(p).level == Complexity::Solo);
+    CHECK(classify_domain(p).domain == Domain::Modeling);
+}
+
+TEST_CASE("battery corpus: mounting plate with holes and ribs is Standard/Modeling") {
+    // Single body, multi-feature feature-list ('and' joins ribs to holes, not a 2nd part).
+    const char* p = "mounting plate with 4 clearance holes and 2 ribs";
+    CHECK(classify_complexity(p).level == Complexity::Standard);
+    CHECK(classify_domain(p).domain == Domain::Modeling);
+}
+
+TEST_CASE("battery corpus: hinge bracket is Standard-or-Complex/Modeling") {
+    // Multi-part intent (two leaves + pin) may escalate to Complex; Standard is also
+    // correct for a single hinge body. Document current: Standard (feature list).
+    const char* p = "hinge bracket with two leaves and a pin";
+    auto cx = classify_complexity(p);
+    CHECK((cx.level == Complexity::Standard || cx.level == Complexity::Complex));
+    CHECK(classify_domain(p).domain == Domain::Modeling);
+}
+
+TEST_CASE("battery corpus: two brackets bolt-together is Complex/Assembly") {
+    const char* p = "two brackets that bolt together with M5 assembly";
+    CHECK(classify_complexity(p).level == Complexity::Complex);
+    CHECK(classify_domain(p).domain == Domain::Assembly);
+}
+
+TEST_CASE("battery corpus: sheetmetal enclosure is Standard/Sheetmetal") {
+    const char* p = "sheetmetal enclosure 200x120x60mm, 1.5mm steel";
+    CHECK(classify_complexity(p).level == Complexity::Standard);
+    CHECK(classify_domain(p).domain == Domain::Sheetmetal);
+}
+
+TEST_CASE("battery corpus: coordinate system is Solo/Modeling (not Complex)") {
+    // Battery-verified edge: "system" must not inflate via the assembly keyword.
+    const char* p = "a coordinate system at the centroid";
+    CHECK(classify_complexity(p).level == Complexity::Solo);
+    CHECK(classify_domain(p).domain == Domain::Modeling);
+}
+
+TEST_CASE("battery corpus: knurled knob is Solo/Modeling (pattern must not inflate)") {
+    const char* p = "knob with knurling pattern";
+    CHECK(classify_complexity(p).level == Complexity::Solo);
+    CHECK(classify_domain(p).domain == Domain::Modeling);
+}
+
+TEST_CASE("battery corpus: garbage prompt is Solo/Modeling (intake rejects, not classifier)") {
+    const char* p = "asdf qwerty blah blah";
+    // Must not crash; mechanically Solo/Modeling is fine. Rejection is intake's job.
+    auto cx = classify_complexity(p);
+    auto dm = classify_domain(p);
+    CHECK(cx.level == Complexity::Solo);
+    CHECK(dm.domain == Domain::Modeling);
+    CHECK(cx.label() != nullptr);
+    CHECK(dm.label() != nullptr);
+}

@@ -82,6 +82,7 @@ void launchAgentRunV2(WorkerClient& w, JobState& job,
         job.errorIsCad = false;
         job.converged = true; job.stopReason.clear(); job.errorDetail.clear();
         job.isMission = false; job.missionVerdict.clear();
+        job.planReady = false; job.planReadyJson.clear();
         job.createdDocPath.clear();
         job.drawingDocId.clear(); job.drawingName.clear(); job.drawingSourceId.clear();
         job.camDocId.clear();
@@ -197,50 +198,79 @@ void launchAgentRunV2(WorkerClient& w, JobState& job,
                 job.converged = false;
                 job.stopReason = result.value("stop_reason", std::string("provider_error"));
             } else {
-                job.converged = (result.value("status", "") == "done");
+                const std::string status = result.value("status", std::string());
                 std::string sr = result.value("stop_reason", std::string());
-                if (!sr.empty()) job.stopReason = sr;
-                std::string ed = result.value("error_detail", std::string());
-                if (ed.empty()) ed = result.value("error", std::string());
-                if (ed.empty()) ed = result.value("error_human", std::string());
-                if (!ed.empty()) job.errorDetail = ed;
-                // Failed run with detail but no hard error string — still surface it so
-                // the chat card prefers errorDetail over the generic early-stop prose.
-                if (!job.converged && job.error.empty() && !job.errorDetail.empty()) {
-                    job.error = job.errorDetail;
-                    job.errorIsCad = (job.stopReason == "failed" ||
-                                      job.stopReason == "no_code" ||
-                                      job.stopReason == "max_iters" ||
-                                      job.stopReason == "model_failed" ||
-                                      job.stopReason == "decompose_failed");
+                // User-facing gate ONLY for manual Plan / advisor escalate — not agent-decided
+                // plans (those execute after in-core advisor approval and return status done).
+                const bool isPlanReady =
+                    (status == "plan_ready") ||
+                    (sr == "awaiting_plan_approval") ||
+                    (sr == "needs_user_decision") ||
+                    (sr == "plan_only");
+                if (isPlanReady) {
+                    job.planReady = true;
+                    job.converged = true;
+                    if (sr.empty()) sr = "awaiting_plan_approval";
+                    job.stopReason = sr;
+                    nlohmann::json stash = nlohmann::json::object();
+                    if (result.contains("plan")) stash["plan"] = result["plan"];
+                    if (result.contains("tasks")) stash["tasks"] = result["tasks"];
+                    if (result.contains("summary") && result["summary"].is_string())
+                        stash["summary"] = result["summary"];
+                    if (result.contains("execution_style") && result["execution_style"].is_string())
+                        stash["execution_style"] = result["execution_style"];
+                    else if (result.contains("structure") && result["structure"].is_string())
+                        stash["execution_style"] = result["structure"];
+                    std::string reason = result.value("reason", std::string());
+                    if (reason.empty()) reason = result.value("verdict", std::string());
+                    if (reason.empty()) reason = result.value("advisor_reason", std::string());
+                    if (!reason.empty()) stash["reason"] = reason;
+                    if (!stash.empty()) job.planReadyJson = stash.dump();
+                } else {
+                    job.converged = (status == "done");
+                    if (!sr.empty()) job.stopReason = sr;
+                    std::string ed = result.value("error_detail", std::string());
+                    if (ed.empty()) ed = result.value("error", std::string());
+                    if (ed.empty()) ed = result.value("error_human", std::string());
+                    if (!ed.empty()) job.errorDetail = ed;
+                    // Failed run with detail but no hard error string — still surface it so
+                    // the chat card prefers errorDetail over the generic early-stop prose.
+                    if (!job.converged && job.error.empty() && !job.errorDetail.empty()) {
+                        job.error = job.errorDetail;
+                        job.errorIsCad = (job.stopReason == "failed" ||
+                                          job.stopReason == "no_code" ||
+                                          job.stopReason == "max_iters" ||
+                                          job.stopReason == "model_failed" ||
+                                          job.stopReason == "decompose_failed");
+                    }
+                    // WS3 true-assembly: the run created a SEPARATE assembly document saved to its own
+                    // .step+ (it did not mutate the active doc). Carry the absolute path so the GL-thread
+                    // drain opens it as a new tab (via requestOpenPath). Only on a clean assembly.
+                    if (result.value("created_doc", false) && status == "done")
+                        job.createdDocPath = result.value("asm_path", std::string());
+                    // W17: the run answered a drawing request by building a 2D drawing (its own dwg-cpp
+                    // id). The drain adopts it as a Drawing tab; the active part doc was untouched.
+                    if (result.value("created_drawing", false) && status == "done") {
+                        job.drawingDocId = result.value("drawing_doc_id", std::string());
+                        job.drawingName = result.value("drawing_name", std::string());
+                        job.drawingSourceId = result.value("source_doc_id", std::string());
+                    }
+                    // CAM fast-path: the run built a machining job from the current part (its own cam
+                    // doc id). The drain loads it into the Manufacture workspace; the part was untouched.
+                    if (result.value("created_cam", false) && status == "done")
+                        job.camDocId = result.value("cam_doc_id", std::string());
+                    // Part-naming stage: AI-chosen display name for the built part.
+                    {
+                        std::string pn = result.value("part_name", std::string());
+                        if (!pn.empty()) job.partName = std::move(pn);
+                    }
+                    // Final doc revision (0 when the run produced no geometry / never advanced).
+                    // Host autosave gates on this so empty/no_geometry runs never write a file.
+                    if (result.contains("revision") && result["revision"].is_number_integer())
+                        job.finalRevision = result["revision"].get<int>();
+                    else
+                        job.finalRevision = result.value("revision", 0);
                 }
-                // WS3 true-assembly: the run created a SEPARATE assembly document saved to its own
-                // .step+ (it did not mutate the active doc). Carry the absolute path so the GL-thread
-                // drain opens it as a new tab (via requestOpenPath). Only on a clean assembly.
-                if (result.value("created_doc", false) && result.value("status", "") == "done")
-                    job.createdDocPath = result.value("asm_path", std::string());
-                // W17: the run answered a drawing request by building a 2D drawing (its own dwg-cpp
-                // id). The drain adopts it as a Drawing tab; the active part doc was untouched.
-                if (result.value("created_drawing", false) && result.value("status", "") == "done") {
-                    job.drawingDocId = result.value("drawing_doc_id", std::string());
-                    job.drawingName = result.value("drawing_name", std::string());
-                    job.drawingSourceId = result.value("source_doc_id", std::string());
-                }
-                // CAM fast-path: the run built a machining job from the current part (its own cam
-                // doc id). The drain loads it into the Manufacture workspace; the part was untouched.
-                if (result.value("created_cam", false) && result.value("status", "") == "done")
-                    job.camDocId = result.value("cam_doc_id", std::string());
-                // Part-naming stage: AI-chosen display name for the built part.
-                {
-                    std::string pn = result.value("part_name", std::string());
-                    if (!pn.empty()) job.partName = std::move(pn);
-                }
-                // Final doc revision (0 when the run produced no geometry / never advanced).
-                // Host autosave gates on this so empty/no_geometry runs never write a file.
-                if (result.contains("revision") && result["revision"].is_number_integer())
-                    job.finalRevision = result["revision"].get<int>();
-                else
-                    job.finalRevision = result.value("revision", 0);
             }
         }
         job.ready = true;
@@ -270,6 +300,7 @@ void launchAgentDesign(WorkerClient& w, JobState& job,
         job.partName.clear();
         job.finalRevision = 0;
         job.isMission = false; job.missionVerdict.clear();
+        job.planReady = false; job.planReadyJson.clear();
     }
     { std::lock_guard<std::mutex> lk(job.evMtx); job.events.clear(); }
 
@@ -450,6 +481,7 @@ void launchMissionRun(WorkerClient& w, JobState& job,
         job.converged = true; job.stopReason.clear(); job.errorDetail.clear();
         job.createdDocPath.clear();
         job.isMission = true; job.missionVerdict.clear();
+        job.planReady = false; job.planReadyJson.clear();
         job.partName.clear();
         job.finalRevision = 0;
     }
@@ -490,7 +522,31 @@ void launchMissionRun(WorkerClient& w, JobState& job,
                     if (!sr.empty() && job.stopReason.empty()) job.stopReason = sr;
                     if (!ed.empty() && job.errorDetail.empty()) job.errorDetail = ed;
                 }
+            } else if (origKind == "swarm_wave") {
+                int wave = jint(d, "wave");
+                int total = jint(d, "total_waves");
+                char buf[64];
+                if (total > 0) std::snprintf(buf, sizeof(buf), "Wave %d/%d", wave, total);
+                else std::snprintf(buf, sizeof(buf), "Wave %d", wave);
+                e.notes = buf;
+            } else if (origKind == "firm_bids") {
+                e.notes = "Collecting firm bids...";
+            } else if (origKind == "firm_award") {
+                std::string firm = jstr(d, "firm");
+                e.notes = firm.empty() ? "Firm awarded" : ("Awarded " + firm);
+            } else if (origKind == "firm_team") {
+                e.notes = "Assembling firm team...";
+            } else if (origKind == "advisor") {
+                std::string stg = jstr(d, "stage");
+                e.notes = stg.empty() ? "Advisor" : ("Advisor \xc2\xb7 " + stg);
+            } else if (origKind == "sub_run") {
+                std::string purpose = jstr(d, "purpose");
+                std::string stt = jstr(d, "status");
+                if (!purpose.empty() && !stt.empty()) e.notes = purpose + " (" + stt + ")";
+                else if (!purpose.empty()) e.notes = purpose;
+                else e.notes = "Sub-run";
             }
+            // firm_comm: frequent — leave notes empty (card aggregates).
             std::lock_guard<std::mutex> lk(job.evMtx);
             job.events.push_back(std::move(e));
         };
@@ -519,6 +575,8 @@ void launchMissionRun(WorkerClient& w, JobState& job,
         } else {
             // agent_mission_v1 returns {status, stop_reason, doc_id, verdict, tasks, ...}
             // or {ok:false, error} on provider resolution failure.
+            // User-facing plan gate ONLY for awaiting_plan_approval / needs_user_decision /
+            // plan_only / status plan_ready — agent-decided plans advisor-approve in-core.
             const bool preRunFail = result.contains("ok") && result["ok"].is_boolean() &&
                                     !result["ok"].get<bool>();
             if (preRunFail) {
@@ -531,15 +589,47 @@ void launchMissionRun(WorkerClient& w, JobState& job,
                 job.converged = false;
                 job.stopReason = result.value("stop_reason", std::string("provider_error"));
             } else {
-                job.converged = (result.value("status", "") == "done");
+                const std::string status = result.value("status", std::string());
                 std::string sr = result.value("stop_reason", std::string());
-                if (!sr.empty()) job.stopReason = sr;
-                std::string ed = result.value("error_detail", std::string());
-                if (ed.empty()) ed = result.value("error", std::string());
-                if (!ed.empty()) job.errorDetail = ed;
-                job.missionVerdict = result.value("verdict", std::string());
-                if (result.value("created_doc", false))
-                    job.createdDocPath = result.value("asm_path", std::string());
+                const bool isPlanReady =
+                    (status == "plan_ready") ||
+                    (sr == "awaiting_plan_approval") ||
+                    (sr == "needs_user_decision") ||
+                    (sr == "plan_only");
+                if (isPlanReady) {
+                    job.planReady = true;
+                    job.converged = true;  // gate, not a failure
+                    if (sr.empty()) sr = "awaiting_plan_approval";
+                    job.stopReason = sr;
+                    nlohmann::json stash = nlohmann::json::object();
+                    if (result.contains("plan")) stash["plan"] = result["plan"];
+                    if (result.contains("tasks")) stash["tasks"] = result["tasks"];
+                    if (result.contains("summary") && result["summary"].is_string())
+                        stash["summary"] = result["summary"];
+                    if (result.contains("execution_style") && result["execution_style"].is_string())
+                        stash["execution_style"] = result["execution_style"];
+                    else if (result.contains("structure") && result["structure"].is_string())
+                        stash["execution_style"] = result["structure"];
+                    std::string reason = result.value("reason", std::string());
+                    if (reason.empty()) reason = result.value("verdict", std::string());
+                    if (reason.empty()) reason = result.value("advisor_reason", std::string());
+                    if (!reason.empty()) stash["reason"] = reason;
+                    if (!stash.empty()) job.planReadyJson = stash.dump();
+                    // Soft assistant text only; plan section + approve card own the UI.
+                    std::string v = result.value("verdict", std::string());
+                    if (v.empty()) v = result.value("summary", std::string());
+                    if (v.empty()) v = reason;
+                    job.missionVerdict = std::move(v);
+                } else {
+                    job.converged = (status == "done");
+                    if (!sr.empty()) job.stopReason = sr;
+                    std::string ed = result.value("error_detail", std::string());
+                    if (ed.empty()) ed = result.value("error", std::string());
+                    if (!ed.empty()) job.errorDetail = ed;
+                    job.missionVerdict = result.value("verdict", std::string());
+                    if (result.value("created_doc", false))
+                        job.createdDocPath = result.value("asm_path", std::string());
+                }
             }
         }
         job.ready = true;

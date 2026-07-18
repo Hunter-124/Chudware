@@ -44,6 +44,25 @@ TEST_CASE("drawings and assemblies route correctly") {
     CHECK(classify_domain("assemble the gearbox and add mates").domain == Domain::Assembly);
 }
 
+TEST_CASE("sheetmetal enclosure routes to Sheetmetal") {
+    // Battery corpus: sm_* ops domain. Explicit "sheetmetal" wins over Modeling default.
+    CHECK(classify_domain("sheetmetal enclosure 200x120x60mm, 1.5mm steel").domain ==
+          Domain::Sheetmetal);
+    CHECK(classify_domain("a sheet metal bracket with a hem").domain == Domain::Sheetmetal);
+    // tool classes include the sheetmetal family so host can grant sm_* ops.
+    auto t = tool_classes_for_domain(Domain::Sheetmetal);
+    CHECK(has(t, "sheetmetal"));
+    CHECK(has(t, "modeling"));
+    CHECK(has(context_sheets_for_domain(Domain::Sheetmetal), "sheetmetal"));
+}
+
+TEST_CASE("bolt-together multi-part routes to Assembly") {
+    CHECK(classify_domain("two brackets that bolt together with M5 assembly").domain ==
+          Domain::Assembly);
+    CHECK(classify_domain("plates that screw together with M3 hardware").domain ==
+          Domain::Assembly);
+}
+
 TEST_CASE("tool-class scoping is domain-narrow (context economy)") {
     // A modeling task must NOT carry CAM/ECAD tool classes.
     auto m = tool_classes_for_domain(Domain::Modeling);

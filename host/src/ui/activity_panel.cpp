@@ -118,13 +118,78 @@ void ActivityPanel::onEvent(const std::string& kind, const nlohmann::json& data)
             liveRun_.stages[activeStageIdx_].name == stageName) {
             activeStageIdx_ = -1;
         }
-    } else if (kind == "run_finished") {
+    } else if (kind == "run_finished" || kind == "mission_finished") {
         liveRun_.status     = jstr(data, "status");
         liveRun_.stopReason = jstr(data, "stop_reason");
         liveRun_.revision   = jint(data, "revision");
         // clear any still-active stage
         for (auto& sn : liveRun_.stages) sn.active = false;
         activeStageIdx_ = -1;
+    } else if (kind == "swarm_wave") {
+        // Surface as a synthetic stage so the activity tree shows wave headers.
+        int wave = jint(data, "wave");
+        int total = jint(data, "total_waves");
+        char name[64];
+        if (total > 0) std::snprintf(name, sizeof(name), "wave_%d/%d", wave, total);
+        else std::snprintf(name, sizeof(name), "wave_%d", wave > 0 ? wave : 1);
+        StageNode sn;
+        sn.name = name;
+        sn.role = "swarm";
+        sn.active = true;
+        sn.finalVerdict = "running";
+        // One-line task summary into finalReason.
+        std::string reason;
+        if (data.contains("tasks") && data["tasks"].is_array()) {
+            for (const auto& t : data["tasks"]) {
+                if (!t.is_object()) continue;
+                std::string tt = jstr(t, "title");
+                if (tt.empty()) tt = jstr(t, "capability");
+                if (tt.empty()) continue;
+                if (!reason.empty()) reason += " · ";
+                reason += tt;
+            }
+        }
+        sn.finalReason = reason;
+        for (auto& s : liveRun_.stages) s.active = false;
+        liveRun_.stages.push_back(std::move(sn));
+        activeStageIdx_ = (int)liveRun_.stages.size() - 1;
+        if (!hasLiveRun_) { hasLiveRun_ = true; liveRun_.status = "running"; }
+    } else if (kind == "firm_bids" || kind == "firm_award" || kind == "firm_team" ||
+               kind == "firm_comm" || kind == "advisor" || kind == "sub_run") {
+        // Compact stage-ish rows so the side panel isn't silent; chat owns the rich cards.
+        StageNode sn;
+        sn.name = kind;
+        sn.role = (kind.rfind("firm_", 0) == 0) ? "eng_firm"
+                : (kind == "advisor") ? "advisor" : "sub_run";
+        sn.active = false;
+        sn.finalVerdict = "done";
+        if (kind == "firm_award") {
+            std::string firm = jstr(data, "firm");
+            sn.finalReason = firm.empty() ? "awarded" : ("awarded " + firm);
+        } else if (kind == "advisor") {
+            sn.finalReason = jstr(data, "stage");
+            if (sn.finalReason.empty()) sn.finalReason = jstr(data, "question");
+        } else if (kind == "sub_run") {
+            sn.finalReason = jstr(data, "purpose");
+            std::string stt = jstr(data, "status");
+            if (!stt.empty()) sn.finalVerdict = stt;
+        } else if (kind == "firm_bids") {
+            sn.finalReason = jstr(data, "domain");
+        } else if (kind == "firm_team") {
+            int n = 0;
+            if (data.contains("members") && data["members"].is_array())
+                n = (int)data["members"].size();
+            char buf[48];
+            std::snprintf(buf, sizeof(buf), "%d members", n);
+            sn.finalReason = buf;
+        } else if (kind == "firm_comm") {
+            // Don't spam a stage per message — skip if last stage is already firm_comm.
+            if (!liveRun_.stages.empty() && liveRun_.stages.back().name == "firm_comm")
+                return;
+            sn.finalReason = "internal comms";
+        }
+        liveRun_.stages.push_back(std::move(sn));
+        if (!hasLiveRun_) { hasLiveRun_ = true; liveRun_.status = "running"; }
     }
 }
 

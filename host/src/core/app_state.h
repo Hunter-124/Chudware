@@ -362,6 +362,13 @@ struct JobState {
     // instead of the generic design summary; createdDocPath still carries any assembly tab to open.
     bool isMission = false;
     std::string missionVerdict;       // the report/verdict prose to show as the assistant reply
+    // Plan gate: ONLY when the user must decide — stop_reason awaiting_plan_approval
+    // (manual Plan mode) or needs_user_decision (advisor escalate). Agent-decided plans
+    // are advisor-approved in-core and do NOT set this (run continues normally).
+    bool planReady = false;
+    // Optional payload from the plan_ready result: {plan, tasks, summary, execution_style,
+    // reason/verdict, ...} so the drain can seed ChatMsg plan section + card chrome.
+    std::string planReadyJson;
     std::mutex evMtx;
     std::vector<AgentEvent> events;  // streamed agent progress, drained on the main thread
 };
@@ -507,7 +514,7 @@ struct ActivityItem {
     bool expanded = false; // user toggled this row open to read the detail
     bool missionHeader = false;  // a top-level mission TASK row ("Wind-tunnel it"); its sub-run
                                  // stages (intake/model/...) follow it, namespaced by task index
-    // ---- typed transparency rows (M12-M14, aicad.agent_events/2) ----
+    // ---- typed transparency rows (M12-M14, aicad.agent_events/2 + exec-mode cards) ----
     // 0 = orchestrator stage row (everything above, unchanged default);
     // 1 = context injection chip (agent.context_injected): title=label, reason=source,
     //     ctxTokens=token_est (M12);
@@ -515,6 +522,16 @@ struct ActivityItem {
     //     deltas arrive, collapsed-by-default once complete (M13);
     // 3 = tool call row (agent.tool_call): title=tool_name, reason=target ("what it acts on"),
     //     durationMs=latency_ms, status=done|fail from `ok` (M14).
+    // 4–8 = corporate org cards (see legacy_chat feedCorporateEvent).
+    // 9 = provider_call log row (aggregated, not drawn inline).
+    // 10 = routing / classification card.
+    // 11 = swarm_wave header (wave N/M + task titles/status).
+    // 12 = firm_bids card (contractor bids + budget).
+    // 13 = firm_award card (winning firm + bid + reason).
+    // 14 = firm_team roster card.
+    // 15 = firm_comm thread (collapsed-by-default; detail appends lines).
+    // 16 = advisor card (stage chip + question + advice; expanded).
+    // 17 = sub_run compact card (purpose + status).
     int rowKind = 0;
     int ctxTokens = 0;      // rowKind 1: best-effort injected-token estimate (kept out of the
                             // turn's usage footer — it is not model I/O)
@@ -539,11 +556,17 @@ struct ChatMsg {
                                    // namespaces sub-run stage keys so per-task stages don't collide
     std::vector<AgentStep> steps;  // assistant turn: the iteration trace
     ClarifyState clarify;          // pre-flight clarify gate (Agent/Design) — see ClarifyState
-    // Plan-mode approve gate: a plan_only run finished; show Execute as Agent/Swarm / Cancel.
-    // Set when submitTurn launches Plan mode; cleared on execute or cancel.
+    // User-facing plan approve gate: ONLY manual Plan mode (plan_only) or advisor escalate
+    // (stop_reason needs_user_decision). Agent/Edit/Swarm/EngFirm agent-decided plans are
+    // advisor-approved in-core — no card. Cleared on execute / edit-plan / cancel.
     bool planApprovePending = false;
     std::string planApproveRequest;   // original user request to re-launch with approved_plan
     nlohmann::json planApproveExtras = nlohmann::json::object();  // attachments/context_refs
+    // Decided execution style from plan_ready / task_route ("edit"|"agent"|"swarm"|"eng_firm").
+    // Card highlights the matching Execute button as Recommended.
+    std::string planExecutionStyle;
+    // Optional escalate/advisor reason shown on the approve card (needs_user_decision).
+    std::string planApproveReason;
     // Per-message copilot mode stamp (CopilotMode 0..5). -1 = unstamped / no mode border.
     // Set at submitTurn from st.aiInteraction; auto-switch (Ask→Agent) updates the assistant.
     int copilotMode = -1;

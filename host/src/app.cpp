@@ -3109,8 +3109,9 @@ WASM_BOOT_LOG("[wasm-boot] entering main loop\n");
             }
             if (st.agentV2Running) {
                 st.agentV2Running = false;
-                if (!openedNewDoc && !madeDrawing && !madeCam && st.docMirror.hasDoc() &&
-                    st.job.error.empty()) {
+                // plan_ready mutates nothing — skip doc_activate / mesh reload.
+                if (!st.job.planReady && !openedNewDoc && !madeDrawing && !madeCam &&
+                    st.docMirror.hasDoc() && st.job.error.empty()) {
                     // C39: a forced rebuild can take tens of seconds on a heavy doc — the old
                     // sync call froze the window right after the agent finished. Queue async;
                     // the callback (a later frame's drain, GL thread) resyncs and reloads.
@@ -3340,6 +3341,15 @@ WASM_BOOT_LOG("[wasm-boot] entering main loop\n");
                     assistant = "Built it, but couldn't load the mesh: " + e;
                     assistantErr = ERR_SYSTEM;
                 }
+            } else if (wasV2 && st.job.planReady && st.job.error.empty()) {
+                // User-facing plan gate (manual Plan / advisor escalate needs_user_decision).
+                // Agent-decided plans never land here — they execute after in-core advisor OK.
+                const bool escalate = (st.job.stopReason == "needs_user_decision");
+                st.status = escalate ? "Plan needs your decision"
+                                    : "Plan ready — need edits, or start execution?";
+                st.statusKind = 0;
+                if (!st.job.missionVerdict.empty())
+                    assistant = st.job.missionVerdict;
             } else if (wasV2 && st.job.isMission && !st.job.missionVerdict.empty() &&
                        st.job.error.empty()) {
                 // Mission run: the report/verdict prose IS the assistant's reply (it already
@@ -3391,16 +3401,77 @@ WASM_BOOT_LOG("[wasm-boot] entering main loop\n");
                     active->running = false;
                     active->liveStatus.clear();
                     active->errKind = assistantErr;
+                    // User-facing plan gate only (manual Plan / needs_user_decision).
+                    if (st.job.planReady && assistantErr == ERR_NONE) {
+                        active->planApprovePending = true;
+                        if (active->planApproveRequest.empty()) {
+                            for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it) {
+                                if (it->fromUser && !it->text.empty()) {
+                                    active->planApproveRequest = it->text;
+                                    break;
+                                }
+                            }
+                        }
+                        // Seed plan section + execution_style + escalate reason from payload.
+                        if (!st.job.planReadyJson.empty()) {
+                            try {
+                                auto stash = nlohmann::json::parse(st.job.planReadyJson);
+                                if (stash.contains("execution_style") &&
+                                    stash["execution_style"].is_string())
+                                    active->planExecutionStyle =
+                                        stash["execution_style"].get<std::string>();
+                                if (stash.contains("reason") && stash["reason"].is_string())
+                                    active->planApproveReason =
+                                        stash["reason"].get<std::string>();
+                                if (!(active->planState.present || active->plan.present)) {
+                                    nlohmann::json planObj = nlohmann::json::object();
+                                    if (stash.contains("plan") && stash["plan"].is_object())
+                                        planObj = stash["plan"];
+                                    else if (stash.contains("plan") && stash["plan"].is_string()) {
+                                        if (assistant.empty())
+                                            assistant = stash["plan"].get<std::string>();
+                                    }
+                                    if (!planObj.empty()) {
+                                        if (planObj.contains("shape") || planObj.contains("items"))
+                                            feedTurnActivity(*active, "plan_state", planObj);
+                                        else
+                                            feedTurnActivity(*active, "plan", planObj);
+                                    }
+                                    if (!(active->planState.present || active->plan.present) &&
+                                        stash.contains("tasks") && stash["tasks"].is_array()) {
+                                        nlohmann::json ms = nlohmann::json::object();
+                                        ms["request"] = active->planApproveRequest;
+                                        ms["tasks"] = stash["tasks"];
+                                        feedTurnActivity(*active, "mission_started", ms);
+                                    }
+                                }
+                            } catch (...) {}
+                        }
+                        if (active->planExecutionStyle.empty() &&
+                            !st.job.stopReason.empty()) {
+                            // Soft default: manual Plan mode often resumes as agent.
+                            if (st.job.stopReason == "plan_only" ||
+                                st.job.stopReason == "awaiting_plan_approval")
+                                active->planExecutionStyle = "agent";
+                        }
+                    } else if (!st.job.planReady && active->planApprovePending) {
+                        // Run finished without a user gate — drop any leftover draft flag
+                        // (e.g. Plan mode that failed before plan_ready).
+                        active->planApprovePending = false;
+                        active->planExecutionStyle.clear();
+                        active->planApproveReason.clear();
+                    }
                     // Replace (never append) so a streamed waterfall isn't duplicated.
                     // Prefer authoritative final text when present; keep streamed text if
                     // the job produced no summary (non-v2 / empty assistant).
+                    // On plan_ready: never dump raw JSON; only soft summary / existing stream.
                     if (!assistant.empty()) {
                         // If stream already equals or contains the final prose, still
                         // replace with the authoritative final so partial streams finalize cleanly.
                         active->text = assistant;
                     }
                     // else: leave active->text as-is (streamed deltas or empty)
-                } else if (!assistant.empty()) {
+                } else if (!assistant.empty() && !st.job.planReady) {
                     ChatMsg m; m.text = assistant; m.errKind = assistantErr;
                     st.chat.push_back(m);
                 }

@@ -720,6 +720,11 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
     state.revision = tree0.value("revision", 0);
     state.complexity = cx.level;
     state.complexity_set = true;
+    state.domain = dom.domain;
+    state.domain_set = true;
+    // Pre-seed domain cheatsheet classes so Sheetmetal (etc.) starts with sm_* ops
+    // without burning a modeler turn on request_tools(["sheetmetal"]).
+    if (dom.domain == Domain::Sheetmetal) state.tool_scope_classes.insert("sheetmetal");
     // Per-part notes (ai_notes) persisted in the .step+ by a prior session's memory stage:
     // load them so intake understands an EXISTING part on a follow-up run ("come back to the
     // part"). Empty object for a fresh doc or a doc that never earned notes (Solo one-offs).
@@ -755,43 +760,47 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
             ss << " Selection: " << scope["selection"].dump() << ".";
         edit_scope_directive = ss.str();
     }
-
+    // outer_run_started: assembly probe (or other outer orchestrator) already emitted
+    // run_started + classification events — do not double-emit for the UI.
+    const bool outer_run_started = options.value("outer_run_started", false);
     json stages = solo_skip_plan
                       ? json::array({"intake", "model", "review", "fix", "memory"})
                       : json::array({"intake", "plan", "model", "review", "fix", "memory"});
-    events.emit("run_started",
-                json{{"request", request}, {"doc_id", state.doc_id}, {"stages", stages}});
-    // Pre-flight classification (GUI "Routing" card). Surfaced ONCE at entry, before any
-    // provider call, so the user sees how the request was deterministically classified +
-    // routed. Mirrors aicad.router/1 / the Python agent.classification producer so the
-    // host renders the same card for the C++ live path (previously only complexity/
-    // task_route were emitted, which the GUI does not draw as a routing card).
-    events.emit("agent.classification",
-                json{{"task_class", dom.label()},
-                     {"scaffold_level", cx.label()},
-                     {"tier", provider_cfg.value("model", std::string())},
-                     {"reason", dom.reason.empty() ? cx.reason : dom.reason},
-                     {"request_snippet", request.substr(0, 120)},
-                     {"picked_model", provider_cfg.value("model", std::string())},
-                     {"picked_provider", provider_cfg.value("name", std::string())}});
-    // Complexity routing decision (GUI shows which structure was chosen + why).
-    events.emit("complexity", json{{"level", cx.label()},
-                                   {"reason", cx.reason},
-                                   {"skip_plan", solo_skip_plan}});
-    // Task-domain routing: the scoped tool classes + on-topic context for this
-    // request's domain, so the host can narrow the toolset (modeling task ->
-    // modeling/sketch/sourcing, not CAM/ECAD/sim) instead of loading everything.
-    {
-        json tclasses = json::array();
-        for (const auto& t : tool_classes_for_domain(dom.domain)) tclasses.push_back(t);
-        json sheets = json::array();
-        for (const auto& s : context_sheets_for_domain(dom.domain)) sheets.push_back(s);
-        events.emit("task_route", json{{"domain", dom.label()},
-                                       {"reason", dom.reason},
-                                       {"tool_classes", tclasses},
-                                       {"context_sheets", sheets},
-                                       {"complexity", cx.label()},
-                                       {"structure", solo_skip_plan ? "solo" : "planned"}});
+    if (!outer_run_started) {
+        events.emit("run_started",
+                    json{{"request", request}, {"doc_id", state.doc_id}, {"stages", stages}});
+        // Pre-flight classification (GUI "Routing" card). Surfaced ONCE at entry, before any
+        // provider call, so the user sees how the request was deterministically classified +
+        // routed. Mirrors aicad.router/1 / the Python agent.classification producer so the
+        // host renders the same card for the C++ live path (previously only complexity/
+        // task_route were emitted, which the GUI does not draw as a routing card).
+        events.emit("agent.classification",
+                    json{{"task_class", dom.label()},
+                         {"scaffold_level", cx.label()},
+                         {"tier", provider_cfg.value("model", std::string())},
+                         {"reason", dom.reason.empty() ? cx.reason : dom.reason},
+                         {"request_snippet", request.substr(0, 120)},
+                         {"picked_model", provider_cfg.value("model", std::string())},
+                         {"picked_provider", provider_cfg.value("name", std::string())}});
+        // Complexity routing decision (GUI shows which structure was chosen + why).
+        events.emit("complexity", json{{"level", cx.label()},
+                                       {"reason", cx.reason},
+                                       {"skip_plan", solo_skip_plan}});
+        // Task-domain routing: the scoped tool classes + on-topic context for this
+        // request's domain, so the host can narrow the toolset (modeling task ->
+        // modeling/sketch/sourcing, not CAM/ECAD/sim) instead of loading everything.
+        {
+            json tclasses = json::array();
+            for (const auto& t : tool_classes_for_domain(dom.domain)) tclasses.push_back(t);
+            json sheets = json::array();
+            for (const auto& s : context_sheets_for_domain(dom.domain)) sheets.push_back(s);
+            events.emit("task_route", json{{"domain", dom.label()},
+                                           {"reason", dom.reason},
+                                           {"tool_classes", tclasses},
+                                           {"context_sheets", sheets},
+                                           {"complexity", cx.label()},
+                                           {"structure", solo_skip_plan ? "solo" : "planned"}});
+        }
     }
 
     // ----------------------------------------------------------------- actions
@@ -836,6 +845,9 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
     };
 
     // ---- INTAKE ----
+    // Reject protocol: model replies {"reject":true,"reason":"..."} for non-CAD /
+    // unintelligible requests. Also belt-and-suspenders: empty/whitespace object
+    // (or empty features+dims with blank object) after a "successful" parse is a reject.
     actions.intake = [&](DesignState& st, int) -> StageOutcome {
         AgentCall ac = agent_call(provider, st, "intake", prompts_dir, call_budget, vision, ctx_cap);
         ojson spec = extract_json_obj(ac.reply);
@@ -852,7 +864,39 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
             o.error = "intake: " + ac.call_error;
             return o;
         }
-        if (!spec.is_null()) {
+        auto reject_out = [&](const std::string& reason) -> StageOutcome {
+            o.verdict = "fail";
+            o.reason = reason;
+            o.parsed_ok = true;
+            o.has_error = true;
+            o.error = "unintelligible_request";
+            return o;
+        };
+        if (!spec.is_null() && spec.is_object()) {
+            // Explicit reject signal from the intake prompt protocol.
+            if (spec.contains("reject") && truthy_json(spec["reject"])) {
+                std::string reason = "request is not a CAD design request";
+                if (spec.contains("reason") && spec["reason"].is_string() &&
+                    !spec["reason"].get<std::string>().empty())
+                    reason = spec["reason"].get<std::string>();
+                return reject_out(reason);
+            }
+            // Deterministic empty-normalized-request belt (model may "pass" with blanks).
+            auto strip_ws = [](std::string s) {
+                size_t a = s.find_first_not_of(" \t\r\n\f\v");
+                if (a == std::string::npos) return std::string();
+                size_t b = s.find_last_not_of(" \t\r\n\f\v");
+                return s.substr(a, b - a + 1);
+            };
+            std::string object;
+            if (spec.contains("object") && spec["object"].is_string())
+                object = strip_ws(spec["object"].get<std::string>());
+            bool has_dims = spec.contains("key_dims") && spec["key_dims"].is_object() &&
+                            !spec["key_dims"].empty();
+            bool has_feats = spec.contains("features") && spec["features"].is_array() &&
+                             !spec["features"].empty();
+            if (object.empty() && !has_dims && !has_feats)
+                return reject_out("normalized request is empty");
             st.spec = spec;
             o.verdict = "pass";
             o.reason = "spec parsed";
@@ -1517,8 +1561,9 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
     // approved_plan clears plan_only above so resume falls through to full run_machine.
     if (plan_only) {
         auto run_one_stage = [&](const std::string& stage, const Action& action,
-                                 const std::string& role, int budget) -> std::string {
-            std::string last_v = "fail";
+                                 const std::string& role, int budget) -> StageOutcome {
+            StageOutcome last;
+            last.verdict = "fail";
             for (int attempt = 1; attempt <= budget; ++attempt) {
                 state.ledger.bump(stage);
                 events.emit("stage_started",
@@ -1526,22 +1571,40 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
                                  {"role", role},
                                  {"attempt", attempt},
                                  {"budget", budget}});
-                StageOutcome outcome = action(state, attempt);
+                last = action(state, attempt);
                 events.emit("stage_result", json{{"stage", stage},
                                                  {"attempt", attempt},
-                                                 {"verdict", outcome.verdict},
-                                                 {"reason", outcome.reason}});
-                last_v = outcome.verdict;
-                if (last_v == "pass" || last_v == "skip" || last_v == "fail") return last_v;
+                                                 {"verdict", last.verdict},
+                                                 {"reason", last.reason}});
+                if (last.verdict == "pass" || last.verdict == "skip" || last.verdict == "fail")
+                    return last;
                 // retry
             }
-            return last_v;
+            return last;
         };
         json budgets = options.value("budgets", json::object());
         int intake_b = budgets.value("intake", 2);
         int plan_b = budgets.value("plan", 2);
-        (void)run_one_stage("intake", actions.intake, "intake", intake_b);  // non-fatal
-        std::string plan_v = run_one_stage("plan", actions.plan, "planner", plan_b);
+        StageOutcome intake_o = run_one_stage("intake", actions.intake, "intake", intake_b);
+        if (intake_o.verdict == "fail" && intake_o.has_error &&
+            intake_o.error == "unintelligible_request") {
+            const std::string detail =
+                intake_o.reason.empty() ? "request is not a CAD design request" : intake_o.reason;
+            events.emit("run_finished",
+                        json{{"status", "failed"},
+                             {"stop_reason", "unintelligible_request"},
+                             {"error_detail", detail},
+                             {"revision", state.revision}});
+            return json{{"run_id", run_id},
+                       {"status", "failed"},
+                       {"stop_reason", "unintelligible_request"},
+                       {"error_detail", detail},
+                       {"error_human", detail},
+                       {"revision", state.revision},
+                       {"doc_id", state.doc_id}};
+        }
+        std::string plan_v =
+            run_one_stage("plan", actions.plan, "planner", plan_b).verdict;
 
         json plan_j = nullptr;
         if (!state.plan.is_null() && state.plan.is_object()) plan_j = state.plan;
@@ -1588,8 +1651,23 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         (void)t_run0;
         return out;
     }
+    // Per-stage budgets: caller options override; else complexity-derived defaults.
+    // Solo: plan=0 (machine omits the stage entirely), fix=2.
+    // Standard: fix=4. Complex: fix=6. Intake/model/review/memory keep kDefaultBudgets.
+    json budgets = options.value("budgets", json::object());
+    if (!budgets.is_object()) budgets = json::object();
+    auto ensure_budget = [&](const char* key, int def) {
+        if (!budgets.contains(key) ||
+            !(budgets[key].is_number_integer() || budgets[key].is_number_unsigned()))
+            budgets[key] = def;
+    };
+    if (solo_skip_plan) ensure_budget("plan", 0);  // omit plan stage (no stub LLM call)
+    int fix_default = 4;
+    if (cx.level == Complexity::Solo) fix_default = 2;
+    else if (cx.level == Complexity::Complex) fix_default = 6;
+    ensure_budget("fix", fix_default);
 
-    json result = run_machine(state, actions, events, options.value("budgets", json::object()));
+    json result = run_machine(state, actions, events, budgets);
 
     // revision = session.revision (re-read live; matches run.py getattr(session,"revision")).
     json tree_now = doc::doc_tree(doc_id);
@@ -1675,8 +1753,58 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
             return run_design(request, doc_id, provider_cfg, emit, options);
     }
 
-    // 1) Plan the request to learn the parts + whether it's an assembly. One intake + one planner
-    //    call (cheap relative to a full build); the per-part run_design re-plans its own part.
+    // Free classify first — skip the expensive intake+planner probe when the
+    // request is confidently single-part (not assembly-plausible). Err toward
+    // probing when unsure (Complex, Domain::Assembly, or multi-part cues).
+    ComplexityVerdict cx = classify_complexity(request);
+    DomainVerdict dom = classify_domain(request);
+    if (options.contains("complexity") && options["complexity"].is_string()) {
+        const std::string forced = options["complexity"].get<std::string>();
+        if (forced == "solo") cx = {Complexity::Solo, "forced by options"};
+        else if (forced == "standard") cx = {Complexity::Standard, "forced by options"};
+        else if (forced == "complex") cx = {Complexity::Complex, "forced by options"};
+    }
+    const bool assembly_plausible =
+        cx.level == Complexity::Complex || dom.domain == Domain::Assembly;
+    if (!assembly_plausible) {
+        // Confident single-part (Solo/Standard + non-Assembly domain): no probe.
+        return run_design(request, doc_id, provider_cfg, emit, options);
+    }
+
+    // Probe path: emit routing events BEFORE the two LLM calls so the UI is not
+    // silent for ~20s. Classification is free (already computed above).
+    RunEvents events(run_id, emit);
+    events.emit("run_started",
+                json{{"request", request},
+                     {"doc_id", doc_id},
+                     {"stages", json::array({"intake", "plan", "model", "review", "fix", "memory"})},
+                     {"assembly_probe", true}});
+    events.emit("agent.classification",
+                json{{"task_class", dom.label()},
+                     {"scaffold_level", cx.label()},
+                     {"tier", provider_cfg.value("model", std::string())},
+                     {"reason", dom.reason.empty() ? cx.reason : dom.reason},
+                     {"request_snippet", request.substr(0, 120)},
+                     {"picked_model", provider_cfg.value("model", std::string())},
+                     {"picked_provider", provider_cfg.value("name", std::string())}});
+    events.emit("complexity", json{{"level", cx.label()},
+                                   {"reason", cx.reason},
+                                   {"skip_plan", false},
+                                   {"assembly_probe", true}});
+    {
+        json tclasses = json::array();
+        for (const auto& t : tool_classes_for_domain(dom.domain)) tclasses.push_back(t);
+        json sheets = json::array();
+        for (const auto& s : context_sheets_for_domain(dom.domain)) sheets.push_back(s);
+        events.emit("task_route", json{{"domain", dom.label()},
+                                       {"reason", dom.reason},
+                                       {"tool_classes", tclasses},
+                                       {"context_sheets", sheets},
+                                       {"complexity", cx.label()},
+                                       {"structure", "assembly_probe"}});
+    }
+
+    // 1) Probe: intake + planner to learn parts + whether it's an assembly.
     ProviderFn provider = make_provider(provider_cfg);
     const CallBudget cb = fit_call_budget(provider_cfg, call_budget_for(provider_cfg));
     const int budget = cb.output;
@@ -1684,28 +1812,82 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
     DesignState pstate;
     pstate.request = request;
     pstate.doc_id = doc_id;
+    pstate.complexity = cx.level;
+    pstate.complexity_set = true;
+    pstate.domain = dom.domain;
+    pstate.domain_set = true;
+    if (dom.domain == Domain::Sheetmetal) pstate.tool_scope_classes.insert("sheetmetal");
+
+    events.emit("stage_started",
+                json{{"stage", "intake"}, {"role", "intake"}, {"attempt", 1}, {"budget", 1},
+                     {"probe", true}});
     {
         AgentCall ia = agent_call(provider, pstate, "intake", prompts_dir, budget, false, ctx_cap);
         ojson spec = extract_json_obj(ia.reply);
+        // BUG-A reject: abort before planner / run_design.
+        if (!spec.is_null() && spec.is_object() && spec.contains("reject") &&
+            truthy_json(spec["reject"])) {
+            std::string reason = "request is not a CAD design request";
+            if (spec.contains("reason") && spec["reason"].is_string() &&
+                !spec["reason"].get<std::string>().empty())
+                reason = spec["reason"].get<std::string>();
+            events.emit("stage_result",
+                        json{{"stage", "intake"},
+                             {"attempt", 1},
+                             {"verdict", "fail"},
+                             {"reason", reason},
+                             {"stop_reason", "unintelligible_request"}});
+            events.emit("run_finished",
+                        json{{"status", "failed"},
+                             {"stop_reason", "unintelligible_request"},
+                             {"error_detail", reason},
+                             {"revision", 0}});
+            return json{{"run_id", run_id},
+                       {"status", "failed"},
+                       {"stop_reason", "unintelligible_request"},
+                       {"error_detail", reason},
+                       {"error_human", reason},
+                       {"revision", 0},
+                       {"doc_id", doc_id}};
+        }
         if (!spec.is_null()) pstate.spec = spec;
+        events.emit("stage_result",
+                    json{{"stage", "intake"},
+                         {"attempt", 1},
+                         {"verdict", "pass"},
+                         {"reason", "probe intake"}});
     }
+    events.emit("stage_started",
+                json{{"stage", "plan"}, {"role", "planner"}, {"attempt", 1}, {"budget", 1},
+                     {"probe", true}});
     AgentCall pa = agent_call(provider, pstate, "planner", prompts_dir, budget, false, ctx_cap);
     ojson plan = extract_json_obj(pa.reply);
+    events.emit("stage_result",
+                json{{"stage", "plan"},
+                     {"attempt", 1},
+                     {"verdict", (!plan.is_null() && plan.is_object()) ? "pass" : "fail"},
+                     {"reason", "probe plan"}});
     bool want_asm = !plan.is_null() && plan.is_object() && truthy_json(plan.value("assembly", ojson(false)));
     ojson parts = (!plan.is_null() && plan.is_object() && plan.contains("parts") &&
                    plan["parts"].is_array())
                       ? plan["parts"]
                       : ojson::array();
 
-    // Not an assembly (or <2 parts): the existing single-doc multibody path is correct.
-    if (!want_asm || parts.size() < 2)
-        return run_design(request, doc_id, provider_cfg, emit, options);
+    // Not an assembly (or <2 parts): single-doc path. Flag outer_run_started so
+    // run_design does not re-emit run_started/classification (already sent above).
+    if (!want_asm || parts.size() < 2) {
+        json inner = options.is_object() ? options : json::object();
+        inner["outer_run_started"] = true;
+        if (!inner.contains("run_id") || !inner["run_id"].is_string() ||
+            inner["run_id"].get<std::string>().empty())
+            inner["run_id"] = run_id;
+        return run_design(request, doc_id, provider_cfg, emit, inner);
+    }
 
-    RunEvents events(run_id, emit);
-    events.emit("run_started", json{{"request", request},
-                                    {"doc_id", doc_id},
-                                    {"assembly", true},
-                                    {"part_count", static_cast<int>(parts.size())}});
+    // True multi-part assembly — extend the already-emitted run with assembly meta.
+    events.emit("run_note", json{{"note", "assembly confirmed"},
+                                {"assembly", true},
+                                {"part_count", static_cast<int>(parts.size())}});
 
     // 2) Build each part in its OWN child doc (full run_design), then save it to a .step+ file.
     struct SavedPart { std::string path, name; double pos[3]; double rot[3]; };

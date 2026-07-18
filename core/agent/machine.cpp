@@ -3,6 +3,8 @@
 
 #include "agent/providers.h"
 
+#include <algorithm>
+
 #include <vector>
 
 namespace aicad {
@@ -195,6 +197,8 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
     bool last_was_provider_error = false;
     bool last_was_parse_error = false;
     bool last_was_free_retry = false;
+    // Intake explicit reject (verdict=fail + error=unintelligible_request).
+    bool last_was_unintelligible = false;
     // Run-level provider error (MODEL stage terminal) — returned as stop_reason.
     std::string run_provider_error;
 
@@ -224,6 +228,7 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
             last_fail_reason = "global iteration cap reached";
             last_was_provider_error = false;
             last_was_parse_error = false;
+            last_was_unintelligible = false;
             events.emit("stage_result", json{{"stage", stage},
                                              {"attempt", attempt},
                                              {"verdict", "fail"},
@@ -236,6 +241,8 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
         global_calls += 1;
         StageOutcome outcome = action(state, attempt);
         emit_call_events(events, stage, role, attempt, outcome);
+        last_was_unintelligible =
+            outcome.has_error && outcome.error == "unintelligible_request";
 
         if (outcome.has_error && !outcome.free_retry) {
             int streak = state.ledger.note_sig(stage, err_sig(outcome.error));
@@ -313,6 +320,8 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
     };
 
     // ---- run a bounded stage to a terminal verdict ----
+    // budget <= 0 means the stage is omitted entirely (no stage_started, no Action call).
+    // Used for solo_skip_plan (budgets.plan=0) so the planner is never invoked.
     auto run_stage = [&](const std::string& stage, const Action& action,
                          const std::string& role) -> std::string {
         int budget = budget_of(stage);
@@ -320,6 +329,8 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
         last_was_provider_error = false;
         last_was_parse_error = false;
         last_was_free_retry = false;
+        last_was_unintelligible = false;
+        if (budget <= 0) return "skip";
         int free_retries = 0;
         constexpr int kMaxFreeRetries = 4;  // full_ops + 3 domain classes
         for (int attempt = 1; attempt <= budget; ++attempt) {
@@ -382,12 +393,23 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
     {
         std::string v = run_stage("intake", actions.intake, "intake");
         if (v == "cancelled") return cancel_result();
-        // intake failure non-fatal.
+        // Explicit reject (unintelligible / non-CAD / empty normalized request): terminal.
+        // Other intake failures (parse/provider → retry → exhaust) stay non-fatal.
+        if (v == "fail" && last_was_unintelligible) {
+            const std::string detail =
+                last_fail_reason.empty() ? "request is not a CAD design request" : last_fail_reason;
+            return json{{"status", "failed"},
+                       {"stop_reason", "unintelligible_request"},
+                       {"error_detail", detail},
+                       {"error_human", detail}};
+        }
+        // Other intake failure non-fatal.
     }
 
     // ---- PLAN ----
+    // budgets.plan <= 0 (solo_skip_plan) omits the stage entirely — no LLM, no stub call.
     if (cancelled()) return cancel_result();
-    {
+    if (budget_of("plan") > 0) {
         std::string plan_v = run_stage("plan", actions.plan, "planner");
         if (plan_v == "cancelled") return cancel_result();
         if (plan_v == "provider_error") {
@@ -419,31 +441,101 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
         }
     }
 
+    // ---- Stage checklist (todo list) ----
+    // Everything except Ask shows a live checklist. Solo (plan budget 0) has no
+    // planner LLM — emit a DETERMINISTIC stage-namespaced checklist from the
+    // request. Ids use "model:" / "review:" / "fix:" / "memory:" prefixes so
+    // they never collide with mission:/firm: items the host upserts by id.
+    const bool plan_skipped = budget_of("plan") <= 0;
+    int stage_check_rev = 0;
+    std::string model_status = "pending";
+    std::string review_status = "pending";
+    std::string fix_status = "pending";
+    std::string memory_status = "pending";
+    bool fix_was_used = false;
+
+    auto stage_summary = [&]() -> std::string {
+        std::string s = state.request;
+        // Collapse whitespace; cap for the tile title helper.
+        std::string out;
+        bool prev_ws = false;
+        for (char c : s) {
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+                if (!prev_ws && !out.empty()) {
+                    out.push_back(' ');
+                    prev_ws = true;
+                }
+            } else {
+                out.push_back(c);
+                prev_ws = false;
+            }
+        }
+        while (!out.empty() && out.back() == ' ') out.pop_back();
+        if (out.size() > 80) out = out.substr(0, 77) + "...";
+        return out.empty() ? std::string("build part") : out;
+    };
+
+    auto emit_stage_checklist = [&]() {
+        ++stage_check_rev;
+        json items = json::array();
+        const std::string sum = stage_summary();
+        items.push_back(json{{"id", "model:"},
+                             {"title", plan_item_title("model: " + sum)},
+                             {"desc", "model: " + sum},
+                             {"status", model_status},
+                             {"kind", "step"}});
+        items.push_back(json{{"id", "review:"},
+                             {"title", plan_item_title("review")},
+                             {"desc", "review"},
+                             {"status", review_status},
+                             {"kind", "step"}});
+        if (fix_was_used || fix_status == "running" || fix_status == "done" ||
+            fix_status == "fail") {
+            items.push_back(json{{"id", "fix:"},
+                                 {"title", plan_item_title("fix")},
+                                 {"desc", "fix"},
+                                 {"status", fix_status},
+                                 {"kind", "step"}});
+        }
+        items.push_back(json{{"id", "memory:"},
+                             {"title", plan_item_title("memory")},
+                             {"desc", "name part"},
+                             {"status", memory_status},
+                             {"kind", "step"}});
+        emit_plan_state(events, "checklist", plan_skipped ? "Build" : "Stages", sum,
+                        stage_check_rev, items);
+    };
+
+    // Solo / no-plan: surface the stage checklist immediately so the UI has a todo list.
+    if (plan_skipped) emit_stage_checklist();
+
     // ---- MODEL (loop per plan step) ----
     std::vector<std::string> steps = actions.plan_steps(state);
     if (steps.empty()) steps.push_back("");
     // Surface the ordered task list so the UI can show a live build checklist (long-horizon
     // planning). Unknown event kinds are ignored by consumers, so this is forward-compatible.
     // Also emit plan_state shape=checklist (additive; keep raw plan_steps).
-    // Skip plan_state when the only step is blank (no-plan / default empty step) so off/no-plan
-    // runs stay free of an empty Plan card; raw plan_steps still fires for back-compat.
+    // When plan ran and steps have content, emit the model-step checklist (ids model:N).
+    // Solo uses the stage checklist above instead of a blank-step card.
     auto steps_have_content = [&]() {
         for (const auto& s : steps)
             if (!s.empty()) return true;
         return false;
     };
-    const bool emit_checklist = steps_have_content();
+    const bool emit_model_steps = !plan_skipped && steps_have_content();
     {
         json task_arr = json::array();
         for (const std::string& s : steps) task_arr.push_back(s);
         events.emit("plan_steps", json{{"steps", task_arr}, {"total", (int)steps.size()}});
-        if (emit_checklist)
+        if (emit_model_steps)
             emit_plan_state(events, "checklist", "Model steps", /*summary=*/"", /*revision=*/1,
                             plan_state_items_from_steps(steps, /*running_index=*/-1));
     }
     int checklist_rev = 1;
     int stagnant = 0;
     int step_index = 0;
+    model_status = "running";
+    if (plan_skipped) emit_stage_checklist();
     for (const std::string& step : steps) {
         if (cancelled()) return cancel_result();
         if (over_global_cap()) return json{{"status", "failed"}, {"stop_reason", "max_iters"}};
@@ -452,7 +544,7 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
                                        {"total", (int)steps.size()},
                                        {"step", step}});
         // Live checklist: prior steps done, current running.
-        if (emit_checklist) {
+        if (emit_model_steps) {
             ++checklist_rev;
             emit_plan_state(events, "checklist", "Model steps", "", checklist_rev,
                             plan_state_items_from_steps(steps, step_index));
@@ -460,7 +552,9 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
         std::string v = run_stage("model", actions.model, "modeler");
         if (v == "cancelled") return cancel_result();
         if (v == "provider_error") {
-            if (emit_checklist) {
+            model_status = "fail";
+            if (plan_skipped) emit_stage_checklist();
+            if (emit_model_steps) {
                 ++checklist_rev;
                 emit_plan_state(events, "checklist", "Model steps", "", checklist_rev,
                                 plan_state_items_from_steps(steps, /*running_index=*/-1,
@@ -474,7 +568,9 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
                        {"error_human", humanize_provider_error(detail)}};
         }
         if (v == "fail") {
-            if (emit_checklist) {
+            model_status = "fail";
+            if (plan_skipped) emit_stage_checklist();
+            if (emit_model_steps) {
                 ++checklist_rev;
                 emit_plan_state(events, "checklist", "Model steps", "", checklist_rev,
                                 plan_state_items_from_steps(steps, /*running_index=*/-1,
@@ -498,7 +594,7 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
         }
     }
     // Mark remaining checklist complete after a successful model loop (or early stagnation break).
-    if (emit_checklist && !steps.empty()) {
+    if (emit_model_steps && !steps.empty()) {
         ++checklist_rev;
         // step_index == count of successfully completed steps (incremented after pass).
         if (step_index >= static_cast<int>(steps.size())) {
@@ -512,7 +608,7 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
                 const std::string& s = steps[i];
                 const char* st =
                     (static_cast<int>(i) < step_index) ? "done" : "abandoned";
-                items.push_back(json{{"id", "step-" + std::to_string(i)},
+                items.push_back(json{{"id", "model:" + std::to_string(i)},
                                      {"title", plan_item_title(s)},
                                      {"desc", s},
                                      {"status", st},
@@ -521,21 +617,80 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
             emit_plan_state(events, "checklist", "Model steps", "", checklist_rev, items);
         }
     }
+    model_status = (step_index > 0) ? "done" : "fail";
+    if (plan_skipped) emit_stage_checklist();
     state.current_step = "";
 
     // ---- REVIEW -> FIX loop ----
-    int review_budget = budget_of("review");
-    for (int review_round = 1; review_round <= review_budget; ++review_round) {
-        if (cancelled()) return cancel_result();
-        if (over_global_cap()) break;
-        std::string v =
-            run_attempt("review", actions.review, "reviewer", review_round, review_budget);
-        if (v == "cancelled") return cancel_result();
-        if (v == "pass" || v == "skip" || v == "fail" || v == "provider_error") break;
-        // v == "retry": run FIX, then re-review.
-        std::string fix_v = run_stage("fix", actions.fix, "fixer");
-        if (fix_v == "cancelled") return cancel_result();
-        if (fix_v == "provider_error" || fix_v == "fail") break;
+    // Review early-exits on pass/skip/fail/provider_error (zero fix calls when first review
+    // passes). Fix budget is a RUN-LEVEL cap on fixer Action invocations (not merely
+    // per-stage retries), so Solo/Standard/Complex defaults actually bound the loop.
+    // Each review "retry" drains fix attempts until fix passes or the cap is hit, then
+    // re-reviews when a fix landed.
+    {
+        const int fix_limit = std::max(0, budget_of("fix"));
+        int fix_calls = 0;
+        int review_round = 0;
+        // Display budget for review events: enough room to re-check after each fix.
+        const int review_display_budget = fix_limit + 1;
+        review_status = "running";
+        if (plan_skipped) emit_stage_checklist();
+        while (true) {
+            if (cancelled()) return cancel_result();
+            if (over_global_cap()) break;
+            ++review_round;
+            std::string v = run_attempt("review", actions.review, "reviewer", review_round,
+                                       review_display_budget);
+            if (v == "cancelled") return cancel_result();
+            if (v == "pass" || v == "skip") {
+                review_status = "done";
+                break;
+            }
+            if (v == "fail" || v == "provider_error") {
+                review_status = "fail";
+                break;
+            }
+            // v == "retry": burn fix attempts until pass or the run-level fix cap.
+            if (fix_calls >= fix_limit) {
+                review_status = "fail";
+                break;
+            }
+            bool fix_passed = false;
+            bool fix_terminal_fail = false;
+            fix_was_used = true;
+            fix_status = "running";
+            if (plan_skipped) emit_stage_checklist();
+            while (fix_calls < fix_limit) {
+                ++fix_calls;
+                std::string fix_v =
+                    run_attempt("fix", actions.fix, "fixer", fix_calls, fix_limit);
+                if (fix_v == "cancelled") return cancel_result();
+                if (fix_v == "provider_error" || fix_v == "fail") {
+                    fix_terminal_fail = true;
+                    fix_status = "fail";
+                    break;
+                }
+                if (fix_v == "pass" || fix_v == "skip") {
+                    fix_passed = true;
+                    fix_status = "done";
+                    break;
+                }
+                // fix_v == "retry": consume another fix slot if any remain.
+            }
+            if (plan_skipped) emit_stage_checklist();
+            if (fix_terminal_fail) {
+                review_status = "fail";
+                break;
+            }
+            if (!fix_passed) {
+                review_status = "fail";
+                break;  // cap hit with no successful fix
+            }
+            // Successful fix → loop and re-review.
+            review_status = "running";
+            if (plan_skipped) emit_stage_checklist();
+        }
+        if (plan_skipped) emit_stage_checklist();
     }
 
     // ---- MEMORY (part naming) ----
@@ -549,6 +704,8 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
         if (!rev_advanced && !has_features) {
             const std::string msg =
                 "model produced no valid geometry — nothing was built";
+            memory_status = "fail";
+            if (plan_skipped) emit_stage_checklist();
             events.emit("stage_result",
                         json{{"stage", "memory"},
                              {"attempt", 0},
@@ -563,7 +720,13 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
                        {"error_human", msg}};
         }
     }
-    if (!cancelled()) run_stage("memory", actions.memory, "memory");
+    if (!cancelled()) {
+        memory_status = "running";
+        if (plan_skipped) emit_stage_checklist();
+        std::string mv = run_stage("memory", actions.memory, "memory");
+        memory_status = (mv == "pass" || mv == "skip") ? "done" : "fail";
+        if (plan_skipped) emit_stage_checklist();
+    }
 
     if (cancelled()) return cancel_result();
     return json{{"status", "done"}, {"stop_reason", "completed"}};

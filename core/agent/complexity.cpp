@@ -97,6 +97,7 @@ ComplexityVerdict classify_complexity(const std::string& request) {
     // --- COMPLEX: assemblies, mechanisms, multi-body systems, whole devices ----
     // "system" / "machine" are word-bounded and exclude common false-positive
     // bigrams ("coordinate system", "state machine") that are not multi-part builds.
+    // Corpus: "two brackets that bolt together with M5 assembly" → Complex
     static const std::array<const char*, 20> kComplex = {
         "assembly", "assemblies", "mechanism", "gearbox", "gear train", "linkage",
         "enclosure with", "housing with", "robot", "drone",
@@ -107,13 +108,17 @@ ComplexityVerdict classify_complexity(const std::string& request) {
             return {Complexity::Complex, std::string("mentions '") + k + "' (assembly/mechanism)"};
 
     // Multi-part intent phrasing (two bodies that fasten / attach).
-    static const std::array<const char*, 4> kMultiPart = {
-        "that bolt together", "that screw together", "mounts to", "attaches to"};
+    // Corpus: "two brackets that bolt together with M5 assembly" → Complex (also via assembly)
+    // Corpus: hinge multi-leaf language stays below unless these fire.
+    static const std::array<const char*, 6> kMultiPart = {
+        "that bolt together", "that screw together", "bolt together", "screw together",
+        "mounts to", "attaches to"};
     for (const char* k : kMultiPart)
         if (r.find(k) != std::string::npos)
             return {Complexity::Complex, std::string("mentions '") + k + "' (multi-part intent)"};
 
     // Word-bounded "system" / "machine", skipping benign bigrams.
+    // Corpus: "a coordinate system at the centroid" → NOT Complex (coordinate system excluded)
     if (has_word(r, "system") && r.find("coordinate system") == std::string::npos)
         return {Complexity::Complex, "mentions 'system' (assembly/mechanism)"};
     if (has_word(r, "machine") && r.find("state machine") == std::string::npos)
@@ -125,7 +130,27 @@ ComplexityVerdict classify_complexity(const std::string& request) {
     // plain primitive with two dimensions still routes SOLO instead of over-planning.
     const int conjunctions = count_object_conjunctions(r);
 
+    // --- STANDARD floor: multi-feature single bodies that the short-path would Solo ---
+    // Corpus: "sheetmetal enclosure 200x120x60mm, 1.5mm steel" → Standard (formed part with
+    // bends/flat pattern; words=5 would otherwise hit the short Solo path).
+    // "enclosure with" / "housing with" already returned Complex above.
+    if (has_word(r, "enclosure") || has_word(r, "housing"))
+        return {Complexity::Standard, "formed enclosure/housing (multi-feature part)"};
+
+    // Sheet-metal fab language implies sm_* ops (flange/bend/hem/flat), not a one-loop
+    // primitive — even when the prompt is terse. Catalog fasteners naming only a material
+    // thickness stay Solo via the noun path before any broader sheet cue is needed.
+    // Corpus: "sheetmetal enclosure …" also covered above; plain "sheet metal bracket …"
+    // with extra features lands here as Standard when not a bare solo noun short-form.
+    const bool sheetmetal_cue = has_word(r, "sheetmetal") || has_word(r, "sheet metal") ||
+                                r.find("sheet-metal") != std::string::npos;
+    if (sheetmetal_cue && conjunctions == 0 && words > 4)
+        return {Complexity::Standard, "sheet-metal multi-feature part"};
+
     // --- SOLO: a single recognizable primitive / catalog part, tersely stated ---
+    // Corpus: standoff / washer / knob / chamfer edit / garbage → Solo
+    // Surface patterns (knurling) must NOT inflate complexity — knurled/knurling are
+    // not in any elevator list.
     static const std::array<const char*, 39> kSoloNouns = {
         "standoff", "spacer", "screw", "bolt", "nut", "washer", "shim", "bearing",
         "o-ring", "oring", "dowel", "pin", "bushing", "insert", "grommet", "plug",
@@ -139,14 +164,23 @@ ComplexityVerdict classify_complexity(const std::string& request) {
 
     // A terse request naming a single simple noun, with no conjunctions joining
     // multiple objects, is a solo one-loop build.
+    // Corpus: "a knurled hex standoff, 22mm tall, M3 clearance bore" → Solo
+    // Corpus: "M6 washer, 1.5mm thick" → Solo
+    // Corpus: "knob with knurling pattern" → Solo (pattern is surface finish, not multi-part)
     if (solo_noun && conjunctions == 0 && words <= 18)
         return {Complexity::Solo, "single simple part, no conjunctions"};
 
     // Very short requests with no conjunction are almost always one object.
+    // Corpus: "chamfer the top edges (edit follow-up, existing doc)" → Solo
+    // Corpus: "a coordinate system at the centroid" → Solo (not Complex; see bigram guard)
+    // Corpus: "asdf qwerty blah blah" → Solo (rejection is intake's job, not classifier)
     if (conjunctions == 0 && words <= 8)
         return {Complexity::Solo, "very short single-object request"};
 
     // --- STANDARD: everything else (a normal multi-feature part) --------------
+    // Corpus: "mounting plate with 4 clearance holes and 2 ribs" → Standard
+    // Corpus: "hinge bracket with two leaves and a pin" → Standard (multi-feature;
+    // Complex only if multi-part phrasing above fires)
     return {Complexity::Standard, "multi-feature part or joined objects"};
 }
 

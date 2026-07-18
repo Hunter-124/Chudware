@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdio>
 #include <sstream>
+#include <set>
 
 #include "agent/roles.h"
 
@@ -688,8 +689,14 @@ BuiltContext build_context(const DesignState& state, const std::string& role,
     Complexity cx = state.complexity_set ? state.complexity
                                          : classify_complexity(state.request).level;
     const bool solo_sheet = (cx == Complexity::Solo) && !state.tool_scope_full;
-    auto pr = load_prompt(role, prompts_dir, solo_sheet, state.tool_scope_full,
-                          state.tool_scope_classes);
+    // Domain-scoped cheatsheets (sheetmetal/weldments/surfacing): prefer classes already
+    // granted on state; when empty, re-derive from stamped (or re-classified) domain so a
+    // Sheetmetal run starts with sm_* ops without waiting for request_tools.
+    std::set<std::string> scope_classes = state.tool_scope_classes;
+    Domain dom = state.domain_set ? state.domain : classify_domain(state.request).domain;
+    if (dom == Domain::Sheetmetal) scope_classes.insert("sheetmetal");
+    // Future: Domain::Weldment → "weldments", Domain::Surfacing → "surfacing".
+    auto pr = load_prompt(role, prompts_dir, solo_sheet, state.tool_scope_full, scope_classes);
     std::string system = pr.first;
     bool trimmed = false;
 

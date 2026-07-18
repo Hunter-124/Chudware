@@ -2104,44 +2104,161 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         return nullptr;
     };
     // ---- Plan / Objectives: multi-shape plan_state + derived normalizers ----
-    // Explicit plan_state wins (by revision). Weaker sources fill only when no event plan,
-    // or when they refine statuses on an already-derived checklist.
+    // Explicit plan_state events drive the visible todo list on EVERY non-Ask run path
+    // (agent / edit / swarm / eng_firm / mission). Items are namespaced by origin
+    // ("edit:…", "mission:…", "firm:…", stage names for Solo) so multiple writers
+    // mid-run NEVER clobber each other — we UPSERT by id, never wholesale-replace.
+    // Edit-mode plans guide execution only (no approve gate).
     auto applyPlanStateEvent = [&](const nlohmann::json& src) {
-        PlanState ps = parsePlanState(src);
-        if (!ps.present) return;
-        if (m.planState.present && m.planState.fromEvent && ps.revision < m.planState.revision)
-            return;  // ignore stale
-        m.planState = std::move(ps);
-        // Mirror build_plan into legacy PlanInfo so old callers of m.plan still see it.
-        if (m.planState.shape == "build_plan" && !m.plan.present) {
-            m.plan.present = true;
-            m.plan.name = m.planState.title;
-            m.plan.summary = m.planState.summary;
-            for (const auto& it : m.planState.items) {
-                if (it.kind != "part" && it.kind != "step" && !it.kind.empty()) continue;
-                PlanPart pp;
-                pp.name = it.title;
-                // Split desc: first line purpose, rest features-ish.
-                if (!it.desc.empty()) {
-                    size_t nl = it.desc.find('\n');
-                    if (nl == std::string::npos) pp.purpose = it.desc;
-                    else {
-                        pp.purpose = it.desc.substr(0, nl);
-                        // crude dims line detection
-                        std::string rest = it.desc.substr(nl + 1);
-                        size_t nl2 = rest.find('\n');
-                        std::string line2 = (nl2 == std::string::npos) ? rest : rest.substr(0, nl2);
-                        if (line2.find("mm") != std::string::npos ||
-                            line2.find_first_of("0123456789") != std::string::npos)
-                            pp.dims = line2;
-                    }
+        PlanState incoming = parsePlanState(src);
+        if (!incoming.present) return;
+
+        // First plan_state of the turn — take wholesale (still mark present/fromEvent).
+        if (!m.planState.present || m.planState.items.empty()) {
+            m.planState = std::move(incoming);
+        } else {
+            // Multi-writer merge: upsert items by id; keep foreign-namespace rows.
+            // Top-level title/summary/shape update when incoming revision is >= current
+            // OR when the field is still empty/generic.
+            const bool revOk = incoming.revision >= m.planState.revision;
+            if (revOk) {
+                if (!incoming.shape.empty()) m.planState.shape = incoming.shape;
+                if (!incoming.title.empty() &&
+                    (m.planState.title.empty() || m.planState.title == "Plan" ||
+                     m.planState.title == "Build plan" || m.planState.title == "Mission" ||
+                     revOk)) {
+                    // Prefer a more specific title when the incoming one isn't generic-only,
+                    // or always accept when revision advances.
+                    if (incoming.title != "Plan" || m.planState.title.empty())
+                        m.planState.title = incoming.title;
                 }
-                m.plan.parts.push_back(std::move(pp));
+                if (!incoming.summary.empty() &&
+                    (m.planState.summary.empty() || revOk))
+                    m.planState.summary = incoming.summary;
+                if (incoming.revision > m.planState.revision)
+                    m.planState.revision = incoming.revision;
+            } else {
+                // Stale snapshot for chrome — still allow per-item status upserts below
+                // (a lagging writer must not erase a newer writer's statuses, but its
+                // own ids still need live status).
+            }
+            m.planState.fromEvent = true;
+            m.planState.present = true;
+
+            // Optional writer scope: when every incoming id shares a common prefix
+            // ("edit:", "mission:", "firm:", "solo:", "stage:"), drop prior items under
+            // that same prefix that are absent from this payload (writer republished
+            // its full list). Unscoped / mixed-prefix payloads only upsert.
+            auto idPrefix = [](const std::string& id) -> std::string {
+                size_t c = id.find(':');
+                if (c == std::string::npos || c == 0) return {};
+                // Require a non-numeric prefix so bare "0:model" mission-stage keys
+                // aren't treated as a writer namespace for prune.
+                std::string pre = id.substr(0, c);
+                bool allDigit = !pre.empty();
+                for (char ch : pre)
+                    if (ch < '0' || ch > '9') { allDigit = false; break; }
+                if (allDigit) return {};
+                return pre + ":";
+            };
+            std::string scope;
+            bool scoped = !incoming.items.empty();
+            for (const auto& it : incoming.items) {
+                std::string pre = idPrefix(it.id);
+                if (pre.empty()) { scoped = false; break; }
+                if (scope.empty()) scope = pre;
+                else if (scope != pre) { scoped = false; break; }
+            }
+            if (scoped && !scope.empty()) {
+                // Collect incoming ids for this scope.
+                std::vector<std::string> keepIds;
+                keepIds.reserve(incoming.items.size());
+                for (const auto& it : incoming.items) keepIds.push_back(it.id);
+                auto stillPresent = [&](const std::string& id) {
+                    for (const auto& k : keepIds) if (k == id) return true;
+                    return false;
+                };
+                std::vector<PlanItem> kept;
+                kept.reserve(m.planState.items.size());
+                for (auto& it : m.planState.items) {
+                    if (it.id.rfind(scope, 0) == 0) {
+                        if (!stillPresent(it.id)) continue;  // dropped by this writer
+                    }
+                    kept.push_back(std::move(it));
+                }
+                m.planState.items = std::move(kept);
+            }
+
+            // Upsert each incoming item by id (append if new).
+            for (auto& inc : incoming.items) {
+                if (inc.id.empty()) continue;
+                PlanItem* existing = nullptr;
+                for (auto& it : m.planState.items)
+                    if (it.id == inc.id) { existing = &it; break; }
+                if (existing) {
+                    if (!inc.title.empty()) existing->title = std::move(inc.title);
+                    if (!inc.desc.empty()) existing->desc = std::move(inc.desc);
+                    if (!inc.status.empty()) existing->status = std::move(inc.status);
+                    if (!inc.kind.empty()) existing->kind = std::move(inc.kind);
+                    if (!inc.phase.empty()) existing->phase = std::move(inc.phase);
+                    if (!inc.parent_id.empty()) existing->parent_id = std::move(inc.parent_id);
+                } else {
+                    m.planState.items.push_back(std::move(inc));
+                }
+            }
+            // Merge dag edges by (from,to) pair when present.
+            for (auto& e : incoming.edges) {
+                bool found = false;
+                for (const auto& x : m.planState.edges)
+                    if (x.from == e.from && x.to == e.to) { found = true; break; }
+                if (!found) m.planState.edges.push_back(std::move(e));
+            }
+            // Prefer a richer shape when merging checklist into build_plan etc.
+            // If we now have mixed part+step items, keep build_plan / phased_todo chrome.
+            if (m.planState.shape == "checklist") {
+                bool hasPart = false, hasTask = false;
+                for (const auto& it : m.planState.items) {
+                    if (it.kind == "part") hasPart = true;
+                    if (it.kind == "task") hasTask = true;
+                }
+                if (hasPart) m.planState.shape = "build_plan";
+                else if (hasTask) m.planState.shape = "phased_todo";
+            }
+        }
+
+        // Mirror build_plan into legacy PlanInfo so old callers of m.plan still see it.
+        // Rebuild parts list from current planState items (id-stable).
+        if (m.planState.shape == "build_plan") {
+            m.plan.present = true;
+            if (!m.planState.title.empty()) m.plan.name = m.planState.title;
+            if (!m.planState.summary.empty()) m.plan.summary = m.planState.summary;
+            // Only seed parts when empty — avoid thrashing order mid-run.
+            if (m.plan.parts.empty()) {
+                for (const auto& it : m.planState.items) {
+                    if (it.kind != "part" && it.kind != "step" && !it.kind.empty()) continue;
+                    PlanPart pp;
+                    pp.name = it.title;
+                    if (!it.desc.empty()) {
+                        size_t nl = it.desc.find('\n');
+                        if (nl == std::string::npos) pp.purpose = it.desc;
+                        else {
+                            pp.purpose = it.desc.substr(0, nl);
+                            std::string rest = it.desc.substr(nl + 1);
+                            size_t nl2 = rest.find('\n');
+                            std::string line2 = (nl2 == std::string::npos) ? rest : rest.substr(0, nl2);
+                            if (line2.find("mm") != std::string::npos ||
+                                line2.find_first_of("0123456789") != std::string::npos)
+                                pp.dims = line2;
+                        }
+                    }
+                    m.plan.parts.push_back(std::move(pp));
+                }
             }
         }
     };
     auto ensureDerivedPlan = [&]() -> PlanState& {
-        // Only create/mutate derived plan when no authoritative plan_state event owns it.
+        // Derived path may create a shell. Once an event plan_state exists we still allow
+        // status-only tweaks via findPlanItem — but ensureDerivedPlan won't wipe it.
         if (!m.planState.present) {
             m.planState.present = true;
             m.planState.fromEvent = false;
@@ -2155,6 +2272,21 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         for (auto& it : m.planState.items)
             if (it.id == id) return &it;
         return nullptr;
+    };
+    // Upsert a single derived checklist item by id (plan_steps / model_step / mission_*).
+    auto upsertDerivedItem = [&](PlanItem item) {
+        if (item.id.empty()) return;
+        if (PlanItem* ex = findPlanItem(item.id)) {
+            if (!item.title.empty()) ex->title = std::move(item.title);
+            if (!item.desc.empty()) ex->desc = std::move(item.desc);
+            if (!item.status.empty()) ex->status = std::move(item.status);
+            if (!item.kind.empty()) ex->kind = std::move(item.kind);
+            if (!item.phase.empty()) ex->phase = std::move(item.phase);
+            if (!item.parent_id.empty()) ex->parent_id = std::move(item.parent_id);
+        } else {
+            m.planState.items.push_back(std::move(item));
+        }
+        m.planState.present = true;
     };
 
     if (kind == "plan_state") {
@@ -2174,107 +2306,173 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         } else {
             nlohmann::json planObj = data;
             if (data.contains("plan") && data["plan"].is_object()) planObj = data["plan"];
-            // Prefer parsePlan (reuse existing) → planStateFromPlanInfo.
+            // Prefer parsePlan (reuse existing) → planStateFromPlanInfo, then MERGE by id
+            // so a legacy plan mid-mission doesn't wipe mission:/edit: rows.
             PlanInfo pi = parsePlan(planObj);
             if (pi.present) {
                 m.plan = pi;
-                if (!m.planState.fromEvent) {
-                    m.planState = planStateFromPlanInfo(pi);
+                PlanState derived = planStateFromPlanInfo(pi);
+                if (!m.planState.present || m.planState.items.empty()) {
+                    m.planState = std::move(derived);
                     m.planState.fromEvent = false;
+                } else {
+                    // Upsert part:* items only; leave foreign namespaces intact.
+                    for (auto& inc : derived.items)
+                        upsertDerivedItem(std::move(inc));
+                    if (m.planState.shape.empty() || m.planState.shape == "checklist")
+                        m.planState.shape = "build_plan";
+                    if (m.planState.title.empty() || m.planState.title == "Plan")
+                        m.planState.title = derived.title.empty() ? "Build plan" : derived.title;
+                    if (m.planState.summary.empty() && !derived.summary.empty())
+                        m.planState.summary = derived.summary;
                 }
             }
         }
     } else if (kind == "plan_steps") {
-        // C++ model checklist: {steps: string[], total}. Skip when plan_state owns the section.
-        if (!m.planState.fromEvent) {
-            PlanState& ps = ensureDerivedPlan();
-            if (ps.shape != "build_plan" || ps.items.empty()) {
+        // C++ model checklist: {steps: string[], total}. Merge step:* items by id —
+        // never wipe foreign namespaces (edit:/mission:/firm:) even when fromEvent.
+        PlanState& ps = ensureDerivedPlan();
+        if (ps.shape != "build_plan" && ps.shape != "phased_todo") {
+            if (ps.shape.empty() || ps.shape == "checklist")
                 ps.shape = "checklist";
-                if (ps.title.empty() || ps.title == "Plan") ps.title = "Build checklist";
+        }
+        if (ps.title.empty() || ps.title == "Plan") ps.title = "Build checklist";
+        const nlohmann::json* steps = nullptr;
+        if (data.contains("steps") && data["steps"].is_array()) steps = &data["steps"];
+        if (steps) {
+            // Prune prior bare step:* / step:N items that this list no longer carries,
+            // but keep namespaced ids (edit:/mission:/firm:/solo:) and subagents.
+            std::vector<std::string> newIds;
+            int i = 0;
+            for (const auto& s : *steps) {
+                std::string id;
+                if (s.is_object()) id = jstr(s, "id");
+                if (id.empty()) id = "step:" + std::to_string(i);
+                newIds.push_back(id);
+                ++i;
             }
-            const nlohmann::json* steps = nullptr;
-            if (data.contains("steps") && data["steps"].is_array()) steps = &data["steps"];
-            if (steps) {
-                // Rebuild step items (preserve non-step kinds like subagent).
-                std::vector<PlanItem> keep;
-                for (auto& it : ps.items)
-                    if (it.kind != "step") keep.push_back(std::move(it));
-                ps.items = std::move(keep);
-                int i = 0;
-                for (const auto& s : *steps) {
-                    PlanItem it;
-                    it.kind = "step";
-                    it.status = "pending";
-                    it.phase = "Model";
-                    if (s.is_string()) {
-                        it.title = s.get<std::string>();
-                    } else if (s.is_object()) {
-                        it.title = jstr(s, "title");
-                        if (it.title.empty()) it.title = jstr(s, "step");
-                        if (it.title.empty()) it.title = jstr(s, "name");
-                        it.desc = jstr(s, "desc");
-                        it.status = jstr(s, "status");
-                        if (it.status.empty()) it.status = "pending";
-                        it.id = jstr(s, "id");
-                    }
-                    if (it.title.empty()) it.title = "Step " + std::to_string(i + 1);
-                    if (it.id.empty()) it.id = "step:" + std::to_string(i);
-                    // Truncate title to ~10 words for tile density.
-                    {
-                        int words = 0;
-                        size_t cut = it.title.size();
-                        for (size_t c = 0; c < it.title.size(); ++c) {
-                            if (it.title[c] == ' ') {
-                                ++words;
-                                if (words >= 10) { cut = c; break; }
-                            }
-                        }
-                        if (cut < it.title.size()) {
-                            if (it.desc.empty()) it.desc = it.title;
-                            it.title = it.title.substr(0, cut);
-                        }
-                    }
-                    ps.items.push_back(std::move(it));
-                    ++i;
+            auto isBareStepId = [](const std::string& id) {
+                // "step:0" / "step:foo" — not "edit:step:0"
+                return id.rfind("step:", 0) == 0;
+            };
+            std::vector<PlanItem> kept;
+            for (auto& it : ps.items) {
+                if (isBareStepId(it.id)) {
+                    bool found = false;
+                    for (const auto& nid : newIds) if (nid == it.id) { found = true; break; }
+                    if (!found) continue;
                 }
-                ps.present = true;
-                ++ps.revision;
+                kept.push_back(std::move(it));
             }
+            ps.items = std::move(kept);
+            i = 0;
+            for (const auto& s : *steps) {
+                PlanItem it;
+                it.kind = "step";
+                it.status = "pending";
+                it.phase = "Model";
+                if (s.is_string()) {
+                    it.title = s.get<std::string>();
+                } else if (s.is_object()) {
+                    it.title = jstr(s, "title");
+                    if (it.title.empty()) it.title = jstr(s, "step");
+                    if (it.title.empty()) it.title = jstr(s, "name");
+                    it.desc = jstr(s, "desc");
+                    it.status = jstr(s, "status");
+                    if (it.status.empty()) it.status = "pending";
+                    it.id = jstr(s, "id");
+                }
+                if (it.title.empty()) it.title = "Step " + std::to_string(i + 1);
+                if (it.id.empty()) it.id = "step:" + std::to_string(i);
+                // Truncate title to ~10 words for tile density.
+                {
+                    int words = 0;
+                    size_t cut = it.title.size();
+                    for (size_t c = 0; c < it.title.size(); ++c) {
+                        if (it.title[c] == ' ') {
+                            ++words;
+                            if (words >= 10) { cut = c; break; }
+                        }
+                    }
+                    if (cut < it.title.size()) {
+                        if (it.desc.empty()) it.desc = it.title;
+                        it.title = it.title.substr(0, cut);
+                    }
+                }
+                upsertDerivedItem(std::move(it));
+                ++i;
+            }
+            ps.present = true;
+            ++ps.revision;
         }
     } else if (kind == "model_step") {
-        // Live step progress: {index, total, step}. Derived path only (plan_state owns statuses).
-        if (!m.planState.fromEvent) {
-            int idx = jint(data, "index");
-            std::string stepTxt = jstr(data, "step");
+        // Live step progress: {index, total, step}. Prefer id-matched step:* rows;
+        // also advance ordinal step/task/part rows. Safe alongside event plan_state.
+        int idx = jint(data, "index");
+        std::string stepTxt = jstr(data, "step");
+        std::string idHint = jstr(data, "id");
+        if (idHint.empty()) idHint = "step:" + std::to_string(idx);
+        if (PlanItem* byId = findPlanItem(idHint)) {
+            byId->status = "running";
+            if (!stepTxt.empty() && byId->title.empty()) byId->title = stepTxt;
+            // Mark earlier bare steps done.
+            for (auto& it : m.planState.items) {
+                if (it.id == idHint) continue;
+                if (it.id.rfind("step:", 0) != 0) continue;
+                // step:N numeric — mark N < idx done
+                if (it.id.size() > 5) {
+                    bool num = true;
+                    for (size_t k = 5; k < it.id.size(); ++k)
+                        if (it.id[k] < '0' || it.id[k] > '9') { num = false; break; }
+                    if (num) {
+                        int n = 0;
+                        try { n = std::stoi(it.id.substr(5)); } catch (...) { n = -1; }
+                        if (n >= 0 && n < idx &&
+                            (it.status == "pending" || it.status == "running" || it.status.empty()))
+                            it.status = "done";
+                    }
+                }
+            }
+        } else {
             int stepOrd = 0;
+            bool touched = false;
             if (m.planState.present) {
                 for (auto& it : m.planState.items) {
                     if (it.kind != "step" && it.kind != "task" && it.kind != "part") continue;
+                    // Skip namespaced foreign writers for ordinal walk.
+                    if (!it.id.empty()) {
+                        size_t c = it.id.find(':');
+                        if (c != std::string::npos) {
+                            std::string pre = it.id.substr(0, c);
+                            if (pre == "edit" || pre == "mission" || pre == "firm" ||
+                                pre == "solo" || pre == "spawn")
+                                continue;
+                        }
+                    }
                     if (stepOrd < idx) {
                         if (it.status == "pending" || it.status == "running" || it.status.empty())
                             it.status = "done";
                     } else if (stepOrd == idx) {
                         it.status = "running";
                         if (!stepTxt.empty() && it.title.empty()) it.title = stepTxt;
+                        touched = true;
                     }
                     ++stepOrd;
                 }
             }
-            // Seed a single running step when checklist was empty.
-            if (stepOrd == 0 && !stepTxt.empty()) {
+            if (!touched && !stepTxt.empty()) {
                 PlanState& ps = ensureDerivedPlan();
-                if (ps.shape.empty() || !ps.fromEvent)
-                    ps.shape = "checklist";
+                if (ps.shape.empty()) ps.shape = "checklist";
                 PlanItem it;
-                it.id = "step:" + std::to_string(idx);
+                it.id = idHint;
                 it.title = stepTxt;
                 it.kind = "step";
                 it.status = "running";
                 it.phase = "Model";
-                ps.items.push_back(std::move(it));
-                ps.present = true;
+                upsertDerivedItem(std::move(it));
             }
         }
+        m.planState.present = true;
     } else if (kind == "agent.spawn") {
         // Subagent row for the Plan section Subagents list.
         PlanState& ps = ensureDerivedPlan();
@@ -2282,6 +2480,8 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         it.id = jstr(data, "subagent_id");
         if (it.id.empty()) it.id = jstr(data, "id");
         if (it.id.empty()) it.id = "spawn:" + std::to_string(ps.items.size());
+        // Ensure spawn: namespace when bare.
+        if (it.id.find(':') == std::string::npos) it.id = "spawn:" + it.id;
         it.title = jstr(data, "name");
         if (it.title.empty()) it.title = jstr(data, "role");
         if (it.title.empty()) it.title = jstr(data, "agent");
@@ -2291,14 +2491,7 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         if (it.desc.empty()) it.desc = jstr(data, "assignment");
         it.kind = "subagent";
         it.status = "running";
-        // Upsert by id.
-        if (PlanItem* existing = findPlanItem(it.id)) {
-            if (!it.title.empty()) existing->title = it.title;
-            if (!it.desc.empty()) existing->desc = it.desc;
-            existing->status = "running";
-        } else {
-            ps.items.push_back(std::move(it));
-        }
+        upsertDerivedItem(std::move(it));
         ps.present = true;
     }
 
@@ -2310,43 +2503,67 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
     } else
     if (kind == "mission_started") {
         m.curMissionTask = -1;  // task rows arrive via mission_task_started
-        // Normalize mission task list into a checklist/phased PlanState when no plan_state yet.
-        if (!m.planState.fromEvent) {
-            PlanState& ps = ensureDerivedPlan();
+        // Merge mission task list into the shared PlanState by mission:* ids.
+        // Never wipe edit:/firm:/step: rows — multi-writer safe even when plan_state
+        // events already landed (fromEvent).
+        PlanState& ps = ensureDerivedPlan();
+        if (ps.shape.empty() || ps.shape == "checklist")
             ps.shape = "phased_todo";
+        if (ps.title.empty() || ps.title == "Plan" || ps.title == "Build checklist")
             ps.title = "Mission";
-            std::string req = jstr(data, "request");
-            if (!req.empty()) ps.summary = req;
-            // Clear previous mission tasks only (keep subagents).
-            std::vector<PlanItem> keep;
-            for (auto& it : ps.items)
-                if (it.kind == "subagent") keep.push_back(std::move(it));
-            ps.items = std::move(keep);
-            if (data.contains("tasks") && data["tasks"].is_array()) {
-                int i = 0;
-                for (const auto& t : data["tasks"]) {
-                    PlanItem it;
-                    it.id = "mission:" + std::to_string(i);
-                    it.kind = "task";
-                    it.phase = "Mission";
-                    it.status = "pending";
-                    if (t.is_object()) {
-                        it.title = jstr(t, "title");
-                        if (it.title.empty()) it.title = jstr(t, "capability");
-                        it.desc = jstr(t, "req");
-                        if (it.desc.empty()) it.desc = jstr(t, "target");
-                        if (it.desc.empty()) it.desc = jstr(t, "capability");
-                    } else if (t.is_string()) {
-                        it.title = t.get<std::string>();
+        std::string req = jstr(data, "request");
+        if (!req.empty() && ps.summary.empty()) ps.summary = req;
+        if (data.contains("tasks") && data["tasks"].is_array()) {
+            // Prune mission:* rows absent from this list; keep everything else.
+            std::vector<std::string> newIds;
+            int i = 0;
+            for (const auto& t : data["tasks"]) {
+                std::string id = "mission:" + std::to_string(i);
+                if (t.is_object()) {
+                    std::string tid = jstr(t, "id");
+                    if (!tid.empty()) {
+                        if (tid.rfind("mission:", 0) == 0) id = tid;
+                        else id = "mission:" + tid;
                     }
-                    if (it.title.empty()) it.title = "Task " + std::to_string(i + 1);
-                    ps.items.push_back(std::move(it));
-                    ++i;
                 }
+                newIds.push_back(id);
+                ++i;
             }
-            ps.present = true;
-            ++ps.revision;
+            std::vector<PlanItem> kept;
+            for (auto& it : ps.items) {
+                if (it.id.rfind("mission:", 0) == 0) {
+                    bool found = false;
+                    for (const auto& nid : newIds) if (nid == it.id) { found = true; break; }
+                    if (!found) continue;
+                }
+                kept.push_back(std::move(it));
+            }
+            ps.items = std::move(kept);
+            i = 0;
+            for (const auto& t : data["tasks"]) {
+                PlanItem it;
+                it.id = newIds[(size_t)i];
+                it.kind = "task";
+                it.phase = "Mission";
+                it.status = "pending";
+                if (t.is_object()) {
+                    it.title = jstr(t, "title");
+                    if (it.title.empty()) it.title = jstr(t, "capability");
+                    it.desc = jstr(t, "req");
+                    if (it.desc.empty()) it.desc = jstr(t, "target");
+                    if (it.desc.empty()) it.desc = jstr(t, "capability");
+                    std::string stt = jstr(t, "status");
+                    if (!stt.empty()) it.status = stt;
+                } else if (t.is_string()) {
+                    it.title = t.get<std::string>();
+                }
+                if (it.title.empty()) it.title = "Task " + std::to_string(i + 1);
+                upsertDerivedItem(std::move(it));
+                ++i;
+            }
         }
+        ps.present = true;
+        ++ps.revision;
     } else if (kind == "mission_task_started") {
         int idx = jint(data, "index");
         m.curMissionTask = idx;
@@ -2362,22 +2579,18 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             a = &m.activity.back();
         }
         a->status = "running";
-        // Mirror into planState mission checklist.
-        if (m.planState.present && !m.planState.fromEvent) {
-            std::string id = "mission:" + std::to_string(idx);
-            if (PlanItem* it = findPlanItem(id)) {
-                it->status = "running";
-                if (!a->title.empty()) it->title = a->title;
-            } else {
-                PlanItem ni;
-                ni.id = id;
-                ni.title = a->title;
-                ni.kind = "task";
-                ni.phase = "Mission";
-                ni.status = "running";
-                m.planState.items.push_back(std::move(ni));
-                m.planState.present = true;
-            }
+        // Mirror into planState mission checklist by id — works with event plan_state too.
+        {
+            std::string id = jstr(data, "id");
+            if (id.empty()) id = "mission:" + std::to_string(idx);
+            else if (id.rfind("mission:", 0) != 0) id = "mission:" + id;
+            PlanItem ni;
+            ni.id = id;
+            ni.title = a->title;
+            ni.kind = "task";
+            ni.phase = "Mission";
+            ni.status = "running";
+            upsertDerivedItem(std::move(ni));
         }
     } else if (kind == "mission_task_result") {
         int midx = jint(data, "index");
@@ -2388,14 +2601,26 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             std::string summary = jstr(data, "summary");
             if (!summary.empty()) a->reason = summary;
         }
-        // Live status mirror (safe even when plan_state owns items — id-matched only).
-        if (m.planState.present) {
-            std::string id = "mission:" + std::to_string(midx);
+        // Live status mirror — id-matched only (mission:N or explicit id).
+        {
+            std::string id = jstr(data, "id");
+            if (id.empty()) id = "mission:" + std::to_string(midx);
+            else if (id.rfind("mission:", 0) != 0) id = "mission:" + id;
+            std::string s = jstr(data, "status");
+            std::string summary = jstr(data, "summary");
             if (PlanItem* it = findPlanItem(id)) {
-                std::string s = jstr(data, "status");
                 it->status = (s == "done" || s.empty()) ? "done" : s;
-                std::string summary = jstr(data, "summary");
                 if (!summary.empty()) it->desc = summary;
+            } else {
+                // Late result without a prior started — still surface the row.
+                PlanItem ni;
+                ni.id = id;
+                ni.title = a ? a->title : ("Task " + std::to_string(midx + 1));
+                ni.kind = "task";
+                ni.phase = "Mission";
+                ni.status = (s == "done" || s.empty()) ? "done" : s;
+                if (!summary.empty()) ni.desc = summary;
+                upsertDerivedItem(std::move(ni));
             }
         }
     } else if (kind == "mission_finished") {
@@ -2411,10 +2636,17 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
                 a.streaming = false;
             }
         }
+        // Close only mission:* task rows — leave edit:/firm:/step: writers alone.
         if (m.planState.present) {
-            for (auto& it : m.planState.items)
+            for (auto& it : m.planState.items) {
+                if (it.id.rfind("mission:", 0) != 0 && it.kind != "task") continue;
+                // Prefer id namespace; fall back to kind=task + phase Mission.
+                bool isMission = (it.id.rfind("mission:", 0) == 0) ||
+                                 (it.kind == "task" && it.phase == "Mission");
+                if (!isMission) continue;
                 if (it.status == "running" || it.status == "pending" || it.status.empty())
-                    if (it.kind == "task" || it.kind == "step") it.status = "done";
+                    it.status = "done";
+            }
         }
     } else if (kind == "stage_started") {
         std::string s = nsKey(jstr(data, "stage"));
@@ -2786,6 +3018,14 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             card = &m.activity.front();
         }
         mergeRoutingFields(*card, data, kind);
+        // task_route.structure is the decided execution style (solo/standard→edit,
+        // complex→swarm, or explicit mode). Stamp for the approve card if a user gate
+        // ever lands; agent-decided plans ignore it for UX (no card).
+        if (kind == "task_route") {
+            std::string structure = jstr(data, "structure");
+            if (structure.empty()) structure = jstr(data, "execution_style");
+            if (!structure.empty()) m.planExecutionStyle = structure;
+        }
         if (m.running && (m.liveStatus.empty() || m.liveStatus == "Routing\xe2\x80\xa6" ||
                           m.liveStatus == "Classifying request...")) {
             // Prefer a short live chrome once we know something concrete.
@@ -2879,6 +3119,372 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         // Additive aicad.corporate/1 stream: corp_event + optional dept/agent/payload.
         // Same drain as stage/tool events (app.cpp strips orch_ prefix).
         feedCorporateEvent(m, data);
+    } else if (kind == "swarm_wave") {
+        // Wave header: "Wave N/M" + task titles with status. One card per wave start.
+        ActivityItem ni;
+        ni.rowKind = 11;
+        int wave = jint(data, "wave");
+        int total = jint(data, "total_waves");
+        if (wave <= 0 && data.contains("wave") && data["wave"].is_number())
+            wave = (int)data["wave"].get<double>();
+        if (total <= 0 && data.contains("total_waves") && data["total_waves"].is_number())
+            total = (int)data["total_waves"].get<double>();
+        char title[80];
+        if (total > 0)
+            std::snprintf(title, sizeof(title), "Wave %d/%d", wave, total);
+        else
+            std::snprintf(title, sizeof(title), "Wave %d", wave > 0 ? wave : 1);
+        ni.title = title;
+        ni.stage = "swarm:wave:" + std::to_string(wave > 0 ? wave : (int)m.activity.size());
+        ni.status = "running";
+        ni.tokensIn = wave;
+        ni.tokensOut = total;
+        // Pack tasks into detail JSON for the card renderer.
+        nlohmann::json pack = nlohmann::json::object();
+        pack["wave"] = wave;
+        pack["total_waves"] = total;
+        nlohmann::json tasks = nlohmann::json::array();
+        std::string reason;
+        if (data.contains("tasks") && data["tasks"].is_array()) {
+            for (const auto& t : data["tasks"]) {
+                if (!t.is_object()) continue;
+                nlohmann::json row = nlohmann::json::object();
+                row["id"] = jstr(t, "id");
+                std::string tt = jstr(t, "title");
+                if (tt.empty()) tt = jstr(t, "name");
+                if (tt.empty()) tt = jstr(t, "capability");
+                row["title"] = tt;
+                std::string stt = jstr(t, "status");
+                if (stt.empty()) stt = "pending";
+                row["status"] = stt;
+                tasks.push_back(std::move(row));
+                if (!reason.empty()) reason += " \xc2\xb7 ";
+                reason += tt.empty() ? "?" : tt;
+            }
+        }
+        pack["tasks"] = std::move(tasks);
+        ni.detail = pack.dump();
+        // Cap reason length for the one-liner under the title.
+        if (reason.size() > 120) { reason.resize(117); reason += "\xe2\x80\xa6"; }
+        ni.reason = reason;
+        m.activity.push_back(std::move(ni));
+        if (m.running) m.liveStatus = ni.title;
+    } else if (kind == "firm_bids") {
+        // Contractor bidding card: firm names + token/$ estimates + budget.
+        ActivityItem ni;
+        ni.rowKind = 12;
+        ni.stage = "firm:bids";
+        ni.title = "Firm bids";
+        ni.status = "done";
+        std::string domain = jstr(data, "domain");
+        std::string complexity = jstr(data, "complexity");
+        double budget = 0.0;
+        if (data.contains("budget_usd") && data["budget_usd"].is_number())
+            budget = data["budget_usd"].get<double>();
+        char reason[160];
+        if (budget > 0.0)
+            std::snprintf(reason, sizeof(reason), "%s%s%s \xc2\xb7 budget $%.2f",
+                          domain.c_str(),
+                          (!domain.empty() && !complexity.empty()) ? " \xc2\xb7 " : "",
+                          complexity.c_str(), budget);
+        else if (!domain.empty() || !complexity.empty())
+            std::snprintf(reason, sizeof(reason), "%s%s%s",
+                          domain.c_str(),
+                          (!domain.empty() && !complexity.empty()) ? " \xc2\xb7 " : "",
+                          complexity.c_str());
+        else
+            std::snprintf(reason, sizeof(reason), "collecting bids");
+        ni.reason = reason;
+        // Store a compact structured payload (not raw event dump) for the card.
+        nlohmann::json pack = nlohmann::json::object();
+        pack["domain"] = domain;
+        pack["complexity"] = complexity;
+        pack["budget_usd"] = budget;
+        if (data.contains("usd_per_1k") && data["usd_per_1k"].is_number())
+            pack["usd_per_1k"] = data["usd_per_1k"];
+        nlohmann::json bids = nlohmann::json::array();
+        if (data.contains("bids") && data["bids"].is_array()) {
+            for (const auto& b : data["bids"]) {
+                if (!b.is_object()) continue;
+                nlohmann::json row = nlohmann::json::object();
+                std::string firm = jstr(b, "firm");
+                if (firm.empty()) firm = jstr(b, "firm_name");
+                if (firm.empty()) firm = jstr(b, "firm_id");
+                row["firm"] = firm;
+                if (b.contains("tokens") && b["tokens"].is_number())
+                    row["tokens"] = b["tokens"];
+                else if (b.contains("tokens_est") && b["tokens_est"].is_number())
+                    row["tokens"] = b["tokens_est"];
+                if (b.contains("usd") && b["usd"].is_number()) row["usd"] = b["usd"];
+                if (b.contains("within_budget")) row["within_budget"] = b["within_budget"];
+                if (b.contains("in_scope")) row["in_scope"] = b["in_scope"];
+                bids.push_back(std::move(row));
+            }
+        }
+        pack["bids"] = std::move(bids);
+        // Also surface awarded_* when the emitter packs it on the same event.
+        if (data.contains("awarded_firm")) pack["awarded_firm"] = data["awarded_firm"];
+        if (data.contains("awarded_usd")) pack["awarded_usd"] = data["awarded_usd"];
+        ni.detail = pack.dump();
+        // Upsert single bids card (replace prior if re-emitted).
+        bool replaced = false;
+        for (auto& a : m.activity) {
+            if (a.rowKind == 12 && a.stage == "firm:bids") {
+                a = ni;
+                replaced = true;
+                break;
+            }
+        }
+        if (!replaced) m.activity.push_back(std::move(ni));
+        if (m.running) m.liveStatus = "Collecting firm bids...";
+    } else if (kind == "firm_award") {
+        ActivityItem ni;
+        ni.rowKind = 13;
+        ni.stage = "firm:award:" + std::to_string(m.activity.size());
+        std::string firm = jstr(data, "firm");
+        if (firm.empty()) firm = jstr(data, "firm_name");
+        if (firm.empty()) firm = jstr(data, "awarded_firm");
+        ni.title = firm.empty() ? "Firm awarded" : ("Awarded " + firm);
+        double bid = 0.0;
+        if (data.contains("bid_usd") && data["bid_usd"].is_number())
+            bid = data["bid_usd"].get<double>();
+        else if (data.contains("usd") && data["usd"].is_number())
+            bid = data["usd"].get<double>();
+        else if (data.contains("awarded_usd") && data["awarded_usd"].is_number())
+            bid = data["awarded_usd"].get<double>();
+        std::string reason = jstr(data, "reason");
+        char line[192];
+        if (bid > 0.0 && !reason.empty())
+            std::snprintf(line, sizeof(line), "$%.2f \xc2\xb7 %s", bid, reason.c_str());
+        else if (bid > 0.0)
+            std::snprintf(line, sizeof(line), "$%.2f", bid);
+        else if (!reason.empty())
+            std::snprintf(line, sizeof(line), "%s", reason.c_str());
+        else
+            std::snprintf(line, sizeof(line), "prime contractor selected");
+        ni.reason = line;
+        ni.detail = reason;
+        ni.status = "done";
+        m.activity.push_back(std::move(ni));
+        if (m.running) m.liveStatus = firm.empty() ? "Firm awarded" : ("Awarded " + firm);
+    } else if (kind == "firm_team") {
+        ActivityItem ni;
+        ni.rowKind = 14;
+        ni.stage = "firm:team";
+        ni.title = "Firm team";
+        ni.status = "done";
+        nlohmann::json pack = nlohmann::json::object();
+        nlohmann::json members = nlohmann::json::array();
+        int nLead = 0, nMem = 0;
+        if (data.contains("members") && data["members"].is_array()) {
+            for (const auto& mem : data["members"]) {
+                if (!mem.is_object()) continue;
+                nlohmann::json row = nlohmann::json::object();
+                std::string role = jstr(mem, "role");
+                if (role.empty()) role = jstr(mem, "role_title");
+                std::string name = jstr(mem, "name");
+                if (name.empty()) name = jstr(mem, "firm");
+                if (name.empty()) name = jstr(mem, "firm_name");
+                row["role"] = role;
+                row["name"] = name;
+                if (mem.contains("firm") && mem["firm"].is_string())
+                    row["firm"] = mem["firm"];
+                else if (mem.contains("firm_name") && mem["firm_name"].is_string())
+                    row["firm"] = mem["firm_name"];
+                bool lead = false;
+                if (mem.contains("lead") && mem["lead"].is_boolean())
+                    lead = mem["lead"].get<bool>();
+                row["lead"] = lead;
+                if (lead) ++nLead; else ++nMem;
+                members.push_back(std::move(row));
+            }
+        }
+        pack["members"] = std::move(members);
+        ni.detail = pack.dump();
+        char reason[96];
+        std::snprintf(reason, sizeof(reason), "%d member%s%s",
+                      nLead + nMem, (nLead + nMem) == 1 ? "" : "s",
+                      nLead > 0 ? " \xc2\xb7 lead assigned" : "");
+        ni.reason = reason;
+        // Upsert single team card.
+        bool replaced = false;
+        for (auto& a : m.activity) {
+            if (a.rowKind == 14 && a.stage == "firm:team") {
+                a = ni;
+                replaced = true;
+                break;
+            }
+        }
+        if (!replaced) m.activity.push_back(std::move(ni));
+        if (m.running) m.liveStatus = "Assembling firm team...";
+    } else if (kind == "firm_comm") {
+        // Internal contractor comms — ONE collapsed-by-default expander; append lines.
+        ActivityItem* thr = nullptr;
+        for (auto it = m.activity.rbegin(); it != m.activity.rend(); ++it)
+            if (it->rowKind == 15 && it->stage == "firm:comm") { thr = &*it; break; }
+        if (!thr) {
+            ActivityItem ni;
+            ni.rowKind = 15;
+            ni.stage = "firm:comm";
+            ni.title = "Internal comms";
+            ni.status = "done";
+            ni.expanded = false;  // collapsed by default
+            ni.detail = "";
+            m.activity.push_back(std::move(ni));
+            thr = &m.activity.back();
+        }
+        std::string from = jstr(data, "from");
+        std::string to = jstr(data, "to");
+        std::string text = jstr(data, "text");
+        if (text.empty()) text = jstr(data, "message");
+        if (text.empty()) return;  // nothing to append
+        std::string line;
+        if (!from.empty() && !to.empty())
+            line = from + " \xe2\x86\x92 " + to + ": " + text;
+        else if (!from.empty())
+            line = from + ": " + text;
+        else
+            line = text;
+        if (!thr->detail.empty()) thr->detail += "\n";
+        thr->detail += line;
+        // Cap stored thread to ~32 KB so a chatty firm can't bloat the turn forever.
+        if (thr->detail.size() > 32768) {
+            size_t cut = thr->detail.size() - 30000;
+            size_t nl = thr->detail.find('\n', cut);
+            if (nl != std::string::npos) thr->detail.erase(0, nl + 1);
+            else thr->detail.erase(0, cut);
+        }
+        // Count lines into opsCount for the header chip.
+        int nLines = 1;
+        for (char c : thr->detail) if (c == '\n') ++nLines;
+        thr->opsCount = nLines;
+        char reason[64];
+        std::snprintf(reason, sizeof(reason), "%d message%s", nLines, nLines == 1 ? "" : "s");
+        thr->reason = reason;
+        thr->status = "done";
+        // Do NOT bump liveStatus on every comm — too noisy.
+    } else if (kind == "advisor") {
+        // Advisor card. Two flavors:
+        //  1) Mid-run consult (stage/question/advice) — expanded default.
+        //  2) Agent-decided plan approval verdict (approved/approve/verdict) — informational
+        //     "Advisor-approved plan" card, collapsed-by-default, NO action buttons.
+        ActivityItem ni;
+        ni.rowKind = 16;
+        ni.stage = "advisor:" + std::to_string(m.activity.size());
+        std::string stg = jstr(data, "stage");
+        if (stg.empty()) stg = jstr(data, "parent_stage");
+        std::string question = jstr(data, "question");
+        std::string advice = jstr(data, "advice");
+        if (advice.empty()) advice = jstr(data, "text");
+        if (advice.empty()) advice = jstr(data, "note");
+        if (advice.empty()) advice = jstr(data, "verdict");
+        std::string verdict = jstr(data, "verdict");
+        if (verdict.empty()) verdict = jstr(data, "decision");
+        // Detect plan-approval flavor: explicit flag, stage name, or verdict keywords.
+        std::string vlow = verdict;
+        for (char& c : vlow) c = (char)std::tolower((unsigned char)c);
+        std::string stglow = stg;
+        for (char& c : stglow) c = (char)std::tolower((unsigned char)c);
+        const bool planApproval =
+            jbool(data, "plan_approved") ||
+            jbool(data, "approved") ||
+            stglow.find("plan") != std::string::npos ||
+            vlow == "approved" || vlow == "approve" || vlow == "ok" ||
+            vlow.find("approv") != std::string::npos;
+        if (planApproval) {
+            ni.title = "Advisor-approved plan";
+            ni.reason = !verdict.empty() ? verdict : (!advice.empty() ? advice : "approved");
+            // Prefer a short plan summary in detail when present.
+            std::string summary = jstr(data, "summary");
+            if (summary.empty() && data.contains("plan")) {
+                if (data["plan"].is_string()) summary = data["plan"].get<std::string>();
+                else if (data["plan"].is_object()) {
+                    summary = jstr(data["plan"], "summary");
+                    if (summary.empty()) summary = jstr(data["plan"], "title");
+                    if (summary.empty()) summary = jstr(data["plan"], "name");
+                }
+            }
+            if (summary.empty()) summary = advice;
+            if (!question.empty() && summary.find(question) == std::string::npos) {
+                if (!summary.empty()) summary = question + "\n" + summary;
+                else summary = question;
+            }
+            ni.detail = summary;
+            ni.status = "done";
+            ni.expanded = false;  // collapsed-by-default informational
+            ni.opsCount = 1;      // flag: plan-approval flavor for the drawer
+            // Also stamp execution_style if the advisor event carries it.
+            std::string es = jstr(data, "execution_style");
+            if (es.empty()) es = jstr(data, "structure");
+            if (!es.empty() && m.planExecutionStyle.empty() && !m.planApprovePending)
+                m.planExecutionStyle = es;
+        } else {
+            ni.title = stg.empty() ? "Advisor" : ("Advisor \xc2\xb7 " + stg);
+            ni.reason = question;
+            ni.detail = advice;
+            ni.status = "done";
+            ni.expanded = true;  // consult: expanded by default
+            ni.opsCount = 0;
+        }
+        m.activity.push_back(std::move(ni));
+        if (m.running) {
+            if (planApproval) {
+                m.liveStatus = "Advisor approved plan \xe2\x80\x94 executing\xe2\x80\xa6";
+            } else if (!advice.empty()) {
+                std::string ls = advice;
+                if (ls.size() > 80) { ls.resize(77); ls += "\xe2\x80\xa6"; }
+                m.liveStatus = "Advisor: " + ls;
+            }
+        }
+    } else if (kind == "sub_run") {
+        // Compact card: purpose + status. Upsert by id when present.
+        std::string id = jstr(data, "id");
+        std::string purpose = jstr(data, "purpose");
+        if (purpose.empty()) purpose = jstr(data, "title");
+        if (purpose.empty()) purpose = jstr(data, "name");
+        std::string parent = jstr(data, "parent_stage");
+        std::string stt = jstr(data, "status");
+        if (stt.empty()) stt = "running";
+        ActivityItem* existing = nullptr;
+        if (!id.empty()) {
+            const std::string key = "subrun:" + id;
+            for (auto it = m.activity.rbegin(); it != m.activity.rend(); ++it)
+                if (it->rowKind == 17 && it->stage == key) { existing = &*it; break; }
+        }
+        if (!existing) {
+            ActivityItem ni;
+            ni.rowKind = 17;
+            ni.stage = id.empty() ? ("subrun:" + std::to_string(m.activity.size()))
+                                 : ("subrun:" + id);
+            ni.title = purpose.empty() ? "Sub-run" : purpose;
+            if (!parent.empty()) {
+                ni.reason = parent;
+                if (!stt.empty()) ni.reason += " \xc2\xb7 " + stt;
+            } else {
+                ni.reason = stt;
+            }
+            ni.status = (stt == "done" || stt == "pass") ? "done"
+                      : (stt == "fail" || stt == "failed" || stt == "error") ? "fail"
+                      : (stt == "running" || stt == "started") ? "running"
+                      : stt;
+            ni.detail = purpose;
+            m.activity.push_back(std::move(ni));
+        } else {
+            if (!purpose.empty()) existing->title = purpose;
+            if (!parent.empty()) {
+                existing->reason = parent;
+                if (!stt.empty()) existing->reason += " \xc2\xb7 " + stt;
+            } else if (!stt.empty()) {
+                existing->reason = stt;
+            }
+            existing->status = (stt == "done" || stt == "pass") ? "done"
+                             : (stt == "fail" || stt == "failed" || stt == "error") ? "fail"
+                             : (stt == "running" || stt == "started") ? "running"
+                             : stt;
+        }
+        if (m.running && !purpose.empty()) {
+            m.liveStatus = purpose + (stt.empty() ? std::string() : (" (" + stt + ")"));
+        }
     }
 }
 
@@ -3483,12 +4089,11 @@ static void drawClarifyCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
     endGlassBubble(gb);
     if (build || skip) {
         // Fold each answer (or its suggested default on Skip) into the request.
-        std::string aug = m.clarify.request + "\n\nClarified dimensions:";
+        std::string aug = m.clarify.request;
         for (auto& q : m.clarify.questions) {
             std::string val;
-            if (skip) {
-                val = q.suggested;
-                if (val.empty() && !q.selectedValues.empty()) {
+            if (q.kind == "choice" && q.multi) {
+                if (!q.selectedValues.empty()) {
                     for (size_t j = 0; j < q.selectedValues.size(); ++j) {
                         if (j) val += ", ";
                         val += q.selectedValues[j];
@@ -3524,11 +4129,12 @@ static void drawClarifyCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
     }
 }
 
-// Plan-mode approve gate: after a plan_only run, show the plan and let the user
-// Execute as Agent / Execute as Swarm / Cancel. Resends with options.approved_plan + execute_as.
+// User-facing plan approve gate — ONLY manual Plan mode (plan_only / awaiting_plan_approval)
+// or advisor escalate (needs_user_decision). Agent-decided plans never reach this card.
+// Question: "need edits, or start execution?" Edit plan prefills the composer; Execute-as
+// buttons stamp approved_plan + execute_as. Recommended button matches planExecutionStyle.
 static void drawPlanApproveCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
     if (!m.planApprovePending || m.running) return;
-    // Failed plan_only run — drop the gate rather than offering execute on an error card.
     if (m.errKind != ERR_NONE) {
         m.planApprovePending = false;
         return;
@@ -3536,15 +4142,47 @@ static void drawPlanApproveCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts
     const auto& pal = ui::palette;
     const ui::AdaptiveSurface& surf = chatSurf();
     const ImVec4 accentCol = semanticOnGlass(pal.accent, surf);
+
+    // Normalize recommended style from plan_ready / task_route.
+    std::string style = m.planExecutionStyle;
+    for (char& c : style) c = (char)std::tolower((unsigned char)c);
+    if (style == "solo" || style == "standard" || style == "edit-style") style = "edit";
+    if (style == "complex" || style == "multi" || style == "multi-part" || style == "swarm-style")
+        style = "swarm";
+    if (style == "engfirm" || style == "firm" || style == "engineering_firm") style = "eng_firm";
+    if (style != "edit" && style != "agent" && style != "swarm" && style != "eng_firm")
+        style = style.empty() ? "agent" : style;
+
     ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
     ImGui::BeginChild("##plan_approve", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
     ImGui::PushFont(fonts.medium);
-    ImGui::TextColored(accentCol, "Plan ready — approve to build");
+    ImGui::TextColored(accentCol, "%s",
+                       m.planApproveReason.empty()
+                           ? "Plan ready — need edits, or start execution?"
+                           : "Plan needs your decision");
     ImGui::PopFont();
-    dimText("Review the plan above, then execute as a single agent or a multi-agent swarm.");
+
+    // Planned-for style chip.
+    {
+        const char* styleLabel =
+            (style == "edit") ? "edit" :
+            (style == "swarm") ? "swarm" :
+            (style == "eng_firm") ? "eng. firm" : "agent";
+        char planned[96];
+        std::snprintf(planned, sizeof(planned), "Planned for %s execution", styleLabel);
+        dimText(planned);
+    }
+    if (!m.planApproveReason.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+        ImGui::TextWrapped("%s", m.planApproveReason.c_str());
+        ImGui::PopStyleColor();
+    } else {
+        dimText("Review the plan above. Edit it, or execute with the recommended style "
+                "(other styles still available).");
+    }
 
     auto planText = [&]() -> std::string {
         std::string out;
@@ -3572,10 +4210,41 @@ static void drawPlanApproveCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts
         return out;
     };
 
+    // Button order: recommended first as primary when matching; others secondary.
+    auto styleBtn = [&](const char* label, const char* key, bool asPrimary) -> bool {
+        if (asPrimary) return primaryButton(label, ImVec2(-1, ui::metrics::copilotBtnH()));
+        return ImGui::Button(label, ImVec2(-1, 0));
+    };
+
     ImGui::Dummy(ImVec2(0, 4 * ui::uiScale));
-    bool asAgent = primaryButton("Execute as Agent", ImVec2(-1, ui::metrics::copilotBtnH()));
-    bool asSwarm = ImGui::Button("Execute as Swarm", ImVec2(-1, 0));
-    bool cancel  = ImGui::Button("Cancel", ImVec2(-1, 0));
+    // Edit plan — focuses composer with plan text for revision (resend as plan_only).
+    bool editPlan = ImGui::Button("Edit plan", ImVec2(-1, 0));
+
+    // Execute buttons: highlight recommended.
+    const bool recAgent   = (style == "agent" || style == "edit");
+    const bool recSwarm   = (style == "swarm");
+    const bool recEngFirm = (style == "eng_firm");
+
+    // Recommended first when not agent, so primary lands on the match.
+    bool asAgent = false, asSwarm = false, asEngFirm = false;
+    if (recEngFirm) {
+        asEngFirm = styleBtn("Execute as Eng. Firm  (Recommended)", "eng_firm", true);
+        asSwarm   = styleBtn("Execute as Swarm", "swarm", false);
+        asAgent   = styleBtn("Execute as Agent", "agent", false);
+    } else if (recSwarm) {
+        asSwarm   = styleBtn("Execute as Swarm  (Recommended)", "swarm", true);
+        asAgent   = styleBtn("Execute as Agent", "agent", false);
+        asEngFirm = styleBtn("Execute as Eng. Firm", "eng_firm", false);
+    } else {
+        // edit-style and agent both map to Execute as Agent (edit-style is single-agent execute).
+        const char* agentLbl = (style == "edit")
+            ? "Execute as Agent  (Recommended \xc2\xb7 edit-style)"
+            : "Execute as Agent  (Recommended)";
+        asAgent   = styleBtn(agentLbl, "agent", true);
+        asSwarm   = styleBtn("Execute as Swarm", "swarm", false);
+        asEngFirm = styleBtn("Execute as Eng. Firm", "eng_firm", false);
+    }
+    bool cancel = ImGui::Button("Cancel", ImVec2(-1, 0));
     ImGui::PopStyleColor();
     ImGui::EndChild();
     endGlassBubble(gb);
@@ -3584,11 +4253,33 @@ static void drawPlanApproveCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts
         m.planApprovePending = false;
         m.planApproveRequest.clear();
         m.planApproveExtras = nlohmann::json::object();
+        m.planExecutionStyle.clear();
+        m.planApproveReason.clear();
         if (m.text.empty()) m.text = "Plan cancelled.";
         st.status = "Ready."; st.statusKind = 0;
         return;
     }
-    if (!asAgent && !asSwarm) return;
+
+    if (editPlan) {
+        // Prefill composer with the plan + a revision prompt; switch to Plan mode so
+        // the next send is plan_only. Cursor at end for the user's edit note.
+        const std::string plan = planText();
+        std::string draft =
+            "Revise this plan:\n\n" + plan +
+            "\n\n---\nMy edits: ";
+        if (st.prompt.size() < draft.size() + 64)
+            st.prompt.resize(draft.size() + 256, 0);
+        std::memset(st.prompt.data(), 0, st.prompt.size());
+        std::memcpy(st.prompt.data(), draft.data(), draft.size());
+        st.aiInteraction = (int)CopilotMode::Plan;
+        m.planApprovePending = false;  // card goes away; user will re-submit
+        // Keep planApproveRequest so a subsequent Plan submit still knows the origin.
+        st.status = "Edit the plan in the composer, then send.";
+        st.statusKind = 0;
+        return;
+    }
+
+    if (!asAgent && !asSwarm && !asEngFirm) return;
 
     const std::string approved = planText();
     const std::string req = m.planApproveRequest.empty() ? approved : m.planApproveRequest;
@@ -3597,12 +4288,19 @@ static void drawPlanApproveCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts
     nlohmann::json opts = nlohmann::json::object();
     opts["advisor"] = true;
     opts["approved_plan"] = approved;
-    if (asSwarm) {
+    if (asEngFirm) {
+        opts["mode"] = "eng_firm";
+        opts["execute_as"] = "eng_firm";
+        opts["org"] = "eng_firm";
+        opts["corporate_force"] = true;
+        opts["budget_usd"] = st.settings.companyBudgetUsd;
+    } else if (asSwarm) {
         opts["mode"] = "swarm";
         opts["execute_as"] = "swarm";
         opts["corporate_force"] = true;
     } else {
-        opts["mode"] = "agent";
+        // edit-style and agent both resume as single-agent execute.
+        opts["mode"] = (style == "edit") ? "edit" : "agent";
         opts["execute_as"] = "agent";
     }
     extras["options"] = std::move(opts);
@@ -3611,15 +4309,19 @@ static void drawPlanApproveCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts
         payload[it.key()] = it.value();
 
     m.planApprovePending = false;
+    m.planExecutionStyle.clear();
+    m.planApproveReason.clear();
     m.running = true;
     if (st.settings.model[0]) m.model = st.settings.model;
-    m.liveStatus = asSwarm ? "Executing plan (swarm)..." : "Executing plan (agent)...";
+    if (asEngFirm) m.liveStatus = "Executing plan (eng. firm)...";
+    else if (asSwarm) m.liveStatus = "Executing plan (swarm)...";
+    else m.liveStatus = "Executing plan (agent)...";
     st.status = m.liveStatus; st.statusKind = 0;
     st.agentV2Running = true;
     st.agentV2 = true;
     if (st.activityPanel) st.activityPanel->clearLive();
 
-    if (asSwarm) {
+    if (asSwarm || asEngFirm) {
         launchMissionRunChat(st, req, /*needFreshDoc=*/true, payload);
     } else {
         launchDesignRun(st, req, payload);
@@ -4483,6 +5185,453 @@ static void drawClassificationCard(const ActivityItem& a, const ui::Fonts& fonts
     }
 }
 
+// ============================ Exec-mode timeline cards (swarm / eng_firm / advisor) ============
+// Formatted glass cards for contract kinds swarm_wave / firm_* / advisor / sub_run.
+// detail holds structured JSON or plain thread text — NEVER dumped raw into the prose bubble.
+
+static void drawSwarmWaveCard(const ActivityItem& a, const ui::Fonts& fonts) {
+    const auto& pal = ui::palette;
+    const float sc = ui::uiScale;
+    const ui::AdaptiveSurface& surf = chatSurf();
+    ImGui::Dummy(ImVec2(0, 2 * sc));
+    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
+    ImGui::BeginChild("##swarmwave", ImVec2(0, 0),
+                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+
+    ui::IconUV iv = ui::getIcon("team", 20);
+    if (!iv.valid) iv = ui::getIcon("milestone_flag", 20);
+    if (iv.valid) {
+        float gz = ImGui::GetTextLineHeight();
+        ImGui::Image(iv.texId, ImVec2(gz, gz), iv.uv0, iv.uv1, semanticOnGlass(pal.accent, surf));
+        ImGui::SameLine(0, 6 * sc);
+    }
+    ImGui::PushFont(fonts.medium);
+    ImGui::TextColored(semanticOnGlass(pal.accent, surf), "%s",
+                       a.title.empty() ? "Swarm wave" : a.title.c_str());
+    ImGui::PopFont();
+
+    // Task rows from packed detail.
+    if (!a.detail.empty()) {
+        try {
+            auto j = nlohmann::json::parse(a.detail);
+            if (j.is_object() && j.contains("tasks") && j["tasks"].is_array()) {
+                for (const auto& t : j["tasks"]) {
+                    if (!t.is_object()) continue;
+                    std::string tt = jstr(t, "title");
+                    std::string stt = jstr(t, "status");
+                    if (tt.empty()) continue;
+                    char line[256];
+                    if (!stt.empty())
+                        std::snprintf(line, sizeof(line), "  %s  \xc2\xb7 %s", tt.c_str(), stt.c_str());
+                    else
+                        std::snprintf(line, sizeof(line), "  %s", tt.c_str());
+                    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+                    ImGui::TextUnformatted(line);
+                    ImGui::PopStyleColor();
+                }
+            }
+        } catch (...) {
+            if (!a.reason.empty()) dimText(a.reason.c_str());
+        }
+    } else if (!a.reason.empty()) {
+        dimText(a.reason.c_str());
+    }
+
+    ImGui::EndChild();
+    ImRect cardRect = endGlassBubble(gb);
+    chatCopyContext(cardRect, "##swarm_wave_copy", chatActivityCopyText(a));
+}
+
+static void drawFirmBidsCard(const ActivityItem& a, const ui::Fonts& fonts) {
+    const auto& pal = ui::palette;
+    const float sc = ui::uiScale;
+    const ui::AdaptiveSurface& surf = chatSurf();
+    ImGui::Dummy(ImVec2(0, 2 * sc));
+    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
+    ImGui::BeginChild("##firmbids", ImVec2(0, 0),
+                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+
+    ui::IconUV iv = ui::getIcon("bookmark", 20);
+    if (!iv.valid) iv = ui::getIcon("team", 20);
+    if (iv.valid) {
+        float gz = ImGui::GetTextLineHeight();
+        ImGui::Image(iv.texId, ImVec2(gz, gz), iv.uv0, iv.uv1, semanticOnGlass(pal.accent, surf));
+        ImGui::SameLine(0, 6 * sc);
+    }
+    ImGui::PushFont(fonts.medium);
+    ImGui::TextColored(semanticOnGlass(pal.accent, surf), "%s",
+                       a.title.empty() ? "Firm bids" : a.title.c_str());
+    ImGui::PopFont();
+    if (!a.reason.empty()) {
+        ImGui::SameLine(0, 8 * sc);
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+        ImGui::TextUnformatted(a.reason.c_str());
+        ImGui::PopStyleColor();
+    }
+
+    if (!a.detail.empty()) {
+        try {
+            auto j = nlohmann::json::parse(a.detail);
+            if (j.is_object() && j.contains("bids") && j["bids"].is_array()) {
+                for (const auto& b : j["bids"]) {
+                    if (!b.is_object()) continue;
+                    std::string firm = jstr(b, "firm");
+                    if (firm.empty()) continue;
+                    double usd = 0.0;
+                    long tokens = 0;
+                    if (b.contains("usd") && b["usd"].is_number()) usd = b["usd"].get<double>();
+                    if (b.contains("tokens") && b["tokens"].is_number_integer())
+                        tokens = b["tokens"].get<long>();
+                    else if (b.contains("tokens") && b["tokens"].is_number())
+                        tokens = (long)b["tokens"].get<double>();
+                    bool inScope = true, within = true;
+                    if (b.contains("in_scope") && b["in_scope"].is_boolean())
+                        inScope = b["in_scope"].get<bool>();
+                    if (b.contains("within_budget") && b["within_budget"].is_boolean())
+                        within = b["within_budget"].get<bool>();
+                    char line[256];
+                    if (tokens > 0 && usd > 0.0)
+                        std::snprintf(line, sizeof(line), "  %s  \xc2\xb7 %ld tok  \xc2\xb7 $%.2f",
+                                      firm.c_str(), tokens, usd);
+                    else if (usd > 0.0)
+                        std::snprintf(line, sizeof(line), "  %s  \xc2\xb7 $%.2f", firm.c_str(), usd);
+                    else
+                        std::snprintf(line, sizeof(line), "  %s", firm.c_str());
+                    ImVec4 col = surf.textPrimary;
+                    if (!inScope || !within) col = surf.textTertiary;
+                    ImGui::PushStyleColor(ImGuiCol_Text, col);
+                    ImGui::TextUnformatted(line);
+                    ImGui::PopStyleColor();
+                    if (!inScope || !within) {
+                        ImGui::SameLine(0, 6 * sc);
+                        ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+                        ImGui::TextUnformatted(!inScope ? "out of scope" : "over budget");
+                        ImGui::PopStyleColor();
+                    }
+                }
+            }
+            // Awarded firm chip when packed on the same event.
+            std::string awarded = jstr(j, "awarded_firm");
+            if (!awarded.empty()) {
+                double ausd = 0.0;
+                if (j.contains("awarded_usd") && j["awarded_usd"].is_number())
+                    ausd = j["awarded_usd"].get<double>();
+                char aw[160];
+                if (ausd > 0.0)
+                    std::snprintf(aw, sizeof(aw), "Awarded %s  \xc2\xb7 $%.2f", awarded.c_str(), ausd);
+                else
+                    std::snprintf(aw, sizeof(aw), "Awarded %s", awarded.c_str());
+                ImGui::Dummy(ImVec2(0, 2 * sc));
+                ImGui::PushStyleColor(ImGuiCol_Text, semanticOnGlass(pal.statusOk, surf));
+                ImGui::TextUnformatted(aw);
+                ImGui::PopStyleColor();
+            }
+        } catch (...) {}
+    }
+
+    ImGui::EndChild();
+    ImRect cardRect = endGlassBubble(gb);
+    // Copy: human summary, never raw JSON.
+    std::string copyTxt = a.title.empty() ? "Firm bids" : a.title;
+    if (!a.reason.empty()) { copyTxt += "\n"; copyTxt += a.reason; }
+    try {
+        auto j = nlohmann::json::parse(a.detail);
+        if (j.is_object() && j.contains("bids") && j["bids"].is_array()) {
+            for (const auto& b : j["bids"]) {
+                if (!b.is_object()) continue;
+                std::string firm = jstr(b, "firm");
+                if (firm.empty()) continue;
+                copyTxt += "\n- ";
+                copyTxt += firm;
+                if (b.contains("usd") && b["usd"].is_number()) {
+                    char u[32];
+                    std::snprintf(u, sizeof(u), " $%.2f", b["usd"].get<double>());
+                    copyTxt += u;
+                }
+            }
+        }
+    } catch (...) {}
+    chatCopyContext(cardRect, "##firm_bids_copy", copyTxt);
+}
+
+static void drawFirmAwardCard(const ActivityItem& a, const ui::Fonts& fonts) {
+    const auto& pal = ui::palette;
+    const float sc = ui::uiScale;
+    const ui::AdaptiveSurface& surf = chatSurf();
+    ImGui::Dummy(ImVec2(0, 2 * sc));
+    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
+    ImGui::BeginChild("##firmaward", ImVec2(0, 0),
+                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+
+    ui::IconUV iv = ui::getIcon("poly_star", 20);
+    if (!iv.valid) iv = ui::getIcon("milestone_flag", 20);
+    if (iv.valid) {
+        float gz = ImGui::GetTextLineHeight() * 0.95f;
+        ImGui::Image(iv.texId, ImVec2(gz, gz), iv.uv0, iv.uv1,
+                     semanticOnGlass(pal.statusOk, surf));
+        ImGui::SameLine(0, 6 * sc);
+    }
+    ImGui::PushFont(fonts.medium);
+    ImGui::TextColored(semanticOnGlass(pal.statusOk, surf), "%s",
+                       a.title.empty() ? "Firm awarded" : a.title.c_str());
+    ImGui::PopFont();
+    if (!a.reason.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+        ImGui::TextWrapped("%s", a.reason.c_str());
+        ImGui::PopStyleColor();
+    }
+
+    ImGui::EndChild();
+    ImRect cardRect = endGlassBubble(gb);
+    chatCopyContext(cardRect, "##firm_award_copy", chatActivityCopyText(a));
+}
+
+static void drawFirmTeamCard(const ActivityItem& a, const ui::Fonts& fonts) {
+    const auto& pal = ui::palette;
+    const float sc = ui::uiScale;
+    const ui::AdaptiveSurface& surf = chatSurf();
+    ImGui::Dummy(ImVec2(0, 2 * sc));
+    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
+    ImGui::BeginChild("##firmteam", ImVec2(0, 0),
+                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+
+    ui::IconUV iv = ui::getIcon("team", 20);
+    if (iv.valid) {
+        float gz = ImGui::GetTextLineHeight();
+        ImGui::Image(iv.texId, ImVec2(gz, gz), iv.uv0, iv.uv1, semanticOnGlass(pal.accent, surf));
+        ImGui::SameLine(0, 6 * sc);
+    }
+    ImGui::PushFont(fonts.medium);
+    ImGui::TextColored(semanticOnGlass(pal.accent, surf), "%s",
+                       a.title.empty() ? "Firm team" : a.title.c_str());
+    ImGui::PopFont();
+    if (!a.reason.empty()) {
+        ImGui::SameLine(0, 8 * sc);
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+        ImGui::TextUnformatted(a.reason.c_str());
+        ImGui::PopStyleColor();
+    }
+
+    if (!a.detail.empty()) {
+        try {
+            auto j = nlohmann::json::parse(a.detail);
+            if (j.is_object() && j.contains("members") && j["members"].is_array()) {
+                for (const auto& mem : j["members"]) {
+                    if (!mem.is_object()) continue;
+                    std::string role = jstr(mem, "role");
+                    std::string name = jstr(mem, "name");
+                    std::string firm = jstr(mem, "firm");
+                    bool lead = false;
+                    if (mem.contains("lead") && mem["lead"].is_boolean())
+                        lead = mem["lead"].get<bool>();
+                    char line[256];
+                    if (lead)
+                        std::snprintf(line, sizeof(line), "  %s  \xc2\xb7 %s  \xc2\xb7 lead",
+                                      role.empty() ? "role" : role.c_str(),
+                                      name.empty() ? (firm.empty() ? "?" : firm.c_str())
+                                                   : name.c_str());
+                    else if (!firm.empty() && firm != name)
+                        std::snprintf(line, sizeof(line), "  %s  \xc2\xb7 %s  \xc2\xb7 %s",
+                                      role.empty() ? "role" : role.c_str(),
+                                      name.empty() ? "?" : name.c_str(), firm.c_str());
+                    else
+                        std::snprintf(line, sizeof(line), "  %s  \xc2\xb7 %s",
+                                      role.empty() ? "role" : role.c_str(),
+                                      name.empty() ? "?" : name.c_str());
+                    ImGui::PushStyleColor(ImGuiCol_Text,
+                                          lead ? semanticOnGlass(pal.accent, surf)
+                                               : surf.textPrimary);
+                    ImGui::TextUnformatted(line);
+                    ImGui::PopStyleColor();
+                }
+            }
+        } catch (...) {}
+    }
+
+    ImGui::EndChild();
+    ImRect cardRect = endGlassBubble(gb);
+    std::string copyTxt = a.title.empty() ? "Firm team" : a.title;
+    if (!a.reason.empty()) { copyTxt += "\n"; copyTxt += a.reason; }
+    try {
+        auto j = nlohmann::json::parse(a.detail);
+        if (j.is_object() && j.contains("members") && j["members"].is_array()) {
+            for (const auto& mem : j["members"]) {
+                if (!mem.is_object()) continue;
+                copyTxt += "\n- ";
+                copyTxt += jstr(mem, "role");
+                std::string name = jstr(mem, "name");
+                if (!name.empty()) { copyTxt += "  "; copyTxt += name; }
+            }
+        }
+    } catch (...) {}
+    chatCopyContext(cardRect, "##firm_team_copy", copyTxt);
+}
+
+static void drawFirmCommCard(ActivityItem& a, const ui::Fonts& fonts) {
+    const auto& pal = ui::palette;
+    const float sc = ui::uiScale;
+    const ui::AdaptiveSurface& surf = chatSurf();
+    ImGui::Dummy(ImVec2(0, 2 * sc));
+    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
+    ImGui::BeginChild("##firmcomm", ImVec2(0, 0),
+                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+
+    // Header is the expander toggle — collapsed by default (a.expanded starts false).
+    ImGui::PushFont(fonts.medium);
+    ImGui::TextColored(surf.textSecondary, "%s",
+                       a.title.empty() ? "Internal comms" : a.title.c_str());
+    ImGui::PopFont();
+    if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+    if (ImGui::IsItemClicked()) {
+        a.expanded = !a.expanded;
+        a.userToggled = true;
+    }
+    ImGui::SameLine(0, 6 * sc);
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+    if (!a.reason.empty()) {
+        ImGui::TextUnformatted(a.reason.c_str());
+        ImGui::SameLine(0, 6 * sc);
+    }
+    ImGui::TextUnformatted(a.expanded ? "(hide)" : "(show)");
+    ImGui::PopStyleColor();
+    if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+    if (ImGui::IsItemClicked()) {
+        a.expanded = !a.expanded;
+        a.userToggled = true;
+    }
+
+    if (a.expanded && !a.detail.empty()) {
+        // Scrollable thread body — plain lines, not raw JSON.
+        drawProseBox("##firmcommbody", a.detail, ui::metrics::copilotProseMaxH());
+    }
+
+    ImGui::EndChild();
+    ImRect cardRect = endGlassBubble(gb);
+    std::string copyTxt = a.title.empty() ? "Internal comms" : a.title;
+    if (!a.reason.empty()) { copyTxt += "\n"; copyTxt += a.reason; }
+    if (!a.detail.empty()) { copyTxt += "\n"; copyTxt += a.detail; }
+    chatCopyContext(cardRect, "##firm_comm_copy", copyTxt);
+    (void)pal;
+}
+
+static void drawAdvisorCard(ActivityItem& a, const ui::Fonts& fonts) {
+    const auto& pal = ui::palette;
+    const float sc = ui::uiScale;
+    const ui::AdaptiveSurface& surf = chatSurf();
+    const bool planApproval = (a.opsCount > 0);  // feed stamps opsCount=1 for plan-approval
+    ImGui::Dummy(ImVec2(0, 2 * sc));
+    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
+    ImGui::BeginChild("##advisor", ImVec2(0, 0),
+                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+
+    ui::IconUV iv = ui::getIcon("poly_star", 20);
+    if (!iv.valid) iv = ui::getIcon("bookmark", 20);
+    if (iv.valid) {
+        float gz = ImGui::GetTextLineHeight() * 0.95f;
+        ImVec4 tint = planApproval ? semanticOnGlass(pal.statusOk, surf)
+                                   : semanticOnGlass(pal.accent, surf);
+        ImGui::Image(iv.texId, ImVec2(gz, gz), iv.uv0, iv.uv1, tint);
+        ImGui::SameLine(0, 6 * sc);
+    }
+    ImGui::PushFont(fonts.medium);
+    ImGui::TextColored(planApproval ? semanticOnGlass(pal.statusOk, surf)
+                                   : semanticOnGlass(pal.accent, surf),
+                       "%s",
+                       a.title.empty()
+                           ? (planApproval ? "Advisor-approved plan" : "Advisor")
+                           : a.title.c_str());
+    ImGui::PopFont();
+    // Toggle expand.
+    if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+    if (ImGui::IsItemClicked()) {
+        a.expanded = !a.expanded;
+        a.userToggled = true;
+    }
+    if (planApproval) {
+        // Collapsed-by-default informational — verdict chip always visible.
+        ImGui::SameLine(0, 8 * sc);
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+        ImGui::TextUnformatted(a.reason.empty() ? "approved" : a.reason.c_str());
+        ImGui::PopStyleColor();
+        ImGui::SameLine(0, 6 * sc);
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+        ImGui::TextUnformatted(a.expanded ? "(hide)" : "(details)");
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        if (ImGui::IsItemClicked()) {
+            a.expanded = !a.expanded;
+            a.userToggled = true;
+        }
+        if (a.expanded && !a.detail.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+            ImGui::TextWrapped("%s", a.detail.c_str());
+            ImGui::PopStyleColor();
+        }
+        // No action buttons — informational only.
+    } else {
+        if (a.expanded) {
+            if (!a.reason.empty()) {
+                ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+                ImGui::TextWrapped("Q: %s", a.reason.c_str());
+                ImGui::PopStyleColor();
+            }
+            if (!a.detail.empty()) {
+                ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+                ImGui::TextWrapped("%s", a.detail.c_str());
+                ImGui::PopStyleColor();
+            }
+        } else if (!a.detail.empty()) {
+            std::string prev = a.detail;
+            if (prev.size() > 100) { prev.resize(97); prev += "\xe2\x80\xa6"; }
+            dimText(prev.c_str());
+        }
+    }
+
+    ImGui::EndChild();
+    ImRect cardRect = endGlassBubble(gb);
+    std::string copyTxt = a.title.empty()
+        ? (planApproval ? "Advisor-approved plan" : "Advisor")
+        : a.title;
+    if (!a.reason.empty()) {
+        copyTxt += planApproval ? "\n" : "\nQ: ";
+        copyTxt += a.reason;
+    }
+    if (!a.detail.empty()) { copyTxt += "\n"; copyTxt += a.detail; }
+    chatCopyContext(cardRect, "##advisor_copy", copyTxt);
+}
+
+static void drawSubRunCard(const ActivityItem& a, const ui::Fonts& fonts) {
+    const auto& pal = ui::palette;
+    const float sc = ui::uiScale;
+    const ui::AdaptiveSurface& surf = chatSurf();
+    ImGui::Dummy(ImVec2(0, 1 * sc));
+    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 6.0f);
+    ImGui::BeginChild("##subrun", ImVec2(0, 0),
+                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+
+    ImVec4 statusCol = surf.textSecondary;
+    if (a.status == "running") statusCol = semanticOnGlass(pal.accent, surf);
+    else if (a.status == "done" || a.status == "pass")
+        statusCol = semanticOnGlass(pal.statusOk, surf);
+    else if (a.status == "fail" || a.status == "error")
+        statusCol = semanticOnGlass(pal.statusErr, surf);
+
+    ImGui::PushFont(fonts.medium);
+    ImGui::TextColored(statusCol, "%s", a.title.empty() ? "Sub-run" : a.title.c_str());
+    ImGui::PopFont();
+    if (!a.reason.empty()) {
+        ImGui::SameLine(0, 8 * sc);
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+        ImGui::TextUnformatted(a.reason.c_str());
+        ImGui::PopStyleColor();
+    }
+
+    ImGui::EndChild();
+    ImRect cardRect = endGlassBubble(gb);
+    chatCopyContext(cardRect, "##sub_run_copy", chatActivityCopyText(a));
+}
+
+
 static void drawAgentTimeline(ChatMsg& m, const ui::Fonts& fonts, float logW, bool showThinking) {
     if (m.activity.empty()) return;
     ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
@@ -4508,6 +5657,20 @@ static void drawAgentTimeline(ChatMsg& m, const ui::Fonts& fonts, float logW, bo
             drawCorpSteeringCard(a, fonts);
         } else if (a.rowKind == 7 || a.rowKind == 8) {
             drawCorpMutedLine(a, fonts);
+        } else if (a.rowKind == 11) {
+            drawSwarmWaveCard(a, fonts);
+        } else if (a.rowKind == 12) {
+            drawFirmBidsCard(a, fonts);
+        } else if (a.rowKind == 13) {
+            drawFirmAwardCard(a, fonts);
+        } else if (a.rowKind == 14) {
+            drawFirmTeamCard(a, fonts);
+        } else if (a.rowKind == 15) {
+            drawFirmCommCard(a, fonts);
+        } else if (a.rowKind == 16) {
+            drawAdvisorCard(a, fonts);
+        } else if (a.rowKind == 17) {
+            drawSubRunCard(a, fonts);
         } else if (isThinkingItem(a)) {
             bool laterDone = false;
             for (size_t j = i + 1; j < m.activity.size(); ++j) {
@@ -5529,7 +6692,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
 
     // (4) Pre-flight clarify gate: the model's build-critical questions, awaiting the user.
     if (m.clarify.active) drawClarifyCard(st, m, fonts);
-    // (4b) Plan-mode approve gate (plan_only finished → Execute as Agent/Swarm).
+    // (4b) Plan-mode / mission plan_ready approve gate (Execute as Agent/Swarm/Eng.Firm).
     if (m.planApprovePending && !m.running) drawPlanApproveCard(st, m, fonts);
 
     // (5) Legacy v1 AgentStep cards — kept for backward compat (glass-restyled in drawAgentStep).
@@ -11340,6 +12503,14 @@ static void submitTurn(AppState& st, const std::string& text) {
 
     if (swarmMode) {
         st.addLog("[..] swarm: " + text);
+        // Agent-decided plan is advisor-approved in-core — no user approve card.
+        // liveStatus shows drafting then execution continues automatically.
+        for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
+            if (!it->fromUser && it->running) {
+                it->liveStatus = "Drafting plan for swarm execution\xe2\x80\xa6";
+                break;
+            }
+        st.status = "Drafting plan for swarm execution...";  st.statusKind = 0;
         nlohmann::json extras = withOptions(turnExtras, {
             {"mode", "swarm"},
             {"corporate_force", true},
@@ -11359,12 +12530,14 @@ static void submitTurn(AppState& st, const std::string& text) {
 
     if (engFirmMode) {
         // USER-ONLY: Eng. Firm is never auto-invoked by Agent/Ask auto-routing.
-        // Only this explicit composer-mode branch may set mode/org/execute_as eng_firm.
-        // Engineering-firm org: the heaviest structure — specialist roles + contractor
-        // firms bidding on tasks within a $ budget. Routes through the mission path with
-        // the eng_firm org flag + the configured budget so the C++ harness assembles the
-        // firm structure (corporate_force guarantees multi-agent execution).
+        // Agent-decided plan is advisor-approved in-core — no user approve card.
         st.addLog("[..] eng.firm: " + text);
+        for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
+            if (!it->fromUser && it->running) {
+                it->liveStatus = "Drafting plan for eng. firm execution\xe2\x80\xa6";
+                break;
+            }
+        st.status = "Drafting plan for eng. firm execution...";  st.statusKind = 0;
         nlohmann::json extras = withOptions(turnExtras, {
             {"mode", "eng_firm"},
             {"org", "eng_firm"},

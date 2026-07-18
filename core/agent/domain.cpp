@@ -90,13 +90,23 @@ DomainVerdict classify_domain(const std::string& request) {
         r.find("engineering drawing") != std::string::npos)
         return {Domain::Drawing, "2D drawing terms"};
 
+    // Corpus: "two brackets that bolt together with M5 assembly" → Assembly
     if (any_word(r, {"assembly", "assemble", "mate", "mates", "components", "fastened",
-                     "bolt together", "linkage", "mechanism", "gearbox"}))
+                     "bolt together", "screw together", "linkage", "mechanism", "gearbox"}))
         return {Domain::Assembly, "assembly/mate terms"};
 
+    // Sheet-metal: explicit family names + formed-part cues.
+    // Corpus: "sheetmetal enclosure 200x120x60mm, 1.5mm steel" → Sheetmetal (sm_* ops)
+    // "flange" alone can be a pipe flange (Modeling default via later fallthrough is wrong
+    // if we key only on flange — keep flange here because sm_flange is the common CAD
+    // sense; pipe flanges still get sheetmetal tools which is acceptable overspill).
     if (any_word(r, {"sheetmetal", "sheet metal", "flange", "hem", "bend", "jog",
-                     "flat pattern", "gauge"}) ||
-        r.find("sheet-metal") != std::string::npos)
+                     "flat pattern", "gauge", "sm_"}) ||
+        r.find("sheet-metal") != std::string::npos ||
+        // bare "enclosure" + ferrous stock thickness language → formed sheet part
+        (has_word(r, "enclosure") &&
+         (has_word(r, "steel") || has_word(r, "aluminum") || has_word(r, "aluminium") ||
+          has_word(r, "gauge"))))
         return {Domain::Sheetmetal, "sheet-metal terms"};
 
     if (any_word(r, {"bom", "vendor", "sourcing", "purchase", "catalog", "part number",
@@ -109,6 +119,7 @@ DomainVerdict classify_domain(const std::string& request) {
         return {Domain::Research, "research/lookup, no geometry"};
 
     // Default: solid part modeling.
+    // Corpus: standoff/washer/chamfer/plate/hinge/knob/coordinate system/garbage → Modeling
     return {Domain::Modeling, "solid modeling (default)"};
 }
 

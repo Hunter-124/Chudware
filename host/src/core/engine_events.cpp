@@ -226,7 +226,7 @@ void handleEvent(AppState& st, const json& evt) {
         if (origKind == "stage_started") {
             e.notes = stage + " > " + role + " attempt " +
                       std::to_string(d.value("attempt", 0) + 1) + "...";
-        } else if (origKind == "run_finished") {
+        } else if (origKind == "run_finished" || origKind == "mission_finished") {
             e.notes = "run " + d.value("status", std::string());
             const std::string sr = d.value("stop_reason", std::string());
             std::string ed = d.value("error_detail", std::string());
@@ -245,6 +245,35 @@ void handleEvent(AppState& st, const json& evt) {
             e.notes = prov + " \xc2\xb7 " + model +
                       (http > 0 ? " HTTP " + std::to_string(http) : std::string(" transport")) +
                       " " + std::to_string(lat) + "ms";
+        } else if (origKind == "mission_task_started") {
+            e.notes = d.value("title", std::string());
+        } else if (origKind == "swarm_wave") {
+            const int wave = d.value("wave", 0);
+            const int total = d.value("total_waves", 0);
+            char buf[64];
+            if (total > 0)
+                std::snprintf(buf, sizeof(buf), "Wave %d/%d", wave, total);
+            else
+                std::snprintf(buf, sizeof(buf), "Wave %d", wave);
+            e.notes = buf;
+        } else if (origKind == "firm_bids") {
+            e.notes = "Collecting firm bids...";
+        } else if (origKind == "firm_award") {
+            const std::string firm = d.value("firm", std::string());
+            e.notes = firm.empty() ? "Firm awarded" : ("Awarded " + firm);
+        } else if (origKind == "firm_team") {
+            e.notes = "Assembling firm team...";
+        } else if (origKind == "firm_comm") {
+            // Frequent — keep notes empty so liveStatus isn't spammed; card appends lines.
+        } else if (origKind == "advisor") {
+            const std::string stg = d.value("stage", std::string());
+            e.notes = stg.empty() ? "Advisor" : ("Advisor \xc2\xb7 " + stg);
+        } else if (origKind == "sub_run") {
+            const std::string purpose = d.value("purpose", std::string());
+            const std::string stt = d.value("status", std::string());
+            if (!purpose.empty() && !stt.empty()) e.notes = purpose + " (" + stt + ")";
+            else if (!purpose.empty()) e.notes = purpose;
+            else e.notes = "Sub-run";
         }
         {
             std::lock_guard<std::mutex> lk(st.job.evMtx);

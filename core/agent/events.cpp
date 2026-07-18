@@ -362,7 +362,7 @@ json plan_state_items_from_steps(const std::vector<std::string>& steps,
         // After a fail, later steps stay pending; earlier stay done (set above).
         if (fail_index >= 0 && static_cast<int>(i) < fail_index) status = "done";
         const std::string& step = steps[i];
-        items.push_back(json{{"id", "step-" + std::to_string(i)},
+        items.push_back(json{{"id", "model:" + std::to_string(i)},
                              {"title", plan_item_title(step)},
                              {"desc", step},
                              {"status", status},

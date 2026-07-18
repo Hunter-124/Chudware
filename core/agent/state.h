@@ -10,6 +10,8 @@
 #pragma once
 
 #include "agent/complexity.h"
+#include "agent/domain.h"
+
 
 #include <functional>
 #include <map>
@@ -84,6 +86,12 @@ struct DesignState {
     // solo modeler/fixer prompts pick the slim ops cheatsheet.
     Complexity complexity = Complexity::Standard;
     bool complexity_set = false;
+
+    // Domain of this run (set by run.cpp after classify_domain). When domain_set
+    // is false, build_context may re-classify from request. Domain also seeds
+    // tool_scope_classes for sheetmetal/weldments/surfacing cheatsheets.
+    Domain domain = Domain::Modeling;
+    bool domain_set = false;
 
     // Dynamic tool-scope escalation (model emits request_tools mid-run).
     // tool_scope_full: Solo runs upgrade from ops_cheatsheet_solo.md to the full sheet.

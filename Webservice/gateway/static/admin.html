@@ -5,17 +5,144 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Chudware — Admin</title>
 <link rel="stylesheet" href="/static/portal.css">
+<link rel="stylesheet" href="/static/vendor/xterm.css">
 <style>
-  .admin-wrap {
-    max-width: 760px;
-    margin: 40px auto;
-    padding: 0 max(16px, env(safe-area-inset-right)) max(24px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
+  html, body {
+    height: 100%;
+    margin: 0;
+    overflow: hidden;
   }
-  .admin-card { background: var(--panel, #16181d); border: 1px solid var(--border, #2a2e36);
-                border-radius: 12px; padding: 20px 24px; margin-bottom: 20px; }
-  .admin-card h2 { margin: 0 0 14px; font-size: 1.05rem; }
-  table.users { width: 100%; border-collapse: collapse; font-size: .92rem; }
-  table.users th, table.users td { text-align: left; padding: 8px 10px;
+  .admin-wrap {
+    display: flex;
+    flex-direction: row;
+    width: 100%;
+    height: 100dvh;
+    max-width: none;
+    margin: 0;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+    gap: 0;
+    box-sizing: border-box;
+    overflow: hidden;
+  }
+
+  /* ---- left: terminal ---- */
+  .admin-term-pane {
+    flex: 1 1 auto;
+    min-width: 0;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    background: #0b0d12;
+    border-right: 1px solid var(--border, #2a2e36);
+  }
+  .term-tabs {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 6px 8px;
+    background: #12151c;
+    border-bottom: 1px solid var(--border, #2a2e36);
+    flex-shrink: 0;
+    overflow-x: auto;
+    min-height: 40px;
+  }
+  .term-tab {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 10px;
+    border-radius: 8px;
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--muted, #8b93a3);
+    font-size: .82rem;
+    cursor: pointer;
+    white-space: nowrap;
+    min-height: 32px;
+    touch-action: manipulation;
+  }
+  .term-tab:hover { background: rgba(255,255,255,.04); color: var(--fg, #e8eaf0); }
+  .term-tab.active {
+    background: #1a1f2a;
+    border-color: var(--border, #2a2e36);
+    color: var(--fg, #e8eaf0);
+  }
+  .term-tab .term-tab-x {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    border-radius: 4px;
+    border: none;
+    background: transparent;
+    color: inherit;
+    font-size: .85rem;
+    line-height: 1;
+    cursor: pointer;
+    padding: 0;
+    opacity: .65;
+  }
+  .term-tab .term-tab-x:hover { opacity: 1; background: rgba(255,107,122,.18); color: #ff6b7a; }
+  .term-tab-new {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    border-radius: 8px;
+    border: 1px dashed var(--border, #2a2e36);
+    background: transparent;
+    color: var(--muted, #8b93a3);
+    font-size: 1.1rem;
+    line-height: 1;
+    cursor: pointer;
+    flex-shrink: 0;
+    touch-action: manipulation;
+  }
+  .term-tab-new:hover { color: var(--fg, #e8eaf0); border-color: var(--teal-hi, #42ecce); }
+  #term-host {
+    flex: 1 1 auto;
+    min-height: 0;
+    position: relative;
+    background: #0b0d12;
+  }
+  #term-host .term-session {
+    position: absolute;
+    inset: 0;
+    padding: 4px 6px 6px;
+    display: none;
+  }
+  #term-host .term-session.active { display: block; }
+  #term-host .xterm { height: 100%; }
+  #term-host .xterm-viewport { overflow-y: auto !important; }
+
+  /* ---- right: admin cards ---- */
+  .admin-side {
+    flex: 0 0 380px;
+    width: 380px;
+    max-width: 42vw;
+    min-width: 300px;
+    min-height: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding: 10px 12px 16px;
+    background: rgba(12, 14, 20, 0.92);
+    box-sizing: border-box;
+  }
+  .admin-side .back-row {
+    margin: 0 0 8px;
+  }
+  .admin-card {
+    background: var(--panel, #16181d);
+    border: 1px solid var(--border, #2a2e36);
+    border-radius: 12px;
+    padding: 14px 16px;
+    margin-bottom: 12px;
+  }
+  .admin-card h2 { margin: 0 0 12px; font-size: 1rem; }
+  table.users { width: 100%; border-collapse: collapse; font-size: .85rem; }
+  table.users th, table.users td { text-align: left; padding: 6px 6px;
                 border-bottom: 1px solid var(--border, #2a2e36); vertical-align: top; }
   table.users th { color: var(--muted, #8b93a3); font-weight: 500; }
   .pill { display: inline-block; padding: 4px 10px; border-radius: 999px; font-size: .78rem;
@@ -27,37 +154,37 @@
             border-radius: 8px; padding: 8px 14px; min-height: 40px; cursor: pointer;
             touch-action: manipulation; }
   .rm-btn:hover, .rm-btn:focus-visible { background: #2a1a20; }
-  form.add-user { display: grid; grid-template-columns: 1.8fr 1.2fr 1.2fr auto auto auto;
-                  gap: 10px; align-items: center; }
+  form.add-user { display: grid; grid-template-columns: 1fr; gap: 8px; align-items: center; }
   .admin-wrap input[type=text], .admin-wrap input[type=email] {
       background: var(--bg, #0e1013); color: var(--fg, #e8eaf0);
       border: 1px solid var(--border, #2a2e36);
-      border-radius: 8px; padding: 10px 12px; min-height: 44px; width: 100%;
-      font-size: 16px; }
+      border-radius: 8px; padding: 10px 12px; min-height: 40px; width: 100%;
+      font-size: 16px; box-sizing: border-box; }
   form.add-user label { font-size: .85rem; color: var(--muted, #8b93a3); white-space: nowrap;
-                        min-height: 44px; display: inline-flex; align-items: center; gap: 8px; }
-  form.add-user button { padding: 10px 18px; min-height: 44px; }
-  #admin-status { margin-top: 12px; font-size: .85rem; color: var(--muted, #8b93a3);
+                        min-height: 40px; display: inline-flex; align-items: center; gap: 8px; }
+  form.add-user .add-checks { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+  form.add-user button { padding: 10px 18px; min-height: 40px; width: 100%; }
+  #admin-status { margin-top: 10px; font-size: .82rem; color: var(--muted, #8b93a3);
                   white-space: pre-wrap; }
   #admin-status.err { color: #e07a8a; }
-  .back { color: var(--muted, #8b93a3); text-decoration: none; font-size: .9rem;
-          display: inline-flex; align-items: center; min-height: 44px; }
-  #default-form { display: flex; gap: 10px; align-items: center; margin: 0 0 6px; flex-wrap: wrap; }
+  .back { color: var(--muted, #8b93a3); text-decoration: none; font-size: .88rem;
+          display: inline-flex; align-items: center; min-height: 36px; }
+  #default-form { display: flex; gap: 8px; align-items: center; margin: 0 0 6px; flex-wrap: wrap; }
   #user-cards { display: none; flex-direction: column; gap: 10px; }
   .user-card {
     border: 1px solid var(--border, #2a2e36);
     border-radius: 12px;
     background: var(--bg, #0e1013);
-    padding: 14px;
+    padding: 12px;
     display: flex;
     flex-direction: column;
-    gap: 10px;
+    gap: 8px;
   }
   .user-card .uc-email { font-weight: 600; word-break: break-all; }
-  .user-card .uc-meta { color: var(--muted, #8b93a3); font-size: .88rem; }
+  .user-card .uc-meta { color: var(--muted, #8b93a3); font-size: .85rem; }
   .user-card .uc-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
   .user-card .uc-actions { display: flex; flex-wrap: wrap; gap: 8px; }
-  .user-card .uc-actions .btn, .user-card .uc-actions .rm-btn { flex: 1 1 auto; min-height: 44px; }
+  .user-card .uc-actions .btn, .user-card .uc-actions .rm-btn { flex: 1 1 auto; min-height: 40px; }
   #browse-modal > div {
     max-width: 640px;
     margin: 8vh auto;
@@ -69,12 +196,45 @@
     display: flex;
     flex-direction: column;
   }
+  #log-pre {
+    max-height: 220px;
+    overflow: auto;
+    font-size: .72rem;
+    background: var(--bg, #0e1013);
+    border: 1px solid var(--border, #2a2e36);
+    border-radius: 8px;
+    padding: 10px;
+    white-space: pre-wrap;
+    margin: 0;
+  }
+
   @media (max-width: 720px) {
-    .admin-wrap { margin: 20px auto; }
-    .admin-card { padding: 16px; }
+    html, body { overflow: auto; height: auto; }
+    .admin-wrap {
+      flex-direction: column;
+      height: auto;
+      min-height: 100dvh;
+      overflow: visible;
+    }
+    .admin-term-pane {
+      flex: 0 0 auto;
+      min-height: 50dvh;
+      height: 50dvh;
+      border-right: none;
+      border-bottom: 1px solid var(--border, #2a2e36);
+    }
+    .admin-side {
+      flex: 1 1 auto;
+      width: 100%;
+      max-width: none;
+      min-width: 0;
+      overflow: visible;
+      padding: 12px;
+    }
+    .admin-card { padding: 14px; }
     form.add-user {
       grid-template-columns: 1fr;
-      gap: 12px;
+      gap: 10px;
       align-items: stretch;
     }
     form.add-user label { white-space: normal; }
@@ -93,55 +253,66 @@
 </head>
 <body>
 <div class="admin-wrap">
-  <p><a class="back" href="/">&larr; back to portal</a></p>
-  <div class="admin-card">
-    <h2>Live sessions</h2>
-    <div id="host-bar" style="font-size:.85rem;color:var(--muted,#8b93a3);margin:0 0 12px">loading…</div>
-    <div id="ops-rows" style="display:flex;flex-direction:column;gap:12px"></div>
-    <div id="ops-empty" style="font-size:.88rem;color:var(--muted,#8b93a3);display:none">
-      Nobody is connected right now.</div>
-  </div>
-  <div class="admin-card">
-    <h2>Allowlist — who can log in</h2>
-    <p style="font-size:.85rem;color:var(--muted,#8b93a3)">
-      Adding an email updates the gateway allowlist <em>and</em> the Cloudflare Access
-      policy, so new people can log in immediately (email OTP or Google).
-      <code>example.com</code> entries are dev-only and never pushed to Access.
-    </p>
-    <form id="default-form">
-      <label style="white-space:nowrap;font-size:.9rem">Default project for everyone:</label>
-      <input type="text" id="f-default-project" placeholder="(none)" list="project-list" style="flex:1;min-width:0">
-      <button type="button" id="btn-browse" class="btn ghost" style="white-space:nowrap">Browse host…</button>
-      <button type="submit" class="btn primary" style="white-space:nowrap">Set for all</button>
-    </form>
-    <div id="default-doc-row" style="font-size:.85rem;color:var(--muted,#8b93a3);margin:0 0 14px"></div>
-    <table class="users">
-      <thead><tr><th>Email</th><th>Name</th><th>Role</th><th>Project</th><th></th></tr></thead>
-      <tbody id="user-rows"></tbody>
-    </table>
-    <div id="user-cards" aria-live="polite"></div>
-  </div>
-  <div class="admin-card">
-    <h2>Add someone</h2>
-    <form class="add-user" id="add-form">
-      <input type="email" id="f-email" placeholder="email@example.edu" required>
-      <input type="text" id="f-display" placeholder="Display name">
-      <input type="text" id="f-project" placeholder="Default project" list="project-list" title="PLM project opened when their session starts">
-      <datalist id="project-list"></datalist>
-      <label><input type="checkbox" id="f-admin"> admin</label>
-      <label><input type="checkbox" id="f-heavy"> GPU seat</label>
-      <button type="submit" class="btn primary">Add</button>
-    </form>
-    <div id="admin-status"></div>
-  </div>
-  <div class="admin-card">
-    <h2>Gateway log</h2>
-    <div style="display:flex;gap:10px;margin:0 0 10px">
-      <button type="button" id="log-refresh" class="btn ghost">Refresh</button>
-      <label style="font-size:.85rem;color:var(--muted,#8b93a3);align-self:center">
-        <input type="checkbox" id="log-follow"> follow</label>
+  <div class="admin-term-pane">
+    <div class="term-tabs" id="term-tabs" role="tablist" aria-label="Terminal tabs">
+      <button type="button" class="term-tab-new" id="term-new" title="New terminal (Ctrl+Alt+T)" aria-label="New terminal">+</button>
     </div>
-    <pre id="log-pre" style="max-height:320px;overflow:auto;font-size:.75rem;background:var(--bg,#0e1013);border:1px solid var(--border,#2a2e36);border-radius:8px;padding:10px;white-space:pre-wrap;margin:0">(press Refresh)</pre>
+    <div id="term-host"></div>
+  </div>
+
+  <div class="admin-side">
+    <p class="back-row"><a class="back" href="/">&larr; back to portal</a></p>
+    <div class="admin-card">
+      <h2>Live sessions</h2>
+      <div id="host-bar" style="font-size:.85rem;color:var(--muted,#8b93a3);margin:0 0 12px">loading…</div>
+      <div id="ops-rows" style="display:flex;flex-direction:column;gap:12px"></div>
+      <div id="ops-empty" style="font-size:.88rem;color:var(--muted,#8b93a3);display:none">
+        Nobody is connected right now.</div>
+    </div>
+    <div class="admin-card">
+      <h2>Allowlist — who can log in</h2>
+      <p style="font-size:.85rem;color:var(--muted,#8b93a3)">
+        Adding an email updates the gateway allowlist <em>and</em> the Cloudflare Access
+        policy, so new people can log in immediately (email OTP or Google).
+        <code>example.com</code> entries are dev-only and never pushed to Access.
+      </p>
+      <form id="default-form">
+        <label style="white-space:nowrap;font-size:.9rem">Default project for everyone:</label>
+        <input type="text" id="f-default-project" placeholder="(none)" list="project-list" style="flex:1;min-width:0">
+        <button type="button" id="btn-browse" class="btn ghost" style="white-space:nowrap">Browse host…</button>
+        <button type="submit" class="btn primary" style="white-space:nowrap">Set for all</button>
+      </form>
+      <div id="default-doc-row" style="font-size:.85rem;color:var(--muted,#8b93a3);margin:0 0 14px"></div>
+      <table class="users">
+        <thead><tr><th>Email</th><th>Name</th><th>Role</th><th>Project</th><th></th></tr></thead>
+        <tbody id="user-rows"></tbody>
+      </table>
+      <div id="user-cards" aria-live="polite"></div>
+    </div>
+    <div class="admin-card">
+      <h2>Add someone</h2>
+      <form class="add-user" id="add-form">
+        <input type="email" id="f-email" placeholder="email@example.edu" required>
+        <input type="text" id="f-display" placeholder="Display name">
+        <input type="text" id="f-project" placeholder="Default project" list="project-list" title="PLM project opened when their session starts">
+        <datalist id="project-list"></datalist>
+        <div class="add-checks">
+          <label><input type="checkbox" id="f-admin"> admin</label>
+          <label><input type="checkbox" id="f-heavy"> GPU seat</label>
+        </div>
+        <button type="submit" class="btn primary">Add</button>
+      </form>
+      <div id="admin-status"></div>
+    </div>
+    <div class="admin-card">
+      <h2>Gateway log</h2>
+      <div style="display:flex;gap:10px;margin:0 0 10px">
+        <button type="button" id="log-refresh" class="btn ghost">Refresh</button>
+        <label style="font-size:.85rem;color:var(--muted,#8b93a3);align-self:center">
+          <input type="checkbox" id="log-follow"> follow</label>
+      </div>
+      <pre id="log-pre">(press Refresh)</pre>
+    </div>
   </div>
 </div>
 <div id="browse-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:50">
@@ -160,5 +331,8 @@
   </div>
 </div>
 <script src="/static/admin.js?v=6"></script>
+<script src="/static/vendor/xterm.js"></script>
+<script src="/static/vendor/xterm-addon-fit.js"></script>
+<script src="/static/admin_terminal.js?v=1"></script>
 </body>
 </html>

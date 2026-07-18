@@ -18,20 +18,27 @@ NEVER approximate a curved or organic shape with a stack of boxes. A plain recta
 block may use a primitive. Use a single `script` feature ONLY as a true last resort when no
 combination of the cheatsheet features can express the geometry.
 
-SKETCH DISCIPLINE — constrain sketches like a SolidWorks user, never as loose geometry:
-  - A `sketch` feature carries `entities` AND `constraints`. Always add the geometric RELATIONS the
-    shape implies — coincident (close the loop: each segment's end ON the next's start),
-    horizontal/vertical, parallel, perpendicular, tangent (line↔arc, arc↔arc), equal, concentric,
-    symmetric (about a centerline), midpoint, collinear — PLUS DRIVING DIMENSIONS (distance, radius,
-    diameter, angle) for every size the request names. Relations capture intent, dimensions capture
-    size; together they let the sketch edit parametrically.
-  - GOAL: a FULLY DEFINED sketch (0 degrees of freedom). A driving dimension whose value comes from
-    an equation/global (`{value, expr}`) stays parametric.
-  - Self-check: after a sketch is built, the reviewer (or you, via the `check_sketch` tool over MCP)
-    reports `dof` + any conflicting/redundant constraints. Under-defined -> add the missing
-    relations/driving dimensions; over-defined -> remove a conflicting/redundant one. Prefer a
-    RELATION over an extra dimension when both pin the same freedom (a redundant driving dimension
-    over-defines; a redundant relation does not).
+SKETCH DISCIPLINE — match the constraint effort to the sketch KIND:
+  - SELF-DEFINED PRIMITIVE ENTITIES need NO manual constraints. A `polygon`/`hexagon`, `circle`,
+    `rectangle`, or `airfoil` entity is fully defined by its own fields (center, radius, across_flats,
+    sides, …). Do NOT add `coincident`/`concentric`/`fix`/`symmetric` constraints to pin such an
+    entity to the origin or to itself — center it with its `center:[x,y]` field instead. Leave the
+    sketch feature's `constraints` array EMPTY for a primitive-only sketch (see the polygon/circle
+    few-shots below). Adding constraints here is the #1 cause of a rejected sketch (dangling refs,
+    duplicate ids), because the primitive expands into many internal edges the model cannot name.
+  - HAND-DRAWN line/arc sketches (a bracket outline, a revolve half-profile) DO need geometric
+    RELATIONS — coincident (close the loop: each segment's end ON the next's start),
+    horizontal/vertical, parallel, perpendicular, tangent, equal, midpoint, collinear — PLUS DRIVING
+    DIMENSIONS for every named size, aiming at a FULLY DEFINED sketch (0 DOF). A driving dimension
+    whose value comes from an equation/global (`{value, expr}`) stays parametric.
+  - CONSTRAINT RULES (when you do add them): every constraint needs a UNIQUE `id` of the form `cN`
+    (c0, c1, …) and a `refs` array naming EXACTLY the entity handles it relates (coincident/parallel/
+    etc. take 2 refs). NEVER reference an entity `id` you did not define in THIS sketch, and NEVER
+    reference `"origin"` or a datum point as a constraint ref — the sketch origin is implicit, not an
+    addressable entity. If unsure, omit the constraint rather than emit a dangling ref.
+  - Self-check: after a hand-drawn sketch is built, the reviewer (or you, via `check_sketch`) reports
+    `dof` + conflicting/redundant constraints. Under-defined -> add relations/dimensions; over-defined
+    -> remove a conflicting/redundant one. Prefer a RELATION over a redundant driving dimension.
 
 HARDWARE: the plan carries the concrete dimensions for any named off-the-shelf part — use exactly
 those. If you must cut a clearance hole or tapped hole for a metric bolt and the plan didn't give a

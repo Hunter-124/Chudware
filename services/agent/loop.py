@@ -1437,16 +1437,16 @@ def run_turn(session: Session, request: str, provider: Provider,
         pass
 
     # Resolve capability for scaffolds (default C = no scaffold tax).
-    _cap = capability
-    if _cap is None:
+    _capprof = capability
+    if _capprof is None:
         try:
             from services.agent.scaffolds import coerce_profile  # noqa: PLC0415
-            _cap = coerce_profile(tier=tier)
+            _capprof = coerce_profile(tier=tier)
         except Exception:  # noqa: BLE001
-            _cap = None
+            _capprof = None
     try:
         from services.agent import scaffolds as _sc  # noqa: PLC0415
-        if _cap is not None and _sc.plan_first_for(_cap):
+        if _capprof is not None and _sc.plan_first_for(_capprof):
             plan_first = True
             buildgraph_first = True  # A: buildgraph checklist with rigid plan
     except Exception:  # noqa: BLE001
@@ -1528,9 +1528,9 @@ def run_turn(session: Session, request: str, provider: Provider,
     if first_turn:
         if buildgraph_first:
             _make_plan_with_buildgraph(session, request, provider, on_event,
-                                      capability=_cap)
+                                      capability=_capprof)
         elif plan_first:
-            _make_plan(session, request, provider, on_event, capability=_cap)
+            _make_plan(session, request, provider, on_event, capability=_capprof)
         opening = FIRST_USER.format(request=request)
         if session.plan:
             opening += "\n\n" + _plan_text(session.plan)
@@ -1834,13 +1834,13 @@ def run_turn(session: Session, request: str, provider: Provider,
                 try:
                     from services.agent import scaffolds as _sc  # noqa: PLC0415
                     if _sc.should_stop_refine(
-                            _cap, stable_geometry_count,
+                            _capprof, stable_geometry_count,
                             ledger=_ledger, actor="loop"):
                         converged = True
                         stop_reason = "refine_cap"
                         # Still show the successful render once, then stop after feedback.
                         # Break immediately — first stable geometry is the allowed pass.
-                        if getattr(_cap, "refine_passes", 2) == 0:
+                        if getattr(_capprof, "refine_passes", 2) == 0:
                             break
                 except Exception:  # noqa: BLE001
                     pass

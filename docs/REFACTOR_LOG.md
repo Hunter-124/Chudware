@@ -1571,3 +1571,55 @@ No tmux → falls back to the old private shell. **Host dep:** `dnf install -y t
 Verified: create→attach(×1)→detach(persists)→kill and 2-client concurrent smoke; gateway
 pytest terminal+admin 11/11 (10 pre-existing failures unrelated — env "not_on_list", identical
 on stashed tree).
+
+## Agent harness overhaul — auto-router, tool categories, streaming, GUI modes, grok completion
+
+Reworked the copilot/agent harness so Agent mode "just does the work" instead of
+dead-ending. **Files touched:** `core/agent/ask.cpp`+`ask.h` (kAskSystem no longer
+tells the user to switch modes — offers direct apply; ask is now C++-only, Python
+mirror is gone), `core/agent/micro.cpp` (install the run.cpp streaming DeltaCoalescer
+so micro design runs also emit live `assistant_delta`), host `legacy_chat.cpp` +
+`app_state.h` + `app.cpp` (Ask auto-promotes build/edit intent to Agent; Agent
+auto-invokes ask for pure questions; Eng.Firm stays USER-ONLY; assistant text streams
+into the chat bubble as a waterfall — tool-call JSON never streamed; per-message
+`copilotMode`-colored borders for all 6 modes + history persist; confirmed `msg:N`
+rewind now clears chat below client-side even when the backend omits
+`chat_truncate_to`), `services/agent/copilot_mode_tools.py` (new `SHARED_DEFAULT_TOOLS`
+floor — make/save/open/close + web + advise + ask_user — unioned into every mode) +
+new `services/agent/tool_categories.py` (`CATEGORY_PACKS` + `enable_tools`/
+`list_tool_categories` meta-tools for mid-turn category expansion with a 40-tool cap,
+so restricted modes get a compact category menu instead of the full catalog) +
+`tool_schemas.py`/`agent_turn.py`/`mission_dispatch.py`/`tool_registry.py` wiring +
+`test_mode_tools.py`, `services/agent/prompts/modeler.md` (SKETCH DISCIPLINE rewrite:
+self-defined primitives — polygon/hexagon/circle/airfoil — take NO manual constraints;
+only hand-drawn line/arc sketches get relations; never ref an uncreated id or the
+origin), and `services/agent/loop.py` (fixed a pre-existing shadow bug: the local
+`_cap = capability` clobbered the module `_cap()` string helper used at 1699/1703,
+crashing the Python `run_turn`/`run_agent.py` path — renamed the local to `_capprof`).
+
+**Verified:** core+host build green; `test_mode_tools`/`workflow_router`/`mega24`
+offline suites green (+4 new passing, ZERO new full-suite failures vs baseline's 27
+pre-existing live-provider/ordering fails); C++ router units (agent/machine/complexity/
+domain) pass. **Live grok (xai-sub / grok-4.5)** on "a knurled hex standoff, 22mm tall,
+M3 clearance bore" via the real C++ `agent_run` path: routes solo → agent design (NOT
+eng_firm — 0 firm events), streams `assistant_delta` live, model stage passes on the
+FIRST attempt ("applied 4 ops") and builds a valid 3-feature part (sketch HexSketch +
+extrude HexBody + hole M3ClearanceBore, vol ≈ 277 mm³). Before the modeler.md fix grok
+failed the model stage 5× (over-constraining the hex primitive with dangling/duplicate
+constraint refs) — the prompt fix cured that at the root.
+
+**Gotchas / deferred:** (1) `core/build-linux/bin/libaicad.so` is a SLIM (no-OCCT)
+build that `./build.sh core` does NOT relink — it was stale from a prior day and
+rejected the (already-supported) flat `add_feature` form, which cost a wasted debug
+cycle; the PRODUCTION lib is `host/build-linux/bin/libaicad.so` staged from
+`core/build-occt-linux` — always test against that. (2) grok-4.5 is slow per call
+(~100-150 s with reasoning); a full solo run including the review/refine loop can exceed
+700 s even though the geometry builds on the first model pass — this is model latency,
+not a harness bug. (3) An engine-side constraint normalizer (flat `{type,a,b}` →
+`{id,refs}`, drop-with-note unresolvable inline constraints) was considered as
+belt-and-suspenders but deferred: the modeler.md prompt fix removes the root cause and
+session.cpp changes carry engine-oracle parity cost. (4) GUI mode borders / rewind /
+bubble-streaming compile clean but want a human visual pass in the running app.
+(5) Pre-existing, NOT introduced here: `feature_surface_audit` red in check.py; the
+`test_sourcing_subagent`/`test_subagent_registry`/`test_roles` failures need a real
+`XAI_API_KEY` (config uses xai-sub OAuth) and fail environmentally.

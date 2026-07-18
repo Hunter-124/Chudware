@@ -1677,11 +1677,23 @@ static void drawModelRolesSection(AppState& st, float sc) {
             ImGui::TableNextColumn();
             ImGui::AlignTextToFramePadding();
             ImGui::TextUnformatted(kRoleLabels[i]);
-            if (std::strcmp(key, "vision") == 0) {
-                // Dim "(?)" info marker — same helpMarker helper used elsewhere in Settings.
-                helpMarker("Vision role: image & geometry understanding \xe2\x80\x94 translating "
-                           "3D geometry to text and validating models from renderings/screenshots. "
-                           "Point this at your most capable vision model.");
+            // Purpose tooltip on every role (vision has the full vision-review description).
+            if (std::strcmp(key, "advisor") == 0) {
+                helpMarker("Steering / Q&A advisor that guides agents with short notes without doing the work itself.");
+            } else if (std::strcmp(key, "task") == 0) {
+                helpMarker("Leaf worker/builder that executes CAD ops, edits, and concrete subagent tasks.");
+            } else if (std::strcmp(key, "planning") == 0) {
+                helpMarker("Orchestrator / plan-mode model that drafts multi-step build plans and coordinates work.");
+            } else if (std::strcmp(key, "vision") == 0) {
+                helpMarker("Translates renderings/screenshots for the worker models, checks and verifies their "
+                           "work/changes, and guides them through the visual modeling steps \xe2\x80\x94 while "
+                           "offloading the bulk of vision work to cheaper models (e.g. Grok) to save premium-vision tokens.");
+            } else if (std::strcmp(key, "default") == 0) {
+                helpMarker("Main copilot agent loop (agent / swarm / ask modes) when no more specific role applies.");
+            } else if (std::strcmp(key, "plm") == 0) {
+                helpMarker("Product lifecycle tasks \xe2\x80\x94 releases, document control, versioning, and PLM workflows.");
+            } else if (std::strcmp(key, "redaction") == 0) {
+                helpMarker("Local-only model that redacts sensitive data before anything leaves the machine.");
             }
             if (isRedaction) {
                 ImGui::SameLine();
@@ -2018,6 +2030,9 @@ const SettingsEntry kSettingsEntries[] = {
     { "Anthropic key",            "AI",           2 },
     { "OpenAI key",               "AI",           2 },
     { "Cloud API key",            "AI",           2 },
+    { "Moonshot",                 "AI",           2 },
+    { "Kimi",                     "AI",           2 },
+    { "Moonshot key",             "AI",           2 },
     { "Vision",                   "AI",           2 },
     { "Offline mode",             "AI",           2 },
     { "Reasoning effort",         "AI",           2 },
@@ -2465,6 +2480,30 @@ void drawSettingsModal(AppState& st, bool busy) {
 
                 settingsGlassSectionBegin("##ai_accounts", "Accounts");
                 drawSubscriptionAccounts(st, sc);
+                settingsGlassSectionEnd();
+
+                // Moonshot key is first-class (keys.moonshot) and can be parked while another
+                // provider stays active — surface it even when Provider & Model isn't on Moonshot.
+                settingsGlassSectionBegin("##ai_moonshot", "Moonshot (Kimi)");
+                dimText("Configured but not the active provider. Store a key to park credit; "
+                        "pick a Kimi model later when you want to use it.");
+                ImGui::TextUnformatted("API key (platform.moonshot.ai)");
+                ImGui::SetNextItemWidth(-1);
+                if (ImGui::InputText("##settings_moonshot_key", st.settings.moonshotKey,
+                                     sizeof(st.settings.moonshotKey),
+                                     ImGuiInputTextFlags_Password)) {
+                    saveSettings(st.settings);
+                }
+                {
+                    const bool have = st.settings.moonshotKey[0] != '\0';
+                    ImGui::PushStyleColor(ImGuiCol_Text,
+                        have ? ui::Palette::toU32(ui::palette.statusOk)
+                             : ui::Palette::toU32(ui::palette.statusWarn));
+                    ImGui::TextUnformatted(have
+                        ? "key set \xe2\x80\x94 Kimi models appear in the picker when enabled"
+                        : "no key \xe2\x80\x94 paste a Moonshot API key when you have credit");
+                    ImGui::PopStyleColor();
+                }
                 settingsGlassSectionEnd();
 
                 settingsGlassSectionBegin("##ai_generation", "Generation");

@@ -2436,8 +2436,8 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
                 ++n;
             }
             if (!arts.empty()) {
-                if (!ni.detail.empty()) ni.detail += "\n\x1eART\x1e\n";
-                else ni.detail = "\x1eART\x1e\n";
+                if (!ni.detail.empty()) ni.detail += "\n\x1e" "ART\x1e\n";
+                else ni.detail = "\x1e" "ART\x1e\n";
                 ni.detail += arts;
             }
         }
@@ -3623,8 +3623,8 @@ static void drawToolCallRow(ActivityItem& a, const ui::Fonts& fonts) {
     std::string argsBody = a.detail;
     std::string artsBlob;
     {
-        const char* kArtMark = "\n\x1eART\x1e\n";
-        const char* kArtMarkBare = "\x1eART\x1e\n";
+        const char* kArtMark = "\n\x1e" "ART\x1e\n";
+        const char* kArtMarkBare = "\x1e" "ART\x1e\n";
         size_t mark = argsBody.find(kArtMark);
         if (mark != std::string::npos) {
             artsBlob = argsBody.substr(mark + std::strlen(kArtMark));
@@ -6095,13 +6095,17 @@ std::vector<OpenRouterModel> openRouterModels(AppState& st) {
 }
 
 // The active provider's API-key buffer (cloud providers keep separate keys; local reuses the
-// optional apiKey buffer).
+// optional apiKey buffer). Moonshot (api.moonshot.ai) uses keys.moonshot, not the generic
+// cloud_compat slot, so the active cloud preset can keep OpenRouter/DashScope/DeepSeek keys intact.
 static char* providerKeyBuf(Settings& s, int provider) {
     switch (provider) {
         case ui::PROV_GEMINI: return s.geminiKey;
         case ui::PROV_ANTHROPIC: return s.anthropicKey;
         case ui::PROV_OPENAI: return s.openaiKey;
-        case ui::PROV_CLOUDCOMPAT: return s.cloudKey;  // DashScope / DeepSeek / OpenAI-compatible
+        case ui::PROV_CLOUDCOMPAT:
+            if (std::string(s.baseUrl).find("moonshot.ai") != std::string::npos)
+                return s.moonshotKey;
+            return s.cloudKey;  // DashScope / DeepSeek / OpenRouter
         case ui::PROV_XAI: return s.xaiKey;
         default: return s.apiKey;  // local OpenAI-compatible optional key
     }
@@ -6283,13 +6287,17 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
     ImGui::Dummy(ImVec2(0, 6 * S));
     if (s.provider == ui::PROV_CLOUDCOMPAT) {
         // Cloud OpenAI-compatible: needs BOTH an endpoint (set by the preset, editable) and a key.
-        // OpenRouter is first-class — key status names the active service.
+        // OpenRouter is first-class — key status names the active service. Moonshot uses its own
+        // keys.moonshot buffer (via providerKeyBuf) so generic cloud_compat keys are preserved.
         const char* svc = ui::cloudServiceKey(s.baseUrl);
         const bool isOR = (std::strcmp(svc, "openrouter") == 0);
-        ImGui::TextUnformatted(isOR ? "OpenRouter endpoint" : "Endpoint (base URL)");
+        const bool isMS = (std::strcmp(svc, "moonshot") == 0);
+        ImGui::TextUnformatted(isOR ? "OpenRouter endpoint"
+                                    : (isMS ? "Moonshot endpoint" : "Endpoint (base URL)"));
         ImGui::SetNextItemWidth(-1);
         if (ImGui::InputText("##cloudbase", s.baseUrl, sizeof(s.baseUrl))) changed = true;
-        ImGui::TextUnformatted(isOR ? "OpenRouter API key" : "API key");
+        ImGui::TextUnformatted(isOR ? "OpenRouter API key"
+                                    : (isMS ? "Moonshot (Kimi) API key" : "API key"));
         char* key = providerKeyBuf(s, s.provider);
         ImGui::SetNextItemWidth(-1);
         if (ImGui::InputText("##provkey", key, 256, ImGuiInputTextFlags_Password)) changed = true;
@@ -6300,10 +6308,29 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
         if (isOR)
             ImGui::TextUnformatted(haveKey ? "OpenRouter key set — models available (blocked in Offline mode)"
                                            : "no OpenRouter key — add one at openrouter.ai/keys");
+        else if (isMS)
+            ImGui::TextUnformatted(haveKey
+                ? "Moonshot key set — Kimi available (blocked in Offline mode)"
+                : "no Moonshot key — add one at platform.moonshot.ai");
         else
             ImGui::TextUnformatted(haveKey ? "key set — cloud API available (blocked in Offline mode)"
                                            : "no API key — add your OpenRouter / DashScope / DeepSeek key");
         ImGui::PopStyleColor();
+        // Always surface the Moonshot key slot even when another cloud service is active, so
+        // credit can be parked without switching the default provider.
+        if (!isMS) {
+            ImGui::Dummy(ImVec2(0, 6 * S));
+            ImGui::TextUnformatted("Moonshot (Kimi) API key (dormant)");
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::InputText("##moonshotkey", s.moonshotKey, sizeof(s.moonshotKey),
+                                 ImGuiInputTextFlags_Password))
+                changed = true;
+            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
+            ImGui::TextUnformatted(s.moonshotKey[0]
+                ? "key stored \xe2\x80\x94 Moonshot is not the active provider"
+                : "optional \xe2\x80\x94 store a key without switching providers");
+            ImGui::PopStyleColor();
+        }
     } else if (s.provider == ui::PROV_XAI) {
         // xAI: SuperGrok / X Premium+ device-code OAuth AND/OR classic API key (console.x.ai).
         // Sign-in uses subscription_login{provider:"xai",device:true}; GUI polls subscription_status.
@@ -6640,8 +6667,10 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
             }
         }
         // Cloud services as their own categories. OpenRouter is discovered LIVE so its category
-        // lists every currently-free model (plus curated paid presets); Alibaba/DeepSeek use presets.
-        for (const char* svc : {"openrouter", "alibaba", "deepseek"}) {
+        // lists every currently-free model (plus curated paid presets); Alibaba/DeepSeek/Moonshot
+        // use curated presets. Moonshot is listed here for visibility even when not the active
+        // provider (models appear in the chat picker only once keys.moonshot is set).
+        for (const char* svc : {"openrouter", "alibaba", "deepseek", "moonshot"}) {
             std::vector<OpenRouterModel> rows;
             if (std::strcmp(svc, "openrouter") == 0) {
                 rows = openRouterModels(st);
@@ -6658,6 +6687,9 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
                 if (std::strcmp(svc, "openrouter") == 0)
                     dimText("Free models discovered live from OpenRouter (cost $0; still need a key "
                             "to run). Paid presets are listed too.");
+                else if (std::strcmp(svc, "moonshot") == 0)
+                    dimText("Moonshot (Kimi) is configured but not the active provider by default. "
+                            "Set keys.moonshot below / in Providers; pick a Kimi model when you want it.");
                 for (const auto& r : rows)
                     visRow(r.id, r.label, r.free ? "free" : (r.vision ? "vision" : "paid"),
                            r.free ? okCol : dimCol);
@@ -6788,10 +6820,31 @@ struct OvRolesUi {
 static OvRolesUi s_ovRoles;
 
 static const char* kOvRoleKeys[] = {
-    "advisor", "task", "planning", "default", "plm", "redaction"};
+    "advisor", "task", "planning", "vision", "default", "plm", "redaction"};
 static const char* kOvRoleLabels[] = {
-    "Advisor", "Task", "Planning", "Default", "PLM", "Redaction"};
-static constexpr int kOvRoleCount = 6;
+    "Advisor", "Task", "Planning", "Vision", "Default", "PLM", "Redaction"};
+static constexpr int kOvRoleCount = 7;
+
+// One-line purpose tooltips for Model Roles (matches harness roles in role_models.py).
+static const char* ovRoleTooltip(const char* key) {
+    if (std::strcmp(key, "advisor") == 0)
+        return "Steering / Q&A advisor that guides agents with short notes without doing the work itself.";
+    if (std::strcmp(key, "task") == 0)
+        return "Leaf worker/builder that executes CAD ops, edits, and concrete subagent tasks.";
+    if (std::strcmp(key, "planning") == 0)
+        return "Orchestrator / plan-mode model that drafts multi-step build plans and coordinates work.";
+    if (std::strcmp(key, "vision") == 0)
+        return "Translates renderings/screenshots for the worker models, checks and verifies their "
+               "work/changes, and guides them through the visual modeling steps \xe2\x80\x94 while "
+               "offloading the bulk of vision work to cheaper models (e.g. Grok) to save premium-vision tokens.";
+    if (std::strcmp(key, "default") == 0)
+        return "Main copilot agent loop (agent / swarm / ask modes) when no more specific role applies.";
+    if (std::strcmp(key, "plm") == 0)
+        return "Product lifecycle tasks \xe2\x80\x94 releases, document control, versioning, and PLM workflows.";
+    if (std::strcmp(key, "redaction") == 0)
+        return "Local-only model that redacts sensitive data before anything leaves the machine.";
+    return "";
+}
 
 static const char* ovRoleProviderWire(int prov) {
     switch (prov) {
@@ -6812,7 +6865,7 @@ static int ovRoleProviderFromWire(const std::string& w) {
     if (w == "local") return ui::PROV_LOCAL;
     if (w == "llamacpp") return ui::PROV_LLAMACPP;
     if (w == "gemini") return ui::PROV_GEMINI;
-    if (w == "openrouter" || w == "cloud" || w == "cloudcompat") return ui::PROV_CLOUDCOMPAT;
+    if (w == "openrouter" || w == "cloud" || w == "cloudcompat" || w == "moonshot") return ui::PROV_CLOUDCOMPAT;
     if (w == "xai" || w == "xai-sub") return ui::PROV_XAI;
     if (w == "cursor") return ui::PROV_CURSOR;
     return -1;
@@ -7544,6 +7597,10 @@ static void drawOvAgentsTab(AppState& st, float S, bool& changed) {
             // Compact single row: Role label | model combo | Thinking combo.
             ImGui::AlignTextToFramePadding();
             ImGui::TextUnformatted(kOvRoleLabels[i]);
+            if (ImGui::IsItemHovered()) {
+                const char* tip = ovRoleTooltip(key);
+                if (tip && tip[0]) ImGui::SetTooltip("%s", tip);
+            }
             if (a.isAuto) {
                 ImGui::SameLine(0, 4.0f * S);
                 ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.accent));
@@ -9221,6 +9278,37 @@ static void drawOvProvidersTab(AppState& st, float S) {
 
         ImGui::Dummy(ImVec2(0, 4.0f * S));
         ImGui::PopID();
+    }
+
+    // Moonshot (Kimi) API key — first-class keys.moonshot slot. Stored even when Moonshot is
+    // NOT the active provider so the user can park credit without switching defaults.
+    ImGui::Dummy(ImVec2(0, 6.0f * S));
+    ImGui::PushStyleColor(ImGuiCol_Text,
+        ImVec4(ui::palette.accent[0], ui::palette.accent[1], ui::palette.accent[2], 1.0f));
+    ImGui::TextUnformatted("Moonshot (Kimi)");
+    ImGui::PopStyleColor();
+    ImGui::SameLine();
+    ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
+    ImGui::TextUnformatted("not active");
+    ImGui::PopStyleColor();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Moonshot is configured but not the active provider. "
+                         "Paste a key to park credit; pick a Kimi model later to use it.");
+    ImGui::TextUnformatted("API key (platform.moonshot.ai)");
+    ImGui::SetNextItemWidth(-1);
+    if (ImGui::InputText("##ov_moonshot_key", st.settings.moonshotKey,
+                         sizeof(st.settings.moonshotKey), ImGuiInputTextFlags_Password)) {
+        // Persist immediately so keys.moonshot survives without waiting for another edit.
+        saveSettings(st.settings);
+    }
+    {
+        const bool have = st.settings.moonshotKey[0] != '\0';
+        ImGui::PushStyleColor(ImGuiCol_Text, have ? ui::Palette::toU32(ui::palette.statusOk)
+                                                 : ui::Palette::toU32(ui::palette.statusWarn));
+        ImGui::TextUnformatted(have
+            ? "key set \xe2\x80\x94 Kimi models available in the picker (not default)"
+            : "no key \xe2\x80\x94 paste a Moonshot API key when you have credit");
+        ImGui::PopStyleColor();
     }
 
     ImGui::EndChild();

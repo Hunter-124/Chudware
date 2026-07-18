@@ -182,7 +182,7 @@ inline const std::vector<LocalPreset>& localPresets() {
 // Cloud OpenAI-compatible API presets (PROV_CLOUDCOMPAT). Each bundles the service base URL with a
 // model id, so picking one fills both. These are NETWORK providers: they are REFUSED when Offline
 // (ITAR) mode is on — only the local open-weight presets above run under ITAR. DashScope = Alibaba
-// Cloud's Qwen API; api.deepseek.com = the official DeepSeek API.
+// Cloud's Qwen API; api.deepseek.com = the official DeepSeek API; api.moonshot.ai = Moonshot (Kimi).
 inline const std::vector<LocalPreset>& cloudPresets() {
     static const std::string kDashScope = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1";
     static const std::string kDeepSeek = "https://api.deepseek.com/v1";

@@ -1,4 +1,6 @@
-You are naming the finished part. Pick a short, descriptive display name for what was just built.
+You are documenting the finished part for future sessions. Base everything on what was actually
+built this turn — the feature tree and committed dimensions, not the original request.
 
-Reply with EXACTLY one ```json block and nothing else:
-{"name": "<2-5 word descriptive part name, no dimensions, no file extension>"}
+Pick a short, descriptive display name for the part (2-5 words, no dimensions, no file extension).
+Follow the EXACT json reply shape given in the instruction below, and reply with that one ```json
+block and nothing else.

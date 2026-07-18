@@ -1644,3 +1644,15 @@ so the core naming is live but the tab-title/auto-save/meter changes are not unt
 `ai/memory.json` entry in `contracts/stepplus.md` is now aspirational-only for the C++ path (optional
 field, readers tolerate absence) — left in place per append-only. (3) `contracts/doc_ops.md` was NOT
 extended for `doc_set_name` (integrator-owned); add it there if it should be a first-class doc method.
+
+#### Follow-up: memory is task-classified, not removed
+Refined the above: the memory stage is NOT deleted — it is GATED by complexity. Every design run
+still NAMES the part (all classes). Standard/Complex tasks (multi-feature parts, assemblies,
+projects) ALSO record durable per-part notes (summary/decisions/open_issues) persisted in the
+.step+ via `doc_set_meta("ai_notes")`, and those notes reload at run start (`doc_get_meta`) so a
+follow-up session understands an existing part. Solo one-off parts are named only (no notes, no
+wasted tokens) — mirrors the `solo_skip_plan` gate. A part that already has notes keeps them
+refreshed even on a Solo-classified follow-up edit (`want_notes = cx!=Solo || !state.memory.empty()`),
+so revisit context never goes stale. Files: `core/agent/run.cpp`, `services/agent/prompts/memory.md`.
+Verified on a scratch daemon: washer -> name only/no notes; bracket -> name + ai_notes; fillet-edit
+follow-up -> notes refreshed.

@@ -656,8 +656,16 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
     state.request = request;
     state.doc_id = doc_id;
     state.revision = tree0.value("revision", 0);
-    // _load_memory: the on-disk/session-embed load is a host concern; start empty.
+    // Per-part notes (ai_notes) persisted in the .step+ by a prior session's memory stage:
+    // load them so intake understands an EXISTING part on a follow-up run ("come back to the
+    // part"). Empty object for a fresh doc or a doc that never earned notes (Solo one-offs).
     state.memory = ojson::object();
+    try {
+        json m = doc::doc_get_meta(state.doc_id, "ai_notes");
+        if (m.is_object() && m.contains("value") && m["value"].is_object() && !m["value"].empty())
+            state.memory = ojson::parse(m["value"].dump());
+    } catch (...) {
+    }
     state.update_tree(tree_to_ojson(tree0.contains("tree") ? tree0["tree"] : json::object()));
 
     // Seed an approved plan so the plan stage is skipped (host Plan-mode resume).
@@ -1159,12 +1167,28 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         return o;
     };
 
-    // ---- MEMORY (repurposed: lightweight PART NAMING) ----
-    // Captured name is threaded into the run result as part_name and emitted as
-    // a part_named event so the host can refresh the tab title + auto-save.
+    // ---- MEMORY (task-classified) ----
+    // ALWAYS name the part (cheap, drives the file name + viewport + Feature Manager). For
+    // Standard/Complex tasks (multi-feature parts, assemblies, projects) ALSO record durable
+    // per-part notes so a future session understands the part — persisted in the .step+ (doc
+    // meta "ai_notes") and reloaded at run start above. Solo one-off parts are named only:
+    // no notes, no wasted tokens (matches the solo_skip_plan gate).
     std::string captured_part_name;
-    actions.memory = [&](DesignState& st, int) -> StageOutcome {
-        AgentCall ac = agent_call(provider, st, "memory", prompts_dir, call_budget, vision, ctx_cap);
+    // Non-Solo tasks earn notes; a part that ALREADY has notes (loaded above) keeps them
+    // refreshed even on a Solo-classified follow-up edit, so revisit context never goes stale.
+    const bool want_notes = (cx.level != Complexity::Solo) || !state.memory.empty();
+    actions.memory = [&, want_notes](DesignState& st, int) -> StageOutcome {
+        const std::string directive =
+            want_notes
+                ? "INSTRUCTION: name the part AND record durable notes for a future session. "
+                  "Reply with EXACTLY one json block: {\"name\": \"<2-5 word name, no dimensions>\", "
+                  "\"summary\": \"one sentence: what this part is\", "
+                  "\"decisions\": [\"key committed dimensions / design decisions\"], "
+                  "\"open_issues\": [\"unresolved problems, [] if none\"]}."
+                : "INSTRUCTION: just name the part — no notes needed. Reply with EXACTLY one json "
+                  "block: {\"name\": \"<2-5 word name, no dimensions, no file extension>\"}.";
+        AgentCall ac = agent_call(provider, st, "memory", prompts_dir, call_budget, vision, ctx_cap,
+                                  directive);
         StageOutcome o;
         fill_meta(o, ac);
         o.raw = ac.reply;
@@ -1182,8 +1206,23 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         }
         events.emit("part_named", json{{"name", name}, {"doc_id", st.doc_id}});
         captured_part_name = name;
+        // Durable per-part notes only for non-Solo tasks — persisted in the part file so a
+        // follow-up session reloads them (see run-start load). Never fails the run.
+        if (want_notes && parsed.is_object()) {
+            ojson notes = ojson::object();
+            for (const char* k : {"summary", "decisions", "open_issues"})
+                if (parsed.contains(k)) notes[k] = parsed[k];
+            if (!notes.empty()) {
+                notes["name"] = name;
+                st.memory = notes;
+                try {
+                    doc::doc_set_meta(st.doc_id, "ai_notes", json::parse(notes.dump()));
+                } catch (...) {
+                }
+            }
+        }
         o.verdict = "pass";
-        o.reason = "named: " + name;
+        o.reason = (want_notes ? "named + notes: " : "named: ") + name;
         o.parsed_ok = !name.empty();
         return o;
     };

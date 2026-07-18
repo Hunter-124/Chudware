@@ -683,7 +683,12 @@ TEST_CASE("run_machine emits plan_state build_plan and checklist") {
         o.parsed_ok = true;
         return o;
     };
-    actions.model = [](DesignState&, int) {
+    actions.model = [](DesignState& s, int) {
+        // A real model stage that passes has applied ops — advance revision and
+        // stamp a non-empty tree so the zero-progress/no_geometry guard sees built
+        // geometry (this test exercises plan_state events, not empty-run handling).
+        s.revision += 1;
+        s.tree_digest = "f1:extrude";
         StageOutcome o;
         o.verdict = "pass";
         o.reason = "modeled";

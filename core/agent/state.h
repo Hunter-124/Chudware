@@ -13,6 +13,7 @@
 
 #include <functional>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -83,6 +84,12 @@ struct DesignState {
     // solo modeler/fixer prompts pick the slim ops cheatsheet.
     Complexity complexity = Complexity::Standard;
     bool complexity_set = false;
+
+    // Dynamic tool-scope escalation (model emits request_tools mid-run).
+    // tool_scope_full: Solo runs upgrade from ops_cheatsheet_solo.md to the full sheet.
+    // tool_scope_classes: granted domain context sheets (sheetmetal/weldments/surfacing).
+    bool tool_scope_full = false;
+    std::set<std::string> tool_scope_classes;
 
     // Dynamic attr the model action sets (stagnation signal); see machine.py.
     bool last_no_progress = false;

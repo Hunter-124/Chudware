@@ -11,6 +11,7 @@
 #include <fstream>
 #include <map>
 #include <sstream>
+#include <thread>
 #include <unordered_set>
 
 #include "imgui.h"
@@ -27,6 +28,7 @@
 #include "../renderer.h"
 #include "../render/aicm_loader.h"   // parse the flow overlay's streamline / slice LINS chunks
 #include "util/aicm_handoff.h"       // is_shm_uri — overlay paths are aicm-shm:// handoff URIs, not files
+#include "engine_backend.h"         // engine::daemonMode — server-owned export paths
 #include "../ui_theme.h"
 
 namespace ui {
@@ -934,6 +936,13 @@ bool SimManager::handleCommand(AppState& st, const std::string& cmdId) {
 
     // sim-gui rework: creating a study opens its setup panel (PM-style, left pane) immediately.
     auto newAndOpen = [&](StudyType t) {
+#ifdef __EMSCRIPTEN__
+        if (isFlowFamily(t) || t == StudyType::Buckling || t == StudyType::Contact ||
+            t == StudyType::FreqResponse) {
+            st.toast(ui::ToastLevel::Warn, "not available in the web version yet");
+            return true;
+        }
+#endif
         newStudy(st, t);
         if (sel_ >= 0) { node_ = SimNode::Study; panelOpen_ = true; }
         return true;
@@ -1665,6 +1674,18 @@ void SimManager::applyResultField(AppState& st, Study& s) {
             return;
         }
     }
+    // Seed display state BEFORE the mesh load: commitDocMeshFromParsed reads
+    // activeScalarField at commit, and setMeshes re-applies a standing nonzero deformScale_.
+    st.colormapOn = true;
+    st.renderer->setColormapMode(true);
+    // Prefer a standing auto scale so async commit (WASM) lands deformed without a second pass.
+    if (st.renderer && st.dispScaleHint > 0)
+        st.renderer->setDeformScale(st.dispScaleHint);
+#ifdef __EMSCRIPTEN__
+    // Main/GL thread must not sync-fetch AICM (wedges ASYNCIFY). Loader pthread + drain commits.
+    pendingOverlayStudyId_ = s.id;
+    st.loadDocMeshAsync(s.overlayPath, /*renderOnly=*/false);
+#else
     std::string err;
     // FULL (not renderOnly) load: re-attaches the chosen named scalar to the mesh so the colormap
     // tracks the selected field. The renderOnly path drops scalar/disp, so it can't switch fields.
@@ -1672,6 +1693,12 @@ void SimManager::applyResultField(AppState& st, Study& s) {
         if (!err.empty()) st.addLog("[sim] overlay reload failed: " + err);
         return;
     }
+    finishResultOverlay(st, s);
+#endif
+}
+
+void SimManager::finishResultOverlay(AppState& st, Study& s) {
+    if (!st.renderer) return;
     st.colormapOn = true;
     st.renderer->setColormapMode(true);
     st.legendOn = st.docMeshHasScalar;
@@ -1696,6 +1723,7 @@ void SimManager::applyResultField(AppState& st, Study& s) {
         st.legendMin = (float)(vmin * fromSI);
         st.legendMax = (float)(vmax * fromSI);
     }
+    (void)s;
 }
 
 void SimManager::clearMeshPreview() {
@@ -1710,7 +1738,9 @@ void SimManager::previewMesh(AppState& st, Study& s) {
         return;
     }
     // T-PERF4: export + sim_mesh are long (up to 180s). AsyncRpc keeps the UI live.
-    const std::string stepPath = appdataAppDir() + "/cache/sim_mesh_preview.step";
+    // Daemon/WASM: empty path → hostd picks a server temp under aicad_cpp_docs.
+    const std::string stepPath =
+        engine::daemonMode() ? std::string() : (appdataAppDir() + "/cache/sim_mesh_preview.step");
     const std::string studyId = s.id;
     const int meshOrder = s.meshOrder;
     meshPreviewPending_ = true;
@@ -2535,6 +2565,13 @@ nlohmann::json SimManager::facePointsFor(AppState& st, const nlohmann::json& sel
 void SimManager::run(AppState& st, Study& s) {
     // Always re-seed material from the part so a FeatureManager / Mass Props change is honored.
     resolveStudyMaterialFromDoc(st, s);
+#ifdef __EMSCRIPTEN__
+    if (isFlowFamily(s.type) || s.type == StudyType::Buckling || s.type == StudyType::Contact ||
+        s.type == StudyType::FreqResponse) {
+        st.toast(ui::ToastLevel::Warn, "not available in the web version yet");
+        return;
+    }
+#endif
     if (s.type == StudyType::Motion)         runMotion(st, s);
     else if (isFlowFamily(s.type))           runFlow(st, s);
     else if (s.type == StudyType::Fatigue)   runFatigue(st, s);
@@ -2550,7 +2587,8 @@ void SimManager::runFatigue(AppState& st, Study& s) {
     auto* sim = st.simClient;
     if (!st.docMirror.hasDoc()) { st.addLog("[sim] no document to analyse"); return; }
 
-    std::string stepPath = appdataAppDir() + "/cache/sim_fatigue.step";
+    const std::string stepPath =
+        engine::daemonMode() ? std::string() : (appdataAppDir() + "/cache/sim_fatigue.step");
     {
         nlohmann::json r, p = {{"doc_id", st.docMirror.docId()}, {"path", stepPath}};
         std::string e;
@@ -2639,92 +2677,175 @@ void SimManager::runStaticOrModal(AppState& st, Study& s) {
     if (!st.simClient) return;
     auto* sim = st.simClient;
     if (!st.docMirror.hasDoc()) { st.addLog("[sim] no document to analyse"); return; }
-
-    std::string stepPath = appdataAppDir() + "/cache/sim_study.step";
-    {
-        nlohmann::json r, p = {{"doc_id", st.docMirror.docId()}, {"path", stepPath}};
-        std::string e;
-        if (!st.worker.call("doc_export_step", p, r, e, 60000) || r.contains("code")) {
-            st.addLog("[sim] export STEP failed: " + (r.contains("code") ? r.value("message", e) : e));
-            st.toast(ui::ToastLevel::Error, "Simulation: export failed");
-            return;
-        }
-        lastStepPath_ = r.value("path", stepPath);
-    }
-
-    nlohmann::json fixtures = nlohmann::json::array();
-    for (const auto& p : s.fixtures.picks) {
-        std::string e;
-        auto fp = facePointsFor(st, p.selector, e);
-        if (!fp.is_null() && fp.contains("points")) fixtures.push_back(fp);
-    }
-    if (fixtures.empty()) {
-        st.addLog("[sim] add at least one fixture face before running");
-        st.toast(ui::ToastLevel::Warn, "Add a fixture before running");
+    if (prepInFlight_ || sim->busy()) {
+        st.toast(ui::ToastLevel::Info, "A simulation is already in progress");
         return;
     }
 
+    // Snapshot study inputs on the UI thread, then run export + face_points + launch off-thread
+    // so the GL/main thread never blocks on 60s doc_export_step / N× doc_face_points (WASM-critical).
+    const std::string docId = st.docMirror.docId();
+    const std::string studyId = s.id;
+    const StudyType stype = s.type;
+    const int nModes = s.nModes;
+    const int meshOrder = s.meshOrder;
+    const std::string materialKey = s.materialKey;
+    const bool meshHex = s.meshHex;
+    const float meshFineness = s.meshFineness;
+    const bool meshCurvature = s.meshCurvature;
+    const float meshCurvPerCircle = s.meshCurvPerCircle;
+    const float meshTargetMm = s.meshTargetMm;
+    const float meshMinMm = s.meshMinMm;
+    const int meshAlgo = s.meshAlgo;
+    const bool meshOptimize = s.meshOptimize;
+
+    struct FacePick { nlohmann::json selector; };
+    struct LoadSnap {
+        bool pressure = false;
+        float vec[3] = {0, 0, -100};
+        float pressureMpa = 0.1f;
+        std::vector<FacePick> faces;
+    };
+    std::vector<FacePick> fixPicks;
+    for (const auto& p : s.fixtures.picks) fixPicks.push_back({p.selector});
+    std::vector<LoadSnap> loadSnaps;
+    if (stype == StudyType::Static) {
+        for (const auto& ld : s.loads) {
+            LoadSnap ls;
+            ls.pressure = ld.pressure;
+            ls.vec[0] = ld.vec[0]; ls.vec[1] = ld.vec[1]; ls.vec[2] = ld.vec[2];
+            ls.pressureMpa = ld.pressureMpa;
+            for (const auto& p : ld.faces.picks) ls.faces.push_back({p.selector});
+            loadSnaps.push_back(std::move(ls));
+        }
+    }
+
     nlohmann::json material = nlohmann::json::object();
-    int mi = materialIndexByKey(s.materialKey);
+    int mi = materialIndexByKey(materialKey);
     if (mi >= 0) {
         const auto& m = materials()[mi];
         material = {{"E_mpa", m.E_mpa}, {"nu", m.nu},
                     {"density_g_cm3", m.density_g_cm3}, {"yield_mpa", m.yield_mpa}};
     }
 
-    nlohmann::json study = {
-        {"step_path", lastStepPath_},
-        {"material", material}, {"fixtures", fixtures},
-    };
-    // 2nd-order (tet10) elements for static so bending is captured; modal stays 1st-order
-    // (its mass matrix is linear-only) — the engine forces order 1 for modal regardless.
-    // Modal has no hex8 mass matrix → force tetrahedral (and 1st-order) for it.
-    addMeshParams(study, s, s.type == StudyType::Static ? s.meshOrder : 1,
-                  /*allowHex=*/s.type == StudyType::Static);
+    // Mark busy immediately so the Run button disables while prep runs.
+    prepInFlight_ = true;
+    clearTransientResult(s);
+    clearMeshPreview();
+    resultShown_ = false; shownStudyId_.clear();
+    running_ = true; runningStudy_ = sel_; runningStudyId_ = s.id;
+    st.status = "Sim: preparing\xe2\x80\xa6"; st.statusKind = 0;
 
-    std::string note;
-    if (s.type == StudyType::Static) {
-        nlohmann::json loads = nlohmann::json::array();
-        for (const auto& ld : s.loads) {
-            nlohmann::json faces = nlohmann::json::array();
-            for (const auto& p : ld.faces.picks) {
-                std::string e;
-                auto fp = facePointsFor(st, p.selector, e);
-                if (!fp.is_null() && fp.contains("points")) {
-                    if (faces.empty()) faces = fp;
-                    else for (auto& pt : fp["points"]) faces["points"].push_back(pt);
-                }
+    // Capture mesh-option fields the addMeshParams helper would read from Study.
+    Study meshOpts;
+    meshOpts.meshHex = meshHex;
+    meshOpts.meshFineness = meshFineness;
+    meshOpts.meshCurvature = meshCurvature;
+    meshOpts.meshCurvPerCircle = meshCurvPerCircle;
+    meshOpts.meshTargetMm = meshTargetMm;
+    meshOpts.meshMinMm = meshMinMm;
+    meshOpts.meshAlgo = meshAlgo;
+    meshOpts.meshOptimize = meshOptimize;
+    meshOpts.meshOrder = meshOrder;
+
+    std::thread([this, &st, sim, docId, studyId, stype, nModes, material, fixPicks, loadSnaps,
+                 meshOpts]() {
+        auto failPrep = [this, &st](const std::string& msg) {
+            prepInFlight_ = false;
+            running_ = false;
+            st.toast(ui::ToastLevel::Error, msg);
+        };
+
+        // Empty path under daemon/WASM → server temp; desktop non-daemon keeps appdata cache path.
+        const std::string stepPath =
+            engine::daemonMode() ? std::string() : (appdataAppDir() + "/cache/sim_study.step");
+        nlohmann::json r, p = {{"doc_id", docId}, {"path", stepPath}};
+        std::string e;
+        if (!st.worker.call("doc_export_step", p, r, e, 60000) || r.contains("code")) {
+            failPrep("Simulation: export failed");
+            return;
+        }
+        const std::string resolved = r.value("path", stepPath);
+        lastStepPath_ = resolved;
+
+        auto facePts = [&](const nlohmann::json& selector, std::string& err) -> nlohmann::json {
+            nlohmann::json result;
+            nlohmann::json sel = selector;
+            if (sel.is_object()) sel.erase("_pick");
+            nlohmann::json params = {{"doc_id", docId}, {"selector", sel}};
+            if (!st.worker.call("doc_face_points", params, result, err, 30000)) return {};
+            if (result.contains("code")) {
+                err = result.value("message", std::string("face_points error"));
+                return {};
             }
-            if (faces.empty()) continue;
-            nlohmann::json l = {{"faces", faces}};
-            if (ld.pressure) { l["type"] = "pressure"; l["magnitude"] = ld.pressureMpa; }
-            else { l["type"] = "force"; l["vector"] = {ld.vec[0], ld.vec[1], ld.vec[2]}; }
-            loads.push_back(l);
+            return result;
+        };
+
+        nlohmann::json fixtures = nlohmann::json::array();
+        for (const auto& fpick : fixPicks) {
+            std::string fe;
+            auto fp = facePts(fpick.selector, fe);
+            if (!fp.is_null() && fp.contains("points")) fixtures.push_back(fp);
         }
-        study["loads"] = loads;
-        if (sim->launch("sim_run_static", {{"study", study}}, note, st.docMirror.docId())) {
-            clearTransientResult(s);
-            clearMeshPreview();
-            resultShown_ = false; shownStudyId_.clear();
-            running_ = true; runningStudy_ = sel_; runningStudyId_ = s.id;
+        if (fixtures.empty()) {
+            failPrep("Add a fixture before running");
+            return;
         }
-    } else {
-        if (sim->launch("sim_run_modal", {{"study", study}, {"n_modes", s.nModes}}, note,
-                        st.docMirror.docId())) {
-            clearTransientResult(s);
-            clearMeshPreview();
-            resultShown_ = false; shownStudyId_.clear();
-            running_ = true; runningStudy_ = sel_; runningStudyId_ = s.id;
+
+        nlohmann::json study = {
+            {"step_path", resolved},
+            {"material", material},
+            {"fixtures", fixtures},
+        };
+        Study meshStudy = meshOpts;  // non-const for addMeshParams
+        addMeshParams(study, meshStudy, stype == StudyType::Static ? meshOpts.meshOrder : 1,
+                      /*allowHex=*/stype == StudyType::Static);
+
+        std::string note;
+        bool launched = false;
+        if (stype == StudyType::Static) {
+            nlohmann::json loads = nlohmann::json::array();
+            for (const auto& ld : loadSnaps) {
+                nlohmann::json faces = nlohmann::json::array();
+                for (const auto& pck : ld.faces) {
+                    std::string fe;
+                    auto fp = facePts(pck.selector, fe);
+                    if (!fp.is_null() && fp.contains("points")) {
+                        if (faces.empty()) faces = fp;
+                        else for (auto& pt : fp["points"]) faces["points"].push_back(pt);
+                    }
+                }
+                if (faces.empty()) continue;
+                nlohmann::json l = {{"faces", faces}};
+                if (ld.pressure) { l["type"] = "pressure"; l["magnitude"] = ld.pressureMpa; }
+                else { l["type"] = "force"; l["vector"] = {ld.vec[0], ld.vec[1], ld.vec[2]}; }
+                loads.push_back(l);
+            }
+            study["loads"] = loads;
+            launched = sim->launch("sim_run_static", {{"study", study}}, note, docId);
+        } else {
+            launched = sim->launch("sim_run_modal", {{"study", study}, {"n_modes", nModes}}, note,
+                                  docId);
         }
-    }
-    st.addLog(note);
+        prepInFlight_ = false;
+        if (!launched) {
+            running_ = false;
+            st.toast(ui::ToastLevel::Error,
+                     note.empty() ? std::string("Simulation failed to start") : note);
+        } else {
+            // Prefer toast over addLog from a worker thread (addLog is not locked).
+            st.toast(ui::ToastLevel::Info, note.empty() ? "Simulation started" : note);
+        }
+        (void)studyId;
+    }).detach();
 }
 
 void SimManager::runFlow(AppState& st, Study& s) {
     if (!st.simClient) return;
     auto* sim = st.simClient;
     if (!st.docMirror.hasDoc()) { st.addLog("[sim] no document to analyse"); return; }
-    std::string stlPath = appdataAppDir() + "/cache/sim_flow.stl";
+    const std::string stlPath =
+        engine::daemonMode() ? std::string(".stl") : (appdataAppDir() + "/cache/sim_flow.stl");
     nlohmann::json r, p = {{"doc_id", st.docMirror.docId()}, {"path", stlPath}};
     std::string e;
     if (!st.worker.call("doc_export_step", p, r, e, 60000) || r.contains("code")) {
@@ -2785,6 +2906,7 @@ void SimManager::clearResultOverlay(AppState& st) {
     st.docMeshHasScalar = false;
     st.docMeshHasDisp = false;
     clearMeshPreview();
+    pendingOverlayStudyId_.clear();
     if (st.renderer) { st.renderer->setColormapMode(false); st.renderer->setDeformScale(0.0f); }
     // The overlay is no longer on the renderer; syncResultView re-applies it if Results is still up.
     resultShown_ = false;
@@ -2795,6 +2917,7 @@ void SimManager::clearResultOverlay(AppState& st) {
 
 void SimManager::restoreModelMesh(AppState& st) {
     clearResultOverlay(st);
+    pendingOverlayStudyId_.clear();
     if (!st.docMirror.hasDoc()) return;
     // The result overlay REPLACED the doc mesh with the FEA surface (no pickable faces). Re-tessellate
     // the current document so the editable, face-bearing model mesh comes back. activate() fires the
@@ -2804,9 +2927,13 @@ void SimManager::restoreModelMesh(AppState& st) {
     st.suppressTabDirty = true;
     std::string aicm, err;
     if (st.docMirror.activate(st.worker, st.docMirror.docId(), aicm, err) && !aicm.empty()) {
+#ifdef __EMSCRIPTEN__
+        st.loadDocMeshAsync(aicm);
+#else
         std::string le;
         if (!st.loadDocMesh(aicm, le) && !le.empty())
             st.addLog("[sim] restore model mesh: " + le);
+#endif
     } else if (!err.empty()) {
         st.addLog("[sim] restore model mesh failed: " + err);
     }
@@ -2856,6 +2983,15 @@ void SimManager::syncResultView(AppState& st) {
 void SimManager::tick(AppState& st) {
     syncResultView(st);   // keep the viewport in step with the result/model view (every frame, cheap)
     tickMotion(st);       // advance motion playback frame if playing
+    // WASM: finish legend/deform once loadDocMeshAsync has committed the overlay mesh.
+    if (!pendingOverlayStudyId_.empty() && (st.docMeshHasScalar || st.docMeshHasDisp)) {
+        for (auto& ss : studies_) {
+            if (ss.id != pendingOverlayStudyId_) continue;
+            finishResultOverlay(st, ss);
+            pendingOverlayStudyId_.clear();
+            break;
+        }
+    }
     // EM gating: probe the em_* backend ONCE when the Simulate workspace is active (async — the
     // callback lands in a later st.rpc.drain(); no per-frame or synchronous worker traffic).
     if (emStatus_ == 0 && !emProbeInflight_ &&
@@ -3068,6 +3204,15 @@ void SimManager::tick(AppState& st) {
 // material or fixtures required by the solver — the flow pipeline handles them).
 static bool studyReady(const Study& s, std::string& blocker) {
     if (s.type == StudyType::Motion) return true;  // Motion only needs a doc + optional mate-id
+#ifdef __EMSCRIPTEN__
+    // Python-worker-only legs (flow/LBM/OpenFOAM, CalculiX proxies, vibration post) are not
+    // available in the browser client yet — gate honestly rather than failing mid-run.
+    if (isFlowFamily(s.type) || s.type == StudyType::Buckling || s.type == StudyType::Contact ||
+        s.type == StudyType::FreqResponse) {
+        blocker = "not available in the web version yet";
+        return false;
+    }
+#endif
     if (isFlowFamily(s.type)) return true;
     // T-FIN24 kinds: the ccx proxies need only a material (E, nu — dims come from the part
     // bbox); thermal FEA needs at least one boundary condition; frequency response mirrors
@@ -3218,6 +3363,13 @@ void SimManager::drawTreeBody(AppState& st) {
         const std::string ccxHint = ccxMissing
             ? caps_["ccx"].value("hint", std::string("CalculiX (ccx) not found."))
             : std::string();
+#ifdef __EMSCRIPTEN__
+        const bool webNoPy = true;
+        const std::string webNoPyHint = "not available in the web version yet";
+#else
+        const bool webNoPy = false;
+        const std::string webNoPyHint;
+#endif
         std::vector<SEntry> kEntries;
         if (mechDoc) {
             kEntries.push_back({Kind::Fea, StudyType::Static, "Static",
@@ -3231,20 +3383,24 @@ void SimManager::drawTreeBody(AppState& st) {
                 "Natural frequencies and mode shapes.", false, ""});
             kEntries.push_back({Kind::Fea, StudyType::FreqResponse, "Vibration",
                 studyTypeIcon(StudyType::FreqResponse),
-                "Harmonic base-excitation response (modal superposition).", false, ""});
+                "Harmonic base-excitation response (modal superposition).",
+                webNoPy, webNoPy ? webNoPyHint : std::string()});
             kEntries.push_back({Kind::Fea, StudyType::Buckling, "Buckling",
                 studyTypeIcon(StudyType::Buckling),
-                "Critical load factors (CalculiX box proxy).", ccxMissing, ccxHint});
+                "Critical load factors (CalculiX box proxy).",
+                webNoPy || ccxMissing, webNoPy ? webNoPyHint : ccxHint});
             kEntries.push_back({Kind::Fea, StudyType::Contact, "Contact",
                 studyTypeIcon(StudyType::Contact),
-                "Nonlinear contact conservation check (CalculiX).", ccxMissing, ccxHint});
+                "Nonlinear contact conservation check (CalculiX).",
+                webNoPy || ccxMissing, webNoPy ? webNoPyHint : ccxHint});
             kEntries.push_back({Kind::Fea, StudyType::Flow, "Flow",
                 studyTypeIcon(StudyType::Flow),
                 "External aerodynamics: drag, lift, streamlines. Fast (LBM) or accurate "
-                "(OpenFOAM).", false, ""});
+                "(OpenFOAM).", webNoPy, webNoPy ? webNoPyHint : std::string()});
             kEntries.push_back({Kind::Fea, StudyType::Thermal, "Thermal (CFD)",
                 studyTypeIcon(StudyType::Thermal),
-                "Heat transfer via OpenFOAM convection / CHT.", false, ""});
+                "Heat transfer via OpenFOAM convection / CHT.",
+                webNoPy, webNoPy ? webNoPyHint : std::string()});
             kEntries.push_back({Kind::Fea, StudyType::ThermalFea, "Thermal (FEA)",
                 studyTypeIcon(StudyType::ThermalFea),
                 "Conduction on the part: fixed temps, flux, convection; steady or transient.",
@@ -5310,7 +5466,7 @@ void SimManager::drawForm(AppState& st, Study& s) {
         ImGui::Spacing();
         ImGui::Separator();
         ImGui::Spacing();
-        bool busy = (st.simClient && st.simClient->busy()) || advRunning_;
+        bool busy = (st.simClient && st.simClient->busy()) || advRunning_ || prepInFlight_;
         std::string blocker;
         bool ready = studyReady(s, blocker);
         const bool canRun = ready && !busy;
@@ -5972,7 +6128,8 @@ void SimManager::runThermalFea(AppState& st, Study& s) {
     auto* sim = st.simClient;
     if (!st.docMirror.hasDoc()) { st.addLog("[sim] no document to analyse"); return; }
 
-    std::string stepPath = appdataAppDir() + "/cache/sim_thermal.step";
+    const std::string stepPath =
+        engine::daemonMode() ? std::string() : (appdataAppDir() + "/cache/sim_thermal.step");
     {
         nlohmann::json r, p = {{"doc_id", st.docMirror.docId()}, {"path", stepPath}};
         std::string e;

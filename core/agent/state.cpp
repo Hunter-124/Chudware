@@ -683,11 +683,13 @@ BuiltContext build_context(const DesignState& state, const std::string& role,
     if (context_cap < 256) context_cap = 256;  // a floor so the math below stays sane
     // Solo modeler/fixer get the slim ops cheatsheet (~6KB vs ~28KB full). Prefer the
     // stamped run complexity; fall back to re-classifying the request so callers that
-    // have not stamped DesignState still pick the right sheet.
+    // have not stamped DesignState still pick the right sheet. Mid-run tool-scope
+    // escalation (state.tool_scope_full) forces the full sheet even on Solo.
     Complexity cx = state.complexity_set ? state.complexity
                                          : classify_complexity(state.request).level;
-    const bool solo_sheet = (cx == Complexity::Solo);
-    auto pr = load_prompt(role, prompts_dir, solo_sheet);
+    const bool solo_sheet = (cx == Complexity::Solo) && !state.tool_scope_full;
+    auto pr = load_prompt(role, prompts_dir, solo_sheet, state.tool_scope_full,
+                          state.tool_scope_classes);
     std::string system = pr.first;
     bool trimmed = false;
 

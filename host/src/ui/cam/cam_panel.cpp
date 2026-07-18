@@ -11,8 +11,13 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <string>
 #include <vector>
+
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
 
 #include "../../core/app_state.h"
 #include "../../ui_theme.h"    // ui::palette (opaque title-bar / border override for this window)
@@ -32,13 +37,16 @@ struct CamUI {
     bool backplot = true;              // draw toolpaths in the 3D viewport
     int selSetup = 0;
     int selOp = -1;
-    nlohmann::json lastExtract;        // last cam_extract result (geometry source)
-    std::string partStep;              // temp STEP path of the exported current part
+    nlohmann::json lastExtract;        // last cam_extract_from_doc result (geometry source)
     std::string sourceModel;           // display name of the part doc the job extracts from
     std::vector<std::string> dialects;
     bool   dialectsInflight = false;   // async cam_post_dialects in flight (never re-fire)
     double dialectsNextTry  = 0.0;     // failure cooldown: no retry before this ImGui::GetTime()
     int postIdx = 0;
+    // Long cam_* RPCs (extract/generate/simulate/post) ride AsyncRpc so the GL thread never
+    // blocks. rpcInflight gates the ribbon/toolbar; callbacks run inside st.rpc.drain().
+    int  rpcInflight = 0;
+    int  rpcGen = 0;                   // bumped to drop stale callbacks after job switch
     // Workspace-tree state (drawCamTreeBody — the Manufacture left column):
     int  generatedRev = -1;            // mirror revision at the last successful cam_generate
     int  genWarnings  = 0;             // warning count from that generate (op status)
@@ -48,7 +56,7 @@ struct CamUI {
                                        // 4=setup 5=op 6=tool 7=models
     int  selTool = -1;                 // selected Tools row (selKind==6); separate from selOp
     std::string gcode;
-    std::string gcodePath;
+    std::string gcodePath;             // desktop temp .nc path (empty on web)
     nlohmann::json sim;                // last cam_simulate result
     std::string status;                // last action status / error
     // operation form buffers (selected op)
@@ -59,7 +67,29 @@ struct CamUI {
 };
 CamUI g;
 
-// ---- RPC helpers (synchronous; cam_* routes to the C++ core via WorkerClient) ----
+bool camBusy() { return g.rpcInflight > 0; }
+void camBeginRpc() { ++g.rpcInflight; }
+void camEndRpc() { if (g.rpcInflight > 0) --g.rpcInflight; }
+
+// Active PART tab's doc id + display title. CAM extract always targets the part, not the job.
+bool activePartDoc(AppState& st, std::string& docId, std::string& title) {
+    if (st.activeTab < 0 || st.activeTab >= (int)st.docTabs.size()) {
+        g.status = "no active part";
+        return false;
+    }
+    const auto& tab = st.docTabs[st.activeTab];
+    if (tab.docId.empty()) {
+        g.status = "active tab is not a part";
+        return false;
+    }
+    docId = tab.docId;
+    title = tab.title.empty() ? tab.docId : tab.title;
+    return true;
+}
+
+// ---- RPC helpers ----
+// Fast tree mutations (cam_new / cam_apply_ops / cam_tree) stay sync — they're cheap. Long
+// work (extract/generate/simulate/post) goes through st.rpc.call (see refreshDialects).
 bool camCall(AppState& st, const char* method, const nlohmann::json& params, nlohmann::json& out) {
     std::string err;
     bool ok = st.worker.call(method, params, out, err);
@@ -103,28 +133,39 @@ nlohmann::json applyOps(AppState& st, const nlohmann::json& ops) {
     return r;
 }
 
-// Export the active PART tab to a temp STEP (cached), for cam_extract.
-bool exportPartStep(AppState& st) {
-    if (st.activeTab < 0 || st.activeTab >= (int)st.docTabs.size()) { g.status = "no active part"; return false; }
-    const auto& tab = st.docTabs[st.activeTab];
-    if (tab.docId.empty()) { g.status = "active tab is not a part"; return false; }
-    std::filesystem::path p = std::filesystem::temp_directory_path() / "aicad_cam_part.step";
-    nlohmann::json r;
-    if (!camCall(st, "export_file", {{"doc_id", tab.docId}, {"path", p.string()}, {"format", "step"}}, r))
-        return false;
-    g.partStep = p.string();
-    g.sourceModel = tab.title.empty() ? tab.docId : tab.title;  // Models node in the CAM tree
-    return true;
-}
-
-// cam_extract on the current part (exports STEP first). kind: all|stock|holes|section|mesh|profile.
-nlohmann::json extract(AppState& st, const std::string& kind, double z = 0, bool useZ = false) {
-    nlohmann::json out;
-    if (g.partStep.empty() && !exportPartStep(st)) return out;
-    nlohmann::json params = {{"path", g.partStep}, {"kind", kind}, {"deflection", 0.1}};
+// Server-side export+extract (cam_extract_from_doc). Never ships a client temp path — web and
+// desktop share one path. `done` runs on the GL thread inside rpc.drain(); may be empty on fail.
+using ExtractDone = std::function<void(const nlohmann::json& out)>;
+void extractFromDoc(AppState& st, const std::string& kind, double z, bool useZ, ExtractDone done) {
+    std::string partId, title;
+    if (!activePartDoc(st, partId, title)) {
+        if (done) done(nlohmann::json::object());
+        return;
+    }
+    g.sourceModel = title;
+    nlohmann::json params = {{"doc_id", partId}, {"kind", kind}, {"deflection", 0.1}};
     if (useZ) params["z"] = z;
-    camCall(st, "cam_extract", params, out);
-    return out;
+    camBeginRpc();
+    g.status = "extracting " + kind + "...";
+    const int gen = g.rpcGen;
+    st.rpc.call("cam_extract_from_doc", std::move(params),
+                [done = std::move(done), gen](const core::RpcResult& r) {
+        camEndRpc();
+        if (gen != g.rpcGen) return;  // job was replaced while we were out
+        nlohmann::json out;
+        if (!r.ok) {
+            g.status = std::string("cam_extract_from_doc: ") +
+                       (r.err.empty() ? std::string("failed") : r.err);
+        } else if (r.result.is_object() && r.result.contains("error") &&
+                   !r.result["error"].is_null()) {
+            g.status = r.result.value("error", std::string("extract failed"));
+        } else if (r.result.is_object()) {
+            out = r.result;
+        } else {
+            g.status = "cam_extract_from_doc: bad response";
+        }
+        if (done) done(out);
+    });
 }
 
 const char* setupId() {
@@ -133,102 +174,223 @@ const char* setupId() {
     return "";
 }
 
-// Add an operation of `type`, pulling appropriate geometry from the current part.
+std::string currentDialect() {
+    if (g.postIdx >= 0 && g.postIdx < (int)g.dialects.size()) return g.dialects[g.postIdx];
+    if (!g.mirror.post().empty()) return g.mirror.post();
+    return "grbl";
+}
+
+// Write g.gcode to a desktop temp .nc (no-op on web — use downloadGcode instead).
+void writeGcodeFile(const std::string& dialect) {
+#ifndef __EMSCRIPTEN__
+    std::filesystem::path p =
+        std::filesystem::temp_directory_path() / ("aicad_cam." + dialect + ".nc");
+    std::ofstream f(p);
+    if (f) {
+        f << g.gcode;
+        g.gcodePath = p.string();
+    }
+#else
+    (void)dialect;
+    g.gcodePath.clear();
+#endif
+}
+
+// Browser Blob download of in-memory gcode (web) / ensure temp file exists (desktop).
+void downloadGcode() {
+    if (g.gcode.empty()) {
+        g.status = "no G-code — Post first";
+        return;
+    }
+    const std::string dialect = currentDialect();
+    const std::string fname = "aicad_cam." + dialect + ".nc";
+#ifdef __EMSCRIPTEN__
+    EM_ASM({
+        var text = UTF8ToString($0);
+        var name = UTF8ToString($1);
+        var blob = new Blob([text], {type: 'text/plain'});
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement('a');
+        a.href = url;
+        a.download = name;
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(function() {
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }, 0);
+    }, g.gcode.c_str(), fname.c_str());
+    g.status = "downloaded " + fname;
+#else
+    if (g.gcodePath.empty()) writeGcodeFile(dialect);
+    g.status = g.gcodePath.empty() ? ("G-code ready (" + fname + ")")
+                                   : ("saved " + g.gcodePath);
+#endif
+}
+
+// Apply heights.bottom from an extract bbox when present.
+void applyExtractHeights(const nlohmann::json& ex, nlohmann::json& heights) {
+    if (!ex.contains("bbox")) return;
+    auto& mn = ex["bbox"]["min"];
+    if (mn.is_array() && mn.size() >= 3) heights["bottom"] = mn[2].get<double>();
+}
+
+// Add an operation of `type`, pulling geometry via server-side extract (async).
 void addOperation(AppState& st, const std::string& type, int toolNumber) {
     if (!ensureJob(st)) return;
     if (g.mirror.setups().empty()) { g.status = "add a setup first"; return; }
-    std::string sid = setupId();
+    if (camBusy()) { g.status = "CAM busy"; return; }
+    const std::string sid = setupId();
 
-    nlohmann::json geom = nlohmann::json::object();
-    nlohmann::json heights = {{"top", 0}, {"bottom", -5}, {"clearance", 15}, {"retract", 5}};
-    bool is3d = type.rfind("parallel", 0) == 0 || type.rfind("contour3", 0) == 0 ||
-                type.rfind("scallop", 0) == 0 || type.rfind("pencil", 0) == 0 ||
-                type.rfind("pocket3", 0) == 0 || type.rfind("adaptive_clear", 0) == 0 ||
-                type.rfind("radial", 0) == 0 || type.rfind("spiral", 0) == 0;
-    bool isTurn = type.rfind("turn", 0) == 0;
-    bool isDrill = (type == "drill" || type == "thread_mill");
-    bool isCut = (type == "cut2d");
+    const bool is3d = type.rfind("parallel", 0) == 0 || type.rfind("contour3", 0) == 0 ||
+                      type.rfind("scallop", 0) == 0 || type.rfind("pencil", 0) == 0 ||
+                      type.rfind("pocket3", 0) == 0 || type.rfind("adaptive_clear", 0) == 0 ||
+                      type.rfind("radial", 0) == 0 || type.rfind("spiral", 0) == 0;
+    const bool isTurn = type.rfind("turn", 0) == 0;
+    const bool isDrill = (type == "drill" || type == "thread_mill");
+    const bool isCut = (type == "cut2d");
+    const bool isFace = (type == "face");
 
+    // Geometry kind for this op. Face uses stock top automatically (no extract for geom).
+    std::string kind = "section";
+    double z = 0.0;
+    bool useZ = true;
     if (is3d) {
-        nlohmann::json m = extract(st, "mesh");
-        if (m.contains("mesh")) geom["mesh"] = m["mesh"];
+        kind = "mesh"; useZ = false;
     } else if (isTurn) {
-        nlohmann::json pr = extract(st, "profile");
-        if (pr.contains("profile")) geom["profile"] = pr["profile"];
+        kind = "profile"; useZ = false;
     } else if (isDrill) {
-        nlohmann::json h = extract(st, "holes");
-        if (h.contains("points")) geom["points"] = h["points"];
-    } else if (type == "face") {
-        // face uses the stock top automatically; also set heights bottom slightly below top
-        heights["bottom"] = -1.0;
-    } else {  // 2.5D milling + cut2d: planar section regions at the top
-        nlohmann::json s = extract(st, "section", 0.0, true);
-        if (s.contains("regions")) {
-            if (isCut) {
-                nlohmann::json contours = nlohmann::json::array();
-                for (auto& reg : s["regions"]) if (reg.contains("outer")) contours.push_back(reg["outer"]);
-                geom["contours"] = contours;
-            } else {
-                geom["regions"] = s["regions"];
+        kind = "holes"; useZ = false;
+    } else if (isFace) {
+        kind = "stock"; useZ = false;  // only need bbox for cut depth
+    }
+
+    AppState* stp = &st;
+    auto finish = [stp, type, toolNumber, sid, is3d, isTurn, isDrill, isCut, isFace](
+                      const nlohmann::json& ex) {
+        if (!ex.empty()) g.lastExtract = ex;
+
+        nlohmann::json geom = nlohmann::json::object();
+        nlohmann::json heights = {{"top", 0}, {"bottom", -5}, {"clearance", 15}, {"retract", 5}};
+        if (isFace) heights["bottom"] = -1.0;
+
+        if (is3d) {
+            if (ex.contains("mesh")) geom["mesh"] = ex["mesh"];
+        } else if (isTurn) {
+            if (ex.contains("profile")) geom["profile"] = ex["profile"];
+        } else if (isDrill) {
+            if (ex.contains("points")) geom["points"] = ex["points"];
+        } else if (!isFace) {
+            if (ex.contains("regions")) {
+                if (isCut) {
+                    nlohmann::json contours = nlohmann::json::array();
+                    for (auto& reg : ex["regions"])
+                        if (reg.contains("outer")) contours.push_back(reg["outer"]);
+                    geom["contours"] = contours;
+                } else {
+                    geom["regions"] = ex["regions"];
+                }
             }
         }
-    }
-    // pull stock bottom for a sensible cut depth
-    if (g.lastExtract.empty()) g.lastExtract = extract(st, "stock");
-    if (g.lastExtract.contains("bbox")) {
-        auto& mn = g.lastExtract["bbox"]["min"];
-        if (mn.is_array() && mn.size() >= 3) heights["bottom"] = mn[2].get<double>();
-    }
+        applyExtractHeights(ex.empty() ? g.lastExtract : ex, heights);
 
-    nlohmann::json op = {{"type", type}, {"tool_number", toolNumber}, {"heights", heights}};
-    if (!geom.empty()) op["geometry"] = geom;
-    nlohmann::json r = applyOps(st, nlohmann::json::array({nlohmann::json{
-        {"op", "add_operation"}, {"setup_id", sid}, {"operation", op}}}));
-    if (r.contains("revision")) {
-        g.status = "added " + type;
-        // select the new last op
-        if (!g.mirror.setups().empty()) {
-            g.selOp = (int)g.mirror.setups()[g.selSetup].ops.size() - 1;
-            g.loadedOpFor = -1;
+        nlohmann::json op = {{"type", type}, {"tool_number", toolNumber}, {"heights", heights}};
+        if (!geom.empty()) op["geometry"] = geom;
+        nlohmann::json r = applyOps(*stp, nlohmann::json::array({nlohmann::json{
+            {"op", "add_operation"}, {"setup_id", sid}, {"operation", op}}}));
+        if (r.contains("revision")) {
+            g.status = "added " + type;
+            if (!g.mirror.setups().empty()) {
+                // selSetup may have shifted; clamp then select last op on that setup.
+                if (g.selSetup < 0 || g.selSetup >= (int)g.mirror.setups().size())
+                    g.selSetup = (int)g.mirror.setups().size() - 1;
+                g.selOp = (int)g.mirror.setups()[g.selSetup].ops.size() - 1;
+                g.loadedOpFor = -1;
+            }
         }
+    };
+
+    // Reuse a prior full extract when the op only needs stock bbox (face) and we already have it.
+    if (isFace && !g.lastExtract.empty()) {
+        finish(g.lastExtract);
+        return;
     }
+    extractFromDoc(st, kind, z, useZ, finish);
 }
 
 void doGenerate(AppState& st) {
     if (g.docId.empty()) { g.status = "no job"; return; }
-    nlohmann::json r;
-    if (camCall(st, "cam_generate", {{"doc_id", g.docId}}, r)) {
-        g.mirror.loadToolpaths(r);
-        int n = r.contains("toolpaths") ? (int)r["toolpaths"].size() : 0;
-        g.generatedRev = g.mirror.revision();  // ops now read "generated" in the workspace tree
-        g.genWarnings = (r.contains("warnings") && r["warnings"].is_array())
-                            ? (int)r["warnings"].size() : 0;
+    if (camBusy()) { g.status = "CAM busy"; return; }
+    camBeginRpc();
+    g.status = "generating...";
+    const int gen = g.rpcGen;
+    const std::string docId = g.docId;
+    st.rpc.call("cam_generate", {{"doc_id", docId}},
+                [gen, docId](const core::RpcResult& r) {
+        camEndRpc();
+        if (gen != g.rpcGen || g.docId != docId) return;
+        if (!r.ok) {
+            g.status = std::string("cam_generate: ") +
+                       (r.err.empty() ? std::string("failed") : r.err);
+            return;
+        }
+        g.mirror.loadToolpaths(r.result);
+        int n = r.result.contains("toolpaths") ? (int)r.result["toolpaths"].size() : 0;
+        g.generatedRev = g.mirror.revision();
+        g.genWarnings = (r.result.contains("warnings") && r.result["warnings"].is_array())
+                            ? (int)r.result["warnings"].size() : 0;
         g.status = "generated " + std::to_string(n) + " toolpath(s)";
         if (g.genWarnings > 0) g.status += " (" + std::to_string(g.genWarnings) + " warning)";
-    }
+    });
 }
 
 void doSimulate(AppState& st) {
     if (g.docId.empty()) return;
-    nlohmann::json r;
-    if (camCall(st, "cam_simulate", {{"doc_id", g.docId}}, r)) {
-        g.sim = r;
+    if (camBusy()) { g.status = "CAM busy"; return; }
+    camBeginRpc();
+    g.status = "simulating...";
+    const int gen = g.rpcGen;
+    const std::string docId = g.docId;
+    st.rpc.call("cam_simulate", {{"doc_id", docId}},
+                [gen, docId](const core::RpcResult& r) {
+        camEndRpc();
+        if (gen != g.rpcGen || g.docId != docId) return;
+        if (!r.ok) {
+            g.status = std::string("cam_simulate: ") +
+                       (r.err.empty() ? std::string("failed") : r.err);
+            return;
+        }
+        g.sim = r.result;
         g.status = "simulated";
-    }
+    });
 }
 
 void doPost(AppState& st) {
     if (g.docId.empty()) return;
-    std::string dialect = (g.postIdx >= 0 && g.postIdx < (int)g.dialects.size()) ? g.dialects[g.postIdx] : "grbl";
-    nlohmann::json r;
-    if (camCall(st, "cam_post", {{"doc_id", g.docId}, {"dialect", dialect}}, r)) {
-        g.gcode = r.value("gcode", std::string());
-        // also write to a temp .nc so the operator can grab it
-        std::filesystem::path p = std::filesystem::temp_directory_path() / ("aicad_cam." + dialect + ".nc");
-        std::ofstream f(p);
-        if (f) { f << g.gcode; g.gcodePath = p.string(); }
-        g.status = "posted " + dialect + " (" + std::to_string(r.value("line_count", 0)) + " lines)";
-    }
+    if (camBusy()) { g.status = "CAM busy"; return; }
+    const std::string dialect = currentDialect();
+    camBeginRpc();
+    g.status = "posting " + dialect + "...";
+    const int gen = g.rpcGen;
+    const std::string docId = g.docId;
+    st.rpc.call("cam_post", {{"doc_id", docId}, {"dialect", dialect}},
+                [gen, docId, dialect](const core::RpcResult& r) {
+        camEndRpc();
+        if (gen != g.rpcGen || g.docId != docId) return;
+        if (!r.ok) {
+            g.status = std::string("cam_post: ") +
+                       (r.err.empty() ? std::string("failed") : r.err);
+            return;
+        }
+        g.gcode = r.result.value("gcode", std::string());
+        writeGcodeFile(dialect);
+        g.status = "posted " + dialect + " (" +
+                   std::to_string(r.result.value("line_count", 0)) + " lines)";
+#ifdef __EMSCRIPTEN__
+        // Web has no local path to hand the operator — offer the Blob download immediately.
+        if (!g.gcode.empty()) downloadGcode();
+#endif
+    });
 }
 
 // ---- 2D backplot canvas (top view) ----
@@ -315,28 +477,59 @@ void camHandleCommand(AppState& st, const std::string& cmd) {
         // Re-extract the current part's stock box and apply it to the selected setup.
         if (!ensureJob(st)) return;
         if (g.mirror.setups().empty()) { g.status = "add a setup first"; return; }
-        nlohmann::json s = extract(st, "stock");
-        if (!s.contains("stock")) { g.status = "stock extraction failed"; return; }
-        nlohmann::json box = s["stock"]["box"];
-        box["type"] = "box"; box["off_ztop"] = 1.0; box["material"] = "aluminum";
-        applyOps(st, nlohmann::json::array({nlohmann::json{
-            {"op", "set_stock"}, {"setup_id", setupId()}, {"stock", box}}}));
-        g.status = "stock set from part";
+        if (camBusy()) { g.status = "CAM busy"; return; }
+        const std::string sid = setupId();
+        // st is process-lifetime AppState; safe to capture by pointer for the drain callback.
+        AppState* stp = &st;
+        extractFromDoc(st, "stock", 0, false, [sid, stp](const nlohmann::json& s) {
+            if (!s.contains("stock")) {
+                if (g.status.find("extract") == std::string::npos)
+                    g.status = "stock extraction failed";
+                return;
+            }
+            g.lastExtract = s;
+            nlohmann::json box = s["stock"]["box"];
+            box["type"] = "box"; box["off_ztop"] = 1.0; box["material"] = "aluminum";
+            applyOps(*stp, nlohmann::json::array({nlohmann::json{
+                {"op", "set_stock"}, {"setup_id", sid}, {"stock", box}}}));
+            g.status = "stock set from part";
+        });
         return;
     }
-    if (cmd == "cam_new_job") { g.docId.clear(); g.mirror.clear(); ensureJob(st); g.status = "new CAM job"; return; }
+    if (cmd == "cam_new_job") {
+        ++g.rpcGen;  // drop any in-flight extract/generate callbacks for the old job
+        g.docId.clear();
+        g.mirror.clear();
+        g.gcode.clear();
+        g.gcodePath.clear();
+        g.sim = nlohmann::json();
+        g.lastExtract = nlohmann::json();
+        g.generatedRev = -1;
+        g.genWarnings = 0;
+        ensureJob(st);
+        g.status = "new CAM job";
+        return;
+    }
     if (cmd == "cam_extract") {
         if (!ensureJob(st)) return;
-        g.lastExtract = extract(st, "all");
-        // seed a setup from the extracted stock if none exists
-        if (g.mirror.setups().empty() && g.lastExtract.contains("stock")) {
-            nlohmann::json box = g.lastExtract["stock"]["box"];
-            box["type"] = "box"; box["off_ztop"] = 1.0; box["material"] = "aluminum";
-            applyOps(st, nlohmann::json::array({nlohmann::json{
-                {"op", "add_setup"}, {"setup", {{"name", "Setup1"}, {"machine", {{"kind", "mill3"}}}, {"stock", box}}}}}));
-        }
-        int nh = g.lastExtract.contains("holes") ? (int)g.lastExtract["holes"].size() : 0;
-        g.status = "extracted stock + " + std::to_string(nh) + " hole(s)";
+        if (camBusy()) { g.status = "CAM busy"; return; }
+        AppState* stp = &st;
+        extractFromDoc(st, "all", 0, false, [stp](const nlohmann::json& ex) {
+            if (ex.empty()) return;
+            g.lastExtract = ex;
+            // seed a setup from the extracted stock if none exists
+            if (g.mirror.setups().empty() && ex.contains("stock")) {
+                nlohmann::json box = ex["stock"]["box"];
+                box["type"] = "box"; box["off_ztop"] = 1.0; box["material"] = "aluminum";
+                applyOps(*stp, nlohmann::json::array({nlohmann::json{
+                    {"op", "add_setup"},
+                    {"setup", {{"name", "Setup1"},
+                               {"machine", {{"kind", "mill3"}}},
+                               {"stock", box}}}}}));
+            }
+            int nh = ex.contains("holes") ? (int)ex["holes"].size() : 0;
+            g.status = "extracted stock + " + std::to_string(nh) + " hole(s)";
+        });
         return;
     }
     if (cmd == "cam_add_setup") {
@@ -406,24 +599,61 @@ void camFloatForShot() { g.floatForShot = true; g.show = true; }
 // panel so it shows up populated instead of empty. Loads the job tree (setups/ops/tools).
 void camLoadJob(AppState& st, const std::string& docId) {
     if (docId.empty()) return;
+    ++g.rpcGen;  // drop callbacks tied to a previous job
     g.docId = docId;
     g.selSetup = 0;
     g.selOp = -1;
     g.loadedOpFor = -1;
+    g.gcode.clear();
+    g.gcodePath.clear();
+    g.sim = nlohmann::json();
     nlohmann::json r;
     if (camCall(st, "cam_tree", {{"doc_id", docId}}, r)) {
         loadTree(r);
         g.status = "loaded CAM job from copilot";
+        // cam_program returns gcode in its envelope; tree usually does not. Opportunistically
+        // seed if a future tree payload (or a stashed side-channel) carries it.
+        if (r.contains("gcode") && r["gcode"].is_string()) {
+            g.gcode = r["gcode"].get<std::string>();
+            if (!g.gcode.empty()) writeGcodeFile(currentDialect());
+        }
     }
-    // Also pull the generated toolpaths so the backplot / "Show in 3D" works immediately (the
-    // job was already generated core-side by cam_program; cam_generate returns the cached paths).
-    nlohmann::json gp;
-    if (camCall(st, "cam_generate", {{"doc_id", docId}}, gp)) {
-        g.mirror.loadToolpaths(gp);
+    // Pull generated toolpaths async so the GL thread never blocks on cam_generate
+    // (job was already generated core-side by cam_program; response is the cached paths).
+    // After toolpaths land, seed g.gcode via cam_post when the load path didn't already
+    // carry it (cam_program produced gcode server-side but only the doc id reaches us).
+    AppState* stp = &st;
+    camBeginRpc();
+    const int gen = g.rpcGen;
+    st.rpc.call("cam_generate", {{"doc_id", docId}},
+                [gen, docId, stp](const core::RpcResult& rr) {
+        camEndRpc();
+        if (gen != g.rpcGen || g.docId != docId) return;
+        if (!rr.ok) return;
+        g.mirror.loadToolpaths(rr.result);
         g.generatedRev = g.mirror.revision();  // copilot jobs arrive pre-generated
-        g.genWarnings = (gp.contains("warnings") && gp["warnings"].is_array())
-                            ? (int)gp["warnings"].size() : 0;
-    }
+        g.genWarnings = (rr.result.contains("warnings") && rr.result["warnings"].is_array())
+                            ? (int)rr.result["warnings"].size() : 0;
+        // Future-proof: if generate ever echoes gcode, seed the G-code tab.
+        if (g.gcode.empty() && rr.result.contains("gcode") && rr.result["gcode"].is_string()) {
+            g.gcode = rr.result["gcode"].get<std::string>();
+            if (!g.gcode.empty()) writeGcodeFile(currentDialect());
+        }
+        // cam_program already posted; re-post cheaply (cached toolpaths) to seed g.gcode
+        // so Download NC works without a manual Post click.
+        if (g.gcode.empty()) {
+            const std::string dialect = currentDialect();
+            camBeginRpc();
+            stp->rpc.call("cam_post", {{"doc_id", docId}, {"dialect", dialect}},
+                          [gen, docId, dialect](const core::RpcResult& pr) {
+                camEndRpc();
+                if (gen != g.rpcGen || g.docId != docId) return;
+                if (!pr.ok) return;
+                g.gcode = pr.result.value("gcode", std::string());
+                if (!g.gcode.empty()) writeGcodeFile(dialect);
+            });
+        }
+    });
     g.show = true;
     g.focusFrames = 10;  // surface the CAM tab for a few frames even if the panel was already
                          // open in the background (out-competes a one-off viewport focus grab)
@@ -471,17 +701,23 @@ void drawCamManager(AppState& st) {
     ImGui::PopStyleColor(3);
     if (!camOpen) { ImGui::End(); return; }
 
-    // toolbar
+    // toolbar — long RPCs (extract/generate/sim/post) disable action buttons + show spinner.
+    const bool busy = camBusy();
+    if (busy) ImGui::BeginDisabled();
     if (ImGui::Button("New Job")) camHandleCommand(st, "cam_new_job");
     ImGui::SameLine(); if (ImGui::Button("Extract Part")) camHandleCommand(st, "cam_extract");
     ImGui::SameLine(); if (ImGui::Button("Add Setup")) camHandleCommand(st, "cam_add_setup");
     ImGui::SameLine(); if (ImGui::Button("Add Tool")) camHandleCommand(st, "cam_add_tool");
     ImGui::Separator();
     // operation buttons
-    auto opBtn = [&](const char* label, const char* cmd) { if (ImGui::Button(label)) camHandleCommand(st, cmd); ImGui::SameLine(); };
+    auto opBtn = [&](const char* label, const char* cmd) {
+        if (ImGui::Button(label)) camHandleCommand(st, cmd);
+        ImGui::SameLine();
+    };
     opBtn("Face", "cam_op_face"); opBtn("Contour", "cam_op_contour"); opBtn("Pocket", "cam_op_pocket");
     opBtn("Adaptive", "cam_op_adaptive"); opBtn("Drill", "cam_op_drill"); opBtn("3D Parallel", "cam_op_parallel3d");
-    opBtn("Waterline", "cam_op_waterline3d"); opBtn("Turn", "cam_op_turn_rough"); if (ImGui::Button("Laser")) camHandleCommand(st, "cam_op_laser");
+    opBtn("Waterline", "cam_op_waterline3d"); opBtn("Turn", "cam_op_turn_rough");
+    if (ImGui::Button("Laser")) camHandleCommand(st, "cam_op_laser");
     ImGui::Separator();
     if (ImGui::Button("Generate")) doGenerate(st);
     ImGui::SameLine(); if (ImGui::Button("Simulate")) doSimulate(st);
@@ -493,6 +729,16 @@ void drawCamManager(AppState& st) {
         for (auto& d : g.dialects) items.push_back(d.c_str());
         ImGui::Combo("##post", &g.postIdx, items.data(), (int)items.size());
         ImGui::SameLine(); if (ImGui::Button("Post")) doPost(st);
+    }
+    if (busy) ImGui::EndDisabled();
+    if (busy) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("|");
+        ImGui::SameLine();
+        // Lightweight spinner: rotating braille dots via frame time (no theme dependency).
+        static const char* kSpin[] = {"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"};
+        const int fi = ((int)(ImGui::GetTime() * 10.0)) % 10;
+        ImGui::TextDisabled("%s working...", kSpin[fi]);
     }
     if (!g.status.empty()) { ImGui::SameLine(); ImGui::TextDisabled("%s", g.status.c_str()); }
 
@@ -536,13 +782,28 @@ void drawCamManager(AppState& st) {
     if (ImGui::BeginTabBar("cam_tabs")) {
         if (ImGui::BeginTabItem("Toolpaths")) { drawBackplot(st); ImGui::EndTabItem(); }
         if (ImGui::BeginTabItem("Simulate")) {
+            if (busy) ImGui::BeginDisabled();
             if (ImGui::Button("Run Material-Removal Sim")) doSimulate(st);
+            if (busy) ImGui::EndDisabled();
             drawSimSummary();
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("G-code")) {
+            if (busy) ImGui::BeginDisabled();
             if (ImGui::Button("Post")) doPost(st);
-            if (!g.gcodePath.empty()) { ImGui::SameLine(); ImGui::TextDisabled("-> %s", g.gcodePath.c_str()); }
+            if (busy) ImGui::EndDisabled();
+            ImGui::SameLine();
+            const bool canDl = !g.gcode.empty();
+            if (!canDl) ImGui::BeginDisabled();
+            if (ImGui::Button("Download NC")) downloadGcode();
+            if (!canDl) ImGui::EndDisabled();
+#ifndef __EMSCRIPTEN__
+            // Desktop: show the temp .nc path the operator can grab. Hidden on web (no local path).
+            if (!g.gcodePath.empty()) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("-> %s", g.gcodePath.c_str());
+            }
+#endif
             ImGui::Separator();
             ImGui::InputTextMultiline("##gcode", g.gcode.data(), g.gcode.size() + 1,
                                       ImVec2(-1, -1), ImGuiInputTextFlags_ReadOnly);
@@ -827,11 +1088,18 @@ void drawCamTreeBody(AppState& st) {
     }
 
     // ---- status footer ----
-    if (!g.status.empty()) {
+    if (camBusy() || !g.status.empty()) {
         ImGui::Spacing();
         ImGui::Separator();
         ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x);
-        ImGui::TextDisabled("%s", g.status.c_str());
+        if (camBusy()) {
+            static const char* kSpin[] = {"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"};
+            const int fi = ((int)(ImGui::GetTime() * 10.0)) % 10;
+            ImGui::TextDisabled("%s %s", kSpin[fi],
+                               g.status.empty() ? "working..." : g.status.c_str());
+        } else {
+            ImGui::TextDisabled("%s", g.status.c_str());
+        }
         ImGui::PopTextWrapPos();
     }
 

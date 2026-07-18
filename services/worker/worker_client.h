@@ -28,6 +28,10 @@ public:
     // doc worker; C19 spawns a second instance with module="engine.sim.worker".
     bool start(std::string& err, const std::string& module = "engine.worker");
     bool started() const { return running_; }
+    // Synthetic ready flag for daemon/WASM (and in-process libaicad FEA): no child process,
+    // but launch()/caps() gates and non-routed methods need started()==true. routeSimToCpp
+    // still runs before the pipe write; markStarted does not open a pipe.
+    void markStarted() { running_ = true; }
     void stop();
 
     // Send {method, params}; block until the matching response. Returns the "result"

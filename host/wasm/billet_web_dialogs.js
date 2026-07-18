@@ -308,5 +308,84 @@ mergeInto(LibraryManager.library, {
     };
 
     loadDir('');
+  },
+
+  // Canvas HTML5 file drop → Module._billet_web_drop_done (app.cpp).
+  // Installed once from C++ after GL/canvas is ready. Does not block;
+  // FileReader completion posts into the C++ pending slot drained per frame.
+  billet_install_canvas_drop__deps: ['$UTF8ToString', '$stringToUTF8', '$lengthBytesUTF8'],
+  billet_install_canvas_drop: function() {
+    if (typeof window === 'undefined' || window.__billetDropInstalled) return;
+    window.__billetDropInstalled = true;
+
+    function canvasEl() {
+      return document.getElementById('canvas') ||
+             (typeof Module !== 'undefined' && Module['canvas']) ||
+             document.querySelector('canvas');
+    }
+
+    function finishDrop(ok, name, data, len, errStr) {
+      if (typeof Module === 'undefined' || !Module._billet_web_drop_done) return;
+      if (ok && data && len > 0) {
+        var ptr = Module._malloc(len);
+        HEAPU8.set(data, ptr);
+        var namePtr = 0;
+        if (name) {
+          var nb = lengthBytesUTF8(name) + 1;
+          namePtr = Module._malloc(nb);
+          stringToUTF8(name, namePtr, nb);
+        }
+        Module._billet_web_drop_done(1, namePtr, ptr, len, 0);
+        if (namePtr) Module._free(namePtr);
+        Module._free(ptr);
+      } else {
+        var errPtr = 0;
+        if (errStr) {
+          var eb = lengthBytesUTF8(errStr) + 1;
+          errPtr = Module._malloc(eb);
+          stringToUTF8(errStr, errPtr, eb);
+        }
+        Module._billet_web_drop_done(0, 0, 0, 0, errPtr);
+        if (errPtr) Module._free(errPtr);
+      }
+    }
+
+    function onDragOver(ev) {
+      ev.preventDefault();
+      try { ev.dataTransfer.dropEffect = 'copy'; } catch (e) {}
+    }
+    function onDrop(ev) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      var files = (ev.dataTransfer && ev.dataTransfer.files) ? ev.dataTransfer.files : null;
+      if (!files || !files.length) {
+        finishDrop(0, null, null, 0, 'Drop a CAD or ECAD file to open it');
+        return;
+      }
+      var f = files[0];
+      var reader = new FileReader();
+      reader.onload = function() {
+        var u8 = new Uint8Array(reader.result);
+        finishDrop(1, f.name || 'upload.bin', u8, u8.length, null);
+      };
+      reader.onerror = function() {
+        finishDrop(0, null, null, 0, 'FileReader failed');
+      };
+      reader.readAsArrayBuffer(f);
+    }
+
+    function attach() {
+      var c = canvasEl();
+      if (!c) {
+        setTimeout(attach, 200);
+        return;
+      }
+      c.addEventListener('dragover', onDragOver);
+      c.addEventListener('drop', onDrop);
+      // Also catch drops on the page body so drops outside the GL canvas still work.
+      document.addEventListener('dragover', onDragOver);
+      document.addEventListener('drop', onDrop);
+    }
+    attach();
   }
 });

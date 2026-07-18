@@ -828,6 +828,35 @@ static json cam_program_from_part(const std::string& part_doc_id, const json& op
     return out;
 }
 
+// Server-side STEP export + cam_extract. The GUI used to export_file to a CLIENT temp
+// path then call cam_extract on the SERVER with that path — on web/daemon the server
+// cannot see the client's filesystem, so extract always failed. Compose export+extract
+// here (same pattern as cam_program_from_part ~611-621) and return cam_extract's shape.
+static json cam_extract_from_doc(const std::string& part_doc_id, const json& params) {
+    if (part_doc_id.empty())
+        return json{{"error", "cam_extract_from_doc: 'doc_id' is required"}};
+    std::error_code ec;
+    std::filesystem::path step =
+        std::filesystem::temp_directory_path(ec) /
+        ("aicad_cam_extract_" + part_doc_id + ".step");
+    try {
+        aicad::doc::doc_export_step(part_doc_id, step.string());
+    } catch (const std::exception& e) {
+        return json{{"error", std::string("export failed: ") + e.what()}};
+    }
+    json p = params.is_object() ? params : json::object();
+    p["path"] = step.string();
+    // cam_extract only understands path/kind/z/... — drop the doc_id we were given.
+    if (p.contains("doc_id")) p.erase("doc_id");
+    try {
+        return aicad::cam::cam_extract(p);
+    } catch (const std::exception& e) {
+        return json{{"error", std::string("cam_extract failed: ") + e.what()}};
+    } catch (...) {
+        return json{{"error", "cam_extract failed"}};
+    }
+}
+
 // Real dispatch body. Extracted from aicad_call so the public entry can wrap it in a
 // Windows structured-exception (SEH) guard WITHOUT this function — which is full of
 // C++ objects that require stack unwinding — having to host the __try/__except itself
@@ -3667,6 +3696,9 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
 
             // OCCT extraction adapter: live B-rep part -> CAM geometry inputs.
             if (m == "cam_extract") return emit(aicad::cam::cam_extract(params), out_json, 0);
+            // Server-side export+extract (web/daemon-safe; no client temp path).
+            if (m == "cam_extract_from_doc")
+                return emit(cam_extract_from_doc(jstr(params, "doc_id"), params), out_json, 0);
             // One-shot: build a complete machining job + G-code from the current part
             // (deterministic recipe; the in-app copilot's CAM fast-path calls the same fn).
             if (m == "cam_program")

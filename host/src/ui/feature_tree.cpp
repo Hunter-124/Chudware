@@ -3279,6 +3279,19 @@ static void applyOpenedDoc(AppState& st, const std::string& path) {
     // whenever the open was served from the .step+'s embedded cache, i.e. every AI-handoff
     // refresh paid for the part twice. Fallback (empty aicm) keeps the historical path.
     if (!st.docMirror.lastOpenedAicm().empty()) {
+#ifdef __EMSCRIPTEN__
+        // Web: sync loadDocMesh runs on the main/GL thread and wedges under ASYNCIFY
+        // (same class as doc_tabs switch). Route through the loader pthread.
+        const std::string aicmFast = st.docMirror.lastOpenedAicm();
+        st.loadDocMeshAsync(aicmFast);
+        if (std::abs(st.docMirror.lastOpenedVolume()) < 1e-6) {
+            st.showPlane[0] = st.showPlane[1] = st.showPlane[2] = false;
+            st.planesUserToggled = true;
+            st.yaw = 0.0f; st.pitch = 89.5f; st.zoom = 1.0f;
+            st.addLog("[open] flat 2D import — hid datum planes + oriented Top");
+        }
+        return;
+#else
         std::string lerr;
         if (st.loadDocMesh(st.docMirror.lastOpenedAicm(), lerr)) {
             if (std::abs(st.docMirror.lastOpenedVolume()) < 1e-6) {
@@ -3292,6 +3305,7 @@ static void applyOpenedDoc(AppState& st, const std::string& path) {
             return;
         }
         st.addLog("[err] loadDocMesh(open fast path): " + lerr + " — falling back to rebuild");
+#endif
     }
     // Multi-document: bind this open-refresh to the doc it targets so a tab switch before the async
     // result drains can't load THIS doc's mesh / tree into whatever doc is foreground by then.
@@ -3315,9 +3329,13 @@ static void applyOpenedDoc(AppState& st, const std::string& path) {
             if (r.result.contains("tess") && r.result["tess"].is_object())
                 aicm = jfld(r.result["tess"], "aicm_path");
             if (!aicm.empty()) {
+#ifdef __EMSCRIPTEN__
+                st.loadDocMeshAsync(aicm);
+#else
                 std::string lerr;
                 if (!st.loadDocMesh(aicm, lerr) && !lerr.empty())
                     st.addLog("[err] loadDocMesh: " + lerr);
+#endif
             }
             // Flat 2D imports (DXF/DWG) lie exactly on a datum plane AND share its light-blue
             // colour, so they wash out against it (the geometry is drawn but invisible until the
@@ -5734,21 +5752,78 @@ void drawFeatureTreeBody(AppState& st,
 // s_docPath (the active doc's on-disk path) as the single source of truth.
 
 // Open a file by absolute path (no dialog). Used by the File Explorer double-click and the
-// Recent-files menu. Returns true on success; toasts + logs on failure (never throws).
+// Recent-files menu. Returns true when the open was started (or an existing tab was focused);
+// toasts + logs on failure (never throws). Async doc_open on all platforms — matches doOpenDoc.
 bool featureTreeOpenPath(AppState& st, const std::string& path, bool asSolid) {
     if (path.empty()) return false;
-    std::string err;
-    if (st.docMirror.open(st.worker, path, err, asSolid)) {
-        applyOpenedDoc(st, path);   // s_docPath = path, new tab, mesh refresh, recent handled by caller
-        return true;
+
+    // Dedup: if a non-handoff tab already has this path, switch to it (mirrors openComponentPart).
+    // Path compare is lexical (web has no real std::filesystem canonical for server abs paths).
+    {
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        fs::path want = fs::weakly_canonical(fs::path(path), ec);
+        if (ec) want = fs::path(path).lexically_normal();
+        // Normalize separators for a stable web/server-path compare.
+        std::string wantStr = want.string();
+        for (char& c : wantStr) if (c == '\\') c = '/';
+        for (int i = 0; i < static_cast<int>(st.docTabs.size()); ++i) {
+            const AppState::DocTab& tab = st.docTabs[i];
+            if (tab.aiHandoff || tab.path.empty()) continue;
+            std::error_code tabEc;
+            fs::path have = fs::weakly_canonical(fs::path(tab.path), tabEc);
+            if (tabEc) have = fs::path(tab.path).lexically_normal();
+            std::string haveStr = have.string();
+            for (char& c : haveStr) if (c == '\\') c = '/';
+            if (haveStr == wantStr || tab.path == path) {
+                st.switchToTab(i);
+                return true;
+            }
+        }
     }
-    st.addLog("[err] open: " + err);
-    // A live MCP-handoff refresh polls in the background — a failed open there must not
-    // toast (it would spam once per poll for an unsupported doc, e.g. an assembly the C++
-    // core's doc_open declines). The caller logs it; pollAiCadHandoff won't retry the rev.
-    if (!st.handoffQuietOpen)
-        st.toast(ui::ToastLevel::Error, "Open failed: " + pathBaseName(path) + " — " + err);
-    return false;
+
+    if (!st.workerStarted) {
+        if (!st.handoffQuietOpen)
+            st.toast(ui::ToastLevel::Error, "Open failed: worker not started");
+        return false;
+    }
+
+    // Handoff quiet path needs the new tab immediately after return (pollAiCadHandoff
+    // tags/dedupes the just-created tab). Keep the historical sync DocMirror::open there;
+    // all user-facing opens go through async rpc so STEP import never freezes the GL thread.
+    if (st.handoffQuietOpen) {
+        std::string err;
+        if (st.docMirror.open(st.worker, path, err, asSolid)) {
+            applyOpenedDoc(st, path);
+            return true;
+        }
+        st.addLog("[err] open: " + err);
+        return false;
+    }
+
+    nlohmann::json params = {{"path", path}};
+    if (asSolid) params["as_solid"] = true;
+    st.toast(ui::ToastLevel::Info, "Opening " + pathBaseName(path) + "\xe2\x80\xa6");
+    ++st.rebuildsInFlight;
+    st.rpc.call("doc_open", std::move(params),
+                [&st, path](const core::RpcResult& r) {
+                    --st.rebuildsInFlight;
+                    if (!r.ok) {
+                        st.addLog("[err] open: " + r.err);
+                        st.toast(ui::ToastLevel::Error,
+                                 "Open failed: " + pathBaseName(path) + " — " + r.err);
+                        return;
+                    }
+                    std::string err;
+                    if (!st.docMirror.adoptOpenResponse(r.result, err)) {
+                        st.addLog("[err] open: " + err);
+                        st.toast(ui::ToastLevel::Error,
+                                 "Open failed: " + pathBaseName(path) + " — " + err);
+                        return;
+                    }
+                    applyOpenedDoc(st, path);
+                }, 120000);
+    return true;  // open started (completion via applyOpenedDoc)
 }
 
 // Live MCP handoff poll — see the header. The external MCP server (the engine Claude drives)
@@ -6086,6 +6161,10 @@ void featureTreeSaveDocToPath(AppState& st, const std::string& path, bool requir
                     ui::plmAutoRecordSave(st, pathCopy);
                     st.addLog("[doc] auto-saved: " + pathCopy);
                     st.toast(ui::ToastLevel::Info, "Saved " + pathBaseName(pathCopy));
+#ifdef __EMSCRIPTEN__
+                    // Web: server file is source of truth; offer a browser download of the .step+.
+                    ui::afterFileWritten(pathCopy);
+#endif
                 }, 120000);
 }
 

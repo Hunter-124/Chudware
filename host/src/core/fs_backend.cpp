@@ -12,7 +12,6 @@
 #include <nlohmann/json.hpp>
 
 #ifdef __EMSCRIPTEN__
-#include "web_fetch.h"
 #include <emscripten.h>
 #include <emscripten/fetch.h>
 #endif
@@ -262,34 +261,156 @@ public:
         return rootAbs_ + "/" + rel;
     }
 
-    // JSON POST helper (mkdir/rename/delete).
+    // ---- ASYNCIFY-yielding fetch helpers -----------------------------------
+    // Main-thread ImGui + ASYNCIFY (no PROXY_TO_PTHREAD): a SYNCHRONOUS
+    // emscripten_fetch never completes and wedges the tab. Pattern matches
+    // web_file_pick.cpp — fire async fetch, then emscripten_sleep until the
+    // callback marks done. Payload/response live on the heap across the yield.
+
+    struct FetchWait {
+        volatile int done = 0;  // 0=pending, 1=ok, -1=err
+        int          status = 0;
+        std::string  body;
+        std::string  err;
+    };
+
+    // Heap-owned request body for POST/PUT; freed in callbacks.
+    struct OwnedPayload {
+        char*  data = nullptr;
+        size_t size = 0;
+        FetchWait* wait = nullptr;
+        OwnedPayload(const void* src, size_t n, FetchWait* w) : size(n), wait(w) {
+            if (n == 0) { data = nullptr; return; }
+            data = static_cast<char*>(std::malloc(n));
+            if (data && src) std::memcpy(data, src, n);
+        }
+        ~OwnedPayload() { /* freed by fetch callback */ }
+    };
+
+    static void fetchSuccess(emscripten_fetch_t* f) {
+        auto* own = static_cast<OwnedPayload*>(f->userData);
+        FetchWait* w = own ? own->wait : nullptr;
+        if (w) {
+            w->status = f->status;
+            if (f->data && f->numBytes > 0)
+                w->body.assign(f->data, f->data + f->numBytes);
+            if (f->status >= 200 && f->status < 300) {
+                w->done = 1;
+            } else {
+                w->err = "HTTP " + std::to_string(f->status);
+                if (!w->body.empty()) w->err += ": " + w->body.substr(0, 200);
+                w->done = -1;
+            }
+        }
+        if (own) {
+            std::free(own->data);
+            delete own;
+        }
+        emscripten_fetch_close(f);
+    }
+
+    static void fetchError(emscripten_fetch_t* f) {
+        auto* own = static_cast<OwnedPayload*>(f->userData);
+        FetchWait* w = own ? own->wait : nullptr;
+        if (w) {
+            w->status = f ? f->status : 0;
+            w->err = "network error";
+            if (f && f->status)
+                w->err = "HTTP " + std::to_string(f->status);
+            w->done = -1;
+        }
+        if (own) {
+            std::free(own->data);
+            delete own;
+        }
+        if (f) emscripten_fetch_close(f);
+    }
+
+    // Blocking GET with ASYNCIFY yield. Returns body bytes; sets err on failure.
+    static std::string fetchGetBlocking(const std::string& url, std::string& err) {
+        err.clear();
+        FetchWait wait;
+        auto* own = new OwnedPayload(nullptr, 0, &wait);
+        emscripten_fetch_attr_t attr;
+        emscripten_fetch_attr_init(&attr);
+        std::strcpy(attr.requestMethod, "GET");
+        attr.attributes = EMSCRIPTEN_FETCH_LOAD_TO_MEMORY;  // async
+        attr.userData = own;
+        attr.onsuccess = fetchSuccess;
+        attr.onerror = fetchError;
+        emscripten_fetch_t* fetch = emscripten_fetch(&attr, url.c_str());
+        if (!fetch) {
+            std::free(own->data);
+            delete own;
+            err = "emscripten_fetch failed: " + url;
+            return {};
+        }
+        while (wait.done == 0) emscripten_sleep(5);
+        if (wait.done < 0) {
+            err = wait.err.empty() ? ("fetch failed: " + url) : (wait.err + " for " + url);
+            return {};
+        }
+        return std::move(wait.body);
+    }
+
+    // Blocking POST/PUT with ASYNCIFY yield. method is "POST" or "PUT".
+    static bool fetchWriteBlocking(const char* method, const char* url,
+                                  const void* body, size_t bodyLen,
+                                  const char* contentType,
+                                  std::string& response, std::string& err) {
+        err.clear();
+        response.clear();
+        FetchWait wait;
+        auto* own = new OwnedPayload(body, bodyLen, &wait);
+        if (bodyLen > 0 && !own->data) {
+            delete own;
+            err = "out of memory";
+            return false;
+        }
+        emscripten_fetch_attr_t attr;
+        emscripten_fetch_attr_init(&attr);
+        std::strcpy(attr.requestMethod, method);
+        attr.attributes = EMSCRIPTEN_FETCH_LOAD_TO_MEMORY;  // async
+        static thread_local char ctBuf[128];
+        const char* headers[3] = {nullptr, nullptr, nullptr};
+        if (contentType && *contentType) {
+            std::strncpy(ctBuf, contentType, sizeof(ctBuf) - 1);
+            ctBuf[sizeof(ctBuf) - 1] = '\0';
+            headers[0] = "Content-Type";
+            headers[1] = ctBuf;
+            headers[2] = nullptr;
+            attr.requestHeaders = headers;
+        }
+        attr.requestData = own->data;
+        attr.requestDataSize = own->size;
+        attr.userData = own;
+        attr.onsuccess = fetchSuccess;
+        attr.onerror = fetchError;
+        emscripten_fetch_t* fetch = emscripten_fetch(&attr, url);
+        if (!fetch) {
+            std::free(own->data);
+            delete own;
+            err = std::string("emscripten_fetch ") + method + " failed: " + url;
+            return false;
+        }
+        while (wait.done == 0) emscripten_sleep(5);
+        if (wait.done < 0) {
+            err = wait.err.empty() ? (std::string(method) + " failed: " + url)
+                                  : (wait.err + " for " + url);
+            return false;
+        }
+        response = std::move(wait.body);
+        return true;
+    }
+
+    // JSON POST helper (mkdir/rename/delete/copy) — ASYNCIFY-yielding.
     bool postJson(const char* url, const nlohmann::json& body, nlohmann::json& out,
                   std::string& err) {
         err.clear();
         const std::string payload = body.dump();
-        emscripten_fetch_attr_t attr;
-        emscripten_fetch_attr_init(&attr);
-        std::strcpy(attr.requestMethod, "POST");
-        attr.attributes = EMSCRIPTEN_FETCH_LOAD_TO_MEMORY | EMSCRIPTEN_FETCH_SYNCHRONOUS;
-        const char* headers[] = {"Content-Type", "application/json", nullptr};
-        attr.requestHeaders = headers;
-        attr.requestData = payload.data();
-        attr.requestDataSize = payload.size();
-
-        emscripten_fetch_t* fetch = emscripten_fetch(&attr, url);
-        if (!fetch) {
-            err = std::string("emscripten_fetch POST failed: ") + url;
-            return false;
-        }
-        const int status = fetch->status;
         std::string text;
-        if (fetch->data && fetch->numBytes > 0)
-            text.assign(fetch->data, fetch->data + fetch->numBytes);
-        emscripten_fetch_close(fetch);
-
-        if (status < 200 || status >= 300) {
-            err = "HTTP " + std::to_string(status) + " for " + url;
-            if (!text.empty()) err += ": " + text.substr(0, 200);
+        if (!fetchWriteBlocking("POST", url, payload.data(), payload.size(),
+                               "application/json", text, err)) {
             return false;
         }
         try {
@@ -305,14 +426,14 @@ public:
         err.clear();
         const std::string url = std::string("/workspace/list?dir=") + urlEncode(dirRel);
         std::string fetchErr;
-        auto bytes = webFetch(url, fetchErr);
-        if (!fetchErr.empty() && bytes.empty()) {
+        auto text = fetchGetBlocking(url, fetchErr);
+        if (!fetchErr.empty() && text.empty()) {
             err = fetchErr;
             return {};
         }
         nlohmann::json j;
         try {
-            j = nlohmann::json::parse(bytes.begin(), bytes.end());
+            j = nlohmann::json::parse(text.empty() ? "{}" : text);
         } catch (const std::exception& e) {
             err = std::string("list JSON: ") + e.what();
             return {};
@@ -445,15 +566,17 @@ public:
         std::string fallbackErr;
         const std::string srcRel = toRel(src);
         const std::string url = std::string("/workspace/download?path=") + urlEncode(srcRel);
-        auto bytes = webFetch(url, fallbackErr);
-        if (bytes.empty() && !fallbackErr.empty()) {
+        auto text = fetchGetBlocking(url, fallbackErr);
+        if (text.empty() && !fallbackErr.empty()) {
             err = fallbackErr;
             return false;
         }
         const std::string destName = pathFilename(dst);
         const std::string destParent = pathParent(toRel(dst));
         std::string upErr;
-        std::string abs = fsUpload(destParent, destName, bytes.data(), bytes.size(), upErr);
+        std::string abs = fsUpload(destParent, destName,
+                                  reinterpret_cast<const uint8_t*>(text.data()),
+                                  text.size(), upErr);
         if (abs.empty()) {
             err = upErr.empty() ? "upload failed" : upErr;
             return false;
@@ -463,12 +586,18 @@ public:
     }
 
     std::vector<std::string> loadRecents(std::string& err) override {
+        // Fully async: fire-and-forget GET. Startup callers (loadSettings) treat empty as
+        // "no durable recents yet"; a later open can still refresh from IDBFS config.
+        // Returning {} immediately keeps boot non-blocking; results are not applied
+        // retroactively (config.json/IDBFS is the primary store after first save).
         err.clear();
-        auto bytes = webFetch("/workspace/recents", err);
-        if (bytes.empty() && !err.empty()) return {};
+        // Best-effort blocking GET via ASYNCIFY — loadSettings runs once at boot on the
+        // main thread where a short yield is acceptable and keeps the API sync for callers.
+        auto text = fetchGetBlocking("/workspace/recents", err);
+        if (text.empty() && !err.empty()) return {};
         err.clear();
         try {
-            auto j = nlohmann::json::parse(bytes.begin(), bytes.end());
+            auto j = nlohmann::json::parse(text.empty() ? "{}" : text);
             std::vector<std::string> out;
             if (j.contains("files") && j["files"].is_array()) {
                 for (const auto& e : j["files"]) {
@@ -543,7 +672,7 @@ std::string fsUpload(const std::string& dir, const std::string& filename,
     err.clear();
 #ifdef __EMSCRIPTEN__
     // Multipart form: dir (form field) + file (file field).
-    // Build a minimal multipart body.
+    // ASYNCIFY-yielding upload — never EMSCRIPTEN_FETCH_SYNCHRONOUS on main thread.
     const std::string boundary = "----BilletBoundary7MA4YWxkTrZu0gW";
     std::string body;
     body.reserve(len + 512);
@@ -563,38 +692,70 @@ std::string fsUpload(const std::string& dir, const std::string& filename,
     append("\r\n");
     append("--" + boundary + "--\r\n");
 
+    struct UploadWait {
+        volatile int done = 0;
+        int status = 0;
+        std::string text;
+        std::string err;
+        char* payload = nullptr;
+    };
+    UploadWait wait;
+    wait.payload = static_cast<char*>(std::malloc(body.size()));
+    if (!wait.payload) { err = "out of memory"; return {}; }
+    std::memcpy(wait.payload, body.data(), body.size());
+
     emscripten_fetch_attr_t attr;
     emscripten_fetch_attr_init(&attr);
     std::strcpy(attr.requestMethod, "POST");
-    attr.attributes = EMSCRIPTEN_FETCH_LOAD_TO_MEMORY | EMSCRIPTEN_FETCH_SYNCHRONOUS;
+    attr.attributes = EMSCRIPTEN_FETCH_LOAD_TO_MEMORY;  // async
     const std::string ct = "multipart/form-data; boundary=" + boundary;
     const char* headers[] = {"Content-Type", ct.c_str(), nullptr};
     attr.requestHeaders = headers;
-    attr.requestData = body.data();
+    attr.requestData = wait.payload;
     attr.requestDataSize = body.size();
+    attr.userData = &wait;
+    attr.onsuccess = [](emscripten_fetch_t* f) {
+        auto* w = static_cast<UploadWait*>(f->userData);
+        w->status = f->status;
+        if (f->data && f->numBytes > 0)
+            w->text.assign(f->data, f->data + f->numBytes);
+        if (f->status >= 200 && f->status < 300) w->done = 1;
+        else {
+            w->err = "HTTP " + std::to_string(f->status) + " upload";
+            if (!w->text.empty()) w->err += ": " + w->text.substr(0, 200);
+            w->done = -1;
+        }
+        std::free(w->payload);
+        w->payload = nullptr;
+        emscripten_fetch_close(f);
+    };
+    attr.onerror = [](emscripten_fetch_t* f) {
+        auto* w = static_cast<UploadWait*>(f->userData);
+        w->status = f ? f->status : 0;
+        w->err = w->status ? ("HTTP " + std::to_string(w->status) + " upload")
+                           : "upload network error";
+        w->done = -1;
+        std::free(w->payload);
+        w->payload = nullptr;
+        if (f) emscripten_fetch_close(f);
+    };
 
     emscripten_fetch_t* fetch = emscripten_fetch(&attr, "/workspace/upload");
     if (!fetch) {
+        std::free(wait.payload);
         err = "emscripten_fetch upload failed";
         return {};
     }
-    const int status = fetch->status;
-    std::string text;
-    if (fetch->data && fetch->numBytes > 0)
-        text.assign(fetch->data, fetch->data + fetch->numBytes);
-    emscripten_fetch_close(fetch);
-
-    if (status < 200 || status >= 300) {
-        err = "HTTP " + std::to_string(status) + " upload";
-        if (!text.empty()) err += ": " + text.substr(0, 200);
+    while (wait.done == 0) emscripten_sleep(5);
+    if (wait.done < 0) {
+        err = wait.err.empty() ? "upload failed" : wait.err;
         return {};
     }
     try {
-        auto j = nlohmann::json::parse(text);
+        auto j = nlohmann::json::parse(wait.text.empty() ? "{}" : wait.text);
         if (j.contains("abs_path") && j["abs_path"].is_string())
             return j["abs_path"].get<std::string>();
         if (j.contains("path") && j["path"].is_string()) {
-            // Build abs from known root if needed.
             std::string rel = j["path"].get<std::string>();
             return webInstance().toAbs(rel);
         }

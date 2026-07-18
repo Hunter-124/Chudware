@@ -349,3 +349,10 @@ patterned), then circular-pattern that extrude feature about axis.z:
  {"op":"add_feature","feature":{"type":"extrude","name":"Boss","params":{"mode":"boss","end":"blind","depth":{"value":10,"expr":null}},"refs":{"profile":[{"kind":"region","sketch":"$1","centroid":[30,0],"hint_index":0}]}}},
  {"op":"add_feature","feature":{"type":"circular_pattern","name":"Ring","params":{"count":6,"angle":{"value":360,"expr":null},"equal_spacing":true},"refs":{"axis":{"kind":"datum","feature":"axis.z"},"features":["$3"]}}}
 ]
+
+----------------------------------------------------------------- TOOL SCOPE
+request_tools — meta-op (not applied to the doc). Ask for more vocabulary mid-run:
+  [{"op":"request_tools","classes":["full_ops"|"sheetmetal"|"weldments"|"surfacing"]}]
+Domain classes append cheatsheets/sheetmetal.md, weldment.md, or surfacing.md on the next turn.
+You already have the full op set on this sheet; prefer emitting real ops. A second full_ops
+request is a no-op.

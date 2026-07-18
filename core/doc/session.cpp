@@ -5610,14 +5610,44 @@ json doc_export_step(const std::string& doc_id, const std::string& path) {
     if (shapes.empty())
         throw OpError("export_failed", "document has no solid bodies to export",
                       {{"doc_id", doc_id}});
+    // Path resolution: an absolute client/server path is honored verbatim (desktop non-daemon
+    // keeps writing under the host appdata cache). Empty OR relative paths get a server-owned
+    // temp file under the same aicad_cpp_docs dir publish_doc_aicm uses — required for WASM /
+    // daemon hosts where the client would otherwise send a browser-local path hostd can't use.
+    // The resolved absolute path is always returned in the response so callers can seed step_path.
+    std::string use_path = path;
+    {
+        const std::filesystem::path p(use_path);
+        if (use_path.empty() || !p.is_absolute()) {
+            std::filesystem::path dir =
+                std::filesystem::temp_directory_path() / "aicad_cpp_docs";
+            std::error_code ec;
+            std::filesystem::create_directories(dir, ec);
+            std::string ext = ".step";
+            if (!use_path.empty()) {
+                std::string e = p.extension().string();
+                if (!e.empty()) ext = e;
+            }
+            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+            // Keep doc_id filename-safe (ids are already alnum-ish; strip path seps just in case).
+            std::string safe = doc_id;
+            for (char& c : safe) {
+                if (c == '/' || c == '\\' || c == ':' || c == ' ') c = '_';
+            }
+            use_path =
+                (dir / ("export_" + safe + "_" + std::to_string(ms) + ext)).string();
+        }
+    }
     // Format follows the extension: .stl (case-insensitive) -> binary STL, else STEP.
     // export_bodies handles single-body-as-is / multi-body-compound (as_compound) and
     // parent-dir creation, matching bridge.py::export_step.
-    std::string suffix = std::filesystem::path(path).extension().string();
+    std::string suffix = std::filesystem::path(use_path).extension().string();
     std::transform(suffix.begin(), suffix.end(), suffix.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     const std::string fmt = (suffix == ".stl") ? "stl" : "step";
-    std::string out = export_bodies(shapes, path, fmt);
+    std::string out = export_bodies(shapes, use_path, fmt);
     return json{{"path", out}};
 }
 

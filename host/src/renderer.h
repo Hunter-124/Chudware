@@ -4,6 +4,7 @@
 // render each body in its own color (matching the engine's contact-sheet palette).
 #pragma once
 #include <cstdint>
+#include <list>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -414,6 +415,8 @@ private:
     void planeCorners(int plane, float e, Vec3 out[4]) const;  // 4 world corners of plane quad
     void freeSubs();
     void freeSubVector(std::vector<Sub>& subs);
+    void meshCacheTouch(const std::string& key);   // mark key MRU; insert if absent from order
+    void meshCacheEvictIfNeeded();                 // drop oldest until size <= kMeshCacheMaxEntries
     void buildLut();              // C19: build the SW-style jet LUT texture (lazy)
     void uploadDeformed(Sub& s);  // C19: re-upload displaced positions for the current scale
     void resolveColorTexture() const;  // SS colorTex_ -> final-size resolvedTex_ by box filter
@@ -547,7 +550,11 @@ private:
         Vec3 center;
         float radius = 0.0f;
     };
+    // Parked GPU meshes keyed by "docId\\x1frev". Cap keeps the N most-recent
+    // (doc,rev) entries so multi-tab sessions don't grow VAOs unbounded.
+    static constexpr size_t kMeshCacheMaxEntries = 6;
     std::unordered_map<std::string, CachedMesh> meshCache_;
+    std::list<std::string> meshCacheOrder_;  // front = most recent
     std::string activeMeshDocId_;
     int activeMeshRevision_ = -1;
     // In-context component-edit ghost: the parked assembly mesh (moved out of subs_ on enter),

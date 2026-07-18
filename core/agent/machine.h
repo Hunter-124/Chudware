@@ -69,6 +69,9 @@ struct StageOutcome {
     bool has_tokens = false;
     json tokens = nullptr;
     bool no_progress = false;
+    // True when this retry must not burn the stage attempt budget (e.g. tool-scope
+    // escalation that re-prompts with a bigger cheatsheet on the same step).
+    bool free_retry = false;
     // Provider reasoning (CompleteResult.thinking) — emitted as agent.thought.
     std::string thinking;
     std::string model;  // optional provider model id for the thought row

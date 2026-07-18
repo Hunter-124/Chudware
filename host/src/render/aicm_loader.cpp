@@ -8,7 +8,9 @@
 
 #include <cstdio>
 #include <cstring>
+#include <list>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #ifndef __EMSCRIPTEN__
@@ -234,34 +236,93 @@ std::string urlEncode(const std::string& s) {
     return out;
 }
 
+// In-memory AICM byte cache keyed by the aicm URI (revision-stable). Avoids re-fetching the
+// same (doc,rev) tess over HTTP when the user switches tabs. Engine keeps only the last few
+// published revs — 404s are not cached and fail the load as before.
+constexpr size_t kAicmLruMaxEntries = 8;
+constexpr size_t kAicmLruMaxBytes   = 64ull * 1024ull * 1024ull;  // 64 MB
+
+struct AicmLruEntry {
+    std::string key;               // original path/URI
+    std::vector<uint8_t> bytes;
+};
+
+struct AicmLru {
+    std::list<AicmLruEntry> order;  // front = most recent
+    std::unordered_map<std::string, std::list<AicmLruEntry>::iterator> index;
+    size_t totalBytes = 0;
+
+    bool lookup(const std::string& key, std::vector<uint8_t>& out) {
+        auto it = index.find(key);
+        if (it == index.end()) return false;
+        order.splice(order.begin(), order, it->second);  // move to MRU
+        out = it->second->bytes;
+        return true;
+    }
+
+    void insert(const std::string& key, const std::vector<uint8_t>& bytes) {
+        if (bytes.empty()) return;
+        auto it = index.find(key);
+        if (it != index.end()) {
+            totalBytes -= it->second->bytes.size();
+            order.erase(it->second);
+            index.erase(it);
+        }
+        totalBytes += bytes.size();
+        order.push_front(AicmLruEntry{key, bytes});  // copy into cache
+        index[key] = order.begin();
+        while (!order.empty() &&
+               (order.size() > kAicmLruMaxEntries || totalBytes > kAicmLruMaxBytes)) {
+            // Keep at least the MRU entry even if it alone exceeds the byte cap.
+            if (order.size() == 1) break;
+            totalBytes -= order.back().bytes.size();
+            index.erase(order.back().key);
+            order.pop_back();
+        }
+    }
+};
+
+AicmLru& aicmLru() {
+    static AicmLru cache;
+    return cache;
+}
+
 }  // namespace
 
 bool loadAicmFile(const std::string& path, DocMesh& out, std::string& err) {
     // Browser has no /dev/shm or daemon FS — pull bytes from the gateway.
-    const bool is_shm = aicad::aicm_handoff::is_shm_uri(path);
-    std::string url;
-    if (is_shm) {
-        // aicm-shm://[/]aicad_<key> → ?shm=aicad_<key> (gateway rejects a leading '/').
-        std::string name = path.substr(std::strlen("aicm-shm://"));
-        while (!name.empty() && name.front() == '/') name.erase(name.begin());
-        if (name.empty()) {
-            err = "malformed aicm-shm uri";
-            return false;
-        }
-        url = "/files/aicm?shm=" + urlEncode(name);
-    } else {
-        if (path.empty()) {
-            err = "empty AICM path";
-            return false;
-        }
-        url = "/files/aicm?path=" + urlEncode(path);
-    }
+    // Hit the in-memory LRU first so a warm (doc,rev) switch never re-GETs.
+    std::vector<uint8_t> bytes;
+    const bool cacheHit = aicmLru().lookup(path, bytes);
 
-    std::string ferr;
-    std::vector<uint8_t> bytes = billet::webFetch(url, ferr);
-    if (bytes.empty()) {
-        err = ferr.empty() ? ("empty AICM response for " + path) : ferr;
-        return false;
+    const bool is_shm = aicad::aicm_handoff::is_shm_uri(path);
+    if (!cacheHit) {
+        std::string url;
+        if (is_shm) {
+            // aicm-shm://[/]aicad_<key> → ?shm=aicad_<key> (gateway rejects a leading '/').
+            std::string name = path.substr(std::strlen("aicm-shm://"));
+            while (!name.empty() && name.front() == '/') name.erase(name.begin());
+            if (name.empty()) {
+                err = "malformed aicm-shm uri";
+                return false;
+            }
+            url = "/files/aicm?shm=" + urlEncode(name);
+        } else {
+            if (path.empty()) {
+                err = "empty AICM path";
+                return false;
+            }
+            url = "/files/aicm?path=" + urlEncode(path);
+        }
+
+        std::string ferr;
+        bytes = billet::webFetch(url, ferr);
+        if (bytes.empty()) {
+            // 404 / network: fail the load as before. Do NOT cache empties.
+            err = ferr.empty() ? ("empty AICM response for " + path) : ferr;
+            return false;
+        }
+        aicmLru().insert(path, bytes);  // cache a copy; keep local bytes for parse
     }
 
     if (is_shm) {

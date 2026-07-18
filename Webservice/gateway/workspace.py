@@ -36,6 +36,16 @@ router = APIRouter()
 
 # POSIX shm objects published by aicm_handoff (shm_object_name: "aicad_" + sanitized key).
 _SHM_NAME_RE = re.compile(r"^aicad_[A-Za-z0-9_.\-]{1,200}$")
+# Revision-stable AICM keys end in _r<digits> (aicm_handoff::key_for). Immutable for a year.
+_AICM_REVID_RE = re.compile(r"_r\d+")
+
+
+def _aicm_cache_headers(name: str) -> dict[str, str]:
+    """Revisioned doc meshes are content-addressed; non-revisioned stay no-store."""
+    if name and _AICM_REVID_RE.search(name):
+        return {"Cache-Control": "private, max-age=31536000, immutable"}
+    return {"Cache-Control": "no-store"}
+
 _SHM_URI_PREFIX = "aicm-shm://"
 
 # Durable recent-files list for the WASM client (config.json lives in /tmp there).
@@ -333,7 +343,7 @@ async def files_aicm(request: Request, path: str = "", shm: str = "") -> FileRes
         if not target.is_file():
             raise HTTPException(status_code=404, detail="shm object gone")
         return FileResponse(str(target), media_type="application/octet-stream",
-                            headers={"Cache-Control": "no-store"})
+                            headers=_aicm_cache_headers(shm))
     if not path:
         raise HTTPException(status_code=400, detail="path or shm required")
     try:
@@ -345,4 +355,4 @@ async def files_aicm(request: Request, path: str = "", shm: str = "") -> FileRes
     if not target.is_file():
         raise HTTPException(status_code=400, detail="not a file")
     return FileResponse(str(target), media_type="application/octet-stream",
-                        headers={"Cache-Control": "no-store"})
+                        headers=_aicm_cache_headers(target.name))

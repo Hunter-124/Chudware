@@ -7,24 +7,40 @@
 
 #include "app_state.h"  // jstr/jint/jnum/jbool safe JSON accessors
 #include "cpp_core.h"   // in-process C++ core (libaicad) — the sim backend when no Python worker
+#include "engine_backend.h"  // daemonMode — WASM/desktop hostd path (no child sim worker)
 
 namespace core {
 
 bool SimClient::ensureStarted(std::string& consoleNote) {
     std::lock_guard<std::mutex> lk(startMtx_);
     if (worker_.started()) return true;
+
+    // Daemon / WASM: there is no Python sim child to spawn. FEA methods
+    // (sim_mesh / sim_run_static / sim_run_modal / sim_run_fatigue / sim_run_thermal)
+    // route via routeSimToCpp → engine::call BEFORE WorkerClient's running_ check, so a
+    // synthetic started flag is enough for launch()/caps() gates. Mirrors
+    // AppState::tryStartWorker's web branch.
+    if (engine::daemonMode()) {
+        worker_.markStarted();
+        consoleNote = "[sim] daemon mode: FEA routes via hostd (no local sim worker)";
+        return true;
+    }
+
     std::string err;
     if (worker_.start(err, "engine.sim.worker")) {
         consoleNote = "[sim] simulation worker started";
         return true;
     }
 #ifndef _WIN32
-    // No managed Python runtime on this platform — the FEA sim RPCs (sim_mesh / sim_run_static /
-    // sim_run_modal / sim_run_fatigue) route in-process to libaicad (routeSimToCpp defaults on),
-    // so treat the backend as ready if the core loads. (sim_run_flow / sim_caps / sim_cancel have
-    // no C++ port yet and degrade gracefully.)
+    // No managed Python runtime on this platform — the FEA sim RPCs route in-process to
+    // libaicad (routeSimToCpp defaults on), so treat the backend as ready if the core loads.
+    // (sim_run_flow / sim_caps / sim_cancel have no C++ port yet and degrade gracefully.)
     std::string lerr;
     if (core::cpp_core().ensureLoaded(lerr)) {
+        // Mark started so launch()'s worker_.call path can reach routeSimToCpp (and so
+        // started() reports ready). running_ stays meaningless for a real pipe — call()
+        // still routes FEA in-process before the pipe write.
+        worker_.markStarted();
         consoleNote = "[sim] using in-process C++ core (libaicad) for simulation";
         return true;
     }

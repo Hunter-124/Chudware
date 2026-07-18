@@ -9,7 +9,9 @@
 #pragma once
 
 #include <optional>
+#include <set>
 #include <string>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -36,6 +38,19 @@ OpsResult extract_ops(const std::string& reply);
 // non-empty ops array (earlier arrays in a reasoning stream are drafts/fragments).
 // Only call this when extract_ops(content) yielded no usable (non-empty) ops.
 OpsResult extract_ops_last_nonempty(const std::string& reply);
+
+// Peel leading/sole request_tools ops out of a model-emitted ops array.
+// request_tools is a harness meta-op (never sent to doc_apply_ops):
+//   {"op":"request_tools","classes":["full_ops"|"sheetmetal"|"weldments"|"surfacing"]}
+// Normalizes aliases (weldment->weldments). Populates `requested` with unique
+// recognized class names in first-seen order. `remaining` is the ops array with
+// every request_tools entry stripped (may be empty).
+struct ToolScopeRequest {
+    std::vector<std::string> requested;
+    json remaining = json::array();
+    bool had_request = false;  // true if at least one request_tools op was present
+};
+ToolScopeRequest peel_request_tools(const json& ops);
 
 // True if the reply carries a {"revert": true} verdict (fenced or bare {..}).
 bool extract_revert(const std::string& reply);

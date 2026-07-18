@@ -237,11 +237,11 @@ bool routeAgentToCpp(const std::string& method, const json& params) {
     return engine::ensureLoaded(lerr);
 }
 // --- C++ SIM (FEA) routing (opt-in, default OFF) ----------------------------
-// Route the host's FEA simulation RPCs (sim_mesh / sim_run_static / sim_run_modal)
-// to the pure-C++ core (libaicad) instead of the Python sim worker. MIRRORS the
-// agent seam but is DEFAULT OFF: unless AI_CAD_CPP_SIM is set (and != "0") every sim
-// call goes to the Python sim worker exactly as today. sim_run_flow (LBM/CFD) and
-// sim_cancel are NEVER routed — they stay Python.
+// Route the host's FEA simulation RPCs (sim_mesh / sim_run_static / sim_run_modal /
+// sim_run_fatigue / sim_run_thermal) to the pure-C++ core (libaicad) instead of the
+// Python sim worker. MIRRORS the agent seam but is DEFAULT OFF: unless AI_CAD_CPP_SIM
+// is set (and != "0") every sim call goes to the Python sim worker exactly as today.
+// sim_run_flow (LBM/CFD) and sim_cancel are NEVER routed — they stay Python.
 //
 // The host's send-shape for sim_run_static/sim_run_modal is already the C++ contract
 // ({study:{step_path, density, material, fixtures, loads}} + n_modes for modal), so no
@@ -257,7 +257,7 @@ bool cppSimFlag() {
 bool routeSimToCpp(const std::string& method, const json& /*params*/) {
     if (!cppSimFlag()) return false;
     if (!(method == "sim_mesh" || method == "sim_run_static" || method == "sim_run_modal" ||
-          method == "sim_run_fatigue"))
+          method == "sim_run_fatigue" || method == "sim_run_thermal"))
         return false;  // sim_run_flow (LBM) + sim_cancel + everything else stays Python
     if (!engine::available()) {
         // Lazily try to load the core DLL; if it can't load, fall through to Python so

@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
+#include <set>
 #include <sstream>
 #include <vector>
 
@@ -108,6 +109,22 @@ std::string read_cheatsheet_shared(const std::string& prompts_dir, bool solo) {
     return read_text(builtin_dir(prompts_dir) / "shared" / name);
 }
 
+// Map a granted tool-scope class to the on-disk cheatsheet stem (no .md).
+// weldments (model-facing plural) -> weldment.md on disk.
+const char* domain_sheet_stem(const std::string& cls) {
+    if (cls == "sheetmetal") return "sheetmetal";
+    if (cls == "weldments" || cls == "weldment") return "weldment";
+    if (cls == "surfacing") return "surfacing";
+    return nullptr;
+}
+
+std::string read_domain_cheatsheet(const std::string& prompts_dir, const std::string& cls) {
+    const char* stem = domain_sheet_stem(cls);
+    if (!stem) return "";
+    return py_strip(read_text(builtin_dir(prompts_dir) / "shared" / "cheatsheets" /
+                              (std::string(stem) + ".md")));
+}
+
 std::string read_hardware_catalog(const std::string& prompts_dir) {
     return py_strip(read_text(builtin_dir(prompts_dir) / "shared" / "cheatsheets" / "hardware.md"));
 }
@@ -134,7 +151,9 @@ bool is_role(const std::string& role) {
 
 std::pair<std::string, std::string> load_prompt(const std::string& role,
                                                 const std::string& prompts_dir,
-                                                bool solo) {
+                                                bool solo,
+                                                bool tool_scope_full,
+                                                const std::set<std::string>& tool_scope_classes) {
     if (!is_role(role)) throw std::runtime_error("unknown role " + role);
     fs::path ov = override_path(role);
     std::string ov_text;
@@ -153,10 +172,19 @@ std::pair<std::string, std::string> load_prompt(const std::string& role,
     }
     if (is_ops_role(role)) {
         // Solo single-part runs get the slim cheatsheet; Standard/Complex keep full.
-        std::string cs = read_cheatsheet_shared(prompts_dir, solo);
+        // tool_scope_full (mid-run escalation via request_tools) forces the full sheet.
+        const bool use_solo = solo && !tool_scope_full;
+        std::string cs = read_cheatsheet_shared(prompts_dir, use_solo);
         // Fall back to the full sheet if the solo file is missing (older installs).
-        if (cs.empty() && solo) cs = read_cheatsheet_shared(prompts_dir, /*solo=*/false);
+        if (cs.empty() && use_solo) cs = read_cheatsheet_shared(prompts_dir, /*solo=*/false);
         if (!cs.empty()) text = py_rstrip(text) + "\n\n---\n" + cs;
+        // Append any granted domain context sheets (sheetmetal/weldments/surfacing).
+        for (const std::string& cls : tool_scope_classes) {
+            if (cls == "full_ops") continue;  // handled by tool_scope_full above
+            std::string dom = read_domain_cheatsheet(prompts_dir, cls);
+            if (dom.empty()) continue;  // missing file = silent skip
+            text = py_rstrip(text) + "\n\n---\nDOMAIN CHEATSHEET (" + cls + "):\n\n" + dom;
+        }
     }
     if (is_catalog_role(role)) {
         std::string hw = read_hardware_catalog(prompts_dir);

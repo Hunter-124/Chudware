@@ -17,6 +17,8 @@
 #include "settings_modal.h"
 
 #include "../core/app_state.h"
+#include "file_dialog.h"
+#include "../core/fs_backend.h"
 #include "../core/cpp_core.h"
 #include "../renderer.h"
 #include "legacy_chat.h"  // ui::drawAiSettingsSection (glass-grouped AI tab sections)
@@ -2382,11 +2384,60 @@ void drawSettingsModal(AppState& st, bool busy) {
                     st.addLog(std::string("[units] set to ") + (st.ips() ? "IPS" : "MMGS"));
                 }
                 dimText("Changes how lengths display/parse everywhere (saved immediately).");
-
                 // Workspace folder (audit P1): workspace_dir was persisted but had NO UI —
                 // users had to hand-edit config.json to re-root the File Explorer.
                 settingsSectionHeader("Workspace");
                 ImGui::TextUnformatted("Workspace folder");
+#ifdef __EMSCRIPTEN__
+                // Web: default is the server workspace abs root (fsBackend), not the
+                // literal "/workspace" stub from defaultWorkspaceDir().
+                {
+                    static std::string s_wsDefaultWeb;
+                    if (s_wsDefaultWeb.empty()) {
+                        s_wsDefaultWeb = billet::fsBackend().defaultRoot();
+                        if (s_wsDefaultWeb.empty() || s_wsDefaultWeb == "/workspace")
+                            s_wsDefaultWeb = billet::fsBackend().defaultRoot();
+                    }
+                    static const std::string s_wsHelpWeb =
+                        "The File Explorer's root folder on the server workspace. "
+                        "Leave empty to use the server default. Browse picks a "
+                        "subfolder under the workspace.";
+                    static const std::string s_wsHintWeb =
+                        s_wsDefaultWeb.empty() ? std::string("(server default)")
+                                               : ("(default: " + s_wsDefaultWeb + ")");
+                    helpMarker(s_wsHelpWeb.c_str());
+                    ImGui::SetNextItemWidth(-210.0f * sc);
+                    ImGui::InputTextWithHint("##wsdir", s_wsHintWeb.c_str(),
+                                             s_wsBuf.data(), s_wsBuf.size());
+                    ImGui::SameLine();
+                    if (ImGui::Button("Browse\xe2\x80\xa6", ImVec2(90.0f * sc, 0))) {
+                        std::string chosen = openFolderDialog();
+                        if (!chosen.empty() && chosen != "/workspace") {
+                            std::fill(s_wsBuf.begin(), s_wsBuf.end(), 0);
+                            std::strncpy(s_wsBuf.data(), chosen.c_str(), s_wsBuf.size() - 1);
+                        }
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Apply", ImVec2(100.0f * sc, 0))) {
+                        std::string chosen = s_wsBuf.data();
+                        // Never persist the literal '/workspace' stub — resolve real root.
+                        if (chosen.empty() || chosen == "/workspace") {
+                            chosen.clear();
+                            settings.workspaceDir.clear();
+                            st.workspaceDir.clear();
+                            // ensureWorkspaceDir will re-resolve via fsBackend().defaultRoot().
+                        } else {
+                            settings.workspaceDir = chosen;
+                            st.workspaceDir = chosen;
+                        }
+                        saveSettings(settings);
+                        st.addLog("[ok] workspace folder set: " +
+                                  (settings.workspaceDir.empty() ? std::string("(default)")
+                                                                 : settings.workspaceDir));
+                    }
+                    dimText("Root of the File Explorer on the server workspace (saved on Apply).");
+                }
+#else
                 // Truthful default label: defaultWorkspaceDir() applies the alias rule
                 // (existing Documents/AI-CAD wins, else Documents/Billet).
                 static const std::string s_wsDefault = defaultWorkspaceDir();
@@ -2411,6 +2462,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                                                              : settings.workspaceDir));
                 }
                 dimText("Root of the File Explorer and default save location (saved on Apply).");
+#endif
 
                 // Theme moved to the Appearance tab (the canonical control); engine routing +
                 // profiler are status/launchers, folded under one System section (audit P2).

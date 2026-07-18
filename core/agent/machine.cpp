@@ -194,6 +194,7 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
     std::string last_fail_reason;
     bool last_was_provider_error = false;
     bool last_was_parse_error = false;
+    bool last_was_free_retry = false;
     // Run-level provider error (MODEL stage terminal) — returned as stop_reason.
     std::string run_provider_error;
 
@@ -236,7 +237,7 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
         StageOutcome outcome = action(state, attempt);
         emit_call_events(events, stage, role, attempt, outcome);
 
-        if (outcome.has_error) {
+        if (outcome.has_error && !outcome.free_retry) {
             int streak = state.ledger.note_sig(stage, err_sig(outcome.error));
             if (streak >= kSameSigLimit) {
                 last_fail_reason =
@@ -277,19 +278,27 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
 
         // Remember the latest provider-facing reason so a budget-exhaust terminal
         // can re-emit it instead of "budget exhausted (N)".
-        if (looks_like_provider_error(outcome)) {
+        if (outcome.free_retry) {
+            last_was_free_retry = true;
+            last_was_provider_error = false;
+            last_was_parse_error = false;
+            last_fail_reason = outcome.reason;
+        } else if (looks_like_provider_error(outcome)) {
+            last_was_free_retry = false;
             last_was_provider_error = true;
             last_was_parse_error = false;
             last_fail_reason = !outcome.reason.empty()
                                    ? outcome.reason
                                    : (outcome.has_error ? outcome.error : std::string("provider error"));
         } else if (outcome.has_parse_error) {
+            last_was_free_retry = false;
             last_was_provider_error = false;
             last_was_parse_error = true;
             last_fail_reason = !outcome.reason.empty()
                                    ? outcome.reason
                                    : (outcome.has_error ? outcome.error : outcome.parse_error);
         } else {
+            last_was_free_retry = false;
             last_was_provider_error = false;
             last_was_parse_error = false;
             last_fail_reason = outcome.reason;
@@ -298,7 +307,8 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
         events.emit("stage_result", json{{"stage", stage},
                                          {"attempt", attempt},
                                          {"verdict", outcome.verdict},
-                                         {"reason", outcome.reason}});
+                                         {"reason", outcome.reason},
+                                         {"free_retry", outcome.free_retry}});
         return outcome.verdict;
     };
 
@@ -309,12 +319,22 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
         last_fail_reason.clear();
         last_was_provider_error = false;
         last_was_parse_error = false;
+        last_was_free_retry = false;
+        int free_retries = 0;
+        constexpr int kMaxFreeRetries = 4;  // full_ops + 3 domain classes
         for (int attempt = 1; attempt <= budget; ++attempt) {
             std::string v = run_attempt(stage, action, role, attempt, budget);
             if (v == "cancelled" || v == "pass" || v == "fail" || v == "skip" ||
                 v == "provider_error")
                 return v;
-            // v == "retry"
+            // v == "retry" — tool-scope free retries re-prompt without burning the attempt.
+            if (last_was_free_retry && free_retries < kMaxFreeRetries) {
+                ++free_retries;
+                --attempt;
+                last_was_free_retry = false;
+                continue;
+            }
+            last_was_free_retry = false;
             if (attempt >= budget) {
                 // Provider/API failures must NOT masquerade as a budget problem — the GUI
                 // phase card renders stage_result.reason. Surface the real HTTP error.

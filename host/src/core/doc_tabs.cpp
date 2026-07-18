@@ -326,12 +326,44 @@ void AppState::switchToTabCore(int idx) {
         dst.session->cachedMirror = {};
         dst.session->cachedDocMesh.reset();
     } else if (!cacheInvalidated) {
+        // Warm GPU/CPU mesh: full O(1) bind path.
         useLocalCache = dst.session->cachedRevision >= 0 &&
                         dst.session->cachedMirror.valid() &&
                         dst.session->cachedMirror.docId == dst.docId &&
                         dst.session->cachedMirror.revision == dst.session->cachedRevision &&
                         dst.session->cachedDocMesh;
         if (useLocalCache) aicmPath = dst.session->cachedAicmPath;
+        // Snapshot+AICM path valid but GPU/CPU mesh not parked (evicted or never committed):
+        // restore the mirror and async-load the mesh — no doc_activate RPC needed.
+        if (!useLocalCache &&
+            dst.session->cachedRevision >= 0 &&
+            dst.session->cachedMirror.valid() &&
+            dst.session->cachedMirror.docId == dst.docId &&
+            dst.session->cachedMirror.revision == dst.session->cachedRevision &&
+            !dst.session->cachedAicmPath.empty()) {
+            if (renderer) renderer->parkActiveMeshes();
+            activeTab = idx;
+            if (activeWorkspace != Workspace::Model && activeWorkspace != Workspace::Simulate &&
+                activeWorkspace != Workspace::Manufacture)
+                activeWorkspace = Workspace::Model;
+            reseatActiveSubsystems(dst.session.get());
+            restoreDocState(*dst.session);
+            suppressTabDirty = true;
+            docMirror.restoreSnapshot(dst.session->cachedMirror);
+            dst.isAssembly = docMirror.tree().is_object() &&
+                             (jtab(docMirror.tree(), "schema") == "aicad.asm/1");
+            dst.title = docTitle(docMirror.tree(), dst.isAssembly);
+            suppressTabDirty = false;
+            ui::featureTreeResetTransient();
+            zoomToBBoxRequested = false;
+            unloadDocMesh();
+            loadDocMeshAsync(dst.session->cachedAicmPath);
+            const double shellMs = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - switchStarted).count();
+            logTabPerf(*this, "[perf] tab_switch doc=" + dst.docId +
+                       " path=cached-async shell=" + std::to_string(shellMs) + "ms");
+            return;
+        }
     }
     const bool ok = useLocalCache;
     if (awaitingPushedMesh) {
@@ -514,26 +546,21 @@ void AppState::activateTabDocAsync(const std::string& docId, int tabIdx,
                                     (jtab(docMirror.tree(), "schema") == "aicad.asm/1");
                      d.title = docTitle(docMirror.tree(), d.isAssembly);
                     if (!aicm.empty()) {
-#ifdef __EMSCRIPTEN__
-                        // Web: loadAicmFile does a SYNCHRONOUS emscripten_fetch. This callback
-                        // runs on the browser main thread during rpc.drain(); a synchronous fetch
-                        // from here doesn't complete, so the switched-to doc never renders (initial
-                        // open + edits work because they use loadDocMeshAsync). Route through the
-                        // async loader (runs on the loader pthread) like every other mesh-load
-                        // site — drainMeshLoads() commits + fills cachedMirror/cachedDocMesh next
-                        // frame; cachedAicmPath/cachedRevision are also set just below.
+                        // Both platforms: loadAicmFile can be multi-100ms (disk parse on
+                        // desktop; emscripten_fetch+parse on web). This callback runs on the
+                        // GL/main thread during rpc.drain() — never block it. Route through
+                        // the async loader (loader pthread); drainMeshLoads() commits + fills
+                        // cachedDocMesh next frame. meshGen_ latest-wins drops stale
+                        // completions if the user switches again mid-load.
                         loadDocMeshAsync(aicm);
-#else
-                        std::string lerr;
-                        if (!loadDocMesh(aicm, lerr) && !lerr.empty())
-                            addLog("[tabs] loadDocMesh on switch: " + lerr);
-#endif
                      } else {
                          unloadDocMesh();
                          renderer->setActiveMeshIdentity(docId, docMirror.revision());
-                         d.session->cachedMirror = docMirror.snapshot();
                          d.session->cachedDocMesh = std::make_shared<render::DocMesh>();
                      }
+                     // Park snapshot + path now so a mid-load switch-away/back can take the
+                     // cached-async path (no second doc_activate) while the mesh still loads.
+                     d.session->cachedMirror = docMirror.snapshot();
                      d.session->cachedAicmPath = aicm;
                      d.session->cachedRevision = docMirror.revision();
                      d.meshCacheInvalidated = false;

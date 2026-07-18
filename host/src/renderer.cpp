@@ -378,6 +378,7 @@ Renderer::~Renderer() {
     freeSubs();
     for (auto& [_, cached] : meshCache_) freeSubVector(cached.subs);
     meshCache_.clear();
+    meshCacheOrder_.clear();
     clearGhost();   // free the component-edit ghost buffers if one is active at teardown
     if (fbo_) glDeleteFramebuffers(1, &fbo_);
     if (colorTex_) glDeleteTextures(1, &colorTex_);
@@ -663,6 +664,26 @@ void Renderer::freeSubs() {
     freeSubVector(subs_);
 }
 
+void Renderer::meshCacheTouch(const std::string& key) {
+    meshCacheOrder_.remove(key);
+    meshCacheOrder_.push_front(key);
+}
+
+void Renderer::meshCacheEvictIfNeeded() {
+    while (meshCache_.size() > kMeshCacheMaxEntries && !meshCacheOrder_.empty()) {
+        const std::string& oldest = meshCacheOrder_.back();
+        auto it = meshCache_.find(oldest);
+        if (it != meshCache_.end()) {
+            freeSubVector(it->second.subs);
+            meshCache_.erase(it);
+        }
+        meshCacheOrder_.pop_back();
+    }
+    // Drop any order entries that no longer map (defensive).
+    while (!meshCacheOrder_.empty() && meshCache_.find(meshCacheOrder_.back()) == meshCache_.end())
+        meshCacheOrder_.pop_back();
+}
+
 void Renderer::setActiveMeshIdentity(const std::string& docId, int revision) {
     if (docId.empty() || revision < 0) {
         activeMeshDocId_.clear();
@@ -688,6 +709,8 @@ void Renderer::parkActiveMeshes() {
         meshCache_.erase(old);
     }
     meshCache_.emplace(activeKey, CachedMesh{std::move(subs_), center_, radius_});
+    meshCacheTouch(activeKey);
+    meshCacheEvictIfNeeded();
     activeMeshDocId_.clear();
     activeMeshRevision_ = -1;
 }
@@ -721,6 +744,8 @@ void Renderer::cacheMeshes(const std::string& docId, int revision,
     discardCachedMeshes(docId);
     const std::string key = docId + '\x1f' + std::to_string(revision);
     meshCache_.emplace(key, std::move(uploaded));
+    meshCacheTouch(key);
+    meshCacheEvictIfNeeded();
 }
 
 bool Renderer::bindCachedMeshes(const std::string& docId, int revision) {
@@ -736,6 +761,7 @@ bool Renderer::bindCachedMeshes(const std::string& docId, int revision) {
     center_ = target->second.center;
     radius_ = target->second.radius;
     meshCache_.erase(target);
+    meshCacheOrder_.remove(targetKey);
     activeMeshDocId_ = docId;
     activeMeshRevision_ = revision;
     ++meshesRevision_;
@@ -748,6 +774,7 @@ void Renderer::discardCachedMeshes(const std::string& docId) {
     for (auto it = meshCache_.begin(); it != meshCache_.end();) {
         if (it->first.compare(0, prefix.size(), prefix) == 0) {
             freeSubVector(it->second.subs);
+            meshCacheOrder_.remove(it->first);
             it = meshCache_.erase(it);
         } else {
             ++it;

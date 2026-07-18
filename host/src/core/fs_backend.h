@@ -31,8 +31,9 @@ struct FsStat {
     int64_t  mtime  = 0;
 };
 
-// Abstract FS. Thread affinity: call from the GL/UI thread (web fetches are
-// synchronous and legal only off the browser main thread under PROXY_TO_PTHREAD).
+// Abstract FS. Thread affinity: call from the GL/UI thread. Web gateway calls use
+// async emscripten_fetch + ASYNCIFY yields (emscripten_sleep) — never EMSCRIPTEN_FETCH_SYNCHRONOUS
+// on the main thread (this build is main-thread ImGui + ASYNCIFY, no PROXY_TO_PTHREAD).
 class FsBackend {
 public:
     virtual ~FsBackend() = default;

@@ -100,3 +100,9 @@ M3 clearance hex standoff, 16mm across flats, 22mm tall (canonical solo part):
  {"op":"add_feature","feature":{"type":"hole","name":"Bore","params":{"style":"simple","end":"through_all","standard":"M3"},"refs":{"face":{"of":"face","side":"top"}}}}
 ]
 ```
+
+----------------------------------------------------------------- TOOL SCOPE
+This is the SLIM tool set. If the task needs ops not listed here (sheet metal, weldments,
+surfaces, lofts, sweeps, advanced patterns), reply with ONLY
+[{"op":"request_tools","classes":["full_ops"]}] and you will receive the full op vocabulary
+on the next turn. Domain extras: add "sheetmetal", "weldments", or "surfacing" to classes.

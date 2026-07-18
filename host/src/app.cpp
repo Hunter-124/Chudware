@@ -75,6 +75,7 @@ inline void wasmBootDom(const char* msg) {
 #include "render/splat_renderer.h"  // RE-27: splat GL draw in reveng reconstruct stage
 
 #include "core/app_state.h"
+#include "core/fs_backend.h"
 #include "core/engine_events.h"  // Phase 4: per-frame hostd event drain (daemon mode)
 #include "engine_backend.h"      // Phase 4: engine::daemonMode() (services/worker)
 #include "ipc_client.h"          // services/ipc EngineClient (orphan recovery RPCs)
@@ -773,6 +774,13 @@ static void onFileDrop(GLFWwindow* win, int count, const char** paths) {
     if (g_prevDropCallback) g_prevDropCallback(win, count, paths);   // keep ImGui's backend in the loop
     AppState* stp = static_cast<AppState*>(glfwGetWindowUserPointer(win));
     if (!stp || count <= 0 || !paths) return;
+#ifdef __EMSCRIPTEN__
+    // Web: GLFW/browser "paths" are not host filesystem paths the daemon can open.
+    // Canvas HTML5 drops are handled by billet_install_canvas_drop + drainWebFileDrop.
+    (void)stp;
+    (void)paths;
+    return;
+#else
     AppState& st = *stp;
     std::string first;
     int known = 0;
@@ -794,7 +802,100 @@ static void onFileDrop(GLFWwindow* win, int count, const char** paths) {
         st.toast(ui::ToastLevel::Info,
                  "Opening " + std::filesystem::path(first).filename().string() +
                  " (dropped " + std::to_string(known) + " files; opening the first)");
+#endif
 }
+
+#ifdef __EMSCRIPTEN__
+// Browser canvas drop → upload into workspace → requestOpenPath (ASYNCIFY-safe drain).
+struct WebDropPending {
+    volatile int ready = 0;  // 0=empty, 1=pending, -1=error toast
+    char         name[512] = {0};
+    uint8_t*     data = nullptr;
+    size_t       len  = 0;
+    char         err[256] = {0};
+};
+static WebDropPending g_webDrop;
+
+extern "C" EMSCRIPTEN_KEEPALIVE void billet_web_drop_done(
+    int ok, const char* name, const uint8_t* data, int len, const char* errMsg) {
+    if (g_webDrop.data) {
+        free(g_webDrop.data);
+        g_webDrop.data = nullptr;
+        g_webDrop.len = 0;
+    }
+    if (ok && data && len > 0 && name && name[0]) {
+        g_webDrop.data = static_cast<uint8_t*>(malloc(static_cast<size_t>(len)));
+        if (!g_webDrop.data) {
+            std::strncpy(g_webDrop.err, "out of memory", sizeof(g_webDrop.err) - 1);
+            g_webDrop.ready = -1;
+            return;
+        }
+        std::memcpy(g_webDrop.data, data, static_cast<size_t>(len));
+        g_webDrop.len = static_cast<size_t>(len);
+        std::strncpy(g_webDrop.name, name, sizeof(g_webDrop.name) - 1);
+        g_webDrop.name[sizeof(g_webDrop.name) - 1] = '\0';
+        g_webDrop.err[0] = '\0';
+        g_webDrop.ready = 1;
+    } else {
+        g_webDrop.name[0] = '\0';
+        if (errMsg && errMsg[0]) {
+            std::strncpy(g_webDrop.err, errMsg, sizeof(g_webDrop.err) - 1);
+            g_webDrop.err[sizeof(g_webDrop.err) - 1] = '\0';
+        } else {
+            g_webDrop.err[0] = '\0';
+        }
+        g_webDrop.ready = -1;
+    }
+}
+
+// JS library (billet_web_dialogs.js) — installs dragover/drop on the canvas.
+extern "C" void billet_install_canvas_drop(void);
+
+static void drainWebFileDrop(AppState& st) {
+    if (g_webDrop.ready == 0) return;
+    if (g_webDrop.ready < 0) {
+        if (g_webDrop.err[0])
+            st.toast(ui::ToastLevel::Warn, g_webDrop.err);
+        else
+            st.toast(ui::ToastLevel::Warn, "Drop a CAD or ECAD file to open it");
+        g_webDrop.ready = 0;
+        return;
+    }
+    // ready == 1
+    std::string name = g_webDrop.name;
+    std::vector<uint8_t> bytes;
+    if (g_webDrop.data && g_webDrop.len > 0)
+        bytes.assign(g_webDrop.data, g_webDrop.data + g_webDrop.len);
+    if (g_webDrop.data) {
+        free(g_webDrop.data);
+        g_webDrop.data = nullptr;
+        g_webDrop.len = 0;
+    }
+    g_webDrop.ready = 0;
+    g_webDrop.name[0] = '\0';
+
+    if (name.empty() || bytes.empty()) {
+        st.toast(ui::ToastLevel::Warn, "Drop a CAD or ECAD file to open it");
+        return;
+    }
+    if (!dropPathHasKnownExt(name)) {
+        st.toast(ui::ToastLevel::Warn, "Drop a CAD or ECAD file to open it");
+        return;
+    }
+    st.toast(ui::ToastLevel::Info, "Uploading " + name + "\xe2\x80\xa6");
+    std::string upErr;
+    // Upload into workspace root (same plumbing as openFileDialog's pickFile path).
+    std::string abs = billet::fsUpload(/*dir=*/"", name, bytes.data(), bytes.size(), upErr);
+    if (abs.empty()) {
+        st.addLog("[dnd] web drop upload failed: " + upErr);
+        st.toast(ui::ToastLevel::Error,
+                 "Upload failed: " + (upErr.empty() ? std::string("unknown") : upErr));
+        return;
+    }
+    st.requestOpenPath = abs;
+    st.addLog("[dnd] web drop -> " + abs);
+}
+#endif
 
 // Default to a fresh part on launch — on a non-shot run, once the worker is ready and nothing is
 // open, auto-create a disposable STARTER part (DocTab::isStarter) so the app opens straight into a
@@ -1364,6 +1465,9 @@ WASM_BOOT_LOG("[wasm-boot] loadIcons done\n");
     // chain to it from onFileDrop so the backend contract is preserved.
     glfwSetWindowUserPointer(win, &st);
     g_prevDropCallback = glfwSetDropCallback(win, onFileDrop);
+#ifdef __EMSCRIPTEN__
+    billet_install_canvas_drop();
+#endif
 
     // Multi-document FALLBACK singletons. PropertyManager / SketchMode / EvaluateDialogs are now
     // owned PER-DOCUMENT on each DocSession; st.propertyManager / sketchMode / evaluateDialogs are
@@ -2777,6 +2881,10 @@ WASM_BOOT_LOG("[wasm-boot] entering main loop\n");
         // T-PERF3: commit mesh loads that finished disk-parse on the loader thread (GL
         // upload only here; stale gens dropped so keep-last-good stays on screen).
         st.drainMeshLoads();
+#ifdef __EMSCRIPTEN__
+        // Browser canvas drop → fsUpload → requestOpenPath (set by billet_web_drop_done).
+        drainWebFileDrop(st);
+#endif
         // Phase 4 (shared engine daemon): drain hostd push events — foreign-edit
         // mirror refresh, mirror tabs from doc.opened, lease toasts. No-op in
         // legacy (in-process) mode.
@@ -3092,6 +3200,36 @@ WASM_BOOT_LOG("[wasm-boot] entering main loop\n");
                     if (stem.empty()) stem = "Part";
                     ui::ensureWorkspaceDir(st);
                     std::string dir = st.workspaceDir;
+#ifdef __EMSCRIPTEN__
+                    // Web: workspace lives on the gateway FS — never std::filesystem for host paths.
+                    {
+                        auto& fsb = billet::fsBackend();
+                        std::string ferr;
+                        if (dir.empty() || dir == "/workspace") {
+                            // defaultRoot() calls ensureRoot internally.
+                            dir = fsb.defaultRoot();
+                            st.workspaceDir = dir;
+                        }
+                        fsb.mkdir(dir, ferr);  // idempotent
+                        auto joinWs = [](const std::string& a, const std::string& b) {
+                            if (a.empty() || a == "/") return a == "/" ? ("/" + b) : b;
+                            char last = a.back();
+                            if (last == '/' || last == '\\') return a + b;
+                            return a + "/" + b;
+                        };
+                        std::string candidate = joinWs(dir, stem + ".step+");
+                        std::string serr;
+                        if (fsb.stat(candidate, serr).exists) {
+                            for (int n = 2; n < 10000; ++n) {
+                                std::string alt =
+                                    joinWs(dir, stem + "_" + std::to_string(n) + ".step+");
+                                if (!fsb.stat(alt, serr).exists) { candidate = alt; break; }
+                            }
+                        }
+                        st.addLog("[v2] auto-saving named part -> " + candidate);
+                        ui::featureTreeSaveDocToPath(st, candidate, /*requireNonEmpty=*/true);
+                    }
+#else
                     if (dir.empty()) dir = defaultWorkspaceDir();
                     namespace fs = std::filesystem;
                     std::error_code ec;
@@ -3107,6 +3245,7 @@ WASM_BOOT_LOG("[wasm-boot] entering main loop\n");
                     const std::string savePath = candidate.string();
                     st.addLog("[v2] auto-saving named part -> " + savePath);
                     ui::featureTreeSaveDocToPath(st, savePath, /*requireNonEmpty=*/true);
+#endif
                 }
             }
             // --- end C22b ---

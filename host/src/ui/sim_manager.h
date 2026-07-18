@@ -581,6 +581,11 @@ private:
     bool running_ = false;          // a run launched by THIS manager is in flight
     int  runningStudy_ = -1;        // index of the study that launched the in-flight run
     std::string runningStudyId_;    // stable id of the launched study (survives refresh/reorder)
+    // True while export + face-points prep runs on a background thread (before SimClient::launch).
+    // Keeps the Run button disabled without blocking the UI thread on web/daemon.
+    bool prepInFlight_ = false;
+    // After loadDocMeshAsync for a result overlay, finish legend/deform once drain commits.
+    std::string pendingOverlayStudyId_;
 
     std::string lastDocId_;         // doc id the mirror was last refreshed for (re-pull on change)
     long lastRevision_ = -1;        // engine revision at last refresh
@@ -593,6 +598,8 @@ private:
     // Re-tessellate the current document and reload its (editable, face-bearing) model mesh, replacing
     // a result overlay. Turns the colormap/deformation off first.
     void restoreModelMesh(AppState& st);
+    // Finish legend/deform after an overlay mesh commit (sync path or async drain).
+    void finishResultOverlay(AppState& st, Study& s);
 
     // Mesh-preview state (built by previewMesh from sim_mesh; drawn in the viewport while setting up).
     std::vector<float> meshPreviewSegs_;   // flat GL_LINES xyz pairs (surface element edges)

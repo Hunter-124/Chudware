@@ -12,6 +12,7 @@
 #include "agent/ops_emit.h"
 
 #include <cctype>
+#include <set>
 #include <vector>
 
 namespace aicad {
@@ -240,6 +241,65 @@ OpsResult extract_ops_last_nonempty(const std::string& reply) {
         }
     r.error = "no non-empty ops array in reasoning";
     return r;
+}
+
+namespace {
+
+// Canonical domain class names the model may request. full_ops upgrades the
+// Solo slim sheet; the rest append shared/cheatsheets/<file>.md.
+const char* normalize_tool_class(const std::string& raw) {
+    std::string t;
+    t.reserve(raw.size());
+    for (unsigned char c : raw) t.push_back(static_cast<char>(std::tolower(c)));
+    // trim
+    size_t a = 0, b = t.size();
+    while (a < b && (t[a] == ' ' || t[a] == '\t')) ++a;
+    while (b > a && (t[b - 1] == ' ' || t[b - 1] == '\t')) --b;
+    t = t.substr(a, b - a);
+    if (t == "full_ops" || t == "full" || t == "ops_full") return "full_ops";
+    if (t == "sheetmetal" || t == "sheet_metal" || t == "sm") return "sheetmetal";
+    // Disk file is weldment.md; accept both singular/plural from the model.
+    if (t == "weldments" || t == "weldment" || t == "weld") return "weldments";
+    if (t == "surfacing" || t == "surface" || t == "surfaces") return "surfacing";
+    return nullptr;
+}
+
+}  // namespace
+
+ToolScopeRequest peel_request_tools(const json& ops) {
+    ToolScopeRequest out;
+    if (!ops.is_array()) {
+        out.remaining = ops;
+        return out;
+    }
+    std::set<std::string> seen;
+    for (const auto& op : ops) {
+        if (!op.is_object()) {
+            out.remaining.push_back(op);
+            continue;
+        }
+        const std::string name = op.value("op", std::string());
+        if (name != "request_tools") {
+            out.remaining.push_back(op);
+            continue;
+        }
+        out.had_request = true;
+        if (!op.contains("classes")) continue;
+        const json& cls = op["classes"];
+        auto push_one = [&](const std::string& raw) {
+            const char* norm = normalize_tool_class(raw);
+            if (!norm) return;
+            if (seen.insert(norm).second) out.requested.push_back(norm);
+        };
+        if (cls.is_array()) {
+            for (const auto& c : cls) {
+                if (c.is_string()) push_one(c.get<std::string>());
+            }
+        } else if (cls.is_string()) {
+            push_one(cls.get<std::string>());
+        }
+    }
+    return out;
 }
 
 bool extract_revert(const std::string& reply) {

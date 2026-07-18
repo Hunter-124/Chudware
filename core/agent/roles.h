@@ -7,10 +7,10 @@
 // reads. The user OVERRIDE dir is %APPDATA%/AI-CAD/prompts/<role>.md.
 #pragma once
 
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
-
 #include <nlohmann/json.hpp>
 
 namespace aicad {
@@ -23,10 +23,15 @@ extern const std::vector<std::string> kRoles;  // 8 roles, in order.
 // (text, source). source is the absolute path the text came from. Ops roles get
 // the ops cheatsheet appended. `prompts_dir` overrides AI_CAD_PROMPTS_DIR.
 // When `solo` is true, modeler/fixer get the slim ops_cheatsheet_solo.md instead
-// of the full ~28KB sheet (Standard/Complex keep the full sheet).
+// of the full ~28KB sheet (Standard/Complex keep the full sheet). When
+// `tool_scope_full` is true the full sheet is forced even on Solo. Each entry in
+// `tool_scope_classes` appends shared/cheatsheets/<class>.md when the file exists
+// (sheetmetal.md / weldment.md / surfacing.md — weldments maps to weldment.md).
 std::pair<std::string, std::string> load_prompt(const std::string& role,
                                                 const std::string& prompts_dir = "",
-                                                bool solo = false);
+                                                bool solo = false,
+                                                bool tool_scope_full = false,
+                                                const std::set<std::string>& tool_scope_classes = {});
 
 // sha256(text utf-8).hexdigest()[:12].
 std::string prompt_hash(const std::string& text);

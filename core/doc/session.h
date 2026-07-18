@@ -196,7 +196,8 @@ nlohmann::json doc_push_pull(const std::string& doc_id, int body_id, int topo_id
 // doc_export_step: write the surviving solid bodies to `path` for the mesher. The
 // format follows the extension (.stl -> binary STL, else STEP/AP214). Single body
 // exports as-is; multiple bodies combine into a compound. Returns {"path": <abs>}.
-// Throws OpError("export_failed", "document has no solid bodies to export") on empty.
+// Empty or relative `path` → server temp under <tmp>/aicad_cpp_docs/export_<doc>_<ts>.ext
+// (absolute paths are honored unchanged). Throws OpError("export_failed", ...) on empty.
 nlohmann::json doc_export_step(const std::string& doc_id, const std::string& path);
 
 // doc_tessellate_bodies: tessellate the document's surviving solids and return them as AICM

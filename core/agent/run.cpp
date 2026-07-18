@@ -55,6 +55,40 @@ const char* kOpsParseFormatDirective =
     "Reply with ONLY a fenced ```json code block containing the ops array — no prose "
     "before or after.";
 
+// Feedback when the model re-requests full_ops after it was already granted.
+const char* kAlreadyHaveFullOps =
+    "you already have the full op set; emit the real document ops now (do not call "
+    "request_tools for full_ops again)";
+
+// True when a dry-run / validate error looks like an unknown op or feature type —
+// the wording produced by doc/op_registry (unknown op '…') and doc/validate
+// (…type: is not a feature type) / document rebuild (no compiler for feature type).
+bool looks_like_unknown_op_error(const std::string& err) {
+    auto has = [&](const char* n) { return err.find(n) != std::string::npos; };
+    return has("unknown op") || has("is not a feature type") ||
+           has("no compiler for feature type");
+}
+
+// Apply a peeled request_tools payload onto DesignState. Returns the list of
+// classes newly granted this call (for the tool_scope event). full_ops already
+// held is a no-op; domain classes already held are skipped.
+std::vector<std::string> grant_tool_scope(DesignState& st, const std::vector<std::string>& requested) {
+    std::vector<std::string> newly;
+    for (const std::string& cls : requested) {
+        if (cls == "full_ops") {
+            if (!st.tool_scope_full) {
+                st.tool_scope_full = true;
+                newly.push_back("full_ops");
+            }
+            st.tool_scope_classes.insert("full_ops");
+            continue;
+        }
+        if (st.tool_scope_classes.insert(cls).second) newly.push_back(cls);
+    }
+    return newly;
+}
+
+
 // Per-call output-token budget by provider + reasoning effort. The hardcoded 4096 throttled
 // capable cloud models (a complex part is one modeler call → truncation → parse fail → escape
 // hatch). Capable cloud backends get real headroom; local models stay modest.
@@ -972,6 +1006,100 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         }
         return out;
     };
+    // Handle request_tools meta-ops peeled from a modeler/fixer ops array.
+    // Returns true when the caller should return `o` immediately (escalation
+    // free-retry, or already-have-full feedback with no remaining ops).
+    auto handle_tool_scope = [&](DesignState& st, ToolScopeRequest& tsr, StageOutcome& o,
+                                 const char* stage_tag) -> bool {
+        if (!tsr.had_request) return false;
+
+        const bool had_full_already = st.tool_scope_full;
+        bool asked_full = false;
+        for (const std::string& c : tsr.requested)
+            if (c == "full_ops") {
+                asked_full = true;
+                break;
+            }
+
+        std::vector<std::string> newly = grant_tool_scope(st, tsr.requested);
+
+        // Build the granted snapshot for the event (full + domain classes).
+        json granted = json::array();
+        if (st.tool_scope_full) granted.push_back("full_ops");
+        for (const std::string& c : st.tool_scope_classes)
+            if (c != "full_ops") granted.push_back(c);
+
+        if (!newly.empty()) {
+            events.emit("tool_scope", json{{"granted", granted},
+                                           {"newly", newly},
+                                           {"stage", stage_tag}});
+        }
+
+        // Pure escalation (only request_tools, no real ops).
+        if (tsr.remaining.empty()) {
+            if (!newly.empty()) {
+                // Fresh grant — free retry with the bigger sheet (does NOT burn stage budget).
+                st.last_errors.clear();
+                o.verdict = "retry";
+                o.reason = "tool_scope: granted " + std::to_string(newly.size()) + " class(es)";
+                o.parsed_ok = true;
+                o.has_ops_count = true;
+                o.ops_count = 0;
+                o.free_retry = true;
+                return true;
+            }
+            // No new classes. Second full_ops (or re-request of held domains) is a
+            // no-op: strip, feed back, and BURN the attempt so this cannot loop.
+            st.last_errors = {asked_full && had_full_already
+                                  ? std::string(kAlreadyHaveFullOps)
+                                  : std::string("requested tool classes already granted; "
+                                                "emit the document ops now")};
+            o.verdict = "retry";
+            o.reason = asked_full && had_full_already ? "tool_scope: already have full_ops"
+                                                      : "tool_scope: no new classes";
+            o.parsed_ok = true;
+            o.has_ops_count = true;
+            o.ops_count = 0;
+            o.free_retry = false;  // burn budget — prevents infinite request_tools loops
+            o.has_error = true;
+            o.error = std::string(stage_tag) + ": tool scope already granted";
+            return true;
+        }
+
+        // Mixed batch: request_tools + real ops. Scope is upgraded for THIS dry-run
+        // (and future turns); strip meta-ops and continue with remaining.
+        // If they re-asked full_ops with no new grant, leave a soft note only when
+        // remaining is empty (handled above); with remaining ops just proceed.
+        return false;
+    };
+
+    // Solo + slim sheet: if validation fails on an unknown op/feature type the model
+    // correctly guessed exists, auto-escalate to the full sheet for the retry.
+    auto maybe_auto_escalate = [&](DesignState& st, const std::string& verr,
+                                   StageOutcome& o, const char* stage_tag) -> bool {
+        if (st.tool_scope_full) return false;
+        if (!st.complexity_set || st.complexity != Complexity::Solo) return false;
+        if (!looks_like_unknown_op_error(verr)) return false;
+        st.tool_scope_full = true;
+        st.tool_scope_classes.insert("full_ops");
+        events.emit("tool_scope",
+                    json{{"granted", json::array({"full_ops"})},
+                         {"newly", json::array({"full_ops"})},
+                         {"stage", stage_tag},
+                         {"auto", true},
+                         {"reason", verr}});
+        st.last_errors = {"invalid ops: " + verr,
+                          "auto-escalated to full op set after unknown-op validation failure; "
+                          "retry with the full vocabulary"};
+        o.verdict = "retry";
+        o.reason = "tool_scope: auto-escalated on unknown op";
+        o.parsed_ok = true;
+        o.free_retry = true;
+        o.has_error = true;
+        o.error = std::string(stage_tag) + "-validate-auto-escalate: " + verr;
+        return true;
+    };
+
     actions.model = [&](DesignState& st, int attempt) -> StageOutcome {
         st.last_no_progress = false;
         if (attempt > kEscapeAfter) return model_escape(st);
@@ -1013,6 +1141,9 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
             return o;
         }
         json ops = filter_ops_to_scope(*ores.ops);
+        ToolScopeRequest tsr = peel_request_tools(ops);
+        if (handle_tool_scope(st, tsr, o, "model")) return o;
+        ops = tsr.remaining;
         if (ops.empty()) {
             // Empty ops on a non-empty build step while the tree is still empty is NOT a
             // genuine "no ops needed" pass — the model bailed. Retry with feedback. Keep
@@ -1051,6 +1182,11 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         json dry = doc::doc_dry_run_ops(doc_id, ops);
         if (!dry.value("ok", false)) {
             std::string verr = dry.value("error", std::string());
+            if (maybe_auto_escalate(st, verr, o, "model")) {
+                o.has_ops_count = true;
+                o.ops_count = static_cast<int>(ops.size());
+                return o;
+            }
             st.last_errors = {"invalid ops: " + verr};
             o.verdict = "retry";
             o.reason = "ops failed validation";
@@ -1207,6 +1343,9 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
             return o;
         }
         json ops = filter_ops_to_scope(*ores.ops);
+        ToolScopeRequest tsr = peel_request_tools(ops);
+        if (handle_tool_scope(st, tsr, o, "fix")) return o;
+        ops = tsr.remaining;
         if (ops.empty()) {
             o.verdict = "pass";
             o.reason = "fix: no change";
@@ -1218,6 +1357,14 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         json dry = doc::doc_dry_run_ops(doc_id, ops);
         if (!dry.value("ok", false)) {
             std::string verr = dry.value("error", std::string());
+            if (maybe_auto_escalate(st, verr, o, "fix")) {
+                o.has_ops_count = true;
+                o.ops_count = static_cast<int>(ops.size());
+                // Keep fix-prefixed error text for the auto path's last_errors first line.
+                if (!st.last_errors.empty())
+                    st.last_errors[0] = "invalid fix ops: " + verr;
+                return o;
+            }
             st.last_errors = {"invalid fix ops: " + verr};
             o.verdict = "retry";
             o.reason = "fix ops failed validation";

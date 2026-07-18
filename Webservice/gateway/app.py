@@ -51,6 +51,7 @@ try:
     from .perf_client import router as perf_router
     from .providers import router as providers_router
     from .terminal import router as terminal_router
+    from .deploy_ops import router as deploy_router
 except ImportError:
     from engine_bridge import router as engine_router, active_bridge_count
     from workspace import router as workspace_router
@@ -58,6 +59,7 @@ except ImportError:
     from perf_client import router as perf_router
     from providers import router as providers_router
     from terminal import router as terminal_router
+    from deploy_ops import router as deploy_router
 
 settings.ensure_data_dirs()  # users_file must exist before the directory loads
 user_directory = UserDirectory(settings.users_file)
@@ -683,6 +685,7 @@ app.include_router(appserve_router)
 app.include_router(perf_router)
 app.include_router(providers_router)
 app.include_router(terminal_router)
+app.include_router(deploy_router)
 
 if STATIC_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")

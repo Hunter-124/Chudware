@@ -1,0 +1,98 @@
+{
+  "schema": "aicad.saved_parts/1",
+  "run_id": "t_w30_pass_217579ec",
+  "status": "needs_correction",
+  "stop_reason": "verify_failed: ['AC1']",
+  "saved": [
+    {
+      "doc_id": "doc-cpp0000003c",
+      "name": "rocket_plane_airframe",
+      "origin_kind": "mcp",
+      "paths": [
+        "/home/hunter/Repositories/CAD/reports/runs/t_w30_pass_217579ec/parts/rocket_plane_airframe_-cpp0000003c.step+",
+        "/home/hunter/Documents/AI-CAD/rocket_plane_airframe_-cpp0000003c.step+"
+      ],
+      "bytes": [
+        35847,
+        35847
+      ]
+    }
+  ],
+  "closed": [
+    {
+      "doc_id": "doc-cpp0000003c",
+      "closed": true,
+      "detached": false
+    }
+  ],
+  "skipped": [
+    {
+      "doc_id": "a4e3c1d2cf08",
+      "reason": "save_failed",
+      "name": "flight_computer",
+      "errors": [
+        "save artifact a4e3c1d2cf08: no such document: a4e3c1d2cf08",
+        "save workspace a4e3c1d2cf08: no such document: a4e3c1d2cf08"
+      ]
+    },
+    {
+      "doc_id": "8dcbdf3dce3a",
+      "reason": "save_failed",
+      "name": null,
+      "errors": [
+        "save artifact 8dcbdf3dce3a: no such document: 8dcbdf3dce3a",
+        "save workspace 8dcbdf3dce3a: no such document: 8dcbdf3dce3a"
+      ]
+    },
+    {
+      "doc_id": "doc-cpp00000001",
+      "reason": "no_geometry",
+      "name": "link_dim_probe",
+      "origin_kind": "mcp"
+    },
+    {
+      "doc_id": "doc-cpp00000012",
+      "reason": "no_geometry",
+      "name": "link_dim_test",
+      "origin_kind": "mcp"
+    },
+    {
+      "doc_id": "doc-cpp00000015",
+      "reason": "no_geometry",
+      "name": "bracket3",
+      "origin_kind": "mcp"
+    },
+    {
+      "doc_id": "doc-cpp00000018",
+      "reason": "no_geometry",
+      "name": "link_dim_probe2",
+      "origin_kind": "mcp"
+    },
+    {
+      "doc_id": "doc-cpp00000029",
+      "reason": "no_geometry",
+      "name": "link_dim_test2",
+      "origin_kind": "mcp"
+    },
+    {
+      "doc_id": "doc-cpp0000002c",
+      "reason": "no_geometry",
+      "name": "bracket5",
+      "origin_kind": "mcp"
+    },
+    {
+      "doc_id": "doc-cpp0000002f",
+      "reason": "no_geometry",
+      "name": "link_dim_probe3",
+      "origin_kind": "mcp"
+    }
+  ],
+  "errors": [
+    "save artifact a4e3c1d2cf08: no such document: a4e3c1d2cf08",
+    "save workspace a4e3c1d2cf08: no such document: a4e3c1d2cf08",
+    "save artifact 8dcbdf3dce3a: no such document: 8dcbdf3dce3a",
+    "save workspace 8dcbdf3dce3a: no such document: 8dcbdf3dce3a"
+  ],
+  "parts_dir": "/home/hunter/Repositories/CAD/reports/runs/t_w30_pass_217579ec/parts",
+  "workspace_dir": "/home/hunter/Documents/AI-CAD"
+}

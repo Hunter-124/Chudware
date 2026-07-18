@@ -1,0 +1,80 @@
+{
+  "schema": "aicad.saved_parts/1",
+  "run_id": "t_w19_status_d874cc49",
+  "status": "needs_correction",
+  "stop_reason": "verify_failed: ['AC1']",
+  "saved": [
+    {
+      "doc_id": "doc-cpp0000001f",
+      "name": "rocket_plane_airframe",
+      "origin_kind": "mcp",
+      "paths": [
+        "/home/hunter/Repositories/CAD/reports/runs/t_w19_status_d874cc49/parts/rocket_plane_airframe_-cpp0000001f.step+",
+        "/home/hunter/Documents/AI-CAD/rocket_plane_airframe_-cpp0000001f.step+"
+      ],
+      "bytes": [
+        35842,
+        35842
+      ]
+    }
+  ],
+  "closed": [
+    {
+      "doc_id": "doc-cpp0000001f",
+      "closed": true,
+      "detached": false
+    }
+  ],
+  "skipped": [
+    {
+      "doc_id": "d66d5a0a32d9",
+      "reason": "save_failed",
+      "name": "flight_computer",
+      "errors": [
+        "save artifact d66d5a0a32d9: no such document: d66d5a0a32d9",
+        "save workspace d66d5a0a32d9: no such document: d66d5a0a32d9"
+      ]
+    },
+    {
+      "doc_id": "4f19793a35be",
+      "reason": "save_failed",
+      "name": null,
+      "errors": [
+        "save artifact 4f19793a35be: no such document: 4f19793a35be",
+        "save workspace 4f19793a35be: no such document: 4f19793a35be"
+      ]
+    },
+    {
+      "doc_id": "doc-cpp00000001",
+      "reason": "no_geometry",
+      "name": "link_dim_probe",
+      "origin_kind": "mcp"
+    },
+    {
+      "doc_id": "doc-cpp00000012",
+      "reason": "no_geometry",
+      "name": "link_dim_test",
+      "origin_kind": "mcp"
+    },
+    {
+      "doc_id": "doc-cpp00000015",
+      "reason": "no_geometry",
+      "name": "bracket3",
+      "origin_kind": "mcp"
+    },
+    {
+      "doc_id": "doc-cpp00000018",
+      "reason": "no_geometry",
+      "name": "link_dim_probe2",
+      "origin_kind": "mcp"
+    }
+  ],
+  "errors": [
+    "save artifact d66d5a0a32d9: no such document: d66d5a0a32d9",
+    "save workspace d66d5a0a32d9: no such document: d66d5a0a32d9",
+    "save artifact 4f19793a35be: no such document: 4f19793a35be",
+    "save workspace 4f19793a35be: no such document: 4f19793a35be"
+  ],
+  "parts_dir": "/home/hunter/Repositories/CAD/reports/runs/t_w19_status_d874cc49/parts",
+  "workspace_dir": "/home/hunter/Documents/AI-CAD"
+}

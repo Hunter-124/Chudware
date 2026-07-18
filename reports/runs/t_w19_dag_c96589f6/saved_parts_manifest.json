@@ -1,0 +1,116 @@
+{
+  "schema": "aicad.saved_parts/1",
+  "run_id": "t_w19_dag_c96589f6",
+  "status": "needs_correction",
+  "stop_reason": "verify_failed: ['AC1']",
+  "saved": [
+    {
+      "doc_id": "doc-cpp00000006",
+      "name": "rocket_plane_airframe",
+      "origin_kind": "mcp",
+      "paths": [
+        "/home/hunter/Repositories/CAD/reports/runs/t_w19_dag_c96589f6/parts/rocket_plane_airframe_-cpp00000006.step+",
+        "/home/hunter/Documents/AI-CAD/rocket_plane_airframe_-cpp00000006.step+"
+      ],
+      "bytes": [
+        35847,
+        35847
+      ]
+    },
+    {
+      "doc_id": "doc-cpp00000002",
+      "name": "dp6_overlap_test",
+      "origin_kind": "mcp",
+      "paths": [
+        "/home/hunter/Repositories/CAD/reports/runs/t_w19_dag_c96589f6/parts/dp6_overlap_test_-cpp00000002.step+",
+        "/home/hunter/Documents/AI-CAD/dp6_overlap_test_-cpp00000002.step+"
+      ],
+      "bytes": [
+        6505,
+        6505
+      ]
+    },
+    {
+      "doc_id": "doc-cpp00000003",
+      "name": "dp6_single_body",
+      "origin_kind": "mcp",
+      "paths": [
+        "/home/hunter/Repositories/CAD/reports/runs/t_w19_dag_c96589f6/parts/dp6_single_body_-cpp00000003.step+",
+        "/home/hunter/Documents/AI-CAD/dp6_single_body_-cpp00000003.step+"
+      ],
+      "bytes": [
+        4362,
+        4362
+      ]
+    },
+    {
+      "doc_id": "doc-cpp00000004",
+      "name": "pf_live_test",
+      "origin_kind": "mcp",
+      "paths": [
+        "/home/hunter/Repositories/CAD/reports/runs/t_w19_dag_c96589f6/parts/pf_live_test_-cpp00000004.step+",
+        "/home/hunter/Documents/AI-CAD/pf_live_test_-cpp00000004.step+"
+      ],
+      "bytes": [
+        4682,
+        4682
+      ]
+    }
+  ],
+  "closed": [
+    {
+      "doc_id": "doc-cpp00000006",
+      "closed": true,
+      "detached": false
+    },
+    {
+      "doc_id": "doc-cpp00000002",
+      "closed": true,
+      "detached": false
+    },
+    {
+      "doc_id": "doc-cpp00000003",
+      "closed": true,
+      "detached": false
+    },
+    {
+      "doc_id": "doc-cpp00000004",
+      "closed": true,
+      "detached": false
+    }
+  ],
+  "skipped": [
+    {
+      "doc_id": "ec3433b2176f",
+      "reason": "save_failed",
+      "name": "flight_computer",
+      "errors": [
+        "save artifact ec3433b2176f: no such document: ec3433b2176f",
+        "save workspace ec3433b2176f: no such document: ec3433b2176f"
+      ]
+    },
+    {
+      "doc_id": "f344131282e8",
+      "reason": "save_failed",
+      "name": null,
+      "errors": [
+        "save artifact f344131282e8: no such document: f344131282e8",
+        "save workspace f344131282e8: no such document: f344131282e8"
+      ]
+    },
+    {
+      "doc_id": "doc-cpp00000001",
+      "reason": "no_geometry",
+      "name": "link_dim_probe",
+      "origin_kind": "mcp"
+    }
+  ],
+  "errors": [
+    "save artifact ec3433b2176f: no such document: ec3433b2176f",
+    "save workspace ec3433b2176f: no such document: ec3433b2176f",
+    "save artifact f344131282e8: no such document: f344131282e8",
+    "save workspace f344131282e8: no such document: f344131282e8"
+  ],
+  "parts_dir": "/home/hunter/Repositories/CAD/reports/runs/t_w19_dag_c96589f6/parts",
+  "workspace_dir": "/home/hunter/Documents/AI-CAD"
+}

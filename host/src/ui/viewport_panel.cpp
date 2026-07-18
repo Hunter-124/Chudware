@@ -4386,7 +4386,23 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             std::string lt = st.livePhase.empty() ? std::string("Working...") : st.livePhase;
             ImVec2 ts = ImGui::CalcTextSize(lt.c_str());
             float maxW = (cr1.x - cr0.x) - 58.0f;
-            ImVec2 p0(cr0.x + 8 * ui::uiScale, cr0.y + 8 * ui::uiScale);
+            // Anchor the pill's left edge just RIGHT of the FeatureManager column (like the
+            // doc-tab strip: fmEdge + margin) so "Working..." lands under the active file tabs
+            // instead of ghosting behind the FM toolbar buttons at the viewport's left edge.
+            float busyLeft = cr0.x + 8 * ui::uiScale;
+            {
+                const float fe = ui::overlayColumnEdge(0);
+                if (fe > cr0.x) busyLeft = fe + 12.0f * ui::uiScale;
+            }
+            // Drop below the doc-tab file strip so the pill sits UNDER the active file display,
+            // not on the same row as the tabs (mirrors the heads-up toolbar's docTabBandBottom
+            // dodge). docTabBandBottom() is the strip's live bottom edge (-1 when no strip).
+            float busyTop = cr0.y + 8 * ui::uiScale;
+            {
+                const float dtb = ui::docTabBandBottom();
+                if (dtb > busyTop) busyTop = dtb + 6.0f * ui::uiScale;
+            }
+            ImVec2 p0(busyLeft, busyTop);
             ImVec2 p1(p0.x + (ts.x > maxW ? maxW : ts.x) + 28.0f * ui::uiScale, p0.y + ts.y + 8.0f * ui::uiScale);
             const ui::AdaptiveSurface& busySurf =
                 ui::adaptivePanel(ui::panelId("vp_busy"), ImRect(p0, p1), ui::GlassGroup::Hud);

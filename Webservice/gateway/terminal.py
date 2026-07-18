@@ -37,6 +37,7 @@ import signal
 import struct
 import subprocess
 import termios
+import time
 from pathlib import Path
 from typing import Any
 
@@ -45,8 +46,10 @@ from starlette.websockets import WebSocketState
 
 try:
     from .auth import get_current_user
+    from .config import settings
 except ImportError:  # uvicorn app:app from package dir
     from auth import get_current_user
+    from config import settings
 
 log = logging.getLogger("billet-web.terminal")
 
@@ -495,6 +498,59 @@ async def kill_terminal_session(name: str, request: Request) -> dict[str, Any]:
     loop = asyncio.get_running_loop()
     ok = await loop.run_in_executor(None, _kill_session, _tmux_name(slug))
     return {"ok": ok}
+
+
+# --- shared window-manager layout (one doc, all admins) --------------------
+def _read_layout() -> dict[str, Any]:
+    """Return the persisted shared layout doc, or an empty default."""
+    path = settings.terminal_layout_file
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"layout": None, "mtime": None}
+    except (OSError, ValueError):
+        log.warning("terminal_layout.json unreadable/corrupt; ignoring")
+        return {"layout": None, "mtime": None}
+    if not isinstance(data, dict):
+        return {"layout": None, "mtime": None}
+    return {"layout": data.get("layout"), "mtime": data.get("mtime")}
+
+
+def _write_layout(layout: dict[str, Any], by: str) -> float:
+    """Atomically persist the shared layout; returns the new mtime (epoch)."""
+    path = settings.terminal_layout_file
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mtime = time.time()
+    payload = {"layout": layout, "mtime": mtime, "by": by}
+    tmp = path.with_suffix(".json.tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+        fh.write("\n")
+    tmp.replace(path)
+    return mtime
+
+
+@router.get("/api/admin/terminal/layout")
+async def get_terminal_layout(request: Request) -> dict[str, Any]:
+    _require_admin(request)
+    doc = _read_layout()
+    return {"ok": True, "layout": doc["layout"], "mtime": doc["mtime"]}
+
+
+@router.put("/api/admin/terminal/layout")
+async def put_terminal_layout(request: Request) -> dict[str, Any]:
+    user = _require_admin(request)
+    try:
+        body = await request.json()
+    except (ValueError, TypeError):
+        body = None
+    layout = body.get("layout") if isinstance(body, dict) else None
+    if not isinstance(layout, dict):
+        raise HTTPException(status_code=400, detail="layout must be an object")
+    by = getattr(user, "email", "") or ""
+    loop = asyncio.get_running_loop()
+    mtime = await loop.run_in_executor(None, _write_layout, layout, by)
+    return {"ok": True, "mtime": mtime}
 
 
 @router.websocket("/admin/terminal")

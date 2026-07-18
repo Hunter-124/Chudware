@@ -6,6 +6,8 @@
 <title>Chudware — Admin</title>
 <link rel="stylesheet" href="/static/portal.css">
 <link rel="stylesheet" href="/static/vendor/xterm.css">
+<link rel="stylesheet" href="/static/admin_wm.css?v=1">
+<link rel="stylesheet" href="/static/admin_ops.css?v=1">
 <style>
   html, body {
     height: 100%;
@@ -335,6 +337,8 @@
       <button type="button" class="term-tab-new" id="term-new" title="New shared session (Ctrl+Alt+T)" aria-label="New shared session">+</button>
     </div>
     <div id="term-host"></div>
+    <div id="wm-root"></div>
+    <div id="snap-preview" hidden></div>
   </div>
 
   <div class="admin-side">
@@ -407,9 +411,10 @@
     </div>
   </div>
 </div>
-<script src="/static/admin.js?v=6"></script>
+<script src="/static/admin.js?v=7"></script>
 <script src="/static/vendor/xterm.js"></script>
 <script src="/static/vendor/xterm-addon-fit.js"></script>
-<script src="/static/admin_terminal.js?v=2"></script>
+<script src="/static/vendor/winbox/winbox.bundle.min.js"></script>
+<script src="/static/admin_terminal.js?v=3"></script>
 </body>
 </html>

@@ -628,6 +628,19 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
                       : json::array({"intake", "plan", "model", "review", "fix", "memory"});
     events.emit("run_started",
                 json{{"request", request}, {"doc_id", state.doc_id}, {"stages", stages}});
+    // Pre-flight classification (GUI "Routing" card). Surfaced ONCE at entry, before any
+    // provider call, so the user sees how the request was deterministically classified +
+    // routed. Mirrors aicad.router/1 / the Python agent.classification producer so the
+    // host renders the same card for the C++ live path (previously only complexity/
+    // task_route were emitted, which the GUI does not draw as a routing card).
+    events.emit("agent.classification",
+                json{{"task_class", dom.label()},
+                     {"scaffold_level", cx.label()},
+                     {"tier", provider_cfg.value("model", std::string())},
+                     {"reason", dom.reason.empty() ? cx.reason : dom.reason},
+                     {"request_snippet", request.substr(0, 120)},
+                     {"picked_model", provider_cfg.value("model", std::string())},
+                     {"picked_provider", provider_cfg.value("name", std::string())}});
     // Complexity routing decision (GUI shows which structure was chosen + why).
     events.emit("complexity", json{{"level", cx.label()},
                                    {"reason", cx.reason},

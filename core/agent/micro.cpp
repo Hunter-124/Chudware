@@ -18,6 +18,8 @@
 #include "agent/roles.h"
 #include "agent/state.h"
 #include "doc/session.h"
+#include "agent/domain.h"
+#include "agent/complexity.h"
 
 namespace aicad {
 namespace agent {
@@ -854,6 +856,20 @@ json run_micro_design(const std::string& request, const std::string& doc_id,
                                     {"doc_id", doc_id},
                                     {"stages", json::array({"decompose", "execute", "verify"})},
                                     {"profile", "micro"}});
+    // Pre-flight classification (GUI "Routing" card) — same transparency as run_design so
+    // the classifier is visible on the micro (local/small-model) profile too.
+    {
+        DomainVerdict mdom = classify_domain(request);
+        ComplexityVerdict mcx = classify_complexity(request);
+        events.emit("agent.classification",
+                    json{{"task_class", mdom.label()},
+                         {"scaffold_level", mcx.label()},
+                         {"tier", provider_cfg.value("model", std::string())},
+                         {"reason", mdom.reason.empty() ? mcx.reason : mdom.reason},
+                         {"request_snippet", request.substr(0, 120)},
+                         {"picked_model", provider_cfg.value("model", std::string())},
+                         {"picked_provider", provider_cfg.value("name", std::string())}});
+    }
 
     // ---- DECOMPOSE ----
     events.emit("stage_started", json{{"stage", "decompose"}, {"role", "decomposer"},

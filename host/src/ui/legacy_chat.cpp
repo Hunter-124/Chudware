@@ -10744,160 +10744,16 @@ static void submitTurn(AppState& st, const std::string& text) {
         }
     }
     nlohmann::json agentExtras = withOptions(turnExtras, {{"mode", "agent"}, {"advisor", true}});
-    if (!st.settings.planMode) {
-        for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
-            if (!it->fromUser && it->running) { it->liveStatus = "Building..."; break; }
-        launchDesignRun(st, sendText, agentExtras);
-        return;
-    }
+    // Agent build → straight to the streaming design run. The old agent_clarify_v1
+    // pre-pass was a BLOCKING, non-streaming one-shot ("Working out what I need to build
+    // this...") that showed no progress and could stall up to a minute on a slow provider
+    // call. The design run's intake stage does the same spec parsing AND streams live
+    // (assistant_delta waterfall) + emits agent.classification (the Routing card) +
+    // plan_state, so the classifier is fully transparent. Supervised plan-approval
+    // remains available via the composer Plan mode.
     for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
-        if (!it->fromUser && it->running) {
-            it->clarify.awaiting = true;
-            it->clarify.request = sendText;
-            it->liveStatus = "Working out what I need to build this...";
-            break;
-        }
-    st.addLog("[..] clarify: " + text);
-    st.status = "Thinking...";  st.statusKind = 0;
-    const std::string clarifyDocId = st.docMirror.hasDoc() ? st.docMirror.docId() : std::string();
-    nlohmann::json params = {{"request", sendText}, {"doc_id", clarifyDocId}};
-    for (auto it = provOverride.begin(); it != provOverride.end(); ++it)
-        params[it.key()] = it.value();
-    for (auto it = turnExtras.begin(); it != turnExtras.end(); ++it)
-        params[it.key()] = it.value();
-    st.rpc.call("agent_clarify_v1", params,
-                [&st, text = sendText, clarifyDocId, agentExtras](const core::RpcResult& r) {
-        ChatMsg* msg = nullptr;
-        for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
-            if (!it->fromUser && it->clarify.awaiting) { msg = &*it; break; }
-        if (!msg) return;
-        if (st.docMirror.docId() != clarifyDocId) {
-            msg->clarify.awaiting = false;
-            msg->running = false;
-            msg->liveStatus.clear();
-            st.addLog("[..] clarify result for " + clarifyDocId + " dropped — active doc changed");
-            return;
-        }
-        msg->clarify.awaiting = false;
-        bool ready = true;
-        std::vector<ClarifyQ> qs;
-        std::vector<std::string> assumptions;
-        if (r.ok && r.result.is_object() && !r.result.contains("code")) {
-            ready = r.result.value("ready", true);
-            auto seedAnswer = [](ClarifyQ& cq) {
-                std::strncpy(cq.answer.data(), cq.suggested.c_str(),
-                             cq.answer.size() - 1);
-                cq.answer[cq.answer.size() - 1] = '\0';
-            };
-            auto parseInteractionQ = [&](const nlohmann::json& q) -> bool {
-                if (!q.is_object()) return false;
-                ClarifyQ cq;
-                cq.key = q.value("id", q.value("key", std::string()));
-                cq.ask = q.value("prompt", q.value("ask", std::string()));
-                cq.kind = q.value("kind", std::string("text"));
-                cq.multi = q.value("multi", q.value("multiple", false));
-                if (cq.ask.empty()) return false;
-                if (q.contains("suggested")) {
-                    const auto& s = q["suggested"];
-                    if (s.is_string()) cq.suggested = s.get<std::string>();
-                    else if (s.is_boolean())
-                        cq.suggested = s.get<bool>() ? "true" : "false";
-                    else if (s.is_number())
-                        cq.suggested = std::to_string(s.get<double>());
-                    else if (s.is_array()) {
-                        for (const auto& v : s) {
-                            if (v.is_string())
-                                cq.selectedValues.push_back(v.get<std::string>());
-                        }
-                        std::string joined;
-                        for (size_t j = 0; j < cq.selectedValues.size(); ++j) {
-                            if (j) joined += ", ";
-                            joined += cq.selectedValues[j];
-                        }
-                        cq.suggested = joined;
-                    } else if (s.is_object()) {
-                        if (s.contains("value") && s.contains("unit")) {
-                            cq.suggested = std::to_string(s.value("value", 0.0));
-                            cq.unit = s.value("unit", std::string());
-                        } else if (s.contains("id")) {
-                            cq.suggested = s.value("id", std::string());
-                            cq.selectedKind = s.value("kind", std::string());
-                            if (!cq.suggested.empty())
-                                cq.selectedValues.push_back(cq.suggested);
-                        }
-                    }
-                }
-                if (q.contains("options") && q["options"].is_array()) {
-                    for (const auto& o : q["options"]) {
-                        if (!o.is_object()) continue;
-                        std::string val = o.value("value", std::string());
-                        std::string lab = o.value("label", val);
-                        if (!val.empty()) cq.options.emplace_back(val, lab);
-                    }
-                }
-                if (q.contains("targets") && q["targets"].is_array()) {
-                    for (const auto& tgt : q["targets"])
-                        if (tgt.is_string()) cq.targets.push_back(tgt.get<std::string>());
-                }
-                if (cq.kind == "dimension" && cq.unit.empty() &&
-                    q.contains("suggested") && q["suggested"].is_object())
-                    cq.unit = q["suggested"].value("unit", std::string());
-                seedAnswer(cq);
-                if (cq.kind == "choice" && !cq.multi && !cq.suggested.empty())
-                    cq.selectedValues = {cq.suggested};
-                qs.push_back(std::move(cq));
-                return true;
-            };
-
-            bool usedInteraction = false;
-            if (r.result.contains("interaction") &&
-                r.result["interaction"].is_object() &&
-                r.result["interaction"].contains("questions") &&
-                r.result["interaction"]["questions"].is_array() &&
-                !r.result["interaction"]["questions"].empty()) {
-                usedInteraction = true;
-                for (const auto& q : r.result["interaction"]["questions"])
-                    parseInteractionQ(q);
-            }
-            if (!usedInteraction && r.result.contains("questions") &&
-                r.result["questions"].is_array()) {
-                for (const auto& q : r.result["questions"]) {
-                    if (!q.is_object()) continue;
-                    if (q.contains("kind") || q.contains("options") ||
-                        q.contains("targets")) {
-                        parseInteractionQ(q);
-                        continue;
-                    }
-                    ClarifyQ cq;
-                    cq.key = q.value("key", std::string());
-                    cq.ask = q.value("ask", std::string());
-                    cq.unit = q.value("unit", std::string());
-                    cq.suggested = q.value("suggested", std::string());
-                    cq.kind = cq.unit.empty() ? "text" : "dimension";
-                    if (cq.ask.empty()) continue;
-                    seedAnswer(cq);
-                    qs.push_back(std::move(cq));
-                }
-            }
-            if (r.result.contains("assumptions") && r.result["assumptions"].is_array())
-                for (const auto& a : r.result["assumptions"])
-                    if (a.is_string()) assumptions.push_back(a.get<std::string>());
-        }
-        if (ready || qs.empty()) {
-            msg->liveStatus.clear();
-            launchDesignRun(st, text, agentExtras);
-            return;
-        }
-        msg->running = false;
-        msg->liveStatus.clear();
-        msg->clarify.active = true;
-        msg->clarify.request = text;
-        msg->clarify.questions = std::move(qs);
-        msg->clarify.assumptions = std::move(assumptions);
-        st.status = "Waiting on a few details...";  st.statusKind = 0;
-        st.addLog("[..] clarify: " + std::to_string(msg->clarify.questions.size()) +
-                  " question(s)");
-    }, 120000);
+        if (!it->fromUser && it->running) { it->liveStatus = "Classifying request..."; break; }
+    launchDesignRun(st, sendText, agentExtras);
 }
 
 // ---- runtime-not-ready banner (kept from the old Design body) ----

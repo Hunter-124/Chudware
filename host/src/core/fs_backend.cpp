@@ -483,34 +483,39 @@ public:
     }
 
     bool saveRecents(const std::vector<std::string>& files, std::string& err) override {
-        // PUT JSON body — emscripten_fetch supports PUT.
+        // Fire-and-forget async PUT. A SYNCHRONOUS emscripten_fetch on the browser
+        // main thread wedges the tab: this build is main-thread ImGui + ASYNCIFY with
+        // no PROXY_TO_PTHREAD, so a sync fetch here never completes (same class as the
+        // doc_tabs.cpp mesh-load note). saveSettings() runs on the GL/UI (main) thread,
+        // and setActiveProjectDir() -> saveSettings() calls this, so a sync PUT froze
+        // the page on "open a project folder" (PLM tab / title bar / onboarding).
+        // Recents persistence is best-effort, so post the write and return immediately;
+        // the payload is heap-owned until the fetch's success/error callback frees it.
         err.clear();
         nlohmann::json body = {{"files", files}};
         const std::string payload = body.dump();
+        char* buf = static_cast<char*>(std::malloc(payload.size()));
+        if (!buf) { err = "out of memory"; return false; }
+        std::memcpy(buf, payload.data(), payload.size());
         emscripten_fetch_attr_t attr;
         emscripten_fetch_attr_init(&attr);
         std::strcpy(attr.requestMethod, "PUT");
-        attr.attributes = EMSCRIPTEN_FETCH_LOAD_TO_MEMORY | EMSCRIPTEN_FETCH_SYNCHRONOUS;
-        const char* headers[] = {"Content-Type", "application/json", nullptr};
+        attr.attributes = EMSCRIPTEN_FETCH_LOAD_TO_MEMORY;  // async (no EMSCRIPTEN_FETCH_SYNCHRONOUS)
+        static const char* headers[] = {"Content-Type", "application/json", nullptr};
         attr.requestHeaders = headers;
-        attr.requestData = payload.data();
+        attr.requestData = buf;
         attr.requestDataSize = payload.size();
-        emscripten_fetch_t* fetch = emscripten_fetch(&attr, "/workspace/recents");
-        if (!fetch) {
-            err = "emscripten_fetch PUT /workspace/recents failed";
-            return false;
-        }
-        const int status = fetch->status;
-        std::string text;
-        if (fetch->data && fetch->numBytes > 0)
-            text.assign(fetch->data, fetch->data + fetch->numBytes);
-        emscripten_fetch_close(fetch);
-        if (status < 200 || status >= 300) {
-            err = "HTTP " + std::to_string(status) + " for /workspace/recents";
-            if (!text.empty()) err += ": " + text.substr(0, 200);
-            return false;
-        }
-        return true;
+        attr.userData = buf;
+        attr.onsuccess = [](emscripten_fetch_t* f) {
+            std::free(f->userData);
+            emscripten_fetch_close(f);
+        };
+        attr.onerror = [](emscripten_fetch_t* f) {
+            std::free(f->userData);
+            emscripten_fetch_close(f);
+        };
+        emscripten_fetch(&attr, "/workspace/recents");
+        return true;  // best-effort; completion delivered via callbacks
     }
 };
 

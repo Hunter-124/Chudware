@@ -366,9 +366,29 @@
         var c = document.getElementById('canvas');
         // Size the drawing buffer to CSS × DPR before first GL frame.
         syncCanvasBackingStore(c);
+        // Tab-backgrounding (or GPU memory pressure) can drop the WebGL context. preventDefault
+        // lets the browser fire 'webglcontextrestored'; without a restore path the app's GL
+        // resources (mesh VBOs, shaders, textures) are gone and the viewport stays blank —
+        // the classic "came back to the tab and the part isn't rendered" bug.
         c.addEventListener('webglcontextlost', function(e) {
           e.preventDefault();
-          setStatus('WebGL context lost', true);
+          setStatus('3D view suspended (tab was in the background)…', true);
+          billetLog('err', 'webglcontextlost');
+        }, false);
+        // The WASM renderer cannot recreate its GL objects in place, so reboot the module.
+        // Document state + recents live on the server daemon, so the session restores on reload.
+        // A sessionStorage counter caps reloads so a permanently-failing GPU can't loop forever.
+        c.addEventListener('webglcontextrestored', function() {
+          billetLog('out', 'webglcontextrestored');
+          var n = 0;
+          try { n = parseInt(sessionStorage.getItem('billetGlReloads') || '0', 10) || 0; } catch (e) {}
+          if (n >= 3) {
+            setStatus('3D context keeps dropping — reload the page to continue.', true);
+            return;
+          }
+          try { sessionStorage.setItem('billetGlReloads', String(n + 1)); } catch (e) {}
+          setStatus('Restoring 3D view…');
+          location.reload();
         }, false);
         return c;
       })(),
@@ -401,6 +421,11 @@
           syncCanvasBackingStore(c);
           c.focus();
         }
+        // Cleared once the module has run healthily for a while, so an occasional
+        // context loss later still gets its full reload budget.
+        setTimeout(function() {
+          try { sessionStorage.removeItem('billetGlReloads'); } catch (e) {}
+        }, 30000);
       }
     };
     window.onerror = function(msg) {

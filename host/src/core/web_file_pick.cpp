@@ -7,7 +7,6 @@
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
-#include <emscripten/threading.h>
 #endif
 
 namespace billet {
@@ -159,10 +158,11 @@ bool pickFile(const char* accept, PickedFile& out, std::string& err) {
         input.click();
     }, accept ? accept : "");
 
-    // Busy-wait: PROXY_TO_PTHREAD worker can block; main browser thread stays free
-    // for the FileReader callbacks.
+    // ASYNCIFY yield (main-thread ImGui model — no PROXY_TO_PTHREAD): unwind back to the
+    // browser event loop so the <input> change / FileReader callbacks can run, then resume.
+    // emscripten_thread_sleep would spin the main thread and deadlock the picker.
     while (g_pick.done == 0) {
-        emscripten_thread_sleep(20);
+        emscripten_sleep(20);
     }
 
     if (g_pick.done < 0) {
@@ -212,8 +212,9 @@ std::string browseWorkspace(WorkspaceBrowseMode mode,
 
     billet_ws_browse(modeInt, acc, sug);
 
+    // ASYNCIFY yield: let the overlay's fetch()/click handlers run on the main thread.
     while (g_browse.done == 0) {
-        emscripten_thread_sleep(20);
+        emscripten_sleep(20);
     }
     if (g_browse.done < 0 || !g_browse.path[0]) return {};
     return std::string(g_browse.path);

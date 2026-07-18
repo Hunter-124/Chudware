@@ -68,8 +68,9 @@ build_wasm() {
     local stage="${BILLET_WEB_APP:-$HOME/billet-web/app}"
     mkdir -p "$stage"
     # Stage the emscripten bundle (html/js/wasm + any .data preload packs).
-    # emcc 6.x with PROXY_TO_PTHREAD embeds workers in Billet.js (no separate
-    # Billet.worker.js); still stage any *worker*.js if a future toolchain emits one.
+    # emcc embeds pthread workers in Billet.js (no separate Billet.worker.js); the app
+    # runs main-thread ImGui + ASYNCIFY, not PROXY_TO_PTHREAD. Still stage any *worker*.js
+    # if a future toolchain emits one.
     local staged_names=""
     for f in "$out"/Billet.html "$out"/Billet.js "$out"/Billet.wasm \
              "$out"/Billet.data "$out"/Billet.worker.js "$out"/*worker*.js; do

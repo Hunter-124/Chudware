@@ -9,6 +9,8 @@
  *   Ctrl+Alt+T  — new shared session
  *   Ctrl+Alt+W  — detach active tab
  * All other keys (Ctrl+C/D, arrows, Tab, F-keys, Alt-combos, etc.) pass through.
+ * Alt+Arrow is re-encoded to \x1b[1;3<A-D> before send: xterm.js otherwise
+ * remaps it to Ctrl+Arrow (non-Mac) / word-nav (Mac), hiding omp's Alt chords.
  */
 (function () {
   "use strict";
@@ -260,6 +262,82 @@
     return k === "t" || k === "w";
   }
 
+  var ARROW_FINAL = { ArrowUp: "A", ArrowDown: "B", ArrowRight: "C", ArrowLeft: "D" };
+
+  // Canonical modified cursor-key sequence (\x1b[1;<mod><final>). Used to bypass
+  // xterm.js's non-Mac Alt+Arrow -> Ctrl+Arrow remap (and its Mac word-nav
+  // remap) so omp's Alt-based shortcuts reach the PTY as the real Alt chord.
+  function modifiedArrowSeq(ev) {
+    var final = ARROW_FINAL[ev.key];
+    if (!final) return null;
+    var mod = 1 + (ev.shiftKey ? 1 : 0) + (ev.altKey ? 2 : 0) + (ev.ctrlKey ? 4 : 0);
+    if (mod === 1) return null; // unmodified — let xterm handle it
+    return "\x1b[1;" + mod + final;
+  }
+
+  // Touch-swipe scrolling. xterm's screen layer sits on top of the scrollable
+  // viewport and swallows touch events, so mobile swipes never scroll natively.
+  // Translate a one-finger vertical drag into scrollback movement (normal
+  // buffer) or SGR wheel reports (when the app has mouse tracking on, e.g. omp
+  // on the alternate screen), giving a real swipe-to-scroll on phones.
+  function cellHeight(term) {
+    try {
+      var c = term._core._renderService.dimensions.css.cell;
+      if (c && c.height) return c.height;
+    } catch (_) {}
+    return 18;
+  }
+
+  function mouseTrackingOn(term) {
+    var x = term.element;
+    return !!(x && x.classList.contains("enable-mouse-events"));
+  }
+
+  function sendWheel(tab, lines, touch) {
+    if (!tab.ws || tab.ws.readyState !== 1) return;
+    var term = tab.term;
+    var col = 1, row = 1;
+    try {
+      var rect = term.element.getBoundingClientRect();
+      var cell = term._core._renderService.dimensions.css.cell;
+      col = Math.max(1, Math.min(term.cols, ((touch.clientX - rect.left) / cell.width | 0) + 1));
+      row = Math.max(1, Math.min(term.rows, ((touch.clientY - rect.top) / cell.height | 0) + 1));
+    } catch (_) {}
+    var btn = lines > 0 ? 65 : 64; // 65 = wheel down, 64 = wheel up
+    var n = Math.min(Math.abs(lines), 8);
+    var seq = "";
+    for (var i = 0; i < n; i++) seq += "\x1b[<" + btn + ";" + col + ";" + row + "M";
+    tab.ws.send(encoder.encode(seq));
+  }
+
+  function bindTouchScroll(tab) {
+    var term = tab.term;
+    var el = tab.el;
+    var lastY = null;
+    var accum = 0;
+    el.addEventListener("touchstart", function (ev) {
+      if (ev.touches.length !== 1) { lastY = null; return; }
+      lastY = ev.touches[0].clientY;
+      accum = 0;
+    }, { passive: true });
+    el.addEventListener("touchmove", function (ev) {
+      if (lastY == null || ev.touches.length !== 1) return;
+      ev.preventDefault(); // own the vertical swipe (no page/pane rubber-band)
+      var t = ev.touches[0];
+      accum += lastY - t.clientY;
+      lastY = t.clientY;
+      var step = cellHeight(term);
+      var lines = accum / step | 0;
+      if (!lines) return;
+      accum -= lines * step;
+      if (mouseTrackingOn(term)) sendWheel(tab, lines, t);
+      else term.scrollLines(lines);
+    }, { passive: false });
+    function end() { lastY = null; }
+    el.addEventListener("touchend", end, { passive: true });
+    el.addEventListener("touchcancel", end, { passive: true });
+  }
+
   function newTab(name) {
     var id = "t" + idSeq++;
     var label = name || "connecting…";
@@ -318,16 +396,27 @@
 
     term.attachCustomKeyEventHandler(function (ev) {
       if (ev.type !== "keydown") return true;
-      if (!isReservedCombo(ev)) return true;
-      ev.preventDefault();
-      var k = (ev.key || "").toLowerCase();
-      if (k === "t") {
-        newSession();
-      } else if (k === "w") {
-        var cur = activeTab();
-        if (cur) closeTab(cur.id);
+      if (isReservedCombo(ev)) {
+        ev.preventDefault();
+        var k = (ev.key || "").toLowerCase();
+        if (k === "t") {
+          newSession();
+        } else if (k === "w") {
+          var cur = activeTab();
+          if (cur) closeTab(cur.id);
+        }
+        return false;
       }
-      return false;
+      // Rescue Alt+Arrow from xterm's remap so omp gets the true Alt chord.
+      if (ev.altKey && !ev.metaKey) {
+        var seq = modifiedArrowSeq(ev);
+        if (seq) {
+          ev.preventDefault();
+          if (tab.ws && tab.ws.readyState === 1) tab.ws.send(encoder.encode(seq));
+          return false;
+        }
+      }
+      return true;
     });
 
     var tab = {
@@ -346,6 +435,7 @@
       _dataBound: false,
     };
     tabs.push(tab);
+    bindTouchScroll(tab);
 
     try {
       fit.fit();

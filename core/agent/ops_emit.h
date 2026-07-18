@@ -87,6 +87,9 @@ struct AdvisorPlanVerdict {
     std::string note;
     std::string confidence;
     bool ok = false;         // true when a recognized verdict was present
+    // Non-empty when the soft-approve path fired instead of a real verdict:
+    // "unparseable" | (call-site may also stamp "provider_error").
+    std::string fallback;
 };
 AdvisorPlanVerdict parse_advisor_plan_verdict(const std::string& reply);
 

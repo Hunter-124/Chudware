@@ -22,12 +22,25 @@ Hard caps: at most 10 key_dims and 12 features. If the request is a single primi
 cylinder, a hex standoff with a bore), say so plainly in "object" and list only its stated size
 in "key_dims" — nothing else.
 
-REJECTION — if the user request is NOT a CAD/design request, is unintelligible gibberish,
-or has no designable content (no object, feature, or dimension to build), do NOT invent a
-spec. Reply with EXACTLY one ```json block:
+EXISTING PART — the user message may include a line:
+  Context: the open part already has features: <digest> (revision N).
+When that context is present, the open document IS the object. Requests that MODIFY or EXTEND
+the existing part are VALID even when they name no explicit object — e.g. chamfer/fillet/hole/
+move/resize/make bigger/thicker/add a pocket. Normalize against the open part: put a short
+description of the existing part (or the edit target) in "object", and capture the change in
+"features" / "key_dims". Do NOT reject solely because no new part name was stated.
+
+REJECTION — if and only if one of the following holds, do NOT invent a spec. Reply with EXACTLY
+one ```json block:
 {
   "reject": true,
   "reason": "<one short sentence>"
 }
-Examples that MUST reject: random keysmash, pure greetings with no part, empty/whitespace,
-off-topic non-engineering chat. Never fabricate an "object" to keep the pipeline moving.
+Reject ONLY:
+(a) gibberish / non-CAD content — random keysmash, pure greetings with no part, off-topic
+    non-engineering chat;
+(b) a modification/extension request when the context does NOT show existing features (nothing
+    to modify) — reason should say so, e.g. "no existing geometry to modify";
+(c) empty / whitespace-only requests.
+Pure creation requests ("make a washer", "50mm cube") are ALWAYS valid, with or without context.
+Never fabricate an "object" to keep the pipeline moving on true gibberish.

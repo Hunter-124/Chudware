@@ -615,9 +615,17 @@ std::vector<std::pair<std::string, std::string>> role_blocks(const DesignState& 
     std::string adv =
         g_context_advisory.empty() ? "" : ("ADVISORY:\n" + g_context_advisory);
 
+    // Compact open-doc line for intake only (names/digest — no tessellation). Lets the
+    // intake model treat edit follow-ups ("chamfer the edges") as valid when geometry exists.
+    std::string doc_ctx;
+    if (has_features(state)) {
+        doc_ctx = "Context: the open part already has features:\n" + state.tree_digest +
+                  "\n(revision " + std::to_string(state.revision) + ").";
+    }
+
     std::vector<std::pair<std::string, std::string>> blocks;
     if (role == "intake") {
-        blocks = {{"opt:mem", mem}, {"req", req}};
+        blocks = {{"opt:mem", mem}, {"opt:doc", doc_ctx}, {"req", req}};
     } else if (role == "planner") {
         std::string spec = jtruthy(state.spec) ? spec_text(state.spec) : "";
         blocks = {{"opt:mem", mem}, {"opt:advisor", adv}, {"req", req}, {"spec", spec}};

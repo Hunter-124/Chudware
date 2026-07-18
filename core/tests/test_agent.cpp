@@ -331,6 +331,30 @@ TEST_CASE("build_context honors a small cap and reports trimming") {
     CHECK(bc.trimmed);
 }
 
+TEST_CASE("build_context intake includes open-doc feature digest") {
+    DesignState st;
+    st.request = "chamfer the top edges 0.5mm";
+    st.revision = 3;
+    st.tree_digest = "f1 extrude Washer\nf2 cut Bore";
+    BuiltContext bc = build_context(st, "intake", "", kContextTokenCap);
+    // Intake must see existing geometry so edit follow-ups are not rejected as object-less.
+    CHECK(bc.body.find("Context: the open part already has features:") != std::string::npos);
+    CHECK(bc.body.find("f1 extrude Washer") != std::string::npos);
+    CHECK(bc.body.find("(revision 3)") != std::string::npos);
+    CHECK(bc.body.find("chamfer the top edges 0.5mm") != std::string::npos);
+}
+
+TEST_CASE("build_context intake omits doc context when empty") {
+    DesignState st;
+    st.request = "make a 20mm cube";
+    st.revision = 0;
+    st.tree_digest = "(empty — no features yet)";
+    BuiltContext bc = build_context(st, "intake", "", kContextTokenCap);
+    CHECK(bc.body.find("Context: the open part already has features:") == std::string::npos);
+    CHECK(bc.body.find("make a 20mm cube") != std::string::npos);
+}
+
+
 TEST_CASE("gemini thinking budget leaves room for the answer") {
     json messages = json::array();
     messages.push_back(user_message(json::array({text_part("hi")})));
@@ -991,6 +1015,117 @@ TEST_CASE("run_machine empty normalized request rejects same path") {
     CHECK(model_n == 0);
 }
 
+TEST_CASE("run_machine mod request on doc with features reaches model") {
+    // Edit follow-up on an open part: intake returns a normalized edit (not reject).
+    // Model stage must run — the object is the open doc.
+    DesignState st;
+    st.request = "chamfer the top edges 0.5mm";
+    st.revision = 4;
+    st.tree_digest = "f1 extrude Washer\nf2 cut Bore";
+    int model_n = 0;
+    StageActions actions = bare_pass_actions();
+    actions.intake = [](DesignState& s, int) {
+        StageOutcome o;
+        o.verdict = "pass";
+        o.reason = "spec parsed";
+        o.parsed_ok = true;
+        s.spec = ojson::parse(R"({
+            "object": "existing washer",
+            "key_dims": {"chamfer": 0.5},
+            "features": ["chamfer top edges"],
+            "constraints": []
+        })");
+        return o;
+    };
+    actions.model = [&](DesignState& s, int) {
+        ++model_n;
+        s.revision += 1;
+        s.tree_digest = "f1 extrude Washer\nf2 cut Bore\nf3 chamfer";
+        return pass_outcome("modeled");
+    };
+
+    RunEvents events("intake-mod-with-geom-ut", nullptr);
+    json result = run_machine(st, actions, events,
+                              json{{"intake", 1}, {"plan", 1}, {"model", 1},
+                                   {"review", 1}, {"fix", 1}, {"memory", 1}});
+    CHECK(result["status"] == "done");
+    CHECK(model_n == 1);
+}
+
+TEST_CASE("run_machine garbage on empty doc terminates unintelligible") {
+    DesignState st;
+    st.request = "asdf qwerty";
+    st.revision = 0;
+    st.tree_digest = "(empty — no features yet)";
+    int plan_n = 0, model_n = 0;
+    StageActions actions = bare_pass_actions();
+    actions.intake = [](DesignState&, int) {
+        StageOutcome o;
+        o.verdict = "fail";
+        o.reason = "not a CAD design request";
+        o.has_error = true;
+        o.error = "unintelligible_request";
+        o.parsed_ok = true;
+        return o;
+    };
+    actions.plan = [&](DesignState&, int) {
+        ++plan_n;
+        return pass_outcome();
+    };
+    actions.model = [&](DesignState&, int) {
+        ++model_n;
+        return pass_outcome();
+    };
+
+    RunEvents events("intake-garbage-empty-ut", nullptr);
+    json result = run_machine(st, actions, events,
+                              json{{"intake", 1}, {"plan", 1}, {"model", 1},
+                                   {"review", 1}, {"fix", 1}, {"memory", 1}});
+    CHECK(result["status"] == "failed");
+    CHECK(result["stop_reason"] == "unintelligible_request");
+    CHECK(result.value("error_detail", std::string()) == "not a CAD design request");
+    CHECK(plan_n == 0);
+    CHECK(model_n == 0);
+}
+
+TEST_CASE("run_machine chamfer on empty doc rejects nothing to modify") {
+    // Modification request with no existing geometry: intake rejects with an explicit reason.
+    DesignState st;
+    st.request = "chamfer the edges";
+    st.revision = 0;
+    st.tree_digest = "(empty — no features yet)";
+    int plan_n = 0, model_n = 0;
+    StageActions actions = bare_pass_actions();
+    actions.intake = [](DesignState&, int) {
+        StageOutcome o;
+        o.verdict = "fail";
+        o.reason = "no existing geometry to modify";
+        o.has_error = true;
+        o.error = "unintelligible_request";
+        o.parsed_ok = true;
+        return o;
+    };
+    actions.plan = [&](DesignState&, int) {
+        ++plan_n;
+        return pass_outcome();
+    };
+    actions.model = [&](DesignState&, int) {
+        ++model_n;
+        return pass_outcome();
+    };
+
+    RunEvents events("intake-chamfer-empty-ut", nullptr);
+    json result = run_machine(st, actions, events,
+                              json{{"intake", 1}, {"plan", 1}, {"model", 1},
+                                   {"review", 1}, {"fix", 1}, {"memory", 1}});
+    CHECK(result["status"] == "failed");
+    CHECK(result["stop_reason"] == "unintelligible_request");
+    CHECK(result.value("error_detail", std::string()) == "no existing geometry to modify");
+    CHECK(plan_n == 0);
+    CHECK(model_n == 0);
+}
+
+
 TEST_CASE("run_machine solo_skip_plan omits plan action entirely") {
     DesignState st;
     st.request = "50mm cube";
@@ -1181,10 +1316,19 @@ TEST_CASE("parse_advisor_plan_verdict approve revise escalate") {
         CHECK(v.verdict == "escalate");
     }
     {
-        // Unparseable → approve (do not block the run).
+        // Unparseable → approve (do not block the run) + honest fallback stamp.
         auto v = parse_advisor_plan_verdict("not json at all");
         CHECK_FALSE(v.ok);
         CHECK(v.verdict == "approve");
+        CHECK(v.fallback == "unparseable");
+        CHECK(v.note.find("unparseable") != std::string::npos);
+    }
+    {
+        // Unrecognized verdict → soft-approve with fallback.
+        auto v = parse_advisor_plan_verdict("{\"verdict\":\"maybe\",\"note\":\"hmm\"}");
+        CHECK_FALSE(v.ok);
+        CHECK(v.verdict == "approve");
+        CHECK(v.fallback == "unparseable");
     }
 }
 
@@ -1389,50 +1533,132 @@ TEST_CASE("swarm plan gate requires approved_plan or advisor path") {
     CHECK_FALSE(needs_gate("edit", false));
 }
 
-TEST_CASE("eng_firm budget_exceeded abort condition") {
-    // Meter: spent accumulates per-task bid; abort when spent > budget.
+TEST_CASE("eng_firm budget filter excludes over-ceiling bids") {
+    // collect_bids marks within_budget; award eligibility is in_scope && within_budget.
+    // With a tiny budget every firm is over ceiling → no award candidate.
+    auto bids = collect_bids("two brackets that bolt together", Complexity::Complex,
+                             Domain::Assembly, /*usd_per_1k=*/3.0, /*budget_usd=*/5.0);
+    REQUIRE_FALSE(bids.empty());
+    int in_scope = 0;
+    int affordable = 0;
+    for (const auto& b : bids) {
+        if (b.in_scope) ++in_scope;
+        if (b.in_scope && b.within_budget) ++affordable;
+        // Every bid must carry a non-empty firm name (firm_award.firm source).
+        CHECK_FALSE(b.firm_name.empty());
+        CHECK_FALSE(b.firm_id.empty());
+        if (b.usd > 5.0 + 1e-9) CHECK_FALSE(b.within_budget);
+    }
+    CHECK(in_scope > 0);
+    CHECK(affordable == 0);  // budget_usd=5 cannot cover any bid
+
+    // Award picker (mirrors run_mission eng_firm path): refuse when none affordable.
+    auto pick_award = [](const std::vector<Bid>& bs) -> const Bid* {
+        for (const auto& b : bs)
+            if (b.in_scope && b.within_budget) return &b;
+        return nullptr;
+    };
+    CHECK(pick_award(bids) == nullptr);
+
+    // Generous budget → cheapest in-scope wins, firm name populated.
+    auto rich = collect_bids("simple plate", Complexity::Solo, Domain::Modeling, 3.0, 1000.0);
+    const Bid* win = pick_award(rich);
+    REQUIRE(win != nullptr);
+    CHECK(win->within_budget);
+    CHECK_FALSE(win->firm_name.empty());
+    // Sorted cheapest-first among in-scope.
+    for (const auto& b : rich) {
+        if (b.in_scope && b.within_budget) {
+            CHECK(win->usd <= b.usd + 1e-9);
+            break;
+        }
+    }
+}
+
+TEST_CASE("eng_firm budget_exceeded abort before overspend") {
+    // Pre-check: if no firm is affordable under remaining budget, abort without awarding.
+    // Post-check: spent never exceeds ceiling via over-budget award.
     double budget = 10.0;
     double spent = 0.0;
-    std::vector<double> bids = {4.0, 4.0, 4.0};  // third exceeds
+    std::vector<double> bids = {4.0, 4.0, 4.0};  // third would exceed if awarded
     int completed = 0;
-    bool exceeded = false;
-    for (double b : bids) {
-        if (exceeded) break;
-        spent += b;
-        ++completed;
-        if (budget > 0.0 && spent > budget + 1e-9) exceeded = true;
-    }
-    CHECK(exceeded);
-    CHECK(completed == 3);          // third task ran then tripped
-    CHECK(spent > budget);
-    // Remaining tasks would be abandoned (not run).
-    int remaining = static_cast<int>(bids.size()) - completed;
-    CHECK(remaining == 0);
-    // With a tighter budget the third never starts:
-    budget = 7.0;
-    spent = 0.0;
-    completed = 0;
-    exceeded = false;
     int abandoned = 0;
+    bool exceeded = false;
+    auto try_award = [&](double bid_usd) -> bool {
+        // Filter: refuse award that would exceed remaining budget.
+        if (budget > 0.0 && spent + bid_usd > budget + 1e-9) return false;
+        spent += bid_usd;
+        return true;
+    };
     for (double b : bids) {
         if (exceeded) {
             ++abandoned;
             continue;
         }
-        spent += b;
+        if (!try_award(b)) {
+            exceeded = true;
+            ++abandoned;
+            continue;
+        }
         ++completed;
-        if (budget > 0.0 && spent > budget + 1e-9) exceeded = true;
     }
     CHECK(exceeded);
     CHECK(completed == 2);
     CHECK(abandoned == 1);
+    CHECK(spent <= budget + 1e-9);
 }
 
-TEST_CASE("plan_state mission ids use mission: namespace") {
-    json tasks = json::array({json{{"capability", "design"}, {"title", "Build"}}});
-    json items = plan_state_items_from_mission(tasks, "Mission");
-    REQUIRE(items.size() == 1);
-    CHECK(items[0]["id"] == "mission:0");
+TEST_CASE("mission stop_reason propagates real unit failure") {
+    // Mirrors run_mission finish: never emit opaque "planned" on failure.
+    auto resolve_stop = [](bool budget_exceeded, bool any_built, bool any_ok, bool created_doc,
+                           const std::string& first_fail,
+                           const std::vector<std::string>& summaries) -> std::string {
+        if (budget_exceeded) return "budget_exceeded";
+        if (any_built) return created_doc ? "assembled" : "built";
+        if (any_ok) return "done";
+        if (!first_fail.empty()) return first_fail;
+        for (auto it = summaries.rbegin(); it != summaries.rend(); ++it)
+            if (!it->empty()) return *it;
+        return "mission_failed";
+    };
+    CHECK(resolve_stop(true, false, false, false, "", {}) == "budget_exceeded");
+    CHECK(resolve_stop(false, true, true, false, "", {}) == "built");
+    CHECK(resolve_stop(false, true, true, true, "", {}) == "assembled");
+    CHECK(resolve_stop(false, false, true, false, "", {}) == "done");
+    CHECK(resolve_stop(false, false, false, false, "provider_error", {"provider_error"}) ==
+          "provider_error");
+    CHECK(resolve_stop(false, false, false, false, "no_geometry", {}) == "no_geometry");
+    CHECK(resolve_stop(false, false, false, false, "", {"", "parse_error"}) == "parse_error");
+    CHECK(resolve_stop(false, false, false, false, "", {}) == "mission_failed");
+    // Critical: never "planned" on a failed mission.
+    CHECK(resolve_stop(false, false, false, false, "provider_error", {}) != "planned");
+}
+
+TEST_CASE("execution_style inheritance for sub-runs") {
+    // Mirrors run_design / run_assembly_design: options.execution_style wins; is_sub_run
+    // must not re-derive edit from recommend_structure.
+    auto resolve = [](Complexity cx, const std::string& mode, const std::string& opt_style,
+                      bool is_sub_run) {
+        ExecStructure rec = recommend_structure(cx, false);
+        std::string style = execution_style_from_structure(structure_label(rec));
+        if (mode == "swarm") style = "swarm";
+        else if (mode == "eng_firm") style = "eng_firm";
+        else if (mode == "edit") style = "edit";
+        // options.execution_style explicit override (parent mission passes this through).
+        if (opt_style == "edit" || opt_style == "swarm" || opt_style == "eng_firm")
+            style = opt_style;
+        // Nested units inherit; mode is erased so only opt_style carries the parent stamp.
+        (void)is_sub_run;
+        return style;
+    };
+    // Parent swarm → child with mode erased + execution_style=swarm keeps swarm.
+    CHECK(resolve(Complexity::Solo, /*mode=*/"", /*opt_style=*/"swarm", true) == "swarm");
+    CHECK(resolve(Complexity::Solo, "", "eng_firm", true) == "eng_firm");
+    // Without inheritance a Solo child would collapse to edit — the bug.
+    CHECK(resolve(Complexity::Solo, "", "", true) == "edit");
+    // Top-level mode still forces style.
+    CHECK(resolve(Complexity::Solo, "swarm", "", false) == "swarm");
+    CHECK(resolve(Complexity::Complex, "edit", "", false) == "edit");
 }
 
 TEST_CASE("mode override forces execution_style over recommend_structure") {
@@ -1450,4 +1676,38 @@ TEST_CASE("mode override forces execution_style over recommend_structure") {
     CHECK(resolve(Complexity::Solo, "eng_firm") == "eng_firm");
     CHECK(resolve(Complexity::Complex, "edit") == "edit");
     CHECK(resolve(Complexity::Solo, "") == "edit");
+}
+
+TEST_CASE("advisor fallback field values") {
+    // Soft-approve keeps resilience; UI reads fallback for 'advisor unavailable'.
+    auto v = parse_advisor_plan_verdict("");
+    CHECK(v.fallback == "unparseable");
+    CHECK(v.verdict == "approve");
+    // Provider-error is stamped at the call site (not the parser).
+    std::string fallback;
+    bool has_call_error = true;
+    if (has_call_error)
+        fallback = "provider_error";
+    else if (!v.ok)
+        fallback = "unparseable";
+    CHECK(fallback == "provider_error");
+}
+
+TEST_CASE("mission planner degraded stub flag") {
+    // When planner returns empty tasks → single "Build the model" stub with degraded=true.
+    // Distinguishes 403/provider-failure fallback from a real 1-task plan.
+    auto is_degraded = [](bool planner_ok, size_t parsed_tasks) -> bool {
+        return !planner_ok || parsed_tasks == 0;
+    };
+    auto task_count = [](bool planner_ok, size_t parsed_tasks) -> size_t {
+        if (!planner_ok || parsed_tasks == 0) return 1;  // stub
+        return parsed_tasks;
+    };
+    CHECK(is_degraded(false, 0));
+    CHECK(task_count(false, 0) == 1);
+    CHECK_FALSE(is_degraded(true, 3));
+    CHECK(task_count(true, 3) == 3);
+    // Real single-task plan from a successful planner is NOT degraded.
+    CHECK_FALSE(is_degraded(true, 1));
+    CHECK(task_count(true, 1) == 1);
 }

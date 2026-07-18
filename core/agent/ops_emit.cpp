@@ -417,6 +417,7 @@ AdvisorPlanVerdict parse_advisor_plan_verdict(const std::string& reply) {
         // Unparseable → approve (do not block the run on a bad advisor reply).
         out.verdict = "approve";
         out.note = "advisor reply unparseable; continuing";
+        out.fallback = "unparseable";
         return out;
     }
     std::string v;
@@ -436,6 +437,7 @@ AdvisorPlanVerdict parse_advisor_plan_verdict(const std::string& reply) {
     } else {
         out.verdict = "approve";
         out.note = "unrecognized verdict; continuing";
+        out.fallback = "unparseable";
         return out;
     }
     if ((*data).contains("note") && (*data)["note"].is_string())

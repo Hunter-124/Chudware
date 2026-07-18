@@ -144,6 +144,16 @@ def _run_tmux(*args: str, timeout: float = 10.0) -> subprocess.CompletedProcess:
     )
 
 
+def _ensure_scroll_defaults() -> None:
+    """Turn on the global tmux mouse option so the wheel / two-finger swipe drive
+    copy-mode scrolling. Global + idempotent, so attaching to a session that was
+    created before this existed (or a server born without our -f config) still
+    picks up the fix live, without needing to be killed and recreated."""
+    if not _TMUX or not _server_running():
+        return
+    _run_tmux("set-option", "-g", "mouse", "on")
+
+
 def _server_running() -> bool:
     if not _TMUX:
         return False
@@ -209,7 +219,9 @@ def _create_session(tmux_name: str, cols: int, rows: int, repo: Path) -> None:
     Later sessions attach to the existing server and inherit that scope.
     """
     env = _child_env(repo)
+    conf = Path(__file__).resolve().parent / "billet-tmux.conf"
     base = _tmux_cmd(
+        *(["-f", str(conf)] if conf.exists() else []),
         "new-session",
         "-d",
         "-s",
@@ -251,6 +263,10 @@ def _create_session(tmux_name: str, cols: int, rows: int, repo: Path) -> None:
     # attached clients so work is never lost when everyone closes their browser.
     _run_tmux("set-option", "-t", target, "status", "off")
     _run_tmux("set-option", "-t", target, "destroy-unattached", "off")
+    # Mouse/scroll defaults, re-applied defensively for a server that was born
+    # without our -f config: the wheel and mobile two-finger swipe drive tmux
+    # copy-mode (browser terminals have no native scrollback on the alt screen).
+    _run_tmux("set-option", "-g", "mouse", "on")
     # Launch omp in the pane. send-keys buffers into the pane pty; bash reads it
     # at its first prompt, so no settle/injection dance is needed.
     _run_tmux("send-keys", "-t", target, _omp_cmd(), "Enter")
@@ -515,6 +531,7 @@ async def admin_terminal(ws: WebSocket) -> None:
                 await loop.run_in_executor(
                     None, _create_session, tmux_name, cols, rows, repo
                 )
+            await loop.run_in_executor(None, _ensure_scroll_defaults)
             pid, master_fd = await loop.run_in_executor(
                 None, _spawn_attach, tmux_name, cols, rows
             )

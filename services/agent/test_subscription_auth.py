@@ -1166,6 +1166,11 @@ def test_xai_complete_ex_rotates_on_tier_denied(tmp_config, monkeypatch):
         }
 
     monkeypatch.setattr(xsp.XAISubProvider, "_post_once", fake_post)
+    # complete_ex now live-pulls usage before each hop — keep unit tests offline.
+    monkeypatch.setattr(
+        xsp, "pull_account_usage",
+        lambda account_id, cred=None, force=True: dict(cred or {}) | {"account_id": account_id},
+    )
     # Avoid real refresh paths if anything looks expired.
     monkeypatch.setattr(xsp.XAISubProvider, "refresh", lambda self: self._cred or {})
 
@@ -1199,6 +1204,10 @@ def test_xai_complete_ex_all_accounts_403_clear_error(tmp_config, monkeypatch):
 
     monkeypatch.setattr(xsp.XAISubProvider, "_post_once", always_403)
     monkeypatch.setattr(xsp.XAISubProvider, "refresh", lambda self: self._cred or {})
+    monkeypatch.setattr(
+        xsp, "pull_account_usage",
+        lambda account_id, cred=None, force=True: dict(cred or {}) | {"account_id": account_id},
+    )
 
     p = xsp.XAISubProvider()
     with pytest.raises(xsp.XaiTierDeniedError) as ei:
@@ -1228,6 +1237,10 @@ def test_xai_model_hyphen_normalized_in_request_body(tmp_config, monkeypatch):
 
     monkeypatch.setattr(xsp.XAISubProvider, "_post_once", fake_post)
     monkeypatch.setattr(xsp.XAISubProvider, "refresh", lambda self: self._cred or {})
+    monkeypatch.setattr(
+        xsp, "pull_account_usage",
+        lambda account_id, cred=None, force=True: dict(cred or {}) | {"account_id": account_id},
+    )
 
     p = xsp.XAISubProvider(model="grok-4-5")
     out, _ = p.complete_ex("s", [{"role": "user", "content": "x"}])
@@ -1265,6 +1278,10 @@ def test_xai_complete_ex_rotates_on_timeout(tmp_config, monkeypatch):
 
     monkeypatch.setattr(xsp.XAISubProvider, "_post_once", fake_post)
     monkeypatch.setattr(xsp.XAISubProvider, "refresh", lambda self: self._cred or {})
+    monkeypatch.setattr(
+        xsp, "pull_account_usage",
+        lambda account_id, cred=None, force=True: dict(cred or {}) | {"account_id": account_id},
+    )
     # No same-account timeout retries in this unit test — rotate immediately.
     monkeypatch.setenv("AICAD_XAI_READ_TIMEOUT_RETRIES", "0")
     xsp._reset_request_semaphore_for_tests()
@@ -1277,6 +1294,138 @@ def test_xai_complete_ex_rotates_on_timeout(tmp_config, monkeypatch):
     assert content == "ok-b"
     assert "tok-a" in seen and "tok-b" in seen
     assert xsp.is_account_blocked("acct-a") is True
+
+
+
+def test_account_usage_exhausted_filters_full_credits():
+    from agent.providers import xai_sub_provider as xsp
+
+    assert xsp.account_usage_exhausted({
+        "last_usage": [
+            {"window": "credits", "used_fraction": 1.0, "status": "blocked"},
+        ],
+    }) is True
+    assert xsp.account_usage_exhausted({
+        "last_usage": [
+            {"window": "credits", "used_fraction": 0.58, "status": "ok"},
+        ],
+    }) is False
+    assert xsp.account_usage_exhausted({"usage_exhausted": True}) is True
+    assert xsp.account_usage_exhausted({"last_usage": []}) is False
+
+
+def test_list_candidates_skips_100pct_usage_and_orders_by_remaining(tmp_config):
+    from agent.providers import xai_sub_provider as xsp
+
+    xsp.clear_blocked_accounts_for_tests()
+    now = int(time.time() * 1000) + 10 ** 9
+    # Active is fully spent — must not be first candidate.
+    sub_auth.save_credential(xsp.PROVIDER_ID, {
+        "access_token": "tok-spent", "refresh_token": "r-s",
+        "account_id": "acct-spent", "expires_at_ms": now,
+        "last_usage": [
+            {"window": "credits", "label": "Credits",
+             "used_fraction": 1.0, "status": "blocked"},
+        ],
+    }, account_id="acct-spent", set_active=True)
+    sub_auth.save_credential(xsp.PROVIDER_ID, {
+        "access_token": "tok-mid", "refresh_token": "r-m",
+        "account_id": "acct-mid", "expires_at_ms": now,
+        "last_usage": [
+            {"window": "credits", "used_fraction": 0.8, "status": "warn"},
+        ],
+    }, account_id="acct-mid", set_active=False)
+    sub_auth.save_credential(xsp.PROVIDER_ID, {
+        "access_token": "tok-fresh", "refresh_token": "r-f",
+        "account_id": "acct-fresh", "expires_at_ms": now,
+        "last_usage": [
+            {"window": "credits", "used_fraction": 0.1, "status": "ok"},
+        ],
+    }, account_id="acct-fresh", set_active=False)
+
+    cands = xsp.list_candidate_accounts(include_blocked=False, include_exhausted=False)
+    ids = [a for a, _ in cands]
+    assert "acct-spent" not in ids
+    assert ids[0] == "acct-fresh"  # lowest usage first among non-preferred
+    assert "acct-mid" in ids
+
+    # pick_usable + constructor skip spent active.
+    picked = xsp.pick_usable_account(prefer="acct-spent")
+    assert picked is not None and picked[0] == "acct-fresh"
+    p = xsp.XAISubProvider()
+    assert p._cred["access_token"] == "tok-fresh"
+
+
+def test_complete_ex_pulls_usage_before_try_and_skips_spent(tmp_config, monkeypatch):
+    """Before each hop, live usage is pulled; 100% accounts are not POSTed."""
+    from agent.providers import xai_sub_provider as xsp
+
+    xsp.clear_blocked_accounts_for_tests()
+    now = int(time.time() * 1000) + 10 ** 9
+    sub_auth.save_credential(xsp.PROVIDER_ID, {
+        "access_token": "tok-a", "refresh_token": "r-a",
+        "account_id": "acct-a", "expires_at_ms": now,
+        # Stale disk says ok — live pull will flip to spent.
+        "last_usage": [
+            {"window": "credits", "used_fraction": 0.2, "status": "ok"},
+        ],
+        "last_usage_fetched_at": 0,
+    }, account_id="acct-a", set_active=True)
+    sub_auth.save_credential(xsp.PROVIDER_ID, {
+        "access_token": "tok-b", "refresh_token": "r-b",
+        "account_id": "acct-b", "expires_at_ms": now,
+        "last_usage": [
+            {"window": "credits", "used_fraction": 0.3, "status": "ok"},
+        ],
+        "last_usage_fetched_at": 0,
+    }, account_id="acct-b", set_active=False)
+
+    pulls: list[str] = []
+
+    def fake_pull(account_id, cred=None, *, force=True):  # noqa: ARG001
+        pulls.append(str(account_id))
+        c = dict(cred or {})
+        c["account_id"] = account_id
+        if account_id == "acct-a":
+            c["last_usage"] = [
+                {"window": "credits", "used_fraction": 1.0, "status": "blocked"},
+            ]
+            c["usage_exhausted"] = True
+            # Mirror production side-effect so filters stick.
+            xsp.mark_account_usage_exhausted("acct-a", detail="test", used_fraction=1.0)
+        else:
+            c["last_usage"] = [
+                {"window": "credits", "used_fraction": 0.3, "status": "ok"},
+            ]
+        c["last_usage_fetched_at"] = time.time()
+        return c
+
+    seen_tokens: list[str] = []
+
+    def fake_post(self, body):  # noqa: ARG001
+        tok = (self._cred or {}).get("access_token")
+        seen_tokens.append(tok)
+        if tok == "tok-a":
+            raise AssertionError("must not POST spent account A")
+        return {
+            "choices": [{"message": {"content": "ok-b", "reasoning_content": ""}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+
+    monkeypatch.setattr(xsp, "pull_account_usage", fake_pull)
+    monkeypatch.setattr(xsp.XAISubProvider, "_post_once", fake_post)
+    monkeypatch.setattr(xsp.XAISubProvider, "refresh", lambda self: self._cred or {})
+
+    p = xsp.XAISubProvider()
+    # Force start pointing at A; ensure_auth must pull + skip to B.
+    p._cred = sub_auth.load_credential(xsp.PROVIDER_ID, account_id="acct-a")
+    sub_auth.set_active_account(xsp.PROVIDER_ID, "acct-a")
+
+    content, _ = p.complete_ex("sys", [{"role": "user", "content": "hi"}])
+    assert content == "ok-b"
+    assert "tok-a" not in seen_tokens
+    assert "tok-b" in seen_tokens
+    assert "acct-a" in pulls and "acct-b" in pulls
 
 
 # ── xAI refresh-token rotation safety ────────────────────────────────────────

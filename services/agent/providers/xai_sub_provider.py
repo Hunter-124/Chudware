@@ -194,12 +194,18 @@ class XaiTierDeniedError(RuntimeError):
         self.detail = detail or ""
 
 
-# ── Multi-account rotation (403/429 fall-through) ────────────────────────────
-# Process-local: when one SuperGrok account is tier/spending-limit gated or rate-
-# limited, try the next signed-in account before failing the whole provider.
+# ── Multi-account rotation (403/429 / spent fall-through) ────────────────────
+# Process-local: when one SuperGrok account is tier/spending-limit gated, rate-
+# limited, or usage bars show 100% spent, try the next signed-in account before
+# failing the whole provider. Prefer accounts with remaining credits.
 _account_block_lock = threading.Lock()
 _blocked_accounts: dict[str, float] = {}  # account_id -> unix-seconds unblock time
 _DEFAULT_ACCOUNT_BLOCK_S = 15 * 60
+# Spending-limit / 100% credits: keep skipped for hours so we don't re-burn the
+# active pointer on every turn (weekly SuperGrok pools).
+_SPEND_BLOCK_S = 6 * 60 * 60
+# Treat used_fraction at/above this as exhausted (billing float noise).
+_USAGE_EXHAUSTED_FRACTION = 0.999
 # Per-account refresh serialization. xAI rotates RTs on every exchange — two
 # concurrent refreshes with the same RT make the second fail invalid_grant and
 # (if it persisted first) can even thrash a good rotation.
@@ -309,15 +315,206 @@ def _has_usable_tokens(cred: dict | None) -> bool:
     return bool(cred.get("access_token") or cred.get("refresh_token"))
 
 
+def _iter_usage_windows(cred: dict | None) -> list[dict]:
+    """Return usage window dicts from a credential (last_usage) if present."""
+    if not isinstance(cred, dict):
+        return []
+    raw = cred.get("last_usage")
+    if not isinstance(raw, list):
+        return []
+    return [w for w in raw if isinstance(w, dict)]
+
+
+def _window_used_fraction(window: dict) -> float | None:
+    frac = window.get("used_fraction")
+    if frac is None:
+        return None
+    try:
+        return float(frac)
+    except (TypeError, ValueError):
+        return None
+
+
+def account_max_used_fraction(cred: dict | None) -> float | None:
+    """Highest used_fraction across stored usage windows, or None if unknown."""
+    best: float | None = None
+    for w in _iter_usage_windows(cred):
+        # Prefer credits/plan windows; still consider others as a floor.
+        frac = _window_used_fraction(w)
+        if frac is None:
+            continue
+        if best is None or frac > best:
+            best = frac
+    return best
+
+
+def account_usage_exhausted(cred: dict | None) -> bool:
+    """True when stored usage says this account is spent / blocked.
+
+    Filters 100% credit bars and explicit blocked/needs_login statuses so
+    rotation never POSTs chat against a known-dead SuperGrok pool.
+    """
+    if not isinstance(cred, dict):
+        return False
+    if cred.get("usage_exhausted"):
+        return True
+    windows = _iter_usage_windows(cred)
+    if not windows:
+        return False
+    for w in windows:
+        status = str(w.get("status") or "").strip().lower()
+        if status in ("blocked", "exhausted", "limit_reached"):
+            # Status-only blocked rows (no fraction) still count.
+            frac = _window_used_fraction(w)
+            if frac is None or frac >= _USAGE_EXHAUSTED_FRACTION * 0.95:
+                return True
+        frac = _window_used_fraction(w)
+        if frac is not None and frac >= _USAGE_EXHAUSTED_FRACTION:
+            win = str(w.get("window") or "").strip().lower()
+            # Credits / plan / default windows gate SuperGrok chat; ignore
+            # secondary request/token rate bars unless they are the only signal.
+            if win in ("", "credits", "credit", "plan", "weekly", "monthly", "default"):
+                return True
+    # If the only windows are rate-limit bars all at 100%, treat as exhausted.
+    fracs = [_window_used_fraction(w) for w in windows]
+    known = [f for f in fracs if f is not None]
+    if known and all(f >= _USAGE_EXHAUSTED_FRACTION for f in known):
+        return True
+    return False
+
+
+def mark_account_usage_exhausted(
+    account_id: str | None,
+    *,
+    detail: str = "",
+    used_fraction: float = 1.0,
+) -> None:
+    """Persist a spent marker + 100% credits window; soft-block for the spend TTL."""
+    aid = str(account_id or "").strip()
+    if not aid:
+        return
+    mark_account_blocked(
+        aid,
+        seconds=_SPEND_BLOCK_S,
+        reason=f"usage_exhausted: {detail}"[:120] if detail else "usage_exhausted",
+    )
+    frac = max(0.0, min(1.0, float(used_fraction)))
+    try:
+        sub_auth.patch_credential(
+            PROVIDER_ID,
+            aid,
+            {
+                "usage_exhausted": True,
+                "auth_error": (detail or "spending-limit / credits exhausted")[:240],
+                "last_usage": [
+                    {
+                        "window": "credits",
+                        "label": "Credits",
+                        "used_fraction": frac,
+                        "resets_at": None,
+                        "status": "blocked",
+                    }
+                ],
+                "last_usage_fetched_at": _now_s(),
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 — best-effort
+        log.warning(
+            "xai oauth: could not persist usage_exhausted for %s: %s",
+            aid[:12],
+            exc,
+        )
+
+
+def clear_account_usage_exhausted(account_id: str | None) -> None:
+    """Drop a stale usage_exhausted marker after a successful completion."""
+    aid = str(account_id or "").strip()
+    if not aid:
+        return
+    try:
+        sub_auth.patch_credential(
+            PROVIDER_ID,
+            aid,
+            {"usage_exhausted": None},
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def pull_account_usage(
+    account_id: str | None,
+    cred: dict | None = None,
+    *,
+    force: bool = True,
+) -> dict | None:
+    """Live-pull usage for one account; return updated cred (or None on failure).
+
+    Uses :mod:`usage` so Settings bars and rotation share one cache. Never raises.
+    """
+    aid = str(account_id or "").strip()
+    if not aid and isinstance(cred, dict):
+        aid = str(_cred_account_id(cred) or "").strip()
+    if not aid:
+        return dict(cred) if isinstance(cred, dict) else None
+    try:
+        from . import usage as usage_mod
+
+        row = usage_mod.fetch_account_usage(
+            "xai",
+            aid,
+            force=force,
+            cred=cred if isinstance(cred, dict) else None,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.debug("xai_sub: usage pull failed for %s: %s", aid[:12], exc)
+        return dict(cred) if isinstance(cred, dict) else sub_auth.load_credential(
+            PROVIDER_ID, account_id=aid
+        )
+    # Prefer disk after persist_identity (may have written last_usage).
+    fresh = sub_auth.load_credential(PROVIDER_ID, account_id=aid)
+    if not isinstance(fresh, dict):
+        fresh = dict(cred) if isinstance(cred, dict) else {}
+    # Mirror the just-fetched row onto the in-memory cred even if persist lagged.
+    if isinstance(row, dict):
+        if row.get("usage"):
+            fresh["last_usage"] = list(row["usage"])
+            fresh["last_usage_fetched_at"] = _now_s()
+        if row.get("plan") and not fresh.get("plan"):
+            fresh["plan"] = row["plan"]
+        if row.get("display_name") and not fresh.get("display_name"):
+            fresh["display_name"] = row["display_name"]
+        if row.get("email") and not fresh.get("email"):
+            fresh["email"] = row["email"]
+        # Live blocked / 100% → sticky exhausted marker.
+        probe = dict(fresh)
+        if row.get("usage"):
+            probe["last_usage"] = list(row["usage"])
+        if account_usage_exhausted(probe) or str(row.get("status") or "").lower() == "blocked":
+            mark_account_usage_exhausted(
+                aid,
+                detail="usage pull reported exhausted",
+                used_fraction=account_max_used_fraction(probe) or 1.0,
+            )
+            fresh = sub_auth.load_credential(PROVIDER_ID, account_id=aid) or fresh
+    return fresh
+
+
+
 def list_candidate_accounts(
     *,
     prefer: str | None = None,
     include_blocked: bool = False,
+    include_exhausted: bool = False,
+    refresh_usage: bool = False,
 ) -> list[tuple[str, dict]]:
     """Ordered (account_id, cred) candidates for chat completion.
 
-    Prefer *prefer* (or the store's active account), then remaining non-blocked
-    signed-in accounts. Empty when no credentials are stored.
+    Prefer *prefer* (or the store's active account) only when it still has
+    credits; then remaining non-blocked signed-in accounts ordered by ascending
+    used_fraction (most remaining first). Accounts whose stored usage is 100%
+    / blocked are skipped unless *include_exhausted*. When *refresh_usage* is
+    True each candidate gets a live usage pull before the filter (prefer the
+    per-hop pull in complete_ex for lower latency).
     """
     accounts = sub_auth.list_accounts(PROVIDER_ID)
     if not accounts:
@@ -330,7 +527,7 @@ def list_candidate_accounts(
         aid = str(a.get("account_id") or "")
         if aid and aid not in ordered:
             ordered.append(aid)
-    out: list[tuple[str, dict]] = []
+    raw: list[tuple[str, dict]] = []
     for aid in ordered:
         if not include_blocked and is_account_blocked(aid):
             continue
@@ -338,16 +535,45 @@ def list_candidate_accounts(
         if not _has_usable_tokens(cred):
             continue
         assert cred is not None
-        # Keep account_id on the dict so rotation + status stay aligned.
+        if refresh_usage:
+            pulled = pull_account_usage(aid, cred, force=True)
+            if isinstance(pulled, dict):
+                cred = pulled
         if not cred.get("account_id"):
             cred["account_id"] = aid
-        out.append((aid, cred))
-    return out
+        if not include_exhausted and account_usage_exhausted(cred):
+            if not is_account_blocked(aid):
+                mark_account_blocked(
+                    aid,
+                    seconds=_SPEND_BLOCK_S,
+                    reason="stored usage exhausted",
+                )
+            continue
+        raw.append((aid, cred))
+
+    if not raw:
+        return []
+
+    def _sort_key(item: tuple[str, dict]) -> tuple[int, float]:
+        aid, cred = item
+        preferred = 0 if (active and aid == str(active)) else 1
+        frac = account_max_used_fraction(cred)
+        # Unknown usage sorts mid-pack (assume partially used) so known-fresh
+        # low-usage accounts win, without always punishing unknowns.
+        frac_key = float(frac) if frac is not None else 0.75
+        return (preferred, frac_key)
+
+    raw.sort(key=_sort_key)
+    return raw
 
 
 def pick_usable_account(prefer: str | None = None) -> tuple[str, dict] | None:
-    """First non-blocked signed-in account, or None."""
-    cands = list_candidate_accounts(prefer=prefer, include_blocked=False)
+    """First non-blocked, non-exhausted signed-in account, or None."""
+    cands = list_candidate_accounts(
+        prefer=prefer,
+        include_blocked=False,
+        include_exhausted=False,
+    )
     return cands[0] if cands else None
 
 
@@ -944,31 +1170,82 @@ class XAISubProvider(Provider):
         return exp_f * 1000.0 > (time.time() * 1000.0 + skew_ms)
 
     def _ensure_auth(self) -> None:
-        """Ensure *self._cred* is present and not expired (refresh if needed).
+        """Ensure *self._cred* is present, not expired, and not usage-exhausted.
 
-        On cold restore / multi-account, prefers a non-blocked signed-in account
-        over a soft-blocked active pointer. Refresh failures that look
-        per-account (403/429) rotate before giving up. If refresh fails with
-        invalid_grant but the access JWT is still live, keep using it.
+        On cold restore / multi-account, prefers a non-blocked, non-exhausted
+        signed-in account over a soft-blocked or spent active pointer. Live
+        usage is pulled for the chosen account before the first chat POST so
+        a 100% SuperGrok bar never burns a round-trip. Refresh failures that
+        look per-account (403/429) rotate before giving up. If refresh fails
+        with invalid_grant but the access JWT is still live, keep using it.
         """
-        if not self._cred or not _has_usable_tokens(self._cred):
-            picked = pick_usable_account()
+        def _bind_fresh(prefer: str | None = None) -> bool:
+            picked = pick_usable_account(prefer=prefer)
             if picked is None:
+                return False
+            aid, cred = picked
+            # Live usage check before first POST on this account.
+            pulled = pull_account_usage(aid, cred, force=True)
+            if isinstance(pulled, dict):
+                cred = pulled
+            if account_usage_exhausted(cred) or is_account_blocked(aid):
+                # pull_account_usage already marked exhausted; try next.
+                picked2 = pick_usable_account(prefer=None)
+                if picked2 is None or picked2[0] == aid:
+                    return False
+                aid, cred = picked2
+                pulled2 = pull_account_usage(aid, cred, force=True)
+                if isinstance(pulled2, dict):
+                    cred = pulled2
+                if account_usage_exhausted(cred):
+                    return False
+            self._bind_account(aid, cred)
+            return True
+
+        need_pick = (
+            not self._cred
+            or not _has_usable_tokens(self._cred)
+            or is_account_blocked(_cred_account_id(self._cred))
+            or account_usage_exhausted(self._cred)
+        )
+        if need_pick:
+            if not _bind_fresh(prefer=None if (
+                is_account_blocked(_cred_account_id(self._cred))
+                or account_usage_exhausted(self._cred)
+            ) else _cred_account_id(self._cred)):
+                if not self._cred or not _has_usable_tokens(self._cred):
+                    raise RuntimeError(
+                        "Not logged in to xAI subscription. "
+                        "Run login() first (Settings → Sign in with xAI)."
+                    )
                 raise RuntimeError(
-                    "Not logged in to xAI subscription. "
-                    "Run login() first (Settings → Sign in with xAI)."
+                    "All signed-in xAI accounts are spent or temporarily blocked "
+                    "(spending-limit / tier-gate 403 / rate-limit 429). Sign in "
+                    "another SuperGrok account, add credits, or wait and retry. "
+                    "Hint: " + TIER_DENIED_HINT
                 )
-            self._bind_account(picked[0], picked[1])
-        elif is_account_blocked(_cred_account_id(self._cred)):
-            # Active account soft-blocked — rotate before the request.
-            picked = pick_usable_account(prefer=None)
-            if picked is None:
-                raise RuntimeError(
-                    "All signed-in xAI accounts are temporarily blocked "
-                    "(tier-gate 403 or rate-limit 429). Sign in another SuperGrok "
-                    "account or wait and retry. Hint: " + TIER_DENIED_HINT
-                )
-            self._bind_account(picked[0], picked[1])
+        else:
+            # Still pull usage for the bound account before chat when stale/missing.
+            aid = _cred_account_id(self._cred)
+            last_at = 0.0
+            try:
+                last_at = float((self._cred or {}).get("last_usage_fetched_at") or 0)
+            except (TypeError, ValueError):
+                last_at = 0.0
+            stale = (not _iter_usage_windows(self._cred)) or (
+                last_at and (_now_s() - last_at) > 5 * 60
+            ) or (last_at == 0.0)
+            if aid and stale:
+                pulled = pull_account_usage(aid, self._cred, force=True)
+                if isinstance(pulled, dict):
+                    self._cred = pulled
+                if account_usage_exhausted(self._cred) or is_account_blocked(aid):
+                    if not _bind_fresh(prefer=None):
+                        raise RuntimeError(
+                            "All signed-in xAI accounts are spent or temporarily "
+                            "blocked (spending-limit). Sign in another SuperGrok "
+                            "account or add credits. Hint: " + TIER_DENIED_HINT
+                        )
 
         if not sub_auth.is_expired(self._cred, skew_ms=REFRESH_SKEW_MS):
             return
@@ -1008,11 +1285,28 @@ class XAISubProvider(Provider):
                 raise
 
     def _activate_next_account(self, *, failed_id: str | None) -> bool:
-        """Mark *failed_id* blocked and switch to the next candidate. True if switched."""
+        """Mark *failed_id* blocked and switch to the next candidate.
+
+        Pulls live usage for each candidate before accepting it so a 100% bar
+        never becomes the next chat target. True if switched.
+        """
         if failed_id:
             mark_account_blocked(failed_id, reason="complete_ex rotate")
-        for aid, cred in list_candidate_accounts(include_blocked=False):
+        for aid, cred in list_candidate_accounts(
+            include_blocked=False,
+            include_exhausted=False,
+        ):
             if failed_id and aid == failed_id:
+                continue
+            # Always re-check usage right before binding a rotated account.
+            pulled = pull_account_usage(aid, cred, force=True)
+            if isinstance(pulled, dict):
+                cred = pulled
+            if account_usage_exhausted(cred) or is_account_blocked(aid):
+                log.info(
+                    "xai_sub: skip exhausted/blocked candidate %s during rotate",
+                    aid[:12],
+                )
                 continue
             log.info(
                 "xai_sub: rotating account %s → %s after per-account failure",
@@ -1248,7 +1542,16 @@ class XAISubProvider(Provider):
         tried: list[str] = []
         last_exc: BaseException | None = None
         resp: dict | None = None
-        max_account_hops = max(1, len(list_candidate_accounts(include_blocked=True)) or 1)
+        max_account_hops = max(
+            1,
+            len(
+                list_candidate_accounts(
+                    include_blocked=True,
+                    include_exhausted=True,
+                )
+            )
+            or 1,
+        )
 
         for _hop in range(max_account_hops):
             aid = _cred_account_id(self._cred) or sub_auth.get_active_account_id(PROVIDER_ID) or "?"
@@ -1266,15 +1569,38 @@ class XAISubProvider(Provider):
                 rotatable = _is_rotatable_account_error(exc) or _is_read_timeout(exc)
                 if not rotatable:
                     raise
-                if _is_rate_limit_error(exc) or _is_read_timeout(exc):
-                    block_s = 5 * 60
-                else:
-                    block_s = None  # default 15 min for tier/spend
-                mark_account_blocked(
-                    aid,
-                    seconds=block_s,
-                    reason=str(exc)[:120],
+                text_l = f"{type(exc).__name__}: {exc}".lower()
+                spendish = any(
+                    m in text_l
+                    for m in (
+                        "spending-limit",
+                        "spending limit",
+                        "personal-team-blocked",
+                        "run out of credits",
+                        "out of credits",
+                        "need a grok subscription",
+                        "team_blocked",
+                        "team blocked",
+                    )
                 )
+                if spendish:
+                    mark_account_usage_exhausted(
+                        str(aid) if aid != "?" else None,
+                        detail=str(exc)[:200],
+                        used_fraction=1.0,
+                    )
+                elif _is_rate_limit_error(exc) or _is_read_timeout(exc):
+                    mark_account_blocked(
+                        aid,
+                        seconds=5 * 60,
+                        reason=str(exc)[:120],
+                    )
+                else:
+                    mark_account_blocked(
+                        aid,
+                        seconds=_SPEND_BLOCK_S if isinstance(exc, XaiTierDeniedError) else None,
+                        reason=str(exc)[:120],
+                    )
                 if not self._activate_next_account(failed_id=str(aid) if aid != "?" else None):
                     break
                 continue
@@ -1309,6 +1635,11 @@ class XAISubProvider(Provider):
         thinking = msg.get("reasoning_content") or msg.get("reasoning") or ""
         if thinking == content:
             thinking = ""
+        # Successful chat → clear a stale usage_exhausted sticky if any.
+        try:
+            clear_account_usage_exhausted(_cred_account_id(self._cred))
+        except Exception:  # noqa: BLE001
+            pass
         # mega-6: capture token usage from OpenAI-shaped response body.
         try:
             from . import token_usage as _tu  # noqa: PLC0415

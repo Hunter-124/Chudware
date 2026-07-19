@@ -13186,6 +13186,9 @@ static void drawComposerPrelude(AppState& st, bool busy) {
                                ImVec2(cx + r * 1.6f, cy + r * 0.6f), tink);
     }
     if (trigClick) ImGui::OpenPopup("##aimodemenu");
+    // Shot-only hook (AI_CAD_CHAT_MODEMENU): hold the mode drop-up open for headless
+    // screenshot verification of the per-mode gradient rows. No-op in normal use.
+    if (std::getenv("AI_CAD_CHAT_MODEMENU")) ImGui::OpenPopup("##aimodemenu");
     if (trigHov && !ImGui::IsPopupOpen("##aimodemenu"))
         ImGui::SetTooltip("%s", modeTips[mode]);
 

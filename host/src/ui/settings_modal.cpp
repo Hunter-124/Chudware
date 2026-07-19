@@ -150,10 +150,12 @@ static void settingsGlassSectionEnd() {
 }
 
 // Sticky Settings tabs: tab bar stays put; only the body child scrolls.
-static void settingsTabBodyBegin(const char* id) {
+static void settingsTabBodyBegin(const char* id, bool scroll = true) {
     const float sc = ui::uiScale;
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f * sc, 8.0f * sc));
-    ImGui::BeginChild(id, ImVec2(0, 0), ImGuiChildFlags_None);
+    ImGuiWindowFlags flags = scroll ? ImGuiWindowFlags_None
+                                    : (ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    ImGui::BeginChild(id, ImVec2(0, 0), ImGuiChildFlags_None, flags);
 }
 static void settingsTabBodyEnd() {
     ImGui::EndChild();
@@ -2677,7 +2679,10 @@ static void drawSettingsSkillsTab(AppState& st, float S) {
         ImGui::PopStyleColor();
     }
 
-    const float colH = ImMax(220.0f * S, ImGui::GetContentRegionAvail().y - 8.0f * S);
+    // One scrollbar only: size columns to the remaining viewport minus the group title
+    // Interwebz paints above the child (title + underline). Parent ##tab_ai must not also scroll.
+    const float titleBudget = ImGui::GetTextLineHeight() + 10.0f * S;
+    const float colH = ImMax(180.0f * S, ImGui::GetContentRegionAvail().y - titleBudget);
     ui::InterwebzTwoColumnBegin(12.0f);
     if (ui::InterwebzGroupBegin("##set_skill_list", "Catalog", ImVec2(0, colH))) {
         if (ImGui::Button("New skill", ImVec2(-1, 0))) {
@@ -2853,16 +2858,8 @@ static void drawSettingsContextTab(AppState& st, float S) {
         ImGui::PopStyleColor();
     }
 
-    ImGui::PushStyleColor(ImGuiCol_Text,
-        ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
-               ui::palette.textDim[2], 1));
-    ImGui::TextWrapped(
-        "Keyword / tool / event triggers inject domain context so the model plans "
-        "with the right numbers and tool sequences (aicad.trigger/1).");
-    ImGui::PopStyleColor();
-    ImGui::Dummy(ImVec2(0, 4.0f * S));
-
-    const float colH = ImMax(220.0f * S, ImGui::GetContentRegionAvail().y - 8.0f * S);
+    const float titleBudget = ImGui::GetTextLineHeight() + 10.0f * S;
+    const float colH = ImMax(180.0f * S, ImGui::GetContentRegionAvail().y - titleBudget);
     ui::InterwebzTwoColumnBegin(10.0f);
     if (ui::InterwebzGroupBegin("##set_trig_list", "Triggers", ImVec2(0, colH))) {
         if (ImGui::Button("New trigger", ImVec2(-1, 0))) {
@@ -3759,15 +3756,12 @@ settingsGlassSectionBegin("##ai_harness_org", "Harness organization");
                     }
 
                     if (ImGui::BeginTabItem("Roles", nullptr, subFlags(2))) {
-settingsGlassSectionBegin("##ai_model_roles", "Model roles");
+                        // Model pickers first (compact table).
+                        settingsGlassSectionBegin("##ai_model_roles", "Model roles");
                 drawModelRolesSection(st, sc);
                 settingsGlassSectionEnd();
-                        if (ImGui::CollapsingHeader("Eng. Firm model assignments")) {
-settingsGlassSectionBegin("##ai_eng_firm", "Eng. Firm model assignments");
-                drawEngFirmModelAssignments(st, sc);
-                settingsGlassSectionEnd();
-                        }
                         ImGui::Dummy(ImVec2(0, 6.0f * sc));
+                        // Role prompt editor — fixed height; parent AI body scrolls.
                 settingsSectionHeader("Role prompts", /*first=*/true);
                 bool canFetch = st.workerStarted && !busy;
                 if (!s_promptsLoaded && canFetch) loadPrompts(st);
@@ -3779,11 +3773,14 @@ settingsGlassSectionBegin("##ai_eng_firm", "Eng. Firm model assignments");
                 // roles = the override editor.
                 const int sysIdx = (int)s_promptRecs.size();
                 float listW = 150.0f * sc;
-                float avail = ImGui::GetContentRegionAvail().y;
+                // Fixed pane height so Model roles above + Eng. Firm below can share one
+                // parent scrollbar — avail-filling children were pushing this off-screen.
+                const float promptsH = ImMax(260.0f * sc,
+                    ImMin(420.0f * sc, ImGui::GetContentRegionAvail().y * 0.72f));
                 ImGui::PushStyleColor(ImGuiCol_ChildBg,
                     ImVec4(ui::palette.panelBg[0], ui::palette.panelBg[1],
                            ui::palette.panelBg[2], 1));
-                ImGui::BeginChild("##rolelist", ImVec2(listW, avail - 38.0f * sc),
+                ImGui::BeginChild("##rolelist", ImVec2(listW, promptsH),
                                   ImGuiChildFlags_Border);
                 for (int i = 0; i < (int)s_promptRecs.size(); ++i) {
                     bool sel = (i == s_selectedRole);
@@ -3811,7 +3808,7 @@ settingsGlassSectionBegin("##ai_eng_firm", "Eng. Firm model assignments");
                 ImGui::SameLine();
 
                 // Right column: editor + diff indicator
-                ImGui::BeginChild("##roleeditor", ImVec2(0, avail - 38.0f * sc),
+                ImGui::BeginChild("##roleeditor", ImVec2(0, promptsH),
                                   ImGuiChildFlags_None);
                 if (s_selectedRole >= sysIdx) {
                     // System prompt override (applied by the footer Save; empty = built-in).
@@ -3894,15 +3891,31 @@ settingsGlassSectionBegin("##ai_eng_firm", "Eng. Firm model assignments");
                         ImGui::SetTooltip("Delete the override and restore the shipped prompt");
                 }
                 ImGui::EndChild();
-                                                                ImGui::EndTabItem();
+                        ImGui::Dummy(ImVec2(0, 6.0f * sc));
+                        {
+                            static bool s_efOpen = false;
+                            ImGui::SetNextItemOpen(s_efOpen, ImGuiCond_Once);
+                            if (ImGui::CollapsingHeader("Eng. Firm model assignments")) {
+                                s_efOpen = true;
+                                settingsGlassSectionBegin("##ai_eng_firm", "Eng. Firm");
+                                drawEngFirmModelAssignments(st, sc);
+                                settingsGlassSectionEnd();
+                            } else {
+                                s_efOpen = false;
+                            }
+                        }
+                        ImGui::EndTabItem();
                     }
 
                     if (ImGui::BeginTabItem("Skills", nullptr, subFlags(3))) {
+                        // Fill-height editors: pin parent scroll so only the catalog/editor scroll.
+                        ImGui::SetScrollY(0.0f);
                         drawSettingsSkillsTab(st, sc);
                         ImGui::EndTabItem();
                     }
 
                     if (ImGui::BeginTabItem("Context", nullptr, subFlags(4))) {
+                        ImGui::SetScrollY(0.0f);
                         drawSettingsContextTab(st, sc);
                         ImGui::EndTabItem();
                     }

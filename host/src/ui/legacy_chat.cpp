@@ -7016,11 +7016,47 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     const float gearW = measureBtn("Settings", "settings");
     const float minGap = style.ItemSpacing.x;
     const float rightInset = ui::metrics::U(0.5f);
-    const float collapseW = lh;
-    const float collapseGap = ui::metrics::asmHeaderIconGap();
-    const float leftInset = collapseW + collapseGap;
+    // Mirror FeatureManager collapse chip (layout.cpp): 26dp glass square.
+    // FM parks « at top-RIGHT of the left column; Copilot parks » at top-LEFT of the right column.
+    const float chevSz  = 26.0f * sc;
+    const float chevPad = 8.0f * sc;
+    const float leftInset = chevSz + chevPad;  // content clears the collapse chip
     const float colW = ImGui::GetContentRegionAvail().x;
 
+    // ---- Collapse chip (absolute, top-left) — drawn first; cursor restored like FM ----
+    {
+        const ImVec2 winP0 = ImGui::GetWindowPos();
+        const ImVec2 c0(winP0.x + ImGui::GetWindowContentRegionMin().x,
+                        winP0.y + ImGui::GetWindowContentRegionMin().y + 4.0f * sc);
+        const ImVec2 savedCur = ImGui::GetCursorScreenPos();
+        ImGui::SetCursorScreenPos(c0);
+        const bool cClicked = ImGui::InvisibleButton("##cp_collapse", ImVec2(chevSz, chevSz));
+        const bool cHover = ImGui::IsItemHovered();
+        ImDrawList* wdl = ImGui::GetWindowDrawList();
+        ui::glassRowBackground(wdl, c0, ImVec2(c0.x + chevSz, c0.y + chevSz), 7.0f, false, false,
+                               cHover ? 0.42f : 0.22f);
+        const ImU32 cCol = ImGui::ColorConvertFloat4ToU32(
+            cHover ? chatSurf().textPrimary : chatSurf().textSecondary);
+        const ImVec2 cc(c0.x + chevSz * 0.5f, c0.y + chevSz * 0.5f);
+        const float ca = 3.5f * sc;
+        // "»" double chevron (mirror of FM's "«")
+        for (int i = 0; i < 2; ++i) {
+            const float ox = (i == 0 ? -2.5f : 2.5f) * sc;
+            wdl->AddLine(ImVec2(cc.x + ox - ca * 0.5f, cc.y - ca),
+                         ImVec2(cc.x + ox + ca * 0.5f, cc.y), cCol, 1.6f * sc);
+            wdl->AddLine(ImVec2(cc.x + ox + ca * 0.5f, cc.y),
+                         ImVec2(cc.x + ox - ca * 0.5f, cc.y + ca), cCol, 1.6f * sc);
+        }
+        if (cHover) ImGui::SetTooltip(s_cpCollapsed ? "Expand" : "Collapse");
+        if (cClicked) {
+            s_cpCollapsed = !s_cpCollapsed;
+            st.settings.copilotCollapsed = s_cpCollapsed;
+            saveSettings(st.settings);
+        }
+        ImGui::SetCursorScreenPos(savedCur);
+    }
+
+    // ---- Row 1: [Tasks] .. centered Chudware .. [Artifacts]  (clears leftInset) ----
     {
         const float logoGap = 3.0f * sc;
         const float cubeSz = std::min(lh, wordLh) * 0.95f;
@@ -7095,36 +7131,10 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         ImGui::SetCursorPosY(rowTop1 + wordLh);
     }
 
+    // ---- Row 2: Chat | Sessions | Settings (equal gaps; left edge = leftInset) ----
     const float rowH   = std::max(lh, ImGui::GetFrameHeight());
     const float rowTop = ImGui::GetCursorPosY();
     auto centerY = [&](float h) { ImGui::SetCursorPosY(rowTop + (rowH - h) * 0.5f); };
-
-    {
-        const float cb = lh;
-        centerY(cb);
-        const ImVec2 c0 = ImGui::GetCursorScreenPos();
-        const bool clk = ImGui::InvisibleButton("##cp_collapse", ImVec2(cb, cb));
-        const bool hov = ImGui::IsItemHovered();
-        ImDrawList* wdl = ImGui::GetWindowDrawList();
-        ui::glassRowBackground(wdl, c0, ImVec2(c0.x + cb, c0.y + cb), 6.0f, false, false,
-                               hov ? 0.42f : 0.20f);
-        const ImU32 cc = ImGui::ColorConvertFloat4ToU32(hov ? chatSurf().textPrimary
-                                                             : chatSurf().textSecondary);
-        const ImVec2 m(c0.x + cb * 0.5f, c0.y + cb * 0.5f);
-        const float a = 3.0f * sc;
-        for (int i = 0; i < 2; ++i) {
-            const float ox = (i == 0 ? -2.2f : 2.2f) * sc;
-            wdl->AddLine(ImVec2(m.x + ox - a * 0.5f, m.y - a), ImVec2(m.x + ox + a * 0.5f, m.y), cc, ui::metrics::stroke(1.6f));
-            wdl->AddLine(ImVec2(m.x + ox + a * 0.5f, m.y), ImVec2(m.x + ox - a * 0.5f, m.y + a), cc, ui::metrics::stroke(1.6f));
-        }
-        if (hov) ImGui::SetTooltip(s_cpCollapsed ? "Expand" : "Collapse");
-        if (clk) {
-            s_cpCollapsed = !s_cpCollapsed;
-            st.settings.copilotCollapsed = s_cpCollapsed;
-            saveSettings(st.settings);
-        }
-        ImGui::SameLine(0, collapseGap);
-    }
 
     const float usableL = leftInset;
     const float usableR = colW - rightInset;

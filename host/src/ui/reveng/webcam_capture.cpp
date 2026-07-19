@@ -481,14 +481,16 @@ void drawWebcamCapture(AppState& st,
         }
     }
 
-    // ---- layout: preview left, coverage ring right ----
+    // ---- layout: two top-anchored columns — preview + controls left, coverage ring right ----
+    // (Previously the ring child was SameLine'd after the bottom stats text, which anchored it
+    // to the last line instead of beside the preview and pushed it past the window edge.)
     const float avW  = ImGui::GetContentRegionAvail().x;
-    const float avH  = ImGui::GetContentRegionAvail().y;
     const float prevW = std::min(avW * 0.55f, 360.0f * sc);
     const float prevH = prevW * (float)ws.texH / (float)std::max(ws.texW, 1);
-    const float ringDiam = std::min(avW - prevW - 24.0f * sc, avH - 80.0f * sc);
+    const float ringDiam = std::max(0.0f, avW - prevW - 40.0f * sc);
     const float ringR    = (ringDiam * 0.5f) * 0.85f;
 
+    ImGui::BeginChild("##wcam_left", ImVec2(prevW, 0), ImGuiChildFlags_AutoResizeY);
     // Preview image
     if (ws.texId) {
         ImGui::Image((ImTextureID)(uintptr_t)ws.texId, ImVec2(prevW, prevH));
@@ -525,21 +527,19 @@ void drawWebcamCapture(AppState& st,
     if (session_id.empty()) {
         ImGui::TextDisabled("(no active session — shutter disabled)");
     }
+    ImGui::EndChild();
 
-    // ---- coverage ring (right of preview) ----
+    // ---- coverage ring (right column, centered) ----
     if (ringR > 20.0f) {
-        ImGui::SameLine(prevW + 16.0f * sc);
-        // Push an invisible child to anchor the draw-list correctly
-        ImGui::BeginChild("##coverage_ring",
-                          ImVec2(ringDiam + 20.0f * sc, avH),
-                          ImGuiChildFlags_None);
+        ImGui::SameLine(0.0f, 16.0f * sc);
+        ImGui::BeginChild("##coverage_ring", ImVec2(0, 0), ImGuiChildFlags_AutoResizeY);
+        ImGui::TextUnformatted("Coverage");
         ImDrawList* dl = ImGui::GetWindowDrawList();
-        const ImVec2 wp = ImGui::GetWindowPos();
-        const ImVec2 ws2sz = ImGui::GetWindowSize();
-        const ImVec2 centre(wp.x + ws2sz.x * 0.5f, wp.y + ringR + 10.0f * sc);
+        const float colW = ImGui::GetContentRegionAvail().x;
+        const ImVec2 cp = ImGui::GetCursorScreenPos();
+        const ImVec2 centre(cp.x + colW * 0.5f, cp.y + ringR + 4.0f * sc);
         drawCoverageRing(dl, centre, ringR, ws.captured, ws.blurred);
-
-        ImGui::Dummy(ImVec2(0, ringDiam + 40.0f * sc));  // reserve vertical space
+        ImGui::Dummy(ImVec2(colW, ringR * 2.0f + 30.0f * sc));  // reserve space incl. legend
         ImGui::EndChild();
     }
 }

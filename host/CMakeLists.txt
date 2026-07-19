@@ -225,6 +225,7 @@ set(BILLET_CORE_SOURCES
   src/ui/reveng/img_tex.cpp          # RE-08 JPEG/PNG->GL texture (shared by RE-19 gallery)
   src/ui/reveng/image_gallery.cpp    # RE-19 thumbnail grid + drag-drop gallery
   src/ui/reveng/sources_panel.cpp    # RE-30 source-mode entry panel (Scan/Datasheet/Web/Library)
+  src/ui/reveng/stage_panels.cpp     # Scale / Model / Deliver stage panels
   # --- end [parts-plm sources] ---
   # --- FsBackend + browser fetch/pick (native + web) ---
   src/core/fs_backend.cpp

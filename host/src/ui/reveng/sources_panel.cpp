@@ -389,6 +389,20 @@ static void drawScanEntry(AppState& st) {
             }
         }
         ImGui::SameLine();
+        // Video ingest — reveng_add_video extracts + blur-culls frames server-side and
+        // returns a run_id (long job; frames land in the session when it completes).
+        if (ImGui::Button("Add video\xe2\x80\xa6") && !sid.empty()) {
+            std::string path = ui::openFileDialog(
+                "Video (*.mp4 *.mov *.avi *.mkv *.webm)\0*.mp4;*.mov;*.avi;*.mkv;*.webm\0"
+                "All files (*.*)\0*.*\0");
+            if (!path.empty()) {
+                nlohmann::json args;
+                args["session_id"] = sid;
+                args["path"] = path;
+                st.rpc.call("reveng_add_video", args, [](const core::RpcResult&){});
+            }
+        }
+        ImGui::SameLine();
         ImGui::TextDisabled("or drag images onto the gallery below");
         ImGui::Spacing();
 
@@ -460,15 +474,9 @@ static void drawDatasheetEntry(AppState& st) {
     }
     ImGui::EndChild();
 
-    // Visible browse affordance alongside drag-drop.
-    if (ImGui::Button("Browse\xe2\x80\xa6##ds")) {
-        std::string path = ui::openFileDialog(
-            "Spec sheet (*.pdf *.png *.jpg *.jpeg)\0*.pdf;*.png;*.jpg;*.jpeg\0"
-            "All files (*.*)\0*.*\0");
-        if (!path.empty()) kickDatasheetIngest(st, path);
-    }
-
-    // Payload accept (ImGui internal DnD).
+    // Payload accept (ImGui internal DnD) — must immediately follow the drop-zone child
+    // so the target region IS the drop-zone (previously sat after the Browse button, so
+    // drops only registered on the button).
     if (ImGui::BeginDragDropTarget()) {
         if (const ImGuiPayload* pl =
                 ImGui::AcceptDragDropPayload("FILES", ImGuiDragDropFlags_None)) {
@@ -480,6 +488,14 @@ static void drawDatasheetEntry(AppState& st) {
             }
         }
         ImGui::EndDragDropTarget();
+    }
+
+    // Visible browse affordance alongside drag-drop.
+    if (ImGui::Button("Browse\xe2\x80\xa6##ds")) {
+        std::string path = ui::openFileDialog(
+            "Spec sheet (*.pdf *.png *.jpg *.jpeg)\0*.pdf;*.png;*.jpg;*.jpeg\0"
+            "All files (*.*)\0*.*\0");
+        if (!path.empty()) kickDatasheetIngest(st, path);
     }
 
     ImGui::Spacing();

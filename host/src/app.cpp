@@ -1660,6 +1660,13 @@ WASM_BOOT_LOG("[wasm-boot] loadIcons done\n");
             std::string cc(cmd_id);
             if (cc.rfind("cam_", 0) == 0) { ui::camHandleCommand(st, cc); return; }
         }
+        // Reverse Engineering workspace: reveng_* commands route to the RE workspace controller
+        // (stage navigation + async kicks; contracts/reveng.md).
+        {
+            std::string rc(cmd_id);
+            if (rc.rfind("reveng_", 0) == 0 && ui::reveng::handleRevEngCommand(st, rc.c_str()))
+                return;
+        }
         if (propertyManager.openForCommand(st, cmd_id)) return;  // form opened
         // C19: Simulation tab -> sim panel; Evaluate tab -> evaluate dialogs.
         std::string cmd(cmd_id);
@@ -2320,63 +2327,76 @@ WASM_BOOT_LOG("[wasm-boot] loadIcons done\n");
     if (shot && shotMode && std::strcmp(shotMode, "reveng") == 0) {
         st.showRibbon = true; st.activeWorkspace = AppState::Workspace::ReverseEng;
     }
+    // Shared canned-session seeder for the reveng_* stage scenarios. Seeds one rail entry,
+    // selects it, and pins the async-list throttle far-future so the live list RPC can't
+    // wipe the canned state mid-shot. gallerySession is pre-marked so the first-frame
+    // session-change reset doesn't clear the seeded stage state.
+    auto seedRevengCanned = [](const char* sid, const char* name, const char* status, int images) {
+        ui::reveng::RevEngState& rs = ui::reveng::S();
+        ui::reveng::SessionSummary ss;
+        ss.session_id = sid;
+        ss.name       = name;
+        ss.status     = status;
+        ss.images     = images;
+        rs.sessions.push_back(ss);
+        rs.selected       = 0;
+        rs.listedOnce     = true;
+        rs.lastListT      = 1e9;  // block live list reload for the whole shot
+        rs.gallerySession = 0;    // skip the session-change state reset
+    };
     // AI_CAD_SHOT=reveng_review: open the RE workspace on the Review stage with a canned
     // confirm_dimensions payload + deviation result — headless visual verification of RE-22.
     if (shot && shotMode && std::strcmp(shotMode, "reveng_review") == 0) {
         st.showRibbon = true; st.activeWorkspace = AppState::Workspace::ReverseEng;
         ui::reveng::seedCannedDimPayload();
-        // Force the Review stage so the center panel shows dim-review + deviation.
+        // Session id matches seedCannedDimPayload's ("re_canned00") so loadDims keeps the
+        // canned rows instead of re-firing list_reveng_dims.
+        seedRevengCanned("re_canned00", "Gear motor (canned)", "review", 11);
         ui::reveng::S().stage = ui::reveng::Stage::Review;
     }
     // AI_CAD_SHOT=reveng_capture: open RE workspace on the Source stage (RE-19 capture suite
-    // + webcam widget + image gallery) for headless visual verification of RE-19 panels.
+    // + webcam widget + image gallery) with a canned selected session so the panels draw.
     if (shot && shotMode && std::strcmp(shotMode, "reveng_capture") == 0) {
         st.showRibbon = true; st.activeWorkspace = AppState::Workspace::ReverseEng;
+        seedRevengCanned("re_canned_cap", "Bracket scan (canned)", "capturing", 3);
         ui::reveng::S().stage = ui::reveng::Stage::Source;
     }
-    // AI_CAD_SHOT=reveng_recon: open RE workspace on the Reconstruct stage with the canned
-    // sparse fixture + recon.done seeded; shows sub-stage stepper + splat indicator (RE-21/RE-27).
+    // AI_CAD_SHOT=reveng_scale: Scale stage with a canned session.
+    if (shot && shotMode && std::strcmp(shotMode, "reveng_scale") == 0) {
+        st.showRibbon = true; st.activeWorkspace = AppState::Workspace::ReverseEng;
+        seedRevengCanned("re_canned_cap", "Bracket scan (canned)", "capturing", 12);
+        ui::reveng::S().stage = ui::reveng::Stage::Scale;
+    }
+    // AI_CAD_SHOT=reveng_recon: open the RE workspace on the Reconstruct stage with a canned
+    // session + mid-run progress state — headless visual verification of RE-21.
     if (shot && shotMode && std::strcmp(shotMode, "reveng_recon") == 0) {
         st.showRibbon = true; st.activeWorkspace = AppState::Workspace::ReverseEng;
-        {
-            ui::reveng::RevEngState& rs = ui::reveng::S();
-            rs.stage      = ui::reveng::Stage::Reconstruct;
-            rs.recon.done = true;
-            rs.recon.pct  = 100;
-        }
-        ui::reveng::seedSplatFixture();
-    }
-    // AI_CAD_SHOT=parts: open the Parts Library workspace with a synthetic no-model
-    // result row so the "Generate 3D model" action (RE-32) is visible in the shot.
-    if (shot && shotMode && std::strcmp(shotMode, "parts") == 0) {
-        st.showRibbon = true; st.activeWorkspace = AppState::Workspace::PartsLibrary;
-        st.wantPartsShot = true;
-    }
-    // AI_CAD_SHOT=reveng_capture: RE-19 capture suite — webcam widget + coverage ring +
-    // image gallery rendered with stub camera (no device required).
-    if (shot && shotMode && std::strcmp(shotMode, "reveng_capture") == 0) {
-        st.showRibbon = true; st.activeWorkspace = AppState::Workspace::ReverseEng;
-    }
-    // AI_CAD_SHOT=reveng_recon: open the RE workspace on the Reconstruct stage with canned
-    // sparse fixture + progress state — headless visual verification of RE-21.
-    if (shot && shotMode && std::strcmp(shotMode, "reveng_recon") == 0) {
-        st.showRibbon = true; st.activeWorkspace = AppState::Workspace::ReverseEng;
+        seedRevengCanned("re_canned_recon", "Bracket scan (canned)", "reconstructing", 12);
         ui::reveng::S().stage = ui::reveng::Stage::Reconstruct;
-        // Seed canned session so the rail + center show a real-looking entry.
-        ui::reveng::SessionSummary ss;
-        ss.session_id = "re_canned_recon";
-        ss.name       = "Bracket scan (canned)";
-        ss.status     = "reconstructing";
-        ss.images     = 12;
-        ui::reveng::S().sessions.push_back(ss);
-        ui::reveng::S().selected = 0;
-        ui::reveng::S().listedOnce = true;
         // Seed reconstruct progress at 45% (mid-dense phase).
         ui::reveng::RevEngEvent ev;
         ev.kind = "reconstruct_progress";
         ev.pct  = 45;
         ev.msg  = "dense";
         ui::reveng::feedRevEngEvent(ev);
+    }
+    // AI_CAD_SHOT=reveng_model: Model stage with a canned session.
+    if (shot && shotMode && std::strcmp(shotMode, "reveng_model") == 0) {
+        st.showRibbon = true; st.activeWorkspace = AppState::Workspace::ReverseEng;
+        seedRevengCanned("re_canned_model", "Bracket scan (canned)", "modeling", 12);
+        ui::reveng::S().stage = ui::reveng::Stage::Model;
+    }
+    // AI_CAD_SHOT=reveng_deliver: Deliver stage with a canned session.
+    if (shot && shotMode && std::strcmp(shotMode, "reveng_deliver") == 0) {
+        st.showRibbon = true; st.activeWorkspace = AppState::Workspace::ReverseEng;
+        seedRevengCanned("re_canned_done", "Bracket scan (canned)", "done", 12);
+        ui::reveng::S().stage = ui::reveng::Stage::Deliver;
+    }
+    // AI_CAD_SHOT=parts: open the Parts Library workspace with a synthetic no-model
+    // result row so the "Generate 3D model" action (RE-32) is visible in the shot.
+    if (shot && shotMode && std::strcmp(shotMode, "parts") == 0) {
+        st.showRibbon = true; st.activeWorkspace = AppState::Workspace::PartsLibrary;
+        st.wantPartsShot = true;
     }
     // AI_CAD_SHOT=git: open the PLM hub on the new Git page for headless verification.
     if (shot && shotMode && std::strcmp(shotMode, "git") == 0) {

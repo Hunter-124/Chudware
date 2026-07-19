@@ -131,6 +131,8 @@ void drawImageGallery(AppState& st,
 
         // Thumbnail or placeholder
         ImGui::BeginGroup();
+        const ImVec2 cellOrigin = ImGui::GetCursorScreenPos();  // badge anchors to the cell,
+                                                                // not the (padded) image
         if (img.texId) {
             // Preserve aspect ratio
             const float aspect = (img.thumbH > 0)
@@ -156,12 +158,11 @@ void drawImageGallery(AppState& st,
         // Quality badge (top-right corner of the cell)
         {
             ImDrawList* dl = ImGui::GetWindowDrawList();
-            const ImVec2 cellPos = ImGui::GetItemRectMin();
             const char*  lbl     = badgeLabel(img.quality);
             const ImVec2 lsz     = ImGui::CalcTextSize(lbl);
             const float  bW      = lsz.x + 6.0f * sc;
             const float  bH      = lsz.y + 2.0f * sc;
-            const ImVec2 br(cellPos.x + tsz, cellPos.y);
+            const ImVec2 br(cellOrigin.x + tsz, cellOrigin.y);
             const ImVec2 bl(br.x - bW, br.y);
             dl->AddRectFilled(bl, ImVec2(br.x, br.y + bH),
                               badgeColor(img.quality), 3.0f);

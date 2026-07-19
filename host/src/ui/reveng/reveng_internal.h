@@ -13,6 +13,8 @@
 #include "render/re_points.h"       // RE-21: sparse point-cloud + frusta overlay
 #include "render/splat_renderer.h"  // RE-28: 3DGS splat renderer (wired RE-27)
 
+struct AppState;
+
 namespace ui {
 namespace reveng {
 
@@ -59,6 +61,85 @@ struct ReconstructState {
     std::string phase;          // e.g. "sparse", "dense", "mesh"
     std::string err;            // sticky error; empty when healthy
     bool     done     = false;
+
+    // GUI kick bookkeeping (reveng_reconstruct launched from the stage panel or ribbon).
+    int         quality    = 1;   // 0=draft, 1=normal, 2=high
+    bool        kickPending = false;
+    std::string kickErr;          // sticky; empty when healthy
+    std::string runId;            // run_id returned by the kick (for status display)
+};
+
+// Scale stage (contracts/reveng.md §2 session.scale + reveng_set_scale §8.2).
+struct ScaleState {
+    int    method = 0;          // 0=aruco_mat, 1=two_point, 2=known_dim
+    // aruco_mat
+    int    board = 0;           // 0=A4, 1=Letter
+    // two_point
+    int    imageIdx = 0;        // index into RevEngState::galleryImages
+    float  p1[2] = {0.0f, 0.0f};
+    float  p2[2] = {100.0f, 0.0f};
+    double distMm = 50.0;
+    // known_dim
+    char   featureBuf[128] = {};
+    double knownValueMm = 10.0;
+    int    knownSource = 0;     // 0=caliper, 1=datasheet, 2=photo_fiducial, 3=guessed
+    // async submit
+    bool        pending = false;
+    std::string err;            // sticky; empty when healthy
+    std::string okMsg;
+    // Mirror of session.scale from get_reveng_session (refreshed by the detail poll).
+    bool        mirrored = false;
+    std::string curMethod;
+    double      mmPerUnit   = 0.0;
+    double      residualPct = 0.0;
+    bool        confirmed   = false;
+};
+
+// Model stage — one parsed row of aicad.reveng_fits/1 §3.
+struct FitEntry {
+    std::string kind;           // "cylinder" | "box" | ...
+    double      confidence = 0.0;
+    std::string source;         // "ransac" | ...
+    std::string paramsSummary;  // preformatted "r=4.0 h=12.0" for the table
+};
+
+// Model stage (reveng_fit_primitives / reveng_build_parametric / describe_reveng_result).
+struct ModelState {
+    std::vector<FitEntry> fits;
+    bool        fitPending = false;
+    bool        fitsLoaded = false;
+    std::string fitErr;
+
+    int         strategy = 0;   // 0=auto, 1=mesh_fallback, 2=override_approximate
+    bool        buildPending = false;
+    std::string buildErr;
+    std::string buildRunId;
+
+    bool        descPending = false;
+    bool        descLoaded  = false;
+    std::string descErr;
+    std::string descDocId;
+    double      descMatchPct = 0.0;
+    std::string descStrategy;
+    bool        descMeshFallback = false;
+};
+
+// Deliver stage (reveng_attach_result / export_reveng_bundle / reveng_print_scale_mat).
+struct DeliverState {
+    char        partRefBuf[256] = {};
+    bool        attachPending = false;
+    std::string attachErr;
+    std::string attachOk;
+
+    char        exportDestBuf[512] = {};
+    bool        exportPending = false;
+    std::string exportErr;
+    std::string exportOk;
+
+    int         matSize = 0;    // 0=A4, 1=Letter
+    bool        matPending = false;
+    std::string matErr;
+    std::string matPath;
 };
 
 // File-static store for the whole workspace. Async-load bookkeeping mirrors the parts /
@@ -74,6 +155,7 @@ struct RevEngState {
     // New-session creation (rail affordance — RE UI polish).
     char        newNameBuf[128] = {};
     bool        newSessionPending = false;
+    bool        focusNewName  = false;  // one-shot: rail focuses the name box (reveng_new)
     std::string newSessionErr;      // sticky; empty when healthy
 
     // Async list bookkeeping.
@@ -115,6 +197,11 @@ struct RevEngState {
     // RE-21: Reconstruct stage.
     ReconstructState recon;
 
+    // Per-stage panel state (reset when the selected session changes).
+    ScaleState   scale;
+    ModelState   model;
+    DeliverState deliver;
+
     // RE-21: GL overlay — point cloud + camera frusta. Owned here so it persists across frames.
     render::RePoints rePoints;
 
@@ -147,6 +234,25 @@ void feedRevEngEvent(const RevEngEvent& ev);
 // RE-27: Seed the splat renderer with the canned fixture (for shot modes that need it without
 // waiting for a real reconstruction job). CPU-only; GL resources are lazily built on first draw.
 void seedSplatFixture();
+
+// Ribbon command routing (app.cpp dispatchCmd → reveng_* ids). Switches to the ReverseEng
+// workspace, lands on the relevant stage and kicks the matching async action. Returns true
+// when the command was consumed (always, for known reveng_* ids; false for unknown ones).
+bool handleRevEngCommand(AppState& st, const char* cmd);
+
+// Kick an async reveng_reconstruct for the selected session (shared by the ribbon command
+// and the Reconstruct stage's Run button). No-op (with a toast) when nothing is selected.
+void kickReconstruct(AppState& st);
+
+// Kick an async reveng_fit_primitives / reveng_build_parametric for the selected session
+// (shared by the ribbon commands and the Model stage buttons). strategyIdx mirrors
+// ModelState::strategy (0=auto, 1=mesh_fallback, 2=override_approximate).
+void kickFitPrimitives(AppState& st);
+void kickBuildParametric(AppState& st, int strategyIdx);
+
+// Kick reveng_print_scale_mat (ribbon + Scale/Deliver panels). sizeIdx: 0=A4, 1=Letter.
+// On success writes the path into DeliverState::matPath and toasts it.
+void kickPrintScaleMat(AppState& st);
 
 }  // namespace reveng
 }  // namespace ui

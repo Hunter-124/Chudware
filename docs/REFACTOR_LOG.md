@@ -1870,3 +1870,26 @@ null-safe helpers. Staged via `./build.sh daemon|stage|wasm` + `install_webd.sh 
 **Gotchas:** engine-behavior needs OCCT daemon rebuild+stage (not just host in-proc);
 browser WS can't send X-Dev-User so local gateway DEV repro of live RPC payloads is
 limited; feature_surface_audit still fails pre-existing Sketch3D/RevEng handler gaps.
+
+### RE workspace stage panels (Scale/Model/Deliver) + visual fixes — 2026-07-19
+Filled the remaining Reverse Eng center-column stages and ribbon routing.
+**New:** `host/src/ui/reveng/stage_panels.{h,cpp}` — `drawScalePanel` (aruco_mat /
+two_point / known_dim → `reveng_set_scale` + session.scale mirror + print-mat
+affordance), `drawModelPanel` (`reveng_fit_primitives` table, strategy combo +
+`reveng_build_parametric`, `describe_reveng_result` summary), `drawDeliverPanel`
+(attach / export bundle / print scale mat). Shared async kicks
+`kickFitPrimitives` / `kickBuildParametric` / `kickPrintScaleMat` (toast on mat).
+**Workspace:** `handleRevEngCommand` + `kickReconstruct` (quality draft/normal/high
++ Run button; honest "queued — badges refresh" progress without event drain);
+`loadSessionDetail` mirrors `session.scale`; session-change reset clears
+scale/model/deliver; properties pane shows confirmed/unconfirmed scale;
+`focusNewName` for `reveng_new`. **Visual:** centered-text clamp (no negative
+SetCursorPosX clip), mode-selector wrap, webcam two-column layout, datasheet DnD
+target on drop-zone, gallery badge at cell origin. **Shots:** shared
+`seedRevengCanned` + `lastListT`/`lastDevT`/`gallerySession` pins so live list/dev
+RPCs can't wipe canned state; scenarios `reveng_scale`/`model`/`deliver` added.
+**app.cpp** routes `reveng_*` before PM fallthrough. **Verify:** host build green;
+7 seeded shots (`reveng`, `_capture`, `_scale`, `_recon`, `_model`, `_deliver`,
+`_review`) each wrote PNG with 0 imgui-error/assert hits. **Deferred:**
+`feedRevEngEvent` still has no real orch event-journal drain — reconstruct % stays
+at kick seed until that wires; live stage-badge → sub-stepper mapping is poll-only.

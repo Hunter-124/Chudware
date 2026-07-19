@@ -14,6 +14,7 @@
 // call fails gracefully and the rail shows an honest empty/unavailable state.
 #include "reveng_workspace.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -31,6 +32,7 @@
 #include "webcam_capture.h"
 #include "image_gallery.h"
 #include "sources_panel.h"  // RE-30: drawSourcesPanel
+#include "stage_panels.h"   // Scale / Model / Deliver stage panels
 
 namespace ui {
 namespace reveng {
@@ -184,6 +186,17 @@ static void loadSessionDetail(AppState& st, bool force = false) {
         st2.artifactSparseDir.clear();
         if (!r.result.contains("session") || !r.result["session"].is_object()) return;
         const auto& sess = r.result["session"];
+        // Mirror session.scale (contracts/reveng.md §2) so the Scale stage + properties
+        // pane can show the current method / mm-per-unit / residual / confirmed gate.
+        if (sess.contains("scale") && sess["scale"].is_object()) {
+            const auto& sj = sess["scale"];
+            ScaleState& sc = st2.scale;
+            sc.mirrored    = true;
+            sc.curMethod   = sj.value("method", std::string());
+            sc.mmPerUnit   = sj.value("mm_per_unit", 0.0);
+            sc.residualPct = sj.value("residual_pct", 0.0);
+            sc.confirmed   = sj.value("confirmed", false);
+        }
         if (sess.contains("artifacts") && sess["artifacts"].is_object()) {
             const auto& art = sess["artifacts"];
             auto take = [&](const char* key) -> std::string {
@@ -257,6 +270,81 @@ static void ensureSplatForSession(RevEngState& s) {
 }
 
 
+// Kick an async reveng_reconstruct for the selected session (ribbon + Run button share this).
+void kickReconstruct(AppState& st) {
+    RevEngState& s = S();
+    if (s.selected < 0 || s.selected >= (int)s.sessions.size()) {
+        st.toast(ui::ToastLevel::Info, "Reverse Eng: select a session first");
+        return;
+    }
+    if (s.recon.kickPending) return;
+    static const char* kQuality[] = { "draft", "normal", "high" };
+    s.recon.kickPending = true;
+    s.recon.kickErr.clear();
+    nlohmann::json args = nlohmann::json::object();
+    args["session_id"] = s.sessions[s.selected].session_id;
+    args["quality"]    = kQuality[std::clamp(s.recon.quality, 0, 2)];
+    st.rpc.call("reveng_reconstruct", args, [](const core::RpcResult& r) {
+        RevEngState& s2 = S();
+        s2.recon.kickPending = false;
+        if (!r.ok) {
+            s2.recon.kickErr = r.err.empty() ? "reveng_reconstruct failed" : r.err;
+            return;
+        }
+        if (r.result.is_object() && !r.result.value("ok", true)) {
+            s2.recon.kickErr = r.result.value("reason", std::string("reveng_reconstruct failed"));
+            const std::string hint = r.result.value("hint", std::string());
+            if (!hint.empty()) s2.recon.kickErr += " — " + hint;
+            return;
+        }
+        s2.recon.kickErr.clear();
+        s2.recon.runId  = r.result.value("run_id", std::string());
+        s2.recon.active = true;
+        s2.recon.done   = false;
+        s2.recon.pct    = 2;
+        s2.recon.phase  = "queued — session badges refresh as the run progresses";
+        s2.recon.err.clear();
+    });
+}
+
+// Ribbon command routing — app.cpp dispatchCmd forwards every reveng_* id here. Each command
+// switches to the ReverseEng workspace and lands on (or kicks) the matching stage.
+bool handleRevEngCommand(AppState& st, const char* cmd) {
+    if (!cmd) return false;
+    const std::string c(cmd);
+    if (c.rfind("reveng_", 0) != 0) return false;
+
+    RevEngState& s = S();
+    auto toStage = [&](Stage stg) {
+        st.activeWorkspace = AppState::Workspace::ReverseEng;
+        s.stage = stg;
+    };
+
+    if (c == "reveng_new")          { toStage(Stage::Source); s.focusNewName = true; return true; }
+    if (c == "reveng_open")         { st.activeWorkspace = AppState::Workspace::ReverseEng;
+                                      loadSessions(st, /*force=*/true); return true; }
+    if (c == "reveng_from_library") { st.activeWorkspace = AppState::Workspace::PartsLibrary;
+                                      return true; }
+    if (c == "reveng_add_photos" || c == "reveng_add_video" || c == "reveng_webcam") {
+        toStage(Stage::Source); s.sourceMode = SourceMode::Scan; return true;
+    }
+    if (c == "reveng_datasheet")    { toStage(Stage::Source); s.sourceMode = SourceMode::Datasheet;
+                                      return true; }
+    if (c == "reveng_scale_aruco")  { toStage(Stage::Scale); s.scale.method = 0; return true; }
+    if (c == "reveng_scale_points") { toStage(Stage::Scale); s.scale.method = 1; return true; }
+    if (c == "reveng_scale_known")  { toStage(Stage::Scale); s.scale.method = 2; return true; }
+    if (c == "reveng_reconstruct")  { toStage(Stage::Reconstruct); kickReconstruct(st); return true; }
+    if (c == "reveng_splat_view")   { toStage(Stage::Reconstruct); return true; }
+    if (c == "reveng_fit")          { toStage(Stage::Model); kickFitPrimitives(st); return true; }
+    if (c == "reveng_ai_model")     { toStage(Stage::Model); kickBuildParametric(st, 0); return true; }
+    if (c == "reveng_mesh_body")    { toStage(Stage::Model); s.model.strategy = 1;
+                                      kickBuildParametric(st, 1); return true; }
+    if (c == "reveng_export")       { toStage(Stage::Deliver); return true; }
+    if (c == "reveng_to_parts")     { toStage(Stage::Deliver); return true; }
+    if (c == "reveng_print_mat")    { toStage(Stage::Deliver); kickPrintScaleMat(st); return true; }
+    return false;
+}
+
 // ---- adaptive stepper helpers --------------------------------------------------
 
 // Returns the ordered list of stages for the current source mode.
@@ -291,6 +379,35 @@ static void clampStageToPipeline(RevEngState& s) {
 }
 
 // ---- small drawing helpers -----------------------------------------------------
+
+// Draw one line of text horizontally centered in availW. When the line is wider than the
+// panel, clamp to the left margin and wrap instead of letting SetCursorPosX go negative
+// (which clipped leading characters and extended past the parent window edge — the
+// "imgui errors" seen on this page).
+static void drawCenteredLine(float availW, const char* begin, const char* end = nullptr) {
+    const float sc = ui::uiScale;
+    const ImVec2 ts = ImGui::CalcTextSize(begin, end);
+    if (ts.x <= availW - 4.0f * sc) {
+        ImGui::SetCursorPosX((availW - ts.x) * 0.5f);
+        ImGui::TextUnformatted(begin, end);
+    } else {
+        ImGui::SetCursorPosX(4.0f * sc);
+        ImGui::PushTextWrapPos(availW - 4.0f * sc);
+        ImGui::TextUnformatted(begin, end);
+        ImGui::PopTextWrapPos();
+    }
+}
+
+static void drawCenteredBlock(float availW, const char* text) {
+    const char* p = text;
+    while (p && *p) {
+        const char* nl = std::strchr(p, '\n');
+        const char* end = nl ? nl : p + std::strlen(p);
+        drawCenteredLine(availW, p, end);
+        if (!nl) break;
+        p = nl + 1;
+    }
+}
 
 static const char* stageBlurb(Stage stg) {
     switch (stg) {
@@ -347,12 +464,9 @@ static void drawReconstructStage(AppState& st) {
 
     // Title.
     {
-        const char* title = "Reconstruct";
         ImGui::PushStyleColor(ImGuiCol_Text,
             ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 1.0f));
-        const ImVec2 ts = ImGui::CalcTextSize(title);
-        ImGui::SetCursorPosX((avail.x - ts.x) * 0.5f);
-        ImGui::TextUnformatted(title);
+        drawCenteredLine(avail.x, "Reconstruct");
         ImGui::PopStyleColor();
     }
     ImGui::Dummy(ImVec2(0, 10 * sc));
@@ -412,9 +526,7 @@ static void drawReconstructStage(AppState& st) {
         ImGui::Dummy(ImVec2(0, 6 * sc));
         if (!s.recon.phase.empty()) {
             ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-            const ImVec2 ps = ImGui::CalcTextSize(s.recon.phase.c_str());
-            ImGui::SetCursorPosX((avail.x - ps.x) * 0.5f);
-            ImGui::TextUnformatted(s.recon.phase.c_str());
+            drawCenteredLine(avail.x, s.recon.phase.c_str());
             ImGui::PopStyleColor();
         }
     }
@@ -437,29 +549,20 @@ static void drawReconstructStage(AppState& st) {
                       "3DGS splat preview: %zu gaussians%s",
                       s.splat.count(),
                       isFixture ? " (demo fixture)" : " (session)");
-        const ImVec2 si = ImGui::CalcTextSize(splatInfo);
-        ImGui::SetCursorPosX((avail.x - si.x) * 0.5f);
-        ImGui::TextUnformatted(splatInfo);
+        drawCenteredLine(avail.x, splatInfo);
         ImGui::PopStyleColor();
         if (!isFixture && !s.splatPathTried.empty()) {
             ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-            const ImVec2 ps = ImGui::CalcTextSize(s.splatPathTried.c_str());
-            ImGui::SetCursorPosX((avail.x - ps.x) * 0.5f);
-            ImGui::TextUnformatted(s.splatPathTried.c_str());
+            drawCenteredLine(avail.x, s.splatPathTried.c_str());
             ImGui::PopStyleColor();
         }
     } else if (!s.artifactMeshPath.empty()) {
         ImGui::Dummy(ImVec2(0, 6 * sc));
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 0.85f, 0.55f, 1.0f));
-        const char* meshLbl = "Session mesh ready";
-        const ImVec2 mi = ImGui::CalcTextSize(meshLbl);
-        ImGui::SetCursorPosX((avail.x - mi.x) * 0.5f);
-        ImGui::TextUnformatted(meshLbl);
+        drawCenteredLine(avail.x, "Session mesh ready");
         ImGui::PopStyleColor();
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-        const ImVec2 ps = ImGui::CalcTextSize(s.artifactMeshPath.c_str());
-        ImGui::SetCursorPosX((avail.x - ps.x) * 0.5f);
-        ImGui::TextUnformatted(s.artifactMeshPath.c_str());
+        drawCenteredLine(avail.x, s.artifactMeshPath.c_str());
         ImGui::PopStyleColor();
     }
 
@@ -468,21 +571,52 @@ static void drawReconstructStage(AppState& st) {
     if (!reconRunning && !reconDone && s.recon.err.empty()) {
         ImGui::Dummy(ImVec2(0, 8 * sc));
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-        const char* hint =
+        drawCenteredBlock(avail.x,
             "Point cloud and camera frusta render in the viewport.\n"
-            "Run Reconstruct from the ribbon to start sparse \xe2\x86\x92 dense \xe2\x86\x92 mesh.\n"
-            "3DGS splat preview available once reconstruction completes.";
-        const char* p = hint;
-        while (p && *p) {
-            const char* nl = std::strchr(p, '\n');
-            const char* end = nl ? nl : p + std::strlen(p);
-            const ImVec2 ls = ImGui::CalcTextSize(p, end);
-            ImGui::SetCursorPosX((avail.x - ls.x) * 0.5f);
-            ImGui::TextUnformatted(p, end);
-            if (!nl) break;
-            p = nl + 1;
-        }
+            "3DGS splat preview available once reconstruction completes.");
         ImGui::PopStyleColor();
+    }
+
+    // ---- Run controls ----------------------------------------------------------
+    // Quality selector + Run button. The ribbon "Reconstruct" command routes here too
+    // (handleRevEngCommand). Progress arrives via the session-detail poll (stage badges)
+    // and, when the event drain feeds it, feedRevEngEvent.
+    if (!reconDone) {
+        ImGui::Dummy(ImVec2(0, 10 * sc));
+        static const char* kQuality[] = { "draft", "normal", "high" };
+        const float qW = 120.0f * sc;
+        const float runW = 180.0f * sc;
+        const float rowW = qW + 8.0f * sc + runW;
+        ImGui::SetCursorPosX(std::max(4.0f * sc, (avail.x - rowW) * 0.5f));
+        ImGui::SetNextItemWidth(qW);
+        ImGui::Combo("##recon_quality", &s.recon.quality, "draft\0normal\0high\0");
+        ImGui::SameLine(0.0f, 8.0f * sc);
+        const bool haveSession = s.selected >= 0 && s.selected < (int)s.sessions.size();
+        const bool canRun = haveSession && !s.recon.kickPending && !reconRunning;
+        if (!canRun) ImGui::BeginDisabled();
+        if (ImGui::Button(s.recon.kickPending ? "Starting\xe2\x80\xa6" : "Run Reconstruct",
+                          ImVec2(runW, 0))) {
+            kickReconstruct(st);
+        }
+        if (!canRun) ImGui::EndDisabled();
+        if (!haveSession) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+            drawCenteredLine(avail.x, "(select a session to run reconstruction)");
+            ImGui::PopStyleColor();
+        }
+        if (!s.recon.runId.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+            char runLine[160];
+            std::snprintf(runLine, sizeof(runLine), "run %s (%s)",
+                          s.recon.runId.c_str(), kQuality[std::clamp(s.recon.quality, 0, 2)]);
+            drawCenteredLine(avail.x, runLine);
+            ImGui::PopStyleColor();
+        }
+        if (!s.recon.kickErr.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.25f, 0.25f, 1.0f));
+            ImGui::TextWrapped("Error: %s", s.recon.kickErr.c_str());
+            ImGui::PopStyleColor();
+        }
     }
 }
 
@@ -493,23 +627,12 @@ static void drawCenteredEmptyState(const char* title, const char* body) {
     {
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.accent[0], palette.accent[1],
                                                     palette.accent[2], 1.0f));
-        const ImVec2 ts = ImGui::CalcTextSize(title);
-        ImGui::SetCursorPosX((avail.x - ts.x) * 0.5f);
-        ImGui::TextUnformatted(title);
+        drawCenteredLine(avail.x, title);
         ImGui::PopStyleColor();
     }
     ImGui::Dummy(ImVec2(0, 6 * sc));
     ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-    const char* p = body;
-    while (p && *p) {
-        const char* nl = std::strchr(p, '\n');
-        const char* end = nl ? nl : p + std::strlen(p);
-        const ImVec2 ls = ImGui::CalcTextSize(p, end);
-        ImGui::SetCursorPosX((avail.x - ls.x) * 0.5f);
-        ImGui::TextUnformatted(p, end);
-        if (!nl) break;
-        p = nl + 1;
-    }
+    drawCenteredBlock(avail.x, body);
     ImGui::PopStyleColor();
 }
 
@@ -534,6 +657,10 @@ static void drawSessionRail(AppState& st, float w) {
     {
         const bool canCreate = st.workerStarted && !s.newSessionPending;
         ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+        if (s.focusNewName) {
+            ImGui::SetKeyboardFocusHere();  // focus the next widget (name InputText)
+            s.focusNewName = false;
+        }
         ImGui::InputTextWithHint("##reveng_new_name", "Name (optional)",
                                  s.newNameBuf, sizeof(s.newNameBuf));
         if (!canCreate) ImGui::BeginDisabled();
@@ -634,6 +761,23 @@ static void drawProperties(AppState& st, float w) {
         } else {
             ImGui::TextDisabled("scan -> mesh -> AI -> parametric");
         }
+        // Scale mirror (populated by the get_reveng_session detail poll).
+        if (s.scale.mirrored) {
+            ImGui::Spacing();
+            ImGui::Text("Scale");
+            if (s.scale.confirmed) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f, 0.85f, 0.4f, 1.0f));
+                ImGui::TextDisabled("%s  %.4g mm/unit  (confirmed)",
+                                    s.scale.curMethod.empty() ? "set" : s.scale.curMethod.c_str(),
+                                    s.scale.mmPerUnit);
+                ImGui::PopStyleColor();
+            } else {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.65f, 0.1f, 1.0f));
+                ImGui::TextDisabled("%s  (unconfirmed)",
+                                    s.scale.curMethod.empty() ? "pending" : s.scale.curMethod.c_str());
+                ImGui::PopStyleColor();
+            }
+        }
     }
     ImGui::EndChild();
 }
@@ -656,7 +800,14 @@ static bool drawSourceModeSelector(RevEngState& s) {
 
     bool changed = false;
     for (int i = 0; i < 4; ++i) {
-        if (i > 0) ImGui::SameLine(0.0f, 4.0f * sc);
+        // Wrap to a new row when the next button no longer fits (narrow center panel —
+        // previously the last button was clipped, e.g. "From Li").
+        const float bw = ImGui::CalcTextSize(kModes[i].label).x +
+                         ImGui::GetStyle().FramePadding.x * 2.0f;
+        if (i > 0 && ImGui::GetContentRegionAvail().x >= bw + 4.0f * sc)
+            ImGui::SameLine(0.0f, 4.0f * sc);
+        else if (i > 0)
+            ImGui::SetCursorPosX(ImGui::GetStyle().WindowPadding.x);  // wrap
         const bool active = (s.sourceMode == kModes[i].mode);
         if (active) {
             ImGui::PushStyleColor(ImGuiCol_Button,
@@ -759,6 +910,13 @@ void drawRevEngWorkspace(AppState& st) {
             s.recon.pct = 0;
             s.recon.phase.clear();
             s.recon.err.clear();
+            s.recon.kickPending = false;
+            s.recon.kickErr.clear();
+            s.recon.runId.clear();
+            // Per-session stage panels reset with the session too.
+            s.scale   = ScaleState{};
+            s.model   = ModelState{};
+            s.deliver = DeliverState{};
         }
     }
 
@@ -793,11 +951,15 @@ void drawRevEngWorkspace(AppState& st) {
             } else if (s.stage == Stage::Source) {
                 // RE-ANCHOR(reveng): RE-30 — sources panel (mode-specific entry widgets).
                 drawSourcesPanel(st);
+            } else if (s.stage == Stage::Scale) {
+                drawScalePanel(st);
             } else if (s.stage == Stage::Reconstruct) {
                 // RE-ANCHOR(reveng): RE-21 — reconstruct stage: sub-stage stepper + progress bar.
                 // The GL point-cloud + frusta overlay is drawn in drawRevEngWorkspace() below via
                 // beginOverlay/endOverlay AFTER ImGui rendering so it composites over the viewport.
                 drawReconstructStage(st);
+            } else if (s.stage == Stage::Model) {
+                drawModelPanel(st);
             } else if (s.stage == Stage::Review) {
                 // RE-22: dim-review + deviation panels.
                 const float sc2 = ui::uiScale;
@@ -809,6 +971,8 @@ void drawRevEngWorkspace(AppState& st) {
                 ImGui::BeginChild("##reveng_deviation", ImVec2(0, 0), ImGuiChildFlags_None);
                 reveng::drawDeviationPanel(st);
                 ImGui::EndChild();
+            } else if (s.stage == Stage::Deliver) {
+                drawDeliverPanel(st);
             } else {
                 char title[128];
                 std::snprintf(title, sizeof(title), "%s — %s",

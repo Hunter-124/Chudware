@@ -130,6 +130,7 @@ void seedCannedDimPayload() {
     d.sessionId  = "re_canned00";
     d.rowsLoaded = true;
     d.loadedOnce = true;
+    d.lastLoadT  = 1e9;   // block live refetch for the whole canned session (shot/demo)
     d.loadErr.clear();
 
     // Seed a canned deviation result too.
@@ -145,6 +146,7 @@ void seedCannedDimPayload() {
         {"> 0.5 mm",  0.03, 0.42},
     };
     d.devLoaded = true;
+    d.lastDevT  = 1e9;    // block live refetch — canned data must survive the shot
 }
 
 // ─── Async loaders ───────────────────────────────────────────────────────────

@@ -154,12 +154,12 @@ def resolve_role_system_prompt(role_id: str, yaml_prompt: str) -> str:
             lines.pop(0)
         while lines and not lines[0].strip():
             lines.pop(0)
-        text = "\n".join(lines).strip()
+        text = '\n'.join(lines).strip()
         if text:
             return text
     return ""
 
-        text = "\n".join(lines).strip()
+
 
 def list_editable_prompts() -> list[dict]:
     """Catalog for Settings → AI → Prompts: YAML mission roles + any .md-only core roles.

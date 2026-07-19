@@ -342,6 +342,19 @@ void drawDashedLine(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 col, float thick,
     }
 }
 
+// Rotating arc spinner for the graph canvas overlay. Draw-list only (no widgets),
+// driven by GetTime() so it stays alive while G.loading keeps the frame loop busy
+// via st.rpc.busy(). Visual language matches plmSpinner: accent stroke, ~2 rev/s.
+void drawArcSpinner(ImDrawList* dl, ImVec2 c, float radius, ImU32 col) {
+    const float t = (float)ImGui::GetTime();
+    const float a0 = t * (4.0f * 3.14159265f);  // 2 revolutions per second
+    const float sweep = 3.14159265f * 1.5f;     // 270° arc
+    const float th = std::max(1.5f, radius * 0.18f);
+    dl->PathArcTo(c, radius, a0, a0 + sweep, 24);
+    dl->PathStroke(col, 0, th);
+}
+
+
 // ---- fetch -------------------------------------------------------------------
 
 void requestGraph(AppState& st, bool force) {
@@ -1049,8 +1062,14 @@ void drawCanvas(AppState& st, ImVec2 canvasSz) {
     if (G.loading && G.nodes.empty()) {
         const char* msg = "Loading graph…";
         ImVec2 ts = ImGui::CalcTextSize(msg);
+        const float r = 12.0f * S;
+        const float gap = 10.0f * S;
+        const float blockH = r * 2.0f + gap + ts.y;
+        const ImVec2 spinC(origin.x + canvasSz.x * 0.5f,
+                           origin.y + (canvasSz.y - blockH) * 0.5f + r);
+        drawArcSpinner(dl, spinC, r, Palette::toU32(palette.accent));
         dl->AddText(ImVec2(origin.x + (canvasSz.x - ts.x) * 0.5f,
-                           origin.y + canvasSz.y * 0.5f),
+                           spinC.y + r + gap),
                     Palette::toU32(palette.accent), msg);
     }
 
@@ -1090,8 +1109,9 @@ void drawListView(AppState& /*st*/, ImVec2 canvasSz) {
     }
     if (G.loading && G.nodes.empty()) {
         ImGui::Dummy(ImVec2(0, 24 * Sc));
-        ImGui::TextColored(ImVec4(palette.accent[0], palette.accent[1],
-                                  palette.accent[2], 1.0f), "Loading graph…");
+        // Widget spinner (plmSpinner) — same accent-dot language as the rest of PLM.
+        // Continuous redraw while loading is covered by st.rpc.busy() in the frame loop.
+        plmSpinner("Loading graph");
         ImGui::EndChild();
         return;
     }

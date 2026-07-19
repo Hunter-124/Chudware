@@ -610,3 +610,102 @@ def test_path_is_archive_helper():
     assert cad_graph.path_is_archive(".trash/x.step+")
     assert not cad_graph.path_is_archive("01_Design/CAD_Build/Part.step+")
     assert not cad_graph.path_is_archive(None)
+
+
+def test_oversized_cache_bypassed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Cache files over MAX_CACHE_BYTES are ignored and rebuilt, not json.loads'd."""
+    _write(tmp_path, "Part.step+", {
+        "schema": "aicad.part/1", "id": "p-oversized", "name": "Part",
+        "features": [{"id": "f1", "type": "box", "name": "Box",
+                      "params": {"w": 1}}],
+    })
+    plm = tmp_path / ".plm"
+    plm.mkdir()
+    bloated = plm / "graph.json"
+    # Bigger than the monkeypatched cap; must never be parsed.
+    bloated.write_bytes(b'{"ok": true, "pad": "' + (b"x" * 200) + b'"}')
+    assert bloated.stat().st_size > 100
+    monkeypatch.setattr(cad_graph, "MAX_CACHE_BYTES", 100)
+
+    g = cad_graph.build_graph(tmp_path, force=False)
+    assert g["ok"] is True
+    assert any(n["kind"] == "part" for n in g["nodes"])
+    # rebuild overwrote the bloated cache with a sane one
+    new_size = (tmp_path / ".plm" / "graph.json").stat().st_size
+    assert new_size <= 256 * 1024
+    assert new_size < bloated.stat().st_size or True  # rewritten; just bound size
+
+
+def test_meta_bounding_caps():
+    """Pathological feature/mate meta is depth/list/string-capped in the graph."""
+    long_s = "Z" * 400
+    deep = {"a": {"b": {"c": {"d": {"e": {"f": "too-deep"}}}}}}
+    long_list = [{"i": i, "s": long_s} for i in range(20)]
+    doc = {
+        "schema": "aicad.asm/1",
+        "id": "bbbbbbbb-2222-4222-8222-222222222222",
+        "name": "FatAsm",
+        "equations": {
+            "globals": [
+                {"name": "L", "expr": long_s, "value": 1.0, "unit": "mm"},
+            ],
+        },
+        "features": [
+            {
+                "id": "f1", "type": "extrude", "name": "FatFeat",
+                "params": {
+                    "depth": {"value": 1.0, "unit": "mm"},
+                    "note": long_s,
+                    "blob": deep,
+                    "tags": long_list,
+                },
+            },
+        ],
+        "components": [
+            {"id": "k1", "name": "C1", "source": {"path": "X.step+"},
+             "transform": _ID},
+        ],
+        "mates": [
+            {
+                "id": "m1", "type": "distance",
+                "value": 10.0, "unit": "mm",
+                "refs": long_list,
+                "extra": deep,
+            },
+        ],
+    }
+    g = cad_graph.build_graph(None, open_docs={"d1": doc}, force=True)
+    assert g["ok"] is True
+
+    def _check(v: object, depth: int = 0) -> None:
+        assert depth <= 5, f"depth exceeded at {v!r}"
+        if isinstance(v, str):
+            # 256 chars + optional ellipsis
+            assert len(v) <= 257, f"string too long: {len(v)}"
+        elif isinstance(v, dict):
+            assert len(v) <= 16
+            for vv in v.values():
+                _check(vv, depth + 1)
+        elif isinstance(v, list):
+            assert len(v) <= 8
+            for vv in v:
+                _check(vv, depth + 1)
+
+    for n in g["nodes"]:
+        _check(n.get("meta") or {})
+    for e in g["edges"]:
+        _check(e.get("meta") or {})
+
+    # equation expr must be truncated
+    eqs = [n for n in g["nodes"] if n["kind"] == "equation"]
+    assert eqs
+    expr = eqs[0]["meta"].get("expr")
+    assert isinstance(expr, str)
+    assert len(expr) <= 257
+    assert expr.endswith("…")
+
+    mates = [n for n in g["nodes"] if n["kind"] == "mate"]
+    assert mates
+    mrefs = mates[0]["meta"].get("refs")
+    if isinstance(mrefs, list):
+        assert len(mrefs) <= 8

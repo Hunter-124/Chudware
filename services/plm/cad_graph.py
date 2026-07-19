@@ -61,6 +61,18 @@ _MULTIBODY_MAX = 2
 DEFAULT_MAX_NODES = 5000
 DEFAULT_MAX_EDGES = 10000
 
+# Reject an on-disk cache larger than this BEFORE parsing it. A legacy/corrupt
+# cache (built before meta was bounded) can be hundreds of MB and block the
+# worker thread for minutes inside json.loads. Over the cap → treat as invalid
+# and rebuild (the rebuild overwrites it via _save_cache).
+MAX_CACHE_BYTES = 64 * 1024 * 1024  # 64 MiB
+# Cap how many co-owners of the same bare dim+value form a complete
+# REFERENCES clique. Without this, a common bool/flag (merge=true across
+# hundreds of extrudes) emits O(n²) edges and bloats the on-disk cache.
+MAX_SHARED_VALUE_GROUP = 24
+
+
+
 # Dir basenames always pruned from the project walk (shadow/cache/VCS).
 # Nested .aicadvault is intentionally here — working trees beside it stay.
 _SYSTEM_SKIP_DIRS = frozenset({
@@ -208,6 +220,7 @@ def build_graph(
             return nid
         if "origin" not in n:
             n["origin"] = ORIGIN_EXTRACTED
+        n["meta"] = _sanitize_meta(n.get("meta") or {})
         nodes.append(n)
         node_ids.add(nid)
         return nid
@@ -219,7 +232,7 @@ def build_graph(
             return
         edges.append({
             "src": src, "dst": dst, "kind": kind,
-            "meta": meta or {}, "origin": origin,
+            "meta": _sanitize_meta(meta or {}), "origin": origin,
         })
 
     # project root
@@ -638,12 +651,20 @@ def build_graph(
         # group by (value, unit) — same name+value across docs = shared
         by_val: dict[tuple[str, str | None], list[str]] = {}
         for nid, val, unit in owners:
+            # bool is a subclass of int — never treat flags as shared dims
+            if isinstance(val, bool):
+                continue
             key = (json.dumps(val, sort_keys=True, default=str), unit)
             by_val.setdefault(key, []).append(nid)
         for (val_s, unit), nids in by_val.items():
             uniq = list(dict.fromkeys(nids))  # stable unique
             if len(uniq) < 2:
                 continue
+            # Pathological cliques (e.g. merge=true on every extrude) must not
+            # emit a complete graph — keep a bounded sample so blast/path still
+            # see the shared-value signal without O(n²) cache blow-up.
+            if len(uniq) > MAX_SHARED_VALUE_GROUP:
+                uniq = uniq[:MAX_SHARED_VALUE_GROUP]
             try:
                 val = json.loads(val_s)
             except Exception:  # noqa: BLE001
@@ -670,6 +691,9 @@ def build_graph(
                              origin=str(lk.get("origin") or "manual"))
         except Exception:  # noqa: BLE001
             pass
+
+    for _e in edges:
+        _e["meta"] = _sanitize_meta(_e.get("meta") or {})
 
     generated_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     graph = {
@@ -1293,8 +1317,13 @@ def _load_cache_if_valid(
     if not cp.is_file():
         return None
     try:
-        cache_mtime = cp.stat().st_mtime
+        st = cp.stat()
+        cache_mtime = st.st_mtime
     except OSError:
+        return None
+    # Guard BOTH parse paths below: never json.loads a pathologically large
+    # cache. Over the cap → invalid → caller rebuilds.
+    if st.st_size > MAX_CACHE_BYTES:
         return None
 
     skip = _skip_dir_names(
@@ -1396,6 +1425,28 @@ def _save_cache(root: Path, graph: dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
+
+
+def _sanitize_meta(value: Any, *, _depth: int = 0) -> Any:
+    """Bound arbitrary node/edge meta so one pathological doc can't bloat the
+    cached graph. Caps nesting depth, string length, list length, dict keys."""
+    _MAX_DEPTH, _MAX_STR, _MAX_LIST, _MAX_KEYS = 4, 256, 8, 16
+    if isinstance(value, str):
+        return value if len(value) <= _MAX_STR else value[:_MAX_STR] + "…"
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if _depth >= _MAX_DEPTH:
+        return "…"
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for i, (k, v) in enumerate(value.items()):
+            if i >= _MAX_KEYS:
+                break
+            out[str(k)[:_MAX_STR]] = _sanitize_meta(v, _depth=_depth + 1)
+        return out
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_meta(v, _depth=_depth + 1) for v in list(value)[:_MAX_LIST]]
+    return str(value)[:_MAX_STR]
 
 
 def _kind_from_schema(schema: str) -> str | None:
@@ -1525,13 +1576,20 @@ def _feature_dims(
     for k, v in params.items():
         if k in ("entities", "constraints", "external_refs", "code", "text"):
             continue
+        # bool subclasses int — exclude flags (merge/centered/copy/…) so they
+        # never enter the shared-value dim index.
+        if isinstance(v, bool):
+            continue
         if isinstance(v, (int, float)):
             out.append((f"{fid}.{k}", v, None, None))
             out.append((k, v, None, None))  # bare name for cross-doc match
         elif isinstance(v, dict) and "value" in v:
+            raw = v.get("value")
+            if isinstance(raw, bool):
+                continue
             expr = v.get("expr")
-            out.append((f"{fid}.{k}", v.get("value"), v.get("unit"), expr))
-            out.append((k, v.get("value"), v.get("unit"), None))
+            out.append((f"{fid}.{k}", raw, v.get("unit"), expr))
+            out.append((k, raw, v.get("unit"), None))
     # sketch dimension constraints
     if isinstance(params.get("constraints"), list):
         for c in params["constraints"]:

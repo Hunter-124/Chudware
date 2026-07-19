@@ -1746,3 +1746,65 @@ of ModesScout this session.
 
 **Deferred:** daemon shutdown-drain SIGABRT when a provider HTTP call is in flight (redeploy
 kills in-flight web runs); a graceful drain is a separate fix.
+
+### Harness deepening + exec modes + grok battery round 2 (2026-07-18)
+All landed on master (5ba1f8cc, b6f5eab, 3529c2b7, 711bc91e, 1827a97f + wasm deploy).
+
+**Round-1 battery bugs FIXED (verified live against grok):**
+- Garbage prompt: intake rejection protocol — {"reject":true} → terminal
+  failed/unintelligible_request in ~2s, no invented geometry, no save. Edit follow-ups
+  stay valid: intake gets a compact feature-tree digest when the doc has geometry
+  ('chamfer the top edges' on an existing washer builds fine; 'chamfer' on an EMPTY doc
+  rejects 'no existing geometry to modify').
+- 20-24s pre-run_started silence: run_assembly_design's silent intake+planner LLM probe
+  now skipped for confident single-part (free classify first) and emits
+  run_started/classification BEFORE the probe when it runs. First event now t≈0.001s.
+  Single-part cloud runs no longer pay duplicated intake+plan LLM cost.
+- Solo leanness: budgets.plan=0 truly skips plan; fix budgets Solo=2/Standard=4/
+  Complex=6 with run-level cap; deterministic plan_state checklist on Solo (todo list
+  for every non-ask mode; namespaced ids model:/mission:/firm:).
+- Classifier: 10-row battery corpus locked as doctests; enclosure/sheetmetal floors;
+  domain stamped on DesignState + Sheetmetal seeds tool_scope_classes (sm_* cheatsheet
+  without a request_tools round-trip — verified: request_tools never fired in round 2).
+
+**Exec modes C++-native (the Python bridge was non-viable — no venv in shared daemon):**
+- recommend_structure wired → execution_style (edit|swarm) decided BEFORE plan drafting;
+  plans structured for their style. task_route/complexity carry it; plan_ready includes it.
+- Advisor role (advisor.md): request_advice peeled op (cap 3/run) for ALL modes;
+  advisor plan-approval (approve/revise-once/escalate) — agent-decided plans never gate
+  the user; only manual Plan mode + escalations show the approve card. Fallback honesty:
+  advisor events carry fallback:provider_error|unparseable on soft-approve.
+- Swarm: plan gate → style-directed mission plan → advisor approve → sequential waves of
+  per-part sub-runs (own docs, final assembly), swarm_wave + sub_run events, mission:
+  plan_state. Eng-firm: firm_bid → firm_award → firm_team role seeds prefix sub-run
+  prompts → firm_comm ledger → budget_usd metering (selection-only award; abort
+  budget_exceeded before overspend).
+- Delegate op: edit/plan/agent may spawn depth-capped nested run_design sub-runs.
+- Mission status semantics: partial (N/M built + first_fail_reason) — never done/built
+  with failed tasks, never 'planned' on failure. Host renders the partial card (ERR_PARTIAL).
+
+**Round-2 battery + spot verifies (live grok):** garbage reject 1.8s; washer 12s;
+chamfer follow-up 10s; sheetmetal domain seeding literal+fallback; advisor
+approve/revise paths; eng_firm budget abort $0-spent; swarm 3-task/2-wave; partial
+card; plan-mode gate PASS. 403 spending-limit mid-battery → rotated active xai-sub
+account (18 stored; probe-refresh-persist script pattern in session history).
+
+**Interface-aware assembly (user directive, the headline feature):** iface_plan module —
+planners declare mating interfaces ONCE with a shared standard + SEED part; build order
+is interface-topological (seeds first; dependent never same/earlier swarm wave);
+per-part injection via advisory seam (mate built → measured 'match EXACTLY'; seed →
+'BINDING' standard); pre-assemble verify_interfaces catches mismatches and re-runs the
+fixer on the DEPENDENT only (seed wins). Verified live: 'two L-brackets bolted back to
+back with M5' — advisor baked envelope defaults (2×Ø5.5 on 40mm spacing, ≥10mm edge
+margin), waves seed→dependent→assemble, measured seed holes, CAUGHT dependent bracket
+missing its bolt holes, targeted fix, status=assembled 3/3.
+
+**Rectangle sketch entity** (top model-hallucination class): native center+width/height
+& two-corner forms → 4 CCW lines pre-validate; cheatsheets updated (ops/solo/sheetmetal/
+sketch). 6 doctests (test_rectangle).
+
+**Open / next:** model still occasionally hallucinates non-cheatsheet ops (set_params
+with invented params) — validator correctly rejects, but the retry churn costs time;
+192s single fix-call observed (grok thinking + retries). Pre-existing test_document/
+test_selectors numeric-drift failures unchanged (predate both sessions). Daemon
+shutdown-drain SIGABRT with in-flight provider call still open (deferred).

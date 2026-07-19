@@ -103,6 +103,110 @@ FEATURE_FLAGGED_TOOLS = frozenset({
 })
 
 _ROLES_DIR = Path(__file__).resolve().parent / "roles"
+
+def _prompts_override_dir() -> Path:
+    """User prompt overrides (same location C++ core/agent/roles.cpp uses)."""
+    import os
+    xdg = os.environ.get("XDG_DATA_HOME")
+    if xdg:
+        root = Path(xdg) / "AI-CAD"
+    else:
+        root = Path.home() / ".local" / "share" / "AI-CAD"
+    # Match C++ paths_root()/prompts when AI_CAD_APPDATA set
+    app = os.environ.get("AI_CAD_APPDATA") or os.environ.get("AI_CAD_DATA")
+    if app:
+        root = Path(app)
+    return root / "prompts"
+
+
+def _prompt_override_path(role_id: str) -> Path:
+    return _prompts_override_dir() / f"{role_id}.md"
+
+
+def _prompt_builtin_md_path(role_id: str) -> Path:
+    """Shipped C++-style prompts under services/agent/prompts/."""
+    return Path(__file__).resolve().parent / "prompts" / f"{role_id}.md"
+
+
+def resolve_role_system_prompt(role_id: str, yaml_prompt: str) -> str:
+    """Resolution order for the live system prompt text:
+    1. User override  (~/.local/share/AI-CAD/prompts/<id>.md) — Settings → Prompts Save
+    2. Shipped .md    (services/agent/prompts/<id>.md) when present
+    3. YAML card      system_prompt field
+    """
+    ov = _prompt_override_path(role_id)
+    if ov.is_file():
+        text = ov.read_text(encoding="utf-8").strip()
+        if text:
+            return text
+    md = _prompt_builtin_md_path(role_id)
+    if md.is_file():
+        text = md.read_text(encoding="utf-8").strip()
+        # strip HTML comment headers we add for dual-source cards
+        lines = text.splitlines()
+        while lines and lines[0].strip().startswith("<!--"):
+            lines.pop(0)
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        text = "\n".join(lines).strip()
+        if text:
+            return text
+    return (yaml_prompt or "").strip()
+
+
+def list_editable_prompts() -> list[dict]:
+    """Catalog for Settings → AI → Prompts: YAML mission roles + any .md-only core roles.
+
+    Each row matches get_prompts_v2 shape so the GUI can merge sources:
+      role, path, override_path, text, overridden, source
+    """
+    out: list[dict] = []
+    seen: set[str] = set()
+
+    # Mission / pipeline cards (delegate runtime)
+    for rid, card in load_all_roles().items():
+        seen.add(rid)
+        ov = _prompt_override_path(rid)
+        md = _prompt_builtin_md_path(rid)
+        overridden = ov.is_file() and bool(ov.read_text(encoding="utf-8").strip())
+        text = resolve_role_system_prompt(rid, card.system_prompt)
+        # Prefer showing the YAML path as builtin when no .md; else .md path
+        path = str(md if md.is_file() else (_ROLES_DIR / f"{rid}.yaml"))
+        out.append({
+            "role": rid,
+            "path": path,
+            "override_path": str(ov),
+            "text": text,
+            "overridden": overridden,
+            "source": "yaml",
+        })
+
+    # Core .md prompts not already covered (C++ agent_run_v2 catalog)
+    prompts_dir = Path(__file__).resolve().parent / "prompts"
+    if prompts_dir.is_dir():
+        for md in sorted(prompts_dir.glob("*.md")):
+            rid = md.stem
+            if rid in seen:
+                continue
+            seen.add(rid)
+            ov = _prompt_override_path(rid)
+            overridden = ov.is_file() and bool(ov.read_text(encoding="utf-8").strip())
+            if overridden:
+                text = ov.read_text(encoding="utf-8").strip()
+            else:
+                text = md.read_text(encoding="utf-8").strip()
+            out.append({
+                "role": rid,
+                "path": str(md),
+                "override_path": str(ov),
+                "text": text,
+                "overridden": overridden,
+                "source": "md",
+            })
+
+    out.sort(key=lambda r: r["role"])
+    return out
+
 _PLAYBOOKS_DIR = Path(__file__).resolve().parent / "playbooks"
 
 
@@ -395,7 +499,24 @@ def load_role(role_id: str, *, roles_dir: Path | None = None) -> RoleCard:
     if not path.exists():
         raise RoleError(f"role card not found: {path}")
     data = yaml.safe_load(path.read_text())
-    return _role_from_dict(data, source=str(path))
+    card = _role_from_dict(data, source=str(path))
+    # Settings → Prompts saves overrides as appdata prompts/<id>.md (C++ path).
+    # Prefer that text so GUI edits apply to delegate/ladder runs.
+    resolved = resolve_role_system_prompt(role_id, card.system_prompt)
+    if resolved != card.system_prompt:
+        return RoleCard(
+            id=card.id,
+            goal=card.goal,
+            system_prompt=resolved,
+            stage_scope=card.stage_scope,
+            tool_allowlist=card.tool_allowlist,
+            context_recipe=card.context_recipe,
+            ledger_sections=card.ledger_sections,
+            handoff_schema=card.handoff_schema,
+            escalation_policy=card.escalation_policy,
+            playbook_default=card.playbook_default,
+        )
+    return card
 
 
 def load_all_roles(*, roles_dir: Path | None = None) -> dict[str, RoleCard]:

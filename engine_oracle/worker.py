@@ -251,11 +251,22 @@ def _agent_cancel(params: dict, _emit_event: EmitFn) -> dict:
 # them by the doc-cpp / dwg-cpp / minting rule (see host/src/worker_client.cpp). What stays in the
 # Python worker: the legacy build123d code-gen path (agent_design), the format-matrix probe, the
 # vendor-parts registry, and the AI-ECAD surface.
+
+def _list_editable_prompts(_params: dict, _emit_event=None):
+    """Settings → AI → Prompts: YAML mission roles + core .md prompts (merged)."""
+    try:
+        from services.agent.roles import list_editable_prompts
+        return list_editable_prompts()
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+
 _METHODS = {
     "ping": _ping,
     "run_model": _run_model,
     "agent_design": _agent_design,
     "get_prompts": _get_prompts,
+    "list_editable_prompts": _list_editable_prompts,
 }
 
 # Format-matrix probe (doc_formats). import_file / export_file moved to the C++ core; the pure

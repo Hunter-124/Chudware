@@ -21,9 +21,16 @@ namespace fs = std::filesystem;
 namespace aicad {
 namespace agent {
 
+// Ordered catalog for Settings → AI → Prompts and load_prompt().
+// Keep in sync with services/agent/prompts/*.md. get_prompts_v2 also appends any
+// extra *.md found on disk (so new files show up without a code change).
 const std::vector<std::string> kRoles = {
     "intake", "planner", "modeler", "reviewer", "fixer", "memory",
-    "decomposer", "executor", "mission_planner", "reporter", "advisor"};
+    "decomposer", "executor", "mission_planner", "reporter", "advisor",
+    // 2D/3D specialist pair (Settings model roles + YAML cards)
+    "sketch2d", "model3d",
+    // On-disk prompts that were missing from the hardcoded list
+    "firmware", "dag_planner"};
 
 namespace {
 
@@ -144,7 +151,10 @@ bool is_catalog_role(const std::string& role) {
 bool is_role(const std::string& role) {
     for (const auto& r : kRoles)
         if (r == role) return true;
-    return false;
+    // Accept drop-in prompts (*.md) that are not yet listed in kRoles.
+    if (role.empty()) return false;
+    std::error_code ec;
+    return fs::exists(builtin_path(role, /*prompts_dir=*/""), ec);
 }
 
 }  // namespace
@@ -285,13 +295,24 @@ std::string prompt_hash(const std::string& text) {
 json get_prompts_v2(const std::string& prompts_dir) {
     json out = json::array();
     std::error_code ec;
-    for (const std::string& role : kRoles) {
+    std::set<std::string> seen;
+
+    auto push_role = [&](const std::string& role) {
+        if (role.empty() || !seen.insert(role).second) return;
         fs::path bpath = builtin_path(role, prompts_dir);
         fs::path opath = override_path(role);
         std::string ov_text;
         if (fs::exists(opath, ec)) ov_text = py_strip(read_text(opath));
         bool overridden = !ov_text.empty();
-        std::string text = overridden ? ov_text : read_text(bpath);
+        // Prefer override; else builtin file if present (skip ghost kRoles with no file).
+        std::string text;
+        if (overridden) {
+            text = ov_text;
+        } else if (fs::exists(bpath, ec)) {
+            text = read_text(bpath);
+        } else {
+            return;  // nothing to edit
+        }
         out.push_back(json{
             {"role", role},
             {"path", bpath.string()},
@@ -299,6 +320,23 @@ json get_prompts_v2(const std::string& prompts_dir) {
             {"text", text},
             {"overridden", overridden},
         });
+    };
+
+    // 1) Canonical order from kRoles
+    for (const std::string& role : kRoles) push_role(role);
+
+    // 2) Any extra *.md in the prompts dir (dev drop-in without editing kRoles)
+    fs::path dir = builtin_dir(prompts_dir);
+    if (fs::is_directory(dir, ec)) {
+        std::vector<std::string> extras;
+        for (fs::directory_iterator it(dir, ec), end; it != end && !ec; it.increment(ec)) {
+            if (!it->is_regular_file(ec)) continue;
+            auto p = it->path();
+            if (p.extension() != ".md") continue;
+            extras.push_back(p.stem().string());
+        }
+        std::sort(extras.begin(), extras.end());
+        for (const auto& role : extras) push_role(role);
     }
     return out;
 }

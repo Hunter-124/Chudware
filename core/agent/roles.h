@@ -18,7 +18,7 @@ namespace agent {
 
 using nlohmann::json;
 
-extern const std::vector<std::string> kRoles;  // 8 roles, in order.
+extern const std::vector<std::string> kRoles;  // canonical order; extras via dir scan.
 
 // (text, source). source is the absolute path the text came from. Ops roles get
 // the ops cheatsheet appended. `prompts_dir` overrides AI_CAD_PROMPTS_DIR.

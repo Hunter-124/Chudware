@@ -16,6 +16,8 @@
 #include "imgui.h"
 
 #include "settings_modal.h"
+#include "config_panel.h"
+#include "layout.h"  // drawConfigurationsBody fallback
 
 #include "../core/app_state.h"
 #include "file_dialog.h"
@@ -48,23 +50,33 @@ static int  s_selectedRole  = 0;
 
 static std::string s_promptsError;
 static void loadPrompts(AppState& st) {
+    // Prefer list_editable_prompts (YAML mission roles + core .md, with overrides).
+    // Fall back to get_prompts_v2 (C++ core kRoles catalog) when the worker is old.
     nlohmann::json result;
     std::string err;
     s_promptsError.clear();
-    if (!st.worker.call("get_prompts_v2", nlohmann::json::object(), result, err, 20000)) {
-        s_promptsError = err.empty() ? "get_prompts_v2 failed" : err;
-        st.addLog("[err] get_prompts_v2: " + s_promptsError);
-        s_promptsLoaded = false;
-        return;
+    bool ok = st.worker.call("list_editable_prompts", nlohmann::json::object(), result, err, 20000);
+    if (!ok) {
+        err.clear();
+        ok = st.worker.call("get_prompts_v2", nlohmann::json::object(), result, err, 20000);
+        if (!ok) {
+            s_promptsError = err.empty() ? "prompt catalog unavailable" : err;
+            st.addLog("[err] prompts catalog: " + s_promptsError);
+            s_promptsLoaded = false;
+            return;
+        }
     }
-    // get_prompts_v2 returns a BARE JSON array of prompt records; tolerate a legacy
-    // {"prompts":[...]} envelope too. Calling value("prompts",...) on a bare array would
-    // throw type_error.306, and a present-but-null string field would throw 302 — either
-    // crashes the Settings > Agents tab. Read every field defensively.
+    // Bare array or {"prompts":[...]} or error object
     auto str = [](const nlohmann::json& j, const char* k) -> std::string {
         auto it = j.find(k);
         return (it != j.end() && it->is_string()) ? it->get<std::string>() : std::string();
     };
+    if (result.is_object() && result.value("ok", true) == false) {
+        s_promptsError = str(result, "error");
+        if (s_promptsError.empty()) s_promptsError = "prompt catalog error";
+        s_promptsLoaded = false;
+        return;
+    }
     const nlohmann::json* recs = &result;
     if (result.is_object() && result.contains("prompts") && result["prompts"].is_array())
         recs = &result["prompts"];
@@ -74,18 +86,22 @@ static void loadPrompts(AppState& st) {
         if (!r.is_object()) continue;
         PromptRecord pr;
         pr.role         = str(r, "role");
+        if (pr.role.empty()) continue;
         pr.builtinPath  = str(r, "path");
         pr.overridePath = str(r, "override_path");
         pr.overridden   = r.value("overridden", false);
         std::string text = str(r, "text");
         pr.builtinLen = (int)text.size();
-        // fill buf with the resolved text (override or built-in)
         std::fill(pr.buf.begin(), pr.buf.end(), 0);
         std::strncpy(pr.buf.data(), text.c_str(), pr.buf.size() - 1);
         s_promptRecs.push_back(std::move(pr));
     }
+    // Stable alpha order for power-user scanning
+    std::sort(s_promptRecs.begin(), s_promptRecs.end(),
+              [](const PromptRecord& a, const PromptRecord& b) { return a.role < b.role; });
     s_promptsLoaded = true;
 }
+
 
 static void savePromptOverride(PromptRecord& pr) {
     // Write the buffer contents to the override file
@@ -3142,6 +3158,7 @@ const SettingsEntry kSettingsEntries[] = {
     { "MMGS units",               "General",      1 },
     { "IPS units",                "General",      1 },
     { "Workspace folder",         "General",      1 },
+    { "Configurations",           "General",      1 },
     { "Engine routing",           "General",      1 },
     { "C++ core",                 "General",      1 },
     { "Performance profiler",     "General",      1 },
@@ -3527,6 +3544,15 @@ void drawSettingsModal(AppState& st, bool busy) {
                     st.addLog(std::string("[units] set to ") + (st.ips() ? "IPS" : "MMGS"));
                 }
                 dimText("Changes how lengths display/parse everywhere (saved immediately).");
+
+                // Configurations moved here from the left-pane strip (Graph took that slot).
+                settingsSectionHeader("Configurations");
+                if (st.configPanel) {
+                    st.configPanel->drawEmbedded(st);
+                } else {
+                    ui::drawConfigurationsBody(st);
+                }
+
                 // Workspace folder (audit P1): workspace_dir was persisted but had NO UI —
                 // users had to hand-edit config.json to re-root the File Explorer.
                 settingsSectionHeader("Workspace");

@@ -8,13 +8,19 @@
 //   1. Node-node repulsion  — Coulomb-like  k_rep * q_i * q_j / r^2  along the
 //      separation, with finite cutoff. Implemented via uniform spatial-grid
 //      hashing rebuilt each substep → expected O(n * k) with k = avg neighbors
-//      inside the cutoff cell neighborhood (≪ n for typical layouts).
+//      inside the cutoff cell neighborhood (≪ n for typical layouts). Each
+//      unordered pair is evaluated exactly once (j > i).
 //   2. Edge springs         — Hooke  strength * (r - restLen)  along the edge.
+//      Springs and collision coexist: the UI should floor each edge rest length
+//      at collDist = ra + rb + pad so springs do not crush discs against the
+//      non-overlap constraint (this engine does not auto-clamp rest lengths).
 //   3. Weak centering       — k_center * (centroid - p) pulls the cloud back
 //      toward its own centroid so the graph doesn't drift off-screen.
-//   4. Collision            — radius-aware non-overlap push ∝ overlap depth
-//      (cooling-independent, like d3-force's collide), sharing the repulsion
-//      spatial grid so it costs no extra broadphase.
+//   4. Collision            — radius-aware non-overlap (d3-force collide analogue).
+//      After integration, 3 Gauss-Seidel passes push overlapping discs apart
+//      along their separation (cooling-independent). Uses its own spatial grid
+//      sized by max collDist so pairs collide even when outside the Coulomb
+//      cutoff. Strength ~10–12 is a near-hard separation per pass.
 //
 // Integration: semi-implicit Euler (v += a*h; x += v*h) with per-step velocity
 // damping. Pinned nodes have infinite mass (a=0, v=0); the UI teleports them
@@ -29,10 +35,11 @@
 // coincide exactly.
 //
 // Complexity notes (N nodes, E edges):
-//   rebuild grid  O(N)
+//   rebuild grid  O(N)   (once for repulsion, once per collision pass)
 //   repulsion     O(N * avg bin occupancy in 3x3 neighborhood)  ≈ O(N) typical
 //   springs       O(E)
 //   centering     O(N)
+//   collision     O(kCollIters * N * avg coll-bin occupancy)  ≈ O(N) typical
 //   3200-node budget: one substep well under ~2 ms on a modern desktop CPU.
 #pragma once
 
@@ -63,6 +70,7 @@ public:
     // Spring between nodes a and b. restLen <= 0 uses the default link distance
     // (plus radii). strength is the Hooke coefficient (typical 0.2 … 1.0).
     // Duplicate undirected pairs are ignored (first wins). Self-edges ignored.
+    // Prefer restLen >= ra+rb+collisionPad so springs do not fight collision.
     void addEdge(int a, int b, float restLen, float strength);
 
     // Advance the simulation by real frame dt (seconds). Internally runs a
@@ -96,9 +104,14 @@ public:
     void setCentering(float k);     // gravity toward centroid (default 0.02)
     void setLinkDistance(float d);  // default rest-length scale (default 60)
     void setAlphaDecay(float d);    // cooling rate per substep (default ~0.023)
-    // Radius-aware non-overlap (d3 collide analogue). strength scales the
-    // overlap-depth push (default 6), pad is the extra gap (default 3).
+    // Radius-aware non-overlap (d3 collide analogue). strength scales how hard
+    // each collision pass separates overlap (default 11 ≈ near-hard at ~0.1×
+    // blend per unit strength, clamped to 1); pad is the extra gap (default 3).
     void setCollision(float strength, float pad);
+    // Velocity retain fraction after each substep integrate (default 0.6 → keep
+    // 40% of prior velocity). Lower = snappier settle; higher = more glide.
+    // Clamped to (0, 1].
+    void setVelocityDecay(float d);
 
 private:
     struct Node {
@@ -115,7 +128,7 @@ private:
         float strength = 0.5f;
     };
 
-    // Spatial hash: uniform grid over the current AABB, cell size = cutoff.
+    // Spatial hash: uniform grid over the current AABB, cell size = query cutoff.
     // Singly-linked lists per cell (head[cell] → node, next[node] → next).
     struct Grid {
         float originX = 0.f, originY = 0.f;
@@ -129,7 +142,9 @@ private:
     void applyRepulsion(std::vector<float>& fx, std::vector<float>& fy);
     void applySprings(std::vector<float>& fx, std::vector<float>& fy);
     void applyCentering(std::vector<float>& fx, std::vector<float>& fy);
-    void rebuildGrid();
+    // Multi-pass position/velocity non-overlap using a collDist-sized grid.
+    void resolveCollisions();
+    void rebuildGrid(float cellSize);
     bool validNode(int i) const;
     static float clampf(float v, float lo, float hi);
     static bool  finitef(float v);
@@ -156,12 +171,14 @@ private:
     float centering_ = 0.02f;
     float linkDistance_ = 60.f;
     float cutoff_ = 96.f;          // repulsion cutoff (≈ 1.6 × default link)
-    float collStrength_ = 6.f;     // collision push per unit of overlap depth
+    float collStrength_ = 11.f;    // collision separation hardness (~10–12 hard)
     float collPad_ = 3.f;          // extra gap kept between node radii
 
     // Fixed substep size and max substeps drained per step() call.
     static constexpr float kSubstep = 1.f / 60.f;
     static constexpr int   kMaxSubsteps = 4;
+    // Gauss-Seidel collision passes after integrate (positions update between).
+    static constexpr int   kCollIterations = 3;
 
     float dtAcc_ = 0.f;
 };

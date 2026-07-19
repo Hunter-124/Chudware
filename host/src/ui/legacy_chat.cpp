@@ -3715,9 +3715,9 @@ static std::string stripMdMarks(const std::string& in) {
 static const char* providerWireName(int provider) {
     switch (provider) {
         case ui::PROV_ANTHROPIC:   return "anthropic";
+        case ui::PROV_LOCAL:       return "openai";  // base_url discriminates (loopback)
         case ui::PROV_OPENAI:
-        case ui::PROV_LOCAL:
-        case ui::PROV_CLOUDCOMPAT: return "openai";
+        case ui::PROV_CLOUDCOMPAT: return "openai";  // moonshot override happens in agentProviderOverride
         case ui::PROV_LLAMACPP:    return "llamacpp";
         case ui::PROV_GEMINI:      return "gemini";
         case ui::PROV_XAI:         return "xai";  // saveSettings rewrites to xai-sub when no key
@@ -3735,7 +3735,16 @@ static const char* providerWireName(int provider) {
 static nlohmann::json agentProviderOverride(const Settings& s) {
     nlohmann::json j = nlohmann::json::object();
     const char* name = providerWireName(s.provider);
-    if (name && name[0]) j["provider"] = name;
+    // Kimi presets ride PROV_CLOUDCOMPAT with a moonshot.ai base_url. Pin the real
+    // provider name so resolve_provider lands on the moonshot descriptor (kimi-k3
+    // alias normalize, 1M context window, reasoning_effort=max) instead of the
+    // generic openai one. saveSettings already writes provider=moonshot +
+    // api_key=moonshotKey to config.json in this case, so the key resolves.
+    std::string wire = name ? name : "";
+    if (s.provider == ui::PROV_CLOUDCOMPAT &&
+        std::string(s.baseUrl).find("moonshot.ai") != std::string::npos)
+        wire = "moonshot";
+    if (!wire.empty()) j["provider"] = wire;
     // llamacpp's Settings::model holds the gguf FILE PATH (the wire model stays "local-gguf");
     // don't clobber the descriptor's model with a filesystem path.
     if (s.provider != ui::PROV_LLAMACPP && s.model[0]) j["model"] = s.model;

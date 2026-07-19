@@ -1676,6 +1676,7 @@ if(AICAD_WITH_OCCT)
   add_executable(aicad-hostd
     hostd/main.cpp
     hostd/server.cpp
+    hostd/worker_bridge.cpp           # lazy python worker for engine-unknown RPCs (web PLM/AI roles)
     hostd/child_supervisor.cpp        # POSIX: fork/PDEATHSIG/execvpe
     hostd/child_supervisor_win.cpp    # Windows: Job Objects, KILL_ON_JOB_CLOSE
     hostd/doc_registry.cpp

@@ -18,6 +18,15 @@ Environment=AICAD_HOSTD_LINGER_SECS=86400
 # against its CWD (none here) and every agent run throws "role prompt unreadable/empty".
 # install_webd.sh deploys the prompt tree to @PROMPTS@ and stamps this path.
 Environment=AI_CAD_PROMPTS_DIR=@PROMPTS@
+# Python worker bridge (hostd/worker_bridge.cpp): engine-unknown methods
+# (plm_*, git_*, ai_roles_*, provider accounts — the whole PLM + Settings
+# surface) are forwarded to a lazily-spawned `python -m engine.worker`
+# subprocess. AI_CAD_PYTHON = runtime venv interpreter; AI_CAD_REPO = repo
+# root used as the worker CWD so `import services`/`engine_oracle` resolve.
+# These defaults match worker_bridge.cpp's built-in fallbacks; stamped
+# explicitly so the unit is self-documenting and overridable.
+Environment=AI_CAD_PYTHON=%h/.local/share/AI-CAD/runtime/venv/bin/python
+Environment=AI_CAD_REPO=%h/Repositories/CAD
 Restart=on-failure
 RestartSec=2
 # Final autosave on stop needs a moment on big docs.

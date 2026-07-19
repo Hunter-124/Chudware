@@ -52,6 +52,74 @@ _SCHEMA_KIND = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Dirty-scan stamp cache (process-wide)
+# ---------------------------------------------------------------------------
+# worker_rpc opens a fresh Vault per RPC (``_with_vault``), so instance-level
+# memoization never hits across overview/status calls. This module-level map is
+# keyed by the resolved project root and reused across short-lived Vaults in
+# the same process (hostd / web worker bridge).
+#
+# Fast path: if a tracked working file's (mtime_ns, size) matches the stamp
+# captured at the last full content compare against the same HEAD, reuse that
+# dirty verdict without re-reading/exploding the container. Same philosophy as
+# cad_graph.py's mtime fast-path.
+#
+# Correctness bound: a rewrite that keeps both mtime and size identical (rare;
+# same-second equal-size write) may be missed until the TTL elapses or a
+# vault mutation invalidates the entry. Explicit save/checkpoint/add/untrack/
+# restore/release paths always drop the cache for this root.
+_DIRTY_CACHE_TTL_S = 30.0
+# root -> {"t": monotonic, "head": str|None,
+#          "items": {item_id: {"stamp": hashable, "dirty": bool}}}
+_dirty_scan_cache: dict[str, dict[str, Any]] = {}
+
+
+def _vault_cache_key(project_dir: str | os.PathLike) -> str:
+    return str(Path(project_dir).resolve())
+
+
+def _invalidate_dirty_cache(project_dir: str | os.PathLike) -> None:
+    """Drop cached dirty verdicts for *project_dir* (any in-process mutation)."""
+    _dirty_scan_cache.pop(_vault_cache_key(project_dir), None)
+
+
+def _tree_working_stamp(root: Path) -> tuple[tuple[str, int, int], ...]:
+    """Mtime/size fingerprint of a generic tree item (exclusion-filtered).
+
+    Mirrors :func:`generic_snapshot._snapshot_tree` walk policy so a stamp hit
+    means the files that would be content-hashed are unchanged on disk.
+    """
+    from services.plm.generic_snapshot import (  # local: avoid import cycle noise
+        _EXCLUDE_DIR_PREFIXES,
+        _EXCLUDE_DIRS,
+    )
+    out: list[tuple[str, int, int]] = []
+    try:
+        if not root.is_dir():
+            return tuple()
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = sorted(
+                d for d in dirnames
+                if d not in _EXCLUDE_DIRS
+                and not any(d.startswith(p) for p in _EXCLUDE_DIR_PREFIXES)
+            )
+            for fn in sorted(filenames):
+                if fn in _EXCLUDE_DIRS:
+                    continue
+                abs_path = Path(dirpath) / fn
+                try:
+                    st = abs_path.stat()
+                except OSError:
+                    continue
+                rel = abs_path.relative_to(root).as_posix()
+                out.append((rel, int(st.st_mtime_ns), int(st.st_size)))
+    except OSError:
+        return tuple()
+    out.sort()
+    return tuple(out)
+
+
 def _kind_from_schema(schema: str) -> str | None:
     return _SCHEMA_KIND.get(str(schema).split("/", 1)[0])
 
@@ -132,6 +200,10 @@ class Vault:
         ``scope`` filters by entry scope: ``design`` (default — the curated
         timeline, hiding planning-store churn), ``planning`` (only task/issue/
         milestone changes), or ``all``.
+
+        When *item_id* is omitted (hub overview / full timeline), entry views are
+        built from a few path-direct blob reads per commit instead of flattening
+        the whole shadow tree — ME489-scale trees are hundreds of blobs.
         """
         entries: list[dict[str, Any]] = []
         prev_sig: object | None = None
@@ -142,18 +214,20 @@ class Vault:
                 cmeta = self._bind.commit_meta(commit)
                 if hist.scope_from_commit_message(cmeta["message"]) != scope:
                     continue
-            tree = self._bind.read_tree(commit)
-            # per-item filter: include only commits where this item's content
-            # changed. CAD items key on document.json; generic (non-container)
-            # items key on their whole content-blob set (no document.json).
             if item_id is not None:
+                tree = self._bind.read_tree(commit)
+                # per-item filter: include only commits where this item's content
+                # changed. CAD items key on document.json; generic (non-container)
+                # items key on their whole content-blob set (no document.json).
                 cur = self._item_content_signature(tree, item_id)
                 if not first and cur == prev_sig:
                     prev_sig = cur
                     continue
                 prev_sig = cur
                 first = False
-            entries.append(self._entry_view(commit, tree, item_id))
+                entries.append(self._entry_view(commit, tree, item_id))
+            else:
+                entries.append(self._entry_view_light(commit))
             if limit is not None and len(entries) >= limit:
                 break
         return entries
@@ -211,6 +285,7 @@ class Vault:
                 commit = self._bind.commit_tree(files, emeta)
             except gitbind.ConcurrentUpdate:
                 continue  # HEAD advanced under us — rebuild against the new snapshot and retry
+            _invalidate_dirty_cache(self.project_dir)
             return {"commit": commit, "kind": kind,
                     "entry": self._entry_view(commit, self._bind.read_tree(commit), item_id)}
         raise VaultError("write_conflict",
@@ -415,6 +490,7 @@ class Vault:
             kind=hist.KIND_AUTO, message="",
             author_name=author["display"], author_email=f'{author["id"]}@aicad.local')
         self._bind.commit_tree(files, emeta)
+        _invalidate_dirty_cache(self.project_dir)
         if checkout_path:
             self.set_local_config({"link_checkouts": {iid: str(checkout_path)}})
         m = self.manifest()
@@ -496,13 +572,18 @@ class Vault:
         m = self.manifest()
         dirty = self._dirty_items(m)
         head = self._bind.head_commit()
-        head_tree = self._bind.read_tree(head) if head else {}
+        # Path-direct blob reads — do not flatten the whole HEAD tree just for
+        # three planning JSON files (ME489-scale trees are hundreds of blobs).
+        def _plan_blob(name: str) -> bytes | None:
+            if head is None:
+                return None
+            return self._bind.read_blob_at(head, f"planning/{name}")
         tasks = planning.entities(
-            planning.load(head_tree.get("planning/tasks.json"), "task"), "task")
+            planning.load(_plan_blob("tasks.json"), "task"), "task")
         issues = planning.entities(
-            planning.load(head_tree.get("planning/issues.json"), "issue"), "issue")
+            planning.load(_plan_blob("issues.json"), "issue"), "issue")
         miles = planning.entities(
-            planning.load(head_tree.get("planning/milestones.json"), "milestone"), "milestone")
+            planning.load(_plan_blob("milestones.json"), "milestone"), "milestone")
         open_tasks = [t for t in tasks if t.get("status") != "done"]
         open_issues = [i for i in issues if i.get("state") == "open"]
         open_ms = sorted(
@@ -551,7 +632,9 @@ class Vault:
             kind=hist.KIND_AUTO, message="",
             author_name=author["display"], author_email=f'{author["id"]}@aicad.local',
         )
-        return self._bind.commit_tree(files, emeta)
+        commit = self._bind.commit_tree(files, emeta)
+        _invalidate_dirty_cache(self.project_dir)
+        return commit
 
     # -- deterministic message drafting (T-R3) ------------------------------
 
@@ -718,6 +801,7 @@ class Vault:
             author_name=author["display"], author_email=f'{author["id"]}@aicad.local',
         )
         pinned_commit = self._bind.commit_tree(files, pin_meta)
+        _invalidate_dirty_cache(self.project_dir)
 
         return {"commit": pinned_commit, "release_commit": commit, "rev": new_rev,
                 "entry": self._entry_view(pinned_commit, self._bind.read_tree(pinned_commit), item_id),
@@ -926,33 +1010,184 @@ class Vault:
         except Exception:
             return ""
 
+    def _working_stamp(self, it: dict[str, Any]) -> object | None:
+        """Stat fingerprint of an item's working path, or None if unreadable.
+
+        Containers/files: ``(mtime_ns, size)``. Tree items: sorted per-file
+        ``(rel, mtime_ns, size)`` tuples under the exclusion walk. Links have
+        no working file (content lives in the shadow tree only) — stamped as
+        the sentinel ``("link",)`` so they still cache.
+        """
+        dt = it.get("doc_type")
+        if dt and dt in doctypes.GENERIC_DOC_TYPES:
+            store = doctypes.storage_form(dt)
+            if store == "link":
+                return ("link",)
+            path = self.project_dir / it["path"]
+            if store == "tree":
+                if not path.is_dir():
+                    return ("missing",)
+                return ("tree", _tree_working_stamp(path))
+            # file
+            try:
+                if not path.is_file():
+                    return ("missing",)
+                st = path.stat()
+                return ("file", int(st.st_mtime_ns), int(st.st_size))
+            except OSError:
+                return ("missing",)
+        path = self.project_dir / it["path"]
+        try:
+            if not path.is_file():
+                return None
+            st = path.stat()
+            return ("container", int(st.st_mtime_ns), int(st.st_size))
+        except OSError:
+            return None
+
     def _dirty_items(self, m: dict[str, Any]) -> list[str]:
-        """Return item_ids whose working container differs from HEAD's canonical form."""
+        """Return item_ids whose working container differs from HEAD's canonical form.
+
+        Hot path for overview/status. On a warm process, unchanged working files
+        skip ``snapshot.explode_container`` / generic content hashing via the
+        module-level stamp cache (see ``_dirty_scan_cache``). A full compare
+        always runs on cache miss, TTL expiry, HEAD change, or stamp mismatch.
+        """
         head = self._bind.head_commit()
         if head is None:
             return [it["item_id"] for it in m["items"]]
-        tree = self._bind.read_tree(head)
+
+        root_key = _vault_cache_key(self.project_dir)
+        now = time.monotonic()
+        cached = _dirty_scan_cache.get(root_key)
+        if (cached is None
+                or cached.get("head") != head
+                or (now - float(cached.get("t", 0.0))) > _DIRTY_CACHE_TTL_S):
+            item_cache: dict[str, dict[str, Any]] = {}
+            cached = {"t": now, "head": head, "items": item_cache}
+            _dirty_scan_cache[root_key] = cached
+        else:
+            item_cache = cached["items"]
+            cached["t"] = now  # sliding freshness while the process keeps reading
+
+        tree: dict[str, bytes] | None = None  # lazy — only for generic is_dirty
         dirty: list[str] = []
+        live_ids: set[str] = set()
+
         for it in m["items"]:
+            iid = it["item_id"]
+            live_ids.add(iid)
+            stamp = self._working_stamp(it)
+            if stamp is None:
+                # container path missing — not dirty (matches prior skip behavior)
+                item_cache.pop(iid, None)
+                continue
+
+            prev = item_cache.get(iid)
+            if prev is not None and prev.get("stamp") == stamp:
+                if prev.get("dirty"):
+                    dirty.append(iid)
+                continue
+
+            # Full content compare (cache miss or working file changed).
+            is_dirty = False
             dt = it.get("doc_type")
             if dt and dt in doctypes.GENERIC_DOC_TYPES:
-                if generic_snapshot.is_dirty(it, self.project_dir, tree):
-                    dirty.append(it["item_id"])
-                continue
-            path = self.project_dir / it["path"]
-            if not path.exists():
-                continue
-            try:
-                exploded = snapshot.explode_container(path.read_bytes())
-            except Exception:
-                continue
-            head_doc = tree.get(snapshot.item_prefix(it["item_id"]) + "document.json")
-            if head_doc != exploded.document_json:
-                dirty.append(it["item_id"])
+                if tree is None:
+                    tree = self._bind.read_tree(head)
+                is_dirty = generic_snapshot.is_dirty(it, self.project_dir, tree)
+            else:
+                path = self.project_dir / it["path"]
+                try:
+                    exploded = snapshot.explode_container(path.read_bytes())
+                except Exception:
+                    item_cache.pop(iid, None)
+                    continue
+                # Path-direct HEAD blob — avoid flattening hundreds of item trees
+                # just to compare document.json on cold overview.
+                head_doc = self._bind.read_blob_at(
+                    head, snapshot.item_prefix(iid) + "document.json")
+                is_dirty = head_doc != exploded.document_json
+
+            item_cache[iid] = {"stamp": stamp, "dirty": is_dirty}
+            if is_dirty:
+                dirty.append(iid)
+
+        # Drop stamps for items no longer in the manifest (untrack / restore).
+        stale = [k for k in item_cache if k not in live_ids]
+        for k in stale:
+            del item_cache[k]
         return dirty
 
     def _item_view(self, it: dict[str, Any]) -> dict[str, Any]:
         return items_mod.item_view(it)
+
+    def _entry_view_light(self, commit: str) -> dict[str, Any]:
+        """Entry view without flattening the whole commit tree.
+
+        Used by overview/full-timeline history. Pulls commit meta + one
+        representative item's meta/summary via path-direct blob reads.
+        """
+        cmeta = self._bind.commit_meta(commit)
+        kind = hist.kind_from_commit_message(cmeta["message"])
+        scope = hist.scope_from_commit_message(cmeta["message"])
+        msg = hist.user_message_from_commit(cmeta["message"])
+        author = {"kind": "user", "id": "user", "display": "User"}
+        ai = None
+        thumb_ref = None
+        summary = ""
+        # Prefer an item_id recorded in a trailer-free scan: read the live
+        # manifest at HEAD once would be wrong for old commits. Instead walk
+        # the commit's items/ tree one level deep (names only, no blob load).
+        pick_iid = self._first_item_id_at(commit)
+        if pick_iid is not None:
+            prefix = snapshot.item_prefix(pick_iid)
+            mraw = self._bind.read_blob_at(commit, prefix + "meta.json")
+            if mraw:
+                import json as _json
+                try:
+                    md = _json.loads(mraw.decode("utf-8"))
+                    author = md.get("author", author)
+                    ai = md.get("ai")
+                except Exception:
+                    pass
+            if self._bind.read_blob_at(commit, prefix + "thumbnail.png") is not None:
+                thumb_ref = prefix + "thumbnail.png"
+            sraw = self._bind.read_blob_at(commit, prefix + "summary.txt")
+            if sraw:
+                summary = sraw.decode("utf-8")
+        return {
+            "commit": commit, "kind": kind, "scope": scope,
+            "authored_at": _iso(cmeta["authored_at"]),
+            "author": author, "ai": ai, "message": msg,
+            "thumbnail_ref": thumb_ref, "summary": summary,
+        }
+
+    def _first_item_id_at(self, commit: str) -> str | None:
+        """First ``items/<id>/`` child name at *commit* without full flatten."""
+        try:
+            c = self._bind._repo[commit.encode("ascii")]  # noqa: SLF001
+            from dulwich.objects import Tree
+            root = self._bind._repo[c.tree]  # noqa: SLF001
+            if not isinstance(root, Tree):
+                return None
+            items_sha = None
+            for entry in root.items():
+                if entry.path == b"items":
+                    items_sha = entry.sha
+                    break
+            if items_sha is None:
+                return None
+            items_tree = self._bind._repo[items_sha]  # noqa: SLF001
+            if not isinstance(items_tree, Tree):
+                return None
+            for entry in items_tree.items():
+                name = entry.path.decode("utf-8", "replace")
+                if name:
+                    return name
+        except Exception:
+            return None
+        return None
 
     def _entry_view(self, commit: str, tree: dict[str, bytes], item_id: str | None) -> dict[str, Any]:
         cmeta = self._bind.commit_meta(commit)

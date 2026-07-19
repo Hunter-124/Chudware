@@ -49,6 +49,29 @@ class ConcurrentUpdate(Exception):
 
 # git binary is an OPTIONAL accelerator; feature-detected once.
 _GIT_ON_PATH: bool | None = None
+# Process-wide flattened-tree cache. Commit contents are content-addressed and
+# immutable, so a tree once read is always valid. worker_rpc opens a fresh
+# GitBinding per call, so this must live at module scope to help warm overview
+# / history / manifest across RPCs. Values are treated as immutable; read_tree
+# returns a shallow copy so callers may mutate their map safely.
+_TREE_CACHE_MAX = 48
+_tree_cache: dict[str, dict[str, bytes]] = {}
+_tree_cache_order: list[str] = []
+
+
+def _tree_cache_get(commit_hex: str) -> dict[str, bytes] | None:
+    return _tree_cache.get(commit_hex)
+
+
+def _tree_cache_put(commit_hex: str, tree: dict[str, bytes]) -> None:
+    if commit_hex in _tree_cache:
+        return
+    _tree_cache[commit_hex] = tree
+    _tree_cache_order.append(commit_hex)
+    while len(_tree_cache_order) > _TREE_CACHE_MAX:
+        old = _tree_cache_order.pop(0)
+        _tree_cache.pop(old, None)
+
 
 
 def git_available() -> bool:
@@ -129,13 +152,58 @@ class GitBinding:
         return head.decode("ascii") if isinstance(head, bytes) else str(head)
 
     def read_tree(self, commit_hex: str) -> dict[str, bytes]:
-        """Return the whole shadow tree at *commit_hex* as ``{path: bytes}``."""
+        """Return the whole shadow tree at *commit_hex* as ``{path: bytes}``.
+
+        Results are memoized process-wide (commits are immutable). The returned
+        dict is a shallow copy — callers may add/remove keys safely.
+        """
+        hit = _tree_cache_get(commit_hex)
+        if hit is not None:
+            return dict(hit)
         commit = self._repo[commit_hex.encode("ascii")]
-        return self._flatten_tree(commit.tree, prefix="")
+        out = self._flatten_tree(commit.tree, prefix="")
+        _tree_cache_put(commit_hex, out)
+        return dict(out)
 
     def read_blob_at(self, commit_hex: str, path: str) -> bytes | None:
-        """Return the bytes of a single shadow-tree path at *commit_hex*, or None."""
-        return self.read_tree(commit_hex).get(path)
+        """Return the bytes of a single shadow-tree path at *commit_hex*, or None.
+
+        Walks only the path components (and uses the tree cache when warm) —
+        never flattens the whole commit just to fetch ``manifest.json``.
+        """
+        hit = _tree_cache_get(commit_hex)
+        if hit is not None:
+            return hit.get(path)
+        try:
+            commit = self._repo[commit_hex.encode("ascii")]
+        except KeyError:
+            return None
+        node_id = commit.tree
+        parts = [p for p in path.split("/") if p]
+        if not parts:
+            return None
+        try:
+            for i, part in enumerate(parts):
+                tree = self._repo[node_id]
+                if not isinstance(tree, Tree):
+                    return None
+                name = part.encode("utf-8")
+                found = None
+                for entry in tree.items():
+                    if entry.path == name:
+                        found = entry
+                        break
+                if found is None:
+                    return None
+                if i == len(parts) - 1:
+                    obj = self._repo[found.sha]
+                    if isinstance(obj, Tree):
+                        return None
+                    return obj.data
+                node_id = found.sha
+        except KeyError:
+            return None
+        return None
 
     def commit_meta(self, commit_hex: str) -> dict[str, Any]:
         """Return commit-level metadata (author, timestamp, message, parents)."""

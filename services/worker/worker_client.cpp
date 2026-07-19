@@ -932,6 +932,41 @@ bool WorkerClient::callImpl(const std::string& method, const json& params, json&
         // the core DLL is unavailable) — continue to the Python worker path below so
         // document creation never hard-breaks when C++ is the default engine.
     }
+#if defined(__EMSCRIPTEN__)
+    // Browser: no Python worker pipe. Fall-through methods (plm_*, git_*, ai_roles_*,
+    // provider accounts, …) ride the same engine channel as doc_*/agent_* above —
+    // engine::call → DaemonConn/EngineClient WS → gateway → hostd, which bridges
+    // engine-unknown methods to its lazily-spawned `python -m engine.worker`.
+    // Map the response into the pipe path's success/failure contract (structured
+    // method errors return true with result={code,message,…}; transport fails false
+    // + errorSink_). onEvent is supported by the daemon channel (live mid-call pushes).
+    // running_ is irrelevant here (tryStartWorker never opens a pipe on web).
+    {
+        std::string cerr;
+        if (engine::call(method, params, result, cerr, timeoutMs, onEvent))
+            return true;
+        // Structured method error envelope (round-trip OK) — same contract as the
+        // pipe path (object error → result + true) and the doc/cam engine branches.
+        if (result.is_object() && result.contains("code")) {
+            err = result.value("message", std::string("rpc error"));
+            return true;
+        }
+        if (result.is_object() && !result.empty()) {
+            // Error object without code (EngineClient stores the error payload in result).
+            err = result.value("message", cerr.empty() ? std::string("rpc error") : cerr);
+            return true;
+        }
+        if (result.is_string()) {
+            // Legacy plain-string method error → false, no errorSink_ (pipe path).
+            err = result.get<std::string>();
+            return false;
+        }
+        // Transport / channel failure (result untouched or empty).
+        err = cerr.empty() ? std::string("engine channel error") : cerr;
+        if (errorSink_) errorSink_(method, err);
+        return false;
+    }
+#else
     if (!running_) {
         err = "worker not started";
         if (errorSink_) errorSink_(method, err);  // W1-B: surface transport failures
@@ -940,12 +975,6 @@ bool WorkerClient::callImpl(const std::string& method, const json& params, json&
     int id = nextId_++;
     json req = {{"id", id}, {"method", method}, {"params", params}};
     std::string line = req.dump() + "\n";
-#if defined(__EMSCRIPTEN__)
-    (void)line;
-    err = "WASM: worker pipe write not available";
-    if (errorSink_) errorSink_(method, err);
-    return false;
-#else
 #ifdef _WIN32
     DWORD wrote = 0;
     if (!WriteFile(childStdinWr_, line.data(), (DWORD)line.size(), &wrote, nullptr)) {
@@ -956,7 +985,6 @@ bool WorkerClient::callImpl(const std::string& method, const json& params, json&
         if (errorSink_) errorSink_(method, err);  // W1-B
         return false;
     }
-#endif  // !__EMSCRIPTEN__
     for (;;) {
         std::string resp;
         if (!readLine(resp, timeoutMs)) {
@@ -1015,4 +1043,5 @@ bool WorkerClient::callImpl(const std::string& method, const json& params, json&
             return false;
         }
     }
+#endif  // !__EMSCRIPTEN__
 }

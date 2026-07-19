@@ -8,7 +8,6 @@ under the per-user knowledge cache (§4); offline mode serves cache only (§5).
 """
 from __future__ import annotations
 
-import os
 import re
 from html.parser import HTMLParser
 from typing import Callable, Optional
@@ -100,25 +99,18 @@ def _valid_url(url: str) -> bool:
 
 
 def _http_get(url: str) -> tuple[str, str, str]:
-    """Live fetch. Returns ``(markdown, final_url, title)``. Uses Firecrawl when a key is
-    present (returns markdown directly), else httpx + the stdlib extractor."""
-    fc_key = os.environ.get("FIRECRAWL_API_KEY")
+    """Live fetch. Returns ``(markdown, final_url, title)``. Uses the Firecrawl key
+    pool when any keys are configured (rotates on rate limits; returns markdown
+    directly), else httpx + the stdlib extractor."""
+    from . import firecrawl_pool
+
     import httpx
 
-    if fc_key:
+    if firecrawl_pool.load_keys():
         try:
-            resp = httpx.post(
-                "https://api.firecrawl.dev/v1/scrape",
-                headers={"Authorization": f"Bearer {fc_key}"},
-                json={"url": url, "formats": ["markdown"]},
-                timeout=60.0,
-            )
-            resp.raise_for_status()
-            data = resp.json().get("data", {})
-            md = data.get("markdown") or ""
+            md, meta = firecrawl_pool.scrape(url)
             if md:
-                title = (data.get("metadata") or {}).get("title", "")
-                return md[:_MAX_CONTENT], url, title
+                return md[:_MAX_CONTENT], url, str(meta.get("title") or "")
         except Exception:  # noqa: BLE001 — degrade to the built-in fetch, never error out
             pass
 

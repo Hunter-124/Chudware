@@ -11,9 +11,12 @@ only produces scratch drafts (default `/tmp/knowledge_drafts/<topic>.md`) that a
 into the real, table-first, hand-authored reference files.
 
 Fetch strategy per URL:
-  1. If `FIRECRAWL_API_KEY` is set, POST to the Firecrawl REST v1 `/scrape` endpoint
-     (https://api.firecrawl.dev/v1/scrape) with `formats: ["markdown"]` and use the returned
-     markdown directly (Firecrawl already does content extraction + boilerplate stripping).
+  1. If any Firecrawl keys are configured (the key pool in
+     `engine/research/firecrawl_pool.py` — `FIRECRAWL_API_KEYS`, `FIRECRAWL_API_KEY`,
+     or config.json `keys.firecrawl`), POST to the Firecrawl REST v1 `/scrape` endpoint
+     with `formats: ["markdown"]` and use the returned markdown directly (Firecrawl
+     already does content extraction + boilerplate stripping). The pool rotates keys
+     automatically when one is rate-limited or out of credits.
   2. Otherwise, fall back to `urllib.request` with a browser-like User-Agent and a crude
      HTML tag-strip (no network dependency beyond the standard library).
 
@@ -27,22 +30,24 @@ so a human curator can trace every fact back to where it came from.
 Usage:
     python3 tools/scrape_knowledge.py --topics fits,threads --out /tmp/knowledge_drafts
     python3 tools/scrape_knowledge.py                      # all built-in topics, default out dir
-    FIRECRAWL_API_KEY=fc-... python3 tools/scrape_knowledge.py --topics bearings
+    FIRECRAWL_API_KEYS=fc-a,fc-b python3 tools/scrape_knowledge.py --topics bearings
 """
 
 from __future__ import annotations
 
 import argparse
 import datetime
-import json
 import re
 import sys
-import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Dict, List
 
-FIRECRAWL_SCRAPE_URL = "https://api.firecrawl.dev/v1/scrape"
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from engine.research import firecrawl_pool  # noqa: E402
 
 BROWSER_USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -112,41 +117,25 @@ def _fetch_urllib(url: str) -> str:
     return _strip_html(html)
 
 
-def _fetch_firecrawl(url: str, api_key: str) -> str:
-    payload = json.dumps({"url": url, "formats": ["markdown"]}).encode("utf-8")
-    req = urllib.request.Request(
-        FIRECRAWL_SCRAPE_URL,
-        data=payload,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        body = json.loads(resp.read().decode("utf-8", errors="replace"))
-    markdown = (body.get("data") or {}).get("markdown")
-    if not markdown:
-        raise ValueError(f"firecrawl response had no markdown for {url}: {body!r}")
-    return markdown
-
-
-def fetch_one(url: str, api_key: str | None) -> str:
-    if api_key:
+def fetch_one(url: str) -> str:
+    if firecrawl_pool.load_keys():
         try:
-            return _fetch_firecrawl(url, api_key)
-        except (urllib.error.URLError, ValueError, json.JSONDecodeError, TimeoutError) as exc:
-            print(f"  ! firecrawl failed for {url}: {exc}; falling back to urllib", file=sys.stderr)
+            markdown, _meta = firecrawl_pool.scrape(url)
+            if markdown:
+                return markdown
+        except Exception as exc:  # noqa: BLE001 — pool exhausted/HTTP issues: degrade
+            print(f"  ! firecrawl pool failed for {url}: {exc}; falling back to urllib",
+                  file=sys.stderr)
     return _fetch_urllib(url)
 
 
-def build_draft(topic: str, urls: List[str], api_key: str | None) -> str:
+def build_draft(topic: str, urls: List[str]) -> str:
     today = _today()
     sections = [f"# DRAFT — {topic}\n", "(auto-generated scrape draft; hand-curate before use)\n"]
     for url in urls:
         print(f"  fetching {url} ...", file=sys.stderr)
         try:
-            content = fetch_one(url, api_key)
+            content = fetch_one(url)
         except Exception as exc:  # noqa: BLE001 - best-effort scraper, keep going
             content = f"(fetch failed: {exc})"
             print(f"  ! {url}: {exc}", file=sys.stderr)
@@ -184,13 +173,13 @@ def main(argv: List[str] | None = None) -> int:
             f"({committed_dir}); pick a scratch --out directory"
         )
 
-    import os
-
-    api_key = os.environ.get("FIRECRAWL_API_KEY") or None
-    if api_key:
-        print("Using Firecrawl REST v1 scrape endpoint.", file=sys.stderr)
+    pool_keys = firecrawl_pool.load_keys()
+    if pool_keys:
+        print(f"Using Firecrawl REST v1 scrape endpoint ({len(pool_keys)} pooled key(s)).",
+              file=sys.stderr)
     else:
-        print("FIRECRAWL_API_KEY not set; falling back to urllib + tag-strip.", file=sys.stderr)
+        print("No Firecrawl keys configured; falling back to urllib + tag-strip.",
+              file=sys.stderr)
 
     requested = [t.strip() for t in args.topics.split(",") if t.strip()]
     unknown = [t for t in requested if t not in TOPIC_URLS]
@@ -200,7 +189,7 @@ def main(argv: List[str] | None = None) -> int:
     for topic in requested:
         urls = TOPIC_URLS[topic]
         print(f"[{topic}] {len(urls)} source(s)", file=sys.stderr)
-        draft = build_draft(topic, urls, api_key)
+        draft = build_draft(topic, urls)
         dest = out_dir / f"{topic}.md"
         dest.write_text(draft, encoding="utf-8")
         print(f"[{topic}] wrote {dest} ({len(draft)} bytes)", file=sys.stderr)

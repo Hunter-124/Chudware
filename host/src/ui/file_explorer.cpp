@@ -15,6 +15,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <cstdint>
 #include <map>
 #include <string>
 #include <vector>
@@ -100,6 +101,29 @@ static std::string s_pendingNewFolder; // a just-created folder to auto-enter in
 // is probed once on first sight, so a list change still paints correctly the same frame.
 static std::map<std::string, bool> s_recentExists;
 static double s_recentExistsAt = -1e9;
+// Directory listing cache: drawDirNode used to call fsb.list() every frame for every open
+// folder. Cache the filtered/sorted children for a short TTL (and bust on mutations / Refresh)
+// so mtime-sorted files don't imply per-frame FS traffic. mtime comes from FsEntry (filled once
+// per list()) — never a separate last_write_time per row.
+struct DirListCache {
+    double scannedAt = -1e9;
+    std::vector<std::string> dirs;   // full paths, name-sorted (case-insensitive)
+    std::vector<std::string> files;  // full paths, mtime-desc (unknown mtime = oldest)
+};
+static std::map<std::string, DirListCache> s_dirListCache;
+static constexpr double kDirListCacheTtlSec = 2.0;
+
+static void invalidateDirListCache() { s_dirListCache.clear(); }
+
+// Hover tooltip: full file/dir name, plus absolute path on a second line when it adds context.
+static void itemPathTooltip(const std::string& name, const std::string& fullPath) {
+    if (!ImGui::IsItemHovered()) return;
+    if (fullPath.empty() || fullPath == name)
+        ImGui::SetTooltip("%s", name.c_str());
+    else
+        ImGui::SetTooltip("%s\n%s", name.c_str(), fullPath.c_str());
+}
+
 
 // ---- known extensions ----------------------------------------------------
 // .step+ is our native part container; the rest are import/interop formats. ECAD/KiCad files open
@@ -201,8 +225,10 @@ static void commitRename(AppState& st, const std::string& root) {
     }
     std::string err;
     if (fsb.exists(newP)) { st.toast(ui::ToastLevel::Warn, "A file with that name exists"); return; }
-    if (!fsb.rename(oldP, newP, err)) st.toast(ui::ToastLevel::Error, "Rename failed: " + err);
-    else {
+    if (!fsb.rename(oldP, newP, err)) {
+        st.toast(ui::ToastLevel::Error, "Rename failed: " + err);
+    } else {
+        invalidateDirListCache();
         st.addLog("[explorer] renamed " + pathFilename(oldP) + " -> " + newName);
         if (s_selectedPath == oldP) s_selectedPath = newP;
     }
@@ -240,6 +266,8 @@ static bool doPaste(AppState& st, const std::string& root, const std::string& de
         return false;
     }
     st.addLog("[explorer] pasted -> " + dest);
+    invalidateDirListCache();
+
     st.toast(ui::ToastLevel::Info, "Pasted " + pathFilename(dest));
     s_selectedPath = dest;
     return true;
@@ -259,6 +287,8 @@ static void createNewFolder(AppState& st, const std::string& root, const std::st
         s_pendingNewFolder = cand;
         s_currentFolder = dir;
         st.addLog("[explorer] new folder " + cand);
+        invalidateDirListCache();
+
     } else {
         st.toast(ui::ToastLevel::Error, "New Folder failed" + (err.empty() ? "" : (": " + err)));
     }
@@ -337,12 +367,15 @@ static void drawFileRow(AppState& st, const std::string& root, const std::string
             if (ImGui::MenuItem("Delete", "Del")) s_pendingDelete = pathStr;
             ImGui::EndPopup();
         }
+        itemPathTooltip(fname, pathStr);
     }
     ImGui::PopID();
 }
 
 // Recursively draw a directory: a tree node that lazy-lists its children on open. Folders first
-// (sorted), then known files (sorted). Hidden/dot entries and unknown extensions are skipped.
+// (name-sorted), then known files (mtime-desc). Hidden/dot entries and unknown extensions are
+// skipped. Children come from s_dirListCache (TTL + mutation bust) so open folders don't re-stat
+// every frame.
 static void drawDirNode(AppState& st, const std::string& root, const std::string& dir, bool isRoot) {
     auto& fsb = billet::fsBackend();
     // The "Workspace" section rule above the tree already names the section; the root row just
@@ -385,6 +418,7 @@ static void drawDirNode(AppState& st, const std::string& root, const std::string
         s_selectedPath = dir;
         s_currentFolder = dir;
     }
+    itemPathTooltip(label, dir);
     // folder context menu (New Folder / Paste / Rename / Delete — root only allows New Folder/Paste)
     if (ImGui::BeginPopupContextItem("##dctx")) {
         s_selectedPath = dir;
@@ -408,24 +442,46 @@ static void drawDirNode(AppState& st, const std::string& root, const std::string
     }
 
     if (open) {
-        // gather + sort children (folders first, then known files)
-        std::string listErr;
-        auto entries = fsb.list(dir, listErr);
-        std::vector<std::string> dirs, files;
-        for (const auto& e : entries) {
-            if (e.name.empty() || e.name[0] == '.') continue;
-            std::string full = pathJoin(dir, e.name);
-            if (e.isDir) dirs.push_back(full);
-            else if (isKnownExt(lowerExt(e.name))) files.push_back(full);
+        // Cache-aware gather + sort: dirs by name, files by mtime desc (FsEntry.mtime from list()).
+        const double now = ImGui::GetTime();
+        auto cacheIt = s_dirListCache.find(dir);
+        if (cacheIt == s_dirListCache.end() ||
+            (now - cacheIt->second.scannedAt) > kDirListCacheTtlSec) {
+            DirListCache fresh;
+            fresh.scannedAt = now;
+            std::string listErr;
+            auto entries = fsb.list(dir, listErr);
+            std::vector<std::pair<std::string, int64_t>> filePairs;  // path, mtime
+            for (const auto& e : entries) {
+                if (e.name.empty() || e.name[0] == '.') continue;
+                std::string full = pathJoin(dir, e.name);
+                if (e.isDir) {
+                    fresh.dirs.push_back(std::move(full));
+                } else if (isKnownExt(lowerExt(e.name))) {
+                    // mtime==0 (unknown/error) sorts as oldest per contract.
+                    filePairs.emplace_back(std::move(full), e.mtime);
+                }
+            }
+            auto byName = [](const std::string& a, const std::string& b) {
+                std::string an = pathFilename(a), bn = pathFilename(b);
+                std::transform(an.begin(), an.end(), an.begin(), ::tolower);
+                std::transform(bn.begin(), bn.end(), bn.begin(), ::tolower);
+                return an < bn;
+            };
+            std::sort(fresh.dirs.begin(), fresh.dirs.end(), byName);
+            // Newest first; tie-break by name for stable order when mtimes match.
+            std::sort(filePairs.begin(), filePairs.end(),
+                      [&](const std::pair<std::string, int64_t>& a,
+                          const std::pair<std::string, int64_t>& b) {
+                          if (a.second != b.second) return a.second > b.second;
+                          return byName(a.first, b.first);
+                      });
+            fresh.files.reserve(filePairs.size());
+            for (auto& fp : filePairs) fresh.files.push_back(std::move(fp.first));
+            cacheIt = s_dirListCache.insert_or_assign(dir, std::move(fresh)).first;
         }
-        auto byName = [](const std::string& a, const std::string& b) {
-            std::string an = pathFilename(a), bn = pathFilename(b);
-            std::transform(an.begin(), an.end(), an.begin(), ::tolower);
-            std::transform(bn.begin(), bn.end(), bn.begin(), ::tolower);
-            return an < bn;
-        };
-        std::sort(dirs.begin(), dirs.end(), byName);
-        std::sort(files.begin(), files.end(), byName);
+        const auto& dirs = cacheIt->second.dirs;
+        const auto& files = cacheIt->second.files;
         for (const auto& d : dirs) drawDirNode(st, root, d, /*isRoot=*/false);
         for (const auto& f : files) drawFileRow(st, root, f, lowerExt(f));
         if (dirs.empty() && files.empty())
@@ -476,7 +532,7 @@ static void drawRecentSection(AppState& st) {
             ImGui::TextUnformatted(fname.c_str());
             ImGui::EndDragDropSource();
         }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", rp.c_str());
+        itemPathTooltip(fname, rp);
         ImGui::PopID();
     }
 }
@@ -497,8 +553,10 @@ static void drawDeleteModal(AppState& st, const std::string& root) {
                 st.toast(ui::ToastLevel::Warn, "Delete blocked outside the workspace");
             } else {
                 std::string err;
-                if (!fsb.remove(p, err)) st.toast(ui::ToastLevel::Error, "Delete failed: " + err);
-                else {
+                if (!fsb.remove(p, err)) {
+                    st.toast(ui::ToastLevel::Error, "Delete failed: " + err);
+                } else {
+                    invalidateDirListCache();
                     st.addLog("[explorer] deleted " + p);
                     st.toast(ui::ToastLevel::Info, "Deleted " + pathFilename(p));
                     if (s_selectedPath == s_pendingDelete) s_selectedPath.clear();
@@ -553,8 +611,10 @@ void drawFileExplorerBody(AppState& st) {
                              !s_clipboardPath.empty()) && !s_clipboardPath.empty())
         doPaste(st, root, current);
     ImGui::SameLine(0, 3.0f * ui::uiScale);
-    if (ui::fmToolbarIconBtn("fx_refresh", "refresh", "Refresh", true))
+    if (ui::fmToolbarIconBtn("fx_refresh", "refresh", "Refresh", true)) {
+        invalidateDirListCache();
         st.toast(ui::ToastLevel::Info, "Explorer refreshed");
+    }
 
     // Breadcrumb: the current folder, in an FM row pill (secondary ink, frame-padded centering).
     {

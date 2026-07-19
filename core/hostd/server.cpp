@@ -14,6 +14,7 @@
 
 #include "../../services/worker/cpp_core.h"
 #include "hostd_log.h"
+#include "worker_bridge.h"
 
 namespace hostd {
 
@@ -532,6 +533,37 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
     const bool engineOk = core::cpp_core().call(method, p, result, err);
     endInflight(c.id);
     if (!engineOk) {
+        // Engine-unknown only: forward to the lazily-spawned Python worker
+        // (plm_*, git_*, ai_roles_*, provider accounts, …). Known-method
+        // failures stay on the engine error path byte-identical — never mask
+        // a real engine error behind a worker round-trip. Bridge call holds
+        // only WorkerBridge's own mutex (one stdio channel); this dispatch
+        // thread alone blocks, so other clients keep serving engine RPCs.
+        const bool unknown =
+            err.rfind("unknown method:", 0) == 0 ||
+            (result.is_object() && result.contains("error") && result["error"].is_string() &&
+             result["error"].get<std::string>().rfind("unknown method:", 0) == 0);
+        if (unknown) {
+            json wresult;
+            std::string werr;
+            if (WorkerBridge::instance().call(method, p, wresult, werr)) {
+                // Worker success: return result verbatim. No registry postCall —
+                // these methods are not engine doc ops.
+                return wresult;
+            }
+            isError = true;
+            // Prefer the worker's structured envelope when present; else a
+            // transport-level failure. Verbatim enough for clients that key on
+            // code/message (including the worker's own unknown-method error).
+            if (wresult.is_object() && (wresult.contains("code") || wresult.contains("message"))) {
+                if (!wresult.contains("message"))
+                    wresult["message"] = !werr.empty() ? werr : std::string("worker error");
+                if (!wresult.contains("code")) wresult["code"] = "worker_error";
+                return wresult;
+            }
+            return json{{"code", "worker_error"},
+                        {"message", !werr.empty() ? werr : std::string("worker bridge failed")}};
+        }
         isError = true;
         // Normalize: clients (CoreError mapping) rely on a "message" field. Keep
         // whatever in-band payload the engine produced ({"error":...}, OpError

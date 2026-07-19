@@ -791,11 +791,14 @@ void rebuildForce(GraphTabState& G) {
     const float S = ui::uiScale;
     // Looser d3-style spacing: longer springs + stronger repulsion + roomy
     // collision pad so sized hubs don't pack into a hairball.
-    const float collPad = 10.0f * S;
-    G.force.setLinkDistance(170.0f * S);
-    G.force.setRepulsion(1400.0f * S * S * (170.0f / 60.0f) * (170.0f / 60.0f));
+    const float collPad = 12.0f * S;
+    G.force.setLinkDistance(190.0f * S);
+    G.force.setRepulsion(1600.0f * S * S * (190.0f / 60.0f) * (190.0f / 60.0f));
     G.force.setCollision(11.0f, collPad);
-    G.force.setVelocityDecay(0.6f);
+    G.force.setVelocityDecay(0.55f);
+    G.force.setCentering(0.015f);
+    // Cluster gravity — O(N) pull toward connected-component centroids.
+    G.force.setGroupPull(0.08f);
 
     // Node sizing metric (d3-style: area ∝ importance). Structural nodes use
     // their hidden-descendant count (features/sketches inside the document);
@@ -813,6 +816,65 @@ void rebuildForce(GraphTabState& G) {
     for (const auto& [id, qty] : G.instCount) {
         auto it = G.idIndex.find(id);
         if (it != G.idIndex.end()) degree[it->second] += qty;
+    }
+
+    // ---- Connected components on "binding" edges (O(N+E)) --------------------
+    // Group parts that share mates / instances / depends / contains structure.
+    // Weak REFERENCES alone do not bridge components — keeps clusters meaningful.
+    auto bindingKind = [](const std::string& k) {
+        return k == "MATES" || k == "INSTANCE_OF" || k == "DEPENDS_ON" ||
+               k == "CONTAINS" || k == "DERIVES_FROM";
+    };
+    std::unordered_map<std::string, int> visOrd;  // node id → 0..V-1
+    visOrd.reserve(G.visibleIdx.size() * 2);
+    for (int i = 0; i < (int)G.visibleIdx.size(); ++i)
+        visOrd[G.nodes[G.visibleIdx[i]].id] = i;
+    const int V = (int)G.visibleIdx.size();
+    std::vector<std::vector<int>> adj(static_cast<size_t>(V));
+    for (const auto& e : G.visibleEdges) {
+        if (G.hiddenKinds.count(e.kind) || !bindingKind(e.kind)) continue;
+        auto a = visOrd.find(e.src), b = visOrd.find(e.dst);
+        if (a == visOrd.end() || b == visOrd.end()) continue;
+        adj[static_cast<size_t>(a->second)].push_back(b->second);
+        adj[static_cast<size_t>(b->second)].push_back(a->second);
+    }
+    std::vector<int> comp(static_cast<size_t>(V), -1);
+    int nComp = 0;
+    std::vector<int> stack;
+    stack.reserve(static_cast<size_t>(V));
+    for (int i = 0; i < V; ++i) {
+        if (comp[static_cast<size_t>(i)] >= 0) continue;
+        const int cid = nComp++;
+        stack.clear();
+        stack.push_back(i);
+        comp[static_cast<size_t>(i)] = cid;
+        while (!stack.empty()) {
+            int u = stack.back(); stack.pop_back();
+            for (int v : adj[static_cast<size_t>(u)]) {
+                if (comp[static_cast<size_t>(v)] >= 0) continue;
+                comp[static_cast<size_t>(v)] = cid;
+                stack.push_back(v);
+            }
+        }
+    }
+    // Deterministic cluster well centers on a ring (sorted by component size).
+    std::vector<int> compSize(static_cast<size_t>(std::max(nComp, 1)), 0);
+    for (int c : comp) if (c >= 0) compSize[static_cast<size_t>(c)]++;
+    std::vector<int> order(static_cast<size_t>(nComp));
+    for (int i = 0; i < nComp; ++i) order[static_cast<size_t>(i)] = i;
+    std::sort(order.begin(), order.end(), [&](int a, int b) {
+        if (compSize[static_cast<size_t>(a)] != compSize[static_cast<size_t>(b)])
+            return compSize[static_cast<size_t>(a)] > compSize[static_cast<size_t>(b)];
+        return a < b;
+    });
+    std::vector<std::pair<float,float>> well(static_cast<size_t>(std::max(nComp, 1)), {0.f, 0.f});
+    if (nComp > 1) {
+        const float ring = 220.0f * S * std::sqrt((float)std::max(nComp, 1));
+        for (int oi = 0; oi < nComp; ++oi) {
+            const int cid = order[static_cast<size_t>(oi)];
+            const float ang = (float)oi * (6.28318530718f / (float)nComp) - 1.57079632679f;
+            well[static_cast<size_t>(cid)] = { ring * std::cos(ang), ring * std::sin(ang) };
+        }
     }
 
     // Collision radius may exceed disc radius so label boxes don't stack.
@@ -840,12 +902,21 @@ void rebuildForce(GraphTabState& G) {
         collR[vi] = collRadius;
 
         float sx = n.lx, sy = n.ly;
+        const int vOrd = visOrd.count(n.id) ? visOrd[n.id] : -1;
+        const int cid = (vOrd >= 0) ? comp[static_cast<size_t>(vOrd)] : -1;
         // Scope root seeds at origin so isolate view frames on the drilled node.
         if (!G.scopeDocId.empty() && n.id == G.scopeDocId &&
             sx == 0.0f && sy == 0.0f) {
             sx = 0.0f;
             sy = 0.0f;
         } else if (sx == 0.0f && sy == 0.0f) {
+            // Fresh nodes: seed near their component well (deterministic cluster
+            // layout) with a small golden-angle jitter — never fight persisted lx/ly.
+            float wx = 0.f, wy = 0.f;
+            if (cid >= 0 && cid < (int)well.size()) {
+                wx = well[static_cast<size_t>(cid)].first;
+                wy = well[static_cast<size_t>(cid)].second;
+            }
             bool seeded = false;
             auto pit = G.containsParent.find(n.id);
             if (pit != G.containsParent.end()) {
@@ -854,25 +925,40 @@ void rebuildForce(GraphTabState& G) {
                     const GNode& p = G.nodes[pi->second];
                     if (p.lx != 0.0f || p.ly != 0.0f) {
                         const float a = (float)fresh * GOLDEN;
-                        sx = p.lx + 70.0f * S * std::cos(a);
-                        sy = p.ly + 70.0f * S * std::sin(a);
+                        sx = p.lx + 80.0f * S * std::cos(a);
+                        sy = p.ly + 80.0f * S * std::sin(a);
                         seeded = true;
                     }
                 }
             }
             if (!seeded) {
-                const float rr = 150.0f * S * std::sqrt((float)fresh);
+                const float rr = 40.0f * S * std::sqrt((float)std::max(fresh, 1));
                 const float a = (float)fresh * GOLDEN;
-                sx = rr * std::cos(a);
-                sy = rr * std::sin(a);
+                sx = wx + rr * std::cos(a);
+                sy = wy + rr * std::sin(a);
             }
             ++fresh;
         }
-        G.forceSlot[vi] = G.force.addNode(sx, sy, collRadius);
+        const int slot = G.force.addNode(sx, sy, collRadius);
+        G.forceSlot[vi] = slot;
+        if (cid >= 0) G.force.setGroup(slot, cid);
     }
 
-    // Springs per visible edge; kind tunes rest length / stiffness. Rest
-    // lengths floor at collision separation so discs never fight springs.
+    // Springs per visible edge; kind tunes rest / stiffness. Cap springs per
+    // node (~12) so dense project graphs stay O(N) and don't form hairballs —
+    // keep strongest binding edges first (MATES > INSTANCE > DEPENDS > …).
+    auto kindPri = [](const std::string& k) -> int {
+        if (k == "MATES") return 0;
+        if (k == "INSTANCE_OF") return 1;
+        if (k == "DEPENDS_ON") return 2;
+        if (k == "CONTAINS") return 3;
+        if (k == "DERIVES_FROM") return 4;
+        if (k == "REFERENCES") return 5;
+        return 6;
+    };
+    struct Cand { int a, b; float rest, strength; int pri; int agg; };
+    std::vector<Cand> cands;
+    cands.reserve(G.visibleEdges.size());
     for (const auto& e : G.visibleEdges) {
         if (G.hiddenKinds.count(e.kind)) continue;
         auto si = G.idIndex.find(e.src), di = G.idIndex.find(e.dst);
@@ -884,17 +970,35 @@ void rebuildForce(GraphTabState& G) {
         const float rb = collR.count(di->second) ? collR[di->second]
                                                  : G.nodes[di->second].radius;
         const float radii = G.nodes[si->second].radius + G.nodes[di->second].radius;
-        float kindRest = 150.0f, strength = 0.40f;
-        if (e.kind == "CONTAINS")               { kindRest = 120.0f; strength = 0.60f; }
-        else if (e.kind == "INSTANCE_OF")       { kindRest = 130.0f; strength = 0.70f; }
-        else if (e.kind == "DEPENDS_ON")        { kindRest = 170.0f; strength = 0.50f; }
-        else if (e.kind == "MATES")             { kindRest = 140.0f; strength = 0.75f; }
+        float kindRest = 160.0f, strength = 0.35f;
+        if (e.kind == "CONTAINS")               { kindRest = 150.0f; strength = 0.45f; }
+        else if (e.kind == "INSTANCE_OF")       { kindRest = 140.0f; strength = 0.72f; }
+        else if (e.kind == "DEPENDS_ON")        { kindRest = 180.0f; strength = 0.48f; }
+        else if (e.kind == "MATES")             { kindRest = 130.0f; strength = 0.80f; }
         else if (e.kind == "REFERENCES" ||
-                 e.kind == "DERIVES_FROM")      { kindRest = 210.0f; strength = 0.30f; }
-        if (e.aggCount > 1) strength += std::min(0.25f, 0.04f * (float)(e.aggCount - 1));
-        const float rest = std::max(kindRest * S + 1.15f * radii,
+                 e.kind == "DERIVES_FROM")      { kindRest = 240.0f; strength = 0.22f; }
+        if (e.aggCount > 1) strength += std::min(0.20f, 0.03f * (float)(e.aggCount - 1));
+        const float rest = std::max(kindRest * S + 1.20f * radii,
                                     ra + rb + collPad);
-        G.force.addEdge(a, b, rest, strength);
+        cands.push_back({a, b, rest, strength, kindPri(e.kind), e.aggCount});
+    }
+    std::sort(cands.begin(), cands.end(), [](const Cand& x, const Cand& y) {
+        if (x.pri != y.pri) return x.pri < y.pri;
+        if (x.agg != y.agg) return x.agg > y.agg;
+        return x.strength > y.strength;
+    });
+    constexpr int kMaxSpringsPerNode = 12;
+    std::unordered_map<int, int> springCount;
+    springCount.reserve(cands.size() * 2);
+    for (const Cand& c : cands) {
+        int& ca = springCount[c.a];
+        int& cb = springCount[c.b];
+        // Always keep top-priority mates/instance even if one end is saturated.
+        if (c.pri > 2 && (ca >= kMaxSpringsPerNode || cb >= kMaxSpringsPerNode))
+            continue;
+        if (ca >= kMaxSpringsPerNode && cb >= kMaxSpringsPerNode) continue;
+        G.force.addEdge(c.a, c.b, c.rest, c.strength);
+        ++ca; ++cb;
     }
 
     G.force.reheat(fresh > (int)G.visibleIdx.size() / 2 ? 0.8f : 0.35f);
@@ -906,12 +1010,14 @@ void rebuildForce(GraphTabState& G) {
     // scopes can't hitch the UI) — the first painted frame is already
     // semi-relaxed instead of an exploding seed spiral.
     const auto t0 = std::chrono::steady_clock::now();
-    for (int i = 0; i < 120; ++i) {
+    // Clustered seed + group pull settles faster; allow a slightly longer
+    // first-paint burst (still wall-capped) so the hairball never flashes.
+    for (int i = 0; i < 180; ++i) {
         G.force.step(1.0f / 60.0f);
         if (G.force.settled()) break;
         if ((i & 15) == 15 &&
             std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - t0).count() > 14.0)
+                std::chrono::steady_clock::now() - t0).count() > 22.0)
             break;
     }
     for (int vi : G.visibleIdx) {
@@ -1692,52 +1798,116 @@ void drawSidePanel(AppState& st, float panelW) {
 
     ImGui::Dummy(ImVec2(0, 8 * S));
 
-    // ---- identity fields ---------------------------------------------------
-    row("kind", sel->kind);
-    row("id", sel->id);
-    row("origin", sel->origin);
-
-    // Document — clickable open button (not a dead "doc" dump of the id).
-    {
-        std::string openTarget;
-        std::string openLabel;
-        const bool isDocLike = isDrillableKind(sel->kind) || sel->kind == "project";
-        if (isDocLike && !sel->path.empty()) {
-            openTarget = resolveNodeAbsPath(st, *sel);
-            openLabel = sel->label.empty() ? sel->path : sel->label;
-        } else if (!sel->docId.empty()) {
-            auto dit = G.idIndex.find(sel->docId);
-            if (dit != G.idIndex.end() && !G.nodes[dit->second].path.empty()) {
-                openTarget = resolveNodeAbsPath(st, G.nodes[dit->second]);
-                openLabel = G.nodes[dit->second].label.empty()
-                    ? G.nodes[dit->second].path : G.nodes[dit->second].label;
-            } else {
-                openLabel = sel->docId;
-            }
-        }
-        if (!openLabel.empty()) {
-            panelFieldLabel("document");
-            ImGui::SameLine(0, 8 * S);
-            if (!openTarget.empty()) {
-                if (ImGui::SmallButton((openLabel + "##opennode").c_str()))
-                    st.requestOpenPath = openTarget;
-                if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
-                    ImGui::SetTooltip("Open %s", openTarget.c_str());
-            } else {
-                ImGui::PushStyleColor(ImGuiCol_Text,
-                    ImVec4(palette.textDim[0], palette.textDim[1],
-                           palette.textDim[2], 1.0f));
-                ImGui::TextWrapped("%s", openLabel.c_str());
-                ImGui::PopStyleColor();
-            }
-        }
+    // Resolve open path once for preview + actions.
+    std::string absPath;
+    if ((isDrillableKind(sel->kind) || sel->kind == "project") && !sel->path.empty())
+        absPath = resolveNodeAbsPath(st, *sel);
+    else if (!sel->docId.empty()) {
+        auto dit = G.idIndex.find(sel->docId);
+        if (dit != G.idIndex.end() && !G.nodes[dit->second].path.empty())
+            absPath = resolveNodeAbsPath(st, G.nodes[dit->second]);
     }
 
-    // Path — folder-icon button reveals the containing folder.
+    // ---- iso preview (package thumbnail / last-solved art) -----------------
+    // Fills the empty inspector band under the title — SolidWorks-style card.
+    {
+        const float previewH = 148.0f * S;
+        const float previewW = ImGui::GetContentRegionAvail().x;
+        const ImVec2 p0 = ImGui::GetCursorScreenPos();
+        const ImVec2 p1(p0.x + previewW, p0.y + previewH);
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        ui::glassBackground(dl, p0, p1, 10.0f);
+        dl->AddRect(p0, p1,
+            ImGui::GetColorU32(ImVec4(palette.glassBorder[0], palette.glassBorder[1],
+                                      palette.glassBorder[2], 0.55f)), 10.0f * S, 0, 1.0f * S);
+
+        const GraphThumb* th = nullptr;
+        if (!absPath.empty()) th = ensureGraphThumb(absPath);
+        // Also try the node's own path if different from open target.
+        if (!th && !sel->path.empty()) {
+            const std::string own = resolveNodeAbsPath(st, *sel);
+            if (!own.empty() && own != absPath) th = ensureGraphThumb(own);
+        }
+
+        if (th && th->tex) {
+            float tw = (float)th->w, thh = (float)th->h;
+            const float pad = 10.0f * S;
+            const float maxW = previewW - pad * 2, maxH = previewH - pad * 2;
+            float sc = std::min(maxW / std::max(tw, 1.f), maxH / std::max(thh, 1.f));
+            tw *= sc; thh *= sc;
+            const ImVec2 ip0(p0.x + (previewW - tw) * 0.5f,
+                             p0.y + (previewH - thh) * 0.5f);
+            dl->AddImage((ImTextureID)(intptr_t)th->tex, ip0,
+                         ImVec2(ip0.x + tw, ip0.y + thh));
+        } else {
+            // Empty state — kind glyph + short hint (no dead white box).
+            const char* hint = absPath.empty()
+                ? "No preview"
+                : "No preview yet";
+            const ImVec2 hsz = ImGui::CalcTextSize(hint);
+            dl->AddText(ImVec2(p0.x + (previewW - hsz.x) * 0.5f,
+                               p0.y + (previewH - hsz.y) * 0.5f),
+                        Palette::toU32(palette.textDisabled), hint);
+            // Soft kind disc behind the hint.
+            const float r = 22.0f * S;
+            dl->AddCircleFilled(ImVec2(p0.x + previewW * 0.5f, p0.y + previewH * 0.38f),
+                                r, kindColor(sel->kind, 0.35f), 28);
+        }
+        ImGui::Dummy(ImVec2(previewW, previewH));
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal) && !absPath.empty())
+            ImGui::SetTooltip("%s", absPath.c_str());
+    }
+
+    ImGui::Dummy(ImVec2(0, 10 * S));
+
+    // ---- compact facts (no raw id dump; path is the locator) ---------------
+    {
+        int outE = 0, inE = 0;
+        for (const auto& e : G.edges) {
+            if (e.src == sel->id) ++outE;
+            if (e.dst == sel->id) ++inE;
+        }
+        char linksBuf[48];
+        std::snprintf(linksBuf, sizeof(linksBuf), "%d out · %d in", outE, inE);
+
+        // One-line summary chips instead of a wall of key/value.
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
+        ImGui::Text("%s", sel->kind.c_str());
+        ImGui::SameLine(0, 10 * S);
+        ImGui::TextUnformatted("·");
+        ImGui::SameLine(0, 10 * S);
+        ImGui::TextUnformatted(linksBuf);
+        if (G.scopeDocId.empty()) {
+            auto dit = G.descCounts.find(sel->id);
+            if (dit != G.descCounts.end() && dit->second.total() > 0) {
+                ImGui::SameLine(0, 10 * S);
+                ImGui::TextUnformatted("·");
+                ImGui::SameLine(0, 10 * S);
+                {
+                    const std::string badge = formatDescBadge(dit->second);
+                    ImGui::TextUnformatted(badge.c_str());
+                }
+            }
+        }
+        if (G.scopeDecomp) {
+            auto qit = G.instCount.find(sel->id);
+            if (qit != G.instCount.end() && qit->second > 0) {
+                ImGui::SameLine(0, 10 * S);
+                ImGui::TextUnformatted("·");
+                ImGui::SameLine(0, 10 * S);
+                ImGui::Text("×%d", qit->second);
+            }
+        }
+        ImGui::PopStyleColor();
+    }
+
+    // Path row with folder reveal — keep; hide full id under a details fold.
     if (!sel->path.empty()) {
+        ImGui::Dummy(ImVec2(0, 6 * S));
         panelFieldLabel("path");
         ImGui::SameLine(0, 8 * S);
-        const std::string abs = resolveNodeAbsPath(st, *sel);
+        const std::string abs = absPath.empty() ? resolveNodeAbsPath(st, *sel) : absPath;
         const float iconBtn = ImGui::GetFrameHeight();
         ImVec2 ip0 = ImGui::GetCursorScreenPos();
         bool folderClick = ImGui::InvisibleButton("##reveal_folder",
@@ -1760,60 +1930,52 @@ void drawSidePanel(AppState& st, float panelW) {
         ImGui::PushStyleColor(ImGuiCol_Text,
             ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
         const float avail = ImGui::GetContentRegionAvail().x;
-        const char* pathTxt = sel->path.c_str();
-        ImVec2 psz = ImGui::CalcTextSize(pathTxt);
+        // Prefer basename; full path on hover.
+        std::string base = sel->path;
+        {
+            auto slash = base.find_last_of("/\\");
+            if (slash != std::string::npos) base = base.substr(slash + 1);
+        }
+        ImVec2 psz = ImGui::CalcTextSize(base.c_str());
         if (psz.x > avail && avail > 24 * S) {
-            std::string clipped = sel->path;
+            std::string clipped = base;
             while (clipped.size() > 4 &&
                    ImGui::CalcTextSize(("…" + clipped).c_str()).x > avail)
                 clipped.erase(clipped.begin());
             ImGui::TextUnformatted(("…" + clipped).c_str());
         } else {
-            ImGui::TextUnformatted(pathTxt);
+            ImGui::TextUnformatted(base.c_str());
         }
         ImGui::PopStyleColor();
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal) && !abs.empty())
-            ImGui::SetTooltip("%s", abs.c_str());
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+            ImGui::SetTooltip("%s", abs.empty() ? sel->path.c_str() : abs.c_str());
     }
 
-    row("meta", sel->metaSummary);
-
-    if (G.scopeDocId.empty()) {
-        auto dit = G.descCounts.find(sel->id);
-        if (dit != G.descCounts.end() && dit->second.total() > 0)
-            row("inside", formatDescBadge(dit->second));
+    // Collapsed technical details — id / origin / meta (keeps the panel clean).
+    ImGui::Dummy(ImVec2(0, 4 * S));
+    ImGui::PushStyleColor(ImGuiCol_Header,
+        ImVec4(palette.text[0], palette.text[1], palette.text[2], 0.06f));
+    ImGui::PushStyleColor(ImGuiCol_HeaderHovered,
+        ImVec4(palette.text[0], palette.text[1], palette.text[2], 0.10f));
+    if (ImGui::TreeNode("Details##node_details")) {
+        row("id", sel->id);
+        row("origin", sel->origin);
+        if (!sel->docId.empty() && sel->docId != sel->id)
+            row("document", sel->docId);
+        row("meta", sel->metaSummary);
+        ImGui::TreePop();
     }
-    if (G.scopeDecomp) {
-        auto qit = G.instCount.find(sel->id);
-        if (qit != G.instCount.end() && qit->second > 0)
-            row("instances", "×" + std::to_string(qit->second));
-    }
-
-    {
-        int outE = 0, inE = 0;
-        for (const auto& e : G.edges) {
-            if (e.src == sel->id) ++outE;
-            if (e.dst == sel->id) ++inE;
-        }
-        char buf[48];
-        std::snprintf(buf, sizeof(buf), "out %d · in %d", outE, inE);
-        row("links", buf);
-    }
+    ImGui::PopStyleColor(2);
 
     ImGui::Dummy(ImVec2(0, 10 * S));
     ImGui::Separator();
     ImGui::Dummy(ImVec2(0, 8 * S));
 
     // ---- actions ------------------------------------------------------------
-    {
-        std::string abs;
-        if ((isDrillableKind(sel->kind) || sel->kind == "project") && !sel->path.empty())
-            abs = resolveNodeAbsPath(st, *sel);
-        if (!abs.empty()) {
-            if (graphGlassButton("##open_doc", "Open document", true, -1.0f, "new_doc"))
-                st.requestOpenPath = abs;
-            ImGui::Dummy(ImVec2(0, 4 * S));
-        }
+    if (!absPath.empty()) {
+        if (graphGlassButton("##open_doc", "Open document", true, -1.0f, "new_doc"))
+            st.requestOpenPath = absPath;
+        ImGui::Dummy(ImVec2(0, 4 * S));
     }
 
     if (sel->id != G.scopeDocId && isDrillableKind(sel->kind)) {

@@ -187,6 +187,16 @@ void ForceGraph::setVelocityDecay(float d) {
     velocityDecay_ = clampf(d, 1e-4f, 1.f);
 }
 
+void ForceGraph::setGroup(int i, int groupId) {
+    if (!validNode(i)) return;
+    nodes_[static_cast<size_t>(i)].group = groupId;
+}
+
+void ForceGraph::setGroupPull(float k) {
+    if (!finitef(k) || k < 0.f) return;
+    groupPull_ = k;
+}
+
 // ---- spatial grid ------------------------------------------------------------
 
 void ForceGraph::rebuildGrid(float cellSize) {
@@ -405,6 +415,42 @@ void ForceGraph::applyCentering(std::vector<float>& fx, std::vector<float>& fy) 
     }
 }
 
+void ForceGraph::applyGroupPull(std::vector<float>& fx, std::vector<float>& fy) {
+    const int n = static_cast<int>(nodes_.size());
+    if (n == 0 || groupPull_ <= 0.f || alpha_ <= 0.f) return;
+
+    // Find group id range (groups are dense small ints from the UI).
+    int maxG = -1;
+    for (int i = 0; i < n; ++i) {
+        const int g = nodes_[static_cast<size_t>(i)].group;
+        if (g > maxG) maxG = g;
+    }
+    if (maxG < 0) return;
+
+    const int G = maxG + 1;
+    std::vector<double> sx(static_cast<size_t>(G), 0.0), sy(static_cast<size_t>(G), 0.0);
+    std::vector<int> cnt(static_cast<size_t>(G), 0);
+    for (int i = 0; i < n; ++i) {
+        const Node& nd = nodes_[static_cast<size_t>(i)];
+        if (nd.group < 0 || nd.pinned) continue;
+        sx[static_cast<size_t>(nd.group)] += nd.x;
+        sy[static_cast<size_t>(nd.group)] += nd.y;
+        cnt[static_cast<size_t>(nd.group)] += 1;
+    }
+
+    const float k = groupPull_ * alpha_;
+    for (int i = 0; i < n; ++i) {
+        const Node& nd = nodes_[static_cast<size_t>(i)];
+        if (nd.pinned || nd.group < 0) continue;
+        const int g = nd.group;
+        if (cnt[static_cast<size_t>(g)] < 2) continue;
+        const float cx = static_cast<float>(sx[static_cast<size_t>(g)] / cnt[static_cast<size_t>(g)]);
+        const float cy = static_cast<float>(sy[static_cast<size_t>(g)] / cnt[static_cast<size_t>(g)]);
+        fx[static_cast<size_t>(i)] += k * (cx - nd.x);
+        fy[static_cast<size_t>(i)] += k * (cy - nd.y);
+    }
+}
+
 void ForceGraph::resolveCollisions() {
     const int n = static_cast<int>(nodes_.size());
     if (n < 2 || collStrength_ <= 0.f) return;
@@ -521,6 +567,7 @@ void ForceGraph::substep(float h) {
     applyRepulsion(fx_, fy_);
     applySprings(fx_, fy_);
     applyCentering(fx_, fy_);
+    applyGroupPull(fx_, fy_);
 
     // Semi-implicit Euler + velocity damping. Mass = 1 for free nodes.
     const float damp = velocityDecay_;

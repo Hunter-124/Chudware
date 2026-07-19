@@ -16,7 +16,10 @@
 //      non-overlap constraint (this engine does not auto-clamp rest lengths).
 //   3. Weak centering       — k_center * (centroid - p) pulls the cloud back
 //      toward its own centroid so the graph doesn't drift off-screen.
-//   4. Collision            — radius-aware non-overlap (d3-force collide analogue).
+//   4. Group / community pull — optional per-node group id; each free node is
+//      pulled toward its group's centroid (O(N) per substep). Used by the UI
+//      to cluster densely-connected components without O(N²) all-pairs work.
+//   5. Collision            — radius-aware non-overlap (d3-force collide analogue).
 //      After integration, 3 Gauss-Seidel passes push overlapping discs apart
 //      along their separation (cooling-independent). Uses its own spatial grid
 //      sized by max collDist so pairs collide even when outside the Coulomb
@@ -112,6 +115,10 @@ public:
     // 40% of prior velocity). Lower = snappier settle; higher = more glide.
     // Clamped to (0, 1].
     void setVelocityDecay(float d);
+    // Community / component clustering. groupId < 0 means "no group".
+    // Pull strength is cooling-scaled like centering (default 0 = off).
+    void setGroup(int i, int groupId);
+    void setGroupPull(float k);     // default 0; typical 0.04 … 0.12
 
 private:
     struct Node {
@@ -120,6 +127,7 @@ private:
         float radius = 14.f;
         float charge = 1.f;   // ∝ radius; used as q_i in repulsion
         bool  pinned = false;
+        int   group = -1;     // community id for group-pull; -1 = none
     };
 
     struct Edge {
@@ -142,6 +150,7 @@ private:
     void applyRepulsion(std::vector<float>& fx, std::vector<float>& fy);
     void applySprings(std::vector<float>& fx, std::vector<float>& fy);
     void applyCentering(std::vector<float>& fx, std::vector<float>& fy);
+    void applyGroupPull(std::vector<float>& fx, std::vector<float>& fy);
     // Multi-pass position/velocity non-overlap using a collDist-sized grid.
     void resolveCollisions();
     void rebuildGrid(float cellSize);
@@ -173,6 +182,7 @@ private:
     float cutoff_ = 96.f;          // repulsion cutoff (≈ 1.6 × default link)
     float collStrength_ = 11.f;    // collision separation hardness (~10–12 hard)
     float collPad_ = 3.f;          // extra gap kept between node radii
+    float groupPull_ = 0.f;        // pull toward per-group centroid (0 = off)
 
     // Fixed substep size and max substeps drained per step() call.
     static constexpr float kSubstep = 1.f / 60.f;

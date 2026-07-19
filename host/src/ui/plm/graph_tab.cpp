@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -86,7 +87,9 @@ struct GraphTabState {
     float panX = 0.0f, panY = 0.0f, zoom = 1.0f;
     bool wasAppFocusLost = false;
     double lastFetch = -1e9;
-    int layoutToken = 0;  // bumps when nodes/edges replace → re-layout
+    // One-shot fit request — set ONLY by the explicit Fit button. Nothing
+    // else may touch the user's view (data polls/relayouts never refit).
+    bool fitRequested = false;
     // edge kind filter — hidden kinds skip drawing (all visible by default)
     std::unordered_set<std::string> hiddenKinds;
     // edge selection indexes into visibleEdges (not the full edges vector)
@@ -567,7 +570,6 @@ void rebuildVisible(GraphTabState& G) {
     }
 
     G.layoutDirty = true;
-    G.layoutToken++;
     G.matchDirty = true;
 }
 
@@ -599,12 +601,32 @@ void rebuildForce(GraphTabState& G) {
     // Scale the engine's defaults (link 60, repulsion 900) up to our spacing.
     G.force.setLinkDistance(100.0f * S);
     G.force.setRepulsion(900.0f * S * S * (100.0f / 60.0f) * (100.0f / 60.0f));
+    G.force.setCollision(6.0f, 3.0f * S);
+
+    // Node sizing metric (d3-style: area ∝ importance). Structural nodes use
+    // their hidden-descendant count (features/sketches inside the document);
+    // everything also accrues its visible edge degree. radius ∝ sqrt so the
+    // disc AREA scales with the metric.
+    std::unordered_map<int, int> degree;
+    degree.reserve(G.visibleIdx.size() * 2);
+    for (const auto& e : G.visibleEdges) {
+        if (G.hiddenKinds.count(e.kind)) continue;
+        auto si = G.idIndex.find(e.src), di = G.idIndex.find(e.dst);
+        if (si != G.idIndex.end()) degree[si->second]++;
+        if (di != G.idIndex.end()) degree[di->second]++;
+    }
 
     const float GOLDEN = 2.39996323f;  // golden angle (rad)
     int fresh = 0;
     for (int vi : G.visibleIdx) {
         GNode& n = G.nodes[vi];
-        n.radius = (n.kind == "project") ? 18.0f * S : 15.0f * S;
+        int desc = 0;
+        if (auto dit = G.descCounts.find(n.id); dit != G.descCounts.end())
+            desc = dit->second.total();
+        const float metric = std::sqrt((float)(desc + degree[vi]));
+        float r = (9.0f + 3.5f * metric) * S;
+        if (n.kind == "project") r *= 1.25f;
+        n.radius = std::clamp(r, 9.0f * S, 40.0f * S);
         float sx = n.lx, sy = n.ly;
         if (sx == 0.0f && sy == 0.0f) {
             bool seeded = false;
@@ -654,6 +676,25 @@ void rebuildForce(GraphTabState& G) {
     // Auto-fit on settle only until the user first pans/zooms.
     G.fitOnSettle = !G.userNavigated;
     G.wasSettled = false;
+
+    // Warm-up burst: run substeps NOW (wall-time bounded so huge drill-down
+    // scopes can't hitch the UI) — the first painted frame is already
+    // semi-relaxed instead of an exploding seed spiral.
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < 120; ++i) {
+        G.force.step(1.0f / 60.0f);
+        if (G.force.settled()) break;
+        if ((i & 15) == 15 &&
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count() > 14.0)
+            break;
+    }
+    for (int vi : G.visibleIdx) {
+        int slot = (vi < (int)G.forceSlot.size()) ? G.forceSlot[vi] : -1;
+        if (slot < 0) continue;
+        G.nodes[vi].lx = G.force.x(slot);
+        G.nodes[vi].ly = G.force.y(slot);
+    }
 }
 
 void drawDashedLine(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 col, float thick,
@@ -747,10 +788,12 @@ void requestGraph(AppState& st, bool force) {
     if (!force && (now - G.lastFetch) < 2.0 && proj == G.projectDir && !G.nodes.empty())
         return;
 
-    G.loading = true;
     G.err.clear();
     G.projectDir = proj;
     G.lastFetch = now;
+    // Background change-probes stay invisible: no spinner, no button flicker.
+    const bool silent = !force && G.mtimesMax > 0.0 && !G.nodes.empty();
+    G.loading = !silent;
 
     nlohmann::json p;
     p["project_dir"] = proj;
@@ -1341,18 +1384,22 @@ void drawCanvas(AppState& st, ImVec2 canvasSz) {
 
     if (G.layoutDirty) rebuildForce(G);
 
-    // First layout after data/scope change → fit the view once.
-    static int s_fitToken = -1;
-    if (s_fitToken != G.layoutToken && !G.visibleIdx.empty()) {
+    // Fit ONLY on explicit request (Fit button). Polls/relayouts never refit.
+    if (G.fitRequested && !G.visibleIdx.empty()) {
         fitView(G, canvasSz);
-        s_fitToken = G.layoutToken;
+        G.fitRequested = false;
     }
 
     // Advance physics and copy graph-space positions back into the render
     // cache. Frozen when settled unless a node is being dragged — idle
-    // frames cost nothing but the draw itself.
+    // frames cost nothing but the draw itself. While active we run extra
+    // substeps per frame so the visible settle takes ~2s, not ~6s.
     if (!G.visibleIdx.empty() && (G.dragNode >= 0 || !G.force.settled())) {
         G.force.step(std::min(ImGui::GetIO().DeltaTime, 0.05f));
+        if (!G.force.settled()) {
+            G.force.step(1.0f / 60.0f);
+            G.force.step(1.0f / 60.0f);
+        }
         for (int vi : G.visibleIdx) {
             int slot = (vi < (int)G.forceSlot.size()) ? G.forceSlot[vi] : -1;
             if (slot < 0) continue;
@@ -1360,15 +1407,14 @@ void drawCanvas(AppState& st, ImVec2 canvasSz) {
             G.nodes[vi].ly = G.force.y(slot);
         }
         // Settle transition: persist the solve state; frame the relaxed
-        // layout once (unless the user already took over the view).
+        // layout once (only if the user hasn't taken over the view).
         bool nowSettled = G.force.settled();
         if (!G.wasSettled && nowSettled) {
             maybeSaveLayout(G);
-            if (G.fitOnSettle) {
+            if (G.fitOnSettle && !G.userNavigated) {
                 fitView(G, canvasSz);
-                s_fitToken = G.layoutToken;
-                G.fitOnSettle = false;
             }
+            G.fitOnSettle = false;
         }
         G.wasSettled = nowSettled;
     }
@@ -1982,8 +2028,8 @@ void plmDrawGraphPage(AppState& st) {
     }
     ImGui::SameLine();
     if (graphGlassButton("##graph_fit", "Fit", false, 70 * S)) {
-        // Fit is applied next canvas draw via token bump.
-        G.layoutToken++;
+        G.fitRequested = true;  // the ONLY auto-fit path left
+        G.userNavigated = false;
     }
     ImGui::SameLine();
     // Hide archive/stale — ON by default; toggling re-fetches with

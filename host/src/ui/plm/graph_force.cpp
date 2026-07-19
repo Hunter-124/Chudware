@@ -107,7 +107,7 @@ void ForceGraph::reheat(float alpha) {
 }
 
 bool ForceGraph::settled() const {
-    return alpha_ <= alphaMin_;
+    return alpha_ <= 0.f;
 }
 
 float ForceGraph::alpha() const {
@@ -167,8 +167,18 @@ void ForceGraph::setLinkDistance(float d) {
     if (!finitef(d) || d <= 0.f) return;
     linkDistance_ = d;
     // Keep cutoff ≈ 2× link distance so linked pairs always interact.
-    cutoff_ = d * 2.f;
+    cutoff_ = d * 1.6f;
     if (cutoff_ < 40.f) cutoff_ = 40.f;
+}
+
+void ForceGraph::setAlphaDecay(float d) {
+    if (!finitef(d) || d <= 0.f || d >= 1.f) return;
+    alphaDecay_ = d;
+}
+
+void ForceGraph::setCollision(float strength, float pad) {
+    if (finitef(strength) && strength >= 0.f) collStrength_ = strength;
+    if (finitef(pad) && pad >= 0.f) collPad_ = pad;
 }
 
 // ---- spatial grid ------------------------------------------------------------
@@ -250,7 +260,6 @@ void ForceGraph::applyRepulsion(std::vector<float>& fx, std::vector<float>& fy) 
 
     for (int i = 0; i < n; ++i) {
         const Node& a = nodes_[static_cast<size_t>(i)];
-        if (a.pinned) continue;
 
         int cx = static_cast<int>((a.x - grid_.originX) / grid_.cell);
         int cy = static_cast<int>((a.y - grid_.originY) / grid_.cell);
@@ -271,13 +280,14 @@ void ForceGraph::applyRepulsion(std::vector<float>& fx, std::vector<float>& fy) 
             for (int gx = x0; gx <= x1; ++gx) {
                 int j = grid_.head[static_cast<size_t>(gy * cols + gx)];
                 while (j >= 0) {
-                    if (j != i) {
+                    // Each unordered pair evaluated exactly once (j > i).
+                    if (j > i) {
                         const Node& b = nodes_[static_cast<size_t>(j)];
                         float dx = a.x - b.x;
                         float dy = a.y - b.y;
                         float d2 = dx * dx + dy * dy;
 
-                        if (d2 < cutoff2) {
+                        if (d2 < cutoff2 && !(a.pinned && b.pinned)) {
                             // Minimum separation floor from radii; also handles
                             // exact coincidence via deterministic jitter.
                             const float minDist = 0.5f * (a.radius + b.radius) + 1.f;
@@ -289,19 +299,36 @@ void ForceGraph::applyRepulsion(std::vector<float>& fx, std::vector<float>& fy) 
                                 dy = jy;
                                 d2 = dx * dx + dy * dy;
                             }
+                            // Collision (d3 collide analogue): strong push ∝
+                            // overlap depth, cooling-independent, so sized
+                            // nodes never visually overlap.
+                            float cfx = 0.f, cfy = 0.f;
+                            const float collDist = a.radius + b.radius + collPad_;
+                            if (d2 < collDist * collDist) {
+                                const float d = std::sqrt(d2);
+                                const float inv = d > 1e-6f ? 1.f / d : 1.f;
+                                const float push = collStrength_ * (collDist - d);
+                                cfx = dx * inv * push;
+                                cfy = dy * inv * push;
+                            }
                             if (d2 < minDist2) d2 = minDist2;
 
-                            // F = k * qa * qb / r^2  in the direction of dx
-                            // (= k * qa * qb / r^3 * (dx,dy) as a vector force).
+                            // F = k * qa * qb / r^2 along the separation.
                             const float invDist = 1.f / std::sqrt(d2);
-                            const float invDist2 = invDist * invDist;
-                            const float f = k * qa * b.charge * invDist2;
-                            // Soften: multiply by invDist so magnitude is k*q/r^2
-                            // and direction is unit — already have invDist2 = 1/r^2,
-                            // so force components = f * (dx*invDist) = f * unit.
+                            const float f = k * qa * b.charge * invDist * invDist;
                             const float s = f * invDist;
-                            fxi += dx * s;
-                            fyi += dy * s;
+                            const float rfx = dx * s;
+                            const float rfy = dy * s;
+
+                            // +f pushes a away from b; −f pushes b away from a.
+                            if (!a.pinned) {
+                                fxi += cfx + rfx;
+                                fyi += cfy + rfy;
+                            }
+                            if (!b.pinned) {
+                                fx[static_cast<size_t>(j)] -= cfx + rfx;
+                                fy[static_cast<size_t>(j)] -= cfy + rfy;
+                            }
                         }
                     }
                     j = grid_.next[static_cast<size_t>(j)];
@@ -386,8 +413,8 @@ void ForceGraph::applyCentering(std::vector<float>& fx, std::vector<float>& fy) 
 void ForceGraph::substep(float h) {
     const int n = static_cast<int>(nodes_.size());
     if (n == 0) {
-        alpha_ += (alphaMin_ - alpha_) * alphaDecay_;
-        if (alpha_ < alphaMin_) alpha_ = alphaMin_;
+        alpha_ *= (1.f - alphaDecay_);
+        if (alpha_ < alphaMin_) alpha_ = 0.f;
         return;
     }
 
@@ -433,9 +460,12 @@ void ForceGraph::substep(float h) {
         }
     }
 
-    // Simulated-annealing cool-down (d3-force style exponential toward alphaMin).
-    alpha_ += (alphaMin_ - alpha_) * alphaDecay_;
-    if (alpha_ < alphaMin_) alpha_ = alphaMin_;
+    // Simulated-annealing cool-down: geometric decay toward ZERO (d3-force
+    // semantics), snapping settled once below the floor. The previous
+    // exponential-toward-alphaMin form approached the floor asymptotically
+    // and could never satisfy settled() — the sim idled forever.
+    alpha_ *= (1.f - alphaDecay_);
+    if (alpha_ < alphaMin_) alpha_ = 0.f;
 }
 
 void ForceGraph::step(float dt) {
@@ -446,7 +476,7 @@ void ForceGraph::step(float dt) {
     }
     if (nodes_.empty()) {
         // Still cool alpha so settled() eventually trips on empty graphs.
-        alpha_ = alphaMin_;
+        alpha_ = 0.f;
         return;
     }
 

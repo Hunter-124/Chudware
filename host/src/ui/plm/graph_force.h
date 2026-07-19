@@ -12,11 +12,15 @@
 //   2. Edge springs         — Hooke  strength * (r - restLen)  along the edge.
 //   3. Weak centering       — k_center * (centroid - p) pulls the cloud back
 //      toward its own centroid so the graph doesn't drift off-screen.
+//   4. Collision            — radius-aware non-overlap push ∝ overlap depth
+//      (cooling-independent, like d3-force's collide), sharing the repulsion
+//      spatial grid so it costs no extra broadphase.
 //
 // Integration: semi-implicit Euler (v += a*h; x += v*h) with per-step velocity
 // damping. Pinned nodes have infinite mass (a=0, v=0); the UI teleports them
-// via setPos. Cooling alpha decays each substep toward alphaMin; reheat()
-// bumps it after structural edits; settled() is true when alpha <= alphaMin
+// via setPos. Cooling alpha decays geometrically toward zero each substep
+// (d3-force semantics: ~300 substeps from alpha=1 to settled); reheat()
+// bumps it after structural edits; settled() is true once alpha hits zero
 // (step() early-outs).
 //
 // Units: positions/radii/rest lengths are abstract graph-space pixels. Time is
@@ -91,6 +95,10 @@ public:
     void setRepulsion(float k);     // charge strength (default 900)
     void setCentering(float k);     // gravity toward centroid (default 0.02)
     void setLinkDistance(float d);  // default rest-length scale (default 60)
+    void setAlphaDecay(float d);    // cooling rate per substep (default ~0.023)
+    // Radius-aware non-overlap (d3 collide analogue). strength scales the
+    // overlap-depth push (default 6), pad is the extra gap (default 3).
+    void setCollision(float strength, float pad);
 
 private:
     struct Node {
@@ -147,7 +155,9 @@ private:
     float repulsion_ = 900.f;
     float centering_ = 0.02f;
     float linkDistance_ = 60.f;
-    float cutoff_ = 120.f;         // repulsion cutoff (≈ 2 × default link)
+    float cutoff_ = 96.f;          // repulsion cutoff (≈ 1.6 × default link)
+    float collStrength_ = 6.f;     // collision push per unit of overlap depth
+    float collPad_ = 3.f;          // extra gap kept between node radii
 
     // Fixed substep size and max substeps drained per step() call.
     static constexpr float kSubstep = 1.f / 60.f;

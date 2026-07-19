@@ -211,6 +211,8 @@ bool agentDocIsCpp(const std::string& method, const json& params) {
     if (method == "agent_clarify_v1") return true;
     // Cancel is process-wide registry keyed by run_id — no doc needed.
     if (method == "agent_cancel") return true;
+    // Steer is the same per-run registry path as cancel — no doc needed.
+    if (method == "agent_steer") return true;
     if (!params.is_object()) return false;
     auto it = params.find("doc_id");
     if (it == params.end() || !it->is_string()) return false;
@@ -229,7 +231,7 @@ bool routeAgentToCpp(const std::string& method, const json& params) {
     if (!(method == "agent_run_v2" || method == "agent_ask_v2" ||
           method == "agent_clarify_v1" || method == "agent_pm_assist_v1" ||
           method == "agent_simulate_v1" || method == "agent_mission_v1" ||
-          method == "agent_cancel" ||
+          method == "agent_cancel" || method == "agent_steer" ||
           method == "get_prompts_v2"))
         return false;  // agent_design (legacy) + everything else stays Python
     if (!agentDocIsCpp(method, params)) return false;  // only C++-backed docs (or doc-indep)
@@ -658,13 +660,18 @@ bool WorkerClient::callAgentCancel(const std::string& runId, json& result, std::
     return call("agent_cancel", json{{"run_id", runId}}, result, err, 5000);
 }
 
+bool WorkerClient::callAgentSteer(const std::string& runId, const std::string& text,
+                                  json& result, std::string& err) {
+    return call("agent_steer", json{{"run_id", runId}, {"text", text}}, result, err, 5000);
+}
+
 bool WorkerClient::callImpl(const std::string& method, const json& params, json& result,
                             std::string& err, int timeoutMs, const EventFn& onEvent) {
-    // agent_cancel must reach the engine WHILE an agent_run is blocked on this client.
-    // Skip callMtx_ so Stop can flip the RunControl flag mid-provider-call. Concurrent
-    // with the run's own call — safe because cancel only touches the process-wide registry
-    // + atomic flag (no shared socket write on the in-flight agent RPC).
-    const bool isCancel = (method == "agent_cancel");
+    // agent_cancel/agent_steer must reach the engine WHILE an agent_run is blocked on this
+    // client. Skip callMtx_ so Stop/Steer can reach the process-wide registry mid-provider-call.
+    // Concurrent with the run's own call — safe because cancel/steer only touch the registry
+    // (+ atomic flag / queued string; no shared socket write on the in-flight agent RPC).
+    const bool isCancel = (method == "agent_cancel" || method == "agent_steer");
     std::unique_lock<std::mutex> lk(callMtx_, std::defer_lock);
     if (!isCancel) lk.lock();
     if (abort_.load()) {  // C39: app is tearing down — intentional, no errorSink toast
@@ -776,6 +783,26 @@ bool WorkerClient::callImpl(const std::string& method, const json& params, json&
             // {doc_id, request} -> {ok, answer, drag_n, lift_n, ...}: run a wind-tunnel CFD on the
             // current geometry (pass-through; the core parses the flow condition + runs LBM).
             ok = engine::call("agent_simulate_v1", params, cppResult, cerr, timeoutMs);
+        } else if (method == "agent_steer") {
+            // Mid-run steering: queue `text` for the run to consume at the next
+            // stage/attempt boundary. Same transport shape as agent_cancel: in-process
+            // calls libaicad directly; daemon mode uses a SHORT-LIVED second EngineClient
+            // so the steer never queues behind the in-flight agent_run on the shared socket.
+            if (engine::daemonMode()) {
+                aicad_ipc::EngineClient side;
+                aicad_ipc::EngineClient::Options opts;
+                opts.clientKind = "gui";
+                opts.allowSpawn = false;  // never spawn a new hostd for steer
+                std::string cerr2;
+                if (side.connectOrSpawn(opts, cerr2)) {
+                    ok = side.call("agent_steer", params, cppResult, cerr, 5000);
+                } else {
+                    cerr = cerr2.empty() ? "steer: daemon unreachable" : cerr2;
+                    ok = false;
+                }
+            } else {
+                ok = engine::call("agent_steer", params, cppResult, cerr, timeoutMs);
+            }
         } else if (method == "agent_cancel") {
             // Best-effort stop. In-process: call libaicad directly (no mutex contention with
             // the blocked agent_run). Daemon: open a SHORT-LIVED second EngineClient so we

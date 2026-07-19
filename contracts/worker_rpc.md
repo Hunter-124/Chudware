@@ -375,7 +375,10 @@ continuous. The flat-pattern geometry is surfaced on `CompileResult.sheet_metal_
 `agent_run_v2 {request, doc_id, options?:{max_stage_attempts?, plan?, roles_override?, workflow?}}`
 → streams events.md orchestrator events → `{run_id, status, stop_reason, revision}` ·
 `get_prompts` (v2 result: `{prompts:[{role, path, override_path, text, overridden}]}`) ·
-`agent_cancel {run_id}` → best-effort stop at the next stage boundary.
+`agent_cancel {run_id}` → best-effort stop at the next stage boundary. ·
+`agent_steer {run_id, text}` → `{ok, steered}`; queues a `[User steering]` user message the
+running turn consumes at its next stage/attempt boundary (cooperative, like cancel — never
+interrupts an in-flight provider HTTP call). Unknown/finished run_id → `{ok:true, steered:false}`.
 
 ### AI context references (Wave 4, append-only)
 `agent_design` and `agent_run_v2` accept an OPTIONAL `context_refs?: [{kind, id, doc_id?,

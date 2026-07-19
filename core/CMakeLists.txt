@@ -1682,6 +1682,7 @@ if(AICAD_WITH_OCCT)
     hostd/doc_registry.cpp
     hostd/autosave.cpp
     hostd/hostd_log.cpp
+    hostd/tray_icon.cpp               # optional Linux AppIndicator status cube
     ${CMAKE_CURRENT_SOURCE_DIR}/../services/ipc/ipc_transport.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../services/ipc/ipc_transport_win.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../services/ipc/ipc_discovery.cpp
@@ -1696,6 +1697,24 @@ if(AICAD_WITH_OCCT)
     # ConvertSidToStringSidW, CreateWellKnownSid). Everything else (named pipes,
     # Job Objects, CreateProcessW) is kernel32, linked by default.
     target_link_libraries(aicad-hostd PRIVATE advapi32)
+  else()
+    # Optional system tray (libappindicator3). Disable at runtime with
+    # AICAD_HOSTD_TRAY=0, or at configure time by leaving the package missing.
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+      pkg_check_modules(APPINDICATOR QUIET appindicator3-0.1)
+    endif()
+    if(APPINDICATOR_FOUND)
+      target_compile_definitions(aicad-hostd PRIVATE AICAD_HOSTD_HAS_TRAY=1)
+      target_include_directories(aicad-hostd PRIVATE ${APPINDICATOR_INCLUDE_DIRS})
+      target_link_libraries(aicad-hostd PRIVATE ${APPINDICATOR_LIBRARIES})
+      if(APPINDICATOR_CFLAGS_OTHER)
+        target_compile_options(aicad-hostd PRIVATE ${APPINDICATOR_CFLAGS_OTHER})
+      endif()
+      message(STATUS "aicad-hostd: system tray enabled (appindicator3)")
+    else()
+      message(STATUS "aicad-hostd: system tray disabled (appindicator3 not found)")
+    endif()
   endif()
   set_target_properties(aicad-hostd PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")

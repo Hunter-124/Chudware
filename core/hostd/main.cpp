@@ -53,9 +53,46 @@
 #include "autosave.h"
 #include "hostd_log.h"
 #include "server.h"
+#include "tray_icon.h"
 #include "version_info.h"
 
 static hostd::Server* g_server = nullptr;
+
+static void trayQuitThunk(void*) {
+    if (g_server) g_server->stop();
+}
+
+// Map server status → tray tint + tooltip. Called from a lightweight ticker
+// thread so the accept loop never blocks on GTK.
+static void trayStatusTick(hostd::Server* server) {
+    using hostd::TrayStatus;
+    const auto& st = server->status();
+    const int eng = st.engineState.load();
+    const int clients = st.clients.load();
+    const int inflight = st.inflight.load();
+    const bool draining = st.draining.load();
+    TrayStatus ts = TrayStatus::Idle;
+    char tip[256];
+    if (eng == 2) {
+        ts = TrayStatus::Error;
+        std::snprintf(tip, sizeof tip, "Billet hostd — engine failed");
+    } else if (draining) {
+        ts = TrayStatus::Busy;
+        std::snprintf(tip, sizeof tip, "Billet hostd — draining (%d client%s)",
+                      clients, clients == 1 ? "" : "s");
+    } else if (eng == 0) {
+        ts = TrayStatus::Busy;
+        std::snprintf(tip, sizeof tip, "Billet hostd — loading engine…");
+    } else if (clients > 0 || inflight > 0) {
+        ts = TrayStatus::Busy;
+        std::snprintf(tip, sizeof tip, "Billet hostd — %d client%s, %d in-flight",
+                      clients, clients == 1 ? "" : "s", inflight);
+    } else {
+        ts = TrayStatus::Idle;
+        std::snprintf(tip, sizeof tip, "Billet hostd — idle (ready)");
+    }
+    hostd::traySetStatus(ts, tip);
+}
 
 #ifdef _WIN32
 
@@ -351,6 +388,20 @@ int main(int argc, char** argv) {
     hostd::log().line("hostd %s starting: key=%s sock=%s pid=%ld", AICAD_HOSTD_BUILD_ID,
                       key.c_str(), sock.c_str(), selfPid());
 
+    // Optional system tray (Linux + libappindicator). No-op when disabled,
+    // headless, or the feature was not compiled in.
+    hostd::trayStart(self);
+    hostd::traySetQuitHandler(&trayQuitThunk, nullptr);
+    hostd::traySetStatus(hostd::TrayStatus::Busy, "Billet hostd — starting…");
+    std::atomic<bool> trayTickerStop{false};
+    std::thread trayTicker([&server, &trayTickerStop] {
+        while (!trayTickerStop.load()) {
+            trayStatusTick(&server);
+            for (int i = 0; i < 10 && !trayTickerStop.load(); ++i)
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    });
+
     // 3. Load the engine asynchronously (many seconds for OCCT).
     std::thread loader([&server] {
         std::string lerr;
@@ -376,6 +427,10 @@ int main(int argc, char** argv) {
     if (const char* l = std::getenv("AICAD_HOSTD_LINGER_SECS"); l && *l)
         linger = std::max(1, std::atoi(l));
     server.run(linger);
+
+    trayTickerStop.store(true);
+    if (trayTicker.joinable()) trayTicker.join();
+    hostd::trayStop();
 
     // Clean shutdown (idle-exit, --stop drain, SIGTERM): save dirty docs so the
     // next daemon recovers them; loss bound on a hard kill = autosave interval.

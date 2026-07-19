@@ -83,7 +83,8 @@ _PRESENCE_SENTINELS = frozenset({"", "\x01", "host", "shared", "1"})
 
 
 def _load_host_keys() -> dict[str, str]:
-    """Return keys.* string slots from host config (empty dict on failure)."""
+    """Return keys.* string slots from host config (+ ai_providers.env fallback)."""
+    out: dict[str, str] = {}
     try:
         try:
             from .providers import _load_host_config  # type: ignore
@@ -92,15 +93,36 @@ def _load_host_keys() -> dict[str, str]:
         cfg = _load_host_config()
     except Exception as exc:  # noqa: BLE001
         log.warning("list_models inject: config load failed: %s", exc)
-        return {}
+        cfg = {}
     keys = cfg.get("keys") if isinstance(cfg, dict) else None
-    if not isinstance(keys, dict):
-        return {}
-    out: dict[str, str] = {}
-    for k, v in keys.items():
-        if isinstance(v, str) and v.strip():
-            out[str(k)] = v.strip()
+    if isinstance(keys, dict):
+        for k, v in keys.items():
+            if isinstance(v, str) and v.strip():
+                out[str(k)] = v.strip()
+
+    # Fallback: ~/billet-web-data/ai_providers.env (shared session keys).
+    # Map ENV names → keys.* slots used by list_models inject.
+    env_to_slot = {
+        "OPENROUTER_API_KEY": "openrouter",
+        "GEMINI_API_KEY": "gemini",
+        "ANTHROPIC_API_KEY": "anthropic",
+        "OPENAI_API_KEY": "openai",
+        "XAI_API_KEY": "xai",
+        "MOONSHOT_API_KEY": "moonshot",
+        "CLOUD_COMPAT_API_KEY": "cloud_compat",
+    }
+    try:
+        env_vars = settings.ai_provider_vars()
+    except Exception:  # noqa: BLE001
+        env_vars = {}
+    for env_name, slot in env_to_slot.items():
+        if slot in out:
+            continue
+        val = env_vars.get(env_name)
+        if isinstance(val, str) and val.strip():
+            out[slot] = val.strip()
     return out
+
 
 
 def _key_for_list_models(provider: str, base_url: str, keys: dict[str, str]) -> tuple[str, str]:

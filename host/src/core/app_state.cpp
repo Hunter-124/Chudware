@@ -313,6 +313,8 @@ void loadSettings(Settings& s) {
                 s.subagentPreference = parsePref(ag, "subagent_preference", s.subagentPreference);
             if (ag.contains("advisor_preference"))
                 s.advisorPreference = parsePref(ag, "advisor_preference", s.advisorPreference);
+            if (ag.contains("proactive_advisor"))
+                s.proactiveAdvisor = ag.value("proactive_advisor", false);
             if (ag.contains("memory_enabled"))
                 s.memoryEnabled = ag.value("memory_enabled", true);
             if (ag.contains("memory_token_budget")) {
@@ -320,6 +322,8 @@ void loadSettings(Settings& s) {
                 s.memoryTokenBudget = (b < 50) ? 50 : (b > 4000 ? 4000 : b);
             }
         }
+        if (j.contains("proactive_advisor"))
+            s.proactiveAdvisor = j.value("proactive_advisor", false);
         if (j.contains("memory_enabled"))
             s.memoryEnabled = j.value("memory_enabled", true);
         if (j.contains("memory_token_budget")) {
@@ -567,6 +571,7 @@ void saveSettings(const Settings& s) {
         j["plan_mode"] = (planPref != 0);  // Python / older readers
         j["subagent_preference"] = prefName(s.subagentPreference);
         j["advisor_preference"] = prefName(s.advisorPreference);
+        j["proactive_advisor"] = s.proactiveAdvisor;
         j["memory_enabled"] = s.memoryEnabled;
         j["memory_token_budget"] = s.memoryTokenBudget;
         // Merge-overlay into agent{} so Python config helpers see the same values.
@@ -574,6 +579,7 @@ void saveSettings(const Settings& s) {
         if (j.contains("agent") && j["agent"].is_object()) agent = j["agent"];
         agent["advisor"] = (s.advisorPreference != 0);
         agent["advisor_preference"] = prefName(s.advisorPreference);
+        agent["proactive_advisor"] = s.proactiveAdvisor;
         agent["subagent_preference"] = prefName(s.subagentPreference);
         agent["memory_enabled"] = s.memoryEnabled;
         agent["memory_token_budget"] = s.memoryTokenBudget;

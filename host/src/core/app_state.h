@@ -109,8 +109,9 @@ struct Settings {
     // and plan_mode bool in config.json (Python still reads it).
     int planPreference = 2;      // default Encourage (old plan_mode=true)
     int subagentPreference = 1;  // default Option — model may spawn subagents
-    int advisorPreference = 2;   // default Encourage — proactive advisor on triggers
+    int advisorPreference = 2;   // default Encourage — pull advisor + tone for guidance
     bool planMode = true;        // binary: planPreference != 0 (Supervised vs Autopilot)
+    bool proactiveAdvisor = false; // opt-in mid-run proactive advisor (cheap gates; not every turn)
     bool memoryEnabled = true;   // project SQLite memory under .plm/memory.db
     int memoryTokenBudget = 400; // max tokens injected from project memory per turn
     // Copilot composer mode: Agent | Plan | Swarm | Edit | Ask. Persisted as "copilot_mode".

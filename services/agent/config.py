@@ -267,6 +267,7 @@ VALID_PREFERENCES = frozenset({"off", "option", "encourage", "require"})
 DEFAULT_PLAN_PREFERENCE = "encourage"
 DEFAULT_SUBAGENT_PREFERENCE = "option"
 DEFAULT_ADVISOR_PREFERENCE = "encourage"
+DEFAULT_PROACTIVE_ADVISOR = False
 DEFAULT_MEMORY_ENABLED = True
 DEFAULT_MEMORY_TOKEN_BUDGET = 400
 
@@ -338,6 +339,33 @@ def get_advisor_preference(cfg: dict | None = None) -> str:
     if not advisor_enabled(c if isinstance(c, dict) else None):
         return "off"
     return DEFAULT_ADVISOR_PREFERENCE
+
+
+def proactive_advisor_enabled(cfg: dict | None = None) -> bool:
+    """Opt-in mid-run proactive advisor (default False).
+
+    Separate from advisor_preference (tone/frequency). Hard gate for the
+    agent_turn proactive inject path. Env ``AI_CAD_PROACTIVE_ADVISOR`` forces
+    on/off when set. Also off when advisor preference is off.
+    """
+    import os
+
+    env = os.environ.get("AI_CAD_PROACTIVE_ADVISOR")
+    if env is not None and str(env).strip() != "":
+        if str(env).strip().lower() in ("0", "false", "no", "off"):
+            return False
+        if str(env).strip().lower() in ("1", "true", "yes", "on"):
+            # Still respect advisor preference off / AI_CAD_ADVISOR=0.
+            return get_advisor_preference(cfg) != "off"
+    if get_advisor_preference(cfg) == "off":
+        return False
+    c = cfg if cfg is not None else load_config()
+    agent = _agent_block(c if isinstance(c, dict) else None)
+    if "proactive_advisor" in agent:
+        return bool(agent.get("proactive_advisor"))
+    if isinstance(c, dict) and "proactive_advisor" in c:
+        return bool(c.get("proactive_advisor"))
+    return DEFAULT_PROACTIVE_ADVISOR
 
 
 def memory_enabled(cfg: dict | None = None) -> bool:

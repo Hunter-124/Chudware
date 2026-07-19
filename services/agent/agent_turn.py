@@ -1708,33 +1708,22 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
         messages.append({"role": "user", "content": _parts(
             f"Result of {tool}:\n{_as_text(result)}")})
 
-        # Proactive advisor (encourage/require): inject guidance on failure streaks
-        # without waiting for the model to call request_advice. Deterministic/cheap
-        # notes first; never blocks the turn.
+        # Proactive advisor (opt-in checkbox): cheap gated mid-run guidance.
+        # Hard gate = proactive_advisor_enabled(); preference sets tone/frequency.
+        # Deterministic by default; optional short advisor LLM only on high severity.
         try:
-            from services.agent.config import get_advisor_preference  # noqa: PLC0415
-            _apref = get_advisor_preference()
-            if _apref in ("encourage", "require") and not ok:
-                _fail_n = sum(1 for c in calls[-6:] if not c.get("ok", True))
-                _every = 4 if _apref == "require" else 99
-                if _fail_n >= 2 or (_apref == "require" and tool_calls_made > 0 and tool_calls_made % _every == 0):
-                    _note = (
-                        f"[ADVISOR — proactive] Recent tool failures ({_fail_n} in last 6). "
-                        f"Last tool={tool!r} ok={ok}. Pause thrash: re-read the error, "
-                        f"narrow the next action, and prefer a different approach if the "
-                        f"same call already failed twice. Do not invent dimensions."
-                    )
-                    messages.append({"role": "user", "content": _parts(_note)})
-                    if on_event is not None:
-                        try:
-                            on_event("agent.advisor", {
-                                "source": "proactive",
-                                "preference": _apref,
-                                "tool": tool,
-                                "fail_streak": _fail_n,
-                            })
-                        except Exception:  # noqa: BLE001
-                            pass
+            from services.agent import proactive_advisor as _pa  # noqa: PLC0415
+            _pa.inject_if_needed(
+                messages,
+                ok=ok,
+                tool=tool,
+                result=result,
+                calls=calls,
+                tool_calls_made=tool_calls_made,
+                options=options if isinstance(options, dict) else None,
+                on_event=on_event,
+                parts_fn=_parts,
+            )
         except Exception:  # noqa: BLE001
             pass
 

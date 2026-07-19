@@ -2398,6 +2398,7 @@ const SettingsEntry kSettingsEntries[] = {
     { "Plan mode",                "AI",           2 },
     { "Subagent preference",      "AI",           2 },
     { "Advisor preference",       "AI",           2 },
+    { "Proactive advisor",        "AI",           2 },
     { "Project memory",           "AI",           2 },
     { "Memory budget",            "AI",           2 },
     { "Refine-pass cap",          "AI",           2 },
@@ -2908,8 +2909,13 @@ void drawSettingsModal(AppState& st, bool busy) {
                               "Off disables nesting; Require pushes multi-agent splits.");
                     prefCombo("Advisor preference", "##adv_pref", &settings.advisorPreference,
                               "Off = no advisor. Option = only when the model asks. "
-                              "Encourage = proactive guidance on failures. "
-                              "Require = periodic mid-run checks plus plan review.");
+                              "Encourage = stronger guidance tone when proactive fires. "
+                              "Require = more frequent checks when proactive is on.");
+                    ImGui::Checkbox("Proactive advisor", &settings.proactiveAdvisor);
+                    helpMarker("Opt-in mid-run guidance on failure streaks and thrash. "
+                               "Cheap deterministic notes by default; at most one short "
+                               "advisor-model call on severe streaks (encourage/require). "
+                               "Off = no proactive injects (pull request_advice still works).");
                     ImGui::Dummy(ImVec2(0, 4.0f * sc));
                     ImGui::Checkbox("Project memory (per-folder)", &settings.memoryEnabled);
                     helpMarker("Remembers decisions and notes under the PLM project "

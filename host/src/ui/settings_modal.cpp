@@ -1,6 +1,7 @@
 // AI-CAD Settings modal (Appearance / General / AI / Providers / Benchmarks /
 // Prompts / Agent / Experimental tabs) and the About modal.
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -25,6 +26,8 @@
 #include "model_registry.h"  // ui::localPresets (experimental vision-review model presets)
 #include "leaderboard_ui.h"  // aicad.leaderboard/1 compact table (Settings > Benchmarks)
 #include "oauth_capture.h"  // in-app xAI multi-account CEF OAuth (Settings → Accounts)
+#include "../core/async_rpc.h"  // core::RpcResult for skills/triggers RPCs
+#include "widgets/interwebz.h"  // Skills/Context two-column editors
 
 
 // ---- C22b prompt editor state ----
@@ -1502,11 +1505,12 @@ static void drawBenchCategories(AppState& st, float sc) {
 
     if (ImGui::BeginTable("##bench_cats", 4,
                           ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg |
-                              ImGuiTableFlags_SizingStretchProp)) {
-        ImGui::TableSetupColumn("Category", ImGuiTableColumnFlags_WidthStretch, 2.4f);
-        ImGui::TableSetupColumn("Tools", ImGuiTableColumnFlags_WidthStretch, 0.7f);
-        ImGui::TableSetupColumn("Last result", ImGuiTableColumnFlags_WidthStretch, 2.2f);
-        ImGui::TableSetupColumn("Run", ImGuiTableColumnFlags_WidthStretch, 0.8f);
+                              ImGuiTableFlags_SizingStretchProp |
+                              ImGuiTableFlags_NoHostExtendY)) {
+        ImGui::TableSetupColumn("Category", ImGuiTableColumnFlags_WidthStretch, 2.0f);
+        ImGui::TableSetupColumn("Tools", ImGuiTableColumnFlags_WidthFixed, 56.0f * sc);
+        ImGui::TableSetupColumn("Last result", ImGuiTableColumnFlags_WidthStretch, 2.4f);
+        ImGui::TableSetupColumn("Run", ImGuiTableColumnFlags_WidthFixed, 64.0f * sc);
         ImGui::TableHeadersRow();
 
         for (const auto& cat : s_cats.cats) {
@@ -1538,14 +1542,21 @@ static void drawBenchCategories(AppState& st, float sc) {
                 ImGui::TextUnformatted("\xe2\x80\x94 never run");
                 ImGui::PopStyleColor();
             } else {
-                // Single-line summary: pass-rate bar + % + short when. Full detail_path
-                // lives in a hover tooltip so the narrow column never wraps char-by-char.
+                // Compact single-line cell: bar + % only. Long when/detail paths go in
+                // the tooltip — dimText uses TextWrapped and was stacking one glyph per
+                // line after SameLine inside a stretch column.
+                const float rowH = ImGui::GetTextLineHeight();
                 if (cat.last.passRate >= 0.f) {
-                    const float pctW = 40.0f * sc;
-                    const float barW = std::max(40.0f * sc,
-                        ImGui::GetContentRegionAvail().x - pctW - 8.0f * sc);
+                    const float pctW = 44.0f * sc;
+                    const float gap = 6.0f * sc;
+                    const float barW = std::max(48.0f * sc,
+                        ImGui::GetContentRegionAvail().x - pctW - gap);
+                    // Vertically center the thin bar with the % text.
+                    const float y0 = ImGui::GetCursorPosY();
+                    ImGui::SetCursorPosY(y0 + std::max(0.f, (rowH - 8.0f * sc) * 0.5f));
                     drawPassRateBar(cat.last.passRate, barW, 8.0f * sc);
-                    ImGui::SameLine(0, 6.0f * sc);
+                    ImGui::SameLine(0, gap);
+                    ImGui::SetCursorPosY(y0);
                     char pct[32];
                     std::snprintf(pct, sizeof(pct), "%.0f%%", cat.last.passRate * 100.f);
                     ImGui::TextUnformatted(pct);
@@ -1554,16 +1565,19 @@ static void drawBenchCategories(AppState& st, float sc) {
                     ImGui::TextUnformatted("ran");
                     ImGui::PopStyleColor();
                 }
-                if (!cat.last.when.empty()) {
-                    ImGui::SameLine(0, 8.0f * sc);
-                    dimText(cat.last.when.c_str());
-                }
-                if ((!cat.last.detailPath.empty() || !cat.last.when.empty()) &&
-                    ImGui::IsItemHovered()) {
+                // Tooltip on the % (or "ran") label — bar Dummy has no hover id.
+                if (ImGui::IsItemHovered()) {
+                    ImGui::BeginTooltip();
+                    if (cat.last.passRate >= 0.f)
+                        ImGui::Text("Pass rate: %.0f%%", cat.last.passRate * 100.f);
+                    if (!cat.last.when.empty())
+                        ImGui::Text("When: %s", cat.last.when.c_str());
                     if (!cat.last.detailPath.empty())
-                        ImGui::SetTooltip("detail: %s", cat.last.detailPath.c_str());
-                    else
-                        ImGui::SetTooltip("%s", cat.last.when.c_str());
+                        ImGui::Text("Detail: %s", cat.last.detailPath.c_str());
+                    if (cat.last.when.empty() && cat.last.detailPath.empty() &&
+                        cat.last.passRate < 0.f)
+                        ImGui::TextUnformatted("Completed (no detail path).");
+                    ImGui::EndTooltip();
                 }
             }
 
@@ -2323,6 +2337,945 @@ static void drawHarnessOrganizationSection(AppState& st, float sc) {
 
 }  // anonymous namespace
 
+namespace {
+
+// ---- Skills editor (Settings → Prompts → Skills; ported from dead overlay) ----
+struct OvSkillRow {
+    std::string name;
+    std::string description;
+    std::string source;  // builtin | user | project
+    std::string inject;
+};
+struct OvSkillsUi {
+    std::vector<OvSkillRow> skills;
+    bool loaded = false;
+    bool rpcMissing = false;
+    bool listInFlight = false;
+    bool bodyInFlight = false;
+    bool saveInFlight = false;
+    double lastList = -1e9;
+    std::string lastError;
+    std::string selected;
+    std::string bodyName;          // name the editor buffer belongs to
+    std::vector<char> body{std::vector<char>(65536, 0)};
+    bool bodyDirty = false;
+    bool creating = false;
+    char newName[96] = {};
+};
+static OvSkillsUi s_ovSkills;
+
+static const char* kSkillCreatorTemplate =
+    "---\n"
+    "name: my-skill\n"
+    "description: One line describing what this skill teaches.\n"
+    "inject: manual\n"
+    "triggers:\n"
+    "  keywords: []\n"
+    "  tools: []\n"
+    "  phases: []\n"
+    "---\n"
+    "\n"
+    "# My Skill\n"
+    "\n"
+    "Teach a tool sequence. Always verify-before-done.\n"
+    "\n"
+    "## Steps\n"
+    "\n"
+    "1. ...\n"
+    "2. ...\n"
+    "\n"
+    "## Checklist\n"
+    "\n"
+    "- [ ] name + description valid\n"
+    "- [ ] verify-before-done called out\n";
+
+static bool ovSkillsAbsent(const core::RpcResult& r) {
+    if (!r.ok) {
+        const std::string& e = r.err;
+        if (e.find("unknown") != std::string::npos || e.find("not found") != std::string::npos ||
+            e.find("not_found") != std::string::npos || e.find("method") != std::string::npos)
+            return true;
+        return false;
+    }
+    if (r.result.is_object()) {
+        const std::string c = r.result.value("code", std::string());
+        if (c == "unknown_method" || c == "method_not_found" || c == "not_implemented")
+            return true;
+        if (!r.result.value("ok", true)) {
+            const std::string reason = r.result.value("reason", std::string());
+            if (reason == "unknown_method" || reason == "method_not_found")
+                return true;
+        }
+    }
+    return false;
+}
+static void ovPollSkills(AppState& st, bool force) {
+    if (s_ovSkills.rpcMissing) return;
+    const double now = ImGui::GetTime();
+    if (!force && s_ovSkills.loaded && (now - s_ovSkills.lastList) < 4.0) return;
+    if (s_ovSkills.listInFlight) return;
+    s_ovSkills.lastList = now;
+    s_ovSkills.listInFlight = true;
+    st.rpc.call("skills_list", nlohmann::json::object(),
+                [](const core::RpcResult& r) {
+        s_ovSkills.listInFlight = false;
+        if (ovSkillsAbsent(r)) {
+            s_ovSkills.rpcMissing = true;
+            s_ovSkills.loaded = true;
+            s_ovSkills.skills.clear();
+            return;
+        }
+        if (!r.ok || !r.result.is_object()) {
+            s_ovSkills.lastError = r.err.empty() ? "skills_list failed" : r.err;
+            s_ovSkills.loaded = true;
+            return;
+        }
+        s_ovSkills.lastError.clear();
+        s_ovSkills.skills.clear();
+        auto arr = r.result.value("skills", nlohmann::json::array());
+        if (arr.is_array()) {
+            for (const auto& e : arr) {
+                if (!e.is_object()) continue;
+                OvSkillRow row;
+                row.name = e.value("name", std::string());
+                row.description = e.value("description", std::string());
+                row.source = e.value("source", std::string("builtin"));
+                row.inject = e.value("inject", std::string("manual"));
+                if (!row.name.empty()) s_ovSkills.skills.push_back(std::move(row));
+            }
+        }
+        std::sort(s_ovSkills.skills.begin(), s_ovSkills.skills.end(),
+                  [](const OvSkillRow& a, const OvSkillRow& b) {
+                      return a.name < b.name;
+                  });
+        s_ovSkills.loaded = true;
+    });
+}
+static void ovLoadSkillBody(AppState& st, const std::string& name) {
+    if (name.empty() || s_ovSkills.bodyInFlight) return;
+    s_ovSkills.bodyInFlight = true;
+    s_ovSkills.bodyName = name;
+    s_ovSkills.bodyDirty = false;
+    std::fill(s_ovSkills.body.begin(), s_ovSkills.body.end(), 0);
+    st.rpc.call("skills_get", nlohmann::json{{"name", name}},
+                [name](const core::RpcResult& r) {
+        s_ovSkills.bodyInFlight = false;
+        if (ovSkillsAbsent(r)) {
+            s_ovSkills.rpcMissing = true;
+            return;
+        }
+        if (!r.ok || !r.result.is_object() || !r.result.value("ok", true)) {
+            s_ovSkills.lastError = r.err.empty()
+                ? r.result.value("reason", std::string("skills_get failed"))
+                : r.err;
+            return;
+        }
+        if (s_ovSkills.selected != name) return;  // selection moved on
+        std::string body = r.result.value("body", std::string());
+        std::fill(s_ovSkills.body.begin(), s_ovSkills.body.end(), 0);
+        if (body.size() >= s_ovSkills.body.size())
+            body.resize(s_ovSkills.body.size() - 1);
+        std::memcpy(s_ovSkills.body.data(), body.data(), body.size());
+        s_ovSkills.bodyName = name;
+        s_ovSkills.bodyDirty = false;
+        s_ovSkills.lastError.clear();
+    });
+}
+static void ovSaveSkill(AppState& st) {
+    if (s_ovSkills.selected.empty() || s_ovSkills.saveInFlight) return;
+    s_ovSkills.saveInFlight = true;
+    nlohmann::json p;
+    p["name"] = s_ovSkills.selected;
+    p["body"] = std::string(s_ovSkills.body.data());
+    st.rpc.call("skills_save", p, [](const core::RpcResult& r) {
+        s_ovSkills.saveInFlight = false;
+        if (ovSkillsAbsent(r)) {
+            s_ovSkills.rpcMissing = true;
+            return;
+        }
+        if (!r.ok || (r.result.is_object() && !r.result.value("ok", true))) {
+            s_ovSkills.lastError = r.err.empty()
+                ? r.result.value("reason", std::string("skills_save failed"))
+                : r.err;
+            return;
+        }
+        s_ovSkills.bodyDirty = false;
+        s_ovSkills.lastError.clear();
+        s_ovSkills.loaded = false;  // refresh list (source may flip to user)
+        s_ovSkills.lastList = -1e9;
+    });
+}
+static void ovDeleteSkill(AppState& st, const std::string& name) {
+    if (name.empty()) return;
+    st.rpc.call("skills_delete", nlohmann::json{{"name", name}},
+                [name](const core::RpcResult& r) {
+        if (!r.ok || (r.result.is_object() && !r.result.value("ok", true))) {
+            s_ovSkills.lastError = r.err.empty()
+                ? r.result.value("reason", std::string("skills_delete failed"))
+                : r.err;
+            return;
+        }
+        if (s_ovSkills.selected == name) {
+            s_ovSkills.selected.clear();
+            s_ovSkills.bodyName.clear();
+            std::fill(s_ovSkills.body.begin(), s_ovSkills.body.end(), 0);
+            s_ovSkills.bodyDirty = false;
+        }
+        s_ovSkills.loaded = false;
+        s_ovSkills.lastList = -1e9;
+    });
+}
+
+// ---- Context injection triggers (Settings → Prompts → Context) ----
+struct OvTriggerRow {
+    std::string id;
+    std::string purpose;
+    std::string source;   // builtin | override | user
+    std::string pack;
+    std::string exemplar;
+    bool enabled = true;
+    int budgetTokens = 250;
+    int cooldownTurns = 8;
+    std::vector<std::string> keywords;
+    std::vector<std::string> tools;
+    std::vector<std::string> events;
+};
+struct OvTriggersUi {
+    std::vector<OvTriggerRow> rows;
+    bool loaded = false;
+    bool rpcMissing = false;
+    bool listInFlight = false;
+    bool bodyInFlight = false;
+    bool saveInFlight = false;
+    double lastList = -1e9;
+    std::string lastError;
+    std::string selected;
+    // Editor buffers for the selected trigger.
+    bool enabled = true;
+    int budgetTokens = 250;
+    int cooldownTurns = 8;
+    char purpose[512] = {};
+    char packName[96] = {};
+    char keywords[2048] = {};   // one regex per line
+    char tools[1024] = {};      // comma or newline separated
+    char events[1024] = {};
+    char exemplar[512] = {};
+    std::vector<char> packBody{std::vector<char>(65536, 0)};
+    bool bodyDirty = false;   // any editor field dirty
+    bool packDirty = false;   // pack body specifically edited (avoid freezing shipped packs)
+    nlohmann::json prerunCalcs = nlohmann::json::array();  // preserved from get/list
+    bool creating = false;
+    char newId[96] = {};
+};
+static OvTriggersUi s_ovTrig;
+
+static bool ovTriggersAbsent(const core::RpcResult& r) {
+    if (!r.ok) {
+        const std::string& e = r.err;
+        if (e.find("unknown") != std::string::npos || e.find("not found") != std::string::npos ||
+            e.find("not_found") != std::string::npos || e.find("method") != std::string::npos)
+            return true;
+        return false;
+    }
+    if (r.result.is_object()) {
+        const std::string c = r.result.value("code", std::string());
+        if (c == "unknown_method" || c == "method_not_found" || c == "not_implemented")
+            return true;
+        if (!r.result.value("ok", true)) {
+            const std::string reason = r.result.value("reason", std::string());
+            if (reason == "unknown_method" || reason == "method_not_found")
+                return true;
+        }
+    }
+    return false;
+}
+static std::vector<std::string> ovSplitLinesOrCommas(const char* buf) {
+    std::vector<std::string> out;
+    if (!buf) return out;
+    std::string cur;
+    for (const char* p = buf; ; ++p) {
+        const char c = *p;
+        if (c == '\n' || c == '\r' || c == ',' || c == 0) {
+            size_t a = 0, b = cur.size();
+            while (a < b && std::isspace((unsigned char)cur[a])) ++a;
+            while (b > a && std::isspace((unsigned char)cur[b - 1])) --b;
+            if (b > a) out.emplace_back(cur.substr(a, b - a));
+            cur.clear();
+            if (c == 0) break;
+            continue;
+        }
+        cur.push_back(c);
+    }
+    return out;
+}
+static void ovJoinLines(const std::vector<std::string>& xs, char* buf, size_t n) {
+    if (!buf || n == 0) return;
+    buf[0] = 0;
+    std::string s;
+    for (size_t i = 0; i < xs.size(); ++i) {
+        if (i) s.push_back('\n');
+        s += xs[i];
+    }
+    if (s.size() >= n) s.resize(n - 1);
+    std::memcpy(buf, s.data(), s.size());
+    buf[s.size()] = 0;
+}
+static void ovPollTriggers(AppState& st, bool force) {
+    if (s_ovTrig.rpcMissing) return;
+    const double now = ImGui::GetTime();
+    if (!force && s_ovTrig.loaded && (now - s_ovTrig.lastList) < 4.0) return;
+    if (s_ovTrig.listInFlight) return;
+    s_ovTrig.lastList = now;
+    s_ovTrig.listInFlight = true;
+    st.rpc.call("triggers_list", nlohmann::json::object(),
+                [](const core::RpcResult& r) {
+        s_ovTrig.listInFlight = false;
+        if (ovTriggersAbsent(r)) {
+            s_ovTrig.rpcMissing = true;
+            s_ovTrig.loaded = true;
+            s_ovTrig.rows.clear();
+            return;
+        }
+        if (!r.ok || !r.result.is_object()) {
+            s_ovTrig.lastError = r.err.empty() ? "triggers_list failed" : r.err;
+            s_ovTrig.loaded = true;
+            return;
+        }
+        s_ovTrig.lastError.clear();
+        s_ovTrig.rows.clear();
+        auto arr = r.result.value("triggers", nlohmann::json::array());
+        if (arr.is_array()) {
+            for (const auto& e : arr) {
+                if (!e.is_object()) continue;
+                OvTriggerRow row;
+                row.id = e.value("id", std::string());
+                row.purpose = e.value("purpose", std::string());
+                row.source = e.value("source", std::string("builtin"));
+                row.enabled = e.value("enabled", true);
+                row.budgetTokens = e.value("budget_tokens", 250);
+                row.cooldownTurns = e.value("cooldown_turns", 8);
+                auto inject = e.value("inject", nlohmann::json::object());
+                if (inject.is_object()) {
+                    row.pack = inject.value("context_pack", std::string());
+                    row.exemplar = inject.value("exemplar", std::string());
+                }
+                auto match = e.value("match", nlohmann::json::object());
+                if (match.is_object()) {
+                    auto kws = match.value("keywords", nlohmann::json::array());
+                    if (kws.is_array())
+                        for (const auto& k : kws)
+                            if (k.is_string()) row.keywords.push_back(k.get<std::string>());
+                    auto tools = match.value("tools", nlohmann::json::array());
+                    if (tools.is_array())
+                        for (const auto& t : tools)
+                            if (t.is_string()) row.tools.push_back(t.get<std::string>());
+                    auto evs = match.value("events", nlohmann::json::array());
+                    if (evs.is_array())
+                        for (const auto& ev : evs)
+                            if (ev.is_string()) row.events.push_back(ev.get<std::string>());
+                }
+                if (!row.id.empty()) s_ovTrig.rows.push_back(std::move(row));
+            }
+        }
+        std::sort(s_ovTrig.rows.begin(), s_ovTrig.rows.end(),
+                  [](const OvTriggerRow& a, const OvTriggerRow& b) {
+                      return a.id < b.id;
+                  });
+        s_ovTrig.loaded = true;
+    });
+}
+static void ovLoadTriggerBody(AppState& st, const std::string& id) {
+    if (id.empty() || s_ovTrig.bodyInFlight) return;
+    s_ovTrig.bodyInFlight = true;
+    s_ovTrig.bodyDirty = false;
+    s_ovTrig.packDirty = false;
+    st.rpc.call("triggers_get", nlohmann::json{{"id", id}},
+                [id](const core::RpcResult& r) {
+        s_ovTrig.bodyInFlight = false;
+        if (ovTriggersAbsent(r)) {
+            s_ovTrig.rpcMissing = true;
+            return;
+        }
+        if (!r.ok || !r.result.is_object() || !r.result.value("ok", true)) {
+            s_ovTrig.lastError = r.err.empty()
+                ? r.result.value("reason", std::string("triggers_get failed"))
+                : r.err;
+            return;
+        }
+        if (s_ovTrig.selected != id) return;
+        auto trig = r.result.value("trigger", nlohmann::json::object());
+        auto pack = r.result.value("pack", nlohmann::json::object());
+        s_ovTrig.enabled = trig.value("enabled", true);
+        s_ovTrig.budgetTokens = trig.value("budget_tokens", 250);
+        s_ovTrig.cooldownTurns = trig.value("cooldown_turns", 8);
+        std::string purpose = trig.value("purpose", std::string());
+        std::memset(s_ovTrig.purpose, 0, sizeof(s_ovTrig.purpose));
+        std::strncpy(s_ovTrig.purpose, purpose.c_str(), sizeof(s_ovTrig.purpose) - 1);
+        auto inject = trig.value("inject", nlohmann::json::object());
+        std::string packName = inject.is_object()
+            ? inject.value("context_pack", std::string()) : std::string();
+        std::string exemplar = inject.is_object()
+            ? inject.value("exemplar", std::string()) : std::string();
+        s_ovTrig.prerunCalcs = (inject.is_object() && inject.contains("prerun_calcs")
+                                && inject["prerun_calcs"].is_array())
+            ? inject["prerun_calcs"] : nlohmann::json::array();
+        std::memset(s_ovTrig.packName, 0, sizeof(s_ovTrig.packName));
+        std::strncpy(s_ovTrig.packName, packName.c_str(), sizeof(s_ovTrig.packName) - 1);
+        std::memset(s_ovTrig.exemplar, 0, sizeof(s_ovTrig.exemplar));
+        std::strncpy(s_ovTrig.exemplar, exemplar.c_str(), sizeof(s_ovTrig.exemplar) - 1);
+        auto match = trig.value("match", nlohmann::json::object());
+        std::vector<std::string> kws, tools, evs;
+        if (match.is_object()) {
+            auto a = match.value("keywords", nlohmann::json::array());
+            if (a.is_array()) for (const auto& k : a)
+                if (k.is_string()) kws.push_back(k.get<std::string>());
+            a = match.value("tools", nlohmann::json::array());
+            if (a.is_array()) for (const auto& t : a)
+                if (t.is_string()) tools.push_back(t.get<std::string>());
+            a = match.value("events", nlohmann::json::array());
+            if (a.is_array()) for (const auto& e : a)
+                if (e.is_string()) evs.push_back(e.get<std::string>());
+        }
+        ovJoinLines(kws, s_ovTrig.keywords, sizeof(s_ovTrig.keywords));
+        ovJoinLines(tools, s_ovTrig.tools, sizeof(s_ovTrig.tools));
+        ovJoinLines(evs, s_ovTrig.events, sizeof(s_ovTrig.events));
+        std::string body = pack.is_object() ? pack.value("body", std::string()) : std::string();
+        std::fill(s_ovTrig.packBody.begin(), s_ovTrig.packBody.end(), 0);
+        if (body.size() >= s_ovTrig.packBody.size())
+            body.resize(s_ovTrig.packBody.size() - 1);
+        std::memcpy(s_ovTrig.packBody.data(), body.data(), body.size());
+        s_ovTrig.bodyDirty = false;
+        s_ovTrig.packDirty = false;
+        s_ovTrig.lastError.clear();
+    });
+}
+static void ovSaveTrigger(AppState& st) {
+    if (s_ovTrig.selected.empty() || s_ovTrig.saveInFlight) return;
+    s_ovTrig.saveInFlight = true;
+    nlohmann::json p;
+    p["id"] = s_ovTrig.selected;
+    p["enabled"] = s_ovTrig.enabled;
+    p["purpose"] = std::string(s_ovTrig.purpose);
+    p["budget_tokens"] = s_ovTrig.budgetTokens;
+    p["cooldown_turns"] = s_ovTrig.cooldownTurns;
+    p["match"] = nlohmann::json{
+        {"keywords", ovSplitLinesOrCommas(s_ovTrig.keywords)},
+        {"tools", ovSplitLinesOrCommas(s_ovTrig.tools)},
+        {"events", ovSplitLinesOrCommas(s_ovTrig.events)},
+    };
+    p["inject"] = nlohmann::json{
+        {"context_pack", std::string(s_ovTrig.packName)},
+        {"prerun_calcs", s_ovTrig.prerunCalcs.is_array()
+            ? s_ovTrig.prerunCalcs : nlohmann::json::array()},
+        {"exemplar", std::string(s_ovTrig.exemplar)},
+    };
+    for (const auto& row : s_ovTrig.rows) {
+        if (row.id == s_ovTrig.selected) {
+            if (s_ovTrig.packName[0] == 0 && !row.pack.empty())
+                p["inject"]["context_pack"] = row.pack;
+            break;
+        }
+    }
+    // Only write pack body when the user actually edited it (or is creating).
+    // Toggling Enabled alone must not freeze a shipped pack into the user dir.
+    if (s_ovTrig.packDirty || s_ovTrig.creating) {
+        p["pack_body"] = std::string(s_ovTrig.packBody.data());
+        p["pack_name"] = std::string(s_ovTrig.packName);
+    }
+    st.rpc.call("triggers_save", p, [](const core::RpcResult& r) {
+        s_ovTrig.saveInFlight = false;
+        if (ovTriggersAbsent(r)) {
+            s_ovTrig.rpcMissing = true;
+            return;
+        }
+        if (!r.ok || (r.result.is_object() && !r.result.value("ok", true))) {
+            s_ovTrig.lastError = r.err.empty()
+                ? r.result.value("reason", std::string("triggers_save failed"))
+                : r.err;
+            return;
+        }
+        s_ovTrig.bodyDirty = false;
+        s_ovTrig.packDirty = false;
+        s_ovTrig.lastError.clear();
+        s_ovTrig.loaded = false;
+        s_ovTrig.lastList = -1e9;
+    });
+}
+static void ovDeleteTriggerOverride(AppState& st, const std::string& id) {
+    if (id.empty()) return;
+    st.rpc.call("triggers_delete", nlohmann::json{{"id", id}},
+                [id](const core::RpcResult& r) {
+        if (!r.ok || (r.result.is_object() && !r.result.value("ok", true))) {
+            s_ovTrig.lastError = r.err.empty()
+                ? r.result.value("reason", std::string("triggers_delete failed"))
+                : r.err;
+            return;
+        }
+        s_ovTrig.lastError.clear();
+        s_ovTrig.loaded = false;
+        s_ovTrig.lastList = -1e9;
+        if (s_ovTrig.selected == id)
+            s_ovTrig.bodyDirty = false;
+    });
+}
+
+static void drawSettingsSkillsTab(AppState& st, float S) {
+    ovPollSkills(st, /*force=*/false);
+
+    if (s_ovSkills.rpcMissing) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusWarn));
+        ImGui::TextWrapped("skills_* RPC not available \xe2\x80\x94 skill editor hidden.");
+        ImGui::PopStyleColor();
+        return;
+    }
+    if (!s_ovSkills.lastError.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusErr));
+        ImGui::TextWrapped("%s", s_ovSkills.lastError.c_str());
+        ImGui::PopStyleColor();
+    }
+
+    const float colH = ImMax(220.0f * S, ImGui::GetContentRegionAvail().y - 8.0f * S);
+    ui::InterwebzTwoColumnBegin(12.0f);
+    if (ui::InterwebzGroupBegin("##set_skill_list", "Catalog", ImVec2(0, colH))) {
+        if (ImGui::Button("New skill", ImVec2(-1, 0))) {
+            s_ovSkills.creating = true;
+            s_ovSkills.selected.clear();
+            std::fill(s_ovSkills.body.begin(), s_ovSkills.body.end(), 0);
+            std::strncpy(s_ovSkills.body.data(), kSkillCreatorTemplate,
+                         s_ovSkills.body.size() - 1);
+            s_ovSkills.bodyName.clear();
+            s_ovSkills.bodyDirty = true;
+            std::memset(s_ovSkills.newName, 0, sizeof(s_ovSkills.newName));
+            std::strncpy(s_ovSkills.newName, "my-skill", sizeof(s_ovSkills.newName) - 1);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Create a user skill from the skill-creator template.");
+        ImGui::Dummy(ImVec2(0, 4.0f * S));
+
+        if (!s_ovSkills.loaded && s_ovSkills.listInFlight) {
+            ImGui::TextUnformatted("Loading skills\xe2\x80\xa6");
+        } else if (s_ovSkills.skills.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
+                       ui::palette.textDim[2], 1));
+            ImGui::TextWrapped("No skills discovered.");
+            ImGui::PopStyleColor();
+        } else {
+            for (size_t i = 0; i < s_ovSkills.skills.size(); ++i) {
+                const auto& sk = s_ovSkills.skills[i];
+                ImGui::PushID((int)i);
+                const bool sel = (!s_ovSkills.creating && s_ovSkills.selected == sk.name);
+                if (ImGui::Selectable("##skrow", sel, 0, ImVec2(0, 0))) {
+                    s_ovSkills.creating = false;
+                    s_ovSkills.selected = sk.name;
+                    ovLoadSkillBody(st, sk.name);
+                }
+                // Paint name + source chip on the same row.
+                {
+                    ImVec2 rmin = ImGui::GetItemRectMin();
+                    ImVec2 rmax = ImGui::GetItemRectMax();
+                    // Expand row height for two lines: name + description.
+                    (void)rmin; (void)rmax;
+                }
+                ImGui::SameLine(0, 0);
+                ImGui::BeginGroup();
+                ImGui::TextUnformatted(sk.name.c_str());
+                ImGui::SameLine();
+                {
+                    const char* chip = sk.source.c_str();
+                    ImU32 chipCol = ui::Palette::toU32(ui::palette.textDim);
+                    if (sk.source == "user")
+                        chipCol = ui::Palette::toU32(ui::palette.accent);
+                    else if (sk.source == "project")
+                        chipCol = ui::Palette::toU32(ui::palette.statusOk);
+                    ImGui::PushStyleColor(ImGuiCol_Text, chipCol);
+                    ImGui::Text("[%s]", chip);
+                    ImGui::PopStyleColor();
+                }
+                if (!sk.description.empty()) {
+                    ImGui::PushStyleColor(ImGuiCol_Text,
+                        ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
+                               ui::palette.textDim[2], 1));
+                    ImGui::TextWrapped("%s", sk.description.c_str());
+                    ImGui::PopStyleColor();
+                }
+                ImGui::EndGroup();
+                // Make the group also selectable.
+                if (ImGui::IsItemClicked()) {
+                    s_ovSkills.creating = false;
+                    s_ovSkills.selected = sk.name;
+                    ovLoadSkillBody(st, sk.name);
+                }
+                ImGui::PopID();
+                ImGui::Dummy(ImVec2(0, 2.0f * S));
+            }
+        }
+    }
+    ui::InterwebzGroupEnd();
+
+    ui::InterwebzTwoColumnNext();
+    if (ui::InterwebzGroupBegin("##set_skill_ed", "Editor", ImVec2(0, colH))) {
+        if (s_ovSkills.creating) {
+            ImGui::TextUnformatted("Name");
+            ImGui::SetNextItemWidth(-1);
+            ImGui::InputText("##set_newskill", s_ovSkills.newName, sizeof(s_ovSkills.newName));
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
+                       ui::palette.textDim[2], 1));
+            ImGui::TextWrapped("Saved under the user skills dir via skills_save.");
+            ImGui::PopStyleColor();
+        } else if (s_ovSkills.selected.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
+                       ui::palette.textDim[2], 1));
+            ImGui::TextWrapped("Select a skill to edit, or New skill.");
+            ImGui::PopStyleColor();
+        } else {
+            ui::InterwebzKeyValueRow("Skill", s_ovSkills.selected.c_str());
+            // Source chip for selected.
+            const char* src = "builtin";
+            for (const auto& sk : s_ovSkills.skills)
+                if (sk.name == s_ovSkills.selected) { src = sk.source.c_str(); break; }
+            ui::InterwebzKeyValueRow("Source", src);
+        }
+
+        if (s_ovSkills.creating || !s_ovSkills.selected.empty()) {
+            if (s_ovSkills.bodyInFlight && !s_ovSkills.creating) {
+                ImGui::TextUnformatted("Loading body\xe2\x80\xa6");
+            } else {
+                const float edH = ImMax(100.0f * S,
+                    ImGui::GetContentRegionAvail().y - 56.0f * S);
+                if (st.fonts.mono) ImGui::PushFont(st.fonts.mono);
+                if (ImGui::InputTextMultiline("##set_skillbody", s_ovSkills.body.data(),
+                                              s_ovSkills.body.size(), ImVec2(-1, edH)))
+                    s_ovSkills.bodyDirty = true;
+                if (st.fonts.mono) ImGui::PopFont();
+            }
+
+            const bool busySave = s_ovSkills.saveInFlight;
+            if (busySave) ImGui::BeginDisabled();
+            if (ImGui::Button(s_ovSkills.creating ? "Create##set_sksave" : "Save##set_sksave",
+                              ImVec2(-1, 0))) {
+                if (s_ovSkills.creating) {
+                    // Normalize name from field; rewrite frontmatter name if needed.
+                    std::string name = s_ovSkills.newName;
+                    // strip spaces
+                    name.erase(std::remove_if(name.begin(), name.end(),
+                        [](unsigned char c) { return std::isspace(c); }), name.end());
+                    if (name.empty()) name = "my-skill";
+                    s_ovSkills.selected = name;
+                    s_ovSkills.creating = false;
+                    ovSaveSkill(st);
+                } else {
+                    ovSaveSkill(st);
+                }
+            }
+            if (busySave) ImGui::EndDisabled();
+
+            // Delete only for user skills.
+            if (!s_ovSkills.creating && !s_ovSkills.selected.empty()) {
+                bool isUser = false;
+                for (const auto& sk : s_ovSkills.skills)
+                    if (sk.name == s_ovSkills.selected && sk.source == "user") {
+                        isUser = true; break;
+                    }
+                if (isUser) {
+                    ImGui::PushStyleColor(ImGuiCol_Button,
+                        ImVec4(ui::palette.statusErr[0], ui::palette.statusErr[1],
+                               ui::palette.statusErr[2], 0.55f));
+                    if (ImGui::Button("Delete user skill", ImVec2(-1, 0)))
+                        ovDeleteSkill(st, s_ovSkills.selected);
+                    ImGui::PopStyleColor();
+                }
+            }
+        }
+    }
+    ui::InterwebzGroupEnd();
+    ui::InterwebzTwoColumnEnd();
+}
+
+static void drawSettingsContextTab(AppState& st, float S) {
+    ovPollTriggers(st, /*force=*/false);
+
+    if (s_ovTrig.rpcMissing) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusWarn));
+        ImGui::TextWrapped(
+            "triggers_* RPC not available \xe2\x80\x94 Context Injection editor hidden.");
+        ImGui::PopStyleColor();
+        return;
+    }
+    if (!s_ovTrig.lastError.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusErr));
+        ImGui::TextWrapped("%s", s_ovTrig.lastError.c_str());
+        ImGui::PopStyleColor();
+    }
+
+    ImGui::PushStyleColor(ImGuiCol_Text,
+        ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
+               ui::palette.textDim[2], 1));
+    ImGui::TextWrapped(
+        "Keyword / tool / event triggers inject domain context so the model plans "
+        "with the right numbers and tool sequences (aicad.trigger/1).");
+    ImGui::PopStyleColor();
+    ImGui::Dummy(ImVec2(0, 4.0f * S));
+
+    const float colH = ImMax(220.0f * S, ImGui::GetContentRegionAvail().y - 8.0f * S);
+    ui::InterwebzTwoColumnBegin(10.0f);
+    if (ui::InterwebzGroupBegin("##set_trig_list", "Triggers", ImVec2(0, colH))) {
+        if (ImGui::Button("New trigger", ImVec2(-1, 0))) {
+            s_ovTrig.creating = true;
+            s_ovTrig.selected.clear();
+            s_ovTrig.enabled = true;
+            s_ovTrig.budgetTokens = 250;
+            s_ovTrig.cooldownTurns = 8;
+            std::memset(s_ovTrig.purpose, 0, sizeof(s_ovTrig.purpose));
+            std::strncpy(s_ovTrig.purpose, "What this pack teaches the model.",
+                         sizeof(s_ovTrig.purpose) - 1);
+            std::memset(s_ovTrig.packName, 0, sizeof(s_ovTrig.packName));
+            std::strncpy(s_ovTrig.packName, "my_pack", sizeof(s_ovTrig.packName) - 1);
+            std::memset(s_ovTrig.keywords, 0, sizeof(s_ovTrig.keywords));
+            std::strncpy(s_ovTrig.keywords, "\\bmy_keyword\\b",
+                         sizeof(s_ovTrig.keywords) - 1);
+            std::memset(s_ovTrig.tools, 0, sizeof(s_ovTrig.tools));
+            std::memset(s_ovTrig.events, 0, sizeof(s_ovTrig.events));
+            std::memset(s_ovTrig.exemplar, 0, sizeof(s_ovTrig.exemplar));
+            std::fill(s_ovTrig.packBody.begin(), s_ovTrig.packBody.end(), 0);
+            std::strncpy(s_ovTrig.packBody.data(),
+                         "# My context pack\n\nImportant considerations:\n- ...\n",
+                         s_ovTrig.packBody.size() - 1);
+            s_ovTrig.prerunCalcs = nlohmann::json::array();
+            s_ovTrig.bodyDirty = true;
+            s_ovTrig.packDirty = true;
+            std::memset(s_ovTrig.newId, 0, sizeof(s_ovTrig.newId));
+            std::strncpy(s_ovTrig.newId, "my_trigger", sizeof(s_ovTrig.newId) - 1);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Create a user-only trigger + pack (saved under context_injection/).");
+        ImGui::Dummy(ImVec2(0, 4.0f * S));
+
+        if (!s_ovTrig.loaded && s_ovTrig.listInFlight) {
+            ImGui::TextUnformatted("Loading triggers\xe2\x80\xa6");
+        } else if (s_ovTrig.rows.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
+                       ui::palette.textDim[2], 1));
+            ImGui::TextWrapped("No triggers discovered.");
+            ImGui::PopStyleColor();
+        } else {
+            for (size_t i = 0; i < s_ovTrig.rows.size(); ++i) {
+                const auto& tr = s_ovTrig.rows[i];
+                ImGui::PushID((int)i);
+                const bool sel = (!s_ovTrig.creating && s_ovTrig.selected == tr.id);
+                if (ImGui::Selectable("##trigrow", sel, 0, ImVec2(0, 0))) {
+                    s_ovTrig.creating = false;
+                    s_ovTrig.selected = tr.id;
+                    ovLoadTriggerBody(st, tr.id);
+                }
+                ImGui::SameLine(0, 0);
+                ImGui::BeginGroup();
+                ImGui::Text("%s %s", tr.enabled ? "\xe2\x97\x8f" : "\xe2\x97\x8b",
+                            tr.id.c_str());
+                ImGui::SameLine();
+                {
+                    const char* chip = tr.source.c_str();
+                    ImU32 chipCol = ui::Palette::toU32(ui::palette.textDim);
+                    if (tr.source == "user")
+                        chipCol = ui::Palette::toU32(ui::palette.accent);
+                    else if (tr.source == "override")
+                        chipCol = ui::Palette::toU32(ui::palette.statusOk);
+                    ImGui::PushStyleColor(ImGuiCol_Text, chipCol);
+                    ImGui::Text("[%s]", chip);
+                    ImGui::PopStyleColor();
+                }
+                if (!tr.purpose.empty()) {
+                    ImGui::PushStyleColor(ImGuiCol_Text,
+                        ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
+                               ui::palette.textDim[2], 1));
+                    ImGui::TextWrapped("%s", tr.purpose.c_str());
+                    ImGui::PopStyleColor();
+                } else if (!tr.pack.empty()) {
+                    ImGui::PushStyleColor(ImGuiCol_Text,
+                        ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
+                               ui::palette.textDim[2], 1));
+                    ImGui::TextWrapped("pack: %s", tr.pack.c_str());
+                    ImGui::PopStyleColor();
+                }
+                ImGui::EndGroup();
+                if (ImGui::IsItemClicked()) {
+                    s_ovTrig.creating = false;
+                    s_ovTrig.selected = tr.id;
+                    ovLoadTriggerBody(st, tr.id);
+                }
+                ImGui::PopID();
+                ImGui::Dummy(ImVec2(0, 2.0f * S));
+            }
+        }
+    }
+    ui::InterwebzGroupEnd();
+
+    ui::InterwebzTwoColumnNext();
+    if (ui::InterwebzGroupBegin("##set_trig_ed", "Editor", ImVec2(0, colH))) {
+        if (s_ovTrig.creating) {
+            ImGui::TextUnformatted("Id");
+            ImGui::SetNextItemWidth(-1);
+            ImGui::InputText("##set_newtrig", s_ovTrig.newId, sizeof(s_ovTrig.newId));
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
+                       ui::palette.textDim[2], 1));
+            ImGui::TextWrapped(
+                "Letters, digits, _ and - only. Saved as a user trigger.");
+            ImGui::PopStyleColor();
+        } else if (s_ovTrig.selected.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
+                       ui::palette.textDim[2], 1));
+            ImGui::TextWrapped("Select a trigger to edit, or New trigger.");
+            ImGui::PopStyleColor();
+        } else {
+            ui::InterwebzKeyValueRow("Trigger", s_ovTrig.selected.c_str());
+            const char* src = "builtin";
+            for (const auto& tr : s_ovTrig.rows)
+                if (tr.id == s_ovTrig.selected) { src = tr.source.c_str(); break; }
+            ui::InterwebzKeyValueRow("Source", src);
+        }
+
+        if (s_ovTrig.creating || !s_ovTrig.selected.empty()) {
+            if (s_ovTrig.bodyInFlight && !s_ovTrig.creating) {
+                ImGui::TextUnformatted("Loading\xe2\x80\xa6");
+            } else {
+                if (ui::InterwebzCheckbox("Enabled", &s_ovTrig.enabled))
+                    s_ovTrig.bodyDirty = true;
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip(
+                        "Off = never inject this pack (user override of shipped).");
+
+                ImGui::TextUnformatted("Purpose");
+                ImGui::SetNextItemWidth(-1);
+                if (ImGui::InputText("##set_purpose", s_ovTrig.purpose,
+                                     sizeof(s_ovTrig.purpose)))
+                    s_ovTrig.bodyDirty = true;
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip(
+                        "Why this pack exists — what important considerations it "
+                        "forces the model to take.");
+
+                ImGui::TextUnformatted("Keywords (regex, one per line)");
+                ImGui::SetNextItemWidth(-1);
+                if (ImGui::InputTextMultiline("##set_kws", s_ovTrig.keywords,
+                        sizeof(s_ovTrig.keywords),
+                        ImVec2(-1, 56.0f * S)))
+                    s_ovTrig.bodyDirty = true;
+
+                ImGui::TextUnformatted("Tools (names that fire this)");
+                ImGui::SetNextItemWidth(-1);
+                if (ImGui::InputText("##set_tools", s_ovTrig.tools,
+                                     sizeof(s_ovTrig.tools)))
+                    s_ovTrig.bodyDirty = true;
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip(
+                        "Comma or newline separated tool names, e.g. part_place, fit_calc.");
+
+                ImGui::TextUnformatted("Events");
+                ImGui::SetNextItemWidth(-1);
+                if (ImGui::InputText("##set_events", s_ovTrig.events,
+                                     sizeof(s_ovTrig.events)))
+                    s_ovTrig.bodyDirty = true;
+
+                ImGui::TextUnformatted("Context pack name");
+                ImGui::SetNextItemWidth(-1);
+                if (ImGui::InputText("##set_packname", s_ovTrig.packName,
+                                     sizeof(s_ovTrig.packName)))
+                    s_ovTrig.bodyDirty = true;
+
+                ImGui::TextUnformatted("Exemplar (short worked example)");
+                ImGui::SetNextItemWidth(-1);
+                if (ImGui::InputText("##set_exemplar", s_ovTrig.exemplar,
+                                     sizeof(s_ovTrig.exemplar)))
+                    s_ovTrig.bodyDirty = true;
+
+                ImGui::SetNextItemWidth(ImMax(100.0f * S,
+                    ImGui::GetContentRegionAvail().x * 0.48f));
+                if (ImGui::SliderInt("Budget tokens", &s_ovTrig.budgetTokens,
+                                     50, 2000))
+                    s_ovTrig.bodyDirty = true;
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(ImMax(80.0f * S,
+                    ImGui::GetContentRegionAvail().x * 0.9f));
+                if (ImGui::SliderInt("Cooldown", &s_ovTrig.cooldownTurns, 0, 32))
+                    s_ovTrig.bodyDirty = true;
+
+                ImGui::TextUnformatted("Pack body (markdown injected into context)");
+                const float edH = ImMax(80.0f * S,
+                    ImGui::GetContentRegionAvail().y - 72.0f * S);
+                if (st.fonts.mono) ImGui::PushFont(st.fonts.mono);
+                if (ImGui::InputTextMultiline("##set_packbody",
+                        s_ovTrig.packBody.data(), s_ovTrig.packBody.size(),
+                        ImVec2(-1, edH))) {
+                    s_ovTrig.bodyDirty = true;
+                    s_ovTrig.packDirty = true;
+                }
+                if (st.fonts.mono) ImGui::PopFont();
+            }
+
+            const bool busySave = s_ovTrig.saveInFlight;
+            if (busySave) ImGui::BeginDisabled();
+            if (ImGui::Button(s_ovTrig.creating ? "Create##set_trsave" : "Save##set_trsave",
+                              ImVec2(-1, 0))) {
+                if (s_ovTrig.creating) {
+                    std::string name = s_ovTrig.newId;
+                    name.erase(std::remove_if(name.begin(), name.end(),
+                        [](unsigned char c) {
+                            return !(std::isalnum(c) || c == '_' || c == '-');
+                        }), name.end());
+                    if (name.empty()) name = "my_trigger";
+                    s_ovTrig.selected = name;
+                    s_ovTrig.creating = false;
+                    ovSaveTrigger(st);
+                } else {
+                    ovSaveTrigger(st);
+                }
+            }
+            if (busySave) ImGui::EndDisabled();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(
+                    "Writes a user override (shipped triggers.yaml is never rewritten).");
+
+            if (!s_ovTrig.creating && !s_ovTrig.selected.empty()) {
+                bool isOverrideOrUser = false;
+                bool isUserOnly = false;
+                for (const auto& tr : s_ovTrig.rows) {
+                    if (tr.id == s_ovTrig.selected) {
+                        isOverrideOrUser = (tr.source == "override" || tr.source == "user");
+                        isUserOnly = (tr.source == "user");
+                        break;
+                    }
+                }
+                if (isOverrideOrUser) {
+                    ImGui::PushStyleColor(ImGuiCol_Button,
+                        ImVec4(ui::palette.statusErr[0], ui::palette.statusErr[1],
+                               ui::palette.statusErr[2], 0.55f));
+                    if (ImGui::Button(
+                            isUserOnly ? "Delete user trigger"
+                                       : "Reset to shipped",
+                            ImVec2(-1, 0)))
+                        ovDeleteTriggerOverride(st, s_ovTrig.selected);
+                    ImGui::PopStyleColor();
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip(
+                            isUserOnly
+                                ? "Remove this user-only trigger."
+                                : "Clear the user override and restore the shipped trigger.");
+                }
+            }
+        }
+    }
+    ui::InterwebzGroupEnd();
+    ui::InterwebzTwoColumnEnd();
+}
+
+}  // namespace (skills/context editors)
+
 // ---- kSettingsEntries: unified command search table (command_search.cpp) ----
 // Tab indices: 0=Appearance 1=General 2=AI 3=Providers 4=Benchmarks 5=Prompts
 // 6=Experimental (Agent tab merged into AI)
@@ -2392,6 +3345,10 @@ const SettingsEntry kSettingsEntries[] = {
     { "Prompt editor",            "Prompts",      5 },
     { "System prompt",            "Prompts",      5 },
     { "System prompt override",   "Prompts",      5 },
+    { "Skills",                   "Prompts",      5 },
+    { "Skill editor",             "Prompts",      5 },
+    { "Context injection",        "Prompts",      5 },
+    { "Triggers",                 "Prompts",      5 },
     // Run behavior (lives on AI tab; was Agent tab 6)
     { "Plan preference",          "AI",           2 },
     { "Plan before building",     "AI",           2 },
@@ -3073,11 +4030,13 @@ void drawSettingsModal(AppState& st, bool busy) {
                 ImGui::EndTabItem();
             }
 
-            // --- C22b: Prompts tab (role prompt editor + system-prompt override) ---
+            // --- Prompts tab: Roles / Skills / Context Injection ---
             if (ImGui::BeginTabItem("Prompts", nullptr,
                                     (jumpToPrompts || jumpToTab == 5) ? ImGuiTabItemFlags_SetSelected
                                                                       : ImGuiTabItemFlags_None)) {
                 settingsTabBodyBegin("##tab_prompts");
+                if (ImGui::BeginTabBar("##prompts_sub", ImGuiTabBarFlags_None)) {
+                    if (ImGui::BeginTabItem("Roles")) {
                 settingsSectionHeader("Role prompts", /*first=*/true);
                 bool canFetch = st.workerStarted && !busy;
                 if (!s_promptsLoaded && canFetch) loadPrompts(st);
@@ -3204,6 +4163,18 @@ void drawSettingsModal(AppState& st, bool busy) {
                         ImGui::SetTooltip("Delete the override and restore the shipped prompt");
                 }
                 ImGui::EndChild();
+                                        ImGui::EndTabItem();
+                    }
+                    if (ImGui::BeginTabItem("Skills")) {
+                        drawSettingsSkillsTab(st, sc);
+                        ImGui::EndTabItem();
+                    }
+                    if (ImGui::BeginTabItem("Context")) {
+                        drawSettingsContextTab(st, sc);
+                        ImGui::EndTabItem();
+                    }
+                    ImGui::EndTabBar();
+                }
                 settingsTabBodyEnd();
                 ImGui::EndTabItem();
             }

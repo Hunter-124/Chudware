@@ -312,6 +312,124 @@ TEST_CASE("resolve_prewalk_provider: off is null; on resolves target") {
     CHECK(pw2.value("model", std::string()) == "cheap-local");
 }
 
+TEST_CASE("load_eng_firm_models: empty config yields empty entries") {
+    EngFirmModels d = load_eng_firm_models(json::object());
+    CHECK(d.mission_planner.empty());
+    CHECK(d.advisor.empty());
+    CHECK(d.lead.empty());
+    CHECK(d.subcontractor.empty());
+    CHECK(d.disciplines.empty());
+    CHECK(resolve_eng_firm_provider(d.mission_planner, json::object()).is_null());
+    CHECK(resolve_eng_firm_provider(d.advisor, json::object()).is_null());
+    CHECK(resolve_eng_firm_provider(d.lead, json::object()).is_null());
+    CHECK(resolve_eng_firm_provider(d.subcontractor, json::object()).is_null());
+}
+
+TEST_CASE("resolve_eng_firm_provider: role entries resolve provider+model+thinking") {
+    json cfg = json{
+        {"eng_firm",
+         {{"models",
+           {{"mission_planner",
+             {{"provider", "moonshot"}, {"model", "kimi-k3"}, {"thinking", "high"}}},
+            {"advisor", {{"provider", "openai"}, {"model", "gpt-4.1-mini"}, {"thinking", "low"}}},
+            {"lead", {{"provider", "openai"}, {"model", "gpt-4.1"}, {"thinking", "medium"}}},
+            {"subcontractor",
+             {{"provider", "openai"}, {"model", "gpt-4.1-nano"}, {"thinking", "minimal"}}}}}}},
+        {"api_key", "sk-test"},
+        {"keys", {{"moonshot", "ms-test"}}},
+        {"openai", {{"base_url", "http://localhost:1234/v1"}}},
+        {"moonshot", {{"base_url", "http://localhost:1234/v1"}}}};
+
+    EngFirmModels m = load_eng_firm_models(cfg);
+    CHECK_FALSE(m.mission_planner.empty());
+    CHECK(m.mission_planner.provider == "moonshot");
+    CHECK(m.mission_planner.model == "kimi-k3");
+    CHECK(m.mission_planner.thinking == "high");
+
+    json mp = resolve_eng_firm_provider(m.mission_planner, cfg, json::object());
+    REQUIRE(mp.is_object());
+    CHECK_FALSE(mp.contains("error"));
+    CHECK(mp.value("name", std::string()) == "moonshot");
+    CHECK(mp.value("model", std::string()) == "kimi-k3");
+    CHECK(mp.value("reasoning_effort", std::string()) == "high");
+
+    json adv = resolve_eng_firm_provider(m.advisor, cfg, json::object());
+    REQUIRE(adv.is_object());
+    CHECK(adv.value("name", std::string()) == "openai");
+    CHECK(adv.value("model", std::string()) == "gpt-4.1-mini");
+    CHECK(adv.value("reasoning_effort", std::string()) == "low");
+
+    json lead = resolve_eng_firm_provider(m.lead, cfg, json::object());
+    REQUIRE(lead.is_object());
+    CHECK(lead.value("name", std::string()) == "openai");
+    CHECK(lead.value("model", std::string()) == "gpt-4.1");
+
+    json sub = resolve_eng_firm_provider(m.subcontractor, cfg, json::object());
+    REQUIRE(sub.is_object());
+    CHECK(sub.value("name", std::string()) == "openai");
+    CHECK(sub.value("model", std::string()) == "gpt-4.1-nano");
+}
+
+TEST_CASE("eng_firm models: discipline beats lead; subcontractor default; malformed safe") {
+    // disciplines.mechanical beats lead for a mechanical task domain.
+    json cfg = json{
+        {"eng_firm",
+         {{"models",
+           {{"lead", {{"provider", "openai"}, {"model", "lead-model"}}},
+            {"subcontractor", {{"provider", "openai"}, {"model", "sub-model"}}},
+            {"disciplines",
+             {{"mechanical", {{"provider", "openai"}, {"model", "mech-model"}}}}}}}}},
+        {"api_key", "sk-test"},
+        {"openai", {{"base_url", "http://localhost:1234/v1"}}}};
+
+    EngFirmModels m = load_eng_firm_models(cfg);
+    CHECK(eng_firm_discipline_key(Discipline::Mechanical) == "mechanical");
+    CHECK(eng_firm_discipline_key(Discipline::Generalist) == "generalist");
+
+    // Mechanical discipline entry wins over lead.
+    auto dit = m.disciplines.find("mechanical");
+    REQUIRE(dit != m.disciplines.end());
+    json mech = resolve_eng_firm_provider(dit->second, cfg, json::object());
+    REQUIRE(mech.is_object());
+    CHECK(mech.value("model", std::string()) == "mech-model");
+
+    // No electrical discipline → subcontractor default applies for that role.
+    CHECK(m.disciplines.count("electrical") == 0);
+    json sub = resolve_eng_firm_provider(m.subcontractor, cfg, json::object());
+    REQUIRE(sub.is_object());
+    CHECK(sub.value("model", std::string()) == "sub-model");
+
+    // lead still resolves when used as fallback.
+    json lead = resolve_eng_firm_provider(m.lead, cfg, json::object());
+    REQUIRE(lead.is_object());
+    CHECK(lead.value("model", std::string()) == "lead-model");
+
+    // Malformed entries never throw: wrong types → empty / null.
+    json bad = json{{"eng_firm",
+                     {{"models",
+                       {{"mission_planner", "not-an-object"},
+                        {"advisor", 42},
+                        {"lead", nullptr},
+                        {"subcontractor", json::array()},
+                        {"disciplines", "nope"}}}}},
+                    {"api_key", "sk-test"}};
+    CHECK_NOTHROW({
+        EngFirmModels bm = load_eng_firm_models(bad);
+        CHECK(bm.mission_planner.empty());
+        CHECK(bm.advisor.empty());
+        CHECK(bm.lead.empty());
+        CHECK(bm.subcontractor.empty());
+        CHECK(bm.disciplines.empty());
+        CHECK(resolve_eng_firm_provider(bm.mission_planner, bad, json::object()).is_null());
+        // Non-object eng_firm / models also safe.
+        CHECK(load_eng_firm_models(json{{"eng_firm", 1}}).mission_planner.empty());
+        CHECK(load_eng_firm_models(json{{"eng_firm", {{"models", 1}}}}).advisor.empty());
+        // Empty entry resolves null.
+        EngFirmModelEntry empty;
+        CHECK(resolve_eng_firm_provider(empty, cfg, json::object()).is_null());
+    });
+}
+
 TEST_CASE("is_implementation_stage / is_planning_stage classify prewalk switch") {
     CHECK(is_planning_stage("intake"));
     CHECK(is_planning_stage("plan"));

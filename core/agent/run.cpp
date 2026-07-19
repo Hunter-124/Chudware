@@ -2767,6 +2767,36 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
     const bool eng_firm_mode = (execution_style == "eng_firm");
     const bool needs_plan_gate = swarm_mode || eng_firm_mode;
 
+    // Eng. Firm per-role model config (optional). Empty/absent → ambient provider
+    // (byte-identical to today). Loaded once for the eng_firm branch.
+    EngFirmModels ef_models;
+    json ef_cfg = json::object();
+    ProviderFn planner_provider = provider;
+    int planner_budget = budget;
+    int planner_ctx_cap = ctx_cap;
+    ProviderFn advisor_provider = provider;
+    int advisor_budget = budget;
+    int advisor_ctx_cap = ctx_cap;
+    if (eng_firm_mode) {
+        ef_cfg = load_config();
+        if (!ef_cfg.is_object()) ef_cfg = json::object();
+        ef_models = load_eng_firm_models(ef_cfg);
+        json mp_desc = resolve_eng_firm_provider(ef_models.mission_planner, ef_cfg);
+        if (mp_desc.is_object() && !mp_desc.contains("error") && !mp_desc.empty()) {
+            planner_provider = make_provider(mp_desc);
+            const CallBudget pb = fit_call_budget(mp_desc, call_budget_for(mp_desc));
+            planner_budget = pb.output;
+            planner_ctx_cap = pb.input_cap;
+        }
+        json adv_desc = resolve_eng_firm_provider(ef_models.advisor, ef_cfg);
+        if (adv_desc.is_object() && !adv_desc.contains("error") && !adv_desc.empty()) {
+            advisor_provider = make_provider(adv_desc);
+            const CallBudget ab = fit_call_budget(adv_desc, call_budget_for(adv_desc));
+            advisor_budget = ab.output;
+            advisor_ctx_cap = ab.input_cap;
+        }
+    }
+
     // approved_plan: host-approved or previously advisor-approved mission plan.
     ojson approved_plan = nullptr;
     if (options.contains("approved_plan") && !options["approved_plan"].is_null()) {
@@ -2863,8 +2893,8 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
                           "Include interfaces:[{between,kind,seed,...}] for mating parts."
                         : "Minimal capability sequence. If multi-part with mates, still emit "
                           "interfaces:[{between,kind,seed,holes/fit}]."));
-        AgentCall ma = agent_call(provider, mstate, "mission_planner", prompts_dir, budget, false,
-                                  ctx_cap, style_dir);
+        AgentCall ma = agent_call(planner_provider, mstate, "mission_planner", prompts_dir,
+                                  planner_budget, false, planner_ctx_cap, style_dir);
         ojson plan = extract_json_obj(ma.reply);
         if (!plan.is_null() && plan.is_object()) {
             mission_plan_obj = plan;
@@ -2918,8 +2948,8 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
                 std::string("STAGE: plan\nReview this MISSION PLAN for execution_style='") +
                 execution_style + "'.\nReturn verdict approve|revise|escalate with a note.\n\n" +
                 "REQUEST:\n" + request + "\n\nPLAN:\n" + py_json_dumps_indent0(mission_plan_obj);
-            AgentCall ac =
-                agent_call(provider, adv_st, "advisor", prompts_dir, budget, false, ctx_cap);
+            AgentCall ac = agent_call(advisor_provider, adv_st, "advisor", prompts_dir,
+                                      advisor_budget, false, advisor_ctx_cap);
             AdvisorPlanVerdict v = parse_advisor_plan_verdict(ac.reply);
             if (ac.has_call_error) {
                 v.verdict = "approve";
@@ -2962,8 +2992,8 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
                     std::string("[execution_style: ") + execution_style +
                     "]\n[PLAN REVISION REQUIRED]\n" +
                     (v.note.empty() ? "Revise the mission plan." : v.note);
-                AgentCall ma = agent_call(provider, mstate, "mission_planner", prompts_dir, budget,
-                                          false, ctx_cap, rev_dir);
+                AgentCall ma = agent_call(planner_provider, mstate, "mission_planner", prompts_dir,
+                                          planner_budget, false, planner_ctx_cap, rev_dir);
                 ojson rp = extract_json_obj(ma.reply);
                 if (!rp.is_null() && rp.is_object()) {
                     mission_plan_obj = rp;
@@ -3262,6 +3292,8 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
         // remaining = TOTAL budget minus ACTUAL prior task spend (not mission selection).
         std::string firm_role_seed;
         double task_bid_usd = 0.0;
+        // Per-task provider override (eng_firm models). Defaults to ambient.
+        json task_provider_cfg = provider_cfg;
         if (eng_firm_mode) {
             ComplexityVerdict tcx = classify_complexity(tk.req);
             DomainVerdict tdom = classify_domain(tk.req);
@@ -3360,6 +3392,49 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
             if (!firm_ledger.empty())
                 seed << "\n[FIRM LEDGER SO FAR]\n" << firm_ledger.dump() << "\n";
             firm_role_seed = seed.str();
+            // Per-task model: disciplines.<disc> → lead|sub by TeamMember role → ambient.
+            {
+                const Discipline task_disc = discipline_for_domain(tdom.domain);
+                const std::string dkey = eng_firm_discipline_key(task_disc);
+                EngFirmModelEntry pick;
+                auto dit = ef_models.disciplines.find(dkey);
+                if (dit != ef_models.disciplines.end() && !dit->second.empty()) {
+                    pick = dit->second;
+                } else {
+                    // Prefer the team member covering this task's domain.
+                    bool is_sub = false;
+                    bool found_role = false;
+                    for (const auto& tm : team) {
+                        if (discipline_for_domain(tm.scope) == task_disc) {
+                            is_sub = tm.subcontractor && !tm.lead;
+                            found_role = true;
+                            break;
+                        }
+                    }
+                    if (!found_role) {
+                        // No domain match: lead if any lead member, else subcontractor.
+                        for (const auto& tm : team) {
+                            if (tm.lead) {
+                                is_sub = false;
+                                found_role = true;
+                                break;
+                            }
+                        }
+                        if (!found_role) {
+                            for (const auto& tm : team) {
+                                if (tm.subcontractor) {
+                                    is_sub = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    pick = is_sub ? ef_models.subcontractor : ef_models.lead;
+                }
+                json tdesc = resolve_eng_firm_provider(pick, ef_cfg);
+                if (tdesc.is_object() && !tdesc.contains("error") && !tdesc.empty())
+                    task_provider_cfg = tdesc;
+            }
             events.emit("firm_comm",
                         json{{"kind", "firm_comm"},
                              {"from", "orchestrator"},
@@ -3447,7 +3522,7 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
                                      {"chars", static_cast<int>(adv.size())}});
                 }
             }
-            json rr = run_assembly_design(tk.req, target_doc, provider_cfg, emit, sub_opts);
+            json rr = run_assembly_design(tk.req, target_doc, task_provider_cfg, emit, sub_opts);
             status = rr.value("status", std::string("done"));
             summary = rr.value("stop_reason", std::string());
             events.emit("sub_run", json{{"kind", "sub_run"},
@@ -3551,7 +3626,7 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
                 sub_opts.erase("org");
                 sub_opts.erase("execute_as");
                 sub_opts.erase("corporate_force");
-                json rr = run_assembly_design(augmented, new_doc_id, provider_cfg, emit, sub_opts);
+                json rr = run_assembly_design(augmented, new_doc_id, task_provider_cfg, emit, sub_opts);
                 status = rr.value("status", std::string("done"));
                 summary = rr.value("stop_reason", std::string());
                 if (status != "done" && first_fail_reason.empty() && !summary.empty())

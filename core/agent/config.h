@@ -8,10 +8,12 @@
 // throwing (the security-critical refusal path). NO network clients built.
 #pragma once
 
+#include <map>
 #include <optional>
 #include <string>
 
 #include <nlohmann/json.hpp>
+#include "agent/firm_team.h"
 
 namespace aicad {
 namespace agent {
@@ -105,6 +107,39 @@ PrewalkConfig load_prewalk_config(const json& cfg = json(nullptr));
 // Returns null when prewalk is off or the target cannot be resolved (safe no-op).
 // Never throws; offline refusals return null (no-op) rather than {error}.
 json resolve_prewalk_provider(const json& cfg, const json& env = json::object());
+
+// --- eng_firm.models (per-role provider overrides for the Eng. Firm org) ------
+// Nested under config.json "eng_firm": { "models": {
+//   "mission_planner"|"advisor"|"lead"|"subcontractor": {provider, model, thinking},
+//   "disciplines": { "mechanical"|...|"generalist": {provider, model, thinking} }
+// }}. All optional. Absent/empty → ambient provider (byte-identical to today).
+// Resolution for an awarded task:
+//   disciplines.<discipline> → lead|subcontractor (by team role) → ambient.
+struct EngFirmModelEntry {
+    std::string provider;
+    std::string model;
+    std::string thinking;
+    bool empty() const {
+        return provider.empty() && model.empty() && thinking.empty();
+    }
+};
+struct EngFirmModels {
+    EngFirmModelEntry mission_planner;
+    EngFirmModelEntry advisor;
+    EngFirmModelEntry lead;
+    EngFirmModelEntry subcontractor;
+    std::map<std::string, EngFirmModelEntry> disciplines;
+};
+// Parse eng_firm.models from cfg (or load_config() when cfg is null). Tolerant of
+// non-object/missing keys; never throws.
+EngFirmModels load_eng_firm_models(const json& cfg = json(nullptr));
+// Resolve an entry to a provider descriptor (same shape as resolve_provider).
+// Bare provider name via resolve_provider; "provider/model" overlay; thinking →
+// reasoning_effort. Empty entry or resolve failure → null (safe no-op). Never throws.
+json resolve_eng_firm_provider(const EngFirmModelEntry& e, const json& cfg,
+                               const json& env = json::object());
+// Discipline enum → lowercase eng_firm.models.disciplines key (Generalist → "generalist").
+std::string eng_firm_discipline_key(Discipline d);
 
 }  // namespace agent
 }  // namespace aicad

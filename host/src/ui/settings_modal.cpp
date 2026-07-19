@@ -1101,6 +1101,7 @@ static const char* roleProviderWire(int prov, const std::string& model = {}) {
         case ui::PROV_GEMINI:      return "gemini";
         case ui::PROV_XAI:         return "xai";
         case ui::PROV_CURSOR:      return "cursor";
+        case ui::PROV_KIMISUB:     return "kimi-sub";
         default: return "local";
     }
 }
@@ -1115,6 +1116,7 @@ static int roleProviderFromWire(const std::string& w) {
         return ui::PROV_CLOUDCOMPAT;
     if (w == "xai" || w == "xai-sub") return ui::PROV_XAI;
     if (w == "cursor" || w == "cursor-sub") return ui::PROV_CURSOR;
+    if (w == "kimi-sub") return ui::PROV_KIMISUB;
     return -1;
 }
 
@@ -1155,26 +1157,36 @@ static std::vector<RolePickEntry> buildRolePickList(AppState& st, bool localOnly
         // them as-is; the old "OpenRouter / Cloud" prefix mislabeled Moonshot/DeepSeek presets.
         add(ui::PROV_CLOUDCOMPAT, p.id, p.label);
     }
-    // Local presets + live-probed local models.
-    for (const auto& p : ui::localPresets()) {
-        char buf[256];
-        std::snprintf(buf, sizeof(buf), "Local \xc2\xb7 %s", p.label.c_str());
-        add(ui::PROV_LOCAL, p.id, buf);
-    }
-    const ProviderModels& lpm = st.providerModels[ui::PROV_LOCAL];
-    if (lpm.ok) {
-        for (const auto& id : lpm.models) {
+    // Local presets + live-probed local models — only when local is actually in play:
+    // redaction/local-only picker, active provider is local, a local probe succeeded, or
+    // Offline/ITAR mode. Cloud-only users with no local server see no Local rows.
+    const bool includeLocal =
+        localOnly ||
+        st.settings.offlineMode ||
+        providerIsLoopback(st.settings.provider) ||
+        st.providerModels[ui::PROV_LOCAL].ok ||
+        st.providerModels[ui::PROV_LLAMACPP].ok;
+    if (includeLocal) {
+        for (const auto& p : ui::localPresets()) {
             char buf[256];
-            std::snprintf(buf, sizeof(buf), "Local \xc2\xb7 %s", id.c_str());
-            add(ui::PROV_LOCAL, id, buf);
+            std::snprintf(buf, sizeof(buf), "Local \xc2\xb7 %s", p.label.c_str());
+            add(ui::PROV_LOCAL, p.id, buf);
         }
-    }
-    const ProviderModels& lcpp = st.providerModels[ui::PROV_LLAMACPP];
-    if (lcpp.ok) {
-        for (const auto& id : lcpp.models) {
-            char buf[256];
-            std::snprintf(buf, sizeof(buf), "llama.cpp \xc2\xb7 %s", id.c_str());
-            add(ui::PROV_LLAMACPP, id, buf);
+        const ProviderModels& lpm = st.providerModels[ui::PROV_LOCAL];
+        if (lpm.ok) {
+            for (const auto& id : lpm.models) {
+                char buf[256];
+                std::snprintf(buf, sizeof(buf), "Local \xc2\xb7 %s", id.c_str());
+                add(ui::PROV_LOCAL, id, buf);
+            }
+        }
+        const ProviderModels& lcpp = st.providerModels[ui::PROV_LLAMACPP];
+        if (lcpp.ok) {
+            for (const auto& id : lcpp.models) {
+                char buf[256];
+                std::snprintf(buf, sizeof(buf), "llama.cpp \xc2\xb7 %s", id.c_str());
+                add(ui::PROV_LLAMACPP, id, buf);
+            }
         }
     }
     return out;
@@ -1927,65 +1939,291 @@ static const HarnessModeInfo kHarnessModes[] = {
 static constexpr int kHarnessModeCount =
     (int)(sizeof(kHarnessModes) / sizeof(kHarnessModes[0]));
 
-// Settings → AI: unified harness-organization map + per-mode viewing panel.
-// Read-only display; mode is chosen in the composer. Eng. Firm budget stays on Agent.
-static void drawHarnessOrganizationSection(const Settings& settings, float sc) {
-    dimText("Composer mode picks the org structure. Defaults below; pick a mode to inspect "
-            "its structure and role. Mode is switched from the copilot composer.");
+// Settings → AI: compact harness-organization mode list (read-only; mode is chosen in the
+// composer). Eng. Firm per-role model assignments live underneath and write config.json.
+static void drawHarnessOrganizationSection(AppState& st, float sc);
+
+// ---- Eng. Firm model assignments (config.json eng_firm.models) ----------------
+// Top-level roles + 8 disciplines. Auto = omit entry (ambient chat model). Merge-overlay
+// load/save never clobbers unrelated keys.
+struct EngFirmAssign {
+    bool isAuto = true;
+    std::string provider;
+    std::string model;
+    std::string thinking = "medium";  // low|medium|high (auto omits thinking key)
+};
+struct EngFirmModelsUi {
+    std::map<std::string, EngFirmAssign> top;   // mission_planner|advisor|lead|subcontractor
+    std::map<std::string, EngFirmAssign> disc;  // 8 discipline keys
+    bool loaded = false;
+};
+static EngFirmModelsUi s_efModels;
+
+static const char* kEfTopKeys[] = {
+    "mission_planner", "advisor", "lead", "subcontractor"};
+static const char* kEfTopLabels[] = {
+    "Mission planner", "Advisor", "Lead (prime contractor)", "Subcontractor (default)"};
+static constexpr int kEfTopCount = 4;
+
+static const char* kEfDiscKeys[] = {
+    "mechanical", "electrical", "structural", "thermal",
+    "manufacturing", "drafting", "sourcing", "generalist"};
+static const char* kEfDiscLabels[] = {
+    "Mechanical", "Electrical", "Structural", "Thermal",
+    "Manufacturing", "Drafting", "Sourcing", "Generalist"};
+static constexpr int kEfDiscCount = 8;
+
+static EngFirmAssign parseEngFirmAssign(const nlohmann::json& j) {
+    EngFirmAssign a;
+    if (!j.is_object()) return a;
+    a.provider = j.value("provider", std::string());
+    a.model = j.value("model", std::string());
+    std::string th = j.value("thinking", std::string());
+    if (th != "low" && th != "medium" && th != "high") th = "medium";
+    a.thinking = th.empty() ? "medium" : th;
+    a.isAuto = a.provider.empty() && a.model.empty();
+    return a;
+}
+
+static void loadEngFirmModelsUi() {
+    s_efModels.top.clear();
+    s_efModels.disc.clear();
+    for (int i = 0; i < kEfTopCount; ++i) s_efModels.top[kEfTopKeys[i]] = EngFirmAssign{};
+    for (int i = 0; i < kEfDiscCount; ++i) s_efModels.disc[kEfDiscKeys[i]] = EngFirmAssign{};
+    try {
+        std::ifstream in(configPath());
+        if (in) {
+            nlohmann::json j;
+            in >> j;
+            if (j.is_object() && j.contains("eng_firm") && j["eng_firm"].is_object()) {
+                const auto& ef = j["eng_firm"];
+                if (ef.contains("models") && ef["models"].is_object()) {
+                    const auto& m = ef["models"];
+                    for (int i = 0; i < kEfTopCount; ++i) {
+                        if (m.contains(kEfTopKeys[i]))
+                            s_efModels.top[kEfTopKeys[i]] = parseEngFirmAssign(m[kEfTopKeys[i]]);
+                    }
+                    if (m.contains("disciplines") && m["disciplines"].is_object()) {
+                        const auto& d = m["disciplines"];
+                        for (int i = 0; i < kEfDiscCount; ++i) {
+                            if (d.contains(kEfDiscKeys[i]))
+                                s_efModels.disc[kEfDiscKeys[i]] =
+                                    parseEngFirmAssign(d[kEfDiscKeys[i]]);
+                        }
+                    }
+                }
+            }
+        }
+    } catch (...) {}
+    s_efModels.loaded = true;
+}
+
+static void saveEngFirmModelsUi() {
+    try {
+        nlohmann::json j = nlohmann::json::object();
+        {
+            std::ifstream in(configPath());
+            if (in) {
+                nlohmann::json old;
+                in >> old;
+                if (old.is_object()) j = std::move(old);
+            }
+        }
+        if (!j.contains("eng_firm") || !j["eng_firm"].is_object())
+            j["eng_firm"] = nlohmann::json::object();
+        nlohmann::json models = nlohmann::json::object();
+        // Preserve unknown sibling keys under eng_firm.models (and disciplines).
+        if (j["eng_firm"].contains("models") && j["eng_firm"]["models"].is_object())
+            models = j["eng_firm"]["models"];
+
+        auto writeEntry = [](nlohmann::json& parent, const char* key, const EngFirmAssign& a) {
+            if (a.isAuto || a.model.empty()) {
+                parent.erase(key);
+                return;
+            }
+            nlohmann::json e = nlohmann::json::object();
+            e["provider"] = a.provider;
+            e["model"] = a.model;
+            if (a.thinking == "low" || a.thinking == "medium" || a.thinking == "high")
+                e["thinking"] = a.thinking;
+            parent[key] = std::move(e);
+        };
+
+        for (int i = 0; i < kEfTopCount; ++i)
+            writeEntry(models, kEfTopKeys[i], s_efModels.top[kEfTopKeys[i]]);
+
+        nlohmann::json discs = nlohmann::json::object();
+        if (models.contains("disciplines") && models["disciplines"].is_object())
+            discs = models["disciplines"];
+        for (int i = 0; i < kEfDiscCount; ++i)
+            writeEntry(discs, kEfDiscKeys[i], s_efModels.disc[kEfDiscKeys[i]]);
+        if (discs.empty())
+            models.erase("disciplines");
+        else
+            models["disciplines"] = std::move(discs);
+
+        if (models.empty())
+            j["eng_firm"].erase("models");
+        else
+            j["eng_firm"]["models"] = std::move(models);
+        if (j["eng_firm"].empty())
+            j.erase("eng_firm");
+
+        const std::string path = configPath();
+        const std::string tmp = path + ".tmp";
+        std::ofstream(tmp) << j.dump(2);
+        std::rename(tmp.c_str(), path.c_str());
+    } catch (...) {}
+}
+
+static void drawEngFirmAssignRow(AppState& st, const char* id, const char* label,
+                                 EngFirmAssign& a, const std::vector<RolePickEntry>& picks,
+                                 float sc) {
+    (void)sc;
+    ImGui::TableNextRow();
+    ImGui::PushID(id);
+
+    ImGui::TableNextColumn();
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(label);
+
+    ImGui::TableNextColumn();
+    int sel = 0;
+    if (!a.isAuto) {
+        const int wantProv = roleProviderFromWire(a.provider);
+        for (int pi = 1; pi < (int)picks.size(); ++pi) {
+            if (picks[pi].model == a.model &&
+                (wantProv < 0 || picks[pi].provider == wantProv ||
+                 roleProviderWire(picks[pi].provider, picks[pi].model) == a.provider)) {
+                sel = pi;
+                break;
+            }
+        }
+    }
+    std::string preview;
+    if (a.isAuto) {
+        preview = "Auto";
+    } else if (sel > 0) {
+        preview = picks[sel].label;
+    } else {
+        preview = a.provider + " \xc2\xb7 " + a.model;
+        if (preview == " \xc2\xb7 ") preview = a.model.empty() ? "Auto" : a.model;
+    }
+    ImGui::SetNextItemWidth(-1);
+    if (ImGui::BeginCombo("##ef_pick", preview.c_str())) {
+        for (int pi = 0; pi < (int)picks.size(); ++pi) {
+            const bool selected = (pi == sel) || (pi == 0 && a.isAuto);
+            if (ImGui::Selectable(picks[pi].label.c_str(), selected)) {
+                if (picks[pi].isAuto) {
+                    a.isAuto = true;
+                    a.provider.clear();
+                    a.model.clear();
+                } else {
+                    a.isAuto = false;
+                    a.provider = roleProviderWire(picks[pi].provider, picks[pi].model);
+                    a.model = picks[pi].model;
+                    if (a.thinking != "low" && a.thinking != "medium" && a.thinking != "high")
+                        a.thinking = "medium";
+                }
+                saveEngFirmModelsUi();
+            }
+            if (selected) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+
+    ImGui::TableNextColumn();
+    static const char* kThinkLabels[] = {"Low", "Medium", "High"};
+    static const char* kThinkValues[] = {"low", "medium", "high"};
+    int thinkSel = 1;  // medium default
+    for (int ti = 0; ti < 3; ++ti) {
+        if (a.thinking == kThinkValues[ti]) { thinkSel = ti; break; }
+    }
+    if (a.isAuto) ImGui::BeginDisabled();
+    ImGui::SetNextItemWidth(-1);
+    if (ImGui::BeginCombo("##ef_think", kThinkLabels[thinkSel])) {
+        for (int ti = 0; ti < 3; ++ti) {
+            const bool selT = (ti == thinkSel);
+            if (ImGui::Selectable(kThinkLabels[ti], selT)) {
+                a.thinking = kThinkValues[ti];
+                saveEngFirmModelsUi();
+            }
+            if (selT) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+    if (a.isAuto) ImGui::EndDisabled();
+
+    ImGui::PopID();
+}
+
+static void drawEngFirmModelAssignments(AppState& st, float sc) {
+    if (!s_efModels.loaded) loadEngFirmModelsUi();
+
+    ImGui::Dummy(ImVec2(0, 8.0f * sc));
+    if (!ImGui::CollapsingHeader("Eng. Firm model assignments"))
+        return;
+
+    dimText("Empty rows inherit the active chat model. Eng. Firm runs resolve: discipline \xe2\x86\x92 "
+            "lead/subcontractor \xe2\x86\x92 chat model.");
+
+    const auto picks = buildRolePickList(st, /*localOnly=*/false);
+
+    if (ImGui::BeginTable("##ef_models", 3,
+                          ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg |
+                              ImGuiTableFlags_SizingStretchProp)) {
+        ImGui::TableSetupColumn("Role", ImGuiTableColumnFlags_WidthStretch, 1.2f);
+        ImGui::TableSetupColumn("Model", ImGuiTableColumnFlags_WidthStretch, 2.4f);
+        ImGui::TableSetupColumn("Thinking", ImGuiTableColumnFlags_WidthFixed, 110.0f * sc);
+        ImGui::TableHeadersRow();
+
+        for (int i = 0; i < kEfTopCount; ++i)
+            drawEngFirmAssignRow(st, kEfTopKeys[i], kEfTopLabels[i],
+                                s_efModels.top[kEfTopKeys[i]], picks, sc);
+
+        // Lightweight separator label row for disciplines.
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn();
+        ImGui::AlignTextToFramePadding();
+        dimText("Disciplines");
+        ImGui::TableNextColumn();
+        ImGui::TableNextColumn();
+
+        for (int i = 0; i < kEfDiscCount; ++i)
+            drawEngFirmAssignRow(st, kEfDiscKeys[i], kEfDiscLabels[i],
+                                s_efModels.disc[kEfDiscKeys[i]], picks, sc);
+
+        ImGui::EndTable();
+    }
+}
+
+static void drawHarnessOrganizationSection(AppState& st, float sc) {
+    dimText("Composer mode picks the org structure. Defaults below \xe2\x80\x94 switch mode from the "
+            "copilot composer.");
 
     ImGui::Dummy(ImVec2(0, 2.0f * sc));
-    ImGui::TextUnformatted("Mode defaults");
+    int active = st.settings.copilotMode;
+    if (active < 0 || active >= kHarnessModeCount) active = 0;
+
+    // Single always-visible list: mode label + structure + one-line description.
     for (int i = 0; i < kHarnessModeCount; ++i) {
         const auto& m = kHarnessModes[i];
         ImGui::Bullet();
         ImGui::SameLine(0, 4.0f * sc);
-        ImGui::Text("%s", m.label);
+        if (i == active) {
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(ui::palette.accent[0], ui::palette.accent[1],
+                       ui::palette.accent[2], 1.0f));
+            ImGui::Text("%s", m.label);
+            ImGui::PopStyleColor();
+        } else {
+            ImGui::Text("%s", m.label);
+        }
         ImGui::SameLine(0, 6.0f * sc);
-        dimText("\xe2\x86\x92");
+        dimText("\xc2\xb7");
         ImGui::SameLine(0, 6.0f * sc);
         ImGui::TextUnformatted(m.structure);
-    }
-
-    ImGui::Dummy(ImVec2(0, 6.0f * sc));
-    ImGui::TextUnformatted("Mode viewer");
-    dimText("Select a mode to see its execution structure and what it does.");
-
-    // Prefer live composer mode (settings.copilotMode); clamp to table.
-    // When the active composer mode changes, re-center the viewer on it.
-    int active = settings.copilotMode;
-    if (active < 0 || active >= kHarnessModeCount) active = 0;
-    static int s_viewMode = -1;
-    static int s_lastActive = -1;
-    if (s_viewMode < 0 || s_viewMode >= kHarnessModeCount || s_lastActive != active) {
-        s_viewMode = active;
-        s_lastActive = active;
-    }
-
-    const float listH = (ImGui::GetTextLineHeightWithSpacing() + 2.0f * sc) *
-                        (float)kHarnessModeCount + 8.0f * sc;
-    if (ImGui::BeginChild("##harness_mode_list", ImVec2(0, listH),
-                          ImGuiChildFlags_Borders)) {
-        for (int i = 0; i < kHarnessModeCount; ++i) {
-            const bool sel = (s_viewMode == i);
-            char row[96];
-            std::snprintf(row, sizeof(row), "%s  \xc2\xb7  %s",
-                          kHarnessModes[i].label, kHarnessModes[i].structure);
-            if (ImGui::Selectable(row, sel))
-                s_viewMode = i;
-            // Soft highlight for the currently-active composer mode.
-            if (i == active && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                ImGui::SetTooltip("Active composer mode");
-        }
-    }
-    ImGui::EndChild();
-
-    if (s_viewMode >= 0 && s_viewMode < kHarnessModeCount) {
-        const auto& m = kHarnessModes[s_viewMode];
-        ImGui::Dummy(ImVec2(0, 4.0f * sc));
-        ImGui::TextUnformatted(m.label);
-        ImGui::SameLine(0, 8.0f * sc);
-        dimText(m.structure);
-        if (s_viewMode == active) {
+        if (i == active) {
             ImGui::SameLine(0, 8.0f * sc);
             ImGui::PushStyleColor(ImGuiCol_Text,
                 ImVec4(ui::palette.accent[0], ui::palette.accent[1],
@@ -1993,8 +2231,12 @@ static void drawHarnessOrganizationSection(const Settings& settings, float sc) {
             ImGui::TextUnformatted("(active)");
             ImGui::PopStyleColor();
         }
+        ImGui::Indent(16.0f * sc);
         dimText(m.description);
+        ImGui::Unindent(16.0f * sc);
     }
+
+    drawEngFirmModelAssignments(st, sc);
 }
 
 }  // anonymous namespace
@@ -2113,6 +2355,8 @@ void drawSettingsModal(AppState& st, bool busy) {
         // Make sure the glass engine reflects the persisted config before the Appearance
         // preview draws (idempotent — app startup wiring may already have pushed it).
         ui::setGlassConfig(settings.glassCfg);
+        // Re-read eng_firm.models so the assignments grid matches disk on every open.
+        s_efModels.loaded = false;
     }
     float sc = ui::uiScale;
     ImGuiViewport* vp = ImGui::GetMainViewport();
@@ -2581,7 +2825,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                 settingsGlassSectionEnd();
 
                 settingsGlassSectionBegin("##ai_harness_org", "Harness organization");
-                drawHarnessOrganizationSection(settings, sc);
+                drawHarnessOrganizationSection(st, sc);
                 settingsGlassSectionEnd();
 
                 settingsGlassSectionBegin("##ai_maintenance", "Maintenance");

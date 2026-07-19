@@ -802,5 +802,121 @@ json resolve_prewalk_provider(const json& cfg, const json& env) {
     return desc;
 }
 
+namespace {
+
+// Parse one eng_firm.models entry object → EngFirmModelEntry. Wrong types → empty fields.
+EngFirmModelEntry parse_eng_firm_entry(const json& j) {
+    EngFirmModelEntry e;
+    if (!j.is_object()) return e;
+    if (j.contains("provider") && j["provider"].is_string())
+        e.provider = j["provider"].get<std::string>();
+    if (j.contains("model") && j["model"].is_string()) e.model = j["model"].get<std::string>();
+    if (j.contains("thinking") && j["thinking"].is_string())
+        e.thinking = j["thinking"].get<std::string>();
+    return e;
+}
+
+}  // namespace
+
+EngFirmModels load_eng_firm_models(const json& cfg_in) {
+    EngFirmModels out;
+    try {
+        json cfg = cfg_in.is_null() ? load_config() : cfg_in;
+        if (!cfg.is_object() || !cfg.contains("eng_firm") || !cfg["eng_firm"].is_object())
+            return out;
+        const json& ef = cfg["eng_firm"];
+        if (!ef.contains("models") || !ef["models"].is_object()) return out;
+        const json& m = ef["models"];
+        if (m.contains("mission_planner")) out.mission_planner = parse_eng_firm_entry(m["mission_planner"]);
+        if (m.contains("advisor")) out.advisor = parse_eng_firm_entry(m["advisor"]);
+        if (m.contains("lead")) out.lead = parse_eng_firm_entry(m["lead"]);
+        if (m.contains("subcontractor"))
+            out.subcontractor = parse_eng_firm_entry(m["subcontractor"]);
+        if (m.contains("disciplines") && m["disciplines"].is_object()) {
+            for (auto it = m["disciplines"].begin(); it != m["disciplines"].end(); ++it) {
+                if (!it.key().empty())
+                    out.disciplines[lower(it.key())] = parse_eng_firm_entry(it.value());
+            }
+        }
+    } catch (...) {
+        // never throw across the config seam
+    }
+    return out;
+}
+
+json resolve_eng_firm_provider(const EngFirmModelEntry& e, const json& cfg, const json& env) {
+    try {
+        if (e.empty()) return json(nullptr);
+
+        std::string prov = e.provider;
+        std::string model = e.model;
+        // Strip whitespace on provider.
+        {
+            size_t a = prov.find_first_not_of(" \t\r\n");
+            size_t b = prov.find_last_not_of(" \t\r\n");
+            if (a == std::string::npos)
+                prov.clear();
+            else
+                prov = prov.substr(a, b - a + 1);
+        }
+
+        // If provider is empty but model looks like "provider/model", split it.
+        // Also honor "provider/model" when provider field itself carries the slash form.
+        std::string split_p, split_m;
+        if (!prov.empty() && split_provider_model(prov, split_p, split_m)) {
+            if (!split_p.empty() && split_p[0] == '@') split_p = split_p.substr(1);
+            prov = split_p;
+            if (model.empty() && !split_m.empty()) model = split_m;
+        }
+
+        if (prov.empty()) return json(nullptr);
+
+        json desc = resolve_provider(prov, cfg, env);
+        if (!desc.is_object() || desc.contains("error")) return json(nullptr);
+
+        if (!model.empty()) {
+            // Drop trailing thinking selector if present (openai/gpt-4.1-mini:low).
+            static const char* kThink[] = {":minimal", ":low", ":medium", ":high", ":xhigh",
+                                           ":max"};
+            for (const char* suf : kThink) {
+                const size_t n = std::strlen(suf);
+                if (model.size() >= n && lower(model.substr(model.size() - n)) == suf) {
+                    model = model.substr(0, model.size() - n);
+                    break;
+                }
+            }
+            if (!model.empty()) desc["model"] = model;
+        }
+
+        // thinking → reasoning_effort (same descriptor field other knobs use).
+        if (!e.thinking.empty()) {
+            std::string th = e.thinking;
+            size_t a = th.find_first_not_of(" \t\r\n");
+            size_t b = th.find_last_not_of(" \t\r\n");
+            if (a != std::string::npos) {
+                th = th.substr(a, b - a + 1);
+                if (!th.empty()) desc["reasoning_effort"] = th;
+            }
+        }
+        return desc;
+    } catch (...) {
+        return json(nullptr);
+    }
+}
+
+std::string eng_firm_discipline_key(Discipline d) {
+    switch (d) {
+        case Discipline::Mechanical: return "mechanical";
+        case Discipline::Electrical: return "electrical";
+        case Discipline::Structural: return "structural";
+        case Discipline::Thermal: return "thermal";
+        case Discipline::Manufacturing: return "manufacturing";
+        case Discipline::Drafting: return "drafting";
+        case Discipline::Sourcing: return "sourcing";
+        case Discipline::Generalist: return "generalist";
+    }
+    return "generalist";
+}
+
 }  // namespace agent
 }  // namespace aicad

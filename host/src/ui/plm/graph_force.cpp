@@ -181,9 +181,15 @@ void ForceGraph::setCollision(float strength, float pad) {
     if (finitef(pad) && pad >= 0.f) collPad_ = pad;
 }
 
+void ForceGraph::setVelocityDecay(float d) {
+    if (!finitef(d)) return;
+    // Retain fraction of prior velocity each substep; (0, 1].
+    velocityDecay_ = clampf(d, 1e-4f, 1.f);
+}
+
 // ---- spatial grid ------------------------------------------------------------
 
-void ForceGraph::rebuildGrid() {
+void ForceGraph::rebuildGrid(float cellSize) {
     const int n = static_cast<int>(nodes_.size());
     grid_.next.assign(static_cast<size_t>(n), -1);
 
@@ -204,7 +210,7 @@ void ForceGraph::rebuildGrid() {
     }
 
     // Pad by one cell so boundary nodes still see a full neighborhood.
-    const float cell = cutoff_ > 1.f ? cutoff_ : 1.f;
+    const float cell = (finitef(cellSize) && cellSize > 1.f) ? cellSize : 1.f;
     const float pad = cell;
     minX -= pad;
     minY -= pad;
@@ -250,7 +256,7 @@ void ForceGraph::applyRepulsion(std::vector<float>& fx, std::vector<float>& fy) 
     const int n = static_cast<int>(nodes_.size());
     if (n < 2) return;
 
-    rebuildGrid();
+    rebuildGrid(cutoff_);
 
     const float cutoff = cutoff_;
     const float cutoff2 = cutoff * cutoff;
@@ -299,21 +305,10 @@ void ForceGraph::applyRepulsion(std::vector<float>& fx, std::vector<float>& fy) 
                                 dy = jy;
                                 d2 = dx * dx + dy * dy;
                             }
-                            // Collision (d3 collide analogue): strong push ∝
-                            // overlap depth, cooling-independent, so sized
-                            // nodes never visually overlap.
-                            float cfx = 0.f, cfy = 0.f;
-                            const float collDist = a.radius + b.radius + collPad_;
-                            if (d2 < collDist * collDist) {
-                                const float d = std::sqrt(d2);
-                                const float inv = d > 1e-6f ? 1.f / d : 1.f;
-                                const float push = collStrength_ * (collDist - d);
-                                cfx = dx * inv * push;
-                                cfy = dy * inv * push;
-                            }
                             if (d2 < minDist2) d2 = minDist2;
 
                             // F = k * qa * qb / r^2 along the separation.
+                            // Collision is handled post-integrate in resolveCollisions().
                             const float invDist = 1.f / std::sqrt(d2);
                             const float f = k * qa * b.charge * invDist * invDist;
                             const float s = f * invDist;
@@ -322,12 +317,12 @@ void ForceGraph::applyRepulsion(std::vector<float>& fx, std::vector<float>& fy) 
 
                             // +f pushes a away from b; −f pushes b away from a.
                             if (!a.pinned) {
-                                fxi += cfx + rfx;
-                                fyi += cfy + rfy;
+                                fxi += rfx;
+                                fyi += rfy;
                             }
                             if (!b.pinned) {
-                                fx[static_cast<size_t>(j)] -= cfx + rfx;
-                                fy[static_cast<size_t>(j)] -= cfy + rfy;
+                                fx[static_cast<size_t>(j)] -= rfx;
+                                fy[static_cast<size_t>(j)] -= rfy;
                             }
                         }
                     }
@@ -410,6 +405,108 @@ void ForceGraph::applyCentering(std::vector<float>& fx, std::vector<float>& fy) 
     }
 }
 
+void ForceGraph::resolveCollisions() {
+    const int n = static_cast<int>(nodes_.size());
+    if (n < 2 || collStrength_ <= 0.f) return;
+
+    float maxR = 0.f;
+    for (int i = 0; i < n; ++i) {
+        const float r = nodes_[static_cast<size_t>(i)].radius;
+        if (r > maxR) maxR = r;
+    }
+    // Cell must cover the largest possible collDist so pairs outside the
+    // Coulomb cutoff still meet in the 3x3 neighborhood.
+    const float cell = std::max(2.f * (maxR + collPad_), 1.f);
+    // Blend factor per pass: strength ~11 → near-hard separation (clamped).
+    const float blend = clampf(collStrength_ * 0.1f, 0.f, 1.f);
+
+    for (int pass = 0; pass < kCollIterations; ++pass) {
+        rebuildGrid(cell);
+        const int cols = grid_.cols;
+        const int rows = grid_.rows;
+        if (cols <= 0 || rows <= 0) return;
+
+        for (int i = 0; i < n; ++i) {
+            Node& a = nodes_[static_cast<size_t>(i)];
+            int cx = static_cast<int>((a.x - grid_.originX) / grid_.cell);
+            int cy = static_cast<int>((a.y - grid_.originY) / grid_.cell);
+            if (cx < 0) cx = 0;
+            else if (cx >= cols) cx = cols - 1;
+            if (cy < 0) cy = 0;
+            else if (cy >= rows) cy = rows - 1;
+
+            const int x0 = cx > 0 ? cx - 1 : 0;
+            const int x1 = cx + 1 < cols ? cx + 1 : cols - 1;
+            const int y0 = cy > 0 ? cy - 1 : 0;
+            const int y1 = cy + 1 < rows ? cy + 1 : rows - 1;
+
+            for (int gy = y0; gy <= y1; ++gy) {
+                for (int gx = x0; gx <= x1; ++gx) {
+                    int j = grid_.head[static_cast<size_t>(gy * cols + gx)];
+                    while (j >= 0) {
+                        if (j > i) {
+                            Node& b = nodes_[static_cast<size_t>(j)];
+                            if (a.pinned && b.pinned) {
+                                j = grid_.next[static_cast<size_t>(j)];
+                                continue;
+                            }
+                            float dx = b.x - a.x;
+                            float dy = b.y - a.y;
+                            float d2 = dx * dx + dy * dy;
+                            const float collDist = a.radius + b.radius + collPad_;
+                            const float collDist2 = collDist * collDist;
+                            if (d2 >= collDist2) {
+                                j = grid_.next[static_cast<size_t>(j)];
+                                continue;
+                            }
+                            float d;
+                            if (d2 < 1e-12f) {
+                                float jx, jy;
+                                indexJitter(i - j, jx, jy);
+                                dx = jx;
+                                dy = jy;
+                                d = std::sqrt(dx * dx + dy * dy);
+                            } else {
+                                d = std::sqrt(d2);
+                            }
+                            const float inv = d > 1e-6f ? 1.f / d : 1.f;
+                            const float nx = dx * inv;
+                            const float ny = dy * inv;
+                            const float overlap = collDist - d;
+                            const float corr = overlap * blend;
+
+                            // Gauss-Seidel: move free nodes apart immediately so
+                            // later pairs in this pass see updated positions.
+                            if (a.pinned && !b.pinned) {
+                                b.x += nx * corr;
+                                b.y += ny * corr;
+                                b.vx += nx * corr;
+                                b.vy += ny * corr;
+                            } else if (!a.pinned && b.pinned) {
+                                a.x -= nx * corr;
+                                a.y -= ny * corr;
+                                a.vx -= nx * corr;
+                                a.vy -= ny * corr;
+                            } else if (!a.pinned && !b.pinned) {
+                                const float half = 0.5f * corr;
+                                a.x -= nx * half;
+                                a.y -= ny * half;
+                                b.x += nx * half;
+                                b.y += ny * half;
+                                a.vx -= nx * half;
+                                a.vy -= ny * half;
+                                b.vx += nx * half;
+                                b.vy += ny * half;
+                            }
+                        }
+                        j = grid_.next[static_cast<size_t>(j)];
+                    }
+                }
+            }
+        }
+    }
+}
+
 void ForceGraph::substep(float h) {
     const int n = static_cast<int>(nodes_.size());
     if (n == 0) {
@@ -459,6 +556,10 @@ void ForceGraph::substep(float h) {
             nd.vy = 0.f;
         }
     }
+
+    // Hard non-overlap after integrate (cooling-independent). Multi-pass so
+    // dense packs separate even when springs briefly crush discs.
+    resolveCollisions();
 
     // Simulated-annealing cool-down: geometric decay toward ZERO (d3-force
     // semantics), snapping settled once below the floor. The previous

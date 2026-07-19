@@ -17,6 +17,8 @@
 #include "file_explorer.h"      // Wave 3: drawFileExplorerBody (Explorer tab)
 #include "property_manager.h"   // PropertyManager::drawBody
 #include "config_panel.h"       // ConfigPanel::drawEmbedded (live Configurations tab)
+#include "plm/graph_tab.h"      // plmGraphFocus / plmGraphAvailable (Graph tab jump)
+#include "plm/plm_hub.h"         // g_plmHub, PlmPage
 #include "sim_manager.h"        // SimManager::drawTreeBody (live Simulation tab)
 #include "cam/cam_panel.h"      // drawCamTreeBody (the Manufacture workspace's left tree)
 #include "ecad/ecad_panel.h"    // drawEcadManagerBody (the Electronics workspace's left tree)
@@ -26,6 +28,7 @@
 #include "metrics.h"            // dockRightTarget (command-dialog default anchor)
 #include "panel_collapse.h"     // ui::PanelCollapseAnim — shared vertical-collapse animation (T-G21)
 
+#include <filesystem>
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -700,7 +703,7 @@ void drawLeftPane(AppState& st,
         { kLeftPanePLM,             "app",         "P", "PLM" },
         { kLeftPaneExplorer,        "body_folder", "E", "Explorer" },
         { kLeftPaneFeatureManager,  "history",     "F", "Feature Manager" },
-        { kLeftPaneConfigurations,  "settings",    "C", "Configurations" },
+        { kLeftPaneGraph,           "mesh",        "G", "Graph" },
     };
 
     const float btn = 30.0f * S;
@@ -735,12 +738,34 @@ void drawLeftPane(AppState& st,
         if (drawManagerTabButton(idBuf, t.icon, t.fallback, t.tip, selected, attention,
                                  surf, lpHalo, btn, glyph,
                                  t.id == kLeftPaneFeatureManager)) {
-            st.leftPaneTab = t.id;
-            // Opening the Simulation manager reveals + fronts the Simulation ribbon toolbar so the
-            // study tools are at hand the moment the user is in the simulation workspace.
-            if (t.id == kLeftPaneSimulation) {
-                st.showSimulationTools = true;
-                st.ribbonTab = AppState::RT_Simulation;
+            if (t.id == kLeftPaneGraph) {
+                // Jump to the PLM Graph workspace (full-page). Do not leave the
+                // left strip parked on an empty Graph body.
+                st.activeWorkspace = AppState::Workspace::PLM;
+                ui::g_plmHub.page = ui::PlmPage::Graph;
+                std::string focus;
+                if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size()) {
+                    const auto& tab = st.docTabs[st.activeTab];
+                    if (!tab.path.empty()) {
+                        std::filesystem::path fp(tab.path);
+                        focus = fp.stem().string();
+                        if (focus.empty()) focus = fp.filename().string();
+                    } else if (!tab.title.empty()) {
+                        focus = tab.title;
+                    }
+                }
+                if (!focus.empty()) {
+                    if (ui::plmGraphAvailable()) ui::plmGraphFocus(focus);
+                }
+                st.leftPaneTab = kLeftPaneFeatureManager;
+            } else {
+                st.leftPaneTab = t.id;
+                // Opening the Simulation manager reveals + fronts the Simulation ribbon toolbar so the
+                // study tools are at hand the moment the user is in the simulation workspace.
+                if (t.id == kLeftPaneSimulation) {
+                    st.showSimulationTools = true;
+                    st.ribbonTab = AppState::RT_Simulation;
+                }
             }
         }
     }
@@ -774,6 +799,7 @@ void drawLeftPane(AppState& st,
             if (st.leftPaneTab == kLeftPanePLM)                  paneTitle = "PLM";
             else if (st.leftPaneTab == kLeftPaneExplorer)        paneTitle = "Explorer";
             else if (st.leftPaneTab == kLeftPaneConfigurations) paneTitle = "Configurations";
+            else if (st.leftPaneTab == kLeftPaneGraph)           paneTitle = "Graph";
             ImDrawList* pdl = ImGui::GetWindowDrawList();
             const ImVec2 tsz = ImGui::CalcTextSize(paneTitle);
             const float rightX = lpPaneRect.Max.x - chevSz - 16.0f * S;   // clear of the collapse chevron
@@ -835,12 +861,16 @@ void drawLeftPane(AppState& st,
                 break;
 
             case kLeftPaneConfigurations:
-                // User chose the live ConfigurationManager (config_* RPCs) for this tab.
-                // ConfigPanel is owned by run_gui and borrowed via st.configPanel; drawEmbedded
-                // renders its contents without a Begin/End. Fall back to the at-rest
-                // single-config body if it's unset.
-                if (st.configPanel) st.configPanel->drawEmbedded(st);
-                else                drawConfigurationsBody(st);
+                // Configurations moved to Settings → General. Legacy leftPaneTab
+                // values (View menu / stale state) redirect there once.
+                st.openSettings = true;
+                st.openSettingsTab = 1;  // General
+                st.leftPaneTab = kLeftPaneFeatureManager;
+                break;
+
+            case kLeftPaneGraph:
+                // Should not stick — click handler jumps to PLM Graph workspace.
+                st.leftPaneTab = kLeftPaneFeatureManager;
                 break;
 
             case kLeftPaneSimulation:   // legacy programmatic target — render the same unified body

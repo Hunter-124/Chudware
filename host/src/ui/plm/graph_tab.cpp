@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -32,6 +33,10 @@
 #include "core/async_rpc.h"
 #include "ui/icons.h"
 #include "ui_theme.h"
+#include "gl_compat.h"
+#include "miniz.h"
+#include "stb_image.h"
+
 
 namespace ui {
 namespace {
@@ -81,7 +86,9 @@ struct GraphTabState {
     std::string generatedAt;
     std::vector<GNode> nodes;
     std::vector<GEdge> edges;
-    std::unordered_set<std::string> blast;  // highlighted node ids
+    std::unordered_set<std::string> blast;  // highlighted node ids (impact set)
+    std::string blastEpicenter;             // node id rings expand from
+    double blastT0 = 0.0;                   // ImGui::GetTime() when blast landed
     std::string selectedId;
     std::string hoverId;
     char search[128] = {};
@@ -101,6 +108,7 @@ struct GraphTabState {
     std::string linkPopupDst; // node id chosen as the target
     int linkKindIdx = 4;      // default REFERENCES (see kEdgeKinds)
     char linkNote[192] = {};
+    std::string scopePending; // plmGraphScopeNode request applied on next draw
     std::string focusPending; // plmGraphFocus request to apply on next draw
     // ME489-scale guards ----------------------------------------------------
     bool hideArchive = true;
@@ -447,6 +455,10 @@ std::string formatDescBadge(const DescCounts& dc) {
 
 // Rebuild visibleIdx + visibleEdges for the active scope. Call when data lands
 // or scopeDocId changes — not per frame.
+bool hasBomChildren(GraphTabState& G, const std::string& id);
+void clearBlast(GraphTabState& G);
+
+
 void rebuildVisible(GraphTabState& G) {
     G.visibleIdx.clear();
     G.visibleEdges.clear();
@@ -589,15 +601,12 @@ void rebuildVisible(GraphTabState& G) {
         std::sort(G.visibleIdx.begin(), G.visibleIdx.end(), [&](int a, int b) {
             return G.nodes[a].id < G.nodes[b].id;
         });
-    } else {
-        // Visible = scope root + all CONTAINS-descendants.
-        if (!G.idIndex.count(G.scopeDocId)) {
-            // Stale scope — fall back to project.
-            G.scopeDocId.clear();
-            G.scopeStack.clear();
-            rebuildVisible(G);
-            return;
-        }
+    } else if (!G.scopeDecomp && G.idIndex.count(G.scopeDocId) &&
+               (G.nodes[G.idIndex[G.scopeDocId]].kind == "assembly" ||
+                hasBomChildren(G, G.scopeDocId))) {
+        // ---- DOC INTERNALS (assembly Internals toggle) ---------------------
+        // Explicit feature/sketch/mate dump — only when user opts into
+        // Internals on a decomposable assembly scope.
         std::unordered_map<std::string, std::vector<std::string>> kids;
         for (const auto& e : G.edges) {
             if (e.kind != "CONTAINS") continue;
@@ -620,11 +629,87 @@ void rebuildVisible(GraphTabState& G) {
         std::sort(G.visibleIdx.begin(), G.visibleIdx.end(), [&](int a, int b) {
             return G.nodes[a].id < G.nodes[b].id;
         });
-
-        // Edges whose BOTH ends are in the visible set (internal focus).
         for (int ei = 0; ei < (int)G.edges.size(); ++ei) {
             const GEdge& e = G.edges[ei];
             if (!visIds.count(e.src) || !visIds.count(e.dst)) continue;
+            VEdge ve;
+            ve.src = e.src; ve.dst = e.dst; ve.kind = e.kind;
+            ve.origin = e.origin; ve.dimLabel = e.dimLabel;
+            ve.aggCount = 1;
+            ve.srcEdgeIdx = ei;
+            G.visibleEdges.push_back(std::move(ve));
+        }
+    } else {
+        // ---- REFERENCE ISOLATE (N-hop) ------------------------------------
+        // Part/doc drill default: root + undirected 2-hop neighborhood along
+        // reference/mate/depends/instance edges (and structural CONTAINS only).
+        // Feature/sketch/body fan-out is intentionally excluded.
+        if (!G.idIndex.count(G.scopeDocId)) {
+            G.scopeDocId.clear();
+            G.scopeStack.clear();
+            rebuildVisible(G);
+            return;
+        }
+        const std::string& root = G.scopeDocId;
+
+        auto isolateEdgeOk = [&](const GEdge& e) -> bool {
+            if (e.kind == "DEPENDS_ON" || e.kind == "REFERENCES" ||
+                e.kind == "MATES" || e.kind == "DERIVES_FROM" ||
+                e.kind == "INSTANCE_OF")
+                return true;
+            if (e.kind == "CONTAINS") {
+                auto si = G.idIndex.find(e.src), di = G.idIndex.find(e.dst);
+                if (si == G.idIndex.end() || di == G.idIndex.end()) return false;
+                return isProjectKind(G.nodes[si->second].kind) &&
+                       isProjectKind(G.nodes[di->second].kind);
+            }
+            return false;
+        };
+
+        // Undirected adjacency for the isolate walk.
+        std::unordered_map<std::string, std::vector<std::string>> adj;
+        adj.reserve(G.edges.size());
+        for (const auto& e : G.edges) {
+            if (!isolateEdgeOk(e)) continue;
+            if (!G.idIndex.count(e.src) || !G.idIndex.count(e.dst)) continue;
+            adj[e.src].push_back(e.dst);
+            adj[e.dst].push_back(e.src);
+        }
+
+        // BFS depth <= 2 from root.
+        std::unordered_map<std::string, int> dist;
+        std::vector<std::string> q;
+        dist[root] = 0;
+        q.push_back(root);
+        for (size_t qi = 0; qi < q.size(); ++qi) {
+            const std::string& u = q[qi];
+            const int d = dist[u];
+            if (d >= 2) continue;
+            auto ait = adj.find(u);
+            if (ait == adj.end()) continue;
+            for (const auto& v : ait->second) {
+                if (dist.count(v)) continue;
+                dist[v] = d + 1;
+                q.push_back(v);
+            }
+        }
+
+        for (const auto& [id, d] : dist) {
+            (void)d;
+            auto it = G.idIndex.find(id);
+            if (it == G.idIndex.end()) continue;
+            G.visibleIdx.push_back(it->second);
+            visIds.insert(id);
+        }
+        std::sort(G.visibleIdx.begin(), G.visibleIdx.end(), [&](int a, int b) {
+            return G.nodes[a].id < G.nodes[b].id;
+        });
+
+        // Visible edges: both ends visible and kind allowed for isolate view.
+        for (int ei = 0; ei < (int)G.edges.size(); ++ei) {
+            const GEdge& e = G.edges[ei];
+            if (!visIds.count(e.src) || !visIds.count(e.dst)) continue;
+            if (!isolateEdgeOk(e)) continue;
             VEdge ve;
             ve.src = e.src; ve.dst = e.dst; ve.kind = e.kind;
             ve.origin = e.origin; ve.dimLabel = e.dimLabel;
@@ -676,7 +761,7 @@ void setScope(GraphTabState& G, const std::string& docId) {
     G.scopeDocId = docId;
     G.selectedId.clear();
     G.selectedEdge = -1;
-    G.blast.clear();
+    clearBlast(G);
     G.hoverId.clear();
     G.userNavigated = false;  // fresh scope → allow one auto-fit again
     // Assemblies (or anything with bom_items) open in decomposition view.
@@ -706,9 +791,11 @@ void rebuildForce(GraphTabState& G) {
     const float S = ui::uiScale;
     // Looser d3-style spacing: longer springs + stronger repulsion + roomy
     // collision pad so sized hubs don't pack into a hairball.
+    const float collPad = 10.0f * S;
     G.force.setLinkDistance(170.0f * S);
     G.force.setRepulsion(1400.0f * S * S * (170.0f / 60.0f) * (170.0f / 60.0f));
-    G.force.setCollision(8.0f, 10.0f * S);
+    G.force.setCollision(11.0f, collPad);
+    G.force.setVelocityDecay(0.6f);
 
     // Node sizing metric (d3-style: area ∝ importance). Structural nodes use
     // their hidden-descendant count (features/sketches inside the document);
@@ -728,6 +815,11 @@ void rebuildForce(GraphTabState& G) {
         if (it != G.idIndex.end()) degree[it->second] += qty;
     }
 
+    // Collision radius may exceed disc radius so label boxes don't stack.
+    // Keyed by nodes[] index; only filled for visible nodes in the sim.
+    std::unordered_map<int, float> collR;
+    collR.reserve(G.visibleIdx.size() * 2);
+
     const float GOLDEN = 2.39996323f;  // golden angle (rad)
     int fresh = 0;
     for (int vi : G.visibleIdx) {
@@ -737,11 +829,23 @@ void rebuildForce(GraphTabState& G) {
             desc = dit->second.total();
         // Milder radius growth so big hubs don't dominate the canvas.
         const float metric = std::sqrt((float)(desc + degree[vi]));
-        float r = (10.0f + 2.4f * metric) * S;
-        if (n.kind == "project") r *= 1.30f;
-        n.radius = std::clamp(r, 11.0f * S, 36.0f * S);
+        float discR = (10.0f + 2.4f * metric) * S;
+        if (n.kind == "project") discR *= 1.30f;
+        discR = std::clamp(discR, 11.0f * S, 36.0f * S);
+        n.radius = discR;  // drawing uses disc radius
+
+        const float labelW = ImGui::CalcTextSize(n.label.c_str()).x;
+        const float collRadius = std::max(discR,
+            std::min(labelW, 140.0f * S) * 0.5f + 4.0f * S);
+        collR[vi] = collRadius;
+
         float sx = n.lx, sy = n.ly;
-        if (sx == 0.0f && sy == 0.0f) {
+        // Scope root seeds at origin so isolate view frames on the drilled node.
+        if (!G.scopeDocId.empty() && n.id == G.scopeDocId &&
+            sx == 0.0f && sy == 0.0f) {
+            sx = 0.0f;
+            sy = 0.0f;
+        } else if (sx == 0.0f && sy == 0.0f) {
             bool seeded = false;
             auto pit = G.containsParent.find(n.id);
             if (pit != G.containsParent.end()) {
@@ -757,35 +861,40 @@ void rebuildForce(GraphTabState& G) {
                 }
             }
             if (!seeded) {
-                const float r = 150.0f * S * std::sqrt((float)fresh);
+                const float rr = 150.0f * S * std::sqrt((float)fresh);
                 const float a = (float)fresh * GOLDEN;
-                sx = r * std::cos(a);
-                sy = r * std::sin(a);
+                sx = rr * std::cos(a);
+                sy = rr * std::sin(a);
             }
             ++fresh;
         }
-        G.forceSlot[vi] = G.force.addNode(sx, sy, n.radius);
+        G.forceSlot[vi] = G.force.addNode(sx, sy, collRadius);
     }
 
     // Springs per visible edge; kind tunes rest length / stiffness. Rest
-    // lengths include both radii so big hubs don't crowd their neighbours.
+    // lengths floor at collision separation so discs never fight springs.
     for (const auto& e : G.visibleEdges) {
         if (G.hiddenKinds.count(e.kind)) continue;
         auto si = G.idIndex.find(e.src), di = G.idIndex.find(e.dst);
         if (si == G.idIndex.end() || di == G.idIndex.end()) continue;
         int a = G.forceSlot[si->second], b = G.forceSlot[di->second];
         if (a < 0 || b < 0 || a == b) continue;
+        const float ra = collR.count(si->second) ? collR[si->second]
+                                                 : G.nodes[si->second].radius;
+        const float rb = collR.count(di->second) ? collR[di->second]
+                                                 : G.nodes[di->second].radius;
         const float radii = G.nodes[si->second].radius + G.nodes[di->second].radius;
-        float rest = 150.0f, strength = 0.40f;
-        if (e.kind == "CONTAINS")               { rest = 120.0f; strength = 0.85f; }
-        else if (e.kind == "INSTANCE_OF")       { rest = 130.0f; strength = 0.70f; }
-        else if (e.kind == "DEPENDS_ON")        { rest = 170.0f; strength = 0.45f; }
-        else if (e.kind == "MATES")             { rest = 150.0f; strength = 0.50f; }
+        float kindRest = 150.0f, strength = 0.40f;
+        if (e.kind == "CONTAINS")               { kindRest = 120.0f; strength = 0.60f; }
+        else if (e.kind == "INSTANCE_OF")       { kindRest = 130.0f; strength = 0.70f; }
+        else if (e.kind == "DEPENDS_ON")        { kindRest = 170.0f; strength = 0.50f; }
+        else if (e.kind == "MATES")             { kindRest = 140.0f; strength = 0.75f; }
         else if (e.kind == "REFERENCES" ||
-                 e.kind == "DERIVES_FROM")      { rest = 210.0f; strength = 0.28f; }
+                 e.kind == "DERIVES_FROM")      { kindRest = 210.0f; strength = 0.30f; }
         if (e.aggCount > 1) strength += std::min(0.25f, 0.04f * (float)(e.aggCount - 1));
-        // Rest = kind base + full radii sum so discs never fight their springs.
-        G.force.addEdge(a, b, rest * S + 1.15f * radii, strength);
+        const float rest = std::max(kindRest * S + 1.15f * radii,
+                                    ra + rb + collPad);
+        G.force.addEdge(a, b, rest, strength);
     }
 
     G.force.reheat(fresh > (int)G.visibleIdx.size() / 2 ? 0.8f : 0.35f);
@@ -959,7 +1068,7 @@ void requestGraph(AppState& st, bool force) {
 
         G.nodes.clear();
         G.edges.clear();
-        G.blast.clear();
+        clearBlast(G);
         G.visibleIdx.clear();
         G.visibleEdges.clear();
         G.descCounts.clear();
@@ -1055,18 +1164,24 @@ void requestGraph(AppState& st, bool force) {
         if (!G.selectedId.empty()) {
             if (!G.idIndex.count(G.selectedId)) {
                 G.selectedId.clear();
-                G.blast.clear();
+                clearBlast(G);
             }
         }
         G.selectedEdge = -1;
     });
 }
 
+void clearBlast(GraphTabState& G) {
+    G.blast.clear();
+    G.blastEpicenter.clear();
+    G.blastT0 = 0.0;
+}
+
 void requestBlast(AppState& st, const std::string& nodeId) {
     auto& G = S();
     if (!G.available || nodeId.empty() || G.blastLoading) return;
     G.blastLoading = true;
-    G.blast.clear();
+    clearBlast(G);
     nlohmann::json p;
     p["node_id"] = nodeId;
     p["project_dir"] = st.plmProjectPath();
@@ -1089,6 +1204,8 @@ void requestBlast(AppState& st, const std::string& nodeId) {
                 if (a.is_string()) G.blast.insert(a.get<std::string>());
             }
         }
+        G.blastEpicenter = nodeId;
+        G.blastT0 = ImGui::GetTime();
     });
 }
 
@@ -1173,6 +1290,119 @@ std::string resolveNodeAbsPath(AppState& st, const GNode& n) {
     std::string root = st.plmProjectPath();
     if (root.empty()) return {};
     return (std::filesystem::path(root) / p).lexically_normal().generic_string();
+}
+
+// ---- hover thumbnails (.step+ package thumbnail.png via miniz) ----------------
+
+struct GraphThumb {
+    GLuint tex = 0;
+    int w = 0, h = 0;
+    bool failed = false;
+    double lastUse = 0.0;
+};
+
+std::unordered_map<std::string, GraphThumb>& thumbCache() {
+    static std::unordered_map<std::string, GraphThumb> c;
+    return c;
+}
+
+bool readZipEntry(const std::string& zipPath, const char* entry, std::string& out) {
+    mz_zip_archive z;
+    std::memset(&z, 0, sizeof(z));
+    if (!mz_zip_reader_init_file(&z, zipPath.c_str(), 0)) return false;
+    bool ok = false;
+    int idx = mz_zip_reader_locate_file(&z, entry, nullptr, 0);
+    if (idx >= 0) {
+        size_t sz = 0;
+        void* p = mz_zip_reader_extract_to_heap(&z, (mz_uint)idx, &sz, 0);
+        if (p) {
+            out.assign(static_cast<const char*>(p), sz);
+            mz_free(p);
+            ok = true;
+        }
+    }
+    mz_zip_reader_end(&z);
+    return ok;
+}
+
+void freeAllGraphThumbs() {
+    auto& c = thumbCache();
+    for (auto& kv : c) {
+        if (kv.second.tex) glDeleteTextures(1, &kv.second.tex);
+    }
+    c.clear();
+}
+
+// Lazy-load thumbnail.png from a .step+ package. Returns nullptr on miss/fail.
+// Cap 64 entries with simple LRU eviction.
+const GraphThumb* ensureGraphThumb(const std::string& absPath) {
+    if (absPath.empty()) return nullptr;
+    auto& c = thumbCache();
+    auto it = c.find(absPath);
+    if (it != c.end()) {
+        it->second.lastUse = ImGui::GetTime();
+        return it->second.failed || !it->second.tex ? nullptr : &it->second;
+    }
+
+    GraphThumb slot;
+    slot.lastUse = ImGui::GetTime();
+    // Only packages (.step+) carry an embedded thumbnail.png.
+    std::string lower = absPath;
+    for (char& ch : lower) ch = (char)std::tolower((unsigned char)ch);
+    const bool isPkg = lower.size() >= 6 &&
+        (lower.compare(lower.size() - 6, 6, ".step+") == 0 ||
+         lower.compare(lower.size() - 5, 5, ".step") == 0 ||
+         lower.find(".step+") != std::string::npos);
+    if (!isPkg) {
+        // Still try if path exists as zip-like; otherwise mark failed once.
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(absPath, ec)) {
+            slot.failed = true;
+            c[absPath] = slot;
+            return nullptr;
+        }
+    }
+
+    std::string png;
+    if (!readZipEntry(absPath, "thumbnail.png", png) || png.empty()) {
+        slot.failed = true;
+        c[absPath] = std::move(slot);
+        return nullptr;
+    }
+    int w = 0, h = 0, n = 0;
+    unsigned char* px = stbi_load_from_memory(
+        reinterpret_cast<const unsigned char*>(png.data()), (int)png.size(),
+        &w, &h, &n, 4);
+    if (!px || w <= 0 || h <= 0) {
+        if (px) stbi_image_free(px);
+        slot.failed = true;
+        c[absPath] = std::move(slot);
+        return nullptr;
+    }
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    stbi_image_free(px);
+    slot.tex = tex;
+    slot.w = w;
+    slot.h = h;
+
+    constexpr size_t kThumbCap = 64;
+    while (c.size() >= kThumbCap) {
+        auto oldest = c.begin();
+        for (auto jt = c.begin(); jt != c.end(); ++jt)
+            if (jt->second.lastUse < oldest->second.lastUse) oldest = jt;
+        if (oldest->second.tex) glDeleteTextures(1, &oldest->second.tex);
+        c.erase(oldest);
+    }
+    auto [ins, ok] = c.emplace(absPath, std::move(slot));
+    (void)ok;
+    return &ins->second;
 }
 
 // Reveal a path (or its parent folder) in the OS file manager.
@@ -1339,6 +1569,7 @@ void drawSidePanel(AppState& st, float panelW) {
         return id;
     };
 
+    // --- an edge is selected (indexes into visibleEdges) ---------------------
     if (G.selectedEdge >= 0 && G.selectedEdge < (int)G.visibleEdges.size()) {
         const VEdge& ve = G.visibleEdges[G.selectedEdge];
         const GEdge* srcE = (ve.srcEdgeIdx >= 0 && ve.srcEdgeIdx < (int)G.edges.size())
@@ -1357,12 +1588,12 @@ void drawSidePanel(AppState& st, float panelW) {
         panelFieldLabel("from");
         ImGui::SameLine(0, 8 * S);
         if (ImGui::SmallButton((nodeLabel(ve.src) + "##lnksrc").c_str())) {
-            G.selectedId = ve.src; G.selectedEdge = -1; G.blast.clear();
+            G.selectedId = ve.src; G.selectedEdge = -1; clearBlast(G);
         }
         panelFieldLabel("to");
         ImGui::SameLine(0, 8 * S);
         if (ImGui::SmallButton((nodeLabel(ve.dst) + "##lnkdst").c_str())) {
-            G.selectedId = ve.dst; G.selectedEdge = -1; G.blast.clear();
+            G.selectedId = ve.dst; G.selectedEdge = -1; clearBlast(G);
         }
 
         ImGui::Dummy(ImVec2(0, 6 * S));
@@ -1428,7 +1659,7 @@ void drawSidePanel(AppState& st, float panelW) {
             ImGui::TextWrapped("Click the target node to link it — or Esc to cancel.");
         else if (G.scopeDocId.empty())
             ImGui::TextWrapped("Click a node to inspect it. Double-click a part or "
-                               "document to drill into its features.");
+                               "document to isolate its references.");
         else
             ImGui::TextWrapped("Click a node to inspect it, or a link to see its "
                                "properties. Double-click empty space to go back.");
@@ -1438,6 +1669,7 @@ void drawSidePanel(AppState& st, float panelW) {
         return;
     }
 
+    // ---- header: kind pill + title -----------------------------------------
     {
         ImDrawList* dl = ImGui::GetWindowDrawList();
         const ImVec2 p0 = ImGui::GetCursorScreenPos();
@@ -1460,10 +1692,12 @@ void drawSidePanel(AppState& st, float panelW) {
 
     ImGui::Dummy(ImVec2(0, 8 * S));
 
+    // ---- identity fields ---------------------------------------------------
     row("kind", sel->kind);
     row("id", sel->id);
     row("origin", sel->origin);
 
+    // Document — clickable open button (not a dead "doc" dump of the id).
     {
         std::string openTarget;
         std::string openLabel;
@@ -1499,6 +1733,7 @@ void drawSidePanel(AppState& st, float panelW) {
         }
     }
 
+    // Path — folder-icon button reveals the containing folder.
     if (!sel->path.empty()) {
         panelFieldLabel("path");
         ImGui::SameLine(0, 8 * S);
@@ -1569,6 +1804,7 @@ void drawSidePanel(AppState& st, float panelW) {
     ImGui::Separator();
     ImGui::Dummy(ImVec2(0, 8 * S));
 
+    // ---- actions ------------------------------------------------------------
     {
         std::string abs;
         if ((isDrillableKind(sel->kind) || sel->kind == "project") && !sel->path.empty())
@@ -1592,10 +1828,12 @@ void drawSidePanel(AppState& st, float panelW) {
     }
 
     if (graphGlassButton("##blast",
-                         G.blastLoading ? "Blasting…" : "Blast radius",
+                         G.blastLoading ? "Blasting…" : "Impact blast",
                          true, -1.0f) && !G.blastLoading) {
         requestBlast(st, sel->id);
     }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+        ImGui::SetTooltip("Show change impact — ripple + affected neighborhood.");
     ImGui::Dummy(ImVec2(0, 4 * S));
 
     if (G.linkArmSrc == sel->id) {
@@ -1614,9 +1852,12 @@ void drawSidePanel(AppState& st, float panelW) {
         ImGui::PushStyleColor(ImGuiCol_Text,
             ImVec4(palette.statusWarn[0], palette.statusWarn[1],
                    palette.statusWarn[2], 1.0f));
-        ImGui::Text("%d node%s in blast", (int)G.blast.size(),
+        ImGui::Text("Impact: %d node%s", (int)G.blast.size(),
                     G.blast.size() == 1 ? "" : "s");
         ImGui::PopStyleColor();
+        ImGui::Dummy(ImVec2(0, 4 * S));
+        if (graphGlassButton("##clear_blast", "Clear blast", false, -1.0f))
+            clearBlast(G);
     }
 
     ImGui::EndChild();
@@ -1626,7 +1867,7 @@ void drawSidePanel(AppState& st, float panelW) {
 void drawCanvas(AppState& st, ImVec2 canvasSz) {
     auto& G = S();
     const float S = ui::uiScale;
-    (void)st;
+    // st used for path resolution / hover thumbs
 
     ImGui::InvisibleButton("##graph_canvas", canvasSz,
                            ImGuiButtonFlags_MouseButtonLeft |
@@ -1755,6 +1996,7 @@ void drawCanvas(AppState& st, ImVec2 canvasSz) {
         float alpha;
         if (dimf) alpha = 0.08f;
         else if (selEdge) alpha = 1.0f;
+        else if (!G.blast.empty() && !incident) alpha = 0.07f;
         else if (incidenceDim && !incident) alpha = 0.08f;
         else if (incident) alpha = 0.95f;
         else alpha = 0.55f;
@@ -1835,12 +2077,12 @@ void drawCanvas(AppState& st, ImVec2 canvasSz) {
             if (slot >= 0) {
                 G.force.setPos(slot, (mp.x - origin.x - G.panX) / G.zoom,
                                      (mp.y - origin.y - G.panY) / G.zoom);
-                G.force.reheat(0.03f);  // neighbours react while dragging
+                G.force.reheat(0.06f);  // neighbours react while dragging
             }
             ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
         } else {
             if (slot >= 0) G.force.setPinned(slot, false);
-            G.force.reheat(0.15f);
+            G.force.reheat(0.50f);
             G.dragNode = -1;
         }
     }
@@ -1852,9 +2094,11 @@ void drawCanvas(AppState& st, ImVec2 canvasSz) {
             G.linkPopupDst = G.hoverId;
             G.linkPopupOpen = true;
         } else {
+            const bool sameSel = (G.hoverId == G.selectedId);
             G.selectedId = G.hoverId;
             G.selectedEdge = -1;
-            G.blast.clear();
+            // Keep blast when re-clicking the same selected node.
+            if (!sameSel) clearBlast(G);
         }
     }
 
@@ -1894,10 +2138,33 @@ void drawCanvas(AppState& st, ImVec2 canvasSz) {
             if (d2 < bestEd) { bestEd = d2; bestEdge = ei; }
         }
         G.selectedEdge = bestEdge;
-        if (bestEdge >= 0) { G.selectedId.clear(); G.blast.clear(); }
+        if (bestEdge >= 0) { G.selectedId.clear(); clearBlast(G); }
     }
 
     // ---- Nodes (visibleIdx only) --------------------------------------------
+    // ---- Blast ripple rings (expanding from epicenter) ----------------------
+    if (!G.blast.empty() && G.blastT0 > 0.0 && !G.blastEpicenter.empty()) {
+        auto eit = G.idIndex.find(G.blastEpicenter);
+        if (eit != G.idIndex.end()) {
+            const GNode& en = G.nodes[eit->second];
+            ImVec2 ec = toScreen(en.lx, en.ly);
+            const float t = (float)(ImGui::GetTime() - G.blastT0);
+            if (t >= 0.0f && t < 1.25f) {
+                const float u = std::clamp(t / 1.2f, 0.0f, 1.0f);
+                // Ease-out: fast start, slow end.
+                const float ease = 1.0f - (1.0f - u) * (1.0f - u);
+                for (int i = 0; i < 3; ++i) {
+                    const float rr = ease * 200.0f * S * (float)(i + 1) / 3.0f * G.zoom;
+                    const float fade = (1.0f - u) * (1.0f - 0.2f * (float)i);
+                    ImU32 rc = ImGui::GetColorU32(ImVec4(
+                        palette.statusWarn[0], palette.statusWarn[1],
+                        palette.statusWarn[2], 0.55f * fade));
+                    dl->AddCircle(ec, rr, rc, 48, (2.0f - 0.4f * (float)i) * S);
+                }
+            }
+        }
+    }
+
     const bool projectScope = G.scopeDocId.empty();
     // Label LOD: with few nodes on screen, label everything; otherwise only
     // hovered/selected/search-matched nodes (text is the draw bottleneck).
@@ -1916,23 +2183,43 @@ void drawCanvas(AppState& st, ImVec2 canvasSz) {
         bool sel = (n.id == G.selectedId);
         bool hov = (n.id == G.hoverId);
         bool inBlast = G.blast.count(n.id) > 0;
-        // Soft-dim non-incident nodes when something is focused.
+        // Soft-dim non-incident nodes when something is focused; blast dims harder.
         bool nonIncident = incidenceDim && !sel && !hov && !inBlast &&
                            n.id != focusId;
-        float a = dim ? 0.18f : (nonIncident ? 0.45f : 1.0f);
+        float a;
+        if (dim) a = 0.18f;
+        else if (!G.blast.empty() && nonIncident) a = 0.07f;
+        else if (nonIncident) a = 0.45f;
+        else a = 1.0f;
         ImU32 fill = kindColor(n.kind, 0.85f * a);
+        if (inBlast && !dim) {
+            // Warm tint on blast members so impact reads differently from selection.
+            fill = ImGui::GetColorU32(ImVec4(
+                palette.statusWarn[0] * 0.55f + palette.accent[0] * 0.15f,
+                palette.statusWarn[1] * 0.45f + 0.15f,
+                palette.statusWarn[2] * 0.20f,
+                0.88f * a));
+        }
         ImU32 ring = Palette::toU32(palette.border);
         if (sel) {
             ring = Palette::toU32(palette.accent);
             r += 2.0f * S;
         } else if (inBlast) {
             ring = Palette::toU32(palette.statusWarn);
-            r += 1.5f * S;
+            r += 2.0f * S;
         } else if (hov) {
             ring = Palette::toU32(palette.accentDim);
         }
         dl->AddCircleFilled(c, r, fill, 24);
-        dl->AddCircle(c, r, ring, 24, (sel || inBlast ? 2.4f : 1.4f) * S);
+        dl->AddCircle(c, r, ring, 24, (sel || inBlast ? 2.6f : 1.4f) * S);
+        // Pulsing outer halo on blast nodes (distinct from selection accent).
+        if (inBlast && !dim) {
+            const float pulse = 0.55f + 0.45f * std::sin((float)ImGui::GetTime() * 4.0f);
+            ImU32 halo = ImGui::GetColorU32(ImVec4(
+                palette.statusWarn[0], palette.statusWarn[1],
+                palette.statusWarn[2], 0.35f * pulse * a));
+            dl->AddCircle(c, r + (4.0f + 3.0f * pulse) * S, halo, 28, 2.0f * S);
+        }
         if (hov && !dim)
             dl->AddCircleFilled(c, r * 0.35f,
                 ImGui::GetColorU32(ImVec4(palette.text[0], palette.text[1],
@@ -2010,13 +2297,28 @@ void drawCanvas(AppState& st, ImVec2 canvasSz) {
         }
     }
 
-    // Tooltip.
+    // Tooltip (optional package thumbnail for part/asm/doc).
     if (!G.hoverId.empty() && hovered) {
         const GNode* hn = nullptr;
         auto it = G.idIndex.find(G.hoverId);
         if (it != G.idIndex.end()) hn = &G.nodes[it->second];
         if (hn) {
             ImGui::BeginTooltip();
+            if ((hn->kind == "part" || hn->kind == "assembly" || hn->kind == "doc" ||
+                 hn->kind == "drawing") && !hn->path.empty()) {
+                const std::string abs = resolveNodeAbsPath(st, *hn);
+                if (const GraphThumb* th = ensureGraphThumb(abs)) {
+                    const float maxSide = 120.0f * S;
+                    float tw = (float)th->w, thh = (float)th->h;
+                    if (tw > 1.0f && thh > 1.0f) {
+                        const float sc = std::min(maxSide / tw, maxSide / thh);
+                        tw *= sc; thh *= sc;
+                    } else {
+                        tw = thh = maxSide;
+                    }
+                    ImGui::Image((ImTextureID)(intptr_t)th->tex, ImVec2(tw, thh));
+                }
+            }
             ImGui::PushStyleColor(ImGuiCol_Text,
                 ImGui::ColorConvertU32ToFloat4(kindColor(hn->kind)));
             ImGui::Text("[%s]", kindShort(hn->kind));
@@ -2035,7 +2337,7 @@ void drawCanvas(AppState& st, ImVec2 canvasSz) {
                 if (dit != G.descCounts.end() && dit->second.total() > 0)
                     ImGui::Text("inside  %s", formatDescBadge(dit->second).c_str());
                 if (isDrillableKind(hn->kind))
-                    ImGui::TextUnformatted("double-click to drill in");
+                    ImGui::TextUnformatted("double-click to isolate references");
             }
             ImGui::PopStyleColor();
             ImGui::EndTooltip();
@@ -2173,9 +2475,10 @@ void drawListView(AppState& /*st*/, ImVec2 canvasSz) {
             }
             if (ImGui::Selectable(n.label.c_str(), sel || inBlast,
                                   ImGuiSelectableFlags_SpanAllColumns)) {
+                const bool sameSel = (n.id == G.selectedId);
                 G.selectedId = n.id;
                 G.selectedEdge = -1;
-                G.blast.clear();
+                if (!sameSel) clearBlast(G);
             }
             if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)
                 && isDrillableKind(n.kind) && n.id != G.scopeDocId) {
@@ -2208,9 +2511,10 @@ bool plmGraphAvailable() { return S().available; }
 void plmGraphOnProjectChanged() {
     auto& G = S();
     maybeSaveLayout(G, /*force=*/true);  // final solve-state save for old project
+    freeAllGraphThumbs();
     G.nodes.clear();
     G.edges.clear();
-    G.blast.clear();
+    clearBlast(G);
     G.selectedId.clear();
     G.hoverId.clear();
     G.err.clear();
@@ -2253,6 +2557,8 @@ void plmGraphOnProjectChanged() {
     G.visMatches = 0;
     G.allMatches = 0;
     G.matchDirty = true;
+    G.scopePending.clear();
+    G.focusPending.clear();
     // Probe + solve-state cache belong to the old project.
     G.mtimesMax = 0.0;
     G.sourcesCount = 0;
@@ -2272,6 +2578,12 @@ void plmGraphFocus(const std::string& query) {
     G.centerPending = !query.empty();
     G.matchDirty = true;
     G.lastFetch = -1e9;  // force a refetch on the next draw
+}
+
+void plmGraphScopeNode(const std::string& idOrQuery) {
+    auto& G = S();
+    G.scopePending = idOrQuery;
+    G.lastFetch = -1e9;  // ensure graph is warm before we resolve
 }
 
 void plmDrawGraphPage(AppState& st) {
@@ -2301,6 +2613,37 @@ void plmDrawGraphPage(AppState& st) {
     G.wasAppFocusLost = lost;
 
     requestGraph(st, /*force=*/false);
+
+    // Apply deferred scope drill (plmGraphScopeNode) once nodes are present.
+    if (!G.scopePending.empty() && !G.nodes.empty()) {
+        const std::string q = G.scopePending;
+        G.scopePending.clear();
+        auto ends_with = [](const std::string& s, const std::string& suf) {
+            return s.size() >= suf.size() && s.compare(s.size() - suf.size(), suf.size(), suf) == 0;
+        };
+        int best = -1;
+        for (int i = 0; i < (int)G.nodes.size(); ++i) {
+            const GNode& n = G.nodes[i];
+            if (n.id == q) { best = i; break; }
+            if (!n.path.empty() && (n.path == q || ends_with(n.path, q))) {
+                best = i; // keep first path suffix match; exact id wins above
+                if (ends_with(n.path, "/" + q) || ends_with(n.path, "\\" + q)) break;
+            }
+            if (!n.label.empty() && (n.label == q || ends_with(n.label, q))) {
+                if (best < 0) best = i;
+            }
+        }
+        if (best >= 0 && isDrillableKind(G.nodes[best].kind)) {
+            G.scopeStack.clear();
+            setScope(G, G.nodes[best].id);
+            G.selectedId = G.nodes[best].id;
+            G.centerPending = true;
+            G.fitRequested = true;
+        } else if (best >= 0) {
+            G.selectedId = G.nodes[best].id;
+            G.centerPending = true;
+        }
+    }
 
     // ---- toolbar -------------------------------------------------------------
     ImGui::SetNextItemWidth(220 * S);
@@ -2450,12 +2793,12 @@ void plmDrawGraphPage(AppState& st) {
                    palette.textDisabled[2], 1.0f));
         if (G.scopeDocId.empty()) {
             if (visN < fullN)
-                ImGui::Text("%d of %d nodes visible · drill into a document for features",
+                ImGui::Text("%d of %d nodes visible · double-click to isolate references",
                             visN, fullN);
             else
                 ImGui::Text("%d nodes · %d edges", visN, (int)G.visibleEdges.size());
         } else {
-            ImGui::Text("%d nodes in document · %d of %d loaded",
+            ImGui::Text("%d nodes in scope · %d of %d loaded",
                         visN, loadN, fullN);
         }
         ImGui::PopStyleColor();
@@ -2560,10 +2903,14 @@ void plmDrawGraphPage(AppState& st) {
         }
         ImGui::EndPopup();
     }
-    // Esc cancels an armed link when no popup is open.
-    if (!G.linkArmSrc.empty() && !ImGui::IsPopupOpen("Add link##graph_link") &&
-        ImGui::IsKeyPressed(ImGuiKey_Escape))
-        G.linkArmSrc.clear();
+    // Esc clears blast, else cancels an armed link when no popup is open.
+    if (!ImGui::IsPopupOpen("Add link##graph_link") &&
+        ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+        if (!G.blast.empty())
+            clearBlast(G);
+        else if (!G.linkArmSrc.empty())
+            G.linkArmSrc.clear();
+    }
 }
 
 }  // namespace ui

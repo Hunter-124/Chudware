@@ -25,4 +25,7 @@ void plmDrawGraphPage(AppState& st);
 // FeatureManager "show this part's links" entry point.
 void plmGraphFocus(const std::string& query);
 
+// Find a node by id or path/label suffix and drill/isolate into it (FM Graph entry).
+void plmGraphScopeNode(const std::string& idOrQuery);
+
 }  // namespace ui

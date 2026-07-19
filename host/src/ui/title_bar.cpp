@@ -513,7 +513,11 @@ struct FilMenuDrawer {
             leftPaneEntry("FeatureManager",     AppState::LP_FeatureManager);
             leftPaneEntry("PropertyManager",    AppState::LP_PropertyManager,
                           st.propertyManager && st.propertyManager->active());
-            leftPaneEntry("ConfigurationManager", AppState::LP_Configurations);
+            if (ImGui::MenuItem("ConfigurationManager", nullptr,
+                                st.openSettings && st.openSettingsTab == 1)) {
+                st.openSettings = true;
+                st.openSettingsTab = 1;  // Settings → General → Configurations
+            }
             leftPaneEntry("Explorer",           AppState::LP_Explorer);
             ImGui::MenuItem("Design Table",     nullptr, &st.showDesignTablePanel);
             ImGui::MenuItem("Cut List",         nullptr, &st.showCutListPanel);

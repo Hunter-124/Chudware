@@ -46,11 +46,15 @@ static std::vector<PromptRecord> s_promptRecs;
 static bool s_promptsLoaded = false;
 static int  s_selectedRole  = 0;
 
+static std::string s_promptsError;
 static void loadPrompts(AppState& st) {
     nlohmann::json result;
     std::string err;
+    s_promptsError.clear();
     if (!st.worker.call("get_prompts_v2", nlohmann::json::object(), result, err, 20000)) {
-        st.addLog("[err] get_prompts_v2: " + err);
+        s_promptsError = err.empty() ? "get_prompts_v2 failed" : err;
+        st.addLog("[err] get_prompts_v2: " + s_promptsError);
+        s_promptsLoaded = false;
         return;
     }
     // get_prompts_v2 returns a BARE JSON array of prompt records; tolerate a legacy
@@ -3185,7 +3189,8 @@ const SettingsEntry kSettingsEntries[] = {
     { "Benchmark categories",     "AI",    2 },
     { "Category run",             "AI",    2 },
     // Prompts (tab 5)
-    { "Role prompts",             "AI",       2 },
+    { "Prompts",                  "AI",           2 },
+    { "Role prompts",             "AI",           2 },
     { "Agent prompts",            "AI",       2 },
     { "Prompt editor",            "AI",       2 },
     { "System prompt",            "AI",       2 },
@@ -3662,7 +3667,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                                     (jumpToTab == 2 || jumpToPrompts) ? ImGuiTabItemFlags_SetSelected
                                                                      : ImGuiTabItemFlags_None)) {
                 settingsTabBodyBegin("##tab_ai");
-                if (jumpToPrompts && s_aiSubJump < 0) s_aiSubJump = 2;
+                if (jumpToPrompts && s_aiSubJump < 0) s_aiSubJump = 3;  // Prompts sub-tab
                 if (jumpToTab == 4 && s_aiSubJump < 0) s_aiSubJump = 5;
                 if (jumpToTab == 5 && s_aiSubJump < 0) s_aiSubJump = 2;
 
@@ -3755,143 +3760,13 @@ settingsGlassSectionBegin("##ai_harness_org", "Harness organization");
                         ImGui::EndTabItem();
                     }
 
+
                     if (ImGui::BeginTabItem("Roles", nullptr, subFlags(2))) {
                         // Model pickers first (compact table).
                         settingsGlassSectionBegin("##ai_model_roles", "Model roles");
                 drawModelRolesSection(st, sc);
                 settingsGlassSectionEnd();
-                        ImGui::Dummy(ImVec2(0, 6.0f * sc));
-                        // Role prompt editor — fixed height; parent AI body scrolls.
-                settingsSectionHeader("Role prompts", /*first=*/true);
-                bool canFetch = st.workerStarted && !busy;
-                if (!s_promptsLoaded && canFetch) loadPrompts(st);
-                if (!s_promptsLoaded)
-                    dimText("Worker not ready \xe2\x80\x94 role prompts appear once the runtime "
-                            "starts.");
-                // Left column: role list + the system-prompt override pseudo-entry (moved here
-                // from the old Advanced tab — it IS a prompt; audit P1). sysIdx = one past the
-                // roles = the override editor.
-                const int sysIdx = (int)s_promptRecs.size();
-                float listW = 150.0f * sc;
-                // Fixed pane height so Model roles above + Eng. Firm below can share one
-                // parent scrollbar — avail-filling children were pushing this off-screen.
-                const float promptsH = ImMax(260.0f * sc,
-                    ImMin(420.0f * sc, ImGui::GetContentRegionAvail().y * 0.72f));
-                ImGui::PushStyleColor(ImGuiCol_ChildBg,
-                    ImVec4(ui::palette.panelBg[0], ui::palette.panelBg[1],
-                           ui::palette.panelBg[2], 1));
-                ImGui::BeginChild("##rolelist", ImVec2(listW, promptsH),
-                                  ImGuiChildFlags_Border);
-                for (int i = 0; i < (int)s_promptRecs.size(); ++i) {
-                    bool sel = (i == s_selectedRole);
-                    auto& pr = s_promptRecs[i];
-                    std::string lbl = pr.role;
-                    if (pr.overridden) lbl += " *";
-                    if (ImGui::Selectable(lbl.c_str(), sel))
-                        s_selectedRole = i;
-                    if (ImGui::IsItemHovered())  // long names truncate in the narrow list
-                        ImGui::SetTooltip("%s%s", pr.role.c_str(),
-                                          pr.overridden ? " (overridden)" : "");
-                }
-                if (!s_promptRecs.empty()) ImGui::Separator();
-                {
-                    std::string syslbl = "system (override)";
-                    if (st.spBuf[0] != 0) syslbl += " *";
-                    if (ImGui::Selectable(syslbl.c_str(), s_selectedRole >= sysIdx))
-                        s_selectedRole = sysIdx;
-                    if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Override the agent's system prompt (advanced)");
-                }
-                ImGui::EndChild();
-                ImGui::PopStyleColor();
-
-                ImGui::SameLine();
-
-                // Right column: editor + diff indicator
-                ImGui::BeginChild("##roleeditor", ImVec2(0, promptsH),
-                                  ImGuiChildFlags_None);
-                if (s_selectedRole >= sysIdx) {
-                    // System prompt override (applied by the footer Save; empty = built-in).
-                    ImGui::PushFont(st.fonts.medium);
-                    ImGui::TextUnformatted("System prompt override");
-                    ImGui::PopFont();
-                    dimText("Leave empty to use the built-in prompt (recommended). A custom "
-                            "prompt fully replaces it - keep the `result`/`parts` contract "
-                            "and the python+json two-block reply format or the agent breaks. "
-                            "Applied by the Save button below.");
-                    ImGui::PushFont(st.fonts.mono);
-                    float edH = ImGui::GetContentRegionAvail().y - 38.0f * sc;
-                    if (edH < 100.0f * sc) edH = 100.0f * sc;
-                    ImGui::InputTextMultiline("##sysprompt", st.spBuf.data(), st.spBuf.size(),
-                                              ImVec2(-1, edH));
-                    ImGui::PopFont();
-                    if (!canFetch) ImGui::BeginDisabled();
-                    if (ImGui::Button("Load built-in prompt")) {
-                        nlohmann::json pr;
-                        std::string perr;
-                        if (st.worker.call("get_prompts", nlohmann::json::object(), pr, perr,
-                                           20000)) {
-                            std::fill(st.spBuf.begin(), st.spBuf.end(), 0);
-                            std::strncpy(st.spBuf.data(), pr.value("system_prompt", "").c_str(),
-                                         st.spBuf.size() - 1);
-                        } else {
-                            st.addLog("[err] get_prompts: " + perr);
-                        }
-                    }
-                    if (!canFetch) ImGui::EndDisabled();
-                    if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Copy the built-in prompt into the editor as a "
-                                          "starting point");
-                    ImGui::SameLine();
-                    if (ImGui::Button("Clear (use built-in)"))
-                        std::fill(st.spBuf.begin(), st.spBuf.end(), 0);
-                } else if (s_selectedRole < (int)s_promptRecs.size()) {
-                    auto& pr = s_promptRecs[s_selectedRole];
-                    // Overridden badge
-                    if (pr.overridden) {
-                        ImGui::PushStyleColor(ImGuiCol_Text,
-                            ImVec4(ui::palette.statusWarn[0], ui::palette.statusWarn[1],
-                                   ui::palette.statusWarn[2], 1));
-                        ImGui::TextUnformatted("[overridden]");
-                        ImGui::PopStyleColor();
-                        ImGui::SameLine();
-                    }
-                    ImGui::PushFont(st.fonts.medium);
-                    ImGui::TextUnformatted(pr.role.c_str());
-                    ImGui::PopFont();
-                    // Diff indicator (just char count difference — not a full diff)
-                    int curLen = (int)std::strlen(pr.buf.data());
-                    int delta  = curLen - pr.builtinLen;
-                    if (delta != 0) {
-                        ImGui::SameLine();
-                        dimText(delta > 0 ? "(differs from built-in: longer)"
-                                          : "(differs from built-in: shorter)");
-                    }
-                    ImGui::PushFont(st.fonts.mono);
-                    float edH = ImGui::GetContentRegionAvail().y - 38.0f * sc;
-                    if (edH < 100.0f * sc) edH = 100.0f * sc;
-                    ImGui::InputTextMultiline("##prompted", pr.buf.data(), pr.buf.size(),
-                                              ImVec2(-1, edH));
-                    ImGui::PopFont();
-                    // Save / Reset
-                    if (!canFetch) ImGui::BeginDisabled();
-                    if (primaryButton("Save", ImVec2(80.0f * sc, 28.0f * sc))) {
-                        savePromptOverride(pr);
-                        st.addLog("[ok] prompt saved: " + pr.role);
-                    }
-                    if (!canFetch) ImGui::EndDisabled();
-                    ImGui::SameLine();
-                    if (!canFetch) ImGui::BeginDisabled();
-                    if (ImGui::Button("Reset to built-in", ImVec2(140.0f * sc, 28.0f * sc))) {
-                        resetPromptOverride(pr, st);
-                        st.addLog("[ok] prompt reset: " + pr.role);
-                    }
-                    if (!canFetch) ImGui::EndDisabled();
-                    if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Delete the override and restore the shipped prompt");
-                }
-                ImGui::EndChild();
-                        ImGui::Dummy(ImVec2(0, 6.0f * sc));
+                        ImGui::Dummy(ImVec2(0, 8.0f * sc));
                         {
                             static bool s_efOpen = false;
                             ImGui::SetNextItemOpen(s_efOpen, ImGuiCond_Once);
@@ -3906,6 +3781,173 @@ settingsGlassSectionBegin("##ai_harness_org", "Harness organization");
                         }
                         ImGui::EndTabItem();
                     }
+
+                    if (ImGui::BeginTabItem("Prompts", nullptr, subFlags(3))) {
+                        // Full-height role prompt editor for power users / dev refinement.
+                        bool canFetch = st.workerStarted && !busy;
+                        if (!s_promptsLoaded && canFetch) loadPrompts(st);
+
+                        ImGui::AlignTextToFramePadding();
+                        ImGui::TextUnformatted("Role prompts");
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip(
+                                "Edit per-role system prompts (pipeline + harness roles). "
+                                "Overrides save next to the shipped YAML cards.");
+                        ImGui::SameLine();
+                        if (!canFetch) ImGui::BeginDisabled();
+                        if (ImGui::SmallButton("Refresh##prompts_refresh")) {
+                            s_promptsLoaded = false;
+                            loadPrompts(st);
+                        }
+                        if (!canFetch) ImGui::EndDisabled();
+                        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                            ImGui::SetTooltip(canFetch
+                                ? "Reload prompt catalog from the worker"
+                                : "Start the worker to load role prompts");
+                        if (!s_promptsError.empty()) {
+                            ImGui::SameLine();
+                            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusErr));
+                            ImGui::TextUnformatted(s_promptsError.c_str());
+                            ImGui::PopStyleColor();
+                        } else if (!s_promptsLoaded) {
+                            ImGui::SameLine();
+                            dimText(st.workerStarted
+                                ? "Loading\xe2\x80\xa6"
+                                : "Worker not ready \xe2\x80\x94 start runtime to edit prompts.");
+                        } else {
+                            ImGui::SameLine();
+                            dimText((std::to_string(s_promptRecs.size()) + " roles").c_str());
+                        }
+
+                        // Auto-select first role once the catalog lands.
+                        if (s_promptsLoaded && !s_promptRecs.empty() &&
+                            (s_selectedRole < 0 ||
+                             (s_selectedRole > (int)s_promptRecs.size()))) {
+                            s_selectedRole = 0;
+                        }
+
+                        const int sysIdx = (int)s_promptRecs.size();
+                        const float listW = 168.0f * sc;
+                        // Fill remaining viewport — single scrollbar inside list/editor only.
+                        const float promptsH = ImMax(220.0f * sc,
+                            ImGui::GetContentRegionAvail().y - 4.0f * sc);
+
+                        ImGui::PushStyleColor(ImGuiCol_ChildBg,
+                            ImVec4(ui::palette.panelBg[0], ui::palette.panelBg[1],
+                                   ui::palette.panelBg[2], 1));
+                        ImGui::BeginChild("##rolelist", ImVec2(listW, promptsH),
+                                          ImGuiChildFlags_Border);
+                        if (s_promptRecs.empty() && s_promptsLoaded) {
+                            dimText("No role prompts returned.");
+                        }
+                        for (int i = 0; i < (int)s_promptRecs.size(); ++i) {
+                            bool sel = (i == s_selectedRole);
+                            auto& pr = s_promptRecs[i];
+                            std::string lbl = pr.role;
+                            if (pr.overridden) lbl += " *";
+                            if (ImGui::Selectable(lbl.c_str(), sel))
+                                s_selectedRole = i;
+                            if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("%s%s", pr.role.c_str(),
+                                                  pr.overridden ? " (overridden)" : "");
+                        }
+                        if (!s_promptRecs.empty() || true) ImGui::Separator();
+                        {
+                            std::string syslbl = "system (override)";
+                            if (st.spBuf[0] != 0) syslbl += " *";
+                            if (ImGui::Selectable(syslbl.c_str(), s_selectedRole >= sysIdx))
+                                s_selectedRole = sysIdx;
+                            if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("Override the agent system prompt (advanced)");
+                        }
+                        ImGui::EndChild();
+                        ImGui::PopStyleColor();
+
+                        ImGui::SameLine();
+
+                        ImGui::BeginChild("##roleeditor", ImVec2(0, promptsH),
+                                          ImGuiChildFlags_None);
+                        if (s_selectedRole >= sysIdx) {
+                            ImGui::PushFont(st.fonts.medium);
+                            ImGui::TextUnformatted("System prompt override");
+                            ImGui::PopFont();
+                            dimText("Empty = built-in. Custom text fully replaces it \xe2\x80\x94 "
+                                    "keep the result/parts contract. Applied by Save below.");
+                            ImGui::PushFont(st.fonts.mono);
+                            float edH = ImGui::GetContentRegionAvail().y - 38.0f * sc;
+                            if (edH < 100.0f * sc) edH = 100.0f * sc;
+                            ImGui::InputTextMultiline("##sysprompt", st.spBuf.data(), st.spBuf.size(),
+                                                      ImVec2(-1, edH));
+                            ImGui::PopFont();
+                            if (!canFetch) ImGui::BeginDisabled();
+                            if (ImGui::Button("Load built-in prompt")) {
+                                nlohmann::json pr;
+                                std::string perr;
+                                if (st.worker.call("get_prompts", nlohmann::json::object(), pr, perr,
+                                                   20000)) {
+                                    std::fill(st.spBuf.begin(), st.spBuf.end(), 0);
+                                    std::strncpy(st.spBuf.data(),
+                                                 pr.value("system_prompt", "").c_str(),
+                                                 st.spBuf.size() - 1);
+                                } else {
+                                    st.addLog("[err] get_prompts: " + perr);
+                                }
+                            }
+                            if (!canFetch) ImGui::EndDisabled();
+                            if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("Copy the built-in prompt into the editor");
+                            ImGui::SameLine();
+                            if (ImGui::Button("Clear (use built-in)"))
+                                std::fill(st.spBuf.begin(), st.spBuf.end(), 0);
+                        } else if (s_selectedRole >= 0 &&
+                                   s_selectedRole < (int)s_promptRecs.size()) {
+                            auto& pr = s_promptRecs[s_selectedRole];
+                            if (pr.overridden) {
+                                ImGui::PushStyleColor(ImGuiCol_Text,
+                                    ImVec4(ui::palette.statusWarn[0], ui::palette.statusWarn[1],
+                                           ui::palette.statusWarn[2], 1));
+                                ImGui::TextUnformatted("[overridden]");
+                                ImGui::PopStyleColor();
+                                ImGui::SameLine();
+                            }
+                            ImGui::PushFont(st.fonts.medium);
+                            ImGui::TextUnformatted(pr.role.c_str());
+                            ImGui::PopFont();
+                            int curLen = (int)std::strlen(pr.buf.data());
+                            int delta  = curLen - pr.builtinLen;
+                            if (delta != 0) {
+                                ImGui::SameLine();
+                                dimText(delta > 0 ? "(differs from built-in: longer)"
+                                                  : "(differs from built-in: shorter)");
+                            }
+                            ImGui::PushFont(st.fonts.mono);
+                            float edH = ImGui::GetContentRegionAvail().y - 38.0f * sc;
+                            if (edH < 100.0f * sc) edH = 100.0f * sc;
+                            ImGui::InputTextMultiline("##prompted", pr.buf.data(), pr.buf.size(),
+                                                      ImVec2(-1, edH));
+                            ImGui::PopFont();
+                            if (!canFetch) ImGui::BeginDisabled();
+                            if (primaryButton("Save", ImVec2(80.0f * sc, 28.0f * sc))) {
+                                savePromptOverride(pr);
+                                st.addLog("[ok] prompt saved: " + pr.role);
+                            }
+                            if (!canFetch) ImGui::EndDisabled();
+                            ImGui::SameLine();
+                            if (!canFetch) ImGui::BeginDisabled();
+                            if (ImGui::Button("Reset to built-in", ImVec2(140.0f * sc, 28.0f * sc))) {
+                                resetPromptOverride(pr, st);
+                                st.addLog("[ok] prompt reset: " + pr.role);
+                            }
+                            if (!canFetch) ImGui::EndDisabled();
+                            if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("Delete override and restore shipped prompt");
+                        } else {
+                            dimText("Select a role on the left to edit its prompt.");
+                        }
+                        ImGui::EndChild();
+                        ImGui::EndTabItem();
+                    }
+
 
                     if (ImGui::BeginTabItem("Skills", nullptr, subFlags(3))) {
                         // Fill-height editors: pin parent scroll so only the catalog/editor scroll.
@@ -4122,8 +4164,8 @@ settingsGlassSectionBegin("##ai_maintenance", "Maintenance");
             // Legacy: Agent(6)/Prompts(5)/Benchmarks(4) → AI(2). Experimental is tab 4.
             if (wantSettingsSel && jumpToTab < 0) jumpToTab = 2;
             if (jumpToTab == 4 || jumpToTab == 5 || jumpToTab == 6) {
-                if (jumpToTab == 4) s_aiSubJump = 5;
-                if (jumpToTab == 5) s_aiSubJump = 2;
+                if (jumpToTab == 4) s_aiSubJump = 6;  // Benchmarks
+                if (jumpToTab == 5) s_aiSubJump = 3;  // Prompts
                 jumpToTab = 2;
             }
             if (jumpToTab == 7) jumpToTab = 4;

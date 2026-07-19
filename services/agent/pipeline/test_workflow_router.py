@@ -297,6 +297,30 @@ class TestRoute:
         assert d["scaffold_level"] == ScaffoldLevel.MAXIMUM.value
         assert d["tier"] == "local-24k"
         assert "reason" in d
+        assert "alternatives" in d
+        assert isinstance(d["alternatives"], list)
+        assert len(d["alternatives"]) >= 2
+        chosen = d["task_class"]
+        for alt in d["alternatives"]:
+            assert isinstance(alt, dict)
+            assert alt.get("task_class")
+            assert alt["task_class"] != chosen
+
+    def test_alternatives_exclude_chosen_and_pad(self):
+        """UNKNOWN / simple routes still expose ≥3 other classes for the GUI."""
+        r = route("make something", "local-24k", tuning={})
+        assert r.task_class == TaskClass.UNKNOWN
+        assert len(r.alternatives) >= 3
+        classes = {a["task_class"] for a in r.alternatives}
+        assert TaskClass.UNKNOWN.value not in classes
+        # Multi-cue request: secondary rule hits should appear first.
+        r2 = route("mill a hinged assembly bracket", "local-24k", tuning={})
+        assert r2.task_class == TaskClass.CAM_PROGRAM
+        alt_classes = [a["task_class"] for a in r2.alternatives]
+        assert TaskClass.CAM_PROGRAM.value not in alt_classes
+        # assembly and simple_part both match the text; at least one real hit.
+        assert any(a.startswith("also matched") for a in
+                   (x.get("reason", "") for x in r2.alternatives))
 
     def test_request_snippet_truncated(self):
         long_req = "a " * 200

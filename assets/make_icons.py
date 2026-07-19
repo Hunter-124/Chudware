@@ -3792,29 +3792,50 @@ def draw_paperclip(d, cell, p):
 
 @icon("context_cube")
 def draw_context_cube(d, cell, p):
-    """Billet logo cube as OUTLINE-ONLY strokes (transparent bg, no fills).
+    """Filled isometric cube for chat context-ref chips (status-tintable).
 
-    Matches brand_cube proportions (2:1 isometric via _iso_pts) but draws only
-    the visible edges — black-line art intent. Uses p.stroke so the monochrome
-    SDF/atlas path inherits the text/icon color role in both themes (light ink
-    on dark, slate on light) rather than hardcoding pure black.
+    Same 2:1 _iso_pts geometry as brand_cube. Top face is near-white / high-alpha
+    so ImGui multiply-tint can recolor the chip by status; left/right faces are
+    slightly darker parallelograms. Hex silhouette only — no circle/ellipse.
+    Simplified notch at >=32 px; plain cube at 20 px for legibility.
     """
     s = cell * SS
-    # Slightly heavier than 1x so the thin wireframe reads at 20 px toolbar size.
-    lw = max(stroke_width(cell), int(2.2 * SS))
-    # Full-slot scale (brand app uses 0.36; we push a touch larger for toolbar).
+    lw = max(1, int(stroke_width(cell) * 0.85))
     r = s * 0.38
     cx, cy = s * 0.50, s * 0.52
     pt = _iso_pts(cx, cy, r)
-    # Visible silhouette + interior Y-junction — the classic iso cube outline.
-    edges = [
-        (pt["lt"], pt["top"]), (pt["top"], pt["rt"]),
-        (pt["rt"], pt["rb"]), (pt["rb"], pt["bot"]),
-        (pt["bot"], pt["lb"]), (pt["lb"], pt["lt"]),
-        (pt["lt"], pt["c"]), (pt["c"], pt["rt"]), (pt["c"], pt["bot"]),
-    ]
+    # High-alpha light top so multiply-tint drives status color cleanly.
+    top_fill = (255, 255, 255, 230) if sum(p.stroke[:3]) > 400 else _rgba(p.stroke, 210)
+    # Optional simplified notch only when the cell has room (skip smear at 20 px).
+    use_notch = cell > 20
+    if use_notch:
+        q = _iso_pts(cx, cy - r + r * 0.5, r * 0.5)
+        d.polygon([pt["lt"], q["lt"], q["c"], q["rt"], pt["rt"], pt["c"]], fill=top_fill)
+    else:
+        d.polygon([pt["lt"], pt["top"], pt["rt"], pt["c"]], fill=top_fill)
+    # Left darker, right mid — shaded parallelogram faces.
+    d.polygon([pt["lt"], pt["c"], pt["bot"], pt["lb"]], fill=_rgba(p.stroke, 55))
+    d.polygon([pt["rt"], pt["c"], pt["bot"], pt["rb"]], fill=_rgba(p.stroke, 90))
+    if use_notch:
+        d.polygon([q["lt"], q["top"], q["rt"], q["c"]], fill=_rgba((255, 255, 255), 90))
+        d.polygon([q["lt"], q["c"], q["bot"], q["lb"]], fill=_rgba(p.stroke, 28))
+        d.polygon([q["rt"], q["c"], q["bot"], q["rb"]], fill=_rgba(p.stroke, 40))
+    # Hex outer silhouette + interior Y-junction.
+    edges = [(pt["rt"], pt["rb"]), (pt["rb"], pt["bot"]), (pt["bot"], pt["lb"]),
+             (pt["lb"], pt["lt"]), (pt["lt"], pt["c"]), (pt["c"], pt["rt"]),
+             (pt["c"], pt["bot"])]
+    if use_notch:
+        edges += [(pt["lt"], q["lt"]), (q["rt"], pt["rt"])]
+    else:
+        edges += [(pt["lt"], pt["top"]), (pt["top"], pt["rt"])]
     for a, b in edges:
         d.line([a, b], fill=p.stroke, width=lw)
+    if use_notch:
+        nlw = max(1, int(lw * 0.7))
+        for a, b in [(q["lt"], q["c"]), (q["c"], q["rt"]), (q["c"], q["bot"]),
+                     (q["lt"], q["lb"]), (q["rt"], q["rb"]), (q["lb"], q["bot"]),
+                     (q["rb"], q["bot"]), (q["lt"], q["top"]), (q["rt"], q["top"])]:
+            d.line([a, b], fill=_rgba(p.stroke, 180), width=nlw)
 
 
 # ---------------------------------------------------------------------------

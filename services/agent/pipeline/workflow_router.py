@@ -159,6 +159,83 @@ def classify_task_detailed(request: str) -> tuple[TaskClass, str]:
     return TaskClass.UNKNOWN, ""
 
 
+# Stable display order for padding alternatives when few rules match.
+_ALT_PAD_ORDER: tuple[TaskClass, ...] = (
+    TaskClass.SIMPLE_PART,
+    TaskClass.MULTI_FEATURE_PART,
+    TaskClass.ASSEMBLY,
+    TaskClass.ENCLOSURE,
+    TaskClass.CAM_PROGRAM,
+    TaskClass.MODIFICATION,
+    TaskClass.ANALYSIS,
+    TaskClass.UNKNOWN,
+)
+
+# Short why-not blurbs when padding non-matched classes for the Routing card.
+_ALT_PAD_REASON: dict[TaskClass, str] = {
+    TaskClass.SIMPLE_PART: "no simple single-feature geometry cues",
+    TaskClass.MULTI_FEATURE_PART: "no multi-feature geometry cues",
+    TaskClass.ASSEMBLY: "no assembly/mate cues",
+    TaskClass.ENCLOSURE: "no enclosure/housing cues",
+    TaskClass.CAM_PROGRAM: "no CAM/machining cues",
+    TaskClass.MODIFICATION: "no modification cues",
+    TaskClass.ANALYSIS: "no simulation/analysis cues",
+    TaskClass.UNKNOWN: "would leave request unclassified",
+}
+
+
+def collect_class_alternatives(
+    request: str,
+    chosen: TaskClass,
+    *,
+    min_count: int = 3,
+) -> list[dict[str, str]]:
+    """Other plausible task classes for transparency (excludes *chosen*).
+
+    Prefer real secondary ``_RULES`` matches on the same request text. When
+    fewer than *min_count* alternate matches exist (common for UNKNOWN /
+    simple single-hit cases), pad with other vocabulary classes and a short
+    why-not reason so the GUI Routing card always has options to expand.
+    Deterministic; no model/network.
+    """
+    text = (request or "").lower()
+    seen: set[str] = set()
+    alts: list[dict[str, str]] = []
+
+    for pattern, cls, label in _RULES:
+        if cls == chosen:
+            continue
+        key = cls.value
+        if key in seen:
+            continue
+        m = re.search(pattern, text, re.IGNORECASE)
+        if not m:
+            continue
+        seen.add(key)
+        hit = m.group(0)
+        alts.append({
+            "task_class": key,
+            "reason": f"also matched {label}: {hit}",
+        })
+
+    if len(alts) < min_count:
+        for cls in _ALT_PAD_ORDER:
+            if cls == chosen:
+                continue
+            key = cls.value
+            if key in seen:
+                continue
+            seen.add(key)
+            alts.append({
+                "task_class": key,
+                "reason": _ALT_PAD_REASON.get(cls, "not selected"),
+            })
+            if len(alts) >= min_count:
+                break
+
+    return alts
+
+
 # ---------------------------------------------------------------------------
 # Tuning results
 # ---------------------------------------------------------------------------
@@ -269,6 +346,8 @@ class RouterResult:
     tier: str
     reason: str
     request_snippet: str = ""     # first 120 chars of request for transparency logs
+    # Other plausible classes (excl. chosen) for Routing-card expand UI.
+    alternatives: list[dict[str, str]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -278,6 +357,7 @@ class RouterResult:
             "tier": self.tier,
             "reason": self.reason,
             "request_snippet": self.request_snippet,
+            "alternatives": list(self.alternatives),
         }
 
 
@@ -303,7 +383,7 @@ def route(request: str, tier: str, *,
             force MAXIMUM scaffold; autopilot (C) keeps eco/tier default.
 
     Returns:
-        RouterResult with task_class, scaffold_level, tier, and reason.
+        RouterResult with task_class, scaffold_level, tier, reason, and alternatives.
     """
     cls, class_why = classify_task_detailed(request)
     level, reason = best_scaffold_for_class(cls, tier, tuning=tuning)
@@ -330,10 +410,12 @@ def route(request: str, tier: str, *,
             # wf == "autopilot" (C): never invent new approve gates.
         except Exception:  # noqa: BLE001
             pass
+    alternatives = collect_class_alternatives(request, cls)
     return RouterResult(
         task_class=cls,
         scaffold_level=level,
         tier=tier,
         reason=reason,
         request_snippet=request[:120],
+        alternatives=alternatives,
     )

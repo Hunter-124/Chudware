@@ -2104,6 +2104,13 @@ static void mergeRoutingFields(ActivityItem& card, const nlohmann::json& data, c
         meta[key] = data[srcKey];
     };
 
+    // Pass through alternatives arrays from any routing event (keys vary by producer).
+    auto putAlts = [&]() {
+        for (const char* k : {"alternatives", "alt_classes", "candidates"}) {
+            if (data.contains(k) && !data[k].is_null()) meta[k] = data[k];
+        }
+    };
+
     if (kind == "agent.classification") {
         std::string tc = jstr(data, "task_class");
         if (!tc.empty()) card.title = tc;
@@ -2118,6 +2125,7 @@ static void mergeRoutingFields(ActivityItem& card, const nlohmann::json& data, c
         std::string tier = jstr(data, "tier");
         if (!tier.empty()) meta["tier"] = tier;
         else putAny("tier", "tier");
+        putAlts();
     } else if (kind == "complexity") {
         std::string level = jstr(data, "level");
         if (!level.empty()) {
@@ -2128,6 +2136,7 @@ static void mergeRoutingFields(ActivityItem& card, const nlohmann::json& data, c
         if (!reason.empty() && card.reason.empty()) card.reason = reason;
         if (data.contains("skip_plan") && !data["skip_plan"].is_null())
             meta["skip_plan"] = data["skip_plan"];
+        putAlts();
     } else if (kind == "task_route") {
         std::string domain = jstr(data, "domain");
         if (!domain.empty()) {
@@ -2146,11 +2155,21 @@ static void mergeRoutingFields(ActivityItem& card, const nlohmann::json& data, c
             meta["tool_classes"] = data["tool_classes"];
         if (data.contains("context_sheets") && !data["context_sheets"].is_null())
             meta["context_sheets"] = data["context_sheets"];
+        putAlts();
     }
     card.detail = meta.dump();
     card.status = "done";
 }
 
+
+// Mid-turn chat_history flush (resume-safe). feedTurnActivity sets the dirty flag;
+// the GL draw path calls maybePersistChatHistoryDebounced with AppState.
+static std::atomic<bool> s_chatHistoryDirty{false};
+static double s_chatHistoryLastPersist = -1e9;
+
+static void markChatHistoryDirty() {
+    s_chatHistoryDirty.store(true, std::memory_order_relaxed);
+}
 
 void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json& data) {
     // Inside a mission, sub-run stage keys (intake/model/...) repeat per task — namespace them by
@@ -3577,6 +3596,16 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             m.liveStatus = purpose + (stt.empty() ? std::string() : (" (" + stt + ")"));
         }
     }
+    // Resume-safe: mark history dirty on activity/text/plan changes; force on terminal events.
+    if (m.running || kind == "run_finished" || kind == "mission_finished" ||
+        kind == "agent.thought" || kind == "agent.thought.delta" || kind == "assistant_delta" ||
+        kind == "agent.tool_call" || kind == "agent.classification" || kind == "plan_state" ||
+        kind == "plan" || kind == "complexity" || kind == "task_route") {
+        markChatHistoryDirty();
+        if (kind == "run_finished" || kind == "mission_finished")
+            s_chatHistoryLastPersist = -1e9;  // force next draw flush
+    }
+
 }
 
 namespace ui {
@@ -4489,7 +4518,7 @@ static bool isThinkingItem(const ActivityItem& a) {
 // thoughts stream; once a later stage reaches a verdict (`laterDone`) it auto-collapses unless the
 // user expanded it (a.expanded, set by clicking). `showThinking` off -> a single dim one-liner.
 static void drawThinkingBlock(ActivityItem& a, const ui::Fonts& fonts, bool showThinking,
-                              bool laterDone) {
+                              bool laterDone, bool turnRunning = false) {
     const float sc = ui::uiScale;
     ImGui::Dummy(ImVec2(0, 2 * sc));
 
@@ -4502,7 +4531,8 @@ static void drawThinkingBlock(ActivityItem& a, const ui::Fonts& fonts, bool show
         return;
     }
 
-    const bool open = a.expanded || !laterDone;   // forced open while it is the active frontier
+    // Force open while streaming or the turn is still running (live planning tokens).
+    const bool open = a.expanded || a.streaming || turnRunning || !laterDone;
     // Split detail into reply body + optional packed sent-prompt trailer.
     std::string replyBody = a.detail;
     std::string sentBody;
@@ -4564,11 +4594,19 @@ static void drawThinkingBlock(ActivityItem& a, const ui::Fonts& fonts, bool show
 // label + duration/ops meta, the verdict folded in as a result line, an expandable drawer (a
 // legacy AgentStep's thinking/code/diff/thumbnail when attached, else the raw detail), and a red
 // border when the stage failed. `step` is non-null only for v1 runs that carry an AgentStep.
-static void drawActionCard(ActivityItem& a, AgentStep* step, const ui::Fonts& fonts, float logW) {
+static void drawActionCard(ActivityItem& a, AgentStep* step, const ui::Fonts& fonts, float logW,
+                           bool turnRunning = false) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
     const bool running = a.status == "running";
     const bool fail    = a.status == "fail";
+    auto hasWord = [](const std::string& s, const char* w) {
+        std::string low; low.reserve(s.size());
+        for (unsigned char c : s) low.push_back((char)std::tolower(c));
+        return low.find(w) != std::string::npos;
+    };
+    const bool intakeLike = hasWord(a.stage, "intake") || hasWord(a.title, "intake") ||
+                            hasWord(a.title, "understanding") || hasWord(a.stage, "understand");
 
     ImGui::Dummy(ImVec2(0, 2 * sc));
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
@@ -4610,18 +4648,43 @@ static void drawActionCard(ActivityItem& a, AgentStep* step, const ui::Fonts& fo
             replyBody.clear();
         }
     }
+    // Optional alternatives packed as JSON in detail (intake/understanding cards).
+    std::vector<std::string> altLines;
+    if (!replyBody.empty() && (replyBody[0] == '{' || replyBody[0] == '[')) {
+        try {
+            auto j = nlohmann::json::parse(replyBody, nullptr, false);
+            if (!j.is_discarded() && j.is_object()) {
+                auto pull = [&](const char* key) {
+                    if (!j.contains(key) || !j[key].is_array()) return;
+                    for (const auto& it : j[key]) {
+                        if (it.is_string()) altLines.push_back(it.get<std::string>());
+                        else if (it.is_object()) {
+                            std::string tc = jstr(it, "task_class");
+                            if (tc.empty()) tc = jstr(it, "class");
+                            if (tc.empty()) tc = jstr(it, "name");
+                            if (!tc.empty()) altLines.push_back(std::move(tc));
+                        }
+                    }
+                };
+                pull("alternatives"); pull("alt_classes"); pull("candidates");
+            }
+        } catch (...) {}
+    }
+    const bool forceOpen = (running || turnRunning) && intakeLike && !a.userToggled;
+    if (forceOpen) a.expanded = true;
+    const bool open = a.expanded || forceOpen;
     const bool hasDrawer = (step && (!step->thinking.empty() || !step->code.empty() ||
                                      !step->diff.empty() || !step->contactSheet.empty())) ||
-                           !replyBody.empty() || !sentBody.empty();
+                           !replyBody.empty() || !sentBody.empty() || !altLines.empty();
     if (hasDrawer) {
         if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-        if (ImGui::IsItemClicked()) a.expanded = !a.expanded;
+        if (ImGui::IsItemClicked()) { a.expanded = !open; a.userToggled = true; }
         ImGui::SameLine(0, 6 * sc);
         ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-        ImGui::TextUnformatted(a.expanded ? "(hide)" : "(details)");
+        ImGui::TextUnformatted(open ? "(hide)" : "(details)");
         ImGui::PopStyleColor();
         if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-        if (ImGui::IsItemClicked()) a.expanded = !a.expanded;
+        if (ImGui::IsItemClicked()) { a.expanded = !open; a.userToggled = true; }
     }
     if (a.durationMs > 0 || a.opsCount > 0) {
         ImGui::SameLine(0, 8 * sc);
@@ -4642,7 +4705,19 @@ static void drawActionCard(ActivityItem& a, AgentStep* step, const ui::Fonts& fo
     else if (step && !step->notes.empty()) dimText(step->notes.c_str());
 
     // ---- expandable drawer ----
-    if (a.expanded && hasDrawer) {
+    if (open && hasDrawer) {
+        if (!altLines.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+            ImGui::TextUnformatted("Alternatives");
+            ImGui::PopStyleColor();
+            for (const auto& al : altLines) {
+                ImGui::Bullet();
+                ImGui::SameLine(0, 4 * sc);
+                ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+                ImGui::TextUnformatted(al.c_str());
+                ImGui::PopStyleColor();
+            }
+        }
         if (step) {
             if (!step->thinking.empty())
                 drawProseBox("##actthink", step->thinking, ui::metrics::copilotProseMaxH());
@@ -4732,7 +4807,8 @@ static void drawContextChip(const ActivityItem& a, const ui::Fonts& fonts) {
 // the user pinned it open (userToggled). `showThinking` off -> a single dim one-liner.
 // stream:out classified as ops JSON ("Building ops…") always shows a one-line summary by default;
 // raw JSON lives only inside the expander (never expanded-by-default mid-stream).
-static void drawThoughtBox(ActivityItem& a, const ui::Fonts& fonts, bool showThinking) {
+static void drawThoughtBox(ActivityItem& a, const ui::Fonts& fonts, bool showThinking,
+                           bool turnRunning = false) {
     const float sc = ui::uiScale;
     const ui::AdaptiveSurface& surf = chatSurf();
     ImGui::Dummy(ImVec2(0, 2 * sc));
@@ -4747,8 +4823,9 @@ static void drawThoughtBox(ActivityItem& a, const ui::Fonts& fonts, bool showThi
         return;
     }
     // Ops JSON: only open when the user expanded it (never force-open while streaming).
-    // Thinking / prose Output: open while streaming OR user-expanded.
-    const bool open = isOpsJson ? a.expanded : (a.expanded || a.streaming);
+    // Thinking: open while streaming OR turn running OR user-expanded.
+    const bool open = isOpsJson ? a.expanded
+                                : (a.expanded || a.streaming || (turnRunning && !isOutput));
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
     ImGui::BeginChild("##thoughtbox", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
@@ -5193,7 +5270,8 @@ static void drawCorpMutedLine(const ActivityItem& a, const ui::Fonts& fonts) {
 // Typed /2 transparency rows (M12-M14) dispatch by rowKind first, at their arrival position.
 // Routing / classification card — distinct glass card at the top of the activity timeline.
 // rowKind 10; title=task_class, reason=reason, detail=JSON of optional picked_model/etc.
-static void drawClassificationCard(const ActivityItem& a, const ui::Fonts& fonts) {
+static void drawClassificationCard(ActivityItem& a, const ui::Fonts& fonts,
+                                   bool turnRunning = false) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
     const ui::AdaptiveSurface& surf = chatSurf();
@@ -5218,8 +5296,8 @@ static void drawClassificationCard(const ActivityItem& a, const ui::Fonts& fonts
     ImGui::TextUnformatted(a.title.empty() ? "task" : a.title.c_str());
     ImGui::PopStyleColor();
 
-    // Optional fields from packed detail JSON (classification + complexity + task_route merge).
     std::string model, provider, scaffold, tier, structure, domain;
+    std::vector<std::string> alts;
     if (!a.detail.empty()) {
         try {
             auto j = nlohmann::json::parse(a.detail);
@@ -5245,9 +5323,36 @@ static void drawClassificationCard(const ActivityItem& a, const ui::Fonts& fonts
                     structure = j["structure"].get<std::string>();
                 if (j.contains("domain") && j["domain"].is_string())
                     domain = j["domain"].get<std::string>();
+                auto pullAlts = [&](const char* key) {
+                    if (!j.contains(key) || !j[key].is_array()) return;
+                    for (const auto& it : j[key]) {
+                        if (it.is_string()) alts.push_back(it.get<std::string>());
+                        else if (it.is_object()) {
+                            std::string tc;
+                            if (it.contains("task_class") && it["task_class"].is_string())
+                                tc = it["task_class"].get<std::string>();
+                            else if (it.contains("class") && it["class"].is_string())
+                                tc = it["class"].get<std::string>();
+                            else if (it.contains("name") && it["name"].is_string())
+                                tc = it["name"].get<std::string>();
+                            if (!tc.empty()) alts.push_back(std::move(tc));
+                        }
+                    }
+                };
+                pullAlts("alternatives");
+                pullAlts("alt_classes");
+                pullAlts("candidates");
             }
         } catch (...) {}
     }
+    static const char* kFallbackClasses[] = {
+        "simple_part", "multi_feature_part", "assembly", "enclosure",
+        "cam_program", "modification", "analysis", "unknown"
+    };
+    if (alts.empty()) {
+        for (const char* c : kFallbackClasses) alts.push_back(c);
+    }
+
     if (!model.empty() || !provider.empty()) {
         std::string line;
         if (!provider.empty() && !model.empty()) line = provider + " \xc2\xb7 " + shortModelName(model);
@@ -5272,13 +5377,39 @@ static void drawClassificationCard(const ActivityItem& a, const ui::Fonts& fonts
         ImGui::TextUnformatted(meta.c_str());
         ImGui::PopStyleColor();
     }
-    // If title is task_class but domain differs, show domain as a secondary chip line.
     if (!domain.empty() && domain != a.title) {
         ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
         ImGui::TextUnformatted(("domain " + domain).c_str());
         ImGui::PopStyleColor();
     }
     if (!a.reason.empty()) dimText(a.reason.c_str());
+
+    const bool forceOpen = turnRunning && !a.userToggled;
+    if (forceOpen) a.expanded = true;
+    const bool open = a.expanded || forceOpen;
+    ImGui::SameLine(0, 8 * sc);
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+    ImGui::TextUnformatted(open ? "(hide alts)" : "(alts)");
+    ImGui::PopStyleColor();
+    if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+    if (ImGui::IsItemClicked()) { a.expanded = !open; a.userToggled = true; }
+    if (open && !alts.empty()) {
+        const std::string chosen = a.title;
+        for (const auto& alt : alts) {
+            const bool isChosen = (!chosen.empty() && alt == chosen);
+            ImGui::Bullet();
+            ImGui::SameLine(0, 4 * sc);
+            if (isChosen) {
+                ImGui::PushStyleColor(ImGuiCol_Text, semanticOnGlass(pal.accent, surf));
+                ImGui::Text("%s  \xe2\x9c\x93", alt.c_str());
+                ImGui::PopStyleColor();
+            } else {
+                ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+                ImGui::TextUnformatted(alt.c_str());
+                ImGui::PopStyleColor();
+            }
+        }
+    }
 
     ImGui::EndChild();
     ImRect cardRect = endGlassBubble(gb);
@@ -5737,6 +5868,7 @@ static void drawSubRunCard(const ActivityItem& a, const ui::Fonts& fonts) {
 
 static void drawAgentTimeline(ChatMsg& m, const ui::Fonts& fonts, float logW, bool showThinking) {
     if (m.activity.empty()) return;
+    const bool turnRunning = m.running;
     ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
     for (size_t i = 0; i < m.activity.size(); ++i) {
         ActivityItem& a = m.activity[i];
@@ -5747,11 +5879,11 @@ static void drawAgentTimeline(ChatMsg& m, const ui::Fonts& fonts, float logW, bo
         if (a.rowKind == 1) {
             drawContextChip(a, fonts);
         } else if (a.rowKind == 2) {
-            drawThoughtBox(a, fonts, showThinking);
+            drawThoughtBox(a, fonts, showThinking, turnRunning);
         } else if (a.rowKind == 3) {
             drawToolCallRow(a, fonts);
         } else if (a.rowKind == 10) {
-            drawClassificationCard(a, fonts);
+            drawClassificationCard(a, fonts, turnRunning);
         } else if (a.rowKind == 4) {
             drawCorpOrgCard(a, fonts);
         } else if (a.rowKind == 5) {
@@ -5782,9 +5914,9 @@ static void drawAgentTimeline(ChatMsg& m, const ui::Fonts& fonts, float logW, bo
                 const std::string& s = m.activity[j].status;
                 if (s == "pass" || s == "done" || s == "fail" || s == "retry") { laterDone = true; break; }
             }
-            drawThinkingBlock(a, fonts, showThinking, laterDone);
+            drawThinkingBlock(a, fonts, showThinking, laterDone, turnRunning);
         } else {
-            drawActionCard(a, nullptr, fonts, logW);
+            drawActionCard(a, nullptr, fonts, logW, turnRunning);
         }
         ImGui::PopID();
     }
@@ -6739,22 +6871,27 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
     // Author label tight above the turn content (mirrors the You-row tight gap). Prefer the
     // model stamped on the turn at run start; only fall back to the live picker for an
     // in-flight turn that somehow has no stamp. Show the model name alone (no "Assistant :"
-    // prefix / vertical separator). Old sessions with empty model → "Assistant".
+    // prefix / vertical separator). No model → omit label (never bare "Assistant").
     {
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
                             ImVec2(ImGui::GetStyle().ItemSpacing.x, 0.0f));
-        std::string label = "Assistant";
         const char* mid = nullptr;
         if (!m.model.empty()) mid = m.model.c_str();
         else if (m.running && st.settings.model[0]) mid = st.settings.model;
-        if (mid && mid[0]) label = shortModelName(mid);
-        ImGui::PushFont(fonts.medium);
-        ImGui::TextColored(turnSurf.textSecondary, "%s", label.c_str());
-        ImGui::PopFont();
+        const bool haveModel = mid && mid[0];
+        if (haveModel) {
+            const std::string label = shortModelName(mid);
+            ImGui::PushFont(fonts.medium);
+            ImGui::TextColored(turnSurf.textSecondary, "%s", label.c_str());
+            ImGui::PopFont();
+        }
         // Subtle restore affordance on mutating turns (hover / inline confirm — no modal).
-        if (msgIdx >= 0 && turnNum > 0 && chatMsgMutatedDoc(m))
+        if (msgIdx >= 0 && turnNum > 0 && chatMsgMutatedDoc(m)) {
+            if (haveModel) ImGui::SameLine(0, 8 * sc);
             drawAiVcTurnRestore(st, msgIdx, turnNum);
-        ImGui::Dummy(ImVec2(0, 2.5f * sc));
+        }
+        if (haveModel || (msgIdx >= 0 && turnNum > 0 && chatMsgMutatedDoc(m)))
+            ImGui::Dummy(ImVec2(0, 2.5f * sc));
         ImGui::PopStyleVar();
     }
 
@@ -7693,14 +7830,100 @@ static std::string promptDraftKey(AppState& st) {
     return key;
 }
 
-static void savePromptDraft(AppState& st, bool force = false) {
+static nlohmann::json serializePendingContextRefs(const AppState& st) {
+    nlohmann::json refs = nlohmann::json::array();
+    for (const auto& r : st.pendingContextRefs) {
+        nlohmann::json o = {
+            {"kind", r.kind},
+            {"id", r.id},
+            {"label", r.label},
+        };
+        // Prefer snake_case on disk; keep docId if set.
+        if (!r.docId.empty()) o["doc_id"] = r.docId;
+        refs.push_back(std::move(o));
+    }
+    return refs;
+}
+
+// Snapshot the composer (text + attachment paths + context refs) for prompt_drafts.json.
+static nlohmann::json promptDraftObject(const AppState& st) {
+    nlohmann::json o = nlohmann::json::object();
     const char* p = st.prompt.data() ? st.prompt.data() : "";
+    o["text"] = p;
+    o["attachments"] = st.pendingAttachments;
+    o["context_refs"] = serializePendingContextRefs(st);
+    return o;
+}
+
+static bool promptDraftIsEmpty(const nlohmann::json& o) {
+    if (!o.is_object()) return true;
+    const std::string text = o.value("text", std::string());
+    if (!text.empty()) return false;
+    if (o.contains("attachments") && o["attachments"].is_array() && !o["attachments"].empty())
+        return false;
+    if (o.contains("context_refs") && o["context_refs"].is_array() && !o["context_refs"].empty())
+        return false;
+    return true;
+}
+
+// Stable fingerprint for debounce (text + paths + ref ids).
+static std::string promptDraftFingerprint(const AppState& st) {
+    return promptDraftObject(st).dump();
+}
+
+static void applyPromptDraftObject(AppState& st, const nlohmann::json& d) {
+    std::string text;
+    if (d.is_string()) {
+        text = d.get<std::string>();
+    } else if (d.is_object()) {
+        text = d.value("text", std::string());
+    } else {
+        return;
+    }
+    if (st.prompt.size() < text.size() + 1) st.prompt.resize(text.size() + 64, 0);
+    std::memset(st.prompt.data(), 0, st.prompt.size());
+    const size_t n = std::min(text.size(), st.prompt.size() - 1);
+    if (n) std::memcpy(st.prompt.data(), text.data(), n);
+    st.prompt[n] = 0;
+
+    st.pendingAttachments.clear();
+    st.pendingContextRefs.clear();
+    if (!d.is_object()) return;
+
+    if (d.contains("attachments") && d["attachments"].is_array()) {
+        for (const auto& a : d["attachments"]) {
+            if (!a.is_string()) continue;
+            std::string path = a.get<std::string>();
+            if (path.empty()) continue;
+            if (std::find(st.pendingAttachments.begin(), st.pendingAttachments.end(), path) ==
+                st.pendingAttachments.end())
+                st.pendingAttachments.push_back(std::move(path));
+        }
+    }
+    if (d.contains("context_refs") && d["context_refs"].is_array()) {
+        for (const auto& r : d["context_refs"]) {
+            if (!r.is_object()) continue;
+            AppState::ContextRef ref;
+            ref.kind = r.value("kind", std::string());
+            ref.id = r.value("id", std::string());
+            ref.label = r.value("label", std::string());
+            if (r.contains("doc_id") && r["doc_id"].is_string())
+                ref.docId = r["doc_id"].get<std::string>();
+            else if (r.contains("docId") && r["docId"].is_string())
+                ref.docId = r["docId"].get<std::string>();
+            if (ref.id.empty() && ref.kind.empty() && ref.label.empty()) continue;
+            st.pendingContextRefs.push_back(std::move(ref));
+        }
+    }
+}
+
+static void savePromptDraft(AppState& st, bool force = false) {
     // Per-key debounce so switching conversations never confuses last-write state.
     static std::string s_lastKey;
     static std::string s_lastSaved;
     static double s_lastWrite = -1e9;
     const std::string key = promptDraftKey(st);
-    const std::string cur = p;
+    const std::string cur = promptDraftFingerprint(st);
     const double now = ImGui::GetTime();
     if (!force) {
         if (key == s_lastKey && cur == s_lastSaved) return;
@@ -7720,9 +7943,9 @@ static void savePromptDraft(AppState& st, bool force = false) {
             }
         }
         if (!root.is_object()) root = nlohmann::json::object();
-        const std::string key = promptDraftKey(st);
-        if (cur.empty()) root.erase(key);
-        else root[key] = cur;
+        const nlohmann::json draft = promptDraftObject(st);
+        if (promptDraftIsEmpty(draft)) root.erase(key);
+        else root[key] = draft;
         fs::create_directories(appdataAppDir());
         const std::string tmp = path + ".tmp";
         {
@@ -7765,13 +7988,16 @@ static void clearPromptDraft(AppState& st) {
             fs::remove(path, ec);
             fs::rename(tmp, path, ec);
         }
+        // Reset debounce fingerprint so a subsequent empty composer doesn't rewrite.
     } catch (...) {
     }
 }
 
 static void restorePromptDraft(AppState& st) {
-    // Don't clobber a non-empty composer (user already typing).
+    // Don't clobber a non-empty composer (user already typing) — session switch clears first.
     if (st.prompt.data() && st.prompt.data()[0] != '\0') return;
+    // Also skip if chips already present (e.g. mid-frame attach) unless both empty.
+    if (!st.pendingAttachments.empty() || !st.pendingContextRefs.empty()) return;
     try {
         std::ifstream in(promptDraftsPath());
         if (!in) return;
@@ -7779,14 +8005,17 @@ static void restorePromptDraft(AppState& st) {
         in >> root;
         if (!root.is_object()) return;
         auto it = root.find(promptDraftKey(st));
-        if (it == root.end() || !it->is_string()) return;
-        const std::string d = it->get<std::string>();
-        if (d.empty()) return;
-        if (st.prompt.size() < d.size() + 1) st.prompt.resize(d.size() + 64, 0);
-        std::memset(st.prompt.data(), 0, st.prompt.size());
-        const size_t n = std::min(d.size(), st.prompt.size() - 1);
-        std::memcpy(st.prompt.data(), d.data(), n);
-        st.prompt[n] = 0;
+        if (it == root.end()) return;
+        // Backward compatible: plain string = text-only draft.
+        if (it->is_string()) {
+            const std::string d = it->get<std::string>();
+            if (d.empty()) return;
+            applyPromptDraftObject(st, *it);
+            return;
+        }
+        if (!it->is_object()) return;
+        if (promptDraftIsEmpty(*it)) return;
+        applyPromptDraftObject(st, *it);
     } catch (...) {
     }
 }
@@ -7916,9 +8145,26 @@ void persistChatHistory(AppState& st) {
             if (!m.fromUser && !m.activity.empty()) {
                 nlohmann::json act = nlohmann::json::array();
                 const int nAct = (int)m.activity.size();
-                const int start = (nAct > 40) ? (nAct - 40) : 0;
-                for (int ai = start; ai < nAct; ++ai) {
-                    const auto& a = m.activity[ai];
+                // Keep all thought/tool/routing rows (rk 2/3/10) + last N stage rows so
+                // mid-turn kill/restart still has planning + tools visible.
+                std::vector<int> keepIdx;
+                keepIdx.reserve((size_t)nAct);
+                int stagesKept = 0;
+                const int kMaxStages = 80;
+                for (int ai = nAct - 1; ai >= 0; --ai) {
+                    const auto& a = m.activity[(size_t)ai];
+                    const bool priority = (a.rowKind == 2 || a.rowKind == 3 || a.rowKind == 10 ||
+                                           a.rowKind == 1 || a.stage == "__stop_meta__");
+                    if (priority) {
+                        keepIdx.push_back(ai);
+                    } else if (stagesKept < kMaxStages) {
+                        keepIdx.push_back(ai);
+                        ++stagesKept;
+                    }
+                }
+                std::sort(keepIdx.begin(), keepIdx.end());
+                for (int ai : keepIdx) {
+                    const auto& a = m.activity[(size_t)ai];
                     nlohmann::json row = {
                         {"rk", a.rowKind},
                         {"stage", a.stage},
@@ -7927,7 +8173,10 @@ void persistChatHistory(AppState& st) {
                         {"reason", a.reason},
                     };
                     std::string det = a.detail;
-                    if (det.size() > 500) det = det.substr(0, 499) + "\xe2\x80\xa6";
+                    const bool isOps = (a.stage == "stream:out" && a.opsCount > 0) ||
+                                       (a.title.find("Building ops") != std::string::npos);
+                    const size_t cap = isOps ? 2000u : 8000u;
+                    if (det.size() > cap) det = det.substr(0, cap - 1) + "\xe2\x80\xa6";
                     if (!det.empty()) row["detail"] = det;
                     act.push_back(std::move(row));
                 }
@@ -8004,6 +8253,17 @@ void persistChatHistory(AppState& st) {
     } catch (...) {
     }
 }
+
+// Debounced flush while a turn is running (min 1.0s). Force bypasses the timer.
+static void maybePersistChatHistoryDebounced(AppState& st, bool force) {
+    if (!force && !s_chatHistoryDirty.load(std::memory_order_relaxed)) return;
+    const double now = ImGui::GetTime();
+    if (!force && (now - s_chatHistoryLastPersist) < 1.0) return;
+    s_chatHistoryDirty.store(false, std::memory_order_relaxed);
+    s_chatHistoryLastPersist = now;
+    persistChatHistory(st);
+}
+
 
 // Drop one or more orphaned doc keys from chat_history.json (Other sessions cleanup).
 // Load-modify-write with the same atomic tmp+rename path as persistChatHistory.
@@ -8317,7 +8577,7 @@ static void wasmApplySharedChatPending(AppState& st) {
     if (!local.is_object()) local = nlohmann::json::object();
 
     const std::string curKey = st.chatDocKey;
-    const bool hadCur = !curKey.empty() && local.contains(curKey) && local[curKey].is_object();
+    const bool hadCur = __omp_shell("curKey.empty() && local.contains(curKey) && local[curKey].is_object();")
     const std::string prevDump = hadCur ? local[curKey].dump() : std::string();
 
     bool dirty = false;
@@ -8391,8 +8651,20 @@ static void syncChatToDoc(AppState& st) {
         persistChatHistory(st);
 }
 
+static void clearComposerState(AppState& st) {
+    if (st.prompt.data() && !st.prompt.empty()) {
+        std::memset(st.prompt.data(), 0, st.prompt.size());
+        st.prompt[0] = 0;
+    }
+    st.pendingAttachments.clear();
+    st.pendingContextRefs.clear();
+    st.contextPickActive = false;
+}
+
 static void parkActiveConversation(AppState& st) {
     if (st.activeConv < 0 || st.activeConv >= (int)st.conversations.size()) return;
+    // Keep in-progress prompt + chips for this session on disk before parking.
+    savePromptDraft(st, /*force=*/true);
     Conversation& c = st.conversations[st.activeConv];
     c.msgs = std::move(st.chat);
     c.lastContextTokens = st.lastContextTokens;
@@ -8410,6 +8682,9 @@ static void restoreActiveConversation(AppState& st) {
     st.queuedPrompts = std::move(c.queuedPrompts);
     c.msgs.clear();
     c.queuedPrompts.clear();
+    // Composer is session-scoped: wipe then restore this session's draft.
+    clearComposerState(st);
+    restorePromptDraft(st);
 }
 
 static bool conversationRunning(const Conversation& c) {
@@ -8427,22 +8702,25 @@ static bool activeConversationRunning(AppState& st) {
 
 static void newConversation(AppState& st) {
     ensureConversations(st);
-    parkActiveConversation(st);
+    parkActiveConversation(st);  // force-saves old draft
     Conversation c;
     c.id = newConvId(st);
     c.title = "Chat " + std::to_string((int)st.conversations.size() + 1);
     st.conversations.push_back(std::move(c));
     st.activeConv = (int)st.conversations.size() - 1;
     st.showSessionsPicker = false;
+    clearComposerState(st);
+    clearPromptDraft(st);  // new empty session has no draft
     persistChatHistory(st);
 }
 
 static void switchConversation(AppState& st, int idx) {
     if (idx == st.activeConv || idx < 0 || idx >= (int)st.conversations.size()) return;
-    parkActiveConversation(st);
+    parkActiveConversation(st);  // force-saves draft + parks chat (incl. running msgs)
     st.activeConv = idx;
-    restoreActiveConversation(st);
+    restoreActiveConversation(st);  // restores chat + draft for target
     st.showSessionsPicker = false;
+    // Force disk so both sessions' msgs + drafts survive kill mid-switch.
     persistChatHistory(st);
 }
 
@@ -8450,12 +8728,49 @@ static void closeConversation(AppState& st, int idx) {
     if (idx < 0 || idx >= (int)st.conversations.size()) return;
     bool closingActive = (idx == st.activeConv);
     if (closingActive) {
+        // Persist leaving session's draft before wiping composer.
+        savePromptDraft(st, /*force=*/true);
         freeChatTextures(st.chat);
         st.chat.clear();
         st.lastContextTokens = 0;
         st.queuedPrompts.clear();
+        clearComposerState(st);
     } else {
         freeChatTextures(st.conversations[idx].msgs);
+    }
+    // Drop draft key for the closed conversation.
+    {
+        const std::string closedId = st.conversations[idx].id;
+        try {
+            namespace fs = std::filesystem;
+            const std::string path = promptDraftsPath();
+            nlohmann::json root = nlohmann::json::object();
+            {
+                std::ifstream in(path);
+                if (in) {
+                    try { in >> root; } catch (...) { root = nlohmann::json::object(); }
+                }
+            }
+            if (root.is_object()) {
+                std::string key = st.chatDocKey.empty() ? convDocKey(st) : st.chatDocKey;
+                key += "/";
+                key += closedId;
+                if (root.erase(key) > 0) {
+                    const std::string tmp = path + ".tmp";
+                    {
+                        std::ofstream out(tmp);
+                        if (out) out << root.dump(1);
+                    }
+                    std::error_code ec;
+                    fs::rename(tmp, path, ec);
+                    if (ec) {
+                        fs::remove(path, ec);
+                        fs::rename(tmp, path, ec);
+                    }
+                }
+            }
+        } catch (...) {
+        }
     }
     st.conversations.erase(st.conversations.begin() + idx);
     if (st.conversations.empty()) {
@@ -11419,8 +11734,10 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
                 std::string p = openFileDialog("All files (*.*)\0*.*\0");
                 if (!p.empty() &&
                     std::find(st.pendingAttachments.begin(), st.pendingAttachments.end(),
-                              p) == st.pendingAttachments.end())
+                              p) == st.pendingAttachments.end()) {
                     st.pendingAttachments.push_back(p);
+                    savePromptDraft(st, /*force=*/true);
+                }
             }
         }
         if (ImGui::IsItemHovered())
@@ -11602,12 +11919,18 @@ struct AgentControlChannel {
                 nlohmann::json r;
                 std::string e;
                 if (job.steer.empty()) {
-                    s->worker.callAgentCancel(job.runId, r, e);
-                    if (!e.empty())
-                        s->addLog(std::string("[..] agent_cancel: ") + e);
-                    else
-                        s->addLog("[..] agent_cancel ok cancelled=" +
-                                  std::string(r.value("cancelled", false) ? "true" : "false"));
+                    try {
+                        s->worker.callAgentCancel(job.runId, r, e);
+                        if (!e.empty())
+                            s->addLog(std::string("[..] agent_cancel: ") + e);
+                        else
+                            s->addLog("[..] agent_cancel ok cancelled=" +
+                                      std::string(r.value("cancelled", false) ? "true" : "false"));
+                    } catch (const std::exception& ex) {
+                        s->addLog(std::string("[..] agent_cancel exception: ") + ex.what());
+                    } catch (...) {
+                        s->addLog("[..] agent_cancel exception");
+                    }
                 } else {
                     s->worker.callAgentSteer(job.runId, job.steer, r, e);
                     if (!e.empty()) {
@@ -11650,8 +11973,13 @@ static void requestStopRun(AppState& st) {
     // behind the worker mutex / daemon socket (callAgentCancel bypasses callMtx_ / uses a
     // side socket) — and never create a thread per click (WASM pthread-pool exhaustion
     // blocked thread creation on the main thread = frozen page).
-    if (!runId.empty() && st.workerStarted)
-        agentControlDispatch(st, runId, /*steer=*/"");
+    if (!runId.empty() && st.workerStarted) {
+        try {
+            agentControlDispatch(st, runId, /*steer=*/"");
+        } catch (...) {
+            st.addLog("[..] agent_cancel dispatch failed");
+        }
+    }
     // Only a job-based run produces a result the drain must discard. Async ask/sim runs land via
     // their own callbacks, which look for a *running* message — clearing it below makes them no-op.
     if (st.job.running.load() || st.job.ready.load()) st.stopRequested = true;
@@ -11667,7 +11995,7 @@ static void requestStopRun(AppState& st) {
             for (auto& a : it->activity) {
                 if (a.rowKind == 2 && (a.streaming || a.status == "running" || a.status.empty()))
                     finalizeThoughtBox(a);
-                else if (a.status == "running" || a.status.empty()) {
+                else if (a.streaming || a.status == "running" || a.status.empty()) {
                     a.status = "done";
                     a.streaming = false;
                 }
@@ -11678,9 +12006,15 @@ static void requestStopRun(AppState& st) {
                 it->text += "\n\n(Stopped by you.)";
             break;
         }
+    // Never leave a running bubble after stop.
+    for (auto& m : st.chat)
+        if (!m.fromUser && m.running) m.running = false;
     st.status = "Stopped.";
     st.statusKind = 1;
     st.addLog("[..] stop requested by user");
+    markChatHistoryDirty();
+    s_chatHistoryLastPersist = -1e9;
+    maybePersistChatHistoryDebounced(st, /*force=*/true);
 }
 
 // The send/stop control, drawn INSIDE the message input box at its bottom-right (flagship
@@ -11868,6 +12202,7 @@ static void drawComposer(AppState& st, bool busy, bool canRun) {
                                   st.pendingAttachments[ai].c_str());
             if (removed) {
                 st.pendingAttachments.erase(st.pendingAttachments.begin() + ai);
+                savePromptDraft(st, /*force=*/true);
                 ImGui::PopID();
                 break;
             }
@@ -11901,6 +12236,7 @@ static void drawComposer(AppState& st, bool busy, bool canRun) {
                                   ref.label.empty() ? ref.id.c_str() : ref.label.c_str());
             if (removed) {
                 st.pendingContextRefs.erase(st.pendingContextRefs.begin() + ci);
+                savePromptDraft(st, /*force=*/true);
                 ImGui::PopID();
                 break;
             }
@@ -12208,6 +12544,7 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
     // run BEFORE the header/composer touch st.conversations, so the seeded/persisted chat is
     // adopted rather than cleared.
     syncChatToDoc(st);
+    maybePersistChatHistoryDebounced(st, /*force=*/false);
 
     // T-G17 screenshot hook: AI_CAD_COPILOT_VIEW forces a Copilot sub-view (and tops up a couple of
     // demo sessions) so the sessions/settings layouts can be captured headless in both themes. Runs
@@ -12332,6 +12669,7 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
 
 void chatWorkspaceSync(AppState& st) {
     syncChatToDoc(st);
+    maybePersistChatHistoryDebounced(st, /*force=*/false);
     ensureConversations(st);
 }
 

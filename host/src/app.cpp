@@ -2182,6 +2182,11 @@ WASM_BOOT_LOG("[wasm-boot] loadIcons done\n");
             err.find("WASM: worker pipe") != std::string::npos)
             return;
 #endif
+        // Stop/steer when hostd is already down is a quiet local finalize — log only, no red Error toast.
+        if (method == "agent_cancel" || method == "agent_steer") {
+            st.addLog("[worker] " + method + ": " + err);
+            return;
+        }
         st.toast(ui::ToastLevel::Error, "Worker error (" + method + "): " + err);
     });
     st.docMirror.setStaleResyncCallback([&st]() {
@@ -2234,13 +2239,7 @@ WASM_BOOT_LOG("[wasm-boot] loadIcons done\n");
     // clean empty-doc state: origin planes + triad, like a fresh SolidWorks part.
 
     std::strncpy(st.code.data(), kStarterCode, st.code.size() - 1);
-    std::strncpy(st.prompt.data(), "a knurled hex standoff, 22mm tall, M3 clearance bore", st.prompt.size() - 1);
-    {
-        ChatMsg w;
-        w.text = "Hi! Describe a part and I'll model it, show my work as I go, and check the "
-                 "result - then keep refining it with you. Set your AI provider in Settings first.";
-        st.chat.push_back(w);
-    }
+    // Composer starts empty; placeholder lives in legacy_chat. No welcome Assistant seed bubble.
 
     const char* shotMode = std::getenv("AI_CAD_SHOT");  // screenshot-only: settings|chat|assembly|plan|ribbon|pmform
     st.wantSettings = shot && shotMode && std::strcmp(shotMode, "settings") == 0;

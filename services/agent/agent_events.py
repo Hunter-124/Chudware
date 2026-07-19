@@ -299,6 +299,7 @@ def classification_event(
     request_snippet: str = "",
     picked_model: str | None = None,
     picked_provider: str | None = None,
+    alternatives: list | None = None,
     span_id: str | None = None,
     parent_id: str | None = None,
     actor: str | None = None,
@@ -308,6 +309,7 @@ def classification_event(
     Mirrors ``workflow_router.RouterResult``. Emitted ONCE at request entry,
     BEFORE dispatch/routing, so the GUI can show a Routing card while work starts.
     Optional ``picked_model`` / ``picked_provider`` only when already resolved.
+    Optional ``alternatives`` lists other plausible task classes (excl. chosen).
     """
     payload = _linkage(node_id, span_id=span_id or new_span_id(),
                        parent_id=parent_id, actor=actor)
@@ -329,6 +331,24 @@ def classification_event(
         payload["picked_model"] = str(picked_model)
     if picked_provider:
         payload["picked_provider"] = str(picked_provider)
+    if alternatives is not None:
+        # Normalize to list[dict] with string fields for the Routing card.
+        norm: list[dict] = []
+        for item in list(alternatives):
+            if isinstance(item, dict):
+                tc = _val(item.get("task_class", item.get("class", "")))
+                if not tc:
+                    continue
+                entry: dict[str, Any] = {"task_class": tc}
+                rs = item.get("reason")
+                if rs is not None and str(rs):
+                    entry["reason"] = _cap(str(rs), 160)
+                norm.append(entry)
+            else:
+                tc = _val(item)
+                if tc:
+                    norm.append({"task_class": tc})
+        payload["alternatives"] = norm
     return "agent.classification", payload
 
 

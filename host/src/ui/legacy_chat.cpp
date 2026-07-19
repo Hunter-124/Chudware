@@ -19,15 +19,19 @@
 // because the Copilot pane is their primary user, and are shared with the other panels via the
 // header.
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cfloat>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cctype>
+#include <deque>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <string>
@@ -960,11 +964,14 @@ PlanState planStateFromPlanInfo(const PlanInfo& plan) {
     for (size_t i = 0; i < plan.parts.size(); ++i) {
         const PlanPart& p = plan.parts[i];
         PlanItem it;
-        it.id = "part:" + std::to_string(i) + ":" + p.name;
+        // Match the C++ plan_state producer (core/agent/events.cpp: id = bare part name,
+        // phase omitted) so multi-writer upsert-by-id REPLACES the C++ items instead of
+        // appending duplicate rows under a second phase (the "I. Tasks" + "II. Parts" bug).
+        it.id = !p.name.empty() ? p.name : ("part:" + std::to_string(i));
         it.title = p.name.empty() ? ("Part " + std::to_string(i + 1)) : p.name;
         it.kind = "part";
-        it.status = "pending";
-        it.phase = "Parts";
+        // Leave status empty (activity heuristic / C++ writer owns live status — a stale
+        // "pending" upsert would clobber in-progress rows) and phase empty (single group).
         std::string desc;
         if (!p.purpose.empty()) desc = p.purpose;
         if (!p.dims.empty()) {
@@ -1097,6 +1104,12 @@ static void planDrawTile(const PlanItem& it, const std::string& status, const ui
     dl->AddText(f, ImGui::GetFontSize(), ImGui::GetCursorScreenPos(), tcol, title);
     dl->PopClipRect();
     ImGui::SetCursorScreenPos(saved);
+
+    // Re-assert the FULL TILE as the last ImGui item: drawStatusGlyph leaves a tiny
+    // Dummy behind, and planDrawTilesRow's SameLine would otherwise lay the next tile
+    // out relative to the glyph (tiles painted on top of each other).
+    ImGui::SetCursorScreenPos(p0);
+    ImGui::Dummy(ImVec2(w, h));
 
     if (hov && !it.desc.empty())
         ImGui::SetTooltip("%s", it.desc.c_str());
@@ -2953,9 +2966,10 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             ni.rowKind = 2;
             ni.stage   = key;
             ni.title   = think ? "Thinking" : "Output";
-            // Thinking AND Output open while streaming; thought auto-collapses on complete
-            // unless userToggled. Output prose stays user-expandable.
-            ni.expanded = true;
+            // Thinking opens while streaming (auto-collapses on complete unless userToggled).
+            // Output stays COLLAPSED: prose streams into the primary bubble (m.text) below,
+            // so the box would be a second copy of the same text (double display).
+            ni.expanded = think;
             if (!think) ni.tokensIn = (int)mTextBefore;  // segment start in m.text
             m.activity.push_back(std::move(ni));
             a = &m.activity.back();
@@ -2967,8 +2981,8 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             a->status    = "running";
             if (!a->userToggled) a->expanded = true;
         } else {
-            // Text channel: append into the Output box always; never dual-render prose
-            // into m.text while streaming (stream expander is the live surface).
+            // Text channel: append into the Output box always (collapsed raw log), AND
+            // stream prose into the primary bubble (m.text) live — see the prose branch below.
             if (!txt.empty()) a->detail += txt;
             a->streaming = true;
             a->status    = "running";
@@ -3005,10 +3019,16 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
                 // Do NOT append this delta (or any further ops JSON) to m.text.
                 m.uiCachedH = -1.0f;
             } else {
-                // Prose: keep ONE surface while streaming — the live stream:out expander.
-                // Do NOT waterfall into m.text (that doubled the reply). On run_finished
-                // we promote a.detail into m.text once for the final bubble.
-                m.uiCachedH = -1.0f;
+                // Prose: stream live into the primary bubble (m.text) — the web-style
+                // instant streaming surface. run_finished's promote-once is guarded by
+                // m.text.empty(), so it never doubles; the ops-classification flip above
+                // strips this segment back out of m.text if the stream turns out to be
+                // ops JSON. The stream:out box keeps accumulating (collapsed) as the
+                // raw-log expander.
+                if (!txt.empty()) {
+                    m.text += txt;
+                    m.uiCachedH = -1.0f;
+                }
             }
         }
     } else if (kind == "agent.tool_call") {                          // M14 — tool call row
@@ -3722,6 +3742,7 @@ static const char* providerWireName(int provider) {
         case ui::PROV_GEMINI:      return "gemini";
         case ui::PROV_XAI:         return "xai";  // saveSettings rewrites to xai-sub when no key
         case ui::PROV_CURSOR:      return "cursor";
+        case ui::PROV_KIMISUB:     return "kimi-sub";
     }
     return "";
 }
@@ -8396,10 +8417,13 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
                 s.vision = cp[0].vision;
             }
         } else if (s.provider == ui::PROV_XAI) {
-            std::strncpy(s.model, "grok-4", sizeof(s.model) - 1);
+            std::strncpy(s.model, "grok-4.5", sizeof(s.model) - 1);
             s.vision = true;
         } else if (s.provider == ui::PROV_CURSOR) {
             std::strncpy(s.model, "composer-2.5", sizeof(s.model) - 1);
+            s.vision = true;
+        } else if (s.provider == ui::PROV_KIMISUB) {
+            std::strncpy(s.model, "kimi-for-coding", sizeof(s.model) - 1);
             s.vision = true;
         }
     }
@@ -8710,6 +8734,22 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
             ImGui::TextUnformatted("Sign in with SuperGrok or paste an API key from console.x.ai");
         ImGui::PopStyleColor();
         if (ImGui::Checkbox("Model supports vision (send screenshots)", &s.vision)) changed = true;
+    } else if (s.provider == ui::PROV_CURSOR || s.provider == ui::PROV_KIMISUB) {
+        // Subscription-only providers: OAuth credential lives in subscription_auth — no API key.
+        if (s.provider == ui::PROV_KIMISUB) {
+            dimText("Kimi Code subscription (OAuth via subscription_auth). Sign in under "
+                    "Accounts; no Moonshot API key required for this path.");
+            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
+            ImGui::TextUnformatted("Wire provider: kimi-sub \xc2\xb7 model: kimi-for-coding");
+            ImGui::PopStyleColor();
+        } else {
+            dimText("Cursor subscription (OAuth via subscription_auth). Sign in under Accounts; "
+                    "no API key field.");
+            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
+            ImGui::TextUnformatted("Wire provider: cursor \xc2\xb7 model: composer-2.5");
+            ImGui::PopStyleColor();
+        }
+        if (ImGui::Checkbox("Model supports vision (send screenshots)", &s.vision)) changed = true;
     } else if (cloud) {
         ImGui::TextUnformatted("API key");
         char* key = providerKeyBuf(s, s.provider);
@@ -8878,9 +8918,9 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
             return st.settings.disabledProviders.count(key) == 0;
         };
 
-        // Built-in cloud providers (Gemini / Anthropic / OpenAI / xAI / Cursor).
+        // Built-in cloud providers (Gemini / Anthropic / OpenAI / xAI / Cursor / Kimi Code).
         for (int pv : {ui::PROV_GEMINI, ui::PROV_ANTHROPIC, ui::PROV_OPENAI, ui::PROV_XAI,
-                       ui::PROV_CURSOR}) {
+                       ui::PROV_CURSOR, ui::PROV_KIMISUB}) {
             std::string key = ui::providerCatKey(pv);
             int n = 0;
             for (const auto& m : ui::builtinModels()) if (m.provider == pv) ++n;
@@ -9087,6 +9127,7 @@ static const char* ovRoleProviderWire(int prov) {
         case ui::PROV_CLOUDCOMPAT: return "openrouter";
         case ui::PROV_XAI:         return "xai";
         case ui::PROV_CURSOR:      return "cursor";
+        case ui::PROV_KIMISUB:     return "kimi-sub";
         default: return "local";
     }
 }
@@ -9099,6 +9140,7 @@ static int ovRoleProviderFromWire(const std::string& w) {
     if (w == "openrouter" || w == "cloud" || w == "cloudcompat" || w == "moonshot") return ui::PROV_CLOUDCOMPAT;
     if (w == "xai" || w == "xai-sub") return ui::PROV_XAI;
     if (w == "cursor") return ui::PROV_CURSOR;
+    if (w == "kimi-sub") return ui::PROV_KIMISUB;
     return -1;
 }
 static bool ovProviderIsLoopback(int prov) {
@@ -9774,6 +9816,9 @@ static void ovApplyProviderDefaults(Settings& s) {
     } else if (s.provider == ui::PROV_CURSOR) {
         std::strncpy(s.model, "composer-2.5", sizeof(s.model) - 1);
         s.vision = true;
+    } else if (s.provider == ui::PROV_KIMISUB) {
+        std::strncpy(s.model, "kimi-for-coding", sizeof(s.model) - 1);
+        s.vision = true;
     }
 }
 
@@ -10161,13 +10206,20 @@ static void drawOvAgentsTab(AppState& st, float S, bool& changed) {
                     if (s.provider != ui::PROV_CLOUDCOMPAT) refreshModelAvailability(st, true);
                 }
             }
-            if (cloud || s.provider == ui::PROV_LOCAL) {
+            if ((cloud || s.provider == ui::PROV_LOCAL) &&
+                s.provider != ui::PROV_CURSOR && s.provider != ui::PROV_KIMISUB) {
                 char* key = providerKeyBuf(s, s.provider);
                 ImGui::SetNextItemWidth(-1);
                 if (ImGui::InputText(s.provider == ui::PROV_LOCAL ? "API key (optional)##ovk"
                                                                  : "API key##ovk",
                                      key, 256, ImGuiInputTextFlags_Password))
                     changed = true;
+            } else if (s.provider == ui::PROV_CURSOR || s.provider == ui::PROV_KIMISUB) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
+                ImGui::TextUnformatted(s.provider == ui::PROV_KIMISUB
+                    ? "Kimi Code uses subscription OAuth (no API key)."
+                    : "Cursor uses subscription OAuth (no API key).");
+                ImGui::PopStyleColor();
             }
         }
 
@@ -11700,6 +11752,7 @@ static const char* providerShort(int provider) {
         case ui::PROV_XAI:       return "xAI";
         case ui::PROV_CLOUDCOMPAT: return "Cloud";
         case ui::PROV_CURSOR:    return "Cursor";
+        case ui::PROV_KIMISUB:   return "kimi code";
     }
     return "";
 }
@@ -11767,6 +11820,7 @@ static bool providerUsable(AppState& st, int provider) {
         case ui::PROV_LOCAL:       return st.providerModels[ui::PROV_LOCAL].ok;
         case ui::PROV_LLAMACPP:    return st.providerModels[ui::PROV_LLAMACPP].ok;
         case ui::PROV_CURSOR:      return s_subConn.cursor;
+        case ui::PROV_KIMISUB:     return s_subConn.kimi;
     }
     return false;
 }
@@ -12982,9 +13036,10 @@ static void drawRuntimeBanner(AppState& st) {
 
 // Build a compact "Provider · model" label for the composer's model chip.
 static void composerModelLabel(const Settings& s, char* out, size_t n) {
-    // Keep in lockstep with ui::ProviderIndex (Anthropic..Cursor).
+    // Keep in lockstep with ui::ProviderIndex (Anthropic..Kimi Code).
     const char* provNames[] = {
-        "Anthropic", "OpenAI", "Local", "llama.cpp", "Gemini", "Cloud API", "xAI", "Cursor"
+        "Anthropic", "OpenAI", "Local", "llama.cpp", "Gemini", "Cloud API", "xAI", "Cursor",
+        "Kimi Code"
     };
     static_assert(sizeof(provNames) / sizeof(provNames[0]) == ui::PROV_COUNT,
                   "composerModelLabel provNames must match PROV_COUNT");
@@ -13285,6 +13340,7 @@ static std::string usageFriendlyProvider(int provider) {
         case ui::PROV_OPENAI:    return "codex";  // ChatGPT/Codex sub
         case ui::PROV_XAI:       return "xai";
         case ui::PROV_CURSOR:    return "cursor";
+        case ui::PROV_KIMISUB:   return "kimi";
         default: return {};
     }
 }
@@ -13740,6 +13796,66 @@ static bool aiTurnActive(AppState& st) {
     return false;
 }
 
+// ---- Agent control channel (cancel / steer) --------------------------------------
+// ONE long-lived worker thread created at LOAD TIME (file-scope static), never a fresh
+// std::thread per click: on Emscripten, thread creation BLOCKS the caller when the
+// pthread pool (PTHREAD_POOL_SIZE=8) is exhausted — during an agent run the pool is
+// busy, so a Stop click that spawned a thread wedged the whole browser page.
+struct AgentControlChannel {
+    struct Job { std::string runId; std::string steer; };  // empty steer = cancel
+    std::mutex mtx;
+    std::condition_variable cv;
+    std::deque<Job> q;
+    std::atomic<AppState*> st{nullptr};
+    AgentControlChannel() {
+        std::thread([this] {
+            for (;;) {
+                Job job;
+                {
+                    std::unique_lock<std::mutex> lk(mtx);
+                    cv.wait(lk, [&] { return !q.empty(); });
+                    job = std::move(q.front());
+                    q.pop_front();
+                }
+                AppState* s = st.load(std::memory_order_acquire);
+                if (!s) continue;
+                nlohmann::json r;
+                std::string e;
+                if (job.steer.empty()) {
+                    s->worker.callAgentCancel(job.runId, r, e);
+                    if (!e.empty())
+                        s->addLog(std::string("[..] agent_cancel: ") + e);
+                    else
+                        s->addLog("[..] agent_cancel ok cancelled=" +
+                                  std::string(r.value("cancelled", false) ? "true" : "false"));
+                } else {
+                    s->worker.callAgentSteer(job.runId, job.steer, r, e);
+                    if (!e.empty()) {
+                        s->addLog(std::string("[..] agent_steer: ") + e);
+                    } else if (!r.value("steered", false)) {
+                        // Run finished between submit and delivery — tell the user their
+                        // text was NOT consumed rather than silently dropping it.
+                        s->addLog("[..] agent_steer: run already finished "
+                                  "(steering not delivered — send again to continue)");
+                    } else {
+                        s->addLog("[..] agent_steer ok (delivered at next step)");
+                    }
+                }
+            }
+        }).detach();
+    }
+};
+static AgentControlChannel g_agentCtl;
+
+static void agentControlDispatch(AppState& st, const std::string& runId, const std::string& steer) {
+    g_agentCtl.st.store(&st, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lk(g_agentCtl.mtx);
+        g_agentCtl.q.push_back({runId, steer});
+    }
+    g_agentCtl.cv.notify_one();
+}
+
 // Stop the in-flight run: fire agent_cancel (hard cooperative cancel — aborts in-flight HTTP
 // via curl xfer + stage boundaries), then soft-finalize the UI so the composer reverts to send
 // immediately. The job drain discards the eventual cancel_result.
@@ -13750,20 +13866,12 @@ static void requestStopRun(AppState& st) {
         std::lock_guard<std::mutex> lk(st.job.mtx);
         runId = st.job.runId;
     }
-    // Fire agent_cancel on a detached thread so we never block the GL thread behind the
-    // worker mutex / daemon socket (callAgentCancel bypasses callMtx_ / uses a side socket).
-    if (!runId.empty() && st.workerStarted) {
-        std::thread([&st, runId]() {
-            nlohmann::json r;
-            std::string e;
-            st.worker.callAgentCancel(runId, r, e);
-            if (!e.empty())
-                st.addLog(std::string("[..] agent_cancel: ") + e);
-            else
-                st.addLog("[..] agent_cancel ok cancelled=" +
-                          std::string(r.value("cancelled", false) ? "true" : "false"));
-        }).detach();
-    }
+    // Fire agent_cancel on the persistent control channel so we never block the GL thread
+    // behind the worker mutex / daemon socket (callAgentCancel bypasses callMtx_ / uses a
+    // side socket) — and never create a thread per click (WASM pthread-pool exhaustion
+    // blocked thread creation on the main thread = frozen page).
+    if (!runId.empty() && st.workerStarted)
+        agentControlDispatch(st, runId, /*steer=*/"");
     // Only a job-based run produces a result the drain must discard. Async ask/sim runs land via
     // their own callbacks, which look for a *running* message — clearing it below makes them no-op.
     if (st.job.running.load() || st.job.ready.load()) st.stopRequested = true;
@@ -14089,10 +14197,28 @@ static void drawComposer(AppState& st, bool busy, bool canRun) {
     if (stopReq) requestStopRun(st);
     if (submit || submitInput) {
         if (active) {
-            // A turn is running — queue the message instead of starting concurrently. It auto-
-            // sends when the assistant frees up (drain at the top of drawComposer).
+            // A turn is running — STEER it mid-run when the engine knows the run_id
+            // (agent_steer: text is folded into the live turn at its next step). Fall
+            // back to next-turn queueing only when no run_id is available (e.g. the
+            // run hasn't announced itself yet). Never both — that would double-send.
             if (st.prompt[0]) {
-                st.queuedPrompts.emplace_back(st.prompt.data());
+                std::string runId;
+                {
+                    std::lock_guard<std::mutex> lk(st.job.mtx);
+                    runId = st.job.runId;
+                }
+                if (!runId.empty() && st.workerStarted) {
+                    agentControlDispatch(st, runId, st.prompt.data());
+                    // Record the steering text in the visible conversation (it otherwise
+                    // only reaches the engine + debug log and vanishes from the composer).
+                    ChatMsg u; u.fromUser = true; u.text = std::string(st.prompt.data());
+                    u.copilotMode = st.aiInteraction;
+                    u.liveStatus = "steering";  // subtle caption under the bubble
+                    st.chat.push_back(std::move(u));
+                } else {
+                    // Auto-sends when the assistant frees up (drain at the top of drawComposer).
+                    st.queuedPrompts.emplace_back(st.prompt.data());
+                }
                 st.prompt[0] = 0;
             }
         } else if (canStart) {

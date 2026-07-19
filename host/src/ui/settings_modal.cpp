@@ -3949,20 +3949,20 @@ settingsGlassSectionBegin("##ai_harness_org", "Harness organization");
                     }
 
 
-                    if (ImGui::BeginTabItem("Skills", nullptr, subFlags(3))) {
+                    if (ImGui::BeginTabItem("Skills", nullptr, subFlags(4))) {
                         // Fill-height editors: pin parent scroll so only the catalog/editor scroll.
                         ImGui::SetScrollY(0.0f);
                         drawSettingsSkillsTab(st, sc);
                         ImGui::EndTabItem();
                     }
 
-                    if (ImGui::BeginTabItem("Context", nullptr, subFlags(4))) {
+                    if (ImGui::BeginTabItem("Context", nullptr, subFlags(5))) {
                         ImGui::SetScrollY(0.0f);
                         drawSettingsContextTab(st, sc);
                         ImGui::EndTabItem();
                     }
 
-                    if (ImGui::BeginTabItem("Benchmarks", nullptr, subFlags(5))) {
+                    if (ImGui::BeginTabItem("Benchmarks", nullptr, subFlags(6))) {
                 // Shared leaderboard board (refreshed by runner / refresh button).
                 static ui::leaderboard::Board s_lb;
                 static bool s_lbLoaded = false;
@@ -3997,7 +3997,7 @@ settingsGlassSectionBegin("##ai_harness_org", "Harness organization");
                                         ImGui::EndTabItem();
                     }
 
-                    if (ImGui::BeginTabItem("Tools", nullptr, subFlags(6))) {
+                    if (ImGui::BeginTabItem("Tools", nullptr, subFlags(7))) {
 
                         settingsGlassSectionBegin("##ai_tools_families", "Tool families");
                         dimText("Enable or disable MCP tool families the agent may call. "
@@ -4080,7 +4080,7 @@ settingsGlassSectionBegin("##ai_harness_org", "Harness organization");
                         ImGui::EndTabItem();
                     }
 
-                    if (ImGui::BeginTabItem("Maintenance", nullptr, subFlags(7))) {
+                    if (ImGui::BeginTabItem("Maintenance", nullptr, subFlags(8))) {
 settingsGlassSectionBegin("##ai_maintenance", "Maintenance");
                 dimText("Repair the local CAD engine runtime, or trim which models appear in the "
                         "composer's model picker.");

@@ -1808,3 +1808,25 @@ with invented params) — validator correctly rejects, but the retry churn costs
 192s single fix-call observed (grok thinking + retries). Pre-existing test_document/
 test_selectors numeric-drift failures unchanged (predate both sessions). Daemon
 shutdown-drain SIGABRT with in-flight provider call still open (deferred).
+
+### Firecrawl key pool — rotating research keys (2026-07-18)
+
+One Firecrawl key throttled (429) or credit-dead (402) mid-research used to end the
+run; Hunter supplied 26 keys and asked for automatic cycling. Added
+`engine_oracle/research/firecrawl_pool.py` (stdlib-only): merges keys from
+`FIRECRAWL_API_KEYS` / `FIRECRAWL_API_KEY` / config.json `keys.firecrawl` (dedup,
+env first), rotates on 429 (honors `Retry-After`), parks 401/402/403 for 24 h,
+brief-cools 5xx/transport, sleeps through all-cooling windows up to
+`FIRECRAWL_POOL_MAX_WAIT_S` (default 180 s) before raising `PoolExhaustedError`, and
+persists cooldowns in a hash-keyed state file next to config.json (flocked RMW) so the
+GUI agent, MCP server, scripts, and the omp CLI share one view. Wired both consumers:
+`research/fetch_page.py` `_http_get` (falls back to httpx extractor on pool exhaust,
+unchanged contract) and `tools/scrape_knowledge.py` (dropped its single-key path).
+`tools/firecrawl_pool.py` CLI (`search`/`scrape`/`keys`) exposes the pool to shells;
+`~/.omp/agent/tools/firecrawl.js` (omp custom tools: `firecrawl_search`,
+`firecrawl_scrape`) lets omp sessions research through the pool; keys merged into
+`~/.local/share/AI-CAD/config.json` `keys.firecrawl` (existing key entries preserved)
+and exported in `~/.bashrc`. Live-verified scrape + search; 18 new pool tests
+(`engine_oracle/research/test_firecrawl_pool.py`, transport-injected, no network),
+195/195 research pytest green. Gotcha: keys state file stores sha256 hashes, never raw
+keys; `pool_status()` masks to `fc-xxx…last4`.

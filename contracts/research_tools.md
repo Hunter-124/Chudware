@@ -226,3 +226,18 @@ The envelope gains one additive field:
   (the common case; behavior byte-identical to before T-X4).
 - Uses `browser_download` (not `browser_fetch`) — a PDF is binary and must not go through
   a rendered-page-content path.
+
+---
+
+## Addendum (2026-07-18): Firecrawl key pool
+
+`engine/research/firecrawl_pool.py` supersedes the single-`FIRECRAWL_API_KEY` behavior
+described above for Firecrawl-backed fetching. Key sources (merged, deduped, env wins):
+`FIRECRAWL_API_KEYS` (separated list), `FIRECRAWL_API_KEY`, config.json
+`keys.firecrawl` (list or separated string). Rotation semantics: 429 → cool the key
+(`Retry-After` honored, else 60 s) and retry the next ready key; 401/402/403 → park
+24 h; 5xx/transport → cool 30 s; all keys cooling → sleep until the soonest recovers,
+capped by `FIRECRAWL_POOL_MAX_WAIT_S` (default 180 s), then degrade to the built-in
+extractor exactly as the no-key case. Cooldown state is shared cross-process via a
+flocked JSON state file beside config.json (keys stored as hashes). Absence of keys
+still degrades to the built-in extractor, never an error.

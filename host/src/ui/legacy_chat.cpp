@@ -7016,19 +7016,18 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     const float gearW = measureBtn("Settings", "settings");
     const float minGap = style.ItemSpacing.x;
     const float rightInset = ui::metrics::U(0.5f);
-    // Mirror FeatureManager collapse chip (layout.cpp): 26dp glass square.
-    // FM parks « at top-RIGHT of the left column; Copilot parks » at top-LEFT of the right column.
-    const float chevSz  = 28.0f * sc;  // +2dp vs FM — needs to read on pale copilot glass
+    // Mirror FeatureManager collapse chip (layout.cpp) — SAME recipe both sides:
+    // 26dp square, wash 0.32/0.50, textPrimary glyph, 1.85px stroke. FM parks « at
+    // top-RIGHT of the left column; Copilot parks » at top-LEFT of the right column.
+    const float chevSz  = 26.0f * sc;
     const float chevPad = 8.0f * sc;
     const float leftInset = chevSz + chevPad;  // content clears the collapse chip
     const float colW = ImGui::GetContentRegionAvail().x;
 
-    // ---- Collapse chip (absolute, top-left) — FM mirror with higher resting contrast ----
-    // Light glass + dim textSecondary washes out on the copilot header; stronger wash,
-    // hairline border, and accent glyph so it matches FM visibility.
+    // ---- Collapse chip (absolute, top-left; cursor restored like FM) ----
     {
         const ImVec2 winP0 = ImGui::GetWindowPos();
-        // Match FM's 8dp inset from the pane top/edge.
+        // 8dp inset on both axes — matches layout.cpp FM chip placement.
         const ImVec2 c0(winP0.x + ImGui::GetWindowContentRegionMin().x,
                         winP0.y + ImGui::GetWindowContentRegionMin().y + 8.0f * sc);
         const ImVec2 savedCur = ImGui::GetCursorScreenPos();
@@ -7037,31 +7036,16 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         const bool cHover = ImGui::IsItemHovered();
         ImDrawList* wdl = ImGui::GetWindowDrawList();
         const ImVec2 c1(c0.x + chevSz, c0.y + chevSz);
-        // Stronger resting wash than FM (0.22) — copilot header is paler glass.
-        ui::glassRowBackground(wdl, c0, c1, 7.0f, false, /*selected=*/cHover,
-                               cHover ? 0.55f : 0.40f);
-        // Hairline border so the chip silhouette reads at a glance.
-        {
-            ImVec4 bcol = cHover
-                ? ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 0.95f)
-                : ImVec4(pal.glassBorder[0], pal.glassBorder[1], pal.glassBorder[2], 0.75f);
-            wdl->AddRect(c0, c1, ImGui::ColorConvertFloat4ToU32(bcol), 7.0f, 0,
-                         ui::metrics::stroke(1.25f));
-        }
-        // Glyph: accent at rest (control affordance), primary on hover. Never dim secondary.
-        ImU32 cCol;
-        if (cHover) {
-            cCol = ImGui::ColorConvertFloat4ToU32(chatSurf().textPrimary);
-        } else {
-            cCol = ImGui::ColorConvertFloat4ToU32(
-                ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1.0f));
-        }
+        ui::glassRowBackground(wdl, c0, c1, 7.0f, false, cHover,
+                               cHover ? 0.50f : 0.32f);
+        // textPrimary at rest (not dim secondary) — shared with FM for even visibility.
+        const ImU32 cCol = ImGui::ColorConvertFloat4ToU32(chatSurf().textPrimary);
         const ImVec2 cc(c0.x + chevSz * 0.5f, c0.y + chevSz * 0.5f);
-        const float ca = 4.0f * sc;      // slightly larger arms than FM (3.5)
-        const float stroke = 2.0f * sc;  // thicker than FM 1.6 — reads on light glass
+        const float ca = 3.5f * sc;
+        const float stroke = 1.85f * sc;
         // "»" double chevron (mirror of FM's "«")
         for (int i = 0; i < 2; ++i) {
-            const float ox = (i == 0 ? -2.6f : 2.6f) * sc;
+            const float ox = (i == 0 ? -2.5f : 2.5f) * sc;
             wdl->AddLine(ImVec2(cc.x + ox - ca * 0.5f, cc.y - ca),
                          ImVec2(cc.x + ox + ca * 0.5f, cc.y), cCol, stroke);
             wdl->AddLine(ImVec2(cc.x + ox + ca * 0.5f, cc.y),

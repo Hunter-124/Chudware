@@ -660,19 +660,20 @@ void drawLeftPane(AppState& st,
         const bool cClicked = ImGui::InvisibleButton("##lp_collapse", ImVec2(cb, cb));
         const bool cHover = ImGui::IsItemHovered();
         ImDrawList* wdl = ImGui::GetWindowDrawList();
-        // Persistent subtle glass chip; brighter on hover.
-        ui::glassRowBackground(wdl, c0, ImVec2(c0.x + cb, c0.y + cb), 7.0f, false, false,
-                               cHover ? 0.42f : 0.22f);
-        const ImU32 cCol =
-            ImGui::ColorConvertFloat4ToU32(cHover ? surf.textPrimary : surf.textSecondary);
+        // Shared collapse-chip recipe (must match Copilot ##cp_collapse):
+        // rest wash 0.32 / hover 0.50, textPrimary glyph, 1.85px stroke.
+        ui::glassRowBackground(wdl, c0, ImVec2(c0.x + cb, c0.y + cb), 7.0f, false, cHover,
+                               cHover ? 0.50f : 0.32f);
+        const ImU32 cCol = ImGui::ColorConvertFloat4ToU32(surf.textPrimary);
         const ImVec2 cc(c0.x + cb * 0.5f, c0.y + cb * 0.5f);
         const float ca = 3.5f * S;
+        const float stroke = 1.85f * S;
         for (int i = 0; i < 2; ++i) {   // "«" double chevron
             const float ox = (i == 0 ? -2.5f : 2.5f) * S;
             wdl->AddLine(ImVec2(cc.x + ox + ca * 0.5f, cc.y - ca),
-                         ImVec2(cc.x + ox - ca * 0.5f, cc.y), cCol, 1.6f * S);
+                         ImVec2(cc.x + ox - ca * 0.5f, cc.y), cCol, stroke);
             wdl->AddLine(ImVec2(cc.x + ox - ca * 0.5f, cc.y),
-                         ImVec2(cc.x + ox + ca * 0.5f, cc.y + ca), cCol, 1.6f * S);
+                         ImVec2(cc.x + ox + ca * 0.5f, cc.y + ca), cCol, stroke);
         }
         if (cHover) ImGui::SetTooltip(s_collapsed ? "Expand" : "Collapse");
         if (cClicked) {

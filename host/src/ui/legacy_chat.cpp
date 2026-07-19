@@ -8577,7 +8577,7 @@ static void wasmApplySharedChatPending(AppState& st) {
     if (!local.is_object()) local = nlohmann::json::object();
 
     const std::string curKey = st.chatDocKey;
-    const bool hadCur = __omp_shell("curKey.empty() && local.contains(curKey) && local[curKey].is_object();")
+    const bool hadCur = !curKey.empty() && local.contains(curKey) && local[curKey].is_object();
     const std::string prevDump = hadCur ? local[curKey].dump() : std::string();
 
     bool dirty = false;
@@ -10216,7 +10216,7 @@ static void drawModelDropdown(AppState& st, bool busy) {
                 // Point base_url back at the local endpoint so the run hits LM Studio, not the cloud
                 // (a local model id sent to the cloud 403s). Preserve an already-loopback base_url so
                 // a custom local port survives.
-                std::string bu = st.settings.baseUrl ? st.settings.baseUrl : "";
+                std::string bu = st.settings.baseUrl;
                 bool loop = bu.find("localhost") != std::string::npos ||
                             bu.find("127.0.0.1") != std::string::npos ||
                             bu.find("0.0.0.0") != std::string::npos ||

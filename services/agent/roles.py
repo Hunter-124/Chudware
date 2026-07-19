@@ -129,20 +129,26 @@ def _prompt_builtin_md_path(role_id: str) -> Path:
 
 
 def resolve_role_system_prompt(role_id: str, yaml_prompt: str) -> str:
-    """Resolution order for the live system prompt text:
+    """Resolution order for the *Python* live path (delegate / load_role):
+
     1. User override  (~/.local/share/AI-CAD/prompts/<id>.md) — Settings → Prompts Save
-    2. Shipped .md    (services/agent/prompts/<id>.md) when present
-    3. YAML card      system_prompt field
+    2. YAML card      system_prompt field (canonical for mission roles)
+    3. Shipped .md    (services/agent/prompts/<id>.md) — fallback when no YAML text
+
+    YAML wins over shipped .md so advisor/model3d handoff contracts stay aligned with
+    roles/*.yaml. C++ agent_run_v2 still reads .md via load_prompt() and never calls this.
     """
     ov = _prompt_override_path(role_id)
     if ov.is_file():
         text = ov.read_text(encoding="utf-8").strip()
         if text:
             return text
+    yaml_text = (yaml_prompt or "").strip()
+    if yaml_text:
+        return yaml_text
     md = _prompt_builtin_md_path(role_id)
     if md.is_file():
         text = md.read_text(encoding="utf-8").strip()
-        # strip HTML comment headers we add for dual-source cards
         lines = text.splitlines()
         while lines and lines[0].strip().startswith("<!--"):
             lines.pop(0)
@@ -151,8 +157,9 @@ def resolve_role_system_prompt(role_id: str, yaml_prompt: str) -> str:
         text = "\n".join(lines).strip()
         if text:
             return text
-    return (yaml_prompt or "").strip()
+    return ""
 
+        text = "\n".join(lines).strip()
 
 def list_editable_prompts() -> list[dict]:
     """Catalog for Settings → AI → Prompts: YAML mission roles + any .md-only core roles.

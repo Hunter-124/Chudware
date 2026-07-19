@@ -57,3 +57,13 @@ def test_memory_role_loads():
     assert c.id == "memory"
     low = c.system_prompt.lower()
     assert "memory" in low or "durable" in low or "historian" in low
+
+
+def test_yaml_beats_shipped_md_for_advisor():
+    """delegate(load_role) must use YAML handoff contract, not prompts/*.md."""
+    import yaml
+    from pathlib import Path
+    from services.agent.roles import load_role
+    y = yaml.safe_load(Path("services/agent/roles/advisor.yaml").read_text())
+    card = load_role("advisor")
+    assert card.system_prompt.strip() == y["system_prompt"].strip()

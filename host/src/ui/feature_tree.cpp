@@ -4212,7 +4212,7 @@ void drawFeatureTreeBody(AppState& st,
             ImGui::Indent(kSecIndent);
 
             // ---- Points folder (origin point + user ref-point/csys features) -----------------
-            // Folder header mirrors Axes (body_folder + DefaultOpen + cascade eye). The origin
+            // Folder header mirrors Axes (body_folder + seed-collapsed + cascade eye). The origin
             // point is a leaf child so selection / PM point-well routing stay on the point row.
             // Future intersection-created point features (type point/datum_point) list here too.
             {
@@ -4230,10 +4230,10 @@ void drawFeatureTreeBody(AppState& st,
                 if (!anyPointShown)
                     ImGui::PushStyleColor(ImGuiCol_Text,
                         ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.85f));
+                fmSeedCollapsed();
                 const bool originFldOpen = ImGui::TreeNodeEx(
                     "Points##ref_points_folder",
-                    ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_SpanFullWidth |
-                    ImGuiTreeNodeFlags_FramePadding);
+                    ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_FramePadding);
                 if (!anyPointShown) ImGui::PopStyleColor();
                 {
                     ImVec2 oFldMin = ImGui::GetItemRectMin();
@@ -4378,7 +4378,7 @@ void drawFeatureTreeBody(AppState& st,
             }
 
             // ---- Planes folder (X/Y, X/Z, Y/Z) ----------------------------------------------
-            // Mirrors the Axes folder: body_folder + DefaultOpen + cascade eye. Per-row eyes,
+            // Mirrors the Axes folder: body_folder + seed-collapsed + cascade eye. Per-row eyes,
             // planeEmphasis selection, and sketch/PM pick routing are unchanged.
             {
                 static const char* kPlanes[] = {"X/Z", "X/Y", "Y/Z"};
@@ -4408,10 +4408,10 @@ void drawFeatureTreeBody(AppState& st,
                 if (!anyPlaneShown)
                     ImGui::PushStyleColor(ImGuiCol_Text,
                         ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.85f));
+                fmSeedCollapsed();
                 const bool planesOpen = ImGui::TreeNodeEx(
                     "Planes##ref_planes_folder",
-                    ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_SpanFullWidth |
-                    ImGuiTreeNodeFlags_FramePadding);
+                    ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_FramePadding);
                 if (!anyPlaneShown) ImGui::PopStyleColor();
                 // Folder cascade eye: any/all shown → hide all; all hidden → show all.
                 {
@@ -4641,17 +4641,17 @@ void drawFeatureTreeBody(AppState& st,
                 if (listedAxes.empty()) { anyAxisShown = false; allAxesShown = false; }
 
                 // Axes folder header — same body_folder + fmRowPill pattern as Planes / Points.
-                // DefaultOpen so X/Y/Z stay one click away. Cascade eye on the header.
+                // Seed-collapsed on first doc display so folder-level cascade eye is primary.
                 FmRowRect axesFldRect = fmRowPill();
                 treeIcon("body_folder", "[F]", 16.0f);
                 ImGui::SameLine(0, 4 * ui::uiScale);
                 if (!anyAxisShown)
                     ImGui::PushStyleColor(ImGuiCol_Text,
                         ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.85f));
+                fmSeedCollapsed();
                 const bool axesOpen = ImGui::TreeNodeEx(
                     "Axes##ref_axes_folder",
-                    ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_SpanFullWidth |
-                    ImGuiTreeNodeFlags_FramePadding);
+                    ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_FramePadding);
                 if (!anyAxisShown) ImGui::PopStyleColor();
                 {
                     ImVec2 aFldMin = ImGui::GetItemRectMin();
@@ -5646,92 +5646,6 @@ void drawFeatureTreeBody(AppState& st,
             s_apprBody.clear();
         }
         popTreePopupGlass();
-    }
-
-    // ---- C41: bottom file strip ----
-    // Compact row: [Save] [Save As...] [Open...] + the current file name (dimmed; "(unsaved)"
-    // until the doc is saved/opened). Buttons size themselves from their labels — no fixed-width
-    // math, so nothing clips off the panel edge (the old strip's Open button did).
-    // AI_CAD_NO_FILE_DIALOGS keeps the old raw-path InputText fallback for headless/CI use.
-    bool canDoc = canDocTree;
-    if (canDoc && (st.docMirror.hasDoc() || !fileDialogsDisabled())) {
-        ImGui::Separator();
-        if (fileDialogsDisabled()) {
-            // Escape hatch: raw path + Save/Open, the pre-C41 behavior — except Open now routes
-            // through applyOpenedDoc so the viewport mesh refreshes (the old code never did).
-            if (st.docMirror.hasDoc()) {
-                static char savePath[512] = "";
-                const ImGuiStyle& style = ImGui::GetStyle();
-                float btnW = ImGui::CalcTextSize("Save").x + ImGui::CalcTextSize("Open").x +
-                             4.0f * style.FramePadding.x + 2.0f * style.ItemSpacing.x;
-                ImGui::SetNextItemWidth(-btnW);
-                ImGui::InputText("##savepath", savePath, sizeof(savePath));
-                ImGui::SameLine();
-                if (ImGui::Button("Save") && savePath[0]) {
-                    std::string err;
-                    if (st.docMirror.save(st.worker, savePath, err)) {
-                        s_docPath = savePath;
-                        st.addLog("[doc] saved: " + std::string(savePath));
-                    } else st.addLog("[err] save: " + err);
-                }
-                ImGui::SameLine();
-                if (ImGui::Button("Open") && savePath[0]) {
-                    std::string err;
-                    std::string p = savePath;
-                    if (st.docMirror.open(st.worker, p, err)) applyOpenedDoc(st, p);
-                    else st.addLog("[err] open: " + err);
-                }
-            }
-        } else {
-            // File name on its own dimmed line (a narrow panel must never push it — or the
-            // buttons — past the edge); the full path shows on hover. Red-pen round-2: the old
-            // glassRowAtCursor + raw Text drew the label flush into the pill's rounded left
-            // corner and at the row top — use the standard fmRowPill with the 6dp left inset and
-            // frame-padded vertical centering (same treatment as the Explorer breadcrumb).
-            {
-                std::string fileLabel = s_docPath.empty() ? "(unsaved)" : pathBaseName(s_docPath);
-                ui::FmRowRect fr = ui::fmRowPill(false);
-                ImGui::SetCursorScreenPos(ImVec2(fr.mn.x + 6.0f * ui::uiScale, fr.mn.y));
-                ImGui::AlignTextToFramePadding();
-                ImGui::PushStyleColor(ImGuiCol_Text,
-                    ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 1.0f));
-                ImGui::TextUnformatted(fileLabel.c_str());
-                ImGui::PopStyleColor();
-                ui::fmRowPillEnd(fr, false);
-                if (!s_docPath.empty() && ImGui::IsItemHovered())
-                    ImGui::SetTooltip("%s", s_docPath.c_str());
-            }
-            bool canSave = st.docMirror.hasDoc();
-            // Adaptive glass chips: theme Button colors don't track the live backdrop, which left
-            // the labels near-invisible over the frosted column (visual-review fix). Fill + ink
-            // both come from the pane's adaptive surface so they always read; disabled rows keep
-            // ImGui's DisabledAlpha over the same high-contrast ink.
-            const ui::AdaptiveSurface& btnSurf = fmSurf();
-            const ImVec4& ink = btnSurf.textPrimary;
-            ImGui::PushStyleColor(ImGuiCol_Text, ink);
-            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(ink.x, ink.y, ink.z, 0.10f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(ink.x, ink.y, ink.z, 0.20f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(ink.x, ink.y, ink.z, 0.28f));
-            ImGui::PushStyleColor(ImGuiCol_Border,
-                ImVec4(btnSurf.textTertiary.x, btnSurf.textTertiary.y,
-                       btnSurf.textTertiary.z, 0.60f));
-            ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, std::max(1.0f, 1.0f * ui::uiScale));
-            if (!canSave) ImGui::BeginDisabled();
-            {
-                const ImGuiStyle& style = ImGui::GetStyle();
-                const float gap = style.ItemSpacing.x;
-                const float halfW = (ImGui::GetContentRegionAvail().x - gap) * 0.5f;
-                if (ImGui::Button("Save", ImVec2(halfW, 0))) doSaveDoc(st, /*forceDialog=*/false);
-                ImGui::SameLine(0, gap);
-                if (ImGui::Button("Save As...", ImVec2(halfW, 0))) doSaveDoc(st, /*forceDialog=*/true);
-            }
-            if (!canSave) ImGui::EndDisabled();
-            if (ImGui::Button("Open...", ImVec2(-1, 0))) doOpenDoc(st);
-            ImGui::PopStyleVar();
-            ImGui::PopStyleColor(5);
-            // Bottom breathing room so the last row never kisses the bubble's rounded edge.
-            ImGui::Dummy(ImVec2(0, 6.0f * ui::uiScale));
-        }
     }
 
     // C25: apply ops queued during drawing — safe now, nothing reads the tree json below.

@@ -3850,10 +3850,10 @@ OUT_DIR = HERE / "icons"
 RENDERED_RECIPE_NAMES: set[str] = {
     "appr_brass", "appr_dark", "appr_default", "appr_metal", "appr_plastic",
     "appr_steel", "chamfer", "circular_pattern", "combine", "curve_helix",
-    "draft", "extrude_boss", "extrude_cut", "fillet", "intersect",
+    "draft", "extrude_boss", "extrude_cut", "fillet", "hole_wizard", "intersect",
     "linear_pattern", "loft", "loft_cut", "mirror", "revolve_boss",
     "revolve_cut", "rib", "shell", "sm_base_flange", "sm_flat_pattern",
-    "stock", "subtract", "sweep", "sweep_cut",
+    "stock", "subtract", "sweep", "sweep_cut", "thread",
 }
 
 

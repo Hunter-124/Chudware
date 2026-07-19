@@ -656,6 +656,47 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
         _turn_span = _ae.new_span_id()
 
     system = (system_prompt or "") + "\n\n" + _SYSTEM_BASE
+    # Project-scoped SQLite memory (token-budgeted recall). Auto-created under .plm/.
+    try:
+        from services.agent.config import (  # noqa: PLC0415
+            get_memory_token_budget,
+            memory_enabled,
+            workspace_dir,
+        )
+        from services.agent import project_memory as _pm  # noqa: PLC0415
+        if memory_enabled():
+            _proj = None
+            if isinstance(options, dict):
+                _proj = options.get("project_dir") or options.get("project_path") or options.get("workspace_dir")
+            _root = _pm.resolve_project_root(_proj)
+            if _root is None:
+                try:
+                    _root = workspace_dir()
+                except Exception:  # noqa: BLE001
+                    _root = None
+            if _root is not None:
+                _hits = _pm.recall(
+                    _root,
+                    request or "",
+                    limit=5,
+                    token_budget=get_memory_token_budget(),
+                )
+                _blk = _pm.format_for_context(_hits)
+                if _blk:
+                    system = system.rstrip() + "\n\n" + _blk
+                    if on_event is not None:
+                        try:
+                            on_event("agent.context_injected", {
+                                "source": "project_memory",
+                                "label": "Project memory",
+                                "token_est": sum(int(h.get("tokens") or 0) for h in _hits),
+                                "count": len(_hits),
+                            })
+                        except Exception:  # noqa: BLE001
+                            pass
+    except Exception:  # noqa: BLE001 — memory never breaks a turn
+        pass
+
     if tools_text:
         system += "\n\n" + tools_text
     elif allow:
@@ -1666,6 +1707,36 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                 pass
         messages.append({"role": "user", "content": _parts(
             f"Result of {tool}:\n{_as_text(result)}")})
+
+        # Proactive advisor (encourage/require): inject guidance on failure streaks
+        # without waiting for the model to call request_advice. Deterministic/cheap
+        # notes first; never blocks the turn.
+        try:
+            from services.agent.config import get_advisor_preference  # noqa: PLC0415
+            _apref = get_advisor_preference()
+            if _apref in ("encourage", "require") and not ok:
+                _fail_n = sum(1 for c in calls[-6:] if not c.get("ok", True))
+                _every = 4 if _apref == "require" else 99
+                if _fail_n >= 2 or (_apref == "require" and tool_calls_made > 0 and tool_calls_made % _every == 0):
+                    _note = (
+                        f"[ADVISOR — proactive] Recent tool failures ({_fail_n} in last 6). "
+                        f"Last tool={tool!r} ok={ok}. Pause thrash: re-read the error, "
+                        f"narrow the next action, and prefer a different approach if the "
+                        f"same call already failed twice. Do not invent dimensions."
+                    )
+                    messages.append({"role": "user", "content": _parts(_note)})
+                    if on_event is not None:
+                        try:
+                            on_event("agent.advisor", {
+                                "source": "proactive",
+                                "preference": _apref,
+                                "tool": tool,
+                                "fail_streak": _fail_n,
+                            })
+                        except Exception:  # noqa: BLE001
+                            pass
+        except Exception:  # noqa: BLE001
+            pass
 
         # mega-8 OpVocab: on FIRST unknown-op failure per mission, append the
         # allowed-ops registry snippet so the model stops thrashing invented

@@ -423,6 +423,30 @@ class MissionDispatch:
                               "(tool result / calc / table / user answer)")}
         try:
             event = led.append(actor, kind, body)
+            # Best-effort project memory: durable decisions/notes for later turns.
+            if kind in ("decision", "note", "requirement", "dimension", "brief"):
+                try:
+                    from services.agent.config import memory_enabled, workspace_dir  # noqa: PLC0415
+                    from services.agent import project_memory as _pm  # noqa: PLC0415
+                    if memory_enabled():
+                        _root = getattr(self, "project_dir", None) or getattr(self, "workspace_dir", None)
+                        _path = _pm.resolve_project_root(_root) or workspace_dir()
+                        _text = (
+                            str(body.get("text") or body.get("summary") or body.get("value") or "")
+                            .strip()
+                        )
+                        if not _text and body.get("id"):
+                            _text = f"{kind}: {body.get('id')}"
+                        if _text and _path is not None:
+                            _pm.remember(
+                                _path,
+                                _text,
+                                kind=kind,
+                                source=f"ledger:{actor}",
+                                importance=0.7 if kind == "decision" else 0.5,
+                            )
+                except Exception:  # noqa: BLE001
+                    pass
             return {"ok": True, "seq": event["seq"], "run_id": led.run_id,
                     "kind": kind, "ts": event["ts"],
                     **({"aliased_from": raw_kind} if raw_kind != kind else {})}

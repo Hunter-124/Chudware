@@ -946,9 +946,16 @@ def _advisory_block(res: "ModelResult | AssemblyResult", seq: int,
     into the Observation so trigger-based context injection fires on this turn.
     """
     try:
-        from services.agent.config import advisor_enabled as _adv_on  # noqa: PLC0415
+        from services.agent.config import (  # noqa: PLC0415
+            advisor_enabled as _adv_on,
+            get_advisor_preference as _adv_pref,
+        )
         if not _adv_on():
             return ""
+        _pref = _adv_pref()
+        if _pref == "off":
+            return ""
+        # option: still run deterministic foreman (cheap); LLM path is pull-only elsewhere
     except Exception:  # noqa: BLE001 — fall back to env snapshot
         if not _ADVISOR_ENABLED:
             return ""

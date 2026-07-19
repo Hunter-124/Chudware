@@ -281,7 +281,51 @@ void loadSettings(Settings& s) {
             s.vision = oai.value("vision", false);
         }
         s.offlineMode = j.value("offline_mode", false);
-        s.planMode = j.value("plan_mode", true);
+        // Preference enums (off|option|encourage|require). Migrate legacy plan_mode bool.
+        auto parsePref = [](const nlohmann::json& jn, const char* key, int def) -> int {
+            if (!jn.contains(key)) return def;
+            const auto& v = jn[key];
+            if (v.is_number_integer()) {
+                int n = v.get<int>();
+                return (n < 0 || n > 3) ? def : n;
+            }
+            if (v.is_string()) {
+                const std::string s = v.get<std::string>();
+                if (s == "off" || s == "0") return 0;
+                if (s == "option" || s == "optional" || s == "1") return 1;
+                if (s == "encourage" || s == "recommended" || s == "2") return 2;
+                if (s == "require" || s == "required" || s == "3") return 3;
+            }
+            if (v.is_boolean()) return v.get<bool>() ? 2 : 0;
+            return def;
+        };
+        if (j.contains("plan_preference"))
+            s.planPreference = parsePref(j, "plan_preference", 2);
+        else
+            s.planPreference = j.value("plan_mode", true) ? 2 : 0;
+        s.planMode = (s.planPreference != 0);
+        s.subagentPreference = parsePref(j, "subagent_preference", 1);
+        s.advisorPreference = parsePref(j, "advisor_preference", 2);
+        // Nested agent.* also accepted (overlay / Python write path).
+        if (j.contains("agent") && j["agent"].is_object()) {
+            const auto& ag = j["agent"];
+            if (ag.contains("subagent_preference"))
+                s.subagentPreference = parsePref(ag, "subagent_preference", s.subagentPreference);
+            if (ag.contains("advisor_preference"))
+                s.advisorPreference = parsePref(ag, "advisor_preference", s.advisorPreference);
+            if (ag.contains("memory_enabled"))
+                s.memoryEnabled = ag.value("memory_enabled", true);
+            if (ag.contains("memory_token_budget")) {
+                int b = ag.value("memory_token_budget", 400);
+                s.memoryTokenBudget = (b < 50) ? 50 : (b > 4000 ? 4000 : b);
+            }
+        }
+        if (j.contains("memory_enabled"))
+            s.memoryEnabled = j.value("memory_enabled", true);
+        if (j.contains("memory_token_budget")) {
+            int b = j.value("memory_token_budget", 400);
+            s.memoryTokenBudget = (b < 50) ? 50 : (b > 4000 ? 4000 : b);
+        }
         {
             // Accept string names or int 0..4; map legacy Design/Edit/Ask if present.
             int cm = 0;
@@ -510,7 +554,31 @@ void saveSettings(const Settings& s) {
     // through to the provider (gemini thinkingConfig / anthropic effort).
     if (s.reasoningEffort[0]) j["reasoning_effort"] = s.reasoningEffort;
     j["offline_mode"] = s.offlineMode;
-    j["plan_mode"] = s.planMode;
+    {
+        static const char* kPrefNames[] = {"off", "option", "encourage", "require"};
+        auto prefName = [&](int p) -> const char* {
+            if (p < 0 || p > 3) p = 0;
+            return kPrefNames[p];
+        };
+        // planPreference is authoritative; planMode is the derived binary gate.
+        const int planPref = (s.planPreference < 0 || s.planPreference > 3) ? 0 : s.planPreference;
+        // (const Settings& — do not write back; callers keep planMode in sync on UI change)
+        j["plan_preference"] = prefName(planPref);
+        j["plan_mode"] = (planPref != 0);  // Python / older readers
+        j["subagent_preference"] = prefName(s.subagentPreference);
+        j["advisor_preference"] = prefName(s.advisorPreference);
+        j["memory_enabled"] = s.memoryEnabled;
+        j["memory_token_budget"] = s.memoryTokenBudget;
+        // Merge-overlay into agent{} so Python config helpers see the same values.
+        nlohmann::json agent = nlohmann::json::object();
+        if (j.contains("agent") && j["agent"].is_object()) agent = j["agent"];
+        agent["advisor"] = (s.advisorPreference != 0);
+        agent["advisor_preference"] = prefName(s.advisorPreference);
+        agent["subagent_preference"] = prefName(s.subagentPreference);
+        agent["memory_enabled"] = s.memoryEnabled;
+        agent["memory_token_budget"] = s.memoryTokenBudget;
+        j["agent"] = std::move(agent);
+    }
     {
         static const char* kModeNames[] = {"agent", "plan", "swarm", "edit", "ask", "eng_firm"};
         int cm = s.copilotMode;

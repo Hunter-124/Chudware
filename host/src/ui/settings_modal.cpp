@@ -2295,56 +2295,29 @@ static void drawEngFirmModelAssignments(AppState& st, float sc) {
 }
 
 static void drawHarnessOrganizationSection(AppState& st, float sc) {
-    dimText("Composer mode picks the org structure. Defaults below \xe2\x80\x94 switch mode from the "
-            "copilot composer.");
+    (void)sc;
+    dimText("Composer mode picks the org structure. Switch mode from the copilot composer.");
     int active = st.settings.copilotMode;
     if (active < 0 || active >= kHarnessModeCount) active = 0;
-    // Multi-line mode reference for the intro (?): label · structure + description; mark active.
-    {
-        std::string tip;
-        tip.reserve(512);
-        for (int i = 0; i < kHarnessModeCount; ++i) {
-            const auto& m = kHarnessModes[i];
-            if (i) tip += '\n';
-            tip += m.label;
-            tip += " \xc2\xb7 ";
-            tip += m.structure;
-            if (i == active) tip += " (active)";
-            tip += '\n';
-            tip += "  ";
-            tip += m.description;
-        }
-        helpMarker(tip.c_str());
-    }
 
-    ImGui::Dummy(ImVec2(0, 2.0f * sc));
-    // Compact list: bullet + aligned label · structure (+ active). Descriptions stay in (?).
-    const float labelCol = ImGui::GetCursorPosX() + 16.0f * sc;
+    ImGui::Dummy(ImVec2(0, 4.0f * sc));
+    // One plain line per mode — ASCII only so icon fonts never steal the label glyphs.
     for (int i = 0; i < kHarnessModeCount; ++i) {
         const auto& m = kHarnessModes[i];
-        ImGui::Bullet();
-        ImGui::SameLine(labelCol);
+        char line[256];
         if (i == active) {
+            std::snprintf(line, sizeof(line), "%s  -  %s  (active)", m.label, m.structure);
             ImGui::PushStyleColor(ImGuiCol_Text,
                 ImVec4(ui::palette.accent[0], ui::palette.accent[1],
                        ui::palette.accent[2], 1.0f));
-            ImGui::Text("%s", m.label);
+            ImGui::TextUnformatted(line);
             ImGui::PopStyleColor();
         } else {
-            ImGui::Text("%s", m.label);
+            std::snprintf(line, sizeof(line), "%s  -  %s", m.label, m.structure);
+            ImGui::TextUnformatted(line);
         }
-        ImGui::SameLine(0, 6.0f * sc);
-        dimText("\xc2\xb7");
-        ImGui::SameLine(0, 6.0f * sc);
-        ImGui::TextUnformatted(m.structure);
-        if (i == active) {
-            ImGui::SameLine(0, 8.0f * sc);
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                ImVec4(ui::palette.accent[0], ui::palette.accent[1],
-                       ui::palette.accent[2], 1.0f));
-            ImGui::TextUnformatted("(active)");
-            ImGui::PopStyleColor();
-        }
+        if (ImGui::IsItemHovered() && m.description && m.description[0])
+            ImGui::SetTooltip("%s", m.description);
     }
 }
 
@@ -2352,7 +2325,7 @@ static void drawHarnessOrganizationSection(AppState& st, float sc) {
 
 // ---- kSettingsEntries: unified command search table (command_search.cpp) ----
 // Tab indices: 0=Appearance 1=General 2=AI 3=Providers 4=Benchmarks 5=Prompts
-// 6=Agent 7=Experimental
+// 6=Experimental (Agent tab merged into AI)
 // One entry per prominent field/section; labels mirror the modal's visible text.
 const SettingsEntry kSettingsEntries[] = {
     // Appearance (tab 0)
@@ -2419,21 +2392,27 @@ const SettingsEntry kSettingsEntries[] = {
     { "Prompt editor",            "Prompts",      5 },
     { "System prompt",            "Prompts",      5 },
     { "System prompt override",   "Prompts",      5 },
-    // Agent (tab 6)
-    { "Plan before building",     "Agent",        6 },
-    { "Plan mode",                "Agent",        6 },
-    { "Refine-pass cap",          "Agent",        6 },
-    { "Max iters",                "Agent",        6 },
-    { "Iteration budget",         "Agent",        6 },
-    { "Eng. Firm budget",         "Agent",        6 },
-    { "Company budget",           "Agent",        6 },
-    // Experimental (tab 7)
-    { "Vision review model",      "Experimental", 7 },
-    { "Model routing",            "Experimental", 7 },
-    { "Seek-CAD split",           "Experimental", 7 },
-    { "Parametric sequence mode", "Experimental", 7 },
-    { "CAD sequence mode",        "Experimental", 7 },
-    { "Feature sequence",         "Experimental", 7 },
+    // Run behavior (lives on AI tab; was Agent tab 6)
+    { "Plan preference",          "AI",           2 },
+    { "Plan before building",     "AI",           2 },
+    { "Plan mode",                "AI",           2 },
+    { "Subagent preference",      "AI",           2 },
+    { "Advisor preference",       "AI",           2 },
+    { "Project memory",           "AI",           2 },
+    { "Memory budget",            "AI",           2 },
+    { "Refine-pass cap",          "AI",           2 },
+    { "Max iters",                "AI",           2 },
+    { "Iteration budget",         "AI",           2 },
+    { "Eng. Firm budget",         "AI",           2 },
+    { "Company budget",           "AI",           2 },
+    { "Run behavior",             "AI",           2 },
+    // Experimental (tab 6 — Agent tab removed)
+    { "Vision review model",      "Experimental", 6 },
+    { "Model routing",            "Experimental", 6 },
+    { "Seek-CAD split",           "Experimental", 6 },
+    { "Parametric sequence mode", "Experimental", 6 },
+    { "CAD sequence mode",        "Experimental", 6 },
+    { "Feature sequence",         "Experimental", 6 },
 };
 const int kSettingsEntryCount =
     (int)(sizeof(kSettingsEntries) / sizeof(kSettingsEntries[0]));
@@ -2899,10 +2878,75 @@ void drawSettingsModal(AppState& st, bool busy) {
                 ui::drawAiSettingsSection(st, busy, ui::AiSettingsSection::Privacy);
                 settingsGlassSectionEnd();
 
+                // ---- Run behavior (moved from Agent tab) ----
+                settingsGlassSectionBegin("##ai_run_behavior", "Run behavior");
+                {
+                    static const char* kPrefLabels[] = {"Off", "Option", "Encourage", "Require"};
+                    auto prefCombo = [&](const char* label, const char* id, int* pref,
+                                         const char* help) {
+                        ImGui::AlignTextToFramePadding();
+                        ImGui::TextUnformatted(label);
+                        if (help && help[0]) {
+                            ImGui::SameLine();
+                            helpMarker(help);
+                        }
+                        ImGui::SameLine(200.0f * sc);
+                        ImGui::SetNextItemWidth(160.0f * sc);
+                        int v = (*pref < 0 || *pref > 3) ? 0 : *pref;
+                        if (ImGui::Combo(id, &v, kPrefLabels, 4)) {
+                            *pref = v;
+                            if (pref == &settings.planPreference)
+                                settings.planMode = (v != 0);
+                        }
+                    };
+                    prefCombo("Plan preference", "##plan_pref", &settings.planPreference,
+                              "Off = never plan first. Option = model may plan. "
+                              "Encourage = plan by default (recommended). "
+                              "Require = always draft a plan before building.");
+                    prefCombo("Subagent preference", "##sub_pref", &settings.subagentPreference,
+                              "How freely the main agent may spawn subagents. "
+                              "Off disables nesting; Require pushes multi-agent splits.");
+                    prefCombo("Advisor preference", "##adv_pref", &settings.advisorPreference,
+                              "Off = no advisor. Option = only when the model asks. "
+                              "Encourage = proactive guidance on failures. "
+                              "Require = periodic mid-run checks plus plan review.");
+                    ImGui::Dummy(ImVec2(0, 4.0f * sc));
+                    ImGui::Checkbox("Project memory (per-folder)", &settings.memoryEnabled);
+                    helpMarker("Remembers decisions and notes under the PLM project "
+                               "(.plm/memory.db). Auto-created; recall is token-budgeted.");
+                    if (settings.memoryEnabled) {
+                        ImGui::AlignTextToFramePadding();
+                        ImGui::TextUnformatted("Memory token budget");
+                        ImGui::SameLine(200.0f * sc);
+                        ImGui::SetNextItemWidth(160.0f * sc);
+                        ImGui::SliderInt("##mem_budget", &settings.memoryTokenBudget, 100, 2000,
+                                         "%d tokens");
+                    }
+                    ImGui::Dummy(ImVec2(0, 6.0f * sc));
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::TextUnformatted("Refine-pass cap per request");
+                    ImGui::SameLine(200.0f * sc);
+                    ImGui::SetNextItemWidth(160.0f * sc);
+                    ImGui::SliderInt("##miters", &settings.maxIters, 0, 64,
+                                     settings.maxIters == 0 ? "automatic" : "%d passes");
+                    dimText("0 = automatic (stops once the render matches)");
+                    ImGui::Dummy(ImVec2(0, 4.0f * sc));
+                    dimText("Eng. Firm budget (USD) — used when the composer is in Eng. Firm mode.");
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::TextUnformatted("Budget (USD)");
+                    ImGui::SameLine(200.0f * sc);
+                    ImGui::SetNextItemWidth(160.0f * sc);
+                    double b = settings.companyBudgetUsd;
+                    if (ImGui::InputDouble("##engfirmbudget", &b, 5.0, 25.0, "$%.2f")) {
+                        if (b < 0.0) b = 0.0;
+                        settings.companyBudgetUsd = b;
+                    }
+                }
+                settingsGlassSectionEnd();
+
                 settingsGlassSectionBegin("##ai_benchmarks_link", "Benchmarks");
                 dimText("Leaderboard, category runs, and live status live on the Benchmarks tab.");
                 if (ImGui::SmallButton("Open Benchmarks tab")) {
-                    // Re-arm openSettingsTab so the next frame selects Benchmarks (index 4).
                     st.openSettingsTab = 4;
                 }
                 if (ImGui::IsItemHovered())
@@ -3017,6 +3061,7 @@ void drawSettingsModal(AppState& st, bool busy) {
 
                 settingsGlassSectionBegin("##bench_model_rankings", "Model rankings");
                 drawModelRankingsSection(st, sc);
+                settingsGlassSectionEnd();
 
                 settingsTabBodyEnd();
                 ImGui::EndTabItem();
@@ -3157,58 +3202,19 @@ void drawSettingsModal(AppState& st, bool busy) {
                 ImGui::EndTabItem();
             }
             // --- end C22b marked block ---
-
-            // ---- Agent tab: run behavior + iteration budget (the old Advanced tab minus the
-            // system-prompt editor, which moved to Prompts where it belongs — audit P1) ----
-            // AI_CAD_SHOT=settings selects this tab ONE-SHOT: consuming st.wantSettings directly
-            // every frame kept the other tabs unclickable for the whole session (audit P2).
+            // Agent tab removed — run behavior lives on AI. wantSettings shot jumps to AI.
             static bool s_wantSettingsTabDone = false;
             bool wantSettingsSel = st.wantSettings && !s_wantSettingsTabDone;
             if (wantSettingsSel) s_wantSettingsTabDone = true;
-            if (ImGui::BeginTabItem("Agent", nullptr,
-                                    (wantSettingsSel || jumpToTab == 6) ? ImGuiTabItemFlags_SetSelected
-                                                                        : ImGuiTabItemFlags_None)) {
-                settingsTabBodyBegin("##tab_agent");
-                settingsSectionHeader("Run behavior", /*first=*/true);
-                ImGui::Checkbox("Plan before building (recommended)", &settings.planMode);
-                dimText("The agent first drafts a build plan - the parts, concrete "
-                        "dimensions and features - shows it in the conversation, then "
-                        "writes the CAD code against it.");
-                settingsSectionHeader("Iteration budget");
-                {
-                    const float labelW = 200.0f * sc;
-                    ImGui::AlignTextToFramePadding();
-                    ImGui::TextUnformatted("Refine-pass cap per request");
-                    ImGui::SameLine(labelW);
-                    ImGui::SetNextItemWidth(160.0f * sc);
-                    ImGui::SliderInt("##miters", &settings.maxIters, 0, 64,
-                                     settings.maxIters == 0 ? "automatic" : "%d passes");
-                }
-                dimText("0 = automatic (stops once the render matches)");
-                settingsSectionHeader("Eng. Firm budget");
-                dimText("Used when the composer is in Eng. Firm mode (see Settings \xe2\x86\x92 AI "
-                        "\xe2\x86\x92 Harness organization for all mode defaults).");
-                {
-                    const float labelW = 200.0f * sc;
-                    ImGui::AlignTextToFramePadding();
-                    ImGui::TextUnformatted("Budget (USD)");
-                    ImGui::SameLine(labelW);
-                    ImGui::SetNextItemWidth(160.0f * sc);
-                    double b = settings.companyBudgetUsd;
-                    if (ImGui::InputDouble("##engfirmbudget", &b, 5.0, 25.0, "$%.2f")) {
-                        if (b < 0.0) b = 0.0;
-                        settings.companyBudgetUsd = b;
-                    }
-                }
-                dimText("Max spend the firm must complete the job within; contractor firms "
-                        "bid in predicted tokens (converted to $) under this ceiling.");
-                settingsTabBodyEnd();
-                ImGui::EndTabItem();
-            }
+            // Legacy jumpToTab==6 (old Agent) and wantSettings → AI tab (index 2).
+            if (wantSettingsSel && jumpToTab < 0) jumpToTab = 2;
+            if (jumpToTab == 6) jumpToTab = 2;  // old Agent index → AI
+            // jumpToTab 7 was Experimental; remap to 6 after Agent removal.
+            if (jumpToTab == 7) jumpToTab = 6;
 
             // ---- Experimental tab: research-backed opt-in AI features ----
             if (ImGui::BeginTabItem("Experimental", nullptr,
-                                    (jumpToTab == 7) ? ImGuiTabItemFlags_SetSelected
+                                    (jumpToTab == 6) ? ImGuiTabItemFlags_SetSelected
                                                      : ImGuiTabItemFlags_None)) {
                 settingsTabBodyBegin("##tab_experimental");
                 dimText("Opt-in, default-off features from the model/provider research. All run "

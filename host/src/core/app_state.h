@@ -103,10 +103,16 @@ struct Settings {
     char baseUrl[256] = "http://localhost:1234/v1";
     bool vision = true;
     bool offlineMode = false;    // C35: local-only mode — refuse any non-loopback provider (ITAR)
-    // Run mode (composer chip): planMode=true is "Supervised" (draft a build plan + ask the
-    // build-critical clarify questions before modeling); planMode=false is "Autopilot" (model
-    // straight from the prompt, no plan/clarify). Persisted as "plan_mode".
-    bool planMode = true;
+    // PreferenceMode 0=Off 1=Option 2=Encourage 3=Require. Serialized as
+    // plan_preference / subagent_preference / advisor_preference strings.
+    // planMode stays as the binary gate (planPreference != 0) for legacy call sites
+    // and plan_mode bool in config.json (Python still reads it).
+    int planPreference = 2;      // default Encourage (old plan_mode=true)
+    int subagentPreference = 1;  // default Option — model may spawn subagents
+    int advisorPreference = 2;   // default Encourage — proactive advisor on triggers
+    bool planMode = true;        // binary: planPreference != 0 (Supervised vs Autopilot)
+    bool memoryEnabled = true;   // project SQLite memory under .plm/memory.db
+    int memoryTokenBudget = 400; // max tokens injected from project memory per turn
     // Copilot composer mode: Agent | Plan | Swarm | Edit | Ask. Persisted as "copilot_mode".
     // Values match AppState::aiInteraction / CopilotMode.
     int copilotMode = 0;         // 0=Agent 1=Plan 2=Swarm 3=Edit 4=Ask 5=EngFirm

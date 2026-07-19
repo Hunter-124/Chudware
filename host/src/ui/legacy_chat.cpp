@@ -7696,6 +7696,116 @@ static void drawArtifactsPanel(AppState& st, bool busy) {
 // rest park in st.conversations[i].msgs. Persisted per document to chat_history.json.
 
 static std::string chatHistoryPath() { return appdataAppDir() + "/chat_history.json"; }
+static std::string promptDraftsPath() { return appdataAppDir() + "/prompt_drafts.json"; }
+
+static std::string promptDraftKey(AppState& st) {
+    std::string key = st.chatDocKey.empty() ? convDocKey(st) : st.chatDocKey;
+    key += "/";
+    if (st.activeConv >= 0 && st.activeConv < (int)st.conversations.size())
+        key += st.conversations[st.activeConv].id;
+    else
+        key += "c0";
+    return key;
+}
+
+static void savePromptDraft(AppState& st, bool force = false) {
+    const char* p = st.prompt.data() ? st.prompt.data() : "";
+    // Per-key debounce so switching conversations never confuses last-write state.
+    static std::string s_lastKey;
+    static std::string s_lastSaved;
+    static double s_lastWrite = -1e9;
+    const std::string key = promptDraftKey(st);
+    const std::string cur = p;
+    const double now = ImGui::GetTime();
+    if (!force) {
+        if (key == s_lastKey && cur == s_lastSaved) return;
+        if (key == s_lastKey && (now - s_lastWrite) < 0.40) return;
+    }
+    s_lastKey = key;
+    s_lastSaved = cur;
+    s_lastWrite = now;
+    try {
+        namespace fs = std::filesystem;
+        const std::string path = promptDraftsPath();
+        nlohmann::json root = nlohmann::json::object();
+        {
+            std::ifstream in(path);
+            if (in) {
+                try { in >> root; } catch (...) { root = nlohmann::json::object(); }
+            }
+        }
+        if (!root.is_object()) root = nlohmann::json::object();
+        const std::string key = promptDraftKey(st);
+        if (cur.empty()) root.erase(key);
+        else root[key] = cur;
+        fs::create_directories(appdataAppDir());
+        const std::string tmp = path + ".tmp";
+        {
+            std::ofstream out(tmp);
+            if (!out) return;
+            out << root.dump(1);
+        }
+        std::error_code ec;
+        fs::rename(tmp, path, ec);
+        if (ec) {
+            fs::remove(path, ec);
+            fs::rename(tmp, path, ec);
+        }
+    } catch (...) {
+    }
+}
+
+static void clearPromptDraft(AppState& st) {
+    try {
+        namespace fs = std::filesystem;
+        const std::string path = promptDraftsPath();
+        nlohmann::json root = nlohmann::json::object();
+        {
+            std::ifstream in(path);
+            if (in) {
+                try { in >> root; } catch (...) { return; }
+            }
+        }
+        if (!root.is_object()) return;
+        if (root.erase(promptDraftKey(st)) == 0) return;
+        const std::string tmp = path + ".tmp";
+        {
+            std::ofstream out(tmp);
+            if (!out) return;
+            out << root.dump(1);
+        }
+        std::error_code ec;
+        fs::rename(tmp, path, ec);
+        if (ec) {
+            fs::remove(path, ec);
+            fs::rename(tmp, path, ec);
+        }
+    } catch (...) {
+    }
+}
+
+static void restorePromptDraft(AppState& st) {
+    // Don't clobber a non-empty composer (user already typing).
+    if (st.prompt.data() && st.prompt.data()[0] != '\0') return;
+    try {
+        std::ifstream in(promptDraftsPath());
+        if (!in) return;
+        nlohmann::json root;
+        in >> root;
+        if (!root.is_object()) return;
+        auto it = root.find(promptDraftKey(st));
+        if (it == root.end() || !it->is_string()) return;
+        const std::string d = it->get<std::string>();
+        if (d.empty()) return;
+        if (st.prompt.size() < d.size() + 1) st.prompt.resize(d.size() + 64, 0);
+        std::memset(st.prompt.data(), 0, st.prompt.size());
+        const size_t n = std::min(d.size(), st.prompt.size() - 1);
+        std::memcpy(st.prompt.data(), d.data(), n);
+        st.prompt[n] = 0;
+    } catch (...) {
+    }
+}
+
 
 // A stable key for the active document: the saved file path if any (survives restarts), else
 // the live doc id, else "scratch" (an unsaved, never-touched session).
@@ -7817,6 +7927,27 @@ void persistChatHistory(AppState& st) {
             if (!m.fromUser && !m.model.empty()) entry["m"] = m.model;
             if (m.copilotMode >= 0) entry["cm"] = m.copilotMode;
             if (m.planState.present) entry["plan_state"] = planStateToJson(m.planState);
+            // Persist activity timeline (capped) so thoughts/tools survive reload.
+            if (!m.fromUser && !m.activity.empty()) {
+                nlohmann::json act = nlohmann::json::array();
+                const int nAct = (int)m.activity.size();
+                const int start = (nAct > 40) ? (nAct - 40) : 0;
+                for (int ai = start; ai < nAct; ++ai) {
+                    const auto& a = m.activity[ai];
+                    nlohmann::json row = {
+                        {"rk", a.rowKind},
+                        {"stage", a.stage},
+                        {"title", a.title},
+                        {"status", a.status},
+                        {"reason", a.reason},
+                    };
+                    std::string det = a.detail;
+                    if (det.size() > 500) det = det.substr(0, 499) + "\xe2\x80\xa6";
+                    if (!det.empty()) row["detail"] = det;
+                    act.push_back(std::move(row));
+                }
+                if (!act.empty()) entry["activity"] = std::move(act);
+            }
             // Persist tool-call artifact paths so Artifacts panel + reopen keep file links.
             if (!m.fromUser && !m.activity.empty()) {
                 nlohmann::json arts = nlohmann::json::array();
@@ -7825,7 +7956,6 @@ void persistChatHistory(AppState& st) {
                     if (a.detail.find("\x1e" "ART\x1e") == std::string::npos) continue;
                     const size_t sep = a.detail.find("\x1e" "ART\x1e");
                     std::string blob = a.detail.substr(sep);
-                    // strip delimiter header
                     size_t nl = blob.find('\n');
                     if (nl != std::string::npos) blob = blob.substr(nl + 1);
                     std::istringstream iss(blob);
@@ -7846,9 +7976,16 @@ void persistChatHistory(AppState& st) {
             }
             jm.push_back(std::move(entry));
         }
-        convs.push_back({{"id", st.conversations[i].id},
-                         {"title", st.conversations[i].title},
-                         {"msgs", jm}});
+        nlohmann::json convObj = {{"id", st.conversations[i].id},
+                                 {"title", st.conversations[i].title},
+                                 {"msgs", jm}};
+        const int lct = (i == st.activeConv) ? st.lastContextTokens
+                                             : st.conversations[i].lastContextTokens;
+        if (lct > 0) convObj["last_context_tokens"] = lct;
+        const auto& qp = (i == st.activeConv) ? st.queuedPrompts
+                                              : st.conversations[i].queuedPrompts;
+        if (!qp.empty()) convObj["queued_prompts"] = qp;
+        convs.push_back(std::move(convObj));
     }
     // Load-modify-write: only replace this doc key; every other key stays intact.
     root[st.chatDocKey] = {{"active", st.activeConv}, {"conversations", convs}};
@@ -7983,16 +8120,28 @@ static void applyChatEntry(AppState& st, const nlohmann::json& e) {
             // Restore plan/task-list state when present (legacy sessions omit the key).
             if (m.contains("plan_state") && m["plan_state"].is_object()) {
                 cm.planState = parsePlanState(m["plan_state"]);
-                // parsePlanState marks fromEvent=true; honor the persisted provenance flag
-                // so derived normalizers don't clobber a restored event plan.
                 cm.planState.fromEvent =
                     m["plan_state"].value("from_event", true);
+            }
+            // Restore activity timeline (thoughts/tools) when persisted.
+            if (m.contains("activity") && m["activity"].is_array()) {
+                for (const auto& row : m["activity"]) {
+                    if (!row.is_object()) continue;
+                    ActivityItem a;
+                    a.rowKind = row.value("rk", 0);
+                    a.stage = row.value("stage", std::string());
+                    a.title = row.value("title", std::string());
+                    a.status = row.value("status", std::string());
+                    a.reason = row.value("reason", std::string());
+                    a.detail = row.value("detail", std::string());
+                    cm.activity.push_back(std::move(a));
+                }
             }
             // Restore agent-created file links into a synthetic activity row so the
             // Artifacts panel can list them after a session reopen.
             if (m.contains("artifacts") && m["artifacts"].is_array() && !m["artifacts"].empty()) {
                 ActivityItem artRow;
-                artRow.rowKind = 1;  // tool-call-ish row
+                artRow.rowKind = 3;
                 artRow.stage = "artifacts";
                 artRow.title = "Session files";
                 artRow.status = "done";
@@ -8014,6 +8163,11 @@ static void applyChatEntry(AppState& st, const nlohmann::json& e) {
             }
             cm.running = false;
             c.msgs.push_back(std::move(cm));
+        }
+        c.lastContextTokens = jc.value("last_context_tokens", 0);
+        if (jc.contains("queued_prompts") && jc["queued_prompts"].is_array()) {
+            for (const auto& q : jc["queued_prompts"])
+                if (q.is_string()) c.queuedPrompts.push_back(q.get<std::string>());
         }
         st.conversations.push_back(std::move(c));
     }
@@ -8044,6 +8198,7 @@ static void loadChatHistoryForKey(AppState& st, const std::string& key,
     };
     if (hasEntry(key)) {
         applyChatEntry(st, root[key]);
+        restorePromptDraft(st);
         return;
     }
     // Rekey migration: new key empty, but old key has history (disk or live memory).
@@ -8051,12 +8206,14 @@ static void loadChatHistoryForKey(AppState& st, const std::string& key,
         if (hasEntry(migrateFrom)) {
             applyChatEntry(st, root[migrateFrom]);
             s_chatKeyToErase = migrateFrom;  // drop old key on next persist under new key
+            restorePromptDraft(st);
             return;
         }
         // In-memory still holds the outgoing doc's conversations (persist just wrote them
         // under migrateFrom). Keep them bound to the new key instead of clearing.
         if (!st.conversations.empty() && st.activeConv >= 0) {
             s_chatKeyToErase = migrateFrom;
+            restorePromptDraft(st);
             return;
         }
     }
@@ -8071,6 +8228,7 @@ static void loadChatHistoryForKey(AppState& st, const std::string& key,
         st.activeConv = -1;
         ensureConversations(st);
     }
+    restorePromptDraft(st);
 }
 
 #ifdef __EMSCRIPTEN__
@@ -11778,137 +11936,107 @@ static void drawAISettingsBody(AppState& st, bool busy) {
     const ui::AdaptiveSurface& surf = chatSurf();
     bool changed = false;
     (void)busy;
-    // Esc returns to chat (same as the header Chat button).
     if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) && !ImGui::IsAnyItemActive()) {
         st.showAISettingsOverlay = false;
         st.showSessionsPicker = false;
         return;
     }
 
-    // Tight chrome spacing so the narrow copilot column packs options without
-    // large empty gaps between header / tabs / content.
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(ui::metrics::U(1.0f), ui::metrics::U(0.75f)));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(ui::metrics::U(1.0f), ui::metrics::U(0.85f)));
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(ui::metrics::U(1.5f), ui::metrics::U(0.75f)));
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
 
     ImGui::PushFont(st.fonts.medium);
-    ImGui::TextUnformatted("AI Settings");
+    ImGui::TextUnformatted("Quick settings");
     ImGui::PopFont();
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-    ImGui::TextWrapped("Agents, prompts, skills, context injection, permissions, providers.");
+    ImGui::TextWrapped("Session knobs. Full providers, roles, and prompts live in Settings.");
     ImGui::PopStyleColor();
-    // Clear vertical separation so the tab strip never overlaps the title block.
     ImGui::Dummy(ImVec2(0, ui::metrics::U(1.0f)));
 
-    // Wrapping top tabs — six labels; pad is tighter so Providers still fits
-    // next to the new Context Injection tab in the narrow copilot column.
-    static int s_aiSettingsRail = 0;
-    static const char* kRailLabels[] = {
-        "Agents", "Prompts", "Skills", "Context", "Permissions", "Providers",
-    };
-    const int nTabs = 6;
-    const float availW = ImGui::GetContentRegionAvail().x;
-    const float gapX = ui::metrics::U(0.5f);
-    const float gapY = ui::metrics::U(0.5f);
-    // Compact pad so more labels fit per row; still readable at any uiScale.
-    const float tabPadX = ui::metrics::U(1.25f);
-    const float tabH = ImGui::GetFrameHeight();
-
-    float naturalW[6];
-    for (int i = 0; i < nTabs; ++i)
-        naturalW[i] = ImGui::CalcTextSize(kRailLabels[i]).x + tabPadX * 2.0f;
-
-    // Greedy wrap into rows, then even-fit each row to the column width so the
-    // strip always shows every tab (typically 3+3 in a narrow copilot pane).
-    int rowStart[6];
-    int rowCount[6];
-    int nRows = 0;
-    {
-        int i = 0;
-        while (i < nTabs && nRows < nTabs) {
-            rowStart[nRows] = i;
-            float used = 0.0f;
-            int count = 0;
-            while (i < nTabs) {
-                const float need = naturalW[i] + (count ? gapX : 0.0f);
-                if (count > 0 && used + need > availW + 0.5f) break;
-                used += need;
-                ++count;
-                ++i;
-            }
-            // Always place at least one tab per row (pathological narrow width).
-            if (count == 0) {
-                count = 1;
-                ++i;
-            }
-            rowCount[nRows] = count;
-            ++nRows;
-        }
-    }
-
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, ui::metrics::rounding(6.0f));
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(gapX, gapY));
-    for (int r = 0; r < nRows; ++r) {
-        const int start = rowStart[r];
-        const int count = rowCount[r];
-        float naturalSum = 0.0f;
-        for (int k = 0; k < count; ++k) naturalSum += naturalW[start + k];
-        const float gaps = gapX * (float)ImMax(0, count - 1);
-        const float extra = ImMax(0.0f, availW - naturalSum - gaps);
-        // Distribute leftover width evenly so a partial last row still fills.
-        const float grow = (count > 0) ? extra / (float)count : 0.0f;
-
-        for (int k = 0; k < count; ++k) {
-            const int i = start + k;
-            if (k) ImGui::SameLine(0, gapX);
-            const bool sel = (s_aiSettingsRail == i);
-            const float tw = naturalW[i] + grow;
-            ImGui::PushStyleColor(ImGuiCol_Button, sel
-                ? ImVec4(ui::palette.chipBg[0], ui::palette.chipBg[1],
-                         ui::palette.chipBg[2], ui::palette.chipBg[3])
-                : ImVec4(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.06f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-                ImVec4(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.12f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive,
-                ImVec4(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.18f));
-            ImGui::PushStyleColor(ImGuiCol_Text, sel ? surf.textPrimary : surf.textSecondary);
-            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
-                ImVec2(tabPadX, (tabH - ImGui::GetFontSize()) * 0.5f));
-            if (ImGui::Button(kRailLabels[i], ImVec2(tw, tabH)))
-                s_aiSettingsRail = i;
-            ImGui::PopStyleVar();
-            if (sel) {
-                ImGui::GetWindowDrawList()->AddRect(
-                    ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
-                    ImGui::ColorConvertFloat4ToU32(semanticOnGlass(ui::palette.accent, surf)),
-                    ui::metrics::rounding(6.0f), 0, ui::metrics::stroke(1.0f));
-            }
-            ImGui::PopStyleColor(4);
-        }
-    }
-    ImGui::PopStyleVar(2);
-
-    // Content starts immediately under the tab strip — small gap only.
-    ImGui::Dummy(ImVec2(0, ui::metrics::U(0.75f)));
-
     ImGui::BeginChild("##ai_ov_body", ImVec2(0, 0), ImGuiChildFlags_None);
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(ui::metrics::U(1.0f), ui::metrics::U(1.0f)));
-    switch (s_aiSettingsRail) {
-    case 0: drawOvAgentsTab(st, S, changed); break;
-    case 1: drawOvPromptsTab(st, S, changed); break;
-    case 2: drawOvSkillsTab(st, S); break;
-    case 3: drawOvContextTab(st, S); break;
-    case 4: drawOvPermissionsTab(st, S, changed); break;
-    case 5: drawOvProvidersTab(st, S); break;
-    default: break;
+    {
+        static const char* kPrefLabels[] = {"Off", "Option", "Encourage", "Require"};
+        auto prefCombo = [&](const char* label, const char* id, int* pref) {
+            int v = (*pref < 0 || *pref > 3) ? 0 : *pref;
+            ImGui::TextUnformatted(label);
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::Combo(id, &v, kPrefLabels, 4)) {
+                *pref = v;
+                if (pref == &s.planPreference) s.planMode = (v != 0);
+                changed = true;
+            }
+        };
+        prefCombo("Plan preference", "##q_plan_pref", &s.planPreference);
+        prefCombo("Subagent preference", "##q_sub_pref", &s.subagentPreference);
+        prefCombo("Advisor preference", "##q_adv_pref", &s.advisorPreference);
+
+        ImGui::Dummy(ImVec2(0, ui::metrics::U(1.0f)));
+        ImGui::Separator();
+        ImGui::Dummy(ImVec2(0, ui::metrics::U(0.5f)));
+
+        if (ImGui::Checkbox("Vision (send screenshots)", &s.vision)) changed = true;
+        if (ImGui::Checkbox("Offline mode (local only)", &s.offlineMode)) changed = true;
+        ImGui::Checkbox("Show assistant thoughts", &gShowThinking);
+
+        ImGui::Dummy(ImVec2(0, ui::metrics::U(0.75f)));
+        ImGui::TextUnformatted("Refine-pass cap");
+        ImGui::SetNextItemWidth(-1);
+        int iters = s.maxIters;
+        if (ImGui::SliderInt("##q_miters", &iters, 0, 64, iters == 0 ? "automatic" : "%d")) {
+            s.maxIters = (iters < 0) ? 0 : iters;
+            changed = true;
+        }
+
+        static int s_maxDepth = -1;
+        if (s_maxDepth < 0) s_maxDepth = ovLoadMaxSubagentDepth();
+        ImGui::TextUnformatted("Max subagent nesting");
+        ImGui::SetNextItemWidth(-1);
+        int depth = s_maxDepth;
+        if (ImGui::SliderInt("##q_depth", &depth, 0, 4, "%d")) {
+            if (depth < 0) depth = 0;
+            if (depth > 4) depth = 4;
+            s_maxDepth = depth;
+            ovSaveMaxSubagentDepth(depth);
+        }
+
+        ImGui::Dummy(ImVec2(0, ui::metrics::U(0.75f)));
+        if (ImGui::Checkbox("Project memory", &s.memoryEnabled)) changed = true;
+        if (s.memoryEnabled) {
+            ImGui::TextUnformatted("Memory token budget");
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::SliderInt("##q_membudget", &s.memoryTokenBudget, 100, 2000, "%d"))
+                changed = true;
+        }
+
+        ImGui::Dummy(ImVec2(0, ui::metrics::U(1.25f)));
+        ImGui::Separator();
+        ImGui::Dummy(ImVec2(0, ui::metrics::U(0.5f)));
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+        ImGui::TextUnformatted("Open full Settings");
+        ImGui::PopStyleColor();
+        if (ImGui::Button("AI##q_open_ai", ImVec2(-1, 0))) {
+            st.openSettings = true;
+            st.openSettingsTab = 2;
+            st.showAISettingsOverlay = false;
+        }
+        if (ImGui::Button("Providers##q_open_prov", ImVec2(-1, 0))) {
+            st.openSettings = true;
+            st.openSettingsTab = 3;
+            st.showAISettingsOverlay = false;
+        }
+        if (ImGui::Button("Prompts##q_open_prompts", ImVec2(-1, 0))) {
+            st.openSettings = true;
+            st.openSettingsTab = 5;
+            st.showAISettingsOverlay = false;
+        }
     }
-    ImGui::PopStyleVar();
     ImGui::EndChild();
 
     if (changed) saveSettings(s);
 
-    ImGui::PopStyleColor();  // surf.textPrimary
-    ImGui::PopStyleVar(2);    // ItemSpacing + FramePadding
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar(2);
 }
 
 // ============================ searchable model dropdown ============================
@@ -14366,6 +14494,8 @@ static void drawComposer(AppState& st, bool busy, bool canRun) {
     bool submitInput = drawChatInput("##aiprompt", st.prompt, placeholder,
                                      ui::metrics::copilotInputMaxLines(),
                                      sendSz + sendInset * 2.0f);
+    // Crash-safe draft: debounce-write whatever is in the box.
+    savePromptDraft(st, /*force=*/false);
     ImGui::PopStyleVar(2);
     ImGui::PopStyleColor(6);
     // Send/stop rides INSIDE the input box, anchored bottom-right of the composer glass.
@@ -14408,12 +14538,14 @@ static void drawComposer(AppState& st, bool busy, bool canRun) {
                     // Auto-sends when the assistant frees up (drain at the top of drawComposer).
                     st.queuedPrompts.emplace_back(st.prompt.data());
                 }
+                clearPromptDraft(st);
                 st.prompt[0] = 0;
             }
         } else if (canStart) {
             // Stage the rollback only on send (Esc cancelled without this).
             if (s_edit.active) commitEditStageOnSend(st);
             submitTurn(st, std::string(st.prompt.data()));
+            clearPromptDraft(st);
             st.prompt[0] = 0;
         }
     }

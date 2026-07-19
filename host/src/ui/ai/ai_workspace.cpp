@@ -1491,11 +1491,16 @@ static void drawSettingsPane(AppState& st, float paneH, bool /*busy*/) {
 
     ImGui::BeginGroup();
     sectionHeader("Workflow");
-    int pm = st.settings.planMode ? 0 : 1;
-    if (ImGui::RadioButton("Supervised — plan + clarify first", &pm, 0)) changed = true;
-    if (ImGui::RadioButton("Autopilot — model straight from the prompt", &pm, 1))
+    int pm = st.settings.planPreference;
+    if (pm < 0 || pm > 3) pm = st.settings.planMode ? 2 : 0;
+    // Compact 4-way; falls back cleanly if only binary was known.
+    static const char* kPref[] = {"Off", "Option", "Encourage", "Require"};
+    ImGui::SetNextItemWidth(160.0f * S);
+    if (ImGui::Combo("Plan preference", &pm, kPref, 4)) {
+        st.settings.planPreference = pm;
+        st.settings.planMode = (pm != 0);
         changed = true;
-    st.settings.planMode = (pm == 0);
+    }
     ImGui::EndGroup();
 
     if (twoCol) ImGui::SameLine(0.0f, 28.0f * S);

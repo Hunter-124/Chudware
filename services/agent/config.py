@@ -261,6 +261,110 @@ def advisor_enabled(cfg: dict | None = None) -> bool:
     return DEFAULT_ADVISOR
 
 
+# --------------------------------------------------------------------------- preference enums
+# Shared with host Settings: off | option | encourage | require
+VALID_PREFERENCES = frozenset({"off", "option", "encourage", "require"})
+DEFAULT_PLAN_PREFERENCE = "encourage"
+DEFAULT_SUBAGENT_PREFERENCE = "option"
+DEFAULT_ADVISOR_PREFERENCE = "encourage"
+DEFAULT_MEMORY_ENABLED = True
+DEFAULT_MEMORY_TOKEN_BUDGET = 400
+
+
+def _parse_preference(raw, default: str) -> str:
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        return "encourage" if raw else "off"
+    if isinstance(raw, (int, float)):
+        try:
+            n = int(raw)
+        except (TypeError, ValueError):
+            return default
+        return ("off", "option", "encourage", "require")[n] if 0 <= n <= 3 else default
+    s = str(raw).strip().lower()
+    if s in ("0", "false", "no"):
+        return "off"
+    if s in ("1", "optional"):
+        return "option"
+    if s in ("2", "recommended", "true", "yes", "on"):
+        return "encourage"
+    if s in ("3", "required", "always"):
+        return "require"
+    return s if s in VALID_PREFERENCES else default
+
+
+def get_plan_preference(cfg: dict | None = None) -> str:
+    """Return plan preference string (default encourage). Honors legacy plan_mode bool."""
+    c = cfg if cfg is not None else load_config()
+    if not isinstance(c, dict):
+        return DEFAULT_PLAN_PREFERENCE
+    if "plan_preference" in c:
+        return _parse_preference(c.get("plan_preference"), DEFAULT_PLAN_PREFERENCE)
+    agent = c.get(AGENT_CONFIG_KEY) if isinstance(c.get(AGENT_CONFIG_KEY), dict) else {}
+    if isinstance(agent, dict) and "plan_preference" in agent:
+        return _parse_preference(agent.get("plan_preference"), DEFAULT_PLAN_PREFERENCE)
+    # Legacy bool
+    if "plan_mode" in c:
+        return "encourage" if bool(c.get("plan_mode")) else "off"
+    return DEFAULT_PLAN_PREFERENCE
+
+
+def get_subagent_preference(cfg: dict | None = None) -> str:
+    c = cfg if cfg is not None else load_config()
+    agent = _agent_block(c if isinstance(c, dict) else None)
+    if "subagent_preference" in agent:
+        return _parse_preference(agent.get("subagent_preference"), DEFAULT_SUBAGENT_PREFERENCE)
+    if isinstance(c, dict) and "subagent_preference" in c:
+        return _parse_preference(c.get("subagent_preference"), DEFAULT_SUBAGENT_PREFERENCE)
+    return DEFAULT_SUBAGENT_PREFERENCE
+
+
+def get_advisor_preference(cfg: dict | None = None) -> str:
+    """off|option|encourage|require. Env AI_CAD_ADVISOR=0 forces off."""
+    import os
+
+    env = os.environ.get("AI_CAD_ADVISOR")
+    if env is not None and str(env).strip() != "":
+        if str(env).strip().lower() in ("0", "false", "no", "off"):
+            return "off"
+    c = cfg if cfg is not None else load_config()
+    agent = _agent_block(c if isinstance(c, dict) else None)
+    if "advisor_preference" in agent:
+        return _parse_preference(agent.get("advisor_preference"), DEFAULT_ADVISOR_PREFERENCE)
+    if isinstance(c, dict) and "advisor_preference" in c:
+        return _parse_preference(c.get("advisor_preference"), DEFAULT_ADVISOR_PREFERENCE)
+    # Fall back to bool agent.advisor
+    if not advisor_enabled(c if isinstance(c, dict) else None):
+        return "off"
+    return DEFAULT_ADVISOR_PREFERENCE
+
+
+def memory_enabled(cfg: dict | None = None) -> bool:
+    c = cfg if cfg is not None else load_config()
+    if isinstance(c, dict) and "memory_enabled" in c:
+        return bool(c.get("memory_enabled"))
+    agent = _agent_block(c if isinstance(c, dict) else None)
+    if "memory_enabled" in agent:
+        return bool(agent.get("memory_enabled"))
+    return DEFAULT_MEMORY_ENABLED
+
+
+def get_memory_token_budget(cfg: dict | None = None) -> int:
+    c = cfg if cfg is not None else load_config()
+    raw = None
+    if isinstance(c, dict) and "memory_token_budget" in c:
+        raw = c.get("memory_token_budget")
+    else:
+        agent = _agent_block(c if isinstance(c, dict) else None)
+        raw = agent.get("memory_token_budget", DEFAULT_MEMORY_TOKEN_BUDGET)
+    try:
+        b = int(raw)
+    except (TypeError, ValueError):
+        b = DEFAULT_MEMORY_TOKEN_BUDGET
+    return max(50, min(4000, b))
+
+
 # --------------------------------------------------------------------------- compaction / session cmds
 # Shared with host + session_cmds (omp port). Nested under ``agent`` unless noted.
 #

@@ -1847,6 +1847,23 @@ def _kimi_reset_iso(data: dict, now_ms: float) -> str | None:
     return None
 
 
+def _kimi_window_id(duration: float | None, time_unit: str) -> str:
+    """Short window id from a {duration, timeUnit} block: 300 minutes -> '5h'."""
+    if duration is None or not time_unit:
+        return "default"
+    upper = time_unit.upper()
+    d = int(duration)
+    if "MINUTE" in upper:
+        return f"{d // 60}h" if (d >= 60 and d % 60 == 0) else f"{d}m"
+    if "HOUR" in upper:
+        return f"{d}h"
+    if "DAY" in upper:
+        return f"{d}d"
+    if "SECOND" in upper:
+        return f"{d}s"
+    return "default"
+
+
 def _kimi_usage_row(data: dict, default_label: str, now_ms: float) -> dict | None:
     limit = _to_number(data.get("limit"))
     used = _to_number(data.get("used"))
@@ -1899,28 +1916,77 @@ def _parse_kimi_usage_payload(payload: Any) -> list[dict]:
             if row is None:
                 continue
             if duration is not None and time_unit:
-                row["window"] = f"{int(duration)}{time_unit.lower()}"
+                row["window"] = _kimi_window_id(duration, time_unit)
                 row["label"] = str(label)
             # Kimi puts resetTime on the limit detail, not on window — fall back
             # to the row-level reset so the UI can render "resets in …".
             if not row.get("resets_at"):
                 row["resets_at"] = _kimi_reset_iso(window_data, now_ms)
             rows.append(row)
+    parallel = payload.get("parallel")
+    if isinstance(parallel, dict):
+        # {limit: "30", details: [active session ids]} — used = len(details).
+        details = parallel.get("details")
+        if isinstance(details, list) and "used" not in parallel:
+            parallel = {**parallel, "used": len(details)}
+        row = _kimi_usage_row(parallel, "Concurrent sessions", now_ms)
+        if row:
+            row["window"] = "parallel"
+            rows.append(row)
     return rows
 
 
+def _kimi_identity(payload: Any, cred: dict) -> dict:
+    """Plan + display label from the /usages `user` block.
+
+    Kimi's OAuth JWT carries only sub/user_id/device_id (no email/name), so the
+    membership level is the only human identity available — mirror the xAI
+    degrade path's honest fallback labels.
+    """
+    out: dict[str, Any] = {}
+    user = payload.get("user") if isinstance(payload, dict) else None
+    plan = None
+    uid = None
+    if isinstance(user, dict):
+        uid = user.get("userId") or user.get("user_id")
+        membership = user.get("membership") if isinstance(user.get("membership"), dict) else {}
+        level = membership.get("level") or user.get("level")
+        if isinstance(level, str) and level.strip():
+            # LEVEL_ADVANCED -> Advanced
+            plan = level.strip().removeprefix("LEVEL_").replace("_", " ").title()
+    if plan:
+        out["plan"] = plan
+    short = (str(uid).split("-")[0][:8] if uid else "") or (
+        str(cred.get("account_id") or "").split("-")[0][:8]
+    )
+    if plan and short:
+        out["display_name"] = f"Kimi {plan} ({short})"
+    elif plan:
+        out["display_name"] = f"Kimi {plan}"
+    elif short:
+        out["display_name"] = f"Kimi ({short})"
+    return out
+
+
 def fetch_kimi_usage(cred: dict) -> dict:
-    """Kimi For Coding usage: GET {base}/usages with Bearer + Kimi CLI headers."""
+    """Kimi For Coding usage: GET {base}/usages with Bearer + Kimi CLI headers.
+
+    Refreshes an expired token inline (Python owns refresh; Settings may poll
+    long before any agent run calls ensure_fresh), then maps the usage/limits/
+    parallel blocks and the user membership level into rows + identity.
+    """
+    from . import kimi_sub_provider as ksp
+
+    if sub_auth.is_expired(cred, skew_ms=0) and cred.get("refresh_token"):
+        try:
+            prov = ksp.KimiSubProvider()
+            prov._cred = cred
+            cred = prov.refresh()
+        except Exception as exc:  # noqa: BLE001 — fall through with stale token
+            log.info("kimi usage: inline refresh failed: %s", exc)
     token = cred.get("access_token") or ""
     if not token:
         return {"usage": [], "plan": cred.get("plan"), "source": "unavailable"}
-    # ensure_fresh owns refresh; an expired token short-circuits this probe — the
-    # next poll cycle carries a freshly refreshed credential (omp does the same).
-    if sub_auth.is_expired(cred, skew_ms=0):
-        return {"usage": [], "plan": cred.get("plan"), "source": "unavailable"}
-    import urllib.request
-
-    from . import kimi_sub_provider as ksp
 
     url = f"{ksp._base_url()}/usages"
     headers = {
@@ -1928,18 +1994,24 @@ def fetch_kimi_usage(cred: dict) -> dict:
         "Accept": "application/json",
         **ksp.get_kimi_common_headers(),
     }
-    req = urllib.request.Request(url, headers=headers, method="GET")
-    try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        if exc.code == 429:
-            raise _RateLimited() from exc
-        raise
+    status, payload, _rh = _http_get(url, headers, timeout=12.0)
+    if status == 429:
+        raise _RateLimited()
+    if status == 401 and cred.get("refresh_token"):
+        # Token rejected despite a fresh-looking expiry — refresh once and retry.
+        prov = ksp.KimiSubProvider()
+        prov._cred = cred
+        cred = prov.refresh()
+        headers["Authorization"] = f"Bearer {cred['access_token']}"
+        status, payload, _rh = _http_get(url, headers, timeout=12.0)
+    if status != 200:
+        raise RuntimeError(f"kimi usages returned HTTP {status}")
     rows = _parse_kimi_usage_payload(payload)
+    identity = _kimi_identity(payload, cred)
     return {
         "usage": rows,
-        "plan": cred.get("plan"),
+        "plan": identity.get("plan") or cred.get("plan"),
+        "display_name": identity.get("display_name") or cred.get("display_name"),
         "source": "api" if rows else "unavailable",
         "dashboard_url": DASHBOARD_URLS.get("kimi"),
     }

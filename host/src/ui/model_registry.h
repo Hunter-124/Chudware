@@ -27,7 +27,8 @@ enum ProviderIndex {
                           // so the offline (ITAR) guard REFUSES it while local stays allowed.
     PROV_XAI = 6,         // xAI Grok — API key (console.x.ai) and/or SuperGrok OAuth (xai-sub)
     PROV_CURSOR = 7,      // Cursor (Composer + proxied Anthropic/OpenAI models)
-    PROV_COUNT = 8,
+    PROV_KIMISUB = 8,     // Kimi Code subscription — OAuth via subscription_auth (wire "kimi-sub")
+    PROV_COUNT = 9,
 };
 
 struct ModelInfo {
@@ -56,13 +57,15 @@ inline const char* providerLabel(int provider) {
         case PROV_CLOUDCOMPAT: return "OpenRouter / Cloud API";
         case PROV_XAI: return "xAI (Grok)";
         case PROV_CURSOR: return "Cursor";
+        case PROV_KIMISUB: return "Kimi Code (subscription)";
         default: return "?";
     }
 }
 
 inline bool providerIsCloud(int provider) {
     return provider == PROV_ANTHROPIC || provider == PROV_OPENAI || provider == PROV_GEMINI ||
-           provider == PROV_CLOUDCOMPAT || provider == PROV_XAI || provider == PROV_CURSOR;
+           provider == PROV_CLOUDCOMPAT || provider == PROV_XAI || provider == PROV_CURSOR ||
+           provider == PROV_KIMISUB;
 }
 
 // ---- provider/service CATEGORY keys (for Manage-models categories + bulk on/off) ----
@@ -79,6 +82,7 @@ inline const char* providerCatKey(int provider) {
         case PROV_CLOUDCOMPAT: return "cloud";  // refine with cloudServiceKey(base_url)
         case PROV_XAI: return "xai";
         case PROV_CURSOR: return "cursor";
+        case PROV_KIMISUB: return "kimi-code";
         default: return "other";
     }
 }
@@ -103,6 +107,7 @@ inline const char* categoryLabel(const std::string& key) {
     if (key == "moonshot") return "Moonshot (Kimi)";
     if (key == "xai") return "xAI (Grok)";
     if (key == "cursor") return "Cursor";
+    if (key == "kimi-code") return "Kimi Code (subscription)";
     return "Cloud API";
 }
 
@@ -119,20 +124,21 @@ inline const std::vector<ModelInfo>& builtinModels() {
         {PROV_ANTHROPIC, "claude-sonnet-5", "Claude Sonnet 5", true, true},
         {PROV_ANTHROPIC, "claude-fable-5", "Claude Fable 5", true, true},
         {PROV_ANTHROPIC, "claude-haiku-4-5", "Claude Haiku 4.5", true, false},
-        // OpenAI cloud.
+        // OpenAI cloud (gpt-5.6-sol is current; older ≤ gpt-5.5 and o3 purged).
         {PROV_OPENAI, "gpt-5.6-sol", "GPT-5.6 Sol", true, true},
-        {PROV_OPENAI, "o3", "OpenAI o3", false, true},
         // Cursor — Composer + proxied Anthropic/OpenAI flagships.
         {PROV_CURSOR, "composer-2.5", "Cursor Composer 2.5", true, true},
         {PROV_CURSOR, "cursor/claude-opus-4-8", "Claude Opus 4.8 (Cursor)", true, true},
         {PROV_CURSOR, "cursor/claude-sonnet-5", "Claude Sonnet 5 (Cursor)", true, true},
         {PROV_CURSOR, "cursor/gpt-5.6-sol", "GPT-5.6 Sol (Cursor)", true, true},
+        // Kimi Code subscription (wire provider "kimi-sub") — distinct from Moonshot API key rows.
+        {PROV_KIMISUB, "kimi-for-coding", "Kimi For Coding (subscription)", true, true},
         // xAI Grok — multimodal on 4.x; reasoning variants expose effort.
         // Model ids from hermes-agent catalog / console.x.ai (2026).
         // grok-4.5 is the current default (500k context; ~$2/$6 per Mtok).
+        // grok-4 original purged (superseded by grok-4.5); keep 4.1 / 4.20-reasoning / build.
         {PROV_XAI, "grok-4.5", "Grok 4.5 (default, 500k)", true, true},
         {PROV_XAI, "grok-4-1", "Grok 4.1", true, true},
-        {PROV_XAI, "grok-4", "Grok 4", true, true},
         {PROV_XAI, "grok-4.20-0309-reasoning", "Grok 4.20 Reasoning", true, true},
         {PROV_XAI, "grok-build-0.1", "Grok Build 0.1", true, false},
     };
@@ -221,12 +227,12 @@ inline const std::vector<LocalPreset>& cloudPresets() {
          "Official DeepSeek API reasoning model (R1).", kDeepSeek},
         // Moonshot (Kimi) — first-class "moonshot" wire provider (keys.moonshot), DIRECT
         // api.moonshot.ai billing. Label says "Moonshot API" to distinguish these rows from
-        // OpenRouter's live catalog, which also carries Kimi models ("MoonshotAI: …") but
-        // bills the OpenRouter balance instead.
+        // the Kimi Code subscription (PROV_KIMISUB / kimi-for-coding) and from OpenRouter's
+        // live catalog, which also carries Kimi models ("MoonshotAI: …") but bills OpenRouter.
         {"kimi-k3", "Moonshot API \xc2\xb7 Kimi K3 (1M, $3/$15)", true,
          "DIRECT api.moonshot.ai — bills keys.moonshot, NOT OpenRouter. 1M context, native vision, always-reasons.", kMoonshot},
-        {"kimi-k2.6", "Moonshot API \xc2\xb7 Kimi K2.6 (256K, $0.95/$4)", true,
-         "DIRECT api.moonshot.ai — bills keys.moonshot. Cheaper Kimi for lighter/leaf assignments; 256K context, vision.", kMoonshot},
+        {"kimi-k2.7-code", "Moonshot API \xc2\xb7 Kimi K2.7 Code (256K)", true,
+         "DIRECT api.moonshot.ai — bills keys.moonshot. Kimi K2.7 Code for lighter/leaf assignments; 256K context, vision.", kMoonshot},
     };
     return kPresets;
 }
@@ -269,8 +275,9 @@ inline int defaultContextWindowForModel(int provider, const std::string& id,
     if (has("gpt-4o") || has("gpt-4-turbo") || has("4o-mini")) return 128000;
     if (has("gpt-3.5")) return 16385;
     if (has("qwen") || has("deepseek")) return 128000;
-    // Moonshot Kimi — check 256k / k2 BEFORE bare kimi-k3 (kimi-k3-256k contains "kimi-k3").
-    if (has("kimi-k3-256k") || has("kimi-k2")) return 262144;
+    // Moonshot Kimi / Kimi Code — check 256k / k2 / for-coding BEFORE bare kimi-k3
+    // (kimi-k3-256k contains "kimi-k3").
+    if (has("kimi-k3-256k") || has("kimi-k2") || has("kimi-for-coding")) return 262144;
     if (has("kimi-k3")) return 1048576;
     // Grok 4.5 ships with a 500k context window; older grok-4.x is ~128k.
     if (has("grok-4.5") || has("grok-4-5")) return 500000;
@@ -282,6 +289,7 @@ inline int defaultContextWindowForModel(int provider, const std::string& id,
         case PROV_CLOUDCOMPAT:
         case PROV_XAI:
         case PROV_CURSOR: return 128000;
+        case PROV_KIMISUB: return 262144;
         default: return 8192;
     }
 }

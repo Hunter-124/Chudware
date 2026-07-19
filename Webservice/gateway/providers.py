@@ -65,7 +65,6 @@ _MODEL_PRESETS: dict[str, list[dict[str, str]]] = {
     ],
     "openai": [
         {"id": "gpt-5.6-sol", "label": "GPT-5.6 Sol"},
-        {"id": "o3", "label": "OpenAI o3"},
     ],
     "codex-sub": [
         {"id": "gpt-5-codex", "label": "GPT-5 Codex"},
@@ -77,14 +76,12 @@ _MODEL_PRESETS: dict[str, list[dict[str, str]]] = {
     "xai": [
         {"id": "grok-4.5", "label": "Grok 4.5 (default, 500k)"},
         {"id": "grok-4-1", "label": "Grok 4.1"},
-        {"id": "grok-4", "label": "Grok 4"},
         {"id": "grok-4.20-0309-reasoning", "label": "Grok 4.20 Reasoning"},
         {"id": "grok-build-0.1", "label": "Grok Build 0.1"},
     ],
     "xai-sub": [
         {"id": "grok-4.5", "label": "Grok 4.5 (default, 500k)"},
         {"id": "grok-4-1", "label": "Grok 4.1"},
-        {"id": "grok-4", "label": "Grok 4"},
         {"id": "grok-4.20-0309-reasoning", "label": "Grok 4.20 Reasoning"},
         {"id": "grok-build-0.1", "label": "Grok Build 0.1"},
     ],
@@ -96,7 +93,7 @@ _MODEL_PRESETS: dict[str, list[dict[str, str]]] = {
     ],
     "moonshot": [
         {"id": "kimi-k3", "label": "Moonshot · Kimi K3 (1M)"},
-        {"id": "kimi-k2.6", "label": "Moonshot · Kimi K2.6 (256K)"},
+        {"id": "kimi-k2.7-code", "label": "Moonshot · Kimi K2.7 Code (256K)"},
     ],
     "openrouter": [
         {"id": "qwen/qwen3-coder:free", "label": "OpenRouter · Qwen3-Coder (free)"},

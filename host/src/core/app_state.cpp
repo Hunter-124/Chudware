@@ -222,6 +222,7 @@ void loadSettings(Settings& s) {
         else if (prov == "llamacpp" || prov == "llama.cpp" || prov == "llama-cpp") s.provider = 3;
         else if (prov == "xai" || prov == "xai-sub") s.provider = 6;  // PROV_XAI
         else if (prov == "cursor" || prov == "cursor-sub") s.provider = 7;  // PROV_CURSOR
+        else if (prov == "kimi-sub") s.provider = 8;  // PROV_KIMISUB (Kimi Code subscription OAuth)
         else if (prov == "moonshot") {
             // First-class Moonshot (Kimi) wire provider — GUI still uses the cloud-compat slot
             // (PROV_CLOUDCOMPAT=5) so the model picker / base_url path stays shared.
@@ -237,6 +238,7 @@ void loadSettings(Settings& s) {
         if (s.provider == 3) model = llama.value("model_path", model);
         if (s.provider == 3 && model.empty()) model = kDefaultLlamaModelPath;
         if (s.provider == 6 && model.empty()) model = "grok-4.5";
+        if (s.provider == 8 && model.empty()) model = "kimi-for-coding";
         if (prov == "moonshot" && model.empty()) model = "kimi-k3";
         copyStr(s.model, sizeof(s.model), model);
         std::string activeKey = j.value("api_key", "");
@@ -456,7 +458,26 @@ void saveSettings(const Settings& s) {
             j["provider"] = "xai-sub";
         }
         j["model"] = s.model[0] ? s.model : "grok-4.5";
+    } else if (s.provider == 7) {
+        // Cursor — subscription OAuth via subscription_auth; no API key field.
+        j["provider"] = "cursor";
+        j["model"] = s.model[0] ? s.model : "composer-2.5";
+    } else if (s.provider == 8) {
+        // Kimi Code subscription — OAuth credential lives in subscription_auth (like xai-sub).
+        // Distinct from Moonshot API key path (provider "moonshot" / keys.moonshot).
+        j["provider"] = "kimi-sub";
+        j["model"] = s.model[0] ? s.model : "kimi-for-coding";
+    } else if (s.provider == 3) {
+        j["provider"] = "llamacpp";
+        j["model"] = "local-gguf";
+        j["llamacpp"] = {
+            {"base_url", s.baseUrl[0] ? s.baseUrl : "http://127.0.0.1:1234/v1"},
+            {"model_path", s.model[0] ? s.model : kDefaultLlamaModelPath},
+            {"auto_start", true},
+            {"vision", s.vision}
+        };
     } else {
+        // Fallback: treat unknown provider indices as managed llama.cpp (legacy default).
         j["provider"] = "llamacpp";
         j["model"] = "local-gguf";
         j["llamacpp"] = {

@@ -1218,7 +1218,7 @@ struct AppState {
     int selectedPart = -1;            // -1 = whole assembly; >=0 = index into asmParts
 
     // ---- model picker availability (filled by the agent_list_models probe) ----
-    ProviderModels providerModels[8];        // indexed by ui::ProviderIndex (PROV_COUNT=8; PROV_CURSOR=7). Literal: model_registry.h not included here.
+    ProviderModels providerModels[9];        // indexed by ui::ProviderIndex (PROV_COUNT=9; PROV_KIMISUB=8). Literal: model_registry.h not included here.
     std::atomic<bool> modelProbeInFlight{false};
 
     std::vector<char> chatInput{std::vector<char>(2048, 0)};

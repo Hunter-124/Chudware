@@ -1845,3 +1845,28 @@ device-code UX, gateway provider list, and a diag script. Contract append in
 (urlopen-mocked, no network). **Deferred:** no C++ core/agent port — Python-only
 like cursor-sub/codex-sub; no model-picker PROV enum.
 
+
+### copilot UI: plan card, streaming, stop/steer, 2x-quota, WASM AI-settings — 2026-07-19
+Fixed the AI copilot chat surface (desktop + WASM share one C++ codebase).
+**Plan card:** tile overlap was SameLine laying out relative to the status-glyph Dummy
+inside `planDrawTile` — re-assert full-tile Dummy as last item; todos I.Tasks/II.Parts
+duplication was dual writers with divergent ids (`name` vs `part:N:name`) — unified
+legacy `planStateFromPlanInfo` to bare-name ids + empty phase/status so upsert replaces.
+**Streaming:** `assistant_delta` prose now dual-writes into `ChatMsg.text` live (Output
+box collapsed); `run_finished` promote guarded by `m.text.empty()`.
+**Stop freeze (web):** load-time persistent `AgentControlChannel` thread for
+cancel+steer — no per-click `std::thread` (WASM pthread pool exhaustion blocked main).
+**Steer:** new `agent_steer {run_id,text}` RPC (worker_client side-socket like cancel,
+libaicad dispatch, `RunControl::SteerQueue` drained at stage/attempt boundaries into
+`[User steering]` request text); composer submit-while-active steers when runId known
+and records a chat bubble; queue fallback only without runId.
+**2x quota:** on agent_run_v2 transport failure with known runId, auto-cancel the
+orphaned hostd run outside `job.mtx`. Dual event delivery / reconnect replay killed
+by evidence (hostd `sendEventTo` originating client only; batched events erased when
+streamed). **WASM AI-settings abort:** present-but-null `.value()` type_error.302 under
+DISABLE_EXCEPTION_CATCHING — hardened subscription/roles/rankings polls in
+settings_modal.cpp + drawAiSettingsSection/xAI/ov/picker paths in legacy_chat.cpp with
+null-safe helpers. Staged via `./build.sh daemon|stage|wasm` + `install_webd.sh --restart`.
+**Gotchas:** engine-behavior needs OCCT daemon rebuild+stage (not just host in-proc);
+browser WS can't send X-Dev-User so local gateway DEV repro of live RPC payloads is
+limited; feature_surface_audit still fails pre-existing Sketch3D/RevEng handler gaps.

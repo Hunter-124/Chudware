@@ -8368,6 +8368,26 @@ static char* providerKeyBuf(Settings& s, int provider) {
 static bool providerUsable(AppState& st, int provider);
 static bool localModelLoaded(const ProviderModels& pm, const std::string& id);
 
+// WASM-safe JSON accessors: present-but-null / wrong-type fields must not throw
+// (WASM builds disable exception catching → page abort on type_error.302).
+static std::string jsonOptStr(const nlohmann::json& obj, const char* key) {
+    if (!obj.is_object()) return {};
+    auto it = obj.find(key);
+    return it != obj.end() && it->is_string() ? it->get<std::string>() : std::string();
+}
+static bool jsonOptBool(const nlohmann::json& obj, const char* key, bool dflt = false) {
+    if (!obj.is_object()) return dflt;
+    auto it = obj.find(key);
+    if (it == obj.end() || it->is_null()) return dflt;
+    return it->is_boolean() ? it->get<bool>() : dflt;
+}
+static nlohmann::json jsonOptObj(const nlohmann::json& obj, const char* key) {
+    if (!obj.is_object()) return nlohmann::json::object();
+    auto it = obj.find(key);
+    if (it == obj.end() || !it->is_object()) return nlohmann::json::object();
+    return *it;
+}
+
 // Shared AI settings, split by section so Settings can glass-group them.
 // ProviderModel = provider + model + auth/status; Generation = effort/tokens/window;
 // Privacy = offline + thoughts; ManageModels = chat-picker visibility.
@@ -8606,18 +8626,18 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
             st.rpc.call("subscription_status", nlohmann::json::object(),
                         [](const core::RpcResult& r) {
                 if (!r.ok || !r.result.is_object()) return;
-                auto providers = r.result.value("providers", nlohmann::json::object());
-                auto x = providers.value("xai", nlohmann::json::object());
-                s_xaiConnected = x.value("connected", false);
-                s_xaiEmail = x.value("email", std::string());
-                s_xaiLoginBusy = x.value("login_in_progress", false);
-                s_xaiBrowserOpened = x.value("browser_opened", false);
-                s_xaiUserCode = x.value("user_code", std::string());
-                s_xaiVerifyUrl = x.value("verification_url", std::string());
+                auto providers = jsonOptObj(r.result, "providers");
+                auto x = jsonOptObj(providers, "xai");
+                s_xaiConnected = jsonOptBool(x, "connected", false);
+                s_xaiEmail = jsonOptStr(x, "email");
+                s_xaiLoginBusy = jsonOptBool(x, "login_in_progress", false);
+                s_xaiBrowserOpened = jsonOptBool(x, "browser_opened", false);
+                s_xaiUserCode = jsonOptStr(x, "user_code");
+                s_xaiVerifyUrl = jsonOptStr(x, "verification_url");
                 if (s_xaiVerifyUrl.empty())
-                    s_xaiVerifyUrl = x.value("verification_uri", std::string());
-                s_xaiStage = x.value("login_stage", std::string());
-                if (auto err = x.value("last_error", std::string()); !err.empty())
+                    s_xaiVerifyUrl = jsonOptStr(x, "verification_uri");
+                s_xaiStage = jsonOptStr(x, "login_stage");
+                if (auto err = jsonOptStr(x, "last_error"); !err.empty())
                     s_xaiError = err;
                 else if (s_xaiConnected)
                     s_xaiError.clear();
@@ -8694,10 +8714,10 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
                     if (!r.ok) {
                         s_xaiLoginBusy = false;
                         s_xaiError = r.err.empty() ? "login failed" : r.err;
-                    } else if (r.result.is_object() && r.result.value("ok", true) == false) {
+                    } else if (r.result.is_object() && jsonOptBool(r.result, "ok", true) == false) {
                         s_xaiLoginBusy = false;
-                        auto reason = r.result.value("reason", std::string());
-                        auto hint = r.result.value("hint", std::string());
+                        auto reason = jsonOptStr(r.result, "reason");
+                        auto hint = jsonOptStr(r.result, "hint");
                         s_xaiError = reason.empty() ? "login failed" : reason;
                         if (!hint.empty()) s_xaiError += " — " + hint;
                     }
@@ -11107,6 +11127,11 @@ static std::string ovOptStr(const nlohmann::json& obj, const char* key) {
     auto it = obj.find(key);
     return it != obj.end() && it->is_string() ? it->get<std::string>() : std::string();
 }
+static bool ovOptBool(const nlohmann::json& obj, const char* key, bool dflt = false) {
+    auto it = obj.find(key);
+    if (it == obj.end() || it->is_null()) return dflt;
+    return it->is_boolean() ? it->get<bool>() : dflt;
+}
 static void ovParseUsageWindows(const nlohmann::json& src, OvSubAccountRow& row) {
     row.usage.clear();
     row.hasUsage = false;
@@ -11234,8 +11259,9 @@ static void ovPollSubUsage(AppState& st, bool force) {
                 s_ovSub.usageRpcMissing = true;
             return;
         }
-        if (!r.result.is_object() || r.result.value("ok", true) == false) return;
-        ovMergeUsageRows(r.result.value("rows", nlohmann::json::array()));
+        if (!r.result.is_object() || ovOptBool(r.result, "ok", true) == false) return;
+        auto rows = r.result.find("rows");
+        if (rows != r.result.end() && rows->is_array()) ovMergeUsageRows(*rows);
     });
 }
 static void ovPollSubAccounts(AppState& st, bool force) {
@@ -11253,7 +11279,7 @@ static void ovPollSubAccounts(AppState& st, bool force) {
                                                   : r.err;
             return;
         }
-        if (r.result.value("ok", true) == false) {
+        if (ovOptBool(r.result, "ok", true) == false) {
             auto reason = ovOptStr(r.result, "reason");
             s_ovSub.lastError = reason.empty() ? "accounts failed" : reason;
             return;
@@ -11263,15 +11289,15 @@ static void ovPollSubAccounts(AppState& st, bool force) {
         for (const auto& prev : s_ovSub.rows)
             prevByKey[prev.provider + "\n" + prev.accountId] = prev;
         s_ovSub.rows.clear();
-        auto arr = r.result.value("accounts", nlohmann::json::array());
-        if (!arr.is_array()) return;
-        for (const auto& a : arr) {
+        auto arrIt = r.result.find("accounts");
+        if (arrIt == r.result.end() || !arrIt->is_array()) return;
+        for (const auto& a : *arrIt) {
             if (!a.is_object()) continue;
             OvSubAccountRow row;
             row.provider  = ovOptStr(a, "provider");
             row.accountId = ovOptStr(a, "account_id");
-            row.active    = a.value("active", false);
-            row.connected = a.value("connected", true);
+            row.active    = ovOptBool(a, "active", false);
+            row.connected = ovOptBool(a, "connected", true);
             ovParseAccountIdentity(a, row);
             if (!row.hasUsage) {
                 auto it = prevByKey.find(row.provider + "\n" + row.accountId);
@@ -11295,8 +11321,8 @@ static void ovPollSubAccounts(AppState& st, bool force) {
             OvSubLoginProgress& p = s_ovSub.login[it.key()];
             const auto& x = it.value();
             const bool wasInProgress = p.inProgress;
-            p.inProgress = x.value("login_in_progress", false);
-            p.browserOpened = x.value("browser_opened", false);
+            p.inProgress = ovOptBool(x, "login_in_progress", false);
+            p.browserOpened = ovOptBool(x, "browser_opened", false);
             p.userCode = ovOptStr(x, "user_code");
             p.verifyUrl = ovOptStr(x, "verification_url");
             if (p.verifyUrl.empty())
@@ -11304,7 +11330,7 @@ static void ovPollSubAccounts(AppState& st, bool force) {
             p.stage = ovOptStr(x, "login_stage");
             p.lastError = ovOptStr(x, "last_error");
             // Also fold connected into empty-account providers via login map stage.
-            if (x.value("connected", false) && p.stage.empty())
+            if (ovOptBool(x, "connected", false) && p.stage.empty())
                 p.stage = "connected";
             if (wasInProgress && !p.inProgress) {
                 s_ovSub.lastAccountsPoll = -1e9;
@@ -11793,10 +11819,10 @@ static void pollSubConnected(AppState& st) {
                 [](const core::RpcResult& r) {
         s_subConn.inFlight = false;
         if (!r.ok || !r.result.is_object()) return;
-        auto providers = r.result.value("providers", nlohmann::json::object());
+        auto providers = jsonOptObj(r.result, "providers");
         auto connected = [](const nlohmann::json& providers, const char* key) {
-            auto p = providers.value(key, nlohmann::json::object());
-            return p.value("connected", false);
+            auto p = jsonOptObj(providers, key);
+            return jsonOptBool(p, "connected", false);
         };
         s_subConn.xai    = connected(providers, "xai");
         s_subConn.claude = connected(providers, "claude");

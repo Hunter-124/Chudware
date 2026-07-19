@@ -236,6 +236,32 @@ static std::string optionalJsonString(const nlohmann::json& obj, const char* key
     auto it = obj.find(key);
     return it != obj.end() && it->is_string() ? it->get<std::string>() : std::string();
 }
+// Present-but-null / wrong-type fields must not throw under WASM (exception catching
+// disabled → page abort). Default when key missing, null, or not the requested type.
+static bool optionalJsonBool(const nlohmann::json& obj, const char* key, bool dflt = false) {
+    auto it = obj.find(key);
+    if (it == obj.end() || it->is_null()) return dflt;
+    if (it->is_boolean()) return it->get<bool>();
+    return dflt;
+}
+static int optionalJsonInt(const nlohmann::json& obj, const char* key, int dflt = 0) {
+    auto it = obj.find(key);
+    if (it == obj.end() || it->is_null()) return dflt;
+    if (it->is_number_integer()) return it->get<int>();
+    if (it->is_number()) return (int)it->get<double>();
+    return dflt;
+}
+static nlohmann::json optionalJsonObj(const nlohmann::json& obj, const char* key) {
+    auto it = obj.find(key);
+    if (it == obj.end() || !it->is_object()) return nlohmann::json::object();
+    return *it;
+}
+static const nlohmann::json* optionalJsonArr(const nlohmann::json& obj, const char* key) {
+    auto it = obj.find(key);
+    if (it == obj.end() || !it->is_array()) return nullptr;
+    return &(*it);
+}
+
 
 // Parse optional usage array from an account / usage-row object.
 static void parseUsageWindows(const nlohmann::json& src, SubAccountRow& row) {
@@ -465,11 +491,11 @@ static void pollSubscriptionUsage(AppState& st, bool force) {
             return;
         }
         if (!r.result.is_object()) return;
-        if (r.result.value("ok", true) == false) {
+        if (optionalJsonBool(r.result, "ok", true) == false) {
             // Soft failure (e.g. 429 / provider outage) — leave prior usage alone.
             return;
         }
-        mergeUsageRows(r.result.value("rows", nlohmann::json::array()));
+        if (const auto* rows = optionalJsonArr(r.result, "rows")) mergeUsageRows(*rows);
     });
 }
 
@@ -489,7 +515,7 @@ static void pollSubscriptionAccounts(AppState& st, bool force) {
                                                      : r.err;
             return;
         }
-        if (r.result.value("ok", true) == false) {
+        if (optionalJsonBool(r.result, "ok", true) == false) {
             auto reason = optionalJsonString(r.result, "reason");
             s_subAccts.lastError = reason.empty() ? "accounts failed" : reason;
             return;
@@ -502,15 +528,15 @@ static void pollSubscriptionAccounts(AppState& st, bool force) {
             prevByKey[prev.provider + "\n" + prev.accountId] = prev;
         }
         s_subAccts.rows.clear();
-        auto arr = r.result.value("accounts", nlohmann::json::array());
-        if (!arr.is_array()) return;
-        for (const auto& a : arr) {
+        const auto* arr = optionalJsonArr(r.result, "accounts");
+        if (!arr) return;
+        for (const auto& a : *arr) {
             if (!a.is_object()) continue;
             SubAccountRow row;
             row.provider  = optionalJsonString(a, "provider");
             row.accountId = optionalJsonString(a, "account_id");
-            row.active    = a.value("active", false);
-            row.connected = a.value("connected", true);
+            row.active    = optionalJsonBool(a, "active", false);
+            row.connected = optionalJsonBool(a, "connected", true);
             parseAccountIdentity(a, row);
             // If this accounts payload lacked usage, keep the last merged usage.
             if (!row.hasUsage) {
@@ -529,15 +555,15 @@ static void pollSubscriptionAccounts(AppState& st, bool force) {
     st.rpc.call("subscription_status", nlohmann::json::object(),
                 [](const core::RpcResult& r) {
         if (!r.ok || !r.result.is_object()) return;
-        auto providers = r.result.value("providers", nlohmann::json::object());
+        auto providers = optionalJsonObj(r.result, "providers");
         if (!providers.is_object()) return;
         for (auto it = providers.begin(); it != providers.end(); ++it) {
             if (!it.value().is_object()) continue;
             SubLoginProgress& p = s_subAccts.login[it.key()];
             const auto& x = it.value();
             const bool wasInProgress = p.inProgress;
-            p.inProgress = x.value("login_in_progress", false);
-            p.browserOpened = x.value("browser_opened", false);
+            p.inProgress = optionalJsonBool(x, "login_in_progress", false);
+            p.browserOpened = optionalJsonBool(x, "browser_opened", false);
             p.userCode = optionalJsonString(x, "user_code");
             p.verifyUrl = optionalJsonString(x, "verification_url");
             if (p.verifyUrl.empty())
@@ -1224,7 +1250,7 @@ static void pollModelRoles(AppState& st, bool force) {
             return;
         }
         s_roles.rolesRpcMissing = false;
-        auto roles = r.result.value("roles", nlohmann::json::object());
+        auto roles = optionalJsonObj(r.result, "roles");
         if (!roles.is_object()) roles = nlohmann::json::object();
         s_roles.roles.clear();
         for (int i = 0; i < kRoleCount; ++i) {
@@ -1237,13 +1263,14 @@ static void pollModelRoles(AppState& st, bool force) {
                     std::string v = it->get<std::string>();
                     a.isAuto = (v == "auto" || v.empty());
                 } else if (it->is_object()) {
-                    a.provider = it->value("provider", std::string());
-                    a.model = it->value("model", std::string());
+                    a.provider = optionalJsonString(*it, "provider");
+                    a.model = optionalJsonString(*it, "model");
                     // Model auto when provider+model absent (or explicit mode=auto).
-                    const std::string mode = it->value("mode", std::string());
+                    const std::string mode = optionalJsonString(*it, "mode");
                     a.isAuto = (mode == "auto") || (a.provider.empty() && a.model.empty());
                     // thinking: auto|low|medium|high (default auto).
-                    std::string th = it->value("thinking", std::string("auto"));
+                    std::string th = optionalJsonString(*it, "thinking");
+                    if (th.empty()) th = "auto";
                     if (th != "low" && th != "medium" && th != "high" && th != "auto")
                         th = "auto";
                     a.thinking = th;
@@ -1282,18 +1309,19 @@ static void pollModelRankings(AppState& st, bool force) {
         }
         s_roles.rankingsRpcMissing = false;
         s_roles.rankings.clear();
-        auto ranks = r.result.value("rankings", nlohmann::json::object());
+        auto ranks = optionalJsonObj(r.result, "rankings");
         if (ranks.is_object()) {
             for (auto it = ranks.begin(); it != ranks.end(); ++it) {
                 if (!it.value().is_object()) continue;
                 ModelRankingRow row;
                 row.modelId = it.key();
-                row.rank = it.value().value("rank", 3);
+                row.rank = optionalJsonInt(it.value(), "rank", 3);
                 if (row.rank < 1) row.rank = 1;
                 if (row.rank > 5) row.rank = 5;
-                row.source = it.value().value("source", std::string("shipped"));
-                row.notes = it.value().value("notes", std::string());
-                row.provider = it.value().value("provider", std::string());
+                row.source = optionalJsonString(it.value(), "source");
+                if (row.source.empty()) row.source = "shipped";
+                row.notes = optionalJsonString(it.value(), "notes");
+                row.provider = optionalJsonString(it.value(), "provider");
                 s_roles.rankings.push_back(std::move(row));
             }
         }
@@ -1342,11 +1370,12 @@ static void setRoleAssign(AppState& st, const char* roleKey, const RoleAssign& a
                 if (it->is_string()) {
                     a.isAuto = (it->get<std::string>() == "auto");
                 } else if (it->is_object()) {
-                    a.provider = it->value("provider", std::string());
-                    a.model = it->value("model", std::string());
-                    const std::string mode = it->value("mode", std::string());
+                    a.provider = optionalJsonString(*it, "provider");
+                    a.model = optionalJsonString(*it, "model");
+                    const std::string mode = optionalJsonString(*it, "mode");
                     a.isAuto = (mode == "auto") || (a.provider.empty() && a.model.empty());
-                    std::string th = it->value("thinking", std::string("auto"));
+                    std::string th = optionalJsonString(*it, "thinking");
+                    if (th.empty()) th = "auto";
                     if (th != "low" && th != "medium" && th != "high" && th != "auto")
                         th = "auto";
                     a.thinking = th;

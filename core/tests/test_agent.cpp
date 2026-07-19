@@ -1315,6 +1315,74 @@ TEST_CASE("run_machine chamfer on empty doc rejects nothing to modify") {
     CHECK(model_n == 0);
 }
 
+TEST_CASE("run_machine capability McMaster request is not unintelligible") {
+    // Mirrors the production override: when the LLM wrongly rejects a parts-library /
+    // McMaster capability request, the host accepts it (is_capability_request) and the
+    // machine continues past intake. Here we assert the ACCEPT path: intake pass with
+    // a capability-shaped spec reaches plan/model (not unintelligible_request).
+    DesignState st;
+    st.request = "download a model from McMaster to test tooling for the parts library";
+    int plan_n = 0, model_n = 0;
+    StageActions actions = bare_pass_actions();
+    actions.intake = [](DesignState& s, int) {
+        // Simulate the capability override path in run.cpp intake.
+        StageOutcome o;
+        o.verdict = "pass";
+        o.reason = "capability request accepted: capability: parts-library/McMaster fetch";
+        o.parsed_ok = true;
+        s.spec = ojson::parse(R"({
+            "object": "capability request",
+            "key_dims": {},
+            "features": ["capability: parts-library/McMaster fetch"],
+            "constraints": [],
+            "capability": true
+        })");
+        return o;
+    };
+    actions.plan = [&](DesignState&, int) {
+        ++plan_n;
+        return pass_outcome();
+    };
+    actions.model = [&](DesignState& s, int) {
+        ++model_n;
+        s.revision += 1;
+        return pass_outcome("modeled");
+    };
+
+    RunEvents events("intake-mcmaster-cap-ut", nullptr);
+    json result = run_machine(st, actions, events,
+                              json{{"intake", 1}, {"plan", 1}, {"model", 1},
+                                   {"review", 1}, {"fix", 1}, {"memory", 1}});
+    CHECK(result["status"] == "done");
+    CHECK(result.value("stop_reason", std::string()) != "unintelligible_request");
+    CHECK(plan_n == 1);
+    CHECK(model_n == 1);
+}
+
+TEST_CASE("run_machine reject still surfaces classifier reason") {
+    // Transparency: error_detail must carry the intake reason, not a bare code.
+    DesignState st;
+    st.request = "zzzz not real";
+    StageActions actions = bare_pass_actions();
+    actions.intake = [](DesignState&, int) {
+        StageOutcome o;
+        o.verdict = "fail";
+        o.reason = "gibberish / non-CAD content";
+        o.has_error = true;
+        o.error = "unintelligible_request";
+        o.parsed_ok = true;
+        return o;
+    };
+    RunEvents events("intake-reason-surface-ut", nullptr);
+    json result = run_machine(st, actions, events,
+                              json{{"intake", 1}, {"plan", 1}, {"model", 1},
+                                   {"review", 1}, {"fix", 1}, {"memory", 1}});
+    CHECK(result["status"] == "failed");
+    CHECK(result["stop_reason"] == "unintelligible_request");
+    CHECK(result.value("error_detail", std::string()) == "gibberish / non-CAD content");
+    CHECK(result.value("error_human", std::string()) == "gibberish / non-CAD content");
+}
+
 
 TEST_CASE("run_machine solo_skip_plan omits plan action entirely") {
     DesignState st;

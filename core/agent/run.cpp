@@ -822,14 +822,27 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         // routed. Mirrors aicad.router/1 / the Python agent.classification producer so the
         // host renders the same card for the C++ live path (previously only complexity/
         // task_route were emitted, which the GUI does not draw as a routing card).
-        events.emit("agent.classification",
-                    json{{"task_class", dom.label()},
-                         {"scaffold_level", cx.label()},
-                         {"tier", provider_cfg.value("model", std::string())},
-                         {"reason", dom.reason.empty() ? cx.reason : dom.reason},
-                         {"request_snippet", request.substr(0, 120)},
-                         {"picked_model", provider_cfg.value("model", std::string())},
-                         {"picked_provider", provider_cfg.value("name", std::string())}});
+        // reason carries domain match terms AND complexity so the card shows why.
+        {
+            std::string why = dom.reason;
+            if (!cx.reason.empty()) {
+                if (!why.empty()) why += " · ";
+                why += cx.reason;
+            }
+            const std::string cap_why = capability_request_reason(request);
+            if (!cap_why.empty()) {
+                if (!why.empty()) why += " · ";
+                why += cap_why;
+            }
+            events.emit("agent.classification",
+                        json{{"task_class", dom.label()},
+                             {"scaffold_level", cx.label()},
+                             {"tier", provider_cfg.value("model", std::string())},
+                             {"reason", why},
+                             {"request_snippet", request.substr(0, 120)},
+                             {"picked_model", provider_cfg.value("model", std::string())},
+                             {"picked_provider", provider_cfg.value("name", std::string())}});
+        }
         // Complexity routing decision (GUI shows which structure was chosen + why).
         events.emit("complexity", json{{"level", cx.label()},
                                        {"reason", cx.reason},
@@ -1108,6 +1121,34 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
                 if (spec.contains("reason") && spec["reason"].is_string() &&
                     !spec["reason"].get<std::string>().empty())
                     reason = spec["reason"].get<std::string>();
+                // Capability-aware override: parts-library / McMaster / measure /
+                // CAM / sim / ECAD / RE / drawing requests are in-product work even
+                // when the LLM mislabels them "not a CAD design request". Accept
+                // with a minimal capability spec so the pipeline keeps routing.
+                if (is_capability_request(st.request)) {
+                    const std::string cap_why = capability_request_reason(st.request);
+                    ojson cap_spec = ojson::object();
+                    cap_spec["object"] = "capability request";
+                    cap_spec["key_dims"] = ojson::object();
+                    cap_spec["features"] = ojson::array({cap_why.empty()
+                                                            ? std::string("in-product capability")
+                                                            : cap_why});
+                    cap_spec["constraints"] = ojson::array();
+                    cap_spec["capability"] = true;
+                    if (!cap_why.empty()) cap_spec["capability_reason"] = cap_why;
+                    // Preserve the model's reject reason for transparency.
+                    if (!reason.empty()) cap_spec["intake_note"] =
+                        std::string("model rejected but capability override: ") + reason;
+                    st.spec = cap_spec;
+                    o.verdict = "pass";
+                    o.reason = cap_why.empty()
+                                   ? std::string("capability request accepted (override reject)")
+                                   : (std::string("capability request accepted: ") + cap_why);
+                    o.parsed_ok = true;
+                    o.has_error = false;
+                    o.error.clear();
+                    return o;
+                }
                 return reject_out(reason);
             }
             // Deterministic empty-normalized-request belt (model may "pass" with blanks).
@@ -1132,6 +1173,26 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
                     !st.tree_digest.empty() && st.tree_digest.rfind("(empty", 0) != 0;
                 const bool raw_nonempty =
                     st.request.find_first_not_of(" \t\r\n\f\v") != std::string::npos;
+                if (is_capability_request(st.request)) {
+                    // Capability asks often don't look like "object + dims" specs —
+                    // synthesize a pass so they aren't rejected as empty.
+                    const std::string cap_why = capability_request_reason(st.request);
+                    ojson cap_spec = ojson::object();
+                    cap_spec["object"] = object.empty() ? "capability request" : object;
+                    cap_spec["key_dims"] = ojson::object();
+                    cap_spec["features"] = ojson::array(
+                        {cap_why.empty() ? std::string("in-product capability") : cap_why});
+                    cap_spec["constraints"] = ojson::array();
+                    cap_spec["capability"] = true;
+                    if (!cap_why.empty()) cap_spec["capability_reason"] = cap_why;
+                    st.spec = cap_spec;
+                    o.verdict = "pass";
+                    o.reason = cap_why.empty()
+                                   ? std::string("capability request accepted (empty-spec belt)")
+                                   : (std::string("capability request accepted: ") + cap_why);
+                    o.parsed_ok = true;
+                    return o;
+                }
                 if (!(doc_has_geom && raw_nonempty))
                     return reject_out("normalized request is empty");
             }
@@ -2172,38 +2233,60 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
     {
         AgentCall ia = agent_call(provider, pstate, "intake", prompts_dir, budget, false, ctx_cap);
         ojson spec = extract_json_obj(ia.reply);
-        // BUG-A reject: abort before planner / run_design.
+        // BUG-A reject: abort before planner / run_design — unless the request maps
+        // to a real in-product capability (parts library, measure, CAM, …).
         if (!spec.is_null() && spec.is_object() && spec.contains("reject") &&
             truthy_json(spec["reject"])) {
             std::string reason = "request is not a CAD design request";
             if (spec.contains("reason") && spec["reason"].is_string() &&
                 !spec["reason"].get<std::string>().empty())
                 reason = spec["reason"].get<std::string>();
+            if (is_capability_request(request)) {
+                const std::string cap_why = capability_request_reason(request);
+                ojson cap_spec = ojson::object();
+                cap_spec["object"] = "capability request";
+                cap_spec["key_dims"] = ojson::object();
+                cap_spec["features"] = ojson::array(
+                    {cap_why.empty() ? std::string("in-product capability") : cap_why});
+                cap_spec["constraints"] = ojson::array();
+                cap_spec["capability"] = true;
+                if (!cap_why.empty()) cap_spec["capability_reason"] = cap_why;
+                pstate.spec = cap_spec;
+                events.emit("stage_result",
+                            json{{"stage", "intake"},
+                                 {"attempt", 1},
+                                 {"verdict", "pass"},
+                                 {"reason", cap_why.empty()
+                                                ? "capability request accepted (override reject)"
+                                                : ("capability request accepted: " + cap_why)}});
+            } else {
+                events.emit("stage_result",
+                            json{{"stage", "intake"},
+                                 {"attempt", 1},
+                                 {"verdict", "fail"},
+                                 {"reason", reason},
+                                 {"stop_reason", "unintelligible_request"}});
+                events.emit("run_finished",
+                            json{{"status", "failed"},
+                                 {"stop_reason", "unintelligible_request"},
+                                 {"error_detail", reason},
+                                 {"revision", pstate.revision}});
+                return json{{"run_id", run_id},
+                           {"status", "failed"},
+                           {"stop_reason", "unintelligible_request"},
+                           {"error_detail", reason},
+                           {"error_human", reason},
+                           {"revision", pstate.revision},
+                           {"doc_id", doc_id}};
+            }
+        } else {
+            if (!spec.is_null()) pstate.spec = spec;
             events.emit("stage_result",
                         json{{"stage", "intake"},
                              {"attempt", 1},
-                             {"verdict", "fail"},
-                             {"reason", reason},
-                             {"stop_reason", "unintelligible_request"}});
-            events.emit("run_finished",
-                        json{{"status", "failed"},
-                             {"stop_reason", "unintelligible_request"},
-                             {"error_detail", reason},
-                             {"revision", pstate.revision}});
-            return json{{"run_id", run_id},
-                       {"status", "failed"},
-                       {"stop_reason", "unintelligible_request"},
-                       {"error_detail", reason},
-                       {"error_human", reason},
-                       {"revision", pstate.revision},
-                       {"doc_id", doc_id}};
+                             {"verdict", "pass"},
+                             {"reason", "probe intake"}});
         }
-        if (!spec.is_null()) pstate.spec = spec;
-        events.emit("stage_result",
-                    json{{"stage", "intake"},
-                         {"attempt", 1},
-                         {"verdict", "pass"},
-                         {"reason", "probe intake"}});
     }
     events.emit("stage_started",
                 json{{"stage", "plan"}, {"role", "planner"}, {"attempt", 1}, {"budget", 1},

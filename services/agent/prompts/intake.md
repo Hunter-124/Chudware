@@ -34,7 +34,7 @@ REJECTION — if and only if one of the following holds, do NOT invent a spec. R
 one ```json block:
 {
   "reject": true,
-  "reason": "<one short sentence>"
+  "reason": "<one short sentence naming WHY — this text is shown to the user>"
 }
 Reject ONLY:
 (a) gibberish / non-CAD content — random keysmash, pure greetings with no part, off-topic
@@ -42,5 +42,21 @@ Reject ONLY:
 (b) a modification/extension request when the context does NOT show existing features (nothing
     to modify) — reason should say so, e.g. "no existing geometry to modify";
 (c) empty / whitespace-only requests.
+
+IN-PRODUCT CAPABILITIES — these are ALWAYS valid intake (never reject as "not a CAD design
+request"). Normalize them into a short object/features spec so the rest of the pipeline can
+route the work:
+- Parts Library / vendor CAD: download or import a model from McMaster-Carr, GrabCAD, DigiKey,
+  Mouser, Fastenal, TraceParts, 3D ContentCentral; fetch/place a standard or catalog part;
+  "test tooling for the parts library"; off-the-shelf / MPN / datasheet sourcing.
+- Measure / Evaluate: measure faces/edges, mass properties, interference/fitment/clearance.
+- CAM: toolpaths, g-code, setups, posts, machining jobs.
+- Simulation: FEA, CFD, thermal, factor-of-safety, stress analysis (when analysis is the ask).
+- ECAD: PCB, schematic, netlist, footprints, Gerber, KiCad.
+- Reverse engineering: rebuild imported STEP/STL/scan/mesh into editable features.
+- Drawing: engineering drawings, section/detail views, GD&T, title blocks.
+- Research that supports a design (material properties, standards) when tied to a part.
+
 Pure creation requests ("make a washer", "50mm cube") are ALWAYS valid, with or without context.
-Never fabricate an "object" to keep the pipeline moving on true gibberish.
+Never fabricate an "object" to keep the pipeline moving on true gibberish. When rejecting, put
+the real reason in "reason" — the host surfaces it to the user (not a bare error code).

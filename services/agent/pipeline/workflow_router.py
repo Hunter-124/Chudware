@@ -101,43 +101,62 @@ class TaskClass(str, Enum):
 # Classifier rules (keyword/pattern, priority-ordered)
 # ---------------------------------------------------------------------------
 
-# Each rule: (pattern, class).  Patterns are case-insensitive re.search patterns.
-# First match wins; UNKNOWN is the fallback.
-_RULES: list[tuple[str, TaskClass]] = [
+# Each rule: (pattern, class, matched_label).  Patterns are case-insensitive re.search
+# patterns. First match wins; UNKNOWN is the fallback. matched_label is embedded in the
+# RouterResult.reason so the Routing card can show *why* the class was chosen.
+_RULES: list[tuple[str, TaskClass, str]] = [
     # CAM / machining (highest priority — "mill a bracket" is CAM, not SIMPLE_PART)
     (r"\b(cam|toolpath|g.?code|gcode|nc\b|machining|mill|turn|lathe|cutting|zero.?gouge)\b",
-     TaskClass.CAM_PROGRAM),
+     TaskClass.CAM_PROGRAM, "CAM/machining terms"),
     # Assembly / multi-body
     (r"\b(assembl|hinge|mate|joint|two.part|multi.?part|snap.fit|moving part)\b",
-     TaskClass.ASSEMBLY),
+     TaskClass.ASSEMBLY, "assembly/mate terms"),
     # Enclosure / shell / housing
     (r"\b(enclosure|housing|shell|clamshell|snap.?lid|lid|cover|box|case)\b",
-     TaskClass.ENCLOSURE),
+     TaskClass.ENCLOSURE, "enclosure/housing terms"),
     # Modification of existing part (before geometry rules so "modify … fit a 25mm shaft"
     # stays MODIFICATION rather than falling into multi-feature-part).
     # Note: modif*/retrofit*/redesign* are prefix-anchored (\b at start only) because
     # "modify", "modification", "retrofit" all begin at a word boundary but end mid-word.
     (r"\b(modif\w*|update\b|change\b|adjust\w*|extend\b|retrofit\w*|redesign\w*|make\s+\w+\s+bigger|make\s+\w+\s+smaller)\b",
-     TaskClass.MODIFICATION),
-    # Analysis / simulation primary
+     TaskClass.MODIFICATION, "modification terms"),
+    # Analysis / simulation primary — require analysis intent for bare "stress"/"load"
+    # is handled by requiring fea/cfd/simulation/… (not bare structural talk).
     (r"\b(fea|cfd|finite.?element|simulation|thermal|stress|load.?bearing|safety.?factor|margin)\b",
-     TaskClass.ANALYSIS),
+     TaskClass.ANALYSIS, "simulation/analysis terms"),
     # Multi-feature single-body (bolt circle, bore + multiple features)
     (r"\b(bearing.?(block|seat|housing)|bolt.?circle|multiple.?feature|fit.*(bore|shaft|journal)|press.?fit|bushing.*bolt|flange.*bore|clearance.*fit)\b",
-     TaskClass.MULTI_FEATURE_PART),
+     TaskClass.MULTI_FEATURE_PART, "multi-feature geometry terms"),
     # Simple single feature: bracket, block, plate, rib with few constraints
     (r"\b(bracket|mounting|plate|slab|block|rib|gusset|simple|basic)\b",
-     TaskClass.SIMPLE_PART),
+     TaskClass.SIMPLE_PART, "simple-part terms"),
+    # In-product capability surfaces (parts library / McMaster / measure / RE / drawing)
+    # — classify so the Routing card is honest even when scaffold falls back to tier default.
+    (r"\b(mcmaster|parts?\s+library|standard\s+parts?|catalog\s+part|vendor\s+(cad|part)|grabcad|off-?the-?shelf|download\s+(a\s+)?model|import\s+(a\s+)?model)\b",
+     TaskClass.UNKNOWN, "parts-library/sourcing capability"),
+    (r"\b(reverse\s*-?\s*engineer|from\s+(scan|mesh|stl|step)|rebuild\s+imported)\b",
+     TaskClass.UNKNOWN, "reverse-engineering capability"),
+    (r"\b(engineering\s+drawing|section\s+view|detail\s+view|titleblock|gd&t|gdt)\b",
+     TaskClass.UNKNOWN, "drawing capability"),
+    (r"\b(measure|mass\s+propert|interference|fitment|clearance\s+check)\b",
+     TaskClass.UNKNOWN, "measure/evaluate capability"),
 ]
 
 
 def classify_task(request: str) -> TaskClass:
     """Classify *request* text into a TaskClass.  Deterministic, no model call."""
+    return classify_task_detailed(request)[0]
+
+
+def classify_task_detailed(request: str) -> tuple[TaskClass, str]:
+    """Classify *request* and return (TaskClass, matched_label_or_empty)."""
     text = (request or "").lower()
-    for pattern, cls in _RULES:
-        if re.search(pattern, text, re.IGNORECASE):
-            return cls
-    return TaskClass.UNKNOWN
+    for pattern, cls, label in _RULES:
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m:
+            hit = m.group(0)
+            return cls, f"{label}: {hit}"
+    return TaskClass.UNKNOWN, ""
 
 
 # ---------------------------------------------------------------------------
@@ -286,8 +305,14 @@ def route(request: str, tier: str, *,
     Returns:
         RouterResult with task_class, scaffold_level, tier, and reason.
     """
-    cls = classify_task(request)
+    cls, class_why = classify_task_detailed(request)
     level, reason = best_scaffold_for_class(cls, tier, tuning=tuning)
+    # Prefix scaffold reason with the class match so the Routing card shows both
+    # "what class" and "why this scaffold" (parity with C++ domain.reason).
+    if class_why:
+        reason = f"{class_why} · {reason}"
+    elif cls == TaskClass.UNKNOWN:
+        reason = f"unclassified request · {reason}"
     # WI-9: capability workflow dial overlays scaffold choice (SOFT).
     # Only when an explicit CapabilityProfile is passed — never re-resolve from
     # tier alone (would force MAXIMUM on every local-tier route call and break

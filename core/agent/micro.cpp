@@ -883,11 +883,21 @@ json run_micro_design(const std::string& request, const std::string& doc_id,
     {
         DomainVerdict mdom = classify_domain(request);
         ComplexityVerdict mcx = classify_complexity(request);
+        std::string why = mdom.reason;
+        if (!mcx.reason.empty()) {
+            if (!why.empty()) why += " · ";
+            why += mcx.reason;
+        }
+        const std::string cap_why = capability_request_reason(request);
+        if (!cap_why.empty()) {
+            if (!why.empty()) why += " · ";
+            why += cap_why;
+        }
         events.emit("agent.classification",
                     json{{"task_class", mdom.label()},
                          {"scaffold_level", mcx.label()},
                          {"tier", provider_cfg.value("model", std::string())},
-                         {"reason", mdom.reason.empty() ? mcx.reason : mdom.reason},
+                         {"reason", why},
                          {"request_snippet", request.substr(0, 120)},
                          {"picked_model", provider_cfg.value("model", std::string())},
                          {"picked_provider", provider_cfg.value("name", std::string())}});

@@ -36,6 +36,16 @@ struct DomainVerdict {
 // Classify a natural-language request into an engineering domain. Deterministic.
 DomainVerdict classify_domain(const std::string& request);
 
+// True when the request maps to a real product capability the app supports
+// (parts-library / McMaster-style fetch, measure/evaluate, CAM, simulation,
+// ECAD, reverse-engineering, drawing, sourcing) — even if it is not a greenfield
+// solid-model design. Intake MUST accept these; only pure gibberish / empty /
+// nothing-to-modify rejects stay terminal.
+bool is_capability_request(const std::string& request);
+
+// Short reason string for a capability hit (empty when is_capability_request is false).
+std::string capability_request_reason(const std::string& request);
+
 // The SCOPED tool/capability classes for a domain — coarse capability tags a host
 // maps to a concrete tool allowlist (keeps a modeling agent from loading CAM/ECAD
 // tools). Always includes the domain's own class plus universally-safe read tags.

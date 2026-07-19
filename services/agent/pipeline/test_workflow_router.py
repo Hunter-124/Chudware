@@ -20,6 +20,7 @@ from services.agent.pipeline.workflow_router import (
     ScaffoldLevel,
     TaskClass,
     classify_task,
+    classify_task_detailed,
     best_scaffold_for_class,
     route,
     _inject_tuning_results,
@@ -89,6 +90,25 @@ class TestClassifyTask:
     def test_cam_beats_simple(self):
         # CAM rule must win over 'bracket' simple-part rule
         assert classify_task("CAM program for bracket milling") == TaskClass.CAM_PROGRAM
+
+    def test_mcmaster_capability_label(self):
+        cls, why = classify_task_detailed(
+            "download a model from McMaster to test tooling for the parts library"
+        )
+        # Class may be UNKNOWN (capability surface) — reason must name the match.
+        assert "parts-library" in why or "mcmaster" in why.lower()
+        assert cls in (TaskClass.UNKNOWN, TaskClass.SIMPLE_PART, TaskClass.MODIFICATION)
+
+    def test_route_reason_includes_class_match(self):
+        r = route("generate a CAM program for milling", "local-24k", tuning={})
+        assert r.task_class == TaskClass.CAM_PROGRAM
+        assert "CAM" in r.reason or "machining" in r.reason.lower()
+
+    def test_measure_capability_label(self):
+        _cls, why = classify_task_detailed("measure mass properties of this bracket")
+        # "bracket" may win as SIMPLE_PART before the measure rule — either is fine,
+        # but the detailed path must return a non-empty why for a real request.
+        assert why  # matched something
 
 
 # ---------------------------------------------------------------------------

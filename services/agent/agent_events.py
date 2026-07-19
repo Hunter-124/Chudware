@@ -321,7 +321,8 @@ def classification_event(
         "task_class": _val(task_class) or "unknown",
         "scaffold_level": _val(scaffold_level),
         "tier": _val(tier),
-        "reason": _cap(reason, 160),
+        # 280 chars: domain match terms + complexity + capability (Routing card).
+        "reason": _cap(reason, 280),
         "request_snippet": _cap(request_snippet, 120),
     })
     if picked_model:

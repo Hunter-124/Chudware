@@ -3,6 +3,7 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <string>
 
 #include "agent/domain.h"
 
@@ -96,4 +97,47 @@ TEST_CASE("context sheets are on-topic") {
 TEST_CASE("labels are stable") {
     CHECK(std::string(classify_domain("a PCB").label()) == "ecad");
     CHECK(std::string(classify_domain("a cube").label()) == "modeling");
+}
+
+TEST_CASE("mech/aero rocket-plane is Modeling not ECAD") {
+    // Multi-domain brief that names an MCU must not flip the whole request to ECAD —
+    // weak electronics tokens lose to mechanical/aero design cues.
+    const char* rocket =
+        "Design a model rocket plane (boost-glide airframe) with good aerodynamics, "
+        "tight budget, and manufacturability; body tube, fins, payload bay. Optional "
+        "flight computer MCU later.";
+    auto v = classify_domain(rocket);
+    CHECK(v.domain == Domain::Modeling);
+    CHECK(v.reason.find("electronics/PCB") == std::string::npos);
+    // Reason should surface mechanical matches for the Routing card.
+    CHECK(v.reason.find("rocket") != std::string::npos);
+}
+
+TEST_CASE("pure PCB still routes to ECAD") {
+    CHECK(classify_domain("design a PCB for an ESP32 with a buck regulator").domain ==
+          Domain::Ecad);
+    CHECK(classify_domain("route the schematic netlist and export gerber").domain ==
+          Domain::Ecad);
+}
+
+TEST_CASE("McMaster / parts-library is Sourcing capability") {
+    auto v = classify_domain(
+        "download a model from McMaster to test tooling for the parts library");
+    CHECK(v.domain == Domain::Sourcing);
+    CHECK(aicad::agent::is_capability_request(
+        "download a model from McMaster to test tooling for the parts library"));
+    CHECK_FALSE(aicad::agent::capability_request_reason(
+                    "download a model from McMaster to test tooling for the parts library")
+                    .empty());
+}
+
+TEST_CASE("capability helper accepts product surfaces, rejects garbage") {
+    CHECK(aicad::agent::is_capability_request("run FEA stress analysis at 200N"));
+    CHECK(aicad::agent::is_capability_request("generate milling toolpaths and post g-code"));
+    CHECK(aicad::agent::is_capability_request("make an engineering drawing with a section view"));
+    CHECK(aicad::agent::is_capability_request("reverse engineer this STEP into features"));
+    CHECK(aicad::agent::is_capability_request("measure mass properties of the bracket"));
+    CHECK_FALSE(aicad::agent::is_capability_request("asdf qwerty blah blah"));
+    CHECK_FALSE(aicad::agent::is_capability_request(""));
+    CHECK_FALSE(aicad::agent::is_capability_request("hello how are you"));
 }

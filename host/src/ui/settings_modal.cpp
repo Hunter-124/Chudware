@@ -980,8 +980,8 @@ struct BenchCategoriesUi {
 };
 static BenchCategoriesUi s_cats;
 
-// ---- Model roles + rankings (Settings → AI) ---------------------------------
-// RPC: ai_roles_get/set, model_rankings_get/set (ModelRolesAuto). Degrade read-only
+// ---- Model roles (Settings → AI → Roles) -------------------------------------
+// RPC: ai_roles_get/set. Degrade read-only when worker offline.
 // when the RPC is absent.
 struct RoleAssign {
     bool isAuto = true;
@@ -990,35 +990,24 @@ struct RoleAssign {
     // Per-role reasoning effort: "auto" | "low" | "medium" | "high" (default auto).
     std::string thinking = "auto";
 };
-struct ModelRankingRow {
-    std::string modelId;
-    std::string provider;
-    int rank = 3;              // 1–5
-    std::string source;        // shipped | user | measured
-    std::string notes;
-};
 struct ModelRolesUi {
     std::map<std::string, RoleAssign> roles;
-    std::vector<ModelRankingRow> rankings;
     bool rolesLoaded = false;
-    bool rankingsLoaded = false;
     bool rolesRpcMissing = false;
-    bool rankingsRpcMissing = false;
     bool rolesPollInFlight = false;
-    bool rankingsPollInFlight = false;
     double lastRolesPoll = -1e9;
-    double lastRankingsPoll = -1e9;
     std::string lastError;
     bool rolesSaveInFlight = false;
-    bool rankingsSaveInFlight = false;
 };
 static ModelRolesUi s_roles;
 
 static const char* kRoleKeys[] = {
-    "advisor", "task", "planning", "vision", "default", "plm", "redaction"};
+    "advisor", "task", "planning", "vision", "default", "plm", "redaction",
+    "sketch2d", "model3d"};
 static const char* kRoleLabels[] = {
-    "Advisor", "Task", "Planning", "Vision", "Default", "PLM", "Redaction"};
-static constexpr int kRoleCount = 7;
+    "Advisor", "Task", "Planning", "Vision", "Default", "PLM", "Redaction",
+    "Sketch 2D", "Model 3D"};
+static constexpr int kRoleCount = 9;
 
 static std::string benchTierForSource(const Settings& s, int source) {
     if (source == 1) return "xai:grok-4-5";
@@ -1333,58 +1322,6 @@ static void pollModelRoles(AppState& st, bool force) {
     });
 }
 
-static void pollModelRankings(AppState& st, bool force) {
-    const double now = ImGui::GetTime();
-    if (!force && s_roles.rankingsLoaded && (now - s_roles.lastRankingsPoll) < 5.0) return;
-    if (s_roles.rankingsPollInFlight || s_roles.rankingsSaveInFlight) return;
-    s_roles.lastRankingsPoll = now;
-    s_roles.rankingsPollInFlight = true;
-    st.rpc.call("model_rankings_get", nlohmann::json::object(),
-                [](const core::RpcResult& r) {
-        s_roles.rankingsPollInFlight = false;
-        if (!r.ok || !r.result.is_object()) {
-            s_roles.rankingsRpcMissing = true;
-            // Seed a read-only fallback from the builtin catalog so the table isn't empty.
-            if (s_roles.rankings.empty()) {
-                for (const auto& m : ui::builtinModels()) {
-                    ModelRankingRow row;
-                    row.modelId = m.id;
-                    row.provider = roleProviderWire(m.provider);
-                    row.rank = 3;
-                    row.source = "shipped";
-                    s_roles.rankings.push_back(std::move(row));
-                }
-            }
-            s_roles.rankingsLoaded = true;
-            return;
-        }
-        s_roles.rankingsRpcMissing = false;
-        s_roles.rankings.clear();
-        auto ranks = optionalJsonObj(r.result, "rankings");
-        if (ranks.is_object()) {
-            for (auto it = ranks.begin(); it != ranks.end(); ++it) {
-                if (!it.value().is_object()) continue;
-                ModelRankingRow row;
-                row.modelId = it.key();
-                row.rank = optionalJsonInt(it.value(), "rank", 3);
-                if (row.rank < 1) row.rank = 1;
-                if (row.rank > 5) row.rank = 5;
-                row.source = optionalJsonString(it.value(), "source");
-                if (row.source.empty()) row.source = "shipped";
-                row.notes = optionalJsonString(it.value(), "notes");
-                row.provider = optionalJsonString(it.value(), "provider");
-                s_roles.rankings.push_back(std::move(row));
-            }
-        }
-        std::sort(s_roles.rankings.begin(), s_roles.rankings.end(),
-                  [](const ModelRankingRow& a, const ModelRankingRow& b) {
-                      if (a.rank != b.rank) return a.rank > b.rank;
-                      return a.modelId < b.modelId;
-                  });
-        s_roles.rankingsLoaded = true;
-    });
-}
-
 static void setRoleAssign(AppState& st, const char* roleKey, const RoleAssign& a) {
     if (s_roles.rolesRpcMissing) return;
     s_roles.roles[roleKey] = a;
@@ -1438,32 +1375,6 @@ static void setRoleAssign(AppState& st, const char* roleKey, const RoleAssign& a
     });
 }
 
-static void setModelRank(AppState& st, const std::string& modelId, int rank) {
-    if (s_roles.rankingsRpcMissing) return;
-    if (rank < 1) rank = 1;
-    if (rank > 5) rank = 5;
-    for (auto& row : s_roles.rankings) {
-        if (row.modelId == modelId) {
-            row.rank = rank;
-            row.source = "user";
-            break;
-        }
-    }
-    nlohmann::json p;
-    p["rankings"] = nlohmann::json::object();
-    p["rankings"][modelId] = nlohmann::json{{"rank", rank}};
-    s_roles.rankingsSaveInFlight = true;
-    st.rpc.call("model_rankings_set", p, [](const core::RpcResult& r) {
-        s_roles.rankingsSaveInFlight = false;
-        if (!r.ok) {
-            s_roles.lastError = r.err.empty() ? "model_rankings_set failed" : r.err;
-            return;
-        }
-        s_roles.lastRankingsPoll = -1e9;  // refresh
-        s_roles.rankingsLoaded = false;
-    });
-}
-
 static void drawPassRateBar(float rate, float width, float height) {
     // Local copy of leaderboard bar so category rows don't need the full Board.
     const auto& pal = ui::palette;
@@ -1514,29 +1425,30 @@ static void drawBenchStatusLine(AppState& st, float sc) {
 
 static void drawBenchCategories(AppState& st, float sc) {
     pollBenchCategories(st, /*force=*/false);
-    dimText("One row per tool family. Run queues the gym/suite for that category; status "
-            "polls via bench_status. History comes from the last cycle's detail_path.");
 
     if (!s_cats.loaded && s_cats.pollInFlight) {
         dimText("Loading categories\xe2\x80\xa6");
         return;
     }
     if (s_cats.rpcMissing || (!s_cats.loaded && !st.workerStarted)) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
-        ImGui::TextWrapped("Categories unavailable (worker not ready or bench_categories RPC "
-                           "not registered yet). The legacy runner below still works.");
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusWarn));
+        ImGui::TextWrapped(
+            "Benchmark categories unavailable \xe2\x80\x94 start the worker to load "
+            "category runs. The legacy runner below still works.");
         ImGui::PopStyleColor();
         if (!s_cats.lastError.empty()) {
-            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusWarn));
+            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusErr));
             ImGui::TextWrapped("%s", s_cats.lastError.c_str());
             ImGui::PopStyleColor();
         }
         return;
     }
     if (s_cats.cats.empty()) {
-        dimText("No categories reported.");
+        dimText("No benchmark categories reported yet.");
         return;
     }
+
+    dimText("One row per tool family. Run queues that suite; history comes from the last cycle.");
 
     if (ImGui::BeginTable("##bench_cats", 4,
                           ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg |
@@ -1741,10 +1653,9 @@ static void drawBenchRunner(AppState& st, float sc, ui::leaderboard::Board& lb,
 
 static void drawModelRolesSection(AppState& st, float sc) {
     pollModelRoles(st, /*force=*/false);
-    pollModelRankings(st, /*force=*/false);
     ensureDefaultRoles();
 
-    dimText("Per-role model + thinking effort. Auto model picks from rankings within enabled "
+    dimText("Per-role model + thinking effort. Auto picks within enabled "
             "providers. Thinking Auto lets the classifier (Default) or dispatcher (subagents) choose. "
             "Redaction is hard-locked to local (loopback) providers.");
 
@@ -1800,6 +1711,13 @@ static void drawModelRolesSection(AppState& st, float sc) {
                 helpMarker("Product lifecycle tasks \xe2\x80\x94 releases, document control, versioning, and PLM workflows.");
             } else if (std::strcmp(key, "redaction") == 0) {
                 helpMarker("Local-only model that redacts sensitive data before anything leaves the machine.");
+            } else if (std::strcmp(key, "sketch2d") == 0) {
+                helpMarker("2D specialist: sketches, ECAD drawings, and other planar work. "
+                           "Does not build 3D solids — model3d delegates sketch jobs here.");
+            } else if (std::strcmp(key, "model3d") == 0) {
+                helpMarker("3D feature planner/builder. Plans the solid feature tree, delegates "
+                           "profiles to sketch2d, places them on the right plane/face, and "
+                           "verifies orientation with vision before committing.");
             }
             if (isRedaction) {
                 ImGui::SameLine();
@@ -1936,116 +1854,6 @@ static void drawModelRolesSection(AppState& st, float sc) {
         ImGui::EndTable();
     }
 
-    // Model rankings live on the Benchmarks tab (drawModelRankingsSection).
-}
-
-// Rankings table (Settings → Benchmarks). Polled via model_rankings_get/set.
-// Display filter: only grok-4.5+ and Kimi among Chinese models; integrations stay in data.
-static bool rankingsRowVisible(const std::string& modelId) {
-    std::string m = modelId;
-    for (char& c : m) c = (char)std::tolower((unsigned char)c);
-    auto has = [&](const char* sub) {
-        return m.find(sub) != std::string::npos;
-    };
-    // Hide older Grok variants; keep grok-4.5 / grok-4-5.
-    if (has("grok") && !(has("grok-4.5") || has("grok-4-5"))) return false;
-    // Hide non-Kimi Chinese integrations from the menu (Qwen / DeepSeek / Alibaba).
-    if (has("qwen") || has("deepseek") || has("dashscope") || has("alibaba") ||
-        has("nemotron"))
-        return false;
-    return true;
-}
-
-static void drawModelRankingsSection(AppState& st, float sc) {
-    pollModelRankings(st, /*force=*/false);
-
-    dimText("1-5 stars. User overrides persist via model_rankings_set; shipped / "
-            "measured badges come from the rankings file and live bench cycles. "
-            "Kimi K3 is the preferred CAD modeling model.");
-
-    if (s_roles.rankingsRpcMissing) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusWarn));
-        ImGui::TextWrapped("model_rankings_* RPC not available \xe2\x80\x94 table is read-only.");
-        ImGui::PopStyleColor();
-    }
-
-    if (!s_roles.rankingsLoaded && s_roles.rankingsPollInFlight) {
-        dimText("Loading rankings\xe2\x80\xa6");
-        return;
-    }
-    if (s_roles.rankings.empty()) {
-        dimText("No rankings yet.");
-        return;
-    }
-
-    if (ImGui::BeginTable("##model_ranks", 4,
-                          ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg |
-                              ImGuiTableFlags_SizingStretchProp |
-                              ImGuiTableFlags_ScrollY,
-                          ImVec2(0, 220.0f * sc))) {
-        ImGui::TableSetupColumn("Model", ImGuiTableColumnFlags_WidthStretch, 2.4f);
-        ImGui::TableSetupColumn("Provider", ImGuiTableColumnFlags_WidthStretch, 1.0f);
-        ImGui::TableSetupColumn("Rank", ImGuiTableColumnFlags_WidthStretch, 1.6f);
-        ImGui::TableSetupColumn("Source", ImGuiTableColumnFlags_WidthStretch, 0.9f);
-        ImGui::TableHeadersRow();
-
-        for (size_t i = 0; i < s_roles.rankings.size(); ++i) {
-            auto& row = s_roles.rankings[i];
-            if (!rankingsRowVisible(row.modelId)) continue;
-            ImGui::TableNextRow();
-            ImGui::PushID((int)i);
-
-            ImGui::TableNextColumn();
-            ImGui::TextUnformatted(row.modelId.c_str());
-            if (!row.notes.empty() && ImGui::IsItemHovered())
-                ImGui::SetTooltip("%s", row.notes.c_str());
-
-            ImGui::TableNextColumn();
-            ImGui::TextUnformatted(row.provider.empty() ? "\xe2\x80\x94" : row.provider.c_str());
-
-            ImGui::TableNextColumn();
-            {
-                // Star buttons 1–5.
-                const bool ro = s_roles.rankingsRpcMissing || s_roles.rankingsSaveInFlight;
-                if (ro) ImGui::BeginDisabled();
-                for (int s = 1; s <= 5; ++s) {
-                    if (s > 1) ImGui::SameLine(0, 2.0f * sc);
-                    const bool on = s <= row.rank;
-                    if (on)
-                        ImGui::PushStyleColor(ImGuiCol_Text,
-                            ui::Palette::toU32(ui::palette.accent));
-                    else
-                        ImGui::PushStyleColor(ImGuiCol_Text,
-                            ui::Palette::toU32(ui::palette.textDim));
-                    char starId[32];
-                    std::snprintf(starId, sizeof(starId), "%s##s%d",
-                                  on ? "\xe2\x98\x85" : "\xe2\x98\x86", s);  // ★ / ☆
-                    if (ImGui::SmallButton(starId))
-                        setModelRank(st, row.modelId, s);
-                    ImGui::PopStyleColor();
-                }
-                if (ro) ImGui::EndDisabled();
-            }
-
-            ImGui::TableNextColumn();
-            {
-                const char* src = row.source.c_str();
-                ImU32 col = ui::Palette::toU32(ui::palette.textDim);
-                if (row.source == "user")
-                    col = ui::Palette::toU32(ui::palette.accent);
-                else if (row.source == "measured")
-                    col = ui::Palette::toU32(ui::palette.statusOk);
-                else if (row.source == "shipped")
-                    col = ui::Palette::toU32(ui::palette.textDim);
-                ImGui::PushStyleColor(ImGuiCol_Text, col);
-                ImGui::TextUnformatted(src[0] ? src : "shipped");
-                ImGui::PopStyleColor();
-            }
-
-            ImGui::PopID();
-        }
-        ImGui::EndTable();
-    }
 }
 
 // Copilot mode → default harness structure + one-line description. Single source of
@@ -3338,11 +3146,16 @@ const SettingsEntry kSettingsEntries[] = {
     { "Performance profiler",     "General",      1 },
     { "Profiler",                 "General",      1 },
     // AI (tab 2) — roles, harness, privacy, maintenance (no provider/accounts)
+    { "Behavior",                 "AI",           2 },
+    { "Harness",                  "AI",           2 },
+    { "Tools",                    "AI",           2 },
+    { "Tool families",            "AI",           2 },
+    { "Sketch 2D",                "AI",           2 },
+    { "Model 3D",                 "AI",           2 },
     { "Offline mode",             "AI",           2 },
     { "Reasoning effort",         "AI",           2 },
     { "Manage models",            "AI",           2 },
     { "Model roles",              "AI",           2 },
-    { "Model rankings",           "Benchmarks",   4 },
     { "Hidden models",            "AI",           2 },
     { "Harness organization",     "AI",           2 },
     { "Copilot mode",             "AI",           2 },
@@ -3368,22 +3181,22 @@ const SettingsEntry kSettingsEntries[] = {
     { "Subscription accounts",    "Providers",    3 },
     { "Sign in",                  "Providers",    3 },
     // Benchmarks (tab 4)
-    { "Benchmarks",               "Benchmarks",   4 },
-    { "Model leaderboard",        "Benchmarks",   4 },
-    { "Run benchmark",            "Benchmarks",   4 },
-    { "Benchmark",                "Benchmarks",   4 },
-    { "Benchmark categories",     "Benchmarks",   4 },
-    { "Category run",             "Benchmarks",   4 },
+    { "Benchmarks",               "AI",    2 },
+    { "Model leaderboard",        "AI",    2 },
+    { "Run benchmark",            "AI",    2 },
+    { "Benchmark",                "AI",    2 },
+    { "Benchmark categories",     "AI",    2 },
+    { "Category run",             "AI",    2 },
     // Prompts (tab 5)
-    { "Role prompts",             "Prompts",      5 },
-    { "Agent prompts",            "Prompts",      5 },
-    { "Prompt editor",            "Prompts",      5 },
-    { "System prompt",            "Prompts",      5 },
-    { "System prompt override",   "Prompts",      5 },
-    { "Skills",                   "Prompts",      5 },
-    { "Skill editor",             "Prompts",      5 },
-    { "Context injection",        "Prompts",      5 },
-    { "Triggers",                 "Prompts",      5 },
+    { "Role prompts",             "AI",       2 },
+    { "Agent prompts",            "AI",       2 },
+    { "Prompt editor",            "AI",       2 },
+    { "System prompt",            "AI",       2 },
+    { "System prompt override",   "AI",       2 },
+    { "Skills",                   "AI",       2 },
+    { "Skill editor",             "AI",       2 },
+    { "Context injection",        "AI",       2 },
+    { "Triggers",                 "AI",       2 },
     // Run behavior (lives on AI tab; was Agent tab 6)
     { "Plan preference",          "AI",           2 },
     { "Plan before building",     "AI",           2 },
@@ -3399,13 +3212,14 @@ const SettingsEntry kSettingsEntries[] = {
     { "Eng. Firm budget",         "AI",           2 },
     { "Company budget",           "AI",           2 },
     { "Run behavior",             "AI",           2 },
+    { "Maintenance",              "AI",           2 },
     // Experimental (tab 6 — Agent tab removed)
-    { "Vision review model",      "Experimental", 6 },
-    { "Model routing",            "Experimental", 6 },
-    { "Seek-CAD split",           "Experimental", 6 },
-    { "Parametric sequence mode", "Experimental", 6 },
-    { "CAD sequence mode",        "Experimental", 6 },
-    { "Feature sequence",         "Experimental", 6 },
+    { "Vision review model",      "Experimental",  4 },
+    { "Model routing",            "Experimental",  4 },
+    { "Seek-CAD split",           "Experimental",  4 },
+    { "Parametric sequence mode", "Experimental",  4 },
+    { "CAD sequence mode",        "Experimental",  4 },
+    { "Feature sequence",         "Experimental",  4 },
 };
 const int kSettingsEntryCount =
     (int)(sizeof(kSettingsEntries) / sizeof(kSettingsEntries[0]));
@@ -3844,35 +3658,25 @@ void drawSettingsModal(AppState& st, bool busy) {
                 settingsTabBodyEnd();
                 ImGui::EndTabItem();
             }
+            // ---- AI tab: unified hub ----
+            // Tab indices: 0=Appearance 1=General 2=AI 3=Providers 4=Experimental
+            static int s_aiSubJump = -1;
             if (ImGui::BeginTabItem("AI", nullptr,
-                                    (jumpToTab == 2) ? ImGuiTabItemFlags_SetSelected
-                                                     : ImGuiTabItemFlags_None)) {
+                                    (jumpToTab == 2 || jumpToPrompts) ? ImGuiTabItemFlags_SetSelected
+                                                                     : ImGuiTabItemFlags_None)) {
                 settingsTabBodyBegin("##tab_ai");
-                dimText(("Used by Design, Edit, and Help. Stored in " + configPath() + ".")
-                            .c_str());
+                if (jumpToPrompts && s_aiSubJump < 0) s_aiSubJump = 2;
+                if (jumpToTab == 4 && s_aiSubJump < 0) s_aiSubJump = 5;
+                if (jumpToTab == 5 && s_aiSubJump < 0) s_aiSubJump = 2;
 
-                // Glass-grouped sections — each child owns its label+widget pairs so a scroll
-                // boundary can never orphan a caption (the unlabeled "0" max-tokens bug).
-                // Provider/Accounts/Moonshot live on the Providers tab; Generation is gone
-                // (effort stays on the composer + per-role Thinking columns).
-                settingsGlassSectionBegin("##ai_model_roles", "Model roles");
-                drawModelRolesSection(st, sc);
-                settingsGlassSectionEnd();
+                if (ImGui::BeginTabBar("##ai_sub", ImGuiTabBarFlags_FittingPolicyScroll)) {
+                    auto subFlags = [](int idx) {
+                        return (s_aiSubJump == idx) ? ImGuiTabItemFlags_SetSelected
+                                                    : ImGuiTabItemFlags_None;
+                    };
 
-                settingsGlassSectionBegin("##ai_eng_firm", "Eng. Firm model assignments");
-                drawEngFirmModelAssignments(st, sc);
-                settingsGlassSectionEnd();
-
-                settingsGlassSectionBegin("##ai_harness_org", "Harness organization");
-                drawHarnessOrganizationSection(st, sc);
-                settingsGlassSectionEnd();
-
-                settingsGlassSectionBegin("##ai_privacy", "Privacy");
-                ui::drawAiSettingsSection(st, busy, ui::AiSettingsSection::Privacy);
-                settingsGlassSectionEnd();
-
-                // ---- Run behavior (moved from Agent tab) ----
-                settingsGlassSectionBegin("##ai_run_behavior", "Run behavior");
+                    if (ImGui::BeginTabItem("Behavior", nullptr, subFlags(0))) {
+settingsGlassSectionBegin("##ai_run_behavior", "Run behavior");
                 {
                     static const char* kPrefLabels[] = {"Off", "Option", "Encourage", "Require"};
                     auto prefCombo = [&](const char* label, const char* id, int* pref,
@@ -3941,137 +3745,29 @@ void drawSettingsModal(AppState& st, bool busy) {
                     }
                 }
                 settingsGlassSectionEnd();
-
-                settingsGlassSectionBegin("##ai_benchmarks_link", "Benchmarks");
-                dimText("Leaderboard, category runs, and live status live on the Benchmarks tab.");
-                if (ImGui::SmallButton("Open Benchmarks tab")) {
-                    st.openSettingsTab = 4;
-                }
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("Jump to Settings \xe2\x86\x92 Benchmarks");
+settingsGlassSectionBegin("##ai_privacy", "Privacy");
+                ui::drawAiSettingsSection(st, busy, ui::AiSettingsSection::Privacy);
                 settingsGlassSectionEnd();
-
-                settingsGlassSectionBegin("##ai_maintenance", "Maintenance");
-                dimText("Repair the local CAD engine runtime, or trim which models appear in the "
-                        "composer's model picker.");
-                {
-                    const bool canSetup = !st.setupRunning.load() && !st.job.running.load();
-                    if (!canSetup) ImGui::BeginDisabled();
-                    if (ImGui::Button("Repair / install runtime", ImVec2(220.0f * sc, 0)))
-                        st.startSetup(true);
-                    if (!canSetup) ImGui::EndDisabled();
-                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                        ImGui::SetTooltip("Rebuild the local Python/CAD runtime (same as "
-                                          "Chudware \xe2\x86\x92 Repair / install runtime).");
-                    if (st.setupRunning.load()) {
-                        ImGui::SameLine();
-                        dimText("Running\xe2\x80\xa6");
+                        ImGui::EndTabItem();
                     }
-                }
-                ImGui::Dummy(ImVec2(0, 4 * sc));
-                if (ImGui::CollapsingHeader("Manage models (chat picker)"))
-                    ui::drawAiSettingsSection(st, busy, ui::AiSettingsSection::ManageModels);
+
+                    if (ImGui::BeginTabItem("Harness", nullptr, subFlags(1))) {
+settingsGlassSectionBegin("##ai_harness_org", "Harness organization");
+                drawHarnessOrganizationSection(st, sc);
                 settingsGlassSectionEnd();
+                        ImGui::EndTabItem();
+                    }
 
-                settingsTabBodyEnd();
-                ImGui::EndTabItem();
-            }
-
-            // ---- Providers tab: provider/model, Moonshot key parking, subscription accounts ----
-            if (ImGui::BeginTabItem("Providers", nullptr,
-                                    (jumpToTab == 3) ? ImGuiTabItemFlags_SetSelected
-                                                     : ImGuiTabItemFlags_None)) {
-                settingsTabBodyBegin("##tab_providers");
-                dimText(("API providers, keys, and subscription accounts. Stored in " +
-                         configPath() + ".").c_str());
-
-                settingsGlassSectionBegin("##prov_provider", "Provider & Model");
-                ui::drawAiSettingsSection(st, busy, ui::AiSettingsSection::ProviderModel);
+                    if (ImGui::BeginTabItem("Roles", nullptr, subFlags(2))) {
+settingsGlassSectionBegin("##ai_model_roles", "Model roles");
+                drawModelRolesSection(st, sc);
                 settingsGlassSectionEnd();
-
-                // Moonshot key is first-class (keys.moonshot) and can be parked while another
-                // provider stays active — surface it even when Provider & Model isn't on Moonshot.
-                settingsGlassSectionBegin("##prov_moonshot", "Moonshot (Kimi)");
-                dimText("Configured but not the active provider. Store a key to park credit; "
-                        "pick a Kimi model later when you want to use it.");
-                ImGui::TextUnformatted("API key (platform.moonshot.ai)");
-                ImGui::SetNextItemWidth(-1);
-                if (ImGui::InputText("##settings_moonshot_key", st.settings.moonshotKey,
-                                     sizeof(st.settings.moonshotKey),
-                                     ImGuiInputTextFlags_Password)) {
-                    saveSettings(st.settings);
-                }
-                {
-                    const bool have = st.settings.moonshotKey[0] != '\0';
-                    ImGui::PushStyleColor(ImGuiCol_Text,
-                        have ? ui::Palette::toU32(ui::palette.statusOk)
-                             : ui::Palette::toU32(ui::palette.statusWarn));
-                    ImGui::TextUnformatted(have
-                        ? "key set \xe2\x80\x94 Kimi models appear in the picker when enabled"
-                        : "no key \xe2\x80\x94 paste a Moonshot API key when you have credit");
-                    ImGui::PopStyleColor();
-                }
+                        if (ImGui::CollapsingHeader("Eng. Firm model assignments")) {
+settingsGlassSectionBegin("##ai_eng_firm", "Eng. Firm model assignments");
+                drawEngFirmModelAssignments(st, sc);
                 settingsGlassSectionEnd();
-
-                settingsGlassSectionBegin("##prov_accounts", "Accounts");
-                drawSubscriptionAccounts(st, sc);
-                settingsGlassSectionEnd();
-
-                settingsTabBodyEnd();
-                ImGui::EndTabItem();
-            }
-
-            // ---- Benchmarks tab: categories + leaderboard + legacy runner ----
-            if (ImGui::BeginTabItem("Benchmarks", nullptr,
-                                    (jumpToTab == 4) ? ImGuiTabItemFlags_SetSelected
-                                                     : ImGuiTabItemFlags_None)) {
-                settingsTabBodyBegin("##tab_benchmarks");
-                // Shared leaderboard board (refreshed by runner / refresh button).
-                static ui::leaderboard::Board s_lb;
-                static bool s_lbLoaded = false;
-                static double s_lbLast = -1e9;
-                const double now = ImGui::GetTime();
-                if (!s_lbLoaded || (now - s_lbLast) > 5.0) {
-                    s_lb = ui::leaderboard::load();
-                    s_lbLoaded = true;
-                    s_lbLast = now;
-                }
-
-                settingsGlassSectionBegin("##bench_categories", "Categories");
-                drawBenchCategories(st, sc);
-                // Keep status polling alive while this tab is open.
-                pollBenchStatus(st, s_bench.running, &s_lb);
-                settingsGlassSectionEnd();
-
-                settingsGlassSectionBegin("##bench_leaderboard", "Model Leaderboard");
-                dimText("Deterministic gym pass rates from benchmarks/leaderboard/leaderboard.json. "
-                        "MOCK badge when task_suite ends in -MOCK.");
-                if (ImGui::SmallButton("Refresh##settings_lb")) {
-                    s_lb = ui::leaderboard::load();
-                    s_lbLast = ImGui::GetTime();
-                    s_cats.lastPoll = -1e9;
-                    s_cats.loaded = false;
-                }
-                ImGui::Dummy(ImVec2(0, 2 * sc));
-                ui::leaderboard::drawCompactTable(s_lb, sc);
-                drawBenchRunner(st, sc, s_lb, s_lbLast);
-                settingsGlassSectionEnd();
-
-                settingsGlassSectionBegin("##bench_model_rankings", "Model rankings");
-                drawModelRankingsSection(st, sc);
-                settingsGlassSectionEnd();
-
-                settingsTabBodyEnd();
-                ImGui::EndTabItem();
-            }
-
-            // --- Prompts tab: Roles / Skills / Context Injection ---
-            if (ImGui::BeginTabItem("Prompts", nullptr,
-                                    (jumpToPrompts || jumpToTab == 5) ? ImGuiTabItemFlags_SetSelected
-                                                                      : ImGuiTabItemFlags_None)) {
-                settingsTabBodyBegin("##tab_prompts");
-                if (ImGui::BeginTabBar("##prompts_sub", ImGuiTabBarFlags_None)) {
-                    if (ImGui::BeginTabItem("Roles")) {
+                        }
+                        ImGui::Dummy(ImVec2(0, 6.0f * sc));
                 settingsSectionHeader("Role prompts", /*first=*/true);
                 bool canFetch = st.workerStarted && !busy;
                 if (!s_promptsLoaded && canFetch) loadPrompts(st);
@@ -4198,35 +3894,230 @@ void drawSettingsModal(AppState& st, bool busy) {
                         ImGui::SetTooltip("Delete the override and restore the shipped prompt");
                 }
                 ImGui::EndChild();
-                                        ImGui::EndTabItem();
+                                                                ImGui::EndTabItem();
                     }
-                    if (ImGui::BeginTabItem("Skills")) {
+
+                    if (ImGui::BeginTabItem("Skills", nullptr, subFlags(3))) {
                         drawSettingsSkillsTab(st, sc);
                         ImGui::EndTabItem();
                     }
-                    if (ImGui::BeginTabItem("Context")) {
+
+                    if (ImGui::BeginTabItem("Context", nullptr, subFlags(4))) {
                         drawSettingsContextTab(st, sc);
                         ImGui::EndTabItem();
                     }
+
+                    if (ImGui::BeginTabItem("Benchmarks", nullptr, subFlags(5))) {
+                // Shared leaderboard board (refreshed by runner / refresh button).
+                static ui::leaderboard::Board s_lb;
+                static bool s_lbLoaded = false;
+                static double s_lbLast = -1e9;
+                const double now = ImGui::GetTime();
+                if (!s_lbLoaded || (now - s_lbLast) > 5.0) {
+                    s_lb = ui::leaderboard::load();
+                    s_lbLoaded = true;
+                    s_lbLast = now;
+                }
+
+                settingsGlassSectionBegin("##bench_categories", "Categories");
+                drawBenchCategories(st, sc);
+                // Keep status polling alive while this tab is open.
+                pollBenchStatus(st, s_bench.running, &s_lb);
+                settingsGlassSectionEnd();
+
+                settingsGlassSectionBegin("##bench_leaderboard", "Model Leaderboard");
+                dimText("Deterministic gym pass rates from benchmarks/leaderboard/leaderboard.json. "
+                        "MOCK badge when task_suite ends in -MOCK.");
+                if (ImGui::SmallButton("Refresh##settings_lb")) {
+                    s_lb = ui::leaderboard::load();
+                    s_lbLast = ImGui::GetTime();
+                    s_cats.lastPoll = -1e9;
+                    s_cats.loaded = false;
+                }
+                ImGui::Dummy(ImVec2(0, 2 * sc));
+                ui::leaderboard::drawCompactTable(s_lb, sc);
+                drawBenchRunner(st, sc, s_lb, s_lbLast);
+                settingsGlassSectionEnd();
+
+                                        ImGui::EndTabItem();
+                    }
+
+                    if (ImGui::BeginTabItem("Tools", nullptr, subFlags(6))) {
+
+                        settingsGlassSectionBegin("##ai_tools_families", "Tool families");
+                        dimText("Enable or disable MCP tool families the agent may call. "
+                                "Saved under config.json agent.tool_families.");
+                        static std::map<std::string, bool> s_toolFam;
+                        static double s_toolFamLast = -1e9;
+                        static bool s_toolFamDirty = false;
+                        static const char* kToolFamilies[] = {
+                            "cad", "ecad", "cam", "em", "reveng", "plm", "parts",
+                            "advisor", "ledger", "intake", "recon", "gsl",
+                            "workspace", "org", "research", "sim"
+                        };
+                        static constexpr int kToolFamilyCount =
+                            (int)(sizeof(kToolFamilies) / sizeof(kToolFamilies[0]));
+                        const double nowTf = ImGui::GetTime();
+                        if (s_toolFam.empty() || (nowTf - s_toolFamLast) > 2.0) {
+                            s_toolFamLast = nowTf;
+                            try {
+                                std::ifstream in(configPath());
+                                nlohmann::json j = nlohmann::json::object();
+                                if (in) { in >> j; }
+                                auto ag = j.value("agent", nlohmann::json::object());
+                                auto tf = ag.value("tool_families", nlohmann::json::object());
+                                for (int i = 0; i < kToolFamilyCount; ++i) {
+                                    const char* k = kToolFamilies[i];
+                                    bool on = true;
+                                    if (tf.is_object() && tf.contains(k) && tf[k].is_boolean())
+                                        on = tf[k].get<bool>();
+                                    s_toolFam[k] = on;
+                                }
+                            } catch (...) {
+                                for (int i = 0; i < kToolFamilyCount; ++i)
+                                    s_toolFam[kToolFamilies[i]] = true;
+                            }
+                        }
+                        if (ImGui::BeginTable("##tool_fams", 3,
+                                              ImGuiTableFlags_SizingStretchSame)) {
+                            for (int i = 0; i < kToolFamilyCount; ++i) {
+                                const char* k = kToolFamilies[i];
+                                ImGui::TableNextColumn();
+                                bool v = s_toolFam.count(k) ? s_toolFam[k] : true;
+                                if (ImGui::Checkbox(k, &v)) {
+                                    s_toolFam[k] = v;
+                                    s_toolFamDirty = true;
+                                }
+                            }
+                            ImGui::EndTable();
+                        }
+                        if (s_toolFamDirty) {
+                            ImGui::Dummy(ImVec2(0, 6.0f * sc));
+                            if (ImGui::Button("Save tool families", ImVec2(180.0f * sc, 0))) {
+                                try {
+                                    nlohmann::json j = nlohmann::json::object();
+                                    {
+                                        std::ifstream in(configPath());
+                                        if (in) {
+                                            nlohmann::json old; in >> old;
+                                            if (old.is_object()) j = old;
+                                        }
+                                    }
+                                    if (!j.contains("agent") || !j["agent"].is_object())
+                                        j["agent"] = nlohmann::json::object();
+                                    nlohmann::json tf = nlohmann::json::object();
+                                    for (const auto& kv : s_toolFam) tf[kv.first] = kv.second;
+                                    j["agent"]["tool_families"] = tf;
+                                    std::ofstream outf(configPath(), std::ios::trunc);
+                                    outf << j.dump(2);
+                                    s_toolFamDirty = false;
+                                    s_toolFamLast = -1e9;
+                                } catch (...) {}
+                            }
+                            ImGui::SameLine();
+                            if (ImGui::Button("Reset all on", ImVec2(120.0f * sc, 0))) {
+                                for (int i = 0; i < kToolFamilyCount; ++i)
+                                    s_toolFam[kToolFamilies[i]] = true;
+                                s_toolFamDirty = true;
+                            }
+                        }
+                        settingsGlassSectionEnd();
+                        ImGui::EndTabItem();
+                    }
+
+                    if (ImGui::BeginTabItem("Maintenance", nullptr, subFlags(7))) {
+settingsGlassSectionBegin("##ai_maintenance", "Maintenance");
+                dimText("Repair the local CAD engine runtime, or trim which models appear in the "
+                        "composer's model picker.");
+                {
+                    const bool canSetup = !st.setupRunning.load() && !st.job.running.load();
+                    if (!canSetup) ImGui::BeginDisabled();
+                    if (ImGui::Button("Repair / install runtime", ImVec2(220.0f * sc, 0)))
+                        st.startSetup(true);
+                    if (!canSetup) ImGui::EndDisabled();
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                        ImGui::SetTooltip("Rebuild the local Python/CAD runtime (same as "
+                                          "Chudware \xe2\x86\x92 Repair / install runtime).");
+                    if (st.setupRunning.load()) {
+                        ImGui::SameLine();
+                        dimText("Running\xe2\x80\xa6");
+                    }
+                }
+                ImGui::Dummy(ImVec2(0, 4 * sc));
+                if (ImGui::CollapsingHeader("Manage models (chat picker)"))
+                    ui::drawAiSettingsSection(st, busy, ui::AiSettingsSection::ManageModels);
+                settingsGlassSectionEnd();
+                        ImGui::EndTabItem();
+                    }
+
                     ImGui::EndTabBar();
                 }
+                s_aiSubJump = -1;
                 settingsTabBodyEnd();
                 ImGui::EndTabItem();
             }
+
+// ---- Providers tab: provider/model, Moonshot key parking, subscription accounts ----
+            if (ImGui::BeginTabItem("Providers", nullptr,
+                                    (jumpToTab == 3) ? ImGuiTabItemFlags_SetSelected
+                                                     : ImGuiTabItemFlags_None)) {
+                settingsTabBodyBegin("##tab_providers");
+                dimText(("API providers, keys, and subscription accounts. Stored in " +
+                         configPath() + ".").c_str());
+
+                settingsGlassSectionBegin("##prov_provider", "Provider & Model");
+                ui::drawAiSettingsSection(st, busy, ui::AiSettingsSection::ProviderModel);
+                settingsGlassSectionEnd();
+
+                // Moonshot key is first-class (keys.moonshot) and can be parked while another
+                // provider stays active — surface it even when Provider & Model isn't on Moonshot.
+                settingsGlassSectionBegin("##prov_moonshot", "Moonshot (Kimi)");
+                dimText("Configured but not the active provider. Store a key to park credit; "
+                        "pick a Kimi model later when you want to use it.");
+                ImGui::TextUnformatted("API key (platform.moonshot.ai)");
+                ImGui::SetNextItemWidth(-1);
+                if (ImGui::InputText("##settings_moonshot_key", st.settings.moonshotKey,
+                                     sizeof(st.settings.moonshotKey),
+                                     ImGuiInputTextFlags_Password)) {
+                    saveSettings(st.settings);
+                }
+                {
+                    const bool have = st.settings.moonshotKey[0] != '\0';
+                    ImGui::PushStyleColor(ImGuiCol_Text,
+                        have ? ui::Palette::toU32(ui::palette.statusOk)
+                             : ui::Palette::toU32(ui::palette.statusWarn));
+                    ImGui::TextUnformatted(have
+                        ? "key set \xe2\x80\x94 Kimi models appear in the picker when enabled"
+                        : "no key \xe2\x80\x94 paste a Moonshot API key when you have credit");
+                    ImGui::PopStyleColor();
+                }
+                settingsGlassSectionEnd();
+
+                settingsGlassSectionBegin("##prov_accounts", "Accounts");
+                drawSubscriptionAccounts(st, sc);
+                settingsGlassSectionEnd();
+
+                settingsTabBodyEnd();
+                ImGui::EndTabItem();
+            }
+
             // --- end C22b marked block ---
             // Agent tab removed — run behavior lives on AI. wantSettings shot jumps to AI.
             static bool s_wantSettingsTabDone = false;
             bool wantSettingsSel = st.wantSettings && !s_wantSettingsTabDone;
             if (wantSettingsSel) s_wantSettingsTabDone = true;
-            // Legacy jumpToTab==6 (old Agent) and wantSettings → AI tab (index 2).
+            // Legacy: Agent(6)/Prompts(5)/Benchmarks(4) → AI(2). Experimental is tab 4.
             if (wantSettingsSel && jumpToTab < 0) jumpToTab = 2;
-            if (jumpToTab == 6) jumpToTab = 2;  // old Agent index → AI
-            // jumpToTab 7 was Experimental; remap to 6 after Agent removal.
-            if (jumpToTab == 7) jumpToTab = 6;
+            if (jumpToTab == 4 || jumpToTab == 5 || jumpToTab == 6) {
+                if (jumpToTab == 4) s_aiSubJump = 5;
+                if (jumpToTab == 5) s_aiSubJump = 2;
+                jumpToTab = 2;
+            }
+            if (jumpToTab == 7) jumpToTab = 4;
 
             // ---- Experimental tab: research-backed opt-in AI features ----
             if (ImGui::BeginTabItem("Experimental", nullptr,
-                                    (jumpToTab == 6) ? ImGuiTabItemFlags_SetSelected
+                                    (jumpToTab == 4) ? ImGuiTabItemFlags_SetSelected
                                                      : ImGuiTabItemFlags_None)) {
                 settingsTabBodyBegin("##tab_experimental");
                 dimText("Opt-in, default-off features from the model/provider research. All run "

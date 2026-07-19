@@ -6994,7 +6994,6 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     const ImGuiStyle& style = ImGui::GetStyle();
     const float lh = ImGui::GetTextLineHeight();
 
-    // Prefer medium over h2 so the logo row stays short (less dead air under the ribbon).
     ImFont* wordF = st.fonts.medium ? st.fonts.medium : nullptr;
     float wordLh = lh;
     if (wordF) { ImGui::PushFont(wordF); wordLh = ImGui::GetTextLineHeight(); ImGui::PopFont(); }
@@ -7003,7 +7002,6 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     const bool settingsOpen = st.showAISettingsOverlay;
     const bool chatOpen = !sessionsOpen && !settingsOpen;
 
-    // Measure icon+label button widths (must match drawHeaderTextButton math).
     auto measureBtn = [&](const char* label, const char* iconName) -> float {
         const float iconSz = lh * 0.92f;
         const float iconGap = 4.0f * sc;
@@ -7016,38 +7014,34 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     const float chatW = measureBtn("Chat", "ai_panel");
     const float sessW = measureBtn("Sessions", "history");
     const float gearW = measureBtn("Settings", "settings");
-    const float gap   = style.ItemSpacing.x;
+    const float minGap = style.ItemSpacing.x;
     const float rightInset = ui::metrics::U(0.5f);
     const float collapseW = lh;
     const float collapseGap = ui::metrics::asmHeaderIconGap();
+    const float leftInset = collapseW + collapseGap;
+    const float colW = ImGui::GetContentRegionAvail().x;
 
-    // ---- Row 1: [Tasks d/t] .. centered Chudware cube+wordmark .. [Artifacts] ----
     {
-        const float colW = ImGui::GetContentRegionAvail().x;
         const float logoGap = 3.0f * sc;
         const float cubeSz = std::min(lh, wordLh) * 0.95f;
         if (wordF) ImGui::PushFont(wordF);
         const float wmW = ImGui::CalcTextSize("Chudware").x;
         if (wordF) ImGui::PopFont();
         const float logoW = cubeSz + logoGap + wmW;
-        // Clear the tool ribbon above the copilot column — row 1 used to sit flush and
-        // clip the Tasks / Artifacts buttons into the ribbon chrome.
         ImGui::Dummy(ImVec2(0, 6.0f * sc));
         const float rowTop1 = ImGui::GetCursorPosY();
-        const float bh = lh + 4.0f * sc;   // real header-button height
+        const float bh = lh + 4.0f * sc;
         auto cy1 = [&](float h) { ImGui::SetCursorPosY(rowTop1 + (wordLh - h) * 0.5f); };
 
-        // Task-list button — nudged inward from the far left so it balances against the
-        // right-side Artifacts button (not flush in the corner).
         int tlDone = 0, tlTotal = 0;
         copilotTaskProgress(st, tlDone, tlTotal);
         char tlLabel[24];
         std::snprintf(tlLabel, sizeof(tlLabel), "%d/%d", tlDone, tlTotal);
         const float tlW = measureBtn(tlLabel, "plan_board");
         const float artW = measureBtn("Artifacts", "team");
-        const float tasksInset = collapseW + collapseGap + 10.0f * sc;
+
         cy1(bh);
-        ImGui::SetCursorPosX(tasksInset);
+        ImGui::SetCursorPosX(leftInset);
         if (busy) ImGui::BeginDisabled();
         if (drawHeaderTextButton("##hdr_tasks", tlLabel, st.showTaskList, tlW, "plan_board")) {
             const bool open = !st.showTaskList;
@@ -7058,40 +7052,24 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Tasks \xc2\xb7 %d of %d done \xc2\xb7 click for the task list", tlDone, tlTotal);
 
-        // Run status fused into the centered Chudware cube (status tip + small corner dot —
-        // NOT a filled rect behind the glyph; that flooded colored bg through the cube).
         const float* statusCol = pal.accentMid;  const char* statusTip = "Idle";
         if (st.statusKind == 2) { statusCol = pal.statusErr; statusTip = "Error"; }
         else if (busy || st.agentV2Running || activeConversationRunning(st)) {
             statusCol = pal.accent; statusTip = "Running";
         }
+        const ImVec4 statusTint(statusCol[0], statusCol[1], statusCol[2], 1.0f);
 
-        // Logo — CENTERED (kept clear of the flanking buttons).
         float logoLeft = (colW - logoW) * 0.5f;
-        logoLeft = std::max(tasksInset + tlW + 6.0f * sc, logoLeft);
+        logoLeft = std::max(leftInset + tlW + 6.0f * sc, logoLeft);
+        logoLeft = std::min(logoLeft, colW - rightInset - artW - logoW - 6.0f * sc);
         ImGui::SameLine(logoLeft);
         {
             IconUV cube = ui::getIcon("context_cube", 20);
             cy1(cubeSz);
-            const ImVec2 cubeP0 = ImGui::GetCursorScreenPos();
             if (cube.valid) {
-                ImGui::Image(cube.texId, ImVec2(cubeSz, cubeSz), cube.uv0, cube.uv1,
-                             chatSurf().textPrimary);
+                ImGui::Image(cube.texId, ImVec2(cubeSz, cubeSz), cube.uv0, cube.uv1, statusTint);
             } else {
                 ImGui::Dummy(ImVec2(cubeSz, cubeSz));
-            }
-            // Status dot at the cube's lower-right corner (no fill flooding the glyph).
-            {
-                ImDrawList* cdl = ImGui::GetWindowDrawList();
-                ImVec4 dot = semanticOnGlass(statusCol, chatSurf());
-                dot.w = 1.0f;
-                const float dr = cubeSz * 0.14f;
-                const ImVec2 dc(cubeP0.x + cubeSz - dr * 0.4f, cubeP0.y + cubeSz - dr * 0.4f);
-                cdl->AddCircleFilled(dc, dr, ImGui::ColorConvertFloat4ToU32(dot), 12);
-                cdl->AddCircle(dc, dr, ImGui::ColorConvertFloat4ToU32(
-                                   ImVec4(chatSurf().textPrimary.x, chatSurf().textPrimary.y,
-                                          chatSurf().textPrimary.z, 0.35f)), 12,
-                               ui::metrics::stroke(1.0f));
             }
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", statusTip);
             ImGui::SameLine(0, logoGap);
@@ -7103,8 +7081,7 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         ImGui::PopStyleColor();
         if (wordF) ImGui::PopFont();
 
-        // Session Artifacts button — RIGHT-aligned with the logo.
-        ImGui::SameLine(std::max(logoLeft + logoW + 6.0f * sc, colW - rightInset - artW));
+        ImGui::SameLine(colW - rightInset - artW);
         cy1(bh);
         if (busy) ImGui::BeginDisabled();
         if (drawHeaderTextButton("##hdr_arts", "Artifacts", st.showArtifacts, artW, "team")) {
@@ -7118,15 +7095,10 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         ImGui::SetCursorPosY(rowTop1 + wordLh);
     }
 
-    // ---- Row 2: collapse | Chat (left) | Sessions (center) | Settings (right) ----
-    // Status is fused into the Chudware cube above; no separate status dot.
     const float rowH   = std::max(lh, ImGui::GetFrameHeight());
     const float rowTop = ImGui::GetCursorPosY();
     auto centerY = [&](float h) { ImGui::SetCursorPosY(rowTop + (rowH - h) * 0.5f); };
-    const float contentMaxX = ImGui::GetContentRegionMax().x;
-    const float rightEdge = contentMaxX - rightInset;
 
-    // Collapse chevron LEADS the control row (in-flow). "»" tucks the column body away (T-G21).
     {
         const float cb = lh;
         centerY(cb);
@@ -7140,7 +7112,7 @@ static void drawCopilotHeader(AppState& st, bool busy) {
                                                              : chatSurf().textSecondary);
         const ImVec2 m(c0.x + cb * 0.5f, c0.y + cb * 0.5f);
         const float a = 3.0f * sc;
-        for (int i = 0; i < 2; ++i) {   // "»"
+        for (int i = 0; i < 2; ++i) {
             const float ox = (i == 0 ? -2.2f : 2.2f) * sc;
             wdl->AddLine(ImVec2(m.x + ox - a * 0.5f, m.y - a), ImVec2(m.x + ox + a * 0.5f, m.y), cc, ui::metrics::stroke(1.6f));
             wdl->AddLine(ImVec2(m.x + ox + a * 0.5f, m.y), ImVec2(m.x + ox - a * 0.5f, m.y + a), cc, ui::metrics::stroke(1.6f));
@@ -7154,17 +7126,19 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         ImGui::SameLine(0, collapseGap);
     }
 
-    // Left edge for Chat (after collapse). Right = Settings (no status-dot reservation).
-    const float leftX = ImGui::GetCursorPosX();
-    const float settingsX = rightEdge - gearW;
-    float sessionsX = (leftX + rightEdge) * 0.5f - sessW * 0.5f;
-    // Keep Sessions from overlapping Chat/Settings.
-    sessionsX = std::max(sessionsX, leftX + chatW + gap);
-    sessionsX = std::min(sessionsX, settingsX - sessW - gap);
+    const float usableL = leftInset;
+    const float usableR = colW - rightInset;
+    const float free = usableR - usableL - chatW - sessW - gearW;
+    float gapEq = free * 0.5f;
+    if (gapEq < minGap) gapEq = minGap;
+    float chatX = usableL;
+    float sessX = usableL + chatW + gapEq;
+    float setX  = usableR - gearW;
+    sessX = std::max(sessX, chatX + chatW + minGap);
+    sessX = std::min(sessX, setX - sessW - minGap);
 
-    // Chat — LEFT aligned.
     centerY(lh);
-    ImGui::SetCursorPosX(leftX);
+    ImGui::SetCursorPosX(chatX);
     if (busy) ImGui::BeginDisabled();
     if (drawHeaderTextButton("##hdr_chat", "Chat", chatOpen, chatW, "ai_panel")) {
         st.showSessionsPicker = false;
@@ -7174,9 +7148,8 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Chat — conversation with the agent.");
 
-    // Sessions — CENTER of the row (between chat and settings).
     centerY(lh);
-    ImGui::SetCursorPosX(sessionsX);
+    ImGui::SetCursorPosX(sessX);
     if (busy) ImGui::BeginDisabled();
     if (drawHeaderTextButton("##hdr_sess", "Sessions", sessionsOpen, sessW, "history")) {
         const bool open = !st.showSessionsPicker;
@@ -7188,9 +7161,8 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         ImGui::SetTooltip(sessionsOpen ? "Sessions list is open."
                                        : "Sessions — switch between chats.");
 
-    // Settings — RIGHT aligned. Status lives in the cube above.
     centerY(lh);
-    ImGui::SetCursorPosX(settingsX);
+    ImGui::SetCursorPosX(setX);
     if (drawHeaderTextButton("##hdr_gear", "Settings", settingsOpen, gearW, "settings")) {
         const bool open = !st.showAISettingsOverlay;
         st.showAISettingsOverlay = open;
@@ -7200,7 +7172,6 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         ImGui::SetTooltip(settingsOpen ? "Settings is open."
                                        : "AI settings — provider, model, privacy.");
 
-    // Close the row at its full shared height so the divider below sits under the tallest element.
     ImGui::SetCursorPosY(std::max(ImGui::GetCursorPosY(), rowTop + rowH));
 }
 
@@ -9507,7 +9478,7 @@ static void drawAISettingsBody(AppState& st, bool busy) {
         }
         if (ImGui::Button("Prompts##q_open_prompts", ImVec2(-1, 0))) {
             st.openSettings = true;
-            st.openSettingsTab = 5;
+            st.openSettingsTab = 2;  // AI (Prompts absorbed)
             st.showAISettingsOverlay = false;
         }
     }

@@ -110,6 +110,11 @@ def _has_api_key_fallback(friendly: str) -> bool:
 
 
 
+# Cap multi-account refresh attempts so a dead-token storm cannot turn one
+# pre-run ensure_fresh into dozens of network round-trips.
+_ENSURE_FRESH_MAX_ACCOUNTS = 5
+
+
 def ensure_fresh(provider: str, *, skew_ms: int = _ENSURE_FRESH_SKEW_MS) -> dict:
     """Refresh the active subscription token if expired or expiring within *skew_ms*.
 
@@ -120,6 +125,10 @@ def ensure_fresh(provider: str, *, skew_ms: int = _ENSURE_FRESH_SKEW_MS) -> dict
 
     *provider* accepts friendly ids (claude/xai/cursor/codex) and provider
     names (anthropic-sub/xai-sub/…) — same aliases as status/login.
+
+    Multi-account (xAI): if the active account's refresh is definitively dead
+    (invalid_grant / revoked), rotate to another signed-in account (capped)
+    instead of failing the whole pre-run gate closed.
     """
     resolved = _resolve(provider)
     if resolved is None:
@@ -169,47 +178,122 @@ def ensure_fresh(provider: str, *, skew_ms: int = _ENSURE_FRESH_SKEW_MS) -> dict
             "error": None,
         }
 
-    # Stale / near-expiry — refresh via the provider's single-writer path.
-    if not cred.get("refresh_token"):
-        return {
-            "ok": False,
-            "refreshed": False,
-            "expires_in": _expires_in_s(cred),
-            "error": (
-                f"{friendly} access token expired and no refresh_token is stored. "
-                "Re-authenticate via Settings → AI → Accounts."
-            ),
-        }
-    try:
-        prov = _instantiate(name)
-        # Constructor already loaded active cred; re-bind for safety.
-        if getattr(prov, "_cred", None) is None:
-            prov._cred = cred
-        new_cred = prov.refresh()
-    except Exception as exc:  # noqa: BLE001 — never leak a traceback over RPC
-        # Dual-path providers (xai / anthropic) may run on a classic API key while a
-        # leftover subscription credential is stale. Don't brick the API-key path.
-        if _has_api_key_fallback(friendly):
+    def _candidate_account_ids() -> list[str]:
+        """Active first, then other stored accounts (stable order)."""
+        active = sub_auth.get_active_account_id(cred_id)
+        ordered: list[str] = []
+        if active:
+            ordered.append(str(active))
+        for a in sub_auth.list_accounts(cred_id):
+            aid = str(a.get("account_id") or "")
+            if aid and aid not in ordered:
+                ordered.append(aid)
+        return ordered[: max(1, _ENSURE_FRESH_MAX_ACCOUNTS)]
+
+    def _is_dead_refresh(exc: BaseException) -> bool:
+        text = f"{type(exc).__name__}: {exc}".lower()
+        return any(
+            m in text
+            for m in (
+                "invalid_grant",
+                "revoked",
+                "re-authenticate",
+                "refresh_token previously revoked",
+                "no refresh_token",
+            )
+        )
+
+    last_exc: BaseException | None = None
+    tried = 0
+    for aid in _candidate_account_ids():
+        c = sub_auth.load_credential(cred_id, account_id=aid)
+        if not c or not (c.get("access_token") or c.get("refresh_token")):
+            continue
+        if c.get("refresh_revoked") and sub_auth.is_expired(c, skew_ms=0):
+            continue
+        if not sub_auth.is_expired(c, skew_ms=skew_ms):
+            # Another account is already fresh — promote it.
+            try:
+                sub_auth.set_active_account(cred_id, aid)
+            except Exception:  # noqa: BLE001
+                pass
             return {
                 "ok": True,
                 "refreshed": False,
-                "expires_in": _expires_in_s(cred),
+                "expires_in": _expires_in_s(c),
                 "error": None,
             }
+        if not c.get("refresh_token") or c.get("refresh_revoked"):
+            last_exc = RuntimeError(
+                f"{friendly} access token expired and no usable refresh_token "
+                f"for account {aid[:12]}"
+            )
+            continue
+        tried += 1
+        try:
+            prov = _instantiate(name)
+            # Bind the candidate account (constructor may have picked another).
+            prov._cred = dict(c)
+            if not prov._cred.get("account_id"):
+                prov._cred["account_id"] = aid
+            try:
+                if hasattr(prov, "_bind_account"):
+                    prov._bind_account(aid, prov._cred)  # type: ignore[attr-defined]
+            except Exception:  # noqa: BLE001
+                pass
+            new_cred = prov.refresh()
+            # refresh() already set active for xAI via _store_tokens; ensure pointer.
+            try:
+                sub_auth.set_active_account(cred_id, aid)
+            except Exception:  # noqa: BLE001
+                pass
+            return {
+                "ok": True,
+                "refreshed": True,
+                "expires_in": _expires_in_s(
+                    new_cred if isinstance(new_cred, dict) else {}
+                ),
+                "error": None,
+            }
+        except Exception as exc:  # noqa: BLE001 — try next account / shape error
+            last_exc = exc
+            if _is_dead_refresh(exc):
+                # Keep scanning siblings for multi-account pools.
+                continue
+            # Non-auth failure (network / 5xx / tier) — don't burn more accounts
+            # unless this is xAI multi-account and the error looks per-account.
+            if friendly == "xai" and any(
+                m in f"{exc}".lower()
+                for m in ("403", "429", "tier", "rate-limit", "rate limited")
+            ):
+                continue
+            break
+
+    # Dual-path providers (xai / anthropic) may run on a classic API key while a
+    # leftover subscription credential is stale. Don't brick the API-key path.
+    if _has_api_key_fallback(friendly):
         return {
-            "ok": False,
+            "ok": True,
             "refreshed": False,
             "expires_in": _expires_in_s(cred),
-            "error": (
-                f"{friendly} token refresh failed — re-authenticate via "
-                f"Settings → AI → Accounts. ({exc})"
-            ),
+            "error": None,
         }
+
+    if last_exc is None and tried == 0:
+        err = (
+            f"{friendly} access token expired and no refresh_token is stored. "
+            "Re-authenticate via Settings → AI → Accounts."
+        )
+    else:
+        err = (
+            f"{friendly} token refresh failed — re-authenticate via "
+            f"Settings → AI → Accounts. ({last_exc})"
+        )
     return {
-        "ok": True,
-        "refreshed": True,
-        "expires_in": _expires_in_s(new_cred if isinstance(new_cred, dict) else {}),
-        "error": None,
+        "ok": False,
+        "refreshed": False,
+        "expires_in": _expires_in_s(cred),
+        "error": err,
     }
 
 

@@ -1227,3 +1227,233 @@ def test_xai_complete_ex_rotates_on_timeout(tmp_config, monkeypatch):
     assert content == "ok-b"
     assert "tok-a" in seen and "tok-b" in seen
     assert xsp.is_account_blocked("acct-a") is True
+
+
+# ── xAI refresh-token rotation safety ────────────────────────────────────────
+
+
+def test_save_credential_identity_patch_does_not_clobber_rotated_rt(tmp_config):
+    """Identity/usage writes must not rewind a just-rotated refresh token."""
+    now = time.time() * 1000
+    sub_auth.save_credential("xai-sub", {
+        "access_token": "at-old",
+        "refresh_token": "rt-old",
+        "expires_at_ms": now - 1000,
+        "email": "a@x.ai",
+        "account_id": "acct-a",
+    }, account_id="acct-a")
+
+    # Simulate a refresh that landed a rotated RT.
+    sub_auth.save_credential("xai-sub", {
+        "access_token": "at-new",
+        "refresh_token": "rt-new",
+        "expires_at_ms": now + 3600_000,
+        "email": "a@x.ai",
+        "account_id": "acct-a",
+    }, account_id="acct-a", replace_tokens=True)
+
+    # Stale identity snapshot from before the refresh (classic usage-poll race).
+    sub_auth.save_credential(
+        "xai-sub",
+        {
+            "access_token": "at-old",
+            "refresh_token": "rt-old",
+            "expires_at_ms": now - 1000,
+            "display_name": "Alice",
+            "plan": "SuperGrok",
+            "email": "a@x.ai",
+            "account_id": "acct-a",
+            "last_usage": [{"window": "total", "label": "Credits", "used_fraction": 0.1}],
+        },
+        account_id="acct-a",
+        set_active=False,
+        replace_tokens=False,
+    )
+
+    stored = sub_auth.load_credential("xai-sub", account_id="acct-a")
+    assert stored["refresh_token"] == "rt-new"
+    assert stored["access_token"] == "at-new"
+    assert stored["display_name"] == "Alice"
+    assert stored["plan"] == "SuperGrok"
+    assert stored["last_usage"][0]["label"] == "Credits"
+
+
+def test_parallel_account_writes_do_not_drop_sibling_tokens(tmp_config):
+    """Two accounts written under lock both survive (no full-snapshot clobber)."""
+    import threading
+
+    now = time.time() * 1000
+    barrier = threading.Barrier(2)
+    errors: list[BaseException] = []
+
+    def writer(aid: str, rt: str) -> None:
+        try:
+            barrier.wait(timeout=5)
+            sub_auth.save_credential(
+                "xai-sub",
+                {
+                    "access_token": f"at-{aid}",
+                    "refresh_token": rt,
+                    "expires_at_ms": now + 3600_000,
+                    "account_id": aid,
+                    "email": f"{aid}@x.ai",
+                },
+                account_id=aid,
+                set_active=False,
+                replace_tokens=True,
+            )
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    t1 = threading.Thread(target=writer, args=("acct-a", "rt-a"))
+    t2 = threading.Thread(target=writer, args=("acct-b", "rt-b"))
+    t1.start(); t2.start()
+    t1.join(timeout=10); t2.join(timeout=10)
+    assert not errors, errors
+    a = sub_auth.load_credential("xai-sub", account_id="acct-a")
+    b = sub_auth.load_credential("xai-sub", account_id="acct-b")
+    assert a and a["refresh_token"] == "rt-a"
+    assert b and b["refresh_token"] == "rt-b"
+
+
+def test_xai_refresh_serializes_and_reuses_rotated_token(tmp_config, monkeypatch):
+    """Two concurrent refresh() calls share one network exchange; both get new RT."""
+    import threading
+    from agent.providers import xai_sub_provider as xsp
+
+    now = time.time() * 1000
+    sub_auth.save_credential(xsp.PROVIDER_ID, {
+        "access_token": "at-old",
+        "refresh_token": "rt-old",
+        "expires_at_ms": now - 1000,
+        "account_id": "acct-a",
+        "email": "a@x.ai",
+        "token_endpoint": "https://auth.x.ai/oauth2/token",
+    }, account_id="acct-a")
+
+    calls = {"n": 0}
+    gate = threading.Barrier(2)
+
+    def fake_post_form(url, fields, headers=None, timeout=30.0):  # noqa: ARG001
+        calls["n"] += 1
+        # Let both threads enter refresh(); the lock should serialize so only one posts.
+        assert fields.get("refresh_token") == "rt-old"
+        return {
+            "access_token": "at-new",
+            "refresh_token": "rt-new",
+            "expires_in": 3600,
+        }
+
+    monkeypatch.setattr(sub_auth, "post_form", fake_post_form)
+
+    results: list[dict] = []
+    errors: list[BaseException] = []
+
+    def worker() -> None:
+        try:
+            p = xsp.XAISubProvider()
+            p._cred = sub_auth.load_credential(xsp.PROVIDER_ID, account_id="acct-a")
+            gate.wait(timeout=5)
+            results.append(p.refresh())
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    t1 = threading.Thread(target=worker)
+    t2 = threading.Thread(target=worker)
+    t1.start(); t2.start()
+    t1.join(timeout=10); t2.join(timeout=10)
+    assert not errors, errors
+    assert len(results) == 2
+    # Only one network refresh — the second short-circuits on the fresh disk cred.
+    assert calls["n"] == 1
+    stored = sub_auth.load_credential(xsp.PROVIDER_ID, account_id="acct-a")
+    assert stored["refresh_token"] == "rt-new"
+    assert stored["access_token"] == "at-new"
+    assert all(r["refresh_token"] == "rt-new" for r in results)
+
+
+def test_xai_refresh_invalid_grant_marks_revoked(tmp_config, monkeypatch):
+    import urllib.error
+    from agent.providers import xai_sub_provider as xsp
+
+    now = time.time() * 1000
+    sub_auth.save_credential(xsp.PROVIDER_ID, {
+        "access_token": "at-old",
+        "refresh_token": "rt-dead",
+        "expires_at_ms": now - 1000,
+        "account_id": "acct-a",
+        "token_endpoint": "https://auth.x.ai/oauth2/token",
+    }, account_id="acct-a")
+    xsp.clear_blocked_accounts_for_tests()
+
+    def boom(url, fields, headers=None, timeout=30.0):  # noqa: ARG001
+        raise urllib.error.HTTPError(
+            url, 400, "Bad Request", hdrs=None, fp=__import__("io").BytesIO(
+                b'{"error":"invalid_grant","error_description":"Refresh token has been revoked"}'
+            ),
+        )
+
+    monkeypatch.setattr(sub_auth, "post_form", boom)
+    p = xsp.XAISubProvider()
+    p._cred = sub_auth.load_credential(xsp.PROVIDER_ID, account_id="acct-a")
+    try:
+        p.refresh()
+        raise AssertionError("expected refresh to fail")
+    except RuntimeError as exc:
+        assert "invalid_grant" in str(exc) or "revoked" in str(exc).lower()
+    stored = sub_auth.load_credential(xsp.PROVIDER_ID, account_id="acct-a")
+    assert stored.get("refresh_revoked") is True
+    assert xsp.is_account_blocked("acct-a") is True
+
+
+def test_ensure_fresh_xai_rotates_past_revoked_active(tmp_config, monkeypatch):
+    """Pre-run gate must not fail closed on a dead active account when siblings live."""
+    from agent.providers import xai_sub_provider as xsp
+
+    now = time.time() * 1000
+    sub_auth.save_credential(xsp.PROVIDER_ID, {
+        "access_token": "at-dead",
+        "refresh_token": "rt-dead",
+        "expires_at_ms": now - 1000,
+        "account_id": "acct-dead",
+        "email": "dead@x.ai",
+        "token_endpoint": "https://auth.x.ai/oauth2/token",
+    }, account_id="acct-dead", set_active=True)
+    sub_auth.save_credential(xsp.PROVIDER_ID, {
+        "access_token": "at-live",
+        "refresh_token": "rt-live",
+        "expires_at_ms": now - 1000,
+        "account_id": "acct-live",
+        "email": "live@x.ai",
+        "token_endpoint": "https://auth.x.ai/oauth2/token",
+    }, account_id="acct-live", set_active=False)
+    # Active pointer is the dead one.
+    assert sub_auth.get_active_account_id(xsp.PROVIDER_ID) == "acct-dead"
+    xsp.clear_blocked_accounts_for_tests()
+
+    def fake_post_form(url, fields, headers=None, timeout=30.0):  # noqa: ARG001
+        rt = fields.get("refresh_token")
+        if rt == "rt-dead":
+            raise urllib.error.HTTPError(
+                url, 400, "Bad Request", hdrs=None, fp=__import__("io").BytesIO(
+                    b'{"error":"invalid_grant","error_description":"Refresh token has been revoked"}'
+                ),
+            )
+        if rt == "rt-live":
+            return {
+                "access_token": "at-live-new",
+                "refresh_token": "rt-live-new",
+                "expires_in": 7200,
+            }
+        raise AssertionError(f"unexpected rt {rt!r}")
+
+    import urllib.error
+    monkeypatch.setattr(sub_auth, "post_form", fake_post_form)
+
+    out = sl.ensure_fresh("xai")
+    assert out["ok"] is True, out
+    assert out["refreshed"] is True
+    assert sub_auth.get_active_account_id(xsp.PROVIDER_ID) == "acct-live"
+    live = sub_auth.load_credential(xsp.PROVIDER_ID, account_id="acct-live")
+    assert live["refresh_token"] == "rt-live-new"
+    assert live["access_token"] == "at-live-new"

@@ -532,7 +532,28 @@ def persist_identity(
         changed = True
     if changed:
         aid = account_id or sub_auth.get_active_account_id(cred_id)
-        sub_auth.save_credential(cred_id, cred, account_id=aid, set_active=False)
+        # Identity/usage only — never rewrite access/refresh tokens. A stale
+        # load_credential snapshot racing an xAI RT rotation was the invalid_grant
+        # footgun (rotated RT clobbered back to the revoked one).
+        identity = {
+            k: cred[k]
+            for k in (
+                "display_name",
+                "plan",
+                "email",
+                "last_usage",
+                "last_usage_fetched_at",
+                "account_id",
+            )
+            if k in cred
+        }
+        sub_auth.save_credential(
+            cred_id,
+            identity,
+            account_id=aid,
+            set_active=False,
+            replace_tokens=False,
+        )
 
 # ── Per-provider fetchers ────────────────────────────────────────────────────
 

@@ -228,9 +228,23 @@ class CallbackServer:
 
 
 # ── Credential store (config.json) ──────────────────────────────────────────
+# config.json is shared by the GUI worker, Settings usage polls, diag scripts,
+# and agent turns. xAI rotates refresh tokens on EVERY exchange — a stale
+# read-modify-write of the whole file (e.g. persist_identity on account B while
+# refresh persists account A) silently reverts the new RT and the next refresh
+# dies with invalid_grant / "Refresh token has been revoked".
+#
+# All mutations take a process lock + exclusive file lock, re-read disk, and
+# patch only the touched account (never rewrite a stale multi-account snapshot).
 
 _AUTH_KEY = "subscription_auth"
 DEFAULT_ACCOUNT_ID = "default"
+_cfg_lock = threading.RLock()
+_LOCK_SUFFIX = ".lock"
+
+
+def _lock_path():
+    return paths.CONFIG.with_name(paths.CONFIG.name + _LOCK_SUFFIX)
 
 
 def _load_cfg() -> dict:
@@ -244,11 +258,66 @@ def _load_cfg() -> dict:
 
 def _write_cfg(cfg: dict) -> None:
     paths.CONFIG.parent.mkdir(parents=True, exist_ok=True)
-    paths.CONFIG.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    # Atomic replace so concurrent readers never see a partial JSON document.
+    tmp = paths.CONFIG.with_name(paths.CONFIG.name + ".tmp")
+    data = json.dumps(cfg, indent=2)
+    tmp.write_text(data, encoding="utf-8")
+    tmp.replace(paths.CONFIG)
+
+
+def _file_lock(lf):
+    """Exclusive flock when available (POSIX); no-op fallback otherwise."""
+    try:
+        import fcntl  # noqa: PLC0415 — optional on non-POSIX
+    except ImportError:  # pragma: no cover
+        return None
+
+    class _Fl:
+        def __enter__(self_inner):
+            fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+            return lf
+
+        def __exit__(self_inner, *exc):
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+            return False
+
+    return _Fl()
+
+
+def _with_cfg_lock(fn):
+    """Run *fn* holding the process + file lock. *fn* receives nothing."""
+    with _cfg_lock:
+        paths.CONFIG.parent.mkdir(parents=True, exist_ok=True)
+        lock_p = _lock_path()
+        with open(lock_p, "a+", encoding="utf-8") as lf:
+            fl = _file_lock(lf)
+            if fl is None:
+                return fn()
+            with fl:
+                return fn()
 
 
 def _load_all() -> dict:
     return _load_cfg().get(_AUTH_KEY, {}) or {}
+
+
+def _commit_provider_entry(provider_id: str, entry: dict, cfg: dict) -> None:
+    """Write one provider's multi-account entry into *cfg* (caller holds lock)."""
+    auth = cfg.setdefault(_AUTH_KEY, {})
+    if not isinstance(auth, dict):
+        auth = {}
+        cfg[_AUTH_KEY] = auth
+    accounts = entry.get("accounts") or {}
+    if not accounts:
+        auth.pop(provider_id, None)
+        return
+    active = entry.get("active")
+    if active is None or str(active) not in accounts:
+        active = next(iter(accounts))
+    auth[provider_id] = {
+        "active": str(active),
+        "accounts": {str(k): dict(v) for k, v in accounts.items()},
+    }
 
 
 def _is_multi_entry(entry) -> bool:
@@ -281,21 +350,22 @@ def _normalize_entry(entry) -> dict:
 
 
 def _persist_entry(provider_id: str, entry: dict) -> None:
-    """Write a multi-account entry; drop the provider key when no accounts remain."""
-    cfg = _load_cfg()
-    auth = cfg.setdefault(_AUTH_KEY, {})
-    accounts = entry.get("accounts") or {}
-    if not accounts:
-        auth.pop(provider_id, None)
-    else:
-        active = entry.get("active")
-        if active is None or str(active) not in accounts:
-            active = next(iter(accounts))
-        auth[provider_id] = {
-            "active": str(active),
-            "accounts": {str(k): dict(v) for k, v in accounts.items()},
-        }
-    _write_cfg(cfg)
+    """Write a multi-account entry; drop the provider key when no accounts remain.
+
+    Locked + disk re-read: only *provider_id* is replaced. Other providers keep
+    whatever is already on disk (avoids clobbering parallel writes).
+    """
+    snapshot = {
+        "active": entry.get("active"),
+        "accounts": {str(k): dict(v) for k, v in (entry.get("accounts") or {}).items()},
+    }
+
+    def _do() -> None:
+        cfg = _load_cfg()
+        _commit_provider_entry(provider_id, snapshot, cfg)
+        _write_cfg(cfg)
+
+    _with_cfg_lock(_do)
 
 
 def _slug_account_id(value: str) -> str:
@@ -337,68 +407,228 @@ def load_credential(provider_id: str, account_id: str | None = None) -> dict | N
     return dict(cred) if cred else None
 
 
+def _resolve_save_account_id(
+    provider_id: str,
+    cred: dict,
+    account_id: str | None,
+    entry: dict,
+) -> str:
+    if account_id is not None and str(account_id).strip():
+        return str(account_id).strip()
+    raw = cred.get("account_id") if isinstance(cred, dict) else None
+    if raw is not None and str(raw).strip():
+        return str(raw).strip()
+    if entry["accounts"] and entry.get("active") in entry["accounts"]:
+        # Refresh path: providers often omit identity; update the active slot
+        # instead of spawning a new "default" account.
+        return entry["active"]
+    return DEFAULT_ACCOUNT_ID
+
+
+def _merge_saved_cred(prev: dict | None, cred: dict, *, replace_tokens: bool) -> dict:
+    """Merge *cred* onto *prev*.
+
+    Token writes (replace_tokens=True) install access/refresh/expiry from *cred*.
+    Identity / usage patches (replace_tokens=False) NEVER touch token fields — that
+    is the xAI invalid_grant footgun when Settings usage polls race a refresh.
+    """
+    base = dict(prev or {})
+    incoming = dict(cred or {})
+    token_keys = (
+        "access_token",
+        "refresh_token",
+        "expires_at_ms",
+        "id_token",
+        "token_endpoint",
+        "refresh_revoked",
+        "auth_error",
+    )
+    if replace_tokens:
+        base.update(incoming)
+        # A successful token write clears a prior revoked marker unless caller set it.
+        if incoming.get("access_token") or incoming.get("refresh_token"):
+            if "refresh_revoked" not in incoming:
+                base.pop("refresh_revoked", None)
+            if "auth_error" not in incoming:
+                base.pop("auth_error", None)
+        return base
+    for k, v in incoming.items():
+        if k in token_keys:
+            continue
+        base[k] = v
+    return base
+
+
 def save_credential(
     provider_id: str,
     cred: dict,
     account_id: str | None = None,
     *,
     set_active: bool = True,
+    replace_tokens: bool | None = None,
 ) -> str:
     """Save *cred* under (provider_id, account_id). Returns the account_id used.
 
     *account_id* defaults to ``cred['account_id']`` then ``DEFAULT_ACCOUNT_ID``.
     When *set_active* is True (default), that account becomes the provider's active one.
     Transparent migration: a legacy flat entry is rewritten as multi-account on save.
+
+    Under lock, only this one account slot is patched against a fresh disk read —
+    parallel writers cannot clobber other accounts' rotated refresh tokens.
+
+    *replace_tokens*:
+      - True  → install token fields from *cred* (login / refresh path)
+      - False → identity/usage patch; token fields on disk are preserved
+      - None  → True when *cred* carries access_token or refresh_token, else False
     """
-    entry = _normalize_entry(_load_all().get(provider_id))
-    if account_id is not None and str(account_id).strip():
-        aid = str(account_id).strip()
-    else:
-        raw = cred.get("account_id") if isinstance(cred, dict) else None
-        if raw is not None and str(raw).strip():
-            aid = str(raw).strip()
-        elif entry["accounts"] and entry.get("active") in entry["accounts"]:
-            # Refresh path: providers often omit identity; update the active slot
-            # instead of spawning a new "default" account.
-            aid = entry["active"]
+    if replace_tokens is None:
+        replace_tokens = bool(
+            isinstance(cred, dict)
+            and (cred.get("access_token") or cred.get("refresh_token")
+                 or cred.get("expires_at_ms") is not None)
+        )
+    # Heuristic: callers that pass set_active=False with a full loaded cred (usage
+    # persist_identity) must NOT rewind tokens. Force non-token merge unless the
+    # payload looks like a dedicated token rotation (explicit replace_tokens=True).
+    if replace_tokens and not set_active:
+        # Still allow token writes with set_active=False when explicitly rotating
+        # off the active pointer — but identity-only payloads often include stale
+        # token copies from load_credential. Detect pure identity intent:
+        # if caller didn't change tokens vs disk we keep disk tokens via merge
+        # keyed on replace_tokens flag from caller. Default path below re-reads.
+        pass
+
+    result: dict[str, str] = {}
+
+    def _do() -> None:
+        cfg = _load_cfg()
+        auth = cfg.get(_AUTH_KEY) or {}
+        entry = _normalize_entry(auth.get(provider_id) if isinstance(auth, dict) else None)
+        aid = _resolve_save_account_id(provider_id, cred, account_id, entry)
+        prev = entry["accounts"].get(aid)
+        # Auto-demote to identity merge when set_active=False and incoming tokens
+        # are older/equal than disk — protects persist_identity races.
+        do_tokens = bool(replace_tokens)
+        if do_tokens and not set_active and prev:
+            try:
+                prev_exp = float(prev.get("expires_at_ms") or 0)
+                new_exp = float((cred or {}).get("expires_at_ms") or 0)
+            except (TypeError, ValueError):
+                prev_exp, new_exp = 0.0, 0.0
+            prev_rt = prev.get("refresh_token") or ""
+            new_rt = (cred or {}).get("refresh_token") or ""
+            prev_at = prev.get("access_token") or ""
+            new_at = (cred or {}).get("access_token") or ""
+            # Stale snapshot of the same slot (common usage-poll path): keep disk tokens.
+            if new_exp <= prev_exp and (new_rt == prev_rt or not new_rt) and (
+                new_at == prev_at or not new_at or new_exp < prev_exp
+            ):
+                do_tokens = False
+        stored = _merge_saved_cred(prev, dict(cred or {}), replace_tokens=do_tokens)
+        if not stored.get("account_id") and aid != DEFAULT_ACCOUNT_ID:
+            stored["account_id"] = aid
+        entry["accounts"][aid] = stored
+        if set_active:
+            entry["active"] = aid
+        elif entry.get("active") not in entry["accounts"]:
+            entry["active"] = aid
+        _commit_provider_entry(provider_id, entry, cfg)
+        _write_cfg(cfg)
+        result["aid"] = aid
+
+    _with_cfg_lock(_do)
+    return result["aid"]
+
+
+def patch_credential(
+    provider_id: str,
+    account_id: str | None,
+    fields: dict,
+) -> bool:
+    """Patch non-token (or explicit) fields on one account under lock. False if missing."""
+    if not isinstance(fields, dict) or not fields:
+        return False
+    ok = {"v": False}
+
+    def _do() -> None:
+        cfg = _load_cfg()
+        auth = cfg.get(_AUTH_KEY) or {}
+        entry = _normalize_entry(auth.get(provider_id) if isinstance(auth, dict) else None)
+        if not entry["accounts"]:
+            return
+        if account_id is None:
+            aid = entry.get("active") or next(iter(entry["accounts"]))
         else:
-            aid = DEFAULT_ACCOUNT_ID
-    stored = dict(cred)
-    # Keep the identity field in sync with the cache key when missing and non-default.
-    if not stored.get("account_id") and aid != DEFAULT_ACCOUNT_ID:
-        stored["account_id"] = aid
-    entry["accounts"][aid] = stored
-    if set_active:
-        entry["active"] = aid
-    elif entry.get("active") not in entry["accounts"]:
-        entry["active"] = aid
-    _persist_entry(provider_id, entry)
-    return aid
+            aid = str(account_id)
+        if aid not in entry["accounts"]:
+            return
+        prev = dict(entry["accounts"][aid])
+        # Default: identity patch. Token keys only applied when explicitly present
+        # AND caller is marking revocation / endpoint metadata.
+        token_allow = {
+            "refresh_revoked",
+            "auth_error",
+            "token_endpoint",
+            "refresh_token",
+            "access_token",
+            "expires_at_ms",
+            "id_token",
+        }
+        for k, v in fields.items():
+            if k in ("access_token", "refresh_token", "expires_at_ms", "id_token"):
+                # Explicit token surgery (e.g. clear RT on invalid_grant).
+                if v is None:
+                    prev.pop(k, None)
+                else:
+                    prev[k] = v
+            elif k in token_allow or k not in (
+                "access_token", "refresh_token", "expires_at_ms", "id_token"
+            ):
+                if v is None:
+                    prev.pop(k, None)
+                else:
+                    prev[k] = v
+        entry["accounts"][aid] = prev
+        _commit_provider_entry(provider_id, entry, cfg)
+        _write_cfg(cfg)
+        ok["v"] = True
+
+    _with_cfg_lock(_do)
+    return bool(ok["v"])
 
 
 def clear_credential(provider_id: str, account_id: str | None = None) -> None:
     """Remove one account (active when *account_id* is None). Drops the provider when empty."""
-    raw = _load_all().get(provider_id)
-    if raw is None:
-        return
-    entry = _normalize_entry(raw)
-    accounts = entry["accounts"]
-    if not accounts:
-        _persist_entry(provider_id, {"active": DEFAULT_ACCOUNT_ID, "accounts": {}})
-        return
-    if account_id is None:
-        target = entry.get("active") or DEFAULT_ACCOUNT_ID
+
+    def _do() -> None:
+        cfg = _load_cfg()
+        auth = cfg.get(_AUTH_KEY) or {}
+        if not isinstance(auth, dict) or provider_id not in auth:
+            return
+        entry = _normalize_entry(auth.get(provider_id))
+        accounts = entry["accounts"]
+        if not accounts:
+            _commit_provider_entry(
+                provider_id, {"active": DEFAULT_ACCOUNT_ID, "accounts": {}}, cfg
+            )
+            _write_cfg(cfg)
+            return
+        if account_id is None:
+            target = entry.get("active") or DEFAULT_ACCOUNT_ID
+            if target not in accounts:
+                target = next(iter(accounts))
+        else:
+            target = str(account_id)
         if target not in accounts:
-            target = next(iter(accounts))
-    else:
-        target = str(account_id)
-    if target not in accounts:
-        return
-    del accounts[target]
-    if entry.get("active") == target:
-        entry["active"] = next(iter(accounts), DEFAULT_ACCOUNT_ID)
-    entry["accounts"] = accounts
-    _persist_entry(provider_id, entry)
+            return
+        del accounts[target]
+        if entry.get("active") == target:
+            entry["active"] = next(iter(accounts), DEFAULT_ACCOUNT_ID)
+        entry["accounts"] = accounts
+        _commit_provider_entry(provider_id, entry, cfg)
+        _write_cfg(cfg)
+
+    _with_cfg_lock(_do)
 
 
 def list_accounts(provider_id: str) -> list[dict]:
@@ -444,28 +674,45 @@ def get_active_account_id(provider_id: str) -> str | None:
 
 def set_active_account(provider_id: str, account_id: str) -> bool:
     """Point the active account pointer at *account_id*. Returns False if unknown."""
-    entry = _normalize_entry(_load_all().get(provider_id))
-    aid = str(account_id)
-    if aid not in entry["accounts"]:
-        return False
-    entry["active"] = aid
-    _persist_entry(provider_id, entry)
-    return True
+    ok = {"v": False}
+
+    def _do() -> None:
+        cfg = _load_cfg()
+        auth = cfg.get(_AUTH_KEY) or {}
+        entry = _normalize_entry(auth.get(provider_id) if isinstance(auth, dict) else None)
+        aid = str(account_id)
+        if aid not in entry["accounts"]:
+            return
+        entry["active"] = aid
+        _commit_provider_entry(provider_id, entry, cfg)
+        _write_cfg(cfg)
+        ok["v"] = True
+
+    _with_cfg_lock(_do)
+    return bool(ok["v"])
 
 
 def migrate_legacy_provider(provider_id: str) -> bool:
     """Persist multi-account shape for a legacy flat entry. Returns True if rewritten."""
-    raw = _load_all().get(provider_id)
-    if raw is None or _is_multi_entry(raw):
-        return False
-    if not isinstance(raw, dict):
-        return False
-    # Only migrate credential-looking dicts.
-    if "access_token" not in raw and "refresh_token" not in raw:
-        return False
-    entry = _normalize_entry(raw)
-    _persist_entry(provider_id, entry)
-    return True
+    ok = {"v": False}
+
+    def _do() -> None:
+        cfg = _load_cfg()
+        auth = cfg.get(_AUTH_KEY) or {}
+        raw = auth.get(provider_id) if isinstance(auth, dict) else None
+        if raw is None or _is_multi_entry(raw):
+            return
+        if not isinstance(raw, dict):
+            return
+        if "access_token" not in raw and "refresh_token" not in raw:
+            return
+        entry = _normalize_entry(raw)
+        _commit_provider_entry(provider_id, entry, cfg)
+        _write_cfg(cfg)
+        ok["v"] = True
+
+    _with_cfg_lock(_do)
+    return bool(ok["v"])
 
 # ── Token lifecycle helpers ─────────────────────────────────────────────────
 

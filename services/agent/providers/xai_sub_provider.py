@@ -200,6 +200,11 @@ class XaiTierDeniedError(RuntimeError):
 _account_block_lock = threading.Lock()
 _blocked_accounts: dict[str, float] = {}  # account_id -> unix-seconds unblock time
 _DEFAULT_ACCOUNT_BLOCK_S = 15 * 60
+# Per-account refresh serialization. xAI rotates RTs on every exchange — two
+# concurrent refreshes with the same RT make the second fail invalid_grant and
+# (if it persisted first) can even thrash a good rotation.
+_refresh_locks_guard = threading.Lock()
+_refresh_locks: dict[str, threading.Lock] = {}
 
 
 def _now_s() -> float:
@@ -248,6 +253,42 @@ def is_account_blocked(account_id: str | None) -> bool:
         return True
 
 
+def _refresh_lock_for(account_id: str | None) -> threading.Lock:
+    key = str(account_id or "").strip() or "__default__"
+    with _refresh_locks_guard:
+        lock = _refresh_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _refresh_locks[key] = lock
+        return lock
+
+
+def mark_refresh_revoked(account_id: str | None, *, detail: str = "") -> None:
+    """Persist a definitive invalid_grant on *account_id* and soft-block it.
+
+    Only call on HTTP 400/401 invalid_grant / revoked — never on network errors.
+    """
+    aid = str(account_id or "").strip()
+    if not aid:
+        return
+    mark_account_blocked(
+        aid,
+        seconds=6 * 60 * 60,
+        reason=f"refresh_revoked: {detail}"[:120],
+    )
+    try:
+        sub_auth.patch_credential(
+            PROVIDER_ID,
+            aid,
+            {
+                "refresh_revoked": True,
+                "auth_error": (detail or "refresh_token revoked")[:240],
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 — best-effort marker
+        log.warning("xai oauth: could not persist refresh_revoked for %s: %s", aid[:12], exc)
+
+
 def _cred_account_id(cred: dict | None) -> str | None:
     if not isinstance(cred, dict):
         return None
@@ -261,6 +302,10 @@ def _cred_account_id(cred: dict | None) -> str | None:
 def _has_usable_tokens(cred: dict | None) -> bool:
     if not isinstance(cred, dict):
         return False
+    if cred.get("refresh_revoked"):
+        # Definitive invalid_grant previously recorded — only a live access JWT
+        # can still carry a request until it expires.
+        return bool(cred.get("access_token")) and not sub_auth.is_expired(cred, skew_ms=0)
     return bool(cred.get("access_token") or cred.get("refresh_token"))
 
 
@@ -725,66 +770,132 @@ class XAISubProvider(Provider):
                     cred["display_name"] = f"Grok ({short})"
                 else:
                     cred["display_name"] = "Grok"
-        sub_auth.save_credential(PROVIDER_ID, cred)
+        aid = _cred_account_id(cred) or account_id or sub_auth.get_active_account_id(PROVIDER_ID)
+        # Explicit account_id + replace_tokens so identity races cannot demote this
+        # write, and so multi-account never lands tokens on the wrong slot.
+        sub_auth.save_credential(
+            PROVIDER_ID,
+            cred,
+            account_id=str(aid) if aid else None,
+            set_active=True,
+            replace_tokens=True,
+        )
         # Fresh tokens mean this account is usable again.
-        aid = _cred_account_id(cred) or account_id
         if aid:
             with _account_block_lock:
                 _blocked_accounts.pop(str(aid), None)
+            try:
+                # Clear any prior revoked marker left on disk.
+                sub_auth.patch_credential(
+                    PROVIDER_ID,
+                    str(aid),
+                    {"refresh_revoked": None, "auth_error": None},
+                )
+            except Exception:  # noqa: BLE001
+                pass
         self._cred = cred
         return cred
 
     def refresh(self) -> dict:
-        """Exchange the stored refresh token for a new access token."""
-        if not self._cred or not self._cred.get("refresh_token"):
+        """Exchange the stored refresh token for a new access token.
+
+        Serialized per account_id. Re-reads the credential from disk under the
+        lock so a concurrent refresh that already rotated the RT is reused
+        instead of burning the old (now-revoked) token a second time.
+        """
+        if not self._cred or not (
+            self._cred.get("refresh_token") or self._cred.get("access_token")
+        ):
             raise RuntimeError(
                 "Not logged in to xAI subscription. "
                 "Run login() first (Settings → Sign in with xAI)."
             )
-        endpoint = (
-            self._cred.get("token_endpoint")
-            or XAI_OAUTH_TOKEN_URL_FALLBACK
-        )
-        aid = _cred_account_id(self._cred)
-        log.info("xai oauth: refresh via %s (account=%s)", endpoint, (aid or "")[:12])
-        try:
-            resp = sub_auth.post_form(
-                endpoint,
-                {
-                    "grant_type": "refresh_token",
-                    "client_id": XAI_OAUTH_CLIENT_ID,
-                    "refresh_token": self._cred["refresh_token"],
-                },
-                headers={"Accept": "application/json"},
-                timeout=30.0,
-            )
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")[:400]
-            if exc.code == 403:
-                log.error("xai oauth: refresh 403-tier: %s", body)
-                mark_account_blocked(aid, reason=f"refresh 403: {body[:80]}")
-                raise XaiTierDeniedError(body) from exc
-            if exc.code in (400, 401):
-                log.error("xai oauth: refresh failed HTTP %s: %s", exc.code, body)
-                mark_account_blocked(
-                    aid, seconds=5 * 60, reason=f"refresh {exc.code}"
+        aid = _cred_account_id(self._cred) or sub_auth.get_active_account_id(PROVIDER_ID)
+        lock = _refresh_lock_for(aid)
+        with lock:
+            # Another thread may have already refreshed this account — reload.
+            if aid:
+                fresh = sub_auth.load_credential(PROVIDER_ID, account_id=aid)
+                if isinstance(fresh, dict) and _has_usable_tokens(fresh):
+                    self._cred = fresh
+                    if not sub_auth.is_expired(self._cred, skew_ms=REFRESH_SKEW_MS):
+                        log.info(
+                            "xai oauth: refresh short-circuit; account %s already fresh",
+                            (aid or "")[:12],
+                        )
+                        return self._cred
+            if not self._cred or not self._cred.get("refresh_token"):
+                raise RuntimeError(
+                    "Not logged in to xAI subscription. "
+                    "Run login() first (Settings → Sign in with xAI)."
                 )
+            if self._cred.get("refresh_revoked"):
                 raise RuntimeError(
                     "xAI OAuth refresh failed — re-authenticate via "
                     "Settings → Sign in with xAI. "
-                    f"(HTTP {exc.code}: {body})"
-                ) from exc
-            if exc.code == 429:
-                mark_account_blocked(aid, seconds=5 * 60, reason="refresh 429")
+                    f"(refresh_token previously revoked"
+                    f"{(': ' + str(self._cred.get('auth_error'))) if self._cred.get('auth_error') else ''})"
+                )
+            endpoint = (
+                self._cred.get("token_endpoint")
+                or XAI_OAUTH_TOKEN_URL_FALLBACK
+            )
+            rt = self._cred["refresh_token"]
+            log.info("xai oauth: refresh via %s (account=%s)", endpoint, (aid or "")[:12])
+            try:
+                resp = sub_auth.post_form(
+                    endpoint,
+                    {
+                        "grant_type": "refresh_token",
+                        "client_id": XAI_OAUTH_CLIENT_ID,
+                        "refresh_token": rt,
+                    },
+                    headers={"Accept": "application/json"},
+                    timeout=30.0,
+                )
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")[:400]
+                if exc.code == 403:
+                    log.error("xai oauth: refresh 403-tier: %s", body)
+                    mark_account_blocked(aid, reason=f"refresh 403: {body[:80]}")
+                    raise XaiTierDeniedError(body) from exc
+                if exc.code in (400, 401):
+                    log.error("xai oauth: refresh failed HTTP %s: %s", exc.code, body)
+                    body_l = body.lower()
+                    definitive = (
+                        "invalid_grant" in body_l
+                        or "revoked" in body_l
+                        or "invalid_token" in body_l
+                        or "expired" in body_l
+                    )
+                    if definitive:
+                        mark_refresh_revoked(aid, detail=body[:200])
+                    else:
+                        mark_account_blocked(
+                            aid, seconds=5 * 60, reason=f"refresh {exc.code}"
+                        )
+                    raise RuntimeError(
+                        "xAI OAuth refresh failed — re-authenticate via "
+                        "Settings → Sign in with xAI. "
+                        f"(HTTP {exc.code}: {body})"
+                    ) from exc
+                if exc.code == 429:
+                    mark_account_blocked(aid, seconds=5 * 60, reason="refresh 429")
+                    raise RuntimeError(
+                        f"xAI token refresh rate-limited (HTTP 429): {body}"
+                    ) from exc
+                log.error("xai oauth: refresh failed HTTP %s: %s", exc.code, body)
                 raise RuntimeError(
-                    f"xAI token refresh rate-limited (HTTP 429): {body}"
+                    f"xAI token refresh failed (HTTP {exc.code}): {body}"
                 ) from exc
-            log.error("xai oauth: refresh failed HTTP %s: %s", exc.code, body)
-            raise RuntimeError(
-                f"xAI token refresh failed (HTTP {exc.code}): {body}"
-            ) from exc
-        resp.setdefault("refresh_token", self._cred["refresh_token"])
-        return self._store_tokens(resp, token_endpoint=endpoint)
+            # xAI rotates RTs — never drop a missing new RT on the floor, but
+            # prefer the rotated one when present. Persist immediately under the
+            # account lock so no peer can race with the old RT.
+            if not resp.get("refresh_token"):
+                resp = dict(resp)
+                resp["refresh_token"] = rt
+            return self._store_tokens(resp, token_endpoint=endpoint)
+
 
     def _bind_account(self, account_id: str, cred: dict) -> None:
         """Switch in-memory + store active account to *account_id*/*cred*."""

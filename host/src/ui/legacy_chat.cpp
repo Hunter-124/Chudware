@@ -6738,7 +6738,8 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
 
     // Author label tight above the turn content (mirrors the You-row tight gap). Prefer the
     // model stamped on the turn at run start; only fall back to the live picker for an
-    // in-flight turn that somehow has no stamp. Old sessions with empty model → "Assistant".
+    // in-flight turn that somehow has no stamp. Show the model name alone (no "Assistant :"
+    // prefix / vertical separator). Old sessions with empty model → "Assistant".
     {
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
                             ImVec2(ImGui::GetStyle().ItemSpacing.x, 0.0f));
@@ -6746,10 +6747,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
         const char* mid = nullptr;
         if (!m.model.empty()) mid = m.model.c_str();
         else if (m.running && st.settings.model[0]) mid = st.settings.model;
-        if (mid && mid[0]) {
-            label += " : ";
-            label += shortModelName(mid);
-        }
+        if (mid && mid[0]) label = shortModelName(mid);
         ImGui::PushFont(fonts.medium);
         ImGui::TextColored(turnSurf.textSecondary, "%s", label.c_str());
         ImGui::PopFont();
@@ -7032,6 +7030,9 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         const float wmW = ImGui::CalcTextSize("Chudware").x;
         if (wordF) ImGui::PopFont();
         const float logoW = cubeSz + logoGap + wmW;
+        // Clear the tool ribbon above the copilot column — row 1 used to sit flush and
+        // clip the Tasks / Artifacts buttons into the ribbon chrome.
+        ImGui::Dummy(ImVec2(0, 6.0f * sc));
         const float rowTop1 = ImGui::GetCursorPosY();
         const float bh = lh + 4.0f * sc;   // real header-button height
         auto cy1 = [&](float h) { ImGui::SetCursorPosY(rowTop1 + (wordLh - h) * 0.5f); };
@@ -7057,7 +7058,8 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Tasks \xc2\xb7 %d of %d done \xc2\xb7 click for the task list", tlDone, tlTotal);
 
-        // Run status fused into the centered Chudware cube (fill color = Idle/Running/Error).
+        // Run status fused into the centered Chudware cube (status tip + small corner dot —
+        // NOT a filled rect behind the glyph; that flooded colored bg through the cube).
         const float* statusCol = pal.accentMid;  const char* statusTip = "Idle";
         if (st.statusKind == 2) { statusCol = pal.statusErr; statusTip = "Error"; }
         else if (busy || st.agentV2Running || activeConversationRunning(st)) {
@@ -7072,21 +7074,24 @@ static void drawCopilotHeader(AppState& st, bool busy) {
             IconUV cube = ui::getIcon("context_cube", 20);
             cy1(cubeSz);
             const ImVec2 cubeP0 = ImGui::GetCursorScreenPos();
-            // Interior fill behind the cube glyph carries the run status color.
-            {
-                ImDrawList* cdl = ImGui::GetWindowDrawList();
-                ImVec4 fill = semanticOnGlass(statusCol, chatSurf());
-                fill.w = statusCol[3] * 0.55f;
-                const float pad = cubeSz * 0.12f;
-                cdl->AddRectFilled(ImVec2(cubeP0.x + pad, cubeP0.y + pad),
-                                   ImVec2(cubeP0.x + cubeSz - pad, cubeP0.y + cubeSz - pad),
-                                   ImGui::ColorConvertFloat4ToU32(fill), 3.0f * sc);
-            }
             if (cube.valid) {
                 ImGui::Image(cube.texId, ImVec2(cubeSz, cubeSz), cube.uv0, cube.uv1,
                              chatSurf().textPrimary);
             } else {
                 ImGui::Dummy(ImVec2(cubeSz, cubeSz));
+            }
+            // Status dot at the cube's lower-right corner (no fill flooding the glyph).
+            {
+                ImDrawList* cdl = ImGui::GetWindowDrawList();
+                ImVec4 dot = semanticOnGlass(statusCol, chatSurf());
+                dot.w = 1.0f;
+                const float dr = cubeSz * 0.14f;
+                const ImVec2 dc(cubeP0.x + cubeSz - dr * 0.4f, cubeP0.y + cubeSz - dr * 0.4f);
+                cdl->AddCircleFilled(dc, dr, ImGui::ColorConvertFloat4ToU32(dot), 12);
+                cdl->AddCircle(dc, dr, ImGui::ColorConvertFloat4ToU32(
+                                   ImVec4(chatSurf().textPrimary.x, chatSurf().textPrimary.y,
+                                          chatSurf().textPrimary.z, 0.35f)), 12,
+                               ui::metrics::stroke(1.0f));
             }
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", statusTip);
             ImGui::SameLine(0, logoGap);
@@ -7618,18 +7623,70 @@ static void drawArtifactsPanel(AppState& st, bool busy) {
         ImGui::TextWrapped("  (none)"); ImGui::PopStyleColor();
     }
     ImGui::Dummy(ImVec2(0, 6 * sc));
-    // Documents (open doc tabs = the session's parts/drawings).
+    // Documents (open doc tabs) + agent-created files from tool_call artifacts.
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
     ImGui::TextUnformatted("Documents");
     ImGui::PopStyleColor();
-    if (st.docTabs.empty()) {
-        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-        ImGui::TextWrapped("  (none)"); ImGui::PopStyleColor();
-    } else {
+    bool anyDoc = false;
+    if (!st.docTabs.empty()) {
+        anyDoc = true;
         for (const auto& t : st.docTabs)
             ImGui::BulletText("%s", t.title.empty()
                                         ? (t.path.empty() ? t.docId.c_str() : t.path.c_str())
                                         : t.title.c_str());
+    }
+    // Agent-created files packed into activity detail after "\x1eART\x1e" (live + restored).
+    {
+        std::set<std::string> seen;
+        for (const auto& m : st.chat) {
+            if (m.fromUser) continue;
+            for (const auto& a : m.activity) {
+                if (a.detail.find("\x1e" "ART\x1e") == std::string::npos) continue;
+                const size_t sep = a.detail.find("\x1e" "ART\x1e");
+                std::string blob = a.detail.substr(sep);
+                size_t nl = blob.find('\n');
+                if (nl != std::string::npos) blob = blob.substr(nl + 1);
+                std::istringstream iss(blob);
+                std::string line;
+                while (std::getline(iss, line)) {
+                    if (line.empty()) continue;
+                    size_t tab = line.find('\t');
+                    std::string kindA = tab == std::string::npos ? "file" : line.substr(0, tab);
+                    std::string path  = tab == std::string::npos ? line : line.substr(tab + 1);
+                    if (path.empty() || !seen.insert(path).second) continue;
+                    anyDoc = true;
+                    std::string base = path;
+                    size_t slash = base.find_last_of("/\\");
+                    if (slash != std::string::npos) base = base.substr(slash + 1);
+                    ImGui::Bullet();
+                    ImGui::SameLine();
+                    ImGui::TextWrapped("%s  (%s)", base.c_str(), kindA.c_str());
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", path.c_str());
+                    if (ImGui::IsItemClicked()) {
+                        namespace fs = std::filesystem;
+                        std::error_code ec;
+                        if (fs::exists(path, ec)) {
+#ifdef _WIN32
+                            std::string cmd = "start \"\" \"" + path + "\"";
+                            (void)std::system(cmd.c_str());
+#elif defined(__APPLE__)
+                            std::string cmd = "open \"" + path + "\"";
+                            (void)std::system(cmd.c_str());
+#else
+                            std::string cmd = "xdg-open \"" + path + "\" >/dev/null 2>&1 &";
+                            (void)std::system(cmd.c_str());
+#endif
+                        } else {
+                            st.toast(ui::ToastLevel::Warn, "File not found: " + base);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (!anyDoc) {
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+        ImGui::TextWrapped("  (none)"); ImGui::PopStyleColor();
     }
 }
 
@@ -7760,6 +7817,33 @@ void persistChatHistory(AppState& st) {
             if (!m.fromUser && !m.model.empty()) entry["m"] = m.model;
             if (m.copilotMode >= 0) entry["cm"] = m.copilotMode;
             if (m.planState.present) entry["plan_state"] = planStateToJson(m.planState);
+            // Persist tool-call artifact paths so Artifacts panel + reopen keep file links.
+            if (!m.fromUser && !m.activity.empty()) {
+                nlohmann::json arts = nlohmann::json::array();
+                std::set<std::string> seen;
+                for (const auto& a : m.activity) {
+                    if (a.detail.find("\x1e" "ART\x1e") == std::string::npos) continue;
+                    const size_t sep = a.detail.find("\x1e" "ART\x1e");
+                    std::string blob = a.detail.substr(sep);
+                    // strip delimiter header
+                    size_t nl = blob.find('\n');
+                    if (nl != std::string::npos) blob = blob.substr(nl + 1);
+                    std::istringstream iss(blob);
+                    std::string line;
+                    while (std::getline(iss, line)) {
+                        if (line.empty()) continue;
+                        size_t tab = line.find('\t');
+                        std::string kindA = tab == std::string::npos ? "file" : line.substr(0, tab);
+                        std::string path  = tab == std::string::npos ? line : line.substr(tab + 1);
+                        if (path.empty() || !seen.insert(path).second) continue;
+                        arts.push_back({{"kind", kindA}, {"path", path},
+                                        {"tool", a.title.empty() ? a.stage : a.title}});
+                        if (arts.size() >= 32) break;
+                    }
+                    if (arts.size() >= 32) break;
+                }
+                if (!arts.empty()) entry["artifacts"] = std::move(arts);
+            }
             jm.push_back(std::move(entry));
         }
         convs.push_back({{"id", st.conversations[i].id},
@@ -7903,6 +7987,30 @@ static void applyChatEntry(AppState& st, const nlohmann::json& e) {
                 // so derived normalizers don't clobber a restored event plan.
                 cm.planState.fromEvent =
                     m["plan_state"].value("from_event", true);
+            }
+            // Restore agent-created file links into a synthetic activity row so the
+            // Artifacts panel can list them after a session reopen.
+            if (m.contains("artifacts") && m["artifacts"].is_array() && !m["artifacts"].empty()) {
+                ActivityItem artRow;
+                artRow.rowKind = 1;  // tool-call-ish row
+                artRow.stage = "artifacts";
+                artRow.title = "Session files";
+                artRow.status = "done";
+                std::string blob;
+                for (const auto& art : m["artifacts"]) {
+                    if (!art.is_object()) continue;
+                    std::string path = art.value("path", std::string());
+                    std::string kindA = art.value("kind", std::string("file"));
+                    if (path.empty()) continue;
+                    if (!blob.empty()) blob += "\n";
+                    blob += kindA;
+                    blob += '\t';
+                    blob += path;
+                }
+                if (!blob.empty()) {
+                    artRow.detail = std::string("\x1e" "ART\x1e\n") + blob;
+                    cm.activity.push_back(std::move(artRow));
+                }
             }
             cm.running = false;
             c.msgs.push_back(std::move(cm));
@@ -12535,6 +12643,8 @@ static void drawBtwPanel(AppState& st) {
 // Centralizes launch paths so the top input and per-turn follow-up share one code path.
 static void submitTurn(AppState& st, const std::string& text) {
     if (text.empty()) return;
+    // A fresh turn always clears a lingering stop latch (e.g. worker never drained after cancel).
+    st.stopRequested = false;
     // Slash commands: /compact /shake /handoff /btw /prewalk — pure host+RPC, no agent turn.
     if (tryHandleSlashCommand(st, text)) return;
     // Persist the active provider/model to config.json BEFORE launching any run. The C++ core
@@ -13860,7 +13970,11 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
 // Is the assistant currently working a turn? Covers every run path: job-based design/edit, the
 // async ask/sim calls (which set the back message running without a job), and any streaming
 // message. Drives the composer's send<->stop swap and the message queue.
+// stopRequested is UI-terminal: once the user hits Stop we soft-finalize the bubble and must
+// immediately leave the streaming chrome (stop button + forging animation). job.running may
+// stay true until the worker unwinds — the drain discards that stale result and clears the flag.
 static bool aiTurnActive(AppState& st) {
+    if (st.stopRequested) return false;
     if (st.job.running.load() || st.agentV2Running) return true;
     if (!st.chat.empty()) {
         const ChatMsg& b = st.chat.back();
@@ -14086,7 +14200,9 @@ static void drawComposer(AppState& st, bool busy, bool canRun) {
 
     // Drain the message queue: once the assistant is free, auto-send the next queued message
     // (Claude-Code-style). Done before computing `active` so the new turn shows as running now.
-    if (!aiTurnActive(st) && !st.queuedPrompts.empty() && canRun) {
+    // Also require !job.running: after Stop, aiTurnActive is false (stopRequested terminal) but
+    // the cancelled job may still be unwinding — don't launch a queued turn on top of it.
+    if (!aiTurnActive(st) && !st.job.running.load() && !st.queuedPrompts.empty() && canRun) {
         std::string next = st.queuedPrompts.front();
         st.queuedPrompts.erase(st.queuedPrompts.begin());
         // Queued sends never commit a staged edit (stage should already be cleared).
@@ -14349,17 +14465,8 @@ static void drawChatLogWindowed(AppState& st) {
             ImGui::Dummy(ImVec2(0, 8 * ui::uiScale));
         }
         ImGui::EndGroup();
-        // Mode-colored left accent bar on assistant turns (user bubbles already border-tint).
-        if (!m.fromUser) {
-            const ImU32 barCol = modeBorderColor(m.copilotMode);
-            if (barCol != 0) {
-                const ImVec2 rmin = ImGui::GetItemRectMin();
-                const ImVec2 rmax = ImGui::GetItemRectMax();
-                const float barW = 3.0f * ui::uiScale;
-                ImGui::GetWindowDrawList()->AddRectFilled(
-                    rmin, ImVec2(rmin.x + barW, rmax.y), barCol);
-            }
-        }
+        // (Mode-colored left accent bar removed — it read as a stray vertical line next
+        // to the model label. Mode is still stamped on the message for other chrome.)
         m.uiCachedH = ImGui::GetItemRectSize().y;
         m.uiCachedW = logW;
         ImGui::PopID();

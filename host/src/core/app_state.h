@@ -1482,7 +1482,8 @@ struct AppState {
     // ---- Stop + message queue (modern agentic composer) ----
     // stopRequested: the user hit Stop on an in-flight JOB run. The worker can't be interrupted
     // mid-RPC, so the background thread finishes, but the GL-thread drain (app.cpp) DISCARDS the
-    // result instead of applying it (no chat/doc/tab updates). Cleared by the drain.
+    // result instead of applying it (no chat/doc/tab updates). UI-terminal for aiTurnActive
+    // (composer reverts to send immediately). Cleared by the drain OR on the next submitTurn.
     bool stopRequested = false;
     // queuedPrompts: messages the user sent WHILE a turn was active (Claude-Code-style queue).
     // Drained one-at-a-time by the composer once the assistant is free again.

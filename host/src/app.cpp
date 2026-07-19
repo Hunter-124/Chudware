@@ -3548,6 +3548,8 @@ WASM_BOOT_LOG("[wasm-boot] entering main loop\n");
                     st.chat.push_back(m);
                 }
             }
+            // Persist finished transcript so reopen/switch keeps assistant text + artifacts.
+            ui::persistChatHistory(st);
           }  // end else (run not stopped by the user)
         }
 

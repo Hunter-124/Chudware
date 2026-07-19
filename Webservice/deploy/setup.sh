@@ -22,6 +22,12 @@ mkdir -p \
   "${DATA_ROOT}/secrets"
 chmod 700 "${DATA_ROOT}/secrets" 2>/dev/null || true
 
+# Shared team workspace (gateway /workspace/*). ME489 default matches
+# install_webd.sh; create empty so a fresh/migrated host doesn't 503 list.
+WORKSPACE_ROOT="${BILLET_WORKSPACE_ROOT:-${HOME}/Documents/ME489/Crimson_Crankers_Program/01_Design_Package/CAD_Build}"
+mkdir -p "${WORKSPACE_ROOT}"
+echo "    workspace: ${WORKSPACE_ROOT}"
+
 # gateway.env skeleton (never overwrite existing — secrets live here)
 ENV_FILE="${DATA_ROOT}/gateway.env"
 if [[ ! -f "${ENV_FILE}" ]]; then

@@ -25,6 +25,15 @@ DST="${BILLET_WEB_HOME:-$HOME/billet-web}"
 BIN="$DST/bin"
 KEY="billetweb"
 WORKSPACE_DEFAULT="$HOME/Documents/ME489/Crimson_Crankers_Program/01_Design_Package/CAD_Build"
+
+# Always land a real directory: gateway /workspace/* 503s when the root is missing
+# (common after host migration before CAD_Build is restored). Prefer an existing
+# env override; otherwise create the ME489 default so a fresh box still serves.
+WORKSPACE_ROOT="${BILLET_WORKSPACE_ROOT:-$WORKSPACE_DEFAULT}"
+if [ ! -d "$WORKSPACE_ROOT" ]; then
+    mkdir -p "$WORKSPACE_ROOT"
+    echo "[webd] created workspace root $WORKSPACE_ROOT"
+fi
 RESTART=0
 [ "${1:-}" = "--restart" ] && RESTART=1
 
@@ -89,9 +98,9 @@ SOCK="$RUNDIR/aicad/hostd-$KEY.sock"
 cat > "$DST/webd.env" <<EOF
 # written by install_webd.sh $(date -Is) — read by the gateway (config.py)
 BILLET_WEBD_SOCKET=$SOCK
-BILLET_WORKSPACE_ROOT=${BILLET_WORKSPACE_ROOT:-$WORKSPACE_DEFAULT}
+BILLET_WORKSPACE_ROOT=$WORKSPACE_ROOT
 EOF
-echo "[webd] wrote $DST/webd.env (socket $SOCK)"
+echo "[webd] wrote $DST/webd.env (socket $SOCK, workspace $WORKSPACE_ROOT)"
 
 # --- launcher for Hunter's local GUI to join the shared session -------------
 cat > "$DST/billet-shared.sh" <<EOF

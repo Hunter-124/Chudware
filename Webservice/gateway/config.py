@@ -218,6 +218,15 @@ class Settings:
         self.data_root.mkdir(parents=True, exist_ok=True)
         self.homes_dir.mkdir(parents=True, exist_ok=True)
         self.plm_dir.mkdir(parents=True, exist_ok=True)
+        # Shared team workspace must exist: /workspace/* 503s otherwise, and a
+        # migrated host often has webd.env pointing at a path that was never
+        # created here. Creating the configured root is safe (empty tree).
+        try:
+            self.workspace_root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            # Don't crash gateway boot if the path is unwritable; list endpoints
+            # will still 503 with a clear detail.
+            pass
         # Seed a runtime users file from the repo template when the configured
         # path lives outside the package and doesn't exist yet (/admin edits it).
         template = Path(__file__).resolve().parent / "users.yaml"

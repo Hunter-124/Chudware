@@ -8,6 +8,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=%h/Repositories/CAD/Webservice/gateway
 EnvironmentFile=-%h/billet-web-data/gateway.env
+EnvironmentFile=-%h/billet-web/webd.env
 Environment=BILLET_WEB_DATA=%h/billet-web-data
 # venv + uvicorn; app module owned by GatewayCore
 ExecStart=%h/Repositories/CAD/Webservice/gateway/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 8300 --proxy-headers --forwarded-allow-ips=127.0.0.1 --ws-max-size 268435456

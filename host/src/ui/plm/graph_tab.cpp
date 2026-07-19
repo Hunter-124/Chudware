@@ -17,6 +17,8 @@
 #include <cctype>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -130,6 +132,21 @@ struct GraphTabState {
     int visMatches = 0;
     int allMatches = 0;
     bool matchDirty = true;
+
+    // Change probe: fingerprint from the last full cad_graph_get response.
+    // Polls echo it via if_mtimes_max/if_sources_count; "unchanged" replies
+    // skip the payload entirely (no re-parse, no re-layout, no view reset).
+    double mtimesMax = 0.0;
+    int sourcesCount = 0;
+    // Settled-layout cache (solve state) — persisted to
+    // <project>/.plm/graph_layout.json so reopening starts from the last
+    // relaxed arrangement instead of re-solving from scratch.
+    std::unordered_map<std::string, std::pair<float, float>> layoutCache;
+    bool layoutCacheLoaded = false;
+    double lastLayoutSave = -1e9;
+    bool wasSettled = true;
+    // Once the user pans/zooms, never auto-fit again until scope/project change.
+    bool userNavigated = false;
 };
 
 // List view auto-threshold (user can still force Graph view).
@@ -561,6 +578,7 @@ void setScope(GraphTabState& G, const std::string& docId) {
     G.selectedEdge = -1;
     G.blast.clear();
     G.hoverId.clear();
+    G.userNavigated = false;  // fresh scope → allow one auto-fit again
     rebuildVisible(G);
     // Fit on next canvas paint.
 }
@@ -633,7 +651,9 @@ void rebuildForce(GraphTabState& G) {
     }
 
     G.force.reheat(fresh > (int)G.visibleIdx.size() / 2 ? 0.8f : 0.35f);
-    G.fitOnSettle = true;
+    // Auto-fit on settle only until the user first pans/zooms.
+    G.fitOnSettle = !G.userNavigated;
+    G.wasSettled = false;
 }
 
 void drawDashedLine(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 col, float thick,
@@ -670,6 +690,51 @@ void drawArcSpinner(ImDrawList* dl, ImVec2 c, float radius, ImU32 col) {
 }
 
 
+// ---- settled-layout cache (solve state) -------------------------------------
+
+std::filesystem::path layoutCachePath(const GraphTabState& G) {
+    return std::filesystem::path(G.projectDir) / ".plm" / "graph_layout.json";
+}
+
+// Load <project>/.plm/graph_layout.json once per project. Only file mtimes
+// invalidate the worker's graph cache; this UI-owned file does not.
+void ensureLayoutCache(GraphTabState& G) {
+    if (G.layoutCacheLoaded) return;
+    G.layoutCacheLoaded = true;
+    G.layoutCache.clear();
+    if (G.projectDir.empty()) return;
+    std::ifstream f(layoutCachePath(G));
+    if (!f) return;
+    nlohmann::json j = nlohmann::json::parse(f, nullptr, false);
+    if (j.is_discarded()) return;
+    auto it = j.find("positions");
+    if (it == j.end() || !it->is_object()) return;
+    for (auto pit = it->begin(); pit != it->end(); ++pit) {
+        const auto& xy = pit.value();
+        if (!xy.is_array() || xy.size() != 2 || !xy[0].is_number() || !xy[1].is_number())
+            continue;
+        G.layoutCache[pit.key()] = {xy[0].get<float>(), xy[1].get<float>()};
+    }
+}
+
+// Persist every node with a real position (any scope) so the next session
+// seeds the sim from the relaxed arrangement. Throttled to once per 2s.
+void maybeSaveLayout(GraphTabState& G, bool force = false) {
+    if (G.projectDir.empty() || G.nodes.empty()) return;
+    const double now = ImGui::GetTime();
+    if (!force && (now - G.lastLayoutSave) < 2.0) return;
+    G.lastLayoutSave = now;
+    nlohmann::json j;
+    auto& pos = j["positions"];
+    for (const auto& n : G.nodes)
+        if (n.lx != 0.0f || n.ly != 0.0f)
+            pos[n.id] = {n.lx, n.ly};
+    std::error_code ec;
+    std::filesystem::create_directories(layoutCachePath(G).parent_path(), ec);
+    std::ofstream out(layoutCachePath(G), std::ios::trunc);
+    if (out) out << j.dump();
+}
+
 // ---- fetch -------------------------------------------------------------------
 
 void requestGraph(AppState& st, bool force) {
@@ -679,7 +744,7 @@ void requestGraph(AppState& st, bool force) {
     const std::string proj = st.plmProjectPath();
     if (proj.empty()) return;
     const double now = ImGui::GetTime();
-    if (!force && (now - G.lastFetch) < 1.5 && proj == G.projectDir && !G.nodes.empty())
+    if (!force && (now - G.lastFetch) < 2.0 && proj == G.projectDir && !G.nodes.empty())
         return;
 
     G.loading = true;
@@ -695,6 +760,12 @@ void requestGraph(AppState& st, bool force) {
     // user unchecks "Hide archive/stale".
     p["include_archive"] = !G.hideArchive;
     if (force) p["force"] = true;
+    // Change probe: when the worker confirms nothing changed we get a tiny
+    // "unchanged" reply instead of the full multi-MB payload.
+    if (!force && G.mtimesMax > 0.0) {
+        p["if_mtimes_max"] = G.mtimesMax;
+        p["if_sources_count"] = G.sourcesCount;
+    }
 
     st.rpc.call("cad_graph_get", p, [](const core::RpcResult& r) {
         auto& G = S();
@@ -715,6 +786,17 @@ void requestGraph(AppState& st, bool force) {
                         std::string("that could not be done")));
             return;
         }
+
+        // Change probe hit: graph unchanged — keep data, layout, and view.
+        if (r.result.is_object() && r.result.value("unchanged", false))
+            return;
+
+        // Stash current positions so a refetch doesn't re-solve from zero.
+        std::unordered_map<std::string, std::pair<float, float>> posStash;
+        posStash.reserve(G.nodes.size());
+        for (const auto& n : G.nodes)
+            if (n.lx != 0.0f || n.ly != 0.0f)
+                posStash[n.id] = {n.lx, n.ly};
 
         G.nodes.clear();
         G.edges.clear();
@@ -775,6 +857,23 @@ void requestGraph(AppState& st, bool force) {
         // Backfill full counts when an older worker omitted them.
         if (G.nodeCountFull <= 0) G.nodeCountFull = (int)G.nodes.size();
         if (G.edgeCountFull <= 0) G.edgeCountFull = (int)G.edges.size();
+
+        // Probe fingerprint for subsequent polls.
+        G.mtimesMax = r.result.value("sources_mtime_max", 0.0);
+        G.sourcesCount = r.result.value("sources_count", 0);
+
+        // Restore positions: in-session stash wins, then the on-disk solve
+        // state from previous sessions (loaded once per project).
+        ensureLayoutCache(G);
+        for (auto& n : G.nodes) {
+            if (auto it = posStash.find(n.id); it != posStash.end()) {
+                n.lx = it->second.first;
+                n.ly = it->second.second;
+            } else if (auto it = G.layoutCache.find(n.id); it != G.layoutCache.end()) {
+                n.lx = it->second.first;
+                n.ly = it->second.second;
+            }
+        }
 
         // Indexes + descendant badges + scoped visible set (once per load).
         rebuildIdIndex(G);
@@ -1260,18 +1359,25 @@ void drawCanvas(AppState& st, ImVec2 canvasSz) {
             G.nodes[vi].lx = G.force.x(slot);
             G.nodes[vi].ly = G.force.y(slot);
         }
-        // Frame the relaxed layout once it first settles.
-        if (G.fitOnSettle && G.force.settled()) {
-            fitView(G, canvasSz);
-            s_fitToken = G.layoutToken;
-            G.fitOnSettle = false;
+        // Settle transition: persist the solve state; frame the relaxed
+        // layout once (unless the user already took over the view).
+        bool nowSettled = G.force.settled();
+        if (!G.wasSettled && nowSettled) {
+            maybeSaveLayout(G);
+            if (G.fitOnSettle) {
+                fitView(G, canvasSz);
+                s_fitToken = G.layoutToken;
+                G.fitOnSettle = false;
+            }
         }
+        G.wasSettled = nowSettled;
     }
 
     // Zoom (wheel) around cursor.
     if (hovered) {
         float wheel = ImGui::GetIO().MouseWheel;
         if (wheel != 0.0f) {
+            G.userNavigated = true;
             ImVec2 mp = ImGui::GetIO().MousePos;
             float lx = (mp.x - origin.x - G.panX) / G.zoom;
             float ly = (mp.y - origin.y - G.panY) / G.zoom;
@@ -1286,6 +1392,7 @@ void drawCanvas(AppState& st, ImVec2 canvasSz) {
         (ImGui::IsMouseDragging(ImGuiMouseButton_Middle) ||
          (ImGui::IsMouseDragging(ImGuiMouseButton_Left) &&
           G.hoverId.empty() && !ImGui::GetIO().KeyCtrl))) {
+        G.userNavigated = true;
         ImVec2 d = ImGui::GetIO().MouseDelta;
         G.panX += d.x;
         G.panY += d.y;
@@ -1768,6 +1875,7 @@ bool plmGraphAvailable() { return S().available; }
 
 void plmGraphOnProjectChanged() {
     auto& G = S();
+    maybeSaveLayout(G, /*force=*/true);  // final solve-state save for old project
     G.nodes.clear();
     G.edges.clear();
     G.blast.clear();
@@ -1810,6 +1918,14 @@ void plmGraphOnProjectChanged() {
     G.visMatches = 0;
     G.allMatches = 0;
     G.matchDirty = true;
+    // Probe + solve-state cache belong to the old project.
+    G.mtimesMax = 0.0;
+    G.sourcesCount = 0;
+    G.layoutCache.clear();
+    G.layoutCacheLoaded = false;
+    G.lastLayoutSave = -1e9;
+    G.wasSettled = true;
+    G.userNavigated = false;
     // hideArchive stays — user preference across projects.
     // Keep available flag — method absence is session-wide, not per-project.
 }

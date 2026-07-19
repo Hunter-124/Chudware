@@ -729,6 +729,8 @@ def get_graph(
     exclude_dirs: Iterable[str] | None = None,
     max_nodes: int | None = None,
     max_edges: int | None = None,
+    if_mtimes_max: float | None = None,
+    if_sources_count: int | None = None,
 ) -> dict[str, Any]:
     """``cad_graph_get`` implementation.
 
@@ -737,7 +739,43 @@ def get_graph(
     ``node_count`` / ``edge_count`` + ``truncated``. Pass ``max_nodes=0`` or
     ``max_edges=0`` to disable a cap. Archive dirs are excluded by default
     (see :func:`build_graph`).
+
+    Change probe: when ``if_mtimes_max`` is given (the ``sources_mtime_max``
+    from a previous full response, optionally with ``if_sources_count``) and
+    the on-disk cache is still fresh with an identical newest-source mtime
+    and source count, returns ``{"ok": True, "unchanged": True}`` without
+    reading the cache payload — cheap enough for polling UIs. The count
+    catches deletions / old-mtime additions that max(mtime) alone misses.
+    NOTE: unlike _load_cache_if_valid this probe does NOT re-check the
+    recorded filter policy (_filter_matches); it is only valid for callers
+    that hold include_archive/exclude_dirs fixed between the full response
+    and the probe (the PLM UI toggles policy only via force-refresh).
+    Any doubt (cache stale/missing, fingerprint mismatch) falls through to
+    the full path.
     """
+    if (if_mtimes_max is not None and not force and not doc_id
+            and not open_docs and project_dir is not None):
+        root = Path(project_dir)
+        cp = _cache_path(root)
+        try:
+            cache_mtime = cp.stat().st_mtime if cp.is_file() else 0.0
+        except OSError:
+            cache_mtime = 0.0
+        if cache_mtime > 0.0:
+            skip = _skip_dir_names(include_archive=include_archive)
+            fast = _source_mtimes_fast(root, skip_names=skip)
+            newest = max(fast.values()) if fast else 0.0
+            n_files = sum(1 for k in fast
+                          if not str(k).startswith("overlay:")
+                          and not str(k).startswith("open:"))
+            count_ok = (if_sources_count is None
+                        or n_files == int(if_sources_count))
+            if (cache_mtime + 1e-6 >= newest
+                    and abs(newest - float(if_mtimes_max)) <= 1e-6
+                    and count_ok):
+                return {"ok": True, "unchanged": True,
+                        "sources_mtime_max": newest,
+                        "sources_count": n_files}
     g = build_graph(
         project_dir, open_docs=open_docs, force=force,
         include_archive=include_archive, exclude_dirs=exclude_dirs,
@@ -782,6 +820,24 @@ def get_graph(
             edges = edges[:e_cap]
 
     truncated = len(nodes) < node_count or len(edges) < edge_count
+    # Change-probe fingerprint: newest source mtime via the SAME code path
+    # the probe uses (_source_mtimes_fast — every .step+/.ecad+ under the
+    # request's skip policy, plus the overlay), so equality can actually
+    # hold. g["mtimes"] only covers sources that parsed, which can disagree.
+    sources_mtime_max = 0.0
+    sources_count = 0
+    if project_dir is not None:
+        skip = _skip_dir_names(include_archive=include_archive)
+        fast = _source_mtimes_fast(Path(project_dir), skip_names=skip)
+        sources_mtime_max = max(fast.values()) if fast else 0.0
+        sources_count = sum(1 for k in fast
+                            if not str(k).startswith("overlay:")
+                            and not str(k).startswith("open:"))
+    else:
+        src_mtimes = [v for k, v in (g.get("mtimes") or {}).items()
+                      if not str(k).startswith("open:") and isinstance(v, (int, float))]
+        sources_mtime_max = max(src_mtimes) if src_mtimes else 0.0
+        sources_count = len(src_mtimes)
     return {
         "ok": True,
         "nodes": nodes,
@@ -791,6 +847,8 @@ def get_graph(
         "node_count": node_count,
         "edge_count": edge_count,
         "truncated": truncated,
+        "sources_mtime_max": sources_mtime_max,
+        "sources_count": sources_count,
         "filter": g.get("filter") or {
             "include_archive": bool(include_archive),
             "exclude_dirs": sorted(_archive_dir_names(exclude_dirs)),

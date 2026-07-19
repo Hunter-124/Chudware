@@ -60,3 +60,18 @@ Graphify/Sourcegraph analogue over CAD projects: how parts/features/mates/BOM/do
   `kind ∈ extract_subassembly | group_into_subassemblies | split_multibody`. Deterministic over
   MATES clustering (≥3 components / ≥2 internal mates), flat-assembly (>12 direct components), and
   multi-body (>2 bodies) thresholds. Surfaced via the MCP `assembly_plan_review` tool.
+
+### Change probe + source fingerprint (2026-07)
+- `cad_graph_get` full responses add `sources_mtime_max: float` and `sources_count: int` —
+  a fingerprint of the source tree (newest `.step+`/`.ecad+`/overlay mtime + file count via
+  `_source_mtimes_fast`).
+- New optional request params `if_mtimes_max: float`, `if_sources_count: int`: when the
+  on-disk cache is still fresh AND both fingerprint parts match, the response is the
+  lightweight probe `{ok, unchanged: true, sources_mtime_max, sources_count}` — no
+  `nodes`/`edges` payload. Consumers must treat a missing `unchanged` as a full response.
+- Probe validity requires the caller to hold `include_archive`/`exclude_dirs` fixed between
+  the full response and the probe (policy changes must use `force: true`); the probe does
+  not re-check the cached filter policy.
+- UI solve-state cache: the PLM graph tab persists settled force-layout positions to
+  `<project>/.plm/graph_layout.json` (`{positions: {node_id: [x, y]}}`). UI-owned; does not
+  participate in worker cache invalidation.

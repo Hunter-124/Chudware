@@ -1025,11 +1025,11 @@ static ModelRolesUi s_roles;
 
 static const char* kRoleKeys[] = {
     "advisor", "task", "planning", "vision", "default", "plm", "redaction",
-    "sketch2d", "model3d"};
+    "sketch2d", "model3d", "memory"};
 static const char* kRoleLabels[] = {
     "Advisor", "Task", "Planning", "Vision", "Default", "PLM", "Redaction",
-    "Sketch 2D", "Model 3D"};
-static constexpr int kRoleCount = 9;
+    "Sketch 2D", "Model 3D", "Memory"};
+static constexpr int kRoleCount = 10;
 
 static std::string benchTierForSource(const Settings& s, int source) {
     if (source == 1) return "xai:grok-4-5";
@@ -1740,6 +1740,9 @@ static void drawModelRolesSection(AppState& st, float sc) {
                 helpMarker("3D feature planner/builder. Plans the solid feature tree, delegates "
                            "profiles to sketch2d, places them on the right plane/face, and "
                            "verifies orientation with vision before committing.");
+            } else if (std::strcmp(key, "memory") == 0) {
+                helpMarker("Project memory distiller — writes durable decisions/notes to "
+                           ".plm/memory.db. Does not design geometry.");
             }
             if (isRedaction) {
                 ImGui::SameLine();
@@ -3221,6 +3224,7 @@ const SettingsEntry kSettingsEntries[] = {
     { "Plan before building",     "AI",           2 },
     { "Plan mode",                "AI",           2 },
     { "Subagent preference",      "AI",           2 },
+    { "Role adoption",            "AI",           2 },
     { "Advisor preference",       "AI",           2 },
     { "Proactive advisor",        "AI",           2 },
     { "Project memory",           "AI",           2 },
@@ -3731,6 +3735,22 @@ settingsGlassSectionBegin("##ai_run_behavior", "Run behavior");
                     prefCombo("Subagent preference", "##sub_pref", &settings.subagentPreference,
                               "How freely the main agent may spawn subagents. "
                               "Off disables nesting; Require pushes multi-agent splits.");
+                    {
+                        ImGui::AlignTextToFramePadding();
+                        ImGui::TextUnformatted("Role adoption");
+                        ImGui::SameLine();
+                        helpMarker(
+                            "Supervised (default): only the main session may adopt_role "
+                            "(switch tools+prompt). Subagents may still delegate() children "
+                            "with other roles, but must request_role_change to adopt themselves. "
+                            "Free: subagents may adopt_role too.");
+                        ImGui::SameLine(200.0f * sc);
+                        ImGui::SetNextItemWidth(160.0f * sc);
+                        int ra = (settings.roleAdoption != 0) ? 1 : 0;
+                        const char* kAdopt[] = {"Supervised", "Free"};
+                        if (ImGui::Combo("##role_adopt", &ra, kAdopt, 2))
+                            settings.roleAdoption = ra;
+                    }
                     prefCombo("Advisor preference", "##adv_pref", &settings.advisorPreference,
                               "Off = no advisor. Option = only when the model asks. "
                               "Encourage = stronger guidance tone when proactive fires. "

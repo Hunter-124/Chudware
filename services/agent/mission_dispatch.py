@@ -160,7 +160,7 @@ class MissionDispatch:
     #: Parts Library V2 sourcing surface — workstream 5) + coordination board
     #: + corporate org mode (aicad.corporate/1).
     TOOLS = ("ledger_get", "ledger_note", "dag_plan", "ask_user",
-             "delegate", "part_search",
+             "delegate", "adopt_role", "request_role_change", "part_search",
              "parts_taxonomy", "part_get", "part_source", "match_model",
              "reverse_engineer_product", "vendors_health",
              "scrape_enqueue", "scrape_queue_status", "import_artifact",
@@ -258,6 +258,8 @@ class MissionDispatch:
             "dag_plan": self.dag_plan,
             "ask_user": self.ask_user,
             "delegate": self.delegate,
+            "adopt_role": self.adopt_role,
+            "request_role_change": self.request_role_change,
             "part_search": self.part_search,
             "parts_taxonomy": self.parts_taxonomy,
             "part_get": self.part_get,
@@ -537,6 +539,26 @@ class MissionDispatch:
         "feature_fixer": "fixer",
     }
     _BRIEF_MAX = 500  # contract §12
+
+
+    def adopt_role(self, role: str = "", **kwargs):
+        """Main-session role switch; supervised subagents are refused."""
+        from services.agent.role_adoption import adopt_role as _adopt
+        depth = int(getattr(self, "depth", 0) or kwargs.get("depth") or 0)
+        is_root = bool(getattr(self, "is_root", depth <= 0))
+        cfg = None
+        try:
+            from services.agent import config as agent_config
+            cfg = agent_config.load_config()
+        except Exception:
+            pass
+        apply = getattr(self, "_apply_role_adoption", None)
+        return _adopt(role, is_root=is_root, depth=depth, cfg=cfg, apply=apply)
+
+    def request_role_change(self, role: str = "", reason: str = "", from_role: str = "", **kwargs):
+        from services.agent.role_adoption import request_role_change as _req
+        depth = int(getattr(self, "depth", 0) or kwargs.get("depth") or 0)
+        return _req(role, reason, from_role=from_role, depth=depth)
 
     def delegate(self, role: str = "", brief: str = "", budget_tokens: int = 0,
                  kind: str = "worker", parent_id: str | None = None,

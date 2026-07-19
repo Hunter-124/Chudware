@@ -113,6 +113,8 @@ struct Settings {
     bool planMode = true;        // binary: planPreference != 0 (Supervised vs Autopilot)
     bool proactiveAdvisor = false; // opt-in mid-run proactive advisor (cheap gates; not every turn)
     bool memoryEnabled = true;   // project SQLite memory under .plm/memory.db
+    // 0=supervised (default): only main may adopt_role; 1=free: subagents may adopt too.
+    int roleAdoption = 0;
     int memoryTokenBudget = 400; // max tokens injected from project memory per turn
     // Copilot composer mode: Agent | Plan | Swarm | Edit | Ask. Persisted as "copilot_mode".
     // Values match AppState::aiInteraction / CopilotMode.

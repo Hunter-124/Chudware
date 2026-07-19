@@ -321,6 +321,27 @@ def get_subagent_preference(cfg: dict | None = None) -> str:
     return DEFAULT_SUBAGENT_PREFERENCE
 
 
+
+DEFAULT_ROLE_ADOPTION = "supervised"  # supervised | free
+
+
+def get_role_adoption_mode(cfg: dict | None = None) -> str:
+    """Subagent role adoption: supervised (default) or free.
+
+    supervised — only the main/root agent may adopt_role; subagents request via advisor.
+    free — subagents may adopt_role themselves (still depth-capped for spawns).
+    """
+    try:
+        from services.agent.role_catalog import get_role_adoption_mode as _g
+        return _g(cfg)
+    except Exception:  # noqa: BLE001
+        c = cfg if cfg is not None else load_config()
+        agent = c.get("agent") if isinstance(c, dict) and isinstance(c.get("agent"), dict) else {}
+        raw = str((agent or {}).get("role_adoption") or c.get("role_adoption") or DEFAULT_ROLE_ADOPTION)
+        raw = raw.strip().lower()
+        return "free" if raw in ("free", "free_reign", "free-reign") else "supervised"
+
+
 def get_advisor_preference(cfg: dict | None = None) -> str:
     """off|option|encourage|require. Env AI_CAD_ADVISOR=0 forces off."""
     import os
@@ -368,6 +389,42 @@ def proactive_advisor_enabled(cfg: dict | None = None) -> bool:
     return DEFAULT_PROACTIVE_ADVISOR
 
 
+
+# ---------------------------------------------------------------------------
+# Tool families (Settings → AI → Tools)
+# agent.tool_families: { "cad": true, "em": false, ... }
+# Missing key = enabled (backward compatible). Env AI_CAD_TOOLS_ALLOW still wins
+# at the registry layer when set.
+# ---------------------------------------------------------------------------
+DEFAULT_TOOL_FAMILIES = (
+    "advisor", "cad", "cam", "ecad", "em", "gsl", "intake", "ledger",
+    "org", "parts", "plm", "recon", "research", "reveng", "sim", "workspace",
+)
+
+def get_tool_families(cfg: dict | None = None) -> dict[str, bool]:
+    """Return family→enabled map. Defaults all known families to True."""
+    c = cfg if isinstance(cfg, dict) else load_config()
+    agent = c.get("agent") if isinstance(c.get("agent"), dict) else {}
+    raw = agent.get("tool_families") if isinstance(agent.get("tool_families"), dict) else {}
+    out: dict[str, bool] = {}
+    for fam in DEFAULT_TOOL_FAMILIES:
+        v = raw.get(fam, True)
+        out[fam] = bool(v) if not isinstance(v, bool) else v
+    # preserve any extra keys user added
+    for k, v in raw.items():
+        if k not in out:
+            out[str(k)] = bool(v)
+    return out
+
+
+def is_tool_family_enabled(family: str, cfg: dict | None = None) -> bool:
+    """True when *family* is enabled (unknown family defaults True)."""
+    if not family:
+        return True
+    fams = get_tool_families(cfg)
+    return bool(fams.get(family, True))
+
+
 def memory_enabled(cfg: dict | None = None) -> bool:
     c = cfg if cfg is not None else load_config()
     if isinstance(c, dict) and "memory_enabled" in c:
@@ -396,45 +453,6 @@ def get_memory_token_budget(cfg: dict | None = None) -> int:
 # --------------------------------------------------------------------------- compaction / session cmds
 # Shared with host + session_cmds (omp port). Nested under ``agent`` unless noted.
 #
-
-# ---------------------------------------------------------------------------
-# Tool families (Settings → AI → Tools)
-# agent.tool_families: { "cad": true, "em": false, ... }
-# Missing key = enabled (backward compatible). Env AI_CAD_TOOLS_ALLOW still wins
-# at the registry layer when set to an explicit allow list.
-# ---------------------------------------------------------------------------
-DEFAULT_TOOL_FAMILIES = (
-    "advisor", "cad", "cam", "ecad", "em", "gsl", "intake", "ledger",
-    "org", "parts", "plm", "recon", "research", "reveng", "sim", "workspace",
-)
-
-
-def get_tool_families(cfg: dict | None = None) -> dict[str, bool]:
-    """Return family→enabled map. Defaults all known families to True."""
-    c = cfg if isinstance(cfg, dict) else load_config()
-    agent = c.get("agent") if isinstance(c.get("agent"), dict) else {}
-    raw = agent.get("tool_families") if isinstance(agent.get("tool_families"), dict) else {}
-    out: dict[str, bool] = {}
-    for fam in DEFAULT_TOOL_FAMILIES:
-        if fam in raw:
-            out[fam] = bool(raw[fam])
-        else:
-            out[fam] = True
-    for k, v in raw.items():
-        ks = str(k)
-        if ks not in out:
-            out[ks] = bool(v)
-    return out
-
-
-def is_tool_family_enabled(family: str, cfg: dict | None = None) -> bool:
-    """True when *family* is enabled (unknown family defaults True)."""
-    if not family:
-        return True
-    fams = get_tool_families(cfg)
-    return bool(fams.get(str(family), True))
-
-
 #   agent.compaction_strategy ∈ "off"|"snapcompact"|"shake"|"summary"  (default "off")
 #   agent.compaction.supersede_reads bool (default true)
 #   agent.compaction.drop_useless bool (default true)

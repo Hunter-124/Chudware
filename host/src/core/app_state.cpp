@@ -317,6 +317,15 @@ void loadSettings(Settings& s) {
                 s.proactiveAdvisor = ag.value("proactive_advisor", false);
             if (ag.contains("memory_enabled"))
                 s.memoryEnabled = ag.value("memory_enabled", true);
+                if (ag.contains("role_adoption")) {
+                    auto ra = ag["role_adoption"];
+                    if (ra.is_string()) {
+                        std::string sra = ra.get<std::string>();
+                        s.roleAdoption = (sra == "free" || sra == "free_reign") ? 1 : 0;
+                    } else if (ra.is_number_integer()) {
+                        s.roleAdoption = ra.get<int>() != 0 ? 1 : 0;
+                    }
+                }
             if (ag.contains("memory_token_budget")) {
                 int b = ag.value("memory_token_budget", 400);
                 s.memoryTokenBudget = (b < 50) ? 50 : (b > 4000 ? 4000 : b);
@@ -573,6 +582,7 @@ void saveSettings(const Settings& s) {
         j["advisor_preference"] = prefName(s.advisorPreference);
         j["proactive_advisor"] = s.proactiveAdvisor;
         j["memory_enabled"] = s.memoryEnabled;
+        j["role_adoption"] = (s.roleAdoption != 0) ? "free" : "supervised";
         j["memory_token_budget"] = s.memoryTokenBudget;
         // Merge-overlay into agent{} so Python config helpers see the same values.
         nlohmann::json agent = nlohmann::json::object();
@@ -582,6 +592,7 @@ void saveSettings(const Settings& s) {
         agent["proactive_advisor"] = s.proactiveAdvisor;
         agent["subagent_preference"] = prefName(s.subagentPreference);
         agent["memory_enabled"] = s.memoryEnabled;
+        agent["role_adoption"] = (s.roleAdoption != 0) ? "free" : "supervised";
         agent["memory_token_budget"] = s.memoryTokenBudget;
         j["agent"] = std::move(agent);
     }

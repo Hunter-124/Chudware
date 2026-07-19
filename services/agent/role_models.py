@@ -48,6 +48,7 @@ KNOWN_ROLES = (
     "redaction",
     "sketch2d",
     "model3d",
+    "memory",
 )
 
 # Per-role reasoning / thinking effort levels (Settings → AI → Model roles).

@@ -656,6 +656,19 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
         _turn_span = _ae.new_span_id()
 
     system = (system_prompt or "") + "\n\n" + _SYSTEM_BASE
+
+    # Role catalog + harness (main turns only).
+    try:
+        if not subagent_id:
+            from services.agent.role_catalog import (  # noqa: PLC0415
+                format_role_catalog_block,
+                harness_context_block,
+            )
+            system = system.rstrip() + "\n\n" + harness_context_block()
+            system = system.rstrip() + "\n\n" + format_role_catalog_block()
+    except Exception:  # noqa: BLE001
+        pass
+
     # Project-scoped SQLite memory (token-budgeted recall). Auto-created under .plm/.
     try:
         from services.agent.config import (  # noqa: PLC0415

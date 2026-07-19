@@ -49,6 +49,14 @@ You are a senior mechanical CAD engineer who designs precise, manufacturable par
 parametric models using build123d (a Python B-rep CAD library on the OpenCASCADE kernel). \
 Units are millimeters.
 
+You run inside Billet/Chudware: OpenCASCADE B-rep kernel, MCP tools (cad/ecad/cam/sim/plm),
+project memory under .plm/memory.db, and specialized roles. For 3D parts prefer the **model3d**
+role (or delegate to it) — it owns solids and calls **sketch2d** for profiles, checking placement
+with vision. Pure 2D/ECAD drawings → sketch2d. Reviews → reviewer. Steering → advisor. Distill
+decisions → memory. Main session may adopt_role or delegate; subagents spawn children via
+delegate but adopt only if role_adoption=free (else request_role_change). Always verify with
+tools before declaring done; never invent dimensions.
+
 Your job: turn the user's request into a build123d script, then verify the rendered \
 result visually and refine until it faithfully matches the request. When the user follows \
 up, MODIFY the existing design — keep what already matches and change only what they asked.
@@ -1331,6 +1339,20 @@ def _generate(session: Session, provider: Provider, on_event: EventFn | None,
     # prompt still takes over on a context overflow, as before.
     role_prompt = (getattr(session, "role_prompt", None) or "").strip()
     base_prompt = override or role_prompt or SYSTEM_PROMPT
+    # Live role catalog (brief when-to-use) for the main design loop.
+    try:
+        from services.agent.role_catalog import (  # noqa: PLC0415
+            format_role_catalog_block,
+            harness_context_block,
+        )
+        if not getattr(session, "role_prompt", None):
+            base_prompt = (
+                base_prompt.rstrip()
+                + "\n\n" + harness_context_block()
+                + "\n\n" + format_role_catalog_block()
+            )
+    except Exception:  # noqa: BLE001
+        pass
     # Skills catalog + any session-activated skill bodies (contracts/skills.md).
     # Best-effort: skills module missing/broken must never break the design loop.
     try:
@@ -1429,6 +1451,7 @@ def run_turn(session: Session, request: str, provider: Provider,
             request_snippet=_rr.request_snippet or (request or "")[:120],
             picked_model=_picked_model,
             picked_provider=_picked_provider,
+            alternatives=getattr(_rr, "alternatives", None),
             actor=getattr(session, "name", None) or "design",
         )
         _j_cls = None
@@ -2080,6 +2103,7 @@ def run_mission(
             request_snippet=_rr.request_snippet or (request or "")[:120],
             picked_model=_picked_model,
             picked_provider=_picked_provider,
+            alternatives=getattr(_rr, "alternatives", None),
             actor="mission",
         )
         _j_cls = None

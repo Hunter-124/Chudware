@@ -396,6 +396,45 @@ def get_memory_token_budget(cfg: dict | None = None) -> int:
 # --------------------------------------------------------------------------- compaction / session cmds
 # Shared with host + session_cmds (omp port). Nested under ``agent`` unless noted.
 #
+
+# ---------------------------------------------------------------------------
+# Tool families (Settings → AI → Tools)
+# agent.tool_families: { "cad": true, "em": false, ... }
+# Missing key = enabled (backward compatible). Env AI_CAD_TOOLS_ALLOW still wins
+# at the registry layer when set to an explicit allow list.
+# ---------------------------------------------------------------------------
+DEFAULT_TOOL_FAMILIES = (
+    "advisor", "cad", "cam", "ecad", "em", "gsl", "intake", "ledger",
+    "org", "parts", "plm", "recon", "research", "reveng", "sim", "workspace",
+)
+
+
+def get_tool_families(cfg: dict | None = None) -> dict[str, bool]:
+    """Return family→enabled map. Defaults all known families to True."""
+    c = cfg if isinstance(cfg, dict) else load_config()
+    agent = c.get("agent") if isinstance(c.get("agent"), dict) else {}
+    raw = agent.get("tool_families") if isinstance(agent.get("tool_families"), dict) else {}
+    out: dict[str, bool] = {}
+    for fam in DEFAULT_TOOL_FAMILIES:
+        if fam in raw:
+            out[fam] = bool(raw[fam])
+        else:
+            out[fam] = True
+    for k, v in raw.items():
+        ks = str(k)
+        if ks not in out:
+            out[ks] = bool(v)
+    return out
+
+
+def is_tool_family_enabled(family: str, cfg: dict | None = None) -> bool:
+    """True when *family* is enabled (unknown family defaults True)."""
+    if not family:
+        return True
+    fams = get_tool_families(cfg)
+    return bool(fams.get(str(family), True))
+
+
 #   agent.compaction_strategy ∈ "off"|"snapcompact"|"shake"|"summary"  (default "off")
 #   agent.compaction.supersede_reads bool (default true)
 #   agent.compaction.drop_useless bool (default true)

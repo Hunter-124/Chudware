@@ -170,6 +170,25 @@ def deny_reason(name: str) -> str | None:
     # Meta-tools are always permitted (request more surface / list packs).
     if name in ("enable_tools", "list_tool_categories"):
         return None
+    # Config agent.tool_families — disabled families blocked unless env/policy allow
+    # list is active (AI_CAD_TOOLS_ALLOW still wins via _current_allow below).
+    try:
+        from services.agent.config import is_tool_family_enabled  # lazy: avoid import cycles
+        fam = (_CATALOG.get(name) or {}).get("family")
+        if fam and not is_tool_family_enabled(str(fam)):
+            # If an explicit allow-list is active, family filter still applies unless
+            # the tool/family token is in the allow set (checked later). When allow is
+            # None (default open), family disable is enough to deny.
+            allow = _current_allow()
+            if allow is None:
+                return (f"tool {name!r} family {fam!r} is disabled in "
+                        f"config agent.tool_families")
+            # allow-list active: only deny if neither name nor family: token present
+            if name not in allow and f"family:{fam}" not in allow:
+                return (f"tool {name!r} family {fam!r} is disabled in "
+                        f"config agent.tool_families")
+    except Exception:
+        pass
     risk = (_CATALOG.get(name) or {}).get("risk") or classify_risk(name)
     deny_risk = _current_deny_risk()
     if deny_risk and risk in deny_risk:

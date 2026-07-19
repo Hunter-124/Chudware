@@ -388,6 +388,37 @@ static ImU32 modeBorderColor(int mode) {
     }
 }
 
+// RGB (0..1) counterpart of modeBorderColor — same palette sources for Agent/Plan/Edit,
+// same fixed hues for Swarm/Ask/Eng.Firm. Used by the mode-selector popup + trigger chip
+// for coloredRowWash gradients (every row gets its mode tint, not only the active one).
+static void modeAccentRgb(int mode, float out[3]) {
+    const auto& pal = ui::palette;
+    switch (mode) {
+        case 0: // Agent — accent/blue
+            out[0] = pal.accent[0]; out[1] = pal.accent[1]; out[2] = pal.accent[2];
+            break;
+        case 1: // Plan — amber (statusWarn)
+            out[0] = pal.statusWarn[0]; out[1] = pal.statusWarn[1]; out[2] = pal.statusWarn[2];
+            break;
+        case 2: // Swarm — teal/cyan  (matches IM_COL32(40, 190, 200, …))
+            out[0] = 40.f / 255.f; out[1] = 190.f / 255.f; out[2] = 200.f / 255.f;
+            break;
+        case 3: // Edit — green (statusOk)
+            out[0] = pal.statusOk[0]; out[1] = pal.statusOk[1]; out[2] = pal.statusOk[2];
+            break;
+        case 4: // Ask — neutral gray  (matches IM_COL32(150, 155, 165, …))
+            out[0] = 150.f / 255.f; out[1] = 155.f / 255.f; out[2] = 165.f / 255.f;
+            break;
+        case 5: // Eng.Firm — violet  (matches IM_COL32(150, 90, 220, …))
+            out[0] = 150.f / 255.f; out[1] = 90.f / 255.f; out[2] = 220.f / 255.f;
+            break;
+        default:
+            out[0] = pal.accent[0]; out[1] = pal.accent[1]; out[2] = pal.accent[2];
+            break;
+    }
+}
+
+
 // Fit/interference readout: a green ("fits") or red ("clash") status line; when detailed,
 // the per-pair overlap volumes (red) and clearance gaps (dim) below it.
 // Tone-matches the CALLER's current ink rather than chatSurf() — this helper is shared with the
@@ -13007,10 +13038,11 @@ static float measureContextMeter(AppState& st, float roomForMeter) {
     return ImGui::CalcTextSize(("ctx " + full).c_str()).x;
 }
 
-// One row in the drop-up mode menu: glass wash on hover/selection + atlas icon + label.
-// Mirrors modelRow styling (glassRowBackground + tinted atlas image). Returns true when
-// clicked and enabled. Header colors are pushed transparent by the caller so the wash is
-// the only row background.
+// One row in the drop-up mode menu: frosted glass base + per-mode coloredRowWash gradient
+// (same hues as modeBorderColor / modeAccentRgb). Every row is tinted; selected gets a
+// stronger fill + mode-colored glow outline; hover brightens. Returns true when clicked
+// and enabled. Header colors are pushed transparent by the caller so the wash is the
+// only row background.
 static bool modeMenuRow(const char* iconName, const char* label, bool selected,
                         bool disabled, int uid) {
     const auto& pal = ui::palette;
@@ -13024,9 +13056,18 @@ static bool modeMenuRow(const char* iconName, const char* label, bool selected,
     const bool hov = ImGui::IsItemHovered();
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
-    ui::glassRowBackground(dl, mn, mx, ui::metrics::rounding(4.0f),
-                           /*stripe=*/false, /*selected=*/(selected || hov),
-                           /*washAlpha=*/selected ? 0.42f : 0.30f);
+    // Logical dp rounding (helpers multiply by uiScale) — matches Layers/rail-tab pills.
+    const float rnd = 4.0f;
+    const float washA = disabled ? 0.18f : (selected ? 0.42f : (hov ? 0.36f : 0.28f));
+    ui::glassRowBackground(dl, mn, mx, rnd,
+                           /*stripe=*/false, /*selected=*/false, /*washAlpha=*/washA);
+    float tint[3];
+    modeAccentRgb(uid, tint);
+    // Resting rows still show a clear mode tint; hover brightens; selected strongest + glow.
+    const float strength = disabled ? 0.10f
+                         : (selected ? 0.38f
+                         : (hov ? 0.28f : 0.18f));
+    ui::coloredRowWash(dl, mn, mx, rnd, tint, strength, /*selected=*/selected && !disabled);
     const float midY = (mn.y + mx.y) * 0.5f;
     const float pad = 8.0f * sc;
     const float isz = fh * 1.02f;
@@ -13045,6 +13086,7 @@ static bool modeMenuRow(const char* iconName, const char* label, bool selected,
     ImGui::PopID();
     return clicked && !disabled;
 }
+
 
 // Prelude row above the prompt: Agent/Plan/Swarm/Edit/Ask dropdown (left) + busy forging
 // glyph (inline, only while a run is active) + context meter (right).
@@ -13104,8 +13146,17 @@ static void drawComposerPrelude(AppState& st, bool busy) {
     const bool trigHov = ImGui::IsItemHovered();
     ImDrawList* pdl = ImGui::GetWindowDrawList();
     const ImVec2 tmn = ImGui::GetItemRectMin(), tmx = ImGui::GetItemRectMax();
-    ui::glassRowBackground(pdl, tmn, tmx, ui::metrics::rounding(6.0f),
-                           /*stripe=*/false, /*selected=*/trigHov, /*washAlpha=*/0.30f);
+    // Frosted base + active-mode colored gradient (matches the selected popup row).
+    const float trigRnd = 6.0f;
+    ui::glassRowBackground(pdl, tmn, tmx, trigRnd,
+                           /*stripe=*/false, /*selected=*/false,
+                           /*washAlpha=*/trigHov ? 0.36f : 0.30f);
+    {
+        float tint[3];
+        modeAccentRgb(mode, tint);
+        const float strength = trigHov ? 0.32f : 0.22f;
+        ui::coloredRowWash(pdl, tmn, tmx, trigRnd, tint, strength, /*selected=*/true);
+    }
     const float tMidY = (tmn.y + tmx.y) * 0.5f;
     const ImU32 tink = ImGui::GetColorU32(surf.textPrimary);
     {

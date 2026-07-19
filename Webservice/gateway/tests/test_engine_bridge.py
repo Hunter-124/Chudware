@@ -227,6 +227,45 @@ class TestEngineBridge:
         doc_calls = [c for c in daemon.calls if c.get("method") == "doc_new"]
         assert all("name" in c["params"] for c in doc_calls) or not doc_calls
 
+    def test_list_models_injects_host_api_key(self, daemon, client, monkeypatch):
+        """agent_list_models gets host keys server-side; browser never sees them back."""
+        from gateway import engine_bridge
+
+        monkeypatch.setattr(
+            engine_bridge,
+            "_load_host_keys",
+            lambda: {
+                "openrouter": "sk-or-host-secret",
+                "gemini": "gem-host-secret",
+            },
+        )
+        with client.websocket_connect("/engine", headers=DEV_HEADERS) as ws:
+            _rpc(ws, 1, "hello")
+            # Empty key + OpenRouter URL — inject must fill api_key from host config.
+            _rpc(
+                ws,
+                2,
+                "agent_list_models",
+                {
+                    "provider": "openai",
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "api_key": "",
+                },
+            )
+            # Gemini with no key/url — inject key only.
+            _rpc(ws, 3, "agent_list_models", {"provider": "gemini", "api_key": ""})
+
+        seen = [c for c in daemon.calls if c.get("method") == "agent_list_models"]
+        assert len(seen) == 2, seen
+        or_params = seen[0]["params"]
+        assert or_params.get("api_key") == "sk-or-host-secret", or_params
+        assert or_params.get("base_url") == "https://openrouter.ai/api/v1", or_params
+        gem_params = seen[1]["params"]
+        assert gem_params.get("api_key") == "gem-host-secret", gem_params
+        # Response path is pass-through — secrets must not be rewritten into client-bound frames
+        # (FakeDaemon returns {"ok": true} without echoing params).
+
+
 
 class TestWorkspaceApi:
     def test_list_and_download(self, workspace, client):

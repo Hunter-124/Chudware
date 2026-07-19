@@ -73,6 +73,119 @@ _AGENT_PROVIDER_METHODS = frozenset({
 # Secrets / server-owned endpoint config — never accept from the browser.
 _STRIP_SECRET_FIELDS = ("api_key", "base_url", "fallback_api_keys", "auth_mode")
 
+# agent_list_models is a C++ probe in libaicad — it does NOT load host config.json.
+# The WASM client has empty/IDBFS keys, so without a server-side inject the probe
+# returns "no api key" / HTTP 401 and the picker looks disconnected from hostd.
+# Fill api_key + base_url from the host config when the client omitted them (or
+# sent a non-secret presence sentinel). Credentials never flow back to the browser.
+_LIST_MODELS_METHOD = "agent_list_models"
+_PRESENCE_SENTINELS = frozenset({"", "\x01", "host", "shared", "1"})
+
+
+def _load_host_keys() -> dict[str, str]:
+    """Return keys.* string slots from host config (empty dict on failure)."""
+    try:
+        try:
+            from .providers import _load_host_config  # type: ignore
+        except ImportError:
+            from providers import _load_host_config  # type: ignore
+        cfg = _load_host_config()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("list_models inject: config load failed: %s", exc)
+        return {}
+    keys = cfg.get("keys") if isinstance(cfg, dict) else None
+    if not isinstance(keys, dict):
+        return {}
+    out: dict[str, str] = {}
+    for k, v in keys.items():
+        if isinstance(v, str) and v.strip():
+            out[str(k)] = v.strip()
+    return out
+
+
+def _key_for_list_models(provider: str, base_url: str, keys: dict[str, str]) -> tuple[str, str]:
+    """Pick (api_key, base_url) for a list_models probe from host keys + URL hints."""
+    prov = (provider or "").strip().lower()
+    url = (base_url or "").strip()
+    url_l = url.lower()
+
+    # URL wins over bare provider name (client often sends provider=openai + OpenRouter URL).
+    if "openrouter.ai" in url_l:
+        return (
+            keys.get("openrouter") or keys.get("cloud_compat") or "",
+            url or "https://openrouter.ai/api/v1",
+        )
+    if "moonshot.ai" in url_l or "api.moonshot" in url_l:
+        return keys.get("moonshot") or "", url or "https://api.moonshot.ai/v1"
+    if "api.x.ai" in url_l:
+        return keys.get("xai") or "", url or "https://api.x.ai/v1"
+    if "generativelanguage.googleapis.com" in url_l or prov == "gemini":
+        return keys.get("gemini") or "", url
+    if "api.anthropic.com" in url_l or prov == "anthropic":
+        return keys.get("anthropic") or "", url
+    if "localhost" in url_l or "127.0.0.1" in url_l or "[::1]" in url_l:
+        return keys.get("openai") or "", url or "http://127.0.0.1:1234/v1"
+
+    if prov == "xai":
+        return keys.get("xai") or "", url or "https://api.x.ai/v1"
+    if prov == "openai":
+        # Prefer dedicated openrouter key when that's the host's cloud path and no URL given.
+        if not url and keys.get("openrouter"):
+            return keys["openrouter"], "https://openrouter.ai/api/v1"
+        if not url and keys.get("cloud_compat"):
+            return keys["cloud_compat"], "https://openrouter.ai/api/v1"
+        return (
+            keys.get("openai") or keys.get("openrouter") or keys.get("cloud_compat") or "",
+            url or "https://api.openai.com/v1",
+        )
+    if prov == "llamacpp":
+        return "", url or "http://127.0.0.1:1234/v1"
+    if prov == "moonshot":
+        return keys.get("moonshot") or "", url or "https://api.moonshot.ai/v1"
+    if prov == "openrouter":
+        return (
+            keys.get("openrouter") or keys.get("cloud_compat") or "",
+            url or "https://openrouter.ai/api/v1",
+        )
+    return "", url
+
+
+def _inject_list_models_creds(line: str) -> str:
+    """Fill empty/sentinel api_key + base_url on agent_list_models from host config."""
+    try:
+        msg = json.loads(line)
+    except ValueError:
+        return line
+    if not isinstance(msg, dict) or msg.get("method") != _LIST_MODELS_METHOD:
+        return line
+    params = msg.get("params")
+    if not isinstance(params, dict):
+        return line
+
+    provider = str(params.get("provider") or "")
+    base_url = str(params.get("base_url") or "")
+    api_key = str(params.get("api_key") or "")
+
+    need_key = api_key.strip() in _PRESENCE_SENTINELS
+    need_url = not base_url.strip()
+    if not need_key and not need_url:
+        return line
+
+    keys = _load_host_keys()
+    inj_key, inj_url = _key_for_list_models(provider, base_url, keys)
+    changed = False
+    if need_key and inj_key:
+        params["api_key"] = inj_key
+        changed = True
+    if need_url and inj_url:
+        params["base_url"] = inj_url
+        changed = True
+    if not changed:
+        return line
+    msg["params"] = params
+    return json.dumps(msg, separators=(",", ":"))
+
+
 
 def _sanitize_agent_provider(line: str) -> str:
     """Drop client-supplied secrets from agent-turn RPCs; keep provider/model selection."""
@@ -115,6 +228,8 @@ async def engine_ws(ws: WebSocket) -> None:
             head = line[:96]
             if '"hello"' in head:
                 line = _inject_identity(line, user.email, user.display)
+            elif '"agent_list_models"' in head:
+                line = _inject_list_models_creds(line)
             elif '"agent_' in head or '"session_btw"' in head or '"session_handoff"' in head:
                 line = _sanitize_agent_provider(line)
             writer.write(line.encode("utf-8") + b"\n")

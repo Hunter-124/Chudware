@@ -799,15 +799,37 @@ static bool drawSourceModeSelector(RevEngState& s) {
     };
 
     bool changed = false;
+    // Pre-compute buttons+spacing only. "Source:" is already drawn with SameLine, so
+    // availW is the remaining width on this row — do NOT re-include the label in rowW
+    // or subtract it again from the combo width.
+    float rowW = 0.0f;
+    float btnW[4];
     for (int i = 0; i < 4; ++i) {
-        // Wrap to a new row when the next button no longer fits (narrow center panel —
-        // previously the last button was clipped, e.g. "From Li").
-        const float bw = ImGui::CalcTextSize(kModes[i].label).x +
-                         ImGui::GetStyle().FramePadding.x * 2.0f;
-        if (i > 0 && ImGui::GetContentRegionAvail().x >= bw + 4.0f * sc)
-            ImGui::SameLine(0.0f, 4.0f * sc);
-        else if (i > 0)
-            ImGui::SetCursorPosX(ImGui::GetStyle().WindowPadding.x);  // wrap
+        btnW[i] = ImGui::CalcTextSize(kModes[i].label).x +
+                  ImGui::GetStyle().FramePadding.x * 2.0f;
+        rowW += btnW[i] + (i > 0 ? 4.0f * sc : 0.0f);
+    }
+    const float availW = ImGui::GetContentRegionAvail().x;
+
+    if (rowW > availW) {
+        // Narrow fallback: one combo filling the remainder of the Source: line.
+        ImGui::SetNextItemWidth(std::max(120.0f * sc, availW));
+        int cur = (int)s.sourceMode;
+        if (ImGui::Combo("##src_mode", &cur,
+                         "Scan\0Datasheet\0Web / Part#\0From Library\0")) {
+            if (cur != (int)s.sourceMode) {
+                s.sourceMode = (SourceMode)cur;
+                changed = true;
+            }
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", kModes[std::clamp(cur, 0, 3)].tip);
+        ImGui::Spacing();
+        return changed;
+    }
+
+    for (int i = 0; i < 4; ++i) {
+        if (i > 0) ImGui::SameLine(0.0f, 4.0f * sc);
         const bool active = (s.sourceMode == kModes[i].mode);
         if (active) {
             ImGui::PushStyleColor(ImGuiCol_Button,

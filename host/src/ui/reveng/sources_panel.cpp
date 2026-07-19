@@ -402,8 +402,8 @@ static void drawScanEntry(AppState& st) {
                 st.rpc.call("reveng_add_video", args, [](const core::RpcResult&){});
             }
         }
-        ImGui::SameLine();
-        ImGui::TextDisabled("or drag images onto the gallery below");
+        // (drag-drop hint lives on the gallery itself — a SameLine caption here clipped at
+        // the panel edge on narrow layouts)
         ImGui::Spacing();
 
         // RE-19: live webcam capture widget (CameraBackend; stub fallback).

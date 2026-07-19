@@ -201,7 +201,9 @@ void drawScalePanel(AppState& st) {
             ImGui::PopStyleColor();
         }
     } else {
-        ImGui::TextDisabled("No scale set yet — reconstruction stays gated until scale is confirmed.");
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        ImGui::TextWrapped("No scale set yet — reconstruction stays gated until scale is confirmed.");
+        ImGui::PopStyleColor();
     }
     ImGui::Spacing();
 

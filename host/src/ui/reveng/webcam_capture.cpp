@@ -305,12 +305,17 @@ static void drawCoverageRing(ImDrawList* dl, ImVec2 centre, float radius,
         // ring outline
         dl->AddCircle(p, dotR, IM_COL32(255, 255, 255, 60), 12, 1.0f);
     }
-    // Legend text
+    // Legend: drawn dots + plain text (the ● glyph is missing from the app font atlas and
+    // rendered as "?").
     const float lx = centre.x - radius;
     const float ly = centre.y + radius + 6.0f;
-    dl->AddText(ImVec2(lx, ly),        IM_COL32(60, 200, 80, 200),  "● captured");
-    dl->AddText(ImVec2(lx + 75.0f, ly), IM_COL32(230,160,30, 200), "● blurred");
-    dl->AddText(ImVec2(lx + 145.0f,ly), IM_COL32(180,180,200,160), "● pending");
+    const float dotY = ly + 6.0f;
+    dl->AddCircleFilled(ImVec2(lx + 4.0f, dotY), 4.0f, IM_COL32(60, 200, 80, 230));
+    dl->AddText(ImVec2(lx + 12.0f, ly), IM_COL32(60, 200, 80, 200), "captured");
+    dl->AddCircleFilled(ImVec2(lx + 76.0f, dotY), 4.0f, IM_COL32(230, 160, 30, 230));
+    dl->AddText(ImVec2(lx + 84.0f, ly), IM_COL32(230, 160, 30, 200), "blurred");
+    dl->AddCircleFilled(ImVec2(lx + 140.0f, dotY), 4.0f, IM_COL32(180, 180, 200, 160));
+    dl->AddText(ImVec2(lx + 148.0f, ly), IM_COL32(180, 180, 200, 160), "pending");
 }
 
 // ---------------------------------------------------------------------------

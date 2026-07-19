@@ -71,6 +71,7 @@ _COST_CLASS: dict[str, int] = {
     "xai-sub": 2,
     "anthropic-sub": 2,
     "codex-sub": 2,
+    "kimi-sub": 2,
     "claude-cli": 2,
     "codex-cli": 2,
     "xai": 5,
@@ -948,7 +949,7 @@ def provider_is_loopback(
         return True
     if name in (
         "anthropic", "openai", "gemini", "openrouter", "xai",
-        "anthropic-sub", "codex-sub", "cursor-sub", "xai-sub",
+        "anthropic-sub", "codex-sub", "cursor-sub", "xai-sub", "kimi-sub",
         "claude-cli", "codex-cli",
     ):
         return False
@@ -1106,6 +1107,8 @@ def _enabled_providers(cfg: Mapping[str, Any] | None) -> list[dict[str, str]]:
             _add("anthropic-sub", "claude-sonnet-4")
         if "codex-sub" in sub or "codex" in sub:
             _add("codex-sub", "gpt-5")
+        if "kimi-sub" in sub or "kimi" in sub:
+            _add("kimi-sub", "kimi-for-coding")
 
     # mega-16: drop process-local unavailable providers (spending-limit etc.)
     out[:] = [

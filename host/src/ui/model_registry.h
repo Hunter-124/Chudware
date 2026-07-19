@@ -219,11 +219,14 @@ inline const std::vector<LocalPreset>& cloudPresets() {
          "Official DeepSeek API. Strong general/coding model.", kDeepSeek},
         {"deepseek-reasoner", "DeepSeek R1 (reasoner)", false,
          "Official DeepSeek API reasoning model (R1).", kDeepSeek},
-        // Moonshot (Kimi) — first-class "moonshot" wire provider (keys.moonshot).
-        {"kimi-k3", "Moonshot \xc2\xb7 Kimi K3 (1M, $3/$15)", true,
-         "Moonshot flagship; 1M context, native vision, always-reasons.", kMoonshot},
-        {"kimi-k2.6", "Moonshot \xc2\xb7 Kimi K2.6 (256K, $0.95/$4)", true,
-         "Cheaper Kimi for lighter/leaf assignments; 256K context, vision.", kMoonshot},
+        // Moonshot (Kimi) — first-class "moonshot" wire provider (keys.moonshot), DIRECT
+        // api.moonshot.ai billing. Label says "Moonshot API" to distinguish these rows from
+        // OpenRouter's live catalog, which also carries Kimi models ("MoonshotAI: …") but
+        // bills the OpenRouter balance instead.
+        {"kimi-k3", "Moonshot API \xc2\xb7 Kimi K3 (1M, $3/$15)", true,
+         "DIRECT api.moonshot.ai — bills keys.moonshot, NOT OpenRouter. 1M context, native vision, always-reasons.", kMoonshot},
+        {"kimi-k2.6", "Moonshot API \xc2\xb7 Kimi K2.6 (256K, $0.95/$4)", true,
+         "DIRECT api.moonshot.ai — bills keys.moonshot. Cheaper Kimi for lighter/leaf assignments; 256K context, vision.", kMoonshot},
     };
     return kPresets;
 }

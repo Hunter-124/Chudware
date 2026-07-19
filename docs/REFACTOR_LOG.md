@@ -1830,3 +1830,18 @@ and exported in `~/.bashrc`. Live-verified scrape + search; 18 new pool tests
 (`engine_oracle/research/test_firecrawl_pool.py`, transport-injected, no network),
 195/195 research pytest green. Gotcha: keys state file stores sha256 hashes, never raw
 keys; `pool_status()` masks to `fc-xxx…last4`.
+
+### kimi-sub subscription provider (Kimi For Coding OAuth) — 2026-07-18
+Ported Moonshot Kimi Code OAuth (device authorization grant) from omp
+(`packages/ai/src/registry/oauth/kimi.ts`, provider/dialect/usage shims) into Billet
+as subscription-auth provider `kimi-sub` alongside anthropic-sub / codex-sub /
+cursor-sub / xai-sub. Files: `services/agent/providers/kimi_sub_provider.py`
+(`KimiSubProvider`, `login_device` device-code flow only, `get_kimi_common_headers`,
+Anthropic-compatible `POST https://api.kimi.com/coding/v1/messages`, refresh keeps
+old RT when omitted), `usage.fetch_kimi_usage` (`GET {base}/usages`), plus
+subscription_login / config / role_models wiring, settings_modal / jobs.cpp GUI
+device-code UX, gateway provider list, and a diag script. Contract append in
+`contracts/providers.md` §4.4/§4.5; unit tests in `test_kimi_sub_provider.py`
+(urlopen-mocked, no network). **Deferred:** no C++ core/agent port — Python-only
+like cursor-sub/codex-sub; no model-picker PROV enum.
+

@@ -71,6 +71,9 @@ _MODEL_PRESETS: dict[str, list[dict[str, str]]] = {
         {"id": "gpt-5-codex", "label": "GPT-5 Codex"},
         {"id": "gpt-5.6-sol", "label": "GPT-5.6 Sol"},
     ],
+    "kimi-sub": [
+        {"id": "kimi-for-coding", "label": "Moonshot · Kimi For Coding (subscription)"},
+    ],
     "xai": [
         {"id": "grok-4.5", "label": "Grok 4.5 (default, 500k)"},
         {"id": "grok-4-1", "label": "Grok 4.1"},
@@ -216,6 +219,7 @@ def list_available_providers(cfg: dict[str, Any] | None = None) -> dict[str, Any
         "codex": ("codex-sub", "OpenAI Codex (ChatGPT Plus/Pro)"),
         "cursor": ("cursor-sub", "Cursor (Pro)"),
         "xai": ("xai-sub", "xAI Grok (SuperGrok / X Premium+)"),
+        "kimi": ("kimi-sub", "Moonshot Kimi (Kimi For Coding)"),
     }
     for friendly, info in sub.items():
         if not isinstance(info, dict):

@@ -206,12 +206,12 @@ def test_codex_build_input_drops_images(tmp_config):
 
 def test_dispatcher_lists_providers():
     ids = {p["id"] for p in sl.providers()}
-    assert ids == {"codex", "claude", "cursor", "xai"}
+    assert ids == {"codex", "claude", "cursor", "xai", "kimi"}
 
 
 def test_dispatcher_status_all_disconnected(tmp_config):
     st = sl.status()
-    assert set(st) == {"codex", "claude", "cursor", "xai"}
+    assert set(st) == {"codex", "claude", "cursor", "xai", "kimi"}
     assert all(not v["connected"] for v in st.values())
 
 

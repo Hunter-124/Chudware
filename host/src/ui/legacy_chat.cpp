@@ -11045,9 +11045,9 @@ struct OvSubAccountsUi {
 };
 static OvSubAccountsUi s_ovSub;
 
-static const char* kOvSubProviders[] = {"xai", "claude", "codex", "cursor"};
+static const char* kOvSubProviders[] = {"xai", "claude", "codex", "cursor", "kimi"};
 static const char* kOvSubProviderLabels[] = {
-    "xAI Grok", "Claude", "ChatGPT / Codex", "Cursor"};
+    "xAI Grok", "Claude", "ChatGPT / Codex", "Cursor", "Kimi Code"};
 static constexpr double kOvUsagePollSec = 5.0 * 60.0;
 static constexpr double kOvAccountsPollSec = 1.5;
 
@@ -11284,7 +11284,7 @@ static void drawOvProvidersTab(AppState& st, float S) {
     const float listH = ImMax(120.0f * S, ImGui::GetContentRegionAvail().y - 4.0f * S);
     ImGui::BeginChild("##ov_prov_list", ImVec2(0, listH), ImGuiChildFlags_None);
 
-    for (int pi = 0; pi < 4; ++pi) {
+    for (int pi = 0; pi < 5; ++pi) {
         const char* prov = kOvSubProviders[pi];
         const char* plabel = kOvSubProviderLabels[pi];
         ImGui::PushID(prov);
@@ -11718,13 +11718,14 @@ static bool modelHidden(AppState& st, const std::string& id) {
 }
 
 // File-static cache of subscription_status "connected" flags so the model picker can show
-// signed-in providers (xAI / Claude / Cursor / Codex) without requiring an API key.
+// signed-in providers (xAI / Claude / Cursor / Codex / Kimi) without requiring an API key.
 namespace {
 struct SubConnectedCache {
     bool xai = false;
     bool claude = false;
     bool cursor = false;
     bool codex = false;
+    bool kimi = false;
     double lastPoll = -1e9;
     bool inFlight = false;
 };
@@ -11748,6 +11749,7 @@ static void pollSubConnected(AppState& st) {
         s_subConn.claude = connected(providers, "claude");
         s_subConn.cursor = connected(providers, "cursor");
         s_subConn.codex  = connected(providers, "codex");
+        s_subConn.kimi   = connected(providers, "kimi");
     });
 }
 }  // namespace

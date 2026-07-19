@@ -36,7 +36,7 @@ from agent.providers import usage as usage_mod  # noqa: E402
 
 # Friendly id -> (provider_name for instantiate, cred store id)
 # Mirrors subscription_login._PROVIDERS.
-_PROVIDER_ORDER = ("xai", "claude", "codex", "cursor")
+_PROVIDER_ORDER = ("xai", "claude", "codex", "cursor", "kimi")
 
 _MSG_PING = [
     {

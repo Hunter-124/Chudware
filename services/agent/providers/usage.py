@@ -41,12 +41,14 @@ _FRIENDLY_TO_CRED = {
     "claude": "anthropic-sub",
     "cursor": "cursor",
     "xai": "xai-sub",
+    "kimi": "kimi-sub",
 }
 
 DASHBOARD_URLS = {
     "claude": "https://claude.ai/settings/usage",
     "codex": "https://chatgpt.com/",
     "cursor": "https://cursor.com/dashboard/usage",
+    "kimi": "https://www.kimi.com/code",
     "xai": "https://grok.com/?_s=usage",
 }
 
@@ -1799,6 +1801,150 @@ def fetch_xai_usage(cred: dict) -> dict:
         return fetch_xai_usage_jwt_inference(cred)
 
 
+# ── Kimi (Kimi For Coding) usage ─────────────────────────────────────────────
+# Port of omp ``packages/ai/src/usage/kimi.ts``: GET {base}/usages with the
+# OAuth Bearer + Kimi CLI headers; payload carries a `usage` summary row and a
+# `limits[]` array with per-window detail/window blocks.
+
+
+def _kimi_duration_label(duration: float | None, time_unit: str) -> str | None:
+    if duration is None or not time_unit:
+        return None
+    upper = time_unit.upper()
+    d = int(duration)
+    if "MINUTE" in upper:
+        if d >= 60 and d % 60 == 0:
+            return f"{d // 60}h limit"
+        return f"{d}m limit"
+    if "HOUR" in upper:
+        return f"{d}h limit"
+    if "DAY" in upper:
+        return f"{d}d limit"
+    if "SECOND" in upper:
+        return f"{d}s limit"
+    return None
+
+
+def _kimi_reset_iso(data: dict, now_ms: float) -> str | None:
+    """reset_at/resetAt/reset_time/resetTime (ISO str or epoch s/ms) or reset_in/ttl/window seconds."""
+    from datetime import datetime, timezone
+
+    for key in ("reset_at", "resetAt", "reset_time", "resetTime"):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            iso = _parse_iso_to_iso(value.strip())
+            if iso:
+                return iso
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            ms = value if value > 1_000_000_000_000 else value * 1000
+            return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat()
+    for key in ("reset_in", "resetIn", "ttl", "window"):
+        seconds = _to_number(data.get(key))
+        if seconds is not None:
+            return datetime.fromtimestamp(
+                (now_ms + seconds * 1000) / 1000, tz=timezone.utc
+            ).isoformat()
+    return None
+
+
+def _kimi_usage_row(data: dict, default_label: str, now_ms: float) -> dict | None:
+    limit = _to_number(data.get("limit"))
+    used = _to_number(data.get("used"))
+    remaining = _to_number(data.get("remaining"))
+    if used is None and remaining is not None and limit is not None:
+        used = limit - remaining
+    if used is None and limit is None:
+        return None
+    frac = _clamp_fraction(used / limit) if (used is not None and limit) else None
+    label = data.get("name") or data.get("title") or default_label
+    return _usage_row(
+        str(data.get("window_id") or "default"),
+        str(label),
+        frac,
+        _kimi_reset_iso(data, now_ms),
+    )
+
+
+def _parse_kimi_usage_payload(payload: Any) -> list[dict]:
+    """Map the /usages payload to harness usage rows (omp parseUsagePayload)."""
+    if not isinstance(payload, dict):
+        return []
+    now_ms = _now() * 1000
+    rows: list[dict] = []
+    summary = payload.get("usage")
+    if isinstance(summary, dict):
+        row = _kimi_usage_row(summary, "Total quota", now_ms)
+        if row:
+            row["window"] = "total"
+            rows.append(row)
+    limits = payload.get("limits")
+    if isinstance(limits, list):
+        for idx, item in enumerate(limits):
+            if not isinstance(item, dict):
+                continue
+            detail = item.get("detail") if isinstance(item.get("detail"), dict) else item
+            window_data = item.get("window") if isinstance(item.get("window"), dict) else {}
+            duration = _to_number(window_data.get("duration"))
+            time_unit = str(window_data.get("timeUnit") or "")
+            label = (
+                item.get("name")
+                or item.get("title")
+                or item.get("scope")
+                or detail.get("name")
+                or detail.get("title")
+                or _kimi_duration_label(duration, time_unit)
+                or f"Limit #{idx + 1}"
+            )
+            row = _kimi_usage_row(detail, str(label), now_ms)
+            if row is None:
+                continue
+            if duration is not None and time_unit:
+                row["window"] = f"{int(duration)}{time_unit.lower()}"
+                row["label"] = str(label)
+            # Kimi puts resetTime on the limit detail, not on window — fall back
+            # to the row-level reset so the UI can render "resets in …".
+            if not row.get("resets_at"):
+                row["resets_at"] = _kimi_reset_iso(window_data, now_ms)
+            rows.append(row)
+    return rows
+
+
+def fetch_kimi_usage(cred: dict) -> dict:
+    """Kimi For Coding usage: GET {base}/usages with Bearer + Kimi CLI headers."""
+    token = cred.get("access_token") or ""
+    if not token:
+        return {"usage": [], "plan": cred.get("plan"), "source": "unavailable"}
+    # ensure_fresh owns refresh; an expired token short-circuits this probe — the
+    # next poll cycle carries a freshly refreshed credential (omp does the same).
+    if sub_auth.is_expired(cred, skew_ms=0):
+        return {"usage": [], "plan": cred.get("plan"), "source": "unavailable"}
+    import urllib.request
+
+    from . import kimi_sub_provider as ksp
+
+    url = f"{ksp._base_url()}/usages"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        **ksp.get_kimi_common_headers(),
+    }
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 429:
+            raise _RateLimited() from exc
+        raise
+    rows = _parse_kimi_usage_payload(payload)
+    return {
+        "usage": rows,
+        "plan": cred.get("plan"),
+        "source": "api" if rows else "unavailable",
+        "dashboard_url": DASHBOARD_URLS.get("kimi"),
+    }
+
+
 class _RateLimited(Exception):
     """Usage endpoint returned 429 — freeze this account until cache TTL."""
 
@@ -1808,6 +1954,7 @@ _FETCHERS: dict[str, Callable[[dict], dict]] = {
     "codex": fetch_codex_usage,
     "cursor": fetch_cursor_usage,
     "xai": fetch_xai_usage,
+    "kimi": fetch_kimi_usage,
 }
 
 

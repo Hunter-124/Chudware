@@ -22,6 +22,7 @@ static std::string subscriptionEnsureProvider(const std::string& provider) {
         return "claude";
     if (provider == "cursor-sub" || provider == "cursor") return "cursor";
     if (provider == "codex-sub" || provider == "codex") return "codex";
+    if (provider == "kimi-sub" || provider == "kimi") return "kimi";
     return {};
 }
 

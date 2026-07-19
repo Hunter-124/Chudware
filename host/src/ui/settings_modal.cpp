@@ -225,9 +225,9 @@ static SubAccountsUi s_subAccts;
 // handles multi-account storage+rotation. Leave oauth_capture compiled but dormant.
 static constexpr bool kXaiUseCef = false;
 
-static const char* kSubProviders[] = {"xai", "claude", "codex", "cursor"};
+static const char* kSubProviders[] = {"xai", "claude", "codex", "cursor", "kimi"};
 static const char* kSubProviderLabels[] = {
-    "xAI Grok", "Claude", "ChatGPT / Codex", "Cursor"};
+    "xAI Grok", "Claude", "ChatGPT / Codex", "Cursor", "Kimi Code"};
 // 5-minute usage poll while the Accounts section is visible (§4.5).
 static constexpr double kUsagePollIntervalSec = 5.0 * 60.0;
 static constexpr double kAccountsPollIntervalSec = 1.5;
@@ -576,7 +576,7 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
         ImGui::PopStyleColor();
     }
 
-    for (int pi = 0; pi < 4; ++pi) {
+    for (int pi = 0; pi < 5; ++pi) {
         const char* prov = kSubProviders[pi];
         const char* plabel = kSubProviderLabels[pi];
         ImGui::PushID(prov);

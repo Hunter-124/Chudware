@@ -313,3 +313,37 @@ Semantics (services/agent/role_models.py):
 - Absent config → Auto → prior behavior plus these assignment paths.
 
 RPCs `ai_roles_get` / `ai_roles_set` echo the full map including `thinking`.
+
+
+## §4.4 / §4.5 — kimi-sub (Kimi For Coding subscription) — 2026-07-18
+
+Provider id: `kimi-sub` (friendly id `kimi`; human label "Moonshot Kimi (Kimi For Coding)").
+Module: `services/agent/providers/kimi_sub_provider.py` (`KimiSubProvider`,
+`PROVIDER_ID = "kimi-sub"`, `DEFAULT_MODEL = "kimi-for-coding"`, `supports_vision = True`).
+
+- **Auth:** OAuth 2.0 device authorization grant against `https://auth.kimi.com`
+  (env override `KIMI_CODE_OAUTH_HOST` / `KIMI_OAUTH_HOST`). Client id
+  `17e5f671-d194-4dfb-9706-5516cb48c098`. Device code: `POST /api/oauth/device_authorization`
+  (form: `client_id`). Poll: `POST /api/oauth/token` with
+  `grant_type=urn:ietf:params:oauth:grant-type:device_code` (handle
+  `authorization_pending` / `slow_down` / `expired_token` / `access_denied`; default
+  interval 5 s, TTL 15 min). Refresh: `POST /api/oauth/token` `grant_type=refresh_token`
+  (when the response omits `refresh_token`, keep the old one). Expiry =
+  `now_ms + expires_in*1000 − 5*60*1000` skew. Login surface:
+  `login_device(open_browser=True, progress=None)` emits progress dicts with
+  `user_code` + `verification_url` for the GUI device-code UX. Common headers via
+  `get_kimi_common_headers()` (`User-Agent: KimiCLI/<ver>`, `X-Msh-Platform`,
+  `X-Msh-Version`, `X-Msh-Device-Name`, `X-Msh-Device-Model`, `X-Msh-Os-Version`,
+  `X-Msh-Device-Id` — device id persisted next to config.json as `kimi-device-id`).
+- **Completions:** Anthropic-compatible `POST https://api.kimi.com/coding/v1/messages`
+  (env override `KIMI_CODE_BASE_URL` for the `/coding/v1` base). Authorization Bearer
+  access token + kimi common headers + `anthropic-version`; `max_tokens` REQUIRED;
+  thinking uses kimi's adaptive variant.
+- **Usage probe (§4.5):** `GET {base}/usages` (`GET /coding/v1/usages` on the default
+  host) with Bearer + common headers. Fetcher: `services/agent/providers/usage.py`
+  `fetch_kimi_usage` — payload shape `{usage, limits[]}` normalized into rows carrying
+  `used` / `limit` / `remaining` / `resets` (plus the usual `used_fraction` /
+  `resets_at` / `status` contract fields when present).
+- **Ownership:** Python-owns-refresh (C++ read-only) — same as `anthropic-sub` /
+  `codex-sub` / `cursor-sub` / `xai-sub`. Credentials under `config.json`
+  `subscription_auth["kimi-sub"]`. Never offline-safe (§5).

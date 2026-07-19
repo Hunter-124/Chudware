@@ -29,6 +29,7 @@ _PROVIDERS = {
     "claude": ("anthropic-sub", "anthropic-sub", "Anthropic Claude (Pro/Max)"),
     "cursor": ("cursor-sub", "cursor", "Cursor (Pro)"),
     "xai": ("xai-sub", "xai-sub", "xAI Grok (SuperGrok / X Premium+)"),
+    "kimi": ("kimi-sub", "kimi-sub", "Moonshot Kimi (Kimi For Coding)"),
 }
 
 ProgressCb = Callable[[dict], None]
@@ -58,6 +59,9 @@ def _instantiate(provider_name: str):
     if provider_name == "xai-sub":
         from .xai_sub_provider import XAISubProvider
         return XAISubProvider()
+    if provider_name == "kimi-sub":
+        from .kimi_sub_provider import KimiSubProvider
+        return KimiSubProvider()
     raise ValueError(f"unknown subscription provider {provider_name!r}")
 
 
@@ -231,14 +235,14 @@ def login(
     resolved = _resolve(provider)
     if resolved is None:
         return {"ok": False, "reason": f"unknown subscription provider {provider!r}",
-                "hint": "Use one of: codex, claude, cursor, xai."}
+                "hint": "Use one of: codex, claude, cursor, xai, kimi."}
     _friendly, name, cred_id, label = resolved
     try:
         prov = _instantiate(name)
         if device and name == "codex-sub":
             cred = prov.login_device()
-        elif name == "xai-sub":
-            # xAI is device-code-only. Always open the verification URL unless the
+        elif name in ("xai-sub", "kimi-sub"):
+            # xAI and Kimi are device-code-only. Always open the verification URL unless the
             # caller explicitly opts out (headless). The previous open_browser=not
             # device inversion meant the GUI's device:true path NEVER opened a
             # browser — that was the "sign-in never reaches a browser" bug.
@@ -295,7 +299,7 @@ def logout(provider: str, account_id: str | None = None) -> dict:
     resolved = _resolve(provider)
     if resolved is None:
         return {"ok": False, "reason": f"unknown subscription provider {provider!r}",
-                "hint": "Use one of: codex, claude, cursor, xai."}
+                "hint": "Use one of: codex, claude, cursor, xai, kimi."}
     friendly, _name, cred_id, _label = resolved
     removed_id = account_id or sub_auth.get_active_account_id(cred_id)
     sub_auth.clear_credential(cred_id, account_id=account_id)
@@ -394,7 +398,7 @@ def switch(provider: str, account_id: str) -> dict:
     resolved = _resolve(provider)
     if resolved is None:
         return {"ok": False, "reason": f"unknown subscription provider {provider!r}",
-                "hint": "Use one of: codex, claude, cursor, xai."}
+                "hint": "Use one of: codex, claude, cursor, xai, kimi."}
     if not account_id or not str(account_id).strip():
         return {"ok": False, "reason": "account_id required", "hint": ""}
     friendly, name, cred_id, label = resolved

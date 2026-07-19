@@ -460,7 +460,7 @@ def provider_offline_safe(provider: Provider) -> bool:
     if name in ("mock", "mock-roles", "base"):
         return True
     if name in ("anthropic", "gemini", "openrouter", "xai",
-                "anthropic-sub", "codex-sub", "cursor-sub", "xai-sub",
+                "anthropic-sub", "codex-sub", "cursor-sub", "xai-sub", "kimi-sub",
                 "claude-cli", "codex-cli"):
         return False  # always cloud (incl. subscription-auth + CLI-subscription providers)
     base_url = getattr(provider, "base_url", None)
@@ -694,7 +694,7 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
                 f"offline mode is enabled (config '{OFFLINE_SETTING}': true): the vLLM serving "
                 f"endpoint {base_url!r} is not loopback, so it is refused before construction.")
     if offline and name in ("anthropic-sub", "codex-sub", "cursor-sub", "xai-sub",
-                            "claude-cli", "codex-cli"):
+                            "kimi-sub", "claude-cli", "codex-cli"):
         # Subscription-auth providers (§4.4) and CLI-subscription drivers always talk to
         # a vendor cloud endpoint (the CLI is just a local front-end).
         raise OfflineModeError(
@@ -890,6 +890,12 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
         from .providers.xai_sub_provider import XAISubProvider, DEFAULT_MODEL
 
         return XAISubProvider(model=cfg.get("model", DEFAULT_MODEL))
+
+    if name == "kimi-sub":
+        # Subscription auth (§4.4): Kimi For Coding device-code OAuth.
+        from .providers.kimi_sub_provider import KimiSubProvider, DEFAULT_MODEL
+
+        return KimiSubProvider(model=cfg.get("model", DEFAULT_MODEL))
 
     if name == "claude-cli":
         # Headless Claude Code CLI — subscription-backed, never offline-safe.

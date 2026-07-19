@@ -131,16 +131,13 @@ inline const std::vector<ModelInfo>& builtinModels() {
         {PROV_CURSOR, "cursor/claude-opus-4-8", "Claude Opus 4.8 (Cursor)", true, true},
         {PROV_CURSOR, "cursor/claude-sonnet-5", "Claude Sonnet 5 (Cursor)", true, true},
         {PROV_CURSOR, "cursor/gpt-5.6-sol", "GPT-5.6 Sol (Cursor)", true, true},
-        // Kimi Code subscription (wire provider "kimi-sub") — distinct from Moonshot API key rows.
-        {PROV_KIMISUB, "kimi-for-coding", "Kimi For Coding (subscription)", true, true},
-        // xAI Grok — multimodal on 4.x; reasoning variants expose effort.
-        // Model ids from hermes-agent catalog / console.x.ai (2026).
-        // grok-4.5 is the current default (500k context; ~$2/$6 per Mtok).
-        // grok-4 original purged (superseded by grok-4.5); keep 4.1 / 4.20-reasoning / build.
+        // Kimi Code subscription (wire provider "kimi-sub") — GUI ids kimi-k3 / kimi-k2.7.
+        // K3 is the CAD-modeling priority model (1M ctx); K2.7 is the lighter secondary (262k).
+        // Wire alias: kimi_sub_provider maps both → "kimi-for-coding" on the subscription endpoint.
+        {PROV_KIMISUB, "kimi-k3", "Kimi K3 (1M)", true, true},
+        {PROV_KIMISUB, "kimi-k2.7", "Kimi K2.7 (262K)", true, true},
+        // xAI Grok — only grok-4.5 is user-visible (500k context; ~$2/$6 per Mtok).
         {PROV_XAI, "grok-4.5", "Grok 4.5 (default, 500k)", true, true},
-        {PROV_XAI, "grok-4-1", "Grok 4.1", true, true},
-        {PROV_XAI, "grok-4.20-0309-reasoning", "Grok 4.20 Reasoning", true, true},
-        {PROV_XAI, "grok-build-0.1", "Grok Build 0.1", true, false},
     };
     return kModels;
 }
@@ -227,12 +224,12 @@ inline const std::vector<LocalPreset>& cloudPresets() {
          "Official DeepSeek API reasoning model (R1).", kDeepSeek},
         // Moonshot (Kimi) — first-class "moonshot" wire provider (keys.moonshot), DIRECT
         // api.moonshot.ai billing. Label says "Moonshot API" to distinguish these rows from
-        // the Kimi Code subscription (PROV_KIMISUB / kimi-for-coding) and from OpenRouter's
-        // live catalog, which also carries Kimi models ("MoonshotAI: …") but bills OpenRouter.
+        // the Kimi Code subscription (PROV_KIMISUB) and from OpenRouter's live catalog.
+        // K3 is the CAD-modeling priority model; K2.7 is secondary.
         {"kimi-k3", "Moonshot API \xc2\xb7 Kimi K3 (1M, $3/$15)", true,
-         "DIRECT api.moonshot.ai — bills keys.moonshot, NOT OpenRouter. 1M context, native vision, always-reasons.", kMoonshot},
-        {"kimi-k2.7-code", "Moonshot API \xc2\xb7 Kimi K2.7 Code (256K)", true,
-         "DIRECT api.moonshot.ai — bills keys.moonshot. Kimi K2.7 Code for lighter/leaf assignments; 256K context, vision.", kMoonshot},
+         "DIRECT api.moonshot.ai — bills keys.moonshot, NOT OpenRouter. 1M context, native vision, always-reasons. Preferred for CAD modeling.", kMoonshot},
+        {"kimi-k2.7", "Moonshot API \xc2\xb7 Kimi K2.7 (262K)", true,
+         "DIRECT api.moonshot.ai — bills keys.moonshot. Kimi K2.7 for lighter/leaf assignments; 262K context, vision.", kMoonshot},
     };
     return kPresets;
 }
@@ -275,9 +272,10 @@ inline int defaultContextWindowForModel(int provider, const std::string& id,
     if (has("gpt-4o") || has("gpt-4-turbo") || has("4o-mini")) return 128000;
     if (has("gpt-3.5")) return 16385;
     if (has("qwen") || has("deepseek")) return 128000;
-    // Moonshot Kimi / Kimi Code — check 256k / k2 / for-coding BEFORE bare kimi-k3
-    // (kimi-k3-256k contains "kimi-k3").
-    if (has("kimi-k3-256k") || has("kimi-k2") || has("kimi-for-coding")) return 262144;
+    // Moonshot Kimi / Kimi Code — check k2.7 / 256k / for-coding BEFORE bare kimi-k3
+    // (kimi-k3-256k contains "kimi-k3"). K3 = 1M; K2.7 = 262k.
+    if (has("kimi-k3-256k") || has("kimi-k2.7") || has("kimi-k2") || has("kimi-for-coding"))
+        return 262144;
     if (has("kimi-k3")) return 1048576;
     // Grok 4.5 ships with a 500k context window; older grok-4.x is ~128k.
     if (has("grok-4.5") || has("grok-4-5")) return 500000;
@@ -289,7 +287,7 @@ inline int defaultContextWindowForModel(int provider, const std::string& id,
         case PROV_CLOUDCOMPAT:
         case PROV_XAI:
         case PROV_CURSOR: return 128000;
-        case PROV_KIMISUB: return 262144;
+        case PROV_KIMISUB: return 1048576;  // default K3 = 1M
         default: return 8192;
     }
 }

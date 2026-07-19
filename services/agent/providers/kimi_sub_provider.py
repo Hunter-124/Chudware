@@ -38,7 +38,21 @@ from . import sub_auth
 log = logging.getLogger("agent.providers.kimi_sub")
 
 PROVIDER_ID = "kimi-sub"
+# Subscription endpoint only accepts "kimi-for-coding". GUI catalog uses kimi-k3 /
+# kimi-k2.7 (K3 is the CAD-modeling priority model); normalize before the wire call.
 DEFAULT_MODEL = "kimi-for-coding"
+_WIRE_ALIASES = {
+    "kimi-k3": "kimi-for-coding",
+    "kimi-k2.7": "kimi-for-coding",
+    "kimi-k2.7-code": "kimi-for-coding",
+    "kimi-for-coding": "kimi-for-coding",
+}
+
+
+def wire_model(model: str | None) -> str:
+    """Map a GUI/catalog model id to the id the Kimi Code subscription accepts."""
+    m = (model or DEFAULT_MODEL).strip()
+    return _WIRE_ALIASES.get(m, DEFAULT_MODEL)
 
 CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098"
 DEFAULT_OAUTH_HOST = "https://auth.kimi.com"
@@ -140,7 +154,7 @@ class KimiSubProvider(Provider):
     supports_vision = True
 
     def __init__(self, model: str = DEFAULT_MODEL) -> None:
-        self.model = model or DEFAULT_MODEL
+        self.model = wire_model(model)
         self._cred = sub_auth.load_credential(PROVIDER_ID)
         self.base_url = _base_url()
 

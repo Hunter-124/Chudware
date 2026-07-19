@@ -8443,7 +8443,7 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
             std::strncpy(s.model, "composer-2.5", sizeof(s.model) - 1);
             s.vision = true;
         } else if (s.provider == ui::PROV_KIMISUB) {
-            std::strncpy(s.model, "kimi-for-coding", sizeof(s.model) - 1);
+            std::strncpy(s.model, "kimi-k3", sizeof(s.model) - 1);
             s.vision = true;
         }
     }
@@ -8760,7 +8760,7 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
             dimText("Kimi Code subscription (OAuth via subscription_auth). Sign in under "
                     "Accounts; no Moonshot API key required for this path.");
             ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
-            ImGui::TextUnformatted("Wire provider: kimi-sub \xc2\xb7 model: kimi-for-coding");
+            ImGui::TextUnformatted("Wire provider: kimi-sub \xc2\xb7 model: kimi-k3 (default)");
             ImGui::PopStyleColor();
         } else {
             dimText("Cursor subscription (OAuth via subscription_auth). Sign in under Accounts; "
@@ -9837,7 +9837,7 @@ static void ovApplyProviderDefaults(Settings& s) {
         std::strncpy(s.model, "composer-2.5", sizeof(s.model) - 1);
         s.vision = true;
     } else if (s.provider == ui::PROV_KIMISUB) {
-        std::strncpy(s.model, "kimi-for-coding", sizeof(s.model) - 1);
+        std::strncpy(s.model, "kimi-k3", sizeof(s.model) - 1);
         s.vision = true;
     }
 }
@@ -10500,7 +10500,7 @@ static void drawOvPromptsTab(AppState& st, float S, bool& changed) {
         ImGui::PopStyleColor();
         if (ImGui::Button("Open Prompts tab\xe2\x80\xa6", ImVec2(-1, 0))) {
             st.openSettings = true;
-            st.openSettingsTab = 4;
+            st.openSettingsTab = 5;  // Prompts (AI=2, Providers=3, Benchmarks=4, Prompts=5)
             st.showAISettingsOverlay = false;
         }
     }
@@ -11868,6 +11868,10 @@ static bool modelRow(AppState& st, int provider, const std::string& id, const st
     ImGui::PushID(uid);
     bool clicked = ImGui::Selectable("##mrow", current,
                                      usable ? 0 : ImGuiSelectableFlags_Disabled, ImVec2(0, rowH));
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+        // Full model name + provider for the composer overlay picker.
+        ImGui::SetTooltip("%s \xe2\x80\x94 %s", label.c_str(), providerShort(provider));
+    }
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
     float midY = (mn.y + mx.y) * 0.5f;

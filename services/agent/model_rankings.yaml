@@ -7,7 +7,7 @@
 #   3. config.json ai_roles_rankings / model_rankings user overrides
 #      (source: user — always wins)
 schema: aicad.model_rankings/1
-notes: public evals 2026-07, replace with measured
+notes: public evals 2026-07 current catalog (Kimi K3 priority for CAD modeling)
 
 models:
   # Rank 5 — frontier band
@@ -15,146 +15,150 @@ models:
     provider: xai
     rank: 5
     source: shipped
-    notes: "public evals 2026-07, replace with measured"
+    notes: "xAI Grok 4.5 (500k) — default SuperGrok frontier"
   - id: grok-4-5
     provider: xai
     rank: 5
     source: shipped
-    notes: "public evals 2026-07 alias, replace with measured"
-  - id: claude-4
+    notes: "grok-4.5 alias (hyphen form used by gym tiers)"
+  - id: claude-opus-4-8
     provider: anthropic
     rank: 5
     source: shipped
-    notes: "public evals 2026-07, replace with measured"
-  - id: claude-sonnet-4
+    notes: "Claude Opus 4.8 flagship"
+  - id: claude-sonnet-5
     provider: anthropic
     rank: 5
     source: shipped
-    notes: "public evals 2026-07, replace with measured"
-  - id: claude-opus-4
-    provider: anthropic
-    rank: 5
-    source: shipped
-    notes: "public evals 2026-07, replace with measured"
-  - id: gpt-5
+    notes: "Claude Sonnet 5"
+  - id: gpt-5.6-sol
     provider: openai
     rank: 5
     source: shipped
-    notes: "public evals 2026-07, replace with measured"
+    notes: "OpenAI GPT-5.6 Sol"
   - id: gemini-2.5-pro
     provider: gemini
     rank: 5
     source: shipped
-    notes: "public evals 2026-07, replace with measured"
+    notes: "Gemini 2.5 Pro"
+  - id: kimi-k3
+    provider: moonshot
+    rank: 5
+    source: shipped
+    notes: "Moonshot Kimi K3 (1M) — preferred CAD modeling model"
   - id: deepseek/deepseek-chat-v3.1
     provider: openrouter
     rank: 5
     source: shipped
-    notes: "mega-16 paid openrouter frontier (no :free); public evals 2026-07"
+    notes: "mega-16 paid openrouter frontier (no :free); keep for auto_pick floor"
   - id: deepseek-chat-v3.1
     provider: openrouter
     rank: 5
     source: shipped
     notes: "mega-16 paid openrouter frontier alias (stem)"
-  - id: kimi-k3
-    provider: moonshot
-    rank: 5
-    source: shipped
-    notes: "Moonshot Kimi K3 flagship (1M ctx, $3/$15); public evals 2026-07"
-  - id: kimi-k3-256k
-    provider: moonshot
-    rank: 5
-    source: shipped
-    notes: "Kimi K3 with a 256k context cap (same wire model, fewer packed tokens)"
-  - id: kimi-k2.7-code
-    provider: moonshot
-    rank: 4
-    source: shipped
-    notes: "Moonshot Kimi K2.7 Code (256K ctx) — the genuinely cheaper Kimi for lighter assignments"
 
-
-  # Rank 4 — strong mid / free strong
+  # Rank 4 — strong mid
   - id: gemini-2.5-flash
     provider: gemini
     rank: 4
     source: shipped
-    notes: "public evals 2026-07, replace with measured"
+    notes: "Gemini 2.5 Flash"
   - id: gemini-flash
     provider: gemini
     rank: 4
     source: shipped
-    notes: "public evals 2026-07, replace with measured"
+    notes: "gemini flash alias"
+  - id: claude-fable-5
+    provider: anthropic
+    rank: 4
+    source: shipped
+    notes: "Claude Fable 5"
+  - id: composer-2.5
+    provider: cursor
+    rank: 4
+    source: shipped
+    notes: "Cursor Composer 2.5"
+  - id: kimi-k2.7
+    provider: moonshot
+    rank: 4
+    source: shipped
+    notes: "Moonshot Kimi K2.7 (262K) — lighter/leaf Kimi assignments"
   - id: qwen3-vl-32b
     provider: openrouter
     rank: 4
     source: shipped
-    notes: "public evals 2026-07, replace with measured"
+    notes: "openrouter Qwen3-VL (integration retained)"
   - id: nvidia/nemotron-ultra:free
     provider: openrouter
     rank: 4
     source: shipped
-    notes: "public evals 2026-07 free tier, replace with measured"
+    notes: "openrouter free tier"
   - id: nemotron-ultra:free
     provider: openrouter
     rank: 4
     source: shipped
-    notes: "public evals 2026-07 free tier alias, replace with measured"
+    notes: "openrouter free tier alias"
 
   # Rank 3 — mid free / small-strong
+  - id: claude-haiku-4-5
+    provider: anthropic
+    rank: 3
+    source: shipped
+    notes: "Claude Haiku 4.5"
   - id: mistral-small
     provider: openrouter
     rank: 3
     source: shipped
-    notes: "public evals 2026-07, replace with measured"
+    notes: "openrouter mistral-small"
   - id: mistralai/mistral-small:free
     provider: openrouter
     rank: 3
     source: shipped
-    notes: "public evals 2026-07 free, replace with measured"
+    notes: "openrouter free mistral"
   - id: google/gemma-3-27b-it:free
     provider: openrouter
     rank: 3
     source: shipped
-    notes: "public evals 2026-07 free, replace with measured"
+    notes: "openrouter free gemma-3-27b"
   - id: meta-llama/llama-3.3-70b-instruct:free
     provider: openrouter
     rank: 3
     source: shipped
-    notes: "public evals 2026-07 free, replace with measured"
+    notes: "openrouter free llama-3.3-70b"
 
   # Rank 2 — small free / large-local utility
   - id: google/gemma-3-12b-it:free
     provider: openrouter
     rank: 2
     source: shipped
-    notes: "public evals 2026-07 free, replace with measured"
+    notes: "openrouter free gemma-3-12b"
   - id: qwen/qwen3-14b:free
     provider: openrouter
     rank: 2
     source: shipped
-    notes: "public evals 2026-07 free, replace with measured"
+    notes: "openrouter free qwen3-14b"
   - id: gemma3-4b-qat
     provider: llamacpp
     rank: 2
     source: shipped
-    notes: "public evals 2026-07 local utility, replace with measured"
+    notes: "local utility"
   - id: gemma-3-4b
     provider: llamacpp
     rank: 2
     source: shipped
-    notes: "public evals 2026-07 local utility alias, replace with measured"
+    notes: "local utility alias"
 
   # Rank 1 — tiny locals
   - id: qwen3-4b
     provider: llamacpp
     rank: 1
     source: shipped
-    notes: "public evals 2026-07 local utility, replace with measured"
+    notes: "local utility"
   - id: gemma4-e4b
     provider: llamacpp
     rank: 1
     source: shipped
-    notes: "public evals 2026-07 local utility, replace with measured"
+    notes: "local utility"
   - id: llama3.2:latest
     provider: ollama
     rank: 1

@@ -238,8 +238,16 @@ void loadSettings(Settings& s) {
         if (s.provider == 3) model = llama.value("model_path", model);
         if (s.provider == 3 && model.empty()) model = kDefaultLlamaModelPath;
         if (s.provider == 6 && model.empty()) model = "grok-4.5";
-        if (s.provider == 8 && model.empty()) model = "kimi-for-coding";
-        if (prov == "moonshot" && model.empty()) model = "kimi-k3";
+        if (s.provider == 8 && model.empty()) model = "kimi-k3";
+        // Stale GUI ids from prior releases → current catalog defaults.
+        if (s.provider == 8 && (model == "kimi-for-coding" || model == "kimi-k2.7-code"))
+            model = "kimi-k3";
+        if (s.provider == 6 && model != "grok-4.5" && model.rfind("grok", 0) == 0)
+            model = "grok-4.5";
+        if (prov == "moonshot") {
+            if (model.empty() || model == "kimi-for-coding") model = "kimi-k3";
+            else if (model == "kimi-k2.7-code") model = "kimi-k2.7";
+        }
         copyStr(s.model, sizeof(s.model), model);
         std::string activeKey = j.value("api_key", "");
         copyStr(s.apiKey, sizeof(s.apiKey), activeKey);
@@ -466,7 +474,7 @@ void saveSettings(const Settings& s) {
         // Kimi Code subscription — OAuth credential lives in subscription_auth (like xai-sub).
         // Distinct from Moonshot API key path (provider "moonshot" / keys.moonshot).
         j["provider"] = "kimi-sub";
-        j["model"] = s.model[0] ? s.model : "kimi-for-coding";
+        j["model"] = s.model[0] ? s.model : "kimi-k3";
     } else if (s.provider == 3) {
         j["provider"] = "llamacpp";
         j["model"] = "local-gguf";

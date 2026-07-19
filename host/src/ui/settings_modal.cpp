@@ -1,5 +1,5 @@
-// AI-CAD Settings modal (Appearance / General / AI / Benchmarks / Prompts / Agent /
-// Experimental tabs) and the About modal.
+// AI-CAD Settings modal (Appearance / General / AI / Providers / Benchmarks /
+// Prompts / Agent / Experimental tabs) and the About modal.
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -177,7 +177,7 @@ static void applyThemeNow(AppState& st, bool light) {
             ui::palette.viewportBottom[0], ui::palette.viewportBottom[1],
             ui::palette.viewportBottom[2]);
 }
-// ---- Subscription accounts (Settings → AI → Accounts) ----------------------
+// ---- Subscription accounts (Settings → Providers → Accounts) ----------------
 // Consumes subscription_accounts / subscription_switch / subscription_login /
 // subscription_logout / subscription_usage. Polls subscription_status for
 // device-code UX fields. Usage is optional per contracts/providers.md §4.5 —
@@ -1525,6 +1525,8 @@ static void drawBenchCategories(AppState& st, float sc) {
                 ImGui::TextUnformatted("\xe2\x80\x94 never run");
                 ImGui::PopStyleColor();
             } else {
+                // Single-line summary: pass-rate bar + % + short when. Full detail_path
+                // lives in a hover tooltip so the narrow column never wraps char-by-char.
                 if (cat.last.passRate >= 0.f) {
                     const float pctW = 40.0f * sc;
                     const float barW = std::max(40.0f * sc,
@@ -1543,13 +1545,12 @@ static void drawBenchCategories(AppState& st, float sc) {
                     ImGui::SameLine(0, 8.0f * sc);
                     dimText(cat.last.when.c_str());
                 }
-                if (!cat.last.detailPath.empty() && ImGui::IsItemHovered())
-                    ImGui::SetTooltip("detail: %s", cat.last.detailPath.c_str());
-                // History: show detail_path as a collapsible one-liner.
-                if (!cat.last.detailPath.empty()) {
-                    ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
-                    ImGui::TextWrapped("%s", cat.last.detailPath.c_str());
-                    ImGui::PopStyleColor();
+                if ((!cat.last.detailPath.empty() || !cat.last.when.empty()) &&
+                    ImGui::IsItemHovered()) {
+                    if (!cat.last.detailPath.empty())
+                        ImGui::SetTooltip("detail: %s", cat.last.detailPath.c_str());
+                    else
+                        ImGui::SetTooltip("%s", cat.last.when.c_str());
                 }
             }
 
@@ -1855,10 +1856,32 @@ static void drawModelRolesSection(AppState& st, float sc) {
         ImGui::EndTable();
     }
 
-    ImGui::Dummy(ImVec2(0, 8.0f * sc));
-    ImGui::TextUnformatted("Model rankings");
+    // Model rankings live on the Benchmarks tab (drawModelRankingsSection).
+}
+
+// Rankings table (Settings → Benchmarks). Polled via model_rankings_get/set.
+// Display filter: only grok-4.5+ and Kimi among Chinese models; integrations stay in data.
+static bool rankingsRowVisible(const std::string& modelId) {
+    std::string m = modelId;
+    for (char& c : m) c = (char)std::tolower((unsigned char)c);
+    auto has = [&](const char* sub) {
+        return m.find(sub) != std::string::npos;
+    };
+    // Hide older Grok variants; keep grok-4.5 / grok-4-5.
+    if (has("grok") && !(has("grok-4.5") || has("grok-4-5"))) return false;
+    // Hide non-Kimi Chinese integrations from the menu (Qwen / DeepSeek / Alibaba).
+    if (has("qwen") || has("deepseek") || has("dashscope") || has("alibaba") ||
+        has("nemotron"))
+        return false;
+    return true;
+}
+
+static void drawModelRankingsSection(AppState& st, float sc) {
+    pollModelRankings(st, /*force=*/false);
+
     dimText("1-5 stars. User overrides persist via model_rankings_set; shipped / "
-            "measured badges come from the rankings file and live bench cycles.");
+            "measured badges come from the rankings file and live bench cycles. "
+            "Kimi K3 is the preferred CAD modeling model.");
 
     if (s_roles.rankingsRpcMissing) {
         ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusWarn));
@@ -1888,6 +1911,7 @@ static void drawModelRolesSection(AppState& st, float sc) {
 
         for (size_t i = 0; i < s_roles.rankings.size(); ++i) {
             auto& row = s_roles.rankings[i];
+            if (!rankingsRowVisible(row.modelId)) continue;
             ImGui::TableNextRow();
             ImGui::PushID((int)i);
 
@@ -1968,8 +1992,8 @@ static const HarnessModeInfo kHarnessModes[] = {
 static constexpr int kHarnessModeCount =
     (int)(sizeof(kHarnessModes) / sizeof(kHarnessModes[0]));
 
-// Settings → AI: compact harness-organization mode list (read-only; mode is chosen in the
-// composer). Eng. Firm per-role model assignments live underneath and write config.json.
+// Settings → AI: compact harness-organization mode list (read-only; mode is chosen
+// in the composer). Mode descriptions live in the intro (?) tooltip.
 static void drawHarnessOrganizationSection(AppState& st, float sc);
 
 // ---- Eng. Firm model assignments (config.json eng_firm.models) ----------------
@@ -2189,10 +2213,6 @@ static void drawEngFirmAssignRow(AppState& st, const char* id, const char* label
 static void drawEngFirmModelAssignments(AppState& st, float sc) {
     if (!s_efModels.loaded) loadEngFirmModelsUi();
 
-    ImGui::Dummy(ImVec2(0, 8.0f * sc));
-    if (!ImGui::CollapsingHeader("Eng. Firm model assignments"))
-        return;
-
     dimText("Empty rows inherit the active chat model. Eng. Firm runs resolve: discipline \xe2\x86\x92 "
             "lead/subcontractor \xe2\x86\x92 chat model.");
 
@@ -2229,16 +2249,33 @@ static void drawEngFirmModelAssignments(AppState& st, float sc) {
 static void drawHarnessOrganizationSection(AppState& st, float sc) {
     dimText("Composer mode picks the org structure. Defaults below \xe2\x80\x94 switch mode from the "
             "copilot composer.");
-
-    ImGui::Dummy(ImVec2(0, 2.0f * sc));
     int active = st.settings.copilotMode;
     if (active < 0 || active >= kHarnessModeCount) active = 0;
+    // Multi-line mode reference for the intro (?): label · structure + description; mark active.
+    {
+        std::string tip;
+        tip.reserve(512);
+        for (int i = 0; i < kHarnessModeCount; ++i) {
+            const auto& m = kHarnessModes[i];
+            if (i) tip += '\n';
+            tip += m.label;
+            tip += " \xc2\xb7 ";
+            tip += m.structure;
+            if (i == active) tip += " (active)";
+            tip += '\n';
+            tip += "  ";
+            tip += m.description;
+        }
+        helpMarker(tip.c_str());
+    }
 
-    // Single always-visible list: mode label + structure + one-line description.
+    ImGui::Dummy(ImVec2(0, 2.0f * sc));
+    // Compact list: bullet + aligned label · structure (+ active). Descriptions stay in (?).
+    const float labelCol = ImGui::GetCursorPosX() + 16.0f * sc;
     for (int i = 0; i < kHarnessModeCount; ++i) {
         const auto& m = kHarnessModes[i];
         ImGui::Bullet();
-        ImGui::SameLine(0, 4.0f * sc);
+        ImGui::SameLine(labelCol);
         if (i == active) {
             ImGui::PushStyleColor(ImGuiCol_Text,
                 ImVec4(ui::palette.accent[0], ui::palette.accent[1],
@@ -2260,18 +2297,14 @@ static void drawHarnessOrganizationSection(AppState& st, float sc) {
             ImGui::TextUnformatted("(active)");
             ImGui::PopStyleColor();
         }
-        ImGui::Indent(16.0f * sc);
-        dimText(m.description);
-        ImGui::Unindent(16.0f * sc);
     }
-
-    drawEngFirmModelAssignments(st, sc);
 }
 
 }  // anonymous namespace
 
 // ---- kSettingsEntries: unified command search table (command_search.cpp) ----
-// Tab indices: 0=Appearance 1=General 2=AI 3=Benchmarks 4=Prompts 5=Agent 6=Experimental
+// Tab indices: 0=Appearance 1=General 2=AI 3=Providers 4=Benchmarks 5=Prompts
+// 6=Agent 7=Experimental
 // One entry per prominent field/section; labels mirror the modal's visible text.
 const SettingsEntry kSettingsEntries[] = {
     // Appearance (tab 0)
@@ -2295,63 +2328,64 @@ const SettingsEntry kSettingsEntries[] = {
     { "C++ core",                 "General",      1 },
     { "Performance profiler",     "General",      1 },
     { "Profiler",                 "General",      1 },
-    // AI (tab 2)
-    { "AI provider",              "AI",           2 },
-    { "Model",                    "AI",           2 },
-    { "API key",                  "AI",           2 },
-    { "Gemini key",               "AI",           2 },
-    { "Anthropic key",            "AI",           2 },
-    { "OpenAI key",               "AI",           2 },
-    { "Cloud API key",            "AI",           2 },
-    { "Moonshot",                 "AI",           2 },
-    { "Kimi",                     "AI",           2 },
-    { "Moonshot key",             "AI",           2 },
-    { "Vision",                   "AI",           2 },
+    // AI (tab 2) — roles, harness, privacy, maintenance (no provider/accounts)
     { "Offline mode",             "AI",           2 },
     { "Reasoning effort",         "AI",           2 },
-    { "Max response tokens",      "AI",           2 },
-    { "Model context window",     "AI",           2 },
-    { "Local endpoint",           "AI",           2 },
     { "Manage models",            "AI",           2 },
-    { "Accounts",                 "AI",           2 },
-    { "Subscription accounts",    "AI",           2 },
-    { "Sign in",                  "AI",           2 },
     { "Model roles",              "AI",           2 },
-    { "Model rankings",           "AI",           2 },
+    { "Model rankings",           "Benchmarks",   4 },
     { "Hidden models",            "AI",           2 },
     { "Harness organization",     "AI",           2 },
     { "Copilot mode",             "AI",           2 },
     { "Mode defaults",            "AI",           2 },
     { "Eng. Firm",                "AI",           2 },
+    { "Eng. Firm model assignments", "AI",        2 },
     { "Swarm",                    "AI",           2 },
-    // Benchmarks (tab 3)
-    { "Benchmarks",               "Benchmarks",   3 },
-    { "Model leaderboard",        "Benchmarks",   3 },
-    { "Run benchmark",            "Benchmarks",   3 },
-    { "Benchmark",                "Benchmarks",   3 },
-    { "Benchmark categories",     "Benchmarks",   3 },
-    { "Category run",             "Benchmarks",   3 },
-    // Prompts (tab 4)
-    { "Role prompts",             "Prompts",      4 },
-    { "Agent prompts",            "Prompts",      4 },
-    { "Prompt editor",            "Prompts",      4 },
-    { "System prompt",            "Prompts",      4 },
-    { "System prompt override",   "Prompts",      4 },
-    // Agent (tab 5)
-    { "Plan before building",     "Agent",        5 },
-    { "Plan mode",                "Agent",        5 },
-    { "Refine-pass cap",          "Agent",        5 },
-    { "Max iters",                "Agent",        5 },
-    { "Iteration budget",         "Agent",        5 },
-    { "Eng. Firm budget",         "Agent",        5 },
-    { "Company budget",           "Agent",        5 },
-    // Experimental (tab 6)
-    { "Vision review model",      "Experimental", 6 },
-    { "Model routing",            "Experimental", 6 },
-    { "Seek-CAD split",           "Experimental", 6 },
-    { "Parametric sequence mode", "Experimental", 6 },
-    { "CAD sequence mode",        "Experimental", 6 },
-    { "Feature sequence",         "Experimental", 6 },
+    // Providers (tab 3) — provider/model, keys, Moonshot, accounts
+    { "AI provider",              "Providers",    3 },
+    { "Provider & Model",         "Providers",    3 },
+    { "Model",                    "Providers",    3 },
+    { "API key",                  "Providers",    3 },
+    { "Gemini key",               "Providers",    3 },
+    { "Anthropic key",            "Providers",    3 },
+    { "OpenAI key",               "Providers",    3 },
+    { "Cloud API key",            "Providers",    3 },
+    { "Moonshot",                 "Providers",    3 },
+    { "Kimi",                     "Providers",    3 },
+    { "Moonshot key",             "Providers",    3 },
+    { "Vision",                   "Providers",    3 },
+    { "Local endpoint",           "Providers",    3 },
+    { "Accounts",                 "Providers",    3 },
+    { "Subscription accounts",    "Providers",    3 },
+    { "Sign in",                  "Providers",    3 },
+    // Benchmarks (tab 4)
+    { "Benchmarks",               "Benchmarks",   4 },
+    { "Model leaderboard",        "Benchmarks",   4 },
+    { "Run benchmark",            "Benchmarks",   4 },
+    { "Benchmark",                "Benchmarks",   4 },
+    { "Benchmark categories",     "Benchmarks",   4 },
+    { "Category run",             "Benchmarks",   4 },
+    // Prompts (tab 5)
+    { "Role prompts",             "Prompts",      5 },
+    { "Agent prompts",            "Prompts",      5 },
+    { "Prompt editor",            "Prompts",      5 },
+    { "System prompt",            "Prompts",      5 },
+    { "System prompt override",   "Prompts",      5 },
+    // Agent (tab 6)
+    { "Plan before building",     "Agent",        6 },
+    { "Plan mode",                "Agent",        6 },
+    { "Refine-pass cap",          "Agent",        6 },
+    { "Max iters",                "Agent",        6 },
+    { "Iteration budget",         "Agent",        6 },
+    { "Eng. Firm budget",         "Agent",        6 },
+    { "Company budget",           "Agent",        6 },
+    // Experimental (tab 7)
+    { "Vision review model",      "Experimental", 7 },
+    { "Model routing",            "Experimental", 7 },
+    { "Seek-CAD split",           "Experimental", 7 },
+    { "Parametric sequence mode", "Experimental", 7 },
+    { "CAD sequence mode",        "Experimental", 7 },
+    { "Feature sequence",         "Experimental", 7 },
 };
 const int kSettingsEntryCount =
     (int)(sizeof(kSettingsEntries) / sizeof(kSettingsEntries[0]));
@@ -2799,40 +2833,18 @@ void drawSettingsModal(AppState& st, bool busy) {
 
                 // Glass-grouped sections — each child owns its label+widget pairs so a scroll
                 // boundary can never orphan a caption (the unlabeled "0" max-tokens bug).
-                settingsGlassSectionBegin("##ai_provider", "Provider & Model");
-                ui::drawAiSettingsSection(st, busy, ui::AiSettingsSection::ProviderModel);
+                // Provider/Accounts/Moonshot live on the Providers tab; Generation is gone
+                // (effort stays on the composer + per-role Thinking columns).
+                settingsGlassSectionBegin("##ai_model_roles", "Model roles");
+                drawModelRolesSection(st, sc);
                 settingsGlassSectionEnd();
 
-                settingsGlassSectionBegin("##ai_accounts", "Accounts");
-                drawSubscriptionAccounts(st, sc);
+                settingsGlassSectionBegin("##ai_eng_firm", "Eng. Firm model assignments");
+                drawEngFirmModelAssignments(st, sc);
                 settingsGlassSectionEnd();
 
-                // Moonshot key is first-class (keys.moonshot) and can be parked while another
-                // provider stays active — surface it even when Provider & Model isn't on Moonshot.
-                settingsGlassSectionBegin("##ai_moonshot", "Moonshot (Kimi)");
-                dimText("Configured but not the active provider. Store a key to park credit; "
-                        "pick a Kimi model later when you want to use it.");
-                ImGui::TextUnformatted("API key (platform.moonshot.ai)");
-                ImGui::SetNextItemWidth(-1);
-                if (ImGui::InputText("##settings_moonshot_key", st.settings.moonshotKey,
-                                     sizeof(st.settings.moonshotKey),
-                                     ImGuiInputTextFlags_Password)) {
-                    saveSettings(st.settings);
-                }
-                {
-                    const bool have = st.settings.moonshotKey[0] != '\0';
-                    ImGui::PushStyleColor(ImGuiCol_Text,
-                        have ? ui::Palette::toU32(ui::palette.statusOk)
-                             : ui::Palette::toU32(ui::palette.statusWarn));
-                    ImGui::TextUnformatted(have
-                        ? "key set \xe2\x80\x94 Kimi models appear in the picker when enabled"
-                        : "no key \xe2\x80\x94 paste a Moonshot API key when you have credit");
-                    ImGui::PopStyleColor();
-                }
-                settingsGlassSectionEnd();
-
-                settingsGlassSectionBegin("##ai_generation", "Generation");
-                ui::drawAiSettingsSection(st, busy, ui::AiSettingsSection::Generation);
+                settingsGlassSectionBegin("##ai_harness_org", "Harness organization");
+                drawHarnessOrganizationSection(st, sc);
                 settingsGlassSectionEnd();
 
                 settingsGlassSectionBegin("##ai_privacy", "Privacy");
@@ -2842,19 +2854,11 @@ void drawSettingsModal(AppState& st, bool busy) {
                 settingsGlassSectionBegin("##ai_benchmarks_link", "Benchmarks");
                 dimText("Leaderboard, category runs, and live status live on the Benchmarks tab.");
                 if (ImGui::SmallButton("Open Benchmarks tab")) {
-                    // Re-arm openSettingsTab so the next frame selects Benchmarks (index 3).
-                    st.openSettingsTab = 3;
+                    // Re-arm openSettingsTab so the next frame selects Benchmarks (index 4).
+                    st.openSettingsTab = 4;
                 }
                 if (ImGui::IsItemHovered())
                     ImGui::SetTooltip("Jump to Settings \xe2\x86\x92 Benchmarks");
-                settingsGlassSectionEnd();
-
-                settingsGlassSectionBegin("##ai_model_roles", "Model roles");
-                drawModelRolesSection(st, sc);
-                settingsGlassSectionEnd();
-
-                settingsGlassSectionBegin("##ai_harness_org", "Harness organization");
-                drawHarnessOrganizationSection(st, sc);
                 settingsGlassSectionEnd();
 
                 settingsGlassSectionBegin("##ai_maintenance", "Maintenance");
@@ -2882,9 +2886,54 @@ void drawSettingsModal(AppState& st, bool busy) {
                 settingsTabBodyEnd();
                 ImGui::EndTabItem();
             }
+
+            // ---- Providers tab: provider/model, Moonshot key parking, subscription accounts ----
+            if (ImGui::BeginTabItem("Providers", nullptr,
+                                    (jumpToTab == 3) ? ImGuiTabItemFlags_SetSelected
+                                                     : ImGuiTabItemFlags_None)) {
+                settingsTabBodyBegin("##tab_providers");
+                dimText(("API providers, keys, and subscription accounts. Stored in " +
+                         configPath() + ".").c_str());
+
+                settingsGlassSectionBegin("##prov_provider", "Provider & Model");
+                ui::drawAiSettingsSection(st, busy, ui::AiSettingsSection::ProviderModel);
+                settingsGlassSectionEnd();
+
+                // Moonshot key is first-class (keys.moonshot) and can be parked while another
+                // provider stays active — surface it even when Provider & Model isn't on Moonshot.
+                settingsGlassSectionBegin("##prov_moonshot", "Moonshot (Kimi)");
+                dimText("Configured but not the active provider. Store a key to park credit; "
+                        "pick a Kimi model later when you want to use it.");
+                ImGui::TextUnformatted("API key (platform.moonshot.ai)");
+                ImGui::SetNextItemWidth(-1);
+                if (ImGui::InputText("##settings_moonshot_key", st.settings.moonshotKey,
+                                     sizeof(st.settings.moonshotKey),
+                                     ImGuiInputTextFlags_Password)) {
+                    saveSettings(st.settings);
+                }
+                {
+                    const bool have = st.settings.moonshotKey[0] != '\0';
+                    ImGui::PushStyleColor(ImGuiCol_Text,
+                        have ? ui::Palette::toU32(ui::palette.statusOk)
+                             : ui::Palette::toU32(ui::palette.statusWarn));
+                    ImGui::TextUnformatted(have
+                        ? "key set \xe2\x80\x94 Kimi models appear in the picker when enabled"
+                        : "no key \xe2\x80\x94 paste a Moonshot API key when you have credit");
+                    ImGui::PopStyleColor();
+                }
+                settingsGlassSectionEnd();
+
+                settingsGlassSectionBegin("##prov_accounts", "Accounts");
+                drawSubscriptionAccounts(st, sc);
+                settingsGlassSectionEnd();
+
+                settingsTabBodyEnd();
+                ImGui::EndTabItem();
+            }
+
             // ---- Benchmarks tab: categories + leaderboard + legacy runner ----
             if (ImGui::BeginTabItem("Benchmarks", nullptr,
-                                    (jumpToTab == 3) ? ImGuiTabItemFlags_SetSelected
+                                    (jumpToTab == 4) ? ImGuiTabItemFlags_SetSelected
                                                      : ImGuiTabItemFlags_None)) {
                 settingsTabBodyBegin("##tab_benchmarks");
                 // Shared leaderboard board (refreshed by runner / refresh button).
@@ -2918,13 +2967,16 @@ void drawSettingsModal(AppState& st, bool busy) {
                 drawBenchRunner(st, sc, s_lb, s_lbLast);
                 settingsGlassSectionEnd();
 
+                settingsGlassSectionBegin("##bench_model_rankings", "Model rankings");
+                drawModelRankingsSection(st, sc);
+
                 settingsTabBodyEnd();
                 ImGui::EndTabItem();
             }
 
             // --- C22b: Prompts tab (role prompt editor + system-prompt override) ---
             if (ImGui::BeginTabItem("Prompts", nullptr,
-                                    (jumpToPrompts || jumpToTab == 4) ? ImGuiTabItemFlags_SetSelected
+                                    (jumpToPrompts || jumpToTab == 5) ? ImGuiTabItemFlags_SetSelected
                                                                       : ImGuiTabItemFlags_None)) {
                 settingsTabBodyBegin("##tab_prompts");
                 settingsSectionHeader("Role prompts", /*first=*/true);
@@ -3066,7 +3118,7 @@ void drawSettingsModal(AppState& st, bool busy) {
             bool wantSettingsSel = st.wantSettings && !s_wantSettingsTabDone;
             if (wantSettingsSel) s_wantSettingsTabDone = true;
             if (ImGui::BeginTabItem("Agent", nullptr,
-                                    (wantSettingsSel || jumpToTab == 5) ? ImGuiTabItemFlags_SetSelected
+                                    (wantSettingsSel || jumpToTab == 6) ? ImGuiTabItemFlags_SetSelected
                                                                         : ImGuiTabItemFlags_None)) {
                 settingsTabBodyBegin("##tab_agent");
                 settingsSectionHeader("Run behavior", /*first=*/true);
@@ -3108,7 +3160,7 @@ void drawSettingsModal(AppState& st, bool busy) {
 
             // ---- Experimental tab: research-backed opt-in AI features ----
             if (ImGui::BeginTabItem("Experimental", nullptr,
-                                    (jumpToTab == 6) ? ImGuiTabItemFlags_SetSelected
+                                    (jumpToTab == 7) ? ImGuiTabItemFlags_SetSelected
                                                      : ImGuiTabItemFlags_None)) {
                 settingsTabBodyBegin("##tab_experimental");
                 dimText("Opt-in, default-off features from the model/provider research. All run "

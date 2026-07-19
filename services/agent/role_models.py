@@ -230,9 +230,10 @@ def _measured_rank_from_pass_rate(pass_rate: float) -> int:
 # xAI is spending-limit-blocked — floor it so analysis min_rank does not collapse
 # to ollama-all (axis Y).
 _FRONTIER_RANK_FLOOR_IDS = frozenset({
-    "grok-4.5", "grok-4-5", "grok-4.20", "grok-4",
-    "claude-4", "claude-sonnet-4", "claude-opus-4",
-    "gpt-5", "gemini-2.5-pro",
+    "grok-4.5", "grok-4-5",
+    "claude-opus-4-8", "claude-sonnet-5",
+    "gpt-5.6-sol", "gemini-2.5-pro",
+    "kimi-k3",
     "deepseek/deepseek-chat-v3.1", "deepseek-chat-v3.1",
     "deepseek/deepseek-chat-v3", "deepseek-chat-v3",
 })

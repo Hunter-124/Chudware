@@ -21,13 +21,15 @@ from .openai_provider import OpenAIProvider
 DEFAULT_MODEL = "kimi-k3"
 BASE_URL = "https://api.moonshot.ai/v1"
 
-# Alias id → wire id. The API only accepts `kimi-k3`; `kimi-k3-256k` is our
-# context-capped profile (see module docstring) and must be normalized here.
+# Alias id → wire id. K3 is a single API model (`kimi-k3`); K2.7 ships as
+# `kimi-k2.7-code` on the official API. GUI catalog uses the short ids.
 _WIRE_ALIASES = {
     "kimi-k3-256k": "kimi-k3",
     "kimi-k3-1m": "kimi-k3",
     "moonshotai/kimi-k3": "kimi-k3",
     "kimi-latest": "kimi-k3",
+    "kimi-k2.7": "kimi-k2.7-code",
+    "kimi-k2.7-code": "kimi-k2.7-code",
 }
 
 

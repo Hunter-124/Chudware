@@ -1987,6 +1987,20 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                 )
             except Exception:  # noqa: BLE001 — AI-VC never breaks the turn
                 pass
+            # Managed-mode project vault checkpoint (author=ai) — complements
+            # AI-VC. Precedence lives in plm_bridge: managed ai_mode > env > off.
+            try:
+                from services.agent.plm_bridge import (  # noqa: PLC0415
+                    maybe_vault_checkpoint_on_tool,
+                )
+                maybe_vault_checkpoint_on_tool(
+                    tool, args, result,
+                    run_id=run_id,
+                    ledger=ledger,
+                    summary=f"AI edit via {tool}.",
+                )
+            except Exception:  # noqa: BLE001 — vault bridge never breaks the turn
+                pass
 
         # mega-2 / C1 AC2–AC4 grading path: when the model runs fit_calc /
         # fit_report / bolt_circle / verify_battery successfully, mirror the

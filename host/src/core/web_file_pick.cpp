@@ -83,6 +83,34 @@ extern "C" EMSCRIPTEN_KEEPALIVE void billet_ws_browse_done(int ok, const char* p
 extern "C" void billet_ws_browse(int mode, const char* accept, const char* suggested);
 
 
+// Take a pick result already posted by JS (upload button / external deliver).
+// Does not open a file picker and does not sleep.
+bool consumePickedFile(PickedFile& out, std::string& err) {
+    err.clear();
+    out = {};
+    if (g_pick.done == 0) {
+        err = "no pending upload";
+        return false;
+    }
+    if (g_pick.done < 0) {
+        if (g_pick.err[0]) err = g_pick.err;
+        g_pick.done = 0;
+        return false;
+    }
+    out.name = g_pick.name;
+    if (g_pick.data && g_pick.len > 0) {
+        out.data.assign(g_pick.data, g_pick.data + g_pick.len);
+    }
+    if (g_pick.data) {
+        free(g_pick.data);
+        g_pick.data = nullptr;
+        g_pick.len = 0;
+    }
+    g_pick.done = 0;
+    g_pick.name[0] = '\0';
+    return !out.name.empty() && !out.data.empty();
+}
+
 bool pickFile(const char* accept, PickedFile& out, std::string& err) {
     err.clear();
     out = {};
@@ -95,8 +123,10 @@ bool pickFile(const char* accept, PickedFile& out, std::string& err) {
         g_pick.len = 0;
     }
 
-    // Fire the <input type=file> on the browser main thread.
-    MAIN_THREAD_EM_ASM({
+    // Already on the browser main thread (main-thread ImGui + ASYNCIFY, no
+    // PROXY_TO_PTHREAD). MAIN_THREAD_EM_ASM from the main thread can re-enter
+    // under ASYNCIFY and blow the stack — use plain EM_ASM (see app.cpp note).
+    EM_ASM({
         var accept = UTF8ToString($0);
         var input = document.createElement('input');
         input.type = 'file';
@@ -108,9 +138,21 @@ bool pickFile(const char* accept, PickedFile& out, std::string& err) {
             if (finished) return;
             finished = true;
             try { document.body.removeChild(input); } catch (e) {}
+            try { window.removeEventListener('focus', onFocus); } catch (e) {}
+            if (typeof Module === 'undefined' || !Module._billet_file_pick_done) return;
             if (ok && data && len > 0) {
                 var ptr = Module._malloc(len);
-                HEAPU8.set(data, ptr);
+                if (!ptr) {
+                    Module._billet_file_pick_done(0, 0, 0, 0, 0);
+                    return;
+                }
+                var heap = Module.HEAPU8;
+                var CHUNK = 1 << 20;
+                for (var off = 0; off < len; off += CHUNK) {
+                    var end = off + CHUNK;
+                    if (end > len) end = len;
+                    heap.set(data.subarray(off, end), ptr + off);
+                }
                 var namePtr = 0;
                 if (name) {
                     var nb = lengthBytesUTF8(name) + 1;
@@ -147,15 +189,20 @@ bool pickFile(const char* accept, PickedFile& out, std::string& err) {
             };
             reader.readAsArrayBuffer(f);
         });
-        // Cancel detection: focus returns without a change event.
+        // Cancel detection: focus returns without a change event. Long delay so
+        // slow native picker UI / FileReader start isn't raced (was 400ms).
         function onFocus() {
             setTimeout(function() {
                 if (!finished) finish(0, null, null, 0, null);
-                window.removeEventListener('focus', onFocus);
-            }, 400);
+                try { window.removeEventListener('focus', onFocus); } catch (e) {}
+            }, 1500);
         }
         window.addEventListener('focus', onFocus);
-        input.click();
+        // May be blocked without a user gesture — prefer the workspace-dialog
+        // upload button path which opens the input inside the click handler.
+        try { input.click(); } catch (e) {
+            finish(0, null, null, 0, 'File picker blocked');
+        }
     }, accept ? accept : "");
 
     // ASYNCIFY yield (main-thread ImGui model — no PROXY_TO_PTHREAD): unwind back to the
@@ -165,20 +212,7 @@ bool pickFile(const char* accept, PickedFile& out, std::string& err) {
         emscripten_sleep(20);
     }
 
-    if (g_pick.done < 0) {
-        if (g_pick.err[0]) err = g_pick.err;
-        return false;
-    }
-    out.name = g_pick.name;
-    if (g_pick.data && g_pick.len > 0) {
-        out.data.assign(g_pick.data, g_pick.data + g_pick.len);
-    }
-    if (g_pick.data) {
-        free(g_pick.data);
-        g_pick.data = nullptr;
-        g_pick.len = 0;
-    }
-    return !out.name.empty();
+    return consumePickedFile(out, err);
 }
 
 std::string promptSaveFilename(const char* suggested) {
@@ -225,6 +259,12 @@ std::string browseWorkspace(WorkspaceBrowseMode mode,
 bool pickFile(const char* /*accept*/, PickedFile& out, std::string& err) {
     out = {};
     err = "pickFile is only available in the web build";
+    return false;
+}
+
+bool consumePickedFile(PickedFile& out, std::string& err) {
+    out = {};
+    err = "consumePickedFile is only available in the web build";
     return false;
 }
 

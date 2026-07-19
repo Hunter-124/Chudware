@@ -31,6 +31,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <map>
 #include <vector>
 #include <unordered_map>
@@ -470,67 +471,83 @@ static void drawStatusGlyph(const std::string& status, float box) {
 // Animated hammer striking an anvil — the "AI is working" busy affordance for the chat column.
 // ImDrawList-only, driven by GetTime(); colors via palette / chatSurf (theme lint).
 // Sized to `box` (logical height of the glyph cell). Caller places it with Dummy/SetCursor.
+// Tuned for the compact composer-prelude slot (~frame height); still reads at the older 28px size.
 static void drawForgingAnimation(float box) {
     const auto& pal = ui::palette;
     const ui::AdaptiveSurface& surf = chatSurf();
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 p0 = ImGui::GetCursorScreenPos();
     const ImVec2 c(p0.x + box * 0.5f, p0.y + box * 0.5f);
-    const float sc = box / 28.0f;
+    const float sc = box / 22.0f;  // unit grid: denser silhouette at prelude size
     const float t = (float)ImGui::GetTime();
     // Strike cycle ~2.4 Hz: hammer rises, then snaps down onto the anvil.
     const float cycle = std::fmod(t * 2.4f, 1.0f);
     const bool striking = cycle > 0.55f;
     const float lift = striking
-        ? (1.0f - (cycle - 0.55f) / 0.45f) * 0.15f   // snap down
-        : (cycle / 0.55f) * 0.85f;                    // rise
+        ? (1.0f - (cycle - 0.55f) / 0.45f) * 0.12f   // snap down
+        : (cycle / 0.55f) * 0.78f;                    // rise
     const float ang = striking
-        ? (-0.55f + (1.0f - (cycle - 0.55f) / 0.45f) * 0.95f)
-        : (-0.55f - (cycle / 0.55f) * 0.85f);
+        ? (-0.48f + (1.0f - (cycle - 0.55f) / 0.45f) * 0.82f)
+        : (-0.48f - (cycle / 0.55f) * 0.78f);
 
     ImU32 anvilCol = ImGui::ColorConvertFloat4ToU32(semanticOnGlass(pal.accentMid, surf));
-    ImU32 hammerCol = ImGui::ColorConvertFloat4ToU32(semanticOnGlass(pal.accent, surf));
+    ImU32 faceCol  = ImGui::ColorConvertFloat4ToU32(semanticOnGlass(pal.accent, surf));
+    ImU32 hammerCol = faceCol;
     ImU32 sparkCol = ImGui::ColorConvertFloat4ToU32(semanticOnGlass(pal.statusWarn, surf));
-    ImU32 dimCol = ImGui::ColorConvertFloat4ToU32(surf.textTertiary);
+    ImU32 haftCol = ImGui::ColorConvertFloat4ToU32(surf.textTertiary);
 
-    // Anvil body (base + horn).
-    const float baseY = c.y + 7.0f * sc;
-    dl->AddRectFilled(ImVec2(c.x - 9.0f * sc, baseY - 2.0f * sc),
-                      ImVec2(c.x + 9.0f * sc, baseY + 3.0f * sc), anvilCol, 1.5f * sc);
-    dl->AddRectFilled(ImVec2(c.x - 6.0f * sc, baseY + 3.0f * sc),
-                      ImVec2(c.x + 6.0f * sc, baseY + 7.0f * sc), anvilCol, 1.0f * sc);
-    dl->AddTriangleFilled(ImVec2(c.x + 9.0f * sc, baseY - 2.0f * sc),
-                          ImVec2(c.x + 14.0f * sc, baseY - 1.0f * sc),
-                          ImVec2(c.x + 9.0f * sc, baseY + 2.0f * sc), anvilCol);
+    // Anvil — waist + broad face + short horn (reads as silhouette at ~18–22px).
+    const float faceY = c.y + 5.2f * sc;
+    const float faceT = 2.4f * sc;
+    // Top face (slightly lighter accent so the strike target pops).
+    dl->AddRectFilled(ImVec2(c.x - 7.5f * sc, faceY - faceT),
+                      ImVec2(c.x + 7.5f * sc, faceY), faceCol, 1.2f * sc);
+    // Body / waist under the face.
+    dl->AddRectFilled(ImVec2(c.x - 4.2f * sc, faceY),
+                      ImVec2(c.x + 4.2f * sc, faceY + 3.6f * sc), anvilCol, 0.8f * sc);
+    // Base foot.
+    dl->AddRectFilled(ImVec2(c.x - 6.5f * sc, faceY + 3.6f * sc),
+                      ImVec2(c.x + 6.5f * sc, faceY + 5.4f * sc), anvilCol, 1.0f * sc);
+    // Horn (right) — sharp triangle, not a soft blob.
+    dl->AddTriangleFilled(ImVec2(c.x + 7.5f * sc, faceY - faceT),
+                          ImVec2(c.x + 11.5f * sc, faceY - faceT * 0.35f),
+                          ImVec2(c.x + 7.5f * sc, faceY - 0.2f * sc), anvilCol);
+    // Heel notch (left) — tiny step so the silhouette isn't a plain bar.
+    dl->AddRectFilled(ImVec2(c.x - 9.0f * sc, faceY - faceT * 0.55f),
+                      ImVec2(c.x - 7.5f * sc, faceY - 0.15f * sc), anvilCol, 0.6f * sc);
 
     // Hammer pivot above the face; head + handle rotate about the pivot.
-    const ImVec2 pivot(c.x - 2.0f * sc, c.y - 2.0f * sc - lift * 10.0f * sc);
+    const ImVec2 pivot(c.x - 1.5f * sc, c.y - 1.2f * sc - lift * 8.5f * sc);
     const float ca = std::cos(ang), sa = std::sin(ang);
     auto rot = [&](float x, float y) -> ImVec2 {
         return ImVec2(pivot.x + x * ca - y * sa, pivot.y + x * sa + y * ca);
     };
-    // Handle
-    dl->AddLine(rot(0.0f, 0.0f), rot(0.0f, -11.0f * sc), dimCol, ui::metrics::stroke(2.2f));
-    // Head
-    ImVec2 h0 = rot(-4.5f * sc, -11.0f * sc);
-    ImVec2 h1 = rot( 4.5f * sc, -11.0f * sc);
-    ImVec2 h2 = rot( 4.5f * sc, -7.0f * sc);
-    ImVec2 h3 = rot(-4.5f * sc, -7.0f * sc);
+    // Handle — slightly thicker stroke so it survives downscale.
+    dl->AddLine(rot(0.0f, 0.5f * sc), rot(0.0f, -9.5f * sc), haftCol, ui::metrics::stroke(1.8f));
+    // Head — short peen + longer face (asymmetric so it reads as a hammer, not a bar).
+    ImVec2 h0 = rot(-5.0f * sc, -9.5f * sc);
+    ImVec2 h1 = rot( 3.6f * sc, -9.5f * sc);
+    ImVec2 h2 = rot( 3.6f * sc, -6.2f * sc);
+    ImVec2 h3 = rot(-5.0f * sc, -6.2f * sc);
     dl->AddQuadFilled(h0, h1, h2, h3, hammerCol);
 
-    // Sparks on impact.
-    if (striking && cycle < 0.78f) {
-        const float sp = (cycle - 0.55f) / 0.23f;
-        for (int i = 0; i < 5; ++i) {
-            float a = -1.2f + i * 0.55f;
-            float d = (3.0f + i * 1.2f) * sc * (0.4f + sp);
-            ImU32 scc = (sparkCol & 0x00FFFFFFu) | ((ImU32)((1.0f - sp) * 220) << 24);
-            dl->AddCircleFilled(ImVec2(c.x + std::cos(a) * d, baseY - 2.0f * sc - std::sin(a) * d * 0.6f),
-                                1.1f * sc, scc);
+    // Sparks on impact — fewer, smaller, fade fast (subtle at prelude size).
+    if (striking && cycle < 0.72f) {
+        const float sp = (cycle - 0.55f) / 0.17f;
+        const float fade = (1.0f - sp) * (1.0f - sp);
+        for (int i = 0; i < 4; ++i) {
+            float a = -1.05f + i * 0.62f;
+            float d = (2.2f + i * 0.95f) * sc * (0.35f + sp * 0.9f);
+            ImU32 scc = (sparkCol & 0x00FFFFFFu) | ((ImU32)(fade * 180) << 24);
+            dl->AddCircleFilled(
+                ImVec2(c.x + std::cos(a) * d,
+                       faceY - faceT * 0.4f - std::sin(a) * d * 0.55f),
+                0.85f * sc, scc);
         }
     }
     ImGui::Dummy(ImVec2(box, box));
 }
+
 
 
 // A "bubble" = an auto-height child painted over an explicit glassPanel fill, ported from
@@ -2329,6 +2346,14 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             }
         }
     } else if (kind == "plan_steps") {
+        // C++ model checklist: {steps: string[], total}. Prefer plan_state (model:N ids)
+        // as the single source of truth — if an event-driven checklist already arrived
+        // for this turn, ignore legacy plan_steps so we don't double the task list as
+        // step:N beside model:N.
+        if (m.planState.present && m.planState.fromEvent) {
+            // Still allow status-only model_step updates later; just don't synthesize rows.
+            return;
+        }
         // C++ model checklist: {steps: string[], total}. Merge step:* items by id —
         // never wipe foreign namespaces (edit:/mission:/firm:) even when fromEvent.
         PlanState& ps = ensureDerivedPlan();
@@ -2406,32 +2431,43 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             ++ps.revision;
         }
     } else if (kind == "model_step") {
-        // Live step progress: {index, total, step}. Prefer id-matched step:* rows;
-        // also advance ordinal step/task/part rows. Safe alongside event plan_state.
+        // Live step progress: {index, total, step}. Prefer model:N (plan_state checklist)
+        // then bare step:N. Safe alongside event plan_state.
         int idx = jint(data, "index");
         std::string stepTxt = jstr(data, "step");
         std::string idHint = jstr(data, "id");
-        if (idHint.empty()) idHint = "step:" + std::to_string(idx);
-        if (PlanItem* byId = findPlanItem(idHint)) {
+        if (idHint.empty()) {
+            // Prefer model:N when plan_state checklist is the source of truth.
+            if (m.planState.present && m.planState.fromEvent)
+                idHint = "model:" + std::to_string(idx);
+            else
+                idHint = "step:" + std::to_string(idx);
+        }
+        PlanItem* byId = findPlanItem(idHint);
+        if (!byId && idHint.rfind("model:", 0) == 0)
+            byId = findPlanItem("step:" + std::to_string(idx));
+        if (!byId && idHint.rfind("step:", 0) == 0)
+            byId = findPlanItem("model:" + std::to_string(idx));
+        if (byId) {
             byId->status = "running";
             if (!stepTxt.empty() && byId->title.empty()) byId->title = stepTxt;
-            // Mark earlier bare steps done.
+            // Mark earlier bare steps / model:N steps done.
             for (auto& it : m.planState.items) {
-                if (it.id == idHint) continue;
-                if (it.id.rfind("step:", 0) != 0) continue;
-                // step:N numeric — mark N < idx done
-                if (it.id.size() > 5) {
-                    bool num = true;
-                    for (size_t k = 5; k < it.id.size(); ++k)
-                        if (it.id[k] < '0' || it.id[k] > '9') { num = false; break; }
-                    if (num) {
-                        int n = 0;
-                        try { n = std::stoi(it.id.substr(5)); } catch (...) { n = -1; }
-                        if (n >= 0 && n < idx &&
-                            (it.status == "pending" || it.status == "running" || it.status.empty()))
-                            it.status = "done";
-                    }
-                }
+                if (it.id == idHint || it.id == byId->id) continue;
+                bool bareStep = it.id.rfind("step:", 0) == 0;
+                bool modelStep = it.id.rfind("model:", 0) == 0;
+                if (!bareStep && !modelStep) continue;
+                const size_t prefix = bareStep ? 5 : 6;
+                if (it.id.size() <= prefix) continue;
+                bool num = true;
+                for (size_t k = prefix; k < it.id.size(); ++k)
+                    if (it.id[k] < '0' || it.id[k] > '9') { num = false; break; }
+                if (!num) continue;
+                int n = 0;
+                try { n = std::stoi(it.id.substr(prefix)); } catch (...) { n = -1; }
+                if (n >= 0 && n < idx &&
+                    (it.status == "pending" || it.status == "running" || it.status.empty()))
+                    it.status = "done";
             }
         } else {
             int stepOrd = 0;
@@ -2718,22 +2754,14 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
                     ta = &m.activity.back();
                 }
                 ta->detail = thinking;
-                // Batch path: content arrives complete. Keep open only while turn runs and
-                // user hasn't toggled; collapse once at turn end via run_finished unless pinned.
-                if (m.running) {
-                    ta->streaming = true;
-                    ta->status = "running";
-                    if (!ta->userToggled) ta->expanded = true;
-                } else {
-                    finalizeThoughtBox(*ta);
-                }
+                finalizeThoughtBox(*ta);
             }
         }
     } else if (kind == "stage_result") {
         ActivityItem* a = findStage(nsKey(jstr(data, "stage")));
         if (a) {
-            std::string v = jstr(data, "verdict");
-            a->status = v.empty() ? "done" : v;
+            a->status = jstr(data, "verdict");
+            if (a->status.empty()) a->status = "done";
             a->reason = jstr(data, "reason");
             if (!a->reason.empty() && m.running) m.liveStatus = a->reason;
         }
@@ -2747,6 +2775,12 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
                 // Thought/output boxes: stop streaming; auto-collapse once unless user pinned.
                 if (a.streaming || a.status == "running" || a.status.empty())
                     finalizeThoughtBox(a);
+                // Promote streamed prose into the final bubble once (no double while running).
+                if (a.stage == "stream:out" && a.opsCount <= 0 && !a.detail.empty() &&
+                    m.text.empty()) {
+                    m.text = a.detail;
+                    m.uiCachedH = -1.0f;
+                }
                 continue;
             }
             if (a.status == "running" || a.status.empty()) {
@@ -2902,7 +2936,8 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             a->status    = "running";
             if (!a->userToggled) a->expanded = true;
         } else {
-            // Text channel: append into the Output box always; gate m.text on ops-JSON class.
+            // Text channel: append into the Output box always; never dual-render prose
+            // into m.text while streaming (stream expander is the live surface).
             if (!txt.empty()) a->detail += txt;
             a->streaming = true;
             a->status    = "running";
@@ -2912,19 +2947,15 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             const bool isOps = wasOps || (opsAt != std::string::npos);
             if (isOps) {
                 if (!wasOps) {
-                    // Classification just flipped. Keep any prose BEFORE the ops blob in m.text;
-                    // strip only the ops portion that already leaked into the bubble.
+                    // Classification just flipped. Drop any prose already in m.text for
+                    // this segment (legacy dual-write); keep the ops box as sole surface.
                     const size_t segStart = (a->tokensIn > 0) ? (size_t)a->tokensIn : 0;
-                    // How much of this segment is prose (before opsAt in detail)?
-                    const size_t proseLen = (opsAt == std::string::npos) ? 0 : opsAt;
-                    const size_t keepEnd = segStart + proseLen;
-                    if (keepEnd <= m.text.size()) m.text.resize(keepEnd);
-                    else if (segStart <= m.text.size()) m.text.resize(segStart);
+                    if (segStart <= m.text.size()) m.text.resize(segStart);
                     a->title = "Building ops\xe2\x80\xa6";  // "Building ops…"
                     a->expanded = false;  // summary collapsed; raw only in expander
                     a->opsCount = 1;      // flag: ops-JSON mode (updated with real count below)
                     // If detail still holds leading prose, drop it from the ops box body so the
-                    // expander shows JSON only (prose already lives in m.text).
+                    // expander shows JSON only.
                     if (opsAt != std::string::npos && opsAt > 0 && opsAt <= a->detail.size())
                         a->detail.erase(0, opsAt);
                 }
@@ -2943,17 +2974,26 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
                 // Do NOT append this delta (or any further ops JSON) to m.text.
                 m.uiCachedH = -1.0f;
             } else {
-                // Prose: waterfall into the primary assistant bubble.
-                if (!txt.empty()) {
-                    m.text += txt;
-                    m.uiCachedH = -1.0f;
-                }
+                // Prose: keep ONE surface while streaming — the live stream:out expander.
+                // Do NOT waterfall into m.text (that doubled the reply). On run_finished
+                // we promote a.detail into m.text once for the final bubble.
+                m.uiCachedH = -1.0f;
             }
         }
     } else if (kind == "agent.tool_call") {                          // M14 — tool call row
-        ActivityItem ni;
+        // Upsert by span id so re-delivered/duplicate events update in place.
+        std::string tid = jstr(data, "id");
+        if (tid.empty()) tid = jstr(data, "span_id");
+        const std::string stageKey = "tool:" + tid;
+        ActivityItem* existingCard = nullptr;
+        if (!tid.empty()) {
+            for (auto& a : m.activity)
+                if (a.rowKind == 3 && a.stage == stageKey) { existingCard = &a; break; }
+        }
+        ActivityItem scratch;
+        ActivityItem& ni = existingCard ? *existingCard : scratch;
         ni.rowKind = 3;
-        ni.stage   = "tool:" + jstr(data, "id");
+        ni.stage   = stageKey;
         ni.title   = jstr(data, "tool_name");
         if (ni.title.empty()) ni.title = "tool";
         ni.reason     = jstr(data, "target");   // human "what it acts on" (may be "")
@@ -3002,7 +3042,7 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             existing.status = "done";
             existing.expanded = false;
         }
-        m.activity.push_back(std::move(ni));
+        if (!existingCard) m.activity.push_back(std::move(scratch));
     } else if (kind == "agent.classification" || kind == "complexity" || kind == "task_route") {
         // Routing card UPSERT (F3): appears on the FIRST of these events and enriches as the
         // rest land. Shared rowKind 10 at the front of the timeline.
@@ -3503,6 +3543,8 @@ static std::string chatHistoryPath();
 static std::string convDocKey(AppState& st);
 static void loadChatHistoryForKey(AppState& st, const std::string& key,
                                   const std::string& migrateFrom = {});
+static void eraseChatHistoryKeys(const std::vector<std::string>& keys);
+
 // Defined here (before drawSessionsPanel) — rekey erase + Sessions "Other" pin.
 static std::string s_chatKeyToErase;
 static std::string s_chatKeyHold;
@@ -7099,7 +7141,9 @@ static void drawCopilotHeader(AppState& st, bool busy) {
 // Sessions list — replaces the chat log while open so users can jump between sessions easily.
 static void drawSessionsPanel(AppState& st, bool busy) {
     const float sc = ui::uiScale;
+    const auto& pal = ui::palette;
     const ui::AdaptiveSurface& surf = chatSurf();
+
     ensureConversations(st);
 
     // New-session button spans the full tab width. Return to chat via the header Chat button
@@ -7270,9 +7314,72 @@ static void drawSessionsPanel(AppState& st, bool busy) {
     }
     if (!others.empty()) {
         ImGui::Dummy(ImVec2(0, ui::metrics::U(2)));
-        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-        ImGui::TextUnformatted("Other sessions");
-        ImGui::PopStyleColor();
+        // Header: "Other sessions" + inline Clear all (click-again confirm).
+        {
+            static double s_clearOtherUntil = 0.0;
+            const double now = ImGui::GetTime();
+            if (s_clearOtherUntil > 0.0 && now > s_clearOtherUntil) s_clearOtherUntil = 0.0;
+            const bool clearPend = s_clearOtherUntil > 0.0;
+
+            ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted("Other sessions");
+            ImGui::PopStyleColor();
+            ImGui::SameLine();
+            {
+                const char* clearLbl = clearPend ? "Confirm?" : "Clear all";
+                const float clearW = ImGui::CalcTextSize(clearLbl).x
+                                     + style.FramePadding.x * 2.0f;
+                const float clearX = ImGui::GetContentRegionMax().x - clearW;
+                if (clearX > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(clearX);
+                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.0f * sc, 1.0f * sc));
+                if (clearPend) {
+                    ImGui::PushStyleColor(ImGuiCol_Button,
+                        ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 0.55f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                        ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 0.70f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonActive,
+                        ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 0.85f));
+                    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+                } else {
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                        ImVec4(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.10f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonActive,
+                        ImVec4(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.16f));
+                    ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+                }
+                if (ImGui::SmallButton(clearLbl)) {
+                    if (!clearPend) {
+                        s_clearOtherUntil = now + 4.0;
+                    } else {
+                        std::vector<std::string> drop;
+                        drop.reserve(others.size());
+                        for (const auto& o : others) drop.push_back(o.key);
+                        // If we're browsing one of these keys, bounce back to the live doc first.
+                        bool heldDying = false;
+                        for (const auto& k : drop)
+                            if (!s_chatKeyHold.empty() && k == s_chatKeyHold) { heldDying = true; break; }
+                        if (heldDying) {
+                            s_chatKeyHold.clear();
+                            const std::string live = convDocKey(st);
+                            loadChatHistoryForKey(st, live);
+                            st.chatDocKey = live;
+                        }
+                        eraseChatHistoryKeys(drop);
+                        s_clearOtherUntil = 0.0;
+                        others.clear();
+                    }
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%s",
+                        clearPend
+                            ? "Click again to permanently remove all other sessions from local history."
+                            : "Remove all other-document sessions from local chat history.");
+                ImGui::PopStyleColor(4);
+                ImGui::PopStyleVar();
+            }
+        }
         ImGui::Dummy(ImVec2(0, ui::metrics::U(0.5f)));
         for (int oi = 0; oi < (int)others.size(); ++oi) {
             const OtherSess& o = others[oi];
@@ -7280,7 +7387,8 @@ static void drawSessionsPanel(AppState& st, bool busy) {
             const ImVec2 rowMin = ImGui::GetCursorScreenPos();
             const float  rowW   = ImGui::GetContentRegionAvail().x;
             const ImVec2 rowMax(rowMin.x + rowW, rowMin.y + rowH);
-            bool picked = ImGui::InvisibleButton("##pickother", ImVec2(std::max(1.0f, rowW), rowH));
+            bool picked = ImGui::InvisibleButton("##pickother",
+                                                ImVec2(std::max(1.0f, rowW - trashSz - padX), rowH));
             bool rowHov = ImGui::IsItemHovered();
             if (picked && !busy) {
                 // Read-only browse: load that key's sessions into view and pin so
@@ -7306,10 +7414,42 @@ static void drawSessionsPanel(AppState& st, bool busy) {
                 std::snprintf(sub, sizeof(sub), "%d sessions", o.nConvs);
             dl->AddText(ImVec2(rowMin.x + padX, titleY + titleH + 2.0f * sc),
                         ImGui::ColorConvertFloat4ToU32(surf.textSecondary), sub);
+
+            // Per-row delete — same trash affordance as active-doc conversations.
+            bool doDel = false;
+            if (rowHov) {
+                const float img  = trashSz - 8.0f * sc;
+                const float btnW = img + style.FramePadding.x * 2.0f;
+                const float btnH = img + style.FramePadding.y * 2.0f;
+                ImGui::SetCursorScreenPos(
+                    ImVec2(rowMax.x - btnW - 4.0f * sc, rowMin.y + (rowH - btnH) * 0.5f));
+                IconUV trash = ui::getIcon("delete", 20);
+                bool del = trash.valid
+                    ? ImGui::ImageButton("##delother", trash.texId, ImVec2(img, img),
+                                         trash.uv0, trash.uv1)
+                    : ImGui::SmallButton("x");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Delete this session from local history");
+                doDel = del;
+            }
+
             ImGui::SetCursorScreenPos(ImVec2(rowMin.x, rowMax.y + rowGap));
             ImGui::PopID();
+            if (doDel) {
+                // If browsing this orphan, return to the live doc before erasing the key.
+                if (!s_chatKeyHold.empty() && s_chatKeyHold == o.key) {
+                    s_chatKeyHold.clear();
+                    const std::string live = convDocKey(st);
+                    loadChatHistoryForKey(st, live);
+                    st.chatDocKey = live;
+                }
+                eraseChatHistoryKeys({o.key});
+                others.erase(others.begin() + oi);
+                break;
+            }
         }
     }
+
     // If we're browsing a held foreign key, offer a one-click return to the live doc.
     if (!s_chatKeyHold.empty()) {
         ImGui::Dummy(ImVec2(0, ui::metrics::U(1)));
@@ -7597,6 +7737,52 @@ void persistChatHistory(AppState& st) {
     } catch (...) {
     }
 }
+
+// Drop one or more orphaned doc keys from chat_history.json (Other sessions cleanup).
+// Load-modify-write with the same atomic tmp+rename path as persistChatHistory.
+// Never touches the active st.chatDocKey. Local store only — does not DELETE on the
+// shared workspace chat endpoint (web-shared sessions may reappear after merge).
+static void eraseChatHistoryKeys(const std::vector<std::string>& keys) {
+    if (keys.empty()) return;
+    namespace fs = std::filesystem;
+    const std::string path = chatHistoryPath();
+    nlohmann::json root = nlohmann::json::object();
+    {
+        std::ifstream in(path, std::ios::binary);
+        if (in) {
+            try {
+                in >> root;
+            } catch (...) {
+                return;  // corrupt — don't clobber
+            }
+        }
+    }
+    if (!root.is_object()) return;
+    bool changed = false;
+    for (const std::string& k : keys) {
+        if (k.empty()) continue;
+        if (root.erase(k) > 0) changed = true;
+    }
+    if (!changed) return;
+    try {
+        fs::create_directories(appdataAppDir());
+        const std::string tmp = path + ".tmp";
+        {
+            std::ofstream out(tmp);
+            if (!out) return;
+            out << root.dump(1);
+        }
+        std::error_code ec;
+        fs::rename(tmp, path, ec);
+        if (ec) {
+            fs::remove(path, ec);
+            fs::rename(tmp, path, ec);
+        }
+        appstatePersistSync();
+    } catch (...) {
+    }
+}
+
 
 void pollChatOpenFoam(AppState& st) {
     if (!st.chatCfdPending || !st.simClient) return;
@@ -12225,6 +12411,8 @@ static void submitTurn(AppState& st, const std::string& text) {
         a.running = true;
         a.copilotMode = st.aiInteraction;  // stamp; auto-switch may update to Agent
         if (st.settings.model[0]) a.model = st.settings.model;
+        // Instant classification chrome — don't wait for the first drained event frame.
+        a.liveStatus = "Routing request\xe2\x80\xa6";
         st.chat.push_back(a);
     }
     st.designStarted = true;   // conversation is now active (kept for shot scenarios)
@@ -12713,7 +12901,11 @@ static void submitTurn(AppState& st, const std::string& text) {
     // plan_state, so the classifier is fully transparent. Supervised plan-approval
     // remains available via the composer Plan mode.
     for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
-        if (!it->fromUser && it->running) { it->liveStatus = "Classifying request..."; break; }
+        if (!it->fromUser && it->running) {
+            // Progressive chrome: Routing → Classifying as soon as the design path starts.
+            it->liveStatus = "Classifying\xe2\x80\xa6";
+            break;
+        }
     launchDesignRun(st, sendText, agentExtras);
 }
 
@@ -12854,9 +13046,11 @@ static bool modeMenuRow(const char* iconName, const char* label, bool selected,
     return clicked && !disabled;
 }
 
-// Prelude row above the prompt: Agent/Plan/Swarm/Edit/Ask dropdown (left) + context meter (right).
+// Prelude row above the prompt: Agent/Plan/Swarm/Edit/Ask dropdown (left) + busy forging
+// glyph (inline, only while a run is active) + context meter (right).
 // Permissions live only in the Settings overlay (not the composer).
-static void drawComposerPrelude(AppState& st, bool /*busy*/) {
+static void drawComposerPrelude(AppState& st, bool busy) {
+
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
     const bool hasDoc = st.docMirror.hasDoc();
@@ -12963,6 +13157,18 @@ static void drawComposerPrelude(AppState& st, bool /*busy*/) {
     }
     ImGui::PopStyleColor(3);
 
+    // Busy forging glyph — sits BETWEEN the mode dropdown and the context meter.
+    // No reserved gap when idle (conditional SameLine only while a run is active).
+    {
+        const bool forging = busy || st.agentV2Running || activeConversationRunning(st);
+        if (forging) {
+            ImGui::SameLine(0, 8.0f * sc);
+            drawForgingAnimation(segH);  // match prelude chip height
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("AI is working\xe2\x80\xa6");
+        }
+    }
+
     // Context meter on the SAME row, right-aligned.
     ImGui::SameLine();
     const float room = ImGui::GetContentRegionAvail().x;
@@ -12970,6 +13176,7 @@ static void drawComposerPrelude(AppState& st, bool /*busy*/) {
     const float x    = ImGui::GetContentRegionMax().x - w;
     if (x > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(x);
     drawContextMeter(st, room);
+
 
     ImGui::PopStyleColor(8);
     ImGui::PopStyleVar(2);
@@ -13468,11 +13675,30 @@ static bool aiTurnActive(AppState& st) {
     return false;
 }
 
-// Stop the in-flight run. The worker RPC can't be interrupted mid-flight (one blocking call per
-// WorkerClient, serialized), so this is a SOFT stop: finalize the active message as stopped and,
-// for a job-based run, flag the drain to discard the result when the background thread lands. The
-// model may finish its current step in the background; we just stop listening.
+// Stop the in-flight run: fire agent_cancel (hard cooperative cancel — aborts in-flight HTTP
+// via curl xfer + stage boundaries), then soft-finalize the UI so the composer reverts to send
+// immediately. The job drain discards the eventual cancel_result.
 static void requestStopRun(AppState& st) {
+    // Capture run_id before we clear flags.
+    std::string runId;
+    {
+        std::lock_guard<std::mutex> lk(st.job.mtx);
+        runId = st.job.runId;
+    }
+    // Fire agent_cancel on a detached thread so we never block the GL thread behind the
+    // worker mutex / daemon socket (callAgentCancel bypasses callMtx_ / uses a side socket).
+    if (!runId.empty() && st.workerStarted) {
+        std::thread([&st, runId]() {
+            nlohmann::json r;
+            std::string e;
+            st.worker.callAgentCancel(runId, r, e);
+            if (!e.empty())
+                st.addLog(std::string("[..] agent_cancel: ") + e);
+            else
+                st.addLog("[..] agent_cancel ok cancelled=" +
+                          std::string(r.value("cancelled", false) ? "true" : "false"));
+        }).detach();
+    }
     // Only a job-based run produces a result the drain must discard. Async ask/sim runs land via
     // their own callbacks, which look for a *running* message — clearing it below makes them no-op.
     if (st.job.running.load() || st.job.ready.load()) st.stopRequested = true;
@@ -13482,15 +13708,24 @@ static void requestStopRun(AppState& st) {
     for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
         if (!it->fromUser && it->running) {
             it->running = false;
-            it->liveStatus.clear();
-            it->errKind = ERR_CAD;  // a user stop is not an app error
+            it->liveStatus = "Stopped";
+            it->errKind = ERR_NONE;  // user stop is not an error card
+            // Finalize any live stream boxes so the forging animation / streaming chrome stops.
+            for (auto& a : it->activity) {
+                if (a.rowKind == 2 && (a.streaming || a.status == "running" || a.status.empty()))
+                    finalizeThoughtBox(a);
+                else if (a.status == "running" || a.status.empty()) {
+                    a.status = "done";
+                    a.streaming = false;
+                }
+            }
             if (it->text.empty())
-                it->text = "Stopped. The model may finish its current step in the background.";
-            else
+                it->text = "Stopped.";
+            else if (it->text.find("(Stopped by you.)") == std::string::npos)
                 it->text += "\n\n(Stopped by you.)";
             break;
         }
-    st.status = st.job.running.load() ? "Stopping..." : "Stopped.";
+    st.status = "Stopped.";
     st.statusKind = 1;
     st.addLog("[..] stop requested by user");
 }
@@ -13571,19 +13806,9 @@ static void drawComposerSendStop(AppState& st, const ImVec2& inMin, const ImVec2
 // ---- the composer: a rounded input box (in-box send) + inline toolbar (model, thinking, +) ----
 // Submits on Enter or the in-box send button. Returns nothing; runs the turn directly.
 static void drawComposer(AppState& st, bool busy, bool canRun) {
-    // Forging busy affordance — pinned just above the input while the agent is working.
-    // Shared by the docked Copilot column and the AI workspace (via chatDrawComposer).
-    {
-        const bool forging = busy || st.agentV2Running || activeConversationRunning(st);
-        if (forging) {
-            const float sc = ui::uiScale;
-            const float box = 28.0f * sc;
-            const float avail = ImGui::GetContentRegionAvail().x;
-            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, (avail - box) * 0.5f));
-            drawForgingAnimation(box);
-            ImGui::Dummy(ImVec2(0, 2.0f * sc));
-        }
-    }
+    // Forging busy affordance lives in drawComposerPrelude (inline between mode
+    // dropdown and context meter) — no reserved row above the input.
+
 
     const bool hasDoc = st.docMirror.hasDoc();
 

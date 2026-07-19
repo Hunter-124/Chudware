@@ -311,8 +311,13 @@ static void drawTopNav(AppState& st) {
 // ---- onboarding (no project resolvable) ---------------------------------------
 
 static void drawOnboarding(AppState& st) {
-    plmEmptyState("[ + ]", "Start a project",
-                  "Open or save a document — history begins automatically.");
+    plmEmptyState(
+        "[ + ]",
+        "Open a project folder",
+        "Use the folder button (top-right) to pick an existing project folder. "
+        "If the folder already has a .aicadvault, it is reused — history is never "
+        "reinitialized. Opening the same folder again is safe and idempotent. "
+        "You can also open or save a document under a folder to start history there.");
     const float S = ui::uiScale;
     float bw = 220 * S;
     ImGui::SetCursorPosX((ImGui::GetContentRegionAvail().x - bw) * 0.5f);

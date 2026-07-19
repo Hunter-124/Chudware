@@ -286,9 +286,109 @@ mergeInto(LibraryManager.library, {
     };
 
     if (uploadBtn) {
+      // Open <input type=file> in THIS click handler so the browser keeps the
+      // user gesture. Returning "__UPLOAD__" to C++ and opening the picker later
+      // (after ASYNCIFY resume) loses the gesture — browsers block input.click()
+      // and/or the focus-cancel timer races FileReader, wedging or silently
+      // cancelling the Open flow. Fill g_pick via billet_file_pick_done, then
+      // finish browse with "__UPLOAD__" so C++ can consume bytes + fsUpload.
       uploadBtn.onclick = function() {
-        // Signal special cancel with path "__UPLOAD__" so C++ can fall through to pickFile.
-        finish(1, '__UPLOAD__');
+        if (finished) return;
+        var input = document.createElement('input');
+        input.type = 'file';
+        if (accept && accept.length) input.accept = accept;
+        input.style.display = 'none';
+        document.body.appendChild(input);
+
+        function showUploadStatus(msg, isErr) {
+          list.innerHTML = '';
+          var e = document.createElement('div');
+          e.style.cssText = 'padding:12px;font-size:12px;color:' +
+            (isErr ? '#f66' : '#a0a0b0') + ';';
+          e.textContent = msg;
+          list.appendChild(e);
+        }
+
+        function deliverPick(ok, name, data, len, errStr) {
+          if (typeof Module === 'undefined' || !Module._billet_file_pick_done) {
+            showUploadStatus('Upload unavailable (module not ready)', true);
+            return false;
+          }
+          try {
+            if (ok && data && len > 0) {
+              var ptr = Module._malloc(len);
+              if (!ptr) {
+                showUploadStatus('Out of memory reading file (' + len + ' bytes)', true);
+                return false;
+              }
+              // Chunked heap write — large .step+ files are multi-MB.
+              var heap = Module.HEAPU8;
+              var CHUNK = 1 << 20;
+              for (var off = 0; off < len; off += CHUNK) {
+                var end = off + CHUNK;
+                if (end > len) end = len;
+                heap.set(data.subarray(off, end), ptr + off);
+              }
+              var namePtr = 0;
+              if (name) {
+                var nb = lengthBytesUTF8(name) + 1;
+                namePtr = Module._malloc(nb);
+                stringToUTF8(name, namePtr, nb);
+              }
+              Module._billet_file_pick_done(1, namePtr, ptr, len, 0);
+              if (namePtr) Module._free(namePtr);
+              Module._free(ptr);
+              return true;
+            }
+            var errPtr = 0;
+            if (errStr) {
+              var eb = lengthBytesUTF8(errStr) + 1;
+              errPtr = Module._malloc(eb);
+              stringToUTF8(errStr, errPtr, eb);
+            }
+            Module._billet_file_pick_done(0, 0, 0, 0, errPtr);
+            if (errPtr) Module._free(errPtr);
+            return false;
+          } catch (ex) {
+            showUploadStatus('Upload failed: ' +
+              (ex && ex.message ? ex.message : ex), true);
+            return false;
+          }
+        }
+
+        input.addEventListener('change', function() {
+          try { document.body.removeChild(input); } catch (e) {}
+          if (!input.files || input.files.length === 0) {
+            // Native picker cancelled — keep workspace overlay open.
+            return;
+          }
+          var f = input.files[0];
+          showUploadStatus('Reading ' + (f.name || 'file') + '…', false);
+          var reader = new FileReader();
+          reader.onload = function() {
+            try {
+              var u8 = new Uint8Array(reader.result);
+              if (!u8.length) {
+                showUploadStatus('File is empty', true);
+                return;
+              }
+              showUploadStatus('Uploading ' + (f.name || 'file') + '…', false);
+              if (deliverPick(1, f.name || 'upload.bin', u8, u8.length, null)) {
+                finish(1, '__UPLOAD__');
+              }
+            } catch (ex) {
+              showUploadStatus('Failed to read file: ' +
+                (ex && ex.message ? ex.message : ex), true);
+            }
+          };
+          reader.onerror = function() {
+            showUploadStatus('FileReader failed', true);
+          };
+          reader.readAsArrayBuffer(f);
+        });
+        // No focus-cancel timer here: cancelling the native picker must leave
+        // the workspace overlay open so the user can retry or Cancel cleanly.
+        input.click();
       };
     }
 

@@ -154,6 +154,19 @@ std::string plmProjectName(AppState& st) {
 
 void plmEnsureOverview(AppState& st) {
     auto& H = g_plmHub;
+    // Hub-open drift capture: when the overview first binds a project folder,
+    // record on-disk changes made outside the editor. Complements
+    // setActiveProjectDir (which already fires this on explicit folder pick).
+    // Idempotent per projectDir; no-op when the working tree matches history.
+    {
+        std::string proj = st.plmProjectPath();
+        if (!proj.empty() && proj != H.outsideRecordedFor && st.workerStarted) {
+            H.outsideRecordedFor = proj;
+            nlohmann::json p;
+            p["path"] = proj;
+            st.rpc.call("plm_record_outside", p, [](const core::RpcResult&) {});
+        }
+    }
     if (H.ovLoading || H.ovGen == H.generation) return;
     H.ovLoading = true;
     int gen = H.generation;

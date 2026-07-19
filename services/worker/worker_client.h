@@ -41,6 +41,10 @@ public:
               nlohmann::json& result, std::string& err, int timeoutMs = 120000,
               const EventFn& onEvent = {});
 
+    // Best-effort agent_cancel {run_id} → {ok, cancelled}. Bypasses the call mutex /
+    // uses a side-channel socket in daemon mode so Stop lands while a run is blocked.
+    bool callAgentCancel(const std::string& runId, nlohmann::json& result, std::string& err);
+
     // C39: one-way teardown abort — makes a blocked (and any future) call() fail fast with
     // err "aborted" instead of running out its timeout. Set at app exit (AsyncRpc::shutdown)
     // so a long in-flight RPC can't hang the close. The errorSink is NOT fired for aborts.

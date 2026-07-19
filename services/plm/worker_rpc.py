@@ -303,10 +303,25 @@ def _plm_overview(params: dict, _emit: Callable) -> dict:
 
 
 def _plm_settings_get(params: dict, _emit: Callable) -> dict:
-    """Per-machine vault-local settings + the project auto-record flag."""
+    """Per-machine vault-local settings + the project auto-record flag.
+
+    Also surfaces ``ai_mode`` and bridge enablement hints so Settings can show
+    that Managed mode turns on AI→vault checkpoints without AICAD_PLM_BRIDGE.
+    Precedence: managed ai_mode > AICAD_PLM_BRIDGE env > off.
+    """
     def run(v: Any) -> dict:
-        return {"ok": True, "settings": v.get_local_config(),
-                "auto_commit": v.auto_commit()}
+        mode = v.ai_mode()
+        env_on = os.environ.get("AICAD_PLM_BRIDGE", "").strip() == "1"
+        return {
+            "ok": True,
+            "settings": v.get_local_config(),
+            "auto_commit": v.auto_commit(),
+            "ai_mode": mode,
+            # Additive hint fields (UI may ignore): bridge is live when managed
+            # OR the env flag is set. AI-authored cuts still require managed.
+            "bridge_env": env_on,
+            "bridge_active": (mode == "managed") or env_on,
+        }
     return _with_vault(params, run)
 
 

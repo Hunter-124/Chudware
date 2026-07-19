@@ -74,7 +74,22 @@ struct GraphTabState {
     int linkKindIdx = 4;      // default REFERENCES (see kEdgeKinds)
     char linkNote[192] = {};
     std::string focusPending; // plmGraphFocus request to apply on next draw
+    // ME489-scale guards ----------------------------------------------------
+    // Hide archive/stale nodes by default (backend also excludes them from
+    // the walk; this toggle re-fetches with include_archive when flipped off).
+    bool hideArchive = true;
+    bool truncated = false;
+    int nodeCountFull = 0;   // full graph size (pre-cap)
+    int edgeCountFull = 0;
+    // When node count exceeds kListViewThreshold, default to a scrollable
+    // hierarchy list instead of the force/ring layout (simplest usable option
+    // for huge graphs — ring layout stays available via the View toggle).
+    bool listView = false;
+    bool listViewUserOverride = false;  // true once the user picks a mode
 };
+
+// Above this many loaded nodes, auto-switch to list/hierarchy view.
+static constexpr int kListViewThreshold = 2000;
 
 GraphTabState& S() {
     static GraphTabState s;
@@ -348,6 +363,10 @@ void requestGraph(AppState& st, bool force) {
     p["project_dir"] = proj;
     // Also accept path-style callers; harmless extra key for robust workers.
     p["path"] = proj;
+    // Archive dirs are excluded server-side by default; flip only when the
+    // user unchecks "Hide archive/stale".
+    p["include_archive"] = !G.hideArchive;
+    if (force) p["force"] = true;
 
     st.rpc.call("cad_graph_get", p, [](const core::RpcResult& r) {
         auto& G = S();
@@ -373,6 +392,11 @@ void requestGraph(AppState& st, bool force) {
         G.edges.clear();
         G.blast.clear();
         G.generatedAt = jstr(r.result, "generated_at");
+
+        // Truncation / full counts (honest "showing N of M").
+        G.truncated = r.result.value("truncated", false);
+        G.nodeCountFull = r.result.value("node_count", 0);
+        G.edgeCountFull = r.result.value("edge_count", 0);
 
         if (auto it = r.result.find("nodes"); it != r.result.end() && it->is_array()) {
             G.nodes.reserve(it->size());
@@ -414,6 +438,18 @@ void requestGraph(AppState& st, bool force) {
                 G.edges.push_back(std::move(e));
             }
         }
+
+        // Auto list-view for huge graphs unless the user already chose a mode.
+        if (!G.listViewUserOverride) {
+            const int nFull = G.nodeCountFull > 0 ? G.nodeCountFull
+                                                 : (int)G.nodes.size();
+            G.listView = nFull > kListViewThreshold;
+        }
+
+        // Backfill full counts when an older worker omitted them.
+        if (G.nodeCountFull <= 0) G.nodeCountFull = (int)G.nodes.size();
+        if (G.edgeCountFull <= 0) G.edgeCountFull = (int)G.edges.size();
+
         G.layoutDirty = true;
         G.layoutToken++;
         G.selectedEdge = -1;  // edge indices are invalidated by the reload
@@ -1035,6 +1071,108 @@ void drawCanvas(AppState& st, ImVec2 canvasSz) {
     }
 }
 
+// Hierarchy / list view — used automatically when node count exceeds
+// kListViewThreshold so a 5k+ graph never force-layouts on the UI thread.
+// Sorted by kind ring then label; search filters the rows. Click selects.
+void drawListView(AppState& /*st*/, ImVec2 canvasSz) {
+    auto& G = S();
+    const float Sc = ui::uiScale;
+
+    ImGui::BeginChild("##graph_list", canvasSz, ImGuiChildFlags_None);
+
+    if (G.nodes.empty() && !G.loading) {
+        ImGui::Dummy(ImVec2(0, 24 * Sc));
+        const char* msg = G.err.empty() ? "No graph nodes yet" : G.err.c_str();
+        ImGui::TextColored(ImVec4(palette.textDim[0], palette.textDim[1],
+                                  palette.textDim[2], 1.0f), "%s", msg);
+        ImGui::EndChild();
+        return;
+    }
+    if (G.loading && G.nodes.empty()) {
+        ImGui::Dummy(ImVec2(0, 24 * Sc));
+        ImGui::TextColored(ImVec4(palette.accent[0], palette.accent[1],
+                                  palette.accent[2], 1.0f), "Loading graph…");
+        ImGui::EndChild();
+        return;
+    }
+
+    // Stable order: kind ring, then label, then id.
+    std::vector<int> order(G.nodes.size());
+    for (int i = 0; i < (int)order.size(); ++i) order[i] = i;
+    std::sort(order.begin(), order.end(), [&](int a, int b) {
+        int ra = kindRing(G.nodes[a].kind), rb = kindRing(G.nodes[b].kind);
+        if (ra != rb) return ra < rb;
+        if (G.nodes[a].label != G.nodes[b].label)
+            return G.nodes[a].label < G.nodes[b].label;
+        return G.nodes[a].id < G.nodes[b].id;
+    });
+
+    const bool filtering = G.search[0] != 0;
+    ImGuiListClipper clipper;
+    // Pre-filter indices so clipper sees only visible rows.
+    std::vector<int> visible;
+    visible.reserve(order.size());
+    for (int i : order) {
+        if (filtering && !matchesSearch(G.nodes[i], G.search)) continue;
+        visible.push_back(i);
+    }
+    clipper.Begin((int)visible.size());
+    while (clipper.Step()) {
+        for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+            const GNode& n = G.nodes[visible[row]];
+            const bool sel = (n.id == G.selectedId);
+            const bool inBlast = G.blast.count(n.id) > 0;
+
+            ImGui::PushID(n.id.c_str());
+            // Kind swatch
+            ImVec2 p = ImGui::GetCursorScreenPos();
+            float r = 5.0f * Sc;
+            ImGui::GetWindowDrawList()->AddCircleFilled(
+                ImVec2(p.x + r + 2 * Sc, p.y + ImGui::GetTextLineHeight() * 0.5f),
+                r, kindColor(n.kind), 12);
+            ImGui::Dummy(ImVec2(r * 2 + 8 * Sc, 0));
+            ImGui::SameLine(0, 0);
+
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImGui::ColorConvertU32ToFloat4(kindColor(n.kind)));
+            ImGui::Text("[%s]", kindShort(n.kind));
+            ImGui::PopStyleColor();
+            ImGui::SameLine();
+
+            // Selectable label
+            if (sel) {
+                ImGui::PushStyleColor(ImGuiCol_Header,
+                    ImVec4(palette.accent[0], palette.accent[1],
+                           palette.accent[2], 0.35f));
+            } else if (inBlast) {
+                ImGui::PushStyleColor(ImGuiCol_Header,
+                    ImVec4(palette.statusWarn[0], palette.statusWarn[1],
+                           palette.statusWarn[2], 0.30f));
+            }
+            if (ImGui::Selectable(n.label.c_str(), sel || inBlast,
+                                  ImGuiSelectableFlags_SpanAllColumns)) {
+                G.selectedId = n.id;
+                G.selectedEdge = -1;
+                G.blast.clear();
+            }
+            if (sel || inBlast) ImGui::PopStyleColor();
+
+            if (!n.path.empty()) {
+                ImGui::SameLine();
+                ImGui::PushStyleColor(ImGuiCol_Text,
+                    ImVec4(palette.textDisabled[0], palette.textDisabled[1],
+                           palette.textDisabled[2], 1.0f));
+                ImGui::TextUnformatted(n.path.c_str());
+                ImGui::PopStyleColor();
+            }
+            ImGui::PopID();
+        }
+    }
+    clipper.End();
+
+    ImGui::EndChild();
+}
+
 }  // namespace
 
 // ---- public ------------------------------------------------------------------
@@ -1063,6 +1201,12 @@ void plmGraphOnProjectChanged() {
     G.linkPopupOpen = false;
     G.linkPopupDst.clear();
     G.linkNote[0] = 0;
+    G.truncated = false;
+    G.nodeCountFull = 0;
+    G.edgeCountFull = 0;
+    G.listView = false;
+    G.listViewUserOverride = false;
+    // hideArchive stays — user preference across projects.
     // Keep available flag — method absence is session-wide, not per-project.
 }
 
@@ -1093,10 +1237,11 @@ void plmDrawGraphPage(AppState& st) {
         G.projectDir = proj;
     }
 
-    // Auto-refresh when the OS app regains focus.
+    // Auto-refresh when the OS app regains focus. Use force=false so a warm
+    // ME489-scale cache can serve without a full rebuild (mtime fast-path).
     const bool lost = ImGui::GetIO().AppFocusLost;
     if (G.wasAppFocusLost && !lost)
-        requestGraph(st, /*force=*/true);
+        requestGraph(st, /*force=*/false);
     G.wasAppFocusLost = lost;
 
     requestGraph(st, /*force=*/false);
@@ -1117,6 +1262,38 @@ void plmDrawGraphPage(AppState& st) {
         // Fit is applied next canvas draw via token bump.
         G.layoutToken++;
     }
+    ImGui::SameLine();
+    // Hide archive/stale — ON by default; toggling re-fetches with
+    // include_archive flipped so the backend walk policy matches the UI.
+    {
+        bool hide = G.hideArchive;
+        if (ImGui::Checkbox("Hide archive/stale", &hide) && hide != G.hideArchive) {
+            G.hideArchive = hide;
+            G.lastFetch = -1e9;
+            requestGraph(st, /*force=*/true);
+        }
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::SetTooltip(
+                "Exclude _archive_stale / _archive / archive / .trash\n"
+                "directories from the graph (default ON).");
+        }
+    }
+    ImGui::SameLine();
+    // View mode: list (hierarchy) vs ring layout. Auto-list above threshold.
+    {
+        const char* modeLabel = G.listView ? "List view" : "Graph view";
+        if (graphGlassButton("##graph_view_mode", modeLabel, false, 100 * S)) {
+            G.listView = !G.listView;
+            G.listViewUserOverride = true;
+            if (!G.listView) G.layoutDirty = true;
+        }
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::SetTooltip(
+                "List view is the default for graphs larger than %d nodes\n"
+                "(avoids laying out thousands of rings).",
+                kListViewThreshold);
+        }
+    }
     if (!G.generatedAt.empty()) {
         ImGui::SameLine();
         ImGui::PushStyleColor(ImGuiCol_Text,
@@ -1129,6 +1306,33 @@ void plmDrawGraphPage(AppState& st) {
     if (!G.err.empty() && !G.nodes.empty()) {
         ImGui::SameLine();
         plmError(G.err);
+    }
+
+    // Truncation notice — honest "showing N of M".
+    if (G.truncated ||
+        (G.nodeCountFull > 0 && (int)G.nodes.size() < G.nodeCountFull)) {
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(palette.statusWarn[0], palette.statusWarn[1],
+                   palette.statusWarn[2], 1.0f));
+        ImGui::Text("Showing %d of %d nodes · %d of %d edges",
+                    (int)G.nodes.size(),
+                    G.nodeCountFull > 0 ? G.nodeCountFull : (int)G.nodes.size(),
+                    (int)G.edges.size(),
+                    G.edgeCountFull > 0 ? G.edgeCountFull : (int)G.edges.size());
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::SetTooltip(
+                "Response is capped so the UI stays responsive.\n"
+                "Use Search to find a specific node; blast radius\n"
+                "still walks the full on-disk graph.");
+        }
+    } else if (!G.nodes.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(palette.textDisabled[0], palette.textDisabled[1],
+                   palette.textDisabled[2], 1.0f));
+        ImGui::Text("%d nodes · %d edges",
+                    (int)G.nodes.size(), (int)G.edges.size());
+        ImGui::PopStyleColor();
     }
 
     // ---- edge-kind filter row -----------------------------------------------
@@ -1152,7 +1356,7 @@ void plmDrawGraphPage(AppState& st) {
 
     ImGui::Dummy(ImVec2(0, 4 * S));
 
-    // ---- body: canvas + side panel ------------------------------------------
+    // ---- body: canvas/list + side panel -------------------------------------
     const float gap = 10.0f * S;
     const float sideW = 260.0f * S;
     const float bodyH = ImGui::GetContentRegionAvail().y;
@@ -1165,7 +1369,10 @@ void plmDrawGraphPage(AppState& st) {
     ImGui::BeginChild("##graph_canvas_host", ImVec2(canvasW, 0), ImGuiChildFlags_None,
                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     ImVec2 csz = ImGui::GetContentRegionAvail();
-    drawCanvas(st, csz);
+    if (G.listView)
+        drawListView(st, csz);
+    else
+        drawCanvas(st, csz);
     ImGui::EndChild();
 
     ImGui::SameLine(0, gap);

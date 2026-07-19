@@ -111,6 +111,9 @@ std::string openFileDialog(const char* filter) {
     std::string accept = filterToAccept(filter);
 
     // Workspace tree browser first (pick existing server file OR choose upload).
+    // "Upload from my machine…" reads the file in JS (gesture-safe) into the pick
+    // buffer, then returns "__UPLOAD__" so we consume + fsUpload here — never a
+    // second input.click() after ASYNCIFY resume (that loses the user gesture).
     std::string chosen = billet::browseWorkspace(billet::WorkspaceBrowseMode::OpenFile,
                                                  accept.c_str(), /*suggestedName=*/nullptr);
     if (chosen.empty()) return {};  // cancel
@@ -122,11 +125,33 @@ std::string openFileDialog(const char* filter) {
         return chosen;
     }
 
-    // Fall through: browser local upload into the workspace.
+    // Bytes already delivered by billet_web_dialogs.js → billet_file_pick_done.
     billet::PickedFile picked;
     std::string err;
-    if (!billet::pickFile(accept.c_str(), picked, err) || picked.name.empty()) {
-        return {};  // cancel or error
+    if (!billet::consumePickedFile(picked, err) || picked.name.empty() || picked.data.empty()) {
+        // Fallback for any caller that still signals __UPLOAD__ without bytes.
+        if (err == "no pending upload") {
+            if (!billet::pickFile(accept.c_str(), picked, err) ||
+                picked.name.empty() || picked.data.empty()) {
+                if (!err.empty()) {
+                    const std::string msg = "Upload failed: " + err;
+                    EM_ASM({
+                        var m = UTF8ToString($0);
+                        try { window.alert(m); } catch (e) {}
+                    }, msg.c_str());
+                }
+                return {};
+            }
+        } else {
+            if (!err.empty()) {
+                const std::string msg = "Upload failed: " + err;
+                EM_ASM({
+                    var m = UTF8ToString($0);
+                    try { window.alert(m); } catch (e) {}
+                }, msg.c_str());
+            }
+            return {};
+        }
     }
     auto& fsb = billet::fsBackend();
     std::string root = s_lastDir.empty() ? fsb.defaultRoot() : s_lastDir;
@@ -148,7 +173,15 @@ std::string openFileDialog(const char* filter) {
     std::string upErr;
     std::string abs = billet::fsUpload(dirRel, picked.name, picked.data.data(),
                                        picked.data.size(), upErr);
-    if (abs.empty()) return {};
+    if (abs.empty()) {
+        const std::string msg = "Upload failed: " +
+            (upErr.empty() ? std::string("unknown error") : upErr);
+        EM_ASM({
+            var m = UTF8ToString($0);
+            try { window.alert(m); } catch (e) {}
+        }, msg.c_str());
+        return {};
+    }
     size_t cut = abs.find_last_of('/');
     if (cut != std::string::npos && cut > 0) s_lastDir = abs.substr(0, cut);
     return abs;

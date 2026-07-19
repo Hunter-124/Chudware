@@ -416,6 +416,18 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         run_id = "run-" + std::to_string(static_cast<unsigned long long>(
                               std::chrono::steady_clock::now().time_since_epoch().count()));
     }
+    // Cooperative cancel: register this run so agent_cancel can flip the flag from
+    // another thread (HTTP xfer + stage boundaries both observe it).
+    RunControl run_ctl;
+    register_run_control(run_id, run_ctl);
+    struct RunCtlGuard {
+        std::string id;
+        ~RunCtlGuard() { unregister_run_control(id); }
+    } run_ctl_guard{run_id};
+    set_provider_cancel_flag(run_ctl.flag.get());
+    struct ProvCancelGuard {
+        ~ProvCancelGuard() { set_provider_cancel_flag(nullptr); }
+    } prov_cancel_guard;
     std::string prompts_dir = options.value("prompts_dir", std::string());
 
     // OFFLINE MODE defense-in-depth (assert_offline_safe). The host owns the app
@@ -1967,7 +1979,7 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
     else if (cx.level == Complexity::Complex) fix_default = 6;
     ensure_budget("fix", fix_default);
 
-    json result = run_machine(state, actions, events, budgets);
+    json result = run_machine(state, actions, events, budgets, run_ctl);
 
     // revision = session.revision (re-read live; matches run.py getattr(session,"revision")).
     json tree_now = doc::doc_tree(doc_id);
@@ -2703,6 +2715,17 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
     if (run_id.empty())
         run_id = "mission-" + std::to_string(static_cast<unsigned long long>(
                                   std::chrono::steady_clock::now().time_since_epoch().count()));
+
+    RunControl run_ctl;
+    register_run_control(run_id, run_ctl);
+    struct RunCtlGuard {
+        std::string id;
+        ~RunCtlGuard() { unregister_run_control(id); }
+    } run_ctl_guard{run_id};
+    set_provider_cancel_flag(run_ctl.flag.get());
+    struct ProvCancelGuard {
+        ~ProvCancelGuard() { set_provider_cancel_flag(nullptr); }
+    } prov_cancel_guard;
 
     ProviderFn provider = make_provider(provider_cfg);
     const CallBudget cb = fit_call_budget(provider_cfg, call_budget_for(provider_cfg));

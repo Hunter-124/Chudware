@@ -8,6 +8,7 @@
 // response yields the numeric status + full body.
 #include "agent/http.h"
 
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -20,6 +21,8 @@ namespace aicad {
 namespace agent {
 
 namespace {
+
+thread_local const std::atomic<bool>* g_http_cancel = nullptr;
 
 // UTF-8 <-> UTF-16 conversion (WinHTTP is wide-char throughout).
 std::wstring widen(const std::string& s) {
@@ -60,6 +63,12 @@ std::string last_error(const char* where) {
 }
 
 }  // namespace
+
+void set_http_cancel_flag(const std::atomic<bool>* flag) { g_http_cancel = flag; }
+const std::atomic<bool>* http_cancel_flag() { return g_http_cancel; }
+bool http_cancel_requested() {
+    return g_http_cancel && g_http_cancel->load(std::memory_order_acquire);
+}
 
 HttpResponse http_post(const std::string& url,
                        const std::vector<std::pair<std::string, std::string>>& headers,
@@ -150,11 +159,15 @@ HttpResponse http_post(const std::string& url,
         out.error = last_error("WinHttpQueryHeaders");
         return out;
     }
-    out.status = static_cast<long>(status);
-
     // --- read the full body ---------------------------------------------------
     std::string buf;
     for (;;) {
+        if (http_cancel_requested()) {
+            out.body.clear();
+            out.status = 0;
+            out.error = "cancelled";
+            return out;
+        }
         DWORD avail = 0;
         if (!WinHttpQueryDataAvailable(request, &avail)) {
             out.error = last_error("WinHttpQueryDataAvailable");
@@ -293,6 +306,18 @@ namespace agent {
 
 namespace {
 
+thread_local const std::atomic<bool>* g_http_cancel = nullptr;
+
+}  // namespace
+
+void set_http_cancel_flag(const std::atomic<bool>* flag) { g_http_cancel = flag; }
+const std::atomic<bool>* http_cancel_flag() { return g_http_cancel; }
+bool http_cancel_requested() {
+    return g_http_cancel && g_http_cancel->load(std::memory_order_acquire);
+}
+
+namespace {
+
 // Process-wide one-time curl_global_init. libcurl will lazy-init on the first
 // easy handle, but doing it explicitly once (and never curl_global_cleanup, since
 // these handles are created ad hoc across the process lifetime) is the documented,
@@ -306,10 +331,18 @@ const CurlGlobal& curl_global() {
 }
 
 size_t write_cb(char* ptr, size_t size, size_t nmemb, void* userdata) {
+    if (http_cancel_requested()) return 0;  // abort transfer
     auto* buf = static_cast<std::string*>(userdata);
     const size_t n = size * nmemb;
     buf->append(ptr, n);
     return n;
+}
+
+// Progress/xfer callback: return nonzero to abort. Polled frequently by libcurl
+// even while waiting on a slow response body (the 192s provider-call dead zone).
+int xferinfo_cb(void* /*clientp*/, curl_off_t /*dltotal*/, curl_off_t /*dlnow*/,
+                curl_off_t /*ultotal*/, curl_off_t /*ulnow*/) {
+    return http_cancel_requested() ? 1 : 0;
 }
 
 // Shared request path for POST (body != nullptr) and GET (body == nullptr).
@@ -343,14 +376,28 @@ HttpResponse curl_request(const std::string& url,
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, static_cast<long>(timeout_ms));
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);  // mirror WinHTTP's default redirect follow.
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);        // thread-safe DNS timeouts (no SIGALRM).
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, xferinfo_cb);
+    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, nullptr);
     if (body) {
         curl_easy_setopt(curl, CURLOPT_POST, 1L);
         curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body->data());
         curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(body->size()));
     }
 
+    if (http_cancel_requested()) {
+        if (hdrs) curl_slist_free_all(hdrs);
+        curl_easy_cleanup(curl);
+        out.error = "cancelled";
+        return out;
+    }
+
     const CURLcode res = curl_easy_perform(curl);
-    if (res != CURLE_OK) {
+    if (res == CURLE_ABORTED_BY_CALLBACK || http_cancel_requested()) {
+        out.body.clear();
+        out.status = 0;
+        out.error = "cancelled";
+    } else if (res != CURLE_OK) {
         // Transport-level failure: status stays 0, body may be partial — clear it.
         out.body.clear();
         out.error = std::string("curl_easy_perform failed: ") + curl_easy_strerror(res);
@@ -359,6 +406,7 @@ HttpResponse curl_request(const std::string& url,
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
         out.status = status;
     }
+
 
     if (hdrs) curl_slist_free_all(hdrs);
     curl_easy_cleanup(curl);
@@ -373,6 +421,7 @@ struct StreamCtx {
     const HttpChunkCb* cb;
 };
 size_t stream_write_cb(char* ptr, size_t size, size_t nmemb, void* userdata) {
+    if (http_cancel_requested()) return 0;  // abort transfer
     auto* ctx = static_cast<StreamCtx*>(userdata);
     const size_t n = size * nmemb;
     ctx->body->append(ptr, n);
@@ -408,11 +457,23 @@ HttpResponse curl_stream_request(const std::string& url,
     curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 0L);  // no hard total-transfer cap
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, xferinfo_cb);
+    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, nullptr);
     curl_easy_setopt(curl, CURLOPT_POST, 1L);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.data());
     curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(body.size()));
+    if (http_cancel_requested()) {
+        if (hdrs) curl_slist_free_all(hdrs);
+        curl_easy_cleanup(curl);
+        out.error = "cancelled";
+        return out;
+    }
     const CURLcode res = curl_easy_perform(curl);
-    if (res != CURLE_OK) {
+    if (res == CURLE_ABORTED_BY_CALLBACK || http_cancel_requested()) {
+        // Keep any partial body (accumulated SSE) so the caller can salvage text.
+        out.error = "cancelled";
+    } else if (res != CURLE_OK) {
         // Keep any partial body (accumulated SSE) so the caller can salvage text.
         out.error = std::string("curl_easy_perform failed: ") + curl_easy_strerror(res);
     } else {

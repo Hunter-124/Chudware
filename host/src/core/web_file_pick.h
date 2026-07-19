@@ -1,11 +1,12 @@
 // Browser file picker + workspace browser for the Emscripten build.
 //
-// Opens a hidden <input type=file>, blocks (PROXY_TO_PTHREAD worker) until the
-// user picks or cancels, and returns the file bytes + name. Desktop stub always
-// cancels so call sites can share the header.
+// Opens a hidden <input type=file>, yields via ASYNCIFY (emscripten_sleep) until
+// the user picks or cancels, and returns the file bytes + name. Desktop stub
+// always cancels so call sites can share the header.
 //
-// Also provides a blocking workspace tree browser (list via /workspace/list) so
-// Open / Save As / Open Folder can pick server-side paths under the workspace.
+// The workspace Open dialog's "Upload from my machine…" path fills the pick
+// buffer from JS (gesture-safe) then signals browse done with "__UPLOAD__";
+// callers consume via consumePickedFile() — never re-open a second picker.
 #pragma once
 
 #include <cstdint>
@@ -21,7 +22,13 @@ struct PickedFile {
 
 // accept: HTML accept attribute (e.g. ".step+,.step,.stl" or ""); empty = any.
 // Returns true and fills out on success; false on cancel/error (err set on error).
+// Prefer the workspace-browser upload path + consumePickedFile() for Open dialogs.
 bool pickFile(const char* accept, PickedFile& out, std::string& err);
+
+// Non-blocking: take bytes already delivered by JS into the pick buffer
+// (billet_file_pick_done). Used after browseWorkspace returns "__UPLOAD__".
+// Returns true and fills out on success; false if nothing pending / cancel / error.
+bool consumePickedFile(PickedFile& out, std::string& err);
 
 // Minimal text prompt for a save filename (suggested prefilled). Returns "" on cancel.
 std::string promptSaveFilename(const char* suggested);

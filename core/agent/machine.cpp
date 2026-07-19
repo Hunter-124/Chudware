@@ -4,7 +4,8 @@
 #include "agent/providers.h"
 
 #include <algorithm>
-
+#include <map>
+#include <mutex>
 #include <vector>
 
 namespace aicad {
@@ -13,6 +14,43 @@ namespace agent {
 const std::map<std::string, int> kDefaultBudgets = {
     {"intake", 1}, {"plan", 2}, {"model", 4}, {"review", 2}, {"fix", 4}, {"memory", 1},
 };
+
+namespace {
+std::mutex g_run_ctl_mtx;
+std::map<std::string, RunControl> g_run_ctl;
+}  // namespace
+
+void register_run_control(const std::string& run_id, RunControl control) {
+    if (run_id.empty()) return;
+    std::lock_guard<std::mutex> lk(g_run_ctl_mtx);
+    g_run_ctl[run_id] = std::move(control);
+}
+
+void unregister_run_control(const std::string& run_id) {
+    if (run_id.empty()) return;
+    std::lock_guard<std::mutex> lk(g_run_ctl_mtx);
+    g_run_ctl.erase(run_id);
+}
+
+json cancel_run(const std::string& run_id) {
+    if (run_id.empty()) return json{{"ok", true}, {"cancelled", false}};
+    RunControl ctl;
+    bool found = false;
+    {
+        std::lock_guard<std::mutex> lk(g_run_ctl_mtx);
+        auto it = g_run_ctl.find(run_id);
+        if (it != g_run_ctl.end()) {
+            ctl = it->second;
+            found = true;
+        }
+    }
+    if (!found) return json{{"ok", true}, {"cancelled", false}};
+    ctl.request_cancel();
+    // Also poke the thread-local HTTP cancel if this thread owns the transfer
+    // (usually agent_cancel is cross-thread — the xfer callback reads the atomic
+    // flag via the RunControl shared_ptr installed at run start).
+    return json{{"ok", true}, {"cancelled", true}};
+}
 
 bool is_planning_stage(const std::string& stage) {
     // Strong-model stages under prewalk: understand / plan / review / memory.
@@ -542,10 +580,11 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
     std::vector<std::string> steps = actions.plan_steps(state);
     if (steps.empty()) steps.push_back("");
     // Surface the ordered task list so the UI can show a live build checklist (long-horizon
-    // planning). Unknown event kinds are ignored by consumers, so this is forward-compatible.
-    // Also emit plan_state shape=checklist (additive; keep raw plan_steps).
-    // When plan ran and steps have content, emit the model-step checklist (ids model:N).
-    // Solo uses the stage checklist above instead of a blank-step card.
+    // planning). When model-step plan_state (ids model:N) is emitted, do NOT also emit the
+    // legacy plan_steps event — host used to synthesize step:N rows from it and double the
+    // checklist. plan_steps is kept only on paths that do NOT emit plan_state checklist
+    // (e.g. solo/blank steps where emit_model_steps is false — and even then solo uses the
+    // stage checklist above, so plan_steps is only for bare consumers with no plan_state).
     auto steps_have_content = [&]() {
         for (const auto& s : steps)
             if (!s.empty()) return true;
@@ -553,12 +592,16 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
     };
     const bool emit_model_steps = !plan_skipped && steps_have_content();
     {
-        json task_arr = json::array();
-        for (const std::string& s : steps) task_arr.push_back(s);
-        events.emit("plan_steps", json{{"steps", task_arr}, {"total", (int)steps.size()}});
-        if (emit_model_steps)
+        if (emit_model_steps) {
             emit_plan_state(events, "checklist", "Model steps", /*summary=*/"", /*revision=*/1,
                             plan_state_items_from_steps(steps, /*running_index=*/-1));
+        } else {
+            // No plan_state checklist for these steps — keep legacy plan_steps for any
+            // consumer that still keys off it (solo stage checklist is already emitted).
+            json task_arr = json::array();
+            for (const std::string& s : steps) task_arr.push_back(s);
+            events.emit("plan_steps", json{{"steps", task_arr}, {"total", (int)steps.size()}});
+        }
     }
     int checklist_rev = 1;
     int stagnant = 0;
@@ -690,6 +733,7 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
             fix_status = "running";
             if (plan_skipped) emit_stage_checklist();
             while (fix_calls < fix_limit) {
+                if (cancelled()) return cancel_result();
                 ++fix_calls;
                 std::string fix_v =
                     run_attempt("fix", actions.fix, "fixer", fix_calls, fix_limit);

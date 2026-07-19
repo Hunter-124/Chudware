@@ -14,7 +14,7 @@
 // The request BUILDERS are kept pure (no network) so they can be golden-tested
 // offline against the Python oracle (tools/cpp_agent_parity.py).
 #pragma once
-
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -169,6 +169,10 @@ std::function<void(const json&)>& provider_call_emitter();
 // callback (the completion still streams over the wire, just not forwarded live).
 void set_provider_delta_emitter(std::function<void(const std::string&, const std::string&)> emit);
 std::function<void(const std::string&, const std::string&)>& provider_delta_emitter();
+// Thread the active run's cancel flag into complete()/HTTP for the duration of a call
+// (or whole run). complete() also re-checks between retry/tool-loop iterations.
+void set_provider_cancel_flag(const std::atomic<bool>* flag);
+const std::atomic<bool>* provider_cancel_flag();
 CompleteResult complete(const std::string& provider, const json& cfg, const std::string& system,
                         const json& messages, int max_tokens = 8000);
 

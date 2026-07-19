@@ -1,11 +1,16 @@
 """services.plm.client — the in-process VaultClient seam (contract §7.1).
 
 ``services/agent/plm_bridge.py`` (T-W18) imports :class:`PLMVaultClient` lazily
-behind the ``AICAD_PLM_BRIDGE=1`` feature flag and duck-types it against its
+behind the bridge enablement gate and duck-types it against its
 ``VaultClient`` Protocol. This class is the AI-authored twin of the MCP
 ``plm_checkpoint`` tool: it is the ONLY path that writes the §3.4 ``ai``
 attribution block (from ``run_id`` / ``artifact_id``), keeping the MCP envelope
 deliberately un-widened (contract §7.1).
+
+Bridge enablement precedence (see ``services.agent.plm_bridge``):
+    1. project manifest ``ai_mode == "managed"`` → real client (no env needed)
+    2. ``AICAD_PLM_BRIDGE=1`` → real client
+    3. otherwise → MockVault (default off)
 
 Surface (frozen, must satisfy the Protocol verbatim):
     is_available() -> bool
@@ -16,14 +21,21 @@ Surface (frozen, must satisfy the Protocol verbatim):
 ``project_id_for_run`` is BEST-EFFORT (contract §7.1): v1 keeps a small
 run→project map that callers may populate; a ``None`` return simply causes the
 bridge to queue the link. It is NOT a mandated registry.
+
+Use :func:`shared_client` so run↔project registrations survive across bridge
+constructions inside one agent process.
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
-_MODEL_DEFAULT = "claude-fable-5"
+_MODEL_DEFAULT = "claude-sonnet-4-6"
 _PROVIDER_DEFAULT = "anthropic"
+
+# Process-wide client so register_run / register_project stick across turns.
+_SHARED: "PLMVaultClient | None" = None
 
 
 class PLMVaultClient:
@@ -46,6 +58,41 @@ class PLMVaultClient:
     def register_run(self, run_id: str, project_id: str) -> None:
         """Best-effort: associate a run with a project (contract §7.1)."""
         self._run_projects[run_id] = project_id
+
+    def register_project_dir(self, project_dir: str | os.PathLike) -> str | None:
+        """Open *project_dir* (idempotent), learn its project_id, and register.
+
+        Returns the project_id, or ``None`` when the folder is not a readable
+        vault. Never creates side effects beyond Vault.open's zero-config init
+        when a vault is absent — callers that only want existing vaults should
+        check for ``.aicadvault`` first.
+        """
+        root = Path(project_dir)
+        if not root.is_dir():
+            return None
+        try:
+            from services.plm.vault import Vault
+
+            v = Vault.open(root)
+            try:
+                pid = v.status().get("project_id") or v.manifest().get("project", {}).get("id")
+            finally:
+                v.close()
+        except Exception:
+            return None
+        if not pid:
+            return None
+        self.register_project(str(pid), str(root))
+        return str(pid)
+
+    def bind_run(self, run_id: str, project_dir: str | os.PathLike) -> str | None:
+        """Register *run_id* ↔ project at *project_dir*. Returns project_id or None."""
+        if not run_id:
+            return None
+        pid = self.register_project_dir(project_dir)
+        if pid:
+            self.register_run(run_id, pid)
+        return pid
 
     def project_id_for_run(self, run_id: str) -> str | None:
         """Best-effort run→project lookup; ``None`` is a valid answer (§7.1)."""
@@ -137,3 +184,18 @@ class PLMVaultClient:
         finally:
             v.close()
         return {"ok": True, "commit": res["commit"], "entry": res["entry"]}
+
+
+def shared_client(provider: str = _PROVIDER_DEFAULT,
+                  model: str = _MODEL_DEFAULT) -> PLMVaultClient:
+    """Process-wide :class:`PLMVaultClient` (run↔project map survives turns)."""
+    global _SHARED
+    if _SHARED is None:
+        _SHARED = PLMVaultClient(provider=provider, model=model)
+    return _SHARED
+
+
+def reset_shared_client() -> None:
+    """Drop the process-wide client — tests only."""
+    global _SHARED
+    _SHARED = None

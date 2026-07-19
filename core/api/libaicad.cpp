@@ -1667,6 +1667,12 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             result["events"] = captured;
             return emit(std::move(result), out_json, 0);
         }
+        if (m == "agent_cancel") {
+            // Best-effort stop at the next stage boundary / in-flight HTTP xfer.
+            // {run_id} -> {ok, cancelled:bool}. Unknown/finished run_id => cancelled:false.
+            const std::string run_id = jstr(params, "run_id");
+            return emit(aicad::agent::cancel_run(run_id), out_json, 0);
+        }
         if (m == "agent_run") {
             // HOST-ERGONOMIC entry: {request, doc_id, options?, provider?}.
             // The host sends just {request, doc_id}; the core resolves everything:

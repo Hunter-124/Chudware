@@ -117,6 +117,9 @@ struct PlmHubState {
     int         setGen = -1; bool setLoading = false; std::string setErr;
     std::string partPrefix, aiMode;
     bool        autoCommit = true;        // record saves to history automatically
+    // Fired once per projectDir when the hub first loads it (setActiveProjectDir
+    // also fires plm_record_outside; this covers "open PLM tab on already-set dir").
+    std::string outsideRecordedFor;
 
     // git (Git page) — real git / GitHub client
     int         gitGen = -1; bool gitLoading = false; std::string gitErr;

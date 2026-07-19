@@ -8,8 +8,10 @@
 // session: StageActions bundles the callables; run.py LIVE wiring is P53b.
 #pragma once
 
+#include <atomic>
 #include <functional>
 #include <map>
+#include <memory>
 #include <string>
 
 #include <nlohmann/json.hpp>
@@ -90,10 +92,23 @@ struct StageActions {
     std::function<std::vector<std::string>(DesignState&)> plan_steps;
 };
 
-// Cooperative-cancel flag, checked at every stage boundary.
+// Cooperative-cancel flag, checked at every stage boundary AND (via the process-wide
+// run registry + thread-local HTTP cancel flag) inside in-flight provider HTTP calls.
+// cancelled is an atomic shared_ptr so agent_cancel can flip it from another thread.
 struct RunControl {
-    std::function<bool()> cancelled = [] { return false; };
+    std::shared_ptr<std::atomic<bool>> flag = std::make_shared<std::atomic<bool>>(false);
+    std::function<bool()> cancelled = [f = flag] { return f && f->load(std::memory_order_acquire); };
+    void request_cancel() {
+        if (flag) flag->store(true, std::memory_order_release);
+    }
 };
+
+// Process-wide run-id → RunControl registry. Runs register on start, unregister on finish.
+// agent_cancel(run_id) flips the flag so stage boundaries + HTTP xfer callbacks abort.
+void register_run_control(const std::string& run_id, RunControl control);
+void unregister_run_control(const std::string& run_id);
+// Returns {ok:true, cancelled:bool} — cancelled is true when a live run was flagged.
+json cancel_run(const std::string& run_id);
 
 // Drive the state machine to completion. Returns {status, stop_reason}.
 json run_machine(DesignState& state, const StageActions& actions, RunEvents& events,

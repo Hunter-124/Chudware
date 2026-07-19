@@ -6,7 +6,7 @@
 // a single blocking POST. Streaming is NOT needed (the Python providers are all
 // non-streaming `messages.create` / `chat.completions.create` calls).
 #pragma once
-
+#include <atomic>
 #include <functional>
 #include <string>
 #include <utility>
@@ -15,6 +15,12 @@
 namespace aicad {
 namespace agent {
 
+// Thread-local cooperative-cancel for in-flight HTTP. complete()/run_design set this
+// from the run's RunControl so CURLOPT_XFERINFOFUNCTION (and WinHTTP read loops) can
+// abort mid-transfer within ~1s of agent_cancel. nullptr = no cancel (default).
+void set_http_cancel_flag(const std::atomic<bool>* flag);
+const std::atomic<bool>* http_cancel_flag();
+bool http_cancel_requested();
 // The result of an http_post. On a transport-level failure (DNS, TLS, refused),
 // `status` is 0 and `error` carries a human-readable reason (incl. the WinHTTP
 // GetLastError code). On an HTTP-level response `status` is the HTTP status code

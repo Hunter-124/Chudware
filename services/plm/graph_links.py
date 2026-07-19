@@ -7,6 +7,10 @@ merges on top of the deterministically extracted graph. Stored per project at
 Zero-config: a missing file reads as an empty overlay, mirroring the vault ethos.
 Deterministic extraction is the source of truth; these links are additive and never
 rewrite the model.
+
+Mutations call :func:`services.plm.cad_graph.invalidate_cache` so the next
+``cad_graph_get`` rebuilds. The graph cache fast-path also watches this file's
+mtime (key ``overlay:graph_links``) as a belt-and-suspenders invalidation signal.
 """
 from __future__ import annotations
 

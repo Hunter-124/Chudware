@@ -92,6 +92,7 @@ void launchAgentRunV2(WorkerClient& w, JobState& job,
         job.camDocId.clear();
         job.partName.clear();
         job.finalRevision = 0;
+        job.runId.clear();
     }
     { std::lock_guard<std::mutex> lk(job.evMtx); job.events.clear(); }
 
@@ -109,6 +110,14 @@ void launchAgentRunV2(WorkerClient& w, JobState& job,
             e.kind = "orch_" + origKind;
             // Carry the full event data in the "text" field as JSON for the panel to parse.
             e.text = d.dump();
+            // Capture run_id early so Stop can agent_cancel before the RPC returns.
+            {
+                std::string rid = jstr(d, "run_id");
+                if (!rid.empty()) {
+                    std::lock_guard<std::mutex> jlk(job.mtx);
+                    if (job.runId.empty()) job.runId = std::move(rid);
+                }
+            }
             // Also expose a human-readable phase hint in notes.
             std::string stage = jstr(d, "stage");
             std::string role  = jstr(d, "role");
@@ -202,8 +211,20 @@ void launchAgentRunV2(WorkerClient& w, JobState& job,
                 job.converged = false;
                 job.stopReason = result.value("stop_reason", std::string("provider_error"));
             } else {
+                // Always remember run_id from the result (backup if events lagged).
+                {
+                    std::string rid = result.value("run_id", std::string());
+                    if (!rid.empty() && job.runId.empty()) job.runId = std::move(rid);
+                }
                 const std::string status = result.value("status", std::string());
                 std::string sr = result.value("stop_reason", std::string());
+                // User cancelled — soft success for drain discard path (stopRequested).
+                if (status == "cancelled" || sr == "cancelled") {
+                    job.converged = false;
+                    job.stopReason = "cancelled";
+                    // Leave error empty so the drain doesn't paint a failure card if
+                    // stopRequested was cleared race-y; requestStopRun already finalized UI.
+                } else {
                 // User-facing gate ONLY for manual Plan / advisor escalate — not agent-decided
                 // plans (those execute after in-core advisor approval and return status done).
                 const bool isPlanReady =
@@ -275,6 +296,7 @@ void launchAgentRunV2(WorkerClient& w, JobState& job,
                     else
                         job.finalRevision = result.value("revision", 0);
                 }
+                }  // end !cancelled
             }
         }
         job.ready = true;
@@ -496,6 +518,7 @@ void launchMissionRun(WorkerClient& w, JobState& job,
         job.planReady = false; job.planReadyJson.clear();
         job.partName.clear();
         job.finalRevision = 0;
+        job.runId.clear();
     }
     { std::lock_guard<std::mutex> lk(job.evMtx); job.events.clear(); }
 
@@ -511,12 +534,18 @@ void launchMissionRun(WorkerClient& w, JobState& job,
             job.running = false;
             return;
         }
-
         WorkerClient::EventFn onEvent = [&job](const nlohmann::json& d) {
             AgentEvent e;
             std::string origKind = jstr(d, "kind");
             e.kind = "orch_" + origKind;
             e.text = d.dump();  // full event JSON for the panel/timeline to parse
+            {
+                std::string rid = jstr(d, "run_id");
+                if (!rid.empty()) {
+                    std::lock_guard<std::mutex> jlk(job.mtx);
+                    if (job.runId.empty()) job.runId = std::move(rid);
+                }
+            }
             std::string stage = jstr(d, "stage");
             std::string role  = jstr(d, "role");
             if (origKind == "stage_started")

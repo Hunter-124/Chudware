@@ -26,6 +26,8 @@ thread_local std::function<void(const json&)> g_provider_call_emitter;
 // Per-thread sink for incremental token deltas (streaming completions). kind is
 // "text" or "thinking". nullptr = no live streaming (behaviour == pre-streaming).
 thread_local std::function<void(const std::string&, const std::string&)> g_provider_delta_emitter;
+// Active run cancel flag (shared with HTTP xfer callback via set_http_cancel_flag).
+thread_local const std::atomic<bool>* g_provider_cancel = nullptr;
 
 // Incremental Server-Sent-Events accumulator for OpenAI-compatible `stream:true`
 // chat completions. feed() is called per received network buffer; it reassembles
@@ -143,6 +145,12 @@ void set_provider_delta_emitter(std::function<void(const std::string&, const std
 std::function<void(const std::string&, const std::string&)>& provider_delta_emitter() {
     return g_provider_delta_emitter;
 }
+
+void set_provider_cancel_flag(const std::atomic<bool>* flag) {
+    g_provider_cancel = flag;
+    set_http_cancel_flag(flag);
+}
+const std::atomic<bool>* provider_cancel_flag() { return g_provider_cancel; }
 
 
 const char* kAnthropicDefaultModel = "claude-opus-4-8";
@@ -913,10 +921,20 @@ RetryResult http_post_retry(const std::string& url,
                             const std::vector<std::pair<std::string, std::string>>& headers,
                             const std::string& body) {
     RetryResult out;
+    if (http_cancel_requested()) {
+        out.hr.error = "cancelled";
+        return out;
+    }
     out.hr = http_post(url, headers, body);
     int delay_ms = 1000;
     for (int attempt = 0; attempt < 4 && out.hr.error.empty() &&
                           (out.hr.status == 429 || out.hr.status == 503); ++attempt) {
+        if (http_cancel_requested()) {
+            out.hr.error = "cancelled";
+            out.hr.status = 0;
+            out.hr.body.clear();
+            break;
+        }
         if (is_daily_quota_exhausted(out.hr)) break;  // retrying won't help today — surface it now
         std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
         delay_ms *= 2;
@@ -1059,6 +1077,13 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
         emit_provider_call(r, provider);
         return r;
     };
+
+    // Cooperative cancel — checked before any network work and between retries.
+    if (http_cancel_requested() ||
+        (g_provider_cancel && g_provider_cancel->load(std::memory_order_acquire))) {
+        res.error = "cancelled";
+        return finish(std::move(res));
+    }
 
     if (provider == "mock") {
         std::vector<std::string> replies;
@@ -1380,6 +1405,11 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
             sheaders.push_back({"Accept", "text/event-stream"});
             int delay_ms = 1000;
             for (;;) {  // transient 429/503 backoff (only while nothing has streamed)
+                if (http_cancel_requested()) {
+                    hr.error = "cancelled";
+                    hr.status = 0;
+                    break;
+                }
                 acc.reset();
                 hr = http_post_stream(req.url, sheaders, stream_body, on_chunk);
                 const bool streamed_now = !acc.text.empty() || !acc.thinking.empty();

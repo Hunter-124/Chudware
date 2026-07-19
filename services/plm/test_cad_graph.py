@@ -235,6 +235,11 @@ def test_get_graph_rpc_shape(project: Path):
     assert isinstance(out["nodes"], list)
     assert isinstance(out["edges"], list)
     assert out["generated_at"]
+    assert out["truncated"] is False
+    assert out["node_count"] == len(out["nodes"])
+    assert out["edge_count"] == len(out["edges"])
+    assert isinstance(out.get("filter"), dict)
+    assert out["filter"]["include_archive"] is False
 
 
 def test_blast_radius_shared_dim(project: Path):
@@ -498,3 +503,110 @@ def test_assembly_advice_clean():
          "edges": []}
     out = cad_graph.assembly_advice(g)
     assert out["ok"] and out["suggestions"] == []
+
+
+# ---------------------------------------------------------------------------
+# ME489-scale: archive exclusion, truncation, cache fast-path
+# ---------------------------------------------------------------------------
+
+
+def test_archive_dirs_excluded_by_default(tmp_path: Path):
+    """_archive_stale / archive / .trash never contribute nodes by default."""
+    live = {
+        "schema": "aicad.part/1", "id": "live-1", "name": "Live",
+        "features": [], "bodies": [], "equations": {"globals": []},
+    }
+    stale = {
+        "schema": "aicad.part/1", "id": "stale-1", "name": "Stale",
+        "features": [], "bodies": [], "equations": {"globals": []},
+    }
+    _write(tmp_path, "Live.step+", live)
+    arch = tmp_path / "_archive_stale" / "old"
+    arch.mkdir(parents=True)
+    (arch / "Stale.step+").write_bytes(_container(stale))
+    trash = tmp_path / ".trash"
+    trash.mkdir()
+    (trash / "Gone.step+").write_bytes(_container(stale))
+
+    g = cad_graph.build_graph(tmp_path, force=True)
+    labels = {n["label"] for n in g["nodes"]}
+    assert "Live" in labels
+    assert "Stale" not in labels
+    assert g["filter"]["include_archive"] is False
+    assert "_archive_stale" in g["filter"]["exclude_dirs"]
+
+    # include_archive keeps them and tags meta.archive
+    g2 = cad_graph.build_graph(tmp_path, force=True, include_archive=True)
+    labels2 = {n["label"] for n in g2["nodes"]}
+    assert "Stale" in labels2
+    stale_nodes = [n for n in g2["nodes"]
+                   if n.get("path") and "_archive_stale" in n["path"]]
+    assert stale_nodes
+    assert all((n.get("meta") or {}).get("archive") for n in stale_nodes
+               if n["kind"] in ("part", "assembly", "doc", "drawing", "board"))
+
+
+def test_nested_aicadvault_skipped_working_tree_kept(tmp_path: Path):
+    """Nested .aicadvault is pruned; CAD files beside it still graph."""
+    nested = tmp_path / "sub_vault"
+    nested.mkdir()
+    (nested / ".aicadvault").mkdir()
+    # decoy inside the shadow tree — must NOT appear
+    decoy = {
+        "schema": "aicad.part/1", "id": "decoy", "name": "Decoy",
+        "features": [], "bodies": [], "equations": {"globals": []},
+    }
+    (nested / ".aicadvault" / "Decoy.step+").write_bytes(_container(decoy))
+    # real working-tree part beside the shadow dir — MUST appear
+    real = {
+        "schema": "aicad.part/1", "id": "real", "name": "RealNested",
+        "features": [], "bodies": [], "equations": {"globals": []},
+    }
+    (nested / "RealNested.step+").write_bytes(_container(real))
+
+    g = cad_graph.build_graph(tmp_path, force=True)
+    labels = {n["label"] for n in g["nodes"]}
+    assert "RealNested" in labels
+    assert "Decoy" not in labels
+
+
+def test_get_graph_truncation_caps(project: Path):
+    """Honest truncated:true + counts when max_nodes/max_edges bind."""
+    full = cad_graph.get_graph(project, force=True, max_nodes=0, max_edges=0)
+    assert full["truncated"] is False
+    n_full = full["node_count"]
+    assert n_full >= 3
+
+    tiny = cad_graph.get_graph(project, force=False, max_nodes=2, max_edges=1)
+    assert tiny["truncated"] is True
+    assert tiny["node_count"] == n_full
+    assert len(tiny["nodes"]) == 2
+    assert len(tiny["edges"]) <= 1
+    # every returned edge endpoints exist in the truncated node set
+    ids = {n["id"] for n in tiny["nodes"]}
+    for e in tiny["edges"]:
+        assert e["src"] in ids and e["dst"] in ids
+
+
+def test_cache_fast_path_serves_without_rescan(project: Path):
+    """Warm cache with matching filter is served on the next non-force build."""
+    g1 = cad_graph.build_graph(project, force=True)
+    t1 = g1["generated_at"]
+    assert (project / ".plm" / "graph.json").is_file()
+    assert "filter" in g1
+
+    g2 = cad_graph.build_graph(project, force=False)
+    assert g2["generated_at"] == t1
+    assert g2["filter"]["include_archive"] is False
+
+    # flipping include_archive must miss the default cache
+    g3 = cad_graph.build_graph(project, force=False, include_archive=True)
+    assert g3["filter"]["include_archive"] is True
+
+
+def test_path_is_archive_helper():
+    assert cad_graph.path_is_archive("_archive_stale/foo/Bar.step+")
+    assert cad_graph.path_is_archive("a/archive/b.step+")
+    assert cad_graph.path_is_archive(".trash/x.step+")
+    assert not cad_graph.path_is_archive("01_Design/CAD_Build/Part.step+")
+    assert not cad_graph.path_is_archive(None)

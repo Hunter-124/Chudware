@@ -15,6 +15,26 @@ Kinds (edges): CONTAINS|DEPENDS_ON|MATES|INSTANCE_OF|REFERENCES|DERIVES_FROM|
 ``inferred`` (heuristic). Cache lives at ``<project>/.plm/graph.json`` and is
 keyed by source-file mtimes; recompute is always allowed.
 
+Walk policy
+-----------
+* Always skip VCS/cache dirs (``.aicadvault``, ``.plm``, ``.git``, …). Nested
+  ``.aicadvault`` shadow trees are skipped so a nested vault is never
+  double-counted; nested vault *working trees* (the real CAD files beside the
+  shadow dir) are still walked — they are live design content.
+* Archive/stale dirs (``_archive_stale``, ``_archive``, ``archive``, ``.trash``
+  by default; override via ``exclude_dirs`` / ``AICAD_GRAPH_EXCLUDE_DIRS``) are
+  pruned from the walk so ME489-scale trees don't bloat the graph. Pass
+  ``include_archive=True`` to keep them (nodes then carry ``meta.archive``).
+
+Size guards
+-----------
+``get_graph`` caps the returned payload (``max_nodes`` / ``max_edges``, defaults
+below) and reports ``truncated`` + full ``node_count``/``edge_count`` so the UI
+can show "showing N of M". The on-disk cache stores the full (archive-filtered)
+graph; caps apply only on the response path. Cache writes are atomic
+(tmp + rename). A fast path serves the cache when its mtime is newer than every
+source ``.step+``/``.ecad+`` and the overlay, without re-reading containers.
+
 AI-VC seam: :func:`on_ai_vc_checkpoint` is the rebuild hook CheckpointsCore
 calls after a successful checkpoint (best-effort; never raises into AI-VC).
 """
@@ -37,6 +57,24 @@ _SUBASM_MIN_CLUSTER = 3
 _FLAT_ASM_MAX = 12
 _MULTIBODY_MAX = 2
 
+# Response payload caps for cad_graph_get / UI (full graph still cached).
+DEFAULT_MAX_NODES = 5000
+DEFAULT_MAX_EDGES = 10000
+
+# Dir basenames always pruned from the project walk (shadow/cache/VCS).
+# Nested .aicadvault is intentionally here — working trees beside it stay.
+_SYSTEM_SKIP_DIRS = frozenset({
+    ".aicadvault", ".plm", ".git", "__pycache__", "node_modules",
+    ".venv", "venv",
+})
+
+# Archive/stale dir basenames excluded by default (case-sensitive match on the
+# directory name as it appears on disk). Overridable via exclude_dirs kwarg or
+# AICAD_GRAPH_EXCLUDE_DIRS (os.pathsep-separated).
+DEFAULT_ARCHIVE_DIR_NAMES = frozenset({
+    "_archive_stale", "_archive", "archive", ".trash",
+})
+
 NODE_KINDS = frozenset({
     "project", "doc", "part", "assembly", "body", "feature", "sketch",
     "mate", "bom_item", "drawing", "sim_study", "board", "firmware",
@@ -58,6 +96,47 @@ _SCHEMA_KIND = {
     "aicad.req": "doc",
 }
 
+
+def _archive_dir_names(
+    exclude_dirs: Iterable[str] | None = None,
+) -> frozenset[str]:
+    """Resolve the archive/stale dir-name set (defaults + env override)."""
+    if exclude_dirs is not None:
+        return frozenset(str(d) for d in exclude_dirs if d)
+    env = os.environ.get("AICAD_GRAPH_EXCLUDE_DIRS", "").strip()
+    if env:
+        parts = [p for p in env.split(os.pathsep) if p]
+        if parts:
+            return frozenset(parts)
+    return DEFAULT_ARCHIVE_DIR_NAMES
+
+
+def _skip_dir_names(
+    *,
+    include_archive: bool = False,
+    exclude_dirs: Iterable[str] | None = None,
+) -> frozenset[str]:
+    """Dir basenames to prune from os.walk (system + optional archive set)."""
+    names = set(_SYSTEM_SKIP_DIRS)
+    if not include_archive:
+        names |= set(_archive_dir_names(exclude_dirs))
+    return frozenset(names)
+
+
+def path_is_archive(
+    rel_path: str | None,
+    archive_names: Iterable[str] | None = None,
+) -> bool:
+    """True when any path segment is an archive/stale dir basename."""
+    if not rel_path:
+        return False
+    names = frozenset(archive_names) if archive_names is not None \
+        else DEFAULT_ARCHIVE_DIR_NAMES
+    for part in str(rel_path).replace("\\", "/").split("/"):
+        if part in names:
+            return True
+    return False
+
 # ---------------------------------------------------------------------------
 # public API
 # ---------------------------------------------------------------------------
@@ -68,6 +147,8 @@ def build_graph(
     *,
     open_docs: dict[str, Any] | None = None,
     force: bool = False,
+    include_archive: bool = False,
+    exclude_dirs: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Build (or load-cached) the CAD project graph.
 
@@ -80,11 +161,40 @@ def build_graph(
         (engine sessions). Merged on top of on-disk containers.
     force
         Skip the mtime cache and rebuild.
+    include_archive
+        When False (default), prune archive/stale directories from the walk.
+        When True, keep them; nodes under those dirs get ``meta.archive=True``.
+    exclude_dirs
+        Optional override for archive dir basenames (defaults:
+        :data:`DEFAULT_ARCHIVE_DIR_NAMES` / ``AICAD_GRAPH_EXCLUDE_DIRS``).
     """
     root = Path(project_dir).resolve() if project_dir else None
-    sources = _collect_sources(root, open_docs or {})
+    archive_names = _archive_dir_names(exclude_dirs)
+    skip_names = _skip_dir_names(
+        include_archive=include_archive, exclude_dirs=exclude_dirs)
+
+    # Fast path: serve cache when fresher than every source mtime — avoids
+    # re-reading every .step+ container on ME489-scale trees. Skipped when
+    # open_docs are merged (those are ephemeral and not on disk).
+    if (not force and root is not None
+            and not (open_docs or {})):
+        cached = _load_cache_if_valid(
+            root, sources=None,
+            include_archive=include_archive,
+            archive_names=sorted(archive_names),
+        )
+        if cached is not None:
+            return cached
+
+    sources = _collect_sources(
+        root, open_docs or {}, skip_names=skip_names,
+        archive_names=archive_names, include_archive=include_archive)
     if not force and root is not None:
-        cached = _load_cache_if_valid(root, sources)
+        cached = _load_cache_if_valid(
+            root, sources,
+            include_archive=include_archive,
+            archive_names=sorted(archive_names),
+        )
         if cached is not None:
             return cached
 
@@ -155,10 +265,14 @@ def build_graph(
             node_kind = "doc"
 
         dnode_id = f"doc:{doc_id}" if not rel else f"doc:{rel}"
+        is_arch = bool(src.get("archive"))
+        doc_meta: dict[str, Any] = {"schema": schema, "uuid": doc_uuid}
+        if is_arch:
+            doc_meta["archive"] = True
         add_node({
             "id": dnode_id, "kind": node_kind, "label": name,
             "path": rel or None, "doc_id": doc_id,
-            "meta": {"schema": schema, "uuid": doc_uuid},
+            "meta": doc_meta,
             "origin": ORIGIN_EXTRACTED,
         })
         add_edge(proj_id, dnode_id, "CONTAINS")
@@ -501,7 +615,9 @@ def build_graph(
 
     # --- project-level folders: sim studies, boards, firmware --------------
     if root is not None:
-        _walk_project_folders(root, proj_id, add_node, add_edge, path_to_doc_node)
+        _walk_project_folders(
+            root, proj_id, add_node, add_edge, path_to_doc_node,
+            skip_names=skip_names)
 
     # --- resolve __resolve__: targets --------------------------------------
     resolved_edges: list[dict[str, Any]] = []
@@ -563,6 +679,11 @@ def build_graph(
         "generated_at": generated_at,
         "project_dir": str(root) if root else None,
         "mtimes": {s["key"]: s["mtime"] for s in sources if s.get("key")},
+        "filter": {
+            "include_archive": bool(include_archive),
+            "exclude_dirs": sorted(archive_names),
+            "skipped_system_dirs": sorted(_SYSTEM_SKIP_DIRS),
+        },
     }
     if root is not None:
         _save_cache(root, graph)
@@ -575,9 +696,23 @@ def get_graph(
     doc_id: str | None = None,
     open_docs: dict[str, Any] | None = None,
     force: bool = False,
+    include_archive: bool = False,
+    exclude_dirs: Iterable[str] | None = None,
+    max_nodes: int | None = None,
+    max_edges: int | None = None,
 ) -> dict[str, Any]:
-    """``cad_graph_get`` implementation."""
-    g = build_graph(project_dir, open_docs=open_docs, force=force)
+    """``cad_graph_get`` implementation.
+
+    Caps the returned node/edge lists (defaults: :data:`DEFAULT_MAX_NODES` /
+    :data:`DEFAULT_MAX_EDGES`) and always reports honest counts via
+    ``node_count`` / ``edge_count`` + ``truncated``. Pass ``max_nodes=0`` or
+    ``max_edges=0`` to disable a cap. Archive dirs are excluded by default
+    (see :func:`build_graph`).
+    """
+    g = build_graph(
+        project_dir, open_docs=open_docs, force=force,
+        include_archive=include_archive, exclude_dirs=exclude_dirs,
+    )
     if doc_id:
         # filter to the subgraph of that doc + its neighbors
         keep = {n["id"] for n in g["nodes"]
@@ -598,12 +733,39 @@ def get_graph(
             "edges": [e for e in g["edges"]
                       if e["src"] in keep and e["dst"] in keep],
         }
+
+    nodes = list(g.get("nodes") or [])
+    edges = list(g.get("edges") or [])
+    node_count = len(nodes)
+    edge_count = len(edges)
+
+    n_cap = DEFAULT_MAX_NODES if max_nodes is None else int(max_nodes)
+    e_cap = DEFAULT_MAX_EDGES if max_edges is None else int(max_edges)
+    # 0 / negative = uncapped
+    if n_cap > 0 and len(nodes) > n_cap:
+        nodes = nodes[:n_cap]
+    if e_cap > 0 and len(edges) > e_cap:
+        # drop edges whose endpoints fell off the node cap, then slice
+        keep_ids = {n["id"] for n in nodes}
+        edges = [e for e in edges
+                 if e.get("src") in keep_ids and e.get("dst") in keep_ids]
+        if len(edges) > e_cap:
+            edges = edges[:e_cap]
+
+    truncated = len(nodes) < node_count or len(edges) < edge_count
     return {
         "ok": True,
-        "nodes": g["nodes"],
-        "edges": g["edges"],
+        "nodes": nodes,
+        "edges": edges,
         "generated_at": g.get("generated_at"),
         "project_dir": g.get("project_dir"),
+        "node_count": node_count,
+        "edge_count": edge_count,
+        "truncated": truncated,
+        "filter": g.get("filter") or {
+            "include_archive": bool(include_archive),
+            "exclude_dirs": sorted(_archive_dir_names(exclude_dirs)),
+        },
     }
 
 
@@ -862,17 +1024,29 @@ def invalidate_cache(project_dir: str | os.PathLike) -> None:
 def _collect_sources(
     root: Path | None,
     open_docs: dict[str, Any],
+    *,
+    skip_names: frozenset[str] | None = None,
+    archive_names: frozenset[str] | None = None,
+    include_archive: bool = False,
 ) -> list[dict[str, Any]]:
+    """Walk project for .step+/.ecad+ containers.
+
+    *skip_names* basenames are pruned from os.walk (system + archive by
+    default). Nested ``.aicadvault`` is always in the system set so shadow
+    trees are never double-counted; nested vault *working* trees remain.
+    When *include_archive* is True, archive dirs are walked and each source
+    is tagged ``archive=True`` for node meta.
+    """
     sources: list[dict[str, Any]] = []
     seen_keys: set[str] = set()
+    skip = skip_names if skip_names is not None else _skip_dir_names(
+        include_archive=include_archive)
+    arch = archive_names if archive_names is not None else DEFAULT_ARCHIVE_DIR_NAMES
 
     if root is not None and root.is_dir():
         for dirpath, dirnames, filenames in os.walk(root):
-            # skip vault / cache / vcs
-            dirnames[:] = [d for d in dirnames
-                           if d not in {".aicadvault", ".plm", ".git",
-                                        "__pycache__", "node_modules",
-                                        ".venv", "venv"}]
+            # prune system + (optional) archive dirs in-place
+            dirnames[:] = [d for d in dirnames if d not in skip]
             for fn in filenames:
                 lower = fn.lower()
                 if not (lower.endswith(".step+") or lower.endswith(".ecad+")):
@@ -892,6 +1066,7 @@ def _collect_sources(
                     "doc": doc, "doc_id": doc.get("id"),
                     "study_ids": study_ids,
                     "kind_hint": "board" if lower.endswith(".ecad+") else None,
+                    "archive": path_is_archive(rel, arch),
                 })
                 seen_keys.add(key)
 
@@ -904,6 +1079,7 @@ def _collect_sources(
         sources.append({
             "key": key, "path": None, "mtime": time.time(),
             "doc": doc, "doc_id": did, "study_ids": [],
+            "archive": False,
         })
     return sources
 
@@ -938,19 +1114,25 @@ def _walk_project_folders(
     add_node,
     add_edge,
     path_to_doc_node: dict[str, str],
+    *,
+    skip_names: frozenset[str] | None = None,
 ) -> None:
     """Emit sim_study / board / firmware nodes from well-known project dirs."""
+    skip = skip_names if skip_names is not None else _skip_dir_names()
     for child in sorted(root.iterdir() if root.is_dir() else []):
         if not child.is_dir():
             continue
-        name = child.name.lower()
-        if name in {".aicadvault", ".plm", ".git", "__pycache__",
-                    ".venv", "venv", "node_modules"}:
+        # basename match — system + archive dirs never contribute folder nodes
+        if child.name in skip or child.name.lower() in {
+            ".aicadvault", ".plm", ".git", "__pycache__",
+            ".venv", "venv", "node_modules",
+        }:
             continue
         try:
             entries = set(os.listdir(child))
         except OSError:
             continue
+        name = child.name.lower()
         rel = child.name
 
         # firmware markers
@@ -1027,38 +1209,188 @@ def _cache_path(root: Path) -> Path:
     return root / ".plm" / "graph.json"
 
 
-def _load_cache_if_valid(root: Path, sources: list[dict[str, Any]]) -> dict | None:
+def _overlay_mtime(root: Path) -> float:
+    """mtime of graph_links.json overlay (0 if absent)."""
+    p = root / ".plm" / "graph_links.json"
+    try:
+        return p.stat().st_mtime if p.is_file() else 0.0
+    except OSError:
+        return 0.0
+
+
+def _source_mtimes_fast(
+    root: Path,
+    *,
+    skip_names: frozenset[str],
+) -> dict[str, float]:
+    """Scan source container mtimes without reading zip contents.
+
+    Used by the cache fast-path so a warm ME489-scale tree can validate the
+    on-disk graph without re-parsing every .step+.
+    """
+    out: dict[str, float] = {}
+    if not root.is_dir():
+        return out
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in skip_names]
+        for fn in filenames:
+            lower = fn.lower()
+            if not (lower.endswith(".step+") or lower.endswith(".ecad+")):
+                continue
+            fp = Path(dirpath) / fn
+            try:
+                rel = str(fp.relative_to(root)).replace("\\", "/")
+                out[f"file:{rel}"] = fp.stat().st_mtime
+            except OSError:
+                continue
+    # overlay participates in invalidation (add/remove also invalidate_cache)
+    om = _overlay_mtime(root)
+    if om > 0:
+        out["overlay:graph_links"] = om
+    return out
+
+
+def _filter_matches(
+    data: dict[str, Any],
+    *,
+    include_archive: bool,
+    archive_names: list[str] | None,
+) -> bool:
+    """True when cached filter policy matches this request.
+
+    Caches written before the archive-exclusion addendum lack a ``filter``
+    block — treat those as a miss so ME489-scale trees rebuild without
+    ``_archive_stale`` bloat rather than serving a stale 500MB+ payload.
+    """
+    filt = data.get("filter")
+    if not isinstance(filt, dict):
+        return False
+    if bool(filt.get("include_archive", False)) != bool(include_archive):
+        return False
+    wanted = sorted(str(x) for x in (
+        archive_names if archive_names is not None
+        else sorted(DEFAULT_ARCHIVE_DIR_NAMES)
+    ))
+    cached = sorted(str(x) for x in (filt.get("exclude_dirs") or []))
+    return cached == wanted
+
+
+def _load_cache_if_valid(
+    root: Path,
+    sources: list[dict[str, Any]] | None = None,
+    *,
+    include_archive: bool = False,
+    archive_names: list[str] | None = None,
+) -> dict | None:
+    """Return cached graph when still valid.
+
+    Fast path: if cache mtime is newer than every source .step+/.ecad+ (and
+    the overlay) under the same skip policy, serve without re-reading
+    containers. Falls back to the full key-set mtime compare when *sources*
+    is supplied (normal build_graph path already collected them).
+    """
     cp = _cache_path(root)
     if not cp.is_file():
         return None
     try:
+        cache_mtime = cp.stat().st_mtime
+    except OSError:
+        return None
+
+    skip = _skip_dir_names(
+        include_archive=include_archive,
+        exclude_dirs=archive_names,
+    )
+
+    # --- fast path: cache fresher than all source files --------------------
+    try:
+        fast_mtimes = _source_mtimes_fast(root, skip_names=skip)
+        newest_src = max(fast_mtimes.values()) if fast_mtimes else 0.0
+        if cache_mtime + 1e-6 >= newest_src:
+            data = json.loads(cp.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return None
+            if not _filter_matches(
+                    data, include_archive=include_archive,
+                    archive_names=archive_names):
+                return None
+            cached_mtimes = data.get("mtimes") or {}
+            # Prefer caller-supplied sources; else the fast mtime scan.
+            if sources is not None:
+                current = {s["key"]: s["mtime"] for s in sources if s.get("key")}
+            else:
+                current = dict(fast_mtimes)
+            cached_files = {k: v for k, v in cached_mtimes.items()
+                            if not str(k).startswith("overlay:")
+                            and not str(k).startswith("open:")}
+            current_files = {k: v for k, v in current.items()
+                             if not str(k).startswith("overlay:")
+                             and not str(k).startswith("open:")}
+            if set(cached_files) != set(current_files):
+                return None
+            for k, mt in current_files.items():
+                if abs(float(cached_files.get(k, -1)) - float(mt)) > 1e-6:
+                    return None
+            data["ok"] = True
+            return data
+    except Exception:  # noqa: BLE001
+        # fall through to full parse path
+        pass
+
+    # --- full path: parse cache + compare recorded mtimes ------------------
+    try:
         data = json.loads(cp.read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001
         return None
-    cached_mtimes = data.get("mtimes") or {}
-    current = {s["key"]: s["mtime"] for s in sources if s.get("key")}
-    # any new/missing/changed mtime → invalidate
-    if set(cached_mtimes) != set(current):
+    if not isinstance(data, dict):
         return None
-    for k, mt in current.items():
-        # float compare with small epsilon for FS granularity
-        if abs(float(cached_mtimes.get(k, -1)) - float(mt)) > 1e-6:
+    if not _filter_matches(
+            data, include_archive=include_archive,
+            archive_names=archive_names):
+        return None
+    cached_mtimes = data.get("mtimes") or {}
+    if sources is None:
+        return None
+    current = {s["key"]: s["mtime"] for s in sources if s.get("key")}
+    # ignore open: keys for durable cache equality (ephemeral)
+    cached_cmp = {k: v for k, v in cached_mtimes.items()
+                  if not str(k).startswith("open:")
+                  and not str(k).startswith("overlay:")}
+    current_cmp = {k: v for k, v in current.items()
+                   if not str(k).startswith("open:")}
+    if set(cached_cmp) != set(current_cmp):
+        return None
+    for k, mt in current_cmp.items():
+        if abs(float(cached_cmp.get(k, -1)) - float(mt)) > 1e-6:
             return None
     data["ok"] = True
     return data
 
 
 def _save_cache(root: Path, graph: dict[str, Any]) -> None:
+    """Atomic cache write (tmp + os.replace). Never leaves a partial file."""
     cp = _cache_path(root)
     try:
         cp.parent.mkdir(parents=True, exist_ok=True)
-        # write atomically
-        tmp = cp.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(graph, sort_keys=True, indent=2,
-                                  default=str), encoding="utf-8")
-        tmp.replace(cp)
+        tmp = cp.with_name(cp.name + ".tmp")
+        payload = json.dumps(graph, sort_keys=True, indent=2, default=str)
+        # write + fsync so a crash mid-write can't leave a half file that
+        # rename would then promote.
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+        os.replace(tmp, cp)
     except OSError:
-        pass
+        try:
+            tmp = cp.with_name(cp.name + ".tmp")
+            if tmp.is_file():
+                tmp.unlink()
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------

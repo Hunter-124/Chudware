@@ -2841,6 +2841,24 @@ def _drive_phases_from_dag(machine, manifest, graph, dag_result, completed,
         except Exception:  # noqa: BLE001 — teardown must not crash the driver
             pass
 
+        # PLM bridge: mission terminal → vault checkpoint when enabled
+        # (managed ai_mode or AICAD_PLM_BRIDGE=1). Best-effort.
+        try:
+            from services.agent.plm_bridge import bridge_for_run  # noqa: PLC0415
+            _ws = None
+            try:
+                from services.agent import config as _acfg  # noqa: PLC0415
+                _ws = _acfg.workspace_dir()
+            except Exception:  # noqa: BLE001
+                _ws = None
+            if run_id and status == "done":
+                _br = bridge_for_run(
+                    run_id, project_dir=_ws, ledger=ledger,
+                )
+                _br.on_milestone(trigger="mission_done")
+        except Exception:  # noqa: BLE001 — bridge never blocks the mission
+            pass
+
     return reached, status, stop_reason
 
 

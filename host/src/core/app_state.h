@@ -327,6 +327,9 @@ struct JobState {
     std::mutex mtx;
     int kind = JOB_BUILD;
     std::string stl, info, error;
+    // Active agent_run_v2 / mission run_id (from run_started event or result). Used by
+    // requestStopRun → agent_cancel so Stop aborts the in-flight provider call.
+    std::string runId;
     bool errorIsCad = false;          // error came from CAD code that didn't build (expected,
                                       // the loop self-corrects) — NOT an app/runtime failure
     bool isAssembly = false;          // final result was a multi-part assembly

@@ -10,7 +10,12 @@ from typing import Any, Callable
 
 
 def _cad_graph_get(params: dict, _emit: Callable) -> dict:
-    """``cad_graph_get {project_dir?|doc_id?} -> {ok, nodes, edges, generated_at}``."""
+    """``cad_graph_get {project_dir?|doc_id?} -> {ok, nodes, edges, generated_at, …}``.
+
+    Additive optional params (contracts/cad_graph.md addenda):
+      force, include_archive, max_nodes, max_edges, open_docs.
+    Response always includes node_count/edge_count/truncated/filter.
+    """
     try:
         from services.plm import cad_graph as cg
     except Exception as exc:  # noqa: BLE001
@@ -20,9 +25,24 @@ def _cad_graph_get(params: dict, _emit: Callable) -> dict:
         project_dir = p.get("project_dir") or p.get("path") or None
         doc_id = p.get("doc_id") or None
         force = bool(p.get("force", False))
+        include_archive = bool(p.get("include_archive", False))
         open_docs = p.get("open_docs") if isinstance(p.get("open_docs"), dict) else None
+        max_nodes = p.get("max_nodes", None)
+        max_edges = p.get("max_edges", None)
+        if max_nodes is not None:
+            try:
+                max_nodes = int(max_nodes)
+            except (TypeError, ValueError):
+                max_nodes = None
+        if max_edges is not None:
+            try:
+                max_edges = int(max_edges)
+            except (TypeError, ValueError):
+                max_edges = None
         return cg.get_graph(
             project_dir, doc_id=doc_id, open_docs=open_docs, force=force,
+            include_archive=include_archive,
+            max_nodes=max_nodes, max_edges=max_edges,
         )
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"cad_graph_get failed: {exc}", "hint": ""}

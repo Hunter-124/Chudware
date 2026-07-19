@@ -10,6 +10,7 @@
 #include <optional>
 #include <sstream>
 #include <memory>
+#include "agent/machine.h"
 
 #include "agent/config.h"
 #include "agent/events.h"
@@ -765,6 +766,17 @@ json run_micro_design(const std::string& request, const std::string& doc_id,
                               std::chrono::steady_clock::now().time_since_epoch().count()));
     std::string prompts_dir = options.value("prompts_dir", std::string());
 
+    RunControl run_ctl;
+    register_run_control(run_id, run_ctl);
+    struct RunCtlGuard {
+        std::string id;
+        ~RunCtlGuard() { unregister_run_control(id); }
+    } run_ctl_guard{run_id};
+    set_provider_cancel_flag(run_ctl.flag.get());
+    struct ProvCancelGuard {
+        ~ProvCancelGuard() { set_provider_cancel_flag(nullptr); }
+    } prov_cancel_guard;
+
     RunEvents events(run_id, emit);
     // Live provider_call debug events → same orch stream as stage events.
     set_provider_call_emitter([&events](const json& ev) {
@@ -840,10 +852,7 @@ json run_micro_design(const std::string& request, const std::string& doc_id,
                     {"doc_id", doc_id}};
     }
 
-    bool has_control = options.contains("control") && options["control"].is_object();
-    auto cancelled = [&]() -> bool {
-        return has_control && options["control"].value("cancelled", false);
-    };
+    auto cancelled = [&]() -> bool { return run_ctl.cancelled(); };
 
     ProviderFn provider = make_provider(provider_cfg);
 

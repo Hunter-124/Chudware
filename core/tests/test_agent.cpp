@@ -757,6 +757,7 @@ TEST_CASE("run_machine emits plan_state build_plan and checklist") {
 
     int n_build = 0, n_check = 0, n_obj = 0, n_plan_steps = 0, n_model_step = 0;
     json last_checklist;
+    json first_checklist;
     for (const auto& ev : seen) {
         const std::string kind = ev.value("kind", std::string());
         if (kind == "plan_steps") ++n_plan_steps;
@@ -774,6 +775,7 @@ TEST_CASE("run_machine emits plan_state build_plan and checklist") {
             CHECK(ev["items"][0]["id"] == "body");
         } else if (shape == "checklist") {
             ++n_check;
+            if (first_checklist.is_null()) first_checklist = ev;
             last_checklist = ev;
         } else if (shape == "objectives") {
             ++n_obj;
@@ -783,9 +785,17 @@ TEST_CASE("run_machine emits plan_state build_plan and checklist") {
     }
     CHECK(n_build == 1);
     CHECK(n_obj == 1);
-    CHECK(n_plan_steps == 1);  // raw event kept
+    // New contract: when model-step plan_state checklist is emitted, legacy plan_steps
+    // is suppressed (host used to synthesize step:N beside model:N → doubled task list).
+    CHECK(n_plan_steps == 0);
     CHECK(n_model_step == 2);
     CHECK(n_check >= 2);  // initial + per-step + final
+    REQUIRE(first_checklist.is_object());
+    REQUIRE(first_checklist["items"].is_array());
+    REQUIRE(first_checklist["items"].size() == 2);
+    CHECK(first_checklist["items"][0]["id"] == "model:0");
+    CHECK(first_checklist["items"][1]["id"] == "model:1");
+    CHECK(first_checklist["items"][0]["kind"] == "step");
     REQUIRE(last_checklist.is_object());
     // Final checklist should mark all done.
     for (const auto& it : last_checklist["items"])
@@ -831,6 +841,67 @@ TEST_CASE("run_machine no plan leaves plan_state absent") {
     CHECK_FALSE(has_build);
     // Blank default step does not emit a plan_state checklist card (off/no-plan unchanged).
     CHECK_FALSE(has_checklist);
+}
+
+TEST_CASE("run_machine solo blank steps still emit plan_steps without model checklist") {
+    // When plan is skipped (budgets.plan=0) or steps have no content, machine keeps the
+    // legacy plan_steps event and does NOT emit the model:N plan_state checklist.
+    DesignState st;
+    st.request = "solo blank";
+    StageActions actions;
+    auto pass = [](DesignState& s, int) {
+        // Advance geometry so memory/no_geometry guard does not fail the run.
+        s.revision += 1;
+        s.tree_digest = "f1:extrude";
+        StageOutcome o;
+        o.verdict = "pass";
+        return o;
+    };
+    actions.intake = pass;
+    actions.plan = pass;  // unused when plan budget is 0
+    actions.model = pass;
+    actions.review = pass;
+    actions.fix = pass;
+    actions.memory = pass;
+    actions.plan_steps = [](DesignState&) { return std::vector<std::string>{""}; };
+
+    std::vector<json> seen;
+    RunEvents events("plan-steps-solo-blank", [&](const json& ev) { seen.push_back(ev); });
+    json budgets = {{"plan", 0}, {"model", 1}, {"review", 1}, {"fix", 1}, {"memory", 1},
+                    {"intake", 1}};
+    json result = run_machine(st, actions, events, budgets);
+    CHECK(result["status"] == "done");
+
+    int n_plan_steps = 0, n_model_checklist = 0, n_stage_checklist = 0;
+    for (const auto& ev : seen) {
+        const std::string kind = ev.value("kind", std::string());
+        if (kind == "plan_steps") ++n_plan_steps;
+        if (kind != "plan_state") continue;
+        if (ev.value("shape", "") != "checklist") continue;
+        // model:N checklist (ids model:0, model:1, …) vs solo stage checklist (intake:/model:/…).
+        const std::string title = ev.value("title", std::string());
+        bool has_model_step_id = false;
+        if (ev.contains("items") && ev["items"].is_array()) {
+            for (const auto& it : ev["items"]) {
+                if (!it.is_object()) continue;
+                const std::string id = it.value("id", std::string());
+                // model:N only — bare "model:" is the solo stage checklist id.
+                if (id.rfind("model:", 0) == 0 && id.size() > 6) {
+                    bool all_digit = true;
+                    for (size_t k = 6; k < id.size(); ++k)
+                        if (id[k] < '0' || id[k] > '9') { all_digit = false; break; }
+                    if (all_digit) { has_model_step_id = true; break; }
+                }
+            }
+        }
+        if (has_model_step_id || title == "Model steps")
+            ++n_model_checklist;
+        else
+            ++n_stage_checklist;
+    }
+    CHECK(n_plan_steps == 1);       // legacy raw list kept when no model:N plan_state
+    CHECK(n_model_checklist == 0);  // blank step → no model-step checklist
+    CHECK(n_stage_checklist >= 1);  // solo stage checklist still surfaces
 }
 
 TEST_CASE("extract_ops_last_nonempty: reasoning-channel ops fallback") {

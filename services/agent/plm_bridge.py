@@ -8,8 +8,13 @@ Design decisions
 ----------------
 * Thin ``VaultClient`` Protocol — realignment to the frozen plm.md is a
   one-file change when T-R2 ships.
-* Feature flag ``AICAD_PLM_BRIDGE`` (default off → MockVault).  Set to "1"
-  in production once services/plm/ (T-R2) is merged.
+* Enablement precedence (default OFF):
+    1. project manifest ``ai_mode == "managed"`` → real PLMVaultClient
+       (agent CAD-touching milestones auto-checkpoint; no env needed)
+    2. ``AICAD_PLM_BRIDGE=1`` → real PLMVaultClient
+    3. otherwise → MockVault (safe offline default)
+  Reachable without the env flag via PLM Settings → AI assistance → Managed
+  (``plm_set_ai_mode`` / worker twin already round-trip the tier).
 * Trigger config table: which buildgraph / pipeline events emit a PLM
   checkpoint.  Only meaningful events (not every stage): part_done,
   mission_done, plan_ratified, stage_exit (part_verify/assembly/sim only),
@@ -103,7 +108,7 @@ class VaultClient(Protocol):
 
 
 # ---------------------------------------------------------------------------
-# MockVault — used when AICAD_PLM_BRIDGE != "1"
+# MockVault — used when the bridge is not enabled (default)
 # ---------------------------------------------------------------------------
 
 class MockVault:
@@ -163,21 +168,115 @@ class MockVault:
 # Feature-flag factory
 # ---------------------------------------------------------------------------
 
-def _default_vault() -> VaultClient:
-    """Return the vault client selected by the feature flag.
+def bridge_enabled_by_env() -> bool:
+    """True when ``AICAD_PLM_BRIDGE=1`` (case/whitespace-tolerant)."""
+    return os.environ.get("AICAD_PLM_BRIDGE", "").strip() == "1"
 
-    AICAD_PLM_BRIDGE=1  → attempt to import and use the real PLM client
-                          (services/plm/, T-R2).  Falls back to MockVault
-                          if that module is not yet available.
-    (unset / anything else) → MockVault (safe offline default).
-    """
-    if os.environ.get("AICAD_PLM_BRIDGE") == "1":
+
+def _project_dir_is_managed(project_dir: str | os.PathLike | None) -> bool:
+    """True when *project_dir* has a vault with ``ai_mode == managed``."""
+    if not project_dir:
+        return False
+    root = os.fspath(project_dir)
+    if not root or not os.path.isdir(root):
+        return False
+    try:
+        from services.plm.vault import Vault  # type: ignore[import]
+
+        v = Vault.open(root)
         try:
-            from services.plm.client import PLMVaultClient  # type: ignore[import]
-            return PLMVaultClient()
+            return v.ai_mode() == "managed"
+        finally:
+            v.close()
+    except Exception:
+        return False
+
+
+def bridge_should_use_real(
+    project_dir: str | os.PathLike | None = None,
+) -> bool:
+    """Enablement gate: managed ai_mode > AICAD_PLM_BRIDGE env > off.
+
+    Default remains OFF. Managed mode is reachable from PLM Settings without
+    setting the env var; the env flag forces the real client for any tier
+    (the client still refuses AI-authored cuts unless the project is managed).
+    """
+    if _project_dir_is_managed(project_dir):
+        return True
+    return bridge_enabled_by_env()
+
+
+def _default_vault(
+    project_dir: str | os.PathLike | None = None,
+) -> VaultClient:
+    """Return the vault client selected by the enablement gate.
+
+    Precedence: managed ai_mode > AICAD_PLM_BRIDGE=1 > MockVault.
+    Uses the process-wide :func:`services.plm.client.shared_client` so
+    ``register_run`` / ``register_project`` stick across bridge instances.
+    """
+    if bridge_should_use_real(project_dir):
+        try:
+            from services.plm.client import shared_client  # type: ignore[import]
+
+            return shared_client()
         except ImportError:
-            pass  # T-R2 not yet merged — fall back to mock
+            pass  # fall back to mock
     return MockVault()
+
+
+def bridge_for_run(
+    run_id: str,
+    *,
+    project_dir: str | os.PathLike | None = None,
+    ledger: Any | None = None,
+    model_id: str = "claude-sonnet-4-6",
+    provider: str = "anthropic",
+    vault: VaultClient | None = None,
+) -> "PLMBridge":
+    """Construct a bridge for *run_id*, binding the project when enabled.
+
+    When the enablement gate is open (managed ai_mode or env flag), registers
+    ``run_id`` ↔ project on the shared PLMVaultClient so milestones cut real
+    vault checkpoints. Best-effort — never raises into the agent loop.
+    """
+    resolved_dir = project_dir
+    if resolved_dir is None:
+        try:
+            from services.agent import config as agent_config  # type: ignore[import]
+
+            wd = agent_config.workspace_dir()
+            if wd is not None:
+                resolved_dir = str(wd)
+        except Exception:
+            resolved_dir = None
+
+    if vault is None:
+        vault = _default_vault(resolved_dir)
+
+    # Bind run↔project on real clients so project_id_for_run resolves.
+    if resolved_dir and hasattr(vault, "bind_run"):
+        try:
+            vault.bind_run(run_id, resolved_dir)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    elif resolved_dir and hasattr(vault, "register_project_dir"):
+        try:
+            pid = vault.register_project_dir(resolved_dir)  # type: ignore[attr-defined]
+            if pid and hasattr(vault, "register_run"):
+                vault.register_run(run_id, pid)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+    bridge = PLMBridge(
+        run_id=run_id,
+        vault=vault,
+        model_id=model_id,
+        provider=provider,
+    )
+    if ledger is not None:
+        bridge.attach_ledger(ledger)
+    return bridge
 
 
 # ---------------------------------------------------------------------------
@@ -320,12 +419,18 @@ class PLMBridge:
         vault: VaultClient | None = None,
         model_id: str = "claude-sonnet-4-6",
         provider: str = "anthropic",
+        project_dir: str | os.PathLike | None = None,
     ) -> None:
         self.run_id = run_id
-        self._vault: VaultClient = vault if vault is not None else _default_vault()
+        self._vault: VaultClient = (
+            vault if vault is not None else _default_vault(project_dir)
+        )
         self._model_id = model_id
         self._provider = provider
         self._ledger: Any | None = None  # set via attach_ledger()
+        self._project_dir = (
+            os.fspath(project_dir) if project_dir is not None else None
+        )
 
     def attach_ledger(self, ledger: Any) -> None:
         """Attach the design ledger for this run."""
@@ -628,3 +733,78 @@ def make_buildgraph_node_emit_hook(bridge: "PLMBridge", graph: dict[str, Any]) -
         )
 
     return _emit
+
+
+# ---------------------------------------------------------------------------
+# Agent-turn seam — managed-mode vault checkpoint on CAD-touching tools
+# ---------------------------------------------------------------------------
+
+# Tools whose success is a meaningful project-doc edit for managed vault cuts.
+# Broader than every mutate: only geometry / assembly / save paths that land
+# on a project document. AI-VC still records the full mutate set separately.
+_PROJECT_DOC_TOOLS = frozenset({
+    "add_features",
+    "doc_apply_ops",
+    "save_part",
+    "doc_save",
+    "new_part",
+    "new_assembly",
+    "asm_add_component",
+    "asm_insert_component",
+    "asm_add_mate",
+    "asm_mate",
+    "part_place",
+    "delete_feature",
+    "remove_feature",
+    "set_material",
+    "regen_resolve",
+})
+
+
+def maybe_vault_checkpoint_on_tool(
+    tool: str,
+    args: dict | None,
+    result: Any,
+    *,
+    run_id: str | None = None,
+    project_dir: str | os.PathLike | None = None,
+    ledger: Any | None = None,
+    summary: str | None = None,
+) -> dict[str, Any] | None:
+    """Cut a managed-mode vault checkpoint after a successful CAD-touching tool.
+
+    Complements AI-VC (always-on, per-doc): this writes the project History
+    entry with ``author=ai`` when the project's ``ai_mode`` is ``managed``.
+    No-op for non-project tools, failed results, or non-managed tiers.
+    Best-effort — never raises.
+    """
+    try:
+        if tool not in _PROJECT_DOC_TOOLS:
+            return None
+        if isinstance(result, dict) and result.get("ok") is False:
+            return None
+
+        resolved_dir = project_dir
+        if resolved_dir is None:
+            try:
+                from services.agent import config as agent_config
+
+                wd = agent_config.workspace_dir()
+                if wd is not None:
+                    resolved_dir = str(wd)
+            except Exception:
+                resolved_dir = None
+        if not resolved_dir or not _project_dir_is_managed(resolved_dir):
+            return None
+
+        rid = run_id or "agent"
+        bridge = bridge_for_run(rid, project_dir=resolved_dir, ledger=ledger)
+        # part_done trigger drafts a Pillar-19 message; buildgraph_node tags the tool.
+        return bridge.on_milestone(
+            trigger="part_done",
+            buildgraph_node=f"tool:{tool}",
+            item_id=None,
+        )
+    except Exception:
+        return None
+

@@ -3065,13 +3065,28 @@ WASM_BOOT_LOG("[wasm-boot] entering main loop\n");
             std::lock_guard<std::mutex> lk(st.job.mtx);
             st.livePhase.clear();
             st.agentV2Status.clear();
-          if (st.stopRequested) {
-            // The user stopped this run. The worker finished in the background, but discard the
-            // result: leave the chat message as the Stop handler finalized it, and skip the doc
-            // rebuild/resync and any new-tab adoption.
+          if (st.stopRequested || st.job.stopReason == "cancelled") {
+            // The user stopped this run (or engine returned cancel_result after agent_cancel).
+            // Discard quietly: leave the chat message as the Stop handler finalized it, and
+            // skip the doc rebuild/resync and any new-tab adoption. Do NOT resurrect an error card.
             st.stopRequested = false;
             st.agentV2Running = false;
             st.status = "Stopped.";  st.statusKind = 1;
+            // Ensure any still-running assistant bubble is settled as Stopped (not error).
+            for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it) {
+                if (!it->fromUser && it->running) {
+                    it->running = false;
+                    it->liveStatus = "Stopped";
+                    it->errKind = ERR_NONE;
+                    break;
+                }
+            }
+            {
+                std::lock_guard<std::mutex> jlk(st.job.mtx);
+                st.job.runId.clear();
+                st.job.error.clear();
+                st.job.errorDetail.clear();
+            }
             st.addLog("[..] run result discarded (stopped by user)");
           } else {
             // --- C22b: if this was a v2 run, resync the DocMirror tree + reload mesh ---

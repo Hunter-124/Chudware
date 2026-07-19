@@ -188,6 +188,22 @@ void launchAgentRunV2(WorkerClient& w, JobState& job,
                 if (it.key() != "options" && !params.contains(it.key()))
                     params[it.key()] = it.value();
         bool ok = w.call("agent_run_v2", params, result, err, 900000, onEvent);
+        // Transport loss (timeout/closed) orphans the daemon-side run: hostd keeps
+        // executing — and billing — with no client attached. A user resubmit then
+        // burns quota twice. Best-effort auto-cancel the orphan BEFORE taking job.mtx:
+        // the side-socket connect can block seconds against a sick daemon, and the GL
+        // thread takes job.mtx every frame.
+        bool orphanCancelled = false;
+        if (!ok) {
+            std::string orphanId;
+            { std::lock_guard<std::mutex> lk(job.mtx); orphanId = job.runId; }
+            if (!orphanId.empty()) {
+                nlohmann::json cr;
+                std::string ce;
+                if (w.callAgentCancel(orphanId, cr, ce) && cr.value("cancelled", false))
+                    orphanCancelled = true;
+            }
+        }
         std::lock_guard<std::mutex> lk(job.mtx);
         if (!ok) {
             // Hard transport/DLL failure — no result payload.
@@ -196,6 +212,8 @@ void launchAgentRunV2(WorkerClient& w, JobState& job,
             job.converged = false;
             if (job.stopReason.empty()) job.stopReason = "provider_error";
             if (job.errorDetail.empty()) job.errorDetail = err;
+            if (orphanCancelled)
+                job.errorDetail += " (orphaned run auto-cancelled after transport loss)";
         } else {
             // agent_run_v2 returns {status, stop_reason, run_id, revision[, error_detail]}
             // OR a pre-run refusal {ok:false, error} (provider resolution / offline).

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import asyncio
 import logging
 import os
 import re
@@ -612,7 +613,7 @@ def _image_present() -> bool:
         r = subprocess.run(
             ["podman", "image", "exists", settings.session_image],
             capture_output=True,
-            timeout=10,
+            timeout=2,
             check=False,
         )
         return r.returncode == 0
@@ -620,7 +621,19 @@ def _image_present() -> bool:
         return False
 
 
+# nvidia-smi on a box with a dead driver (e.g. livingroom 1050 Ti, no module)
+# still burns its full timeout before failing. Cache both hit and miss so
+# /healthz never serializes the event loop behind a multi-second shell-out.
+_VRAM_CACHE_TTL_S = 30.0
+_vram_cache: tuple[float, dict[str, Any] | None] | None = None
+
+
 def _nvidia_vram() -> dict[str, Any] | None:
+    global _vram_cache
+    now = time.monotonic()
+    if _vram_cache is not None and (now - _vram_cache[0]) < _VRAM_CACHE_TTL_S:
+        return _vram_cache[1]
+    result: dict[str, Any] | None = None
     try:
         r = subprocess.run(
             [
@@ -630,22 +643,22 @@ def _nvidia_vram() -> dict[str, Any] | None:
             ],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=1,
             check=False,
         )
-        if r.returncode != 0 or not r.stdout.strip():
-            return None
-        line = r.stdout.strip().splitlines()[0]
-        parts = [p.strip() for p in line.split(",")]
-        if len(parts) < 2:
-            return None
-        return {
-            "used_mib": int(float(parts[0])),
-            "total_mib": int(float(parts[1])),
-            "util_pct": int(float(parts[2])) if len(parts) > 2 else None,
-        }
+        if r.returncode == 0 and r.stdout.strip():
+            line = r.stdout.strip().splitlines()[0]
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) >= 2:
+                result = {
+                    "used_mib": int(float(parts[0])),
+                    "total_mib": int(float(parts[1])),
+                    "util_pct": int(float(parts[2])) if len(parts) > 2 else None,
+                }
     except (OSError, ValueError, subprocess.SubprocessError):
-        return None
+        result = None
+    _vram_cache = (now, result)
+    return result
 
 
 @app.get("/healthz")
@@ -657,6 +670,13 @@ async def healthz() -> dict[str, Any]:
         presence_n = len(online) if online is not None else 0
     except Exception:  # noqa: BLE001
         presence_n = None
+    # Shell-outs (podman / nvidia-smi) must not block the asyncio loop —
+    # a wedged nvidia driver previously made every /healthz take ~5s and
+    # stalled concurrent portal traffic on the same worker.
+    image_present, vram = await asyncio.gather(
+        asyncio.to_thread(_image_present),
+        asyncio.to_thread(_nvidia_vram),
+    )
     return {
         "ok": True,
         "sessions": manager.active_count(),
@@ -667,8 +687,8 @@ async def healthz() -> dict[str, Any]:
         "mem_available_gib": round(mem_g, 2) if mem_g is not None else None,
         "refuse_new": settings.refuse_new_flag.exists(),
         "image": settings.session_image,
-        "image_present": _image_present(),
-        "vram": _nvidia_vram(),
+        "image_present": image_present,
+        "vram": vram,
         "presence": presence_n,
         "dev_mode": settings.dev_mode,
         "engine_bridges": active_bridge_count(),

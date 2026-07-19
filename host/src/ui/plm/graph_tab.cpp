@@ -1063,6 +1063,11 @@ void drawArcSpinner(ImDrawList* dl, ImVec2 c, float radius, ImU32 col) {
 
 
 // ---- settled-layout cache (solve state) -------------------------------------
+//
+// Bump kLayoutVersion whenever seed/clustering/force policy changes enough that
+// old positions would re-open as a hairball. Missing/mismatched version → ignore
+// the file and re-seed from the current algorithm (cluster wells).
+constexpr int kLayoutVersion = 2;
 
 std::filesystem::path layoutCachePath(const GraphTabState& G) {
     return std::filesystem::path(G.projectDir) / ".plm" / "graph_layout.json";
@@ -1078,7 +1083,11 @@ void ensureLayoutCache(GraphTabState& G) {
     std::ifstream f(layoutCachePath(G));
     if (!f) return;
     nlohmann::json j = nlohmann::json::parse(f, nullptr, false);
-    if (j.is_discarded()) return;
+    if (j.is_discarded() || !j.is_object()) return;
+    // Pre-version caches (and any future mismatch) are discarded so the new
+    // clustered seed runs automatically — no manual delete required.
+    const int ver = j.value("layoutVersion", 0);
+    if (ver != kLayoutVersion) return;
     auto it = j.find("positions");
     if (it == j.end() || !it->is_object()) return;
     for (auto pit = it->begin(); pit != it->end(); ++pit) {
@@ -1097,6 +1106,7 @@ void maybeSaveLayout(GraphTabState& G, bool force = false) {
     if (!force && (now - G.lastLayoutSave) < 2.0) return;
     G.lastLayoutSave = now;
     nlohmann::json j;
+    j["layoutVersion"] = kLayoutVersion;
     auto& pos = j["positions"];
     for (const auto& n : G.nodes)
         if (n.lx != 0.0f || n.ly != 0.0f)

@@ -8365,7 +8365,8 @@ static char* providerKeyBuf(Settings& s, int provider) {
 
 // Availability helpers (defined with the model-dropdown section below; forward-declared so the
 // "Manage models" panel inside drawAiSettingsSection can call them).
-static bool providerUsable(AppState& st, int provider);
+// providerUsable is public (legacy_chat.h) — used by Settings role/Eng.Firm pickers too.
+bool providerUsable(AppState& st, int provider);  // def below; also declared in legacy_chat.h
 static bool localModelLoaded(const ProviderModels& pm, const std::string& id);
 
 // WASM-safe JSON accessors: present-but-null / wrong-type fields must not throw
@@ -9181,6 +9182,8 @@ static std::vector<OvRolePick> ovBuildRolePicks(AppState& st, bool localOnly) {
     out.push_back(OvRolePick{true, 0, "", "Auto"});
     auto add = [&](int prov, const std::string& model, const std::string& label) {
         if (localOnly && !ovProviderIsLoopback(prov)) return;
+        // Hide providers the user can't actually run (no key / not signed in / endpoint down).
+        if (!providerUsable(st, prov)) return;
         OvRolePick e;
         e.isAuto = false;
         e.provider = prov;
@@ -9194,15 +9197,30 @@ static std::vector<OvRolePick> ovBuildRolePicks(AppState& st, bool localOnly) {
                       ui::providerLabel(m.provider), m.label.c_str());
         add(m.provider, m.id, buf);
     }
+    // Cloud presets: OpenRouter/Alibaba/DeepSeek need cloudKey; Moonshot needs moonshotKey.
     for (const auto& p : ui::cloudPresets()) {
+        const char* svc = ui::cloudServiceKey(p.baseUrl);
+        if (std::strcmp(svc, "moonshot") == 0) {
+            if (!st.settings.moonshotKey[0]) continue;
+        } else if (!st.settings.cloudKey[0]) {
+            continue;
+        }
         char buf[256];
-        std::snprintf(buf, sizeof(buf), "OpenRouter / Cloud \xc2\xb7 %s", p.label.c_str());
+        std::snprintf(buf, sizeof(buf), "%s", p.label.c_str());
         add(ui::PROV_CLOUDCOMPAT, p.id, buf);
     }
-    for (const auto& p : ui::localPresets()) {
-        char buf[256];
-        std::snprintf(buf, sizeof(buf), "Local \xc2\xb7 %s", p.label.c_str());
-        add(ui::PROV_LOCAL, p.id, buf);
+    // Local presets only when a local endpoint is actually up (or offline/ITAR).
+    const bool localUp = st.providerModels[ui::PROV_LOCAL].ok ||
+                         st.providerModels[ui::PROV_LLAMACPP].ok ||
+                         st.settings.offlineMode ||
+                         ovProviderIsLoopback(st.settings.provider);
+    if (localUp) {
+        for (const auto& p : ui::localPresets()) {
+            if (!providerUsable(st, ui::PROV_LOCAL) && !st.settings.offlineMode) break;
+            char buf[256];
+            std::snprintf(buf, sizeof(buf), "Local \xc2\xb7 %s", p.label.c_str());
+            add(ui::PROV_LOCAL, p.id, buf);
+        }
     }
     const ProviderModels& lpm = st.providerModels[ui::PROV_LOCAL];
     if (lpm.ok) {
@@ -9872,12 +9890,6 @@ static void drawOvAgentsTab(AppState& st, float S, bool& changed) {
 
         const auto allPicks = ovBuildRolePicks(st, /*localOnly=*/false);
         const auto localPicks = ovBuildRolePicks(st, /*localOnly=*/true);
-        // Stable C-string pointers for InterwebzCombo (labels live in picks vectors).
-        std::vector<const char*> allLabels, localLabels;
-        allLabels.reserve(allPicks.size());
-        localLabels.reserve(localPicks.size());
-        for (const auto& p : allPicks) allLabels.push_back(p.label.c_str());
-        for (const auto& p : localPicks) localLabels.push_back(p.label.c_str());
 
         static const char* kThinkLabels[] = {"Auto", "Low", "Med", "High"};
         static const char* kThinkValues[] = {"auto", "low", "medium", "high"};
@@ -9887,7 +9899,6 @@ static void drawOvAgentsTab(AppState& st, float S, bool& changed) {
             const bool isRedaction = (std::strcmp(key, "redaction") == 0);
             OvRoleAssign& a = s_ovRoles.roles[key];
             const auto& picks = isRedaction ? localPicks : allPicks;
-            const auto& labels = isRedaction ? localLabels : allLabels;
 
             ImGui::PushID(key);
             // Compact single row: Role label | model combo | Thinking combo.
@@ -9932,26 +9943,53 @@ static void drawOvAgentsTab(AppState& st, float S, bool& changed) {
             const float thinkW = ImMax(64.0f * S, rowW * 0.28f);
             const float modelW = ImMax(80.0f * S, rowW - thinkW - 8.0f * S);
 
-            int comboSel = sel;
+            // Searchable combo: type to narrow models; list is already key-gated.
+            std::string preview = (sel >= 0 && sel < (int)picks.size())
+                ? picks[sel].label
+                : (a.isAuto ? "Auto" : a.model);
             ImGui::SetNextItemWidth(modelW);
-            if (ui::InterwebzCombo("##role_model", &comboSel, labels.data(), (int)labels.size()) &&
-                comboSel >= 0 && comboSel < (int)picks.size()) {
-                OvRoleAssign next = a;  // preserve thinking
-                if (picks[comboSel].isAuto) {
-                    next.isAuto = true;
-                    next.provider.clear();
-                    next.model.clear();
-                } else {
-                    next.isAuto = false;
-                    next.provider = ovRoleProviderWire(picks[comboSel].provider);
-                    next.model = picks[comboSel].model;
+            if (ImGui::BeginCombo("##role_model", preview.c_str(),
+                                  ImGuiComboFlags_HeightLarge)) {
+                static char s_roleFilter[64] = "";
+                if (ImGui::IsWindowAppearing()) {
+                    s_roleFilter[0] = 0;
+                    ImGui::SetKeyboardFocusHere();
                 }
-                if (isRedaction && !next.isAuto &&
-                    !ovProviderIsLoopback(picks[comboSel].provider)) {
-                    s_ovRoles.lastError = "Redaction role refuses non-loopback providers.";
-                } else {
-                    ovSetRole(st, key, next);
+                ImGui::SetNextItemWidth(-1);
+                ImGui::InputTextWithHint("##role_filt", "Type to filter...",
+                                         s_roleFilter, sizeof(s_roleFilter));
+                auto lc = [](std::string s) {
+                    for (char& c : s) c = (char)std::tolower((unsigned char)c);
+                    return s;
+                };
+                const std::string fq = lc(s_roleFilter);
+                for (int pi = 0; pi < (int)picks.size(); ++pi) {
+                    if (!fq.empty()) {
+                        const std::string hay = lc(picks[pi].label + " " + picks[pi].model);
+                        if (hay.find(fq) == std::string::npos) continue;
+                    }
+                    const bool selected = (pi == sel) || (pi == 0 && a.isAuto);
+                    if (ImGui::Selectable(picks[pi].label.c_str(), selected)) {
+                        OvRoleAssign next = a;  // preserve thinking
+                        if (picks[pi].isAuto) {
+                            next.isAuto = true;
+                            next.provider.clear();
+                            next.model.clear();
+                        } else {
+                            next.isAuto = false;
+                            next.provider = ovRoleProviderWire(picks[pi].provider);
+                            next.model = picks[pi].model;
+                        }
+                        if (isRedaction && !next.isAuto &&
+                            !ovProviderIsLoopback(picks[pi].provider)) {
+                            s_ovRoles.lastError = "Redaction role refuses non-loopback providers.";
+                        } else {
+                            ovSetRole(st, key, next);
+                        }
+                    }
+                    if (selected) ImGui::SetItemDefaultFocus();
                 }
+                ImGui::EndCombo();
             }
 
             int thinkSel = 0;
@@ -11834,14 +11872,14 @@ static void pollSubConnected(AppState& st) {
 }  // namespace
 
 // Does this provider have credentials / a reachable endpoint / a signed-in subscription,
-// so its models can be selected?
-static bool providerUsable(AppState& st, int provider) {
+// so its models can be selected? Public (legacy_chat.h) so Settings role pickers share it.
+bool providerUsable(AppState& st, int provider) {
     pollSubConnected(st);
     switch (provider) {
         case ui::PROV_GEMINI:      return st.settings.geminiKey[0] != 0;
         case ui::PROV_ANTHROPIC:   return st.settings.anthropicKey[0] != 0 || s_subConn.claude;
         case ui::PROV_OPENAI:      return st.settings.openaiKey[0] != 0 || s_subConn.codex;
-        case ui::PROV_CLOUDCOMPAT: return st.settings.cloudKey[0] != 0;
+        case ui::PROV_CLOUDCOMPAT: return st.settings.cloudKey[0] != 0 || st.settings.moonshotKey[0] != 0;
         case ui::PROV_XAI:         return st.settings.xaiKey[0] != 0 || s_subConn.xai;
         case ui::PROV_LOCAL:       return st.providerModels[ui::PROV_LOCAL].ok;
         case ui::PROV_LLAMACPP:    return st.providerModels[ui::PROV_LLAMACPP].ok;
@@ -11949,7 +11987,7 @@ static void drawModelDropdown(AppState& st, bool busy) {
                          ink, gl);
         }
         if (gHov) ImGui::SetTooltip("AI settings");
-        if (openSet) { st.openSettings = true; st.openSettingsTab = 2; ImGui::CloseCurrentPopup(); }
+        if (openSet) { st.openSettings = true; st.openSettingsTab = 3; /* Providers */ ImGui::CloseCurrentPopup(); }
     }
     ImGui::Separator();
 
@@ -11959,8 +11997,13 @@ static void drawModelDropdown(AppState& st, bool busy) {
         return s;
     };
     std::string q = lc(s_modelSearch);
-    auto matchq = [&](const std::string& a, const std::string& b) {
-        return q.empty() || lc(a).find(q) != std::string::npos || lc(b).find(q) != std::string::npos;
+    // Match label, provider short name, OR model id (type "k3" / "opus" / "grok").
+    auto matchq = [&](const std::string& a, const std::string& b, const std::string& id = {}) {
+        if (q.empty()) return true;
+        if (lc(a).find(q) != std::string::npos) return true;
+        if (lc(b).find(q) != std::string::npos) return true;
+        if (!id.empty() && lc(id).find(q) != std::string::npos) return true;
+        return false;
     };
 
     bool picked = false;
@@ -11976,7 +12019,7 @@ static void drawModelDropdown(AppState& st, bool busy) {
     // category is bulk-disabled.
     for (const auto& m : ui::builtinModels()) {
         if (catOff(ui::providerCatKey(m.provider))) continue;
-        if (!providerUsable(st, m.provider) || !matchq(m.label, providerShort(m.provider))) continue;
+        if (!providerUsable(st, m.provider) || !matchq(m.label, providerShort(m.provider), m.id)) continue;
         if (modelHidden(st, m.id)) continue;
         ++shown;
         if (modelRow(st, m.provider, m.id, m.label, true, uid++)) {
@@ -11992,7 +12035,7 @@ static void drawModelDropdown(AppState& st, bool busy) {
         // OpenRouter: the live list (all free models + curated paid), minus any the user hid.
         if (!catOff("openrouter")) {
             for (const auto& r : openRouterModels(st)) {
-                if (modelHidden(st, r.id) || !matchq(r.label, "openrouter free")) continue;
+                if (modelHidden(st, r.id) || !matchq(r.label, "openrouter free", r.id)) continue;
                 ++shown;
                 if (modelRow(st, ui::PROV_CLOUDCOMPAT, r.id, r.label, true, uid++)) {
                     st.settings.provider = ui::PROV_CLOUDCOMPAT;
@@ -12010,7 +12053,7 @@ static void drawModelDropdown(AppState& st, bool busy) {
             if (key == "openrouter") continue;  // handled above (live)
             if (key == "moonshot") continue;    // handled below via its own key gate
             if (catOff(key)) continue;
-            if (modelHidden(st, p.id) || !matchq(p.label, key)) continue;
+            if (modelHidden(st, p.id) || !matchq(p.label, key, p.id)) continue;
             ++shown;
             if (modelRow(st, ui::PROV_CLOUDCOMPAT, p.id, p.label, true, uid++)) {
                 st.settings.provider = ui::PROV_CLOUDCOMPAT;
@@ -12026,7 +12069,7 @@ static void drawModelDropdown(AppState& st, bool busy) {
     if (st.settings.moonshotKey[0] && !catOff("moonshot")) {
         for (const auto& p : ui::cloudPresets()) {
             if (std::strcmp(ui::cloudServiceKey(p.baseUrl), "moonshot") != 0) continue;
-            if (modelHidden(st, p.id) || !matchq(p.label, "moonshot kimi")) continue;
+            if (modelHidden(st, p.id) || !matchq(p.label, "moonshot kimi", p.id)) continue;
             ++shown;
             if (modelRow(st, ui::PROV_CLOUDCOMPAT, p.id, p.label, true, uid++)) {
                 st.settings.provider = ui::PROV_CLOUDCOMPAT;
@@ -12050,7 +12093,7 @@ static void drawModelDropdown(AppState& st, bool busy) {
             if (!seenLocal.insert(id).second) continue;     // already shown for the sibling provider
             if (!localModelLoaded(pm, id)) continue;        // downloaded but not loaded into memory
             if (modelHidden(st, id)) continue;
-            if (!matchq(id, providerShort(lp))) continue;
+            if (!matchq(id, providerShort(lp), id)) continue;
             ++shown;
             if (modelRow(st, lp, id, id, true, uid++)) {
                 st.settings.provider = lp;

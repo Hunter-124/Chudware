@@ -1161,8 +1161,12 @@ struct RolePickEntry {
 static std::vector<RolePickEntry> buildRolePickList(AppState& st, bool localOnly) {
     std::vector<RolePickEntry> out;
     out.push_back(RolePickEntry{true, 0, "", "Auto"});
+    // Keep the pick list aligned with the composer dropdown: only providers the user can
+    // actually run (API key present, subscription signed in, or local endpoint up).
+    ui::refreshModelAvailability(st, false);
     auto add = [&](int prov, const std::string& model, const std::string& label) {
         if (localOnly && !providerIsLoopback(prov)) return;
+        if (!ui::providerUsable(st, prov)) return;
         RolePickEntry e;
         e.isAuto = false;
         e.provider = prov;
@@ -1170,17 +1174,22 @@ static std::vector<RolePickEntry> buildRolePickList(AppState& st, bool localOnly
         e.label = label;
         out.push_back(std::move(e));
     };
-    // Built-in cloud catalog.
+    // Built-in cloud catalog (Gemini / Anthropic / OpenAI / xAI / Cursor / Kimi Code).
     for (const auto& m : ui::builtinModels()) {
         char buf[256];
         std::snprintf(buf, sizeof(buf), "%s \xc2\xb7 %s",
                       ui::providerLabel(m.provider), m.label.c_str());
         add(m.provider, m.id, buf);
     }
-    // Cloud OpenRouter / DashScope / DeepSeek presets.
+    // Cloud presets: OpenRouter/Alibaba/DeepSeek need cloudKey; Moonshot needs moonshotKey.
+    // Labels already self-qualify their service (e.g. "Moonshot · Kimi K3").
     for (const auto& p : ui::cloudPresets()) {
-        // Preset labels already self-qualify their service (e.g. "Moonshot \xc2\xb7 Kimi K3"), so show
-        // them as-is; the old "OpenRouter / Cloud" prefix mislabeled Moonshot/DeepSeek presets.
+        const char* svc = ui::cloudServiceKey(p.baseUrl);
+        if (std::strcmp(svc, "moonshot") == 0) {
+            if (!st.settings.moonshotKey[0]) continue;
+        } else if (!st.settings.cloudKey[0]) {
+            continue;
+        }
         add(ui::PROV_CLOUDCOMPAT, p.id, p.label);
     }
     // Local presets + live-probed local models — only when local is actually in play:
@@ -1194,6 +1203,10 @@ static std::vector<RolePickEntry> buildRolePickList(AppState& st, bool localOnly
         st.providerModels[ui::PROV_LLAMACPP].ok;
     if (includeLocal) {
         for (const auto& p : ui::localPresets()) {
+            // Presets still require a usable local endpoint (or offline intent).
+            if (!ui::providerUsable(st, ui::PROV_LOCAL) && !st.settings.offlineMode &&
+                !providerIsLoopback(st.settings.provider))
+                break;
             char buf[256];
             std::snprintf(buf, sizeof(buf), "Local \xc2\xb7 %s", p.label.c_str());
             add(ui::PROV_LOCAL, p.id, buf);
@@ -1783,8 +1796,26 @@ static void drawModelRolesSection(AppState& st, float sc) {
             const bool ro = s_roles.rolesRpcMissing || s_roles.rolesSaveInFlight;
             if (ro) ImGui::BeginDisabled();
             ImGui::SetNextItemWidth(-1);
-            if (ImGui::BeginCombo("##role_pick", preview.c_str())) {
+            if (ImGui::BeginCombo("##role_pick", preview.c_str(), ImGuiComboFlags_HeightLarge)) {
+                // Type-to-filter — list is already filtered to keyed/signed-in providers.
+                static char s_roleFilt[64] = "";
+                if (ImGui::IsWindowAppearing()) {
+                    s_roleFilt[0] = 0;
+                    ImGui::SetKeyboardFocusHere();
+                }
+                ImGui::SetNextItemWidth(-1);
+                ImGui::InputTextWithHint("##role_filt", "Type to filter...",
+                                         s_roleFilt, sizeof(s_roleFilt));
+                auto lc = [](std::string s) {
+                    for (char& c : s) c = (char)std::tolower((unsigned char)c);
+                    return s;
+                };
+                const std::string fq = lc(s_roleFilt);
                 for (int pi = 0; pi < (int)picks.size(); ++pi) {
+                    if (!fq.empty()) {
+                        const std::string hay = lc(picks[pi].label + " " + picks[pi].model);
+                        if (hay.find(fq) == std::string::npos) continue;
+                    }
                     const bool selected = (pi == sel) || (pi == 0 && a.isAuto);
                     if (ImGui::Selectable(picks[pi].label.c_str(), selected)) {
                         RoleAssign next = a;  // preserve thinking
@@ -2163,8 +2194,25 @@ static void drawEngFirmAssignRow(AppState& st, const char* id, const char* label
         if (preview == " \xc2\xb7 ") preview = a.model.empty() ? "Auto" : a.model;
     }
     ImGui::SetNextItemWidth(-1);
-    if (ImGui::BeginCombo("##ef_pick", preview.c_str())) {
+    if (ImGui::BeginCombo("##ef_pick", preview.c_str(), ImGuiComboFlags_HeightLarge)) {
+        static char s_efFilt[64] = "";
+        if (ImGui::IsWindowAppearing()) {
+            s_efFilt[0] = 0;
+            ImGui::SetKeyboardFocusHere();
+        }
+        ImGui::SetNextItemWidth(-1);
+        ImGui::InputTextWithHint("##ef_filt", "Type to filter...",
+                                 s_efFilt, sizeof(s_efFilt));
+        auto lc = [](std::string s) {
+            for (char& c : s) c = (char)std::tolower((unsigned char)c);
+            return s;
+        };
+        const std::string fq = lc(s_efFilt);
         for (int pi = 0; pi < (int)picks.size(); ++pi) {
+            if (!fq.empty()) {
+                const std::string hay = lc(picks[pi].label + " " + picks[pi].model);
+                if (hay.find(fq) == std::string::npos) continue;
+            }
             const bool selected = (pi == sel) || (pi == 0 && a.isAuto);
             if (ImGui::Selectable(picks[pi].label.c_str(), selected)) {
                 if (picks[pi].isAuto) {

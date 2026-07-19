@@ -1230,13 +1230,13 @@ static std::vector<RolePickEntry> buildRolePickList(AppState& st, bool localOnly
                       ui::providerLabel(m.provider), m.label.c_str());
         add(m.provider, m.id, buf);
     }
-    // Cloud presets: OpenRouter/Alibaba/DeepSeek need cloudKey; Moonshot needs moonshotKey.
-    // Labels already self-qualify their service (e.g. "Moonshot · Kimi K3").
+    // Cloud presets: OpenRouter/Alibaba/DeepSeek need cloud key (local or host-shared);
+    // Moonshot needs moonshot key (local or host-shared).
     for (const auto& p : ui::cloudPresets()) {
         const char* svc = ui::cloudServiceKey(p.baseUrl);
         if (std::strcmp(svc, "moonshot") == 0) {
-            if (!st.settings.moonshotKey[0]) continue;
-        } else if (!st.settings.cloudKey[0]) {
+            if (!ui::moonshotKeyPresent(st)) continue;
+        } else if (!ui::cloudCompatKeyPresent(st)) {
             continue;
         }
         add(ui::PROV_CLOUDCOMPAT, p.id, p.label);

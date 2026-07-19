@@ -9852,6 +9852,8 @@ static bool modelHidden(AppState& st, const std::string& id) {
 
 // File-static cache of subscription_status "connected" flags so the model picker can show
 // signed-in providers (xAI / Claude / Cursor / Codex / Kimi) without requiring an API key.
+// On web (__EMSCRIPTEN__), also merges GET /api/providers host-shared key/subscription
+// presence so the picker matches the daemon's signed-in accounts (WASM IDBFS has no real keys).
 namespace {
 struct SubConnectedCache {
     bool xai = false;
@@ -9859,13 +9861,91 @@ struct SubConnectedCache {
     bool cursor = false;
     bool codex = false;
     bool kimi = false;
+    // Host-shared API-key providers (web only; filled from GET /api/providers).
+    bool hostGemini = false;
+    bool hostAnthropic = false;
+    bool hostOpenai = false;
+    bool hostCloud = false;     // openrouter / cloud_compat
+    bool hostMoonshot = false;
+    bool hostXaiKey = false;    // xAI API key (distinct from xai-sub OAuth)
+    bool hostFetched = false;   // web: /api/providers completed at least once
     double lastPoll = -1e9;
     bool inFlight = false;
 };
 static SubConnectedCache s_subConn;
+#ifdef __EMSCRIPTEN__
+// File-scope so emscripten_fetch callbacks (no-capture lambdas) can reset on retry.
+static bool s_hostProvidersFetchStarted = false;
+static int s_hostProvidersFetchFails = 0;
+#endif
+
+#ifdef __EMSCRIPTEN__
+// One-shot async GET /api/providers — names only (no secrets). Marks which host providers
+// are signed in so providerUsable() can show them without local key buffers.
+static void wasmKickHostProvidersFetch() {
+    if (s_subConn.hostFetched || s_hostProvidersFetchStarted) return;
+    s_hostProvidersFetchStarted = true;
+    emscripten_fetch_attr_t attr;
+    emscripten_fetch_attr_init(&attr);
+    std::strcpy(attr.requestMethod, "GET");
+    attr.attributes = EMSCRIPTEN_FETCH_LOAD_TO_MEMORY;
+    attr.onsuccess = [](emscripten_fetch_t* f) {
+        try {
+            if (f->status >= 200 && f->status < 300 && f->data && f->numBytes > 0) {
+                auto j = nlohmann::json::parse(f->data, f->data + f->numBytes);
+                if (j.is_object()) {
+                    // Reset host bits then apply.
+                    s_subConn.hostGemini = s_subConn.hostAnthropic = s_subConn.hostOpenai = false;
+                    s_subConn.hostCloud = s_subConn.hostMoonshot = s_subConn.hostXaiKey = false;
+                    auto applySub = [](const std::string& id) {
+                        if (id == "xai" || id == "xai-sub") s_subConn.xai = true;
+                        else if (id == "claude" || id == "anthropic-sub") s_subConn.claude = true;
+                        else if (id == "cursor" || id == "cursor-sub") s_subConn.cursor = true;
+                        else if (id == "codex" || id == "codex-sub") s_subConn.codex = true;
+                        else if (id == "kimi" || id == "kimi-sub") s_subConn.kimi = true;
+                    };
+                    auto applyKey = [](const std::string& id) {
+                        if (id == "gemini") s_subConn.hostGemini = true;
+                        else if (id == "anthropic") s_subConn.hostAnthropic = true;
+                        else if (id == "openai") s_subConn.hostOpenai = true;
+                        else if (id == "openrouter" || id == "cloud" || id == "cloud_compat")
+                            s_subConn.hostCloud = true;
+                        else if (id == "moonshot") s_subConn.hostMoonshot = true;
+                        else if (id == "xai") s_subConn.hostXaiKey = true;
+                    };
+                    if (j.contains("providers") && j["providers"].is_array()) {
+                        for (const auto& p : j["providers"]) {
+                            if (!p.is_object()) continue;
+                            std::string id = p.value("id", p.value("name", std::string()));
+                            if (id.empty()) continue;
+                            std::string auth = p.value("auth", std::string());
+                            const bool isSub = (auth == "subscription") ||
+                                (auth.empty() && id.find("-sub") != std::string::npos);
+                            if (isSub) applySub(id);
+                            else applyKey(id);
+                        }
+                    }
+                    s_subConn.hostFetched = true;
+                }
+            }
+        } catch (...) {
+        }
+        emscripten_fetch_close(f);
+    };
+    attr.onerror = [](emscripten_fetch_t* f) {
+        // Allow a few retries on transient failure; then stop.
+        if (++s_hostProvidersFetchFails < 5) s_hostProvidersFetchStarted = false;
+        emscripten_fetch_close(f);
+    };
+    emscripten_fetch(&attr, "/api/providers");
+}
+#endif
 
 static void pollSubConnected(AppState& st) {
     const double now = ImGui::GetTime();
+#ifdef __EMSCRIPTEN__
+    wasmKickHostProvidersFetch();
+#endif
     if (s_subConn.inFlight || (now - s_subConn.lastPoll) < 2.0) return;
     s_subConn.lastPoll = now;
     s_subConn.inFlight = true;
@@ -9878,11 +9958,12 @@ static void pollSubConnected(AppState& st) {
             auto p = jsonOptObj(providers, key);
             return jsonOptBool(p, "connected", false);
         };
-        s_subConn.xai    = connected(providers, "xai");
-        s_subConn.claude = connected(providers, "claude");
-        s_subConn.cursor = connected(providers, "cursor");
-        s_subConn.codex  = connected(providers, "codex");
-        s_subConn.kimi   = connected(providers, "kimi");
+        // OR with host-fetched bits so a slow/failed RPC doesn't clear web presence.
+        s_subConn.xai    = connected(providers, "xai")    || s_subConn.xai;
+        s_subConn.claude = connected(providers, "claude") || s_subConn.claude;
+        s_subConn.cursor = connected(providers, "cursor") || s_subConn.cursor;
+        s_subConn.codex  = connected(providers, "codex")  || s_subConn.codex;
+        s_subConn.kimi   = connected(providers, "kimi")   || s_subConn.kimi;
     });
 }
 }  // namespace
@@ -9892,11 +9973,17 @@ static void pollSubConnected(AppState& st) {
 bool providerUsable(AppState& st, int provider) {
     pollSubConnected(st);
     switch (provider) {
-        case ui::PROV_GEMINI:      return st.settings.geminiKey[0] != 0;
-        case ui::PROV_ANTHROPIC:   return st.settings.anthropicKey[0] != 0 || s_subConn.claude;
-        case ui::PROV_OPENAI:      return st.settings.openaiKey[0] != 0 || s_subConn.codex;
-        case ui::PROV_CLOUDCOMPAT: return st.settings.cloudKey[0] != 0 || st.settings.moonshotKey[0] != 0;
-        case ui::PROV_XAI:         return st.settings.xaiKey[0] != 0 || s_subConn.xai;
+        case ui::PROV_GEMINI:
+            return st.settings.geminiKey[0] != 0 || s_subConn.hostGemini;
+        case ui::PROV_ANTHROPIC:
+            return st.settings.anthropicKey[0] != 0 || s_subConn.claude || s_subConn.hostAnthropic;
+        case ui::PROV_OPENAI:
+            return st.settings.openaiKey[0] != 0 || s_subConn.codex || s_subConn.hostOpenai;
+        case ui::PROV_CLOUDCOMPAT:
+            return st.settings.cloudKey[0] != 0 || st.settings.moonshotKey[0] != 0 ||
+                   s_subConn.hostCloud || s_subConn.hostMoonshot;
+        case ui::PROV_XAI:
+            return st.settings.xaiKey[0] != 0 || s_subConn.xai || s_subConn.hostXaiKey;
         case ui::PROV_LOCAL:       return st.providerModels[ui::PROV_LOCAL].ok;
         case ui::PROV_LLAMACPP:    return st.providerModels[ui::PROV_LLAMACPP].ok;
         case ui::PROV_CURSOR:      return s_subConn.cursor;
@@ -9904,6 +9991,17 @@ bool providerUsable(AppState& st, int provider) {
     }
     return false;
 }
+
+bool cloudCompatKeyPresent(AppState& st) {
+    pollSubConnected(st);
+    return st.settings.cloudKey[0] != 0 || s_subConn.hostCloud;
+}
+
+bool moonshotKeyPresent(AppState& st) {
+    pollSubConnected(st);
+    return st.settings.moonshotKey[0] != 0 || s_subConn.hostMoonshot;
+}
+
 
 // One model row: checkmark gutter (drawn — no check glyph in the font) + label + dim provider
 // sublabel; an accent "Add key" when the provider isn't usable. Returns true when picked.
@@ -10047,7 +10145,7 @@ static void drawModelDropdown(AppState& st, bool busy) {
     // Cloud OpenAI-compatible service presets (OpenRouter / Alibaba / DeepSeek). Shown when a cloud
     // key is configured and the service category isn't bulk-disabled. Picking one points the active
     // Cloud API provider at that service's endpoint + model.
-    if (st.settings.cloudKey[0]) {
+    if (cloudCompatKeyPresent(st)) {
         // OpenRouter: the live list (all free models + curated paid), minus any the user hid.
         if (!catOff("openrouter")) {
             for (const auto& r : openRouterModels(st)) {
@@ -10082,7 +10180,7 @@ static void drawModelDropdown(AppState& st, bool busy) {
     }
     // Moonshot (Kimi) — first-class wire provider gated on its OWN key (keys.moonshot), so Kimi
     // shows in the composer picker whenever a Moonshot key is set, even with no generic cloud key.
-    if (st.settings.moonshotKey[0] && !catOff("moonshot")) {
+    if (moonshotKeyPresent(st) && !catOff("moonshot")) {
         for (const auto& p : ui::cloudPresets()) {
             if (std::strcmp(ui::cloudServiceKey(p.baseUrl), "moonshot") != 0) continue;
             if (modelHidden(st, p.id) || !matchq(p.label, "moonshot kimi", p.id)) continue;

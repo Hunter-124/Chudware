@@ -38,9 +38,15 @@ bool drawProviderModelPicker(AppState& state, bool busy, bool slim = false);
 // Throttled internally; pass force=true to probe immediately (e.g. on a base-URL change).
 void refreshModelAvailability(AppState& state, bool force);
 
-// True when the provider has a key, signed-in subscription, or reachable local endpoint —
-// shared by the composer model picker, Settings role/Eng.Firm combos, and Manage models.
+// True when the provider has a key, signed-in subscription, host-shared account (web),
+// or reachable local endpoint — shared by the composer model picker, Settings role/Eng.Firm
+// combos, and Manage models.
 bool providerUsable(AppState& state, int provider);
+
+// Cloud OpenAI-compat / Moonshot key presence: local settings OR host-shared keys on web
+// (GET /api/providers). Used by picker sections that gate rows on cloudKey/moonshotKey.
+bool cloudCompatKeyPresent(AppState& state);
+bool moonshotKeyPresent(AppState& state);
 
 // Persist the active document's conversations (the active one synced from state.chat) to
 // %APPDATA%/AI-CAD/chat_history.json. Safe to call any time; no-op if nothing to save.

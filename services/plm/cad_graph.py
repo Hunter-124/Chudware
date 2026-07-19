@@ -46,6 +46,7 @@ import os
 import re
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -213,6 +214,9 @@ def build_graph(
     nodes: list[dict[str, Any]] = []
     edges: list[dict[str, Any]] = []
     node_ids: set[str] = set()
+    # (src, dst) pairs of DEPENDS_ON edges — O(1) dedup for the per-feature
+    # history check below (was an O(len(edges)) scan per feature).
+    dep_pairs: set[tuple[str, str]] = set()
 
     def add_node(n: dict[str, Any]) -> str:
         nid = n["id"]
@@ -234,6 +238,8 @@ def build_graph(
             "src": src, "dst": dst, "kind": kind,
             "meta": _sanitize_meta(meta or {}), "origin": origin,
         })
+        if kind == "DEPENDS_ON":
+            dep_pairs.add((src, dst))
 
     # project root
     proj_id = "project:root"
@@ -417,8 +423,7 @@ def build_graph(
             b = feat_nodes.get(str(feat_list[i - 1]["id"]))
             if a and b:
                 # only add if not already DEPENDS_ON via explicit ref
-                if not any(e["src"] == a and e["dst"] == b and e["kind"] == "DEPENDS_ON"
-                           for e in edges):
+                if (a, b) not in dep_pairs:
                     add_edge(a, b, "DEPENDS_ON",
                              meta={"via": "history"}, origin=ORIGIN_INFERRED)
 
@@ -1068,6 +1073,8 @@ def _collect_sources(
     arch = archive_names if archive_names is not None else DEFAULT_ARCHIVE_DIR_NAMES
 
     if root is not None and root.is_dir():
+        # Collect candidate files in deterministic walk order first…
+        pending: list[tuple[Path, str, float]] = []
         for dirpath, dirnames, filenames in os.walk(root):
             # prune system + (optional) archive dirs in-place
             dirnames[:] = [d for d in dirnames if d not in skip]
@@ -1079,9 +1086,17 @@ def _collect_sources(
                 try:
                     rel = str(fp.relative_to(root)).replace("\\", "/")
                     mtime = fp.stat().st_mtime
-                    doc, study_ids = _read_container(fp)
-                except Exception:  # noqa: BLE001
+                except OSError:
                     continue
+                pending.append((fp, rel, mtime))
+        # …then read containers in parallel. zlib decompression releases the
+        # GIL, so threads give a real speedup on ME489-scale trees; map()
+        # preserves walk order so the source list stays deterministic.
+        if pending:
+            workers = min(8, (os.cpu_count() or 4), len(pending))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                results = pool.map(lambda t: _read_container(t[0]), pending)
+            for (fp, rel, mtime), (doc, study_ids) in zip(pending, results):
                 if doc is None:
                     continue
                 key = f"file:{rel}"
@@ -1089,7 +1104,7 @@ def _collect_sources(
                     "key": key, "path": rel, "mtime": mtime,
                     "doc": doc, "doc_id": doc.get("id"),
                     "study_ids": study_ids,
-                    "kind_hint": "board" if lower.endswith(".ecad+") else None,
+                    "kind_hint": "board" if rel.lower().endswith(".ecad+") else None,
                     "archive": path_is_archive(rel, arch),
                 })
                 seen_keys.add(key)

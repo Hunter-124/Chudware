@@ -1,13 +1,16 @@
 // PLM Project Hub — Graph tab body (contracts/cad_graph.md).
 //
-// Project-view + document drill-down scopes over cad_graph_get. Layered DAG
-// layout (Sugiyama-lite) over the visible subgraph; project view aggregates
-// cross-doc edges whose endpoints are hidden internals onto owning docs.
+// Project-view + document drill-down scopes over cad_graph_get. Interactive
+// force-directed layout (ui::ForceGraph, graph_force.h) animates the visible
+// subgraph; project view aggregates cross-doc edges whose endpoints are
+// hidden internals onto owning docs. Nodes are draggable with live physics;
+// the sim freezes once settled so idle frames are near-free.
 // Pan/zoom, hover tooltip, click → side panel + blast radius, search filter,
 // refresh + auto-refresh on OS app focus regain. Degrades: unknown_method
 // permanently hides the tab via plmGraphAvailable().
 #include "graph_tab.h"
 
+#include "graph_force.h"
 #include "plm_hub.h"
 
 #include <algorithm>
@@ -113,6 +116,20 @@ struct GraphTabState {
     std::unordered_map<std::string, int> idIndex;
     // CONTAINS parent: child id → parent id (first parent wins; rebuilt with data).
     std::unordered_map<std::string, std::string> containsParent;
+
+    // Force-directed layout (graph_force.h). forceSlot maps nodes[] index →
+    // sim node index (-1 when not in the sim); GNode::lx/ly stay the render
+    // cache. The sim is rebuilt when layoutDirty, stepped until settled.
+    ui::ForceGraph force;
+    std::vector<int> forceSlot;
+    int dragNode = -1;        // nodes[] index currently physics-dragged
+    int dragCandidate = -1;   // nodes[] index pressed, awaiting drag threshold
+    bool fitOnSettle = false; // fit once when a fresh layout first settles
+    // Search match cache (rebuilt when the query or visible set changes).
+    std::unordered_set<std::string> matchIds;
+    int visMatches = 0;
+    int allMatches = 0;
+    bool matchDirty = true;
 };
 
 // List view auto-threshold (user can still force Graph view).
@@ -192,13 +209,7 @@ bool isDrillableKind(const std::string& k) {
            k == "board" || k == "firmware" || k == "sim_study";
 }
 
-// Hierarchy edge kinds that establish layer(child) > layer(parent).
-bool isHierarchyEdge(const std::string& k) {
-    return k == "CONTAINS" || k == "DEPENDS_ON" || k == "DERIVES_FROM" ||
-           k == "INSTANCE_OF";
-}
-
-// Stable kind order for list view grouping (not layout rings anymore).
+// Stable kind order for list view grouping.
 int kindOrder(const std::string& k) {
     if (k == "project") return 0;
     if (k == "assembly" || k == "doc") return 1;
@@ -540,6 +551,7 @@ void rebuildVisible(GraphTabState& G) {
 
     G.layoutDirty = true;
     G.layoutToken++;
+    G.matchDirty = true;
 }
 
 void setScope(GraphTabState& G, const std::string& docId) {
@@ -553,180 +565,75 @@ void setScope(GraphTabState& G, const std::string& docId) {
     // Fit on next canvas paint.
 }
 
-// Deterministic Sugiyama-lite over the VISIBLE subgraph.
-// Layers = longest-path depth via hierarchy edges; within-layer barycenter
-// sweeps; positions top→bottom, left→right, centered per layer.
-void computeLayout(GraphTabState& G) {
-    const float S = ui::uiScale;
-    if (G.visibleIdx.empty()) {
-        G.layoutDirty = false;
-        return;
-    }
-
-    const int N = (int)G.visibleIdx.size();
-    std::unordered_map<std::string, int> vpos;  // id → index in visibleIdx
-    vpos.reserve(N * 2);
-    for (int i = 0; i < N; ++i) vpos[G.nodes[G.visibleIdx[i]].id] = i;
-
-    // Build directed hierarchy adjacency among visible nodes only.
-    // parent → children (downward), and reverse for in-degree.
-    std::vector<std::vector<int>> down(N), up(N);
-    std::vector<int> indeg(N, 0);
-    for (const auto& e : G.visibleEdges) {
-        if (!isHierarchyEdge(e.kind)) continue;
-        auto si = vpos.find(e.src), di = vpos.find(e.dst);
-        if (si == vpos.end() || di == vpos.end()) continue;
-        int a = si->second, b = di->second;
-        if (a == b) continue;
-        down[a].push_back(b);
-        up[b].push_back(a);
-        ++indeg[b];
-    }
-    // Deterministic neighbor order.
-    for (int i = 0; i < N; ++i) {
-        auto byId = [&](int x, int y) {
-            return G.nodes[G.visibleIdx[x]].id < G.nodes[G.visibleIdx[y]].id;
-        };
-        std::sort(down[i].begin(), down[i].end(), byId);
-        down[i].erase(std::unique(down[i].begin(), down[i].end()), down[i].end());
-        std::sort(up[i].begin(), up[i].end(), byId);
-        up[i].erase(std::unique(up[i].begin(), up[i].end()), up[i].end());
-        indeg[i] = (int)up[i].size();
-    }
-
-    // Kahn topological layering. Remaining cyclic nodes get
-    // layer = max(pred)+1 processed in id order.
-    std::vector<int> layer(N, 0);
-    std::vector<int> indegWork = indeg;
-    std::vector<int> queue;
-    queue.reserve(N);
-    for (int i = 0; i < N; ++i)
-        if (indegWork[i] == 0) queue.push_back(i);
-    std::sort(queue.begin(), queue.end(), [&](int a, int b) {
-        return G.nodes[G.visibleIdx[a]].id < G.nodes[G.visibleIdx[b]].id;
-    });
-
-    std::vector<int> topo;
-    topo.reserve(N);
-    std::vector<char> placed(N, 0);
-    size_t qh = 0;
-    while (qh < queue.size()) {
-        int u = queue[qh++];
-        placed[u] = 1;
-        topo.push_back(u);
-        // Collect newly-ready kids, then sort-append for determinism.
-        std::vector<int> ready;
-        for (int v : down[u]) {
-            layer[v] = std::max(layer[v], layer[u] + 1);
-            if (--indegWork[v] == 0) ready.push_back(v);
-        }
-        std::sort(ready.begin(), ready.end(), [&](int a, int b) {
-            return G.nodes[G.visibleIdx[a]].id < G.nodes[G.visibleIdx[b]].id;
-        });
-        for (int v : ready) queue.push_back(v);
-    }
-
-    // Cycle remainder: process by id, layer = max pred layer + 1.
-    if ((int)topo.size() < N) {
-        std::vector<int> rest;
-        for (int i = 0; i < N; ++i) if (!placed[i]) rest.push_back(i);
-        std::sort(rest.begin(), rest.end(), [&](int a, int b) {
-            return G.nodes[G.visibleIdx[a]].id < G.nodes[G.visibleIdx[b]].id;
-        });
-        // Relax a few passes so order is stable.
-        for (int pass = 0; pass < N; ++pass) {
-            bool changed = false;
-            for (int u : rest) {
-                int ml = 0;
-                bool any = false;
-                for (int p : up[u]) {
-                    any = true;
-                    ml = std::max(ml, layer[p] + 1);
-                }
-                if (any && layer[u] != ml) { layer[u] = ml; changed = true; }
-            }
-            if (!changed) break;
-        }
-        for (int u : rest) topo.push_back(u);
-    }
-
-    int maxLayer = 0;
-    for (int l : layer) maxLayer = std::max(maxLayer, l);
-
-    // Bucket nodes per layer (initial order = id).
-    std::vector<std::vector<int>> buckets(maxLayer + 1);
-    {
-        std::vector<int> order(N);
-        for (int i = 0; i < N; ++i) order[i] = i;
-        std::sort(order.begin(), order.end(), [&](int a, int b) {
-            if (layer[a] != layer[b]) return layer[a] < layer[b];
-            return G.nodes[G.visibleIdx[a]].id < G.nodes[G.visibleIdx[b]].id;
-        });
-        for (int i : order) buckets[layer[i]].push_back(i);
-    }
-
-    // Position index within layer (for barycenter).
-    std::vector<float> pos(N, 0.0f);
-    for (int L = 0; L <= maxLayer; ++L)
-        for (int i = 0; i < (int)buckets[L].size(); ++i)
-            pos[buckets[L][i]] = (float)i;
-
-    // 3 barycenter sweeps (down, up, down) — tie-break by id.
-    auto barySort = [&](std::vector<int>& bucket, bool useUp) {
-        std::vector<std::pair<float, int>> keys;
-        keys.reserve(bucket.size());
-        for (int u : bucket) {
-            const auto& nbrs = useUp ? up[u] : down[u];
-            float sum = 0.0f;
-            int cnt = 0;
-            for (int v : nbrs) { sum += pos[v]; ++cnt; }
-            float key = cnt > 0 ? sum / (float)cnt : pos[u];
-            keys.emplace_back(key, u);
-        }
-        std::sort(keys.begin(), keys.end(), [&](const auto& a, const auto& b) {
-            if (a.first != b.first) return a.first < b.first;
-            return G.nodes[G.visibleIdx[a.second]].id <
-                   G.nodes[G.visibleIdx[b.second]].id;
-        });
-        for (int i = 0; i < (int)keys.size(); ++i) {
-            bucket[i] = keys[i].second;
-            pos[bucket[i]] = (float)i;
-        }
-    };
-    for (int sweep = 0; sweep < 3; ++sweep) {
-        if (sweep % 2 == 0) {
-            for (int L = 1; L <= maxLayer; ++L) barySort(buckets[L], /*useUp=*/true);
-        } else {
-            for (int L = maxLayer - 1; L >= 0; --L) barySort(buckets[L], /*useUp=*/false);
-        }
-    }
-
-    // Assign coordinates.
-    const float layerGap = 110.0f * S;
-    const float nodeGap  = 100.0f * S;
-    const float nodeR    = 16.0f * S;
-
-    // Find widest layer for centering reference.
-    int maxW = 1;
-    for (const auto& b : buckets) maxW = std::max(maxW, (int)b.size());
-    const float fullW = (maxW - 1) * nodeGap;
-
-    for (int L = 0; L <= maxLayer; ++L) {
-        auto& bucket = buckets[L];
-        const int n = (int)bucket.size();
-        const float rowW = n > 1 ? (n - 1) * nodeGap : 0.0f;
-        const float x0 = (fullW - rowW) * 0.5f;
-        const float y = (float)L * layerGap;
-        for (int i = 0; i < n; ++i) {
-            GNode& gn = G.nodes[G.visibleIdx[bucket[i]]];
-            gn.lx = x0 + (float)i * nodeGap;
-            gn.ly = y;
-            // Slightly larger root / structural nodes.
-            gn.radius = (gn.kind == "project") ? nodeR * 1.15f : nodeR;
-        }
-    }
-
+// Rebuild the force simulation over the VISIBLE subgraph (called when
+// layoutDirty, not per frame). Existing layout coords are reused as seeds so
+// refreshes/filter toggles stay stable; new nodes seed near their CONTAINS
+// parent or on a deterministic golden-angle spiral. Hidden edge kinds exert
+// no spring force. Sets fitOnSettle so the view frames the relaxed layout.
+void rebuildForce(GraphTabState& G) {
+    G.force.clear();
+    G.forceSlot.assign(G.nodes.size(), -1);
+    G.dragNode = G.dragCandidate = -1;
     G.layoutDirty = false;
+    if (G.visibleIdx.empty()) return;
+
+    const float S = ui::uiScale;
+    // Scale the engine's defaults (link 60, repulsion 900) up to our spacing.
+    G.force.setLinkDistance(100.0f * S);
+    G.force.setRepulsion(900.0f * S * S * (100.0f / 60.0f) * (100.0f / 60.0f));
+
+    const float GOLDEN = 2.39996323f;  // golden angle (rad)
+    int fresh = 0;
+    for (int vi : G.visibleIdx) {
+        GNode& n = G.nodes[vi];
+        n.radius = (n.kind == "project") ? 18.0f * S : 15.0f * S;
+        float sx = n.lx, sy = n.ly;
+        if (sx == 0.0f && sy == 0.0f) {
+            bool seeded = false;
+            auto pit = G.containsParent.find(n.id);
+            if (pit != G.containsParent.end()) {
+                auto pi = G.idIndex.find(pit->second);
+                if (pi != G.idIndex.end()) {
+                    const GNode& p = G.nodes[pi->second];
+                    if (p.lx != 0.0f || p.ly != 0.0f) {
+                        const float a = (float)fresh * GOLDEN;
+                        sx = p.lx + 40.0f * S * std::cos(a);
+                        sy = p.ly + 40.0f * S * std::sin(a);
+                        seeded = true;
+                    }
+                }
+            }
+            if (!seeded) {
+                const float r = 90.0f * S * std::sqrt((float)fresh);
+                const float a = (float)fresh * GOLDEN;
+                sx = r * std::cos(a);
+                sy = r * std::sin(a);
+            }
+            ++fresh;
+        }
+        G.forceSlot[vi] = G.force.addNode(sx, sy, n.radius);
+    }
+
+    // Springs per visible edge; kind tunes rest length / stiffness.
+    for (const auto& e : G.visibleEdges) {
+        if (G.hiddenKinds.count(e.kind)) continue;
+        auto si = G.idIndex.find(e.src), di = G.idIndex.find(e.dst);
+        if (si == G.idIndex.end() || di == G.idIndex.end()) continue;
+        int a = G.forceSlot[si->second], b = G.forceSlot[di->second];
+        if (a < 0 || b < 0 || a == b) continue;
+        float rest = 110.0f, strength = 0.45f;
+        if (e.kind == "CONTAINS")               { rest = 85.0f;  strength = 0.9f; }
+        else if (e.kind == "INSTANCE_OF")       { rest = 90.0f;  strength = 0.7f; }
+        else if (e.kind == "DEPENDS_ON")        { rest = 120.0f; strength = 0.5f; }
+        else if (e.kind == "MATES")             { rest = 110.0f; strength = 0.55f; }
+        else if (e.kind == "REFERENCES" ||
+                 e.kind == "DERIVES_FROM")      { rest = 150.0f; strength = 0.3f; }
+        if (e.aggCount > 1) strength += std::min(0.3f, 0.05f * (float)(e.aggCount - 1));
+        G.force.addEdge(a, b, rest * S, strength);
+    }
+
+    G.force.reheat(fresh > (int)G.visibleIdx.size() / 2 ? 0.8f : 0.35f);
+    G.fitOnSettle = true;
 }
 
 void drawDashedLine(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 col, float thick,
@@ -1028,6 +935,26 @@ bool matchesSearch(const GNode& n, const char* q) {
     return has(n.label) || has(n.kind) || has(n.id) || has(n.path);
 }
 
+// Search match cache: matchIds (visible), vis/all match tallies for the
+// hidden-match hint. Rebuilt only when the query or visible set changes.
+void rebuildMatchCache(GraphTabState& G) {
+    G.matchIds.clear();
+    G.visMatches = 0;
+    G.allMatches = 0;
+    std::unordered_set<std::string> visSet;
+    visSet.reserve(G.visibleIdx.size() * 2);
+    for (int vi : G.visibleIdx) visSet.insert(G.nodes[vi].id);
+    for (const auto& n : G.nodes) {
+        if (!matchesSearch(n, G.search)) continue;
+        ++G.allMatches;
+        if (visSet.count(n.id)) {
+            ++G.visMatches;
+            G.matchIds.insert(n.id);
+        }
+    }
+    G.matchDirty = false;
+}
+
 void drawLegend(ImDrawList* dl, ImVec2 origin, bool projectScope) {
     const float S = ui::uiScale;
     // Scope note + edge styles + kinds actually shown in this view.
@@ -1313,13 +1240,32 @@ void drawCanvas(AppState& st, ImVec2 canvasSz) {
     ui::glassBackground(dl, origin,
                         ImVec2(origin.x + canvasSz.x, origin.y + canvasSz.y), 10.0f);
 
-    if (G.layoutDirty) computeLayout(G);
+    if (G.layoutDirty) rebuildForce(G);
 
     // First layout after data/scope change → fit the view once.
     static int s_fitToken = -1;
     if (s_fitToken != G.layoutToken && !G.visibleIdx.empty()) {
         fitView(G, canvasSz);
         s_fitToken = G.layoutToken;
+    }
+
+    // Advance physics and copy graph-space positions back into the render
+    // cache. Frozen when settled unless a node is being dragged — idle
+    // frames cost nothing but the draw itself.
+    if (!G.visibleIdx.empty() && (G.dragNode >= 0 || !G.force.settled())) {
+        G.force.step(std::min(ImGui::GetIO().DeltaTime, 0.05f));
+        for (int vi : G.visibleIdx) {
+            int slot = (vi < (int)G.forceSlot.size()) ? G.forceSlot[vi] : -1;
+            if (slot < 0) continue;
+            G.nodes[vi].lx = G.force.x(slot);
+            G.nodes[vi].ly = G.force.y(slot);
+        }
+        // Frame the relaxed layout once it first settles.
+        if (G.fitOnSettle && G.force.settled()) {
+            fitView(G, canvasSz);
+            s_fitToken = G.layoutToken;
+            G.fitOnSettle = false;
+        }
     }
 
     // Zoom (wheel) around cursor.
@@ -1335,10 +1281,11 @@ void drawCanvas(AppState& st, ImVec2 canvasSz) {
         }
     }
 
-    // Pan: middle-drag or left-drag on empty background.
-    if (hovered && (ImGui::IsMouseDragging(ImGuiMouseButton_Middle) ||
-                    (ImGui::IsMouseDragging(ImGuiMouseButton_Left) &&
-                     G.hoverId.empty() && !ImGui::GetIO().KeyCtrl))) {
+    // Pan: middle-drag or left-drag on empty background (never mid node-drag).
+    if (hovered && G.dragNode < 0 && G.dragCandidate < 0 &&
+        (ImGui::IsMouseDragging(ImGuiMouseButton_Middle) ||
+         (ImGui::IsMouseDragging(ImGuiMouseButton_Left) &&
+          G.hoverId.empty() && !ImGui::GetIO().KeyCtrl))) {
         ImVec2 d = ImGui::GetIO().MouseDelta;
         G.panX += d.x;
         G.panY += d.y;
@@ -1349,15 +1296,17 @@ void drawCanvas(AppState& st, ImVec2 canvasSz) {
                       origin.y + G.panY + ly * G.zoom);
     };
 
-    // Search filter over VISIBLE nodes.
+    // Viewport culling helpers (screen space, padded past the clip rect).
+    const ImVec2 scrMin(origin.x - 40.0f, origin.y - 40.0f);
+    const ImVec2 scrMax(origin.x + canvasSz.x + 40.0f,
+                        origin.y + canvasSz.y + 40.0f);
+    auto onScreen = [&](ImVec2 p) {
+        return p.x >= scrMin.x && p.x <= scrMax.x && p.y >= scrMin.y && p.y <= scrMax.y;
+    };
+
+    // Search filter over VISIBLE nodes (cached; rebuilt on query/visible change).
     const bool filtering = G.search[0] != 0;
-    std::unordered_set<std::string> matchIds;
-    if (filtering) {
-        for (int vi : G.visibleIdx) {
-            const GNode& n = G.nodes[vi];
-            if (matchesSearch(n, G.search)) matchIds.insert(n.id);
-        }
-    }
+    if (filtering && G.matchDirty) rebuildMatchCache(G);
 
     // Focus id for incidence dimming: hover wins, else selection.
     const std::string& focusId = !G.hoverId.empty() ? G.hoverId : G.selectedId;
@@ -1372,6 +1321,8 @@ void drawCanvas(AppState& st, ImVec2 canvasSz) {
     };
 
     // ---- Edges (visibleEdges only) ------------------------------------------
+    // Coarse LOD for huge webs: solid 1px lines, no mid-edge labels.
+    const bool edgeLod = (int)G.visibleEdges.size() > 4000;
     for (int ei = 0; ei < (int)G.visibleEdges.size(); ++ei) {
         const VEdge& e = G.visibleEdges[ei];
         if (G.hiddenKinds.count(e.kind)) continue;
@@ -1384,7 +1335,7 @@ void drawCanvas(AppState& st, ImVec2 canvasSz) {
         if (e.kind == "CONTAINS" && std::fabs(a.ly - b.ly) < 1.0f)
             continue;
 
-        bool dimf = filtering && !matchIds.count(a.id) && !matchIds.count(b.id);
+        bool dimf = filtering && !G.matchIds.count(a.id) && !G.matchIds.count(b.id);
         bool incident = edgeIncident(e);
         bool selEdge = (ei == G.selectedEdge);
         bool authored = (e.origin == "manual" || e.origin == "ai");
@@ -1406,14 +1357,16 @@ void drawCanvas(AppState& st, ImVec2 canvasSz) {
 
         ImVec2 p0 = toScreen(a.lx, a.ly);
         ImVec2 p1 = toScreen(b.lx, b.ly);
-        float thick = (selEdge ? 3.0f : (incident && !dimf ? 2.2f : 1.3f)) * S;
-        if (e.origin == "inferred" || e.origin == "ai")
+        if (!onScreen(p0) && !onScreen(p1)) continue;  // viewport cull
+        float thick = (edgeLod ? 1.0f
+                      : selEdge ? 3.0f : (incident && !dimf ? 2.2f : 1.3f)) * S;
+        if (!edgeLod && (e.origin == "inferred" || e.origin == "ai"))
             drawDashedLine(dl, p0, p1, col, thick, 7 * S, 4 * S);
         else
             dl->AddLine(p0, p1, col, thick);
 
         // Dimensional / aggregation label at midpoint when zoomed in.
-        if (!dimf && alpha > 0.2f && G.zoom >= 0.8f) {
+        if (!edgeLod && !dimf && alpha > 0.2f && G.zoom >= 0.8f) {
             std::string lab = e.dimLabel;
             if (e.aggCount > 1) {
                 char buf[48];
@@ -1449,6 +1402,37 @@ void drawCanvas(AppState& st, ImVec2 canvasSz) {
             }
         }
     }
+
+    // ---- Node physics-drag ---------------------------------------------------
+    // Press on a node arms a candidate; crossing the drag threshold pins it to
+    // the cursor (live physics) until release. Click-select still fires on the
+    // press frame below, so plain clicks are unaffected.
+    if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !G.hoverId.empty()) {
+        auto it = G.idIndex.find(G.hoverId);
+        G.dragCandidate = (it != G.idIndex.end()) ? it->second : -1;
+    }
+    if (G.dragCandidate >= 0 && G.dragNode < 0 &&
+        ImGui::IsMouseDragging(ImGuiMouseButton_Left, 4.0f * S)) {
+        G.dragNode = G.dragCandidate;
+        int slot = (G.dragNode < (int)G.forceSlot.size()) ? G.forceSlot[G.dragNode] : -1;
+        if (slot >= 0) G.force.setPinned(slot, true);
+    }
+    if (G.dragNode >= 0) {
+        int slot = (G.dragNode < (int)G.forceSlot.size()) ? G.forceSlot[G.dragNode] : -1;
+        if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            if (slot >= 0) {
+                G.force.setPos(slot, (mp.x - origin.x - G.panX) / G.zoom,
+                                     (mp.y - origin.y - G.panY) / G.zoom);
+                G.force.reheat(0.03f);  // neighbours react while dragging
+            }
+            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        } else {
+            if (slot >= 0) G.force.setPinned(slot, false);
+            G.force.reheat(0.15f);
+            G.dragNode = -1;
+        }
+    }
+    if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) G.dragCandidate = -1;
 
     // Single-click select (nodes) — also completes an armed link.
     if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !G.hoverId.empty()) {
@@ -1503,11 +1487,20 @@ void drawCanvas(AppState& st, ImVec2 canvasSz) {
 
     // ---- Nodes (visibleIdx only) --------------------------------------------
     const bool projectScope = G.scopeDocId.empty();
+    // Label LOD: with few nodes on screen, label everything; otherwise only
+    // hovered/selected/search-matched nodes (text is the draw bottleneck).
+    int onScreenNodes = 0;
+    for (int vi : G.visibleIdx) {
+        const GNode& n = G.nodes[vi];
+        if (onScreen(toScreen(n.lx, n.ly))) ++onScreenNodes;
+    }
+    const bool labelAll = onScreenNodes <= 150;
     for (int vi : G.visibleIdx) {
         const GNode& n = G.nodes[vi];
         ImVec2 c = toScreen(n.lx, n.ly);
+        if (!onScreen(c)) continue;  // viewport cull
         float r = n.radius * G.zoom;
-        bool dim = filtering && !matchIds.count(n.id);
+        bool dim = filtering && !G.matchIds.count(n.id);
         bool sel = (n.id == G.selectedId);
         bool hov = (n.id == G.hoverId);
         bool inBlast = G.blast.count(n.id) > 0;
@@ -1533,8 +1526,10 @@ void drawCanvas(AppState& st, ImVec2 canvasSz) {
                 ImGui::GetColorU32(ImVec4(palette.text[0], palette.text[1],
                                           palette.text[2], 0.55f)), 12);
 
-        // Labels: always in project view (counts are small); zoom-gated in drill-down.
-        const bool showLabel = !dim && (projectScope || G.zoom >= 0.75f || sel || hov);
+        // Labels: LOD-gated (few on screen, or zoomed, or focused/matched).
+        const bool showLabel = !dim &&
+            ((labelAll && G.zoom >= 0.35f) || sel || hov ||
+             (filtering && G.matchIds.count(n.id)) || G.zoom >= 0.9f);
         if (showLabel) {
             const char* lab = n.label.c_str();
             ImVec2 ts = ImGui::CalcTextSize(lab);
@@ -1647,9 +1642,9 @@ void drawCanvas(AppState& st, ImVec2 canvasSz) {
     dl->PopClipRect();
 
     // Search-driven center: when the user types a filter, center on first VISIBLE match.
-    if (G.centerPending && filtering && !matchIds.empty()) {
+    if (G.centerPending && filtering && !G.matchIds.empty()) {
         for (int vi : G.visibleIdx) {
-            if (matchIds.count(G.nodes[vi].id)) {
+            if (G.matchIds.count(G.nodes[vi].id)) {
                 centerOnNode(G, G.nodes[vi], canvasSz);
                 break;
             }
@@ -1805,6 +1800,16 @@ void plmGraphOnProjectChanged() {
     G.descCounts.clear();
     G.idIndex.clear();
     G.containsParent.clear();
+    // Force sim + interaction + search cache.
+    G.force.clear();
+    G.forceSlot.clear();
+    G.dragNode = -1;
+    G.dragCandidate = -1;
+    G.fitOnSettle = false;
+    G.matchIds.clear();
+    G.visMatches = 0;
+    G.allMatches = 0;
+    G.matchDirty = true;
     // hideArchive stays — user preference across projects.
     // Keep available flag — method absence is session-wide, not per-project.
 }
@@ -1814,6 +1819,7 @@ void plmGraphFocus(const std::string& query) {
     std::snprintf(G.search, sizeof(G.search), "%s", query.c_str());
     G.focusPending = query;
     G.centerPending = !query.empty();
+    G.matchDirty = true;
     G.lastFetch = -1e9;  // force a refetch on the next draw
 }
 
@@ -1850,6 +1856,8 @@ void plmDrawGraphPage(AppState& st) {
     if (ImGui::InputTextWithHint("##graph_search", "Search nodes…",
                                  G.search, sizeof(G.search))) {
         G.centerPending = G.search[0] != 0;
+        G.matchDirty = true;
+        G.force.reheat(0.12f);  // matched nodes draw the eye as they settle
     }
     ImGui::SameLine();
     if (graphGlassButton("##graph_refresh", G.loading ? "Refreshing…" : "Refresh",
@@ -1888,8 +1896,9 @@ void plmDrawGraphPage(AppState& st) {
         }
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
             ImGui::SetTooltip(
-                "Graph view lays out the current scope as a top-down DAG.\n"
-                "List view shows every loaded node (including features).");
+                "Graph view animates the current scope as a live force-directed\n"
+                "layout (drag nodes to rearrange). List view shows every\n"
+                "loaded node (including features).");
         }
     }
     if (!G.generatedAt.empty()) {
@@ -1966,16 +1975,8 @@ void plmDrawGraphPage(AppState& st) {
 
     // Hidden search-match hint (matches outside the current visible scope).
     if (G.search[0] != 0 && !G.nodes.empty()) {
-        int visMatches = 0, allMatches = 0;
-        std::unordered_set<std::string> visSet;
-        visSet.reserve(G.visibleIdx.size() * 2);
-        for (int vi : G.visibleIdx) visSet.insert(G.nodes[vi].id);
-        for (const auto& n : G.nodes) {
-            if (!matchesSearch(n, G.search)) continue;
-            ++allMatches;
-            if (visSet.count(n.id)) ++visMatches;
-        }
-        const int hiddenMatches = allMatches - visMatches;
+        if (G.matchDirty) rebuildMatchCache(G);
+        const int hiddenMatches = G.allMatches - G.visMatches;
         if (hiddenMatches > 0) {
             ImGui::PushStyleColor(ImGuiCol_Text,
                 ImVec4(palette.textDisabled[0], palette.textDisabled[1],
@@ -1990,10 +1991,13 @@ void plmDrawGraphPage(AppState& st) {
     if (graphGlassButton("##links_only", "Links only", false, 0.0f)) {
         G.hiddenKinds.clear();
         G.hiddenKinds.insert("CONTAINS");  // hide containment → the link web
+        G.layoutDirty = true;  // hidden kinds exert no spring force
     }
     ImGui::SameLine();
-    if (graphGlassButton("##all_kinds", "All", false, 0.0f))
+    if (graphGlassButton("##all_kinds", "All", false, 0.0f)) {
         G.hiddenKinds.clear();
+        G.layoutDirty = true;
+    }
     for (const char* k : kEdgeKinds) {
         ImGui::SameLine();
         bool vis = !G.hiddenKinds.count(k);
@@ -2001,6 +2005,7 @@ void plmDrawGraphPage(AppState& st) {
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(tc));
         if (ImGui::SmallButton(k)) {
             if (vis) G.hiddenKinds.insert(k); else G.hiddenKinds.erase(k);
+            G.layoutDirty = true;
         }
         ImGui::PopStyleColor();
     }

@@ -258,3 +258,12 @@ Producers: core/agent/machine.cpp (build_plan after plan pass; checklist from pl
 | scope | obj | {} | edit targeting {doc_id, feature_ids?, selection?, section?} |
 | advisor | bool | true | advisor on for run + subagents; config agent.advisor default true, env AI_CAD_ADVISOR honored |
 Mode→role: agent→default, plan→planning, swarm→default(+corporate), edit→task, ask→default(read-only). Mode→tools (Python copilot_mode_tools): ask=read-only; plan=read+plan no mutation; edit=doc mutators no new_part/mission; agent=full+delegate; swarm=full+corporate/delegate. Subagents available in every mode. Plan gate: mode=plan → plan_only run → GUI drawPlanApproveCard (Execute as Agent/Swarm/Cancel) → resend approved_plan+execute_as. C++ (run.cpp/libaicad.cpp) parses these; absent mode = legacy byte-identical.
+
+## Mid-run steering (2026-07-19, additive)
+- `agent_steer` (new kind): emitted by the C++ run machine when a queued user steering
+  message is consumed at a stage/attempt boundary. Fields: `text` (the steering text).
+  The machine folds the text into the request as `[User steering] <text>` so the next
+  provider call sees it. Queue side: `agent_steer {run_id, text}` RPC (contracts/worker_rpc.md
+  §AI) → `{ok, steered}`; cooperative like `agent_cancel` — never interrupts an in-flight
+  provider HTTP call; unknown/finished run_id → `steered:false`. Consumers tolerate unknown
+  kinds (conformance §5).

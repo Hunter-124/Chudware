@@ -12,7 +12,9 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -101,6 +103,28 @@ struct RunControl {
     void request_cancel() {
         if (flag) flag->store(true, std::memory_order_release);
     }
+
+    // Mid-run steering (agent_steer): any thread queues text; the run drains it at
+    // stage/attempt boundaries and folds it into the request so the NEXT provider
+    // call sees it. Never interrupts an in-flight HTTP call (same cooperative model
+    // as cancel).
+    struct SteerQueue {
+        std::mutex mtx;
+        std::vector<std::string> pending;
+    };
+    std::shared_ptr<SteerQueue> steers = std::make_shared<SteerQueue>();
+    void queue_steer(const std::string& text) {
+        if (!steers) return;
+        std::lock_guard<std::mutex> lk(steers->mtx);
+        steers->pending.push_back(text);
+    }
+    std::vector<std::string> drain_steers() {
+        std::vector<std::string> out;
+        if (!steers) return out;
+        std::lock_guard<std::mutex> lk(steers->mtx);
+        out.swap(steers->pending);
+        return out;
+    }
 };
 
 // Process-wide run-id → RunControl registry. Runs register on start, unregister on finish.
@@ -109,6 +133,11 @@ void register_run_control(const std::string& run_id, RunControl control);
 void unregister_run_control(const std::string& run_id);
 // Returns {ok:true, cancelled:bool} — cancelled is true when a live run was flagged.
 json cancel_run(const std::string& run_id);
+
+// Queue a mid-run steering message for a live run. Returns {ok:true, steered:bool} —
+// steered is false for unknown/finished run_id or empty text. The run consumes queued
+// steers at its next stage/attempt boundary as `[User steering]` context.
+json steer_run(const std::string& run_id, const std::string& text);
 
 // Drive the state machine to completion. Returns {status, stop_reason}.
 json run_machine(DesignState& state, const StageActions& actions, RunEvents& events,

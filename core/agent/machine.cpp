@@ -52,6 +52,27 @@ json cancel_run(const std::string& run_id) {
     return json{{"ok", true}, {"cancelled", true}};
 }
 
+json steer_run(const std::string& run_id, const std::string& text) {
+    if (run_id.empty()) return json{{"ok", true}, {"steered", false}};
+    // Trim; empty steering is a no-op.
+    std::string t = text;
+    const auto ws = t.find_first_not_of(" \t\r\n");
+    if (ws == std::string::npos) return json{{"ok", true}, {"steered", false}};
+    RunControl ctl;
+    bool found = false;
+    {
+        std::lock_guard<std::mutex> lk(g_run_ctl_mtx);
+        auto it = g_run_ctl.find(run_id);
+        if (it != g_run_ctl.end()) {
+            ctl = it->second;
+            found = true;
+        }
+    }
+    if (!found) return json{{"ok", true}, {"steered", false}};
+    ctl.queue_steer(t);
+    return json{{"ok", true}, {"steered", true}};
+}
+
 bool is_planning_stage(const std::string& stage) {
     // Strong-model stages under prewalk: understand / plan / review / memory.
     // NOT implementation (model apply / fix / micro execute).
@@ -223,6 +244,16 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
     auto over_global_cap = [&] { return global_calls >= kGlobalIterCap; };
     auto cancelled = [&] { return control.cancelled(); };
 
+    // Mid-run steering: fold queued user steering into the request so the NEXT stage /
+    // attempt provider call sees it (cooperative — never interrupts an in-flight call).
+    // Drained at every stage/attempt boundary below (same checkpoints as cancelled()).
+    auto apply_steers = [&] {
+        for (const std::string& s : control.drain_steers()) {
+            state.request += "\n\n[User steering] " + s;
+            events.emit("agent_steer", json{{"text", s}});
+        }
+    };
+
     auto budget_of = [&](const std::string& stage) -> int {
         auto it = budgets.find(stage);
         return it == budgets.end() ? 1 : it->second;
@@ -265,6 +296,7 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
     auto run_attempt = [&](const std::string& stage, const Action& action, const std::string& role,
                            int attempt, int budget) -> std::string {
         if (cancelled()) return "cancelled";
+        apply_steers();
         if (over_global_cap()) {
             last_fail_reason = "global iteration cap reached";
             last_was_provider_error = false;

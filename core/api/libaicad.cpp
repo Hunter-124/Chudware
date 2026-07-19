@@ -1673,6 +1673,14 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             const std::string run_id = jstr(params, "run_id");
             return emit(aicad::agent::cancel_run(run_id), out_json, 0);
         }
+        if (m == "agent_steer") {
+            // Mid-run steering: {run_id, text} -> {ok, steered:bool}. The run folds queued
+            // steering into the request at its next stage/attempt boundary (cooperative —
+            // never interrupts an in-flight provider call). Unknown/finished => steered:false.
+            const std::string run_id = jstr(params, "run_id");
+            const std::string text = jstr(params, "text");
+            return emit(aicad::agent::steer_run(run_id, text), out_json, 0);
+        }
         if (m == "agent_run") {
             // HOST-ERGONOMIC entry: {request, doc_id, options?, provider?}.
             // The host sends just {request, doc_id}; the core resolves everything:

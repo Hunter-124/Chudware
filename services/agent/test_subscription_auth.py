@@ -1507,3 +1507,61 @@ def test_ensure_fresh_xai_rotates_past_revoked_active(tmp_config, monkeypatch):
     live = sub_auth.load_credential(xsp.PROVIDER_ID, account_id="acct-live")
     assert live["refresh_token"] == "rt-live-new"
     assert live["access_token"] == "at-live-new"
+
+
+def test_ensure_fresh_skips_revoked_prefix_beyond_old_cap(tmp_config, monkeypatch):
+    """Revoked leaders must not hide a live account past the old 5-slot cap.
+
+    Regression: _ENSURE_FRESH_MAX_ACCOUNTS sliced candidates BEFORE skipping
+    refresh_revoked, so pools with many dead actives always failed closed.
+    """
+    from agent.providers import xai_sub_provider as xsp
+
+    now = time.time() * 1000
+    # 7 revoked/expired leaders, then one live account.
+    for i in range(7):
+        aid = f"acct-dead-{i}"
+        sub_auth.save_credential(xsp.PROVIDER_ID, {
+            "access_token": f"at-dead-{i}",
+            "refresh_token": f"rt-dead-{i}",
+            "expires_at_ms": now - 1000,
+            "account_id": aid,
+            "email": f"dead{i}@x.ai",
+            "refresh_revoked": True,
+            "auth_error": "invalid_grant",
+            "token_endpoint": "https://auth.x.ai/oauth2/token",
+        }, account_id=aid, set_active=(i == 0))
+    sub_auth.save_credential(xsp.PROVIDER_ID, {
+        "access_token": "at-live",
+        "refresh_token": "rt-live",
+        "expires_at_ms": now - 1000,
+        "account_id": "acct-live-deep",
+        "email": "live@x.ai",
+        "token_endpoint": "https://auth.x.ai/oauth2/token",
+    }, account_id="acct-live-deep", set_active=False)
+    assert sub_auth.get_active_account_id(xsp.PROVIDER_ID) == "acct-dead-0"
+    xsp.clear_blocked_accounts_for_tests()
+
+    posts = {"n": 0}
+
+    def fake_post_form(url, fields, headers=None, timeout=30.0):  # noqa: ARG001
+        posts["n"] += 1
+        rt = fields.get("refresh_token")
+        if rt == "rt-live":
+            return {
+                "access_token": "at-live-new",
+                "refresh_token": "rt-live-new",
+                "expires_in": 7200,
+            }
+        raise AssertionError(f"must not POST refresh for {rt!r}")
+
+    monkeypatch.setattr(sub_auth, "post_form", fake_post_form)
+
+    out = sl.ensure_fresh("xai")
+    assert out["ok"] is True, out
+    assert out["refreshed"] is True
+    assert posts["n"] == 1  # only the live account
+    assert sub_auth.get_active_account_id(xsp.PROVIDER_ID) == "acct-live-deep"
+    live = sub_auth.load_credential(xsp.PROVIDER_ID, account_id="acct-live-deep")
+    assert live["refresh_token"] == "rt-live-new"
+

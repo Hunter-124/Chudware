@@ -505,6 +505,88 @@ def test_subscription_usage_rows_with_mocked_fetchers(tmp_config, monkeypatch):
     assert bad["ok"] is False and bad["rows"] == []
 
 
+def test_subscription_usage_fetches_accounts_in_parallel(tmp_config, monkeypatch):
+    """Multi-account usage must not serialize N network waterfalls."""
+    import threading
+    import time as _time
+
+    for i in range(6):
+        sub_auth.save_credential("xai-sub", {
+            "access_token": f"t{i}",
+            "refresh_token": f"r{i}",
+            "expires_at_ms": (_time.time() + 3600) * 1000,
+            "account_id": f"a{i}",
+            "email": f"u{i}@x.ai",
+            "display_name": f"User {i}",
+            "plan": "Grok Pro",
+        }, account_id=f"a{i}", set_active=(i == 0))
+
+    barrier = threading.Barrier(6, timeout=5.0)
+    peak = {"n": 0}
+    lock = threading.Lock()
+    inflight = {"n": 0}
+
+    def slow_fetch(cred):
+        with lock:
+            inflight["n"] += 1
+            peak["n"] = max(peak["n"], inflight["n"])
+        try:
+            barrier.wait()
+            return {
+                "display_name": cred.get("display_name"),
+                "plan": cred.get("plan"),
+                "email": cred.get("email"),
+                "usage": [{"window": "credits", "label": "Credits",
+                           "used_fraction": 0.1, "resets_at": None, "status": "ok"}],
+                "source": "api",
+            }
+        finally:
+            with lock:
+                inflight["n"] -= 1
+
+    monkeypatch.setitem(usage._FETCHERS, "xai", slow_fetch)
+    usage.clear_cache()
+    t0 = _time.time()
+    out = usage.subscription_usage("xai", force=True)
+    elapsed = _time.time() - t0
+    assert out["ok"] is True
+    assert len(out["rows"]) == 6
+    assert peak["n"] >= 4, peak  # truly concurrent, not serial
+    assert elapsed < 2.0, elapsed
+
+
+def test_xai_expired_token_skips_usage_waterfall(tmp_config, monkeypatch):
+    """Expired access tokens must not issue billing/userinfo GETs."""
+    now = time.time()
+    sub_auth.save_credential("xai-sub", {
+        "access_token": "dead.jwt.sig",
+        "refresh_token": "rt",
+        "expires_at_ms": (now - 100) * 1000,
+        "account_id": "acct-x",
+        "email": "e@x.ai",
+        "display_name": "E",
+        "plan": "Grok Pro",
+        "last_usage": [{"window": "credits", "label": "Credits",
+                        "used_fraction": 0.4, "resets_at": None, "status": "ok"}],
+        "refresh_revoked": True,
+    }, account_id="acct-x")
+
+    calls = {"n": 0}
+
+    def no_http(*_a, **_k):
+        calls["n"] += 1
+        raise AssertionError("expired/revoked xAI must not hit network")
+
+    monkeypatch.setattr(usage, "_http_get", no_http)
+    monkeypatch.setattr(usage, "_http_request", no_http)
+    usage.clear_cache()
+    row = usage.fetch_account_usage("xai", "acct-x", force=True)
+    assert calls["n"] == 0
+    assert row["usage"] and row["usage"][0]["used_fraction"] == 0.4
+    assert row.get("source") in ("cached", "jwt_inference", "api")
+
+
+
 def test_subscription_usage_rpc(tmp_config, monkeypatch):
     from engine_oracle.parts_hub import subscription_rpc as rpc
 

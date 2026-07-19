@@ -25,6 +25,7 @@ import logging
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -1179,10 +1180,32 @@ def _infer_xai_plan(cred: dict) -> str | None:
     return None
 
 
-def fetch_xai_usage_jwt_inference(cred: dict) -> dict:
-    """xAI degrade path: plan from JWT / stored tier; no remaining-quota API."""
+def fetch_xai_usage_jwt_inference(cred: dict, *, network: bool = True) -> dict:
+    """xAI degrade path: plan from JWT / stored tier; no remaining-quota API.
+
+    *network*=False skips OIDC userinfo (expired/revoked bulk polls).
+    """
     # Re-run identity so cold-start credentials without display_name get a label.
-    enriched = enrich_xai_identity(dict(cred))
+    if network:
+        enriched = enrich_xai_identity(dict(cred))
+    else:
+        enriched = dict(cred)
+        # Offline label fill — mirror enrich_xai_identity's non-network branch.
+        plan_l = _infer_xai_plan(enriched)
+        if plan_l:
+            enriched.setdefault("plan", plan_l)
+        dn = enriched.get("display_name")
+        if not dn or _looks_like_uuid(dn) or _looks_like_acct_slug(dn):
+            if enriched.get("email"):
+                enriched["display_name"] = enriched["email"]
+            elif plan_l:
+                short = _short_id(enriched.get("account_id"))
+                enriched["display_name"] = (
+                    f"Grok ({plan_l})" if not short else f"Grok ({plan_l} · {short})"
+                )
+            else:
+                short = _short_id(enriched.get("account_id"))
+                enriched["display_name"] = f"Grok ({short})" if short else "Grok"
     email = enriched.get("email") or cred.get("email")
     plan = enriched.get("plan") or _infer_xai_plan(cred)
     display_name = enriched.get("display_name") or email
@@ -1596,12 +1619,28 @@ def fetch_xai_usage_api(cred: dict) -> dict:
     Identity still comes from OIDC userinfo (JWT has no email/name).
     Rate-limit headers (api.x.ai chat / last_usage) are secondary enrichment
     appended only when billing did not return a credits window.
-    """
-    base = fetch_xai_usage_jwt_inference(cred)
-    token = str(cred.get("access_token") or "").strip()
-    if not token:
-        return base
 
+    Dead/expired tokens skip the multi-GET waterfall entirely — Settings multi-
+    account polls otherwise spend minutes serial-timing-out 30+ accounts.
+    """
+    token = str(cred.get("access_token") or "").strip()
+    # Dead/expired tokens skip the multi-GET waterfall entirely — Settings multi-
+    # account polls otherwise spend minutes serial-timing-out 30+ accounts.
+    # Use offline jwt_inference (no userinfo) so bulk polls stay local.
+    if not token:
+        return fetch_xai_usage_jwt_inference(cred, network=False)
+    if cred.get("refresh_revoked") and sub_auth.is_expired(cred, skew_ms=0):
+        out = fetch_xai_usage_jwt_inference(cred, network=False)
+        if out.get("usage"):
+            out["source"] = "cached"
+        return out
+    if sub_auth.is_expired(cred, skew_ms=0):
+        out = fetch_xai_usage_jwt_inference(cred, network=False)
+        if out.get("usage"):
+            out["source"] = "cached"
+        return out
+
+    base = fetch_xai_usage_jwt_inference(cred)
     headers = _xai_auth_headers(cred)
     out = dict(base)
     out["source"] = XAI_SOURCE_API
@@ -2286,6 +2325,10 @@ def subscription_usage(provider: str | None = None, *, force: bool = False) -> d
     """Collect usage rows for all (or one) connected subscription accounts.
 
     Returns ``{ok: True, rows: [...]}`` — contract-shaped, never a traceback.
+
+    Multi-account pools (especially xAI) fetch in parallel so Settings does not
+    wait on N serial billing/userinfo waterfalls. Cache / disk last_usage still
+    short-circuit inside :func:`fetch_account_usage`.
     """
     targets: list[tuple[str, str, str]] = []  # friendly, cred_id, label
     if provider:
@@ -2303,36 +2346,69 @@ def subscription_usage(provider: str | None = None, *, force: bool = False) -> d
         for friendly, (_name, cred_id, label) in sl._PROVIDERS.items():
             targets.append((friendly, cred_id, label))
 
-    rows: list[dict] = []
+    jobs: list[tuple[str, str, dict]] = []  # friendly, aid, acct_meta
     for friendly, cred_id, _label in targets:
         for acct in sub_auth.list_accounts(cred_id):
-            aid = acct["account_id"]
-            try:
-                row = fetch_account_usage(friendly, aid, force=force)
-                # Strip internal-only noise for the RPC surface while keeping extras
-                # (dashboard_url, source, email) that the UI can use.
-                rows.append({
-                    "provider": row.get("provider") or friendly,
-                    "account_id": row.get("account_id") or aid,
-                    "display_name": row.get("display_name"),
-                    "plan": row.get("plan"),
-                    "usage": row.get("usage") or [],
-                    **({"dashboard_url": row["dashboard_url"]} if row.get("dashboard_url") else {}),
-                    **({"source": row["source"]} if row.get("source") else {}),
-                    **({"email": row["email"]} if row.get("email") else {}),
-                })
-            except Exception as exc:  # noqa: BLE001
-                log.warning("usage: row build failed for %s/%s: %s", friendly, aid, exc)
-                rows.append(_base_row(
-                    friendly,
-                    aid,
-                    display_name=acct.get("display_name") or acct.get("email"),
-                    plan=acct.get("plan"),
-                    usage=[],
-                    source="unavailable",
-                    email=acct.get("email"),
-                ))
-    return {"ok": True, "rows": rows}
+            aid = str(acct.get("account_id") or "") or sub_auth.DEFAULT_ACCOUNT_ID
+            jobs.append((friendly, aid, dict(acct)))
+
+    if not jobs:
+        return {"ok": True, "rows": []}
+
+    def _one(job: tuple[str, str, dict]) -> dict:
+        friendly, aid, acct = job
+        try:
+            row = fetch_account_usage(friendly, aid, force=force)
+            return {
+                "provider": row.get("provider") or friendly,
+                "account_id": row.get("account_id") or aid,
+                "display_name": row.get("display_name"),
+                "plan": row.get("plan"),
+                "usage": row.get("usage") or [],
+                **({"dashboard_url": row["dashboard_url"]} if row.get("dashboard_url") else {}),
+                **({"source": row["source"]} if row.get("source") else {}),
+                **({"email": row["email"]} if row.get("email") else {}),
+            }
+        except Exception as exc:  # noqa: BLE001
+            log.warning("usage: row build failed for %s/%s: %s", friendly, aid, exc)
+            return _base_row(
+                friendly,
+                aid,
+                display_name=acct.get("display_name") or acct.get("email"),
+                plan=acct.get("plan"),
+                usage=[],
+                source="unavailable",
+                email=acct.get("email"),
+            )
+
+    # Keep order stable (provider targets × account list order) for UI merge.
+    rows: list[dict | None] = [None] * len(jobs)
+    # Bound workers: enough to hide RTT, not enough to hammer every vendor.
+    max_workers = min(12, max(1, len(jobs)))
+    # Single-account path stays inline (tests + simple providers).
+    if len(jobs) == 1:
+        rows[0] = _one(jobs[0])
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="sub-usage") as pool:
+            fut_map = {pool.submit(_one, job): idx for idx, job in enumerate(jobs)}
+            for fut in as_completed(fut_map):
+                idx = fut_map[fut]
+                try:
+                    rows[idx] = fut.result()
+                except Exception as exc:  # noqa: BLE001 — should be rare; _one already catches
+                    friendly, aid, acct = jobs[idx]
+                    log.warning("usage: parallel row failed for %s/%s: %s", friendly, aid, exc)
+                    rows[idx] = _base_row(
+                        friendly,
+                        aid,
+                        display_name=acct.get("display_name") or acct.get("email"),
+                        plan=acct.get("plan"),
+                        usage=[],
+                        source="unavailable",
+                        email=acct.get("email"),
+                    )
+
+    return {"ok": True, "rows": [r for r in rows if isinstance(r, dict)]}
 
 
 # Login-time profile helpers (called from providers after token store) ─────────

@@ -756,16 +756,29 @@ class XAISubProvider(Provider):
             cred["id_token"] = resp["id_token"]
         # Preserve plan/display_name/last_usage across refresh.
         if self._cred:
-            for k in ("plan", "display_name", "last_usage", "last_usage_fetched_at"):
+            for k in ("plan", "display_name", "last_usage", "last_usage_fetched_at", "email"):
                 if self._cred.get(k) is not None and not cred.get(k):
                     cred[k] = self._cred[k]
-        try:
-            from . import usage as usage_mod
-            cred = usage_mod.enrich_xai_identity(cred)
-        except Exception:
-            if email:
-                cred.setdefault("display_name", email)
-            elif not cred.get("display_name"):
+        # Only hit OIDC userinfo when identity is still missing. Refresh paths
+        # already carry plan/display from the prior cred — avoid serializing
+        # every rotation behind a 12s userinfo GET (Settings multi-account).
+        need_identity = not (
+            cred.get("email")
+            or (
+                cred.get("display_name")
+                and not str(cred.get("display_name") or "").startswith("Grok (")
+            )
+        )
+        if need_identity:
+            try:
+                from . import usage as usage_mod
+                cred = usage_mod.enrich_xai_identity(cred)
+            except Exception:
+                pass
+        if not cred.get("display_name"):
+            if cred.get("email"):
+                cred["display_name"] = cred["email"]
+            else:
                 # Never leave the UI with a bare UUID account_id as the only label.
                 plan = cred.get("plan")
                 short = (str(account_id).split("-")[0][:8] if account_id else "")

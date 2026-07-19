@@ -110,9 +110,14 @@ def _has_api_key_fallback(friendly: str) -> bool:
 
 
 
-# Cap multi-account refresh attempts so a dead-token storm cannot turn one
-# pre-run ensure_fresh into dozens of network round-trips.
-_ENSURE_FRESH_MAX_ACCOUNTS = 5
+# Cap multi-account *network* refresh attempts so a dead-token storm cannot
+# turn one pre-run ensure_fresh into dozens of round-trips. Already-fresh and
+# already-revoked accounts are free to scan (no network) and do not count.
+_ENSURE_FRESH_MAX_REFRESH_ATTEMPTS = 8
+# Hard ceiling on how many account slots we even inspect (revoked + fresh +
+# candidates). Large multi-account pools (30+) must still be walkable so a
+# cluster of leading revoked actives cannot hide a live sibling past index 5.
+_ENSURE_FRESH_MAX_SCAN = 64
 
 
 def ensure_fresh(provider: str, *, skew_ms: int = _ENSURE_FRESH_SKEW_MS) -> dict:
@@ -127,8 +132,10 @@ def ensure_fresh(provider: str, *, skew_ms: int = _ENSURE_FRESH_SKEW_MS) -> dict
     names (anthropic-sub/xai-sub/…) — same aliases as status/login.
 
     Multi-account (xAI): if the active account's refresh is definitively dead
-    (invalid_grant / revoked), rotate to another signed-in account (capped)
-    instead of failing the whole pre-run gate closed.
+    (invalid_grant / revoked), rotate to another signed-in account instead of
+    failing the whole pre-run gate closed. Already-revoked accounts are skipped
+    without counting against the network-attempt budget — only real refresh
+    POSTs do.
     """
     resolved = _resolve(provider)
     if resolved is None:
@@ -179,7 +186,11 @@ def ensure_fresh(provider: str, *, skew_ms: int = _ENSURE_FRESH_SKEW_MS) -> dict
         }
 
     def _candidate_account_ids() -> list[str]:
-        """Active first, then other stored accounts (stable order)."""
+        """Active first, then other stored accounts (stable order).
+
+        Do NOT slice to the network-attempt budget here — revoked leaders must
+        not hide a live account past a small prefix. Scan is capped separately.
+        """
         active = sub_auth.get_active_account_id(cred_id)
         ordered: list[str] = []
         if active:
@@ -188,7 +199,7 @@ def ensure_fresh(provider: str, *, skew_ms: int = _ENSURE_FRESH_SKEW_MS) -> dict
             aid = str(a.get("account_id") or "")
             if aid and aid not in ordered:
                 ordered.append(aid)
-        return ordered[: max(1, _ENSURE_FRESH_MAX_ACCOUNTS)]
+        return ordered[: max(1, _ENSURE_FRESH_MAX_SCAN)]
 
     def _is_dead_refresh(exc: BaseException) -> bool:
         text = f"{type(exc).__name__}: {exc}".lower()
@@ -205,11 +216,28 @@ def ensure_fresh(provider: str, *, skew_ms: int = _ENSURE_FRESH_SKEW_MS) -> dict
 
     last_exc: BaseException | None = None
     tried = 0
+    saw_revoked = 0
+    saw_candidates = 0
     for aid in _candidate_account_ids():
         c = sub_auth.load_credential(cred_id, account_id=aid)
         if not c or not (c.get("access_token") or c.get("refresh_token")):
             continue
-        if c.get("refresh_revoked") and sub_auth.is_expired(c, skew_ms=0):
+        saw_candidates += 1
+        # Definitive prior invalid_grant: skip without burning the network budget.
+        if c.get("refresh_revoked"):
+            saw_revoked += 1
+            if not sub_auth.is_expired(c, skew_ms=0) and c.get("access_token"):
+                # Access JWT still live — promote and use until it dies.
+                try:
+                    sub_auth.set_active_account(cred_id, aid)
+                except Exception:  # noqa: BLE001
+                    pass
+                return {
+                    "ok": True,
+                    "refreshed": False,
+                    "expires_in": _expires_in_s(c),
+                    "error": None,
+                }
             continue
         if not sub_auth.is_expired(c, skew_ms=skew_ms):
             # Another account is already fresh — promote it.
@@ -223,12 +251,16 @@ def ensure_fresh(provider: str, *, skew_ms: int = _ENSURE_FRESH_SKEW_MS) -> dict
                 "expires_in": _expires_in_s(c),
                 "error": None,
             }
-        if not c.get("refresh_token") or c.get("refresh_revoked"):
+        if not c.get("refresh_token"):
             last_exc = RuntimeError(
                 f"{friendly} access token expired and no usable refresh_token "
                 f"for account {aid[:12]}"
             )
             continue
+        if tried >= _ENSURE_FRESH_MAX_REFRESH_ATTEMPTS:
+            # Budget exhausted; keep scanning only for already-fresh siblings
+            # (handled above). Stop issuing more refresh POSTs.
+            break
         tried += 1
         try:
             prov = _instantiate(name)
@@ -280,10 +312,16 @@ def ensure_fresh(provider: str, *, skew_ms: int = _ENSURE_FRESH_SKEW_MS) -> dict
         }
 
     if last_exc is None and tried == 0:
-        err = (
-            f"{friendly} access token expired and no refresh_token is stored. "
-            "Re-authenticate via Settings → AI → Accounts."
-        )
+        if saw_revoked and saw_candidates == saw_revoked:
+            err = (
+                f"{friendly} refresh tokens are revoked on every stored account "
+                f"({saw_revoked}). Re-authenticate via Settings → AI → Accounts."
+            )
+        else:
+            err = (
+                f"{friendly} access token expired and no usable refresh_token "
+                "is stored. Re-authenticate via Settings → AI → Accounts."
+            )
     else:
         err = (
             f"{friendly} token refresh failed — re-authenticate via "

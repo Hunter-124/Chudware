@@ -301,6 +301,9 @@ struct DocSession {
     bool planesUserToggled = false;
     bool originUserToggled = false;
     bool axesUserToggled = false;   // sticky: FM eye on any axis takes control of axis auto-hide
+    // Per-id sticky: axis ids whose FM eye the user explicitly toggled. Auto-hide never
+    // rewrites these (esp. axis.auto:*); defaults also land here on eye click.
+    std::unordered_set<std::string> axesUserToggledIds;
     std::string                modelInfo;            // (DocSession parked copy — see AppState field)
     std::vector<PartInfo>      asmParts;
     FitReport                  asmFit;
@@ -1276,8 +1279,13 @@ struct AppState {
     // toggles origin visibility via the FeatureManager eye, after which hiddenFeatures is honored.
     bool originUserToggled = false;
     // Sticky escape hatch for reference-axis auto-hide (mirrors originUserToggled). Set when the
-    // user toggles any axis eye in the FeatureManager; until then axes follow hasSolidContent.
+    // user toggles any axis eye in the FeatureManager. Per-id stickiness lives in
+    // axesUserToggledIds — toggling one axis must NOT unlock auto-hide for other axis.auto:*.
     bool axesUserToggled = false;
+    // Axis ids whose FeatureManager eye the user has explicitly toggled. Auto-hide
+    // (hasSolidContent) never rewrites these; new axis.auto:* stay hidden on solid parts
+    // until the user shows that specific id.
+    std::unordered_set<std::string> axesUserToggledIds;
     // W2-ref: ids of every reference-axis datum currently injected (default axis.x/y/z +
     // GUI-derived plane-intersection axes). Seeded into axisDatumIds on a fresh doc and left
     // OUT of hiddenFeatures so empty/sketch-only docs show OPEN FM eyes + draw axes; auto-hide

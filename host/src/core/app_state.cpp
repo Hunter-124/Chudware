@@ -1739,6 +1739,7 @@ void AppState::clearViewportForNewDoc() {
     planesUserToggled = false;
     originUserToggled = false;
     axesUserToggled = false;
+    axesUserToggledIds.clear();
     showPlane[0] = showPlane[1] = showPlane[2] = false;
 }
 
@@ -1763,6 +1764,7 @@ void AppState::captureDocState(DocSession& s) {
     s.planesUserToggled = planesUserToggled;
     s.originUserToggled = originUserToggled;
     s.axesUserToggled = axesUserToggled;
+    s.axesUserToggledIds = std::move(axesUserToggledIds);
     s.modelInfo    = std::move(modelInfo);
     s.asmParts     = std::move(asmParts);
     s.asmFit       = std::move(asmFit);
@@ -1789,6 +1791,7 @@ void AppState::restoreDocState(DocSession& s) {
     planesUserToggled = s.planesUserToggled;
     originUserToggled = s.originUserToggled;
     axesUserToggled = s.axesUserToggled;
+    axesUserToggledIds = std::move(s.axesUserToggledIds);
     applyDatumVisibility();   // reflect this tab's datum hides in the renderer
     modelInfo    = std::move(s.modelInfo);
     asmParts     = std::move(s.asmParts);
@@ -2199,9 +2202,17 @@ void AppState::applyDocDrivenVisibility(const nlohmann::json& tree) {
             }
         }
         // Axis eye sync (same as the full-features path below).
-        if (!axesUserToggled) {
+        // Per-id sticky: axesUserToggledIds honors hiddenFeatures as-is.
+        // Defaults still gate on global axesUserToggled; axis.auto:* always
+        // auto-hide on solid unless that specific id was user-toggled.
+        {
             bool changed = false;
             auto syncAxis = [&](const std::string& id) {
+                if (id.empty()) return;
+                if (axesUserToggledIds.count(id)) return;
+                const bool isAuto = id.rfind("axis.auto:", 0) == 0;
+                // Defaults: only auto-manage while user has not taken aggregate control.
+                if (!isAuto && axesUserToggled) return;
                 if (hasSolidContent) {
                     if (hiddenFeatures.insert(id).second) changed = true;
                 } else {
@@ -2348,14 +2359,15 @@ void AppState::applyDocDrivenVisibility(const nlohmann::json& tree) {
     }
 
     // Keep hiddenFeatures in step with hasSolidContent for axes so the FeatureManager eye
-    // matches what the viewport draws. Viewport only mutates a per-frame effDatums set; the
-    // FM eye reads hiddenFeatures.count(id). When the user has not taken control (axesUserToggled),
-    // show axes on empty/sketch-only docs and hide them once solid content exists.
-    // Defaults axis.x/y/z always tracked even before first inject fills axisDatumIds.
-    // Also covers host-only plane-intersection axes (axis.auto:<a>|<b>).
-    if (!axesUserToggled) {
+    // matches what the viewport draws. Per-id sticky (axesUserToggledIds) wins; axis.auto:*
+    // always auto-hide on solid parts even after axesUserToggled (toggling X must not unlock
+    // a forest of plane-intersection axes). Defaults still honor the aggregate flag.
+    {
         auto syncAxis = [&](const std::string& id) {
             if (id.empty()) return;
+            if (axesUserToggledIds.count(id)) return;
+            const bool isAuto = id.rfind("axis.auto:", 0) == 0;
+            if (!isAuto && axesUserToggled) return;
             if (hasSolidContent) {
                 if (hiddenFeatures.insert(id).second) datumVisibilityChanged = true;
             } else {

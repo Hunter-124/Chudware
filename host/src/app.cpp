@@ -2077,60 +2077,60 @@ WASM_BOOT_LOG("[wasm-boot] loadIcons done\n");
                 }
 
                 // Rebuild axisDatumIds. Visibility is driven by hasSolidContent
-                // (viewport_panel / applyDocDrivenVisibility) unless axesUserToggled.
-                // Empty/sketch-only docs start with axes VISIBLE (FM eye open). Once solid
-                // content exists, EVERY injected axis — default X/Y/Z AND plane-intersection
-                // axis.auto:* — must land in hiddenFeatures so they match the default-axis
-                // hide policy. The old erase-only path left newly-minted auto axes drawn on
-                // solid parts (the dashed RGB clutter after many user planes).
+                // (viewport_panel / applyDocDrivenVisibility) with per-id sticky
+                // axesUserToggledIds. Defaults still honor aggregate axesUserToggled;
+                // every axis.auto:* on a solid part is auto-hidden unless THAT id was
+                // user-toggled (toggling X must not unlock plane-intersection clutter).
                 std::unordered_set<std::string> prevAxisIds = std::move(st.axisDatumIds);
                 st.axisDatumIds.clear();
                 for (const auto& rd : rds) {
                     if (rd.kind != Renderer::RefDatum::Kind::Axis || rd.id.empty()) continue;
                     st.axisDatumIds.insert(rd.id);
                 }
-                if (!st.axesUserToggled) {
-                    // treeHasSolidContent equivalent: any non-ref feature or assembly component.
-                    bool solid = false;
-                    if (st.docMirror.hasDoc()) {
-                        const auto& tree = st.docMirror.tree();
-                        if (tree.is_object()) {
-                            auto tci = tree.find("components");
-                            if (tci != tree.end() && tci->is_array() && !tci->empty()) {
-                                solid = true;
-                            } else {
-                                auto tfi = tree.find("features");
-                                if (tfi != tree.end() && tfi->is_array()) {
-                                    for (const auto& f : *tfi) {
-                                        if (!f.is_object() || f.value("suppressed", false)) continue;
-                                        const std::string ty = f.value("type", std::string());
-                                        if (ty.empty()) continue;
-                                        // Reference-only types leave axes visible (sketch/plane/axis/…).
-                                        if (ty == "sketch" || ty == "sketch3d" ||
-                                            ty == "ref_plane" || ty == "ref_axis" ||
-                                            ty == "ref_point" || ty == "ref_csys" ||
-                                            ty == "plane" || ty == "datum_plane" ||
-                                            ty == "axis" || ty == "datum_axis" ||
-                                            ty == "point" || ty == "datum_point" ||
-                                            ty == "csys" || ty == "coordinate_system")
-                                            continue;
-                                        solid = true;
-                                        break;
-                                    }
+                // treeHasSolidContent equivalent: any non-ref feature or assembly component.
+                bool solid = false;
+                if (st.docMirror.hasDoc()) {
+                    const auto& tree = st.docMirror.tree();
+                    if (tree.is_object()) {
+                        auto tci = tree.find("components");
+                        if (tci != tree.end() && tci->is_array() && !tci->empty()) {
+                            solid = true;
+                        } else {
+                            auto tfi = tree.find("features");
+                            if (tfi != tree.end() && tfi->is_array()) {
+                                for (const auto& f : *tfi) {
+                                    if (!f.is_object() || f.value("suppressed", false)) continue;
+                                    const std::string ty = f.value("type", std::string());
+                                    if (ty.empty()) continue;
+                                    // Reference-only types leave axes visible (sketch/plane/axis/…).
+                                    if (ty == "sketch" || ty == "sketch3d" ||
+                                        ty == "ref_plane" || ty == "ref_axis" ||
+                                        ty == "ref_point" || ty == "ref_csys" ||
+                                        ty == "plane" || ty == "datum_plane" ||
+                                        ty == "axis" || ty == "datum_axis" ||
+                                        ty == "point" || ty == "datum_point" ||
+                                        ty == "csys" || ty == "coordinate_system")
+                                        continue;
+                                    solid = true;
+                                    break;
                                 }
                             }
                         }
                     }
-                    for (const auto& id : st.axisDatumIds) {
-                        if (solid) st.hiddenFeatures.insert(id);
-                        else       st.hiddenFeatures.erase(id);
-                    }
-                    // Defaults always tracked even if somehow missing from axisDatumIds.
-                    for (const char* def : {"axis.x", "axis.y", "axis.z"}) {
-                        if (solid) st.hiddenFeatures.insert(def);
-                        else       st.hiddenFeatures.erase(def);
-                    }
                 }
+                auto syncAxisHid = [&](const std::string& id) {
+                    if (id.empty()) return;
+                    if (st.axesUserToggledIds.count(id)) return; // per-id sticky
+                    const bool isAuto = id.rfind("axis.auto:", 0) == 0;
+                    // Defaults: only auto-manage while user has not taken aggregate control.
+                    if (!isAuto && st.axesUserToggled) return;
+                    if (solid) st.hiddenFeatures.insert(id);
+                    else       st.hiddenFeatures.erase(id);
+                };
+                for (const auto& id : st.axisDatumIds) syncAxisHid(id);
+                // Defaults always tracked even if somehow missing from axisDatumIds.
+                for (const char* def : {"axis.x", "axis.y", "axis.z"})
+                    syncAxisHid(def);
                 // Rebuild display names when axis set membership changes (or first fill).
                 bool membershipChanged =
                     st.axisDisplayNames.empty() ||

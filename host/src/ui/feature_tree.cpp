@@ -4606,6 +4606,19 @@ void drawFeatureTreeBody(AppState& st,
                     if (aid == "axis.x" || aid == "axis.y" || aid == "axis.z") continue;
                     axes.push_back({aid, displayName(aid, aid.c_str())});
                 }
+                // Union axisAutoCache so listing works even if axisDatumIds is briefly stale.
+                for (const auto& ent : st.axisAutoCache) {
+                    if (ent.id.empty() || ent.id == "axis.x" || ent.id == "axis.y" ||
+                        ent.id == "axis.z")
+                        continue;
+                    bool seen = false;
+                    for (const auto& ar : axes)
+                        if (ar.id == ent.id) { seen = true; break; }
+                    if (!seen) {
+                        const char* fb = ent.name.empty() ? ent.id.c_str() : ent.name.c_str();
+                        axes.push_back({ent.id, displayName(ent.id, fb)});
+                    }
+                }
                 // User axis features not yet in axisDatumIds (pre-inject / edge cases).
                 for (const auto& ua : userAxes) {
                     bool seen = false;
@@ -4620,6 +4633,9 @@ void drawFeatureTreeBody(AppState& st,
                 // Build the listed set once so the folder cascade eye and the child loop agree.
                 std::unordered_set<std::string> userAxisIds;
                 for (const auto& ua : userAxes) userAxisIds.insert(ua.id);
+                std::unordered_set<std::string> autoCacheIds;
+                for (const auto& ent : st.axisAutoCache)
+                    if (!ent.id.empty()) autoCacheIds.insert(ent.id);
                 std::vector<AxisRow> listedAxes;
                 listedAxes.reserve(axes.size());
                 for (const auto& ar : axes) {
@@ -4627,8 +4643,9 @@ void drawFeatureTreeBody(AppState& st,
                         ar.id == "axis.x" || ar.id == "axis.y" || ar.id == "axis.z";
                     const bool inDatum = st.axisDatumIds.count(ar.id) > 0;
                     const bool isUserAxis = userAxisIds.count(ar.id) > 0;
-                    // Defaults always; injected auto/user axes; user-authored axis features.
-                    if (isDefault || isUserAxis || inDatum)
+                    const bool inAutoCache = autoCacheIds.count(ar.id) > 0;
+                    // Defaults always; injected auto/user axes; cache fallback; user features.
+                    if (isDefault || isUserAxis || inDatum || inAutoCache)
                         listedAxes.push_back(ar);
                 }
                 bool anyAxisShown = false;
@@ -4675,6 +4692,7 @@ void drawFeatureTreeBody(AppState& st,
                                     if (st.selectedFeatureId == ar.id)
                                         st.selectedFeatureId.clear();
                                 }
+                                st.axesUserToggledIds.insert(ar.id);
                             }
                             st.axesUserToggled = true;
                             st.applyDatumVisibility();
@@ -4725,7 +4743,8 @@ void drawFeatureTreeBody(AppState& st,
                                         st.hiddenFeatures.insert(ar.id);
                                         if (axisSel) st.selectedFeatureId.clear();
                                     }
-                                    st.axesUserToggled = true;  // stick: stop auto-hide (parity with origin)
+                                    st.axesUserToggled = true;
+                                    st.axesUserToggledIds.insert(ar.id);
                                     st.applyDatumVisibility();
                                 }
                             }

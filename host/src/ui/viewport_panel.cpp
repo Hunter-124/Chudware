@@ -2237,38 +2237,38 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
 
         // Origin gizmo + axis auto-hide/force-show: one effective hidden-datums set per frame.
         // Origin auto-hide: show until hasSolidContent; hide once a solid exists (unless user-toggled).
-        // Axis auto-hide: same hasSolidContent gate for every id in axisDatumIds (unless axesUserToggled
-        // or a PM axis well force-shows them). ALSO keep st.hiddenFeatures in step for axes when
-        // !axesUserToggled — the FeatureManager eye reads hiddenFeatures.count(id) directly (unlike
-        // origin which uses originVisEff). Without this, empty docs can draw axes while the FM eye
-        // still shows "hidden" if applyDocDrivenVisibility never ran or left a stale entry.
-        // PM axis wells only apply outside sketch/sketch3d — while sketching the grid owns the view.
+        // Axis auto-hide: hasSolidContent gate with per-id sticky axesUserToggledIds.
+        // Defaults still honor aggregate axesUserToggled; axis.auto:* always auto-hide on
+        // solid parts unless THAT id was eye-toggled (global flag must not unlock auto axes).
+        // ALSO keep st.hiddenFeatures in step so FM eyes match draw. PM axis wells force-show.
         bool pmWantsAxis = !inSketch && !inSketch3d && st.propertyManager &&
                            st.propertyManager->active() &&
                            st.propertyManager->activeWellWantsAxis();
-        // Sketch force-hide: once a part has solid geometry, axes stay hidden while sketching
-        // unless the user took sticky FM-eye control (axesUserToggled). Empty/sketch-only docs
-        // keep axes as a first-sketch reference (matches normal auto-hide policy).
-        const bool sketchHideAxes =
-            (inSketch || inSketch3d) && hasSolidContent && !st.axesUserToggled;
+        // Sketch force-hide: once a part has solid geometry, non-sticky axes stay hidden while
+        // sketching. Sticky per-id eyes still honor hiddenFeatures. Empty/sketch-only docs
+        // keep default axes as a first-sketch reference.
+        const bool sketchHideAxes = (inSketch || inSketch3d) && hasSolidContent;
+        // Always need effDatums while auto axes may need per-id hide, or origin/PM/sketch paths.
         const bool needEffDatums =
-            !st.originUserToggled || !st.axesUserToggled || pmWantsAxis || sketchHideAxes;
+            !st.originUserToggled || !st.axesUserToggled || pmWantsAxis || sketchHideAxes ||
+            !st.axisDatumIds.empty();
         if (needEffDatums) {
             // Persist auto axis visibility into hiddenFeatures so FM eyes match the draw path.
-            // Only while the user has not taken sticky control (axesUserToggled).
-            // hasSolidContent (incl. while sketching a solid part) auto-hides; empty docs show.
-            if (!st.axesUserToggled) {
-                auto syncAxisHid = [&](const std::string& id) {
-                    if (id.empty()) return;
-                    if (hasSolidContent) st.hiddenFeatures.insert(id);
-                    else                 st.hiddenFeatures.erase(id);
-                };
-                // Defaults first (pre-inject / empty axisDatumIds still lists X/Y/Z in the tree).
-                syncAxisHid("axis.x");
-                syncAxisHid("axis.y");
-                syncAxisHid("axis.z");
-                for (const auto& id : st.axisDatumIds) syncAxisHid(id);
-            }
+            // Per-id sticky skips; defaults skip only when aggregate axesUserToggled.
+            auto syncAxisHid = [&](const std::string& id) {
+                if (id.empty()) return;
+                if (st.axesUserToggledIds.count(id)) return;
+                const bool isAuto = id.rfind("axis.auto:", 0) == 0;
+                if (!isAuto && st.axesUserToggled) return;
+                if (hasSolidContent) st.hiddenFeatures.insert(id);
+                else                 st.hiddenFeatures.erase(id);
+            };
+            // Defaults first (pre-inject / empty axisDatumIds still lists X/Y/Z in the tree).
+            syncAxisHid("axis.x");
+            syncAxisHid("axis.y");
+            syncAxisHid("axis.z");
+            for (const auto& id : st.axisDatumIds) syncAxisHid(id);
+
             std::unordered_set<std::string> effDatums = st.hiddenFeatures;
             if (!st.originUserToggled) {
                 if (hasSolidContent) effDatums.insert("point.origin");
@@ -2285,26 +2285,25 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     else
                         ++it;
                 }
-            } else if (!st.axesUserToggled) {
-                // Mirror the just-synced hiddenFeatures (belt + braces with the sync above).
-                // Same gate as sketchHideAxes: solid content hides axes (sketch or not).
-                if (hasSolidContent) {
-                    effDatums.insert("axis.x");
-                    effDatums.insert("axis.y");
-                    effDatums.insert("axis.z");
-                    for (const auto& id : st.axisDatumIds) effDatums.insert(id);
-                } else {
-                    effDatums.erase("axis.x");
-                    effDatums.erase("axis.y");
-                    effDatums.erase("axis.z");
-                    for (const auto& id : st.axisDatumIds) effDatums.erase(id);
-                }
+            } else {
+                // Apply per-id auto-hide into effDatums (belt + braces with hiddenFeatures sync).
+                auto effAxis = [&](const std::string& id) {
+                    if (id.empty()) return;
+                    if (st.axesUserToggledIds.count(id)) return; // honor hiddenFeatures
+                    const bool isAuto = id.rfind("axis.auto:", 0) == 0;
+                    if (!isAuto && st.axesUserToggled) return;
+                    if (hasSolidContent) effDatums.insert(id);
+                    else                 effDatums.erase(id);
+                };
+                effAxis("axis.x");
+                effAxis("axis.y");
+                effAxis("axis.z");
+                for (const auto& id : st.axisDatumIds) effAxis(id);
             }
-            // axesUserToggled: leave effDatums as hiddenFeatures (user eye state sticks in sketch).
             renderer.setHiddenDatums(std::move(effDatums));
         } else {
-            // User took control of origin AND axes, no axis well: resync to hiddenFeatures so
-            // a just-closed axis well doesn't leave force-shown axes drawn.
+            // User took control of origin AND axes, no axis well, no datums: resync to
+            // hiddenFeatures so a just-closed axis well doesn't leave force-shown axes drawn.
             renderer.setHiddenDatums(st.hiddenFeatures);
             st.originVisEff = !st.hiddenFeatures.count("point.origin");
         }

@@ -155,14 +155,27 @@ APP = Path(sys.argv[2]).resolve()
 
 APP_PACKAGES = ("engine", "mcp_server", "agent", "installer")
 SERVICE_PACKAGES = ("plm", "dag", "browser", "deliverables", "ipc", "serving", "verify")
-IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc", "build", "test_*", "tests")
+def _ignore(dirpath: str, names: list[str]) -> set[str]:
+    """stdlib ignore for copytree: drop caches/tests and the prompts/prompts self-ref."""
+    ignored = {n for n in names if n in {"__pycache__", "build"} or n.startswith("test_") or n == "tests" or n.endswith(".pyc")}
+    # Only skip a nested "prompts" entry when we're already inside .../prompts
+    if Path(dirpath).name == "prompts" and "prompts" in names:
+        ignored.add("prompts")
+    return ignored
 
 
 def pkg_src(name: str) -> Path | None:
     """Resolve top-level package, following repo root symlinks (engine→engine_oracle, …)."""
     p = REPO / name
     if p.exists():
+        # Don't resolve agent/prompts nested loops — only follow the package root symlink.
         return p.resolve() if p.is_symlink() else p
+    # agent -> services/agent etc.
+    alt = REPO / "services" / name
+    if name == "agent" and (REPO / "services" / "agent").exists():
+        return REPO / "services" / "agent"
+    if name == "mcp_server" and (REPO / "services" / "mcp").exists():
+        return REPO / "services" / "mcp"
     return None
 
 
@@ -176,7 +189,15 @@ for pkg in APP_PACKAGES:
         print(f"    WARN: missing APP package {pkg}", file=sys.stderr)
         continue
     print(f"    app/{pkg} <- {src}")
-    shutil.copytree(src, APP / pkg, dirs_exist_ok=True, ignore=IGNORE)
+    # copytree without following nested directory symlinks (prompt self-refs, etc.)
+    shutil.copytree(
+        src,
+        APP / pkg,
+        dirs_exist_ok=True,
+        ignore=_ignore,
+        symlinks=False,
+        ignore_dangling_symlinks=True,
+    )
 
 services_src = REPO / "services"
 if services_src.is_dir():
@@ -191,14 +212,14 @@ if services_src.is_dir():
         s = services_src / name
         if s.exists():
             print(f"    app/services/{name}")
-            shutil.copytree(s, services_dst / name, dirs_exist_ok=True, ignore=IGNORE)
+            shutil.copytree(s, services_dst / name, dirs_exist_ok=True, ignore=_ignore, symlinks=False, ignore_dangling_symlinks=True)
     # services.agent / services.mcp aliases (same as provision.ensure_app_code)
     agent_src = pkg_src("agent") or (services_src / "agent")
     if agent_src.exists():
-        shutil.copytree(agent_src, services_dst / "agent", dirs_exist_ok=True, ignore=IGNORE)
+        shutil.copytree(agent_src, services_dst / "agent", dirs_exist_ok=True, ignore=_ignore, symlinks=False, ignore_dangling_symlinks=True)
     mcp_src = pkg_src("mcp_server") or (services_src / "mcp")
     if mcp_src.exists():
-        shutil.copytree(mcp_src, services_dst / "mcp", dirs_exist_ok=True, ignore=IGNORE)
+        shutil.copytree(mcp_src, services_dst / "mcp", dirs_exist_ok=True, ignore=_ignore, symlinks=False, ignore_dangling_symlinks=True)
 
 req = REPO / "requirements.txt"
 if req.exists():
@@ -209,10 +230,17 @@ else:
     sys.exit(1)
 
 prompts = APP / "agent" / "prompts"
+# Drop accidental nested prompts/ dir leftover if ignore missed it
+nested = prompts / "prompts"
+if nested.exists() or nested.is_symlink():
+    if nested.is_dir() and not nested.is_symlink():
+        shutil.rmtree(nested)
+    else:
+        nested.unlink(missing_ok=True)
 if not prompts.is_dir():
     print(f"ERROR: agent/prompts missing after stage ({prompts})", file=sys.stderr)
     sys.exit(1)
-print(f"    app/agent/prompts ok ({sum(1 for _ in prompts.rglob('*'))} entries)")
+print(f"    app/agent/prompts ok ({sum(1 for p in prompts.rglob('*') if p.is_file())} files)")
 PY
 
 # ---- Manifest ---------------------------------------------------------------

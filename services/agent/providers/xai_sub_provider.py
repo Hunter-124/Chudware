@@ -542,12 +542,19 @@ class XAISubProvider(Provider):
             _progress({"stage": "device_code", "error": str(exc)})
             raise
 
+        user_code = str(device.get("user_code") or "")
         verification_url = (
             device.get("verification_uri_complete")
             or device.get("verification_uri")
             or XAI_VERIFICATION_URL_FALLBACK
         )
-        user_code = str(device.get("user_code") or "")
+        # Always embed user_code when the issuer omitted verification_uri_complete.
+        # Bare /oauth2/device (no code) often bounces unauthenticated browsers to the
+        # generic X "Sign in to X to generate tweets with Grok" page instead of the
+        # device-approve form — that is the "already signed in but still asked" footgun.
+        if user_code and "user_code=" not in str(verification_url):
+            sep = "&" if "?" in str(verification_url) else "?"
+            verification_url = f"{verification_url}{sep}user_code={user_code}"
         expires_in = int(device.get("expires_in") or 900)
         interval = max(1, int(device.get("interval") or 5))
         device_code = str(device["device_code"])

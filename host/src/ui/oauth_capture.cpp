@@ -261,8 +261,15 @@ void OauthCapture::pollStatus(AppState& st, bool force) {
         const std::string code = optStr(x, "user_code");
         std::string vurl = optStr(x, "verification_url");
         if (vurl.empty()) vurl = optStr(x, "verification_uri");
-        if (vurl.empty() && !code.empty())
-            vurl = "https://accounts.x.ai/oauth2/device?user_code=" + code;
+        // Always embed user_code — bare /oauth2/device dumps unauthenticated
+        // browsers on the generic X "tweets with Grok" login page.
+        if (!code.empty() &&
+            (vurl.empty() || vurl.find("user_code=") == std::string::npos)) {
+            const std::string base =
+                vurl.empty() ? "https://accounts.x.ai/oauth2/device" : vurl;
+            const char sep = (base.find('?') == std::string::npos) ? '?' : '&';
+            vurl = base + sep + "user_code=" + code;
+        }
 
         if (!code.empty()) userCode_ = code;
         if (!vurl.empty()) verifyUrl_ = vurl;

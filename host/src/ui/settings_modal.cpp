@@ -571,6 +571,18 @@ static void pollSubscriptionAccounts(AppState& st, bool force) {
             p.verifyUrl = optionalJsonString(x, "verification_url");
             if (p.verifyUrl.empty())
                 p.verifyUrl = optionalJsonString(x, "verification_uri");
+            // Prefer the complete device URL (code embedded). Bare /oauth2/device
+            // without user_code bounces signed-out browsers to the generic X
+            // "tweets with Grok" login instead of the approve form.
+            if (!p.userCode.empty() &&
+                (p.verifyUrl.empty() ||
+                 p.verifyUrl.find("user_code=") == std::string::npos)) {
+                const std::string base = p.verifyUrl.empty()
+                    ? "https://accounts.x.ai/oauth2/device"
+                    : p.verifyUrl;
+                const char sep = (base.find('?') == std::string::npos) ? '?' : '&';
+                p.verifyUrl = base + sep + "user_code=" + p.userCode;
+            }
             p.stage = optionalJsonString(x, "login_stage");
             p.lastError = optionalJsonString(x, "last_error");
             if (wasInProgress && !p.inProgress) {
@@ -820,11 +832,13 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
                     if (ImGui::SmallButton(copyId))
                         ImGui::SetClipboardText(prog.userCode.c_str());
                 }
-                const std::string fallbackUrl =
-                    prog.verifyUrl.empty()
-                        ? (std::string(prov) == "xai" ? "https://accounts.x.ai/oauth2/device"
-                                                      : prog.verifyUrl)
-                        : prog.verifyUrl;
+                // Always surface a code-bearing URL for xAI (see pollSubscriptionAccounts).
+                std::string fallbackUrl = prog.verifyUrl;
+                if (fallbackUrl.empty() && std::string(prov) == "xai") {
+                    fallbackUrl = "https://accounts.x.ai/oauth2/device";
+                    if (!prog.userCode.empty())
+                        fallbackUrl += "?user_code=" + prog.userCode;
+                }
                 if (!fallbackUrl.empty()) {
                     ImGui::TextWrapped("%s", fallbackUrl.c_str());
                     char openId[64];
@@ -840,10 +854,25 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
                     }
                 }
             }
+            // Allow abandoning a stuck device-code wait without restarting the app.
+            // Python may keep polling until TTL; GUI just stops showing the busy state.
+            char cancelId[64];
+            std::snprintf(cancelId, sizeof(cancelId), "Cancel##login_%s", prov);
+            if (ImGui::SmallButton(cancelId)) {
+                prog.inProgress = false;
+                prog.userCode.clear();
+                prog.verifyUrl.clear();
+                prog.browserOpened = false;
+                prog.stage.clear();
+                prog.lastError.clear();
+                s_subAccts.lastAccountsPoll = -1e9;
+            }
             pollSubscriptionAccounts(st, true);
         } else {
+            // First account vs multi-account: label makes "already signed in" obvious.
             char addId[64];
-            std::snprintf(addId, sizeof(addId), "Add account##%s", prov);
+            std::snprintf(addId, sizeof(addId),
+                          any ? "Add another account##%s" : "Sign in##%s", prov);
             if (ImGui::SmallButton(addId)) {
                 const bool isXai = std::string(prov) == "xai";
                 // xAI: CEF path is gated by kXaiUseCef (currently off — Python
@@ -890,11 +919,17 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
             if (ImGui::IsItemHovered()) {
                 if (std::string(prov) == "xai" && kXaiUseCef && ui::OauthCapture::cefAvailable())
                     ImGui::SetTooltip(
-                        "Add another %s account in the embedded browser "
-                        "(session isolated for multi-account).", plabel);
+                        any
+                            ? "Add another %s account in the embedded browser "
+                              "(session isolated for multi-account)."
+                            : "Sign in to %s in the embedded browser.",
+                        plabel);
                 else
                     ImGui::SetTooltip(
-                        "Add another %s subscription account (browser OAuth).", plabel);
+                        any
+                            ? "Add another %s subscription account (browser OAuth)."
+                            : "Sign in to %s (browser OAuth). Existing accounts stay listed above.",
+                        plabel);
             }
         }
         if (!prog.lastError.empty() && !prog.inProgress) {

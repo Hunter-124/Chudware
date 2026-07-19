@@ -476,6 +476,56 @@ def test_open_verification_url_fallback_does_not_raise(monkeypatch):
     assert xsp.open_verification_url("https://accounts.x.ai/activate") is False
 
 
+def test_xai_device_url_always_embeds_user_code(tmp_config, monkeypatch):
+    """Bare verification_uri without user_code must be completed before browser open.
+
+    Without this, accounts.x.ai/oauth2/device bounces signed-out browsers to the
+    generic X "Sign in to X to generate tweets with Grok" page.
+    """
+    from agent.providers import xai_sub_provider as xsp
+
+    opened = {}
+
+    def fake_post_form(url, data, headers=None, timeout=30.0):
+        if "device/code" in url:
+            return {
+                "device_code": "dev-1",
+                "user_code": "QWER-5678",
+                # Issuer omitted verification_uri_complete — the footgun path.
+                "verification_uri": "https://accounts.x.ai/oauth2/device",
+                "expires_in": 600,
+                "interval": 1,
+            }
+        raise AssertionError(f"unexpected post_form {url}")
+
+    def fake_open(url):
+        opened["url"] = url
+        return True
+
+    monkeypatch.setattr(xsp.sub_auth, "post_form", fake_post_form)
+    monkeypatch.setattr(xsp, "open_verification_url", fake_open)
+    # Never reach token poll — we only care about the URL handed to the browser.
+    monkeypatch.setattr(
+        xsp.XAISubProvider,
+        "_poll_device_token",
+        lambda self, **kw: (_ for _ in ()).throw(RuntimeError("stop-after-url")),
+    )
+    monkeypatch.setattr(
+        xsp.XAISubProvider,
+        "_discover_token_endpoint",
+        lambda self: "https://auth.x.ai/oauth2/token",
+    )
+
+    prov = xsp.XAISubProvider()
+    try:
+        prov.login_device(open_browser=True)
+    except RuntimeError as exc:
+        assert "stop-after-url" in str(exc)
+    assert "url" in opened
+    assert "user_code=QWER-5678" in opened["url"]
+    assert opened["url"].startswith("https://accounts.x.ai/oauth2/device")
+
+
 def test_xai_default_model_is_grok_45():
     from agent.providers.xai_sub_provider import DEFAULT_MODEL as sub_default
     from agent.providers.xai_provider import DEFAULT_MODEL as key_default

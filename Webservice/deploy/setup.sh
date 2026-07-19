@@ -61,7 +61,7 @@ echo "    venv ok: ${VENV}"
 
 # --- systemd user units ------------------------------------------------------
 mkdir -p "${UNIT_DIR}"
-for u in billet-gateway.service billet-cloudflared.service billet-monitor.service billet-monitor.timer billet-backup.service billet-backup.timer; do
+for u in billet-gateway.service billet-cloudflared.service billet-monitor.service billet-monitor.timer billet-backup.service billet-backup.timer billet-webd-sync.path billet-webd-sync.service; do
   src="${DEPLOY_DIR}/${u}"
   dst="${UNIT_DIR}/${u}"
   if [[ -f "${src}" ]]; then
@@ -89,7 +89,9 @@ fi
 
 systemctl --user daemon-reload
 systemctl --user enable billet-gateway.service billet-cloudflared.service billet-monitor.timer billet-backup.timer
-echo "    enabled: billet-gateway, billet-cloudflared, billet-monitor.timer, billet-backup.timer"
+# Path unit: re-promote ~/billet-web when core/build-occt-linux rebuilds aicad-hostd.
+systemctl --user enable --now billet-webd-sync.path >/dev/null 2>&1 || true
+echo "    enabled: billet-gateway, billet-cloudflared, billet-monitor.timer, billet-backup.timer, billet-webd-sync.path"
 
 # --- image reminder (no build here) ------------------------------------------
 echo

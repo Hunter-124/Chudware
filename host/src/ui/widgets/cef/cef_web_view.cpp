@@ -1067,6 +1067,11 @@ void CefWebView::clearSession(AppState& /*st*/, std::function<void()> done) {
         "https://x.ai/",
         "https://grok.x.ai/",
         "https://api.x.ai/",
+        // Device approve may bounce through X's IdP; wipe those jars too so
+        // "Add another" does not auto-bind the previous X session.
+        "https://x.com/",
+        "https://twitter.com/",
+        "https://grok.com/",
     };
     const int nUrls = (int)(sizeof(kXaiCookieUrls) / sizeof(kXaiCookieUrls[0]));
     auto remaining = std::make_shared<int>(nUrls);

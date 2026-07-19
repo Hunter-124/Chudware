@@ -8903,6 +8903,16 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
                 s_xaiVerifyUrl = jsonOptStr(x, "verification_url");
                 if (s_xaiVerifyUrl.empty())
                     s_xaiVerifyUrl = jsonOptStr(x, "verification_uri");
+                if (!s_xaiUserCode.empty() &&
+                    (s_xaiVerifyUrl.empty() ||
+                     s_xaiVerifyUrl.find("user_code=") == std::string::npos)) {
+                    const std::string base = s_xaiVerifyUrl.empty()
+                        ? "https://accounts.x.ai/oauth2/device"
+                        : s_xaiVerifyUrl;
+                    const char sep =
+                        (base.find('?') == std::string::npos) ? '?' : '&';
+                    s_xaiVerifyUrl = base + sep + "user_code=" + s_xaiUserCode;
+                }
                 s_xaiStage = jsonOptStr(x, "login_stage");
                 if (auto err = jsonOptStr(x, "last_error"); !err.empty())
                     s_xaiError = err;
@@ -8931,7 +8941,12 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
                         ImGui::SetClipboardText(s_xaiUserCode.c_str());
                 }
                 const std::string fallbackUrl =
-                    s_xaiVerifyUrl.empty() ? "https://accounts.x.ai/activate" : s_xaiVerifyUrl;
+                    s_xaiVerifyUrl.empty()
+                        ? (s_xaiUserCode.empty()
+                               ? "https://accounts.x.ai/oauth2/device"
+                               : ("https://accounts.x.ai/oauth2/device?user_code=" +
+                                  s_xaiUserCode))
+                        : s_xaiVerifyUrl;
                 ImGui::TextWrapped("%s", fallbackUrl.c_str());
                 if (ImGui::SmallButton("Copy URL##xai"))
                     ImGui::SetClipboardText(fallbackUrl.c_str());

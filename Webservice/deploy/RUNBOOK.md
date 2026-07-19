@@ -275,6 +275,43 @@ podman unshare tar -xzf ~/billet-web-backups/billet-web-data-<stamp>.tar.gz -C ~
 Off-host copies are on you: rsync the backup dir somewhere that isn't this
 machine when the project data starts mattering.
 
+
+## (g) Pull / rebuild / redeploy (keep this host current)
+
+One entry point for day-to-day sync from the other machine / `origin/master`:
+
+```bash
+# Full path: git pull --ff-only + host GUI + engine + install_webd --restart + gateway
+bash Webservice/deploy/update.sh
+
+# Variants
+bash Webservice/deploy/update.sh --pull-only   # git only
+bash Webservice/deploy/update.sh --no-pull     # rebuild current tree
+bash Webservice/deploy/update.sh --host-only   # desktop Billet binary
+bash Webservice/deploy/update.sh --web-only    # engine + webd + gateway
+bash Webservice/deploy/update.sh --image       # also rebuild session container
+bash Webservice/deploy/update.sh --wasm        # also wasm
+```
+
+Logs/lock: `~/billet-web-data/logs/update.log`, `deploy.lock`, `deploy-status.json`
+(shared with admin `rebuild.sh` / `redeploy.sh`).
+
+**Auto-promote engine → webd:** `billet-webd-sync.path` watches
+`core/build-occt-linux/bin/aicad-hostd` and re-runs `install_webd.sh --restart`
+(idle-wait when sessions are connected). Enabled by `setup.sh` and
+`install_webd.sh`. Confirm with:
+
+```bash
+systemctl --user is-enabled billet-webd-sync.path
+systemctl --user status billet-webd-sync.path --no-pager
+```
+
+Desktop against the **shared** daemon (same engine as web sessions):
+
+```bash
+~/billet-web/billet-shared.sh
+```
+
 ---
 
 ## Layout reference
@@ -282,7 +319,10 @@ machine when the project data starts mattering.
 | Path | Role |
 |------|------|
 | `Webservice/deploy/setup.sh` | Idempotent dirs, venv, unit install, enable |
-| `Webservice/deploy/billet-*.service` / `.timer` | systemd **user** units |
+| `Webservice/deploy/update.sh` | **Day-to-day:** pull → rebuild host/engine → webd → gateway |
+| `Webservice/deploy/rebuild.sh` / `redeploy.sh` | Admin-locked rebuild targets / gateway restart |
+| `Webservice/deploy/install_webd.sh` | Promote engine build → `~/billet-web` + hostd unit |
+| `Webservice/deploy/billet-*.service` / `.timer` / `.path` | systemd **user** units (incl. webd-sync) |
 | `Webservice/deploy/monitor.py` | Host sample + reaper (stdlib) |
 | `Webservice/deploy/cf_provision.py` | Driver: tunnel/DNS/Access via API |
 | `~/billet-web-data/gateway.env` | Secrets + CF team/AUD/token (gitignored conceptually; never commit) |

@@ -27,7 +27,10 @@ Environment=AI_CAD_PROMPTS_DIR=@PROMPTS@
 # explicitly so the unit is self-documenting and overridable.
 Environment=AI_CAD_PYTHON=%h/.local/share/AI-CAD/runtime/venv/bin/python
 Environment=AI_CAD_REPO=%h/Repositories/CAD
-Restart=on-failure
+# always — shared webd must come back after clean exits too (binary replace
+# during install_webd without --restart, unexpected idle-exit, etc.). systemctl
+# stop still stays down; only unexpected death auto-recovers.
+Restart=always
 RestartSec=2
 # Final autosave on stop needs a moment on big docs.
 TimeoutStopSec=30

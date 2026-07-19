@@ -856,6 +856,102 @@ def get_graph(
     }
 
 
+def assembly_tree(
+    project_dir: str | os.PathLike | None = None,
+    *,
+    doc_id: str | None = None,
+    include_archive: bool = False,
+    max_depth: int = 12,
+    graph: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """``cad_graph_assembly_tree`` — nested assembly decomposition.
+
+    Walks ``doc CONTAINS bom_item INSTANCE_OF doc`` chains into a tree:
+    ``{ok, trees:[{id, label, kind, count, path?, children:[…]}]}``.
+    ``count`` = instance quantity of that child within its parent (1 for the
+    root). Roots: *doc_id* when given, else every assembly that no other
+    assembly instances (all assemblies as a cyclic fallback). Children of a
+    non-assembly doc are not expanded (parts are leaves). Cycle-guarded and
+    depth-capped so malformed graphs still terminate.
+    """
+    g = graph or build_graph(project_dir, include_archive=include_archive)
+    nodes = {n["id"]: n for n in g.get("nodes") or [] if n.get("id")}
+
+    contains_kids: dict[str, list[str]] = {}
+    instance_of: dict[str, list[str]] = {}
+    instanced_targets: set[str] = set()
+    for e in g.get("edges") or []:
+        k = e.get("kind")
+        if k == "CONTAINS":
+            contains_kids.setdefault(e["src"], []).append(e["dst"])
+        elif k == "INSTANCE_OF":
+            instance_of.setdefault(e["src"], []).append(e["dst"])
+            if (nodes.get(e["src"]) or {}).get("kind") == "bom_item":
+                instanced_targets.add(e["dst"])
+
+    def children_of(doc: str, seen: frozenset[str], depth: int) -> list[dict]:
+        if depth >= max_depth:
+            return []
+        # Aggregate bom_item INSTANCE_OF targets (count = instances).
+        counts: dict[str, int] = {}
+        order: list[str] = []
+        for kid in contains_kids.get(doc, []):
+            kn = nodes.get(kid)
+            if kn is None:
+                continue
+            if kn["kind"] == "bom_item":
+                for tgt in instance_of.get(kid, []):
+                    if tgt not in nodes or tgt == doc:
+                        continue
+                    if tgt not in counts:
+                        order.append(tgt)
+                    counts[tgt] = counts.get(tgt, 0) + 1
+            elif kn["kind"] in ("part", "assembly", "doc"):
+                if kid not in counts:
+                    order.append(kid)
+                counts[kid] = counts.get(kid, 0) + 1
+        out = []
+        for tgt in order:
+            tn = nodes[tgt]
+            entry = {
+                "id": tgt,
+                "label": tn.get("label") or tgt,
+                "kind": tn.get("kind"),
+                "count": counts[tgt],
+            }
+            if tn.get("path"):
+                entry["path"] = tn["path"]
+            if tn.get("kind") == "assembly" and tgt not in seen:
+                entry["children"] = children_of(
+                    tgt, seen | {tgt}, depth + 1)
+            out.append(entry)
+        return out
+
+    def tree_for(doc: str) -> dict | None:
+        n = nodes.get(doc)
+        if n is None:
+            return None
+        t = {"id": doc, "label": n.get("label") or doc,
+             "kind": n.get("kind"), "count": 1,
+             "children": children_of(doc, frozenset({doc}), 0)}
+        if n.get("path"):
+            t["path"] = n["path"]
+        return t
+
+    if doc_id:
+        t = tree_for(doc_id)
+        if t is None:
+            return {"ok": False, "reason": "doc_id not in graph",
+                    "hint": "pass an assembly/part node id", "trees": []}
+        return {"ok": True, "trees": [t]}
+
+    # Roots: assemblies nothing else instances; fallback = every assembly.
+    assemblies = [n["id"] for n in nodes.values() if n.get("kind") == "assembly"]
+    roots = [a for a in assemblies if a not in instanced_targets] or assemblies
+    trees = [t for a in sorted(roots) if (t := tree_for(a)) is not None]
+    return {"ok": True, "trees": trees}
+
+
 def blast_radius(node_id: str, graph: dict[str, Any] | None = None,
                  *, project_dir: str | os.PathLike | None = None) -> dict[str, Any]:
     """``cad_graph_blast`` — transitive dependents of *node_id*.

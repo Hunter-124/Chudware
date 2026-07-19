@@ -111,6 +111,13 @@ struct GraphTabState {
 
     // Scope: "" = project view; else the structural doc/asm/part node drilled into.
     std::string scopeDocId;
+    // Ancestor chain for nested drills ("" entries = came from project view).
+    std::vector<std::string> scopeStack;
+    // Decomposition scope: assembly → subassemblies/parts with instance
+    // counts (bom_item INSTANCE_OF resolution). false = raw doc internals.
+    bool scopeDecomp = false;
+    // Instance quantity per child doc in decomposition scope (label badges).
+    std::unordered_map<std::string, int> instCount;
     // Visible node indices (into nodes[]) for the active scope.
     std::vector<int> visibleIdx;
     // Scope-filtered / aggregated edges for drawing + hit-test.
@@ -524,12 +531,69 @@ void rebuildVisible(GraphTabState& G) {
             ve.srcEdgeIdx = a.srcEdgeIdx;
             G.visibleEdges.push_back(std::move(ve));
         }
+    } else if (G.scopeDecomp) {
+        // ---- ASSEMBLY DECOMPOSITION ----------------------------------------
+        // scope root + resolved child docs (bom_item INSTANCE_OF targets,
+        // aggregated with instance counts; direct doc/part/assembly kids).
+        if (!G.idIndex.count(G.scopeDocId)) {
+            G.scopeDocId.clear();
+            G.scopeStack.clear();
+            G.scopeDecomp = false;
+            rebuildVisible(G);
+            return;
+        }
+        G.instCount.clear();
+        const std::string& root = G.scopeDocId;
+        visIds.insert(root);
+        G.visibleIdx.push_back(G.idIndex[root]);
+
+        std::vector<std::pair<std::string, int>> targets;  // (docId, qty)
+        std::unordered_map<std::string, int> tpos;
+        auto addTarget = [&](const std::string& t, int qty) {
+            if (t == root || !G.idIndex.count(t)) return;
+            auto it = tpos.find(t);
+            if (it == tpos.end()) {
+                tpos[t] = (int)targets.size();
+                targets.push_back({t, qty});
+            } else {
+                targets[it->second].second += qty;
+            }
+        };
+        for (const auto& e : G.edges) {
+            if (e.kind != "CONTAINS" || e.src != root) continue;
+            auto kit = G.idIndex.find(e.dst);
+            if (kit == G.idIndex.end()) continue;
+            const std::string& kkind = G.nodes[kit->second].kind;
+            if (kkind == "bom_item") {
+                for (const auto& ie : G.edges)
+                    if (ie.kind == "INSTANCE_OF" && ie.src == e.dst)
+                        addTarget(ie.dst, 1);
+            } else if (kkind == "part" || kkind == "assembly" || kkind == "doc") {
+                addTarget(e.dst, 1);
+            }
+        }
+        std::sort(targets.begin(), targets.end(),
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
+        for (const auto& [t, qty] : targets) {
+            visIds.insert(t);
+            G.visibleIdx.push_back(G.idIndex[t]);
+            G.instCount[t] = qty;
+            VEdge ve;
+            ve.src = root; ve.dst = t; ve.kind = "INSTANCE_OF";
+            ve.origin = "extracted";
+            ve.aggCount = qty;
+            ve.srcEdgeIdx = -1;  // synthetic; side panel null-guards this
+            G.visibleEdges.push_back(std::move(ve));
+        }
+        std::sort(G.visibleIdx.begin(), G.visibleIdx.end(), [&](int a, int b) {
+            return G.nodes[a].id < G.nodes[b].id;
+        });
     } else {
-        // ---- DRILL-DOWN -----------------------------------------------------
         // Visible = scope root + all CONTAINS-descendants.
         if (!G.idIndex.count(G.scopeDocId)) {
             // Stale scope — fall back to project.
             G.scopeDocId.clear();
+            G.scopeStack.clear();
             rebuildVisible(G);
             return;
         }
@@ -573,6 +637,39 @@ void rebuildVisible(GraphTabState& G) {
     G.matchDirty = true;
 }
 
+// True when the node has bom_item children — i.e. it can be viewed as an
+// assembly decomposition (subassemblies/parts) rather than raw internals.
+bool hasBomChildren(GraphTabState& G, const std::string& id) {
+    for (const auto& e : G.edges) {
+        if (e.kind != "CONTAINS" || e.src != id) continue;
+        auto it = G.idIndex.find(e.dst);
+        if (it != G.idIndex.end() && G.nodes[it->second].kind == "bom_item")
+            return true;
+    }
+    return false;
+}
+
+void setScope(GraphTabState& G, const std::string& docId);
+
+// Nested drill navigation: drillInto pushes the current scope, scopeBack
+// pops one level (empty string = project view). Stack invariant: it holds
+// the ancestor chain, so depth == stack.size() when scoped.
+void drillInto(GraphTabState& G, const std::string& id) {
+    if (id.empty() || id == G.scopeDocId) return;
+    G.scopeStack.push_back(G.scopeDocId);
+    setScope(G, id);
+}
+
+void scopeBack(GraphTabState& G) {
+    if (!G.scopeStack.empty()) {
+        std::string up = std::move(G.scopeStack.back());
+        G.scopeStack.pop_back();
+        setScope(G, up);
+    } else {
+        setScope(G, "");
+    }
+}
+
 void setScope(GraphTabState& G, const std::string& docId) {
     if (G.scopeDocId == docId) return;
     G.scopeDocId = docId;
@@ -581,6 +678,14 @@ void setScope(GraphTabState& G, const std::string& docId) {
     G.blast.clear();
     G.hoverId.clear();
     G.userNavigated = false;  // fresh scope → allow one auto-fit again
+    // Assemblies (or anything with bom_items) open in decomposition view.
+    G.scopeDecomp = false;
+    if (!docId.empty()) {
+        auto it = G.idIndex.find(docId);
+        if (it != G.idIndex.end() &&
+            (G.nodes[it->second].kind == "assembly" || hasBomChildren(G, docId)))
+            G.scopeDecomp = true;
+    }
     rebuildVisible(G);
     // Fit on next canvas paint.
 }
@@ -599,14 +704,14 @@ void rebuildForce(GraphTabState& G) {
 
     const float S = ui::uiScale;
     // Scale the engine's defaults (link 60, repulsion 900) up to our spacing.
-    G.force.setLinkDistance(100.0f * S);
-    G.force.setRepulsion(900.0f * S * S * (100.0f / 60.0f) * (100.0f / 60.0f));
-    G.force.setCollision(6.0f, 3.0f * S);
+    G.force.setLinkDistance(110.0f * S);
+    G.force.setRepulsion(900.0f * S * S * (110.0f / 60.0f) * (110.0f / 60.0f));
+    G.force.setCollision(6.0f, 4.0f * S);
 
     // Node sizing metric (d3-style: area ∝ importance). Structural nodes use
     // their hidden-descendant count (features/sketches inside the document);
-    // everything also accrues its visible edge degree. radius ∝ sqrt so the
-    // disc AREA scales with the metric.
+    // decomposition children accrue instance quantity; everything accrues
+    // visible edge degree. radius ∝ sqrt so disc AREA scales with the metric.
     std::unordered_map<int, int> degree;
     degree.reserve(G.visibleIdx.size() * 2);
     for (const auto& e : G.visibleEdges) {
@@ -614,6 +719,11 @@ void rebuildForce(GraphTabState& G) {
         auto si = G.idIndex.find(e.src), di = G.idIndex.find(e.dst);
         if (si != G.idIndex.end()) degree[si->second]++;
         if (di != G.idIndex.end()) degree[di->second]++;
+    }
+    // Instance quantity makes repeatedly-used parts visually bigger.
+    for (const auto& [id, qty] : G.instCount) {
+        auto it = G.idIndex.find(id);
+        if (it != G.idIndex.end()) degree[it->second] += qty;
     }
 
     const float GOLDEN = 2.39996323f;  // golden angle (rad)
@@ -626,7 +736,7 @@ void rebuildForce(GraphTabState& G) {
         const float metric = std::sqrt((float)(desc + degree[vi]));
         float r = (9.0f + 3.5f * metric) * S;
         if (n.kind == "project") r *= 1.25f;
-        n.radius = std::clamp(r, 9.0f * S, 40.0f * S);
+        n.radius = std::clamp(r, 9.0f * S, 46.0f * S);
         float sx = n.lx, sy = n.ly;
         if (sx == 0.0f && sy == 0.0f) {
             bool seeded = false;
@@ -654,22 +764,24 @@ void rebuildForce(GraphTabState& G) {
         G.forceSlot[vi] = G.force.addNode(sx, sy, n.radius);
     }
 
-    // Springs per visible edge; kind tunes rest length / stiffness.
+    // Springs per visible edge; kind tunes rest length / stiffness. Rest
+    // lengths include both radii so big hubs don't crowd their neighbours.
     for (const auto& e : G.visibleEdges) {
         if (G.hiddenKinds.count(e.kind)) continue;
         auto si = G.idIndex.find(e.src), di = G.idIndex.find(e.dst);
         if (si == G.idIndex.end() || di == G.idIndex.end()) continue;
         int a = G.forceSlot[si->second], b = G.forceSlot[di->second];
         if (a < 0 || b < 0 || a == b) continue;
-        float rest = 110.0f, strength = 0.45f;
-        if (e.kind == "CONTAINS")               { rest = 85.0f;  strength = 0.9f; }
-        else if (e.kind == "INSTANCE_OF")       { rest = 90.0f;  strength = 0.7f; }
-        else if (e.kind == "DEPENDS_ON")        { rest = 120.0f; strength = 0.5f; }
-        else if (e.kind == "MATES")             { rest = 110.0f; strength = 0.55f; }
+        const float radii = G.nodes[si->second].radius + G.nodes[di->second].radius;
+        float rest = 100.0f, strength = 0.45f;
+        if (e.kind == "CONTAINS")               { rest = 70.0f;  strength = 0.9f; }
+        else if (e.kind == "INSTANCE_OF")       { rest = 80.0f;  strength = 0.75f; }
+        else if (e.kind == "DEPENDS_ON")        { rest = 110.0f; strength = 0.5f; }
+        else if (e.kind == "MATES")             { rest = 100.0f; strength = 0.55f; }
         else if (e.kind == "REFERENCES" ||
-                 e.kind == "DERIVES_FROM")      { rest = 150.0f; strength = 0.3f; }
+                 e.kind == "DERIVES_FROM")      { rest = 140.0f; strength = 0.3f; }
         if (e.aggCount > 1) strength += std::min(0.3f, 0.05f * (float)(e.aggCount - 1));
-        G.force.addEdge(a, b, rest * S, strength);
+        G.force.addEdge(a, b, rest * S + 0.7f * radii, strength);
     }
 
     G.force.reheat(fresh > (int)G.visibleIdx.size() / 2 ? 0.8f : 0.35f);
@@ -923,8 +1035,10 @@ void requestGraph(AppState& st, bool force) {
         rebuildContainsParent(G);
         rebuildDescCounts(G);
         // Drop stale drill target if the node vanished.
-        if (!G.scopeDocId.empty() && !G.idIndex.count(G.scopeDocId))
+        if (!G.scopeDocId.empty() && !G.idIndex.count(G.scopeDocId)) {
             G.scopeDocId.clear();
+            G.scopeStack.clear();
+        }
         rebuildVisible(G);
 
         // With project-view scoping the canvas stays readable; only auto-list
@@ -1308,15 +1422,16 @@ void drawSidePanel(AppState& st, float panelW) {
 
     ImGui::Dummy(ImVec2(0, 8 * S));
 
-    // Drill into a structural node from project view.
-    if (G.scopeDocId.empty() && isDrillableKind(sel->kind)) {
+    // Drill into a structural node (any depth); back steps up ONE level.
+    if (sel->id != G.scopeDocId && isDrillableKind(sel->kind)) {
         if (graphGlassButton("##drill", "Drill in", true, -1.0f)) {
-            setScope(G, sel->id);
+            drillInto(G, sel->id);
         }
         ImGui::Dummy(ImVec2(0, 4 * S));
-    } else if (!G.scopeDocId.empty() && G.scopeDocId == sel->id) {
-        if (graphGlassButton("##drillup", "Back to project", false, -1.0f)) {
-            setScope(G, "");
+    }
+    if (!G.scopeDocId.empty()) {
+        if (graphGlassButton("##drillup", "Back", false, -1.0f)) {
+            scopeBack(G);
         }
         ImGui::Dummy(ImVec2(0, 4 * S));
     }
@@ -1599,14 +1714,14 @@ void drawCanvas(AppState& st, ImVec2 canvasSz) {
         }
     }
 
-    // Double-click drill / back.
+    // Double-click drill / back (works at any nesting depth).
     if (hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-        if (!G.hoverId.empty() && G.scopeDocId.empty()) {
+        if (!G.hoverId.empty() && G.hoverId != G.scopeDocId) {
             auto it = G.idIndex.find(G.hoverId);
             if (it != G.idIndex.end() && isDrillableKind(G.nodes[it->second].kind))
-                setScope(G, G.hoverId);
+                drillInto(G, G.hoverId);
         } else if (G.hoverId.empty() && !G.scopeDocId.empty()) {
-            setScope(G, "");
+            scopeBack(G);
         }
     }
 
@@ -1679,6 +1794,19 @@ void drawCanvas(AppState& st, ImVec2 canvasSz) {
                 ImGui::GetColorU32(ImVec4(palette.text[0], palette.text[1],
                                           palette.text[2], 0.55f)), 12);
 
+        // Kind glyph inside the disc once it's big enough on screen.
+        if (r >= 9.0f) {
+            const char* glyph = kindShort(n.kind);
+            ImVec2 gs = ImGui::CalcTextSize(glyph);
+            if (gs.x <= r * 1.6f) {
+                dl->AddText(ImVec2(c.x - gs.x * 0.5f, c.y - gs.y * 0.5f),
+                            ImGui::GetColorU32(ImVec4(
+                                palette.panelBg[0], palette.panelBg[1],
+                                palette.panelBg[2], dim ? 0.5f : 0.95f)),
+                            glyph);
+            }
+        }
+
         // Labels: LOD-gated (few on screen, or zoomed, or focused/matched).
         const bool showLabel = !dim &&
             ((labelAll && G.zoom >= 0.35f) || sel || hov ||
@@ -1719,6 +1847,20 @@ void drawCanvas(AppState& st, ImVec2 canvasSz) {
                         palette.textDisabled[2], 0.95f));
                     dl->AddText(ImVec2(c.x - bs.x * 0.5f, tp.y + ts.y + 1 * S),
                                 bc, badge.c_str());
+                }
+            }
+            // Instance quantity badge (decomposition view).
+            if (G.scopeDecomp && (G.zoom >= 0.4f || sel || hov)) {
+                auto qit = G.instCount.find(n.id);
+                if (qit != G.instCount.end() && qit->second > 1) {
+                    char qty[24];
+                    std::snprintf(qty, sizeof(qty), "\u00d7%d", qit->second);
+                    ImVec2 bs = ImGui::CalcTextSize(qty);
+                    ImU32 bc = ImGui::GetColorU32(ImVec4(
+                        palette.accent[0], palette.accent[1],
+                        palette.accent[2], 0.95f));
+                    dl->AddText(ImVec2(c.x - bs.x * 0.5f, tp.y + ts.y + 1 * S),
+                                bc, qty);
                 }
             }
         }
@@ -1892,8 +2034,8 @@ void drawListView(AppState& /*st*/, ImVec2 canvasSz) {
                 G.blast.clear();
             }
             if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)
-                && isDrillableKind(n.kind) && G.scopeDocId.empty()) {
-                setScope(G, n.id);
+                && isDrillableKind(n.kind) && n.id != G.scopeDocId) {
+                drillInto(G, n.id);
             }
             if (sel || inBlast) ImGui::PopStyleColor();
 
@@ -1949,6 +2091,9 @@ void plmGraphOnProjectChanged() {
     G.listViewUserOverride = false;
     // Scope / visible caches — never open a new project inside a stale drill.
     G.scopeDocId.clear();
+    G.scopeStack.clear();
+    G.scopeDecomp = false;
+    G.instCount.clear();
     G.visibleIdx.clear();
     G.visibleEdges.clear();
     G.descCounts.clear();
@@ -2077,7 +2222,7 @@ void plmDrawGraphPage(AppState& st) {
         plmError(G.err);
     }
 
-    // ---- breadcrumb: Project › <doc> ----------------------------------------
+    // ---- breadcrumb: Project › asm › subasm › … ----------------------------
     {
         ImGui::AlignTextToFramePadding();
         ImGui::PushStyleColor(ImGuiCol_Text,
@@ -2085,10 +2230,20 @@ void plmDrawGraphPage(AppState& st) {
                 ? ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 1.0f)
                 : ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
         if (ImGui::SmallButton("▣ Project##bc_root")) {
-            if (!G.scopeDocId.empty()) setScope(G, "");
+            if (!G.scopeDocId.empty()) {
+                G.scopeStack.clear();
+                setScope(G, "");
+            }
         }
         ImGui::PopStyleColor();
-        if (!G.scopeDocId.empty()) {
+        // Ancestor chain + current scope; all but the current are clickable
+        // and pop the stack back to that level.
+        std::vector<std::string> crumbs;
+        for (const auto& a : G.scopeStack)
+            if (!a.empty()) crumbs.push_back(a);
+        if (!G.scopeDocId.empty()) crumbs.push_back(G.scopeDocId);
+        for (int ci = 0; ci < (int)crumbs.size(); ++ci) {
+            const bool current = (ci == (int)crumbs.size() - 1);
             ImGui::SameLine(0, 4 * S);
             ImGui::PushStyleColor(ImGuiCol_Text,
                 ImVec4(palette.textDisabled[0], palette.textDisabled[1],
@@ -2096,13 +2251,48 @@ void plmDrawGraphPage(AppState& st) {
             ImGui::TextUnformatted("›");
             ImGui::PopStyleColor();
             ImGui::SameLine(0, 4 * S);
-            std::string lab = G.scopeDocId;
-            auto it = G.idIndex.find(G.scopeDocId);
+            std::string lab = crumbs[ci];
+            auto it = G.idIndex.find(crumbs[ci]);
             if (it != G.idIndex.end()) lab = G.nodes[it->second].label;
             ImGui::PushStyleColor(ImGuiCol_Text,
-                ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 1.0f));
-            ImGui::TextUnformatted(lab.c_str());
+                current
+                    ? ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 1.0f)
+                    : ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
+            ImGui::PushID(ci);
+            if (!current && ImGui::SmallButton(lab.c_str())) {
+                // Jump straight to this crumb: scope = crumb, ancestors =
+                // project entry + crumbs before it.
+                std::vector<std::string> newStack;
+                newStack.push_back(std::string());
+                for (int k = 0; k < ci; ++k) newStack.push_back(crumbs[k]);
+                G.scopeStack = std::move(newStack);
+                setScope(G, crumbs[ci]);
+            } else if (current) {
+                ImGui::TextUnformatted(lab.c_str());
+            }
+            ImGui::PopID();
             ImGui::PopStyleColor();
+        }
+        if (!G.scopeDocId.empty()) {
+            auto it = G.idIndex.find(G.scopeDocId);
+            // Decomposable scopes can flip between the parts tree and the
+            // raw doc internals (features/sketches/mates).
+            if (hasBomChildren(G, G.scopeDocId) ||
+                (it != G.idIndex.end() && G.nodes[it->second].kind == "assembly")) {
+                ImGui::SameLine(0, 12 * S);
+                if (ImGui::SmallButton(G.scopeDecomp ? "Parts\u2009\u25cf##sc_parts"
+                                                     : "Parts##sc_parts")) {
+                    if (!G.scopeDecomp) { G.scopeDecomp = true; rebuildVisible(G); }
+                }
+                ImGui::SameLine(0, 2 * S);
+                if (ImGui::SmallButton(!G.scopeDecomp ? "Internals\u2009\u25cf##sc_int"
+                                                      : "Internals##sc_int")) {
+                    if (G.scopeDecomp) { G.scopeDecomp = false; rebuildVisible(G); }
+                }
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+                    ImGui::SetTooltip("Parts: subassembly/part decomposition with instance counts.\n"
+                                      "Internals: raw features / sketches / mates of this document.");
+            }
         }
     }
 

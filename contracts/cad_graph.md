@@ -75,3 +75,13 @@ Graphify/Sourcegraph analogue over CAD projects: how parts/features/mates/BOM/do
 - UI solve-state cache: the PLM graph tab persists settled force-layout positions to
   `<project>/.plm/graph_layout.json` (`{positions: {node_id: [x, y]}}`). UI-owned; does not
   participate in worker cache invalidation.
+
+### Assembly decomposition tree (2026-07)
+- New worker RPC `cad_graph_assembly_tree {project_dir, doc_id?, max_depth?=12} ->
+  {ok, trees:[{id, label, kind, count, path?, children:[…]}]}` — nested assembly →
+  subassembly/part decomposition over `CONTAINS bom_item INSTANCE_OF doc` chains.
+  `count` = instance quantity within the parent. Roots: `doc_id` when given, else every
+  assembly no other assembly instances (all assemblies on cyclic fallback). Parts are
+  leaves; cycles and depth are capped.
+- MCP: `cad_graph(query_kind="tree", node_id=<optional root>, project_dir)` exposes the
+  same tree to agents.

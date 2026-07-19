@@ -327,6 +327,7 @@ def test_rpc_methods_registered():
     assert set(CAD_GRAPH_METHODS) == {
         "cad_graph_get", "cad_graph_blast", "cad_graph_path",
         "cad_graph_link_add", "cad_graph_link_remove", "cad_graph_link_list",
+        "cad_graph_assembly_tree",
     }
     from engine_oracle.parts_hub import worker_rpc
     for name in CAD_GRAPH_METHODS:

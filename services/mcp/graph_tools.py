@@ -39,6 +39,9 @@ def register_graph_tools(mcp: FastMCP) -> None:
           - "get"   → the whole graph (nodes + edges), token-bounded.
           - "blast" → transitive dependents of `node_id` (what breaks if it changes).
           - "path"  → shortest link chain between `src` and `dst`.
+          - "tree"  → assembly decomposition: nested assembly → subassembly/part
+            tree with instance counts. `node_id` roots at one assembly;
+            omit it for every top-level assembly in the project.
         `project_dir` is the project folder (the shared working directory). Edges
         carry meta (dim/value/expr/via) explaining WHAT links two parts.
         """
@@ -70,7 +73,10 @@ def register_graph_tools(mcp: FastMCP) -> None:
                 if not src or not dst:
                     return _err("src_dst_required", "pass both graph node ids")
                 return _dumps(cg.find_path(src, dst, project_dir=project_dir or None))
-            return _err("invalid_query_kind", "query_kind ∈ get | blast | path")
+            if qk == "tree":
+                return _dumps(cg.assembly_tree(project_dir or None,
+                                               doc_id=node_id or None))
+            return _err("invalid_query_kind", "query_kind ∈ get | blast | path | tree")
         except Exception as exc:  # noqa: BLE001
             return _err("cad_graph_failed", str(exc))
 

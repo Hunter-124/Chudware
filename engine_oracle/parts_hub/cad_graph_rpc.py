@@ -39,10 +39,25 @@ def _cad_graph_get(params: dict, _emit: Callable) -> dict:
                 max_edges = int(max_edges)
             except (TypeError, ValueError):
                 max_edges = None
+        # Change-probe pass-through (contracts/cad_graph.md 2026-07 addendum).
+        if_mtimes_max = p.get("if_mtimes_max", None)
+        if if_mtimes_max is not None:
+            try:
+                if_mtimes_max = float(if_mtimes_max)
+            except (TypeError, ValueError):
+                if_mtimes_max = None
+        if_sources_count = p.get("if_sources_count", None)
+        if if_sources_count is not None:
+            try:
+                if_sources_count = int(if_sources_count)
+            except (TypeError, ValueError):
+                if_sources_count = None
         return cg.get_graph(
             project_dir, doc_id=doc_id, open_docs=open_docs, force=force,
             include_archive=include_archive,
             max_nodes=max_nodes, max_edges=max_edges,
+            if_mtimes_max=if_mtimes_max,
+            if_sources_count=if_sources_count,
         )
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"cad_graph_get failed: {exc}", "hint": ""}
@@ -151,6 +166,30 @@ def _cad_graph_link_list(params: dict, _emit: Callable) -> dict:
                 "hint": "", "links": []}
 
 
+def _cad_graph_assembly_tree(params: dict, _emit: Callable) -> dict:
+    """``cad_graph_assembly_tree {project_dir, doc_id?, max_depth?} -> {ok, trees}``."""
+    try:
+        from services.plm import cad_graph as cg
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"cad_graph unavailable: {exc}", "hint": ""}
+    try:
+        p = params or {}
+        project_dir = p.get("project_dir") or p.get("path") or None
+        doc_id = p.get("doc_id") or None
+        include_archive = bool(p.get("include_archive", False))
+        max_depth = p.get("max_depth", 12)
+        try:
+            max_depth = max(1, int(max_depth))
+        except (TypeError, ValueError):
+            max_depth = 12
+        return cg.assembly_tree(project_dir, doc_id=doc_id,
+                                include_archive=include_archive,
+                                max_depth=max_depth)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"cad_graph_assembly_tree failed: {exc}",
+                "hint": "", "trees": []}
+
+
 CAD_GRAPH_METHODS: dict[str, Callable[..., Any]] = {
     "cad_graph_get": _cad_graph_get,
     "cad_graph_blast": _cad_graph_blast,
@@ -158,4 +197,5 @@ CAD_GRAPH_METHODS: dict[str, Callable[..., Any]] = {
     "cad_graph_link_add": _cad_graph_link_add,
     "cad_graph_link_remove": _cad_graph_link_remove,
     "cad_graph_link_list": _cad_graph_link_list,
+    "cad_graph_assembly_tree": _cad_graph_assembly_tree,
 }

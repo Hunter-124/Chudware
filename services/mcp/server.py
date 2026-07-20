@@ -196,13 +196,15 @@ _FULL_INSTRUCTIONS = (
         "call with defaults for every field (cad_guide('interaction')).\n"
         "BOM + COST: after placing parts, bom_rollup() → bom_price() for a costed BOM; "
         "cam_cost_estimate() for made-part cost seeds (cad_guide('sourcing'), cad_guide('cost')).\n"
-        "CAM FEEDS & SPEEDS: feeds_speeds(material, tool_type, tool_dia, operation) returns a "
-        "table-driven rpm/feed/stepdown/stepover envelope (aicad.calc/1); cam_check_feeds_envelope() "
+        "CAM FEEDS & SPEEDS: feeds_speeds(material, tool_type, tool_dia, operation, machine=?) returns a "
+        "table-driven rpm/feed/stepdown/stepover envelope (aicad.calc/1); pass machine= (haas_vf2, …) to "
+        "clamp to a machine profile; thread= folds in tap_drill_mm. cam_check_feeds_envelope() "
         "returns an aicad.advisory/1 hint when params are out of range; tap_drill(thread) gives "
         "the standard tap-drill size for metric and unified threads. Call these BEFORE cam_add_operation "
         "to pick sane defaults, and use cam_check_feeds_envelope() AFTER to flag risky params before "
         "simulation. Materials: same ids as cam_materials() / cam_add_setup() (alu_6061, steel_1018, "
-        "ti_6al4v, abs, pla, nylon_pa12, cast_iron_gray, inconel_718, …).\n"
+        "ti_6al4v, abs, pla, nylon_pa12, cast_iron_gray, inconel_718, …). "
+        "cam_audit — deterministic G-code verification; run after cam_post.\n"
         "DOMAIN TOOLS: cam_* (machining toolpaths — cad_guide('cam')), ecad_* (schematic/PCB), "
         "piping_* (pipe networks — cad_guide('piping')), hydraulic_* (ISO 1219 circuits — "
         "cad_guide('hydraulic')), fw_* (firmware build/sim/flash — cad_guide('firmware')), "
@@ -319,6 +321,8 @@ register_heatsink_tools(_reg.view(mcp, "ecad"))
 # CAM (computer-aided machining): toolpaths, feeds & speeds, material-removal sim, G-code post.
 from mcp_server.cam_tools import register_cam_tools
 register_cam_tools(_reg.view(mcp, "cam"))
+from mcp_server.cam_audit import register_cam_audit_tools
+register_cam_audit_tools(_reg.view(mcp, "cam"))
 
 # Doc diff — semantic feature-level diff between two document revisions (T-H2).
 from mcp_server.doc_diff_tools import register_doc_diff_tools

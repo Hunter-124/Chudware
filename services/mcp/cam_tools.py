@@ -184,19 +184,75 @@ def register_cam_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def cam_add_setup(name: str = "Setup1", machine: str = "mill3", material: str = "aluminum",
-                      stock: Optional[dict] = None, wcs: Optional[dict] = None) -> str:
+                      stock: Optional[dict] = None, wcs: Optional[dict] = None,
+                      machine_profile: str = "") -> str:
         """Add a machining setup (a stock + WCS + machine/platform). machine: mill3|mill4|mill5|
         router|lathe|millturn|laser|plasma|waterjet. `material` accepts any engine materials
         registry ID/alias (e.g. "aluminum_6061_t6", "6061") or a CuttingDB group id ("aluminum",
         "steel_mild") — a registry id is translated to the group whose feeds/speeds the calculator
         uses (T-M4). `stock` is a stock dict (e.g. from cam_extract(kind="stock")["stock"]["box"]
         -> {"type":"box","min":[...],"max":[...]}), defaulting to a box-offset of the model bbox.
-        Returns the new setup_id (+ a material_note when the id has no dedicated feeds row)."""
+        `machine_profile` (optional): id from cam_machines() (e.g. "haas_vf2") — merges the full
+        machine envelope (travel, rapids, rpm/feed clamps, tool_change_s, accel) into the setup
+        machine payload. Returns the new setup_id (+ a material_note when the id has no dedicated
+        feeds row)."""
         try:
             resolved, note = _resolve_cam_material(material)
             st = dict(stock or {"type": "box_offset", "off_ztop": 1.0})
             st["material"] = resolved
-            setup = {"name": name, "machine": {"kind": machine}, "stock": st}
+            mach: dict = {"kind": machine}
+            mp = str(machine_profile or "").strip()
+            if mp:
+                try:
+                    mr = cb.call("cam_machines", {})
+                except Exception as e:  # noqa: BLE001
+                    raise ValueError(
+                        f"machine profile '{mp}' unavailable — cam_machines failed: {e}"
+                    ) from e
+                machines = mr.get("machines") if isinstance(mr, dict) else None
+                if not isinstance(machines, list):
+                    raise ValueError(
+                        f"machine profile '{mp}' unavailable — cam_machines returned no list"
+                    )
+                hit = None
+                for m in machines:
+                    if isinstance(m, dict) and str(m.get("id", "")) == mp:
+                        hit = m
+                        break
+                if hit is None:
+                    ids = sorted(str(m.get("id", "")) for m in machines if isinstance(m, dict))
+                    raise ValueError(
+                        f"unknown machine profile '{mp}'; valid ids: {ids}"
+                    )
+                # Map aicad.machines/1 → core Machine wire keys; drop catalog-only fields.
+                if hit.get("kind"):
+                    mach["kind"] = hit["kind"]
+                if hit.get("label"):
+                    mach["name"] = hit["label"]
+                if "travel_mm" in hit:
+                    mach["travel"] = hit["travel_mm"]
+                elif "travel" in hit:
+                    mach["travel"] = hit["travel"]
+                if "rapid_xy_mm_min" in hit:
+                    mach["rapid_xy"] = hit["rapid_xy_mm_min"]
+                elif "rapid_xy" in hit:
+                    mach["rapid_xy"] = hit["rapid_xy"]
+                if "rapid_z_mm_min" in hit:
+                    mach["rapid_z"] = hit["rapid_z_mm_min"]
+                elif "rapid_z" in hit:
+                    mach["rapid_z"] = hit["rapid_z"]
+                for src, dst in (
+                    ("max_rpm", "max_rpm"),
+                    ("min_rpm", "min_rpm"),
+                    ("max_feed_mm_min", "max_feed"),
+                    ("max_feed", "max_feed"),
+                    ("tool_change_s", "tool_change_s"),
+                    ("accel_mm_s2", "accel"),
+                    ("accel", "accel"),
+                ):
+                    if src in hit and dst not in mach:
+                        mach[dst] = hit[src]
+            setup = {"name": name, "machine": mach, "stock": st}
             if wcs:
                 setup["wcs"] = wcs
             r = _apply([{"op": "add_setup", "setup": setup, "ref": "_s"}])
@@ -402,6 +458,8 @@ def register_cam_tools(mcp: FastMCP) -> None:
         min_rpm: Optional[float] = None,
         max_feed: Optional[float] = None,
         min_feed: Optional[float] = None,
+        thread: str = "",
+        machine: str = "",
     ) -> str:
         """Compute table-driven rpm / feed / stepdown / stepover envelope for a
         material + tool type + operation (aicad.calc/1, contracts/advisor.md §7).
@@ -426,7 +484,14 @@ def register_cam_tools(mcp: FastMCP) -> None:
             One of: ``roughing``, ``finishing``, ``slotting``, ``drilling``.
         max_rpm, min_rpm, max_feed, min_feed : float, optional
             Machine envelope overrides (mm/min for feeds, RPM for speed). Unset fields
-            use conservative benchtop-VMC defaults (max_rpm=15000, max_feed=5000).
+            use conservative benchtop-VMC defaults (max_rpm=15000, max_feed=5000), or
+            the selected ``machine`` profile when given.
+        thread : str, optional
+            When non-empty, include ``answer.tap_drill_mm`` from the tap-drill table
+            (e.g. ``M10x1.5`` → 8.5). Prefer this over a separate tap_drill call.
+        machine : str, optional
+            Machine profile id (``haas_vf2``, ``tormach_770``, …) — clamps rpm/feed
+            to that machine's envelope from machines.json / cam_machines().
         """
         from engine_oracle.research import machining as _m  # noqa: PLC0415
         lim: dict = {}
@@ -435,7 +500,10 @@ def register_cam_tools(mcp: FastMCP) -> None:
         if max_feed is not None: lim["max_feed"] = max_feed
         if min_feed is not None: lim["min_feed"] = min_feed
         mat, note = _resolve_cam_material(material)
-        result = _m.feeds_speeds(mat, tool_type, tool_dia, operation, lim or None)
+        result = _m.feeds_speeds(
+            mat, tool_type, tool_dia, operation, lim or None,
+            thread=thread or "", machine=machine or "",
+        )
         if note:
             result.setdefault("notes", []).append(note)
         return _dumps(result)

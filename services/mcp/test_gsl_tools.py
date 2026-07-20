@@ -349,9 +349,10 @@ def test_describe_toolpaths_narrates_job_sim_and_gcode():
     assert "G-code digest (source: cam_post): " in text, text
     assert " lines, bounds X[" in text and "] Y[" in text and "] Z[" in text, text
     assert " mm/min, " in text and " tool change(s)" in text, text
-    # Trailing attribution line per contracts/narration.md.
-    assert ("(Source: cam_job_tree, cam_simulate, cam_post — numbers narrated, "
-            "never recomputed)") in text, text
+    # Trailing attribution — audit section is best-effort (may be unavailable on old engines).
+    assert "Audit (source: cam_audit):" in text or "Audit unavailable:" in text, text
+    assert "cam_job_tree" in text and "cam_simulate" in text and "cam_post" in text, text
+    assert "numbers narrated, never recomputed" in text, text
 
 
 # ---------------------------------------------------------------- describe_results

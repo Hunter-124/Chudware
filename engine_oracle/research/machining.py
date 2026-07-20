@@ -40,6 +40,7 @@ from typing import Any, Optional
 # ---------------------------------------------------------------------------
 
 _DATA_PATH = pathlib.Path(__file__).with_name("data") / "feeds_speeds.json"
+_MACHINES_PATH = pathlib.Path(__file__).with_name("data") / "machines.json"
 
 _SCHEMA_CALC = "aicad.calc/1"
 _SCHEMA_ADV  = "aicad.advisory/1"
@@ -54,6 +55,50 @@ _DEFAULT_MACHINE_LIMITS = {
 }
 
 _db: Optional[dict] = None
+
+_machines_db: Optional[dict] = None
+
+
+def _load_machines_db() -> dict:
+    """Lazy-load engine_oracle/research/data/machines.json (aicad.machines/1)."""
+    global _machines_db
+    if _machines_db is None:
+        _machines_db = json.loads(_MACHINES_PATH.read_text(encoding="utf-8"))
+    return _machines_db
+
+
+def machine_profile(profile_id: str) -> dict:
+    """Return one machine profile record from machines.json.
+
+    Raises ``ValueError`` listing valid ids when ``profile_id`` is unknown.
+    """
+    pid = str(profile_id or "").strip()
+    db = _load_machines_db()
+    machines = db.get("machines") or []
+    by_id = {str(m.get("id", "")): m for m in machines if isinstance(m, dict)}
+    if pid not in by_id:
+        valid = sorted(k for k in by_id if k)
+        raise ValueError(
+            f"unknown machine profile '{profile_id}'; valid ids: {valid}"
+        )
+    return dict(by_id[pid])
+
+
+def machine_limits_from_profile(profile: dict) -> dict:
+    """Map an aicad.machines/1 record onto feeds_speeds machine_limits keys."""
+    out: dict[str, float] = {}
+    if "max_rpm" in profile:
+        out["max_rpm"] = float(profile["max_rpm"])
+    if "min_rpm" in profile:
+        out["min_rpm"] = float(profile["min_rpm"])
+    if "max_feed_mm_min" in profile:
+        out["max_feed"] = float(profile["max_feed_mm_min"])
+    elif "max_feed" in profile:
+        out["max_feed"] = float(profile["max_feed"])
+    if "min_feed" in profile:
+        out["min_feed"] = float(profile["min_feed"])
+    return out
+
 
 
 def _load_db() -> dict:
@@ -152,6 +197,8 @@ def feeds_speeds(
     tool_dia: float,
     operation: str,
     machine_limits: Optional[dict] = None,
+    thread: str = "",
+    machine: str = "",
 ) -> dict:
     """Compute rpm / feed / stepdown / stepover envelope for a material + tool + operation.
 
@@ -166,6 +213,7 @@ def feeds_speeds(
     - ``chipload``: feed-per-tooth range (mm/tooth) for the diameter bracket
     - ``coolant``: advisory coolant note string
     - ``provenance``: notes on which table row was used
+    - ``tap_drill_mm``: present when ``thread`` is non-empty (from the tap-drill table)
 
     Parameters
     ----------
@@ -180,8 +228,21 @@ def feeds_speeds(
     machine_limits : dict, optional
         Keys: ``max_rpm``, ``min_rpm``, ``max_feed``, ``min_feed`` (all optional within
         the dict). Unset keys fall back to ``_DEFAULT_MACHINE_LIMITS``.
+    thread : str, optional
+        When non-empty, look up the standard tap drill and include ``tap_drill_mm``
+        on the answer (e.g. ``M10x1.5`` → 8.5).
+    machine : str, optional
+        Machine profile id from ``machines.json`` (e.g. ``haas_vf2``). When set,
+        overrides benchtop defaults for rpm/feed clamps before ``machine_limits``.
     """
-    limits = {**_DEFAULT_MACHINE_LIMITS, **(machine_limits or {})}
+    limits = dict(_DEFAULT_MACHINE_LIMITS)
+    machine_id = str(machine or "").strip()
+    if machine_id:
+        prof = machine_profile(machine_id)
+        limits.update(machine_limits_from_profile(prof))
+        limits["machine_profile"] = machine_id
+    if machine_limits:
+        limits.update(machine_limits)
     max_rpm  = float(limits.get("max_rpm",  _DEFAULT_MACHINE_LIMITS["max_rpm"]))
     min_rpm  = float(limits.get("min_rpm",  _DEFAULT_MACHINE_LIMITS["min_rpm"]))
     max_feed = float(limits.get("max_feed", _DEFAULT_MACHINE_LIMITS["max_feed"]))
@@ -308,6 +369,22 @@ def feeds_speeds(
         "coolant":    coolant,
         "provenance": f"{material}/{tool_type}/{operation} @ dia_bracket={bracket}; cam_id={mat_row.get('cam_id', '?')}",
     }
+
+    thread_s = str(thread or "").strip()
+    if thread_s:
+        td = _lookup_tap_drill(thread_s)
+        if td is None:
+            notes.append(f"thread '{thread_s}' not found in tap_drill table")
+        else:
+            answer["tap_drill_mm"] = td["tap_drill_mm"]
+            if "pct_thread" in td:
+                answer["pct_thread"] = td.get("pct_thread", 75)
+            if td.get("series"):
+                answer["thread_series"] = td["series"]
+            notes.append(f"tap_drill for {thread_s}: {td['tap_drill_mm']} mm")
+
+    if machine_id:
+        notes.append(f"machine profile '{machine_id}' applied to rpm/feed clamps")
 
     return _calc_envelope(
         "feeds_speeds",

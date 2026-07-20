@@ -124,6 +124,8 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "cam_setup_sheet",
         "cam_tool_import",
         "feeds_speeds",
+        "cam_audit",
+        "cam_job_diff",
         "describe_toolpaths",
     ],
     "ecad": [

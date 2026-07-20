@@ -204,7 +204,7 @@ _TOOL_FAMILIES: dict[str, set[str]] = {
         "cam_simulate", "cam_post", "cam_job_tree", "cam_open", "cam_save",
         "cam_undo", "cam_redo", "cam_extract", "cam_set_stock",
         "cam_setup_sheet", "cam_materials", "cam_op_types", "cam_tool_types",
-        "cam_post_dialects",
+        "cam_post_dialects", "cam_audit", "cam_job_diff",
     },
     "doc_diff": {
         "doc_diff_tool",

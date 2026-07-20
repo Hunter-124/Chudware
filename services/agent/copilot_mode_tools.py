@@ -233,6 +233,7 @@ _MUTATING_TOOLS: frozenset[str] = frozenset({
     "solve_mates",
     "cam_generate",
     "cam_post",
+    "cam_audit",
     "cam_add_operation",
     "cam_add_setup",
     "cam_add_tool",

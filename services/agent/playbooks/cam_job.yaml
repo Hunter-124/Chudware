@@ -2,15 +2,11 @@ schema: aicad.playbook/1
 id: cam_job
 stage: cam
 # Owning role: cam_programmer. Helper tools ⊆ cam_programmer.tool_allowlist.
-# NOTE (task note / lead flag): the cam_programmer prompt instructs "tap_drill sizes
-# the pilot", but tap_drill is NOT in cam_programmer.tool_allowlist (which is already
-# at the 14-tool cap). Under the helpers ⊆ allowlist model it is therefore NOT listed
-# as a step helper here. Resolving that (drop a tool to make room, or have the foreman
-# supply the pilot size via advisory) is a lead decision — see the T-W7 task note.
+# RESOLVED (2026-07): tap-drill lookup folded into feeds_speeds(thread=…); cam_audit added; allowlist reworked.
 steps:
   - id: job_setup
     goal: create the job; stock from the ledger/spec; material aligned to cam_materials ids
-    helper_tools: [ledger_get, cam_new_job, cam_add_setup, cam_materials]
+    helper_tools: [ledger_get, cam_new_job, cam_add_setup]
     checklist:
       - stock choice recorded as a decision (oversize is money)
       - material id aligned to cam_materials
@@ -46,11 +42,11 @@ steps:
       required: [setups]
   - id: generate_sim_post
     goal: generate then simulate EVERY setup; only a clean sim earns a post
-    helper_tools: [cam_generate, cam_simulate, cam_cost_estimate, cam_post]
+    helper_tools: [cam_generate, cam_simulate, cam_audit, cam_post]
     checklist:
       - zero gouges, zero rapids-through-stock on every setup
       - machined_fraction meets target (leftover stock found and cleaned)
-      - cam_cost_estimate sanity-checks cycle time before posting
+      - cam_audit.ok is true
     output:
       type: object
       required: [sim_results, post_artifact]

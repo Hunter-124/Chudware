@@ -19,6 +19,7 @@ namespace fs = std::filesystem;
 #include "cam/operations.h"
 #include "cam/post.h"
 #include "cam/stock_sim.h"
+#include "cam/audit.h"
 #include "miniz.h"
 
 namespace aicad {
@@ -475,6 +476,168 @@ json cam_op_types() {
     for (int i = 0; i <= (int)OpType::Probe; ++i)
         a.push_back(json{{"id", to_string((OpType)i)}});
     return json{{"op_types", a}};
+}
+
+json cam_machines() { return MachineDB::builtin().to_json(); }
+
+json cam_feeds(const std::string& doc_id, const json& params) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    CamSession& s = must(doc_id);
+    int tool_number = params.value("tool_number", 0);
+    if (tool_number <= 0)
+        throw OpError("invalid_op", "cam_feeds requires tool_number", params);
+    const Tool* tool = s.job.tools.find(tool_number);
+    if (!tool)
+        throw OpError("unknown_tool", "no tool T" + std::to_string(tool_number) + " in job", params);
+
+    std::string setup_id = params.value("setup_id", std::string());
+    Setup* su = nullptr;
+    if (!setup_id.empty()) {
+        su = find_setup(s.job, setup_id);
+        if (!su) throw OpError("unknown_setup", "no such setup", params);
+    } else if (!s.job.setups.empty()) {
+        su = &s.job.setups.front();
+    }
+
+    std::string material = params.value("material", std::string());
+    if (material.empty())
+        material = su ? su->stock.material : std::string("aluminum");
+
+    const CuttingDB& db = CuttingDB::builtin();
+    if (!db.find(material)) {
+        auto ids = db.material_ids();
+        std::string list;
+        for (size_t i = 0; i < ids.size(); ++i) {
+            if (i) list += ", ";
+            list += ids[i];
+        }
+        throw OpError("unknown_material",
+                      "unknown material '" + material + "'; valid ids: " + list,
+                      json{{"material", material}, {"valid", ids}});
+    }
+
+    Machine mach = su ? su->machine : MachineDB::fallback();
+    Operation op;
+    op.tool_number = tool_number;
+    // operation: "roughing"|"finishing" — mild bias via OpType when no concrete op.
+    std::string operation = params.value("operation", std::string("roughing"));
+    op.type = (operation == "finishing") ? OpType::Contour2D : OpType::Pocket2D;
+
+    // Prefer a real op on the setup that uses this tool (for heights/overrides).
+    if (su) {
+        for (const Operation& cand : su->operations) {
+            if (cand.tool_number == tool_number && !cand.suppressed) {
+                op = cand;
+                break;
+            }
+        }
+    }
+
+    Feeds f = compute_feeds(mach, *tool, op, material, db);
+    return f.to_json();
+}
+
+json cam_audit(const std::string& doc_id, const json& params) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    CamSession& s = must(doc_id);
+
+    std::string setup_id = params.value("setup_id", std::string());
+    std::string dialect = params.value("dialect", s.job.post);
+    std::string machine_id = params.value("machine", std::string());
+    std::string gcode = params.value("gcode", std::string());
+    std::string source = gcode.empty() ? "cam_post" : "supplied";
+
+    // Resolve machine profile.
+    const MachineDB& mdb = MachineDB::builtin();
+    const MachineRecord* rec = machine_id.empty() ? nullptr : mdb.find_record(machine_id);
+    Machine profile = rec ? rec->machine : MachineDB::fallback();
+    std::string profile_id = rec ? rec->id : std::string("benchtop_vmc");
+    if (rec) {
+        // Prefer the record's post dialect when caller omitted dialect and job has default.
+        if (!params.contains("dialect") && !rec->post_dialect.empty())
+            dialect = rec->post_dialect;
+    }
+
+    // Ensure toolpaths (same as cam_simulate / cam_post).
+    std::vector<Toolpath> tps;
+    if (!setup_id.empty()) {
+        Setup* su = find_setup(s.job, setup_id);
+        if (!su) throw OpError("unknown_setup", "no such setup", params);
+        auto it = s.cache.find(su->id);
+        if (it != s.cache.end() && !s.stale) tps = it->second;
+        else {
+            json w = json::array();
+            tps = generate_setup(s.job, *su, &w);
+            s.cache[su->id] = tps;
+            s.stale = false;
+        }
+        // When no explicit machine profile, use setup machine limits as envelope.
+        if (!rec) {
+            profile = su->machine;
+            // Keep profile_id as fallback id for provenance when not a named preset.
+            profile_id = "setup";
+        }
+    } else {
+        for (Setup& su : s.job.setups) {
+            if (s.cache.find(su.id) == s.cache.end() || s.stale) {
+                json w = json::array();
+                s.cache[su.id] = generate_setup(s.job, su, &w);
+            }
+        }
+        s.stale = false;
+        for (auto& su : s.job.setups) {
+            auto it = s.cache.find(su.id);
+            if (it != s.cache.end())
+                tps.insert(tps.end(), it->second.begin(), it->second.end());
+        }
+        if (!rec && !s.job.setups.empty()) {
+            profile = s.job.setups.front().machine;
+            profile_id = "setup";
+        }
+    }
+
+    // Empty gcode → run the same post path as cam_post in-memory.
+    if (gcode.empty()) {
+        PostOptions po;
+        if (params.contains("options")) {
+            const json& o = params["options"];
+            po.sequence_numbers = o.value("sequence_numbers", po.sequence_numbers);
+            po.comments = o.value("comments", po.comments);
+            po.metric = o.value("metric", po.metric);
+            po.program_name = o.value("program_name", po.program_name);
+            po.program_number = o.value("program_number", po.program_number);
+            if (o.contains("overrides")) po.overrides = o["overrides"];
+        }
+        if (!setup_id.empty()) {
+            Setup* su = find_setup(s.job, setup_id);
+            if (!su) throw OpError("unknown_setup", "no such setup", params);
+            PostResult r = post_setup(*su, s.job.tools, dialect, s.cache[su->id], po);
+            gcode = r.gcode;
+            if (!r.ok && gcode.empty())
+                throw OpError("post_failed", r.error.empty() ? "post failed" : r.error, params);
+        } else {
+            std::vector<std::vector<Toolpath>> per;
+            for (auto& su : s.job.setups) per.push_back(s.cache[su.id]);
+            Job jd = s.job;
+            jd.post = dialect;
+            PostResult r = post_job(jd, per, po);
+            gcode = r.gcode;
+            if (!r.ok && gcode.empty())
+                throw OpError("post_failed", r.error.empty() ? "post failed" : r.error, params);
+        }
+    }
+
+    // Build a job view scoped to the setup when setup_id is set (stock/tools still full).
+    Job audit_job = s.job;
+    if (!setup_id.empty()) {
+        Setup* su = find_setup(s.job, setup_id);
+        if (su) {
+            audit_job.setups.clear();
+            audit_job.setups.push_back(*su);
+        }
+    }
+
+    return audit_program(audit_job, gcode, dialect, profile, tps, source, profile_id);
 }
 
 // ── save / open (.cam+ ZIP via miniz) ──

@@ -613,8 +613,8 @@ def _study_bc_faces(doc_id: str, study: dict) -> dict:
     return out
 
 
-def _describe_toolpaths_text(job_id: Optional[str] = None) -> str:
-    """Narrate a CAM job's toolpaths — data from cam_tree, cam_simulate, cam_post only."""
+def _describe_toolpaths_text(job_id: Optional[str] = None, audit: bool = True) -> str:
+    """Narrate a CAM job's toolpaths — data from cam_tree, cam_simulate, cam_post, cam_audit."""
     from mcp_server.cam_tools import _CAM  # shared job state  # noqa: PLC0415
 
     jid = job_id or _CAM.get("doc_id")
@@ -747,10 +747,36 @@ def _describe_toolpaths_text(job_id: Optional[str] = None) -> str:
     else:
         lines.append('\nG-code: not available — run cam_post first')
 
+    if audit:
+        try:
+            ar = cb.call("cam_audit", {"doc_id": jid})
+            ok = bool(ar.get("ok"))
+            n_err = len(ar.get("errors") or [])
+            n_warn = len(ar.get("warnings") or [])
+            stats = ar.get("stats") or {}
+            bounds = stats.get("bounds") or {}
+            bx = bounds.get("x") or [0, 0]
+            by = bounds.get("y") or [0, 0]
+            bz = bounds.get("z") or [0, 0]
+            fr = stats.get("feed_range_mm_min") or [0, 0]
+            est = stats.get("est_time_s")
+            status = "ok" if ok else "FAILED"
+            est_s = f"{float(est):.1f}" if isinstance(est, (int, float)) else "?"
+            lines.append(
+                f'\nAudit (source: cam_audit): {status} — {n_err} error(s), {n_warn} warning(s); '
+                f'bounds X[{bx[0]:.3g}..{bx[1]:.3g}] Y[{by[0]:.3g}..{by[1]:.3g}] '
+                f'Z[{bz[0]:.3g}..{bz[1]:.3g}]; feed {fr[0]:.0f}–{fr[1]:.0f}; est. {est_s}s'
+            )
+        except Exception as e:  # noqa: BLE001
+            lines.append(f'\nAudit unavailable: {e}')
+
     if not setups:
         lines.append('No setups configured — call cam_add_setup to add one.')
 
-    lines.append('\n(Source: cam_job_tree, cam_simulate, cam_post — numbers narrated, never recomputed)')
+    src = "cam_job_tree, cam_simulate, cam_post"
+    if audit:
+        src += ", cam_audit"
+    lines.append(f'\n(Source: {src} — numbers narrated, never recomputed)')
     return _dumps({"ok": True, "text": "\n".join(lines)})
 
 
@@ -1598,14 +1624,15 @@ def register_gsl_tools(mcp: FastMCP) -> None:
     # ---------------------------------------------------------------- narration (T-F7)
 
     @mcp.tool()
-    def describe_toolpaths(job_id: Optional[str] = None) -> str:
+    def describe_toolpaths(job_id: Optional[str] = None, audit: bool = True) -> str:
         """Compact narrative of a CAM job's toolpaths and simulation results — use INSTEAD of
         dumping the raw cam_job_tree JSON. Returns per-op strategy/tool/stepdown/engagement,
         cycle-time and gouge/rapid checks from cam_simulate, and a G-code digest (bounds, feed
-        range, tool-change count) from cam_post. Narrates existing numbers only — never
-        recomputes. Call cam_generate + cam_simulate first for full results."""
+        range, tool-change count) from cam_post. When audit=True (default), also calls cam_audit
+        and appends the audit summary. Narrates existing numbers only — never recomputes.
+        Call cam_generate + cam_simulate first for full results."""
         try:
-            return _describe_toolpaths_text(job_id)
+            return _describe_toolpaths_text(job_id, audit=audit)
         except Exception as e:  # noqa: BLE001
             return _err(e)
 

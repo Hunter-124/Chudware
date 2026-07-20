@@ -82,6 +82,8 @@ def _build_catalog() -> set[str]:
         _regmod(f"mcp_server.{mod}", mod.replace("_tools", ""))
     _regmod("services.dag.mcp_tools", "dag")
     _regmod("services.agent.buildgraph.mcp_tools", "buildgraph")
+    # cam_audit.py is not named *_tools.py (Wave 2); register it under family cam.
+    _regmod("mcp_server.cam_audit", "cam")
     return set(reg.catalog().keys())
 
 

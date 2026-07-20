@@ -1,0 +1,80 @@
+{
+  "schema": "aicad.machines/1",
+  "machines": [
+    {
+      "id": "benchtop_vmc",
+      "label": "Benchtop VMC",
+      "kind": "mill3",
+      "travel_mm": [300.0, 300.0, 150.0],
+      "rapid_xy_mm_min": 5000.0,
+      "rapid_z_mm_min": 3000.0,
+      "max_rpm": 15000.0,
+      "min_rpm": 100.0,
+      "max_feed_mm_min": 5000.0,
+      "tool_change_s": 6.0,
+      "accel_mm_s2": 0.0,
+      "post_dialect": "grbl",
+      "notes": "Generic benchtop VMC defaults (matches engine_oracle/research/machining.py)."
+    },
+    {
+      "id": "tormach_770",
+      "label": "Tormach 770",
+      "kind": "mill3",
+      "travel_mm": [355.0, 280.0, 405.0],
+      "rapid_xy_mm_min": 5000.0,
+      "rapid_z_mm_min": 3000.0,
+      "max_rpm": 10000.0,
+      "min_rpm": 100.0,
+      "max_feed_mm_min": 5000.0,
+      "tool_change_s": 8.0,
+      "accel_mm_s2": 0.0,
+      "post_dialect": "centroid",
+      "notes": "Tormach 770 Series 3."
+    },
+    {
+      "id": "haas_vf2",
+      "label": "Haas VF-2",
+      "kind": "mill3",
+      "travel_mm": [762.0, 406.0, 508.0],
+      "rapid_xy_mm_min": 12000.0,
+      "rapid_z_mm_min": 12000.0,
+      "max_rpm": 8100.0,
+      "min_rpm": 100.0,
+      "max_feed_mm_min": 8000.0,
+      "tool_change_s": 3.5,
+      "accel_mm_s2": 0.0,
+      "post_dialect": "haas",
+      "notes": "Haas VF-2 vertical machining center."
+    },
+    {
+      "id": "grbl_router",
+      "label": "GRBL gantry router",
+      "kind": "router",
+      "travel_mm": [600.0, 600.0, 100.0],
+      "rapid_xy_mm_min": 5000.0,
+      "rapid_z_mm_min": 3000.0,
+      "max_rpm": 24000.0,
+      "min_rpm": 8000.0,
+      "max_feed_mm_min": 6000.0,
+      "tool_change_s": 0.0,
+      "accel_mm_s2": 0.0,
+      "post_dialect": "grbl",
+      "notes": "Typical CNC router (Shapeoko-class) running GRBL."
+    },
+    {
+      "id": "lathe_basic",
+      "label": "Basic CNC lathe",
+      "kind": "lathe",
+      "travel_mm": [200.0, 0.0, 400.0],
+      "rapid_xy_mm_min": 5000.0,
+      "rapid_z_mm_min": 3000.0,
+      "max_rpm": 4000.0,
+      "min_rpm": 50.0,
+      "max_feed_mm_min": 3000.0,
+      "tool_change_s": 4.0,
+      "accel_mm_s2": 0.0,
+      "post_dialect": "linuxcnc",
+      "notes": "Small 2-axis CNC lathe."
+    }
+  ]
+}

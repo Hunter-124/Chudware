@@ -316,5 +316,177 @@ void apply_feeds(Operation& op, const Feeds& f) {
     if (op.stepdown == 0) op.stepdown = f.stepdown;
 }
 
+// ───────────────────────────────────────────────────── MachineDB ──
+namespace {
+Machine mk_machine(MachineKind kind, const char* name, double tx, double ty, double tz,
+                   double rxy, double rz, double max_rpm, double min_rpm, double max_feed,
+                   double tool_change_s, double accel) {
+    Machine m;
+    m.kind = kind;
+    m.name = name;
+    m.travel = {tx, ty, tz};
+    m.rapid_xy = rxy;
+    m.rapid_z = rz;
+    m.max_rpm = max_rpm;
+    m.min_rpm = min_rpm;
+    m.max_feed = max_feed;
+    m.tool_change_s = tool_change_s;
+    m.accel = accel;
+    return m;
+}
+
+std::vector<MachineRecord> builtin_machines() {
+    // Values must match engine_oracle/research/data/machines.json exactly.
+    return {
+        MachineRecord{"benchtop_vmc", "Benchtop VMC",
+                      mk_machine(MachineKind::Mill3, "Benchtop VMC", 300, 300, 150,
+                                 5000, 3000, 15000, 100, 5000, 6.0, 0.0),
+                      "grbl",
+                      "Generic benchtop VMC defaults (matches engine_oracle/research/machining.py)."},
+        MachineRecord{"tormach_770", "Tormach 770",
+                      mk_machine(MachineKind::Mill3, "Tormach 770", 355, 280, 405,
+                                 5000, 3000, 10000, 100, 5000, 8.0, 0.0),
+                      "centroid", "Tormach 770 Series 3."},
+        MachineRecord{"haas_vf2", "Haas VF-2",
+                      mk_machine(MachineKind::Mill3, "Haas VF-2", 762, 406, 508,
+                                 12000, 12000, 8100, 100, 8000, 3.5, 0.0),
+                      "haas", "Haas VF-2 vertical machining center."},
+        MachineRecord{"grbl_router", "GRBL gantry router",
+                      mk_machine(MachineKind::Router, "GRBL gantry router", 600, 600, 100,
+                                 5000, 3000, 24000, 8000, 6000, 0.0, 0.0),
+                      "grbl", "Typical CNC router (Shapeoko-class) running GRBL."},
+        MachineRecord{"lathe_basic", "Basic CNC lathe",
+                      mk_machine(MachineKind::Lathe, "Basic CNC lathe", 200, 0, 400,
+                                 5000, 3000, 4000, 50, 3000, 4.0, 0.0),
+                      "linuxcnc", "Small 2-axis CNC lathe."},
+    };
+}
+
+MachineRecord record_from_json(const json& j) {
+    MachineRecord r;
+    r.id = j.value("id", std::string());
+    r.label = j.value("label", r.id);
+    r.post_dialect = j.value("post_dialect", std::string("grbl"));
+    r.notes = j.value("notes", std::string());
+    r.machine.kind = machine_kind_from_string(j.value("kind", std::string("mill3")));
+    r.machine.name = r.label;
+    if (j.contains("travel_mm") && j["travel_mm"].is_array() && j["travel_mm"].size() >= 3) {
+        r.machine.travel.x = num(j["travel_mm"][0], 0);
+        r.machine.travel.y = num(j["travel_mm"][1], 0);
+        r.machine.travel.z = num(j["travel_mm"][2], 0);
+    } else if (j.contains("travel")) {
+        r.machine.travel = vec3_from_json(j["travel"]);
+    }
+    r.machine.rapid_xy = num(j.value("rapid_xy_mm_min", j.value("rapid_xy", json(5000.0))), 5000);
+    r.machine.rapid_z = num(j.value("rapid_z_mm_min", j.value("rapid_z", json(3000.0))), 3000);
+    r.machine.max_rpm = num(j.value("max_rpm", json(24000.0)), 24000);
+    r.machine.min_rpm = num(j.value("min_rpm", json(0.0)), 0);
+    r.machine.max_feed = num(j.value("max_feed_mm_min", j.value("max_feed", json(10000.0))), 10000);
+    r.machine.tool_change_s = num(j.value("tool_change_s", json(6.0)), 6.0);
+    r.machine.accel = num(j.value("accel_mm_s2", j.value("accel", json(0.0))), 0);
+    return r;
+}
+
+std::filesystem::path resolve_machines_registry_path() {
+    namespace fs = std::filesystem;
+    if (const char* env = std::getenv("AICAD_MACHINES_REGISTRY"); env && env[0])
+        return fs::path(env);
+    return {};
+}
+}  // namespace
+
+json machine_record_json(const MachineRecord& r) {
+    return json{
+        {"id", r.id},
+        {"label", r.label},
+        {"kind", to_string(r.machine.kind)},
+        {"travel_mm", json::array({r.machine.travel.x, r.machine.travel.y, r.machine.travel.z})},
+        {"rapid_xy_mm_min", r.machine.rapid_xy},
+        {"rapid_z_mm_min", r.machine.rapid_z},
+        {"max_rpm", r.machine.max_rpm},
+        {"min_rpm", r.machine.min_rpm},
+        {"max_feed_mm_min", r.machine.max_feed},
+        {"tool_change_s", r.machine.tool_change_s},
+        {"accel_mm_s2", r.machine.accel},
+        {"post_dialect", r.post_dialect},
+        {"notes", r.notes},
+    };
+}
+
+MachineDB::MachineDB() : machines_(builtin_machines()) {}
+
+void MachineDB::merge(const json& doc) {
+    if (!doc.is_object() || !doc.contains("machines") || !doc["machines"].is_array()) return;
+    for (const auto& j : doc["machines"]) {
+        if (!j.is_object()) continue;
+        MachineRecord r = record_from_json(j);
+        if (r.id.empty()) continue;
+        bool replaced = false;
+        for (auto& existing : machines_) {
+            if (existing.id == r.id) {
+                existing = std::move(r);
+                replaced = true;
+                break;
+            }
+        }
+        if (!replaced) machines_.push_back(std::move(r));
+    }
+}
+
+const MachineRecord* MachineDB::find_record(const std::string& id) const {
+    for (const auto& m : machines_)
+        if (m.id == id) return &m;
+    return nullptr;
+}
+
+const Machine* MachineDB::find(const std::string& id) const {
+    const MachineRecord* r = find_record(id);
+    return r ? &r->machine : nullptr;
+}
+
+std::vector<std::string> MachineDB::machine_ids() const {
+    std::vector<std::string> ids;
+    ids.reserve(machines_.size());
+    for (const auto& m : machines_) ids.push_back(m.id);
+    return ids;
+}
+
+json MachineDB::to_json() const {
+    json arr = json::array();
+    for (const auto& m : machines_) arr.push_back(machine_record_json(m));
+    return json{{"machines", arr}};
+}
+
+const MachineDB& MachineDB::builtin() {
+    static MachineDB db = [] {
+        MachineDB d;
+        try {
+            std::filesystem::path p = resolve_machines_registry_path();
+            if (!p.empty()) {
+                std::ifstream fh(p, std::ios::binary);
+                if (fh) {
+                    json doc = json::parse(fh, nullptr, /*allow_exceptions=*/false);
+                    if (!doc.is_discarded()) d.merge(doc);
+                }
+            }
+        } catch (...) {
+            // Unreadable/malformed registry -> keep built-ins.
+        }
+        return d;
+    }();
+    return db;
+}
+
+const Machine& MachineDB::fallback() {
+    static const Machine* fb = []() -> const Machine* {
+        const Machine* m = MachineDB::builtin().find("benchtop_vmc");
+        if (m) return m;
+        static Machine def = mk_machine(MachineKind::Mill3, "Benchtop VMC", 300, 300, 150,
+                                        5000, 3000, 15000, 100, 5000, 6.0, 0.0);
+        return &def;
+    }();
+    return *fb;
+}
+
 }  // namespace cam
 }  // namespace aicad

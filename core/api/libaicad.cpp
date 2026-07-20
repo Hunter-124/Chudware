@@ -3683,6 +3683,9 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             if (m == "cam_materials") return emit(aicad::cam::cam_materials(), out_json, 0);
             if (m == "cam_tool_types") return emit(aicad::cam::cam_tool_types(), out_json, 0);
             if (m == "cam_op_types") return emit(aicad::cam::cam_op_types(), out_json, 0);
+            if (m == "cam_machines") return emit(aicad::cam::cam_machines(), out_json, 0);
+            if (m == "cam_feeds") return emit(aicad::cam::cam_feeds(params.value("doc_id", std::string()), params), out_json, 0);
+            if (m == "cam_audit") return emit(aicad::cam::cam_audit(params.value("doc_id", std::string()), params), out_json, 0);
             if (m == "cam_save")
                 return emit(aicad::cam::cam_save(params.value("doc_id", std::string()),
                                                  params.value("path", std::string())), out_json, 0);

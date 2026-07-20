@@ -5,6 +5,9 @@
 #include <doctest/doctest.h>
 
 #include <cmath>
+#include <cctype>
+#include <fstream>
+#include <sstream>
 #include <filesystem>
 
 #include "cam/geometry.h"
@@ -1376,3 +1379,234 @@ TEST_CASE("op: adaptive arc-blend linking bounds ring-transition engagement on a
     // just a smaller straight-line gap) -- the headline deliverable.
     CHECK(count_kind(on.path, MoveKind::Arc) > count_kind(off.path, MoveKind::Arc));
 }
+
+// ── CAM-overhaul wave 2: MachineDB + cam_feeds + cam_audit ───────────────────
+namespace {
+// Pocket + drill job for audit tests (two tools).
+std::string make_audit_job() {
+    json nw = cam_new(json{{"name", "AuditJob"}, {"post", "grbl"}});
+    std::string doc = nw["doc_id"].get<std::string>();
+    json setup = json{{"name", "S1"},
+                      {"machine", json{{"kind", "mill3"}, {"rapid_xy", 5000}, {"rapid_z", 3000},
+                                       {"max_rpm", 15000}, {"min_rpm", 100}, {"max_feed", 5000}}},
+                      {"stock", json{{"type", "box"}, {"min", {-20, -20, -6}}, {"max", {20, 20, 0}},
+                                     {"material", "aluminum"}}}};
+    json a = cam_apply_ops(doc, -1, json::array({
+        json{{"op", "add_tool"}, {"tool", json{{"number", 1}, {"type", "endmill_flat"},
+                                               {"diameter", 6}, {"flutes", 3}, {"name", "EM6"}}}},
+        json{{"op", "add_tool"}, {"tool", json{{"number", 2}, {"type", "drill"},
+                                               {"diameter", 3}, {"flutes", 2}, {"name", "D3"}}}},
+        json{{"op", "add_setup"}, {"ref", "S"}, {"setup", setup}}}));
+    std::string sid = a["id_map"]["S"].get<std::string>();
+    json pocket = json{{"type", "pocket2d"}, {"tool_number", 1}, {"stepover", 3}, {"stepdown", 2},
+                       {"feed", 600}, {"rpm", 8000},
+                       {"heights", json{{"top", 0}, {"bottom", -4}}},
+                       {"geometry", json{{"regions", json::array({to_json(square(0, 0, 8))})}}}};
+    json drill = json{{"type", "drill"}, {"tool_number", 2}, {"feed", 200}, {"rpm", 4000},
+                      {"heights", json{{"top", 0}, {"bottom", -5}}},
+                      {"geometry", json{{"points", json::array({json::array({5.0, 5.0})})}}}};
+    cam_apply_ops(doc, a["revision"].get<long>(), json::array({
+        json{{"op", "add_operation"}, {"setup_id", sid}, {"operation", pocket}},
+        json{{"op", "add_operation"}, {"setup_id", sid}, {"operation", drill}}}));
+    return doc;
+}
+
+
+// Bump the first absolute X word on a G1 line past a large value (round-trip fail).
+std::string tamper_x_extent(std::string gcode, double x_abs) {
+    std::istringstream in(gcode);
+    std::ostringstream out;
+    std::string line;
+    bool done = false;
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "X%.3f", x_abs);
+    while (std::getline(in, line)) {
+        if (!done) {
+            // Prefer a cutting move with an X word.
+            bool is_cut = line.find('G') != std::string::npos &&
+                          (line.find("G1") != std::string::npos || line.find("G01") != std::string::npos ||
+                           line.find("G1 ") != std::string::npos);
+            auto xpos = line.find('X');
+            if (is_cut && xpos != std::string::npos) {
+                size_t i = xpos + 1;
+                size_t j = i;
+                if (j < line.size() && (line[j] == '+' || line[j] == '-')) ++j;
+                while (j < line.size() && (std::isdigit(static_cast<unsigned char>(line[j])) || line[j] == '.')) ++j;
+                line.replace(xpos, j - xpos, buf);
+                done = true;
+            }
+        }
+        out << line << "\n";
+    }
+    return out.str();
+}
+}  // namespace
+
+TEST_CASE("audit: generated+posted pocket/drill job is ok with stats (wave 2)") {
+    std::string doc = make_audit_job();
+    json gen = cam_generate(doc, json::object());
+    REQUIRE(gen["toolpaths"].size() >= 1);
+    json post = cam_post(doc, json{{"dialect", "grbl"}});
+    REQUIRE(post["ok"].get<bool>());
+    REQUIRE(post["gcode"].get<std::string>().size() > 20);
+
+    json a = cam_audit(doc, json{{"dialect", "grbl"}, {"machine", "benchtop_vmc"}});
+    CHECK(a["schema"] == "aicad.cam_audit/1");
+    CHECK(a["ok"].get<bool>());
+    CHECK(a["errors"].empty());
+    CHECK(a["stats"]["lines"].get<int>() > 0);
+    CHECK(a["stats"]["tools_used"].is_array());
+    CHECK(a["stats"]["tools_used"].size() >= 1);
+    CHECK(a["stats"].contains("bounds"));
+    CHECK(a["stats"]["bounds"].contains("x"));
+    CHECK(a["stats"].contains("feed_range_mm_min"));
+    CHECK(a["stats"]["feed_range_mm_min"].is_array());
+    CHECK(a["provenance"]["source"] == "cam_post");
+    CHECK(a["provenance"]["dialect"] == "grbl");
+    cam_close(doc);
+}
+
+TEST_CASE("audit: F above profile max_feed fails with feed error (wave 2)") {
+    std::string doc = make_audit_job();
+    json post = cam_post(doc, json{{"dialect", "grbl"}});
+    std::string g = post["gcode"].get<std::string>();
+    // Inject an over-limit feed word.
+    g = "F99999\n" + g;
+    json a = cam_audit(doc, json{{"gcode", g}, {"dialect", "grbl"}, {"machine", "benchtop_vmc"}});
+    CHECK_FALSE(a["ok"].get<bool>());
+    bool feed_err = false;
+    for (auto& e : a["errors"]) {
+        std::string s = e.get<std::string>();
+        if (s.find("feed") != std::string::npos || s.find("F") != std::string::npos) feed_err = true;
+    }
+    CHECK(feed_err);
+    cam_close(doc);
+}
+
+TEST_CASE("audit: unknown T fails (wave 2)") {
+    std::string doc = make_audit_job();
+    json post = cam_post(doc, json{{"dialect", "grbl"}});
+    std::string g = post["gcode"].get<std::string>();
+    g = "T99 M6\n" + g;
+    json a = cam_audit(doc, json{{"gcode", g}, {"dialect", "grbl"}, {"machine", "benchtop_vmc"}});
+    CHECK_FALSE(a["ok"].get<bool>());
+    bool tool_err = false;
+    for (auto& e : a["errors"]) {
+        if (e.get<std::string>().find("T99") != std::string::npos ||
+            e.get<std::string>().find("tool") != std::string::npos) tool_err = true;
+    }
+    CHECK(tool_err);
+    cam_close(doc);
+}
+
+TEST_CASE("audit: G20 fails units check (wave 2)") {
+    std::string doc = make_audit_job();
+    json post = cam_post(doc, json{{"dialect", "grbl"}});
+    std::string g = "G20\n" + post["gcode"].get<std::string>();
+    json a = cam_audit(doc, json{{"gcode", g}, {"dialect", "grbl"}, {"machine", "benchtop_vmc"}});
+    CHECK_FALSE(a["ok"].get<bool>());
+    bool units = false;
+    for (auto& e : a["errors"])
+        if (e.get<std::string>().find("G20") != std::string::npos) units = true;
+    CHECK(units);
+    cam_close(doc);
+}
+
+TEST_CASE("audit: tampered X extent fails round-trip (wave 2)") {
+    std::string doc = make_audit_job();
+    cam_generate(doc, json::object());
+    json post = cam_post(doc, json{{"dialect", "grbl"}});
+    std::string g = tamper_x_extent(post["gcode"].get<std::string>(), 5000.0);
+    json a = cam_audit(doc, json{{"gcode", g}, {"dialect", "grbl"}, {"machine", "benchtop_vmc"}});
+    CHECK_FALSE(a["ok"].get<bool>());
+    bool rt = false;
+    for (auto& e : a["errors"]) {
+        std::string s = e.get<std::string>();
+        if (s.find("round-trip") != std::string::npos || s.find("envelope") != std::string::npos)
+            rt = true;
+    }
+    CHECK(rt);
+    cam_close(doc);
+}
+
+TEST_CASE("session: cam_machines lists presets including tormach_770 (wave 2)") {
+    json m = cam_machines();
+    REQUIRE(m.contains("machines"));
+    CHECK(m["machines"].size() >= 5);
+    bool found = false;
+    for (auto& row : m["machines"])
+        if (row.value("id", std::string()) == "tormach_770") found = true;
+    CHECK(found);
+    // Contract shape keys present on first record.
+    const json& r0 = m["machines"][0];
+    CHECK(r0.contains("travel_mm"));
+    CHECK(r0.contains("rapid_xy_mm_min"));
+    CHECK(r0.contains("max_feed_mm_min"));
+    CHECK(r0.contains("post_dialect"));
+}
+
+TEST_CASE("session: cam_feeds aluminum/endmill nonzero and unknown material errors (wave 2)") {
+    std::string doc = make_audit_job();
+    json f = cam_feeds(doc, json{{"tool_number", 1}, {"material", "aluminum"}, {"operation", "roughing"}});
+    CHECK(f["rpm"].get<double>() > 0);
+    CHECK(f["feed"].get<double>() > 0);
+    CHECK(f["stepover"].get<double>() > 0);
+
+    bool threw = false;
+    try {
+        cam_feeds(doc, json{{"tool_number", 1}, {"material", "unobtanium_xyz"}});
+    } catch (const OpError& oe) {
+        threw = true;
+        CHECK(oe.code == "unknown_material");
+        std::string msg = oe.what();
+        CHECK(msg.find("unobtanium_xyz") != std::string::npos);
+        CHECK(msg.find("aluminum") != std::string::npos);  // lists valid ids
+    }
+    CHECK(threw);
+    cam_close(doc);
+}
+
+#ifdef AICAD_TEST_MACHINES
+TEST_CASE("MachineDB: five built-ins match machines.json (wave 2)") {
+    std::ifstream fh(AICAD_TEST_MACHINES);
+    REQUIRE_MESSAGE(fh.good(), "machines.json not found at AICAD_TEST_MACHINES");
+    json doc = json::parse(fh, nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(doc.is_discarded());
+    REQUIRE(doc.contains("machines"));
+
+    json core = MachineDB::builtin().to_json();
+    REQUIRE(core["machines"].size() >= 5);
+
+    auto by_id = [](const json& arr, const std::string& id) -> const json* {
+        for (const auto& r : arr)
+            if (r.value("id", std::string()) == id) return &r;
+        return nullptr;
+    };
+
+    for (const auto& expect : doc["machines"]) {
+        std::string id = expect["id"].get<std::string>();
+        const json* got = by_id(core["machines"], id);
+        REQUIRE_MESSAGE(got != nullptr, ("missing built-in " + id).c_str());
+        CHECK((*got)["kind"] == expect["kind"]);
+        CHECK((*got)["label"] == expect["label"]);
+        CHECK((*got)["post_dialect"] == expect["post_dialect"]);
+        CHECK((*got)["max_rpm"].get<double>() == doctest::Approx(expect["max_rpm"].get<double>()));
+        CHECK((*got)["min_rpm"].get<double>() == doctest::Approx(expect["min_rpm"].get<double>()));
+        CHECK((*got)["max_feed_mm_min"].get<double>() ==
+              doctest::Approx(expect["max_feed_mm_min"].get<double>()));
+        CHECK((*got)["rapid_xy_mm_min"].get<double>() ==
+              doctest::Approx(expect["rapid_xy_mm_min"].get<double>()));
+        CHECK((*got)["rapid_z_mm_min"].get<double>() ==
+              doctest::Approx(expect["rapid_z_mm_min"].get<double>()));
+        CHECK((*got)["tool_change_s"].get<double>() ==
+              doctest::Approx(expect["tool_change_s"].get<double>()));
+        CHECK((*got)["accel_mm_s2"].get<double>() ==
+              doctest::Approx(expect["accel_mm_s2"].get<double>()));
+        REQUIRE((*got)["travel_mm"].size() == 3);
+        REQUIRE(expect["travel_mm"].size() == 3);
+        for (int i = 0; i < 3; ++i)
+            CHECK((*got)["travel_mm"][i].get<double>() ==
+                  doctest::Approx(expect["travel_mm"][i].get<double>()));
+    }
+}
+#endif

@@ -87,5 +87,34 @@ Feeds compute_feeds(const Machine&, const Tool&, const Operation&,
 // Apply computed feeds back onto an operation in place (fills only unset fields).
 void apply_feeds(Operation&, const Feeds&);
 
+// ──────────────────────────────────────────────────── machine profile DB ──
+// Built-in machine presets (aicad.machines/1) + optional AICAD_MACHINES_REGISTRY
+// override file that merges/replaces by id. Wire Machine fields map to the
+// contract JSON shape via machine_record_json / MachineDB::to_json.
+struct MachineRecord {
+    std::string id;
+    std::string label;
+    Machine machine;
+    std::string post_dialect;
+    std::string notes;
+};
+
+class MachineDB {
+public:
+    MachineDB();                              // loads the five built-in presets
+    void merge(const json& doc);              // aicad.machines/1 {"machines":[...]} by id
+    const Machine* find(const std::string& id) const;
+    const MachineRecord* find_record(const std::string& id) const;
+    std::vector<std::string> machine_ids() const;
+    json to_json() const;                     // {"machines":[contract records…]}
+    static const MachineDB& builtin();
+    static const Machine& fallback();         // benchtop_vmc-style default
+private:
+    std::vector<MachineRecord> machines_;
+};
+
+// Map a MachineRecord (or Machine + metadata) to the aicad.machines/1 wire shape.
+json machine_record_json(const MachineRecord& r);
+
 }  // namespace cam
 }  // namespace aicad

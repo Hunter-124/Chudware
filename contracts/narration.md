@@ -135,8 +135,17 @@ Setup "<name>" [<machine>] — <N> op(s)
 
 G-code digest (source: cam_post): <N> lines, bounds X[<min>..<max>] Y[<min>..<max>]
   Z[<min>..<max>] mm, feed <min>–<max> mm/min, <N> tool change(s), est. time <val>s
-(Source: cam_job_tree, cam_simulate, cam_post — numbers narrated, never recomputed)
+Audit (source: cam_audit): ok|FAILED — <N> error(s), <N> warning(s); bounds
+  X[<min>..<max>] Y[<min>..<max>] Z[<min>..<max>] mm; feed <min>–<max> mm/min;
+  est. <val>s
+(Source: cam_job_tree, cam_simulate, cam_post, cam_audit — numbers narrated, never recomputed)
 ```
+
+The `Audit` line is appended when `describe_toolpaths(audit=True)` (the default) and
+the `cam_audit` RPC is reachable; on bridge error the line reads
+`Audit unavailable: <err>`. All figures come from the `aicad.cam_audit/1` envelope
+(`stats.bounds`, `stats.feed_range_mm_min`, `stats.est_time_s`) — never recomputed
+from G-code text.
 
 ### `describe_results` (FEA/CFD)
 

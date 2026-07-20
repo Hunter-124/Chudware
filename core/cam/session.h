@@ -72,6 +72,13 @@ json cam_materials();             // cutting DB material table
 json cam_tool_types();            // tool type enum + class mapping
 json cam_op_types();              // op type enum + which platforms support each
 
+// Machine profile presets (aicad.machines/1) from MachineDB.
+json cam_machines();
+// cam_feeds {doc_id, setup_id?, tool_number, material?, operation?} -> Feeds::to_json
+json cam_feeds(const std::string& doc_id, const json& params);
+// cam_audit {doc_id, gcode?, dialect?, machine?, setup_id?} -> aicad.cam_audit/1
+json cam_audit(const std::string& doc_id, const json& params);
+
 // cam_save {doc_id, path?} -> {path}. Writes a .cam+ ZIP container.
 json cam_save(const std::string& doc_id, const std::string& path);
 // cam_open {path} -> {doc_id, revision, tree}.

@@ -165,9 +165,19 @@ static bool rewrapInPlace(char* buf, int len, float wrapW) {
 }
 namespace {
 struct ChatInputCb { float wrapW = 0.0f; };
-// Panel-local transparency toggle: show/hide the AI's reasoning ("Thinking") blocks. Session-only
-// (DESIGN §5 "Show thinking" switch, default on); not persisted and deliberately NOT in AppState.
+}  // namespace
+
+// Panel-local transparency toggle: show/hide the AI's reasoning ("Thinking") blocks.
+// Session-only (DESIGN §5 "Show thinking" switch, default on); not persisted.
+namespace {
 bool gShowThinking = true;
+}  // namespace
+
+namespace ui {
+bool& assistantThoughtsVisible() { return gShowThinking; }
+}  // namespace ui
+
+namespace {
 int chatInputEditCallback(ImGuiInputTextCallbackData* data) {
     if (data->EventFlag == ImGuiInputTextFlags_CallbackEdit) {
         auto* cb = static_cast<ChatInputCb*>(data->UserData);
@@ -2060,9 +2070,10 @@ static int countOpsInJsonPrefix(const std::string& s) {
     return -1;
 }
 
-// Finalize a thought/output box: stop streaming. Auto-collapse Thinking (and keep ops JSON
-// collapsed) once unless the user pinned it. Prose Output keeps the user's last expanded state
-// (defaults open while streaming).
+// Finalize a thought/output box: stop streaming. Ops JSON stays collapsed unless
+// the user pinned it. Thinking stays OPEN by default so the user can audit plan/
+// intake reasoning live (only collapses if the user explicitly hid it).
+// Prose Output keeps the user's last expanded state.
 static void finalizeThoughtBox(ActivityItem& a) {
     a.streaming = false;
     if (a.status == "running" || a.status.empty()) a.status = "done";
@@ -2070,7 +2081,12 @@ static void finalizeThoughtBox(ActivityItem& a) {
                        (a.title.find("Building ops") != std::string::npos);
     const bool isProseOut = !isOps && (a.stage == "stream:out" || a.title == "Output");
     if (isProseOut) return;  // leave expanded as-is
-    if (!a.userToggled) a.expanded = false;
+    if (isOps) {
+        if (!a.userToggled) a.expanded = false;
+        return;
+    }
+    // Thinking / plan reasoning — stay open for audit unless user hid it.
+    if (!a.userToggled) a.expanded = true;
 }
 
 // Find or create the single rowKind-10 routing card (always kept at front).
@@ -4612,6 +4628,8 @@ static void drawActionCard(ActivityItem& a, AgentStep* step, const ui::Fonts& fo
     };
     const bool intakeLike = hasWord(a.stage, "intake") || hasWord(a.title, "intake") ||
                             hasWord(a.title, "understanding") || hasWord(a.stage, "understand");
+    const bool planLike = hasWord(a.stage, "plan") || hasWord(a.title, "planning") ||
+                          hasWord(a.title, "planner");
 
     ImGui::Dummy(ImVec2(0, 2 * sc));
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
@@ -4675,7 +4693,9 @@ static void drawActionCard(ActivityItem& a, AgentStep* step, const ui::Fonts& fo
             }
         } catch (...) {}
     }
-    const bool forceOpen = (running || turnRunning) && intakeLike && !a.userToggled;
+    // Intake + plan stages stay open while the turn runs so the user can audit
+    // live model thoughts (same transparency as tool/thought boxes).
+    const bool forceOpen = (running || turnRunning) && (intakeLike || planLike) && !a.userToggled;
     if (forceOpen) a.expanded = true;
     const bool open = a.expanded || forceOpen;
     const bool hasDrawer = (step && (!step->thinking.empty() || !step->code.empty() ||
@@ -4686,7 +4706,7 @@ static void drawActionCard(ActivityItem& a, AgentStep* step, const ui::Fonts& fo
         if (ImGui::IsItemClicked()) { a.expanded = !open; a.userToggled = true; }
         ImGui::SameLine(0, 6 * sc);
         ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-        ImGui::TextUnformatted(open ? "(hide)" : "(details)");
+        ImGui::TextUnformatted(open ? "(hide)" : (planLike || intakeLike ? "(show thinking)" : "(details)"));
         ImGui::PopStyleColor();
         if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
         if (ImGui::IsItemClicked()) { a.expanded = !open; a.userToggled = true; }
@@ -5389,12 +5409,13 @@ static void drawClassificationCard(ActivityItem& a, const ui::Fonts& fonts,
     }
     if (!a.reason.empty()) dimText(a.reason.c_str());
 
+    // Alts toggle on its OWN row (never SameLine after a wrapped reason — that
+    // jammed "(hide alts)" into the reason line and broke the card layout).
     const bool forceOpen = turnRunning && !a.userToggled;
     if (forceOpen) a.expanded = true;
     const bool open = a.expanded || forceOpen;
-    ImGui::SameLine(0, 8 * sc);
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
-    ImGui::TextUnformatted(open ? "(hide alts)" : "(alts)");
+    ImGui::TextUnformatted(open ? "(hide alts)" : "(show alts)");
     ImGui::PopStyleColor();
     if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
     if (ImGui::IsItemClicked()) { a.expanded = !open; a.userToggled = true; }
@@ -9679,7 +9700,7 @@ bool drawProviderModelPicker(AppState& st, bool busy, bool slim) {
 }
 
 // Quick-settings helpers + overlay body (Copilot gear). Full providers/roles/prompts live in Settings.
-static int ovLoadMaxSubagentDepth() {
+int loadMaxSubagentDepth() {
     // agent.max_subagent_depth — nesting levels of subagent-spawning-subagent
     // (not concurrency). Root chat = depth 0. Default 2, GUI clamp 0-4.
     // Enforced by AgentCoord (delegation.py / mission_dispatch.py).
@@ -9702,7 +9723,7 @@ static int ovLoadMaxSubagentDepth() {
     if (depth > 4) depth = 4;
     return depth;
 }
-static void ovSaveMaxSubagentDepth(int depth) {
+void saveMaxSubagentDepth(int depth) {
     if (depth < 0) depth = 0;
     if (depth > 4) depth = 4;
     try {
@@ -9789,7 +9810,7 @@ static void drawAISettingsBody(AppState& st, bool busy) {
         }
 
         static int s_maxDepth = -1;
-        if (s_maxDepth < 0) s_maxDepth = ovLoadMaxSubagentDepth();
+        if (s_maxDepth < 0) s_maxDepth = loadMaxSubagentDepth();
         ImGui::TextUnformatted("Max subagent nesting");
         ImGui::SetNextItemWidth(-1);
         int depth = s_maxDepth;
@@ -9797,7 +9818,7 @@ static void drawAISettingsBody(AppState& st, bool busy) {
             if (depth < 0) depth = 0;
             if (depth > 4) depth = 4;
             s_maxDepth = depth;
-            ovSaveMaxSubagentDepth(depth);
+            saveMaxSubagentDepth(depth);
         }
 
         ImGui::Dummy(ImVec2(0, ui::metrics::U(0.75f)));
@@ -12111,7 +12132,9 @@ static void requestStopRun(AppState& st) {
     // behind the worker mutex / daemon socket (callAgentCancel bypasses callMtx_ / uses a
     // side socket) — and never create a thread per click (WASM pthread-pool exhaustion
     // blocked thread creation on the main thread = frozen page).
-    if (!runId.empty() && st.workerStarted) {
+    // Empty run_id still dispatches: core agent_cancel with empty id cancels ALL live runs
+    // (covers Stop before run_started lands, which previously left hostd 1 in-flight).
+    if (st.workerStarted && (st.job.running.load() || st.agentV2Running || !runId.empty())) {
         try {
             agentControlDispatch(st, runId, /*steer=*/"");
         } catch (...) {

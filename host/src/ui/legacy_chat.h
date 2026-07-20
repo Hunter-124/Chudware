@@ -48,6 +48,14 @@ bool providerUsable(AppState& state, int provider);
 bool cloudCompatKeyPresent(AppState& state);
 bool moonshotKeyPresent(AppState& state);
 
+// Session-local "Show assistant thoughts" toggle (Copilot quick settings + Settings).
+// Not persisted — lives for the process only.
+bool& assistantThoughtsVisible();
+
+// agent.max_subagent_depth in config.json (0–4). Shared by quick settings + Harness.
+int  loadMaxSubagentDepth();
+void saveMaxSubagentDepth(int depth);
+
 // Persist the active document's conversations (the active one synced from state.chat) to
 // %APPDATA%/AI-CAD/chat_history.json. Safe to call any time; no-op if nothing to save.
 void persistChatHistory(AppState& state);

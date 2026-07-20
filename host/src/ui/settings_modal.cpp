@@ -1905,9 +1905,9 @@ static const HarnessModeInfo kHarnessModes[] = {
 static constexpr int kHarnessModeCount =
     (int)(sizeof(kHarnessModes) / sizeof(kHarnessModes[0]));
 
-// Settings → AI: compact harness-organization mode list (read-only; mode is chosen
-// in the composer). Mode descriptions live in the intro (?) tooltip.
+// Settings → AI → Harness: mode grid + full quick-settings mirror (session knobs).
 static void drawHarnessOrganizationSection(AppState& st, float sc);
+static void drawHarnessSessionKnobs(AppState& st, float sc);
 
 // ---- Eng. Firm model assignments (config.json eng_firm.models) ----------------
 // Top-level roles + 8 disciplines. Auto = omit entry (ambient chat model). Merge-overlay
@@ -2177,29 +2177,196 @@ static void drawEngFirmModelAssignments(AppState& st, float sc) {
 }
 
 static void drawHarnessOrganizationSection(AppState& st, float sc) {
-    (void)sc;
+    // Two-column mode chips: active mode accented, others secondary. Saves vertical
+    // space vs the old 6-line stack (screenshot ask).
     dimText("Composer mode picks the org structure. Switch mode from the copilot composer.");
     int active = st.settings.copilotMode;
     if (active < 0 || active >= kHarnessModeCount) active = 0;
 
     ImGui::Dummy(ImVec2(0, 4.0f * sc));
-    // One plain line per mode — ASCII only so icon fonts never steal the label glyphs.
-    for (int i = 0; i < kHarnessModeCount; ++i) {
-        const auto& m = kHarnessModes[i];
-        char line[256];
-        if (i == active) {
-            std::snprintf(line, sizeof(line), "%s  -  %s  (active)", m.label, m.structure);
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                ImVec4(ui::palette.accent[0], ui::palette.accent[1],
-                       ui::palette.accent[2], 1.0f));
-            ImGui::TextUnformatted(line);
-            ImGui::PopStyleColor();
-        } else {
-            std::snprintf(line, sizeof(line), "%s  -  %s", m.label, m.structure);
-            ImGui::TextUnformatted(line);
+    if (ImGui::BeginTable("##harness_modes", 2,
+                          ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_NoPadOuterX)) {
+        for (int i = 0; i < kHarnessModeCount; ++i) {
+            const auto& m = kHarnessModes[i];
+            ImGui::TableNextColumn();
+            char line[192];
+            std::snprintf(line, sizeof(line), "%s  \xc2\xb7  %s%s",
+                          m.label, m.structure, (i == active) ? "  (active)" : "");
+            if (i == active) {
+                ImGui::PushStyleColor(ImGuiCol_Text,
+                    ImVec4(ui::palette.accent[0], ui::palette.accent[1],
+                           ui::palette.accent[2], 1.0f));
+                ImGui::TextUnformatted(line);
+                ImGui::PopStyleColor();
+            } else {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+                ImGui::TextUnformatted(line);
+                ImGui::PopStyleColor();
+            }
+            if (ImGui::IsItemHovered() && m.description && m.description[0])
+                ImGui::SetTooltip("%s", m.description);
         }
-        if (ImGui::IsItemHovered() && m.description && m.description[0])
-            ImGui::SetTooltip("%s", m.description);
+        ImGui::EndTable();
+    }
+}
+
+// Settings → AI → Harness: full mirror of copilot Quick settings + extras that
+// only live in the modal (role adoption, company auto-route, Eng. Firm budget,
+// privacy). Laid out in a 2-column grid to save vertical space.
+static void drawHarnessSessionKnobs(AppState& st, float sc) {
+    Settings& settings = st.settings;
+    static const char* kPrefLabels[] = {"Off", "Option", "Encourage", "Require"};
+
+    auto prefCombo = [&](const char* label, const char* id, int* pref, const char* help) {
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(label);
+        if (help && help[0]) {
+            ImGui::SameLine();
+            helpMarker(help);
+        }
+        ImGui::SetNextItemWidth(-1.0f);
+        int v = (*pref < 0 || *pref > 3) ? 0 : *pref;
+        if (ImGui::Combo(id, &v, kPrefLabels, 4)) {
+            *pref = v;
+            if (pref == &settings.planPreference)
+                settings.planMode = (v != 0);
+        }
+    };
+
+    // ---- Preferences (3 combos) + flags in a 2-col grid ----
+    if (ImGui::BeginTable("##harness_prefs", 2,
+                          ImGuiTableFlags_SizingStretchSame |
+                          ImGuiTableFlags_NoPadOuterX)) {
+        ImGui::TableNextColumn();
+        prefCombo("Plan preference", "##h_plan_pref", &settings.planPreference,
+                  "Off = never plan first. Option = model may plan. "
+                  "Encourage = plan by default (recommended). "
+                  "Require = always draft a plan before building.");
+        ImGui::TableNextColumn();
+        prefCombo("Subagent preference", "##h_sub_pref", &settings.subagentPreference,
+                  "How freely the main agent may spawn subagents. "
+                  "Off disables nesting; Require pushes multi-agent splits.");
+        ImGui::TableNextColumn();
+        prefCombo("Advisor preference", "##h_adv_pref", &settings.advisorPreference,
+                  "Off = no advisor. Option = only when the model asks. "
+                  "Encourage = stronger guidance tone when proactive fires. "
+                  "Require = more frequent checks when proactive is on.");
+        ImGui::TableNextColumn();
+        {
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted("Role adoption");
+            ImGui::SameLine();
+            helpMarker(
+                "Supervised (default): only the main session may adopt_role "
+                "(switch tools+prompt). Subagents may still delegate() children "
+                "with other roles, but must request_role_change to adopt themselves. "
+                "Free: subagents may adopt_role too.");
+            ImGui::SetNextItemWidth(-1.0f);
+            int ra = (settings.roleAdoption != 0) ? 1 : 0;
+            const char* kAdopt[] = {"Supervised", "Free"};
+            if (ImGui::Combo("##h_role_adopt", &ra, kAdopt, 2))
+                settings.roleAdoption = ra;
+        }
+        ImGui::EndTable();
+    }
+
+    ImGui::Dummy(ImVec2(0, 6.0f * sc));
+
+    // ---- Checkboxes in 2 columns (mirrors quick-settings flags) ----
+    if (ImGui::BeginTable("##harness_flags", 2,
+                          ImGuiTableFlags_SizingStretchSame |
+                          ImGuiTableFlags_NoPadOuterX)) {
+        ImGui::TableNextColumn();
+        ImGui::Checkbox("Proactive advisor", &settings.proactiveAdvisor);
+        helpMarker("Opt-in mid-run guidance on failure streaks and thrash. "
+                   "Cheap deterministic notes by default; at most one short "
+                   "advisor-model call on severe streaks (encourage/require). "
+                   "Off = no proactive injects (pull request_advice still works).");
+        ImGui::TableNextColumn();
+        ImGui::Checkbox("Company structure auto-route", &settings.corporateMode);
+        helpMarker("When on, complex cross-discipline requests may route as "
+                   "company (director + departments). Default off — Agent will "
+                   "not auto-invoke company; use Swarm / Eng. Firm modes or "
+                   "turn this on when ready.");
+
+        ImGui::TableNextColumn();
+        ImGui::Checkbox("Vision (send screenshots)", &settings.vision);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Attach viewport screenshots so the model can see the part.");
+        ImGui::TableNextColumn();
+        ImGui::Checkbox("Offline mode (local only)", &settings.offlineMode);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Refuses any cloud provider. Only a local loopback endpoint is allowed.");
+
+        ImGui::TableNextColumn();
+        ImGui::Checkbox("Show assistant thoughts", &ui::assistantThoughtsVisible());
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Show the AI's reasoning steps inline in the conversation.");
+        ImGui::TableNextColumn();
+        ImGui::Checkbox("Project memory (per-folder)", &settings.memoryEnabled);
+        helpMarker("Remembers decisions and notes under the PLM project "
+                   "(.plm/memory.db). Auto-created; recall is token-budgeted.");
+        ImGui::EndTable();
+    }
+
+    ImGui::Dummy(ImVec2(0, 6.0f * sc));
+
+    // ---- Sliders / budgets in 2 columns ----
+    if (ImGui::BeginTable("##harness_sliders", 2,
+                          ImGuiTableFlags_SizingStretchSame |
+                          ImGuiTableFlags_NoPadOuterX)) {
+        ImGui::TableNextColumn();
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("Refine-pass cap");
+        ImGui::SameLine();
+        helpMarker("0 = automatic (stops once the render matches).");
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::SliderInt("##h_miters", &settings.maxIters, 0, 64,
+                         settings.maxIters == 0 ? "automatic" : "%d passes");
+
+        ImGui::TableNextColumn();
+        {
+            static int s_maxDepth = -1;
+            if (s_maxDepth < 0) s_maxDepth = ui::loadMaxSubagentDepth();
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted("Max subagent nesting");
+            ImGui::SameLine();
+            helpMarker("Nesting levels of subagent-spawning-subagent (not concurrency). "
+                       "Root chat = depth 0. Saved to config.json agent.max_subagent_depth.");
+            ImGui::SetNextItemWidth(-1.0f);
+            int depth = s_maxDepth;
+            if (ImGui::SliderInt("##h_depth", &depth, 0, 4, "%d")) {
+                if (depth < 0) depth = 0;
+                if (depth > 4) depth = 4;
+                s_maxDepth = depth;
+                ui::saveMaxSubagentDepth(depth);
+            }
+        }
+
+        ImGui::TableNextColumn();
+        if (settings.memoryEnabled) {
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted("Memory token budget");
+            ImGui::SetNextItemWidth(-1.0f);
+            ImGui::SliderInt("##h_membudget", &settings.memoryTokenBudget, 100, 2000,
+                             "%d tokens");
+        } else {
+            ImGui::Dummy(ImVec2(1, ImGui::GetFrameHeight()));
+        }
+
+        ImGui::TableNextColumn();
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("Eng. Firm budget (USD)");
+        ImGui::SameLine();
+        helpMarker("Used when the composer is in Eng. Firm mode.");
+        ImGui::SetNextItemWidth(-1.0f);
+        double b = settings.companyBudgetUsd;
+        if (ImGui::InputDouble("##h_engfirmbudget", &b, 5.0, 25.0, "$%.2f")) {
+            if (b < 0.0) b = 0.0;
+            settings.companyBudgetUsd = b;
+        }
+        ImGui::EndTable();
     }
 }
 
@@ -3166,8 +3333,8 @@ const SettingsEntry kSettingsEntries[] = {
     { "C++ core",                 "General",      1 },
     { "Performance profiler",     "General",      1 },
     { "Profiler",                 "General",      1 },
-    // AI (tab 2) — roles, harness, privacy, maintenance (no provider/accounts)
-    { "Behavior",                 "AI",           2 },
+    // AI (tab 2) — harness (session knobs), roles, tools+maintenance
+    { "Session knobs",            "AI",           2 },
     { "Harness",                  "AI",           2 },
     { "Tools",                    "AI",           2 },
     { "Tool families",            "AI",           2 },
@@ -3236,6 +3403,7 @@ const SettingsEntry kSettingsEntries[] = {
     { "Company budget",           "AI",           2 },
     { "Run behavior",             "AI",           2 },
     { "Maintenance",              "AI",           2 },
+    { "Max subagent nesting",     "AI",           2 },
     // Experimental (tab 6 — Agent tab removed)
     { "Vision review model",      "Experimental",  4 },
     { "Model routing",            "Experimental",  4 },
@@ -3697,9 +3865,9 @@ void drawSettingsModal(AppState& st, bool busy) {
                                     (jumpToTab == 2 || jumpToPrompts) ? ImGuiTabItemFlags_SetSelected
                                                                      : ImGuiTabItemFlags_None)) {
                 settingsTabBodyBegin("##tab_ai");
-                if (jumpToPrompts && s_aiSubJump < 0) s_aiSubJump = 3;  // Prompts sub-tab
-                if (jumpToTab == 4 && s_aiSubJump < 0) s_aiSubJump = 5;
-                if (jumpToTab == 5 && s_aiSubJump < 0) s_aiSubJump = 2;
+                if (jumpToPrompts && s_aiSubJump < 0) s_aiSubJump = 2;  // Prompts sub-tab
+                if (jumpToTab == 4 && s_aiSubJump < 0) s_aiSubJump = 5;  // Benchmarks
+                if (jumpToTab == 5 && s_aiSubJump < 0) s_aiSubJump = 2;  // Prompts (legacy)
 
                 if (ImGui::BeginTabBar("##ai_sub", ImGuiTabBarFlags_FittingPolicyScroll)) {
                     auto subFlags = [](int idx) {
@@ -3707,112 +3875,29 @@ void drawSettingsModal(AppState& st, bool busy) {
                                                     : ImGuiTabItemFlags_None;
                     };
 
-                    if (ImGui::BeginTabItem("Behavior", nullptr, subFlags(0))) {
-settingsGlassSectionBegin("##ai_run_behavior", "Run behavior");
-                {
-                    static const char* kPrefLabels[] = {"Off", "Option", "Encourage", "Require"};
-                    auto prefCombo = [&](const char* label, const char* id, int* pref,
-                                         const char* help) {
-                        ImGui::AlignTextToFramePadding();
-                        ImGui::TextUnformatted(label);
-                        if (help && help[0]) {
-                            ImGui::SameLine();
-                            helpMarker(help);
-                        }
-                        ImGui::SameLine(200.0f * sc);
-                        ImGui::SetNextItemWidth(160.0f * sc);
-                        int v = (*pref < 0 || *pref > 3) ? 0 : *pref;
-                        if (ImGui::Combo(id, &v, kPrefLabels, 4)) {
-                            *pref = v;
-                            if (pref == &settings.planPreference)
-                                settings.planMode = (v != 0);
-                        }
-                    };
-                    prefCombo("Plan preference", "##plan_pref", &settings.planPreference,
-                              "Off = never plan first. Option = model may plan. "
-                              "Encourage = plan by default (recommended). "
-                              "Require = always draft a plan before building.");
-                    prefCombo("Subagent preference", "##sub_pref", &settings.subagentPreference,
-                              "How freely the main agent may spawn subagents. "
-                              "Off disables nesting; Require pushes multi-agent splits.");
-                    {
-                        ImGui::AlignTextToFramePadding();
-                        ImGui::TextUnformatted("Role adoption");
-                        ImGui::SameLine();
-                        helpMarker(
-                            "Supervised (default): only the main session may adopt_role "
-                            "(switch tools+prompt). Subagents may still delegate() children "
-                            "with other roles, but must request_role_change to adopt themselves. "
-                            "Free: subagents may adopt_role too.");
-                        ImGui::SameLine(200.0f * sc);
-                        ImGui::SetNextItemWidth(160.0f * sc);
-                        int ra = (settings.roleAdoption != 0) ? 1 : 0;
-                        const char* kAdopt[] = {"Supervised", "Free"};
-                        if (ImGui::Combo("##role_adopt", &ra, kAdopt, 2))
-                            settings.roleAdoption = ra;
-                    }
-                    prefCombo("Advisor preference", "##adv_pref", &settings.advisorPreference,
-                              "Off = no advisor. Option = only when the model asks. "
-                              "Encourage = stronger guidance tone when proactive fires. "
-                              "Require = more frequent checks when proactive is on.");
-                    ImGui::Checkbox("Proactive advisor", &settings.proactiveAdvisor);
-                    helpMarker("Opt-in mid-run guidance on failure streaks and thrash. "
-                               "Cheap deterministic notes by default; at most one short "
-                               "advisor-model call on severe streaks (encourage/require). "
-                               "Off = no proactive injects (pull request_advice still works).");
-                    ImGui::Checkbox("Company structure auto-route", &settings.corporateMode);
-                    helpMarker("When on, complex cross-discipline requests may route as "
-                               "company (director + departments). Default off — Agent will "
-                               "not auto-invoke company; use Swarm / Eng. Firm modes or "
-                               "turn this on when ready.");
-                    ImGui::Dummy(ImVec2(0, 4.0f * sc));
-                    ImGui::Checkbox("Project memory (per-folder)", &settings.memoryEnabled);
-                    helpMarker("Remembers decisions and notes under the PLM project "
-                               "(.plm/memory.db). Auto-created; recall is token-budgeted.");
-                    if (settings.memoryEnabled) {
-                        ImGui::AlignTextToFramePadding();
-                        ImGui::TextUnformatted("Memory token budget");
-                        ImGui::SameLine(200.0f * sc);
-                        ImGui::SetNextItemWidth(160.0f * sc);
-                        ImGui::SliderInt("##mem_budget", &settings.memoryTokenBudget, 100, 2000,
-                                         "%d tokens");
-                    }
-                    ImGui::Dummy(ImVec2(0, 6.0f * sc));
-                    ImGui::AlignTextToFramePadding();
-                    ImGui::TextUnformatted("Refine-pass cap per request");
-                    ImGui::SameLine(200.0f * sc);
-                    ImGui::SetNextItemWidth(160.0f * sc);
-                    ImGui::SliderInt("##miters", &settings.maxIters, 0, 64,
-                                     settings.maxIters == 0 ? "automatic" : "%d passes");
-                    dimText("0 = automatic (stops once the render matches)");
-                    ImGui::Dummy(ImVec2(0, 4.0f * sc));
-                    dimText("Eng. Firm budget (USD) — used when the composer is in Eng. Firm mode.");
-                    ImGui::AlignTextToFramePadding();
-                    ImGui::TextUnformatted("Budget (USD)");
-                    ImGui::SameLine(200.0f * sc);
-                    ImGui::SetNextItemWidth(160.0f * sc);
-                    double b = settings.companyBudgetUsd;
-                    if (ImGui::InputDouble("##engfirmbudget", &b, 5.0, 25.0, "$%.2f")) {
-                        if (b < 0.0) b = 0.0;
-                        settings.companyBudgetUsd = b;
-                    }
-                }
-                settingsGlassSectionEnd();
-settingsGlassSectionBegin("##ai_privacy", "Privacy");
-                ui::drawAiSettingsSection(st, busy, ui::AiSettingsSection::Privacy);
-                settingsGlassSectionEnd();
-                        ImGui::EndTabItem();
-                    }
+                    // Harness is first: full quick-settings mirror + mode grid.
+                    // (Behavior was absorbed here so knobs aren't duplicated.)
+                    if (ImGui::BeginTabItem("Harness", nullptr, subFlags(0))) {
+                        settingsGlassSectionBegin("##ai_harness_org", "Harness organization");
+                        drawHarnessOrganizationSection(st, sc);
+                        settingsGlassSectionEnd();
 
-                    if (ImGui::BeginTabItem("Harness", nullptr, subFlags(1))) {
-settingsGlassSectionBegin("##ai_harness_org", "Harness organization");
-                drawHarnessOrganizationSection(st, sc);
-                settingsGlassSectionEnd();
+                        settingsGlassSectionBegin("##ai_harness_session", "Session knobs");
+                        dimText("Same knobs as Copilot \xe2\x86\x92 Quick settings, plus modal-only "
+                                "options (role adoption, company auto-route, Eng. Firm budget).");
+                        ImGui::Dummy(ImVec2(0, 4.0f * sc));
+                        drawHarnessSessionKnobs(st, sc);
+                        settingsGlassSectionEnd();
+
+                        settingsGlassSectionBegin("##ai_privacy", "Privacy");
+                        ui::drawAiSettingsSection(st, busy, ui::AiSettingsSection::Privacy);
+                        settingsGlassSectionEnd();
                         ImGui::EndTabItem();
                     }
 
 
-                    if (ImGui::BeginTabItem("Roles", nullptr, subFlags(2))) {
+
+                    if (ImGui::BeginTabItem("Roles", nullptr, subFlags(1))) {
                         // Model pickers first (compact table).
                         settingsGlassSectionBegin("##ai_model_roles", "Model roles");
                 drawModelRolesSection(st, sc);
@@ -3833,7 +3918,7 @@ settingsGlassSectionBegin("##ai_harness_org", "Harness organization");
                         ImGui::EndTabItem();
                     }
 
-                    if (ImGui::BeginTabItem("Prompts", nullptr, subFlags(3))) {
+                    if (ImGui::BeginTabItem("Prompts", nullptr, subFlags(2))) {
                         // Full-height role prompt editor for power users / dev refinement.
                         bool canFetch = st.workerStarted && !busy;
                         if (!s_promptsLoaded && canFetch) loadPrompts(st);
@@ -4000,20 +4085,20 @@ settingsGlassSectionBegin("##ai_harness_org", "Harness organization");
                     }
 
 
-                    if (ImGui::BeginTabItem("Skills", nullptr, subFlags(4))) {
+                    if (ImGui::BeginTabItem("Skills", nullptr, subFlags(3))) {
                         // Fill-height editors: pin parent scroll so only the catalog/editor scroll.
                         ImGui::SetScrollY(0.0f);
                         drawSettingsSkillsTab(st, sc);
                         ImGui::EndTabItem();
                     }
 
-                    if (ImGui::BeginTabItem("Context", nullptr, subFlags(5))) {
+                    if (ImGui::BeginTabItem("Context", nullptr, subFlags(4))) {
                         ImGui::SetScrollY(0.0f);
                         drawSettingsContextTab(st, sc);
                         ImGui::EndTabItem();
                     }
 
-                    if (ImGui::BeginTabItem("Benchmarks", nullptr, subFlags(6))) {
+                    if (ImGui::BeginTabItem("Benchmarks", nullptr, subFlags(5))) {
                 // Shared leaderboard board (refreshed by runner / refresh button).
                 static ui::leaderboard::Board s_lb;
                 static bool s_lbLoaded = false;
@@ -4048,7 +4133,7 @@ settingsGlassSectionBegin("##ai_harness_org", "Harness organization");
                                         ImGui::EndTabItem();
                     }
 
-                    if (ImGui::BeginTabItem("Tools", nullptr, subFlags(7))) {
+                    if (ImGui::BeginTabItem("Tools", nullptr, subFlags(6))) {
 
                         settingsGlassSectionBegin("##ai_tools_families", "Tool families");
                         dimText("Enable or disable MCP tool families the agent may call. "
@@ -4128,31 +4213,30 @@ settingsGlassSectionBegin("##ai_harness_org", "Harness organization");
                             }
                         }
                         settingsGlassSectionEnd();
-                        ImGui::EndTabItem();
-                    }
 
-                    if (ImGui::BeginTabItem("Maintenance", nullptr, subFlags(8))) {
-settingsGlassSectionBegin("##ai_maintenance", "Maintenance");
-                dimText("Repair the local CAD engine runtime, or trim which models appear in the "
-                        "composer's model picker.");
-                {
-                    const bool canSetup = !st.setupRunning.load() && !st.job.running.load();
-                    if (!canSetup) ImGui::BeginDisabled();
-                    if (ImGui::Button("Repair / install runtime", ImVec2(220.0f * sc, 0)))
-                        st.startSetup(true);
-                    if (!canSetup) ImGui::EndDisabled();
-                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                        ImGui::SetTooltip("Rebuild the local Python/CAD runtime (same as "
-                                          "Chudware \xe2\x86\x92 Repair / install runtime).");
-                    if (st.setupRunning.load()) {
-                        ImGui::SameLine();
-                        dimText("Running\xe2\x80\xa6");
-                    }
-                }
-                ImGui::Dummy(ImVec2(0, 4 * sc));
-                if (ImGui::CollapsingHeader("Manage models (chat picker)"))
-                    ui::drawAiSettingsSection(st, busy, ui::AiSettingsSection::ManageModels);
-                settingsGlassSectionEnd();
+                        ImGui::Dummy(ImVec2(0, 10.0f * sc));
+                        settingsGlassSectionBegin("##ai_maintenance", "Maintenance");
+                        dimText("Repair the local CAD engine runtime, or trim which models appear "
+                                "in the composer's model picker.");
+                        {
+                            const bool canSetup = !st.setupRunning.load() && !st.job.running.load();
+                            if (!canSetup) ImGui::BeginDisabled();
+                            if (ImGui::Button("Repair / install runtime", ImVec2(220.0f * sc, 0)))
+                                st.startSetup(true);
+                            if (!canSetup) ImGui::EndDisabled();
+                            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                                ImGui::SetTooltip(
+                                    "Rebuild the local Python/CAD runtime (same as "
+                                    "Chudware \xe2\x86\x92 Repair / install runtime).");
+                            if (st.setupRunning.load()) {
+                                ImGui::SameLine();
+                                dimText("Running\xe2\x80\xa6");
+                            }
+                        }
+                        ImGui::Dummy(ImVec2(0, 4 * sc));
+                        if (ImGui::CollapsingHeader("Manage models (chat picker)"))
+                            ui::drawAiSettingsSection(st, busy, ui::AiSettingsSection::ManageModels);
+                        settingsGlassSectionEnd();
                         ImGui::EndTabItem();
                     }
 
@@ -4215,8 +4299,8 @@ settingsGlassSectionBegin("##ai_maintenance", "Maintenance");
             // Legacy: Agent(6)/Prompts(5)/Benchmarks(4) → AI(2). Experimental is tab 4.
             if (wantSettingsSel && jumpToTab < 0) jumpToTab = 2;
             if (jumpToTab == 4 || jumpToTab == 5 || jumpToTab == 6) {
-                if (jumpToTab == 4) s_aiSubJump = 6;  // Benchmarks
-                if (jumpToTab == 5) s_aiSubJump = 3;  // Prompts
+                if (jumpToTab == 4) s_aiSubJump = 5;  // Benchmarks (after Behavior fold)
+                if (jumpToTab == 5) s_aiSubJump = 2;  // Prompts
                 jumpToTab = 2;
             }
             if (jumpToTab == 7) jumpToTab = 4;

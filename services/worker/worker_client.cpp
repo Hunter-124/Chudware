@@ -517,6 +517,16 @@ void WorkerClient::stop() {
     running_ = false;
 }
 
+void WorkerClient::abortPending() {
+    abort_.store(true);
+    // Wake a blocked daemon agent_run so AsyncRpc::shutdown / app quit cannot hang
+    // on a multi-minute modeling call. In-proc path still relies on agent_cancel
+    // (libaicad cooperative flag) which requestStopRun already fired.
+    if (engine::daemonMode()) {
+        if (auto* c = engine::client()) c->abortPending();
+    }
+}
+
 bool WorkerClient::readLine(std::string& line, int timeoutMs) {
 #ifdef __EMSCRIPTEN__
     (void)line; (void)timeoutMs;

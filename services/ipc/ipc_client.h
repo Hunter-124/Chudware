@@ -43,6 +43,14 @@ public:
 
     bool connected() const { return conn_.valid() && !conn_.eof(); }
     void disconnect() { conn_.close(); }
+    // Teardown abort: flip a flag the in-flight readResponse loop polls, then
+    // close the socket so a blocked agent_run wakes immediately (EOF) instead of
+    // hanging app quit until the multi-minute run finishes. One-way; next call()
+    // reconnects. Safe from any thread.
+    void abortPending() {
+        abort_.store(true, std::memory_order_release);
+        conn_.close();
+    }
 
     // The hello response: {proto, abi, engine_path, git_rev, daemon_pid, state, id_remap}.
     const nlohmann::json& serverInfo() const { return serverInfo_; }
@@ -126,6 +134,7 @@ private:
     std::string userId_;                 // saved with clientKind_ for reconnect hello
     std::string userDisplay_;
     int nextId_ = 1;
+    std::atomic<bool> abort_{false};     // set by abortPending(); readResponse returns fast
     std::atomic<uint64_t> reconnectGen_{0};  // bumped by reconnectLocked (see accessor)
 };
 

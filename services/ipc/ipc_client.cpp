@@ -107,7 +107,12 @@ using nlohmann::json;
 
 bool EngineClient::tryConnect(std::string& err) {
     conn_ = connectTo(sockPath_, err);
-    return conn_.valid();
+    if (conn_.valid()) {
+        // Fresh socket after abortPending() — allow subsequent call()s again.
+        abort_.store(false, std::memory_order_release);
+        return true;
+    }
+    return false;
 }
 
 bool EngineClient::hello(const std::string& kind, std::string& err) {
@@ -214,12 +219,20 @@ bool EngineClient::readResponse(int id, json& out, std::string& err, int timeout
                           std::chrono::milliseconds(timeoutMs >= 0 ? timeoutMs : 0);
     std::string line;
     for (;;) {
+        if (abort_.load(std::memory_order_acquire)) {
+            err = "aborted";
+            conn_.close();
+            return false;
+        }
         int wait = -1;
         if (timeoutMs >= 0) {
             const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
                                   deadline - std::chrono::steady_clock::now())
                                   .count();
             wait = left > 0 ? (int)left : 0;
+        } else {
+            // Infinite timeout: still wake periodically so abortPending is observed.
+            wait = 200;
         }
         if (!conn_.readLine(line, wait)) {
             if (!conn_.eof() && timeoutMs >= 0) {

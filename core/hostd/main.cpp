@@ -59,7 +59,24 @@
 static hostd::Server* g_server = nullptr;
 
 static void trayQuitThunk(void*) {
-    if (g_server) g_server->stop();
+    // When systemd supervises us (billet-hostd.service Restart=always), a bare
+    // process exit is respawned in ~2s — the tray "Quit hostd" bounce users hit.
+    // systemctl --user stop is a manual stop and stays down. Detect via
+    // INVOCATION_ID (set by systemd for every unit invocation).
+#ifndef _WIN32
+    if (const char* inv = std::getenv("INVOCATION_ID"); inv && inv[0]) {
+        // Best-effort: stop by unit name. If the unit is unknown, fall through
+        // to in-process stop so a hand-launched hostd still quits.
+        const int rc = std::system("systemctl --user stop billet-hostd.service >/dev/null 2>&1");
+        if (rc == 0) return;
+        // Also try the short name / path-derived forms used by install_webd.
+        if (std::system("systemctl --user stop billet-hostd >/dev/null 2>&1") == 0) return;
+    }
+#endif
+    if (g_server) {
+        g_server->status().draining = true;  // refuse new accepts while we wind down
+        g_server->stop();
+    }
 }
 
 // Map server status → tray tint + tooltip. Called from a lightweight ticker

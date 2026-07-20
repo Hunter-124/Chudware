@@ -54,7 +54,8 @@ public:
     // C39: one-way teardown abort — makes a blocked (and any future) call() fail fast with
     // err "aborted" instead of running out its timeout. Set at app exit (AsyncRpc::shutdown)
     // so a long in-flight RPC can't hang the close. The errorSink is NOT fired for aborts.
-    void abortPending() { abort_.store(true); }
+    // Also aborts the daemon EngineClient socket so agent_run_v2 mid-flight does not pin quit.
+    void abortPending();
 
 private:
     // Real call() body; the public call() wraps it with the T-G9 parity trace (env

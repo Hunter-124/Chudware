@@ -27,6 +27,8 @@ freely but must not edit them. One owner per round per append-only file (see
 - `sim_handoff.md` — cross-sim handoff & verify envelopes (`aicad.simhandoff/1`): study
   provenance refs, handoff (geometry + BCs/loads with units + provenance) and verify
   (quantity/tolerance/verdict) shapes; executable form `services/mcp/simhandoff.py`.
+- `cam.md` — CAM simulation frames, G-code audit, machine profiles, job diff
+  (`aicad.cam_sim_frames/1`, `aicad.cam_audit/1`, `aicad.machines/1`, `aicad.cam_job_diff/1`).
 
 ## Agent-layer contracts (Pillar 20 / design pipeline)
 

@@ -1,7 +1,7 @@
 # core/cam — CAM (toolpath, post-processor, stock simulator)
 
 Scope: core/cam/**, core/api/libaicad.cpp (C ABI for cam_* RPCs), core/tests/test_cam.cpp
-Contracts: None yet (cam_new/cam_apply_ops/cam_generate/cam_post/etc live directly in session.h as the de facto RPC contract)
+Contracts: `contracts/cam.md` — aicad.cam_sim_frames/1, aicad.cam_audit/1, aicad.machines/1, aicad.cam_job_diff/1 (cam_new/cam_apply_ops/cam_generate/cam_post/etc live directly in session.h as the de facto RPC contract)
 
 ## Entry points
 - core/cam/session.h:33-61 `cam_new` / `cam_apply_ops` / `cam_generate` / `cam_simulate` / `cam_post` — the stateful CAM job RPC surface (mirrored to ecad parity)

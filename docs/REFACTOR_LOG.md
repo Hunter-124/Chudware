@@ -1937,3 +1937,36 @@ dual. **Verify:** host build green; AI_CAD_SHOT=sketch complete; earcut
 fuzz-validated standalone 0/2000. **Gotcha:** naive ear-clipping over
 bridge-spliced weakly-simple polygons fails on multi-hole inputs — don't
 reintroduce a hand-rolled clipper here.
+
+## CAM overhaul (2026-07-20) — viewport sim, GUI overhaul, AI audit tooling
+
+Six waves landing the full CAM overhaul. (0) Froze `contracts/cam.md` (sim frames,
+audit, machine profiles, job diff schemas). (1) Core sim frame snapshots:
+`options.frames` on `cam_simulate` captures equal-interval remaining-stock
+heightfields (64-frame cap, 128-grid downsample, final-frame guarantee), and
+`cam_tree` setups now carry `machine_detail` (full Machine JSON) — host reads
+rapid rates from it. (2) Deterministic verification: `core/cam/audit.{h,cpp}`
+modal-parses posted G-code (units/envelope/feeds/tools/round-trip/clearance
+checks) into `aicad.cam_audit/1`; `MachineDB` (5 presets + `AICAD_MACHINES_REGISTRY`
+override, canonical copy `engine_oracle/research/data/machines.json`) backs new
+`cam_machines`/`cam_feeds` core RPCs; MCP `cam_audit` is a thin wrapper plus
+MCP-only `cam_job_diff`; `feeds_speeds` gained `thread=`/`machine=`; the
+`cam_programmer` role was reworked to a coherent 14-tool surface. (3) Host
+viewport playhead: time-stamped backplot segments (`CamBackplot.*T`), split-at-t
+rendering, remnant-stock aux mesh in the renderer (`setAuxMesh`, ghost-pattern
+translucent pass), interpolated tool marker, bottom-center transport HUD, theme
+`camStock`/`camTool`. (4) CAM panel overhaul: Generate→Simulate→Post pipeline
+runner, op parameter form with `cam_feeds` autofill, tree status badges, sim-tab
+check options + holder row, G-code tab audit summary, stock-box toggle. (5) Shop
+gaps: `heightfield_to_mesh` + `set_stock from_sim` rest-stock handoff between
+setups, post-processor tool re-change warnings, `sim_error` surfaced on the
+surface fast path.
+**Verify:** core ctest (cam) green incl. wave-1/2/5 test cases; host build green;
+AI_CAD_SHOT=cam exercises cam_simulate(frames:8) + playhead; pytest
+services/mcp/test_cam_audit.py + freshness + mega4 green (test_roles has 6
+pre-existing failures unrelated to CAM: drawing_detailer/sourcing/GBNF).
+**Deferred:** 5-axis and region-limited rest roughing; GUI machine-profile
+dropdown (MCP `cam_add_setup(machine_profile=)` exists); all-setups playback.
+**Gotcha:** host playhead timing duplicates the engine feed-limited model —
+jobs with machine.accel > 0 will see scrubber/sim divergence (HUD reads
+cycle_time_s for display).

@@ -772,10 +772,14 @@ json run_micro_design(const std::string& request, const std::string& doc_id,
         std::string id;
         ~RunCtlGuard() { unregister_run_control(id); }
     } run_ctl_guard{run_id};
+    // Save/restore (not clear-to-null): a mission sub-run's guard must hand the
+    // parent's flag back so later parent-level provider calls stay cancellable.
+    const std::atomic<bool>* prev_cancel_flag = provider_cancel_flag();
     set_provider_cancel_flag(run_ctl.flag.get());
     struct ProvCancelGuard {
-        ~ProvCancelGuard() { set_provider_cancel_flag(nullptr); }
-    } prov_cancel_guard;
+        const std::atomic<bool>* prev;
+        ~ProvCancelGuard() { set_provider_cancel_flag(prev); }
+    } prov_cancel_guard{prev_cancel_flag};
 
     RunEvents events(run_id, emit);
     // Live provider_call debug events → same orch stream as stage events.

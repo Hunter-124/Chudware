@@ -404,6 +404,63 @@ std::vector<std::string> status_errors(const json& feature_status) {
     return feature_status_errors(fs);
 }
 
+// Forward streaming token deltas to a run's event stream so the GUI shows the
+// model's continuous output live (channel "text" | "thinking"). Deltas are
+// COALESCED per channel (flush at >=48 chars, newline, or >=60ms since last
+// flush) so we don't reopen events.jsonl per token — grok emits thousands.
+// The final assistant message is persisted separately, so a trailing sub-flush
+// buffer is not authoritative.
+struct DeltaCoalescer {
+    RunEvents* ev = nullptr;
+    std::string buf_text, buf_think;
+    std::chrono::steady_clock::time_point last_flush_text =
+        std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point last_flush_think =
+        std::chrono::steady_clock::now();
+    std::string& chan(const std::string& kind) {
+        return kind == "thinking" ? buf_think : buf_text;
+    }
+    std::chrono::steady_clock::time_point& last_flush(const std::string& kind) {
+        return kind == "thinking" ? last_flush_think : last_flush_text;
+    }
+    void flush(const std::string& kind) {
+        std::string& b = chan(kind);
+        if (b.empty()) return;
+        ev->emit("assistant_delta", json{{"text", b}, {"channel", kind}});
+        b.clear();
+        last_flush(kind) = std::chrono::steady_clock::now();
+    }
+    void push(const std::string& d, const std::string& kind) {
+        std::string& b = chan(kind);
+        b += d;
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - last_flush(kind))
+                            .count();
+        if (b.size() >= 48 || b.find('\n') != std::string::npos || ms >= 60)
+            flush(kind);
+    }
+    void flush_all() { flush("text"); flush("thinking"); }
+};
+
+// Install `coalescer` as this thread's provider delta sink, restoring the
+// previous emitter on scope exit (mission -> assembly probe -> run_design nest
+// on one dispatch thread, so clear-to-null would orphan the parent's stream).
+struct ProviderDeltaGuard {
+    std::shared_ptr<DeltaCoalescer> c;
+    std::function<void(const std::string&, const std::string&)> prev;
+    explicit ProviderDeltaGuard(std::shared_ptr<DeltaCoalescer> coalescer) : c(std::move(coalescer)) {
+        prev = provider_delta_emitter();
+        std::weak_ptr<DeltaCoalescer> w = c;
+        set_provider_delta_emitter([w](const std::string& delta, const std::string& kind) {
+            if (auto sp = w.lock()) sp->push(delta, kind);
+        });
+    }
+    ~ProviderDeltaGuard() {
+        if (c) c->flush_all();
+        set_provider_delta_emitter(std::move(prev));
+    }
+};
+
 }  // namespace
 
 json run_design(const std::string& request, const std::string& doc_id, const json& provider_cfg,
@@ -424,10 +481,14 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         std::string id;
         ~RunCtlGuard() { unregister_run_control(id); }
     } run_ctl_guard{run_id};
+    // Save/restore (not clear-to-null): a mission sub-run's guard must hand the
+    // parent's flag back so later parent-level provider calls stay cancellable.
+    const std::atomic<bool>* prev_cancel_flag = provider_cancel_flag();
     set_provider_cancel_flag(run_ctl.flag.get());
     struct ProvCancelGuard {
-        ~ProvCancelGuard() { set_provider_cancel_flag(nullptr); }
-    } prov_cancel_guard;
+        const std::atomic<bool>* prev;
+        ~ProvCancelGuard() { set_provider_cancel_flag(prev); }
+    } prov_cancel_guard{prev_cancel_flag};
     std::string prompts_dir = options.value("prompts_dir", std::string());
 
     // OFFLINE MODE defense-in-depth (assert_offline_safe). The host owns the app
@@ -586,52 +647,10 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
     struct ProviderEmitGuard {
         ~ProviderEmitGuard() { set_provider_call_emitter(nullptr); }
     } provider_emit_guard;
-    // Forward streaming token deltas to the run event stream so the GUI shows the
-    // model's continuous output live (channel "text" | "thinking"). Deltas are
-    // COALESCED per channel (flush at >=48 chars, newline, or >=60ms since last
-    // flush) so we don't reopen events.jsonl per token — grok emits thousands.
-    // The final assistant message is persisted separately, so a trailing sub-flush
-    // buffer is not authoritative.
-    struct DeltaCoalescer {
-        RunEvents* ev;
-        std::string buf_text, buf_think;
-        std::chrono::steady_clock::time_point last_flush_text =
-            std::chrono::steady_clock::now();
-        std::chrono::steady_clock::time_point last_flush_think =
-            std::chrono::steady_clock::now();
-        std::string& chan(const std::string& kind) {
-            return kind == "thinking" ? buf_think : buf_text;
-        }
-        std::chrono::steady_clock::time_point& last_flush(const std::string& kind) {
-            return kind == "thinking" ? last_flush_think : last_flush_text;
-        }
-        void flush(const std::string& kind) {
-            std::string& b = chan(kind);
-            if (b.empty()) return;
-            ev->emit("assistant_delta", json{{"text", b}, {"channel", kind}});
-            b.clear();
-            last_flush(kind) = std::chrono::steady_clock::now();
-        }
-        void push(const std::string& d, const std::string& kind) {
-            std::string& b = chan(kind);
-            b += d;
-            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                std::chrono::steady_clock::now() - last_flush(kind))
-                                .count();
-            if (b.size() >= 48 || b.find('\n') != std::string::npos || ms >= 60)
-                flush(kind);
-        }
-        void flush_all() { flush("text"); flush("thinking"); }
-    };
+    // Live provider token streaming (shared DeltaCoalescer — see anonymous namespace).
     auto coalescer = std::make_shared<DeltaCoalescer>();
     coalescer->ev = &events;
-    set_provider_delta_emitter([coalescer](const std::string& delta, const std::string& kind) {
-        coalescer->push(delta, kind);
-    });
-    struct ProviderDeltaGuard {
-        std::shared_ptr<DeltaCoalescer> c;
-        ~ProviderDeltaGuard() { if (c) c->flush_all(); set_provider_delta_emitter(nullptr); }
-    } provider_delta_guard{coalescer};
+    ProviderDeltaGuard provider_delta_guard{coalescer};
 
     // ONE provider instance for the whole run (per-role scripted queues must persist).
     ProviderFn provider = make_provider(provider_cfg);
@@ -2212,6 +2231,12 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
                                        {"execution_style", execution_style}});
     }
 
+    // Live provider token streaming for the probe intake/planner calls (the ~20s
+    // of planning the user watches before the first build event).
+    auto probe_coalescer = std::make_shared<DeltaCoalescer>();
+    probe_coalescer->ev = &events;
+    ProviderDeltaGuard probe_delta_guard{probe_coalescer};
+
     // 1) Probe: intake + planner to learn parts + whether it's an assembly.
     ProviderFn provider = make_provider(provider_cfg);
     const CallBudget cb = fit_call_budget(provider_cfg, call_budget_for(provider_cfg));
@@ -2813,16 +2838,26 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
         std::string id;
         ~RunCtlGuard() { unregister_run_control(id); }
     } run_ctl_guard{run_id};
+    // Save/restore (not clear-to-null): a mission sub-run's guard must hand the
+    // parent's flag back so later parent-level provider calls stay cancellable.
+    const std::atomic<bool>* prev_cancel_flag = provider_cancel_flag();
     set_provider_cancel_flag(run_ctl.flag.get());
     struct ProvCancelGuard {
-        ~ProvCancelGuard() { set_provider_cancel_flag(nullptr); }
-    } prov_cancel_guard;
+        const std::atomic<bool>* prev;
+        ~ProvCancelGuard() { set_provider_cancel_flag(prev); }
+    } prov_cancel_guard{prev_cancel_flag};
 
     ProviderFn provider = make_provider(provider_cfg);
     const CallBudget cb = fit_call_budget(provider_cfg, call_budget_for(provider_cfg));
     const int budget = cb.output;
     const int ctx_cap = cb.input_cap;
     RunEvents events(run_id, emit);
+    // Live provider token streaming: the mission planner's drafting + the verdict
+    // synthesis run on this thread — without a delta sink their thinking never
+    // reached the GUI until the call completed (looked frozen, not "live").
+    auto mission_coalescer = std::make_shared<DeltaCoalescer>();
+    mission_coalescer->ev = &events;
+    ProviderDeltaGuard mission_delta_guard{mission_coalescer};
 
     // ---- Mode / execution_style (before drafting) ----
     const std::string copilot_mode = options.value("mode", std::string());
@@ -3360,6 +3395,7 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
     };
 
     auto run_one_task = [&](size_t i) -> void {
+        if (run_ctl.cancelled()) { task_status[i] = "skipped"; return; }
         if (budget_exceeded) {
             task_status[i] = "abandoned";
             set_task_plan_status(i, "abandoned", "budget_exceeded");
@@ -3821,7 +3857,7 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
     // Drive waves.
     const int total_waves = static_cast<int>(waves.size());
     for (int wi = 0; wi < total_waves; ++wi) {
-        if (budget_exceeded) break;
+        if (budget_exceeded || run_ctl.cancelled()) break;
         const auto& wave = waves[wi];
         if (swarm_mode) {
             json wave_tasks = json::array();
@@ -3837,7 +3873,7 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
         }
         // Sequential units within the wave (v1).
         for (size_t idx : wave) {
-            if (budget_exceeded) break;
+            if (budget_exceeded || run_ctl.cancelled()) break;
             run_one_task(idx);
             // Update swarm_wave task status after each unit.
             if (swarm_mode) {
@@ -3889,7 +3925,12 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
         return "mission_failed";
     };
 
-    if (budget_exceeded && !any_built && !any_ok) {
+    if (run_ctl.cancelled()) {
+        // User stop: sub-run already unwound via its own RunControl (cancel cascade
+        // in cancel_run); remaining tasks were skipped above. Report honestly.
+        status = "cancelled";
+        stop_reason = "cancelled";
+    } else if (budget_exceeded && !any_built && !any_ok) {
         // Pure budget abort with no usable work.
         status = "failed";
         stop_reason = "budget_exceeded";

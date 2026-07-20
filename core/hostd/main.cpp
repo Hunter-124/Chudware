@@ -61,16 +61,46 @@ static hostd::Server* g_server = nullptr;
 static void trayQuitThunk(void*) {
     // When systemd supervises us (billet-hostd.service Restart=always), a bare
     // process exit is respawned in ~2s — the tray "Quit hostd" bounce users hit.
-    // systemctl --user stop is a manual stop and stays down. Detect via
-    // INVOCATION_ID (set by systemd for every unit invocation).
+    // systemctl --user stop is a manual stop and stays down.
+    //
+    // Two traps this avoids:
+    //  1. INVOCATION_ID leaks into ANY process spawned from a systemd-managed
+    //     desktop session (GUI-spawned dev daemons inherit it), so env presence
+    //     alone mis-stops the systemd unit while the dev daemon keeps running.
+    //     Verify we really ARE the unit's process via /proc/self/cgroup.
+    //  2. A SYNCHRONOUS `systemctl stop` deadlocks: it waits for the unit to die,
+    //     but main() can't exit until trayStop() joins the GTK thread — which is
+    //     blocked inside std::system. systemd SIGKILLs after TimeoutStopSec=30
+    //     (observed: "failed (Result: signal) code=killed signal=KILL"). Run it
+    //     async ("&") so the GTK thread returns immediately and SIGTERM does the rest.
 #ifndef _WIN32
+    bool under_unit = false;
     if (const char* inv = std::getenv("INVOCATION_ID"); inv && inv[0]) {
-        // Best-effort: stop by unit name. If the unit is unknown, fall through
-        // to in-process stop so a hand-launched hostd still quits.
-        const int rc = std::system("systemctl --user stop billet-hostd.service >/dev/null 2>&1");
-        if (rc == 0) return;
-        // Also try the short name / path-derived forms used by install_webd.
-        if (std::system("systemctl --user stop billet-hostd >/dev/null 2>&1") == 0) return;
+        if (int fd = ::open("/proc/self/cgroup", O_RDONLY | O_CLOEXEC); fd >= 0) {
+            char buf[4096];
+            const ssize_t n = ::read(fd, buf, sizeof buf - 1);
+            ::close(fd);
+            if (n > 0) {
+                buf[n] = 0;
+                under_unit = std::string(buf, (size_t)n).find("billet-hostd.service") !=
+                             std::string::npos;
+            }
+        }
+    }
+    if (under_unit) {
+        // systemctl --user needs the session bus; user services don't always get
+        // DBUS_SESSION_BUS_ADDRESS. Fall back to the standard user-bus path.
+        if (!std::getenv("DBUS_SESSION_BUS_ADDRESS")) {
+            if (const char* xrt = std::getenv("XDG_RUNTIME_DIR"); xrt && *xrt) {
+                const std::string bus = "unix:path=" + std::string(xrt) + "/bus";
+                ::setenv("DBUS_SESSION_BUS_ADDRESS", bus.c_str(), /*overwrite=*/0);
+            }
+        }
+        std::system("systemctl --user stop billet-hostd.service >/dev/null 2>&1 &");
+        // SIGTERM lands in a moment (onSignal -> stop()). Do NOT also in-process
+        // stop here: a clean self-exit before the stop job registers = Restart=
+        // always bounce. If the stop call somehow fails, the next Quit click retries.
+        return;
     }
 #endif
     if (g_server) {

@@ -34,22 +34,24 @@ void unregister_run_control(const std::string& run_id) {
 
 json cancel_run(const std::string& run_id) {
     if (run_id.empty()) return json{{"ok", true}, {"cancelled", false}};
-    RunControl ctl;
-    bool found = false;
+    // Cancel the run AND every sub-run it spawned (mission tasks register as
+    // "<mission-id>-t<N>"). Without the cascade, Stop on a mission flipped only the
+    // parent's flag — the in-flight modeling sub-run kept its own flag false and the
+    // wave loop never consulted the parent's, so the agent kept building.
+    std::vector<RunControl> matched;
     {
         std::lock_guard<std::mutex> lk(g_run_ctl_mtx);
-        auto it = g_run_ctl.find(run_id);
-        if (it != g_run_ctl.end()) {
-            ctl = it->second;
-            found = true;
+        for (auto& kv : g_run_ctl) {
+            if (kv.first == run_id ||
+                (kv.first.size() > run_id.size() &&
+                 kv.first.compare(0, run_id.size(), run_id) == 0 &&
+                 kv.first[run_id.size()] == '-'))
+                matched.push_back(kv.second);
         }
     }
-    if (!found) return json{{"ok", true}, {"cancelled", false}};
-    ctl.request_cancel();
-    // Also poke the thread-local HTTP cancel if this thread owns the transfer
-    // (usually agent_cancel is cross-thread — the xfer callback reads the atomic
-    // flag via the RunControl shared_ptr installed at run start).
-    return json{{"ok", true}, {"cancelled", true}};
+    if (matched.empty()) return json{{"ok", true}, {"cancelled", false}};
+    for (auto& ctl : matched) ctl.request_cancel();
+    return json{{"ok", true}, {"cancelled", true}, {"count", (int)matched.size()}};
 }
 
 json cancel_all_runs() {

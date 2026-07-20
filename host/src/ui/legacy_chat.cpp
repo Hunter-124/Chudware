@@ -5423,15 +5423,16 @@ static void drawClassificationCard(ActivityItem& a, const ui::Fonts& fonts,
         const std::string chosen = a.title;
         for (const auto& alt : alts) {
             const bool isChosen = (!chosen.empty() && alt == chosen);
-            ImGui::Bullet();
-            ImGui::SameLine(0, 4 * sc);
+            // Text bullet prefix (not ImGui::Bullet+SameLine — the glyph overlapped
+            // the label inside the glass child, clipping into the first character).
+            const std::string line = "\xE2\x80\xA2  " + alt;  // "•  "
             if (isChosen) {
                 ImGui::PushStyleColor(ImGuiCol_Text, semanticOnGlass(pal.accent, surf));
-                ImGui::Text("%s  \xe2\x9c\x93", alt.c_str());
+                ImGui::Text("%s  \xe2\x9c\x93", line.c_str());
                 ImGui::PopStyleColor();
             } else {
                 ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-                ImGui::TextUnformatted(alt.c_str());
+                ImGui::TextUnformatted(line.c_str());
                 ImGui::PopStyleColor();
             }
         }

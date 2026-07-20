@@ -2355,3 +2355,22 @@ TEST_CASE("interface advisory present in modeler context via advisory seam") {
     CHECK(has_exact);
     clear_context_advisory();
 }
+
+TEST_CASE("cancel_run cascades to mission sub-runs") {
+    using namespace aicad::agent;
+    RunControl parent, child, other;
+    register_run_control("mission-1", parent);
+    register_run_control("mission-1-t0", child);
+    register_run_control("mission-2", other);
+    json r = cancel_run("mission-1");
+    CHECK(r.value("cancelled", false));
+    CHECK(r.value("count", 0) == 2);
+    CHECK(parent.flag->load());
+    CHECK(child.flag->load());
+    CHECK_FALSE(other.flag->load());
+    // An unrelated run id that merely shares a word prefix (no dash) must NOT cancel.
+    CHECK(cancel_run("missionX").value("cancelled", false) == false);
+    unregister_run_control("mission-1");
+    unregister_run_control("mission-1-t0");
+    unregister_run_control("mission-2");
+}

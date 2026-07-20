@@ -7158,48 +7158,63 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     const float gearW = measureBtn("Settings", "settings");
     const float minGap = style.ItemSpacing.x;
     const float rightInset = ui::metrics::U(0.5f);
-    // Mirror FeatureManager collapse chip (layout.cpp) — SAME recipe both sides:
-    // 26dp square, wash 0.32/0.50, textPrimary glyph, 1.85px stroke. FM parks « at
-    // top-RIGHT of the left column; Copilot parks » at top-LEFT of the right column.
+    // Collapse chip parks OUTSIDE the column's left edge (see screenshot): same 26dp
+    // recipe as FM's «, but hanging in the viewport gutter rather than eating header
+    // inset. Content therefore uses a symmetric left/right inset — no chev reserve.
     const float chevSz  = 26.0f * sc;
-    const float chevPad = 8.0f * sc;
-    const float leftInset = chevSz + chevPad;  // content clears the collapse chip
+    const float chevPad = 8.0f * sc;       // gap between chip right edge and column left
+    const float leftInset = rightInset;
     const float colW = ImGui::GetContentRegionAvail().x;
 
-    // ---- Collapse chip (absolute, top-left; cursor restored like FM) ----
+    // ---- Collapse chip (floating window just left of the column) ----
     {
         const ImVec2 winP0 = ImGui::GetWindowPos();
-        // 8dp inset on both axes — matches layout.cpp FM chip placement.
-        const ImVec2 c0(winP0.x + ImGui::GetWindowContentRegionMin().x,
+        // Vertically match the old in-header placement (content top + 8dp).
+        const ImVec2 c0(winP0.x - chevSz - chevPad,
                         winP0.y + ImGui::GetWindowContentRegionMin().y + 8.0f * sc);
-        const ImVec2 savedCur = ImGui::GetCursorScreenPos();
-        ImGui::SetCursorScreenPos(c0);
-        const bool cClicked = ImGui::InvisibleButton("##cp_collapse", ImVec2(chevSz, chevSz));
-        const bool cHover = ImGui::IsItemHovered();
-        ImDrawList* wdl = ImGui::GetWindowDrawList();
-        const ImVec2 c1(c0.x + chevSz, c0.y + chevSz);
-        ui::glassRowBackground(wdl, c0, c1, 7.0f, false, cHover,
-                               cHover ? 0.50f : 0.32f);
-        // textPrimary at rest (not dim secondary) — shared with FM for even visibility.
-        const ImU32 cCol = ImGui::ColorConvertFloat4ToU32(chatSurf().textPrimary);
-        const ImVec2 cc(c0.x + chevSz * 0.5f, c0.y + chevSz * 0.5f);
-        const float ca = 3.5f * sc;
-        const float stroke = 1.85f * sc;
-        // "»" double chevron (mirror of FM's "«")
-        for (int i = 0; i < 2; ++i) {
-            const float ox = (i == 0 ? -2.5f : 2.5f) * sc;
-            wdl->AddLine(ImVec2(cc.x + ox - ca * 0.5f, cc.y - ca),
-                         ImVec2(cc.x + ox + ca * 0.5f, cc.y), cCol, stroke);
-            wdl->AddLine(ImVec2(cc.x + ox + ca * 0.5f, cc.y),
-                         ImVec2(cc.x + ox - ca * 0.5f, cc.y + ca), cCol, stroke);
+        ImGui::SetNextWindowPos(c0, ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(chevSz, chevSz), ImGuiCond_Always);
+        ImGui::SetNextWindowBgAlpha(0.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 7.0f);
+        const ImGuiWindowFlags chipFlags =
+            ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoNav |
+            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
+            ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking |
+            ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoBringToFrontOnFocus |
+            ImGuiWindowFlags_NoBackground;
+        if (ImGui::Begin("##cp_collapse_chip", nullptr, chipFlags)) {
+            const ImVec2 b0 = ImGui::GetCursorScreenPos();
+            const bool cClicked = ImGui::InvisibleButton("##cp_collapse", ImVec2(chevSz, chevSz));
+            const bool cHover = ImGui::IsItemHovered();
+            ImDrawList* wdl = ImGui::GetWindowDrawList();
+            const ImVec2 b1(b0.x + chevSz, b0.y + chevSz);
+            // Shared collapse-chip recipe (must match FM ##lp_collapse):
+            // rest wash 0.32 / hover 0.50, textPrimary glyph, 1.85px stroke.
+            ui::glassRowBackground(wdl, b0, b1, 7.0f, false, cHover,
+                                   cHover ? 0.50f : 0.32f);
+            const ImU32 cCol = ImGui::ColorConvertFloat4ToU32(chatSurf().textPrimary);
+            const ImVec2 cc(b0.x + chevSz * 0.5f, b0.y + chevSz * 0.5f);
+            const float ca = 3.5f * sc;
+            const float stroke = 1.85f * sc;
+            // "»" double chevron (mirror of FM's "«")
+            for (int i = 0; i < 2; ++i) {
+                const float ox = (i == 0 ? -2.5f : 2.5f) * sc;
+                wdl->AddLine(ImVec2(cc.x + ox - ca * 0.5f, cc.y - ca),
+                             ImVec2(cc.x + ox + ca * 0.5f, cc.y), cCol, stroke);
+                wdl->AddLine(ImVec2(cc.x + ox + ca * 0.5f, cc.y),
+                             ImVec2(cc.x + ox - ca * 0.5f, cc.y + ca), cCol, stroke);
+            }
+            if (cHover) ImGui::SetTooltip(s_cpCollapsed ? "Expand" : "Collapse");
+            if (cClicked) {
+                s_cpCollapsed = !s_cpCollapsed;
+                st.settings.copilotCollapsed = s_cpCollapsed;
+                saveSettings(st.settings);
+            }
         }
-        if (cHover) ImGui::SetTooltip(s_cpCollapsed ? "Expand" : "Collapse");
-        if (cClicked) {
-            s_cpCollapsed = !s_cpCollapsed;
-            st.settings.copilotCollapsed = s_cpCollapsed;
-            saveSettings(st.settings);
-        }
-        ImGui::SetCursorScreenPos(savedCur);
+        ImGui::End();
+        ImGui::PopStyleVar(3);
     }
 
     // ---- Row 1: [Tasks] .. centered Chudware .. [Artifacts]  (clears leftInset) ----
@@ -12639,8 +12654,8 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         if (overlay) ui::publishOverlayColumnEdge(1, wmin.x);
     }
 
-    // (Collapse chevron now leads the Copilot header row — see drawCopilotHeader — so it can't
-    // overlap the cube the way a top-left corner chip did.)
+    // Collapse chip floats just left of the column (see drawCopilotHeader) so header
+    // content can start flush without a chevron reserve.
 
     // Invisible left-edge resize hit-zone (design rule: no visible splitter bars). Dragging the
     // strip left widens the column; clamped at the top of the next frame.

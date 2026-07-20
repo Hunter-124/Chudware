@@ -10758,6 +10758,24 @@ static void drawBtwPanel(AppState& st) {
 // Launch the active turn for `text` according to the current CopilotMode
 // (Agent/Plan/Swarm/Edit/Ask). Pushes the user + live-assistant ChatMsgs.
 // Centralizes launch paths so the top input and per-turn follow-up share one code path.
+// Compact transcript of recent conversation turns for the agent run REQUEST (never shown in
+// the chat). Every launch path below is otherwise context-free: a follow-up like "continue"
+// reached intake with no idea what it was continuing and was rejected as unintelligible.
+// Keep it small — newest few finished messages, each truncated; the live bubble is skipped.
+static std::string buildTurnChatContext(const AppState& st, size_t maxMsgs = 8,
+                                        size_t maxCharsPerMsg = 280) {
+    std::vector<std::string> lines;
+    for (auto it = st.chat.rbegin(); it != st.chat.rend() && lines.size() < maxMsgs; ++it) {
+        if (it->running || it->text.empty()) continue;
+        std::string t = it->text;
+        if (t.size() > maxCharsPerMsg) t = t.substr(0, maxCharsPerMsg - 1) + "\xe2\x80\xa6";
+        lines.push_back(std::string(it->fromUser ? "User: " : "Assistant: ") + t);
+    }
+    std::string out;
+    for (auto it = lines.rbegin(); it != lines.rend(); ++it) { out += *it; out += '\n'; }
+    return out;
+}
+
 static void submitTurn(AppState& st, const std::string& text) {
     if (text.empty()) return;
     // A fresh turn always clears a lingering stop latch (e.g. worker never drained after cancel).
@@ -10783,6 +10801,15 @@ static void submitTurn(AppState& st, const std::string& text) {
     nlohmann::json turnExtras = nlohmann::json::object();
     if (!attachments.empty()) turnExtras["attachments"] = attachments;
     if (!contextRefs.empty()) turnExtras["context_refs"] = contextRefs;
+    // Fold in recent conversation context so follow-ups ("continue", "make it bigger") make
+    // sense to intake/planning. Only the model payload changes — the visible bubble keeps the
+    // raw typed text.
+    {
+        const std::string ctx = buildTurnChatContext(st);
+        if (!ctx.empty())
+            sendText = "[conversation so far]\n" + ctx +
+                       "[/conversation]\nLatest user message: " + sendText;
+    }
     {
         ChatMsg u; u.fromUser = true; u.text = text;
         u.copilotMode = st.aiInteraction;  // stamp composer mode for colored border
@@ -10878,7 +10905,11 @@ static void submitTurn(AppState& st, const std::string& text) {
                              has("create ") || has("generate ") || has("give me") || has("add ") ||
                              has("cut ") || has("draw ");
     const bool changeIntent = has("edit ") || has("change ") || has("modify ") || has("update ") ||
-                              has("fix ") || has("on this") || has("this part") || has("the part");
+                              has("fix ") || has("on this") || has("this part") || has("the part") ||
+                              // Bare continuation follow-ups — continue the work on the open part.
+                              has("continu") || has("go on") || has("keep going") ||
+                              has("proceed") || has("resume") || has("carry on") ||
+                              has("finish it") || has("keep building");
     const bool questionIntent = !buildIntent && !changeIntent &&
         (lo.find('?') != std::string::npos ||
          lo.rfind("what ", 0) == 0 || lo.find(" what ") != std::string::npos ||

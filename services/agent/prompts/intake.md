@@ -30,6 +30,18 @@ move/resize/make bigger/thicker/add a pocket. Normalize against the open part: p
 description of the existing part (or the edit target) in "object", and capture the change in
 "features" / "key_dims". Do NOT reject solely because no new part name was stated.
 
+CONVERSATION CONTEXT — the request may open with a transcript block:
+  [conversation so far]
+  User: ...
+  Assistant: ...
+  [/conversation]
+  Latest user message: ...
+When present, the transcript is ground truth for what the user is working on. A short
+follow-up ("continue", "go on", "keep going", "proceed", "finish it", "make it bigger")
+refers to the MOST RECENT design/build request in the transcript plus any later refinements —
+normalize THAT work into the spec instead of rejecting the follow-up as empty or meaningless.
+Only reject when neither the transcript nor the latest message carries any CAD design request.
+
 REJECTION — if and only if one of the following holds, do NOT invent a spec. Reply with EXACTLY
 one ```json block:
 {

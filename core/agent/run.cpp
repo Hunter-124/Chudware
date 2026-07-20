@@ -524,10 +524,15 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
 
     // execution_style: decide BEFORE drafting. recommend_structure → edit|swarm;
     // explicit mode swarm/eng_firm overrides. eng_firm is never auto-recommended.
+    // Company structure is opt-in via options.corporate_mode / agent.corporate_mode
+    // (Settings → AI → Behavior); default off so Agent never auto-invokes company.
     const bool cross_discipline =
         (dom.domain == Domain::Ecad || dom.domain == Domain::Cam ||
          dom.domain == Domain::Simulation);
-    ExecStructure rec_struct = recommend_structure(cx.level, cross_discipline);
+    const bool allow_company = options.value("corporate_mode", false) ||
+                               options.value("allow_company", false);
+    ExecStructure rec_struct =
+        recommend_structure(cx.level, cross_discipline, allow_company);
     std::string execution_style = execution_style_from_structure(structure_label(rec_struct));
     if (copilot_mode == "swarm" || execute_as == "swarm")
         execution_style = "swarm";
@@ -2150,7 +2155,10 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
     const bool cross_discipline =
         (dom.domain == Domain::Ecad || dom.domain == Domain::Cam ||
          dom.domain == Domain::Simulation);
-    ExecStructure rec_struct = recommend_structure(cx.level, cross_discipline);
+    const bool allow_company = options.value("corporate_mode", false) ||
+                               options.value("allow_company", false);
+    ExecStructure rec_struct =
+        recommend_structure(cx.level, cross_discipline, allow_company);
     std::string execution_style = execution_style_from_structure(structure_label(rec_struct));
     {
         const std::string mode = options.value("mode", std::string());
@@ -2834,7 +2842,10 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
     const bool cross_discipline =
         (mdom.domain == Domain::Ecad || mdom.domain == Domain::Cam ||
          mdom.domain == Domain::Simulation);
-    ExecStructure rec_struct = recommend_structure(mcx.level, cross_discipline);
+    const bool allow_company = options.value("corporate_mode", false) ||
+                               options.value("allow_company", false);
+    ExecStructure rec_struct =
+        recommend_structure(mcx.level, cross_discipline, allow_company);
     std::string execution_style = execution_style_from_structure(structure_label(rec_struct));
     if (copilot_mode == "swarm" || org == "swarm" || execute_as == "swarm")
         execution_style = "swarm";

@@ -3928,12 +3928,14 @@ static void launchDesignRun(AppState& st, const std::string& request,
             payload[it.key()] = it.value();
     }
     // Mode overhaul: default options.mode=agent when caller didn't stamp one (Build-it path).
+    // corporate_mode mirrors Settings → AI → Behavior (default off — no auto company).
     {
         nlohmann::json opts = nlohmann::json::object();
         if (payload.contains("options") && payload["options"].is_object())
             opts = payload["options"];
         if (!opts.contains("mode")) opts["mode"] = "agent";
         if (!opts.contains("advisor")) opts["advisor"] = true;
+        opts["corporate_mode"] = st.settings.corporateMode;
         payload["options"] = std::move(opts);
     }
     // Cursor has no C++ chat completions transport (Connect-RPC lives only in the Python
@@ -4012,6 +4014,7 @@ static void launchMissionRunChat(AppState& st, const std::string& request, bool 
             payload[it.key()] = it.value();
     }
     // Mode overhaul: default mode=swarm when corporate_force, else agent, if unstamped.
+    // corporate_mode mirrors Settings → AI → Behavior (default off — no auto company).
     {
         nlohmann::json opts = nlohmann::json::object();
         if (payload.contains("options") && payload["options"].is_object())
@@ -4021,6 +4024,7 @@ static void launchMissionRunChat(AppState& st, const std::string& request, bool 
             else opts["mode"] = "agent";
         }
         if (!opts.contains("advisor")) opts["advisor"] = true;
+        opts["corporate_mode"] = st.settings.corporateMode;
         payload["options"] = std::move(opts);
     }
     launchMissionRun(st.worker, st.job, request, st.docMirror.docId(), payload);
@@ -4420,6 +4424,7 @@ static void drawPlanApproveCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts
     nlohmann::json opts = nlohmann::json::object();
     opts["advisor"] = true;
     opts["approved_plan"] = approved;
+    opts["corporate_mode"] = st.settings.corporateMode;
     if (asEngFirm) {
         opts["mode"] = "eng_firm";
         opts["execute_as"] = "eng_firm";
@@ -10726,6 +10731,8 @@ static void submitTurn(AppState& st, const std::string& text) {
     auto withOptions = [&](nlohmann::json base, nlohmann::json opts) -> nlohmann::json {
         if (!opts.is_object()) opts = nlohmann::json::object();
         if (!opts.contains("advisor")) opts["advisor"] = true;
+        // Settings gate for company structure auto-route (core recommend_structure).
+        opts["corporate_mode"] = st.settings.corporateMode;
         base["options"] = std::move(opts);
         return base;
     };
@@ -10889,6 +10896,7 @@ static void submitTurn(AppState& st, const std::string& text) {
         for (auto it = turnExtras.begin(); it != turnExtras.end(); ++it)
             extra[it.key()] = it.value();
         nlohmann::json opts = {{"mode", "edit"}, {"advisor", true},
+                               {"corporate_mode", st.settings.corporateMode},
                                {"scope", buildEditScope()}};
         extra["options"] = std::move(opts);
         launchAgentRunV2(st.worker, st.job, sendText, st.docMirror.docId(),
@@ -10933,6 +10941,7 @@ static void submitTurn(AppState& st, const std::string& text) {
                 for (auto it = turnExtras.begin(); it != turnExtras.end(); ++it)
                     extra[it.key()] = it.value();
                 nlohmann::json opts = {{"mode", "agent"}, {"advisor", true},
+                                       {"corporate_mode", st.settings.corporateMode},
                                        {"scope", buildEditScope()}};
                 extra["options"] = std::move(opts);
                 launchAgentRunV2(st.worker, st.job, sendText, st.docMirror.docId(),
@@ -11070,7 +11079,8 @@ static void submitTurn(AppState& st, const std::string& text) {
         nlohmann::json extra = provOverride;
         for (auto it = turnExtras.begin(); it != turnExtras.end(); ++it)
             extra[it.key()] = it.value();
-        extra["options"] = {{"mode", "plan"}, {"plan_only", true}, {"advisor", true}};
+        extra["options"] = {{"mode", "plan"}, {"plan_only", true}, {"advisor", true},
+                            {"corporate_mode", st.settings.corporateMode}};
         std::string err;
         if (!st.docMirror.hasDoc()) {
             if (!st.docMirror.newPart(st.worker, err)) {
@@ -11170,6 +11180,7 @@ static void submitTurn(AppState& st, const std::string& text) {
             for (auto it = turnExtras.begin(); it != turnExtras.end(); ++it)
                 extra[it.key()] = it.value();
             nlohmann::json opts = {{"mode", "agent"}, {"advisor", true},
+                                   {"corporate_mode", st.settings.corporateMode},
                                    {"scope", buildEditScope()}};
             extra["options"] = std::move(opts);
             launchAgentRunV2(st.worker, st.job, sendText, st.docMirror.docId(),
@@ -11466,25 +11477,39 @@ static void drawComposerPrelude(AppState& st, bool busy) {
     }
     ImGui::PopStyleColor(3);
 
-    // Busy forging glyph — sits BETWEEN the mode dropdown and the context meter.
-    // No reserved gap when idle (conditional SameLine only while a run is active).
+    // Busy forging glyph — centered in the gap between the mode dropdown and the
+    // context meter. Hidden the instant Stop is pressed (aiTurnActive honors
+    // stopRequested) so the animation never keeps playing after a stop.
+    // Note: `busy` is job.running and can lag past Stop — always gate on stopRequested.
+    // Use `tmx` (mode chip screen rect captured above) — GetItemRectMax after the
+    // popup is no longer the mode button.
     {
-        const bool forging = busy || st.agentV2Running || activeConversationRunning(st);
+        const bool forging = !st.stopRequested &&
+                             (busy || st.agentV2Running || activeConversationRunning(st));
+        const float meterRoomFull = ImGui::GetContentRegionAvail().x;
+        const float meterW = measureContextMeter(st, meterRoomFull);
+        const float rowRightScreen = ImGui::GetWindowPos().x + ImGui::GetContentRegionMax().x;
+        const float meterLeftScreen = rowRightScreen - meterW;
         if (forging) {
-            ImGui::SameLine(0, 8.0f * sc);
+            const float midScreen = (tmx.x + meterLeftScreen) * 0.5f;
+            float hammerScreenX = midScreen - segH * 0.5f;
+            // Keep clear of the mode chip; fall back if the row is narrow.
+            if (hammerScreenX < tmx.x + 4.0f * sc)
+                hammerScreenX = tmx.x + 8.0f * sc;
+            if (hammerScreenX + segH > meterLeftScreen - 4.0f * sc)
+                hammerScreenX = ImMax(tmx.x + 4.0f * sc, meterLeftScreen - segH - 4.0f * sc);
+            ImGui::SameLine(0, 0.0f);
+            ImGui::SetCursorScreenPos(ImVec2(hammerScreenX, tmn.y));
             drawForgingAnimation(segH);  // match prelude chip height
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
                 ImGui::SetTooltip("AI is working\xe2\x80\xa6");
         }
+        // Context meter on the SAME row, right-aligned.
+        ImGui::SameLine(0, 0.0f);
+        const float meterCursorX = ImGui::GetContentRegionMax().x - meterW;
+        if (meterCursorX > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(meterCursorX);
+        drawContextMeter(st, meterRoomFull);
     }
-
-    // Context meter on the SAME row, right-aligned.
-    ImGui::SameLine();
-    const float room = ImGui::GetContentRegionAvail().x;
-    const float w    = measureContextMeter(st, room);
-    const float x    = ImGui::GetContentRegionMax().x - w;
-    if (x > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(x);
-    drawContextMeter(st, room);
 
 
     ImGui::PopStyleColor(8);

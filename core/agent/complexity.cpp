@@ -184,12 +184,16 @@ ComplexityVerdict classify_complexity(const std::string& request) {
     return {Complexity::Standard, "multi-feature part or joined objects"};
 }
 
-ExecStructure recommend_structure(Complexity level, bool cross_discipline) {
+ExecStructure recommend_structure(Complexity level, bool cross_discipline,
+                                  bool allow_company) {
     switch (level) {
         case Complexity::Solo:     return ExecStructure::Solo;
         case Complexity::Standard: return ExecStructure::Subagent;
-        case Complexity::Complex:  return cross_discipline ? ExecStructure::Company
-                                                          : ExecStructure::Dag;
+        case Complexity::Complex:
+            // Company only when explicitly allowed (Settings agent.corporate_mode).
+            // Cross-discipline alone must not auto-invoke company.
+            return (cross_discipline && allow_company) ? ExecStructure::Company
+                                                      : ExecStructure::Dag;
     }
     return ExecStructure::Subagent;
 }

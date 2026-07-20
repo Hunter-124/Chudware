@@ -82,15 +82,21 @@ TEST_CASE("structure recommendation tracks complexity") {
     CHECK(recommend_structure(standard.level) == ExecStructure::Subagent);
     CHECK(std::string(structure_label(recommend_structure(standard.level))) == "subagent");
 
-    // Complex assembly -> Dag by default, Company when cross-discipline
+    // Complex assembly -> Dag by default; Company only when allow_company=true
     auto complex = classify_complexity("a two-stage planetary gearbox assembly");
     CHECK(complex.level == Complexity::Complex);
     CHECK(recommend_structure(complex.level, /*cross_discipline=*/false) == ExecStructure::Dag);
     CHECK(std::string(structure_label(
               recommend_structure(complex.level, /*cross_discipline=*/false))) == "dag");
-    CHECK(recommend_structure(complex.level, /*cross_discipline=*/true) == ExecStructure::Company);
+    // cross_discipline alone must NOT pick company (default allow_company=false)
+    CHECK(recommend_structure(complex.level, /*cross_discipline=*/true) == ExecStructure::Dag);
     CHECK(std::string(structure_label(
-              recommend_structure(complex.level, /*cross_discipline=*/true))) == "company");
+              recommend_structure(complex.level, /*cross_discipline=*/true))) == "dag");
+    CHECK(recommend_structure(complex.level, /*cross_discipline=*/true,
+                              /*allow_company=*/true) == ExecStructure::Company);
+    CHECK(std::string(structure_label(
+              recommend_structure(complex.level, /*cross_discipline=*/true,
+                                 /*allow_company=*/true))) == "company");
 }
 
 // ---- wave hardening -------------------------------------------------------

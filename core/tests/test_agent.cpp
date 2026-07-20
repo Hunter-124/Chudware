@@ -1608,8 +1608,14 @@ TEST_CASE("execution_style_from_structure maps structure labels") {
     CHECK(std::string(execution_style_from_structure(structure_label(solo))) == "edit");
     auto complex = recommend_structure(Complexity::Complex, /*cross_discipline=*/false);
     CHECK(std::string(execution_style_from_structure(structure_label(complex))) == "swarm");
-    auto company = recommend_structure(Complexity::Complex, /*cross_discipline=*/true);
+    // company requires allow_company=true; still maps to swarm execution_style
+    auto company = recommend_structure(Complexity::Complex, /*cross_discipline=*/true,
+                                      /*allow_company=*/true);
+    CHECK(std::string(structure_label(company)) == "company");
     CHECK(std::string(execution_style_from_structure(structure_label(company))) == "swarm");
+    // cross_discipline alone stays dag (company opt-in)
+    auto dag_xd = recommend_structure(Complexity::Complex, /*cross_discipline=*/true);
+    CHECK(std::string(structure_label(dag_xd)) == "dag");
 }
 
 TEST_CASE("run_machine advisor escalate returns plan_ready needs_user_decision") {

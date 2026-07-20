@@ -3760,6 +3760,11 @@ settingsGlassSectionBegin("##ai_run_behavior", "Run behavior");
                                "Cheap deterministic notes by default; at most one short "
                                "advisor-model call on severe streaks (encourage/require). "
                                "Off = no proactive injects (pull request_advice still works).");
+                    ImGui::Checkbox("Company structure auto-route", &settings.corporateMode);
+                    helpMarker("When on, complex cross-discipline requests may route as "
+                               "company (director + departments). Default off — Agent will "
+                               "not auto-invoke company; use Swarm / Eng. Firm modes or "
+                               "turn this on when ready.");
                     ImGui::Dummy(ImVec2(0, 4.0f * sc));
                     ImGui::Checkbox("Project memory (per-folder)", &settings.memoryEnabled);
                     helpMarker("Remembers decisions and notes under the PLM project "

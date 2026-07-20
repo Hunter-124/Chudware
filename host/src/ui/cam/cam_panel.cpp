@@ -70,6 +70,7 @@ struct CamUI {
     int curFrame = -1;                 // frame index currently uploaded as aux mesh
     Mesh frameMesh;                    // built from simFrames[curFrame]
     bool frameMeshValid = false;
+    int simGen = 0;                    // bumped on new sim/job — invalidates the aux mesh upload
     bool showStock = false;            // stock box overlay
     bool optGouge = true, optRapid = true, optHolder = false;
     float optRes = 0.5f;
@@ -703,6 +704,7 @@ const CamBackplot* camActiveBackplot() {
 // Adopt a cam_simulate response: parse the selected setup's frames into the playhead state.
 // Called by doSimulate's async callback and by headless scenarios (sync worker.call path).
 void camAdoptSimResult(const nlohmann::json& result) {
+    ++g.simGen;
     g.simFrames.clear(); g.simFrameT.clear();
     g.framesClamped = false; g.playT = 0; g.playing = false;
     g.curFrame = -1; g.frameMeshValid = false; g.splitT = -1;
@@ -757,6 +759,7 @@ int camCurrentFrameIndex() {
 }
 
 // Rebuild the remnant mesh for frame `idx` if needed; returns true when a mesh is ready.
+int camSimGen() { return g.simGen; }
 bool camFrameMeshFor(int idx) {
     if (idx < 0 || idx >= (int)g.simFrames.size()) return false;
     if (idx == g.curFrame && g.frameMeshValid) return true;
@@ -902,6 +905,7 @@ void camLoadJob(AppState& st, const std::string& docId) {
     g.gcode.clear();
     g.gcodePath.clear();
     g.sim = nlohmann::json();
+    ++g.simGen;
     g.simFrames.clear(); g.simFrameT.clear();
     g.framesClamped = false; g.playT = 0; g.playing = false;
     g.curFrame = -1; g.frameMeshValid = false; g.splitT = -1;

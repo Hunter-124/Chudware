@@ -2404,8 +2404,13 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // Cleared whenever the Manufacture workspace isn't active.
         if (st.activeWorkspace == AppState::Workspace::Manufacture && ui::camSimHudActive()) {
             int fidx = ui::camCurrentFrameIndex();
-            if (ui::camFrameMeshFor(fidx))
+            // camFrameMeshFor caches the CPU mesh by frame index; only re-upload the GPU
+            // buffers when the frame actually changed (setAuxMesh always reallocates).
+            static int s_lastAuxFrame = -2;
+            if (fidx != s_lastAuxFrame && ui::camFrameMeshFor(fidx)) {
                 renderer.setAuxMesh(ui::camFrameMesh(), 0.45f);
+                s_lastAuxFrame = fidx;
+            }
         } else if (renderer.hasAuxMesh()) {
             renderer.clearAuxMesh();
         }

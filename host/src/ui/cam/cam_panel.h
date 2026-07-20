@@ -67,6 +67,8 @@ bool camSimHudActive();
 const std::pair<const CamBackplot*, const CamBackplot*>& camBackplotSplit();
 // Frame index for the current playT (-1 = no frames).
 int camCurrentFrameIndex();
+// Sim generation — changes whenever a new sim result is adopted (aux-mesh cache key).
+int camSimGen();
 // Rebuild + return the remnant-stock mesh for the current frame index.
 bool camFrameMeshFor(int idx);
 const Mesh& camFrameMesh();

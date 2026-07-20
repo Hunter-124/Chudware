@@ -26,6 +26,7 @@ ROLE_BRIEFS: dict[str, str] = {
     "linkage_planner": "Datum schemes, reference chains, shared interfaces.",
     "assembly_fit_engineer": "Mates, fits, clearances vs layout budget.",
     "sim_engineer": "Set up and interpret sims that prove the spec.",
+    "drawing_detailer": "2D drawings — views, dims, GD&T, title block, export.",
     "cam_programmer": "Table-driven CAM with simulated-clean toolpaths.",
     "reviewer": "Prove/refute acceptance criteria with named tool runs.",
     "fixer": "One failure card → one candidate fix per attempt.",

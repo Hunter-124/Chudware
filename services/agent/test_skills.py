@@ -65,7 +65,7 @@ def _write_skill(root: Path, name: str, description: str, *, inject: str = "manu
 
 
 def test_discover_builtins_from_repo():
-    """Without env overrides, the real builtin set has the 9 v1 skills."""
+    """Without env overrides, the real builtin set has the v1 + domain skills."""
     # Clear any test overrides from other tests in-process.
     import os
     for k in ("AICAD_SKILLS_PROJECT_DIR", "AICAD_SKILLS_USER_DIR", "AICAD_SKILLS_BUILTIN_DIR"):
@@ -77,11 +77,12 @@ def test_discover_builtins_from_repo():
         "edit-part", "edit-assembly", "edit-sketch", "edit-feature",
         "simulate", "assess-model-state", "source-parts", "ecad-board",
         "skill-creator",
+        "make-drawing", "cam-job", "sheet-metal", "reverse-engineer", "plm-workflow",
     }
     assert expected <= names, f"missing builtins: {expected - names}"
     # skills_list shape
     listing = sk.list_skills()
-    assert len([e for e in listing if e["name"] in expected]) == 9
+    assert len([e for e in listing if e["name"] in expected]) == len(expected)
 
 
 def test_precedence_project_over_user_over_builtin(skill_roots):
@@ -261,7 +262,7 @@ def test_save_and_delete_user_skill(skill_roots):
 
 
 def test_skills_rpc_list_nine_builtins():
-    """RPC list returns the 9 builtins when no overrides hide them."""
+    """RPC list returns the v1 + domain builtins when no overrides hide them."""
     import os
     for k in ("AICAD_SKILLS_PROJECT_DIR", "AICAD_SKILLS_USER_DIR", "AICAD_SKILLS_BUILTIN_DIR"):
         os.environ.pop(k, None)
@@ -274,9 +275,10 @@ def test_skills_rpc_list_nine_builtins():
         "edit-part", "edit-assembly", "edit-sketch", "edit-feature",
         "simulate", "assess-model-state", "source-parts", "ecad-board",
         "skill-creator",
+        "make-drawing", "cam-job", "sheet-metal", "reverse-engineer", "plm-workflow",
     }
     assert expected <= names
-    assert out["count"] >= 9
+    assert out["count"] >= len(expected)
 
 
 def test_session_system_block_includes_catalog_and_activation(skill_roots):

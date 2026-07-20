@@ -149,19 +149,22 @@ _TOOL_FAMILIES: dict[str, set[str]] = {
         "set_process", "set_titleblock",
         "add_drawing_view", "add_section_view", "add_detail_view",
         "add_dimension", "add_gdt", "add_surface_finish", "export_drawing",
-        "run_fea_static", "run_fea_modal", "run_cfd_flow", "run_cfd_accurate",
-        "run_fea_fatigue", "run_fea_thermal", "run_fea_buckling", "run_fea_contact",
         "measure_part", "measure_between", "query_geometry",
         "check_feature_overlap", "check_interference", "check_symmetry",
         "check_metadata", "check_sketch",
         "wall_thickness", "draft_analysis",
         "bom_price", "bom_rollup",
         "hover", "show_in_app",
-        "solve_mates", "list_world_bodies", "simulate_motion",
+        "solve_mates", "list_world_bodies",
         "list_configurations", "add_configuration", "activate_configuration",
         "list_standard_parts", "set_config_override", "set_config_suppression",
         "inspect_section", "recover_parts", "make_fit_coupon",
         "contact_sheet",
+    },
+    "sim": {
+        "run_fea_static", "run_fea_modal", "run_cfd_flow", "run_cfd_accurate",
+        "run_fea_fatigue", "run_fea_thermal", "run_fea_buckling", "run_fea_contact",
+        "simulate_motion",
     },
     "gsl": {
         "describe_part", "query_adjacency", "hover", "describe_sketch",
@@ -216,6 +219,7 @@ _TOOL_FAMILIES: dict[str, set[str]] = {
         "research_web_search", "research_fetch_page", "research_material_lookup",
         "research_unit_convert", "research_standard_section",
         "research_datasheet_fetch", "research_thread_spec", "research_eng_calc",
+        "fit_calc", "recommend_fit",
     },
     "deliverables": {
         "make_report", "make_presentation", "make_workbook",
@@ -286,6 +290,21 @@ _TOOL_FAMILIES: dict[str, set[str]] = {
     },
     "mechanical": {
         "gear_check", "bearing_life",
+    },
+    "mission": {
+        "dag_plan", "dag_run", "dag_status", "dag_approve", "dag_abort",
+        "dag_replan", "buildgraph_plan", "buildgraph_status",
+        "mission_start", "mission_status", "replan_request",
+    },
+    "plm": {
+        "plm_init", "plm_open", "plm_save", "plm_checkpoint", "plm_release",
+        "plm_history", "plm_restore", "plm_status", "plm_compare",
+        "plm_set_ai_mode", "plm_item_set", "plm_where_used", "plm_timeline",
+        "plm_rollback",
+    },
+    "reveng": {
+        "reverse_engineer", "compare_parts", "convert_face_to_sketch",
+        "measure_from_photo", "start_capture_session",
     },
 }
 
@@ -501,6 +520,7 @@ class TestMCPFreshness(unittest.TestCase):
             "sourcing", "cost", "spec", "piping", "hydraulic", "firmware",
             "structural", "parts", "serving", "regen", "code_compliance",
             "dag", "design_review", "ledger", "tolerance_stackup", "mechanical",
+            "sim", "mission", "plm", "reveng",
         }
         missing = required_families - set(_TOOL_FAMILIES.keys())
         self.assertFalse(

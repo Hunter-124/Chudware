@@ -351,6 +351,166 @@ _BUILTIN_TRIGGERS: list[dict] = [
         "budget_tokens": 250,
         "cooldown_turns": 8,
     },
+    {
+        "id": "drawing_standards",
+        "match": {
+            "keywords": [
+                r"\bdrawing\b", r"\bdimension", r"GD&T|geometric toleranc",
+                r"\btitle block\b", r"section view", r"detail view",
+                r"\bsheet format\b", r"\bannotation",
+            ],
+            "tools": [
+                "make_drawing", "add_drawing_view", "add_section_view",
+                "add_detail_view", "add_dimension", "add_gdt",
+                "add_surface_finish", "export_drawing",
+            ],
+            "events": [],
+        },
+        "inject": {
+            "context_pack": "drawing_standards",
+            "prerun_calcs": [],
+            "exemplar": "Base → projected → section/detail; dimension from measure_part, never invent (drawing_standards pack)",
+        },
+        "budget_tokens": 300,
+        "cooldown_turns": 8,
+    },
+    {
+        "id": "sim_setup",
+        "match": {
+            "keywords": [
+                r"\bFEA\b", r"\bCFD\b", r"\bstress\b", r"\bmodal\b",
+                r"\bthermal\b", r"\bbuckling\b", r"\bfatigue\b",
+                r"flow simulation", r"motion study", r"\bmesh\b",
+            ],
+            "tools": [
+                "run_fea_static", "run_fea_modal", "run_fea_fatigue",
+                "run_fea_thermal", "run_fea_buckling", "run_fea_contact",
+                "run_cfd_flow", "run_cfd_accurate", "simulate_motion",
+            ],
+            "events": [],
+        },
+        "inject": {
+            "context_pack": "sim_setup",
+            "prerun_calcs": [],
+            "exemplar": "Anchor with research_eng_calc before run_fea_*; one load case per study (sim_setup pack)",
+        },
+        "budget_tokens": 300,
+        "cooldown_turns": 8,
+    },
+    {
+        "id": "ecad_design",
+        "match": {
+            "keywords": [
+                r"\bschematic\b", r"\bPCB\b", r"\bnet\b", r"\bfootprint\b",
+                r"\bimpedance\b", r"\bERC\b", r"\bDRC\b", r"\bautorout",
+                r"\bnet class\b", r"\bsilkscreen\b",
+            ],
+            "tools": [
+                "ecad_new_schematic", "ecad_new_pcb", "place_symbol", "wire",
+                "autoroute", "fill_zones", "update_from_sch", "set_net_class",
+                "run_erc", "run_drc",
+            ],
+            "events": [],
+        },
+        "inject": {
+            "context_pack": "ecad_design",
+            "prerun_calcs": [],
+            "exemplar": "Schematic → ERC → board_from_schematic → DRC; nets before SPICE (ecad_design pack)",
+        },
+        "budget_tokens": 250,
+        "cooldown_turns": 8,
+    },
+    {
+        "id": "cam_setup",
+        "match": {
+            "keywords": [
+                r"\bmachin", r"\btoolpath\b", r"feeds and speeds",
+                r"\bstock\b", r"\bsetup\b", r"\bpost.?process",
+                r"\bg.?code\b", r"\bstepover\b", r"\bstepdown\b",
+            ],
+            "tools": [
+                "cam_new_job", "cam_add_setup", "cam_add_tool",
+                "cam_add_operation", "cam_generate", "cam_simulate",
+                "cam_post", "cam_set_stock",
+            ],
+            "events": [],
+        },
+        "inject": {
+            "context_pack": "cam_setup",
+            "prerun_calcs": [],
+            "exemplar": "Stock → setup → tool → op → generate → simulate clean → post (cam_setup pack)",
+        },
+        "budget_tokens": 300,
+        "cooldown_turns": 8,
+    },
+    {
+        "id": "part_sourcing",
+        "match": {
+            "keywords": [
+                r"\bvendor\b", r"\bsupplier\b", r"\bpurchase\b", r"\bbuy\b",
+                r"\bquote\b", r"lead time",
+                r"\bBOM\b.*\bcost|cost.*\bBOM\b",
+                r"\bsource\b.*\bpart|part.*\bsource\b",
+            ],
+            "tools": [
+                "part_search", "part_get", "part_place", "part_source",
+                "bom_price", "bom_rollup", "request_quote", "match_part_number",
+            ],
+            "events": [],
+        },
+        "inject": {
+            "context_pack": "sourcing",
+            "prerun_calcs": [],
+            "exemplar": "part_search → part_get → part_place; never hand-model catalog hardware (sourcing pack)",
+        },
+        "budget_tokens": 250,
+        "cooldown_turns": 10,
+    },
+    {
+        "id": "reveng_flow",
+        "match": {
+            "keywords": [
+                r"reverse.engineer", r"\bscan\b", r"\bpoint cloud\b",
+                r"\bmesh\b.*\b(part|model)", r"\bphotogrammetry\b",
+                r"\bSTEP\b.*\bimport|import.*\bSTEP\b", r"\bdatasheet\b",
+            ],
+            "tools": [
+                "reverse_engineer", "compare_parts", "convert_face_to_sketch",
+                "project_into_sketch", "measure_from_photo", "start_capture_session",
+            ],
+            "events": [],
+        },
+        "inject": {
+            "context_pack": "reveng_flow",
+            "prerun_calcs": [],
+            "exemplar": "Import/capture → reverse_engineer → compare_parts loop → verify_battery (reveng_flow pack)",
+        },
+        "budget_tokens": 250,
+        "cooldown_turns": 8,
+    },
+    {
+        "id": "plm_flow",
+        "match": {
+            "keywords": [
+                r"\bcheckpoint\b", r"\brelease\b", r"\brevision\b",
+                r"where.used", r"\brollback\b", r"\bchange order\b",
+                r"\bitem master\b",
+            ],
+            "tools": [
+                "plm_init", "plm_open", "plm_save", "plm_checkpoint",
+                "plm_release", "plm_history", "plm_restore", "plm_compare",
+                "plm_where_used", "plm_rollback",
+            ],
+            "events": [],
+        },
+        "inject": {
+            "context_pack": "plm_flow",
+            "prerun_calcs": [],
+            "exemplar": "Checkpoint before risk; where_used before release; history→restore for recovery (plm_flow pack)",
+        },
+        "budget_tokens": 200,
+        "cooldown_turns": 10,
+    },
 ]
 
 _CHARS_PER_TOKEN = 4  # repo-wide heuristic (matches render.py / ledger.py)

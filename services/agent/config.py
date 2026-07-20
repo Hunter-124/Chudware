@@ -398,7 +398,8 @@ def proactive_advisor_enabled(cfg: dict | None = None) -> bool:
 # ---------------------------------------------------------------------------
 DEFAULT_TOOL_FAMILIES = (
     "advisor", "cad", "cam", "ecad", "em", "gsl", "intake", "ledger",
-    "org", "parts", "plm", "recon", "research", "reveng", "sim", "workspace",
+    "mission", "org", "parts", "plm", "recon", "research", "reveng", "sim",
+    "workspace",
 )
 
 def get_tool_families(cfg: dict | None = None) -> dict[str, bool]:

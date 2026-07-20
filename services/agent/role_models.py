@@ -49,7 +49,25 @@ KNOWN_ROLES = (
     "sketch2d",
     "model3d",
     "memory",
+    "cam",
+    "sim",
+    "ecad",
+    "drawing",
+    "reveng",
 )
+
+# Specialist role ids → Settings model-picker keys (ai_roles.*).
+ROLE_MODEL_KEY_ALIASES: dict[str, str] = {
+    "cam_programmer": "cam",
+    "sim_engineer": "sim",
+    "ecad_engineer": "ecad",
+    "layout_engineer": "ecad",
+    "firmware_engineer": "ecad",
+    "drawing_detailer": "drawing",
+    "re_modeler": "reveng",
+    "re_datasheet_reader": "reveng",
+    "re_geometry_verifier": "reveng",
+}
 
 # Per-role reasoning / thinking effort levels (Settings → AI → Model roles).
 THINKING_LEVELS = ("auto", "low", "medium", "high")
@@ -1871,6 +1889,7 @@ def resolve_role_model(
     * Redaction role: HARD refuse non-loopback (raises :class:`RoleModelError`).
     """
     role_s = (role or "default").strip().lower() or "default"
+    role_s = ROLE_MODEL_KEY_ALIASES.get(role_s, role_s)
     cfg = cfg or {}
     roles = get_ai_roles(cfg)
     entry = roles.get(role_s)

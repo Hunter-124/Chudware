@@ -1025,11 +1025,12 @@ static ModelRolesUi s_roles;
 
 static const char* kRoleKeys[] = {
     "advisor", "task", "planning", "vision", "default", "plm", "redaction",
-    "sketch2d", "model3d", "memory"};
+    "sketch2d", "model3d", "memory", "cam", "sim", "ecad", "drawing", "reveng"};
 static const char* kRoleLabels[] = {
     "Advisor", "Task", "Planning", "Vision", "Default", "PLM", "Redaction",
-    "Sketch 2D", "Model 3D", "Memory"};
-static constexpr int kRoleCount = 10;
+    "Sketch 2D", "Model 3D", "Memory", "CAM", "Simulation", "ECAD", "Drawing",
+    "Reverse eng"};
+static constexpr int kRoleCount = 15;
 
 static std::string benchTierForSource(const Settings& s, int source) {
     if (source == 1) return "xai:grok-4-5";

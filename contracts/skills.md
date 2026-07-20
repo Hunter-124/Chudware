@@ -20,7 +20,8 @@ metadata always in context (~100 tokens/skill), full body injected on activation
   `skills_get {name} -> {ok, body, files:[..]}`, `skills_save {name, body} -> {ok}` (user dir only),
   `skills_delete {name}` (user dir only).
 - Builtin set (v1): edit-part, edit-assembly, edit-sketch, edit-feature, simulate,
-  assess-model-state, source-parts, ecad-board, skill-creator.
+  assess-model-state, source-parts, ecad-board, skill-creator,
+  make-drawing, cam-job, sheet-metal, reverse-engineer, plm-workflow.
 - Grounding rule: every builtin skill teaches verify-before-done (describe/measure/check_* after
   mutations) and single-source-of-truth sequencing (model the mating part FIRST, reference its
   dims — never parallel-guess mating interfaces).

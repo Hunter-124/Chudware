@@ -519,9 +519,43 @@ register_sketch3d_tools(_reg.view(mcp, "cad"))
 from mcp_server.ascii2d import register_ascii2d_tools
 register_ascii2d_tools(_reg.view(mcp, "gsl"))
 
-# RE-ANCHOR(reveng): Reverse Engineering MCP family (contracts/reveng.md §8).
-# RE-02 wires: from services.mcp.reveng_tools import register_reveng_tools
-#              register_reveng_tools(_reg.view(mcp, "reveng"))
+# Reverse Engineering MCP family (contracts/reveng.md §8).
+from services.mcp.reveng_tools import register_reveng_tools
+register_reveng_tools(_reg.view(mcp, "reveng"))
+
+# Family retags so Settings → AI → Tools toggles match real tool ownership.
+# FEA/CFD/motion ship inside register_cad_tools but belong under ``sim``;
+# bare register_* calls (research/plm/dag/mission/buildgraph) get families here.
+_FAMILY_REASSIGN: dict[str, tuple[str, ...]] = {
+    "sim": (
+        "run_fea_static", "run_fea_modal", "run_fea_fatigue", "run_fea_thermal",
+        "run_fea_buckling", "run_fea_contact", "run_cfd_flow", "run_cfd_accurate",
+        "simulate_motion",
+    ),
+    "plm": (
+        "plm_init", "plm_open", "plm_save", "plm_checkpoint", "plm_release",
+        "plm_history", "plm_restore", "plm_status", "plm_compare",
+        "plm_set_ai_mode", "plm_item_set", "plm_item_add", "plm_where_used",
+        "plm_timeline", "plm_rollback", "plm_add_remote", "plm_sync",
+        "plm_lock", "plm_unlock", "plm_link_repo", "plm_plan",
+    ),
+    "research": (
+        "research_web_search", "research_fetch_page", "research_material_lookup",
+        "research_unit_convert", "research_standard_section",
+        "research_datasheet_fetch", "research_thread_spec", "research_eng_calc",
+        "fit_calc", "recommend_fit",
+    ),
+    "mission": (
+        "dag_plan", "dag_run", "dag_status", "dag_approve", "dag_abort",
+        "dag_replan", "buildgraph_plan", "buildgraph_status",
+        "mission_start", "mission_status", "replan_request",
+    ),
+}
+_cat = _reg.catalog()
+for _fam, _names in _FAMILY_REASSIGN.items():
+    for _n in _names:
+        if _n in _cat:
+            _cat[_n]["family"] = _fam
 
 
 def _install_clean_stdout():

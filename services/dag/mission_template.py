@@ -53,7 +53,7 @@ _TYPE_DELIVER = "report"
 _BUILD_ROLE_BY_KIND = {
     "part": "feature_modeler",
     "assembly": "assembly_fit_engineer",
-    "drawing": "feature_modeler",       # drawing build handled at deliver
+    "drawing": "drawing_detailer",
     "cam_program": "feature_modeler",
     "analysis": "sim_engineer",         # default; overridden by name heuristics
     "report": "reviewer",
@@ -151,12 +151,20 @@ def _resolve_build_role(d: dict[str, Any]) -> str:
     mega-11: analysis kinds named for ECAD/board/schematic/antenna →
     ``ecad_engineer``; firmware/sensor_loop → ``firmware_engineer``; else
     kind table (sim_engineer for generic analysis).
+    Reveng keyword scan (any kind) → ``re_modeler`` before the analysis-only gate.
     """
     kind = d.get("kind") or ""
     role = _BUILD_ROLE_BY_KIND.get(kind, "feature_modeler")
+    blob = _deliverable_blob(d)
+    reveng_keys = (
+        "reverse", "reveng", "scan", "mesh", "point cloud",
+        "photogrammetry", "reverse.engineer", "reverse engineer",
+        "reverse-engineer",
+    )
+    if any(k in blob for k in reveng_keys):
+        return "re_modeler"
     if kind != "analysis":
         return role
-    blob = _deliverable_blob(d)
     fw_keys = (
         "firmware", "sensor_loop", "sensor-loop", "renode", "fw_build",
         "mcu firmware", "embedded",

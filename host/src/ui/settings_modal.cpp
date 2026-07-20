@@ -1745,13 +1745,14 @@ static void drawModelRolesSection(AppState& st, float sc) {
                            ".plm/memory.db. Does not design geometry.");
             }
             if (isRedaction) {
-                ImGui::SameLine();
+                ImGui::SameLine(0.0f, 6.0f * sc);
                 ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusWarn));
                 ImGui::TextUnformatted("[local]");
                 ImGui::PopStyleColor();
                 if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("Redaction must use a loopback (local) provider. "
-                                      "Cloud providers are refused.");
+                    ImGui::SetTooltip(
+                        "Local only \xe2\x80\x94 ITAR redaction stage must not leave the machine.\n"
+                        "Hard-locked to loopback providers; cloud picks are refused.");
             }
 
             ImGui::TableNextColumn();
@@ -1870,9 +1871,8 @@ static void drawModelRolesSection(AppState& st, float sc) {
             }
             if (ro) ImGui::EndDisabled();
 
-            if (isRedaction) {
-                dimText("Local only \xe2\x80\x94 ITAR redaction stage must not leave the machine.");
-            }
+            // Redaction ITAR note lives on the Role [local] badge tooltip — never
+            // TextWrapped inside the fixed-width Thinking column (that blew out the row).
 
             ImGui::PopID();
         }

@@ -86,7 +86,9 @@ static void trayStatusTick(hostd::Server* server) {
     const auto& st = server->status();
     const int eng = st.engineState.load();
     const int clients = st.clients.load();
-    const int inflight = st.inflight.load();
+    // Engine calls only — Status::inflight includes every hello/status poll and
+    // permanently reads "1 in-flight" while a GUI client is connected.
+    const int engInflight = server->engineInflightCount();
     const bool draining = st.draining.load();
     TrayStatus ts = TrayStatus::Idle;
     char tip[256];
@@ -100,10 +102,14 @@ static void trayStatusTick(hostd::Server* server) {
     } else if (eng == 0) {
         ts = TrayStatus::Busy;
         std::snprintf(tip, sizeof tip, "Billet hostd — loading engine…");
-    } else if (clients > 0 || inflight > 0) {
+    } else if (engInflight > 0) {
         ts = TrayStatus::Busy;
         std::snprintf(tip, sizeof tip, "Billet hostd — %d client%s, %d in-flight",
-                      clients, clients == 1 ? "" : "s", inflight);
+                      clients, clients == 1 ? "" : "s", engInflight);
+    } else if (clients > 0) {
+        ts = TrayStatus::Idle;
+        std::snprintf(tip, sizeof tip, "Billet hostd — %d client%s (idle)",
+                      clients, clients == 1 ? "" : "s");
     } else {
         ts = TrayStatus::Idle;
         std::snprintf(tip, sizeof tip, "Billet hostd — idle (ready)");

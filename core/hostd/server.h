@@ -77,6 +77,10 @@ public:
     void stop() { stopping_ = true; }
 
     Status& status() { return status_; }
+    // Count of engine-side calls only (agent_run / doc_* via beginInflight).
+    // Distinct from Status::inflight which counts every RPC including hello/status
+    // and makes the tray show a permanent "1 in-flight" while any client polls.
+    int engineInflightCount() const;
 
 private:
     void clientLoop(std::shared_ptr<ClientConn> c);
@@ -122,7 +126,7 @@ private:
     std::map<std::string, long long> watchBaselineMs_;  // path -> first-seen mtime
     // Engine-call watchdog state.
     struct InflightCall { std::string method; long long startMs = 0; };
-    std::mutex inflightMtx_;
+    mutable std::mutex inflightMtx_;
     std::map<int, InflightCall> inflight_;   // clientId -> current engine call (absent = idle)
     std::thread watchdog_;
     // 90s: safely above any healthy interactive rebuild (they're milliseconds — a pathological

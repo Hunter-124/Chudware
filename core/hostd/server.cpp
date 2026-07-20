@@ -341,6 +341,8 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
         json st{{"state", stateNames[status_.engineState.load()]},
                 {"clients", status_.clients.load()},
                 {"inflight", status_.inflight.load()},
+                // Engine-only (agent_run / heavy doc ops) — tray / Stop UX use this.
+                {"engine_inflight", engineInflightCount()},
                 {"draining", status_.draining.load()},
                 {"git_rev", buildId_},
                 {"engine_build_id", core::cpp_core().buildId()},
@@ -615,6 +617,11 @@ void Server::beginInflight(int clientId, const std::string& method) {
 void Server::endInflight(int clientId) {
     std::lock_guard<std::mutex> lk(inflightMtx_);
     inflight_.erase(clientId);
+}
+
+int Server::engineInflightCount() const {
+    std::lock_guard<std::mutex> lk(inflightMtx_);
+    return (int)inflight_.size();
 }
 
 // Background watchdog: force-restart the daemon if a watchdogged interactive engine call runs

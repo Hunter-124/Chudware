@@ -2302,14 +2302,27 @@ bool SketchMode::tangentArcThrough(const ImVec2& start, const ImVec2& tdir, cons
     return true;
 }
 
-void SketchMode::snapPoint(float& u, float& v, std::string& snapHandle, SnapInfer* infer) const {
+void SketchMode::snapPoint(float& u, float& v, std::string& snapHandle, SnapInfer* infer,
+                           const char* excludeHandle,
+                           const std::set<std::string>* excludeEnts) const {
     snapHandle.clear();
     const float snapPx = kSnapPx * ui::uiScale;   // snap reach tracks DPI
     const ImVec2 cur = uvToScreen(u, v);   // raw cursor (snap distances measure from here)
+    // C56 drag-snap exclusions: excludeHandle drops one exact point handle (the dragged point
+    // tracks the cursor and would self-snap); excludeEnts drops whole entities (group drags).
+    auto excluded = [&](const std::string& handle) {
+        if (excludeHandle && handle == excludeHandle) return true;
+        if (excludeEnts) {
+            std::string base = handle.substr(0, handle.find('.'));
+            if (excludeEnts->count(base)) return true;
+        }
+        return false;
+    };
     // Visit every snappable POINT (handle, u, v) — point snap + alignment share this set.
     auto forEachPoint = [&](const std::function<void(const std::string&, float, float)>& fn) {
         fn("origin", 0.0f, 0.0f);   // the sketch origin is a first-class snap/anchor target
         for (const auto& e : ents_) {
+            if (excludeEnts && excludeEnts->count(e.id)) continue;
             if (e.type == "line" || e.type == "slot") {
                 fn(e.id + ".p1", e.p1[0], e.p1[1]);
                 fn(e.id + ".p2", e.p2[0], e.p2[1]);
@@ -2327,6 +2340,7 @@ void SketchMode::snapPoint(float& u, float& v, std::string& snapHandle, SnapInfe
     // 1) Endpoint/center/point coincident snap within snapPx (screen space) — highest priority.
     float best = snapPx * snapPx;
     forEachPoint([&](const std::string& handle, float eu, float ev) {
+        if (excluded(handle)) return;
         ImVec2 s = uvToScreen(eu, ev);
         float dx = s.x - cur.x, dy = s.y - cur.y;
         float d2 = dx * dx + dy * dy;
@@ -2338,6 +2352,7 @@ void SketchMode::snapPoint(float& u, float& v, std::string& snapHandle, SnapInfe
         best = snapPx * snapPx;
         for (const auto& e : ents_) {
             if (e.type != "line") continue;
+            if (excludeEnts && excludeEnts->count(e.id)) continue;
             float mu2 = (e.p1[0] + e.p2[0]) * 0.5f, mv2 = (e.p1[1] + e.p2[1]) * 0.5f;
             ImVec2 s = uvToScreen(mu2, mv2);
             float dx = s.x - cur.x, dy = s.y - cur.y;
@@ -2352,6 +2367,7 @@ void SketchMode::snapPoint(float& u, float& v, std::string& snapHandle, SnapInfe
         best = snapPx;          // compare |dist - r| in px (1D)
         for (const auto& e : ents_) {
             if (e.type != "circle" && e.type != "arc") continue;
+            if (excludeEnts && excludeEnts->count(e.id)) continue;
             ImVec2 cc = uvToScreen(e.center[0], e.center[1]);
             ImVec2 rimRef = uvToScreen(e.center[0] + e.radius, e.center[1]);
             float rpx = std::hypot(rimRef.x - cc.x, rimRef.y - cc.y);
@@ -2374,6 +2390,7 @@ void SketchMode::snapPoint(float& u, float& v, std::string& snapHandle, SnapInfe
         const float pxPerV = std::hypot(vAxisS_.x, vAxisS_.y);
         float bestU = snapPx, bestV = snapPx;   // screen-px distance along each axis
         forEachPoint([&](const std::string& handle, float eu, float ev) {
+            if (excluded(handle)) return;
             ImVec2 s = uvToScreen(eu, ev);
             float d2 = (s.x - cur.x) * (s.x - cur.x) + (s.y - cur.y) * (s.y - cur.y);
             if (d2 < (2.0f * snapPx) * (2.0f * snapPx)) return;  // too close to the point itself
@@ -2998,6 +3015,209 @@ void SketchMode::updateGroupDrag(AppState& st, float curU, float curV) {
         targets.push_back({{"handle", t.first},
                            {"xy", nlohmann::json::array({t.second.x + dx, t.second.y + dy})}});
     queueSketchDrag(st, {{"targets", targets}});
+}
+
+// C56: snap a live group translate. (gu,gv) is the raw cursor uv; on return it's adjusted so the
+// fired snap lands exactly. Priority: keypoint coincident > u/v alignment > collinear. Preview
+// state (dragSnap* members) is filled for the draw pass + applyDragSnapRelations on drop.
+void SketchMode::groupDragSnap(float& gu, float& gv) {
+    dragSnapLive_ = false; dragSnapHandle_.clear(); groupSnapSrc_.clear();
+    dragRelType_.clear(); dragRelOther_.clear(); dragRelEnt_.clear();
+    dragAlignSrcU_.clear(); dragAlignSrcV_.clear();
+    dragSnapInfer_ = SnapInfer{};
+    if (groupDragTargets_.empty()) return;
+    const float snapPx = kSnapPx * ui::uiScale;
+    const float dx0 = gu - groupDragStartUV_.x, dy0 = gv - groupDragStartUV_.y;
+    std::set<std::string> dragged;
+    for (const auto& t : groupDragTargets_)
+        dragged.insert(t.first.substr(0, t.first.find('.')));
+    auto origOf = [&](const std::string& h) -> ImVec2 {
+        for (const auto& t : groupDragTargets_) if (t.first == h) return t.second;
+        return ImVec2(0, 0);
+    };
+    // Snap targets: origin + keypoints (+ line midpoints) of everything NOT being dragged.
+    struct Tgt { std::string handle; float u, v; };
+    std::vector<Tgt> tgts = {{"origin", 0.0f, 0.0f}};
+    for (const auto& e : ents_) {
+        if (dragged.count(e.id)) continue;
+        if (e.type == "line" || e.type == "slot") {
+            tgts.push_back({e.id + ".p1", e.p1[0], e.p1[1]});
+            tgts.push_back({e.id + ".p2", e.p2[0], e.p2[1]});
+            if (e.type == "line" && inferenceOn_)
+                tgts.push_back({"mid:" + e.id, (e.p1[0] + e.p2[0]) * 0.5f,
+                                (e.p1[1] + e.p2[1]) * 0.5f});
+        } else if (e.type == "circle" || e.type == "arc" || e.type == "arc_slot" ||
+                   e.type == "ellipse") {
+            tgts.push_back({e.id + ".center", e.center[0], e.center[1]});
+        } else if (e.type == "point") {
+            tgts.push_back({e.id + ".p", e.p1[0], e.p1[1]});
+        } else if (e.type == "spline" || e.type == "style_spline") {
+            for (size_t i = 0; i < e.pts.size(); ++i)
+                tgts.push_back({e.id + ".p" + std::to_string(i), e.pts[i].x, e.pts[i].y});
+        }
+    }
+    // 1) Keypoint coincident snap: closest (dragged keypoint, target) pair in screen space.
+    {
+        float best = snapPx * snapPx;
+        const Tgt* bt = nullptr;
+        std::string bsrc;
+        for (const auto& t : groupDragTargets_) {
+            ImVec2 a = uvToScreen(t.second.x + dx0, t.second.y + dy0);
+            for (const auto& g : tgts) {
+                ImVec2 b = uvToScreen(g.u, g.v);
+                float ddx = a.x - b.x, ddy = a.y - b.y;
+                float d2 = ddx * ddx + ddy * ddy;
+                if (d2 < best) { best = d2; bt = &g; bsrc = t.first; }
+            }
+        }
+        if (bt) {
+            ImVec2 o = origOf(bsrc);
+            gu += bt->u - (o.x + dx0);
+            gv += bt->v - (o.y + dy0);
+            dragSnapHandle_ = bt->handle; groupSnapSrc_ = bsrc;
+            dragSnapUV_ = ImVec2(bt->u, bt->v); dragSnapLive_ = true;
+            return;
+        }
+    }
+    if (!inferenceOn_) return;
+    const float pxPerU = std::hypot(uAxisS_.x, uAxisS_.y);
+    const float pxPerV = std::hypot(vAxisS_.x, vAxisS_.y);
+    // 2) Single-axis alignment: a dragged keypoint's u (or v) matches a target point's u (or v).
+    {
+        float bestU = snapPx, bestV = snapPx;
+        const Tgt *btU = nullptr, *btV = nullptr;
+        std::string srcU, srcV;
+        for (const auto& t : groupDragTargets_) {
+            float pu = t.second.x + dx0, pv = t.second.y + dy0;
+            for (const auto& g : tgts) {
+                if (snapHasPrefix(g.handle, "mid:")) continue;   // alignment vs. real points only
+                float dU = std::fabs(pu - g.u) * pxPerU;
+                float dV = std::fabs(pv - g.v) * pxPerV;
+                if (dU < bestU) { bestU = dU; btU = &g; srcU = t.first; }
+                if (dV < bestV) { bestV = dV; btV = &g; srcV = t.first; }
+            }
+        }
+        if (btU || btV) {
+            if (btU) {
+                ImVec2 o = origOf(srcU);
+                gu += btU->u - (o.x + dx0);
+                dragSnapInfer_.alignU = true; dragSnapInfer_.srcU = ImVec2(btU->u, btU->v);
+                dragSnapInfer_.srcUHandle = btU->handle; dragAlignSrcU_ = srcU;
+            }
+            if (btV) {
+                ImVec2 o = origOf(srcV);
+                gv += btV->v - (o.y + dy0);
+                dragSnapInfer_.alignV = true; dragSnapInfer_.srcV = ImVec2(btV->u, btV->v);
+                dragSnapInfer_.srcVHandle = btV->handle; dragAlignSrcV_ = srcV;
+            }
+            const std::string& anchor = btU ? srcU : srcV;
+            ImVec2 o = origOf(anchor);
+            dragSnapUV_ = ImVec2(o.x + (gu - groupDragStartUV_.x),
+                                 o.y + (gv - groupDragStartUV_.y));
+            dragSnapLive_ = true;
+            return;
+        }
+    }
+    // 3) Collinear snap: a dragged line whose direction is parallel to a static line and whose
+    //    supporting line is within snap range snaps perpendicular so the two lines coincide.
+    for (const auto& e : ents_) {
+        if (!dragged.count(e.id) || e.type != "line") continue;
+        float dux = e.p2[0] - e.p1[0], duv = e.p2[1] - e.p1[1];
+        float L = std::hypot(dux, duv);
+        if (L < 1e-5f) continue;
+        dux /= L; duv /= L;
+        const float live1u = e.p1[0] + dx0, live1v = e.p1[1] + dy0;
+        for (const auto& oe : ents_) {
+            if (dragged.count(oe.id) || oe.type != "line") continue;
+            float ox = oe.p2[0] - oe.p1[0], oy = oe.p2[1] - oe.p1[1];
+            float oL = std::hypot(ox, oy);
+            if (oL < 1e-5f) continue;
+            ox /= oL; oy /= oL;
+            float ang = std::acos(std::fmin(1.0f, std::fabs(dux * ox + duv * oy))) * 57.2957795f;
+            if (ang > kInferHVDeg) continue;   // not parallel — a translate can't fix that
+            // Signed perpendicular distance from oe.p1 to the dragged line's supporting line.
+            float cross = (oe.p1[0] - live1u) * duv - (oe.p1[1] - live1v) * dux;
+            float crossPx = std::fabs(cross) * pxPerU;
+            if (crossPx > snapPx || crossPx < 0.01f) continue;   // out of range / already exact
+            gu += cross * duv;   // shift along the normal so the supporting lines coincide
+            gv += -cross * dux;
+            dragRelType_ = "collinear"; dragRelEnt_ = e.id; dragRelOther_ = oe.id;
+            dragSnapUV_ = ImVec2((live1u + e.p2[0] + dx0) * 0.5f + cross * duv,
+                                 (live1v + e.p2[1] + dy0) * 0.5f - cross * dux);
+            dragSnapLive_ = true;
+            return;
+        }
+    }
+}
+
+// C56: is this relation already on the sketch? Compares type + refs as an unordered set so a
+// drag drop never double-adds a constraint that already exists (e.g. re-dropping onto the same
+// origin the entity is already coincident with).
+bool SketchMode::constraintExists(const std::string& type,
+                                  const std::vector<std::string>& refs) const {
+    for (const SketchConstraint& c : cons_) {
+        if (c.type != type || c.refs.size() != refs.size()) continue;
+        std::vector<std::string> a = c.refs, b = refs;
+        std::sort(a.begin(), a.end());
+        std::sort(b.begin(), b.end());
+        if (a == b) return true;
+    }
+    return false;
+}
+
+// C56: commit the previewed drag-snap relations as real constraints (Settings -> Modeling).
+// Runs right after sketch_drag_commit so the geometry is already at the snapped position; the
+// solver only has to record the relation. One applyOps batch = one undo step.
+void SketchMode::applyDragSnapRelations(AppState& st, bool groupDrag) {
+    const bool live = dragSnapLive_;
+    const std::string snap = dragSnapHandle_;
+    const SnapInfer infer = dragSnapInfer_;
+    const std::string relType = dragRelType_, relOther = dragRelOther_, relEnt = dragRelEnt_;
+    const std::string src = groupDrag ? groupSnapSrc_ : dragHandle_;
+    const std::string alignSrcU = dragAlignSrcU_, alignSrcV = dragAlignSrcV_;
+    dragSnapLive_ = false; dragSnapHandle_.clear(); dragRelType_.clear();
+    dragRelOther_.clear(); dragRelEnt_.clear(); groupSnapSrc_.clear();
+    dragAlignSrcU_.clear(); dragAlignSrcV_.clear();
+    dragSnapInfer_ = SnapInfer{};
+    if (!live || !st.settings.sketchDragSnapRelations) return;
+
+    nlohmann::json cs = nlohmann::json::array();
+    auto push = [&](const char* type, std::vector<std::string> refs) {
+        if (!constraintExists(type, refs))
+            cs.push_back({{"type", type}, {"refs", std::move(refs)}});
+    };
+    // Point snap / alignment relations need the dragged point handle; a group drag that only
+    // fired a collinear/parallel line relation has no keypoint snap and skips these.
+    if (!snap.empty() && !src.empty()) {
+        if (snapHasPrefix(snap, "mid:"))
+            push("midpoint", {src, snap.substr(4)});
+        else if (snapHasPrefix(snap, "rim:"))
+            push("point_on", {src, snap.substr(4)});
+        else
+            push("coincident", {snap, src});
+    } else if (!src.empty() || !alignSrcU.empty() || !alignSrcV.empty()) {
+        // Alignment guides -> two-point vertical (same u) / horizontal (same v) relations.
+        const std::string srcU = alignSrcU.empty() ? src : alignSrcU;
+        const std::string srcV = alignSrcV.empty() ? src : alignSrcV;
+        if (infer.alignU && !infer.srcUHandle.empty() && !srcU.empty())
+            push("vertical", {infer.srcUHandle, srcU});
+        if (infer.alignV && !infer.srcVHandle.empty() && !srcV.empty())
+            push("horizontal", {infer.srcVHandle, srcV});
+    }
+    if (!relType.empty() && !relEnt.empty()) {
+        if (relType == "horizontal" || relType == "vertical")
+            push(relType.c_str(), {relEnt});
+        else if ((relType == "parallel" || relType == "collinear") && !relOther.empty())
+            push(relType.c_str(), {relEnt, relOther});
+    }
+    if (cs.empty()) return;
+    nlohmann::json ops = nlohmann::json::array();
+    for (const auto& c : cs)
+        ops.push_back({{"op", "sketch_add_constraint"}, {"sketch", fid_}, {"constraint", c}});
+    auto r = st.docMirror.applyOps(st.worker, ops);
+    if (!r.ok) { st.addLog("[sketch] drag-snap relation failed: " + r.error_message); return; }
+    if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+    resolve(st);
 }
 
 // ---------------------------------------------------------------------------
@@ -6527,6 +6747,10 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             if (frame != dragFrame_) {
                 dragFrame_ = frame;
                 float gu, gv; screenToUV(io.MousePos, gu, gv);
+                // C56: snap the translate to origin/keypoints/midpoints, alignment guides, and
+                // collinear lines; the previewed relation is committed on drop.
+                if (st.settings.sketchDragSnapRelations) groupDragSnap(gu, gv);
+                else dragSnapLive_ = false;
                 updateGroupDrag(st, gu, gv);
             }
             st.requestCursor(ui::CursorKind::Hand);
@@ -6559,8 +6783,83 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                     extra = {{"handle", dragHandle_},
                              {"xy", nlohmann::json::array({ang, 0.0})}};
                 } else {
+                    // C56: snap the dragged point to origin/endpoints/centers/midpoints/rims and
+                    // u/v alignment guides (excludes itself); line endpoints additionally infer
+                    // horizontal/vertical/parallel/collinear direction. Committed on drop.
+                    float su = mu, sv = mv;
+                    dragSnapLive_ = false; dragSnapHandle_.clear();
+                    dragRelType_.clear(); dragRelOther_.clear(); dragRelEnt_.clear();
+                    dragAlignSrcU_.clear(); dragAlignSrcV_.clear();
+                    dragSnapInfer_ = SnapInfer{};
+                    if (st.settings.sketchDragSnapRelations) {
+                        snapPoint(su, sv, dragSnapHandle_, &dragSnapInfer_,
+                                  dragHandle_.c_str(), nullptr);
+                        dragSnapLive_ = true;
+                        // Line-endpoint direction inference (only when no point snap fired).
+                        if (dragSnapHandle_.empty() && hEnt && hEnt->type == "line" &&
+                            (hSuf(dragHandle_, "p1") || hSuf(dragHandle_, "p2"))) {
+                            const bool isP1 = hSuf(dragHandle_, "p1");
+                            const float ax = isP1 ? hEnt->p2[0] : hEnt->p1[0];
+                            const float ay = isP1 ? hEnt->p2[1] : hEnt->p1[1];
+                            const float du = su - ax, dv = sv - ay;
+                            const float ang = std::atan2(std::fabs(dv), std::fabs(du)) * 57.2957795f;
+                            if (ang < kInferHVDeg && (du != 0.0f || dv != 0.0f)) {
+                                sv = ay; dragRelType_ = "horizontal"; dragRelEnt_ = hEid;
+                                if (dragSnapInfer_.alignV && dragSnapInfer_.srcV.y != ay)
+                                    dragSnapInfer_.alignV = false;
+                            } else if (ang > 90.0f - kInferHVDeg) {
+                                su = ax; dragRelType_ = "vertical"; dragRelEnt_ = hEid;
+                                if (dragSnapInfer_.alignU && dragSnapInfer_.srcU.x != ax)
+                                    dragSnapInfer_.alignU = false;
+                            } else {
+                                // Parallel / collinear to another line: project the cursor onto
+                                // the snapped direction ray from the fixed endpoint.
+                                const float segL = std::hypot(du, dv);
+                                if (segL > 1e-5f) {
+                                    const float pxPerU = std::hypot(uAxisS_.x, uAxisS_.y);
+                                    const float snapPx = kSnapPx * ui::uiScale;
+                                    float bestPx = snapPx;
+                                    float bestU = 0, bestV = 0;
+                                    const SketchEntity* bestOe = nullptr;
+                                    bool bestCol = false;
+                                    for (const auto& oe : ents_) {
+                                        if (oe.id == hEid || oe.type != "line") continue;
+                                        float ox = oe.p2[0] - oe.p1[0], oy = oe.p2[1] - oe.p1[1];
+                                        float oL = std::hypot(ox, oy);
+                                        if (oL < 1e-5f) continue;
+                                        ox /= oL; oy /= oL;
+                                        float dot = du * ox + dv * oy;
+                                        float sdirx = dot >= 0 ? ox : -ox, sdiry = dot >= 0 ? oy : -oy;
+                                        float cosang = std::fabs(dot) / segL;
+                                        if (std::acos(std::fmin(1.0f, cosang)) * 57.2957795f >
+                                            kInferHVDeg) continue;
+                                        float t = du * sdirx + dv * sdiry;
+                                        if (t <= 0.0f) continue;
+                                        float cu = ax + sdirx * t, cv = ay + sdiry * t;
+                                        float offPx = std::hypot(su - cu, sv - cv) * pxPerU;
+                                        if (offPx >= bestPx) continue;
+                                        // Collinear when the ray's supporting line passes
+                                        // through the other line (perp distance ~ 0).
+                                        float cross = (oe.p1[0] - ax) * sdiry -
+                                                      (oe.p1[1] - ay) * sdirx;
+                                        bestPx = offPx; bestU = cu; bestV = cv; bestOe = &oe;
+                                        bestCol = std::fabs(cross) * pxPerU <= snapPx;
+                                    }
+                                    if (bestOe) {
+                                        su = bestU; sv = bestV;
+                                        dragRelType_ = bestCol ? "collinear" : "parallel";
+                                        dragRelEnt_ = hEid; dragRelOther_ = bestOe->id;
+                                        dragSnapInfer_.alignU = dragSnapInfer_.alignV = false;
+                                    }
+                                }
+                            }
+                        }
+                        dragSnapUV_ = ImVec2(su, sv);
+                        dragSnapLive_ = !dragSnapHandle_.empty() || dragSnapInfer_.alignU ||
+                                        dragSnapInfer_.alignV || !dragRelType_.empty();
+                    }
                     extra = {{"handle", dragHandle_},
-                             {"xy", nlohmann::json::array({(double)mu, (double)mv})}};
+                             {"xy", nlohmann::json::array({(double)su, (double)sv})}};
                 }
                 queueSketchDrag(st, std::move(extra));
             }
@@ -6599,11 +6898,70 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 st.pan[2] += (-R.z * gx + U.z * gy) * worldPerPx;
             }
         }
+        // ---- C56: drag snap preview — marker at the snapped point, dashed alignment guides,
+        // and chips showing exactly which relation(s) the drop will add.
+        if ((dragging_ || groupDragging_) && dragSnapLive_ &&
+            ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            const ImU32 inferCol = col(pal.sketchInfer);
+            const ImU32 halo = col(pal.viewportTop, 0.65f);
+            ImVec2 sCur = uvToScreen(dragSnapUV_.x, dragSnapUV_.y);
+            const float dd = 6.0f * ui::uiScale, dg = 4.0f * ui::uiScale, dw = 1.2f * ui::uiScale;
+            if (dragSnapHandle_.empty()) {
+                if (dragSnapInfer_.alignU)
+                    drawDashedLine(dl, uvToScreen(dragSnapInfer_.srcU.x, dragSnapInfer_.srcU.y),
+                                   sCur, inferCol, dw, dd, dg);
+                if (dragSnapInfer_.alignV)
+                    drawDashedLine(dl, uvToScreen(dragSnapInfer_.srcV.x, dragSnapInfer_.srcV.y),
+                                   sCur, inferCol, dw, dd, dg);
+            }
+            // Snap marker — same vocabulary as the drawing tools (dot / ring / diamond).
+            const float ms = 5.0f * ui::uiScale;
+            if (!dragSnapHandle_.empty()) {
+                dl->AddCircleFilled(sCur, ms * 2.4f, halo, 0);
+                if (snapHasPrefix(dragSnapHandle_, "mid:")) {
+                    ImVec2 d[4] = {ImVec2(sCur.x, sCur.y - ms * 1.5f), ImVec2(sCur.x + ms * 1.5f, sCur.y),
+                                   ImVec2(sCur.x, sCur.y + ms * 1.5f), ImVec2(sCur.x - ms * 1.5f, sCur.y)};
+                    dl->AddQuad(d[0], d[1], d[2], d[3], inferCol, 1.6f * ui::uiScale);
+                } else if (snapHasPrefix(dragSnapHandle_, "rim:")) {
+                    dl->AddCircle(sCur, ms * 1.4f, inferCol, 0, 1.6f * ui::uiScale);
+                } else if (dragSnapHandle_.find(".center") != std::string::npos) {
+                    dl->AddCircle(sCur, ms, inferCol, 0, 1.6f * ui::uiScale);
+                    dl->AddCircle(sCur, ms * 1.9f, inferCol, 0, 1.2f * ui::uiScale);
+                } else {   // endpoint / point / origin
+                    dl->AddCircleFilled(sCur, ms * 0.7f, inferCol);
+                    dl->AddCircle(sCur, ms * 1.4f, inferCol, 0, 1.2f * ui::uiScale);
+                }
+            } else {
+                dl->AddCircle(sCur, 4.0f * ui::uiScale, inferCol, 0, 1.5f * ui::uiScale);
+            }
+            // Pending-relation chips below-right of the cursor (same chip style as the tools).
+            const float bs2 = 16.0f * ui::uiScale;
+            float chipX = io.MousePos.x + bs2;
+            const float chipY = io.MousePos.y + bs2;
+            auto chip = [&](const char* relType) {
+                ImVec2 gp(chipX, chipY);
+                ImVec2 c0(gp.x - bs2 * 0.5f, gp.y - bs2 * 0.5f), c1(gp.x + bs2 * 0.5f, gp.y + bs2 * 0.5f);
+                dl->AddRectFilled(c0, c1, col(pal.sketchRelBg), 3.5f * ui::uiScale);
+                dl->AddRect(c0, c1, col(pal.sketchRelBorder), 3.5f * ui::uiScale, 0,
+                            1.2f * ui::uiScale);
+                drawRelationGlyph(dl, gp, bs2, relType, col(pal.sketchInk));
+                chipX += bs2 + 2.0f * ui::uiScale;
+            };
+            if (!dragSnapHandle_.empty()) {
+                if (snapHasPrefix(dragSnapHandle_, "mid:")) chip("midpoint");
+                else if (snapHasPrefix(dragSnapHandle_, "rim:")) chip("point_on");
+                else chip("coincident");
+            } else {
+                if (dragSnapInfer_.alignU) chip("vertical");
+                if (dragSnapInfer_.alignV) chip("horizontal");
+            }
+            if (!dragRelType_.empty()) chip(dragRelType_.c_str());
+        }
         if (ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
-            if (dragging_) { dragging_ = false; commitDrag(st); }
+            if (dragging_) { dragging_ = false; commitDrag(st); applyDragSnapRelations(st, false); }
             else if (groupDragging_) {
                 // C51: profile/selection translate finished -> persist it as one undoable batch.
-                groupDragging_ = false; commitDrag(st);
+                groupDragging_ = false; commitDrag(st); applyDragSnapRelations(st, true);
             }
             else if (dragArmed_) {
                 // Released without dragging -> select the point handle (vertex/center pick).

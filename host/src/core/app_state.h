@@ -137,6 +137,10 @@ struct Settings {
     Units units = Units::MMGS;   // document display/input unit system — persisted to config.json
     bool orthographic = true;    // viewport projection: true=orthographic (CAD default), false=perspective
                                  // — persisted to config.json as "orthographic"
+    // Sketcher drag snap-and-relate: while dragging a sketch entity/point, snap to the origin,
+    // keypoints, midpoints, rims, and alignment guides; auto-add the previewed relation on drop.
+    // Settings → Modeling. Serialized "sketch_drag_snap_relations".
+    bool sketchDragSnapRelations = true;
     bool partsGridView = false;  // Parts Library results as grid cards vs list — "parts_grid_view"
     // Parts Library GUI V2: expanded taxonomy categories + result sort mode
     // (0=Relevance 1=Price low→high 2=Price high→low 3=Name). Serialized as

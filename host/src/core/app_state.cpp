@@ -370,6 +370,7 @@ void loadSettings(Settings& s) {
         s.systemPrompt = j.value("system_prompt", "");
         s.theme = j.value("theme", "light");
         s.orthographic = j.value("orthographic", true);
+        s.sketchDragSnapRelations = j.value("sketch_drag_snap_relations", true);
         s.units = (j.value("units", std::string("mmgs")) == "ips") ? Units::IPS : Units::MMGS;
         s.partsGridView = j.value("parts_grid_view", false);
         s.partsSortMode = j.value("parts_sort_mode", 0);
@@ -615,6 +616,7 @@ void saveSettings(const Settings& s) {
     if (!s.systemPrompt.empty()) j["system_prompt"] = s.systemPrompt;
     j["theme"] = s.theme;
     j["orthographic"] = s.orthographic;
+    j["sketch_drag_snap_relations"] = s.sketchDragSnapRelations;
     j["units"] = (s.units == Units::IPS) ? "ips" : "mmgs";
     j["parts_grid_view"] = s.partsGridView;
     j["parts_sort_mode"] = s.partsSortMode;

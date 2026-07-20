@@ -13,6 +13,7 @@
 #pragma once
 
 #include <array>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -370,7 +371,9 @@ private:
     //   "rim:e5"                        circle/arc rim snap -> point_on (+ maybe tangent) candidate
     //   ""                              nothing within range
     // Midpoint/rim/alignment fire only while inferenceOn_; plain point snap is always on.
-    void snapPoint(float& u, float& v, std::string& snapHandle, SnapInfer* infer = nullptr) const;
+    void snapPoint(float& u, float& v, std::string& snapHandle, SnapInfer* infer = nullptr,
+                   const char* excludeHandle = nullptr,
+                   const std::set<std::string>* excludeEnts = nullptr) const;
     int hitTestHandle(const ImVec2& s, std::string& handleOut, float& uOut, float& vOut) const;
     // Nearest WHOLE entity under the screen point (line segment / circle rim / arc rim distance);
     // returns the index into ents_ or -1. Used by Trim / Extend / Offset hover + pick (C29-B).
@@ -586,6 +589,29 @@ private:
     bool dragArmed_ = false;
     std::string pendingHandle_;
     ImVec2 dragDownPos_{0, 0};
+
+    // C56: drag snap-and-relate (Settings::sketchDragSnapRelations, default on). While a point
+    // handle or a whole-entity/group translate is being dragged, the dragged point snaps to the
+    // origin / endpoints / centers / midpoints / rims and u/v alignment guides (line endpoint
+    // drags additionally infer horizontal/vertical/parallel/collinear direction). The pending
+    // relation is previewed as cursor chips + the usual snap markers, and committed as real
+    // sketch_add_constraint ops on drop (applyDragSnapRelations).
+    bool        dragSnapLive_ = false;   // preview state valid this frame (a drag is active)
+    std::string dragSnapHandle_;         // snapPoint-encoded target ("origin"/"e3.p1"/"mid:e3"/"rim:e4")
+    SnapInfer   dragSnapInfer_;          // u/v alignment guides fired during the drag
+    std::string dragRelType_;            // inferred line relation: horizontal|vertical|parallel|collinear
+    std::string dragRelEnt_;             // dragged line the relation belongs to
+    std::string dragRelOther_;           // other entity id for parallel/collinear
+    std::string groupSnapSrc_;           // group drag: dragged keypoint handle that fired the snap
+    std::string dragAlignSrcU_, dragAlignSrcV_;  // group drags: dragged keypoint per alignment axis
+    ImVec2      dragSnapUV_{0, 0};       // snapped dragged-point position (marker/chip anchor)
+    // Snap a live group translate: adjusts (gu,gv) so the fired keypoint/alignment/collinear
+    // snap lands exactly and fills the drag-snap preview state above.
+    void groupDragSnap(float& gu, float& gv);
+    // Emit the previewed relations as constraints after sketch_drag_commit. `srcHandle` is the
+    // dragged point (dragHandle_ or groupSnapSrc_); skips relations that already exist.
+    void applyDragSnapRelations(AppState& st, bool groupDrag);
+    bool constraintExists(const std::string& type, const std::vector<std::string>& refs) const;
 
     // C41 (T2): in-sketch selection (tool_ == None). Left-click on/near an entity selects it
     // (Ctrl+click toggles multi-select); Delete/Backspace deletes the selection via

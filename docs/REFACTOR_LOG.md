@@ -1893,3 +1893,21 @@ RPCs can't wipe canned state; scenarios `reveng_scale`/`model`/`deliver` added.
 `_review`) each wrote PNG with 0 imgui-error/assert hits. **Deferred:**
 `feedRevEngEvent` still has no real orch event-journal drain — reconstruct % stays
 at kick seed until that wires; live stage-badge → sub-stepper mapping is poll-only.
+
+## 2026-07-19 — Drag snap-and-relate + Settings > Modeling (C56)
+
+**sketch_mode.cpp/.h**: point-handle and group (entity/loop) drags now snap live —
+origin/endpoints/centers/midpoints/rims + u/v alignment guides for all drags;
+line-endpoint drags additionally infer horizontal/vertical direction and
+parallel/collinear to other lines; group translates snap dragged keypoints to
+static keypoints/midpoints and dragged lines to collinear. `snapPoint` grew
+optional exclude params (dragged handle / dragged entity set). Preview = the
+tools' snap markers + dashed guides + pending-relation chips at the cursor; on
+drop `applyDragSnapRelations` commits real `sketch_add_constraint` ops via
+DocMirror (one undo step), deduped against `cons_`. **app_state.{h,cpp} /
+settings_modal.cpp**: new Settings > Modeling tab (jump id 8, non-linear —
+legacy 2/3/4-7 indices untouched) holding the master toggle
+`sketch_drag_snap_relations` (default on). **Verify:** host build green;
+`AI_CAD_SHOT=sketch` scenario complete; gui_lint theme clean. **Deferred:**
+rim-snap and parallel inference for group drags (keypoint/alignment/collinear
+only); point_on glyph renders as the neutral dot (no dedicated glyph).

@@ -16,6 +16,7 @@ CATEGORY_EXPAND_CAP = 40
 META_TOOLS: frozenset[str] = frozenset({
     "enable_tools",
     "list_tool_categories",
+    "design_recipe",
 })
 
 # Logical packs → concrete names and/or family:X tokens. Pure data; family tokens

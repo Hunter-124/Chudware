@@ -1,0 +1,25 @@
+schema: aicad.recipe/1
+id: cam_2p5d_job
+title: 2.5D CAM job
+domains: [cam]
+keywords: [CAM, toolpath, stock, facing, pocket, post, g-code]
+summary: Stock to setup to tool to ops to generate to simulate clean to post.
+steps:
+  - tool: cam_new_job
+    note: Create job linked to part.
+  - tool: cam_set_stock
+    note: Material + envelope.
+  - tool: cam_add_setup
+    note: WCS / fixture.
+  - tool: cam_add_tool
+    note: From library.
+  - tool: cam_add_operation
+    note: Facing then rough then finish then drill.
+  - tool: cam_generate
+    note: Build toolpaths.
+  - tool: cam_simulate
+    note: Must be clean before post.
+  - tool: cam_post
+    note: Only after clean simulate.
+verify:
+  - cam_simulate clean

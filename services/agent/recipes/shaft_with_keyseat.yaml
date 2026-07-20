@@ -1,0 +1,15 @@
+schema: aicad.recipe/1
+id: shaft_with_keyseat
+title: Shaft with keyseat
+domains: [cad]
+keywords: [shaft, keyseat, keyway, shoulder, journal]
+summary: Stepped shaft with keyseat cut to standard width/depth.
+steps:
+  - tool: add_features
+    note: Revolve/extrude stepped shaft profile.
+  - tool: add_features
+    note: Keyseat cut to standard size for shaft OD.
+  - tool: measure_part
+    note: Journal diameters and keyseat width/depth.
+verify:
+  - keyseat matches standard for shaft diameter

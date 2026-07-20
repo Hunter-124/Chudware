@@ -1,0 +1,19 @@
+schema: aicad.recipe/1
+id: sheet_metal_box
+title: Sheet metal box
+domains: [sheetmetal, cad]
+keywords: [sheet metal, base flange, edge flange, flat pattern, K-factor, bend]
+summary: Constant-thickness folded box via sm_* features.
+steps:
+  - tool: bend_allowance
+    note: K-factor / BA for thickness and radius.
+  - tool: add_features
+    note: sm_base_flange on closed sketch first.
+  - tool: query_geometry
+    note: Resolve bend edges on thickness faces.
+  - tool: add_features
+    note: sm_edge_flange walls; optional sm_flat_pattern.
+  - tool: wall_thickness
+    note: Confirm constant thickness.
+verify:
+  - body is sheet-metal marked

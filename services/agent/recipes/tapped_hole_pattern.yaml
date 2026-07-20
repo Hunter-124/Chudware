@@ -1,0 +1,17 @@
+schema: aicad.recipe/1
+id: tapped_hole_pattern
+title: Tapped hole pattern
+domains: [cad]
+keywords: [tap, threaded hole, pilot, M6x1, UNC, engagement]
+summary: Add correctly piloted tapped holes with engagement depth for the material.
+steps:
+  - tool: describe_part
+    note: Name the face and thickness at the tap.
+  - tool: research_thread_spec
+    note: Get pitch and recommended engagement.
+  - tool: add_features
+    note: Pilot + thread feature; depth meets engagement rule.
+  - tool: measure_part
+    note: Confirm pilot diameter and depth.
+verify:
+  - pilot matches tap drill table

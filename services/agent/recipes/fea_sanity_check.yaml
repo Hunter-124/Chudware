@@ -1,0 +1,19 @@
+schema: aicad.recipe/1
+id: fea_sanity_check
+title: FEA sanity check
+domains: [sim]
+keywords: [FEA, stress, static, mesh, fixture, anchor]
+summary: Anchor, one load case, static FEA, compare to closed-form.
+steps:
+  - tool: set_material
+    note: Registry material.
+  - tool: research_eng_calc
+    note: Closed-form anchor; ledger expected stress.
+  - tool: describe_part
+    note: Name fixture and load faces.
+  - tool: run_fea_static
+    note: One load case; coarse mesh first.
+  - tool: describe_results
+    note: Compare to anchor within ~2-3x.
+verify:
+  - anchor recorded

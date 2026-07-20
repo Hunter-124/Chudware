@@ -143,6 +143,11 @@ def render_tools_block(
                     "- list_tool_categories()\n"
                     "    List requestable tool category packs (name + one line)."
                 )
+            elif tool == "design_recipe":
+                entry = (
+                    "- design_recipe(query: str, max_results: int = 3)\n"
+                    "    NL intent → ordered tool recipe steps (empty query = catalog)."
+                )
             else:
                 entry = f"- {tool}(…)  # schema unavailable"
         else:
@@ -151,13 +156,22 @@ def render_tools_block(
             entry = f"- {schema['signature']}"
             if desc:
                 entry += f"\n    {desc}"
+            try:
+                from services.agent.config import get_tool_options  # noqa: PLC0415
+                note = (get_tool_options(None, tool).get("prompt_note") or "").strip()
+                if note:
+                    entry += f"\n    Note: {note}"
+            except Exception:  # noqa: BLE001
+                pass
         cost = _count_tokens(entry)
         if used + cost > budget:
             omitted.append(tool)
             continue
         lines.append(entry)
         used += cost
-        if fn is None and tool not in ("enable_tools", "list_tool_categories"):
+        if fn is None and tool not in (
+            "enable_tools", "list_tool_categories", "design_recipe",
+        ):
             unresolved.append(tool)
         else:
             rendered.append(tool)

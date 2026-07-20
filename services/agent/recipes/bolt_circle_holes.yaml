@@ -1,0 +1,20 @@
+schema: aicad.recipe/1
+id: bolt_circle_holes
+title: Bolt circle hole pattern
+domains: [cad, assembly]
+keywords: [bolt circle, PCD, flange bolts, hole pattern, M6, M8]
+summary: Lay out a circular fastener pattern on a face with correct clearance/tap holes.
+steps:
+  - tool: describe_part
+    note: Identify the flange face and center.
+  - tool: measure_part
+    note: Confirm pitch diameter and thickness.
+  - tool: research_thread_spec
+    note: Resolve thread major diameter for tap/clearance.
+  - tool: add_features
+    note: Sketch bolt circle + hole feature patterned about axis.
+  - tool: check_feature_overlap
+    note: Ensure holes do not merge incorrectly.
+verify:
+  - measure_between on opposite holes equals PCD
+  - verify_battery clean

@@ -8,6 +8,7 @@
 #include <ctime>
 #include <fstream>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -4138,17 +4139,86 @@ void drawSettingsModal(AppState& st, bool busy) {
 
                         settingsGlassSectionBegin("##ai_tools_families", "Tool families");
                         dimText("Enable or disable MCP tool families the agent may call. "
-                                "Saved under config.json agent.tool_families.");
+                                "Expand a family for per-tool options (timeout, call caps, "
+                                "param defaults, prompt notes). Saved under config.json "
+                                "agent.tool_families / agent.tool_options.");
                         static std::map<std::string, bool> s_toolFam;
                         static double s_toolFamLast = -1e9;
                         static bool s_toolFamDirty = false;
+                        static bool s_toolOptDirty = false;
+                        static std::map<std::string, bool> s_toolEnabled;
+                        static std::map<std::string, int> s_toolTimeout;
+                        static std::map<std::string, int> s_toolMaxCalls;
+                        static std::map<std::string, std::string> s_toolDefaults;
+                        static std::map<std::string, std::string> s_toolNote;
+                        static std::string s_toolOptErr;
                         static const char* kToolFamilies[] = {
                             "cad", "ecad", "cam", "em", "reveng", "plm", "parts",
                             "advisor", "ledger", "intake", "recon", "gsl",
-                            "workspace", "org", "research", "sim"
+                            "workspace", "org", "research", "sim", "mission"
                         };
                         static constexpr int kToolFamilyCount =
                             (int)(sizeof(kToolFamilies) / sizeof(kToolFamilies[0]));
+                        // Static per-family tool lists (mirrors services/mcp test inventory).
+                        struct FamTools { const char* fam; const char* const* tools; int n; };
+                        static const char* kCadTools[] = {
+                            "cad_guide","new_part","add_features","render_part","close_part",
+                            "make_drawing","add_drawing_view","add_dimension","add_gdt",
+                            "export_drawing","measure_part","check_interference","solve_mates"
+                        };
+                        static const char* kSimTools[] = {
+                            "run_fea_static","run_fea_modal","run_fea_thermal","run_cfd_flow",
+                            "run_cfd_accurate","simulate_motion"
+                        };
+                        static const char* kCamTools[] = {
+                            "cam_new_job","cam_set_stock","cam_add_setup","cam_add_tool",
+                            "cam_add_operation","cam_generate","cam_simulate","cam_post"
+                        };
+                        static const char* kEcadTools[] = {
+                            "ecad_new_schematic","ecad_new_pcb","place_symbol","wire",
+                            "autoroute","run_erc","run_drc","board_from_schematic"
+                        };
+                        static const char* kPartsTools[] = {
+                            "part_search","part_get","part_place","part_source",
+                            "bom_price","bom_rollup","request_quote"
+                        };
+                        static const char* kRevengTools[] = {
+                            "reverse_engineer","compare_parts","convert_face_to_sketch",
+                            "measure_from_photo","start_capture_session"
+                        };
+                        static const char* kPlmTools[] = {
+                            "plm_init","plm_open","plm_checkpoint","plm_release",
+                            "plm_history","plm_where_used","plm_rollback","plm_status"
+                        };
+                        static const char* kResearchTools[] = {
+                            "research_web_search","research_fetch_page","research_material_lookup",
+                            "research_eng_calc","fit_calc","recommend_fit"
+                        };
+                        static const char* kMissionTools[] = {
+                            "dag_plan","dag_run","dag_status","mission_start","mission_status",
+                            "buildgraph_plan","replan_request"
+                        };
+                        static const char* kGslTools[] = {
+                            "describe_part","describe_sketch","sketch_health","render_sketch"
+                        };
+                        static const char* kAdvisorTools[] = {
+                            "advise","stage_set","advisory_dispute"
+                        };
+                        static const FamTools kFamToolMap[] = {
+                            {"cad", kCadTools, (int)(sizeof(kCadTools)/sizeof(kCadTools[0]))},
+                            {"sim", kSimTools, (int)(sizeof(kSimTools)/sizeof(kSimTools[0]))},
+                            {"cam", kCamTools, (int)(sizeof(kCamTools)/sizeof(kCamTools[0]))},
+                            {"ecad", kEcadTools, (int)(sizeof(kEcadTools)/sizeof(kEcadTools[0]))},
+                            {"parts", kPartsTools, (int)(sizeof(kPartsTools)/sizeof(kPartsTools[0]))},
+                            {"reveng", kRevengTools, (int)(sizeof(kRevengTools)/sizeof(kRevengTools[0]))},
+                            {"plm", kPlmTools, (int)(sizeof(kPlmTools)/sizeof(kPlmTools[0]))},
+                            {"research", kResearchTools, (int)(sizeof(kResearchTools)/sizeof(kResearchTools[0]))},
+                            {"mission", kMissionTools, (int)(sizeof(kMissionTools)/sizeof(kMissionTools[0]))},
+                            {"gsl", kGslTools, (int)(sizeof(kGslTools)/sizeof(kGslTools[0]))},
+                            {"advisor", kAdvisorTools, (int)(sizeof(kAdvisorTools)/sizeof(kAdvisorTools[0]))},
+                        };
+                        static constexpr int kFamToolMapN =
+                            (int)(sizeof(kFamToolMap)/sizeof(kFamToolMap[0]));
                         const double nowTf = ImGui::GetTime();
                         if (s_toolFam.empty() || (nowTf - s_toolFamLast) > 2.0) {
                             s_toolFamLast = nowTf;
@@ -4164,6 +4234,26 @@ void drawSettingsModal(AppState& st, bool busy) {
                                     if (tf.is_object() && tf.contains(k) && tf[k].is_boolean())
                                         on = tf[k].get<bool>();
                                     s_toolFam[k] = on;
+                                }
+                                auto to = ag.value("tool_options", nlohmann::json::object());
+                                if (to.is_object()) {
+                                    for (auto it = to.begin(); it != to.end(); ++it) {
+                                        const std::string tn = it.key();
+                                        const auto& e = it.value();
+                                        if (!e.is_object()) continue;
+                                        if (e.contains("enabled") && e["enabled"].is_boolean())
+                                            s_toolEnabled[tn] = e["enabled"].get<bool>();
+                                        else
+                                            s_toolEnabled[tn] = true;
+                                        if (e.contains("timeout_s") && e["timeout_s"].is_number_integer())
+                                            s_toolTimeout[tn] = e["timeout_s"].get<int>();
+                                        if (e.contains("max_calls_per_turn") && e["max_calls_per_turn"].is_number_integer())
+                                            s_toolMaxCalls[tn] = e["max_calls_per_turn"].get<int>();
+                                        if (e.contains("param_defaults"))
+                                            s_toolDefaults[tn] = e["param_defaults"].dump(2);
+                                        if (e.contains("prompt_note") && e["prompt_note"].is_string())
+                                            s_toolNote[tn] = e["prompt_note"].get<std::string>();
+                                    }
                                 }
                             } catch (...) {
                                 for (int i = 0; i < kToolFamilyCount; ++i)
@@ -4183,9 +4273,73 @@ void drawSettingsModal(AppState& st, bool busy) {
                             }
                             ImGui::EndTable();
                         }
-                        if (s_toolFamDirty) {
+
+                        ImGui::Dummy(ImVec2(0, 8.0f * sc));
+                        dimText("Per-tool options (expand a family):");
+                        for (int fi = 0; fi < kFamToolMapN; ++fi) {
+                            const FamTools& ft = kFamToolMap[fi];
+                            if (!ImGui::TreeNode(ft.fam)) continue;
+                            for (int ti = 0; ti < ft.n; ++ti) {
+                                const char* tn = ft.tools[ti];
+                                ImGui::PushID(tn);
+                                bool en = s_toolEnabled.count(tn) ? s_toolEnabled[tn] : true;
+                                if (ImGui::Checkbox("##en", &en)) {
+                                    s_toolEnabled[tn] = en;
+                                    s_toolOptDirty = true;
+                                }
+                                ImGui::SameLine();
+                                ImGui::TextUnformatted(tn);
+                                ImGui::SameLine();
+                                if (ImGui::SmallButton("Options"))
+                                    ImGui::OpenPopup("tool_opts");
+                                if (ImGui::BeginPopup("tool_opts")) {
+                                    int to = s_toolTimeout.count(tn) ? s_toolTimeout[tn] : 0;
+                                    int mc = s_toolMaxCalls.count(tn) ? s_toolMaxCalls[tn] : 0;
+                                    if (ImGui::InputInt("timeout_s (0=default)", &to)) {
+                                        s_toolTimeout[tn] = std::max(0, to);
+                                        s_toolOptDirty = true;
+                                    }
+                                    if (ImGui::InputInt("max_calls_per_turn (0=unlim)", &mc)) {
+                                        s_toolMaxCalls[tn] = std::max(0, mc);
+                                        s_toolOptDirty = true;
+                                    }
+                                    std::string& def = s_toolDefaults[tn];
+                                    if (def.capacity() < 512) def.reserve(512);
+                                    def.resize(std::max<size_t>(def.size(), 1));
+                                    // Ensure buffer for InputText
+                                    static char defBuf[2048];
+                                    static char noteBuf[1024];
+                                    std::snprintf(defBuf, sizeof(defBuf), "%s",
+                                        s_toolDefaults.count(tn) ? s_toolDefaults[tn].c_str() : "{}");
+                                    std::snprintf(noteBuf, sizeof(noteBuf), "%s",
+                                        s_toolNote.count(tn) ? s_toolNote[tn].c_str() : "");
+                                    if (ImGui::InputTextMultiline("param_defaults JSON",
+                                            defBuf, sizeof(defBuf),
+                                            ImVec2(-1, 60 * sc))) {
+                                        s_toolDefaults[tn] = defBuf;
+                                        s_toolOptDirty = true;
+                                    }
+                                    if (ImGui::InputTextMultiline("prompt_note",
+                                            noteBuf, sizeof(noteBuf),
+                                            ImVec2(-1, 40 * sc))) {
+                                        s_toolNote[tn] = noteBuf;
+                                        s_toolOptDirty = true;
+                                    }
+                                    ImGui::EndPopup();
+                                }
+                                ImGui::PopID();
+                            }
+                            ImGui::TreePop();
+                        }
+
+                        if (s_toolFamDirty || s_toolOptDirty) {
                             ImGui::Dummy(ImVec2(0, 6.0f * sc));
-                            if (ImGui::Button("Save tool families", ImVec2(180.0f * sc, 0))) {
+                            if (!s_toolOptErr.empty()) {
+                                ImGui::TextColored(ImVec4(1,0.4f,0.3f,1), "%s",
+                                                   s_toolOptErr.c_str());
+                            }
+                            if (ImGui::Button("Save tool families & options",
+                                              ImVec2(240.0f * sc, 0))) {
                                 try {
                                     nlohmann::json j = nlohmann::json::object();
                                     {
@@ -4200,17 +4354,59 @@ void drawSettingsModal(AppState& st, bool busy) {
                                     nlohmann::json tf = nlohmann::json::object();
                                     for (const auto& kv : s_toolFam) tf[kv.first] = kv.second;
                                     j["agent"]["tool_families"] = tf;
-                                    std::ofstream outf(configPath(), std::ios::trunc);
-                                    outf << j.dump(2);
-                                    s_toolFamDirty = false;
-                                    s_toolFamLast = -1e9;
+
+                                    nlohmann::json to = nlohmann::json::object();
+                                    // Collect all tool names we know about
+                                    std::set<std::string> names;
+                                    for (const auto& kv : s_toolEnabled) names.insert(kv.first);
+                                    for (const auto& kv : s_toolTimeout) names.insert(kv.first);
+                                    for (const auto& kv : s_toolMaxCalls) names.insert(kv.first);
+                                    for (const auto& kv : s_toolDefaults) names.insert(kv.first);
+                                    for (const auto& kv : s_toolNote) names.insert(kv.first);
+                                    s_toolOptErr.clear();
+                                    for (const auto& tn : names) {
+                                        nlohmann::json e = nlohmann::json::object();
+                                        bool en = s_toolEnabled.count(tn) ? s_toolEnabled[tn] : true;
+                                        if (!en) e["enabled"] = false;
+                                        int tmo = s_toolTimeout.count(tn) ? s_toolTimeout[tn] : 0;
+                                        if (tmo > 0) e["timeout_s"] = tmo;
+                                        int mc = s_toolMaxCalls.count(tn) ? s_toolMaxCalls[tn] : 0;
+                                        if (mc > 0) e["max_calls_per_turn"] = mc;
+                                        if (s_toolDefaults.count(tn) && !s_toolDefaults[tn].empty()) {
+                                            try {
+                                                auto parsed = nlohmann::json::parse(s_toolDefaults[tn]);
+                                                if (parsed.is_object() && !parsed.empty())
+                                                    e["param_defaults"] = parsed;
+                                            } catch (...) {
+                                                s_toolOptErr = "Invalid JSON in param_defaults for " + tn;
+                                                break;
+                                            }
+                                        }
+                                        if (s_toolNote.count(tn) && !s_toolNote[tn].empty())
+                                            e["prompt_note"] = s_toolNote[tn];
+                                        if (!e.empty()) to[tn] = e;
+                                    }
+                                    if (s_toolOptErr.empty()) {
+                                        j["agent"]["tool_options"] = to;
+                                        std::ofstream outf(configPath(), std::ios::trunc);
+                                        outf << j.dump(2);
+                                        s_toolFamDirty = false;
+                                        s_toolOptDirty = false;
+                                        s_toolFamLast = -1e9;
+                                    }
                                 } catch (...) {}
                             }
                             ImGui::SameLine();
                             if (ImGui::Button("Reset all on", ImVec2(120.0f * sc, 0))) {
                                 for (int i = 0; i < kToolFamilyCount; ++i)
                                     s_toolFam[kToolFamilies[i]] = true;
+                                s_toolEnabled.clear();
+                                s_toolTimeout.clear();
+                                s_toolMaxCalls.clear();
+                                s_toolDefaults.clear();
+                                s_toolNote.clear();
                                 s_toolFamDirty = true;
+                                s_toolOptDirty = true;
                             }
                         }
                         settingsGlassSectionEnd();

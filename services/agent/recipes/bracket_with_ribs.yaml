@@ -1,0 +1,17 @@
+schema: aicad.recipe/1
+id: bracket_with_ribs
+title: Bracket with ribs
+domains: [cad]
+keywords: [bracket, rib, gusset, L-bracket, mounting]
+summary: Structural bracket — base, upright, ribs; fillets last.
+steps:
+  - tool: new_part
+    note: Open a fresh part if needed.
+  - tool: add_features
+    note: Base plate then upright.
+  - tool: add_features
+    note: Ribs/gussets; fillets last.
+  - tool: verify_battery
+    note: Done gate.
+verify:
+  - verify_battery no FAIL

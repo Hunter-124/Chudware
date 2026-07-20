@@ -1,0 +1,17 @@
+schema: aicad.recipe/1
+id: enclosure_box
+title: Enclosure box
+domains: [cad, sheetmetal]
+keywords: [enclosure, housing, box, shell, lid, wall thickness]
+summary: Thin-wall enclosure with verified minimum wall.
+steps:
+  - tool: add_features
+    note: Outer envelope first.
+  - tool: add_features
+    note: Shell to wall thickness; openings for connectors.
+  - tool: wall_thickness
+    note: Confirm min wall vs process.
+  - tool: verify_battery
+    note: Done gate.
+verify:
+  - wall_thickness above process minimum

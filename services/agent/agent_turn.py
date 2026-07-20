@@ -524,16 +524,54 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
             _budget_in = 16
     budget = int(_budget_in)
     completion_cap = int(max_tokens) if max_tokens else 2048
+    _tool_call_counts: dict[str, int] = {}
     if tool_dispatch is not None:
-        dispatch = tool_dispatch
+        _inner_dispatch = tool_dispatch
+
+        def dispatch(tool: str, args: dict) -> Any:
+            return _dispatch_tool(
+                tool, args, _call_counts=_tool_call_counts, _inner=_inner_dispatch
+            )
     elif mission_dispatch is not None:
         def dispatch(tool: str, args: dict) -> Any:
             fn = mission_dispatch.resolve(tool)
             if fn is not None:
-                return fn(**(args or {}))
-            return _dispatch_tool(tool, args)
+                # Still count toward per-tool caps when resolved via mission.
+                try:
+                    from services.agent.config import get_tool_options  # noqa: PLC0415
+                    opts = get_tool_options(None, tool) or {}
+                    max_calls = opts.get("max_calls_per_turn")
+                    if max_calls is not None:
+                        n = int(_tool_call_counts.get(tool, 0))
+                        if n >= int(max_calls):
+                            raise RuntimeError(
+                                f"tool '{tool}' exceeded max_calls_per_turn={max_calls} "
+                                f"(agent.tool_options)"
+                            )
+                        _tool_call_counts[tool] = n + 1
+                    defaults = dict(opts.get("param_defaults") or {})
+                    if args:
+                        defaults.update(args)
+                    args = defaults
+                except RuntimeError:
+                    raise
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    return fn(**(args or {}))
+                except Exception as exc:  # noqa: BLE001
+                    try:
+                        from services.agent.tool_hints import hint_for  # noqa: PLC0415
+                        hint = hint_for(tool)
+                    except Exception:  # noqa: BLE001
+                        hint = None
+                    if hint:
+                        raise type(exc)(f"{exc} Hint: {hint}") from exc
+                    raise
+            return _dispatch_tool(tool, args, _call_counts=_tool_call_counts)
     else:
-        dispatch = _dispatch_tool
+        def dispatch(tool: str, args: dict) -> Any:
+            return _dispatch_tool(tool, args, _call_counts=_tool_call_counts)
     allow = set(allowed_tools or [])
     # Copilot mode → tools: intersect caller allowlist with mode policy.
     # Precedence: explicit arg → options key if present → mission_dispatch → default.
@@ -2439,18 +2477,90 @@ def resolver_for(mission_dispatch: Any | None = None) -> Callable[[str], Any]:
     return _resolve
 
 
-def _dispatch_tool(tool: str, args: dict) -> Any:
+def _dispatch_tool(
+    tool: str,
+    args: dict,
+    *,
+    _call_counts: dict | None = None,
+    _inner: Any | None = None,
+) -> Any:
     """Dispatch a tool call against the live MCP registry (battery singleton).
 
     Uses the reviewer_exec resolver (which extends battery._get_fn to the intake /
     verify modules), so ANY §16-ish tool resolves through ONE process-wide registry.
-    Raises on unresolved tool or dispatch failure — the caller feeds the error back
-    to the model (never a fabricated success)."""
+    Applies agent.tool_options (param_defaults, max_calls_per_turn, timeout_s) and
+    appends tool_hints on failure. Raises on unresolved tool or dispatch failure —
+    the caller feeds the error back to the model (never a fabricated success).
+    If *_inner* is provided it is called instead of the default resolver (used when
+    the turn supplied a custom tool_dispatch)."""
     from services.agent.reviewer_exec import _resolve_fn
-    fn = _resolve_fn(tool)
-    if fn is None:
-        raise KeyError(f"tool {tool!r} could not be resolved")
-    return fn(**(args or {}))
+
+    # Per-tool options (Settings → AI → Tools).
+    opts: dict = {}
+    try:
+        from services.agent.config import get_tool_options  # noqa: PLC0415
+        opts = get_tool_options(None, tool) or {}
+    except Exception:  # noqa: BLE001
+        opts = {}
+
+    if opts.get("enabled") is False:
+        raise RuntimeError(f"tool '{tool}' disabled in Settings → AI → Tools")
+
+    max_calls = opts.get("max_calls_per_turn")
+    if max_calls is not None and _call_counts is not None:
+        n = int(_call_counts.get(tool, 0))
+        if n >= int(max_calls):
+            raise RuntimeError(
+                f"tool '{tool}' exceeded max_calls_per_turn={max_calls} "
+                f"(agent.tool_options)"
+            )
+        _call_counts[tool] = n + 1
+
+    merged = dict(opts.get("param_defaults") or {})
+    if args:
+        merged.update(args)  # call args win
+
+    import time as _time
+    t0 = _time.monotonic()
+    timeout_s = opts.get("timeout_s")
+
+    def _call() -> Any:
+        if _inner is not None:
+            # Custom turn tool_dispatch has signature (tool, args).
+            return _inner(tool, merged or {})
+        fn = _resolve_fn(tool)
+        if fn is None:
+            if tool == "design_recipe":
+                from services.agent.design_recipe import design_recipe as _dr  # noqa: PLC0415
+                return _dr(**(merged or {}))
+            raise KeyError(f"tool {tool!r} could not be resolved")
+        return fn(**(merged or {}))
+
+    try:
+        result = _call()
+    except Exception as exc:  # noqa: BLE001
+        hint = None
+        try:
+            from services.agent.tool_hints import hint_for  # noqa: PLC0415
+            hint = hint_for(tool)
+        except Exception:  # noqa: BLE001
+            hint = None
+        if hint:
+            raise type(exc)(f"{exc} Hint: {hint}") from exc
+        raise
+
+    # Soft timeout: measure only (sync path — no new threads).
+    if timeout_s is not None:
+        elapsed = _time.monotonic() - t0
+        if elapsed > float(timeout_s):
+            tag = f"(exceeded configured timeout_s={timeout_s})"
+            if isinstance(result, str):
+                return f"{result} {tag}"
+            if isinstance(result, dict):
+                out = dict(result)
+                out["_timeout_note"] = tag
+                return out
+    return result
 
 
 # ---------------------------------------------------------------------------

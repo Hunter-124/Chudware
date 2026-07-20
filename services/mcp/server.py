@@ -494,6 +494,19 @@ if not _LITE:
 # card per contracts/narration.md — never a raw JSON dump.  On-demand helper (kept in lite).
 from services.mcp.design_review_tools import register_design_review_tools
 register_design_review_tools(mcp)
+# design_recipe — NL intent → ordered tool steps (always-on helper).
+from services.agent.design_recipe import design_recipe as _design_recipe_fn
+_ws = _reg.view(mcp, "workspace")
+
+@_ws.tool()
+def design_recipe(query: str = "", max_results: int = 3) -> dict:
+    """Map a natural-language intent to an ordered tool recipe (or list the catalog).
+
+    Empty query returns {ok, recipes:[{id,title,summary}...]}. Non-empty returns
+    ranked full recipes with steps[{tool,params,note}] and verify[].
+    """
+    return _design_recipe_fn(query=query, max_results=max_results)
+
 # Interface alignment checker (T-BL49): interface_check inspects mating component pairs for
 # hole-pattern registration, bore coaxiality, contact-plane flushness, and fastener pass-through
 # — the layout errors that pass check_interference (no clash) but are still wrong.  Reuses

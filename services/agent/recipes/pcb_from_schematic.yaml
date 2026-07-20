@@ -1,0 +1,23 @@
+schema: aicad.recipe/1
+id: pcb_from_schematic
+title: PCB from schematic
+domains: [ecad]
+keywords: [schematic, PCB, ERC, DRC, autoroute, net]
+summary: Schematic place/wire, ERC, board, route, DRC.
+steps:
+  - tool: ecad_new_schematic
+    note: New schematic doc.
+  - tool: place_symbol
+    note: Or ecad_place_symbol / ecad_find_part.
+  - tool: wire
+    note: Nets + power before SPICE.
+  - tool: run_erc
+    note: Fix all errors.
+  - tool: board_from_schematic
+    note: Create PCB.
+  - tool: autoroute
+    note: Or manual route + fill_zones.
+  - tool: run_drc
+    note: Board sign-off.
+verify:
+  - ERC and DRC clean or blocked with named failures

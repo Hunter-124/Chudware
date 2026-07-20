@@ -402,6 +402,70 @@ DEFAULT_TOOL_FAMILIES = (
     "workspace",
 )
 
+
+# ---------------------------------------------------------------------------
+# Per-tool options (Settings → AI → Tools)
+# agent.tool_options: { "run_fea_static": {"timeout_s": 180, "prompt_note": "..."}, ... }
+# Missing key / missing field = stock behavior.
+# ---------------------------------------------------------------------------
+TOOL_OPTION_KEYS = (
+    "enabled", "timeout_s", "max_calls_per_turn", "param_defaults", "prompt_note",
+)
+
+_TOOL_OPTION_DEFAULTS: dict = {
+    "enabled": True,
+    "timeout_s": None,
+    "max_calls_per_turn": None,
+    "param_defaults": {},
+    "prompt_note": "",
+}
+
+
+def get_tool_options(cfg: dict | None, name: str) -> dict:
+    """Merged per-tool options for *name*. Unknown stored keys ignored."""
+    out = {
+        "enabled": True,
+        "timeout_s": None,
+        "max_calls_per_turn": None,
+        "param_defaults": {},
+        "prompt_note": "",
+    }
+    if not name:
+        return out
+    try:
+        c = cfg if isinstance(cfg, dict) else load_config()
+    except Exception:  # noqa: BLE001
+        c = cfg if isinstance(cfg, dict) else {}
+    agent = c.get("agent") if isinstance(c, dict) and isinstance(c.get("agent"), dict) else {}
+    raw_root = agent.get("tool_options") if isinstance(agent, dict) else None
+    if not isinstance(raw_root, dict):
+        return out
+    entry = raw_root.get(name)
+    if not isinstance(entry, dict):
+        return out
+    if "enabled" in entry:
+        out["enabled"] = bool(entry.get("enabled"))
+    if "timeout_s" in entry:
+        try:
+            v = entry.get("timeout_s")
+            out["timeout_s"] = None if v in (None, "", 0, "0") else max(1, int(v))
+        except (TypeError, ValueError):
+            pass
+    if "max_calls_per_turn" in entry:
+        try:
+            v = entry.get("max_calls_per_turn")
+            out["max_calls_per_turn"] = (
+                None if v in (None, "", 0, "0") else max(1, int(v))
+            )
+        except (TypeError, ValueError):
+            pass
+    if "param_defaults" in entry and isinstance(entry.get("param_defaults"), dict):
+        out["param_defaults"] = dict(entry.get("param_defaults") or {})
+    if "prompt_note" in entry and entry.get("prompt_note") is not None:
+        out["prompt_note"] = str(entry.get("prompt_note") or "")
+    return out
+
+
 def get_tool_families(cfg: dict | None = None) -> dict[str, bool]:
     """Return family→enabled map. Defaults all known families to True."""
     c = cfg if isinstance(cfg, dict) else load_config()

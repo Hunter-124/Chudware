@@ -1,0 +1,19 @@
+schema: aicad.recipe/1
+id: re_from_step
+title: Reverse engineer from STEP/mesh
+domains: [reveng]
+keywords: [reverse engineer, STEP, mesh, scan, compare]
+summary: Import, reverse_engineer, compare_parts loop, verify.
+steps:
+  - tool: import_part
+    note: Load STEP/mesh source.
+  - tool: reverse_engineer
+    note: Parametric rebuild.
+  - tool: compare_parts
+    note: Iterate until deviation acceptable.
+  - tool: convert_face_to_sketch
+    note: When a face must become editable.
+  - tool: verify_battery
+    note: Done gate.
+verify:
+  - compare deviation within tolerance

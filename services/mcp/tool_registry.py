@@ -87,11 +87,10 @@ def record(name: str, family: str, risk: str | None = None) -> dict:
     _CATALOG[name] = entry
     return entry
 
-# Meta-tools for mid-turn category expansion. Always recorded + always allowed
-# (family=workspace, risk=read) so the risk guard never blocks them.
 _META_TOOLS = (
     ("enable_tools", "workspace", RISK_READ),
     ("list_tool_categories", "workspace", RISK_READ),
+    ("design_recipe", "workspace", RISK_READ),
 )
 for _meta_name, _meta_fam, _meta_risk in _META_TOOLS:
     record(_meta_name, _meta_fam, _meta_risk)
@@ -167,9 +166,17 @@ def is_allowed(name: str) -> bool:
 
 def deny_reason(name: str) -> str | None:
     """None if allowed; else a human reason string for the refusal."""
-    # Meta-tools are always permitted (request more surface / list packs).
-    if name in ("enable_tools", "list_tool_categories"):
+    # Meta-tools are always permitted (request more surface / list packs / recipes).
+    if name in ("enable_tools", "list_tool_categories", "design_recipe"):
         return None
+    # Per-tool enabled flag (Settings → AI → Tools options).
+    try:
+        from services.agent.config import get_tool_options  # lazy
+        opts = get_tool_options(None, name)
+        if not opts.get("enabled", True):
+            return f"tool '{name}' disabled in Settings → AI → Tools"
+    except Exception:
+        pass
     # Config agent.tool_families — disabled families blocked unless env/policy allow
     # list is active (AI_CAD_TOOLS_ALLOW still wins via _current_allow below).
     try:

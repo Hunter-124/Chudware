@@ -1,0 +1,25 @@
+schema: aicad.recipe/1
+id: drawing_from_part
+title: Drawing from part
+domains: [drawing]
+keywords: [drawing, views, dimension, GD&T, title block, section view]
+summary: Multi-view drawing with measured dimensions and export.
+steps:
+  - tool: describe_part
+    note: Inventory features to show.
+  - tool: make_drawing
+    note: Create drawing doc.
+  - tool: add_drawing_view
+    note: Base then projected views.
+  - tool: add_section_view
+    note: Internal features as needed.
+  - tool: add_dimension
+    note: Only measured sizes — never invent.
+  - tool: add_gdt
+    note: Datums and controls where required.
+  - tool: set_titleblock
+    note: Title, revision, material.
+  - tool: export_drawing
+    note: Deliverable export.
+verify:
+  - every dim traces to measure/describe

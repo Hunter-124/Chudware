@@ -1,0 +1,19 @@
+schema: aicad.recipe/1
+id: sourced_bom_build
+title: Sourced BOM build
+domains: [parts, sourcing]
+keywords: [BOM, part_search, vendor, quote, catalog, fastener]
+summary: Prefer library parts, place them, roll up cost.
+steps:
+  - tool: part_search
+    note: Find catalog candidates.
+  - tool: part_get
+    note: Verify dims/PN.
+  - tool: part_place
+    note: Instance into assembly/doc.
+  - tool: bom_rollup
+    note: Structure.
+  - tool: bom_price
+    note: Cost; request_quote if missing.
+verify:
+  - every buy part has part_id

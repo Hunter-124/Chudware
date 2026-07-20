@@ -5947,6 +5947,14 @@ static void drawSubRunCard(const ActivityItem& a, const ui::Fonts& fonts) {
 static void drawAgentTimeline(ChatMsg& m, const ui::Fonts& fonts, float logW, bool showThinking) {
     if (m.activity.empty()) return;
     const bool turnRunning = m.running;
+    if (!turnRunning) {
+        // Stale live rows on a finished turn (restored history, terminal events dropped after
+        // a stop) would animate forever — clamp them once here, idempotently.
+        for (auto& a : m.activity) {
+            if (a.streaming) a.streaming = false;
+            if (a.status == "running") a.status = "done";
+        }
+    }
     ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
     for (size_t i = 0; i < m.activity.size(); ++i) {
         ActivityItem& a = m.activity[i];
@@ -12183,6 +12191,19 @@ static void agentControlDispatch(AppState& st, const std::string& runId, const s
 // Stop the in-flight run: fire agent_cancel (hard cooperative cancel — aborts in-flight HTTP
 // via curl xfer + stage boundaries), then soft-finalize the UI so the composer reverts to send
 // immediately. The job drain discards the eventual cancel_result.
+// Stop-finalize one turn's activity rows: streaming thought boxes collapse (unless pinned),
+// stage/tool rows leave "running" so no glyph animates a turn that is no longer live.
+static void finalizeStoppedTurnActivity(ChatMsg& m) {
+    for (auto& a : m.activity) {
+        if (a.rowKind == 2 && (a.streaming || a.status == "running" || a.status.empty()))
+            finalizeThoughtBox(a);
+        else if (a.streaming || a.status == "running" || a.status.empty()) {
+            a.status = "done";
+            a.streaming = false;
+        }
+    }
+}
+
 static void requestStopRun(AppState& st) {
     // Capture run_id before we clear flags.
     std::string runId;
@@ -12215,23 +12236,21 @@ static void requestStopRun(AppState& st) {
             it->liveStatus = "Stopped";
             it->errKind = ERR_NONE;  // user stop is not an error card
             // Finalize any live stream boxes so the forging animation / streaming chrome stops.
-            for (auto& a : it->activity) {
-                if (a.rowKind == 2 && (a.streaming || a.status == "running" || a.status.empty()))
-                    finalizeThoughtBox(a);
-                else if (a.streaming || a.status == "running" || a.status.empty()) {
-                    a.status = "done";
-                    a.streaming = false;
-                }
-            }
+            finalizeStoppedTurnActivity(*it);
             if (it->text.empty())
                 it->text = "Stopped.";
             else if (it->text.find("(Stopped by you.)") == std::string::npos)
                 it->text += "\n\n(Stopped by you.)";
             break;
         }
-    // Never leave a running bubble after stop.
+    // Never leave a running bubble after stop — and never leave its rows mid-animation:
+    // every OTHER still-running message (subagent/parked turns the sweep above didn't reach)
+    // gets the same finalize, or its stage cards keep spinning forever with no live turn.
     for (auto& m : st.chat)
-        if (!m.fromUser && m.running) m.running = false;
+        if (!m.fromUser && m.running) {
+            m.running = false;
+            finalizeStoppedTurnActivity(m);
+        }
     st.status = "Stopped.";
     st.statusKind = 1;
     st.addLog("[..] stop requested by user");

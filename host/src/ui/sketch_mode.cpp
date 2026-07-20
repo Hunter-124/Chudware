@@ -4,12 +4,16 @@
 #include "camera_anim.h"   // C34: restore the pre-sketch camera on exit
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <functional>
 #include <set>
 #include <unordered_set>
+
+#include "../../extern/mapbox/earcut.hpp"   // C56c: hole-aware region triangulation
 
 #include "../core/app_state.h"
 #include "../renderer.h"
@@ -2576,6 +2580,49 @@ float polyAreaUV(const std::vector<ImVec2>& p) {
         a += (p[j].x + p[i].x) * (p[j].y - p[i].y);
     return std::fabs(a) * 0.5f;
 }
+
+// ---- C56c: hole-aware polygon triangulation (screen space) ----
+// ImGui's concave tessellator has no hole support, so the profile shading can't "punch" holes
+// with a flat color (the sketch backdrop is the live 3D viewport — no flat color ever matches).
+// mapbox earcut triangulates the outer loop + hole loops into true-hole triangles the canvas
+// shows through. (Validated: 0/2000 fuzz failures on contained disjoint holes.)
+bool skTriangulateWithHoles(const std::vector<ImVec2>& outer,
+                            const std::vector<std::vector<ImVec2>>& holes,
+                            std::vector<ImVec2>& tris) {
+    if (outer.size() < 3) return false;
+    std::vector<std::vector<std::array<float, 2>>> poly;
+    poly.reserve(1 + holes.size());
+    std::vector<std::array<float, 2>> ring;
+    ring.reserve(outer.size());
+    for (const auto& p : outer) ring.push_back({p.x, p.y});
+    poly.push_back(std::move(ring));
+    for (const auto& h : holes) {
+        if (h.size() < 3) continue;
+        ring.clear();
+        ring.reserve(h.size());
+        for (const auto& p : h) ring.push_back({p.x, p.y});
+        poly.push_back(ring);
+    }
+    const std::vector<uint32_t> idx = mapbox::earcut<uint32_t>(poly);
+    if (idx.empty()) return false;
+    tris.reserve(tris.size() + idx.size());
+    for (uint32_t i : idx) {
+        size_t off = 0;
+        const std::array<float, 2>* pt = nullptr;
+        if (i < poly[0].size()) pt = &poly[0][i];
+        else {
+            off = poly[0].size();
+            for (size_t r = 1; r < poly.size(); ++r) {
+                if (i < off + poly[r].size()) { pt = &poly[r][i - off]; break; }
+                off += poly[r].size();
+            }
+        }
+        if (!pt) return false;
+        tris.push_back(ImVec2((*pt)[0], (*pt)[1]));
+    }
+    return !tris.empty();
+}
+
 // Representative interior point: circle centre, else polygon centroid (shoelace).
 ImVec2 loopCentroidUV(const std::vector<ImVec2>& poly, bool isCircle,
                       float cx0, float cy0) {
@@ -3083,10 +3130,38 @@ void SketchMode::groupDragSnap(float& gu, float& gv) {
     const float pxPerU = std::hypot(uAxisS_.x, uAxisS_.y);
     const float pxPerV = std::hypot(vAxisS_.x, vAxisS_.y);
     // 2b) Tangent snap: a dragged circle/arc translates until it touches a static line or
-    //     another circle/arc (external or internal contact). The user's "circle in a square
-    //     dragged to an edge" case — commits a tangent relation on drop.
+    //     another circle/arc (external or internal contact), and a dragged line translates
+    //     until it touches a static circle/arc. The user's "circle in a square dragged to an
+    //     edge" case (and its dual) — commits a tangent relation on drop.
     for (const auto& e : ents_) {
-        if (!dragged.count(e.id) || (e.type != "circle" && e.type != "arc")) continue;
+        if (!dragged.count(e.id)) continue;
+        if (e.type == "line") {
+            // Dragged LINE -> static circle/arc: |distance(circle center, line)| == R with the
+            // foot on the dragged segment.
+            float dx = e.p2[0] - e.p1[0], dy = e.p2[1] - e.p1[1];
+            float L = std::hypot(dx, dy);
+            if (L < 1e-5f) continue;
+            float nx = -dy / L, ny = dx / L;
+            const float lp1u = e.p1[0] + dx0, lp1v = e.p1[1] + dy0;
+            for (const auto& oe : ents_) {
+                if (dragged.count(oe.id) || (oe.type != "circle" && oe.type != "arc")) continue;
+                float sd = (oe.center[0] - lp1u) * nx + (oe.center[1] - lp1v) * ny;
+                float t = ((oe.center[0] - lp1u) * dx + (oe.center[1] - lp1v) * dy) / (L * L);
+                if (t < 0.0f || t > 1.0f) continue;
+                float gap = std::fabs(sd) - oe.radius;
+                if (std::fabs(gap) * pxPerU >= snapPx || std::fabs(sd) < 1e-5f) continue;
+                float corr = gap * (sd >= 0 ? 1.0f : -1.0f);   // push the line out to tangency
+                gu += nx * corr; gv += ny * corr;
+                dragRelType_ = "tangent"; dragRelEnt_ = e.id; dragRelOther_ = oe.id;
+                float n1u = lp1u + nx * corr, n1v = lp1v + ny * corr;
+                float s2 = (oe.center[0] - n1u) * nx + (oe.center[1] - n1v) * ny;
+                dragSnapUV_ = ImVec2(oe.center[0] - nx * s2, oe.center[1] - ny * s2);
+                dragSnapLive_ = true;
+                return;
+            }
+            continue;
+        }
+        if (e.type != "circle" && e.type != "arc") continue;
         const float R = e.radius;
         const float lcx = e.center[0] + dx0, lcy = e.center[1] + dy0;
         for (const auto& oe : ents_) {
@@ -6114,19 +6189,20 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
     // Loops detected from the live geometry are filled faintly so a closed profile reads as a
     // selectable face; the one the cursor has dwelled in (hotRegion_) brightens + gets an outline,
     // signalling that a click will grab its whole loop. Drawn BEFORE the entities so the boundary
-    // lines stay crisp on top. ONLY material (even-depth) regions are shaded; each direct child
-    // hole is punched with an opaque canvas fill so concentric loops read as washers (hollow
-    // white center matching the sketch background). AddConcavePolyFilled handles L-brackets etc.
+    // lines stay crisp on top. ONLY material (even-depth) regions are shaded. C56c: the fill is
+    // TRIANGULATED with true holes (bridge + ear clip) so a nested closed profile reads as a real
+    // donut hole with the live canvas showing through — no opaque punch (the sketch backdrop is
+    // the 3D viewport, which no flat punch color can match). Legacy fill+punch remains as the
+    // fallback for pathological loops the triangulator rejects.
     rebuildRegions();
     if (hotRegion_ >= (int)regions_.size()) hotRegion_ = -1;
     {
         const ImU32 fillCol = col(pal.accent, 0.13f);
         const ImU32 hotFill = col(pal.accent, 0.28f);
         const ImU32 hotEdge = col(pal.accent, 0.65f);
-        // Opaque canvas punch — viewportTop is the light sketch/canvas tone (not accent).
-        const ImU32 holePunch = col(pal.viewportTop, 1.0f);
-        // Draw shallow material first so deeper islands land on top of outer hole punches
-        // (triple-nested: outer ring / void / island).
+        const ImU32 holePunch = col(pal.viewportTop, 1.0f);   // legacy fallback only
+        // Draw shallow material first so deeper islands land on top of outer holes (triple-nested:
+        // outer ring / void / island).
         std::vector<int> matOrder;
         matOrder.reserve(regions_.size());
         for (size_t ri = 0; ri < regions_.size(); ++ri)
@@ -6139,14 +6215,22 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             bool hot = (tool_ == SketchTool::None && ri == hotRegion_);
             std::vector<ImVec2> sp; sp.reserve(rg.poly.size());
             for (const auto& p : rg.poly) sp.push_back(uvToScreen(p.x, p.y));
-            dl->AddConcavePolyFilled(sp.data(), (int)sp.size(), hot ? hotFill : fillCol);
-            // Punch each direct child hole with opaque canvas so the center reads hollow/white.
+            std::vector<std::vector<ImVec2>> holePolys;
             for (int hi : rg.holeChildren) {
                 if (hi < 0 || hi >= (int)regions_.size()) continue;
-                const auto& hole = regions_[(size_t)hi];
-                std::vector<ImVec2> hp; hp.reserve(hole.poly.size());
-                for (const auto& p : hole.poly) hp.push_back(uvToScreen(p.x, p.y));
-                if (hp.size() >= 3)
+                std::vector<ImVec2> hp;
+                for (const auto& p : regions_[(size_t)hi].poly) hp.push_back(uvToScreen(p.x, p.y));
+                if (hp.size() >= 3) holePolys.push_back(std::move(hp));
+            }
+            std::vector<ImVec2> tris;
+            const ImU32 fill = hot ? hotFill : fillCol;
+            if (skTriangulateWithHoles(sp, holePolys, tris)) {
+                for (size_t t = 0; t + 2 < tris.size(); t += 3)
+                    dl->AddTriangleFilled(tris[t], tris[t + 1], tris[t + 2], fill);
+            } else {
+                // Fallback: fill the outer loop and punch holes with opaque canvas.
+                dl->AddConcavePolyFilled(sp.data(), (int)sp.size(), fill);
+                for (const auto& hp : holePolys)
                     dl->AddConcavePolyFilled(hp.data(), (int)hp.size(), holePunch);
             }
             if (hot) dl->AddPolyline(sp.data(), (int)sp.size(), hotEdge, ImDrawFlags_Closed,

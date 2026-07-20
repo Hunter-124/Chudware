@@ -3082,7 +3082,56 @@ void SketchMode::groupDragSnap(float& gu, float& gv) {
     if (!inferenceOn_) return;
     const float pxPerU = std::hypot(uAxisS_.x, uAxisS_.y);
     const float pxPerV = std::hypot(vAxisS_.x, vAxisS_.y);
-    // 2) Single-axis alignment: a dragged keypoint's u (or v) matches a target point's u (or v).
+    // 2b) Tangent snap: a dragged circle/arc translates until it touches a static line or
+    //     another circle/arc (external or internal contact). The user's "circle in a square
+    //     dragged to an edge" case — commits a tangent relation on drop.
+    for (const auto& e : ents_) {
+        if (!dragged.count(e.id) || (e.type != "circle" && e.type != "arc")) continue;
+        const float R = e.radius;
+        const float lcx = e.center[0] + dx0, lcy = e.center[1] + dy0;
+        for (const auto& oe : ents_) {
+            if (dragged.count(oe.id)) continue;
+            if (oe.type == "line") {
+                float dx = oe.p2[0] - oe.p1[0], dy = oe.p2[1] - oe.p1[1];
+                float L = std::hypot(dx, dy);
+                if (L < 1e-5f) continue;
+                float nx = -dy / L, ny = dx / L;                    // unit normal
+                float sd = (lcx - oe.p1[0]) * nx + (lcy - oe.p1[1]) * ny;  // signed distance
+                float t = ((lcx - oe.p1[0]) * dx + (lcy - oe.p1[1]) * dy) / (L * L);
+                if (t < 0.0f || t > 1.0f) continue;   // contact point must be on the segment
+                float gap = std::fabs(sd) - R;
+                if (std::fabs(gap) * pxPerU >= snapPx || std::fabs(sd) < 1e-5f) continue;
+                float corr = -gap * (sd >= 0 ? 1.0f : -1.0f);   // close the gap along the normal
+                gu += nx * corr; gv += ny * corr;
+                dragRelType_ = "tangent"; dragRelEnt_ = e.id; dragRelOther_ = oe.id;
+                // Marker at the contact point (center shifted by R along the normal, post-snap).
+                float ncx = lcx + nx * corr, ncy = lcy + ny * corr;
+                float s2 = (ncx - oe.p1[0]) * nx + (ncy - oe.p1[1]) * ny;
+                dragSnapUV_ = ImVec2(ncx - nx * s2, ncy - ny * s2);
+                dragSnapLive_ = true;
+                return;
+            }
+            if (oe.type == "circle" || oe.type == "arc") {
+                const float Ro = oe.radius;
+                const float dcx = oe.center[0] - lcx, dcy = oe.center[1] - lcy;
+                const float dc = std::hypot(dcx, dcy);
+                if (dc < 1e-5f) continue;   // concentric — coincident center snap owns this
+                float targets[2] = {R + Ro, std::fabs(R - Ro)};   // external / internal contact
+                for (float tgt : targets) {
+                    float gap = dc - tgt;
+                    if (std::fabs(gap) * pxPerU >= snapPx || tgt < 1e-4f) continue;
+                    float ux = dcx / dc, uy = dcy / dc;
+                    gu += ux * gap; gv += uy * gap;   // move along the center line onto contact
+                    dragRelType_ = "tangent"; dragRelEnt_ = e.id; dragRelOther_ = oe.id;
+                    float ncx = lcx + ux * gap, ncy = lcy + uy * gap;
+                    dragSnapUV_ = ImVec2(ncx + ux * R, ncy + uy * R);
+                    dragSnapLive_ = true;
+                    return;
+                }
+            }
+        }
+    }
+    // 2c) Single-axis alignment: a dragged keypoint's u (or v) matches a target point's u (or v).
     {
         float bestU = snapPx, bestV = snapPx;
         const Tgt *btU = nullptr, *btV = nullptr;
@@ -3150,6 +3199,98 @@ void SketchMode::groupDragSnap(float& gu, float& gv) {
     }
 }
 
+// C56: snap a circle/arc radius drag. `r` is the raw radius from the cursor; on return it's the
+// snapped radius. Priority (best screen-px radius delta wins): rim through a point handle
+// (point_on) > tangent to a line > tangent to another circle/arc > equal radius. Preview state
+// (dragSnap* members) is filled for the draw pass + applyDragSnapRelations on drop.
+void SketchMode::rimDragSnap(const SketchEntity& e, float& r) {
+    dragSnapLive_ = false; dragSnapHandle_.clear();
+    dragRelType_.clear(); dragRelOther_.clear(); dragRelEnt_.clear();
+    dragAlignSrcU_.clear(); dragAlignSrcV_.clear();
+    dragSnapInfer_ = SnapInfer{};
+    const float snapPx = kSnapPx * ui::uiScale;
+    const float pxPerU = std::hypot(uAxisS_.x, uAxisS_.y);
+    const float cx = e.center[0], cy = e.center[1];
+    float bestPx = snapPx;
+    int kind = 0;                    // 1=through-point 2=tangent line 3=tangent circle 4=equal
+    std::string ref;                 // point handle (1) or entity id (2/3/4)
+    float snapR = r;
+    ImVec2 marker(cx + r, cy);
+    // 1) Rim through a point handle (origin / endpoints / centers / points / spline points).
+    auto considerPoint = [&](const std::string& h, float pu, float pv) {
+        float d = std::hypot(pu - cx, pv - cy);
+        float dpx = std::fabs(d - r) * pxPerU;
+        if (dpx < bestPx) { bestPx = dpx; kind = 1; ref = h; snapR = d; marker = ImVec2(pu, pv); }
+    };
+    considerPoint("origin", 0.0f, 0.0f);
+    for (const auto& oe : ents_) {
+        if (oe.id == e.id) continue;   // own handles ride the rim/center — not useful targets
+        if (oe.type == "line" || oe.type == "slot") {
+            considerPoint(oe.id + ".p1", oe.p1[0], oe.p1[1]);
+            considerPoint(oe.id + ".p2", oe.p2[0], oe.p2[1]);
+        } else if (oe.type == "circle" || oe.type == "arc" || oe.type == "arc_slot" ||
+                   oe.type == "ellipse") {
+            considerPoint(oe.id + ".center", oe.center[0], oe.center[1]);
+        } else if (oe.type == "point") {
+            considerPoint(oe.id + ".p", oe.p1[0], oe.p1[1]);
+        } else if (oe.type == "spline" || oe.type == "style_spline") {
+            for (size_t i = 0; i < oe.pts.size(); ++i)
+                considerPoint(oe.id + ".p" + std::to_string(i), oe.pts[i].x, oe.pts[i].y);
+        }
+    }
+    for (const auto& oe : ents_) {
+        if (oe.id == e.id) continue;
+        if (oe.type == "line") {
+            // 2) Tangent to a line: radius == perpendicular distance center&#8594;line (foot on segment).
+            float dx = oe.p2[0] - oe.p1[0], dy = oe.p2[1] - oe.p1[1];
+            float L = std::hypot(dx, dy);
+            if (L < 1e-5f) continue;
+            float cross = (cx - oe.p1[0]) * dy - (cy - oe.p1[1]) * dx;
+            float d = std::fabs(cross) / L;
+            if (d < 1e-5f) continue;    // center ON the line — r=0 tangency is degenerate
+            float t = ((cx - oe.p1[0]) * dx + (cy - oe.p1[1]) * dy) / (L * L);
+            if (t < 0.0f || t > 1.0f) continue;   // tangency point would fall off the segment
+            float dpx = std::fabs(d - r) * pxPerU;
+            if (dpx < bestPx) {
+                bestPx = dpx; kind = 2; ref = oe.id; snapR = d;
+                float fx = oe.p1[0] + t * dx, fy = oe.p1[1] + t * dy;
+                marker = ImVec2(fx, fy);
+            }
+        } else if (oe.type == "circle" || oe.type == "arc") {
+            // 3) Tangent to another circle/arc: r == dc - R (external), r == R - dc (inside it),
+            //    or r == dc + R (enclosing it, internal contact).
+            const float R = oe.radius;
+            const float dc = std::hypot(oe.center[0] - cx, oe.center[1] - cy);
+            if (dc < 1e-5f) continue;   // concentric — equal (4) owns this pair
+            float cands[3] = {dc - R, R - dc, dc + R};
+            for (float cand : cands) {
+                if (cand <= 1e-4f) continue;
+                float dpx = std::fabs(cand - r) * pxPerU;
+                if (dpx < bestPx) {
+                    bestPx = dpx; kind = 3; ref = oe.id; snapR = cand;
+                    float ux = (oe.center[0] - cx) / dc, uy = (oe.center[1] - cy) / dc;
+                    marker = ImVec2(cx + ux * cand, cy + uy * cand);
+                }
+            }
+            // 4) Equal radius.
+            float dpx = std::fabs(R - r) * pxPerU;
+            if (dpx < bestPx) {
+                bestPx = dpx; kind = 4; ref = oe.id; snapR = R;
+                float ux = (oe.center[0] - cx) / dc, uy = (oe.center[1] - cy) / dc;
+                marker = ImVec2(cx + ux * R, cy + uy * R);
+            }
+        }
+    }
+    if (!kind) return;
+    r = snapR;
+    dragSnapLive_ = true;
+    dragSnapUV_ = marker;
+    dragRelEnt_ = e.id;
+    if (kind == 1) { dragRelType_ = "point_on"; dragRelOther_ = ref; }  // other = point handle
+    else if (kind == 4) { dragRelType_ = "equal"; dragRelOther_ = ref; }
+    else { dragRelType_ = "tangent"; dragRelOther_ = ref; }
+}
+
 // C56: is this relation already on the sketch? Compares type + refs as an unordered set so a
 // drag drop never double-adds a constraint that already exists (e.g. re-dropping onto the same
 // origin the entity is already coincident with).
@@ -3207,7 +3348,10 @@ void SketchMode::applyDragSnapRelations(AppState& st, bool groupDrag) {
     if (!relType.empty() && !relEnt.empty()) {
         if (relType == "horizontal" || relType == "vertical")
             push(relType.c_str(), {relEnt});
-        else if ((relType == "parallel" || relType == "collinear") && !relOther.empty())
+        else if (relType == "point_on" && !relOther.empty())
+            push("point_on", {relOther, relEnt});   // other = the point handle, ent = circle/arc
+        else if ((relType == "parallel" || relType == "collinear" || relType == "tangent" ||
+                  relType == "equal") && !relOther.empty())
             push(relType.c_str(), {relEnt, relOther});
     }
     if (cs.empty()) return;
@@ -6772,6 +6916,15 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 if (hSuf(dragHandle_, "rim") && hEnt) {
                     double dr = std::hypot((double)mu - hEnt->center[0],
                                            (double)mv - hEnt->center[1]);
+                    // C56: snap the radius — rim through a point, tangent to a line/circle,
+                    // or equal to another radius. Previewed + committed on drop.
+                    if (st.settings.sketchDragSnapRelations) {
+                        float rs = (float)dr;
+                        rimDragSnap(*hEnt, rs);
+                        dr = rs;
+                    } else {
+                        dragSnapLive_ = false;
+                    }
                     extra = {{"handle", dragHandle_},
                              {"xy", nlohmann::json::array({dr, 0.0})}};
                 } else if ((hSuf(dragHandle_, "start_angle") ||

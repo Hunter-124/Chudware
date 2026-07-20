@@ -608,6 +608,9 @@ private:
     // Snap a live group translate: adjusts (gu,gv) so the fired keypoint/alignment/collinear
     // snap lands exactly and fills the drag-snap preview state above.
     void groupDragSnap(float& gu, float& gv);
+    // Snap a circle/arc radius (.rim handle) drag: adjusts r so the rim passes through a point,
+    // touches a line or another circle/arc (tangent), or matches another radius (equal).
+    void rimDragSnap(const SketchEntity& e, float& r);
     // Emit the previewed relations as constraints after sketch_drag_commit. `srcHandle` is the
     // dragged point (dragHandle_ or groupSnapSrc_); skips relations that already exist.
     void applyDragSnapRelations(AppState& st, bool groupDrag);

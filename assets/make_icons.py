@@ -3015,20 +3015,29 @@ def draw_ws_appearance(d, cell, p):
 
 @icon("color_picker")
 def draw_color_picker(d, cell, p):
-    """Eyedropper color picker over a color swatch."""
+    """Appearance opener — multi-swatch palette + eyedropper tip.
+    Solid fills so the ribbon cell never reads as an empty white plate."""
     s = cell * SS
     lw = stroke_width(cell)
-    # color swatch (bottom-left)
-    d.rounded_rectangle([s * 0.14, s * 0.62, s * 0.44, s * 0.86], radius=int(s * 0.04),
-                        fill=_rgba(p.accent, 130), outline=p.stroke, width=max(1, lw // 2))
-    # eyedropper body (diagonal) with squeeze bulb at the top-right
-    bx0, by0 = s * 0.78, s * 0.18
-    tx, ty = s * 0.40, s * 0.58
-    d.line([(bx0, by0), (tx, ty)], fill=p.stroke, width=lw * 2)
-    d.rounded_rectangle([bx0 - s * 0.04, by0 - s * 0.08, bx0 + s * 0.10, by0 + s * 0.06],
-                        radius=int(s * 0.03), fill=_rgba(p.stroke, 60), outline=p.stroke, width=max(1, lw // 2))
-    # picked-color drop at the tip
-    filled_circle(d, tx, ty, lw * 1.1, p.accent)
+    # 2x2 color swatches (reads as a material/color picker even at 20px).
+    pad = s * 0.14
+    gap = s * 0.04
+    sw = (s - 2 * pad - gap) * 0.5
+    colors = [
+        (pad, pad, (80, 170, 255)),                 # blue
+        (pad + sw + gap, pad, (240, 90, 90)),       # red
+        (pad, pad + sw + gap, (90, 210, 130)),      # green
+        (pad + sw + gap, pad + sw + gap, p.accent), # accent / teal
+    ]
+    for x, y, col in colors:
+        d.rounded_rectangle([x, y, x + sw, y + sw], radius=int(s * 0.04),
+                            fill=_rgba(col, 220), outline=p.stroke, width=max(1, lw // 2))
+    # Eyedropper tip over the bottom-right swatch (reads "pick color").
+    tip_x, tip_y = pad + sw + gap + sw * 0.55, pad + sw + gap + sw * 0.55
+    handle_x, handle_y = s * 0.86, s * 0.14
+    d.line([(handle_x, handle_y), (tip_x, tip_y)], fill=p.stroke, width=max(lw, int(2.2 * SS)))
+    filled_circle(d, handle_x, handle_y, s * 0.07, _rgba(p.stroke, 200))
+    filled_circle(d, tip_x, tip_y, s * 0.055, p.accent)
 
 @icon("appr_metal")
 def draw_appr_metal(d, cell, p):
@@ -3873,32 +3882,89 @@ RENDERED_RECIPE_NAMES: set[str] = {
     "appr_steel", "chamfer", "circular_pattern", "combine", "curve_helix",
     "draft", "extrude_boss", "extrude_cut", "fillet", "hole_wizard", "intersect",
     "linear_pattern", "loft", "loft_cut", "mirror", "revolve_boss",
-    "revolve_cut", "rib", "shell", "sm_base_flange", "sm_flat_pattern",
-    "stock", "subtract", "sweep", "sweep_cut", "thread",
+    "revolve_cut", "rib", "shell",
+    # Sheet metal + weldments — engine-rendered tiles (icon_pipeline recipes).
+    "sm_base_flange", "sm_edge_flange", "sm_flat_pattern", "sm_hem", "sm_jog",
+    "split", "stock", "subtract", "sweep", "sweep_cut", "thread",
+    "weld_end_cap", "weld_gusset", "weld_member",
 }
+
+# Scratch dir of engine-rendered tiles. Prefer these over whatever is already in
+# the committed atlas so a rebuild after SDF-flatten still recovers photo art.
+RENDER_DIR = Path(__file__).resolve().parent.parent / "scratch" / "icon_render"
 
 
 def _is_rendered_name(name: str) -> bool:
     return name in RENDERED_RECIPE_NAMES or name.startswith("cam_")
 
 
+def _fit_render_tile(src: Image.Image, size: int, pad_frac: float = 0.08) -> Image.Image:
+    """Fit a transparent engine render into a square atlas cell (same contract as
+    icon_pipeline.inject): aspect-preserving, small inset, no baked plate."""
+    src = src.convert("RGBA")
+    # Trim near-empty margins so the part fills the cell.
+    alpha = src.split()[-1]
+    bbox = alpha.getbbox()
+    if bbox:
+        src = src.crop(bbox)
+    tw, th = src.size
+    if tw <= 0 or th <= 0:
+        return Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    pad = max(1, int(round(size * pad_frac)))
+    inner = max(1, size - 2 * pad)
+    scale = min(inner / tw, inner / th)
+    nw = max(1, int(round(tw * scale)))
+    nh = max(1, int(round(th * scale)))
+    resized = src.resize((nw, nh), Image.LANCZOS)
+    out = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    out.paste(resized, ((size - nw) // 2, (size - nh) // 2), resized)
+    return out
+
+
 def _preserve_rendered_tiles(atlas: Image.Image, cell_map: dict,
                              old_atlas_path: Path, old_json_path: Path) -> int:
-    """Paste rendered (non-glyph) tiles back from the existing committed atlas so
-    a full glyph regen never clobbers curated model screenshots. Returns count."""
-    if not (old_atlas_path.exists() and old_json_path.exists()):
-        return 0
-    old_cells = json.loads(old_json_path.read_text(encoding="utf-8")).get("cell", {})
-    old_img = Image.open(old_atlas_path).convert("RGBA")
+    """Paste rendered (non-glyph) tiles back so a full glyph regen never clobbers
+    curated model screenshots. Prefers scratch/icon_render/<name>.png when present
+    (recovers after SDF-flatten / empty atlas cells); else falls back to the
+    existing committed atlas cell. Returns count of cells restored."""
+    old_cells = {}
+    old_img = None
+    if old_atlas_path.exists() and old_json_path.exists():
+        old_cells = json.loads(old_json_path.read_text(encoding="utf-8")).get("cell", {})
+        old_img = Image.open(old_atlas_path).convert("RGBA")
+
     n = 0
+    # Cache fitted scratch renders per (name, size) so @32/@20 each fit once.
+    fitted: dict[tuple[str, int], Image.Image] = {}
     for key, c in cell_map.items():
         name = key.rsplit("@", 1)[0]
         if not _is_rendered_name(name):
             continue
-        oc = old_cells.get(key)
-        if not oc or oc["w"] != c["w"] or oc["h"] != c["h"]:
-            continue  # new/resized cell — nothing curated to preserve
-        tile = old_img.crop((oc["x"], oc["y"], oc["x"] + oc["w"], oc["y"] + oc["h"]))
+        sz = int(c["w"])
+        tile = None
+        cache_key = (name, sz)
+        if cache_key in fitted:
+            tile = fitted[cache_key]
+        else:
+            render_path = RENDER_DIR / f"{name}.png"
+            if render_path.exists():
+                try:
+                    tile = _fit_render_tile(Image.open(render_path), sz)
+                    fitted[cache_key] = tile
+                except Exception:
+                    tile = None
+        if tile is None and old_img is not None:
+            oc = old_cells.get(key)
+            if oc and oc["w"] == c["w"] and oc["h"] == c["h"]:
+                tile = old_img.crop((oc["x"], oc["y"], oc["x"] + oc["w"], oc["y"] + oc["h"]))
+        if tile is None:
+            continue
+        # Skip empty / near-empty tiles so we don't paste blanks over glyphs.
+        a = tile.split()[-1]
+        if a.getbbox() is None:
+            continue
+        # Full-cell replace (no alpha mask): engine tiles have transparent margins;
+        # masking would let the freshly-drawn glyph bleed through those pixels.
         atlas.paste(tile, (c["x"], c["y"]))
         n += 1
     return n
@@ -3985,9 +4051,36 @@ def main():
     dark_atlas.save(OUT_DIR / "atlas_dark.png")
     light_atlas.save(OUT_DIR / "atlas_light.png")
 
+    # Carry forward raster_only so the C++ SDF loader keeps skipping photo tiles
+    # after a glyph regen. Union with every preserved recipe name that still has
+    # a non-empty cell (or a scratch render) so missing keys self-heal.
+    # ROOT CAUSE of "icons break every rebuild": this writer used to emit only
+    # {atlas_px, cell}, silently dropping raster_only that icon_pipeline injects.
+    prev_ro: set[str] = set()
+    old_json = OUT_DIR / "atlas.json"
+    if old_json.exists():
+        try:
+            prev_ro = set(json.loads(old_json.read_text(encoding="utf-8")).get("raster_only", []))
+        except Exception:
+            prev_ro = set()
+    ro = set(prev_ro)
+    for name in CONTRACT_NAMES:
+        if not _is_rendered_name(name):
+            continue
+        has_render = (RENDER_DIR / f"{name}.png").exists()
+        cell = dark_map.get(f"{name}@32")
+        has_px = False
+        if cell is not None:
+            x, y, w, h = cell["x"], cell["y"], cell["w"], cell["h"]
+            sample = dark_atlas.crop((x, y, x + w, y + h)).split()[-1]
+            has_px = sample.getbbox() is not None
+        if has_render or has_px:
+            ro.add(name)
+
     json_data = {
         "atlas_px": [atlas_w, atlas_h],
         "cell": dark_map,
+        "raster_only": sorted(ro),
     }
     with open(OUT_DIR / "atlas.json", "w", encoding="utf-8") as f:
         json.dump(json_data, f, indent=2)
@@ -3997,6 +4090,7 @@ def main():
           f"{len(CONTRACT_NAMES)*len(CELL_SIZES)} cells")
     print(f"  FM refresh manifest: {len(FM_REFRESH_MANIFEST)} glyphs")
     print(f"  Atlas dimensions: {atlas_w} × {atlas_h} px")
+    print(f"  raster_only: {len(ro)} photo/model tiles")
 
     if fm_bad:
         raise RuntimeError(f"FM manifest invalid: {fm_bad}")

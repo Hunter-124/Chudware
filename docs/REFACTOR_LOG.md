@@ -1911,3 +1911,16 @@ legacy 2/3/4-7 indices untouched) holding the master toggle
 `AI_CAD_SHOT=sketch` scenario complete; gui_lint theme clean. **Deferred:**
 rim-snap and parallel inference for group drags (keypoint/alignment/collinear
 only); point_on glyph renders as the neutral dot (no dedicated glyph).
+
+## 2026-07-19 — Drag snap: rim-radius + translate tangency (C56b)
+
+**sketch_mode.cpp/.h**: `rimDragSnap` covers the .rim scalar drag (circle/arc
+resize): rim through a point handle (point_on), tangent to a line (foot on
+segment) or another circle/arc (external / inside / enclosing), equal radius —
+best screen-px radius delta wins. `groupDragSnap` step 2b: circle/arc body
+translates snap to tangency vs. static lines and circles (gap closed along the
+normal / center line), so a circle dragged to a square's edge snaps tangent.
+`applyDragSnapRelations` extended: tangent/equal emit {ent, other}, point_on
+emits {pointHandle, ent}. **Verify:** host build green; AI_CAD_SHOT=sketch
+complete. **Deferred:** arc angle-handle snapping (no matching relation type);
+ellipse rim handles don't exist yet.

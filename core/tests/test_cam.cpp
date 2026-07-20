@@ -1313,9 +1313,9 @@ TEST_CASE("sim: giant frame request clamps to 64 and flags frames_clamped") {
 TEST_CASE("session: cam_tree exposes machine_detail with rapid rates (wave 1)") {
     std::string doc = make_frames_job();
     json tr = cam_tree(doc);
-    REQUIRE(tr["setups"].size() == 1);
-    CHECK(tr["setups"][0].contains("machine_detail"));
-    CHECK(tr["setups"][0]["machine_detail"]["rapid_xy"].get<double>() == doctest::Approx(5000));
+    REQUIRE(tr["tree"]["setups"].size() == 1);
+    CHECK(tr["tree"]["setups"][0].contains("machine_detail"));
+    CHECK(tr["tree"]["setups"][0]["machine_detail"]["rapid_xy"].get<double>() == doctest::Approx(5000));
     cam_close(doc);
 }
 
@@ -1412,22 +1412,22 @@ std::string make_audit_job() {
 }
 
 
-// Bump the first absolute X word on a G1 line past a large value (round-trip fail).
+// Bump the first absolute X word at/after the first G1 motion (modal output may put
+// the X word on its own line) past a large value (round-trip fail).
 std::string tamper_x_extent(std::string gcode, double x_abs) {
     std::istringstream in(gcode);
     std::ostringstream out;
     std::string line;
+    bool saw_g1 = false;
     bool done = false;
     char buf[64];
     std::snprintf(buf, sizeof(buf), "X%.3f", x_abs);
     while (std::getline(in, line)) {
-        if (!done) {
-            // Prefer a cutting move with an X word.
-            bool is_cut = line.find('G') != std::string::npos &&
-                          (line.find("G1") != std::string::npos || line.find("G01") != std::string::npos ||
-                           line.find("G1 ") != std::string::npos);
+        if (line.find("G1") != std::string::npos || line.find("G01") != std::string::npos)
+            saw_g1 = true;
+        if (saw_g1 && !done) {
             auto xpos = line.find('X');
-            if (is_cut && xpos != std::string::npos) {
+            if (xpos != std::string::npos) {
                 size_t i = xpos + 1;
                 size_t j = i;
                 if (j < line.size() && (line[j] == '+' || line[j] == '-')) ++j;
@@ -1446,11 +1446,13 @@ TEST_CASE("audit: generated+posted pocket/drill job is ok with stats (wave 2)") 
     std::string doc = make_audit_job();
     json gen = cam_generate(doc, json::object());
     REQUIRE(gen["toolpaths"].size() >= 1);
-    json post = cam_post(doc, json{{"dialect", "grbl"}});
+    // fanuc (not grbl) so the posted program carries T words — grbl's post suppresses
+    // them, so stats.tools_used would be legitimately empty there.
+    json post = cam_post(doc, json{{"dialect", "fanuc"}});
     REQUIRE(post["ok"].get<bool>());
     REQUIRE(post["gcode"].get<std::string>().size() > 20);
 
-    json a = cam_audit(doc, json{{"dialect", "grbl"}, {"machine", "benchtop_vmc"}});
+    json a = cam_audit(doc, json{{"dialect", "fanuc"}, {"machine", "benchtop_vmc"}});
     CHECK(a["schema"] == "aicad.cam_audit/1");
     CHECK(a["ok"].get<bool>());
     CHECK(a["errors"].empty());
@@ -1462,7 +1464,7 @@ TEST_CASE("audit: generated+posted pocket/drill job is ok with stats (wave 2)") 
     CHECK(a["stats"].contains("feed_range_mm_min"));
     CHECK(a["stats"]["feed_range_mm_min"].is_array());
     CHECK(a["provenance"]["source"] == "cam_post");
-    CHECK(a["provenance"]["dialect"] == "grbl");
+    CHECK(a["provenance"]["dialect"] == "fanuc");
     cam_close(doc);
 }
 

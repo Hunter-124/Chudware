@@ -483,6 +483,13 @@ PostResult post_setup(const Setup& setup, const ToolLibrary& tools, const std::s
         }
     }
 
+    // ── footer ──
+    if (!g.lathe && !( setup.machine.kind == MachineKind::Laser )) g.blk(g.c.spindle_off);
+    g.blk(c.coolant_off);
+    if (!c.program_end.empty()) g.blk(c.program_end);
+    g.blk(c.program_stop);
+    if (c.percent_wrap) g.raw("%");
+
     // Tool re-change warning: a tool number that appears in ≥2 non-consecutive
     // op groups within this setup costs extra tool changes.
     {

@@ -1372,6 +1372,36 @@ static void planDrawSubagents(const PlanState& plan,
     }
 }
 
+// Live plan progress: done/total across step/task/part items + the title of the item
+// currently running (for the one-line summary shown while the turn works).
+static void planProgress(const PlanState& plan, const std::vector<ActivityItem>& activity,
+                         int& done, int& total, std::string& current) {
+    done = 0; total = 0; current.clear();
+    for (const auto& it : plan.items) {
+        if (it.kind == "subagent" || it.kind == "objective") continue;
+        ++total;
+        const std::string st = planItemStatusFromActivity(it, activity);
+        if (st == "done" || st == "pass") ++done;
+        else if (st == "running" && current.empty())
+            current = it.title.empty() ? it.id : it.title;
+    }
+}
+
+// One-line live summary: "3/8 done · now: extrude base" (or the tail when nothing runs).
+static std::string planProgressLine(const PlanState& plan,
+                                    const std::vector<ActivityItem>& activity) {
+    int d = 0, t = 0; std::string cur;
+    planProgress(plan, activity, d, t, cur);
+    std::string out;
+    if (t > 0) {
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "%d/%d", d, t);
+        out = buf;
+    }
+    if (!cur.empty()) { if (!out.empty()) out += " \xc2\xb7 "; out += "now: "; out += cur; }
+    return out;
+}
+
 void drawPlanSection(const PlanState& plan, const std::vector<ActivityItem>& activity,
                      const ui::Fonts& fonts) {
     if (!plan.present) return;
@@ -1382,6 +1412,40 @@ void drawPlanSection(const PlanState& plan, const std::vector<ActivityItem>& act
     const ui::AdaptiveSurface& surf = chatSurf();
     const ImVec4 accent = semanticOnGlass(pal.accent, surf);
     const float sc = ui::uiScale;
+
+    // Collapsible section — the header toggle state persists per message via ImGui storage
+    // (id is stable inside the message's PushID scope). Default open.
+    ImGuiStorage* hdrStore = ImGui::GetStateStorage();
+    const ImGuiID hdrId = ImGui::GetID("##plansec_open");
+    const bool sectionOpen = hdrStore->GetBool(hdrId, true);
+    if (!sectionOpen) {
+        // Collapsed: one-line card with title + live progress; click re-opens.
+        GlassBubble gb0 = beginGlassBubble(ImGui::GetContentRegionAvail().x,
+                                           ui::GlassLevel::Thin, 8.0f);
+        ImGui::BeginChild("##plansec_min", ImVec2(0, 0),
+                          ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+        ImGui::PushFont(fonts.medium);
+        ImGui::TextColored(accent, "%s", plan.title.empty() ? "Plan" : plan.title.c_str());
+        ImGui::PopFont();
+        if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        if (ImGui::IsItemClicked()) hdrStore->SetBool(hdrId, true);
+        const std::string prog = planProgressLine(plan, activity);
+        if (!prog.empty()) {
+            ImGui::SameLine(0, 8.0f * sc);
+            ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+            ImGui::TextUnformatted(prog.c_str());
+            ImGui::PopStyleColor();
+        }
+        ImGui::SameLine(0, 8.0f * sc);
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+        ImGui::TextUnformatted("(show)");
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        if (ImGui::IsItemClicked()) hdrStore->SetBool(hdrId, true);
+        ImGui::EndChild();
+        endGlassBubble(gb0);
+        return;
+    }
 
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
     ImGui::BeginChild("##plansec", ImVec2(0, 0),
@@ -1409,6 +1473,22 @@ void drawPlanSection(const PlanState& plan, const std::vector<ActivityItem>& act
         ImGui::TextColored(accent, "%s", hdr);
     }
     ImGui::PopFont();
+    // (hide) toggle on the header row — collapses the whole section to the one-line summary.
+    {
+        ImGui::SameLine(0, 8.0f * sc);
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+        ImGui::TextUnformatted("(hide)");
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        if (ImGui::IsItemClicked()) hdrStore->SetBool(hdrId, false);
+        const std::string prog = planProgressLine(plan, activity);
+        if (!prog.empty()) {
+            ImGui::SameLine(0, 8.0f * sc);
+            ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+            ImGui::TextUnformatted(prog.c_str());
+            ImGui::PopStyleColor();
+        }
+    }
     if (!plan.shape.empty()) {
         ImGui::SameLine(0, 8.0f * sc);
         // Vertically center chip with title line.
@@ -2068,6 +2148,33 @@ static int countOpsInJsonPrefix(const std::string& s) {
         }
     } catch (...) {}
     return -1;
+}
+
+// Best-effort label of the most recent op in a streamed ops-JSON prefix: the last
+// "op"/"tool" string field. Powers the live "Building ops…" summary so the user sees
+// WHAT is being built in real time without opening the raw JSON expander.
+static std::string lastOpLabelInJsonPrefix(const std::string& s) {
+    static const char* keys[] = {"\"op\"", "\"tool\""};
+    for (const char* k : keys) {
+        size_t pos = s.rfind(k);
+        while (pos != std::string::npos) {
+            size_t p = pos + std::strlen(k);
+            while (p < s.size() && (s[p] == ' ' || s[p] == '\t' || s[p] == '\r' || s[p] == '\n')) ++p;
+            if (p < s.size() && s[p] == ':') {
+                ++p;
+                while (p < s.size() && (s[p] == ' ' || s[p] == '\t')) ++p;
+                if (p < s.size() && s[p] == '"') {
+                    size_t e = s.find('"', p + 1);
+                    if (e != std::string::npos && e > p + 1 && e - p - 1 <= 64)
+                        return s.substr(p + 1, e - p - 1);
+                    if (e == std::string::npos && s.size() > p + 1 && s.size() - p - 1 <= 64)
+                        return s.substr(p + 1) + "\xe2\x80\xa6";   // value still streaming
+                }
+            }
+            pos = (pos == 0) ? std::string::npos : s.rfind(k, pos - 1);
+        }
+    }
+    return {};
 }
 
 // Finalize a thought/output box: stop streaming. Ops JSON stays collapsed unless
@@ -3088,6 +3195,7 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
                 // Refresh one-line summary into reason; keep raw JSON in detail.
                 int nOps = countOpsInJsonPrefix(a->detail);
                 if (nOps > 0) a->opsCount = nOps;
+                const std::string opLbl = lastOpLabelInJsonPrefix(a->detail);
                 if (nOps > 0) {
                     char buf[64];
                     std::snprintf(buf, sizeof(buf), "%d op%s", nOps, nOps == 1 ? "" : "s");
@@ -3097,6 +3205,7 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
                     std::snprintf(buf, sizeof(buf), "%zu bytes", a->detail.size());
                     a->reason = buf;
                 }
+                if (!opLbl.empty()) { a->reason += " \xc2\xb7 "; a->reason += opLbl; }
                 // Do NOT append this delta (or any further ops JSON) to m.text.
                 m.uiCachedH = -1.0f;
             } else {
@@ -6999,6 +7108,18 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
         // Lazy normalize so the old AgentEvent plan path still lights the section.
         m.planState = planStateFromPlanInfo(m.plan);
         drawPlanSection(m.planState, m.activity, fonts);
+    } else if (planInTimeline && m.planState.present && m.running) {
+        // The full plan card lives inline at its arrival position (below). While the turn
+        // runs, pin a one-line live progress summary at the TOP of the turn so step/part
+        // progress stays visible even when the inline card has scrolled out of view.
+        const std::string prog = planProgressLine(m.planState, m.activity);
+        if (!prog.empty()) {
+            const ui::AdaptiveSurface& surf = chatSurf();
+            ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+            ImGui::TextUnformatted((std::string("Plan \xc2\xb7 ") + prog).c_str());
+            ImGui::PopStyleColor();
+            ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
+        }
     }
 
     // (2) Agent timeline — typed blocks: collapsible thinking + glass action cards.

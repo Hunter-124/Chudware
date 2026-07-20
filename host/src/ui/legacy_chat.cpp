@@ -2188,6 +2188,19 @@ static void markChatHistoryDirty() {
 }
 
 void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json& data) {
+    // Plan-section position marker (rowKind 18): the plan/objectives section renders at the
+    // point in the timeline where the plan FIRST arrived, not pinned to the top of the turn.
+    // Without this a late plan used to pop in ABOVE thinking blocks the user had already read,
+    // looking out-of-order. Idempotent — one marker per turn.
+    auto ensurePlanMarker = [&]() {
+        for (const auto& a : m.activity)
+            if (a.rowKind == 18) return;
+        ActivityItem ni;
+        ni.rowKind = 18;
+        ni.stage   = "__plan__";
+        ni.status  = "done";
+        m.activity.push_back(std::move(ni));
+    };
     // Inside a mission, sub-run stage keys (intake/model/...) repeat per task — namespace them by
     // the current task index so task 2's "model" row doesn't reopen task 1's. Outside a mission
     // (curMissionTask < 0) the key is the bare stage, preserving the single-run behavior exactly.
@@ -2212,6 +2225,7 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         // First plan_state of the turn — take wholesale (still mark present/fromEvent).
         if (!m.planState.present || m.planState.items.empty()) {
             m.planState = std::move(incoming);
+            ensurePlanMarker();
         } else {
             // Multi-writer merge: upsert items by id; keep foreign-namespace rows.
             // Top-level title/summary/shape update when incoming revision is >= current
@@ -2361,6 +2375,7 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             m.planState.shape = "checklist";
             m.planState.title = "Plan";
             m.planState.revision = 0;
+            ensurePlanMarker();
         }
         return m.planState;
     };
@@ -2411,6 +2426,7 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
                 if (!m.planState.present || m.planState.items.empty()) {
                     m.planState = std::move(derived);
                     m.planState.fromEvent = false;
+                    ensurePlanMarker();
                 } else {
                     // Upsert part:* items only; leave foreign namespaces intact.
                     for (auto& inc : derived.items)
@@ -2823,6 +2839,22 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
                 ActivityItem* ta = nullptr;
                 for (auto it = m.activity.rbegin(); it != m.activity.rend(); ++it)
                     if (it->rowKind == 2 && it->stage == key) { ta = &*it; break; }
+                // Dedupe: the same reasoning often already streamed live into a "Thinking"
+                // box (assistant_delta channel=thinking). Fold into that box instead of
+                // stacking a second, identical display under it.
+                if (!ta) {
+                    for (auto it = m.activity.rbegin(); it != m.activity.rend(); ++it) {
+                        if (it->rowKind != 2 || it->stage == key ||
+                            it->stage == "stream:out") continue;
+                        if (it->detail == thinking ||
+                            (!it->detail.empty() &&
+                             thinking.find(it->detail.substr(0, std::min<size_t>(it->detail.size(), 64))) == 0)) {
+                            ta = &*it;
+                            break;
+                        }
+                        if (it->stage.rfind("thought:out:", 0) == 0) break;  // only scan this stage's burst
+                    }
+                }
                 if (!ta) {
                     ActivityItem ni;
                     ni.rowKind = 2;
@@ -2990,8 +3022,19 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         const bool think = (chan == "thinking");
         const std::string key = think ? "thought:stream" : "stream:out";
         ActivityItem* a = nullptr;
-        for (auto it = m.activity.rbegin(); it != m.activity.rend(); ++it)
-            if (it->rowKind == 2 && it->stage == key && it->streaming) { a = &*it; break; }
+        // Thinking coalesces only into a LIVE box (per stage burst). The Output/ops box
+        // also coalesces with a JUST-FINALIZED stream:out row when nothing else landed after
+        // it (tail of the timeline): consecutive stage bursts then share ONE "Building ops…"
+        // box instead of stacking duplicates. Boxes behind other rows stay put (chronology),
+        // and a prose stage after an ops stage always gets a fresh box so its text still
+        // streams into the primary bubble.
+        for (auto it = m.activity.rbegin(); it != m.activity.rend(); ++it) {
+            if (it->rowKind != 2 || it->stage != key) continue;
+            const bool tailReuse = !think && (it == m.activity.rbegin()) &&
+                                   (it->opsCount > 0 ||
+                                    it->title.find("Building ops") != std::string::npos);
+            if (it->streaming || tailReuse) { a = &*it; break; }
+        }
         // tokensIn on stream:out = byte offset into m.text where THIS segment began (for
         // stripping JSON that already leaked into the prose bubble when classification flips).
         // opsCount > 0  => classified as OPS JSON (Building ops… mode).
@@ -3019,9 +3062,12 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             // Text channel: append into the Output box always (collapsed raw log), AND
             // stream prose into the primary bubble (m.text) live — see the prose branch below.
             if (!txt.empty()) a->detail += txt;
-            a->streaming = true;
+            a->streaming = true;   // re-opens a finalized (coalesced) box
             a->status    = "running";
-
+            // A reused tail box may have been auto-collapsed — keep the user's last
+            // expanded state; never force it back open mid-turn. Its tokensIn segment
+            // marker also resets so a fresh ops-flip strip can't truncate older prose.
+            if (!a->streaming && a->opsCount <= 0) a->tokensIn = (int)mTextBefore;
             const bool wasOps = (a->opsCount > 0);
             const size_t opsAt = wasOps ? 0 : findOpsJsonStart(a->detail);
             const bool isOps = wasOps || (opsAt != std::string::npos);
@@ -4552,8 +4598,10 @@ static void drawThinkingBlock(ActivityItem& a, const ui::Fonts& fonts, bool show
         return;
     }
 
-    // Force open while streaming or the turn is still running (live planning tokens).
-    const bool open = a.expanded || a.streaming || turnRunning || !laterDone;
+    // Force open while streaming or the turn is still running (live planning tokens) —
+    // UNLESS the user explicitly toggled the block: a user collapse must stick even mid-run.
+    const bool open = a.userToggled ? a.expanded
+                                    : (a.expanded || a.streaming || turnRunning || !laterDone);
     // Split detail into reply body + optional packed sent-prompt trailer.
     std::string replyBody = a.detail;
     std::string sentBody;
@@ -4580,13 +4628,13 @@ static void drawThinkingBlock(ActivityItem& a, const ui::Fonts& fonts, bool show
     ImGui::PopFont();
     if (hasDetail) {
         if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-        if (ImGui::IsItemClicked()) a.expanded = !open;
+        if (ImGui::IsItemClicked()) { a.expanded = !open; a.userToggled = true; }
         ImGui::SameLine(0, 6 * sc);
         ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
         ImGui::TextUnformatted(open ? "(hide)" : "(show thinking)");
         ImGui::PopStyleColor();
         if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-        if (ImGui::IsItemClicked()) a.expanded = !open;
+        if (ImGui::IsItemClicked()) { a.expanded = !open; a.userToggled = true; }
     }
     if (open && hasDetail) {
         if (!sentBody.empty()) {
@@ -4848,9 +4896,12 @@ static void drawThoughtBox(ActivityItem& a, const ui::Fonts& fonts, bool showThi
         return;
     }
     // Ops JSON: only open when the user expanded it (never force-open while streaming).
-    // Thinking: open while streaming OR turn running OR user-expanded.
+    // Thinking: open while streaming OR turn running OR user-expanded — but a user's explicit
+    // collapse/expand always wins over the auto-open (else the (hide) toggle was dead mid-run).
     const bool open = isOpsJson ? a.expanded
-                                : (a.expanded || a.streaming || (turnRunning && !isOutput));
+                                : (a.userToggled ? a.expanded
+                                                 : (a.expanded || a.streaming ||
+                                                    (turnRunning && !isOutput)));
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
     ImGui::BeginChild("##thoughtbox", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
@@ -5933,6 +5984,10 @@ static void drawAgentTimeline(ChatMsg& m, const ui::Fonts& fonts, float logW, bo
             drawAdvisorCard(a, fonts);
         } else if (a.rowKind == 17) {
             drawSubRunCard(a, fonts);
+        } else if (a.rowKind == 18) {
+            // Plan position marker — the plan/objectives section renders HERE, where the plan
+            // first arrived in the event stream, instead of pinned to the top of the turn.
+            if (m.planState.present) drawPlanSection(m.planState, m.activity, fonts);
         } else if (isThinkingItem(a)) {
             bool laterDone = false;
             for (size_t j = i + 1; j < m.activity.size(); ++j) {
@@ -6924,10 +6979,15 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
 
     // (1) Plan / Objectives — multi-shape section (tiles + todos + subagents).
     // Prefer planState; back-compat: legacy PlanInfo (Python kind:plan via app.cpp) normalizes
-    // on the fly when planState was never filled.
-    if (m.planState.present) {
+    // on the fly when planState was never filled. When a rowKind-18 marker exists in the
+    // activity timeline the section renders THERE (arrival position) instead — drawing it
+    // here too would double the card and re-introduce the out-of-order top-pin bug.
+    bool planInTimeline = false;
+    for (const auto& a : m.activity)
+        if (a.rowKind == 18) { planInTimeline = true; break; }
+    if (!planInTimeline && m.planState.present) {
         drawPlanSection(m.planState, m.activity, fonts);
-    } else if (m.plan.present) {
+    } else if (!planInTimeline && m.plan.present) {
         // Lazy normalize so the old AgentEvent plan path still lights the section.
         m.planState = planStateFromPlanInfo(m.plan);
         drawPlanSection(m.planState, m.activity, fonts);
@@ -8196,7 +8256,8 @@ void persistChatHistory(AppState& st) {
                 for (int ai = nAct - 1; ai >= 0; --ai) {
                     const auto& a = m.activity[(size_t)ai];
                     const bool priority = (a.rowKind == 2 || a.rowKind == 3 || a.rowKind == 10 ||
-                                           a.rowKind == 1 || a.stage == "__stop_meta__");
+                                           a.rowKind == 1 || a.rowKind == 18 ||
+                                           a.stage == "__stop_meta__");
                     if (priority) {
                         keepIdx.push_back(ai);
                     } else if (stagesKept < kMaxStages) {
@@ -12454,7 +12515,19 @@ static void drawComposer(AppState& st, bool busy, bool canRun) {
     // Reserve the in-box send button's footprint on the input's right so text never runs under it.
     const float sendSz    = ImGui::GetFrameHeight();
     const float sendInset = 6.0f * ui::uiScale;
-    bool submitInput = drawChatInput("##aiprompt", st.prompt, placeholder,
+    // After a send the backing buffer is cleared while the InputText is still ACTIVE — ImGui
+    // keeps its own edit state for the active widget and ignores the external clear, so the
+    // prompt stayed in the box. Bump a generation into the widget id on send so the widget
+    // restarts from the (empty) buffer; refocus it so the user can keep typing.
+    static int  s_composerGen = 0;
+    static bool s_refocusComposer = false;
+    if (s_refocusComposer) {
+        ImGui::SetKeyboardFocusHere();
+        s_refocusComposer = false;
+    }
+    char inputId[32];
+    std::snprintf(inputId, sizeof(inputId), "##aiprompt%d", s_composerGen);
+    bool submitInput = drawChatInput(inputId, st.prompt, placeholder,
                                      ui::metrics::copilotInputMaxLines(),
                                      sendSz + sendInset * 2.0f);
     // Crash-safe draft: debounce-write whatever is in the box.
@@ -12477,6 +12550,20 @@ static void drawComposer(AppState& st, bool busy, bool canRun) {
 
     // ---- stop / submit / queue ----
     if (stopReq) requestStopRun(st);
+    // The composer re-wraps text by toggling spaces<->newlines (rewrapInPlace). Flatten those
+    // soft breaks back to spaces on the way OUT so submitted/queued/steered prompts — and the
+    // user bubble that echoes them — never carry the composer's visual line breaks.
+    auto flattenComposer = [](const char* s) {
+        std::string out(s ? s : "");
+        for (auto& c : out) if (c == '\n') c = ' ';
+        return out;
+    };
+    auto clearComposerBox = [&]() {
+        clearPromptDraft(st);
+        st.prompt[0] = 0;
+        ++s_composerGen;          // fresh InputText state (active widget ignores external clears)
+        s_refocusComposer = true; // keep typing without re-clicking
+    };
     if (submit || submitInput) {
         if (active) {
             // A turn is running — STEER it mid-run when the engine knows the run_id
@@ -12489,27 +12576,26 @@ static void drawComposer(AppState& st, bool busy, bool canRun) {
                     std::lock_guard<std::mutex> lk(st.job.mtx);
                     runId = st.job.runId;
                 }
+                const std::string text = flattenComposer(st.prompt.data());
                 if (!runId.empty() && st.workerStarted) {
-                    agentControlDispatch(st, runId, st.prompt.data());
+                    agentControlDispatch(st, runId, text);
                     // Record the steering text in the visible conversation (it otherwise
                     // only reaches the engine + debug log and vanishes from the composer).
-                    ChatMsg u; u.fromUser = true; u.text = std::string(st.prompt.data());
+                    ChatMsg u; u.fromUser = true; u.text = text;
                     u.copilotMode = st.aiInteraction;
                     u.liveStatus = "steering";  // subtle caption under the bubble
                     st.chat.push_back(std::move(u));
                 } else {
                     // Auto-sends when the assistant frees up (drain at the top of drawComposer).
-                    st.queuedPrompts.emplace_back(st.prompt.data());
+                    st.queuedPrompts.emplace_back(text);
                 }
-                clearPromptDraft(st);
-                st.prompt[0] = 0;
+                clearComposerBox();
             }
         } else if (canStart) {
             // Stage the rollback only on send (Esc cancelled without this).
             if (s_edit.active) commitEditStageOnSend(st);
-            submitTurn(st, std::string(st.prompt.data()));
-            clearPromptDraft(st);
-            st.prompt[0] = 0;
+            submitTurn(st, flattenComposer(st.prompt.data()));
+            clearComposerBox();
         }
     }
 }

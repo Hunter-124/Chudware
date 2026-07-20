@@ -184,6 +184,13 @@ public:
     void captureCurrentAsGhost();
     void clearGhost();
     bool hasGhost() const { return showGhost_ && !ghostSubs_.empty(); }
+    // CAM simulation remnant-stock mesh: a translucent aux body drawn with the same
+    // shaded alpha pass as the component-edit ghost, but owned by the CAM viewport
+    // playhead (uploaded per frame index, cleared when leaving the Manufacture
+    // workspace). Non-pickable, identity model matrix (CAM coords are world/WCS).
+    void setAuxMesh(const Mesh& m, float alpha);
+    void clearAuxMesh();
+    bool hasAuxMesh() const { return showAux_ && !auxSubs_.empty(); }
     void setGhostAlpha(float a) { ghostAlpha_ = (a < 0.0f) ? 0.0f : (a > 1.0f ? 1.0f : a); }
     // In-context component edit: relocate the ghost pass by this column-major 4x4 (applied to ghost
     // vertices BEFORE the camera). Caller passes inverse(editedComponent.placement) so the ghost's
@@ -563,6 +570,10 @@ private:
     bool  showGhost_ = false;
     float ghostAlpha_ = 0.28f;
     Mat4  ghostXform_;   // extra model xform for the ghost pass only (identity = no shift); see setGhostTransform
+    // CAM remnant-stock aux mesh (see setAuxMesh): separate from ghostSubs_ (component-edit owns that).
+    std::vector<Sub> auxSubs_;
+    bool  showAux_ = false;
+    float auxAlpha_ = 0.45f;
     Vec3 center_;
     Vec3 pan_;  // W2-D: world-space orbit-target offset (set by renderOrbit; added to center_)
     float lensShiftX_ = 0.0f;  // W2: horizontal NDC lens shift (proj.m[8] / ortho offset)

@@ -10,8 +10,14 @@
 #pragma once
 
 #include <string>
+#include <utility>
+#include <vector>
+
+#include "imgui.h"
+#include <nlohmann/json.hpp>
 
 struct AppState;
+struct Mesh;  // fwd (host/src/mesh.h, global namespace)
 
 namespace ui {
 
@@ -49,5 +55,31 @@ void drawCamTreeBody(AppState& st);
 // Viewport overlay accessor: the active job's classified toolpath segments to draw over the
 // part (rapid/cut/lead/plunge/arc), or nullptr when the panel is hidden / backplot off.
 const CamBackplot* camActiveBackplot();
+
+// ---- viewport playhead (wave 3: animated material-removal sim in the 3D view) ----
+// Adopt a cam_simulate response into the playhead state (async callback + headless scenarios).
+void camAdoptSimResult(const nlohmann::json& result);
+// Adopt a cam_generate response into the backplot (headless scenarios; normal path is async).
+void camAdoptToolpaths(const nlohmann::json& result);
+// True when a sim with frames is loaded and the backplot overlay is on.
+bool camSimHudActive();
+// Split backplot at the current playT (lazy re-split). first = before (done), second = after.
+const std::pair<const CamBackplot*, const CamBackplot*>& camBackplotSplit();
+// Frame index for the current playT (-1 = no frames).
+int camCurrentFrameIndex();
+// Rebuild + return the remnant-stock mesh for the current frame index.
+bool camFrameMeshFor(int idx);
+const Mesh& camFrameMesh();
+// Tool pose interpolated at playT; false when no toolpath geometry exists.
+bool camToolPoseAt(double t, float outPos[3]);
+double camPlayTotalTime();
+double camPlayT();
+// Bottom-center transport bar over the viewport rect (screen space).
+void camDrawSimHud(AppState& st, const ImVec2& vpMin, const ImVec2& vpSize);
+// Shot-only: park the playhead at a fraction of total time.
+void camDebugSetPlayhead(float frac);
+// Stock-box overlay: visible toggle + 12 edge segments of the selected setup's box stock.
+bool camStockBoxVisible();
+bool camStockBoxSegments(std::vector<float>& out);
 
 }  // namespace ui

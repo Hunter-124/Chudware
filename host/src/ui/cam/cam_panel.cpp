@@ -21,6 +21,7 @@
 
 #include "../../core/app_state.h"
 #include "../../ui_theme.h"    // ui::palette (opaque title-bar / border override for this window)
+#include "../../mesh.h"        // Mesh — playhead remnant-stock mesh
 #include "../feature_tree.h"   // fmRowPill / fmTreeIcon / fmSectionDivider — the ratified FM row
                                // styling, reused so the Manufacture tree matches the FeatureManager
 
@@ -59,6 +60,21 @@ struct CamUI {
     std::string gcodePath;             // desktop temp .nc path (empty on web)
     nlohmann::json sim;                // last cam_simulate result
     std::string status;                // last action status / error
+    // Viewport playhead state (wave 3: animated material-removal sim in the 3D view)
+    std::vector<nlohmann::json> simFrames;  // aicad.cam_sim_frames/1 field dicts
+    std::vector<double> simFrameT;          // frame times (s), parallel to simFrames
+    bool framesClamped = false;
+    double playT = 0;                  // playhead time (s)
+    bool playing = false;
+    float playSpeed = 1.0f;
+    int curFrame = -1;                 // frame index currently uploaded as aux mesh
+    Mesh frameMesh;                    // built from simFrames[curFrame]
+    bool frameMeshValid = false;
+    bool showStock = false;            // stock box overlay
+    bool optGouge = true, optRapid = true, optHolder = false;
+    float optRes = 0.5f;
+    CamBackplot bpBefore, bpAfter;     // split backplot for the playhead scrub
+    double splitT = -1;                // playT the split was computed for
     // operation form buffers (selected op)
     char opName[64] = "";
     float fStepover = 0, fStepdown = 0, fStockLeave = 0, fFeed = 0, fRpm = 0;
@@ -351,7 +367,13 @@ void doSimulate(AppState& st) {
     g.status = "simulating...";
     const int gen = g.rpcGen;
     const std::string docId = g.docId;
-    st.rpc.call("cam_simulate", {{"doc_id", docId}},
+    st.rpc.call("cam_simulate",
+                {{"doc_id", docId}, {"include_field", true},
+                 {"options", {{"resolution", (double)g.optRes},
+                              {"check_gouge", g.optGouge},
+                              {"check_rapid", g.optRapid},
+                              {"check_holder", g.optHolder},
+                              {"frames", 16}}}},
                 [gen, docId](const core::RpcResult& r) {
         camEndRpc();
         if (gen != g.rpcGen || g.docId != docId) return;
@@ -361,6 +383,7 @@ void doSimulate(AppState& st) {
             return;
         }
         g.sim = r.result;
+        camAdoptSimResult(r.result);
         g.status = "simulated";
     });
 }
@@ -581,6 +604,182 @@ const CamBackplot* camActiveBackplot() {
     return &g.mirror.backplot();
 }
 
+// Adopt a cam_simulate response: parse the selected setup's frames into the playhead state.
+// Called by doSimulate's async callback and by headless scenarios (sync worker.call path).
+void camAdoptSimResult(const nlohmann::json& result) {
+    g.simFrames.clear(); g.simFrameT.clear();
+    g.framesClamped = false; g.playT = 0; g.playing = false;
+    g.curFrame = -1; g.frameMeshValid = false; g.splitT = -1;
+    if (!result.contains("results") || !result["results"].is_array()) return;
+    const nlohmann::json* pick = nullptr;
+    const auto& results = result["results"];
+    if (g.selSetup >= 0 && g.selSetup < (int)g.mirror.setups().size()) {
+        const std::string& sid = g.mirror.setups()[g.selSetup].id;
+        for (const auto& e : results)
+            if (e.value("setup_id", std::string()) == sid) { pick = &e; break; }
+    }
+    if (!pick && !results.empty()) pick = &results[0];
+    if (pick && pick->contains("frames") && (*pick)["frames"].is_array()) {
+        for (const auto& f : (*pick)["frames"]) {
+            if (!f.contains("field") || !f.contains("t_s")) continue;
+            g.simFrames.push_back(f["field"]);
+            g.simFrameT.push_back(f["t_s"].get<double>());
+        }
+        g.framesClamped = pick->value("frames_clamped", false);
+    }
+}
+
+void camAdoptToolpaths(const nlohmann::json& result) {
+    g.mirror.loadToolpaths(result);
+    g.generatedRev = g.mirror.revision();
+    g.genWarnings = (result.contains("warnings") && result["warnings"].is_array())
+                        ? (int)result["warnings"].size() : 0;
+}
+
+// ---- viewport playhead (wave 3) ----
+bool camSimHudActive() {
+    return g.backplot && !g.mirror.backplot().empty() && !g.simFrames.empty();
+}
+
+// Split backplot at the current playT, lazily re-splitting only when playT changed.
+const std::pair<const CamBackplot*, const CamBackplot*>& camBackplotSplit() {
+    static std::pair<const CamBackplot*, const CamBackplot*> out;
+    if (g.splitT != g.playT) {
+        g.mirror.backplot().splitAt(g.playT, g.bpBefore, g.bpAfter);
+        g.splitT = g.playT;
+    }
+    out = {&g.bpBefore, &g.bpAfter};
+    return out;
+}
+
+// Frame index for the current playT (lower_bound over frame times).
+int camCurrentFrameIndex() {
+    if (g.simFrameT.empty()) return -1;
+    auto it = std::lower_bound(g.simFrameT.begin(), g.simFrameT.end(), g.playT);
+    if (it == g.simFrameT.end()) return (int)g.simFrameT.size() - 1;
+    return (int)(it - g.simFrameT.begin());
+}
+
+// Rebuild the remnant mesh for frame `idx` if needed; returns true when a mesh is ready.
+bool camFrameMeshFor(int idx) {
+    if (idx < 0 || idx >= (int)g.simFrames.size()) return false;
+    if (idx == g.curFrame && g.frameMeshValid) return true;
+    if (!camFieldToMesh(g.simFrames[idx], g.frameMesh)) {
+        g.status = "sim frame mesh: malformed field (kept previous)";
+        return g.frameMeshValid;
+    }
+    g.curFrame = idx;
+    g.frameMeshValid = true;
+    return true;
+}
+const Mesh& camFrameMesh() { return g.frameMesh; }
+
+// Tool pose at time t: walk the segment time arrays (cut/lead/plunge/arc; rapids first-fit).
+bool camToolPoseAt(double t, float outPos[3]) {
+    const CamBackplot& bp = g.mirror.backplot();
+    auto walk = [&](const std::vector<float>& segs, const std::vector<float>& times) -> bool {
+        for (size_t i = 0; i + 5 < segs.size(); i += 6) {
+            double tEnd = (i / 6 < times.size()) ? times[i / 6] : 0;
+            double tStart = (i >= 6) ? times[i / 6 - 1] : 0.0;
+            if (t <= tEnd) {
+                double f = (tEnd > tStart) ? (t - tStart) / (tEnd - tStart) : 1.0;
+                outPos[0] = segs[i]   + (segs[i+3] - segs[i])   * (float)f;
+                outPos[1] = segs[i+1] + (segs[i+4] - segs[i+1]) * (float)f;
+                outPos[2] = segs[i+2] + (segs[i+5] - segs[i+2]) * (float)f;
+                return true;
+            }
+        }
+        return false;
+    };
+    // prefer cutting geometry (the tool's working position)
+    if (walk(bp.cut, bp.cutT) || walk(bp.arc, bp.arcT) || walk(bp.lead, bp.leadT) ||
+        walk(bp.plunge, bp.plungeT) || walk(bp.rapid, bp.rapidT)) return true;
+    return false;
+}
+
+double camPlayTotalTime() {
+    return g.mirror.backplot().totalTime;
+}
+double camPlayT() { return g.playT; }
+
+bool camStockBoxVisible() { return g.showStock && g.selSetup >= 0 &&
+                                  g.selSetup < (int)g.mirror.setups().size(); }
+
+// 12 edges of the selected setup's box stock (world mm); false when the stock isn't a box.
+bool camStockBoxSegments(std::vector<float>& out) {
+    if (g.selSetup < 0 || g.selSetup >= (int)g.mirror.setups().size()) return false;
+    const nlohmann::json& stock = g.mirror.setups()[g.selSetup].stock;
+    if (!stock.contains("min") || !stock.contains("max")) return false;
+    const auto& mn = stock["min"]; const auto& mx = stock["max"];
+    if (!mn.is_array() || mn.size() < 3 || !mx.is_array() || mx.size() < 3) return false;
+    float x0 = mn[0].get<float>(), y0 = mn[1].get<float>(), z0 = mn[2].get<float>();
+    float x1 = mx[0].get<float>(), y1 = mx[1].get<float>(), z1 = mx[2].get<float>();
+    const float c[8][3] = {{x0,y0,z0},{x1,y0,z0},{x1,y1,z0},{x0,y1,z0},
+                           {x0,y0,z1},{x1,y0,z1},{x1,y1,z1},{x0,y1,z1}};
+    const int e[12][2] = {{0,1},{1,2},{2,3},{3,0},{4,5},{5,6},{6,7},{7,4},
+                          {0,4},{1,5},{2,6},{3,7}};
+    out.clear();
+    for (auto& edge : e) {
+        out.push_back(c[edge[0]][0]); out.push_back(c[edge[0]][1]); out.push_back(c[edge[0]][2]);
+        out.push_back(c[edge[1]][0]); out.push_back(c[edge[1]][1]); out.push_back(c[edge[1]][2]);
+    }
+    return true;
+}
+
+// Bottom-center transport bar over the viewport (drawn in screen space by viewport_panel).
+void camDrawSimHud(AppState& st, const ImVec2& vpMin, const ImVec2& vpSize) {
+    if (!camSimHudActive()) return;
+    double total = g.mirror.backplot().totalTime;
+    if (total <= 0) return;
+    if (g.playing) {
+        g.playT += ImGui::GetIO().DeltaTime * g.playSpeed;
+        if (g.playT >= total) { g.playT = total; g.playing = false; }
+    }
+    const float w = 420.0f, h = 56.0f;
+    ImVec2 pos(vpMin.x + (vpSize.x - w) * 0.5f, vpMin.y + vpSize.y - h - 14.0f);
+    ImGui::SetNextWindowPos(pos);
+    ImGui::SetNextWindowSize(ImVec2(w, h));
+    ImGui::SetNextWindowBgAlpha(0.55f);
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                             ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking |
+                             ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav;
+    if (ImGui::Begin("##cam_sim_hud", nullptr, flags)) {
+        if (ImGui::SmallButton(g.playing ? "Pause" : "Play")) g.playing = !g.playing;
+        ImGui::SameLine();
+        float tf = (float)g.playT;
+        ImGui::SetNextItemWidth(w - 150.0f);
+        if (ImGui::SliderFloat("##camt", &tf, 0.0f, (float)total, "")) g.playT = tf;
+        ImGui::SameLine();
+        int mm = (int)(g.playT / 60), ss = (int)g.playT % 60;
+        ImGui::Text("%d:%02d", mm, ss);
+        const float speeds[] = {0.25f, 0.5f, 1.0f, 2.0f, 4.0f};
+        const char* labels[] = {"0.25x", "0.5x", "1x", "2x", "4x"};
+        int cur = 2;
+        for (int i = 0; i < 5; ++i) if (std::fabs(speeds[i] - g.playSpeed) < 0.01f) cur = i;
+        ImGui::SetNextItemWidth(70.0f);
+        if (ImGui::BeginCombo("##camspeed", labels[cur])) {
+            for (int i = 0; i < 5; ++i)
+                if (ImGui::Selectable(labels[i], i == cur)) g.playSpeed = speeds[i];
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine();
+        // machined % interpolated between frame times
+        double pct = 0;
+        if (!g.simFrameT.empty() && g.simFrameT.back() > 0)
+            pct = 100.0 * std::min(1.0, g.playT / g.simFrameT.back());
+        ImGui::Text("machined %.0f%%", pct);
+        if (g.framesClamped) { ImGui::SameLine(); ImGui::TextDisabled("(!) frames clamped"); }
+    }
+    ImGui::End();
+}
+
+// Shot-only: park the playhead at a fraction of total time for a headless capture.
+void camDebugSetPlayhead(float frac) {
+    double total = g.mirror.backplot().totalTime;
+    if (frac < 0) frac = 0; if (frac > 1) frac = 1;
+    g.playT = total * frac;
+}
+
 void camEnsureVisible() { g.show = true; }
 
 void camRequestFocus() {
@@ -607,6 +806,9 @@ void camLoadJob(AppState& st, const std::string& docId) {
     g.gcode.clear();
     g.gcodePath.clear();
     g.sim = nlohmann::json();
+    g.simFrames.clear(); g.simFrameT.clear();
+    g.framesClamped = false; g.playT = 0; g.playing = false;
+    g.curFrame = -1; g.frameMeshValid = false; g.splitT = -1;
     nlohmann::json r;
     if (camCall(st, "cam_tree", {{"doc_id", docId}}, r)) {
         loadTree(r);

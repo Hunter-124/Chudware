@@ -102,6 +102,8 @@ struct Palette {
     float camPlunge[4]     = {0.31f,0.71f,0.86f, 0.95f}; //   plunge (cyan)
     float camCut[4]        = {0.35f,0.59f,0.94f, 1};     //   cut (blue)
     float camArc[4]        = {0.59f,0.51f,0.94f, 1};     //   arc (violet)
+    float camStock[4]      = {0.55f,0.60f,0.68f, 0.50f}; //   stock box (grey-blue)
+    float camTool[4]       = {0.95f,0.80f,0.25f, 0.90f}; //   tool marker (steel yellow)
 
     // ---- C18 sketch mode ----
     float sketchUnder[4]   = {0.337f,0.612f,0.960f, 1};   // under-defined entity (SW-style blue)

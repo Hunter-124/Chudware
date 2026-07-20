@@ -864,8 +864,25 @@ void ScenarioRunner::tick(AppState& st) {
                     (res.is_object() ? (int)res.value("line_count", 0) : -1));
         std::fflush(stdout);
         ui::camLoadJob(st, camId);                 // adopt like the GL-thread drain
+        // Wave 3: drive a framed sim + adopt toolpaths synchronously so the headless capture
+        // exercises the playhead path (frames -> remnant mesh -> HUD) without waiting on AsyncRpc.
+        if (!camId.empty()) {
+            nlohmann::json simRes; std::string e3;
+            if (st.worker.call("cam_simulate",
+                    {{"doc_id", camId}, {"include_field", true},
+                     {"options", {{"frames", 8}}}}, simRes, e3))
+                ui::camAdoptSimResult(simRes);
+            nlohmann::json genRes; std::string e4;
+            if (st.worker.call("cam_generate", {{"doc_id", camId}}, genRes, e4))
+                ui::camAdoptToolpaths(genRes);
+            ui::camDebugSetPlayhead(0.5f);
+            std::printf("cam-shot: playhead sim=%d totalT=%.1fs\n", (int)!simRes.is_null(),
+                        ui::camPlayTotalTime());
+            std::fflush(stdout);
+        }
         ui::camFloatForShot();                     // float so the headless capture shows the tree
         st.showRibbon = true; st.ribbonTab = AppState::RT_Manufacture;
+        st.activeWorkspace = AppState::Workspace::Manufacture;   // viewport playhead + HUD gate
         st.wantFocusViewport = 0;                  // let the CAM tab stay forward
         st.camShotDone = true;
     }

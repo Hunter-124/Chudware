@@ -813,6 +813,59 @@ void Renderer::clearGhost() {
     ++meshesRevision_;
 }
 
+// CAM remnant-stock aux mesh: translucent body drawn with the ghost-style alpha pass.
+// Owned by the CAM viewport playhead — uploaded per sim frame index, cleared when the
+// Manufacture workspace deactivates. Identity model matrix (CAM coords are world/WCS).
+void Renderer::setAuxMesh(const Mesh& m, float alpha) {
+    clearAuxMesh();
+    if (m.empty()) return;
+    auxAlpha_ = (alpha < 0.0f) ? 0.0f : (alpha > 1.0f ? 1.0f : alpha);
+    Sub s;
+    glGenVertexArrays(1, &s.vao);
+    glGenBuffers(1, &s.vboPos);
+    glGenBuffers(1, &s.vboNrm);
+    glGenBuffers(1, &s.ebo);
+    glBindVertexArray(s.vao);
+    glBindBuffer(GL_ARRAY_BUFFER, s.vboPos);
+    glBufferData(GL_ARRAY_BUFFER, m.positions.size() * sizeof(float), m.positions.data(),
+                 GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+    glBindBuffer(GL_ARRAY_BUFFER, s.vboNrm);
+    glBufferData(GL_ARRAY_BUFFER, m.normals.size() * sizeof(float), m.normals.data(),
+                 GL_STATIC_DRAW);
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+    // complete the VAO with a NaN scalar buffer like the main upload (shader ignores it)
+    glGenBuffers(1, &s.vboScalar);
+    glBindBuffer(GL_ARRAY_BUFFER, s.vboScalar);
+    std::vector<float> nans(m.positions.size() / 3, std::numeric_limits<float>::quiet_NaN());
+    glBufferData(GL_ARRAY_BUFFER, nans.size() * sizeof(float), nans.data(), GL_STATIC_DRAW);
+    glEnableVertexAttribArray(2);
+    glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, sizeof(float), (void*)0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, s.ebo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, m.indices.size() * sizeof(unsigned int),
+                 m.indices.data(), GL_STATIC_DRAW);
+    glBindVertexArray(0);
+    s.idxCount = static_cast<int>(m.indices.size());
+    auxSubs_.push_back(std::move(s));
+    showAux_ = true;
+}
+
+void Renderer::clearAuxMesh() {
+    for (auto& s : auxSubs_) {
+        if (s.vao) glDeleteVertexArrays(1, &s.vao);
+        if (s.vboPos) glDeleteBuffers(1, &s.vboPos);
+        if (s.vboNrm) glDeleteBuffers(1, &s.vboNrm);
+        if (s.ebo) glDeleteBuffers(1, &s.ebo);
+        if (s.edgeVao) glDeleteVertexArrays(1, &s.edgeVao);
+        if (s.vboEdge) glDeleteBuffers(1, &s.vboEdge);
+        if (s.vboScalar) glDeleteBuffers(1, &s.vboScalar);
+    }
+    auxSubs_.clear();
+    showAux_ = false;
+}
+
 void Renderer::setPreviewIsolation(const std::vector<uint64_t>& editFaceKeys, float alpha) {
     previewFaces_.clear();
     if (alpha >= 1.0f || editFaceKeys.empty()) { previewAlpha_ = 1.0f; return; }
@@ -1284,6 +1337,29 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
             glDisable(GL_BLEND);
             // Restore the unshifted MVP for any later prog_ pass in this frame (cheap insurance).
             glUniformMatrix4fv(glGetUniformLocation(prog_, "uMVP"), 1, GL_FALSE, mvp.m);
+        }
+
+        // CAM remnant-stock aux mesh (playhead remnant): same translucent shaded pass as
+        // the ghost — flat neutral tint, depth-write OFF, identity model matrix (CAM
+        // coords are world/WCS). Non-pickable (never fed to id_pass). HLR skips it.
+        if (showAux_ && !auxSubs_.empty() && !hlr) {
+            const float atint[3] = {0.55f, 0.60f, 0.68f};   // neutral stock grey
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glDepthMask(GL_FALSE);
+            glUniform1i(useScalarLoc, 0);
+            glUniform1f(alphaLoc, auxAlpha_);
+            glUniform3f(colorLoc, atint[0], atint[1], atint[2]);
+            glUniform1f(metallicLoc, 0.0f);
+            glUniform1f(roughnessLoc, 0.7f);
+            for (const auto& s : auxSubs_) {
+                if (!s.visible) continue;
+                glBindVertexArray(s.vao);
+                glDrawElements(GL_TRIANGLES, s.idxCount, GL_UNSIGNED_INT, 0);
+            }
+            glUniform1f(alphaLoc, 1.0f);
+            glDepthMask(GL_TRUE);
+            glDisable(GL_BLEND);
         }
 
         glBindVertexArray(0);

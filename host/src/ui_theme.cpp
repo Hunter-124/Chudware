@@ -92,7 +92,8 @@ static void fillDark(Palette& p) {
     set4(p.camPlunge,  0.31f,0.71f,0.86f, 0.95f);
     set4(p.camCut,     0.35f,0.59f,0.94f, 1);
     set4(p.camArc,     0.59f,0.51f,0.94f, 1);
-    // C18 sketch mode
+    set4(p.camStock,   0.55f,0.60f,0.68f, 0.50f);
+    set4(p.camTool,    0.95f,0.80f,0.25f, 0.90f);
     set4(p.sketchUnder, 0.337f,0.612f,0.960f, 1);
     set4(p.sketchGrid,  0.520f,0.560f,0.620f, 0.18f);
     // C40: dark sketch ink — the viewport canvas is light in both themes.
@@ -223,7 +224,8 @@ static void fillLight(Palette& p) {
     set4(p.camPlunge,  0.13f,0.53f,0.68f, 0.95f);
     set4(p.camCut,     0.16f,0.40f,0.80f, 1);
     set4(p.camArc,     0.44f,0.34f,0.82f, 1);
-    // C24 orientation-triad axes (slightly deeper on the light studio bg for contrast)
+    set4(p.camStock,   0.35f,0.40f,0.50f, 0.50f);
+    set4(p.camTool,    0.85f,0.65f,0.10f, 0.95f);
     set4(p.axisX, 0.800f,0.180f,0.180f, 1);
     set4(p.axisY, 0.180f,0.580f,0.220f, 1);
     set4(p.axisZ, 0.000f,0.380f,0.820f, 1);

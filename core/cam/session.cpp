@@ -20,6 +20,7 @@ namespace fs = std::filesystem;
 #include "cam/post.h"
 #include "cam/stock_sim.h"
 #include "cam/audit.h"
+#include "cam/heightfield.h"
 #include "miniz.h"
 
 namespace aicad {
@@ -34,6 +35,8 @@ struct CamSession {
     std::vector<json> undo, redo;
     // cached generated toolpaths per setup id; invalidated on edit.
     std::unordered_map<std::string, std::vector<Toolpath>> cache;
+    // last simulate_setup remaining heightfield per setup id (rest stock / from_sim).
+    std::unordered_map<std::string, HeightField> lastRemaining;
     bool stale = true;
 };
 
@@ -173,7 +176,38 @@ void apply_one(CamSession& s, const json& op, json& id_map) {
                                         [&](const Setup& x) { return x.id == id; }), job.setups.end());
     } else if (kind == "set_stock") {
         Setup& su = first_or(job, op.value("setup_id", std::string()));
-        su.stock = Stock::from_json(op.value("stock", json::object()));
+        json stock_j = op.value("stock", json::object());
+        if (stock_j.value("type", std::string()) == "from_sim") {
+            std::string src = stock_j.value("setup_id", std::string());
+            if (src.empty())
+                throw OpError("invalid_op",
+                              "from_sim stock requires setup_id of the source simulation", op);
+            auto it = s.lastRemaining.find(src);
+            if (it == s.lastRemaining.end())
+                throw OpError("invalid_op",
+                              "no simulation remaining stock for setup " + src +
+                                  " — run cam_simulate first",
+                              op);
+            Stock st;
+            st.type = StockType::FromSolid;
+            st.solid = heightfield_to_mesh(it->second);
+            st.material = stock_j.value("material", su.stock.material);
+            if (!st.solid.verts.empty()) {
+                st.min = st.solid.verts[0];
+                st.max = st.solid.verts[0];
+                for (const auto& v : st.solid.verts) {
+                    st.min.x = std::min(st.min.x, v.x);
+                    st.min.y = std::min(st.min.y, v.y);
+                    st.min.z = std::min(st.min.z, v.z);
+                    st.max.x = std::max(st.max.x, v.x);
+                    st.max.y = std::max(st.max.y, v.y);
+                    st.max.z = std::max(st.max.z, v.z);
+                }
+            }
+            su.stock = std::move(st);
+        } else {
+            su.stock = Stock::from_json(stock_j);
+        }
     } else if (kind == "set_wcs") {
         Setup& su = first_or(job, op.value("setup_id", std::string()));
         su.wcs = WCS::from_json(op.value("wcs", json::object()));
@@ -367,6 +401,7 @@ json cam_simulate(const std::string& doc_id, const json& params) {
         TriMesh part;  // optional part mesh for gouge (supplied via params or empty)
         if (params.contains("part_mesh")) part = trimesh_from_json(params["part_mesh"]);
         SimResult r = simulate_setup(su, s.job.tools, tps, part, so);
+        s.lastRemaining[su.id] = r.remaining;
         json rj = r.to_json(include_field);
         rj["setup_id"] = su.id;
         results.push_back(rj);

@@ -261,6 +261,33 @@ double HeightField::drop_tool(double x, double y, double radius, double corner_r
     return tip_z;
 }
 
+TriMesh heightfield_to_mesh(const HeightField& field) {
+    TriMesh m;
+    const int nx = field.nx(), ny = field.ny();
+    if (nx < 2 || ny < 2) return m;
+    const double res = field.res();
+    const Vec2 lo = field.lo();
+    m.verts.resize(static_cast<size_t>(nx) * static_cast<size_t>(ny));
+    for (int j = 0; j < ny; ++j) {
+        for (int i = 0; i < nx; ++i) {
+            const size_t idx = static_cast<size_t>(j) * static_cast<size_t>(nx) + static_cast<size_t>(i);
+            m.verts[idx] = {lo.x + i * res, lo.y + j * res, field.raw(i, j)};
+        }
+    }
+    m.tris.reserve(static_cast<size_t>(nx - 1) * static_cast<size_t>(ny - 1) * 2);
+    for (int j = 0; j < ny - 1; ++j) {
+        for (int i = 0; i < nx - 1; ++i) {
+            const int i00 = j * nx + i;
+            const int i10 = i00 + 1;
+            const int i01 = i00 + nx;
+            const int i11 = i01 + 1;
+            m.tris.push_back({i00, i10, i11});
+            m.tris.push_back({i00, i11, i01});
+        }
+    }
+    return m;
+}
+
 // ── waterline sections ────────────────────────────────────────────────────────
 
 std::vector<std::vector<Path2>> waterline_sections(const TriMesh& mesh,

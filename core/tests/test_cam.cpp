@@ -1610,3 +1610,98 @@ TEST_CASE("MachineDB: five built-ins match machines.json (wave 2)") {
     }
 }
 #endif
+
+// ── Wave 5: rest stock from_sim, tool re-change warnings ─────────────────────
+TEST_CASE("session: set_stock from_sim carries remaining mesh to second setup (wave 5)") {
+    json nw = cam_new(json{{"name", "RestStock"}, {"post", "grbl"}});
+    std::string doc = nw["doc_id"].get<std::string>();
+    json setup1 = json{{"name", "S1"}, {"machine", json{{"kind", "mill3"}}},
+                       {"stock", json{{"type", "box"}, {"min", {-20, -20, -6}}, {"max", {20, 20, 0}},
+                                      {"material", "aluminum"}}}};
+    json a = cam_apply_ops(doc, -1, json::array({
+        json{{"op", "add_tool"}, {"tool", json{{"number", 1}, {"type", "endmill_flat"},
+                                               {"diameter", 10}, {"flutes", 4}}}},
+        json{{"op", "add_setup"}, {"ref", "S1"}, {"setup", setup1}}}));
+    std::string sid1 = a["id_map"]["S1"].get<std::string>();
+    json face = json{{"type", "face"}, {"tool_number", 1}, {"stepover", 8},
+                     {"heights", json{{"top", 0}, {"bottom", -1.5}}},
+                     {"geometry", json{{"regions", json::array({to_json(square(0, 0, 18))})}}}};
+    cam_apply_ops(doc, a["revision"].get<long>(), json::array({
+        json{{"op", "add_operation"}, {"setup_id", sid1}, {"operation", face}}}));
+    json sim = cam_simulate(doc, json{{"setup_id", sid1}});
+    REQUIRE(sim["results"].size() == 1);
+
+    json setup2 = json{{"name", "S2"}, {"machine", json{{"kind", "mill3"}}},
+                       {"stock", json{{"type", "box"}, {"min", {-20, -20, -6}}, {"max", {20, 20, 0}}}}};
+    json a2 = cam_apply_ops(doc, -1, json::array({
+        json{{"op", "add_setup"}, {"ref", "S2"}, {"setup", setup2}}}));
+    std::string sid2 = a2["id_map"]["S2"].get<std::string>();
+    cam_apply_ops(doc, a2["revision"].get<long>(), json::array({
+        json{{"op", "set_stock"}, {"setup_id", sid2},
+             {"stock", json{{"type", "from_sim"}, {"setup_id", sid1}}}}}));
+
+    json tr = cam_tree(doc);
+    const json* s2 = nullptr;
+    for (const auto& su : tr["tree"]["setups"])
+        if (su.value("id", std::string()) == sid2) { s2 = &su; break; }
+    REQUIRE(s2 != nullptr);
+    CHECK((*s2)["stock"]["type"] == "from_solid");
+    REQUIRE((*s2)["stock"].contains("solid"));
+    CHECK((*s2)["stock"]["solid"]["verts"].size() > 0);
+    CHECK((*s2)["stock"]["solid"]["tris"].size() > 0);
+    cam_close(doc);
+}
+
+TEST_CASE("session: set_stock from_sim before any sim errors (wave 5)") {
+    json nw = cam_new(json{{"name", "NoSimYet"}, {"post", "grbl"}});
+    std::string doc = nw["doc_id"].get<std::string>();
+    json setup = json{{"name", "S1"}, {"machine", json{{"kind", "mill3"}}},
+                      {"stock", json{{"type", "box"}, {"min", {-10, -10, -5}}, {"max", {10, 10, 0}}}}};
+    json a = cam_apply_ops(doc, -1, json::array({
+        json{{"op", "add_setup"}, {"ref", "S"}, {"setup", setup}}}));
+    std::string sid = a["id_map"]["S"].get<std::string>();
+    bool threw = false;
+    std::string msg;
+    try {
+        cam_apply_ops(doc, a["revision"].get<long>(), json::array({
+            json{{"op", "set_stock"}, {"setup_id", sid},
+                 {"stock", json{{"type", "from_sim"}, {"setup_id", sid}}}}}));
+    } catch (const OpError& e) {
+        threw = true;
+        msg = e.what();
+    }
+    CHECK(threw);
+    CHECK(msg == "no simulation remaining stock for setup " + sid +
+                     " — run cam_simulate first");
+    cam_close(doc);
+}
+
+TEST_CASE("post: tool re-change warning when T1 ops are separated (wave 5)") {
+    Built b = build_mill_job();
+    // T1 contour, T2 drill, T1 contour again → T1 appears in 2 separated groups.
+    Operation c2 = b.setup.operations[0];
+    c2.id = "c2";
+    c2.name = "Profile2";
+    b.setup.operations.push_back(c2);
+    {
+        OpContext ctx;
+        ctx.machine = b.setup.machine;
+        ctx.stock = b.setup.stock;
+        ctx.wcs = b.setup.wcs;
+        ctx.material_id = "aluminum";
+        ctx.tool = *b.tools.find(c2.tool_number);
+        b.tps.push_back(generate(c2, ctx).path);
+    }
+    PostResult r = post_setup(b.setup, b.tools, "grbl", b.tps);
+    REQUIRE(r.ok);
+    bool found = false;
+    for (const auto& w : r.warnings) {
+        if (w.find("reorder to save") != std::string::npos &&
+            w.find("T1") != std::string::npos) {
+            found = true;
+            CHECK(w.find("2 separated op groups") != std::string::npos);
+            CHECK(w.find("1 tool change") != std::string::npos);
+        }
+    }
+    CHECK(found);
+}

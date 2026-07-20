@@ -50,6 +50,11 @@ private:
     std::vector<float> z_;  // nx_*ny_, row-major (j*nx_+i)
 };
 
+// Grid triangulation of a heightfield: one vertex per node
+// (lo.x + i*res, lo.y + j*res, z), two triangles per cell.
+// Empty field (nx<2 || ny<2) → empty TriMesh.
+TriMesh heightfield_to_mesh(const HeightField& field);
+
 // Z-level (waterline) cross sections of a mesh at the given Z planes: each plane
 // yields a set of closed contours (the silhouette of material at/above that Z).
 std::vector<std::vector<Path2>> waterline_sections(const TriMesh&,

@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdio>
 #include <sstream>
+#include <unordered_map>
 
 #include "cam/feeds.h"
 
@@ -482,12 +483,26 @@ PostResult post_setup(const Setup& setup, const ToolLibrary& tools, const std::s
         }
     }
 
-    // ── footer ──
-    if (!g.lathe && !( setup.machine.kind == MachineKind::Laser )) g.blk(g.c.spindle_off);
-    g.blk(c.coolant_off);
-    if (!c.program_end.empty()) g.blk(c.program_end);
-    g.blk(c.program_stop);
-    if (c.percent_wrap) g.raw("%");
+    // Tool re-change warning: a tool number that appears in ≥2 non-consecutive
+    // op groups within this setup costs extra tool changes.
+    {
+        std::unordered_map<int, int> groups;
+        int prev = -999;
+        for (const Toolpath& tp : toolpaths) {
+            if (tp.tool_number != prev) {
+                ++groups[tp.tool_number];
+                prev = tp.tool_number;
+            }
+        }
+        for (const auto& kv : groups) {
+            if (kv.second >= 2) {
+                res.warnings.push_back(
+                    "tool T" + std::to_string(kv.first) + " used in " +
+                    std::to_string(kv.second) + " separated op groups — reorder to save " +
+                    std::to_string(kv.second - 1) + " tool change(s)");
+            }
+        }
+    }
 
     res.gcode = g.out.str();
     res.line_count = g.lines;

@@ -786,7 +786,14 @@ static json cam_program_from_part(const std::string& part_doc_id, const json& op
     } catch (const std::exception& e) {
         return json{{"ok", false}, {"error", std::string("generate: ") + e.what()}};
     }
-    try { sim = aicad::cam::cam_simulate(cam_id, json::object()); } catch (...) {}
+    try {
+        sim = aicad::cam::cam_simulate(cam_id, json::object());
+    } catch (const std::exception& e) {
+        // captured below into out["sim_error"]
+        sim = json{{"_sim_error", e.what()}};
+    } catch (...) {
+        sim = json{{"_sim_error", "unknown sim error"}};
+    }
     try {
         post = aicad::cam::cam_post(cam_id, json{{"dialect", dialect}, {"program_name", "AICAD"}});
     } catch (const std::exception& e) {
@@ -824,7 +831,10 @@ static json cam_program_from_part(const std::string& part_doc_id, const json& op
                 {"gcode_path", ncPath},
                 {"line_count", post.value("line_count", 0)},
                 {"warnings", gen.contains("warnings") ? gen["warnings"] : json::array()}};
-    if (sim.is_object() && sim.contains("results")) out["sim"] = sim["results"];
+    if (sim.is_object() && sim.contains("_sim_error"))
+        out["sim_error"] = sim["_sim_error"];
+    else if (sim.is_object() && sim.contains("results"))
+        out["sim"] = sim["results"];
     return out;
 }
 

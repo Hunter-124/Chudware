@@ -266,7 +266,9 @@ def register_cam_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     def cam_set_stock(setup_id: str, stock: dict) -> str:
         """Set/replace a setup's stock. stock types: box | box_offset | cylinder |
-        cylinder_offset | from_solid (see cad_guide('cam'))."""
+        cylinder_offset | from_solid | from_sim (see cad_guide('cam')).
+        from_sim form: {"type":"from_sim","setup_id":"<id>"} uses the remaining
+        stock mesh from a prior cam_simulate of that setup."""
         try:
             return _dumps(_apply([{"op": "set_stock", "setup_id": setup_id, "stock": stock}]))
         except Exception as e:  # noqa: BLE001

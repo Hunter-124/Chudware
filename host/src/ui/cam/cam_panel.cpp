@@ -75,6 +75,11 @@ struct CamUI {
     float optRes = 0.5f;
     CamBackplot bpBefore, bpAfter;     // split backplot for the playhead scrub
     double splitT = -1;                // playT the split was computed for
+    // Wave 4: pipeline runner (Generate -> Simulate -> Post chained over AsyncRpc).
+    int pipeStage = 0;                 // 0=idle 1=generate 2=simulate 3=post
+    // Wave 4: last cam_audit result for the G-code tab.
+    nlohmann::json audit;
+    bool auditInflight = false;
     // operation form buffers (selected op)
     char opName[64] = "";
     float fStepover = 0, fStepdown = 0, fStockLeave = 0, fFeed = 0, fRpm = 0;
@@ -86,6 +91,10 @@ CamUI g;
 bool camBusy() { return g.rpcInflight > 0; }
 void camBeginRpc() { ++g.rpcInflight; }
 void camEndRpc() { if (g.rpcInflight > 0) --g.rpcInflight; }
+
+// fwd (pipeline chains: generate -> simulate -> post)
+void doSimulate(AppState& st);
+void doPost(AppState& st);
 
 // Active PART tab's doc id + display title. CAM extract always targets the part, not the job.
 bool activePartDoc(AppState& st, std::string& docId, std::string& title) {
@@ -341,11 +350,13 @@ void doGenerate(AppState& st) {
     g.status = "generating...";
     const int gen = g.rpcGen;
     const std::string docId = g.docId;
+    AppState* stp = &st;
     st.rpc.call("cam_generate", {{"doc_id", docId}},
-                [gen, docId](const core::RpcResult& r) {
+                [gen, docId, stp](const core::RpcResult& r) {
         camEndRpc();
         if (gen != g.rpcGen || g.docId != docId) return;
         if (!r.ok) {
+            g.pipeStage = 0;
             g.status = std::string("cam_generate: ") +
                        (r.err.empty() ? std::string("failed") : r.err);
             return;
@@ -357,7 +368,16 @@ void doGenerate(AppState& st) {
                             ? (int)r.result["warnings"].size() : 0;
         g.status = "generated " + std::to_string(n) + " toolpath(s)";
         if (g.genWarnings > 0) g.status += " (" + std::to_string(g.genWarnings) + " warning)";
+        if (g.pipeStage == 1) { g.pipeStage = 2; doSimulate(*stp); }
     });
+}
+
+// Wave 4: chained Generate -> Simulate -> Post pipeline. Status reports the failing stage.
+void doPipeline(AppState& st) {
+    if (g.docId.empty()) { g.status = "no job"; return; }
+    if (camBusy()) { g.status = "CAM busy"; return; }
+    g.pipeStage = 1;
+    doGenerate(st);
 }
 
 void doSimulate(AppState& st) {
@@ -367,6 +387,7 @@ void doSimulate(AppState& st) {
     g.status = "simulating...";
     const int gen = g.rpcGen;
     const std::string docId = g.docId;
+    AppState* stp = &st;
     st.rpc.call("cam_simulate",
                 {{"doc_id", docId}, {"include_field", true},
                  {"options", {{"resolution", (double)g.optRes},
@@ -374,10 +395,11 @@ void doSimulate(AppState& st) {
                               {"check_rapid", g.optRapid},
                               {"check_holder", g.optHolder},
                               {"frames", 16}}}},
-                [gen, docId](const core::RpcResult& r) {
+                [gen, docId, stp](const core::RpcResult& r) {
         camEndRpc();
         if (gen != g.rpcGen || g.docId != docId) return;
         if (!r.ok) {
+            g.pipeStage = 0;
             g.status = std::string("cam_simulate: ") +
                        (r.err.empty() ? std::string("failed") : r.err);
             return;
@@ -385,6 +407,7 @@ void doSimulate(AppState& st) {
         g.sim = r.result;
         camAdoptSimResult(r.result);
         g.status = "simulated";
+        if (g.pipeStage == 2) { g.pipeStage = 3; doPost(*stp); }
     });
 }
 
@@ -401,18 +424,88 @@ void doPost(AppState& st) {
         camEndRpc();
         if (gen != g.rpcGen || g.docId != docId) return;
         if (!r.ok) {
+            g.pipeStage = 0;
             g.status = std::string("cam_post: ") +
                        (r.err.empty() ? std::string("failed") : r.err);
             return;
         }
         g.gcode = r.result.value("gcode", std::string());
         writeGcodeFile(dialect);
-        g.status = "posted " + dialect + " (" +
-                   std::to_string(r.result.value("line_count", 0)) + " lines)";
+        if (g.pipeStage == 3) {
+            g.pipeStage = 0;
+            g.status = "pipeline done: generated + simulated + posted " + dialect;
+        } else {
+            g.status = "posted " + dialect + " (" +
+                       std::to_string(r.result.value("line_count", 0)) + " lines)";
+        }
 #ifdef __EMSCRIPTEN__
         // Web has no local path to hand the operator — offer the Blob download immediately.
         if (!g.gcode.empty()) downloadGcode();
 #endif
+    });
+}
+
+// Wave 4b: feeds autofill — CuttingDB lookup via the core cam_feeds RPC, filling the op
+// parameter form buffers. On error the buffers stay untouched and the status shows why.
+void doFeedsAutofill(AppState& st) {
+    if (g.docId.empty()) { g.status = "no job"; return; }
+    if (g.selSetup < 0 || g.selSetup >= (int)g.mirror.setups().size() ||
+        g.selOp < 0 || g.selOp >= (int)g.mirror.setups()[g.selSetup].ops.size()) {
+        g.status = "select an operation first";
+        return;
+    }
+    if (camBusy()) { g.status = "CAM busy"; return; }
+    const auto& op = g.mirror.setups()[g.selSetup].ops[g.selOp];
+    const auto& stock = g.mirror.setups()[g.selSetup].stock;
+    std::string material = stock.value("material", std::string("aluminum"));
+    camBeginRpc();
+    const int gen = g.rpcGen;
+    const std::string docId = g.docId;
+    st.rpc.call("cam_feeds",
+                {{"doc_id", docId},
+                 {"setup_id", g.mirror.setups()[g.selSetup].id},
+                 {"tool_number", op.tool_number},
+                 {"material", material}},
+                [gen, docId, material](const core::RpcResult& r) {
+        camEndRpc();
+        if (gen != g.rpcGen || g.docId != docId) return;
+        if (!r.ok) {
+            g.status = std::string("cam_feeds: ") +
+                       (r.err.empty() ? std::string("failed") : r.err);
+            return;
+        }
+        auto num = [&](const char* k, float& dst) {
+            if (r.result.contains(k) && r.result[k].is_number()) dst = r.result[k].get<float>();
+        };
+        num("rpm", g.fRpm);
+        num("feed", g.fFeed);
+        num("stepover", g.fStepover);
+        num("stepdown", g.fStepdown);
+        g.status = "feeds filled from tables (" + material + ")";
+    });
+}
+
+// Wave 4e: deterministic G-code audit via the core cam_audit RPC.
+void doAudit(AppState& st) {
+    if (g.docId.empty()) { g.status = "no job"; return; }
+    if (g.auditInflight) return;
+    g.auditInflight = true;
+    const int gen = g.rpcGen;
+    const std::string docId = g.docId;
+    const std::string dialect = currentDialect();
+    g.status = "auditing...";
+    st.rpc.call("cam_audit", {{"doc_id", docId}, {"dialect", dialect}},
+                [gen, docId](const core::RpcResult& r) {
+        g.auditInflight = false;
+        if (gen != g.rpcGen || g.docId != docId) return;
+        if (!r.ok) {
+            g.audit = nlohmann::json();
+            g.status = std::string("cam_audit: ") +
+                       (r.err.empty() ? std::string("failed") : r.err);
+            return;
+        }
+        g.audit = r.result;
+        g.status = g.audit.value("ok", false) ? "audit ok" : "audit FAILED";
     });
 }
 
@@ -466,11 +559,14 @@ void drawSimSummary() {
         double t = r.value("cycle_time_s", 0.0);
         ImGui::Text("Cycle time: %dm %02ds", (int)(t / 60), (int)t % 60);
         int gouges = r.value("gouges", 0), rapids = r.value("rapid_collisions", 0);
-        if (gouges > 0) { ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(230, 120, 60, 255));
+        int holders = r.value("holder_collisions", 0);
+        if (gouges > 0) { ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(ui::palette.statusWarn[0], ui::palette.statusWarn[1], ui::palette.statusWarn[2], ui::palette.statusWarn[3]));
             ImGui::Text("GOUGES: %d (max %.3f mm)", gouges, r.value("max_gouge_mm", 0.0)); ImGui::PopStyleColor(); }
-        if (rapids > 0) { ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(230, 120, 60, 255));
+        if (rapids > 0) { ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(ui::palette.statusWarn[0], ui::palette.statusWarn[1], ui::palette.statusWarn[2], ui::palette.statusWarn[3]));
             ImGui::Text("RAPID THROUGH STOCK: %d", rapids); ImGui::PopStyleColor(); }
-        if (gouges == 0 && rapids == 0) { ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(90, 200, 120, 255));
+        if (holders > 0) { ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(ui::palette.statusWarn[0], ui::palette.statusWarn[1], ui::palette.statusWarn[2], ui::palette.statusWarn[3]));
+            ImGui::Text("HOLDER/SHANK COLLISIONS: %d", holders); ImGui::PopStyleColor(); }
+        if (gouges == 0 && rapids == 0 && holders == 0) { ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(ui::palette.statusOk[0], ui::palette.statusOk[1], ui::palette.statusOk[2], ui::palette.statusOk[3]));
             ImGui::TextUnformatted("No gouges or rapid collisions."); ImGui::PopStyleColor(); }
     }
 }
@@ -923,7 +1019,9 @@ void drawCamManager(AppState& st) {
     ImGui::Separator();
     if (ImGui::Button("Generate")) doGenerate(st);
     ImGui::SameLine(); if (ImGui::Button("Simulate")) doSimulate(st);
+    ImGui::SameLine(); if (ImGui::Button("Run: Generate > Simulate > Post")) doPipeline(st);
     ImGui::SameLine(); ImGui::Checkbox("Show in 3D", &g.backplot);
+    ImGui::SameLine(); ImGui::Checkbox("Stock box", &g.showStock);
     ImGui::SameLine(); ImGui::TextDisabled("|");
     ImGui::SameLine(); ImGui::SetNextItemWidth(120);
     if (!g.dialects.empty()) {
@@ -986,8 +1084,51 @@ void drawCamManager(AppState& st) {
         if (ImGui::BeginTabItem("Simulate")) {
             if (busy) ImGui::BeginDisabled();
             if (ImGui::Button("Run Material-Removal Sim")) doSimulate(st);
+            ImGui::SameLine(); ImGui::Checkbox("Gouge", &g.optGouge);
+            ImGui::SameLine(); ImGui::Checkbox("Rapids", &g.optRapid);
+            ImGui::SameLine(); ImGui::Checkbox("Holder", &g.optHolder);
+            ImGui::SameLine(); ImGui::SetNextItemWidth(110);
+            ImGui::SliderFloat("Resolution", &g.optRes, 0.2f, 2.0f, "%.1f mm");
             if (busy) ImGui::EndDisabled();
             drawSimSummary();
+            ImGui::TextDisabled("Frames play back in the 3D viewport — use the transport bar.");
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Operation")) {
+            // Minimal op parameter form: the four CuttingDB fields, autofilled from the
+            // core cam_feeds table for the setup material + op tool, applied via update_operation.
+            const bool haveOp = g.selSetup >= 0 && g.selSetup < (int)g.mirror.setups().size() &&
+                                g.selOp >= 0 && g.selOp < (int)g.mirror.setups()[g.selSetup].ops.size();
+            if (!haveOp) {
+                ImGui::TextDisabled("Select an operation in the tree to edit its parameters.");
+            } else {
+                const auto& op = g.mirror.setups()[g.selSetup].ops[g.selOp];
+                ImGui::Text("%s  [T%d]", (op.name.empty() ? op.type.c_str() : op.name.c_str()), op.tool_number);
+                if (g.loadedOpFor != g.selOp) {
+                    // reset buffers on op switch; autofill (or a future read-back) populates them
+                    g.loadedOpFor = g.selOp;
+                }
+                ImGui::SetNextItemWidth(120); ImGui::InputFloat("Stepover (mm)", &g.fStepover, 0, 0, "%.2f");
+                ImGui::SetNextItemWidth(120); ImGui::InputFloat("Stepdown (mm)", &g.fStepdown, 0, 0, "%.2f");
+                ImGui::SetNextItemWidth(120); ImGui::InputFloat("Feed (mm/min)", &g.fFeed, 0, 0, "%.0f");
+                ImGui::SetNextItemWidth(120); ImGui::InputFloat("RPM", &g.fRpm, 0, 0, "%.0f");
+                if (busy) ImGui::BeginDisabled();
+                if (ImGui::Button("Autofill from tables")) doFeedsAutofill(st);
+                ImGui::SameLine();
+                if (ImGui::Button("Apply to operation")) {
+                    nlohmann::json upd = nlohmann::json::object();
+                    if (g.fStepover > 0) upd["stepover"] = g.fStepover;
+                    if (g.fStepdown > 0) upd["stepdown"] = g.fStepdown;
+                    if (g.fFeed > 0) upd["feed"] = g.fFeed;
+                    if (g.fRpm > 0) upd["rpm"] = g.fRpm;
+                    if (!upd.empty()) {
+                        nlohmann::json r = applyOps(st, nlohmann::json::array({nlohmann::json{
+                            {"op", "update_operation"}, {"op_id", op.id}, {"operation", upd}}}));
+                        g.status = r.contains("revision") ? "operation updated" : "update failed";
+                    }
+                }
+                if (busy) ImGui::EndDisabled();
+            }
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("G-code")) {
@@ -999,6 +1140,48 @@ void drawCamManager(AppState& st) {
             if (!canDl) ImGui::BeginDisabled();
             if (ImGui::Button("Download NC")) downloadGcode();
             if (!canDl) ImGui::EndDisabled();
+            ImGui::SameLine();
+            if (g.auditInflight) ImGui::BeginDisabled();
+            if (ImGui::Button("Audit")) doAudit(st);
+            if (g.auditInflight) ImGui::EndDisabled();
+            if (!g.audit.empty()) {
+                const bool aok = g.audit.value("ok", false);
+                const float* col = aok ? ui::palette.statusOk : ui::palette.statusErr;
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(col[0], col[1], col[2], col[3]));
+                ImGui::Text("Audit: %s", aok ? "ok" : "FAILED");
+                ImGui::PopStyleColor();
+                if (g.audit.contains("stats") && g.audit["stats"].is_object()) {
+                    const auto& s = g.audit["stats"];
+                    ImGui::Text("lines %d, tool changes %d, est %.0fs",
+                                s.value("lines", 0), s.value("tool_changes", 0),
+                                s.value("est_time_s", 0.0));
+                    if (s.contains("bounds") && s["bounds"].is_object()) {
+                        const auto& b = s["bounds"];
+                        auto rng = [&](const char* k) {
+                            if (!b.contains(k) || !b[k].is_array() || b[k].size() < 2)
+                                return std::string("?");
+                            char buf[48];
+                            std::snprintf(buf, sizeof(buf), "[%.1f..%.1f]",
+                                          b[k][0].get<double>(), b[k][1].get<double>());
+                            return std::string(buf);
+                        };
+                        ImGui::Text("bounds X%s Y%s Z%s mm",
+                                    rng("x").c_str(), rng("y").c_str(), rng("z").c_str());
+                    }
+                }
+                if (g.audit.contains("errors") && g.audit["errors"].is_array() &&
+                    !g.audit["errors"].empty()) {
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(ui::palette.statusErr[0], ui::palette.statusErr[1], ui::palette.statusErr[2], ui::palette.statusErr[3]));
+                    for (const auto& e : g.audit["errors"]) ImGui::BulletText("%s", e.get<std::string>().c_str());
+                    ImGui::PopStyleColor();
+                }
+                if (g.audit.contains("warnings") && g.audit["warnings"].is_array() &&
+                    !g.audit["warnings"].empty()) {
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(ui::palette.statusWarn[0], ui::palette.statusWarn[1], ui::palette.statusWarn[2], ui::palette.statusWarn[3]));
+                    for (const auto& w : g.audit["warnings"]) ImGui::BulletText("%s", w.get<std::string>().c_str());
+                    ImGui::PopStyleColor();
+                }
+            }
 #ifndef __EMSCRIPTEN__
             // Desktop: show the temp .nc path the operator can grab. Hidden on web (no local path).
             if (!g.gcodePath.empty()) {
@@ -1221,12 +1404,36 @@ void drawCamTreeBody(AppState& st) {
                 else if (generated)    ol += (g.genWarnings > 0) ? "  — generated (!)"
                                                                  : "  — generated";
                 else                   ol += "  — needs generate";
+                // Wave 4c: status badge — stale when the tree moved past the last generate,
+                // warn count from that generate, clean after a 0-gouge/0-rapid sim.
+                const char* badge = nullptr;
+                const float* badgeCol = nullptr;
+                if (!o.suppressed) {
+                    if (g.generatedRev >= 0 && g.generatedRev != g.mirror.revision()) {
+                        badge = "stale"; badgeCol = ui::palette.statusWarn;
+                    } else if (g.genWarnings > 0 && generated) {
+                        static thread_local char warnBuf[24];
+                        std::snprintf(warnBuf, sizeof(warnBuf), "warn %d", g.genWarnings);
+                        badge = warnBuf; badgeCol = ui::palette.statusWarn;
+                    } else if (!g.sim.empty() && g.sim.contains("results")) {
+                        for (const auto& sr : g.sim["results"])
+                            if (sr.value("gouges", 0) == 0 && sr.value("rapid_collisions", 0) == 0 &&
+                                sr.value("holder_collisions", 0) == 0) {
+                                badge = "clean"; badgeCol = ui::palette.statusOk;
+                                break;
+                            }
+                    }
+                }
                 ImGui::PushID(oi);
                 FmRowRect orr = fmRowPill(opSel);
                 fmTreeIcon(("cam_" + o.type).c_str(), "o", 16.0f, o.suppressed ? 0.45f : 1.0f);
                 ImGui::SameLine(0, 4.0f * S);
                 if (leafSelectable(ol)) {
                     g.selKind = 5; g.selSetup = si; g.selOp = oi; g.loadedOpFor = -1;
+                }
+                if (badge) {
+                    ImGui::SameLine(0, 6.0f * S);
+                    ImGui::TextColored(ImVec4(badgeCol[0], badgeCol[1], badgeCol[2], badgeCol[3]), "%s", badge);
                 }
                 const bool dbl = ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0);
                 if (ImGui::BeginPopupContextItem("##cam_op_ctx")) {
@@ -1290,6 +1497,12 @@ void drawCamTreeBody(AppState& st) {
     }
 
     // ---- status footer ----
+    if (g.docId.empty() == false && !g.mirror.setups().empty()) {
+        ImGui::Spacing();
+        if (camBusy()) ImGui::BeginDisabled();
+        if (ImGui::Button("Run: Generate > Simulate > Post")) doPipeline(st);
+        if (camBusy()) ImGui::EndDisabled();
+    }
     if (camBusy() || !g.status.empty()) {
         ImGui::Spacing();
         ImGui::Separator();

@@ -1242,7 +1242,81 @@ TEST_CASE("session: cam_post dialect override beats the job default (whole-job p
     cam_close(doc);
 }
 
-// ── T-M2: adaptive ring-to-ring arc-blend linking ────────────────────────────
+// ── CAM-overhaul wave 1: sim frames + machine_detail ────────────────────────
+namespace {
+// Build a one-setup facing+pocket job in a fresh session; returns doc id.
+std::string make_frames_job() {
+    json nw = cam_new(json{{"name", "FramesJob"}, {"post", "grbl"}});
+    std::string doc = nw["doc_id"].get<std::string>();
+    json setup = json{{"name", "S1"}, {"machine", json{{"kind", "mill3"}, {"rapid_xy", 5000}, {"rapid_z", 3000}}},
+                      {"stock", json{{"type", "box"}, {"min", {-20, -20, -6}}, {"max", {20, 20, 0}}, {"material", "aluminum"}}}};
+    json a = cam_apply_ops(doc, -1, json::array({
+        json{{"op", "add_tool"}, {"tool", json{{"number", 1}, {"type", "endmill_flat"}, {"diameter", 6}, {"flutes", 3}}}},
+        json{{"op", "add_setup"}, {"ref", "S"}, {"setup", setup}}}));
+    std::string sid = a["id_map"]["S"].get<std::string>();
+    json face = json{{"type", "face"}, {"tool_number", 1}, {"stepover", 8},
+                     {"heights", json{{"top", 0}, {"bottom", -2}}},
+                     {"geometry", json{{"regions", json::array({to_json(square(0, 0, 18))})}}}};
+    json pocket = json{{"type", "pocket2d"}, {"tool_number", 1}, {"stepover", 3}, {"stepdown", 2},
+                       {"heights", json{{"top", -2}, {"bottom", -5}}},
+                       {"geometry", json{{"regions", json::array({to_json(square(0, 0, 8))})}}}};
+    cam_apply_ops(doc, a["revision"].get<long>(), json::array({
+        json{{"op", "add_operation"}, {"setup_id", sid}, {"operation", face}},
+        json{{"op", "add_operation"}, {"setup_id", sid}, {"operation", pocket}}}));
+    return doc;
+}
+}  // namespace
+
+TEST_CASE("sim: frames snapshots are equal-interval and end at the remnant (wave 1)") {
+    std::string doc = make_frames_job();
+    json sim = cam_simulate(doc, json{{"include_field", true}, {"options", json{{"frames", 4}}}});
+    REQUIRE(sim["results"].size() == 1);
+    const json& r = sim["results"][0];
+    REQUIRE(r.contains("frames"));
+    const size_t nframes = r["frames"].size();
+    CHECK(nframes >= 4);
+    CHECK(nframes <= 5);   // 4 intervals + optional final append
+    double prev_t = -1;
+    for (const auto& f : r["frames"]) {
+        double t = f["t_s"].get<double>();
+        CHECK(t > prev_t);
+        prev_t = t;
+    }
+    // last frame field equals the full-resolution final field
+    const json& lastf = r["frames"].back()["field"];
+    CHECK(lastf["nx"] == r["field"]["nx"]);
+    CHECK(lastf["ny"] == r["field"]["ny"]);
+    CHECK(lastf["z"].get<std::vector<double>>() == r["field"]["z"].get<std::vector<double>>());
+    cam_close(doc);
+}
+
+TEST_CASE("sim: frames=0 emits no frames key (back-compat)") {
+    std::string doc = make_frames_job();
+    json sim = cam_simulate(doc, json::object());
+    CHECK_FALSE(sim["results"][0].contains("frames"));
+    cam_close(doc);
+}
+
+TEST_CASE("sim: giant frame request clamps to 64 and flags frames_clamped") {
+    std::string doc = make_frames_job();
+    json sim = cam_simulate(doc, json{{"options", json{{"frames", 500}}}});
+    const json& r = sim["results"][0];
+    REQUIRE(r.contains("frames"));
+    CHECK(r["frames"].size() <= 64);
+    CHECK(r.value("frames_clamped", false));
+    cam_close(doc);
+}
+
+TEST_CASE("session: cam_tree exposes machine_detail with rapid rates (wave 1)") {
+    std::string doc = make_frames_job();
+    json tr = cam_tree(doc);
+    REQUIRE(tr["setups"].size() == 1);
+    CHECK(tr["setups"][0].contains("machine_detail"));
+    CHECK(tr["setups"][0]["machine_detail"]["rapid_xy"].get<double>() == doctest::Approx(5000));
+    cam_close(doc);
+}
+
+
 namespace {
 // A corner-heavy "star/gear" pocket: an irregular star with sharp acute-angle
 // spikes and reflex notches (no right angles anywhere, unlike a rectangular

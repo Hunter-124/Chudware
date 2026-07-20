@@ -19,6 +19,10 @@ public:
     // Build from a mesh over the XY bbox (expanded by `pad`), at `res` mm spacing.
     static HeightField from_mesh(const TriMesh&, double res, double pad = 0,
                                  double floor_z = 0);
+    // Allocate an empty grid (all cells = floor_z) without meshing. Used for
+    // strided frame downsamples and tests.
+    static HeightField empty(int nx, int ny, double res, Vec2 lo, double floor_z = 0);
+
 
     int nx() const { return nx_; }
     int ny() const { return ny_; }

@@ -170,6 +170,20 @@ HeightField HeightField::from_mesh(const TriMesh& mesh, double res, double pad,
     return hf;
 }
 
+HeightField HeightField::empty(int nx, int ny, double res, Vec2 lo, double floor_z) {
+    HeightField hf;
+    if (nx < 1 || ny < 1 || res <= 0.0) return hf;
+    hf.nx_ = nx;
+    hf.ny_ = ny;
+    hf.res_ = res;
+    hf.lo_ = lo;
+    hf.hi_ = {lo.x + (nx - 1) * res, lo.y + (ny - 1) * res};
+    hf.floor_ = floor_z;
+    hf.z_.assign((size_t)nx * (size_t)ny, (float)floor_z);
+    return hf;
+}
+
+
 double HeightField::height_at(double x, double y) const {
     if (nx_ < 2 || ny_ < 2) return floor_;
     double fi = (x - lo_.x) / res_;

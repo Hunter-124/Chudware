@@ -14,71 +14,101 @@ namespace {
 // A flat plane mesh over [lo..hi] (expanded by `grow`) at height z, for seeding a
 // stock HeightField at the stock top.
 TriMesh flat_plane(const Vec2& lo, const Vec2& hi, double z, double grow) {
+    double x0 = lo.x - grow, x1 = hi.x + grow, y0 = lo.y - grow, y1 = hi.y + grow;
     TriMesh m;
-    m.verts = {{lo.x - grow, lo.y - grow, z}, {hi.x + grow, lo.y - grow, z},
-               {hi.x + grow, hi.y + grow, z}, {lo.x - grow, hi.y + grow, z}};
+    m.verts = {{x0, y0, z}, {x1, y0, z}, {x1, y1, z}, {x0, y1, z}};
     m.tris = {{0, 1, 2}, {0, 2, 3}};
     return m;
 }
+
 double dist_point_seg(double px, double py, double ax, double ay, double bx, double by, double& t) {
     double dx = bx - ax, dy = by - ay;
-    double L2 = dx * dx + dy * dy;
-    if (L2 < 1e-12) { t = 0; return std::hypot(px - ax, py - ay); }
-    t = ((px - ax) * dx + (py - ay) * dy) / L2;
-    t = std::max(0.0, std::min(1.0, t));
-    double cx = ax + dx * t, cy = ay + dy * t;
-    return std::hypot(px - cx, py - cy);
+    double den = dx * dx + dy * dy;
+    if (den < 1e-18) { t = 0; return std::hypot(px - ax, py - ay); }
+    t = std::max(0.0, std::min(1.0, ((px - ax) * dx + (py - ay) * dy) / den));
+    return std::hypot(px - (ax + t * dx), py - (ay + t * dy));
+}
+
+// Shared per-move time (seconds). Used by estimate_time and the sim sweep
+// accumulator so frame times align with cycle_time_s. `from` is the previous
+// position; for the first real move of a path the caller skips (have=false).
+double move_time_s(const Move& mv, const Vec3& from, const Machine& m) {
+    if (mv.kind == MoveKind::Dwell) return mv.dwell_s;
+    if (mv.kind == MoveKind::ToolChange) return m.tool_change_s;
+    double rapid_xy = m.rapid_xy > 0 ? m.rapid_xy : 5000;
+    double rapid_z = m.rapid_z > 0 ? m.rapid_z : 3000;
+    double accel = m.accel;  // mm/s^2; 0 = feed-limited only
+    double len;
+    if (mv.kind == MoveKind::Arc) {
+        double r = std::hypot(from.x - mv.center.x, from.y - mv.center.y);
+        double a0 = std::atan2(from.y - mv.center.y, from.x - mv.center.x);
+        double a1 = std::atan2(mv.to.y - mv.center.y, mv.to.x - mv.center.x);
+        double sweep = a1 - a0;
+        if (mv.ccw) { while (sweep <= 0) sweep += 2 * M_PI; }
+        else { while (sweep >= 0) sweep -= 2 * M_PI; sweep = -sweep; }
+        len = r * sweep;
+    } else {
+        len = std::sqrt((mv.to.x - from.x) * (mv.to.x - from.x) +
+                        (mv.to.y - from.y) * (mv.to.y - from.y) +
+                        (mv.to.z - from.z) * (mv.to.z - from.z));
+    }
+    if (mv.kind == MoveKind::Rapid || mv.kind == MoveKind::Retract) {
+        double dxy = std::hypot(mv.to.x - from.x, mv.to.y - from.y);
+        double dz = std::fabs(mv.to.z - from.z);
+        return 60.0 * std::max(dxy / rapid_xy, dz / rapid_z);
+    }
+    double feed_mm_min = mv.feed > 0 ? mv.feed : 600;
+    double v = feed_mm_min / 60.0;  // mm/s
+    if (accel > 0 && v > 0) {
+        double d_acc = v * v / accel;  // accel + decel distance
+        if (len >= d_acc) return (len - d_acc) / v + 2.0 * v / accel;
+        return 2.0 * std::sqrt(len / accel);
+    }
+    return 60.0 * len / feed_mm_min;
+}
+
+// Downsample a heightfield to ≤max_axis per side by strided sampling (frames payload only).
+HeightField downsample_field(const HeightField& src, int max_axis, bool& clamped) {
+    int nx = src.nx(), ny = src.ny();
+    if (nx <= 0 || ny <= 0) return src;
+    if (nx <= max_axis && ny <= max_axis) return src;
+    int step_x = std::max(1, (nx + max_axis - 1) / max_axis);
+    int step_y = std::max(1, (ny + max_axis - 1) / max_axis);
+    int step = std::max(step_x, step_y);
+    int nnx = std::max(1, (nx + step - 1) / step);
+    int nny = std::max(1, (ny + step - 1) / step);
+    double nres = src.res() * step;
+    HeightField out = HeightField::empty(nnx, nny, nres, src.lo(), src.floor());
+    for (int j = 0; j < nny; ++j)
+        for (int i = 0; i < nnx; ++i)
+            out.set_raw(i, j, src.raw(i * step, j * step));
+    clamped = true;
+    return out;
+}
+
+bool field_z_equal(const HeightField& a, const HeightField& b) {
+    if (a.nx() != b.nx() || a.ny() != b.ny()) return false;
+    for (int j = 0; j < a.ny(); ++j)
+        for (int i = 0; i < a.nx(); ++i)
+            if (a.raw(i, j) != b.raw(i, j)) return false;
+    return true;
 }
 }  // namespace
 
 double estimate_time(const Toolpath& tp, const Machine& m) {
-    double rapid_xy = m.rapid_xy > 0 ? m.rapid_xy : 5000;
-    double rapid_z = m.rapid_z > 0 ? m.rapid_z : 3000;
-    double accel = m.accel;  // mm/s^2; 0 = feed-limited only
     double t = 0;
     Vec3 prev{0, 0, 0};
     bool have = false;
     for (const Move& mv : tp.moves) {
-        if (mv.kind == MoveKind::Dwell) { t += mv.dwell_s; continue; }
-        if (mv.kind == MoveKind::ToolChange) { t += m.tool_change_s; continue; }
+        if (mv.kind == MoveKind::Dwell) { t += move_time_s(mv, prev, m); continue; }
+        if (mv.kind == MoveKind::ToolChange) { t += move_time_s(mv, prev, m); continue; }
         if (!have) { prev = mv.to; have = true; continue; }
-        double len;
-        if (mv.kind == MoveKind::Arc) {
-            double r = std::hypot(prev.x - mv.center.x, prev.y - mv.center.y);
-            double a0 = std::atan2(prev.y - mv.center.y, prev.x - mv.center.x);
-            double a1 = std::atan2(mv.to.y - mv.center.y, mv.to.x - mv.center.x);
-            double sweep = a1 - a0;
-            if (mv.ccw) { while (sweep <= 0) sweep += 2 * M_PI; }
-            else { while (sweep >= 0) sweep -= 2 * M_PI; sweep = -sweep; }
-            len = r * sweep;
-        } else {
-            len = std::sqrt((mv.to.x - prev.x) * (mv.to.x - prev.x) +
-                            (mv.to.y - prev.y) * (mv.to.y - prev.y) +
-                            (mv.to.z - prev.z) * (mv.to.z - prev.z));
-        }
-        double feed_mm_min;
-        if (mv.kind == MoveKind::Rapid || mv.kind == MoveKind::Retract) {
-            double dxy = std::hypot(mv.to.x - prev.x, mv.to.y - prev.y);
-            double dz = std::fabs(mv.to.z - prev.z);
-            t += 60.0 * std::max(dxy / rapid_xy, dz / rapid_z);
-            prev = mv.to;
-            continue;
-        } else {
-            feed_mm_min = mv.feed > 0 ? mv.feed : 600;
-        }
-        double v = feed_mm_min / 60.0;  // mm/s
-        if (accel > 0 && v > 0) {
-            // trapezoidal: time to reach v, distance to accel+decel
-            double d_acc = v * v / accel;  // accel + decel distance
-            if (len >= d_acc) t += (len - d_acc) / v + 2.0 * v / accel;
-            else t += 2.0 * std::sqrt(len / accel);
-        } else {
-            t += 60.0 * len / feed_mm_min;
-        }
+        t += move_time_s(mv, prev, m);
         prev = mv.to;
     }
     return t;
 }
+
 
 json backplot(const Toolpath& tp) {
     json rapid = json::array(), cut = json::array(), lead = json::array(),
@@ -254,7 +284,44 @@ SimResult simulate_setup(const Setup& setup, const ToolLibrary& tools,
     // lower the field along every cutting move; flag rapids through stock
     int rapid_hits = 0;
     int holder_hits = 0;
+
+    // ── frame snapshots (aicad.cam_sim_frames/1) ──────────────────────────
+    // Total time up front with the same model the sweep accumulates, then
+    // snapshot the field at equal time intervals as the sweep crosses them.
+    int want_frames = opt.frames > 0 ? opt.frames : 0;
+    if (want_frames > 64) { want_frames = 64; res.frames_clamped = true; }
+    double frame_total = 0;
+    if (want_frames > 0) {
+        int lt = -999;
+        for (const Toolpath& tp : toolpaths) {
+            if (tp.tool_number != lt) { frame_total += setup.machine.tool_change_s; lt = tp.tool_number; }
+            frame_total += estimate_time(tp, setup.machine);
+        }
+    }
+    double elapsed = 0;
+    int frames_taken = 0;
+    auto push_frame = [&](double t) {
+        bool dc = false;
+        HeightField snap = downsample_field(field, 128, dc);
+        if (dc) res.frames_clamped = true;
+        res.frames.push_back(std::move(snap));
+        res.frame_times_s.push_back(t);
+    };
+    auto cross_frames = [&]() {
+        if (want_frames <= 0 || frame_total <= 0) return;
+        while (frames_taken < want_frames &&
+               elapsed >= (double)(frames_taken + 1) * frame_total / want_frames) {
+            ++frames_taken;
+            push_frame(elapsed);
+        }
+    };
+    int last_tool_frame = -999;
     for (const Toolpath& tp : toolpaths) {
+        if (want_frames > 0 && tp.tool_number != last_tool_frame) {
+            elapsed += setup.machine.tool_change_s;
+            last_tool_frame = tp.tool_number;
+            cross_frames();
+        }
         const Tool* tl = tools.find(tp.tool_number);
         double r = tl ? tl->effective_radius() : 1.0;
         // non-cutting tool body for holder/shank collision (audit T-M3): the flutes cut
@@ -320,9 +387,14 @@ SimResult simulate_setup(const Setup& setup, const ToolLibrary& tools,
             return false;
         };
         for (const Move& m : tp.moves) {
-            if (m.kind == MoveKind::Dwell || m.kind == MoveKind::ToolChange) continue;
+            if (m.kind == MoveKind::Dwell || m.kind == MoveKind::ToolChange) {
+                if (want_frames > 0) { elapsed += move_time_s(m, prev, setup.machine); cross_frames(); }
+                continue;
+            }
             Vec3 to = m.to;
             if (!have) { prev = to; have = true; continue; }
+            double frame_from = elapsed;
+            if (want_frames > 0) elapsed += move_time_s(m, prev, setup.machine);
             bool cutting = (m.kind == MoveKind::Cut || m.kind == MoveKind::Plunge ||
                             m.kind == MoveKind::Lead || m.kind == MoveKind::Arc);
             bool rapid = (m.kind == MoveKind::Rapid || m.kind == MoveKind::Retract);
@@ -360,6 +432,15 @@ SimResult simulate_setup(const Setup& setup, const ToolLibrary& tools,
             }
             if (holder_hit) ++holder_hits;
             prev = to;
+            (void)frame_from;
+            cross_frames();
+        }
+    }
+    // guarantee the last frame is the final remnant field (never exceeding the 64 cap)
+    if (want_frames > 0 && res.frames.size() < 64) {
+        if (res.frames.empty() || !field_z_equal(res.frames.back(), field) ||
+            res.frame_times_s.back() < frame_total) {
+            push_frame(frame_total > 0 ? frame_total : elapsed);
         }
     }
     double final_sum = field_sum();
@@ -423,7 +504,24 @@ json SimResult::to_json(bool include_field) const {
         j["field"] = json{{"nx", remaining.nx()}, {"ny", remaining.ny()}, {"res", remaining.res()},
                           {"lo", json::array({remaining.lo().x, remaining.lo().y})}, {"z", zs}};
     }
+    frames_to_json(j);
     return j;
+}
+
+void SimResult::frames_to_json(json& j) const {
+    if (frames.empty()) return;
+    json arr = json::array();
+    for (size_t k = 0; k < frames.size(); ++k) {
+        const HeightField& f = frames[k];
+        json zs = json::array();
+        for (int jj = 0; jj < f.ny(); ++jj)
+            for (int ii = 0; ii < f.nx(); ++ii) zs.push_back(f.raw(ii, jj));
+        arr.push_back(json{{"t_s", frame_times_s[k]},
+                           {"field", json{{"nx", f.nx()}, {"ny", f.ny()}, {"res", f.res()},
+                                          {"lo", json::array({f.lo().x, f.lo().y})}, {"z", zs}}}});
+    }
+    j["frames"] = arr;
+    if (frames_clamped) j["frames_clamped"] = true;
 }
 
 }  // namespace cam

@@ -18,6 +18,9 @@ struct SimOptions {
     bool check_rapid = true;   // flag rapid moves that pass through stock
     bool check_holder = false; // holder/shank collision (needs tool stickout)
     double gouge_tol = 0.05;   // allowed overcut below the part surface (mm)
+    // >0: snapshot the remaining field at this many equal time intervals
+    // (clamped to 64; large grids downsampled in the frames payload only).
+    int frames = 0;
 };
 
 struct SimResult {
@@ -37,7 +40,12 @@ struct SimResult {
     std::vector<std::string> warnings;
     // the simulated remaining-stock heightfield (for display / stock-to-stock rest)
     HeightField remaining;
+    // equal-interval snapshots (aicad.cam_sim_frames/1); empty when options.frames==0
+    std::vector<double> frame_times_s;
+    std::vector<HeightField> frames;
+    bool frames_clamped = false;       // true when count or grid was reduced
     json to_json(bool include_field = false) const;
+    void frames_to_json(json& j) const;
 };
 
 // Simulate one setup: build the stock dexel field, sweep every toolpath's cutting

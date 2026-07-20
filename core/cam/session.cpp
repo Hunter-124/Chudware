@@ -88,6 +88,7 @@ json tree_of(const Job& job) {
                                {"tool_number", o.tool_number}, {"suppressed", o.suppressed}});
         setups.push_back(json{{"id", su.id}, {"name", su.name},
                               {"machine", to_string(su.machine.kind)},
+                              {"machine_detail", su.machine.to_json()},
                               {"stock", su.stock.to_json()}, {"wcs", su.wcs.to_json()},
                               {"operations", ops}});
     }
@@ -352,6 +353,7 @@ json cam_simulate(const std::string& doc_id, const json& params) {
         so.check_rapid = o.value("check_rapid", so.check_rapid);
         so.check_holder = o.value("check_holder", so.check_holder);
         so.gouge_tol = o.value("gouge_tol", so.gouge_tol);
+        so.frames = o.value("frames", so.frames);
     }
     bool include_field = params.value("include_field", false);
     json results = json::array();

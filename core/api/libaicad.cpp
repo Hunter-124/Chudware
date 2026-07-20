@@ -1669,8 +1669,11 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
         }
         if (m == "agent_cancel") {
             // Best-effort stop at the next stage boundary / in-flight HTTP xfer.
-            // {run_id} -> {ok, cancelled:bool}. Unknown/finished run_id => cancelled:false.
+            // {run_id} -> {ok, cancelled:bool}. Empty/missing run_id cancels ALL live
+            // runs so Stop still works when run_started has not landed yet.
             const std::string run_id = jstr(params, "run_id");
+            if (run_id.empty())
+                return emit(aicad::agent::cancel_all_runs(), out_json, 0);
             return emit(aicad::agent::cancel_run(run_id), out_json, 0);
         }
         if (m == "agent_steer") {

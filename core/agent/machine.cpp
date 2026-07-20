@@ -52,6 +52,18 @@ json cancel_run(const std::string& run_id) {
     return json{{"ok", true}, {"cancelled", true}};
 }
 
+json cancel_all_runs() {
+    std::vector<RunControl> live;
+    {
+        std::lock_guard<std::mutex> lk(g_run_ctl_mtx);
+        live.reserve(g_run_ctl.size());
+        for (auto& kv : g_run_ctl) live.push_back(kv.second);
+    }
+    for (auto& ctl : live) ctl.request_cancel();
+    const int n = (int)live.size();
+    return json{{"ok", true}, {"cancelled", n > 0}, {"count", n}};
+}
+
 json steer_run(const std::string& run_id, const std::string& text) {
     if (run_id.empty()) return json{{"ok", true}, {"steered", false}};
     // Trim; empty steering is a no-op.

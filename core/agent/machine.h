@@ -132,7 +132,11 @@ struct RunControl {
 void register_run_control(const std::string& run_id, RunControl control);
 void unregister_run_control(const std::string& run_id);
 // Returns {ok:true, cancelled:bool} — cancelled is true when a live run was flagged.
+// Empty run_id is a no-op (cancelled:false); use cancel_all_runs to stop every live run.
 json cancel_run(const std::string& run_id);
+// Cancel every registered live run (Stop with unknown/missing run_id, client disconnect).
+// Returns {ok:true, cancelled:bool, count:N}.
+json cancel_all_runs();
 
 // Queue a mid-run steering message for a live run. Returns {ok:true, steered:bool} —
 // steered is false for unknown/finished run_id or empty text. The run consumes queued

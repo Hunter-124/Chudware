@@ -52,9 +52,81 @@ std::string digest16(const std::string& text) {
     return h;
 }
 
+// Human one-line summary of a doc op's params for tool cards — e.g.
+// "standoff_hex · 22mm · M3" from {"family":"standoff_hex","length_mm":22,"thread":"M3"}.
+// Skips scaffolding keys so the label stays about the geometry, not the plumbing.
+std::string summarize_op_params(const json& params) {
+    if (!params.is_object()) return "";
+    static const char* kSkip[] = {"family", "type", "op", "name", "id", "doc_id"};
+    std::string out;
+    int n = 0;
+    for (auto it = params.begin(); it != params.end() && n < 4; ++it) {
+        bool skip = false;
+        for (const char* s : kSkip)
+            if (it.key() == s) { skip = true; break; }
+        if (skip) continue;
+        std::string v;
+        const json& val = it.value();
+        if (val.is_string()) v = val.get<std::string>();
+        else if (val.is_number_integer()) v = std::to_string(val.get<long long>());
+        else if (val.is_number_unsigned()) v = std::to_string(val.get<unsigned long long>());
+        else if (val.is_number_float()) {
+            char b[32];
+            std::snprintf(b, sizeof b, "%g", val.get<double>());
+            v = b;
+        } else continue;
+        if (v.empty()) continue;
+        // Keep units explicit: length_mm 22 -> "22mm" reads as a dimension, not a count.
+        const std::string& k = it.key();
+        bool mm = (k.size() > 3 && k.compare(k.size() - 3, 3, "_mm") == 0);
+        if (!mm) {
+            // Doc ops are all millimetre-space; bare geometric keys get the suffix too.
+            static const char* kMmKeys[] = {"diameter", "radius", "width", "height", "depth",
+                                            "length", "distance", "offset", "pitch", "size",
+                                            "thickness", "chamfer", "fillet"};
+            for (const char* mk : kMmKeys)
+                if (k == mk) { mm = true; break; }
+        }
+        if (mm) v += "mm";
+        if (!out.empty()) out += " \xc2\xb7 ";
+        out += v;
+        ++n;
+    }
+    return out;
+}
+
+// Summary of a feature-bearing op (add_feature / standard_part / edit_feature):
+// "Standoff (standoff_hex · 22mm · M3)" — name + family + dims for the Doing card.
+std::string summarize_feature_op(const json& op) {
+    if (!op.is_object() || !op.contains("feature") || !op["feature"].is_object())
+        return "";
+    const json& f = op["feature"];
+    const std::string name = f.value("name", std::string());
+    std::string sub;
+    if (f.contains("params") && f["params"].is_object()) {
+        if (f["params"].contains("family") && f["params"]["family"].is_string())
+            sub = f["params"]["family"].get<std::string>();
+        const std::string dims = summarize_op_params(f["params"]);
+        if (!dims.empty()) sub += (sub.empty() ? "" : " \xc2\xb7 ") + dims;
+    }
+    if (sub.empty() && f.contains("type") && f["type"].is_string())
+        sub = f["type"].get<std::string>();
+    std::string s = name;
+    if (!sub.empty()) {
+        if (!s.empty()) s += " (" + sub + ")";
+        else s = sub;
+    }
+    return cap_text(s, 120);
+}
+
 std::string derive_ops_target(const json& args) {
     auto one = [](const json& op) -> std::string {
         if (!op.is_object()) return "";
+        // Feature ops first: the geometry name + dims beat any plumbing field.
+        {
+            std::string fs = summarize_feature_op(op);
+            if (!fs.empty()) return fs;
+        }
         for (const char* k : {"target", "face", "faces", "edge", "edges", "feature",
                               "sketch", "part", "part_name", "name", "body", "component",
                               "plane", "doc_id", "path", "id"}) {
@@ -80,26 +152,44 @@ std::string derive_ops_target(const json& args) {
                 if (!joined.empty()) return cap_text(joined, 120);
             }
         }
-        // type/op as last-resort label fragment
-        if (op.contains("type") && op["type"].is_string())
-            return cap_text(op["type"].get<std::string>(), 120);
-        if (op.contains("op") && op["op"].is_string())
-            return cap_text(op["op"].get<std::string>(), 120);
+        // type/op as last-resort label fragment — with dims when the op carries them
+        // ("extrude (22mm)", "cut (\u00d83.4mm)") so the action is readable at a glance.
+        {
+            std::string base;
+            if (op.contains("type") && op["type"].is_string())
+                base = op["type"].get<std::string>();
+            else if (op.contains("op") && op["op"].is_string())
+                base = op["op"].get<std::string>();
+            if (!base.empty()) {
+                const std::string dims = summarize_op_params(op);
+                if (!dims.empty()) base += " (" + dims + ")";
+                return cap_text(base, 120);
+            }
+        }
         return "";
     };
     if (args.is_array()) {
         if (args.empty()) return "";
         if (args.size() == 1) return one(args[0]);
-        // Multi-op: first op type + count
-        std::string t = one(args[0]);
-        if (t.empty() && args[0].is_object()) {
-            if (args[0].contains("op") && args[0]["op"].is_string())
-                t = args[0]["op"].get<std::string>();
-            else if (args[0].contains("type") && args[0]["type"].is_string())
-                t = args[0]["type"].get<std::string>();
+        // Multi-op: list each action ("Standoff (standoff_hex · 22mm · M3) → cut Ø3.4 bore").
+        // The user asked for a real per-action display, not "first + N more".
+        std::string s;
+        const size_t nShow = args.size() <= 3 ? args.size() : 2;
+        for (size_t i = 0; i < nShow; ++i) {
+            std::string t = one(args[i]);
+            if (t.empty() && args[i].is_object()) {
+                if (args[i].contains("op") && args[i]["op"].is_string())
+                    t = args[i]["op"].get<std::string>();
+                else if (args[i].contains("type") && args[i]["type"].is_string())
+                    t = args[i]["type"].get<std::string>();
+            }
+            if (t.empty()) continue;
+            if (!s.empty()) s += " \xe2\x86\x92 ";  // " → "
+            s += t;
         }
-        std::string s = t.empty() ? (std::to_string(args.size()) + " ops")
-                                  : (t + " +" + std::to_string(args.size() - 1) + " more");
+        if (args.size() > nShow)
+            s += " \xe2\x86\x92 +" + std::to_string(args.size() - nShow) + " more";
+        if (s.empty()) s = std::to_string(args.size()) + " ops";
         return cap_text(s, 120);
     }
     if (args.is_object()) return one(args);
@@ -109,7 +199,15 @@ std::string derive_ops_target(const json& args) {
 std::string derive_tool_name(const json& args) {
     auto op_name = [](const json& op) -> std::string {
         if (!op.is_object()) return "";
-        if (op.contains("op") && op["op"].is_string()) return op["op"].get<std::string>();
+        // standard_part gets a human label ("add standard part" reads better in the
+        // Doing card than the raw op id; target line carries the family + dims).
+        if (op.contains("op") && op["op"].is_string()) {
+            const std::string o = op["op"].get<std::string>();
+            if (o == "add_feature" && op.contains("feature") && op["feature"].is_object() &&
+                op["feature"].value("type", std::string()) == "standard_part")
+                return "add standard part";
+            return o;
+        }
         if (op.contains("type") && op["type"].is_string()) return op["type"].get<std::string>();
         return "";
     };
@@ -118,7 +216,9 @@ std::string derive_tool_name(const json& args) {
         std::string first = op_name(args[0]);
         if (first.empty()) return "doc_apply_ops";
         for (size_t i = 1; i < args.size(); ++i) {
-            if (op_name(args[i]) != first) return "doc_apply_ops";
+            if (op_name(args[i]) != first)
+                // Mixed batch: say what it is in human terms, not the raw RPC name.
+                return "apply " + std::to_string(args.size()) + " ops";
         }
         return first;
     }

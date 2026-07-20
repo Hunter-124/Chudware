@@ -5077,10 +5077,88 @@ static void drawThoughtBox(ActivityItem& a, const ui::Fonts& fonts, bool showThi
     chatCopyContext(thoughtRect, "##thought_copy", thoughtCopy);
 }
 
+// ---- artifact file actions ---------------------------------------------------------------
+// Shared by the inline chat artifact rows (tool-call files/images) and the Session Artifacts
+// panel: open with the OS default handler, or reveal in the OS file manager. Warn-toasts when
+// the file is gone (moved/deleted after the run).
+static std::string chatShellQuote(std::string s) {
+    std::string out;
+    out.reserve(s.size() + 2);
+    for (char c : s) {
+        if (c == '"' || c == '\\' || c == '$' || c == '`') out.push_back('\\');
+        out.push_back(c);
+    }
+    return out;
+}
+
+static bool chatArtifactExists(const std::string& path) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    return fs::exists(path, ec);
+}
+
+static void chatArtifactOpen(AppState& st, const std::string& path) {
+    if (!chatArtifactExists(path)) {
+        namespace fs = std::filesystem;
+        st.toast(ui::ToastLevel::Warn, "File not found: " + fs::path(path).filename().string());
+        return;
+    }
+    const std::string q = chatShellQuote(path);
+#ifdef _WIN32
+    std::string cmd = "start \"\" \"" + q + "\"";
+#elif defined(__APPLE__)
+    std::string cmd = "open \"" + q + "\"";
+#else
+    std::string cmd = "xdg-open \"" + q + "\" >/dev/null 2>&1 &";
+#endif
+    (void)std::system(cmd.c_str());
+}
+
+static void chatArtifactReveal(AppState& st, const std::string& path) {
+    namespace fs = std::filesystem;
+    if (!chatArtifactExists(path)) {
+        st.toast(ui::ToastLevel::Warn, "File not found: " + fs::path(path).filename().string());
+        return;
+    }
+    const std::string q = chatShellQuote(path);
+#ifdef _WIN32
+    std::string cmd = "explorer /select,\"" + q + "\"";
+#elif defined(__APPLE__)
+    std::string cmd = "open -R \"" + q + "\"";
+#else
+    // No portable select-file on Linux — open the containing folder instead.
+    std::error_code ec;
+    const std::string dir = fs::path(path).parent_path().string();
+    const std::string qd = chatShellQuote(dir.empty() ? std::string(".") : dir);
+    std::string cmd = "xdg-open \"" + qd + "\" >/dev/null 2>&1 &";
+#endif
+    (void)std::system(cmd.c_str());
+}
+
+// Two small text actions — "open" / "folder" — for one artifact path. Caller wraps in PushID.
+static void chatArtifactActions(AppState& st, const std::string& path) {
+    const ui::AdaptiveSurface& surf = chatSurf();
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+    ImGui::TextUnformatted("(open)");
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        ImGui::SetTooltip("Open with the default app\n%s", path.c_str());
+    }
+    if (ImGui::IsItemClicked()) chatArtifactOpen(st, path);
+    ImGui::SameLine(0, 6.0f * ui::uiScale);
+    ImGui::TextUnformatted("(folder)");
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        ImGui::SetTooltip("Show in file manager\n%s", path.c_str());
+    }
+    if (ImGui::IsItemClicked()) chatArtifactReveal(st, path);
+    ImGui::PopStyleColor();
+}
+
 // M14 — one inline row per tool call ("Doing"): ok/fail glyph + tool icon + tool name + latency,
 // with the human-readable target as a dim wrapped line. Args preview + image artifacts expand
 // on click. Artifact image paths are packed into detail after "\n\x1eART\x1e\n" by feedTurnActivity.
-static void drawToolCallRow(ActivityItem& a, const ui::Fonts& fonts) {
+static void drawToolCallRow(AppState& st, ActivityItem& a, const ui::Fonts& fonts) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
     const bool fail = a.status == "fail";
@@ -5182,11 +5260,18 @@ static void drawToolCallRow(ActivityItem& a, const ui::Fonts& fonts) {
                         ImGui::TextWrapped("image: %s", path.c_str());
                         ImGui::PopStyleColor();
                     }
+                    ImGui::PushID(imgI + 1000);
+                    chatArtifactActions(st, path);
+                    ImGui::PopID();
                 } else {
-                    // mesh / file — show path as a dim line (no inline preview).
+                    // mesh / file — show path as a dim line (no inline preview) + file actions.
                     ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
                     ImGui::TextWrapped("%s: %s", kindA.c_str(), path.c_str());
                     ImGui::PopStyleColor();
+                    ImGui::PushID(imgI + 2000);
+                    chatArtifactActions(st, path);
+                    ImGui::PopID();
+                    ++imgI;
                 }
             }
         }
@@ -6053,7 +6138,8 @@ static void drawSubRunCard(const ActivityItem& a, const ui::Fonts& fonts) {
 }
 
 
-static void drawAgentTimeline(ChatMsg& m, const ui::Fonts& fonts, float logW, bool showThinking) {
+static void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float logW,
+                              bool showThinking) {
     if (m.activity.empty()) return;
     const bool turnRunning = m.running;
     if (!turnRunning) {
@@ -6076,7 +6162,7 @@ static void drawAgentTimeline(ChatMsg& m, const ui::Fonts& fonts, float logW, bo
         } else if (a.rowKind == 2) {
             drawThoughtBox(a, fonts, showThinking, turnRunning);
         } else if (a.rowKind == 3) {
-            drawToolCallRow(a, fonts);
+            drawToolCallRow(st, a, fonts);
         } else if (a.rowKind == 10) {
             drawClassificationCard(a, fonts, turnRunning);
         } else if (a.rowKind == 4) {
@@ -7123,7 +7209,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
     }
 
     // (2) Agent timeline — typed blocks: collapsible thinking + glass action cards.
-    drawAgentTimeline(m, fonts, logW, gShowThinking);
+    drawAgentTimeline(st, m, fonts, logW, gShowThinking);
 
     // (3) Streaming assistant text — a Thin glass "prose" card (Liquid Glass v2 §6, host
     // contract H5) keeps body copy legible over the live viewport blur. Selectable for
@@ -8011,28 +8097,18 @@ static void drawArtifactsPanel(AppState& st, bool busy) {
                     std::string base = path;
                     size_t slash = base.find_last_of("/\\");
                     if (slash != std::string::npos) base = base.substr(slash + 1);
+                    ImGui::PushID(path.c_str());
                     ImGui::Bullet();
                     ImGui::SameLine();
                     ImGui::TextWrapped("%s  (%s)", base.c_str(), kindA.c_str());
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", path.c_str());
-                    if (ImGui::IsItemClicked()) {
-                        namespace fs = std::filesystem;
-                        std::error_code ec;
-                        if (fs::exists(path, ec)) {
-#ifdef _WIN32
-                            std::string cmd = "start \"\" \"" + path + "\"";
-                            (void)std::system(cmd.c_str());
-#elif defined(__APPLE__)
-                            std::string cmd = "open \"" + path + "\"";
-                            (void)std::system(cmd.c_str());
-#else
-                            std::string cmd = "xdg-open \"" + path + "\" >/dev/null 2>&1 &";
-                            (void)std::system(cmd.c_str());
-#endif
-                        } else {
-                            st.toast(ui::ToastLevel::Warn, "File not found: " + base);
-                        }
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                        ImGui::SetTooltip("%s", path.c_str());
                     }
+                    if (ImGui::IsItemClicked()) chatArtifactOpen(st, path);
+                    ImGui::SameLine(0, 6.0f * sc);
+                    chatArtifactActions(st, path);
+                    ImGui::PopID();
                 }
             }
         }

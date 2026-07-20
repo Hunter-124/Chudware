@@ -1924,3 +1924,16 @@ normal / center line), so a circle dragged to a square's edge snaps tangent.
 emits {pointHandle, ent}. **Verify:** host build green; AI_CAD_SHOT=sketch
 complete. **Deferred:** arc angle-handle snapping (no matching relation type);
 ellipse rim handles don't exist yet.
+
+## 2026-07-19 — Hole-aware profile fill + line→circle tangency (C56c)
+
+**sketch_mode.cpp**: region shading no longer punches nested loops with opaque
+viewportTop (white blob on the live 3D backdrop); material regions are now
+triangulated with vendored mapbox earcut (`host/extern/mapbox/earcut.hpp`,
+ISC — `host/third_party` is gitignored) from outer + hole-child loops, leaving
+true transparent holes (donut). Legacy fill+punch remains as triangulator
+fallback. `groupDragSnap` 2b gained the dragged-line → static-circle tangency
+dual. **Verify:** host build green; AI_CAD_SHOT=sketch complete; earcut
+fuzz-validated standalone 0/2000. **Gotcha:** naive ear-clipping over
+bridge-spliced weakly-simple polygons fails on multi-hole inputs — don't
+reintroduce a hand-rolled clipper here.

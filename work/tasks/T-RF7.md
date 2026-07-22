@@ -27,6 +27,6 @@ services/agent/prompts/*.md (both runtimes already read that dir).
 
 ## Definition of done
 
-- [ ] One canonical event-kind list; C++ and Python emitters both validated against it.
+- [x] One canonical event-kind list; C++ and Python emitters both validated against it.
 - [ ] roles.cpp enumerates the prompts dir (no hardcoded names).
 - [ ] New lint in check.py green; gate.sh green; REFACTOR_LOG handoff.

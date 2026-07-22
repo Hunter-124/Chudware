@@ -28,6 +28,6 @@ Mirror tests in core/tests/.
 
 ## Definition of done
 
-- [ ] fw_* served by libaicad with corpus parity; Python module deleted same commit.
+- [x] fw_* served by libaicad with corpus parity; Python module deleted same commit.
 - [ ] MCP firmware tools unchanged on the surface (freshness rule if touched).
 - [ ] gate.sh green; REFACTOR_LOG handoff; web_parity inventory shrinks.

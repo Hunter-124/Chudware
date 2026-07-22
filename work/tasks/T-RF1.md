@@ -33,6 +33,6 @@ append the REFACTOR_LOG.md supersession note for the old cursor plan + this DAG'
 
 - [x] No doc references ui/imgui, ui/abstract, host/DEPRECATED.md,
       docs/PYTHON_CUTOVER_STATUS.md, or docs/CPP_MIGRATION.md as live.
-- [ ] AGENTS.md states ~110k LOC host/src/ui and the real ui/viewport status.
+- [x] AGENTS.md states ~110k LOC host/src/ui and the real ui/viewport status.
 - [ ] T-G* board statuses reflect reality; `work.py validate` clean.
 - [ ] REFACTOR_LOG.md paragraph appended; `graphify update .` run.

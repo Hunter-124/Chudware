@@ -1,22 +1,23 @@
 # services/worker — engine routing seam (libaicad vs Python oracle)
 
-Static library target for the worker client, C++ core loader, and routing policy.
-The legacy host binary links these sources directly today; ui/imgui will link
-this library once N4a / G1 integration completes.
+The routing seam between the host GUI and the engine: every host→engine call
+funnels through here and is routed to in-process `libaicad` or the Python
+oracle subprocess (`engine_oracle/` via JSON-RPC). The host compiles these
+sources directly (`host/CMakeLists.txt`).
 
-## Sources
+## Sources (post-R0b: these four only)
+
 - `worker_client.{h,cpp}` — JSON-RPC to engine_oracle subprocess (+ libaicad routing)
+- `engine_backend.{h,cpp}` — backend seam: InProcCore vs daemon conn, IPC discovery
 - `cpp_core.{h,cpp}` — in-process libaicad via flat C ABI
 - `worker_router.{h,cpp}` — method/doc routing policy (C++ vs Python)
-- `doc_mirror.{h,cpp}` — worker-backed document mirror
-- `async_rpc.{h,cpp}` — non-blocking worker calls for the UI thread
-- `selection.{h,cpp}` + `pick_hit.h` — topology selection model (GL-free)
-- `jobs.{h,cpp}` + `worker_types.{h,cpp}` — background agent/design jobs
-- `sim_client.{h,cpp}` — FEA/CFD sim worker seam
-- `doc_tabs.{h,cpp}` + `doc_session.h` — multi-document tab model
-- `worker_command_dispatcher.{h,cpp}` — `ICommandDispatcher` implementation
-- `bootstrap.{h,cpp}` — runtime/python provisioning
+
+The stale duplicate copies of the host's live modules (async_rpc, doc_mirror,
+jobs, sim_client, selection, doc_tabs, bootstrap, worker_types, doc_session,
+pick_hit, worker_command_dispatcher) were deleted in R0b — the canonical
+copies live in `host/src/core/*` and `host/src/bootstrap.cpp`.
 
 ## Host forwarding headers
+
 - `host/src/worker_client.h` → `#include "../../services/worker/worker_client.h"`
 - `host/src/core/cpp_core.h` → `#include "../../../services/worker/cpp_core.h"`

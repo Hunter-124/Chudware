@@ -1,6 +1,6 @@
 # Commands Reference
 
-Every ribbon command (225 total), grouped by tab and ribbon group.
+Every ribbon command (344 total), grouped by tab and ribbon group.
 
 ## Annotation
 
@@ -126,47 +126,63 @@ _Available from the Appearance ▸ Material ribbon group._
 
 _Available from the Appearance ▸ Material ribbon group._
 
-## Assembly
+## EM
 
-### Components
+### Reference
 
-#### Comp. Pattern
+#### Coord. Sys.
 
-_Available from the Assembly ▸ Components ribbon group._
+_Available from the EM ▸ Reference ribbon group._
 
-#### Insert Comp.
+#### Ref. Axis
 
-_Available from the Assembly ▸ Components ribbon group._
+_Available from the EM ▸ Reference ribbon group._
 
-#### Move Comp.
+#### Ref. Plane
 
-_Available from the Assembly ▸ Components ribbon group._
+_Available from the EM ▸ Reference ribbon group._
 
-#### Std. Parts
+#### Ref. Point
 
-_Available from the Assembly ▸ Components ribbon group._
+_Available from the EM ▸ Reference ribbon group._
 
-### Display
+### Run
 
-#### Exploded View
+#### Results
 
-_Available from the Assembly ▸ Display ribbon group._
+_Available from the EM ▸ Run ribbon group._
 
-### Evaluate
+#### Run
 
-#### BOM
+_Available from the EM ▸ Run ribbon group._
 
-_Available from the Assembly ▸ Evaluate ribbon group._
+### Setup
 
-#### Interference
+#### Boundaries
 
-_Available from the Assembly ▸ Evaluate ribbon group._
+_Available from the EM ▸ Setup ribbon group._
 
-### Mate
+#### Freq Range
 
-#### Mate
+_Available from the EM ▸ Setup ribbon group._
 
-_Available from the Assembly ▸ Mate ribbon group._
+#### Ports
+
+_Available from the EM ▸ Setup ribbon group._
+
+### Study
+
+#### Eigenmode
+
+_Available from the EM ▸ Study ribbon group._
+
+#### Freq Sweep
+
+_Available from the EM ▸ Study ribbon group._
+
+#### Time Domain
+
+_Available from the EM ▸ Study ribbon group._
 
 ## Evaluate
 
@@ -232,6 +248,58 @@ _Available from the Evaluate ▸ Measure ribbon group._
 
 _Available from the Evaluate ▸ Performance ribbon group._
 
+## Fatigue
+
+### Mesh
+
+#### Mesh
+
+_Available from the Fatigue ▸ Mesh ribbon group._
+
+### Reference
+
+#### Coord. Sys.
+
+_Available from the Fatigue ▸ Reference ribbon group._
+
+#### Ref. Axis
+
+_Available from the Fatigue ▸ Reference ribbon group._
+
+#### Ref. Plane
+
+_Available from the Fatigue ▸ Reference ribbon group._
+
+#### Ref. Point
+
+_Available from the Fatigue ▸ Reference ribbon group._
+
+### Run
+
+#### Results
+
+_Available from the Fatigue ▸ Run ribbon group._
+
+#### Run
+
+_Available from the Fatigue ▸ Run ribbon group._
+
+### Setup
+
+#### Loading / S-N
+
+_Available from the Fatigue ▸ Setup ribbon group._
+
+#### Material
+
+_Available from the Fatigue ▸ Setup ribbon group._
+
+### Study
+
+#### New Study
+
+_Available from the Fatigue ▸ Study ribbon group._
+
 ## Features
 
 ### 3D Body
@@ -268,15 +336,39 @@ _Available from the Features ▸ 3D Body ribbon group._
 
 _Available from the Features ▸ 3D Body ribbon group._
 
-### Curves
+### Assembly
 
-#### Helix
+#### BOM
 
-_Available from the Features ▸ Curves ribbon group._
+_Available from the Features ▸ Assembly ribbon group._
 
-#### Split
+#### Comp. Pattern
 
-_Available from the Features ▸ Curves ribbon group._
+_Available from the Features ▸ Assembly ribbon group._
+
+#### Exploded View
+
+_Available from the Features ▸ Assembly ribbon group._
+
+#### Insert Comp.
+
+_Available from the Features ▸ Assembly ribbon group._
+
+#### Interference
+
+_Available from the Features ▸ Assembly ribbon group._
+
+#### Mate
+
+_Available from the Features ▸ Assembly ribbon group._
+
+#### Move Comp.
+
+_Available from the Features ▸ Assembly ribbon group._
+
+#### Std. Parts
+
+_Available from the Features ▸ Assembly ribbon group._
 
 ### Dress-up
 
@@ -306,6 +398,10 @@ SHELL - hollow a solid to a wall thickness, optionally opening faces.
 
 _Available from the Features ▸ Hole ribbon group._
 
+#### Thread
+
+THREAD — a ONE-OP helical thread cut on a cylindrical face. This is the easy way to
+
 ### Multi-body
 
 #### Combine
@@ -313,6 +409,10 @@ _Available from the Features ▸ Hole ribbon group._
 _Available from the Features ▸ Multi-body ribbon group._
 
 #### Intersect
+
+_Available from the Features ▸ Multi-body ribbon group._
+
+#### Split
 
 _Available from the Features ▸ Multi-body ribbon group._
 
@@ -340,6 +440,10 @@ _Available from the Features ▸ Pattern ribbon group._
 
 _Available from the Features ▸ Reference ribbon group._
 
+#### Helix
+
+_Available from the Features ▸ Reference ribbon group._
+
 #### Ref. Axis
 
 _Available from the Features ▸ Reference ribbon group._
@@ -357,6 +461,58 @@ _Available from the Features ▸ Reference ribbon group._
 #### New Sketch
 
 _Available from the Features ▸ Sketch ribbon group._
+
+## Flow
+
+### Grid
+
+#### Resolution
+
+_Available from the Flow ▸ Grid ribbon group._
+
+### Reference
+
+#### Coord. Sys.
+
+_Available from the Flow ▸ Reference ribbon group._
+
+#### Ref. Axis
+
+_Available from the Flow ▸ Reference ribbon group._
+
+#### Ref. Plane
+
+_Available from the Flow ▸ Reference ribbon group._
+
+#### Ref. Point
+
+_Available from the Flow ▸ Reference ribbon group._
+
+### Run
+
+#### Results
+
+_Available from the Flow ▸ Run ribbon group._
+
+#### Run
+
+_Available from the Flow ▸ Run ribbon group._
+
+### Setup
+
+#### Boundaries
+
+_Available from the Flow ▸ Setup ribbon group._
+
+#### Fluid
+
+_Available from the Flow ▸ Setup ribbon group._
+
+### Study
+
+#### New Study
+
+_Available from the Flow ▸ Study ribbon group._
 
 ## Manufacture
 
@@ -442,11 +598,19 @@ _Available from the Manufacture ▸ Job ribbon group._
 
 _Available from the Manufacture ▸ Job ribbon group._
 
+#### Stock
+
+_Available from the Manufacture ▸ Job ribbon group._
+
 #### Tool
 
 _Available from the Manufacture ▸ Job ribbon group._
 
 ### Output
+
+#### Flavor
+
+_Available from the Manufacture ▸ Output ribbon group._
 
 #### Generate
 
@@ -456,9 +620,31 @@ _Available from the Manufacture ▸ Output ribbon group._
 
 _Available from the Manufacture ▸ Output ribbon group._
 
+#### Show in 3D
+
+_Available from the Manufacture ▸ Output ribbon group._
+
 #### Simulate
 
 _Available from the Manufacture ▸ Output ribbon group._
+
+### Reference
+
+#### Coord. Sys.
+
+_Available from the Manufacture ▸ Reference ribbon group._
+
+#### Ref. Axis
+
+_Available from the Manufacture ▸ Reference ribbon group._
+
+#### Ref. Plane
+
+_Available from the Manufacture ▸ Reference ribbon group._
+
+#### Ref. Point
+
+_Available from the Manufacture ▸ Reference ribbon group._
 
 ### Turning
 
@@ -478,113 +664,305 @@ _Available from the Manufacture ▸ Turning ribbon group._
 
 _Available from the Manufacture ▸ Turning ribbon group._
 
-## PCB
+## Modal
 
-### Analyze
+### Mesh
 
-#### Simulate
+#### Mesh
 
-_Available from the PCB ▸ Analyze ribbon group._
+_Available from the Modal ▸ Mesh ribbon group._
+
+### Options
+
+#### Frequencies
+
+_Available from the Modal ▸ Options ribbon group._
+
+### Reference
+
+#### Coord. Sys.
+
+_Available from the Modal ▸ Reference ribbon group._
+
+#### Ref. Axis
+
+_Available from the Modal ▸ Reference ribbon group._
+
+#### Ref. Plane
+
+_Available from the Modal ▸ Reference ribbon group._
+
+#### Ref. Point
+
+_Available from the Modal ▸ Reference ribbon group._
+
+### Run
+
+#### Results
+
+_Available from the Modal ▸ Run ribbon group._
+
+#### Run
+
+_Available from the Modal ▸ Run ribbon group._
+
+### Setup
+
+#### Fixture
+
+_Available from the Modal ▸ Setup ribbon group._
+
+#### Material
+
+_Available from the Modal ▸ Setup ribbon group._
+
+### Study
+
+#### New Study
+
+_Available from the Modal ▸ Study ribbon group._
+
+## Motion
+
+### Reference
+
+#### Coord. Sys.
+
+_Available from the Motion ▸ Reference ribbon group._
+
+#### Ref. Axis
+
+_Available from the Motion ▸ Reference ribbon group._
+
+#### Ref. Plane
+
+_Available from the Motion ▸ Reference ribbon group._
+
+#### Ref. Point
+
+_Available from the Motion ▸ Reference ribbon group._
+
+### Run
+
+#### Playback
+
+_Available from the Motion ▸ Run ribbon group._
+
+#### Run
+
+_Available from the Motion ▸ Run ribbon group._
+
+### Setup
+
+#### Driver / Time
+
+_Available from the Motion ▸ Setup ribbon group._
+
+### Study
+
+#### New Study
+
+_Available from the Motion ▸ Study ribbon group._
+
+## PCB Design
 
 ### Board
 
 #### Autoroute
 
-_Available from the PCB ▸ Board ribbon group._
+_Available from the PCB Design ▸ Board ribbon group._
 
 #### Copper Zone
 
-_Available from the PCB ▸ Board ribbon group._
+_Available from the PCB Design ▸ Board ribbon group._
 
 #### Fill Zones
 
-_Available from the PCB ▸ Board ribbon group._
+_Available from the PCB Design ▸ Board ribbon group._
 
 #### Footprint
 
-_Available from the PCB ▸ Board ribbon group._
+_Available from the PCB Design ▸ Board ribbon group._
 
 #### Route
 
-_Available from the PCB ▸ Board ribbon group._
-
-#### Run DRC
-
-_Available from the PCB ▸ Board ribbon group._
+_Available from the PCB Design ▸ Board ribbon group._
 
 #### Update Board
 
-_Available from the PCB ▸ Board ribbon group._
+_Available from the PCB Design ▸ Board ribbon group._
 
 #### Via
 
-_Available from the PCB ▸ Board ribbon group._
+_Available from the PCB Design ▸ Board ribbon group._
+
+### Checks
+
+#### Run DRC
+
+_Available from the PCB Design ▸ Checks ribbon group._
 
 ### New
 
 #### AI Design
 
-_Available from the PCB ▸ New ribbon group._
+_Available from the PCB Design ▸ New ribbon group._
 
 #### Open
 
-_Available from the PCB ▸ New ribbon group._
+_Available from the PCB Design ▸ New ribbon group._
 
 #### PCB Layout
 
-_Available from the PCB ▸ New ribbon group._
+_Available from the PCB Design ▸ New ribbon group._
 
 #### Save
 
-_Available from the PCB ▸ New ribbon group._
-
-#### Schematic
-
-_Available from the PCB ▸ New ribbon group._
+_Available from the PCB Design ▸ New ribbon group._
 
 ### Outputs
 
 #### BOM
 
-_Available from the PCB ▸ Outputs ribbon group._
+_Available from the PCB Design ▸ Outputs ribbon group._
 
 #### Board to 3D
 
-_Available from the PCB ▸ Outputs ribbon group._
+_Available from the PCB Design ▸ Outputs ribbon group._
 
 #### Drill
 
-_Available from the PCB ▸ Outputs ribbon group._
+_Available from the PCB Design ▸ Outputs ribbon group._
 
 #### Gerbers
 
-_Available from the PCB ▸ Outputs ribbon group._
+_Available from the PCB Design ▸ Outputs ribbon group._
+
+## Reverse Eng
+
+### Deliver
+
+#### Add to Parts
+
+_Available from the Reverse Eng ▸ Deliver ribbon group._
+
+#### Export
+
+_Available from the Reverse Eng ▸ Deliver ribbon group._
+
+#### Print Scale Mat
+
+_Available from the Reverse Eng ▸ Deliver ribbon group._
+
+### Model
+
+#### AI Model
+
+_Available from the Reverse Eng ▸ Model ribbon group._
+
+#### Fit Primitives
+
+_Available from the Reverse Eng ▸ Model ribbon group._
+
+#### Mesh Body
+
+_Available from the Reverse Eng ▸ Model ribbon group._
+
+### Reconstruct
+
+#### Reconstruct
+
+_Available from the Reverse Eng ▸ Reconstruct ribbon group._
+
+#### Splat View
+
+_Available from the Reverse Eng ▸ Reconstruct ribbon group._
+
+### Scale
+
+#### ArUco Mat
+
+_Available from the Reverse Eng ▸ Scale ribbon group._
+
+#### Known Dim
+
+_Available from the Reverse Eng ▸ Scale ribbon group._
+
+#### Two Points
+
+_Available from the Reverse Eng ▸ Scale ribbon group._
+
+### Session
+
+#### From Library
+
+_Available from the Reverse Eng ▸ Session ribbon group._
+
+#### New Session
+
+_Available from the Reverse Eng ▸ Session ribbon group._
+
+#### Open Session
+
+_Available from the Reverse Eng ▸ Session ribbon group._
+
+### Sources
+
+#### Add Photos
+
+_Available from the Reverse Eng ▸ Sources ribbon group._
+
+#### Add Video
+
+_Available from the Reverse Eng ▸ Sources ribbon group._
+
+#### Datasheet
+
+_Available from the Reverse Eng ▸ Sources ribbon group._
+
+#### Webcam
+
+_Available from the Reverse Eng ▸ Sources ribbon group._
+
+## Schematic
+
+### Analyze
+
+#### Simulate
+
+_Available from the Schematic ▸ Analyze ribbon group._
+
+### New
+
+#### New Schematic
+
+_Available from the Schematic ▸ New ribbon group._
 
 ### Schematic
 
 #### Annotate
 
-_Available from the PCB ▸ Schematic ribbon group._
+_Available from the Schematic ▸ Schematic ribbon group._
 
 #### Net Label
 
-_Available from the PCB ▸ Schematic ribbon group._
+_Available from the Schematic ▸ Schematic ribbon group._
 
 #### Place Symbol
 
-_Available from the PCB ▸ Schematic ribbon group._
+_Available from the Schematic ▸ Schematic ribbon group._
 
 #### Power Port
 
-_Available from the PCB ▸ Schematic ribbon group._
+_Available from the Schematic ▸ Schematic ribbon group._
 
 #### Run ERC
 
-_Available from the PCB ▸ Schematic ribbon group._
+_Available from the Schematic ▸ Schematic ribbon group._
 
 #### Wire
 
-_Available from the PCB ▸ Schematic ribbon group._
+_Available from the Schematic ▸ Schematic ribbon group._
 
 ## Sheet Metal
 
@@ -645,6 +1023,24 @@ _Available from the Simulation ▸ Materials ribbon group._
 #### Mesh
 
 _Available from the Simulation ▸ Mesh ribbon group._
+
+### Reference
+
+#### Coord. Sys.
+
+_Available from the Simulation ▸ Reference ribbon group._
+
+#### Ref. Axis
+
+_Available from the Simulation ▸ Reference ribbon group._
+
+#### Ref. Plane
+
+_Available from the Simulation ▸ Reference ribbon group._
+
+#### Ref. Point
+
+_Available from the Simulation ▸ Reference ribbon group._
 
 ### Run
 
@@ -708,6 +1104,10 @@ _Available from the Sketch ▸ Draw ribbon group._
 
 _Available from the Sketch ▸ Draw ribbon group._
 
+#### Centerline
+
+_Available from the Sketch ▸ Draw ribbon group._
+
 #### Circle
 
 _Available from the Sketch ▸ Draw ribbon group._
@@ -752,6 +1152,10 @@ _Available from the Sketch ▸ Draw ribbon group._
 
 _Available from the Sketch ▸ Draw ribbon group._
 
+#### Move Ent.
+
+_Available from the Sketch ▸ Draw ribbon group._
+
 #### Octagon
 
 _Available from the Sketch ▸ Draw ribbon group._
@@ -785,6 +1189,10 @@ _Available from the Sketch ▸ Draw ribbon group._
 _Available from the Sketch ▸ Draw ribbon group._
 
 #### Rectangle
+
+_Available from the Sketch ▸ Draw ribbon group._
+
+#### Rotate Ent.
 
 _Available from the Sketch ▸ Draw ribbon group._
 
@@ -840,6 +1248,10 @@ _Available from the Sketch ▸ Relations ribbon group._
 
 _Available from the Sketch ▸ Sketch ribbon group._
 
+#### New 3D Sketch
+
+_Available from the Sketch ▸ Sketch ribbon group._
+
 ### Sketch Tools
 
 #### Circ. Pattern
@@ -885,6 +1297,134 @@ _Available from the Sketch ▸ Sketch Tools ribbon group._
 #### Trim
 
 _Available from the Sketch ▸ Sketch Tools ribbon group._
+
+## Sketch3D
+
+### Draw
+
+#### 3-Pt Arc
+
+_Available from the Sketch3D ▸ Draw ribbon group._
+
+#### Line
+
+_Available from the Sketch3D ▸ Draw ribbon group._
+
+#### Point
+
+_Available from the Sketch3D ▸ Draw ribbon group._
+
+#### Spline
+
+_Available from the Sketch3D ▸ Draw ribbon group._
+
+### Sketch
+
+#### Exit Sketch
+
+_Available from the Sketch3D ▸ Sketch ribbon group._
+
+### Sketch Tools
+
+#### Construction
+
+_Available from the Sketch3D ▸ Sketch Tools ribbon group._
+
+#### Delete
+
+_Available from the Sketch3D ▸ Sketch Tools ribbon group._
+
+#### Fix
+
+_Available from the Sketch3D ▸ Sketch Tools ribbon group._
+
+#### Relations
+
+_Available from the Sketch3D ▸ Sketch Tools ribbon group._
+
+### Working Plane
+
+#### View Plane
+
+_Available from the Sketch3D ▸ Working Plane ribbon group._
+
+#### XY Plane
+
+_Available from the Sketch3D ▸ Working Plane ribbon group._
+
+#### XZ Plane
+
+_Available from the Sketch3D ▸ Working Plane ribbon group._
+
+#### YZ Plane
+
+_Available from the Sketch3D ▸ Working Plane ribbon group._
+
+## Static
+
+### Loads
+
+#### Force
+
+_Available from the Static ▸ Loads ribbon group._
+
+#### Pressure
+
+_Available from the Static ▸ Loads ribbon group._
+
+#### Torque
+
+_Available from the Static ▸ Loads ribbon group._
+
+### Mesh
+
+#### Mesh
+
+_Available from the Static ▸ Mesh ribbon group._
+
+### Reference
+
+#### Coord. Sys.
+
+_Available from the Static ▸ Reference ribbon group._
+
+#### Ref. Axis
+
+_Available from the Static ▸ Reference ribbon group._
+
+#### Ref. Plane
+
+_Available from the Static ▸ Reference ribbon group._
+
+#### Ref. Point
+
+_Available from the Static ▸ Reference ribbon group._
+
+### Run
+
+#### Results
+
+_Available from the Static ▸ Run ribbon group._
+
+#### Run
+
+_Available from the Static ▸ Run ribbon group._
+
+### Setup
+
+#### Fixture
+
+_Available from the Static ▸ Setup ribbon group._
+
+#### Material
+
+_Available from the Static ▸ Setup ribbon group._
+
+### Study
+
+#### New Study
+
+_Available from the Static ▸ Study ribbon group._
 
 ## Surfaces
 
@@ -953,6 +1493,48 @@ _Available from the Surfaces ▸ Edit ribbon group._
 #### Untrim Surf.
 
 _Available from the Surfaces ▸ Edit ribbon group._
+
+## Thermal
+
+### Reference
+
+#### Coord. Sys.
+
+_Available from the Thermal ▸ Reference ribbon group._
+
+#### Ref. Axis
+
+_Available from the Thermal ▸ Reference ribbon group._
+
+#### Ref. Plane
+
+_Available from the Thermal ▸ Reference ribbon group._
+
+#### Ref. Point
+
+_Available from the Thermal ▸ Reference ribbon group._
+
+### Run
+
+#### Results
+
+_Available from the Thermal ▸ Run ribbon group._
+
+#### Run
+
+_Available from the Thermal ▸ Run ribbon group._
+
+### Setup
+
+#### Heat Loads
+
+_Available from the Thermal ▸ Setup ribbon group._
+
+### Study
+
+#### New Study
+
+_Available from the Thermal ▸ Study ribbon group._
 
 ## View Layout
 

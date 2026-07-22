@@ -71,10 +71,11 @@ Three things distinguish the architecture:
   Python engine subsystem-by-subsystem: 24/24 feature parity, 42/42 doc-session parity, FEA
   4/4, SPICE 35/35. Still Python: CFD, ECAD, formats, assemblies, agent/MCP layer.
   Settings → General → Engine shows which is live.
-- **GUI migration (workstream G, nearly done).** The modular `ui/imgui` + `ui/viewport` app
-  (liquid-glass overlay design — full-bleed viewport, transparent floating columns) has
-  absorbed the legacy `host/` GUI wave-by-wave; `host/` is deleted at T-G11 after the final
-  polish tasks land. New UI work goes in `ui/`, never `host/`. Rename compatibility (product is now **Billet**):
+- **Single GUI, two targets.** The production GUI is `host/src/ui/` (liquid-glass overlay
+  design — full-bleed viewport, transparent floating columns), built native for the desktop
+  and compiled to WASM for the web app (`Webservice/`) — one tree, desktop/web parity by
+  construction. (The earlier `ui/imgui` migration, workstream G, was reversed and its shell
+  deleted.) Rename compatibility (product displays as **Chudware**, binary stays `Billet`):
   `BILLET_*` env vars canonical (`AI_CAD_*`/`AICAD_*` still honored), binary `Billet` + `AI-CAD`
   symlink, MCP id `billet` (existing `ai-cad` preserved), existing `AI-CAD` appdata dirs
   keep working.
@@ -172,7 +173,8 @@ cmake --build core/build-occt --config Release
 ctest --test-dir core/build-occt -C Release --output-on-failure
 ```
 Developed against the Python engine as a differential oracle — never weaken an assertion;
-match Python unless Python is provably buggy. See [docs/CPP_MIGRATION.md](docs/CPP_MIGRATION.md).
+match Python unless Python is provably buggy. Cutover state lives in
+[docs/REFACTOR_LOG.md](docs/REFACTOR_LOG.md) and the `T-RF*` board stream.
 
 **Engine dev & tests** (managed venv at `%APPDATA%\AI-CAD\runtime\venv`; suites are plain
 `main()`-runner modules):

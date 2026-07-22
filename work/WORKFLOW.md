@@ -49,14 +49,15 @@ over the stock** — so each CAM icon doubles as a smoke check that the op chain
 produces a valid toolpath. If an op won't produce a renderable toolpath, that is a
 **CAM bug to FILE (issue + backlog task), never an icon to skip or fake.**
 
-## 3c. GUI ownership policy (T-G24, 2026-07-05)
+## 3c. GUI ownership policy (updated 2026-07-22 — T-G11 direction REVERSED)
 
-`ui/imgui/` is the **sole active GUI target**. `host/` is reference-only for T-G23
-(Chrome port) and is deleted by T-G11.
+`host/` is the **sole active GUI target**. The `ui/imgui` + `ui/abstract` (AI-CAD2)
+shell is retired and deleted; the former T-G11 "delete host/" plan was reversed.
 
-- **New GUI work goes in `ui/imgui/` only.** Do not touch `host/` for features or fixes.
-- `host/` is deleted by T-G11 — but only after T-G23 + T-G25 land AND a Windows
-  build is verified. T-G11's `depends_on` reflects this.
+- **New GUI work goes in `host/src/ui/` only.** There is no second GUI tree.
+- The same `host/src/ui` tree compiles to WASM for the web app
+  (`Webservice/README.md`) — a desktop UI change ships to web by construction;
+  never fork a web-only copy of a panel.
 - Scripted shot launches (gate.sh, tools/gui_parity/run_all.py) use `xvfb-run` unless
   `AI_CAD_SHOT_HEADED=1` is set, even when `DISPLAY` is present. Set that env var for
   interactive/walkthrough runs.

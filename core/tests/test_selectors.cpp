@@ -358,11 +358,28 @@ TEST_CASE("A8 coaxial cylinders resolve by selector area (bore vs boss)") {
     REQUIRE(rs.index.has_value());
     CHECK(*rs.index == 1);
 
-    // Two EQUAL-area coaxial cylinders are a genuine tie -> must still dangle (no guess).
+    // Two EQUAL-area coaxial cylinders minted from the SAME recorded snapshot (the
+    // selector's centroid + area byte-match BOTH, since the two are coincident
+    // duplicates): the exact-snapshot fast path (asm-FEA F1) resolves the deterministic
+    // sort winner — for coincident duplicates either face denotes the same set of points
+    // (see the fast-path comment in selectors.cpp), so resolving is correct, not a guess.
     std::vector<TopoInfo> equal = {cyl(0, BORE), cyl(1, BORE)};
     sel["area_or_len"] = BORE;
+    sel["hint_index"] = 0;
     ResolveResult re = resolve(sel, equal, diag);
-    CHECK_FALSE(re.index.has_value());
+    REQUIRE(re.index.has_value());
+    CHECK(*re.index == 0);  // deterministic: lowest hint_index wins the exact tie
+    MESSAGE("A8 coincident duplicates resolved index=" << *re.index);
+
+    // ...but a genuine area tie that is NOT a byte-exact snapshot (here the selector's
+    // centroid matches NEITHER candidate) must still dangle — no guess: the signed-axis
+    // break sees co-directional axes (alignment gap 0) and the coaxial area break sees
+    // equal areas (gap 0), so both tie-breaks correctly refuse to pick.
+    sel["centroid"] = json::array({0.0, 0.0, 0.0});
+    ResolveResult rg = resolve(sel, equal, diag);
+    CHECK_FALSE(rg.index.has_value());
+    REQUIRE(rg.dangling_reason.has_value());
+    MESSAGE("A8 equal-area non-snapshot tie still dangles: " << *rg.dangling_reason);
 }
 
 // B7. describe_faces over a 20x10x6 box (min corner at origin): 6 planar faces,

@@ -70,7 +70,7 @@ Because the closest reference (SolveSpace) is GPLv3, the build tasks that descen
   (e.g. the review papers arXiv:2202.13795, arXiv:1006.1126), and **our own existing 2D solver**.
 - Residuals are re-derived from first principles (the geometry of the constraint), not
   transcribed from GPL code. Cite the math source in code comments.
-- This protocol is inherited by every T-BL51+ build task below.
+- This protocol is inherited by every T-BL56+ build task below.
 
 ---
 
@@ -274,11 +274,11 @@ without a contract"), observes the §1 clean-room protocol, and passes `scripts/
 
 | Phase | Deferred task | Scope | Acceptance |
 |---|---|---|---|
-| **P1** | **T-BL51** | `sketch3d` data model + core solver skeleton: `point3d`/`line3d`, `coincident3d`/`fix3d`/`distance3d`; Newton loop in `core/sketch3d/`, DOF analysis. Schema addition to `doc_schema.md`. Per DECISION-NEEDED-A, may include the Python `sketch3d_solver.py` oracle. | A 3D sketch of points+lines with distance/coincident/fix constraints solves to `full` DOF; ctest parity (vs Python oracle if A1) green; document round-trips save/open. |
-| **P2** | **T-BL52** | Curves + relational constraints: `arc3d`/`spline3d`/`polyline3d`; `parallel3d`/`perpendicular3d`/`angle3d`/`point_on3d`/`on_plane`. Emit `TopoDS_Wire`/edge body from solved entities. | 3D curves solve + emit valid OCCT edges; `on_plane` reproduces a planar constraint result; edge body is selectable. |
-| **P3** | **T-BL53** | Feature integration: 3D-sketch edge body consumed as `sweep` path (verify existing `sel(edge,…)` path); loft guide-curves + 3D section placement. | A 3D sketch path drives a sweep end-to-end via MCP/engine (pipe around a 3D bend); loft with a 3D guide builds; `verify_battery` PASS. |
-| **P4** | **T-BL54** | GUI + GSL: `sketch3d` viewport mode (3D dragging w/ axis/plane locks), toolbar verbs, `describe_sketch3d`. Depends on T-BL48 sketch-entry wiring. | User draws + drags a 3D sketch in-app; drag stays interactive (in-process solve); text-only describe reads it. |
-| **P5** | **T-BL55** | Advanced constraints + robustness: `horizontal3d`/`vertical3d`/`symmetric3d`/`tangent3d`; warm-start/drag hardening; (optional) Ceres fallback eval. | Advanced constraints solve; drag warm-start stable; robustness suite green. |
+| **P1** | **T-BL56** | `sketch3d` data model + core solver skeleton: `point3d`/`line3d`, `coincident3d`/`fix3d`/`distance3d`; Newton loop in `core/sketch3d/`, DOF analysis. Schema addition to `doc_schema.md`. Per DECISION-NEEDED-A, may include the Python `sketch3d_solver.py` oracle. | A 3D sketch of points+lines with distance/coincident/fix constraints solves to `full` DOF; ctest parity (vs Python oracle if A1) green; document round-trips save/open. |
+| **P2** | **T-BL57** | Curves + relational constraints: `arc3d`/`spline3d`/`polyline3d`; `parallel3d`/`perpendicular3d`/`angle3d`/`point_on3d`/`on_plane`. Emit `TopoDS_Wire`/edge body from solved entities. | 3D curves solve + emit valid OCCT edges; `on_plane` reproduces a planar constraint result; edge body is selectable. |
+| **P3** | **T-BL58** | Feature integration: 3D-sketch edge body consumed as `sweep` path (verify existing `sel(edge,…)` path); loft guide-curves + 3D section placement. | A 3D sketch path drives a sweep end-to-end via MCP/engine (pipe around a 3D bend); loft with a 3D guide builds; `verify_battery` PASS. |
+| **P4** | **T-BL59** | GUI + GSL: `sketch3d` viewport mode (3D dragging w/ axis/plane locks), toolbar verbs, `describe_sketch3d`. Depends on T-BL48 sketch-entry wiring. | User draws + drags a 3D sketch in-app; drag stays interactive (in-process solve); text-only describe reads it. |
+| **P5** | **T-BL60** | Advanced constraints + robustness: `horizontal3d`/`vertical3d`/`symmetric3d`/`tangent3d`; warm-start/drag hardening; (optional) Ceres fallback eval. | Advanced constraints solve; drag warm-start stable; robustness suite green. |
 
 P1→P5 are strictly ordered (`depends_on`). All start **deferred: yes** and are unparked only on
 Hunter's greenlight (`work_set`).
@@ -300,10 +300,10 @@ Hunter's greenlight (`work_set`).
 
 ## 7. Follow-on (deferred) tasks cut by this plan
 
-- `work/backlog/T-BL51-sketch3d-core-solver.md` — P1 data model + core solver (deferred)
-- `work/backlog/T-BL52-sketch3d-curves.md` — P2 curves + relational constraints (deferred)
-- `work/backlog/T-BL53-sketch3d-features.md` — P3 feature integration (sweep/loft) (deferred)
-- `work/backlog/T-BL54-sketch3d-gui.md` — P4 GUI + GSL (deferred)
-- `work/backlog/T-BL55-sketch3d-advanced.md` — P5 advanced constraints + robustness (deferred)
+- `work/backlog/T-BL56-sketch3d-core-solver.md` — P1 data model + core solver (deferred)
+- `work/backlog/T-BL57-sketch3d-curves.md` — P2 curves + relational constraints (deferred)
+- `work/backlog/T-BL58-sketch3d-features.md` — P3 feature integration (sweep/loft) (deferred)
+- `work/backlog/T-BL59-sketch3d-gui.md` — P4 GUI + GSL (deferred)
+- `work/backlog/T-BL60-sketch3d-advanced.md` — P5 advanced constraints + robustness (deferred)
 
 All reference this document and stay parked (`deferred: yes`) until Hunter greenlights the build.

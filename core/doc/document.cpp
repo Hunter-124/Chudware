@@ -4022,6 +4022,10 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     const std::string gid = selector_owner_id(gsel);
                     if (gid.empty())
                         throw std::runtime_error("sweep: malformed guide-curve ref");
+                    if (gid == path_id)
+                        throw std::runtime_error(
+                            "sweep: the guide curve must be a different sketch/curve "
+                            "than the path");
                     TopoDS_Wire gw;
                     auto git2 = results.find(gid);
                     if (git2 != results.end() &&

@@ -5184,17 +5184,24 @@ WASM_BOOT_LOG("[wasm-boot] entering main loop\n");
     freeChatTextures(st.chat);  // release iteration thumbnails while the GL context is still live
     ui::freeIcons();            // C14: release atlas textures while GL context is still live
     ui::destroyCursors();       // W1-B: free the GLFW standard cursors
+    if (std::getenv("AI_CAD_DEBUG_SHUTDOWN")) std::fprintf(stderr, "[td] rpc.shutdown\n");
     st.rpc.shutdown();          // C39: drop pending async calls + abort the in-flight one
+    if (std::getenv("AI_CAD_DEBUG_SHUTDOWN")) std::fprintf(stderr, "[td] stopMeshLoader\n");
     st.stopMeshLoader();        // T-PERF3: join mesh thread before static dtors (avoid terminate)
+    if (std::getenv("AI_CAD_DEBUG_SHUTDOWN")) std::fprintf(stderr, "[td] worker.stop\n");
     st.worker.stop();
+    if (std::getenv("AI_CAD_DEBUG_SHUTDOWN")) std::fprintf(stderr, "[td] simClient.stop\n");
     simClient.stop();  // C19: shut down the second worker process
 #ifdef AI_CAD_ENABLE_CEF
+    if (std::getenv("AI_CAD_DEBUG_SHUTDOWN")) std::fprintf(stderr, "[td] cef.shutdown\n");
     ui::cef::shutdown();  // no-op unless CEF was initialised (browsers close in their dtors)
 #endif
+    if (std::getenv("AI_CAD_DEBUG_SHUTDOWN")) std::fprintf(stderr, "[td] imgui/glfw shutdown\n");
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
     glfwDestroyWindow(win);
     glfwTerminate();
+    if (std::getenv("AI_CAD_DEBUG_SHUTDOWN")) std::fprintf(stderr, "[td] done\n");
     return 0;
 }

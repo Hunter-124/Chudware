@@ -5,8 +5,8 @@ Composes ``docs/manual/*.md`` (and, best-effort, a rendered ``user_manual`` PDF/
 ``deliverables.make_report``) from three truth sources already in the repo — never invented
 prose:
 
-- ``scripts/ui_inventory.parse_ribbon_def`` — every ribbon command (id/label/tab/group), so the
-  "Commands Reference" section covers 100% of the UI surface.
+- ``scripts/feature_surface_audit.ribbon_rows`` — every ribbon command (id/label/tab/group),
+  so the "Commands Reference" section covers 100% of the UI surface.
 - ``mcp_server.cad_tools.cad_guide_text`` — the agent's own modeling-guide prose (overview,
   simulation, intake, gsl, cam, narration, deliverables, reverse-engineering) and, per-command,
   its per-feature cheatsheets (``fillet``, ``chamfer``, ``shell``, ...) when one exists for a
@@ -66,8 +66,17 @@ def collect(repo: Path) -> dict:
     repo = Path(repo)
     _ensure_sys_path(repo)
 
-    from scripts.ui_inventory import parse_ribbon_def  # noqa: PLC0415
-    ribbon = parse_ribbon_def(repo)
+    ribbon: list[dict] = []
+    try:
+        # scripts/ui_inventory.py was retired with the ui/imgui shell; the live
+        # ribbon parser is feature_surface_audit.ribbon_rows (cmd → id mapping here).
+        from scripts.feature_surface_audit import ribbon_rows  # noqa: PLC0415
+        ribbon = [
+            {"id": r["cmd"], "label": r["label"], "tab": r["tab"], "group": r["group"]}
+            for r in ribbon_rows()
+        ]
+    except Exception:  # noqa: BLE001 - inventory is best-effort; never raise
+        ribbon = []
 
     try:
         from mcp_server.cad_tools import cad_guide_text  # noqa: PLC0415

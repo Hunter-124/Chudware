@@ -1,35 +1,48 @@
-# services/worker — JSON-RPC seam, libaicad router, document mirror
+# services/worker — C++ engine routing seam (daemon client, libaicad loader, router)
 
-Scope: services/worker/**, contracts/worker_rpc.md
+Scope: services/worker/** (four compiled modules), contracts/worker_rpc.md
 Contracts: contracts/worker_rpc.md (protocol 2, newline-delimited JSON-RPC), contracts/doc_ops.md (ops envelope), contracts/doc_schema.md (aicad.part/1 | aicad.asm/1)
 
+> Purged 2026-07-22 (T-RF2): the stale duplicate modules (async_rpc/doc_mirror/jobs/
+> sim_client/selection/doc_tabs/bootstrap/worker_command_dispatcher + worker_types/
+> doc_session/pick_hit) lived here in NO build and were deleted. The live copies of those
+> are compiled from `host/src/core/`. Only the four modules below remain.
+
 ## Entry points
-- services/worker/worker_command_dispatcher.cpp:L28 `dispatch(cmdId, params)` — stable command router; routes ui::ICommandDispatcher calls to WorkerClient or libaicad
-- services/worker/worker_client.h:L29 `start(module)` and :L36 `call(method, params)` — spawns Python engine.worker subprocess (stdio JSON-RPC) and sends synchronous RPC; blocks until response or timeout (120s default)
-- services/worker/cpp_core.h:L29 `ensureLoaded(err)` and :L38 `call(method, params)` — runtime DLL loader for libaicad (via LoadLibrary/dlopen); resolves aicad_call/aicad_free/aicad_abi_version C ABI exports and returns true iff core handled the method
-- services/worker/worker_router.cpp:L16 `routeMethod(method, docId)` — routing policy: returns CppCore if AI_CAD_CPP_DOCS=1 AND (method=="doc_new" OR docId has "doc-cpp" prefix); else PythonOracle
-- services/worker/doc_mirror.h:L68 `DocMirror` — stateful document model (tree + revision + feature_status); caches last known doc JSON and feeds feature tree UI; notified post-mutation
-- services/worker/bootstrap.cpp:L1 — runtime provisioning (Python venv setup on first app launch)
+- `services/worker/worker_client.{h,cpp}` — THE routing policy. Per-method/per-doc flags:
+  `cppDocsFlag()` (:101, env `AI_CAD_CPP_DOCS`, default 1), `routeDocToCpp()` (:120, doc-id
+  prefixes `doc-cpp`/`dwg-cpp`/`ecadcpp` commit a doc to C++ for its lifetime),
+  `cppAgentFlag()`/`routeAgentToCpp()` (:190/:222), `cppSimFlag()`/`routeSimToCpp()`
+  (:257/:263), `cppEcadFlag()`/`routeEcadToCpp()` (:295/:305), CAM block (:988, C++-only,
+  no Python fallback). Unported methods on a C++ doc fail loud; only minting calls declined
+  with `code:"unsupported"` fall back to the Python oracle subprocess (`python -m engine.worker`).
+- `services/worker/engine_backend.{h,cpp}` — daemon seam above cpp_core. `AI_CAD_ENGINE_DAEMON`
+  (default 1) routes via `EngineClient` over the aicad-hostd unix socket (`core/hostd/`,
+  multi-client, push events, edit holds); `=0` = legacy in-proc dlopen; daemon failure falls
+  back to in-proc. The WASM web client reaches the same daemon via gateway WS `/engine`.
+- `services/worker/cpp_core.{h,cpp}` — runtime dlopen of libaicad. Resolve order:
+  `$BILLET_LIBAICAD`/`$AI_CAD_LIBAICAD` → compile-time `AICAD_DEFAULT_LIBAICAD` → exe-adjacent
+  → loader path. Flat C ABI: `aicad_call` (JSON in/out), `aicad_free`,
+  `aicad_set_event_sink`, `aicad_abi_version`, `aicad_build_id`; nonzero return = unknown
+  method → Python fallback. Method table lives in `core/api/libaicad.cpp` (~248 branches).
+- `services/worker/worker_router.{h,cpp}` — thin policy mirror (`routeMethod`, `isCppDocId`).
+
+## Current backend split (2026-07)
+- **C++ by default**: docs (`doc_*`, `config_*`, `export_*`, `weld_*`, `eval_*`), agent v2
+  (`agent_run_v2`/`agent_ask_v2`/`agent_clarify_v1`/`agent_pm_assist_v1`/`agent_mission_v1`/
+  cancel/steer/`get_prompts_v2`), FEA (`sim_mesh`, `sim_run_static/modal/fatigue/thermal`),
+  CAM (`cam_*`), parts catalog, ECAD (Linux/macOS; Windows default off).
+- **Python only** (until the T-RF15+ zero-Python stream lands): CFD (`sim_run_flow`,
+  `sim_cancel`), firmware (`fw_*`), ECAD gaps (autoroute doc-id form/`to_3d`/`fill_zones`/
+  `simulate`/`design`/kicad-import), BOM/sourcing/parts-hub, hydraulic/piping/intake/vision/
+  research/render/structural/tolerance/vendor_parts, legacy `agent_design`.
+- Escape hatches: `AI_CAD_CPP_DOCS=0`, `AI_CAD_CPP_AGENT=0`, `AI_CAD_CPP_SIM=0`,
+  `AI_CAD_CPP_ECAD=0` (all removed at T-RF21 closeout).
 
 ## How it connects
-This is the production strangler seam: every UI doc command (doc_new/doc_apply_ops/doc_undo/doc_redo/etc) flows through WorkerCommandDispatcher → WorkerClient → worker_router → either CppCore (libaicad.dll/.so) or Python engine_oracle over stdio JSON-RPC. CppCore lazily loads the native core (separate binary; zero dependency on OCCT/Python in host), dispatches via flat C ABI, and silently falls back to Python if the method is unhandled or the DLL is absent. Per README: **24/24 geometric-feature parity, 42/42 stateful doc-session parity, FEA static/modal 4/4, SPICE 35/35+10/10**. Still Python-only: CFD, ECAD, formats, assemblies, agent/MCP layer. Settings → General → Engine surfaces the live backend.
-
-## Debugging playbook
-- Build libaicad: `cmake -S core -B core/build-linux -DAICAD_WITH_OCCT=ON && cmake --build core/build-linux --config Release` (produces libaicad.so)
-- Test core: `ctest --test-dir core/build-linux -R "test_doc|test_sketch" --output-on-failure` (constraint solver, geometry, session tests)
-- Test Python worker: `python3 -m engine.doc.test_session` or `python3 -m engine.run_model mounting_plate`
-- Gotcha: AI_CAD_CPP_DOCS env flag MUST be set to "1" (or any non-empty non-"0" value) to route to C++; default routes all to Python oracle
-- Gotcha: libaicad.dll/.so must be in exe dir, AI_CAD_LIBAICAD env var, or system loader path; CppCore::ensureLoaded caches the load result, so first call failure silently disables C++ routing for the process lifetime (fallback to Python)
-- Gotcha: Windows DLL transitive-dep resolution requires SetDllDirectoryW (cpp_core.cpp:L129); LOAD_WITH_ALTERED_SEARCH_PATH alone doesn't cover OCCT TK*.dll or gmsh siblings
-
-## Graphify starters
-- graphify query "WorkerClient call routing libaicad engine_oracle"
-- graphify explain "routeMethod"
-- graphify path "worker_command_dispatcher.cpp" "cpp_core.cpp"
-
-## Related tasks/docs
-- contracts/worker_rpc.md (protocol 2 handshake, doc_* method table, ops-response shape + owner_map)
-- docs/CPP_MIGRATION.md (strangler cutover design, ABI versioning)
-- docs/REFACTOR_LOG.md (C++ parity roadmap: what's landed vs pending)
-- AGENTS.md §N6b (engine_oracle lifecycle: "frozen while core/ catches up... deleted LAST")
-- work/tasks: grep `worker|routing|cpp_docs|libaicad` (integration tasks T-C*, T-G*, T-S* track cutover)
+GUI (host/src/core/{doc_mirror,async_rpc,jobs,...}) → `worker_client.call(method, params)` →
+routing policy → `engine_backend` (hostd daemon → libaicad) or Python oracle stdio JSON-RPC.
+Ops responses (`{revision, tree, feature_status, owner_map, tess.aicm_path}`) update the
+DocMirror on the GL thread; the AICM mesh is parsed from the path by
+`host/src/render/aicm_loader.cpp` (a duplicate of the kept `ui/viewport/render/aicm_loader.cpp`
+compiled into core tests/tools — merging them is deferred).

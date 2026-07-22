@@ -47,12 +47,12 @@ result against the request and iterate.
 
 ## Components
 
-> **2026-06 refactor:** the codebase is reorganizing into layered modules — see
-> [AGENTS.md](AGENTS.md), [docs/PYTHON_CUTOVER_STATUS.md](docs/PYTHON_CUTOVER_STATUS.md),
+> **2026-07 refactor:** the codebase is consolidating under the T-RF DAG — see
+> [AGENTS.md](AGENTS.md), [docs/plans/2026-07-22-consolidation-refactor-dag.md](docs/plans/2026-07-22-consolidation-refactor-dag.md),
 > and [docs/REFACTOR_LOG.md](docs/REFACTOR_LOG.md). Frozen contracts live in
-> [`contracts/`](contracts/). The new GUI is [`ui/imgui/`](ui/imgui/) over the
-> framework-agnostic seam [`ui/abstract/`](ui/abstract/). The legacy host is
-> deprecated ([`host/DEPRECATED.md`](host/DEPRECATED.md)).
+> [`contracts/`](contracts/). The production GUI is [`host/`](host/) (native +
+> WASM for web; see [`Webservice/README.md`](Webservice/README.md)) — the
+> `ui/imgui`/`ui/abstract` shell was retired and deleted.
 
 ### 1. Python CAD kernel (`engine_oracle/`, symlink `engine/`) — parity oracle, deleted last
 The brain of the modeling. Pure Python, runs inside the managed runtime.
@@ -82,10 +82,13 @@ Provider-adapter layer (`providers/`: anthropic, openai, openai-compatible/local
 "any API provider" works; default Anthropic (vision + codegen). Keys stored in
 `%APPDATA%\AI-CAD\config.json`.
 
-### 4. Native host (`host/`) — **deprecated**; production GUI migrating to `ui/imgui/`
+### 4. Native host (`host/`) — the production GUI (native + WASM)
 GLFW window, Dear ImGui docking UI (chat, viewport, code, log, settings), OpenGL mesh
-renderer with orbit camera, framebuffer capture → PNG. Spawns + supervises the Python
-worker. Hosts the MCP server. Embeds the runtime payload and runs first-launch bootstrap.
+renderer with orbit camera, framebuffer capture → PNG. Talks to the shared
+`aicad-hostd` daemon (dlopens `libaicad`); falls back to the Python worker for
+not-yet-ported methods. The same `host/src/ui` tree compiles to WASM under
+Emscripten for the web app (`Webservice/`), so desktop and web stay in parity by
+construction. Hosts the MCP server. Embeds the runtime payload and runs first-launch bootstrap.
 
 ### 5. Installer / bootstrap (`services/installer/`, symlink `installer/`, `scripts/`)
 Embed-and-extract of the runtime payload; version-stamped provisioning into

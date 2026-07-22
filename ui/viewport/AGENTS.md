@@ -1,16 +1,24 @@
-# ui/viewport — shared OpenGL viewport pipeline
+# ui/viewport — AICM loader only (R0b remnant)
 
-**Owner:** P2 node N2c, then P3. Framework-shared (not ImGui-specific).
+This directory was the planned "shared OpenGL viewport pipeline". That
+consolidation never happened: the host builds its own renderer/mesh/camera/
+id-pass/overlays under `host/src/` + `host/src/render/`, and the copies here
+were orphaned (in no build). R0b deleted them.
 
-Reused OpenGL renderer from `host/src/render/*` and viewport GL parts from
-`host/src/ui/viewport_panel.cpp` / `host/src/ui/camera_anim.*`. Implements
-`ui/abstract/viewport.h` (`IViewport`).
+## What remains and why
 
-## Write-set rules
-- Owns: `renderer.*`, `mesh.*`, `render/*`, `camera_anim.*`, FBO compositing.
-- Must NOT depend on ImGui (only on abstract viewport interface + GL).
-- Preserves id-pass picking, AICM mesh format, overlay VBO batching.
+- `render/aicm_loader.{h,cpp}` — AICM v1 mesh-format reader (contract:
+  `docs/contracts/mesh_format.md`). Pure CPU, no GL. Kept because
+  `core/CMakeLists.txt` compiles it into the libaicad test/tool targets
+  (include dir `ui/viewport/render`). Depends only on
+  `core/util/aicm_handoff.h`.
 
-## Migration source (host/ → here, N2c)
-- `host/src/renderer.h`, `host/src/render/*`
-- `host/src/ui/camera_anim.*`
+## Gotchas
+
+- `host/src/render/aicm_loader.{h,cpp}` is a duplicate of the same loader,
+  compiled into the host GUI. The two are deliberately NOT merged in R0b;
+  dedup is future work (care: core must stay GUI-free).
+- `CMakeLists.txt` here is orphaned (no parent `add_subdirectory`) and still
+  references the deleted renderer/mesh/camera/id_pass/overlays sources and
+  the retired `ui/abstract` tree — integrator owns its removal; do not try
+  to configure it standalone.

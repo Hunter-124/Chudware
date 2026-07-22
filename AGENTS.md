@@ -22,10 +22,12 @@ Architecture in one paragraph: the pure C++/CUDA kernel `libaicad` (under
 `core/`) is strangling out the legacy Python engine (`engine_oracle/`, with the
 root `engine` symlink preserving imports). The two are kept in lockstep by a
 per-subsystem parity corpus until each Python module is flipped off and
-deleted. The C++ host under `host/` is the **sole GUI target** (~52k LOC under
-`host/src/ui/`); it talks to the Python engine worker over JSON-RPC on
-stdio/local socket during the migration, and links `libaicad` increasingly
-in-process. The shared OpenGL render pipeline lives in `ui/viewport/`.
+deleted. The C++ host under `host/` is the **sole GUI target** (~110k LOC under
+`host/src/ui/`); it talks to the shared `aicad-hostd` daemon (which dlopens
+`libaicad`) over a unix socket, with the Python engine worker as fallback for
+not-yet-ported methods. The same `host/src/ui` tree compiles to WASM for the
+web app (`Webservice/README.md`), so desktop and web stay at parity by
+construction. The host builds its own OpenGL pipeline under `host/src/render/`.
 
 Canonical references:
 - `ARCHITECTURE.md` — system architecture and locked decisions.
@@ -34,9 +36,11 @@ Canonical references:
 - `docs/PLAN.md` — design + milestones. `docs/REFACTOR_LOG.md` — refactor
   handoff log (each DAG node appends a paragraph: files touched, deferred,
   gotchas).
-- The active modular-refactor plan (source of truth for the target layered
-  layout and per-phase DAG):
-  `/home/hunter/.cursor/plans/cad_modular_refactor_+_gui_abstraction_6371dd9f.plan.md`
+- The active refactor plan (source of truth for the current consolidation
+  effort — hygiene → agent harness → UI/UX → perf → zero-Python cutover):
+  `docs/plans/2026-07-22-consolidation-refactor-dag.md`, tracked on the board
+  as workstream `T-RF*`. (The older cursor-plan file was superseded
+  2026-07-22 — see `docs/REFACTOR_LOG.md`.)
 
 ## Agent workflow on this repo (read before starting any task)
 
@@ -65,10 +69,10 @@ Canonical references:
 | Dir | Purpose |
 |-----|---------|
 | `core/` | Pure C++/CUDA kernel → `libaicad`: geom/doc/sketch/solver/cam/sim/ecad/mate/parts/agent/util/api/tests. The zero-Python engine target. |
-| `host/` | **The single GUI target.** Production C++ desktop host (~52k LOC under `host/src/ui/`), cross-platform (Linux GCC/Clang + Windows MSVC). Binary: `host/build-linux/bin/Billet` (`AI-CAD` compat symlink). |
+| `host/` | **The single GUI target.** Production C++ desktop host (~110k LOC under `host/src/ui/`), cross-platform (Linux GCC/Clang + Windows MSVC); the same tree compiles to WASM for the web app. Binary: `host/build-linux/bin/Billet` (`AI-CAD` compat symlink). Own GL pipeline under `host/src/render/`. |
 | `engine_oracle/` | Frozen legacy Python engine, kept as differential parity oracle while `core/` catches up. Deleted LAST (node N6b). Root `engine` symlink preserves `python -m engine.*` imports. |
-| `services/` | Python services: `agent/` (built-in agent loop; root `agent` symlink), `mcp/` (MCP server for external agents; root `mcp_server` symlink), `worker/` (engine routing seam: WorkerClient/DocMirror/bootstrap), `installer/` (provisioning, MCP registration, packaging), plus `dag/`, `deliverables/`, `plm/`, `browser/`, `ipc/`, `serving/`, `verify/`, `dist/`. |
-| `ui/viewport/` | Shared OpenGL viewport pipeline: renderer/mesh/camera + render (AICM loader, id-pass picking, overlays), consumed by `host/`. **Only `ui/viewport` exists** — `ui/imgui`/`ui/abstract` (the AI-CAD2 shell) are retired and gone. |
+| `services/` | Python services: `agent/` (built-in agent loop; root `agent` symlink), `mcp/` (MCP server for external agents; root `mcp_server` symlink), `worker/` (C++ engine routing seam, four modules: worker_client / engine_backend / cpp_core / worker_router), `installer/` (provisioning, MCP registration, packaging), plus `dag/`, `deliverables/`, `plm/`, `browser/`, `ipc/`, `serving/` (LoRA adapter routing — not the webservice; the webservice is top-level `Webservice/`), `verify/`, `dist/`. |
+| `ui/viewport/` | AICM mesh-format loader (`render/aicm_loader.*`) consumed by `core/` (libaicad tests/tools). The rest of the former "shared renderer" extraction was orphaned (host builds its own pipeline in `host/src/render/`) and was purged in T-RF2. `ui/imgui`/`ui/abstract` (the AI-CAD2 shell) are retired and gone. |
 | `platform/` | Cross-OS shims (dialogs, DPI, paths, resources, window) with `_linux`/`_win32` implementations. |
 | `contracts/` | Frozen interface contracts — THE seams. Append-only, integrator-owned. |
 | `corpora/` | Consolidated test fixtures (`sketch/`, `render/`, `sw_parity/`, `sw_fixtures/`). Root `corpus*` symlinks preserve legacy paths. |
@@ -101,17 +105,20 @@ Canonical references:
 The Linux gate is **`bash scripts/gate.sh`** — every DAG node must leave it
 green. It runs, in order:
 
-1. `python3 scripts/check.py` — stdlib-only fast gate (always runs):
-   `gui_lint` (icons exist in the atlas; no HiDPI-collapse theme bug),
+1. `python3 scripts/check.py` — stdlib-only fast gate (always runs, FATAL on red
+   since T-RF3): `gui_lint` (icons exist in the atlas; no HiDPI-collapse theme bug),
    `feature_surface_audit` (every ribbon command routes to a real handler),
    `parity_audit` (SW_PARITY_SPEC claims resolve to real code).
-   Currently RECORDED non-fatal (pre-existing red); `CHECK_PY_FATAL=1` flips it
-   back to hard-gating once the gaps are fixed.
 2. Core CMake/Ninja build — `libaicad` with `-DAICAD_WITH_OCCT=ON` (Linux
    `linux-core` preset). SKIPPED with a clear reason if system OCCT is absent —
    a SKIP is **not** a failure.
-3. `ctest` on the core build (best-effort).
-4. Host GUI build: `cmake -S host -B host/build-linux -G Ninja` + `ninja Billet`.
+3. Host GUI build: `cmake -S host -B host/build-linux -G Ninja` + `ninja Billet`;
+   then a WASM build smoke (`./build.sh wasm` into a scratch dir — FATAL when
+   emsdk is provisioned and the web build breaks).
+4. `ctest` on the core build, plus the `aicad-hostd` lifecycle smoke, plus the
+   **web parity probe** (`scripts/web_parity_probe.py` enforcing
+   `contracts/web_parity.md` over a scratch hostd with the Python worker bridge
+   disabled — what the WASM client faces).
 5. Engine + agent pytest suites: `<venv>/python -X utf8 -m pytest engine/doc agent -q`.
    SKIPPED if the runtime venv/pytest is not provisioned on the box — again a
    SKIP, not a failure.

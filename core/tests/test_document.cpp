@@ -2739,7 +2739,12 @@ TEST_CASE("eval_mass counts disconnected sub-solids in a fused compound (not 1)"
     // The compile pipeline still tracks the fused compound as ONE surviving body — that
     // is the (unchanged) behavior the picking/owner-map relies on.
     CHECK(resp["tess"]["bodies"].size() == 1);
-    CHECK(resp.value("volume", 0.0) == doctest::Approx(2.0 * PI * 10.0 * 10.0 * 30.0).epsilon(1e-3));
+    // The compile `volume` stat is mesh-based (BRepGProp UseTriangulation over the just-
+    // tessellated body — a documented display/stats approximation, see compile_document),
+    // so assert it with the same 2% tolerance the other compile-stat volume checks in this
+    // file use. The EXACT analytic volume contract is doc_eval_mass below (exact
+    // VolumeProperties), still checked at 1e-3.
+    CHECK(resp.value("volume", 0.0) == doctest::Approx(2.0 * PI * 10.0 * 10.0 * 30.0).epsilon(0.02));
 
     // ...but eval_mass now sees the two PHYSICAL bodies.
     json m = doc_eval_mass(id, 0, 7.85);

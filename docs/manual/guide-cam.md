@@ -25,6 +25,7 @@ TYPICAL LOOP
   7. cam_simulate()    material-removal sim: removed/remaining volume, gouge + rapid-collision
                        checks, estimated cycle time.
   8. cam_post("fanuc") emit the NC program; cam_setup_sheet() for the operator sheet.
+  9. Audit: cam_audit — modal parse, envelope, feeds, tool and round-trip checks; ship only ok:true.
 
 FEEDS & SPEEDS ADVISOR (T-W6 — table-driven, aicad.calc/1 contract)
   Before cam_add_operation, call feeds_speeds() to get a recommended envelope:

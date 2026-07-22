@@ -29,6 +29,14 @@ On a complex/imported part, do NOT page through query_geometry's whole face list
                          face the camera (by sid/surf/side/dims) plus the part bbox — computed
                          from B-rep normals with NO occlusion modeling (says so inline). This is
                          the non-vision self-review step; do it instead of skipping the review.
+  inspect_part(target)   CLOSE-UP of a face/edge/feature (plain-word query or feature id fN):
+                         face-normal camera + projected-bbox crop; emphasize=True for high-
+                         contrast target + desaturated context (palette in caption).
+  inspect_feature(target) ONE-CALL: framed EMPHASIS render + describe_part excerpt + dims +
+                         auto-section when the target is internal. Prefer after mutations.
+  render_views(views?)   6-ortho+iso labelled contact sheet (or a custom view list); optional
+                         target= frames every tile to a feature AABB.
+  look_around(target)    N orbit close-ups of the same target tiled as a contact sheet.
   hover(sid)             expand ONE face/edge by the sid describe_part / query_geometry gave —
                          its full card (surf, side, signed normal, concavity bore/boss, radius).
   query_adjacency()      the face-adjacency graph: which faces touch, and whether each shared

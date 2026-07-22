@@ -1,5 +1,10 @@
 # GUI parity gaps — host/ fixes not yet in ui/imgui
 
+> **SUPERSEDED (2026-07-22):** the `ui/imgui` shell this audit targeted was retired and
+> deleted; `host/` is the keeper GUI, so the "trapped fix" premise is inverted — fixes in
+> `host/` ARE in the shipping app. Kept for history; the two open interactive items below
+> (T-BL37 etc.) remain valid as `host/` feature tasks and are tracked on the board.
+
 Findings from a trapped-fix audit (legacy `host/` vs the keeper `ui/imgui/`) run during GUI
 unification (2026-07-06). Fixes that landed only in `host/` never reach the shipping Linux app.
 

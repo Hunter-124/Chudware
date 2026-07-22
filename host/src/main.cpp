@@ -482,7 +482,15 @@ int main(int argc, char** argv) {
         // `shot` is still enabled and the capture-then-exit path runs (otherwise we'd fall
         // through to interactive GUI mode and hang headlessly, never writing a PNG).
         static std::string defShot = exeDir() + "/ui_screenshot.png";
-        return run_gui(argc >= 3 ? argv[2] : defShot.c_str());
+        const int rc = run_gui(argc >= 3 ? argv[2] : defShot.c_str());
+        // Chromium threads outlive CefShutdown() on this build and hang static/AtExit
+        // destruction AFTER run_gui's teardown already completed (chat persisted, workers
+        // stopped, shot written) — the gate's shot smoke then never exits. Exit directly,
+        // skipping static dtors; the interactive exit path keeps the normal return (the
+        // underlying CEF exit hang is tracked as T-RF23).
+        std::fflush(stdout);
+        std::fflush(stderr);
+        std::_Exit(rc);
     }
     // "Open with" / file association (task 05): a bare path argument — the verb the OS invokes when
     // a user double-clicks a .step+ (or any registered CAD/ECAD file) — launches the GUI and opens

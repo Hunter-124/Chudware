@@ -23,6 +23,7 @@ HANDLER_FILES = [
     REPO / "host" / "src" / "app.cpp",
     REPO / "host" / "src" / "ui" / "pm_forms.cpp",
     REPO / "host" / "src" / "ui" / "sketch_mode.cpp",
+    REPO / "host" / "src" / "ui" / "sketch3d_mode.cpp",  # sk3d_* + sketch3d_new/exit commands
     REPO / "host" / "src" / "ui" / "asm_panels.cpp",
     REPO / "host" / "src" / "ui" / "evaluate_dialogs.cpp",
     REPO / "host" / "src" / "ui" / "sim_panel.cpp",
@@ -46,7 +47,9 @@ STRCMP_RE = re.compile(r'std::strcmp\(\s*cmd_id\s*,\s*"([^"]+)"\s*\)')
 #         so the regex harvest misses them; the prefix rule is correct here.
 # dwg_  : drawingHandleCmd() in host/src/ui/drawing_panel.cpp owns the full dwg_ prefix.
 #         All dwg_* ribbon commands are handled by explicit if-chains in that function.
-PREFIX_DISPATCH = ("ecad_", "sch_", "pcb_", "sim_", "eval_", "asm_", "cam_", "dwg_")
+# reveng_ : reveng_workspace.cpp's command handler owns the full reveng_ prefix
+#         (compares against a `c` variable, which the cmdId/cmd regex does not harvest).
+PREFIX_DISPATCH = ("ecad_", "sch_", "pcb_", "sim_", "eval_", "asm_", "cam_", "dwg_", "reveng_")
 
 
 def read(path: Path) -> str:

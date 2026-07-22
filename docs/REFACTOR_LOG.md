@@ -2058,3 +2058,154 @@ discloses on `workerListing || diskProbe`. **Verify:** host ninja green;
 headless shots at 2400x900 — with a seeded project the Firmware chip renders at
 startup (on a box with NO Python worker), with no projects the chip is absent
 (disclosure still conditional, not always-on).
+
+**R0b — dead-code purge (services/worker + ui/viewport).** Deleted 33 files
+in no build and referenced by nothing live. In `services/worker/`: the stale
+duplicate cluster whose canonical copies live in `host/src/core/*` /
+`host/src/bootstrap.cpp` — `async_rpc.*`, `doc_mirror.*`, `jobs.*`,
+`sim_client.*`, `selection.*`, `doc_tabs.*`, `bootstrap.*`,
+`worker_command_dispatcher.*` (known-broken: included `command_dispatcher.h`/
+`variant.h` from the retired `ui/abstract` tree) — plus the cluster-internal
+`doc_session.h`, `pick_hit.h`, `worker_types.*` (included only by the dead
+files). Kept: the four compiled modules `worker_client.*`, `engine_backend.*`,
+`cpp_core.*`, `worker_router.*` (host builds all four; core builds
+`cpp_core.cpp`). `worker_client.cpp` still says `#include "bootstrap.h"` —
+it now resolves to `host/src/bootstrap.h` via include-path order (host/src
+precedes services/worker); only `runtimePython()` is used, defined by
+`host/src/bootstrap.cpp` (native) and `host/src/wasm_stubs.cpp` (wasm). Note:
+the deleted services/worker bootstrap had diverged (exported `appdataRoot()`,
+different AI-CAD/Billet dir-alias rule) — proof the copies had drifted.
+In `ui/viewport/`: deleted the orphaned shared-GL pipeline (`renderer.*`,
+`mesh.*`, `camera_anim.*`, `viewport_impl.*`, `vec_math.h`,
+`render/id_pass.*`, `render/overlays.*`) — no parent `add_subdirectory`
+exists and the host builds its own copies from `host/src` + `host/src/render`.
+Kept `render/aicm_loader.{h,cpp}`: `core/CMakeLists.txt` compiles it into ~13
+libaicad test/tool targets (depends only on `core/util/aicm_handoff.h`).
+**Gotchas for the integrator:** (1) `ui/viewport/CMakeLists.txt` is orphaned
+and references the deleted sources + the retired `ui/abstract` include dir —
+its removal is a CMake edit, deferred to the integrator. (2)
+`host/src/render/aicm_loader.*` duplicates the kept ui/viewport loader —
+deliberately not merged here. (3) `work/context/worker-bridge.md` and
+`work/context/gui-imgui.md` describe deleted files and need a context-pack
+refresh (outside R0b write-set). (4) `docs/PACKAGING_WINDOWS.md` and
+`scratch/worker_client_agent_repro.cpp` mention the deleted
+`services/worker/bootstrap.cpp` (stale, non-blocking). **Verify:** host
+reconfigure + `ninja Billet` green (374 steps, links); `cmake --build
+core/build-linux` green (105 steps); repo grep shows zero live build/code
+references to any deleted basename. AGENTS.md updated in both purged dirs +
+`services/worker/README.md`.
+
+
+---
+
+## 2026-07-22 — T-RF consolidation DAG kickoff (integrator) + node R0a docs/board reconciliation
+
+**Kickoff.** New monolithic refactor DAG approved by Hunter and filed as workstream
+`T-RF1`–`T-RF22` on the board; full plan at
+`docs/plans/2026-07-22-consolidation-refactor-dag.md`. Locked decisions: keep the
+single-source UI compiled twice (native + WASM on the shared aicad-hostd daemon) — NO
+view-model/UI-framework abstraction (the ui/abstract effort was built once and deleted);
+keep CLI-subscription providers but port token auth into `core/agent` (C++); full
+zero-Python push (engine_oracle deleted at closeout); wave order hygiene → agent harness →
+UI/UX → perf, with the zero-Python cutover as a parallel stream. This **supersedes** the
+old cursor plan (`~/.cursor/plans/cad_modular_refactor_+_gui_abstraction_….plan.md`) whose
+nodes were marked completed but partially reversed (host/ survived; ui/imgui+ui/abstract
+are gone). Pre-flight: the dirty 53-file WIP sweep (copilot polish, firmware workspace,
+sub-auth tests, Chudware rebrand) was committed+push as `61cb0a6b` so the swarm starts clean.
+
+**R0a (this entry).** Fixed the doc drift: top `AGENTS.md` (52k→110k LOC for host/src/ui,
+real daemon/WASM architecture paragraph, repo-map rows for host/services/ui-viewport, plan
+pointer now the T-RF DAG), `work/WORKFLOW.md` §3c (host/ is the sole GUI — the old
+"ui/imgui sole target, host/ deleted by T-G11" policy was reversed), `ARCHITECTURE.md`
+(components note + host section; removed references to non-existent
+`docs/PYTHON_CUTOVER_STATUS.md` and `host/DEPRECATED.md`), `README.md` (single-GUI two
+targets block; dead `docs/CPP_MIGRATION.md` link), bannered `docs/gui_parity_gaps.md` as
+superseded (premise inverted: host/ IS the keeper), fixed `docs/PACKAGING_WINDOWS.md`
+bootstrap path. Board: closed `T-G11` as REVERSED with a note (its Windows-verify remnant
+lives in T-WIN1/2), annotated `T-G12` (walkthrough loop continues against host/, latest
+round = 2026-07-16 gui-session, executes as T-RF10), and renumbered the colliding deferred
+sketch3d series `T-BL51..T-BL55` → `T-BL56..T-BL60` (live tasks held those ids; second such
+collision — ids are global across tasks+backlog). Context packs: rewrote
+`work/context/worker-bridge.md` to the post-purge four-module reality;
+`work/context/gui-imgui.md` already carries a STALE banner + live host/ entry points.
+R0b's leftover `ui/viewport/CMakeLists.txt` (orphaned, referenced deleted sources) removed
+by integrator. **Deferred:** merging the two AICM loaders (`host/src/render/` vs
+`ui/viewport/render/`); `docs/GUI_MIGRATION_DAG.md`/`GLASS_DESIGN_SPEC.md` remain
+historical. **Verify:** `work.py validate` + `work.py dag` regenerate clean; full gate at
+wave close.
+
+**T-RF gate reds (document/selectors ctest) — 2 stale tests + 1 trivial regression, all fixed
+in place.** `document` had two reds: (1) "sweep rejects a guide curve identical to the path"
+asserted an error naming the guide — the `gid == path_id` validation guard (added with the
+test in 44306bbe) was silently dropped by the unrelated grab-bag commit 78c3ba87, so the
+degenerate guide==spine sweep fell through to OCCT and failed with the misleading generic
+"sweep produced an empty solid (check the profile sits on/near the path start…)" — a real
+(diagnostic-quality) regression; minimal fix: restored the 4-line guard verbatim in
+`core/doc/document.cpp` (sweep guide-ref block, ~:4023). (2) "eval_mass counts disconnected
+sub-solids…" asserted `doc_apply_ops`' compile `volume` stat at 1e-3 — stale since 7dea7597
+intentionally made that stat mesh-based (`UseTriangulation`, documented "display/stats
+only"; observed mesh error 0.166%); test now asserts the compile stat at the file's existing
+2% compile-stat tolerance while `doc_eval_mass` (exact VolumeProperties) keeps its 1e-3 exact
+contract. `selectors` A8's "equal-area coaxial cylinders must dangle" case went stale when
+58e88dcd added the exact-snapshot fast path (asm-FEA F1): a selector byte-matching a
+candidate's centroid+area resolves the deterministic sort winner even inside the ambiguity
+band (documented: coincident duplicates denote the same point set). The case now pins the
+new behavior (byte-identical duplicates resolve to hint_index 0) AND preserves the original
+no-guess contract with a non-snapshot equal-area tie that still dangles via the margin rule
+(axis/area tie-breaks both refuse, gap 0). Files: `core/doc/document.cpp`,
+`core/tests/test_document.cpp`, `core/tests/test_selectors.cpp`. **Verify:** full core ctest
+65/65 green (`ctest --test-dir core/build-linux -C Release`), no rebuild regressions.
+
+---
+
+## 2026-07-22 — node R0c: gate hardening (WASM smoke + web parity probe + check.py fatal)
+
+**R0c (T-RF3).** `scripts/gate.sh` grew two stages and a policy flip. (1) **WASM build
+smoke**: runs `./build.sh wasm` with `BILLET_WEB_APP=$GATE_TMP/wasm-app` (never clobbers
+the live `~/billet-web/app`); SKIP when emsdk is absent, FATAL when provisioned and the
+web build breaks — a native-only break of the WASM build is a web-parity regression.
+(2) **Web parity probe** (`scripts/web_parity_probe.py`, new): parses the
+```web-parity block in `contracts/web_parity.md` (new, aicad.webparity/1), spawns a
+scratch aicad-hostd **with the Python worker bridge disabled** (`AI_CAD_PYTHON=/nonexistent`
+— exactly what the WASM client faces), and asserts `web_required` methods are
+libaicad-served while `web_unsupported` methods fail loud; an inventoried gap that starts
+succeeding fails the probe until the inventory is shrunk (Z-stream nodes do this as they
+land). (3) **check.py is FATAL again** (`CHECK_PY_FATAL=1`): the last red was
+`feature_surface_audit`, which simply didn't know `host/src/ui/sketch3d_mode.cpp`
+(sk3d_*/sketch3d_* handlers) or the `reveng_` prefix dispatcher in
+`reveng/reveng_workspace.cpp` — both taught to `scripts/feature_surface_audit.py`;
+check.py now reports all 4 gates PASS. **Discoveries the probe surfaced** (inventory
+seeded from reality, not docs): `sim_run_flow` (LBM), `ecad_fill_zones`, `ecad_simulate`
+are ALREADY libaicad-dispatched (T-RF16/T-RF17 scopes shrink — board updated);
+`agent_design`, `fw_*`, `ecad_design`, `ecad_import_kicad`, `bom_*`, `spec_sheet_match`,
+hydraulic/piping/structural/tolerance/render/intake are confirmed python-only web holes.
+hostd's Python fallback is `core/hostd/worker_bridge.cpp` (lazy `-m engine.worker` spawn,
+honors `AI_CAD_PYTHON`). **Deferred:** none. **Gotchas:** probe classification keys on
+error KIND (unknown-method / worker-bridge class), never on side effects — methods are
+called with `{}` against a scratch daemon. **Verify:** probe green standalone (13
+required + 14 unsupported); WASM smoke green (~4 min incremental); ctest 65/65 after the
+sweep-guard restoration (see previous entry); full gate re-run at wave close.
+
+---
+
+## 2026-07-22 — wave-0 close: two gate-blocking bugs fixed (fin25 set -e trap, shot-smoke exit hang)
+
+Getting the gate to actually run to its summary surfaced two latent bugs, both fixed as
+part of R0c close. **(1) fin25 stage silent death:** the marker-count grep pipelines in
+`stage_fin_content` and `_run_e2e_bench` (`grep -l '^FAIL' ... | wc -l`) exit non-zero on a
+clean run (no FAIL markers), which `set -euo pipefail` turned into an immediate script
+abort right after the demo — every gate run had been dying silently at the fin25 stage
+header with exit 1, never reaching the shot smoke or the summary. Fixed with `|| true` on
+all six pipelines (verified: fin25 now prints `PASS pass=13 fail=0 skip=0`).
+**(2) --ui-screenshot never exits:** the m1 scenario completes and run_gui's teardown runs
+to completion (verified with new `AI_CAD_DEBUG_SHUTDOWN=1` teardown tracing in app.cpp),
+but the process then hangs in post-main static/AtExit destruction with ~30 live Chromium
+threads (ThreadPoolForeg / Chrome_InProcGp / ANGLE-GC / NetworkService / CrShutdownDetec)
+— CEF threads outlive `CefShutdown()` on this build. Scoped fix: the `--ui-screenshot`
+path in main.cpp now `_Exit(rc)` after run_gui returns (shot written, teardown done;
+static dtors skipped). The **interactive** exit path hangs identically for real users —
+filed as T-RF23 (priority 2, real product bug; the `CrShutdownDetec` watchdog exists but
+never fires). Also fixed along the way: `tools/manual_gen.py` imported the deleted
+`scripts/ui_inventory.py` (retired with ui/imgui) — repointed at
+`scripts/feature_surface_audit.ribbon_rows`; manual regenerated (`docs/manual/*.md`, 13
+files, drift CLEAN, coverage 344/344); tools pytest healed to 415 PASS.

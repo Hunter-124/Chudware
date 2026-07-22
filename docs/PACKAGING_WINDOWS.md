@@ -3,7 +3,7 @@
 **This document was written on a Linux box that cannot build, run, or verify any of the steps
 below** — no MSVC, no Inno Setup, no Windows `AI-CAD.exe`. Everything here is derived from
 reading `services/installer/{build_release.py,install.ps1,uninstall.ps1}` (which already exist
-and already work for a manual/dev install) plus `services/worker/bootstrap.cpp`'s POSIX branch,
+and already work for a manual/dev install) plus `host/src/bootstrap.cpp`'s POSIX branch,
 which the Windows branch mirrors exactly (same `%APPDATA%/AI-CAD` layout, same
 `installer.provision` invocation). A Windows host must run through this once and report back
 before T-Q1's Windows box can be marked more than `[~]`.

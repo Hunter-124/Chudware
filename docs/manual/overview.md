@@ -23,8 +23,15 @@ WORKFLOW
                                             tinted + labelled TOP/FRONT/RIGHT...). Self-review
                                             against the request; iterate add_features to fix.
                                             render_part(view="right" | {"azimuth":30,"elevation":20})
-                                            for a specific angle; contact_sheet() for several
-                                            labelled views (front/right/top/iso) in one image.
+                                            for a specific angle; render_part(emphasize="f2") for
+                                            feature EMPHASIS (high-contrast target, desaturated
+                                            context). render_views() for the full 6-ortho+iso
+                                            labelled grid; contact_sheet() for a smaller multi-
+                                            angle sheet. inspect_part(target) / inspect_feature(
+                                            target) for a CLOSE-UP (feature AABB frame + dims;
+                                            inspect_feature also returns a describe_part excerpt
+                                            + emphasis palette). look_around(target) for N orbit
+                                            close-ups. VERIFY LOOP after every mutation.
   4. measure_part() / query_geometry(q)     check mass/bbox, or explore faces/edges.
      set_material("aluminum" | {color,...})  give a body its appearance (colour + finish); it
                                             persists in the .step+ and shows in render_part.
@@ -42,6 +49,17 @@ Address geometry in PLAIN WORDS (no coordinates, no face numbers): "the top face
 edges", "the vertical edges", "the largest round face". The engine resolves the words to
 topology. cad_guide("review") explains how to read the annotated render. The full op
 vocabulary, with worked examples, follows.
+
+DOC OWNERSHIP & SAVE DISCIPLINE
+  Docs you mint (new_part/new_assembly/import) are AI-OWNED. The user sees them live in a
+  mirror tab while you work; when you finish (detach/close/disconnect) the app AUTO-CLOSES
+  that live view unless the user is actively viewing or has adopted it by editing. So the
+  responsibility to preserve work is YOURS, not the user's:
+    * save_part(path=...) every DELIVERABLE before you finish — this is the hand-off.
+    * close_part(discard=True) for SCRATCH docs you don't want kept.
+  An unsaved AI doc that's just abandoned is retired to a crash-recovery tier — a safety
+  net, NOT a delivery mechanism, and never surfaced to the user as a warning. If the user
+  edits your doc they ADOPT it (it becomes theirs); you keep co-editing the same live doc.
 
 ================================================================================
 DOC OPS CHEATSHEET. You emit a JSON array of document ops. Units mm / degrees.
@@ -106,9 +124,12 @@ SKETCH + a 2D-profile feature — this is how you make anything that is not a ba
   2) sketch_add_entity ops (refer to the sketch as "$<its op index>"). Entity types:
         circle {center:[x,y], radius}      line {p1:[x,y], p2:[x,y]}
         arc {center:[x,y], radius, start:<deg>, end:<deg>, ccw:<bool>}      point {p:[x,y]}
+        rectangle {center:[x,y], width, height}  — PREFERRED way to make a rectangle (1 op,
+                expands to 4 closed lines). Also {corner1:[x1,y1], corner2:[x2,y2]}. width/height
+                accept bare numbers or {"value":N,"expr":null}. (4 separate lines still work.)
         spline {points:[[x,y],[x,y],...]}  — a smooth curve THROUGH the points (use for organic /
                 aerofoil / cam outlines). Close a region by making the first and last point meet
-                another edge. A rectangle = 4 lines (there is no "rect" entity).
+                another edge.
         airfoil {naca:"2412" OR dat:"<path>", chord:<mm>, aoa:<deg>, points:50, closedTE:true}
                 — expands to the upper+lower aerofoil splines as one closed loop (see airfoil sheet).
   3) Turn the sketch into a solid with ONE of:
@@ -144,6 +165,10 @@ need a face number or a coordinate.
   Query predicates (combine freely; omit all = EVERY edge/face of `of`):
     "side": which side it's on — "top"/"bottom"/"left"/"right"/"front"/"back" (top=+Z, front=-Y;
             signed axes "+z"/"-x"/.. also work). Keeps the faces/edges furthest that way.
+            EXCEPTION with a size pick: side+pick "largest"/"smallest" means "the largest/
+            smallest face FACING that way" — side filters to that facing, pick chooses by area
+            (so {"side":"top","pick":"largest"} finds a base's big top even when a taller
+            sliver face sits higher).
     "surf": the shape — faces "flat"/"round" (round matches ANY curved face: cylinder/cone/sphere/
             torus); also "cylindrical"/"conical"/"spherical"/"toroidal" for specific curved types.
             Edges: "straight"/"round" (or exact: plane/cylinder/cone/sphere/torus, line/circle).
@@ -221,12 +246,24 @@ for the common machining features; they take a face in plain words and need no p
           resolves the clearance bore — M3->3.4mm; tap-drill when style:"tap"). For an "M3 clearance
           bore" just give {"standard":"M3"}.
           refs.face = a face query e.g. {"of":"face","side":"top"}. Optional `positions`:[[u,v],..]
-          (mm in the face, origin = face centre) for several holes; omit = one at the centre.
+          for several holes; omit = one at the centre.
+          POSITIONS FRAME (deterministic): origin = the centroid of the face's OUTER boundary
+          (holes already cut in the face do NOT shift it); u = world +X projected into the face
+          (world +Y if the face is perpendicular to X); v = n×u, right-handed around the outward
+          normal. So on a top face u=+X,v=+Y; on a front (−Y) face u=+X,v=+Z; on a right (+X)
+          face u=+Y,v=+Z. bolt_circle uses the same frame (start_angle measured from u).
   bolt_circle — a RING of holes in one feature (no per-hole trig). params {diameter, count, pcd
           (bolt-circle diameter), style?, end?, depth?(blind), start_angle?:<deg>}. refs.face = a
           face query (defaults to the top face). e.g. 6×⌀5 on a 40mm circle:
           {"type":"bolt_circle","params":{"diameter":5,"count":6,"pcd":40},"refs":{"face":{"of":"face","side":"top"}}}
   rib    — a thin web from an open sketch profile. refs.profile = [region]. (See sheet if present.)
+  standard_part — a catalog HARDWARE part expanded into normal editable tree features (same
+          generators as parts_make). PREFER over hand-modeling stock hardware. params {family
+          (required), size|thread ("M3", "1/4-20", bearing "608"), length_mm (screws/standoffs/
+          rod/dowel/insert; nuts/washers/bearings ignore it)}. Families: shcs, bhcs, fhcs,
+          hex_bolt, hex_nut, washer_flat, washer_lock, standoff_round, standoff_hex,
+          threaded_rod, dowel_pin, heat_set_insert, bearing. Invalid family → error lists keys.
+          {"type":"standard_part","name":"Standoff","params":{"family":"standoff_hex","thread":"M3","length_mm":22}}
 
 ADVANCED FEATURE FAMILIES — three families the engine fully supports (watertight geometry). Each has
 its own detailed cheatsheet; the essentials to invoke them:
@@ -289,7 +326,34 @@ sketching ON a face, `offset` lifts along that face's outward normal.
 ----------------------------------------------------------------- SKETCH OPS (append to an existing sketch feature)
 
 sketch_add_entity   {"op":"sketch_add_entity","sketch":"$0","entity":{...}}
-                    Add a line/circle/arc/spline/polygon/airfoil/point entity to a sketch.
+                    Add a line/circle/arc/spline/polygon/rectangle/airfoil/point entity to a sketch.
+
+                    REGULAR POLYGON (hexagons, nuts, bolt-heads, prisms) — ALWAYS use this ONE
+                    entity; never hand-draw the sides as separate lines (slow + usually fails to
+                    close). It expands to N closed segments for you:
+                      {"op":"sketch_add_entity","sketch":"$0",
+                       "type":"hexagon","center":[0,0],"across_flats":16}
+                    - type: "polygon"/"ngon" (needs "sides":N) OR a named n-gon that implies its
+                      count: triangle, pentagon, hexagon, heptagon, octagon, nonagon, decagon,
+                      dodecagon (an explicit "sides" still overrides).
+                    - size — give exactly ONE: "across_flats" (wrench/spanner size, flat-to-flat =
+                      the usual way hex stock/nuts are specified), "circumradius" (centre→vertex),
+                      or "inradius"/"apothem" (centre→edge). "rotation":<deg> optional (default: a
+                      vertex on +X; use rotation:90 to put a flat on top).
+                    e.g. a hex prism 16mm across flats, 20mm tall:
+                      [{"op":"add_feature","type":"sketch","refs":{"plane":"plane.top"}},
+                       {"op":"sketch_add_entity","sketch":"$0","type":"hexagon","across_flats":16},
+                       {"op":"add_feature","type":"extrude","params":{"mode":"boss","end":"blind",
+                        "depth":20},"refs":{"profile":[{"kind":"region","sketch":"$0","hint_index":0}]}}]
+
+                    RECTANGLE — PREFERRED over 4 hand-drawn lines (1 op, always closes):
+                      {"op":"sketch_add_entity","sketch":"$0",
+                       "entity":{"type":"rectangle","center":[0,0],"width":80,"height":50}}
+                    - center-form: center:[x,y] (default [0,0]), width, height (both > 0). Dims
+                      may be bare numbers or {"value":N,"expr":null}. Optional rotation:<deg>.
+                    - two-corner form: corner1:[x1,y1], corner2:[x2,y2] (order-independent).
+                    - alias type "rect" also accepted. Expands to 4 CCW line segments.
+                    4 separate line entities remain valid if you already have corners pinned.
 
 sketch_convert      {"op":"sketch_convert","sketch":"<sketch-fid>","refs":[Ref,...],"construction":false,"fix":true}
                     Project external geometry INTO an existing sketch (SolidWorks "Convert Entities").
@@ -361,5 +425,12 @@ patterned), then circular-pattern that extrude feature about axis.z:
  {"op":"add_feature","feature":{"type":"extrude","name":"Boss","params":{"mode":"boss","end":"blind","depth":{"value":10,"expr":null}},"refs":{"profile":[{"kind":"region","sketch":"$1","centroid":[30,0],"hint_index":0}]}}},
  {"op":"add_feature","feature":{"type":"circular_pattern","name":"Ring","params":{"count":6,"angle":{"value":360,"expr":null},"equal_spacing":true},"refs":{"axis":{"kind":"datum","feature":"axis.z"},"features":["$3"]}}}
 ]
+
+----------------------------------------------------------------- TOOL SCOPE
+request_tools — meta-op (not applied to the doc). Ask for more vocabulary mid-run:
+  [{"op":"request_tools","classes":["full_ops"|"sheetmetal"|"weldments"|"surfacing"]}]
+Domain classes append cheatsheets/sheetmetal.md, weldment.md, or surfacing.md on the next turn.
+You already have the full op set on this sheet; prefer emitting real ops. A second full_ops
+request is a no-op.
 ```
 

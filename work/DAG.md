@@ -122,7 +122,7 @@ graph TD
   subgraph WS_G["workstream G"]
     T_G1["T-G1: Land the uncommitted GUI working tree in scoped commits"]:::done
     T_G10["T-G10: ShopCraft rename tiers 2+3 - build targets, env vars, MCP id, appdata"]:::done
-    T_G11["T-G11: Windows build verify, then delete host/ and all deprecated GUI code"]:::doing
+    T_G11["T-G11: Windows build verify, then delete host/ and all deprecated GUI code — CLOSED AS REVERSED"]:::done
     T_G12["T-G12: Human UI walkthrough - recursive element-by-element feedback loop until converged"]:::doing
     T_G13["T-G13: Fix issue 7 (scenario deadlock) - ScenarioRunner step-machine scenarios deadlock offscreen"]:::done
     T_G14["T-G14: Dark-mode readability + popup/subwindow correctness (black-on-black text, transparent borders, evaluate window sizing)"]:::done
@@ -224,6 +224,30 @@ graph TD
     RE_32["RE-32: Parts Library 'Reverse Engineer / Generate 3D model' context menu"]:::done
     RE_33["RE-33: Parts Library one-call 'make un-modeled part' flow (research→build→attach)"]:::done
     RE_34["RE-34: Fix research_and_ingest monkeypatch seam (ordering-dependent test failure)"]:::done
+  end
+  subgraph WS_RF["workstream RF"]
+    T_RF1["T-RF1: RF wave-0 docs + board reconciliation (node R0a)"]:::todo
+    T_RF10["T-RF10: RF wave-2 GUI feedback batch — 15-item gui-session list + OVERHAUL_SPEC pendings (node R2a)"]:::todo
+    T_RF11["T-RF11: RF wave-2 app.cpp dispatch decomposition — per-workspace handler tables (node R2b)"]:::todo
+    T_RF12["T-RF12: RF wave-2 web degradation UX — CEF panels + explicit web_unsupported gating (node R2c)"]:::todo
+    T_RF13["T-RF13: RF wave-3 WASM adaptive-quality ladder (node R3a)"]:::todo
+    T_RF14["T-RF14: RF wave-3 (stretch) doc_open mmap/zero-copy + tiny-op marshalling fast path (node R3b)"]:::todo
+    T_RF15["T-RF15: RF stream-Z firmware fw_* cutover to core/ (node R4a)"]:::todo
+    T_RF16["T-RF16: RF stream-Z CFD/LBM sim_run_flow + sim_cancel cutover to core/ (node R4b)"]:::todo
+    T_RF17["T-RF17: RF stream-Z ECAD gaps cutover to core/ecad (node R4c)"]:::todo
+    T_RF18["T-RF18: RF stream-Z sourcing/BOM/cost + parts providers cutover to core/ (node R4d)"]:::todo
+    T_RF19["T-RF19: RF stream-Z long-tail oracle modules cutover (node R4e)"]:::todo
+    T_RF2["T-RF2: RF wave-0 dead-code purge — services/worker dupes + orphaned ui/viewport (node R0b)"]:::todo
+    T_RF20["T-RF20: RF stream-Z MCP + DAG thin-client flip — no engine imports in Python (node R4f)"]:::todo
+    T_RF21["T-RF21: RF closeout — remove AI_CAD_CPP_* fallback flags, delete engine_oracle (node R5a)"]:::todo
+    T_RF22["T-RF22: RF closeout — final docs, contract index, cross-platform build check (node R5b)"]:::todo
+    T_RF3["T-RF3: RF wave-0 gate hardening — WASM smoke + web parity probe + check.py fatal (node R0c)"]:::todo
+    T_RF4["T-RF4: RF wave-1 subscription auth/token-refresh ported to core/agent C++ (node R1a)"]:::todo
+    T_RF5["T-RF5: RF wave-1 single agent entry — kill legacy agent_design path (node R1b)"]:::todo
+    T_RF6["T-RF6: RF wave-1 split legacy_chat.cpp god file + reconcile ai_workspace (node R1c)"]:::todo
+    T_RF7["T-RF7: RF wave-1 single event-schema + prompt-catalog source (node R1d)"]:::todo
+    T_RF8["T-RF8: RF wave-1 MCP god-file split + dual-import shim removal (node R1e)"]:::todo
+    T_RF9["T-RF9: RF wave-1 mode allow-list parity + leftover TODO seams (node R1f)"]:::todo
   end
   subgraph WS_SIM["workstream SIM"]
     T_SIM1["T-SIM1: Thermal FEA solver - steady-state heat conduction kernel + sim_new_thermal end-to-end"]:::done
@@ -356,8 +380,11 @@ graph TD
     T_BL49["T-BL49: AI fitment & interface-alignment checker — interface_check tool for mating components (hole patterns, coaxiality, contact planes, fastener clearance)"]:::done
     T_BL50["T-BL50: Layout-first planning helper — critical-dimension & interface capture up front, with a coverage gate so the AI can't miss critical dims"]:::done
     T_BL51["T-BL51: Associative Convert Entities — projected sketch references update when the source geometry changes"]:::todo
-    T_BL54["T-BL54: 3D sketcher P4 — GUI viewport mode (3D dragging) + GSL describe"]:::backlog
-    T_BL55["T-BL55: 3D sketcher P5 — advanced constraints + solver robustness"]:::backlog
+    T_BL56["T-BL56: 3D sketcher P1 — sketch3d data model + core Newton solver skeleton"]:::backlog
+    T_BL57["T-BL57: 3D sketcher P2 — 3D curves + relational constraints + edge-body emit"]:::backlog
+    T_BL58["T-BL58: 3D sketcher P3 — feature integration (sweep path, loft guide-curves)"]:::backlog
+    T_BL59["T-BL59: 3D sketcher P4 — GUI viewport mode (3D dragging) + GSL describe"]:::backlog
+    T_BL60["T-BL60: 3D sketcher P5 — advanced constraints + solver robustness"]:::backlog
   end
   subgraph WS_integration["workstream integration"]
     T_INT["T-INT: ABSORBED into T-A5 - day-5 integration demo (capstone consolidated, Erik 2026-07-03)"]:::backlog
@@ -464,10 +491,13 @@ graph TD
   T_BL02 --> T_BL47
   T_BL43 --> T_BL51
   T_BL21 --> T_BL52
-  T_BL52 --> T_BL54
-  T_BL48 --> T_BL54
-  T_BL53 --> T_BL55
-  T_BL54 --> T_BL55
+  T_BL45 --> T_BL56
+  T_BL56 --> T_BL57
+  T_BL57 --> T_BL58
+  T_BL57 --> T_BL59
+  T_BL48 --> T_BL59
+  T_BL58 --> T_BL60
+  T_BL59 --> T_BL60
   T_C1 --> T_C2
   T_C2 --> T_C3
   T_C3 --> T_C4
@@ -614,6 +644,36 @@ graph TD
   T_R2 --> T_R7
   T_R4 --> T_R7
   T_R7 --> T_R8
+  T_RF5 --> T_RF10
+  T_RF6 --> T_RF10
+  T_RF6 --> T_RF11
+  T_RF3 --> T_RF12
+  T_RF6 --> T_RF12
+  T_RF10 --> T_RF13
+  T_RF11 --> T_RF13
+  T_RF12 --> T_RF13
+  T_RF13 --> T_RF14
+  T_RF3 --> T_RF15
+  T_RF3 --> T_RF16
+  T_RF3 --> T_RF17
+  T_RF3 --> T_RF18
+  T_RF15 --> T_RF19
+  T_RF16 --> T_RF19
+  T_RF17 --> T_RF19
+  T_RF18 --> T_RF19
+  T_RF19 --> T_RF20
+  T_RF4 --> T_RF20
+  T_RF9 --> T_RF20
+  T_RF20 --> T_RF21
+  T_RF21 --> T_RF22
+  T_RF1 --> T_RF3
+  T_RF2 --> T_RF3
+  T_RF3 --> T_RF4
+  T_RF4 --> T_RF5
+  T_RF3 --> T_RF6
+  T_RF3 --> T_RF7
+  T_RF3 --> T_RF8
+  T_RF3 --> T_RF9
   T_SIM1 --> T_SIM4
   T_G6 --> T_U1
   T_U1 --> T_U2

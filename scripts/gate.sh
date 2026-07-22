@@ -4,14 +4,20 @@
 # Every DAG node must leave this gate green before close (see AGENTS.md swarm
 # rules + the plan file). It runs, in order:
 #   1. scripts/check.py        — stdlib source/docs gate (gui_lint, feature_surface_audit,
-#                                 parity_audit). Always runs.
+#                                 parity_audit). Always runs; FATAL on red (T-RF3).
 #   2. core CMake/Ninja build  — libaicad with -DAICAD_WITH_OCCT=ON + ctest. SKIPPED with a
 #                                 clear reason if the system OCCT cmake config is not found
 #                                 (the gate does NOT fail just because OCCT is absent on a box).
 #   2b. host GUI build         — cmake -S host -B host/build-linux + ninja Billet.
 #                                 The ui/imgui / ui/abstract (AI-CAD2) app is retired;
 #                                 host/ is the single cross-platform GUI target.
+#   2c. WASM build smoke       — ./build.sh wasm into a scratch dir (BILLET_WEB_APP override).
+#                                 The web app is the same host/ tree compiled by Emscripten;
+#                                 FATAL when emsdk is provisioned and the build breaks.
 #   3. ctest                   — only if the core build succeeded; best-effort (SKIP if no tests).
+#   3b. hostd smoke            — daemon lifecycle/race/stop/recovery (scripts/hostd_smoke.py).
+#   3d. web parity probe       — contracts/web_parity.md enforced over a scratch hostd with the
+#                                 Python worker bridge disabled (scripts/web_parity_probe.py).
 #   4. engine + agent pytest   — only if a runtime venv / pytest is discoverable; SKIP with a
 #                                 clear reason if the Python runtime is not provisioned.
 #   5. host shot smoke         — AI_CAD_SHOT=m1 headless screenshot via xvfb-run.
@@ -19,16 +25,12 @@
 #                                 Renode/OpenFOAM-gated legs SKIP honestly via marker files.
 #   6. PASS/SKIP summary.
 #
-# SKIP semantics: OCCT-absent and venv-absent are environment SKIPs, not failures — the gate
-# stays green on a box that simply hasn't provisioned those optional runtimes, while still
-# running the stdlib check + whatever builds are possible.
+# SKIP semantics: OCCT-absent, emsdk-absent and venv-absent are environment SKIPs, not
+# failures — the gate stays green on a box that simply hasn't provisioned those optional
+# runtimes, while still running the stdlib check + whatever builds are possible.
 #
-# Pre-existing check.py red: at refactor start (P0) `scripts/check.py` is RED for reasons
-# unrelated to the refactor (feature_surface_audit missing dwg_*/cam_* ribbon handlers;
-# parity_audit SW_PARITY_SPEC drift — see docs/REFACTOR_LOG.md). Until those engine gaps are
-# closed in later phases, check.py is treated as a RECORDED non-fatal stage here so the swarm
-# is not blocked on pre-existing drift. Flip CHECK_PY_FATAL=1 below once the ribbon/parity
-# gaps are fixed to make check.py hard-gating again.
+# check.py is FATAL as of T-RF3 (2026-07-22): the feature_surface_audit red was fixed by
+# teaching the audit the sketch3d_mode.cpp handler file + the reveng_ prefix dispatcher.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -44,7 +46,7 @@ GATE_TMP="${GATE_TMPDIR:-/tmp/aicad-gate-${AICAD_INSTANCE_KEY:-$$}}"
 mkdir -p "$GATE_TMP"
 echo "gate temp dir: $GATE_TMP"
 
-CHECK_PY_FATAL=0   # 1 = check.py failure fails the gate; 0 = record only (pre-existing red)
+CHECK_PY_FATAL=1   # 1 = check.py failure fails the gate (T-RF3: audits green since 2026-07-22)
 
 declare -a SUMMARY
 fail_fatal=0
@@ -199,6 +201,30 @@ stage_ui_abstract() {
     HOST_BUILD_OK=1
 }
 
+# ---- Stage 2c: WASM web-client build smoke (T-RF3) ---------------------------
+# The web app is the same host/ tree compiled by Emscripten; a native-only break of the
+# WASM build is a web-parity regression, so this stage is FATAL when the toolchain is
+# provisioned and the build breaks. SKIPs honestly when emsdk is absent. Stages into
+# $GATE_TMP/wasm-app via BILLET_WEB_APP so a live web deploy (~/billet-web/app) is
+# never clobbered.
+stage_wasm_smoke() {
+    echo "=== [2c/6] WASM web-client build smoke ==="
+    local emsdk_dir="${EMSDK:-$HOME/.emsdk}"
+    if [ ! -f "$emsdk_dir/emsdk_env.sh" ]; then
+        record "wasm build          SKIP    emsdk not found at $emsdk_dir"
+        echo "  SKIP: emsdk not provisioned ($emsdk_dir)"
+        return 0
+    fi
+    if ! BILLET_WEB_APP="${GATE_TMP}/wasm-app" ./build.sh wasm > ${GATE_TMP}/wasm.out 2>&1; then
+        record "wasm build          FAIL    ./build.sh wasm (see ${GATE_TMP}/wasm.out)"
+        echo "  FAIL: wasm build"; tail -n 15 ${GATE_TMP}/wasm.out | sed 's/^/    /'
+        fail_fatal=1
+        return 0
+    fi
+    record "wasm build          PASS    Billet.wasm bundle built + staged (scratch dir)"
+    echo "  PASS"
+}
+
 # ---- Stage 3: ctest (core) -------------------------------------------------
 stage_ctest() {
     echo "=== [3/6] ctest (core) ==="
@@ -246,6 +272,32 @@ stage_hostd_smoke() {
     else
         record "hostd smoke         FAIL    see ${GATE_TMP}/hostd.out"
         echo "  FAIL: hostd smoke"; tail -n 12 ${GATE_TMP}/hostd.out | sed 's/^/    /'
+        fail_fatal=1
+    fi
+}
+
+# ---- Stage 3d: web parity probe (contracts/web_parity.md, T-RF3) ------------
+# Spawns a scratch aicad-hostd with the Python worker bridge disabled (exactly what the
+# WASM web client faces) and asserts contracts/web_parity.md: web_required methods are
+# libaicad-served, web_unsupported gaps fail loud. FATAL when a hostd binary exists —
+# a new parity hole (or an unrecorded cutover) must never merge silently.
+stage_web_parity() {
+    echo "=== [3d/6] web parity probe ==="
+    local hostd=""
+    for cand in core/build-occt-linux/bin/aicad-hostd core/build-linux/bin/aicad-hostd; do
+        [ -x "$cand" ] && { hostd="$cand"; break; }
+    done
+    if [ -z "$hostd" ]; then
+        record "web parity probe    SKIP    aicad-hostd not built"
+        echo "  SKIP: no aicad-hostd binary"
+        return 0
+    fi
+    if python3 scripts/web_parity_probe.py "$hostd" > ${GATE_TMP}/web_parity.out 2>&1; then
+        record "web parity probe    PASS    contracts/web_parity.md holds"
+        echo "  PASS"
+    else
+        record "web parity probe    FAIL    see ${GATE_TMP}/web_parity.out"
+        echo "  FAIL: web parity"; tail -n 12 ${GATE_TMP}/web_parity.out | sed 's/^/    /'
         fail_fatal=1
     fi
 }
@@ -760,9 +812,9 @@ stage_fin_content() {
     # Summarise per-leg markers (PASS/FAIL/SKIP) for the gate line.
     local n_pass=0 n_fail=0 n_skip=0
     if [ -d "$out/markers" ]; then
-        n_pass=$(grep -l '^PASS' "$out/markers"/*.marker 2>/dev/null | wc -l | tr -d ' ')
-        n_fail=$(grep -l '^FAIL' "$out/markers"/*.marker 2>/dev/null | wc -l | tr -d ' ')
-        n_skip=$(grep -l '^SKIP' "$out/markers"/*.marker 2>/dev/null | wc -l | tr -d ' ')
+        n_pass=$(grep -l '^PASS' "$out/markers"/*.marker 2>/dev/null | wc -l | tr -d ' ' || true)
+        n_fail=$(grep -l '^FAIL' "$out/markers"/*.marker 2>/dev/null | wc -l | tr -d ' ' || true)
+        n_skip=$(grep -l '^SKIP' "$out/markers"/*.marker 2>/dev/null | wc -l | tr -d ' ' || true)
     fi
     local detail="pass=$n_pass fail=$n_fail skip=$n_skip (see ${GATE_TMP}/fin25.out)"
 
@@ -812,9 +864,9 @@ _run_e2e_bench() {  # $1=label $2=script $3=tmp-subdir $4=gate-flag $5=script-en
             > "${GATE_TMP}/${pfx}.out" 2>&1; then rc=$?; fi
     local n_pass=0 n_fail=0 n_skip=0
     if [ -d "$out/markers" ]; then
-        n_pass=$(grep -l '^PASS' "$out/markers"/*.marker 2>/dev/null | wc -l | tr -d ' ')
-        n_fail=$(grep -l '^FAIL' "$out/markers"/*.marker 2>/dev/null | wc -l | tr -d ' ')
-        n_skip=$(grep -l '^SKIP' "$out/markers"/*.marker 2>/dev/null | wc -l | tr -d ' ')
+        n_pass=$(grep -l '^PASS' "$out/markers"/*.marker 2>/dev/null | wc -l | tr -d ' ' || true)
+        n_fail=$(grep -l '^FAIL' "$out/markers"/*.marker 2>/dev/null | wc -l | tr -d ' ' || true)
+        n_skip=$(grep -l '^SKIP' "$out/markers"/*.marker 2>/dev/null | wc -l | tr -d ' ' || true)
     fi
     local detail="pass=$n_pass fail=$n_fail skip=$n_skip (see ${GATE_TMP}/${pfx}.out)"
     if [ "$rc" -eq 0 ] && [ "$n_fail" = "0" ]; then
@@ -843,8 +895,10 @@ stage_manual_gen
 stage_ui_style_check
 stage_core_build
 stage_ui_abstract
+stage_wasm_smoke
 stage_ctest
 stage_hostd_smoke
+stage_web_parity
 stage_appimage_smoke
 stage_pytest
 stage_vv

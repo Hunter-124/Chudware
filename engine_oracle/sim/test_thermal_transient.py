@@ -18,7 +18,11 @@ import sys
 
 import numpy as np
 
-_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".."))
+# realpath: pytest may collect this file through a symlinked package dir
+# (e.g. services/engine -> engine_oracle); dirname() without resolving
+# yields services/ and putting THAT on sys.path shadows the third-party
+# `mcp` SDK with services/mcp (collection-time ImportError).
+_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", ".."))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 

@@ -95,6 +95,15 @@ _HANDOFF = {
 @pytest.fixture()
 def env(tmp_path, monkeypatch):
     monkeypatch.setenv("AICAD_CACHE_ROOT", str(tmp_path))
+    # Hermetic: delegate() rebuilds a per-role provider from model assignment
+    # (WS2/mega-5) — ambient config.json ai_roles on a dev machine, or the
+    # ollama default when config is empty. Either replaces the scripted mock
+    # with a live provider. Force the legacy no-assignment path instead.
+    monkeypatch.setattr("services.agent.config.load_config", lambda *a, **k: {})
+    monkeypatch.setattr("services.agent.role_models.resolve_for_node",
+                        lambda *a, **k: None)
+    monkeypatch.setattr("services.agent.role_models.resolve_role_model",
+                        lambda *a, **k: None)
     # Deterministic parts backends — no hub/index.
     from services.mcp import parts_tools as pt
     monkeypatch.setattr(pt, "taxonomy_browse",
@@ -205,9 +214,11 @@ class TestSourcingSubagent:
         node = md.delegate(role="mystery_role", brief="do a thing",
                            budget_tokens=4000)
         assert node["ok"] is True and node["subagent_status"] == "done"
-        # No role card → no card prompt, no tools slot.
-        assert "[TOOLS]" not in provider.systems[0]
+        # No role card → no card prompt and no card tools. (Mode-unioned
+        # SHARED_DEFAULT_TOOLS may still render a [TOOLS] slot — that is the
+        # shipped copilot-mode behavior, not a role card.)
         assert "SOURCING SPECIALIST" not in provider.systems[0]
+        assert "part_source(need: str" not in provider.systems[0]
 
     def test_role_card_loads_and_validates(self):
         from services.agent import roles
@@ -216,8 +227,7 @@ class TestSourcingSubagent:
         names = card.concrete_tools
         for t in ("parts_taxonomy", "part_search", "part_get", "part_source",
                   "vendors_health", "scrape_enqueue", "scrape_queue_status",
-                  "import_artifact", "part_place", "bom_price", "request_quote",
-                  "cam_tool_import"):
+                  "import_artifact", "part_place", "bom_price"):
             assert t in names, t
         assert len(card.tool_allowlist) <= roles.MAX_TOOLS_PER_ROLE
         # Handoff schema requires recommendations with artifact plans.

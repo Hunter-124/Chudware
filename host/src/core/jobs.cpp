@@ -13,6 +13,22 @@
 
 #include "../worker_client.h"
 
+// Crash guard for the detached agent-job threads below: an exception escaping a
+// detached std::thread calls std::terminate -> SIGABRT and kills the whole app
+// (the classic case is an nlohmann type_error on a malformed run result, e.g.
+// result.value("error", ...) when the field is null/an object). Land the job in
+// a normal error state instead so the chat drain paints a failure card.
+static void failJobFromEscapedException(JobState& job, const std::string& what) {
+    std::lock_guard<std::mutex> lk(job.mtx);
+    job.error = "agent job error: " + what;
+    job.errorDetail = job.error;
+    job.errorIsCad = false;
+    job.converged = false;
+    if (job.stopReason.empty()) job.stopReason = "provider_error";
+    job.ready = true;
+    job.running = false;
+}
+
 // Map a GUI / wire provider id to the subscription_ensure_fresh RPC id, or "" when
 // the provider is NOT subscription-auth (API key / local / gemini / etc. — skip).
 // Accepts friendly + *-sub names so launch paths and config.json both work.
@@ -92,6 +108,7 @@ void launchAgentRunV2(WorkerClient& w, JobState& job,
         job.drawingDocId.clear(); job.drawingName.clear(); job.drawingSourceId.clear();
         job.camDocId.clear();
         job.partName.clear();
+        job.savedPath.clear();
         job.finalRevision = 0;
         job.runId.clear();
     }
@@ -100,6 +117,7 @@ void launchAgentRunV2(WorkerClient& w, JobState& job,
     std::thread([&w, &job, request, docId, cam, extra]() {
         nlohmann::json result;
         std::string err;
+        try {
 
         // The onEvent callback is called on the worker thread for each streamed event.
         // We package it as an AgentEvent with kind = "orch_<original_kind>" so the GL thread
@@ -308,6 +326,14 @@ void launchAgentRunV2(WorkerClient& w, JobState& job,
                         std::string pn = result.value("part_name", std::string());
                         if (!pn.empty()) job.partName = std::move(pn);
                     }
+                    // File-first persistence: the core agent already saved the part itself
+                    // (at modeling start + milestone re-saves + memory-stage rename). Carry
+                    // its path so the GL drain saves onto it instead of writing a duplicate
+                    // <name>_2.step+ next to the agent's file.
+                    {
+                        std::string sp = result.value("saved_path", std::string());
+                        if (!sp.empty()) job.savedPath = std::move(sp);
+                    }
                     // Final doc revision (0 when the run produced no geometry / never advanced).
                     // Host autosave gates on this so empty/no_geometry runs never write a file.
                     if (result.contains("revision") && result["revision"].is_number_integer())
@@ -320,6 +346,11 @@ void launchAgentRunV2(WorkerClient& w, JobState& job,
         }
         job.ready = true;
         job.running = false;
+        } catch (const std::exception& e) {
+            failJobFromEscapedException(job, e.what());
+        } catch (...) {
+            failJobFromEscapedException(job, "unknown exception");
+        }
     }).detach();
 }
 
@@ -343,6 +374,7 @@ void launchAgentDesign(WorkerClient& w, JobState& job,
         job.drawingDocId.clear(); job.drawingName.clear(); job.drawingSourceId.clear();
         job.camDocId.clear();
         job.partName.clear();
+        job.savedPath.clear();
         job.finalRevision = 0;
         job.isMission = false; job.missionVerdict.clear();
         job.missionPartial = false;
@@ -372,6 +404,7 @@ void launchAgentDesign(WorkerClient& w, JobState& job,
     std::thread([&w, &job, request, docId, extra]() {
         nlohmann::json result;
         std::string err;
+        try {
 
         WorkerClient::EventFn onEvent = [&job](const nlohmann::json& d) {
             AgentEvent e;
@@ -510,6 +543,11 @@ void launchAgentDesign(WorkerClient& w, JobState& job,
         }
         job.ready = true;
         job.running = false;
+        } catch (const std::exception& e) {
+            failJobFromEscapedException(job, e.what());
+        } catch (...) {
+            failJobFromEscapedException(job, "unknown exception");
+        }
     }).detach();
 }
 
@@ -536,6 +574,7 @@ void launchMissionRun(WorkerClient& w, JobState& job,
         job.missionTasksTotal = 0;
         job.planReady = false; job.planReadyJson.clear();
         job.partName.clear();
+        job.savedPath.clear();
         job.finalRevision = 0;
         job.runId.clear();
     }
@@ -544,6 +583,7 @@ void launchMissionRun(WorkerClient& w, JobState& job,
     std::thread([&w, &job, request, docId, extra]() {
         nlohmann::json result;
         std::string err;
+        try {
 
         // Refresh stale subscription tokens BEFORE agent_mission_v1 (C++ reads tokens
         // read-only; Python is the single writer). Same pre-run hook as agent_run_v2 /
@@ -787,5 +827,10 @@ void launchMissionRun(WorkerClient& w, JobState& job,
         }
         job.ready = true;
         job.running = false;
+        } catch (const std::exception& e) {
+            failJobFromEscapedException(job, e.what());
+        } catch (...) {
+            failJobFromEscapedException(job, "unknown exception");
+        }
     }).detach();
 }

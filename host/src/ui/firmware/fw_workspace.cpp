@@ -8,6 +8,11 @@
 //   right : backend doctor (fw_status, T-FIN4) + Flash/Debug — buttons exist ONLY when the
 //           doctor says the backend exists; otherwise the doctor's guidance banner shows.
 //
+// Styling: the workspace speaks the shared "liquid glass" language (ui_theme.h) instead of
+// stock ImGui chrome — glass children, accent-gradient section headers, tinted status
+// pills, glass action buttons and glow selection, all scaled by ui::uiScale and painted
+// from palette roles only (gui_lint).
+//
 // GL-thread rules honored throughout: every engine call is ASYNC (st.rpc.call + callbacks
 // run in the drain), listing is throttled, and nothing grabs focus per-frame.
 #include "fw_workspace.h"
@@ -15,7 +20,9 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -23,6 +30,8 @@
 #include <nlohmann/json.hpp>
 
 #include "core/app_state.h"
+#include "ui/icons.h"
+#include "ui/metrics.h"
 #include "ui_theme.h"
 
 namespace ui {
@@ -90,6 +99,175 @@ static FwState& S() {
 
 static const char* kMcuFamilies[] = {"cortex-m4", "cortex-m0", "cortex-m3", "cortex-m7",
                                      "esp32", "avr"};
+
+// ---- glass styling helpers ------------------------------------------------------
+// Small local widgets built on the shared ui_theme primitives (the same recipes the
+// PLM hub and title bar use). Kept local so the firmware workspace stays self-contained.
+
+// Section title: accent atlas icon + accent label + a short accent->transparent gradient
+// underline (the title-bar divider trick). Replaces the old plain text + Separator().
+static void fwSectionHeader(const char* icon, const char* label) {
+    const float sc = ui::uiScale;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    const float h = ImGui::GetFrameHeight();
+    float x = p0.x;
+    if (icon && icon[0]) {
+        const float isz = 16.0f * sc;
+        ui::drawIconGlass(dl, icon, ImVec2(x + isz * 0.5f, p0.y + h * 0.5f), isz,
+                          palette.toU32(palette.accent), 0);
+        x += isz + 7.0f * sc;
+    }
+    dl->AddText(ImVec2(x, p0.y + (h - ImGui::GetTextLineHeight()) * 0.5f),
+                palette.toU32(palette.accent), label);
+    ImGui::Dummy(ImVec2(0.0f, h));
+    const float w = std::min(ImGui::GetContentRegionAvail().x, 140.0f * sc);
+    const float uy = p0.y + h + 1.0f * sc;
+    const ImU32 ca = ImGui::GetColorU32(
+        ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 0.55f));
+    const ImU32 cb = ImGui::GetColorU32(
+        ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 0.0f));
+    dl->AddRectFilledMultiColor(ImVec2(p0.x, uy), ImVec2(p0.x + w, uy + sc), ca, cb, cb, ca);
+    ImGui::Dummy(ImVec2(0.0f, 4.0f * sc));
+}
+
+// Status pill: soft tinted fill + tinted text + hairline border (the graph-tab kind-pill
+// recipe). Used for build/sim verdicts so they read at a glance.
+static void fwStatusPill(const char* text, const float tint[3]) {
+    const float sc = ui::uiScale;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    const ImVec2 ts = ImGui::CalcTextSize(text);
+    const float pillH = ImGui::GetTextLineHeight() + 6.0f * sc;
+    const float pillW = ts.x + 16.0f * sc;
+    const ImVec2 p1(p0.x + pillW, p0.y + pillH);
+    dl->AddRectFilled(p0, p1, ImGui::GetColorU32(ImVec4(tint[0], tint[1], tint[2], 0.16f)),
+                      pillH * 0.5f);
+    dl->AddRect(p0, p1, ImGui::GetColorU32(ImVec4(tint[0], tint[1], tint[2], 0.55f)),
+                pillH * 0.5f, 0, ui::metrics::stroke(1.0f));
+    dl->AddText(ImVec2(p0.x + 8.0f * sc, p0.y + 3.0f * sc),
+                ImGui::GetColorU32(ImVec4(tint[0], tint[1], tint[2], 1.0f)), text);
+    ImGui::Dummy(ImVec2(pillW, pillH));
+}
+
+// Width a fwGlassButton will occupy — for laying an input row out next to one.
+static float fwGlassButtonWidth(const char* label, const char* icon) {
+    const float sc = ui::uiScale;
+    float w = 28.0f * sc + ImGui::CalcTextSize(label).x;   // 2 * 14dp horizontal padding
+    if (icon && icon[0]) w += 21.0f * sc;                  // 15dp glyph + 6dp gap
+    return w;
+}
+
+// Liquid-glass action button (the plmGlassButton recipe): frosted base + optional accent
+// fill with a hover/held alpha ramp, atlas icon + centered label. `enabled=false` draws
+// the same shell dimmed and inert — BeginDisabled can't fade custom draw-list paint.
+static bool fwGlassButton(const char* id, const char* label, const char* icon, bool accent,
+                          float width, bool enabled = true) {
+    const float sc = ui::uiScale;
+    const float iconSz = (icon && icon[0]) ? 15.0f * sc : 0.0f;
+    const float gap = iconSz > 0.0f ? 6.0f * sc : 0.0f;
+    const float padX = 14.0f * sc;
+    const float textW = ImGui::CalcTextSize(label).x;
+    const float content = iconSz + gap + textW;
+    const float w = width > 0.0f ? width : padX * 2.0f + content;
+    const float h = ImGui::GetFrameHeight() + 2.0f * sc;
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    const ImVec2 p1(p0.x + w, p0.y + h);
+    bool clicked = false, hov = false, held = false;
+    if (enabled) {
+        clicked = ImGui::InvisibleButton(id, ImVec2(w, h));
+        hov = ImGui::IsItemHovered();
+        held = ImGui::IsItemActive();
+    } else {
+        ImGui::Dummy(ImVec2(w, h));
+        hov = ImGui::IsItemHovered();   // still lets callers show a gating tooltip
+    }
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float dim = enabled ? 1.0f : 0.45f;
+    ui::glassBackground(dl, p0, p1, 9.0f, dim);
+    if (accent) {
+        const float a = (held ? 0.92f : hov ? 0.80f : 0.62f) * dim;
+        dl->AddRectFilled(p0, p1, ImGui::GetColorU32(ImVec4(
+            palette.accent[0], palette.accent[1], palette.accent[2], a)), 9.0f * sc);
+    } else if (hov && enabled) {
+        dl->AddRectFilled(p0, p1, ImGui::GetColorU32(ImVec4(
+            palette.text[0], palette.text[1], palette.text[2], held ? 0.10f : 0.06f)),
+            9.0f * sc);
+    }
+    ImU32 tcol;
+    if (accent && enabled) {
+        tcol = ImGui::GetColorU32(ui::maxContrastTextOn(
+            ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 1.0f)));
+    } else {
+        tcol = enabled ? palette.toU32(palette.text) : palette.toU32(palette.textDisabled);
+    }
+    float tx = p0.x + (w - content) * 0.5f;
+    if (iconSz > 0.0f) {
+        ui::drawIconGlass(dl, icon, ImVec2(tx + iconSz * 0.5f, p0.y + h * 0.5f), iconSz,
+                          tcol, 0);
+        tx += iconSz + gap;
+    }
+    dl->AddText(ImVec2(tx, p0.y + (h - ImGui::GetTextLineHeight()) * 0.5f), tcol, label);
+    return clicked;
+}
+
+// Doctor guidance banner: a tinted liquid-glass card (glassCardWash gradient) behind
+// wrapped text. Height is pre-measured with CalcTextSize so the card hugs the text.
+static void fwBanner(const char* text, const float tint[3]) {
+    const float sc = ui::uiScale;
+    const float padX = 10.0f * sc;
+    const float padY = 7.0f * sc;
+    const ImVec2 cp = ImGui::GetCursorPos();
+    const float cardW = ImGui::GetContentRegionAvail().x;
+    const float wrapW = std::max(40.0f * sc, cardW - padX * 2.0f);
+    const ImVec2 ts = ImGui::CalcTextSize(text, nullptr, false, wrapW);
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    const ImVec2 p1(p0.x + cardW, p0.y + ts.y + padY * 2.0f);
+    ui::glassCardWash(ImGui::GetWindowDrawList(), p0, p1, 8.0f, tint, 0.16f);
+    ImGui::SetCursorPos(ImVec2(cp.x + padX, cp.y + padY));
+    ImGui::PushTextWrapPos(cp.x + padX + wrapW);
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(tint[0], tint[1], tint[2], 1.0f));
+    ImGui::TextUnformatted(text);
+    ImGui::PopStyleColor();
+    ImGui::PopTextWrapPos();
+    ImGui::SetCursorPos(ImVec2(cp.x, cp.y + (p1.y - p0.y) + 2.0f * sc));
+}
+
+// Project rail row: frosted pill + left->right accent gradient wash on hover/selected and
+// a glow border when selected (the title-bar chip recipe). Returns clicked.
+static bool fwProjectRow(const FwProject& p, bool selected) {
+    const float sc = ui::uiScale;
+    const float rowH = ImGui::GetFrameHeight() + 4.0f * sc;
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    const float w = ImGui::GetContentRegionAvail().x;
+    const ImVec2 p1(p0.x + w, p0.y + rowH);
+    const bool clicked = ImGui::InvisibleButton("##fw_row", ImVec2(w, rowH));
+    const bool hov = ImGui::IsItemHovered();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    if (selected || hov) {
+        ui::glassRowBackground(dl, p0, p1, 6.0f, false, false, 0.20f);
+        ui::coloredRowWash(dl, p0, p1, 6.0f, palette.accent, selected ? 0.34f : 0.16f, false);
+    }
+    if (selected) ui::glassSelectionGlow(dl, p0, p1, 6.0f, palette.accent);
+    const float ty = p0.y + (rowH - ImGui::GetTextLineHeight()) * 0.5f;
+    dl->AddText(ImVec2(p0.x + 10.0f * sc, ty), palette.toU32(palette.text), p.name.c_str());
+    if (!p.mcu.empty()) {
+        const ImVec2 ms = ImGui::CalcTextSize(p.mcu.c_str());
+        dl->AddText(ImVec2(p1.x - ms.x - 10.0f * sc, ty),
+                    palette.toU32(selected ? palette.accent : palette.textDisabled),
+                    p.mcu.c_str());
+    }
+    return clicked;
+}
+
+// Small secondary action ("Refresh"/"Recheck") parked on the right edge of the header row
+// that the next fwSectionHeader() call draws. Call IMMEDIATELY before fwSectionHeader.
+static void fwHeaderAction(const char* label, float width, std::function<void()> onClick) {
+    const ImVec2 cp = ImGui::GetCursorPos();
+    ImGui::SetCursorPosX(cp.x + ImGui::GetContentRegionAvail().x - width);
+    if (ImGui::SmallButton(label)) onClick();
+    ImGui::SetCursorPos(cp);
+}
 
 // ---- async loaders (throttled; NEVER sync in the draw path) -----------------------------
 
@@ -264,19 +442,61 @@ static void applySimResult(FwState& s, const nlohmann::json& j) {
     }
 }
 
+// ---- tab disclosure probe ----------------------------------------------------
+// T-FIN24: the tab discloses when a firmware project EXISTS. fw_projects is a
+// Python-worker-only RPC (on Linux it dies with "worker not started" whenever the
+// GUI's worker pipe isn't up — slow boot, missing runtime, or the AsyncRpc dispatch
+// thread jammed behind startup calls), so an RPC-only probe hid the tab until the
+// user happened into the Electronics workspace. The project store is plain
+// <firmware_root>/<id>/project.json sidecars on LOCAL disk (same files the trace
+// viewer reads), so probe the disk directly: read-only, throttled, worker-independent.
+bool firmwareProjectsExistOnDisk() {
+    static double lastProbe = -1e9;
+    static bool cached = false;
+    const double now = ImGui::GetTime();
+    if (now - lastProbe < 5.0) return cached;
+    lastProbe = now;
+    cached = false;
+    // Mirror engine.firmware.project.firmware_root(): AI_CAD_FIRMWARE_DIR override,
+    // else %APPDATA%/AI-CAD/firmware, else <tmp>/AI-CAD/firmware (Python
+    // tempfile.gettempdir() honors TMPDIR/TEMP/TMP, then /tmp).
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::path root;
+    if (const char* ov = std::getenv("AI_CAD_FIRMWARE_DIR"); ov && *ov) {
+        root = ov;
+    } else if (const char* ad = std::getenv("APPDATA"); ad && *ad) {
+        root = fs::path(ad) / "AI-CAD" / "firmware";
+    } else {
+        const char* tmp = std::getenv("TMPDIR");
+        if (!tmp || !*tmp) tmp = std::getenv("TEMP");
+        if (!tmp || !*tmp) tmp = std::getenv("TMP");
+        if (!tmp || !*tmp) tmp = "/tmp";
+        root = fs::path(tmp) / "AI-CAD" / "firmware";
+    }
+    if (!fs::is_directory(root, ec) || ec) return false;
+    for (fs::directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
+        if (it->is_directory(ec) && !ec && fs::is_regular_file(it->path() / "project.json", ec)) {
+            cached = true;
+            break;
+        }
+    }
+    return cached;
+}
+
 // ---- left rail: projects + sources -------------------------------------------------------
 
 static void drawProjectRail(AppState& st, float w) {
     FwState& s = S();
     const float sc = ui::uiScale;
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10 * sc, 8 * sc));
+    ui::pushGlassChildStyle(10.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12 * sc, 10 * sc));
     ImGui::BeginChild("##fw_rail", ImVec2(w, 0), ImGuiChildFlags_Border);
     ImGui::PopStyleVar();
 
-    ImGui::TextUnformatted("Projects");
-    ImGui::SameLine(ImGui::GetContentRegionAvail().x - 48.0f * sc);
-    if (ImGui::SmallButton(s.listPending ? "..." : "Refresh")) loadProjects(st, /*force=*/true);
-    ImGui::Separator();
+    fwHeaderAction(s.listPending ? "..." : "Refresh", 64.0f * sc,
+                   [&st]() { loadProjects(st, /*force=*/true); });
+    fwSectionHeader("folder_new", "Projects");
 
     // New project (create only when the toolchain family can at least be selected —
     // creation itself is always allowed; the BUILD is what fw_status gates).
@@ -287,9 +507,10 @@ static void drawProjectRail(AppState& st, float w) {
     ImGui::Combo("##fw_new_mcu", &s.newMcuIdx, kMcuFamilies,
                  (int)(sizeof(kMcuFamilies) / sizeof(kMcuFamilies[0])));
     const bool canCreate = st.workerStarted && !s.createPending;
-    if (!canCreate) ImGui::BeginDisabled();
-    if (ImGui::Button(s.createPending ? "Creating\xe2\x80\xa6" : "+ New Project",
-                      ImVec2(-1, 0))) {
+    if (fwGlassButton("##fw_create",
+                      s.createPending ? "Creating\xe2\x80\xa6" : "New Project",
+                      "new_doc", /*accent=*/true, ImGui::GetContentRegionAvail().x,
+                      canCreate)) {
         s.createPending = true;
         s.createErr.clear();
         nlohmann::json p;
@@ -308,26 +529,21 @@ static void drawProjectRail(AppState& st, float w) {
             loadProjects(st, /*force=*/true);
         });
     }
-    if (!canCreate) ImGui::EndDisabled();
-    if (!st.workerStarted && ImGui::IsItemHovered()) ImGui::SetTooltip("Worker not running");
-    if (!s.createErr.empty()) {
-        ImGui::PushStyleColor(ImGuiCol_Text,
-                              ImVec4(palette.statusErr[0], palette.statusErr[1], palette.statusErr[2], 1));
-        ImGui::TextWrapped("%s", s.createErr.c_str());
-        ImGui::PopStyleColor();
-    }
-    ImGui::Separator();
+    if (!canCreate && !st.workerStarted && ImGui::IsItemHovered())
+        ImGui::SetTooltip("Worker not running");
+    if (!s.createErr.empty()) fwBanner(s.createErr.c_str(), palette.statusErr);
+    ImGui::Spacing();
 
     if (!st.workerStarted) {
         ImGui::TextDisabled("Worker not running.");
     } else if (s.projects.empty()) {
-        if (!s.listErr.empty()) ImGui::TextWrapped("No projects. %s", s.listErr.c_str());
-        else ImGui::TextDisabled("No firmware projects yet.\nUse + New Project above.");
+        if (!s.listErr.empty()) fwBanner(s.listErr.c_str(), palette.statusWarn);
+        else ImGui::TextDisabled("No firmware projects yet.\nUse New Project above.");
     } else {
         for (int i = 0; i < (int)s.projects.size(); ++i) {
             const FwProject& p = s.projects[i];
             ImGui::PushID(i);
-            if (ImGui::Selectable(p.name.c_str(), s.selected == i)) {
+            if (fwProjectRow(p, s.selected == i)) {
                 if (s.selected != i) {
                     s.selected = i;
                     // Reset per-project consoles so results never leak across projects.
@@ -338,8 +554,6 @@ static void drawProjectRail(AppState& st, float w) {
                     s.tracePath.clear();
                 }
             }
-            ImGui::SameLine();
-            ImGui::TextDisabled("%s", p.mcu.c_str());
             ImGui::PopID();
         }
     }
@@ -348,10 +562,11 @@ static void drawProjectRail(AppState& st, float w) {
     if (s.selected >= 0 && s.selected < (int)s.projects.size()) {
         const FwProject& p = s.projects[s.selected];
         ImGui::Spacing();
-        ImGui::Separator();
-        ImGui::TextUnformatted("Sources");
+        fwSectionHeader(nullptr, "Sources");
         if (p.srcs.empty()) ImGui::TextDisabled("(none registered)");
+        if (st.fonts.mono) ImGui::PushFont(st.fonts.mono);
         for (const std::string& src : p.srcs) ImGui::BulletText("%s", src.c_str());
+        if (st.fonts.mono) ImGui::PopFont();
         if (!p.rootDir.empty()) {
             ImGui::Spacing();
             ImGui::TextDisabled("Root");
@@ -359,6 +574,7 @@ static void drawProjectRail(AppState& st, float w) {
         }
     }
     ImGui::EndChild();
+    ui::popGlassChildStyle();
 }
 
 // ---- center: build console + emulation + trace viewer ------------------------------------
@@ -367,23 +583,18 @@ static void drawBuildSection(AppState& st, float h) {
     FwState& s = S();
     const float sc = ui::uiScale;
     ImGui::BeginChild("##fw_build_sec", ImVec2(0, h), ImGuiChildFlags_None);
-    ImGui::TextUnformatted("Build");
-    ImGui::SameLine();
+    fwSectionHeader("eng_firm", "Build");
 
     const bool haveProject = s.selected >= 0 && s.selected < (int)s.projects.size();
     if (s.statusLoaded && !s.canBuild) {
         // Honest gating: no dead Build button — the doctor's guidance instead.
-        ImGui::PushStyleColor(ImGuiCol_Text,
-                              ImVec4(palette.statusWarn[0], palette.statusWarn[1],
-                                     palette.statusWarn[2], 1));
-        ImGui::TextWrapped("Toolchain missing — install cmake + arm-none-eabi-gcc "
-                           "(see Backend panel for fw_status guidance).");
-        ImGui::PopStyleColor();
+        fwBanner("Toolchain missing — install cmake + arm-none-eabi-gcc "
+                 "(see Backend panel for fw_status guidance).", palette.statusWarn);
     } else {
         const bool canGo = haveProject && st.workerStarted && !s.buildPending;
-        if (!canGo) ImGui::BeginDisabled();
-        if (ImGui::Button(s.buildPending ? "Building\xe2\x80\xa6" : "Build",
-                          ImVec2(110 * sc, 0))) {
+        if (fwGlassButton("##fw_build_btn",
+                          s.buildPending ? "Building\xe2\x80\xa6" : "Build",
+                          "eng_firm", /*accent=*/true, 0.0f, canGo)) {
             s.buildPending = true;
             s.buildDone = false;
             s.warnings.clear(); s.buildStderr.clear(); s.elfPath.clear();
@@ -413,33 +624,34 @@ static void drawBuildSection(AppState& st, float h) {
                         if (w.is_string()) s2.warnings.push_back(w.get<std::string>());
             });
         }
-        if (!canGo) ImGui::EndDisabled();
-        if (!haveProject && ImGui::IsItemHovered()) ImGui::SetTooltip("Select a project first");
-    }
-    if (s.buildDone) {
-        ImGui::SameLine();
-        if (s.buildOk) {
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.statusOk[0], palette.statusOk[1],
-                                                        palette.statusOk[2], 1));
-            ImGui::Text("OK  %.0f ms  %zu warning(s)", s.buildMs, s.warnings.size());
-        } else {
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.statusErr[0], palette.statusErr[1],
-                                                        palette.statusErr[2], 1));
-            ImGui::TextUnformatted("FAILED");
+        if (!canGo && !haveProject && ImGui::IsItemHovered())
+            ImGui::SetTooltip("Select a project first");
+        if (s.buildDone) {
+            ImGui::SameLine(0.0f, 10.0f * sc);
+            if (s.buildOk) {
+                char buf[96];
+                std::snprintf(buf, sizeof(buf), "OK  \xc2\xb7  %.0f ms  \xc2\xb7  %zu warning(s)",
+                              s.buildMs, s.warnings.size());
+                fwStatusPill(buf, palette.statusOk);
+            } else {
+                fwStatusPill("FAILED", palette.statusErr);
+            }
         }
-        ImGui::PopStyleColor();
     }
 
-    // Parsed-warnings console.
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8 * sc, 6 * sc));
+    // Parsed-warnings console (monospace, glass).
+    ui::pushGlassChildStyle(8.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10 * sc, 8 * sc));
     ImGui::BeginChild("##fw_build_console", ImVec2(0, 0), ImGuiChildFlags_Border);
     ImGui::PopStyleVar();
+    if (st.fonts.mono) ImGui::PushFont(st.fonts.mono);
     if (!s.buildDone && !s.buildPending) {
         ImGui::TextDisabled("Build output appears here.");
     } else {
         for (const std::string& w : s.warnings) {
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.statusWarn[0], palette.statusWarn[1],
-                                                        palette.statusWarn[2], 1));
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.consoleWarn[0],
+                                                        palette.consoleWarn[1],
+                                                        palette.consoleWarn[2], 1));
             ImGui::TextWrapped("%s", w.c_str());
             ImGui::PopStyleColor();
         }
@@ -452,7 +664,9 @@ static void drawBuildSection(AppState& st, float h) {
         }
         if (!s.elfPath.empty()) ImGui::TextDisabled("ELF: %s", s.elfPath.c_str());
     }
+    if (st.fonts.mono) ImGui::PopFont();
     ImGui::EndChild();
+    ui::popGlassChildStyle();
     ImGui::EndChild();
 }
 
@@ -460,31 +674,30 @@ static void drawEmulationSection(AppState& st, float h) {
     FwState& s = S();
     const float sc = ui::uiScale;
     ImGui::BeginChild("##fw_sim_sec", ImVec2(0, h), ImGuiChildFlags_None);
-    ImGui::TextUnformatted("Emulation");
+    fwSectionHeader("run_study", "Emulation");
     const bool haveProject = s.selected >= 0 && s.selected < (int)s.projects.size();
     if (haveProject) {
-        ImGui::SameLine();
-        ImGui::TextDisabled("platform: %s (Renode preferred, QEMU fallback)",
-                            s.projects[s.selected].mcu.c_str());
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.textDim[0], palette.textDim[1],
+                                                    palette.textDim[2], 1));
+        ImGui::Text("platform: %s  (Renode preferred, QEMU fallback)",
+                    s.projects[s.selected].mcu.c_str());
+        ImGui::PopStyleColor();
     }
 
     if (s.statusLoaded && !s.canEmulate) {
-        ImGui::PushStyleColor(ImGuiCol_Text,
-                              ImVec4(palette.statusWarn[0], palette.statusWarn[1],
-                                     palette.statusWarn[2], 1));
-        ImGui::TextWrapped("Emulation unavailable: install Renode (preferred) or "
-                           "qemu-system-arm.");
-        ImGui::PopStyleColor();
+        fwBanner("Emulation unavailable: install Renode (preferred) or qemu-system-arm.",
+                 palette.statusWarn);
     } else {
-        ImGui::SetNextItemWidth(-(130.0f * sc));
+        const char* runLabel = s.simPending ? "Running\xe2\x80\xa6" : "Run emulation";
+        const float runW = fwGlassButtonWidth(runLabel, "run_study");
+        ImGui::SetNextItemWidth(-(runW + 8.0f * sc));
         ImGui::InputTextWithHint("##fw_asserts",
                                  "Scenario assertions, ';'-separated  e.g. uart:hello; gpio:PA5=1",
                                  s.assertBuf, sizeof(s.assertBuf));
-        ImGui::SameLine();
+        ImGui::SameLine(0.0f, 8.0f * sc);
         const bool canGo = haveProject && st.workerStarted && !s.simPending;
-        if (!canGo) ImGui::BeginDisabled();
-        if (ImGui::Button(s.simPending ? "Running\xe2\x80\xa6" : "Run emulation",
-                          ImVec2(-1, 0))) {
+        if (fwGlassButton("##fw_sim_btn", runLabel, "run_study", /*accent=*/true, runW,
+                          canGo)) {
             s.simPending = true;
             s.simDone = false;
             s.uartLog.clear(); s.assertionLines.clear(); s.gpio.clear();
@@ -523,61 +736,74 @@ static void drawEmulationSection(AppState& st, float h) {
                 applySimResult(s2, r.result);
             });
         }
-        if (!canGo) ImGui::EndDisabled();
-        if (!haveProject && ImGui::IsItemHovered()) ImGui::SetTooltip("Select a project first");
+        if (!canGo && !haveProject && ImGui::IsItemHovered())
+            ImGui::SetTooltip("Select a project first");
     }
 
     if (s.simDone) {
-        if (s.simPassed) {
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.statusOk[0], palette.statusOk[1],
-                                                        palette.statusOk[2], 1));
-            ImGui::Text("PASSED  %.0f ms", s.simMs);
-        } else {
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.statusErr[0], palette.statusErr[1],
-                                                        palette.statusErr[2], 1));
-            ImGui::Text("NOT PASSED  %.0f ms", s.simMs);
+        {
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "%s  \xc2\xb7  %.0f ms",
+                          s.simPassed ? "PASSED" : "NOT PASSED", s.simMs);
+            fwStatusPill(buf, s.simPassed ? palette.statusOk : palette.statusErr);
         }
-        ImGui::PopStyleColor();
-        for (const std::string& a : s.assertionLines) ImGui::TextDisabled("%s", a.c_str());
+        if (st.fonts.mono) ImGui::PushFont(st.fonts.mono);
+        for (const std::string& a : s.assertionLines) {
+            const bool pass = a.rfind("PASS", 0) == 0;
+            const float* tint = pass ? palette.statusOk : palette.statusErr;
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(tint[0], tint[1], tint[2], 0.9f));
+            ImGui::TextUnformatted(a.c_str());
+            ImGui::PopStyleColor();
+        }
         if (!s.simErr.empty()) ImGui::TextDisabled("%s", s.simErr.c_str());
+        if (st.fonts.mono) ImGui::PopFont();
     }
 
     // Live UART console (auto-scrolls to the newest output).
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8 * sc, 6 * sc));
+    ui::pushGlassChildStyle(8.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10 * sc, 8 * sc));
     ImGui::BeginChild("##fw_uart_console", ImVec2(0, 0), ImGuiChildFlags_Border);
     ImGui::PopStyleVar();
+    if (st.fonts.mono) ImGui::PushFont(st.fonts.mono);
     if (s.uartLog.empty()) {
         ImGui::TextDisabled(s.simPending ? "Emulator starting\xe2\x80\xa6"
                                          : "UART / semihosting output appears here.");
     } else {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.consoleDim[0], palette.consoleDim[1],
-                                                    palette.consoleDim[2], 1));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.consoleDefault[0],
+                                                    palette.consoleDefault[1],
+                                                    palette.consoleDefault[2], 1));
         ImGui::TextUnformatted(s.uartLog.c_str());
         ImGui::PopStyleColor();
         if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 4.0f) ImGui::SetScrollHereY(1.0f);
     }
+    if (st.fonts.mono) ImGui::PopFont();
     ImGui::EndChild();
+    ui::popGlassChildStyle();
     ImGui::EndChild();
 }
 
 static void drawTraceViewer(AppState& st) {
-    (void)st;
     FwState& s = S();
     const float sc = ui::uiScale;
     ImGui::BeginChild("##fw_trace_sec", ImVec2(0, 0), ImGuiChildFlags_None);
-    ImGui::TextUnformatted("GPIO trace");
+    fwSectionHeader("activity", "GPIO trace");
     if (!s.tracePath.empty()) {
-        ImGui::SameLine();
-        ImGui::TextDisabled("%s", s.tracePath.c_str());
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.textDisabled[0],
+                                                    palette.textDisabled[1],
+                                                    palette.textDisabled[2], 1));
+        ImGui::TextUnformatted(s.tracePath.c_str());
+        ImGui::PopStyleColor();
     }
 
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8 * sc, 6 * sc));
+    ui::pushGlassChildStyle(8.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10 * sc, 8 * sc));
     ImGui::BeginChild("##fw_trace_body", ImVec2(0, 0), ImGuiChildFlags_Border);
     ImGui::PopStyleVar();
     if (s.gpio.empty()) {
         ImGui::TextDisabled("No GPIO events. Run an emulation with gpio: assertions —\n"
                             "the aicad.firmware.trace/1 artifact renders here as waveforms.");
         ImGui::EndChild();
+        ui::popGlassChildStyle();
         ImGui::EndChild();
         return;
     }
@@ -606,15 +832,30 @@ static void drawTraceViewer(AppState& st) {
     const float laneH  = 30.0f * sc;
     const float plotW  = std::max(60.0f, ImGui::GetContentRegionAvail().x - labelW - 8.0f * sc);
     const ImU32 waveCol = palette.toU32(palette.accent);
+    const ImU32 glowCol = ImGui::GetColorU32(ImVec4(palette.accent[0], palette.accent[1],
+                                                    palette.accent[2], 0.16f));
     const ImU32 gridCol = palette.toU32(palette.glassBorder);
+    // Wave segments get a soft accent glow pass under the crisp line (oscilloscope look).
+    auto waveSeg = [&](ImVec2 a, ImVec2 b) {
+        dl->AddLine(a, b, glowCol, 4.5f * sc);
+        dl->AddLine(a, b, waveCol, ui::metrics::stroke(2.0f));
+    };
 
+    if (st.fonts.mono) ImGui::PushFont(st.fonts.mono);
+    int laneIdx = 0;
     for (const std::string& pin : pins) {
         const ImVec2 rowP = ImGui::GetCursorScreenPos();
+        // Faint alternating lane wash so adjacent channels read as separate rows.
+        if (laneIdx % 2 == 1)
+            ui::coloredRowWash(dl, rowP, ImVec2(rowP.x + ImGui::GetContentRegionAvail().x,
+                                                rowP.y + laneH),
+                               4.0f, palette.text, 0.05f, false);
         ImGui::Text("%s", pin.c_str());
         const float x0 = rowP.x + labelW;
         const float yHi = rowP.y + 4.0f * sc;            // level 1
         const float yLo = rowP.y + laneH - 8.0f * sc;    // level 0
-        dl->AddLine(ImVec2(x0, yLo), ImVec2(x0 + plotW, yLo), gridCol, 1.0f);
+        dl->AddLine(ImVec2(x0, yLo), ImVec2(x0 + plotW, yLo), gridCol,
+                    ui::metrics::stroke(1.0f));
 
         // Step waveform: horizontal hold at the current level, vertical edge at each event.
         float prevX = x0;
@@ -626,22 +867,25 @@ static void drawTraceViewer(AppState& st) {
             const float eyNew = e.level ? yHi : yLo;
             if (prevLevel >= 0) {
                 const float eyOld = prevLevel ? yHi : yLo;
-                dl->AddLine(ImVec2(prevX, eyOld), ImVec2(ex, eyOld), waveCol, 2.0f);
+                waveSeg(ImVec2(prevX, eyOld), ImVec2(ex, eyOld));
                 if (prevLevel != e.level)
-                    dl->AddLine(ImVec2(ex, eyOld), ImVec2(ex, eyNew), waveCol, 2.0f);
+                    waveSeg(ImVec2(ex, eyOld), ImVec2(ex, eyNew));
             }
             prevX = ex;
             prevLevel = e.level;
         }
         if (prevLevel >= 0) {
             const float ey = prevLevel ? yHi : yLo;
-            dl->AddLine(ImVec2(prevX, ey), ImVec2(x0 + plotW, ey), waveCol, 2.0f);
+            waveSeg(ImVec2(prevX, ey), ImVec2(x0 + plotW, ey));
         }
         ImGui::Dummy(ImVec2(0, laneH - ImGui::GetTextLineHeightWithSpacing()));
+        ++laneIdx;
     }
+    if (st.fonts.mono) ImGui::PopFont();
     if (anyT) ImGui::TextDisabled("t: %.1f .. %.1f ms", xMin, xMax);
     else      ImGui::TextDisabled("no timestamps — event order (seq %d .. %d)", (int)xMin, (int)xMax);
     ImGui::EndChild();
+    ui::popGlassChildStyle();
     ImGui::EndChild();
 }
 
@@ -650,55 +894,56 @@ static void drawTraceViewer(AppState& st) {
 static void drawBackendRail(AppState& st, float w) {
     FwState& s = S();
     const float sc = ui::uiScale;
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10 * sc, 8 * sc));
+    ui::pushGlassChildStyle(10.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12 * sc, 10 * sc));
     ImGui::BeginChild("##fw_backend", ImVec2(w, 0), ImGuiChildFlags_Border);
     ImGui::PopStyleVar();
 
-    ImGui::TextUnformatted("Backend");
-    ImGui::SameLine(ImGui::GetContentRegionAvail().x - 48.0f * sc);
-    if (ImGui::SmallButton(s.statusPending ? "..." : "Recheck")) loadStatus(st, /*force=*/true);
-    ImGui::Separator();
+    fwHeaderAction(s.statusPending ? "..." : "Recheck", 68.0f * sc,
+                   [&st]() { loadStatus(st, /*force=*/true); });
+    fwSectionHeader("health_check", "Backend");
 
     if (!s.statusLoaded) {
         ImGui::TextDisabled(s.statusErr.empty() ? "Checking fw_status\xe2\x80\xa6"
                                                 : s.statusErr.c_str());
     } else {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const float dotR = 4.0f * sc;
         for (const FwState::ToolRow& t : s.tools) {
+            const ImVec2 rp = ImGui::GetCursorScreenPos();
+            const float rowH = ImGui::GetFrameHeight();
+            const ImVec2 c(rp.x + dotR + 2.0f * sc, rp.y + rowH * 0.5f);
             if (t.found) {
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.statusOk[0],
-                                                            palette.statusOk[1],
-                                                            palette.statusOk[2], 1));
-                ImGui::TextUnformatted("\xe2\x97\x8f");
-                ImGui::PopStyleColor();
+                // Soft glow halo + solid core (the "tool present" look).
+                dl->AddCircleFilled(c, dotR + 2.5f * sc,
+                                    ImGui::GetColorU32(ImVec4(palette.statusOk[0],
+                                        palette.statusOk[1], palette.statusOk[2], 0.18f)));
+                dl->AddCircleFilled(c, dotR, palette.toU32(palette.statusOk));
             } else {
-                ImGui::TextDisabled("\xe2\x97\x8b");
+                dl->AddCircle(c, dotR, palette.toU32(palette.textDisabled), 0,
+                              ui::metrics::stroke(1.0f));
             }
-            ImGui::SameLine();
-            ImGui::TextUnformatted(t.name.c_str());
+            ImGui::Dummy(ImVec2(dotR * 2.0f + 10.0f * sc, rowH));
+            ImGui::SameLine(0.0f, 0.0f);
+            if (t.found) ImGui::TextUnformatted(t.name.c_str());
+            else         ImGui::TextDisabled("%s", t.name.c_str());
             if (!t.info.empty() && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", t.info.c_str());
         }
         for (const std::string& b : s.banners) {
             ImGui::Spacing();
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.statusWarn[0], palette.statusWarn[1],
-                                                        palette.statusWarn[2], 1));
-            ImGui::TextWrapped("%s", b.c_str());
-            ImGui::PopStyleColor();
+            fwBanner(b.c_str(), palette.statusWarn);
         }
     }
 
     ImGui::Spacing();
-    ImGui::Separator();
-    ImGui::TextUnformatted("Flash & Debug");
+    fwSectionHeader("issue_bug", "Flash & Debug");
     // Honest gating (task DoD): the buttons only EXIST when fw_status says the backend
     // (probe-rs / esptool) is present; otherwise the doctor's guidance shows instead.
     if (!s.statusLoaded) {
         ImGui::TextDisabled("Waiting for fw_status\xe2\x80\xa6");
     } else if (!s.canFlash) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.statusWarn[0], palette.statusWarn[1],
-                                                    palette.statusWarn[2], 1));
-        ImGui::TextWrapped("Flashing/debug unavailable: `cargo install probe-rs-tools` "
-                           "(Cortex-M) or `pip install esptool` (ESP32).");
-        ImGui::PopStyleColor();
+        fwBanner("Flashing/debug unavailable: `cargo install probe-rs-tools` (Cortex-M) "
+                 "or `pip install esptool` (ESP32).", palette.statusWarn);
     } else {
         ImGui::SetNextItemWidth(-1);
         ImGui::InputTextWithHint("##fw_chip", "Chip (e.g. STM32F407VGTx)", s.chipBuf,
@@ -722,21 +967,26 @@ static void drawBackendRail(AppState& st, float w) {
                 s2.hwOut = out;
             });
         };
-        if (!canHw || !haveElf) ImGui::BeginDisabled();
-        if (ImGui::Button(s.hwPending ? "Working\xe2\x80\xa6" : "Flash ELF", ImVec2(-1, 0)))
+        const float fullW = ImGui::GetContentRegionAvail().x;
+        if (fwGlassButton("##fw_flash", s.hwPending ? "Working\xe2\x80\xa6" : "Flash ELF",
+                          "eng_firm", /*accent=*/true, fullW, canHw && haveElf))
             hwCall("fw_flash", {{"elf_path", s.elfPath}, {"chip", std::string(s.chipBuf)}});
-        if (!canHw || !haveElf) ImGui::EndDisabled();
         if (!haveElf && ImGui::IsItemHovered())
             ImGui::SetTooltip("Build first — the last successful ELF is flashed");
-        if (!canHw) ImGui::BeginDisabled();
-        if (ImGui::Button("Debug: reset + run", ImVec2(-1, 0)))
+        if (fwGlassButton("##fw_dbg_run", "Debug: reset + run", "run_study",
+                          /*accent=*/false, fullW, canHw))
             hwCall("fw_debug_start", {{"chip", std::string(s.chipBuf)}});
-        if (ImGui::Button("Debug: halt", ImVec2(-1, 0)))
+        if (fwGlassButton("##fw_dbg_halt", "Debug: halt", nullptr,
+                          /*accent=*/false, fullW, canHw))
             hwCall("fw_debug_halt", {{"chip", std::string(s.chipBuf)}});
-        if (!canHw) ImGui::EndDisabled();
-        if (!s.hwOut.empty()) ImGui::TextWrapped("%s", s.hwOut.c_str());
+        if (!s.hwOut.empty()) {
+            ImGui::Spacing();
+            const bool ok = s.hwOut.rfind("OK", 0) == 0;
+            fwBanner(s.hwOut.c_str(), ok ? palette.statusOk : palette.statusErr);
+        }
     }
     ImGui::EndChild();
+    ui::popGlassChildStyle();
 }
 
 // ---- AI_CAD_SHOT=firmware fixture ---------------------------------------------------------
@@ -786,14 +1036,15 @@ static void drawFirmwareWorkspaceBody(AppState& st) {
     const float sc = ui::uiScale;
     const float railW = 250.0f * sc;
     const float backW = 260.0f * sc;
-    const float gutter = 8.0f * sc;
+    const float gutter = 10.0f * sc;
 
     drawProjectRail(st, railW);
     ImGui::SameLine(0.0f, gutter);
 
     const float midW =
         std::max(220.0f * sc, ImGui::GetContentRegionAvail().x - backW - gutter);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12 * sc, 8 * sc));
+    ui::pushGlassChildStyle(10.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14 * sc, 10 * sc));
     ImGui::BeginChild("##fw_center", ImVec2(midW, 0), ImGuiChildFlags_Border);
     ImGui::PopStyleVar();
     {
@@ -805,6 +1056,7 @@ static void drawFirmwareWorkspaceBody(AppState& st) {
         drawTraceViewer(st);
     }
     ImGui::EndChild();
+    ui::popGlassChildStyle();
 
     ImGui::SameLine(0.0f, gutter);
     drawBackendRail(st, backW);
@@ -820,14 +1072,16 @@ bool firmwareTabVisible(AppState& st) {
     // ECAD in play → firmware is the natural next step (T-FIN24 disclosure rule).
     if (st.activeWorkspace == AppState::Workspace::Electronics) return true;
 #ifdef __EMSCRIPTEN__
-    // No Python worker on web: never probe fw_projects for tab disclosure.
+    // No project disk on web: never probe for tab disclosure.
     (void)st;
     return false;
 #else
     firmware::FwState& s = firmware::S();
-    // Kick the throttled async listing so existing projects disclose the tab at startup.
+    // Kick the throttled async listing so the rail is warm when the user enters.
     firmware::loadProjects(st);
-    return s.listedOnce && !s.projects.empty();
+    // Disclose on the worker listing OR the local disk probe — the disk probe covers
+    // the boot window where the Python-worker-only fw_projects RPC can't answer yet.
+    return (s.listedOnce && !s.projects.empty()) || firmware::firmwareProjectsExistOnDisk();
 #endif
 }
 

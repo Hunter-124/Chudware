@@ -15,6 +15,9 @@ namespace ui {
 // The hub rail skips the Graph button when this is false.
 bool plmGraphAvailable();
 
+// True once the first cad_graph_get response has landed (headless shot sync).
+bool plmGraphLoaded();
+
 // Drop caches when the active project folder changes (called from the hub shell).
 void plmGraphOnProjectChanged();
 

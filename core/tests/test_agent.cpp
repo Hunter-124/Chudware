@@ -543,15 +543,20 @@ TEST_CASE("openai parse") {
     CHECK(pr.text == "answer");
     CHECK(pr.thinking == "thought");
 
-    // Reasoning model that emitted ONLY reasoning (empty content) -> fall back to it so any
-    // inline ops JSON survives instead of the run seeing an empty reply.
+    // Reasoning model that emitted ONLY reasoning (empty content) -> text stays EMPTY:
+    // extraction must see the model's actions, never its scratchpad (no CoT->text
+    // fallback — a JSON-ish blob the model is mulling over is not an answer).
     json only_reason = {{"choices", json::array({{{"message",
                         {{"content", ""}, {"reasoning_content", "{\"ops\":[]}"}}}}})}};
-    CHECK(openai_parse_response(only_reason).text == "{\"ops\":[]}");
+    ParsedReply onlyr = openai_parse_response(only_reason);
+    CHECK(onlyr.text == "");
+    CHECK(onlyr.thinking == "{\"ops\":[]}");
 
-    // The `reasoning` spelling (some servers) is also honored.
+    // The `reasoning` spelling (some servers) is also captured — as thinking, not text.
     json alt = {{"choices", json::array({{{"message", {{"reasoning", "r"}}}}})}};
-    CHECK(openai_parse_response(alt).text == "r");
+    ParsedReply altr = openai_parse_response(alt);
+    CHECK(altr.text == "");
+    CHECK(altr.thinking == "r");
 }
 
 TEST_CASE("mock provider repeats last") {

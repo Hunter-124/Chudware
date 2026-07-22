@@ -1970,3 +1970,91 @@ dropdown (MCP `cam_add_setup(machine_profile=)` exists); all-setups playback.
 **Gotcha:** host playhead timing duplicates the engine feed-limited model —
 jobs with machine.accel > 0 will see scrubber/sim divergence (HUD reads
 cycle_time_s for display).
+
+### 2026-07-21 — agent-harness crash fix + suite cleanup wave
+**Crash (user-reported, SIGABRT core 3515720):** a `kimi-k3` cloud `agent_run_v2`
+held `WorkerClient::callMtx_` for the whole (multi-minute) daemon round trip, so
+the GUI thread hard-blocked on a routine `config_list` and the app froze, then
+aborted. Fix: contended engine-bound calls now run on a short-lived side
+`EngineClient` (the established agent_cancel/agent_steer pattern; hostd serves
+each connection on its own thread and the doc registry gates multi-writer
+overlap) in `services/worker/worker_client.{h,cpp}`; long runs
+(agent_run_v2/agent_mission_v1), minting calls, agent-seam name translations,
+and pipe-bound methods keep the legacy serialization. Also wrapped the three
+detached agent-job threads in `host/src/core/jobs.cpp` with a catch-all that
+lands the job in an error state (an escaped nlohmann type_error was a loaded
+std::terminate→SIGABRT gun). Host rebuild + 5/5 ctest green.
+**Python harness (27 → 0 failures):** real loop regressions fixed in
+`agent/loop.py` — `_loop_done_guardrail` demanded `verify_battery` evidence the
+quick loop can never produce (every run burned its full iteration budget;
+battery floor now skipped only where no battery tool exists, assembly fit
+reports feed the interference check), and `run_turn` re-raises context overflow
+after the compaction cap instead of misclassifying it as provider_error.
+Everything else was drift, fixed at the drifted layer: role-card data
+(`sourcing_specialist` trimmed to the 14-tool cap, `drawing_detailer` stage
+vocabulary + new `playbooks/drawing_package.yaml`, `routing.yaml` rows for 7
+newer roles), stale test mocks (battery_payload kwarg, mega-8 typed_refusal,
+mime/source evidence fields, GBNF `+` acceptor, role-prompt skills injection,
+mega-13 zero-tool-done, mode-unioned default tools). Systemic: `conftest.py`
+gained a meta_path alias finder so `agent`/`engine`/… symlink imports resolve
+to the SAME module object as `services.*` (was: two live copies, monkeypatches
+landed on the wrong one); `session_cmds.py` imports compaction via
+`importlib.import_module` so sys.modules patches hold; delegate tests made
+hermetic against ambient config.json ai_roles (load_config/resolve stubs);
+`test_mega4` stubs the ambient-state terminal mech/ecad gates;
+`engine_oracle/sim/em/antenna_bridge.py` restores process CWD after openEMS
+deletes its temp dir (was order-dependent suite-wide pollution);
+`engine/doc/test_aicm.py` fixture path updated for the N0c contracts/ move.
+**Providers:** cursor `_CURSOR_MODEL_MAP` pruned of 5 upstream-dead wire ids
+(live-verified) + clear dead-model error naming the working default; dead
+`cursor/*` rows removed from `host/src/ui/model_registry.h`, `composer-2`
+added; xAI surfaces "re-login required" when every stored account is
+refresh-revoked and labels spending-limit 403s distinctly (the user's pool IS
+12/13 revoked + 1 spend-blocked — re-login is a user action, endpoints are
+fine). `pyvista` was missing from system python (render-dependent tests
+silently degraded) — installed.
+**Verify:** `pytest agent engine/doc` 2300+ green; host ninja + ctest green.
+**Deferred/gotchas:** `scripts/check.py` feature_surface_audit is still RED
+(pre-existing since N0b: missing ribbon handlers for Sketch3D/ReverseEng —
+untouched by this wave); in-proc mode (AI_CAD_ENGINE_DAEMON=0) still serializes
+everything behind callMtx_ (daemon is the default); xAI re-login + credits are
+user actions, not code.
+
+### Firmware workspace glass revamp (2026-07-21)
+Restyled the Firmware tab (`host/src/ui/firmware/fw_workspace.cpp`, the only
+file touched) onto the shared liquid-glass language, stealing the PLM/title-bar
+recipes via `ui_theme.h` primitives: rails + center + consoles are now
+`pushGlassChildStyle` glass children; section titles are accent icon + accent
+label + accent→transparent gradient underline (local `fwSectionHeader`);
+build/sim verdicts render as tinted status pills (`fwStatusPill`, the
+graph-tab kind-pill recipe); CTAs (New Project, Build, Run emulation, Flash
+ELF) are accent glass buttons (`fwGlassButton`, the plmGlassButton recipe with
+a manual `enabled` dim since BeginDisabled can't fade draw-list paint);
+doctor guidance/flash results render as tinted `glassCardWash` banners
+(`fwBanner`); project rows get the title-bar chip treatment (frosted pill +
+`coloredRowWash` hover/selected gradient + `glassSelectionGlow`); backend tool
+dots are glow-halo circles; consoles + sources + GPIO pin labels use
+`st.fonts.mono`; GPIO waveforms got a soft accent glow pass + alternating lane
+washes. **No behavior change** — all RPC payloads, throttling, honest-gating
+rules, and the `AI_CAD_SHOT=firmware` fixture are untouched. **Verify:** host
+ninja build green; `gui_lint icons/theme/scale` clean; headless
+`AI_CAD_SHOT=firmware` screenshot renders all panels. **Gotchas:**
+`scripts/check.py` feature_surface_audit remains RED for the pre-existing
+Sketch3D/RevEng ribbon-handler gap (recorded since N0b; unrelated).
+
+### Firmware tab startup disclosure fix (2026-07-21)
+Bug: the Firmware title-bar tab stayed hidden until the user opened the
+Electronics workspace. Root cause: T-FIN24 disclosure keyed "project exists" on
+the async `fw_projects` RPC, which is Python-worker-only — on Linux it fails
+with "worker not started" whenever the GUI's worker pipe isn't up (slow Python
+boot, missing runtime, AsyncRpc dispatch thread jammed behind startup calls),
+so `listedOnce && !projects.empty()` never became true. Electronics short-circuits
+`firmwareTabVisible()` to true, which masked it. Fix (fw_workspace.cpp/.h only):
+`firmwareProjectsExistOnDisk()` — a throttled (5s) read-only scan of
+`firmware_root()` for `<id>/project.json` sidecars, mirroring
+`engine.firmware.project.firmware_root()` env resolution
+(`AI_CAD_FIRMWARE_DIR` → `%APPDATA%` → `TMPDIR/TEMP/TMP` → `/tmp`); the tab now
+discloses on `workerListing || diskProbe`. **Verify:** host ninja green;
+headless shots at 2400x900 — with a seeded project the Firmware chip renders at
+startup (on a box with NO Python worker), with no projects the chip is absent
+(disclosure still conditional, not always-on).

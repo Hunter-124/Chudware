@@ -138,6 +138,8 @@ inline void wasmBootDom(const char* msg) {
 #include "ui/scenarios.h"  // scripted screenshot/test scenarios (m1/sketch/asm/fea/evalmass/activity)
 // [workspace-tabs seam] full-body workspace renderers for PLM and PartsLibrary.
 #include "ui/plm/plm_workspace.h"
+#include "ui/plm/plm_quickbar.h"  // ui::plmAutoRecordSave — record agent self-saves in PLM
+#include "ui/plm/graph_tab.h"  // plmGraphLoaded — PLM graph shot sync
 #include "ui/parts/parts_workspace.h"
 
 #include <filesystem>      // Wave N: ecad export output dir + W14: flat-pattern DXF export
@@ -1903,6 +1905,15 @@ WASM_BOOT_LOG("[wasm-boot] loadIcons done\n");
         // go stale after a topology rebuild retags them. (docUndo/docRedo also refresh explicitly,
         // which is redundant-but-harmless; this listener covers the ops/resync paths.)
         ui::refreshFeatureHighlight(st);
+        // Doc-driven reference auto-hide on EVERY tree mutation, not just mesh commits. The
+        // interactive path reaches applyDocDrivenVisibility via commitDocMeshFromParsed, but
+        // agent/worker-driven updates can refresh the tree WITHOUT a mesh commit (end-of-run
+        // resync when the live preview already landed the final revision; daemon-pushed
+        // restoreSnapshot with no aicm), which left autoHiddenPlanes/hiddenFeatures stale and
+        // the origin/planes/axes visible after the AI's first solid feature. Idempotent, and
+        // honors the same user-toggle overrides (planesUserToggled / axesUserToggled /
+        // originUserToggled / per-id sticky) as the interactive path — a manual show still wins.
+        st.applyDocDrivenVisibility(st.docMirror.tree());
         // Push feature datum geometry (axes/planes/points/csys) to the renderer so CREATED reference
         // geometry is visible — datums build no body, so the engine ships them out-of-band in the
         // ops-response. Tolerant of missing fields / an engine that doesn't send "datums" (the array
@@ -2404,6 +2415,7 @@ WASM_BOOT_LOG("[wasm-boot] loadIcons done\n");
         if (pg && std::strcmp(pg, "planning") == 0) ui::plmSelectPlanningPage();
         else if (pg && std::strcmp(pg, "overview") == 0) ui::plmSelectOverviewPage();
         else if (pg && std::strcmp(pg, "files") == 0) ui::plmSelectFilesPage();
+        else if (pg && std::strcmp(pg, "graph") == 0) ui::plmSelectGraphPage();
         else ui::plmSelectGitPage();
         if (st.plmProjectDir.empty()) {
             std::error_code ec;
@@ -3005,6 +3017,18 @@ WASM_BOOT_LOG("[wasm-boot] entering main loop\n");
                                     std::lock_guard<std::mutex> lk(st.job.mtx);
                                     st.job.partName = std::move(pn);
                                 }
+                            } else if (orchKind == "run_note") {
+                                // Agent self-persistence (file-first create / milestone re-save /
+                                // memory-stage rename) happens in-daemon, so the host's doc_save
+                                // PLM hook never sees it. Record those saves into project history
+                                // here — plmAutoRecordSave self-gates (worker up, auto_commit on,
+                                // path inside the PLM project folder) and is async/non-blocking.
+                                const std::string note = data.value("note", std::string());
+                                if (note == "file_created" || note == "milestone_saved" ||
+                                    note == "file_renamed") {
+                                    const std::string p = data.value("path", std::string());
+                                    if (!p.empty()) ui::plmAutoRecordSave(st, p);
+                                }
                             } else if (orchKind == "doc.preview") {
                                 // Live viewport preview: agent successfully applied ops.
                                 // data = {doc_id, revision, aicm_path}. Monotonic rev guard +
@@ -3224,6 +3248,18 @@ WASM_BOOT_LOG("[wasm-boot] entering main loop\n");
                         st.docTabs[st.activeTab].title = partName;
                     }
                     st.syncActiveTabTitle();
+                    // File-first persistence: the core agent already saved the part itself
+                    // (modeling start + milestone re-saves + memory-stage rename) and reported
+                    // the path in the run result's saved_path. Save straight onto THAT path —
+                    // unique-ifying here would write a duplicate <name>_2.step+ next to the
+                    // agent's <name>.step+. Still goes through featureTreeSaveDocToPath so the
+                    // tab path / dirty clear / recents / PLM auto-record all fire as usual.
+                    if (!st.job.savedPath.empty()) {
+                        st.addLog("[v2] saving named part onto agent-persisted path -> " +
+                                  st.job.savedPath);
+                        ui::featureTreeSaveDocToPath(st, st.job.savedPath,
+                                                     /*requireNonEmpty=*/true);
+                    } else {
                     // Sanitize to a filesystem-safe stem (match drawing export style).
                     std::string stem;
                     stem.reserve(partName.size());
@@ -3281,6 +3317,7 @@ WASM_BOOT_LOG("[wasm-boot] entering main loop\n");
                     st.addLog("[v2] auto-saving named part -> " + savePath);
                     ui::featureTreeSaveDocToPath(st, savePath, /*requireNonEmpty=*/true);
 #endif
+                    }  // end legacy unique-ify auto-save (no agent-persisted saved_path)
                 }
             }
             // --- end C22b ---
@@ -5066,6 +5103,13 @@ WASM_BOOT_LOG("[wasm-boot] entering main loop\n");
         // simdisc: keep the loop alive until the scenario forced the study picker open, then
         // give the popup a few frames to draw before capturing.
         if (st.wantSimDisc) shotFrame = st.simDiscShotDone ? 30 : 99999;
+        // PLM graph shot: hold until the first cad_graph_get payload lands, then
+        // give the force layout ~2s (120 frames) to settle before capturing.
+        if (st.activeWorkspace == AppState::Workspace::PLM) {
+            static int plmGraphShotAt = -1;
+            if (plmGraphShotAt < 0 && ui::plmGraphLoaded()) plmGraphShotAt = st.frame + 120;
+            shotFrame = plmGraphShotAt > 0 ? plmGraphShotAt : 99999;
+        }
         // T-G15 iconpipe: keep the loop alive (offscreen icon renders happen in tick()) until every
         // recipe is captured, then exit promptly — the --shot backbuffer capture is a throwaway.
         if (st.wantIconPipe) shotFrame = st.iconPipeShotDone ? 3 : 99999;

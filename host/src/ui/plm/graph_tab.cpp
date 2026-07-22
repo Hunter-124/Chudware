@@ -112,6 +112,8 @@ struct GraphTabState {
     std::string focusPending; // plmGraphFocus request to apply on next draw
     // ME489-scale guards ----------------------------------------------------
     bool hideArchive = true;
+    // Project-view cleanup: skip nodes with no visible links (scattered dots).
+    bool hideUnconnected = true;
     bool truncated = false;
     int nodeCountFull = 0;   // full graph size (pre-cap)
     int edgeCountFull = 0;
@@ -471,7 +473,9 @@ void rebuildVisible(GraphTabState& G) {
     if (G.scopeDocId.empty()) {
         // ---- PROJECT VIEW ---------------------------------------------------
         for (int i = 0; i < (int)G.nodes.size(); ++i) {
-            if (isProjectKind(G.nodes[i].kind)) {
+            // The project-root node itself is not drawn — it is just a
+            // fan-out hub for CONTAINS edges and clutters the canvas.
+            if (isProjectKind(G.nodes[i].kind) && G.nodes[i].kind != "project") {
                 G.visibleIdx.push_back(i);
                 visIds.insert(G.nodes[i].id);
             }
@@ -543,6 +547,22 @@ void rebuildVisible(GraphTabState& G) {
             ve.aggCount = a.count;
             ve.srcEdgeIdx = a.srcEdgeIdx;
             G.visibleEdges.push_back(std::move(ve));
+        }
+
+        // "Hide unconnected": drop nodes with no visible edges — they render
+        // as scattered dots with no context. List view still shows them.
+        if (G.hideUnconnected) {
+            std::unordered_set<std::string> linked;
+            linked.reserve(G.visibleEdges.size() * 2);
+            for (const auto& ve : G.visibleEdges) {
+                linked.insert(ve.src);
+                linked.insert(ve.dst);
+            }
+            std::vector<int> kept;
+            kept.reserve(G.visibleIdx.size());
+            for (int i : G.visibleIdx)
+                if (linked.count(G.nodes[i].id)) kept.push_back(i);
+            G.visibleIdx.swap(kept);
         }
     } else if (G.scopeDecomp) {
         // ---- ASSEMBLY DECOMPOSITION ----------------------------------------
@@ -698,6 +718,7 @@ void rebuildVisible(GraphTabState& G) {
             (void)d;
             auto it = G.idIndex.find(id);
             if (it == G.idIndex.end()) continue;
+            if (G.nodes[it->second].kind == "project") continue;  // never drawn
             G.visibleIdx.push_back(it->second);
             visIds.insert(id);
         }
@@ -2680,6 +2701,9 @@ void drawListView(AppState& /*st*/, ImVec2 canvasSz) {
 
 bool plmGraphAvailable() { return S().available; }
 
+// True once a cad_graph_get response has landed (headless shot sync).
+bool plmGraphLoaded() { return !S().loading && !S().nodes.empty(); }
+
 void plmGraphOnProjectChanged() {
     auto& G = S();
     maybeSaveLayout(G, /*force=*/true);  // final solve-state save for old project
@@ -2849,6 +2873,20 @@ void plmDrawGraphPage(AppState& st) {
             ImGui::SetTooltip(
                 "Exclude _archive_stale / _archive / archive / .trash\n"
                 "directories from the graph (default ON).");
+        }
+    }
+    ImGui::SameLine();
+    // Hide unconnected — ON by default; project view only, no refetch needed.
+    {
+        bool hu = G.hideUnconnected;
+        if (ImGui::Checkbox("Hide unconnected", &hu) && hu != G.hideUnconnected) {
+            G.hideUnconnected = hu;
+            rebuildVisible(G);
+        }
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::SetTooltip(
+                "Hide nodes with no visible links (default ON).\n"
+                "They remain available in List view.");
         }
     }
     ImGui::SameLine();

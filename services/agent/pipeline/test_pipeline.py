@@ -71,6 +71,19 @@ def _multi_manifest() -> dict:
     return m
 
 
+# mega-8: the multi-domain PLAN/BUILD soft gate (dag/node_runner.py) refuses a
+# bare auto-complete on gated nodes (n_plan) — the done-mock agent must carry a
+# schema-valid typed refusal or n_plan escalates to failed and the PLAN phase
+# soft-reconciles (entered, never exited) instead of recording its exit gate.
+_TYPED_REFUSAL_RESULT = {
+    "typed_refusal": {
+        "reason": "single-part mechanical mission — no delegation needed",
+        "domains_considered": ["mechanical"],
+        "why_flat": "one deliverable, one domain; a flat plan is correct",
+    }
+}
+
+
 # ===========================================================================
 # 1. Manifest validator — rule by rule (contract §16)
 # ===========================================================================
@@ -622,7 +635,7 @@ def test_run_mission_execute_dag_records_all_phases_in_ledger(monkeypatch):
         stop_reason = "confirmed"
         success = True
         final_code = None
-        result = None
+        result = _TYPED_REFUSAL_RESULT
 
     def _mock_agent(request, context_pack):
         return _DoneResult()
@@ -631,7 +644,10 @@ def test_run_mission_execute_dag_records_all_phases_in_ledger(monkeypatch):
     # ledger (no fabricated PASS). This is an all-nodes-done integration case, so
     # stand in a reviewer that records PASS for every AC — the pipeline completes
     # ONLY because the reviewer passed the criteria, which is the honest contract.
-    def _reviewer_pass(manifest, ledger, *, doc_id=None, actor="reviewer"):
+    # (Signature matches reviewer_exec.run_acceptance_checks: loop._run_reviewer_checks
+    # also passes battery_payload since mega-10.)
+    def _reviewer_pass(manifest, ledger, *, doc_id=None, actor="reviewer",
+                       battery_payload=None):
         out = {}
         for d in manifest.get("deliverables", []):
             for ac in d.get("acceptance_criteria", []):
@@ -672,11 +688,13 @@ def test_mission_status_tool_renders_all_phases(monkeypatch):
     from services.mcp import mission_tools
 
     class _DoneResult:
-        stop_reason = "confirmed"; success = True; final_code = None; result = None
+        stop_reason = "confirmed"; success = True; final_code = None
+        result = _TYPED_REFUSAL_RESULT
 
     # T-W30: stand in a reviewer that PASSes every AC so the honest VERIFY gate
     # (which reads real criterion results) lets the mission reach deliver.
-    def _reviewer_pass(manifest, ledger, *, doc_id=None, actor="reviewer"):
+    def _reviewer_pass(manifest, ledger, *, doc_id=None, actor="reviewer",
+                       battery_payload=None):
         for d in manifest.get("deliverables", []):
             for ac in d.get("acceptance_criteria", []):
                 ledger.add_criterion_result(actor, ac["id"], "PASS",
@@ -722,7 +740,8 @@ def _run_mission_all_nodes_done(run_id, manifest, reviewer, monkeypatch):
     from services.agent.providers.mock_provider import MockProvider
 
     class _DoneResult:
-        stop_reason = "confirmed"; success = True; final_code = None; result = None
+        stop_reason = "confirmed"; success = True; final_code = None
+        result = _TYPED_REFUSAL_RESULT
 
     monkeypatch.setattr("services.agent.reviewer_exec.run_acceptance_checks", reviewer)
     return loop.run_mission(
@@ -736,7 +755,8 @@ def test_verify_gate_fails_on_failing_criterion(monkeypatch):
     """A deliberately FAILING acceptance criterion must NOT pass VERIFY: the
     mission routes to CORRECT, deliver is never reached, and the failing AC is
     named in the stop_reason. This is the fabricated-PASS bug's regression."""
-    def _reviewer_fail(manifest, ledger, *, doc_id=None, actor="reviewer"):
+    def _reviewer_fail(manifest, ledger, *, doc_id=None, actor="reviewer",
+                       battery_payload=None):
         for d in manifest.get("deliverables", []):
             for ac in d.get("acceptance_criteria", []):
                 ledger.add_criterion_result(actor, ac["id"], "FAIL",
@@ -753,16 +773,20 @@ def test_verify_gate_fails_on_failing_criterion(monkeypatch):
     assert result.phase == "correct", result.phase       # routed to CORRECT
     assert "verify_failed" in (result.stop_reason or "")
     assert "AC1" in (result.stop_reason or "")
-    # The ledger did NOT record a verify exit gate (the phase never exited).
+    # The ledger did NOT record a verify/deliver exit gate (the phase never
+    # exited). mega-5's live DAG cursor may log a deliver *entry* (n_deliver_*
+    # ran inside the DAG), but it must never carry an exited timestamp.
     from services.agent.ledger import Ledger
-    stages = [s["stage"] for s in Ledger.load(run_id).state["stage_log"]]
-    assert "deliver" not in stages
+    stage_log = Ledger.load(run_id).state["stage_log"]
+    assert not any(s["stage"] == "deliver" and s.get("exited")
+                   for s in stage_log)
 
 
 def test_verify_gate_fails_on_unchecked_criterion(monkeypatch):
     """A criterion with NO reviewer result must fail VERIFY too — silence cannot
     fabricate a pass (the vacuous-pass hole). The reviewer here records nothing."""
-    def _reviewer_silent(manifest, ledger, *, doc_id=None, actor="reviewer"):
+    def _reviewer_silent(manifest, ledger, *, doc_id=None, actor="reviewer",
+                         battery_payload=None):
         return {}  # writes no criterion_result events
 
     run_id = f"t_w30_silent_{uuid.uuid4().hex[:8]}"
@@ -777,7 +801,8 @@ def test_verify_gate_fails_on_unchecked_criterion(monkeypatch):
 def test_verify_gate_passes_only_when_reviewer_passes(monkeypatch):
     """Complement: when the reviewer records PASS for every AC, VERIFY exits and
     the mission reaches deliver. Proves the gate is driven by ledger results."""
-    def _reviewer_pass(manifest, ledger, *, doc_id=None, actor="reviewer"):
+    def _reviewer_pass(manifest, ledger, *, doc_id=None, actor="reviewer",
+                       battery_payload=None):
         for d in manifest.get("deliverables", []):
             for ac in d.get("acceptance_criteria", []):
                 ledger.add_criterion_result(actor, ac["id"], "PASS",

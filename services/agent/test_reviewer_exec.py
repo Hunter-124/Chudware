@@ -89,7 +89,9 @@ def test_run_acceptance_checks_dispatches_and_records(monkeypatch):
     # one event per AC, each carrying the raw tool output as evidence.
     assert len(led.events) == 4
     ac1 = next(e for e in led.events if e["payload"]["id"] == "AC1")
-    assert ac1["payload"]["evidence"] == {"clearance": 0.02}
+    # mega-11: evidence carries provenance (source=live|ledger_tool_call|…) so a
+    # PASS is auditable; the raw tool output rides alongside it.
+    assert ac1["payload"]["evidence"] == {"clearance": 0.02, "source": "live"}
 
 
 def test_manual_criterion_is_not_checked():

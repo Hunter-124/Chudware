@@ -442,7 +442,9 @@ class TestDispatchOrder:
         """A non-mission tool falls through to the process-wide registry path."""
         seen = {}
 
-        def _global(tool, args):
+        # The global fallback is invoked with run_turn's per-tool call counter
+        # (agent_turn._dispatch_tool(tool, args, _call_counts=...)).
+        def _global(tool, args, **_kw):
             seen["tool"] = tool
             return {"ok": True}
         monkeypatch.setattr(agent_turn, "_dispatch_tool", _global)

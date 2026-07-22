@@ -51,20 +51,17 @@ _DEFAULT_TIMEOUT_S = 180.0
 
 # Registry / GUI id → (wire model_id, display_name, max_mode)
 # Wire ids match Cursor usable-models / omp catalog; ``cursor/`` prefix is stripped.
+# Pruned 2026-07: upstream rejects composer-1 / composer-1.5
+# (ERROR_MODEL_NO_LONGER_SUPPORTED — "use Composer 2.5/2") and the proxied
+# claude-opus-4-8 / claude-sonnet-5 / gpt-5.6-sol ids (ERROR_BAD_MODEL_NAME).
 _CURSOR_MODEL_MAP: dict[str, tuple[str, str, bool]] = {
     "default": ("default", "Cursor Auto", False),
     "auto": ("default", "Cursor Auto", False),
     "cursor-default": ("default", "Cursor Auto", False),
     "composer-2.5": ("composer-2.5", "Cursor Composer 2.5", False),
     "composer-2.5-max": ("composer-2.5", "Cursor Composer 2.5 Max", True),
-    "composer-1.5": ("composer-1.5", "Cursor Composer 1.5", False),
-    "composer-1": ("composer-1", "Cursor Composer 1", False),
-    "cursor/claude-opus-4-8": ("claude-opus-4-8", "Claude Opus 4.8 (Cursor)", False),
-    "cursor/claude-sonnet-5": ("claude-sonnet-5", "Claude Sonnet 5 (Cursor)", False),
-    "cursor/gpt-5.6-sol": ("gpt-5.6-sol", "GPT-5.6 Sol (Cursor)", False),
-    "claude-opus-4-8": ("claude-opus-4-8", "Claude Opus 4.8 (Cursor)", False),
-    "claude-sonnet-5": ("claude-sonnet-5", "Claude Sonnet 5 (Cursor)", False),
-    "gpt-5.6-sol": ("gpt-5.6-sol", "GPT-5.6 Sol (Cursor)", False),
+    "composer-2": ("composer-2", "Cursor Composer 2", False),
+    "composer-2-max": ("composer-2", "Cursor Composer 2 Max", True),
 }
 
 
@@ -161,6 +158,15 @@ def map_cursor_error(
         return CursorAuthError(
             f"Cursor auth failed ({status or code or 'unauthenticated'}): "
             f"{message or 're-login required (Settings → Connect Cursor)'}"
+        )
+    if "model_no_longer_supported" in combined or "bad_model_name" in combined:
+        return CursorProviderError(
+            f"Cursor model not available ({code or 'model error'}): "
+            f"{message or 'the selected model id is dead upstream'}. "
+            f"Pick a supported model — the working default is "
+            f"'{DEFAULT_MODEL}' (Cursor Composer 2.5); 'composer-2' also works.",
+            code=code,
+            status=status,
         )
     if status == 403 and any(
         s in combined

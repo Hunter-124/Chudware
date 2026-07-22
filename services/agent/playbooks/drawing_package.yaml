@@ -1,0 +1,44 @@
+schema: aicad.playbook/1
+id: drawing_package
+stage: deliver
+# Owning role: drawing_detailer. Helper tools ⊆ drawing_detailer.tool_allowlist.
+steps:
+  - id: read_brief
+    goal: read the brief and acceptance criteria; measure every critical size from the part BEFORE placing anything
+    helper_tools: [ledger_get, describe_part, measure_part]
+    checklist:
+      - acceptance criteria named from the ledger, not from memory
+      - entity ids and critical sizes come from describe_part / measure_part
+    output:
+      type: object
+      required: [criteria, critical_dims]
+  - id: sheet_and_views
+    goal: create the sheet and place views in order — base, projected, then section/detail only where needed
+    helper_tools: [make_drawing, add_drawing_view, add_section_view, add_detail_view]
+    checklist:
+      - base view first, then projected orthographics
+      - section/detail only where a hidden feature or tight zone needs them
+      - view set covers every feature the criteria name before dimensioning starts
+    output:
+      type: object
+      required: [drawing_id, views]
+  - id: dimension_and_callouts
+    goal: dimension from measured values only; GD&T and finish callouts where the spec or process requires them
+    helper_tools: [add_dimension, add_gdt, add_surface_finish]
+    checklist:
+      - every dimension traceable to a measurement, the ledger, or an explicit user answer
+      - functional/manufacturing dims preferred over redundant chains
+      - no decoration; incomplete geometry → blocked with the missing feature named
+    output:
+      type: object
+      required: [annotations]
+  - id: titleblock_and_export
+    goal: fill the title block and export; if export cannot run, the handoff still lists every view and annotation
+    helper_tools: [set_titleblock, export_drawing, ledger_note]
+    checklist:
+      - title block carries part name, rev, material, units, scale
+      - export artifact path ledger_noted, or the blocker recorded honestly
+    output:
+      type: object
+      required: [export_artifact]
+exit_gate: [views_cover_criteria, dims_from_measurements, export_or_summary]

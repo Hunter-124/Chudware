@@ -1113,14 +1113,18 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
     Mat4 proj;
     if (orthographic_) {
         // Generous near/far in VIEW space (lookAt puts the eye at the origin looking -Z, so
-        // the target sits at z=-dist). ±10*sceneR from the eye covers the whole model even when
-        // the camera is rolled past it; avoids the tight perspective near/far clipping.
+        // the target sits at front-distance dist). The band must FOLLOW the eye: the orbit
+        // distance grows with 1/zoom, so a fixed ±10*sceneR around the eye leaves the whole
+        // scene beyond the far plane once zoom drops below ~0.35 — the datum quads, being the
+        // largest geometry, get sliced first (the "planes vanish / get cut off when zooming
+        // out in ortho" bug). dist±10*sceneR brackets the model, pan, and datum quads at any
+        // zoom; a negative near (zoomed in close) is harmless for an ortho volume.
         // lensShiftX_ is NDC offset: convert to world offset = shift * halfW so the asymmetric
         // ortho volume re-centers the part in the un-occluded region (same contract as proj.m[8]).
         const float shiftW = lensShiftX_ * halfW;
         proj = makeOrtho(-halfW + shiftW, halfW + shiftW,
                          -halfH,           halfH,
-                         -10.0f * sceneR,  10.0f * sceneR);
+                         dist - 10.0f * sceneR, dist + 10.0f * sceneR);
     } else {
         proj = perspective(fov, aspect, dist * 0.01f, dist * 10.0f);
         // W2 full-bleed viewport: bake the horizontal lens shift into the projection's unused m[8]
@@ -1619,8 +1623,8 @@ void Renderer::drawGroundShadow(const Mat4& mvp, const Vec3& eye, const Vec3& up
         {cx + e, cy + e, groundZ,  1.f,  1.f},
         {cx - e, cy + e, groundZ, -1.f,  1.f},
     };
-    // Reuse the plane VAO/VBO but with a 5-float stride (pos + uv); the shadow shader binds
-    // location 0 (pos) and 1 (uv).
+    // Own VAO/VBO with a 5-float stride (pos + uv); the shadow shader binds
+    // location 0 (pos) and 1 (uv). Lazily created once.
     glUseProgram(shadowProg_);
     glUniformMatrix4fv(glGetUniformLocation(shadowProg_, "uMVP"), 1, GL_FALSE, mvp.m);
     glUniform3fv(glGetUniformLocation(shadowProg_, "uColor"), 1, groundShadow_);
@@ -1723,16 +1727,6 @@ void Renderer::planeCorners(int plane, float e, Vec3 out[4]) const {
 bool Renderer::planeQuad(int plane, Vec3 out[4]) const {
     if (plane < 0 || plane > 2) return false;
     planeCorners(plane, ((radius_ > 0.0f) ? radius_ : kEmptySceneRadius) * 1.25f, out);
-    return true;
-}
-
-bool Renderer::planeAnchor(int plane, Vec3& world) const {
-    if (plane < 0 || plane > 2) return false;
-    Vec3 c[4];
-    planeCorners(plane, ((radius_ > 0.0f) ? radius_ : kEmptySceneRadius) * 1.25f, c);
-    // Spread labels to different corners per plane so they rarely overlap on screen.
-    static const int cornerFor[3] = {3, 2, 1};
-    world = c[cornerFor[plane]];
     return true;
 }
 

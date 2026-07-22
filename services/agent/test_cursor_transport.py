@@ -106,10 +106,11 @@ def test_map_generic_provider():
         ("default", "default", False),
         ("auto", "default", False),
         ("composer-2.5-max", "composer-2.5", True),
-        ("cursor/claude-opus-4-8", "claude-opus-4-8", False),
-        ("cursor/claude-sonnet-5", "claude-sonnet-5", False),
-        ("cursor/gpt-5.6-sol", "gpt-5.6-sol", False),
-        ("claude-sonnet-5", "claude-sonnet-5", False),
+        ("composer-2", "composer-2", False),
+        ("composer-2-max", "composer-2", True),
+        # Unknown ids pass through (cursor/ prefix stripped) so future models
+        # work without a map entry.
+        ("cursor/some-future-model", "some-future-model", False),
     ],
 )
 def test_map_cursor_model(registry_id, wire, max_mode):
@@ -118,11 +119,52 @@ def test_map_cursor_model(registry_id, wire, max_mode):
     assert mm is max_mode
 
 
+def test_dead_cursor_models_pruned_from_map():
+    """Upstream rejects these ids (live-verified 2026-07): they must not be
+    offered as named map entries."""
+    dead = (
+        "composer-1",
+        "composer-1.5",
+        "claude-opus-4-8",
+        "claude-sonnet-5",
+        "gpt-5.6-sol",
+        "cursor/claude-opus-4-8",
+        "cursor/claude-sonnet-5",
+        "cursor/gpt-5.6-sol",
+    )
+    for mid in dead:
+        assert mid not in csp._CURSOR_MODEL_MAP, mid
+
+
+def test_map_cursor_error_model_no_longer_supported():
+    exc = csp.map_cursor_error(
+        code="failed_precondition",
+        message="ERROR_MODEL_NO_LONGER_SUPPORTED: model composer-1.5 is "
+                "deprecated, use Composer 2.5/2",
+    )
+    assert isinstance(exc, csp.CursorProviderError)
+    msg = str(exc)
+    assert "composer-1.5" in msg  # dead model named
+    assert csp.DEFAULT_MODEL in msg  # working default named
+    assert "composer-2" in msg
+
+
+def test_map_cursor_error_bad_model_name():
+    exc = csp.map_cursor_error(
+        code="invalid_argument",
+        message="ERROR_BAD_MODEL_NAME: claude-opus-4-8",
+    )
+    assert isinstance(exc, csp.CursorProviderError)
+    msg = str(exc)
+    assert "claude-opus-4-8" in msg
+    assert csp.DEFAULT_MODEL in msg
+
+
 def test_map_cursor_model_strips_cursor_prefix():
-    w, name, mm = csp.map_cursor_model("cursor/composer-1.5")
-    assert w == "composer-1.5"
+    w, name, mm = csp.map_cursor_model("cursor/future-model-9")
+    assert w == "future-model-9"
     assert mm is False
-    assert "cursor/" in name or name == "cursor/composer-1.5"
+    assert "cursor/" in name or name == "cursor/future-model-9"
 
 
 # ── Protobuf encode / decode ─────────────────────────────────────────────────

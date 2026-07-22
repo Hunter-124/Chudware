@@ -675,6 +675,50 @@ bool WorkerClient::callAgentSteer(const std::string& runId, const std::string& t
     return call("agent_steer", json{{"run_id", runId}, {"text", text}}, result, err, 5000);
 }
 
+bool WorkerClient::callViaSideClient(const std::string& method, const json& params,
+                                     json& result, std::string& err, int timeoutMs,
+                                     const EventFn& onEvent) {
+    if (abort_.load()) {  // C39: app is tearing down — intentional, no errorSink toast
+        err = "aborted";
+        return false;
+    }
+    // Short-lived private connection to the daemon (no spawn: a call is already
+    // in flight on the shared client, so hostd is up). Same pattern as the
+    // agent_cancel/agent_steer side channel in callImpl below.
+    // hostdBin hint is REQUIRED: an empty hint hashes "default" in instanceKey(),
+    // which is a different socket than the running daemon's (hostd binds
+    // instanceKey(selfPath())) — the connect then fails ENOENT mid-session.
+    aicad_ipc::EngineClient side;
+    aicad_ipc::EngineClient::Options opts;
+    opts.clientKind = "gui";
+    opts.hostdBin = engine::hostdBinHint();
+    opts.allowSpawn = false;
+    std::string cerr;
+    if (!side.connectOrSpawn(opts, cerr)) {
+        // The daemon died between the in-flight call and now — fail fast with a
+        // clear error rather than queueing behind a run that will never return.
+        err = cerr.empty() ? "engine daemon unreachable" : cerr;
+        if (errorSink_) errorSink_(method, err);
+        return false;
+    }
+    if (side.call(method, params, result, cerr, timeoutMs, onEvent))
+        return true;
+    // Same response contract as the engine branches in callImpl: a structured
+    // method error round-trips in `result` and returns true (the RPC succeeded,
+    // the METHOD reported an error); only transport failures return false.
+    if (result.is_object() && !result.empty()) {
+        err = result.value("message", cerr.empty() ? std::string("rpc error") : cerr);
+        return true;
+    }
+    if (result.is_string()) {
+        err = result.get<std::string>();
+        return false;
+    }
+    err = cerr.empty() ? std::string("engine channel error") : cerr;
+    if (errorSink_) errorSink_(method, err);
+    return false;
+}
+
 bool WorkerClient::callImpl(const std::string& method, const json& params, json& result,
                             std::string& err, int timeoutMs, const EventFn& onEvent) {
     // agent_cancel/agent_steer must reach the engine WHILE an agent_run is blocked on this
@@ -682,8 +726,32 @@ bool WorkerClient::callImpl(const std::string& method, const json& params, json&
     // Concurrent with the run's own call — safe because cancel/steer only touch the registry
     // (+ atomic flag / queued string; no shared socket write on the in-flight agent RPC).
     const bool isCancel = (method == "agent_cancel" || method == "agent_steer");
+    // The long streaming runs keep full serialization: two runs must never
+    // overlap (they would interleave ops on the same doc in the daemon).
+    const bool isLongRun = (method == "agent_run_v2" || method == "agent_mission_v1");
     std::unique_lock<std::mutex> lk(callMtx_, std::defer_lock);
-    if (!isCancel) lk.lock();
+    if (!isCancel && !isLongRun && engine::daemonMode()) {
+        // Engine-bound call arriving while another call holds callMtx_ —
+        // typically a multi-minute agent_run: the GUI thread makes config_list /
+        // doc_tree / pick calls on normal interaction, and blocking it behind
+        // the run froze the whole app (2026-07-21 SIGABRT crash). In daemon mode
+        // hostd serves each connection on its own thread, so sidestep the wait
+        // with a short-lived side connection. Excluded (keep legacy blocking):
+        // minting calls (doc_new/doc_open/import_file, ecad_new/ecad_open —
+        // their "unsupported" fallback needs the shared Python-worker pipe
+        // below), agent-seam methods (routeAgentToCpp translates host RPC names
+        // to core names — agent_ask_v2→agent_answer_question etc. — which the
+        // side channel does not do), and pipe-bound methods (plm_*, git_*,
+        // most sim_* — rare on the GUI thread).
+        const bool engineBound =
+            (method.rfind("cam_", 0) == 0 ||
+             routeSimToCpp(method, params) || routeEcadToCpp(method, params) ||
+             (routeDocToCpp(method, params) && !isMintingMethod(method, params))) &&
+            method != "ecad_new" && method != "ecad_open";
+        if (engineBound && !lk.try_lock())
+            return callViaSideClient(method, params, result, err, timeoutMs, onEvent);
+    }
+    if (!isCancel && !lk.owns_lock()) lk.lock();
     if (abort_.load()) {  // C39: app is tearing down — intentional, no errorSink toast
         err = "aborted";
         return false;
@@ -802,6 +870,7 @@ bool WorkerClient::callImpl(const std::string& method, const json& params, json&
                 aicad_ipc::EngineClient side;
                 aicad_ipc::EngineClient::Options opts;
                 opts.clientKind = "gui";
+                opts.hostdBin = engine::hostdBinHint();  // same instance key as the live daemon
                 opts.allowSpawn = false;  // never spawn a new hostd for steer
                 std::string cerr2;
                 if (side.connectOrSpawn(opts, cerr2)) {
@@ -821,6 +890,7 @@ bool WorkerClient::callImpl(const std::string& method, const json& params, json&
                 aicad_ipc::EngineClient side;
                 aicad_ipc::EngineClient::Options opts;
                 opts.clientKind = "gui";
+                opts.hostdBin = engine::hostdBinHint();  // same instance key as the live daemon
                 opts.allowSpawn = false;  // never spawn a new hostd for cancel
                 std::string cerr2;
                 if (side.connectOrSpawn(opts, cerr2)) {

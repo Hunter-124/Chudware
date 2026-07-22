@@ -66,6 +66,17 @@ private:
                   nlohmann::json& result, std::string& err, int timeoutMs,
                   const EventFn& onEvent);
 
+    // Daemon-mode fallback when another call (typically a long agent_run) holds
+    // callMtx_: run this call on a short-lived side EngineClient connection
+    // (the same pattern callAgentCancel/callAgentSteer use) instead of freezing
+    // the caller behind the run. hostd serves each connection on its own thread,
+    // and its doc registry gates multi-writer overlap, so a concurrent read or
+    // edit is safe. Only used for engine-bound calls — pipe-bound methods still
+    // serialize on callMtx_.
+    bool callViaSideClient(const std::string& method, const nlohmann::json& params,
+                           nlohmann::json& result, std::string& err, int timeoutMs,
+                           const EventFn& onEvent);
+
     bool readLine(std::string& line, int timeoutMs);
 
 #ifdef _WIN32

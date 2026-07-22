@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <map>
 #include <optional>
@@ -274,6 +275,64 @@ std::string fallback_part_name(const std::string& request) {
     }
     if (acc.empty()) acc = "Part";
     return sanitize_part_name(acc);
+}
+
+// ----------------------------------------------------------------- file-first persistence
+
+// Where the agent persists the part file it creates BEFORE modeling starts (so
+// version control / PLM sees a real file from the first feature, not only
+// after the run). Resolution order: options.save_dir (host override) →
+// config.json "workspace_dir" (Settings → General workspace folder) → the
+// host's default workspace root (Documents/AI-CAD when present, else
+// Documents/Billet — mirrors fs_backend defaultRoot()).
+std::string agent_workspace_dir(const json& options) {
+    if (options.contains("save_dir") && options["save_dir"].is_string() &&
+        !options["save_dir"].get<std::string>().empty())
+        return options["save_dir"].get<std::string>();
+    json cfg = load_config();
+    if (cfg.is_object() && cfg.contains("workspace_dir") && cfg["workspace_dir"].is_string() &&
+        !cfg["workspace_dir"].get<std::string>().empty())
+        return cfg["workspace_dir"].get<std::string>();
+    namespace fs = std::filesystem;
+#ifdef _WIN32
+    const char* up = std::getenv("USERPROFILE");
+    const fs::path base = up && *up ? fs::path(up) / "Documents" : fs::path();
+#else
+    const char* home = std::getenv("HOME");
+    const fs::path base = home && *home ? fs::path(home) / "Documents" : fs::path();
+#endif
+    if (base.empty()) return std::string();
+    std::error_code ec;
+    const fs::path legacy = base / "AI-CAD";
+    if (fs::exists(legacy, ec)) return legacy.string();
+    return (base / "Billet").string();
+}
+
+// Filename stem from a part name — mirrors the host auto-save rule (app.cpp):
+// spaces -> '_', keep alnum / '_' / '-', drop the rest.
+std::string stepplus_stem(const std::string& name) {
+    std::string stem;
+    stem.reserve(name.size());
+    for (unsigned char c : name) {
+        if (c == ' ') stem.push_back('_');
+        else if (std::isalnum(c) || c == '_' || c == '-')
+            stem.push_back(static_cast<char>(c));
+    }
+    return stem.empty() ? std::string("Part") : stem;
+}
+
+// First non-existing <dir>/<stem>.step+, then <stem>_2, _3, … (host rule).
+std::string unique_stepplus_path(const std::string& dir, const std::string& stem) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::create_directories(dir, ec);  // idempotent
+    fs::path candidate = fs::path(dir) / (stem + ".step+");
+    if (!fs::exists(candidate, ec)) return candidate.string();
+    for (int n = 2; n < 10000; ++n) {
+        fs::path alt = fs::path(dir) / (stem + "_" + std::to_string(n) + ".step+");
+        if (!fs::exists(alt, ec)) return alt.string();
+    }
+    return candidate.string();  // absurd; overwrite rather than fail
 }
 
 // ----------------------------------------------------------------- provider call
@@ -835,8 +894,13 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
     // outer_run_started: assembly probe (or other outer orchestrator) already emitted
     // run_started + classification events — do not double-emit for the UI.
     const bool outer_run_started = options.value("outer_run_started", false);
+    // Solo (trivial single part): intake → model → memory. The LLM plan stage
+    // was already skipped; the LLM review + fix loop is the bulk of the
+    // "bloated actions/thoughts" on a one-loop build, and no non-LLM review
+    // exists — so those stages are omitted too (budgets below; the machine
+    // skips budget-0 stages entirely). Standard/Complex keep the full path.
     json stages = solo_skip_plan
-                      ? json::array({"intake", "model", "review", "fix", "memory"})
+                      ? json::array({"intake", "model", "memory"})
                       : json::array({"intake", "plan", "model", "review", "fix", "memory"});
     if (!outer_run_started) {
         events.emit("run_started",
@@ -893,6 +957,66 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
                                            {"execution_style", execution_style}});
         }
     }
+
+    // ---- FILE-FIRST: persist the part to disk BEFORE modeling starts ----
+    // The host historically saved only AFTER the run (its end-of-run auto-save
+    // on part_named). For the built-in version control / PLM the file must
+    // exist from the first feature so every milestone lands as a save state on
+    // a real document. Create <workspace>/<name>.step+ now — named
+    // deterministically from the request (the memory stage renames it to the
+    // AI-chosen name at the end) — then re-save it at each successful
+    // model/fix milestone below. Skipped for: sub-runs (assembly children are
+    // saved by the parent loop), plan_only runs (no modeling), mock-provider
+    // parity runs (no disk writes in the gate), and docs that already have a
+    // path (edit follow-ups — never rewrite the user's existing file mid-run;
+    // the in-memory doc_checkpoint save states below still apply). Never fails
+    // the run.
+    std::string file_first_path;
+    const bool is_mock_provider = provider_cfg.value("name", std::string()) == "mock";
+    if (!is_sub_run && !plan_only && !is_mock_provider && options.value("file_first", true)) {
+        try {
+            std::string existing_path;
+            json dl = doc::doc_list();
+            if (dl.is_object() && dl.contains("docs") && dl["docs"].is_array())
+                for (const auto& d : dl["docs"])
+                    if (d.is_object() && d.value("doc_id", std::string()) == doc_id) {
+                        existing_path = d.value("path", std::string());
+                        break;
+                    }
+            if (existing_path.empty()) {
+                const std::string dir = agent_workspace_dir(options);
+                if (!dir.empty()) {
+                    file_first_path = unique_stepplus_path(
+                        dir, stepplus_stem(fallback_part_name(request)));
+                    doc::doc_save(doc_id, file_first_path);
+                    events.emit("run_note", json{{"note", "file_created"},
+                                                 {"path", file_first_path},
+                                                 {"doc_id", doc_id}});
+                }
+            }
+        } catch (...) {
+            file_first_path.clear();  // persistence is best-effort; model anyway
+        }
+    }
+    // Milestone save state: an in-memory doc_checkpoint (existing revert
+    // mechanism — the same save-state primitive PLM rollback uses) after every
+    // successful feature batch, plus a re-save of the file-first .step+ so the
+    // on-disk file tracks modeling progress.
+    auto milestone_save = [&](const char* stage_tag) {
+        try {
+            doc::doc_checkpoint(doc_id);
+        } catch (...) {
+        }
+        if (file_first_path.empty()) return;
+        try {
+            doc::doc_save(doc_id, file_first_path);
+            events.emit("run_note", json{{"note", "milestone_saved"},
+                                         {"stage", stage_tag},
+                                         {"path", file_first_path},
+                                         {"doc_id", doc_id}});
+        } catch (...) {
+        }
+    };
 
     // ----------------------------------------------------------------- actions
     StageActions actions;
@@ -1627,6 +1751,7 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
             return o;
         }
         st.last_errors = apply_ops(st, ops);
+        milestone_save("model");  // feature batch landed → checkpoint + re-save
         o.verdict = "pass";
         o.reason = "applied " + std::to_string(ops.size()) + " ops";
         o.parsed_ok = true;
@@ -1812,6 +1937,7 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         }
         st.last_errors = apply_ops(st, ops);
         st.last_issues.clear();
+        milestone_save("fix");  // fix batch landed → checkpoint + re-save
         o.verdict = "pass";
         o.reason = "fix: applied " + std::to_string(ops.size()) + " ops";
         o.parsed_ok = true;
@@ -1872,6 +1998,30 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
                     doc::doc_set_meta(st.doc_id, "ai_notes", json::parse(notes.dump()));
                 } catch (...) {
                 }
+            }
+        }
+        // File-first rename: the file was created before modeling under the
+        // deterministic request-derived name; move it to the AI-chosen name
+        // (save to the new path, drop the old file) so the workspace ends with
+        // ONE part file carrying the final name + notes. Never fails the run.
+        if (!file_first_path.empty()) {
+            try {
+                namespace fs = std::filesystem;
+                const fs::path old_path(file_first_path);
+                const std::string new_path =
+                    unique_stepplus_path(old_path.parent_path().string(), stepplus_stem(name));
+                if (new_path != file_first_path) {
+                    doc::doc_save(st.doc_id, new_path);
+                    std::error_code ec;
+                    fs::remove(old_path, ec);
+                    file_first_path = new_path;
+                    events.emit("run_note", json{{"note", "file_renamed"},
+                                                 {"path", file_first_path},
+                                                 {"doc_id", st.doc_id}});
+                } else {
+                    doc::doc_save(st.doc_id, file_first_path);  // flush name + notes meta
+                }
+            } catch (...) {
             }
         }
         o.verdict = "pass";
@@ -2049,8 +2199,10 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         return out;
     }
     // Per-stage budgets: caller options override; else complexity-derived defaults.
-    // Solo: plan=0 (machine omits the stage entirely), fix=2.
-    // Standard: fix=4. Complex: fix=6. Intake/model/review/memory keep kDefaultBudgets.
+    // Solo: plan=0, review=0, fix=0 (machine omits all three stages entirely —
+    // the modeler already self-corrects via dry-run validation on every
+    // attempt, and no non-LLM review exists to keep). Standard: fix=4.
+    // Complex: fix=6. Intake/model/review/memory keep kDefaultBudgets.
     json budgets = options.value("budgets", json::object());
     if (!budgets.is_object()) budgets = json::object();
     auto ensure_budget = [&](const char* key, int def) {
@@ -2058,11 +2210,15 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
             !(budgets[key].is_number_integer() || budgets[key].is_number_unsigned()))
             budgets[key] = def;
     };
-    if (solo_skip_plan) ensure_budget("plan", 0);  // omit plan stage (no stub LLM call)
+    if (solo_skip_plan) {
+        ensure_budget("plan", 0);    // omit plan stage (no stub LLM call)
+        ensure_budget("review", 0);  // omit the LLM review/fix loop on trivial parts
+        ensure_budget("fix", 0);
+    }
     int fix_default = 4;
     if (cx.level == Complexity::Solo) fix_default = 2;
     else if (cx.level == Complexity::Complex) fix_default = 6;
-    ensure_budget("fix", fix_default);
+    if (!solo_skip_plan) ensure_budget("fix", fix_default);
 
     json result = run_machine(state, actions, events, budgets, run_ctl);
 
@@ -2122,6 +2278,7 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
                     {"doc_id", state.doc_id},
                     {"execution_style", execution_style}};
     if (!captured_part_name.empty()) out["part_name"] = captured_part_name;
+    if (!file_first_path.empty()) out["saved_path"] = file_first_path;
     if (!copilot_mode.empty()) out["mode"] = copilot_mode;
     if (result.contains("error_detail") && result["error_detail"].is_string() &&
         !result["error_detail"].get<std::string>().empty())
@@ -2326,11 +2483,19 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
                      {"probe", true}});
     AgentCall pa = agent_call(provider, pstate, "planner", prompts_dir, budget, false, ctx_cap);
     ojson plan = extract_json_obj(pa.reply);
+    // The probe is ADVISORY: no parseable plan just means the single-doc path
+    // below (want_asm stays false). Only a real call failure is a stage fail —
+    // anything else paints a false-alarm red card on a normal single-part run.
+    const bool plan_ok = !plan.is_null() && plan.is_object();
+    const bool plan_call_failed = pa.has_call_error || pa.reply.empty();
     events.emit("stage_result",
                 json{{"stage", "plan"},
                      {"attempt", 1},
-                     {"verdict", (!plan.is_null() && plan.is_object()) ? "pass" : "fail"},
-                     {"reason", "probe plan"}});
+                     {"verdict", (!plan_ok && plan_call_failed) ? "fail" : "pass"},
+                     {"reason", plan_ok ? std::string("probe plan")
+                                        : (plan_call_failed
+                                               ? std::string("probe plan: provider call failed")
+                                               : std::string("no assembly plan (single-part path)"))}});
     bool want_asm = !plan.is_null() && plan.is_object() && truthy_json(plan.value("assembly", ojson(false)));
     ojson parts = (!plan.is_null() && plan.is_object() && plan.contains("parts") &&
                    plan["parts"].is_array())

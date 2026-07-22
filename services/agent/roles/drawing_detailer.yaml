@@ -1,7 +1,7 @@
 schema: aicad.role/1
 id: drawing_detailer
 goal: Produce and edit manufacturing 2D drawings — views, sections, details, dimensions, GD&T, surface finish, title block, and export.
-stage_scope: [drawing, deliver]
+stage_scope: [deliver]
 playbook_default: drawing_package
 tool_allowlist:
   - tool: ledger_get

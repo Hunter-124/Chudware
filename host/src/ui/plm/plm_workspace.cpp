@@ -339,6 +339,7 @@ void plmSelectGitPage() { g_plmHub.page = PlmPage::Git; }
 void plmSelectPlanningPage() { g_plmHub.page = PlmPage::Planning; }
 void plmSelectOverviewPage() { g_plmHub.page = PlmPage::Overview; }
 void plmSelectFilesPage() { g_plmHub.page = PlmPage::Files; }
+void plmSelectGraphPage() { g_plmHub.page = PlmPage::Graph; }
 
 void drawPlmWorkspace(AppState& st) {
     const float S = ui::uiScale;

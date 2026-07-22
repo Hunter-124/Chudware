@@ -5114,8 +5114,23 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             const ImU32 planeChipBord = ui::Palette::toU32(vpal.planeOutline);
             for (int p = 0; p < 3; ++p) {
                 if (!effPlane[p]) continue;
-                Vec3 a; if (!renderer.planeAnchor(p, a)) continue;
-                ImVec2 sp; if (!project(a, sp)) continue;
+                // Anchor the chip to the quad corner that currently sits farthest from the
+                // viewport centre among the corners IN FRONT of the camera. A fixed world
+                // corner swings behind the eye while orbiting (wc <= 0 -> chip popped out of
+                // existence) and clamps to a random viewport edge when zoomed in; re-picking
+                // per frame keeps the label riding a visible outer corner, SolidWorks-style.
+                Vec3 c4[4];
+                if (!renderer.planeQuad(p, c4)) continue;
+                const float vcx = (vr0.x + vr1.x) * 0.5f, vcy = (vr0.y + vr1.y) * 0.5f;
+                ImVec2 sp; float bestD2 = -1.0f;
+                for (int ci = 0; ci < 4; ++ci) {
+                    ImVec2 cand;
+                    if (!project(c4[ci], cand)) continue;
+                    const float dx = cand.x - vcx, dy = cand.y - vcy;
+                    const float d2 = dx * dx + dy * dy;
+                    if (d2 > bestD2) { bestD2 = d2; sp = cand; }
+                }
+                if (bestD2 < 0.0f) continue;  // every corner behind the camera
                 const char* nm = kPlaneName[p];
                 ImVec2 ts = ImGui::CalcTextSize(nm);
                 // keep the chip inside the viewport rect

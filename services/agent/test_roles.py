@@ -99,7 +99,7 @@ def _fresh_ledger(suffix: str = "") -> Ledger:
 
 # ---------------------------------------------------------------------------
 # A tiny, self-contained GBNF acceptor. Covers exactly the subset roles.py emits:
-# rules, `name ::= ...`, alternation `|`, sequence, `?`, `*`, grouping `( )`,
+# rules, `name ::= ...`, alternation `|`, sequence, `?`, `*`, `+`, grouping `( )`,
 # string terminals "..." (with \" escapes), char classes [ ... ], rule references.
 # It is a backtracking recognizer — not fast, but the handoff JSONs are tiny.
 # We use it to PROVE the emitted grammar accepts a valid handoff and rejects a bad
@@ -151,12 +151,14 @@ class _Gbnf:
         # ending in * or ? is a suffix — including an OPTIONAL quoted literal like
         # `"-"?` (used by the integer/number rules); the old `not startswith('"')`
         # guard wrongly excluded that case and broke integer handoffs (T-DP2/DP3).
-        if tok.endswith("*"):
+        if tok.endswith("*") or tok.endswith("+"):
+            plus = tok.endswith("+")
             base = tok[:-1]
-            # zero or more (greedy-with-backtrack): collect all reachable positions.
+            # zero-or-more (one-or-more for `+`, used by the number primitive's
+            # [0-9]+): collect all reachable positions (greedy-with-backtrack).
             seen = {i}
             frontier = [i]
-            results = [i]
+            results = [] if plus else [i]
             while frontier:
                 nxt = []
                 for pos in frontier:
@@ -262,8 +264,8 @@ def _tokenize(expr):
                 j += 1
             tok = expr[i:j]
             i = j
-        # attach a trailing * or ? that follows the atom
-        if i < n and expr[i] in "*?":
+        # attach a trailing *, ?, or + that follows the atom
+        if i < n and expr[i] in "*?+":
             tok += expr[i]
             i += 1
         toks.append(tok)
@@ -305,19 +307,24 @@ def _class_match(tok, ch):
 # ---------------------------------------------------------------------------
 
 class TestLoadAndValidate(unittest.TestCase):
-    def test_thirteen_roles_load(self):
-        # Pipeline + org/ladder + design-pipeline + RE + sketch2d/model3d roles.
-        # council_seats.yaml is data, not a card. Count grows as roles ship.
+    def test_all_roles_load(self):
+        # 13 pipeline roles + department_manager + design_thinker (org/ladder
+        # layers) + feature_architect (design-pipeline Stage 1, T-DP2) +
+        # geometry_designer (design-pipeline Stage 2, T-DP3) +
+        # linkage_planner (design-pipeline Stage 3, T-DP4) +
+        # sourcing_specialist (Parts Library V2 workstream 5).
+        # council_seats.yaml is data, not a card.
         cards = roles.load_all_roles()
         self.assertGreaterEqual(len(cards), 19, sorted(cards))
+        self.assertIn("sketch2d", cards)
+        self.assertIn("model3d", cards)
         for rid in ("intake_analyst", "clarifier", "spec_writer", "orchestrator",
                     "layout_engineer", "sketcher", "feature_modeler",
                     "assembly_fit_engineer", "sim_engineer", "cam_programmer",
                     "reviewer", "fixer", "overseer",
                     "department_manager", "design_thinker",
                     "feature_architect", "geometry_designer",
-                    "linkage_planner", "sourcing_specialist",
-                    "sketch2d", "model3d"):
+                    "linkage_planner", "sourcing_specialist"):
             self.assertIn(rid, cards)
 
     def test_six_playbooks_load(self):
@@ -635,6 +642,43 @@ def _minimal_value(schema, depth=0):
     return {}
 
 
+class TestSketch2dModel3dRoles(unittest.TestCase):
+    """New 2D/3D split roles (sketch2d + model3d)."""
+
+    def test_load_sketch2d_and_model3d(self):
+        s2 = roles.load_role("sketch2d")
+        m3 = roles.load_role("model3d")
+        self.assertEqual(s2.id, "sketch2d")
+        self.assertEqual(m3.id, "model3d")
+        self.assertLessEqual(len(s2.tool_allowlist), roles.MAX_TOOLS_PER_ROLE)
+        self.assertLessEqual(len(m3.tool_allowlist), roles.MAX_TOOLS_PER_ROLE)
+
+    def test_model3d_prompt_contract(self):
+        m3 = roles.load_role("model3d")
+        prompt = m3.system_prompt
+        low = prompt.lower()
+        self.assertIn("delegate", m3.concrete_tools)
+        self.assertIn("sketch2d", low)
+        self.assertIn("vision", low)
+        self.assertIn("delegate", low)
+
+    def test_sketch2d_no_solids_contract(self):
+        s2 = roles.load_role("sketch2d")
+        low = s2.system_prompt.lower()
+        self.assertIn("do not", low)
+        self.assertIn("3d solids", low)
+        self.assertNotIn("delegate", s2.concrete_tools)
+        # 2D tools only — no pure solid planners beyond sketch-capable add_features
+        self.assertIn("sketch_health", s2.concrete_tools)
+
+    def test_roles_validate_against_catalog(self):
+        for rid in ("sketch2d", "model3d"):
+            card = roles.load_role(rid)
+            findings = roles.validate_role(card, tool_names=_CATALOG)
+            errs = [f for f in findings if f.level == "error"]
+            self.assertEqual(errs, [], f"{rid}: " + "; ".join(str(e) for e in errs))
+
+
 class TestLoopRoleSeam(unittest.TestCase):
     """The single-role loop host (services/agent/loop.py) applies a role card's
     system prompt when ``role=`` is passed."""
@@ -656,9 +700,17 @@ class TestLoopRoleSeam(unittest.TestCase):
         sess = loop.Session(name="t_role", role_prompt=card.system_prompt)
         sess.messages = [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
         loop._generate(sess, _CaptureProvider(), None, 0, 1)
-        # loop strips whitespace on the role prompt before use
-        self.assertEqual(captured["system"], card.system_prompt.strip())
-        self.assertIn("SKETCHER", captured["system"])
+        # loop strips whitespace on the role prompt, then appends the skills
+        # catalog block ([SKILLS] ...) — shipped behavior since the wave-1
+        # prompt/skills work (d779f85b / 79664632); contracts/skills.md. The
+        # skills block is best-effort (loop.py: a broken/unloadable skills
+        # module must never break the loop — e.g. when a sibling test leaves a
+        # deleted CWD behind, skills discovery fails and the block is omitted),
+        # so assert the role prompt is the verbatim prefix, not exact equality.
+        system = captured["system"]
+        self.assertTrue(system.startswith(card.system_prompt.strip()),
+                        system[:200])
+        self.assertIn("SKETCHER", system)
 
     def test_default_prompt_without_role(self):
         from services.agent import loop

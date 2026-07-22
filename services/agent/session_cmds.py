@@ -8,6 +8,7 @@ RPCs live in ``engine_oracle.parts_hub.session_rpc`` and call these functions.
 from __future__ import annotations
 
 import copy
+import importlib
 from typing import Any, Optional
 
 # ---------------------------------------------------------------------------
@@ -280,10 +281,14 @@ def compact_session(
             "short_summary": "",
         }
 
+    # importlib.import_module (not `from agent import compaction`): the
+    # from-form short-circuits on the package attribute once the real module
+    # was imported anywhere in the process, ignoring sys.modules patches in
+    # tests. import_module consults sys.modules first.
     try:
-        from agent import compaction as comp  # type: ignore
+        comp = importlib.import_module("agent.compaction")
     except Exception:  # noqa: BLE001
-        from services.agent import compaction as comp  # type: ignore
+        comp = importlib.import_module("services.agent.compaction")
 
     if strat == "shake":
         result = comp.shake_messages(
@@ -328,10 +333,14 @@ def shake_session(
     Returns ``{messages, saved_tokens, notice}`` for the RPC layer.
     """
     msgs = _snapshot_messages(messages)
+    # importlib.import_module (not `from agent import compaction`): the
+    # from-form short-circuits on the package attribute once the real module
+    # was imported anywhere in the process, ignoring sys.modules patches in
+    # tests. import_module consults sys.modules first.
     try:
-        from agent import compaction as comp  # type: ignore
+        comp = importlib.import_module("agent.compaction")
     except Exception:  # noqa: BLE001
-        from services.agent import compaction as comp  # type: ignore
+        comp = importlib.import_module("services.agent.compaction")
 
     result = comp.shake_messages(
         msgs,

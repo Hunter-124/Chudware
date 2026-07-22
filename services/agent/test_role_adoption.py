@@ -64,6 +64,10 @@ def test_yaml_beats_shipped_md_for_advisor():
     import yaml
     from pathlib import Path
     from services.agent.roles import load_role
-    y = yaml.safe_load(Path("services/agent/roles/advisor.yaml").read_text())
+    # Anchor at the repo root (this file's parents[2]) — never the process CWD:
+    # some suite tests leave a stale/deleted CWD behind (openEMS fdtd.Run
+    # cleanup chdirs into a temp dir it then removes).
+    repo = Path(__file__).resolve().parents[2]
+    y = yaml.safe_load((repo / "services/agent/roles/advisor.yaml").read_text())
     card = load_role("advisor")
     assert card.system_prompt.strip() == y["system_prompt"].strip()

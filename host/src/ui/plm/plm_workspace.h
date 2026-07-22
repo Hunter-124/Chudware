@@ -16,5 +16,6 @@ void plmSelectGitPage();
 void plmSelectPlanningPage();
 void plmSelectOverviewPage();
 void plmSelectFilesPage();
+void plmSelectGraphPage();
 
 }  // namespace ui

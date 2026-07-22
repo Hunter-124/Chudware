@@ -767,10 +767,15 @@ def _extract_decision(reply: str) -> dict:
 
 def _loop_done_guardrail(decision: dict, res: Any, ledger: Any,
                          *, is_assembly: bool = False) -> str | None:
-    """WI-11/13/14: reject loop done when HARD floors fail. ImportError-safe.
+    """WI-13: reject loop done when an assembly still has interference. ImportError-safe.
 
-    Quick-loop always mutates geometry (run_code_multi), so battery is required
-    unless waived via decision notes/waivers. Interference required for assemblies.
+    The quick loop has no MCP tool surface — its verification IS the successful
+    build + render the model inspects each pass — so the WI-11 verify_battery
+    floor (aimed at the tool-call loop / mission gates, which do run a battery)
+    is unsatisfiable here and is skipped; blocking on it made done unreachable
+    and every successful run burned the whole iteration budget.  For assemblies
+    the loop DOES compute a fit report every build, so that report is fed in as
+    the check_interference evidence: a clean fit passes, a real clash blocks.
     """
     try:
         from services.agent import guardrails as _gr  # noqa: PLC0415
@@ -796,15 +801,26 @@ def _loop_done_guardrail(decision: dict, res: Any, ledger: Any,
                     pass
         if is_assembly:
             handoff["doc_kind"] = "assembly"
-        # Fabricate a synthetic mutating call so battery is required after a build.
+        # Synthetic mutating call: the quick loop always mutates geometry via
+        # run_code_multi, so downstream checks see a mutation this turn.
         calls = [{"tool": "add_features", "ok": True, "args": {}, "result": {"ok": True}}]
+        if is_assembly:
+            # The loop's own fit report is the interference evidence (WI-13).
+            fit = getattr(res, "fit", None) or {}
+            calls.append({
+                "tool": "check_interference", "ok": True,
+                "result": {"interferences": list(fit.get("interferences") or [])},
+            })
         # If ledger already has battery evidence from prior tools, check_done sees it.
+        skip = {"verify_battery"}
+        if not handoff.get("doc_id"):
+            # Orphan sketch: quick-loop has no doc tree; skip unless handoff supplies.
+            skip.add("orphan_sketch")
         verdict = _gr.check_done(
             handoff, ledger=ledger, calls=calls, actor="loop",
             require_battery_if_no_mutation=True,
             force_assembly=True if is_assembly else False,
-            # Orphan sketch: quick-loop has no doc tree; skip unless handoff supplies.
-            skip={"orphan_sketch"} if not handoff.get("doc_id") else set(),
+            skip=skip,
         )
         if verdict.ok:
             return None
@@ -1639,6 +1655,11 @@ def run_turn(session: Session, request: str, provider: Provider,
         try:
             reply, thinking = _generate(session, provider, on_event, i, turn)
         except Exception as _prov_exc:  # noqa: BLE001 — surface provider/API failure
+            # Context overflow is unrecoverable here: _generate already burned its
+            # compaction passes and gave up, so propagate rather than misreporting
+            # it as an ordinary provider error.
+            if _is_context_overflow(_prov_exc):
+                raise
             logging.getLogger("ai-cad.loop").error(
                 "provider error during design loop: %s\n%s",
                 _prov_exc, traceback.format_exc(),

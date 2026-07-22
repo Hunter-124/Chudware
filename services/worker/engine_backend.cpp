@@ -54,6 +54,8 @@ std::string selfExePath() {
 #endif
 }
 
+}  // namespace
+
 // hostd binary hint, mirroring services/mcp/daemon_bridge.py resolve_hostd_bin:
 // $AICAD_HOSTD_BIN is honored inside resolveHostdBin(); the hint covers
 // exe-adjacent (installed layout: dist/AI-CAD stages both binaries together)
@@ -83,6 +85,8 @@ std::string hostdBinHint() {
     }
     return std::string();
 }
+
+namespace {
 
 // One-shot startup latency probe: N pings over the socket, logged to stderr so
 // the number lands in the app log/console (Phase 4 deliverable: <0.5 ms/call).

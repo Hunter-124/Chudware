@@ -126,11 +126,11 @@ inline const std::vector<ModelInfo>& builtinModels() {
         {PROV_ANTHROPIC, "claude-haiku-4-5", "Claude Haiku 4.5", true, false},
         // OpenAI cloud (gpt-5.6-sol is current; older ≤ gpt-5.5 and o3 purged).
         {PROV_OPENAI, "gpt-5.6-sol", "GPT-5.6 Sol", true, true},
-        // Cursor — Composer + proxied Anthropic/OpenAI flagships.
+        // Cursor — Composer only. The proxied cursor/claude-* + cursor/gpt-* rows were
+        // removed 2026-07-21: Cursor rejects those wire ids upstream
+        // (ERROR_BAD_MODEL_NAME), and composer-1/1.5 are sunset — every pick failed.
         {PROV_CURSOR, "composer-2.5", "Cursor Composer 2.5", true, true},
-        {PROV_CURSOR, "cursor/claude-opus-4-8", "Claude Opus 4.8 (Cursor)", true, true},
-        {PROV_CURSOR, "cursor/claude-sonnet-5", "Claude Sonnet 5 (Cursor)", true, true},
-        {PROV_CURSOR, "cursor/gpt-5.6-sol", "GPT-5.6 Sol (Cursor)", true, true},
+        {PROV_CURSOR, "composer-2", "Cursor Composer 2", true, true},
         // Kimi Code subscription (wire provider "kimi-sub") — GUI ids kimi-k3 / kimi-k2.7.
         // K3 is the CAD-modeling priority model (1M ctx); K2.7 is the lighter secondary (262k).
         // Wire alias: kimi_sub_provider maps both → "kimi-for-coding" on the subscription endpoint.

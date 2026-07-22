@@ -18,7 +18,9 @@ void drawFirmwareWorkspace(AppState& st);
 
 // Progressive disclosure (T-FIN24 rules): the title-bar tab is offered when a firmware
 // project exists, an ECAD workspace/doc is in play, or the workspace is already active.
-// Cheap to call per frame — project listing behind it is async + throttled.
+// Cheap to call per frame — "project exists" is a throttled LOCAL disk probe of
+// firmware_root() (worker-independent, so the tab discloses at startup even before the
+// Python-worker-only fw_projects RPC can answer), plus the throttled async listing.
 bool firmwareTabVisible(AppState& st);
 
 namespace firmware {

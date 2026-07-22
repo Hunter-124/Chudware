@@ -175,21 +175,41 @@ TIER_DENIED_HINT = (
     "Use an API key from console.x.ai and switch provider to 'xai', "
     "or upgrade the SuperGrok tier that includes OAuth API access."
 )
+# 403 bodies like personal-team-blocked:spending-limit are NOT the tier gate —
+# the account is simply out of credits. Surface that distinctly.
+SPENDING_LIMIT_REASON = (
+    "xAI account is out of credits / spending limit reached — "
+    "needs a Grok subscription or added credits"
+)
+_SPENDING_LIMIT_MARKERS = (
+    "personal-team-blocked",
+    "spending-limit",
+    "spending limit",
+    "run out of credits",
+    "out of credits",
+    "need a grok subscription",
+    "team_blocked",
+    "team blocked",
+)
 
 # progress callback payload keys (also mirrored into subscription_status)
 ProgressCb = Callable[[dict], None]
 
 
 class XaiTierDeniedError(RuntimeError):
-    """HTTP 403 from xAI OAuth/API — subscription tier not API-enabled."""
+    """HTTP 403 from xAI OAuth/API — tier gate OR spending-limit / credits."""
 
     def __init__(self, detail: str = "") -> None:
-        msg = TIER_DENIED_REASON
+        reason = TIER_DENIED_REASON
+        detail_l = (detail or "").lower()
+        if any(m in detail_l for m in _SPENDING_LIMIT_MARKERS):
+            reason = SPENDING_LIMIT_REASON
+        msg = reason
         if detail:
-            msg = f"{TIER_DENIED_REASON}: {detail}"
+            msg = f"{reason}: {detail}"
         msg = f"{msg}. Hint: {TIER_DENIED_HINT}"
         super().__init__(msg)
-        self.reason = TIER_DENIED_REASON
+        self.reason = reason
         self.hint = TIER_DENIED_HINT
         self.detail = detail or ""
 
@@ -313,6 +333,43 @@ def _has_usable_tokens(cred: dict | None) -> bool:
         # can still carry a request until it expires.
         return bool(cred.get("access_token")) and not sub_auth.is_expired(cred, skew_ms=0)
     return bool(cred.get("access_token") or cred.get("refresh_token"))
+
+
+def _stored_accounts_all_refresh_revoked() -> bool:
+    """True when stored xAI accounts exist but NONE can ever refresh.
+
+    Every stored credential with tokens has ``refresh_revoked`` set (upstream
+    invalid_grant) and no live access JWT left — only an interactive re-login
+    recovers, so account hopping is pointless. False when no accounts are
+    stored (plain "not logged in") or any account is still viable.
+    """
+    accounts = sub_auth.list_accounts(PROVIDER_ID)
+    if not accounts:
+        return False
+    saw_tokens = False
+    for a in accounts:
+        aid = str(a.get("account_id") or "").strip()
+        cred = sub_auth.load_credential(PROVIDER_ID, account_id=aid or None)
+        if not isinstance(cred, dict):
+            continue
+        if not (cred.get("access_token") or cred.get("refresh_token")):
+            continue
+        saw_tokens = True
+        if not cred.get("refresh_revoked"):
+            return False
+        if _has_usable_tokens(cred):
+            # Live access JWT can still carry requests — not fully dead.
+            return False
+    return saw_tokens
+
+
+def _all_revoked_relogin_error() -> RuntimeError:
+    return RuntimeError(
+        "All stored xAI accounts have revoked refresh tokens "
+        "(upstream invalid_grant — the OAuth grants were revoked or expired "
+        "server-side). Re-login required: Settings → Sign in with xAI "
+        "for each account you want to keep using."
+    )
 
 
 def _iter_usage_windows(cred: dict | None) -> list[dict]:
@@ -1214,10 +1271,14 @@ class XAISubProvider(Provider):
                 or account_usage_exhausted(self._cred)
             ) else _cred_account_id(self._cred)):
                 if not self._cred or not _has_usable_tokens(self._cred):
+                    if _stored_accounts_all_refresh_revoked():
+                        raise _all_revoked_relogin_error()
                     raise RuntimeError(
                         "Not logged in to xAI subscription. "
                         "Run login() first (Settings → Sign in with xAI)."
                     )
+                if _stored_accounts_all_refresh_revoked():
+                    raise _all_revoked_relogin_error()
                 raise RuntimeError(
                     "All signed-in xAI accounts are spent or temporarily blocked "
                     "(spending-limit / tier-gate 403 / rate-limit 429). Sign in "
@@ -1278,10 +1339,14 @@ class XAISubProvider(Provider):
                     )
                     if self._activate_next_account(failed_id=failed):
                         return
+                if _stored_accounts_all_refresh_revoked():
+                    raise _all_revoked_relogin_error() from exc
                 raise
             failed = _cred_account_id(self._cred)
             mark_account_blocked(failed, reason=f"ensure_auth refresh: {exc}"[:120])
             if not self._activate_next_account(failed_id=failed):
+                if _stored_accounts_all_refresh_revoked():
+                    raise _all_revoked_relogin_error() from exc
                 raise
 
     def _activate_next_account(self, *, failed_id: str | None) -> bool:

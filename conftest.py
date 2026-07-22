@@ -26,9 +26,17 @@ if _ROOT not in sys.path:
 # mcp_server->services/mcp). On Windows checkouts with core.symlinks=false these
 # materialize as plain text files, so `import engine.dfm` etc. fail at collection. Alias
 # the short name to the real package in sys.modules so imports work regardless of
-# filesystem symlink support. No-op where the real symlink already resolves (e.g. Linux),
-# and silently skipped when a target is genuinely absent.
+# filesystem symlink support. NOTE: a bare `sys.modules['agent'] = services.agent`
+# alias is NOT enough — on Linux the symlink makes `import agent.config` load
+# config.py a SECOND time under the short name, so `agent.config` and
+# `services.agent.config` become two distinct module objects. Monkeypatches then
+# land on the copy the code under test doesn't read (order-dependent failures in
+# test_tiers / test_sourcing_subagent / test_subagent_registry). The meta_path
+# finder below makes the short name resolve to the SAME module object as the
+# canonical path, for the package and every submodule, in both directions.
 import importlib
+import importlib.abc
+import importlib.machinery
 
 _PKG_ALIASES = {
     "engine": "engine_oracle",
@@ -38,20 +46,39 @@ _PKG_ALIASES = {
     "installer": "services.installer",
     "mcp_server": "services.mcp",
 }
-for _alias, _target in _PKG_ALIASES.items():
-    if _alias in sys.modules:
-        continue
-    # On Linux the symlink resolves to a real directory, so normal import handles it and we
-    # skip (zero overhead). On Windows (core.symlinks=false) the short name is a plain text
-    # file — not a dir — so alias it to the real package. NOTE: this only fixes in-process
-    # imports; child processes spawned as `python -m engine.<x>` still need real symlinks or
-    # junctions on Windows (see docs/BUILD_WINDOWS.md).
-    if os.path.isdir(os.path.join(_ROOT, _alias)):
-        continue
-    try:
-        sys.modules[_alias] = importlib.import_module(_target)
-    except ImportError:
-        pass                                         # target absent — nothing to alias
+
+
+class _AliasLoader(importlib.abc.Loader):
+    """`import agent.x` returns the already-canonical `services.agent.x` module
+    object (identity, not a re-execution of the same file)."""
+
+    def __init__(self, target: str):
+        self._target = target
+
+    def create_module(self, spec):
+        try:
+            return importlib.import_module(self._target)
+        except ImportError:
+            return None  # target genuinely absent — fall back to default loading
+
+    def exec_module(self, module):
+        pass  # already executed by import_module above
+
+
+class _SymlinkAliasFinder(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        for alias, tgt in _PKG_ALIASES.items():
+            if fullname == alias or fullname.startswith(alias + "."):
+                real = tgt + fullname[len(alias):]
+                return importlib.machinery.ModuleSpec(fullname, _AliasLoader(real))
+        return None
+
+
+sys.meta_path.insert(0, _SymlinkAliasFinder())
+# Windows note: this also covers the core.symlinks=false checkout (the short
+# name is a plain text file there), but only for IN-PROCESS imports; child
+# processes spawned as `python -m engine.<x>` still need real symlinks or
+# junctions on Windows (see docs/BUILD_WINDOWS.md).
 
 
 def _stub(name: str, **attrs) -> types.ModuleType:

@@ -52,8 +52,10 @@ inline Mat4 perspective(float fovyRad, float aspect, float znear, float zfar) {
 // Symmetric orthographic projection (OpenGL clip space, column-major).
 // left/right/bottom/top are the half-extents of the view volume at any depth;
 // znear/zfar are distances along the camera forward axis (positive = in front).
-// For a free orbit, pass generous signed near/far (e.g. -10R .. +10R from the eye
-// via lookAt's view space) so the model never clips when the camera rolls past it.
+// For a free orbit, pass a generous band that brackets the orbit TARGET
+// (e.g. dist-10R .. dist+10R, where dist is the eye->target distance) so the
+// volume follows the eye as it recedes with 1/zoom and the model never clips
+// when the camera rolls past it or zooms out.
 // Named makeOrtho (not orthographic) so it never collides with Renderer::orthographic().
 inline Mat4 makeOrtho(float left, float right, float bottom, float top,
                       float znear, float zfar) {

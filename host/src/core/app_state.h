@@ -376,6 +376,11 @@ struct JobState {
     // streamed part_named event and/or the agent_run result's part_name field. The GL drain uses
     // it to refresh the tab title and auto-save <name>.step+ into the workspace.
     std::string partName;
+    // File-first persistence: the core agent saved the part itself (at modeling start +
+    // milestone re-saves + memory-stage rename) and reports the final path in the run
+    // result's saved_path. Non-empty => the drain saves onto THIS path instead of
+    // unique-ifying a duplicate <name>_2.step+ next to the agent's file.
+    std::string savedPath;
     // Final doc revision from a successful agent_run_v2 result. Host autosave gates on
     // partName set AND finalRevision > 0 so a zero-progress / no_geometry run never writes.
     int finalRevision = 0;

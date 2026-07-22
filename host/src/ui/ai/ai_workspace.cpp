@@ -1458,7 +1458,7 @@ static void drawChatCenter(AppState& st, bool busy, bool canRun) {
                    "Describe what to build — the copilot plans, models and verifies it.");
     } else {
         chatDrawLog(st);
-        if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 12) ImGui::SetScrollHereY(1.0f);
+        chatLogStickToBottom();
     }
     ImGui::EndChild();
     ImGui::PopStyleColor();

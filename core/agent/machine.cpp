@@ -560,9 +560,12 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
     // request. Ids use "model:" / "review:" / "fix:" / "memory:" prefixes so
     // they never collide with mission:/firm: items the host upserts by id.
     const bool plan_skipped = budget_of("plan") <= 0;
+    // Review omitted (budget 0 — the solo fast path for trivial single parts):
+    // no LLM review, no fix loop, and no checklist row for either.
+    const bool review_omitted = budget_of("review") <= 0;
     int stage_check_rev = 0;
     std::string model_status = "pending";
-    std::string review_status = "pending";
+    std::string review_status = review_omitted ? "skip" : "pending";
     std::string fix_status = "pending";
     std::string memory_status = "pending";
     bool fix_was_used = false;
@@ -597,11 +600,13 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
                              {"desc", "model: " + sum},
                              {"status", model_status},
                              {"kind", "step"}});
-        items.push_back(json{{"id", "review:"},
-                             {"title", plan_item_title("review")},
-                             {"desc", "review"},
-                             {"status", review_status},
-                             {"kind", "step"}});
+        if (!review_omitted) {
+            items.push_back(json{{"id", "review:"},
+                                 {"title", plan_item_title("review")},
+                                 {"desc", "review"},
+                                 {"status", review_status},
+                                 {"kind", "step"}});
+        }
         if (fix_was_used || fix_status == "running" || fix_status == "done" ||
             fix_status == "fail") {
             items.push_back(json{{"id", "fix:"},
@@ -745,7 +750,9 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
     // per-stage retries), so Solo/Standard/Complex defaults actually bound the loop.
     // Each review "retry" drains fix attempts until fix passes or the cap is hit, then
     // re-reviews when a fix landed.
-    {
+    // review budget <= 0 (solo fast path for trivial single parts) omits the
+    // whole loop — same "budget 0 = stage omitted" contract as the plan stage.
+    if (!review_omitted) {
         const int fix_limit = std::max(0, budget_of("fix"));
         int fix_calls = 0;
         int review_round = 0;

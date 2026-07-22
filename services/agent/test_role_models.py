@@ -314,6 +314,10 @@ class TestResolveRoleModel:
         for r in rm.KNOWN_ROLES:
             assert roles[r] == "auto"
 
+    def test_known_roles_includes_sketch2d_model3d(self):
+        assert "sketch2d" in rm.KNOWN_ROLES
+        assert "model3d" in rm.KNOWN_ROLES
+
     def test_set_ai_roles_no_persist(self):
         roles = rm.set_ai_roles(
             {"task": {"provider": "xai", "model": "grok-4.5"}},

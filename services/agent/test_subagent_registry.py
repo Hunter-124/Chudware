@@ -28,6 +28,15 @@ from services.agent.providers.mock_provider import MockProvider
 @pytest.fixture(autouse=True)
 def _tmp_registry(tmp_path, monkeypatch):
     monkeypatch.setenv("AICAD_SUBAGENTS_DIR", str(tmp_path / "subagents"))
+    # Hermetic: delegate() rebuilds a per-role provider from model assignment
+    # (WS2/mega-5) — ambient config.json ai_roles on a dev machine, or the
+    # ollama default when config is empty. Either replaces the mock with a live
+    # provider. Force the legacy no-assignment path instead.
+    monkeypatch.setattr("services.agent.config.load_config", lambda *a, **k: {})
+    monkeypatch.setattr("services.agent.role_models.resolve_for_node",
+                        lambda *a, **k: None)
+    monkeypatch.setattr("services.agent.role_models.resolve_role_model",
+                        lambda *a, **k: None)
     yield
 
 
@@ -56,6 +65,7 @@ def _msg_texts(messages: list[dict]) -> str:
 
 _DONE = '```json\n{"done": true, "handoff": {"summary": "finished"}}\n```'
 _TOOL = '```json\n{"tool": "probe", "args": {"target": "top face"}}\n```'
+_LIST_CATS = '```json\n{"tool": "list_tool_categories", "args": {}}\n```'
 
 
 # ---------------------------------------------------------------------------
@@ -177,13 +187,17 @@ def test_delegate_registers_streams_spawn_and_executes():
         events.append(dict(data))
 
     tree = DelegationTree(run_id="r_test", on_event=on_event)
-    prov = MockProvider([_DONE])
+    # mega-13 refuses a zero-tool done on product roles (add_features+new_part
+    # on the sketcher allowlist) — script one harmless meta call first.
+    prov = MockProvider([_LIST_CATS, _DONE])
     md = MissionDispatch(run_id="r_test", delegation_tree=tree, provider=prov,
                          on_event=on_event)
     out = md.delegate(role="sketcher", brief="sketch the base plate",
                       budget_tokens=2000)
     assert out.get("executed") is True and out.get("ok") is True
-    assert out.get("handoff") == {"summary": "finished"}
+    # mega-8 multi-domain gate augments outputs with a residual typed_refusal —
+    # assert the scripted handoff content, not exact envelope equality.
+    assert (out.get("handoff") or {}).get("summary") == "finished"
     node_id = out["id"]
     # agent.spawn streamed live with the child's subagent_id
     spawns = [e for e in events if e.get("kind") == "agent.spawn"]

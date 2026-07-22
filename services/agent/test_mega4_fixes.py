@@ -93,8 +93,20 @@ def test_live_ledger_aliases_and_criterion_result_section(tmp_path):
     assert mission_brief["ok"] and mission_brief["section"] == "brief"
 
 
-def test_failed_plan_and_build_are_reconciled_but_not_completed():
+def test_failed_plan_and_build_are_reconciled_but_not_completed(monkeypatch):
     """Mega-4 failed nodes must not receive fabricated successful exit gates."""
+    # The mission driver's terminal mech/ecad product forces inspect AMBIENT
+    # engine state (open docs from earlier tests) — order-dependent in a full
+    # suite run. This test pins phase-reconciliation semantics only, so stub
+    # the forces out (they have their own coverage elsewhere).
+    monkeypatch.setattr(
+        "services.agent.agent_turn.mech_deliver_gate",
+        lambda *a, **k: {"allow_deliver": True, "had_mech": True,
+                         "forced": False, "ok": True, "refusal": None,
+                         "doc_id": None, "calls": []})
+    monkeypatch.setattr(
+        "services.agent.agent_turn.ecad_product_gate",
+        lambda *a, **k: {"forced": False})
     from services.agent import loop
     from services.agent.pipeline.phases import Phase, PhaseMachine, PipelineFlags
 

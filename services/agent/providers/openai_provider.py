@@ -176,17 +176,11 @@ class OpenAIProvider(Provider):
         msg = choices[0].message
         # Reasoning models served over the OpenAI-compatible API (LM Studio, llama.cpp,
         # vLLM, DeepSeek-R1, Qwen-think, …) put their chain-of-thought in `reasoning_content`
-        # (some use `reasoning`). When the model returned ONLY reasoning with an empty
-        # `content` (spent its output budget thinking, or never split the two), fall back to
-        # it so the caller can still pull any ops JSON the model wrote inline.
+        # (some use `reasoning`). Never alias it into the reply: ops/JSON extraction must
+        # see the model's ACTIONS, not its scratchpad — a JSON-ish blob the model is
+        # mulling over is not an answer. A content-empty reply stays empty (the caller
+        # retries/fails honestly). Mirrors the C++ core (providers.cpp).
         content = getattr(msg, "content", None) or ""
-        if not content:
-            extra = getattr(msg, "model_extra", None) or {}
-            content = (getattr(msg, "reasoning_content", None)
-                       or getattr(msg, "reasoning", None)
-                       or extra.get("reasoning_content")
-                       or extra.get("reasoning")
-                       or "")
         # mega-6: stash provider usage without changing complete return signature.
         try:
             from . import token_usage as _tu  # noqa: PLC0415

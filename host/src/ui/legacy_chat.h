@@ -73,6 +73,9 @@ void pollChatOpenFoam(AppState& state);
 void chatWorkspaceSync(AppState& st);                         // bind conversations to the active doc
 bool chatTurnActive(AppState& st);                            // an assistant turn is streaming
 void chatDrawLog(AppState& st);                               // the active conversation's turns
+// Stick-to-bottom autoscroll for the chat scroll region — call right after chatDrawLog inside
+// the scrolling child. Pins the view to the tail while streaming unless the user scrolled up.
+void chatLogStickToBottom();
 void chatDrawComposer(AppState& st, bool busy, bool canRun);  // prelude + input + toolbar (real send path)
 void chatDrawSessionsList(AppState& st, bool busy);           // session rows + "+ New session"
 

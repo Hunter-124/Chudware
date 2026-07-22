@@ -1714,3 +1714,95 @@ def test_ensure_fresh_skips_revoked_prefix_beyond_old_cap(tmp_config, monkeypatc
     live = sub_auth.load_credential(xsp.PROVIDER_ID, account_id="acct-live-deep")
     assert live["refresh_token"] == "rt-live-new"
 
+
+
+
+def test_xai_tier_denied_spending_limit_reason_distinct():
+    """403 body personal-team-blocked:spending-limit must surface as
+    out-of-credits / needs-subscription, not the Heavy-only tier gate."""
+    from agent.providers import xai_sub_provider as xsp
+
+    exc = xsp.XaiTierDeniedError('{"code":"personal-team-blocked:spending-limit"}')
+    msg = str(exc)
+    assert "out of credits" in msg
+    assert "spending limit" in msg
+    assert "tier not API-enabled" not in msg
+    assert exc.reason == xsp.SPENDING_LIMIT_REASON
+    # Hint retained so the chat card still points at a way out.
+    assert "Hint" in msg
+
+    # Non-spend 403 keeps the tier-gate reason.
+    exc2 = xsp.XaiTierDeniedError('{"code":"tier-gated"}')
+    assert exc2.reason == xsp.TIER_DENIED_REASON
+    assert "tier not API-enabled" in str(exc2)
+
+
+def test_xai_ensure_auth_all_revoked_pool_says_relogin(tmp_config, monkeypatch):
+    """When every stored account is refresh_revoked, _ensure_auth must say
+    plainly that re-login is required — not a generic all-accounts-failed."""
+    from agent.providers import xai_sub_provider as xsp
+
+    xsp.clear_blocked_accounts_for_tests()
+    past = time.time() * 1000 - 1000  # expired access JWTs
+    for aid in ("acct-dead-1", "acct-dead-2"):
+        sub_auth.save_credential(xsp.PROVIDER_ID, {
+            "access_token": f"at-{aid}",
+            "refresh_token": f"rt-{aid}",
+            "expires_at_ms": past,
+            "account_id": aid,
+            "refresh_revoked": True,
+            "auth_error": "invalid_grant",
+            "token_endpoint": "https://auth.x.ai/oauth2/token",
+        }, account_id=aid, set_active=(aid == "acct-dead-1"))
+
+    p = xsp.XAISubProvider()
+    with pytest.raises(RuntimeError) as ei:
+        p._ensure_auth()
+    msg = str(ei.value)
+    assert "revoked refresh tokens" in msg
+    assert "Re-login required" in msg
+    assert "Sign in with xAI" in msg
+    # Not the misleading generic messages.
+    assert "spent or temporarily blocked" not in msg
+    assert "Not logged in" not in msg
+
+
+def test_xai_ensure_auth_mixed_pool_not_flagged_all_revoked(tmp_config, monkeypatch):
+    """One viable account among revoked ones must NOT trip the re-login error."""
+    from agent.providers import xai_sub_provider as xsp
+
+    xsp.clear_blocked_accounts_for_tests()
+    past = time.time() * 1000 - 1000
+    sub_auth.save_credential(xsp.PROVIDER_ID, {
+        "access_token": "at-dead",
+        "refresh_token": "rt-dead",
+        "expires_at_ms": past,
+        "account_id": "acct-dead",
+        "refresh_revoked": True,
+        "token_endpoint": "https://auth.x.ai/oauth2/token",
+    }, account_id="acct-dead", set_active=True)
+    sub_auth.save_credential(xsp.PROVIDER_ID, {
+        "access_token": "at-live",
+        "refresh_token": "rt-live",
+        "expires_at_ms": time.time() * 1000 + 10 ** 9,
+        "account_id": "acct-live",
+        "token_endpoint": "https://auth.x.ai/oauth2/token",
+    }, account_id="acct-live", set_active=False)
+
+    assert xsp._stored_accounts_all_refresh_revoked() is False
+
+    monkeypatch.setattr(
+        xsp, "pull_account_usage",
+        lambda account_id, cred=None, force=True: dict(cred or {}) | {"account_id": account_id},
+    )
+    p = xsp.XAISubProvider()
+    p._ensure_auth()  # must not raise
+    assert (p._cred or {}).get("account_id") == "acct-live"
+
+
+def test_xai_all_revoked_predicate_empty_store(tmp_config):
+    """No stored accounts → predicate is False (plain 'not logged in' path)."""
+    from agent.providers import xai_sub_provider as xsp
+
+    xsp.clear_blocked_accounts_for_tests()
+    assert xsp._stored_accounts_all_refresh_revoked() is False

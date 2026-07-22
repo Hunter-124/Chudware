@@ -31,6 +31,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <mutex>
 #include <set>
 #include <sstream>
@@ -869,7 +870,8 @@ static std::string chatActivityCopyText(const ActivityItem& a) {
 // ============================ Plan / Objectives section ============================
 // Multi-shape plan display (build_plan | checklist | phased_todo | objectives | dag).
 // Tiles show brief titles; full purpose/dims/assignment lives in ImGui hover tooltips.
-// Todos tree uses omp-like status glyphs; subagents list is omitted when empty.
+// Todos tree rows use the shared vector status glyph (drawStatusGlyph); subagents list is
+// omitted when empty.
 
 PlanState parsePlanState(const nlohmann::json& p) {
     PlanState ps;
@@ -1042,14 +1044,8 @@ static const char* planRomanNumeral(int n) {
     return nullptr;
 }
 
-// Compact omp-like status glyph as a single UTF-8 codepoint string.
-static const char* planTodoGlyph(const std::string& status) {
-    if (status == "running") return "\xe2\x86\x92";          // →
-    if (status == "pass" || status == "done") return "\xe2\x9c\x93";  // ✓
-    if (status == "fail") return "\xe2\x9c\x97";             // ✗
-    if (status == "abandoned") return "\xe2\x80\x93";        // –
-    return "\xe2\x97\x8b";                                   // ○
-}
+// (The old omp-style text glyphs here — ○ ✓ → — are gone: the UI font lacks those codepoints
+// and rendered them as literal "?". Rows use the vector drawStatusGlyph instead.)
 
 static void planDrawShapeChip(const char* label, const ImVec4& accent) {
     if (!label || !*label) return;
@@ -1072,21 +1068,36 @@ static void planDrawShapeChip(const char* label, const ImVec4& accent) {
     ImGui::Dummy(ImVec2(p1.x - p0.x, p1.y - p0.y));
 }
 
-// One compact tile: status glyph + brief title; full desc on hover tooltip.
+// Tile width recipe shared by planDrawTile (paint) and planDrawTilesRow (layout): measured in
+// the SAME medium font the tile draws with (mixing fonts here used to overlap/clip chips), and
+// capped so one long title wraps to its own row instead of eating the whole strip.
+static float planTileWidth(const PlanItem& it, const ui::Fonts& fonts) {
+    const float sc = ui::uiScale;
+    const float glyph = ImGui::GetTextLineHeight();
+    const char* title = it.title.empty() ? "(untitled)" : it.title.c_str();
+    ImFont* f = fonts.medium ? fonts.medium : ImGui::GetFont();
+    const float tw = f->CalcTextSizeA(ImGui::GetFontSize(), FLT_MAX, 0.0f, title).x;
+    float w = glyph + 4.0f * sc + tw + 12.0f * sc;
+    const float avail = ImGui::GetContentRegionAvail().x;
+    const float maxW = std::min(280.0f * sc, avail > 1.0f ? avail : 280.0f * sc);
+    if (w > maxW) w = maxW;
+    return w;
+}
+
+// One compact tile: status glyph + brief title (ellipsized); full desc on hover tooltip.
 static void planDrawTile(const PlanItem& it, const std::string& status, const ui::Fonts& fonts) {
     const float sc = ui::uiScale;
     const ui::AdaptiveSurface& surf = chatSurf();
     const float glyph = ImGui::GetTextLineHeight();
     const char* title = it.title.empty() ? "(untitled)" : it.title.c_str();
-    ImVec2 tsz = ImGui::CalcTextSize(title);
+    ImFont* f = fonts.medium ? fonts.medium : ImGui::GetFont();
+    const float fs = ImGui::GetFontSize();
+    ImVec2 tsz = f->CalcTextSizeA(fs, FLT_MAX, 0.0f, title);
     float padX = 6.0f * sc;
     float padY = 3.0f * sc;
     float gap = 4.0f * sc;
-    float w = glyph + gap + tsz.x + padX * 2.0f;
+    const float w = planTileWidth(it, fonts);
     float h = std::max(glyph, tsz.y) + padY * 2.0f;
-    // Cap very long titles so the row stays dense.
-    const float maxW = 140.0f * sc;
-    if (w > maxW) w = maxW;
 
     ImVec2 p0 = ImGui::GetCursorScreenPos();
     ImGui::InvisibleButton("##tile", ImVec2(w, h));
@@ -1102,16 +1113,29 @@ static void planDrawTile(const PlanItem& it, const std::string& status, const ui
     dl->AddRectFilled(p0, ImVec2(p0.x + w, p0.y + h), bg, rnd);
     dl->AddRect(p0, ImVec2(p0.x + w, p0.y + h), edge, rnd, 0, ui::metrics::stroke(1.0f));
 
+    // Ellipsize the title to the tile's text lane (full title stays on the hover tooltip).
+    const float textMax = w - padX * 2.0f - glyph - gap;
+    std::string shown = title;
+    auto textW = [&](const std::string& s) {
+        return f->CalcTextSizeA(fs, FLT_MAX, 0.0f, s.c_str()).x;
+    };
+    if (textW(shown) > textMax) {
+        static const char* kEll = "\xe2\x80\xa6";
+        const float ellW = textW(kEll);
+        while (!shown.empty() && textW(shown) + ellW > textMax) shown.pop_back();
+        while (!shown.empty() && (shown.back() & 0xC0) == 0x80) shown.pop_back();  // UTF-8 boundary
+        if (!shown.empty()) shown += kEll;
+    }
+
     // Glyph inside the tile (restore cursor for drawStatusGlyph, then restore after).
     ImVec2 saved = ImGui::GetCursorScreenPos();
     ImGui::SetCursorScreenPos(ImVec2(p0.x + padX, p0.y + (h - glyph) * 0.5f));
     drawStatusGlyph(status, glyph);
-    ImGui::SetCursorScreenPos(ImVec2(p0.x + padX + glyph + gap, p0.y + (h - tsz.y) * 0.5f));
-    ImFont* f = fonts.medium ? fonts.medium : ImGui::GetFont();
     ImU32 tcol = ImGui::ColorConvertFloat4ToU32(surf.textPrimary);
     // Clip title to tile width.
     dl->PushClipRect(p0, ImVec2(p0.x + w - padX, p0.y + h), true);
-    dl->AddText(f, ImGui::GetFontSize(), ImGui::GetCursorScreenPos(), tcol, title);
+    dl->AddText(f, fs, ImVec2(p0.x + padX + glyph + gap, p0.y + (h - tsz.y) * 0.5f),
+                tcol, shown.c_str());
     dl->PopClipRect();
     ImGui::SetCursorScreenPos(saved);
 
@@ -1123,7 +1147,7 @@ static void planDrawTile(const PlanItem& it, const std::string& status, const ui
 
     if (hov && !it.desc.empty())
         ImGui::SetTooltip("%s", it.desc.c_str());
-    else if (hov && it.desc.empty() && !it.title.empty())
+    else if (hov && !it.title.empty())
         ImGui::SetTooltip("%s", it.title.c_str());
 }
 
@@ -1147,10 +1171,7 @@ static void planDrawTilesRow(const std::vector<PlanItem>& items,
             if (it.kind == "subagent") continue;
         }
         const std::string st = planItemStatusFromActivity(it, activity);
-        const char* title = it.title.empty() ? "(untitled)" : it.title.c_str();
-        float glyph = ImGui::GetTextLineHeight();
-        float tw = glyph + 4.0f * sc + ImGui::CalcTextSize(title).x + 12.0f * sc;
-        if (tw > 140.0f * sc) tw = 140.0f * sc;
+        const float tw = planTileWidth(it, fonts);
         if (drawn > 0) {
             if (x + gap + tw > avail) {
                 // wrap to next line
@@ -1252,17 +1273,12 @@ static void planDrawTodosTree(const PlanState& plan,
                 ImGui::Dummy(ImVec2(8.0f * sc, 0));
                 ImGui::SameLine(0, 0);
             }
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                (st == "running" || st == "pass" || st == "done")
-                    ? semanticOnGlass(ui::palette.accent, surf)
-                    : (st == "fail")
-                        ? semanticOnGlass(ui::palette.statusErr, surf)
-                        : surf.textSecondary);
-            ImGui::TextUnformatted(planTodoGlyph(st));
-            ImGui::PopStyleColor();
+            // Same vector status glyph the action cards / tiles use — the old omp-style text
+            // glyphs (○ ✓ →) are missing from the UI font and rendered as literal "?".
+            drawStatusGlyph(st, ImGui::GetTextLineHeight());
             ImGui::SameLine(0, 6.0f * sc);
             ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
-            ImGui::TextUnformatted(it.title.empty() ? "(untitled)" : it.title.c_str());
+            ImGui::TextWrapped("%s", it.title.empty() ? "(untitled)" : it.title.c_str());
             ImGui::PopStyleColor();
             if (ImGui::IsItemHovered() && !it.desc.empty())
                 ImGui::SetTooltip("%s", it.desc.c_str());
@@ -1481,13 +1497,6 @@ void drawPlanSection(const PlanState& plan, const std::vector<ActivityItem>& act
         ImGui::PopStyleColor();
         if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
         if (ImGui::IsItemClicked()) hdrStore->SetBool(hdrId, false);
-        const std::string prog = planProgressLine(plan, activity);
-        if (!prog.empty()) {
-            ImGui::SameLine(0, 8.0f * sc);
-            ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-            ImGui::TextUnformatted(prog.c_str());
-            ImGui::PopStyleColor();
-        }
     }
     if (!plan.shape.empty()) {
         ImGui::SameLine(0, 8.0f * sc);
@@ -1496,7 +1505,36 @@ void drawPlanSection(const PlanState& plan, const std::vector<ActivityItem>& act
         ImGui::SetCursorPosY(y + 1.0f * sc);
         planDrawShapeChip(planShapeChipLabel(plan.shape), accent);
     }
-    if (!plan.summary.empty()) {
+    // Live progress ("0/3 · now: model: …") on its OWN wrapped line under the header — same
+    // line as the title it overflowed and hard-clipped (the "Build (hide) 0/3 · now:…" bug).
+    int progDone = 0, progTotal = 0;
+    std::string progCur;
+    planProgress(plan, activity, progDone, progTotal, progCur);
+    std::string prog;
+    if (progTotal > 0) {
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "%d/%d", progDone, progTotal);
+        prog = buf;
+    }
+    if (!progCur.empty()) { if (!prog.empty()) prog += " \xc2\xb7 "; prog += "now: "; prog += progCur; }
+    if (!prog.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+        ImGui::TextWrapped("%s", prog.c_str());
+        ImGui::PopStyleColor();
+    }
+    // Summary — skipped when it only restates the progress line (the solo stage checklist
+    // emits summary = request text AND a "model: <request>" running item, so the card used to
+    // print the same sentence twice). Titles are word-capped, so compare prefixes both ways.
+    bool summaryDup = false;
+    if (!plan.summary.empty() && !progCur.empty()) {
+        std::string cur = progCur;
+        const size_t colon = cur.find(": ");
+        if (colon != std::string::npos) cur = cur.substr(colon + 2);   // drop "model:" stage prefix
+        // plan_item_title word-caps the item title, so cur is a word-boundary prefix of the
+        // summary (or equal); compare prefixes both ways.
+        summaryDup = plan.summary.rfind(cur, 0) == 0 || cur.rfind(plan.summary, 0) == 0;
+    }
+    if (!plan.summary.empty() && !summaryDup) {
         ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
         ImGui::TextWrapped("%s", plan.summary.c_str());
         ImGui::PopStyleColor();
@@ -2210,6 +2248,21 @@ static ActivityItem* findOrCreateRoutingCard(ChatMsg& m) {
     return &m.activity.front();
 }
 
+// Finalize the live streamed-thinking box ("thought:stream") when the model
+// ACTS — prose/output text, a tool call, a stage boundary, or a completed
+// agent.thought block landing. The box stops pulsing, and because the
+// assistant_delta think branch only coalesces into a STILL-STREAMING box, the
+// next reasoning burst opens a fresh Thinking block instead of two boxes
+// updating at once.
+static void finalizeLiveStreamThought(ChatMsg& m) {
+    for (auto it = m.activity.rbegin(); it != m.activity.rend(); ++it) {
+        if (it->rowKind == 2 && it->stage == "thought:stream" && it->streaming) {
+            finalizeThoughtBox(*it);
+            return;
+        }
+    }
+}
+
 // Merge routing-related fields into the packed detail JSON + title/reason on the card.
 static void mergeRoutingFields(ActivityItem& card, const nlohmann::json& data, const std::string& kind) {
     nlohmann::json meta = nlohmann::json::object();
@@ -2887,6 +2940,8 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             }
         }
     } else if (kind == "stage_started") {
+        // A stage boundary ends any reasoning burst from the previous call.
+        finalizeLiveStreamThought(m);
         std::string s = nsKey(jstr(data, "stage"));
         ActivityItem* a = findStage(s);
         if (!a) {
@@ -3095,6 +3150,23 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         ActivityItem* a = nullptr;
         for (auto it = m.activity.rbegin(); it != m.activity.rend(); ++it)
             if (it->rowKind == 2 && it->stage == key && it->streaming) { a = &*it; break; }
+        if (!a && kind == "agent.thought") {
+            // Dedupe vs the live stream: this completed block usually carries the
+            // SAME reasoning assistant_delta channel=thinking already rendered
+            // (possibly truncated per contract). Fold into that box instead of
+            // stacking a second, identical Thinking block that also keeps pulsing.
+            const std::string blk = jstr(data, "text");
+            for (auto it = m.activity.rbegin(); it != m.activity.rend(); ++it) {
+                if (it->rowKind != 2 || it->stage.rfind("thought:", 0) != 0) continue;
+                const std::string& d = it->detail;
+                if (d.empty() || blk.empty()) continue;
+                const size_t n = std::min<size_t>(std::min(d.size(), blk.size()), 64);
+                if (d.compare(0, n, blk, 0, n) == 0) { a = &*it; break; }
+            }
+        }
+        // A completed thought block = the call's reasoning is done — stop the
+        // live box from pulsing even when the dedupe above found no twin.
+        if (kind == "agent.thought") finalizeLiveStreamThought(m);
         if (!a) {
             ActivityItem ni;
             ni.rowKind = 2;
@@ -3166,6 +3238,8 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             a->status    = "running";
             if (!a->userToggled) a->expanded = true;
         } else {
+            // Action output (ops/prose) — the reasoning burst is over.
+            finalizeLiveStreamThought(m);
             // Text channel: append into the Output box always (collapsed raw log), AND
             // stream prose into the primary bubble (m.text) live — see the prose branch below.
             if (!txt.empty()) a->detail += txt;
@@ -3222,6 +3296,8 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             }
         }
     } else if (kind == "agent.tool_call") {                          // M14 — tool call row
+        // A tool call is an action — the reasoning burst that preceded it is over.
+        finalizeLiveStreamThought(m);
         // Upsert by span id so re-delivered/duplicate events update in place.
         std::string tid = jstr(data, "id");
         if (tid.empty()) tid = jstr(data, "span_id");
@@ -4987,6 +5063,19 @@ static void drawContextChip(const ActivityItem& a, const ui::Fonts& fonts) {
 // M13 — the model's thoughts in a collapsible textbox. While deltas stream (a.streaming) the box
 // stays open so tokens appear live; a completed block auto-collapses to a one-line preview unless
 // the user pinned it open (userToggled). `showThinking` off -> a single dim one-liner.
+// Truncate `s` to fit `maxW` in the current font, appending "…" when truncated (UTF-8-safe).
+static std::string chatEllipsize(const std::string& s, float maxW) {
+    if (maxW <= 0.0f) return s;
+    if (ImGui::CalcTextSize(s.c_str()).x <= maxW) return s;
+    static const char* kEll = "\xe2\x80\xa6";
+    const float ellW = ImGui::CalcTextSize(kEll).x;
+    std::string out = s;
+    while (!out.empty() && ImGui::CalcTextSize(out.c_str()).x + ellW > maxW) out.pop_back();
+    while (!out.empty() && (out.back() & 0xC0) == 0x80) out.pop_back();  // UTF-8 boundary
+    while (!out.empty() && out.back() == ' ') out.pop_back();
+    return out.empty() ? s : out + kEll;
+}
+
 // stream:out classified as ops JSON ("Building ops…") always shows a one-line summary by default;
 // raw JSON lives only inside the expander (never expanded-by-default mid-stream).
 static void drawThoughtBox(ActivityItem& a, const ui::Fonts& fonts, bool showThinking,
@@ -5063,12 +5152,12 @@ static void drawThoughtBox(ActivityItem& a, const ui::Fonts& fonts, bool showThi
             }
         }
     } else if (!isOpsJson && !a.detail.empty()) {
-        // Collapsed thinking/prose: dim one-line preview (first line, ellipsized).
-        std::string prev = a.detail.substr(0, a.detail.find('\n'));
-        if (prev.size() > 110) { prev.resize(110); prev += "\xe2\x80\xa6"; }
-        else if (prev.size() < a.detail.size()) prev += " \xe2\x80\xa6";
+        // Collapsed thinking/prose: dim one-line preview (first line), ellipsized to the card's
+        // content width — a raw first line + TextUnformatted ran past the card's right edge.
+        std::string prev = stripMdMarks(a.detail.substr(0, a.detail.find('\n')));
+        prev = chatEllipsize(prev, ImGui::GetContentRegionAvail().x);
         ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
-        ImGui::TextUnformatted(stripMdMarks(prev).c_str());
+        ImGui::TextUnformatted(prev.c_str());
         ImGui::PopStyleColor();
     }
     ImGui::EndChild();
@@ -5135,23 +5224,56 @@ static void chatArtifactReveal(AppState& st, const std::string& path) {
     (void)std::system(cmd.c_str());
 }
 
-// Two small text actions — "open" / "folder" — for one artifact path. Caller wraps in PushID.
+// Lower-cased extension (with the leading dot) of a path.
+static std::string chatLowerExt(const std::string& p) {
+    const size_t dot = p.find_last_of('.');
+    const size_t slash = p.find_last_of("/\\");
+    if (dot == std::string::npos || (slash != std::string::npos && dot < slash)) return {};
+    std::string e = p.substr(dot);
+    for (char& c : e) c = (char)std::tolower((unsigned char)c);
+    return e;
+}
+
+// Extensions the app itself opens in the viewport (mirrors file_explorer.cpp isKnownExt: native
+// .step+ container, CAD import formats, ECAD/KiCad).
+static bool chatAppOpenableExt(const std::string& e) {
+    return e == ".step+" || e == ".step" || e == ".stp" || e == ".iges" || e == ".igs" ||
+           e == ".stl"   || e == ".3mf"  || e == ".ecad+" || e == ".ecad" ||
+           e == ".kicad_sch" || e == ".kicad_pcb";
+}
+
+// Smart "open": CAD/ECAD files open IN THE APP's viewport via st.requestOpenPath (the same
+// dispatch a File Explorer double-click uses — app.cpp's pump routes CAD vs ECAD). xdg-open on a
+// .step usually has no OS association and silently does nothing, which read as "the button
+// doesn't work". Everything else still goes to the OS default handler.
+static void chatArtifactOpenSmart(AppState& st, const std::string& path) {
+    if (!chatArtifactExists(path)) {
+        namespace fs = std::filesystem;
+        st.toast(ui::ToastLevel::Warn, "File not found: " + fs::path(path).filename().string());
+        return;
+    }
+    if (chatAppOpenableExt(chatLowerExt(path))) {
+        st.requestOpenPath = path;
+        return;
+    }
+    chatArtifactOpen(st, path);
+}
+
+// Two small actions — "(open)" / "(folder)" — for one artifact path. Real SmallButtons (not
+// bare text + IsItemClicked): a TextWrapped label on the same row swallows the hover/click for
+// the trailing bare-text items, so the old text "buttons" never fired. Caller wraps in PushID.
 static void chatArtifactActions(AppState& st, const std::string& path) {
-    const ui::AdaptiveSurface& surf = chatSurf();
-    ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
-    ImGui::TextUnformatted("(open)");
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-        ImGui::SetTooltip("Open with the default app\n%s", path.c_str());
-    }
-    if (ImGui::IsItemClicked()) chatArtifactOpen(st, path);
-    ImGui::SameLine(0, 6.0f * ui::uiScale);
-    ImGui::TextUnformatted("(folder)");
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-        ImGui::SetTooltip("Show in file manager\n%s", path.c_str());
-    }
-    if (ImGui::IsItemClicked()) chatArtifactReveal(st, path);
+    ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textTertiary);
+    if (ImGui::SmallButton("(open)")) chatArtifactOpenSmart(st, path);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s\n%s",
+                          chatAppOpenableExt(chatLowerExt(path))
+                              ? "Open in the viewport"
+                              : "Open with the default app",
+                          path.c_str());
+    ImGui::SameLine(0, 4.0f * ui::uiScale);
+    if (ImGui::SmallButton("(folder)")) chatArtifactReveal(st, path);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show in file manager\n%s", path.c_str());
     ImGui::PopStyleColor();
 }
 
@@ -7081,10 +7203,29 @@ static void drawProviderLog(ChatMsg& m, const ui::Fonts& fonts) {
     {
         char hdr[64];
         std::snprintf(hdr, sizeof(hdr), "Provider log (%d)", (int)calls.size());
+        // Vector-drawn chevron — the ▼/▶ text glyphs are missing from the UI font and rendered
+        // as a literal "?". Same hand-drawn-triangle recipe as the FM section dividers.
+        const float box = ImGui::GetTextLineHeight();
+        const ImVec2 p0 = ImGui::GetCursorScreenPos();
+        ImGui::Dummy(ImVec2(box * 0.8f, box));
+        {
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const ImU32 ink = ImGui::ColorConvertFloat4ToU32(surf.textTertiary);
+            const float cx = p0.x + box * 0.4f, cy = p0.y + box * 0.5f;
+            const float aa = box * 0.20f;
+            if (open)
+                dl->AddTriangleFilled(ImVec2(cx - aa, cy - aa * 0.6f),
+                                      ImVec2(cx + aa, cy - aa * 0.6f),
+                                      ImVec2(cx, cy + aa * 0.7f), ink);
+            else
+                dl->AddTriangleFilled(ImVec2(cx - aa * 0.6f, cy - aa),
+                                      ImVec2(cx - aa * 0.6f, cy + aa),
+                                      ImVec2(cx + aa * 0.7f, cy), ink);
+        }
+        ImGui::SameLine(0, 2.0f * sc);
         ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
         ImGui::PushFont(fonts.medium ? fonts.medium : fonts.body);
-        const char* chev = open ? "\xe2\x96\xbc " : "\xe2\x96\xb6 ";  // ▼ / ▶
-        ImGui::Text("%s%s", chev, hdr);
+        ImGui::TextUnformatted(hdr);
         ImGui::PopFont();
         ImGui::PopStyleColor();
         if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
@@ -7439,7 +7580,7 @@ static void drawCopilotHeader(AppState& st, bool busy) {
 
     const bool sessionsOpen = st.showSessionsPicker;
     const bool settingsOpen = st.showAISettingsOverlay;
-    const bool chatOpen = !sessionsOpen && !settingsOpen;
+    const bool chatOpen = !sessionsOpen && !settingsOpen && !st.showTaskList && !st.showArtifacts;
 
     auto measureBtn = [&](const char* label, const char* iconName) -> float {
         const float iconSz = lh * 0.92f;
@@ -7611,6 +7752,8 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     if (drawHeaderTextButton("##hdr_chat", "Chat", chatOpen, chatW, "ai_panel")) {
         st.showSessionsPicker = false;
         st.showAISettingsOverlay = false;
+        st.showTaskList = false;
+        st.showArtifacts = false;
     }
     if (busy) ImGui::EndDisabled();
     if (ImGui::IsItemHovered())
@@ -7622,7 +7765,7 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     if (drawHeaderTextButton("##hdr_sess", "Sessions", sessionsOpen, sessW, "history")) {
         const bool open = !st.showSessionsPicker;
         st.showSessionsPicker = open;
-        if (open) st.showAISettingsOverlay = false;
+        if (open) { st.showAISettingsOverlay = st.showTaskList = st.showArtifacts = false; }
     }
     if (busy) ImGui::EndDisabled();
     if (ImGui::IsItemHovered())
@@ -7634,7 +7777,7 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     if (drawHeaderTextButton("##hdr_gear", "Settings", settingsOpen, gearW, "settings")) {
         const bool open = !st.showAISettingsOverlay;
         st.showAISettingsOverlay = open;
-        if (open) st.showSessionsPicker = false;
+        if (open) { st.showSessionsPicker = st.showTaskList = st.showArtifacts = false; }
     }
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip(settingsOpen ? "Settings is open."
@@ -8069,10 +8212,33 @@ static void drawArtifactsPanel(AppState& st, bool busy) {
     bool anyDoc = false;
     if (!st.docTabs.empty()) {
         anyDoc = true;
-        for (const auto& t : st.docTabs)
-            ImGui::BulletText("%s", t.title.empty()
-                                        ? (t.path.empty() ? t.docId.c_str() : t.path.c_str())
-                                        : t.title.c_str());
+        for (int ti = 0; ti < (int)st.docTabs.size(); ++ti) {
+            const auto& t = st.docTabs[ti];
+            ImGui::PushID(t.docId.empty() ? ti : (int)(std::hash<std::string>{}(t.docId) & 0x7fffffff));
+            ImGui::Bullet();
+            ImGui::SameLine();
+            ImGui::TextWrapped("%s", t.title.empty()
+                                         ? (t.path.empty() ? t.docId.c_str() : t.path.c_str())
+                                         : t.title.c_str());
+            if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+            if (ImGui::IsItemClicked()) st.switchToTab(ti);
+            // Row actions: (open) fronts the doc in the viewport (switchToTab — the same call
+            // the doc-tab strip uses); (folder) reveals the saved file in the OS file manager —
+            // only when the doc has an on-disk path (never-saved docs don't). Real SmallButtons
+            // so the click can't be swallowed by the wrapped title's item rect.
+            ImGui::SameLine(0, 6.0f * sc);
+            ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+            if (ImGui::SmallButton("(open)")) st.switchToTab(ti);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Open in the viewport");
+            if (!t.path.empty()) {
+                ImGui::SameLine(0, 4.0f * sc);
+                if (ImGui::SmallButton("(folder)")) chatArtifactReveal(st, t.path);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Show in file manager\n%s", t.path.c_str());
+            }
+            ImGui::PopStyleColor();
+            ImGui::PopID();
+        }
     }
     // Agent-created files packed into activity detail after "\x1eART\x1e" (live + restored).
     {
@@ -8105,7 +8271,7 @@ static void drawArtifactsPanel(AppState& st, bool busy) {
                         ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
                         ImGui::SetTooltip("%s", path.c_str());
                     }
-                    if (ImGui::IsItemClicked()) chatArtifactOpen(st, path);
+                    if (ImGui::IsItemClicked()) chatArtifactOpenSmart(st, path);
                     ImGui::SameLine(0, 6.0f * sc);
                     chatArtifactActions(st, path);
                     ImGui::PopID();
@@ -12902,6 +13068,27 @@ static void drawChatLogWindowed(AppState& st) {
     chatDrawCopyFlash();
 }
 
+// Stick-to-bottom autoscroll for the chat scroll region. Call right after chatDrawLog /
+// drawChatLogWindowed, INSIDE the scrolling child. While new content streams in (thinking,
+// tool rows) the view stays pinned to the tail UNLESS the user scrolled up; scrolling back to
+// within a few px of the bottom re-engages. The old "if scrollY >= maxY - 12 snap" check
+// evaluated AFTER the frame's growth, so one >12px growth frame dropped stickiness forever —
+// this instead detects a user scroll (position moved UP vs. last frame) and otherwise snaps.
+void chatLogStickToBottom() {
+    static bool  s_stick = true;
+    static float s_prevScrollY = -1.0f;
+    const float sy   = ImGui::GetScrollY();
+    const float smax = ImGui::GetScrollMaxY();
+    const float thresh = 24.0f * ui::uiScale;
+    if (s_prevScrollY >= 0.0f && sy < s_prevScrollY - 0.5f)
+        s_stick = false;                       // user scrolled up this frame
+    if (sy >= smax - thresh)
+        s_stick = true;                        // at/near the bottom — re-engage
+    if (s_stick && smax > sy)
+        ImGui::SetScrollY(smax);
+    s_prevScrollY = ImGui::GetScrollY();
+}
+
 
 // ---- unified AI Copilot pane: header -> conversation -> bottom composer ----
 // The pane is a PINNED, full-height, rounded glass column overlaid on the viewport's right edge
@@ -13082,8 +13269,16 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
     if (s_cpAnim.bodyVisible()) {
         drawRuntimeBanner(st);
 
-        // Settings / Sessions overlays replace the chat log (and hide the composer) while open.
-        const bool overlayOpen = st.showSessionsPicker || st.showAISettingsOverlay;
+        // Settings / Sessions / Tasks / Artifacts overlays replace the chat log (and hide the
+        // composer) while open. They are mutually exclusive (the header toggles clear the
+        // others) and a click outside the Copilot column dismisses them.
+        const bool overlayOpen = st.showSessionsPicker || st.showAISettingsOverlay ||
+                                 st.showTaskList || st.showArtifacts;
+        if (overlayOpen && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+            !ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows)) {
+            st.showSessionsPicker = st.showAISettingsOverlay =
+                st.showTaskList = st.showArtifacts = false;
+        }
         static float s_composerH = 0.0f;
         const float bottomClearance = ui::metrics::U(5);
         float reserve = 0.0f;
@@ -13109,8 +13304,7 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
             drawSessionsPanel(st, busy);
         } else {
             drawChatLogWindowed(st);   // M19: render-windowed endless scroll-back
-            if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 12)
-                ImGui::SetScrollHereY(1.0f);
+            chatLogStickToBottom();
         }
         const bool  logScrolled = !overlayOpen && ImGui::GetScrollY() > 0.5f;
         const ImVec2 logP0 = ImGui::GetWindowPos();
@@ -13137,8 +13331,7 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         }
         ImGui::PopStyleColor();
 
-        // Composer is hidden under Sessions / Settings overlays (same pattern as before for
-        // sessions was "chat log only" — keep the composer under chat only).
+        // Composer is hidden under the header overlays (sessions / settings / tasks / artifacts).
         if (!overlayOpen) {
             ImGui::Dummy(ImVec2(0, ui::metrics::U(1)));
             ImGui::BeginGroup();

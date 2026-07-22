@@ -750,14 +750,12 @@ ParsedReply openai_parse_response(const json& resp) {
     //
     // Reasoning models served over the OpenAI-compatible API (LM Studio, llama.cpp, vLLM,
     // DeepSeek-R1, Qwen-think, gemma-think, …) emit their chain-of-thought in a separate
-    // `reasoning_content` field (some use `reasoning`). Capture it as thinking; and when the
-    // model returned ONLY reasoning with an empty `content` — it spent its output budget
-    // thinking, or never split the two — fall back to it so extract_json_obj can still pull
-    // any ops JSON the model wrote inline, instead of the run dying with an empty reply.
+    // `reasoning_content` field (some use `reasoning`). Capture it as thinking — but never
+    // alias it into `text`: extract_json_obj must parse the model's ACTIONS, not its
+    // scratchpad. A content-empty reply stays empty (the caller retries/fails honestly).
     for (const char* k : {"reasoning_content", "reasoning"}) {
         if (msg.contains(k) && msg[k].is_string() && !msg[k].get<std::string>().empty()) {
             out.thinking = msg[k].get<std::string>();
-            if (out.text.empty()) out.text = out.thinking;
             break;
         }
     }
@@ -1451,7 +1449,11 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
             text = pr.text;
             thinking = pr.thinking;
         }
-        if (text.empty() && !thinking.empty()) text = thinking;  // CoT-only fallback
+        // No CoT->text fallback: extraction downstream (extract_json_obj) must
+        // see the model's ACTIONS only. Aliasing reasoning into text lets a
+        // thinking model's scratchpad (which often contains JSON-ish arrays of
+        // constraints it is mulling over) be parsed as if it were the answer.
+        // An action-empty reply is an honest "no completion" instead.
         if (text.empty()) {
             res.error = std::string(err_name) + " endpoint returned no completion";
             res.error_excerpt = truncate_excerpt(hr.body.empty() ? res.error : hr.body);

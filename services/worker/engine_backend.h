@@ -36,6 +36,13 @@ bool daemonMode();
 // drain + daemon-only methods (attach_doc / edit_hold / subscribe) go here.
 aicad_ipc::EngineClient* client();
 
+// hostd binary hint used for daemon discovery (exe-adjacent, then the repo
+// dev tree). Short-lived side-channel EngineClients MUST set
+// Options.hostdBin = hostdBinHint() — an empty hint makes instanceKey() hash
+// "default", which is a DIFFERENT socket than the running daemon's
+// (instanceKey(selfPath())), so the side connect fails ENOENT mid-session.
+std::string hostdBinHint();
+
 // Route an engine call to the selected backend. Same contract as
 // core::CppCore::call: true = rc==0 (result holds the payload); false = the
 // method reported an error (structured {code,message} lands in `result`) or a

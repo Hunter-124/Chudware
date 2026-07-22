@@ -24,7 +24,8 @@ from engine.doc.tessellate import (
 )
 
 # Repo-relative path to golden fixture
-_FIXTURE = Path(__file__).resolve().parents[2] / "docs" / "contracts" / "fixtures" / "box.aicm"
+# contracts/ moved top-level in the N0c consolidation (was docs/contracts/)
+_FIXTURE = Path(__file__).resolve().parents[2] / "contracts" / "fixtures" / "box.aicm"
 
 
 # ---------------------------------------------------------------------------
@@ -32,7 +33,7 @@ _FIXTURE = Path(__file__).resolve().parents[2] / "docs" / "contracts" / "fixture
 # ---------------------------------------------------------------------------
 def _golden_generate() -> bytes:
     import sys
-    gen_dir = str(Path(__file__).resolve().parents[2] / "docs" / "contracts" / "fixtures")
+    gen_dir = str(Path(__file__).resolve().parents[2] / "contracts" / "fixtures")
     if gen_dir not in sys.path:
         sys.path.insert(0, gen_dir)
     from make_box_aicm import generate  # type: ignore

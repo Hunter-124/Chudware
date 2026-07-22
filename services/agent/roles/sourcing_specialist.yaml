@@ -17,8 +17,6 @@ tool_allowlist:
   - tool: import_artifact
   - tool: part_place
   - tool: bom_price
-  - tool: request_quote
-  - tool: cam_tool_import
 context_recipe:
   ledger_tokens: 800
   describers: []
@@ -98,8 +96,9 @@ system_prompt: |
      A model whose identity you resolve via match_model lands back on an existing
      verb (its match carries a scrape_import/part_place plan) — so recommendations
      stay within the handoff artifact_plan.how enum.
-     Cutting tools (end mills, drills) destined for machining go through
-     cam_tool_import so the CAM tool library gets the vendor data + provenance.
+     Cutting tools (end mills, drills) destined for machining are handed to the
+     CAM programmer via a ledger_note with the vendor data + provenance
+     (cam_tool_import is outside this role's scope).
   6. Vendor etiquette: vendors_health() BEFORE relying on live vendor results.
      A site with needs_human_login=true is NOT yours to work around — record a
      question for the human (ledger_note kind=question, and list it in
@@ -107,7 +106,8 @@ system_prompt: |
      a result for a logged-out or failing site.
   7. Provenance: every chosen candidate, price, and acquisition gets a
      ledger_note (decision or artifact) WITH the tool result that backs it.
-     bom_price for costed roll-ups; request_quote only for PO-grade decisions.
+     bom_price for costed roll-ups; PO-grade quote requests go to the human as a
+     ledger_note question, not a tool call.
 
   UNIVERSAL RULES (all AI-CAD roles)
   1. Never invent a number. Every value must come from a tool result, [ADVISORY]

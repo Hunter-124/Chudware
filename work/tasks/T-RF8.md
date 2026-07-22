@@ -28,7 +28,7 @@ work/context packs in the same branch.
 
 ## Definition of done
 
-- [ ] No MCP module over ~2k lines; tool count unchanged (344) and all register.
+- [x] No MCP module over ~2k lines; tool count unchanged (344) and all register.
 - [ ] Zero dual-import shims remain.
 - [ ] MCP server boots and a smoke tool call works; pytest agent green.
 - [ ] gate.sh green; REFACTOR_LOG handoff; MCP docs refreshed.

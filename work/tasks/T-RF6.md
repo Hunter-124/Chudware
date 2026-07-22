@@ -28,7 +28,7 @@ the PNGs.
 
 ## Definition of done
 
-- [ ] No file over ~3k lines in the copilot surface; legacy_chat.* gone.
+- [x] No file over ~3k lines in the copilot surface; legacy_chat.* gone.
 - [ ] ai_workspace renders from the same chat modules (no forked logic).
 - [ ] Shot scenarios pixel-plausible (eyeballed); gate.sh green.
 - [ ] REFACTOR_LOG handoff; T-DP16 unblocked on the board.

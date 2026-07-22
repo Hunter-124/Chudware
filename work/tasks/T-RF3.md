@@ -31,4 +31,4 @@ explicitly scope the current check.py reds and make CHECK_PY_FATAL=1 the default
 - [x] gate.sh runs WASM smoke + parity probe stages with SKIP-on-missing-env.
 - [x] contracts/web_parity.md inventory exists and the probe enforces it.
 - [x] check.py fatal by default with zero unscoped reds.
-- [ ] Full gate green; REFACTOR_LOG.md handoff appended.
+- [x] Full gate green; REFACTOR_LOG.md handoff appended.

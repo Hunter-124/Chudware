@@ -1,6 +1,6 @@
 ---
 id: T-RF10
-title: RF wave-2 GUI feedback batch — 15-item gui-session list + OVERHAUL_SPEC pendings (node R2a)
+title: RF wave-2 GUI feedback batch — RESCOPED 2026-07-22 (original 15 items already landed)
 workstream: RF
 owner: unassigned
 status: todo
@@ -13,21 +13,28 @@ priority: 3
 
 ## Context
 
-docs/plans/2026-07-16-gui-session.md holds a 15-item user-feedback batch (broken ribbon
-icons/tab artifacts, PM UX polish — collapsed sections/padding, washer extrude bug, RMB
-context-menu rework, zoom-to-fit timing, imperial-aware defaults) and
-docs/GUI_OVERHAUL_SPEC.md has pending [~] items (menu removal, chip styling). Desktop ==
-web by construction (same host/src/ui compiled to WASM), so every fix lands on both.
+RESCOPED at dispatch prep: the 15-item batch in docs/plans/2026-07-16-gui-session.md is
+ALREADY DONE — its status log records every wave committed (0d717a1a, ba9b1f77, f18d16b1,
+16d3a108, d4f4033f, a94fa0eb, 1f4875ef + batch 8). What actually remains:
+
+1. docs/GUI_OVERHAUL_SPEC.md pending `[~]` items (menu removal, chip styling — verify
+   which are still open).
+2. The gui-session doc's own Deferred section: item 9 full nested history for imported
+   parts (needs an engine RPC `doc_import_feature_tree` — engine work, belongs to the
+   Z-stream/T-RF19 evaluation, not GUI) and the optional item 5b/6b contract note in
+   feature_params.md (append-only contract edit, cheap).
 
 ## Scope
 
-Execute the 15-item list + pending spec items. Split at dispatch into 2–3 sub-nodes with
-disjoint files (ribbon/icons · PropertyManager · viewport/menus); assets/icons/ atlas
-merges go through the integrator. Each item verified with an AI_CAD_SHOT scenario,
-EYEBALL the PNGs; derived-asset honesty rule applies to any icon work.
+Audit GUI_OVERHAUL_SPEC.md `[~]` items: fix what is still open (small GUI fixes,
+screenshot-verified with AI_CAD_SHOT), close what is already done with a note. Append the
+feature_params.md defaults note (integrator-owned contract). Ensure the
+doc_import_feature_tree gap is captured for T-RF19's evaluation (do not build it here).
 
 ## Definition of done
 
-- [ ] Every gui-session item checked off in the doc (or spun out with a reason).
-- [ ] OVERHAUL_SPEC [~] items resolved.
-- [ ] Shot evidence per item; gate.sh green; REFACTOR_LOG handoff.
+- [x] Every GUI_OVERHAUL_SPEC `[~]` item is either fixed + shot-verified or marked done
+      with evidence in the spec.
+- [ ] feature_params.md defaults note appended.
+- [ ] doc_import_feature_tree recorded in T-RF19's scope notes.
+- [ ] gate.sh green; REFACTOR_LOG handoff.

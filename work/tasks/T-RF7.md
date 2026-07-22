@@ -29,4 +29,4 @@ services/agent/prompts/*.md (both runtimes already read that dir).
 
 - [x] One canonical event-kind list; C++ and Python emitters both validated against it.
 - [x] roles.cpp enumerates the prompts dir (no hardcoded names).
-- [ ] New lint in check.py green; gate.sh green; REFACTOR_LOG handoff.
+- [x] New lint in check.py green; gate.sh green; REFACTOR_LOG handoff.

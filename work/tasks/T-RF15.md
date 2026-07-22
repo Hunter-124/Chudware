@@ -30,4 +30,4 @@ Mirror tests in core/tests/.
 
 - [x] fw_* served by libaicad with corpus parity; Python module deleted same commit.
 - [x] MCP firmware tools unchanged on the surface (freshness rule if touched).
-- [ ] gate.sh green; REFACTOR_LOG handoff; web_parity inventory shrinks.
+- [x] gate.sh green; REFACTOR_LOG handoff; web_parity inventory shrinks.

@@ -29,7 +29,7 @@ the same token store until T-RF20. Test against a scratch config dir, never live
 
 ## Definition of done
 
-- [ ] C++ agent runs end-to-end with a subscription provider, no Python in the loop.
+- [x] C++ agent runs end-to-end with a subscription provider, no Python in the loop.
 - [ ] jobs.cpp Python token callback removed.
 - [ ] Token-store format unchanged (Python side reads it until T-RF20).
 - [ ] Tests for refresh/expiry paths; gate.sh green; REFACTOR_LOG handoff.

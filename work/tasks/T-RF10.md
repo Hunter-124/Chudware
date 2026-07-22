@@ -37,4 +37,4 @@ doc_import_feature_tree gap is captured for T-RF19's evaluation (do not build it
       with evidence in the spec.
 - [x] feature_params.md defaults note appended.
 - [x] doc_import_feature_tree recorded in T-RF19's scope notes.
-- [ ] gate.sh green; REFACTOR_LOG handoff.
+- [x] gate.sh green; REFACTOR_LOG handoff.

@@ -30,5 +30,5 @@ work/context packs in the same branch.
 
 - [x] No MCP module over ~2k lines; tool count unchanged (344) and all register.
 - [x] Zero dual-import shims remain.
-- [ ] MCP server boots and a smoke tool call works; pytest agent green.
+- [x] MCP server boots and a smoke tool call works; pytest agent green.
 - [ ] gate.sh green; REFACTOR_LOG handoff; MCP docs refreshed.

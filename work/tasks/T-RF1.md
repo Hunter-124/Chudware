@@ -35,4 +35,4 @@ append the REFACTOR_LOG.md supersession note for the old cursor plan + this DAG'
       docs/PYTHON_CUTOVER_STATUS.md, or docs/CPP_MIGRATION.md as live.
 - [x] AGENTS.md states ~110k LOC host/src/ui and the real ui/viewport status.
 - [x] T-G* board statuses reflect reality; `work.py validate` clean.
-- [ ] REFACTOR_LOG.md paragraph appended; `graphify update .` run.
+- [x] REFACTOR_LOG.md paragraph appended; `graphify update .` run.

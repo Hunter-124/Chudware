@@ -36,5 +36,5 @@ doc_import_feature_tree gap is captured for T-RF19's evaluation (do not build it
 - [x] Every GUI_OVERHAUL_SPEC `[~]` item is either fixed + shot-verified or marked done
       with evidence in the spec.
 - [x] feature_params.md defaults note appended.
-- [ ] doc_import_feature_tree recorded in T-RF19's scope notes.
+- [x] doc_import_feature_tree recorded in T-RF19's scope notes.
 - [ ] gate.sh green; REFACTOR_LOG handoff.

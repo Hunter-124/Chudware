@@ -29,5 +29,5 @@ this node owns app.cpp exclusively within wave 2 — sequence it to land FIRST.
 ## Definition of done
 
 - [x] Ribbon dispatch is table-driven; app.cpp shrinks materially.
-- [ ] All ~150 ribbon commands still route (feature_surface_audit green).
+- [x] All ~150 ribbon commands still route (feature_surface_audit green).
 - [ ] Behavior unchanged (AI_CAD_SHOT scenarios); gate.sh green; REFACTOR_LOG handoff.

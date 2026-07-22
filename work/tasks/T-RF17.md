@@ -28,5 +28,5 @@ the Python modules in the same commit. Unblocks web ECAD and the Windows default
 ## Definition of done
 
 - [x] All ecad_* served by libaicad on Linux; corpus + e2e parity green.
-- [ ] Python ecad modules deleted same commit; routing flipped (integrator merge).
+- [x] Python ecad modules deleted same commit; routing flipped (integrator merge).
 - [ ] gate.sh green; REFACTOR_LOG handoff; web_parity inventory shrinks.

@@ -31,4 +31,4 @@ surface behind them (YAGNI — prefer delete if no live consumer).
 
 - [x] One mode-gating table; parity test green across runtimes.
 - [x] No [TODO T-W*] placeholder strings left in services/agent.
-- [ ] gate.sh green; REFACTOR_LOG handoff; MCP freshness if prompts/tools touched.
+- [x] gate.sh green; REFACTOR_LOG handoff; MCP freshness if prompts/tools touched.

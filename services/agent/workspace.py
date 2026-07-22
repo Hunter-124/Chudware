@@ -16,8 +16,9 @@ Key design decisions (locked)
   Each line is one JSON event.  The GUI polls or tails these files; no engine
   coupling required here (T-W17 concern).
 * Fan-out: BuildGraphExecutor.ready_nodes() drives parallel part dispatch.
-  T-W14 delegation is behind a TODO seam (not yet merged); this module spawns
-  roles directly via a simple callable until that seam closes.
+  The harness wires the real spawn via the ``spawn_modeler`` callable
+  (T-W14 delegation lives in services/agent/delegation.py); the default is an
+  honest no-op that records an advisory (see _default_spawn_modeler).
 * workspace_status() is the single-call poll target for the GUI until a push
   channel exists.
 """
@@ -414,16 +415,17 @@ SpawnFn = Callable[[dict, str, str], Any]
 
 
 def _default_spawn_modeler(node: dict, doc_id: str, run_id: str) -> None:
-    """TODO T-W14 seam — direct role spawn placeholder.
+    """No-spawn default used when the host wires no ``spawn_modeler`` callable.
 
-    When T-W14 delegation lands, replace this with:
-        delegate(role="modeler", doc_id=doc_id, brief=node.get("label",""),
-                 run_id=run_id, node_id=node["id"])
-    Until then this stub records the intent without running a real agent.
+    A real spawn needs the mission's delegation tree (services/agent/delegation.py),
+    which a bare WorkspaceSession does not hold — the harness that runs a mission
+    passes ``spawn_modeler=`` explicitly (tests inject a capture stub). This
+    default therefore does NOT fake a sub-agent: it records an advisory doc event
+    so the orchestrator/GUI can see the node was dispatched without a worker.
     """
-    # Record that spawn was requested so callers can track in tests
     append_doc_event(run_id, doc_id, EVENT_ADVISORY, {
-        "msg": f"[TODO T-W14] spawn modeler for node {node['id']!r} label={node.get('label','')!r}",
+        "msg": f"modeler spawn not wired for node {node['id']!r} "
+               f"label={node.get('label','')!r} (no spawn_modeler callable)",
         "node_id": node["id"],
     })
 

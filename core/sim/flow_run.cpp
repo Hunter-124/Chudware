@@ -3,6 +3,7 @@
 // trimesh voxelize+fill is replaced by a self-contained X-scanline parity fill (per body).
 #include "sim/flow_run.h"
 #include "sim/sim_cache.h"
+#include "sim/sim_cancel.h"
 
 #include <nlohmann/json.hpp>
 
@@ -157,7 +158,7 @@ LbmResult lbm_from_json(const nlohmann::json& j) {
 }
 
 // Content-addressed key for a wind-tunnel call: geometry + every FlowParams field.
-// progress_path is intentionally excluded (side-channel only).
+// progress_path and job_id are intentionally excluded (side-channel / run-control only).
 std::string cfd_input_hash(const std::vector<std::vector<float>>& body_pos,
                            const std::vector<std::vector<uint32_t>>& body_idx,
                            const FlowParams& fp) {
@@ -187,6 +188,16 @@ LbmResult run_wind_tunnel(const std::vector<std::vector<float>>& body_pos,
                           double* reynolds_out) {
     LbmResult R;
     if (body_pos.empty()) { R.ok = false; R.error = "no geometry"; return R; }
+
+    // Cancel registration (sim_cancel): an empty job_id is an anonymous run and registers
+    // nothing. The guard unregisters on every return path (cache hit, error, cancel, done).
+    const SimCancelToken cancel_tok = sim_job_register(fp.job_id);
+    struct JobGuard {
+        const std::string& id;
+        ~JobGuard() { sim_job_unregister(id); }
+    } _job_guard{fp.job_id};
+    std::function<bool()> should_cancel;
+    if (cancel_tok) should_cancel = [cancel_tok] { return cancel_tok->load(); };
 
     const std::string input_hash = cfd_input_hash(body_pos, body_idx, fp);
     {
@@ -364,7 +375,7 @@ LbmResult run_wind_tunnel(const std::vector<std::vector<float>>& body_pos,
     const auto t_solve0 = std::chrono::steady_clock::now();
     aicad::prof::phases::add("voxelize", std::chrono::duration<double, std::milli>(
                                              t_solve0 - t_setup0).count());
-    R = lbm_run(mask, Nx, Ny, Nz, lp, std::max(1, fp.n_steps), on_progress);
+    R = lbm_run(mask, Nx, Ny, Nz, lp, std::max(1, fp.n_steps), on_progress, should_cancel);
     aicad::prof::phases::add("solve", std::chrono::duration<double, std::milli>(
                                           std::chrono::steady_clock::now() - t_solve0).count());
 

@@ -9,7 +9,7 @@
 //
 // The conversation window is ALWAYS visible (M6 — no "Conversation" tab); it renders the SAME
 // state and send path as the docked Copilot (st.chat / st.conversations / st.prompt) via the
-// legacy_chat.h reuse hooks — single chat implementation, two hosts. The tab strip switches only
+// ui/copilot/copilot.h reuse hooks — single chat implementation, two hosts. The tab strip switches only
 // the DAG pane (M7): "Session Plan" is the existing buildgraph view (persisted run sidecars the
 // worker's dag_status serves — ~/.local/share/AI-CAD/runs/*.buildgraph.json, the ONLY run
 // enumeration source), steered via dag_status / dag_approve / dag_abort over st.rpc (async).
@@ -34,7 +34,7 @@
 #include "imgui.h"
 
 #include "core/app_state.h"
-#include "ui/legacy_chat.h"
+#include "ui/copilot/copilot.h"
 #include "ui_theme.h"
 #include "ui/leaderboard_ui.h"
 

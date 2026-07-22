@@ -16,6 +16,7 @@
 
 #include "agent/complexity.h"
 #include "agent/config.h"
+#include "agent/copilot_modes.h"
 #include "agent/domain.h"
 #include "agent/events.h"
 #include "agent/firm_bid.h"
@@ -573,6 +574,12 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
     // Absent mode = today's byte-identical path. plan_only / approved_plan / scope /
     // advisor only engage when explicitly set by the host.
     const std::string copilot_mode = options.value("mode", std::string());
+    // Mode→tool gating contract (contracts/copilot_modes.json) — the same file the
+    // Python path (services/agent/copilot_mode_tools.py) reads, so in-app and
+    // MCP/DAG runs cannot diverge. std::nullopt when unreadable (packaged install
+    // without the repo tree): the delegate gate below keeps its legacy inline
+    // behavior in that case.
+    const std::optional<CopilotModes> copilot_modes = CopilotModes::load();
     // plan_only: explicit flag OR mode==plan. Resume with approved_plan is NOT plan_only
     // (host keeps mode=plan while re-sending the approved plan to execute).
     bool plan_only = options.value("plan_only", false) || copilot_mode == "plan";
@@ -1120,9 +1127,15 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
             }
             return false;  // mixed: note and continue with remaining
         };
-        // Mode gate: only edit/plan/agent (or legacy empty mode).
-        const bool mode_ok = copilot_mode.empty() || copilot_mode == "edit" ||
-                             copilot_mode == "plan" || copilot_mode == "agent";
+        // Mode gate via the shared contract (parity with the Python path):
+        // delegate is denied under ask, allowed under agent/plan/edit/swarm
+        // (empty mode normalizes to agent). Legacy inline gate when the
+        // contract file is unreadable.
+        const bool mode_ok =
+            copilot_modes
+                ? copilot_tool_allowed(*copilot_modes, "delegate", copilot_mode)
+                : (copilot_mode.empty() || copilot_mode == "edit" ||
+                   copilot_mode == "plan" || copilot_mode == "agent");
         if (!mode_ok) return refuse("mode '" + copilot_mode + "' disallows delegate");
         if (st.complexity_set && st.complexity == Complexity::Solo)
             return refuse("Solo complexity cannot delegate");

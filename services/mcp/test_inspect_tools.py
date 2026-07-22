@@ -42,6 +42,7 @@ def _extract_palette(caption: str) -> dict:
     raise AssertionError(f"unbalanced palette_json in caption: {caption!r}")
 
 from services.mcp import cad_tools as ct  # noqa: E402
+from services.mcp import cad_render_tools as ct_render  # noqa: E402  T-RF8: inspect/render tools moved
 
 
 # --------------------------------------------------------------------------- fixtures / fakes
@@ -323,9 +324,9 @@ class TestInspectToolsE2E:
 
         monkeypatch.setattr(ct.cb, "call", fake_call)
         # Pin _doc so we don't need a live current-doc.
-        monkeypatch.setattr(ct, "_doc", lambda doc_id=None: doc_id or "doc-test")
+        monkeypatch.setattr(ct_render, "_doc", lambda doc_id=None: doc_id or "doc-test")
         # describe_part excerpt path may call gsl_tools — keep it offline.
-        monkeypatch.setattr(ct, "_describe_part_excerpt",
+        monkeypatch.setattr(ct_render, "_describe_part_excerpt",
                             lambda doc_id, max_chars=900: (
                                 "Part bbox 40x30x20 mm | features: f1:box | faces: top Ftop"))
         return calls

@@ -1,0 +1,168 @@
+#include "firmware/pinmap.h"
+
+#include <algorithm>
+#include <cctype>
+#include <regex>
+#include <set>
+
+#include "ecad/netlist.h"
+#include "ecad/schema.h"
+#include "firmware/mcu_pinouts.h"
+
+namespace aicad::firmware {
+namespace {
+
+// Power / ground rails — never emitted as GPIO pins (mirrors _POWER_NAMES).
+const std::set<std::string> kPowerNames = {
+    "GND", "GNDA", "GNDD", "AGND", "DGND", "PGND", "EGND", "EARTH", "CHASSIS",
+    "VSS", "VSSA", "VDD", "VDDA", "VCC", "VCCA", "VEE", "VBAT", "VREF", "VREFP",
+    "VREFN", "VDDIO", "AVDD", "AVCC", "DVDD", "VBUS", "VPP",
+};
+
+// +3V3, 3V3, +5V, -12V, 3.3V, 1V8 (mirrors _VOLT_RE).
+const std::regex kVoltRe(R"(^[+-]?\d+(?:V\d*|\.\d+V?|V)$)", std::regex::icase);
+
+const std::regex kNonTokenRe(R"([^A-Za-z0-9_])");
+
+std::string upper(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+    return s;
+}
+
+std::string trim(const std::string& s) {
+    size_t b = s.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos) return "";
+    size_t e = s.find_last_not_of(" \t\r\n");
+    return s.substr(b, e - b + 1);
+}
+
+// Sanitise a net name into a valid C macro suffix (mirrors _macro_token).
+std::string macro_token(const std::string& name) {
+    std::string tok = std::regex_replace(upper(trim(name)), kNonTokenRe, "_");
+    if (tok.empty()) return "NET";
+    if (std::isdigit(static_cast<unsigned char>(tok[0]))) tok = "_" + tok;
+    return tok;
+}
+
+}  // namespace
+
+bool is_power_net(const std::string& name) {
+    std::string s = trim(name);
+    if (s.empty()) return true;
+    if (kPowerNames.count(upper(s))) return true;
+    return std::regex_match(s, kVoltRe);
+}
+
+std::vector<std::string> net_names(const nlohmann::json& doc) {
+    std::vector<std::string> out;
+    if (!doc.is_object()) return out;
+    if (aicad::ecad::schema::is_board(doc)) {
+        if (doc.contains("nets") && doc["nets"].is_array()) {
+            for (const auto& n : doc["nets"]) {
+                if (n.is_object() && n.value("name", std::string()).size())
+                    out.push_back(n["name"].get<std::string>());
+            }
+        }
+        return out;
+    }
+    if (aicad::ecad::schema::is_schematic(doc)) {
+        nlohmann::json nl = aicad::ecad::build_netlist(doc);
+        if (nl.contains("nets") && nl["nets"].is_object()) {
+            for (auto it = nl["nets"].begin(); it != nl["nets"].end(); ++it) out.push_back(it.key());
+        }
+        return out;
+    }
+    // Tolerant fallback: raw dict with a nets list or mapping.
+    if (doc.contains("nets")) {
+        const auto& nets = doc["nets"];
+        if (nets.is_object()) {
+            for (auto it = nets.begin(); it != nets.end(); ++it)
+                if (!it.key().empty()) out.push_back(it.key());
+        } else if (nets.is_array()) {
+            for (const auto& n : nets) {
+                if (n.is_object() && n.value("name", std::string()).size())
+                    out.push_back(n["name"].get<std::string>());
+            }
+        }
+    }
+    return out;
+}
+
+nlohmann::json pin_model(const nlohmann::json& board_doc, const std::string& mcu_family) {
+    std::set<std::string> seen;
+    std::vector<std::string> ordered;
+    for (const auto& n : net_names(board_doc)) {
+        if (!n.empty() && seen.insert(n).second) ordered.push_back(n);
+    }
+    std::sort(ordered.begin(), ordered.end());
+
+    nlohmann::json out = nlohmann::json::array();
+    int seq = 0;
+    std::set<std::string> used_tokens;
+    for (const auto& name : ordered) {
+        if (is_power_net(name)) continue;
+        std::string token = macro_token(name);
+        if (!used_tokens.insert(token).second) continue;
+        auto pin = resolve_pin(name, mcu_family);
+        bool positional = pin.has_value();
+        int pin_id = pin.value_or(kLogicalPinBase + seq);
+        if (!positional) ++seq;
+        out.push_back({
+            {"net", name},
+            {"token", token},
+            {"pin_id", pin_id},
+            {"positional", positional},
+            {"strap", is_strap_net(name, mcu_family)},
+            {"input_only", is_input_only_pin(name, mcu_family)},
+            {"direction", nullptr},
+            {"mux", nullptr},
+        });
+    }
+    return out;
+}
+
+std::string generate_pinmap(const nlohmann::json& board_doc, const std::string& mcu_family,
+                            const std::string& guard) {
+    std::set<std::string> seen;
+    std::vector<std::string> ordered;
+    for (const auto& n : net_names(board_doc)) {
+        if (!n.empty() && seen.insert(n).second) ordered.push_back(n);
+    }
+    std::sort(ordered.begin(), ordered.end());
+
+    std::string text;
+    auto line = [&text](const std::string& l) { text += l; text += '\n'; };
+    line("#ifndef " + guard);
+    line("#define " + guard);
+    line("/* Auto-generated by AI-CAD firmware pin-map (T-C2). DO NOT EDIT. */");
+    line("/* Source: ECAD netlist net names -> firmware pin ids. Power/ground rails skipped. */");
+    line("");
+
+    int seq = 0, emitted = 0;
+    std::set<std::string> used_tokens;
+    for (const auto& name : ordered) {
+        if (is_power_net(name)) continue;
+        std::string token = macro_token(name);
+        if (!used_tokens.insert(token).second) continue;
+        auto pin = resolve_pin(name, mcu_family);
+        std::string comment;
+        int pin_id;
+        if (pin) {
+            pin_id = *pin;
+        } else {
+            pin_id = kLogicalPinBase + seq;
+            ++seq;
+            comment = "  /* logical index; net name encodes no physical pin */";
+        }
+        line("#define PIN_" + token + " " + std::to_string(pin_id) + comment);
+        ++emitted;
+    }
+    if (emitted == 0) line("/* (no GPIO/signal nets found in this board) */");
+    line("");
+    // "\n".join([..., "#endif /* G */", ""]) ends with exactly one newline.
+    line("#endif /* " + guard + " */");
+    return text;
+}
+
+}  // namespace aicad::firmware

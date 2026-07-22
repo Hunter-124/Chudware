@@ -1,0 +1,25 @@
+{
+  "events": [
+    {
+      "level": 1,
+      "pin": "PA5",
+      "seq": 0,
+      "t_ms": 0.0,
+      "type": "gpio"
+    },
+    {
+      "level": 1,
+      "pin": "PA9",
+      "seq": 1,
+      "t_ms": 1.0,
+      "type": "gpio"
+    }
+  ],
+  "generated_at": 0.0,
+  "gpio_final": {
+    "PA5": 1,
+    "PA9": 1
+  },
+  "schema": "aicad.firmware.trace/1",
+  "source": "renode"
+}

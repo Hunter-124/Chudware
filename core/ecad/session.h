@@ -43,8 +43,11 @@ nlohmann::json ecad_save(const std::string& doc_id, const std::string& path);
 
 // ecad_open {path} -> ops-response + "doc_id" + "warnings". Opens a .ecad+ container
 // (engine/ecad/rpc.py::_ecad_open + formats.open), registers a session around the
-// parsed document, rebuilds (compile), and returns the full response. KiCad S-expr
-// imports are DEFERRED (the host routes .kicad_sch/.kicad_pcb to Python).
+// parsed document, rebuilds (compile), and returns the full response. Dispatches by
+// extension like the Python rpc: .kicad_sch / .kicad_pcb route to the KiCad S-expr
+// importers (ecad/kicad.cpp, port of engine/ecad/formats.py import_kicad_*); any
+// import failure raises the same OpError("io_error", "import_kicad_* failed for
+// '<path>': <exc>") envelope the oracle raises.
 nlohmann::json ecad_open(const std::string& path);
 
 // ecad_update_from_sch {board_doc_id, sch_doc_id, prune?, place_origin?,

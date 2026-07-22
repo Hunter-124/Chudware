@@ -24,7 +24,7 @@ import time
 
 import pytest
 
-import mcp_server.cad_tools as cad_tools
+import mcp_server.cad_common as cad_tools  # T-RF8: autosave internals moved
 import mcp_server.crash_bundle as crash_bundle
 
 

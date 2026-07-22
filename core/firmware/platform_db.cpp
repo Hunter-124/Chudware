@@ -1,0 +1,142 @@
+#include "firmware/platform_db.h"
+
+#include <algorithm>
+#include <cctype>
+#include <filesystem>
+#include <fstream>
+#include <regex>
+#include <vector>
+
+#include "firmware/templates.h"
+
+namespace aicad::firmware {
+namespace {
+
+// mcu_family substring patterns → canonical family key (first match wins).
+const std::vector<std::pair<std::string, std::string>> kFamilyPatterns = {
+    {R"(stm32f4)", "stm32f4"},
+    {R"(stm32f1)", "stm32f1"},
+    {R"(nrf52)", "nrf52"},
+    {R"(rp2040|pico)", "rp2040"},
+    {R"(esp32)", "esp32"},
+    {R"(cortex-m)", "cortex-m"},
+};
+
+// Per-family capability matrix (mirrors platform_db.PLATFORM_CAPS — including
+// the internal gpio_regmap the fw_status payload drops).
+nlohmann::json caps_table() {
+    nlohmann::json t;
+    t["stm32f4"] = {
+        {"file", "stm32f4_discovery.repl"}, {"emulation", "renode"},
+        {"uart", true}, {"gpio", true}, {"gpio_observe", true},
+        {"adc", false}, {"i2c", true}, {"spi", true}, {"timers", true},
+        {"gpio_regmap", {{"base", 0x40020000}, {"stride", 0x400}, {"odr_offset", 0x14}}},
+        {"notes", "USART1/2, GPIO A-E (observed), I2C1-3, SPI1-3, TIM1-5. No ADC model upstream."},
+    };
+    t["stm32f1"] = {
+        {"file", "stm32f103.repl"}, {"emulation", "renode"},
+        {"uart", true}, {"gpio", true}, {"gpio_observe", true},
+        {"adc", false}, {"i2c", true}, {"spi", false}, {"timers", true},
+        {"gpio_regmap", {{"base", 0x40010800}, {"stride", 0x400}, {"odr_offset", 0x0C}}},
+        {"notes", "Upstream stm32f103.repl: USART1-5, GPIO A-G (observed), I2C1-2, TIM1-14, DMA. No ADC/SPI model."},
+    };
+    t["nrf52"] = {
+        {"file", "nrf52840.repl"}, {"emulation", "renode"},
+        {"uart", true}, {"gpio", true}, {"gpio_observe", false},
+        {"adc", false}, {"i2c", true}, {"spi", true}, {"timers", true},
+        {"gpio_regmap", nullptr},
+        {"notes", "Upstream nrf52840.repl: UART0/1, GPIO0/1+GPIOTE, TWI0/1, SPI2, TIMER0-4/RTC. "
+                  "gpio assertions unsupported (observation wiring is STM32-only)."},
+    };
+    t["rp2040"] = {
+        {"file", "rp2040.repl"}, {"emulation", "renode-minimal"},
+        {"uart", true}, {"gpio", false}, {"gpio_observe", false},
+        {"adc", false}, {"i2c", false}, {"spi", false}, {"timers", false},
+        {"gpio_regmap", nullptr},
+        {"notes", "Minimal local platform (stock Renode has no RP2040 model): Cortex-M0+ + PL011 "
+                  "UART0/1 only. Bare-metal UART works; pico-sdk stdio / GPIO / other peripherals do not."},
+    };
+    t["esp32"] = {
+        {"file", "esp32_stub.repl"}, {"emulation", "none"},
+        {"uart", false}, {"gpio", false}, {"gpio_observe", false},
+        {"adc", false}, {"i2c", false}, {"spi", false}, {"timers", false},
+        {"gpio_regmap", nullptr},
+        {"notes", "NO EMULATION — Renode ESP32 support is experimental with no usable peripherals. "
+                  "Build (idf.py) + flash (esptool) only."},
+    };
+    t["cortex-m"] = {
+        {"file", "cortex_m_generic.repl"}, {"emulation", "renode"},
+        {"uart", false}, {"gpio", false}, {"gpio_observe", false},
+        {"adc", false}, {"i2c", false}, {"spi", false}, {"timers", false},
+        {"gpio_regmap", nullptr},
+        {"notes", "Generic fallback: CPU+NVIC+memory only; no peripherals. UART/gpio assertions "
+                  "need a specific family platform (or the QEMU semihosting path)."},
+    };
+    return t;
+}
+
+}  // namespace
+
+std::string canonical_family(const std::string& mcu_family) {
+    std::string key = mcu_family;
+    std::transform(key.begin(), key.end(), key.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    for (const auto& [pattern, family] : kFamilyPatterns) {
+        if (std::regex_search(key, std::regex(pattern))) return family;
+    }
+    return "cortex-m";
+}
+
+nlohmann::json get_capabilities(const std::string& mcu_family) {
+    std::string family = canonical_family(mcu_family);
+    nlohmann::json caps = caps_table()[family];
+    caps["family"] = family;
+    return caps;
+}
+
+nlohmann::json capability_matrix() {
+    // json-safe view (drops gpio_regmap internals).
+    nlohmann::json table = caps_table();
+    nlohmann::json out;
+    for (auto& [family, caps] : table.items()) {
+        nlohmann::json view;
+        for (const char* k : {"file", "emulation", "uart", "gpio", "gpio_observe",
+                              "adc", "i2c", "spi", "timers", "notes"}) {
+            view[k] = caps[k];
+        }
+        out[family] = view;
+    }
+    return out;
+}
+
+std::string get_platform_file(const std::string& mcu_family) {
+    // Materialize the embedded .repl files to a cache dir (rewritten when the
+    // contents differ) — Renode's LoadPlatformDescription needs a real path.
+    namespace fs = std::filesystem;
+    std::string family = canonical_family(mcu_family);
+    std::string want = caps_table()[family]["file"].get<std::string>();
+    fs::path dir = fs::temp_directory_path() / "aicad_renode_platforms";
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    for (const auto& tf : renode_platform_files()) {
+        fs::path out = dir / tf.relpath;
+        bool write = true;
+        if (fs::is_regular_file(out, ec)) {
+            std::ifstream in(out, std::ios::binary);
+            std::string existing((std::istreambuf_iterator<char>(in)),
+                                 std::istreambuf_iterator<char>());
+            write = existing != tf.contents;
+        }
+        if (write) {
+            std::ofstream f(out, std::ios::binary | std::ios::trunc);
+            f << tf.contents;
+        }
+    }
+    fs::path candidate = dir / want;
+    if (fs::is_regular_file(candidate, ec)) return candidate.string();
+    fs::path generic = dir / "cortex_m_generic.repl";
+    if (fs::is_regular_file(generic, ec)) return generic.string();
+    return "";
+}
+
+}  // namespace aicad::firmware

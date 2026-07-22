@@ -1,5 +1,0 @@
-Attempt-1 aborted for grading as invalid conservation run:
-auto_pick assigned ollama/llama3.2:latest to ALL 23 nodes because
-enabled_providers used model id "grok-4.5" (shipped rank=1) which fails
-min_rank thresholds 3–5; ranking key "grok-4-5" has rank=5.
-Harness-local fix: enable xai-sub model "grok-4-5".

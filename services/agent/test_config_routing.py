@@ -3,7 +3,7 @@
 Bug (confirmed): a source written into routing.yaml (e.g. by
 ``local_runtime.register_routing_source`` when the bundled llama.cpp server comes up)
 had ZERO effect on which provider ``services.agent.config.get_provider`` — the real
-seam every production caller (run_agent.py, node_runner.py, worker_rpc.py, ...) uses to
+seam every production caller (agent_turn.py, node_runner.py, worker_rpc.py, ...) uses to
 get a live model — actually returns. ``services.agent.routing.load_routing()`` could
 parse routing.yaml, but nothing in production ever called it; ``config.get_provider``
 only read config.json's flat ``provider``/``model`` fields.

@@ -26,10 +26,7 @@ def register_workspace_tools(mcp) -> None:
         This is the polling target until a push channel exists (T-W17).
         Risk: read (named in _READ_EXACT in tool_registry — no lease required).
         """
-        try:
-            from services.agent import workspace as ws
-        except ImportError:
-            from agent import workspace as ws  # type: ignore
+        from services.agent import workspace as ws
 
         # Look up the active session for this run_id
         session = ws._session_registry.get(run_id)
@@ -55,10 +52,7 @@ def register_workspace_tools(mcp) -> None:
 
         Risk: read.
         """
-        try:
-            from services.agent.workspace import read_doc_events
-        except ImportError:
-            from agent.workspace import read_doc_events  # type: ignore
+        from services.agent.workspace import read_doc_events
 
         events = read_doc_events(run_id, doc_id, since_seq=since_seq)
         return {

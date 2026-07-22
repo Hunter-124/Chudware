@@ -1,0 +1,278 @@
+// Copilot internals shared across the ui/copilot/* translation units (T-RF6 split of the old
+// legacy_chat.cpp monolith). NOT a public header: everything below was a file-static of the
+// monolith and is now defined in exactly one copilot TU and declared here for the sibling TUs.
+// Public API lives in copilot.h (and core/app_state.h for the shared small-UI helpers).
+//
+// Module map (one concern per TU):
+//   ui_common.cpp          shared small-UI helpers, Liquid-Glass bubble toolkit, code/diff/prose
+//                          boxes, fit readout, copy/paste affordances, model-name/token helpers
+//   chat_log.cpp           message list rendering: user block, provider log, assistant turn,
+//                          windowed log + stick-to-bottom
+//   activity_timeline.cpp  per-turn typed-block timeline: agent steps, thinking/action cards,
+//                          transparency rows, tool-call rows, artifact actions
+//   cards.cpp              plan/objectives section, clarify + plan-approve cards, corporate-org
+//                          cards, exec-mode (swarm/eng-firm/advisor) cards, AI-VC checkpoint UI
+//   feed.cpp               feedTurnActivity: stream-event -> ActivityItem folding (orchestrator
+//                          events, corporate events, ops-JSON detection), chat-history dirty flag
+//   conversations.cpp      conversation tabs + chat-history/prompt-draft persistence (incl.
+//                          WASM shared-chat sync), chat-triggered OpenFOAM poll
+//   settings.cpp           AI settings sections (provider/model/auth, generation, privacy,
+//                          manage-models), searchable model dropdown, provider usability
+//   composer.cpp           wrapping chat input, attachments/context refs, run launch, slash
+//                          commands, submitTurn send path, composer prelude/toolbar/send-stop
+//   panel.cpp              the docked Copilot pane host (header, sessions/tasks/artifacts
+//                          panels, drawAIPanel) + the ai_workspace reuse hooks
+#pragma once
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cfloat>
+#include <cmath>
+#include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cctype>
+#include <deque>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <mutex>
+#include <set>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <map>
+#include <vector>
+#include <unordered_map>
+
+#include <nlohmann/json.hpp>
+
+#include "imgui.h"
+#include "imgui_internal.h"   // ImRect — Liquid Glass v2 host port (contract H5: glass bubbles)
+
+#include "copilot.h"
+#include "ui/layout.h"          // ui::overlayBand / takeOverlayColumnReset — pinned-column geometry
+#include "ui/panel_collapse.h"  // ui::PanelCollapseAnim — shared vertical-collapse animation (T-G21)
+#include "ui/doc_tabs.h"        // ui::docTabStripHeight — top inset so the column clears the tab band
+#include "ui/model_registry.h"  // ui::ModelInfo / capability flags / provider mapping
+#include "ui/metrics.h"         // ui::metrics::px/U/asmHeaderIconGap
+#include "ui/activity_panel.h"  // C22b: ActivityPanel still fed for the AI_CAD_SHOT=activity scenario
+#include "ui/console_panel.h"   // drawConsoleBody (shared console helper)
+#include "ui/file_dialog.h"     // openFileDialog — composer paperclip attachments (M23)
+#include "ui/icons.h"           // getIcon / IconUV — composer settings glyph
+
+#include "core/app_state.h"
+#include "ui/property_manager.h"  // Edit-mode scope: PM targetId
+#include "core/cpp_core.h"        // detect the in-process C++ core (libaicad) backend
+#include "core/sim_client.h"      // chat-triggered OpenFOAM CFD on the SimClient channel
+#include "core/jobs.h"
+#include "ui_theme.h"
+
+#include "worker_client.h"
+
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#include <emscripten/fetch.h>
+#endif
+
+// ============================ cross-module declarations ============================
+// Everything below was file-static in the monolith; linkage is now external but each symbol is
+// still defined exactly once (see the module map above). Keep this header in sync when moving
+// code between copilot TUs.
+
+// ---- Liquid Glass v2 host port (contract H5): glass surface + bubble helpers (ui_common) ----
+struct GlassBubble {
+    ImVec2         origin;
+    float          width;
+    ui::GlassLevel level;
+    float          rounding;   // LOGICAL dp — ui::glassPanel scales by uiScale internally
+};
+const ui::AdaptiveSurface& chatSurf();
+ImVec4 semanticOnGlass(const float role[4], const ui::AdaptiveSurface& surf);
+ImU32  modeBorderColor(int mode);
+void   modeAccentRgb(int mode, float out[3]);
+void   drawStatusGlyph(const std::string& status, float box);
+void   drawForgingAnimation(float box);
+GlassBubble beginGlassBubble(float width, ui::GlassLevel level, float rounding);
+ImRect  endGlassBubble(const GlassBubble& b);
+
+// ---- auto-growing, wrapping chat input (composer) ----
+bool rewrapInPlace(char* buf, int len, float wrapW);
+// rightReserve narrows the widget (and its wrap width) so composer overlays anchored at the
+// input's right edge — the in-box send button — never sit over the text.
+bool drawChatInput(const char* id, std::vector<char>& buf, const char* placeholder,
+                   int maxLines, float rightReserve = 0.0f);
+
+// ---- chat copy/paste affordances (ui_common) ----
+extern bool gShowThinking;   // session-only "Show assistant thoughts" toggle (not persisted)
+void        chatDrawCopyFlash();
+std::string chatInputSelection(ImGuiID id);
+void        chatCopyContext(const ImRect& rect, const char* popupId,
+                            const std::string& copyText,
+                            const std::string& copyAll = {},
+                            const std::string& selText = {});
+ImGuiID     chatDrawSelectableText(const char* id, const std::string& plain,
+                                   const ImVec4& col);
+void        chatHoverCopyGlyph(const ImRect& rect, const std::string& text);
+std::string chatActivityCopyText(const ActivityItem& a);
+
+// ---- plan progress one-liner (cards) ----
+std::string planProgressLine(const PlanState& plan,
+                             const std::vector<ActivityItem>& activity);
+
+// ---- corporate chart field helpers (feed; shared with the corporate cards in cards.cpp) ----
+std::string    corpShortId(const std::string& id);
+int            corpWorkerCount(const nlohmann::json& dept);
+std::string    corpDeptHead(const nlohmann::json& dept);
+std::string    corpDeptLead(const nlohmann::json& dept);
+std::string    corpDeptNameOf(const nlohmann::json& dept);
+nlohmann::json corpParseChart(const ActivityItem& a);
+
+// ---- activity feed finalize + chat-history dirty tracking (feed) ----
+void finalizeThoughtBox(ActivityItem& a);
+void markChatHistoryDirty();
+extern std::atomic<bool> s_chatHistoryDirty;
+extern double            s_chatHistoryLastPersist;
+
+namespace ui {
+
+// ---- model label / token formatting (ui_common) ----
+std::string shortModelName(const std::string& id);
+std::string fmtTokens(int n);
+int         effectiveContextWindow(const Settings& s);
+
+// ---- activity timeline (activity_timeline) ----
+void        drawAgentStep(AgentStep& s, const ui::Fonts& fonts, float logW);
+std::string stripMdMarks(const std::string& in);
+void        drawActionCard(ActivityItem& a, AgentStep* step, const ui::Fonts& fonts, float logW,
+                           bool turnRunning = false);
+void        chatArtifactReveal(AppState& st, const std::string& path);
+void        chatArtifactOpenSmart(AppState& st, const std::string& path);
+void        chatArtifactActions(AppState& st, const std::string& path);
+void        drawToolCallRow(AppState& st, ActivityItem& a, const ui::Fonts& fonts);
+void        drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float logW,
+                              bool showThinking);
+
+// ---- run launch helpers (composer; shared with the clarify/plan-approve cards) ----
+nlohmann::json agentProviderOverride(const Settings& s);
+void launchDesignRun(AppState& st, const std::string& request,
+                     nlohmann::json extra = nlohmann::json::object());
+void launchMissionRunChat(AppState& st, const std::string& request, bool needFreshDoc,
+                          nlohmann::json extra = nlohmann::json::object());
+
+// ---- cards (cards) ----
+void drawClarifyCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts);
+void drawPlanApproveCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts);
+void drawCorpOrgCard(ActivityItem& a, const ui::Fonts& fonts);
+void drawCorpMeetingCard(ActivityItem& a, const ui::Fonts& fonts);
+void drawCorpSteeringCard(const ActivityItem& a, const ui::Fonts& fonts);
+void drawCorpMutedLine(const ActivityItem& a, const ui::Fonts& fonts);
+void drawClassificationCard(ActivityItem& a, const ui::Fonts& fonts,
+                            bool turnRunning = false);
+void drawSwarmWaveCard(const ActivityItem& a, const ui::Fonts& fonts);
+void drawFirmBidsCard(const ActivityItem& a, const ui::Fonts& fonts);
+void drawFirmAwardCard(const ActivityItem& a, const ui::Fonts& fonts);
+void drawFirmTeamCard(const ActivityItem& a, const ui::Fonts& fonts);
+void drawFirmCommCard(ActivityItem& a, const ui::Fonts& fonts);
+void drawAdvisorCard(ActivityItem& a, const ui::Fonts& fonts);
+void drawSubRunCard(const ActivityItem& a, const ui::Fonts& fonts);
+
+// ---- AI-VC (agent version control) state + cards (cards) ----
+struct AiVcCheckpoint {
+    std::string id;
+    int         turn = -1;     // agent turn index, or -1 if unset
+    std::string when;          // ISO timestamp
+    std::string label;         // tool/op-batch summary
+    int         features = 0;  // feature count at checkpoint
+    // v2 prompt/tool granularity (absent => -1 / empty → turn-level UI only)
+    std::string kind;          // "prompt" | "tool" | ""
+    int         msgIdx = -1;   // chat message ordinal for kind=prompt
+    int         callTurn = -1; // call.turn for kind=tool
+    int         callI = -1;    // call.i for kind=tool
+};
+
+struct AiVcUi {
+    bool available = true;     // false after unknown-method (hide all AI-VC chrome)
+    bool loading   = false;
+    bool busy      = false;
+    std::string err;
+    std::vector<AiVcCheckpoint> checkpoints;
+    double      lastFetch = 0.0;
+    std::string lastDocId;
+    // v2 capability flags — latched from the last successful timeline payload.
+    bool hasMsgGranularity  = false;  // any row carried msg_idx
+    bool hasCallGranularity = false;  // any row carried call:{turn,i}
+    // Inline confirm (click again) for per-turn / per-msg / per-call restore — never a modal.
+    int    confirmMsgIdx = -1;  // chat index pending confirm, -1 = none
+    int    confirmKind   = 0;   // 1 = before, 2 = after, 3 = user-msg rewind
+    int    confirmCallI  = -1;  // tool-call index within turn when confirmKind is call-scoped
+    double confirmUntil  = 0.0; // auto-clear after a few seconds
+};
+extern AiVcUi s_aiVc;
+
+// Staged "Edit message" — rollback is deferred until the user actually sends. Esc restores
+// the pre-edit chat tail + composer without any plm_rollback.
+struct EditStage {
+    bool active = false;
+    int  msgIdx = -1;
+    std::string savedPrompt;                 // composer contents before edit
+    std::vector<ChatMsg> chatTail;           // messages [msgIdx..) parked for Esc restore
+};
+extern EditStage s_edit;
+
+bool chatMsgMutatedDoc(const ChatMsg& m);
+void aiVcRollback(AppState& st, const std::string& to, const std::string& okToast);
+void drawDoubleRewindGlyph(ImDrawList* dl, const ImVec2& mn, const ImVec2& mx,
+                           ImU32 col);
+void drawPencilGlyph(ImDrawList* dl, const ImVec2& mn, const ImVec2& mx, ImU32 col);
+bool drawHeaderTextButton(const char* id, const char* label, bool active,
+                          float minW = 0.0f, const char* iconName = nullptr);
+void cancelEditStage(AppState& st);
+void beginEditStage(AppState& st, int msgIdx);
+void commitEditStageOnSend(AppState& st);
+void drawAiVcTurnRestore(AppState& st, int msgIdx, int turnNum);
+
+// ---- chat log (chat_log) ----
+void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
+                   float panelW, int msgIdx);
+void drawChatLogWindowed(AppState& st);
+
+// ---- conversations + persistence (conversations) ----
+// Defined early in the monolith (before drawSessionsPanel) — rekey erase + Sessions "Other" pin.
+extern std::string s_chatKeyHold;
+std::string chatHistoryPath();
+void        savePromptDraft(AppState& st, bool force = false);
+void        clearPromptDraft(AppState& st);
+std::string convDocKey(AppState& st);
+std::string newConvId(AppState& st);
+void        ensureConversations(AppState& st);
+void        maybePersistChatHistoryDebounced(AppState& st, bool force);
+void        eraseChatHistoryKeys(const std::vector<std::string>& keys);
+void        loadChatHistoryForKey(AppState& st, const std::string& key,
+                                  const std::string& migrateFrom = {});
+void        syncChatToDoc(AppState& st);
+void        parkActiveConversation(AppState& st);
+bool        activeConversationRunning(AppState& st);
+void        newConversation(AppState& st);
+void        switchConversation(AppState& st, int idx);
+void        closeConversation(AppState& st, int idx);
+
+// ---- AI settings (settings) ----
+// Compact AI-settings popover body (provider + model + effort + run toggles + "All settings...");
+// hosted by the header Settings button.
+void drawAISettingsBody(AppState& st, bool busy);
+void drawModelDropdown(AppState& st, bool busy);
+
+// ---- composer + send path (composer) ----
+void drawBtwPanel(AppState& st);
+void submitTurn(AppState& st, const std::string& text);
+void drawRuntimeBanner(AppState& st);
+bool aiTurnActive(AppState& st);
+void drawComposer(AppState& st, bool busy, bool canRun);
+
+// ---- sessions/tasks/artifacts panels (panel) ----
+void drawSessionsPanel(AppState& st, bool busy);
+
+}  // namespace ui

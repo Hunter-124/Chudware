@@ -47,17 +47,16 @@ Rules:
     {"method": "ecad_simulate",      "note": "ECAD, C++ (verified 2026-07-22)"},
     {"method": "parts_catalog_list", "note": "parts catalog, C++-only"},
     {"method": "get_prompts_v2",     "note": "agent prompt catalog, C++"},
-    {"method": "config_list",        "note": "config, C++"}
+    {"method": "config_list",        "note": "config, C++"},
+    {"method": "sim_cancel",         "note": "sim cancel registry, C++ (T-RF16 landed 2026-07-22)"},
+    {"method": "fw_new_project",     "note": "firmware scaffold, C++ (T-RF15 landed 2026-07-22)"},
+    {"method": "fw_sim_run",         "note": "firmware emulator, C++ (T-RF15 resume landed 2026-07-22)"},
+    {"method": "bom_rollup",         "note": "sourcing/BOM, C++ (T-RF18 landed 2026-07-22)"},
+    {"method": "bom_price",          "note": "sourcing/BOM, C++ (T-RF18 landed 2026-07-22)"},
+    {"method": "spec_sheet_match",   "note": "sourcing/spec-match, C++ (T-RF18 landed 2026-07-22)"}
   ],
   "web_unsupported": [
-    {"method": "agent_design",       "family": "legacy python agent",  "remove_at": "T-RF5"},
-    {"method": "fw_new_project",     "family": "firmware",             "remove_at": "T-RF15"},
-    {"method": "sim_cancel",         "family": "sim cancel",           "remove_at": "T-RF16"},
-    {"method": "ecad_design",        "family": "ECAD gaps",            "remove_at": "T-RF17"},
-    {"method": "ecad_import_kicad",  "family": "ECAD gaps",            "remove_at": "T-RF17"},
-    {"method": "bom_rollup",         "family": "sourcing/BOM",         "remove_at": "T-RF18"},
-    {"method": "bom_price",          "family": "sourcing/BOM",         "remove_at": "T-RF18"},
-    {"method": "spec_sheet_match",   "family": "sourcing/BOM",         "remove_at": "T-RF18"},
+    {"method": "ecad_design",        "family": "ECAD LLM orchestrator","remove_at": "T-RF20"},
     {"method": "hydraulic_new",      "family": "hydraulic",            "remove_at": "T-RF19"},
     {"method": "pipe_network",       "family": "piping",               "remove_at": "T-RF19"},
     {"method": "struct_analyze",     "family": "structural",           "remove_at": "T-RF19"},
@@ -67,3 +66,9 @@ Rules:
   ]
 }
 ```
+
+`ecad_import_kicad` was removed from the inventory 2026-07-22: it is not a real RPC
+method on either side (KiCad import is `ecad_open` dispatching on the `.kicad_sch`/
+`.kicad_pcb` extension), and that path is C++ since T-RF17 — nothing to track.
+`sim_cancel` and `fw_new_project` moved to `web_required` the same day as their
+cutovers landed; `fw_sim_run` (Renode emulator leg) is the only firmware remainder.

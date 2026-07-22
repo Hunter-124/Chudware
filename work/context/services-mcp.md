@@ -13,11 +13,18 @@ Contracts: contracts/doc_ops.md, contracts/doc_schema.md, contracts/worker_rpc.m
   agent's first-contact map of the full capability surface.
 - services/mcp/server.py:298 `main()` — entrypoint; spawns libaicad.so warmup thread,
   redirects native stdout (OCCT prints) to a log file to protect the JSON-RPC channel.
-- services/mcp/cad_tools.py:1433 `register_cad_tools(mcp)` — mechanical CAD + simulation
-  (new_part, add_features, render_part, run_fea_static/modal, run_cfd_flow/accurate,
-  export_part, make_drawing, measure_part, check_feature_overlap, check_interference,
-  wall_thickness, draft_analysis, list_parts, undo/redo, close_part, recover_parts,
-  import_part, make_standard_part, set_material/view/process, configurations, drawings).
+- services/mcp/cad_tools.py — COMPAT FACADE (T-RF8 split): re-exports the historical
+  cad_tools namespace + register_cad_tools(mcp) composite. The mechanical-CAD tools now
+  live in per-family modules over `cad_common.py` (doc registry/handoff/autosave/jobs/
+  materials/inspect-render helpers) + `cad_guide.py` (topic texts + cad_guide_text):
+  cad_doc_tools (new_part, add_features, get_part, undo/redo, save/close/recover, configs,
+  set_material, engine_profile, cad_guide), cad_eval_tools (query_geometry, check_sketch,
+  measure*, check_interference/overlap/symmetry, wall_thickness, draft_analysis),
+  cad_render_tools (render_part, contact_sheet, render_views, inspect_part, look_around,
+  inspect_feature), cad_exchange_tools (export_part, import_part, standard parts),
+  cad_sim_tools (run_fea_*, run_cfd_*), cad_asm_tools (new_assembly, asm_add_component,
+  asm_mate, solve_mates, simulate_motion, motion_fea_handoff, list_world_bodies),
+  cad_drawing_tools (make_drawing + view/dimension/gdt/datum/titleblock tools).
   ASSEMBLY AUTHORING (2026-07-06): new_assembly (doc_new kind=assembly),
   asm_add_component (asm_insert_component op + initial pose), asm_mate (plain-word
   queries resolved per component source doc via doc_open+doc_query → asm_add_mate +
@@ -27,7 +34,7 @@ Contracts: contracts/doc_ops.md, contracts/doc_schema.md, contracts/worker_rpc.m
   contracts/feature_params.md `hole`); {"side","pick":"largest"} = largest face FACING
   that way (core/doc/picks.cpp W3). Regression tests: test_cad_tools.py W2/W3/G4-G5
   sections; acceptance = NEMA17 bracket+motor+screws mate assembly (2026-07-06 session).
-- services/mcp/cad_tools.py:1009 `cad_guide_text(topic)` — the knowledge-dispatch
+- services/mcp/cad_guide.py `cad_guide_text(topic)` — the knowledge-dispatch
   function behind the `cad_guide` tool; topics: overview, simulation, review, intake, gsl,
   cam, narration, parts, reverse, deliverables, requirements, dag, verify, interaction,
   sourcing, cost, spec, piping, hydraulic, firmware, structural, regen, code_compliance,
@@ -43,11 +50,21 @@ Contracts: contracts/doc_ops.md, contracts/doc_schema.md, contracts/worker_rpc.m
 - services/mcp/interaction_tools.py:66 `register_interaction_tools(mcp)` — elicitation
   seam (Pillar 9, contracts/interaction.md): ask_user (typed questions with defaults,
   persist + replay within scope).
-- services/mcp/ecad_tools.py `register_ecad_tools(mcp)` — schematic/PCB: ecad_new_*,
-  ecad_place_symbol, ecad_wire, ecad_label, ecad_add_power/zone, ecad_autoroute,
-  ecad_fill_zones, ecad_run_erc/drc/dfm, ecad_simulate, ecad_to_3d, ecad_export,
-  ecad_status, ecad_find_part, ecad_design, ecad_sweep, ecad_tf, ecad_update_from_sch,
-  ecad_check_impedance/diff_impedance, ecad_run_hostcheck/sicheck/pdn, ecad_fpga_check.
+- services/mcp/ecad_tools.py — COMPAT FACADE (T-RF8 split): re-exports _ECAD,
+  register_ecad_tools, autosave entry points. Tools now live in per-family modules over
+  `ecad_common.py` (session state, autosave/recovery, provider budgets, pin/net helpers,
+  sim summarizers): ecad_sch_tools (ecad_new_schematic, find_part, place_symbol, wire,
+  add_power, label, status, run_erc, update_from_sch), ecad_pcb_tools (ecad_new_pcb,
+  run_drc/hostcheck/dfm, autoroute, zones, export, to_3d, net-class, stackup_solve,
+  make_board, board_from_schematic, autoplace, optimize_traces), ecad_sim_tools
+  (ecad_simulate, run_pdn, sweep, fpga_check, impedance/diff-impedance, run_sicheck,
+  tf, design).
+- services/mcp/reveng_tools.py — COMPAT FACADE (T-RF8 split): re-exports _ingest_pdf,
+  register_reveng_tools. Tools now live in reveng_session_tools (session CRUD/status/
+  coverage/deviation, images/video/datasheet ingest, scale) + reveng_build_tools
+  (reconstruct, single_photo, fit_primitives, build_parametric, attach_result,
+  import_scan_mesh, export_reveng_bundle, make_part_from_library, research_source) over
+  `reveng_common.py` (session store, ingest, pipeline-agent factory, mission launcher).
 - services/mcp/ecad_thermal.py — ecad_thermal_handoff/verify (+ thermal_handoff_impl shared
   with worker), airflow/CHT, vibe screen registration
 - services/mcp/heatsink.py — heatsink_select / heatsink_select_impl (T-FIN17; worker probe)
@@ -139,7 +156,8 @@ MCP tools, NOT through the worker socket. ECAD is pure Python until 3D (board_to
 ## MCP freshness rule (WORKFLOW.md §6 — enforced mechanically)
 
 `test_mcp_freshness.py` catches drift: every registered tool family must have a signal string
-in server.py instructions OR a cad_guide topic in cad_tools.py:cad_guide_text(). When adding
+in server.py instructions OR a cad_guide topic in cad_guide.py:cad_guide_text() (re-exported
+through the cad_tools facade). When adding
 a new tool family: (1) add it to `_TOOL_FAMILIES` in the test, (2) add its signal to
 `_FAMILY_SIGNALS`, (3) update either server.py instructions or cad_guide_text() with a topic.
 The test runs in the pytest gate stage (no libaicad.so needed).

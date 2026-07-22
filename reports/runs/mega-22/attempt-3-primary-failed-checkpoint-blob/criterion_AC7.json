@@ -1,7 +1,0 @@
-{
-  "id": "AC7",
-  "result": "SKIP",
-  "detail": "post-hoc: no criterion_result in ledger for AC7 at terminal failed/dag_error:checkpoint_blob",
-  "source": "grade_run_posthoc_z1",
-  "honest": true
-}

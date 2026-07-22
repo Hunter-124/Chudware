@@ -482,68 +482,6 @@ def test_retry_cheap_forces_low_effort(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_live_phase_cursor_advances_on_dag_node_started(tmp_path):
-    """mega-5: stage_log must leave INTAKE when SPECIFY/DELIVER nodes start."""
-    from services.agent import loop as loop_mod
-    from services.agent.ledger import Ledger
-
-    ledger = Ledger("mega5_phase_cursor", path=tmp_path / "ledger.json")
-    # Seed intake like a real mission.
-    ledger.log_stage("pipeline", "intake", exit_gate="manifest_valid")
-    state = {"cursor": "intake"}
-    phases = []
-
-    def on_event(*args, **kwargs):
-        if args and isinstance(args[0], dict):
-            if args[0].get("kind") == "mission_phase":
-                phases.append(args[0].get("phase"))
-        elif len(args) >= 1 and args[0] == "mission_phase":
-            pl = args[1] if len(args) > 1 and isinstance(args[1], dict) else kwargs
-            phases.append(pl.get("phase"))
-
-    # SPECIFY worker starts → cursor must enter specify.
-    loop_mod._live_phase_cursor_on_dag_event(
-        "dag.node.started",
-        {"node_id": "n_spec_DL1"},
-        ledger=ledger,
-        on_event=on_event,
-        run_id="mega5_phase_cursor",
-        state=state,
-    )
-    assert state["cursor"] == "specify"
-    stages = [s.get("stage") for s in (ledger.state.get("stage_log") or [])]
-    assert "specify" in stages, stages
-
-    # DELIVER leaf starts while SPECIFY still incomplete → cursor advances.
-    loop_mod._live_phase_cursor_on_dag_event(
-        "dag.node.started",
-        {"node_id": "n_deliver_DL3"},
-        ledger=ledger,
-        on_event=on_event,
-        run_id="mega5_phase_cursor",
-        state=state,
-    )
-    assert state["cursor"] == "deliver"
-    stages = [s.get("stage") for s in (ledger.state.get("stage_log") or [])]
-    # Contiguous: specify already present; plan/build/verify/deliver entered.
-    for need in ("plan", "build", "verify", "deliver"):
-        assert need in stages, stages
-
-    # Idempotent: same/earlier phase does not re-enter.
-    n_before = len(ledger.state.get("stage_log") or [])
-    loop_mod._live_phase_cursor_on_dag_event(
-        "dag.node.done",
-        {"node_id": "n_spec_DL2"},
-        ledger=ledger,
-        on_event=on_event,
-        run_id="mega5_phase_cursor",
-        state=state,
-    )
-    assert state["cursor"] == "deliver"
-    assert len(ledger.state.get("stage_log") or []) == n_before
-
-
-
 # ---------------------------------------------------------------------------
 # 7. SPECIFY tools_slot must respect MAX_TOOLS_PER_ROLE after family expand
 # ---------------------------------------------------------------------------

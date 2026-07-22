@@ -30,10 +30,7 @@ def register_ledger_tools(mcp) -> None:
         pass ``all``/``*`` for the full ledger render. ``budget_tokens`` controls
         the rendering budget (default 800).
         """
-        try:
-            from services.agent.ledger import Ledger, ledger_render
-        except ImportError:
-            from agent.ledger import Ledger, ledger_render  # type: ignore
+        from services.agent.ledger import Ledger, ledger_render
 
         ledger = Ledger.load(run_id)
         # mega-2: models pass section="all" meaning full render, not a named key.
@@ -110,10 +107,7 @@ def register_ledger_tools(mcp) -> None:
         action stream: advisory/audit/tool events, council votes, delegation
         transitions, and auto-applied fixes.
         """
-        try:
-            from services.agent.ledger import Ledger
-        except ImportError:
-            from agent.ledger import Ledger  # type: ignore
+        from services.agent.ledger import Ledger
 
         try:
             ledger = Ledger.load(run_id)
@@ -167,10 +161,7 @@ def register_ledger_tools(mcp) -> None:
         Dimension events MUST include a ``provenance`` field (tool result / calc /
         table / user answer) — contract rule.
         """
-        try:
-            from services.agent.ledger import Ledger
-        except ImportError:
-            from agent.ledger import Ledger  # type: ignore
+        from services.agent.ledger import Ledger
 
         VALID_KINDS = {"brief", "decision", "dimension", "question",
                        "requirement", "stage", "artifact", "note",

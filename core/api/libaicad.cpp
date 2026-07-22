@@ -99,6 +99,10 @@
 #include "sim/netlist.h"
 #include "sim/numpy_rng.h"
 #include "sim/overlay.h"
+#include "sim/sim_cancel.h"
+#include "firmware/firmware_rpc.h"
+#include "sourcing/sourcing.h"
+#include "ecad/container.h"
 #include "sim/spice.h"
 
 using nlohmann::json;
@@ -875,6 +879,93 @@ static json cam_extract_from_doc(const std::string& part_doc_id, const json& par
 // becomes a clean JSON error with every lock_guard/DocLock already released by unwind.
 // Only a hardware fault (access violation) escapes as an SEH; that's caught one frame
 // up in aicad_call.
+// --- T-RF18: sourcing seams (production defaults for core/sourcing) ------------
+// The sourcing lib is pure; every side effect is injected here: assembly/board
+// loading via the doc/ecad sessions, vendor index reads, model building via
+// parts+doc, and HTTP via the agent transport (8s cap; providers fail closed
+// without credentials). The LLM dims lane stays empty (spec_sheet_match degrades
+// per contract).
+static aicad::sourcing::Seams build_sourcing_seams() {
+    using aicad::sourcing::HttpResult;
+    using aicad::sourcing::Seams;
+    Seams s;
+    s.load_assembly = [](const std::string& doc_path) -> json {
+        json opened = aicad::doc::doc_open(doc_path);
+        if (!opened.is_object() || !opened.contains("doc_id")) return json();
+        return aicad::doc::doc_tree(opened["doc_id"].get<std::string>());
+    };
+    s.load_board = [](const std::string& path) -> json {
+        try {
+            return aicad::ecad::ecad_container_open(path).doc;
+        } catch (...) {
+            return json();
+        }
+    };
+    s.vendor_lookup = [](const json& component) -> json {
+        try {
+            namespace fs = std::filesystem;
+            const fs::path idx = fs::path(aicad::sourcing::vendor_parts_dir()) / "index.json";
+            if (!fs::exists(idx)) return json();
+            std::ifstream in(idx);
+            json index = json::parse(in);
+            std::string mpn = component.value("mpn", std::string());
+            if (mpn.empty()) mpn = component.value("part_number", std::string());
+            if (mpn.empty()) return json();
+            auto it = index.find(aicad::sourcing::vendor_slug(mpn));
+            return it != index.end() ? *it : json();
+        } catch (...) {
+            return json();
+        }
+    };
+    s.build_model = [](const json& match) -> std::string {
+        try {
+            if (!match.is_object() || !match.contains("family") ||
+                match.value("source", std::string()) != "bolts")
+                return std::string();
+            const std::string family = match["family"].get<std::string>();
+            const std::string size = match["size"].get<std::string>();
+            const double length_mm = match.value("length_mm", 0.0);
+            auto pb = aicad::parts::build(family, size, length_mm, json::object());
+            json created = aicad::doc::doc_new("part", pb.name);
+            const std::string doc_id = created["doc_id"].get<std::string>();
+            aicad::doc::doc_apply_ops(doc_id, created.value("revision", 0L), pb.ops, false);
+            namespace fs = std::filesystem;
+            const fs::path dir = fs::temp_directory_path() / "aicad_spec_models";
+            fs::create_directories(dir);
+            json saved = aicad::doc::doc_export_step(doc_id, (dir / (family + "_" + size + ".step")).string());
+            return saved.value("path", std::string());
+        } catch (...) {
+            return std::string();
+        }
+    };
+    s.build_spec_model = [](const std::string& tmpl, const json& dims) -> std::string {
+        try {
+            json ops = aicad::sourcing::template_build_ops(tmpl, dims);
+            json created = aicad::doc::doc_new("part", tmpl);
+            const std::string doc_id = created["doc_id"].get<std::string>();
+            aicad::doc::doc_apply_ops(doc_id, created.value("revision", 0L), ops, false);
+            namespace fs = std::filesystem;
+            const fs::path dir = fs::temp_directory_path() / "aicad_spec_models";
+            fs::create_directories(dir);
+            json saved = aicad::doc::doc_export_step(doc_id, (dir / (tmpl + ".step")).string());
+            return saved.value("path", std::string());
+        } catch (...) {
+            return std::string();
+        }
+    };
+    // extract_dims: intentionally empty (LLM lane unported).
+    s.http_post = [](const std::string& url, const aicad::sourcing::HttpHeaders& headers,
+                     const std::string& body) -> HttpResult {
+        auto r = aicad::agent::http_post(url, headers, body, 8000);
+        return HttpResult{r.status, std::move(r.body), std::move(r.error)};
+    };
+    s.http_get = [](const std::string& url, const aicad::sourcing::HttpHeaders& headers) -> HttpResult {
+        auto r = aicad::agent::http_get(url, headers, 8000);
+        return HttpResult{r.status, std::move(r.body), std::move(r.error)};
+    };
+    return s;
+}
+
 static int aicad_call_inner(const char* method, const char* params_json, char** out_json) {
     if (out_json) *out_json = nullptr;
     if (!method) return emit_error("null method", out_json);
@@ -2980,6 +3071,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                 fp.cells = params.value("cells", 96);
                 fp.n_steps = params.value("n_steps", 2000);
                 fp.progress_path = params.value("progress_path", std::string());
+                fp.job_id = params.value("job_id", std::string());  // T-RF16: sim_cancel registry key
                 double re = 0.0;
                 aicad::sim::LbmResult r = aicad::sim::run_wind_tunnel(bp, bi, fp, &re);
                 if (!r.ok)
@@ -3004,6 +3096,12 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                           {"grid", {r.nx, r.ny, r.nz}}};
                 if (!r.warning.empty()) flow["warning"] = r.warning;
                 return emit(std::move(flow), out_json, 0);
+            }
+            if (m == "sim_cancel") {
+                // T-RF16: cancel a registered sim job (core/sim/sim_cancel.cpp — same
+                // registry semantics as agent cancel: idempotent, miss = cancelled:false).
+                return emit(aicad::sim::sim_cancel(params.value("job_id", std::string())),
+                            out_json, 0);
             }
             if (m == "agent_simulate_v1") {
                 // "AI runs CFD": {doc_id, request} (+ optional explicit velocity/aoa/fluid) ->
@@ -3735,6 +3833,24 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                 return emit(cam_program_from_part(jstr(params, "doc_id"), params), out_json, 0);
         } catch (const aicad::cam::OpError& oe) {
             return emit(oe.envelope(), out_json, 3);
+        }
+        // --- T-RF18: sourcing/BOM/cost/spec-match (core/sourcing) ---
+        // sourcing::call returns false for methods it does not own (fall through).
+        {
+            json src_result;
+            if (aicad::sourcing::call(m, params, build_sourcing_seams(), src_result)) {
+                return emit(std::move(src_result), out_json, 0);
+            }
+        }
+        // --- T-RF15: firmware engine surface (core/firmware) ---
+        // firmware::call returns false for methods still owned by the Python
+        // oracle (fw_sim_run / fw_power_profile / fw_sensor_scenario).
+        {
+            json fw_result;
+            std::string fw_err;
+            if (aicad::firmware::call(m, params, fw_result, fw_err)) {
+                return emit(std::move(fw_result), out_json, 0);
+            }
         }
         // Unknown to the C++ core -> nonzero so the host falls back to Python.
         return emit(json{{"error", "unknown method: " + m}}, out_json, 2);

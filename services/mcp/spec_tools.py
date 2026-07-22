@@ -1,19 +1,21 @@
 """Spec-sheet matching MCP tools (deterministic BOLTS/KiCad lookup, workstream B / T-B4).
 
-Thin MCP adapter over :mod:`engine.spec_sheet_matcher`. ``match_part_number`` takes a purchased
-manufacturer/vendor part number, strips vendor packaging suffixes, and resolves it against the
-clean-room ISO/DIN standard-part tables (fasteners, bearings) — falling back to the user's own
-installed KiCad symbol libraries — then builds real editable geometry via the ``parts_make``
-core generator. Deterministic and offline: no network, no keys. A part that cannot be matched
-comes back ``matched: false`` with ``params``/``model_path`` null (contract "unknown"), never a
-fabricated part; a match with the native core unavailable returns the spec with ``model_path``
-null.
+Thin MCP adapter over the C++ core (libaicad ``match_part_number`` / ``spec_sheet_match`` /
+``list_spec_templates`` RPCs via :mod:`services.mcp.core_bridge`, T-RF18). ``match_part_number``
+takes a purchased manufacturer/vendor part number, strips vendor packaging suffixes, and resolves
+it against the clean-room ISO/DIN standard-part tables (fasteners, bearings) — falling back to the
+user's own installed KiCad symbol libraries — then builds real editable geometry via the
+``parts_make`` core generator. Deterministic and offline: no network, no keys. A part that cannot
+be matched comes back ``matched: false`` with ``params``/``model_path`` null (contract "unknown"),
+never a fabricated part; a match with the native core unavailable returns the spec with
+``model_path`` null.
 """
 from __future__ import annotations
 
 from mcp.server.fastmcp import FastMCP
 
 from mcp_server.cad_tools import _dumps, _err
+from . import core_bridge as cb
 
 
 def register_spec_tools(mcp: FastMCP) -> None:
@@ -33,9 +35,12 @@ def register_spec_tools(mcp: FastMCP) -> None:
         without the native core returns the spec with model_path null.
         """
         try:
-            from engine import spec_sheet_matcher as ssm
-            result = ssm.match_part_number(mpn)
-            return _dumps({"ok": True, **result})
+            r = cb.call("match_part_number", {"mpn": mpn})
+            # The RPC envelope nests the match under "match"; unwrap to the historical
+            # flat tool shape {ok, matched, source, ...}.
+            if isinstance(r, dict) and isinstance(r.get("match"), dict):
+                return _dumps({"ok": True, **r["match"]})
+            return _dumps(r)
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -57,9 +62,12 @@ def register_spec_tools(mcp: FastMCP) -> None:
         registered, vendor_part}.
         """
         try:
-            from engine import spec_sheet_matcher as ssm
-            result = ssm.spec_sheet_match(text_or_url, mpn, template)
-            return _dumps({"ok": True, **result})
+            r = cb.call("spec_sheet_match",
+                        {"text_or_url": text_or_url, "mpn": mpn, "template": template})
+            # Same envelope unwrap as match_part_number ({ok, match:{...}} -> flat).
+            if isinstance(r, dict) and isinstance(r.get("match"), dict):
+                return _dumps({"ok": True, **r["match"]})
+            return _dumps(r)
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -71,7 +79,6 @@ def register_spec_tools(mcp: FastMCP) -> None:
         LLM must extract for each template. `required` keys gate the build (never defaulted).
         """
         try:
-            from engine import spec_sheet_matcher as ssm
-            return _dumps({"ok": True, "templates": ssm.list_templates()})
+            return _dumps(cb.call("list_spec_templates", {}))
         except Exception as e:  # noqa: BLE001
             return _err(e)

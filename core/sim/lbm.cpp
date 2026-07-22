@@ -144,7 +144,8 @@ float pairwise_sum_f32(const float* a, std::size_t n) {
 
 LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
                   const LbmParams& p, int n_steps,
-                  const std::function<void(int, int)>& on_progress) {
+                  const std::function<void(int, int)>& on_progress,
+                  const std::function<bool()>& should_cancel) {
     LbmResult R;
     R.nx = nx;
     R.ny = ny;
@@ -177,12 +178,16 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
                 : "auto: no CUDA device, using CPU";
         } else {
             std::string why;
-            LbmResult cr = lbm_run_cuda(solid, nx, ny, nz, p, n_steps, on_progress, why);
+            LbmResult cr = lbm_run_cuda(solid, nx, ny, nz, p, n_steps, on_progress,
+                                        should_cancel, why);
             if (cr.ok) {
                 cr.backend = "cuda";
                 if (!why.empty()) cr.backend_fallback = why;
                 return cr;
             }
+            // A cancel on the CUDA path is terminal: report it instead of restarting the
+            // whole lattice on the CPU fallback.
+            if (should_cancel && should_cancel()) return cr;
             R.backend_fallback = why.empty()
                 ? (cr.error.empty() ? "CUDA path failed; using CPU" : cr.error)
                 : why;
@@ -608,6 +613,15 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
             convergence_ms += std::chrono::duration<double, std::milli>(
                                   std::chrono::steady_clock::now() - t_cv0).count();
             if (on_progress) on_progress(step, n_steps);  // live progress (read-only)
+            // Cooperative cancel (sim_cancel): stop at the checkpoint, reporting the steps
+            // actually run. Parity-safe — the gate never passes a cancel hook.
+            if (should_cancel && should_cancel()) {
+                R.ok = false;
+                R.steps_run = step;
+                R.error = "cancelled by sim_cancel at step " + std::to_string(step) +
+                          " of " + std::to_string(n_steps);
+                return R;
+            }
             // Emergency stop (governor): the HOST is nearly out of memory — the lattice
             // itself was admitted up-front, so this means some other process is eating
             // RAM. Stop gracefully at this checkpoint instead of letting the OS swap or

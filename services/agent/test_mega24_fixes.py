@@ -290,56 +290,6 @@ def test_resolve_tool_dispatch_no_silent_fn_empty():
 # ---------------------------------------------------------------------------
 
 
-def test_terminal_product_force_predicate_covers_verify_failed():
-    """Source-level + behavioral: loop fires gates on verify_failed terminals."""
-    src = (_ROOT / "services/agent/loop.py").read_text(encoding="utf-8")
-    assert "verify_failed" in src
-    assert "_terminal_product_force" in src
-    # Predicate body must include verify_failed startswith and needs_correction.
-    tree = ast.parse(src)
-    found = False
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Assign):
-            for t in node.targets:
-                if isinstance(t, ast.Name) and t.id == "_terminal_product_force":
-                    found = True
-    assert found, "_terminal_product_force assignment missing"
-
-    # Behavioral: monkeypatch gates and drive the predicate path via source
-    # constants — call the helper if exposed, else re-evaluate the condition.
-    status = "needs_correction"
-    stop_reason = "verify_failed: ['AC1', 'AC2', 'AC3', 'AC4', 'AC5']"
-    reached = "verify"
-    completed = {"intake", "specify", "verify"}
-    _sr = stop_reason or ""
-    _terminal_product_force = (
-        status in ("done", "blocked", "needs_correction", "failed")
-        and (
-            _sr in ("deliver_partial", "mission_complete", "", "needs_correction")
-            or _sr.startswith("deliver")
-            or _sr.startswith("verify_failed")
-            or _sr.startswith("mech_")
-            or reached == "deliver"
-            or "deliver" in completed
-            or "verify" in completed
-            or "build" in completed
-        )
-    )
-    assert _terminal_product_force is True
-
-    # Old predicate (mega-22) would have SKIPPED this terminal.
-    old = (
-        status in ("done", "blocked", "needs_correction")
-        and (
-            stop_reason in ("deliver_partial", "mission_complete", "")
-            or (stop_reason or "").startswith("deliver")
-            or reached == "deliver"
-            or "deliver" in completed
-        )
-    )
-    assert old is False, "old predicate must NOT fire on mega-23 terminal"
-
-
 def test_s23_t23_not_weakened():
     """S23/T23 pass rules remain: in-band V, real measure scores."""
     # Import mega23 tests' scoring contracts without re-running full suite.

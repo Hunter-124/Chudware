@@ -29,9 +29,15 @@ from typing import Any
 # MPN normalisation — reuse existing, no reinvention
 # ---------------------------------------------------------------------------
 try:
-    from ..spec_sheet_matcher import normalize_mpn
+    # spec_sheet_matcher was deleted (T-RF18); the C++ port answers via core_bridge.
+    from services.mcp.core_bridge import call as _cb_call
+
+    def normalize_mpn(pn: str) -> str:
+        r = _cb_call("normalize_mpn", {"mpn": str(pn or "")})
+        return (r.get("normalized") or str(pn or "").strip()) if isinstance(r, dict) \
+            else str(pn or "").strip()
 except Exception:  # pragma: no cover
-    # Fallback shim when running standalone outside the package tree
+    # Fallback shim when the core is unavailable
     def normalize_mpn(pn: str) -> str:  # type: ignore[misc]
         return str(pn or "").strip()
 

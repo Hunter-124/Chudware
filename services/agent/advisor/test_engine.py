@@ -263,50 +263,6 @@ def test_stage_set_records_override(tmp_path, monkeypatch):
 # loop.py injection golden test — [ADVISORY] reaches session.messages
 # ---------------------------------------------------------------------------
 
-def test_loop_injects_advisory_block(tmp_path, monkeypatch):
-    """A rebuild failure in the loop must prepend an [ADVISORY] block to the next
-    user turn (the injection-live-in-loop.py DoD proof).  Mirrors the
-    test_live_seam_wiring.py fixture pattern — no LLM, no core."""
-    from dataclasses import dataclass, field
-    from services.agent import loop
-    from services.agent.providers.mock_provider import MockProvider
-
-    @dataclass
-    class _FailBuild:
-        ok: bool = False
-        stl_path = None
-        error: str = "BRepCheck: feature F7 failed to rebuild"
-        stdout: str = ""
-        volume: float = 0.0
-        triangles: int = 0
-        bbox: dict = field(default_factory=lambda: {"size": [0, 0, 0]})
-        is_assembly: bool = False
-        parts = None
-        fit = None
-
-    # Mock provider: emit a code block so the loop attempts a build (which fails).
-    replies = ["```python\nresult = Box(1,1,1)\n```", "```python\nresult = Box(1,1,1)\n```"]
-    provider = MockProvider(replies)
-    monkeypatch.setattr(loop, "run_code_multi", lambda code, out_dir, name: _FailBuild())
-    monkeypatch.setattr(loop.paths, "model_dir", lambda name: tmp_path)
-    monkeypatch.setenv("AI_CAD_ADVISOR", "1")
-    monkeypatch.setenv("AI_CAD_CACHE_ROOT", str(tmp_path))
-
-    session = loop.Session(name="adv_golden")
-    loop.run_turn(session, "a 1mm cube", provider, max_iters=2)
-
-    # Find the [ADVISORY] block in the assembled messages.
-    joined = "\n".join(
-        p.get("text", "")
-        for m in session.messages
-        for p in m.get("content", [])
-        if p.get("type") == "text"
-    )
-    assert "[ADVISORY" in joined, "advisory block was not injected into the loop messages"
-    assert "rebuild" in joined
-    assert "regen_diagnose" in joined            # helper tool advertised
-
-
 # ---------------------------------------------------------------------------
 # dag node runner injection — output_state["advisory"] populated (DoD: both hosts)
 # ---------------------------------------------------------------------------

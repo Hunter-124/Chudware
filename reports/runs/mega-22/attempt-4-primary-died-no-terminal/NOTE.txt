@@ -1,2 +1,0 @@
-a4 primary died without mission terminal status (~8min, last event n_layout budget
-exhausted). Infra/process death. Best graded remains a2 live 7/9.

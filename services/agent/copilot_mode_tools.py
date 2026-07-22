@@ -1,6 +1,12 @@
 """copilot_mode_tools.py — per-mode tool allowlists for Agent|Plan|Swarm|Edit|Ask.
 
-Contract (mode-overhaul + shared floor):
+Contract (frozen): contracts/copilot_modes.md — the machine-readable data lives
+in contracts/copilot_modes.json (``aicad.copilot_modes/1``) and is loaded at
+import time below; this module keeps NO private copy of the sets so the Python
+(MCP/DAG) and C++ (in-app, core/agent/copilot_modes.cpp) runtimes cannot
+diverge. Parity: services/agent/test_copilot_modes_parity.py vs
+core/tests/test_copilot_modes.cpp over the same mode × tool matrix.
+
   options.mode ∈ agent|plan|swarm|edit|ask
   Mode gates the tool set applied at agent_turn.run_turn (intersected with any
   role-card allowlist the caller already computed).
@@ -21,73 +27,46 @@ gets shared defaults (doc lifecycle + advise + web) so it never dead-ends.
 """
 from __future__ import annotations
 
+import json
+import os
+from pathlib import Path
 from typing import Any, Iterable, Optional
 
+
+def _contract_path() -> Path:
+    """Locate contracts/copilot_modes.json (canonical mode data).
+
+    Resolution: ``AI_CAD_COPILOT_MODES_JSON`` (explicit file, tests) →
+    ``<repo>/contracts/copilot_modes.json`` via this file's parents[2]
+    (services/agent/ → repo root). Mirrors the C++ loader's order.
+    """
+    env = os.environ.get("AI_CAD_COPILOT_MODES_JSON")
+    if env:
+        return Path(env)
+    return Path(__file__).resolve().parents[2] / "contracts" / "copilot_modes.json"
+
+
+def _load_contract() -> dict:
+    with open(_contract_path(), encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+_CONTRACT = _load_contract()
+
 # Canonical mode vocabulary (frozen with host/core).
-COPILOT_MODES = frozenset({"agent", "plan", "swarm", "edit", "ask"})
-DEFAULT_MODE = "agent"
+COPILOT_MODES = frozenset(_CONTRACT["modes"])
+DEFAULT_MODE = _CONTRACT["default_mode"]
 
 # Always-available floor across restricted modes so the agent can get work done,
 # talk to the user, reach the advisor, search the web, and manage docs.
-SHARED_DEFAULT_TOOLS: frozenset[str] = frozenset({
-    # Doc lifecycle (make / save / open / close)
-    "new_part",
-    "save_part",
-    "close_part",
-    "import_part",
-    "export_part",
-    # Web + advisor + interaction
-    "research_web_search",
-    "advise",
-    "ask_user",
-    # Baseline read / help
-    "cad_guide",
-    "list_parts",
-    "describe_part",
-    "measure_part",
-    # Meta: request more tool categories mid-turn
-    "enable_tools",
-    "list_tool_categories",
-})
+SHARED_DEFAULT_TOOLS: frozenset[str] = frozenset(_CONTRACT["shared_default_tools"])
 
 # ---------------------------------------------------------------------------
-# Allowlists (None = no mode-level restriction)
+# Allowlists (None = no mode-level restriction) — loaded from the contract JSON
 # ---------------------------------------------------------------------------
 
 # Ask: pure read / research. No mutation, no mission, no new docs.
-ASK_TOOLS: frozenset[str] = frozenset({
-    "cad_guide",
-    "describe_part",
-    "describe_assembly",
-    "describe_sketch",
-    "describe_scene",
-    "describe_board",
-    "describe_results",
-    "describe_toolpaths",
-    "describe_project",
-    "measure_part",
-    "measure_between",
-    "measure_from_photo",
-    "query_geometry",
-    "query_adjacency",
-    "hover",
-    "list_parts",
-    "list_world_bodies",
-    "get_part",
-    "research_web_search",
-    "research_fetch_page",
-    "research_material_lookup",
-    "research_standard_section",
-    "research_thread_spec",
-    "research_unit_convert",
-    "research_eng_calc",
-    "research_datasheet_fetch",
-    "list_calcs",
-    "list_standard_parts",
-    "part_search",
-    "part_get",
-    "parts_taxonomy",
-})
+ASK_TOOLS: frozenset[str] = frozenset(_CONTRACT["mode_tools"]["ask"])
 
 # Plan: same breadth as agent for research/sim/inspect/sourcing/delegate, but
 # NEVER geometry/document commit mutators. Used when role_tools is empty (a
@@ -95,192 +74,18 @@ ASK_TOOLS: frozenset[str] = frozenset({
 # role card is present, apply_mode_tools subtracts mutators from that card
 # instead of intersecting with this set — callers that must stay broad should
 # pass role_tools=None for plan.
-PLAN_TOOLS: frozenset[str] = frozenset({
-    *ASK_TOOLS,
-    # Plan / ledger / status
-    "buildgraph_plan",
-    "buildgraph_status",
-    "dag_plan",
-    "dag_status",
-    "ledger_get",
-    "ledger_note",
-    "ledger_events",
-    "layout_plan",
-    "layout_plan_report",
-    "preflight_ops",
-    "ask_user",
-    "delegate",
-    "workspace_status",
-    "intake_status",
-    "suggest_dimension_scheme",
-    "advise",
-    # Describe / inspect / look
-    "inspect_part",
-    "inspect_feature",
-    "inspect_section",
-    "look_around",
-    "contact_sheet",
-    "render_part",
-    "render_views",
-    "render_sketch",
-    "render_ascii",
-    "render_sketch_ascii",
-    "wall_thickness",
-    "draft_analysis",
-    # Checks / compare / fit
-    "check_sketch",
-    "check_sketch_d",
-    "check_interference",
-    "check_symmetry",
-    "check_feature_overlap",
-    "check_metadata",
-    "interference_check",
-    "interface_check",
-    "compare_parts",
-    "stackup_analyze",
-    "fit_calc",
-    "fit_report",
-    "recommend_fit",
-    "gear_check",
-    "bearing_life",
-    "tap_drill",
-    "feeds_speeds",
-    "sketch_health",
-    "sketch_preview_text",
-    # Sourcing / BOM
-    "part_source",
-    "bom_rollup",
-    "bom_price",
-    # Design review
-    "design_review",
-    "dfm_check",
-    "verify_battery",
-    # Sim read/run (analysis is non-commit)
-    "run_fea_static",
-    "run_fea_modal",
-    "run_fea_frequency_response",
-    "run_fea_fatigue",
-    "run_fea_thermal",
-    "run_fea_buckling",
-    "run_fea_contact",
-    "run_cfd_flow",
-    "run_cfd_accurate",
-    "get_job",
-    "simulate_motion",
-    # Corporate / coordinate read helpers
-    "corporate_channel_read",
-    "corporate_chart",
-    "coordinate_board",
-    "coordinate_progress",
-    "coordinate_claim",
-    "coordinate_release",
-})
+PLAN_TOOLS: frozenset[str] = frozenset(_CONTRACT["mode_tools"]["plan"])
 
 # Edit: mutate current doc; no new_part / mission / corporate activate.
-EDIT_TOOLS: frozenset[str] = frozenset({
-    *ASK_TOOLS,
-    "add_features",
-    "edit_feature",
-    "undo",
-    "redo",
-    "save_part",
-    "export_part",
-    "set_material",
-    "set_process",
-    "set_config_override",
-    "set_config_suppression",
-    "list_configurations",
-    "activate_configuration",
-    "add_configuration",
-    "check_feature_overlap",
-    "check_interference",
-    "check_symmetry",
-    "wall_thickness",
-    "dfm_check",
-    "draft_analysis",
-    "verify_battery",
-    "design_review",
-    "inspect_part",
-    "inspect_feature",
-    "inspect_section",
-    "render_part",
-    "render_views",
-    "contact_sheet",
-    "look_around",
-    "convert_face_to_sketch",
-    "project_into_sketch",
-    "sketch_auto_constrain",
-    "preflight_ops",
-    "ledger_get",
-    "ledger_note",
-    "advise",
-    # Subagents stay available outside pure Swarm, but edit stays doc-local —
-    # no corporate_activate / mission spawn. delegate remains for scoped help.
-    "delegate",
-})
+EDIT_TOOLS: frozenset[str] = frozenset(_CONTRACT["mode_tools"]["edit"])
 
 # Explicit denylists used when intersecting open-ended role cards.
-_MUTATING_TOOLS: frozenset[str] = frozenset({
-    "add_features",
-    "edit_feature",
-    "new_part",
-    "new_assembly",
-    "close_part",
-    "import_part",
-    "import_artifact",
-    "asm_add_component",
-    "asm_mate",
-    "solve_mates",
-    "cam_generate",
-    "cam_post",
-    "cam_audit",
-    "cam_add_operation",
-    "cam_add_setup",
-    "cam_add_tool",
-    "ecad_place_symbol",
-    "ecad_wire",
-    "ecad_new_schematic",
-    "ecad_new_pcb",
-    "board_from_schematic",
-    "fw_new_project",
-    "fw_build",
-    "fw_flash",
-})
+_MUTATING_TOOLS: frozenset[str] = frozenset(_CONTRACT["mutating_tools"])
 
-_EDIT_DENIED: frozenset[str] = frozenset({
-    "new_part",
-    "new_assembly",
-    "close_part",
-    "import_part",
-    "import_artifact",
-    "corporate_activate",
-    "corporate_spawn_worker",
-    "dag_run",
-    "dag_replan",
-    "mission_start",
-    "scrape_enqueue",
-})
+_EDIT_DENIED: frozenset[str] = frozenset(_CONTRACT["edit_denied"])
 
 # Swarm extras always kept when mode is swarm (unioned onto an open allowlist).
-SWARM_EXTRA_TOOLS: frozenset[str] = frozenset({
-    "delegate",
-    "corporate_activate",
-    "corporate_channel_post",
-    "corporate_channel_read",
-    "corporate_chart",
-    "corporate_spawn_worker",
-    "corporate_hold_meeting",
-    "corporate_record_completion",
-    "coordinate_claim",
-    "coordinate_release",
-    "coordinate_progress",
-    "coordinate_board",
-    "dag_plan",
-    "dag_status",
-    "ask_user",
-    "ledger_get",
-    "ledger_note",
-})
+SWARM_EXTRA_TOOLS: frozenset[str] = frozenset(_CONTRACT["swarm_extra_tools"])
 
 
 def normalize_mode(mode: str | None) -> str:

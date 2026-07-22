@@ -1,6 +1,6 @@
 # Contracts Summary
 
-43 frozen contracts under `contracts/`:
+44 frozen contracts under `contracts/`:
 
 - `README.md` — contracts/ — frozen interface seams
 - `advisor.md` — contracts/advisor.md — Advisory Layer contracts (aicad.advisor/1.7)
@@ -8,6 +8,7 @@
 - `ai_vc.md` — Contract: AI-VC (silent agent version control) — v1
 - `cad_graph.md` — Contract: CAD Project Graph — v1
 - `cam.md` — Contract: CAM simulation frames, audit, machines, job diff
+- `copilot_modes.md` — Copilot modes — Agent|Plan|Swarm|Edit|Ask tool gating (aicad.copilot_modes/1)
 - `dag_schema.md` — Contract: DAG Orchestrator Schema — `aicad.dag/1`
 - `deliverables.md` — Contract: Deliverables — `deliverables/1`
 - `design_pipeline.md` — contracts/design_pipeline.md — Design pipeline contract (`aicad.designpipe/1`)

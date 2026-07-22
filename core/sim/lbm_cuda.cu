@@ -222,6 +222,7 @@ bool lbm_cuda_device_available() {
 LbmResult lbm_run_cuda(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
                        const LbmParams& p, int n_steps,
                        const std::function<void(int, int)>& on_progress,
+                       const std::function<bool()>& should_cancel,
                        std::string& fallback_reason) {
     LbmResult R;
     R.nx = nx;
@@ -350,6 +351,18 @@ LbmResult lbm_run_cuda(const std::vector<uint8_t>& solid, int nx, int ny, int nz
         }
         if (step % sample_every == 0 || step == n_steps) {
             if (on_progress) on_progress(step, n_steps);
+            // Cooperative cancel (sim_cancel): drain the queued kernels, free, and report a
+            // terminal cancel (NOT a fallback — the caller checks should_cancel before the
+            // CPU fallback). Takes effect at the next checkpoint, like the CPU path.
+            if (should_cancel && should_cancel()) {
+                cudaDeviceSynchronize();
+                cleanup();
+                R.ok = false;
+                R.steps_run = step;
+                R.error = "cancelled by sim_cancel at step " + std::to_string(step) +
+                          " of " + std::to_string(n_steps);
+                return R;
+            }
             // Lightweight checkpoint: just record a zero placeholder; force is computed
             // fully at the end on the host after D2H (preserves reduction order options).
             drag_hist.push_back(0.0);

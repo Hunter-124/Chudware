@@ -201,6 +201,7 @@ add_library(aicad_sim STATIC
   sim/lbm.cpp
   sim/flow_run.cpp
   sim/sim_cache.cpp
+  sim/sim_cancel.cpp
   sim/spice_sweep.cpp)
 target_include_directories(aicad_sim PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(aicad_sim PRIVATE ${spectra_SOURCE_DIR}/include)
@@ -325,6 +326,7 @@ add_library(aicad_ecad STATIC
   ecad/recipes.cpp
   ecad/sync.cpp
   ecad/container.cpp
+  ecad/kicad.cpp
   ecad/session.cpp)
 target_include_directories(aicad_ecad PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # aicad_miniz is the ZIP read/write lib (shared with the .step+ container) — the
@@ -341,6 +343,62 @@ target_link_libraries(test_autoroute PRIVATE aicad_ecad)
 set_target_properties(test_autoroute PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME autoroute COMMAND test_autoroute)
+
+# T-RF15 (node R4a): firmware engine surface — project scaffold + pin-map +
+# toolchain/build wrappers + probe-rs/esptool hardware path + co-verification +
+# the Renode/QEMU emulator leg (fw_sim_run incl. §7 trace + §9 scenarios,
+# fw_power_profile, fw_sensor_scenario) + the fw_* RPC dispatch
+# (firmware/firmware_rpc.cpp). Pure JSON like aicad_sim/aicad_ecad; links
+# aicad_ecad for session/netlist/schema/container resolution of board_doc_ref.
+add_library(aicad_firmware STATIC
+  firmware/subprocess.cpp
+  firmware/templates_embedded.cpp
+  firmware/mcu_pinouts.cpp
+  firmware/pinmap.cpp
+  firmware/project.cpp
+  firmware/toolchains.cpp
+  firmware/hardware.cpp
+  firmware/platform_db.cpp
+  firmware/provision.cpp
+  firmware/coverify.cpp
+  firmware/eng_rails.cpp
+  firmware/pyfmt.cpp
+  firmware/scenario.cpp
+  firmware/emulator.cpp
+  firmware/powerprofile.cpp
+  firmware/sensor_models.cpp
+  firmware/sim_sensor_bridge.cpp
+  firmware/firmware_rpc.cpp)
+target_include_directories(aicad_firmware PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(aicad_firmware PUBLIC nlohmann_json::nlohmann_json aicad_ecad)
+
+add_executable(test_firmware tests/test_firmware.cpp)
+target_include_directories(test_firmware PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_firmware PRIVATE aicad_firmware)
+# The fw_* tests read small ECAD board/schematic/trace fixtures from the source
+# tree; pass the absolute dir so the test runs from the build dir.
+target_compile_definitions(test_firmware PRIVATE
+  AICAD_TEST_DATA="${CMAKE_CURRENT_SOURCE_DIR}/tests/data/firmware")
+set_target_properties(test_firmware PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME firmware COMMAND test_firmware)
+
+# fw_cli: differential-harness driver (same role as sketch_cli) — reads
+# {"method","params"} and prints the firmware::call result as one JSON line.
+# Used by the T-RF15 parity diffs against the Python oracle.
+add_executable(fw_cli firmware/fw_cli.cpp)
+target_link_libraries(fw_cli PRIVATE aicad_firmware)
+set_target_properties(fw_cli PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
+# T-RF17: KiCad importers (import_kicad_sch / import_kicad_pcb) + the ecad_open
+# .kicad_* extension dispatch — mirrors engine/ecad/test_formats.py tests 3-6.
+add_executable(test_kicad_import tests/test_kicad_import.cpp)
+target_include_directories(test_kicad_import PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_kicad_import PRIVATE aicad_ecad)
+set_target_properties(test_kicad_import PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME kicad_import COMMAND test_kicad_import)
 
 enable_testing()
 
@@ -560,9 +618,11 @@ target_include_directories(aicad_aicm PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # it builds in both configs. Dynamic CRT to match aicad_miniz / the DLL heap.
 add_library(aicad_agent STATIC
   agent/http.cpp
+  agent/auth.cpp
   agent/providers.cpp
   agent/paths.cpp
   agent/config.cpp
+  agent/copilot_modes.cpp
   agent/ops_emit.cpp
   agent/events.cpp
   agent/roles.cpp
@@ -600,6 +660,16 @@ set_target_properties(test_agent PROPERTIES
 # the repo root (core/..) so the lookup resolves regardless of where ctest is invoked.
 add_test(NAME agent COMMAND test_agent WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
+# subscription-auth store + pre-run refresh (agent/auth.cpp). OCCT-free, links
+# aicad_agent; all cases run against a scratch XDG config dir with a fake HTTP seam.
+add_executable(test_agent_auth
+  tests/test_agent_auth.cpp)
+target_include_directories(test_agent_auth PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_agent_auth PRIVATE aicad_agent)
+set_target_properties(test_agent_auth PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME agent_auth COMMAND test_agent_auth)
+
 # err_sig identical-failure detector (agent/machine.cpp). OCCT-free, links aicad_agent.
 add_executable(test_machine
   tests/test_machine.cpp)
@@ -617,6 +687,18 @@ target_link_libraries(test_complexity PRIVATE aicad_agent)
 set_target_properties(test_complexity PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME complexity COMMAND test_complexity)
+
+# Copilot mode tool-gating contract (agent/copilot_modes.cpp ←
+# contracts/copilot_modes.json). OCCT-free, links aicad_agent. Runs from the
+# repo root (like test_agent) so the repo-relative contracts/ fallback resolves.
+add_executable(test_copilot_modes
+  tests/test_copilot_modes.cpp)
+target_include_directories(test_copilot_modes PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_copilot_modes PRIVATE aicad_agent)
+set_target_properties(test_copilot_modes PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME copilot_modes COMMAND test_copilot_modes
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
 # domain classifier + tool-class registry (agent/domain.cpp). OCCT-free.
 add_executable(test_domain
@@ -678,6 +760,33 @@ target_link_libraries(test_parts PRIVATE aicad_parts)
 set_target_properties(test_parts PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME parts COMMAND test_parts)
+
+# --- libaicad sourcing (BOM roll-up / cost model / spec-match / providers) -------
+# T-RF18: C++ port of engine_oracle/{bom,cost_model,spec_sheet_matcher,parts_providers,
+# quote_providers}.py backing the worker methods bom_rollup / bom_price /
+# request_quote / match_part_number / vendor_part_fetch and the MCP spec_sheet_match
+# lane. PURE (OCCT-free, no doc/ecad/agent linkage): every side effect — assembly /
+# board loading, HTTP transport, model building — is a Seams injection point, so the
+# libaicad dispatch glue supplies the production defaults and tests run fully
+# offline. Linked into the libaicad DLL below and unit-tested in both configs.
+add_library(aicad_sourcing STATIC
+  sourcing/bom.cpp
+  sourcing/config.cpp
+  sourcing/cost.cpp
+  sourcing/providers.cpp
+  sourcing/quote.cpp
+  sourcing/sourcing.cpp
+  sourcing/specmatch.cpp
+  sourcing/vendorreg.cpp)
+target_include_directories(aicad_sourcing PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(aicad_sourcing PUBLIC nlohmann_json::nlohmann_json)
+
+add_executable(test_sourcing tests/test_sourcing.cpp)
+target_include_directories(test_sourcing PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_sourcing PRIVATE aicad_sourcing)
+set_target_properties(test_sourcing PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME sourcing COMMAND test_sourcing)
 
 # --- Wave 2: OCCT geometry kernel (opt-in) -----------------------------------
 if(AICAD_WITH_OCCT)
@@ -1619,7 +1728,7 @@ if(AICAD_WITH_OCCT)
   target_include_directories(aicad PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/hostd_gen)
   add_dependencies(aicad aicad_version_info)
   target_compile_definitions(aicad PRIVATE AICAD_BUILD_DLL)
-  target_link_libraries(aicad PRIVATE aicad_doc aicad_sim aicad_ecad aicad_cam aicad_agent aicad_parts aicad_prof)
+  target_link_libraries(aicad PRIVATE aicad_doc aicad_sim aicad_ecad aicad_cam aicad_agent aicad_parts aicad_sourcing aicad_firmware aicad_prof)
   if(AICAD_WITH_NETGEN)
     target_link_libraries(aicad PRIVATE aicad_mesh)
     target_compile_definitions(aicad PRIVATE AICAD_WITH_NETGEN)  # enable the mesh RPCs in libaicad.cpp

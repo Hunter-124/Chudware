@@ -1,0 +1,301 @@
+{
+  "footprints": [
+    {
+      "angle": 0.0,
+      "attr": "smd",
+      "fields": {},
+      "fpid": "Package_QFP:LQFP-48",
+      "graphics": [],
+      "id": "fp1",
+      "libid": "MCU:Generic_QFP48",
+      "model_3d": null,
+      "pads": [
+        {
+          "angle": 0.0,
+          "drill": null,
+          "id": "p1",
+          "layers": [
+            "F.Cu"
+          ],
+          "net": "VDD",
+          "number": "1",
+          "pin": "1",
+          "pos": [
+            0.0,
+            1.0
+          ],
+          "shape": "rect",
+          "size": [
+            0.5,
+            0.5
+          ],
+          "type": "smd"
+        },
+        {
+          "angle": 0.0,
+          "drill": null,
+          "id": "p2",
+          "layers": [
+            "F.Cu"
+          ],
+          "net": "VDDA",
+          "number": "2",
+          "pin": "2",
+          "pos": [
+            0.0,
+            2.0
+          ],
+          "shape": "rect",
+          "size": [
+            0.5,
+            0.5
+          ],
+          "type": "smd"
+        },
+        {
+          "angle": 0.0,
+          "drill": null,
+          "id": "p3",
+          "layers": [
+            "F.Cu"
+          ],
+          "net": "GND",
+          "number": "3",
+          "pin": "3",
+          "pos": [
+            0.0,
+            3.0
+          ],
+          "shape": "rect",
+          "size": [
+            0.5,
+            0.5
+          ],
+          "type": "smd"
+        },
+        {
+          "angle": 0.0,
+          "drill": null,
+          "id": "p4",
+          "layers": [
+            "F.Cu"
+          ],
+          "net": "PA5",
+          "number": "4",
+          "pin": "4",
+          "pos": [
+            0.0,
+            4.0
+          ],
+          "shape": "rect",
+          "size": [
+            0.5,
+            0.5
+          ],
+          "type": "smd"
+        }
+      ],
+      "pos": [
+        10.0,
+        10.0
+      ],
+      "ref": "U1",
+      "side": "top",
+      "value": "STM32F407"
+    },
+    {
+      "angle": 0.0,
+      "attr": "smd",
+      "fields": {},
+      "fpid": "LED_SMD:LED_0603",
+      "graphics": [],
+      "id": "fp2",
+      "model_3d": null,
+      "pads": [
+        {
+          "angle": 0.0,
+          "drill": null,
+          "id": "p1",
+          "layers": [
+            "F.Cu"
+          ],
+          "net": "PA5",
+          "number": "1",
+          "pin": "1",
+          "pos": [
+            0.0,
+            1.0
+          ],
+          "shape": "rect",
+          "size": [
+            0.5,
+            0.5
+          ],
+          "type": "smd"
+        },
+        {
+          "angle": 0.0,
+          "drill": null,
+          "id": "p2",
+          "layers": [
+            "F.Cu"
+          ],
+          "net": "GND",
+          "number": "2",
+          "pin": "2",
+          "pos": [
+            0.0,
+            2.0
+          ],
+          "shape": "rect",
+          "size": [
+            0.5,
+            0.5
+          ],
+          "type": "smd"
+        }
+      ],
+      "pos": [
+        10.0,
+        10.0
+      ],
+      "ref": "D1",
+      "side": "top",
+      "value": "LED"
+    },
+    {
+      "angle": 0.0,
+      "attr": "smd",
+      "fields": {},
+      "fpid": "Capacitor_SMD:C_0402",
+      "graphics": [],
+      "id": "fp3",
+      "model_3d": null,
+      "pads": [
+        {
+          "angle": 0.0,
+          "drill": null,
+          "id": "p1",
+          "layers": [
+            "F.Cu"
+          ],
+          "net": "VDD",
+          "number": "1",
+          "pin": "1",
+          "pos": [
+            0.0,
+            1.0
+          ],
+          "shape": "rect",
+          "size": [
+            0.5,
+            0.5
+          ],
+          "type": "smd"
+        },
+        {
+          "angle": 0.0,
+          "drill": null,
+          "id": "p2",
+          "layers": [
+            "F.Cu"
+          ],
+          "net": "GND",
+          "number": "2",
+          "pin": "2",
+          "pos": [
+            0.0,
+            2.0
+          ],
+          "shape": "rect",
+          "size": [
+            0.5,
+            0.5
+          ],
+          "type": "smd"
+        }
+      ],
+      "pos": [
+        10.0,
+        10.0
+      ],
+      "ref": "C1",
+      "side": "top",
+      "value": "100n"
+    }
+  ],
+  "graphics": [],
+  "id": "8db7035a-ffeb-4ec8-9cd1-aa67f8ab600d",
+  "linked_sch": null,
+  "name": "t_rf15_eng",
+  "net_classes": {
+    "default": {
+      "clearance": 0.2,
+      "track_width": 0.25,
+      "via_diameter": 0.8,
+      "via_drill": 0.4
+    }
+  },
+  "nets": [
+    {
+      "class": "default",
+      "name": "GND"
+    },
+    {
+      "class": "default",
+      "name": "PA5"
+    },
+    {
+      "class": "default",
+      "name": "VDD"
+    },
+    {
+      "class": "default",
+      "name": "VDDA"
+    }
+  ],
+  "origin": [
+    0.0,
+    0.0
+  ],
+  "outline": {
+    "closed": false,
+    "shapes": []
+  },
+  "rules": {
+    "annular_ring_min": 0.13,
+    "clearance": 0.2,
+    "edge_clearance": 0.3,
+    "hole_to_hole_min": 0.25,
+    "silk_to_mask_min": 0.15,
+    "track_width_min": 0.15,
+    "via_diameter_min": 0.45,
+    "via_drill_min": 0.2
+  },
+  "schema": "aicad.pcb/1",
+  "stackup": {
+    "copper_layers": 2,
+    "layers": [
+      {
+        "id": "F.Cu",
+        "thickness": 0.035,
+        "type": "copper"
+      },
+      {
+        "er": 4.5,
+        "id": "diel1",
+        "thickness": 1.53,
+        "type": "core"
+      },
+      {
+        "id": "B.Cu",
+        "thickness": 0.035,
+        "type": "copper"
+      }
+    ],
+    "thickness": 1.6
+  },
+  "tracks": [],
+  "vias": [],
+  "zones": []
+}

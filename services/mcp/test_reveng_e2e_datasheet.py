@@ -87,15 +87,23 @@ def test_ingest_extracts_mpn_candidate():
         )
 
 
+def _match_part_number(mpn, generate=False):
+    """engine_oracle.spec_sheet_matcher was deleted (T-RF18) — call the C++ port."""
+    from services.mcp import core_bridge as cb
+
+    r = cb.call("match_part_number", {"mpn": mpn, "generate": generate})
+    if isinstance(r, dict) and isinstance(r.get("match"), dict):
+        return r["match"]
+    return r
+
+
 # ---------------------------------------------------------------------------
 # 2. MPN fast-path — deterministic BOLTS lookup (offline, no LLM)
 # ---------------------------------------------------------------------------
 
 def test_match_part_number_6205_params():
     """match_part_number('6205-2RS') resolves OD/ID/Width from the BOLTS table."""
-    from engine_oracle.spec_sheet_matcher import match_part_number
-
-    result = match_part_number("6205-2RS", generate=False)
+    result = _match_part_number("6205-2RS", generate=False)
 
     assert result.get("matched"), (
         f"6205-2RS should match in BOLTS bearing table but got: {result}"
@@ -121,9 +129,7 @@ def test_match_part_number_6205_params():
 
 def test_match_part_number_6205_without_suffix():
     """'6205' (no seal code) also resolves the same dimensions."""
-    from engine_oracle.spec_sheet_matcher import match_part_number
-
-    result = match_part_number("6205", generate=False)
+    result = _match_part_number("6205", generate=False)
     assert result.get("matched"), f"6205 should match: {result}"
     params = result.get("params", {})
     assert params["outer_d"] == _EXPECTED_OD
@@ -144,7 +150,6 @@ def test_e2e_ingest_then_mpn_dims():
         pytest.skip("pdfplumber not installed")
 
     from engine_oracle.vision.datasheet_ingest import ingest_datasheet
-    from engine_oracle.spec_sheet_matcher import match_part_number
 
     with tempfile.TemporaryDirectory() as tmpdir:
         # Step 1: ingest datasheet
@@ -161,7 +166,7 @@ def test_e2e_ingest_then_mpn_dims():
         mpn = bearing_candidate or "6205-2RS"
 
         # Step 3: MPN fast-path resolution
-        match_result = match_part_number(mpn, generate=False)
+        match_result = _match_part_number(mpn, generate=False)
         assert match_result.get("matched"), (
             f"MPN '{mpn}' from datasheet did not match in BOLTS table: {match_result}"
         )

@@ -7,8 +7,8 @@
 ## 1. Legacy kinds (frozen)
 
 `status {phase, text?}` · `iteration {index, ok, done, notes, thinking, code, diff, dims, error,
-contact_sheet, stl_path, is_assembly, parts, fit}` · `plan {plan, raw}` — emitted by
-`agent_design`; unchanged until M9 retires nothing (legacy path stays).
+contact_sheet, stl_path, is_assembly, parts, fit}` · `plan {plan, raw}` — formerly emitted by
+`agent_design` (removed 2026-07-22, T-RF5); shapes kept here for historical reference.
 
 ## 2. Document & simulation
 

@@ -17,7 +17,7 @@ import pathlib
 import tempfile
 import time
 
-import mcp_server.ecad_tools as et
+import mcp_server.ecad_common as et  # T-RF8: budget/session internals moved
 from engine.ecad import autosave as eauto
 from engine.ecad import session as esess
 from mcp_server.ecad_tools import register_ecad_tools
@@ -304,11 +304,12 @@ def test_ecad_design_slow_provider_falls_back_promptly() -> None:
     os.environ["AI_CAD_ECAD_PLAN_BUDGET_S"] = "1.0"
 
     # Force the configured provider path and skip the TCP pre-flight.
-    import agent.config as _cfg  # type: ignore
+    import services.agent.config as _cfg  # T-RF8: canonical path (ecad_design uses it)
     orig_get = getattr(_cfg, "get_provider", None)
     _cfg.get_provider = lambda *a, **k: slow  # type: ignore[attr-defined]
-    orig_reach = et._provider_reachable
-    et._provider_reachable = lambda p, timeout_s=0.6: True  # type: ignore[assignment]
+    import mcp_server.ecad_sim_tools as et_sim  # T-RF8: ecad_design looks it up here
+    orig_reach = et_sim._provider_reachable
+    et_sim._provider_reachable = lambda p, timeout_s=0.6: True  # type: ignore[assignment]
 
     # Snapshot session registry size so we can assert only ONE new sch was built.
     before_ids = {s.doc_id for s in esess.iter_sessions()}
@@ -319,7 +320,7 @@ def test_ecad_design_slow_provider_falls_back_promptly() -> None:
     finally:
         if orig_get is not None:
             _cfg.get_provider = orig_get  # type: ignore[attr-defined]
-        et._provider_reachable = orig_reach  # type: ignore[assignment]
+        et_sim._provider_reachable = orig_reach  # type: ignore[assignment]
         if orig_budget is None:
             os.environ.pop("AI_CAD_ECAD_PLAN_BUDGET_S", None)
         else:

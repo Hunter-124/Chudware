@@ -10,15 +10,20 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <map>
 #include <set>
+#include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
 #include "sim/fea_static.h"
 #include "sim/flow_run.h"
 #include "sim/lbm.h"
+#include "sim/sim_cancel.h"
 
 using aicad::sim::fea_static_solve;
 using aicad::sim::FeaStaticResult;
@@ -693,3 +698,118 @@ TEST_CASE("LBM CUDA path skips cleanly or matches CPU within float32 tol") {
     }
 }
 
+
+// ── sim_cancel: run/cancel registry + cooperative LBM cancel (T-RF16) ───────────
+
+TEST_CASE("sim_cancel registry: running job cancels, unknown/finished reports cleanly") {
+    using aicad::sim::sim_cancel;
+    using aicad::sim::sim_job_register;
+    using aicad::sim::sim_job_unregister;
+
+    // Unknown job (never registered): ok, but nothing cancelled (mirrors agent::cancel_run).
+    auto miss = sim_cancel("sim-test-no-such-job");
+    CHECK(miss.value("ok", false));
+    CHECK_FALSE(miss.value("cancelled", true));
+
+    // Empty job_id: same idempotent no-op.
+    auto empty = sim_cancel("");
+    CHECK(empty.value("ok", false));
+    CHECK_FALSE(empty.value("cancelled", true));
+
+    // Running job: cancel flips the token the solver polls between steps.
+    auto tok = sim_job_register("sim-test-job-a");
+    REQUIRE(tok != nullptr);
+    CHECK_FALSE(tok->load());
+    auto hit = sim_cancel("sim-test-job-a");
+    CHECK(hit.value("ok", false));
+    CHECK(hit.value("cancelled", false));
+    CHECK(hit.value("job_id", std::string()) == "sim-test-job-a");
+    CHECK(tok->load());
+
+    // Finished job (unregistered at run end): cancel-after-finish is an idempotent miss.
+    sim_job_unregister("sim-test-job-a");
+    auto done = sim_cancel("sim-test-job-a");
+    CHECK(done.value("ok", false));
+    CHECK_FALSE(done.value("cancelled", true));
+}
+
+TEST_CASE("lbm_run stops at a checkpoint when should_cancel fires") {
+    using aicad::sim::lbm_run;
+    using aicad::sim::LbmParams;
+    const int nx = 16, ny = 8, nz = 8;
+    std::vector<uint8_t> solid(static_cast<size_t>(nx * ny * nz), 0);
+    for (int x = 6; x < 10; ++x)
+        for (int y = 3; y < 5; ++y)
+            for (int z = 3; z < 5; ++z)
+                solid[(x * ny + y) * nz + z] = 1;
+    LbmParams p;
+    p.backend = "cpu";
+    p.u_lat = 0.05;
+    p.tau0 = 0.6;
+    p.dx_m = 1e-3;
+    p.dt_s = 5e-6;
+
+    // Control: no cancel hook — the full run completes.
+    auto full = lbm_run(solid, nx, ny, nz, p, 100);
+    REQUIRE(full.ok);
+    CHECK(full.steps_run == 100);
+
+    // Cancel on the 4th checkpoint poll: the run stops early with a clear error envelope.
+    int polls = 0;
+    auto cancelled = lbm_run(solid, nx, ny, nz, p, 100, {},
+                             [&polls] { return ++polls > 3; });
+    CHECK_FALSE(cancelled.ok);
+    CHECK(cancelled.error.find("cancelled") != std::string::npos);
+    CHECK(cancelled.steps_run > 0);
+    CHECK(cancelled.steps_run < 100);
+}
+
+TEST_CASE("run_wind_tunnel is cancellable through FlowParams.job_id (sim_cancel)") {
+    using aicad::sim::FlowParams;
+    using aicad::sim::LbmResult;
+    using aicad::sim::run_wind_tunnel;
+    using aicad::sim::sim_cancel;
+
+    // Watertight 50mm cube (same construction as G4): 8 corners, 12 triangles.
+    std::vector<float> pos = {
+        -25,-25,-25,  25,-25,-25,  25,25,-25,  -25,25,-25,
+        -25,-25, 25,  25,-25, 25,  25,25, 25,  -25,25, 25,
+    };
+    std::vector<uint32_t> idx = {
+        0,2,1, 0,3,2,  // -Z face
+        4,5,6, 4,6,7,  // +Z face
+        0,1,5, 0,5,4,  // -Y face
+        2,3,7, 2,7,6,  // +Y face
+        0,4,7, 0,7,3,  // -X face
+        1,2,6, 1,6,5,  // +X face
+    };
+
+    FlowParams fp;
+    fp.cells = 16;
+    fp.n_steps = 100000;  // long enough that the cancel below lands mid-run
+    fp.job_id = "sim-test-wt-cancel";
+
+    LbmResult r;
+    std::thread worker([&] { r = run_wind_tunnel({pos}, {idx}, fp); });
+
+    // Poll until the job shows up in the registry and accepts the cancel (thread-start
+    // timing is not deterministic; registration happens at the top of the run).
+    bool accepted = false;
+    for (int i = 0; i < 200 && !accepted; ++i) {
+        auto c = sim_cancel("sim-test-wt-cancel");
+        accepted = c.value("ok", false) && c.value("cancelled", false);
+        if (!accepted) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    CHECK(accepted);
+    worker.join();
+
+    // The run stopped early at an LBM checkpoint and reported the cancel.
+    CHECK_FALSE(r.ok);
+    CHECK(r.error.find("cancelled") != std::string::npos);
+    CHECK(r.steps_run < 100000);
+
+    // The run's guard unregistered on exit: a second cancel is an idempotent miss.
+    auto after = sim_cancel("sim-test-wt-cancel");
+    CHECK(after.value("ok", false));
+    CHECK_FALSE(after.value("cancelled", true));
+}

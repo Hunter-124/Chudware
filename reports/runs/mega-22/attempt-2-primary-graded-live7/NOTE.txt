@@ -1,3 +1,0 @@
-a2 primary graded: terminal done/deliver_partial; live AC 7/9;
-Q22 PASS (DRC=0); P22 PARTIAL V(3V3)=null; R22 PARTIAL soft_zero mb.
-Archived before a2 rebind + a3 relaunch.

@@ -11,6 +11,9 @@ Gates (all stdlib-only — they parse source/docs, so they need NO engine/OCCT d
   - feature_surface_audit : every visible ribbon command routes to a real handler (no dead buttons).
   - parity_audit          : every machine-checkable SW_PARITY_SPEC done/beyond claim resolves to real
                             code (no spec<->code drift).
+  - agent_events_audit    : the aicad.agent_events/2 kind list (contracts/agent_events.json) matches
+                            both emitters (core C++ + Python services), and the kRoles prompt catalog
+                            matches services/agent/prompts/*.md (no C++<->Python agent drift).
 
 The engine + agent pytest suites are NOT run here (they need the runtime venv); run them separately:
     <venv>/python -X utf8 -m pytest engine/doc agent -q
@@ -29,6 +32,7 @@ GATES = [
     ("gui_lint (theme)", ["scripts/gui_lint.py", "--rule", "theme"]),
     ("feature_surface_audit (ribbon -> handlers)", ["scripts/feature_surface_audit.py"]),
     ("parity_audit (spec <-> code drift)", ["scripts/parity_audit.py"]),
+    ("agent_events_audit (event kinds + role catalog)", ["scripts/agent_events_audit.py"]),
 ]
 
 

@@ -97,14 +97,14 @@ def parts_hub_fake(monkeypatch):
 
 def _inject_research_mock(monkeypatch, result: dict):
     """Patch _research_and_ingest to return *result*."""
-    import services.mcp.reveng_tools as rt
-    monkeypatch.setattr(rt, "_research_and_ingest", lambda *a, **kw: result)
+    import services.mcp.reveng_common as rc  # T-RF8: lookup happens in reveng_common
+    monkeypatch.setattr(rc, "_research_and_ingest", lambda *a, **kw: result)
 
 
 def _inject_mission_mock(monkeypatch, result: dict):
     """Patch _launch_reveng_mission to return *result*."""
-    import services.mcp.reveng_tools as rt
-    monkeypatch.setattr(rt, "_launch_reveng_mission", lambda *a, **kw: result)
+    import services.mcp.reveng_build_tools as rb  # T-RF8: tools look it up here
+    monkeypatch.setattr(rb, "_launch_reveng_mission", lambda *a, **kw: result)
 
 
 def _inject_place_mock(monkeypatch, ok: bool = True):
@@ -150,8 +150,9 @@ def test_known_mpn_model_present_and_place(
             rt._save_session(s)
         return {"ok": True, "status": "done", "interrupted": False, "pending_dims": []}
 
+    import services.mcp.reveng_build_tools as rb  # T-RF8: tools look it up here
     import services.mcp.reveng_tools as rt
-    monkeypatch.setattr(rt, "_launch_reveng_mission", _mission_with_mesh)
+    monkeypatch.setattr(rb, "_launch_reveng_mission", _mission_with_mesh)
     _inject_place_mock(monkeypatch)
 
     mcp, tools = _make_fake_mcp()
@@ -211,8 +212,9 @@ def test_pending_dims_returned_no_fabrication(
             ],
         }
 
+    import services.mcp.reveng_build_tools as rb  # T-RF8: tools look it up here
     import services.mcp.reveng_tools as rt
-    monkeypatch.setattr(rt, "_launch_reveng_mission", _mission_pending)
+    monkeypatch.setattr(rb, "_launch_reveng_mission", _mission_pending)
 
     mcp, tools = _make_fake_mcp()
     rt.register_reveng_tools(mcp)
@@ -284,12 +286,13 @@ def test_no_query_skips_research_and_fails_mission_gracefully(
     PART_ID, _ = parts_hub_fake
 
     # Mission runner absent
+    import services.mcp.reveng_build_tools as rb  # T-RF8: tools look it up here
     import services.mcp.reveng_tools as rt
 
     def _mission_unavailable(session_id, template, stage_map, **kw):
         raise RuntimeError("DAG executor not available in test environment")
 
-    monkeypatch.setattr(rt, "_launch_reveng_mission", _mission_unavailable)
+    monkeypatch.setattr(rb, "_launch_reveng_mission", _mission_unavailable)
 
     mcp, tools = _make_fake_mcp()
     rt.register_reveng_tools(mcp)

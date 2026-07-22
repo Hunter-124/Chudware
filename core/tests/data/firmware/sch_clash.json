@@ -1,0 +1,142 @@
+{
+  "annotations": {},
+  "buses": [],
+  "graphics": [],
+  "id": "b263b602-ba8f-4649-957f-202dee0e887e",
+  "junctions": [],
+  "labels": [
+    {
+      "id": "l1",
+      "pos": [
+        5.0,
+        0.0
+      ],
+      "scope": "global",
+      "sheet": "sh1",
+      "text": "PA0"
+    }
+  ],
+  "lib_cache": {
+    "MCU:STM32F407": {
+      "description": "MCU",
+      "libid": "MCU:STM32F407",
+      "name": "STM32F407",
+      "pins": [
+        {
+          "angle": 0.0,
+          "length": 0.0,
+          "name": "PA0",
+          "number": "1",
+          "pos": [
+            0.0,
+            0.0
+          ],
+          "type": "bidirectional",
+          "unit": 1
+        }
+      ],
+      "power": false,
+      "reference_prefix": "U",
+      "value": "STM32F407"
+    },
+    "Sensor:OUT": {
+      "description": "Sensor w/ push-pull out",
+      "libid": "Sensor:OUT",
+      "name": "SENS",
+      "pins": [
+        {
+          "angle": 0.0,
+          "length": 0.0,
+          "name": "OUT",
+          "number": "1",
+          "pos": [
+            0.0,
+            0.0
+          ],
+          "type": "output",
+          "unit": 1
+        }
+      ],
+      "power": false,
+      "reference_prefix": "S",
+      "value": "SENS"
+    }
+  },
+  "name": "t_rf15_sch",
+  "no_connect": [],
+  "power": [],
+  "schema": "aicad.sch/1",
+  "sheet_symbols": [],
+  "sheets": [
+    {
+      "id": "sh1",
+      "name": "root",
+      "parent": null,
+      "ports": [],
+      "size": [
+        297,
+        210
+      ]
+    }
+  ],
+  "symbols": [
+    {
+      "angle": 0.0,
+      "dnp": false,
+      "fields": {},
+      "footprint": "FP",
+      "id": "s1",
+      "in_bom": true,
+      "libid": "MCU:STM32F407",
+      "mirror": "none",
+      "on_board": true,
+      "pos": [
+        0.0,
+        0.0
+      ],
+      "ref": "U1",
+      "sheet": "sh1",
+      "unit": 1,
+      "value": "STM32F407"
+    },
+    {
+      "angle": 0.0,
+      "dnp": false,
+      "fields": {},
+      "footprint": "FP",
+      "id": "s2",
+      "in_bom": true,
+      "libid": "Sensor:OUT",
+      "mirror": "none",
+      "on_board": true,
+      "pos": [
+        10.0,
+        0.0
+      ],
+      "ref": "S1",
+      "sheet": "sh1",
+      "unit": 1,
+      "value": "SENS"
+    }
+  ],
+  "units": {
+    "grid": 2.54
+  },
+  "wires": [
+    {
+      "bus": false,
+      "id": "w1",
+      "pts": [
+        [
+          0.0,
+          0.0
+        ],
+        [
+          10.0,
+          0.0
+        ]
+      ],
+      "sheet": "sh1"
+    }
+  ]
+}

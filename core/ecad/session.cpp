@@ -25,6 +25,7 @@ namespace fs = std::filesystem;
 #include "ecad/erc.h"
 #include "ecad/fabformats.h"
 #include "ecad/impedance.h"
+#include "ecad/kicad.h"
 #include "ecad/netlist.h"
 #include "ecad/schema.h"
 #include "ecad/sync.h"
@@ -443,28 +444,57 @@ json ecad_save(const std::string& doc_id, const std::string& path) {
 
 json ecad_open(const std::string& path) {
     EcadLock lk;
-    EcadContainerDoc loaded = ecad_container_open(path);  // throws OpError on a bad file
 
-    if (!(schema::is_schematic(loaded.doc) || schema::is_board(loaded.doc))) {
-        std::string sch = loaded.doc.is_object() ? loaded.doc.value("schema", std::string()) : "";
+    // Dispatch by extension (engine/ecad/rpc.py::_ecad_open): KiCad files route to
+    // their S-expr importers; .ecad+/.ecad/.json and anything else falls through to
+    // the container open below. The Python ImportError ("not_available") branch does
+    // not exist here — the C++ importers are always linked.
+    std::string suffix;
+    {
+        const std::size_t dot = path.find_last_of('.');
+        suffix = dot == std::string::npos ? "" : path.substr(dot);
+        for (char& c : suffix) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    json doc;
+    std::map<std::string, std::string> extra_entries;
+    std::vector<std::string> load_warnings;
+    if (suffix == ".kicad_sch" || suffix == ".kicad_pcb") {
+        const char* which = suffix == ".kicad_sch" ? "import_kicad_sch" : "import_kicad_pcb";
+        try {
+            doc = suffix == ".kicad_sch" ? kicad::import_kicad_sch(path)
+                                         : kicad::import_kicad_pcb(path);
+        } catch (const std::exception& exc) {
+            throw OpError("io_error",
+                          std::string(which) + " failed for '" + path + "': " + exc.what(),
+                          {{"path", path}});
+        }
+    } else {
+        EcadContainerDoc loaded = ecad_container_open(path);  // throws OpError on a bad file
+        doc = std::move(loaded.doc);
+        extra_entries = std::move(loaded.extra);
+        load_warnings = std::move(loaded.warnings);
+    }
+
+    if (!(schema::is_schematic(doc) || schema::is_board(doc))) {
+        std::string sch = doc.is_object() ? doc.value("schema", std::string()) : "";
         throw OpError("invalid_op", "not an ECAD document (" + sch + ")",
                       {{"reason", "unknown schema"}});
     }
 
     Session s;
     s.doc_id = new_doc_id();
-    s.doc = loaded.doc;            // open_session deep-copies the doc
+    s.doc = doc;                   // open_session deep-copies the doc
     s.doc["id"] = s.doc_id;        // Python uses uuid4; the session id is faithful here
     s.revision = 0;
     s.path = path;
-    s.extra_entries = std::move(loaded.extra);
+    s.extra_entries = std::move(extra_entries);
     Session& stored = g_sessions[s.doc_id] = std::move(s);
 
     // ecad_open -> rebuild() (no op application, no rev bump) + doc_id + warnings.
     json resp = ops_response(stored, json::object(), json::array());
     resp["doc_id"] = stored.doc_id;
     json warnings = json::array();
-    for (const std::string& w : loaded.warnings) warnings.push_back(w);
+    for (const std::string& w : load_warnings) warnings.push_back(w);
     resp["warnings"] = warnings;
     return resp;
 }

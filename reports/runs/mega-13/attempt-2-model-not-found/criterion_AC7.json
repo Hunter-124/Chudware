@@ -1,8 +1,0 @@
-{
-  "id": "AC7",
-  "result": "NOT-CHECKED",
-  "check_tool": "fw_build",
-  "pass_rule": "returncode==0",
-  "detail": "check tool 'fw_build' could not be resolved (backend absent?)",
-  "evidence": {}
-}

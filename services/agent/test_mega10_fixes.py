@@ -155,68 +155,6 @@ def test_ac1_fail_when_battery_critical_zeros(monkeypatch):
     assert results["AC1"] != re.NOT_CHECKED
 
 
-def test_run_reviewer_checks_battery_before_acs(monkeypatch):
-    """VERIFY path: battery first, AC1 reuses battery_payload (order + wiring)."""
-    from services.agent import loop as loop_mod
-
-    order: list[str] = []
-
-    def _bat(ledger, *, doc_id=None, actor="reviewer"):
-        order.append(f"battery:{doc_id}")
-        payload = {
-            "verdict": "PASS",
-            "ok": True,
-            "checks": [{"name": "is_manifold", "verdict": "PASS", "score": 1.0}],
-            "doc_id": doc_id,
-            "evidence": {
-                "scores": {"is_manifold": 1.0, "eval_check": 1.0},
-                "findings": [],
-            },
-        }
-        ledger.append(actor, "battery_result", payload)
-        return payload
-
-    def _acs(manifest, ledger, *, doc_id=None, actor="reviewer",
-             battery_payload=None):
-        order.append(f"acs:{doc_id}")
-        assert battery_payload is not None, "AC sweep must receive battery_payload"
-        assert battery_payload.get("doc_id") == "doc-cpp9"
-        # Grade AC1 from battery like production path.
-        from services.agent.reviewer_exec import evaluate_pass_rule, PASS
-        ev = battery_payload.get("evidence") or battery_payload
-        v, d = evaluate_pass_rule("PASS", ev)
-        ledger.add_criterion_result(
-            actor, "AC1", v, check_tool="verify_battery",
-            pass_rule="PASS", detail=d, evidence={"source": "battery_result"},
-        )
-        return {"AC1": v}
-
-    monkeypatch.setattr("services.agent.reviewer_exec.run_verify_battery", _bat)
-    monkeypatch.setattr("services.agent.reviewer_exec.run_acceptance_checks", _acs)
-    monkeypatch.setattr(
-        "services.agent.reviewer_exec.resolve_mission_doc_id",
-        lambda **kw: "doc-cpp9",
-    )
-
-    led = _MemLedger()
-    manifest = {
-        "deliverables": [{
-            "id": "DL1",
-            "acceptance_criteria": [{
-                "id": "AC1",
-                "check": {"tool": "verify_battery", "pass_rule": "PASS"},
-            }],
-        }],
-    }
-    loop_mod._run_reviewer_checks(manifest, led, {"nodes": {}})
-    assert order == ["battery:doc-cpp9", "acs:doc-cpp9"], order
-    ac1 = next(
-        e for e in led.events
-        if e["kind"] == "criterion_result" and e["payload"].get("id") == "AC1"
-    )
-    assert ac1["payload"]["result"] == "PASS"
-
-
 def test_interference_pass_rule_mechanical():
     from services.agent.reviewer_exec import evaluate_pass_rule, FAIL, PASS
 

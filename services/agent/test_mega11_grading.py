@@ -594,26 +594,6 @@ def test_gradeable_count_at_least_six():
     assert gradeable == 9
 
 
-def test_skip_is_gate_ok():
-    """VERIFY gate and _failing_criteria treat SKIP as non-failing."""
-    from services.agent.loop import _failing_criteria
-    from services.agent.pipeline.phases import PhaseMachine, Phase
-
-    led = _MemLedger()
-    led.add_criterion_result("reviewer", "AC6", "SKIP", check_tool="ecad_antenna_analyze")
-    led.add_criterion_result("reviewer", "AC8", "SKIP", check_tool="fw_sim_run")
-    led.add_criterion_result("reviewer", "AC3", "PASS", check_tool="check_interference")
-    failing = _failing_criteria(None, led, ["AC3", "AC6", "AC8"])
-    assert failing == []
-
-    machine = PhaseMachine()
-    g = machine.run_gate(Phase.VERIFY, {
-        "criterion_results": {"AC3": "PASS", "AC6": "SKIP", "AC8": "SKIP"},
-        "waived_criteria": [],
-    })
-    assert g.passed, g
-
-
 def test_end_to_end_ac_sweep_mixed(monkeypatch):
     """Full run_acceptance_checks over composition ACs with mocked tools."""
     from services.agent import reviewer_exec as re

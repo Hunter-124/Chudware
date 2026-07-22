@@ -1,3 +1,0 @@
-a1 primary graded: terminal blocked mech_force_add_features_failed (box f5);
-live AC 4/9 (AC3/6/7/8); P22/Q22 FAIL (ECAD starved); R22 PARTIAL.
-Archived before Fixer22 rebind + a2 relaunch.

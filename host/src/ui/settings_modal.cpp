@@ -25,7 +25,7 @@
 #include "../core/fs_backend.h"
 #include "../core/cpp_core.h"
 #include "../renderer.h"
-#include "legacy_chat.h"  // ui::drawAiSettingsSection (glass-grouped AI tab sections)
+#include "copilot/copilot.h"  // ui::drawAiSettingsSection (glass-grouped AI tab sections)
 #include "model_registry.h"  // ui::localPresets (experimental vision-review model presets)
 #include "leaderboard_ui.h"  // aicad.leaderboard/1 compact table (Settings > Benchmarks)
 #include "oauth_capture.h"  // in-app xAI multi-account CEF OAuth (Settings → Accounts)

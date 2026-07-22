@@ -1,6 +1,6 @@
 // host/src/ui/model_registry.h — the copilot model catalog + capability flags.
 //
-// Header-only so both settings_modal.cpp and legacy_chat.cpp can share it without a
+// Header-only so both settings_modal.cpp and copilot/settings.cpp can share it without a
 // build-file change. Drives the "model picker": which models exist per provider, whether
 // a model supports a reasoning-effort control, and whether it can see screenshots (vision).
 // Live availability (key present / endpoint reachable / which local models are loaded) is

@@ -386,7 +386,7 @@ stage_appimage_smoke() {
 #   engine_oracle/doc/test_aicm.py        — REMOVED from ignores (T-V3: OCP now installed; collects cleanly)
 #   engine_oracle/sim/test_foam_case.py   — REMOVED from ignores (T-V4: trimesh now installed; 14 tests collect)
 #   engine_oracle/sim/test_lbm.py         — REMOVED from ignores (T-V4: trimesh now installed; collects cleanly)
-#   services/agent/test_loop_mock.py      — KEPT: hardcoded path to services/engine/samples/mounting_plate.py missing (pre-existing, not a dep gap)
+#   services/agent/test_loop_mock.py      — file DELETED in T-RF5 (legacy agent loop removed)
 #
 # Pre-existing test failures inside the collected suites are RECORDED (non-fatal) here,
 # matching the check.py FAIL-RECORDED policy. Only a hard collection crash or a zero-
@@ -463,7 +463,7 @@ stage_pytest() {
         # T-V2/T-V3 tracked ignores: collection-error files that poison the whole run.
         # engine_oracle/doc/test_aicm.py was removed (T-V3): OCP now installed, collects cleanly.
         # T-V4: foam_case and lbm ignores removed — trimesh now installed, both collect cleanly.
-        [ -f "services/agent/test_loop_mock.py" ]     && ignore_args+=(--ignore=services/agent/test_loop_mock.py)
+        # (test_loop_mock.py ignore removed in T-RF5 — the file was deleted with the legacy loop.)
         # T-Q2: test_autosave_recovery must be collected via mcp_server/ (not services/)
         # because it imports mcp_server.cad_tools; from services/ the 'mcp' name resolves
         # to the services/mcp/ package and shadows mcp.server.fastmcp (collection crash).
@@ -509,7 +509,7 @@ stage_pytest() {
     done
 
     echo "  total collected ≈ $total_collected tests across ${#dirs[@]} dirs"
-    record "pytest              total ≈ $total_collected collected | $total_passed passed | ignoring 1 file (test_loop_mock.py: missing fixture path, pre-existing; T-V4: foam_case+lbm+test_aicm ignores removed — trimesh+OCP now installed)"
+    record "pytest              total ≈ $total_collected collected | $total_passed passed | (T-V4: foam_case+lbm+test_aicm ignores removed — trimesh+OCP now installed; T-RF5: test_loop_mock.py deleted with the legacy loop)"
 
     if [ "$any_hard_fail" -ne 0 ]; then
         record "pytest              FAIL    one or more dirs had a hard collection crash (rc≥2)"

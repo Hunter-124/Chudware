@@ -29,59 +29,6 @@ static void failJobFromEscapedException(JobState& job, const std::string& what) 
     job.running = false;
 }
 
-// Map a GUI / wire provider id to the subscription_ensure_fresh RPC id, or "" when
-// the provider is NOT subscription-auth (API key / local / gemini / etc. — skip).
-// Accepts friendly + *-sub names so launch paths and config.json both work.
-static std::string subscriptionEnsureProvider(const std::string& provider) {
-    if (provider == "xai-sub" || provider == "xai") return "xai";
-    if (provider == "anthropic-sub" || provider == "claude" || provider == "anthropic")
-        return "claude";
-    if (provider == "cursor-sub" || provider == "cursor") return "cursor";
-    if (provider == "codex-sub" || provider == "codex") return "codex";
-    if (provider == "kimi-sub" || provider == "kimi") return "kimi";
-    return {};
-}
-
-// Pre-run: ask Python (single token-refresh writer) to refresh a stale subscription
-// access token before the C++ agent reads it read-only. 10s hard timeout; transport
-// failure / unknown_method → proceed (don't brick runs when the worker is down).
-// Returns false only when Python reported {ok:false} (refresh failed → re-auth).
-static bool ensureSubscriptionFreshBeforeRun(WorkerClient& w, JobState& job,
-                                             const nlohmann::json& extra) {
-    std::string prov;
-    if (extra.is_object() && extra.contains("provider") && extra["provider"].is_string())
-        prov = extra["provider"].get<std::string>();
-    const std::string sub = subscriptionEnsureProvider(prov);
-    if (sub.empty()) return true;  // not a subscription provider
-    if (!w.started()) return true;  // can't refresh; let the run fail later if needed
-
-    nlohmann::json freshen;
-    std::string ferr;
-    const bool ok = w.call("subscription_ensure_fresh",
-                           nlohmann::json{{"provider", sub}},
-                           freshen, ferr, /*timeoutMs=*/10000);
-    if (!ok) {
-        // Transport / timeout / unknown_method — degrade gracefully.
-        return true;
-    }
-    if (!freshen.is_object()) return true;
-    if (freshen.value("ok", true)) return true;
-
-    std::string detail = freshen.value("error", std::string());
-    if (detail.empty()) detail = freshen.value("reason", std::string());
-    if (detail.empty())
-        detail = "Subscription auth expired — re-authenticate via Settings → AI → Accounts.";
-    {
-        std::lock_guard<std::mutex> lk(job.mtx);
-        job.error = detail;
-        job.errorDetail = detail;
-        job.errorIsCad = false;
-        job.converged = false;
-        job.stopReason = "provider_auth";
-    }
-    return false;
-}
-
 // --- C22b: agent_run_v2 launcher ---
 // Runs agent_run_v2 on a background thread. Orchestrator events arrive via the EventFn
 // callback with kind = "run_started" / "stage_started" / etc.  We push them into
@@ -176,14 +123,8 @@ void launchAgentRunV2(WorkerClient& w, JobState& job,
             job.events.push_back(std::move(e));
         };
 
-        // Refresh stale subscription tokens BEFORE agent_run_v2 (C++ reads tokens
-        // read-only; Python is the single writer). Auth failure → stop_reason=provider_auth.
-        if (!ensureSubscriptionFreshBeforeRun(w, job, extra)) {
-            std::lock_guard<std::mutex> lk(job.mtx);
-            job.ready = true;
-            job.running = false;
-            return;
-        }
+        // (T-RF4: subscription token refresh moved INTO the C++ core —
+        // agent/auth.cpp refreshes at resolve_provider time; no Python RPC here.)
 
         // options.cam (true when launched from the Manufacture workspace) lets the core's
         // CAM fast-path treat a generic "make a program" as a CAM request on the current part.
@@ -354,203 +295,6 @@ void launchAgentRunV2(WorkerClient& w, JobState& job,
     }).detach();
 }
 
-// --- Cursor / legacy Python agent_design launcher ---
-// Packs worker event data into AgentEvent fields the way the historical launchJob did
-// (status / plan / iteration → chat steps + livePhase). NOT orch_-prefixed: app.cpp routes
-// bare kinds to the legacy chat path; ActivityPanel only consumes orch_*.
-void launchAgentDesign(WorkerClient& w, JobState& job,
-                       const std::string& request, const std::string& docId,
-                       const nlohmann::json& extra) {
-    if (job.running.exchange(true)) return;
-    job.ready = false;
-    job.kind = JOB_DESIGN;
-    {
-        std::lock_guard<std::mutex> lk(job.mtx);
-        job.error.clear(); job.stl.clear(); job.info.clear();
-        job.errorIsCad = false;
-        job.isAssembly = false; job.parts.clear(); job.fit = FitReport{};
-        job.converged = true; job.stopReason.clear(); job.errorDetail.clear();
-        job.createdDocPath.clear();
-        job.drawingDocId.clear(); job.drawingName.clear(); job.drawingSourceId.clear();
-        job.camDocId.clear();
-        job.partName.clear();
-        job.savedPath.clear();
-        job.finalRevision = 0;
-        job.isMission = false; job.missionVerdict.clear();
-        job.missionPartial = false;
-        job.missionTasksCompleted = 0;
-        job.missionTasksFailed = 0;
-        job.missionTasksTotal = 0;
-        job.planReady = false; job.planReadyJson.clear();
-    }
-    { std::lock_guard<std::mutex> lk(job.evMtx); job.events.clear(); }
-
-    // Failure honesty: Cursor needs the Python subprocess (CursorSubProvider lives there).
-    // With C++ agent default-on, agent_run_v2 never hits Python; if the worker was never
-    // started, fail loud instead of "worker not started" silence later.
-    if (!w.started()) {
-        {
-            std::lock_guard<std::mutex> lk(job.mtx);
-            job.error = "Cursor runs require the Python worker — not available";
-            job.errorIsCad = false;
-            job.converged = false;
-            job.stopReason = "provider_unavailable";
-        }
-        job.ready = true;
-        job.running = false;
-        return;
-    }
-
-    std::thread([&w, &job, request, docId, extra]() {
-        nlohmann::json result;
-        std::string err;
-        try {
-
-        WorkerClient::EventFn onEvent = [&job](const nlohmann::json& d) {
-            AgentEvent e;
-            e.kind = jstr(d, "kind");
-            e.index = jint(d, "index");
-            e.ok = jbool(d, "ok");
-            e.done = jbool(d, "done");
-            e.phase = jstr(d, "phase");
-            e.text = jstr(d, "text");
-            e.notes = jstr(d, "notes");
-            e.thinking = jstr(d, "thinking");
-            e.code = jstr(d, "code");
-            e.diff = jstr(d, "diff");
-            e.dims = jstr(d, "dims");
-            e.error = jstr(d, "error");
-            // Prefer error_detail when the loop surfaces a classified provider failure.
-            if (e.error.empty()) e.error = jstr(d, "error_detail");
-            e.contactSheet = jstr(d, "contact_sheet");
-            e.stlPath = jstr(d, "stl_path");
-            e.stdoutText = jstr(d, "stdout");
-            e.isAssembly = jbool(d, "is_assembly");
-            if (auto it = d.find("parts"); it != d.end()) e.parts = parseParts(*it);
-            if (auto it = d.find("fit"); it != d.end()) e.fit = parseFit(*it);
-            if (auto it = d.find("plan"); it != d.end()) e.plan = parsePlan(*it);
-            // status with phase=error: surface stop_reason in notes for the live line.
-            if (e.kind == "status" && e.phase == "error") {
-                std::string sr = jstr(d, "stop_reason");
-                if (!sr.empty() && e.notes.empty()) e.notes = sr;
-            }
-            std::lock_guard<std::mutex> lk(job.evMtx);
-            job.events.push_back(std::move(e));
-        };
-
-        nlohmann::json params = {
-            {"request", request},
-            {"name", "gui_design"},
-            {"session_id", "gui_design"},
-            {"reset", true},
-            {"plan", true},
-        };
-        // doc_id is accepted by the contract (context) even though the legacy loop is
-        // build123d-scoped; harmless if ignored.
-        if (!docId.empty()) params["doc_id"] = docId;
-        // Mode overhaul: options.mode / plan_only / corporate_force / … under options.
-        nlohmann::json opts = nlohmann::json::object();
-        opts["advisor"] = true;
-        if (extra.is_object() && extra.contains("options") && extra["options"].is_object()) {
-            for (auto it = extra["options"].begin(); it != extra["options"].end(); ++it)
-                opts[it.key()] = it.value();
-        }
-        params["options"] = std::move(opts);
-        if (extra.is_object())
-            for (auto it = extra.begin(); it != extra.end(); ++it)
-                if (it.key() != "options" && !params.contains(it.key()))
-                    params[it.key()] = it.value();
-
-        // Cursor (and any other sub provider on this path) — refresh before design.
-        if (!ensureSubscriptionFreshBeforeRun(w, job, extra)) {
-            std::lock_guard<std::mutex> lk(job.mtx);
-            job.ready = true;
-            job.running = false;
-            return;
-        }
-
-        bool ok = w.call("agent_design", params, result, err, 900000, onEvent);
-        std::lock_guard<std::mutex> lk(job.mtx);
-        if (!ok) {
-            // Transport / "worker not started" / write failure.
-            if (err.find("worker not started") != std::string::npos)
-                job.error = "Cursor runs require the Python worker — not available";
-            else
-                job.error = err.empty() ? "agent_design call failed" : err;
-            job.errorIsCad = false;
-            job.converged = false;
-        } else if (result.is_object() && result.contains("code") && !result.value("ok", true)) {
-            // Structured protocol-2 method error envelope.
-            job.error = result.value("message", std::string("agent_design error"));
-            job.errorIsCad = false;
-            job.converged = false;
-        } else if (result.is_object() && result.contains("success") &&
-                   !result.value("success", true)) {
-            // Provider / loop failure returned as a normal RPC result (success:false).
-            std::string detail = result.value("error_detail", std::string());
-            if (detail.empty()) detail = result.value("error", std::string("agent_design failed"));
-            job.error = detail;
-            job.errorIsCad = false;
-            job.converged = false;
-            job.stopReason = result.value("stop_reason", std::string("provider_error"));
-        } else {
-            nlohmann::json mr = (result.contains("result") && result["result"].is_object())
-                                    ? result["result"] : nlohmann::json::object();
-            if (!mr.empty() && !mr.value("ok", true) && mr.contains("error")) {
-                // CAD script didn't build — modeling problem, not app failure.
-                job.error = mr.value("error", "The CAD code didn't produce a solid.");
-                job.errorIsCad = true;
-                job.converged = result.value("converged", false);
-                job.stopReason = result.value("stop_reason", std::string());
-            } else {
-                job.stl = mr.value("stl_path", std::string());
-                char buf[256] = "";
-                auto bb = mr.value("bbox", nlohmann::json::object());
-                if (bb.is_object() && bb.contains("size") && bb["size"].is_array() &&
-                    bb["size"].size() >= 3) {
-                    auto sz = bb["size"];
-                    std::snprintf(buf, sizeof(buf),
-                                  "%.1f x %.1f x %.1f mm  |  %.0f mm\xc2\xb3",
-                                  sz[0].get<double>(), sz[1].get<double>(),
-                                  sz[2].get<double>(), mr.value("volume", 0.0));
-                }
-                job.info = buf;
-                if (!job.info.empty())
-                    job.info += "  |  " + std::to_string(result.value("iterations", 0)) +
-                                " iters";
-                else
-                    job.info = std::to_string(result.value("iterations", 0)) + " iters";
-                job.converged = result.value("converged", true);
-                job.stopReason = result.value("stop_reason", std::string());
-                job.isAssembly = mr.value("is_assembly", false);
-                if (job.isAssembly) {
-                    job.parts = parseParts(mr.value("parts", nlohmann::json::array()));
-                    job.fit = parseFit(mr.value("fit", nlohmann::json::object()));
-                }
-                // success:true but no solid (e.g. no_code / max_iters with empty result)
-                if (job.stl.empty() && !job.converged) {
-                    std::string detail = result.value("error_detail", std::string());
-                    if (detail.empty() && !job.stopReason.empty())
-                        detail = "stopped: " + job.stopReason;
-                    if (!detail.empty()) {
-                        job.error = detail;
-                        job.errorIsCad = (job.stopReason == "failed" ||
-                                          job.stopReason == "no_code" ||
-                                          job.stopReason == "max_iters");
-                    }
-                }
-            }
-        }
-        job.ready = true;
-        job.running = false;
-        } catch (const std::exception& e) {
-            failJobFromEscapedException(job, e.what());
-        } catch (...) {
-            failJobFromEscapedException(job, "unknown exception");
-        }
-    }).detach();
-}
-
 // --- Mission orchestrator launcher (see jobs.h) ---
 // A near-clone of launchAgentRunV2: same background thread + "orch_"-prefixed event streaming,
 // but calls agent_mission_v1 and captures the verdict + any assembly tab to open. The mission
@@ -585,14 +329,8 @@ void launchMissionRun(WorkerClient& w, JobState& job,
         std::string err;
         try {
 
-        // Refresh stale subscription tokens BEFORE agent_mission_v1 (C++ reads tokens
-        // read-only; Python is the single writer). Same pre-run hook as agent_run_v2 /
-        // design — without it a mission/swarm/eng-firm run 403s on an expired OAuth token.
-        if (!ensureSubscriptionFreshBeforeRun(w, job, extra)) {
-            job.ready = true;
-            job.running = false;
-            return;
-        }
+        // (T-RF4: subscription token refresh moved INTO the C++ core —
+        // agent/auth.cpp refreshes at resolve_provider time; no Python RPC here.)
         WorkerClient::EventFn onEvent = [&job](const nlohmann::json& d) {
             AgentEvent e;
             std::string origKind = jstr(d, "kind");

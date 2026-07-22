@@ -63,6 +63,7 @@ inline void wasmBootDom(const char* msg) {
 #include <unistd.h>
 #endif
 
+#include "app_commands.h"  // T-RF11: ribbon command router (dispatchCmd family table)
 #include "bootstrap.h"
 #include "mesh.h"
 #include "renderer.h"
@@ -91,7 +92,7 @@ inline void wasmBootDom(const char* msg) {
 #include "ui/feature_tree.h"
 #include "ui/file_explorer.h"  // Wave 3: File Explorer + workspace/recent helpers
 #include "ui/layout.h"        // Wave 1C/1D: buildDefaultLayout + tabbed left pane (drawLeftPane)
-#include "ui/legacy_chat.h"
+#include "ui/copilot/copilot.h"
 #include "ui/ai/ai_workspace.h"   // AI workspace full-body hub (sessions + DAG + chat + settings)
 #include "ui/reveng/reveng_workspace.h"  // Reverse Engineering workspace full-body shell (RE-03)
 #include "ui/firmware/fw_workspace.h"    // T-FIN5 Firmware workspace (drawFirmwareWorkspace + shot fixture)
@@ -676,6 +677,99 @@ static void exportFlatDxf(AppState& st) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// T-RF11: app-level ribbon command handlers. These were inline blocks in dispatchCmd's if-chain;
+// they stay here (app-level policy) and are registered into the CommandRouter (app_commands.cpp)
+// through RibbonCommandHooks, in the original chain order.
+// ---------------------------------------------------------------------------
+
+// Wave 4C/4D: Edit-menu copy / cut / paste. The menu bar fires these ids; they route exactly like
+// the global Ctrl+C/X/V keys (sketch first when active, else the FeatureManager). They are
+// registered AFTER the sketch onRibbonCommand hook so an armed sketch tool doesn't swallow them —
+// these ids are never sketch-tool ids, so onRibbonCommand returns false for them.
+static bool cmdEditCopy(AppState& st, const std::string& /*cmd*/) {
+    ui::SketchMode& sketchMode = *st.sketchMode;
+    if (sketchMode.active()) { if (sketchMode.sketchHasSelection()) sketchMode.sketchCopySelection(st); }
+    else ui::featureCopySelection(st);
+    return true;
+}
+static bool cmdEditCut(AppState& st, const std::string& /*cmd*/) {
+    // Sketch mode has no cut (Delete removes entities); cut applies to the FeatureManager.
+    ui::SketchMode& sketchMode = *st.sketchMode;
+    if (!sketchMode.active()) ui::featureCutSelection(st);
+    return true;
+}
+static bool cmdEditPaste(AppState& st, const std::string& /*cmd*/) {
+    ui::SketchMode& sketchMode = *st.sketchMode;
+    if (sketchMode.active() &&
+        st.clipboard.kind == AppState::Clipboard::Kind::SketchEntities)
+        sketchMode.sketchPasteBegin(st);
+    else if (st.clipboard.kind == AppState::Clipboard::Kind::Feature)
+        ui::featurePasteSelection(st);
+    return true;
+}
+// Wave-5-fill: Edit > Delete / Select All. featureDeleteSelection applies a DocMirror op
+// immediately; that is safe here because the dispatcher runs BEFORE the FeatureManager tree walk
+// this frame, so no tree-json iteration is live. Both stand down while a sketch is active
+// (SketchMode owns the sketch-entity Del / marquee); with no sketch they act on the
+// FeatureManager selection.
+static bool cmdEditDelete(AppState& st, const std::string& /*cmd*/) {
+    ui::SketchMode& sketchMode = *st.sketchMode;
+    if (!sketchMode.active()) ui::featureDeleteSelection(st);
+    return true;
+}
+static bool cmdEditSelectAll(AppState& st, const std::string& /*cmd*/) {
+    ui::SketchMode& sketchMode = *st.sketchMode;
+    if (!sketchMode.active()) ui::featureSelectAll(st);
+    return true;
+}
+
+// DRAWINGS: "Make Drawing" creates a drawing + standard views from the active part and opens it
+// as a Drawing tab (guarded; toasts if no part is open).
+static bool cmdMakeDrawing(AppState& st, const std::string& cmd) {
+    if (cmd == "make_drawing") { st.makeDrawing(); return true; }
+    return false;
+}
+
+// Appearance tab: Display group (cheap — the viewport applies st.displayStyle each frame).
+static bool cmdDisplayStyle(AppState& st, const std::string& cmd) {
+    int ds = -1;
+    if      (cmd == "display_shaded")       ds = 0;
+    else if (cmd == "display_shaded_edges") ds = 1;
+    else if (cmd == "display_hlr")          ds = 2;
+    else if (cmd == "display_hlv")          ds = 3;
+    else if (cmd == "display_wireframe")    ds = 4;
+    if (ds < 0) return false;
+    st.displayStyle = ds;
+    return true;
+}
+
+// Appearance tab: Material group (set_appearance on body "b1").
+static bool cmdAppearance(AppState& st, const std::string& cmd) {
+    if (cmd == "appr_color") { st.requestAppearanceEditor = true; return true; }
+    if (cmd == "appr_clear") { applyModelAppearance(st, nullptr, 0.0f, 0.5f); return true; }
+    int mi = -1;
+    if      (cmd == "appr_mat_plastic")  mi = 0;
+    else if (cmd == "appr_mat_aluminum") mi = 1;
+    else if (cmd == "appr_mat_steel")    mi = 2;
+    else if (cmd == "appr_mat_brass")    mi = 3;
+    else if (cmd == "appr_mat_dark")     mi = 4;
+    if (mi < 0) return false;
+    const ui::MaterialPreset& m = ui::kMaterials[mi];
+    applyModelAppearance(st, m.rgb, m.metallic, m.roughness);
+    return true;
+}
+
+// Sheet Metal one-clicks (W16 Flatten / W14 flat-pattern DXF) — no PM form.
+static bool cmdFlatPattern(AppState& st, const std::string& cmd) {
+    if (cmd == "sm_flat_pattern") { applyFlatPattern(st); return true; }
+    return false;
+}
+static bool cmdFlatDxf(AppState& st, const std::string& cmd) {
+    if (cmd == "sm_export_flat_dxf") { exportFlatDxf(st); return true; }
+    return false;
+}
+
 // Wave-5-fill / F4: File > Export <fmt> — export the ACTIVE part/assembly's bodies to a 3D format
 // engine.doc.formats.export_document accepts ("step"|"iges"|"stl"|"3mf"|"brep"|"obj"|"ply"|"gltf"|
 // "glb"; see engine/doc/formats.py FORMAT_REGISTRY / doc_formats RPC). Picks a path (native Save-As,
@@ -1044,7 +1138,7 @@ static void wasmApplyMobileLayout(AppState& st, float& scale, bool mobile) {
     }
 }
 
-// Keep the layout.cpp / legacy_chat static collapse flags in sync with settings while mobile.
+// Keep the layout.cpp / copilot static collapse flags in sync with settings while mobile.
 // Those columns seed once from settings on first draw; after that they own a local bool. Writing
 // settings alone is not enough once they've drawn, so we re-assert via settings every frame and
 // also set the statics indirectly: the columns already write settings on chevron click, and they
@@ -1528,16 +1622,16 @@ WASM_BOOT_LOG("[wasm-boot] loadIcons done\n");
     // C17/C18: SINGLE ribbon-command dispatcher. The ribbon callback and st.ribbonDispatch (used by
     // the shortcut bar / gesture wheel) route through the SAME lambda so the two paths can never
     // drift apart — they were previously hand-duplicated (Wave 1B unification).
-    //   - sketch-tab commands (sketch_new / sk_* / smart_dim / sketch_exit) go to SketchMode first
-    //     so the sketch experience takes priority over any PM form for those ids;
-    //   - commands without a form log a stub line so they stay observable until later cards wire them.
-    auto dispatchCmd = [&st, &asmPanels](const char* cmd_id) {
-        // Multi-document: resolve the PropertyManager / SketchMode / EvaluateDialogs of the ACTIVE
-        // document (st.* are re-seated on every tab switch). Shadowing the names keeps the dispatch
-        // body below byte-identical to the single-document version.
-        ui::PropertyManager& propertyManager = *st.propertyManager;
-        ui::SketchMode&      sketchMode      = *st.sketchMode;
-        ui::EvaluateDialogs& evaluateDialogs = *st.evaluateDialogs;
+    //   - App-level policy stays here: prof_toggle, the Simulation lockout (runs before family
+    //     routing), PM-cancel-on-sketch_new, and the unhandled-stub log.
+    //   - T-RF11: every command FAMILY (sketch, edit_*, dwg_, display_/appr_, asm_, ecad_/sch_/pcb_,
+    //     cam_, reveng_, PM forms, sm_, sim_, eval_) lives in an ordered rule table built by
+    //     buildRibbonCommandRouter (app_commands.cpp); registration order reproduces the original
+    //     if-chain exactly, including its fall-through cases.
+    auto dispatchCmd = [&st](const char* cmd_id) {
+        // Multi-document: handlers resolve the PropertyManager / SketchMode / EvaluateDialogs of
+        // the ACTIVE document through the AppState& they are handed (st.* are re-seated on every
+        // tab switch), so no per-call shadowing locals are needed here anymore.
         // Evaluate > Profiler: global, document-independent — handle before any lockout so it can be
         // toggled at any time (including mid-edit, which is exactly when you want to profile).
         if (std::strcmp(cmd_id, "prof_toggle") == 0) { st.showProfilerWindow = true; return; }
@@ -1571,114 +1665,19 @@ WASM_BOOT_LOG("[wasm-boot] loadIcons done\n");
         // C43: starting a sketch while a PM form is open cancels the form first (revert
         // preview + close). Without this, plane-pick and the PM coexisted: the PM hid the
         // FeatureManager, both fought over the viewport mouse, and Esc couldn't untangle it.
-        if (propertyManager.active() && std::strcmp(cmd_id, "sketch_new") == 0)
-            propertyManager.cancelEdits(st);
-        if (sketchMode.onRibbonCommand(st, cmd_id)) return;       // C18 sketch tool handled
-        // 3D sketch entry point + exit (all in-mode tools live on the viewport overlay toolbar).
-        if (st.sketch3dMode && st.sketch3dMode->onRibbonCommand(st, cmd_id)) return;
-        // Wave 4C/4D: Edit-menu copy / cut / paste. The menu bar fires these ids; they route exactly
-        // like the global Ctrl+C/X/V keys (sketch first when active, else the FeatureManager). Copy
-        // routed AFTER onRibbonCommand so an armed sketch tool doesn't swallow "edit_copy" — these
-        // ids are never sketch-tool ids, so onRibbonCommand returns false for them.
-        if (std::strcmp(cmd_id, "edit_copy") == 0) {
-            if (sketchMode.active()) { if (sketchMode.sketchHasSelection()) sketchMode.sketchCopySelection(st); }
-            else ui::featureCopySelection(st);
-            return;
-        }
-        if (std::strcmp(cmd_id, "edit_cut") == 0) {
-            // Sketch mode has no cut (Delete removes entities); cut applies to the FeatureManager.
-            if (!sketchMode.active()) ui::featureCutSelection(st);
-            return;
-        }
-        if (std::strcmp(cmd_id, "edit_paste") == 0) {
-            if (sketchMode.active() &&
-                st.clipboard.kind == AppState::Clipboard::Kind::SketchEntities)
-                sketchMode.sketchPasteBegin(st);
-            else if (st.clipboard.kind == AppState::Clipboard::Kind::Feature)
-                ui::featurePasteSelection(st);
-            return;
-        }
-        // Wave-5-fill: Edit > Delete / Select All. Like cut/copy/paste these route through the SAME
-        // lambda the menu shares. featureDeleteSelection applies a DocMirror op immediately; that is
-        // safe here because the menu bar draws BEFORE the FeatureManager tree walk this frame, so no
-        // tree-json iteration is live. Both stand down while a sketch is active (SketchMode owns the
-        // sketch-entity Del / marquee); with no sketch they act on the FeatureManager selection.
-        if (std::strcmp(cmd_id, "edit_delete") == 0) {
-            if (!sketchMode.active()) ui::featureDeleteSelection(st);
-            return;
-        }
-        if (std::strcmp(cmd_id, "edit_select_all") == 0) {
-            if (!sketchMode.active()) ui::featureSelectAll(st);
-            return;
-        }
-        // DRAWINGS: "Make Drawing" creates a drawing + standard views from the active part and
-        // opens it as a Drawing tab (guarded; toasts if no part is open).
-        if (std::strcmp(cmd_id, "make_drawing") == 0) { st.makeDrawing(); return; }
-        // W17 drawing overhaul: View Layout / Annotation ribbon commands route to the 2D panel.
-        if (std::strncmp(cmd_id, "dwg_", 4) == 0 && ui::drawingHandleCommand(st, std::string(cmd_id)))
-            return;
-        // ---- Appearance tab: Display group (cheap — viewport applies st.displayStyle each frame) ----
-        {
-            int ds = -1;
-            if      (std::strcmp(cmd_id, "display_shaded")       == 0) ds = 0;
-            else if (std::strcmp(cmd_id, "display_shaded_edges") == 0) ds = 1;
-            else if (std::strcmp(cmd_id, "display_hlr")          == 0) ds = 2;
-            else if (std::strcmp(cmd_id, "display_hlv")          == 0) ds = 3;
-            else if (std::strcmp(cmd_id, "display_wireframe")    == 0) ds = 4;
-            if (ds >= 0) { st.displayStyle = ds; return; }
-        }
-        // ---- Appearance tab: Material group (set_appearance on body "b1") ----
-        if (std::strcmp(cmd_id, "appr_color") == 0) { st.requestAppearanceEditor = true; return; }
-        if (std::strcmp(cmd_id, "appr_clear") == 0) { applyModelAppearance(st, nullptr, 0.0f, 0.5f); return; }
-        {
-            int mi = -1;
-            if      (std::strcmp(cmd_id, "appr_mat_plastic")  == 0) mi = 0;
-            else if (std::strcmp(cmd_id, "appr_mat_aluminum") == 0) mi = 1;
-            else if (std::strcmp(cmd_id, "appr_mat_steel")    == 0) mi = 2;
-            else if (std::strcmp(cmd_id, "appr_mat_brass")    == 0) mi = 3;
-            else if (std::strcmp(cmd_id, "appr_mat_dark")     == 0) mi = 4;
-            if (mi >= 0) {
-                const ui::MaterialPreset& m = ui::kMaterials[mi];
-                applyModelAppearance(st, m.rgb, m.metallic, m.roughness);
-                return;
-            }
-        }
-        // C20b: Assembly tab + New Assembly route to the assembly panels first.
-        {
-            std::string cmd(cmd_id);
-            if ((cmd.rfind("asm_", 0) == 0 || cmd == "new_assembly") &&
-                asmPanels.handleCommand(st, cmd)) return;
-        }
-        // Wave N: AI-ECAD commands (ecad_/sch_/pcb_) route to the ECAD editor.
-        {
-            std::string ec(cmd_id);
-            if (ec.rfind("ecad_", 0) == 0 || ec.rfind("sch_", 0) == 0 || ec.rfind("pcb_", 0) == 0) {
-                st.showPcbTools = true;
-                ecadDispatch(st, ec); return;
-            }
-        }
-        // CAM (Manufacture workspace): cam_* commands route to the CAM manager panel.
-        {
-            std::string cc(cmd_id);
-            if (cc.rfind("cam_", 0) == 0) { ui::camHandleCommand(st, cc); return; }
-        }
-        // Reverse Engineering workspace: reveng_* commands route to the RE workspace controller
-        // (stage navigation + async kicks; contracts/reveng.md).
-        {
-            std::string rc(cmd_id);
-            if (rc.rfind("reveng_", 0) == 0 && ui::reveng::handleRevEngCommand(st, rc.c_str()))
-                return;
-        }
-        if (propertyManager.openForCommand(st, cmd_id)) return;  // form opened
-        // C19: Simulation tab -> sim panel; Evaluate tab -> evaluate dialogs.
-        std::string cmd(cmd_id);
-        if (cmd == "sm_flat_pattern") { applyFlatPattern(st); return; }  // W16: one-click Flatten
-        if (cmd == "sm_export_flat_dxf") { exportFlatDxf(st); return; }  // W14: flat-pattern DXF
-        if (cmd.rfind("sim_", 0) == 0) {
-            st.showSimulationTools = true;
-            if (st.simManager && st.simManager->handleCommand(st, cmd)) return;
-        }
-        if (cmd.rfind("eval_", 0) == 0 && evaluateDialogs.handleCommand(st, cmd)) return;
+        if (st.propertyManager->active() && std::strcmp(cmd_id, "sketch_new") == 0)
+            st.propertyManager->cancelEdits(st);
+        // T-RF11: family routing lives in the ordered rule table (app_commands.cpp). Built once;
+        // the rules are stateless and resolve every subsystem through the AppState& at call time.
+        // The app-level family handlers (cmdEdit*/cmdDisplayStyle/cmdAppearance/...) stay in this
+        // file and are handed over via RibbonCommandHooks.
+        static const CommandRouter router = buildRibbonCommandRouter(
+            {cmdEditCopy, cmdEditCut, cmdEditPaste, cmdEditDelete, cmdEditSelectAll,
+             cmdMakeDrawing, cmdDisplayStyle, cmdAppearance, cmdFlatPattern, cmdFlatDxf,
+             ecadDispatch});
+        if (router.dispatch(st, cmd_id)) return;
+        // Commands without a handler log a stub line so they stay observable until later cards
+        // wire them.
         std::printf("[ribbon] %s (no PM form)\n", cmd_id);
         std::fflush(stdout);
         st.addLog(std::string("[ribbon] ") + cmd_id + " (no PM form yet)");
@@ -2250,7 +2249,7 @@ WASM_BOOT_LOG("[wasm-boot] loadIcons done\n");
     // clean empty-doc state: origin planes + triad, like a fresh SolidWorks part.
 
     std::strncpy(st.code.data(), kStarterCode, st.code.size() - 1);
-    // Composer starts empty; placeholder lives in legacy_chat. No welcome Assistant seed bubble.
+    // Composer starts empty; placeholder lives in ui/copilot/composer.cpp. No welcome Assistant seed bubble.
 
     const char* shotMode = std::getenv("AI_CAD_SHOT");  // screenshot-only: settings|chat|assembly|plan|ribbon|pmform
     st.wantSettings = shot && shotMode && std::strcmp(shotMode, "settings") == 0;
@@ -4385,7 +4384,7 @@ WASM_BOOT_LOG("[wasm-boot] entering main loop\n");
         const float dockTopY = barH + ribbonH;
         // Publish the overlay band (the full-width viewport region the pinned glass columns
         // anchor to) BEFORE any panel draws — drawLeftPane (layout.cpp) and the Copilot column
-        // (legacy_chat.cpp) read it via ui::overlayBand().
+        // (ui/copilot/) read it via ui::overlayBand().
         ui::setOverlayBand(vp->Pos.x, vp->Pos.y + dockTopY,
                            vp->Pos.x + vp->Size.x, vp->Pos.y + vp->Size.y - statusH);
         ImGui::SetNextWindowPos(ImVec2(vp->Pos.x, vp->Pos.y + dockTopY));

@@ -59,13 +59,21 @@ ProviderMap = dict[str, Any]
 
 
 def _default_providers() -> ProviderMap:
-    """Best-effort discovery of configured providers (empty when none / offline).
+    """Resolve the overseer provider from routing.yaml (T-W14 seam, now wired).
 
-    TODO(T-W14): replace with routing.yaml source resolution.  Today there is no
-    global provider registry in services/agent, so this returns ``{}`` and callers
-    that want a real audit pass ``providers=`` explicitly (the GUI/loop wire it).
+    Uses services.agent.config.get_provider(role="overseer") — the same
+    routing.yaml role→source resolution (contract §14) the agent loop uses.
+    Returns ``{}`` when no provider can be constructed (unconfigured env,
+    offline refusal, missing credentials); callers that want a specific map
+    pass ``providers=`` explicitly (the GUI/loop wire it).
     """
-    return {}
+    try:
+        from services.agent.config import get_provider  # lazy: heavy module
+        provider = get_provider(role="overseer")
+    except Exception:  # noqa: BLE001 — an unconfigured env must not break audit_now
+        return {}
+    name = getattr(provider, "name", "") or "resolved"
+    return {name: provider}
 
 
 # ---------------------------------------------------------------------------

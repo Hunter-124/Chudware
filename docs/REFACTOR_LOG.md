@@ -2209,3 +2209,666 @@ never fires). Also fixed along the way: `tools/manual_gen.py` imported the delet
 `scripts/ui_inventory.py` (retired with ui/imgui) — repointed at
 `scripts/feature_surface_audit.ribbon_rows`; manual regenerated (`docs/manual/*.md`, 13
 files, drift CLEAN, coverage 344/344); tools pytest healed to 415 PASS.
+
+## 2026-07-22 — node R1d (T-RF7): agent event schema + prompt catalog single-sourced
+
+Added `contracts/agent_events.json` — the machine-readable canonical kind list for
+`aicad.agent_events/2` (28 kinds: 12 required, 16 optional/reserved-or-externally-emitted)
+with required payload fields per kind; `contracts/agent_events.md` stays the prose contract
+and gained a pointer note. New stdlib gate `scripts/agent_events_audit.py` (wired into
+`scripts/check.py` as the 5th gate) literal-scans both emitters (`core/agent/events.cpp`,
+`services/agent/agent_events.py`) and FAILs on a kind emitted but absent from the JSON, a
+non-optional JSON kind with no emitter, or a `kRoles` entry with no
+`services/agent/prompts/*.md` file (extras on disk are WARN-only). `core/agent/roles.cpp`
+gained `validate_roles_against_disk()` (called from `load_prompt` + `get_prompts_v2`, once
+per process): a stale kRoles entry now drops with a stderr warning instead of surfacing a
+ghost row silently; curated kRoles order and disk-append of extras unchanged. No
+emitter-side drift found (kRoles 15 == 15 prompt files; both emitters' kinds all
+contract-covered) — the only spec-level gap was `agent.model_assignment` (Python-emitted,
+undocumented in the prose .md), now captured in the JSON. Failure-proof demos: removing
+`agent.spawn` from the JSON, renaming `fixer.md`, and adding a fake required kind each made
+the gate exit 1; all restored, `python3 scripts/check.py` green (5/5). Gotcha for the
+integrator: roles.cpp change is C++-only, no CMake touched; the once-per-process validator
+uses the first caller's prompts_dir (all production paths share it).
+
+## 2026-07-22 — node R4b (T-RF16): sim_cancel cutover — C++ run/cancel registry for sim jobs
+
+`sim_cancel` existed only in the Python sim worker (`engine_oracle/sim/worker.py`, a
+process-global flag) and was unrouted on the C++ daemon. Added `core/sim/sim_cancel.{h,cpp}`:
+a process-wide job_id → shared `atomic<bool>` token registry mirroring
+`core/agent/machine.cpp`'s agent cancel (same envelope: `{ok, cancelled, job_id}`;
+unknown/finished/empty job_id = `ok:true, cancelled:false`, cancel-after-finish stays
+idempotent). `lbm_run` (CPU in `core/sim/lbm.cpp`, CUDA in `core/sim/lbm_cuda.cu`) gained a
+trailing `should_cancel` predicate polled at the existing ~50 convergence checkpoints — on
+cancel it stops early with `ok:false`, `error:"cancelled by sim_cancel at step N of M"`,
+`steps_run=N`; a CUDA-side cancel is terminal (the caller re-checks the predicate before the
+CPU fallback so a cancelled GPU run never restarts on CPU). `FlowParams` gained `job_id`;
+`run_wind_tunnel` registers/unregisters around the whole call (RAII guard, covers cache-hit
+and error paths) and threads the token into `lbm_run`. `job_id` is excluded from the CFD
+cache hash (run-control only); cancelled results are never cached (store is `if (R.ok)`).
+Tests: 3 new doctests in `core/tests/test_sim.cpp` (registry transitions, deterministic
+`lbm_run` cancel via counter predicate, threaded `run_wind_tunnel` cancel via `job_id`) —
+16/16 pass. Files touched: `core/sim/sim_cancel.{h,cpp}` (new), `core/sim/lbm.{h,cpp}`,
+`core/sim/lbm_cuda.{h,cu}`, `core/sim/flow_run.{h,cpp}`, `core/tests/test_sim.cpp`,
+`core/CMakeLists.txt` (one source line). Deferred to the integrator: the `sim_cancel`
+dispatch line in `core/api/libaicad.cpp` + `fp.job_id` wiring in `sim_run_flow`, the
+`services/worker/worker_client.cpp` routing flip, and the `contracts/web_parity.md` move of
+`sim_cancel` to web_required. Gotchas: the CUDA path (`.cu`) is compile-unverified here (no
+toolkit on this box) — the change is small but should get a CUDA-build smoke on a CUDA box;
+the LBM python remnant (`engine_oracle/sim/lbm.py` + `overlay.py` + `worker.py`) still serves
+the HOST GUI's stl-based `sim_run_flow` (the C++ dispatch is doc_id-based), so the oracle
+deletion waits on the host-path port, not just this node.
+
+## 2026-07-22 — node R1c (T-RF6): copilot split — legacy_chat.cpp monolith → ui/copilot/* modules
+
+The 13,374-line `host/src/ui/legacy_chat.cpp` (the LIVE copilot pane, badly misnamed "legacy")
+is gone, split into `host/src/ui/copilot/` by concern: `ui_common.cpp` (735 ln — shared
+small-UI helpers, Liquid-Glass bubble toolkit, code/diff/prose boxes, copy/paste affordances),
+`chat_log.cpp` (585 — user/provider/assistant turn rendering + windowed log + stick-to-bottom),
+`activity_timeline.cpp` (873 — typed-block per-turn timeline, tool-call rows, artifact actions),
+`cards.cpp` (2,734 — plan/objectives section, clarify + plan-approve, corporate-org,
+swarm/eng-firm/advisor cards, AI-VC checkpoint UI), `feed.cpp` (2,224 — feedTurnActivity
+stream-event folding, no drawing), `conversations.cpp` (1,006 — conversation tabs +
+chat-history/prompt-draft persistence + WASM shared-chat sync + OpenFOAM poll), `settings.cpp`
+(1,482 — drawAiSettingsSection/drawProviderModelPicker, model dropdown, providerUsable),
+`composer.cpp` (2,671 — wrapping chat input, attachments, run launch, slash commands,
+submitTurn, composer chrome), `panel.cpp` (1,049 — drawAIPanel host: header, sessions/tasks/
+artifacts panels, + the ai_workspace reuse hooks). Pure structural refactor: code moved
+verbatim; the only edits are linkage. `copilot.h` is the public header (same declarations as
+the old legacy_chat.h, plus the one-impl/two-layouts doc); `copilot_internal.h` carries the
+shared includes + the ~90 cross-module declarations (former file-statics, each still defined
+in exactly one TU) + the moved GlassBubble/AiVcUi/EditStage/AiVcCheckpoint structs and extern
+globals (s_aiVc, s_edit, s_chatKeyHold, s_chatHistoryDirty/LastPersist, gShowThinking).
+Namespace layout preserved: everything that was inside the monolith's `namespace ui` (line
+3858+) stays in `namespace ui`; earlier code stays global, so call sites are untouched. Default
+args moved from definitions to the internal-header declarations where a symbol crossed modules
+(chatCopyContext, drawChatInput, launchDesignRun/launchMissionRunChat, drawActionCard,
+drawClassificationCard, drawHeaderTextButton, savePromptDraft, loadChatHistoryForKey).
+openRouterModels/refreshOpenRouterModels had no external users and became TU-static.
+`ai_workspace.cpp` needed only its include swapped — it already embedded the chat through the
+reuse hooks, so the "one chat implementation, two layouts (overlay pane + full-page workspace)"
+reconciliation T-DP16 depends on is now explicit in the module layout. Files touched:
+`host/src/ui/copilot/*` (new, 11 files), `host/src/ui/legacy_chat.{cpp,h}` (deleted),
+`host/CMakeLists.txt` (one source line → nine), `host/src/app.cpp` + `host/src/ui/settings_modal.cpp`
+(include line only), `host/src/ui/ai/ai_workspace.{cpp,h}` (include + two comment references).
+Verify: `ninja -C host/build-linux Billet` green (full rebuild); `AI_CAD_SHOT=m1` headless
+screenshot smoke exits 0, PNG written, pane chrome (header + composer) renders;
+`python3 scripts/check.py` all 5 gates PASS. Gotchas: emsdk is NOT provisioned on this box,
+so the WASM compile of the new TUs is unverified — the sources are the shared
+BILLET_CORE_SOURCES list with no new platform APIs (the __EMSCRIPTEN__ shared-chat/providers
+blocks moved verbatim), but the gate's WASM smoke should catch any surprise on an emsdk box.
+Stale "legacy_chat" mentions remain in comments of files outside this node's write-set
+(metrics.h, layout.h/.cpp, model_registry.h, app_state.h) — cosmetic, for a later hygiene pass.
+
+## 2026-07-22 — node R4c (T-RF17): ECAD gaps cutover — KiCad importers ported to core/ecad
+
+Probe-verified the claimed gaps first: the doc-id forms of `ecad_autoroute` /
+`ecad_route_diff_pair` / `ecad_to_3d` named in the T-RF17 brief were ALREADY ported
+(`core/ecad/session.{h,cpp}` + `core/api/libaicad.cpp:3557-3616` dispatch both the
+inline-board and doc-id forms; the `services/worker/worker_client.cpp:285-294` comment
+listing them as gaps is stale and should be refreshed at merge). `ecad_fill_zones` /
+`ecad_simulate` were already C++ (web_parity notes 2026-07-22). The REAL remaining gaps
+were `ecad_import_kicad*` and `ecad_design`. `ecad_import_kicad` is not an RPC method
+anywhere — not even in `engine_oracle/ecad/rpc.py::METHODS`; KiCad import is
+`ecad_open` dispatching on the `.kicad_sch` / `.kicad_pcb` extension to
+`formats.import_kicad_sch` / `import_kicad_pcb` (rpc.py:71-97). Ported that whole stack:
+new `core/ecad/kicad.{h,cpp}` carries a clean S-expr parser (port of
+`engine/ecad/library/sexpr.py`), the kicad_sym/kicad_mod parsers (pins, symbol defs,
+pads, footprint graphics, 3D-model transforms), and both importers, mirroring the
+Python line for line (y-flip, `round(x, 6)` half-even via the erc.cpp py_round idiom,
+net-registry + GND insertion, pad net binding, copper-layer counting, Edge.Cuts outline
+harvest, power-port detection, stub lib_cache defs). `core/ecad/session.cpp::ecad_open`
+now dispatches on the extension exactly like rpc.py (`io_error` envelope
+`import_kicad_* failed for '<path>': <exc>` on failure; the Python-only `not_available`
+ImportError branch has no C++ analogue — the importers are always linked).
+Parity evidence: parsed-JSON diff of C++ vs `engine_oracle` output on the
+test_formats.py fixtures (_MINIMAL_SCH/_MINIMAL_PCB) plus a richer hand-made
+fixture pair (vias, zones+hatch, copper/Edge.Cuts arcs, thru-hole oval drills,
+fp model transforms, buses, hier labels, power symbols, missing-lib stubs) —
+IDENTICAL for all four docs (only the random uuid `id` excluded). Tests: new
+`core/tests/test_kicad_import.cpp` (6 doctest cases — both importers + schema
+validation, file-based import name-stem, ecad_open dispatch for both extensions,
+the io_error envelope, sexpr error shapes), wired in `core/CMakeLists.txt`
+(one source line + one test block, integrator reviews). Deferred/remainder:
+`ecad_design` — `engine_oracle/ecad/orchestrator.py` (926 lines) is an LLM state
+machine whose PLAN stage calls an agent provider (`agent.config.get_provider()`);
+libaicad has no provider seam and `libaicad.cpp` already documents it as deferred
+to the agent/LLM epic (the deterministic recipe builders it falls back to ARE in
+core: `ecad_recipe` / `ecad_recipes_all` / `ecad_closest_recipe`). Gotchas: none —
+the port is pure JSON/OCCT-free and slots into aicad_ecad.
+
+## 2026-07-22 — node R4a (T-RF15): firmware cutover — fw_* engine surface ported to core/firmware
+
+New `core/firmware/` module (~3.4k LOC C++ + 9.5kB embedded template data)
+ports the firmware engine surface of `engine_oracle/firmware/` behind a single
+dispatch entry `aicad::firmware::call(method, params, result, err)`
+(`core/firmware/firmware_rpc.{h,cpp}`, returns false = unported/unknown so
+routing can keep the Python oracle per-method). Ported methods:
+`fw_new_project` (template scaffold + BOM mcu auto-select + pinmap.h seed +
+synthetic compile_commands.json), `fw_build` (cmake/espidf/arduino subprocess
+toolchains, toolchain_not_found posture), `fw_sources`, `fw_verify_board`
+(static checks + dynamic pass over a trace artifact), `fw_flash` /
+`fw_debug_start` / `fw_debug_halt` / `fw_debug_read_mem` (probe-rs + esptool
+subprocess wrappers), `fw_status` (provisioning doctor + T-FIN2 platform
+matrix), `fw_projects`. DEFERRED to the resume (call() returns false, Python
+oracle still owns them): `fw_sim_run` / `fw_power_profile` /
+`fw_sensor_scenario` — the Renode/QEMU emulator leg (emulator.py 869 +
+scenario.py 560 + sensor_models.py 770 + sim_sensor_bridge.py 411 +
+powerprofile.py 408). `fw_verify_board(emulate=true)` degrades honestly
+(ran:false + reason naming the deferred leg); the trace_path dynamic pass is
+fully ported. `lsp.py` (clangd, 268 lines) is PROPOSED DELETE, not ported —
+its only consumer is its own test (no MCP tool, no worker method, no host
+call). Files: `core/firmware/{subprocess,templates,templates_embedded,
+mcu_pinouts,pinmap,project,toolchains,hardware,platform_db,provision,coverify,
+firmware_rpc}.{h,cpp}` + `fw_cli.cpp` (sketch_cli-style parity driver);
+`core/tests/test_firmware.cpp` (14 doctest cases) + fixtures in
+`core/tests/data/firmware/` (board/schematic/trace JSON + Python-generated
+golden pinmap header); `core/CMakeLists.txt` (aicad_firmware lib linking
+aicad_ecad, test_firmware, fw_cli — integrator reviews). Board refs resolve
+via `aicad::ecad::ecad_session_doc` → `.ecad+` container → plain JSON;
+schematic net names + direction-clash pin types reuse
+`aicad::ecad::build_netlist`; the T-FIN8 eng supply-rail lookup is a minimal
+embedded table (only `MCU:Generic_QFP48` carries rails among starter MCU
+symbols — probed at cutover). Parity: 37-check JSON diff vs the Python oracle
+(project scaffold, sources ops, real arm-none-eabi build, verify_board
+clean/seeded/clash/trace, hardware tool_not_found shapes, fw_status,
+fw_projects, error envelopes) — ALL IDENTICAL after masking volatile
+ids/timestamps/ms; the generated pinmap.h is byte-identical to the Python
+golden. Gotchas: (1) `engine_oracle/firmware/templates/cmake_arm` is embedded
+as C++ source (templates_embedded.cpp, generated by a throwaway script
+recorded here: walk the template dir, emit one raw-string per file) — if the
+Python template changes during the overlap window, regenerate it the same way;
+(2) `_STRAP_PIN_NAMES`/eng-rails tables are data ports — extend both sides or
+regenerate until engine_oracle/firmware is deleted; (3) two transient build
+breaks hit during this node were concurrent-leaf edits to
+test_agent_auth.cpp/CMakeLists.txt outside my write-set, not this change;
+(4) subprocess runner is fork/exec+poll on POSIX and CreateProcess on Windows,
+untested on MSVC.
+
+T-RF8 (node R1e, MCP god-file split): `services/mcp/cad_tools.py` (7,952 lines /
+68 tools), `ecad_tools.py` (4,479 / 33), and `reveng_tools.py` (2,040 / 21) were
+split into per-family modules by verbatim text surgery — every tool body moved
+byte-for-byte into a family register function; shared module-level helpers/state
+moved verbatim into ONE `*_common.py` per family group. New map: `cad_common.py`
+(doc registry/handoff/autosave/jobs/materials/inspect-render helpers) +
+`cad_guide.py` (topic texts + `cad_guide_text`) + `cad_{doc,eval,render,exchange,
+sim,asm,drawing}_tools.py`; `ecad_common.py` + `ecad_{sch,pcb,sim}_tools.py`;
+`reveng_common.py` + `reveng_{session,build}_tools.py`. The three original module
+paths are now thin COMPAT FACADES re-exporting their historical namespaces
+(incl. `register_*_tools` composites), because ~20 in-repo consumers and several
+test stubs import private helpers straight from them (`_dumps`, `_err`, `_doc`,
+`_CUR`, `_ECAD`, `_ingest_pdf`, `cad_guide_text`, …) — server.py now imports the
+family modules directly, one `register_*(_reg.view(mcp, "<family>"))` call per
+module, registry family names unchanged ("cad"/"ecad"/"reveng"; the sim retag in
+_FAMILY_REASSIGN is untouched). Tool surface proven identical by registration
+smoke: 68/68, 33/33, 21/21 same names before/after. Dual-import shims removed
+(`interaction_tools`, `ledger_tools` ×3, `workspace_tools` ×2, `intake_tools` ×2
+→ canonical `services.agent.*`; the intake_ledger shim → `mcp_server.*`, the
+majority path inside services/mcp; one stray `from agent import config` in the
+ecad_design tool → `services.agent.config`). Deferred: registration ORDER of the
+cad tools is now family-grouped rather than the historical interleave (tool
+names/count identical; MCP listing order differs — no client contract on order).
+Gotchas: (1) monkeypatch-based tests must patch the module where the looked-up
+name now lives — import-path-only fixes applied to test_vibration_tool
+(→cad_sim_tools), test_inspect_tools (→cad_render_tools), test_multiagent_overlap
++ test_autosave_recovery (→cad_common), test_mega8_op_vocab (→cad_doc_tools for
+inspect.getsource), test_ecad_hardening (→ecad_common for budget/session, +
+ecad_sim_tools for _provider_reachable, + services.agent.config), the three
+reveng suites (→reveng_common / reveng_build_tools); (2) `mcp_server.` vs
+`services.mcp.` remain two sys.modules aliases of one tree (pre-existing) —
+facades preserve whichever path a consumer uses; (3) test_mcp_freshness's
+"read cad_tools.py as text" fallback now sees the facade, but its primary path
+(cad_guide_text import) is unaffected; (4) pre-existing failures in this
+environment proven NOT from the split by A/B against the pre-split backups:
+test_reveng_tools LongJobStubs ×2, test_review_guide_mentions_inspect,
+test_autosave_skips_unchanged_docs, test_verify_battery ×3.
+
+**T-RF4 / node R1a (subscription auth → C++).** Ported the subscription
+token-refresh layer from Python into the core so the in-app C++ agent no
+longer calls back into Python (`subscription_ensure_fresh` worker RPC) before
+every run. New `core/agent/auth.{h,cpp}`: byte-compatible reader/writer of the
+SAME `config.json` `subscription_auth` store Python uses (multi-account
+`{active, accounts}` shape + legacy flat migration on read), the same
+`<config.json>.lock` advisory lock (`flock(LOCK_EX)` POSIX / `LockFileEx`
+Windows — a depth-aware `StoreLock` so nested store ops can't self-deadlock),
+tmp+replace atomic write-back, and `ensure_fresh()` mirroring
+`subscription_login.ensure_fresh` (5-min skew, active-first account scan capped
+64/8 network attempts, revoked-skip with live-access promotion, dead-refresh
+classification, xAI 403/429/tier continue rule, xai/claude API-key fallback).
+All five provider refresh exchanges ported: codex (form POST
+auth.openai.com/oauth/token), claude (JSON POST api.anthropic.com/v1/oauth/token
++ oauth-2025-04-20 beta header, skew subtracted at store), cursor (Bearer
+exchange api2.cursor.sh/auth/exchange_user_api_key, JWT exp-derived expiry),
+xai (form POST to stored token_endpoint else auth.x.ai fallback, RT rotation
+written back atomically INSIDE the same critical section as the POST, definitive
+400/401 persists refresh_revoked+auth_error), kimi (form POST
+auth.kimi.com/api/oauth/token + KimiCLI X-Msh-* headers, skew at store). The
+whole re-check→POST→save runs under the store lock so C++ and Python refreshes
+cannot race the xAI RT rotation during the transition window (Python keeps
+read/write store access until T-RF20; its `subscription_ensure_fresh` RPC STAYS
+for other consumers). Wired in at the single funnel: `resolve_provider` now
+takes cfg by value and calls `auth::ensure_fresh_for_run(name, cfg)` after the
+offline refusals — a stale snapshot refreshes in-process and swaps in the
+reloaded config; a hard auth failure returns the same re-auth refusal jobs.cpp
+used to surface. `host/src/core/jobs.cpp`: deleted `subscriptionEnsureProvider`
++ `ensureSubscriptionFreshBeforeRun` + all three call sites (agent_run_v2,
+agent_design, agent_mission_v1). Deviations: (1) codex refresh keeps the stored
+account_id when the new JWT lacks chatgpt_account_id instead of raising;
+(2) non-xAI saves resolve the account slot from cred.account_id (Python's
+implicit path) with the active pointer following the written slot;
+(3) the refresh POST is held inside the file lock (Python locks only at save) —
+strictly safer, still advisory-compatible; (4) Kimi X-Msh-Device-Name/Os-Version
+headers are best-effort (no Python platform module). Tests:
+`core/tests/test_agent_auth.cpp` (12 doctest cases: fresh-skip, rotation
+write-back + lock/tmp artifacts, legacy-flat migration, request shapes,
+revoked-sibling rotation + marker persistence, all-revoked error, 4-thread
+single-POST lock race, malformed store, skew margin, cursor JWT expiry,
+ensure_fresh_for_run reload/refusal, API-key fallback) — ALL against a scratch
+XDG dir with an injectable HTTP seam (`set_http_post_for_testing`). Registered
+as ctest `agent_auth`; `agent/auth.cpp` added to `aicad_agent`.
+`cmake --build core/build-linux --config Release` green;
+`ctest -R agent` 2/2 green; `ninja -C host/build-linux Billet` green (jobs.cpp
+recompiled). Full-suite ctest: 69/69 green (55s) — re-verified after the
+concurrent firmware/sourcing leaves settled. Gotcha for the
+integrator: the firmware leaf deleted/recreated `core/tests/test_firmware.cpp`
+and `test_sourcing.cpp` mid-wave, which broke cmake regeneration twice — rerun
+the full build+ctest after their node lands.
+
+## T-RF18 (node R4d) — sourcing/BOM/cost + parts providers cutover (leaf)
+
+Ported the BOM/sourcing stack to a new PURE `core/sourcing/` lib (OCCT-free, no
+doc/ecad/agent linkage — every side effect is a `Seams` injection point, mirroring
+the oracle's injectable loaders): `bom.cpp` (rollup made/bought classification +
+aggregation, ECAD-board BOM expansion with the CURRENT oracle's
+`_group_footprints` incl. MPN-in-group-key + MPN enrichment + natural ref sort,
+`resolve_prices`, `unit_price_for_qty`, `vendor_slug`), `cost.cpp` (seed table +
+aliases + config override + `estimate_made_cost`, Python round-half-even
+`round6`), `specmatch.cpp` + `bolts_data.h` (normalize_mpn, clean-room ISO/DIN
+tables transcribed from `engine_oracle/data/bolts/*.blt.yaml` — bearings file
+first, order matters — match_bolts/match_part_number, the 4 parametric
+templates, gsl_preview, register lane), `providers.cpp` (Nexar/Digi-Key/Mouser
+mapping + fail-closed mcmaster/grabcad/traceparts scaffolds, config/env creds),
+`quote.cpp` (Xometry/JLCPCB, self-contained SHA-256+HMAC — JLCPCB signature pins
+the oracle's `_FIXTURE_SIG`), `config.cpp` (appdata root mirror of
+agent/paths.cpp pick_app_dir), `vendorreg.cpp` (`register_local_cad` write path;
+the Python PartsHub FTS rebuild side effect NOT mirrored — hub is a remainder),
+`sourcing.cpp` (`call(method, params, seams, result)` — envelopes mirror
+sourcing_worker_rpc.py). Methods: bom_rollup, bom_price, request_quote,
+match_part_number, vendor_part_fetch, spec_sheet_match, list_spec_templates.
+Tests: `core/tests/test_sourcing.cpp` (25 doctest cases, 235 asserts — fixture
+board/assembly rollup+pricing math, cost numbers, normalize/match, spec preview
+exact bytes, provider mapping over a mock HTTP seam, JLCPCB sign fixture,
+dispatch envelopes, vendor registry write). Parity: scratch/t-rf18-parity/
+(dump.cpp vs parity.py vs compare.py) — 34/34 fixture outputs IDENTICAL vs the
+Python oracle (timestamps masked). Build+ctest green in core/build-z-r4d
+(68/68; the only failing test is `firmware` — the concurrent T-RF15 leaf's own
+test, mid-work at fw_status doctor shape, not this change).
+Gotchas / remainders: (1) KiCad-lane of match_part_number NOT ported (needs the
+deferred .kicad_sym parser — returns no-match; only diverges when
+AICAD_KICAD_SYM_PATH is configured); (2) spec_sheet_match LLM extraction lane
+NOT ported — C++ accepts pre-extracted `dims` (additive param) or the
+`extract_dims` seam; without them it returns the contract "unknown" shape with a
+reason naming the unported lane (web probe only needs a served response);
+(3) .kicad_pcb board expansion degrades to skip (C++ KiCad importers deferred);
+(4) parts_hub (part_search/get/place, gui_rpc, source.py FTS), the vendor-scan
+worker methods (vendor_part_register_local_cad/list/context/scan_library), and
+MCP cam_cost_estimate's doc-measurement glue remain Python — exact file list in
+the R4d report; (5) CMakeLists edits needing integrator review: aicad_sourcing
+lib+test, `aicad_sourcing` AND `aicad_firmware` on the `aicad` DLL link line
+(firmware was undefined-referenced via the integrator's own libaicad.cpp
+firmware routing — transient race), `firmware/eng_rails.cpp` added to
+aicad_firmware sources (same race — the firmware leaf added the file but not
+the source-list entry; drop if they land it first); (6) ecad fabformats
+write_bom in C++ has DRIFTED from the current oracle (group key lacks MPN,
+reads only fields-dict MPN) — sourcing ports the current oracle grouping
+inline; flag for T-RF17.
+
+## 2026-07-22 — node R4a resume (T-RF15): emulator leg — fw_sim_run / fw_power_profile / fw_sensor_scenario ported
+
+Completes the firmware cutover: the deferred Renode/QEMU leg is now C++.
+New `core/firmware/` files: `emulator.{h,cpp}` (Renode+QEMU subprocess
+backends, .resc generation incl. §7 trace artifact + T-FIN1 GPIO hooks/ODR
+snapshot, T-FIN2 capability gates, the full assertion grammar — uart:/gpio:
+end-state + timeline forms/toggles:/period:/uart_within:), `scenario.{h,cpp}`
+(aicad.fwscenario/1 validation with Python-repr error text, all 9 track kinds
+compiled to Renode monitor lines, ADC PythonPeripheral stub repl, the 5-fixture
+library incl. the NTC thermistor generator), `powerprofile.{h,cpp}`
+(aicad.powerprofile/1 — CPU residency via AICAD_CPU_EVT markers, per-pin duty,
+per-rail currents via the new `eng_rails.{h,cpp}` shared starter-library eng
+table with instance-override precedence; coverify now consumes the same table),
+`sensor_models.{h,cpp}` (MPU6050/BMP280/LIS3MDL/NEO-6M-NMEA/pitot physics,
+FlightProfile.from_dict), `sim_sensor_bridge.{h,cpp}` (uniform-grid resample +
+track packing), `pyfmt.{h,cpp}` (Python :g/:.3f/!r/#x formatting parity).
+`platform_db` gained get_capabilities (with gpio_regmap) + get_platform_file
+(materializes the now-embedded renode_platforms .repl set to
+$TMP/aicad_renode_platforms). firmware_rpc now handles ALL 13 fw_* methods
+plus fw_projects; fw_verify_board(emulate=true) takes the live run_simulation
+path (no more "not ported yet" degrade). One cross-cutting fix: run_capture
+now applies Python subprocess text=True universal-newline translation
+(\r\n/\r→\n) — renode writes \r\n and the oracle's logs are normalized, so
+uart_log byte parity required it; affects every wrapper (identical to their
+Python twins). Parity: 60-check JSON diff vs the Python oracle — all first-
+increment methods plus sim envelopes/no_elf/esp32 refusal/scenario_error,
+LIVE renode runs (scenario compile+run, UART capture), the live QEMU fallback,
+power profiles (activity-only/board rails/window override), the full sensor
+bridge, and emulate=true — ALL IDENTICAL after masking volatile
+ids/timestamps/ms/renode-banner paths. Two live-verified ORACLE GAPS (same
+behavior both sides, do not "fix" unilaterally): (1) QEMU writes semihosting
+output to STDERR on this box (qemu 9.x) and both engines read stdout only, so
+the QEMU fallback captures no UART — the oracle's own [~] live-verify notes
+predicted this; (2) Renode 1.16.1 has no AddStateChangedHook on
+GPIOPort.STM32_GPIOPort — the hook command errors and aborts the .resc, so
+gpio: assertions on real Renode runs degrade identically in both engines (the
+ODR-snapshot + hook machinery is unit-tested via the pure parsers instead).
+Tests: test_firmware.cpp now 24 doctest cases (368 assertions) — parsers,
+assertion grammar, scenario validation/plans/timeline, envelopes, power
+profiles, sensor bridge, plus two LIVE emulation runs gated honestly on
+renode/qemu/arm-none-eabi-gcc presence (they compile tiny semihosting/
+USART1 fixture ELFs — core/tests/data/firmware/{semi_hello,stm32_hello}.{c,ld}
+— and really boot them; SKIP markers when tools are absent). Live renode runs
+take ~5-15s wall each and can flake on timeout under swarm CPU load — rerun,
+not a behavior diff. Gotchas: (1) Python round() is banker's rounding —
+round_n in powerprofile.cpp and the sensor clamp paths replicate it; (2)
+empty-rails instance override REPLACES the library rail list (presence, not
+emptiness — eng_rails handles it); (3) ScenarioPlan timeline sort must stay
+stable; (4) the ADC stub .repl rides an aux temp dir that lands in the
+generated .resc, so resc text is run-unique by design; (5) templates_embedded
+now carries both cmake_arm and renode_platforms — regenerate both with the
+same walk-and-emit script if the Python trees change before deletion.
+
+## 2026-07-22 — node R2b (T-RF11): app.cpp ribbon-dispatch decomposition (leaf)
+
+The monolithic dispatchCmd if-chain in `host/src/app.cpp` (~150 lines of inline
+family routing) is replaced by an ordered rule table in the NEW
+`host/src/app_commands.{h,cpp}`: `CommandRouter` (registerExact / registerPrefix /
+registerAny; dispatch walks rules in REGISTRATION ORDER, first matching rule whose
+handler returns true consumes) plus `buildRibbonCommandRouter(hooks)`, which
+registers every family in exactly the original if-chain order — sketch onRibbonCommand
+→ sketch3d → edit_copy/cut/paste/delete/select_all → make_drawing → dwg_ →
+display_* → appr_* → asm_/new_assembly → ecad_/sch_/pcb_ → cam_ → reveng_ →
+PropertyManager::openForCommand → sm_flat_pattern/sm_export_flat_dxf → sim_ → eval_.
+Registration order IS the semantics: fall-through cases (a dwg_/asm_/reveng_/sim_/eval_
+id its owner declines still reaching openForCommand or the stub log; sim_ revealing
+the tools column even when unconsumed; cam_/ecad_/sch_/pcb_ consuming unconditionally)
+are preserved by construction, NOT by an exact-before-prefix ranking — do not reorder
+rules without auditing those fall-throughs. App-level policy stays in app.cpp's
+dispatchCmd: prof_toggle, the Simulation lockout (runs before the router),
+PM-cancel-on-sketch_new, and the unhandled-stub printf/addLog. The app-level FAMILIES
+(edit_* clipboard verbs, make_drawing, display_*, appr_*, sm_flat_pattern /
+sm_export_flat_dxf) also stay in app.cpp — now as flat named handler functions
+(cmdEditCopy/.../cmdFlatDxf, defined after exportFlatDxf) instead of nested if-chain
+blocks — and reach the table through RibbonCommandHooks (std::function members +
+ecadDispatch as a plain function pointer). Workspace families route to the modules'
+EXISTING entry points (SketchMode/Sketch3DMode::onRibbonCommand, drawingHandleCommand,
+AsmPanels::handleCommand, ecadDispatch, camHandleCommand,
+reveng::handleRevEngCommand, PropertyManager::openForCommand,
+SimManager/EvaluateDialogs::handleCommand) — no workspace module files were touched.
+Handlers resolve SketchMode/PropertyManager/EvaluateDialogs/SimManager through the
+AppState& at call time (re-seated per tab switch); the dispatchCmd shadowing locals
+are gone. AppState untouched; st.ribbonDispatch exposure unchanged.
+Files touched: host/src/app.cpp (dispatchCmd lambda ~155 → ~50 lines; +cmd* handlers;
+5207 → 5206 total), host/src/app_commands.{h,cpp} (new, 61+162 lines),
+host/CMakeLists.txt (new source line). Verify: ninja Billet green; check.py all 5
+gates PASS (feature_surface_audit harvests the app-level ids from the cmd* bodies in
+app.cpp — `cmd == "id"` POSITIVE comparisons only, the audit regex does not match
+`!=`); AI_CAD_SHOT=m1 headless run exits 0 (sketch_new/extrude/fillet/shell/edit/
+reopen all through the router). Gotchas: (1) the router is a function-local static
+inside dispatchCmd — rules are stateless std::functions capturing only the hooks
+struct by value; (2) edit_* handlers dereference st.sketchMode unconditionally,
+matching the original lambda's top-of-body deref (fallback instance is always
+installed before dispatch); (3) app.cpp's raw line count is roughly break-even BY
+DESIGN — scripts/feature_surface_audit.py scans only host/src/app.cpp (+ fixed module
+list), and scripts/ is outside this leaf's write-set, so the app-level families (the
+largest blocks) had to stay in app.cpp to keep the gate honest; INTEGRATOR OPTION:
+add host/src/app_commands.cpp to HANDLER_FILES in scripts/feature_surface_audit.py
+and the cmd* handlers (~100 lines) can move to app_commands.cpp too. Deferred:
+nothing.
+
+## 2026-07-22 — node R1f (T-RF9): copilot mode allow-list parity + leftover TODO seams (leaf)
+
+Part 1 — mode gating single-sourced. The Agent|Plan|Swarm|Edit|Ask tool allowlists lived
+twice (services/agent/copilot_mode_tools.py for MCP/DAG; inline checks in core/agent/run.cpp
+for the in-app loop). Now contracts/copilot_modes.json (aicad.copilot_modes/1) + one-paragraph
+prose contracts/copilot_modes.md are the canonical source BOTH runtimes load at runtime:
+Python reads it at import (AI_CAD_COPILOT_MODES_JSON → <repo>/contracts via parents[2]);
+new core/agent/copilot_modes.{h,cpp} loads it (AI_CAD_COPILOT_MODES_JSON →
+AI_CAD_CONTRACTS_DIR → repo-relative contracts/, same CWD convention as roles.cpp's
+agent/prompts) and implements the exact apply_mode_tools/is_tool_allowed semantics.
+run.cpp's delegate mode gate now consults the contract (legacy inline gate kept only as
+the contract-unreadable packaged fallback). BEHAVIOR CHANGE (parity fix, intended):
+top-level swarm / eng_firm runs no longer refuse delegate — the contract (and Python)
+allow it; empty mode still normalizes to agent (allowed), ask still refuses. Parity
+tests encode the identical 17-tool × 5-mode verdict matrix on both sides:
+core/tests/test_copilot_modes.cpp (doctest, 141 asserts, ctest name copilot_modes,
+WORKING_DIRECTORY=repo root) and services/agent/test_copilot_modes_parity.py (27 tests).
+Part 2 — seams: (1) workspace.py _default_spawn_modeler: no live consumer wires a real
+spawn (fanout/WorkspaceSession are test-only; a real spawn needs the mission delegation
+tree a bare session doesn't hold) — kept as an HONEST no-op default that records a
+"spawn not wired" advisory doc event; [TODO T-W14] literal + stale module-doc framing
+deleted. (2) overseer.py load_role_card: implemented for real — delegates to the landed
+T-W7 loader services.agent.roles.load_role (so Settings→Prompts overrides now apply to
+the overseer too); returns {} on any failure (caller falls back to _FALLBACK_SYSTEM as
+before); dead local _ROLES_DIR removed. (3) overseer_tools.py _default_providers:
+implemented for real via services.agent.config.get_provider(role="overseer") (T-W14
+routing.yaml resolution); returns {} on any exception — Overseer.audit degrades provider
+call failures to error=, never raises, so unconfigured hosts are safe. Files touched:
+contracts/copilot_modes.{json,md} (new), services/agent/copilot_mode_tools.py,
+core/agent/copilot_modes.{h,cpp} (new), core/agent/run.cpp, core/tests/test_copilot_modes.cpp
+(new), services/agent/test_copilot_modes_parity.py (new), services/agent/workspace.py,
+services/agent/advisor/overseer.py, services/agent/advisor/overseer_tools.py.
+WRITE-SET OVERFLOW for the integrator: core/CMakeLists.txt (added copilot_modes.cpp to
+aicad_agent + test_copilot_modes target/ctest) — unavoidable to build/test the new
+module; merge carefully if another leaf touched it. Gotchas: (1) core/CMake test uses
+WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/.. so the repo-relative contracts/
+fallback resolves, mirroring test_agent; (2) C++ is_tool_allowed strips but does NOT
+lowercase the tool name (Python semantics); (3) pre-existing reds NOT mine:
+scripts/check.py feature_surface_audit fails on host/src/ui/ribbon_def.cpp missing
+handlers (host leaf in flight), and 3 pytest failures are services.agent.loop missing
+Session/run_code_multi (loop.py gutted mid-refactor elsewhere); my verification:
+test_copilot_modes 9/9 + ctest pass, test_agent 84/84 (delegate-gate regression check),
+pytest -k 'mode or copilot' 225 passed/1 skipped, test_workspace + test_overseer 61/61.
+Deferred: wiring a real spawn into WorkspaceSession needs the mission DelegationTree —
+tracked as mission-glue work, not this node.
+
+## 2026-07-22 — node R2a part 1 (T-RF10): GUI_OVERHAUL_SPEC closure — title-bar + ribbon cluster (leaf)
+
+All 11 cluster items verified as ALREADY DONE in the current build; no code fixes were needed —
+the July `[~]` statuses were stale. Verification per item: headless shots (AI_CAD_SHOT=m1 /
+workspaces / sketch / settings light+dark), a live Xvfb+xdotool session (Ctrl+P Search popout
+capture + functional Linux title-bar drag test: empty caption moves the window, chip/tab spans
+do not — chrome::tick + HitLayout window-relative spans, win_chrome.cpp:164-218), and code
+reading (title_bar.cpp chips/centered tabs; ribbon.cpp ribbon_tabVisible per-workspace filter,
+ribbon_btnRest liquid-glass tiles, ribbon_btnActive bold box; settings_modal.cpp:3461-3475 opaque
+TitleBg*; command_search.cpp:68-89 opaque settings-style popout). Files touched (docs only):
+docs/GUI_OVERHAUL_SPEC.md (11 items `[~]`→`[x]` with one-line evidence each), this log. Build
+`ninja -C host/build-linux Billet` green; `python3 scripts/check.py` all 5 gates PASS;
+`python3 scripts/gui_lint.py` clean. Shot evidence: /tmp/r2a1-m1.png (title bar, FM undo/redo
+line-art glyphs), /tmp/r2a1-search.png (Search popout + ribbon tiles at native res),
+/tmp/r2a1-settings-{light,dark}.png (opaque strip both themes), scratch/workspace_shots/*.png
+(per-tab filtering: Drawing=Sketch/View Layout/Annotation, Simulate=per-type tabs+Reference,
+Manufacture=Reference+Job+CAM, PLM/Parts Library/AI=no ribbon), scratch/sketch_shots/
+sketch_01_enter.png (armed tool bold box). Gotchas: (1) workspace tabs compress to left-aligned
+when the window is too narrow for all 10 tabs (by design, title_bar.cpp:826-833) — at ≤1400px
+Parts Library/AI clip; (2) benign startup log noise `[icons] unknown icon: ws_electronics /
+ws_manufacture / ws_parts (size 20)` — title_bar requests those raster cells, misses the atlas,
+and falls back to the procedural glyph (renders fine); worth a follow-up either adding the cells
+or dropping the rasterCell names. (3) PRE-EXISTING RED NOT MINE: `check.py` was all-5-gates PASS
+at my build; a later run fails feature_surface_audit on make_drawing / sm_flat_pattern /
+sm_export_flat_dxf handlers — the parallel R2b leaf moved dispatch out of app.cpp into
+app_commands.cpp mid-flight (app.cpp mtime 16:18, after my build) and the audit
+(scripts/feature_surface_audit.py) scans only host/src/app.cpp. app.cpp is off-limits to this
+leaf; integrator/R2b to resolve. Deferred: none in this cluster.
+
+## T-RF10 (node R2a, part 2 of 2) — GUI_OVERHAUL_SPEC closure: FM + doc tabs + EM + misc (leaf)
+
+Docs-only node: audited every still-open `[~]` item in docs/GUI_OVERHAUL_SPEC.md outside the
+sibling leaf's title-bar/ribbon/settings cluster against the current build; ALL were already
+implemented by earlier waves, so no host/ source edits were needed (write-set untouched —
+feature_tree.cpp / doc_tabs.cpp / sim_manager.cpp verified, not modified). Spec updates:
+§4 FM row centering+padding and doc-tab-strip centering marked [x] (code evidence:
+feature_tree.cpp:159-615 (rowH-content)*0.5f centering + polish-G2 padding, fmPaneHeaderChip;
+doc_tabs.cpp:569-572 band-hugs-pills centering fix, :187-210 icon/label/× centering;
+eyeball: native-res crops of /tmp/r2a2-fm-doctabs.png from AI_CAD_SHOT=m1). §5 EM tab marked
+[x] on the GUI side — the em_* RPC contract is final and worker-registered
+(engine_oracle/worker.py:155, T-SIM11), ribbon rows + async em_status probe +
+setRibbonDisabledPrefix + real RPC-dispatching setup forms all live (ribbon_def.cpp:624-640,
+sim_manager.cpp:1075-1212); annotated that the remaining dependency is engine-side openEMS
+(T-SIM11, sim DAG), not GUI. §6: PLM / Parts Library / AI full-page bodies marked [x]
+(plm_pages.cpp checkpoints/history/release, parts_workspace+parts_vendors catalog/vendor-
+login/download-queue, ai_workspace.cpp; eyeball: scratch/workspace_shots/workspace_06/07/08).
+§6 Model/Drawing sketch auto-switch items kept [~] with an honest status note: C34
+deliberately flips the ribbon to the Sketch tab IN Model instead of hopping workspace —
+needs Hunter's call, owner is the title-bar/workspace seam. §7 repo-unification items marked
+[x] (ui/imgui+ui/abstract+app/ gone from disk; build.sh app -> host; gate.sh stages 2b+5).
+Verify: ninja -C host/build-linux Billet green; python3 scripts/check.py all 5 gates PASS;
+shots /tmp/r2a2-fm-doctabs.png (m1) + /tmp/r2a2-em-simulate.png (simdisc_mech — EM tab chip
+visible in the Simulate tab row). Gotchas: (1) docs/GUI_OVERHAUL_SPEC.md is edited
+CONCURRENTLY by the sibling R2a-1 leaf — re-read before every Edit; (2) AI_CAD_SHOT=
+git/parts/aiws workspace shots get forced back to the Model workspace by restored AI-handoff
+part tabs (doc_tabs.cpp:346-434 forces Model for part tabs) — use the sibling's
+scratch/workspace_shots/*.png (AI_CAD_SHOT=workspaces) for workspace-body evidence;
+(3) no headless path selects ribbon tab 19 (EM) — AI_CAD_TAB clamps at RT_Manufacture=12,
+so EM-tab content was verified in code + the tab-row chip shot, not a selected-tab capture.
+
+## 2026-07-22 — node R1b (T-RF5): single agent entry — legacy agent_design path killed (leaf)
+
+Decision: DELETE (option a), not alias — agent_design's only live caller was the GUI's
+cursor-provider branch in composer.cpp, and aliasing would keep a 3.7k-line build123d loop
+alive for one provider the C++ core already refuses with a classified pre-run error
+("cursor: no C++ chat completions transport", core/agent/providers.cpp:1522). Removed:
+launchAgentDesign (host/src/core/jobs.cpp:298-488 + jobs.h decl) with the composer.cpp
+cursorDesign branch — every Design send now takes launchAgentRunV2/agent_run_v2; the
+agent_design branch + _SESSIONS registry in engine_oracle/worker.py (exception scope;
+_get_prompts/_run_model/agent_cancel/ecad untouched); services/agent/run_agent.py (CLI,
+no programmatic users — README.md/dev docs only). loop.py could NOT be fully deleted:
+agent_turn.py (T-RF20 scope, untouched) lazily imports apply_context_refs from it and
+worker._get_prompts serves loop.SYSTEM_PROMPT/PLAN_PROMPT to the Settings editor, so
+loop.py was REDUCED 3,732→320 lines to exactly those symbols (+ _format_context_refs_block)
+— everything else (run/run_turn/Session/AgentRun, compaction, ETA, plan mode, run_mission
++ the whole mission-phase machinery, all with zero production callers) deleted. Tests:
+deleted test_loop_mock.py, test_live_seam_wiring.py, test_autosave_close.py; trimmed the
+loop section of test_compaction.py (kept the services.agent.compaction OMP-engine tests),
+3 agent_design tests out of engine_oracle/test_worker_stream.py, and 44 deleted-surface
+tests across test_pipeline.py, test_eta_estimator.py, test_roles.py, advisor/test_engine.py
+and test_mega{1_top5,3_fixes,4_fixes,5_fixes,7_fixes,8_rolesurface,9_fixes,10_fixes,
+11_grading,17_fixes,24_fixes,28_terminal}.py.
+Docs refreshed: services/agent/AGENTS.md, README.md, work/context/services-agent.md.
+Verification: ninja -C host/build-linux Billet green; scripts/check.py all 5 gates PASS;
+mcp-venv imports engine.worker/services.agent.loop/agent_turn OK; pytest services/agent
+2276 passed 0 failed (was 44 failed mid-trim, all deleted-surface), -k 'loop or design'
+37/37; engine_oracle/test_worker_stream.py + test_compaction.py 15/15; AI_CAD_SHOT=m1
+headless smoke exit 0. Gotchas: (1) cursor-picked Design now fails with the core's
+classified provider_error card instead of running — intended, Cursor Connect-RPC has no
+C++ transport; (2) engine_oracle suite shows 37 failed + 10 errors in research/ecad/sim/
+vision/cost — verified NOT mine (no import of worker/loop; ecad registry + research
+eng_calc module-shadowing breakage, parallel-leaf or pre-existing; my planned baseline run
+was tainted by parallel leaves mutating the tree mid-run); (3) main.cpp:333 `--design` CLI
+still calls agent_design → now unknown-method, needs v2 migration (out of my write-set);
+(4) tools/flywheel/bench/gym/runner.py calls loop.run_mission → broken (training is a
+deferred plan); reports/runs/mega-*/run_mega.py are archived run scripts; (5) stale doc
+references left for owners: contracts/web_parity.md:58 agent_design remove_at T-RF5 entry
+(integrator), contracts/worker_rpc.md:23 + events.md:11 + agent_events.md (integrator),
+services/mcp mission_tools.py/server.py/advisor_tools.py docstrings citing
+loop.run_mission/loop.py, services/worker/worker_client.cpp:187,236 comments,
+settings_modal.cpp:4024 get_prompts button + the system_prompt override are inert for the
+v2 agent (C++ never reads config system_prompt) — rewire to get_prompts_v2 or delete.
+
+---
+
+## 2026-07-22 — integrator merge pass: waves 1+2 + Z-stream phase 1 (T-RF4..T-RF11, T-RF15..T-RF18)
+
+Six leaves landed in one harvest; this entry records the integrator-side merges (leaf
+handoffs are their own paragraphs above). **Wave 1 (agent harness):** R1a auth→C++
+(`core/agent/auth.*`, all five refresh exchanges, xAI rotation rule, jobs.cpp Python
+callback gone), R1b single agent entry (`agent_design` DELETED — v2 covers it; Cursor
+transport refused classified; loop.py reduced 3,732→320 keeping only agent_turn/_get_prompts
+symbols), R1c chat split (11 copilot/ modules), R1d event schema
+(`contracts/agent_events.json` + 5th check.py gate), R1e MCP god-file split (cad 68 / ecad
+33 / reveng 21 tools into family modules, facades keep ~20 consumers working, 354 tools
+registered unchanged), R1f mode parity (`contracts/copilot_modes.{json,md}` + C++ consumer;
+swarm/eng_firm delegate allowed — parity fix). **Wave 2 (UI/UX):** R2a — all 22
+`GUI_OVERHAUL_SPEC [~]` items audited; 20 were already done in the current build (July
+statuses stale), flipped with per-item evidence; 2 honest remainders (C34 sketch
+auto-switch needs Hunter's call; EM engine work is deferred T-SIM11). R2b — dispatch
+decomposition: `host/src/app_commands.{h,cpp}` CommandRouter (16 families in original
+if-chain order), dispatchCmd 155→50 lines, host+WASM builds green. **Z-stream phase 1:**
+R4a firmware FULL surface C++ (13 methods + projects; Renode+QEMU emulator leg, 24
+doctests, 60-check parity), R4b sim_cancel registry, R4c KiCad import (byte-parity),
+R4d sourcing (7 methods, 25 doctests, 34/34 parity).
+**Integrator merges:** libaicad.cpp dispatch blocks (firmware::call, sourcing::call with
+production Seams glue — doc/ecad/parts/http), sim_cancel dispatch + include; routing in
+worker_client.cpp (routeFirmwareToCpp + 13-method allowlist, sourcing 7-method set, stale
+ECAD/sim gap comments refreshed); contracts/web_parity.md updated (sim_cancel, fw_new_project,
+fw_sim_run, bom_rollup, bom_price, spec_sheet_match → web_required; ecad_import_kicad
+removed as nonexistent-method; agent_design removed as deleted); stale agent_design refs
+swept from contracts/worker_rpc.md, contracts/events.md, contracts/agent_events.md,
+gate.sh (test_loop_mock ignore), worker_client.cpp comments; feature_surface_audit gained
+app_commands.cpp; services/mcp/firmware_tools.py flipped off engine.firmware to
+core_bridge (12 call sites); **engine_oracle/firmware/ DELETED** (13/13 methods C++,
+templates embedded, MCP flip done) + its worker.py registration block; --design CLI
+removed from main.cpp (dead since agent_design deletion; no consumers). **Notable
+discoveries:** QEMU semihosting→stderr and Renode-1.16.1 missing AddStateChangedHook are
+live ORACLE gaps, identical on both engines (do not "fix" one side); fabformats.cpp
+write_bom has drifted from the oracle BOM grouping (flag for R4e); QEMU/Renode live legs
+flake under swarm CPU load (same timeout semantics both engines). **Verify:** core 70/70
+ctest (build-linux), host build green, web parity probe OK (19 required / 7 unsupported),
+full gate at wave close. **Deferred to next nodes:** sourcing oracle deletions (waiting
+on the cost/spec/sourcing/regen/power_budget MCP flip leaf), R1b follow-ups (settings
+system-prompt override inert — row needs rewiring or deletion; gym runner stays broken
+per the deferred training plan), R4e long tail, R4f thin-client flip.
+
+T-RF19 (sourcing MCP flip, leaf): flipped the five sourcing/BOM-facing MCP modules off the
+engine_oracle sourcing modules onto the C++ core bridge (core/sourcing via libaicad, T-RF18
+dispatch), following the cam_tools.py / firmware_tools.py pattern. services/mcp/sourcing_tools.py:
+bom_rollup/bom_price now `_dumps(cb.call("bom_rollup"|"bom_price", {"doc_path": ...}))` — the C++
+envelope {ok, bom} is byte-identical to the old {ok:True, bom:to_dicts(lines)} tool output.
+services/mcp/spec_tools.py: match_part_number/spec_sheet_match call the same-named RPCs and unwrap
+the worker envelope's nested "match" object back to the historical flat tool shape
+{ok, matched, ...}; list_spec_templates passes {ok, templates} through unchanged.
+services/mcp/cost_tools.py: request_quote flips to cb.call("request_quote", {doc_path: part_file,
+vendor, quantity, material?, layers, finish?}) keeping the pre-RPC STEP export (the C++ quote.cpp
+takes a part file path, not a doc), and unwraps {ok, quote} to the historical
+{ok: quote.ok, quote} shape so a keyless §0-degraded quote keeps the exact old output.
+services/mcp/regen_tools.py + power_budget.py: NO FLIP NEEDED — regen_tools only imports
+engine.paths (CACHE telemetry dir; not in the deletion set), power_budget is pure Python with zero
+engine imports. NEEDS RPC SURFACE (one gap): cam_cost_estimate in cost_tools.py calls
+engine.cost_model.estimate_made_cost directly — the C++ port EXISTS (core/sourcing/cost.cpp
+estimate_made_cost, declared in sourcing.h) but sourcing::call (core/sourcing/sourcing.cpp)
+dispatches no method for it, and no closest RPC covers made-part costing (bom_price leaves made
+lines null). Left the oracle import at the call site with a NEEDS-RPC-SURFACE comment; integrator
+should add an estimate_made_cost dispatch (params {volume_mm3, material, cycle_time_s, quantity,
+machine_rate_per_hr}) before deleting engine_oracle/cost_model.py. No test edits needed: no
+services/mcp test monkeypatched the flipped call sites; the two live MCP-tool tests in
+engine_oracle/test_spec_sheet_matcher.py pass through the bridge unchanged. Verification (mcp-venv):
+all five modules import clean with the oracles still present; pytest services/mcp -k 'cost or
+sourcing or spec or regen or power' 61 passed / 1 failed BEFORE and AFTER (the failure,
+test_inspect_tools::test_review_guide_mentions_inspect, is pre-existing and unrelated — matched by
+the 'spec' substring); engine_oracle/test_spec_sheet_matcher.py -k 'mcp_tool_registers or
+tool_registered' 2/2 through cb.call. Grep proof: zero imports of engine.{bom, cost_model,
+quote_providers, parts_providers, spec_sheet_matcher, bolts_loader} in the five modules except the
+single documented cost_model gap in cost_tools.py:87. Gotchas: parts_providers/bolts_loader have
+NO importers anywhere in services/mcp (only engine_oracle-internal + reveng tests that stub
+engine_oracle.spec_sheet_matcher directly — integrator's scope when the oracle modules die).
+
+---
+
+## 2026-07-22 — oracle-deletion fallout sweep (sourcing seam)
+
+Deleting the R4d sourcing modules surfaced consumers the leaf's recommendation missed
+(caught by the gate's pytest collection crash — the gate works): `parts_hub/model_matcher.py`
+(relative import of spec_sheet_matcher — flipped to a core_bridge `_Ssm` shim;
+`normalize_mpn` added to the sourcing::call dispatch for it), `structural/bom_bridge.py`
+(module-level `from ..bom import BomLine` — the record is now defined locally; its
+consumer services/deliverables/joins reads asdict shape only; test import retargeted),
+`parts_hub/adapters/bolts_adapter.py` (module-level bolts_loader import — **restored**
+`engine_oracle/bolts_loader.py` + `engine_oracle/data/bolts/` from git; the adapter's
+browse surface is live and unported, R4e owns it), two vision files (lazy
+`normalize_mpn` — flipped to core_bridge with their shim fallback preserved),
+`vendor_parts.py:231` + `parts_library.py:161` (lazy provider imports — now degrade
+honestly; the real path is C++-routed), `services/mcp/test_reveng_e2e_datasheet.py`
+(3 call sites → `_match_part_number` over core_bridge). Also: `estimate_made_cost` and
+`normalize_mpn` added to the sourcing::call dispatch (the R4d leaf's "needs RPC surface"
+gap in cost_tools.py:87 — flipped to `cb.call`). Structural suite 140/140 after the
+fix; `test_datasheet_ingest.py::test_extraction_ok` fails for an environmental reason
+(docling not installed — reproduces on pre-deletion code, pre-existing). Manual
+regenerated (drift clean, 344/344).

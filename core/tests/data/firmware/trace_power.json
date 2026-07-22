@@ -1,0 +1,56 @@
+{
+  "events": [
+    {
+      "seq": 0,
+      "t_ms": null,
+      "text": "boot",
+      "type": "uart"
+    },
+    {
+      "seq": 1,
+      "t_ms": 100.0,
+      "text": "AICAD_CPU_EVT sleep t=100ms",
+      "type": "uart"
+    },
+    {
+      "seq": 2,
+      "t_ms": 300.0,
+      "text": "AICAD_CPU_EVT run t=300ms",
+      "type": "uart"
+    },
+    {
+      "level": 1,
+      "pin": "PA5",
+      "seq": 3,
+      "t_ms": 0.0,
+      "type": "gpio"
+    },
+    {
+      "level": 0,
+      "pin": "PA5",
+      "seq": 4,
+      "t_ms": 100.0,
+      "type": "gpio"
+    },
+    {
+      "level": 1,
+      "pin": "PA5",
+      "seq": 5,
+      "t_ms": 200.0,
+      "type": "gpio"
+    },
+    {
+      "level": 0,
+      "pin": "PA5",
+      "seq": 6,
+      "t_ms": 300.0,
+      "type": "gpio"
+    }
+  ],
+  "generated_at": 0.0,
+  "gpio_final": {
+    "PA5": 0
+  },
+  "schema": "aicad.firmware.trace/1",
+  "source": "renode"
+}

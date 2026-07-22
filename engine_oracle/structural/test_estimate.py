@@ -215,7 +215,7 @@ class TestEstimate:
 
 class TestBomBridge:
     def test_structural_bom_lines_returns_bom_lines(self):
-        from ..bom import BomLine
+        from .bom_bridge import BomLine  # engine_oracle/bom.py deleted in T-RF18; record lives here
         from ..structural.bom_bridge import structural_bom_lines
 
         doc = _simple_doc()

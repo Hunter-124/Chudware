@@ -158,8 +158,13 @@ def resolve_priced_part(mpn: str) -> dict | None:
     raised traceback or a network call without configured keys. The provider chain is
     constructed lazily so importing this scanner never pulls in the HTTP/provider surface.
     """
-    from engine import parts_providers
-    return parts_providers.default_pricing_chain().fetch(str(mpn or ""))
+    # parts_providers was deleted (T-RF18) — the C++ sourcing RPC owns pricing; degrade
+    # gracefully (docstring contract: "no price feed" state, never a traceback).
+    try:
+        from engine import parts_providers
+        return parts_providers.default_pricing_chain().fetch(str(mpn or ""))
+    except ImportError:
+        return None
 
 
 EmitFn = Callable[[dict], None]

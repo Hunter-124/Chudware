@@ -8,6 +8,7 @@
 
 #include <cctype>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <set>
@@ -22,8 +23,11 @@ namespace aicad {
 namespace agent {
 
 // Ordered catalog for Settings → AI → Prompts and load_prompt().
-// Keep in sync with services/agent/prompts/*.md. get_prompts_v2 also appends any
-// extra *.md found on disk (so new files show up without a code change).
+// Keep in sync with services/agent/prompts/*.md — scripts/agent_events_audit.py (in
+// scripts/check.py) fails on a stale entry. At runtime validate_roles_against_disk()
+// warns on stderr and get_prompts_v2 drops an entry whose file is gone.
+// get_prompts_v2 also appends any extra *.md found on disk (so new files show up
+// without a code change).
 const std::vector<std::string> kRoles = {
     "intake", "planner", "modeler", "reviewer", "fixer", "memory",
     "decomposer", "executor", "mission_planner", "reporter", "advisor",
@@ -157,6 +161,27 @@ bool is_role(const std::string& role) {
     return fs::exists(builtin_path(role, /*prompts_dir=*/""), ec);
 }
 
+// Validate the curated kRoles catalog against the on-disk prompts dir: an entry whose
+// *.md was renamed/deleted is a stale order entry — warn loudly on stderr instead of
+// silently surfacing nothing (get_prompts_v2 drops it; load_prompt throws on use).
+// Once per process; the first caller's prompts_dir wins (all production paths share it).
+void validate_roles_against_disk(const std::string& prompts_dir) {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    for (const auto& role : kRoles) {
+        std::error_code ec;
+        if (!fs::exists(builtin_path(role, prompts_dir), ec) &&
+            !fs::exists(override_path(role), ec)) {
+            std::fprintf(stderr,
+                         "agent roles: kRoles entry '%s' has no prompt file "
+                         "(%s missing) — dropping stale catalog entry\n",
+                         role.c_str(),
+                         builtin_path(role, prompts_dir).string().c_str());
+        }
+    }
+}
+
 }  // namespace
 
 std::pair<std::string, std::string> load_prompt(const std::string& role,
@@ -164,6 +189,7 @@ std::pair<std::string, std::string> load_prompt(const std::string& role,
                                                 bool solo,
                                                 bool tool_scope_full,
                                                 const std::set<std::string>& tool_scope_classes) {
+    validate_roles_against_disk(prompts_dir);
     if (!is_role(role)) throw std::runtime_error("unknown role " + role);
     fs::path ov = override_path(role);
     std::string ov_text;
@@ -293,6 +319,7 @@ std::string prompt_hash(const std::string& text) {
 }
 
 json get_prompts_v2(const std::string& prompts_dir) {
+    validate_roles_against_disk(prompts_dir);
     json out = json::array();
     std::error_code ec;
     std::set<std::string> seen;
@@ -304,7 +331,9 @@ json get_prompts_v2(const std::string& prompts_dir) {
         std::string ov_text;
         if (fs::exists(opath, ec)) ov_text = py_strip(read_text(opath));
         bool overridden = !ov_text.empty();
-        // Prefer override; else builtin file if present (skip ghost kRoles with no file).
+        // Prefer override; else builtin file if present. A kRoles entry with no file is
+        // a stale catalog entry: drop it here (validate_roles_against_disk already
+        // warned on stderr) so the Settings UI never shows a ghost row.
         std::string text;
         if (overridden) {
             text = ov_text;

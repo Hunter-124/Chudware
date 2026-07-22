@@ -26,6 +26,10 @@ struct FlowParams {
     // {"pct","step","n_steps","stage"} here every ~2% so a long background LBM run can be
     // polled live (get_job) the way the OpenFOAM path reports progress. Empty = no progress.
     std::string progress_path;
+    // Optional cancel identity: if set, the run registers in the sim-job registry
+    // (sim/sim_cancel.h) for its duration so sim_cancel(job_id) stops it at the next LBM
+    // checkpoint. Empty = anonymous run (not registered, not cancellable).
+    std::string job_id;
 };
 
 // Run a wind-tunnel LBM over the given bodies. Each body is a triangle soup: positions = flat

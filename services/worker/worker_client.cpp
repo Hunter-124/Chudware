@@ -123,6 +123,18 @@ bool routeDocToCpp(const std::string& method, const json& params) {
     // is doc-independent (family/size listing); parts_make mints a NEW doc-cpp part from the
     // generator. There is no Python equivalent, so always route to the core.
     if (method == "parts_catalog_list" || method == "parts_make") return true;
+    // T-RF18: sourcing/BOM/cost/spec-match ported to core/sourcing (dispatch in
+    // libaicad.cpp with production seams). Route the ported set; the vendor registry
+    // read methods and parts_hub stay Python until their cutover.
+    if (method == "bom_rollup" || method == "bom_price" || method == "request_quote" ||
+        method == "match_part_number" || method == "vendor_part_fetch" ||
+        method == "spec_sheet_match" || method == "list_spec_templates") {
+        if (!engine::available()) {
+            std::string lerr;
+            if (!engine::ensureLoaded(lerr)) return false;  // can't load -> Python
+        }
+        return true;
+    }
     // Agent RPCs are owned by the AGENT seam (routeAgentToCpp), which translates the host
     // names (agent_run_v2 -> agent_run, get_prompts_v2 -> agent_get_prompts_v2). They also
     // carry the active doc's doc_id, so without this guard the doc seam below would greedily
@@ -184,7 +196,7 @@ bool routeDocToCpp(const std::string& method, const json& params) {
 // get_prompts_v2) to the pure-C++ core (libaicad) instead of the Python worker. This
 // MIRRORS the doc_* seam but is DEFAULT OFF: unless AI_CAD_CPP_AGENT is set (and != "0")
 // the app behaves byte-for-byte as today (every agent call goes to the Python worker).
-// The legacy agent_design loop is NOT routed (stays Python). The C++ agent drives a
+// (agent_design was deleted in T-RF5 — the v2 run is the only agent path.) The C++ agent drives a
 // C++-backed ("doc-cpp") doc session, so we only route when the active doc is C++-backed;
 // a Python doc (e.g. an assembly) falls through to Python.
 bool cppAgentFlag() {
@@ -233,7 +245,7 @@ bool routeAgentToCpp(const std::string& method, const json& params) {
           method == "agent_simulate_v1" || method == "agent_mission_v1" ||
           method == "agent_cancel" || method == "agent_steer" ||
           method == "get_prompts_v2"))
-        return false;  // agent_design (legacy) + everything else stays Python
+        return false;  // everything else stays Python
     if (!agentDocIsCpp(method, params)) return false;  // only C++-backed docs (or doc-indep)
     // Ensure the core DLL is loadable before committing to the C++ path. ensureLoaded is
     // idempotent (loads once); if it can't load, fall through to the Python worker so the
@@ -247,7 +259,11 @@ bool routeAgentToCpp(const std::string& method, const json& params) {
 // sim_run_fatigue / sim_run_thermal) to the pure-C++ core (libaicad) instead of the
 // Python sim worker. MIRRORS the agent seam but is DEFAULT OFF: unless AI_CAD_CPP_SIM
 // is set (and != "0") every sim call goes to the Python sim worker exactly as today.
-// sim_run_flow (LBM/CFD) and sim_cancel are NEVER routed — they stay Python.
+// sim_run_flow (LBM/CFD) stays Python for the host panel path (stl-shaped params);
+// the C++ core owns doc_id-shaped flow runs directly. sim_cancel is now C++-dispatched
+// in core (T-RF16, core/sim/sim_cancel.cpp) and served to daemon/web clients; the
+// host panel's Python flow runs keep their own Python-side cancel — the two cancel
+// paths coexist per run ownership, so no routing change is made here.
 //
 // The host's send-shape for sim_run_static/sim_run_modal is already the C++ contract
 // ({study:{step_path, density, material, fixtures, loads}} + n_modes for modal), so no
@@ -282,15 +298,13 @@ bool routeSimToCpp(const std::string& method, const json& /*params*/) {
 // that doc_id routes to the C++ core too — the id prefix IS the commit-at-mint
 // marker, an all-or-nothing-per-document cutover (the ECAD analogue of "doc-cpp").
 //
-// Coverage gaps to be aware of when the flag is ON (these stay Python via the
-// "unknown method" -> nonzero-without-{code} hard-fail or, for ecad_design, by
-// minting a Python doc id): the C++ core handles the STATEFUL doc-id ecad methods
-// in libaicad.cpp (ecad_new/open/apply_ops/undo/redo/tree/rebuild/close/describe/
-// schema/dfm/impedance/export/save/update_from_sch/recipe*), but ecad_autoroute /
-// ecad_to_3d / ecad_route_diff_pair are only ported for the STATELESS inline-board
-// form, NOT the host's doc-id form; and ecad_fill_zones / ecad_simulate /
-// ecad_design / ecad_import_kicad* are not in the C++ core at all (KiCad import
-// stays Python). A call bound to an ecadcpp doc that hits one of these fails loud
+// Coverage gaps (updated 2026-07-22, T-RF17): the C++ core handles the stateful
+// doc-id ecad methods in libaicad.cpp AND the doc-id forms of ecad_autoroute /
+// ecad_to_3d / ecad_route_diff_pair (libaicad.cpp:3557-3616), plus ecad_fill_zones,
+// ecad_simulate, and KiCad import (ecad_open dispatches .kicad_sch/.kicad_pcb to
+// core/ecad/kicad.cpp). The only remaining Python method is ecad_design (an LLM
+// state machine — deferred to the agent seam; its deterministic recipe fallback
+// is already C++). A call bound to an ecadcpp doc that hits ecad_design fails loud
 // (no Python doc to fall back to) — exactly the doc-cpp seam's behavior.
 bool cppEcadFlag() {
     const char* f = std::getenv("AI_CAD_CPP_ECAD");
@@ -324,6 +338,38 @@ bool routeEcadToCpp(const std::string& method, const json& params) {
     // the Python worker so document creation never hard-breaks.
     if (!cppEcadFlag()) return false;
     if (method != "ecad_new" && method != "ecad_open") return false;  // minting only
+    if (!engine::available()) {
+        std::string lerr;
+        if (!engine::ensureLoaded(lerr)) return false;  // can't load -> Python
+    }
+    return true;
+}
+// --- C++ firmware routing (T-RF15) ------------------------------------------
+// Route the ported fw_* methods to core/firmware (libaicad). DEFAULT ON on
+// Linux/macOS (the platforms the C++ module is verified on); AI_CAD_CPP_FIRMWARE
+// overrides. The three emulator-leg methods (fw_sim_run / fw_power_profile /
+// fw_sensor_scenario) stay Python until the Renode leg lands.
+bool cppFirmwareFlag() {
+    const char* f = std::getenv("AI_CAD_CPP_FIRMWARE");
+    if (f && f[0]) return f[0] != '0';
+#ifdef _WIN32
+    return false;  // Windows: firmware subprocess layer is POSIX-verified only
+#else
+    return true;
+#endif
+}
+
+bool routeFirmwareToCpp(const std::string& method, const json& /*params*/) {
+    static const char* const kPorted[] = {
+        "fw_new_project", "fw_build", "fw_sources", "fw_verify_board", "fw_flash",
+        "fw_debug_start", "fw_debug_halt", "fw_debug_read_mem", "fw_status", "fw_projects",
+        "fw_sim_run", "fw_power_profile", "fw_sensor_scenario",  // T-RF15 emulator leg
+    };
+    if (!cppFirmwareFlag()) return false;
+    bool ported = false;
+    for (const char* p : kPorted)
+        if (method == p) { ported = true; break; }
+    if (!ported) return false;  // unknown fw_* stays Python
     if (!engine::available()) {
         std::string lerr;
         if (!engine::ensureLoaded(lerr)) return false;  // can't load -> Python
@@ -746,6 +792,7 @@ bool WorkerClient::callImpl(const std::string& method, const json& params, json&
         const bool engineBound =
             (method.rfind("cam_", 0) == 0 ||
              routeSimToCpp(method, params) || routeEcadToCpp(method, params) ||
+             routeFirmwareToCpp(method, params) ||
              (routeDocToCpp(method, params) && !isMintingMethod(method, params))) &&
             method != "ecad_new" && method != "ecad_open";
         if (engineBound && !lk.try_lock())

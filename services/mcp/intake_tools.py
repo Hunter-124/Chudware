@@ -57,16 +57,9 @@ def _ask_via_contract(questions: list, run_id: Optional[str], transport=None,
     are auto-accepted, just like a non-interactive pipeline run.  The caller (MCP tool)
     then returns the question payload to the user for the next turn.
     """
-    try:
-        from services.agent.interaction import (
-            FileLedger, MemoryLedger, ask_user, make_batch)
-    except ImportError:
-        from agent.interaction import (  # type: ignore
-            FileLedger, MemoryLedger, ask_user, make_batch)
-    try:
-        from services.mcp.intake_ledger import IntakeLedger
-    except ImportError:
-        from mcp_server.intake_ledger import IntakeLedger  # type: ignore
+    from services.agent.interaction import (
+        FileLedger, MemoryLedger, ask_user, make_batch)
+    from mcp_server.intake_ledger import IntakeLedger
 
     if ledger is None:
         if run_id:

@@ -183,8 +183,6 @@ $py = "$env:APPDATA\AI-CAD\runtime\venv\Scripts\python.exe"
 & $py -m engine.doc.test_sketch_solver      # one engine suite
 & $py -m mcp_server.test_roundtrip          # MCP roundtrip self-test
 & $py -m mcp_server.server                  # run the MCP server (stdio)
-& $py -m agent.run_agent "a 60x40x12mm bracket with two M5 clearance holes"   # needs API key
-& $py -m agent.test_loop_mock               # agent loop, no key needed
 ```
 
 ## Where this is going

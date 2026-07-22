@@ -15,10 +15,6 @@ Methods:
                                        the result carries per-part exports + a fit report
                                        (pairwise interference / clearance); single-`result`
                                        scripts behave exactly as before.
-  agent_design {request, name?, session_id?, reset?, max_iters?}
-                                    -> run one turn of the agent loop against a persistent
-                                       session (needs a provider). Emits live "event"
-                                       notification lines per iteration before the result.
   shutdown                          -> graceful exit
 
 Streaming: long-running methods receive an ``emit`` callback. Each call writes a
@@ -40,10 +36,6 @@ from engine.kernel import run_code_multi
 
 logging.basicConfig(stream=sys.stderr, level=logging.WARNING)
 log = logging.getLogger("ai-cad.worker")
-
-# Live conversation state keyed by session id, so follow-up requests refine the existing
-# part instead of restarting. Held in-process for the life of the worker.
-_SESSIONS: dict = {}
 
 EmitFn = Callable[[dict], None]
 
@@ -68,147 +60,6 @@ def _run_model(params: dict, _emit_event: EmitFn) -> dict:
     return asdict(res)
 
 
-def _agent_design(params: dict, emit_event: EmitFn) -> dict:
-    from agent import config, loop
-
-    request = params["request"]
-    name = params.get("name", "agent_model")
-    session_id = params.get("session_id") or name
-    cfg = config.load_config()
-    # Iteration budget: explicit param > config.json "max_iters" > loop's generous default.
-    # The loop normally converges (stops the moment a render matches) well before the cap.
-    mi = params.get("max_iters")
-    if mi is None:
-        mi = cfg.get("max_iters")
-    max_iters = int(mi) if mi else None
-    # Plan mode: explicit param > config.json "plan_mode" > ON. (Only the first turn of a
-    # session actually plans; follow-up turns refine against the stored plan.)
-    plan = params.get("plan")
-    if plan is None:
-        plan = cfg.get("plan_mode", True)
-
-    if params.get("reset"):
-        _SESSIONS.pop(session_id, None)
-    session = _SESSIONS.get(session_id)
-    if session is None or session.name != name:
-        session = loop.Session(name=name)
-        _SESSIONS[session_id] = session
-
-    # O1 (GUI model picker): an explicit provider NAME in the params pins the provider for this
-    # turn — get_provider(name=...) beats the ambient AI_CAD_PROVIDER env / config.json default.
-    # An explicit pick also skips the IP-1 routing override below (the user's choice wins).
-    explicit_provider = params.get("provider") or None
-    # GUI wire id is "cursor"; config.get_provider registers the subscription adapter as
-    # "cursor-sub". Normalize so a Design send with provider=cursor actually constructs
-    # CursorSubProvider (not ValueError: Unknown provider).
-    if isinstance(explicit_provider, str):
-        _prov_l = explicit_provider.strip().lower()
-        if _prov_l in ("cursor", "cursor-sub"):
-            explicit_provider = "cursor-sub"
-    # Explicit model from the picker must win over ambient config.json "model".
-    # Cursor registry ids (cursor/claude-sonnet-5, composer-2.5, …) are accepted by
-    # CursorSubProvider.model_map (strips cursor/ prefix).
-    if params.get("model"):
-        cfg = dict(cfg or {})
-        cfg["model"] = params.get("model")
-    # Per-role thinking (Settings → AI → Model roles): when the GUI did not pass an
-    # explicit reasoning_effort, resolve Default-role thinking (Auto → classifier).
-    if not (cfg or {}).get("reasoning_effort") and not params.get("reasoning_effort"):
-        try:
-            from services.agent.role_models import resolve_role_thinking  # noqa: PLC0415
-            _eff = resolve_role_thinking(
-                "default",
-                cfg,
-                request=str(params.get("request") or ""),
-            )
-            if _eff:
-                cfg = dict(cfg or {})
-                cfg["reasoning_effort"] = _eff
-        except Exception:  # noqa: BLE001 — never block a turn on thinking resolve
-            pass
-    if params.get("reasoning_effort"):
-        cfg = dict(cfg or {})
-        cfg["reasoning_effort"] = params.get("reasoning_effort")
-    provider = config.get_provider(explicit_provider, cfg)
-    # T-BL22: per-insertion-point adapter routing (T-H9 seam, IP-1 = the design loop).
-    # When config.json carries a "routing" entry for IP-1, resolve which brain answers:
-    # a non-fallback decision re-resolves the provider (e.g. a vLLM-served LoRA) and the
-    # decision is stamped onto the provider so loop.py tags every ai_artifact with the
-    # adapter version (RouteDecision.telemetry_tag()). No table / no IP-1 entry / any
-    # error -> the existing provider unchanged (the kill-switch fallback path).
-    try:
-        from services.serving.routing import load_routing_table
-
-        _rt = load_routing_table(cfg)
-        if "IP-1" in _rt and not explicit_provider:  # explicit user pick beats adapter routing
-            _decision = _rt.resolve("IP-1", user_id=str(session_id or ""))
-            if not _decision.is_fallback:
-                try:
-                    provider = config.get_provider(_decision.provider, cfg)
-                    # Stamp the decision so loop._emit_ai_artifact tags every response
-                    # with the served adapter (telemetry_tag()). Fallback decisions are
-                    # NOT stamped — the default provider answers and its own name/model
-                    # (adapter None) is the truthful tag.
-                    provider._routing_decision = _decision
-                except Exception:  # adapter endpoint unavailable -> kill-switch degrade:
-                    pass           # keep the default provider, untagged (adapter None)
-    except Exception:  # noqa: BLE001 — routing is optional; never break the design loop
-        pass
-    try:
-        run = loop.run_turn(session, request, provider,
-                            on_event=emit_event, max_iters=max_iters,
-                            plan_first=bool(plan),
-                            context_refs=params.get("context_refs"))
-    except Exception as e:  # noqa: BLE001 — never swallow the cause for the GUI
-        log.error("agent_design failed: %s\n%s", e, traceback.format_exc())
-        try:
-            from services.agent.agent_turn import (  # noqa: PLC0415
-                classify_provider_error,
-                format_provider_error_detail,
-            )
-            stop_reason, _ = classify_provider_error(e)
-            if stop_reason == "failed":
-                stop_reason = "provider_error"
-            detail = format_provider_error_detail(e, provider)
-        except Exception:  # noqa: BLE001
-            stop_reason = "provider_error"
-            detail = f"{type(e).__name__}: {e}"[:300]
-        try:
-            emit_event({
-                "kind": "status",
-                "phase": "error",
-                "text": detail,
-                "stop_reason": stop_reason,
-                "error_detail": detail,
-                "converged": False,
-            })
-        except Exception:  # noqa: BLE001
-            pass
-        return {
-            "request": request,
-            "success": False,
-            "iterations": 0,
-            "final_code": None,
-            "result": None,
-            "contact_sheet": None,
-            "out_dir": "",
-            "session_id": session_id,
-            "turn": getattr(session, "turns", 0) + 1,
-            "log": [],
-            "is_assembly": False,
-            "fit": None,
-            "converged": False,
-            "stop_reason": stop_reason,
-            "error_detail": detail,
-            "plan": getattr(session, "plan", None),
-        }
-    result = asdict(run)
-    # Ensure early-stop fields always present on the RPC result (additive).
-    result.setdefault("stop_reason", getattr(run, "stop_reason", "") or "")
-    result.setdefault("error_detail", getattr(run, "error_detail", "") or "")
-    return result
-
-
 def _get_prompts(_params: dict, _emit_event: EmitFn) -> dict:
     """The built-in prompts (+ the active override), so the GUI's Settings editor can show
     and prefill them without duplicating the text in C++."""
@@ -227,10 +78,10 @@ def _get_prompts(_params: dict, _emit_event: EmitFn) -> dict:
 # (ask), agent_pm_assist_v1 (PM assist) and get_prompts_v2 (prompt catalog) — now runs
 # in-process in the C++ core, which the host routes to by default (AI_CAD_CPP_AGENT on). The
 # Python orchestrator/ask/pm_assist modules were deleted after a final differential-parity pass
-# (orch 20 / micro 65 / assist 87 / agent-support 163 all MATCH). The LEGACY agent_design
-# code-gen path (above) stays in Python (agent/loop.py executes build123d code). agent_cancel
-# remains as a harmless no-op for any run not tracked in this process (the C++ core owns v2 run
-# lifecycles now).
+# (orch 20 / micro 65 / assist 87 / agent-support 163 all MATCH). T-RF5 then removed the LEGACY
+# agent_design code-gen path too (agent/loop.py's run/run_turn went with it) — agent_run_v2 in
+# the C++ core is the single agent entry. agent_cancel remains as a harmless no-op for any run
+# not tracked in this process (the C++ core owns v2 run lifecycles now).
 
 # Active orchestrator runs: run_id -> control. Retained for agent_cancel; normally empty now.
 _RUNS: dict = {}
@@ -249,7 +100,7 @@ def _agent_cancel(params: dict, _emit_event: EmitFn) -> dict:
 # The Python doc modeling engine is gone — every doc/sketch/evaluate/config/drawing/instant3d/
 # sim_study/sim-bridge/weldment/2D-export RPC now runs in the C++ core (libaicad); the host routes
 # them by the doc-cpp / dwg-cpp / minting rule (see host/src/worker_client.cpp). What stays in the
-# Python worker: the legacy build123d code-gen path (agent_design), the format-matrix probe, the
+# Python worker: run_model (build123d script builds), the format-matrix probe, the
 # vendor-parts registry, and the AI-ECAD surface.
 
 def _list_editable_prompts(_params: dict, _emit_event=None):
@@ -264,7 +115,6 @@ def _list_editable_prompts(_params: dict, _emit_event=None):
 _METHODS = {
     "ping": _ping,
     "run_model": _run_model,
-    "agent_design": _agent_design,
     "get_prompts": _get_prompts,
     "list_editable_prompts": _list_editable_prompts,
 }
@@ -358,19 +208,10 @@ except Exception as _reveng_import_err:  # noqa: BLE001
         "engine_oracle.reveng_rpc unavailable — reverse-engineering RPCs not registered: %s",
         _reveng_import_err)
 # === end Reverse Engineering ===
-# === BOM / sourcing seam (T-U4) — bom_rollup / bom_price / request_quote / match_part_number ===
-# Thin wrappers over engine.bom + engine.quote_providers + engine_oracle.spec_sheet_matcher,
-# exposed over the worker seam so the BOM panel (ui/imgui/src/ui/bom_panel.cpp) reaches them
-# via AsyncRpc with no bespoke transport.  Gracefully absent when the engine.bom module is not
-# yet provisioned (e.g. CI without the ML track) — the panel degrades to an error state.
-try:
-    from .sourcing_worker_rpc import WORKER_METHODS as _SOURCING_METHODS  # noqa: E402
-    _METHODS.update(_SOURCING_METHODS)
-except Exception as _sourcing_import_err:  # noqa: BLE001
-    import logging as _logging
-    _logging.getLogger("ai-cad.worker").warning(
-        "engine_oracle.sourcing_worker_rpc unavailable — bom_price/bom_rollup/request_quote"
-        "/match_part_number not registered: %s", _sourcing_import_err)
+# === BOM / sourcing seam (T-U4) — REMOVED 2026-07-22 (T-RF18) ===
+# bom_rollup / bom_price / request_quote / match_part_number / vendor_part_fetch /
+# spec_sheet_match / list_spec_templates / estimate_made_cost are C++-dispatched
+# (core/sourcing, routed via worker_client.cpp); the oracle modules were deleted.
 # === end BOM / sourcing ===
 
 # === DAG steering seam (T-F17) — dag_status / dag_approve / dag_abort ===
@@ -421,19 +262,9 @@ except Exception as _plm_import_err:  # noqa: BLE001
         _plm_import_err)
 # === end PLM vault ===
 
-# === Firmware seam (T-FIN5) — fw_status/projects/new_project/build/sources/sim_run/flash/debug ===
-# GUI-facing mirror of the fw_* MCP tools (contracts/firmware_rpc.md §8): the desktop
-# Firmware workspace drives the SAME engine.firmware implementation as the MCP server.
-# Gracefully absent when engine.firmware can't import; the GUI shows its honest
-# "firmware tools unavailable" state instead.
-try:
-    from engine.firmware.worker_rpc import WORKER_METHODS as _FW_METHODS  # noqa: E402
-    _METHODS.update(_FW_METHODS)
-except Exception as _fw_import_err:  # noqa: BLE001
-    import logging as _logging
-    _logging.getLogger("ai-cad.worker").warning(
-        "engine.firmware.worker_rpc unavailable — fw_* worker methods not registered: %s",
-        _fw_import_err)
+# === Firmware seam (T-FIN5) — REMOVED 2026-07-22 (T-RF15) ===
+# The full fw_* surface is C++ (core/firmware, routed via worker_client.cpp);
+# engine_oracle/firmware was deleted. The MCP firmware tools call the core bridge.
 # === end Firmware seam ===
 
 # Multi-physics Simulate-tab seam (T-FIN24): advanced FEA proxies (ccx buckling /

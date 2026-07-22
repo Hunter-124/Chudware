@@ -1,6 +1,10 @@
 """Cost-out MCP tools: made-part cost estimate + on-demand manufacturing quotes (workstream B).
 
-Thin MCP adapters over :mod:`engine.cost_model` and :mod:`engine.quote_providers`.
+Thin MCP adapters over the C++ core (libaicad ``request_quote`` RPC via
+:mod:`services.mcp.core_bridge`). ``cam_cost_estimate`` still rides the oracle
+cost_model — the C++ port (core/sourcing/cost.cpp) dispatched via the
+``estimate_made_cost`` worker-RPC method (T-RF18); the oracle module was deleted.
+RPC method yet (see the call-site comment).
 
 - ``cam_cost_estimate(doc_path)`` opens a doc that carries CAM operations, reads its solid volume,
   CAM setup material, and simulated ``cycle_time_s``, and returns the ``aicad.sourcing/1`` §3
@@ -75,7 +79,7 @@ def register_cost_tools(mcp: FastMCP) -> None:
         "unit_cost": null} (price unknown), never a fabricated number. Returns {ok, cost}.
         """
         try:
-            from engine import cost_model
+            # estimate_made_cost is C++-dispatched via the sourcing RPC (T-RF18).
             opened = cb.call("doc_open", {"path": str(doc_path)})
             doc_id = opened.get("doc_id") if isinstance(opened, dict) else None
             volume = opened.get("volume") if isinstance(opened, dict) else None
@@ -95,10 +99,10 @@ def register_cost_tools(mcp: FastMCP) -> None:
                     except Exception:  # noqa: BLE001
                         mat = None
 
-            cost = cost_model.estimate_made_cost(
-                volume_mm3=volume_mm3, material=mat, cycle_time_s=cycle_time_s,
-                quantity=quantity, machine_rate_per_hr=machine_rate_per_hr,
-            )
+            cost = cb.call("estimate_made_cost", {
+                "volume_mm3": volume_mm3, "material": mat, "cycle_time_s": cycle_time_s,
+                "quantity": quantity, "machine_rate_per_hr": machine_rate_per_hr,
+            })
             return _dumps({"ok": bool(cost.get("ok")), "cost": cost})
         except Exception as e:  # noqa: BLE001
             return _err(e)
@@ -117,7 +121,6 @@ def register_cost_tools(mcp: FastMCP) -> None:
         price_breaks/quote_id). No scraping. Returns {ok, quote}.
         """
         try:
-            from engine import quote_providers
             part_file = str(doc_path)
             v = str(vendor or "").strip().lower()
             if v in ("xometry", "xom", "cnc", "mechanical"):
@@ -133,10 +136,21 @@ def register_cost_tools(mcp: FastMCP) -> None:
                         part_file = step
                 except Exception:  # noqa: BLE001 (export unavailable -> pass the doc path through)
                     part_file = str(doc_path)
-            quote = quote_providers.request_quote(
-                part_file, vendor, quantity=quantity, material=material,
-                layers=layers, finish=finish,
-            )
-            return _dumps({"ok": bool(quote.get("ok")), "quote": quote})
+            # T-RF18: the quote providers live in the C++ core (core/sourcing/quote.cpp);
+            # the RPC envelope mirrors the Python worker wrapper ({ok, quote} on success,
+            # {ok:false, reason, hint} on a hard failure). Unwrap to the historical tool
+            # shape {ok, quote} — a keyless/vendor-down quote is the contract §0 shape
+            # nested in "quote", exactly as the oracle returned it.
+            params: dict = {"doc_path": part_file, "vendor": vendor, "quantity": quantity,
+                            "layers": layers}
+            if material is not None:
+                params["material"] = material
+            if finish is not None:
+                params["finish"] = finish
+            r = cb.call("request_quote", params)
+            quote = r.get("quote") if isinstance(r, dict) else None
+            if isinstance(quote, dict):
+                return _dumps({"ok": bool(quote.get("ok")), "quote": quote})
+            return _dumps(r)
         except Exception as e:  # noqa: BLE001
             return _err(e)

@@ -64,54 +64,6 @@ def test_dag_state_reducer_fan_in_two_writers():
 # 2. on_event dual arity
 # ---------------------------------------------------------------------------
 
-def test_normalize_on_event_dict_arity():
-    from services.agent.loop import normalize_on_event
-
-    seen: list[Any] = []
-
-    def sink_dict(ev: dict) -> None:
-        seen.append(("dict", ev))
-
-    adapted = normalize_on_event(sink_dict)
-    assert adapted is not None
-    adapted({"kind": "status", "text": "hi"})
-    adapted("dag.node.started", {"node_id": "n1"})
-    assert seen[0][0] == "dict" and seen[0][1]["kind"] == "status"
-    # two-arg emit adapted into single dict with kind
-    assert seen[1][0] == "dict"
-    assert seen[1][1].get("kind") == "dag.node.started"
-    assert seen[1][1].get("node_id") == "n1"
-
-
-def test_normalize_on_event_str_dict_arity():
-    from services.agent.loop import normalize_on_event
-
-    seen: list[Any] = []
-
-    def sink_pair(kind: str, payload: dict) -> None:
-        seen.append((kind, payload))
-
-    adapted = normalize_on_event(sink_pair)
-    assert adapted is not None
-    adapted("dag.run.started", {"run_id": "r1"})
-    adapted({"kind": "mission_phase", "phase": "intake"})
-    assert seen[0] == ("dag.run.started", {"run_id": "r1"})
-    # dict form adapted into (kind, dict)
-    assert seen[1][0] == "mission_phase"
-    assert seen[1][1]["phase"] == "intake"
-
-
-def test_normalize_on_event_never_raises_on_bad_sink():
-    from services.agent.loop import normalize_on_event
-
-    def boom(*_a, **_k):
-        raise RuntimeError("sink exploded")
-
-    adapted = normalize_on_event(boom)
-    adapted("x", {"y": 1})  # must not raise
-    adapted({"kind": "z"})
-
-
 # ---------------------------------------------------------------------------
 # 3. Auth fail-closed pre-DAG
 # ---------------------------------------------------------------------------
@@ -152,70 +104,6 @@ def test_provider_for_tier_xai_with_key_constructs(monkeypatch):
     assert calls[-1][0] == "xai"
     assert calls[-1][1] == "test-key-not-real"
     assert prov.name == "xai"
-
-
-def test_run_mission_auth_fail_closed_pre_dag(monkeypatch, tmp_path):
-    """xai:* with no creds → stop_reason=provider_auth BEFORE DAG launches."""
-    monkeypatch.setenv("AI_CAD_TIER", "xai:grok-4-5")
-    monkeypatch.setenv("AI_CAD_ADVISOR", "0")
-    monkeypatch.delenv("AI_CAD_PROVIDER", raising=False)
-    monkeypatch.delenv("XAI_API_KEY", raising=False)
-
-    from services.agent import loop
-    from services.agent.tiers import MissionAuthError
-    from services.agent.providers import sub_auth
-    from services.agent.providers.base import Provider
-
-    monkeypatch.setattr(sub_auth, "load_credential", lambda *_a, **_k: None)
-
-    class _MockProv(Provider):
-        name = "mock"
-        model = "mock"
-
-        def complete(self, system, messages, max_tokens=8000):
-            return '{"done": true}'
-
-    manifest = {
-        "schema": "aicad.deliverables/1",
-        "request_verbatim": "a part",
-        "deliverables": [{
-            "id": "DL1", "kind": "part", "name": "widget",
-            "description": "x",
-            "acceptance_criteria": [{
-                "id": "AC1", "text": "exists",
-                "check": {"tool": "measure_part", "pass_rule": "ok"},
-            }],
-            "depends_on": [], "status": "pending",
-        }],
-        "ambiguities": [], "assumptions": [],
-    }
-
-    dag_called = {"n": 0}
-
-    def _fake_dag_run(*_a, **_k):
-        dag_called["n"] += 1
-        return {"status": "done", "nodes": {}}
-
-    monkeypatch.setattr("services.dag.executor.run", _fake_dag_run)
-
-    # Force provider_for_tier to raise even if env leaks a key.
-    import services.agent.tiers as tiers_mod
-
-    def _raise_auth(tier, cfg=None):
-        raise MissionAuthError(
-            "no creds", code="auth_missing", tried=["xai-sub", "xai"], tier=tier)
-
-    monkeypatch.setattr(tiers_mod, "provider_for_tier", _raise_auth)
-    monkeypatch.setattr(tiers_mod, "detect_tier_from_env", lambda: "xai:grok-4-5")
-    monkeypatch.setattr(tiers_mod, "parse_xai_tier",
-                        lambda t: "grok-4.5" if t and str(t).startswith("xai:") else None)
-
-    result = loop.run_mission(
-        "a part", _MockProv(), name="mega1-auth-test",
-        intake_fn=lambda r: manifest, execute_dag=True, autonomy_default="auto")
-    assert result.stop_reason == "provider_auth", result.stop_reason
-    assert result.status == "failed"
-    assert dag_called["n"] == 0, "DAG must not launch after auth fail-closed"
 
 
 # ---------------------------------------------------------------------------

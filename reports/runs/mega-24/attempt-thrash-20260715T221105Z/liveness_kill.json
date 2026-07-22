@@ -1,6 +1,0 @@
-{
-  "reason": "liveness kill: dag.node.failed count=4 > 3 (tools=147)",
-  "archive": "/home/hunter/Repositories/CAD/reports/runs/mega-24/attempt-thrash-20260715T221105Z",
-  "wall": 1784153465.006777,
-  "stamp": "20260715T221105Z"
-}

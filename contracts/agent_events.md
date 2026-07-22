@@ -6,6 +6,12 @@
 > the built-in agent loop) and two sinks (the mission-control UI live stream and the
 > telemetry journal). Never duplicate this vocabulary in a parallel file.
 >
+> **Machine check:** the canonical machine-readable kind list is
+> `contracts/agent_events.json` (kinds + required payload fields), verified against both
+> emitters (`core/agent/events.cpp`, `services/agent/agent_events.py`) by
+> `scripts/agent_events_audit.py` (wired into `scripts/check.py`). Any kind added here
+> MUST be added to the JSON in the same change or the gate fails.
+>
 > **`/2` is a strict superset of `/1`** — every `/1` record is a valid `/2` record.
 > `/2` adds four net-new agent-level kinds (`agent.context_injected`, `agent.spawn`,
 > `agent.advisor`, and the forward-compat `agent.thought.delta`), a human-readable
@@ -197,7 +203,8 @@ A conforming consumer MUST:
 
 ## Early-stop detail (2026-07-16, additive)
 On `run_finished` / terminal `status` (phase done|error|failed|cancelled) and the
-`agent_design` RPC result, optional additive fields:
+agent run RPC result (`agent_run_v2`; formerly also `agent_design`, removed T-RF5),
+optional additive fields:
 - `stop_reason` — short enum-ish string (confirmed|stabilized|refine_cap|max_iters|no_code|failed|provider_error|provider_auth|provider_unavailable|phase_step_cap|terminated_by_user|…)
 - `error_detail` — human sentence, secret-scrubbed, ≤~300 chars; empty on normal completion. Prefer over legacy `error`.
 GUI renders error bubbles as `stopped: <stop_reason> — <error_detail>` when present.
@@ -247,7 +254,7 @@ Event `kind:"plan_state"` { shape:"build_plan"|"checklist"|"phased_todo"|"object
 Producers: core/agent/machine.cpp (build_plan after plan pass; checklist from plan_steps live; objectives when plan JSON has objectives/acceptance/success_criteria); core/agent/run.cpp mission loop (phased_todo). DAG not emitted from C++ (host reads buildgraph sidecar/RPC). Back-compat: kind:"plan"+PlanInfo kept; host normalizes PlanInfo→plan_state build_plan when planState empty. Raw plan_steps/model_step/mission_* remain. GUI: copilot Plan/Objectives section (tiles+hover tooltips, todos tree, subagents) above the activity timeline.
 
 ## options.mode — copilot mode overhaul (Agent/Plan/Swarm/Edit/Ask)
-`options` on agent_run/agent_run_v2/agent_design/agent_mission_v1:
+`options` on agent_run/agent_run_v2/agent_mission_v1 (agent_design removed T-RF5):
 | key | type | default | meaning |
 |-----|------|---------|--------|
 | mode | agent|plan|swarm|edit|ask | agent | copilot composer mode (persisted host-side as config copilot_mode) |

@@ -36,7 +36,7 @@
 // Overlay layout: the dockspace hosts ONLY the central document windows, tabbed in one node, so
 // the viewport runs edge to edge between the ribbon and the status bar. The FeatureManager and
 // Copilot are pinned floating glass columns drawn OVER the viewport (drawLeftPane below /
-// drawAIPanel in legacy_chat.cpp) — no left/right dock splits, no splitter bars anywhere.
+// drawAIPanel in ui/copilot/panel.cpp) — no left/right dock splits, no splitter bars anywhere.
 // "Reset layout" rebuilds exactly this (plus resetOverlayColumns for the columns' geometry).
 void buildDefaultLayout(ImGuiID root, const ImVec2& size) {
     ImGui::DockBuilderRemoveNode(root);

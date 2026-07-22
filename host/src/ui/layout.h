@@ -5,7 +5,7 @@
 // SolidWorks docked-columns arrangement (left task pane / right task pane / dialogs slot) is GONE —
 // buildDefaultLayout() now builds a single splitless central node, and the FeatureManager renders
 // as a pinned full-height rounded glass column OVER the viewport's left edge (drawLeftPane). The
-// Copilot column (legacy_chat.cpp) mirrors the same pattern on the right edge.
+// Copilot column (ui/copilot/) mirrors the same pattern on the right edge.
 //
 // buildDefaultLayout stays in the GLOBAL namespace because app_state.h forward-declares it there
 // and app.cpp calls it unqualified — keeping it global avoids touching either site.
@@ -41,7 +41,7 @@ enum {
 // The screen-space rect between the ribbon (bottom edge of the chrome) and the status bar — the
 // region the full-width viewport surface fills and the pinned glass columns overlay. app.cpp
 // publishes it once per frame (setOverlayBand, right where dockTopY/statusH are computed) before
-// the panels draw; consumers (drawLeftPane here, the Copilot column in legacy_chat.cpp) read it
+// the panels draw; consumers (drawLeftPane here, the Copilot column in ui/copilot/) read it
 // via overlayBand() to anchor their pinned geometry.
 struct OverlayBand {
     float minX = 0.f, minY = 0.f, maxX = 0.f, maxY = 0.f;
@@ -53,7 +53,7 @@ const OverlayBand& overlayBand();
 // "Reset layout" (title_bar.cpp -> st.resetLayout -> app.cpp rebuild branch) must also restore the
 // pinned columns' default width/collapse state, or the menu item breaks its promise. app.cpp calls
 // resetOverlayColumns() in the rebuild branch; each column consumes its one-shot flag on its next
-// draw. Slots: 0 = FeatureManager column (drawLeftPane), 1 = Copilot column (legacy_chat.cpp).
+// draw. Slots: 0 = FeatureManager column (drawLeftPane), 1 = Copilot column (ui/copilot/).
 void resetOverlayColumns();
 bool takeOverlayColumnReset(int slot);
 

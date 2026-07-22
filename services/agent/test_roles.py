@@ -679,59 +679,5 @@ class TestSketch2dModel3dRoles(unittest.TestCase):
             self.assertEqual(errs, [], f"{rid}: " + "; ".join(str(e) for e in errs))
 
 
-class TestLoopRoleSeam(unittest.TestCase):
-    """The single-role loop host (services/agent/loop.py) applies a role card's
-    system prompt when ``role=`` is passed."""
-
-    def test_generate_uses_role_prompt(self):
-        from services.agent import loop
-        from services.agent.providers.base import Provider
-
-        captured = {}
-
-        class _CaptureProvider(Provider):
-            name = "capture"
-
-            def complete_ex(self, system, messages, max_tokens=8000):
-                captured["system"] = system
-                return ("done", "")
-
-        card = roles.load_role("sketcher")
-        sess = loop.Session(name="t_role", role_prompt=card.system_prompt)
-        sess.messages = [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
-        loop._generate(sess, _CaptureProvider(), None, 0, 1)
-        # loop strips whitespace on the role prompt, then appends the skills
-        # catalog block ([SKILLS] ...) — shipped behavior since the wave-1
-        # prompt/skills work (d779f85b / 79664632); contracts/skills.md. The
-        # skills block is best-effort (loop.py: a broken/unloadable skills
-        # module must never break the loop — e.g. when a sibling test leaves a
-        # deleted CWD behind, skills discovery fails and the block is omitted),
-        # so assert the role prompt is the verbatim prefix, not exact equality.
-        system = captured["system"]
-        self.assertTrue(system.startswith(card.system_prompt.strip()),
-                        system[:200])
-        self.assertIn("SKETCHER", system)
-
-    def test_default_prompt_without_role(self):
-        from services.agent import loop
-        from services.agent.providers.base import Provider
-
-        captured = {}
-
-        class _CaptureProvider(Provider):
-            name = "capture"
-
-            def complete_ex(self, system, messages, max_tokens=8000):
-                captured["system"] = system
-                return ("done", "")
-
-        sess = loop.Session(name="t_norole")
-        sess.messages = [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
-        loop._generate(sess, _CaptureProvider(), None, 0, 1)
-        # falls back to the built-in SYSTEM_PROMPT (no role, no config override)
-        self.assertNotEqual(captured["system"], "")
-        self.assertNotIn("SKETCHER", captured["system"])
-
-
 if __name__ == "__main__":
     unittest.main()

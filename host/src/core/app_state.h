@@ -555,7 +555,7 @@ struct ActivityItem {
     //     deltas arrive, collapsed-by-default once complete (M13);
     // 3 = tool call row (agent.tool_call): title=tool_name, reason=target ("what it acts on"),
     //     durationMs=latency_ms, status=done|fail from `ok` (M14).
-    // 4–8 = corporate org cards (see legacy_chat feedCorporateEvent).
+    // 4–8 = corporate org cards (see copilot/feed.cpp feedCorporateEvent).
     // 9 = provider_call log row (aggregated, not drawn inline).
     // 10 = routing / classification card.
     // 11 = swarm_wave header (wave N/M + task titles/status).

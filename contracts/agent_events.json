@@ -1,0 +1,50 @@
+{
+  "schema": "aicad.agent_events/2",
+  "prose_contract": "contracts/agent_events.md",
+  "checked_by": "scripts/agent_events_audit.py",
+  "scanned_emitters": [
+    "core/agent/events.cpp",
+    "services/agent/agent_events.py"
+  ],
+  "notes": [
+    "Machine-readable canonical kind list for the frozen aicad.agent_events/2 vocabulary. The .md remains the prose contract; this file is the machine check (scripts/agent_events_audit.py, wired into scripts/check.py).",
+    "required_fields lists the payload fields the prose contract defines for each kind (envelope fields kind/ts/run_id and the /2 linkage fields id/parent_id/actor/seq are implied and not repeated).",
+    "optional=true means the kind is reserved, or its producer lives outside the two scanned emitters (e.g. services/dag, core/agent/machine.cpp, the ask/interaction paths); the audit then treats a missing emitter as WARN, not FAIL.",
+    "When adding a kind: bump per the .md header rules, add it here, and emit it from at least one runtime."
+  ],
+  "kinds": [
+    {"kind": "dag.run.started", "required_fields": ["graph_id", "node_count", "graph_name"], "optional": true, "emitter_note": "services/dag executor (outside scanned emitters)"},
+    {"kind": "dag.node.started", "required_fields": ["node_id", "node_type", "node_name"], "optional": true, "emitter_note": "services/dag executor"},
+    {"kind": "dag.node.done", "required_fields": ["node_id", "output_summary"], "optional": true, "emitter_note": "services/dag executor"},
+    {"kind": "dag.node.failed", "required_fields": ["node_id", "error"], "optional": true, "emitter_note": "services/dag executor"},
+    {"kind": "dag.node.paused", "required_fields": ["node_id", "reason"], "optional": true, "emitter_note": "services/dag executor"},
+    {"kind": "dag.node.approval_required", "required_fields": ["node_id"], "optional": true, "emitter_note": "services/dag executor"},
+    {"kind": "dag.node.manual_required", "required_fields": ["node_id"], "optional": true, "emitter_note": "services/dag executor"},
+    {"kind": "dag.run.done", "required_fields": ["status", "node_states"], "optional": true, "emitter_note": "services/dag executor"},
+
+    {"kind": "agent.thought", "required_fields": ["node_id", "text"], "optional": false, "emitter_note": "both runtimes"},
+    {"kind": "agent.thought.delta", "required_fields": ["node_id", "text"], "optional": true, "emitter_note": "reserved forward-compat (producer-gated on token streaming); Python builder exists"},
+    {"kind": "agent.tool_call", "required_fields": ["node_id", "tool_name", "target", "args_digest", "result_digest", "ok", "latency_ms"], "optional": false, "emitter_note": "both runtimes"},
+    {"kind": "agent.artifact", "required_fields": ["node_id", "artifact_id", "kind", "path", "summary"], "optional": true, "emitter_note": "frozen /1 kind; no live journal producer (see .md §3.2a note)"},
+    {"kind": "agent.question", "required_fields": ["node_id", "batch_id", "prompt"], "optional": true, "emitter_note": "ask/interaction paths (contracts/interaction.md §7)"},
+    {"kind": "agent.answer", "required_fields": ["node_id", "batch_id", "source"], "optional": true, "emitter_note": "ask/interaction paths"},
+
+    {"kind": "agent.context_injected", "required_fields": ["node_id", "source", "label"], "optional": false, "emitter_note": "python"},
+    {"kind": "agent.spawn", "required_fields": ["node_id", "subagent_id", "role", "spawn_kind", "brief", "budget_tokens"], "optional": false, "emitter_note": "python"},
+    {"kind": "agent.advisor", "required_fields": ["node_id", "advisor_kind", "verdict_summary"], "optional": false, "emitter_note": "python"},
+    {"kind": "agent.classification", "required_fields": ["task_class", "scaffold_level", "tier", "reason", "request_snippet"], "optional": false, "emitter_note": "python (2026-07-17 additive)"},
+    {"kind": "agent.model_assignment", "required_fields": ["depth", "task_class", "picked_model"], "optional": false, "emitter_note": "python (spawn model-assignment audit, watch-list additive)"},
+
+    {"kind": "mission.brief.proposed", "required_fields": ["batch_id", "brief_ref"], "optional": true, "emitter_note": "design-brief flow (telemetry.md §5.4)"},
+    {"kind": "mission.brief.signed", "required_fields": ["batch_id", "brief_ref", "signed_ref"], "optional": true, "emitter_note": "design-brief flow"},
+    {"kind": "corporate", "required_fields": ["corp_event"], "optional": true, "emitter_note": "services/agent/corporate.py emit_corporate_event"},
+
+    {"kind": "plan_state", "required_fields": ["shape", "title", "revision", "items"], "optional": false, "emitter_note": "cpp (batch 2c additive)"},
+    {"kind": "agent_steer", "required_fields": ["text"], "optional": true, "emitter_note": "core/agent/machine.cpp (outside scanned emitters)"},
+    {"kind": "doc.preview", "required_fields": ["doc_id", "revision", "aicm_path"], "optional": false, "emitter_note": "cpp"},
+
+    {"kind": "ai_artifact", "required_fields": ["artifact_id", "insertion_point", "model", "prompt_hash", "input_ref", "output_ref", "base_revision", "verifier_scores", "latency_ms", "consent"], "optional": false, "emitter_note": "cpp (telemetry.md vocabulary)"},
+    {"kind": "ai_artifact_action", "required_fields": ["artifact_id", "action", "revision", "edit_ops_ref", "undo_within_ops", "dwell_ms", "note", "consent"], "optional": false, "emitter_note": "cpp (telemetry.md vocabulary)"},
+    {"kind": "doc_semantic_diff", "required_fields": ["artifact_id", "from_revision", "to_revision", "diff_ref", "consent"], "optional": false, "emitter_note": "cpp (telemetry.md vocabulary)"}
+  ]
+}

@@ -85,6 +85,15 @@ def _ensure_import_stubs() -> None:
 _ensure_import_stubs()
 
 from services.mcp import reveng_tools as rt  # noqa: E402
+from services.mcp import reveng_common as rc  # noqa: E402  T-RF8: pipeline internals moved
+from services.mcp import reveng_build_tools as rb  # noqa: E402
+from services.mcp import reveng_session_tools as rs  # noqa: E402
+
+
+def _patch_reveng_status(monkeypatch, value):
+    """_reveng_status is looked up in common (pipeline fn) + both tool modules."""
+    for mod in (rc, rb, rs):
+        monkeypatch.setattr(mod, "_reveng_status", value)
 
 
 # ---------------------------------------------------------------------------
@@ -290,10 +299,10 @@ def _install_backend(
             "notes": [],
         }
 
-    monkeypatch.setattr(rt, "_call_reverse_engineer", _fake_re)
+    monkeypatch.setattr(rc, "_call_reverse_engineer", _fake_re)
 
     # reveng_status capabilities (so open paths aren't pre-gated elsewhere)
-    monkeypatch.setattr(rt, "_reveng_status", lambda: {
+    _patch_reveng_status(monkeypatch, lambda: {
         "ok": True,
         "capabilities": {
             "sparse": True, "dense": True, "splat": True,
@@ -366,7 +375,7 @@ class TestReconstructNode:
 
         monkeypatch.setitem(sys.modules, "engine_oracle.vision.colmap_pipeline", _Boom())
         monkeypatch.setitem(sys.modules, "engine_oracle.vision.ffwd_sfm", _Boom())
-        monkeypatch.setattr(rt, "_reveng_status", lambda: {
+        _patch_reveng_status(monkeypatch, lambda: {
             "ok": True,
             "capabilities": {"sparse": False, "dense": False},
             "provisioning": {}, "banners": [], "missing": [],
@@ -510,7 +519,7 @@ class TestMcpToolUnstubs:
 
         sp.reconstruct_single_photo = reconstruct_single_photo
         monkeypatch.setitem(sys.modules, "engine_oracle.vision.single_photo", sp)
-        monkeypatch.setattr(rt, "_reveng_status", lambda: {
+        _patch_reveng_status(monkeypatch, lambda: {
             "ok": True,
             "capabilities": {"single_photo": True},
             "provisioning": {}, "banners": [], "missing": [],

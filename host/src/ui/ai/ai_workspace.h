@@ -4,7 +4,7 @@
 //     (Phase 1 renders the existing buildgraph view in both; Phase 2 swaps in the live
 //     agent-execution DAG for Agent Workflow). Left of it: the sessions/sub-agents rail.
 //   - LOWER-LEFT: the conversation window (message log + composer) — ALWAYS visible, no tab
-//     (SAME state/send path as the docked column, via the legacy_chat.h reuse hooks).
+//     (SAME state/send path as the docked column, via the ui/copilot/copilot.h reuse hooks).
 //   - LOWER-RIGHT: AI *workflow* settings only (Supervised/Autopilot, refine passes, max output
 //     tokens, context window). The inference block (model/effort/tokens/API key/privacy/vision)
 //     lives ONLY on the main Settings page now — persisted through saveSettings (config.json).

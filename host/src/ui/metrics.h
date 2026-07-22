@@ -44,7 +44,7 @@ inline float pmOkBtn()     { return px(28.0f); }   // OK / Cancel button size
 inline float titleFramePadX() { return px(14.0f); }
 inline float titleFramePadY() { return px(12.0f); }
 
-// ---- pinned Copilot column default/min width (PIXELS; consumed by legacy_chat drawAIPanel) -----
+// ---- pinned Copilot column default/min width (PIXELS; consumed by copilot/panel.cpp drawAIPanel) -----
 inline float dockRightTarget() { return px(340.0f); }
 inline float dockRightMin()    { return px(200.0f); }
 
@@ -62,7 +62,7 @@ inline float ribbonBtnRound()    { return rounding(3.0f); }  // button + tab fil
 inline float ribbonSplitInset()  { return px(4.0f); }        // big-button split divider inset
 inline float ribbonSmSplitInset(){ return px(2.0f); }        // small-button + tab underline inset
 
-// ---- AI Copilot pane (legacy_chat.cpp) --------------------------------------------------------
+// ---- AI Copilot pane (ui/copilot/, split from legacy_chat.cpp) -------------------------------
 inline float copilotBtnH()        { return px(32.0f); }   // primary send / build button height
 inline int   copilotInputMaxLines(){ return 6; }          // prompt box grows to N lines, then scrolls
 inline float copilotThumbW()      { return px(220.0f); }  // iteration contact-sheet thumbnail width

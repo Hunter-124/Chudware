@@ -86,10 +86,20 @@ endif()
 set(BILLET_CORE_SOURCES
   src/main.cpp
   src/app.cpp
+  src/app_commands.cpp   # T-RF11: ribbon command router + family handlers (extracted from app.cpp)
   src/ui/scenarios.cpp   # scripted screenshot/test scenarios (extracted from app.cpp)
   src/core/app_state.cpp
   src/core/jobs.cpp
-  src/ui/legacy_chat.cpp
+  # --- AI Copilot (T-RF6: split of the legacy_chat.cpp monolith — one chat impl, two hosts) ---
+  src/ui/copilot/ui_common.cpp          # glass/bubble toolkit + shared small-UI helpers
+  src/ui/copilot/chat_log.cpp           # message list rendering + stick-to-bottom
+  src/ui/copilot/activity_timeline.cpp  # per-turn typed-block activity timeline
+  src/ui/copilot/cards.cpp              # plan/clarify/corporate/swarm cards + AI-VC
+  src/ui/copilot/feed.cpp               # feedTurnActivity stream-event folding
+  src/ui/copilot/conversations.cpp      # conversation tabs + chat-history persistence
+  src/ui/copilot/settings.cpp           # AI settings sections + model dropdown
+  src/ui/copilot/composer.cpp           # chat input + send path + composer chrome
+  src/ui/copilot/panel.cpp              # drawAIPanel host + ai_workspace reuse hooks
   src/ui/settings_modal.cpp
   src/ui/oauth_capture.cpp  # in-app xAI multi-account CEF OAuth (Settings → Accounts)
   src/ui/console_panel.cpp

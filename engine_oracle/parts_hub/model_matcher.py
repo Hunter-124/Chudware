@@ -27,7 +27,38 @@ from __future__ import annotations
 
 from typing import Any
 
-from .. import spec_sheet_matcher as _ssm
+
+def _ssm_normalize(mpn: str) -> str:
+    """spec_sheet_matcher was deleted (T-RF18); the C++ port answers via core_bridge."""
+    from services.mcp import core_bridge as _cb
+    try:
+        r = _cb.call("normalize_mpn", {"mpn": mpn})
+        if isinstance(r, dict) and r.get("ok"):
+            return r.get("normalized", mpn)
+    except Exception:  # noqa: BLE001 — offline/degraded: identity normalize
+        pass
+    return str(mpn).strip().upper()
+
+
+def _ssm_match(mpn: str, generate: bool = False) -> dict:
+    from services.mcp import core_bridge as _cb
+    r = _cb.call("match_part_number", {"mpn": mpn, "generate": generate})
+    if isinstance(r, dict) and isinstance(r.get("match"), dict):
+        return r["match"]
+    return r if isinstance(r, dict) else {}
+
+
+class _Ssm:
+    @staticmethod
+    def normalize_mpn(mpn: str) -> str:
+        return _ssm_normalize(mpn)
+
+    @staticmethod
+    def match_part_number(mpn: str, generate: bool = False) -> dict:
+        return _ssm_match(mpn, generate)
+
+
+_ssm = _Ssm()
 
 # CAD-model-yielding sites ONLY (contracts/sourcing.md §2a). Commerce/datasheet
 # adapters do not yield importable geometry and are excluded from the fan-out.

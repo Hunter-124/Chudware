@@ -20,8 +20,10 @@ for, and shows the repair-runtime flow. Workers tolerate unknown OPTIONAL params
 ## 2. Doc worker (`engine/worker.py`) — method table
 
 ### Legacy (unchanged, frozen)
-`ping` · `run_model {code, name?}` · `agent_design {request, name?, session_id?, reset?,
-max_iters?, plan?}` · `get_prompts` · `shutdown`
+`ping` · `run_model {code, name?}` · `get_prompts` · `shutdown`
+
+> `agent_design` was REMOVED 2026-07-22 (T-RF5): the C++ `agent_run_v2` covers its
+> surface; the method now returns "unknown method" everywhere.
 
 ### Documents
 | method | params → result |

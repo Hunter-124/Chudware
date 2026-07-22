@@ -303,12 +303,13 @@ int renderContact(const std::string& stl, const std::string& out) {
 
 }  // namespace
 
-// Drive the Python worker: build a solid (from a .py file / inline code) or run the full
-// AI design loop, then render the resulting STL to a contact sheet — proving the whole
-// native pipeline: host -> worker -> build123d -> STL -> GL render -> PNG.
-int buildAndRender(const std::string& src, const std::string& out, bool isDesign) {
+// Drive the Python worker: build a solid (from a .py file / inline code), then render the
+// resulting STL to a contact sheet — proving the whole native pipeline: host -> worker ->
+// build123d -> STL -> GL render -> PNG. (The --design mode was removed in T-RF5 with the
+// legacy agent_design loop; the in-app copilot is the design path.)
+int buildAndRender(const std::string& src, const std::string& out) {
     std::string code = src;
-    if (!isDesign) {
+    {
         std::ifstream f(src, std::ios::binary);
         if (f) {
             std::ostringstream ss;
@@ -328,21 +329,13 @@ int buildAndRender(const std::string& src, const std::string& out, bool isDesign
         return 6;
     }
     nlohmann::json result;
-    bool ok;
-    if (isDesign)
-        ok = w.call("agent_design", {{"request", src}, {"name", "host_design"}}, result, err,
-                    900000);
-    else
-        ok = w.call("run_model", {{"code", code}, {"name", "host_build"}}, result, err, 120000);
+    const bool ok = w.call("run_model", {{"code", code}, {"name", "host_build"}}, result, err,
+                           120000);
     if (!ok) {
         std::fprintf(stderr, "worker call failed: %s\n", err.c_str());
         return 7;
     }
-    std::string stl;
-    if (isDesign)
-        stl = result.value("result", nlohmann::json::object()).value("stl_path", "");
-    else
-        stl = result.value("stl_path", "");
+    std::string stl = result.value("stl_path", "");
     if (stl.empty()) {
         std::fprintf(stderr, "no STL produced. worker result:\n%s\n", result.dump(2).c_str());
         return 8;
@@ -452,9 +445,7 @@ int main(int argc, char** argv) {
     if (argc >= 4 && std::strcmp(argv[1], "--contact") == 0)
         return renderContact(argv[2], argv[3]);
     if (argc >= 4 && std::strcmp(argv[1], "--build") == 0)
-        return buildAndRender(argv[2], argv[3], false);
-    if (argc >= 4 && std::strcmp(argv[1], "--design") == 0)
-        return buildAndRender(argv[2], argv[3], true);
+        return buildAndRender(argv[2], argv[3]);
     if (argc >= 2 && std::strcmp(argv[1], "--ensure-runtime") == 0) {
         std::string log;
         bool ok = ensureRuntime(log);

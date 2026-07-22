@@ -1,6 +1,7 @@
 """Sourcing MCP tools: unified BOM roll-up + provider-resolved pricing (workstream B).
 
-Thin MCP adapter over :mod:`engine.bom`. ``bom_rollup`` walks an assembly document (and any
+Thin MCP adapter over the C++ core (libaicad ``bom_rollup`` / ``bom_price`` RPCs via
+:mod:`services.mcp.core_bridge`, T-RF18). ``bom_rollup`` walks an assembly document (and any
 linked ECAD board) into a unified made/bought BOM; ``bom_price`` additionally resolves the
 bought lines' prices through the approved-provider chain (Nexar→Digi-Key→Mouser). Both return
 JSON-serializable BOM lines (``aicad.sourcing/1`` §3). No scraping, no network without configured
@@ -12,6 +13,7 @@ from __future__ import annotations
 from mcp.server.fastmcp import FastMCP
 
 from mcp_server.cad_tools import _dumps, _err
+from . import core_bridge as cb
 
 
 def register_sourcing_tools(mcp: FastMCP) -> None:
@@ -27,9 +29,7 @@ def register_sourcing_tools(mcp: FastMCP) -> None:
         Returns {ok, bom: [BomLine...]} where each line follows aicad.sourcing/1 §3.
         """
         try:
-            from engine import bom as bom_mod
-            lines = bom_mod.rollup(doc_path)
-            return _dumps({"ok": True, "bom": bom_mod.to_dicts(lines)})
+            return _dumps(cb.call("bom_rollup", {"doc_path": doc_path}))
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -45,8 +45,6 @@ def register_sourcing_tools(mcp: FastMCP) -> None:
         model. Returns {ok, bom: [BomLine...]}.
         """
         try:
-            from engine import bom as bom_mod
-            lines = bom_mod.resolve_prices(bom_mod.rollup(doc_path))
-            return _dumps({"ok": True, "bom": bom_mod.to_dicts(lines)})
+            return _dumps(cb.call("bom_price", {"doc_path": doc_path}))
         except Exception as e:  # noqa: BLE001
             return _err(e)

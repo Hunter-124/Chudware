@@ -31,9 +31,10 @@ tests inject a mock provider that returns canned audit JSON — real code paths,
 all-skip).  Every audit record logs ``tokens`` (cost control: audits are
 frontier-model calls).
 
-Routing seam (§14): overseer binds to ``strongest``.  Until T-W14 (model routing)
-lands, :func:`resolve_overseer_provider` uses a hardcoded provider-preference list;
-the seam is clearly marked so T-W14 can drop in ``routing.yaml`` resolution.
+Routing seam (§14): overseer binds to ``strongest``. :func:`resolve_overseer_provider`
+resolves that assignment from routing.yaml (T-W14) when a routing table is passed,
+falling back to a hardcoded provider-preference list only when routing.yaml has no
+configured sources.
 """
 from __future__ import annotations
 
@@ -69,26 +70,22 @@ _BLOCKER_ESCALATE_AT = 2
 
 
 # ---------------------------------------------------------------------------
-# Role-card loader — minimal local YAML read.
-#   TODO(T-W7): replace this whole helper with the T-W7 role loader
-#   (services/agent/roles loader) once its branch merges.  It must return the
-#   same shape (a dict with ``system_prompt``); do NOT import T-W7's branch here.
+# Role-card loader — delegates to the canonical T-W7 role loader
+# (services/agent/roles.py) so the overseer reads the same card — including
+# Settings → Prompts overrides — as every other role consumer.
 # ---------------------------------------------------------------------------
-
-_ROLES_DIR = Path(__file__).resolve().parents[1] / "roles"
 
 
 def load_role_card(role_id: str = "overseer", roles_dir: Path | None = None) -> dict:
-    """Load a role card YAML into a dict.  Minimal local read (T-W7 seam).
+    """Load a role card YAML into a dict with ``system_prompt`` (via the T-W7 loader).
 
     Returns ``{}`` if the card is missing or unparseable — the caller degrades to
     a built-in fallback system prompt rather than crashing a mission.
     """
-    d = roles_dir or _ROLES_DIR
-    path = d / f"{role_id}.yaml"
     try:
-        import yaml  # PyYAML is already a repo dependency (used across roles/)
-        return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        from services.agent.roles import load_role  # lazy: avoid import cost/cycles
+        card = load_role(role_id, roles_dir=roles_dir)
+        return {"id": card.id, "goal": card.goal, "system_prompt": card.system_prompt}
     except Exception:  # noqa: BLE001 — missing/broken card must not break the run
         return {}
 

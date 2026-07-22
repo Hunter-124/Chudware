@@ -1,8 +1,7 @@
-"""Worker-layer tests: session reuse across agent_design RPC calls + event forwarding.
+"""Worker-layer tests: run_model assembly detection + the streaming event wire format.
 
-Drives engine.worker's handlers directly with a mock provider (no model/API needed), so
-the session registry and the streaming `emit` contract the native client consumes are
-exercised deterministically.
+(T-RF5 removed the agent_design session-reuse / plan / provider-override tests with the
+agent_design RPC itself.)
 """
 from __future__ import annotations
 
@@ -11,89 +10,7 @@ import json
 import subprocess
 import sys
 
-from agent import config
-from agent.providers.mock_provider import MockProvider
 from engine import worker
-
-
-def _factory(replies: list[str]):
-    return lambda *a, **k: MockProvider(replies)
-
-
-def test_session_reuse_reset_and_streaming() -> None:
-    original = config.get_provider
-    worker._SESSIONS.clear()
-    events: list[dict] = []
-    emit = events.append
-    try:
-        # turn 1 — fresh session
-        config.get_provider = _factory([
-            '```python\nresult = Box(15, 15, 15)\n```\n```json\n{"done": false, "notes": "v1"}\n```',
-            '```json\n{"done": true, "notes": "ok"}\n```',
-        ])
-        r1 = worker._agent_design(
-            {"request": "a 15mm cube", "name": "wkr", "session_id": "s1", "plan": False}, emit)
-        assert r1["success"] and r1["turn"] == 1, "turn 1 should be the first turn"
-        assert "s1" in worker._SESSIONS, "session should be registered"
-
-        # turn 2 — same session id must continue (refine), not restart
-        config.get_provider = _factory([
-            '```python\nresult = Box(15, 15, 30)\n```\n```json\n{"done": false, "notes": "taller"}\n```',
-            '```json\n{"done": true, "notes": "ok"}\n```',
-        ])
-        r2 = worker._agent_design(
-            {"request": "twice as tall", "name": "wkr", "session_id": "s1", "plan": False},
-            emit)
-        assert r2["turn"] == 2, "same session_id must advance the turn counter"
-        assert "15, 15, 30" in (r2["final_code"] or ""), "turn 2 should refine to the taller cube"
-
-        # reset — start a brand-new session under the same id
-        config.get_provider = _factory([
-            '```python\nresult = Box(8, 8, 8)\n```\n```json\n{"done": false, "notes": "v1"}\n```',
-            '```json\n{"done": true, "notes": "ok"}\n```',
-        ])
-        r3 = worker._agent_design(
-            {"request": "small cube", "name": "wkr", "session_id": "s1", "reset": True,
-             "plan": False}, emit)
-        assert r3["turn"] == 1, "reset must start a new session at turn 1"
-
-        # events were forwarded in the structured shape the UI consumes
-        it = [e for e in events if e.get("kind") == "iteration"]
-        st = [e for e in events if e.get("kind") == "status"]
-        assert it and st, "worker must forward status + iteration events"
-        assert it[0].get("code") and "Box(" in it[0]["code"], "iteration events carry code"
-        print("[worker] turns:", r1["turn"], r2["turn"], "reset->", r3["turn"],
-              " events:", len(events), " (iter", len(it), "/ status", len(st), ")")
-    finally:
-        config.get_provider = original
-
-
-def test_plan_event_forwarded() -> None:
-    """With plan mode on, the worker must forward the "plan" event (the GUI's plan card)
-    and the run result must carry the parsed plan."""
-    original = config.get_provider
-    worker._SESSIONS.clear()
-    events: list[dict] = []
-    plan_reply = ('```json\n{"name": "cube", "summary": "one box", "parts": '
-                  '[{"name": "cube", "purpose": "demo", "dimensions": {"side": 15}, '
-                  '"features": ["none"]}], "fit": ""}\n```')
-    try:
-        config.get_provider = _factory([
-            plan_reply,
-            '```python\nresult = Box(15, 15, 15)\n```\n```json\n{"done": false, "notes": "v1"}\n```',
-            '```json\n{"done": true, "notes": "ok"}\n```',
-        ])
-        r = worker._agent_design(
-            {"request": "a 15mm cube", "name": "wkrplan", "session_id": "sp", "plan": True},
-            events.append)
-        assert r["success"], "plan-mode run should succeed"
-        plans = [e for e in events if e.get("kind") == "plan"]
-        assert len(plans) == 1 and plans[0]["plan"]["parts"][0]["name"] == "cube", \
-            "the worker must forward exactly one plan event"
-        assert r["plan"] and r["plan"]["name"] == "cube", "the run result carries the plan"
-        print("[worker-plan] plan event forwarded; run.plan:", r["plan"]["name"])
-    finally:
-        config.get_provider = original
 
 
 def test_run_model_assembly() -> None:
@@ -174,39 +91,9 @@ def test_subprocess_roundtrip() -> None:
         p.wait(timeout=10)
 
 
-def test_agent_design_provider_override_threads_name() -> None:
-    """O1 (GUI model picker): an explicit params["provider"] name must reach
-    config.get_provider(name=...) — it may not be silently dropped in favor of the ambient
-    config.json / AI_CAD_PROVIDER default."""
-    original = config.get_provider
-    worker._SESSIONS.clear()
-    seen: list = []
-
-    def _capture(name=None, cfg=None, *a, **k):  # noqa: ANN001
-        seen.append(name)
-        return MockProvider([
-            '```python\nresult = Box(10, 10, 10)\n```\n```json\n{"done": false, "notes": "v1"}\n```',
-            '```json\n{"done": true, "notes": "ok"}\n```',
-        ])
-
-    try:
-        config.get_provider = _capture
-        worker._agent_design(
-            {"request": "a 10mm cube", "name": "wkr_ovr", "session_id": "s_ovr",
-             "plan": False, "provider": "llamacpp"}, lambda e: None)
-    finally:
-        config.get_provider = original
-        worker._SESSIONS.clear()
-    assert seen and seen[0] == "llamacpp", (
-        f"explicit provider name should thread into get_provider, got {seen!r}")
-
-
 def main() -> None:
-    test_session_reuse_reset_and_streaming()
-    test_plan_event_forwarded()
     test_run_model_assembly()
     test_event_wire_format()
-    test_agent_design_provider_override_threads_name()
     test_subprocess_roundtrip()
     print("\nWORKER SESSION + STREAMING TESTS PASSED")
 

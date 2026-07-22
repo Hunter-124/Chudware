@@ -214,6 +214,9 @@ class TestResearchAndIngest:
 
 
 # ---------------------------------------------------------------------------
+import services.mcp.reveng_common as rc_mod  # noqa: E402  T-RF8: ingest internals moved
+
+
 # MCP tool integration tests (reveng_tools layer)
 # ---------------------------------------------------------------------------
 
@@ -265,7 +268,7 @@ class TestRevengResearchSourceTool:
                 "provenance_method": "web",
             },
         })
-        monkeypatch.setattr(rt_mod, "_research_and_ingest", self._mock_ingest)
+        monkeypatch.setattr(rc_mod, "_research_and_ingest", self._mock_ingest)
 
         mcp = FastMCP("test-reveng")
         rt_mod.register_reveng_tools(mcp)
@@ -308,7 +311,7 @@ class TestRevengResearchSourceTool:
 
     def test_ingest_error_returns_honest_envelope(self, mcp_tools, monkeypatch):
         tools, rt_mod, _ = mcp_tools
-        monkeypatch.setattr(rt_mod, "_research_and_ingest", mock.Mock(return_value={
+        monkeypatch.setattr(rc_mod, "_research_and_ingest", mock.Mock(return_value={
             "ok": False,
             "reason": "offline",
             "hint": "No network available",
@@ -322,7 +325,7 @@ class TestRevengResearchSourceTool:
 
     def test_ingest_absent_returns_backend_not_provisioned(self, mcp_tools, monkeypatch):
         tools, rt_mod, _ = mcp_tools
-        monkeypatch.setattr(rt_mod, "_research_and_ingest", None)
+        monkeypatch.setattr(rc_mod, "_research_and_ingest", None)
         fn = tools["reveng_research_source"].fn
         raw = fn(session_id=self._session_id, query="bearing")
         result = _parse(raw)

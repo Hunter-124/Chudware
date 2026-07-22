@@ -87,9 +87,13 @@ struct LbmResult {
 // throws; a bad mask/params returns ok=false with an error string.
 // `on_progress(step, n_steps)` (optional) is invoked at the ~50 convergence checkpoints so a
 // long run can report live progress; it must not touch the lattice (it is read-only timing).
+// `should_cancel()` (optional) is polled at the same checkpoints; when it returns true the
+// run stops early with ok=false, error "cancelled by sim_cancel at step ...", and steps_run =
+// the steps completed so far. Never fires in the parity gate (the gate passes neither hook).
 LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
                   const LbmParams& p, int n_steps,
-                  const std::function<void(int, int)>& on_progress = {});
+                  const std::function<void(int, int)>& on_progress = {},
+                  const std::function<bool()>& should_cancel = {});
 
 // True when this build was compiled with AICAD_WITH_CUDA and a CUDA device is present.
 bool lbm_cuda_available();

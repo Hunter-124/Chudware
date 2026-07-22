@@ -1,4 +1,0 @@
-Attempt-1 aborted mid-run: original nohup pid 316015 was running when a second
-launch-broker instance was started (ready-log race). Broker stop + cleanup
-killed the primary before terminal. Partial events only (~19 lines, early
-SPECIFY). Not graded. Relaunch as clean primary under launch broker only.

@@ -227,9 +227,14 @@ def _vendor_part_scan_library(params: dict, emit: EmitFn) -> dict:
 
 
 def _vendor_part_fetch(params: dict, emit: EmitFn) -> dict:
-    # Imported lazily to keep the provider/HTTP surface out of the registry import path.
-    from engine import parts_providers
-    return parts_providers._vendor_part_fetch(params, emit)
+    # parts_providers was deleted (T-RF18) — the C++ sourcing RPC owns the fetch path
+    # (routed via worker_client.cpp); this Python fallback degrades honestly.
+    try:
+        from engine import parts_providers
+        return parts_providers._vendor_part_fetch(params, emit)
+    except ImportError:
+        return {"ok": False, "error": "vendor_part_fetch moved to the C++ core "
+                "(T-RF18); the Python provider chain was deleted"}
 
 
 # vendor_part_insert moved to the C++ core (doc_vendor_part_insert): it mutates a doc by applying

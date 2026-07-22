@@ -17,13 +17,9 @@ from mcp.server.fastmcp import Context, FastMCP
 
 from mcp_server.cad_tools import _dumps, _err
 
-# The interaction core; support both server bootstraps (repo-root vs services/ on path).
-try:  # pragma: no cover - path shim
-    from services.agent.interaction import (
-        FileLedger, InAppTransport, MemoryLedger, QuestionBatch, make_batch)
-except ImportError:  # pragma: no cover
-    from agent.interaction import (
-        FileLedger, InAppTransport, MemoryLedger, QuestionBatch, make_batch)
+# The interaction core (canonical import path: services.agent.*).
+from services.agent.interaction import (
+    FileLedger, InAppTransport, MemoryLedger, QuestionBatch, make_batch)
 
 
 def _model_for(q):
@@ -105,10 +101,7 @@ def register_interaction_tools(mcp: FastMCP) -> None:
         Answers persist to the run/doc record and replay on resume — a resumed agent never
         re-asks. Returns `{id: {value, canonical?, source, at}}`.
         """
-        try:
-            from services.agent import interaction as core
-        except ImportError:
-            from agent import interaction as core  # type: ignore
+        from services.agent import interaction as core
         try:
             batch = make_batch(questions, scope=scope, run_id=run_id, doc_id=doc_id,
                               revision=revision, blocking=blocking)

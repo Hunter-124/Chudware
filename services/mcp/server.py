@@ -10,8 +10,9 @@ This is parity with the in-app AI agent — except YOU (the model calling these 
 brain, so call `cad_guide()` first to load the engine's op vocabulary, then model → render →
 iterate → simulate exactly like the app does.
 
-Mechanical CAD + simulation tools live in `cad_tools` (driven through `core_bridge`, the
-ctypes bridge to the staged DLL). ECAD (schematic/PCB) tools live in `ecad_tools`.
+Mechanical CAD + simulation tools live in the `cad_*_tools` family modules (driven through
+`core_bridge`, the ctypes bridge to the staged DLL). ECAD (schematic/PCB) tools live in the
+`ecad_*_tools` family modules.
 Runs over stdio; the desktop host registers it into the machine's MCP client configs.
 """
 from __future__ import annotations
@@ -261,8 +262,22 @@ mcp = FastMCP(
 from mcp_server import tool_registry as _reg
 
 # Mechanical CAD + simulation (C++ feature engine via libaicad.dll).
-from mcp_server.cad_tools import register_cad_tools
-register_cad_tools(_reg.view(mcp, "cad"))
+# Per-family modules (T-RF8 split of the former cad_tools.py god file); all register
+# under the stable registry family "cad".
+from mcp_server.cad_doc_tools import register_cad_doc_tools
+from mcp_server.cad_eval_tools import register_cad_eval_tools
+from mcp_server.cad_render_tools import register_cad_render_tools
+from mcp_server.cad_exchange_tools import register_cad_exchange_tools
+from mcp_server.cad_sim_tools import register_cad_sim_tools
+from mcp_server.cad_asm_tools import register_cad_asm_tools
+from mcp_server.cad_drawing_tools import register_cad_drawing_tools
+register_cad_doc_tools(_reg.view(mcp, "cad"))
+register_cad_eval_tools(_reg.view(mcp, "cad"))
+register_cad_render_tools(_reg.view(mcp, "cad"))
+register_cad_exchange_tools(_reg.view(mcp, "cad"))
+register_cad_sim_tools(_reg.view(mcp, "cad"))
+register_cad_asm_tools(_reg.view(mcp, "cad"))
+register_cad_drawing_tools(_reg.view(mcp, "cad"))
 
 # Nested-tree profiler (mission master): engine_profile_tree drills a call-tree / phase-tree
 # by path so an agent reads root + hot children first (context-frugal). Over prof/tree.{h,cpp}.
@@ -293,9 +308,14 @@ register_intake_tools(_reg.view(mcp, "intake"))
 from mcp_server.interaction_tools import register_interaction_tools
 register_interaction_tools(mcp)
 
-# ECAD (schematic / PCB / native circuit sim).
-from mcp_server.ecad_tools import register_ecad_tools
-register_ecad_tools(_reg.view(mcp, "ecad"))
+# ECAD (schematic / PCB / native circuit sim) — per-family modules (T-RF8 split of the
+# former ecad_tools.py god file); all register under the stable registry family "ecad".
+from mcp_server.ecad_sch_tools import register_ecad_sch_tools
+from mcp_server.ecad_pcb_tools import register_ecad_pcb_tools
+from mcp_server.ecad_sim_tools import register_ecad_sim_tools
+register_ecad_sch_tools(_reg.view(mcp, "ecad"))
+register_ecad_pcb_tools(_reg.view(mcp, "ecad"))
+register_ecad_sim_tools(_reg.view(mcp, "ecad"))
 
 # ECAD -> thermal FEA handoff (T-FIN16, aicad.simhandoff/1 coupling ecad_to_thermal_fea):
 # one call from a routed board to a solved board-level thermal study + Tj/limits verify.
@@ -536,9 +556,12 @@ register_sketch3d_tools(_reg.view(mcp, "cad"))
 from mcp_server.ascii2d import register_ascii2d_tools
 register_ascii2d_tools(_reg.view(mcp, "gsl"))
 
-# Reverse Engineering MCP family (contracts/reveng.md §8).
-from services.mcp.reveng_tools import register_reveng_tools
-register_reveng_tools(_reg.view(mcp, "reveng"))
+# Reverse Engineering MCP family (contracts/reveng.md §8) — per-family modules (T-RF8
+# split of the former reveng_tools.py god file); both register under "reveng".
+from services.mcp.reveng_session_tools import register_reveng_session_tools
+from services.mcp.reveng_build_tools import register_reveng_build_tools
+register_reveng_session_tools(_reg.view(mcp, "reveng"))
+register_reveng_build_tools(_reg.view(mcp, "reveng"))
 
 # Family retags so Settings → AI → Tools toggles match real tool ownership.
 # FEA/CFD/motion ship inside register_cad_tools but belong under ``sim``;
@@ -610,7 +633,7 @@ def _warm_core() -> None:
     # recovery succeeds even if libaicad.dll is unavailable. ECAD docs live only in memory, so a
     # transport-timeout kill of a heavy ecad_* tool would otherwise lose every open schematic/board.
     try:
-        from mcp_server.ecad_tools import enable_ecad_autosave, recover_ecad_autosaved
+        from mcp_server.ecad_common import enable_ecad_autosave, recover_ecad_autosaved
         enable_ecad_autosave()
         recover_ecad_autosaved()
     except Exception:
@@ -637,8 +660,8 @@ def _warm_core() -> None:
         # Recover any docs auto-saved before a previous restart so a client-timeout kill doesn't
         # permanently drop the user's open parts (they reload with fresh ids; list_parts shows them).
         try:
-            from mcp_server.cad_tools import (recover_autosaved, start_periodic_autosave,
-                                              sweep_stale_handoff)
+            from mcp_server.cad_common import (recover_autosaved, start_periodic_autosave,
+                                               sweep_stale_handoff)
             # Prune dead-session handoff fragments FIRST: if the last publisher crashed
             # (atexit never ran), docs.json still advertises its docs and the GUI shows
             # ghost mirror tabs until someone re-merges — which is us, right now.

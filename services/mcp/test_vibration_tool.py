@@ -24,6 +24,7 @@ if _REPO_ROOT not in sys.path:
 import pytest
 
 from mcp_server import cad_tools
+from mcp_server import cad_sim_tools  # T-RF8: run_fea_* tools live here now
 
 
 # ---------------------------------------------------------------------------
@@ -50,12 +51,12 @@ def freq_tool(monkeypatch):
     from mcp.server.fastmcp import FastMCP
 
     monkeypatch.setattr(cad_tools.cb, "call", _fake_cb_call)
-    monkeypatch.setattr(cad_tools, "_doc", lambda doc_id: "doc-test")
-    monkeypatch.setattr(cad_tools, "_resolve_face_points",
+    monkeypatch.setattr(cad_sim_tools, "_doc", lambda doc_id: "doc-test")
+    monkeypatch.setattr(cad_sim_tools, "_resolve_face_points",
                         lambda d, q: [{"points": [[0.0, 0.0, 0.0]], "tol_mm": 1.0}])
-    monkeypatch.setattr(cad_tools, "_autosave_all_open", lambda: None)
-    monkeypatch.setattr(cad_tools, "_persist_study", lambda d, rec: "study1")
-    monkeypatch.setattr(cad_tools, "_solve_sync_or_handoff",
+    monkeypatch.setattr(cad_sim_tools, "_autosave_all_open", lambda: None)
+    monkeypatch.setattr(cad_sim_tools, "_persist_study", lambda d, rec: "study1")
+    monkeypatch.setattr(cad_sim_tools, "_solve_sync_or_handoff",
                         lambda kind, fn, *a, **kw: fn())
 
     mcp = FastMCP("test-vibration")
@@ -145,7 +146,7 @@ def test_verdict_grms_limit_without_psd_fails_closed(freq_tool):
 # ---------------------------------------------------------------------------
 
 def test_unresolved_fixtures_error(freq_tool, monkeypatch):
-    monkeypatch.setattr(cad_tools, "_resolve_face_points", lambda d, q: [])
+    monkeypatch.setattr(cad_sim_tools, "_resolve_face_points", lambda d, q: [])
     out = json.loads(freq_tool(fixtures=["bogus-face"], sweep_hz=[100.0]))
     assert out["ok"] is False
     assert "no fixture faces resolved" in out["error"]

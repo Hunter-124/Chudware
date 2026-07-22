@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "agent/paths.h"
+#include "agent/auth.h"  // T-RF4: in-process subscription token refresh
 #include "agent/state.h"  // kContextTokenCap (the lean input-cap ceiling for big windows)
 
 namespace aicad {
@@ -33,9 +34,11 @@ int default_context_window(const std::string& name) {
 }
 
 // Read the ACTIVE account's access_token from config.subscription_auth[provider_id].
-// READ-ONLY: never refreshes or writes tokens. xAI rotates refresh tokens on every
-// exchange — only the Python xai_sub_provider may refresh+persist. If the access
-// token is expired the call will 401; the user re-signs in via Settings.
+// Token REFRESH lives in agent/auth.cpp (T-RF4): resolve_provider refreshes a stale
+// credential in-process via auth::ensure_fresh_for_run and reloads the store before
+// this reader runs, so the token returned here is fresh at run start. xAI rotates
+// refresh tokens on every exchange — refresh writes back atomically under the
+// shared config.json.lock advisory lock that Python also honors.
 std::string subscription_access_token(const json& cfg, const char* provider_id) {
     if (!cfg.is_object() || !cfg.contains("subscription_auth") ||
         !cfg["subscription_auth"].is_object())
@@ -252,7 +255,7 @@ bool provider_offline_safe(const json& provider) {
     return base_url ? host_is_loopback(*base_url) : false;
 }
 
-json resolve_provider(const std::optional<std::string>& name_arg, const json& cfg,
+json resolve_provider(const std::optional<std::string>& name_arg, json cfg,
                       const json& env) {
     bool offline = offline_enabled(cfg);
     // name = (name_arg or env AI_CAD_PROVIDER or cfg.provider or "").lower()
@@ -324,6 +327,17 @@ json resolve_provider(const std::optional<std::string>& name_arg, const json& cf
                 std::string("offline mode is enabled (config '") + kOfflineSetting +
                 "': true): the managed llama.cpp endpoint '" + base_url +
                 "' is not loopback, so it is refused before probing the server.");
+    }
+
+    // T-RF4: refresh a stale subscription OAuth token IN-PROCESS (ported from the
+    // Python subscription_ensure_fresh RPC) and re-read the store so the
+    // subscription branches below resolve the rotated access token. Runs after the
+    // offline refusals (no network in offline mode) and no-ops for non-subscription
+    // names, fresh tokens, and absent credentials. A hard auth failure surfaces as
+    // a refusal — the same provider_auth gate jobs.cpp used to apply via RPC.
+    if (auth::is_subscription_name(name)) {
+        std::string auth_err = auth::ensure_fresh_for_run(name, cfg);
+        if (!auth_err.empty()) return refusal(auth_err);
     }
 
     // Resolve descriptors (no network client construction).
@@ -435,7 +449,7 @@ json resolve_provider(const std::optional<std::string>& name_arg, const json& cf
     } else if (name == "xai" || name == "xai-sub") {
         // xAI Grok: classic console.x.ai API key OR SuperGrok OAuth access_token.
         // Completions are OpenAI-compatible at https://api.x.ai/v1/chat/completions.
-        // C++ NEVER refreshes the OAuth token (xAI rotates RTs; only Python persists).
+        // A stale OAuth token was already refreshed in-process above (auth.cpp, T-RF4).
         std::string key = py_or(cfg_str(cfg, "api_key"), env_get(env, "XAI_API_KEY").value_or(""));
         if (key.empty() && cfg.contains("keys") && cfg["keys"].is_object() &&
             cfg["keys"].contains("xai") && cfg["keys"]["xai"].is_string())
@@ -471,7 +485,8 @@ json resolve_provider(const std::optional<std::string>& name_arg, const json& cf
         if (oauth) {
             desc["auth_mode"] = "oauth";
             // Multi-account fallback: on a 403 tier-gate, complete() rotates to the
-            // next signed-in xai-sub account (read-only; Python owns refresh).
+            // next signed-in xai-sub account (read-only at request time; token
+            // refresh itself already happened in auth::ensure_fresh_for_run).
             json fb = json::array();
             for (const auto& t : all_subscription_access_tokens(cfg, "xai-sub"))
                 if (t != key) fb.push_back(t);

@@ -1,8 +1,9 @@
 """Firmware compile-loop MCP tools — ``fw_new_project`` / ``fw_build`` / ``fw_sources`` (T-C2).
 
-Thin FastMCP wrappers over :mod:`engine.firmware.mcp_tools`, mirroring ``services/mcp/ecad_tools.py``
-exactly: each ``@mcp.tool()`` returns a JSON string and calls the framework-free engine handler
-directly. Registration is deferred behind :func:`register_firmware_tools` so ``server.py`` wires us
+Thin FastMCP wrappers over the C++ core via :mod:`services.mcp.core_bridge` (flipped off
+the deleted ``engine.firmware.mcp_tools`` in T-RF15), mirroring ``services/mcp/ecad_tools.py``
+exactly: each ``@mcp.tool()`` returns a JSON string and calls the worker-RPC method.
+Registration is deferred behind :func:`register_firmware_tools` so ``server.py`` wires us
 in with a two-line block and the tools can be driven against a stub ``mcp`` in tests without the
 whole stdio server.
 
@@ -15,7 +16,7 @@ from __future__ import annotations
 import json
 from typing import Optional
 
-from engine.firmware import mcp_tools as _fw
+from . import core_bridge as cb
 
 
 def _dumps(payload) -> str:
@@ -57,8 +58,7 @@ def register_firmware_tools(mcp) -> None:
         Offline-safe — reads PATH + `--version` only, never the network.
         """
         try:
-            from engine.firmware.provision import fw_status as _fw_status
-            return _dumps(_fw_status())
+            return _dumps(cb.call("fw_status", {}))
         except Exception as exc:  # noqa: BLE001 — the doctor itself never errors out
             return _dumps({"ok": True, "tools": {}, "families": {}, "banners": [
                 f"fw_status probe degraded: {exc}"], "missing": []})
@@ -81,7 +81,7 @@ def register_firmware_tools(mcp) -> None:
             params["mcu_family"] = mcu_family
         if board_doc_ref:
             params["board_doc_ref"] = board_doc_ref
-        return _dumps(_fw.fw_new_project(params))
+        return _dumps(cb.call("fw_new_project", params))
 
     @mcp.tool()
     def fw_build(project_id: str) -> str:
@@ -90,7 +90,7 @@ def register_firmware_tools(mcp) -> None:
         cross-toolchain is reported as ``success=false, returncode=-1`` (not an error) so the agent
         can surface an install hint rather than crash the loop.
         """
-        return _dumps(_fw.fw_build({"project_id": project_id}))
+        return _dumps(cb.call("fw_build", {"project_id": project_id}))
 
     @mcp.tool()
     def fw_sources(project_id: str, add: Optional[list[str]] = None,
@@ -103,7 +103,7 @@ def register_firmware_tools(mcp) -> None:
             params["add"] = add
         if remove:
             params["remove"] = remove
-        return _dumps(_fw.fw_sources(params))
+        return _dumps(cb.call("fw_sources", params))
 
     @mcp.tool()
     def fw_sim_run(project_id: str, elf_path: str = "", scenario: str = "",
@@ -167,7 +167,7 @@ def register_firmware_tools(mcp) -> None:
             p["scenario"] = scenario
         if assertions:
             p["assertions"] = assertions
-        return _dumps(_fw.fw_sim_run(p))
+        return _dumps(cb.call("fw_sim_run", p))
 
     @mcp.tool()
     def fw_verify_board(board_doc_ref: str, project_id: str = "",
@@ -212,7 +212,7 @@ def register_firmware_tools(mcp) -> None:
             p["trace_path"] = trace_path
         if emulate:
             p["emulate"] = True
-        return _dumps(_fw.fw_verify_board(p))
+        return _dumps(cb.call("fw_verify_board", p))
 
     @mcp.tool()
     def fw_power_profile(trace_path: str, project_id: str = "",
@@ -257,7 +257,7 @@ def register_firmware_tools(mcp) -> None:
             p["mcu_family"] = mcu_family
         if window_ms:
             p["window_ms"] = window_ms
-        return _dumps(_fw.fw_power_profile(p))
+        return _dumps(cb.call("fw_power_profile", p))
 
     # -----------------------------------------------------------------------
     # Hardware path (T-C4): probe-rs flash/debug + esptool ESP32 flash
@@ -291,7 +291,7 @@ def register_firmware_tools(mcp) -> None:
             p["baud"] = baud
         if flash_offset != "0x0":
             p["flash_offset"] = flash_offset
-        return _dumps(_fw.fw_flash(p))
+        return _dumps(cb.call("fw_flash", p))
 
     @mcp.tool()
     def fw_debug_start(chip: str) -> str:
@@ -302,7 +302,7 @@ def register_firmware_tools(mcp) -> None:
 
         [~] Live run requires a connected DAP probe.
         """
-        return _dumps(_fw.fw_debug_start({"chip": chip}))
+        return _dumps(cb.call("fw_debug_start", {"chip": chip}))
 
     @mcp.tool()
     def fw_debug_halt(chip: str) -> str:
@@ -313,7 +313,7 @@ def register_firmware_tools(mcp) -> None:
 
         [~] Live run requires a connected DAP probe.
         """
-        return _dumps(_fw.fw_debug_halt({"chip": chip}))
+        return _dumps(cb.call("fw_debug_halt", {"chip": chip}))
 
     @mcp.tool()
     def fw_debug_read_mem(chip: str, address: str, length: int) -> str:
@@ -328,7 +328,7 @@ def register_firmware_tools(mcp) -> None:
 
         [~] Live run requires a connected DAP probe and a halted target.
         """
-        return _dumps(_fw.fw_debug_read_mem({"chip": chip, "address": address, "length": length}))
+        return _dumps(cb.call("fw_debug_read_mem", {"chip": chip, "address": address, "length": length}))
 
     @mcp.tool()
     def fw_sensor_scenario(profile: str = "", sensor_map: Optional[list] = None,
@@ -401,4 +401,4 @@ def register_firmware_tools(mcp) -> None:
             if isinstance(parsed, dict) and parsed.get("code"):
                 return _dumps(parsed)
             p["sim_result"] = parsed
-        return _dumps(_fw.fw_sensor_scenario(p))
+        return _dumps(cb.call("fw_sensor_scenario", p))

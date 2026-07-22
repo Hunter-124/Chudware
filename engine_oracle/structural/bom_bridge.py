@@ -11,10 +11,33 @@ or substituted for vendor provider prices.
 
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
+from typing import Optional
 
-from ..bom import BomLine
 from ..structural.estimate import TakeoffLine, estimate, fastener_count
+
+
+@dataclass
+class BomLine:
+    """One line of a priced bill of materials (``aicad.sourcing/1`` §3).
+
+    Restored locally 2026-07-22: ``engine_oracle/bom.py`` was deleted in T-RF18 (its
+    pricing logic is C++ now) — the structural takeoff only needs the record shape,
+    which services/deliverables/joins.bom_rollup consumes via ``asdict``.
+    """
+
+    line_id: str
+    kind: str                                  # "made" | "bought"
+    quantity: int = 1
+    unit: str = "ea"
+    part_ref: Optional[str] = None             # bought: "<supplier>::<part_number>" (VendorPart.key)
+    vendor_part: Optional[dict] = None         # bought: resolved §1 record; else None
+    cost_model: Optional[dict] = None          # made: cost-model result (T-B3); else None
+    unit_cost: Optional[float] = None          # cost of one unit at `quantity`; None if unpriced
+    ext_cost: Optional[float] = None           # unit_cost * quantity; None if unpriced
+    currency: str = "USD"                      # ISO-4217 for unit_cost/ext_cost
+    mpn: Optional[str] = None                  # manufacturer part number driving provider lookup
+    description: str = ""                      # human-readable line description (order summary)
 
 
 def _takeoff_to_bom_line(line: TakeoffLine, *, currency: str = "USD") -> BomLine:

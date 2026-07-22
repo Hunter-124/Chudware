@@ -108,3 +108,10 @@ Webservice/Cloudflare-info.txt
 Webservice/secrets/
 Webservice/image/stage/
 Webservice/gateway/.venv/
+
+# local artifacts — never commit
+reports/runs/
+signal-desktop*
+services/corpora/
+.omp/
+repomix-output.*

@@ -1103,7 +1103,7 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
 
     // Anthropic Messages API — classic x-api-key OR Claude Pro/Max OAuth bearer.
     // OAuth requires the Claude-Code-shaped system array + CCH billing hash + betas.
-    // C++ never refreshes OAuth tokens (Python anthropic_sub_provider owns that).
+    // OAuth tokens arrive already refreshed (auth::ensure_fresh_for_run, T-RF4).
     if (provider == "anthropic" || provider == "anthropic-sub") {
         std::string model = str_or(cfg, "model", std::string(kAnthropicDefaultModel));
         std::string effort = str_or(cfg, "reasoning_effort");
@@ -1329,7 +1329,8 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
 
     // OpenAI-compatible family: openai / llamacpp / xai / xai-sub / moonshot.
     // billet's Python XAISubProvider posts to /v1/chat/completions with Bearer
-    // (OAuth access_token or API key). C++ never refreshes OAuth tokens.
+    // (OAuth access_token or API key). OAuth tokens arrive already refreshed
+    // (auth::ensure_fresh_for_run at resolve time, T-RF4).
     if (provider == "openai" || provider == "llamacpp" || provider == "xai" ||
         provider == "xai-sub" || provider == "moonshot") {
         std::string def = (provider == "llamacpp") ? std::string("local-gguf")

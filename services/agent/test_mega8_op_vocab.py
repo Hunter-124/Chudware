@@ -98,7 +98,7 @@ def test_op_vocab_bridge_fallback():
 def test_add_features_docstring_enumerates_vocab():
     """Tool description must list the closed op + feature-type vocabulary."""
     import inspect
-    from services.mcp import cad_tools
+    from services.mcp import cad_doc_tools as cad_tools  # T-RF8: add_features moved
     # register_cad_tools closes over add_features; pull the function source from module.
     src = inspect.getsource(cad_tools)
     assert "OP VOCABULARY" in src

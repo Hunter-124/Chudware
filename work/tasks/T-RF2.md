@@ -32,5 +32,5 @@ merge the two AICM loaders (report only). CMake edits, if any, go through the in
 
 - [x] Dead files deleted; grep proof no references remain.
 - [x] Host + core rebuild green after deletion.
-- [ ] Sub-AGENTS.md files match on-disk reality.
+- [x] Sub-AGENTS.md files match on-disk reality.
 - [ ] REFACTOR_LOG.md handoff appended; gate.sh green (integrator run).

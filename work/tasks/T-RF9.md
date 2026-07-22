@@ -30,5 +30,5 @@ surface behind them (YAGNI — prefer delete if no live consumer).
 ## Definition of done
 
 - [x] One mode-gating table; parity test green across runtimes.
-- [ ] No [TODO T-W*] placeholder strings left in services/agent.
+- [x] No [TODO T-W*] placeholder strings left in services/agent.
 - [ ] gate.sh green; REFACTOR_LOG handoff; MCP freshness if prompts/tools touched.

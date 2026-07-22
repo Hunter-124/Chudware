@@ -28,5 +28,5 @@ LBM module in the same commit. Thermal-transient tests that ride along must stay
 ## Definition of done
 
 - [x] sim_run_flow served by libaicad; simsuite flow parity green.
-- [ ] Python LBM deleted same commit; routing flipped (integrator merge).
+- [x] Python LBM deleted same commit; routing flipped (integrator merge).
 - [ ] gate.sh green; REFACTOR_LOG handoff; web_parity inventory shrinks.

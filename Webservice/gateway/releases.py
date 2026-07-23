@@ -2,7 +2,9 @@
 
 Lists files dropped into CHUDWARE_RELEASES_DIR (default ~/chudware-releases)
 and serves them for download from the /admin dashboard's Releases card, so
-testers can grab the latest Windows/etc. installer without SSH.
+testers can grab the latest Windows/etc. installer without SSH. Admins can
+also upload/delete releases from the same card (e.g. a Chudware-Setup-*.exe
+built on a Windows box, since this Linux deploy host cannot produce one).
 """
 
 from __future__ import annotations
@@ -12,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 
 try:
@@ -74,3 +76,47 @@ async def download_release(name: str, request: Request) -> FileResponse:
     if not path.is_file():
         raise HTTPException(status_code=404, detail="release not found")
     return FileResponse(path, filename=safe)
+
+
+@router.post("/releases/upload")
+async def upload_release(request: Request, file: UploadFile = File(...)) -> dict[str, Any]:
+    _require_admin(request)
+    safe = _safe_name(file.filename or "")
+    d = _releases_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    dest = d / safe
+    # Stream to a .part sibling first (chunked — never buffers the whole upload in memory,
+    # which matters under the gateway unit's MemoryMax=1G) then atomically rename, so a
+    # client abort or crash mid-upload can never leave a half-written file visible to
+    # list_releases/download.
+    tmp = dest.with_name(dest.name + ".part")
+    try:
+        with tmp.open("wb") as out:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                out.write(chunk)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+    finally:
+        await file.close()
+    tmp.replace(dest)
+    st = dest.stat()
+    return {
+        "name": dest.name,
+        "size": st.st_size,
+        "mtime": datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat(),
+    }
+
+
+@router.delete("/releases/{name}")
+async def delete_release(name: str, request: Request) -> dict[str, Any]:
+    _require_admin(request)
+    safe = _safe_name(name)
+    path = _releases_dir() / safe
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="release not found")
+    path.unlink()
+    return {"ok": True}

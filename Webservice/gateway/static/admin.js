@@ -593,10 +593,18 @@
     card.className = "admin-card releases-card";
     card.innerHTML =
       "<h2>Releases</h2>" +
-      "<div class='releases-list' id='releases-list'>Loading…</div>";
+      "<div class='releases-list' id='releases-list'>Loading…</div>" +
+      "<div class='release-upload'>" +
+        "<input type='file' id='release-file' />" +
+        "<button type='button' class='btn ghost' id='release-upload-btn'>Upload</button>" +
+        "<span class='release-upload-status' id='release-upload-status'></span>" +
+      "</div>";
     side.appendChild(card);
 
     var listEl = document.getElementById("releases-list");
+    var fileEl = document.getElementById("release-file");
+    var uploadBtn = document.getElementById("release-upload-btn");
+    var uploadStatus = document.getElementById("release-upload-status");
 
     function fmtSize(n) {
       if (n < 1024) return n + " B";
@@ -616,8 +624,10 @@
       var data = await api("/api/admin/releases");
       if (!data || !data.length) {
         listEl.innerHTML =
-          "<p class='deploy-note'>Drop installers into ~/chudware-releases on the server " +
-          "(e.g. ChudwareSetup.exe from scripts/build_windows.ps1 + installer/build_release.py).</p>";
+          "<p class='deploy-note'>No releases yet. Windows installers can't be built on this " +
+          "Linux host — build one on a Windows box (scripts\\build_windows.ps1, then " +
+          "installer\\build_release.py --zip, then packaging\\windows\\chudware.iss) and upload " +
+          "it below, or drop it into ~/chudware-releases on the server.</p>";
         return;
       }
       listEl.innerHTML = data.map(function (r) {
@@ -626,11 +636,57 @@
             "<span class='release-name'>" + esc(r.name) + "</span>" +
             "<span class='release-meta'>" + fmtSize(r.size) + " \xb7 " + fmtDate(r.mtime) + "</span>" +
           "</div>" +
-          "<a class='btn ghost' href='/api/admin/releases/download/" + encodeURIComponent(r.name) +
-            "' download>Download</a>" +
+          "<div class='release-actions'>" +
+            "<a class='btn ghost' href='/api/admin/releases/download/" + encodeURIComponent(r.name) +
+              "' download>Download</a>" +
+            "<button type='button' class='btn ghost danger release-delete' data-name='" +
+              esc(r.name) + "'>Delete</button>" +
+          "</div>" +
         "</div>";
       }).join("");
+
+      Array.prototype.forEach.call(listEl.querySelectorAll(".release-delete"), function (btn) {
+        btn.addEventListener("click", async function () {
+          var name = btn.getAttribute("data-name");
+          if (!window.confirm("Delete " + name + "?")) return;
+          btn.disabled = true;
+          try {
+            await api("/api/admin/releases/" + encodeURIComponent(name), { method: "DELETE" });
+            await refreshReleases();
+          } catch (e) {
+            window.alert("Delete failed: " + (e.message || e));
+            btn.disabled = false;
+          }
+        });
+      });
     }
+
+    uploadBtn.addEventListener("click", async function () {
+      var f = fileEl.files && fileEl.files[0];
+      if (!f) {
+        uploadStatus.textContent = "choose a file first";
+        return;
+      }
+      uploadBtn.disabled = true;
+      uploadStatus.textContent = "uploading " + f.name + "\u2026";
+      try {
+        var fd = new FormData();
+        fd.append("file", f, f.name);
+        var res = await fetch("/api/admin/releases/upload", { method: "POST", body: fd });
+        var data = null;
+        try { data = await res.json(); } catch (e) { /* non-JSON */ }
+        if (!res.ok) {
+          throw new Error((data && (data.detail || data.error)) || res.status + " " + res.statusText);
+        }
+        uploadStatus.textContent = "uploaded " + f.name;
+        fileEl.value = "";
+        await refreshReleases();
+      } catch (e) {
+        uploadStatus.textContent = "upload failed: " + (e.message || e);
+      } finally {
+        uploadBtn.disabled = false;
+      }
+    });
 
     refreshReleases().catch(function (e) {
       listEl.innerHTML = "<p class='deploy-note'>Failed to load releases: " + esc(e.message || e) + "</p>";

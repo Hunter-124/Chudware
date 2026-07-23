@@ -800,3 +800,73 @@ def test_include_list_never_quotes_email(tmp_path, monkeypatch):
     # A stray-quote email can never match in CF Access -> silently no OTP.
     assert emails == ["brother@gmail.com"]
     assert all('"' not in e for e in emails)
+
+
+def test_releases_requires_admin(client, _admin_env):
+    r = client.get("/api/admin/releases", headers=_auth("demo@example.com"))
+    assert r.status_code == 403
+
+
+def test_releases_empty_list(client, _admin_env, tmp_path, monkeypatch):
+    monkeypatch.setenv("CHUDWARE_RELEASES_DIR", str(tmp_path / "releases-none"))
+    r = client.get("/api/admin/releases", headers=_auth("boss@example.com"))
+    assert r.status_code == 200
+    assert r.json() == []
+
+
+def test_releases_upload_list_download_delete(client, _admin_env, tmp_path, monkeypatch):
+    monkeypatch.setenv("CHUDWARE_RELEASES_DIR", str(tmp_path / "releases"))
+    admin = _auth("boss@example.com")
+    payload = b"fake installer bytes " * 1000
+
+    r = client.post(
+        "/api/admin/releases/upload",
+        headers=admin,
+        files={"file": ("Chudware-Setup-1.0.0.exe", payload, "application/octet-stream")},
+    )
+    assert r.status_code == 200, r.text
+    meta = r.json()
+    assert meta["name"] == "Chudware-Setup-1.0.0.exe"
+    assert meta["size"] == len(payload)
+
+    r2 = client.get("/api/admin/releases", headers=admin)
+    assert r2.status_code == 200
+    names = [row["name"] for row in r2.json()]
+    assert names == ["Chudware-Setup-1.0.0.exe"]
+
+    r3 = client.get(
+        "/api/admin/releases/download/Chudware-Setup-1.0.0.exe", headers=admin
+    )
+    assert r3.status_code == 200
+    assert r3.content == payload
+
+    r4 = client.delete(
+        "/api/admin/releases/Chudware-Setup-1.0.0.exe", headers=admin
+    )
+    assert r4.status_code == 200
+    assert r4.json() == {"ok": True}
+
+    r5 = client.get("/api/admin/releases", headers=admin)
+    assert r5.json() == []
+
+    r6 = client.delete("/api/admin/releases/Chudware-Setup-1.0.0.exe", headers=admin)
+    assert r6.status_code == 404
+
+
+def test_releases_upload_requires_admin(client, _admin_env, tmp_path, monkeypatch):
+    monkeypatch.setenv("CHUDWARE_RELEASES_DIR", str(tmp_path / "releases-forbidden"))
+    r = client.post(
+        "/api/admin/releases/upload",
+        headers=_auth("demo@example.com"),
+        files={"file": ("x.exe", b"nope", "application/octet-stream")},
+    )
+    assert r.status_code == 403
+
+
+def test_releases_download_rejects_path_traversal(client, _admin_env, tmp_path, monkeypatch):
+    monkeypatch.setenv("CHUDWARE_RELEASES_DIR", str(tmp_path / "releases-safe"))
+    admin = _auth("boss@example.com")
+    r = client.get("/api/admin/releases/download/..%2F..%2Fetc%2Fpasswd", headers=admin)
+    assert r.status_code in (400, 404)
+    r2 = client.delete("/api/admin/releases/..%2F..%2Fetc%2Fpasswd", headers=admin)
+    assert r2.status_code in (400, 404)

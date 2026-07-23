@@ -170,3 +170,40 @@
   padding: 6px 12px;
   flex: 0 0 auto;
 }
+
+.release-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.release-upload {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border, #2a2e36);
+  flex-wrap: wrap;
+}
+
+.release-upload input[type="file"] {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 0.8rem;
+  color: var(--muted, #8b93a3);
+}
+
+.release-upload .btn {
+  min-height: 36px;
+  padding: 6px 12px;
+  flex: 0 0 auto;
+}
+
+.release-upload-status {
+  flex: 0 0 100%;
+  font-size: 0.76rem;
+  color: var(--muted, #8b93a3);
+  overflow-wrap: anywhere;
+}

@@ -40,6 +40,7 @@ calls after a successful checkpoint (best-effort; never raises into AI-VC).
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -286,6 +287,10 @@ def build_graph(
         dnode_id = f"doc:{doc_id}" if not rel else f"doc:{rel}"
         is_arch = bool(src.get("archive"))
         doc_meta: dict[str, Any] = {"schema": schema, "uuid": doc_uuid}
+        if src.get("mtime") is not None:
+            doc_meta["mt"] = src["mtime"]  # source mtime (cheap staleness)
+        if src.get("doc_hash"):
+            doc_meta["dh"] = src["doc_hash"]  # content hash (true freshness)
         if is_arch:
             doc_meta["archive"] = True
         add_node({
@@ -525,14 +530,21 @@ def build_graph(
             cref = _component_ref(comp)
             clabel = str(comp.get("name") or cref or cid or "component")
             cnode = f"instance:{dnode_id}:{cid or clabel}"
+            cmeta: dict[str, Any] = {
+                "component_id": cid, "ref": cref,
+                "suppressed": bool(comp.get("suppressed")),
+                "fixed": bool(comp.get("fixed")),
+            }
+            # World placement (row-major 4x4; translation at 3/7/11) — lets
+            # the graph 3D mode lay instances out like the actual model.
+            ctr = comp.get("transform")
+            if (isinstance(ctr, list) and len(ctr) == 16
+                    and all(isinstance(v, (int, float)) for v in ctr)):
+                cmeta["wp"] = [float(ctr[3]), float(ctr[7]), float(ctr[11])]
             add_node({
                 "id": cnode, "kind": "doc",
                 "label": clabel, "path": rel or None, "doc_id": doc_id,
-                "meta": {
-                    "component_id": cid, "ref": cref,
-                    "suppressed": bool(comp.get("suppressed")),
-                    "fixed": bool(comp.get("fixed")),
-                },
+                "meta": cmeta,
                 "origin": ORIGIN_EXTRACTED,
             })
             add_edge(dnode_id, cnode, "CONTAINS")
@@ -1250,13 +1262,14 @@ def _collect_sources(
             workers = min(8, (os.cpu_count() or 4), len(pending))
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 results = pool.map(lambda t: _read_container(t[0]), pending)
-            for (fp, rel, mtime), (doc, study_ids) in zip(pending, results):
+            for (fp, rel, mtime), (doc, study_ids, doc_hash) in zip(pending, results):
                 if doc is None:
                     continue
                 key = f"file:{rel}"
                 sources.append({
                     "key": key, "path": rel, "mtime": mtime,
                     "doc": doc, "doc_id": doc.get("id"),
+                    "doc_hash": doc_hash,
                     "study_ids": study_ids,
                     "kind_hint": "board" if rel.lower().endswith(".ecad+") else None,
                     "archive": path_is_archive(rel, arch),
@@ -1277,18 +1290,25 @@ def _collect_sources(
     return sources
 
 
-def _read_container(path: Path) -> tuple[dict | None, list[str]]:
-    """Return (document.json dict, study ids from studies/)."""
+def _read_container(path: Path) -> tuple[dict | None, list[str], str | None]:
+    """Return (document.json dict, study ids from studies/, content hash).
+
+    The hash is blake2b-8 over the raw document.json bytes (already read
+    for parsing, so it costs nothing extra). It changes iff doc content
+    changes — the freshness signal preview/thumbnail caches key on
+    (surfaced as meta.dh on the doc node)."""
     try:
         raw = path.read_bytes()
     except OSError:
-        return None, []
+        return None, [], None
     try:
         with zipfile.ZipFile(io.BytesIO(raw)) as zf:
             names = zf.namelist()
             if "document.json" not in names:
-                return None, []
-            doc = json.loads(zf.read("document.json").decode("utf-8"))
+                return None, [], None
+            doc_bytes = zf.read("document.json")
+            doc_hash = hashlib.blake2b(doc_bytes, digest_size=8).hexdigest()
+            doc = json.loads(doc_bytes.decode("utf-8"))
             study_ids = []
             for n in names:
                 if n.startswith("studies/") and n.endswith(".json"):
@@ -1296,9 +1316,9 @@ def _read_container(path: Path) -> tuple[dict | None, list[str]]:
                     parts = n.split("/")
                     if len(parts) == 2:
                         study_ids.append(parts[1][:-5])  # strip .json
-            return doc, study_ids
+            return doc, study_ids, doc_hash
     except Exception:  # noqa: BLE001
-        return None, []
+        return None, [], None
 
 
 def _walk_project_folders(

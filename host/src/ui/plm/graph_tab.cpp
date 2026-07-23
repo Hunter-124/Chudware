@@ -4828,15 +4828,6 @@ void plmDrawGraphPage(AppState &st) {
       G.userNavigated = false;
     }
   }
-  if (!G.generatedAt.empty() && !G.listView && !G.gridView) {
-    ImGui::SameLine();
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.textDisabled[0],
-                                                palette.textDisabled[1],
-                                                palette.textDisabled[2], 1.0f));
-    ImGui::AlignTextToFramePadding();
-    ImGui::Text("generated %s", G.generatedAt.c_str());
-    ImGui::PopStyleColor();
-  }
   if (!G.err.empty() && !G.nodes.empty()) {
     ImGui::SameLine();
     plmError(G.err);
@@ -4956,7 +4947,9 @@ void plmDrawGraphPage(AppState &st) {
     }
   }
 
-  // Honest counts: visible vs loaded vs full.
+  // Honest counts consolidated into ONE dim status line (was scattered across
+  // the toolbar): visible / loaded / edges / generated stamp, with the
+  // load-truncation warning appended in the warn tint.
   if (!G.nodes.empty()) {
     const int visN = (int)G.visibleIdx.size();
     const int loadN = (int)G.nodes.size();
@@ -4964,19 +4957,24 @@ void plmDrawGraphPage(AppState &st) {
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.textDisabled[0],
                                                 palette.textDisabled[1],
                                                 palette.textDisabled[2], 1.0f));
-    if (G.scopeDocId.empty()) {
-      if (visN < fullN)
-        ImGui::Text(
-            "%d of %d nodes visible · double-click to isolate references", visN,
-            fullN);
-      else
-        ImGui::Text("%d nodes · %d edges", visN, (int)G.visibleEdges.size());
-    } else {
-      ImGui::Text("%d nodes in scope · %d of %d loaded", visN, loadN, fullN);
-    }
+    if (G.scopeDocId.empty())
+      ImGui::Text("%d of %d nodes visible \xc2\xb7 %d edges", visN, fullN,
+                  (int)G.visibleEdges.size());
+    else
+      ImGui::Text("%d in scope \xc2\xb7 %d of %d loaded \xc2\xb7 %d edges", visN,
+                  loadN, fullN, (int)G.visibleEdges.size());
     ImGui::PopStyleColor();
+    if (!G.generatedAt.empty()) {
+      ImGui::SameLine(0, 8 * S);
+      ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.textDisabled[0],
+                                                  palette.textDisabled[1],
+                                                  palette.textDisabled[2],
+                                                  0.75f));
+      ImGui::Text("\xc2\xb7 generated %s", G.generatedAt.c_str());
+      ImGui::PopStyleColor();
+    }
     if (G.truncated || loadN < fullN) {
-      ImGui::SameLine();
+      ImGui::SameLine(0, 8 * S);
       ImGui::PushStyleColor(ImGuiCol_Text,
                             ImVec4(palette.statusWarn[0], palette.statusWarn[1],
                                    palette.statusWarn[2], 1.0f));
@@ -5027,8 +5025,24 @@ void plmDrawGraphPage(AppState &st) {
         "Arrangement is kept per-session (the layered layout is re-derived\n"
         "deterministically on entry).");
   }
-  for (const char *k : kEdgeKinds) {
-    ImGui::SameLine();
+  // Edge-kind toggles, visually grouped: structural relations (containment,
+  // deps, mates, instances, references) then documentation/derivation
+  // relations. A wider gap + thin divider separates the two families.
+  for (int ki = 0; ki < (int)(sizeof(kEdgeKinds) / sizeof(kEdgeKinds[0]));
+       ++ki) {
+    const char *k = kEdgeKinds[ki];
+    if (ki == 5) {
+      // Group boundary: structural | documentation.
+      ImGui::SameLine(0, 12 * S);
+      const ImVec2 dp = ImGui::GetCursorScreenPos();
+      const float dh = ImGui::GetFrameHeight();
+      ImGui::GetWindowDrawList()->AddLine(
+          ImVec2(dp.x, dp.y + 3 * S), ImVec2(dp.x, dp.y + dh - 3 * S),
+          Palette::toU32(palette.glassBorder), 1.0f * S);
+      ImGui::SameLine(0, 12 * S);
+    } else {
+      ImGui::SameLine();
+    }
     bool vis = !G.hiddenKinds.count(k);
     ImU32 tc = vis ? edgeColor(k, 1.0f) : Palette::toU32(palette.textDisabled);
     ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(tc));

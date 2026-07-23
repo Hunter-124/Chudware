@@ -33,6 +33,7 @@
 #include "web_capabilities.h"  // ui::webGapReason (T-RF12: sign-in is desktop-only on web)
 #include "../core/async_rpc.h"  // core::RpcResult for skills/triggers RPCs
 #include "widgets/interwebz.h"  // Skills/Context two-column editors
+#include "ui/provider_logos.h"  // ui::drawProviderLogo/providerBrandColor (Providers list badges)
 
 
 // ---- C22b prompt editor state ----
@@ -1323,6 +1324,24 @@ static void ompStatusDotText(const char* label, const float col[3], bool filled,
     ImGui::PopStyleColor();
 }
 
+// ---- Providers-tab search filtering (provider list + model list) -----------
+static std::string toLowerAscii(const std::string& s) {
+    std::string out = s;
+    for (char& c : out) c = (char)std::tolower((unsigned char)c);
+    return out;
+}
+// needleLower must already be lowercased (case-insensitive substring on label/id).
+static bool provMatches(const OmpProviderRow& r, const std::string& needleLower) {
+    if (needleLower.empty()) return true;
+    return toLowerAscii(r.label).find(needleLower) != std::string::npos ||
+           toLowerAscii(r.id).find(needleLower) != std::string::npos;
+}
+static bool modelMatches(const ui::BridgeModelMeta& m, const std::string& needleLower) {
+    if (needleLower.empty()) return true;
+    return toLowerAscii(m.name).find(needleLower) != std::string::npos ||
+           toLowerAscii(m.id).find(needleLower) != std::string::npos;
+}
+
 static void drawOmpProviderDetail(AppState& st, float sc) {
     const OmpProviderRow* row = nullptr;
     for (const auto& r : s_omp.rows)
@@ -1341,6 +1360,13 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
                                   ? s_omp.detail.state : prov.state;
 
     // ---- header: label + state + disable toggle (mapped CAD categories only) ----
+    {
+        const float badgeSide = ImGui::GetFontSize() * 1.4f;
+        ui::drawProviderLogo(ImGui::GetWindowDrawList(), ImGui::GetCursorScreenPos(),
+                             badgeSide, prov.id);
+        ImGui::Dummy(ImVec2(badgeSide, badgeSide));
+        ImGui::SameLine(0, 6.0f * sc);
+    }
     ImGui::PushStyleColor(ImGuiCol_Text,
         ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1.0f));
     ImGui::TextUnformatted(prov.label.c_str());
@@ -1635,14 +1661,20 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
         std::snprintf(modelsTitle, sizeof(modelsTitle), "Models (%d)",
                       count > 0 ? count : prov.modelsAvailable);
         settingsGlassSectionBegin("##omp_models", modelsTitle);
+
+        static char s_modelSearchBuf[64] = "";
+        ImGui::SetNextItemWidth(-1);
+        ImGui::InputTextWithHint("##model_search", "Search models...", s_modelSearchBuf,
+                                 sizeof(s_modelSearchBuf));
+        const std::string modelNeedle = toLowerAscii(s_modelSearchBuf);
+
         if (count == 0) {
             dimText(s_omp.available
                         ? "Catalog loading \xe2\x80\x94 or no bundled models for this provider."
                         : "Catalog unavailable.");
         }
-        for (const auto& m : ui::bridgeModelCatalog()) {
-            if (m.provider != prov.id) continue;
-            ImGui::PushID(m.id.c_str());
+        // Same checkbox+name+sublabel row for both the active list and the deprecated group.
+        auto drawModelRow = [&](const ui::BridgeModelMeta& m) {
             bool hidden = st.settings.hiddenModels.count(m.id) != 0;
             bool shown = !hidden;
             if (ImGui::Checkbox("##show", &shown)) {
@@ -1667,8 +1699,34 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
             const std::string detail = ui::bridgeModelCostDetail(m);
             if (!detail.empty() && ImGui::IsItemHovered())
                 ImGui::SetTooltip("%s", detail.c_str());
+        };
+
+        // Catalog is already provider-sorted newest-first; render active models inline and
+        // stash deprecated ones for the collapsed group below (search applies to both).
+        std::vector<const ui::BridgeModelMeta*> deprecatedMatches;
+        int matchCount = 0;
+        for (const auto& m : ui::bridgeModelCatalog()) {
+            if (m.provider != prov.id) continue;
+            if (!modelMatches(m, modelNeedle)) continue;
+            ++matchCount;
+            if (m.deprecated) { deprecatedMatches.push_back(&m); continue; }
+            ImGui::PushID(m.id.c_str());
+            drawModelRow(m);
             ImGui::PopID();
         }
+        if (!deprecatedMatches.empty()) {
+            char depTitle[48];
+            std::snprintf(depTitle, sizeof(depTitle), "Older / deprecated (%d)",
+                          (int)deprecatedMatches.size());
+            if (ImGui::CollapsingHeader(depTitle)) {
+                for (const auto* mp : deprecatedMatches) {
+                    ImGui::PushID(mp->id.c_str());
+                    drawModelRow(*mp);
+                    ImGui::PopID();
+                }
+            }
+        }
+        if (count > 0 && matchCount == 0) dimText("No models match your search.");
         settingsGlassSectionEnd();
     }
     ImGui::PopID();
@@ -1702,6 +1760,16 @@ static void drawOmpProviderManager(AppState& st) {
     const float availW = ImGui::GetContentRegionAvail().x;
     const bool narrow = availW < 640.0f * sc;
 
+    static char s_provSearchBuf[64] = "";
+    ImGui::SetNextItemWidth(-1);
+    ImGui::InputTextWithHint("##prov_search", "Search providers...", s_provSearchBuf,
+                             sizeof(s_provSearchBuf));
+    const std::string provNeedle = toLowerAscii(s_provSearchBuf);
+    std::vector<const OmpProviderRow*> filteredRows;
+    filteredRows.reserve(s_omp.rows.size());
+    for (const auto& r : s_omp.rows)
+        if (provMatches(r, provNeedle)) filteredRows.push_back(&r);
+
     if (narrow) {
         // Collapsed: provider pick as a combo, detail below.
         std::string preview = s_omp.selectedId;
@@ -1709,8 +1777,14 @@ static void drawOmpProviderManager(AppState& st) {
             if (r.id == s_omp.selectedId) { preview = r.label; break; }
         ImGui::SetNextItemWidth(-1);
         if (ImGui::BeginCombo("##omp_prov_pick", preview.c_str())) {
-            for (const auto& r : s_omp.rows) {
+            for (const auto* rp : filteredRows) {
+                const OmpProviderRow& r = *rp;
                 ImGui::PushID(r.id.c_str());
+                const float badgeSide = ImGui::GetFontSize() * 1.1f;
+                ui::drawProviderLogo(ImGui::GetWindowDrawList(), ImGui::GetCursorScreenPos(),
+                                     badgeSide, r.id);
+                ImGui::Dummy(ImVec2(badgeSide, badgeSide));
+                ImGui::SameLine(0, 4.0f * sc);
                 if (ImGui::Selectable(r.label.c_str(), r.id == s_omp.selectedId))
                     s_omp.selectedId = r.id;
                 const float* c = ompStateColor(r.state);
@@ -1720,13 +1794,19 @@ static void drawOmpProviderManager(AppState& st) {
                 ImGui::PopStyleColor();
                 ImGui::PopID();
             }
+            if (filteredRows.empty()) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+                ImGui::TextUnformatted("No providers match your search.");
+                ImGui::PopStyleColor();
+            }
             ImGui::EndCombo();
         }
     } else {
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f * sc, 6.0f * sc));
         ImGui::BeginChild("##omp_prov_list", ImVec2(220.0f * sc, paneH),
                           ImGuiChildFlags_Borders);
-        for (const auto& r : s_omp.rows) {
+        for (const auto* rp : filteredRows) {
+            const OmpProviderRow& r = *rp;
             ImGui::PushID(r.id.c_str());
             const bool sel = (r.id == s_omp.selectedId);
             if (ImGui::Selectable("##row", sel, 0,
@@ -1736,7 +1816,14 @@ static void drawOmpProviderManager(AppState& st) {
             ImDrawList* dl = ImGui::GetWindowDrawList();
             const ImVec2 mn = ImGui::GetItemRectMin();
             const float fh = ImGui::GetFontSize();
-            dl->AddText(ImVec2(mn.x + 6.0f * sc, mn.y + 4.0f * sc),
+            const float rowH = fh * 2.0f + 8.0f * sc;
+            const float badgeSide = fh * 1.4f;
+            const float badgeGap = 8.0f * sc;
+            const float badgeX = mn.x + 6.0f * sc;
+            const float badgeY = mn.y + (rowH - badgeSide) * 0.5f;
+            ui::drawProviderLogo(dl, ImVec2(badgeX, badgeY), badgeSide, r.id);
+            const float textX = badgeX + badgeSide + badgeGap;
+            dl->AddText(ImVec2(textX, mn.y + 4.0f * sc),
                         ui::Palette::toU32(sel ? pal.text : pal.textDim), r.label.c_str());
             const float* c = ompStateColor(r.state);
             const bool bullet = (r.state == "oauth_connected" || r.state == "key_set");
@@ -1745,16 +1832,17 @@ static void drawOmpProviderManager(AppState& st) {
             const float dotR = fh * 0.28f;
             const float sy = mn.y + 4.0f * sc + fh + 2.0f * sc;
             const ImU32 cu = ImGui::ColorConvertFloat4ToU32(ImVec4(c[0], c[1], c[2], 1.0f));
-            const ImVec2 dc(mn.x + 6.0f * sc + dotR, sy + fh * 0.5f);
+            const ImVec2 dc(textX + dotR, sy + fh * 0.5f);
             if (bullet) dl->AddCircleFilled(dc, dotR, cu, 16);
             else        dl->AddCircle(dc, dotR, cu, 16, 1.4f * sc);
-            dl->AddText(ImVec2(mn.x + 6.0f * sc + dotR * 2.0f + 5.0f * sc, sy), cu, statusLine);
+            dl->AddText(ImVec2(textX + dotR * 2.0f + 5.0f * sc, sy), cu, statusLine);
             ImGui::PopID();
         }
-        if (s_omp.rows.empty()) {
+        if (filteredRows.empty()) {
             ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
             ImGui::TextWrapped(s_omp.listInFlight ? "Loading providers\xe2\x80\xa6"
-                                                  : "No providers reported by the bridge.");
+                               : (s_omp.rows.empty() ? "No providers reported by the bridge."
+                                                     : "No providers match your search."));
             ImGui::PopStyleColor();
         }
         ImGui::EndChild();

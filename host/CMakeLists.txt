@@ -101,6 +101,7 @@ set(CHUDWARE_CORE_SOURCES
   src/ui/copilot/composer.cpp           # chat input + send path + composer chrome
   src/ui/copilot/panel.cpp              # drawAIPanel host + ai_workspace reuse hooks
   src/ui/settings_modal.cpp
+  src/ui/provider_logos.cpp             # provider brand color + badge (Settings -> Providers)
   src/ui/oauth_capture.cpp  # in-app xAI multi-account CEF OAuth (Settings → Accounts)
   src/ui/web_capabilities.cpp  # T-RF12: WASM-build gap table (ui::webBuild / ui::webGapReason)
   src/ui/console_panel.cpp

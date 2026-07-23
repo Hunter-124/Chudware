@@ -1262,6 +1262,93 @@ std::string fmtUsd(double v) {
     return buf;
 }
 
+// Lowercased copy for case-insensitive substring matching below.
+std::string toLowerCopy(const std::string& s) {
+    std::string out(s.size(), '\0');
+    std::transform(s.begin(), s.end(), out.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    return out;
+}
+
+// Infer a release date embedded in a model id/name, e.g.:
+//   "claude-3-5-sonnet-20241022" -> 2024-10-22 (bare YYYYMMDD token)
+//   "gpt-4o-2024-08-06"          -> 2024-08-06 (YYYY-MM-DD token)
+// Deliberately conservative: only an unambiguous 8-digit YYYYMMDD run or a hyphenated
+// YYYY-MM-DD run is accepted (both self-contained — no external "year context" needed, so
+// the "-MMDD suffix + surrounding year" case never arises in practice for the ids OMP emits;
+// skip rather than guess when nothing unambiguous is found). Sets outIso="" / outSort=0 on
+// failure.
+void inferReleaseDate(const std::string& id, const std::string& name, std::string& outIso,
+                      long& outSort) {
+    outIso.clear();
+    outSort = 0;
+    auto isDigit = [](char c) { return c >= '0' && c <= '9'; };
+    auto tryParse = [&](const std::string& s) -> bool {
+        // YYYY-MM-DD (10 chars, hyphens at 4/7)
+        for (size_t i = 0; i + 10 <= s.size(); ++i) {
+            if (isDigit(s[i]) && isDigit(s[i + 1]) && isDigit(s[i + 2]) && isDigit(s[i + 3]) &&
+                s[i + 4] == '-' && isDigit(s[i + 5]) && isDigit(s[i + 6]) && s[i + 7] == '-' &&
+                isDigit(s[i + 8]) && isDigit(s[i + 9])) {
+                // Reject if immediately flanked by another digit (avoid mis-slicing a longer run).
+                if (i > 0 && isDigit(s[i - 1])) continue;
+                if (i + 10 < s.size() && isDigit(s[i + 10])) continue;
+                int y = (s[i] - '0') * 1000 + (s[i + 1] - '0') * 100 + (s[i + 2] - '0') * 10 +
+                        (s[i + 3] - '0');
+                int mo = (s[i + 5] - '0') * 10 + (s[i + 6] - '0');
+                int d = (s[i + 8] - '0') * 10 + (s[i + 9] - '0');
+                if (y < 2015 || y > 2035 || mo < 1 || mo > 12 || d < 1 || d > 31) continue;
+                char buf[16];
+                std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d", y, mo, d);
+                outIso = buf;
+                outSort = (long)y * 10000 + mo * 100 + d;
+                return true;
+            }
+        }
+        // Bare YYYYMMDD (8-digit run, not part of a longer digit run).
+        for (size_t i = 0; i + 8 <= s.size(); ++i) {
+            bool allDigit = true;
+            for (int k = 0; k < 8; ++k) if (!isDigit(s[i + k])) { allDigit = false; break; }
+            if (!allDigit) continue;
+            if (i > 0 && isDigit(s[i - 1])) continue;
+            if (i + 8 < s.size() && isDigit(s[i + 8])) continue;
+            int y = std::stoi(s.substr(i, 4));
+            int mo = std::stoi(s.substr(i + 4, 2));
+            int d = std::stoi(s.substr(i + 6, 2));
+            if (y < 2015 || y > 2035 || mo < 1 || mo > 12 || d < 1 || d > 31) continue;
+            char buf[16];
+            std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d", y, mo, d);
+            outIso = buf;
+            outSort = (long)y * 10000 + mo * 100 + d;
+            return true;
+        }
+        return false;
+    };
+    if (tryParse(id)) return;
+    tryParse(name);
+}
+
+// Conservative, substring-based heuristic flagging clearly-superseded/legacy model ids
+// (case-insensitive). Deliberately narrow — false negatives (an old model left unflagged) are
+// fine, false positives (a current flagship hidden) are not. Update this list as families age
+// out; never flag a current flagship by broad prefix match.
+bool isDeprecatedModelId(const std::string& id) {
+    static const char* kLegacySubstrings[] = {
+        "gpt-3.5", "gpt-4-0314", "gpt-4-0613", "gpt-4-32k", "text-davinci", "davinci",
+        "babbage", "ada-", "claude-1", "claude-2", "claude-instant", "claude-3-opus",
+        "gemini-1.0", "gemini-pro-vision", "palm", "deprecated",
+    };
+    const std::string lo = toLowerCopy(id);
+    for (const char* sub : kLegacySubstrings)
+        if (lo.find(sub) != std::string::npos) return true;
+    // claude-3-sonnet / claude-3-haiku are flagged, but claude-3-5-sonnet / claude-3-5-haiku
+    // (current generation) are NOT: the "-5-" between "claude-3" and "sonnet"/"haiku" means
+    // "claude-3-sonnet"/"claude-3-haiku" is never a substring of those newer ids, so a plain
+    // substring check is already exact here.
+    if (lo.find("claude-3-sonnet") != std::string::npos) return true;
+    if (lo.find("claude-3-haiku") != std::string::npos) return true;
+    return false;
+}
+
 }  // namespace
 
 void refreshBridgeModelCatalog(AppState& st, bool force) {
@@ -1305,8 +1392,19 @@ void refreshBridgeModelCatalog(AppState& st, bool force) {
                 b.costCacheRead = c->value("cacheRead", 0.0);
                 b.costCacheWrite = c->value("cacheWrite", 0.0);
             }
+            inferReleaseDate(b.id, b.name, b.releaseDate, b.releaseSort);
+            b.deprecated = isDeprecatedModelId(b.id);
             rows.push_back(std::move(b));
         }
+        // Newest-first per provider: provider ASC, deprecated last, then newest release first,
+        // then name ASC as a stable tiebreak for same-day/unknown-date rows.
+        std::stable_sort(rows.begin(), rows.end(),
+                         [](const ui::BridgeModelMeta& a, const ui::BridgeModelMeta& b) {
+            if (a.provider != b.provider) return a.provider < b.provider;
+            if (a.deprecated != b.deprecated) return !a.deprecated;  // non-deprecated first
+            if (a.releaseSort != b.releaseSort) return a.releaseSort > b.releaseSort;
+            return a.name < b.name;
+        });
         s_bridgeModels = std::move(rows);
     }, 15000);
 }

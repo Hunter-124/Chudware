@@ -71,8 +71,9 @@ MODES: tuple[str, ...] = ("simple", "advanced", "auto")
 # for manual selection.  "advanced" exposes every per-tier knob.
 DEFAULT_MODE = "auto"
 
-# The config.json key this module owns (config.save_config merges shallowly,
-# so writing {"ai_effort": {...}} never clobbers provider/api_key/etc.).
+# The config.json key this module owns (config.save_config deep-merges, so writing
+# {"ai_effort": {...}} never clobbers provider/api_key/etc. — or sibling per-tier keys
+# already nested under "overrides").
 CONFIG_KEY = "ai_effort"
 
 
@@ -281,7 +282,27 @@ class EffortProfile:
                 "warnings": list(self.warnings)}
 
 
-def _effort_config(config: dict | None) -> dict:
+def _normalize_overrides(overrides: dict, tiers: dict[str, TierProfile]) -> dict:
+    """Canonicalize override keys through normalize_tier — mirrors the write side
+    (save_effort_settings, which stores overrides under normalize_tier(tname)) —
+    so a hand-edited config.json alias like 'frontier-200k' still resolves when
+    resolve_effort looks it up by the canonical tier name 'frontier' instead of
+    being silently dropped. Keys that don't match any known tier/alias are left
+    as-is (harmless: nothing will ever look them up by that raw string either)."""
+    out: dict[str, Any] = {}
+    for tname, kv in overrides.items():
+        try:
+            canon = normalize_tier(tname, tiers)
+        except EffortError:
+            canon = tname
+        if isinstance(kv, dict) and isinstance(out.get(canon), dict):
+            out[canon].update(kv)
+        else:
+            out[canon] = kv
+    return out
+
+
+def _effort_config(config: dict | None, *, tiers: dict[str, TierProfile] | None = None) -> dict:
     """Extract + default the ai_effort block from a config.json dict."""
     if config is None:
         from services.agent.config import load_config
@@ -296,6 +317,7 @@ def _effort_config(config: dict | None) -> dict:
     overrides = block.get("overrides") or {}
     if not isinstance(overrides, dict):
         raise EffortError(f"config.json {CONFIG_KEY}.overrides must be a mapping")
+    overrides = _normalize_overrides(overrides, tiers if tiers is not None else load_all_tiers())
     return {"level": level, "mode": mode, "overrides": overrides}
 
 
@@ -313,7 +335,7 @@ def resolve_effort(
     """
     tiers = load_all_tiers(path=tiers_path)
     tname = normalize_tier(tier, tiers)
-    eff = _effort_config(config)
+    eff = _effort_config(config, tiers=tiers)
     presets = load_presets(path=presets_path)
 
     values = _shipped_baseline(tiers[tname])
@@ -459,8 +481,8 @@ def view(*, config: dict | None = None, presets_path: Path | None = None) -> dic
     """The GUI handoff shape (mirrors routing.view): presets + per-tier
     resolved knobs with provenance + warnings + knob metadata for layout."""
     presets = load_presets(path=presets_path)
-    eff = _effort_config(config)
     tiers = load_all_tiers()
+    eff = _effort_config(config, tiers=tiers)
     out: dict[str, Any] = {
         "schema": EFFORT_SCHEMA,
         "level": eff["level"],

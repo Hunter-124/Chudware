@@ -8,9 +8,11 @@ provider. Legacy single-account entries migrate transparently to account_id ``"d
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import http.server
 import json
+import os
 import secrets
 import threading
 import time
@@ -247,8 +249,23 @@ def _lock_path():
     return paths.CONFIG.with_name(paths.CONFIG.name + _LOCK_SUFFIX)
 
 
+def _secure_perms(path) -> None:
+    """Best-effort: ensure *path* is owner-only (0600).
+
+    OAuth tokens for every provider live in the credential store and its
+    lockfiles — never leave them world/group readable. Some filesystems
+    (FUSE mounts, exotic NAS shares) reject chmod; ignore failures rather
+    than crash a credential read/write over it.
+    """
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
 def _load_cfg() -> dict:
     if paths.CONFIG.exists():
+        _secure_perms(paths.CONFIG)
         try:
             return json.loads(paths.CONFIG.read_text(encoding="utf-8"))
         except Exception:
@@ -262,6 +279,8 @@ def _write_cfg(cfg: dict) -> None:
     tmp = paths.CONFIG.with_name(paths.CONFIG.name + ".tmp")
     data = json.dumps(cfg, indent=2)
     tmp.write_text(data, encoding="utf-8")
+    # OAuth tokens for every provider live in here — never world/group readable.
+    _secure_perms(tmp)
     tmp.replace(paths.CONFIG)
 
 
@@ -290,11 +309,47 @@ def _with_cfg_lock(fn):
         paths.CONFIG.parent.mkdir(parents=True, exist_ok=True)
         lock_p = _lock_path()
         with open(lock_p, "a+", encoding="utf-8") as lf:
+            _secure_perms(lock_p)
             fl = _file_lock(lf)
             if fl is None:
                 return fn()
             with fl:
                 return fn()
+
+
+def _account_lock_path(provider_id: str, account_id: str):
+    """Per-(provider, account) interprocess lockfile path, next to the store."""
+    slug = _slug_account_id(f"{provider_id}:{account_id}")
+    return paths.CONFIG.with_name(f"{paths.CONFIG.name}.{slug}{_LOCK_SUFFIX}")
+
+
+def account_lock(provider_id: str, account_id: str):
+    """Interprocess exclusive lock scoped to one (provider_id, account_id).
+
+    Serializes read-check-POST-persist token-rotation sequences (e.g. xAI's
+    single-use rotating refresh_token) across processes — an in-process
+    ``threading.Lock`` only protects threads inside one process, so two
+    processes refreshing the same account can otherwise race: the loser
+    submits an already-rotated-out token and gets falsely treated as
+    revoked. Callers MUST re-read the credential from disk after acquiring
+    this lock in case a peer process already rotated it while waiting.
+    Best-effort no-op (never blocks) on platforms without ``fcntl``.
+    """
+    lock_p = _account_lock_path(provider_id, account_id)
+
+    @contextlib.contextmanager
+    def _cm():
+        paths.CONFIG.parent.mkdir(parents=True, exist_ok=True)
+        with open(lock_p, "a+", encoding="utf-8") as lf:
+            _secure_perms(lock_p)
+            fl = _file_lock(lf)
+            if fl is None:
+                yield
+            else:
+                with fl:
+                    yield
+
+    return _cm()
 
 
 def _load_all() -> dict:

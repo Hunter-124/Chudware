@@ -382,6 +382,14 @@ def classify_provider_error(exc: BaseException) -> tuple[str, bool]:
         "forbidden",
         "invalid-argument",  # xAI 400 envelope for bad key
         "api key provided",
+        # xai_sub_provider dead-refresh-token phrasing (providers/xai_sub_provider.py
+        # mark_refresh_revoked() callers inside refresh()): dead OAuth refresh
+        # tokens are permanent — only an interactive re-login recovers, never
+        # retryable.
+        "invalid_grant",
+        "re-authenticate",
+        "not logged in",
+        "previously revoked",
     )
     if status_i in (400, 401, 403) or any(m in text for m in auth_markers):
         # 400 alone is ambiguous (bad request vs auth). Treat as non-retryable
@@ -442,6 +450,70 @@ _SYSTEM_BASE = (
     "status may be done|blocked|escalated. Call only tools from the allowed list. "
     "Do not invent results — run the tool."
 )
+
+
+# mega-25 / T-W21 §20: once-per-session cache for the static skills+role
+# catalog blocks (role_catalog.harness_context_block/format_role_catalog_block
+# + skills.catalog_block) — both are static within a mission but were being
+# rebuilt and resent on EVERY main turn (~900-1000 tokens/turn, ~15-20k/mission).
+# Keyed by subagent_id (fresh per DAG-node/subagent context) else run_id
+# (shared mission); calls with neither (standalone/test calls — no session
+# identity) always inject, matching pre-fix behavior with zero pollution risk
+# across unrelated calls.
+_CATALOG_INJECTED_SESSIONS: set[str] = set()
+
+
+def _catalog_due(session_key: str | None) -> bool:
+    """True on the first call for *session_key* (consumes it); always True
+    (never marked) when *session_key* is falsy."""
+    if not session_key:
+        return True
+    if session_key in _CATALOG_INJECTED_SESSIONS:
+        return False
+    _CATALOG_INJECTED_SESSIONS.add(session_key)
+    return True
+
+
+def _maybe_inject_trigger_advisory(
+    *,
+    output_text: str,
+    tool_names: list[str],
+    seq: int,
+    cooldown_state: dict,
+    stage: str = "agent_turn",
+) -> str | None:
+    """T-W21 §20 / mega-25: render matched trigger context packs for the
+    PREVIOUS iteration's model output + tool calls, or ``None`` when nothing
+    fires (cheap no-match path — no import, no engine call).
+
+    Delegates to the advisor engine (adapters.observe_build → engine.
+    build_advisory → render.render_advisory) so the effort gate
+    (``trigger_injection``), the ``[ADVISORY]`` block format, and the §3
+    candidate-fix invariant all come from the single source of truth in
+    advisor/engine.py — this wrapper only decides WHEN to call it (per turn,
+    with a run-local ``cooldown_state``) and folds the rendered block into
+    the conversation. ``res={}`` on the loop-path adapter: this call site has
+    no build123d result, only turn signals.
+    """
+    if not output_text and not tool_names:
+        return None
+    try:
+        from services.agent.advisor import adapters as _adv_adapters  # noqa: PLC0415
+        from services.agent.advisor import engine as _adv_engine  # noqa: PLC0415
+        from services.agent.advisor import render as _adv_render  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        obs = _adv_adapters.observe_build(
+            {}, stage=stage, seq=seq,
+            output_text=output_text, tool_names=tool_names,
+            cooldown_state=cooldown_state,
+        )
+        advisory = _adv_engine.build_advisory(obs)
+        block = _adv_render.render_advisory(advisory)
+    except Exception:  # noqa: BLE001 — trigger layer never breaks a turn
+        return None
+    return block or None
 
 
 def run_turn(request: str, provider: Any, *, name: str = "dag_node",
@@ -621,6 +693,11 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
     except Exception:  # noqa: BLE001 — mode gate never breaks a turn
         pass
     actor = actor or name
+    # mega-25: once-per-session key for the static catalog gate below (role
+    # catalog is main-turn-only; skills catalog applies to every call). Fresh
+    # per DAG-node/subagent context (subagent_id), else per mission (run_id).
+    _catalog_session_key = subagent_id or run_id
+    _first_catalog_turn = _catalog_due(_catalog_session_key)
     # WI-8: inject reference builds into the user request for A/B specify.
     _req = request
     # Wave 4: surface GUI context_refs before scaffolds so both the model and
@@ -697,7 +774,7 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
 
     # Role catalog + harness (main turns only).
     try:
-        if not subagent_id:
+        if not subagent_id and _first_catalog_turn:
             from services.agent.role_catalog import (  # noqa: PLC0415
                 format_role_catalog_block,
                 harness_context_block,
@@ -768,7 +845,16 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
             except Exception:  # noqa: BLE001
                 _req = _clean
             messages = [{"role": "user", "content": _parts(_req)}]
-        _sk = _skills.session_system_block(_sid, user_text=request, phase=_phase)
+        _sk_parts: list[str] = []
+        if _first_catalog_turn:
+            _cat = _skills.catalog_block()
+            if _cat:
+                _sk_parts.append(_cat)
+        if request or _phase:
+            _sk_parts.extend(
+                _skills.activate_for_prompt(request or "", session_id=_sid, phase=_phase)
+            )
+        _sk = "\n\n".join(_sk_parts)
         if _sk:
             system = system.rstrip() + "\n\n" + _sk
     except Exception:  # noqa: BLE001
@@ -811,6 +897,14 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
         pass
     # mega-24 a2: at most one forced first-tool on zero-tool no_code.
     _force_once = [False]
+    # T-W21 §20 / mega-25: trigger-injection bookkeeping scoped to THIS
+    # run_turn() call — messages/context is always fresh per call (no cross-
+    # call conversation continuity), so cooldown only needs to hold across
+    # this call's own tool-iteration loop.
+    _trig_cooldown_state: dict = {}
+    _trig_seq = 0
+    _trig_prev_text = ""
+    _trig_prev_calls_idx = 0
     for _ in range(budget + 1):
         # Phase 4 (M11/M16/M17): the sub-agent turn boundary.  When this turn IS a
         # sub-agent session (subagent_id set), drain the cross-process steering queue
@@ -847,6 +941,22 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                                          "steer_id": _steer.get("steer_id", "")})
             except Exception:  # noqa: BLE001
                 pass
+        # T-W21 §20: inject matched trigger context packs from the PREVIOUS
+        # iteration's model output + tool calls (effort-gated inside; cheap
+        # no-op on the first iteration / no signal — mega-25).
+        _trig_tool_names = [
+            c.get("tool") for c in calls[_trig_prev_calls_idx:]
+            if isinstance(c, dict) and c.get("tool")
+        ]
+        _trig_block = _maybe_inject_trigger_advisory(
+            output_text=_trig_prev_text,
+            tool_names=_trig_tool_names,
+            seq=_trig_seq,
+            cooldown_state=_trig_cooldown_state,
+        )
+        _trig_seq += 1
+        if _trig_block:
+            messages.append({"role": "user", "content": _parts(_trig_block)})
         try:
             reply = provider.complete(system, messages, max_tokens=completion_cap)
             # mega-6: drain last-call usage into ledger so spend is auditable.
@@ -1032,6 +1142,8 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                                              if _tu else None)})
 
         messages.append({"role": "assistant", "content": _parts(reply)})
+        _trig_prev_text = reply
+        _trig_prev_calls_idx = len(calls)
         # Phase 4: sub-agent transcripts capture every model reply so the GUI viewer
         # shows the real conversation (never fabricated).
         if subagent_id:

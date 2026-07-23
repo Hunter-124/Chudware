@@ -179,8 +179,6 @@ _CHECK_RULES = {
 # Which role owns a given kind of edit (dispatch recommendation).
 _DISPATCH_RULES = {
     "dimension": "feature_modeler",   # a dimension change is a feature edit
-    "feature": "feature_modeler",
-    "part": "assembly_fit_engineer",
     "fit": "assembly_fit_engineer",
 }
 

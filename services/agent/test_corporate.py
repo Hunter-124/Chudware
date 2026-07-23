@@ -26,6 +26,7 @@ from services.agent.corporate import (
     CORPORATE_SCHEMA,
     OrgChart,
     build_corporate_org,
+    classify_task_department,
     clear_org_charts,
     derive_departments,
     drop_org_chart,
@@ -549,6 +550,33 @@ class TestRegistry:
         assert c1 is c2
         drop_org_chart("r_reg")
         assert get_org_chart("r_reg", create=False) is None
+
+
+# ---------------------------------------------------------------------------
+# classify_task_department — role→dept completeness + word-boundary fallback
+# ---------------------------------------------------------------------------
+
+class TestClassifyDepartment:
+    def test_model3d_and_sketch2d_map_to_geometry(self):
+        assert classify_task_department("model3d") == "geometry"
+        assert classify_task_department("sketch2d") == "geometry"
+        assert classify_task_department({"role": "model3d"}) == "geometry"
+        assert classify_task_department({"role": "sketch2d"}) == "geometry"
+
+    def test_drawing_detailer_maps_to_documentation(self):
+        assert classify_task_department("drawing_detailer") == "documentation"
+        assert classify_task_department({"role": "drawing_detailer"}) == "documentation"
+
+    def test_onboarding_does_not_misroute_to_electronics(self):
+        # "board" is a mid-word substring of "onboarding" — must not match via
+        # the free-text keyword fallback (word-boundary regex, not raw `in`).
+        dept = classify_task_department({"brief": "onboarding checklist for new hires"})
+        assert dept != "electronics"
+        assert dept == "general"
+
+    def test_real_board_keyword_still_routes_to_electronics(self):
+        # The word-boundary fix must not break the genuine keyword match.
+        assert classify_task_department({"brief": "lay out the circuit board"}) == "electronics"
 
 
 # ---------------------------------------------------------------------------

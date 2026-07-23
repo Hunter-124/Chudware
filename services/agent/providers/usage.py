@@ -2194,6 +2194,32 @@ def fetch_account_usage(
         row = _base_row(friendly, str(aid), source="unavailable")
         return _merge_identity(row, stored)
 
+    # Revoked/expired-token accounts (any provider) can never complete a live
+    # fetch — skip the network entirely instead of re-hitting it every
+    # cache-TTL cycle. A credential whose access token is still live is left
+    # to the normal fetcher path (it may yet succeed until that token dies).
+    if stored.get("refresh_revoked") and sub_auth.is_expired(stored, skew_ms=0):
+        log.info("usage: %s/%s revoked+expired; skipping live fetch", friendly, aid)
+        last_usage = []
+        if cached and cached.get("row") and cached["row"].get("usage"):
+            last_usage = list(cached["row"]["usage"])
+        elif isinstance(stored.get("last_usage"), list):
+            last_usage = list(stored["last_usage"])
+        row = _merge_identity(
+            _base_row(
+                friendly,
+                str(aid),
+                display_name=stored.get("display_name") or stored.get("email"),
+                plan=stored.get("plan"),
+                usage=last_usage,
+                source="cached" if last_usage else "unavailable",
+                email=stored.get("email"),
+            ),
+            stored,
+        )
+        _cache[key] = {"fetched_at": now, "rate_limited_until": 0, "row": row}
+        return row
+
     try:
         result = fetcher(stored)
     except _RateLimited:

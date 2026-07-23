@@ -99,8 +99,12 @@ class TestLedgerEvent:
         assert rc == 0 and out["ok"] is True
         ledger = tmp_path / "runs" / "r_test_sim3" / "ledger.json"
         assert ledger.exists(), "ledger artifact event not written"
-        doc = json.loads(ledger.read_text())
-        evs = [e for e in doc["events"]
+        # Events persist append-only in the ledger.jsonl sidecar (ledger.json holds
+        # only the materialized state snapshot); one JSON event per line.
+        sidecar = ledger.with_suffix(".jsonl")
+        assert sidecar.exists(), "ledger.jsonl event sidecar not written"
+        events = [json.loads(line) for line in sidecar.read_text().splitlines() if line.strip()]
+        evs = [e for e in events
                if e["actor"] == "gui_sim" and e["kind"] == "artifact"]
         assert evs, "no gui_sim artifact event"
         assert evs[-1]["payload"]["id"] == "study-abc"

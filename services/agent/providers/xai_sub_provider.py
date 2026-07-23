@@ -1102,9 +1102,20 @@ class XAISubProvider(Provider):
     def refresh(self) -> dict:
         """Exchange the stored refresh token for a new access token.
 
-        Serialized per account_id. Re-reads the credential from disk under the
-        lock so a concurrent refresh that already rotated the RT is reused
-        instead of burning the old (now-revoked) token a second time.
+        Serialized per account_id both in-process (``threading.Lock``, a
+        cheap same-process short-circuit) and cross-process (an interprocess
+        file lock — ``sub_auth.account_lock``) around the whole read-check-
+        POST-persist sequence. xAI rotates the refresh token on every
+        exchange, so two unsynchronized processes refreshing the same
+        account would otherwise race: the loser submits an already-rotated-
+        out RT and gets falsely marked ``invalid_grant`` — permanently
+        locking out a healthy account via ``mark_refresh_revoked``. Re-reads
+        the credential from disk under each lock so a refresh that already
+        completed (this process or a peer's) is reused instead of burning
+        the old (now-revoked) token a second time. As defense-in-depth, an
+        ``invalid_grant`` response is also checked against the on-disk
+        refresh_token before revoking — a peer rotation observed there is
+        retried once with the newer token instead of condemning the account.
         """
         if not self._cred or not (
             self._cred.get("refresh_token") or self._cred.get("access_token")
@@ -1116,7 +1127,8 @@ class XAISubProvider(Provider):
         aid = _cred_account_id(self._cred) or sub_auth.get_active_account_id(PROVIDER_ID)
         lock = _refresh_lock_for(aid)
         with lock:
-            # Another thread may have already refreshed this account — reload.
+            # Another thread in this process may have already refreshed this
+            # account — reload before paying for the interprocess file lock.
             if aid:
                 fresh = sub_auth.load_credential(PROVIDER_ID, account_id=aid)
                 if isinstance(fresh, dict) and _has_usable_tokens(fresh):
@@ -1139,65 +1151,113 @@ class XAISubProvider(Provider):
                     f"(refresh_token previously revoked"
                     f"{(': ' + str(self._cred.get('auth_error'))) if self._cred.get('auth_error') else ''})"
                 )
-            endpoint = (
-                self._cred.get("token_endpoint")
-                or XAI_OAUTH_TOKEN_URL_FALLBACK
-            )
-            rt = self._cred["refresh_token"]
-            log.info("xai oauth: refresh via %s (account=%s)", endpoint, (aid or "")[:12])
-            try:
-                resp = sub_auth.post_form(
-                    endpoint,
-                    {
-                        "grant_type": "refresh_token",
-                        "client_id": XAI_OAUTH_CLIENT_ID,
-                        "refresh_token": rt,
-                    },
-                    headers={"Accept": "application/json"},
-                    timeout=30.0,
+            with sub_auth.account_lock(PROVIDER_ID, aid or "__default__"):
+                # Cross-process: re-read INSIDE the interprocess lock — a peer
+                # process may have already rotated this RT while we waited on
+                # the flock. No-op out rather than burn a token it retired.
+                if aid:
+                    fresh2 = sub_auth.load_credential(PROVIDER_ID, account_id=aid)
+                    if isinstance(fresh2, dict) and _has_usable_tokens(fresh2):
+                        self._cred = fresh2
+                        if not sub_auth.is_expired(self._cred, skew_ms=REFRESH_SKEW_MS):
+                            log.info(
+                                "xai oauth: refresh short-circuit (cross-process); "
+                                "account %s already fresh",
+                                (aid or "")[:12],
+                            )
+                            return self._cred
+                        if self._cred.get("refresh_revoked"):
+                            raise RuntimeError(
+                                "xAI OAuth refresh failed — re-authenticate via "
+                                "Settings → Sign in with xAI. "
+                                f"(refresh_token previously revoked"
+                                f"{(': ' + str(self._cred.get('auth_error'))) if self._cred.get('auth_error') else ''})"
+                            )
+                endpoint = (
+                    self._cred.get("token_endpoint")
+                    or XAI_OAUTH_TOKEN_URL_FALLBACK
                 )
-            except urllib.error.HTTPError as exc:
-                body = exc.read().decode("utf-8", errors="replace")[:400]
-                if exc.code == 403:
-                    log.error("xai oauth: refresh 403-tier: %s", body)
-                    mark_account_blocked(aid, reason=f"refresh 403: {body[:80]}")
-                    raise XaiTierDeniedError(body) from exc
-                if exc.code in (400, 401):
-                    log.error("xai oauth: refresh failed HTTP %s: %s", exc.code, body)
-                    body_l = body.lower()
-                    definitive = (
-                        "invalid_grant" in body_l
-                        or "revoked" in body_l
-                        or "invalid_token" in body_l
-                        or "expired" in body_l
+                retried = False
+                while True:
+                    rt = self._cred["refresh_token"]
+                    log.info(
+                        "xai oauth: refresh via %s (account=%s)", endpoint, (aid or "")[:12]
                     )
-                    if definitive:
-                        mark_refresh_revoked(aid, detail=body[:200])
-                    else:
-                        mark_account_blocked(
-                            aid, seconds=5 * 60, reason=f"refresh {exc.code}"
+                    try:
+                        resp = sub_auth.post_form(
+                            endpoint,
+                            {
+                                "grant_type": "refresh_token",
+                                "client_id": XAI_OAUTH_CLIENT_ID,
+                                "refresh_token": rt,
+                            },
+                            headers={"Accept": "application/json"},
+                            timeout=30.0,
                         )
-                    raise RuntimeError(
-                        "xAI OAuth refresh failed — re-authenticate via "
-                        "Settings → Sign in with xAI. "
-                        f"(HTTP {exc.code}: {body})"
-                    ) from exc
-                if exc.code == 429:
-                    mark_account_blocked(aid, seconds=5 * 60, reason="refresh 429")
-                    raise RuntimeError(
-                        f"xAI token refresh rate-limited (HTTP 429): {body}"
-                    ) from exc
-                log.error("xai oauth: refresh failed HTTP %s: %s", exc.code, body)
-                raise RuntimeError(
-                    f"xAI token refresh failed (HTTP {exc.code}): {body}"
-                ) from exc
-            # xAI rotates RTs — never drop a missing new RT on the floor, but
-            # prefer the rotated one when present. Persist immediately under the
-            # account lock so no peer can race with the old RT.
-            if not resp.get("refresh_token"):
-                resp = dict(resp)
-                resp["refresh_token"] = rt
-            return self._store_tokens(resp, token_endpoint=endpoint)
+                        break
+                    except urllib.error.HTTPError as exc:
+                        body = exc.read().decode("utf-8", errors="replace")[:400]
+                        if exc.code == 403:
+                            log.error("xai oauth: refresh 403-tier: %s", body)
+                            mark_account_blocked(aid, reason=f"refresh 403: {body[:80]}")
+                            raise XaiTierDeniedError(body) from exc
+                        if exc.code in (400, 401):
+                            log.error("xai oauth: refresh failed HTTP %s: %s", exc.code, body)
+                            body_l = body.lower()
+                            definitive = (
+                                "invalid_grant" in body_l
+                                or "revoked" in body_l
+                                or "invalid_token" in body_l
+                                or "expired" in body_l
+                            )
+                            if definitive and not retried:
+                                # Defense-in-depth: the interprocess lock should
+                                # prevent this, but if a peer rotated this RT
+                                # anyway, don't punish a healthy account — pick
+                                # up the newer token from disk and retry once
+                                # before giving up.
+                                disk = (
+                                    sub_auth.load_credential(PROVIDER_ID, account_id=aid)
+                                    if aid else None
+                                )
+                                disk_rt = (disk or {}).get("refresh_token")
+                                if disk_rt and disk_rt != rt:
+                                    log.info(
+                                        "xai oauth: invalid_grant but on-disk "
+                                        "refresh_token already rotated by a peer — "
+                                        "retrying once (account=%s)",
+                                        (aid or "")[:12],
+                                    )
+                                    self._cred = dict(disk)
+                                    retried = True
+                                    continue
+                            if definitive:
+                                mark_refresh_revoked(aid, detail=body[:200])
+                            else:
+                                mark_account_blocked(
+                                    aid, seconds=5 * 60, reason=f"refresh {exc.code}"
+                                )
+                            raise RuntimeError(
+                                "xAI OAuth refresh failed — re-authenticate via "
+                                "Settings → Sign in with xAI. "
+                                f"(HTTP {exc.code}: {body})"
+                            ) from exc
+                        if exc.code == 429:
+                            mark_account_blocked(aid, seconds=5 * 60, reason="refresh 429")
+                            raise RuntimeError(
+                                f"xAI token refresh rate-limited (HTTP 429): {body}"
+                            ) from exc
+                        log.error("xai oauth: refresh failed HTTP %s: %s", exc.code, body)
+                        raise RuntimeError(
+                            f"xAI token refresh failed (HTTP {exc.code}): {body}"
+                        ) from exc
+                # xAI rotates RTs — never drop a missing new RT on the floor, but
+                # prefer the rotated one when present. Persist immediately under the
+                # account lock so no peer can race with the old RT.
+                if not resp.get("refresh_token"):
+                    resp = dict(resp)
+                    resp["refresh_token"] = rt
+                return self._store_tokens(resp, token_endpoint=endpoint)
 
 
     def _bind_account(self, account_id: str, cred: dict) -> None:

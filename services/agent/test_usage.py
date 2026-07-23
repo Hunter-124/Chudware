@@ -1146,3 +1146,55 @@ def test_xai_enrich_userinfo_live_shape(monkeypatch):
     assert cred["email"] == "h@example.com"
     assert cred["display_name"] == "Hunter Edmonds"
     assert cred["plan"] == "SuperGrok"
+
+
+def test_revoked_expired_credential_skips_live_fetch_any_provider(tmp_config, monkeypatch):
+    """Generalized skip (not xAI-only): any provider's revoked+expired stored
+    credential must not reach its live fetcher, even past cache TTL — matches
+    the xAI-specific disk-only skip in fetch_xai_usage_api, but for everyone."""
+    now = time.time()
+    sub_auth.save_credential("openai-codex", {
+        "access_token": "dead-at",
+        "refresh_token": "dead-rt",
+        "expires_at_ms": (now - 100) * 1000,
+        "account_id": "acct-c",
+        "email": "c@openai.com",
+        "display_name": "C",
+        "plan": "plus",
+        "last_usage": [{"window": "5h", "label": "5h", "used_fraction": 0.2,
+                        "resets_at": None, "status": "ok"}],
+        "refresh_revoked": True,
+    }, account_id="acct-c")
+
+    def boom(_cred):
+        raise AssertionError("revoked/expired credential must not reach the live fetcher")
+
+    monkeypatch.setitem(usage._FETCHERS, "codex", boom)
+    usage.clear_cache()
+    row = usage.fetch_account_usage("codex", "acct-c", force=True)
+    assert row["usage"] and row["usage"][0]["used_fraction"] == 0.2
+    assert row["source"] == "cached"
+
+
+def test_live_access_token_still_tries_fetcher_despite_prior_revoke_marker(tmp_config, monkeypatch):
+    """A stale 'refresh_revoked' marker must not skip the fetch while the
+    access token itself is still unexpired — only revoked+expired skips."""
+    now = time.time()
+    sub_auth.save_credential("openai-codex", {
+        "access_token": "live-at",
+        "refresh_token": "rt",
+        "expires_at_ms": (now + 3600) * 1000,
+        "account_id": "acct-d",
+        "refresh_revoked": True,
+    }, account_id="acct-d")
+
+    calls = {"n": 0}
+
+    def fetcher(_cred):
+        calls["n"] += 1
+        return {"usage": [], "plan": "plus"}
+
+    monkeypatch.setitem(usage._FETCHERS, "codex", fetcher)
+    usage.clear_cache()
+    usage.fetch_account_usage("codex", "acct-d", force=True)
+    assert calls["n"] == 1

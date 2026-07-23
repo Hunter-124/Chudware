@@ -5,7 +5,7 @@ inject: auto
 triggers:
   keywords: [assembly, mate, mates, component, subassembly, fit together, bolt pattern]
   tools: [new_assembly, asm_add_component, asm_mate, solve_mates, check_interference, interface_check]
-  phases: [assembly, linkage]
+  phases: [assembly, feature]
 ---
 
 # Edit Assembly

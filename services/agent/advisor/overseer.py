@@ -23,8 +23,10 @@ NOT re-author the prompt — it:
   * writes the audit as a ledger event and converts its verdicts into advisory
     items marked ``source.kind: "llm"`` so renderers flag them as review findings,
     never kernel facts;
-  * tracks the blocker fingerprint (``class+finding``) repeat counter — two
-    matching ``blocker`` audits ⇒ mandatory ask_user escalation.
+  * tracks a repeat-misroute fingerprint counter — keyed on the deterministic
+    ``targeted_reentry`` (stage/role/feature) when routing resolves one, else
+    class+finding as a legacy fallback — so two matching non-``ok`` verdicts
+    (any severity) trip mandatory ask_user escalation even when reworded.
 
 The engine is deterministic around a **pluggable provider** (offline discipline:
 tests inject a mock provider that returns canned audit JSON — real code paths, no
@@ -65,7 +67,7 @@ VERDICT_CLASSES = frozenset({
 _SEVERITIES = frozenset({"info", "action", "blocker"})
 _ACTION_KINDS = frozenset({"replan", "reorder", "edit", "ask_user", "none"})
 
-# Two blockers with the same fingerprint ⇒ mandatory ask_user (§11).
+# Two non-ok verdicts with the same fingerprint ⇒ mandatory ask_user (§11).
 _BLOCKER_ESCALATE_AT = 2
 
 
@@ -507,8 +509,22 @@ def validate_audit(obj: dict) -> dict:
 
 
 def _fingerprint(verdict: dict) -> str:
-    """Stable ``class+finding`` fingerprint used for the repeat-blocker counter."""
-    raw = f"{verdict.get('class','')}|{verdict.get('finding','').strip().lower()}"
+    """Stable fingerprint for the repeat-misroute counter.
+
+    Keyed on the DETERMINISTIC reentry decision the routing engine already
+    computed (target stage/role/feature from ``targeted_reentry``, T-DP5) —
+    never the model's free-text finding prose, so a repeatedly-misrouted
+    correction still counts as a repeat when the LLM just rewords its finding
+    (or picks a different severity). Falls back to class+finding only when no
+    reentry resolved (no DP stage owns the verdict — nothing deterministic to
+    key on, e.g. a legacy non-DP run).
+    """
+    reentry = verdict.get("targeted_reentry")
+    if isinstance(reentry, dict) and reentry.get("stage"):
+        raw = (f"reentry|{reentry.get('stage','')}|{reentry.get('role','')}|"
+              f"{reentry.get('feature') or ''}")
+    else:
+        raw = f"class|{verdict.get('class','')}|{verdict.get('finding','').strip().lower()}"
     return hashlib.sha256(raw.encode()).hexdigest()[:12]
 
 
@@ -631,7 +647,7 @@ class Overseer:
             if ev.get("kind") != "audit":
                 continue
             for v in (ev.get("payload") or {}).get("verdicts", []):
-                if v.get("severity") == "blocker":
+                if v.get("class") != "ok":
                     fp = _fingerprint(v)
                     self._blocker_counts[fp] = self._blocker_counts.get(fp, 0) + 1
 
@@ -769,7 +785,10 @@ class Overseer:
             except Exception:  # noqa: BLE001
                 pass
 
-        # Repeat-blocker escalation: two blockers with the same fingerprint ⇒ ask_user.
+        # Repeat-misroute escalation: two non-ok verdicts with the same deterministic
+        # reroute fingerprint ⇒ ask_user — not just blocker-severity, since a
+        # repeatedly-misrouted correction loops regardless of the severity the LLM
+        # assigns it.
         escalated, esc_text = self._check_repeat_blockers(audit)
 
         advisory = audit_to_advisory(audit, seq=len(getattr(self.ledger, "events", []) or []))
@@ -777,11 +796,18 @@ class Overseer:
                            escalated=escalated, escalation_text=esc_text)
 
     def _check_repeat_blockers(self, audit: dict) -> tuple[bool, str]:
-        """Bump the fingerprint counter for each blocker; escalate at exactly 2."""
+        """Bump the fingerprint counter for each non-ok verdict; escalate at 2.
+
+        Counts every non-``ok`` verdict (any severity) — a correction that keeps
+        getting misrouted loops regardless of the severity the LLM assigns it.
+        Safe to widen from blocker-only because ``_fingerprint`` now keys on the
+        deterministic reroute target, not prose, so unrelated findings never
+        collide into a false escalation.
+        """
         escalated = False
         texts: list[str] = []
         for v in audit.get("verdicts", []):
-            if v.get("severity") != "blocker":
+            if v.get("class") == "ok":
                 continue
             fp = _fingerprint(v)
             self._blocker_counts[fp] = self._blocker_counts.get(fp, 0) + 1

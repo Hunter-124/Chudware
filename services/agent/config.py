@@ -16,6 +16,7 @@ state. config.json shape:
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
 from urllib.parse import urlparse
@@ -27,26 +28,69 @@ from .providers.base import Provider
 from . import model_catalog
 
 
+# --------------------------------------------------------------------------- load/save cache
+# config.json is read on EVERY tool dispatch (get_tool_options / is_tool_family_enabled
+# call load_config() with cfg=None at least twice per tool call), so re-reading and
+# re-parsing the file on every call is wasted work. Cache keyed on the resolved path
+# (str(paths.CONFIG) — tests monkeypatch this to a tmp_path fixture, see test_effort.py)
+# plus its mtime_ns; either changing invalidates and reparses. Mirrors
+# advisor/triggers.py's _ensure_cache_fresh pattern. load_config() returns a deep copy
+# so callers (notably save_config below, which mutates its result in place) can never
+# corrupt the cached dict.
+_cfg_cache: dict | None = None
+_cfg_cache_path: str | None = None
+_cfg_cache_mtime_ns: int | None = None
+
 
 def load_config() -> dict:
-    if paths.CONFIG.exists():
+    global _cfg_cache, _cfg_cache_path, _cfg_cache_mtime_ns
+    path = paths.CONFIG
+    path_key = str(path)
+    try:
+        mtime_ns = path.stat().st_mtime_ns
+    except OSError:
+        mtime_ns = None
+    if (
+        _cfg_cache is not None
+        and _cfg_cache_path == path_key
+        and _cfg_cache_mtime_ns == mtime_ns
+    ):
+        return copy.deepcopy(_cfg_cache)
+    cfg: dict = {}
+    if mtime_ns is not None:
         try:
-            return json.loads(paths.CONFIG.read_text(encoding="utf-8"))
+            cfg = json.loads(path.read_text(encoding="utf-8"))
         except Exception:  # noqa: BLE001
-            return {}
-    return {}
+            cfg = {}
+    _cfg_cache, _cfg_cache_path, _cfg_cache_mtime_ns = cfg, path_key, mtime_ns
+    return copy.deepcopy(cfg)
+
+
+def _deep_merge(base: dict, updates: dict) -> dict:
+    """Recursively merge dict-valued keys of *updates* into *base* in place;
+    scalars/lists in *updates* replace outright. Lets save_config's read-merge-write
+    honor its documented contract for nested writes (e.g. {"keys": {...}}), not just
+    top-level ones."""
+    for key, value in updates.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_merge(base[key], value)
+        else:
+            base[key] = value
+    return base
 
 
 def save_config(cfg: dict) -> None:
     """Read-merge-write a partial update into config.json (creating it on first run).
 
-    Merges shallowly into whatever is already on disk so one caller (e.g. a first-run
-    consent prompt setting telemetry_consent) never clobbers keys another caller owns
-    (provider/api_key/etc.) — the same non-destructive contract the C++ GUI's first-run
-    dialog follows when it writes this file directly (ui/imgui/src/ui/first_run.cpp).
+    Deep-merges into whatever is already on disk — recursing into dict-valued keys,
+    replacing scalars/lists outright — so one caller (e.g. a first-run consent prompt
+    setting telemetry_consent) never clobbers keys another caller owns (provider/api_key/
+    etc.), including nested siblings under a shared parent key (e.g. {"keys": {...}}) —
+    the same non-destructive contract the C++ GUI's first-run dialog follows when it
+    writes this file directly (ui/imgui/src/ui/first_run.cpp).
     """
     current = load_config()
-    current.update(cfg)
+    _deep_merge(current, cfg)
     paths.CONFIG.parent.mkdir(parents=True, exist_ok=True)
     paths.CONFIG.write_text(json.dumps(current, indent=2), encoding="utf-8")
 
@@ -398,7 +442,7 @@ def proactive_advisor_enabled(cfg: dict | None = None) -> bool:
 # ---------------------------------------------------------------------------
 DEFAULT_TOOL_FAMILIES = (
     "advisor", "cad", "cam", "ecad", "em", "gsl", "intake", "ledger",
-    "mission", "org", "parts", "plm", "recon", "research", "reveng", "sim",
+    "mission", "parts", "plm", "recon", "research", "reveng", "sim",
     "workspace",
 )
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import stat
 import threading
 import time
 from urllib.parse import parse_qs, urlparse
@@ -1806,3 +1807,118 @@ def test_xai_all_revoked_predicate_empty_store(tmp_config):
 
     xsp.clear_blocked_accounts_for_tests()
     assert xsp._stored_accounts_all_refresh_revoked() is False
+
+
+# ── 0600 credential-store permissions ───────────────────────────────────────
+
+def test_credential_store_file_is_0600(tmp_config):
+    """OAuth tokens must never persist world/group readable (default umask)."""
+    sub_auth.save_credential("prov", {"access_token": "x"}, account_id="a")
+    mode = stat.S_IMODE(tmp_config.stat().st_mode)
+    assert mode == 0o600
+
+
+def test_load_cfg_tightens_existing_insecure_permissions(tmp_config):
+    """A config.json left over from before this fix gets chmod'd on load."""
+    tmp_config.write_text("{}", encoding="utf-8")
+    tmp_config.chmod(0o644)
+    sub_auth._load_cfg()
+    mode = stat.S_IMODE(tmp_config.stat().st_mode)
+    assert mode == 0o600
+
+
+def test_account_lock_file_is_0600(tmp_config):
+    with sub_auth.account_lock("prov", "acct-a"):
+        pass
+    lock_p = sub_auth._account_lock_path("prov", "acct-a")
+    mode = stat.S_IMODE(lock_p.stat().st_mode)
+    assert mode == 0o600
+
+
+# ── account_lock (interprocess flock) ───────────────────────────────────────
+
+def test_account_lock_serializes_across_independent_opens(tmp_config):
+    """Two independent lock acquisitions (simulating separate processes, since
+    flock is per open-file-description) must serialize — the second blocks
+    until the first releases, even with no in-process threading.Lock held."""
+    order: list[str] = []
+    entered = threading.Event()
+    release = threading.Event()
+
+    def first() -> None:
+        with sub_auth.account_lock("prov", "acct-a"):
+            order.append("first-enter")
+            entered.set()
+            release.wait(timeout=5)
+            order.append("first-exit")
+
+    t1 = threading.Thread(target=first)
+    t1.start()
+    assert entered.wait(timeout=5)
+
+    def second() -> None:
+        with sub_auth.account_lock("prov", "acct-a"):
+            order.append("second-enter")
+
+    t2 = threading.Thread(target=second)
+    t2.start()
+    time.sleep(0.15)
+    assert order == ["first-enter"]  # second is still blocked on the flock
+
+    release.set()
+    t1.join(timeout=5)
+    t2.join(timeout=5)
+    assert order == ["first-enter", "first-exit", "second-enter"]
+
+
+def test_xai_refresh_invalid_grant_retries_once_when_peer_rotated(tmp_config, monkeypatch):
+    """Defense-in-depth: invalid_grant on the token we sent must not revoke a
+    healthy account when the on-disk refresh_token already moved on (a peer
+    rotated it) — retry once with the newer token instead."""
+    import io
+    import urllib.error
+    from agent.providers import xai_sub_provider as xsp
+
+    now = time.time() * 1000
+    sub_auth.save_credential(xsp.PROVIDER_ID, {
+        "access_token": "at-old",
+        "refresh_token": "rt-old",
+        "expires_at_ms": now - 1000,
+        "account_id": "acct-a",
+        "token_endpoint": "https://auth.x.ai/oauth2/token",
+    }, account_id="acct-a")
+    xsp.clear_blocked_accounts_for_tests()
+
+    p = xsp.XAISubProvider()
+    p._cred = sub_auth.load_credential(xsp.PROVIDER_ID, account_id="acct-a")
+
+    calls = {"n": 0}
+
+    def fake_post_form(url, fields, headers=None, timeout=30.0):  # noqa: ARG001
+        calls["n"] += 1
+        if fields.get("refresh_token") == "rt-old":
+            # Simulate a peer process having already rotated this RT: land the
+            # newer token on disk (bypassing our own lock, as a true peer
+            # process would) before we discover our token is stale.
+            sub_auth.save_credential(xsp.PROVIDER_ID, {
+                "access_token": "at-peer",
+                "refresh_token": "rt-peer",
+                "expires_at_ms": now + 3600_000,
+                "account_id": "acct-a",
+                "token_endpoint": "https://auth.x.ai/oauth2/token",
+            }, account_id="acct-a", replace_tokens=True)
+            raise urllib.error.HTTPError(
+                url, 400, "Bad Request", hdrs=None, fp=io.BytesIO(
+                    b'{"error":"invalid_grant","error_description":"revoked"}'
+                ),
+            )
+        assert fields.get("refresh_token") == "rt-peer"
+        return {"access_token": "at-new", "refresh_token": "rt-new", "expires_in": 3600}
+
+    monkeypatch.setattr(sub_auth, "post_form", fake_post_form)
+    result = p.refresh()
+    assert calls["n"] == 2  # one failed attempt + one retry with the rotated token
+    assert result["refresh_token"] == "rt-new"
+    stored = sub_auth.load_credential(xsp.PROVIDER_ID, account_id="acct-a")
+    assert stored.get("refresh_revoked") is not True
+    assert xsp.is_account_blocked("acct-a") is False

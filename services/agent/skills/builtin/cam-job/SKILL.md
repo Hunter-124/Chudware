@@ -5,7 +5,7 @@ inject: auto
 triggers:
   keywords: [machining, toolpath, stock, setup, g-code, gcode, feeds and speeds, CNC, mill]
   tools: [cam_new_job, cam_generate, cam_simulate, cam_post, cam_set_stock]
-  phases: [cam, deliver]
+  phases: [build, deliver]
 ---
 
 # CAM Job

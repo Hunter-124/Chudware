@@ -199,6 +199,29 @@ def test_refs_resolve_ignores_geom_queries_and_pending():
     assert missing == []
 
 
+def test_refs_resolve_destructive_target_cannot_dodge_via_geom_word():
+    """WI-15: a destructive op's target id must resolve even when it collides
+    with a geom-query dictionary word — the bypass is for SELECTOR args only."""
+    missing = gr.check_refs_resolve_ids(
+        [{"op": "delete_feature", "id": "top"}],
+        known_ids={"f1"},
+    )
+    assert missing == ["top"]
+    for kind in ("remove_feature", "suppress_feature"):
+        assert gr.check_refs_resolve_ids(
+            [{"op": kind, "id": "face"}], known_ids={"f1"},
+        ) == ["face"], f"{kind} target ids must not dodge WI-15 via dictionary words"
+
+
+def test_refs_resolve_non_destructive_id_still_bypasses_geom_words():
+    """Non-destructive ops keep the geom-query bypass for id_key=='id' (unchanged)."""
+    missing = gr.check_refs_resolve_ids(
+        [{"op": "add_feature", "id": "top"}],
+        known_ids={"f1"},
+    )
+    assert missing == []
+
+
 def test_refs_no_waiver():
     """WI-15: pure dangling refs have no waiver path."""
     v = gr.pre_dispatch_refs(

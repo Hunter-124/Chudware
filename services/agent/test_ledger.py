@@ -138,15 +138,71 @@ class TestAppendReplay(unittest.TestCase):
         replayed = _materialize(ledger2.events, run_id)
         self.assertEqual(replayed["dimensions"], ledger2.state["dimensions"])
 
-    def test_stored_file_has_events_and_state(self):
-        """ledger.json contains both 'events' and 'state' keys."""
+    def test_stored_file_is_state_only_events_in_jsonl_sidecar(self):
+        """ledger.json now holds only the compact 'state' snapshot; events are
+        appended one-per-line to the ledger.jsonl sidecar (O(1) append)."""
         run_id, path = _fresh("file_structure")
         ledger = Ledger(run_id, path)
         ledger.set_brief("human", "Test", "desc", [])
         raw = json.loads(path.read_text())
-        self.assertIn("events", raw)
+        self.assertNotIn("events", raw)
         self.assertIn("state", raw)
-        self.assertEqual(len(raw["events"]), 1)
+
+        events_path = path.with_suffix(".jsonl")
+        self.assertTrue(events_path.exists())
+        lines = [l for l in events_path.read_text().splitlines() if l.strip()]
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(json.loads(lines[0])["kind"], "brief")
+
+    def test_legacy_whole_document_still_loads(self):
+        """A pre-refactor ledger.json ({"events": [...], "state": {...}}, no
+        JSONL sidecar) must still load through the public API."""
+        run_id, path = _fresh("legacy_load")
+        legacy_events = [
+            {"seq": 0, "ts": "2026-01-01T00:00:00Z", "actor": "human",
+             "kind": "brief", "payload": {"title": "Legacy Part", "summary": "d",
+                                           "success_criteria": []}},
+            {"seq": 1, "ts": "2026-01-01T00:00:01Z", "actor": "human",
+             "kind": "requirement", "payload": {"req_id": "R1", "text": "req",
+                                                 "source": "user", "status": "open"}},
+        ]
+        path.write_text(json.dumps({"events": legacy_events, "state": {}}))
+
+        ledger = Ledger.load(run_id, path)
+        self.assertEqual(len(ledger.events), 2)
+        self.assertEqual(ledger.state["brief"]["title"], "Legacy Part")
+        self.assertEqual(ledger.state["requirements"][0]["req_id"], "R1")
+
+        # First append after a legacy load migrates prior events into the
+        # JSONL sidecar so every append from here on is O(1).
+        ledger.add_decision("human", "D1", "layout", "text", "rationale")
+        events_path = path.with_suffix(".jsonl")
+        self.assertTrue(events_path.exists())
+        lines = [l for l in events_path.read_text().splitlines() if l.strip()]
+        self.assertEqual(len(lines), 3)
+
+        # Reload: with the sidecar now present, events come from it, not the
+        # (now state-only) ledger.json.
+        reloaded = Ledger.load(run_id, path)
+        self.assertEqual(len(reloaded.events), 3)
+        self.assertEqual(reloaded.state["decisions"][0]["id"], "D1")
+
+    def test_append_does_not_rewrite_full_event_log(self):
+        """O(1) append: each append is one JSONL line, not a rewrite of the
+        whole growing events list (the O(N^2) regression this fix removes)."""
+        run_id, path = _fresh("o1_append")
+        ledger = Ledger(run_id, path)
+        for i in range(50):
+            ledger.add_requirement("human", f"R{i}", f"requirement {i}")
+
+        events_path = path.with_suffix(".jsonl")
+        lines = [l for l in events_path.read_text().splitlines() if l.strip()]
+        self.assertEqual(len(lines), 50)
+        # The state snapshot (ledger.json) stays state-only — never grows an
+        # "events" array proportional to event count.
+        raw = json.loads(path.read_text())
+        self.assertNotIn("events", raw)
+        self.assertEqual(len(raw["state"]["requirements"]), 50)
 
 
 # ---------------------------------------------------------------------------

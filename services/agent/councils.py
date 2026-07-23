@@ -101,9 +101,6 @@ _POLICY_CACHE: Optional[dict] = None
 # Ordered seat names (from council_seats.yaml).  Breadth slices from index 0.
 _SEAT_ORDER: tuple[str, ...] = ("manufacturing", "tolerancing", "fitment", "simplicity")
 
-# Valid tier names (mirrors tiers.yaml profiles; must stay in sync).
-_KNOWN_TIERS: frozenset[str] = frozenset({"local-24k", "local-48k", "mid", "frontier"})
-
 
 @_dataclass(frozen=True)
 class CouncilPolicy:

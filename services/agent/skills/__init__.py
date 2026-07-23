@@ -20,6 +20,7 @@ Activation:
 """
 from __future__ import annotations
 
+import logging
 import os
 import re
 import sys
@@ -29,6 +30,8 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 # --------------------------------------------------------------------------- constants
+
+log = logging.getLogger(__name__)
 
 _SKILL_FILENAME = "SKILL.md"
 _FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n?", re.DOTALL)
@@ -284,6 +287,7 @@ def _load_skill_from_dir(skill_dir: Path, source: str) -> Optional[Skill]:
         return None
     description = str(fm.get("description") or "").strip()
     if not description:
+        log.warning("skill %r at %s has no description; skipping", name, skill_dir)
         return None
     inject = str(fm.get("inject") or "manual").strip().lower()
     if inject not in ("auto", "manual"):
@@ -461,7 +465,7 @@ def match_keyword_triggers(
         if already_injected(skill.name, session_id):
             continue
         for kw in skill.triggers.keywords:
-            if kw and kw.lower() in hay:
+            if kw and re.search(r"\b" + re.escape(kw.lower()) + r"\b", hay):
                 hits.append(skill)
                 break
     return hits

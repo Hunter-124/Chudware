@@ -144,7 +144,7 @@ _BUILTIN_TRIGGERS: list[dict] = [
                 r"\bthin wall\b", r"\bthin-wall\b", r"\bwall thickness\b",
                 r"\bshell\b", r"\bminimum wall\b",
             ],
-            "tools": ["wall_thickness", "shell"],
+            "tools": ["wall_thickness"],
             "events": ["thin_wall"],
         },
         "inject": {
@@ -163,7 +163,7 @@ _BUILTIN_TRIGGERS: list[dict] = [
                 r"\bfastener pattern\b", r"\bPCD\b", r"\bflange bolt\b",
                 r"\bclearance hole\b", r"\bcountersink\b", r"\bcounterbore\b",
             ],
-            "tools": ["bolt_circle"],
+            "tools": [],
             "events": [],
         },
         "inject": {
@@ -337,7 +337,7 @@ _BUILTIN_TRIGGERS: list[dict] = [
                 r"\binjection mold\b", r"\binjection mould\b", r"\brelease angle\b",
                 r"\bcavity\b", r"\bcore pull\b",
             ],
-            "tools": ["draft_analysis", "draft_check"],
+            "tools": ["draft_analysis"],
             "events": [],
         },
         "inject": {
@@ -406,11 +406,10 @@ _BUILTIN_TRIGGERS: list[dict] = [
                 r"\bnet class\b", r"\bsilkscreen\b",
             ],
             "tools": [
-                "ecad_new_schematic", "ecad_new_pcb", "place_symbol", "wire",
-                "autoroute", "fill_zones", "update_from_sch", "set_net_class",
-                "run_erc", "run_drc",
+                "ecad_new_schematic", "ecad_new_pcb", "ecad_place_symbol", "ecad_wire",
+                "ecad_autoroute", "ecad_fill_zones", "ecad_update_from_sch",
+                "ecad_set_net_class", "ecad_run_erc", "ecad_run_drc",
             ],
-            "events": [],
         },
         "inject": {
             "context_pack": "ecad_design",
@@ -542,6 +541,8 @@ _TABLE: Optional[list[dict]] = None
 _RAW_MERGED: Optional[list[dict]] = None
 _CACHE_TRIGGERS_MTIME: float = -1.0
 _CACHE_PACKS_MTIME: float = -1.0
+_PACKS_DIR_EMPTY: Optional[bool] = None  # cached "no user packs" fact (see _packs_dir_mtime)
+_PACK_CACHE: dict[pathlib.Path, tuple[float, str]] = {}  # path -> (mtime, text)
 
 _ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_\-]{0,63}$")
 _PACK_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_\-]{0,63}$")
@@ -572,11 +573,13 @@ def user_packs_dir() -> pathlib.Path:
 
 def clear_cache() -> None:
     """Drop compiled + merged caches so the next load re-reads disk."""
-    global _TABLE, _RAW_MERGED, _CACHE_TRIGGERS_MTIME, _CACHE_PACKS_MTIME
+    global _TABLE, _RAW_MERGED, _CACHE_TRIGGERS_MTIME, _CACHE_PACKS_MTIME, _PACKS_DIR_EMPTY
     _TABLE = None
     _RAW_MERGED = None
     _CACHE_TRIGGERS_MTIME = -1.0
     _CACHE_PACKS_MTIME = -1.0
+    _PACKS_DIR_EMPTY = None
+    _PACK_CACHE.clear()
 
 
 def _path_mtime(path: pathlib.Path) -> float:
@@ -587,19 +590,35 @@ def _path_mtime(path: pathlib.Path) -> float:
 
 
 def _packs_dir_mtime() -> float:
-    """Max mtime over the user packs dir (0 if absent)."""
+    """Max mtime over the user packs dir (0 if absent).
+
+    The common install never has user packs; once this is observed absent or
+    empty, that fact is cached for the process lifetime (until
+    :func:`clear_cache`) so the hot ``match_triggers`` path skips the
+    per-call stat/iterdir entirely (zero-cost no-match path, see module
+    docstring).
+    """
+    global _PACKS_DIR_EMPTY
+    if _PACKS_DIR_EMPTY:
+        return 0.0
     d = user_packs_dir()
     if not d.is_dir():
+        _PACKS_DIR_EMPTY = True
         return 0.0
     latest = _path_mtime(d)
+    saw_entry = False
     try:
         for p in d.iterdir():
+            saw_entry = True
             try:
                 latest = max(latest, p.stat().st_mtime)
             except OSError:
                 pass
     except OSError:
         pass
+    if not saw_entry:
+        _PACKS_DIR_EMPTY = True
+        return 0.0
     return latest
 
 
@@ -823,20 +842,45 @@ def load_table() -> list[dict]:
 # Pack loader + budgeter
 # ---------------------------------------------------------------------------
 
+def _read_pack_cached(path: pathlib.Path) -> Optional[str]:
+    """Read *path* text, cached by ``(path, mtime)`` (None if missing/unreadable).
+
+    A trigger can fire on every turn of a long session; without this, the
+    same pack body would be re-read from disk every time.
+    """
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        _PACK_CACHE.pop(path, None)
+        return None
+    cached = _PACK_CACHE.get(path)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        _PACK_CACHE.pop(path, None)
+        return None
+    _PACK_CACHE[path] = (mtime, text)
+    return text
+
+
 def _load_pack(pack_name: str, budget_tokens: int) -> str:
     """Read a context pack file and truncate to *budget_tokens* whole lines.
 
     User packs (``context_injection/packs/<name>.md``) shadow shipped packs of
-    the same name so GUI edits take effect without rewriting the repo.
+    the same name so GUI edits take effect without rewriting the repo. Pack
+    bodies are cached by ``(path, mtime)`` — see :func:`_read_pack_cached`.
     """
     if not pack_name:
         return ""
-    user_path = user_packs_dir() / f"{pack_name}.md"
-    shipped_path = _PACKS_DIR / f"{pack_name}.md"
-    pack_path = user_path if user_path.is_file() else shipped_path
-    try:
-        text = pack_path.read_text(encoding="utf-8")
-    except FileNotFoundError:
+    pack_path = _PACKS_DIR / f"{pack_name}.md"
+    if not _PACKS_DIR_EMPTY:
+        user_path = user_packs_dir() / f"{pack_name}.md"
+        if user_path.is_file():
+            pack_path = user_path
+    text = _read_pack_cached(pack_path)
+    if text is None:
         return f"[context pack '{pack_name}' not found]"
 
     budget_chars = budget_tokens * _CHARS_PER_TOKEN
@@ -1234,8 +1278,9 @@ def save_pack(name: str, body: str) -> dict[str, Any]:
         tmp.replace(dest)
     except OSError as exc:
         return {"ok": False, "reason": f"write failed: {exc}"}
-    # Pack text is read live by _load_pack — no compile cache for bodies —
-    # but clear anyway so list_packs / get_trigger refresh source chips.
+    # _load_pack caches bodies by (path, mtime); the atomic replace above
+    # changes dest's mtime so that cache self-invalidates, and clear_cache()
+    # drops it outright — also refreshes list_packs / get_trigger source chips.
     clear_cache()
     source = "override" if (_PACKS_DIR / f"{pack}.md").is_file() else "user"
     return {"ok": True, "name": pack, "source": source}

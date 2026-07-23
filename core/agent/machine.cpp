@@ -4,6 +4,7 @@
 #include "agent/providers.h"
 
 #include <algorithm>
+#include <cctype>
 #include <map>
 #include <mutex>
 #include <vector>
@@ -307,6 +308,29 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
         return false;
     };
 
+    // Hard auth failure (401/403, or explicit auth-failure phrasing) — mirrors
+    // agent_turn.classify_provider_error()'s non-retryable provider_auth bucket
+    // (mega-1 TOP-4). Distinct from looks_like_provider_error: this must fail the
+    // stage on the FIRST occurrence instead of burning the retry budget, since a
+    // dead/rejected credential will not succeed on a later attempt.
+    auto looks_like_auth_error = [](const StageOutcome& o) -> bool {
+        auto lower = [](std::string s) {
+            for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            return s;
+        };
+        const std::string reason = lower(o.reason);
+        const std::string error = o.has_error ? lower(o.error) : std::string();
+        static const char* kAuthMarkers[] = {
+            "http 401",       "http 403",          "unauthorized",
+            "forbidden",      "invalid_api_key",   "invalid api key",
+            "incorrect api key", "authentication", "permission denied",
+        };
+        for (const char* m : kAuthMarkers)
+            if (reason.find(m) != std::string::npos || error.find(m) != std::string::npos)
+                return true;
+        return false;
+    };
+
     auto run_attempt = [&](const std::string& stage, const Action& action, const std::string& role,
                            int attempt, int budget) -> std::string {
         if (cancelled()) return "cancelled";
@@ -333,6 +357,28 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
         if (outcome.has_error && outcome.error == "needs_user_decision") {
             last_was_needs_user_decision = true;
             last_escalate_note = outcome.reason;
+        }
+
+        if (outcome.has_error && !outcome.free_retry && looks_like_auth_error(outcome)) {
+            // Hard auth failure: fail the stage on the FIRST attempt — no further
+            // retries burn the budget on a credential that will not start working.
+            const std::string reason =
+                !outcome.reason.empty()
+                    ? outcome.reason
+                    : (outcome.has_error ? outcome.error
+                                          : std::string("provider authentication failed"));
+            last_fail_reason = reason;
+            last_was_provider_error = true;
+            last_was_parse_error = false;
+            run_provider_error = reason;
+            events.emit("stage_result", json{{"stage", stage},
+                                             {"attempt", attempt},
+                                             {"verdict", "fail"},
+                                             {"reason", reason},
+                                             {"stop_reason", "provider_auth"},
+                                             {"error_detail", reason},
+                                             {"error_human", humanize_provider_error(reason)}});
+            return "provider_auth";
         }
 
         if (outcome.has_error && !outcome.free_retry) {
@@ -429,7 +475,7 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
         for (int attempt = 1; attempt <= budget; ++attempt) {
             std::string v = run_attempt(stage, action, role, attempt, budget);
             if (v == "cancelled" || v == "pass" || v == "fail" || v == "skip" ||
-                v == "provider_error")
+                v == "provider_error" || v == "provider_auth")
                 return v;
             // v == "retry" — tool-scope free retries re-prompt without burning the attempt.
             if (last_was_free_retry && free_retries < kMaxFreeRetries) {
@@ -505,11 +551,11 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
     if (budget_of("plan") > 0) {
         std::string plan_v = run_stage("plan", actions.plan, "planner");
         if (plan_v == "cancelled") return cancel_result();
-        if (plan_v == "provider_error") {
+        if (plan_v == "provider_error" || plan_v == "provider_auth") {
             const std::string detail =
                 run_provider_error.empty() ? last_fail_reason : run_provider_error;
             return json{{"status", "failed"},
-                       {"stop_reason", "provider_error"},
+                       {"stop_reason", plan_v},
                        {"error_detail", detail},
                        {"error_human", humanize_provider_error(detail)}};
         }
@@ -674,7 +720,7 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
         }
         std::string v = run_stage("model", actions.model, "modeler");
         if (v == "cancelled") return cancel_result();
-        if (v == "provider_error") {
+        if (v == "provider_error" || v == "provider_auth") {
             model_status = "fail";
             if (plan_skipped) emit_stage_checklist();
             if (emit_model_steps) {
@@ -686,7 +732,7 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
             const std::string detail =
                 run_provider_error.empty() ? last_fail_reason : run_provider_error;
             return json{{"status", "failed"},
-                       {"stop_reason", "provider_error"},
+                       {"stop_reason", v},
                        {"error_detail", detail},
                        {"error_human", humanize_provider_error(detail)}};
         }
@@ -771,7 +817,7 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
                 review_status = "done";
                 break;
             }
-            if (v == "fail" || v == "provider_error") {
+            if (v == "fail" || v == "provider_error" || v == "provider_auth") {
                 review_status = "fail";
                 break;
             }
@@ -791,7 +837,7 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
                 std::string fix_v =
                     run_attempt("fix", actions.fix, "fixer", fix_calls, fix_limit);
                 if (fix_v == "cancelled") return cancel_result();
-                if (fix_v == "provider_error" || fix_v == "fail") {
+                if (fix_v == "provider_error" || fix_v == "fail" || fix_v == "provider_auth") {
                     fix_terminal_fail = true;
                     fix_status = "fail";
                     break;

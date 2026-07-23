@@ -12,6 +12,7 @@ buildgraph sidecars).
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import platform
@@ -41,6 +42,40 @@ def _now() -> str:
 
 def _sidecar_path(run_id: str, runs_dir: Path) -> Path:
     return runs_dir / f"{run_id}.coordination.json"
+
+
+def _claim_lock_path(run_id: str, runs_dir: Path) -> Path:
+    return runs_dir / f"{run_id}.coordination.lock"
+
+
+class _FileFlock:
+    """Exclusive interprocess flock (POSIX) held for one ``with`` block.
+
+    Same fallback as services/agent/providers/sub_auth.py's credential-store
+    lock: a no-op when ``fcntl`` is unavailable (non-POSIX).  Closes the lock
+    file handle on exit — callers open a fresh handle per call.
+    """
+
+    def __init__(self, lf) -> None:
+        self._lf = lf
+        try:
+            import fcntl  # noqa: PLC0415 — optional on non-POSIX
+            self._fcntl = fcntl
+        except ImportError:  # pragma: no cover
+            self._fcntl = None
+
+    def __enter__(self) -> None:
+        if self._fcntl is not None:
+            self._fcntl.flock(self._lf.fileno(), self._fcntl.LOCK_EX)
+        return None
+
+    def __exit__(self, *exc: object) -> bool:
+        try:
+            if self._fcntl is not None:
+                self._fcntl.flock(self._lf.fileno(), self._fcntl.LOCK_UN)
+        finally:
+            self._lf.close()
+        return False
 
 
 @dataclass
@@ -117,6 +152,13 @@ class CoordinationBoard:
         ``{ok: False, status: "CONFLICT", conflicts: [...], message: ...}``
         when any resource is already held by a different agent.
         Idempotent re-claim by the same agent refreshes intent and succeeds.
+
+        Cross-process exclusive: when persisted, the whole read-modify-write
+        (re-read the sidecar, check conflicts, grant, flush) runs under an
+        interprocess file lock, so two CoordinationBoard instances in different
+        processes can never both win the same resource — the second re-reads
+        the sidecar INSIDE the lock and sees the first's claim even if both
+        started the call before either had flushed.
         """
         agent = str(agent_id or "").strip()
         if not agent:
@@ -128,7 +170,9 @@ class CoordinationBoard:
         if not res_list:
             return {"ok": False, "error": "resources must be a non-empty list"}
 
-        with self._lock:
+        with self._lock, self._claims_file_lock():
+            if self._persist:
+                self._reload_claims_locked()
             conflicts: list[dict[str, Any]] = []
             for res in res_list:
                 held = self._claims.get(res)
@@ -306,17 +350,20 @@ class CoordinationBoard:
 
     # -- persistence ----------------------------------------------------------
 
-    def _load_sidecar(self) -> None:
+    def _read_sidecar_data(self) -> dict[str, Any] | None:
+        """Fresh parse of the on-disk sidecar, or ``None`` when absent/unreadable."""
         rd = self._runs_dir or _runs_dir()
         path = _sidecar_path(self.run_id, rd)
         if not path.exists():
-            return
+            return None
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except Exception:  # noqa: BLE001
-            return
-        if not isinstance(data, dict):
-            return
+            return None
+        return data if isinstance(data, dict) else None
+
+    def _parse_claims(self, data: dict[str, Any]) -> dict[str, Claim]:
+        claims: dict[str, Claim] = {}
         claims_raw = data.get("claims") or []
         if isinstance(claims_raw, list):
             for item in claims_raw:
@@ -326,13 +373,20 @@ class CoordinationBoard:
                 agent = str(item.get("agent_id") or "").strip()
                 if not res or not agent:
                     continue
-                self._claims[res] = Claim(
+                claims[res] = Claim(
                     claim_id=str(item.get("claim_id") or f"cl_{uuid.uuid4().hex[:12]}"),
                     agent_id=agent,
                     resource=res,
                     intent=str(item.get("intent") or ""),
                     ts=str(item.get("ts") or ""),
                 )
+        return claims
+
+    def _load_sidecar(self) -> None:
+        data = self._read_sidecar_data()
+        if data is None:
+            return
+        self._claims = self._parse_claims(data)
         prog_raw = data.get("progress") or []
         if isinstance(prog_raw, list):
             for item in prog_raw:
@@ -349,6 +403,34 @@ class CoordinationBoard:
                 ))
             if len(self._progress) > self._progress_limit:
                 self._progress = self._progress[-self._progress_limit:]
+
+    def _reload_claims_locked(self) -> None:
+        """Replace in-memory claims with on-disk truth.
+
+        Call ONLY while holding both the thread lock and the interprocess
+        file lock (``_claims_file_lock``) — this closes the cross-process
+        double-claim race: another process may have granted and flushed a
+        claim since this instance last read the sidecar, and the conflict
+        check that follows in ``register_claim`` must see it.
+        """
+        data = self._read_sidecar_data()
+        if data is None:
+            return
+        self._claims = self._parse_claims(data)
+
+    def _claims_file_lock(self):
+        """Interprocess exclusive lock for the ``register_claim`` critical section.
+
+        No sidecar file exists to race on when persistence is off, so a pure
+        in-memory board (most tests) gets a no-op — single-process behavior
+        and perf are unchanged.
+        """
+        if not self._persist:
+            return contextlib.nullcontext()
+        rd = self._runs_dir or _runs_dir()
+        rd.mkdir(parents=True, exist_ok=True)
+        lf = open(_claim_lock_path(self.run_id, rd), "a+", encoding="utf-8")
+        return _FileFlock(lf)
 
     def _flush_sidecar(self) -> None:
         if not self._persist:

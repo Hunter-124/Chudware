@@ -3957,3 +3957,36 @@ organized under design/ reference/ plans/ review/; root keeps SW_PARITY_SPEC.md
 reality; CONTRIBUTING.md refreshed; stale PROMPT.txt deleted; all cross-references
 fixed (AGENTS.md, contracts/sim_handoff.md, code comments). Board: every T-RF1–T-RF23
 DoD box checked (status flip to done is the human merge-time action per work/ policy).
+
+## 2026-07-23 — Agent-harness adversarial audit + fix wave
+
+Orchestrated audit (10 parallel scouts) of the agent harness + task classifiers,
+then a 9-worker fix wave; verified via scripts/gate.sh. Headline fixes: (1) MCP
+registration — ~28 register_*_tools call sites bypassed _reg.view(), leaving ~20
+tool families with no catalog entry and Settings→AI→Tools toggles inert; every
+registration now carries a family, _FAMILY_REASSIGN deleted, phantom 'org' family
+removed, new services/mcp/test_registration_catalog.py pins full coverage.
+(2) Trigger injection was production-dead (observe_build/observe_doc never
+received output_text/tool_names/cooldown_state); agent_turn.run_turn now fires
+match_triggers per iteration with per-run cooldown + effort trigger_injection
+gate (services/agent/test_trigger_wiring.py). (3) Classifiers word-bounded:
+core/agent/complexity.cpp kComplex+kMultiPart ('estimating'→'mating' false
+Complex), corporate.py dept fallback ('onboarding'→'board'), skills keyword
+match, triggers.yaml ecad_* tool names. (4) C++ machine.cpp fast-fails 401/403
+as provider_auth (parity with Python classify_provider_error, whose auth markers
+were also extended). (5) Providers: cross-process fcntl lock around xAI refresh
+rotation + invalid_grant retry-before-revoke, credential store chmod 0600,
+revoked-token usage-fetch skip generalized. (6) Efficiency: load_config and
+models.dev mtime-cached, ledger.jsonl append-only (legacy load preserved;
+contracts/advisor.md §2 addendum), token estimate 4→3.2 chars/token, per-session
+skills/role catalog injection, trigger pack cache. (7) Guardrails: WI-15
+geom-query bypass restricted from destructive ops, coordination claims
+cross-process fcntl-locked, overseer repeat-escalation fingerprints on
+deterministic targeted_reentry. (8) Flywheel taxonomy detectors understand real
+producer payload shapes (None==None advisory_ignored false positive fixed).
+Deferred/known: pytest services dir rc=2 teardown KeyboardInterrupt pre-exists
+(old-master gate run shows identical signature; T-V2 owns); verify_battery×3 +
+mcmaster×3 failures stash-verified pre-existing; firmware ctest passes
+standalone (20s renode timeout flaky under load); R1a–R1f consolidation nodes
+remain the planned architectural follow-up. Webservice/DESIGN.md WASM claim
+corrected (parity verified by gate web-parity probe).

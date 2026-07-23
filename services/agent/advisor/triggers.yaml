@@ -119,7 +119,6 @@ triggers:
         - "\\bminimum wall\\b"
       tools:
         - wall_thickness
-        - shell
       events:
         - thin_wall        # geometry event: wall_thickness check flagged a wall < 2 mm
     inject:
@@ -141,8 +140,7 @@ triggers:
         - "\\bclearance hole\\b"
         - "\\bcountersink\\b"
         - "\\bcounterbore\\b"
-      tools:
-        - bolt_circle
+      tools: []
       events: []
     inject:
       context_pack: fastener_pattern
@@ -356,7 +354,6 @@ triggers:
         - "\\bcore pull\\b"
       tools:
         - draft_analysis
-        - draft_check
       events: []
     inject:
       context_pack: molded_draft
@@ -444,14 +441,14 @@ triggers:
       tools:
         - ecad_new_schematic
         - ecad_new_pcb
-        - place_symbol
-        - wire
-        - autoroute
-        - fill_zones
-        - update_from_sch
-        - set_net_class
-        - run_erc
-        - run_drc
+        - ecad_place_symbol
+        - ecad_wire
+        - ecad_autoroute
+        - ecad_fill_zones
+        - ecad_update_from_sch
+        - ecad_set_net_class
+        - ecad_run_erc
+        - ecad_run_drc
       events: []
     inject:
       context_pack: ecad_design

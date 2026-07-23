@@ -719,15 +719,22 @@ def check_refs_resolve_ids(ops: list[dict], known_ids: set[str],
         # edit/delete by id
         for id_key in ("id", "feature_id", "target"):
             rid = op.get(id_key)
-            if isinstance(rid, str) and rid and not rid.startswith("$") \
-                    and rid not in known_ids and rid not in known_names \
-                    and not _looks_like_geom_query(rid):
-                # edit_feature / delete of unknown id
-                kind = (op.get("op") or op.get("kind") or "").lower()
-                if kind in ("edit_feature", "delete_feature", "remove_feature",
-                            "delete", "remove", "suppress_feature") or id_key != "id":
-                    if rid not in missing:
-                        missing.append(rid)
+            if not (isinstance(rid, str) and rid and not rid.startswith("$")):
+                continue
+            if rid in known_ids or rid in known_names:
+                continue
+            kind = (op.get("op") or op.get("kind") or "").lower()
+            # DESTRUCTIVE ops' target refs must always resolve — WI-15 has no
+            # waiver, and the geom-query bypass ("top"/"face"/…) is legitimate
+            # only for geometry-SELECTOR args, never a destructive op's target.
+            is_destructive_target = kind in ("edit_feature", "delete_feature",
+                                             "remove_feature", "delete", "remove",
+                                             "suppress_feature")
+            if not is_destructive_target and _looks_like_geom_query(rid):
+                continue
+            if is_destructive_target or id_key != "id":
+                if rid not in missing:
+                    missing.append(rid)
     return missing
 
 

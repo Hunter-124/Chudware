@@ -78,11 +78,18 @@ def findings_from_build(res: Any) -> list[Finding]:
 
 
 def observe_build(res: Any, stage: str = "feature", seq: int = 0,
-                  user_override: bool = False) -> Observation:
+                  user_override: bool = False,
+                  output_text: str = "", tool_names: Optional[list[str]] = None,
+                  cooldown_state: Optional[dict] = None) -> Observation:
     """Convenience: wrap a loop result into an :class:`Observation`.
 
     Default stage is ``assembly`` when the result is an assembly (interference is
     an assembly-stage check), else ``feature``.
+
+    *output_text* / *tool_names* / *cooldown_state* (T-W21 §20) thread the
+    trigger-injection signals through to :func:`engine.build_advisory`.
+    agent_turn.py's turn loop is also a caller of this adapter — it has no
+    build123d result, so it passes ``res={}`` purely for the trigger path.
     """
     if _get(res, "is_assembly", False) or isinstance(_get(res, "fit", None), dict):
         stage = "assembly"
@@ -92,6 +99,9 @@ def observe_build(res: Any, stage: str = "feature", seq: int = 0,
         seq=seq,
         doc_id="",
         user_override=user_override,
+        output_text=output_text,
+        tool_names=list(tool_names or []),
+        cooldown_state=cooldown_state,
     )
 
 
@@ -122,13 +132,22 @@ def findings_from_doc(doc_id: str, stage: str, rpc: Optional[Any] = None) -> lis
 
 
 def observe_doc(doc_id: str, stage: str, seq: int = 0,
-                rpc: Optional[Any] = None, user_override: bool = False) -> Observation:
+                rpc: Optional[Any] = None, user_override: bool = False,
+                output_text: str = "", tool_names: Optional[list[str]] = None,
+                cooldown_state: Optional[dict] = None) -> Observation:
+    """T-W21 §20: *output_text* / *tool_names* / *cooldown_state* are optional
+    trigger-injection signals threaded through to :func:`engine.build_advisory`;
+    absent by default so the advise() MCP doc path (no turn signals) is unchanged.
+    """
     return Observation(
         stage=stage,
         findings=findings_from_doc(doc_id, stage, rpc=rpc),
         seq=seq,
         doc_id=doc_id,
         user_override=user_override,
+        output_text=output_text,
+        tool_names=list(tool_names or []),
+        cooldown_state=cooldown_state,
     )
 
 

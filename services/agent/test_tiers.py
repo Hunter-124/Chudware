@@ -365,6 +365,19 @@ class TestProviderForTier:
         assert result == "mock-provider"
         assert calls == [(None, None)]
 
+    def test_local_tier_unprovisioned_model_fails_closed(self, monkeypatch):
+        """get_model_path() returning None (GGUF not downloaded) must raise a clear
+        ModelProvisionError, never stringify to the literal 'model_path': 'None'
+        (which used to be truthy and silently defeat find_default_model())."""
+        from . import model_manager
+        from .tiers import provider_for_tier
+
+        monkeypatch.delenv("AI_CAD_PROVIDER", raising=False)
+        monkeypatch.setattr(model_manager, "get_model_path", lambda model_id: None)
+
+        with pytest.raises(model_manager.ModelProvisionError, match="qwen3-4b"):
+            provider_for_tier("local-24k")
+
 
 # ---------------------------------------------------------------------------
 # Grammar routing tests

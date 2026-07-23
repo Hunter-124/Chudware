@@ -42,6 +42,12 @@ File: `<cache_root>/runs/<run_id>/ledger.json`. Append-only `events[]` plus a
 materialized `state`. Every event: `{seq, ts, actor, kind, payload}` where `actor` is
 a role id, "human", or "foreman".
 
+- **Layout addendum (2026-07-23):** events now persist append-only in
+  `<cache_root>/runs/<run_id>/ledger.jsonl` (one JSON event per line, O(1) append);
+  `ledger.json` carries only the materialized `state` snapshot. Readers must go
+  through `services/agent/ledger.py` `Ledger.load()`, which accepts both layouts;
+  legacy whole-document `ledger.json` files still load and migrate on first append.
+
 `state`:
 
 ```json

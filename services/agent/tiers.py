@@ -490,10 +490,20 @@ def provider_for_tier(tier: str | None, cfg: Optional[dict] = None):
     local_models = load_local_models()
     model_id = LOCAL_TIER_MODELS.get(tier) or local_models.get("fanout") or "qwen3-4b"
     from services.agent import model_manager
-    model_path = str(model_manager.get_model_path(model_id))
+    model_path = model_manager.get_model_path(model_id)
+    if model_path is None:
+        # get_model_path() returning None means the GGUF isn't provisioned on this
+        # machine. str(None) == "None" is truthy, which used to silently defeat
+        # installer.llamacpp's find_default_model() fallback — fail closed instead
+        # (mirrors local_runtime.py's guard: only set model_path when non-None).
+        raise model_manager.ModelProvisionError(
+            f"local tier {tier!r} needs model {model_id!r}, which is not "
+            f"provisioned on this machine (no GGUF found for it). Provision "
+            f"the model before launching this tier."
+        )
     merged_cfg = dict(cfg or {})
     merged_cfg["llamacpp"] = {**(merged_cfg.get("llamacpp") or {}),
-                              "model_path": model_path, "model": model_id}
+                              "model_path": str(model_path), "model": model_id}
     # llamacpp (not openai) so structured-output nodes get GBNF grammars, which
     # the local-24k/local-48k tiers require (tiers.yaml structured_output: gbnf).
     return _config.get_provider("llamacpp", cfg=merged_cfg)

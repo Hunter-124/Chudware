@@ -16,11 +16,14 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import re
 from typing import Any, Iterable
 
 # --------------------------------------------------------------------------- constants
-CHARS_PER_TOKEN = 4
+CHARS_PER_TOKEN = 3.2  # conservative: code/JSON-heavy transcripts run ~3.0-3.3 chars/token,
+                       # not the naive 4 — underestimating lets true prompt tokens overflow
+                       # the context window while compaction thinks it's under budget.
 
 TOOL_RESULT_MAX_CHARS = 2000
 TOOL_ARG_MAX_CHARS = 500
@@ -68,10 +71,10 @@ _INTENT_FIELDS = frozenset({"intent", "i"})
 # --------------------------------------------------------------------------- token / truncate helpers
 
 def count_tokens(text: str) -> int:
-    """Repo-wide 4-chars/token ceiling heuristic."""
+    """Conservative chars/token ceiling heuristic (see CHARS_PER_TOKEN)."""
     if not text:
         return 0
-    return (len(text) + CHARS_PER_TOKEN - 1) // CHARS_PER_TOKEN
+    return math.ceil(len(text) / CHARS_PER_TOKEN)
 
 
 def truncate_middle(text: str, max_chars: int, head_ratio: float = TRUNCATE_HEAD_RATIO) -> str:

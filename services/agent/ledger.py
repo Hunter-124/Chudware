@@ -6,10 +6,14 @@ The ledger is the anti-context-loss mechanism for Pillar 20: every agent role
 cold-starts from ``ledger_render(budget_tokens)`` instead of chat history, making
 24k-context local models viable across a whole mission.
 
-Storage: ``<cache_root>/runs/<run_id>/ledger.json`` — a single JSON document:
-``{"events": [...], "state": {...}}``.  Events are never mutated; state is
-re-materialized from events on every ``append()``.  ``load()`` rebuilds state from
-events alone, so replay is a full correctness guarantee.
+Storage: ``<cache_root>/runs/<run_id>/ledger.json`` holds the compact materialized
+``state`` snapshot; events append one-per-line to the ``ledger.jsonl`` sidecar next
+to it (O(1) append, independent of event count — see contracts/advisor.md §2 for
+the on-disk layout note). Events are never mutated; state is re-materialized from
+events on every ``append()``. ``load()`` rebuilds state from events alone, so
+replay is a full correctness guarantee. Legacy runs whose ``ledger.json`` still
+holds the old whole-document ``{"events": [...], "state": {...}}`` shape (no
+sidecar) load transparently and migrate on first append.
 
 Chars-per-token heuristic: ~4 chars/token (same constant used throughout the loop).
 """
@@ -226,24 +230,57 @@ def _materialize(events: list[dict], run_id: str) -> dict:
 class Ledger:
     """Persistent design ledger for one run.
 
-    Append-only event log + materialized state, stored in a single
-    ``ledger.json``.  State is always a pure replay of events — never mutated
-    directly.
+    Append-only event log + materialized state.  Events are stored as a
+    JSONL sidecar (``ledger.jsonl``, one JSON object per line) so ``append``
+    is O(1) regardless of how many events the run has accumulated; the
+    compact materialized state is snapshotted separately into ``ledger.json``
+    (small — bounded by distinct entities, not by event count). State is
+    always a pure replay of events — never mutated directly.
+
+    Legacy runs whose ``ledger.json`` still holds the old whole-document
+    format (``{"events": [...], "state": {...}}``) load transparently; the
+    first append after loading one migrates its events into the JSONL log.
     """
 
     def __init__(self, run_id: str, path: Path | None = None) -> None:
         self.run_id = run_id
         self.path = path or run_ledger_path(run_id)
+        self._events_path = self.path.with_suffix(".jsonl")
         self.events: list[dict] = []
         self.state: dict = _empty_state(run_id)
-        if self.path.exists():
-            self._load_from_disk()
+        self._needs_migration = False
+        if self._events_path.exists():
+            self._load_from_jsonl()
+        elif self.path.exists():
+            self._load_legacy_document()
 
     # ------------------------------------------------------------------
     # Persistence
     # ------------------------------------------------------------------
 
-    def _load_from_disk(self) -> None:
+    @staticmethod
+    def _read_events_jsonl(path: Path) -> list[dict]:
+        events: list[dict] = []
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        events.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue  # tolerate a torn last line from a mid-write crash
+        except OSError:
+            return []
+        return events
+
+    def _load_from_jsonl(self) -> None:
+        self.events = self._read_events_jsonl(self._events_path)
+        # Always rematerialize from events (replay guarantee — ignore stored state)
+        self.state = _materialize(self.events, self.run_id)
+
+    def _load_legacy_document(self) -> None:
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
@@ -251,14 +288,37 @@ class Ledger:
         self.events = raw.get("events", [])
         # Always rematerialize from events (replay guarantee — ignore stored state)
         self.state = _materialize(self.events, self.run_id)
+        self._needs_migration = bool(self.events)
+
+    def _seed_events_jsonl(self, events: list[dict]) -> None:
+        """One-time migration: move legacy-loaded events into the JSONL log so
+        every append from here on is O(1) instead of rewriting the whole doc."""
+        try:
+            with self._events_path.open("w", encoding="utf-8") as f:
+                for ev in events:
+                    f.write(json.dumps(ev, ensure_ascii=False))
+                    f.write("\n")
+                f.flush()
+        except OSError:
+            pass
+
+    def _append_event_jsonl(self, event: dict) -> None:
+        """Append one event line — O(1) regardless of ledger size."""
+        try:
+            with self._events_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(event, ensure_ascii=False))
+                f.write("\n")
+                f.flush()
+        except OSError:
+            # Best-effort — a failed save must not break the run
+            pass
 
     def _save(self) -> None:
-        """Atomic write: temp file + rename to avoid corruption."""
-        doc = {"events": self.events, "state": self.state}
+        """Atomic write of the compact state snapshot: temp file + rename."""
+        doc = {"state": self.state}
         tmp = self.path.with_suffix(".tmp")
         try:
-            tmp.write_text(json.dumps(doc, ensure_ascii=False, indent=2),
-                           encoding="utf-8")
+            tmp.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
             tmp.replace(self.path)
         except OSError:
             # Best-effort — a failed save must not break the run
@@ -270,6 +330,9 @@ class Ledger:
 
     def append(self, actor: str, kind: str, payload: dict) -> dict:
         """Record one event, rematerialize state, persist.  Returns the event."""
+        if self._needs_migration:
+            self._seed_events_jsonl(self.events)
+            self._needs_migration = False
         event = {
             "seq": len(self.events),
             "ts": _now(),
@@ -279,6 +342,7 @@ class Ledger:
         }
         self.events.append(event)
         _apply(self.state, event)
+        self._append_event_jsonl(event)
         self._save()
         return event
 

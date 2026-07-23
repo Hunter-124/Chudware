@@ -102,6 +102,8 @@ DEPARTMENT_CATALOG: tuple[tuple[str, str], ...] = (
 
 # role id → department id
 ROLE_TO_DEPT: dict[str, str] = {
+    "model3d": "geometry",
+    "sketch2d": "geometry",
     "geometry_designer": "geometry",
     "feature_modeler": "geometry",
     "feature_architect": "geometry",
@@ -115,6 +117,7 @@ ROLE_TO_DEPT: dict[str, str] = {
     "cam_programmer": "manufacturing",
     "reviewer": "documentation",
     "spec_writer": "documentation",
+    "drawing_detailer": "documentation",
     "re_datasheet_reader": "documentation",
     "ecad_engineer": "electronics",
     "firmware_engineer": "firmware",
@@ -300,6 +303,13 @@ def effective_corporate_depth_cap(
 # Classification helpers
 # ---------------------------------------------------------------------------
 
+def _kw_match(blob: str, keywords: tuple[str, ...]) -> bool:
+    """True if any *keywords* starts a word in *blob* (word-boundary, not a raw
+    substring) — e.g. ``"board"`` matches "circuit board" but NOT "onboarding"
+    (mid-word), while a stem like ``"machin"`` still matches "machining"."""
+    return any(re.search(rf"\b{re.escape(w)}", blob) for w in keywords)
+
+
 def classify_task_department(task: dict[str, Any] | str | None) -> str:
     """Map one task/role/stage descriptor to a department id."""
     if task is None:
@@ -344,19 +354,19 @@ def classify_task_department(task: dict[str, Any] | str | None) -> str:
         str(task.get(k) or "")
         for k in ("brief", "name", "title", "description", "goal", "id")
     ).lower()
-    if any(w in blob for w in ("cam", "toolpath", "gcode", "machin")):
+    if _kw_match(blob, ("cam", "toolpath", "gcode", "machin")):
         return "manufacturing"
-    if any(w in blob for w in ("fea", "cfd", "simulat", "thermal", "stress")):
+    if _kw_match(blob, ("fea", "cfd", "simulat", "thermal", "stress")):
         return "simulation"
-    if any(w in blob for w in ("draw", "report", "document", "titleblock")):
+    if _kw_match(blob, ("draw", "report", "document", "titleblock")):
         return "documentation"
-    if any(w in blob for w in ("schematic", "pcb", "ecad", "board")):
+    if _kw_match(blob, ("schematic", "pcb", "ecad", "board")):
         return "electronics"
-    if any(w in blob for w in ("firmware", "elf", "mcu", "fw_")):
+    if _kw_match(blob, ("firmware", "elf", "mcu", "fw_")):
         return "firmware"
-    if any(w in blob for w in ("sourc", "vendor", "bom", "buy")):
+    if _kw_match(blob, ("sourc", "vendor", "bom", "buy")):
         return "sourcing"
-    if any(w in blob for w in ("sketch", "extrude", "revolve", "fillet", "geometry", "part")):
+    if _kw_match(blob, ("sketch", "extrude", "revolve", "fillet", "geometry", "part")):
         return "geometry"
     return "general"
 

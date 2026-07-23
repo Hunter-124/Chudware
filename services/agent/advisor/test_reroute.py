@@ -311,3 +311,84 @@ def test_feature_change_maps_to_decompose():
 
 def test_empty_affected_set_yields_no_stage_reentry():
     assert reroute._stage_reentry_from_affected(cr.AffectedSet()) is None
+
+
+# ---------------------------------------------------------------------------
+# 6. Repeat-misroute escalation keys on the deterministic reentry, not prose
+#    (P1 fix: overseer._fingerprint / _check_repeat_blockers)
+# ---------------------------------------------------------------------------
+
+def _geometry_action_audit(finding: str) -> str:
+    """A non-blocker (severity=action) verdict citing the same geometry_spec
+    (seq 5) as ``_geometry_error_audit`` — same targeted_reentry, reworded
+    finding, non-blocker severity: exactly the case the old prose+blocker-only
+    fingerprint let loop forever."""
+    return json.dumps({
+        "schema": "aicad.audit/1",
+        "trigger": "stage_exit",
+        "verdicts": [{
+            "class": "cot_error",
+            "finding": finding,
+            "evidence": {"ledger_events": [5]},
+            "required_action": {"kind": "edit", "detail": "recompute the bore from fit_calc",
+                                "dispatch_role": "geometry_designer"},
+            "severity": "action",
+        }],
+        "model": {"provider": "mock", "id": "canned"},
+        "tokens": 90,
+    })
+
+
+def _feature_action_audit(finding: str) -> str:
+    """A non-blocker verdict citing the feature artifact (seq 2) — a DIFFERENT
+    targeted_reentry (decompose/feature_architect) than the geometry ones."""
+    return json.dumps({
+        "schema": "aicad.audit/1",
+        "trigger": "stage_exit",
+        "verdicts": [{
+            "class": "cot_error",
+            "finding": finding,
+            "evidence": {"ledger_events": [2]},
+            "required_action": {"kind": "edit", "detail": "revisit feature FT1",
+                                "dispatch_role": "feature_architect"},
+            "severity": "action",
+        }],
+        "model": {"provider": "mock", "id": "canned"},
+        "tokens": 80,
+    })
+
+
+def test_repeat_misroute_escalates_on_reentry_fingerprint_despite_reworded_prose(tmp_path):
+    """A correction that keeps getting routed to the same DP stage must escalate
+    even when the LLM rewords the finding and never assigns severity=blocker."""
+    lg = _dp_ledger(tmp_path)
+    prov = _CannedProvider([
+        _geometry_action_audit("bore Ø 20.02 was recalled, not computed"),
+        _geometry_action_audit("the bore diameter still has no fit_calc provenance"),
+    ])
+    o = Overseer(provider=prov, role_card={"system_prompt": "audit."}, ledger=lg)
+
+    r1 = o.audit("stage_exit", AuditScope(run_id="run_dp", stage="buildpath"))
+    assert r1.audit["verdicts"][0]["severity"] == "action"
+    assert not r1.escalated, "first non-blocker misroute must not escalate"
+
+    r2 = o.audit("stage_exit", AuditScope(run_id="run_dp", stage="assembly"))
+    assert r2.escalated, ("a second reworded finding routed to the SAME geometry "
+                          "stage must escalate — the fingerprint is the deterministic "
+                          "reentry, not prose, and severity=='action' still counts")
+    assert "human" in r2.escalation_text.lower()
+
+
+def test_repeat_misroute_does_not_escalate_across_different_reentry_targets(tmp_path):
+    """Same finding text, but each verdict routes to a DIFFERENT owning stage — the
+    reentry-based fingerprint must NOT collapse these into one repeat count."""
+    lg = _dp_ledger(tmp_path)
+    prov = _CannedProvider([
+        _geometry_action_audit("something is off"),
+        _feature_action_audit("something is off"),
+    ])
+    o = Overseer(provider=prov, role_card={"system_prompt": "audit."}, ledger=lg)
+    r1 = o.audit("stage_exit", AuditScope(run_id="run_dp", stage="buildpath"))
+    assert not r1.escalated
+    r2 = o.audit("stage_exit", AuditScope(run_id="run_dp", stage="assembly"))
+    assert not r2.escalated, "different targeted_reentry stages must not count as the same repeat"

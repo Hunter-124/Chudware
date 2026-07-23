@@ -5,7 +5,7 @@ inject: auto
 triggers:
   keywords: [reverse engineer, reverse-engineer, scan, mesh, point cloud, photogrammetry, STEP import]
   tools: [reverse_engineer, compare_parts, measure_from_photo, convert_face_to_sketch, import_part]
-  phases: [reveng, feature]
+  phases: [geometry, feature]
 ---
 
 # Reverse Engineer

@@ -140,6 +140,17 @@ def ensure_models_dev_cache(
     return path
 
 
+# In-process cache: the multi-MB models.dev snapshot is otherwise re-parsed on every
+# provider resolution (config._catalog_caps -> resolve_capabilities -> lookup_model ->
+# merge_catalog, at least once per run_turn). Keyed on the resolved path (tests patch
+# models_dev_cache_path() to point elsewhere per-call) + mtime_ns; either changing
+# invalidates and reparses. Mirrors advisor/triggers.py's _ensure_cache_fresh pattern.
+# Safe to return by reference (never None once set) — every caller only reads it.
+_models_dev_cache: dict[str, Any] | None = None
+_models_dev_cache_path: str | None = None
+_models_dev_cache_mtime_ns: int | None = None
+
+
 def load_models_dev(
     *,
     cache_path: Path | None = None,
@@ -147,16 +158,32 @@ def load_models_dev(
     opener: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
     """Load the models.dev snapshot. Does not network unless *allow_fetch* is True."""
+    global _models_dev_cache, _models_dev_cache_path, _models_dev_cache_mtime_ns
     path = cache_path or models_dev_cache_path()
     if not path.exists():
         if not allow_fetch:
             return {}
         path = ensure_models_dev_cache(opener=opener)
+    path_key = str(path)
+    try:
+        mtime_ns = path.stat().st_mtime_ns
+    except OSError:
+        mtime_ns = None
+    if (
+        _models_dev_cache is not None
+        and _models_dev_cache_path == path_key
+        and _models_dev_cache_mtime_ns == mtime_ns
+    ):
+        return _models_dev_cache
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return {}
-    return data if isinstance(data, dict) else {}
+        data = {}
+    data = data if isinstance(data, dict) else {}
+    _models_dev_cache, _models_dev_cache_path, _models_dev_cache_mtime_ns = (
+        data, path_key, mtime_ns,
+    )
+    return data
 
 
 # --------------------------------------------------------------------------- live discovery
@@ -560,9 +587,9 @@ def heuristic_row(provider: str, model_id: str) -> ModelRow:
     context = 8192
     max_output = 0
     vision = False
-    if "1.5-pro" in m:
+    if (p == "gemini" or "gemini" in m) and "1.5-pro" in m:
         context = 2097152
-    elif any(x in m for x in ("1.5-flash", "2.0", "2.5", "flash", "gemini")):
+    elif (p == "gemini" or "gemini" in m) and any(x in m for x in ("1.5-flash", "2.0", "2.5", "flash")):
         context = 1048576
     elif any(x in m for x in ("claude", "opus", "sonnet", "haiku")):
         context = 200000

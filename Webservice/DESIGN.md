@@ -44,8 +44,13 @@ flowchart LR
 7. **Layout**: everything under `Webservice/` except the T-R7 subset (services/plm + MCP/worker
    wiring). Secrets only in gitignored files (`Webservice/Cloudflare-info.txt`,
    `Webservice/secrets/`); `config.example.env` committed instead.
-8. **WASM**: rejected (OCCT/CEF footprint; WASM bytecode on the client is worse IP posture
-   than server-side streaming).
+8. **WASM**: ~~rejected (OCCT/CEF footprint; WASM bytecode on the client is worse IP posture
+   than server-side streaming)~~ — **superseded**: the premise was wrong. A WASM build of
+   `host/src/ui` now talks to the shared `aicad-hostd` through the gateway's WS `/engine`
+   bridge (`Webservice/gateway/engine_bridge.py` ↔ `services/ipc/ipc_transport_wasm.cpp`),
+   a byte-for-byte RPC/event pass-through, so engine/AI behavior is identical by
+   construction. Selkies pixel-streaming remains the default session path. See
+   `Webservice/README.md`.
 
 ## Component contract (frozen for the build wave)
 - Image: `localhost/billet-session:latest`; container `billet-sess-<slug>`.

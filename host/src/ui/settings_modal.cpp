@@ -4150,7 +4150,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                         static const char* kToolFamilies[] = {
                             "cad", "ecad", "cam", "em", "reveng", "plm", "parts",
                             "advisor", "ledger", "intake", "recon", "gsl",
-                            "workspace", "org", "research", "sim", "mission"
+                            "workspace", "research", "sim", "mission"
                         };
                         static constexpr int kToolFamilyCount =
                             (int)(sizeof(kToolFamilies) / sizeof(kToolFamilies[0]));
@@ -4170,8 +4170,8 @@ void drawSettingsModal(AppState& st, bool busy) {
                             "cam_add_operation","cam_generate","cam_simulate","cam_post"
                         };
                         static const char* kEcadTools[] = {
-                            "ecad_new_schematic","ecad_new_pcb","place_symbol","wire",
-                            "autoroute","run_erc","run_drc","board_from_schematic"
+                            "ecad_new_schematic","ecad_new_pcb","ecad_place_symbol","ecad_wire",
+                            "ecad_autoroute","ecad_run_erc","ecad_run_drc","board_from_schematic"
                         };
                         static const char* kPartsTools[] = {
                             "part_search","part_get","part_place","part_source",

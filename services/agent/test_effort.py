@@ -154,6 +154,16 @@ def test_tier_alias_normalization():
     assert resolve_effort("frontier-200k", config=_cfg()).tier == "frontier"
 
 
+def test_hand_edited_alias_override_key_resolves_on_read():
+    """An override key written directly as an alias (e.g. a hand-edited config.json,
+    never round-tripped through save_effort_settings) must still resolve — read and
+    write share one canonicalization via normalize_tier."""
+    cfg = _cfg(overrides={"frontier-200k": {"council": "off"}})
+    prof = resolve_effort("frontier", config=cfg)
+    assert prof.values["council"] == "off"
+    assert prof.sources["council"] == "override"
+
+
 # --------------------------------------------------------------------------- freedom rule + warnings
 
 def test_depth_above_contract_cap_warns_but_never_clamps():

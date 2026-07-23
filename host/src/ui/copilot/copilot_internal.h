@@ -54,7 +54,7 @@
 
 #include "copilot.h"
 #include "ui/layout.h"          // ui::overlayBand / takeOverlayColumnReset — pinned-column geometry
-#include "ui/panel_collapse.h"  // ui::PanelCollapseAnim — FM vertical roll-up + Copilot horizontal slide
+#include "ui/panel_collapse.h"  // ui::PanelCollapseAnim — shared vertical-collapse animation (T-G21)
 #include "ui/doc_tabs.h"        // ui::docTabStripHeight — top inset so the column clears the tab band
 #include "ui/model_registry.h"  // ui::ModelInfo / capability flags / provider mapping
 #include "ui/metrics.h"         // ui::metrics::px/U/asmHeaderIconGap

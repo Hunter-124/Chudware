@@ -2513,8 +2513,7 @@ bool drawHeaderTextButton(const char* id, const char* label, bool active,
 
     const float padX = ImGui::GetStyle().FramePadding.x;
     const float tw = ImGui::CalcTextSize(label).x;
-    // No label (icon-only header tab) => drop the icon/text gap so the icon stays centered.
-    const float contentW = (haveIcon ? iconSz + (tw > 0.0f ? iconGap : 0.0f) : 0.0f) + tw;
+    const float contentW = (haveIcon ? iconSz + iconGap : 0.0f) + tw;
     const float bw = std::max(minW, contentW + padX * 2.0f);
     const float bh = ImGui::GetFrameHeight();
 
@@ -2545,7 +2544,7 @@ bool drawHeaderTextButton(const char* id, const char* label, bool active,
                      ImVec2(x, midY - iconSz * 0.5f),
                      ImVec2(x + iconSz, midY + iconSz * 0.5f),
                      icon.uv0, icon.uv1, ImGui::ColorConvertFloat4ToU32(tint));
-        x += iconSz + (tw > 0.0f ? iconGap : 0.0f);
+        x += iconSz + iconGap;
     }
     const ImU32 ink = ImGui::ColorConvertFloat4ToU32(
         active ? surf.textPrimary : surf.textSecondary);

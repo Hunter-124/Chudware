@@ -1,12 +1,9 @@
-// Shared collapse animation for the pinned FeatureManager and Copilot glass columns (T-G21).
-// Both columns used to shrink to a small square pill in both axes. The FeatureManager rolls UP
-// toward its header strip instead — the header (tabs/title row + the collapse control) stays
+// Shared vertical-collapse animation for the pinned FeatureManager and Copilot glass columns
+// (T-G21). Both columns used to shrink to a small square pill in both axes; they now roll UP
+// toward their header strip instead — the header (tabs/title row + the collapse control) stays
 // pinned at the column's fixed position while only the window HEIGHT animates down to the
-// header's height, leaving the viewport visible underneath (tick/snap/measureHeader/bodyVisible).
-// The Copilot column uses the horizontal analogue (tickW/snapW/bodyVisibleW): it slides OUT to
-// the right screen edge — the window's right edge stays pinned while the WIDTH animates down to
-// a slim rail that keeps the expand chevron reachable. One helper so both columns share the same
-// exponential-approach feel instead of two hand-tuned implementations.
+// header's height, leaving the viewport visible underneath. One helper so both columns share
+// identical motion instead of two hand-tuned implementations.
 #pragma once
 
 #include "imgui.h"
@@ -58,36 +55,6 @@ struct PanelCollapseAnim {
     // the body below the header. Gates the rest of the column's content so a collapsing/collapsed
     // panel doesn't keep building (and eating input for) content nobody can see.
     bool bodyVisible() const { return h > headerH + 2.0f; }
-
-    // ---- horizontal slide-out variant (Copilot column) ----
-    // Same exponential approach as tick(), applied to WIDTH. The collapsed target is a slim rail
-    // pinned at the right screen edge that still hosts the expand chevron.
-    float w = -1.0f;      // current animated window width (px); negative = not yet initialized
-    float railW = 0.0f;   // collapsed rail width, set by tickW/snapW
-
-    // Call BEFORE SetNextWindowPos/Size: returns the window width to use this frame.
-    float tickW(bool collapsed, float fullW, float rail) {
-        railW = rail;
-        const float target = collapsed ? rail : fullW;
-        const float dt = ImGui::GetIO().DeltaTime;
-        if (w < 0.0f) { w = target; return w; }
-        const float tau = 0.12f;  // same ~120ms feel as tick()
-        const float a = 1.0f - std::exp(-dt / tau);
-        w += (target - w) * a;
-        if (std::fabs(w - target) < 0.5f) w = target;
-        return w;
-    }
-
-    // Snap immediately to the collapsed (rail) or expanded (full) width with no animation — the
-    // width analogue of snap(), for deterministic headless captures (AI_CAD_COPILOT_COLLAPSED).
-    void snapW(bool collapsed, float fullW, float rail) {
-        railW = rail;
-        w = collapsed ? rail : fullW;
-    }
-
-    // Width analogue of bodyVisible(): false once the column has slid down to the rail, so the
-    // header/body skip everything but the expand chevron.
-    bool bodyVisibleW() const { return w > railW + 2.0f; }
 };
 
 }  // namespace ui

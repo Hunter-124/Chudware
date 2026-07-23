@@ -1741,6 +1741,7 @@ static void drawOmpProviderManager(AppState& st) {
     pollOmpProviderList(st, false);
     pollOmpOAuth(st);
     ui::refreshBridgeModelCatalog(st, false);
+    ui::providerLogosTick(st);  // load/fetch real provider brand icons (gated; badges otherwise)
 
     if (!s_omp.available) {
         ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.statusWarn));
@@ -1764,6 +1765,12 @@ static void drawOmpProviderManager(AppState& st) {
     ImGui::SetNextItemWidth(-1);
     ImGui::InputTextWithHint("##prov_search", "Search providers...", s_provSearchBuf,
                              sizeof(s_provSearchBuf));
+    bool logosOn = ui::providerLogosEnabled();
+    if (ImGui::Checkbox("Show provider logos", &logosOn))
+        ui::setProviderLogosEnabled(logosOn);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Fetch each provider's real brand icon (cached locally in appdata).\n"
+                          "Off = colored letter badges, no network.");
     const std::string provNeedle = toLowerAscii(s_provSearchBuf);
     std::vector<const OmpProviderRow*> filteredRows;
     filteredRows.reserve(s_omp.rows.size());

@@ -1691,6 +1691,14 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                 return emit_error("agent_provider_logout: provider is required", out_json);
             return emit(omp_bridge_proxy("auth_logout", params), out_json, 0);
         }
+        if (m == "agent_provider_logo") {
+            // {domain, size?} -> {ok, b64, mime} the provider's brand favicon (fetched by the
+            // bridge from a favicon service). Functional display of the connected service;
+            // the host caches it locally and gates the call behind a user setting.
+            if (jstr(params, "domain").empty())
+                return emit_error("agent_provider_logo: domain is required", out_json);
+            return emit(omp_bridge_proxy("provider_logo", params), out_json, 0);
+        }
         if (m == "agent_models_list") {
             // {provider?} -> {ok, ...} every bundled OMP catalog model for one provider, or
             // every provider's when omitted. Distinct from the native agent_list_models above

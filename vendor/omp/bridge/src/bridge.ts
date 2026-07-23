@@ -174,6 +174,37 @@ async function handleWarmCache(params: Json): Promise<Json> {
 	return { warmed: result.stopReason !== "error", cacheHit: cacheRead > 0, ...collapsed };
 }
 
+// Fetch a provider's brand icon (favicon) for the domain in `params.domain`, returned as
+// base64 so the C++ side can decode + upload a GL texture. Functional/nominative display of
+// the service the user connects to; cached client-side, never persisted here. Tries the
+// DuckDuckGo icon service first (clean PNGs), then Google's favicon service as a fallback.
+async function handleProviderLogo(params: Json): Promise<Json> {
+	const domain = str(params.domain).trim().toLowerCase();
+	if (!domain) throw new Error("provider_logo requires domain");
+	const size = typeof params.size === "number" ? params.size : 64;
+	const urls = [
+		`https://icons.duckduckgo.com/ip3/${domain}.ico`,
+		`https://www.google.com/s2/favicons?domain=${domain}&sz=${size}`,
+	];
+	for (const url of urls) {
+		try {
+			const res = await fetch(url, { redirect: "follow", signal: AbortSignal.timeout(8000) });
+			if (!res.ok) continue;
+			const buf = Buffer.from(await res.arrayBuffer());
+			if (buf.length < 64) continue; // 1x1 tracking px / empty -> treat as miss
+			return {
+				ok: true,
+				domain,
+				mime: res.headers.get("content-type") ?? "image/png",
+				b64: buf.toString("base64"),
+			};
+		} catch {
+			// try the next source
+		}
+	}
+	return { ok: false, domain, message: "no icon found" };
+}
+
 async function dispatch(method: string, params: Json): Promise<Json> {
 	switch (method) {
 		case "ping":
@@ -192,6 +223,8 @@ async function dispatch(method: string, params: Json): Promise<Json> {
 			return handleWarmCache(params);
 		case "cache_policy":
 			return handleCachePolicy(params);
+		case "provider_logo":
+			return handleProviderLogo(params);
 		case "models_list":
 			return handleModelsList(params);
 		case "cost_summary":

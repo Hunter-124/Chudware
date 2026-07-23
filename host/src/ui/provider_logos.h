@@ -1,14 +1,16 @@
 // Provider brand identity for the Settings -> Providers UI (colors + a small drawn badge).
 //
-// The bundled UI font has no brand-logo glyphs, and shipping raster logos would bloat the
-// binary + carry trademark baggage, so a provider's "logo" here is a rounded brand-colored
-// badge with a short ASCII mark (font-safe) — enough to make the list scannable and branded.
-// Unknown ids get a stable hashed color + first-letter mark so nothing renders blank.
+// A provider's baseline "logo" is a rounded brand-colored badge with a short ASCII mark
+// (font-safe) — always available, offline, no committed assets. On top of that, when enabled,
+// providerLogosTick() fetches the provider's real brand favicon at runtime (via the bun
+// bridge), caches it in the user's appdata, and drawProviderLogo() renders that texture when
+// ready — falling back to the badge until then / when disabled / for unknown domains.
 #pragma once
 
 #include <string>
 
 #include "imgui.h"
+struct AppState;  // core/app_state.h (providerLogosTick needs st.rpc + appdata paths)
 
 namespace ui {
 
@@ -23,5 +25,15 @@ const char* providerBrandMark(const std::string& providerId);
 // Draw a filled rounded brand badge (brand color + white mark) of side `side` px with its
 // top-left at `pos`, via `dl`. Cursor is untouched — the caller reserves layout space.
 void drawProviderLogo(ImDrawList* dl, ImVec2 pos, float side, const std::string& providerId);
+
+// Per-frame driver (GL thread): for provider ids drawn since the previous tick, load a cached
+// favicon from appdata or kick a ONE-SHOT bridge fetch, then upload it as a GL texture.
+// Throttled to a few fetches per frame; no-op while disabled. Call once from the Providers UI.
+void providerLogosTick(AppState& st);
+
+// Runtime favicon toggle (config.json agent.provider_logos, default true). When off, no network
+// fetch happens and the list shows badges only; turning it off also drops cached textures.
+bool providerLogosEnabled();
+void setProviderLogosEnabled(bool on);
 
 }  // namespace ui

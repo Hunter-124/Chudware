@@ -9,6 +9,18 @@
 
 #include "ui_theme.h"
 
+#include <cctype>
+#include <filesystem>
+#include <fstream>
+#include <set>
+#include <system_error>
+
+#include <nlohmann/json.hpp>
+
+#include "stb_image.h"
+#include "gl_compat.h"
+#include "core/app_state.h"
+
 namespace ui {
 
 namespace {
@@ -132,6 +144,90 @@ const char* hashedMark(const std::string& id) {
     return "?";
 }
 
+// ---- runtime favicon layer: bridge fetch -> appdata cache -> GL texture ---------------------
+// id -> brand domain. Only ids with a real, stable website are listed; the favicon service the
+// bridge queries resolves the icon. Unknown / on-prem ids (ollama, lm-studio, llama.cpp, vllm)
+// are intentionally absent -> they keep the drawn badge. Approximate domains are fine: a wrong
+// or missing icon just falls back to the badge.
+const std::unordered_map<std::string, std::string>& domainTable() {
+    static const std::unordered_map<std::string, std::string> t = {
+        {"anthropic", "anthropic.com"}, {"openai", "openai.com"},
+        {"openai-codex", "openai.com"}, {"openai-codex-device", "openai.com"},
+        {"azure", "azure.microsoft.com"}, {"google", "google.com"},
+        {"gemini", "gemini.google.com"}, {"google-antigravity", "google.com"},
+        {"google-gemini-cli", "google.com"}, {"google-vertex", "cloud.google.com"},
+        {"xai", "x.ai"}, {"xai-oauth", "x.ai"}, {"kimi-code", "moonshot.cn"},
+        {"moonshot", "moonshot.cn"}, {"deepseek", "deepseek.com"}, {"mistral", "mistral.ai"},
+        {"groq", "groq.com"}, {"together", "together.ai"}, {"fireworks", "fireworks.ai"},
+        {"openrouter", "openrouter.ai"}, {"cerebras", "cerebras.ai"}, {"baseten", "baseten.co"},
+        {"bedrock", "aws.amazon.com"}, {"amazon-bedrock", "aws.amazon.com"},
+        {"aiml", "aimlapi.com"}, {"aimlapi", "aimlapi.com"}, {"zhipu", "z.ai"},
+        {"zhipu-coding-plan", "z.ai"}, {"zai", "z.ai"}, {"z-ai", "z.ai"},
+        {"alibaba", "alibabacloud.com"}, {"alibaba-coding-plan", "alibabacloud.com"},
+        {"qwen", "qwen.ai"}, {"qwen-portal", "qwen.ai"}, {"github-copilot", "github.com"},
+        {"cursor", "cursor.com"}, {"devin", "devin.ai"}, {"gitlab-duo", "gitlab.com"},
+        {"gitlab-duo-agent", "gitlab.com"}, {"minimax", "minimax.io"},
+        {"minimax-code", "minimax.io"}, {"minimax-code-cn", "minimaxi.com"},
+        {"xiaomi", "mi.com"}, {"xiaomi-token-plan-cn", "mi.com"},
+        {"xiaomi-token-plan-sgp", "mi.com"}, {"xiaomi-token-plan-ams", "mi.com"},
+        {"nvidia", "nvidia.com"}, {"novita", "novita.ai"}, {"huggingface", "huggingface.co"},
+        {"perplexity", "perplexity.ai"}, {"qianfan", "cloud.baidu.com"}, {"venice", "venice.ai"},
+        {"nanogpt", "nano-gpt.com"}, {"vercel-ai-gateway", "vercel.com"},
+        {"cloudflare-ai-gateway", "cloudflare.com"}, {"litellm", "litellm.ai"},
+        {"tavily", "tavily.com"}, {"kagi", "kagi.com"}, {"sakana", "sakana.ai"},
+        {"cohere", "cohere.com"},
+    };
+    return t;
+}
+
+struct LogoTex { unsigned int tex = 0; int w = 0, h = 0; bool fetching = false; };
+std::unordered_map<std::string, LogoTex> g_logoTex;  // GL thread only
+std::set<std::string> g_logoReq;                     // ids drawn since last tick (GL thread)
+int g_logoEnabled = -1;                              // -1 unknown, 0 off, 1 on
+
+std::string logoCacheDir() { return appdataAppDir() + "/provider_logos"; }
+std::string logoSafeId(const std::string& id) {
+    std::string s; s.reserve(id.size());
+    for (char c : id) s += std::isalnum((unsigned char)c) ? c : '_';
+    return s;
+}
+std::string logoCachePath(const std::string& id) {
+    return logoCacheDir() + "/" + logoSafeId(id) + ".png";
+}
+
+// Standard base64 decode (bridge returns unpadded-safe standard base64, no line breaks).
+std::string b64dec(const std::string& in) {
+    static const std::array<int, 256> rev = [] {
+        std::array<int, 256> r; r.fill(-1);
+        const char* tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        for (int i = 0; i < 64; ++i) r[(unsigned char)tbl[i]] = i;
+        return r;
+    }();
+    std::string out; out.reserve(in.size() * 3 / 4);
+    int val = 0, bits = -8;
+    for (unsigned char c : in) {
+        if (c == '=') break;
+        if (rev[c] < 0) continue;
+        val = (val << 6) + rev[c]; bits += 6;
+        if (bits >= 0) { out.push_back(char((val >> bits) & 0xFF)); bits -= 8; }
+    }
+    return out;
+}
+
+bool logoEnabled() {
+    if (g_logoEnabled >= 0) return g_logoEnabled != 0;
+    g_logoEnabled = 1;  // default on (user opted in)
+    std::ifstream f(configPath());
+    if (f) {
+        try {
+            nlohmann::json j; f >> j;
+            if (j.contains("agent") && j["agent"].contains("provider_logos"))
+                g_logoEnabled = j["agent"]["provider_logos"].get<bool>() ? 1 : 0;
+        } catch (...) {}
+    }
+    return g_logoEnabled != 0;
+}
+
 }  // namespace
 
 const float* providerBrandColor(const std::string& providerId) {
@@ -148,6 +244,20 @@ const char* providerBrandMark(const std::string& providerId) {
 
 void drawProviderLogo(ImDrawList* dl, ImVec2 pos, float side, const std::string& providerId) {
     if (!dl) return;
+    // Real favicon (when enabled + fetched): register the id for the next tick and, if its
+    // texture is ready, draw it rounded on a white backing. Otherwise fall through to the badge.
+    if (logoEnabled()) {
+        g_logoReq.insert(providerId);
+        auto it = g_logoTex.find(providerId);
+        if (it != g_logoTex.end() && it->second.tex) {
+            const ImVec2 mx(pos.x + side, pos.y + side);
+            const float rounding = side * 0.28f;
+            dl->AddRectFilled(pos, mx, IM_COL32(255, 255, 255, 235), rounding);
+            dl->AddImageRounded((ImTextureID)(intptr_t)it->second.tex, pos, mx,
+                                ImVec2(0, 0), ImVec2(1, 1), IM_COL32(255, 255, 255, 255), rounding);
+            return;
+        }
+    }
     const float* c = providerBrandColor(providerId);
     const ImU32 fill = ImGui::ColorConvertFloat4ToU32(ImVec4(c[0], c[1], c[2], 1.0f));
     // Slightly darker ring for definition on light panels.
@@ -198,5 +308,79 @@ void drawProviderLogo(ImDrawList* dl, ImVec2 pos, float side, const std::string&
     const ImU32 ink = IM_COL32(255, 255, 255, 235);
     dl->AddText(ImVec2(pos.x + (side - ts.x) * 0.5f, pos.y + (side - ts.y) * 0.5f), ink, mark);
 }
+bool providerLogosEnabled() { return logoEnabled(); }
+
+void setProviderLogosEnabled(bool on) {
+    g_logoEnabled = on ? 1 : 0;
+    // Persist config.json agent.provider_logos (load-modify-write).
+    nlohmann::json j = nlohmann::json::object();
+    { std::ifstream f(configPath()); if (f) { try { f >> j; } catch (...) { j = nlohmann::json::object(); } } }
+    if (!j.is_object()) j = nlohmann::json::object();
+    j["agent"]["provider_logos"] = on;
+    std::error_code ec; std::filesystem::create_directories(appdataAppDir(), ec);
+    { std::ofstream o(configPath(), std::ios::trunc); if (o) o << j.dump(2); }
+    if (!on) {
+        // Drop cached textures so the list falls back to badges immediately (GL thread).
+        for (auto& kv : g_logoTex)
+            if (kv.second.tex) { GLuint t = kv.second.tex; glDeleteTextures(1, &t); }
+        g_logoTex.clear();
+    }
+}
+
+void providerLogosTick(AppState& st) {
+    if (!logoEnabled()) { g_logoReq.clear(); return; }
+    int budget = 3;  // fetch kicks per frame (throttle a first-open burst)
+    for (const std::string& id : g_logoReq) {
+        auto dit = domainTable().find(id);
+        if (dit == domainTable().end()) continue;   // no known domain -> badge only
+        LogoTex& lt = g_logoTex[id];
+        if (lt.tex) continue;                        // already uploaded
+        const std::string path = logoCachePath(id);
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(path, ec)) {
+            int w = 0, h = 0, n = 0;
+            unsigned char* px = stbi_load(path.c_str(), &w, &h, &n, 4);
+            if (px && w > 0 && h > 0) {
+                GLuint tex = 0;
+                glGenTextures(1, &tex);
+                glBindTexture(GL_TEXTURE_2D, tex);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+                glBindTexture(GL_TEXTURE_2D, 0);
+                lt.tex = tex; lt.w = w; lt.h = h;
+            }
+            if (px) stbi_image_free(px);
+            else std::filesystem::remove(path, ec);  // corrupt -> drop, refetch next session
+            continue;
+        }
+        if (!lt.fetching && budget > 0) {
+            lt.fetching = true; --budget;
+            const std::string domain = dit->second;
+            st.rpc.call("agent_provider_logo",
+                        nlohmann::json{{"domain", domain}, {"size", 64}},
+                        [path](const core::RpcResult& r) {
+                // Off the GL thread: only touch disk (atomic tmp+rename). The next tick loads it.
+                if (!r.ok || !r.result.is_object()) return;
+                if (!r.result.value("ok", false)) return;
+                const std::string b64 = r.result.value("b64", std::string());
+                if (b64.empty()) return;
+                const std::string bytes = b64dec(b64);
+                if (bytes.size() < 64) return;
+                std::error_code ec2;
+                std::filesystem::create_directories(
+                    std::filesystem::path(path).parent_path(), ec2);
+                const std::string tmp = path + ".tmp";
+                { std::ofstream o(tmp, std::ios::binary | std::ios::trunc);
+                  if (!o) return; o.write(bytes.data(), (std::streamsize)bytes.size()); }
+                std::filesystem::rename(tmp, path, ec2);
+            });
+        }
+    }
+    g_logoReq.clear();
+}
+
 
 }  // namespace ui

@@ -1216,6 +1216,317 @@ bool moonshotKeyPresent(AppState& st) {
     return st.settings.moonshotKey[0] != 0 || s_subConn.hostMoonshot;
 }
 
+// ============================ OMP bridge model catalog + session cost (S-UI-PROV) ===
+// Static OMP catalog (capabilities + $/Mtok cost) via the libaicad `agent_models_list` C-ABI
+// (bridge `models_list`), and the per-session cost strip via `agent_cost_summary` (a pure
+// calculator — the UI supplies the session's token events, the bridge prices them). Both
+// degrade permanently on unknown_method (sibling slice absent / older core) and quietly keep
+// the last good data on soft failures.
+
+namespace {
+
+std::vector<ui::BridgeModelMeta> s_bridgeModels;
+bool s_bridgeCatalogAvailable = true;  // false after unknown_method — stop polling, no sublabels
+bool s_bridgeCatalogInFlight = false;
+double s_bridgeCatalogLastFetch = -1e9;
+
+// True when the RPC is permanently absent (unknown method / older core) — mirrors
+// usageIsAbsent in composer.cpp.
+bool bridgeRpcAbsent(const core::RpcResult& r) {
+    if (!r.ok) {
+        const std::string& e = r.err;
+        if (e.find("unknown") != std::string::npos || e.find("not found") != std::string::npos ||
+            e.find("not_found") != std::string::npos || e.find("method") != std::string::npos)
+            return true;
+        return false;
+    }
+    if (!r.result.is_object()) return false;
+    if (r.result.contains("code")) {
+        const std::string c = r.result.value("code", std::string());
+        if (c == "unknown_method" || c == "method_not_found" || c == "not_implemented")
+            return true;
+    }
+    if (!r.result.value("ok", true)) {
+        const std::string reason = r.result.value("reason", std::string());
+        if (reason == "unknown_method" || reason == "method_not_found" ||
+            reason == "not_implemented")
+            return true;
+    }
+    return false;
+}
+
+// "$3" / "$1.5" / "$18.75" — OMP formatCostPair trims to meaningful digits (model-browser.ts:271).
+std::string fmtUsd(double v) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "$%.4g", v);
+    return buf;
+}
+
+}  // namespace
+
+void refreshBridgeModelCatalog(AppState& st, bool force) {
+    if (!s_bridgeCatalogAvailable || s_bridgeCatalogInFlight) return;
+    const double now = ImGui::GetTime();
+    // Catalog changes slowly (only on a bridge/OMP update) — 5-min TTL like the usage polls.
+    if (!force && (now - s_bridgeCatalogLastFetch) < 300.0) return;
+    s_bridgeCatalogLastFetch = now;
+    s_bridgeCatalogInFlight = true;
+    st.rpc.call("agent_models_list", nlohmann::json::object(),
+                [](const core::RpcResult& r) {
+        s_bridgeCatalogInFlight = false;
+        if (bridgeRpcAbsent(r)) {
+            s_bridgeCatalogAvailable = false;
+            s_bridgeModels.clear();
+            return;
+        }
+        if (!r.ok || !r.result.is_object() || !r.result.value("ok", true)) return;  // soft fail
+        const auto it = r.result.find("models");
+        if (it == r.result.end() || !it->is_array()) return;
+        std::vector<ui::BridgeModelMeta> rows;
+        for (const auto& m : *it) {
+            if (!m.is_object()) continue;
+            ui::BridgeModelMeta b;
+            b.id = m.value("id", std::string());
+            if (b.id.empty()) continue;
+            b.name = m.value("name", b.id);
+            b.provider = m.value("provider", std::string());
+            b.vision = m.value("vision", false);
+            b.tools = m.value("supportsTools", false);
+            b.reasoning = m.value("reasoning", false);
+            if (m.contains("contextWindow") && m["contextWindow"].is_number())
+                b.contextWindow = m["contextWindow"].get<int>();
+            if (m.contains("maxTokens") && m["maxTokens"].is_number())
+                b.maxTokens = m["maxTokens"].get<int>();
+            const auto c = m.find("cost");
+            if (c != m.end() && c->is_object()) {
+                b.hasCost = true;
+                b.costIn = c->value("input", 0.0);
+                b.costOut = c->value("output", 0.0);
+                b.costCacheRead = c->value("cacheRead", 0.0);
+                b.costCacheWrite = c->value("cacheWrite", 0.0);
+            }
+            rows.push_back(std::move(b));
+        }
+        s_bridgeModels = std::move(rows);
+    }, 15000);
+}
+
+const std::vector<ui::BridgeModelMeta>& bridgeModelCatalog() { return s_bridgeModels; }
+
+const ui::BridgeModelMeta* bridgeModelMeta(const std::string& providerId,
+                                               const std::string& modelId) {
+    for (const auto& m : s_bridgeModels) {
+        if (m.id != modelId) continue;
+        if (providerId.empty() || m.provider == providerId) return &m;
+    }
+    return nullptr;
+}
+
+const ui::BridgeModelMeta* bridgeModelMetaForCad(int cadProvider, const std::string& modelId,
+                                                     const char* cloudBaseUrl) {
+    // CAD ProviderIndex -> OMP catalog provider id (the bridge-routed subset; local endpoints
+    // have no catalog rows and simply get no sublabel).
+    std::string prov;
+    switch (cadProvider) {
+        case ui::PROV_ANTHROPIC: prov = "anthropic"; break;
+        case ui::PROV_KIMISUB:   prov = "kimi-code"; break;
+        case ui::PROV_OPENAI:    prov = "openai"; break;
+        case ui::PROV_XAI:       prov = "xai"; break;
+        case ui::PROV_GEMINI:    prov = "google"; break;
+        case ui::PROV_CLOUDCOMPAT: {
+            // The shared cloud slot resolves by base_url (Moonshot is the prioritized one).
+            const char* svc = ui::cloudServiceKey(cloudBaseUrl ? cloudBaseUrl : "");
+            if (std::strcmp(svc, "cloud") != 0) prov = svc;
+            break;
+        }
+        default: break;
+    }
+    if (!prov.empty())
+        if (const ui::BridgeModelMeta* m = bridgeModelMeta(prov, modelId)) return m;
+    // Fallback: bare id match (covers cloud-slot services whose OMP id differs from ours).
+    return bridgeModelMeta("", modelId);
+}
+
+std::string bridgeModelSublabel(const ui::BridgeModelMeta& m) {
+    // "ctx 200k \xc2\xb7 $3/$15 \xc2\xb7 tools vision" — OMP model-browser.ts row format.
+    std::string out;
+    if (m.contextWindow > 0) {
+        char buf[24];
+        if (m.contextWindow >= 1000000)
+            std::snprintf(buf, sizeof(buf), "ctx %dM", m.contextWindow / 1000000);
+        else
+            std::snprintf(buf, sizeof(buf), "ctx %dk", m.contextWindow / 1000);
+        out = buf;
+    }
+    if (m.hasCost) {
+        if (!out.empty()) out += " \xc2\xb7 ";
+        if (m.costIn == 0.0 && m.costOut == 0.0)
+            out += "free";
+        else
+            out += fmtUsd(m.costIn) + "/" + fmtUsd(m.costOut);
+    }
+    std::string caps;
+    if (m.tools) caps = "tools";
+    if (m.vision) caps += caps.empty() ? "vision" : " vision";
+    if (m.reasoning) caps += caps.empty() ? "reasoning" : " reasoning";
+    if (!caps.empty()) {
+        if (!out.empty()) out += " \xc2\xb7 ";
+        out += caps;
+    }
+    return out;
+}
+
+std::string bridgeModelCostDetail(const ui::BridgeModelMeta& m) {
+    // Tooltip line: full precision + cache pricing (OMP keeps cache cost off the row).
+    std::string out;
+    if (m.hasCost) {
+        out = "in " + fmtUsd(m.costIn) + "/M \xc2\xb7 out " + fmtUsd(m.costOut) + "/M";
+        if (m.costCacheRead > 0.0 || m.costCacheWrite > 0.0)
+            out += " \xc2\xb7 cache " + fmtUsd(m.costCacheRead) + "/" + fmtUsd(m.costCacheWrite);
+    }
+    if (m.maxTokens > 0) {
+        char buf[24];
+        std::snprintf(buf, sizeof(buf), "%smax out %dk", out.empty() ? "" : " \xc2\xb7 ",
+                      m.maxTokens / 1000);
+        out += buf;
+    }
+    return out;
+}
+
+// ---- per-session cost strip ----
+namespace {
+
+struct CostModelRow {
+    std::string provider;
+    std::string model;
+    double usd = 0;
+    int tokensIn = 0, tokensOut = 0;
+};
+double s_costUsd = 0;
+int s_costTin = 0, s_costTout = 0;
+std::vector<CostModelRow> s_costRows;
+bool s_costAvailable = true;   // false after unknown_method
+bool s_costInFlight = false;
+bool s_costHasData = false;
+double s_costLastFetch = -1e9;
+// Fingerprint of the events array last priced (turn count + total tokens) — events only grow
+// within a conversation, and a conversation switch changes the totals, so this refires exactly
+// when the visible session's completed turns change (plus a 30s refresh while open).
+long long s_costFingerprint = -1;
+
+}  // namespace
+
+void drawSessionCostStrip(AppState& st) {
+    if (!s_costAvailable) return;
+    const float sc = ui::uiScale;
+
+    // Rebuild the session's token events from completed assistant turns: ChatMsg.model is the
+    // model id at run start, and rowKind-0 activity rows carry per-stage tokens (the same sum
+    // the chat footer shows, chat_log.cpp). agent_cost_summary is a pure calculator, so the
+    // full event list is re-sent each poll — no accumulation state to drift.
+    nlohmann::json events = nlohmann::json::array();
+    long long fp = 0;
+    for (const auto& m : st.chat) {
+        if (m.fromUser || m.running || m.model.empty()) continue;
+        int tin = 0, tout = 0;
+        for (const auto& a : m.activity) {
+            if (a.rowKind != 0) continue;
+            tin += a.tokensIn;
+            tout += a.tokensOut;
+        }
+        if (tin <= 0 && tout <= 0) continue;
+        // The bridge prices by (provider, model); recover the OMP provider id from the catalog.
+        const ui::BridgeModelMeta* meta = bridgeModelMeta("", m.model);
+        if (!meta || meta->provider.empty()) continue;
+        fp += 1 + tin + tout;
+        events.push_back({{"provider", meta->provider},
+                          {"model", m.model},
+                          {"input", tin},
+                          {"output", tout}});
+    }
+    const double now = ImGui::GetTime();
+    if (!s_costInFlight && (fp != s_costFingerprint || (now - s_costLastFetch) > 30.0)) {
+        s_costFingerprint = fp;
+        s_costLastFetch = now;
+        s_costInFlight = true;
+        st.rpc.call("agent_cost_summary", nlohmann::json{{"events", events}},
+                    [](const core::RpcResult& r) {
+            s_costInFlight = false;
+            if (bridgeRpcAbsent(r)) {
+                s_costAvailable = false;
+                s_costHasData = false;
+                return;
+            }
+            if (!r.ok || !r.result.is_object() || !r.result.value("ok", true)) return;
+            const auto total = r.result.find("total");
+            if (total != r.result.end() && total->is_object()) {
+                s_costUsd = total->value("usd", 0.0);
+                const auto tok = total->find("tokens");
+                if (tok != total->end() && tok->is_object()) {
+                    s_costTin = tok->value("input", 0);
+                    s_costTout = tok->value("output", 0);
+                }
+            }
+            s_costRows.clear();
+            const auto pm = r.result.find("perModel");
+            if (pm != r.result.end() && pm->is_array()) {
+                for (const auto& row : *pm) {
+                    if (!row.is_object()) continue;
+                    CostModelRow cr;
+                    cr.provider = row.value("provider", std::string());
+                    cr.model = row.value("model", std::string());
+                    cr.usd = row.value("usd", 0.0);
+                    const auto tok = row.find("tokens");
+                    if (tok != row.end() && tok->is_object()) {
+                        cr.tokensIn = tok->value("input", 0);
+                        cr.tokensOut = tok->value("output", 0);
+                    }
+                    s_costRows.push_back(std::move(cr));
+                }
+            }
+            s_costHasData = true;
+        }, 15000);
+    }
+    if (!s_costHasData) return;
+
+    // Compact one-liner: "Session $1.87 \xc2\xb7 142k tok". Click = per-model breakdown popover.
+    char line[96];
+    const long long tokTotal = (long long)s_costTin + (long long)s_costTout;
+    char tokBuf[24];
+    if (tokTotal >= 1000000)
+        std::snprintf(tokBuf, sizeof(tokBuf), "%.1fM tok", tokTotal / 1.0e6);
+    else
+        std::snprintf(tokBuf, sizeof(tokBuf), "%lldk tok", tokTotal / 1000);
+    std::snprintf(line, sizeof(line), "Session %s \xc2\xb7 %s", fmtUsd(s_costUsd).c_str(), tokBuf);
+    ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
+    ImGui::TextUnformatted(line);
+    ImGui::PopStyleColor();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("OMP-observed spend (catalog pricing \xc3\x97 session tokens) \xe2\x80\x94 "
+                          "not a bill. Click for the per-model breakdown.");
+    if (ImGui::IsItemClicked()) ImGui::OpenPopup("##session_cost_detail");
+    if (ImGui::BeginPopup("##session_cost_detail")) {
+        ImGui::TextUnformatted("Session cost by model");
+        ImGui::Separator();
+        if (s_costRows.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
+            ImGui::TextUnformatted("No priced turns yet this session.");
+            ImGui::PopStyleColor();
+        }
+        for (const auto& row : s_costRows) {
+            ImGui::PushID(row.model.c_str());
+            ImGui::TextUnformatted(row.model.c_str());
+            ImGui::SameLine(220.0f * sc);
+            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
+            ImGui::Text("%d in / %d out", row.tokensIn, row.tokensOut);
+            ImGui::PopStyleColor();
+            ImGui::SameLine(380.0f * sc);
+            ImGui::TextUnformatted(fmtUsd(row.usd).c_str());
+            ImGui::PopID();
+        }
+        ImGui::EndPopup();
+    }
+}
 
 // One model row: checkmark gutter (drawn — no check glyph in the font) + label + dim provider
 // sublabel; an accent "Add key" when the provider isn't usable. Returns true when picked.
@@ -1234,9 +1545,22 @@ static bool modelRow(AppState& st, int provider, const std::string& id, const st
     ImGui::PushID(uid);
     bool clicked = ImGui::Selectable("##mrow", current,
                                      usable ? 0 : ImGuiSelectableFlags_Disabled, ImVec2(0, rowH));
+    // OMP catalog sublabel (ctx / cost / capabilities) for bridge-routed providers.
+    const ui::BridgeModelMeta* meta = bridgeModelMetaForCad(provider, id, st.settings.baseUrl);
+    const std::string sublabel = meta ? bridgeModelSublabel(*meta) : std::string();
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
-        // Full model name + provider for the composer overlay picker.
-        ImGui::SetTooltip("%s \xe2\x80\x94 %s", label.c_str(), providerShort(provider));
+        // Full model name + provider for the composer overlay picker; cost detail (cache
+        // pricing, max output) rides the tooltip per the OMP model-browser convention.
+        if (meta) {
+            const std::string detail = bridgeModelCostDetail(*meta);
+            if (!detail.empty())
+                ImGui::SetTooltip("%s \xe2\x80\x94 %s\n%s", label.c_str(),
+                                  providerShort(provider), detail.c_str());
+            else
+                ImGui::SetTooltip("%s \xe2\x80\x94 %s", label.c_str(), providerShort(provider));
+        } else {
+            ImGui::SetTooltip("%s \xe2\x80\x94 %s", label.c_str(), providerShort(provider));
+        }
     }
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
@@ -1260,6 +1584,12 @@ static bool modelRow(AppState& st, int provider, const std::string& id, const st
         float hw = ImGui::CalcTextSize(hint).x;
         dl->AddText(ImVec2(mx.x - hw - 8 * sc, midY - fh * 0.5f),
                     ui::Palette::toU32(pal.accent), hint);
+    } else if (!sublabel.empty()) {
+        // Right-aligned dim "ctx 200k \xc2\xb7 $3/$15 \xc2\xb7 tools vision" (OMP model-browser row).
+        const float sw = ImGui::CalcTextSize(sublabel.c_str()).x;
+        if (mn.x + gut + lw + 8 * sc + 60.0f * sc < mx.x - sw - 8 * sc)
+            dl->AddText(ImVec2(mx.x - sw - 8 * sc, midY - fh * 0.5f),
+                        ui::Palette::toU32(pal.textDim), sublabel.c_str());
     }
     ImGui::PopID();
     return clicked && usable;
@@ -1274,6 +1604,7 @@ void drawModelDropdown(AppState& st, bool busy) {
     const float sc = ui::uiScale;
     static char s_modelSearch[64] = "";
     refreshModelAvailability(st, false);
+    refreshBridgeModelCatalog(st, false);  // OMP catalog sublabels (ctx/cost/capability chips)
 
     if (ImGui::IsWindowAppearing()) { s_modelSearch[0] = 0; ImGui::SetKeyboardFocusHere(); }
 
@@ -1465,6 +1796,10 @@ void drawModelDropdown(AppState& st, bool busy) {
             "Other providers need a sign-in or API key \xE2\x80\x94 add one in Settings.");
         ImGui::PopStyleColor();
     }
+
+    // Footer: per-session cost strip (agent_cost_summary; hidden while the bridge is absent).
+    ImGui::Dummy(ImVec2(0, 2 * sc));
+    drawSessionCostStrip(st);
 
     if (picked) {
         // CRITICAL: persist the pick to config.json NOW. The in-app run (agent_run_v2) resolves its

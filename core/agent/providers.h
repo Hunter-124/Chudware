@@ -141,9 +141,17 @@ using AssistCompleteFn =
 AssistCompleteFn make_assist_provider(const json& descriptor);
 
 // --- high-level dispatch ----------------------------------------------------
-// complete(): pick anthropic vs openai/llamacpp, build the request, http_post,
-// parse. provider is "anthropic"|"openai"|"llamacpp"|"mock". cfg may carry
-// {api_key, model, base_url}. On a transport/HTTP error, .error is set.
+// complete(): pick anthropic vs openai/llamacpp vs the OMP bridge, build the request,
+// http_post (or bridge call), parse. provider is
+// "anthropic"|"anthropic-sub"|"openai"|"llamacpp"|"xai"|"xai-sub"|"moonshot"|"gemini"|"mock",
+// or any id in is_omp_bridge_provider()'s set (routed to core/agent/omp_bridge_client.h — see
+// providers.cpp). cfg may carry {api_key, model, base_url}. On a transport/HTTP error, .error
+// is set.
+// Provider ids that route through the bun OMP bridge (vendor/omp/bridge/src/bridge.ts)
+// instead of a native libcurl/WinHTTP branch below. Empty until the orchestrator wires real
+// catalog ids (see providers.cpp for the TODO + wiring point); public so callers other than
+// complete() (e.g. a future host-side provider picker) can ask the same question.
+bool is_omp_bridge_provider(const std::string& provider);
 struct CompleteResult {
     std::string text;
     std::string thinking;

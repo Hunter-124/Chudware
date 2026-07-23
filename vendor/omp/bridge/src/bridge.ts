@@ -16,7 +16,13 @@
  *   <- {"id": <number>, "ok": false, "error": {"message": <string>, "status"?: <number>}}
  *
  * Methods: ping | listProviders | listModels{provider} | complete{provider,model,apiKey?,
- * baseUrl?,system?,messages,maxTokens?}.
+ * baseUrl?,system?,messages,maxTokens?} | models_list{provider?} | cost_summary{events?} |
+ * auth_list_providers | auth_state{provider?} | auth_validate_key{provider,apiKey} |
+ * auth_set_key{provider,apiKey} | auth_remove_key{provider,account?} |
+ * auth_logout{provider,account?} | auth_begin_oauth{provider} | auth_oauth_poll{handle} |
+ * auth_oauth_manual{handle,code} | auth_oauth_cancel{handle}. Auth/model/cost methods are
+ * implemented in the sibling json.ts/models.ts/auth-context.ts/oauth-flow.ts modules and wired
+ * in through dispatch() below; see those files for the OMP surface each one reuses.
  *
  * NOTE: `stream().result()` resolves (does not throw) on provider HTTP errors — the error is
  * embedded in the returned AssistantMessage (stopReason:"error", errorStatus, errorMessage).
@@ -28,25 +34,21 @@ import { createInterface } from "node:readline";
 
 import { stream } from "@oh-my-pi/pi-ai";
 import type { AssistantMessage, Context, Message, StreamOptions } from "@oh-my-pi/pi-ai";
-import { getBundledModel, getBundledModels, getBundledProviders } from "@oh-my-pi/pi-catalog";
-import type { Api, Model } from "@oh-my-pi/pi-catalog";
-
-type Json = Record<string, unknown>;
-/** The branded provider-id parameter `getBundledModel`/`getBundledModels` accept. */
-type ProviderId = Parameters<typeof getBundledModel>[0];
+import { getBundledModels, getBundledProviders } from "@oh-my-pi/pi-catalog";
+import {
+	handleAuthListProviders,
+	handleAuthLogout,
+	handleAuthRemoveKey,
+	handleAuthSetKey,
+	handleAuthState,
+	handleAuthValidateKey,
+} from "./auth-context";
+import { asObject, str, type Json } from "./json";
+import { handleCostSummary, handleModelsList, modelInfo, resolveModel, type ProviderId } from "./models";
+import { handleAuthBeginOAuth, handleAuthOAuthCancel, handleAuthOAuthManual, handleAuthOAuthPoll } from "./oauth-flow";
 
 function log(...args: unknown[]): void {
 	process.stderr.write(args.map(String).join(" ") + "\n");
-}
-
-// Narrow an unknown JSON value to an object map. `as Json` is safe after the typeof guard
-// (Json is just Record<string, unknown>); used at ~every RPC boundary, hence a shared helper.
-function asObject(v: unknown): Json {
-	return v && typeof v === "object" ? (v as Json) : {};
-}
-// Read a string field from unknown RPC input; used across every method, kept in lockstep.
-function str(v: unknown, fallback = ""): string {
-	return typeof v === "string" ? v : fallback;
 }
 
 interface CadPart {
@@ -108,26 +110,6 @@ function convertMessages(messages: CadMessage[]): Message[] {
 	return built as unknown as Message[];
 }
 
-/** Resolve an OMP Model, honoring a caller-supplied base_url override for proxies/local endpoints. */
-function resolveModel(provider: string, modelId: string, baseUrl?: string): Model<Api> {
-	// `as ProviderId`: provider is a runtime string; the registry keys on a branded union.
-	const providerId = provider as ProviderId;
-	// getBundledModel is typed non-optional but returns undefined on a registry miss.
-	let model = getBundledModel(providerId, modelId) as Model<Api> | undefined;
-	if (!model) {
-		// Unknown id under a known provider: clone the provider's first bundled model as a
-		// template and retarget it, so proxied/newer ids still stream through the right API.
-		const templates = getBundledModels(providerId);
-		if (templates && templates.length > 0) {
-			model = { ...templates[0], id: modelId, requestModelId: modelId, name: modelId };
-		}
-	}
-	if (!model) {
-		throw new Error(`unknown provider/model: ${provider}/${modelId} (no bundled model and no template)`);
-	}
-	return baseUrl ? { ...model, baseUrl } : model;
-}
-
 /** Collapse a resolved AssistantMessage down to CAD's (text, thinking, usage) shape. */
 function collapse(msg: AssistantMessage): Json {
 	let text = "";
@@ -167,20 +149,6 @@ async function handleComplete(params: Json): Promise<Json> {
 	return collapse(result);
 }
 
-function modelInfo(m: Model<Api>): Json {
-	return {
-		id: m.id,
-		name: m.name,
-		api: m.api,
-		provider: m.provider,
-		input: m.input,
-		supportsTools: m.supportsTools ?? true,
-		reasoning: m.reasoning ?? false,
-		contextWindow: m.contextWindow ?? null,
-		cost: m.cost ?? null,
-	};
-}
-
 async function dispatch(method: string, params: Json): Promise<Json> {
 	switch (method) {
 		case "ping":
@@ -195,6 +163,30 @@ async function dispatch(method: string, params: Json): Promise<Json> {
 		}
 		case "complete":
 			return handleComplete(params);
+		case "models_list":
+			return handleModelsList(params);
+		case "cost_summary":
+			return handleCostSummary(params);
+		case "auth_list_providers":
+			return handleAuthListProviders();
+		case "auth_state":
+			return handleAuthState(params);
+		case "auth_validate_key":
+			return handleAuthValidateKey(params);
+		case "auth_set_key":
+			return handleAuthSetKey(params);
+		case "auth_remove_key":
+			return handleAuthRemoveKey(params);
+		case "auth_logout":
+			return handleAuthLogout(params);
+		case "auth_begin_oauth":
+			return handleAuthBeginOAuth(params);
+		case "auth_oauth_poll":
+			return handleAuthOAuthPoll(params);
+		case "auth_oauth_manual":
+			return handleAuthOAuthManual(params);
+		case "auth_oauth_cancel":
+			return handleAuthOAuthCancel(params);
 		default:
 			throw new Error(`unknown method: ${method}`);
 	}

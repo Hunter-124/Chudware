@@ -13,9 +13,11 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <unordered_set>
 #include <vector>
 
 #include "agent/http.h"
+#include "agent/omp_bridge_client.h"
 
 namespace aicad {
 namespace agent {
@@ -1059,6 +1061,63 @@ std::string humanize_provider_error(const std::string& raw) {
     return s.empty() ? "The model provider failed." : s;
 }
 
+namespace {
+// --------------------------------------------------------------------------- omp bridge
+// Build the bridge's messages[] wire shape from CAD's existing base.py-mirrored part
+// representation (text_part/image_part/user_message above). CAD's parts already carry
+// {type:"text",text} / {type:"image",path}, which is the exact CadPart shape
+// vendor/omp/bridge/src/bridge.ts's readPart/convertPart expects — this only re-validates and
+// filters to the two part kinds the bridge accepts, mirroring anthropic_block/openai_content/
+// gemini_part's same-shaped per-provider builders above (each is also a pure part -> wire-part
+// function).
+json omp_bridge_part(const json& part) {
+    if (pstr(part, "type") == "image") {
+        json p = json{{"type", "image"}, {"path", pstr(part, "path")}};
+        // Pass inline base64 data straight through when the caller supplied it instead of a
+        // path (image_part() above only ever builds path-based parts today; kept so a future
+        // caller can hand the bridge already-loaded bytes without a round-trip through disk).
+        if (part.contains("data") && part["data"].is_string()) p["data"] = part["data"];
+        if (part.contains("mime") && part["mime"].is_string()) p["mime"] = part["mime"];
+        return p;
+    }
+    return json{{"type", "text"}, {"text", pstr(part, "text")}};
+}
+
+json omp_bridge_messages(const json& messages) {
+    json out = json::array();
+    for (const auto& m : messages) {
+        std::string role = m.value("role", std::string("user"));
+        if (role != "assistant") role = "user";  // bridge.ts normalizes the same way
+        json content = json::array();
+        if (m.contains("content") && m["content"].is_array())
+            for (const auto& p : m["content"]) content.push_back(omp_bridge_part(p));
+        out.push_back(json{{"role", role}, {"content", content}});
+    }
+    return out;
+}
+
+}  // namespace
+
+namespace {
+// Provider ids routed through the OMP bun bridge (core/agent/omp_bridge_client.h,
+// vendor/omp/bridge/src/bridge.ts) instead of a native libcurl/WinHTTP branch below.
+//
+// TODO(omp-bridge-wiring): empty until the orchestrator populates this with the real catalog
+// provider ids once the provider picker + sign-in UI land (docs/omp-integration/
+// 01-DECISIONS.md "Providers"; ids must match what OMP's pi-catalog getBundledProviders()
+// returns, since providers.cpp forwards `provider` verbatim as the bridge's {provider,model}
+// params below). Until populated, is_omp_bridge_provider() always returns false and every
+// provider keeps resolving through its existing native branch.
+const std::unordered_set<std::string>& omp_bridge_provider_ids() {
+    static const std::unordered_set<std::string> kOmpBridgeProviders = {};
+    return kOmpBridgeProviders;
+}
+}  // namespace
+
+bool is_omp_bridge_provider(const std::string& provider) {
+    return omp_bridge_provider_ids().count(provider) != 0;
+}
+
 // --------------------------------------------------------------------------- complete
 CompleteResult complete(const std::string& provider, const json& cfg, const std::string& system,
                         const json& messages, int max_tokens) {
@@ -1100,6 +1159,61 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
     auto is_oauth_key = [](const std::string& k) {
         return k.rfind("sk-ant-oat", 0) == 0;
     };
+
+    // OMP bridge — providers routed to the bun sidecar (core/agent/omp_bridge_client.h)
+    // instead of a native branch below. See is_omp_bridge_provider()'s TODO for how the
+    // provider set gets populated; this branch is additive and never shadows a native
+    // provider id. Contract keys threaded through: name (== provider), model, max_tokens,
+    // reasoning_effort — no temperature (docs/omp-integration/01-DECISIONS.md).
+    if (is_omp_bridge_provider(provider)) {
+        std::string model = str_or(cfg, "model");
+        std::string effort = str_or(cfg, "reasoning_effort");
+        json params = {
+            {"provider", provider},
+            {"model", model},
+            {"system", system},
+            {"messages", omp_bridge_messages(messages)},
+            {"maxTokens", max_tokens},
+        };
+        if (!api_key.empty()) params["apiKey"] = api_key;
+        if (!base_url.empty()) params["baseUrl"] = base_url;
+        if (!effort.empty()) params["reasoningEffort"] = effort;
+
+        json result;
+        std::string bridge_err;
+        // 300 s: handleComplete() in bridge.ts awaits the FULL (non-streamed-to-us)
+        // completion before responding, so this has to tolerate a slow reasoning-model turn,
+        // not just RPC round-trip latency.
+        const bool ok = OmpBridgeClient::instance().call("complete", params, result, bridge_err,
+                                                          /*timeoutMs=*/300000);
+        res.model = model;
+        res.endpoint = "omp-bridge:" + provider;
+        if (!ok) {
+            res.error = "omp-bridge " + provider + ": " +
+                        (bridge_err.empty() ? std::string("transport error") : bridge_err);
+            res.error_excerpt = truncate_excerpt(res.error);
+            return finish(std::move(res));
+        }
+        res.text = result.value("text", std::string());
+        res.thinking = result.value("thinking", std::string());
+        if (result.value("stopReason", std::string()) == "error") {
+            std::string em = result.value("errorMessage", std::string("provider error"));
+            if (result.contains("errorStatus") && result["errorStatus"].is_number())
+                res.http_status = result["errorStatus"].get<int>();
+            res.error = "omp-bridge " + provider + ": " + em;
+            res.error_excerpt = truncate_excerpt(em);
+            return finish(std::move(res));
+        }
+        if (res.text.empty() && res.thinking.empty()) {
+            res.error = "omp-bridge " + provider + ": endpoint returned no completion";
+            res.error_excerpt = truncate_excerpt(res.error);
+            return finish(std::move(res));
+        }
+        // NOTE: result["usage"] (bridge.ts collapse()) has no CompleteResult field yet — cost
+        // accounting (01-DECISIONS.md "Cost + cache") is a later phase; not dropped silently,
+        // just not threaded through until that struct grows a usage member.
+        return finish(std::move(res));
+    }
 
     // Anthropic Messages API — classic x-api-key OR Claude Pro/Max OAuth bearer.
     // OAuth requires the Claude-Code-shaped system array + CCH billing hash + betas.

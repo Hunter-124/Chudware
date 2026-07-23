@@ -30,4 +30,4 @@ T-RF21. WASM-shot verify the gated states.
 
 - [x] No silent dead buttons on the web build for inventoried gaps.
 - [x] Capability flag reads the web_parity inventory (single source).
-- [ ] WASM + native shots; gate.sh green; REFACTOR_LOG handoff.
+- [x] WASM + native shots; gate.sh green; REFACTOR_LOG handoff.

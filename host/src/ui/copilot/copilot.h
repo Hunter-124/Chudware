@@ -75,6 +75,12 @@ struct BridgeModelMeta {
     int maxTokens = 0;       // max output tokens; 0 = unknown
     bool hasCost = false;
     double costIn = 0, costOut = 0, costCacheRead = 0, costCacheWrite = 0;  // $/Mtok
+    // Release/lifecycle metadata (populated by refreshBridgeModelCatalog from the model id/name;
+    // the OMP catalog itself carries no date). Drives per-provider newest-first sort + the
+    // "older / deprecated" grouping in the Providers tab.
+    std::string releaseDate;    // "YYYY-MM-DD" inferred from the id/name; "" when unknown
+    long releaseSort = 0;       // YYYYMMDD int key for sorting; 0 = unknown (sorts oldest)
+    bool deprecated = false;    // superseded/legacy family (inferred) -> grouped, hidden by default
 };
 // Fetch the full catalog (all providers) into the process cache; ~5-min TTL, async.
 void refreshBridgeModelCatalog(AppState& state, bool force);
@@ -112,6 +118,12 @@ void saveMaxSubagentDepth(int depth);
 // Persist the active document's conversations (the active one synced from state.chat) to
 // %APPDATA%/Chudware/chat_history.json. Safe to call any time; no-op if nothing to save.
 void persistChatHistory(AppState& state);
+
+// Debounced mid-turn flush of the active session's chat history (resume-safe: streaming
+// assistant text is written to disk ~1/s WHILE a turn runs, not only at completion).
+// `force` bypasses the timer. Call once per frame from whichever chat host is on screen —
+// the docked Copilot column OR the AI-tab workspace (which does not draw that column).
+void maybePersistChatHistoryDebounced(AppState& state, bool force);
 
 // Per-frame: if a chat-triggered accurate (OpenFOAM) CFD launched on the SimClient channel has
 // finished, post its Cd/Cl result onto the running chat bubble. No-op when nothing is pending.

@@ -2061,6 +2061,10 @@ void drawAiWorkspace(AppState& st) {
     // badge, the popup transcripts and the auto-pop of NEW live sub-agents work no matter
     // which view is selected — not just while the Agent Hub is showing.
     pollSubagentList(st);
+    // Resume-safe autosave: the docked Copilot column (which normally drives this) is not
+    // drawn while the AI tab is active, so flush streaming chat here too — a crash mid-turn
+    // keeps the assistant text on disk (drafts ride the shared composer's savePromptDraft).
+    maybePersistChatHistoryDebounced(st, /*force=*/false);
 
     // M8 plumbing: bind the Session Plan scope to the active chat session's id.
     s_ai.selSession = (st.activeConv >= 0 && st.activeConv < (int)st.conversations.size())

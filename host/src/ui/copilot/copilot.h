@@ -31,21 +31,19 @@ namespace ui {
 // running, `canRun` whether new jobs can be launched.
 void drawAIPanel(AppState& state, bool busy, bool canRun);
 
-// Shared AI settings fields (provider/model/auth, generation, privacy, manage-models).
-// Rendered by the Settings modal's AI tab as glass-grouped sections, and composed by
-// drawProviderModelPicker for any single-call site that still wants the whole form.
+// Shared AI settings fields (provider/model/auth, generation). Rendered by the Settings modal's
+// AI tab as glass-grouped sections. Privacy (offline mode) + assistant-thoughts live in the AI
+// Harness "Session knobs" grid now, and per-model visibility moved to Settings -> Providers
+// (per-provider model checkboxes) — so neither is a shared section anymore.
 // Returns true if a setting changed this frame (caller may persist).
 enum class AiSettingsSection {
     ProviderModel = 0,  // provider, model, sign-in / API key + status, vision
     Generation,         // reasoning effort, max response tokens, context window
-    Privacy,            // offline mode, thoughts
-    ManageModels,       // hide/show models in the chat picker
-    All,                // full form (Provider + Generation + ManageModels + Privacy)
+    All,                // full form (Provider + Generation)
 };
 bool drawAiSettingsSection(AppState& state, bool busy, AiSettingsSection section);
 
-// Full form: Provider + Generation + (Manage models unless slim) + Privacy.
-// `slim` drops Manage models (legacy flag kept for any compact caller).
+// Full form: Provider + Generation. (Single-call convenience; slim is a legacy no-op flag.)
 bool drawProviderModelPicker(AppState& state, bool busy, bool slim = false);
 
 // Probe local-endpoint model availability (agent_list_models) into state.providerModels.

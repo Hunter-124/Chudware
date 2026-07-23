@@ -144,7 +144,7 @@ static char* providerKeyBuf(Settings& s, int provider) {
 }
 
 // Availability helpers (defined with the model-dropdown section below; forward-declared so the
-// "Manage models" panel inside drawAiSettingsSection can call them).
+// provider/model section inside drawAiSettingsSection can call them).
 // providerUsable is public (copilot.h) — used by Settings role/Eng.Firm pickers too.
 bool providerUsable(AppState& st, int provider);  // def below; also declared in copilot.h
 static bool localModelLoaded(const ProviderModels& pm, const std::string& id);
@@ -170,8 +170,7 @@ static nlohmann::json jsonOptObj(const nlohmann::json& obj, const char* key) {
 }
 
 // Shared AI settings, split by section so Settings can glass-group them.
-// ProviderModel = provider + model + auth/status; Generation = effort/tokens/window;
-// Privacy = offline + thoughts; ManageModels = chat-picker visibility.
+// ProviderModel = provider + model + auth/status; Generation = effort/tokens/window.
 bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
     (void)busy;
     Settings& s = st.settings;
@@ -688,156 +687,6 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
 
     };
 
-    auto drawManageModels = [&]() {
-        dimText("Uncheck a model to hide it from the composer's model dropdown. Only available "
-                "models (keyed cloud / loaded local) appear there; this just trims that list.");
-        ImGui::Dummy(ImVec2(0, 2 * S));
-        const auto& pal2 = ui::palette;
-        int rowuid = 0;
-        // One toggle row: [x] Label .................... status
-        auto visRow = [&](const std::string& id, const std::string& label,
-                          const char* status, ImU32 statusCol) {
-            ImGui::PushID(rowuid++);
-            bool show = (s.hiddenModels.count(id) == 0);
-            if (ImGui::Checkbox("##vis", &show)) {
-                if (show) s.hiddenModels.erase(id);
-                else      s.hiddenModels.insert(id);
-                changed = true;
-            }
-            ImGui::SameLine();
-            ImGui::TextUnformatted(label.c_str());
-            if (status && status[0]) {
-                float tw = ImGui::CalcTextSize(status).x;
-                ImGui::SameLine(ImGui::GetContentRegionMax().x - tw);
-                ImGui::PushStyleColor(ImGuiCol_Text, statusCol);
-                ImGui::TextUnformatted(status);
-                ImGui::PopStyleColor();
-            }
-            ImGui::PopID();
-        };
-        const ImU32 okCol = ui::Palette::toU32(pal2.statusOk);
-        const ImU32 dimCol = ui::Palette::toU32(pal2.textDim);
-        const ImU32 warnCol = ui::Palette::toU32(pal2.statusWarn);
-        dimText("Each provider is a category: the checkbox bulk-toggles the whole provider on/off; "
-                "expand it to hide individual models. Off = hidden from the composer's model picker.");
-        ImGui::Dummy(ImVec2(0, 2 * S));
-
-        // One collapsible category header: [x] bulk-on/off checkbox + an expander showing the model
-        // count. Returns whether the body (the model rows) should be drawn.
-        auto catHeader = [&](const std::string& key, int n) -> bool {
-            bool enabled = st.settings.disabledProviders.count(key) == 0;
-            ImGui::PushID(("cat_" + key).c_str());
-            if (ImGui::Checkbox("##en", &enabled)) {
-                if (enabled) st.settings.disabledProviders.erase(key);
-                else         st.settings.disabledProviders.insert(key);
-                changed = true;
-            }
-            ImGui::PopID();
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip(enabled ? "Turn this whole provider OFF (hide all its models)"
-                                          : "Turn this provider back ON");
-            ImGui::SameLine();
-            char hdr[128];
-            std::snprintf(hdr, sizeof(hdr), "%s  (%d)%s###hdr_%s", ui::categoryLabel(key), n,
-                          enabled ? "" : "   - off", key.c_str());
-            return ImGui::CollapsingHeader(hdr);
-        };
-        auto catEnabled = [&](const std::string& key) {
-            return st.settings.disabledProviders.count(key) == 0;
-        };
-
-        // Built-in cloud providers (Gemini / Anthropic / OpenAI / xAI / Cursor / Kimi Code / ZenMux).
-        for (int pv : {ui::PROV_GEMINI, ui::PROV_ANTHROPIC, ui::PROV_OPENAI, ui::PROV_XAI,
-                       ui::PROV_CURSOR, ui::PROV_KIMISUB, ui::PROV_ZENMUX}) {
-            std::string key = ui::providerCatKey(pv);
-            int n = 0;
-            for (const auto& m : ui::builtinModels()) if (m.provider == pv) ++n;
-            if (catHeader(key, n)) {
-                bool en = catEnabled(key);
-                if (!en) ImGui::BeginDisabled();
-                ImGui::Indent(14 * S);
-                bool keyed = providerUsable(st, pv);
-                for (const auto& m : ui::builtinModels()) {
-                    if (m.provider != pv) continue;
-                    visRow(m.id, m.label, keyed ? "available" : "needs key", keyed ? okCol : warnCol);
-                }
-                ImGui::Unindent(14 * S);
-                if (!en) ImGui::EndDisabled();
-            }
-        }
-        // Cloud services as their own categories. OpenRouter is discovered LIVE so its category
-        // lists every currently-free model (plus curated paid presets); Alibaba/DeepSeek/Moonshot
-        // use curated presets. Moonshot is listed here for visibility even when not the active
-        // provider (models appear in the chat picker only once keys.moonshot is set).
-        for (const char* svc : {"openrouter", "alibaba", "deepseek", "moonshot"}) {
-            std::vector<OpenRouterModel> rows;
-            if (std::strcmp(svc, "openrouter") == 0) {
-                rows = openRouterModels(st);
-            } else {
-                for (const auto& p : ui::cloudPresets())
-                    if (std::strcmp(ui::cloudServiceKey(p.baseUrl), svc) == 0)
-                        rows.push_back({p.id, p.label, p.vision, false});
-            }
-            if (rows.empty()) continue;
-            if (catHeader(svc, (int)rows.size())) {
-                bool en = catEnabled(svc);
-                if (!en) ImGui::BeginDisabled();
-                ImGui::Indent(14 * S);
-                if (std::strcmp(svc, "openrouter") == 0)
-                    dimText("Free models discovered live from OpenRouter (cost $0; still need a key "
-                            "to run). Paid presets are listed too.");
-                else if (std::strcmp(svc, "moonshot") == 0)
-                    dimText("Moonshot (Kimi) is configured but not the active provider by default. "
-                            "Set keys.moonshot below / in Providers; pick a Kimi model when you want it.");
-                for (const auto& r : rows)
-                    visRow(r.id, r.label, r.free ? "free" : (r.vision ? "vision" : "paid"),
-                           r.free ? okCol : dimCol);
-                ImGui::Unindent(14 * S);
-                if (!en) ImGui::EndDisabled();
-            }
-        }
-        // Local discovered models (deduped across the local provider pair).
-        {
-            const ProviderModels& lpm = st.providerModels[ui::PROV_LOCAL];
-            std::vector<std::string> ids;
-            std::set<std::string> seen;
-            for (const auto& id : lpm.models) if (seen.insert(id).second) ids.push_back(id);
-            if (catHeader("local", (int)ids.size())) {
-                bool en = catEnabled("local");
-                if (!en) ImGui::BeginDisabled();
-                ImGui::Indent(14 * S);
-                if (ids.empty()) {
-                    dimText("No local models discovered - start your local model server.");
-                } else {
-                    for (const auto& id : ids) {
-                        bool loaded = localModelLoaded(lpm, id);
-                        visRow(id, id,
-                               lpm.loadedKnown ? (loaded ? "loaded" : "not loaded") : "available",
-                               loaded ? okCol : dimCol);
-                    }
-                }
-                ImGui::Unindent(14 * S);
-                if (!en) ImGui::EndDisabled();
-            }
-        }
-    };
-
-    auto drawPrivacy = [&]() {
-    // ---- privacy / offline ----
-    // Keep labels short enough for narrow columns / high uiScale (CalcTextSize fit).
-    if (ImGui::Checkbox("Offline mode (local only)", &s.offlineMode))
-        changed = true;
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Refuses any cloud provider (Gemini, Anthropic, OpenAI, xAI, OpenRouter).\n"
-                          "Only a local loopback endpoint is allowed. Enforced before every run.");
-    // Session-local (not persisted): matches the Copilot overlay Permissions tab.
-    ImGui::Checkbox("Show assistant thoughts", &gShowThinking);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Show the AI's reasoning steps inline in the conversation.");
-    dimText("Telemetry is not collected \xe2\x80\x94 Chudware does not phone home.");
-
-    };
-
     switch (section) {
     case AiSettingsSection::ProviderModel:
         drawProviderModel();
@@ -845,42 +694,19 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
     case AiSettingsSection::Generation:
         drawGeneration();
         break;
-    case AiSettingsSection::Privacy:
-        drawPrivacy();
-        break;
-    case AiSettingsSection::ManageModels:
-        drawManageModels();
-        break;
     case AiSettingsSection::All:
         drawProviderModel();
         ImGui::Dummy(ImVec2(0, 8 * S));
         ImGui::SeparatorText("Generation");
         drawGeneration();
-        ImGui::Dummy(ImVec2(0, 6 * S));
-        if (ImGui::CollapsingHeader("Manage models (chat picker)"))
-            drawManageModels();
-        ImGui::Dummy(ImVec2(0, 6 * S));
-        ImGui::SeparatorText("Privacy");
-        drawPrivacy();
         break;
     }
     return changed;
 }
 
-// Full form: Provider + Generation + (Manage models unless slim) + Privacy.
+// Full form: Provider + Generation. (Single-call convenience; slim is a legacy no-op flag.)
 bool drawProviderModelPicker(AppState& st, bool busy, bool slim) {
-    if (slim) {
-        // Compact: provider/model/auth + generation + privacy (no manage-models dump).
-        bool changed = false;
-        changed |= drawAiSettingsSection(st, busy, AiSettingsSection::ProviderModel);
-        ImGui::Dummy(ImVec2(0, 6 * ui::uiScale));
-        ImGui::SeparatorText("Generation");
-        changed |= drawAiSettingsSection(st, busy, AiSettingsSection::Generation);
-        ImGui::Dummy(ImVec2(0, 6 * ui::uiScale));
-        ImGui::SeparatorText("Privacy");
-        changed |= drawAiSettingsSection(st, busy, AiSettingsSection::Privacy);
-        return changed;
-    }
+    (void)slim;
     return drawAiSettingsSection(st, busy, AiSettingsSection::All);
 }
 
@@ -1072,7 +898,7 @@ static bool localModelLoaded(const ProviderModels& pm, const std::string& id) {
     return std::find(pm.loaded.begin(), pm.loaded.end(), id) != pm.loaded.end();
 }
 
-// Has the user hidden this model from the chat picker (Settings → AI → Manage models)?
+// Has the user hidden this model from the chat picker (Settings → Providers model list)?
 static bool modelHidden(AppState& st, const std::string& id) {
     return st.settings.hiddenModels.count(id) != 0;
 }
@@ -1712,6 +1538,42 @@ static bool modelRow(AppState& st, int provider, const std::string& id, const st
     return clicked && usable;
 }
 
+// One-time model-picker default seeding: on first run keep only the top 3 models per provider
+// enabled (the rest go into hiddenModels) so a fresh install's composer picker isn't flooded.
+// Runs once — settings.modelDefaultsSeeded flips and the user's explicit choices win after that.
+// The ACTIVE model is never hidden. Bridge (OMP) seeding needs the async catalog; when it hasn't
+// arrived yet we still seed the builtin half so the picker is sane on builtin alone.
+static void seedModelDefaultsOnce(AppState& st) {
+    if (st.settings.modelDefaultsSeeded) return;
+    const std::string active = st.settings.model;
+    auto hideUnlessActive = [&](const std::string& id) {
+        if (id != active) st.settings.hiddenModels.insert(id);
+    };
+    // (a) Built-in catalog, in catalog order: first 3 per provider stay enabled.
+    {
+        std::map<int, int> kept;
+        for (const auto& m : ui::builtinModels()) {
+            int& n = kept[m.provider];
+            if (n < 3) { ++n; continue; }
+            hideUnlessActive(m.id);
+        }
+    }
+    // (b) Bridge (OMP) catalog, pre-sorted per provider (non-deprecated first, newest first):
+    // the first 3 non-deprecated rows stay enabled; everything else — including ALL deprecated
+    // rows — hides. Skipped while the catalog is empty (first async fetch not back yet).
+    if (!ui::bridgeModelCatalog().empty()) {
+        std::map<std::string, int> kept;
+        for (const auto& m : ui::bridgeModelCatalog()) {
+            int& n = kept[m.provider];
+            if (!m.deprecated && n < 3) { ++n; continue; }
+            hideUnlessActive(m.id);
+        }
+    }
+    st.settings.hiddenModels.erase(active);  // the active model always stays visible
+    st.settings.modelDefaultsSeeded = true;
+    saveSettings(st.settings);
+}
+
 // The model dropdown body (hosted in a popup): a search box with a compact glass gear on the
 // same row (opens Settings), the usable models with a checkmark on the current one, and a muted
 // hint for unkeyed providers. Picking a model sets provider+model and closes the popup.
@@ -1722,6 +1584,7 @@ void drawModelDropdown(AppState& st, bool busy) {
     static char s_modelSearch[64] = "";
     refreshModelAvailability(st, false);
     refreshBridgeModelCatalog(st, false);  // OMP catalog sublabels (ctx/cost/capability chips)
+    seedModelDefaultsOnce(st);             // first-run top-3-per-provider seeding; no-op after
 
     if (ImGui::IsWindowAppearing()) { s_modelSearch[0] = 0; ImGui::SetKeyboardFocusHere(); }
 
@@ -1793,14 +1656,39 @@ void drawModelDropdown(AppState& st, bool busy) {
 
     // Usable built-in cloud models (provider has a key), minus any the user hid or whose provider
     // category is bulk-disabled.
+    std::set<std::string> shownIds;  // builtin ids already emitted — bridge-catalog dedup below
     for (const auto& m : ui::builtinModels()) {
         if (catOff(ui::providerCatKey(m.provider))) continue;
         if (!providerUsable(st, m.provider) || !matchq(m.label, providerShort(m.provider), m.id)) continue;
         if (modelHidden(st, m.id)) continue;
         ++shown;
+        shownIds.insert(m.id);
         if (modelRow(st, m.provider, m.id, m.label, true, uid++)) {
             st.settings.provider = m.provider;
             std::strncpy(st.settings.model, m.id.c_str(), sizeof(st.settings.model) - 1);
+            picked = true;
+        }
+    }
+    // Bridge (OMP) catalog models for SIGNED-IN bridge providers mapped to a composer slot
+    // (ZenMux / Kimi Code): this is how Providers-tab selections surface in the composer.
+    // Other bridge providers have no composer routing path. Respects per-provider hide choices
+    // and dedups against builtin ids already emitted above.
+    for (const auto& m : ui::bridgeModelCatalog()) {
+        int slot = -1;
+        if (m.provider == "zenmux") slot = ui::PROV_ZENMUX;
+        else if (m.provider == "kimi-code") slot = ui::PROV_KIMISUB;
+        else continue;
+        if (st.signedInBridgeProviders.count(m.provider) == 0) continue;  // not signed in
+        if (m.deprecated) continue;
+        if (modelHidden(st, m.id)) continue;
+        if (shownIds.count(m.id) != 0) continue;
+        if (!matchq(m.name, providerShort(slot), m.id)) continue;
+        ++shown;
+        if (modelRow(st, slot, m.id, m.name, true, uid++)) {
+            st.settings.provider = slot;
+            std::strncpy(st.settings.model, m.id.c_str(), sizeof(st.settings.model) - 1);
+            if (slot == ui::PROV_ZENMUX)
+                st.settings.baseUrl[0] = 0;  // bridge-routed: leave base_url empty/default
             picked = true;
         }
     }

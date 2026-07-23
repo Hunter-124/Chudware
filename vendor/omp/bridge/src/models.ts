@@ -5,6 +5,7 @@
  */
 import { getBundledModel, getBundledModels, getBundledProviders } from "@oh-my-pi/pi-catalog";
 import type { Api, Model } from "@oh-my-pi/pi-catalog";
+import { DEPRECATED_CATALOG, extraModels } from "./catalog-extra";
 import { asObject, num, optStr, str, type Json } from "./json";
 
 /** The branded provider-id parameter `getBundledModel`/`getBundledModels` accept. */
@@ -16,6 +17,10 @@ export function resolveModel(provider: string, modelId: string, baseUrl?: string
 	const providerId = provider as ProviderId;
 	// getBundledModel is typed non-optional but returns undefined on a registry miss.
 	let model = getBundledModel(providerId, modelId) as Model<Api> | undefined;
+	if (!model) {
+		// CAD-side additions (kimi-k3 etc.) missing from the pinned vendor catalog.
+		model = extraModels(provider).find((m) => m.id === modelId);
+	}
 	if (!model) {
 		// Unknown id under a known provider: clone the provider's first bundled model as a
 		// template and retarget it, so proxied/newer ids still stream through the right API.
@@ -53,7 +58,11 @@ export function handleModelsList(params: Json): Json {
 	const providers = provider ? [provider] : getBundledProviders();
 	const models: Json[] = [];
 	for (const p of providers) {
-		for (const m of getBundledModels(p as ProviderId)) models.push(modelInfo(m));
+		for (const m of getBundledModels(p as ProviderId)) {
+			if (DEPRECATED_CATALOG[p]?.[m.id] === true) continue;
+			models.push(modelInfo(m));
+		}
+		for (const m of extraModels(p)) models.push(modelInfo(m));
 	}
 	return { models };
 }

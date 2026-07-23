@@ -16,6 +16,7 @@
 #pragma once
 #include <atomic>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -139,6 +140,36 @@ private:
 using AssistCompleteFn =
     std::function<std::string(const std::string& system, const std::string& body, std::string* err)>;
 AssistCompleteFn make_assist_provider(const json& descriptor);
+
+// --- compliance_mode=redact outbound scrub (WS3; mirrors services/agent/redaction.py) ---
+// Bidirectional per-request placeholder map. placeholder_for() is stable: the same original
+// value always maps to the same token within one RedactionMap (one map per complete() call,
+// matching the Python per-session wrapper semantics at request granularity).
+class RedactionMap {
+public:
+    // Return the existing or newly-allocated placeholder (CATEGORY_N) for `original`.
+    std::string placeholder_for(const std::string& original, const std::string& category);
+    // Map placeholders back to originals; unknown tokens pass through unchanged.
+    std::string rehydrate(const std::string& text) const;
+    bool empty() const { return reverse_.empty(); }
+
+private:
+    std::unordered_map<std::string, std::string> forward_;   // original -> placeholder
+    std::unordered_map<std::string, std::string> reverse_;   // placeholder -> original
+    std::unordered_map<std::string, int> counters_;          // per-category counters
+};
+// Gate: true ONLY when compliance_mode(cfg)=="redact" AND the provider resolves to a
+// NON-loopback (cloud) endpoint. Loopback/local providers are never wrapped. local_only /
+// offline_mode continue to REFUSE non-loopback in config.cpp resolve_provider (unchanged).
+bool redaction_active(const std::string& provider, const json& cfg);
+// Deterministic GSL-aware scrub: dimensions/units, ISO fits, tolerances, material grades,
+// part/drawing numbers, and project identifiers -> stable placeholders (DIM_1, MAT_1, ...).
+std::string redaction_scrub_text(const std::string& text, RedactionMap& map);
+// Inbound rehydrate: map placeholders back to the original controlled values.
+std::string redaction_rehydrate_text(const std::string& text, const RedactionMap& map);
+// Deep-scrub a base.py-shaped message list (string/array content, tool-call args). Image
+// parts are replaced with a text marker — redact mode blocks outbound images.
+json redaction_scrub_messages(const json& messages, RedactionMap& map);
 
 // --- high-level dispatch ----------------------------------------------------
 // complete(): pick anthropic vs openai/llamacpp vs the OMP bridge, build the request,

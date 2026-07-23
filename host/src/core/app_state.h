@@ -172,6 +172,16 @@ struct Settings {
     // Serialized as "disabled_providers".
     std::set<std::string> disabledProviders;
 
+    // One-time model-picker default seeding: on first run we keep only the top 2-3 models per
+    // provider enabled (rest added to hiddenModels), so the picker isn't flooded. Once seeded we
+    // never re-seed (the user's explicit choices win). Serialized "model_defaults_seeded".
+    bool modelDefaultsSeeded = false;
+    // ITAR/IP outbound redaction (WS3 compliance_mode). "off" | "redact" | "local_only".
+    // "redact" wraps cloud traffic: deterministic scrub (+ optional local-LLM residual pass) with
+    // inbound rehydrate, images blocked. "local_only" refuses non-loopback (== offlineMode).
+    // Enforced in the native C++ provider path (core/agent). Serialized top-level "compliance_mode".
+    char complianceMode[16] = "off";
+
     // ---- Experimental AI features (Settings → Experimental) -> config.json "experimental" ----
     // All default-off and additive: when off, the resolved provider + agent loop are byte-identical
     // to the non-experimental path. See docs/EXPERIMENTAL_AI.md.
@@ -1263,6 +1273,11 @@ struct AppState {
     // ---- model picker availability (filled by the agent_list_models probe) ----
     ProviderModels providerModels[10];       // indexed by ui::ProviderIndex (PROV_COUNT=10; PROV_ZENMUX=9). Literal: model_registry.h not included here.
     std::atomic<bool> modelProbeInFlight{false};
+    // Bridge (OMP) provider ids currently signed in (state != signed_out), populated by the
+    // Settings->Providers poll (settings_modal.cpp pollOmpProviderList). Read by the composer
+    // model dropdown so ONLY signed-in bridge providers' catalog models appear (no clutter from
+    // providers the user hasn't authed). Runtime-only (not persisted).
+    std::set<std::string> signedInBridgeProviders;
 
     std::vector<char> chatInput{std::vector<char>(2048, 0)};
     std::string modelInfo;

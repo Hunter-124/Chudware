@@ -2379,3 +2379,123 @@ TEST_CASE("cancel_run cascades to mission sub-runs") {
     unregister_run_control("mission-1-t0");
     unregister_run_control("mission-2");
 }
+
+// --------------------------------------------------------------------------- redaction (WS3)
+TEST_CASE("compliance_mode normalization") {
+    CHECK(compliance_mode(json::object()) == "off");
+    CHECK(compliance_mode(json{{"compliance_mode", "off"}}) == "off");
+    CHECK(compliance_mode(json{{"compliance_mode", "REDACT"}}) == "redact");
+    CHECK(compliance_mode(json{{"compliance_mode", "local-only"}}) == "local_only");
+    CHECK(compliance_mode(json{{"compliance_mode", "localonly"}}) == "local_only");
+    CHECK(compliance_mode(json{{"compliance_mode", "garbage"}}) == "off");
+    CHECK(local_only_enabled(json{{"compliance_mode", "local_only"}}));
+    CHECK(local_only_enabled(json{{"offline_mode", true}}));
+    CHECK_FALSE(local_only_enabled(json{{"compliance_mode", "redact"}}));
+}
+
+TEST_CASE("redaction scrub: dimension + part number round-trip") {
+    RedactionMap map;
+    const std::string src =
+        "Machine the boss to 12.345 mm in 6061-T6 per P/N ABC-123, tol ±0.02 mm, bore H7/g6.";
+    std::string scrubbed = redaction_scrub_text(src, map);
+    // Controlled values never leave in cleartext.
+    CHECK(scrubbed.find("12.345") == std::string::npos);
+    CHECK(scrubbed.find("ABC-123") == std::string::npos);
+    CHECK(scrubbed.find("6061-T6") == std::string::npos);
+    CHECK(scrubbed.find("±0.02") == std::string::npos);
+    CHECK(scrubbed.find("H7/g6") == std::string::npos);
+    // Stable placeholders went in their place.
+    CHECK(scrubbed.find("DIM_") != std::string::npos);
+    CHECK(scrubbed.find("MAT_1") != std::string::npos);
+    CHECK(scrubbed.find("PN_1") != std::string::npos);
+    // Placeholders are stable: the same original maps to the same token on a later scrub.
+    std::string again = redaction_scrub_text("recheck 12.345 mm and P/N ABC-123", map);
+    CHECK(again.find("12.345") == std::string::npos);
+    CHECK(again.find("ABC-123") == std::string::npos);
+    CHECK(redaction_rehydrate_text(again, map) == "recheck 12.345 mm and P/N ABC-123");
+    // Inbound rehydrate restores the real values (round-trip through the wire shape).
+    std::string inbound = scrubbed;  // model echoes the scrubbed text back
+    CHECK(redaction_rehydrate_text(inbound, map) == src);
+    CHECK(redaction_rehydrate_text("set " + scrubbed, map) == "set " + src);
+    // Unknown placeholder tokens pass through untouched.
+    CHECK(redaction_rehydrate_text("note DIM_999 here", map) == "note DIM_999 here");
+}
+
+TEST_CASE("redaction gate: mode=off is a no-op, never wraps") {
+    CHECK_FALSE(redaction_active("anthropic", json::object()));
+    CHECK_FALSE(redaction_active("anthropic", json{{"compliance_mode", "off"}}));
+    CHECK_FALSE(redaction_active("openai", json{{"compliance_mode", "off"},
+                                                {"base_url", "https://api.openai.com/v1"}}));
+    // And with no map allocated, scrub/rehydrate on an empty map are identity.
+    RedactionMap map;
+    CHECK(redaction_rehydrate_text("plain text 12.345 mm", map) == "plain text 12.345 mm");
+}
+
+TEST_CASE("redaction gate: loopback providers are never wrapped in redact mode") {
+    json redact = json{{"compliance_mode", "redact"}};
+    // Cloud (non-loopback) providers ARE wrapped.
+    CHECK(redaction_active("anthropic", redact));
+    CHECK(redaction_active("anthropic-sub", redact));
+    CHECK(redaction_active("gemini", redact));
+    CHECK(redaction_active("xai", redact));
+    CHECK(redaction_active("moonshot", redact));
+    json cloud_oai = redact;
+    cloud_oai["base_url"] = "https://api.openai.com/v1";
+    CHECK(redaction_active("openai", cloud_oai));
+    // Loopback/local providers are NEVER wrapped, even in redact mode.
+    CHECK_FALSE(redaction_active("mock", redact));
+    CHECK_FALSE(redaction_active("llamacpp", redact));
+    json local_oai = redact;
+    local_oai["base_url"] = "http://localhost:1234/v1";
+    CHECK_FALSE(redaction_active("openai", local_oai));
+    json flagged = redact;
+    flagged["offline_safe"] = true;
+    CHECK_FALSE(redaction_active("custom-local", flagged));
+}
+
+TEST_CASE("redaction scrub_messages blocks images outbound") {
+    RedactionMap map;
+    json messages = json::array({user_message(json::array(
+        {text_part("bore 12.345 mm, see screenshot"), image_part("/tmp/shot.png")}))});
+    json out = redaction_scrub_messages(messages, map);
+    REQUIRE(out.is_array());
+    REQUIRE(out.size() == 1);
+    json content = out[0]["content"];
+    REQUIRE(content.is_array());
+    REQUIRE(content.size() == 2);
+    // Text part scrubbed.
+    CHECK(content[0].value("type", std::string()) == "text");
+    CHECK(content[0].value("text", std::string()).find("12.345") == std::string::npos);
+    // Image part dropped and replaced with the compliance marker.
+    CHECK(content[1].value("type", std::string()) == "text");
+    CHECK(content[1].value("text", std::string()) ==
+          "[image redacted — compliance_mode=redact blocks outbound images]");
+    CHECK(content[1].value("text", std::string()).find("/tmp/shot.png") == std::string::npos);
+}
+
+TEST_CASE("compliance_mode=local_only refuses non-loopback, redact threads descriptor") {
+    // local_only reuses the offline machinery: cloud refused before any network use.
+    json refused = resolve_provider(std::string("anthropic"),
+                                    json{{"compliance_mode", "local_only"},
+                                         {"api_key", "sk-test"}},
+                                    json::object());
+    REQUIRE(refused.is_object());
+    CHECK(refused.contains("error"));
+    // A loopback openai endpoint stays allowed under local_only.
+    json local = resolve_provider(std::string("openai"),
+                                  json{{"compliance_mode", "local_only"},
+                                       {"openai", {{"base_url", "http://localhost:1234/v1"}}}},
+                                  json::object());
+    REQUIRE(local.is_object());
+    CHECK_FALSE(local.contains("error"));
+    CHECK(local.value("offline_safe", false) == true);
+    // redact mode does NOT refuse cloud — it threads the mode so complete() wraps traffic.
+    json redact = resolve_provider(std::string("anthropic"),
+                                   json{{"compliance_mode", "redact"},
+                                        {"api_key", "sk-test"}},
+                                   json::object());
+    REQUIRE(redact.is_object());
+    CHECK_FALSE(redact.contains("error"));
+    CHECK(redact.value("compliance_mode", std::string()) == "redact");
+    CHECK(redact.value("offline_safe", true) == false);
+}

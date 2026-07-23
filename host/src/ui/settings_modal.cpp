@@ -1089,7 +1089,7 @@ static void pollOmpProviderList(AppState& st, bool force) {
     s_omp.lastListPoll = now;
     s_omp.listInFlight = true;
     st.rpc.call("agent_provider_list", nlohmann::json::object(),
-                [](const core::RpcResult& r) {
+                [&st](const core::RpcResult& r) {
         s_omp.listInFlight = false;
         if (ompRpcAbsent(r)) {
             s_omp.available = false;   // permanent degrade → legacy sections
@@ -1140,6 +1140,13 @@ static void pollOmpProviderList(AppState& st, bool force) {
             if (ra != rb) return ra < rb;
             return a.label < b.label;
         });
+        // Sole writer of the signed-in bridge set: anything with credentials
+        // (key_set / oauth_connected / connected / error-with-creds) counts;
+        // only a plain signed_out state excludes a provider.
+        st.signedInBridgeProviders.clear();
+        for (const auto& row : s_omp.rows)
+            if (!row.state.empty() && row.state != "signed_out")
+                st.signedInBridgeProviders.insert(row.id);
         if (s_omp.selectedId.empty() && !s_omp.rows.empty())
             s_omp.selectedId = s_omp.rows.front().id;
     });
@@ -1661,6 +1668,26 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
         std::snprintf(modelsTitle, sizeof(modelsTitle), "Models (%d)",
                       count > 0 ? count : prov.modelsAvailable);
         settingsGlassSectionBegin("##omp_models", modelsTitle);
+
+        if (count > 0) {
+            if (ImGui::SmallButton("Select all")) {
+                for (const auto& m : ui::bridgeModelCatalog())
+                    if (m.provider == prov.id) st.settings.hiddenModels.erase(m.id);
+                saveSettings(st.settings);
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Show every catalog model for this provider in the "
+                                  "copilot model picker.");
+            ImGui::SameLine(0, 6.0f * sc);
+            if (ImGui::SmallButton("Clear")) {
+                for (const auto& m : ui::bridgeModelCatalog())
+                    if (m.provider == prov.id) st.settings.hiddenModels.insert(m.id);
+                saveSettings(st.settings);
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Hide every catalog model for this provider from the "
+                                  "copilot model picker.");
+        }
 
         static char s_modelSearchBuf[64] = "";
         ImGui::SetNextItemWidth(-1);
@@ -3216,6 +3243,24 @@ static void drawHarnessSessionKnobs(AppState& st, float sc) {
         ImGui::Checkbox("Project memory (per-folder)", &settings.memoryEnabled);
         helpMarker("Remembers decisions and notes under the PLM project "
                    "(.plm/memory.db). Auto-created; recall is token-budgeted.");
+
+        ImGui::TableNextColumn();
+        {
+            bool redact = std::strcmp(settings.complianceMode, "redact") == 0;
+            if (ImGui::Checkbox("Redact sensitive data (local, IP-safe)", &redact)) {
+                std::memset(settings.complianceMode, 0, sizeof(settings.complianceMode));
+                std::strncpy(settings.complianceMode, redact ? "redact" : "off",
+                             sizeof(settings.complianceMode) - 1);
+                saveSettings(st.settings);
+            }
+            helpMarker("Scrubs dimensions, materials, part/drawing numbers, and project "
+                       "ids from outbound cloud traffic and rehydrates replies; images "
+                       "are blocked. Uses your local redaction-role model (Settings -> "
+                       "AI -> Roles -> redaction) for a residual pass. Compliance/IP "
+                       "protection for cloud providers.");
+        }
+        ImGui::TableNextColumn();
+        ImGui::Dummy(ImVec2(1, ImGui::GetFrameHeight()));
         ImGui::EndTable();
     }
 
@@ -3335,6 +3380,48 @@ static void saveAgentConfigValue(const char* key, const nlohmann::json& value) {
     } catch (...) {}
 }
 
+// Nested agent.<obj>.<key> variants (e.g. agent.compaction.supersede_reads): same
+// load-modify-write recipe, ensuring the intermediate object exists on write.
+static bool loadAgentConfigNestedBool(const char* obj, const char* key, bool fallback) {
+    bool v = fallback;
+    try {
+        std::ifstream in(configPath());
+        if (in) {
+            nlohmann::json j;
+            in >> j;
+            if (j.is_object()) {
+                auto agent = j.value("agent", nlohmann::json::object());
+                if (agent.is_object() && agent.contains(obj) && agent[obj].is_object() &&
+                    agent[obj].contains(key) && agent[obj][key].is_boolean())
+                    v = agent[obj][key].get<bool>();
+            }
+        }
+    } catch (...) {}
+    return v;
+}
+static void saveAgentConfigNestedBool(const char* obj, const char* key, bool value) {
+    try {
+        nlohmann::json j = nlohmann::json::object();
+        {
+            std::ifstream in(configPath());
+            if (in) {
+                nlohmann::json old;
+                in >> old;
+                if (old.is_object()) j = std::move(old);
+            }
+        }
+        if (!j.contains("agent") || !j["agent"].is_object())
+            j["agent"] = nlohmann::json::object();
+        if (!j["agent"].contains(obj) || !j["agent"][obj].is_object())
+            j["agent"][obj] = nlohmann::json::object();
+        j["agent"][obj][key] = value;
+        const std::string path = configPath();
+        const std::string tmp = path + ".tmp";
+        std::ofstream(tmp) << j.dump(2);
+        std::rename(tmp.c_str(), path.c_str());
+    } catch (...) {}
+}
+
 // Memory & Learning + Workspace visibility knobs (Settings > AI > Harness).
 // 2-col grid like the session knobs above. Backend/learning/cache knobs persist to
 // config.json agent.* via the recipe above; visibility knobs persist via ui/ai/ai_prefs.
@@ -3344,6 +3431,10 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
     static bool s_loaded = false;
     static int s_memBackend = 0;      // 0 sqlite | 1 mnemopi  (agent.memory_backend)
     static int s_compBackend = 0;     // 0 builtin | 1 omp     (agent.compaction_backend)
+    static int s_compStrategy = 0;    // 0 off | 1 snapcompact | 2 shake | 3 summary
+                                      // (agent.compaction_strategy)
+    static bool s_supersedeReads = true;  // agent.compaction.supersede_reads
+    static bool s_dropUseless = true;     // agent.compaction.drop_useless
     static bool s_learn = true;       // agent.memory_learn
     static int s_verbosity = 2;       // ui::aiUiVerbosity (0 quiet | 1 normal | 2 full)
     static bool s_follow = true;      // ui::aiFollowActiveSession
@@ -3353,6 +3444,13 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
         s_loaded = true;
         s_memBackend = (loadAgentConfigString("memory_backend", "sqlite") == "mnemopi") ? 1 : 0;
         s_compBackend = (loadAgentConfigString("compaction_backend", "builtin") == "omp") ? 1 : 0;
+        {
+            const std::string cs = loadAgentConfigString("compaction_strategy", "off");
+            s_compStrategy = cs == "snapcompact" ? 1 : cs == "shake" ? 2
+                           : cs == "summary" ? 3 : 0;
+        }
+        s_supersedeReads = loadAgentConfigNestedBool("compaction", "supersede_reads", true);
+        s_dropUseless = loadAgentConfigNestedBool("compaction", "drop_useless", true);
         s_learn = loadAgentConfigBool("memory_learn", true);
         s_verbosity = ui::aiUiVerbosity();
         s_follow = ui::aiFollowActiveSession();
@@ -3362,6 +3460,7 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
 
     static const char* kMemBackends[] = {"SQLite", "Mnemopi"};
     static const char* kCompBackends[] = {"Builtin", "OMP snapcompact"};
+    static const char* kCompStrategies[] = {"Off", "Snapcompact", "Shake", "Summary"};
     static const char* kVerbosity[] = {"Quiet", "Normal", "Full"};
 
     if (ImGui::BeginTable("##memory_learning", 2,
@@ -3391,6 +3490,22 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
             if (ImGui::Combo("##comp_backend", &s_compBackend, kCompBackends, 2))
                 saveAgentConfigValue("compaction_backend", s_compBackend == 1 ? "omp" : "builtin");
         }
+        ImGui::TableNextColumn();
+        {
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted("Compaction strategy");
+            ImGui::SameLine();
+            helpMarker("How a compaction pass rewrites an overflowing transcript. "
+                       "Off = truncate only (default). Snapcompact = snapshot-style "
+                       "archive. Shake = drop low-value turns. Summary = model-written "
+                       "recap. Saved to config.json agent.compaction_strategy.");
+            ImGui::SetNextItemWidth(-1.0f);
+            if (ImGui::Combo("##comp_strategy", &s_compStrategy, kCompStrategies, 4))
+                saveAgentConfigValue("compaction_strategy",
+                                     s_compStrategy == 1 ? "snapcompact"
+                                     : s_compStrategy == 2 ? "shake"
+                                     : s_compStrategy == 3 ? "summary" : "off");
+        }
 
         ImGui::TableNextColumn();
         ImGui::Checkbox("Project memory (per-folder)", &settings.memoryEnabled);
@@ -3414,7 +3529,17 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
             ImGui::Dummy(ImVec2(1, ImGui::GetFrameHeight()));
         }
         ImGui::TableNextColumn();
-        ImGui::Dummy(ImVec2(1, ImGui::GetFrameHeight()));
+        if (ImGui::Checkbox("Supersede stale reads", &s_supersedeReads))
+            saveAgentConfigNestedBool("compaction", "supersede_reads", s_supersedeReads);
+        helpMarker("When a file or artifact is re-read after it changed, the stale "
+                   "earlier read is superseded in the compacted transcript "
+                   "(agent.compaction.supersede_reads, default on).");
+        ImGui::TableNextColumn();
+        if (ImGui::Checkbox("Drop useless turns", &s_dropUseless))
+            saveAgentConfigNestedBool("compaction", "drop_useless", s_dropUseless);
+        helpMarker("Compaction drops turns that contributed nothing (failed no-op "
+                   "tool calls, empty replies) instead of archiving them "
+                   "(agent.compaction.drop_useless, default on).");
         ImGui::EndTable();
     }
 
@@ -4426,9 +4551,7 @@ const SettingsEntry kSettingsEntries[] = {
     { "Tool families",            "AI",           2 },
     { "Sketch 2D",                "AI",           2 },
     { "Model 3D",                 "AI",           2 },
-    { "Offline mode",             "AI",           2 },
     { "Reasoning effort",         "AI",           2 },
-    { "Manage models",            "AI",           2 },
     { "Model roles",              "AI",           2 },
     { "Hidden models",            "AI",           2 },
     { "Harness organization",     "AI",           2 },
@@ -4967,10 +5090,6 @@ void drawSettingsModal(AppState& st, bool busy) {
                         settingsGlassSectionBegin("##ai_memory", "Memory & Learning");
                         drawMemoryLearningSection(st, sc);
                         settingsGlassSectionEnd();
-
-                        settingsGlassSectionBegin("##ai_privacy", "Privacy");
-                        ui::drawAiSettingsSection(st, busy, ui::AiSettingsSection::Privacy);
-                        settingsGlassSectionEnd();
                         ImGui::EndTabItem();
                     }
 
@@ -5311,9 +5430,8 @@ void drawSettingsModal(AppState& st, bool busy) {
                         settingsGlassSectionEnd();
 
                         settingsGlassSectionBegin("##ai_tools_families", "Tool families");
-                        dimText("Enable or disable MCP tool families the agent may call. "
-                                "Expand a family for per-tool options (timeout, call caps, "
-                                "param defaults, prompt notes). Saved under config.json "
+                        dimText("Toggle whole MCP tool families the agent may call. Per-tool "
+                                "rows live in the tree below. Saved under config.json "
                                 "agent.tool_families / agent.tool_options.");
                         static std::map<std::string, bool> s_toolFam;
                         static double s_toolFamLast = -1e9;
@@ -5448,20 +5566,46 @@ void drawSettingsModal(AppState& st, bool busy) {
                         }
 
                         ImGui::Dummy(ImVec2(0, 8.0f * sc));
-                        dimText("Per-tool options (expand a family):");
+                        dimText("Per-tool rows: the checkbox enables a tool (dimmed = off); "
+                                "Options overrides timeout, call cap, param defaults, and "
+                                "prompt note.");
+                        static char s_toolFilterBuf[64] = "";
+                        ImGui::SetNextItemWidth(-1);
+                        ImGui::InputTextWithHint("##tool_filter", "Filter tools...",
+                                                 s_toolFilterBuf, sizeof(s_toolFilterBuf));
+                        const std::string toolNeedle = toLowerAscii(s_toolFilterBuf);
                         for (int fi = 0; fi < kFamToolMapN; ++fi) {
                             const FamTools& ft = kFamToolMap[fi];
+                            if (!toolNeedle.empty()) {
+                                int famMatches = 0;
+                                for (int ti = 0; ti < ft.n; ++ti)
+                                    if (toLowerAscii(ft.tools[ti]).find(toolNeedle)
+                                        != std::string::npos)
+                                        ++famMatches;
+                                if (famMatches == 0) continue;
+                                ImGui::SetNextItemOpen(true, ImGuiCond_Always);
+                            }
                             if (!ImGui::TreeNode(ft.fam)) continue;
                             for (int ti = 0; ti < ft.n; ++ti) {
                                 const char* tn = ft.tools[ti];
+                                if (!toolNeedle.empty() &&
+                                    toLowerAscii(tn).find(toolNeedle) == std::string::npos)
+                                    continue;
                                 ImGui::PushID(tn);
                                 bool en = s_toolEnabled.count(tn) ? s_toolEnabled[tn] : true;
                                 if (ImGui::Checkbox("##en", &en)) {
                                     s_toolEnabled[tn] = en;
                                     s_toolOptDirty = true;
                                 }
+                                if (ImGui::IsItemHovered())
+                                    ImGui::SetTooltip("Enable/disable this tool.");
                                 ImGui::SameLine();
+                                if (!en)
+                                    ImGui::PushStyleColor(
+                                        ImGuiCol_Text,
+                                        ui::Palette::toU32(ui::palette.textDim));
                                 ImGui::TextUnformatted(tn);
+                                if (!en) ImGui::PopStyleColor();
                                 ImGui::SameLine();
                                 if (ImGui::SmallButton("Options"))
                                     ImGui::OpenPopup("tool_opts");
@@ -5613,8 +5757,7 @@ void drawSettingsModal(AppState& st, bool busy) {
 
                         ImGui::Dummy(ImVec2(0, 10.0f * sc));
                         settingsGlassSectionBegin("##ai_maintenance", "Maintenance");
-                        dimText("Repair the local CAD engine runtime, or trim which models appear "
-                                "in the composer's model picker.");
+                        dimText("Repair the local CAD engine runtime.");
                         {
                             const bool canSetup = !st.setupRunning.load() && !st.job.running.load();
                             if (!canSetup) ImGui::BeginDisabled();
@@ -5630,9 +5773,6 @@ void drawSettingsModal(AppState& st, bool busy) {
                                 dimText("Running\xe2\x80\xa6");
                             }
                         }
-                        ImGui::Dummy(ImVec2(0, 4 * sc));
-                        if (ImGui::CollapsingHeader("Manage models (chat picker)"))
-                            ui::drawAiSettingsSection(st, busy, ui::AiSettingsSection::ManageModels);
                         settingsGlassSectionEnd();
                         ImGui::EndTabItem();
                     }

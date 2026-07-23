@@ -4,18 +4,23 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cctype>
 #include <chrono>
 #include <fstream>
 #include <memory>
+#include <regex>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
+#include "agent/config.h"  // compliance_mode / provider_offline_safe / host_is_loopback (WS3)
 #include "agent/http.h"
 #include "agent/omp_bridge_client.h"
 
@@ -1132,11 +1137,563 @@ bool is_omp_bridge_provider(const std::string& provider) {
     return omp_bridge_provider_ids().count(provider) != 0;
 }
 
+// --------------------------------------------------------------------------- redaction (WS3)
+// Native C++ port of services/agent/redaction.py. compliance_mode=redact wraps cloud-bound
+// traffic: deterministic scrub -> optional loopback-LLM residual pass -> rehydrate inbound;
+// images blocked outbound. Loopback/local providers are never wrapped; local_only /
+// offline_mode refuse non-loopback at resolve_provider (config.cpp) as before.
+
+// Placeholder families -> category prefix used in tokens (DIM_1, MAT_1, PN_3, PROJ_1, SPAN_4).
+static const char* kCatDim = "DIM";
+static const char* kCatMat = "MAT";
+static const char* kCatPn = "PN";
+static const char* kCatProj = "PROJ";
+static const char* kCatSpan = "SPAN";  // residual spans from the optional LLM pass
+
+std::string RedactionMap::placeholder_for(const std::string& original,
+                                          const std::string& category) {
+    auto it = forward_.find(original);
+    if (it != forward_.end()) return it->second;
+    int n = ++counters_[category];
+    std::string token = category + "_" + std::to_string(n);
+    forward_[original] = token;
+    reverse_[token] = original;
+    return token;
+}
+
+namespace {
+
+// Placeholder token form: DIM_1, MAT_12, PN_3, PROJ_1, SPAN_4
+const std::regex& placeholder_re() {
+    static const std::regex re(R"(\b(?:DIM|MAT|PN|PROJ|SPAN)_\d+\b)");
+    return re;
+}
+
+// Common aerospace/mechanical alloy & polymer designations. Longest first so multi-token
+// specs win ("6061-T6" over bare "6061"); case-insensitive, original case preserved in the
+// mapping table for rehydrate fidelity. Mirrors redaction.py _MATERIAL_SPECS.
+const char* kMaterialSpecs[] = {
+    // Aluminum alloys + temper
+    R"(7075-T6)", R"(7075-T73)", R"(7075-T7351)", R"(6061-T6)", R"(6061-T651)", R"(6061-T4)",
+    R"(2024-T3)", R"(2024-T4)", R"(2024-T351)", R"(7050-T7451)", R"(5083-H116)", R"(5052-H32)",
+    R"(AL\s*7075)", R"(AL\s*6061)", R"(AL\s*2024)",
+    R"(Aluminium\s+6061-T6)", R"(Aluminum\s+6061-T6)",
+    R"(Aluminium\s+6061)", R"(Aluminum\s+6061)",
+    R"(Aluminium\s+7075)", R"(Aluminum\s+7075)",
+    // Steels
+    R"(AISI\s*4140)", R"(AISI\s*4340)", R"(AISI\s*1018)", R"(AISI\s*1020)", R"(AISI\s*1045)",
+    R"(SAE\s*4140)", R"(SAE\s*4340)", R"(SAE\s*1018)",
+    R"(A36\s+steel)", R"(A36)",
+    R"(4140\s+steel)", R"(4340\s+steel)", R"(1018\s+steel)", R"(mild\s+steel)",
+    R"(SS\s*316L)", R"(SS\s*316)", R"(SS\s*304L)", R"(SS\s*304)",
+    R"(304\s+stainless)", R"(316\s+stainless)", R"(316L\s+stainless)",
+    R"(17-4\s*PH)", R"(15-5\s*PH)",
+    // Titanium / nickel / copper alloys
+    R"(Ti-6Al-4V)", R"(Ti6Al4V)", R"(Grade\s*5\s+titanium)", R"(titanium\s+Grade\s*5)",
+    R"(Inconel\s*718)", R"(Inconel\s*625)", R"(Hastelloy\s*C-?276)",
+    R"(brass\s*C360)", R"(C360\s+brass)", R"(C36000)",
+    // Polymers / composites commonly called out as material specs
+    R"(PEEK)", R"(ULTEM\s*9085)", R"(ULTEM\s*1010)", R"(Delrin)", R"(POM-C)",
+    R"(carbon\s+fiber)", R"(GFRP)", R"(CFRP)",
+};
+
+// Project / program identifiers often leak controlled context.
+const char* kProjectPatterns[] = {
+    R"(\b(?:ITAR|EAR|CUI|FOUO)[-_\s]?(?:restricted|controlled)?\b)",
+    R"(\b(?:program|project|mission|contract)\s*(?:id|no\.?|number|#)?\s*[:=]?\s*[A-Z]{2,6}[-_]?\d{2,8}(?:[-_][A-Z0-9]{1,6})?\b)",
+    R"(\b(?:PRJ|PROG|MSN|CTR)[-_][A-Z0-9]{2,12}\b)",
+};
+
+// Part / drawing numbers: DWG-1234, P/N ABC-12, drawing 100-200-A, PN: X12345
+const char* kPartNumberPatterns[] = {
+    R"(\b(?:P/?N|P/N|PN|part\s*(?:no\.?|number|#)|drawing\s*(?:no\.?|number|#)?|DWG|dwg)\s*[:=]?\s*[A-Z0-9][A-Z0-9._/-]{2,24}\b)",
+    R"(\b(?:DWG|PN|P/N)[-_][A-Z0-9][A-Z0-9._/-]{1,20}\b)",
+    R"(\b[A-Z]{1,3}\d{2,4}[-_]\d{2,6}(?:[-_][A-Z0-9]{1,4})?\b)",  // AB12-3456-A style
+};
+
+// Join patterns into one alternation; longest-first when `longest_first` (materials) so
+// multi-token specs win. Case-insensitive mirrors redaction.py _compile_list/_compile_material_re.
+std::string join_patterns(const char* const* specs, size_t n, bool longest_first) {
+    std::vector<std::string> ordered(specs, specs + n);
+    if (longest_first)
+        std::stable_sort(ordered.begin(), ordered.end(),
+                         [](const std::string& a, const std::string& b) {
+                             return a.size() > b.size();
+                         });
+    std::string pat = "(?:";
+    bool first = true;
+    for (const auto& s : ordered) {
+        if (!first) pat += "|";
+        pat += "(?:" + s + ")";
+        first = false;
+    }
+    pat += ")";
+    return pat;
+}
+
+const std::regex& material_re() {
+    static const std::regex re(
+        join_patterns(kMaterialSpecs, sizeof(kMaterialSpecs) / sizeof(kMaterialSpecs[0]), true),
+        std::regex_constants::icase);
+    return re;
+}
+const std::regex& part_number_re() {
+    static const std::regex re(
+        join_patterns(kPartNumberPatterns,
+                      sizeof(kPartNumberPatterns) / sizeof(kPartNumberPatterns[0]), false),
+        std::regex_constants::icase);
+    return re;
+}
+const std::regex& project_re() {
+    static const std::regex re(
+        join_patterns(kProjectPatterns, sizeof(kProjectPatterns) / sizeof(kProjectPatterns[0]),
+                      false),
+        std::regex_constants::icase);
+    return re;
+}
+
+// Bilateral / unilateral tolerance: ±0.02, +/-0.05 mm, +0.02/-0.01
+const std::regex& tol_re() {
+    static const std::regex re(
+        R"((?:±|\+/-|\+/?-)\s*(\d+(?:[.,]\d+)?)\s*(mm|in|mil|µm|um|μm)?)"
+        R"(|\+(\d+(?:[.,]\d+)?)\s*/\s*-(\d+(?:[.,]\d+)?)\s*(mm|in|mil|µm|um|μm)?)");
+    return re;
+}
+
+// Numeric dimensions with units. Order: compound first, then simple.
+// Captures: 12.5 mm, 0.25 in, 45 deg, 30°, 1/4", 3/8 in, Ø20 mm, dia 10mm, R3.0
+const std::regex& dim_unit_re() {
+    static const std::regex re(
+        // diameter prefixes (Ø, ⌀, dia, diam) — radius handled separately (word-bounded)
+        R"((?:[Ø⌀]|[Dd]ia(?:m(?:eter)?)?\.?)\s*([+-]?\d+(?:[.,]\d+)?(?:\s*/\s*\d+(?:[.,]\d+)?)?)\s*(mm|cm|m|in|inch|inches|"|''|mil|µm|um|μm|deg|°|rad|degrees?)?)"
+        // radius: R3 / R 3.0 / R3.0mm — whole-word R so "chamfer" is safe
+        R"(|\b[Rr]\s*([+-]?\d+(?:[.,]\d+)?)\s*(mm|cm|m|in|inch|inches|"|''|mil|µm|um|μm)?\b)"
+        // plain number + unit (incl. fraction 1/4 in)
+        R"(|([+-]?\d+(?:[.,]\d+)?(?:\s*/\s*\d+(?:[.,]\d+)?)?)\s*(mm|cm|m|in|inch|inches|"|''|mil|µm|um|μm|deg|°|rad|degrees?)\b)"
+        // bare degree symbol glued: 45°
+        R"(|([+-]?\d+(?:[.,]\d+)?)\s*(°))");
+    return re;
+}
+
+// ISO hole/shaft fits & unilateral tolerances: H7, g6, H7/g6, js6, F8, …
+const std::regex& iso_fit_strict_re() {
+    static const std::regex re(
+        R"(\b(?:[A-Z]{1,2}|[a-z]{1,2})\d{1,2}(?:\s*/\s*(?:[A-Z]{1,2}|[a-z]{1,2})\d{1,2})?\b)");
+    return re;
+}
+const std::regex& iso_fit_known_re() {
+    static const std::regex re(
+        R"(^(?:[A-Z]{1,2}|[a-z]{1,2})\d{1,2}$|^(?:[A-Z]{1,2}|[a-z]{1,2})\d{1,2}\s*/\s*(?:[A-Z]{1,2}|[a-z]{1,2})\d{1,2}$)");
+    return re;
+}
+const std::regex& iso_fit_part_re() {
+    static const std::regex re(R"(^([A-Za-z]{1,2})(\d{1,2})$)");
+    return re;
+}
+const std::unordered_set<std::string>& iso_fit_letters() {
+    static const std::unordered_set<std::string> s = {
+        "A", "B", "C", "CD", "D", "E", "EF", "F", "FG", "G", "H", "JS", "J", "K", "M",
+        "N", "P", "R", "S", "T", "U", "V", "X", "Y", "Z", "ZA", "ZB", "ZC",
+    };
+    return s;
+}
+
+// Only treat a letter+grade token as an ISO fit when the letters are a known fit class and
+// the grade is 1..18 (mirrors redaction.py _is_iso_fit).
+bool is_iso_fit(std::string token) {
+    // trim
+    while (!token.empty() && std::isspace(static_cast<unsigned char>(token.front())))
+        token.erase(token.begin());
+    while (!token.empty() && std::isspace(static_cast<unsigned char>(token.back())))
+        token.pop_back();
+    if (!std::regex_search(token, iso_fit_known_re())) return false;
+    // Split possible hole/shaft pair.
+    size_t slash = token.find('/');
+    std::string parts[2];
+    size_t nparts = 0;
+    if (slash == std::string::npos) {
+        parts[nparts++] = token;
+    } else {
+        parts[nparts++] = token.substr(0, slash);
+        parts[nparts++] = token.substr(slash + 1);
+    }
+    for (size_t i = 0; i < nparts; ++i) {
+        std::string p = parts[i];
+        while (!p.empty() && std::isspace(static_cast<unsigned char>(p.front())))
+            p.erase(p.begin());
+        while (!p.empty() && std::isspace(static_cast<unsigned char>(p.back()))) p.pop_back();
+        std::smatch m;
+        if (!std::regex_match(p, m, iso_fit_part_re())) return false;
+        std::string letters = m[1].str();
+        for (char& c : letters) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        if (!iso_fit_letters().count(letters)) return false;
+        int grade = std::atoi(m[2].str().c_str());
+        if (grade < 1 || grade > 18) return false;
+    }
+    return true;
+}
+
+struct RedactSpan {
+    size_t start;
+    size_t end;
+    std::string original;
+    std::string category;
+};
+
+void collect_spans(const std::string& text, const std::regex& re, const char* category,
+                   std::vector<RedactSpan>& spans, bool iso_fit_predicate = false) {
+    for (std::sregex_iterator it(text.begin(), text.end(), re), end; it != end; ++it) {
+        std::string orig = it->str();
+        if (iso_fit_predicate && !is_iso_fit(orig)) continue;
+        size_t pos = static_cast<size_t>(it->position());
+        spans.push_back({pos, pos + static_cast<size_t>(it->length()), std::move(orig),
+                         category});
+    }
+}
+
+// Deep-scrub arbitrary JSON (tool-call args / inputs): every string value is scrubbed.
+json scrub_json_value(const json& v, RedactionMap& map);
+
+json scrub_arguments(const json& args, RedactionMap& map) {
+    if (args.is_string()) {
+        // JSON string args — scrub then try to keep valid JSON (mirrors Python).
+        std::string s = args.get<std::string>();
+        json parsed = json::parse(s, nullptr, false);
+        if (!parsed.is_discarded()) return scrub_json_value(parsed, map).dump();
+        return redaction_scrub_text(s, map);
+    }
+    if (args.is_null()) return args;
+    return scrub_json_value(args, map);
+}
+
+json scrub_json_value(const json& v, RedactionMap& map) {
+    if (v.is_string()) return redaction_scrub_text(v.get<std::string>(), map);
+    if (v.is_object()) {
+        json o = json::object();
+        for (auto it = v.begin(); it != v.end(); ++it) o[it.key()] = scrub_json_value(it.value(), map);
+        return o;
+    }
+    if (v.is_array()) {
+        json a = json::array();
+        for (const auto& e : v) a.push_back(scrub_json_value(e, map));
+        return a;
+    }
+    return v;
+}
+
+// --- optional local-LLM residual pass (redaction.py llm_flag_residual) -------------------
+const char* kRedactionLlmFlagSystem =
+    "You are a compliance redaction assistant. Given TEXT already partially redacted "
+    "with placeholders like DIM_1/MAT_1/PN_1, list any REMAINING sensitive spans that "
+    "look like exact dimensions, tolerances, material grades, part/drawing numbers, "
+    "or project identifiers. Reply ONLY with a JSON array of exact substrings to "
+    "redact, e.g. [\"secret-bit\", \"12.345\"]. Empty array if none. No prose.";
+
+// Resolve the redaction-role assignment to a LOOPBACK-only OpenAI-compatible descriptor.
+// Hard rule (mirrors redaction.py _build_loopback_from_assignment): known cloud names are
+// refused up-front; openai is allowed only with an explicit loopback base_url. Returns null
+// when absent/unusable — the caller degrades to deterministic-only and NEVER sends raw.
+json resolve_redaction_role_cfg(const json& cfg) {
+    json role = json(nullptr);
+    if (cfg.contains("redaction_role") && cfg["redaction_role"].is_object())
+        role = cfg["redaction_role"];  // threaded by resolve_provider (config.cpp)
+    else if (cfg.contains("ai_roles") && cfg["ai_roles"].is_object() &&
+             cfg["ai_roles"].contains("redaction"))
+        role = cfg["ai_roles"]["redaction"];
+    else if (cfg.contains("redaction"))
+        role = cfg["redaction"];
+    if (role.is_null()) return json(nullptr);
+    std::string name, model, base_url;
+    if (role.is_string()) {
+        std::string s = role.get<std::string>();
+        if (s.empty() || s == "auto") return json(nullptr);
+        size_t colon = s.find(':');
+        if (colon != std::string::npos) {
+            name = s.substr(0, colon);
+            model = s.substr(colon + 1);
+        } else {
+            name = s;
+        }
+    } else if (role.is_object()) {
+        name = str_or(role, "provider");
+        model = str_or(role, "model");
+        base_url = str_or(role, "base_url");
+    } else {
+        return json(nullptr);
+    }
+    name = lower_copy(name);
+    if (name.empty()) return json(nullptr);
+    // Refuse known cloud names up-front (hard rule for the redaction role).
+    if (name == "anthropic" || name == "gemini" || name == "openrouter" || name == "xai" ||
+        name == "anthropic-sub" || name == "codex-sub" || name == "cursor-sub" ||
+        name == "xai-sub" || name == "claude-cli" || name == "codex-cli" ||
+        name == "moonshot" || name == "cursor")
+        return json(nullptr);
+    if (name == "llamacpp") {
+        if (base_url.empty()) base_url = kDefaultLocalBaseUrl;
+        if (!host_is_loopback(base_url)) return json(nullptr);
+        return json{{"name", "llamacpp"}, {"model", model}, {"base_url", base_url},
+                    {"api_key", "lm-studio"}};
+    }
+    if (name == "openai") {
+        if (base_url.empty() || !host_is_loopback(base_url)) return json(nullptr);
+        return json{{"name", "openai"}, {"model", model}, {"base_url", base_url},
+                    {"api_key", "lm-studio"}};
+    }
+    return json(nullptr);  // unknown name — refuse (never construct non-loopback)
+}
+
+// Extract the first JSON array from an LLM reply (tolerant of prose/fences), mirroring
+// redaction.py _parse_span_list.
+std::vector<std::string> parse_span_list(const std::string& raw) {
+    std::vector<std::string> out;
+    if (raw.empty()) return out;
+    size_t l = raw.find('[');
+    size_t r = raw.rfind(']');
+    if (l == std::string::npos || r == std::string::npos || r < l) return out;
+    json data = json::parse(raw.substr(l, r - l + 1), nullptr, false);
+    if (!data.is_array()) return out;
+    for (const auto& x : data) {
+        std::string s;
+        if (x.is_string())
+            s = x.get<std::string>();
+        else if (x.is_number())
+            s = x.dump();
+        if (!s.empty()) out.push_back(s);
+    }
+    return out;
+}
+
+void replace_all(std::string& text, const std::string& from, const std::string& to) {
+    if (from.empty()) return;
+    size_t pos = 0;
+    while ((pos = text.find(from, pos)) != std::string::npos) {
+        text.replace(pos, from.size(), to);
+        pos += to.size();
+    }
+}
+
+// Best-effort residual pass over ONE text blob. Any failure leaves the text unchanged
+// (deterministic-only); the scrubbed text is what would go out, never the raw.
+void redaction_llm_residual_pass(std::string& text, RedactionMap& map, const json& role_cfg) {
+    if (text.empty() || text.find_first_not_of(" \t\r\n") == std::string::npos) return;
+    std::string name = role_cfg.value("name", std::string());
+    if (name.empty()) return;
+    std::string snippet = text.size() > 8000 ? text.substr(0, 8000) : text;
+    json msgs = json::array({user_message(json::array({text_part(snippet)}))});
+    CompleteResult cr = complete(name, role_cfg, kRedactionLlmFlagSystem, msgs, 512);
+    if (!cr.error.empty()) return;  // degrade to deterministic-only
+    std::vector<std::string> spans = parse_span_list(cr.text);
+    if (spans.empty()) return;
+    // Replace longer first to reduce partial-eat issues; dedupe identical spans.
+    std::set<std::string> seen(spans.begin(), spans.end());
+    std::vector<std::string> uniq(seen.begin(), seen.end());
+    std::stable_sort(uniq.begin(), uniq.end(), [](const std::string& a, const std::string& b) {
+        return a.size() > b.size();
+    });
+    for (const auto& span : uniq) {
+        if (span.empty() || text.find(span) == std::string::npos) continue;
+        // Skip if it already looks like a placeholder.
+        if (std::regex_match(span, placeholder_re())) continue;
+        std::string token = map.placeholder_for(span, kCatSpan);
+        replace_all(text, span, token);
+    }
+}
+
+// Apply the optional residual pass to the scrubbed system prompt + every message text part
+// (mirrors RedactingProvider.complete_ex). No-op when no loopback redaction role resolves.
+void apply_redaction_llm_residual(std::string& system, json& messages, RedactionMap& map,
+                                  const json& cfg) {
+    json role_cfg = resolve_redaction_role_cfg(cfg);
+    if (role_cfg.is_null()) return;
+    redaction_llm_residual_pass(system, map, role_cfg);
+    if (!messages.is_array()) return;
+    for (auto& m : messages) {
+        if (!m.is_object() || !m.contains("content")) continue;
+        json& content = m["content"];
+        if (content.is_string()) {
+            std::string t = content.get<std::string>();
+            redaction_llm_residual_pass(t, map, role_cfg);
+            content = t;
+        } else if (content.is_array()) {
+            for (auto& p : content) {
+                if (!p.is_object() || pstr(p, "type") != "text" || !p.contains("text") ||
+                    !p["text"].is_string())
+                    continue;
+                std::string t = p["text"].get<std::string>();
+                redaction_llm_residual_pass(t, map, role_cfg);
+                p["text"] = t;
+            }
+        }
+    }
+}
+
+}  // namespace
+
+bool redaction_active(const std::string& provider, const json& cfg) {
+    if (compliance_mode(cfg) != "redact") return false;
+    // Build a minimal descriptor for the loopback check: the provider NAME discriminates
+    // cloud (anthropic/gemini/xai/moonshot -> never offline-safe) from local; openai needs
+    // its base_url; an explicit offline_safe flag (loopback mock/test) wins.
+    json desc = json::object();
+    desc["name"] = provider;
+    std::string base = str_or(cfg, "base_url");
+    if (!base.empty()) desc["base_url"] = base;
+    if (cfg.contains("offline_safe") && cfg["offline_safe"].is_boolean())
+        desc["offline_safe"] = cfg["offline_safe"];
+    return !provider_offline_safe(desc);
+}
+
+std::string redaction_scrub_text(const std::string& text, RedactionMap& map) {
+    if (text.empty()) return text;
+    // Collect spans from every class, then apply right-to-left so indices stay valid
+    // (mirrors redaction.py scrub_text).
+    std::vector<RedactSpan> spans;
+    collect_spans(text, material_re(), kCatMat, spans);
+    collect_spans(text, part_number_re(), kCatPn, spans);
+    collect_spans(text, project_re(), kCatProj, spans);
+    collect_spans(text, tol_re(), kCatDim, spans);
+    collect_spans(text, dim_unit_re(), kCatDim, spans);
+    collect_spans(text, iso_fit_strict_re(), kCatDim, spans, /*iso_fit_predicate=*/true);
+    if (spans.empty()) return text;
+
+    // Drop overlaps: keep earliest-starting, then longer; skip any that overlap kept.
+    std::sort(spans.begin(), spans.end(), [](const RedactSpan& a, const RedactSpan& b) {
+        if (a.start != b.start) return a.start < b.start;
+        return (a.end - a.start) > (b.end - b.start);
+    });
+    std::vector<RedactSpan> kept;
+    size_t occupied_end = 0;
+    bool any = false;
+    for (const auto& s : spans) {
+        if (any && s.start < occupied_end) continue;  // overlap with a previously kept span
+        kept.push_back(s);
+        occupied_end = s.end;
+        any = true;
+    }
+
+    // Apply right-to-left.
+    std::sort(kept.begin(), kept.end(),
+              [](const RedactSpan& a, const RedactSpan& b) { return a.start > b.start; });
+    std::string out = text;
+    for (const auto& s : kept) {
+        std::string token = map.placeholder_for(s.original, s.category);
+        out.replace(s.start, s.end - s.start, token);
+    }
+    return out;
+}
+
+std::string RedactionMap::rehydrate(const std::string& text) const {
+    if (text.empty() || reverse_.empty()) return text;
+    std::string out;
+    out.reserve(text.size());
+    size_t last = 0;
+    for (std::sregex_iterator it(text.begin(), text.end(), placeholder_re()), end; it != end;
+         ++it) {
+        size_t pos = static_cast<size_t>(it->position());
+        out.append(text, last, pos - last);
+        auto found = reverse_.find(it->str());
+        out += found != reverse_.end() ? found->second : it->str();
+        last = pos + static_cast<size_t>(it->length());
+    }
+    out.append(text, last, std::string::npos);
+    return out;
+}
+
+std::string redaction_rehydrate_text(const std::string& text, const RedactionMap& map) {
+    return map.rehydrate(text);
+}
+
+json redaction_scrub_messages(const json& messages, RedactionMap& map) {
+    // Deep-scrub message content (text + tool-call args); image parts are dropped and
+    // replaced with a text marker (mirrors redaction.py scrub_messages, block_images=True).
+    if (!messages.is_array()) return messages;
+    json out = json::array();
+    for (const auto& msg : messages) {
+        if (!msg.is_object()) {
+            out.push_back(msg);
+            continue;
+        }
+        json m = msg;
+        if (m.contains("content")) {
+            const json& content = m["content"];
+            if (content.is_string()) {
+                m["content"] = redaction_scrub_text(content.get<std::string>(), map);
+            } else if (content.is_array()) {
+                json parts = json::array();
+                for (const auto& part : content) {
+                    if (!part.is_object()) {
+                        parts.push_back(part);
+                        continue;
+                    }
+                    json p = part;
+                    std::string ptype = pstr(p, "type");
+                    if (ptype == "image" || ptype == "image_url" || ptype == "input_image") {
+                        // Drop the image part entirely; leave a text marker so the model
+                        // knows vision was withheld under compliance policy.
+                        parts.push_back(
+                            {{"type", "text"},
+                             {"text",
+                              "[image redacted — compliance_mode=redact blocks outbound "
+                              "images]"}});
+                        continue;
+                    }
+                    if (p.contains("text") && p["text"].is_string())
+                        p["text"] = redaction_scrub_text(p["text"].get<std::string>(), map);
+                    if (p.contains("input")) p["input"] = scrub_json_value(p["input"], map);
+                    if (p.contains("arguments"))
+                        p["arguments"] = scrub_arguments(p["arguments"], map);
+                    // tool names are not redacted
+                    parts.push_back(p);
+                }
+                m["content"] = parts;
+            }
+        }
+        // Top-level tool_calls (OpenAI chat format)
+        if (m.contains("tool_calls") && m["tool_calls"].is_array()) {
+            json tcs = json::array();
+            for (const auto& tc : m["tool_calls"]) {
+                if (!tc.is_object()) {
+                    tcs.push_back(tc);
+                    continue;
+                }
+                json t = tc;
+                if (t.contains("function") && t["function"].is_object()) {
+                    json fn = t["function"];
+                    if (fn.contains("arguments"))
+                        fn["arguments"] = scrub_arguments(fn["arguments"], map);
+                    t["function"] = fn;
+                }
+                tcs.push_back(t);
+            }
+            m["tool_calls"] = tcs;
+        }
+        out.push_back(m);
+    }
+    return out;
+}
+
 // --------------------------------------------------------------------------- complete
 CompleteResult complete(const std::string& provider, const json& cfg, const std::string& system,
                         const json& messages, int max_tokens) {
     CompleteResult res;
     auto t0 = std::chrono::steady_clock::now();
+    // WS3 compliance_mode=redact: gate + per-request placeholder map. Loopback providers are
+    // never wrapped (redaction_active), so mock/local take the zero-cost path and mode=off
+    // is byte-identical to the pre-redaction flow.
+    RedactionMap redact_map;
+    const bool redact = redaction_active(provider, cfg);
+    std::string scrubbed_system;
+    json scrubbed_messages;
+    if (redact) {
+        scrubbed_system = redaction_scrub_text(system, redact_map);
+        scrubbed_messages = redaction_scrub_messages(messages, redact_map);
+        // Best-effort loopback-LLM residual pass (the deterministic scrub above is the
+        // mandatory layer; the LLM pass only ever ADDS placeholders, never removes them).
+        apply_redaction_llm_residual(scrubbed_system, scrubbed_messages, redact_map, cfg);
+    }
+    const std::string& eff_system = redact ? scrubbed_system : system;
+    const json& eff_messages = redact ? scrubbed_messages : messages;
     auto finish = [&](CompleteResult r) -> CompleteResult {
         r.latency_ms = static_cast<int>(
             std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1145,6 +1702,12 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
         if (r.attempt <= 0) r.attempt = 1;
         if (!r.error.empty() && r.error_excerpt.empty())
             r.error_excerpt = truncate_excerpt(r.error);
+        if (redact) {
+            // Inbound rehydrate: the cloud only ever saw placeholders; restore originals
+            // before the agent loop parses tool calls or the GUI shows the reply.
+            r.text = redaction_rehydrate_text(r.text, redact_map);
+            r.thinking = redaction_rehydrate_text(r.thinking, redact_map);
+        }
         emit_provider_call(r, provider);
         return r;
     };
@@ -1185,8 +1748,8 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
         json params = {
             {"provider", provider},
             {"model", model},
-            {"system", system},
-            {"messages", omp_bridge_messages(messages)},
+            {"system", eff_system},
+            {"messages", omp_bridge_messages(eff_messages)},
             {"maxTokens", max_tokens},
         };
         if (!api_key.empty()) params["apiKey"] = api_key;
@@ -1247,13 +1810,13 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
         }
 
         BuiltRequest req =
-            anthropic_build_request(model, system, messages, max_tokens, effort);
+            anthropic_build_request(model, eff_system, eff_messages, max_tokens, effort);
 
         if (oauth) {
             // OAuth: Authorization Bearer + Claude Code betas (not x-api-key).
             // System must be the 3-block array with billing header + CCH integrity.
             std::string first_user;
-            for (const auto& m : messages) {
+            for (const auto& m : eff_messages) {
                 if (m.value("role", std::string()) != "user") continue;
                 if (!m.contains("content") || !m["content"].is_array()) break;
                 for (const auto& p : m["content"]) {
@@ -1397,7 +1960,7 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
                               "." + suffix + "; cc_entrypoint=local-agent; cch=00000;"}},
                 {{"type", "text"},
                  {"text", "You are a Claude agent, built on Anthropic's Claude Agent SDK."}},
-                {{"type", "text"}, {"text", system}},
+                {{"type", "text"}, {"text", eff_system}},
             });
             // OAuth path: adaptive thinking (budget_tokens 400s on opus 4.8).
             // Object, not array — see anthropic_build_request note.
@@ -1491,7 +2054,7 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
             res.endpoint = base_url.empty() ? "https://api.moonshot.ai/v1" : base_url;
             return finish(std::move(res));
         }
-        BuiltRequest req = openai_build_request(model, system, messages, max_tokens, base_url);
+        BuiltRequest req = openai_build_request(model, eff_system, eff_messages, max_tokens, base_url);
         const char* err_name =
             (provider == "xai" || provider == "xai-sub")
                 ? (provider == "xai-sub" ? "xai-sub" : "xai")
@@ -1608,7 +2171,7 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
     if (provider == "gemini") {
         std::string model = str_or(cfg, "model", std::string(kGeminiDefaultModel));
         std::string effort = str_or(cfg, "reasoning_effort");
-        BuiltRequest req = gemini_build_request(model, system, messages, max_tokens, effort);
+        BuiltRequest req = gemini_build_request(model, eff_system, eff_messages, max_tokens, effort);
         for (auto& h : req.headers)
             if (h.first == "x-goog-api-key") h.second = api_key;
         RetryResult rr = http_post_retry(req.url, req.headers, req.body);

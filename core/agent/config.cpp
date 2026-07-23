@@ -202,6 +202,40 @@ std::string py_or(const std::optional<std::string>& a, const std::string& b) {
     return b;
 }
 
+// WS3: parse cfg.ai_roles.redaction / cfg.redaction into {provider, model?, base_url?}.
+// "auto"/absent/malformed -> null. "provider:model" string shorthand supported (mirrors
+// redaction.py resolve_redaction_provider's config fallback block). The loopback-only
+// hard rule is enforced at USE time (providers.cpp), not here.
+json redaction_role_from(const json& cfg) {
+    if (!cfg.is_object()) return json(nullptr);
+    json assignment = json(nullptr);
+    if (cfg.contains("ai_roles") && cfg["ai_roles"].is_object() &&
+        cfg["ai_roles"].contains("redaction"))
+        assignment = cfg["ai_roles"]["redaction"];
+    else if (cfg.contains("redaction"))
+        assignment = cfg["redaction"];
+    if (assignment.is_null()) return json(nullptr);
+    if (assignment.is_string()) {
+        std::string s = assignment.get<std::string>();
+        if (s.empty() || s == "auto") return json(nullptr);
+        size_t colon = s.find(':');
+        if (colon != std::string::npos)
+            return json{{"provider", s.substr(0, colon)}, {"model", s.substr(colon + 1)}};
+        return json{{"provider", s}};
+    }
+    if (!assignment.is_object()) return json(nullptr);
+    json out = json::object();
+    if (assignment.contains("provider") && assignment["provider"].is_string())
+        out["provider"] = assignment["provider"];
+    if (assignment.contains("model") && assignment["model"].is_string())
+        out["model"] = assignment["model"];
+    if (assignment.contains("base_url") && assignment["base_url"].is_string())
+        out["base_url"] = assignment["base_url"];
+    if (!out.contains("provider") || out["provider"].get<std::string>().empty())
+        return json(nullptr);
+    return out;
+}
+
 }  // namespace
 
 bool offline_enabled(const json& cfg) {
@@ -214,6 +248,27 @@ bool offline_enabled(const json& cfg) {
     if (v.is_array()) return !v.empty();
     if (v.is_object()) return !v.empty();
     return false;
+}
+
+std::string compliance_mode(const json& cfg) {
+    // Mirrors redaction.py normalize_compliance_mode + compliance_mode: trim, lowercase,
+    // '-' -> '_', alias localonly/local -> local_only; unknown/missing -> "off".
+    if (!cfg.is_object() || !cfg.contains("compliance_mode")) return "off";
+    const json& v = cfg["compliance_mode"];
+    if (!v.is_string()) return "off";
+    std::string s = lower(v.get<std::string>());
+    while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.erase(s.begin());
+    while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) s.pop_back();
+    std::replace(s.begin(), s.end(), '-', '_');
+    if (s == "localonly" || s == "local_only" || s == "local") return "local_only";
+    if (s == "off" || s == "redact") return s;
+    return "off";
+}
+
+bool local_only_enabled(const json& cfg) {
+    // offline_mode remains the legacy hard switch; compliance_mode=local_only is the named
+    // WS3 equivalent. redact does NOT imply local-only (it wraps cloud traffic instead).
+    return offline_enabled(cfg) || compliance_mode(cfg) == "local_only";
 }
 
 std::string consent_tier(const json& cfg) {
@@ -258,7 +313,9 @@ bool provider_offline_safe(const json& provider) {
 
 json resolve_provider(const std::optional<std::string>& name_arg, json cfg,
                       const json& env) {
-    bool offline = offline_enabled(cfg);
+    // Legacy offline_mode AND compliance_mode=local_only both refuse non-loopback
+    // providers (mirrors config.py: offline = offline_enabled or compliance==local_only).
+    bool offline = local_only_enabled(cfg);
     // name = (name_arg or env CHUDWARE_PROVIDER or cfg.provider or "").lower()
     std::optional<std::string> name_opt = name_arg;
     if (!name_opt || name_opt->empty()) {
@@ -605,6 +662,18 @@ json resolve_provider(const std::optional<std::string>& name_arg, json cfg,
     }
 
     desc["offline_safe"] = provider_offline_safe(desc);
+    // WS3 compliance_mode: thread the normalized mode (and, in redact mode, any configured
+    // redaction-role assignment) into the descriptor so providers.cpp::complete() can gate
+    // the outbound ITAR scrub without re-reading config.json. "off" is the no-op default.
+    desc["compliance_mode"] = compliance_mode(cfg);
+    if (compliance_mode(cfg) == "redact") {
+        json role = redaction_role_from(cfg);
+        if (!role.is_null()) desc["redaction_role"] = role;
+        // RedactingProvider forces supports_vision off in redact mode so the run loop never
+        // attaches screenshots that complete() would then have to drop (cloud only; loopback
+        // providers are never wrapped and keep their vision capability).
+        if (desc["offline_safe"].get<bool>() == false) desc["supports_vision"] = false;
+    }
     return desc;
 }
 

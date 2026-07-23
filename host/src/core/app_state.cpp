@@ -325,6 +325,11 @@ void loadSettings(Settings& s) {
             s.vision = oai.value("vision", false);
         }
         s.offlineMode = j.value("offline_mode", false);
+        {
+            std::string cm = j.value("compliance_mode", std::string("off"));
+            std::snprintf(s.complianceMode, sizeof(s.complianceMode), "%s", cm.c_str());
+        }
+        s.modelDefaultsSeeded = j.value("model_defaults_seeded", false);
         // Preference enums (off|option|encourage|require). Migrate legacy plan_mode bool.
         auto parsePref = [](const nlohmann::json& jn, const char* key, int def) -> int {
             if (!jn.contains(key)) return def;
@@ -622,7 +627,9 @@ void saveSettings(const Settings& s) {
     // Reasoning effort applies only to reasoning-capable models; resolve_provider passes it
     // through to the provider (gemini thinkingConfig / anthropic effort).
     if (s.reasoningEffort[0]) j["reasoning_effort"] = s.reasoningEffort;
-    j["offline_mode"] = s.offlineMode;
+        j["offline_mode"] = s.offlineMode;
+        j["compliance_mode"] = s.complianceMode[0] ? s.complianceMode : "off";
+        j["model_defaults_seeded"] = s.modelDefaultsSeeded;
     {
         static const char* kPrefNames[] = {"off", "option", "encourage", "require"};
         auto prefName = [&](int p) -> const char* {

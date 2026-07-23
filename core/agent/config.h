@@ -38,6 +38,17 @@ bool offline_enabled(const json& cfg);
 // External default is "off". Unknown/missing values default to "off".
 std::string consent_tier(const json& cfg);
 
+// compliance_mode: "off" | "redact" | "local_only" (WS3 ITAR outbound redaction).
+// Reads the top-level "compliance_mode" config key; normalized case-insensitively
+// ("localonly"/"local-only"/"local" -> "local_only"); unknown/missing -> "off".
+// Mirrors services/agent/redaction.py normalize_compliance_mode/compliance_mode.
+std::string compliance_mode(const json& cfg);
+
+// local_only_enabled: offline_enabled(cfg) || compliance_mode(cfg)=="local_only" — the
+// named WS3 equivalent of the legacy hard local-only switch. resolve_provider() refuses
+// every non-loopback provider under either (same machinery as offline_mode).
+bool local_only_enabled(const json& cfg);
+
 // urlparse(base_url).hostname lowercased ∈ {localhost,127.0.0.1,::1,[::1],0.0.0.0}.
 bool host_is_loopback(const std::string& base_url);
 

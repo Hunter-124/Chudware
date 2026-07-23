@@ -126,6 +126,8 @@ inline const std::vector<ModelInfo>& builtinModels() {
         // ZenMux — OMP-bridge provider; owner directive 2026-07-23 default. Free x-ai/grok-4.5-free
         // tier needs only a ZenMux sign-in (Settings → Providers), not an xAI credential.
         {PROV_ZENMUX, "x-ai/grok-4.5-free", "Grok 4.5 (default, free via ZenMux)", true, true},
+        {PROV_ZENMUX, "moonshotai/kimi-k3", "Kimi K3 (via ZenMux)", true, true},
+        {PROV_ZENMUX, "moonshotai/kimi-k3-free", "Kimi K3 (free via ZenMux)", true, true},
         // Google Gemini — vision + thinking (reasoning-effort) on 2.5; 2.0-flash has no knob.
         {PROV_GEMINI, "gemini-2.5-pro", "Gemini 2.5 Pro", true, true},
         {PROV_GEMINI, "gemini-2.5-flash", "Gemini 2.5 Flash", true, true},

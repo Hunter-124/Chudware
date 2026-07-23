@@ -263,7 +263,8 @@ from mcp_server import tool_registry as _reg
 
 # Mechanical CAD + simulation (C++ feature engine via libaicad.dll).
 # Per-family modules (T-RF8 split of the former cad_tools.py god file); all register
-# under the stable registry family "cad".
+# under the stable registry family "cad" EXCEPT cad_sim_tools (FEA/CFD solves), which
+# is genuinely "sim" so the Settings -> AI -> Tools toggle matches real ownership.
 from mcp_server.cad_doc_tools import register_cad_doc_tools
 from mcp_server.cad_eval_tools import register_cad_eval_tools
 from mcp_server.cad_render_tools import register_cad_render_tools
@@ -275,8 +276,13 @@ register_cad_doc_tools(_reg.view(mcp, "cad"))
 register_cad_eval_tools(_reg.view(mcp, "cad"))
 register_cad_render_tools(_reg.view(mcp, "cad"))
 register_cad_exchange_tools(_reg.view(mcp, "cad"))
-register_cad_sim_tools(_reg.view(mcp, "cad"))
+register_cad_sim_tools(_reg.view(mcp, "sim"))
 register_cad_asm_tools(_reg.view(mcp, "cad"))
+# cad_asm mixes assembly authoring (cad) with kinematics (sim): retag the two motion
+# tools post-registration so the Settings 'sim' family toggle governs them.
+for _n in ("simulate_motion", "motion_fea_handoff"):
+    if _n in _reg.catalog():
+        _reg.catalog()[_n]["family"] = "sim"
 register_cad_drawing_tools(_reg.view(mcp, "cad"))
 
 # Nested-tree profiler (mission master): engine_profile_tree drills a call-tree / phase-tree
@@ -306,7 +312,7 @@ register_intake_tools(_reg.view(mcp, "intake"))
 # interaction core (services/agent/interaction.py). Callers (intake clarify, DAG gates) migrate
 # onto this in T-F4.
 from mcp_server.interaction_tools import register_interaction_tools
-register_interaction_tools(mcp)
+register_interaction_tools(_reg.view(mcp, "intake"))
 
 # ECAD (schematic / PCB / native circuit sim) — per-family modules (T-RF8 split of the
 # former ecad_tools.py god file); all register under the stable registry family "ecad".
@@ -346,12 +352,12 @@ register_cam_audit_tools(_reg.view(mcp, "cam"))
 
 # Doc diff — semantic feature-level diff between two document revisions (T-H2).
 from mcp_server.doc_diff_tools import register_doc_diff_tools
-register_doc_diff_tools(mcp)
+register_doc_diff_tools(_reg.view(mcp, "cad"))
 # PLM vault (Pillar 19, aicad.plm/1): hidden git-backed version history —
 # Project/History/Checkpoint/Release/Restore. Schema: contracts/plm.md.
 # Engine: services/plm/. Zero user-facing git vocabulary (contract §8).
 from mcp_server.plm_tools import register_plm_tools
-register_plm_tools(mcp)
+register_plm_tools(_reg.view(mcp, "plm"))
 # CAD link graph (1D): cad_graph traversal + cad_graph_link (AI overlay) +
 # assembly_plan_review. Over services/plm/cad_graph.py + graph_links.py.
 from mcp_server.graph_tools import register_graph_tools
@@ -359,67 +365,67 @@ register_graph_tools(_reg.view(mcp, "cad"))
 # Requirements (aicad.req/1): CRUD + markdown projection for design briefs.
 # Schema: contracts/requirements.md  Brain: services/requirements/requirements.py
 from mcp_server.req_tools import register_req_tools
-register_req_tools(mcp)
+register_req_tools(_reg.view(mcp, "cad"))
 
 # Layout-first planning helper (T-BL50) — capture envelope + critical dims + interfaces
 # BEFORE modeling; coverage gate (layout_coverage) surfaces in design_review.
 from mcp_server.layout_plan_tools import register_layout_plan_tools
-register_layout_plan_tools(mcp)
+register_layout_plan_tools(_reg.view(mcp, "cad"))
 
 # Verify battery (T-H4) — deterministic check dispatcher for RL reward + CI gate.
 from mcp_server.verify_tools import register_verify_tools
-register_verify_tools(mcp)
+register_verify_tools(_reg.view(mcp, "cad"))
 
 # Research (Pillar 8): look-it-up-instead-of-recall. web_search + fetch_page return the
 # provenance-stamped answer envelope; per-user local cache; offline-safe degradation.
 # T-W3: also registers fit_calc + recommend_fit (ISO 286, aicad.calc/1 envelope).
 # Rule: call fit_calc BEFORE hole_sizing / bore decisions; recommend_fit to choose the class.
 from mcp_server.research_tools import register_research_tools
-register_research_tools(mcp)
+register_research_tools(_reg.view(mcp, "research"))
 
 # Dimension scheme planner (T-W3 / Pillar 20): suggest_dimension_scheme reads a sketch
 # entity roster and emits an ordered process-aware dimension plan (IT-grade tolerances,
 # bolt-pattern datum rules, needs_user_confirm flags for function-critical dims).
 from mcp_server.dimension_scheme_tools import register_dimension_scheme_tools
-register_dimension_scheme_tools(mcp)
+register_dimension_scheme_tools(_reg.view(mcp, "cad"))
 
 # Deliverables — spec-driven office artifacts (contract deliverables/1): make_presentation /
 # make_report / make_workbook build real .pptx/.docx/.pdf/.xlsx from a JSON spec with the
 # provenance rule (the model never types a load-bearing number); render_document previews any
 # supported file; list_artifacts reads the artifact registry. Guide: cad_guide('deliverables').
 from deliverables import register_deliverables_tools
-register_deliverables_tools(mcp)
+register_deliverables_tools(_reg.view(mcp, "cad"))
 
 # Sourcing — unified BOM roll-up (made/bought) + approved-provider price resolution (workstream B).
 from mcp_server.sourcing_tools import register_sourcing_tools
-register_sourcing_tools(mcp)
+register_sourcing_tools(_reg.view(mcp, "parts"))
 
 # Cost-out — made-part cost model (material + machining) + approved quote-out APIs (workstream B).
 from mcp_server.cost_tools import register_cost_tools
-register_cost_tools(mcp)
+register_cost_tools(_reg.view(mcp, "parts"))
 
 # Spec-sheet matching — deterministic part-number → standard-part model (BOLTS/KiCad, workstream B).
 from mcp_server.spec_tools import register_spec_tools
-register_spec_tools(mcp)
+register_spec_tools(_reg.view(mcp, "parts"))
 
 # Piping (routed pipe networks): steady-state 1-D hydraulic solve + pressure-drop report.
 from mcp_server.piping_tools import register_piping_tools
-register_piping_tools(mcp)
+register_piping_tools(_reg.view(mcp, "sim"))
 
 # Hydraulic (ISO 1219 circuit design + component sizing).
 from mcp_server.hydraulic_tools import register_hydraulic_tools
-register_hydraulic_tools(mcp)
+register_hydraulic_tools(_reg.view(mcp, "sim"))
 
 # Photo capture + photogrammetry entry path for reverse_engineer (Pillar 10 v2).
 # DEFAULT OFF — start_capture_session MCP tool starts the local listener on demand.
 from mcp_server.recon_tools import register_photo_recon_tools
-register_photo_recon_tools(mcp)
+register_photo_recon_tools(_reg.view(mcp, "recon"))
 
 # Firmware (embedded compile loop): fw_new_project / fw_build / fw_sources / fw_sim_run — auto-selects
 # the MCU target, generates a pinmap.h header from the linked ECAD board's netlist (T-C2), and runs
 # the ELF through Renode or QEMU with assertion checks (T-C3).
 from mcp_server.firmware_tools import register_firmware_tools
-register_firmware_tools(mcp)
+register_firmware_tools(_reg.view(mcp, "ecad"))
 
 # Full-wave EM (eigenmode / driven / timedomain) — builtin-fdfd + analytic adapters;
 # openEMS when installed. Compact summary-first envelopes (field arrays behind detail=).
@@ -438,31 +444,31 @@ register_power_budget_tools(_reg.view(mcp, "ecad"))
 
 # Structural (T-D2): PyNite member forces & deflections for aicad.structure/1 docs.
 from mcp_server.structural_tools import register_structural_tools
-register_structural_tools(mcp)
+register_structural_tools(_reg.view(mcp, "sim"))
 
 # Preflight (T-W12, Pillar 20 §2.10): dry-run plan validation on shadow doc clones.
 # preflight_ops is read-only; never mutates the live doc.
 from mcp_server.preflight_tools import register_preflight_tools
-register_preflight_tools(mcp)
+register_preflight_tools(_reg.view(mcp, "cad"))
 
 # Unified parts library (T-P1): federated search across all standard-parts catalogs.
 # part_search / part_get over the aicad.parts/1 FTS hub (contracts/parts.md).
 from mcp_server.parts_tools import register_parts_tools
-register_parts_tools(mcp)
+register_parts_tools(_reg.view(mcp, "parts"))
 # Adapter serving (T-H9): per-insertion-point LoRA routing table — status ("which brain
 # answered"), canary dial, always-safe rollback, and the Erik-ratified gated promotion
 # (evidence + human sign-off; no auto-promote). Pure-Python, no core dependency.
 from mcp_server.serving_tools import register_serving_tools
-register_serving_tools(mcp)
+register_serving_tools(_reg.view(mcp, "advisor"))
 # Regen diagnosis (T-H11 / IP-18): on a rebuild failure, diagnose + propose editable fix-ops as
 # an accept/edit/reject card, logged as an IP-18 correction trace. LIVE since T-BL22:
 # add_features attaches the card on rebuild failure; regen_resolve records the accept/edit/
 # reject action trace (journaled to CACHE/telemetry/events.jsonl).
 from mcp_server.regen_tools import register_regen_tools
-register_regen_tools(mcp)
+register_regen_tools(_reg.view(mcp, "cad"))
 # Code compliance (T-D4): deterministic rule engine + agentic RAG for building-code checks.
 from mcp_server.code_compliance_tools import register_code_compliance_tools
-register_code_compliance_tools(mcp)
+register_code_compliance_tools(_reg.view(mcp, "cad"))
 # ---------------------------------------------------------------------------
 # Orchestration / supervision families — the DAG supervisor, mission phase
 # machine, build-order planner, foreman, ledger, and workspace lease registry.
@@ -475,12 +481,12 @@ if not _LITE:
     # These five tools expose the services/dag executor to MCP clients so a model or UI can
     # start/resume/inspect/gate DAG missions without a bespoke integration layer.
     from services.dag.mcp_tools import register_dag_tools
-    register_dag_tools(mcp)
+    register_dag_tools(_reg.view(mcp, "mission"))
     # DAG replan (T-F12): dag_replan splices new nodes into a running checkpointed DAG run.
     # Validates end_condition + retry_budget on every spliced node (DoD enforcement), merges
     # into the persisted graph sidecar, and resumes via executor.resume().
     from services.dag.mcp_tools import register_dag_replan_tools
-    register_dag_replan_tools(mcp)
+    register_dag_replan_tools(_reg.view(mcp, "mission"))
     # Mission pipeline (T-W19): mission_start / mission_status / replan_request.
     # The copilot's mission front door — INTAKE→DELIVER phase machine on top of the
     # ledger + roles + buildgraph + DAG.  mission_status renders phase state from the
@@ -488,7 +494,7 @@ if not _LITE:
     # an aicad.replan/1 request per contract §17.  The in-app path is
     # services.agent.loop.run_mission.
     from services.mcp.mission_tools import register_mission_tools
-    register_mission_tools(mcp)
+    register_mission_tools(_reg.view(mcp, "mission"))
     # Design ledger (T-W1, Pillar 20): persistent mission state (aicad.ledger/1).
     # ledger_get / ledger_note let any agent role read or write the design ledger without
     # holding the full chat history — the anti-context-loss mechanism for 24k local models.
@@ -500,7 +506,7 @@ if not _LITE:
     # with prerequisite edges; validator findings are aicad.advisory/1 items.
     # ready_nodes() surface for T-W16 multi-doc fan-out.
     from services.agent.buildgraph.mcp_tools import register_buildgraph_tools
-    register_buildgraph_tools(mcp)
+    register_buildgraph_tools(_reg.view(mcp, "mission"))
     # Advisory engine / foreman (T-W5, Pillar 20): advise / stage_set / advisory_dispute.
     # advise runs a stage's read-only check battery over a doc on demand (aicad.advisory/1);
     # the in-app loop.py + dag node runner already run the foreman automatically. advise is
@@ -517,7 +523,7 @@ if not _LITE:
 # (verify.py) + battery._get_fn for feature_overlap/dfm.  Returns a narrated verdict
 # card per contracts/narration.md — never a raw JSON dump.  On-demand helper (kept in lite).
 from services.mcp.design_review_tools import register_design_review_tools
-register_design_review_tools(mcp)
+register_design_review_tools(_reg.view(mcp, "cad"))
 # design_recipe — NL intent → ordered tool steps (always-on helper).
 from services.agent.design_recipe import design_recipe as _design_recipe_fn
 _ws = _reg.view(mcp, "workspace")
@@ -536,14 +542,14 @@ def design_recipe(query: str = "", max_results: int = 3) -> dict:
 # — the layout errors that pass check_interference (no clash) but are still wrong.  Reuses
 # doc_query (per-body faces), asm_world_bodies, cam_extract holes, research_thread_spec.
 from mcp_server.interface_check_tools import register_interface_check_tools
-register_interface_check_tools(mcp)
+register_interface_check_tools(_reg.view(mcp, "cad"))
 # Tolerance stack-up analysis (T-BL08): 1D worst-case + RSS over a chain of feature
 # dimensions.  Pure-Python; no C++ engine required.  See cad_guide('tolerance_stackup').
 from services.mcp.tolerance_tools import register_tolerance_tools
-register_tolerance_tools(mcp)
+register_tolerance_tools(_reg.view(mcp, "cad"))
 # Mechanical engineering checks (T-BL18): AGMA gear tooth stress + ISO 281 bearing life.
 from mcp_server.mechanical_tools import register_mechanical_tools
-register_mechanical_tools(mcp)
+register_mechanical_tools(_reg.view(mcp, "sim"))
 # 3D sketch + sketch preview tools: sketch3d_new/add_curves/get/clear/as_sweep_guide,
 # render_sketch, sketch_preview_text, doc_sketch_contact_sheet, sketch3d_preview.
 # These give an AI driver the same 3D-sketch and 2D-sketch-preview capabilities the GUI
@@ -562,40 +568,6 @@ from services.mcp.reveng_session_tools import register_reveng_session_tools
 from services.mcp.reveng_build_tools import register_reveng_build_tools
 register_reveng_session_tools(_reg.view(mcp, "reveng"))
 register_reveng_build_tools(_reg.view(mcp, "reveng"))
-
-# Family retags so Settings → AI → Tools toggles match real tool ownership.
-# FEA/CFD/motion ship inside register_cad_tools but belong under ``sim``;
-# bare register_* calls (research/plm/dag/mission/buildgraph) get families here.
-_FAMILY_REASSIGN: dict[str, tuple[str, ...]] = {
-    "sim": (
-        "run_fea_static", "run_fea_modal", "run_fea_fatigue", "run_fea_thermal",
-        "run_fea_buckling", "run_fea_contact", "run_cfd_flow", "run_cfd_accurate",
-        "simulate_motion",
-    ),
-    "plm": (
-        "plm_init", "plm_open", "plm_save", "plm_checkpoint", "plm_release",
-        "plm_history", "plm_restore", "plm_status", "plm_compare",
-        "plm_set_ai_mode", "plm_item_set", "plm_item_add", "plm_where_used",
-        "plm_timeline", "plm_rollback", "plm_add_remote", "plm_sync",
-        "plm_lock", "plm_unlock", "plm_link_repo", "plm_plan",
-    ),
-    "research": (
-        "research_web_search", "research_fetch_page", "research_material_lookup",
-        "research_unit_convert", "research_standard_section",
-        "research_datasheet_fetch", "research_thread_spec", "research_eng_calc",
-        "fit_calc", "recommend_fit",
-    ),
-    "mission": (
-        "dag_plan", "dag_run", "dag_status", "dag_approve", "dag_abort",
-        "dag_replan", "buildgraph_plan", "buildgraph_status",
-        "mission_start", "mission_status", "replan_request",
-    ),
-}
-_cat = _reg.catalog()
-for _fam, _names in _FAMILY_REASSIGN.items():
-    for _n in _names:
-        if _n in _cat:
-            _cat[_n]["family"] = _fam
 
 
 def _install_clean_stdout():

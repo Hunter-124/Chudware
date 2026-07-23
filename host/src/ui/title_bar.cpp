@@ -33,6 +33,7 @@
 #include "feature_tree.h"      // ui::featureTreeActivePath (Save vs. Save As gating)
 #include "property_manager.h"  // PropertyManager::active() (used in View sub-menu)
 #include "widgets/interwebz.h" // ui::InterwebzDemoToggle (View > Interwebz demo)
+#include "plm/plm_hub.h"       // ui::plmProjectName (active-project status control)
 
 #include <filesystem>      // Recent-files menu labels
 #include <cstdio>          // snprintf
@@ -419,6 +420,69 @@ static ChipResult drawChipAt(const char* btnId,
     return {clicked, hovered};
 }
 
+// ---- Active-project status control (title bar) --------------------------
+// Distinct from the workspace-tab chips on purpose: this is a persistent piece of
+// app state (which project folder is active), not a page switch. It reads as a
+// recessed "field" — tight corners + an always-visible accent border + a trailing
+// chevron that signals "click opens a switcher" — where the tabs are borderless
+// pills that only wash on hover/active. Click opens the same folder picker the
+// old PLM-tab nav button used (see plm/plm_workspace.cpp drawNavFolderButton,
+// now removed in favor of this one shared control).
+static ChipResult drawActiveProjectControl(AppState& st, ImVec2 p0, float h, ImFont* boldFont,
+                                            float& outW) {
+    const float S = ui::uiScale;
+    std::string name = ui::plmProjectName(st);
+    if (name.empty()) name = "Open project\xe2\x80\xa6";
+
+    const float iconSz  = h * 0.44f;
+    const float padX    = 10.0f * S;
+    const float iconGap = 6.0f * S;
+    const float chevGap = 8.0f * S;
+    const float chevW   = h * 0.26f;
+
+    ImFont* font = boldFont ? boldFont : ImGui::GetFont();
+    const float textW = font->CalcTextSizeA(font->FontSize, FLT_MAX, 0, name.c_str()).x;
+    const float w = padX + iconSz + iconGap + textW + chevGap + chevW + padX;
+    outW = w;
+
+    ImGui::SetCursorScreenPos(p0);
+    bool clicked = ImGui::InvisibleButton("##tb_active_project", ImVec2(w, h));
+    bool hovered = ImGui::IsItemHovered();
+    bool held    = ImGui::IsItemActive();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 p1(p0.x + w, p0.y + h);
+    const float rnd = h * 0.16f;  // tighter than tab/chip rounding (~0.28-0.30) — reads as a field
+
+    ui::glassBackground(dl, p0, p1, rnd / S);
+    const ImU32 borderCol = ImGui::GetColorU32(ImVec4(
+        ui::palette.accent[0], ui::palette.accent[1], ui::palette.accent[2], hovered ? 0.85f : 0.50f));
+    dl->AddRect(p0, p1, borderCol, rnd, 0, ui::metrics::stroke(1.3f));
+    if (held || hovered) {
+        dl->AddRectFilled(p0, p1, ImGui::GetColorU32(ImVec4(
+            ui::palette.accent[0], ui::palette.accent[1], ui::palette.accent[2],
+            held ? 0.16f : 0.09f)), rnd);
+    }
+
+    const ImU32 textU32 = ImGui::ColorConvertFloat4ToU32(ImVec4(
+        ui::palette.text[0], ui::palette.text[1], ui::palette.text[2], ui::palette.text[3]));
+    float x = p0.x + padX;
+    ui::drawIconGlass(dl, "body_folder", ImVec2(x + iconSz * 0.5f, p0.y + h * 0.5f), iconSz, textU32, 0);
+    x += iconSz + iconGap;
+    dl->AddText(font, font->FontSize, ImVec2(x, p0.y + (h - font->FontSize) * 0.5f), textU32, name.c_str());
+    x += textW + chevGap;
+    {
+        // Small chevron glyph — a switcher affordance, not a nav arrow.
+        const float cy = p0.y + h * 0.5f;
+        const float cw = chevW, chh = chevW * 0.55f;
+        const float th = ui::metrics::stroke(1.4f);
+        dl->AddLine(ImVec2(x, cy - chh * 0.5f), ImVec2(x + cw * 0.5f, cy + chh * 0.5f), textU32, th);
+        dl->AddLine(ImVec2(x + cw * 0.5f, cy + chh * 0.5f), ImVec2(x + cw, cy - chh * 0.5f), textU32, th);
+    }
+
+    if (hovered) ImGui::SetTooltip("Change the active project folder");
+    return {clicked, hovered};
+}
+
 // Measure chip width (same formula as drawChipAt so sizes are consistent).
 static float chipMeasureW(const char* label, float padX, ImFont* boldFont,
                           float iconSz, float iconGap) {
@@ -774,6 +838,33 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
         hitLayout.menuRight = (int)(cx - winX);
 
         // ---- Subtle vertical separator between left group and workspace tabs ----
+        {
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const float sepScreenX = cx + 6.0f * s;
+            const float sepY0 = barTopScreenY + barH * 0.20f;
+            const float sepY1 = barTopScreenY + barH * 0.80f;
+            ImU32 sepCol = ui::Palette::toU32(ui::palette.border);
+            sepCol = (sepCol & 0x00FFFFFF) | 0x60000000u;
+            dl->AddLine(ImVec2(sepScreenX, sepY0), ImVec2(sepScreenX, sepY1), sepCol, 1.5f * s);
+        }
+
+        cx += 14.0f * s;  // clear the separator just drawn
+
+        // ---- Active-project status control — deliberately NOT another chip in the tab
+        // group; see drawActiveProjectControl for why (persistent state vs. page switch). ----
+        {
+            const ImVec2 ctrlP0(cx, barTopScreenY + chipVPad);
+            float ctrlW = 0.0f;
+            auto res = drawActiveProjectControl(st, ctrlP0, chipH, boldFont, ctrlW);
+            hitLayout.addSpan((int)(cx - winX), (int)(cx - winX + ctrlW));
+            if (res.clicked) {
+                std::string abs = ui::openFolderDialog();
+                if (!abs.empty()) setActiveProjectDir(st, abs);
+            }
+            cx += ctrlW + 10.0f * s;
+        }
+
+        // Second separator between the active-project control and the workspace tabs.
         {
             ImDrawList* dl = ImGui::GetWindowDrawList();
             const float sepScreenX = cx + 6.0f * s;

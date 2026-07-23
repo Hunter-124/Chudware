@@ -242,59 +242,14 @@ static void drawNavButton(const RailItem& r, int badge) {
     ImGui::PopID();
 }
 
-// A right-aligned, nav-styled action button showing the CURRENT project folder
-// name (Files icon). Click → native folder picker to switch the active PLM
-// folder. Same size/style/baseline as the rail buttons; never "selected".
-static void drawNavFolderButton(AppState& st, float rowStartX, float fullW) {
-    const float S = ui::uiScale;
-    std::string name = plmProjectName(st);
-    if (name.empty()) name = "Open folder\xe2\x80\xa6";
-
-    const float h       = ImGui::GetFrameHeight() * 1.16f;
-    const float iconSz  = 15 * S;
-    const float padX    = 10 * S;
-    const float iconGap = 7 * S;
-    const float textW   = ImGui::CalcTextSize(name.c_str()).x;
-    const float w       = padX + iconSz + iconGap + textW + padX;
-
-    ImGui::SameLine();
-    ImGui::SetCursorPosX(rowStartX + fullW - w);   // pin to the strip's right edge
-    ImGui::PushID("plm_folder_btn");
-    ImVec2 p0 = ImGui::GetCursorScreenPos();
-    ImVec2 p1(p0.x + w, p0.y + h);
-    if (ImGui::InvisibleButton("##folder", ImVec2(w, h))) {
-        std::string abs = ui::openFolderDialog();
-        if (!abs.empty()) setActiveProjectDir(st, abs);
-    }
-    const bool hov = ImGui::IsItemHovered(), held = ImGui::IsItemActive();
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    const float rnd = 9.0f * S;
-
-    // Frosted base like the rail buttons; a clean full-button wash on hover/press
-    // (no accent top-strip — that read as a glitchy bar across the top edge).
-    ui::glassBackground(dl, p0, p1, 9.0f);
-    if (hov)
-        dl->AddRectFilled(p0, p1, ImGui::GetColorU32(ImVec4(
-            palette.text[0], palette.text[1], palette.text[2], held ? 0.12f : 0.06f)), rnd);
-    const ImU32 tcu = ImGui::ColorConvertFloat4ToU32(ImVec4(
-        palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
-    float x = p0.x + padX;
-    ui::drawIconGlass(dl, "body_folder", ImVec2(x + iconSz * 0.5f, p0.y + h * 0.5f),
-                      iconSz, tcu, 0);
-    x += iconSz + iconGap;
-    ImVec2 ts = ImGui::CalcTextSize(name.c_str());
-    dl->AddText(ImVec2(x, p0.y + (h - ts.y) * 0.5f), tcu, name.c_str());
-    if (hov) ImGui::SetTooltip("Change the active project folder");
-    ImGui::PopID();
-}
-
 // Horizontal PROJECT nav strip above the page body (replaces the old side rail —
-// frees the dead vertical column). Rail buttons on the left; a right-aligned
-// folder button (current project folder name) on the right.
+// frees the dead vertical column). The active-project folder switcher used to live
+// as a right-aligned button on this strip; it now lives in the title bar (a
+// persistent, always-visible status control) — see ui::drawTitleBar /
+// drawActiveProjectControl in title_bar.cpp — so this strip is rail buttons only.
 static void drawTopNav(AppState& st) {
+    (void)st;
     const float S = ui::uiScale;
-    const float rowStartX = ImGui::GetCursorPosX();
-    const float fullW     = ImGui::GetContentRegionAvail().x;
     const float gap = 6 * S;
     for (int i = 0; i < (int)(sizeof(kRail) / sizeof(kRail[0])); ++i) {
         // Degrade: hide Graph when the worker lacks cad_graph_* RPCs.
@@ -305,7 +260,6 @@ static void drawTopNav(AppState& st) {
         if (kRail[i].page == PlmPage::Planning) badge = g_plmHub.overview.openIssues;
         drawNavButton(kRail[i], badge);
     }
-    drawNavFolderButton(st, rowStartX, fullW);
 }
 
 // ---- onboarding (no project resolvable) ---------------------------------------

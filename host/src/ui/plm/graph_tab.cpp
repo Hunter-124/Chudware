@@ -360,6 +360,20 @@ ImU32 kindColor(const std::string &k, float a = 1.0f) {
   return ImGui::GetColorU32(ImVec4(c[0], c[1], c[2], a));
 }
 
+// DOCUMENTS/SIMULATES/MANUFACTURES used to alias palette.accent/simMesh/
+// statusOk — accent and statusOk are the SAME teal (statusOk is defined as
+// "same as accent"), so DOCUMENTS and MANUFACTURES rendered as literally
+// identical colors, and simMesh sits a hair off diffHunk (REFERENCES),
+// clustering three edge kinds into one indistinguishable blue/teal family.
+// These three get their own hues, spread away from every other edge color
+// (red/amber/green/blue/purple already claimed) instead of reusing
+// generically-named theme fields whose values happen to collide.
+static const float kDocumentsColor[4] = {0.902f, 0.478f, 0.702f, 1.0f}; // rose
+static const float kSimulatesColor[4] = {0.902f, 0.451f, 0.251f, 1.0f}; // burnt orange
+static const float kManufacturesColor[4] = {0.243f, 0.780f, 0.729f,
+                                            1.0f}; // cyan-teal (distinct from
+                                                   // INSTANCE_OF's true green)
+
 ImU32 edgeColor(const std::string &k, float a = 0.70f) {
   const float *c = palette.textDim;
   if (k == "CONTAINS")
@@ -375,11 +389,11 @@ ImU32 edgeColor(const std::string &k, float a = 0.70f) {
   else if (k == "DERIVES_FROM")
     c = palette.sketchExternal;
   else if (k == "DOCUMENTS")
-    c = palette.accent;
+    c = kDocumentsColor;
   else if (k == "SIMULATES")
-    c = palette.simMesh;
+    c = kSimulatesColor;
   else if (k == "MANUFACTURES")
-    c = palette.statusOk;
+    c = kManufacturesColor;
   return ImGui::GetColorU32(ImVec4(c[0], c[1], c[2], a));
 }
 
@@ -422,6 +436,27 @@ static const char *kEdgeKinds[] = {
     "CONTAINS",     "DEPENDS_ON", "MATES",     "INSTANCE_OF",  "REFERENCES",
     "DERIVES_FROM", "DOCUMENTS",  "SIMULATES", "MANUFACTURES",
 };
+
+// Display label for an edge-kind token: "DEPENDS_ON" -> "Depends On". The
+// raw upper_snake token is still what's stored in hiddenKinds / sent to the
+// backend; only the chip/legend text is reformatted for readability.
+std::string edgeKindLabel(const std::string &k) {
+  std::string out;
+  out.reserve(k.size());
+  bool startOfWord = true;
+  for (char c : k) {
+    if (c == '_') {
+      out += ' ';
+      startOfWord = true;
+    } else if (startOfWord) {
+      out += (char)std::toupper((unsigned char)c);
+      startOfWord = false;
+    } else {
+      out += (char)std::tolower((unsigned char)c);
+    }
+  }
+  return out;
+}
 
 // Compact value label for a dimensional edge, e.g. "width=12mm" or "25mm".
 std::string edgeDimLabel(const nlohmann::json &meta) {
@@ -1341,14 +1376,34 @@ void hierarchySeed(GraphTabState &G,
                  members[static_cast<size_t>(b)].size();
         return a < b;
       });
-      // Main-pack extent (placed nodes) anchors the shelf origin.
-      float mainExt = spacing * 10.0f;
+      // Main-pack extent anchors the shelf origin. Fresh nodes wrote their
+      // position into outX/outY; already-placed (cached/warm) nodes never
+      // did, so their real extent must come from the node's own lx/ly —
+      // skipping them (as before) left mainExt pinned at an oversized
+      // fallback floor whenever the whole main pack was warm (the common
+      // case on a routine refresh), stranding fragments far off-canvas from
+      // an already-tight main cluster. Only fall back to a small floor when
+      // there is truly no main pack to anchor against.
+      float mainExt = 0.0f;
+      bool haveMain = false;
       for (int i = 0; i < V; ++i) {
-        if (!placed[static_cast<size_t>(i)] || !isFresh[static_cast<size_t>(i)])
+        if (!placed[static_cast<size_t>(i)])
           continue;
-        mainExt = std::max(mainExt, std::fabs(outX[static_cast<size_t>(i)]));
-        mainExt = std::max(mainExt, std::fabs(outY[static_cast<size_t>(i)]));
+        float px, py;
+        if (isFresh[static_cast<size_t>(i)]) {
+          px = outX[static_cast<size_t>(i)];
+          py = outY[static_cast<size_t>(i)];
+        } else {
+          const GNode &pn = G.nodes[G.visibleIdx[static_cast<size_t>(i)]];
+          px = pn.lx;
+          py = pn.ly;
+        }
+        mainExt = std::max(mainExt, std::fabs(px));
+        mainExt = std::max(mainExt, std::fabs(py));
+        haveMain = true;
       }
+      if (!haveMain)
+        mainExt = spacing * 2.0f; // no main pack at all: small, sane floor
       const float x0 = mainExt + 2.2f * spacing;
       float sx = x0, sy = -mainExt, rowH = 0.0f;
       const float rowW = 2.0f * mainExt + 4.0f * spacing;
@@ -1926,7 +1981,7 @@ void drawArcSpinner(ImDrawList *dl, ImVec2 c, float radius, ImU32 col) {
 // Bump kLayoutVersion whenever seed/clustering/force policy changes enough that
 // old positions would re-open as a hairball. Missing/mismatched version →
 // ignore the file and re-seed from the current algorithm (cluster wells).
-constexpr int kLayoutVersion = 9;
+constexpr int kLayoutVersion = 10;
 
 std::filesystem::path layoutCachePath(const GraphTabState &G) {
   return std::filesystem::path(G.projectDir) / ".plm" / "graph_layout.json";
@@ -4849,10 +4904,14 @@ void plmDrawGraphPage(AppState &st) {
       ImGui::AlignTextToFramePadding();
       const ImVec2 ip = ImGui::GetCursorScreenPos();
       const float ic = 14.0f * S;
-      ImGui::Dummy(ImVec2(ic, ic));
+      // Reserve the full button-row height (not just the icon's own ic x ic
+      // box) so the icon centers on the "Project" button beside it instead
+      // of sitting top-anchored above a taller frame item.
+      const float rowH = ImGui::GetFrameHeight();
+      ImGui::Dummy(ImVec2(ic, rowH));
       ImGui::SameLine(0, 3.0f * S);
       ui::drawIconGlass(ImGui::GetWindowDrawList(), "body_folder",
-                        ImVec2(ip.x + ic * 0.5f, ip.y + ic * 0.5f), ic,
+                        ImVec2(ip.x + ic * 0.5f, ip.y + rowH * 0.5f), ic,
                         kindColor("project", 0.9f), 0);
     }
     if (ImGui::SmallButton("Project##bc_root")) {
@@ -4954,9 +5013,9 @@ void plmDrawGraphPage(AppState &st) {
     const int visN = (int)G.visibleIdx.size();
     const int loadN = (int)G.nodes.size();
     const int fullN = G.nodeCountFull > 0 ? G.nodeCountFull : loadN;
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.textDisabled[0],
-                                                palette.textDisabled[1],
-                                                palette.textDisabled[2], 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.textDim[0],
+                                                palette.textDim[1],
+                                                palette.textDim[2], 1.0f));
     if (G.scopeDocId.empty())
       ImGui::Text("%d of %d nodes visible \xc2\xb7 %d edges", visN, fullN,
                   (int)G.visibleEdges.size());
@@ -4969,7 +5028,7 @@ void plmDrawGraphPage(AppState &st) {
       ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.textDisabled[0],
                                                   palette.textDisabled[1],
                                                   palette.textDisabled[2],
-                                                  0.75f));
+                                                  1.0f));
       ImGui::Text("\xc2\xb7 generated %s", G.generatedAt.c_str());
       ImGui::PopStyleColor();
     }
@@ -5025,35 +5084,43 @@ void plmDrawGraphPage(AppState &st) {
         "Arrangement is kept per-session (the layered layout is re-derived\n"
         "deterministically on entry).");
   }
-  // Edge-kind toggles, visually grouped: structural relations (containment,
-  // deps, mates, instances, references) then documentation/derivation
-  // relations. A wider gap + thin divider separates the two families.
-  for (int ki = 0; ki < (int)(sizeof(kEdgeKinds) / sizeof(kEdgeKinds[0]));
-       ++ki) {
-    const char *k = kEdgeKinds[ki];
-    if (ki == 5) {
-      // Group boundary: structural | documentation.
-      ImGui::SameLine(0, 12 * S);
-      const ImVec2 dp = ImGui::GetCursorScreenPos();
-      const float dh = ImGui::GetFrameHeight();
-      ImGui::GetWindowDrawList()->AddLine(
-          ImVec2(dp.x, dp.y + 3 * S), ImVec2(dp.x, dp.y + dh - 3 * S),
-          Palette::toU32(palette.glassBorder), 1.0f * S);
-      ImGui::SameLine(0, 12 * S);
-    } else {
-      ImGui::SameLine();
+  // Edge-kind toggle grid: structural relations (containment, deps, mates,
+  // instances, references) on top, documentation/derivation relations
+  // (derives-from, documents, simulates, manufactures) stacked directly
+  // beneath — a compact 2-row grid of on/off switches instead of one long
+  // strip that ran off past the window edge.
+  ImGui::SameLine(0, 12 * S);
+  {
+    const float gridX = ImGui::GetCursorPosX();
+    auto drawKindChip = [&](const char *k) {
+      const bool vis = !G.hiddenKinds.count(k);
+      const ImU32 tc =
+          vis ? edgeColor(k, 1.0f) : Palette::toU32(palette.textDisabled);
+      ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(tc));
+      const std::string lab = edgeKindLabel(k) + "##ek_" + std::string(k);
+      if (ImGui::SmallButton(lab.c_str())) {
+        if (vis)
+          G.hiddenKinds.insert(k);
+        else
+          G.hiddenKinds.erase(k);
+        G.layoutDirty = true;
+      }
+      ImGui::PopStyleColor();
+    };
+    constexpr int kStructN = 5; // CONTAINS..REFERENCES
+    constexpr int kTotal = (int)(sizeof(kEdgeKinds) / sizeof(kEdgeKinds[0]));
+    for (int ki = 0; ki < kStructN; ++ki) {
+      if (ki > 0)
+        ImGui::SameLine(0, 4 * S);
+      drawKindChip(kEdgeKinds[ki]);
     }
-    bool vis = !G.hiddenKinds.count(k);
-    ImU32 tc = vis ? edgeColor(k, 1.0f) : Palette::toU32(palette.textDisabled);
-    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(tc));
-    if (ImGui::SmallButton(k)) {
-      if (vis)
-        G.hiddenKinds.insert(k);
-      else
-        G.hiddenKinds.erase(k);
-      G.layoutDirty = true;
+    ImGui::NewLine();
+    ImGui::SetCursorPosX(gridX);
+    for (int ki = kStructN; ki < kTotal; ++ki) {
+      if (ki > kStructN)
+        ImGui::SameLine(0, 4 * S);
+      drawKindChip(kEdgeKinds[ki]);
     }
-    ImGui::PopStyleColor();
   }
   } else {
     // Grid/List controls: kind filter chips + sort (graph controls hidden).

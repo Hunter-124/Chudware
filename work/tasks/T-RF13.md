@@ -30,5 +30,5 @@ beacons; update Webservice/perf/baseline.json.
 ## Definition of done
 
 - [ ] WASM build holds ≥30 FPS on a weak-iGPU scenario without manual settings.
-- [ ] Native desktop output pixel-identical at default quality.
+- [x] Native desktop output pixel-identical at default quality.
 - [ ] perf_probe + client beacons updated; gate.sh green; REFACTOR_LOG handoff.

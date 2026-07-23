@@ -46,6 +46,25 @@ bool is_capability_request(const std::string& request);
 // Short reason string for a capability hit (empty when is_capability_request is false).
 std::string capability_request_reason(const std::string& request);
 
+// What KIND of capability a request maps to. The distinction matters because the
+// run pipeline is a modeling pipeline: accepting a capability request is only safe
+// when that capability actually produces geometry. Non-geometry work (PLM /
+// version-control, file + project organization, measure-only, BOM/sourcing) must
+// terminate the run with a handoff instead of being fed a synthetic spec — else the
+// planner turns every admin step into an extruded plate.
+enum class CapabilityKind {
+    None,         // not an in-product capability request
+    Geometry,     // produces/edits geometry — safe to run the modeling pipeline
+    NonGeometry,  // admin/analysis surface — must NOT enter the modeling pipeline
+};
+
+CapabilityKind capability_kind(const std::string& request);
+
+// True when the request is dominated by project/file/PLM administration cues
+// (organize folders, move files, deprecate, rename parts, check into version
+// control) rather than by build-a-part cues. Deterministic, no LLM.
+bool is_admin_request(const std::string& request);
+
 // The SCOPED tool/capability classes for a domain — coarse capability tags a host
 // maps to a concrete tool allowlist (keeps a modeling agent from loading CAM/ECAD
 // tools). Always includes the domain's own class plus universally-safe read tags.

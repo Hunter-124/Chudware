@@ -145,3 +145,52 @@ TEST_CASE("capability helper accepts product surfaces, rejects garbage") {
     CHECK_FALSE(chudware::agent::is_capability_request(""));
     CHECK_FALSE(chudware::agent::is_capability_request("hello how are you"));
 }
+
+// Regression: a project/file/PLM administration brief must be classified as a
+// NON-GEOMETRY capability. Before this, the capability override accepted it and
+// fed the modeling pipeline a synthetic spec, so every admin step in the plan came
+// back as an extruded plate in a bogus part document.
+TEST_CASE("admin/PLM cleanup brief is non-geometry, never modeling work") {
+    const std::string brief =
+        "I want you to look at all the documents in this folder/project and get them "
+        "cleaned up & put into the plm system properly, and clean up the file system "
+        "while your at it too. lets have it all well organized and have all the "
+        "depricated stuff in specified \"depricated\" folders, move the unrelated work "
+        "into /documents/AI-CAD, and keep the .step files seperate as well. you need to "
+        "rename a lot of the parts too and just make the names simpler.";
+    CHECK(chudware::agent::is_admin_request(brief));
+    CHECK(chudware::agent::capability_kind(brief) ==
+          chudware::agent::CapabilityKind::NonGeometry);
+    CHECK(chudware::agent::is_capability_request(brief));
+}
+
+TEST_CASE("non-geometry capabilities are tagged as such") {
+    using chudware::agent::capability_kind;
+    using chudware::agent::CapabilityKind;
+    CHECK(capability_kind("initialize the built-in PLM vault for this project") ==
+          CapabilityKind::NonGeometry);
+    CHECK(capability_kind("check in a checkpoint and deprecate the old parts") ==
+          CapabilityKind::NonGeometry);
+    CHECK(capability_kind("measure mass properties of the bracket") ==
+          CapabilityKind::NonGeometry);
+    CHECK(capability_kind("export the bill of materials") == CapabilityKind::NonGeometry);
+}
+
+TEST_CASE("geometry capabilities still route into the modeling pipeline") {
+    using chudware::agent::capability_kind;
+    using chudware::agent::CapabilityKind;
+    CHECK(capability_kind("download a model from McMaster") == CapabilityKind::Geometry);
+    CHECK(capability_kind("reverse engineer this STEP into features") ==
+          CapabilityKind::Geometry);
+    CHECK(capability_kind("generate milling toolpaths and post g-code") ==
+          CapabilityKind::Geometry);
+    CHECK(capability_kind("design a PCB for an ESP32") == CapabilityKind::Geometry);
+}
+
+// A real design brief that merely MENTIONS version control must still model.
+TEST_CASE("design brief that mentions PLM is not demoted to admin") {
+    const std::string brief =
+        "design a mounting bracket with two M5 holes, then check it into PLM";
+    CHECK_FALSE(chudware::agent::is_admin_request(brief));
+    CHECK(classify_domain(brief).domain == Domain::Modeling);
+}

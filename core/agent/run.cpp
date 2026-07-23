@@ -699,6 +699,38 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
     } advisory_guard;
 
     RunEvents events(run_id, emit);
+
+    // ---- PRE-FLIGHT: refuse non-modeling work before anything is created ----
+    // Deterministic, LLM-independent. A request dominated by project/file/PLM
+    // administration cues ("clean up the folders, move the unrelated .step files out,
+    // deprecate the old parts, track it in PLM") has no geometry in it. Historically
+    // it fell through to the default Modeling domain and the planner turned each admin
+    // step into an extruded plate. Bail out here — before the FILE-FIRST doc save —
+    // so no document, no feature and no file is created. Sub-runs are exempt: their
+    // request text is a parent-authored task, already vetted.
+    if (!is_sub_run && is_admin_request(request)) {
+        const std::string why = capability_request_reason(request);
+        const std::string human =
+            "That's project and file management, not a modeling task. I build geometry, "
+            "so running this here would have produced a part full of meaningless "
+            "features. Nothing was built, nothing was moved, no file was touched.\n\n"
+            "Use the PLM tab for version control, releases and deprecating parts, and "
+            "the file explorer for reorganizing folders.";
+        events.emit("task_route", json{{"domain", "admin"},
+                                       {"reason", why},
+                                       {"tool_classes", json::array()},
+                                       {"context_sheets", json::array()}});
+        events.emit("run_finished", json{{"status", "blocked"},
+                                         {"stop_reason", "non_modeling_request"},
+                                         {"error_detail", why}});
+        return json{{"run_id", run_id},
+                    {"status", "blocked"},
+                    {"stop_reason", "non_modeling_request"},
+                    {"error_detail", why},
+                    {"error_human", human},
+                    {"doc_id", doc_id}};
+    }
+
     // Live provider_call debug events (endpoint/status/latency) land on the same
     // emit stream as stage events so the host can orch_-prefix them into chat.
     set_provider_call_emitter([&events](const json& ev) {
@@ -1275,6 +1307,17 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
             o.error = "unintelligible_request";
             return o;
         };
+        // Non-geometry capability (PLM / project + file organization / measure-only /
+        // BOM). Terminal, but NOT "unintelligible" — the request is understood, it
+        // just must not enter the modeling pipeline.
+        auto handoff_out = [&](const std::string& why) -> StageOutcome {
+            o.verdict = "fail";
+            o.reason = why;
+            o.parsed_ok = true;
+            o.has_error = true;
+            o.error = "non_modeling_request";
+            return o;
+        };
         if (!spec.is_null() && spec.is_object()) {
             // Explicit reject signal from the intake prompt protocol.
             if (spec.contains("reject") && truthy_json(spec["reject"])) {
@@ -1286,6 +1329,13 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
                 // CAM / sim / ECAD / RE / drawing requests are in-product work even
                 // when the LLM mislabels them "not a CAD design request". Accept
                 // with a minimal capability spec so the pipeline keeps routing.
+                // Only GEOMETRY-producing capabilities may override the reject and
+                // continue into the modeling pipeline. Non-geometry capabilities are
+                // real work the app supports, but not work this pipeline can do:
+                // overriding them here is what made a "clean up the folders + put it in
+                // PLM" request come back as a part full of extruded plates.
+                if (capability_kind(st.request) == CapabilityKind::NonGeometry)
+                    return handoff_out(capability_request_reason(st.request));
                 if (is_capability_request(st.request)) {
                     const std::string cap_why = capability_request_reason(st.request);
                     ojson cap_spec = ojson::object();
@@ -2444,6 +2494,35 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
             if (spec.contains("reason") && spec["reason"].is_string() &&
                 !spec["reason"].get<std::string>().empty())
                 reason = spec["reason"].get<std::string>();
+            // Non-geometry capability (PLM / file + project organization / measure /
+            // BOM): understood, but the modeling pipeline must not run. Terminate with
+            // a handoff instead of synthesizing a spec and building plates.
+            if (capability_kind(request) == CapabilityKind::NonGeometry) {
+                const std::string why = capability_request_reason(request);
+                const std::string human =
+                    "That's project/file management, not a modeling task — I build "
+                    "geometry, so running it here would have produced a part full of "
+                    "meaningless features. Nothing was built and nothing was moved.\n\n"
+                    "Use the PLM tab for version control, releases and deprecating "
+                    "parts, and the file explorer for reorganizing folders. (" +
+                    why + ")";
+                events.emit("stage_result", json{{"stage", "intake"},
+                                                 {"attempt", 1},
+                                                 {"verdict", "fail"},
+                                                 {"reason", why},
+                                                 {"stop_reason", "non_modeling_request"}});
+                events.emit("run_finished", json{{"status", "blocked"},
+                                                 {"stop_reason", "non_modeling_request"},
+                                                 {"error_detail", why},
+                                                 {"revision", pstate.revision}});
+                return json{{"run_id", run_id},
+                            {"status", "blocked"},
+                            {"stop_reason", "non_modeling_request"},
+                            {"error_detail", why},
+                            {"error_human", human},
+                            {"revision", pstate.revision},
+                            {"doc_id", doc_id}};
+            }
             if (is_capability_request(request)) {
                 const std::string cap_why = capability_request_reason(request);
                 ojson cap_spec = ojson::object();

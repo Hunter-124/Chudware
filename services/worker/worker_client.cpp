@@ -1362,36 +1362,39 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
     // below so document creation never hard-breaks when C++ is the default
     // engine.
   }
+  // Fall-through methods (plm_*, git_*, ai_roles_*, subscription_status, bench_*,
+  // triggers_*, skills_*, list_editable_prompts, provider accounts, and Python-only provider
+  // completions like Cursor) are served by the Python worker, NOT the C++ core. On the web
+  // there is no local pipe; on desktop in DAEMON mode the GUI likewise has no local Python
+  // child (tryStartWorker fell back to the in-process C++ core, running_==false), so in BOTH
+  // cases route them over the engine channel — engine::call -> hostd, which bridges
+  // engine-unknown methods to its lazily-spawned `python -m services.worker_main`. Without
+  // this, desktop daemon mode hit the dead local pipe below and every such method failed with
+  // "worker not started" even though hostd was up. Only a desktop build on the LEGACY
+  // in-process backend (CHUDWARE_ENGINE_DAEMON=0) with a real local worker child takes the
+  // pipe path below.
 #if defined(__EMSCRIPTEN__)
-  // Browser: no Python worker pipe. Fall-through methods (plm_*, git_*,
-  // ai_roles_*, provider accounts, …) ride the same engine channel as
-  // doc_*/agent_* above — engine::call → DaemonConn/EngineClient WS → gateway →
-  // hostd, which bridges engine-unknown methods to its lazily-spawned `python
-  // -m services.worker_main`. Map the response into the pipe path's
-  // success/failure contract (structured method errors return true with
-  // result={code,message,…}; transport fails false
-  // + errorSink_). onEvent is supported by the daemon channel (live mid-call
-  // pushes). running_ is irrelevant here (tryStartWorker never opens a pipe on
-  // web).
-  {
+  const bool routeViaEngine = true;
+#else
+  const bool routeViaEngine = engine::daemonMode();
+#endif
+  if (routeViaEngine) {
     std::string cerr;
     if (engine::call(method, params, result, cerr, timeoutMs, onEvent))
       return true;
-    // Structured method error envelope (round-trip OK) — same contract as the
-    // pipe path (object error → result + true) and the doc/cam engine branches.
+    // Structured method error envelope (round-trip OK) — same contract as the pipe path
+    // (object error -> result + true) and the doc/cam engine branches.
     if (result.is_object() && result.contains("code")) {
       err = result.value("message", std::string("rpc error"));
       return true;
     }
     if (result.is_object() && !result.empty()) {
-      // Error object without code (EngineClient stores the error payload in
-      // result).
-      err = result.value("message",
-                         cerr.empty() ? std::string("rpc error") : cerr);
+      // Error object without code (EngineClient stores the error payload in result).
+      err = result.value("message", cerr.empty() ? std::string("rpc error") : cerr);
       return true;
     }
     if (result.is_string()) {
-      // Legacy plain-string method error → false, no errorSink_ (pipe path).
+      // Legacy plain-string method error -> false, no errorSink_ (pipe path contract).
       err = result.get<std::string>();
       return false;
     }
@@ -1401,7 +1404,7 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
       errorSink_(method, err);
     return false;
   }
-#else
+#if !defined(__EMSCRIPTEN__)
   // Reap a worker child that died since start() (import crash, kill, OOM, …).
   // Without this, running_ stays true and every pipe write fails EPIPE —
   // polling panels (fw_projects, parts, plm) then re-raise the same transport

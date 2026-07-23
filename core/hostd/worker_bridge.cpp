@@ -138,16 +138,36 @@ bool WorkerBridge::spawn(std::string& err) {
     // Caller holds mtx_. running_ must be false / fds closed.
     if (!pathsResolved_) {
         const std::string home = homeDir();
-        python_ = envOr("CHUDWARE_PYTHON",
-                        home.empty() ? std::string("python3")
-                                     : home + "/.local/share/Chudware/runtime/venv/bin/python");
+        // Preferred backend is the provisioned Chudware runtime venv (carries every Python dep).
+        // When it is absent (dev checkout / unprovisioned install) fall back to a system python3
+        // so the lightweight worker RPCs the GUI needs (ai_roles / subscription_status / skills /
+        // triggers / prompts / bench catalog) still work instead of hard-failing with "Python
+        // runtime not installed". CHUDWARE_PYTHON overrides all of this. Heavy deps (build123d
+        // etc.) only matter for run_model-class RPCs, which route to the C++ core anyway.
+        python_ = envOr("CHUDWARE_PYTHON", std::string());
+        if (python_.empty()) {
+            const std::string venv =
+                home.empty() ? std::string()
+                             : home + "/.local/share/Chudware/runtime/venv/bin/python";
+            if (!venv.empty() && fileExists(venv)) {
+                python_ = venv;
+            } else {
+                for (const char* cand :
+                     {"/usr/bin/python3", "/usr/local/bin/python3", "/usr/bin/python"}) {
+                    if (fileExists(cand)) { python_ = cand; break; }
+                }
+                if (python_.empty()) python_ = "python3";  // execlp PATH search in the child
+            }
+        }
         repo_ = envOr("CHUDWARE_REPO",
                       home.empty() ? std::string(".") : home + "/Repositories/CAD");
         pathsResolved_ = true;
     }
 
-    if (!fileExists(python_)) {
-        err = "Python runtime not installed. Expected: " + python_ +
+    // Only a fully-qualified path is validated here; a bare "python3" defers to execlp's PATH
+    // search in the forked child (fileExists on a bare name is always false).
+    if (python_.find('/') != std::string::npos && !fileExists(python_)) {
+        err = "Python runtime not found at " + python_ +
               " (set CHUDWARE_PYTHON or provision the Chudware runtime venv)";
         log().line("worker_bridge: spawn failed: %s", err.c_str());
         return false;

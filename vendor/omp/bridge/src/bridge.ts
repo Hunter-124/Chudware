@@ -39,6 +39,7 @@ import { stream } from "@oh-my-pi/pi-ai";
 import type { AssistantMessage, Context, Message, StreamOptions } from "@oh-my-pi/pi-ai";
 import { getBundledModels, getBundledProviders } from "@oh-my-pi/pi-catalog";
 import {
+	getAuthContext,
 	handleAuthListProviders,
 	handleAuthLogout,
 	handleAuthRemoveKey,
@@ -137,6 +138,20 @@ function collapse(msg: AssistantMessage): Json {
 	return out;
 }
 
+// Credential fallback for completion ops: sign-ins land in the CAD-owned AuthStorage
+// (auth-context.ts), but stream() only consults options.apiKey / env vars — so without
+// this, every bridge-routed provider fails "No API key" even when signed in. The C++
+// side only sends apiKey when IT holds one (native providers); bridge providers rely
+// on this lookup. OAuth credentials refresh inside getApiKey() before being handed out.
+async function resolveAuthApiKey(provider: string): Promise<string | undefined> {
+	try {
+		const { authStorage } = await getAuthContext();
+		return (await authStorage.getApiKey(provider)) || undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 async function handleComplete(params: Json): Promise<Json> {
 	const provider = str(params.provider);
 	const modelId = str(params.model);
@@ -149,6 +164,10 @@ async function handleComplete(params: Json): Promise<Json> {
 
 	const options: StreamOptions = {};
 	if (params.apiKey) options.apiKey = str(params.apiKey);
+	else {
+		const stored = await resolveAuthApiKey(provider);
+		if (stored) options.apiKey = stored;
+	}
 	if (typeof params.maxTokens === "number") options.maxTokens = params.maxTokens;
 
 	const result = await stream(model, context, options).result();
@@ -167,6 +186,10 @@ async function handleWarmCache(params: Json): Promise<Json> {
 	// ~1/10 the cost of a full re-send. cacheHit reports whether the prefix was actually cached.
 	const options: StreamOptions = { maxTokens: 1 };
 	if (params.apiKey) options.apiKey = str(params.apiKey);
+	else {
+		const stored = await resolveAuthApiKey(provider);
+		if (stored) options.apiKey = stored;
+	}
 	const result = await stream(model, context, options).result();
 	const collapsed = collapse(result);
 	const usage = asObject(collapsed.usage);

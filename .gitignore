@@ -49,6 +49,11 @@ imgui.ini
 # Scratch + spike outputs
 scratch/
 
+# Vendored OMP (oh-my-pi) bun workspace — SOURCE under vendor/omp/ IS tracked (deterministic,
+# re-pulled by scripts/vendor_omp.py); installed deps + native binaries are not.
+vendor/omp/node_modules/
+vendor/omp/**/node_modules/
+
 # Claude Code project state — CLAUDE.md, settings.json (shared graphify hook),
 # commands/, skills/ ARE tracked (team-shared config); only per-machine state is ignored.
 .claude/settings.local.json

@@ -34,7 +34,7 @@ can expose it and whether it's in scope for the doc subsystem or genuinely new w
 
 - [x] Every remaining oracle module either ported+deleted or proven dead+deleted.
 - [x] engine_oracle/ reduced to worker.py shell + __init__ shims for T-RF20.
-- [ ] gate.sh green per leaf; REFACTOR_LOG handoffs; web_parity inventory ~empty.
+- [x] gate.sh green per leaf; REFACTOR_LOG handoffs; web_parity inventory ~empty.
 
 ## Sub-split plan (2026-07-22, integrator recon)
 

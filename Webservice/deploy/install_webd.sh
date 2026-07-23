@@ -116,7 +116,7 @@ cat > "$DST/chudware-shared.sh" <<EOF
 export CHUDWARE_INSTANCE_KEY=$KEY
 export CHUDWARE_HOSTD_BIN="$BIN/chudware-hostd"
 export CHUDWARE_ENGINE_DAEMON=1
-exec "\${CHUDWARE_BIN:-$ROOT/host/build-linux/bin/Chudware}" "\$@"
+exec "\${CHUDWARE_BIN:-$ROOT/host/build-linux/bin/chudware}" "\$@"
 EOF
 chmod +x "$DST/chudware-shared.sh"
 echo "[webd] wrote $DST/chudware-shared.sh"

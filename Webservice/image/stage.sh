@@ -10,17 +10,17 @@ BIN_SRC="$REPO/host/build-linux/bin"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
-[ -x "$BIN_SRC/Chudware" ] || die "missing $BIN_SRC/Chudware — build host GUI first"
+[ -x "$BIN_SRC/chudware" ] || die "missing $BIN_SRC/chudware — build host GUI first"
 [ -f "$BIN_SRC/libchudware.so" ] || die "missing $BIN_SRC/libchudware.so"
 
 echo "==> staging into $STAGE"
 rm -rf "$STAGE"
 mkdir -p "$STAGE/bin" "$STAGE/lib" "$STAGE/share"
 
-# ---- Chudware binary + compat symlink -----------------------------------------
-cp -a "$BIN_SRC/Chudware" "$STAGE/bin/Chudware"
-ln -sfn Chudware "$STAGE/bin/Chudware"
-chmod +x "$STAGE/bin/Chudware"
+# ---- chudware binary + back-compat symlink -------------------------------------
+cp -a "$BIN_SRC/chudware" "$STAGE/bin/chudware"
+chmod +x "$STAGE/bin/chudware"
+ln -sfn chudware "$STAGE/bin/Chudware"  # back-compat: old capitalized name
 
 # ---- Engine shared libs -----------------------------------------------------
 # Prefer the full OCCT engine from core/build-occt-linux; fall back to the
@@ -97,7 +97,7 @@ fi
 # CEF is the only viable path. CHUDWARE_CEF_LAZY=1 (entrypoint) defers cold init.
 echo "==> staging CEF runtime (cannot disable at runtime)"
 CEF_SRC="$BIN_SRC"
-[ -f "$CEF_SRC/libcef.so" ] || die "libcef.so missing — Chudware will not load"
+[ -f "$CEF_SRC/libcef.so" ] || die "libcef.so missing — chudware will not load"
 
 CEF_STRIPPED="$REPO/build/tools/libcef-stripped.so"
 mkdir -p "$REPO/build/tools"
@@ -246,7 +246,7 @@ PY
 # ---- Manifest ---------------------------------------------------------------
 {
     echo "staged_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    echo "chudware=$(stat -c %s "$STAGE/bin/Chudware" 2>/dev/null || echo '?')"
+    echo "chudware=$(stat -c %s "$STAGE/bin/chudware" 2>/dev/null || echo '?')"
     echo "libchudware_src=$LIBCHUDWARE"
     echo "hostd=${HOSTD:-none}"
     echo "cef=stripped"

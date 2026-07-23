@@ -73,7 +73,7 @@ with `ai-cad` preserved.
 ./build.sh core         # C++ kernel only (linux-core preset; needs system OCCT)
 ./build.sh all          # core, then GUI
 ./build.sh clean        # wipe host/build-linux (core kept — OCCT reconfig is expensive)
-./host/build-linux/bin/Chudware                     # run the app
+./host/build-linux/bin/chudware                     # run the app
 scripts/gate.sh         # THE gate: check.py → core build+ctest → host build → pytest → shot smoke
 python3 scripts/check.py                          # fast stdlib gate (gui_lint, audits) — always runnable
 python3 work/tools/work.py ready|board            # task board
@@ -84,7 +84,7 @@ stays green on an unprovisioned box. Engine+agent pytest runs as
 `<venv>/python -X utf8 -m pytest engine/doc agent -q` when the venv exists.
 Scripted GUI launches use `xvfb-run` automatically; set `CHUDWARE_SHOT_HEADED=1` to see a real
 window. Headless scenario smoke: `CHUDWARE_SHOT=<m1|sketch|asm|fea|flow|drawing|…>
-./host/build-linux/bin/Chudware --ui-screenshot scratch/smoke.png` (crash check, not visual
+./host/build-linux/bin/chudware --ui-screenshot scratch/smoke.png` (crash check, not visual
 judgment).
 
 ## Rules that bind every change

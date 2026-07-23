@@ -154,6 +154,6 @@ fi
 
 echo
 echo "=== chudware update finished ok $(date -Iseconds) ==="
-echo "Desktop: host/build-linux/bin/Chudware"
+echo "Desktop: host/build-linux/bin/chudware"
 echo "Shared:  ~/chudware-web/chudware-shared.sh  (CHUDWARE_INSTANCE_KEY=chudwareweb)"
 exit 0

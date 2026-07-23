@@ -319,7 +319,7 @@ case "$STREAM_BACKEND" in
 esac
 
 # ---- Chudware -----------------------------------------------------------------
-CHUDWARE_BIN="$CHUDWARE_ROOT/bin/Chudware"
+CHUDWARE_BIN="$CHUDWARE_ROOT/bin/chudware"
 if [ ! -x "$CHUDWARE_BIN" ]; then
     log "FATAL: $CHUDWARE_BIN not executable"
     exit 1

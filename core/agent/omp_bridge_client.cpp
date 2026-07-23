@@ -118,6 +118,31 @@ std::string resolveBunExe() {
     return "bun";
 }
 
+// The bridge's runtime deps live in <vendorOmp>/node_modules, which is gitignored — a fresh
+// checkout or a clean build lacks them, and `bun run bridge.ts` then fails to resolve the
+// workspace packages. Materialize them ONCE from the committed bun.lock (frozen) so the core
+// is self-sufficient (no manual `bun install` step for providers to work). Best-effort +
+// idempotent: a present node_modules short-circuits; on install failure we fall through and
+// let spawn() surface bun's own diagnostic. Caller holds mtx_ (first-spawn resolvePaths).
+void ensureBridgeDeps(const std::string& vendorOmpDir, const std::string& bunExe) {
+    std::error_code ec;
+    if (std::filesystem::is_directory(vendorOmpDir + "/node_modules", ec))
+        return;  // already packed
+    if (!std::filesystem::is_regular_file(vendorOmpDir + "/package.json", ec))
+        return;  // no vendored workspace here — nothing to install
+    pid_t pid = fork();
+    if (pid < 0) return;
+    if (pid == 0) {
+        if (::chdir(vendorOmpDir.c_str()) != 0) _exit(127);
+        // Install chatter -> stderr so it never contaminates a JSON-RPC stdout stream.
+        dup2(STDERR_FILENO, STDOUT_FILENO);
+        execlp(bunExe.c_str(), bunExe.c_str(), "install", "--frozen-lockfile", (char*)nullptr);
+        _exit(127);
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+}
+
 }  // namespace
 
 OmpBridgeClient& OmpBridgeClient::instance() {
@@ -199,6 +224,11 @@ bool OmpBridgeClient::resolvePaths(std::string& err) {
               "containing vendor/omp/)";
         return false;
     }
+    // <...>/vendor/omp/bridge/src/bridge.ts -> <...>/vendor/omp. Self-pack the workspace deps
+    // on first use if they are absent (gitignored node_modules on a fresh checkout).
+    ensureBridgeDeps(
+        std::filesystem::path(bridgeScript_).parent_path().parent_path().parent_path().string(),
+        bunExe_);
     pathsResolved_ = true;
     return true;
 }

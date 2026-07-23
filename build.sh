@@ -38,6 +38,22 @@ MODE="${1:-default}"
 command -v cmake >/dev/null 2>&1 || { echo "[build] ERROR: cmake not found on PATH"; exit 1; }
 command -v ninja >/dev/null 2>&1 || { echo "[build] ERROR: ninja not found on PATH"; exit 1; }
 
+# The OMP bun bridge (providers/models/memory) resolves its workspace deps from
+# vendor/omp/node_modules, which is gitignored — so a fresh checkout / CI clone has no deps
+# and `bun run bridge.ts` fails. Materialize them once from the committed bun.lock (frozen)
+# so the built app's provider sign-in + model catalog work out of the box. Skipped when bun
+# is absent (the C++ core self-heals at first bridge use) or the deps are already present.
+ensure_omp_deps() {
+    local vd="$ROOT/vendor/omp"
+    [ -f "$vd/package.json" ] || return 0
+    [ -d "$vd/node_modules" ] && return 0
+    if command -v bun >/dev/null 2>&1; then
+        echo "[build] installing OMP bridge deps (vendor/omp) ..."
+        ( cd "$vd" && bun install --frozen-lockfile ) || echo "[build] WARN: bun install failed; bridge self-heals at first use"
+    else
+        echo "[build] WARN: bun not on PATH; OMP bridge deps not pre-installed (self-heals at first use)"
+    fi
+}
 build_core() { cmake --preset linux-core && cmake --build --preset linux-core; }
 build_app()  {
     cmake -S "$ROOT/host" -B "$ROOT/host/build-linux" -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -211,6 +227,9 @@ case "$MODE" in
     MODE=default
     ;;
 esac
+
+# Pack the OMP bridge deps for any build that ships/runs the engine (skip pure staging).
+case "$MODE" in core|app|default|daemon|all) ensure_omp_deps ;; esac
 
 case "$MODE" in
   core)         build_core ;;

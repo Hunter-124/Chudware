@@ -11,6 +11,7 @@
 #include "graph_tab.h"
 
 #include "graph_force.h"
+#include "graph_thumbs.h"
 #include "plm_hub.h"
 
 #include <algorithm>
@@ -48,6 +49,8 @@ namespace {
 struct GNode {
   std::string id, kind, label, path, docId, origin;
   std::string metaSummary;    // short key=val dump for tooltip/panel
+  std::string metaDh;         // content hash (blake2b-8) for thumb freshness
+  double metaMt = 0.0;        // source mtime (fallback freshness signal)
   float lx = 0.0f, ly = 0.0f; // layout coords (graph space)
   float lz = 0.0f;            // depth coord (3D projection mode only)
   float radius = 14.0f;
@@ -127,6 +130,9 @@ struct GraphTabState {
   int edgeCountFull = 0;
   bool listView = false;
   bool listViewUserOverride = false; // true once the user picks a mode
+  // Grid view: structural nodes (assembly/part/doc) of the current scope as
+  // square iso-preview cells. Mutually exclusive with listView.
+  bool gridView = false;
   // Assembly structure view (project scope only): assemblies + parts with
   // CONTAINS / INSTANCE_OF / MATES / DEPENDS_ON, laid out as layered tree.
   bool asmView = false;
@@ -1924,8 +1930,12 @@ void requestGraph(AppState &st, bool force) {
         n.origin = jstr(jn, "origin");
         if (n.origin.empty())
           n.origin = "extracted";
-        if (auto m = jn.find("meta"); m != jn.end() && m->is_object())
+        if (auto m = jn.find("meta"); m != jn.end() && m->is_object()) {
           n.metaSummary = summarizeMeta(*m);
+          n.metaDh = jstr(*m, "dh");
+          if (auto mt = m->find("mt"); mt != m->end() && mt->is_number())
+            n.metaMt = mt->get<double>();
+        }
         if (n.id.empty())
           continue;
         if (n.label.empty())
@@ -2002,6 +2012,8 @@ void requestGraph(AppState &st, bool force) {
     // when the *visible* set is still enormous (or user forced list).
     if (!G.listViewUserOverride) {
       G.listView = (int)G.visibleIdx.size() > kListViewThreshold;
+      if (G.listView)
+        G.gridView = false; // auto-list wins over a stale grid flag
     }
 
     // Keep selection if it still exists in the full graph.
@@ -3761,6 +3773,259 @@ void drawListView(AppState & /*st*/, ImVec2 canvasSz) {
   ImGui::EndChild();
 }
 
+// Elide a label to fit maxW with a trailing "..." (visible cells only, so the
+// incremental trim is bounded and cheap).
+std::string elideToWidth(const std::string &s, float maxW) {
+  if (ImGui::CalcTextSize(s.c_str()).x <= maxW)
+    return s;
+  const float ellW = ImGui::CalcTextSize("...").x;
+  std::string out = s;
+  while (!out.empty() && ImGui::CalcTextSize(out.c_str()).x + ellW > maxW)
+    out.pop_back();
+  return out + "...";
+}
+
+// Grid view — structural nodes (assembly/part/doc) of the current scope's
+// visible set as responsive square cells: iso-preview tile + kind chip +
+// elided label. Click selects (inspector), double-click drills (mirrors the
+// list rows). Missing previews paint a kind-icon placeholder immediately and
+// render on demand via the .plm/thumbs disk cache (graph_thumbs).
+void drawGridView(AppState &st, ImVec2 canvasSz) {
+  auto &G = S();
+  const float Sc = ui::uiScale;
+
+  ImGui::BeginChild("##graph_grid", canvasSz, ImGuiChildFlags_None);
+
+  if (G.nodes.empty() && !G.loading) {
+    ImGui::Dummy(ImVec2(0, 24 * Sc));
+    const char *msg = G.err.empty() ? "No graph nodes yet" : G.err.c_str();
+    ImGui::TextColored(ImVec4(palette.textDim[0], palette.textDim[1],
+                              palette.textDim[2], 1.0f),
+                       "%s", msg);
+    ImGui::EndChild();
+    return;
+  }
+  if (G.loading && G.nodes.empty()) {
+    ImGui::Dummy(ImVec2(0, 24 * Sc));
+    plmSpinner("Loading graph");
+    ImGui::EndChild();
+    return;
+  }
+
+  // Structural nodes of the current scope, search-filtered (same row
+  // filtering the list view applies). In a drill scope the visible set IS
+  // the scope's child set; in project view the grid lists every structural
+  // doc node — the canvas's "Hide unconnected" cleanup drops loose docs
+  // because scattered dots have no context, but grid cells (like list rows)
+  // carry their own context.
+  const bool filtering = G.search[0] != 0;
+  auto gridKind = [](const std::string &k) {
+    return k == "assembly" || k == "part" || k == "doc";
+  };
+  std::vector<int> items;
+  if (G.scopeDocId.empty()) {
+    items.reserve(G.nodes.size());
+    for (int i = 0; i < (int)G.nodes.size(); ++i) {
+      const GNode &n = G.nodes[i];
+      if (!gridKind(n.kind))
+        continue;
+      if (filtering && !matchesSearch(n, G.search))
+        continue;
+      items.push_back(i);
+    }
+  } else {
+    items.reserve(G.visibleIdx.size());
+    for (int vi : G.visibleIdx) {
+      const GNode &n = G.nodes[vi];
+      if (!gridKind(n.kind))
+        continue;
+      if (filtering && !matchesSearch(n, G.search))
+        continue;
+      items.push_back(vi);
+    }
+  }
+  std::sort(items.begin(), items.end(), [&](int a, int b) {
+    int ra = kindOrder(G.nodes[a].kind), rb = kindOrder(G.nodes[b].kind);
+    if (ra != rb)
+      return ra < rb;
+    if (G.nodes[a].label != G.nodes[b].label)
+      return G.nodes[a].label < G.nodes[b].label;
+    return G.nodes[a].id < G.nodes[b].id;
+  });
+
+  if (items.empty()) {
+    ImGui::Dummy(ImVec2(0, 24 * Sc));
+    ImGui::TextColored(ImVec4(palette.textDim[0], palette.textDim[1],
+                              palette.textDim[2], 1.0f),
+                       "%s", filtering
+                                 ? "No parts or assemblies match the search"
+                                 : "No parts or assemblies in this view");
+    ImGui::EndChild();
+    return;
+  }
+
+  // Responsive columns: target ~168px cells, then stretch to fill the row so
+  // the grid tracks the window width with no dead gutter.
+  const float availW = ImGui::GetContentRegionAvail().x;
+  const float gap = 10.0f * Sc;
+  const float ideal = 168.0f * Sc;
+  const int cols =
+      std::max(1, (int)((availW + gap) / (ideal + gap)));
+  const float cellW =
+      std::min((availW - gap * (float)(cols - 1)) / (float)cols, 240.0f * Sc);
+  const float pad = 6.0f * Sc;
+  const float tile = cellW - 2.0f * pad; // square preview box
+  const float lineH = ImGui::GetTextLineHeight();
+  const float cellH = pad + tile + 4.0f * Sc + lineH + 2.0f * Sc + lineH +
+                      6.0f * Sc;
+  const int rows = ((int)items.size() + cols - 1) / cols;
+
+  ImDrawList *dl = ImGui::GetWindowDrawList();
+  ImGuiListClipper clipper;
+  clipper.Begin(rows, cellH + gap);
+  while (clipper.Step()) {
+    for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+      for (int col = 0; col < cols; ++col) {
+        const int idx = row * cols + col;
+        if (idx >= (int)items.size())
+          break;
+        const GNode &n = G.nodes[items[idx]];
+        const bool sel = (n.id == G.selectedId);
+        const bool inBlast = G.blast.count(n.id) > 0;
+
+        // The clipper positions the row cursor; columns are placed
+        // explicitly from the row origin so they line up.
+        const ImVec2 rowPos = ImGui::GetCursorScreenPos();
+        const ImVec2 cellPos(rowPos.x + (float)col * (cellW + gap),
+                             rowPos.y);
+        ImGui::SetCursorScreenPos(cellPos);
+
+        ImGui::PushID(n.id.c_str());
+        ImGui::InvisibleButton("##cell", ImVec2(cellW, cellH));
+        const bool hov = ImGui::IsItemHovered();
+        if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+          const bool sameSel = (n.id == G.selectedId);
+          G.selectedId = n.id;
+          G.selectedEdge = -1;
+          if (!sameSel)
+            clearBlast(G);
+        }
+        if (hov && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) &&
+            isDrillableKind(n.kind) && n.id != G.scopeDocId) {
+          drillInto(G, n.id);
+        }
+
+        const ImVec2 p1(cellPos.x + cellW, cellPos.y + cellH);
+        // Cell state fills (mirrors the list-row selection accents).
+        if (sel) {
+          dl->AddRectFilled(cellPos, p1,
+                            ImGui::GetColorU32(ImVec4(
+                                palette.accent[0], palette.accent[1],
+                                palette.accent[2], 0.30f)),
+                            9.0f * Sc);
+          dl->AddRect(cellPos, p1,
+                      ImGui::GetColorU32(ImVec4(palette.accent[0],
+                                                palette.accent[1],
+                                                palette.accent[2], 0.85f)),
+                      9.0f * Sc, 0, 1.5f * Sc);
+        } else if (inBlast) {
+          dl->AddRectFilled(cellPos, p1,
+                            ImGui::GetColorU32(ImVec4(
+                                palette.statusWarn[0], palette.statusWarn[1],
+                                palette.statusWarn[2], 0.25f)),
+                            9.0f * Sc);
+        } else if (hov) {
+          dl->AddRectFilled(cellPos, p1,
+                            ImGui::GetColorU32(ImVec4(
+                                palette.text[0], palette.text[1],
+                                palette.text[2], 0.06f)),
+                            9.0f * Sc);
+        }
+
+        // ---- square preview tile ----------------------------------------
+        const ImVec2 t0(cellPos.x + pad, cellPos.y + pad);
+        const ImVec2 t1(t0.x + tile, t0.y + tile);
+        ui::glassBackground(dl, t0, t1, 8.0f);
+
+        const std::string absPath = resolveNodeAbsPath(st, n);
+        GraphGridThumb th;
+        if (!absPath.empty()) {
+          const std::string key = graphThumbKey(n.metaDh, n.metaMt, absPath);
+          th = graphThumbEnsure(st, G.projectDir, key, absPath);
+        }
+        if (th.tex) {
+          const float sc = std::min(tile / std::max((float)th.w, 1.0f),
+                                    tile / std::max((float)th.h, 1.0f));
+          const float tw = (float)th.w * sc, thh = (float)th.h * sc;
+          const ImVec2 i0(t0.x + (tile - tw) * 0.5f,
+                          t0.y + (tile - thh) * 0.5f);
+          dl->AddImage((ImTextureID)(intptr_t)th.tex, i0,
+                       ImVec2(i0.x + tw, i0.y + thh));
+        } else {
+          // Placeholder: kind glyph disc (+ spinner while rendering).
+          const char *icon = n.kind == "assembly"  ? "assembly"
+                             : n.kind == "part"     ? "part"
+                                                    : "new_doc";
+          const ImVec2 ic(t0.x + tile * 0.5f, t0.y + tile * 0.44f);
+          dl->AddCircleFilled(ic, tile * 0.22f, kindColor(n.kind, 0.22f), 28);
+          ui::drawIconGlass(dl, icon, ic, 26.0f * Sc,
+                            kindColor(n.kind, 0.9f), 0);
+          if (th.pending) {
+            drawArcSpinner(dl,
+                           ImVec2(t0.x + tile * 0.5f, t0.y + tile * 0.78f),
+                           7.0f * Sc, kindColor(n.kind, 0.9f));
+          }
+        }
+
+        // ---- kind chip + elided label -----------------------------------
+        const float textX = cellPos.x + pad;
+        const float textW = cellW - 2.0f * pad;
+        float ty = t1.y + 4.0f * Sc;
+        dl->AddText(ImVec2(textX, ty), kindColor(n.kind),
+                    kindShort(n.kind));
+        ty += lineH + 2.0f * Sc;
+        const std::string lab = elideToWidth(n.label, textW);
+        dl->AddText(ImVec2(textX, ty), Palette::toU32(palette.text),
+                    lab.c_str());
+
+        if (hov) {
+          ImGui::BeginTooltip();
+          ImGui::TextUnformatted(n.label.c_str());
+          if (!n.path.empty()) {
+            ImGui::PushStyleColor(
+                ImGuiCol_Text,
+                ImVec4(palette.textDisabled[0], palette.textDisabled[1],
+                       palette.textDisabled[2], 1.0f));
+            ImGui::TextUnformatted(n.path.c_str());
+            ImGui::PopStyleColor();
+          }
+          if (th.pending) {
+            ImGui::PushStyleColor(
+                ImGuiCol_Text,
+                ImVec4(palette.textDim[0], palette.textDim[1],
+                       palette.textDim[2], 1.0f));
+            ImGui::TextUnformatted("Preview rendering...");
+            ImGui::PopStyleColor();
+          }
+          ImGui::EndTooltip();
+        }
+
+        ImGui::PopID();
+        // Restore the row origin for the next column (the InvisibleButton
+        // moved the cursor below the cell).
+        ImGui::SetCursorScreenPos(rowPos);
+      }
+      // Advance past this row for the clipper.
+      ImGui::SetCursorScreenPos(
+          ImVec2(ImGui::GetCursorScreenPos().x,
+                 ImGui::GetCursorScreenPos().y + cellH + gap));
+    }
+  }
+  clipper.End();
+
+  ImGui::EndChild();
+}
+
 } // namespace
 
 // ---- public
@@ -3800,6 +4065,8 @@ void plmGraphOnProjectChanged() {
   G.edgeCountFull = 0;
   G.listView = false;
   G.listViewUserOverride = false;
+  G.gridView = false;
+  graphThumbsReset();
   G.asmView = false;
   G.projPosStash.clear();
   G.asmPosStash.clear();
@@ -3863,6 +4130,21 @@ void plmDrawGraphPage(AppState &st) {
     return;
   }
 
+  // Shot-only hook (AI_CAD_PLM_GRAPH_VIEW=grid): force Grid view so headless
+  // --ui-screenshot runs can capture it (mirrors AI_CAD_FM_COLLAPSED). No-op
+  // in normal use.
+  {
+    static const bool shotGrid = [] {
+      const char *v = std::getenv("AI_CAD_PLM_GRAPH_VIEW");
+      return v && std::strcmp(v, "grid") == 0;
+    }();
+    if (shotGrid && !G.listViewUserOverride) {
+      G.gridView = true;
+      G.listView = false;
+      G.listViewUserOverride = true;
+    }
+  }
+
   // Project change → drop caches.
   const std::string proj = st.plmProjectPath();
   if (proj != G.projectDir && !G.loading) {
@@ -3880,6 +4162,11 @@ void plmDrawGraphPage(AppState &st) {
   G.wasAppFocusLost = lost;
 
   requestGraph(st, /*force=*/false);
+
+  // Grid thumbnails: drive at most one queued iso render per frame (no-op
+  // when idle). Placeholders paint immediately; tiles swap in as renders
+  // land in .plm/thumbs.
+  graphThumbsPump(st);
 
   // Apply deferred scope drill (plmGraphScopeNode) once nodes are present.
   if (!G.scopePending.empty() && !G.nodes.empty()) {
@@ -3972,21 +4259,42 @@ void plmDrawGraphPage(AppState &st) {
     }
   }
   ImGui::SameLine();
-  // View mode: list vs layered DAG. Auto-list only if visible set is huge.
-  // Accent fill marks it as the ACTIVE view chip (matches the 2D|3D segment).
+  // View mode chips: Graph / List / Grid. The active chip carries the accent
+  // fill (same active-chip style as the 2D|3D segment).
   {
-    const char *modeLabel = G.listView ? "List view" : "Graph view";
-    if (graphGlassButton("##graph_view_mode", modeLabel, true, 100 * S)) {
-      G.listView = !G.listView;
-      G.listViewUserOverride = true;
-      if (!G.listView)
+    const bool graphActive = !G.listView && !G.gridView;
+    if (graphGlassButton("##view_graph", "Graph view", graphActive, 0.0f)) {
+      if (G.listView || G.gridView) {
+        G.listView = false;
+        G.gridView = false;
         G.layoutDirty = true;
+      }
+      G.listViewUserOverride = true;
     }
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
-      ImGui::SetTooltip(
-          "Graph view animates the current scope as a live force-directed\n"
-          "layout (drag nodes to rearrange). List view shows every\n"
-          "loaded node (including features).");
+      ImGui::SetTooltip("Graph view animates the current scope as a live\n"
+                        "force-directed layout (drag nodes to rearrange).");
+    }
+    ImGui::SameLine(0, 4 * S);
+    if (graphGlassButton("##view_list", "List view", G.listView, 0.0f)) {
+      G.listView = true;
+      G.gridView = false;
+      G.listViewUserOverride = true;
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+      ImGui::SetTooltip("List view shows every loaded node (including\n"
+                        "features) as filterable rows.");
+    }
+    ImGui::SameLine(0, 4 * S);
+    if (graphGlassButton("##view_grid", "Grid view", G.gridView, 0.0f)) {
+      G.gridView = true;
+      G.listView = false;
+      G.listViewUserOverride = true;
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+      ImGui::SetTooltip("Grid view shows the parts and assemblies of the\n"
+                        "current scope as square cells with iso previews.\n"
+                        "Previews render on demand and cache on disk.");
     }
   }
   ImGui::SameLine();
@@ -4219,7 +4527,9 @@ void plmDrawGraphPage(AppState &st) {
       "##graph_canvas_host", ImVec2(canvasW, 0), ImGuiChildFlags_None,
       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
   ImVec2 csz = ImGui::GetContentRegionAvail();
-  if (G.listView)
+  if (G.gridView)
+    drawGridView(st, csz);
+  else if (G.listView)
     drawListView(st, csz);
   else
     drawCanvas(st, csz);

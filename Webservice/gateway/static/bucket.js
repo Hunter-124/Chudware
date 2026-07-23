@@ -7,6 +7,7 @@
   var statusEl = document.getElementById("status");
   var dropZone = document.getElementById("drop-zone");
   var fileInput = document.getElementById("file-input");
+  var folderInput = document.getElementById("folder-input");
 
   var state = { dir: "" };
 
@@ -161,21 +162,88 @@
     } catch (e) { setStatus(String(e.message || e), "err"); }
   }
 
-  async function uploadFiles(fileList) {
-    if (!fileList || !fileList.length) return;
+  // entries: array of { file: File, relPath: "sub/dir/name.ext" }
+  async function uploadEntries(entries) {
+    if (!entries || !entries.length) return;
     var form = new FormData();
-    Array.prototype.forEach.call(fileList, function (f) { form.append("files", f); });
+    entries.forEach(function (e) { form.append("files", e.file, e.relPath); });
     form.append("dir", state.dir);
-    setStatus("Uploading " + fileList.length + " file(s)…");
+    setStatus("Uploading " + entries.length + " file(s)…");
     try {
       var r = await api("/api/bucket/upload", { method: "POST", body: form });
-      setStatus("Uploaded " + r.uploaded.length + " file(s).", "ok");
+      var msg = "Uploaded " + r.uploaded.length + " file(s).";
+      if (r.skipped && r.skipped.length) msg += " Skipped " + r.skipped.length + ".";
+      setStatus(msg, "ok");
       refresh();
     } catch (e) { setStatus(String(e.message || e), "err"); }
   }
 
+  // Flat FileList (plain <input multiple> or drag-drop fallback without entry API).
+  function entriesFromFileList(fileList) {
+    return Array.prototype.map.call(fileList || [], function (f) {
+      return { file: f, relPath: f.webkitRelativePath || f.name };
+    });
+  }
+
+  // Recursively walk a dropped FileSystemEntry (file or directory) into flat entries.
+  function readEntry(entry, prefix) {
+    return new Promise(function (resolve) {
+      if (entry.isFile) {
+        entry.file(function (file) {
+          resolve([{ file: file, relPath: prefix + entry.name }]);
+        }, function () { resolve([]); });
+      } else if (entry.isDirectory) {
+        var reader = entry.createReader();
+        var all = [];
+        (function readBatch() {
+          reader.readEntries(function (batch) {
+            if (!batch.length) {
+              Promise.all(all.map(function (child) {
+                return readEntry(child, prefix + entry.name + "/");
+              })).then(function (nested) {
+                resolve([].concat.apply([], nested));
+              });
+            } else {
+              all = all.concat(batch);
+              readBatch();
+            }
+          }, function () { resolve([]); });
+        })();
+      } else {
+        resolve([]);
+      }
+    });
+  }
+
+  // Dropped items: use the DataTransferItem entry API (supports folders) when
+  // available, falling back to the flat FileList (no folder support) otherwise.
+  async function entriesFromDataTransfer(dt) {
+    var items = dt && dt.items;
+    if (items && items.length && items[0].webkitGetAsEntry) {
+      var roots = [];
+      for (var i = 0; i < items.length; i++) {
+        var entry = items[i].webkitGetAsEntry && items[i].webkitGetAsEntry();
+        if (entry) roots.push(entry);
+      }
+      if (roots.length) {
+        var nested = await Promise.all(roots.map(function (e) { return readEntry(e, ""); }));
+        return [].concat.apply([], nested);
+      }
+    }
+    return entriesFromFileList(dt && dt.files);
+  }
+
   document.getElementById("upload-btn").addEventListener("click", function () { fileInput.click(); });
-  fileInput.addEventListener("change", function () { uploadFiles(fileInput.files); fileInput.value = ""; });
+  fileInput.addEventListener("change", function () {
+    uploadEntries(entriesFromFileList(fileInput.files));
+    fileInput.value = "";
+  });
+
+  document.getElementById("upload-folder-btn").addEventListener("click", function () { folderInput.click(); });
+  folderInput.addEventListener("change", function () {
+    uploadEntries(entriesFromFileList(folderInput.files));
+    folderInput.value = "";
+  });
 
   document.getElementById("new-folder-btn").addEventListener("click", async function () {
     var name = prompt("New folder name:");
@@ -206,7 +274,7 @@
   });
   dropZone.addEventListener("drop", function (e) {
     var dt = e.dataTransfer;
-    if (dt && dt.files && dt.files.length) uploadFiles(dt.files);
+    if (dt) entriesFromDataTransfer(dt).then(uploadEntries);
   });
   // Allow dropping anywhere on the page, not just the highlighted box.
   document.addEventListener("dragover", function (e) { e.preventDefault(); });
@@ -214,7 +282,7 @@
     e.preventDefault();
     if (e.target === dropZone) return; // already handled above
     var dt = e.dataTransfer;
-    if (dt && dt.files && dt.files.length) uploadFiles(dt.files);
+    if (dt) entriesFromDataTransfer(dt).then(uploadEntries);
   });
 
   refresh();

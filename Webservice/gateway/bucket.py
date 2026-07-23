@@ -93,16 +93,34 @@ async def bucket_upload(
     files: list[UploadFile] = File(...),
     dir: str = Form(""),
 ) -> dict[str, Any]:
+    """Accept flat files or a whole dropped/selected folder tree.
+
+    Each UploadFile's filename may be a nested relative path
+    (``sub/dir/name.ext``, forward-slashed) when the client uploaded a
+    folder — the browser File API and our frontend both preserve that via
+    ``File.webkitRelativePath`` / ``FormData.append(name, file, path)``.
+    Path segments are clamped under the target dir the same way ``_resolve``
+    clamps client dir paths; anything that tries to escape is skipped rather
+    than aborting the whole batch, so one bad entry in a big folder drop
+    doesn't lose everything else.
+    """
     user = get_current_user(request)
     base = _resolve(dir, must_exist=False)
     base.mkdir(parents=True, exist_ok=True)
     root = _bucket_root()
     uploaded: list[dict[str, Any]] = []
+    skipped: list[str] = []
     for file in files:
-        name = Path(file.filename or "upload.bin").name  # strip any client dirs
-        if name.startswith(".") or not name:
-            raise HTTPException(status_code=400, detail=f"bad filename: {file.filename!r}")
-        target = base / name
+        raw = (file.filename or "").strip().replace("\\", "/").lstrip("/")
+        parts = [p for p in raw.split("/") if p not in ("", ".")]
+        if not parts or any(p == ".." for p in parts):
+            skipped.append(file.filename or "")
+            continue
+        target = base.joinpath(*parts).resolve()
+        if target != root and root not in target.parents:
+            skipped.append(raw)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
         size = 0
         with target.open("wb") as out:
             while chunk := await file.read(1 << 20):
@@ -110,7 +128,9 @@ async def bucket_upload(
                 out.write(chunk)
         log.info("bucket upload: %s (%d bytes) by %s", target, size, user.email)
         uploaded.append({"path": str(target.relative_to(root)), "bytes": size})
-    return {"ok": True, "uploaded": uploaded}
+    if not uploaded and skipped:
+        raise HTTPException(status_code=400, detail=f"no valid files (skipped: {', '.join(skipped[:5])})")
+    return {"ok": True, "uploaded": uploaded, "skipped": skipped}
 
 
 @router.post("/api/bucket/mkdir")

@@ -18,6 +18,7 @@ import json
 import os
 import re
 import sys
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -52,8 +53,12 @@ def api(method: str, path: str, body: dict | None = None) -> dict:
             "Content-Type": "application/json",
         },
     )
-    with urllib.request.urlopen(req) as resp:
-        out = json.load(resp)
+    try:
+        with urllib.request.urlopen(req) as resp:
+            out = json.load(resp)
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")
+        sys.exit(f"cloudflare API error on {method} {path}: HTTP {e.code} {detail}")
     if not out.get("success"):
         sys.exit(f"cloudflare API error on {method} {path}: {out.get('errors')}")
     return out["result"]
@@ -143,16 +148,22 @@ def sync_users(host: str) -> None:
     if app is None:
         sys.exit(f"no Access app for {host} — run full provisioning first")
     pols = api("GET", f"/accounts/{ACCOUNT_ID}/access/apps/{app['id']}/policies")
+    allow_pols = [p for p in pols if p.get("decision") == "allow"]
+    # Reuse whatever allow policy already governs this app instead of creating a second
+    # one at precedence 1 — deployments get relabeled (e.g. "billet-users" instead of
+    # "chudware-users") and a name-only lookup used to miss the existing policy, then
+    # collide on precedence with a hard "policy precedences must be unique" 400.
+    pol = find(pols, "name", "chudware-users") or (allow_pols[0] if len(allow_pols) == 1 else None)
+    name = pol["name"] if pol else "chudware-users"
     pol_body = {
-        "name": "chudware-users", "decision": "allow", "precedence": 1,
+        "name": name, "decision": "allow", "precedence": pol["precedence"] if pol else 1,
         "include": _include_list(emails),
     }
-    pol = find(pols, "name", "chudware-users")
     if pol:
         api("PUT", f"/accounts/{ACCOUNT_ID}/access/apps/{app['id']}/policies/{pol['id']}", pol_body)
     else:
         api("POST", f"/accounts/{ACCOUNT_ID}/access/apps/{app['id']}/policies", pol_body)
-    print(f"Access policy chudware-users synced from users.yaml: {len(emails)} email(s)")
+    print(f"Access policy {name!r} synced from users.yaml: {len(emails)} email(s)")
     for e in emails:
         print(f"  - {e}")
 
@@ -232,16 +243,18 @@ def main() -> None:
 
     # 5. allow policy (exact-email allowlist; OTP + any configured IdP)
     pols = api("GET", f"/accounts/{ACCOUNT_ID}/access/apps/{app['id']}/policies")
+    allow_pols = [p for p in pols if p.get("decision") == "allow"]
+    pol = find(pols, "name", "chudware-users") or (allow_pols[0] if len(allow_pols) == 1 else None)
+    name = pol["name"] if pol else "chudware-users"
     pol_body = {
-        "name": "chudware-users", "decision": "allow", "precedence": 1,
+        "name": name, "decision": "allow", "precedence": pol["precedence"] if pol else 1,
         "include": _include_list(emails),
     }
-    pol = find(pols, "name", "chudware-users")
     if pol:
         api("PUT", f"/accounts/{ACCOUNT_ID}/access/apps/{app['id']}/policies/{pol['id']}", pol_body)
     else:
         api("POST", f"/accounts/{ACCOUNT_ID}/access/apps/{app['id']}/policies", pol_body)
-    print(f"policy chudware-users: {len(emails)} email(s)")
+    print(f"policy {name!r}: {len(emails)} email(s)")
 
     # 6. org team domain + tunnel token -> env file
     org = api("GET", f"/accounts/{ACCOUNT_ID}/access/organizations")

@@ -124,3 +124,49 @@
   margin: 0;
   box-sizing: border-box;
 }
+
+.releases-card h2 {
+  margin: 0 0 12px;
+  font-size: 1rem;
+}
+
+.releases-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.release-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  background: #0b0d12;
+  border: 1px solid var(--border, #2a2e36);
+  border-radius: 8px;
+}
+
+.release-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.release-name {
+  font-size: 0.88rem;
+  color: var(--fg, #e8eaf0);
+  overflow-wrap: anywhere;
+}
+
+.release-meta {
+  font-size: 0.76rem;
+  color: var(--muted, #8b93a3);
+}
+
+.releases-list .btn {
+  min-height: 36px;
+  padding: 6px 12px;
+  flex: 0 0 auto;
+}

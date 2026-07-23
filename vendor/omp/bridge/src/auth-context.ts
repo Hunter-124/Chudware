@@ -9,6 +9,7 @@
  * oauth-flow.ts (they need the same AuthStorage instance, hence `getAuthContext`
  * is exported rather than duplicated).
  */
+import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
@@ -57,16 +58,26 @@ const CONSOLE_URLS: Readonly<Record<string, string>> = {
 	huggingface: "https://huggingface.co/settings/tokens",
 };
 
-/** `$XDG_DATA_HOME/Billet/omp-bridge-auth.db` (or `%APPDATA%`/`~/.local/share` equivalents) — mirrors host/src/core/app_state.cpp's `appdataDir()` naming, in its own file so the bridge never touches CAD's C++-owned config.json/AI-CAD legacy dir. `CAD_OMP_AUTH_DB` overrides outright. */
+/** `$XDG_DATA_HOME/Chudware/omp-bridge-auth.db` (or `%APPDATA%`/`~/.local/share` equivalents) — mirrors host/src/core/app_state.cpp's `appdataDir()` naming, in its own file so the bridge never touches CAD's C++-owned config.json. A pre-rebrand `Billet/omp-bridge-auth.db` is migrated (copied, incl. -wal/-shm) the first time the Chudware db is absent. `CAD_OMP_AUTH_DB` overrides outright. */
 function resolveAuthDbPath(): string {
 	const override = process.env.CAD_OMP_AUTH_DB;
 	if (override) return override;
 	const home = os.homedir();
-	if (process.platform === "win32") {
-		return path.join(process.env.APPDATA ?? home, "Billet", "omp-bridge-auth.db");
+	const base =
+		process.platform === "win32"
+			? (process.env.APPDATA ?? home)
+			: process.env.XDG_DATA_HOME || path.join(home, ".local", "share");
+	const dbPath = path.join(base, "Chudware", "omp-bridge-auth.db");
+	if (!fs.existsSync(dbPath)) {
+		const legacy = path.join(base, "Billet", "omp-bridge-auth.db");
+		if (fs.existsSync(legacy)) {
+			fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+			for (const suffix of ["", "-wal", "-shm"]) {
+				if (fs.existsSync(legacy + suffix)) fs.copyFileSync(legacy + suffix, dbPath + suffix);
+			}
+		}
 	}
-	const base = process.env.XDG_DATA_HOME || path.join(home, ".local", "share");
-	return path.join(base, "Billet", "omp-bridge-auth.db");
+	return dbPath;
 }
 
 interface AuthContext {

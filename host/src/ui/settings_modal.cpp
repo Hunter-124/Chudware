@@ -5214,6 +5214,102 @@ void drawSettingsModal(AppState& st, bool busy) {
 
                     if (ImGui::BeginTabItem("Tools", nullptr, subFlags(6))) {
 
+                        settingsGlassSectionBegin("##ai_tools_global", "Global tool limits");
+                        dimText("Defaults applied to every tool call. A per-tool Options override "
+                                "(nonzero) always wins. Saved under config.json agent.*.");
+                        static int s_globalTimeout = 0;
+                        static int s_globalMaxCalls = 0;
+                        static int s_globalSupervision = 4;
+                        static bool s_globalLoaded = false;
+                        static double s_globalLast = -1e9;
+                        static bool s_globalDirty = false;
+                        static std::string s_globalErr;
+                        {
+                            const double nowGl = ImGui::GetTime();
+                            if (!s_globalLoaded || (nowGl - s_globalLast) > 2.0) {
+                                s_globalLast = nowGl;
+                                s_globalLoaded = true;
+                                try {
+                                    std::ifstream in(configPath());
+                                    nlohmann::json j = nlohmann::json::object();
+                                    if (in) { in >> j; }
+                                    auto ag = j.value("agent", nlohmann::json::object());
+                                    s_globalTimeout = ag.value("tool_timeout_s_default", 0);
+                                    s_globalMaxCalls = ag.value("tool_max_calls_default", 0);
+                                    s_globalSupervision = ag.value("supervision_interval_calls", 4);
+                                } catch (...) {
+                                    s_globalTimeout = 0;
+                                    s_globalMaxCalls = 0;
+                                    s_globalSupervision = 4;
+                                }
+                                if (s_globalTimeout < 0) s_globalTimeout = 0;
+                                if (s_globalMaxCalls < 0) s_globalMaxCalls = 0;
+                                if (s_globalSupervision < 0) s_globalSupervision = 4;
+                            }
+                        }
+                        const float gLabelW = 160.0f * sc;
+                        const float gFieldW = 90.0f * sc;
+                        auto globalFieldRow = [&](const char* label) {
+                            ImGui::AlignTextToFramePadding();
+                            ImGui::TextUnformatted(label);
+                            ImGui::SameLine(gLabelW);
+                            ImGui::SetNextItemWidth(gFieldW);
+                        };
+                        globalFieldRow("Tool timeout (s)");
+                        if (ImGui::InputInt("##global_timeout_s", &s_globalTimeout)) {
+                            if (s_globalTimeout < 0) s_globalTimeout = 0;
+                            s_globalDirty = true;
+                        }
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("0 = no timeout. Per-tool override wins.");
+                        globalFieldRow("Max calls per turn");
+                        if (ImGui::InputInt("##global_max_calls", &s_globalMaxCalls)) {
+                            if (s_globalMaxCalls < 0) s_globalMaxCalls = 0;
+                            s_globalDirty = true;
+                        }
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("0 = unlimited. Per-tool override wins.");
+                        globalFieldRow("Supervision interval");
+                        if (ImGui::InputInt("##global_supervision", &s_globalSupervision)) {
+                            if (s_globalSupervision < 0) s_globalSupervision = 0;
+                            s_globalDirty = true;
+                        }
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("Force an advisor verification pass every N tool "
+                                              "calls. 0 = never.");
+                        if (s_globalDirty) {
+                            ImGui::Dummy(ImVec2(0, 4.0f * sc));
+                            if (!s_globalErr.empty())
+                                ImGui::TextColored(ImVec4(1, 0.4f, 0.3f, 1), "%s",
+                                                   s_globalErr.c_str());
+                            if (ImGui::Button("Save global limits", ImVec2(180.0f * sc, 0))) {
+                                try {
+                                    nlohmann::json j = nlohmann::json::object();
+                                    {
+                                        std::ifstream in(configPath());
+                                        if (in) {
+                                            nlohmann::json old; in >> old;
+                                            if (old.is_object()) j = old;
+                                        }
+                                    }
+                                    if (!j.contains("agent") || !j["agent"].is_object())
+                                        j["agent"] = nlohmann::json::object();
+                                    j["agent"]["tool_timeout_s_default"] = std::max(0, s_globalTimeout);
+                                    j["agent"]["tool_max_calls_default"] = std::max(0, s_globalMaxCalls);
+                                    j["agent"]["supervision_interval_calls"] =
+                                        std::max(0, s_globalSupervision);
+                                    std::ofstream outf(configPath(), std::ios::trunc);
+                                    outf << j.dump(2);
+                                    s_globalDirty = false;
+                                    s_globalErr.clear();
+                                    s_globalLast = -1e9;
+                                } catch (...) {
+                                    s_globalErr = "Failed to save global tool limits.";
+                                }
+                            }
+                        }
+                        settingsGlassSectionEnd();
+
                         settingsGlassSectionBegin("##ai_tools_families", "Tool families");
                         dimText("Enable or disable MCP tool families the agent may call. "
                                 "Expand a family for per-tool options (timeout, call caps, "
@@ -5372,19 +5468,41 @@ void drawSettingsModal(AppState& st, bool busy) {
                                 if (ImGui::BeginPopup("tool_opts")) {
                                     ImGui::TextUnformatted(tn);
                                     ImGui::Separator();
-                                    const float fieldW = 90.0f * sc;   // compact int field; label sits to its right
+                                    ImGui::TextDisabled("0 = use global default");
+                                    const float labelW = 150.0f * sc;  // left label column
+                                    const float fieldW = 90.0f * sc;   // compact int field
                                     const float boxW = 320.0f * sc;    // bounds the popup width (was -1 -> ballooned to ~1000px)
+                                    auto popupFieldRow = [&](const char* label) {
+                                        ImGui::AlignTextToFramePadding();
+                                        ImGui::TextUnformatted(label);
+                                        ImGui::SameLine(labelW);
+                                        ImGui::SetNextItemWidth(fieldW);
+                                    };
                                     int to = s_toolTimeout.count(tn) ? s_toolTimeout[tn] : 0;
                                     int mc = s_toolMaxCalls.count(tn) ? s_toolMaxCalls[tn] : 0;
-                                    ImGui::SetNextItemWidth(fieldW);
-                                    if (ImGui::InputInt("timeout_s (0=default)", &to)) {
+                                    popupFieldRow("timeout_s");
+                                    if (ImGui::InputInt("##timeout_s", &to)) {
                                         s_toolTimeout[tn] = std::max(0, to);
                                         s_toolOptDirty = true;
                                     }
-                                    ImGui::SetNextItemWidth(fieldW);
-                                    if (ImGui::InputInt("max_calls_per_turn (0=unlim)", &mc)) {
+                                    if (to == 0) {
+                                        ImGui::SameLine();
+                                        if (s_globalTimeout > 0)
+                                            ImGui::TextDisabled("(global: %ds)", s_globalTimeout);
+                                        else
+                                            ImGui::TextDisabled("(global: no timeout)");
+                                    }
+                                    popupFieldRow("max_calls_per_turn");
+                                    if (ImGui::InputInt("##max_calls_per_turn", &mc)) {
                                         s_toolMaxCalls[tn] = std::max(0, mc);
                                         s_toolOptDirty = true;
+                                    }
+                                    if (mc == 0) {
+                                        ImGui::SameLine();
+                                        if (s_globalMaxCalls > 0)
+                                            ImGui::TextDisabled("(global: %d)", s_globalMaxCalls);
+                                        else
+                                            ImGui::TextDisabled("(global: unlimited)");
                                     }
                                     static char defBuf[2048];
                                     static char noteBuf[1024];

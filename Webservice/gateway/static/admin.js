@@ -583,4 +583,57 @@
     // Reflect a run started elsewhere (shared workspace).
     pollOnce().catch(function () {});
   })();
+
+  /* ---- releases: installer downloads for testing ---- */
+  (function initReleases() {
+    var side = document.querySelector(".admin-side");
+    if (!side) return;
+
+    var card = document.createElement("div");
+    card.className = "admin-card releases-card";
+    card.innerHTML =
+      "<h2>Releases</h2>" +
+      "<div class='releases-list' id='releases-list'>Loading…</div>";
+    side.appendChild(card);
+
+    var listEl = document.getElementById("releases-list");
+
+    function fmtSize(n) {
+      if (n < 1024) return n + " B";
+      var units = ["KB", "MB", "GB", "TB"];
+      var v = n / 1024;
+      var i = 0;
+      while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+      return v.toFixed(v < 10 ? 2 : 1) + " " + units[i];
+    }
+
+    function fmtDate(iso) {
+      var d = new Date(iso);
+      return isNaN(d.getTime()) ? iso : d.toLocaleString();
+    }
+
+    async function refreshReleases() {
+      var data = await api("/api/admin/releases");
+      if (!data || !data.length) {
+        listEl.innerHTML =
+          "<p class='deploy-note'>Drop installers into ~/chudware-releases on the server " +
+          "(e.g. ChudwareSetup.exe from scripts/build_windows.ps1 + installer/build_release.py).</p>";
+        return;
+      }
+      listEl.innerHTML = data.map(function (r) {
+        return "<div class='release-row'>" +
+          "<div class='release-info'>" +
+            "<span class='release-name'>" + esc(r.name) + "</span>" +
+            "<span class='release-meta'>" + fmtSize(r.size) + " \xb7 " + fmtDate(r.mtime) + "</span>" +
+          "</div>" +
+          "<a class='btn ghost' href='/api/admin/releases/download/" + encodeURIComponent(r.name) +
+            "' download>Download</a>" +
+        "</div>";
+      }).join("");
+    }
+
+    refreshReleases().catch(function (e) {
+      listEl.innerHTML = "<p class='deploy-note'>Failed to load releases: " + esc(e.message || e) + "</p>";
+    });
+  })();
 })();

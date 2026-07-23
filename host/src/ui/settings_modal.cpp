@@ -1821,16 +1821,19 @@ static void drawOmpProviderManager(AppState& st) {
             const float badgeGap = 8.0f * sc;
             const float badgeX = mn.x + 6.0f * sc;
             const float badgeY = mn.y + (rowH - badgeSide) * 0.5f;
+            // Center the two-line text block (name + status) on the same row-center as the
+            // badge so the badge, name and status read as one vertically-centered unit.
+            const float textTop = mn.y + (rowH - (fh * 2.0f + 2.0f * sc)) * 0.5f;
             ui::drawProviderLogo(dl, ImVec2(badgeX, badgeY), badgeSide, r.id);
             const float textX = badgeX + badgeSide + badgeGap;
-            dl->AddText(ImVec2(textX, mn.y + 4.0f * sc),
+            dl->AddText(ImVec2(textX, textTop),
                         ui::Palette::toU32(sel ? pal.text : pal.textDim), r.label.c_str());
             const float* c = ompStateColor(r.state);
             const bool bullet = (r.state == "oauth_connected" || r.state == "key_set");
             char statusLine[160];
             std::snprintf(statusLine, sizeof(statusLine), "%s", ompStateLabel(r));
             const float dotR = fh * 0.28f;
-            const float sy = mn.y + 4.0f * sc + fh + 2.0f * sc;
+            const float sy = textTop + fh + 2.0f * sc;
             const ImU32 cu = ImGui::ColorConvertFloat4ToU32(ImVec4(c[0], c[1], c[2], 1.0f));
             const ImVec2 dc(textX + dotR, sy + fh * 0.5f);
             if (bullet) dl->AddCircleFilled(dc, dotR, cu, 16);

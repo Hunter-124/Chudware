@@ -441,9 +441,9 @@ def proactive_advisor_enabled(cfg: dict | None = None) -> bool:
 # at the registry layer when set.
 # ---------------------------------------------------------------------------
 DEFAULT_TOOL_FAMILIES = (
-    "advisor", "cad", "cam", "ecad", "em", "gsl", "intake", "ledger",
-    "mission", "parts", "plm", "recon", "research", "reveng", "sim",
-    "workspace",
+    "advisor", "cad", "cam", "ecad", "em", "files", "gsl", "intake", "ledger",
+    "mission", "office", "parts", "plm", "recon", "research", "reveng", "shell",
+    "sim", "workspace",
 )
 
 

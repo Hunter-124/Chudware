@@ -364,6 +364,15 @@ register_plm_tools(_reg.view(mcp, "plm"))
 # (services/agent/worker_rpc.py) for the host AI-tab docs_panel.
 from mcp_server.office_tools import register_office_tools
 register_office_tools(_reg.view(mcp, "office"))
+# General-purpose coding-harness tools (fs_tools.py): the tool-calling agent (agent_turn
+# DAG/mission/subagent + external MCP clients) can read/organize files on disk, search, and
+# run commands. fs_read/list/glob/grep/write/edit under "files"; run_shell under "shell"
+# (separate family so shell can be toggled off independently). fs_read is context-safe
+# (line-numbered, offset/limit, byte/column caps, selectors) and routes documents through
+# office_extract, so large files/docs never overflow the model context.
+from mcp_server.fs_tools import register_fs_tools, register_shell_tools
+register_fs_tools(_reg.view(mcp, "files"))
+register_shell_tools(_reg.view(mcp, "shell"))
 # CAD link graph (1D): cad_graph traversal + cad_graph_link (AI overlay) +
 # assembly_plan_review. Over services/plm/cad_graph.py + graph_links.py.
 from mcp_server.graph_tools import register_graph_tools

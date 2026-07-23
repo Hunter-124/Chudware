@@ -51,7 +51,11 @@ _READ_EXACT = {"hover", "cad_guide", "intake_status", "ecad_status", "cam_job_tr
               # match the get_/describe_/etc prefix classifier (all start with "office_"), so
               # they need explicit entries. office_edit_* is left unclassified -> RISK_WRITE.
               "office_extract", "office_read_pptx", "office_read_xlsx", "office_read_csv",
-              "office_read_pdf", "office_read_docx", "office_read_doc"}
+              "office_read_pdf", "office_read_docx", "office_read_doc",
+              # General-purpose filesystem read tools (fs_tools.py, family "files"): none
+              # match a read prefix, so classify explicitly. fs_write/fs_edit/run_shell
+              # stay unclassified -> RISK_WRITE.
+              "fs_read", "fs_list", "fs_glob", "fs_grep"}
 
 # Explicit overrides for names the classifier would mislabel. name -> risk.
 _RISK_OVERRIDES: dict[str, str] = {

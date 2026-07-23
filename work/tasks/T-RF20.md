@@ -37,7 +37,7 @@ recommend with evidence; deletion is the default if nothing real consumes it.
 
 ## Definition of done
 
-- [ ] `grep -r "engine_oracle\|from engine\|import engine" services/` returns nothing
+- [x] `grep -r "engine_oracle\|from engine\|import engine" services/` returns nothing
       live; gate lint enforces it.
 - [ ] MCP server + DAG runner work against hostd with no Python engine import.
 - [ ] gate.sh green; REFACTOR_LOG handoff.

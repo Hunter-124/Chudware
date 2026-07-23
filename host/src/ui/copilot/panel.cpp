@@ -81,19 +81,20 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     const float gearW = measureBtn("Settings", "settings");
     const float minGap = style.ItemSpacing.x;
     const float rightInset = ui::metrics::U(0.5f);
-    // Collapse chip parks OUTSIDE the column's left edge (see screenshot): same 26dp
-    // recipe as FM's «, but hanging in the viewport gutter rather than eating header
-    // inset. Content therefore uses a symmetric left/right inset — no chev reserve.
+    // Collapse chip lives INSIDE the header at the column's right edge (was:
+    // parked in the viewport gutter, overlapping viewport buttons like
+    // Section View). Row content reserves chevSz + gap on the right via
+    // contentRightInset so nothing sits under the chip.
     const float chevSz  = 26.0f * sc;
-    const float chevPad = 8.0f * sc;       // gap between chip right edge and column left
+    const float contentRightInset = rightInset + chevSz + 4.0f * sc;
     const float leftInset = rightInset;
     const float colW = ImGui::GetContentRegionAvail().x;
 
     // ---- Collapse chip (floating window just left of the column) ----
     {
         const ImVec2 winP0 = ImGui::GetWindowPos();
-        // Vertically match the old in-header placement (content top + 8dp).
-        const ImVec2 c0(winP0.x - chevSz - chevPad,
+        // Inside the header's right edge, vertically matched to row 1.
+        const ImVec2 c0(winP0.x + ImGui::GetWindowWidth() - rightInset - chevSz,
                         winP0.y + ImGui::GetWindowContentRegionMin().y + 8.0f * sc);
         ImGui::SetNextWindowPos(c0, ImGuiCond_Always);
         ImGui::SetNextWindowSize(ImVec2(chevSz, chevSz), ImGuiCond_Always);
@@ -121,13 +122,14 @@ static void drawCopilotHeader(AppState& st, bool busy) {
             const ImVec2 cc(b0.x + chevSz * 0.5f, b0.y + chevSz * 0.5f);
             const float ca = 3.5f * sc;
             const float stroke = 1.85f * sc;
-            // "»" double chevron (mirror of FM's "«")
+            // "»" double chevron to collapse, "«" to expand (mirrored).
+            const float dir = s_cpCollapsed ? -1.0f : 1.0f;
             for (int i = 0; i < 2; ++i) {
                 const float ox = (i == 0 ? -2.5f : 2.5f) * sc;
-                wdl->AddLine(ImVec2(cc.x + ox - ca * 0.5f, cc.y - ca),
-                             ImVec2(cc.x + ox + ca * 0.5f, cc.y), cCol, stroke);
-                wdl->AddLine(ImVec2(cc.x + ox + ca * 0.5f, cc.y),
-                             ImVec2(cc.x + ox - ca * 0.5f, cc.y + ca), cCol, stroke);
+                wdl->AddLine(ImVec2(cc.x + dir * (ox - ca * 0.5f), cc.y - ca),
+                             ImVec2(cc.x + dir * (ox + ca * 0.5f), cc.y), cCol, stroke);
+                wdl->AddLine(ImVec2(cc.x + dir * (ox + ca * 0.5f), cc.y),
+                             ImVec2(cc.x + dir * (ox - ca * 0.5f), cc.y + ca), cCol, stroke);
             }
             if (cHover) ImGui::SetTooltip(s_cpCollapsed ? "Expand" : "Collapse");
             if (cClicked) {
@@ -181,7 +183,7 @@ static void drawCopilotHeader(AppState& st, bool busy) {
 
         float logoLeft = (colW - logoW) * 0.5f;
         logoLeft = std::max(leftInset + tlW + 6.0f * sc, logoLeft);
-        logoLeft = std::min(logoLeft, colW - rightInset - artW - logoW - 6.0f * sc);
+        logoLeft = std::min(logoLeft, colW - contentRightInset - artW - logoW - 6.0f * sc);
         ImGui::SameLine(logoLeft);
         {
             IconUV cube = ui::getIcon("context_cube", 20);
@@ -201,7 +203,7 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         ImGui::PopStyleColor();
         if (wordF) ImGui::PopFont();
 
-        ImGui::SameLine(colW - rightInset - artW);
+        ImGui::SameLine(colW - contentRightInset - artW);
         cy1(bh);
         if (busy) ImGui::BeginDisabled();
         if (drawHeaderTextButton("##hdr_arts", "Artifacts", st.showArtifacts, artW, "team")) {
@@ -221,7 +223,7 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     auto centerY = [&](float h) { ImGui::SetCursorPosY(rowTop + (rowH - h) * 0.5f); };
 
     const float usableL = leftInset;
-    const float usableR = colW - rightInset;
+    const float usableR = colW - contentRightInset;
     const float free = usableR - usableL - chatW - sessW - gearW;
     float gapEq = free * 0.5f;
     if (gapEq < minGap) gapEq = minGap;

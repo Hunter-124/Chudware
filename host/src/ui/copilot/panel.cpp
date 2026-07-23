@@ -85,14 +85,27 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     const float rightInset = 0.0f;
     // Collapse chip sits on the left, vertically centered between row 1's
     // 0/0 tasks chip and row 2's Chat button. Row content shifts right past
-    // it via contentLeftInset; right side keeps the plain rightInset so the
-    // block hugs the screen edge.
+    // it via contentLeftInset. Independent of rightInset (was a shared var —
+    // zeroing it for the header-edge tightening put the chip's floating window
+    // flush on the main window's origin, exactly overlapping the invisible
+    // left-edge resize strip and stealing its clicks — T-broke-collapse).
     const float chevSz  = 26.0f * sc;
-    const float leftInset = rightInset;
+    const float leftInset = ui::metrics::U(0.5f);
     const float contentLeftInset = leftInset + chevSz + 6.0f * sc;
     const float colW = ImGui::GetContentRegionAvail().x;
 
-    // ---- Collapse chip (floating window, left edge, between the two rows) ----
+    // ---- Collapse chip: drawn INSIDE this window at an absolute screen position
+    // (SetCursorScreenPos), exactly like the FeatureManager's ##lp_collapse — NOT a
+    // separate nested Begin()'d floating window. A standalone utility window here
+    // silently loses hover/click forever the first time the main Copilot window is
+    // refocused: NoBringToFrontOnFocus keeps it pinned behind the (constantly
+    // refocused) main window in z-order for HIT-TESTING even though it still RENDERS
+    // fine (nothing else paints that pixel region, so the stale draw looks correct).
+    // Confirmed via a live click test: mouse sat inside the button's own reported
+    // rect every frame, yet IsItemHovered() stayed false. Drawing it as a same-window
+    // widget removes the cross-window z-order ambiguity entirely; submitting it AFTER
+    // the left-edge resize hit-zone (drawAIPanel, above drawCopilotHeader's call) lets
+    // it win the same-window overlap the normal "later item wins" way.
     {
         const ImVec2 winP0 = ImGui::GetWindowPos();
         // The header is pulled to window top (drawAIPanel SetCursorPosY(0)), so the
@@ -102,50 +115,36 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         const float row2H = std::max(lh, ImGui::GetFrameHeight());
         const float chipY = winP0.y + (row1H + row2H - chevSz) * 0.5f;
         const ImVec2 c0(winP0.x + leftInset, chipY);
-        ImGui::SetNextWindowPos(c0, ImGuiCond_Always);
-        ImGui::SetNextWindowSize(ImVec2(chevSz, chevSz), ImGuiCond_Always);
-        ImGui::SetNextWindowBgAlpha(0.0f);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 7.0f);
-        const ImGuiWindowFlags chipFlags =
-            ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoNav |
-            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
-            ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking |
-            ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoBringToFrontOnFocus |
-            ImGuiWindowFlags_NoBackground;
-        if (ImGui::Begin("##cp_collapse_chip", nullptr, chipFlags)) {
-            const ImVec2 b0 = ImGui::GetCursorScreenPos();
-            const bool cClicked = ImGui::InvisibleButton("##cp_collapse", ImVec2(chevSz, chevSz));
-            const bool cHover = ImGui::IsItemHovered();
-            ImDrawList* wdl = ImGui::GetWindowDrawList();
-            const ImVec2 b1(b0.x + chevSz, b0.y + chevSz);
-            // Shared collapse-chip recipe (must match FM ##lp_collapse):
-            // rest wash 0.32 / hover 0.50, textPrimary glyph, 1.85px stroke.
-            ui::glassRowBackground(wdl, b0, b1, 7.0f, false, cHover,
-                                   cHover ? 0.50f : 0.32f);
-            const ImU32 cCol = ImGui::ColorConvertFloat4ToU32(chatSurf().textPrimary);
-            const ImVec2 cc(b0.x + chevSz * 0.5f, b0.y + chevSz * 0.5f);
-            const float ca = 3.5f * sc;
-            const float stroke = 1.85f * sc;
-            // "«" collapse to the left, "»" expand back right.
-            const float dir = s_cpCollapsed ? 1.0f : -1.0f;
-            for (int i = 0; i < 2; ++i) {
-                const float ox = (i == 0 ? -2.5f : 2.5f) * sc;
-                wdl->AddLine(ImVec2(cc.x + dir * (ox - ca * 0.5f), cc.y - ca),
-                             ImVec2(cc.x + dir * (ox + ca * 0.5f), cc.y), cCol, stroke);
-                wdl->AddLine(ImVec2(cc.x + dir * (ox + ca * 0.5f), cc.y),
-                             ImVec2(cc.x + dir * (ox - ca * 0.5f), cc.y + ca), cCol, stroke);
-            }
-            if (cHover) ImGui::SetTooltip(s_cpCollapsed ? "Expand" : "Collapse");
-            if (cClicked) {
-                s_cpCollapsed = !s_cpCollapsed;
-                st.settings.copilotCollapsed = s_cpCollapsed;
-                saveSettings(st.settings);
-            }
+        const ImVec2 savedCur = ImGui::GetCursorScreenPos();
+        ImGui::SetCursorScreenPos(c0);
+        const bool cClicked = ImGui::InvisibleButton("##cp_collapse", ImVec2(chevSz, chevSz));
+        const bool cHover = ImGui::IsItemHovered();
+        ImDrawList* wdl = ImGui::GetWindowDrawList();
+        const ImVec2 b1(c0.x + chevSz, c0.y + chevSz);
+        // Shared collapse-chip recipe (must match FM ##lp_collapse):
+        // rest wash 0.32 / hover 0.50, textPrimary glyph, 1.85px stroke.
+        ui::glassRowBackground(wdl, c0, b1, 7.0f, false, cHover,
+                               cHover ? 0.50f : 0.32f);
+        const ImU32 cCol = ImGui::ColorConvertFloat4ToU32(chatSurf().textPrimary);
+        const ImVec2 cc(c0.x + chevSz * 0.5f, c0.y + chevSz * 0.5f);
+        const float ca = 3.5f * sc;
+        const float stroke = 1.85f * sc;
+        // "«" collapse to the left, "»" expand back right.
+        const float dir = s_cpCollapsed ? 1.0f : -1.0f;
+        for (int i = 0; i < 2; ++i) {
+            const float ox = (i == 0 ? -2.5f : 2.5f) * sc;
+            wdl->AddLine(ImVec2(cc.x + dir * (ox - ca * 0.5f), cc.y - ca),
+                         ImVec2(cc.x + dir * (ox + ca * 0.5f), cc.y), cCol, stroke);
+            wdl->AddLine(ImVec2(cc.x + dir * (ox + ca * 0.5f), cc.y),
+                         ImVec2(cc.x + dir * (ox - ca * 0.5f), cc.y + ca), cCol, stroke);
         }
-        ImGui::End();
-        ImGui::PopStyleVar(3);
+        if (cHover) ImGui::SetTooltip(s_cpCollapsed ? "Expand" : "Collapse");
+        if (cClicked) {
+            s_cpCollapsed = !s_cpCollapsed;
+            st.settings.copilotCollapsed = s_cpCollapsed;
+            saveSettings(st.settings);
+        }
+        ImGui::SetCursorScreenPos(savedCur);
     }
 
     // ---- Row 1: [Tasks] .. centered Chudware .. [Artifacts]  (clears leftInset) ----

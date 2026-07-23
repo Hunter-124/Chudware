@@ -85,11 +85,15 @@ enum class CopilotMode : int {
 };
 
 struct Settings {
-    int provider = 6;  // 0=Anthropic 1=OpenAI 2=Local OpenAI-compat 3=managed llama.cpp 4=Gemini
-                       // 5=Cloud OpenAI-compat 6=xAI. Default xAI grok-4.5 (owner directive
-                       // 2026-07-14: SuperGrok subscription is the cheapest tested tier; the
-                       // Accounts sign-in wires credentials; Gemini stays one pick away).
-    char model[512] = "grok-4.5";  // frontier default; auto-pick still routes cheap work down
+    int provider = 9;  // 0=Anthropic 1=OpenAI 2=Local OpenAI-compat 3=managed llama.cpp 4=Gemini
+                       // 5=Cloud OpenAI-compat 6=xAI 7=Cursor 8=Kimi Code 9=ZenMux (OMP bridge).
+                       // Default ZenMux x-ai/grok-4.5-free (owner directive 2026-07-23: xAI/grok-4.5
+                       // required an xAI sign-in most installs don't have — every fresh chat opened
+                       // to "xAI not configured". ZenMux's free tier works out of the box off a
+                       // ZenMux sign-in via the OMP bridge (Settings → Providers); OpenRouter's
+                       // ":free" models are the documented backup when ZenMux itself is unusable).
+    char model[512] = "x-ai/grok-4.5-free";  // frontier-free default; auto-pick still routes cheap
+                                             // work down
     char apiKey[256] = "";        // active-provider key (local OpenAI-compat optional key)
     // Per-provider keys so the picker can hide providers with no key while keeping each key
     // around when another provider is active. Serialized under config.json "keys".
@@ -1257,7 +1261,7 @@ struct AppState {
     int selectedPart = -1;            // -1 = whole assembly; >=0 = index into asmParts
 
     // ---- model picker availability (filled by the agent_list_models probe) ----
-    ProviderModels providerModels[9];        // indexed by ui::ProviderIndex (PROV_COUNT=9; PROV_KIMISUB=8). Literal: model_registry.h not included here.
+    ProviderModels providerModels[10];       // indexed by ui::ProviderIndex (PROV_COUNT=10; PROV_ZENMUX=9). Literal: model_registry.h not included here.
     std::atomic<bool> modelProbeInFlight{false};
 
     std::vector<char> chatInput{std::vector<char>(2048, 0)};

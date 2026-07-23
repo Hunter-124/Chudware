@@ -211,7 +211,7 @@ void loadSettings(Settings& s) {
     try {
         nlohmann::json j;
         f >> j;
-        std::string prov = j.value("provider", "xai-sub");
+        std::string prov = j.value("provider", "zenmux");
         auto oai = j.value("openai", nlohmann::json::object());
         auto llama = j.value("llamacpp", nlohmann::json::object());
         std::string base = oai.value("base_url", "");
@@ -232,6 +232,7 @@ void loadSettings(Settings& s) {
         else if (prov == "xai" || prov == "xai-sub") s.provider = 6;  // PROV_XAI
         else if (prov == "cursor" || prov == "cursor-sub") s.provider = 7;  // PROV_CURSOR
         else if (prov == "kimi-sub") s.provider = 8;  // PROV_KIMISUB (Kimi Code subscription OAuth)
+        else if (prov == "zenmux") s.provider = 9;  // PROV_ZENMUX (OMP bridge — default provider)
         else if (prov == "moonshot") {
             // First-class Moonshot (Kimi) wire provider — GUI still uses the cloud-compat slot
             // (PROV_CLOUDCOMPAT=5) so the model picker / base_url path stays shared.
@@ -247,6 +248,7 @@ void loadSettings(Settings& s) {
         if (s.provider == 3) model = llama.value("model_path", model);
         if (s.provider == 3 && model.empty()) model = kDefaultLlamaModelPath;
         if (s.provider == 6 && model.empty()) model = "grok-4.5";
+        if (s.provider == 9 && model.empty()) model = "x-ai/grok-4.5-free";
         if (s.provider == 8 && model.empty()) model = "kimi-k3";
         // Stale GUI ids from prior releases → current catalog defaults.
         if (s.provider == 8 && (model == "kimi-for-coding" || model == "kimi-k2.7-code"))
@@ -255,9 +257,11 @@ void loadSettings(Settings& s) {
             model = "grok-4.5";
         // Cursor has NO chat-completions transport (its agent API is Connect-RPC/protobuf, not
         // REST) in either the C++ core or the Python worker, so a saved CHAT provider of "cursor"
-        // makes the copilot refuse on open. Migrate the chat provider to xAI/grok (the default
-        // role model, and one the user is signed into). Cursor stays usable for the design-agent
-        // path, which routes separately. One-time on load; persisted on the next settings write.
+        // makes the copilot refuse on open. Migrate the chat provider to xAI/grok — the migration
+        // just below then re-migrates that (along with any other saved xAI/grok-4.5 pick) to the
+        // ZenMux default when the user has no xAI credential of their own. Cursor stays usable for
+        // the design-agent path, which routes separately. One-time on load; persisted on the next
+        // settings write.
         if (s.provider == 7) { s.provider = 6; model = "grok-4.5"; }
         if (prov == "moonshot") {
             if (model.empty() || model == "kimi-for-coding") model = "kimi-k3";
@@ -283,6 +287,31 @@ void loadSettings(Settings& s) {
             else if (prov == "openai" && hasBase && !baseLoopback && !s.cloudKey[0]) copyStr(s.cloudKey, sizeof(s.cloudKey), activeKey);
             else if (prov == "moonshot" && !s.moonshotKey[0]) copyStr(s.moonshotKey, sizeof(s.moonshotKey), activeKey);
             else if ((prov == "xai" || prov == "xai-sub") && !s.xaiKey[0]) copyStr(s.xaiKey, sizeof(s.xaiKey), activeKey);
+        }
+        // Owner directive 2026-07-23: xAI/grok-4.5 was the default chat provider (and the target
+        // of the Cursor migration just above), but most installs are NOT signed into xAI — no
+        // console.x.ai API key and no completed SuperGrok/X Premium+ OAuth — so every fresh chat
+        // opened straight to "xAI not configured". ZenMux's free x-ai/grok-4.5-free tier (an
+        // OMP-bridge provider — its credential lives in the bridge's own auth db, not this
+        // config.json) is now the default; OpenRouter's ":free" models are the documented backup.
+        // Migrate a saved xAI/grok-4.5 chat provider — whether the user's own prior pick or the
+        // Cursor migration above — to ZenMux, but ONLY when the user has no xAI credential of
+        // their own: a deliberately-signed-in xAI user keeps xAI. One-time on load, persisted on
+        // the next settings write; idempotent — once migrated (or user-repicked), Settings never
+        // again satisfies "provider==xAI && model==grok-4.5" so this branch never re-fires.
+        if (s.provider == 6 && model == "grok-4.5") {
+            bool xaiSignedIn = s.xaiKey[0] != 0;
+            if (!xaiSignedIn) {
+                auto subAuth = j.value("subscription_auth", nlohmann::json::object());
+                if (subAuth.is_object() &&
+                    (subAuth.contains("xai") || subAuth.contains("xai-sub")))
+                    xaiSignedIn = true;
+            }
+            if (!xaiSignedIn) {
+                s.provider = 9;  // PROV_ZENMUX
+                model = "x-ai/grok-4.5-free";
+                copyStr(s.model, sizeof(s.model), model);
+            }
         }
         // Seed the shipped Gemini key on first run so the copilot works out of the box.
         if (!s.geminiKey[0]) copyStr(s.geminiKey, sizeof(s.geminiKey), kSeededGeminiKey);
@@ -552,6 +581,13 @@ void saveSettings(const Settings& s) {
         // Distinct from Moonshot API key path (provider "moonshot" / keys.moonshot).
         j["provider"] = "kimi-sub";
         j["model"] = s.model[0] ? s.model : "kimi-k3";
+    } else if (s.provider == 9) {
+        // ZenMux — OMP-bridge provider (core/agent/providers.cpp kOmpBridgeProviders). No local
+        // api_key: the completion routes through the bun bridge, which resolves the credential
+        // from its own auth db (Settings → Providers sign-in). Default provider (owner directive
+        // 2026-07-23) — free x-ai/grok-4.5-free tier.
+        j["provider"] = "zenmux";
+        j["model"] = s.model[0] ? s.model : "x-ai/grok-4.5-free";
     } else if (s.provider == 3) {
         j["provider"] = "llamacpp";
         j["model"] = "local-gguf";

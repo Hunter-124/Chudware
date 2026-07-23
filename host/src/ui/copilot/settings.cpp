@@ -226,6 +226,9 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
         } else if (s.provider == ui::PROV_KIMISUB) {
             std::strncpy(s.model, "kimi-k3", sizeof(s.model) - 1);
             s.vision = true;
+        } else if (s.provider == ui::PROV_ZENMUX) {
+            std::strncpy(s.model, "x-ai/grok-4.5-free", sizeof(s.model) - 1);
+            s.vision = true;
         }
     }
 
@@ -566,6 +569,15 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
             ImGui::PopStyleColor();
         }
         if (ImGui::Checkbox("Model supports vision (send screenshots)", &s.vision)) changed = true;
+    } else if (s.provider == ui::PROV_ZENMUX) {
+        // OMP-bridge provider — the credential lives in the bridge's own auth db, wired up via
+        // Settings → Providers sign-in (drawOmpProviderManager), not a local config.json key.
+        dimText("ZenMux (OMP bridge). Sign in under Settings \xe2\x86\x92 Providers; no API key "
+                "field here — the bridge resolves the credential from its own auth db.");
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
+        ImGui::TextUnformatted("Wire provider: zenmux \xc2\xb7 model: x-ai/grok-4.5-free (default)");
+        ImGui::PopStyleColor();
+        if (ImGui::Checkbox("Model supports vision (send screenshots)", &s.vision)) changed = true;
     } else if (cloud) {
         ImGui::TextUnformatted("API key");
         char* key = providerKeyBuf(s, s.provider);
@@ -734,9 +746,9 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
             return st.settings.disabledProviders.count(key) == 0;
         };
 
-        // Built-in cloud providers (Gemini / Anthropic / OpenAI / xAI / Cursor / Kimi Code).
+        // Built-in cloud providers (Gemini / Anthropic / OpenAI / xAI / Cursor / Kimi Code / ZenMux).
         for (int pv : {ui::PROV_GEMINI, ui::PROV_ANTHROPIC, ui::PROV_OPENAI, ui::PROV_XAI,
-                       ui::PROV_CURSOR, ui::PROV_KIMISUB}) {
+                       ui::PROV_CURSOR, ui::PROV_KIMISUB, ui::PROV_ZENMUX}) {
             std::string key = ui::providerCatKey(pv);
             int n = 0;
             for (const auto& m : ui::builtinModels()) if (m.provider == pv) ++n;
@@ -1047,6 +1059,7 @@ static const char* providerShort(int provider) {
         case ui::PROV_CLOUDCOMPAT: return "Cloud";
         case ui::PROV_CURSOR:    return "Cursor";
         case ui::PROV_KIMISUB:   return "kimi code";
+        case ui::PROV_ZENMUX:    return "ZenMux";
     }
     return "";
 }
@@ -1202,6 +1215,11 @@ bool providerUsable(AppState& st, int provider) {
         case ui::PROV_LLAMACPP:    return st.providerModels[ui::PROV_LLAMACPP].ok;
         case ui::PROV_CURSOR:      return s_subConn.cursor;
         case ui::PROV_KIMISUB:     return s_subConn.kimi;
+        // ZenMux — OMP-bridge credential lives in the bridge's own auth db (Settings → Providers),
+        // not a locally-polled subscription/key flag this file can cheaply check. Always offered;
+        // an unsigned-in bridge surfaces a normal auth error from the backend on send, same class
+        // as any other unconfigured provider.
+        case ui::PROV_ZENMUX:      return true;
     }
     return false;
 }
@@ -1431,6 +1449,7 @@ const ui::BridgeModelMeta* bridgeModelMetaForCad(int cadProvider, const std::str
         case ui::PROV_OPENAI:    prov = "openai"; break;
         case ui::PROV_XAI:       prov = "xai"; break;
         case ui::PROV_GEMINI:    prov = "google"; break;
+        case ui::PROV_ZENMUX:    prov = "zenmux"; break;
         case ui::PROV_CLOUDCOMPAT: {
             // The shared cloud slot resolves by base_url (Moonshot is the prioritized one).
             const char* svc = ui::cloudServiceKey(cloudBaseUrl ? cloudBaseUrl : "");
@@ -1876,7 +1895,7 @@ void drawModelDropdown(AppState& st, bool busy) {
     if (shown == 0) {
         ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDisabled));
         ImGui::TextWrapped(q.empty()
-            ? "No models available — sign in to a subscription (xAI / Claude / Cursor), "
+            ? "No models available — sign in to a subscription (ZenMux / xAI / Claude / Cursor), "
               "add an API key, or start a local model server (gear below)."
             : "No models match your search.");
         ImGui::PopStyleColor();

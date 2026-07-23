@@ -5,6 +5,7 @@
 #include "imgui.h"
 
 #include "metrics.h"
+#include "model_registry.h"
 #include "status_bar.h"
 
 #include "../core/app_state.h"
@@ -312,12 +313,9 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
                      it->get<std::string>() == "aicad.asm/1");
         }
     }
-    const char* provName = st.settings.provider == 0 ? "Anthropic"
-                         : st.settings.provider == 1 ? "OpenAI"
-                         : st.settings.provider == 3 ? "llama.cpp"
-                         : st.settings.provider == 4 ? "Gemini"
-                         : st.settings.provider == 5 ? "Cloud API"
-                         : st.settings.provider == 6 ? "xAI" : "Local";
+    // Provider name from the shared registry (covers every ProviderIndex incl. bridge
+    // providers like ZenMux); the old hardcoded 0-6 chain mislabeled newer slots "Local".
+    const char* provName = ui::providerLabel(st.settings.provider);
     std::string ptxt = std::string(provName) + "  /  " +
                        (st.settings.model[0] ? st.settings.model : "default") +
                        (st.settings.planMode ? "   [plan mode]" : "");

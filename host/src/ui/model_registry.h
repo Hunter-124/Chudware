@@ -28,7 +28,12 @@ enum ProviderIndex {
     PROV_XAI = 6,         // xAI Grok — API key (console.x.ai) and/or SuperGrok OAuth (xai-sub)
     PROV_CURSOR = 7,      // Cursor (Composer + proxied Anthropic/OpenAI models)
     PROV_KIMISUB = 8,     // Kimi Code subscription — OAuth via subscription_auth (wire "kimi-sub")
-    PROV_COUNT = 9,
+    PROV_ZENMUX = 9,      // ZenMux — OMP-bridge provider (core/agent/providers.cpp
+                          // kOmpBridgeProviders); credentials live in the bridge's own auth db
+                          // (Settings → Providers sign-in), not a local config.json key. Default
+                          // chat/agent provider (owner directive 2026-07-23: free x-ai/grok-4.5-free
+                          // tier works out of the box without an xAI sign-in).
+    PROV_COUNT = 10,
 };
 
 struct ModelInfo {
@@ -58,6 +63,7 @@ inline const char* providerLabel(int provider) {
         case PROV_XAI: return "xAI (Grok)";
         case PROV_CURSOR: return "Cursor";
         case PROV_KIMISUB: return "Kimi Code (subscription)";
+        case PROV_ZENMUX: return "ZenMux";
         default: return "?";
     }
 }
@@ -65,7 +71,7 @@ inline const char* providerLabel(int provider) {
 inline bool providerIsCloud(int provider) {
     return provider == PROV_ANTHROPIC || provider == PROV_OPENAI || provider == PROV_GEMINI ||
            provider == PROV_CLOUDCOMPAT || provider == PROV_XAI || provider == PROV_CURSOR ||
-           provider == PROV_KIMISUB;
+           provider == PROV_KIMISUB || provider == PROV_ZENMUX;
 }
 
 // ---- provider/service CATEGORY keys (for Manage-models categories + bulk on/off) ----
@@ -83,6 +89,7 @@ inline const char* providerCatKey(int provider) {
         case PROV_XAI: return "xai";
         case PROV_CURSOR: return "cursor";
         case PROV_KIMISUB: return "kimi-code";
+        case PROV_ZENMUX: return "zenmux";
         default: return "other";
     }
 }
@@ -108,6 +115,7 @@ inline const char* categoryLabel(const std::string& key) {
     if (key == "xai") return "xAI (Grok)";
     if (key == "cursor") return "Cursor";
     if (key == "kimi-code") return "Kimi Code (subscription)";
+    if (key == "zenmux") return "ZenMux";
     return "Cloud API";
 }
 
@@ -115,6 +123,9 @@ inline const char* categoryLabel(const std::string& key) {
 // (a local endpoint can serve any GGUF), so they are NOT listed here — the probe fills them.
 inline const std::vector<ModelInfo>& builtinModels() {
     static const std::vector<ModelInfo> kModels = {
+        // ZenMux — OMP-bridge provider; owner directive 2026-07-23 default. Free x-ai/grok-4.5-free
+        // tier needs only a ZenMux sign-in (Settings → Providers), not an xAI credential.
+        {PROV_ZENMUX, "x-ai/grok-4.5-free", "Grok 4.5 (default, free via ZenMux)", true, true},
         // Google Gemini — vision + thinking (reasoning-effort) on 2.5; 2.0-flash has no knob.
         {PROV_GEMINI, "gemini-2.5-pro", "Gemini 2.5 Pro", true, true},
         {PROV_GEMINI, "gemini-2.5-flash", "Gemini 2.5 Flash", true, true},
@@ -136,8 +147,9 @@ inline const std::vector<ModelInfo>& builtinModels() {
         // Wire alias: kimi_sub_provider maps both → "kimi-for-coding" on the subscription endpoint.
         {PROV_KIMISUB, "kimi-k3", "Kimi K3 (1M)", true, true},
         {PROV_KIMISUB, "kimi-k2.7", "Kimi K2.7 (262K)", true, true},
-        // xAI Grok — only grok-4.5 is user-visible (500k context; ~$2/$6 per Mtok).
-        {PROV_XAI, "grok-4.5", "Grok 4.5 (default, 500k)", true, true},
+        // xAI Grok — only grok-4.5 is user-visible (500k context; ~$2/$6 per Mtok). No longer the
+        // default (needs an explicit xAI sign-in) — kept for users who ARE signed into xAI.
+        {PROV_XAI, "grok-4.5", "Grok 4.5 (500k)", true, true},
     };
     return kModels;
 }
@@ -286,6 +298,7 @@ inline int defaultContextWindowForModel(int provider, const std::string& id,
         case PROV_OPENAI:
         case PROV_CLOUDCOMPAT:
         case PROV_XAI:
+        case PROV_ZENMUX:
         case PROV_CURSOR: return 128000;
         case PROV_KIMISUB: return 1048576;  // default K3 = 1M
         default: return 8192;

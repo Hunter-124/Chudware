@@ -118,6 +118,9 @@ static const char* providerWireName(int provider) {
         case ui::PROV_XAI:         return "xai";  // saveSettings rewrites to xai-sub when no key
         case ui::PROV_CURSOR:      return "cursor";
         case ui::PROV_KIMISUB:     return "kimi-sub";
+        // ZenMux — OMP-bridge provider id, routed through the bun bridge (core/agent/providers.cpp
+        // is_omp_bridge_provider) using its own auth db, not a config.json key. Default provider.
+        case ui::PROV_ZENMUX:      return "zenmux";
     }
     return "";
 }
@@ -1366,10 +1369,10 @@ void drawRuntimeBanner(AppState& st) {
 
 // Build a compact "Provider · model" label for the composer's model chip.
 static void composerModelLabel(const Settings& s, char* out, size_t n) {
-    // Keep in lockstep with ui::ProviderIndex (Anthropic..Kimi Code).
+    // Keep in lockstep with ui::ProviderIndex (Anthropic..ZenMux).
     const char* provNames[] = {
         "Anthropic", "OpenAI", "Local", "llama.cpp", "Gemini", "Cloud API", "xAI", "Cursor",
-        "Kimi Code"
+        "Kimi Code", "ZenMux"
     };
     static_assert(sizeof(provNames) / sizeof(provNames[0]) == ui::PROV_COUNT,
                   "composerModelLabel provNames must match PROV_COUNT");

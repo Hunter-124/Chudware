@@ -4,9 +4,9 @@ Makes a double-clicked file (or right-click -> Open with) open in Chudware, and 
 as the default app. The native **.step+** document is the priority; the interchange formats Chudware
 natively loads are added to "Open with" without hijacking the user's existing handlers for them.
 
-The executable is now named Chudware (2026-07 deep rename); an Chudware compat symlink ships
+The executable is now named Chudware (2026-07 deep rename); an AI-CAD compat symlink ships
 beside it for legacy scripts, and default_exe() falls back to the old name on stale builds. Register/unregister
-also clean up the pre-rename Chudware.* ProgIDs / ai-cad.* XDG files so a machine migrates cleanly.
+also clean up the pre-rename AICAD.* ProgIDs / ai-cad.* XDG files so a machine migrates cleanly.
 
 Idempotent, **per-user (no elevation)**, and reversible (`--unregister`) — modelled on
 installer/setup_mcp_clients.py (stdlib only, `--dry-run`, backups).
@@ -41,9 +41,9 @@ DESKTOP_FILE = "chudware.desktop"
 MIME_PACKAGE = "chudware.xml"
 ICON_SIZES = (16, 32, 48, 64, 128, 256)          # hicolor sizes for the document MIME icon
 
-# Pre-rename (Chudware) identifiers — register/unregister remove these so a machine that
+# Pre-rename (AI-CAD) identifiers — register/unregister remove these so a machine that
 # had the old associations migrates cleanly to the Chudware names.
-LEGACY_PROGIDS = ("Chudware.stepplus", "Chudware.document")
+LEGACY_PROGIDS = ("AICAD.stepplus", "AICAD.document")
 LEGACY_MIME_ICON = "application-vnd.aicad.stepplus"
 LEGACY_DESKTOP_FILE = "ai-cad.desktop"
 LEGACY_MIME_PACKAGE = "ai-cad.xml"
@@ -65,16 +65,16 @@ ASSOCIATIONS = [
 
 def default_exe() -> str:
     """Best-guess path to the executable for this platform (overridable with --exe).
-    Prefers the canonical Chudware binary; falls back to the pre-rename Chudware name so
+    Prefers the canonical Chudware binary; falls back to the pre-rename AI-CAD name so
     stale build dirs / the dist/Chudware Windows stage layout keep working."""
     repo = Path(__file__).resolve().parent.parent
     if sys.platform.startswith("win"):
         candidates = [repo / "dist" / "Chudware" / "Chudware.exe",
-                      repo / "dist" / "Chudware" / "Chudware.exe"]
+                      repo / "dist" / "AI-CAD" / "AI-CAD.exe"]
     else:
         # Linux/macOS: the host build output (host/build-linux/bin/Chudware).
         bindir = repo / "host" / "build-linux" / "bin"
-        candidates = [bindir / "Chudware", bindir / "Chudware"]
+        candidates = [bindir / "Chudware", bindir / "AI-CAD"]
     for c in candidates:
         if c.exists():
             return str(c)
@@ -116,7 +116,7 @@ def windows_registry_plan(exe: str) -> list[dict]:
 
 
 def windows_legacy_cleanup_plan() -> list[dict]:
-    """Pure description of the PRE-RENAME (Chudware.*) registry state to remove — list of
+    """Pure description of the PRE-RENAME (AICAD.*) registry state to remove — list of
     {"kind": "tree", "subkey": ...} (delete whole key tree) and
     {"kind": "value", "subkey": ..., "name": ...} (delete one value). Applied on BOTH
     register (migration) and unregister (full cleanup)."""
@@ -144,7 +144,7 @@ def register_windows(exe: str, unregister: bool, dry_run: bool) -> list[str]:
     msgs: list[str] = []
     if unregister:
         # Delete the ProgID trees + our OpenWithProgids values (current AND pre-rename
-        # Chudware.* names). Deepest keys first.
+        # AICAD.* names). Deepest keys first.
         progid_roots = [fr"Software\Classes\{PROGID_NATIVE}", fr"Software\Classes\{PROGID_DOC}"]
         if not dry_run:
             for root in progid_roots:
@@ -155,11 +155,11 @@ def register_windows(exe: str, unregister: bool, dry_run: bool) -> list[str]:
                                      fr"Software\Classes\{a['ext']}\OpenWithProgids", pid)
             apply_legacy_cleanup()
         msgs.append(f"{'would remove' if dry_run else 'removed'} {len(progid_roots)} ProgIDs "
-                    f"+ {len(ASSOCIATIONS)} associations (+ legacy Chudware.* names)")
+                    f"+ {len(ASSOCIATIONS)} associations (+ legacy AICAD.* names)")
         return msgs
 
     if not dry_run:
-        # Migration: drop the pre-rename Chudware.* ProgIDs/values FIRST, then write the
+        # Migration: drop the pre-rename AICAD.* ProgIDs/values FIRST, then write the
         # Chudware plan (which re-defaults .step+ to the new native ProgID).
         apply_legacy_cleanup()
     for e in plan:
@@ -255,7 +255,7 @@ def _mime_icon_paths(data: Path, icon_name: str = MIME_ICON) -> list[Path]:
 
 
 def _legacy_linux_paths(data: Path) -> list[Path]:
-    """Pre-rename (Chudware) XDG artifacts removed on both register and unregister."""
+    """Pre-rename (AI-CAD) XDG artifacts removed on both register and unregister."""
     return [data / "applications" / LEGACY_DESKTOP_FILE,
             data / "mime" / "packages" / LEGACY_MIME_PACKAGE,
             *_mime_icon_paths(data, LEGACY_MIME_ICON)]

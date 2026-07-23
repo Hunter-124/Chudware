@@ -54,14 +54,14 @@ def test_windows_plan() -> None:
     for pid in (fa.PROGID_NATIVE, fa.PROGID_DOC):
         check(has(fr"Software\Classes\{pid}\DefaultIcon", "", lambda v: v == f"{exe},1"),
               f"windows: {pid} DefaultIcon = <exe>,1 (doc icon group)")
-    # Chudware identity (2026-07 rename): ProgIDs + user-visible type names say Chudware, not Chudware.
+    # Chudware identity (2026-07 rename): ProgIDs + user-visible type names say Chudware, not AI-CAD.
     check(fa.PROGID_NATIVE == "Chudware.stepplus" and fa.PROGID_DOC == "Chudware.document",
           "windows: ProgIDs use the Chudware identity")
     check(has(fr"Software\Classes\{fa.PROGID_NATIVE}", "", lambda v: v == "Chudware Document"),
           "windows: native ProgID type name is 'Chudware Document'")
-    check(not any("Chudware" in e["value"] or "Chudware" in e["subkey"]
+    check(not any("AICAD" in e["value"] or "AI-CAD" in e["value"] or "AICAD" in e["subkey"]
                   for e in plan if e["subkey"].count("\\") == 2 and e["name"] == ""),
-          "windows: no Chudware branding left in ProgID type names")
+          "windows: no AI-CAD branding left in ProgID type names")
     # .step+ defaults to the native ProgID; all listed extensions advertise in Open-with.
     check(has(r"Software\Classes\.step+", "", lambda v: v == fa.PROGID_NATIVE),
           "windows: .step+ defaults to the native ProgID")
@@ -117,8 +117,8 @@ def test_linux_content() -> None:
     check("Name=Chudware" in desk, "linux: launcher Name is Chudware")
     check(fa.MIME_NATIVE == "application/vnd.chudware.stepplus",
           "linux: native MIME is application/vnd.chudware.stepplus")
-    check("Chudware Document" in xml and "Chudware" not in xml,
-          "linux: MIME comment says Chudware Document (no Chudware branding)")
+    check("Chudware Document" in xml and "AI-CAD" not in xml,
+          "linux: MIME comment says Chudware Document (no AI-CAD branding)")
     check(fa.DESKTOP_FILE == "chudware.desktop" and fa.MIME_PACKAGE == "chudware.xml",
           "linux: XDG file names use the chudware identity")
 
@@ -130,7 +130,7 @@ def test_linux_register_roundtrip() -> None:
         desktop = Path(tmp) / "applications" / fa.DESKTOP_FILE
         mime = Path(tmp) / "mime" / "packages" / fa.MIME_PACKAGE
 
-        # Pre-seed the PRE-RENAME (Chudware) artifacts so register can prove the migration cleanup.
+        # Pre-seed the PRE-RENAME (AI-CAD) artifacts so register can prove the migration cleanup.
         legacy_desktop = Path(tmp) / "applications" / fa.LEGACY_DESKTOP_FILE
         legacy_mime = Path(tmp) / "mime" / "packages" / fa.LEGACY_MIME_PACKAGE
         legacy_icon = (Path(tmp) / "icons" / "hicolor" / "256x256" / "mimetypes"

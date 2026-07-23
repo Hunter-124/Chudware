@@ -25,12 +25,14 @@ try:
     from .proxy import router as proxy_router
     from .sessions import SessionBusy, PodmanError, manager, mem_available_bytes, mem_available_gib
     from .chat import Presence, presence, router as chat_router  # noqa: F401
+    from .bucket import router as bucket_router
 except ImportError:  # uvicorn app:app from package dir
     from auth import AuthMiddleware, User, get_current_user
     from config import settings
     from proxy import router as proxy_router
     from sessions import SessionBusy, PodmanError, manager, mem_available_bytes, mem_available_gib
     from chat import Presence, presence, router as chat_router  # noqa: F401
+    from bucket import router as bucket_router
 
 log = logging.getLogger("chudware-web")
 logging.basicConfig(
@@ -709,6 +711,7 @@ app.include_router(providers_router)
 app.include_router(terminal_router)
 app.include_router(deploy_router)
 app.include_router(releases_router)
+app.include_router(bucket_router)
 
 if STATIC_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")

@@ -144,6 +144,10 @@ class Settings:
     # defaults (instance key "chudwareweb" is verbatim => socket name is stable).
     webd_socket: Path = field(default_factory=Path)
     workspace_root: Path = field(default_factory=Path)
+    # Team file-drop bucket (/bucket page): any logged-in user can upload/organize
+    # files here. Independent of workspace_root (the CAD engine's live doc tree) —
+    # separate concern so uploads don't collide with .aicm mesh cache / doc autosave.
+    bucket_root: Path = field(default_factory=Path)
     # WASM web client static root (served at /app) + client perf traces.
     app_dir: Path = field(default_factory=Path)
     perf_traces_dir: Path = field(default_factory=Path)
@@ -169,6 +173,9 @@ class Settings:
                 or "~/Documents/ME489/Crimson_Crankers_Program/01_Design_Package/CAD_Build"
             )
             self.workspace_root = _expand_path(raw)
+        if not self.bucket_root or str(self.bucket_root) in {".", ""}:
+            raw = _env("CHUDWARE_WEB_BUCKET_ROOT") or "~/ME489"
+            self.bucket_root = _expand_path(raw)
         if not self.app_dir or str(self.app_dir) in {".", ""}:
             raw = _env("CHUDWARE_WEB_APP_DIR") or "~/chudware-web/app"
             self.app_dir = _expand_path(raw)
@@ -251,6 +258,10 @@ class Settings:
         except OSError as exc:
             # Don't crash gateway boot if the path is unwritable; list endpoints
             # will still 503 with a clear detail.
+            pass
+        try:
+            self.bucket_root.mkdir(parents=True, exist_ok=True)
+        except OSError:
             pass
         # Seed a runtime users file from the repo template when the configured
         # path lives outside the package and doesn't exist yet (/admin edits it).

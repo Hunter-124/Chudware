@@ -96,6 +96,13 @@
       line-height: 1.55;
       color: var(--muted);
     }
+    .cta-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: center;
+      gap: 14px;
+    }
     .cta {
       display: inline-flex;
       align-items: center;
@@ -117,6 +124,17 @@
     .cta:hover, .cta:focus-visible { transform: translateY(-1px); box-shadow: 0 12px 30px rgba(79,140,255,0.45), inset 0 1px 0 rgba(255,255,255,0.3); }
     .cta:active { transform: translateY(0); }
     .cta svg { width: 18px; height: 18px; }
+    .cta.secondary {
+      background: var(--panel);
+      color: var(--text);
+      border: 1px solid var(--panel-edge);
+      box-shadow: none;
+      padding: 13px 32px;
+    }
+    .cta.secondary:hover, .cta.secondary:focus-visible {
+      border-color: var(--accent);
+      box-shadow: 0 8px 20px rgba(0,0,0,0.25);
+    }
     /* Feature row */
     .features {
       display: flex;
@@ -166,11 +184,17 @@
         font-size: 0.98rem;
         max-width: none;
       }
+      .cta-row {
+        flex-direction: column;
+        width: 100%;
+        align-items: stretch;
+      }
       .cta {
         width: 100%;
         max-width: 360px;
         padding: 16px 24px;
         font-size: 1.08rem;
+        margin: 0 auto;
       }
       .features {
         width: 100%;
@@ -216,10 +240,16 @@
         The full Chudware CAD suite runs natively in your browser on the shared team
         workspace — no install. Everyone sees the same models update live.
       </p>
-      <a class="cta" href="/app/">
-        Open Chudware
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
-      </a>
+      <div class="cta-row">
+        <a class="cta" href="/app/">
+          Open Chudware
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+        </a>
+        <a class="cta secondary" href="/bucket">
+          Team Bucket
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/></svg>
+        </a>
+      </div>
       <div class="features">
         <div class="feature"><span class="dot"></span> Live collaborative editing</div>
         <div class="feature"><span class="dot"></span> AI copilot built in</div>

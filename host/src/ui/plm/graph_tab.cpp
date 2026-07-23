@@ -1750,7 +1750,7 @@ void drawArcSpinner(ImDrawList *dl, ImVec2 c, float radius, ImU32 col) {
 // Bump kLayoutVersion whenever seed/clustering/force policy changes enough that
 // old positions would re-open as a hairball. Missing/mismatched version →
 // ignore the file and re-seed from the current algorithm (cluster wells).
-constexpr int kLayoutVersion = 5;
+constexpr int kLayoutVersion = 6;
 
 std::filesystem::path layoutCachePath(const GraphTabState &G) {
   return std::filesystem::path(G.projectDir) / ".plm" / "graph_layout.json";

@@ -24,6 +24,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <set>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -135,6 +136,10 @@ struct GraphTabState {
   int edgeCountFull = 0;
   bool listView = false;
   bool listViewUserOverride = false; // true once the user picks a mode
+  // Grid/List controls (graph-only controls hide in those modes): kind
+  // filter (empty = all) and sort mode (0=Name, 1=Kind, 2=Newest).
+  std::unordered_set<std::string> kindFilter;
+  int gridSort = 0;
   // Grid view: structural nodes (assembly/part/doc) of the current scope as
   // square iso-preview cells. Mutually exclusive with listView.
   bool gridView = false;
@@ -157,6 +162,10 @@ struct GraphTabState {
   std::unordered_map<std::string, Pos3> asmPosStash;
   // 2D positions stashed while the 3D world-position overlay is active.
   std::unordered_map<std::string, Pos3> preWorldStash;
+  // 2D<->3D toggle transition: positions lerp from->to over 0.35 s
+  // (smoothstep) so mode switches read as motion instead of a jump cut.
+  std::unordered_map<std::string, Pos3> trans3dFrom, trans3dTo;
+  double t3dStart = -1.0;
 
   // Scope: "" = project view; else the structural doc/asm/part node drilled
   // into.
@@ -1047,8 +1056,6 @@ void toggleAsmView(GraphTabState &G) {
 void hierarchySeed(GraphTabState &G,
                    const std::unordered_map<std::string, int> &visOrd,
                    const std::vector<std::vector<int>> &adjAll,
-                   const std::vector<int> &comp,
-                   const std::vector<std::pair<float, float>> &well,
                    const std::vector<char> &isFresh, float spacing,
                    std::vector<float> &outX, std::vector<float> &outY,
                    std::vector<float> &outZ) {
@@ -1247,16 +1254,95 @@ void hierarchySeed(GraphTabState &G,
       }
     }
   }
-  // Leftovers (no placed neighbor): component well + golden offset.
+  // Leftovers (no placed neighbor anywhere): disconnected FRAGMENTS. Cluster
+  // each fragment (connected over ANY edge kind) into its own phyllotaxis
+  // ball and shelf-pack the balls to the RIGHT of the main pack — the user's
+  // "each interlinked group gets its own circle" instead of the old golden
+  // ring of clutter around the main web.
+  {
+    // Fragment ids over adjAll, unplaced fresh nodes only.
+    std::vector<int> frag(static_cast<size_t>(V), -1);
+    int nFrag = 0;
+    std::vector<int> stack;
+    for (int i = 0; i < V; ++i) {
+      if (placed[static_cast<size_t>(i)] || !isFresh[static_cast<size_t>(i)] ||
+          frag[static_cast<size_t>(i)] >= 0)
+        continue;
+      const int fid = nFrag++;
+      stack.clear();
+      stack.push_back(i);
+      frag[static_cast<size_t>(i)] = fid;
+      while (!stack.empty()) {
+        const int u = stack.back();
+        stack.pop_back();
+        for (int v : adjAll[static_cast<size_t>(u)]) {
+          if (placed[static_cast<size_t>(v)] ||
+              !isFresh[static_cast<size_t>(v)] ||
+              frag[static_cast<size_t>(v)] >= 0)
+            continue;
+          frag[static_cast<size_t>(v)] = fid;
+          stack.push_back(v);
+        }
+      }
+    }
+    if (nFrag > 0) {
+      std::vector<std::vector<int>> members(static_cast<size_t>(nFrag));
+      for (int i = 0; i < V; ++i)
+        if (frag[static_cast<size_t>(i)] >= 0)
+          members[static_cast<size_t>(frag[static_cast<size_t>(i)])].push_back(i);
+      // Biggest fragments first (stable: lower id wins ties — deterministic).
+      std::vector<int> ford(static_cast<size_t>(nFrag));
+      for (int f = 0; f < nFrag; ++f)
+        ford[static_cast<size_t>(f)] = f;
+      std::sort(ford.begin(), ford.end(), [&](int a, int b) {
+        if (members[static_cast<size_t>(a)].size() !=
+            members[static_cast<size_t>(b)].size())
+          return members[static_cast<size_t>(a)].size() >
+                 members[static_cast<size_t>(b)].size();
+        return a < b;
+      });
+      // Main-pack extent (placed nodes) anchors the shelf origin.
+      float mainExt = spacing * 10.0f;
+      for (int i = 0; i < V; ++i) {
+        if (!placed[static_cast<size_t>(i)] || !isFresh[static_cast<size_t>(i)])
+          continue;
+        mainExt = std::max(mainExt, std::fabs(outX[static_cast<size_t>(i)]));
+        mainExt = std::max(mainExt, std::fabs(outY[static_cast<size_t>(i)]));
+      }
+      const float x0 = mainExt + 2.2f * spacing;
+      float sx = x0, sy = -mainExt, rowH = 0.0f;
+      const float rowW = 2.0f * mainExt + 4.0f * spacing;
+      for (int f : ford) {
+        const auto &mem = members[static_cast<size_t>(f)];
+        const float br = spacing * 0.9f *
+                             std::sqrt((float)mem.size() + 0.5f) +
+                         spacing * 0.5f;
+        if (sx + 2.0f * br > x0 + rowW) {
+          sx = x0;
+          sy += rowH + spacing;
+          rowH = 0.0f;
+        }
+        const float cx = sx + br, cy = sy + br;
+        for (size_t k = 0; k < mem.size(); ++k) {
+          const int i = mem[k];
+          const float rr = spacing * 0.9f * std::sqrt((float)k + 0.5f);
+          const float a = (float)k * GOLDEN;
+          outX[static_cast<size_t>(i)] = cx + rr * std::cos(a);
+          outY[static_cast<size_t>(i)] = cy + rr * std::sin(a);
+          placed[static_cast<size_t>(i)] = 1;
+        }
+        sx += 2.0f * br + spacing;
+        rowH = std::max(rowH, 2.0f * br);
+      }
+    }
+  }
+  // Anything still unplaced (no edges at all): deterministic origin cluster.
   for (int i = 0; i < V; ++i) {
     if (placed[static_cast<size_t>(i)] || !isFresh[static_cast<size_t>(i)])
       continue;
-    const int c = comp[static_cast<size_t>(i)];
-    const float wx = c >= 0 ? well[static_cast<size_t>(c)].first : 0.0f;
-    const float wy = c >= 0 ? well[static_cast<size_t>(c)].second : 0.0f;
     const float a = (float)i * GOLDEN;
-    outX[static_cast<size_t>(i)] = wx + spacing * 0.35f * std::cos(a);
-    outY[static_cast<size_t>(i)] = wy + spacing * 0.35f * std::sin(a);
+    outX[static_cast<size_t>(i)] = spacing * 0.35f * std::cos(a);
+    outY[static_cast<size_t>(i)] = spacing * 0.35f * std::sin(a);
   }
 }
 
@@ -1570,7 +1656,7 @@ void rebuildForce(GraphTabState &G) {
     layeredAsmSeed(G, collROrd, S, seedX, seedY, seedZ);
     haveSeed = true;
   } else if (fresh * 2 > V) {
-    hierarchySeed(G, visOrd, adjAll, comp, well, isFresh, 190.0f * S, seedX,
+    hierarchySeed(G, visOrd, adjAll, isFresh, 190.0f * S, seedX,
                   seedY, seedZ);
     haveSeed = true;
     G.hierarchyLayout = true; // pure structure — freeze the sim below
@@ -2299,6 +2385,22 @@ std::string resolveNodeAbsPath(AppState &st, const GNode &n) {
   return (std::filesystem::path(root) / p).lexically_normal().generic_string();
 }
 
+// For instance: nodes, the doc node they instance (INSTANCE_OF edge
+// src=instance, dst=doc), else nullptr. Thumbnails/open must target the
+// REFERENCED doc — the instance's own path is the containing assembly, so
+// every instance would otherwise render/open the assembly.
+const GNode *instanceTarget(const GraphTabState &G, const GNode &n) {
+  if (n.id.rfind("instance:", 0) != 0)
+    return nullptr;
+  for (const auto &e : G.edges)
+    if (e.kind == "INSTANCE_OF" && e.src == n.id) {
+      auto it = G.idIndex.find(e.dst);
+      if (it != G.idIndex.end())
+        return &G.nodes[it->second];
+    }
+  return nullptr;
+}
+
 // ---- hover thumbnails (.step+ package thumbnail.png via miniz)
 // ----------------
 
@@ -2791,13 +2893,16 @@ void drawSidePanel(AppState &st, float panelW) {
 
   ImGui::Dummy(ImVec2(0, 8 * S));
 
-  // Resolve open path once for preview + actions.
+  // Resolve open path once for preview + actions. Instance nodes resolve to
+  // the doc they instance (otherwise everything opens/renders the assembly).
   std::string absPath;
-  if ((isDrillableKind(sel->kind) || sel->kind == "project") &&
-      !sel->path.empty())
-    absPath = resolveNodeAbsPath(st, *sel);
-  else if (!sel->docId.empty()) {
-    auto dit = G.idIndex.find(sel->docId);
+  const GNode *instTgt = instanceTarget(G, *sel);
+  const GNode &openNode = instTgt ? *instTgt : *sel;
+  if ((isDrillableKind(openNode.kind) || openNode.kind == "project") &&
+      !openNode.path.empty())
+    absPath = resolveNodeAbsPath(st, openNode);
+  else if (!openNode.docId.empty()) {
+    auto dit = G.idIndex.find(openNode.docId);
     if (dit != G.idIndex.end() && !G.nodes[dit->second].path.empty())
       absPath = resolveNodeAbsPath(st, G.nodes[dit->second]);
   }
@@ -2817,18 +2922,28 @@ void drawSidePanel(AppState &st, float panelW) {
                                           palette.glassBorder[2], 0.55f)),
                 10.0f * S, 0, 1.0f * S);
 
+    // Primary: worker-rendered iso thumb (content-hash cache, same pipeline
+    // as the grid). Fallback: any thumbnail.png packaged inside the .step+.
+    GraphGridThumb gth;
+    if (!absPath.empty()) {
+      const std::string tkey =
+          graphThumbKey(openNode.metaDh, openNode.metaMt, absPath);
+      gth = graphThumbEnsure(st, G.projectDir, tkey, absPath);
+    }
     const GraphThumb *th = nullptr;
-    if (!absPath.empty())
+    if (!gth.tex && !absPath.empty())
       th = ensureGraphThumb(absPath);
     // Also try the node's own path if different from open target.
-    if (!th && !sel->path.empty()) {
+    if (!gth.tex && !th && !sel->path.empty()) {
       const std::string own = resolveNodeAbsPath(st, *sel);
       if (!own.empty() && own != absPath)
         th = ensureGraphThumb(own);
     }
 
-    if (th && th->tex) {
-      float tw = (float)th->w, thh = (float)th->h;
+    if (gth.tex || (th && th->tex)) {
+      const GLuint tex = gth.tex ? gth.tex : th->tex;
+      float tw = (float)(gth.tex ? gth.w : th->w),
+            thh = (float)(gth.tex ? gth.h : th->h);
       const float pad = 10.0f * S;
       const float maxW = previewW - pad * 2, maxH = previewH - pad * 2;
       float sc = std::min(maxW / std::max(tw, 1.f), maxH / std::max(thh, 1.f));
@@ -2836,7 +2951,7 @@ void drawSidePanel(AppState &st, float panelW) {
       thh *= sc;
       const ImVec2 ip0(p0.x + (previewW - tw) * 0.5f,
                        p0.y + (previewH - thh) * 0.5f);
-      dl->AddImage((ImTextureID)(intptr_t)th->tex, ip0,
+      dl->AddImage((ImTextureID)(intptr_t)tex, ip0,
                    ImVec2(ip0.x + tw, ip0.y + thh));
     } else {
       // Empty state — kind glyph + short hint (no dead white box).
@@ -2850,6 +2965,12 @@ void drawSidePanel(AppState &st, float panelW) {
       dl->AddCircleFilled(
           ImVec2(p0.x + previewW * 0.5f, p0.y + previewH * 0.38f), r,
           kindColor(sel->kind, 0.35f), 28);
+      if (gth.pending) {
+        // A render is queued/in flight — spinner above the hint.
+        drawArcSpinner(dl, ImVec2(p0.x + previewW * 0.5f,
+                                  p0.y + previewH * 0.20f),
+                       8.0f * S, kindColor(sel->kind, 0.9f));
+      }
     }
     ImGui::Dummy(ImVec2(previewW, previewH));
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal) && !absPath.empty())
@@ -2967,7 +3088,8 @@ void drawSidePanel(AppState &st, float panelW) {
   ImGui::PushStyleColor(
       ImGuiCol_HeaderHovered,
       ImVec4(palette.text[0], palette.text[1], palette.text[2], 0.10f));
-  if (ImGui::TreeNode("Details##node_details")) {
+  if (ImGui::TreeNodeEx("Details##node_details",
+                        ImGuiTreeNodeFlags_DefaultOpen)) {
     row("id", sel->id);
     row("origin", sel->origin);
     if (!sel->docId.empty() && sel->docId != sel->id)
@@ -2985,6 +3107,9 @@ void drawSidePanel(AppState &st, float panelW) {
   if (!absPath.empty()) {
     if (graphGlassButton("##open_doc", "Open document", true, -1.0f, "new_doc"))
       st.requestOpenPath = absPath;
+    ImGui::Dummy(ImVec2(0, 4 * S));
+    if (graphGlassButton("##copy_path", "Copy path", false, -1.0f, nullptr))
+      ImGui::SetClipboardText(absPath.c_str());
     ImGui::Dummy(ImVec2(0, 4 * S));
   }
 
@@ -3069,7 +3194,31 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
   // cache. Frozen when settled unless a node is being dragged — idle
   // frames cost nothing but the draw itself. While active we run extra
   // substeps per frame so the visible settle takes ~2s, not ~6s.
-  if (!G.visibleIdx.empty() && (G.dragNode >= 0 || !G.force.settled())) {
+  // 2D<->3D toggle transition: lerp from->to (smoothstep 0.35 s), skipping
+  // the sim while active so the motion reads cleanly.
+  if (G.t3dStart >= 0.0) {
+    const float t = (float)((ImGui::GetTime() - G.t3dStart) / 0.35);
+    if (t >= 1.0f || G.dragNode >= 0) {
+      G.trans3dFrom.clear();
+      G.trans3dTo.clear();
+      G.t3dStart = -1.0;
+    } else {
+      const float s = t * t * (3.0f - 2.0f * t);
+      for (const auto &kv : G.trans3dFrom) {
+        const auto to = G.trans3dTo.find(kv.first);
+        const auto ni = G.idIndex.find(kv.first);
+        if (to == G.trans3dTo.end() || ni == G.idIndex.end())
+          continue;
+        GNode &n = G.nodes[ni->second];
+        n.lx = kv.second.x + (to->second.x - kv.second.x) * s;
+        n.ly = kv.second.y + (to->second.y - kv.second.y) * s;
+        n.lz = kv.second.z + (to->second.z - kv.second.z) * s;
+      }
+    }
+  }
+
+  if (!G.visibleIdx.empty() && G.t3dStart < 0.0 &&
+      (G.dragNode >= 0 || !G.force.settled())) {
     G.force.step(std::min(ImGui::GetIO().DeltaTime, 0.05f));
     if (!G.force.settled()) {
       G.force.step(1.0f / 60.0f);
@@ -3335,13 +3484,33 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
             G.force.setZ(slot, dn.lz - ImGui::GetIO().MouseDelta.y /
                                            (G.zoom * std::max(persp, 0.05f)));
           } else {
+            // Exact inverse of projectPoint at fixed depth: solve the 2x2
+            // rotation directly, with one fixed-point persp refresh (the
+            // old first-order offset skewed ~15% off-cursor at default
+            // orbit).
             const float tx = (mp.x - origin.x - G.panX) / G.zoom;
             const float ty = (mp.y - origin.y - G.panY) / G.zoom;
-            const float ux = (tx - px) / std::max(persp, 0.05f);
-            const float uy = (ty - py) / std::max(persp, 0.05f);
             const float cyC = std::clamp(P.cy, 0.35f, 1.0f);
             const float cpC = std::clamp(P.cp, 0.35f, 1.0f);
-            G.force.setPos(slot, dn.lx + ux / cyC, dn.ly + uy / cpC);
+            const float syC =
+                std::sqrt(std::max(0.0f, 1.0f - cyC * cyC)) *
+                (P.sy < 0 ? -1.0f : 1.0f);
+            const float spC =
+                std::sqrt(std::max(0.0f, 1.0f - cpC * cpC)) *
+                (P.sp < 0 ? -1.0f : 1.0f);
+            float nlx = dn.lx, nly = dn.ly, perspU = persp;
+            for (int it = 0; it < 2; ++it) {
+              const float x1 = tx / std::max(perspU, 0.05f);
+              const float y1 = ty / std::max(perspU, 0.05f);
+              nlx = (x1 - dn.lz * syC) / cyC;
+              const float z1 = -nlx * syC + dn.lz * cyC;
+              nly = (y1 + z1 * spC) / cpC;
+              const float z1n = -nlx * P.sy + dn.lz * P.cy;
+              const float z2n = nly * P.sp + z1n * P.cp;
+              perspU =
+                  P.focal / std::max(200.0f * ui::uiScale, P.focal + z2n);
+            }
+            G.force.setPos(slot, nlx, nly);
           }
         } else {
           G.force.setPos(slot, (mp.x - origin.x - G.panX) / G.zoom,
@@ -3747,17 +3916,30 @@ void drawListView(AppState & /*st*/, ImVec2 canvasSz) {
     return;
   }
 
-  // Stable order: kind order, then label, then id.
+  // Stable order (sort mode 1 = Kind: kind order, then label, then id).
   std::vector<int> order(G.nodes.size());
   for (int i = 0; i < (int)order.size(); ++i)
     order[i] = i;
   std::sort(order.begin(), order.end(), [&](int a, int b) {
-    int ra = kindOrder(G.nodes[a].kind), rb = kindOrder(G.nodes[b].kind);
+    const GNode &A = G.nodes[a], &B = G.nodes[b];
+    if (G.gridSort == 0) { // Name
+      if (A.label != B.label)
+        return A.label < B.label;
+      return A.id < B.id;
+    }
+    if (G.gridSort == 2) { // Newest
+      if (A.metaMt != B.metaMt)
+        return A.metaMt > B.metaMt;
+      if (A.label != B.label)
+        return A.label < B.label;
+      return A.id < B.id;
+    }
+    int ra = kindOrder(A.kind), rb = kindOrder(B.kind);
     if (ra != rb)
       return ra < rb;
-    if (G.nodes[a].label != G.nodes[b].label)
-      return G.nodes[a].label < G.nodes[b].label;
-    return G.nodes[a].id < G.nodes[b].id;
+    if (A.label != B.label)
+      return A.label < B.label;
+    return A.id < B.id;
   });
 
   const bool filtering = G.search[0] != 0;
@@ -3767,6 +3949,8 @@ void drawListView(AppState & /*st*/, ImVec2 canvasSz) {
   visible.reserve(order.size());
   for (int i : order) {
     if (filtering && !matchesSearch(G.nodes[i], G.search))
+      continue;
+    if (!G.kindFilter.empty() && !G.kindFilter.count(G.nodes[i].kind))
       continue;
     visible.push_back(i);
   }
@@ -3895,6 +4079,8 @@ void drawGridView(AppState &st, ImVec2 canvasSz) {
         continue;
       if (filtering && !matchesSearch(n, G.search))
         continue;
+      if (!G.kindFilter.empty() && !G.kindFilter.count(n.kind))
+        continue;
       items.push_back(i);
     }
   } else {
@@ -3905,16 +4091,31 @@ void drawGridView(AppState &st, ImVec2 canvasSz) {
         continue;
       if (filtering && !matchesSearch(n, G.search))
         continue;
+      if (!G.kindFilter.empty() && !G.kindFilter.count(n.kind))
+        continue;
       items.push_back(vi);
     }
   }
   std::sort(items.begin(), items.end(), [&](int a, int b) {
-    int ra = kindOrder(G.nodes[a].kind), rb = kindOrder(G.nodes[b].kind);
+    const GNode &A = G.nodes[a], &B = G.nodes[b];
+    if (G.gridSort == 0) { // Name
+      if (A.label != B.label)
+        return A.label < B.label;
+      return A.id < B.id;
+    }
+    if (G.gridSort == 2) { // Newest
+      if (A.metaMt != B.metaMt)
+        return A.metaMt > B.metaMt;
+      if (A.label != B.label)
+        return A.label < B.label;
+      return A.id < B.id;
+    }
+    int ra = kindOrder(A.kind), rb = kindOrder(B.kind);
     if (ra != rb)
       return ra < rb;
-    if (G.nodes[a].label != G.nodes[b].label)
-      return G.nodes[a].label < G.nodes[b].label;
-    return G.nodes[a].id < G.nodes[b].id;
+    if (A.label != B.label)
+      return A.label < B.label;
+    return A.id < B.id;
   });
 
   if (items.empty()) {
@@ -4009,10 +4210,12 @@ void drawGridView(AppState &st, ImVec2 canvasSz) {
         const ImVec2 t1(t0.x + tile, t0.y + tile);
         ui::glassBackground(dl, t0, t1, 8.0f);
 
-        const std::string absPath = resolveNodeAbsPath(st, n);
+        const GNode *instTgt = instanceTarget(G, n);
+        const GNode &tn = instTgt ? *instTgt : n;
+        const std::string absPath = resolveNodeAbsPath(st, tn);
         GraphGridThumb th;
         if (!absPath.empty()) {
-          const std::string key = graphThumbKey(n.metaDh, n.metaMt, absPath);
+          const std::string key = graphThumbKey(tn.metaDh, tn.metaMt, absPath);
           th = graphThumbEnsure(st, G.projectDir, key, absPath);
         }
         if (th.tex) {
@@ -4283,13 +4486,15 @@ void plmDrawGraphPage(AppState &st) {
   }
   if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
     ImGui::SetTooltip("Re-fetch the project graph from the backend.");
-  ImGui::SameLine();
-  if (graphGlassButton("##graph_fit", "Fit", false, 70 * S)) {
-    G.fitRequested = true; // the ONLY auto-fit path left
-    G.userNavigated = false;
+  if (!G.listView && !G.gridView) {
+    ImGui::SameLine();
+    if (graphGlassButton("##graph_fit", "Fit", false, 70 * S)) {
+      G.fitRequested = true; // the ONLY auto-fit path left
+      G.userNavigated = false;
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+      ImGui::SetTooltip("Frame all visible nodes in the canvas.");
   }
-  if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
-    ImGui::SetTooltip("Frame all visible nodes in the canvas.");
   ImGui::SameLine();
   // Hide archive/stale — ON by default; toggling re-fetches with
   // include_archive flipped so the backend walk policy matches the UI.
@@ -4357,13 +4562,18 @@ void plmDrawGraphPage(AppState &st) {
                         "Previews render on demand and cache on disk.");
     }
   }
-  ImGui::SameLine();
-  // Dimension mode: segmented 2D|3D switch — the accent segment is the
-  // active mode (no glyph badges; labels/icons only).
-  {
+  // Dimension mode: segmented 2D|3D switch — graph view only.
+  if (!G.listView && !G.gridView) {
+    ImGui::SameLine();
     const int seg = graphModeSegment("##graph_dim", G.view3d);
     if (seg >= 0 && (seg == 1) != G.view3d) {
       G.view3d = !G.view3d;
+      // Transition: capture pre-toggle positions for the lerp animation.
+      G.trans3dFrom.clear();
+      G.trans3dTo.clear();
+      for (const auto &n : G.nodes)
+        if (hasPosition(n))
+          G.trans3dFrom[n.id] = {n.lx, n.ly, n.lz};
       // World-position overlay: nodes whose doc carries a persisted
       // assembly transform (meta.wp) take their REAL model coordinates in
       // 3D — scaled + centered onto the current layout frame — so the 3D
@@ -4410,6 +4620,46 @@ void plmDrawGraphPage(AppState &st) {
             n.lz = (n.wz - wcz) * k;
           }
         }
+        // Planetary ball: nodes WITHOUT real model coordinates map the 2D
+        // pack disc onto a sphere (azimuth preserved, disc radius -> polar
+        // angle) — a solid 3D ball instead of a flat cone. Deterministic;
+        // stashed + restored through the same overlay flow.
+        {
+          float bcx = 0.0f, bcy = 0.0f, r2d = 0.0f;
+          int pn = 0;
+          for (const auto &n : G.nodes) {
+            if (n.hasW || !hasPosition(n))
+              continue;
+            bcx += n.lx;
+            bcy += n.ly;
+            ++pn;
+          }
+          if (pn > 0) {
+            bcx /= (float)pn;
+            bcy /= (float)pn;
+            for (const auto &n : G.nodes) {
+              if (n.hasW || !hasPosition(n))
+                continue;
+              r2d = std::max(r2d, std::hypot(n.lx - bcx, n.ly - bcy));
+            }
+            if (r2d < 1.0f)
+              r2d = 1.0f;
+            for (auto &n : G.nodes) {
+              if (n.hasW || !hasPosition(n))
+                continue;
+              if (G.preWorldStash.find(n.id) == G.preWorldStash.end())
+                G.preWorldStash[n.id] = {n.lx, n.ly, n.lz};
+              const float dx = (n.lx - bcx) / r2d, dy = (n.ly - bcy) / r2d;
+              const float d = std::clamp(std::hypot(dx, dy), 0.0f, 1.0f);
+              const float th = d * 3.14159265f;
+              const float ph = d > 1e-5f ? std::atan2(dy, dx) : 0.0f;
+              const float sth = std::sin(th);
+              n.lx = bcx + r2d * sth * std::cos(ph);
+              n.ly = bcy + r2d * sth * std::sin(ph);
+              n.lz = r2d * std::cos(th);
+            }
+          }
+        }
       } else {
         for (const auto &kv : G.preWorldStash) {
           auto it = G.idIndex.find(kv.first);
@@ -4421,13 +4671,18 @@ void plmDrawGraphPage(AppState &st) {
         }
         G.preWorldStash.clear();
       }
+      // Transition targets: animate from pre-toggle to post-toggle.
+      for (const auto &n : G.nodes)
+        if (hasPosition(n))
+          G.trans3dTo[n.id] = {n.lx, n.ly, n.lz};
+      G.t3dStart = ImGui::GetTime();
       G.layoutDirty = true; // rebuild the sim in the new dimensionality
       // Refit so the projected bounds frame correctly on entry.
       G.fitRequested = true;
       G.userNavigated = false;
     }
   }
-  if (!G.generatedAt.empty()) {
+  if (!G.generatedAt.empty() && !G.listView && !G.gridView) {
     ImGui::SameLine();
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.textDisabled[0],
                                                 palette.textDisabled[1],
@@ -4588,7 +4843,8 @@ void plmDrawGraphPage(AppState &st) {
     }
   }
 
-  // ---- edge-kind filter row -----------------------------------------------
+  // ---- edge-kind filter row (graph view only) ----------------------------
+  if (!G.listView && !G.gridView) {
   if (graphGlassButton("##links_only", "Links only", false, 0.0f)) {
     G.hiddenKinds.clear();
     G.hiddenKinds.insert("CONTAINS"); // hide containment → the link web
@@ -4625,6 +4881,40 @@ void plmDrawGraphPage(AppState &st) {
       G.layoutDirty = true;
     }
     ImGui::PopStyleColor();
+  }
+  } else {
+    // Grid/List controls: kind filter chips + sort (graph controls hidden).
+    if (graphGlassButton("##kf_all", "All kinds", G.kindFilter.empty(), 0.0f))
+      G.kindFilter.clear();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+      ImGui::SetTooltip("Show every kind (clear the kind filter).");
+    std::set<std::string> present;
+    for (const auto &n : G.nodes)
+      present.insert(n.kind);
+    for (const auto &k : present) {
+      ImGui::SameLine(0, 4 * S);
+      const bool on = G.kindFilter.count(k) > 0;
+      if (graphGlassButton(("##kf_" + k).c_str(), k.c_str(), on, 0.0f)) {
+        if (on)
+          G.kindFilter.erase(k);
+        else
+          G.kindFilter.insert(k);
+      }
+    }
+    ImGui::SameLine(0, 14 * S);
+    ImGui::PushStyleColor(ImGuiCol_Text,
+                          ImVec4(palette.textDisabled[0], palette.textDisabled[1],
+                                 palette.textDisabled[2], 1.0f));
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted("Sort:");
+    ImGui::PopStyleColor();
+    static const char *kSorts[3] = {"Name", "Kind", "Newest"};
+    for (int si = 0; si < 3; ++si) {
+      ImGui::SameLine(0, 4 * S);
+      if (graphGlassButton(("##sort_" + std::to_string(si)).c_str(), kSorts[si],
+                           G.gridSort == si, 0.0f))
+        G.gridSort = si;
+    }
   }
 
   ImGui::Dummy(ImVec2(0, 4 * S));

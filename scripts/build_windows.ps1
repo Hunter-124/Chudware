@@ -58,6 +58,6 @@ if (Test-Path $py) {
 }
 
 Write-Host ""
-Write-Host "DONE. Run: dist\Chudware\Chudware.exe"
-Write-Host "  or:    host\build-win\bin\Chudware.exe"
+Write-Host "DONE. Run: dist\Chudware\chudware.exe"
+Write-Host "  or:    host\build-win\bin\chudware.exe"
 Write-Host "MCP: restart Grok / Claude Code / OpenCode to pick up chudware (lite)."

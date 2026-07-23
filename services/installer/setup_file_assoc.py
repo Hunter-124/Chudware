@@ -11,7 +11,7 @@ also clean up the pre-rename AICAD.* ProgIDs / ai-cad.* XDG files so a machine m
 Idempotent, **per-user (no elevation)**, and reversible (`--unregister`) — modelled on
 installer/setup_mcp_clients.py (stdlib only, `--dry-run`, backups).
 
-  Windows: HKCU\\Software\\Classes — a ProgID with an Open command (`"Chudware.exe" "%1"`) + a
+  Windows: HKCU\\Software\\Classes — a ProgID with an Open command (`"chudware.exe" "%1"`) + a
            DefaultIcon pointing at the exe's SECOND icon group (the branded document icon from
            host/app.rc), the `.step+` extension defaulted to it, and every other extension wired
            into OpenWithProgids so Chudware shows in "Open with".
@@ -69,12 +69,12 @@ def default_exe() -> str:
     stale build dirs / the dist/Chudware Windows stage layout keep working."""
     repo = Path(__file__).resolve().parent.parent
     if sys.platform.startswith("win"):
-        candidates = [repo / "dist" / "Chudware" / "Chudware.exe",
+        candidates = [repo / "dist" / "Chudware" / "chudware.exe",
                       repo / "dist" / "AI-CAD" / "AI-CAD.exe"]
     else:
-        # Linux/macOS: the host build output (host/build-linux/bin/Chudware).
+        # Linux/macOS: the host build output (host/build-linux/bin/chudware).
         bindir = repo / "host" / "build-linux" / "bin"
-        candidates = [bindir / "Chudware", bindir / "AI-CAD"]
+        candidates = [bindir / "chudware", bindir / "AI-CAD"]
     for c in candidates:
         if c.exists():
             return str(c)

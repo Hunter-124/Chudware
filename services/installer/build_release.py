@@ -1,7 +1,7 @@
 """Assemble a distributable Chudware release (payload + installer scripts).
 
 Produces  <out>/Chudware/  containing:
-    Chudware.exe              the native host (built separately via CMake)
+    chudware.exe              the native host (built separately via CMake)
     app/                    Python packages (engine, mcp_server, agent, installer) + requirements
     wheelhouse/             offline wheels for the runtime (pip download)   [--skip-wheels to omit]
     python-embed/           portable CPython for self-contained installs    [--with-python]
@@ -25,9 +25,9 @@ APP_PACKAGES = ("engine", "mcp_server", "agent", "installer")
 # Nested packages under services/ that the engine worker imports as services.X
 # (services.plm drives the PLM hub; without it plm_*/git_* never register).
 SERVICE_PACKAGES = ("plm", "dag", "browser", "deliverables", "ipc", "serving", "verify")
-HOST_EXE = REPO / "host" / "build-win" / "bin" / "Chudware.exe"
+HOST_EXE = REPO / "host" / "build-win" / "bin" / "chudware.exe"
 if not HOST_EXE.exists():
-    HOST_EXE = REPO / "host" / "build" / "bin" / "Release" / "Chudware.exe"
+    HOST_EXE = REPO / "host" / "build" / "bin" / "Release" / "chudware.exe"
 # Engine host daemon (core/hostd). MSVC builds of chudware-hostd are new — absence is a
 # warning + skip, not a failure (the app falls back to legacy in-process engine mode).
 HOSTD_EXE_CANDIDATES = (
@@ -104,12 +104,12 @@ def build(out: Path, skip_wheels: bool, with_python: bool, make_zip: bool) -> di
     manifest: dict = {"components": {}}
 
     if HOST_EXE.exists():
-        shutil.copy2(HOST_EXE, dst / "Chudware.exe")
+        shutil.copy2(HOST_EXE, dst / "chudware.exe")
         manifest["components"]["exe"] = True
     else:
         manifest["components"]["exe"] = False  # build it with: cmake --build host/build --config Release
 
-    # chudware-hostd.exe (+ .pdb when present) — staged next to Chudware.exe/libchudware.dll so
+    # chudware-hostd.exe (+ .pdb when present) — staged next to chudware.exe/libchudware.dll so
     # install.ps1 can stop/replace it and register_mcp can pin CHUDWARE_HOSTD_BIN at it.
     hostd = next((p for p in HOSTD_EXE_CANDIDATES if p.exists()), None)
     if hostd is not None:

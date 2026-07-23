@@ -28,9 +28,7 @@ if (-not $CoreBin) {
 
 $HostBin = $null
 foreach ($h in $HostCandidates) {
-    $hasBillet = Test-Path (Join-Path $h "Chudware.exe")
-    $hasAicad = Test-Path (Join-Path $h "Chudware.exe")
-    if ($hasBillet -or $hasAicad) {
+    if (Test-Path (Join-Path $h "chudware.exe")) {
         $HostBin = $h
         break
     }
@@ -44,7 +42,7 @@ if ($LASTEXITCODE -ge 8) {
 }
 
 if ($null -ne $HostBin) {
-    foreach ($name in @("Chudware.exe", "Chudware.exe", "Chudware.pdb")) {
+    foreach ($name in @("chudware.exe", "chudware.pdb")) {
         $p = Join-Path $HostBin $name
         if (Test-Path $p) {
             Copy-Item -Force $p $Dist
@@ -54,7 +52,7 @@ if ($null -ne $HostBin) {
     Write-Host "[stage] also next to host bin: $HostBin"
     & robocopy $CoreBin $HostBin *.dll chudware-hostd.exe /R:2 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
 } else {
-    Write-Warning "Chudware.exe not found - staging engine only"
+    Write-Warning "chudware.exe not found - staging engine only"
 }
 
 foreach ($pkg in @("engine", "agent", "mcp_server", "installer")) {
@@ -78,12 +76,12 @@ Write-Host ""
 Write-Host "[stage] DONE"
 $dll = Join-Path $Dist "libchudware.dll"
 $hostd = Join-Path $Dist "chudware-hostd.exe"
-$chudware = Join-Path $Dist "Chudware.exe"
+$chudware = Join-Path $Dist "chudware.exe"
 if (Test-Path $dll) {
     Write-Host ("  libchudware : OK " + (Get-Item $dll).Length)
 } else {
     Write-Host "  libchudware : MISSING"
 }
 if (Test-Path $hostd) { Write-Host "  hostd    : OK" } else { Write-Host "  hostd    : MISSING" }
-if (Test-Path $chudware) { Write-Host "  Chudware   : OK" } else { Write-Host "  Chudware   : MISSING" }
+if (Test-Path $chudware) { Write-Host "  chudware   : OK" } else { Write-Host "  chudware   : MISSING" }
 Write-Host ("  Run      : " + $chudware)

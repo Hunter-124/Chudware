@@ -28,7 +28,7 @@ if (Test-Path $hostdExe) {
 }
 
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-foreach ($item in @("Chudware.exe", "chudware-hostd.exe", "chudware-hostd.pdb", "assets", "app", "wheelhouse", "python-embed", "requirements.txt", "llamacpp", "models")) {
+foreach ($item in @("chudware.exe", "chudware-hostd.exe", "chudware-hostd.pdb", "assets", "app", "wheelhouse", "python-embed", "requirements.txt", "llamacpp", "models")) {
     $p = Join-Path $src $item
     if (Test-Path $p) { Copy-Item $p -Destination $InstallDir -Recurse -Force }
 }
@@ -65,7 +65,7 @@ try {
         # File associations (.step+ default + Open-with for the formats Chudware loads). Per-user
         # (HKCU), idempotent, reversed on uninstall. Stdlib-only, so the base python is fine too.
         Write-Host "==> Registering Chudware file associations ..."
-        & $venvPy -m installer.setup_file_assoc --exe (Join-Path $InstallDir "Chudware.exe")
+        & $venvPy -m installer.setup_file_assoc --exe (Join-Path $InstallDir "chudware.exe")
     }
 
     # Optional sim/firmware backends (Renode portable zip, openEMS MSVC note).
@@ -96,9 +96,9 @@ try {
     $ws = New-Object -ComObject WScript.Shell
     $programs = [Environment]::GetFolderPath('Programs')
     $lnk = $ws.CreateShortcut((Join-Path $programs "Chudware.lnk"))
-    $lnk.TargetPath = Join-Path $InstallDir "Chudware.exe"
+    $lnk.TargetPath = Join-Path $InstallDir "chudware.exe"
     $lnk.WorkingDirectory = $InstallDir
     $lnk.Save()
 } catch { Write-Warning "shortcut creation skipped: $_" }
 
-Write-Host "==> Chudware installed. Launch from the Start Menu or $InstallDir\Chudware.exe"
+Write-Host "==> Chudware installed. Launch from the Start Menu or $InstallDir\chudware.exe"

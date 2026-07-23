@@ -108,7 +108,7 @@ correctness proof on Windows is `ctest` on the `windows-core` / `windows-occt` c
 
 ## GUI app (`host/`) — Windows build
 
-The single cross-platform GUI is `host/` (target `Chudware.exe`, `Chudware` compat name). It builds
+The single cross-platform GUI is `host/` (target `Chudware`, output binary `chudware.exe`). It builds
 from its own CMakeLists with the MSVC toolchain after the core (`libchudware.dll` from the
 `windows-occt` preset). **Windows re-verification of the restored `host/` build is an open item**
 (`docs/plans/GUI_OVERHAUL_SPEC.md`) — the notes below record the `ui/imgui`-era bring-up seams,

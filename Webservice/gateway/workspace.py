@@ -49,10 +49,10 @@ def _aicm_cache_headers(name: str) -> dict[str, str]:
 _SHM_URI_PREFIX = "aicm-shm://"
 
 # Durable recent-files list for the WASM client (config.json lives in /tmp there).
-_RECENTS_NAME = ".billet_recents.json"
+_RECENTS_NAME = ".chudware_recents.json"
 _RECENTS_MAX = 10
 # Shared copilot chat store (same shape as client chat_history.json: root[key] = entry).
-_CHAT_NAME = ".billet_chat_history.json"
+_CHAT_NAME = ".chudware_chat_history.json"
 _CHAT_MAX_BODY = 5 * 1024 * 1024  # reject PUT bodies larger than 5 MiB
 
 
@@ -198,7 +198,7 @@ async def workspace_copy(request: Request, body: dict[str, Any]) -> dict[str, An
 
 @router.get("/workspace/recents")
 async def workspace_recents_get(request: Request) -> dict[str, Any]:
-    """Load durable recent-files list (workspace-root .billet_recents.json)."""
+    """Load durable recent-files list (workspace-root .chudware_recents.json)."""
     path = _ws_root() / _RECENTS_NAME
     if not path.is_file():
         return {"files": []}
@@ -268,7 +268,7 @@ def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
 
 @router.get("/workspace/chat")
 async def workspace_chat_get(request: Request) -> dict[str, Any]:
-    """Full shared chat_history store (workspace-root .billet_chat_history.json).
+    """Full shared chat_history store (workspace-root .chudware_chat_history.json).
 
     Shape matches the WASM/desktop client file: root[docKey] = {active, conversations}.
     Missing file → empty object so clients can merge cleanly.

@@ -353,7 +353,7 @@ if [ -n "${CHUDWARE_DEFAULT_PROJECT:-}" ]; then
     fi
 fi
 
-launch_billet() {
+launch_chudware() {
     log "launching Chudware as ${CHUDWARE_USER_EMAIL:-?} / ${CHUDWARE_USER_DISPLAY}"
     log "  DISPLAY=$DISPLAY STREAM_BACKEND=$STREAM_BACKEND HEAVY=$CHUDWARE_HEAVY USE_VGL=$USE_VGL"
     log "  prefix=${CHUDWARE_PREFIX[*]:-(none)}"
@@ -376,7 +376,7 @@ launch_billet() {
     log "Chudware pid=$CHUDWARE_PID"
 }
 
-launch_billet
+launch_chudware
 
 # If VirtualGL fails (missing EGL symbols, bad CDI libs, …) Chudware dies immediately.
 # Detect early exit and relaunch under llvmpipe so the seat stays usable.
@@ -388,7 +388,7 @@ if [ "$USE_VGL" = "1" ]; then
             _rc=$?
             log "WARNING: Chudware under VirtualGL exited within ${_i}s (rc=${_rc}) — falling back to llvmpipe"
             enable_llvmpipe
-            launch_billet
+            launch_chudware
             break
         fi
         sleep 1

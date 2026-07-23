@@ -29,7 +29,7 @@ flowchart LR
   subgraph hunter [Hunter's machine]
     CF[Cloudflare Tunnel + Access] --> GW[Gateway :8300\nauth + /app + /engine WSS bridge\n+ /files/aicm + /workspace]
     GW -- unix socket, hello identity injected --> D[chudware-webd\npinned chudware-hostd + libchudware\nDocRegistry / autosave / in-core copilot]
-    L[Hunter local ImGui\nAICAD_HOSTD_SOCKET=webd] --> D
+    L[Hunter local ImGui\nCHUDWARE_WEBD_SOCKET=webd] --> D
     M[MCP servers / agents] --> D
     D --- FS[(CAD_Build workspace\n+ hostd state dirs)]
     GW --- FS

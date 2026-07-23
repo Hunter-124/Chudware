@@ -72,6 +72,10 @@ MAX_CACHE_BYTES = 64 * 1024 * 1024  # 64 MiB
 # REFERENCES clique. Without this, a common bool/flag (merge=true across
 # hundreds of extrudes) emits O(n²) edges and bloats the on-disk cache.
 MAX_SHARED_VALUE_GROUP = 24
+# Cap doc-node meta.mat (distinct material names). _sanitize_meta already
+# hard-bounds any list to 8 entries, so capping here at the same number
+# avoids a silently-truncated (and therefore unsorted-looking) list.
+MAX_DOC_MATERIALS = 8
 
 
 
@@ -293,6 +297,12 @@ def build_graph(
             doc_meta["dh"] = src["doc_hash"]  # content hash (true freshness)
         if is_arch:
             doc_meta["archive"] = True
+        un = _doc_units(doc)
+        if un:
+            doc_meta["un"] = un  # display unit system ("ips" | "mmgs")
+        mats = _doc_materials(doc)
+        if mats:
+            doc_meta["mat"] = mats  # distinct material names (doc_schema.md §1)
         add_node({
             "id": dnode_id, "kind": node_kind, "label": name,
             "path": rel or None, "doc_id": doc_id,
@@ -1657,6 +1667,48 @@ def _sanitize_meta(value: Any, *, _depth: int = 0) -> Any:
 def _kind_from_schema(schema: str) -> str | None:
     base = str(schema).split("/", 1)[0]
     return _SCHEMA_KIND.get(base)
+
+
+# doc_schema.md §0/§1/§6: display unit system + top-level material key. Both
+# fields are optional in the doc and thus optional on the doc node's meta.
+_UNITS_IPS = frozenset({"ips", "inch", "inches", "in", "imperial", "english"})
+_UNITS_MMGS = frozenset({"mmgs", "mm", "mgs", "metric", "millimeter", "millimeters"})
+
+
+def _doc_units(doc: dict) -> str | None:
+    """Normalize doc.units.system ("MMGS"|"IPS", doc_schema.md §0) to
+    "ips" / "mmgs". Absent/unknown → None (field omitted)."""
+    units = doc.get("units")
+    if not isinstance(units, dict):
+        return None
+    system = units.get("system")
+    if not isinstance(system, str) or not system.strip():
+        return None
+    s = system.strip().lower()
+    if s in _UNITS_IPS:
+        return "ips"
+    if s in _UNITS_MMGS:
+        return "mmgs"
+    return None
+
+
+def _doc_materials(doc: dict) -> list[str]:
+    """Distinct material names referenced by the document.
+
+    doc_schema.md §1 defines exactly one material field: the part-doc
+    top-level `material.key` (indexes engine/sim/materials.json; may be
+    null). Assemblies/drawings carry no material field of their own. Dedup,
+    sort, cap at MAX_DOC_MATERIALS (matches _sanitize_meta's list cap so the
+    emitted list is never silently re-truncated)."""
+    names: set[str] = set()
+    mat = doc.get("material")
+    if isinstance(mat, dict):
+        key = mat.get("key")
+        if isinstance(key, str) and key.strip():
+            names.add(key.strip())
+    if not names:
+        return []
+    return sorted(names)[:MAX_DOC_MATERIALS]
 
 
 def _norm_path(p: str) -> str:

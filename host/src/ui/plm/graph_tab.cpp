@@ -52,6 +52,8 @@ struct GNode {
   std::string metaSummary;    // short key=val dump for tooltip/panel
   std::string metaDh;         // content hash (blake2b-8) for thumb freshness
   double metaMt = 0.0;        // source mtime (fallback freshness signal)
+  std::string metaUn;         // unit system ("ips"/"mmgs") from doc meta.un
+  std::vector<std::string> metaMat; // material names from doc meta.mat
   float lx = 0.0f, ly = 0.0f; // layout coords (graph space)
   float lz = 0.0f;            // depth coord (3D projection mode only)
   float radius = 14.0f;
@@ -98,6 +100,8 @@ struct GraphTabState {
   bool blastLoading = false;
   bool layoutDirty = true;
   bool centerPending = false;
+  // Focus Document: id of a node to select + center on the next canvas paint.
+  std::string pendingCenterId;
   std::string projectDir;
   std::string err;
   std::string generatedAt;
@@ -2110,6 +2114,12 @@ void requestGraph(AppState &st, bool force) {
             n.wz = (*wp)[2].get<float>();
             n.hasW = true;
           }
+          n.metaUn = jstr(*m, "un");
+          if (auto mat = m->find("mat"); mat != m->end() && mat->is_array()) {
+            for (const auto &mv : *mat)
+              if (mv.is_string())
+                n.metaMat.push_back(mv.get<std::string>());
+          }
         }
         if (n.id.empty())
           continue;
@@ -2565,27 +2575,50 @@ const GraphThumb *ensureGraphThumb(const std::string &absPath) {
   return &ins->second;
 }
 
-// Reveal a path (or its parent folder) in the OS file manager.
+// Reveal a path in the OS file manager WITH the file highlighted/selected
+// (not just its parent folder). Falls back to opening the folder if the
+// select-aware call isn't available.
 void revealInFolder(const std::string &absPath) {
   if (absPath.empty())
     return;
   std::error_code ec;
   std::filesystem::path p(absPath);
-  std::filesystem::path target = p;
-  if (!std::filesystem::is_directory(p, ec))
-    target = p.parent_path();
-  if (target.empty())
+  const bool isFile = !std::filesystem::is_directory(p, ec);
+  std::filesystem::path folder = isFile ? p.parent_path() : p;
+  if (folder.empty())
     return;
-  std::string s = target.generic_string();
 #if defined(_WIN32)
-  std::string cmd = "explorer \"" + s + "\"";
+  // explorer /select,"C:\path\file" highlights the item in its folder.
+  std::string cmd =
+      isFile ? ("explorer /select,\"" + p.string() + "\"")
+             : ("explorer \"" + folder.string() + "\"");
   (void)std::system(cmd.c_str());
 #elif defined(__APPLE__)
-  std::string cmd = "open \"" + s + "\" >/dev/null 2>&1 &";
+  // open -R reveals + selects the file in Finder.
+  std::string cmd =
+      isFile ? ("open -R \"" + p.string() + "\" >/dev/null 2>&1 &")
+             : ("open \"" + folder.string() + "\" >/dev/null 2>&1 &");
   (void)std::system(cmd.c_str());
 #else
-  std::string cmd = "xdg-open \"" + s + "\" >/dev/null 2>&1 &";
-  (void)std::system(cmd.c_str());
+  // Linux: the freedesktop FileManager1 D-Bus API selects the item in the
+  // user's file manager (Nautilus/Dolphin/Nemo/etc.). Fall back to xdg-open
+  // on the folder if dbus-send isn't present.
+  if (isFile) {
+    std::string uri = "file://" + p.string();
+    std::string cmd =
+        "dbus-send --session --print-reply "
+        "--dest=org.freedesktop.FileManager1 "
+        "--type=method_call /org/freedesktop/FileManager1 "
+        "org.freedesktop.FileManager1.ShowItems "
+        "array:string:\"" +
+        uri + "\" string:\"\" >/dev/null 2>&1 || " +
+        "xdg-open \"" + folder.generic_string() + "\" >/dev/null 2>&1 &";
+    (void)std::system(cmd.c_str());
+  } else {
+    std::string cmd =
+        "xdg-open \"" + folder.generic_string() + "\" >/dev/null 2>&1 &";
+    (void)std::system(cmd.c_str());
+  }
 #endif
 }
 
@@ -3080,89 +3113,126 @@ void drawSidePanel(AppState &st, float panelW) {
     ImGui::PopStyleColor();
   }
 
-  // Path row with folder reveal — keep; hide full id under a details fold.
+  // Path row — a Feature-Manager-style row (icon vertically centered with the
+  // filename); clicking it reveals + highlights the file in the OS file
+  // manager. Full-width, hover-lit, like an FM feature entry.
+  const std::string abs =
+      absPath.empty() ? resolveNodeAbsPath(st, *sel) : absPath;
   if (!sel->path.empty()) {
     ImGui::Dummy(ImVec2(0, 6 * S));
-    panelFieldLabel("path");
-    ImGui::SameLine(0, 8 * S);
-    const std::string abs =
-        absPath.empty() ? resolveNodeAbsPath(st, *sel) : absPath;
-    const float iconBtn = ImGui::GetFrameHeight();
-    ImVec2 ip0 = ImGui::GetCursorScreenPos();
-    bool folderClick =
-        ImGui::InvisibleButton("##reveal_folder", ImVec2(iconBtn, iconBtn));
-    bool fh = ImGui::IsItemHovered();
+    const float rowH = ImGui::GetFrameHeight();
+    const float rowW = ImGui::GetContentRegionAvail().x;
+    const ImVec2 rp0 = ImGui::GetCursorScreenPos();
+    const bool rowClick = ImGui::InvisibleButton("##path_row", ImVec2(rowW, rowH));
+    const bool rh = ImGui::IsItemHovered();
     ImDrawList *dl = ImGui::GetWindowDrawList();
-    if (fh) {
+    if (rh)
       dl->AddRectFilled(
-          ip0, ImVec2(ip0.x + iconBtn, ip0.y + iconBtn),
+          rp0, ImVec2(rp0.x + rowW, rp0.y + rowH),
           ImGui::GetColorU32(
               ImVec4(palette.text[0], palette.text[1], palette.text[2], 0.08f)),
           6.0f * S);
-    }
+    const float icoR = 15.0f * S;
+    const float padX = 6.0f * S;
     ui::drawIconGlass(dl, "body_folder",
-                      ImVec2(ip0.x + iconBtn * 0.5f, ip0.y + iconBtn * 0.5f),
-                      16.0f * S,
-                      Palette::toU32(fh ? palette.accent : palette.textDim), 0);
-    if (folderClick && !abs.empty())
-      revealInFolder(abs);
-    if (fh)
-      ImGui::SetTooltip("Show in folder\n%s",
-                        abs.empty() ? sel->path.c_str() : abs.c_str());
-    ImGui::SameLine(0, 6 * S);
-    ImGui::PushStyleColor(ImGuiCol_Text,
-                          ImVec4(palette.textDim[0], palette.textDim[1],
-                                 palette.textDim[2], 1.0f));
-    const float avail = ImGui::GetContentRegionAvail().x;
-    // Prefer basename; full path on hover.
+                      ImVec2(rp0.x + padX + icoR * 0.5f, rp0.y + rowH * 0.5f),
+                      icoR, Palette::toU32(rh ? palette.accent : palette.textDim),
+                      0);
+    // Basename, vertically centered with the icon; clipped to the row width.
     std::string base = sel->path;
-    {
-      auto slash = base.find_last_of("/\\");
-      if (slash != std::string::npos)
-        base = base.substr(slash + 1);
-    }
-    ImVec2 psz = ImGui::CalcTextSize(base.c_str());
-    if (psz.x > avail && avail > 24 * S) {
-      std::string clipped = base;
-      while (clipped.size() > 4 &&
-             ImGui::CalcTextSize(("…" + clipped).c_str()).x > avail)
-        clipped.erase(clipped.begin());
-      ImGui::TextUnformatted(("…" + clipped).c_str());
-    } else {
-      ImGui::TextUnformatted(base.c_str());
-    }
-    ImGui::PopStyleColor();
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
-      ImGui::SetTooltip("%s", abs.empty() ? sel->path.c_str() : abs.c_str());
+    if (auto slash = base.find_last_of("/\\"); slash != std::string::npos)
+      base = base.substr(slash + 1);
+    const float txX = rp0.x + padX + icoR + 6.0f * S;
+    const float txAvail = rp0.x + rowW - txX - padX;
+    std::string shown = base;
+    while (shown.size() > 4 &&
+           ImGui::CalcTextSize(("…" + shown).c_str()).x > txAvail)
+      shown.erase(shown.begin());
+    if (shown != base)
+      shown = "…" + shown;
+    const ImVec2 tsz = ImGui::CalcTextSize(shown.c_str());
+    dl->AddText(ImVec2(txX, rp0.y + (rowH - tsz.y) * 0.5f),
+                Palette::toU32(rh ? palette.text : palette.textDim),
+                shown.c_str());
+    if (rowClick && !abs.empty())
+      revealInFolder(abs);
+    if (rh)
+      ImGui::SetTooltip("Show in file manager\n%s",
+                        abs.empty() ? sel->path.c_str() : abs.c_str());
   }
 
-  // Collapsed technical details — id / origin / meta (keeps the panel clean).
+  // ---- details: a tight 2-column table (no tree nesting / left indent) -----
+  plmSectionHeader("Details", "bom");
   ImGui::Dummy(ImVec2(0, 4 * S));
-  ImGui::PushStyleColor(
-      ImGuiCol_Header,
-      ImVec4(palette.text[0], palette.text[1], palette.text[2], 0.06f));
-  ImGui::PushStyleColor(
-      ImGuiCol_HeaderHovered,
-      ImVec4(palette.text[0], palette.text[1], palette.text[2], 0.10f));
-  if (ImGui::TreeNodeEx("Details##node_details",
-                        ImGuiTreeNodeFlags_DefaultOpen)) {
-    row("id", sel->id);
-    row("origin", sel->origin);
-    if (!sel->docId.empty() && sel->docId != sel->id)
-      row("document", sel->docId);
-    row("meta", sel->metaSummary);
-    ImGui::TreePop();
+  {
+    // units string, upper-cased for display (ips -> IPS).
+    std::string units = sel->metaUn;
+    for (char &c : units)
+      c = (char)std::toupper((unsigned char)c);
+    // materials joined, clipped so a big assembly can't blow up the row.
+    std::string mats;
+    for (size_t i = 0; i < sel->metaMat.size() && i < 6; ++i) {
+      if (!mats.empty())
+        mats += ", ";
+      mats += sel->metaMat[i];
+    }
+    if (sel->metaMat.size() > 6)
+      mats += " +" + std::to_string(sel->metaMat.size() - 6);
+
+    auto trow = [&](const char *k, const std::string &v) {
+      if (v.empty())
+        return;
+      ImGui::TableNextRow();
+      ImGui::TableSetColumnIndex(0);
+      panelFieldLabel(k);
+      ImGui::TableSetColumnIndex(1);
+      ImGui::PushStyleColor(ImGuiCol_Text,
+                            ImVec4(palette.textDim[0], palette.textDim[1],
+                                   palette.textDim[2], 1.0f));
+      ImGui::TextWrapped("%s", v.c_str());
+      ImGui::PopStyleColor();
+    };
+    if (ImGui::BeginTable("##node_details", 2,
+                          ImGuiTableFlags_SizingFixedFit |
+                              ImGuiTableFlags_PadOuterX)) {
+      ImGui::TableSetupColumn("k", ImGuiTableColumnFlags_WidthFixed,
+                              66.0f * S);
+      ImGui::TableSetupColumn("v", ImGuiTableColumnFlags_WidthStretch);
+      trow("units", units);
+      trow("material", mats);
+      trow("origin", sel->origin);
+      if (!sel->docId.empty() && sel->docId != sel->id)
+        trow("document", sel->docId);
+      trow("id", sel->id);
+      ImGui::EndTable();
+    }
   }
-  ImGui::PopStyleColor(2);
 
   ImGui::Dummy(ImVec2(0, 10 * S));
   ImGui::Separator();
   ImGui::Dummy(ImVec2(0, 8 * S));
 
   // ---- actions ------------------------------------------------------------
+  // Open document: launch in its native editor. requestOpenPath routes by
+  // extension in app.cpp's pump, and doc_tabs auto-selects the matching
+  // workspace on the switch (Drawing->Drawing, board->Electronics, part/asm->
+  // Model, sim->Simulate). Focus Document: stay in PLM and center the graph
+  // on the resolved doc node.
   if (!absPath.empty()) {
     if (graphGlassButton("##open_doc", "Open document", true, -1.0f, "new_doc"))
       st.requestOpenPath = absPath;
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+      ImGui::SetTooltip("Open in its editor (Model / Drawing / Simulate /\n"
+                        "Electronics / Manufacture, by document kind).");
+    ImGui::Dummy(ImVec2(0, 4 * S));
+    if (graphGlassButton("##focus_doc", "Focus document", false, -1.0f,
+                         "view_selector")) {
+      G.selectedId = openNode.id;
+      G.selectedEdge = -1;
+      G.pendingCenterId = openNode.id;
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+      ImGui::SetTooltip("Center this document in the PLM graph.");
     ImGui::Dummy(ImVec2(0, 4 * S));
     if (graphGlassButton("##copy_path", "Copy path", false, -1.0f, nullptr))
       ImGui::SetClipboardText(absPath.c_str());
@@ -3252,6 +3322,18 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
   if (G.fitRequested && !G.visibleIdx.empty()) {
     fitView(G, canvasSz);
     G.fitRequested = false;
+  }
+
+  // Focus Document: center the view on a specific node once its layout is
+  // resolved. Zoom in a touch if the current view is very zoomed out.
+  if (!G.pendingCenterId.empty()) {
+    auto it = G.idIndex.find(G.pendingCenterId);
+    if (it != G.idIndex.end()) {
+      if (G.zoom < 0.6f)
+        G.zoom = 0.9f;
+      centerOnNode(G, G.nodes[it->second], canvasSz);
+    }
+    G.pendingCenterId.clear();
   }
 
   // Advance physics and copy graph-space positions back into the render

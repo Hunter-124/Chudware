@@ -395,6 +395,43 @@ def test_equation_nodes_and_expr_links():
                and e["meta"].get("via") == "equation" for e in df), df
 
 
+def test_doc_meta_units_and_material():
+    """meta.un normalizes doc.units.system; meta.mat carries the doc's
+    material.key (doc_schema.md §0/§1). Both are optional and omitted when
+    the source doc has no usable value."""
+    ips_doc = {
+        "schema": "aicad.part/1",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "name": "MatPart",
+        "units": {"system": "IPS"},
+        "material": {"key": "alu_6061"},
+        "features": [],
+    }
+    g = cad_graph.build_graph(None, open_docs={"d1": ips_doc}, force=True)
+    node = next(n for n in g["nodes"] if n["kind"] == "part")
+    assert node["meta"]["un"] == "ips"
+    assert node["meta"]["mat"] == ["alu_6061"]
+
+    mmgs_null_mat_doc = {
+        "schema": "aicad.part/1",
+        "id": "44444444-4444-4444-8444-444444444444",
+        "name": "NoMatPart",
+        "units": {"system": "MMGS"},
+        "material": None,
+        "features": [],
+    }
+    g2 = cad_graph.build_graph(None, open_docs={"d2": mmgs_null_mat_doc}, force=True)
+    node2 = next(n for n in g2["nodes"] if n["kind"] == "part")
+    assert node2["meta"]["un"] == "mmgs"
+    assert "mat" not in node2["meta"]  # null material.key → omitted, not []
+
+    # no units/material fields at all → both keys absent from meta
+    g3 = cad_graph.build_graph(None, open_docs={"d3": _expr_doc()}, force=True)
+    node3 = next(n for n in g3["nodes"] if n["kind"] == "part")
+    assert "un" not in node3["meta"]
+    assert "mat" not in node3["meta"]
+
+
 def test_mate_value_edge_meta():
     asm = {
         "schema": "aicad.asm/1", "id": "22222222-2222-4222-8222-222222222222",

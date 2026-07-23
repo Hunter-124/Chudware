@@ -1295,6 +1295,28 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
       errorSink_(method, err);
     return false;
   }
+  // OMP provider bridge (agent_provider_*, agent_models_list, agent_cost_summary,
+  // agent_cap_raw): these are served ONLY by the C++ core (libchudware.cpp proxies
+  // them to the bun OMP bridge / catalog; hostd dispatches them in daemon mode).
+  // The Python worker never registered them, so without this they fall through to
+  // the pipe path below and die with "worker not started" whenever no Python child
+  // is up (the common Linux in-process / daemon case — the exact providers-menu
+  // bug). Route like cam_*/fw_*: structured error envelopes round-trip in `result`;
+  // hard failures surface via errorSink. Never fall back to Python.
+  if (method.rfind("agent_provider_", 0) == 0 || method == "agent_models_list" ||
+      method == "agent_cost_summary" || method == "agent_cap_raw") {
+    std::string cerr;
+    if (engine::call(method, params, result, cerr, timeoutMs))
+      return true; // handled (rc==0)
+    if (result.is_object() && result.contains("code")) {
+      err = result.value("message", std::string("omp-bridge error"));
+      return true; // structured error round-tripped
+    }
+    err = cerr.empty() ? ("omp-bridge (" + method + ") failed") : cerr;
+    if (errorSink_)
+      errorSink_(method, err);
+    return false;
+  }
   // P16: route C++-backed documents to the in-process core (libchudware) instead
   // of the Python worker. All-or-nothing per document (NO mid-doc Python
   // fallback — Python never created this doc), so an unported method surfaces a

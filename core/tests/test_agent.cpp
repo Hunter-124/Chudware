@@ -1103,6 +1103,19 @@ TEST_CASE("openai_reasoning_patch: per-provider/model reasoning-effort gating") 
     CHECK(openai_reasoning_patch("openai", "gpt-5", "http://localhost:1234/v1", "high").empty());
 }
 
+TEST_CASE("moonshot_normalize_model: kimi-k2.7 -> valid wire id, k3 aliases fold") {
+    // Live 404: the bare `kimi-k2.7` is rejected ("Not found the model kimi-k2.7"); the official
+    // moonshot.ai wire id is `kimi-k2.7-code`.
+    CHECK(moonshot_normalize_model("kimi-k2.7") == "kimi-k2.7-code");
+    // kimi-k3 stays kimi-k3; the capped/aliased profiles fold to the bare wire id.
+    CHECK(moonshot_normalize_model("kimi-k3") == "kimi-k3");
+    CHECK(moonshot_normalize_model("kimi-k3-256k") == "kimi-k3");
+    CHECK(moonshot_normalize_model("moonshotai/kimi-k3") == "kimi-k3");
+    // Already-valid wire ids pass through untouched — never downgraded to the 404 id.
+    CHECK(moonshot_normalize_model("kimi-k2.7-code") == "kimi-k2.7-code");
+    CHECK(moonshot_normalize_model("kimi-k2.6") == "kimi-k2.6");
+}
+
 // --------------------------------------------------------------------------- harness fixes (battery r1)
 namespace {
 

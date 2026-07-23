@@ -69,62 +69,6 @@ void refreshModelAvailability(AppState& st, bool force) {
     }, 12000);
 }
 
-// A row in the OpenRouter model list (curated preset or live-discovered free model).
-struct OpenRouterModel {
-    std::string id;
-    std::string label;
-    bool vision = false;
-    bool free = false;
-};
-static std::vector<OpenRouterModel> openRouterModels(AppState& st);  // fwd (defined just below)
-
-// Probe OpenRouter's public /models catalog and cache the list of currently-FREE model ids (the
-// endpoint exposes per-model pricing). Stored in providerModels[PROV_CLOUDCOMPAT] so the OpenRouter
-// category can list every free model live instead of from a stale hardcoded set. Listing needs no
-// key (the catalog is public); running a free model still needs the OpenRouter key. Throttled — the
-// catalog changes slowly.
-static void refreshOpenRouterModels(AppState& st, bool force) {
-    static double last = -1e9;
-    double now = ImGui::GetTime();
-    if (!force && (now - last) < 60.0) return;
-    last = now;
-    nlohmann::json p = {{"provider", "openai"},
-                        {"base_url", "https://openrouter.ai/api/v1"},
-                        {"api_key", st.settings.cloudKey}};
-    st.rpc.call("agent_list_models", p, [&st](const core::RpcResult& r) {
-        ProviderModels pm;
-        pm.checked = true;
-        if (r.ok && r.result.is_object()) {
-            pm.ok = r.result.value("ok", false);
-            if (r.result.contains("models") && r.result["models"].is_array())
-                for (const auto& m : r.result["models"])
-                    if (m.is_string()) pm.models.push_back(m.get<std::string>());
-            if (r.result.contains("free") && r.result["free"].is_array())
-                for (const auto& m : r.result["free"])
-                    if (m.is_string()) pm.free.push_back(m.get<std::string>());
-        } else {
-            pm.error = r.err.empty() ? "core unavailable" : r.err;
-        }
-        st.providerModels[ui::PROV_CLOUDCOMPAT] = pm;
-    }, 12000);
-}
-
-// The OpenRouter model list shown in the picker/manage UI: the curated presets PLUS every live
-// free model the catalog probe found (deduped). `free`/`vision` flags drive the row status.
-static std::vector<OpenRouterModel> openRouterModels(AppState& st) {
-    refreshOpenRouterModels(st, false);
-    std::vector<OpenRouterModel> out;
-    std::set<std::string> seen;
-    for (const auto& p : ui::cloudPresets()) {
-        if (std::strcmp(ui::cloudServiceKey(p.baseUrl), "openrouter") != 0) continue;
-        out.push_back({p.id, p.label, p.vision,
-                       p.id.find(":free") != std::string::npos});
-        seen.insert(p.id);
-    }
-    for (const auto& id : st.providerModels[ui::PROV_CLOUDCOMPAT].free)
-        if (seen.insert(id).second) out.push_back({id, id, false, true});
-    return out;
-}
 
 // The active provider's API-key buffer (cloud providers keep separate keys; local reuses the
 // optional apiKey buffer). Moonshot (api.moonshot.ai) uses keys.moonshot, not the generic
@@ -1574,6 +1518,33 @@ static void seedModelDefaultsOnce(AppState& st) {
     saveSettings(st.settings);
 }
 
+// Poll agent_provider_list so the composer knows which OMP providers are signed in WITHOUT the
+// user having opened Settings -> Providers. Fills st.signedInBridgeProviders (same set the
+// Providers panel writes) so the dropdown mirrors the Providers tab. TTL'd; degrades silently.
+static void refreshSignedInProviders(AppState& st, bool force) {
+    static double s_lastPoll = -1e9;
+    static bool s_inFlight = false;
+    if (s_inFlight) return;
+    const double now = ImGui::GetTime();
+    if (!force && (now - s_lastPoll) < 5.0) return;
+    s_lastPoll = now;
+    s_inFlight = true;
+    st.rpc.call("agent_provider_list", nlohmann::json::object(), [&st](const core::RpcResult& r) {
+        s_inFlight = false;
+        if (!r.ok || !r.result.is_object() || !r.result.value("ok", true)) return;
+        const auto it = r.result.find("providers");
+        if (it == r.result.end() || !it->is_array()) return;
+        std::set<std::string> live;
+        for (const auto& p : *it) {
+            if (!p.is_object()) continue;
+            const std::string id = p.value("id", std::string());
+            const std::string state = p.value("state", std::string());
+            if (!id.empty() && !state.empty() && state != "signed_out") live.insert(id);
+        }
+        st.signedInBridgeProviders = std::move(live);
+    }, 15000);
+}
+
 // The model dropdown body (hosted in a popup): a search box with a compact glass gear on the
 // same row (opens Settings), the usable models with a checkmark on the current one, and a muted
 // hint for unkeyed providers. Picking a model sets provider+model and closes the popup.
@@ -1584,6 +1555,7 @@ void drawModelDropdown(AppState& st, bool busy) {
     static char s_modelSearch[64] = "";
     refreshModelAvailability(st, false);
     refreshBridgeModelCatalog(st, false);  // OMP catalog sublabels (ctx/cost/capability chips)
+    refreshSignedInProviders(st, false);  // mirror Settings->Providers signed-in set into the picker
     seedModelDefaultsOnce(st);             // first-run top-3-per-provider seeding; no-op after
 
     if (ImGui::IsWindowAppearing()) { s_modelSearch[0] = 0; ImGui::SetKeyboardFocusHere(); }
@@ -1654,92 +1626,62 @@ void drawModelDropdown(AppState& st, bool busy) {
         return st.settings.disabledProviders.count(key) != 0;
     };
 
-    // Usable built-in cloud models (provider has a key), minus any the user hid or whose provider
-    // category is bulk-disabled.
-    std::set<std::string> shownIds;  // builtin ids already emitted — bridge-catalog dedup below
-    for (const auto& m : ui::builtinModels()) {
-        if (catOff(ui::providerCatKey(m.provider))) continue;
-        if (!providerUsable(st, m.provider) || !matchq(m.label, providerShort(m.provider), m.id)) continue;
-        if (modelHidden(st, m.id)) continue;
-        ++shown;
-        shownIds.insert(m.id);
-        if (modelRow(st, m.provider, m.id, m.label, true, uid++)) {
-            st.settings.provider = m.provider;
-            std::strncpy(st.settings.model, m.id.c_str(), sizeof(st.settings.model) - 1);
-            picked = true;
-        }
-    }
-    // Bridge (OMP) catalog models for SIGNED-IN bridge providers mapped to a composer slot
-    // (ZenMux / Kimi Code): this is how Providers-tab selections surface in the composer.
-    // Other bridge providers have no composer routing path. Respects per-provider hide choices
-    // and dedups against builtin ids already emitted above.
-    for (const auto& m : ui::bridgeModelCatalog()) {
-        int slot = -1;
-        if (m.provider == "zenmux") slot = ui::PROV_ZENMUX;
-        else if (m.provider == "kimi-code") slot = ui::PROV_KIMISUB;
-        else continue;
-        if (st.signedInBridgeProviders.count(m.provider) == 0) continue;  // not signed in
-        if (m.deprecated) continue;
-        if (modelHidden(st, m.id)) continue;
-        if (shownIds.count(m.id) != 0) continue;
-        if (!matchq(m.name, providerShort(slot), m.id)) continue;
-        ++shown;
-        if (modelRow(st, slot, m.id, m.name, true, uid++)) {
-            st.settings.provider = slot;
-            std::strncpy(st.settings.model, m.id.c_str(), sizeof(st.settings.model) - 1);
-            if (slot == ui::PROV_ZENMUX)
-                st.settings.baseUrl[0] = 0;  // bridge-routed: leave base_url empty/default
-            picked = true;
-        }
-    }
-    // Cloud OpenAI-compatible service presets (OpenRouter / Alibaba / DeepSeek). Shown when a cloud
-    // key is configured and the service category isn't bulk-disabled. Picking one points the active
-    // Cloud API provider at that service's endpoint + model.
-    if (cloudCompatKeyPresent(st)) {
-        // OpenRouter: the live list (all free models + curated paid), minus any the user hid.
-        if (!catOff("openrouter")) {
-            for (const auto& r : openRouterModels(st)) {
-                if (modelHidden(st, r.id) || !matchq(r.label, "openrouter free", r.id)) continue;
-                ++shown;
-                if (modelRow(st, ui::PROV_CLOUDCOMPAT, r.id, r.label, true, uid++)) {
-                    st.settings.provider = ui::PROV_CLOUDCOMPAT;
-                    std::strncpy(st.settings.model, r.id.c_str(), sizeof(st.settings.model) - 1);
-                    std::strncpy(st.settings.baseUrl, "https://openrouter.ai/api/v1",
-                                 sizeof(st.settings.baseUrl) - 1);
-                    st.settings.vision = r.vision;
-                    picked = true;
-                }
-            }
-        }
-        // Alibaba / DeepSeek curated presets.
-        for (const auto& p : ui::cloudPresets()) {
-            std::string key = ui::cloudServiceKey(p.baseUrl);
-            if (key == "openrouter") continue;  // handled above (live)
-            if (key == "moonshot") continue;    // handled below via its own key gate
-            if (catOff(key)) continue;
-            if (modelHidden(st, p.id) || !matchq(p.label, key, p.id)) continue;
+    // Composer models = the user's SELECTED (checked = NOT hidden) catalog models for SIGNED-IN
+    // providers, sourced from the Settings -> Providers catalog (ui::bridgeModelCatalog()). Each OMP
+    // catalog provider id maps to a composer slot + base_url; providers with no working native
+    // transport (e.g. Cursor) map to slot -1 and are excluded so they can't cause provider_error.
+    struct Route { int slot; const char* baseUrl; };
+    auto routeFor = [](const std::string& p) -> Route {
+        if (p == "anthropic") return {ui::PROV_ANTHROPIC, ""};
+        if (p == "openai") return {ui::PROV_OPENAI, ""};
+        if (p == "google" || p == "gemini") return {ui::PROV_GEMINI, ""};
+        if (p == "xai") return {ui::PROV_XAI, "https://api.x.ai/v1"};
+        if (p == "kimi-code") return {ui::PROV_KIMISUB, ""};
+        if (p == "zenmux") return {ui::PROV_ZENMUX, ""};
+        if (p == "moonshot") return {ui::PROV_CLOUDCOMPAT, "https://api.moonshot.ai/v1"};
+        if (p == "openrouter") return {ui::PROV_CLOUDCOMPAT, "https://openrouter.ai/api/v1"};
+        if (p == "deepseek") return {ui::PROV_CLOUDCOMPAT, "https://api.deepseek.com/v1"};
+        if (p == "alibaba" || p == "alibaba-coding-plan")
+            return {ui::PROV_CLOUDCOMPAT, "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"};
+        return {-1, ""};  // cursor + any unrouted provider: no working composer transport -> excluded
+    };
+
+    const auto& catalog = ui::bridgeModelCatalog();
+    if (!catalog.empty()) {
+        for (const auto& m : catalog) {
+            Route r = routeFor(m.provider);
+            if (r.slot < 0) continue;                                        // no transport (cursor/…)
+            if (st.signedInBridgeProviders.count(m.provider) == 0) continue; // provider not signed in
+            std::string catk = (r.slot == ui::PROV_CLOUDCOMPAT) ? ui::cloudServiceKey(r.baseUrl)
+                                                                : ui::providerCatKey(r.slot);
+            if (catOff(catk)) continue;                                      // provider bulk-disabled
+            if (m.deprecated) continue;
+            if (modelHidden(st, m.id)) continue;                             // unchecked in Providers
+            if (!matchq(m.name, providerShort(r.slot), m.id)) continue;
             ++shown;
-            if (modelRow(st, ui::PROV_CLOUDCOMPAT, p.id, p.label, true, uid++)) {
-                st.settings.provider = ui::PROV_CLOUDCOMPAT;
-                std::strncpy(st.settings.model, p.id.c_str(), sizeof(st.settings.model) - 1);
-                std::strncpy(st.settings.baseUrl, p.baseUrl.c_str(), sizeof(st.settings.baseUrl) - 1);
-                st.settings.vision = p.vision;
+            if (modelRow(st, r.slot, m.id, m.name, true, uid++)) {
+                st.settings.provider = r.slot;
+                std::strncpy(st.settings.model, m.id.c_str(), sizeof(st.settings.model) - 1);
+                if (r.baseUrl[0])
+                    std::strncpy(st.settings.baseUrl, r.baseUrl, sizeof(st.settings.baseUrl) - 1);
+                else
+                    st.settings.baseUrl[0] = 0;  // native/bridge-routed: leave base_url empty/default
+                st.settings.vision = m.vision;
                 picked = true;
             }
         }
-    }
-    // Moonshot (Kimi) — first-class wire provider gated on its OWN key (keys.moonshot), so Kimi
-    // shows in the composer picker whenever a Moonshot key is set, even with no generic cloud key.
-    if (moonshotKeyPresent(st) && !catOff("moonshot")) {
-        for (const auto& p : ui::cloudPresets()) {
-            if (std::strcmp(ui::cloudServiceKey(p.baseUrl), "moonshot") != 0) continue;
-            if (modelHidden(st, p.id) || !matchq(p.label, "moonshot kimi", p.id)) continue;
+    } else {
+        // Bridge down / older core (empty catalog): fall back to the hardcoded builtin cloud list so
+        // the picker still works. Gated on provider category + usable credential + search.
+        for (const auto& m : ui::builtinModels()) {
+            if (catOff(ui::providerCatKey(m.provider))) continue;
+            if (!providerUsable(st, m.provider) ||
+                !matchq(m.label, providerShort(m.provider), m.id)) continue;
+            if (modelHidden(st, m.id)) continue;
             ++shown;
-            if (modelRow(st, ui::PROV_CLOUDCOMPAT, p.id, p.label, true, uid++)) {
-                st.settings.provider = ui::PROV_CLOUDCOMPAT;
-                std::strncpy(st.settings.model, p.id.c_str(), sizeof(st.settings.model) - 1);
-                std::strncpy(st.settings.baseUrl, p.baseUrl.c_str(), sizeof(st.settings.baseUrl) - 1);
-                st.settings.vision = p.vision;
+            if (modelRow(st, m.provider, m.id, m.label, true, uid++)) {
+                st.settings.provider = m.provider;
+                std::strncpy(st.settings.model, m.id.c_str(), sizeof(st.settings.model) - 1);
                 picked = true;
             }
         }
@@ -1790,15 +1732,10 @@ void drawModelDropdown(AppState& st, bool busy) {
     }
     ImGui::EndChild();
 
-    // Unavailable models (no key / not signed in / endpoint down) are hidden from the list above;
-    // surface a single muted hint pointing at Settings so they're still discoverable.
-    bool anyUnavailable = false;
-    for (const auto& m : ui::builtinModels())
-        if (!providerUsable(st, m.provider)) { anyUnavailable = true; break; }
-    if (anyUnavailable) {
+    // No providers signed in yet -> nothing routable; point the user at Settings to add models.
+    if (st.signedInBridgeProviders.empty()) {
         ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
-        ImGui::TextUnformatted(
-            "Other providers need a sign-in or API key \xE2\x80\x94 add one in Settings.");
+        ImGui::TextUnformatted("Sign in to a provider in Settings -> Providers to add models.");
         ImGui::PopStyleColor();
     }
 

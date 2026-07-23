@@ -83,6 +83,10 @@ ParsedReply openai_parse_response(const json& resp);
 // merge into the request body, or an empty object to omit (capability-gated; see providers.cpp).
 json openai_reasoning_patch(const std::string& provider, const std::string& model,
                             const std::string& base_url, const std::string& effort);
+// Moonshot (Kimi) wire-id normalization: map catalog/GUI aliases to the ids the moonshot.ai API
+// accepts. `kimi-k3-256k`/`kimi-k3-1m`/`kimi-latest`/`moonshotai/kimi-k3` -> `kimi-k3`; the bare
+// `kimi-k2.7` -> `kimi-k2.7-code` (the raw id 404s). Everything else passes through unchanged.
+std::string moonshot_normalize_model(const std::string& model);
 
 // --- gemini (Google generativelanguage REST) --------------------------------
 extern const char* kGeminiDefaultModel;  // "gemini-2.5-pro"

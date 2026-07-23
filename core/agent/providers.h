@@ -165,6 +165,12 @@ struct CompleteResult {
     std::string model;
     std::string request_id;
     std::string error_excerpt;  // ≤200 chars of raw failure body/message
+    // Token/cost accounting (docs/omp-integration/01-DECISIONS.md "Cost + cache"). Populated
+    // only by the OMP bridge branch today from the bun sidecar's `complete` result.usage
+    // (pi-ai's Usage shape: {input,output,cacheRead,cacheWrite,totalTokens,cost:{...}});
+    // null/absent for native libcurl branches (not threaded there yet). Callers MUST check
+    // is_null() before reading fields.
+    json usage = nullptr;
 };
 // Optional live sink for per-provider-call debug events (kind "provider_call").
 // Set for the duration of a design/micro run so complete() can emit without

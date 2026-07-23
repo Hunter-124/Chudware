@@ -1102,14 +1102,28 @@ namespace {
 // Provider ids routed through the OMP bun bridge (core/agent/omp_bridge_client.h,
 // vendor/omp/bridge/src/bridge.ts) instead of a native libcurl/WinHTTP branch below.
 //
-// TODO(omp-bridge-wiring): empty until the orchestrator populates this with the real catalog
-// provider ids once the provider picker + sign-in UI land (docs/omp-integration/
-// 01-DECISIONS.md "Providers"; ids must match what OMP's pi-catalog getBundledProviders()
-// returns, since providers.cpp forwards `provider` verbatim as the bridge's {provider,model}
-// params below). Until populated, is_omp_bridge_provider() always returns false and every
-// provider keeps resolving through its existing native branch.
+// S-CORE: sourced from OMP's bundled catalog (`vendor/omp/packages/catalog/src/models.json`
+// top-level keys == `getBundledProviders()`'s return value, verified by reading the JSON
+// directly rather than round-tripping the bridge at static-init time) MINUS every id that has
+// a native libcurl/WinHTTP branch in complete() below or in config.cpp::resolve_provider:
+// anthropic, openai, google (CAD's native "gemini"/"gemini-sub" branch — same service, CAD's
+// own name), xai + xai-oauth (CAD's native "xai"/"xai-sub"), moonshot, cursor. llamacpp/mock
+// aren't OMP catalog ids at all. Re-derive with
+// `python3 -c "import json;print(sorted(json.load(open('vendor/omp/packages/catalog/src/
+// models.json')).keys()))"` if the vendored catalog is re-pulled and provider coverage shifts.
 const std::unordered_set<std::string>& omp_bridge_provider_ids() {
-    static const std::unordered_set<std::string> kOmpBridgeProviders = {};
+    static const std::unordered_set<std::string> kOmpBridgeProviders = {
+        "aimlapi", "alibaba-coding-plan", "amazon-bedrock", "azure", "baseten", "cerebras",
+        "cloudflare-ai-gateway", "coreweave", "deepseek", "devin", "firepass", "fireworks",
+        "github-copilot", "gitlab-duo", "gitlab-duo-agent", "google-antigravity",
+        "google-gemini-cli", "google-vertex", "groq", "huggingface", "kilo", "kimi-code",
+        "minimax", "minimax-cn", "minimax-code", "minimax-code-cn", "mistral", "nanogpt",
+        "novita", "nvidia", "ollama-cloud", "openai-codex", "opencode", "opencode-go",
+        "opencode-zen", "openrouter", "qianfan", "qwen-portal", "sakana", "synthetic",
+        "together", "umans", "venice", "vercel-ai-gateway", "wafer-serverless", "xiaomi",
+        "xiaomi-token-plan-ams", "xiaomi-token-plan-cn", "xiaomi-token-plan-sgp", "zai",
+        "zenmux", "zhipu-coding-plan",
+    };
     return kOmpBridgeProviders;
 }
 }  // namespace
@@ -1196,6 +1210,8 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
         }
         res.text = result.value("text", std::string());
         res.thinking = result.value("thinking", std::string());
+        if (result.contains("usage") && !result["usage"].is_null())
+            res.usage = result["usage"];
         if (result.value("stopReason", std::string()) == "error") {
             std::string em = result.value("errorMessage", std::string("provider error"));
             if (result.contains("errorStatus") && result["errorStatus"].is_number())
@@ -1209,9 +1225,8 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
             res.error_excerpt = truncate_excerpt(res.error);
             return finish(std::move(res));
         }
-        // NOTE: result["usage"] (bridge.ts collapse()) has no CompleteResult field yet — cost
-        // accounting (01-DECISIONS.md "Cost + cache") is a later phase; not dropped silently,
-        // just not threaded through until that struct grows a usage member.
+        // (usage threaded above from bridge.ts collapse()'s result.usage; cost accounting on
+        // top of it — 01-DECISIONS.md "Cost + cache" — is a later phase.)
         return finish(std::move(res));
     }
 

@@ -60,6 +60,7 @@
 #include "agent/paths.h"
 #include "agent/ops_emit.h"
 #include "agent/providers.h"
+#include "agent/omp_bridge_client.h"
 #include "agent/http.h"
 #include "agent/roles.h"
 #include "sim/flow_run.h"
@@ -151,6 +152,34 @@ int emit(json&& j, char** out_json, int rc) {
 
 int emit_error(const std::string& msg, char** out_json) {
     return emit(json{{"error", msg}}, out_json, 1);
+}
+
+// Proxy one of the twelve agent_provider_*/agent_models_list/agent_cost_summary C-ABI methods
+// straight to the OMP bun bridge (RPC CONTRACT, OMP_INTEGRATION_PLAN.md). Params pass through
+// verbatim — the C-ABI method's param shape IS the bridge method's param shape for all twelve
+// (see the frozen contract comment at each call site below). On ok:false, the bridge's
+// structured {message,status?} error (result, when supplied) takes precedence over the raw
+// transport `err` string so the host sees the same detail bridge.ts callers get; secrets are
+// never part of that error payload (OMP's auth handlers never echo key material back).
+json omp_bridge_proxy(const char* bridge_method, const json& bridge_params) {
+    json result;
+    std::string err;
+    const bool ok = aicad::agent::OmpBridgeClient::instance().call(bridge_method, bridge_params,
+                                                                    result, err);
+    if (!ok) {
+        std::string msg = (result.is_object() && result.contains("message") &&
+                           result["message"].is_string())
+                              ? result["message"].get<std::string>()
+                              : err;
+        json out = json{{"ok", false},
+                        {"error", msg.empty() ? std::string("omp-bridge transport error") : msg}};
+        if (result.is_object() && result.contains("status") && result["status"].is_number())
+            out["status"] = result["status"];
+        return out;
+    }
+    json out = result.is_object() ? result : json::object();
+    out["ok"] = true;
+    return out;
 }
 
 // --- sampling-profiler scoping ------------------------------------------------------
@@ -1255,7 +1284,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                         out_json, 0);
         }
         if (m == "agent_complete") {
-            // {provider, cfg?, system?, messages?, max_tokens?} -> {text, thinking, error}.
+            // {provider, cfg?, system?, messages?, max_tokens?} -> {text, thinking, error, usage}.
             // For provider:"mock" this is fully offline (scripted replies in cfg.replies).
             // For anthropic/openai/llamacpp it performs a LIVE http_post (the gate only
             // drives this when an API key is present).
@@ -1275,7 +1304,8 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                              {"endpoint", cr.endpoint},
                              {"model", cr.model},
                              {"request_id", cr.request_id},
-                             {"error_excerpt", cr.error_excerpt}},
+                             {"error_excerpt", cr.error_excerpt},
+                             {"usage", cr.usage}},
                         out_json, 0);
         }
         if (m == "agent_role_of") {
@@ -1590,6 +1620,89 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             return emit(json{{"ok", false}, {"models", models}, {"model_rows", model_rows},
                              {"error", "unknown provider"}},
                         out_json, 0);
+        }
+        // --- S-CORE: 12 libaicad proxies for the bridge auth/model/cost surface (frozen RPC
+        // CONTRACT in OMP_INTEGRATION_PLAN.md — every param name below is copied verbatim into
+        // the bridge call; see omp_bridge_proxy() above and vendor/omp/bridge/src/{auth-context,
+        // oauth-flow,models}.ts for the handlers each one reaches). ---
+        if (m == "agent_provider_list") {
+            // {} -> {ok, providers:[...]} (bridge auth_list_providers; takes no params).
+            return emit(omp_bridge_proxy("auth_list_providers", json::object()), out_json, 0);
+        }
+        if (m == "agent_provider_state") {
+            // {provider?} -> {ok, ...} one provider's sign-in state + usage window, or every
+            // provider's when provider is omitted.
+            return emit(omp_bridge_proxy("auth_state", params), out_json, 0);
+        }
+        if (m == "agent_provider_validate_key") {
+            // {provider, apiKey} -> {ok, detail?} via OMP's cheap-request key validators. No
+            // key is persisted here (that's agent_provider_set_key).
+            if (jstr(params, "provider").empty() || jstr(params, "apiKey").empty())
+                return emit_error(
+                    "agent_provider_validate_key: provider and apiKey are required", out_json);
+            return emit(omp_bridge_proxy("auth_validate_key", params), out_json, 0);
+        }
+        if (m == "agent_provider_set_key") {
+            // {provider, apiKey} -> {ok} persists an api_key credential in the bridge's own
+            // AuthStorage (SQLite). The key never round-trips back out to the UI.
+            if (jstr(params, "provider").empty() || jstr(params, "apiKey").empty())
+                return emit_error(
+                    "agent_provider_set_key: provider and apiKey are required", out_json);
+            return emit(omp_bridge_proxy("auth_set_key", params), out_json, 0);
+        }
+        if (m == "agent_provider_remove_key") {
+            // {provider, account?} -> {ok} removes one credential row (account = its numeric
+            // id) or every credential for the provider when account is omitted.
+            if (jstr(params, "provider").empty())
+                return emit_error("agent_provider_remove_key: provider is required", out_json);
+            return emit(omp_bridge_proxy("auth_remove_key", params), out_json, 0);
+        }
+        if (m == "agent_provider_begin_oauth") {
+            // {provider} -> {ok, url?, handle?, ...} starts AuthStorage.login and returns the
+            // launch URL + a poll handle for agent_provider_oauth_poll.
+            if (jstr(params, "provider").empty())
+                return emit_error("agent_provider_begin_oauth: provider is required", out_json);
+            return emit(omp_bridge_proxy("auth_begin_oauth", params), out_json, 0);
+        }
+        if (m == "agent_provider_oauth_poll") {
+            // {handle} -> {ok, ...} current flow snapshot for a handle from begin_oauth.
+            if (jstr(params, "handle").empty())
+                return emit_error("agent_provider_oauth_poll: handle is required", out_json);
+            return emit(omp_bridge_proxy("auth_oauth_poll", params), out_json, 0);
+        }
+        if (m == "agent_provider_oauth_manual") {
+            // {handle, code} -> {ok} feeds a pasted device code / redirect URL into the
+            // in-flight manual-code wait for that handle.
+            if (jstr(params, "handle").empty() || jstr(params, "code").empty())
+                return emit_error(
+                    "agent_provider_oauth_manual: handle and code are required", out_json);
+            return emit(omp_bridge_proxy("auth_oauth_manual", params), out_json, 0);
+        }
+        if (m == "agent_provider_oauth_cancel") {
+            // {handle} -> {ok} aborts the in-flight OAuth flow for a handle from begin_oauth.
+            if (jstr(params, "handle").empty())
+                return emit_error("agent_provider_oauth_cancel: handle is required", out_json);
+            return emit(omp_bridge_proxy("auth_oauth_cancel", params), out_json, 0);
+        }
+        if (m == "agent_provider_logout") {
+            // {provider, account?} -> {ok} same removal semantics as agent_provider_remove_key,
+            // named for the sign-out action in the provider panel.
+            if (jstr(params, "provider").empty())
+                return emit_error("agent_provider_logout: provider is required", out_json);
+            return emit(omp_bridge_proxy("auth_logout", params), out_json, 0);
+        }
+        if (m == "agent_models_list") {
+            // {provider?} -> {ok, ...} every bundled OMP catalog model for one provider, or
+            // every provider's when omitted. Distinct from the native agent_list_models above
+            // (which LIVE-probes a keyed endpoint): this is the static OMP-catalog listing
+            // (capabilities + cost) used by the model picker for bridge-routed providers.
+            return emit(omp_bridge_proxy("models_list", params), out_json, 0);
+        }
+        if (m == "agent_cost_summary") {
+            // {events?:[{provider,model,input,output,cacheRead?,cacheWrite?}]} -> {ok, ...} a
+            // pure $/Mtok calculator (catalog pricing x caller-supplied token counts); no
+            // persistence, no network.
+            return emit(omp_bridge_proxy("cost_summary", params), out_json, 0);
         }
         if (m == "agent_cap_raw") {
             std::string text = params.value("text", std::string());

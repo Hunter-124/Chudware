@@ -12,6 +12,7 @@
 
 #include "agent/paths.h"
 #include "agent/auth.h"  // T-RF4: in-process subscription token refresh
+#include "agent/providers.h"  // is_omp_bridge_provider() (S-CORE: bridge-routed provider ids)
 #include "agent/state.h"  // kContextTokenCap (the lean input-cap ceiling for big windows)
 
 namespace aicad {
@@ -528,6 +529,36 @@ json resolve_provider(const std::optional<std::string>& name_arg, json cfg,
             {"base_url", kDefaultLocalBaseUrl},
             {"supports_vision", false},
             {"api_key", nullptr},
+        };
+    } else if (is_omp_bridge_provider(name)) {
+        // OMP-bridge-backed provider (docs/omp-integration/research/verify-host-provider-seam.md):
+        // no native C++ completions transport — providers.cpp::complete() forwards this id
+        // verbatim to the bun sidecar's `complete` op (core/agent/omp_bridge_client.h). Just
+        // carry name/model/api_key/base_url/reasoning_effort through; reasoning_effort +
+        // context_window are applied by the shared tail below like every other branch.
+        // Key precedence mirrors the native branches: explicit cfg.api_key -> cfg.keys.<name>
+        // -> OMP_<NAME>_API_KEY env (dashes -> underscores, uppercased). OAuth-signed-in
+        // providers (auth_begin_oauth) live only in the bridge's own AuthStorage today —
+        // handleComplete() (vendor/omp/bridge/src/bridge.ts) has no fallback to read it when
+        // apiKey is omitted, so those need an explicit key threaded in until the bridge grows
+        // that lookup (S-BRIDGE follow-up, out of scope here).
+        std::string key = py_or(cfg_str(cfg, "api_key"), std::string());
+        if (key.empty() && cfg.contains("keys") && cfg["keys"].is_object() &&
+            cfg["keys"].contains(name) && cfg["keys"][name].is_string())
+            key = cfg["keys"][name].get<std::string>();
+        if (key.empty()) {
+            std::string env_name = "OMP_";
+            for (char c : name) env_name += (c == '-' ? '_' : (char)std::toupper((unsigned char)c));
+            env_name += "_API_KEY";
+            key = env_get(env, env_name.c_str()).value_or("");
+        }
+        std::optional<std::string> base = cfg_str(cfg, "base_url");
+        desc = json{
+            {"name", name},
+            {"model", py_or(cfg_str(cfg, "model"), std::string())},
+            {"base_url", base ? json(*base) : json(nullptr)},
+            {"supports_vision", cfg.value("supports_vision", false)},
+            {"api_key", key.empty() ? json(nullptr) : json(key)},
         };
     } else {
         return refusal(std::string("Unknown provider: '") + name + "'");

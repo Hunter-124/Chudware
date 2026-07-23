@@ -191,6 +191,22 @@ class _SessionFacade:
         self._by_id: dict[str, EcadSession] = {}
         self._alias: dict[str, str] = {}  # old doc_id -> new doc_id (swap_doc re-mints)
 
+    @property
+    def _REGISTRY(self) -> dict[str, EcadSession]:
+        """engine.ecad.session._REGISTRY compat (tests clear it between phases)."""
+        return self._by_id
+
+    @staticmethod
+    def _autosave(session: EcadSession) -> None:
+        """Crash-recovery persist after every mutation (mirrors where engine.ecad.session
+        called autosave_session; no-op unless armed). engine.ecad.autosave STAYS (no C++
+        counterpart)."""
+        try:
+            from engine.ecad import autosave as _eauto  # STAYS (T-RF20): no C++ counterpart
+            _eauto.autosave_session(session)
+        except Exception:  # noqa: BLE001
+            pass
+
     def _resolve(self, doc_id: str) -> str:
         seen = set()
         while doc_id in self._alias and doc_id not in seen:
@@ -229,7 +245,7 @@ class _SessionFacade:
         resp = _rpc("ecad_apply_ops", {
             "doc_id": session.doc_id,
             "base_revision": base_revision if base_revision is not None else -1,
-            "ops": ops,
+            "ops": _attach_lib_defs(session, ops),
         })
         session._update(resp)
         return resp
@@ -276,6 +292,45 @@ class _SessionFacade:
 
 
 ecad_session = _SessionFacade()
+
+
+def _attach_lib_defs(session: EcadSession, ops: list[dict]) -> list[dict]:
+    """Inline resolved symbol/footprint defs on add ops that lack one (T-RF20).
+
+    The Python op handlers fell back to engine.ecad.library when an op carried no ``def``;
+    the C++ core has NO library server-side (core/ecad/ops.cpp ensure_lib_def / resolve_fp_def
+    stub instead — a stub corrupts ref-prefix annotation, pin geometry, and pads). The library
+    module itself has no RPC surface (STAYS), so resolution happens here at the seam, exactly
+    where the old op-layer fallback sat.
+    """
+    lib = None
+    out: list[dict] = []
+    for op in ops:
+        if isinstance(op, dict) and "def" not in op:
+            kind = op.get("op")
+            key = ("libid" if kind == "sch_add_symbol"
+                   else "fpid" if kind == "pcb_add_footprint" else None)
+            ident = op.get(key) if key else None
+            if isinstance(ident, str) and ident and not (
+                    key == "libid" and ident in (session.doc.get("lib_cache") or {})):
+                if lib is None:
+                    try:
+                        from engine.ecad import library as _lib  # STAYS: no ecad_library RPC
+                        lib = _lib
+                    except Exception:  # noqa: BLE001
+                        lib = False
+                if lib:
+                    try:
+                        d = (lib.resolve(ident) if key == "libid"
+                             else (lib.resolve_footprint(ident)
+                                   if hasattr(lib, "resolve_footprint")
+                                   else lib.resolve(ident)))
+                        if isinstance(d, dict):
+                            op = {**op, "def": d}
+                    except Exception:  # noqa: BLE001 — library is best-effort, never hard-fail
+                        pass
+        out.append(op)
+    return out
 
 
 def _mint_from_doc(doc: dict) -> dict:
@@ -1435,12 +1490,18 @@ def _default_outline_shapes(doc: dict, margin: float = 5.0,
             for i in range(4)]
 
 
-def _summarize_sweep_steps(runs: list, atype: str, probe: Optional[str]):
+def _summarize_sweep_steps(runs: list, atype: str, probe: Optional[str],
+                           probe_order: Optional[list] = None):
     """Compact a `.step` sweep into (trend_sentence, sweep_table, chosen_probe).
 
     For each swept value we pull a single scalar for the chosen probe (the op node voltage, or the
     final transient value, or the peak AC magnitude) and build a plain-English 'rises/falls/holds'
-    sentence so a weak model can read the trend without parsing the raw runs."""
+    sentence so a weak model can read the trend without parsing the raw runs.
+
+    ``probe_order`` (T-RF20): the study's probe list. The C++ core returns result dicts with
+    alphabetically-ordered keys (nlohmann::json), which scrambled the old insertion-order-based
+    "first finite probe" heuristic (it could pick the stiff source net over the probed output);
+    the caller's probe order restores the intended priority."""
     # Pick the probe to report: the explicit one, else the first probe that has finite values.
     def _scalar(run: dict, p: str):
         if atype == "op":
@@ -1472,6 +1533,9 @@ def _summarize_sweep_steps(runs: list, atype: str, probe: Optional[str]):
         # prefer a node voltage
         v_names = [n for n in names if str(n).startswith("V(")]
         ordered = v_names or names
+        if probe_order:
+            rank = {p: i for i, p in enumerate(probe_order)}
+            ordered = sorted(ordered, key=lambda n: rank.get(n, len(rank)))
         for cand in ordered:
             if any(_finite(_scalar(run, cand)) for run in runs):
                 chosen = cand

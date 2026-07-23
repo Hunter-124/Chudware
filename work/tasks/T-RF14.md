@@ -29,3 +29,8 @@ Webservice perf_probe).
 
 - [x] Measurable opens/s or tiny-op latency win on the ratchet, no regressions.
 - [x] gate.sh green; REFACTOR_LOG handoff; skip-with-reason is an acceptable close.
+
+CLOSED AS SKIPPED WITH REASON (2026-07-22, integrator): the perf_probe harness measures
+WS RPC latency (already p50 0.34 ms — no headroom) and cannot observe doc_open's
+memmove floor or GPU fill headlessly; the WASM quality ladder (T-RF13) addressed the
+real user-visible perf gap. Reopen only with fresh ratchet evidence.

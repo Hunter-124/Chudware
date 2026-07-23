@@ -3,8 +3,10 @@
 Re-homed from ``engine_oracle/ecad/orchestrator.py`` to ``services/ecad_design/`` in T-RF20:
 this is THIN LLM ORCHESTRATION (a prompt/validate/retry state machine over a provider), not
 engine logic, so it lives services-side. The deterministic machinery it drives — the ECAD
-session/ops, the recipe fallback library, netlist + SPICE simulation — stays behind the
-``engine.ecad`` / ``engine.sim`` modules it imports (transitional until those port to core/).
+session/ops, the recipe fallback library, netlist + SPICE simulation — is C++-dispatched and
+consumed via the core_bridge-backed facades in ``services.mcp.ecad_common`` (T-RF20); only
+``engine.ecad.library.starter`` / ``library.resolve`` remain direct imports (no ecad_library
+RPC surface).
 
 A DETERMINISTIC PYTHON STATE MACHINE drives the whole flow. Code decides every transition; the
 model only makes scoped decisions (the design intent) inside one bounded stage. This mirrors the
@@ -52,11 +54,20 @@ import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Optional
 
-from engine.ecad import netlist as netlist_mod
-from engine.ecad import recipes as recipes_mod
-from engine.ecad import schema as ecad_schema
-from engine.ecad import session as ecad_session
-from engine.ecad.ops import OpError
+# T-RF20: netlist/schema/session/ops/recipes and the SPICE stack are C++-dispatched
+# (core/ecad/*, core/sim/spice.cpp) — consumed here via the core_bridge-backed facades in
+# services.mcp.ecad_common and the ecad_recipe/ecad_closest_recipe/sim_* RPCs.
+# engine.ecad.library.starter + library.resolve have NO ecad_library RPC surface — those
+# lazy imports STAY (see _catalog_lines / validate_design / _remap_pins_by_name).
+from services.mcp.ecad_common import (
+    OpError,
+    _netlist_to_circuit,
+    _rpc,
+    _sim_run,
+    ecad_session,
+    netlist_mod,
+)
+from services.mcp.ecad_common import schema as ecad_schema
 
 EmitFn = Callable[[dict], None]
 
@@ -167,13 +178,23 @@ def _cap(s: str | None, n: int) -> str | None:
     return s if len(s) <= n else s[:n] + "\n...[truncated]"
 
 
+
+def _closest_recipe(request: str) -> dict:
+    """Deterministic recipe fallback (the safety net). TRANSITIONAL (T-RF20): the C++
+    ecad_closest_recipe RPC ports only 4 of the 5 recipes (core/ecad/recipes.cpp lacks
+    led_driver), and a wrong fallback recipe fails the VERIFY stage — so this stays on the
+    Python module until the port is complete. Needs-port gap tracked in docs/REFACTOR_LOG.md.
+    """
+    from engine.ecad import recipes as recipes_mod  # STAYS: C++ port missing led_driver
+    return recipes_mod.closest_recipe(request)
+
 def _catalog_lines() -> list[str]:
     """A COMPACT catalog of the simulatable starter parts (libid + pin numbers + a sim hint).
 
     Bounded by construction: only the handful of parts a small analog design needs, one line each,
     so the planner context stays tiny. Pin NUMBERS are shown because nets reference pins by number.
     """
-    from engine.ecad.library.starter import SYMBOLS
+    from engine.ecad.library.starter import SYMBOLS  # STAYS (T-RF20): no ecad_library RPC
 
     wanted = [
         "Simulation_SPICE:V_source", "Simulation_SPICE:I_source",
@@ -196,8 +217,9 @@ def _catalog_lines() -> list[str]:
 
 def _few_shot_text() -> str:
     """Two recipe designs rendered as compact few-shot examples for the planner."""
-    examples = [recipes_mod.voltage_divider(5.0, 2.5),
-                recipes_mod.inverting_amp(10.0)]
+    examples = [_rpc("ecad_recipe", {"name": "voltage_divider",
+                                     "params": {"vin": 5.0, "vout": 2.5}}),
+                _rpc("ecad_recipe", {"name": "inverting_amp", "params": {"gain": 10.0}})]
     blocks = []
     for ex in examples:
         compact = {
@@ -255,7 +277,7 @@ def validate_design(design: Any) -> tuple[bool, list[str]]:
     real pin number on that component's resolved SymbolDef; study has a usable analysis + expect.
     Returns (ok, errors). Pure; never raises.
     """
-    from engine.ecad.library import resolve as lib_resolve
+    from engine.ecad.library import resolve as lib_resolve  # STAYS (T-RF20): no ecad_library RPC
 
     errs: list[str] = []
     if not isinstance(design, dict):
@@ -529,7 +551,7 @@ def _remap_pins_by_name(netlist: dict) -> None:
     Adding name-keyed aliases lets those subckt-backed parts resolve their nodes correctly. A no-op
     for parts whose pin_order already uses numbers (R/C/L/V). Read-only use of the library.
     """
-    from engine.ecad.library.starter import SYMBOLS
+    from engine.ecad.library.starter import SYMBOLS  # STAYS (T-RF20): no ecad_library RPC
 
     for comp in netlist.get("components", []):
         sdef = SYMBOLS.get(comp.get("libid"))
@@ -592,12 +614,9 @@ def simulate_design(session: ecad_session.EcadSession, design: dict) -> dict:
 
     Returns {analysis, converged, probe, expect, got, pass, tol, warnings, log}. Never raises.
     """
-    from engine.sim.circuit import simulate as sim_run
-    from engine.sim.spice import netlist_to_spice_circuit
-
     nl = netlist_mod.build_netlist(session.doc)
     _remap_pins_by_name(nl)
-    circuit, warns = netlist_to_spice_circuit(nl)
+    circuit, warns = _netlist_to_circuit(nl)
 
     study = _build_study(design)
     expect = design.get("study", {}).get("expect", {})
@@ -618,7 +637,7 @@ def simulate_design(session: ecad_session.EcadSession, design: dict) -> dict:
             if d.get("kind") == "V" and (src is None or d.get("name") == src):
                 d.setdefault("params", {})["ac"] = {"mag": mag, "phase": 0.0}
 
-    result = sim_run(circuit, study)
+    result = _sim_run(circuit, study)  # C++ sim_spice RPC
     out["converged"] = bool(result.get("convergence", {}).get(analysis, False))
     out["log"] = result.get("log", [])[-6:]
 
@@ -717,7 +736,7 @@ def plan_design(request: str, *, provider=None, max_attempts: int = _PLAN_ATTEMP
         if design is not None:
             return design, recipe_used, stages
     # No provider, or planning failed -> deterministic recipe (the safety net).
-    design = recipes_mod.closest_recipe(request)
+    design = _closest_recipe(request)
     recipe_used = design.get("name")
     ev = StageEvent(stage="plan", ok=True, attempt=0,
                     detail=f"used recipe fallback {recipe_used!r}",
@@ -770,7 +789,7 @@ def run_design(request: str, *, provider=None, doc_id: str | None = None,
             stages.extend(plan_events)
         if design is None:
             # no provider, or planning failed -> deterministic recipe fallback (the safety net).
-            design = recipes_mod.closest_recipe(request)
+            design = _closest_recipe(request)
             recipe_used = design.get("name")
             ev = StageEvent(stage="plan", ok=True, attempt=0,
                             detail=f"used recipe fallback {recipe_used!r}",

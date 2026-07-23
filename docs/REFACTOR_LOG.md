@@ -3735,3 +3735,31 @@ leaf), sim/{worker,lbm,overlay} (after the flow-path leaf), piping threed/cfd_ha
 port, paths.py + vendor/bolts/canonical re-homes (in flight), ecad non-ported modules
 (pdn/antenna/si_rules/trace_opt/hostboard_rules/stackup/fpga/place/autosave/metadata/
 threed) disposition, the services-side worker main (R5a), flag removal (R5a).
+
+---
+
+## 2026-07-22 — Z-stream endgame (integrator, quota-economy phase)
+
+After the provider-quota pause, the wrap-up ran integrator-direct with one resumed leaf
+(ecad+sim MCP flip, still in flight). **Verified + committed (7735b236, ae4d0c3f):**
+the aborted leaves' work was largely sound — agent-40's re-home sweep (requirements,
+paths, vendor registry, bolts, canonical), agent-41's complete `run_flow_stl`
+implementation (integrator wired: stl-shaped `sim_run_flow` dispatch, routeSimToCpp
+covers flow+cancel, sim_client is in-process-only on all platforms — verified e2e:
+STL voxelized, forces envelope, honest `overlay_pending` degrade; the flow overlay
+package is a named follow-up, not ported). **hyd/piping baseline tests retargeted**
+(32/32 green: cb-driven shims replace the deleted module imports; physics assertions
+unchanged). **Dispositions executed:** doc remnant → services/formats +
+services/sw_import; piping hold-backs (threed/cfd_handoff — Python-kernel by nature)
+→ services/piping; openfoam cluster + lbm + overlay + tessellate → services/sim;
+em → services/sim/em (moved only — T-SIM11 stays parked); multiphysics_rpc +
+ngspice_backend + margin_policy re-homed; op_registry offline fallback →
+services/mcp/op_registry. **Worker transition:** engine_oracle/worker.py is now a
+shim over the new `services/worker_main.py` (dual-path registrations for every
+surviving services-side table); hostd worker_bridge + WorkerClient default spawn
+flipped to `services.worker_main`; both entry points boot-identical (protocol 2).
+**Gotchas:** `pkill -f aicad-hostd` matched my own shell once (use pgrep+kill by pid);
+the live web daemon keeps its old lib until the next webd-sync reinstall — expected
+by design. **Remaining:** ecad+sim flip leaf, then ecad/ + sim MNA deletions,
+vibration/fea_thermal disposition, R5a (flags, symlink, conftest alias, tree delete),
+R5b docs.

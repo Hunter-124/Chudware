@@ -148,7 +148,8 @@ def register_ecad_sch_tools(mcp: FastMCP) -> None:
         # silently produce a 2-pin stub with ok:true, which then corrupts the netlist. Fail fast
         # with a clear error and direct the user to ecad_find_part.
         from engine.ecad import library as _lib  # STAYS (T-RF20): no ecad_library RPC
-        if _lib.resolve(libid) is None:
+        _resolved_def = _lib.resolve(libid)
+        if _resolved_def is None:
             keyword = libid.split(":")[-1] if ":" in libid else libid
             return _err(
                 f"unknown library part {libid!r} — use ecad_find_part to find a real libid",
@@ -160,8 +161,11 @@ def register_ecad_sch_tools(mcp: FastMCP) -> None:
                 ],
                 libid=libid,
             )
+        # The C++ core has no symbol library server-side (core/ecad/ops.cpp ensure_lib_def
+        # stubs when no def rides the op) — pass the resolved def inline so lib_cache,
+        # ref-prefix annotation (R1, not U1) and pin geometry are identical to the old path.
         op: dict = {"op": "sch_add_symbol", "libid": libid, "pos": [float(x), float(y)],
-                    "angle": float(angle)}
+                    "angle": float(angle), "def": _resolved_def}
         if ref:
             op["ref"] = ref
         if value:

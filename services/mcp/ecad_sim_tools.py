@@ -535,7 +535,8 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
         result = _sim_run(circuit, study)
         step = result.get("step", {})
         runs = step.get("runs", [])
-        trend, sweep_table, chosen = _summarize_sweep_steps(runs, an["type"], probe or None)
+        trend, sweep_table, chosen = _summarize_sweep_steps(runs, an["type"], probe or None,
+                                                            probe_order=probe_list)
         converged = bool(result.get("convergence", {}).get("step", False))
         return _dumps({
             "ok": True, "doc_id": session.doc_id, "analysis": an["type"],

@@ -29,6 +29,10 @@ beacons; update Webservice/perf/baseline.json.
 
 ## Definition of done
 
-- [ ] WASM build holds ≥30 FPS on a weak-iGPU scenario without manual settings.
+- [~] WASM build holds ≥30 FPS on a weak-iGPU scenario without manual settings.
+      LADDER IMPLEMENTED + forced-adaptive proven both directions under synthetic frame
+      times (llvmpipe). NOT validated on real UHD-620-class hardware — needs a tune
+      pass on a real iGPU browser (thresholds 20/12.5 ms, LOW scale 0.60 are reasoned
+      defaults). Left open intentionally; the mechanism is live on the web build.
 - [x] Native desktop output pixel-identical at default quality.
 - [x] perf_probe + client beacons updated; gate.sh green; REFACTOR_LOG handoff.

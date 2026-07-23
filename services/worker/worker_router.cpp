@@ -5,10 +5,7 @@
 namespace aicad::services {
 
 bool cppDocsEnabled() {
-    // Default ON, matching worker_client.cpp cppDocsFlag() (C++ doc engine is
-    // parity-complete since 2026-06-19). AI_CAD_CPP_DOCS=0 forces the Python oracle.
-    const char* v = std::getenv("AI_CAD_CPP_DOCS");
-    if (v && *v) return std::strcmp(v, "0") != 0;
+    // R5a (T-RF21): unconditional — the C++ doc engine is the only backend.
     return true;
 }
 

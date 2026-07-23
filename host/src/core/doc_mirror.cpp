@@ -23,61 +23,6 @@ static inline int jint(const nlohmann::json& o, const char* k) {
     return (it != o.end() && it->is_number_integer()) ? it->get<int>() : 0;
 }
 
-// Strangler diagnostic (docs/CPP_MIGRATION.md): when $AI_CAD_CPP_PARITY is set
-// (non-empty, not "0"), compile the SAME feature tree the host already holds
-// through the in-process C++ core (libaicad.dll) and log how its per-feature
-// statuses + body count compare to Python's. This NEVER affects the production
-// result — the Python worker remains authoritative. It is the measurement that
-// tells us which real features the C++ core has reached parity on, feature by
-// feature, before we cut any of them over.
-static void cppParityProbe(const char* where, const std::string& docId, int revision,
-                           const nlohmann::json& tree,
-                           const nlohmann::json& pyFeatureStatus) {
-    const char* flag = std::getenv("AI_CAD_CPP_PARITY");
-    if (!flag || !flag[0] || flag[0] == '0') return;
-    if (!tree.is_object() || !tree.contains("features")) return;
-
-    nlohmann::json result, params;
-    params["doc"] = tree;  // libaicad accepts a tree carrying a top-level "features"
-    std::string err;
-    if (!cpp_core().call("doc_compile_cpp", params, result, err)) {
-        std::printf("[cpp-parity] %s doc=%s rev=%d  C++ core unavailable/declined: %s\n",
-                    where, docId.c_str(), revision, err.c_str());
-        std::fflush(stdout);
-        return;
-    }
-    std::map<std::string, bool> cppOk;
-    int cppBodies = result.value("body_count", 0);
-    if (result.contains("statuses") && result["statuses"].is_array())
-        for (const auto& s : result["statuses"])
-            cppOk[s.value("id", std::string())] = s.value("ok", false);
-
-    int total = 0, match = 0;
-    std::string diffs;
-    if (pyFeatureStatus.is_array()) {
-        for (const auto& f : pyFeatureStatus) {
-            std::string id = f.value("id", std::string());
-            bool pyok = f.value("ok", false);
-            ++total;
-            auto it = cppOk.find(id);
-            if (it == cppOk.end()) {
-                if (!diffs.empty()) diffs += ", ";
-                diffs += id + "(cpp missing)";
-            } else if (it->second == pyok) {
-                ++match;
-            } else {
-                if (!diffs.empty()) diffs += ", ";
-                diffs += id + (it->second ? "(cpp ok,py err)" : "(cpp err,py ok)");
-            }
-        }
-    }
-    std::printf("[cpp-parity] %s doc=%s rev=%d  features py=%d cpp-match=%d  cpp-bodies=%d aicm=%llu%s%s\n",
-                where, docId.c_str(), revision, total, match, cppBodies,
-                (unsigned long long)result.value("aicm_bytes", (uint64_t)0),
-                diffs.empty() ? "" : "  DIFF: ", diffs.c_str());
-    std::fflush(stdout);
-}
-
 // ---- OpsResponse parser ----
 
 OpsResponse DocMirror::parseOpsResponse(const nlohmann::json& result) {
@@ -304,9 +249,6 @@ OpsResponse DocMirror::applyOps(WorkerClient& w, const nlohmann::json& ops, bool
         if (!r.tree.is_null()) tree_ = r.tree;
         if (!r.feature_status.is_null()) featureStatus_ = r.feature_status;
         storeOwnerMap(r.owner_map);  // W1-B: refresh owner map (tolerates absence)
-        // Strangler diagnostic (no-op unless $AI_CAD_CPP_PARITY): every edit is a
-        // chance to measure C++-core parity on a real, evolving tree.
-        cppParityProbe("apply_ops", docId_, revision_, tree_, featureStatus_);
         notify();
     }
     return r;
@@ -367,7 +309,6 @@ void DocMirror::applyOpsAsync(AsyncRpc& rpc, WorkerClient& w, const nlohmann::js
                 if (!r.tree.is_null()) tree_ = r.tree;
                 if (!r.feature_status.is_null()) featureStatus_ = r.feature_status;
                 storeOwnerMap(r.owner_map);
-                cppParityProbe("apply_ops_async", docId_, revision_, tree_, featureStatus_);
                 notify();
             }
             if (done) done(r, r.ok);
@@ -651,9 +592,6 @@ bool DocMirror::activate(WorkerClient& w, const std::string& docId, std::string&
         refDatums_ = nlohmann::json::array();
     if (res.contains("tess") && res["tess"].is_object())
         aicmPath = jstr(res["tess"], "aicm_path");
-    // Strangler diagnostic (no-op unless $AI_CAD_CPP_PARITY): compile the same tree
-    // through the C++ core and log per-feature parity vs Python.
-    cppParityProbe("rebuild", docId_, revision_, tree_, featureStatus_);
     notify();
     return true;
 }
@@ -685,7 +623,6 @@ bool DocMirror::adoptActivateResponse(const std::string& docId, const nlohmann::
         refDatums_ = nlohmann::json::array();
     if (res.contains("tess") && res["tess"].is_object())
         aicmPath = jstr(res["tess"], "aicm_path");
-    cppParityProbe("rebuild_async", docId_, revision_, tree_, featureStatus_);
     notify();
     return true;
 }

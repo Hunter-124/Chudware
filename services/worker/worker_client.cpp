@@ -83,25 +83,19 @@ bool callAgentStreaming(const std::string& coreMethod, const json& p, json& cppR
     return engine::call(coreMethod, p, cppResult, cerr, timeoutMs);
 }
 
-// --- P16: per-document cutover routing to the pure-C++ core (libaicad) -------
-// Opt-in via env AI_CAD_CPP_DOCS (non-empty, not "0"). A document CREATED in the C++
-// core gets a "doc-cpp..." id, so every subsequent doc_* call carrying that id routes
-// to the C++ core too — the id prefix IS the commit-at-doc_new marker, giving an
-// all-or-nothing-per-document cutover with no separate routing state. Flag OFF (default)
-// is byte-for-byte today's behavior: every call goes to the Python worker.
-//
-// DEFAULT ON (2026-06-19): the C++ doc engine is parity-complete for parts / sketch mode /
-// the full Evaluate suite / weldments / assemblies / copy-paste-as-derived, verified by the
-// aggregate differential gate (tools/run_parity_suite.py — 24/24 vs the Python oracle: session
-// 65, eval 40, sketch 22, weld 26, asm 10, derived 37, audit/audit2/audit3, + agent orchestration
-// via the mock provider). Documents now default to the pure-C++ core. AI_CAD_CPP_DOCS=0 still
-// forces the legacy Python worker (escape hatch / fallback while the Python oracle stays in-tree).
-// The coupled cppAgentFlag() follows this, so the agent also defaults to C++ (it drives the same
+// --- Per-document routing to the pure-C++ core (libaicad) --------------------
+// A document CREATED in the C++ core gets a "doc-cpp..." id, so every subsequent doc_*
+// call carrying that id routes to the C++ core too — the id prefix IS the
+// commit-at-doc_new marker, giving an all-or-nothing-per-document cutover with no
+// separate routing state. R5a (T-RF21): unconditional — the C++ doc engine is the only
+// backend (parity-complete since 2026-06-19: 24/24 differential gate vs the retired
+// Python oracle; the AI_CAD_CPP_DOCS escape hatch is gone). cppAgentFlag() follows, so
+// the agent also routes C++ (it drives the same doc session it edits).
 // doc-cpp session it edits).
 bool cppDocsFlag() {
-    const char* f = std::getenv("AI_CAD_CPP_DOCS");
-    if (f && f[0]) return f[0] != '0';  // explicit override (1=on, 0=force Python fallback)
-    return true;                        // default: pure-C++ doc engine (parity-complete)
+    // R5a (T-RF21): the AI_CAD_CPP_DOCS escape hatch is removed — the pure-C++ doc
+    // engine is the only backend (the Python oracle is deleted at closeout).
+    return true;
 }
 
 // Methods that MINT a new document (vs. operate on an existing one). For these the C++
@@ -238,21 +232,14 @@ bool routeDocToCpp(const std::string& method, const json& params) {
 // --- C++ AGENT routing (opt-in, default OFF) --------------------------------
 // Route the in-app AI-agent RPCs (agent_run_v2 / agent_ask_v2 / agent_pm_assist_v1 /
 // get_prompts_v2) to the pure-C++ core (libaicad) instead of the Python worker. This
-// MIRRORS the doc_* seam but is DEFAULT OFF: unless AI_CAD_CPP_AGENT is set (and != "0")
-// the app behaves byte-for-byte as today (every agent call goes to the Python worker).
+// MIRRORS the doc_* seam and is unconditional since R5a (T-RF21).
 // (agent_design was deleted in T-RF5 — the v2 run is the only agent path.) The C++ agent drives a
 // C++-backed ("doc-cpp") doc session, so we only route when the active doc is C++-backed;
 // a Python doc (e.g. an assembly) falls through to Python.
 bool cppAgentFlag() {
-    const char* f = std::getenv("AI_CAD_CPP_AGENT");
-    if (f && f[0]) return f[0] != '0';  // explicit override (1=on, 0=force Python)
-    // DEFAULT = FOLLOW THE DOC ENGINE. The agent drives the SAME doc session it edits, so it
-    // MUST run on the same engine as the doc (C++ agent <-> doc-cpp; Python agent <-> Python
-    // doc). Coupling the default to cppDocsFlag() makes the two impossible to mismatch: with
-    // AI_CAD_CPP_DOCS=1 the agent also routes to C++ (so agent_run_v2 on a doc-cpp doc is
-    // caught+translated by the agent seam, not mis-claimed by the doc seam); with docs on
-    // Python (the current default) the agent stays Python. An explicit AI_CAD_CPP_AGENT still
-    // overrides. (routeAgentToCpp additionally gates on the active doc actually being doc-cpp.)
+    // R5a (T-RF21): the AI_CAD_CPP_AGENT escape hatch is removed — the C++ agent is
+    // the only agent backend. The agent still drives the SAME doc session it edits
+    // (C++ agent <-> doc-cpp), so it follows the (unconditional) doc engine.
     return cppDocsFlag();
 }
 
@@ -315,9 +302,9 @@ bool routeAgentToCpp(const std::string& method, const json& params) {
 // which is exactly what sim_panel consumes (it never reads results_npz/solve_time_s,
 // the two fields the C++ result omits) — so the result is byte-compatible for display.
 bool cppSimFlag() {
-    const char* f = std::getenv("AI_CAD_CPP_SIM");
-    if (f && f[0]) return f[0] != '0';  // explicit override (1=on, 0=force Python)
-    return true;                        // default ON: FEA mesh/static/modal on the C++ core
+    // R5a (T-RF21): the AI_CAD_CPP_SIM escape hatch is removed — FEA/flow run on the
+    // C++ core only.
+    return true;
 }
 
 bool routeSimToCpp(const std::string& method, const json& /*params*/) {
@@ -352,13 +339,10 @@ bool routeSimToCpp(const std::string& method, const json& /*params*/) {
 // is already C++). A call bound to an ecadcpp doc that hits ecad_design fails loud
 // (no Python doc to fall back to) — exactly the doc-cpp seam's behavior.
 bool cppEcadFlag() {
-    const char* f = std::getenv("AI_CAD_CPP_ECAD");
-    if (f && f[0]) return f[0] != '0';  // explicit override (1=on, 0=force Python)
-#ifdef _WIN32
-    return false;  // Windows: default to the mature Python ECAD worker
-#else
-    return true;   // Linux/macOS: no Python worker — the C++ core is the only ECAD backend
-#endif
+    // R5a (T-RF21): the AI_CAD_CPP_ECAD escape hatch is removed — the C++ core is the
+    // only ECAD backend on every platform (the Python ECAD worker is deleted at
+    // closeout; Windows' Python default goes with it).
+    return true;
 }
 
 bool routeEcadToCpp(const std::string& method, const json& params) {
@@ -395,13 +379,9 @@ bool routeEcadToCpp(const std::string& method, const json& params) {
 // overrides. The three emulator-leg methods (fw_sim_run / fw_power_profile /
 // fw_sensor_scenario) stay Python until the Renode leg lands.
 bool cppFirmwareFlag() {
-    const char* f = std::getenv("AI_CAD_CPP_FIRMWARE");
-    if (f && f[0]) return f[0] != '0';
-#ifdef _WIN32
-    return false;  // Windows: firmware subprocess layer is POSIX-verified only
-#else
+    // R5a (T-RF21): the AI_CAD_CPP_FIRMWARE escape hatch is removed — core/firmware
+    // owns the fw_* surface (POSIX-verified; Windows path is best-effort C++).
     return true;
-#endif
 }
 
 bool routeFirmwareToCpp(const std::string& method, const json& /*params*/) {

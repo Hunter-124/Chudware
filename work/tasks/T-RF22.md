@@ -27,7 +27,7 @@ either live or marked historical); verify Linux gate fully green and a Windows b
 ## Definition of done
 
 - [x] Docs match the tree; no stale references (link sweep in check.py if cheap).
-- [ ] Linux gate green; Windows build verified.
+- [x] Linux gate green; Windows build verified.
 - [x] Board: every T-RF* done; final REFACTOR_LOG paragraph; graphify update run.
 
 ## Progress log

@@ -510,6 +510,82 @@ def get_tool_options(cfg: dict | None, name: str) -> dict:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Global tool-dispatch defaults (Settings → AI → Tools "Advanced")
+# agent.tool_timeout_s_default      int seconds, 0 = no global timeout (default 0)
+# agent.tool_max_calls_default      int, 0 = unlimited (default 0)
+# agent.supervision_interval_calls  int tool calls between forced proactive-advisor
+#                                    verification passes, 0 = never force (default 4)
+# Precedence ENV > config.json > default. Per-tool ``agent.tool_options.<tool>``
+# entries (see get_tool_options above) always win over these globals — callers
+# only fall back to them when the per-tool value is absent/0. Never throw:
+# any parse failure (bad env, missing/malformed config) yields the default.
+# ---------------------------------------------------------------------------
+
+def tool_timeout_s_default(cfg: dict | None = None) -> int:
+    """Global default per-tool timeout in seconds (``agent.tool_timeout_s_default``).
+
+    0 means "no global timeout" — only an explicit per-tool
+    ``agent.tool_options.<tool>.timeout_s`` applies (today's behavior).
+    Precedence: env ``CHUDWARE_TOOL_TIMEOUT_S`` > config.json > default (0).
+    Negative values clamp to 0; unparseable env/config values fall back to 0.
+    """
+    try:
+        env = os.environ.get("CHUDWARE_TOOL_TIMEOUT_S")
+        if env is not None and str(env).strip() != "":
+            return max(0, int(str(env).strip()))
+    except (TypeError, ValueError):
+        pass
+    try:
+        agent = _agent_block(cfg)
+        return max(0, int(agent.get("tool_timeout_s_default", 0)))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def tool_max_calls_default(cfg: dict | None = None) -> int:
+    """Global default max-calls-per-turn cap (``agent.tool_max_calls_default``).
+
+    0 means "unlimited" — only an explicit per-tool
+    ``agent.tool_options.<tool>.max_calls_per_turn`` applies (today's behavior).
+    Precedence: env ``CHUDWARE_TOOL_MAX_CALLS`` > config.json > default (0).
+    Negative values clamp to 0; unparseable env/config values fall back to 0.
+    """
+    try:
+        env = os.environ.get("CHUDWARE_TOOL_MAX_CALLS")
+        if env is not None and str(env).strip() != "":
+            return max(0, int(str(env).strip()))
+    except (TypeError, ValueError):
+        pass
+    try:
+        agent = _agent_block(cfg)
+        return max(0, int(agent.get("tool_max_calls_default", 0)))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def supervision_interval_calls(cfg: dict | None = None) -> int:
+    """Tool calls between forced advisor checks (``agent.supervision_interval_calls``).
+
+    Drives ``proactive_advisor._REQUIRE_EVERY_N``: with advisor preference
+    ``require``, a verification pass is force-injected every N tool calls.
+    0 disables require-mode entirely (never force-inject).
+    Precedence: env ``CHUDWARE_SUPERVISION_INTERVAL`` > config.json > default (4).
+    Negative values clamp to 0; unparseable env/config values fall back to 4.
+    """
+    try:
+        env = os.environ.get("CHUDWARE_SUPERVISION_INTERVAL")
+        if env is not None and str(env).strip() != "":
+            return max(0, int(str(env).strip()))
+    except (TypeError, ValueError):
+        pass
+    try:
+        agent = _agent_block(cfg)
+        return max(0, int(agent.get("supervision_interval_calls", 4)))
+    except Exception:  # noqa: BLE001
+        return 4
+
+
 def get_tool_families(cfg: dict | None = None) -> dict[str, bool]:
     """Return family→enabled map. Defaults all known families to True."""
     c = cfg if isinstance(cfg, dict) else load_config()

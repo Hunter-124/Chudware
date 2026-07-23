@@ -612,7 +612,15 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                 try:
                     from services.agent.config import get_tool_options  # noqa: PLC0415
                     opts = get_tool_options(None, tool) or {}
+                    # Per-tool option always wins; fall back to the global default
+                    # (Settings → AI → Tools "Advanced") only when unset/0.
                     max_calls = opts.get("max_calls_per_turn")
+                    if max_calls is None:
+                        try:
+                            from services.agent.config import tool_max_calls_default  # noqa: PLC0415
+                            max_calls = tool_max_calls_default() or None
+                        except Exception:  # noqa: BLE001
+                            max_calls = None
                     if max_calls is not None:
                         n = int(_tool_call_counts.get(tool, 0))
                         if n >= int(max_calls):
@@ -2618,7 +2626,15 @@ def _dispatch_tool(
     if opts.get("enabled") is False:
         raise RuntimeError(f"tool '{tool}' disabled in Settings → AI → Tools")
 
+    # Per-tool option always wins; fall back to the global default (Settings →
+    # AI → Tools "Advanced") only when the per-tool value is unset/0.
     max_calls = opts.get("max_calls_per_turn")
+    if max_calls is None:
+        try:
+            from services.agent.config import tool_max_calls_default  # noqa: PLC0415
+            max_calls = tool_max_calls_default() or None
+        except Exception:  # noqa: BLE001
+            max_calls = None
     if max_calls is not None and _call_counts is not None:
         n = int(_call_counts.get(tool, 0))
         if n >= int(max_calls):
@@ -2635,6 +2651,12 @@ def _dispatch_tool(
     import time as _time
     t0 = _time.monotonic()
     timeout_s = opts.get("timeout_s")
+    if timeout_s is None:
+        try:
+            from services.agent.config import tool_timeout_s_default  # noqa: PLC0415
+            timeout_s = tool_timeout_s_default() or None
+        except Exception:  # noqa: BLE001
+            timeout_s = None
 
     def _call() -> Any:
         if _inner is not None:

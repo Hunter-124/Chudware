@@ -30,7 +30,7 @@ _MIN_SECONDS = 45.0
 _MAX_FIRES_PER_TURN = 3
 _MAX_LLM_PER_TURN = 1
 _MAX_LLM_PER_RUN = 3
-_REQUIRE_EVERY_N = 4
+_REQUIRE_EVERY_N = 4  # fallback only; _require_every_n() reads config.supervision_interval_calls()
 _LLM_MAX_TOKENS = 220
 _EVIDENCE_CHARS = 900
 
@@ -58,6 +58,22 @@ def _state(bucket: dict | None) -> dict:
         }
         bucket[_STATE_KEY] = st
     return st
+
+
+def _require_every_n() -> int:
+    """Cadence for require-mode force-injection (``agent.supervision_interval_calls``).
+
+    Single source of truth for every ``_REQUIRE_EVERY_N``-style read in this
+    module — routes through :func:`services.agent.config.supervision_interval_calls`
+    so the GUI Settings value (and its ENV override / precedence rules) take
+    effect without a restart. 0 disables require-mode entirely (never force).
+    Falls back to the historical default (4) if config is unreachable.
+    """
+    try:
+        from services.agent import config  # noqa: PLC0415
+        return max(0, int(config.supervision_interval_calls()))
+    except Exception:  # noqa: BLE001
+        return _REQUIRE_EVERY_N
 
 
 def _truncate(text: str, n: int = _EVIDENCE_CHARS) -> str:
@@ -118,10 +134,16 @@ def evaluate_trigger(
         reason = (reason + "+" if reason else "") + f"same_tool_x{same_tool_n}"
         if same_tool_n >= 3:
             severity = "high"
-    if pref == "require" and tool_calls_made > 0 and tool_calls_made % _REQUIRE_EVERY_N == 0:
+    require_n = _require_every_n()
+    if (
+        pref == "require"
+        and require_n > 0
+        and tool_calls_made > 0
+        and tool_calls_made % require_n == 0
+    ):
         fire = True
         if not reason:
-            reason = f"require_every_{_REQUIRE_EVERY_N}"
+            reason = f"require_every_{require_n}"
             severity = "med"
 
     # option: only fire on high severity (strict opt-in feel even if checkbox on)

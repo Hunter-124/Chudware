@@ -22,7 +22,9 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -128,6 +130,12 @@ struct GraphTabState {
   // Assembly structure view (project scope only): assemblies + parts with
   // CONTAINS / INSTANCE_OF / MATES / DEPENDS_ON, laid out as layered tree.
   bool asmView = false;
+  // Hierarchy (balloon) layout: positions are pure deterministic structure
+  // and the force sim stays FROZEN (reheat 0) so the tree never homogenizes
+  // into a blob. Saved/restored across asm-view and scope swaps via
+  // projWasHierarchy.
+  bool hierarchyLayout = false;
+  bool projWasHierarchy = false; // saved across asm-view/scope swaps
   // 3D projection of the (still 2D-solved) layout; right-drag orbits.
   bool view3d = false;
   float orbitYaw = 0.55f;
@@ -953,6 +961,14 @@ void setScope(GraphTabState &G, const std::string &docId) {
   G.userNavigated = false; // fresh scope → allow one auto-fit again
   // Assemblies (or anything with bom_items) open in decomposition view.
   G.scopeDecomp = false;
+  // Scopes run live sims; the balloon freeze resumes back in project view.
+  if (docId.empty()) {
+    G.hierarchyLayout = G.projWasHierarchy;
+  } else {
+    if (G.scopeDocId.empty())
+      G.projWasHierarchy = G.hierarchyLayout;
+    G.hierarchyLayout = false;
+  }
   if (!docId.empty()) {
     auto it = G.idIndex.find(docId);
     if (it != G.idIndex.end() &&
@@ -982,6 +998,13 @@ void stashLivePositions(GraphTabState &G) {
 void toggleAsmView(GraphTabState &G) {
   stashLivePositions(G);
   G.asmView = !G.asmView;
+  // Asm view runs the live layered sim; preserve the project freeze.
+  if (G.asmView) {
+    G.projWasHierarchy = G.hierarchyLayout;
+    G.hierarchyLayout = false;
+  } else {
+    G.hierarchyLayout = G.projWasHierarchy;
+  }
   const auto &stash = G.asmView ? G.asmPosStash : G.projPosStash;
   for (auto &n : G.nodes) {
     auto it = stash.find(n.id);
@@ -998,189 +1021,201 @@ void toggleAsmView(GraphTabState &G) {
 
 // ---- deterministic seeds ----------------------------------------------------
 
-// Structural seed per connected component, phyllotaxis + neighbor anchoring.
-// Sized components (binding-edge graphs) start as a compact golden-angle
-// spiral disc at their component well — the v2 behavior, which never
-// collapses (unlike harmonic embeddings, which implode on tree-dominated
-// graphs: observed live as wedge/ring artifacts). Reference-only singles
-// (no binding edges) anchor at the centroid of their already-placed
-// neighbors over any edge kind, so the REFERENCES web starts NEXT to what
-// it references instead of fanning in from remote wells. Deterministic
-// (fixed orders, golden angle, no RNG). Depth (z) = BFS level gradient
-// from each component's max-degree root — seeds the 3D physics mode.
-void structuralSeed(GraphTabState &G, const std::vector<std::vector<int>> &adj,
-                    const std::vector<std::vector<int>> &adjAll,
-                    const std::vector<int> &comp,
-                    const std::vector<int> &compSize, int nComp,
-                    const std::vector<std::pair<float, float>> &well,
-                    const std::vector<char> &isFresh, float spacing,
-                    std::vector<float> &outX, std::vector<float> &outY,
-                    std::vector<float> &outZ) {
-  const int V = (int)adj.size();
+// Balloon hierarchy seed over the visible CONTAINS forest: each subtree gets
+// a wedge of the circle proportional to its leaf count; per-depth radii grow
+// so every level keeps >= hop arc spacing. PURE STRUCTURE — the force sim
+// stays frozen in this mode (hierarchyLayout): force polish of any strength
+// homogenizes hierarchy into a uniform blob (verified in sim bake-offs AND
+// three rounds of live screenshots: ring, wedge, dandelion). Non-tree fresh
+// nodes (the REFERENCES web) anchor on small phyllotaxis discs around their
+// already-placed neighbors instead of fanning in from remote wells. z =
+// containment depth — a volumetric cone in 3D mode. Deterministic: sorted
+// children, golden angle, no RNG, O(N).
+void hierarchySeed(GraphTabState &G,
+                   const std::unordered_map<std::string, int> &visOrd,
+                   const std::vector<std::vector<int>> &adjAll,
+                   const std::vector<int> &comp,
+                   const std::vector<std::pair<float, float>> &well,
+                   const std::vector<char> &isFresh, float spacing,
+                   std::vector<float> &outX, std::vector<float> &outY,
+                   std::vector<float> &outZ) {
+  const int V = (int)adjAll.size();
   outX.assign(static_cast<size_t>(V), 0.0f);
   outY.assign(static_cast<size_t>(V), 0.0f);
   outZ.assign(static_cast<size_t>(V), 0.0f);
-  if (V == 0 || nComp <= 0)
+  if (V == 0)
     return;
+  constexpr float GOLDEN = 2.39996323f;
+  const float hop = spacing * 0.9f;
 
-  constexpr float GOLDEN = 2.39996323f; // golden angle (rad)
-  std::vector<std::vector<int>> members(static_cast<size_t>(nComp));
-  for (int i = 0; i < V; ++i)
-    if (comp[static_cast<size_t>(i)] >= 0)
-      members[static_cast<size_t>(comp[static_cast<size_t>(i)])].push_back(i);
-
-  std::vector<char> placed(static_cast<size_t>(V), 0);
-
-  for (int c = 0; c < nComp; ++c) {
-    const auto &mem = members[static_cast<size_t>(c)];
-    const int m = (int)mem.size();
-    if (m <= 1)
-      continue; // singles anchored below
-    const float wx = well[static_cast<size_t>(c)].first;
-    const float wy = well[static_cast<size_t>(c)].second;
-
-    // Phyllotaxis disc for fresh members (visOrd order → deterministic).
-    std::vector<float> px(static_cast<size_t>(m), 0.0f),
-        py(static_cast<size_t>(m), 0.0f);
-    int cached = 0;
-    float ancX = 0.0f, ancY = 0.0f;
-    for (int i = 0; i < m; ++i) {
-      const int gv = mem[i];
-      if (!isFresh[static_cast<size_t>(gv)]) {
-        const GNode &n = G.nodes[G.visibleIdx[static_cast<size_t>(gv)]];
-        px[static_cast<size_t>(i)] = n.lx;
-        py[static_cast<size_t>(i)] = n.ly;
-        ancX += n.lx;
-        ancY += n.ly;
-        ++cached;
-      } else {
-        const float r = spacing * 0.9f * std::sqrt((float)i + 0.5f);
-        const float a = (float)i * GOLDEN;
-        px[static_cast<size_t>(i)] = wx + r * std::cos(a);
-        py[static_cast<size_t>(i)] = wy + r * std::sin(a);
-      }
-    }
-    // Mixed component: pull the fresh disc onto the cached anchors' centroid.
-    if (cached > 0 && cached < m) {
-      float mx = 0.0f, my = 0.0f;
-      int nf = 0;
-      for (int i = 0; i < m; ++i) {
-        if (!isFresh[static_cast<size_t>(mem[i])])
-          continue;
-        mx += px[static_cast<size_t>(i)];
-        my += py[static_cast<size_t>(i)];
-        ++nf;
-      }
-      if (nf > 0) {
-        const float ox = ancX / (float)cached - mx / (float)nf;
-        const float oy = ancY / (float)cached - my / (float)nf;
-        for (int i = 0; i < m; ++i) {
-          if (!isFresh[static_cast<size_t>(mem[i])])
-            continue;
-          px[static_cast<size_t>(i)] += ox;
-          py[static_cast<size_t>(i)] += oy;
-        }
-      }
-    }
-    // Depth gradient: BFS level from the max-degree root (deterministic).
-    {
-      int root = mem[0];
-      for (int gv : mem)
-        if (adj[static_cast<size_t>(gv)].size() >
-            adj[static_cast<size_t>(root)].size())
-          root = gv;
-      std::vector<int> dist(static_cast<size_t>(V), -1);
-      std::vector<int> q;
-      q.reserve(static_cast<size_t>(m));
-      dist[static_cast<size_t>(root)] = 0;
-      q.push_back(root);
-      for (size_t qi = 0; qi < q.size(); ++qi) {
-        const int u = q[qi];
-        for (int v : adj[static_cast<size_t>(u)]) {
-          if (dist[static_cast<size_t>(v)] >= 0)
-            continue;
-          dist[static_cast<size_t>(v)] = dist[static_cast<size_t>(u)] + 1;
-          q.push_back(v);
-        }
-      }
-      float mean = 0.0f;
-      int cnt = 0;
-      for (int gv : mem)
-        if (dist[static_cast<size_t>(gv)] >= 0) {
-          mean += (float)dist[static_cast<size_t>(gv)];
-          ++cnt;
-        }
-      if (cnt > 0)
-        mean /= (float)cnt;
-      for (int gv : mem) {
-        if (!isFresh[static_cast<size_t>(gv)])
-          continue;
-        const int d = dist[static_cast<size_t>(gv)];
-        outZ[static_cast<size_t>(gv)] =
-            d >= 0 ? ((float)d - mean) * spacing * 0.5f : 0.0f;
-      }
-    }
-    for (int i = 0; i < m; ++i) {
-      const int gv = mem[i];
-      if (!isFresh[static_cast<size_t>(gv)])
+  // CONTAINS forest in visOrd space (parent -> sorted children).
+  std::vector<std::vector<int>> kids(static_cast<size_t>(V));
+  std::vector<char> hasParent(static_cast<size_t>(V), 0);
+  if (!G.hiddenKinds.count("CONTAINS")) {
+    for (const auto &e : G.visibleEdges) {
+      if (e.kind != "CONTAINS")
         continue;
-      outX[static_cast<size_t>(gv)] = px[static_cast<size_t>(i)];
-      outY[static_cast<size_t>(gv)] = py[static_cast<size_t>(i)];
-      placed[static_cast<size_t>(gv)] = 1;
+      auto a = visOrd.find(e.src), b = visOrd.find(e.dst);
+      if (a == visOrd.end() || b == visOrd.end() || a->second == b->second)
+        continue;
+      kids[static_cast<size_t>(a->second)].push_back(b->second);
+      hasParent[static_cast<size_t>(b->second)] = 1;
     }
   }
-  // Cached nodes count as placed anchors for the single-anchoring sweeps.
+  for (auto &k : kids) {
+    std::sort(k.begin(), k.end());
+    k.erase(std::unique(k.begin(), k.end()), k.end());
+  }
+
+  // Roots: visible children but no visible parent.
+  std::vector<int> roots;
+  for (int i = 0; i < V; ++i)
+    if (!kids[static_cast<size_t>(i)].empty() &&
+        !hasParent[static_cast<size_t>(i)])
+      roots.push_back(i);
+
+  // Depth + leaf counts (iterative preorder; cycle-guarded).
+  std::vector<int> depth(static_cast<size_t>(V), -1),
+      leaves(static_cast<size_t>(V), 1), order;
+  order.reserve(static_cast<size_t>(V));
+  for (int r : roots) {
+    std::vector<std::pair<int, int>> st{{r, 0}};
+    while (!st.empty()) {
+      const auto pr = st.back();
+      st.pop_back();
+      const int u = pr.first, d = pr.second;
+      if (depth[static_cast<size_t>(u)] >= 0)
+        continue;
+      depth[static_cast<size_t>(u)] = d;
+      order.push_back(u);
+      for (int v : kids[static_cast<size_t>(u)])
+        st.push_back({v, d + 1});
+    }
+  }
+  int maxDepth = 0;
+  for (int u : order)
+    maxDepth = std::max(maxDepth, depth[static_cast<size_t>(u)]);
+  for (auto it = order.rbegin(); it != order.rend(); ++it) {
+    const int u = *it;
+    if (kids[static_cast<size_t>(u)].empty())
+      continue;
+    int s = 0;
+    for (int v : kids[static_cast<size_t>(u)])
+      s += leaves[static_cast<size_t>(v)];
+    leaves[static_cast<size_t>(u)] = std::max(s, 1);
+  }
+
+  // Per-depth radii (virtual super-root at origin: real roots sit at depth 1).
+  std::vector<int> levelCount(static_cast<size_t>(maxDepth) + 2, 0);
+  for (int u : order)
+    ++levelCount[static_cast<size_t>(depth[static_cast<size_t>(u)]) + 1];
+  std::vector<float> radius(static_cast<size_t>(maxDepth) + 2, 0.0f);
+  for (size_t d = 1; d < radius.size(); ++d)
+    radius[d] = std::max(radius[d - 1] + hop * 1.8f,
+                         (float)levelCount[d] * hop / 6.2831853f);
+
+  // Mean depth (z centring).
+  double meanDepth = 0.0;
+  for (int u : order)
+    meanDepth += depth[static_cast<size_t>(u)];
+  if (!order.empty())
+    meanDepth /= (double)order.size();
+
+  // Place: roots partition the circle by subtree leaves.
+  double totalLeaves = 0.0;
+  for (int r : roots)
+    totalLeaves += leaves[static_cast<size_t>(r)];
+  double acc = 0.0;
+  for (int r : roots) {
+    const double span =
+        totalLeaves > 0.0
+            ? 6.28318530718 * leaves[static_cast<size_t>(r)] / totalLeaves
+            : 0.0;
+    std::vector<std::tuple<int, double, double>> st;
+    st.emplace_back(r, acc, acc + span);
+    acc += span;
+    while (!st.empty()) {
+      const auto t = st.back();
+      st.pop_back();
+      const int u = std::get<0>(t);
+      const double a0 = std::get<1>(t), a1 = std::get<2>(t);
+      const double mid = 0.5 * (a0 + a1);
+      const float rr =
+          radius[static_cast<size_t>(depth[static_cast<size_t>(u)]) + 1];
+      if (isFresh[static_cast<size_t>(u)]) {
+        outX[static_cast<size_t>(u)] = (float)(rr * std::cos(mid));
+        outY[static_cast<size_t>(u)] = (float)(rr * std::sin(mid));
+        outZ[static_cast<size_t>(u)] =
+            ((float)depth[static_cast<size_t>(u)] - (float)meanDepth) * hop;
+      }
+      double cacc = a0;
+      const double lu = (double)leaves[static_cast<size_t>(u)];
+      for (int v : kids[static_cast<size_t>(u)]) {
+        const double w =
+            lu > 0.0 ? (a1 - a0) * leaves[static_cast<size_t>(v)] / lu : 0.0;
+        st.emplace_back(v, cacc, cacc + w);
+        cacc += w;
+      }
+    }
+  }
+
+  // Anchor pass: fresh non-tree nodes group onto phyllotaxis discs around
+  // their first placed neighbor (ANY edge kind). 3 sweeps settle chains.
+  std::vector<char> placed(static_cast<size_t>(V), 0);
+  for (int u : order)
+    placed[static_cast<size_t>(u)] = 1;
   for (int i = 0; i < V; ++i)
     if (!isFresh[static_cast<size_t>(i)])
       placed[static_cast<size_t>(i)] = 1;
-
-  // Anchor reference-only singles to the centroid of their placed neighbors
-  // (ANY edge kind — REFERENCES/DOCUMENTS included). 3 sweeps lets short
-  // chains settle; leftovers fall back to their component well with a tiny
-  // golden-angle offset so exact stacks never occur.
+  auto posOf = [&](int v, float &x, float &y) {
+    if (isFresh[static_cast<size_t>(v)]) {
+      x = outX[static_cast<size_t>(v)];
+      y = outY[static_cast<size_t>(v)];
+    } else {
+      const GNode &n = G.nodes[G.visibleIdx[static_cast<size_t>(v)]];
+      x = n.lx;
+      y = n.ly;
+    }
+  };
   for (int sweep = 0; sweep < 3; ++sweep) {
-    bool moved = false;
+    std::map<int, std::vector<int>> groups; // ordered -> deterministic
     for (int i = 0; i < V; ++i) {
       if (placed[static_cast<size_t>(i)] || !isFresh[static_cast<size_t>(i)])
         continue;
-      float cx = 0.0f, cy = 0.0f;
-      int cnt = 0;
-      for (int v : adjAll[static_cast<size_t>(i)]) {
-        if (!placed[static_cast<size_t>(v)])
-          continue;
-        float nx = outX[static_cast<size_t>(v)],
-              ny = outY[static_cast<size_t>(v)];
-        if (!isFresh[static_cast<size_t>(v)]) {
-          const GNode &nn = G.nodes[G.visibleIdx[static_cast<size_t>(v)]];
-          nx = nn.lx;
-          ny = nn.ly;
+      int tgt = -1;
+      for (int v : adjAll[static_cast<size_t>(i)])
+        if (placed[static_cast<size_t>(v)]) {
+          tgt = v;
+          break;
         }
-        cx += nx;
-        cy += ny;
-        ++cnt;
-      }
-      if (cnt == 0)
-        continue;
-      const float ja = (float)i * GOLDEN;
-      outX[static_cast<size_t>(i)] =
-          cx / (float)cnt + spacing * 0.35f * std::cos(ja);
-      outY[static_cast<size_t>(i)] =
-          cy / (float)cnt + spacing * 0.35f * std::sin(ja);
-      placed[static_cast<size_t>(i)] = 1;
-      moved = true;
+      if (tgt >= 0)
+        groups[tgt].push_back(i);
     }
-    if (!moved)
+    if (groups.empty())
       break;
+    for (const auto &kv : groups) {
+      float cx, cy;
+      posOf(kv.first, cx, cy);
+      for (size_t k = 0; k < kv.second.size(); ++k) {
+        const int i = kv.second[k];
+        const float rr = hop * 0.7f * std::sqrt((float)k + 0.5f);
+        const float a = (float)k * GOLDEN;
+        outX[static_cast<size_t>(i)] = cx + rr * std::cos(a);
+        outY[static_cast<size_t>(i)] = cy + rr * std::sin(a);
+        placed[static_cast<size_t>(i)] = 1;
+      }
+    }
   }
+  // Leftovers (no placed neighbor): component well + golden offset.
   for (int i = 0; i < V; ++i) {
     if (placed[static_cast<size_t>(i)] || !isFresh[static_cast<size_t>(i)])
       continue;
     const int c = comp[static_cast<size_t>(i)];
     const float wx = c >= 0 ? well[static_cast<size_t>(c)].first : 0.0f;
     const float wy = c >= 0 ? well[static_cast<size_t>(c)].second : 0.0f;
-    const float ja = (float)i * GOLDEN;
-    outX[static_cast<size_t>(i)] = wx + spacing * 0.35f * std::cos(ja);
-    outY[static_cast<size_t>(i)] = wy + spacing * 0.35f * std::sin(ja);
+    const float a = (float)i * GOLDEN;
+    outX[static_cast<size_t>(i)] = wx + spacing * 0.35f * std::cos(a);
+    outY[static_cast<size_t>(i)] = wy + spacing * 0.35f * std::sin(a);
   }
 }
 
@@ -1483,8 +1518,9 @@ void rebuildForce(GraphTabState &G) {
   // Fresh nodes (no persisted/stashed position) get placed by a deterministic
   // algorithm; cached positions are never touched.
   //  - Assembly view: layered tree (Sugiyama-lite) — reads top-down.
-  //  - Mostly-fresh web: phyllotaxis discs per component + neighbor-anchored
-  //    reference singles (structuralSeed) — no collapse modes.
+  //  - Mostly-fresh web: balloon hierarchy over the CONTAINS forest +
+  //    neighbor-anchored reference singles (hierarchySeed) — pure
+  //    structure, sim frozen; no collapse/homogenization modes.
   //  - A few new nodes on a warm layout: cheap golden-angle append (below).
   std::vector<float> seedX, seedY, seedZ;
   bool haveSeed = false;
@@ -1492,9 +1528,10 @@ void rebuildForce(GraphTabState &G) {
     layeredAsmSeed(G, collROrd, S, seedX, seedY, seedZ);
     haveSeed = true;
   } else if (fresh * 2 > V) {
-    structuralSeed(G, adj, adjAll, comp, compSize, nComp, well, isFresh,
-                   190.0f * S, seedX, seedY, seedZ);
+    hierarchySeed(G, visOrd, adjAll, comp, well, isFresh, 190.0f * S, seedX,
+                  seedY, seedZ);
     haveSeed = true;
+    G.hierarchyLayout = true; // pure structure — freeze the sim below
   }
 
   const float GOLDEN = 2.39996323f; // golden angle (rad)
@@ -1639,7 +1676,11 @@ void rebuildForce(GraphTabState &G) {
     ++cb;
   }
 
-  G.force.reheat(fresh > (int)G.visibleIdx.size() / 2 ? 0.8f : 0.35f);
+  // Hierarchy mode: frozen — the balloon IS the layout; only manual drags
+  // change positions (persisted via the layout cache like before).
+  G.force.reheat(G.hierarchyLayout
+                     ? 0.0f
+                     : (fresh > (int)G.visibleIdx.size() / 2 ? 0.8f : 0.35f));
   // Auto-fit on settle only until the user first pans/zooms.
   G.fitOnSettle = !G.userNavigated;
   G.wasSettled = false;
@@ -2121,12 +2162,11 @@ int graphModeSegment(const char *id, bool view3d) {
   const char *icons[2] = {"plane", "view_cube"};
   const char *tips[2] = {
       "2D force layout (flat x/y). Drag nodes to rearrange.",
-      "3D force layout: physics runs on x/y/z. Right-drag orbits,\n"
-      "Shift+drag moves a node in depth."};
+      "3D force layout: physics runs on x/y/z. Left-drag orbits,\n"
+      "right-drag pans, Shift+drag moves a node in depth."};
   float segW[2], w = 0.0f;
   for (int i = 0; i < 2; ++i) {
-    segW[i] =
-        padX * 2.0f + iconSz + iconGap + ImGui::CalcTextSize(labels[i]).x;
+    segW[i] = padX * 2.0f + iconSz + iconGap + ImGui::CalcTextSize(labels[i]).x;
     w += segW[i];
   }
   const ImVec2 p0 = ImGui::GetCursorScreenPos();
@@ -2147,30 +2187,28 @@ int graphModeSegment(const char *id, bool view3d) {
     const bool hov = ImGui::IsItemHovered(), held = ImGui::IsItemActive();
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
       ImGui::SetTooltip("%s", tips[i]);
-    const ImDrawFlags corners = i == 0 ? ImDrawFlags_RoundCornersLeft
-                                       : ImDrawFlags_RoundCornersRight;
+    const ImDrawFlags corners =
+        i == 0 ? ImDrawFlags_RoundCornersLeft : ImDrawFlags_RoundCornersRight;
     if (active) {
       const float a = held ? 0.92f : hov ? 0.80f : 0.66f;
-      dl->AddRectFilled(s0, s1,
-                        ImGui::GetColorU32(ImVec4(palette.accent[0],
-                                                  palette.accent[1],
-                                                  palette.accent[2], a)),
-                        rnd, corners);
+      dl->AddRectFilled(
+          s0, s1,
+          ImGui::GetColorU32(ImVec4(palette.accent[0], palette.accent[1],
+                                    palette.accent[2], a)),
+          rnd, corners);
     } else if (hov) {
-      dl->AddRectFilled(s0, s1,
-                        ImGui::GetColorU32(ImVec4(palette.text[0],
-                                                  palette.text[1],
-                                                  palette.text[2],
-                                                  held ? 0.10f : 0.06f)),
-                        rnd, corners);
+      dl->AddRectFilled(
+          s0, s1,
+          ImGui::GetColorU32(ImVec4(palette.text[0], palette.text[1],
+                                    palette.text[2], held ? 0.10f : 0.06f)),
+          rnd, corners);
     }
     const ImU32 tcol =
         active ? IM_COL32(255, 255, 255, 255) : Palette::toU32(palette.text);
     const float content = iconSz + iconGap + ImGui::CalcTextSize(labels[i]).x;
     float cx = x + (segW[i] - content) * 0.5f;
-    ui::drawIconGlass(dl, icons[i],
-                      ImVec2(cx + iconSz * 0.5f, p0.y + h * 0.5f), iconSz,
-                      tcol, 0);
+    ui::drawIconGlass(dl, icons[i], ImVec2(cx + iconSz * 0.5f, p0.y + h * 0.5f),
+                      iconSz, tcol, 0);
     cx += iconSz + iconGap;
     dl->AddText(ImVec2(cx, p0.y + (h - ImGui::GetTextLineHeight()) * 0.5f),
                 tcol, labels[i]);
@@ -3016,20 +3054,24 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
     }
   }
 
-  // Pan: middle-drag or left-drag on empty background (never mid node-drag).
+  // Pan: middle-drag anywhere; in 3D right-drag pans, in 2D left-drag on
+  // empty background pans (3D swaps left/right per CAD convention).
   if (hovered && G.dragNode < 0 && G.dragCandidate < 0 &&
       (ImGui::IsMouseDragging(ImGuiMouseButton_Middle) ||
-       (ImGui::IsMouseDragging(ImGuiMouseButton_Left) && G.hoverId.empty() &&
-        !ImGui::GetIO().KeyCtrl))) {
+       (G.view3d && ImGui::IsMouseDragging(ImGuiMouseButton_Right)) ||
+       (!G.view3d && ImGui::IsMouseDragging(ImGuiMouseButton_Left) &&
+        G.hoverId.empty() && !ImGui::GetIO().KeyCtrl))) {
     G.userNavigated = true;
     ImVec2 d = ImGui::GetIO().MouseDelta;
     G.panX += d.x;
     G.panY += d.y;
   }
 
-  // Orbit: right-drag rotates the 3D projection (view3d only).
-  if (G.view3d && hovered && G.dragNode < 0 &&
-      ImGui::IsMouseDragging(ImGuiMouseButton_Right)) {
+  // Orbit: left-drag on empty background rotates the 3D projection
+  // (view3d only; swapped with pan per CAD convention).
+  if (G.view3d && hovered && G.dragNode < 0 && G.dragCandidate < 0 &&
+      G.hoverId.empty() && !ImGui::GetIO().KeyCtrl &&
+      ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
     G.userNavigated = true;
     ImVec2 d = ImGui::GetIO().MouseDelta;
     G.orbitYaw += d.x * 0.008f;
@@ -3229,13 +3271,14 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
           G.force.setPos(slot, (mp.x - origin.x - G.panX) / G.zoom,
                          (mp.y - origin.y - G.panY) / G.zoom);
         }
-        G.force.reheat(0.06f); // neighbours react while dragging
+        if (!G.hierarchyLayout)
+          G.force.reheat(0.06f); // neighbours react while dragging
       }
       ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
     } else {
       if (slot >= 0)
         G.force.setPinned(slot, false);
-      G.force.reheat(0.50f);
+      G.force.reheat(G.hierarchyLayout ? 0.0f : 0.50f);
       G.dragNode = -1;
     }
   }
@@ -3564,7 +3607,9 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
   {
     const char *mode = G.view3d ? "3D" : "2D";
     const char *bindings =
-        G.view3d ? "  |  right-drag orbit  |  Shift+drag depth" : "";
+        G.view3d
+            ? "  |  left-drag orbit  |  right-drag pan  |  Shift+drag depth"
+            : "";
     const ImVec2 ms = ImGui::CalcTextSize(mode);
     const ImVec2 bs = ImGui::CalcTextSize(bindings);
     const float padX = 8.0f * S, padY = 4.0f * S;
@@ -3879,7 +3924,9 @@ void plmDrawGraphPage(AppState &st) {
                                sizeof(G.search))) {
     G.centerPending = G.search[0] != 0;
     G.matchDirty = true;
-    G.force.reheat(0.12f); // matched nodes draw the eye as they settle
+    G.force.reheat(G.hierarchyLayout
+                       ? 0.0f
+                       : 0.12f); // matched nodes draw the eye as they settle
   }
   ImGui::SameLine();
   if (graphGlassButton("##graph_refresh", G.loading ? "Refreshing…" : "Refresh",
@@ -4038,9 +4085,9 @@ void plmDrawGraphPage(AppState &st) {
         ImGui::SameLine(0, 12 * S);
         // Active chip reads by accent text (the app font lacks dot glyphs).
         if (G.scopeDecomp)
-          ImGui::PushStyleColor(
-              ImGuiCol_Text, ImVec4(palette.accent[0], palette.accent[1],
-                                    palette.accent[2], 1.0f));
+          ImGui::PushStyleColor(ImGuiCol_Text,
+                                ImVec4(palette.accent[0], palette.accent[1],
+                                       palette.accent[2], 1.0f));
         if (ImGui::SmallButton("Parts##sc_parts")) {
           if (!G.scopeDecomp) {
             G.scopeDecomp = true;
@@ -4051,9 +4098,9 @@ void plmDrawGraphPage(AppState &st) {
           ImGui::PopStyleColor();
         ImGui::SameLine(0, 2 * S);
         if (!G.scopeDecomp)
-          ImGui::PushStyleColor(
-              ImGuiCol_Text, ImVec4(palette.accent[0], palette.accent[1],
-                                    palette.accent[2], 1.0f));
+          ImGui::PushStyleColor(ImGuiCol_Text,
+                                ImVec4(palette.accent[0], palette.accent[1],
+                                       palette.accent[2], 1.0f));
         if (ImGui::SmallButton("Internals##sc_int")) {
           if (G.scopeDecomp) {
             G.scopeDecomp = false;

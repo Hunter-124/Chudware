@@ -27,5 +27,5 @@ Webservice perf_probe).
 
 ## Definition of done
 
-- [ ] Measurable opens/s or tiny-op latency win on the ratchet, no regressions.
+- [x] Measurable opens/s or tiny-op latency win on the ratchet, no regressions.
 - [ ] gate.sh green; REFACTOR_LOG handoff; skip-with-reason is an acceptable close.

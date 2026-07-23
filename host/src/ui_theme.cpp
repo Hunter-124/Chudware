@@ -1116,20 +1116,27 @@ void drawScrollPill(ImDrawList* dl, const ImVec2& trackMin, const ImVec2& trackM
     // the same line so it reads as a minimal hairline scrollbar.
     const float trackThin = 2.0f * s;
     const float pillThick = trackThin;
+    const float outlineW = 1.0f * s;
     const ImU32 trackCol = ImGui::ColorConvertFloat4ToU32(
         ImVec4(surf.textTertiary.x, surf.textTertiary.y, surf.textTertiary.z, 0.16f));
+    // Accent-tinted pill with a thin, higher-alpha outline of the same hue so the bar reads as a
+    // distinct colored control against the glass background instead of a barely-there gray sliver.
     const ImU32 pillCol = ImGui::ColorConvertFloat4ToU32(
-        ImVec4(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, hovered ? 0.58f : 0.34f));
+        ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], hovered ? 0.85f : 0.55f));
+    const ImU32 pillOutline = ImGui::ColorConvertFloat4ToU32(
+        ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], hovered ? 1.0f : 0.85f));
     if (vertical) {
         const float cx = (trackMin.x + trackMax.x) * 0.5f;
         dl->AddLine(ImVec2(cx, trackMin.y), ImVec2(cx, trackMax.y), trackCol, trackThin);
-        dl->AddRectFilled(ImVec2(cx - pillThick * 0.5f, thumbA),
-                          ImVec2(cx + pillThick * 0.5f, thumbB), pillCol, pillThick * 0.5f);
+        const ImVec2 pmn(cx - pillThick * 0.5f, thumbA), pmx(cx + pillThick * 0.5f, thumbB);
+        dl->AddRectFilled(pmn, pmx, pillCol, pillThick * 0.5f);
+        dl->AddRect(pmn, pmx, pillOutline, pillThick * 0.5f, 0, outlineW);
     } else {
         const float cy = (trackMin.y + trackMax.y) * 0.5f;
         dl->AddLine(ImVec2(trackMin.x, cy), ImVec2(trackMax.x, cy), trackCol, trackThin);
-        dl->AddRectFilled(ImVec2(thumbA, cy - pillThick * 0.5f),
-                          ImVec2(thumbB, cy + pillThick * 0.5f), pillCol, pillThick * 0.5f);
+        const ImVec2 pmn(thumbA, cy - pillThick * 0.5f), pmx(thumbB, cy + pillThick * 0.5f);
+        dl->AddRectFilled(pmn, pmx, pillCol, pillThick * 0.5f);
+        dl->AddRect(pmn, pmx, pillOutline, pillThick * 0.5f, 0, outlineW);
     }
 }
 

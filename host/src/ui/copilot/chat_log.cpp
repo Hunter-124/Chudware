@@ -231,6 +231,15 @@ void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
     ImGui::SetCursorPosY(rowY + rowH);
     ImGui::Dummy(ImVec2(1.0f, 0.0f));
     ImGui::PopStyleVar();   // ItemSpacing -- pushed after BeginChild, must pop before EndChild
+    // Hover-copy glyph MUST be submitted while "##umsg" is still the current window: ImGui's
+    // hovered-window resolution grants overlapping screen space to the (deeper) child window,
+    // so an InvisibleButton added to the PARENT after EndChild silently loses every click here
+    // to the InputTextMultiline underneath — the copy button drew fine but never fired.
+    {
+        const ImVec2 wp = ImGui::GetWindowPos();
+        const ImVec2 ws = ImGui::GetWindowSize();
+        chatHoverCopyGlyph(ImRect(wp, ImVec2(wp.x + ws.x, wp.y + ws.y)), userBody);
+    }
     ImGui::EndChild();
     ImGui::PopStyleVar();   // ##umsg WindowPadding -- pushed before BeginChild, pops after
     ImRect bubble = endGlassBubble(gb);
@@ -246,7 +255,6 @@ void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
     }
     const std::string sel = chatInputSelection(textId);
     chatCopyContext(bubble, "##umsg_copy", userBody, userBody, sel);
-    chatHoverCopyGlyph(bubble, userBody);
 
     ImGui::Dummy(ImVec2(0, 4 * ui::uiScale));
 }
@@ -467,12 +475,18 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
             ImGui::Dummy(ImVec2(0, 2.0f * sc));
         }
         const ImGuiID textId = chatDrawSelectableText("##prose_sel", prose, chatSurf().textPrimary);
+        // Submitted before EndChild — see the comment on the user-bubble copy glyph in
+        // drawUserBlock() for why an after-EndChild button silently eats no clicks here.
+        {
+            const ImVec2 wp = ImGui::GetWindowPos();
+            const ImVec2 ws = ImGui::GetWindowSize();
+            chatHoverCopyGlyph(ImRect(wp, ImVec2(wp.x + ws.x, wp.y + ws.y)), prose);
+        }
         ImGui::EndChild();
         ImGui::PopStyleVar();  // ##prose WindowPadding
         ImRect proseRect = endGlassBubble(gb);
         const std::string sel = chatInputSelection(textId);
         chatCopyContext(proseRect, "##prose_copy", prose, prose, sel);
-        chatHoverCopyGlyph(proseRect, prose);
         ImGui::Dummy(ImVec2(0, 4 * ui::uiScale));
     }
 
@@ -547,6 +561,13 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
         ImGui::PopFont();
         // Body is the selectable detail (counts + first failure / verdict).
         const ImGuiID textId = chatDrawSelectableText("##partial_sel", body, chatSurf().textPrimary);
+        // Submitted before EndChild — see the comment on the user-bubble copy glyph in
+        // drawUserBlock() for why an after-EndChild button silently eats no clicks here.
+        {
+            const ImVec2 wp = ImGui::GetWindowPos();
+            const ImVec2 ws = ImGui::GetWindowSize();
+            chatHoverCopyGlyph(ImRect(wp, ImVec2(wp.x + ws.x, wp.y + ws.y)), body);
+        }
         ImGui::EndChild();
         ImRect cardRect = endGlassBubble(gb);
         ImGui::GetWindowDrawList()->AddRect(
@@ -554,7 +575,6 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
             8.0f * ui::uiScale, 0, ui::metrics::stroke(1.5f));
         const std::string sel = chatInputSelection(textId);
         chatCopyContext(cardRect, "##partial_copy", body, body, sel);
-        chatHoverCopyGlyph(cardRect, body);
     } else if (m.errKind != ERR_NONE) {
         std::string stopReason, errorDetail;
         for (const auto& a : m.activity) {
@@ -636,13 +656,19 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
                 ImGui::Dummy(ImVec2(0, 2.0f * sc));
             }
             const ImGuiID textId = chatDrawSelectableText("##err_sel", body, errCol);
+            // Submitted before EndChild — see the comment on the user-bubble copy glyph in
+            // drawUserBlock() for why an after-EndChild button silently eats no clicks here.
+            {
+                const ImVec2 wp = ImGui::GetWindowPos();
+                const ImVec2 ws = ImGui::GetWindowSize();
+                chatHoverCopyGlyph(ImRect(wp, ImVec2(wp.x + ws.x, wp.y + ws.y)), body);
+            }
             ImGui::EndChild();
             ImRect cardRect = endGlassBubble(gb);
             ImGui::GetWindowDrawList()->AddRect(cardRect.Min, cardRect.Max, ui::Palette::toU32(pal.statusErr),
                                                 8.0f * ui::uiScale, 0, ui::metrics::stroke(1.5f));
             const std::string sel = chatInputSelection(textId);
             chatCopyContext(cardRect, "##err_copy", body, body, sel);
-            chatHoverCopyGlyph(cardRect, body);
         }
         } // has something to show
     }

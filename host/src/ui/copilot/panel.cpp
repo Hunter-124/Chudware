@@ -1160,7 +1160,8 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
         // Slim chat-log gutters so bubbles/cards use the column width.
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(3.0f * ui::uiScale, 2.0f * ui::uiScale));
-        ImGui::BeginChild("chatlog", ImVec2(0, chatH), ImGuiChildFlags_None);
+        ImGui::BeginChild("chatlog", ImVec2(0, chatH), ImGuiChildFlags_None,
+                          ImGuiWindowFlags_NoScrollbar);
         if (st.showAISettingsOverlay) {
             drawAISettingsBody(st, busy);
         } else if (st.showTaskList) {
@@ -1176,6 +1177,7 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         const bool  logScrolled = !overlayOpen && ImGui::GetScrollY() > 0.5f;
         const ImVec2 logP0 = ImGui::GetWindowPos();
         const float  logVisW = ImGui::GetWindowSize().x;
+        ui::drawWindowPillScrollbarV(chatSurf());
         ImGui::EndChild();
 
         // Top fade mask over the conversation scroll viewport.

@@ -29,5 +29,5 @@ construction; keep the probe as a regression gate.
 ## Definition of done
 
 - [x] engine_oracle/ gone from the tree; zero Python engine processes spawn anywhere.
-- [ ] Routing table is single-path C++; flags removed from code + docs.
+- [x] Routing table is single-path C++; flags removed from code + docs.
 - [ ] Full gate green incl. WASM smoke + parity probe; REFACTOR_LOG handoff.

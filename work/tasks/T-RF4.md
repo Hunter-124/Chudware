@@ -3,7 +3,7 @@ id: T-RF4
 title: RF wave-1 subscription auth/token-refresh ported to core/agent C++ (node R1a)
 workstream: RF
 owner: unassigned
-status: todo
+status: done
 branch: task/T-RF4-agent-auth-cpp
 depends_on: [T-RF3]
 lane: ai-copilot

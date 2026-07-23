@@ -3,7 +3,7 @@ id: T-RF9
 title: RF wave-1 mode allow-list parity + leftover TODO seams (node R1f)
 workstream: RF
 owner: unassigned
-status: todo
+status: done
 branch: task/T-RF9-mode-parity
 depends_on: [T-RF3]
 lane: ai-copilot

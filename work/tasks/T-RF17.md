@@ -3,7 +3,7 @@ id: T-RF17
 title: RF stream-Z ECAD gaps cutover to core/ecad (node R4c)
 workstream: RF
 owner: unassigned
-status: todo
+status: done
 branch: task/T-RF17-ecad-gaps-cpp
 depends_on: [T-RF3]
 lane: ecad-firmware

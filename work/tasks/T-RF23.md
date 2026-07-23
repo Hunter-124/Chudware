@@ -3,7 +3,7 @@ id: T-RF23
 title: Interactive app exit hang — Chromium threads outlive CefShutdown (found in R0c)
 workstream: RF
 owner: unassigned
-status: todo
+status: done
 branch: task/T-RF23-cef-exit-hang
 depends_on: []
 lane: app-gui

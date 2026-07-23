@@ -487,10 +487,20 @@ int main(int argc, char** argv) {
     // a user double-clicks a .step+ (or any registered CAD/ECAD file) — launches the GUI and opens
     // that document through the normal deferred open pump (NOT a headless mode). Anything starting
     // with '-' is a flag handled above; a non-flag arg that names an existing file is the doc to open.
+    // T-RF23: ALL native exits go through the same hard-exit tail as --ui-screenshot — Chromium
+    // threads outlive CefShutdown() on this build and hang static/AtExit destruction on the
+    // interactive close path too. run_gui's teardown (chat persisted, workers stopped, docs
+    // autosaved) has fully completed by the time it returns, so skipping static dtors is safe.
+    auto hard_exit = [](int rc) -> int {
+        std::fflush(stdout);
+        std::fflush(stderr);
+        std::_Exit(rc);
+        return rc;  // unreachable; satisfies the compiler
+    };
     if (argc >= 2 && argv[1] && argv[1][0] != '-') {
         std::error_code ec;
         const char* openArg = std::filesystem::exists(argv[1], ec) ? argv[1] : nullptr;
-        return run_gui(nullptr, openArg);
+        return hard_exit(run_gui(nullptr, openArg));
     }
     // GUI opens immediately and provisions the runtime in-app (with progress) if needed.
 #ifdef __EMSCRIPTEN__
@@ -504,7 +514,11 @@ int main(int argc, char** argv) {
         console.log('boot: calling run_gui');
     });
 #endif
-    return run_gui(nullptr);
+#ifdef __EMSCRIPTEN__
+    return run_gui(nullptr);  // wasm: never hard-exit — the VM owns the lifecycle
+#else
+    return hard_exit(run_gui(nullptr));
+#endif
 #endif  // !__EMSCRIPTEN__
 
 }

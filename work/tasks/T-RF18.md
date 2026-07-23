@@ -3,7 +3,7 @@ id: T-RF18
 title: RF stream-Z sourcing/BOM/cost + parts providers cutover to core/ (node R4d)
 workstream: RF
 owner: unassigned
-status: todo
+status: done
 branch: task/T-RF18-sourcing-cpp
 depends_on: [T-RF3]
 lane: parts-sourcing

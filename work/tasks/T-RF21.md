@@ -3,7 +3,7 @@ id: T-RF21
 title: RF closeout — remove AI_CAD_CPP_* fallback flags, delete engine_oracle (node R5a)
 workstream: RF
 owner: integrator
-status: todo
+status: done
 branch: task/T-RF21-oracle-delete
 depends_on: [T-RF20]
 lane: platform-infra

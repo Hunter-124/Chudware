@@ -3,7 +3,7 @@ id: T-RF14
 title: RF wave-3 (stretch) doc_open mmap/zero-copy + tiny-op marshalling fast path (node R3b)
 workstream: RF
 owner: unassigned
-status: todo
+status: done
 branch: task/T-RF14-docio-mmap
 depends_on: [T-RF13]
 lane: modeling-core

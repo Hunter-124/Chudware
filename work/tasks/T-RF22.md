@@ -3,7 +3,7 @@ id: T-RF22
 title: RF closeout — final docs, contract index, cross-platform build check (node R5b)
 workstream: RF
 owner: integrator
-status: todo
+status: done
 branch: task/T-RF22-final-docs
 depends_on: [T-RF21]
 lane: platform-infra

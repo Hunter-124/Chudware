@@ -3,7 +3,7 @@ id: T-RF2
 title: RF wave-0 dead-code purge — services/worker dupes + orphaned ui/viewport (node R0b)
 workstream: RF
 owner: integrator
-status: todo
+status: done
 branch: task/T-RF2-dead-code-purge
 depends_on: []
 lane: platform-infra

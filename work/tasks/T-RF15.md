@@ -3,7 +3,7 @@ id: T-RF15
 title: RF stream-Z firmware fw_* cutover to core/ (node R4a)
 workstream: RF
 owner: unassigned
-status: todo
+status: done
 branch: task/T-RF15-firmware-cpp
 depends_on: [T-RF3]
 lane: ecad-firmware

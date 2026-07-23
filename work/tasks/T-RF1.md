@@ -3,7 +3,7 @@ id: T-RF1
 title: RF wave-0 docs + board reconciliation (node R0a)
 workstream: RF
 owner: integrator
-status: todo
+status: done
 branch: task/T-RF1-docs-reconcile
 depends_on: []
 lane: platform-infra

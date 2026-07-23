@@ -3,7 +3,7 @@ id: T-RF12
 title: RF wave-2 web degradation UX — CEF panels + explicit web_unsupported gating (node R2c)
 workstream: RF
 owner: unassigned
-status: todo
+status: done
 branch: task/T-RF12-web-degradation
 depends_on: [T-RF3, T-RF6]
 lane: app-gui

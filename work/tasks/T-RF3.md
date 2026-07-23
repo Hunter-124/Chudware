@@ -3,7 +3,7 @@ id: T-RF3
 title: RF wave-0 gate hardening — WASM smoke + web parity probe + check.py fatal (node R0c)
 workstream: RF
 owner: integrator
-status: todo
+status: done
 branch: task/T-RF3-gate-hardening
 depends_on: [T-RF1, T-RF2]
 lane: platform-infra

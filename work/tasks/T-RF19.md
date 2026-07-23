@@ -3,7 +3,7 @@ id: T-RF19
 title: RF stream-Z long-tail oracle modules cutover (node R4e)
 workstream: RF
 owner: unassigned
-status: todo
+status: done
 branch: task/T-RF19-longtail-cpp
 depends_on: [T-RF15, T-RF16, T-RF17, T-RF18]
 lane: modeling-core

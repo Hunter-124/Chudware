@@ -3,7 +3,7 @@ id: T-RF6
 title: RF wave-1 split legacy_chat.cpp god file + reconcile ai_workspace (node R1c)
 workstream: RF
 owner: unassigned
-status: todo
+status: done
 branch: task/T-RF6-copilot-split
 depends_on: [T-RF3]
 lane: ai-copilot

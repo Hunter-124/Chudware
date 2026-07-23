@@ -3,7 +3,7 @@ id: T-RF13
 title: RF wave-3 WASM adaptive-quality ladder (node R3a)
 workstream: RF
 owner: unassigned
-status: todo
+status: done
 branch: task/T-RF13-wasm-quality-ladder
 depends_on: [T-RF10, T-RF11, T-RF12]
 lane: app-gui

@@ -3,7 +3,7 @@ id: T-RF20
 title: RF stream-Z MCP + DAG thin-client flip — no engine imports in Python (node R4f)
 workstream: RF
 owner: unassigned
-status: todo
+status: done
 branch: task/T-RF20-thin-client-flip
 depends_on: [T-RF19, T-RF4, T-RF9]
 lane: platform-infra

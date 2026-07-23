@@ -3,7 +3,7 @@ id: T-RF16
 title: RF stream-Z CFD/LBM sim_run_flow + sim_cancel cutover to core/ (node R4b)
 workstream: RF
 owner: unassigned
-status: todo
+status: done
 branch: task/T-RF16-cfd-cpp
 depends_on: [T-RF3]
 lane: simulation

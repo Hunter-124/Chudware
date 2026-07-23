@@ -3,7 +3,7 @@ id: T-RF10
 title: RF wave-2 GUI feedback batch — RESCOPED 2026-07-22 (original 15 items already landed)
 workstream: RF
 owner: unassigned
-status: todo
+status: done
 branch: task/T-RF10-gui-feedback-batch
 depends_on: [T-RF5, T-RF6]
 lane: app-gui

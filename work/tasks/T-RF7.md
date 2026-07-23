@@ -3,7 +3,7 @@ id: T-RF7
 title: RF wave-1 single event-schema + prompt-catalog source (node R1d)
 workstream: RF
 owner: unassigned
-status: todo
+status: done
 branch: task/T-RF7-event-schema
 depends_on: [T-RF3]
 lane: ai-copilot

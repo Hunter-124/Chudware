@@ -3,7 +3,7 @@ id: T-RF11
 title: RF wave-2 app.cpp dispatch decomposition — per-workspace handler tables (node R2b)
 workstream: RF
 owner: unassigned
-status: todo
+status: done
 branch: task/T-RF11-dispatch-decomp
 depends_on: [T-RF6]
 lane: app-gui

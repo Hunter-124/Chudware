@@ -3931,3 +3931,29 @@ links neutralized in-place where touched. **Outside-docs references the integrat
 `AGENTS.md` references `docs/PLAN.md` (gone since bb29af1c) and `docs/BUILD_WINDOWS.md` (now
 `docs/reference/BUILD_WINDOWS.md`); numerous `work/tasks/*` records cite pruned docs (historical
 board entries — leave as history).
+
+---
+
+## T-RF23 + T-RF22 — final leftovers (2026-07-23, integrator)
+
+**T-RF23 (interactive exit hang).** host/src/main.cpp: every native exit path now goes
+through a shared `hard_exit` tail (fflush + std::_Exit) after run_gui returns — the same
+escape the --ui-screenshot path already used, now justified once in a comment block
+instead of special-cased. run_gui's teardown (chat persisted, workers stopped, docs
+autosaved) completes before it returns, so skipping static dtors is safe; the wasm
+build keeps the normal return (the VM owns the lifecycle). Verified live: Xvfb +
+xdotool windowclose on the interactive GUI → process exits within ~8s (previously
+lingered on orphaned Chromium threads after CefShutdown).
+**T-RF22 (Windows verification).** No MSVC toolchain exists on this box (both Windows
+presets are MSVC-only) — all wave-touched C++ (core/ecad/session.cpp, core/sim/spice.cpp,
+core/api/libaicad.cpp, host/src/main.cpp) passes `x86_64-w64-mingw32-g++ -fsyntax-only`
+for the Windows target with zero errors. A real MSVC build still needs a Windows host;
+recorded on the task (work.py note) instead of faked.
+**Docs wave (user request, agents 44+45).** docs/ pruned 80→55 files (24 stale docs +
+2 dirs deleted: HANDOFF_*, dated audits/sprints, retired ui/imgui specs; survivors
+organized under design/ reference/ plans/ review/; root keeps SW_PARITY_SPEC.md
+(gate-read), PORT_LEDGER.md, REFACTOR_LOG.md, AI_TOOLING_MASTER_PLAN.md
+(contract-referenced)). README.md + ARCHITECTURE.md rewritten to the post-cutover
+reality; CONTRIBUTING.md refreshed; stale PROMPT.txt deleted; all cross-references
+fixed (AGENTS.md, contracts/sim_handoff.md, code comments). Board: every T-RF1–T-RF23
+DoD box checked (status flip to done is the human merge-time action per work/ policy).

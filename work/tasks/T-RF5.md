@@ -3,7 +3,7 @@ id: T-RF5
 title: RF wave-1 single agent entry — kill legacy agent_design path (node R1b)
 workstream: RF
 owner: unassigned
-status: todo
+status: done
 branch: task/T-RF5-single-agent-entry
 depends_on: [T-RF4]
 lane: ai-copilot

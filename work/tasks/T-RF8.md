@@ -3,7 +3,7 @@ id: T-RF8
 title: RF wave-1 MCP god-file split + dual-import shim removal (node R1e)
 workstream: RF
 owner: unassigned
-status: todo
+status: done
 branch: task/T-RF8-mcp-split
 depends_on: [T-RF3]
 lane: ai-copilot

@@ -2106,6 +2106,88 @@ bool graphGlassButton(const char *id, const char *label, bool accent = false,
   return clicked;
 }
 
+// Segmented 2D|3D mode switch: two segments under one shared glass frame;
+// the active segment uses the same accent fill as an accent graphGlassButton
+// (the active view-chip style). Returns 0 when 2D was clicked, 1 for 3D,
+// -1 otherwise.
+int graphModeSegment(const char *id, bool view3d) {
+  const float S = ui::uiScale;
+  ImDrawList *dl = ImGui::GetWindowDrawList();
+  const float h = ImGui::GetFrameHeight();
+  const float iconSz = 14.0f * S;
+  const float iconGap = 5.0f * S;
+  const float padX = 10.0f * S;
+  const char *labels[2] = {"2D", "3D"};
+  const char *icons[2] = {"plane", "view_cube"};
+  const char *tips[2] = {
+      "2D force layout (flat x/y). Drag nodes to rearrange.",
+      "3D force layout: physics runs on x/y/z. Right-drag orbits,\n"
+      "Shift+drag moves a node in depth."};
+  float segW[2], w = 0.0f;
+  for (int i = 0; i < 2; ++i) {
+    segW[i] =
+        padX * 2.0f + iconSz + iconGap + ImGui::CalcTextSize(labels[i]).x;
+    w += segW[i];
+  }
+  const ImVec2 p0 = ImGui::GetCursorScreenPos();
+  const ImVec2 p1(p0.x + w, p0.y + h);
+  ui::glassBackground(dl, p0, p1, 9.0f); // one shared frame
+  const float rnd = 9.0f * S;
+  int clicked = -1;
+  float x = p0.x;
+  ImGui::PushID(id);
+  for (int i = 0; i < 2; ++i) {
+    const bool active = (i == 1) == view3d;
+    const ImVec2 s0(x, p0.y), s1(x + segW[i], p0.y + h);
+    ImGui::SetCursorScreenPos(s0);
+    ImGui::PushID(i);
+    if (ImGui::InvisibleButton("##seg", ImVec2(segW[i], h)))
+      clicked = i;
+    ImGui::PopID();
+    const bool hov = ImGui::IsItemHovered(), held = ImGui::IsItemActive();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+      ImGui::SetTooltip("%s", tips[i]);
+    const ImDrawFlags corners = i == 0 ? ImDrawFlags_RoundCornersLeft
+                                       : ImDrawFlags_RoundCornersRight;
+    if (active) {
+      const float a = held ? 0.92f : hov ? 0.80f : 0.66f;
+      dl->AddRectFilled(s0, s1,
+                        ImGui::GetColorU32(ImVec4(palette.accent[0],
+                                                  palette.accent[1],
+                                                  palette.accent[2], a)),
+                        rnd, corners);
+    } else if (hov) {
+      dl->AddRectFilled(s0, s1,
+                        ImGui::GetColorU32(ImVec4(palette.text[0],
+                                                  palette.text[1],
+                                                  palette.text[2],
+                                                  held ? 0.10f : 0.06f)),
+                        rnd, corners);
+    }
+    const ImU32 tcol =
+        active ? IM_COL32(255, 255, 255, 255) : Palette::toU32(palette.text);
+    const float content = iconSz + iconGap + ImGui::CalcTextSize(labels[i]).x;
+    float cx = x + (segW[i] - content) * 0.5f;
+    ui::drawIconGlass(dl, icons[i],
+                      ImVec2(cx + iconSz * 0.5f, p0.y + h * 0.5f), iconSz,
+                      tcol, 0);
+    cx += iconSz + iconGap;
+    dl->AddText(ImVec2(cx, p0.y + (h - ImGui::GetTextLineHeight()) * 0.5f),
+                tcol, labels[i]);
+    x += segW[i];
+  }
+  ImGui::PopID();
+  // Segment divider.
+  dl->AddLine(ImVec2(p0.x + segW[0], p0.y + 5.0f * S),
+              ImVec2(p0.x + segW[0], p1.y - 5.0f * S),
+              ImGui::GetColorU32(ImVec4(palette.textDisabled[0],
+                                        palette.textDisabled[1],
+                                        palette.textDisabled[2], 0.35f)));
+  ImGui::SetCursorScreenPos(p0);
+  ImGui::Dummy(ImVec2(w, h)); // reserve the rect the buttons were drawn over
+  return clicked;
+}
+
 // Resolve a graph node path to an absolute filesystem path under the project.
 std::string resolveNodeAbsPath(AppState &st, const GNode &n) {
   if (n.path.empty())
@@ -3477,6 +3559,30 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
   drawLegend(dl, ImVec2(origin.x + 12 * S, origin.y + canvasSz.y - 200 * S),
              projectScope);
 
+  // Mode badge top-left: at-a-glance 2D/3D state; in 3D it also lists the
+  // actual bindings (right-drag orbits, Shift+drag moves a node in depth).
+  {
+    const char *mode = G.view3d ? "3D" : "2D";
+    const char *bindings =
+        G.view3d ? "  |  right-drag orbit  |  Shift+drag depth" : "";
+    const ImVec2 ms = ImGui::CalcTextSize(mode);
+    const ImVec2 bs = ImGui::CalcTextSize(bindings);
+    const float padX = 8.0f * S, padY = 4.0f * S;
+    const ImVec2 b0(origin.x + 10.0f * S, origin.y + 10.0f * S);
+    const ImVec2 b1(b0.x + ms.x + bs.x + padX * 2.0f,
+                    b0.y + ms.y + padY * 2.0f);
+    dl->AddRectFilled(b0, b1, Palette::toU32(palette.overlayBg), 7.0f * S);
+    dl->AddRect(b0, b1, Palette::toU32(palette.overlayBorder), 7.0f * S);
+    const float ty = b0.y + padY;
+    dl->AddText(ImVec2(b0.x + padX, ty),
+                G.view3d ? Palette::toU32(palette.accent)
+                         : Palette::toU32(palette.overlayText),
+                mode);
+    if (bindings[0])
+      dl->AddText(ImVec2(b0.x + padX + ms.x, ty),
+                  Palette::toU32(palette.overlayText), bindings);
+  }
+
   dl->PopClipRect();
 
   // Search-driven center: when the user types a filter, center on first VISIBLE
@@ -3781,11 +3887,15 @@ void plmDrawGraphPage(AppState &st) {
       !G.loading) {
     requestGraph(st, /*force=*/true);
   }
+  if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+    ImGui::SetTooltip("Re-fetch the project graph from the backend.");
   ImGui::SameLine();
   if (graphGlassButton("##graph_fit", "Fit", false, 70 * S)) {
     G.fitRequested = true; // the ONLY auto-fit path left
     G.userNavigated = false;
   }
+  if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+    ImGui::SetTooltip("Frame all visible nodes in the canvas.");
   ImGui::SameLine();
   // Hide archive/stale — ON by default; toggling re-fetches with
   // include_archive flipped so the backend walk policy matches the UI.
@@ -3816,9 +3926,10 @@ void plmDrawGraphPage(AppState &st) {
   }
   ImGui::SameLine();
   // View mode: list vs layered DAG. Auto-list only if visible set is huge.
+  // Accent fill marks it as the ACTIVE view chip (matches the 2D|3D segment).
   {
     const char *modeLabel = G.listView ? "List view" : "Graph view";
-    if (graphGlassButton("##graph_view_mode", modeLabel, false, 100 * S)) {
+    if (graphGlassButton("##graph_view_mode", modeLabel, true, 100 * S)) {
       G.listView = !G.listView;
       G.listViewUserOverride = true;
       if (!G.listView)
@@ -3832,21 +3943,16 @@ void plmDrawGraphPage(AppState &st) {
     }
   }
   ImGui::SameLine();
-  // 3D projection toggle: same layout, viewed with a depth dimension.
+  // Dimension mode: segmented 2D|3D switch — the accent segment is the
+  // active mode (no glyph badges; labels/icons only).
   {
-    if (graphGlassButton("##graph_3d", G.view3d ? "3D \u25cf" : "3D", false,
-                         60 * S)) {
+    const int seg = graphModeSegment("##graph_dim", G.view3d);
+    if (seg >= 0 && (seg == 1) != G.view3d) {
       G.view3d = !G.view3d;
       G.layoutDirty = true; // rebuild the sim in the new dimensionality
       // Refit so the projected bounds frame correctly on entry.
       G.fitRequested = true;
       G.userNavigated = false;
-    }
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
-      ImGui::SetTooltip(
-          "True 3D force layout: physics runs on x/y/z (right-drag orbits,\n"
-          "Shift+drag moves a node in depth). Depth seeds from a structural\n"
-          "BFS gradient — deterministic, no randomness.");
     }
   }
   if (!G.generatedAt.empty()) {
@@ -3930,21 +4036,32 @@ void plmDrawGraphPage(AppState &st) {
       if (hasBomChildren(G, G.scopeDocId) ||
           (it != G.idIndex.end() && G.nodes[it->second].kind == "assembly")) {
         ImGui::SameLine(0, 12 * S);
-        if (ImGui::SmallButton(G.scopeDecomp ? "Parts\u2009\u25cf##sc_parts"
-                                             : "Parts##sc_parts")) {
+        // Active chip reads by accent text (the app font lacks dot glyphs).
+        if (G.scopeDecomp)
+          ImGui::PushStyleColor(
+              ImGuiCol_Text, ImVec4(palette.accent[0], palette.accent[1],
+                                    palette.accent[2], 1.0f));
+        if (ImGui::SmallButton("Parts##sc_parts")) {
           if (!G.scopeDecomp) {
             G.scopeDecomp = true;
             rebuildVisible(G);
           }
         }
+        if (G.scopeDecomp)
+          ImGui::PopStyleColor();
         ImGui::SameLine(0, 2 * S);
-        if (ImGui::SmallButton(!G.scopeDecomp ? "Internals\u2009\u25cf##sc_int"
-                                              : "Internals##sc_int")) {
+        if (!G.scopeDecomp)
+          ImGui::PushStyleColor(
+              ImGuiCol_Text, ImVec4(palette.accent[0], palette.accent[1],
+                                    palette.accent[2], 1.0f));
+        if (ImGui::SmallButton("Internals##sc_int")) {
           if (G.scopeDecomp) {
             G.scopeDecomp = false;
             rebuildVisible(G);
           }
         }
+        if (!G.scopeDecomp)
+          ImGui::PopStyleColor();
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
           ImGui::SetTooltip(
               "Parts: subassembly/part decomposition with instance counts.\n"
@@ -4012,8 +4129,8 @@ void plmDrawGraphPage(AppState &st) {
   }
   ImGui::SameLine();
   // Assembly structure view: containment/instance tree + mates, layered.
-  if (graphGlassButton("##asm_view", G.asmView ? "Assembly \u25cf" : "Assembly",
-                       false, 0.0f)) {
+  // Accent fill while active (same active-chip style as the 2D|3D segment).
+  if (graphGlassButton("##asm_view", "Assembly", G.asmView, 0.0f)) {
     toggleAsmView(G);
   }
   if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {

@@ -21,12 +21,12 @@
 
 namespace ui {
 
-// ---- header: logo row + collapse + [Chat L | Sessions C | Settings R] + status ----
-// Copilot vertical-collapse state (file scope so the header's collapse chevron and drawAIPanel's
-// height animation share it). Mirrors the FeatureManager collapse (T-G21: rolls UP to this header
-// strip instead of shrinking to a pill in both axes). Seeded from st.settings.copilotCollapsed on
-// drawAIPanel's first call (see s_cpInited there) so a collapsed column stays collapsed across
-// restarts.
+// ---- header: one row — [counter chip] [cube Chudware] [icon tabs] .. [collapse chevron] ----
+// Copilot collapse state (file scope so the header's collapse chevron and drawAIPanel's width
+// animation share it). The column slides OUT to the right screen edge (horizontal analogue of
+// the FeatureManager roll-up; see ui::PanelCollapseAnim::tickW), leaving a slim rail whose only
+// content is the expand chevron. Seeded from st.settings.copilotCollapsed on drawAIPanel's
+// first call (see s_cpInited there) so a collapsed column stays collapsed across restarts.
 static bool s_cpCollapsed = false;
 // In-column AI-settings overlay (header Settings). Mutually exclusive with showSessionsPicker —
 // same swap pattern: hide chat log, fill the body with the compact settings form
@@ -53,11 +53,59 @@ static void copilotTaskProgress(AppState& st, int& done, int& total) {
     }
 }
 
-static void drawCopilotHeader(AppState& st, bool busy) {
-    const auto& pal = ui::palette;
+// Collapse/expand chevron chip, drawn at the current cursor INSIDE the header row (it used to
+// be a floating window parked outside the column's left edge). pointsRight=true shows ">>",
+// the collapse direction (the column slides out to the right screen edge); false shows "<<"
+// (slide back in). Hand-drawn double chevron: the atlas has no chevron tile and the UI font
+// lacks glyph characters — the same recipe as the FM "<<" chip and this chip's old floating
+// incarnation.
+static bool drawCpChevronChip(float size, bool pointsRight) {
     const float sc = ui::uiScale;
-    const ImGuiStyle& style = ImGui::GetStyle();
+    const ImVec2 b0 = ImGui::GetCursorScreenPos();
+    const bool clicked = ImGui::InvisibleButton("##cp_collapse", ImVec2(size, size));
+    const bool hov = ImGui::IsItemHovered();
+    ImDrawList* wdl = ImGui::GetWindowDrawList();
+    const ImVec2 b1(b0.x + size, b0.y + size);
+    // Shared collapse-chip recipe (must match FM ##lp_collapse):
+    // rest wash 0.32 / hover 0.50, textPrimary glyph, 1.85px stroke.
+    ui::glassRowBackground(wdl, b0, b1, 7.0f, false, hov, hov ? 0.50f : 0.32f);
+    const ImU32 cCol = ImGui::ColorConvertFloat4ToU32(chatSurf().textPrimary);
+    const ImVec2 cc(b0.x + size * 0.5f, b0.y + size * 0.5f);
+    const float ca = 3.5f * sc;
+    const float stroke = 1.85f * sc;
+    const float dir = pointsRight ? 1.0f : -1.0f;
+    for (int i = 0; i < 2; ++i) {
+        const float ox = (i == 0 ? -2.5f : 2.5f) * sc * dir;
+        wdl->AddLine(ImVec2(cc.x + ox - dir * ca * 0.5f, cc.y - ca),
+                     ImVec2(cc.x + ox + dir * ca * 0.5f, cc.y), cCol, stroke);
+        wdl->AddLine(ImVec2(cc.x + ox + dir * ca * 0.5f, cc.y),
+                     ImVec2(cc.x + ox - dir * ca * 0.5f, cc.y + ca), cCol, stroke);
+    }
+    if (hov) ImGui::SetTooltip(pointsRight ? "Collapse" : "Expand");
+    return clicked;
+}
+
+static void drawCopilotHeader(AppState& st, bool busy, bool railMode) {
+    const float sc = ui::uiScale;
     const float lh = ImGui::GetTextLineHeight();
+
+    const float chevSz = 26.0f * sc;   // same 26dp chip recipe as FM's
+    auto toggleCollapse = [&](bool chipPointsRight) {
+        if (drawCpChevronChip(chevSz, chipPointsRight)) {
+            s_cpCollapsed = !s_cpCollapsed;
+            st.settings.copilotCollapsed = s_cpCollapsed;
+            saveSettings(st.settings);
+        }
+    };
+
+    // ---- Collapsed rail: the entire header is the expand chevron, centered in the rail ----
+    if (railMode) {
+        ImGui::Dummy(ImVec2(0, 6.0f * sc));
+        ImGui::SetCursorPosX((ImGui::GetContentRegionAvail().x - chevSz) * 0.5f);
+        toggleCollapse(false);   // "<<" — slide the column back in from the right edge
+        ImGui::Dummy(ImVec2(0, 6.0f * sc));
+        return;
+    }
 
     ImFont* wordF = st.fonts.medium ? st.fonts.medium : nullptr;
     float wordLh = lh;
@@ -73,97 +121,58 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         IconUV icon = (iconName && iconName[0]) ? ui::getIcon(iconName, 20) : IconUV{};
         const float padX = 6.0f * sc;
         const float tw = ImGui::CalcTextSize(label).x;
-        const float contentW = (icon.valid ? iconSz + iconGap : 0.0f) + tw;
+        const float contentW = (icon.valid ? iconSz + (tw > 0.0f ? iconGap : 0.0f) : 0.0f) + tw;
         return contentW + padX * 2.0f;
     };
-    const float chatW = measureBtn("Chat", "ai_panel");
-    const float sessW = measureBtn("Sessions", "history");
-    const float gearW = measureBtn("Settings", "settings");
-    const float minGap = style.ItemSpacing.x;
-    const float rightInset = ui::metrics::U(0.5f);
-    // Collapse chip parks OUTSIDE the column's left edge (see screenshot): same 26dp
-    // recipe as FM's «, but hanging in the viewport gutter rather than eating header
-    // inset. Content therefore uses a symmetric left/right inset — no chev reserve.
-    const float chevSz  = 26.0f * sc;
-    const float chevPad = 8.0f * sc;       // gap between chip right edge and column left
-    const float leftInset = rightInset;
+
+    const float leftInset = ui::metrics::U(0.5f);
+    const float rightInset = leftInset;
     const float colW = ImGui::GetContentRegionAvail().x;
+    const float gap = 6.0f * sc;
 
-    // ---- Collapse chip (floating window just left of the column) ----
-    {
-        const ImVec2 winP0 = ImGui::GetWindowPos();
-        // Vertically match the old in-header placement (content top + 8dp).
-        const ImVec2 c0(winP0.x - chevSz - chevPad,
-                        winP0.y + ImGui::GetWindowContentRegionMin().y + 8.0f * sc);
-        ImGui::SetNextWindowPos(c0, ImGuiCond_Always);
-        ImGui::SetNextWindowSize(ImVec2(chevSz, chevSz), ImGuiCond_Always);
-        ImGui::SetNextWindowBgAlpha(0.0f);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 7.0f);
-        const ImGuiWindowFlags chipFlags =
-            ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoNav |
-            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
-            ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking |
-            ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoBringToFrontOnFocus |
-            ImGuiWindowFlags_NoBackground;
-        if (ImGui::Begin("##cp_collapse_chip", nullptr, chipFlags)) {
-            const ImVec2 b0 = ImGui::GetCursorScreenPos();
-            const bool cClicked = ImGui::InvisibleButton("##cp_collapse", ImVec2(chevSz, chevSz));
-            const bool cHover = ImGui::IsItemHovered();
-            ImDrawList* wdl = ImGui::GetWindowDrawList();
-            const ImVec2 b1(b0.x + chevSz, b0.y + chevSz);
-            // Shared collapse-chip recipe (must match FM ##lp_collapse):
-            // rest wash 0.32 / hover 0.50, textPrimary glyph, 1.85px stroke.
-            ui::glassRowBackground(wdl, b0, b1, 7.0f, false, cHover,
-                                   cHover ? 0.50f : 0.32f);
-            const ImU32 cCol = ImGui::ColorConvertFloat4ToU32(chatSurf().textPrimary);
-            const ImVec2 cc(b0.x + chevSz * 0.5f, b0.y + chevSz * 0.5f);
-            const float ca = 3.5f * sc;
-            const float stroke = 1.85f * sc;
-            // "»" double chevron (mirror of FM's "«")
-            for (int i = 0; i < 2; ++i) {
-                const float ox = (i == 0 ? -2.5f : 2.5f) * sc;
-                wdl->AddLine(ImVec2(cc.x + ox - ca * 0.5f, cc.y - ca),
-                             ImVec2(cc.x + ox + ca * 0.5f, cc.y), cCol, stroke);
-                wdl->AddLine(ImVec2(cc.x + ox + ca * 0.5f, cc.y),
-                             ImVec2(cc.x + ox - ca * 0.5f, cc.y + ca), cCol, stroke);
-            }
-            if (cHover) ImGui::SetTooltip(s_cpCollapsed ? "Expand" : "Collapse");
-            if (cClicked) {
-                s_cpCollapsed = !s_cpCollapsed;
-                st.settings.copilotCollapsed = s_cpCollapsed;
-                saveSettings(st.settings);
-            }
-        }
-        ImGui::End();
-        ImGui::PopStyleVar(3);
-    }
+    int tlDone = 0, tlTotal = 0;
+    copilotTaskProgress(st, tlDone, tlTotal);
+    char tlLabel[24];
+    std::snprintf(tlLabel, sizeof(tlLabel), "%d/%d", tlDone, tlTotal);
+    const float tlFullW = measureBtn(tlLabel, "plan_board");
+    const float tlIconW = measureBtn("", "plan_board");
+    const float tabW = measureBtn("", "ai_panel");   // all four tabs share the icon-only width
+    const float cubeSz = std::min(lh, wordLh) * 0.95f;
+    const float logoGap = 3.0f * sc;
+    if (wordF) ImGui::PushFont(wordF);
+    const float wmW = ImGui::CalcTextSize("Chudware").x;
+    if (wordF) ImGui::PopFont();
 
-    // ---- Row 1: [Tasks] .. centered Chudware .. [Artifacts]  (clears leftInset) ----
-    {
-        const float logoGap = 3.0f * sc;
-        const float cubeSz = std::min(lh, wordLh) * 0.95f;
-        if (wordF) ImGui::PushFont(wordF);
-        const float wmW = ImGui::CalcTextSize("Chudware").x;
-        if (wordF) ImGui::PopFont();
-        const float logoW = cubeSz + logoGap + wmW;
-        ImGui::Dummy(ImVec2(0, 6.0f * sc));
-        const float rowTop1 = ImGui::GetCursorPosY();
-        const float bh = lh + 4.0f * sc;
-        auto cy1 = [&](float h) { ImGui::SetCursorPosY(rowTop1 + (wordLh - h) * 0.5f); };
+    // Single row: [counter chip] [cube Chudware] [Chat][Sessions][Artifacts][Settings] .. [>>].
+    // The tabs are icon-only (labels live in their tooltips — the same icon-rail pattern as the
+    // FM column) so the row fits the default column width. When the user narrows the column the
+    // row sheds the wordmark, then the counter label, then the cube, then the counter chip
+    // before anything clips.
+    const float budgetW = colW - leftInset - rightInset - gap - chevSz;
+    bool showTasks = true, showCount = true, showCube = true, showWord = true;
+    auto rowW = [&]() {
+        return (showTasks ? (showCount ? tlFullW : tlIconW) + gap : 0.0f) +
+               (showCube ? cubeSz : 0.0f) + (showWord ? logoGap + wmW : 0.0f) + gap +
+               4.0f * tabW + 3.0f * gap;
+    };
+    if (rowW() > budgetW) showWord = false;
+    if (rowW() > budgetW) showCount = false;
+    if (rowW() > budgetW) showCube = false;
+    if (rowW() > budgetW) showTasks = false;
 
-        int tlDone = 0, tlTotal = 0;
-        copilotTaskProgress(st, tlDone, tlTotal);
-        char tlLabel[24];
-        std::snprintf(tlLabel, sizeof(tlLabel), "%d/%d", tlDone, tlTotal);
-        const float tlW = measureBtn(tlLabel, "plan_board");
-        const float artW = measureBtn("Artifacts", "team");
+    ImGui::Dummy(ImVec2(0, 6.0f * sc));
+    const float rowTop = ImGui::GetCursorPosY();
+    const float rowH = std::max(std::max(wordLh, ImGui::GetFrameHeight()), chevSz);
+    auto cy = [&](float h) { ImGui::SetCursorPosY(rowTop + (rowH - h) * 0.5f); };
+    float x = leftInset;
 
-        cy1(bh);
-        ImGui::SetCursorPosX(leftInset);
+    // -- counter chip (Tasks) --
+    if (showTasks) {
+        cy(ImGui::GetFrameHeight());
+        ImGui::SetCursorPosX(x);
         if (busy) ImGui::BeginDisabled();
-        if (drawHeaderTextButton("##hdr_tasks", tlLabel, st.showTaskList, tlW, "plan_board")) {
+        if (drawHeaderTextButton("##hdr_tasks", showCount ? tlLabel : "", st.showTaskList,
+                                 showCount ? tlFullW : tlIconW, "plan_board")) {
             const bool open = !st.showTaskList;
             st.showTaskList = open;
             if (open) { st.showArtifacts = st.showSessionsPicker = st.showAISettingsOverlay = false; }
@@ -171,104 +180,82 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         if (busy) ImGui::EndDisabled();
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Tasks \xc2\xb7 %d of %d done \xc2\xb7 click for the task list", tlDone, tlTotal);
+        x += (showCount ? tlFullW : tlIconW) + gap;
+    }
 
+    // -- status cube + wordmark --
+    if (showCube || showWord) {
+        const auto& pal = ui::palette;
         const float* statusCol = pal.accentMid;  const char* statusTip = "Idle";
         if (st.statusKind == 2) { statusCol = pal.statusErr; statusTip = "Error"; }
         else if (busy || st.agentV2Running || activeConversationRunning(st)) {
             statusCol = pal.accent; statusTip = "Running";
         }
         const ImVec4 statusTint(statusCol[0], statusCol[1], statusCol[2], 1.0f);
-
-        float logoLeft = (colW - logoW) * 0.5f;
-        logoLeft = std::max(leftInset + tlW + 6.0f * sc, logoLeft);
-        logoLeft = std::min(logoLeft, colW - rightInset - artW - logoW - 6.0f * sc);
-        ImGui::SameLine(logoLeft);
-        {
+        if (showCube) {
             IconUV cube = ui::getIcon("context_cube", 20);
-            cy1(cubeSz);
+            cy(cubeSz);
+            ImGui::SetCursorPosX(x);
             if (cube.valid) {
                 ImGui::Image(cube.texId, ImVec2(cubeSz, cubeSz), cube.uv0, cube.uv1, statusTint);
             } else {
                 ImGui::Dummy(ImVec2(cubeSz, cubeSz));
             }
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", statusTip);
-            ImGui::SameLine(0, logoGap);
+            x += cubeSz + (showWord ? logoGap : gap);
         }
-        if (wordF) ImGui::PushFont(wordF);
-        cy1(wordLh);
-        ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textPrimary);
-        ImGui::TextUnformatted("Chudware");
-        ImGui::PopStyleColor();
-        if (wordF) ImGui::PopFont();
-
-        ImGui::SameLine(colW - rightInset - artW);
-        cy1(bh);
-        if (busy) ImGui::BeginDisabled();
-        if (drawHeaderTextButton("##hdr_arts", "Artifacts", st.showArtifacts, artW, "team")) {
-            const bool open = !st.showArtifacts;
-            st.showArtifacts = open;
-            if (open) { st.showTaskList = st.showSessionsPicker = st.showAISettingsOverlay = false; }
+        if (showWord) {
+            if (wordF) ImGui::PushFont(wordF);
+            cy(wordLh);
+            ImGui::SetCursorPosX(x);
+            ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textPrimary);
+            ImGui::TextUnformatted("Chudware");
+            ImGui::PopStyleColor();
+            if (wordF) ImGui::PopFont();
+            x += wmW + gap;
         }
-        if (busy) ImGui::EndDisabled();
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Session Artifacts \xc2\xb7 subagents, plan, documents");
-        ImGui::SetCursorPosY(rowTop1 + wordLh);
     }
 
-    // ---- Row 2: Chat | Sessions | Settings (equal gaps; left edge = leftInset) ----
-    const float rowH   = std::max(lh, ImGui::GetFrameHeight());
-    const float rowTop = ImGui::GetCursorPosY();
-    auto centerY = [&](float h) { ImGui::SetCursorPosY(rowTop + (rowH - h) * 0.5f); };
+    // -- icon tabs (labels in tooltips; same enablement rules as the old two-row header) --
+    auto tab = [&](const char* id, const char* icon, bool active, const char* tip) -> bool {
+        cy(ImGui::GetFrameHeight());
+        ImGui::SetCursorPosX(x);
+        const bool clicked = drawHeaderTextButton(id, "", active, tabW, icon);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
+        x += tabW + gap;
+        return clicked;
+    };
 
-    const float usableL = leftInset;
-    const float usableR = colW - rightInset;
-    const float free = usableR - usableL - chatW - sessW - gearW;
-    float gapEq = free * 0.5f;
-    if (gapEq < minGap) gapEq = minGap;
-    float chatX = usableL;
-    float sessX = usableL + chatW + gapEq;
-    float setX  = usableR - gearW;
-    sessX = std::max(sessX, chatX + chatW + minGap);
-    sessX = std::min(sessX, setX - sessW - minGap);
-
-    centerY(lh);
-    ImGui::SetCursorPosX(chatX);
     if (busy) ImGui::BeginDisabled();
-    if (drawHeaderTextButton("##hdr_chat", "Chat", chatOpen, chatW, "ai_panel")) {
-        st.showSessionsPicker = false;
-        st.showAISettingsOverlay = false;
-        st.showTaskList = false;
-        st.showArtifacts = false;
+    if (tab("##hdr_chat", "ai_panel", chatOpen, "Chat — conversation with the agent.")) {
+        st.showSessionsPicker = st.showAISettingsOverlay = st.showTaskList = st.showArtifacts = false;
     }
-    if (busy) ImGui::EndDisabled();
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Chat — conversation with the agent.");
-
-    centerY(lh);
-    ImGui::SetCursorPosX(sessX);
-    if (busy) ImGui::BeginDisabled();
-    if (drawHeaderTextButton("##hdr_sess", "Sessions", sessionsOpen, sessW, "history")) {
+    if (tab("##hdr_sess", "history", sessionsOpen,
+            sessionsOpen ? "Sessions list is open." : "Sessions — switch between chats.")) {
         const bool open = !st.showSessionsPicker;
         st.showSessionsPicker = open;
         if (open) { st.showAISettingsOverlay = st.showTaskList = st.showArtifacts = false; }
     }
+    if (tab("##hdr_arts", "team", st.showArtifacts,
+            "Session Artifacts \xc2\xb7 subagents, plan, documents")) {
+        const bool open = !st.showArtifacts;
+        st.showArtifacts = open;
+        if (open) { st.showTaskList = st.showSessionsPicker = st.showAISettingsOverlay = false; }
+    }
     if (busy) ImGui::EndDisabled();
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip(sessionsOpen ? "Sessions list is open."
-                                       : "Sessions — switch between chats.");
-
-    centerY(lh);
-    ImGui::SetCursorPosX(setX);
-    if (drawHeaderTextButton("##hdr_gear", "Settings", settingsOpen, gearW, "settings")) {
+    if (tab("##hdr_gear", "settings", settingsOpen,
+            settingsOpen ? "Settings is open." : "AI settings — provider, model, privacy.")) {
         const bool open = !st.showAISettingsOverlay;
         st.showAISettingsOverlay = open;
         if (open) { st.showSessionsPicker = st.showTaskList = st.showArtifacts = false; }
     }
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip(settingsOpen ? "Settings is open."
-                                       : "AI settings — provider, model, privacy.");
 
-    ImGui::SetCursorPosY(std::max(ImGui::GetCursorPosY(), rowTop + rowH));
+    // -- collapse chevron, far right INSIDE the header row --
+    cy(chevSz);
+    ImGui::SetCursorPosX(colW - rightInset - chevSz);
+    toggleCollapse(true);   // ">>" — slide the column out to the right edge
+
+    ImGui::SetCursorPosY(rowTop + rowH);
 }
 
 // Sessions list — replaces the chat log while open so users can jump between sessions easily.
@@ -816,6 +803,10 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         // keeping the two pinned columns sharing their top edge.
         const float colY = band.minY + 4.0f * ui::uiScale;   // match left-pane top (doc_tabs / FM)
         const float colH = std::max(120.0f * ui::uiScale, band.maxY - margin - colY);
+        // Collapsed rail width: the 26dp chevron chip + window padding, so a fully collapsed
+        // column is a slim strip at the right edge whose only content is the expand chevron.
+        const float railW = 26.0f * ui::uiScale + ImGui::GetStyle().WindowPadding.x * 2.0f +
+                            4.0f * ui::uiScale;
         // "Reset layout" (slot 1 = Copilot column) restores the default width + expands it.
         if (ui::takeOverlayColumnReset(1)) {
             s_paneW = 0.0f;
@@ -826,23 +817,25 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         if (s_paneW <= 0.0f) s_paneW = ui::metrics::dockRightTarget();
         if (std::getenv("AI_CAD_COPILOT_NARROW"))       // T-G17 shot: capture the narrowest column
             s_paneW = ui::metrics::dockRightMin();
-        // T-G21 shot: mirrors AI_CAD_FM_COLLAPSED — --ui-screenshot always resets the overlay
+        // Collapse shot: mirrors AI_CAD_FM_COLLAPSED — --ui-screenshot always resets the overlay
         // columns for determinism (see the reset branch above), which clobbers the persisted
         // collapse setting before it can render; force it back for the collapsed capture.
         if (std::getenv("AI_CAD_COPILOT_COLLAPSED")) {
             s_cpCollapsed = true;
-            s_cpAnim.snap(true, colH);  // snap immediately — headless captures must not depend on frame count
+            s_cpAnim.snapW(true, s_paneW, railW);  // snap — headless captures must not depend on frame count
         }
         const float maxW = std::max((band.maxX - band.minX) * 0.5f,
                                     ui::metrics::dockRightMin());
         s_paneW = std::min(std::max(s_paneW, ui::metrics::dockRightMin()), maxW);
 
-        // T-G21: vertical collapse — the column rolls UP to its header row (drawCopilotHeader)
-        // instead of shrinking to a pill in both axes (mirrors the FeatureManager column; see
-        // ui::PanelCollapseAnim). Width is unaffected by collapse.
-        const float winH = s_cpAnim.tick(s_cpCollapsed, colH);
-        ImGui::SetNextWindowPos(ImVec2(band.maxX - margin - s_paneW, colY), ImGuiCond_Always);
-        ImGui::SetNextWindowSize(ImVec2(s_paneW, winH), ImGuiCond_Always);
+        // Collapse: the column slides OUT to the right screen edge (horizontal analogue of the
+        // FeatureManager roll-up; see ui::PanelCollapseAnim::tickW). The window's RIGHT edge
+        // stays pinned at band.maxX - margin while the WIDTH animates between the full column
+        // width and the slim rail, so the header's chevron (pinned at the row's right end) never
+        // moves on screen. Height is unaffected by collapse.
+        const float winW = s_cpAnim.tickW(s_cpCollapsed, s_paneW, railW);
+        ImGui::SetNextWindowPos(ImVec2(band.maxX - margin - winW, colY), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(winW, colH), ImGuiCond_Always);
         flags |= ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                  ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
                  ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoScrollbar |
@@ -872,12 +865,13 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         if (overlay) ui::publishOverlayColumnEdge(1, wmin.x);
     }
 
-    // Collapse chip floats just left of the column (see drawCopilotHeader) so header
-    // content can start flush without a chevron reserve.
+    // Collapse chevron lives INSIDE the header row at the far right (see drawCopilotHeader);
+    // when collapsed the column is a slim rail and the chevron is the rail's only content.
 
     // Invisible left-edge resize hit-zone (design rule: no visible splitter bars). Dragging the
-    // strip left widens the column; clamped at the top of the next frame.
-    if (overlay) {
+    // strip left widens the column; clamped at the top of the next frame. Disabled while
+    // collapsed — the rail's width is fixed.
+    if (overlay && !s_cpCollapsed) {
         const ImVec2 keep = ImGui::GetCursorPos();
         ImGui::SetCursorScreenPos(ImGui::GetWindowPos());
         ImGui::InvisibleButton("##copilot_resize",
@@ -930,17 +924,16 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
                             ImVec2(ImGui::GetStyle().ItemSpacing.x, 0.0f));
         ImGui::SetCursorPosY(0.0f);
-        drawCopilotHeader(st, busy);
+        drawCopilotHeader(st, busy, overlay && !s_cpAnim.bodyVisibleW());
         ImGui::PopStyleVar();
     }
     ImGui::Separator();
 
-    // T-G21: the title row + separator above IS the header strip a vertical collapse rolls up to
-    // — measure it (cursor position right after, symmetric-padded) so PanelCollapseAnim knows the
-    // exact collapsed target, same one-frame-lag trick as s_composerH below. Everything from the
-    // runtime banner down is gated on bodyVisible() so a collapsed column costs nothing per frame.
-    s_cpAnim.measureHeader();
-    if (s_cpAnim.bodyVisible()) {
+    // The header row + separator above is the whole header. Everything from the runtime banner
+    // down is gated on bodyVisibleW() so a collapsing/collapsed column doesn't keep building
+    // (and eating input for) content nobody can see — the width-driven analogue of the old
+    // vertical roll-up gate.
+    if (s_cpAnim.bodyVisibleW()) {
         drawRuntimeBanner(st);
 
         // Settings / Sessions / Tasks / Artifacts overlays replace the chat log (and hide the
@@ -1016,7 +1009,7 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         } else {
             ImGui::Dummy(ImVec2(0, bottomClearance));
         }
-    }  // s_cpAnim.bodyVisible()
+    }  // s_cpAnim.bodyVisibleW()
 
     // Side-channel /btw answer panel (not part of chat history).
     drawBtwPanel(st);

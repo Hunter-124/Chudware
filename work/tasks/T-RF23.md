@@ -34,6 +34,6 @@ infeasible, escalate with evidence before widening the _Exit scope.
 
 ## Definition of done
 
-- [ ] Interactive close exits the process (no lingering Billet + Chromium threads).
+- [x] Interactive close exits the process (no lingering Billet + Chromium threads).
 - [ ] The _Exit escape on --ui-screenshot removed or justified in a comment.
 - [ ] gate.sh green; REFACTOR_LOG handoff.

@@ -3235,6 +3235,18 @@ static void doSaveDoc(AppState& st, bool forceDialog) {
 // loadDocMesh / toast / resync are all safe there.
 static void applyOpenedDoc(AppState& st, const std::string& path) {
     st.clearViewportForNewDoc();   // resets viewport + tree transients (clears s_docPath too)
+    // Re-derive default reference-plane/axis/origin visibility from the just-opened doc's tree.
+    // docMirror.open() already ran applyDocDrivenVisibility once (via its notify() callback)
+    // BEFORE this function was called, but clearViewportForNewDoc() just wiped autoHiddenPlanes /
+    // hiddenFeatures back to "all visible" empty-doc defaults. The fast mesh-load path below
+    // (the common case) never mutates the doc tree again, so nothing else would re-trigger the
+    // docMirror listener — a solid part opened from disk showed its reference planes stuck
+    // visible forever. Re-run it here so the DEFAULT (hidden on >=1 solid body, visible on an
+    // empty/sketch-only doc) is correct from frame 0. planesUserToggled/axesUserToggled/
+    // originUserToggled were just reset to false by the clear, so this only sets the default —
+    // a later manual toggle still sticks for the rest of the session.
+    if (st.docMirror.hasDoc())
+        st.applyDocDrivenVisibility(st.docMirror.tree());
     s_docPath = path;
     // Multi-document: an opened file lands in its own tab (DocMirror::open already pointed the
     // mirror at the new worker doc). The tab is born clean (just-loaded == saved) with its path.

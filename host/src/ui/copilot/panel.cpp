@@ -93,10 +93,12 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     // ---- Collapse chip (floating window, left edge, between the two rows) ----
     {
         const ImVec2 winP0 = ImGui::GetWindowPos();
-        const float row1H = 6.0f * sc + wordLh;      // top pad + row-1 height
-        const float row2H = std::max(lh, ImGui::GetFrameHeight()) + 6.0f * sc;
-        const float chipY = winP0.y + ImGui::GetWindowContentRegionMin().y +
-                            (row1H + row2H - chevSz) * 0.5f;
+        // The header is pulled to window top (drawAIPanel SetCursorPosY(0)), so the
+        // true stack is: 6sc top pad + row-1 (wordLh) + row-2 (frame height). Center
+        // the chip across exactly that — no content-region/padding offset.
+        const float row1H = 6.0f * sc + wordLh;
+        const float row2H = std::max(lh, ImGui::GetFrameHeight());
+        const float chipY = winP0.y + (row1H + row2H - chevSz) * 0.5f;
         const ImVec2 c0(winP0.x + leftInset, chipY);
         ImGui::SetNextWindowPos(c0, ImGuiCond_Always);
         ImGui::SetNextWindowSize(ImVec2(chevSz, chevSz), ImGuiCond_Always);
@@ -889,8 +891,11 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
                  ImGuiWindowFlags_NoScrollWithMouse;
     }
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, bubbleDp * ui::uiScale);
+    // Tighter column padding than the theme default (15,13): the Copilot is a slim
+    // pinned column — wide gutters just shrink the chat bubbles and composer.
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(7.0f * ui::uiScale, 4.0f * ui::uiScale));
     const bool cpOpen = ImGui::Begin("Copilot###AI", nullptr, flags);
-    ImGui::PopStyleVar();
+    ImGui::PopStyleVar(2);
     if (!cpOpen) { ImGui::End(); return; }
     ui::Fonts& fonts = st.fonts;
 
@@ -994,7 +999,7 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
                 st.showTaskList = st.showArtifacts = false;
         }
         static float s_composerH = 0.0f;
-        const float bottomClearance = ui::metrics::U(5);
+        const float bottomClearance = ui::metrics::U(2);
         float reserve = 0.0f;
         if (!overlayOpen) {
             reserve = (s_composerH > 0 ? s_composerH
@@ -1007,6 +1012,8 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         if (chatH < ui::metrics::px(120.0f)) chatH = ui::metrics::px(120.0f);
 
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
+        // Slim chat-log gutters so bubbles/cards use the column width.
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(3.0f * ui::uiScale, 2.0f * ui::uiScale));
         ImGui::BeginChild("chatlog", ImVec2(0, chatH), ImGuiChildFlags_None);
         if (st.showAISettingsOverlay) {
             drawAISettingsBody(st, busy);
@@ -1043,6 +1050,7 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
             ImGui::EndChild();
             ImGui::SetCursorPos(keep);
         }
+        ImGui::PopStyleVar();   // chatlog WindowPadding
         ImGui::PopStyleColor();
 
         // Composer is hidden under the header overlays (sessions / settings / tasks / artifacts).

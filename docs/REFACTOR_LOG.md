@@ -3990,3 +3990,23 @@ mcmaster×3 failures stash-verified pre-existing; firmware ctest passes
 standalone (20s renode timeout flaky under load); R1a–R1f consolidation nodes
 remain the planned architectural follow-up. Webservice/DESIGN.md WASM claim
 corrected (parity verified by gate web-parity probe).
+
+### Copilot message meta + margin rework (2026-07-23)
+Copilot column space/layout pass per Hunter's redpen: author names moved INSIDE
+the message boxes with a relative age ("3m ago", dates past 24h; hover tooltip
+shows the concise absolute time, adding the date once over a day old).
+`ChatMsg` gained `double ts` (epoch s, default-initialized at construction via
+`chatNowEpoch()` in app_state.h; 0 = legacy/unknown → no age label) and
+`conversations.cpp` persists/restores it as `"ts"`. User bubbles render
+"You"+age as the bubble's bottom row (the AI-VC rewind/edit footer row now
+only appears when those buttons exist); assistant turns render model+age
+inside the prose card top, or inline with the above-card label for
+activity-only / VC-restore turns. Collapse chip is now truly centered between
+the two header rows (was offset by WindowPadding.y/2 + 3sc — it used
+GetWindowContentRegionMin().y and counted a phantom 6sc in row 2). Margins:
+Copilot window padding (15,13)→(7,4)·scale, chatlog child →(3,2), message
+bubble bodies →(10,7), bottom clearance U(5)→U(2) — reclaims ~40px of width
+for bubbles/composer. Gotcha: headless CHUDWARE_SHOT chat/plan/assembly seeds
+don't render in shots (pre-existing: syncChatToDoc re-keys the conversation
+when the scenario doc opens, parking seeded messages under the no-doc key) —
+verified no-regression via stash A/B; verify message meta live in the app.

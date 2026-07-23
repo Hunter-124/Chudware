@@ -7,6 +7,96 @@
 
 namespace ui {
 
+// ---- message age helpers ------------------------------------------------------
+// Relative age for the in-bubble meta row ("3m ago"), switching to a bare date
+// once the message is over a day old. The hover tooltip carries the concise
+// absolute time ("4:37 PM"), adding the date when it's over a day old.
+static bool chatLocalTime(double ts, std::tm& out) {
+    if (ts <= 0.0) return false;
+    const std::time_t t = (std::time_t)ts;
+#ifdef _WIN32
+    return localtime_s(&out, &t) == 0;
+#else
+    return localtime_r(&t, &out) != nullptr;
+#endif
+}
+
+static std::string chatAgeLabel(double ts) {
+    if (ts <= 0.0) return std::string();
+    static const char* kMonths[] = {"Jan","Feb","Mar","Apr","May","Jun",
+                                    "Jul","Aug","Sep","Oct","Nov","Dec"};
+    const double age = chatNowEpoch() - ts;
+    char buf[40];
+    if (age < 45.0) return "now";
+    if (age < 3600.0) {
+        int mins = (int)(age / 60.0); if (mins < 1) mins = 1;
+        std::snprintf(buf, sizeof(buf), "%dm ago", mins);
+        return buf;
+    }
+    if (age < 86400.0) {
+        std::snprintf(buf, sizeof(buf), "%dh ago", (int)(age / 3600.0));
+        return buf;
+    }
+    std::tm tmv; if (!chatLocalTime(ts, tmv)) return std::string();
+    std::tm nowTm; chatLocalTime(chatNowEpoch(), nowTm);
+    if (tmv.tm_year == nowTm.tm_year)
+        std::snprintf(buf, sizeof(buf), "%s %d", kMonths[tmv.tm_mon], tmv.tm_mday);
+    else
+        std::snprintf(buf, sizeof(buf), "%s %d, %d", kMonths[tmv.tm_mon], tmv.tm_mday,
+                      tmv.tm_year + 1900);
+    return buf;
+}
+
+static std::string chatTimeTooltip(double ts) {
+    std::tm tmv; if (!chatLocalTime(ts, tmv)) return std::string();
+    static const char* kMonths[] = {"Jan","Feb","Mar","Apr","May","Jun",
+                                    "Jul","Aug","Sep","Oct","Nov","Dec"};
+    std::tm nowTm; chatLocalTime(chatNowEpoch(), nowTm);
+    int h = tmv.tm_hour % 12; if (h == 0) h = 12;
+    char clock[24];
+    std::snprintf(clock, sizeof(clock), "%d:%02d %s", h, tmv.tm_min,
+                  tmv.tm_hour < 12 ? "AM" : "PM");
+    char buf[64];
+    const bool sameDay = tmv.tm_year == nowTm.tm_year && tmv.tm_yday == nowTm.tm_yday;
+    if (sameDay)
+        std::snprintf(buf, sizeof(buf), "%s", clock);
+    else if (tmv.tm_year == nowTm.tm_year)
+        std::snprintf(buf, sizeof(buf), "%s %d, %s", kMonths[tmv.tm_mon], tmv.tm_mday, clock);
+    else
+        std::snprintf(buf, sizeof(buf), "%s %d, %d, %s", kMonths[tmv.tm_mon], tmv.tm_mday,
+                      tmv.tm_year + 1900, clock);
+    return buf;
+}
+
+// In-bubble meta row: author name (left) + relative age (right; hover = absolute
+// time). Renders as a bubble's first (assistant) or last (user) row so the author
+// lives INSIDE the message box. Name may be null (age-only row).
+static void drawMsgMetaRow(const ui::Fonts& fonts, const char* name, const ImVec4& nameCol,
+                           double ts) {
+    const ui::AdaptiveSurface& surf = chatSurf();
+    const std::string age = chatAgeLabel(ts);
+    if (name && name[0]) {
+        ImGui::PushFont(fonts.medium);
+        ImGui::TextColored(nameCol, "%s", name);
+        ImGui::PopFont();
+    } else {
+        ImGui::Dummy(ImVec2(1.0f, ImGui::GetTextLineHeight()));
+    }
+    if (!age.empty()) {
+        const float ageW = ImGui::CalcTextSize(age.c_str()).x;
+        const float rx = ImGui::GetWindowContentRegionMax().x - ageW;
+        ImGui::SameLine();
+        ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(), rx));
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+        ImGui::TextUnformatted(age.c_str());
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered()) {
+            const std::string tip = chatTimeTooltip(ts);
+            if (!tip.empty()) ImGui::SetTooltip("%s", tip.c_str());
+        }
+    }
+}
+
 void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
                           float panelW, int msgIdx) {
     const auto& pal = ui::palette;
@@ -16,14 +106,20 @@ void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
     ImGui::SetCursorPosX(ImGui::GetCursorPosX() + panelW * 0.22f);
     const float bw = ImGui::GetContentRegionAvail().x;
     GlassBubble gb = beginGlassBubble(bw, ui::GlassLevel::Regular, 8.0f);
+    // Tighter in-bubble padding than the theme default — slimmer message box.
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f * sc, 7.0f * sc));
     ImGui::BeginChild("##umsg", ImVec2(bw, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
-    // Body only — the "You" author label lives in the footer row under the bubble.
+    // Body, then the author meta row INSIDE the bubble bottom ("You" left, age
+    // right; hover the age for the absolute time).
     // Same selectable read-only InputText treatment as assistant prose (soft-wrap +
     // click-drag + Ctrl+C toast + right-click Copy).
     const std::string userBody = stripMdMarks(m.text);
     const ImGuiID textId = chatDrawSelectableText("##umsg_sel", userBody, chatSurf().textPrimary);
+    ImGui::Dummy(ImVec2(0, 2.0f * sc));
+    drawMsgMetaRow(fonts, "You", accentCol, m.ts);
     ImGui::EndChild();
+    ImGui::PopStyleVar();  // ##umsg WindowPadding
     ImRect bubble = endGlassBubble(gb);
     {
         ImU32 border = modeBorderColor(m.copilotMode);
@@ -40,7 +136,8 @@ void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
     chatHoverCopyGlyph(bubble, userBody);
 
 
-    // Footer row: "You" (left) + ◁◁ rewind / pencil edit (right). Tight under the bubble.
+    // Footer row: rewind / pencil edit buttons only (the "You" label moved inside
+    // the bubble). Skipped entirely when AI-VC is unavailable — no dead strip.
     {
         const double now = ImGui::GetTime();
         if (s_aiVc.confirmMsgIdx >= 0 && now > s_aiVc.confirmUntil) {
@@ -54,6 +151,7 @@ void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
         const float gap = 4.0f * sc;
         const float totalBtnW = showBtns ? (btnSz + gap + btnSz) : 0.0f;
 
+        if (showBtns) {
         // Nearly touch the bubble bottom (~2-3px * uiScale) — no default ItemSpacing gap.
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
                             ImVec2(ImGui::GetStyle().ItemSpacing.x, 0.0f));
@@ -64,16 +162,13 @@ void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
         // Capture the start of the row so we can place buttons on the same line, right-aligned.
         const float rowStartY = ImGui::GetCursorPosY();
         const float rowStartX = ImGui::GetCursorPosX();
+        // Reserve the row's height (the buttons are absolutely positioned below).
+        ImGui::Dummy(ImVec2(1.0f, ImGui::GetTextLineHeight()));
 
-        ImGui::PushFont(fonts.medium);
-        ImGui::TextColored(accentCol, "You");
-        ImGui::PopFont();
-
-        if (showBtns) {
-            // Right-align buttons under the bubble's right edge, same baseline as the label.
+        {
+            // Right-align buttons under the bubble's right edge.
             const float rowX = bubble.Max.x - totalBtnW - winX;
-            ImGui::SetCursorPos(ImVec2(std::max(rowStartX + ImGui::CalcTextSize("You").x + gap,
-                                               rowX),
+            ImGui::SetCursorPos(ImVec2(std::max(rowStartX, rowX),
                                       rowStartY + (ImGui::GetTextLineHeight() - btnSz) * 0.5f));
 
             ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -140,6 +235,7 @@ void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
             }
         }
         ImGui::PopStyleVar();  // ItemSpacing.y = 0 for the tight footer
+        }  // showBtns
     }
 
     ImGui::Dummy(ImVec2(0, 4 * ui::uiScale));
@@ -264,10 +360,16 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
     const ui::AdaptiveSurface& turnSurf = chatSurf();
     const float sc = ui::uiScale;
 
-    // Author label tight above the turn content (mirrors the You-row tight gap). Prefer the
-    // model stamped on the turn at run start; only fall back to the live picker for an
-    // in-flight turn that somehow has no stamp. Show the model name alone (no "Assistant :"
-    // prefix / vertical separator). No model → omit label (never bare "Assistant").
+    // Author label. When the turn renders a prose card (plain Q&A reply), the
+    // label moves INSIDE that card (top row: model left, age right) — see (3).
+    // Otherwise (activity-only / error / VC-restore turns) it stays as a tight row
+    // above the turn content with the age appended inline.
+    // Prefer the model stamped on the turn at run start; only fall back to the
+    // live picker for an in-flight turn that somehow has no stamp. No model →
+    // omit label (never bare "Assistant").
+    const bool proseCard = !m.text.empty() && m.errKind == ERR_NONE;
+    const bool vcRestore = msgIdx >= 0 && turnNum > 0 && chatMsgMutatedDoc(m);
+    const bool metaInProse = proseCard && !vcRestore;
     {
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
                             ImVec2(ImGui::GetStyle().ItemSpacing.x, 0.0f));
@@ -275,18 +377,30 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
         if (!m.model.empty()) mid = m.model.c_str();
         else if (m.running && st.settings.model[0]) mid = st.settings.model;
         const bool haveModel = mid && mid[0];
-        if (haveModel) {
+        if (haveModel && !metaInProse) {
             const std::string label = shortModelName(mid);
             ImGui::PushFont(fonts.medium);
             ImGui::TextColored(turnSurf.textSecondary, "%s", label.c_str());
             ImGui::PopFont();
+            // Inline age next to the above-card label (in-card rows right-align it).
+            const std::string age = chatAgeLabel(m.ts);
+            if (!age.empty()) {
+                ImGui::SameLine(0, 6 * sc);
+                ImGui::PushStyleColor(ImGuiCol_Text, turnSurf.textTertiary);
+                ImGui::TextUnformatted(age.c_str());
+                ImGui::PopStyleColor();
+                if (ImGui::IsItemHovered()) {
+                    const std::string tip = chatTimeTooltip(m.ts);
+                    if (!tip.empty()) ImGui::SetTooltip("%s", tip.c_str());
+                }
+            }
         }
         // Subtle restore affordance on mutating turns (hover / inline confirm — no modal).
-        if (msgIdx >= 0 && turnNum > 0 && chatMsgMutatedDoc(m)) {
-            if (haveModel) ImGui::SameLine(0, 8 * sc);
+        if (vcRestore) {
+            if (haveModel && !metaInProse) ImGui::SameLine(0, 8 * sc);
             drawAiVcTurnRestore(st, msgIdx, turnNum);
         }
-        if (haveModel || (msgIdx >= 0 && turnNum > 0 && chatMsgMutatedDoc(m)))
+        if ((haveModel && !metaInProse) || vcRestore)
             ImGui::Dummy(ImVec2(0, 2.5f * sc));
         ImGui::PopStyleVar();
     }
@@ -325,14 +439,27 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
     // (3) Streaming assistant text — a Thin glass "prose" card (Liquid Glass v2 §6, host
     // contract H5) keeps body copy legible over the live viewport blur. Selectable for
     // click-drag + Ctrl+C; right-click copies selection or full text.
-    if (!m.text.empty() && m.errKind == ERR_NONE) {
+    if (proseCard) {
         const std::string prose = stripMdMarks(m.text);
         GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin,
                                           4.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f * sc, 7.0f * sc));
         ImGui::BeginChild("##prose", ImVec2(0, 0),
                           ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+        // Author meta row INSIDE the card top (model left, age right) when it
+        // wasn't drawn above the turn (VC-restore turns keep the top row).
+        if (metaInProse) {
+            const char* mid = nullptr;
+            if (!m.model.empty()) mid = m.model.c_str();
+            else if (m.running && st.settings.model[0]) mid = st.settings.model;
+            const std::string label = (mid && mid[0]) ? shortModelName(mid) : std::string();
+            drawMsgMetaRow(fonts, label.empty() ? nullptr : label.c_str(),
+                           turnSurf.textSecondary, m.ts);
+            ImGui::Dummy(ImVec2(0, 2.0f * sc));
+        }
         const ImGuiID textId = chatDrawSelectableText("##prose_sel", prose, chatSurf().textPrimary);
         ImGui::EndChild();
+        ImGui::PopStyleVar();  // ##prose WindowPadding
         ImRect proseRect = endGlassBubble(gb);
         const std::string sel = chatInputSelection(textId);
         chatCopyContext(proseRect, "##prose_copy", prose, prose, sel);

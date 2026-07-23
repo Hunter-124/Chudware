@@ -574,8 +574,15 @@ struct ActivityItem {
                               // one-shot auto-collapse when the stream completes
 };
 
+// Wall-clock epoch seconds (UTC) — stamps ChatMsg send/receive times at construction.
+inline double chatNowEpoch() {
+    return std::chrono::duration<double>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
 struct ChatMsg {
     bool fromUser = false;
+    double ts = chatNowEpoch();    // send/receive time (epoch s); 0 = legacy/unknown (no age label)
     std::string text;              // user prompt, or the assistant's final summary
     bool running = false;          // assistant turn still streaming
     std::string model;             // assistant turn: model id at run start (label); empty = plain "Assistant"

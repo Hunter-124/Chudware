@@ -374,6 +374,7 @@ void persistChatHistory(AppState& st) {
             // Keep turns that only carry a plan (no text body) so the task list survives reload.
             if (body.empty() && !m.planState.present) continue;
             nlohmann::json entry = {{"u", m.fromUser}, {"t", body}, {"e", m.errKind}};
+            if (m.ts > 0.0) entry["ts"] = m.ts;   // send/receive time for the in-bubble age label
             if (!m.fromUser && !m.model.empty()) entry["m"] = m.model;
             if (m.copilotMode >= 0) entry["cm"] = m.copilotMode;
             if (m.planState.present) entry["plan_state"] = planStateToJson(m.planState);
@@ -660,6 +661,7 @@ static void applyChatEntry(AppState& st, const nlohmann::json& e) {
             cm.errKind = m.value("e", 0);
             if (!cm.fromUser) cm.model = m.value("m", std::string());
             cm.copilotMode = m.value("cm", -1);  // -1 when absent (legacy sessions)
+            cm.ts = m.value("ts", 0.0);          // 0 = legacy (constructed with now) — no age label
             // Restore plan/task-list state when present (legacy sessions omit the key).
             if (m.contains("plan_state") && m["plan_state"].is_object()) {
                 cm.planState = parsePlanState(m["plan_state"]);

@@ -538,6 +538,12 @@ void drawEcadManagerBodyImpl(AppState& st, const ui::AdaptiveSurface& surf, ImU3
     }
     const bool pcb = m.isPcb();
 
+    // Compact vertical rhythm (the FeatureManager convention): tighten ItemSpacing.y only.
+    // RAII so it unwinds on any early return.
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+                        ImVec2(ImGui::GetStyle().ItemSpacing.x, 4.0f * sc));
+    struct SpacingPop { ~SpacingPop() { ImGui::PopStyleVar(); } } spacingPop;
+
     // ---- header: the pane-header chip now lives UP in the Electronics rail row (drawn by layout.cpp
     // beside the Explorer/PCB Manager tab buttons — round-5b: kills the dead band to the right of
     // those buttons and pulls this tree up). The body therefore starts straight at the doc-name row. ----
@@ -597,8 +603,8 @@ void drawEcadManagerBodyImpl(AppState& st, const ui::AdaptiveSurface& surf, ImU3
         const float toolW = nBtn * bw + (nBtn - 1) * gap;
         ImVec2 rowMin = ImGui::GetCursorScreenPos();
         const float availW = ImGui::GetContentRegionAvail().x;
-        ui::glassRowBackground(ImGui::GetWindowDrawList(), rowMin,
-                               ImVec2(rowMin.x + availW, rowMin.y + bw), 3.5f, false, false, 0.24f);
+        // No wash behind the row — the FeatureManager toolbar floats on the pane glass; each
+        // 24px button carries its own resting pill (fmToolbarIconBtn).
         float bx = rowMin.x + std::max(0.0f, (availW - toolW) * 0.5f);
         ImGui::SetCursorScreenPos(ImVec2(bx, rowMin.y));
         if (ui::fmToolbarIconBtn("ecad_save", "save", "Save  (Shift-click: Save As...)", true))
@@ -677,8 +683,9 @@ void drawEcadManagerBodyImpl(AppState& st, const ui::AdaptiveSurface& surf, ImU3
         if (drawPropInspector(st, es, sc)) ImGui::Spacing();
     }
 
+    // FM chrome convention: Spacing alone separates the header stack from the tree — no
+    // orphaned Separator() hairline (the section rules inside the tree carry the structure).
     ImGui::Spacing();
-    ImGui::Separator();
 
     // ---- Layers (pcb) / Nets + Symbols (sch) — Feature Manager tree-row styling: fmSectionDivider
     // for the "Reference"/"Features"-style section labels, fmRowPill for the alternating-stripe,

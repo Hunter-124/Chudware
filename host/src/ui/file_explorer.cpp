@@ -579,6 +579,13 @@ static void drawDeleteModal(AppState& st, const std::string& root) {
 void drawFileExplorerBody(AppState& st) {
     auto& fsb = billet::fsBackend();
     ui::fmRowStripeReset();   // restart the FM stripe phase + refresh the shared FM palette
+
+    // Compact vertical rhythm (the FeatureManager convention): tighten ItemSpacing.y only so
+    // the breadcrumb/rows don't read "double spaced". RAII so it unwinds on any early return.
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+                        ImVec2(ImGui::GetStyle().ItemSpacing.x, 4.0f * ui::uiScale));
+    struct SpacingPop { ~SpacingPop() { ImGui::PopStyleVar(); } } spacingPop;
+
     ensureWorkspaceDir(st);
     const std::string root = st.workspaceDir;
 
@@ -600,20 +607,38 @@ void drawFileExplorerBody(AppState& st) {
         fsb.isRegularFile(s_selectedPath) &&
         isKnownExt(lowerExt(s_selectedPath));
 
-    // Toolbar: the exact FeatureManager top-strip button (24px glass pill, 18px crisp glyph).
-    if (ui::fmToolbarIconBtn("fx_open", "open", "Open selected file", selectedFile) && selectedFile)
-        requestOpen(st, s_selectedPath);
-    ImGui::SameLine(0, 3.0f * ui::uiScale);
-    if (ui::fmToolbarIconBtn("fx_new_folder", "folder_new", "New folder", true))
-        createNewFolder(st, root, current);
-    ImGui::SameLine(0, 3.0f * ui::uiScale);
-    if (ui::fmToolbarIconBtn("fx_paste", "paste", "Paste into current folder",
-                             !s_clipboardPath.empty()) && !s_clipboardPath.empty())
-        doPaste(st, root, current);
-    ImGui::SameLine(0, 3.0f * ui::uiScale);
-    if (ui::fmToolbarIconBtn("fx_refresh", "refresh", "Refresh", true)) {
-        invalidateDirListCache();
-        st.toast(ui::ToastLevel::Info, "Explorer refreshed");
+    // Toolbar: the exact FeatureManager top-strip layout — a centered row of 24px glass icon
+    // buttons (4dp gaps), the row reserved with a Dummy (glass/icons are draw-list only), the
+    // layout cursor restored after the absolute-positioned buttons, then Spacing before the body.
+    {
+        const float S = ui::uiScale;
+        const float bw = 24.0f * S, gap = 4.0f * S, nBtns = 4.0f;
+        const float toolW = nBtns * bw + (nBtns - 1) * gap;
+        ImVec2 toolRowMin = ImGui::GetCursorScreenPos();
+        const float availW = ImGui::GetContentRegionAvail().x;
+        ImGui::Dummy(ImVec2(availW, bw));
+        float bx = toolRowMin.x + std::max(0.0f, (availW - toolW) * 0.5f);
+        const float by = toolRowMin.y;
+        auto toolBtn = [&](const char* id, const char* icon, const char* tip, bool en) -> bool {
+            ImGui::SetCursorScreenPos(ImVec2(bx, by));
+            bool hit = ui::fmToolbarIconBtn(id, icon, tip, en);
+            bx += bw + gap;
+            return hit;
+        };
+        if (toolBtn("fx_open", "open", "Open selected file", selectedFile) && selectedFile)
+            requestOpen(st, s_selectedPath);
+        if (toolBtn("fx_new_folder", "folder_new", "New folder", true))
+            createNewFolder(st, root, current);
+        if (toolBtn("fx_paste", "paste", "Paste into current folder",
+                    !s_clipboardPath.empty()) && !s_clipboardPath.empty())
+            doPaste(st, root, current);
+        if (toolBtn("fx_refresh", "refresh", "Refresh", true)) {
+            invalidateDirListCache();
+            st.toast(ui::ToastLevel::Info, "Explorer refreshed");
+        }
+        ImGui::SetCursorScreenPos(ImVec2(toolRowMin.x, toolRowMin.y + bw));
+        ImGui::Dummy(ImVec2(0, 0));
+        ImGui::Spacing();
     }
 
     // Breadcrumb: the current folder, in an FM row pill (secondary ink, frame-padded centering).

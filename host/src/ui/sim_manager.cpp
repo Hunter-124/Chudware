@@ -4618,7 +4618,8 @@ void SimManager::drawTreeBody(AppState &st) {
     return;
   }
   if (studies_.empty()) {
-    ImGui::Separator();
+    // FM chrome convention: Spacing alone separates — no orphaned hairline under the button.
+    ImGui::Spacing();
     pushDimText(); // pane surface — dim the ADAPTIVE ink, not the theme textDim
                    // role
     ImGui::TextWrapped("No studies yet. Create a study above to add fixtures, "

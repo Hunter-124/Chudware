@@ -1508,8 +1508,8 @@ void drawCamTreeBody(AppState& st) {
         if (camBusy()) ImGui::EndDisabled();
     }
     if (camBusy() || !g.status.empty()) {
+        // FM chrome convention: Spacing alone separates — no orphaned hairline.
         ImGui::Spacing();
-        ImGui::Separator();
         ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x);
         if (camBusy()) {
             static const char* kSpin[] = {"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"};

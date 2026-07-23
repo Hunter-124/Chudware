@@ -467,9 +467,9 @@ void drawLeftPane(AppState& st,
         if (s_simTab == 0) {
             drawFileExplorerBody(st);
         } else {
-            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6.0f * S, 4.0f * S));
+            // Same body inset as the Explorer tab — the FM convention is the shared ebodyPad
+            // child padding; the manager body adds no extra WindowPadding of its own.
             st.simManager->drawTreeBody(st);
-            ImGui::PopStyleVar();
         }
         const float eBodyContentH = ImGui::GetCursorPosY();
         ImGui::EndChild();
@@ -538,9 +538,9 @@ void drawLeftPane(AppState& st,
         if (s_camTab == 0) {
             drawFileExplorerBody(st);
         } else {
-            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6.0f * S, 4.0f * S));
+            // Same body inset as the Explorer tab (shared ebodyPad child padding — the FM
+            // convention); the Job Manager body adds no extra WindowPadding of its own.
             ui::drawCamTreeBody(st);
-            ImGui::PopStyleVar();
         }
         const float eBodyContentH = ImGui::GetCursorPosY();
         ImGui::EndChild();

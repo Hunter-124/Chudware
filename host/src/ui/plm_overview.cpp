@@ -878,6 +878,12 @@ void drawPlmOverviewBody(AppState& st) {
     const auto& surf = plmOvSurf();
     const float Scl  = ui::uiScale;
 
+    // Compact vertical rhythm (the FeatureManager convention): tighten ItemSpacing.y only.
+    // RAII so it unwinds on any early return.
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+                        ImVec2(ImGui::GetStyle().ItemSpacing.x, 4.0f * Scl));
+    struct SpacingPop { ~SpacingPop() { ImGui::PopStyleVar(); } } spacingPop;
+
     // Kick async refreshes (throttled inside).
     const std::string path = st.plmProjectPath();
     if (path != S.projectPath) {

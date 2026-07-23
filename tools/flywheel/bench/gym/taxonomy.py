@@ -135,8 +135,34 @@ def _call_succeeded(p: dict) -> bool:
 _REF_RE = re.compile(r"\b(DL\d+|AC\d+|DIM\d+|FN\d+|FT\d+|G\d+)\b")
 
 
+def _mint_ids(kind: str | None, p: dict) -> set[str]:
+    """Ids a SINGLE event's payload mints/declares (manifest ids excluded — those
+    are known from run start, not minted mid-ledger; see _known_ids)."""
+    minted: set[str] = set()
+    if kind == "artifact" and p.get("kind") == "manifest":
+        for dl in p.get("deliverables", []) or []:
+            if dl.get("id"):
+                minted.add(dl["id"])
+            for ac in dl.get("acceptance_criteria", []) or []:
+                if ac.get("id"):
+                    minted.add(ac["id"])
+    if kind == "dimension" and p.get("id"):
+        minted.add(p["id"])
+    # ladder rung artifacts mint FN/FT/G ids
+    for coll_key in ("functions", "features", "elements", "datums"):
+        for item in p.get(coll_key, []) or []:
+            if isinstance(item, dict) and item.get("id"):
+                minted.add(item["id"])
+    # explicit mint list (agent_fn may declare minted ids for a turn)
+    for mid in p.get("mints", []) or []:
+        minted.add(mid)
+    return minted
+
+
 def _known_ids(events: list[dict], manifest: dict | None = None) -> set[str]:
-    """Every DL/AC/DIM/FN/FT/G id the ledger has actually MINTED (declared).
+    """Every DL/AC/DIM/FN/FT/G id the ledger has actually MINTED (declared),
+    ACROSS THE WHOLE LEDGER (unordered — see _detect_context_loss for the ordered,
+    per-event view an id-cited-before-it-was-minted check needs).
 
     T-W32: REAL cells don't replay the manifest as an artifact event (the mission
     pipeline records the manifest artifact without its deliverables payload), so
@@ -151,27 +177,7 @@ def _known_ids(events: list[dict], manifest: dict | None = None) -> set[str]:
             if ac.get("id"):
                 known.add(ac["id"])
     for e in events:
-        p = e.get("payload") or {}
-        kind = e.get("kind")
-        # manifest artifact carries the deliverable + criterion ids
-        if kind == "artifact" and p.get("kind") == "manifest":
-            for dl in p.get("deliverables", []) or []:
-                if dl.get("id"):
-                    known.add(dl["id"])
-                for ac in dl.get("acceptance_criteria", []) or []:
-                    if ac.get("id"):
-                        known.add(ac["id"])
-        if kind == "dimension":
-            if p.get("id"):
-                known.add(p["id"])
-        # ladder rung artifacts mint FN/FT/G ids
-        for coll_key in ("functions", "features", "elements", "datums"):
-            for item in p.get(coll_key, []) or []:
-                if isinstance(item, dict) and item.get("id"):
-                    known.add(item["id"])
-        # explicit mint list (agent_fn may declare minted ids for a turn)
-        for mid in p.get("mints", []) or []:
-            known.add(mid)
+        known |= _mint_ids(e.get("kind"), e.get("payload") or {})
     return known
 
 
@@ -305,6 +311,16 @@ def _detect_tool_misuse(events: list[dict], manifest: dict | None) -> list[Class
         # construction. So gate on verification intent: an explicit ``verifies`` flag,
         # or the called tool being a known check tool (i.e. the role is checking, not
         # building). This prevents false-positives on build steps tagged with for_ac.
+        #
+        # Scoping decision (P1 audit): this rule depends on for_ac/verifies — fields
+        # ONLY the scripted gym emits (runner.py replay_turns_into_ledger); real
+        # tool_call payloads (agent_turn._log) never tag a call with the criterion
+        # it claims to verify, so there is no real signal to adapt this rule to.
+        # Kept scripted-only rather than deleted per YAGNI — ~15 gym challenge
+        # fixtures under tools/flywheel/bench/gym/challenges/*.py drive misuse
+        # detection through for_ac (e.g. c1/c4/c5/c6/c7/c9's misuse variants). It
+        # correctly never fires on real-shaped payloads (no false positive)
+        # instead of guessing which criterion an untagged real call verified.
         target_ac = p.get("for_ac")
         if not (target_ac and target_ac in ac_tool):
             continue
@@ -331,25 +347,37 @@ _CHECK_TOOLS = frozenset({
 def _detect_context_loss(events: list[dict],
                          manifest: dict | None = None) -> list[Classification]:
     out: list[Classification] = []
-    known = _known_ids(events, manifest)
-    for e in events:
+    # Manifest ids are known from the start of the run (T-W32: real cells don't
+    # replay a manifest artifact event). Ledger-MINTED ids are ORDERED: an id only
+    # counts as known for events AFTER the event that minted it — citing an id
+    # before it exists in the ledger IS the failure this detector exists to catch,
+    # and a whole-ledger union (the old behaviour) missed exactly that case.
+    known: set[str] = set()
+    for dl in (manifest or {}).get("deliverables", []) or []:
+        if dl.get("id"):
+            known.add(dl["id"])
+        for ac in dl.get("acceptance_criteria", []) or []:
+            if ac.get("id"):
+                known.add(ac["id"])
+    for e in sorted(events, key=lambda ev: ev.get("seq", 0)):
         p = e.get("payload") or {}
+        kind = e.get("kind")
         # Only inspect free-text/ref fields a role authored (not the manifest artifact).
-        if e.get("kind") == "artifact" and p.get("kind") == "manifest":
-            continue
-        cited = set()
-        for field_name in ("text", "rationale", "summary", "cites", "refs_text"):
-            val = p.get(field_name)
-            if isinstance(val, str):
-                cited |= set(_REF_RE.findall(val))
-            elif isinstance(val, list):
-                cited |= {c for c in val if isinstance(c, str) and _REF_RE.fullmatch(c)}
-        missing = sorted(c for c in cited if c not in known)
-        if missing:
-            out.append(Classification(
-                FailureClass.CONTEXT_LOSS.value,
-                f"cited nonexistent ref(s): {', '.join(missing)}",
-                [e.get("seq")], [_ev_ref(e, f"cites undeclared id(s) {missing}")]))
+        if not (kind == "artifact" and p.get("kind") == "manifest"):
+            cited = set()
+            for field_name in ("text", "rationale", "summary", "cites", "refs_text"):
+                val = p.get(field_name)
+                if isinstance(val, str):
+                    cited |= set(_REF_RE.findall(val))
+                elif isinstance(val, list):
+                    cited |= {c for c in val if isinstance(c, str) and _REF_RE.fullmatch(c)}
+            missing = sorted(c for c in cited if c not in known)
+            if missing:
+                out.append(Classification(
+                    FailureClass.CONTEXT_LOSS.value,
+                    f"cited nonexistent ref(s): {', '.join(missing)}",
+                    [e.get("seq")], [_ev_ref(e, f"cites undeclared id(s) {missing}")]))
+        known |= _mint_ids(kind, p)
     return out
 
 
@@ -369,9 +397,29 @@ def _detect_abstraction_skip(events: list[dict]) -> list[Classification]:
     return out
 
 
+def _grind_target(p: dict) -> str:
+    """The repeated-action TARGET grind groups by.
+
+    Scripted-gym turns carry an explicit build-graph ``node`` (e.g.
+    ``n_verify_DL1``) — genuinely per-deliverable. Real payloads carry no such
+    id: real tool_call events (agent_turn._log) have none at all, and real
+    decision events (ledger.log_decision) carry a ``stage`` that is a workflow
+    phase SHARED by every deliverable in that phase — keying on it collapsed
+    unrelated deliverables at the same stage into one grind bucket. Fall back to
+    the call's own tool+args signature (or its decision id) so two different real
+    deliverables making different calls never collapse into a single '?' bucket."""
+    node = p.get("node") or p.get("for_dl")
+    if node:
+        return str(node)
+    tool = p.get("tool")
+    if tool:
+        return f"{tool}|{_stable(p.get('args'))}"
+    return str(p.get("id") or p.get("stage") or "?")
+
+
 def _detect_grind(events: list[dict], grind_threshold: int = 3) -> list[Classification]:
     out: list[Classification] = []
-    # Group tool_call / decision events by (node/deliverable, action fingerprint).
+    # Group tool_call / decision events by (target, action fingerprint).
     # T-W32: tool calls are read through the normaliser so real agent-turn calls
     # (kind=agent_turn, payload.event=tool_call) count toward grind too.
     seen: dict[tuple, list[dict]] = {}
@@ -379,51 +427,85 @@ def _detect_grind(events: list[dict], grind_threshold: int = 3) -> list[Classifi
         (e, e.get("payload") or {}) for e in _by_kind(events, "decision")]
     pairs.sort(key=lambda ep: ep[0].get("seq", 0))
     for e, p in pairs:
-        node = p.get("node") or p.get("for_dl") or p.get("stage") or "?"
+        target = _grind_target(p)
         fp = p.get("hypothesis") or p.get("fingerprint")
         if fp is None:
             # fingerprint the action: same tool + same args string == no changed hypothesis
             fp = f"{p.get('tool','')}|{_stable(p.get('args'))}|{p.get('text','')[:40]}"
-        seen.setdefault((node, fp), []).append(e)
-    for (node, fp), group in seen.items():
+        seen.setdefault((target, fp), []).append(e)
+    for (target, fp), group in seen.items():
         if len(group) >= grind_threshold:
             seqs = [g.get("seq") for g in group]
             out.append(Classification(
                 FailureClass.GRIND.value,
-                f"{len(group)} attempts on {node!r} with no changed hypothesis",
+                f"{len(group)} attempts on {target!r} with no changed hypothesis",
                 seqs, [_ev_ref(group[0], f"{len(group)} identical attempts (anti-grind)")]))
     return out
+
+
+def _advisory_ids(p: dict) -> set[str]:
+    """Every identifier a payload's advisory represents.
+
+    Scripted-gym advisories carry a top-level ``topic``/``id`` (runner.py
+    replay_turns_into_ledger). Real advisories are advisor.engine.build_advisory's
+    ``{schema, seq, stage, items, user_override, failure_cards}`` shape — there is
+    NO top-level topic/id, only per-item ids (``items[].id``, minted by
+    engine._finding_to_item). Collect both so either shape is matched by id.
+    Returns an EMPTY set when the payload carries nothing identifiable — the
+    caller must never treat two empty sets as a match. That was the source of the
+    old false-positive: ``pa.get("id") == pe.get("contradicts_advisory")`` compared
+    None == None, and virtually every real advisory (no top-level id) matched."""
+    ids: set[str] = set()
+    for key in ("topic", "id"):
+        v = p.get(key)
+        if v:
+            ids.add(str(v))
+    for item in p.get("items", []) or []:
+        if isinstance(item, dict) and item.get("id"):
+            ids.add(str(item["id"]))
+    return ids
 
 
 def _detect_advisory_ignored(events: list[dict]) -> list[Classification]:
     out: list[Classification] = []
     advisories = _by_kind(events, "advisory")
-    disputes = _by_kind(events, "replan", "dispute")
-    disputed_topics = {(_advisory_topic((d.get("payload") or {}))) for d in disputes}
+    # "replan"/"dispute" are the scripted-gym dispute kinds; "advisory_dispute" is
+    # the real one (services/mcp/advisor_tools.advisory_dispute -> ledger kind
+    # "advisory_dispute", payload carries "advisory_id").
+    disputes = _by_kind(events, "replan", "dispute", "advisory_dispute")
+    disputed_ids: set[str] = set()
+    for d in disputes:
+        pd = d.get("payload") or {}
+        for key in ("topic", "id", "advisory_id"):
+            v = pd.get(key)
+            if v:
+                disputed_ids.add(str(v))
     for a in advisories:
         pa = a.get("payload") or {}
-        topic = _advisory_topic(pa)
+        ids = _advisory_ids(pa)
+        if not ids:
+            # nothing identifiable on this advisory — never guess a match.
+            continue
         # a later action contradicts the advisory (payload carries what it warned against)
         contra = None
         for e in events:
             if e.get("seq", -1) <= a.get("seq", -1):
                 continue
             pe = e.get("payload") or {}
-            if pe.get("contradicts_advisory") == pa.get("id") or (
-                    topic and pe.get("topic") == topic and pe.get("action") == "proceed"):
+            contradicts = pe.get("contradicts_advisory")
+            topic = pe.get("topic")
+            if (contradicts and str(contradicts) in ids) or (
+                    topic and str(topic) in ids and pe.get("action") == "proceed"):
                 contra = e
                 break
-        if contra is not None and topic not in disputed_topics:
+        if contra is not None and not (ids & disputed_ids):
+            label = sorted(ids)[0]
             out.append(Classification(
                 FailureClass.ADVISORY_IGNORED.value,
-                f"advisory {pa.get('id','?')} ({topic}) contradicted without dispute",
+                f"advisory {label!r} contradicted without dispute",
                 [a.get("seq"), contra.get("seq")],
                 [_ev_ref(a, "advisory shown"), _ev_ref(contra, "later action contradicts it")]))
     return out
-
-
-def _advisory_topic(p: dict) -> str:
-    return str(p.get("topic") or p.get("id") or p.get("text", "")[:24])
 
 
 def _stable(obj: Any) -> str:

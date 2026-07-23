@@ -144,6 +144,24 @@ def test_tool_misuse_preflight_reject():
     assert fired, "a preflight reject must fire tool_misuse"
 
 
+def test_tool_misuse_rule_b_scoped_to_scripted_shape_no_real_signal():
+    """Rule (b) (wrong tool for a criterion) depends on for_ac/verifies — fields
+    ONLY the scripted gym emits (runner.py replay_turns_into_ledger). Real
+    tool_call payloads (agent_turn._log) never tag a call with the criterion it
+    claims to verify, so there is no real signal to derive the same check from.
+    Decision: keep rule (b) scripted-only rather than delete it (the gym's
+    challenge fixtures rely on for_ac-driven misuse detection) — it must
+    correctly NOT fire on a real-shaped call using the "wrong" tool, rather than
+    guess which criterion an untagged call was meant to verify."""
+    lg = _ledger([
+        {"kind": "agent_turn", "payload": {"event": "tool_call", "tool": "measure_part",
+            "args": {"nominal": 20}, "ok": True, "result": "20.02mm"}},
+    ])
+    res = classify_ledger(lg, manifest=_MANIFEST,
+                          graded={"criteria": [], "passed": True})
+    assert not [c for c in res if c.failure_class == FailureClass.TOOL_MISUSE.value]
+
+
 # --- context_loss -----------------------------------------------------------
 
 def test_context_loss_cites_nonexistent_ref():
@@ -167,6 +185,20 @@ def test_context_loss_manifest_ids_are_known():
     res = classify_ledger(lg, manifest=_MANIFEST,
                           graded={"criteria": [], "passed": True})
     assert not [c for c in res if c.failure_class == FailureClass.CONTEXT_LOSS.value]
+
+
+def test_context_loss_cites_id_before_it_is_minted():
+    """Ordering regression: a ledger-wide id UNION (the old behaviour) misses a ref
+    cited BEFORE the event that minted it — an id must only count as known for
+    events strictly AFTER its minting event."""
+    lg = _ledger([
+        {"kind": "decision", "payload": {"id": "d1",
+            "text": "flange bore sized off DIM7", "node": "n1"}},   # DIM7 not minted yet
+        {"kind": "dimension", "payload": {"id": "DIM7", "name": "bore", "value": 20}},
+    ])
+    res = classify_ledger(lg, manifest=None, graded={"criteria": [], "passed": True})
+    fired = [c for c in res if c.failure_class == FailureClass.CONTEXT_LOSS.value]
+    assert fired and "DIM7" in fired[0].detail
 
 
 # --- abstraction_skip -------------------------------------------------------
@@ -212,6 +244,56 @@ def test_grind_does_not_fire_when_hypothesis_changes():
     assert not [c for c in res if c.failure_class == FailureClass.GRIND.value]
 
 
+def test_grind_real_shape_repeated_identical_calls_fire():
+    """Real tool_call payloads (agent_turn._log) carry no 'node' at all — grind
+    must still detect >=N identical repeats via the tool+args signature."""
+    same = {"event": "tool_call", "tool": "run_fea_static",
+            "args": {"load_N": 500, "material": "1045"}, "ok": True}
+    lg = _ledger([
+        {"kind": "agent_turn", "payload": dict(same)},
+        {"kind": "agent_turn", "payload": dict(same)},
+        {"kind": "agent_turn", "payload": dict(same)},
+    ])
+    res = classify_ledger(lg, manifest=None,
+                          graded={"criteria": [], "passed": True}, grind_threshold=3)
+    fired = [c for c in res if c.failure_class == FailureClass.GRIND.value]
+    assert fired and len(fired[0].evidence_seqs) == 3
+
+
+def test_grind_real_shape_different_deliverables_do_not_collapse():
+    """Different tool+args calls for different real deliverables (identified only
+    by their differing args, e.g. doc_id) must not be grouped together."""
+    lg = _ledger([
+        {"kind": "agent_turn", "payload": {"event": "tool_call", "tool": "verify_battery",
+            "args": {"doc_id": "part_a"}, "ok": True}},
+        {"kind": "agent_turn", "payload": {"event": "tool_call", "tool": "verify_battery",
+            "args": {"doc_id": "part_b"}, "ok": True}},
+    ])
+    res = classify_ledger(lg, manifest=None,
+                          graded={"criteria": [], "passed": True}, grind_threshold=3)
+    assert not [c for c in res if c.failure_class == FailureClass.GRIND.value]
+
+
+def test_grind_real_decision_events_same_stage_different_id_do_not_collapse():
+    """Regression: real decision events (ledger.log_decision) carry a workflow
+    'stage' shared by EVERY deliverable in that phase, not a deliverable id.
+    Three decisions with identical text (so the fingerprint alone can't tell them
+    apart) but different decision ids, all at the same stage, must NOT collapse
+    into one grind bucket keyed on the shared stage (the old '?'/stage fallback
+    would have wrongly grouped and fired grind here)."""
+    lg = _ledger([
+        {"kind": "decision", "payload": {"id": "fit_bore", "stage": "specify",
+            "text": "verified clearance fit", "rationale": "fit_report result"}},
+        {"kind": "decision", "payload": {"id": "fit_shaft", "stage": "specify",
+            "text": "verified clearance fit", "rationale": "fit_report result"}},
+        {"kind": "decision", "payload": {"id": "fit_pin", "stage": "specify",
+            "text": "verified clearance fit", "rationale": "fit_report result"}},
+    ])
+    res = classify_ledger(lg, manifest=None,
+                          graded={"criteria": [], "passed": True}, grind_threshold=3)
+    assert not [c for c in res if c.failure_class == FailureClass.GRIND.value]
+
+
 # --- advisory_ignored -------------------------------------------------------
 
 def test_advisory_ignored_contradicted_without_dispute():
@@ -233,6 +315,94 @@ def test_advisory_not_ignored_when_disputed():
             "scope": "spec", "text": "propose cantilever redesign"}},
         {"kind": "decision", "payload": {"id": "d1", "topic": "petg_snap_marginal",
             "action": "proceed"}},
+    ])
+    res = classify_ledger(lg, manifest=None, graded={"criteria": [], "passed": True})
+    assert not [c for c in res if c.failure_class == FailureClass.ADVISORY_IGNORED.value]
+
+
+# --- advisory_ignored (real producer shape) ----------------------------------
+
+_REAL_ADVISORY_ITEM = {
+    "id": "ADV-7-interference-boss_clash",
+    "severity": "warn",
+    "check": "check_interference",
+    "finding": "boss clashes with mating face",
+    "refs": {"doc_id": "doc123"},
+    "numbers": {},
+    "candidate_fixes": [{"tool": "edit_feature", "args": {}}],
+    "helper_tools": [],
+    "source": {"kind": "kernel", "detail": "interference_check"},
+}
+
+
+def _real_advisory_payload(items=None):
+    """advisor.engine.build_advisory's real shape — no top-level topic/id, ids
+    live per-item (engine._finding_to_item)."""
+    return {
+        "schema": "aicad.advisory/1", "seq": 3, "stage": "assembly",
+        "items": items if items is not None else [dict(_REAL_ADVISORY_ITEM)],
+        "user_override": False, "failure_cards": [],
+    }
+
+
+def test_advisory_ignored_no_false_positive_when_payload_has_no_identifiable_id():
+    """P0: a payload with no top-level topic/id AND no items (degenerate real
+    shape) must never fire. The old comparison was
+    ``pa.get("id") == pe.get("contradicts_advisory")`` — both None on virtually
+    every real advisory/tool_call pair, so None == None fired on almost
+    everything."""
+    lg = _ledger([
+        {"kind": "advisory", "payload": {"schema": "aicad.advisory/1", "seq": 1,
+            "stage": "assembly", "items": [], "user_override": False,
+            "failure_cards": []}},
+        {"kind": "agent_turn", "payload": {"event": "tool_call", "tool": "add_features",
+            "args": {"op": "boss"}, "ok": True}},
+    ])
+    res = classify_ledger(lg, manifest=None, graded={"criteria": [], "passed": True})
+    assert not [c for c in res if c.failure_class == FailureClass.ADVISORY_IGNORED.value]
+
+
+def test_advisory_ignored_real_shape_no_false_positive_when_heeded():
+    """P0 regression: a real advisory (with a real, non-empty item id) followed by
+    an unrelated real tool_call that heeds it (no contradiction tag at all) must
+    NOT fire advisory_ignored."""
+    lg = _ledger([
+        {"kind": "advisory", "payload": _real_advisory_payload()},
+        {"kind": "agent_turn", "payload": {"event": "tool_call", "tool": "edit_feature",
+            "args": {"feature": "boss_offset", "offset_mm": -2.0}, "ok": True}},
+    ])
+    res = classify_ledger(lg, manifest=None, graded={"criteria": [], "passed": True})
+    assert not [c for c in res if c.failure_class == FailureClass.ADVISORY_IGNORED.value]
+
+
+def test_advisory_ignored_real_shape_matches_per_item_id():
+    """Real advisory ids live in items[] (engine._finding_to_item), not at the
+    payload's top level — a later action tagged with the item's id must still be
+    recognised as a contradiction."""
+    lg = _ledger([
+        {"kind": "advisory", "payload": _real_advisory_payload()},
+        {"kind": "agent_turn", "payload": {"event": "tool_call", "tool": "add_features",
+            "args": {"op": "boss"}, "ok": True,
+            "contradicts_advisory": "ADV-7-interference-boss_clash"}},
+    ])
+    res = classify_ledger(lg, manifest=None, graded={"criteria": [], "passed": True})
+    fired = [c for c in res if c.failure_class == FailureClass.ADVISORY_IGNORED.value]
+    assert fired and len(fired[0].evidence_seqs) == 2
+
+
+def test_advisory_ignored_real_shape_disputed_via_advisory_dispute_tool():
+    """A real advisory_dispute event (services/mcp/advisor_tools.advisory_dispute,
+    ledger kind "advisory_dispute", payload carries "advisory_id") referencing the
+    item id must suppress the class, same as the scripted 'replan'/'dispute'
+    kinds."""
+    lg = _ledger([
+        {"kind": "advisory", "payload": _real_advisory_payload()},
+        {"kind": "advisory_dispute", "payload": {
+            "advisory_id": "ADV-7-interference-boss_clash", "reason": "acceptable risk",
+            "source_kind": "kernel", "waiver_required": True, "status": "pending"}},
+        {"kind": "agent_turn", "payload": {"event": "tool_call", "tool": "add_features",
+            "args": {"op": "boss"}, "ok": True,
+            "contradicts_advisory": "ADV-7-interference-boss_clash"}},
     ])
     res = classify_ledger(lg, manifest=None, graded={"criteria": [], "passed": True})
     assert not [c for c in res if c.failure_class == FailureClass.ADVISORY_IGNORED.value]

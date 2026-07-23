@@ -5272,35 +5272,40 @@ void drawSettingsModal(AppState& st, bool busy) {
                                 if (ImGui::SmallButton("Options"))
                                     ImGui::OpenPopup("tool_opts");
                                 if (ImGui::BeginPopup("tool_opts")) {
+                                    ImGui::TextUnformatted(tn);
+                                    ImGui::Separator();
+                                    const float fieldW = 90.0f * sc;   // compact int field; label sits to its right
+                                    const float boxW = 320.0f * sc;    // bounds the popup width (was -1 -> ballooned to ~1000px)
                                     int to = s_toolTimeout.count(tn) ? s_toolTimeout[tn] : 0;
                                     int mc = s_toolMaxCalls.count(tn) ? s_toolMaxCalls[tn] : 0;
+                                    ImGui::SetNextItemWidth(fieldW);
                                     if (ImGui::InputInt("timeout_s (0=default)", &to)) {
                                         s_toolTimeout[tn] = std::max(0, to);
                                         s_toolOptDirty = true;
                                     }
+                                    ImGui::SetNextItemWidth(fieldW);
                                     if (ImGui::InputInt("max_calls_per_turn (0=unlim)", &mc)) {
                                         s_toolMaxCalls[tn] = std::max(0, mc);
                                         s_toolOptDirty = true;
                                     }
-                                    std::string& def = s_toolDefaults[tn];
-                                    if (def.capacity() < 512) def.reserve(512);
-                                    def.resize(std::max<size_t>(def.size(), 1));
-                                    // Ensure buffer for InputText
                                     static char defBuf[2048];
                                     static char noteBuf[1024];
                                     std::snprintf(defBuf, sizeof(defBuf), "%s",
                                         s_toolDefaults.count(tn) ? s_toolDefaults[tn].c_str() : "{}");
                                     std::snprintf(noteBuf, sizeof(noteBuf), "%s",
                                         s_toolNote.count(tn) ? s_toolNote[tn].c_str() : "");
-                                    if (ImGui::InputTextMultiline("param_defaults JSON",
+                                    ImGui::Dummy(ImVec2(0, 2.0f * sc));
+                                    ImGui::TextUnformatted("param_defaults JSON");
+                                    if (ImGui::InputTextMultiline("##param_defaults",
                                             defBuf, sizeof(defBuf),
-                                            ImVec2(-1, 60 * sc))) {
+                                            ImVec2(boxW, 60 * sc))) {
                                         s_toolDefaults[tn] = defBuf;
                                         s_toolOptDirty = true;
                                     }
-                                    if (ImGui::InputTextMultiline("prompt_note",
+                                    ImGui::TextUnformatted("prompt_note");
+                                    if (ImGui::InputTextMultiline("##prompt_note",
                                             noteBuf, sizeof(noteBuf),
-                                            ImVec2(-1, 40 * sc))) {
+                                            ImVec2(boxW, 40 * sc))) {
                                         s_toolNote[tn] = noteBuf;
                                         s_toolOptDirty = true;
                                     }

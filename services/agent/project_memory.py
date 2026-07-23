@@ -8,6 +8,7 @@ only top-k hits that fit. Never dump the whole DB into the model context.
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import sqlite3
 import threading
@@ -113,6 +114,130 @@ def close_all() -> None:
         _conns.clear()
 
 
+# --------------------------------------------------------------------------- OMP bridge hybrid backend
+# Optional: recall/remember/stats can route through the OMP bridge's mnemopi-backed
+# memory_* RPCs (real reuse of vendor/omp/packages/mnemopi — see
+# OMP_INTEGRATION_PLAN.md §RPC CONTRACT, docs/omp-integration/01-DECISIONS.md §Memory)
+# instead of the SQLite+FTS5 path below. Off by default (unchanged behavior); opt in
+# with env AI_CAD_MEMORY_BACKEND=mnemopi or config.json agent.memory_backend="mnemopi".
+# Any bridge failure (bun/script missing, crash, timeout, RPC error) raises
+# omp_bridge.BridgeUnavailable, caught here to fall back to SQLite+FTS5 transparently.
+
+def _bridge():
+    from services.agent import omp_bridge  # noqa: PLC0415
+    return omp_bridge
+
+
+def _memory_backend(cfg: dict | None = None) -> str:
+    """``"sqlite"`` (default) or ``"mnemopi"``. Env wins over config.json."""
+    env = (os.environ.get("AI_CAD_MEMORY_BACKEND") or "").strip().lower()
+    if env in ("mnemopi", "omp", "bridge"):
+        return "mnemopi"
+    if env:
+        return "sqlite"
+    try:
+        from services.agent.config import load_config  # noqa: PLC0415
+        c = cfg if cfg is not None else load_config()
+        agent = c.get("agent") if isinstance(c, dict) else None
+        backend = agent.get("memory_backend") if isinstance(agent, dict) else None
+        if isinstance(backend, str) and backend.strip().lower() in ("mnemopi", "omp", "bridge"):
+            return "mnemopi"
+    except Exception:  # noqa: BLE001 — bad/missing config never breaks memory
+        pass
+    return "sqlite"
+
+
+def _stable_int_id(raw_id: Any) -> int:
+    """Deterministic non-negative int from a bridge-returned memory id.
+
+    mnemopi memory ids are opaque strings (vendor/omp/packages/mnemopi/src/
+    types.ts ``RecallResult.id``); this module's public API returns
+    ``int | None`` (SQLite ``rowid``), so bridge ids are hashed into a stable
+    surrogate int. Same string always hashes to the same int, so remember()'s
+    "identical content -> identical id" dedupe contract still holds.
+    """
+    if isinstance(raw_id, int):
+        return raw_id
+    if isinstance(raw_id, str) and raw_id.isdigit():
+        return int(raw_id)
+    digest = hashlib.sha256(str(raw_id).encode("utf-8")).digest()[:8]
+    return int.from_bytes(digest, "big")
+
+
+def _bridge_remember(bridge, project_root: str | Path, text: str, kind: str, source: str,
+                      importance: float) -> int | None:
+    """``remember`` via bridge ``memory_remember`` (mnemopi, real OMP reuse)."""
+    root = str(Path(project_root).expanduser().resolve())
+    result = bridge.call(
+        "memory_remember",
+        {"root": root, "content": text, "kind": kind, "source": source, "importance": importance},
+    )
+    raw_id = result.get("id", result.get("value"))
+    return None if raw_id is None else _stable_int_id(raw_id)
+
+
+def _bridge_recall(bridge, project_root: str | Path, query: str, limit: int, token_budget: int,
+                    kind: str | None) -> list[dict[str, Any]]:
+    """``recall`` via bridge ``memory_recall``; maps mnemopi ``RecallResult`` fields
+    (vendor/omp/packages/mnemopi/src/types.ts) onto this module's hit shape. The
+    bridge is handed ``tokenBudget`` and trusted to honor it server-side.
+    """
+    root = str(Path(project_root).expanduser().resolve())
+    params: dict[str, Any] = {"root": root, "query": query, "limit": limit, "tokenBudget": token_budget}
+    if kind:
+        params["kind"] = kind
+    result = bridge.call("memory_recall", params)
+    hits = result.get("hits", result.get("value"))
+    if not isinstance(hits, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for h in hits[:limit]:
+        if not isinstance(h, dict):
+            continue
+        content = str(h.get("content") or "")
+        try:
+            tok = int(h["tokens"]) if h.get("tokens") is not None else estimate_tokens(content)
+        except (TypeError, ValueError):
+            tok = estimate_tokens(content)
+        try:
+            importance = float(h.get("importance") or 0.5)
+        except (TypeError, ValueError):
+            importance = 0.5
+        try:
+            score = float(h.get("score") or 0.0)
+        except (TypeError, ValueError):
+            score = 0.0
+        raw_id = h.get("id")
+        out.append({
+            "id": _stable_int_id(raw_id) if raw_id is not None else 0,
+            "content": content,
+            "kind": str(h.get("kind") or h.get("memory_type") or h.get("memoryType") or "note"),
+            "source": str(h.get("source") or ""),
+            "importance": importance,
+            "score": score,
+            "tokens": tok,
+        })
+    return out
+
+
+def _bridge_stats(bridge, project_root: str | Path) -> dict[str, Any]:
+    """``stats`` via bridge ``memory_stats``."""
+    root = str(Path(project_root).expanduser().resolve())
+    result = bridge.call("memory_stats", {"root": root})
+    path = str(result.get("path") or result.get("database") or memory_db_path(project_root))
+    try:
+        count = int(result.get("count", result.get("total_memories", 0)) or 0)
+    except (TypeError, ValueError):
+        count = 0
+    exists = result.get("exists")
+    exists = bool(exists) if exists is not None else count > 0
+    out: dict[str, Any] = {"path": path, "count": count, "exists": exists}
+    if exists:
+        kinds = result.get("kinds")
+        out["kinds"] = kinds if isinstance(kinds, dict) else {}
+    return out
+
+
 def remember(
     project_root: str | Path,
     content: str,
@@ -121,7 +246,13 @@ def remember(
     source: str = "",
     importance: float = 0.5,
 ) -> int | None:
-    """Insert a memory. Dedupes identical content (returns existing id). None if empty."""
+    """Insert a memory. Dedupes identical content (returns existing id). None if empty.
+
+    Hybrid backend: routes through the OMP bridge (mnemopi) when
+    ``AI_CAD_MEMORY_BACKEND=mnemopi`` / ``agent.memory_backend`` is set, falling
+    back to SQLite+FTS5 below when the bridge is unavailable. Same signature and
+    return shape either way.
+    """
     text = _normalize_content(content)
     if not text:
         return None
@@ -134,6 +265,13 @@ def remember(
     except (TypeError, ValueError):
         imp = 0.5
     imp = max(0.0, min(1.0, imp))
+
+    if _memory_backend() == "mnemopi":
+        bridge = _bridge()
+        try:
+            return _bridge_remember(bridge, project_root, text, kind, source, imp)
+        except bridge.BridgeUnavailable:
+            pass  # OMP bridge unavailable — fall back to SQLite+FTS5 below
     now = time.time()
     h = _content_hash(text)
     conn = _connect(project_root)
@@ -194,6 +332,13 @@ def recall(
         token_budget = max(50, min(4000, int(token_budget)))
     except (TypeError, ValueError):
         token_budget = 400
+
+    if _memory_backend() == "mnemopi":
+        bridge = _bridge()
+        try:
+            return _bridge_recall(bridge, project_root, q, limit, token_budget, kind)
+        except bridge.BridgeUnavailable:
+            pass  # OMP bridge unavailable — fall back to SQLite+FTS5 below
 
     path = memory_db_path(project_root)
     if not path.is_file():
@@ -285,6 +430,12 @@ def format_for_context(hits: list[dict[str, Any]], *, header: str = "Project mem
 
 def stats(project_root: str | Path) -> dict[str, Any]:
     """Return basic counts for Settings / debug."""
+    if _memory_backend() == "mnemopi":
+        bridge = _bridge()
+        try:
+            return _bridge_stats(bridge, project_root)
+        except bridge.BridgeUnavailable:
+            pass  # OMP bridge unavailable — fall back to SQLite+FTS5 below
     path = memory_db_path(project_root)
     if not path.is_file():
         return {"path": str(path), "count": 0, "exists": False}

@@ -17,6 +17,7 @@ from __future__ import annotations
 import copy
 import json
 import math
+import os
 import re
 from typing import Any, Iterable
 
@@ -585,6 +586,201 @@ def _plan_text_archive(text: str, edge_chars: int = TEXT_EDGE_CHARS) -> dict[str
     }
 
 
+# --------------------------------------------------------------------------- OMP bridge hybrid backend
+# Optional: snapcompact_archive can route through the OMP bridge's ``compact`` RPC
+# (real reuse of OMP's snapcompact engine over vendor/omp/bridge — see
+# OMP_INTEGRATION_PLAN.md §RPC CONTRACT, docs/omp-integration/01-DECISIONS.md
+# §Compaction) instead of the pure-Python path below. Off by default (unchanged
+# behavior); opt in with env AI_CAD_COMPACTION_BACKEND=omp or config.json
+# agent.compaction.backend="omp". Any bridge failure (bun/script missing, crash,
+# timeout, RPC error) raises omp_bridge.BridgeUnavailable, caught here to fall
+# back to the pure-Python path transparently.
+
+def _bridge():
+    from services.agent import omp_bridge  # noqa: PLC0415
+    return omp_bridge
+
+
+def _compaction_backend(cfg: dict | None = None) -> str:
+    """``"local"`` (default) or ``"omp"``. Env wins over config.json."""
+    env = (os.environ.get("AI_CAD_COMPACTION_BACKEND") or "").strip().lower()
+    if env in ("omp", "bridge", "mnemopi"):
+        return "omp"
+    if env:
+        return "local"
+    try:
+        from services.agent.config import load_config  # noqa: PLC0415
+        c = cfg if cfg is not None else load_config()
+        agent = c.get("agent") if isinstance(c, dict) else None
+        comp = agent.get("compaction") if isinstance(agent, dict) else None
+        backend = comp.get("backend") if isinstance(comp, dict) else None
+        if isinstance(backend, str) and backend.strip().lower() in ("omp", "bridge", "mnemopi"):
+            return "omp"
+    except Exception:  # noqa: BLE001 — bad/missing config never breaks compaction
+        pass
+    return "local"
+
+
+def _to_wire_message(msg: dict) -> dict[str, Any]:
+    """Adapt one CAD transcript message onto the bridge's stricter ``compact``
+    wire shape (vendor/omp/bridge/src/compact.ts ``readCompactMessage``): role
+    ``toolResult`` (not ``tool``) with camelCase ``toolCallId``/``toolName``/
+    ``isError``, assistant tool calls as content parts (not a top-level OpenAI
+    ``tool_calls``). Reuses this module's own role/content accessors
+    (_is_tool_result/_tool_call_id/_tool_name/_is_error_result/_iter_tool_calls)
+    so both the local and bridge paths agree on what a message means.
+    """
+    if _is_tool_result(msg):
+        out: dict[str, Any] = {
+            "role": "toolResult",
+            "toolCallId": _tool_call_id(msg),
+            "content": _content_as_list(msg.get("content")),
+        }
+        name = _tool_name(msg)
+        if name:
+            out["toolName"] = name
+        if _is_error_result(msg):
+            out["isError"] = True
+        if msg.get("useless") is True:
+            out["useless"] = True
+        return out
+
+    if _is_assistant(msg):
+        parts: list[dict[str, Any]] = []
+        content = msg.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "text" and block.get("text"):
+                    parts.append({"type": "text", "text": str(block["text"])})
+                elif block.get("type") == "thinking" and block.get("thinking"):
+                    parts.append({"type": "thinking", "thinking": str(block["thinking"])})
+        elif isinstance(content, str) and content:
+            parts.append({"type": "text", "text": content})
+        for tc in _iter_tool_calls(msg):
+            if not tc.get("id") or not tc.get("name"):
+                continue
+            part: dict[str, Any] = {
+                "type": "toolCall", "id": tc["id"], "name": tc["name"],
+                "arguments": tc.get("arguments") or {},
+            }
+            if tc.get("intent"):
+                part["intent"] = str(tc["intent"])
+            parts.append(part)
+        return {"role": "assistant", "content": parts}
+
+    return {
+        "role": "developer" if _role(msg) == "developer" else "user",
+        "content": _content_as_list(msg.get("content")),
+    }
+
+
+def _to_wire_archive(archive: dict) -> dict[str, Any]:
+    """CAD's ``archive`` dict (snake_case — this module's own shape, possibly a
+    previous bridge response already mapped back to it) onto compact.ts's
+    camelCase ``Archive`` wire shape (``readArchive``), so a ``prior_archive``
+    round-trips correctly no matter which backend produced it.
+    """
+    out: dict[str, Any] = {"frames": archive.get("frames") or []}
+    total_chars = archive.get("total_chars", archive.get("totalChars"))
+    if total_chars is not None:
+        out["totalChars"] = total_chars
+    truncated_chars = archive.get("truncated_chars", archive.get("truncatedChars"))
+    if truncated_chars is not None:
+        out["truncatedChars"] = truncated_chars
+    if archive.get("text"):
+        out["text"] = archive["text"]
+    text_head = archive.get("text_head", archive.get("textHead"))
+    if text_head:
+        out["textHead"] = text_head
+    text_tail = archive.get("text_tail", archive.get("textTail"))
+    if text_tail:
+        out["textTail"] = text_tail
+    checksum = archive.get("checksum")
+    if checksum:
+        out["checksum"] = checksum
+    return out
+
+
+def _bridge_compact(bridge, messages: list[dict], keep_recent_tokens: int, prior_archive: dict | None,
+                     supersede_reads: bool) -> dict[str, Any]:
+    """``snapcompact_archive`` via the bridge's ``compact`` RPC — OMP's real
+    snapcompact algorithm (vendor/omp/packages/snapcompact: foveation + PNG
+    frame planning), reused verbatim server-side; see
+    vendor/omp/bridge/src/compact.ts and OMP_INTEGRATION_PLAN.md §RPC CONTRACT.
+
+    The bridge owns the keep/discard boundary (it re-derives it from
+    ``messages`` + ``keepRecentTokens`` with its own tool-result-safe cut,
+    mirroring but not reusing this module's ``find_cut_index``); this function
+    only trusts the *count* of ``keptMessages`` it returns and re-slices the
+    original CAD-shaped ``msgs`` at that boundary, so ``kept_messages`` in the
+    result is always this module's own message objects — never the bridge's
+    re-serialized wire copies (role/content get lossily normalized on the
+    wire, e.g. ``tool`` -> ``toolResult``, ``tool_call_id`` -> ``toolCallId``).
+
+    Maps ``{keptMessages,summary,shortSummary,archive?,checksum,frames?,
+    recoverable?,warning?}`` back onto this module's ``{archive,summary,
+    short_summary,kept_messages,cut_index}`` shape (plus ``checksum``/
+    ``recoverable``/``warning`` as additive extra keys when present).
+    """
+    msgs = list(messages or [])
+    if supersede_reads:
+        msgs = apply_supersede_reads(msgs)
+
+    params: dict[str, Any] = {
+        "messages": [_to_wire_message(m) for m in msgs],
+        "keepRecentTokens": int(keep_recent_tokens),
+    }
+    if isinstance(prior_archive, dict):
+        params["priorArchive"] = _to_wire_archive(prior_archive)
+
+    result = bridge.call("compact", params, timeout=120)
+
+    wire_kept = result.get("keptMessages")
+    kept_count = len(wire_kept) if isinstance(wire_kept, list) else len(msgs)
+    cut_index = max(0, min(len(msgs), len(msgs) - kept_count))
+    kept_messages = msgs[cut_index:]
+
+    raw_archive = result.get("archive")
+    raw_archive = raw_archive if isinstance(raw_archive, dict) else {}
+    frames = result.get("frames")
+    if not isinstance(frames, list):
+        frames = raw_archive.get("frames") or []
+    text_head = str(raw_archive.get("textHead") or raw_archive.get("text") or "")
+    text_tail = str(raw_archive.get("textTail") or "")
+    if not text_head and not text_tail:
+        # No native/foveated archive (e.g. no pi-natives binary for this platform, or the
+        # renderer threw) — compact.ts's textFallbackResult puts the whole serialized
+        # archive into `summary` instead (vendor/omp/bridge/src/compact.ts:277-292). Mirror
+        # that into archive.text/text_head so reinject_archive() finds it there too.
+        text_head = str(result.get("summary") or "")
+    archive: dict[str, Any] = {
+        "text": str(raw_archive.get("text") or text_head),
+        "text_head": text_head,
+        "text_tail": text_tail,
+        "truncated_chars": int(raw_archive.get("truncatedChars") or 0),
+        "total_chars": int(raw_archive.get("totalChars") or (len(text_head) + len(text_tail))),
+        "frames": frames,
+    }
+
+    out: dict[str, Any] = {
+        "archive": archive,
+        "summary": str(result.get("summary") or ""),
+        "short_summary": str(result.get("shortSummary") or ""),
+        "kept_messages": kept_messages,
+        "cut_index": cut_index,
+    }
+    if "checksum" in result:
+        archive["checksum"] = result["checksum"]  # embedded too, so a later prior_archive round-trip carries it
+        out["checksum"] = result["checksum"]
+    if isinstance(result.get("recoverable"), dict):
+        out["recoverable"] = result["recoverable"]
+    if result.get("warning"):
+        out["warning"] = result["warning"]
+    return out
+
+
 # --------------------------------------------------------------------------- snapcompact_archive
 
 def snapcompact_archive(
@@ -608,7 +804,19 @@ def snapcompact_archive(
 
     No LLM call. PNG frames are intentionally omitted (future/vision phase).
     Never cuts mid tool-result. Cumulative fold of ``prior_archive["text"]``.
+
+    Hybrid backend: when gated on (env AI_CAD_COMPACTION_BACKEND=omp /
+    agent.compaction.backend="omp" in config.json), routes through the OMP
+    bridge's ``compact`` RPC (vendor/omp/bridge) instead of the pure-Python
+    path below, falling back here whenever the bridge is unavailable. Same
+    return shape either way (see docstring above).
     """
+    if _compaction_backend() == "omp":
+        bridge = _bridge()
+        try:
+            return _bridge_compact(bridge, messages, keep_recent_tokens, prior_archive, supersede_reads)
+        except bridge.BridgeUnavailable:
+            pass  # OMP bridge unavailable — fall back to the pure-Python path below
     msgs = list(messages or [])
     if supersede_reads:
         msgs = apply_supersede_reads(msgs)

@@ -4,12 +4,24 @@ Status board + contracts for wiring oh-my-pi ("OMP") into CAD's built-in copilot
 IDE. Detail + research live in `docs/omp-integration/` (`00-OPTIONS-AND-DECISIONS.md`,
 `01-DECISIONS.md`, `research/`). This file is the top-level, always-current plan.
 
-## Landed (on master)
-- `scripts/vendor_omp.py` + `vendor/omp/` — deterministic vendoring; prebuilt `pi-natives` via npm.
-- `vendor/omp/bridge` — bun sidecar: `ping|listProviders|listModels|complete` + 13 auth/model/cost
-  methods (`auth_*`, `models_list`, `cost_summary`). Verified end-to-end.
-- `core/agent/omp_bridge_client.{h,cpp}` — long-lived bun sidecar client (mirrors `worker_bridge.cpp`).
-- `core/agent/providers.cpp` — gated OMP-backed branch in `complete()` (provider-id set empty → wire in S-CORE).
+## Landed (on master) — all 6 slices, full Billet host binary builds
+- **Vendoring** `scripts/vendor_omp.py` + `vendor/omp/` — deterministic; prebuilt `pi-natives` via npm.
+- **Bridge** `vendor/omp/bridge` — bun sidecar: `complete`, `listProviders`(67), `models_list`,
+  `cost_summary`, 13 `auth_*`, `memory_*`, `compact` (safety: sha256 frames + recoverable + text
+  fallback), `warm_cache`/`cache_policy`. Verified via bun stdio.
+- **C++ core** `core/agent/omp_bridge_client.{h,cpp}` + `providers.cpp` (52 OMP ids routed) +
+  `config.cpp` + 12 `libaicad` C-ABI methods + `CompleteResult.usage`. `aicad_agent`/`aicad` build clean.
+- **Provider UI** `settings_modal.cpp` (Settings→Providers: key+OAuth sign-in) + `copilot/settings.cpp`
+  (model cost sublabels + session cost strip). Full `Billet` builds+links.
+- **Memory** `services/agent/{omp_bridge.py,project_memory.py,compaction.py}` — mnemopi/snapcompact
+  hybrid, opt-in (`AI_CAD_MEMORY_BACKEND`/`AI_CAD_COMPACTION_BACKEND`), SQLite fallback.
+- **Firmware** `core/firmware/hardware.cpp` (avrdude/OpenOCD-GDB/simavr/Renode/serial) + 12 RPCs +
+  `fw_workspace.cpp` unified Arduino-style IDE. `test_firmware` 24/24; live Renode.
+
+### Remaining (next phase, after runtime verify)
+- Cache-warming/cheap-recompact: UI toggles + C++ idle-scheduler (backend done).
+- Firmware breadth beyond ARM/AVR (RISC-V rides gdb-MI; PIC/FPGA/PLC need glue).
+- Installer bundling of `bun` (+ `pi-natives`). Prewalk/advisor/slash-commands (not started).
 
 ## Architecture (data flow)
 ```

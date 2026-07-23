@@ -29,3 +29,6 @@ either live or marked historical); verify Linux gate fully green and a Windows b
 - [x] Docs match the tree; no stale references (link sweep in check.py if cheap).
 - [ ] Linux gate green; Windows build verified.
 - [x] Board: every T-RF* done; final REFACTOR_LOG paragraph; graphify update run.
+
+## Progress log
+- 2026-07-23 08:00 UTC [integrator] Windows build verification (2026-07-23): no MSVC toolchain on this Linux box (windows-core/windows-occt presets are MSVC-only). Verified instead: all wave-touched C++ (core/ecad/session.cpp, core/sim/spice.cpp, core/api/libaicad.cpp, host/src/main.cpp) is ISO C++17 and passes x86_64-w64-mingw32-g++ -fsyntax-only for the Windows target (zero errors; one pre-existing benign NOMINMAX redefine warning). A real MSVC build still needs a Windows host — recorded honestly rather than faked.

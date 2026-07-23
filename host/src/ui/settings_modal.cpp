@@ -976,6 +976,777 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
     }
 }
 
+// ---- OMP provider manager (Settings → Providers) — S-UI-PROV ----------------------
+// Two-pane provider sign-in/manager per docs/omp-integration/research/design-provider-signin-ui.md
+// §3.1, driven by the frozen libaicad C-ABI methods (OMP_INTEGRATION_PLAN.md RPC CONTRACT),
+// which proxy the bun bridge auth_*/models_list methods. The UI holds no auth truth — it
+// renders the last agent_provider_list/agent_provider_state response and re-polls on open +
+// short TTL (mirrors drawSubscriptionAccounts above). Degrade: unknown_method (sibling slice
+// mid-flight / older core) flips s_omp.available off permanently and the tab falls back to
+// the legacy Provider & Model / Moonshot / Accounts sections.
+struct OmpProviderRow {
+    std::string id;            // OMP registry id ("anthropic", "kimi-code", "moonshot", ...)
+    std::string label;
+    std::string state;         // signed_out|key_set|oauth_connected|error|disabled
+    std::string origin;        // runtime|config|oauth|api_key|env|fallback (empty = none)
+    std::string envVar;        // when origin == "env"
+    std::string error;         // last validate/login error text
+    std::string consoleUrl;    // vendor key console deep link
+    bool keyless = false;
+    bool hasApiKey = false;    // authKinds contains "api_key"
+    bool hasOAuth = false;     // authKinds contains "oauth"
+    int modelsAvailable = 0;
+};
+struct OmpAccountRow {
+    int credentialId = 0;
+    std::string accountId;
+    std::string email;
+    std::string orgName;
+};
+struct OmpProvDetail {
+    bool loaded = false;
+    std::string state;
+    std::string origin;
+    std::string error;
+    std::vector<OmpAccountRow> accounts;
+    std::vector<SubUsageWindow> usage;
+    std::vector<std::string> usageNotes;
+};
+struct OmpOAuthFlow {
+    bool active = false;
+    bool pollInFlight = false;
+    std::string handle;
+    std::string provider;
+    std::string status;        // starting|awaiting_auth|connected|error|cancelled
+    std::string url;
+    std::string launchUrl;
+    std::string instructions;
+    std::string progress;
+    std::string error;
+    double lastPoll = -1e9;
+    char codeBuf[512] = "";
+};
+struct OmpProvUi {
+    bool available = true;     // false after unknown_method → legacy fallback
+    bool listInFlight = false;
+    double lastListPoll = -1e9;
+    std::vector<OmpProviderRow> rows;
+    std::string selectedId;
+    std::string lastError;
+    OmpProvDetail detail;
+    std::string detailFor;
+    bool detailInFlight = false;
+    double lastDetailPoll = -1e9;
+    // API-key flow (per selected provider)
+    char keyBuf[256] = "";
+    std::string keyFor;
+    bool keyBusy = false;
+    std::string keyStatus;
+    bool keyStatusErr = false;
+    OmpOAuthFlow oauth;
+    int lastDrawnFrame = -100;
+};
+static OmpProvUi s_omp;
+
+static bool ompRpcAbsent(const core::RpcResult& r) {
+    if (!r.ok) {
+        const std::string& e = r.err;
+        if (e.find("unknown") != std::string::npos || e.find("not found") != std::string::npos ||
+            e.find("not_found") != std::string::npos || e.find("method") != std::string::npos)
+            return true;
+        return false;
+    }
+    if (!r.result.is_object()) return false;
+    if (r.result.contains("code")) {
+        const std::string c = r.result.value("code", std::string());
+        if (c == "unknown_method" || c == "method_not_found" || c == "not_implemented")
+            return true;
+    }
+    if (!r.result.value("ok", true)) {
+        const std::string reason = r.result.value("reason", std::string());
+        if (reason == "unknown_method" || reason == "method_not_found" ||
+            reason == "not_implemented")
+            return true;
+    }
+    return false;
+}
+
+// Claude stack + Kimi first (design brief), then signed-in providers, then the rest alpha.
+static int ompProviderRank(const OmpProviderRow& r) {
+    if (r.id == "anthropic") return 0;
+    if (r.id == "kimi-code") return 1;
+    if (r.id == "moonshot") return 2;
+    if (r.state != "signed_out" && !r.state.empty()) return 3;
+    return 4;
+}
+
+static void pollOmpProviderList(AppState& st, bool force) {
+    if (!s_omp.available || s_omp.listInFlight) return;
+    const double now = ImGui::GetTime();
+    if (!force && (now - s_omp.lastListPoll) < 3.0) return;
+    s_omp.lastListPoll = now;
+    s_omp.listInFlight = true;
+    st.rpc.call("agent_provider_list", nlohmann::json::object(),
+                [](const core::RpcResult& r) {
+        s_omp.listInFlight = false;
+        if (ompRpcAbsent(r)) {
+            s_omp.available = false;   // permanent degrade → legacy sections
+            return;
+        }
+        if (!r.ok || !r.result.is_object()) {
+            if (s_omp.lastError.empty())
+                s_omp.lastError = r.err.empty() ? "provider list unavailable" : r.err;
+            return;
+        }
+        if (!optionalJsonBool(r.result, "ok", true)) {
+            s_omp.lastError = optionalJsonString(r.result, "error");
+            if (s_omp.lastError.empty()) s_omp.lastError = "provider list failed";
+            return;
+        }
+        s_omp.lastError.clear();
+        const auto* arr = optionalJsonArr(r.result, "providers");
+        if (!arr) return;
+        s_omp.rows.clear();
+        for (const auto& p : *arr) {
+            if (!p.is_object()) continue;
+            OmpProviderRow row;
+            row.id = optionalJsonString(p, "id");
+            if (row.id.empty()) continue;
+            row.label = optionalJsonString(p, "label");
+            if (row.label.empty()) row.label = row.id;
+            row.state = optionalJsonString(p, "state");
+            if (row.state.empty()) row.state = "signed_out";
+            row.origin = optionalJsonString(p, "origin");
+            row.envVar = optionalJsonString(p, "envVar");
+            row.error = optionalJsonString(p, "error");
+            row.consoleUrl = optionalJsonString(p, "consoleUrl");
+            row.keyless = optionalJsonBool(p, "keyless", false);
+            row.modelsAvailable = optionalJsonInt(p, "modelsAvailable", 0);
+            if (const auto* kinds = optionalJsonArr(p, "authKinds")) {
+                for (const auto& k : *kinds) {
+                    if (!k.is_string()) continue;
+                    const std::string ks = k.get<std::string>();
+                    if (ks == "api_key") row.hasApiKey = true;
+                    if (ks == "oauth") row.hasOAuth = true;
+                }
+            }
+            s_omp.rows.push_back(std::move(row));
+        }
+        std::stable_sort(s_omp.rows.begin(), s_omp.rows.end(),
+                         [](const OmpProviderRow& a, const OmpProviderRow& b) {
+            const int ra = ompProviderRank(a), rb = ompProviderRank(b);
+            if (ra != rb) return ra < rb;
+            return a.label < b.label;
+        });
+        if (s_omp.selectedId.empty() && !s_omp.rows.empty())
+            s_omp.selectedId = s_omp.rows.front().id;
+    });
+}
+
+static void fetchOmpProviderDetail(AppState& st, const std::string& id, bool force) {
+    if (!s_omp.available || id.empty() || s_omp.detailInFlight) return;
+    const double now = ImGui::GetTime();
+    if (!force && s_omp.detailFor == id && (now - s_omp.lastDetailPoll) < 60.0) return;
+    s_omp.lastDetailPoll = now;
+    s_omp.detailInFlight = true;
+    s_omp.detailFor = id;
+    st.rpc.call("agent_provider_state", nlohmann::json{{"provider", id}},
+                [id](const core::RpcResult& r) {
+        s_omp.detailInFlight = false;
+        if (ompRpcAbsent(r)) { s_omp.available = false; return; }
+        if (!r.ok || !r.result.is_object() || !optionalJsonBool(r.result, "ok", true))
+            return;   // soft fail — keep last detail
+        if (s_omp.detailFor != id) return;   // selection moved on
+        OmpProvDetail d;
+        d.loaded = true;
+        d.state = optionalJsonString(r.result, "state");
+        d.origin = optionalJsonString(r.result, "origin");
+        d.error = optionalJsonString(r.result, "error");
+        if (const auto* accts = optionalJsonArr(r.result, "accounts")) {
+            for (const auto& a : *accts) {
+                if (!a.is_object()) continue;
+                OmpAccountRow ac;
+                ac.credentialId = optionalJsonInt(a, "credentialId", 0);
+                ac.accountId = optionalJsonString(a, "accountId");
+                ac.email = optionalJsonString(a, "email");
+                ac.orgName = optionalJsonString(a, "orgName");
+                d.accounts.push_back(std::move(ac));
+            }
+        }
+        const nlohmann::json usage = optionalJsonObj(r.result, "usage");
+        if (usage.is_object() && !usage.empty()) {
+            if (const auto* notes = optionalJsonArr(usage, "notes"))
+                for (const auto& n : *notes)
+                    if (n.is_string()) d.usageNotes.push_back(n.get<std::string>());
+            if (const auto* wins = optionalJsonArr(usage, "windows")) {
+                for (const auto& w : *wins) {
+                    if (!w.is_object()) continue;
+                    SubUsageWindow sw;
+                    sw.window = optionalJsonString(w, "id");
+                    sw.label = optionalJsonString(w, "label");
+                    if (sw.label.empty()) sw.label = optionalJsonString(w, "windowLabel");
+                    if (sw.label.empty()) sw.label = sw.window;
+                    auto it = w.find("usedFraction");
+                    if (it != w.end() && it->is_number()) {
+                        sw.usedFraction = (float)it->get<double>();
+                        sw.hasFraction = true;
+                    }
+                    sw.resetsAt = optionalJsonString(w, "resetsAt");
+                    sw.status = optionalJsonString(w, "status");
+                    if (sw.status.empty()) sw.status = "unknown";
+                    d.usage.push_back(std::move(sw));
+                }
+            }
+        }
+        s_omp.detail = std::move(d);
+    }, 15000);   // auth_state fetches usage reports upstream (8s bridge-side cap)
+}
+
+static void refreshOmpProvider(AppState& st) {
+    s_omp.lastListPoll = -1e9;
+    s_omp.lastDetailPoll = -1e9;
+    pollOmpProviderList(st, true);
+    fetchOmpProviderDetail(st, s_omp.selectedId, true);
+}
+
+// Parse one OAuth flow snapshot (shared by begin_oauth and oauth_poll results).
+static void ompOAuthApplySnapshot(const nlohmann::json& r) {
+    OmpOAuthFlow& f = s_omp.oauth;
+    const std::string st_ = optionalJsonString(r, "status");
+    if (!st_.empty()) f.status = st_;
+    const std::string url = optionalJsonString(r, "url");
+    if (!url.empty()) f.url = url;
+    const std::string launch = optionalJsonString(r, "launchUrl");
+    if (!launch.empty()) f.launchUrl = launch;
+    const std::string instr = optionalJsonString(r, "instructions");
+    if (!instr.empty()) f.instructions = instr;
+    const std::string prog = optionalJsonString(r, "progress");
+    if (!prog.empty()) f.progress = prog;
+    const std::string err = optionalJsonString(r, "error");
+    if (!err.empty()) f.error = err;
+}
+
+static void beginOmpOAuth(AppState& st, const std::string& provider) {
+    OmpOAuthFlow& f = s_omp.oauth;
+    if (f.active) return;
+    f = OmpOAuthFlow{};   // reset (keeps codeBuf zeroed)
+    f.active = true;
+    f.provider = provider;
+    f.status = "starting";
+    st.rpc.call("agent_provider_begin_oauth", nlohmann::json{{"provider", provider}},
+                [&st](const core::RpcResult& r) {
+        OmpOAuthFlow& f = s_omp.oauth;
+        if (!r.ok || !r.result.is_object() || !optionalJsonBool(r.result, "ok", true)) {
+            f.status = "error";
+            f.error = !r.ok ? (r.err.empty() ? "sign-in failed to start" : r.err)
+                            : optionalJsonString(r.result, "error");
+            if (f.error.empty()) f.error = "sign-in failed to start";
+            return;
+        }
+        f.handle = optionalJsonString(r.result, "handle");
+        ompOAuthApplySnapshot(r.result);
+        if (f.status == "connected") {
+            f.active = false;
+            st.addLog("[ok] signed in to " + f.provider);
+            refreshOmpProvider(st);
+        }
+    }, 30000);   // bridge waits up to 20s for the first onAuth callback
+}
+
+static void pollOmpOAuth(AppState& st) {
+    OmpOAuthFlow& f = s_omp.oauth;
+    if (!f.active || f.handle.empty() || f.pollInFlight) return;
+    if (f.status != "starting" && f.status != "awaiting_auth") return;
+    const double now = ImGui::GetTime();
+    if ((now - f.lastPoll) < 1.0) return;
+    f.lastPoll = now;
+    f.pollInFlight = true;
+    st.rpc.call("agent_provider_oauth_poll", nlohmann::json{{"handle", f.handle}},
+                [&st](const core::RpcResult& r) {
+        OmpOAuthFlow& f = s_omp.oauth;
+        f.pollInFlight = false;
+        if (!r.ok || !r.result.is_object() || !optionalJsonBool(r.result, "ok", true)) {
+            // Transient poll failure — keep waiting; the flow itself owns the TTL.
+            return;
+        }
+        ompOAuthApplySnapshot(r.result);
+        if (f.status == "connected") {
+            f.active = false;
+            st.addLog("[ok] signed in to " + f.provider);
+            refreshOmpProvider(st);
+        } else if (f.status == "error" || f.status == "cancelled") {
+            f.active = false;
+        }
+    }, 10000);
+}
+
+static const float* ompStateColor(const std::string& state) {
+    if (state == "oauth_connected" || state == "key_set") return ui::palette.statusOk;
+    if (state == "error") return ui::palette.statusErr;
+    return ui::palette.textDim;   // signed_out / disabled / unknown
+}
+
+static const char* ompStateLabel(const OmpProviderRow& r) {
+    if (r.state == "oauth_connected") return "OAuth connected";
+    if (r.state == "key_set")
+        return r.origin == "env" ? "key set (env)" : "API key set";
+    if (r.state == "error") return "error";
+    if (r.state == "disabled") return "disabled";
+    if (r.keyless) return "keyless";
+    return "signed out";
+}
+
+static void drawOmpProviderDetail(AppState& st, float sc) {
+    const OmpProviderRow* row = nullptr;
+    for (const auto& r : s_omp.rows)
+        if (r.id == s_omp.selectedId) { row = &r; break; }
+    if (!row) {
+        dimText("Select a provider on the left.");
+        return;
+    }
+    const OmpProviderRow& prov = *row;
+    const auto& pal = ui::palette;
+    ImGui::PushID(prov.id.c_str());
+
+    fetchOmpProviderDetail(st, prov.id, false);
+    const bool detailReady = s_omp.detail.loaded && s_omp.detailFor == prov.id;
+    const std::string state = detailReady && !s_omp.detail.state.empty()
+                                  ? s_omp.detail.state : prov.state;
+
+    // ---- header: label + state + disable toggle (mapped CAD categories only) ----
+    ImGui::PushStyleColor(ImGuiCol_Text,
+        ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1.0f));
+    ImGui::TextUnformatted(prov.label.c_str());
+    ImGui::PopStyleColor();
+    const float* scol = ompStateColor(state);
+    ImGui::SameLine(0, 8.0f * sc);
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(scol[0], scol[1], scol[2], 1.0f));
+    ImGui::TextUnformatted(ompStateLabel(prov));
+    ImGui::PopStyleColor();
+    // Disable = CAD's provider-category off switch (composer picker hides the models;
+    // credentials stay). Only the bridge providers with a CAD category key get the toggle.
+    const char* catKey = nullptr;
+    if (prov.id == "anthropic") catKey = "anthropic";
+    else if (prov.id == "kimi-code") catKey = "kimi-code";
+    else if (prov.id == "moonshot") catKey = "moonshot";
+    if (catKey) {
+        ImGui::SameLine(0, 16.0f * sc);
+        bool disabled = st.settings.disabledProviders.count(catKey) != 0;
+        if (ImGui::Checkbox("Disable", &disabled)) {
+            if (disabled) st.settings.disabledProviders.insert(catKey);
+            else st.settings.disabledProviders.erase(catKey);
+            saveSettings(st.settings);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Hide this provider's models from the copilot picker. "
+                              "Credentials are kept — re-enable restores.");
+    }
+
+    // ---- Sign-in section ----
+    settingsGlassSectionBegin("##omp_signin", "Sign-in");
+    if (state == "error") {
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.statusErr));
+        ImGui::TextWrapped("%s", (detailReady && !s_omp.detail.error.empty()
+                                      ? s_omp.detail.error : prov.error).c_str());
+        ImGui::PopStyleColor();
+        if (ImGui::SmallButton("Retry")) refreshOmpProvider(st);
+        ImGui::SameLine(0, 8.0f * sc);
+    }
+    if (state == "oauth_connected") {
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.statusOk));
+        ImGui::TextUnformatted("\xe2\x97\x8f OAuth connected");
+        ImGui::PopStyleColor();
+        if (detailReady) {
+            for (const auto& ac : s_omp.detail.accounts) {
+                ImGui::PushID(ac.credentialId);
+                std::string who = !ac.email.empty() ? ac.email
+                                  : (!ac.accountId.empty() ? shortAccountId(ac.accountId)
+                                                           : "(account)");
+                ImGui::Bullet();
+                ImGui::TextUnformatted(who.c_str());
+                if (!ac.orgName.empty()) {
+                    ImGui::SameLine(0, 6.0f * sc);
+                    ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+                    ImGui::TextUnformatted(ac.orgName.c_str());
+                    ImGui::PopStyleColor();
+                }
+                ImGui::PopID();
+            }
+        }
+        if (prov.hasOAuth && !s_omp.oauth.active) {
+            if (ImGui::SmallButton("Add account")) beginOmpOAuth(st, prov.id);
+            ImGui::SameLine(0, 8.0f * sc);
+        }
+        if (ImGui::SmallButton("Sign out")) {
+            st.rpc.call("agent_provider_logout",
+                        nlohmann::json{{"provider", prov.id}},
+                        [&st, pid = prov.id](const core::RpcResult& r) {
+                if (!r.ok || !r.result.is_object() ||
+                    !optionalJsonBool(r.result, "ok", true)) {
+                    s_omp.lastError = !r.ok ? r.err : optionalJsonString(r.result, "error");
+                } else {
+                    s_omp.lastError.clear();
+                }
+                refreshOmpProvider(st);
+            });
+        }
+    } else if (state == "key_set") {
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.statusOk));
+        ImGui::TextUnformatted(prov.origin == "env" && !prov.envVar.empty()
+                                   ? (std::string("\xe2\x97\x8f key set via ") + prov.envVar).c_str()
+                                   : "\xe2\x97\x8f API key set");
+        ImGui::PopStyleColor();
+        if (ImGui::SmallButton("Remove key")) {
+            st.rpc.call("agent_provider_remove_key",
+                        nlohmann::json{{"provider", prov.id}},
+                        [&st](const core::RpcResult& r) {
+                if (!r.ok || !r.result.is_object() ||
+                    !optionalJsonBool(r.result, "ok", true))
+                    s_omp.lastError = !r.ok ? r.err : optionalJsonString(r.result, "error");
+                refreshOmpProvider(st);
+            });
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Remove the stored key from the auth bridge. "
+                              "Paste a new key below to replace it.");
+    } else if (prov.keyless) {
+        dimText("No credential needed — this provider serves models without a key.");
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+        ImGui::TextUnformatted("\xe2\x97\x8b signed out");
+        ImGui::PopStyleColor();
+    }
+
+    // OAuth entry point + in-flight flow.
+    OmpOAuthFlow& flow = s_omp.oauth;
+    const bool flowHere = flow.active && flow.provider == prov.id;
+    if (prov.hasOAuth && state != "oauth_connected" && !flow.active) {
+        if (primaryButton("Sign in\xe2\x80\xa6", ImVec2(140.0f * sc, 0))) {
+            beginOmpOAuth(st, prov.id);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Browser OAuth (PKCE loopback or device code, whichever the "
+                              "provider supports). A manual code paste fallback is offered "
+                              "when the browser can't be opened.");
+    }
+    if (flowHere || (!flow.active && flow.provider == prov.id &&
+                     (flow.status == "error" || flow.status == "cancelled"))) {
+        ImGui::Dummy(ImVec2(0, 4.0f * sc));
+        if (flow.status == "starting") {
+            ImGui::TextUnformatted("Starting sign-in\xe2\x80\xa6");
+        } else if (flow.status == "awaiting_auth") {
+            if (!flow.progress.empty()) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+                ImGui::TextWrapped("%s", flow.progress.c_str());
+                ImGui::PopStyleColor();
+            } else {
+                ImGui::TextUnformatted("Waiting for browser approval\xe2\x80\xa6");
+            }
+            if (!flow.instructions.empty()) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+                ImGui::TextWrapped("%s", flow.instructions.c_str());
+                ImGui::PopStyleColor();
+            }
+            const std::string& openUrl = !flow.launchUrl.empty() ? flow.launchUrl : flow.url;
+            if (!openUrl.empty()) {
+                ImGui::TextWrapped("%s", openUrl.c_str());
+                if (ImGui::SmallButton("Copy URL")) ImGui::SetClipboardText(openUrl.c_str());
+                ImGui::SameLine(0, 6.0f * sc);
+                if (ImGui::SmallButton("Open in browser")) {
+#if defined(_WIN32)
+                    std::system(("start \"\" \"" + openUrl + "\"").c_str());
+#elif defined(__APPLE__)
+                    std::system(("open '" + openUrl + "'").c_str());
+#else
+                    std::system(("xdg-open '" + openUrl + "' >/dev/null 2>&1 &").c_str());
+#endif
+                }
+            }
+            // Manual fallback: paste the device code / full redirect URL.
+            ImGui::SetNextItemWidth(-1);
+            ImGui::InputTextWithHint("##omp_oauth_code", "Paste code or redirect URL\xe2\x80\xa6",
+                                     flow.codeBuf, sizeof(flow.codeBuf));
+            if (ImGui::SmallButton("Submit code") && flow.codeBuf[0]) {
+                st.rpc.call("agent_provider_oauth_manual",
+                            nlohmann::json{{"handle", flow.handle}, {"code", flow.codeBuf}},
+                            [](const core::RpcResult& r) {
+                    if (!r.ok || !r.result.is_object() ||
+                        !optionalJsonBool(r.result, "ok", true))
+                        s_omp.oauth.error = !r.ok ? r.err
+                                                  : optionalJsonString(r.result, "error");
+                    s_omp.oauth.codeBuf[0] = 0;
+                    s_omp.oauth.lastPoll = -1e9;   // pick up the result on the next poll
+                });
+            }
+            ImGui::SameLine(0, 6.0f * sc);
+            if (ImGui::SmallButton("Cancel")) {
+                st.rpc.call("agent_provider_oauth_cancel",
+                            nlohmann::json{{"handle", flow.handle}},
+                            [](const core::RpcResult&) {});
+                flow.active = false;
+                flow.status = "cancelled";
+            }
+        } else if (flow.status == "error") {
+            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.statusErr));
+            ImGui::TextWrapped("%s", flow.error.empty() ? "Sign-in failed" : flow.error.c_str());
+            ImGui::PopStyleColor();
+            if (prov.hasOAuth && ImGui::SmallButton("Try again")) beginOmpOAuth(st, prov.id);
+        } else if (flow.status == "cancelled") {
+            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+            ImGui::TextUnformatted("Sign-in cancelled.");
+            ImGui::PopStyleColor();
+        }
+    }
+
+    // API-key block (inline; validate → set, with an explicit unvalidated save for providers
+    // whose wire API has no cheap validation endpoint).
+    if (prov.hasApiKey) {
+        ImGui::Dummy(ImVec2(0, 4.0f * sc));
+        if (s_omp.keyFor != prov.id) {
+            s_omp.keyFor = prov.id;
+            s_omp.keyBuf[0] = 0;
+            s_omp.keyStatus.clear();
+        }
+        ImGui::TextUnformatted(state == "key_set" ? "Replace API key" : "Add API key");
+        ImGui::SetNextItemWidth(-1);
+        ImGui::InputTextWithHint("##omp_key", "Paste key\xe2\x80\xa6", s_omp.keyBuf,
+                                 sizeof(s_omp.keyBuf), ImGuiInputTextFlags_Password);
+        const bool haveInput = s_omp.keyBuf[0] != 0;
+        if (s_omp.keyBusy) ImGui::BeginDisabled();
+        if (ImGui::SmallButton("Validate \x26 add") && haveInput && !s_omp.keyBusy) {
+            s_omp.keyBusy = true;
+            s_omp.keyStatus.clear();
+            const std::string pid = prov.id;
+            const std::string key = s_omp.keyBuf;
+            st.rpc.call("agent_provider_validate_key",
+                        nlohmann::json{{"provider", pid}, {"apiKey", key}},
+                        [&st, pid, key](const core::RpcResult& r) {
+                bool ok = r.ok && r.result.is_object() &&
+                          optionalJsonBool(r.result, "ok", false);
+                if (!ok) {
+                    s_omp.keyBusy = false;
+                    s_omp.keyStatusErr = true;
+                    s_omp.keyStatus = !r.ok ? (r.err.empty() ? "validation failed" : r.err)
+                                            : optionalJsonString(r.result, "error");
+                    if (s_omp.keyStatus.empty())
+                        s_omp.keyStatus = optionalJsonString(r.result, "detail");
+                    if (s_omp.keyStatus.empty()) s_omp.keyStatus = "key rejected";
+                    return;
+                }
+                st.rpc.call("agent_provider_set_key",
+                            nlohmann::json{{"provider", pid}, {"apiKey", key}},
+                            [&st](const core::RpcResult& sr) {
+                    s_omp.keyBusy = false;
+                    if (!sr.ok || !sr.result.is_object() ||
+                        !optionalJsonBool(sr.result, "ok", true)) {
+                        s_omp.keyStatusErr = true;
+                        s_omp.keyStatus = !sr.ok ? sr.err
+                                                 : optionalJsonString(sr.result, "error");
+                        return;
+                    }
+                    s_omp.keyStatusErr = false;
+                    s_omp.keyStatus = "key saved";
+                    s_omp.keyBuf[0] = 0;
+                    refreshOmpProvider(st);
+                });
+            }, 20000);
+        }
+        ImGui::SameLine(0, 6.0f * sc);
+        if (ImGui::SmallButton("Add unvalidated") && haveInput && !s_omp.keyBusy) {
+            s_omp.keyBusy = true;
+            s_omp.keyStatus.clear();
+            const std::string pid = prov.id;
+            const std::string key = s_omp.keyBuf;
+            st.rpc.call("agent_provider_set_key",
+                        nlohmann::json{{"provider", pid}, {"apiKey", key}},
+                        [&st](const core::RpcResult& sr) {
+                s_omp.keyBusy = false;
+                if (!sr.ok || !sr.result.is_object() ||
+                    !optionalJsonBool(sr.result, "ok", true)) {
+                    s_omp.keyStatusErr = true;
+                    s_omp.keyStatus = !sr.ok ? sr.err
+                                             : optionalJsonString(sr.result, "error");
+                    return;
+                }
+                s_omp.keyStatusErr = false;
+                s_omp.keyStatus = "key saved (not validated)";
+                s_omp.keyBuf[0] = 0;
+                refreshOmpProvider(st);
+            });
+        }
+        if (s_omp.keyBusy) ImGui::EndDisabled();
+        if (!s_omp.keyStatus.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ui::Palette::toU32(s_omp.keyStatusErr ? pal.statusErr : pal.statusOk));
+            ImGui::TextWrapped("%s", s_omp.keyStatus.c_str());
+            ImGui::PopStyleColor();
+        }
+        if (!prov.consoleUrl.empty()) {
+            if (ImGui::SmallButton("Get a key \xe2\x86\x92")) {
+#if defined(_WIN32)
+                std::system(("start \"\" \"" + prov.consoleUrl + "\"").c_str());
+#elif defined(__APPLE__)
+                std::system(("open '" + prov.consoleUrl + "'").c_str());
+#else
+                std::system(("xdg-open '" + prov.consoleUrl + "' >/dev/null 2>&1 &").c_str());
+#endif
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", prov.consoleUrl.c_str());
+        }
+    }
+    settingsGlassSectionEnd();
+
+    // ---- Usage section (OAuth subscription windows + observed-spend notes) ----
+    if (detailReady && !s_omp.detail.usage.empty()) {
+        settingsGlassSectionBegin("##omp_usage", "Usage");
+        for (const auto& w : s_omp.detail.usage) drawUsageWindow(w, sc);
+        for (const auto& n : s_omp.detail.usageNotes) dimText(n.c_str());
+        settingsGlassSectionEnd();
+    }
+
+    // ---- Models section (OMP catalog: capability chips + ctx + $in/$out per Mtok) ----
+    {
+        int count = 0;
+        for (const auto& m : ui::bridgeModelCatalog())
+            if (m.provider == prov.id) ++count;
+        char modelsTitle[64];
+        std::snprintf(modelsTitle, sizeof(modelsTitle), "Models (%d)",
+                      count > 0 ? count : prov.modelsAvailable);
+        settingsGlassSectionBegin("##omp_models", modelsTitle);
+        if (count == 0) {
+            dimText(s_omp.available
+                        ? "Catalog loading \xe2\x80\x94 or no bundled models for this provider."
+                        : "Catalog unavailable.");
+        }
+        for (const auto& m : ui::bridgeModelCatalog()) {
+            if (m.provider != prov.id) continue;
+            ImGui::PushID(m.id.c_str());
+            bool hidden = st.settings.hiddenModels.count(m.id) != 0;
+            bool shown = !hidden;
+            if (ImGui::Checkbox("##show", &shown)) {
+                if (shown) st.settings.hiddenModels.erase(m.id);
+                else st.settings.hiddenModels.insert(m.id);
+                saveSettings(st.settings);
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Show/hide in the copilot model picker.");
+            ImGui::SameLine(0, 6.0f * sc);
+            ImGui::TextUnformatted(m.name.c_str());
+            const std::string sub = ui::bridgeModelSublabel(m);
+            if (!sub.empty()) {
+                const float sw = ImGui::CalcTextSize(sub.c_str()).x;
+                const float rx = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x
+                                 - sw;
+                ImGui::SameLine(rx > ImGui::GetCursorPosX() ? rx : 0, 6.0f * sc);
+                ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+                ImGui::TextUnformatted(sub.c_str());
+                ImGui::PopStyleColor();
+            }
+            const std::string detail = ui::bridgeModelCostDetail(m);
+            if (!detail.empty() && ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", detail.c_str());
+            ImGui::PopID();
+        }
+        settingsGlassSectionEnd();
+    }
+    ImGui::PopID();
+}
+
+// Two-pane provider manager: left = provider list with sign-in state, right = detail
+// (Sign-in / Usage / Models). Footer = per-session cost strip. Single-column fallback under
+// 640*sc: the list collapses to a combo (design §3.1).
+static void drawOmpProviderManager(AppState& st) {
+    const float sc = ui::uiScale;
+    const auto& pal = ui::palette;
+    pollOmpProviderList(st, false);
+    pollOmpOAuth(st);
+    ui::refreshBridgeModelCatalog(st, false);
+
+    if (!s_omp.available) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.statusWarn));
+        ImGui::TextWrapped("Provider sign-in bridge unavailable in this build \xe2\x80\x94 "
+                           "legacy provider settings below.");
+        ImGui::PopStyleColor();
+        return;
+    }
+    if (!s_omp.lastError.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.statusWarn));
+        ImGui::TextWrapped("%s", s_omp.lastError.c_str());
+        ImGui::PopStyleColor();
+    }
+
+    const float footerH = ImGui::GetFrameHeightWithSpacing() + 4.0f * sc;
+    const float paneH = -footerH;
+    const float availW = ImGui::GetContentRegionAvail().x;
+    const bool narrow = availW < 640.0f * sc;
+
+    if (narrow) {
+        // Collapsed: provider pick as a combo, detail below.
+        std::string preview = s_omp.selectedId;
+        for (const auto& r : s_omp.rows)
+            if (r.id == s_omp.selectedId) { preview = r.label; break; }
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::BeginCombo("##omp_prov_pick", preview.c_str())) {
+            for (const auto& r : s_omp.rows) {
+                ImGui::PushID(r.id.c_str());
+                if (ImGui::Selectable(r.label.c_str(), r.id == s_omp.selectedId))
+                    s_omp.selectedId = r.id;
+                const float* c = ompStateColor(r.state);
+                ImGui::SameLine();
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(c[0], c[1], c[2], 1.0f));
+                ImGui::TextUnformatted(ompStateLabel(r));
+                ImGui::PopStyleColor();
+                ImGui::PopID();
+            }
+            ImGui::EndCombo();
+        }
+    } else {
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f * sc, 6.0f * sc));
+        ImGui::BeginChild("##omp_prov_list", ImVec2(220.0f * sc, paneH),
+                          ImGuiChildFlags_Borders);
+        for (const auto& r : s_omp.rows) {
+            ImGui::PushID(r.id.c_str());
+            const bool sel = (r.id == s_omp.selectedId);
+            if (ImGui::Selectable("##row", sel, 0,
+                                  ImVec2(0, ImGui::GetTextLineHeight() * 2 + 8.0f * sc))) {
+                s_omp.selectedId = r.id;
+            }
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const ImVec2 mn = ImGui::GetItemRectMin();
+            const float fh = ImGui::GetFontSize();
+            dl->AddText(ImVec2(mn.x + 6.0f * sc, mn.y + 4.0f * sc),
+                        ui::Palette::toU32(sel ? pal.text : pal.textDim), r.label.c_str());
+            const float* c = ompStateColor(r.state);
+            const bool bullet = (r.state == "oauth_connected" || r.state == "key_set");
+            char statusLine[160];
+            std::snprintf(statusLine, sizeof(statusLine), "%s %s",
+                          bullet ? "\xe2\x97\x8f" : "\xe2\x97\x8b", ompStateLabel(r));
+            dl->AddText(ImVec2(mn.x + 6.0f * sc, mn.y + 4.0f * sc + fh + 2.0f * sc),
+                        ImGui::ColorConvertFloat4ToU32(ImVec4(c[0], c[1], c[2], 1.0f)),
+                        statusLine);
+            ImGui::PopID();
+        }
+        if (s_omp.rows.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+            ImGui::TextWrapped(s_omp.listInFlight ? "Loading providers\xe2\x80\xa6"
+                                                  : "No providers reported by the bridge.");
+            ImGui::PopStyleColor();
+        }
+        ImGui::EndChild();
+        ImGui::PopStyleVar();
+        ImGui::SameLine(0, 8.0f * sc);
+    }
+
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+    ImGui::BeginChild("##omp_prov_detail", ImVec2(0, paneH));
+    drawOmpProviderDetail(st, sc);
+    ImGui::EndChild();
+    ImGui::PopStyleVar();
+
+    // Footer: per-session cost strip (agent_cost_summary; hides itself when unavailable).
+    ui::drawSessionCostStrip(st);
+}
+
 // ---- Run benchmark + categories (Settings → Benchmarks) ---------------------
 struct BenchUi {
     int source = 1;   // 0=current copilot, 1=xAI grok-4.5, 2=local
@@ -3382,6 +4153,12 @@ const SettingsEntry kSettingsEntries[] = {
     { "Accounts",                 "Providers",    3 },
     { "Subscription accounts",    "Providers",    3 },
     { "Sign in",                  "Providers",    3 },
+    { "Add API key",              "Providers",    3 },
+    { "OAuth",                    "Providers",    3 },
+    { "Disconnect",               "Providers",    3 },
+    { "Usage & cost",             "Providers",    3 },
+    { "Session cost",             "Providers",    3 },
+    { "Model routing",            "Providers",    3 },
     // Benchmarks (tab 4)
     { "Benchmarks",               "AI",    2 },
     { "Model leaderboard",        "AI",    2 },
@@ -4439,45 +5216,48 @@ void drawSettingsModal(AppState& st, bool busy) {
                 ImGui::EndTabItem();
             }
 
-// ---- Providers tab: provider/model, Moonshot key parking, subscription accounts ----
+// ---- Providers tab: OMP two-pane provider manager (legacy sections as the degrade path) ----
             if (ImGui::BeginTabItem("Providers", nullptr,
                                     (jumpToTab == 3) ? ImGuiTabItemFlags_SetSelected
                                                      : ImGuiTabItemFlags_None)) {
                 settingsTabBodyBegin("##tab_providers");
-                dimText(("API providers, keys, and subscription accounts. Stored in " +
-                         configPath() + ".").c_str());
+                dimText("API providers, sign-in, and model routing. Credentials are stored by "
+                        "the auth bridge \xe2\x80\x94 never written to config.json.");
+                drawOmpProviderManager(st);
+                if (!s_omp.available) {
+                    // Degrade path: the agent_provider_* C-ABI is absent in this build
+                    // (sibling slice mid-flight / older core) — keep the legacy sections so
+                    // provider config stays possible. drawOmpProviderManager drew the banner.
+                    settingsGlassSectionBegin("##prov_provider", "Provider \x26 Model");
+                    ui::drawAiSettingsSection(st, busy, ui::AiSettingsSection::ProviderModel);
+                    settingsGlassSectionEnd();
 
-                settingsGlassSectionBegin("##prov_provider", "Provider & Model");
-                ui::drawAiSettingsSection(st, busy, ui::AiSettingsSection::ProviderModel);
-                settingsGlassSectionEnd();
+                    settingsGlassSectionBegin("##prov_moonshot", "Moonshot (Kimi)");
+                    dimText("Configured but not the active provider. Store a key to park credit; "
+                            "pick a Kimi model later when you want to use it.");
+                    ImGui::TextUnformatted("API key (platform.moonshot.ai)");
+                    ImGui::SetNextItemWidth(-1);
+                    if (ImGui::InputText("##settings_moonshot_key", st.settings.moonshotKey,
+                                         sizeof(st.settings.moonshotKey),
+                                         ImGuiInputTextFlags_Password)) {
+                        saveSettings(st.settings);
+                    }
+                    {
+                        const bool have = st.settings.moonshotKey[0] != '\0';
+                        ImGui::PushStyleColor(ImGuiCol_Text,
+                            have ? ui::Palette::toU32(ui::palette.statusOk)
+                                 : ui::Palette::toU32(ui::palette.statusWarn));
+                        ImGui::TextUnformatted(have
+                            ? "key set \xe2\x80\x94 Kimi models appear in the picker when enabled"
+                            : "no key \xe2\x80\x94 paste a Moonshot API key when you have credit");
+                        ImGui::PopStyleColor();
+                    }
+                    settingsGlassSectionEnd();
 
-                // Moonshot key is first-class (keys.moonshot) and can be parked while another
-                // provider stays active — surface it even when Provider & Model isn't on Moonshot.
-                settingsGlassSectionBegin("##prov_moonshot", "Moonshot (Kimi)");
-                dimText("Configured but not the active provider. Store a key to park credit; "
-                        "pick a Kimi model later when you want to use it.");
-                ImGui::TextUnformatted("API key (platform.moonshot.ai)");
-                ImGui::SetNextItemWidth(-1);
-                if (ImGui::InputText("##settings_moonshot_key", st.settings.moonshotKey,
-                                     sizeof(st.settings.moonshotKey),
-                                     ImGuiInputTextFlags_Password)) {
-                    saveSettings(st.settings);
+                    settingsGlassSectionBegin("##prov_accounts", "Accounts");
+                    drawSubscriptionAccounts(st, sc);
+                    settingsGlassSectionEnd();
                 }
-                {
-                    const bool have = st.settings.moonshotKey[0] != '\0';
-                    ImGui::PushStyleColor(ImGuiCol_Text,
-                        have ? ui::Palette::toU32(ui::palette.statusOk)
-                             : ui::Palette::toU32(ui::palette.statusWarn));
-                    ImGui::TextUnformatted(have
-                        ? "key set \xe2\x80\x94 Kimi models appear in the picker when enabled"
-                        : "no key \xe2\x80\x94 paste a Moonshot API key when you have credit");
-                    ImGui::PopStyleColor();
-                }
-                settingsGlassSectionEnd();
-
-                settingsGlassSectionBegin("##prov_accounts", "Accounts");
-                drawSubscriptionAccounts(st, sc);
-                settingsGlassSectionEnd();
 
                 settingsTabBodyEnd();
                 ImGui::EndTabItem();

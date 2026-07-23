@@ -20,6 +20,9 @@
 // conversations, settings, composer, panel (the docked-pane host + reuse hooks).
 #pragma once
 
+#include <string>
+#include <vector>
+
 struct AppState;
 
 namespace ui {
@@ -53,6 +56,45 @@ void refreshModelAvailability(AppState& state, bool force);
 // or reachable local endpoint — shared by the composer model picker, Settings role/Eng.Firm
 // combos, and Manage models.
 bool providerUsable(AppState& state, int provider);
+
+// ---- OMP bridge-backed model catalog + session cost (S-UI-PROV) -------------------
+// Static OMP catalog metadata (capabilities + cost) for bridge-routed providers, fetched via
+// the libaicad `agent_models_list` C-ABI (bridge `models_list`). Distinct from the live
+// agent_list_models probe above: that one asks a keyed endpoint what it can serve right now;
+// this is the static catalog the model picker uses for ctx/cost/capability sublabels and the
+// Providers-tab Models section. Degrades silently (empty catalog) when the bridge method is
+// absent — every consumer must tolerate a nullptr/empty result.
+struct BridgeModelMeta {
+    std::string id;          // OMP catalog model id (e.g. "claude-opus-4-8")
+    std::string name;        // display name
+    std::string provider;    // OMP provider id ("anthropic", "kimi-code", "moonshot", ...)
+    bool vision = false;
+    bool tools = false;
+    bool reasoning = false;
+    int contextWindow = 0;   // tokens; 0 = unknown
+    int maxTokens = 0;       // max output tokens; 0 = unknown
+    bool hasCost = false;
+    double costIn = 0, costOut = 0, costCacheRead = 0, costCacheWrite = 0;  // $/Mtok
+};
+// Fetch the full catalog (all providers) into the process cache; ~5-min TTL, async.
+void refreshBridgeModelCatalog(AppState& state, bool force);
+// The cached catalog (empty until the first successful fetch).
+const std::vector<BridgeModelMeta>& bridgeModelCatalog();
+// Exact (provider, id) lookup; providerId empty = first catalog row with that id.
+const BridgeModelMeta* bridgeModelMeta(const std::string& providerId, const std::string& modelId);
+// CAD picker lookup: map a CAD ProviderIndex (+ cloud base_url for the shared cloud slot) to
+// the OMP provider id, then find the model; falls back to a global id match. nullptr = absent.
+const BridgeModelMeta* bridgeModelMetaForCad(int cadProvider, const std::string& modelId,
+                                             const char* cloudBaseUrl);
+// OMP model-browser.ts display formats: "ctx 200k \xc2\xb7 $3/$15 \xc2\xb7 tools vision" row
+// sublabel, and the cache-pricing detail line for tooltips.
+std::string bridgeModelSublabel(const BridgeModelMeta& m);
+std::string bridgeModelCostDetail(const BridgeModelMeta& m);
+// Per-session cost strip (agent_cost_summary, a pure $/Mtok calculator fed with the session's
+// completed-turn token events): "Session $1.87 \xc2\xb7 142k tok" + click popover with the
+// per-model breakdown. Hidden while the bridge method is unavailable. Emits into the CURRENT
+// window; drawn by the composer model dropdown footer and the Settings->Providers footer.
+void drawSessionCostStrip(AppState& state);
 
 // Cloud OpenAI-compat / Moonshot key presence: local settings OR host-shared keys on web
 // (GET /api/providers). Used by picker sections that gate rows on cloudKey/moonshotKey.

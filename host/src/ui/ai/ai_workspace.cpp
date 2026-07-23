@@ -1902,8 +1902,6 @@ static void drawOptionsView(AppState& st) {
     const ImGuiTableFlags gridFlags =
         ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_NoPadOuterX;
 
-    ImGui::Indent(6.0f * S);
-
     sectionHeader("Workspace");
     if (ImGui::BeginTable("##ai_ws_workspace", 2, gridFlags)) {
         ImGui::TableNextColumn();
@@ -1981,7 +1979,6 @@ static void drawOptionsView(AppState& st) {
                        "Model, reasoning effort, API key and privacy live on the main Settings "
                        "page (Settings -> AI).");
     ImGui::PopStyleColor();
-    ImGui::Unindent(6.0f * S);
 }
 
 }  // anonymous namespace
@@ -2017,6 +2014,12 @@ static void drawViewPane(AppState& st, bool busy) {
         s_ai.lastAutoRun = s_agdag.runId;
         s_ai.view        = 0;
     }
+
+    // Left margin off the glass edge — one indent for every nav view so Agent Hub / Session
+    // Plan / Active Work / Documents / Sessions / Leaderboard / Metrics / Options all sit the
+    // same distance in (previously only Options/Metrics indented themselves, so switching
+    // views shifted content left/right).
+    ImGui::Indent(6.0f * S);
 
     switch (s_ai.view) {
         case 0:  // Agent Hub: sub-agent roster + live agent-execution DAG.
@@ -2061,6 +2064,7 @@ static void drawViewPane(AppState& st, bool busy) {
             s_ai.view = 0;
             break;
     }
+    ImGui::Unindent(6.0f * S);
     ImGui::EndChild();
 }
 

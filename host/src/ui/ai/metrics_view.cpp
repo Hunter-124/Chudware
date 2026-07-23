@@ -146,8 +146,6 @@ void drawMetricsView(AppState& st) {
     std::sort(sessions.begin(), sessions.end(),
              [](const SessionSpend& a, const SessionSpend& b) { return a.usd > b.usd; });
 
-    ImGui::Indent(6.0f * S);
-
     // ---- headline totals ----
     secHeader("Overall");
     if (ImGui::BeginTable("##ai_metrics_totals", 4,
@@ -236,8 +234,6 @@ void drawMetricsView(AppState& st) {
                        "turns) \xe2\x80\x94 not a bill. Sessions or models with no priced turns "
                        "aren't listed; unpriced/local models show token counts with no $ figure.");
     ImGui::PopStyleColor();
-
-    ImGui::Unindent(6.0f * S);
 }
 
 }  // namespace ui

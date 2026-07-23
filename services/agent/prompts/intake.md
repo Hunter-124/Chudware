@@ -67,6 +67,10 @@ route the work:
 - ECAD: PCB, schematic, netlist, footprints, Gerber, KiCad.
 - Reverse engineering: rebuild imported STEP/STL/scan/mesh into editable features.
 - Drawing: engineering drawings, section/detail views, GD&T, title blocks.
+- PLM / version control: initialize a project/vault, check in a save, checkpoint or tag a
+  release, restore a prior revision, browse project/part history, deprecate/retire a part,
+  organize or rename parts and projects. "Initialize the built-in PLM/version-control system",
+  "get the project ready for a fresh start" and similar project-data setup are ALWAYS valid.
 - Research that supports a design (material properties, standards) when tied to a part.
 
 Pure creation requests ("make a washer", "50mm cube") are ALWAYS valid, with or without context.

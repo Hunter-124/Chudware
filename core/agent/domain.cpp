@@ -264,6 +264,11 @@ std::pair<bool, std::string> match_capability(const std::string& request) {
          {"engineering drawing", "detail drawing", "section view", "titleblock", "gd&t", "gdt"}},
         {"sourcing/BOM",
          {"bom", "bill of materials", "sourcing", "part number", "mpn", "datasheet"}},
+        {"PLM/version-control",
+         {"plm", "version control", "version-control", "check in", "check-in", "checkin",
+          "checkpoint", "vault", "project history", "part history", "revision history",
+          "tag a release", "release version", "deprecate", "deprecated", "retire a part",
+          "initialize project", "initialize the project"}},
     };
     for (const CapHit& cap : kCaps) {
         for (const char* w : cap.words) {

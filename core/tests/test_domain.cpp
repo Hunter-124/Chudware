@@ -137,6 +137,10 @@ TEST_CASE("capability helper accepts product surfaces, rejects garbage") {
     CHECK(chudware::agent::is_capability_request("make an engineering drawing with a section view"));
     CHECK(chudware::agent::is_capability_request("reverse engineer this STEP into features"));
     CHECK(chudware::agent::is_capability_request("measure mass properties of the bracket"));
+    CHECK(chudware::agent::is_capability_request(
+        "initialize the built-in PLM/version-control system for this project"));
+    CHECK(chudware::agent::is_capability_request(
+        "check in a checkpoint and deprecate the old parts in the vault"));
     CHECK_FALSE(chudware::agent::is_capability_request("asdf qwerty blah blah"));
     CHECK_FALSE(chudware::agent::is_capability_request(""));
     CHECK_FALSE(chudware::agent::is_capability_request("hello how are you"));

@@ -55,6 +55,10 @@ struct GNode {
   float lz = 0.0f;            // depth coord (3D projection mode only)
   float radius = 14.0f;
   float bubbleR = 0.0f; // packed containment bubble (0 = leaf/no children)
+  // Real model coordinates from the persisted assembly transform (meta.wp);
+  // the 3D mode overlays these so instances lay out like the actual model.
+  float wx = 0.0f, wy = 0.0f, wz = 0.0f;
+  bool hasW = false;
 };
 
 // Persisted / stashed node position (x, y + depth z).
@@ -151,6 +155,8 @@ struct GraphTabState {
   // each view keeps its own arrangement without clobbering the other's.
   std::unordered_map<std::string, Pos3> projPosStash;
   std::unordered_map<std::string, Pos3> asmPosStash;
+  // 2D positions stashed while the 3D world-position overlay is active.
+  std::unordered_map<std::string, Pos3> preWorldStash;
 
   // Scope: "" = project view; else the structural doc/asm/part node drilled
   // into.
@@ -1622,6 +1628,9 @@ void rebuildForce(GraphTabState &G) {
     }
     const int slot = G.force.addNode(sx, sy, n.lz, collRadius);
     G.forceSlot[vi] = slot;
+    // World-placed nodes hold their real model coordinates in 3D.
+    if (G.view3d && n.hasW)
+      G.force.setPinned(slot, true);
     if (cid >= 0)
       G.force.setGroup(slot, cid);
   }
@@ -1965,6 +1974,15 @@ void requestGraph(AppState &st, bool force) {
           n.metaDh = jstr(*m, "dh");
           if (auto mt = m->find("mt"); mt != m->end() && mt->is_number())
             n.metaMt = mt->get<double>();
+          if (auto wp = m->find("wp");
+              wp != m->end() && wp->is_array() && wp->size() == 3 &&
+              (*wp)[0].is_number() && (*wp)[1].is_number() &&
+              (*wp)[2].is_number()) {
+            n.wx = (*wp)[0].get<float>();
+            n.wy = (*wp)[1].get<float>();
+            n.wz = (*wp)[2].get<float>();
+            n.hasW = true;
+          }
         }
         if (n.id.empty())
           continue;
@@ -4111,6 +4129,7 @@ void plmGraphOnProjectChanged() {
   G.asmView = false;
   G.projPosStash.clear();
   G.asmPosStash.clear();
+  G.preWorldStash.clear();
   // Scope / visible caches — never open a new project inside a stale drill.
   G.scopeDocId.clear();
   G.scopeStack.clear();
@@ -4345,6 +4364,63 @@ void plmDrawGraphPage(AppState &st) {
     const int seg = graphModeSegment("##graph_dim", G.view3d);
     if (seg >= 0 && (seg == 1) != G.view3d) {
       G.view3d = !G.view3d;
+      // World-position overlay: nodes whose doc carries a persisted
+      // assembly transform (meta.wp) take their REAL model coordinates in
+      // 3D — scaled + centered onto the current layout frame — so the 3D
+      // view mirrors the actual assembly. 2D positions stash + restore.
+      if (G.view3d) {
+        float wmin[3] = {1e30f, 1e30f, 1e30f},
+              wmax[3] = {-1e30f, -1e30f, -1e30f};
+        int wn = 0;
+        for (const auto &n : G.nodes) {
+          if (!n.hasW)
+            continue;
+          wmin[0] = std::min(wmin[0], n.wx);
+          wmax[0] = std::max(wmax[0], n.wx);
+          wmin[1] = std::min(wmin[1], n.wy);
+          wmax[1] = std::max(wmax[1], n.wy);
+          wmin[2] = std::min(wmin[2], n.wz);
+          wmax[2] = std::max(wmax[2], n.wz);
+          ++wn;
+        }
+        if (wn > 0) {
+          float lx0 = 1e30f, ly0 = 1e30f, lx1 = -1e30f, ly1 = -1e30f;
+          for (const auto &n : G.nodes) {
+            if (!hasPosition(n))
+              continue;
+            lx0 = std::min(lx0, n.lx);
+            lx1 = std::max(lx1, n.lx);
+            ly0 = std::min(ly0, n.ly);
+            ly1 = std::max(ly1, n.ly);
+          }
+          const float wExt = std::max(
+              {wmax[0] - wmin[0], wmax[1] - wmin[1], wmax[2] - wmin[2]});
+          const float lExt = std::max(lx1 - lx0, ly1 - ly0);
+          const float k = (wExt > 1e-6f && lExt > 1e-6f) ? lExt / wExt : 1.0f;
+          const float wcx = (wmin[0] + wmax[0]) * 0.5f,
+                      wcy = (wmin[1] + wmax[1]) * 0.5f,
+                      wcz = (wmin[2] + wmax[2]) * 0.5f;
+          const float lcx = (lx0 + lx1) * 0.5f, lcy = (ly0 + ly1) * 0.5f;
+          for (auto &n : G.nodes) {
+            if (!n.hasW)
+              continue;
+            G.preWorldStash[n.id] = {n.lx, n.ly, n.lz};
+            n.lx = (n.wx - wcx) * k + lcx;
+            n.ly = (n.wy - wcy) * k + lcy;
+            n.lz = (n.wz - wcz) * k;
+          }
+        }
+      } else {
+        for (const auto &kv : G.preWorldStash) {
+          auto it = G.idIndex.find(kv.first);
+          if (it == G.idIndex.end())
+            continue;
+          G.nodes[it->second].lx = kv.second.x;
+          G.nodes[it->second].ly = kv.second.y;
+          G.nodes[it->second].lz = kv.second.z;
+        }
+        G.preWorldStash.clear();
+      }
       G.layoutDirty = true; // rebuild the sim in the new dimensionality
       // Refit so the projected bounds frame correctly on entry.
       G.fitRequested = true;

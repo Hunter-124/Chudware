@@ -2,7 +2,8 @@
 
   stackup_analyze(dims, mode)  -> 1D worst-case + RSS tolerance stack-up report
 
-The pure math lives in ``engine/tolerance/stackup.py``; this module is the thin
+The pure math lives in the C++ core (``core/tolerance/stackup.cpp``, dispatched via the
+libaicad ``stackup_analyze`` method through ``core_bridge``); this module is the thin
 MCP wrapper.
 
 Registration note: append-only in ``server.py`` (sibling to structural_tools).
@@ -11,10 +12,9 @@ registration line is independent of the concurrent T-BL04/16/17/18 appends.
 """
 from __future__ import annotations
 
-import json
-
 from mcp.server.fastmcp import FastMCP
 
+from mcp_server import core_bridge as cb
 from mcp_server.cad_tools import _dumps, _err
 
 DISCLAIMER = (
@@ -97,42 +97,17 @@ def register_tolerance_tools(mcp: FastMCP) -> None:
         Raises:
             Returns ``{ok: false, error, code}`` on invalid input.
         """
+        # The C++ core owns the whole envelope: it validates `mode` (invalid_mode),
+        # validates the dims (invalid_input), scopes worst_case/rss, and stamps
+        # ok/disclaimer — identical shape to the retired Python wrapper.
         try:
-            from engine.tolerance.stackup import stackup_analyze as _analyze
-        except ImportError as e:
+            return _dumps(cb.call("stackup_analyze", {"dims": dims, "mode": mode}))
+        except cb.CoreError as e:
             return _dumps({
                 "ok": False,
                 "error": "tolerance stack-up engine unavailable",
                 "code": "engine_unavailable",
                 "detail": str(e),
-            })
-
-        try:
-            # Validate mode
-            valid_modes = {"worst_case", "rss", "both"}
-            if mode not in valid_modes:
-                return _dumps({
-                    "ok": False,
-                    "error": f"Invalid mode {mode!r}. Choose: {sorted(valid_modes)}",
-                    "code": "invalid_mode",
-                })
-
-            result = _analyze(dims)
-            out = result.to_dict()
-
-            # Scope the result to the requested mode
-            if mode == "worst_case":
-                out.pop("rss", None)
-            elif mode == "rss":
-                out.pop("worst_case", None)
-
-            return _dumps(out)
-
-        except (ValueError, TypeError, KeyError) as e:
-            return _dumps({
-                "ok": False,
-                "error": str(e),
-                "code": "invalid_input",
             })
         except Exception as e:  # noqa: BLE001
             return _err(e)

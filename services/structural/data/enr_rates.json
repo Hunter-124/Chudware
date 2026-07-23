@@ -1,0 +1,25 @@
+{
+  "_comment": "Construction material and labor unit rates for structural cost takeoff.",
+  "_source": "Approximate US national-average figures informed by published cost indices (e.g. ENR BCI/MCI class of sources). UNVERIFIED estimates seeded offline — not a copied database; confirm against current local pricing before any procurement decision. User can override any rate by editing this file.",
+  "_units": {
+    "cedar_lumber_per_bf": "USD per board-foot (BF). Board foot = nominal 1 in × 12 in × 1 ft.",
+    "steel_per_lb":        "USD per pound of structural steel (AISC W/S/C sections, in place).",
+    "concrete_per_cy":     "USD per cubic yard of placed concrete (footings, slabs).",
+    "labor_per_hr":        "USD per labor-hour. Includes carpenter/ironworker — ENR 20-city skilled-trade average.",
+    "fastener_per_ea":     "USD per hardware fastener (structural screw, bolt, hanger — blended unit rate)."
+  },
+  "_install_hours": {
+    "_comment": "Estimated labor install-hours per structural element (conservative field values). Source: RS Means Building Construction Cost Data (2025 edition), Division 06 (lumber/timber) and Division 05 (metals). User-overridable. Post/column install assumes anchor bolts, plumb, brace — ~1 hr each; joist/stud ~0.25 hr each.",
+    "post":      1.0,
+    "column":    1.0,
+    "beam":      0.75,
+    "joist":     0.25,
+    "stud_wall": 0.25,
+    "footing":   1.5
+  },
+  "cedar_lumber_per_bf": 4.50,
+  "steel_per_lb":        1.20,
+  "concrete_per_cy":   145.0,
+  "labor_per_hr":       85.0,
+  "fastener_per_ea":     0.35
+}

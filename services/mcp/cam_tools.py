@@ -19,22 +19,18 @@ from mcp.server.fastmcp import FastMCP
 
 from . import core_bridge as cb
 from .core_bridge import CoreError
+from .cad_common import _wire_materials_registry  # engine-side registry env default
 from .cad_tools import _CUR  # the "current part" doc_id (shared with the modeling tools)
 
 # The "current CAM job" so single-argument calls just work.
 _CAM: dict = {"doc_id": None}
 
-
-def _wire_materials_registry() -> None:
-    """Point the C++ core at the bundled engine materials registry so the CuttingDB folds its
-    ``cam`` sub-sections in (T-M4 / Issue #2). ``setdefault`` never overrides an explicit
-    AICAD_MATERIALS_REGISTRY (a user/installer path wins). Best-effort: a missing registry module
-    leaves the core on its in-code fallback table."""
-    try:
-        from engine.materials import registry as _reg
-        os.environ.setdefault("AICAD_MATERIALS_REGISTRY", str(_reg.registry_path()))
-    except Exception:  # noqa: BLE001
-        pass
+# Point the C++ core at the bundled materials registry at IMPORT time (T-M4 / Issue #2):
+# the CuttingDB folds the registry's ``cam`` sub-sections in, and material_cam_id /
+# material_resolve_key (used by _resolve_cam_material) read it. Import time matters — the
+# core caches the registry once per process, so the env must be set before the first
+# engine RPC can spawn/attach an engine without it.
+_wire_materials_registry()
 
 
 def _resolve_cam_material(material: str) -> tuple[str, Optional[str]]:
@@ -43,17 +39,17 @@ def _resolve_cam_material(material: str) -> tuple[str, Optional[str]]:
     Accepts any registry material ID (DoD): a registry id/alias that carries a ``cam`` fold-in is
     translated to its cutting-group id; a bare CuttingDB group id (or an unknown id) passes through
     unchanged. Returns (resolved_id, note) — ``note`` is a non-fatal advisory when the material has
-    no cam correspondence (feeds will use the calculator's defaults)."""
+    no cam correspondence (feeds will use the calculator's defaults). Resolution goes through the
+    C++ core's ``material_cam_id`` / ``material_resolve_key`` methods."""
     m = str(material or "").strip() or "aluminum"
     try:
-        from engine.materials import registry as _reg
-        gid = _reg.cam_material_id(m)
+        gid = cb.call("material_cam_id", {"name": m}).get("result")
         if gid:
             return gid, None
         # Not a cam-annotated registry material. If it is a known registry material at all, keep the
         # user's id but flag that it has no dedicated feeds row; else pass through (may be a raw
         # CuttingDB group id the core knows).
-        if _reg.resolve_key(m) is not None:
+        if cb.call("material_resolve_key", {"name": m}).get("result") is not None:
             return m, f"material '{m}' has no CAM feeds data in the registry; using calculator defaults"
     except Exception:  # noqa: BLE001
         pass
@@ -495,7 +491,7 @@ def register_cam_tools(mcp: FastMCP) -> None:
             Machine profile id (``haas_vf2``, ``tormach_770``, …) — clamps rpm/feed
             to that machine's envelope from machines.json / cam_machines().
         """
-        from engine_oracle.research import machining as _m  # noqa: PLC0415
+        from services.research import machining as _m  # noqa: PLC0415
         lim: dict = {}
         if max_rpm  is not None: lim["max_rpm"]  = max_rpm
         if min_rpm  is not None: lim["min_rpm"]  = min_rpm
@@ -534,7 +530,7 @@ def register_cam_tools(mcp: FastMCP) -> None:
         ``cam_add_operation``; out-of-envelope params are surfaced as advisory hints
         before simulation discovers gouges.
         """
-        from engine_oracle.research import machining as _m  # noqa: PLC0415
+        from services.research import machining as _m  # noqa: PLC0415
         lim: dict = {}
         if max_rpm  is not None: lim["max_rpm"]  = max_rpm
         if min_rpm  is not None: lim["min_rpm"]  = min_rpm
@@ -561,7 +557,7 @@ def register_cam_tools(mcp: FastMCP) -> None:
         Use ``research_thread_spec`` for full thread geometry (minor/pitch diameter,
         tensile stress area, etc.).
         """
-        from engine_oracle.research import machining as _m  # noqa: PLC0415
+        from services.research import machining as _m  # noqa: PLC0415
         return _dumps(_m.tap_drill(thread))
 
     @mcp.tool()

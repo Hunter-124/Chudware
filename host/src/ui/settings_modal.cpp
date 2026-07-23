@@ -29,6 +29,7 @@
 #include "model_registry.h"  // ui::localPresets (experimental vision-review model presets)
 #include "leaderboard_ui.h"  // aicad.leaderboard/1 compact table (Settings > Benchmarks)
 #include "oauth_capture.h"  // in-app xAI multi-account CEF OAuth (Settings → Accounts)
+#include "web_capabilities.h"  // ui::webGapReason (T-RF12: sign-in is desktop-only on web)
 #include "../core/async_rpc.h"  // core::RpcResult for skills/triggers RPCs
 #include "widgets/interwebz.h"  // Skills/Context two-column editors
 
@@ -893,9 +894,14 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
             pollSubscriptionAccounts(st, true);
         } else {
             // First account vs multi-account: label makes "already signed in" obvious.
+            // T-RF12: on the web (WASM) build the token store + OAuth flows live in the
+            // desktop engine worker, so the button renders disabled with the gap reason
+            // as its tooltip instead of firing an RPC that can only fail.
+            const char* webWhy = ui::webGapReason("account_signin");
             char addId[64];
             std::snprintf(addId, sizeof(addId),
                           any ? "Add another account##%s" : "Sign in##%s", prov);
+            if (webWhy) ImGui::BeginDisabled();
             if (ImGui::SmallButton(addId)) {
                 const bool isXai = std::string(prov) == "xai";
                 // xAI: CEF path is gated by kXaiUseCef (currently off — Python
@@ -939,8 +945,14 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
                     });
                 }
             }
-            if (ImGui::IsItemHovered()) {
-                if (std::string(prov) == "xai" && kXaiUseCef && ui::OauthCapture::cefAvailable())
+            if (webWhy) ImGui::EndDisabled();
+            // Disabled items need AllowWhenDisabled to still show the explaining tooltip.
+            if (webWhy
+                    ? ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)
+                    : ImGui::IsItemHovered()) {
+                if (webWhy)
+                    ImGui::SetTooltip("%s", webWhy);
+                else if (std::string(prov) == "xai" && kXaiUseCef && ui::OauthCapture::cefAvailable())
                     ImGui::SetTooltip(
                         any
                             ? "Add another %s account in the embedded browser "

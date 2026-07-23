@@ -102,6 +102,7 @@ set(BILLET_CORE_SOURCES
   src/ui/copilot/panel.cpp              # drawAIPanel host + ai_workspace reuse hooks
   src/ui/settings_modal.cpp
   src/ui/oauth_capture.cpp  # in-app xAI multi-account CEF OAuth (Settings → Accounts)
+  src/ui/web_capabilities.cpp  # T-RF12: WASM-build gap table (ui::webBuild / ui::webGapReason)
   src/ui/console_panel.cpp
   # --- W1-B: core infrastructure (toast / cursor manager / shared appearance picker) ---
   src/ui/toast.cpp

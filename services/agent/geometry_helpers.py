@@ -13,8 +13,8 @@ This module is the registry. Each **geometry kind** maps to:
     injects its context pack + prerun calc — the wiring is reused, not duplicated;
   * the helper **tools** the geometry_designer should call for that kind;
   * a **resolver** that pulls the *material/process-gated* numbers from the real
-    calculators (``engine_oracle.research.*``) and DFM process profiles
-    (``engine_oracle.dfm.process_profiles``) — so machining and printing yield
+    calculators (``services.research.*``) and the C++ DfM process profiles
+    (``core/dfm``, via ``core_bridge``) — so machining and printing yield
     *different* minimums, and every value comes back with a citation.
 
 Nothing here invents a number. ``resolve_helpers(kind, material, process, …)``
@@ -54,11 +54,16 @@ def canonical_process(process: Optional[str]) -> str:
 
 
 def _KNOWN_PROFILE_IDS() -> set[str]:
+    """The DfM process ids, from the C++ core (core/dfm, ``dfm_known_processes``);
+    the literal set is the offline fallback when no engine bridge is up."""
     try:
-        from engine_oracle.dfm.process_profiles import KNOWN_PROCESSES
-        return set(KNOWN_PROCESSES)
+        from services.mcp import core_bridge as cb  # noqa: PLC0415
+        r = cb.call("dfm_known_processes", {})
+        if r.get("ok") and isinstance(r.get("result"), list):
+            return set(r["result"])
     except Exception:  # noqa: BLE001
-        return {"fdm", "cnc_mill", "lathe", "sheet_metal", "laser", "injection"}
+        pass
+    return {"fdm", "cnc_mill", "lathe", "sheet_metal", "laser", "injection"}
 
 
 # --------------------------------------------------------------------------- registry entries
@@ -182,8 +187,12 @@ class HelperResult:
 
 
 def _profile(process: str) -> dict[str, Any]:
-    from engine_oracle.dfm.process_profiles import get_profile
-    return get_profile(canonical_process(process))
+    """The DfM process profile, from the C++ core (core/dfm, ``dfm_get_profile``)."""
+    from services.mcp import core_bridge as cb  # noqa: PLC0415
+    r = cb.call("dfm_get_profile", {"process": canonical_process(process)})
+    if not r.get("ok"):
+        raise ValueError(r.get("error") or "dfm_get_profile failed")
+    return r.get("result") or {}
 
 
 # --------------------------------------------------------------------------- resolvers
@@ -202,11 +211,11 @@ def resolve_wall(*, process: str = "fdm", feature_height_mm: Optional[float] = N
         "tolerance_band_mm": prof.get("tolerance_band_mm"),
     }
     prov = (f"process_profiles.get_profile('{proc}').params.min_wall_mm = {min_wall} mm "
-            f"[engine_oracle/dfm/process_profiles.py]")
+            f"[core/dfm/process_profiles.cpp]")
     # When a machining feature height is known, refine with the chatter-rule calc.
     if proc in ("cnc_mill", "lathe") and feature_height_mm:
         try:
-            from engine_oracle.research.calcs import run_calc
+            from services.research.calcs import run_calc
             r = run_calc("wall_thickness", {"process": "machining",
                                             "feature_height_mm": float(feature_height_mm),
                                             "material_family": material or "default"})
@@ -230,10 +239,10 @@ def resolve_fit(*, nominal_mm: Optional[float] = None, fit: str = "H7/g6",
         "hole_comp_mm": prof.get("hole_comp_mm"),
     }
     prov = (f"process_profiles.get_profile('{proc}').params.fit_classes_mm = {fit_classes} "
-            f"[process_profiles.py]")
+            f"[core/dfm/process_profiles.cpp]")
     if nominal_mm:
         try:
-            from engine_oracle.research.fits import fit_calc
+            from services.research.fits import fit_calc
             fc = fit_calc(float(nominal_mm), fit)
             if fc.get("ok"):
                 numbers["iso286"] = fc["answer"]
@@ -260,7 +269,7 @@ def resolve_thread(*, thread: str = "", material: str = "", **_: Any) -> HelperR
     prov_parts: list[str] = []
     if thread:
         try:
-            from engine_oracle.research.machining import tap_drill
+            from services.research.machining import tap_drill
             td = tap_drill(thread)
             ans = td.get("answer") if isinstance(td, dict) else None
             if ans:
@@ -288,7 +297,7 @@ def resolve_clearance_hole(*, thread: str = "", **_: Any) -> HelperResult:
     prov = ""
     if thread:
         try:
-            from engine_oracle.research.machining import tap_drill
+            from services.research.machining import tap_drill
             td = tap_drill(thread)
             ans = td.get("answer") if isinstance(td, dict) else None
             if ans:
@@ -304,7 +313,7 @@ def resolve_clearance_hole(*, thread: str = "", **_: Any) -> HelperResult:
 def resolve_snap_fit(*, material: str = "", **_: Any) -> HelperResult:
     # The snap_fit calc needs beam geometry; here we advertise the check + the
     # material's strain limit source. The calc itself runs when geometry is known.
-    prov = ("snap_fit calc (engine_oracle/research/calcs/snap_fit.py): "
+    prov = ("snap_fit calc (services/research/calcs/snap_fit.py): "
             "ε_allow ≈ 0.6×(yield/E); viable if ε_root ≤ ε_allow — run with the "
             "cantilever length/thickness")
     return HelperResult("snap_fit", "snap_fit_mention", ["research_eng_calc"],
@@ -319,7 +328,7 @@ def resolve_bend(*, thickness_mm: Optional[float] = None,
     prov = ""
     if thickness_mm and inside_radius_mm is not None:
         try:
-            from engine_oracle.research.calcs import run_calc
+            from services.research.calcs import run_calc
             r = run_calc("bend_allowance", {"thickness_mm": float(thickness_mm),
                                             "inside_radius_mm": float(inside_radius_mm),
                                             "angle_deg": float(angle_deg)})
@@ -346,10 +355,10 @@ def resolve_draft(*, draw_depth_mm: Optional[float] = None, finish: str = "smoot
     numbers: dict[str, Any] = {"process_min_draft_deg": draft.get("min_deg"),
                                "draft_required": draft.get("required")}
     prov = (f"process_profiles injection.draft.min_deg = {draft.get('min_deg')}° "
-            f"(required={draft.get('required')}) [process_profiles.py]")
+            f"(required={draft.get('required')}) [core/dfm/process_profiles.cpp]")
     if draw_depth_mm:
         try:
-            from engine_oracle.research.calcs import run_calc
+            from services.research.calcs import run_calc
             r = run_calc("draft_check", {"draw_depth_mm": float(draw_depth_mm),
                                          "finish": finish})
             if r.get("ok"):
@@ -368,7 +377,7 @@ def resolve_material(*, material: str = "", **_: Any) -> HelperResult:
     prov = ""
     if material:
         try:
-            from engine_oracle.research.material_lookup import material_lookup  # type: ignore
+            from services.research.material_lookup import material_lookup  # type: ignore
             ml = material_lookup(material)
             if isinstance(ml, dict) and ml.get("ok"):
                 props = ml.get("properties") or {}

@@ -13,6 +13,7 @@ from __future__ import annotations
 from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
+from mcp_server import core_bridge as cb
 from mcp_server.cad_tools import _dumps, _err
 
 
@@ -67,20 +68,16 @@ def register_mechanical_tools(mcp: FastMCP) -> None:
 
         Preliminary estimate only -- see disclaimer in response.
         """
+        # The C++ core (core/mechanical/mechanical.cpp) returns the full
+        # {ok, sigma_*, SF_*, disclaimer} envelope — same shape the Python wrapper emitted.
         try:
-            from engine.mechanical.gear_check import gear_check as _gear_check
-        except ImportError as e:
-            return _dumps({"ok": False, "error": "mechanical engine unavailable",
-                           "code": "solver_unavailable", "detail": str(e)})
-        try:
-            result = _gear_check(
-                Wt=Wt, module=module, face_width=face_width,
-                pitch_diameter=pitch_diameter, J=J, I=I,
-                Ko=Ko, Kv=Kv, Ks=Ks, Km=Km, KB=KB, Cf=Cf, Cp=Cp,
-                allowable_bending_stress=allowable_bending_stress,
-                allowable_contact_stress=allowable_contact_stress,
-            )
-            return _dumps({"ok": True, **result.to_dict()})
+            return _dumps(cb.call("gear_check", {
+                "Wt": Wt, "module": module, "face_width": face_width,
+                "pitch_diameter": pitch_diameter, "J": J, "I": I,
+                "Ko": Ko, "Kv": Kv, "Ks": Ks, "Km": Km, "KB": KB, "Cf": Cf, "Cp": Cp,
+                "allowable_bending_stress": allowable_bending_stress,
+                "allowable_contact_stress": allowable_contact_stress,
+            }))
         except Exception as e:
             return _err(e)
 
@@ -122,17 +119,13 @@ def register_mechanical_tools(mcp: FastMCP) -> None:
 
         Preliminary estimate only -- see disclaimer in response.
         """
+        # The C++ core (core/mechanical/mechanical.cpp) returns the full
+        # {ok, L10_*, P_equiv_N, disclaimer} envelope — same shape as the Python wrapper.
         try:
-            from engine.mechanical.bearing_life import bearing_life as _bearing_life
-        except ImportError as e:
-            return _dumps({"ok": False, "error": "mechanical engine unavailable",
-                           "code": "solver_unavailable", "detail": str(e)})
-        try:
-            result = _bearing_life(
-                C=C, Fr=Fr, Fa=Fa, n_rpm=n_rpm,
-                bearing_type=bearing_type, X=X, Y=Y,
-                bearing_designation=bearing_designation,
-            )
-            return _dumps({"ok": True, **result.to_dict()})
+            return _dumps(cb.call("bearing_life", {
+                "C": C, "Fr": Fr, "Fa": Fa, "n_rpm": n_rpm,
+                "bearing_type": bearing_type, "X": X, "Y": Y,
+                "bearing_designation": bearing_designation,
+            }))
         except Exception as e:
             return _err(e)

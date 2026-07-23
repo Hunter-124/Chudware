@@ -26,7 +26,7 @@ FASTENAL_SEARCH_HTML = r"""<table><tbody><tr><td><div class="card h-100 border-0
 @pytest.fixture()
 def fastenal_mod(tmp_path, monkeypatch):
     monkeypatch.setenv("APPDATA", str(tmp_path))
-    from engine import paths as engine_paths
+    from services import paths as engine_paths
     importlib.reload(engine_paths)
     from services.browser import profiles, session
     importlib.reload(profiles)

@@ -37,7 +37,7 @@ from services.agent.advisor.sim_advisor import (
     thermal_anchor,
     _thermal_bc_issues,
 )
-from engine_oracle.research.calcs.beam import beam_calc_raw
+from services.research.calcs.beam import beam_calc_raw
 
 
 # ---------------------------------------------------------------------------

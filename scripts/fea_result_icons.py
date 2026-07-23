@@ -16,8 +16,8 @@ use, all raw core-bridge method names):
 
 ``sim_run_static`` returns the full field (per-node von_mises / displacement) AND an
 ``overlay_aicm`` file: the surface tessellation with per-surface-vertex von_mises
-(SCLR) + displacement vectors (DISP) already mapped by engine.sim.overlay. We read
-that AICM with engine.doc.tessellate.read_aicm, deform each surface vertex by
+(SCLR) + displacement vectors (DISP) already mapped by services.sim.overlay. We read
+that AICM with services.sim.tessellate.read_aicm, deform each surface vertex by
 (displacement * exaggeration), colormap by von Mises (blue->green->red), and paint
 the triangles painter's-algorithm in the same iso camera the other icon tiles use
 (yaw 35 / pitch 26). The whole thing doubles as a smoke test of the static solver.
@@ -181,11 +181,11 @@ def _read_overlay(handle: str) -> bytes:
 def solve_cantilever(cb):
     """Build the beam, solve static FEA, return the parsed overlay AICM + stats.
 
-    Returns (aicm_dict, summary, stats) where aicm_dict is engine.doc.tessellate
+    Returns (aicm_dict, summary, stats) where aicm_dict is services.sim.tessellate
     .read_aicm output (surface pos/idx + von_mises SCLR + displacement DISP).
     """
     try:  # deployed engine aliases `engine`; source tree uses `engine_oracle`
-        from engine.doc.tessellate import read_aicm
+        from services.sim.tessellate import read_aicm
     except ImportError:
         from engine_oracle.doc.tessellate import read_aicm
 

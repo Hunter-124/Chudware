@@ -134,7 +134,7 @@ def test_confirm_dimensions_persists_through_reopen(tmp_path):
     doc1 = r["doc_id"]
 
     # Seed a critical-dim ledger so confirm_dimensions has a row to close.
-    from engine.intake import intake as ik
+    from services.intake import intake as ik
     mp = ik.new_measured_part("mp_1", "motor", source="photo")
     mp.features = [ik.new_measured_feature("output_shaft", "shaft_in_bore",
                                            dims={"dia": 8.0})]

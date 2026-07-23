@@ -95,7 +95,7 @@ def register_reveng_build_tools(mcp: FastMCP) -> None:
             })
         image_path = images[0]
         try:
-            from engine_oracle.vision.single_photo import (  # noqa: PLC0415
+            from services.vision.single_photo import (  # noqa: PLC0415
                 reconstruct_single_photo,
             )
         except Exception as exc:  # noqa: BLE001
@@ -161,7 +161,7 @@ def register_reveng_build_tools(mcp: FastMCP) -> None:
                 "hint": "Run reveng_reconstruct (or reveng_single_photo) first to produce a mesh.",
             })
         try:
-            from engine_oracle.vision.segment_fit import segment_fit  # noqa: PLC0415
+            from services.vision.segment_fit import segment_fit  # noqa: PLC0415
         except Exception as exc:  # noqa: BLE001
             return _not_provisioned(
                 f"segment_fit unavailable ({exc}). pip install open3d"
@@ -203,7 +203,7 @@ def register_reveng_build_tools(mcp: FastMCP) -> None:
 
         strategy:
           - ``deterministic`` (default) — reverse_engineer with fit hints
-          - ``ml`` — CAD-Recode build_parametric (engine_oracle.vision.cad_recode)
+          - ``ml`` — CAD-Recode build_parametric (services.vision.cad_recode)
           - ``override_approximate`` — allow parametric on single-photo meshes
             (honesty gate only; rebuild strategy stays deterministic)
 
@@ -335,8 +335,8 @@ def register_reveng_build_tools(mcp: FastMCP) -> None:
 
             # Register the live adapter into the parts-hub singleton (idempotent).
             try:
-                from engine_oracle.parts_hub import register_provider as _reg_provider  # noqa: PLC0415
-                from engine_oracle.parts_hub.adapters.reveng_result_adapter import RevengResultAdapter  # noqa: PLC0415
+                from services.parts import register_provider as _reg_provider  # noqa: PLC0415
+                from services.parts.adapters.reveng_result_adapter import RevengResultAdapter  # noqa: PLC0415
                 _reg_provider(RevengResultAdapter())
             except Exception:
                 pass  # best-effort; part_place tests that bypass hub still work
@@ -478,7 +478,7 @@ def register_reveng_build_tools(mcp: FastMCP) -> None:
             # Best-effort: copy photos / datasheet from the parts-hub record
             seeded: dict = {}
             try:
-                from engine_oracle.parts_hub import get as _hub_get  # noqa: PLC0415
+                from services.parts import get as _hub_get  # noqa: PLC0415
                 record = _hub_get(part_ref)
                 if record:
                     meta = record.get("metadata") or {}
@@ -647,8 +647,8 @@ def register_reveng_build_tools(mcp: FastMCP) -> None:
 
             # Register live adapter into parts-hub singleton (idempotent)
             try:
-                from engine_oracle.parts_hub import register_provider as _reg_provider  # noqa: PLC0415
-                from engine_oracle.parts_hub.adapters.reveng_result_adapter import (  # noqa: PLC0415
+                from services.parts import register_provider as _reg_provider  # noqa: PLC0415
+                from services.parts.adapters.reveng_result_adapter import (  # noqa: PLC0415
                     RevengResultAdapter,
                 )
                 _reg_provider(RevengResultAdapter())

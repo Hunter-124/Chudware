@@ -11,17 +11,372 @@ import os
 from typing import Any, Optional, Union
 
 from mcp_server import result_serving as _rs
+from mcp_server import core_bridge as cb
 
-from engine.ecad import netlist as netlist_mod
-from engine.ecad import schema
-from engine.ecad import session as ecad_session
-from engine.ecad.library import search as lib_search
-from engine.ecad.ops import OpError
+# T-RF20: the ECAD document/session/netlist/ERC/DRC kernel now lives in the C++ core
+# (core/ecad/*, dispatched via the ecad_*/sim_* RPCs — see worker_client.cpp). The direct
+# engine.ecad.{session,netlist,schema,ops} imports are replaced by the RPC-backed shims
+# below (ecad_session facade, netlist_mod facade, schema facade, OpError). Modules with NO
+# C++ counterpart stay as direct imports (re-homed by another T-RF leaf):
+#   - engine.ecad.library.search/resolve (no ecad_library RPC; reads starter/kicad_sym data)
+#   - engine.ecad.metadata (advisory eng-metadata layer, Python-only)
+#   - engine.ecad.autosave (lazy, crash-recovery; Python-only)
+from engine.ecad.library import search as lib_search  # STAYS: no ecad_library RPC surface
 
 try:  # T-FIN8 engineering-metadata layer — advisory, must never break the tools
-    from engine.ecad import metadata as _eng_metadata
+    from engine.ecad import metadata as _eng_metadata  # STAYS: no C++ counterpart
 except Exception:  # noqa: BLE001
     _eng_metadata = None  # type: ignore[assignment]
+
+
+class OpError(Exception):
+    """A structured op error (ecad_ops.md §7). Carries ``code`` + ``detail`` for the RPC envelope.
+
+    Local home after T-RF20: raised by tool code exactly like engine.ecad.ops.OpError, and
+    translated from core_bridge.CoreError (the C++ core's {code,message,detail} envelope) by
+    ``_rpc`` so the family modules keep a single except type.
+    """
+
+    def __init__(self, code: str, message: str, detail: dict | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.detail = detail or {}
+
+    def to_envelope(self) -> dict:
+        return {"code": self.code, "message": self.message, "detail": self.detail}
+
+
+def _rpc(method: str, params: dict | None = None) -> dict:
+    """One C++ core RPC with CoreError -> OpError translation (the ecad_* error contract)."""
+    try:
+        return cb.call(method, params or {})
+    except cb.CoreError as e:
+        raise OpError(e.code or "engine_error", str(e),
+                      e.detail if isinstance(e.detail, dict) else {}) from e
+
+
+# --------------------------------------------------------------------------- schema helpers
+#
+# Pure doc-dict geometry/predicates ported verbatim from engine.ecad.schema (the doc — with
+# its embedded lib_cache — is fetched from the C++ session, so the helpers run unchanged on
+# the client side; there is no per-helper RPC).
+
+_SCHEMA_SCH = "aicad.sch/1"
+_SCHEMA_PCB = "aicad.pcb/1"
+
+
+def _is_schematic(doc: dict) -> bool:
+    return doc.get("schema") == _SCHEMA_SCH
+
+
+def _is_board(doc: dict) -> bool:
+    return doc.get("schema") == _SCHEMA_PCB
+
+
+def _doc_kind(doc: dict) -> str:
+    return "sch" if _is_schematic(doc) else "pcb" if _is_board(doc) else ""
+
+
+def _rot(x: float, y: float, deg: float) -> tuple[float, float]:
+    r = math.radians(deg)
+    c, s = math.cos(r), math.sin(r)
+    return (x * c - y * s, x * s + y * c)
+
+
+def _apply_mirror(x: float, y: float, mirror: str) -> tuple[float, float]:
+    if mirror == "x":
+        return (-x, y)
+    if mirror == "y":
+        return (x, -y)
+    return (x, y)
+
+
+def _local_to_world(p, pos, angle: float = 0.0, mirror: str = "none") -> tuple[float, float]:
+    """Transform a local point: mirror, then rotate CCW by ``angle``, then translate by ``pos``."""
+    x, y = float(p[0]), float(p[1])
+    x, y = _apply_mirror(x, y, mirror)
+    x, y = _rot(x, y, angle)
+    return (x + float(pos[0]), y + float(pos[1]))
+
+
+def _pin_world(symbol: dict, pin: dict) -> tuple[float, float]:
+    """World endpoint of a symbol pin (the connection point — the tip away from the body)."""
+    px, py = float(pin["pos"][0]), float(pin["pos"][1])
+    length = float(pin.get("length", 2.54))
+    a = math.radians(float(pin.get("angle", 0.0)))
+    tip = (px + length * math.cos(a), py + length * math.sin(a))
+    return _local_to_world(tip, symbol["pos"], symbol.get("angle", 0.0),
+                           symbol.get("mirror", "none"))
+
+
+def _pad_world(footprint: dict, pad: dict) -> tuple[float, float]:
+    """World position of a footprint pad. Bottom-side footprints are mirrored across x."""
+    mirror = "x" if footprint.get("side") == "bottom" else "none"
+    return _local_to_world(pad["pos"], footprint["pos"], footprint.get("angle", 0.0), mirror)
+
+
+def _symbol_def(doc: dict, libid: str) -> dict | None:
+    """Resolve a symbol definition from the doc's embedded lib_cache."""
+    return doc.get("lib_cache", {}).get(libid)
+
+
+def _iter_placed_pins(doc: dict):
+    """Yield ``(symbol, pin, world_xy)`` for every pin of every placed symbol."""
+    cache = doc.get("lib_cache", {})
+    for sym in doc.get("symbols", []):
+        sdef = cache.get(sym.get("libid"))
+        if not sdef:
+            continue
+        unit = sym.get("unit", 1)
+        for pin in sdef.get("pins", []):
+            if pin.get("unit", 1) not in (unit, 0):
+                continue
+            yield sym, pin, _pin_world(sym, pin)
+
+
+class _SchemaFacade:
+    """Drop-in for the old ``from engine.ecad import schema`` (pure helpers only)."""
+
+    is_schematic = staticmethod(_is_schematic)
+    is_board = staticmethod(_is_board)
+    doc_kind = staticmethod(_doc_kind)
+    pin_world = staticmethod(_pin_world)
+    pad_world = staticmethod(_pad_world)
+    symbol_def = staticmethod(_symbol_def)
+    iter_placed_pins = staticmethod(_iter_placed_pins)
+
+
+schema = _SchemaFacade()
+
+
+# --------------------------------------------------------------------------- C++ session facade
+#
+# ECAD documents live in the C++ core (core/ecad/session.cpp): ecad_new/ecad_open mint an
+# "ecadcpp" doc; every mutation is an ecad_apply_ops RPC whose response carries
+# {revision, kind, tree (the full doc), compile {netlist|erc|drc|ratsnest}}. This facade
+# mirrors the engine.ecad.session API the tools were written against.
+
+class EcadSession:
+    """doc_id handle to a C++ ECAD session; mirrors engine.ecad.session.EcadSession's attrs."""
+
+    def __init__(self, doc_id: str, doc: dict, revision: int = 0,
+                 compile_field: dict | None = None, path: str | None = None) -> None:
+        self.doc_id = doc_id
+        self.doc = doc
+        self.revision = revision
+        self.last_compile = compile_field
+        self.path = path
+        self.dirty = False
+
+    @property
+    def kind(self) -> str:
+        return _doc_kind(self.doc)
+
+    def _update(self, resp: dict) -> None:
+        if isinstance(resp.get("tree"), dict):
+            self.doc = resp["tree"]
+        if isinstance(resp.get("revision"), int):
+            self.revision = resp["revision"]
+        if isinstance(resp.get("compile"), dict):
+            self.last_compile = resp["compile"]
+
+
+class _SessionFacade:
+    """Drop-in for the old ``from engine.ecad import session as ecad_session``."""
+
+    EcadSession = EcadSession
+
+    def __init__(self) -> None:
+        self._by_id: dict[str, EcadSession] = {}
+        self._alias: dict[str, str] = {}  # old doc_id -> new doc_id (swap_doc re-mints)
+
+    def _resolve(self, doc_id: str) -> str:
+        seen = set()
+        while doc_id in self._alias and doc_id not in seen:
+            seen.add(doc_id)
+            doc_id = self._alias[doc_id]
+        return doc_id
+
+    def _register(self, s: EcadSession) -> EcadSession:
+        self._by_id[s.doc_id] = s
+        return s
+
+    # -- engine.ecad.session API surface -------------------------------------
+
+    def new_session(self, kind: str = "sch", name: str | None = None) -> EcadSession:
+        resp = _rpc("ecad_new", {"kind": kind, "name": name or ""})
+        s = EcadSession(resp["doc_id"], resp.get("tree") or {},
+                        revision=resp.get("revision", 0),
+                        compile_field=resp.get("compile"))
+        return self._register(s)
+
+    def get_session(self, doc_id: str) -> EcadSession:
+        did = self._resolve(doc_id)
+        # Always refetch (ecad_tree) — in daemon mode another client may have advanced the doc.
+        resp = _rpc("ecad_tree", {"doc_id": did})
+        s = self._by_id.get(did)
+        if s is None:
+            s = EcadSession(did, resp.get("tree") or {})
+        s._update(resp)
+        return self._register(s)
+
+    def iter_sessions(self) -> list[EcadSession]:
+        return list(self._by_id.values())
+
+    def apply_ops(self, session: EcadSession, base_revision: int | None, ops: list[dict],
+                  emit=None) -> dict:
+        resp = _rpc("ecad_apply_ops", {
+            "doc_id": session.doc_id,
+            "base_revision": base_revision if base_revision is not None else -1,
+            "ops": ops,
+        })
+        session._update(resp)
+        return resp
+
+    def rebuild(self, session: EcadSession, emit=None) -> dict:
+        resp = _rpc("ecad_rebuild", {"doc_id": session.doc_id})
+        session._update(resp)
+        return resp
+
+    def tree(self, session: EcadSession) -> dict:
+        resp = _rpc("ecad_tree", {"doc_id": session.doc_id})
+        session._update(resp)
+        return resp
+
+    def swap_doc(self, session: EcadSession, new_doc: dict, *, base_revision: int | None = None,
+                 warnings: list[str] | None = None, emit=None) -> dict:
+        """Wholesale doc replacement. GAP (T-RF20): swap_doc_locked exists in
+        core/ecad/session.cpp:507 but no ecad_swap_doc RPC is dispatched in libaicad.cpp —
+        until one lands we re-mint: write the doc to a temp .ecad+ container, ecad_open it
+        (which validates + compiles), alias the old doc_id to the new one, and close the old
+        session. Revision/undo history restart at 0 (the RPC gap is tracked in the handoff).
+        """
+        resp = _mint_from_doc(new_doc)
+        new_id = resp["doc_id"]
+        old_id = session.doc_id
+        if new_id != old_id:
+            self._alias[old_id] = new_id
+            # Re-point the MCP "active doc" pointers if they referenced the old id.
+            for key in ("current_sch", "current_pcb", "current"):
+                if _ECAD.get(key) == old_id:
+                    _ECAD[key] = new_id
+            try:
+                _rpc("ecad_close", {"doc_id": old_id})
+            except OpError:
+                pass
+            self._by_id.pop(old_id, None)
+        session.doc_id = new_id
+        session._update(resp)
+        self._register(session)
+        if warnings:
+            resp.setdefault("warnings", [])
+            resp["warnings"] = list(resp["warnings"]) + list(warnings)
+        return resp
+
+
+ecad_session = _SessionFacade()
+
+
+def _mint_from_doc(doc: dict) -> dict:
+    """Mint a C++ session owning an inline doc dict via a temp .ecad+ container + ecad_open.
+
+    (No ecad_swap_doc / ecad_mint RPC surface yet — see swap_doc.) Returns the ecad_open
+    ops-response (+ doc_id)."""
+    import tempfile
+    import zipfile
+
+    kind = _doc_kind(doc)
+    meta = {
+        "container": "aicad.ecad+/1",
+        "app_version": "mcp-swap",
+        "kind": kind,
+        "schema": doc.get("schema", ""),
+        "created": "",
+        "modified": "",
+        "units": doc.get("units") if isinstance(doc.get("units"), dict) else {},
+        "name": doc.get("name", "Untitled"),
+    }
+    tmp = tempfile.NamedTemporaryFile(suffix=".ecad+", delete=False)
+    tmp.close()
+    try:
+        with zipfile.ZipFile(tmp.name, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("meta.json", json.dumps(meta))
+            z.writestr("document.json", json.dumps(doc))
+        return _rpc("ecad_open", {"path": tmp.name})
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+
+class _NetlistFacade:
+    """Drop-in for ``from engine.ecad import netlist as netlist_mod``.
+
+    build_netlist(doc) resolves the doc's owning C++ session by its embedded ``id`` and
+    returns the session's compiled netlist (the C++ core compiles netlist/ERC on every
+    apply/tree — core/ecad/session.cpp compile_field)."""
+
+    def build_netlist(self, doc: dict) -> dict:
+        did = doc.get("id") if isinstance(doc, dict) else None
+        if not did:
+            raise OpError("unknown_doc", "netlist: doc carries no session id", {})
+        s = ecad_session.get_session(str(did))
+        nl = (s.last_compile or {}).get("netlist")
+        if nl is None:
+            ecad_session.rebuild(s)
+            nl = (s.last_compile or {}).get("netlist")
+        return nl or {}
+
+
+netlist_mod = _NetlistFacade()
+
+
+def _compile_of(session) -> dict:
+    """Fresh compile field {netlist|erc|drc|ratsnest|stats} for a session (one ecad_tree RPC)."""
+    ecad_session.tree(session)
+    return session.last_compile or {}
+
+
+# --------------------------------------------------------------------------- sim RPC helpers
+
+
+def _netlist_to_circuit(nl: dict, sim_params: dict | None = None):
+    """engine.sim.spice.netlist_to_spice_circuit -> C++ sim_netlist_to_circuit RPC.
+    Returns (circuit, warnings)."""
+    resp = _rpc("sim_netlist_to_circuit", {"netlist": nl, "sim_params": sim_params})
+    return resp.get("circuit") or {}, list(resp.get("warnings") or [])
+
+
+def _sim_run(circuit: dict, study: dict, backend: str = "mna") -> dict:
+    """engine.sim.circuit.simulate -> C++ sim_spice RPC for the internal MNA solver.
+
+    The ngspice subprocess backend has NO C++ counterpart (engine.sim.ngspice_backend shells
+    out to the ngspice binary) — that leg STAYS a direct import, mirroring
+    circuit.simulate's resolve_backend dispatch so backend="ngspice"/"auto" degrade honestly.
+    """
+    choice, note = "mna", ""
+    if (backend or "mna").lower() in ("ngspice", "auto"):
+        from engine.sim import ngspice_backend as _ng  # STAYS: no C++ counterpart
+
+        choice, note = _ng.resolve_backend(backend, circuit, study)
+        if choice == "ngspice":
+            try:
+                result = _ng.simulate_ngspice(circuit, study)
+                result["backend"] = "ngspice"
+                if note:
+                    result["backend_note"] = note
+                return result
+            except _ng.NgspiceError as e:
+                note = ((note + " ") if note else "") + \
+                    f"ngspice run failed ({e}) — fell back to the internal MNA solver."
+    result = _rpc("sim_spice", {"circuit": circuit, "study": study})
+    result["backend"] = "mna"
+    if note:
+        result["backend_note"] = note
+        result.setdefault("log", []).append(f"backend: {note}")
+    return result
 
 
 def _component_eng(libid: str = "", fpid: str = "", overrides=None):
@@ -82,11 +437,11 @@ _PROVIDER_PLAN_BUSY = {"v": False}
 
 # --------------------------------------------------------------------------- crash recovery
 #
-# ECAD docs live only in memory (engine.ecad.session registry). A heavy ecad_* tool that overruns
-# the MCP client's transport timeout gets the server KILLED, and without on-disk backing every open
-# schematic/board is lost — unlike C++ part docs, which autosave + recover (cad_tools). The
-# engine.ecad.autosave module persists each session to %APPDATA%/AI-CAD/ecad_autosave after every
-# mutation; here we arm it and expose recovery to server._warm_core.
+# ECAD docs live in the C++ core's session registry (core/ecad/session.cpp). A heavy ecad_* tool
+# that overruns the MCP client's transport timeout gets the server KILLED, and without on-disk
+# backing every open schematic/board is lost — unlike C++ part docs, which autosave + recover
+# (cad_tools). The engine.ecad.autosave module (no C++ counterpart — STAYS) persists each doc to
+# %APPDATA%/AI-CAD/ecad_autosave; here we arm it and expose recovery to server._warm_core.
 
 _ECAD_SESSION_ID = _uuid_ecad.uuid4().hex[:12]
 
@@ -95,11 +450,10 @@ def enable_ecad_autosave() -> None:
     """Arm ECAD crash-recovery autosave for this server process. Called once from
     server._warm_core at startup. Best-effort.
 
-    NOTE (daemon mode): unlike the C++ part-doc autosave — which moved into
-    aicad-hostd (core/hostd/autosave.cpp) and is DISABLED in cad_tools when
-    AI_CAD_ENGINE_DAEMON=1 — ECAD docs are pure Python living in THIS process,
-    invisible to the daemon, and engine.ecad.autosave is mutation-hooked (no
-    threading.Timer chain). So it stays armed in both modes."""
+    NOTE (T-RF20): with ECAD sessions in the C++ core, autosave is no longer mutation-hooked
+    (engine.ecad.session drove it before); it fires from _autosave_all_open_ecad — the pre-heavy-op
+    sweep — and from recovery. The OpenECAD docs remain invisible to the daemon's own part-doc
+    autosave (core/hostd/autosave.cpp), so this stays armed in both engine modes."""
     try:
         from engine.ecad import autosave as _eauto
         _eauto.enable(_ECAD_SESSION_ID)
@@ -108,9 +462,13 @@ def enable_ecad_autosave() -> None:
 
 
 def recover_ecad_autosaved(scope: str = "recent"):
-    """Reopen ECAD docs autosaved before a (possibly killed) prior session into the live registry,
+    """Reopen ECAD docs autosaved before a (possibly killed) prior session as fresh C++ sessions,
     and re-point _ECAD['current_*'] at the recovered docs so default-doc tool calls work. Returns
     the recovery list. Best-effort — never raises into startup.
+
+    T-RF20: the autosave FILES are still written by engine.ecad.autosave (no C++ counterpart —
+    the direct import stays), but recovery now re-mints the doc into the C++ session registry
+    (temp .ecad+ container + ecad_open) instead of the deleted Python session registry.
 
     MONOTONICITY (critical): recovery runs on a BACKGROUND warm thread (server._warm_core), so it
     can finish AFTER a user has already called ecad_new_schematic / ecad_new_pcb / ecad_design on
@@ -119,10 +477,55 @@ def recover_ecad_autosaved(scope: str = "recent"):
     remain addressable by their explicit doc_id.
     """
     try:
-        from engine.ecad import autosave as _eauto
-        recovered = _eauto.recover_ecad_autosaved(scope=scope) or []
+        from engine.ecad import autosave as _eauto  # STAYS: no C++ counterpart
+        _eauto.prune()
+        files = sorted(_eauto.autosave_dir().glob("*.json"))
     except Exception:  # noqa: BLE001
         return []
+    info: list = []  # (path, payload, session_tag, saved_at)
+    for p in files:
+        try:
+            payload = json.loads(p.read_text(encoding="utf-8"))
+            ts = float(payload.get("saved_at", p.stat().st_mtime))
+        except Exception:  # noqa: BLE001 — skip a half-written/corrupt file
+            continue
+        if isinstance(payload, dict):
+            info.append((p, payload, payload.get("session"), ts))
+    if scope != "all":
+        prior = [t for t in info if t[2] != _ECAD_SESSION_ID]  # exclude our own session
+        if prior:
+            latest = max(prior, key=lambda t: t[3])[2]  # most-recent prior session's tag
+            if latest is None:
+                prior.sort(key=lambda t: t[3], reverse=True)
+                info = prior[:8]
+            else:
+                info = [t for t in prior if t[2] == latest]
+        else:
+            info = []
+    recovered: list = []
+    for p, payload, _tag, _ts in info:
+        doc = payload.get("doc")
+        if not isinstance(doc, dict) or not (_is_schematic(doc) or _is_board(doc)):
+            continue
+        try:
+            resp = _mint_from_doc(doc)
+        except Exception:  # noqa: BLE001 — a bad doc must never break recovery
+            continue
+        s = ecad_session._register(EcadSession(
+            resp["doc_id"], resp.get("tree") or {}, revision=resp.get("revision", 0),
+            compile_field=resp.get("compile"), path=payload.get("path")))
+        recovered.append({"doc_id": s.doc_id, "kind": s.kind,
+                          "name": doc.get("name", ""),
+                          "original_doc_id": payload.get("doc_id")})
+        # MIGRATE the file: persist the reopened doc under its NEW id (current session tag) and
+        # delete the stale prior-session source, so the autosave dir doesn't grow per restart.
+        try:
+            if _eauto.is_enabled():
+                _eauto.autosave_session(s)
+                if p.name != f"{s.doc_id}.json":
+                    p.unlink(missing_ok=True)
+        except Exception:  # noqa: BLE001 — migration is best-effort; never fail recovery
+            pass
     # Re-establish the "active" docs so ecad_status / ecad_simulate / etc. find a default doc after
     # a restart, mirroring how cad_tools.recover_autosaved sets _CUR["doc_id"].
     #
@@ -157,11 +560,10 @@ def _autosave_all_open_ecad() -> None:
     (which the soft budget below can't always pre-empt) can never lose open work. Mirrors
     cad_tools._autosave_all_open for the C++ side. Best-effort."""
     try:
-        from engine.ecad import autosave as _eauto
-        from engine.ecad import session as _esess
+        from engine.ecad import autosave as _eauto  # STAYS: no C++ counterpart
         if not _eauto.is_enabled():
             return
-        for s in _esess.iter_sessions():
+        for s in ecad_session.iter_sessions():
             _eauto.autosave_session(s)
     except Exception:  # noqa: BLE001
         pass
@@ -628,11 +1030,7 @@ def _build_analysis(analysis: str, params: dict, circuit: dict) -> dict | None:
 def _simulate_advanced(session, circuit: dict, an: dict, probe_list: list[str],
                        warns: list[str]) -> str:
     """Run one of the advanced analyses (four/mc/temp/noise) and return a rich payload."""
-    try:
-        from engine.sim.circuit import simulate as sim_run
-    except Exception as e:  # noqa: BLE001
-        return _err(f"simulator unavailable ({type(e).__name__}: {e})",
-                    hint="The sim engine (numpy/scipy) is not importable here.")
+    sim_run = _sim_run  # C++ sim_spice RPC (advanced analyses always run on the MNA solver)
 
     atype = an["type"]
 
@@ -1106,5 +1504,5 @@ def _summarize_sweep_steps(runs: list, atype: str, probe: Optional[str]):
 
 
 def _default_out_dir(name: str):
-    from engine import paths
+    from services import paths
     return paths.model_dir(f"ecad_{name}")

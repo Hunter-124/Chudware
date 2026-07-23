@@ -8,7 +8,7 @@ import json
 import math
 import unittest
 
-from engine_oracle.sim.em.worker_rpc import WORKER_METHODS
+from services.sim.em.worker_rpc import WORKER_METHODS
 from services.mcp import em_tools
 
 

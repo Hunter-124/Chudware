@@ -1,0 +1,250 @@
+[
+  {
+    "method": "gear_check",
+    "name": "gear_shigley_example",
+    "params": {
+      "Cf": 1.0,
+      "I": 0.107,
+      "J": 0.36,
+      "Km": 1.8,
+      "Ko": 1.25,
+      "Ks": 1.0,
+      "Kv": 1.52,
+      "Wt": 1000,
+      "face_width": 50,
+      "module": 4,
+      "pitch_diameter": 100
+    },
+    "result": {
+      "SF_bending": null,
+      "SF_contact": null,
+      "disclaimer": "Preliminary engineering estimate — not a certified analysis. Verify with a qualified mechanical engineer before use in safety-critical applications.",
+      "ok": true,
+      "sigma_bending_MPa": 47.5,
+      "sigma_contact_MPa": 482.9137033257734
+    }
+  },
+  {
+    "method": "gear_check",
+    "name": "gear_with_allowables",
+    "params": {
+      "Cf": 1.1,
+      "Cp": 191.0,
+      "I": 0.11,
+      "J": 0.32,
+      "KB": 1.2,
+      "Km": 1.4,
+      "Ko": 1.5,
+      "Ks": 1.1,
+      "Kv": 1.3,
+      "Wt": 2500,
+      "allowable_bending_stress": 200.0,
+      "allowable_contact_stress": 1200.0,
+      "face_width": 40.0,
+      "module": 3.0,
+      "pitch_diameter": 75.0
+    },
+    "result": {
+      "SF_bending": 0.8524808524808525,
+      "SF_contact": 1.2559167011783536,
+      "disclaimer": "Preliminary engineering estimate — not a certified analysis. Verify with a qualified mechanical engineer before use in safety-critical applications.",
+      "ok": true,
+      "sigma_bending_MPa": 234.609375,
+      "sigma_contact_MPa": 955.4773806846503
+    }
+  },
+  {
+    "method": "gear_check",
+    "name": "gear_required_only",
+    "params": {
+      "I": 0.12,
+      "J": 0.4,
+      "Wt": 500,
+      "face_width": 25.0,
+      "module": 2.5,
+      "pitch_diameter": 60.0
+    },
+    "result": {
+      "SF_bending": null,
+      "SF_contact": null,
+      "disclaimer": "Preliminary engineering estimate — not a certified analysis. Verify with a qualified mechanical engineer before use in safety-critical applications.",
+      "ok": true,
+      "sigma_bending_MPa": 20.0,
+      "sigma_contact_MPa": 318.33333333333337
+    }
+  },
+  {
+    "method": "gear_check",
+    "name": "gear_err_geometry",
+    "params": {
+      "I": 0.12,
+      "J": 0.4,
+      "Wt": 500,
+      "face_width": 25.0,
+      "module": 0,
+      "pitch_diameter": 60.0
+    },
+    "result": {
+      "error": "face_width, module, and pitch_diameter must be positive.",
+      "ok": false
+    }
+  },
+  {
+    "method": "gear_check",
+    "name": "gear_err_factors",
+    "params": {
+      "I": 0.12,
+      "J": 0,
+      "Wt": 500,
+      "face_width": 25.0,
+      "module": 2.5,
+      "pitch_diameter": 60.0
+    },
+    "result": {
+      "error": "Geometry factors J and I must be positive.",
+      "ok": false
+    }
+  },
+  {
+    "method": "gear_check",
+    "name": "gear_err_wt",
+    "params": {
+      "I": 0.12,
+      "J": 0.4,
+      "Wt": -5,
+      "face_width": 25.0,
+      "module": 2.5,
+      "pitch_diameter": 60.0
+    },
+    "result": {
+      "error": "Tangential load Wt must be positive.",
+      "ok": false
+    }
+  },
+  {
+    "method": "bearing_life",
+    "name": "bearing_ball_radial",
+    "params": {
+      "C": 30000,
+      "Fa": 0,
+      "Fr": 8000,
+      "bearing_type": "ball",
+      "n_rpm": 1200
+    },
+    "result": {
+      "L10_million_rev": 52.734375,
+      "L10h_hours": 732.421875,
+      "P_equiv_N": 8000.0,
+      "bearing_designation": "",
+      "disclaimer": "Preliminary engineering estimate — not a certified analysis. Verify with a qualified mechanical engineer before use in safety-critical applications.",
+      "ok": true,
+      "p_exponent": 3.0
+    }
+  },
+  {
+    "method": "bearing_life",
+    "name": "bearing_roller_mixed",
+    "params": {
+      "C": 50000,
+      "Fa": 2500,
+      "Fr": 10000,
+      "X": 0.4,
+      "Y": 1.5,
+      "bearing_designation": "NU205",
+      "bearing_type": "roller",
+      "n_rpm": 900
+    },
+    "result": {
+      "L10_million_rev": 499.9128951485247,
+      "L10h_hours": 9257.646206454161,
+      "P_equiv_N": 7750.0,
+      "bearing_designation": "NU205",
+      "disclaimer": "Preliminary engineering estimate — not a certified analysis. Verify with a qualified mechanical engineer before use in safety-critical applications.",
+      "ok": true,
+      "p_exponent": 3.3333333333333335
+    }
+  },
+  {
+    "method": "bearing_life",
+    "name": "bearing_case_strip",
+    "params": {
+      "C": 20000,
+      "Fr": 5000,
+      "bearing_type": " Ball "
+    },
+    "result": {
+      "L10_million_rev": 64.0,
+      "L10h_hours": 1066.6666666666667,
+      "P_equiv_N": 5000.0,
+      "bearing_designation": "",
+      "disclaimer": "Preliminary engineering estimate — not a certified analysis. Verify with a qualified mechanical engineer before use in safety-critical applications.",
+      "ok": true,
+      "p_exponent": 3.0
+    }
+  },
+  {
+    "method": "bearing_life",
+    "name": "bearing_err_c",
+    "params": {
+      "C": 0,
+      "Fr": 8000
+    },
+    "result": {
+      "error": "Dynamic load rating C must be positive. Supply C from the bearing manufacturer's datasheet.",
+      "ok": false
+    }
+  },
+  {
+    "method": "bearing_life",
+    "name": "bearing_err_loads",
+    "params": {
+      "C": 30000,
+      "Fa": 0,
+      "Fr": 0
+    },
+    "result": {
+      "error": "At least one of Fr (radial) or Fa (axial) must be positive.",
+      "ok": false
+    }
+  },
+  {
+    "method": "bearing_life",
+    "name": "bearing_err_type",
+    "params": {
+      "C": 30000,
+      "Fr": 8000,
+      "bearing_type": "needle"
+    },
+    "result": {
+      "error": "bearing_type must be 'ball' or 'roller', got 'needle'.",
+      "ok": false
+    }
+  },
+  {
+    "method": "bearing_life",
+    "name": "bearing_err_p",
+    "params": {
+      "C": 30000,
+      "Fr": 8000,
+      "X": 0.0,
+      "Y": 0.0
+    },
+    "result": {
+      "error": "Equivalent bearing load P = X*Fr + Y*Fa must be positive.",
+      "ok": false
+    }
+  },
+  {
+    "method": "bearing_life",
+    "name": "bearing_err_nrpm",
+    "params": {
+      "C": 30000,
+      "Fr": 8000,
+      "n_rpm": 0
+    },
+    "result": {
+      "error": "Shaft speed n_rpm must be positive.",
+      "ok": false
+    }
+  }
+]

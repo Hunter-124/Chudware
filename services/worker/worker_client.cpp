@@ -123,6 +123,50 @@ bool routeDocToCpp(const std::string& method, const json& params) {
     // is doc-independent (family/size listing); parts_make mints a NEW doc-cpp part from the
     // generator. There is no Python equivalent, so always route to the core.
     if (method == "parts_catalog_list" || method == "parts_make") return true;
+    // T-RF19: doc_formats (the import/export format matrix) is C++-only (core/doc/formats).
+    if (method == "doc_formats") {
+        if (!engine::available()) {
+            std::string lerr;
+            if (!engine::ensureLoaded(lerr)) return false;  // can't load -> Python
+        }
+        return true;
+    }
+    // T-RF19 leaves 4-6: hydraulic/piping/structural/tolerance/mechanical/materials/dfm
+    // ported to core/ (dispatch in libaicad.cpp). Route the ported sets.
+    static const char* const kR4e6[] = {
+        // hydraulic (core/hydraulic)
+        "hydraulic_new", "hydraulic_add_component", "hydraulic_add_hose",
+        "hydraulic_size_cylinder", "hydraulic_size_pump", "hydraulic_size_accumulator",
+        "hydraulic_valve_flow", "hydraulic_fmu_simulate", "hydraulic_bom",
+        "hydraulic_piping_handoff", "hydraulic_verify_piping", "hydraulic_fea_handoff",
+        "hydraulic_verify_fea",
+        // piping (core/piping)
+        "piping_solve", "piping_report", "piping_operating_point", "piping_fluid",
+        "piping_cfd_boundary", "piping_verify_cfd",
+        // structural (core/structural)
+        "struct_analyze", "struct_check", "struct_estimate",
+        // tolerance / mechanical / materials / dfm
+        "stackup_analyze", "gear_check", "bearing_life",
+        "material_get", "material_density", "material_resolve_key", "material_fea_table",
+        "material_fea_aliases", "material_cam_data", "material_cam_id",
+        "material_cam_materials", "material_all",
+        "dfm_known_processes", "dfm_get_profile", "dfm_resolve_process",
+        "dfm_fit_clearance", "dfm_modeled_dim", "dfm_process_block_text",
+        // parts placement (core/parts/place; callers pass `record` — hub FTS is Python)
+        "part_place", "part_import_file",
+    };
+    {
+        bool ported = false;
+        for (const char* p : kR4e6)
+            if (method == p) { ported = true; break; }
+        if (ported) {
+            if (!engine::available()) {
+                std::string lerr;
+                if (!engine::ensureLoaded(lerr)) return false;  // can't load -> Python
+            }
+            return true;
+        }
+    }
     // T-RF18: sourcing/BOM/cost/spec-match ported to core/sourcing (dispatch in
     // libaicad.cpp with production seams). Route the ported set; the vendor registry
     // read methods and parts_hub stay Python until their cutover.
@@ -279,8 +323,9 @@ bool cppSimFlag() {
 bool routeSimToCpp(const std::string& method, const json& /*params*/) {
     if (!cppSimFlag()) return false;
     if (!(method == "sim_mesh" || method == "sim_run_static" || method == "sim_run_modal" ||
-          method == "sim_run_fatigue" || method == "sim_run_thermal"))
-        return false;  // sim_run_flow (LBM) + sim_cancel + everything else stays Python
+          method == "sim_run_fatigue" || method == "sim_run_thermal" ||
+          method == "sim_run_flow" || method == "sim_cancel"))
+        return false;  // sim_caps + everything else stays Python (services worker)
     if (!engine::available()) {
         // Lazily try to load the core DLL; if it can't load, fall through to Python so
         // sim never hard-breaks. ensureLoaded is idempotent (loads once).

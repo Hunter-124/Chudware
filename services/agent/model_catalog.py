@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
 
-from engine import paths
+from services import paths
 
 __all__ = [
     "ModelRow",

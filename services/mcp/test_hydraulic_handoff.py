@@ -2,17 +2,19 @@
 aicad.simhandoff/1 seam (contracts/sim_handoff.md).
 
 Groups:
-  1. Translators — hoses_to_piping produces a valid aicad.piping/1 network with
-     exact hose bores; estimate_line_dp physics sanity.
+  1. Translators — the hoses→piping network with exact hose bores (driven through
+     the flipped tool: the translator lives in the C++ core since T-RF20, so these
+     need libaicad and skip cleanly without it); estimate_line_dp physics sanity.
   2. Envelopes — handoff/verify envelopes for both couplings validate structurally
-     and cross-checks fire correctly on mock solve results (fluids-less coverage,
-     mirroring test_simhandoff.py's approach).
+     and cross-checks fire correctly on mock solve results (the pure-Python
+     envelope compositions in hydraulic_tools, mirroring test_simhandoff.py).
   3. Pump-margin feedback — real line losses change the pump margin.
-  4. Tools — driven against a stub FastMCP; solve_pending path when the ``fluids``
-     library is absent, live solve path when present (skipped otherwise, honestly).
+  4. Tools — driven against a stub FastMCP; the C++ core always runs the live
+     solve (the old fluids-absent "solve_pending" stage is gone).
   5. piping_solve consumer — network_from_handoff extracts doc/boundary/fluid.
 
-Pure Python — no engine kernel, no FastMCP server required.
+The tool-driven groups need libaicad (the tool bodies are core_bridge wrappers
+now); the envelope/margin/estimate groups stay pure Python.
 
 Run: pytest services/mcp/test_hydraulic_handoff.py -q
 """
@@ -24,47 +26,76 @@ import math
 
 import pytest
 
-from engine.hydraulic import schema as hyd_schema
-from engine.piping import schema as piping_schema
-from engine.piping import solve as piping_solve_mod
+from services.mcp import core_bridge as cb
 from services.mcp import hydraulic_tools as ht
 from services.mcp import piping_tools as pt
 from services.mcp import simhandoff as sh
 
 
-HAVE_FLUIDS = piping_solve_mod.have_fluids()
+_HAVE_CORE = cb.available()
 
 
 # ── fixtures ──────────────────────────────────────────────────────────────────
 
+def _component(cid, type, name, **params) -> dict:
+    return {"id": cid, "type": type, "name": name, "position": [0.0, 0.0],
+            "angle": 0.0, "ports": [], "params": params,
+            "sourcing": {"mpn": None, "manufacturer": None, "description": None,
+                         "quantity": 1, "unit": "ea", "category": None}}
+
+
 def _circuit() -> dict:
-    """Two-hose circuit: pump → cylinder pressure line + return line."""
-    doc = hyd_schema.new_hydraulic("Press circuit")
-    pump = hyd_schema.new_component("c1", "pump", name="pump")
-    cyl = hyd_schema.new_component("c2", "cylinder_linear", name="cyl",
-                                   bore_mm=50.0, rod_mm=28.0)
-    doc["components"] += [pump, cyl]
-    doc["hoses"].append(hyd_schema.new_hose(
-        "h1", "PRESSURE_LINE",
-        [{"component_id": "c1", "port": "pressure"},
-         {"component_id": "c2", "port": "work_a"}]))
-    doc["hoses"].append(hyd_schema.new_hose(
-        "h2", "RETURN_LINE",
-        [{"component_id": "c2", "port": "work_b"},
-         {"component_id": "c1", "port": "tank"}]))
+    """Two-hose circuit: pump → cylinder pressure line + return line (inline
+    aicad.hydraulic/1 — the engine schema factories are deleted with the oracle)."""
+    doc = {
+        "schema": "aicad.hydraulic/1",
+        "id": "test-circuit",
+        "name": "Press circuit",
+        "units": {"pressure": "bar", "flow": "L/min", "force": "kN", "position": "mm"},
+        "components": [
+            _component("c1", "pump", "pump"),
+            _component("c2", "cylinder_linear", "cyl", bore_mm=50.0, rod_mm=28.0),
+        ],
+        "hoses": [
+            {"id": "h1", "net_name": "PRESSURE_LINE",
+             "connections": [{"component_id": "c1", "port": "pressure"},
+                             {"component_id": "c2", "port": "work_a"}]},
+            {"id": "h2", "net_name": "RETURN_LINE",
+             "connections": [{"component_id": "c2", "port": "work_b"},
+                             {"component_id": "c1", "port": "tank"}]},
+        ],
+        "annotations": [],
+    }
     # hose-carried geometry (the translator reads these fields)
     doc["hoses"][0]["id_mm"] = 12.7      # -8 hose
     doc["hoses"][0]["length_mm"] = 2500.0
     doc["hoses"][1]["id_mm"] = 19.0      # -12 hose
     doc["hoses"][1]["length_mm"] = 3000.0
-    assert hyd_schema.validate_hydraulic(doc) == []
     return doc
 
 
+def _empty_circuit() -> dict:
+    return {"schema": "aicad.hydraulic/1", "id": "empty", "name": "empty",
+            "units": {"pressure": "bar", "flow": "L/min", "force": "kN",
+                      "position": "mm"},
+            "components": [], "hoses": [], "annotations": []}
+
+
 def _net(doc=None, **kw):
+    """The hoses→piping translation, driven through the flipped tool — the
+    translator lives in the C++ core (core/hydraulic/handoff.cpp) and
+    hydraulic_piping_handoff's base payload IS the net."""
+    if not _HAVE_CORE:
+        pytest.skip("libaicad not staged — hoses_to_piping lives in the C++ core")
     kw.setdefault("flow_lpm", 30.0)
     kw.setdefault("supply_pressure_bar", 200.0)
-    return ht.hoses_to_piping(doc or _circuit(), **kw)
+    tools = _tools()
+    res = json.loads(tools["hydraulic_piping_handoff"](
+        doc=json.dumps(doc or _circuit()), **kw))
+    if not res.get("ok"):
+        return res
+    return {k: res[k] for k in
+            ("ok", "piping_doc", "boundary", "fluid", "lines", "estimates", "warnings")}
 
 
 class _StubMCP:
@@ -90,8 +121,7 @@ def _tools():
 def test_hoses_to_piping_valid_doc_exact_bores():
     net = _net()
     assert net["ok"]
-    pdoc = net["piping_doc"]
-    assert piping_schema.validate(pdoc) == []
+    pdoc = net["piping_doc"]  # the core validated the doc it generated (ok attests)
     assert [r["bore_mm"] for r in pdoc["runs"]] == [12.7, 19.0]
     assert [r["name"] for r in pdoc["runs"]] == ["PRESSURE_LINE", "RETURN_LINE"]
     # each run gets a fixed supply pressure at start + demand at end
@@ -113,8 +143,7 @@ def test_hoses_to_piping_line_overrides_beat_hose_fields():
 
 
 def test_hoses_to_piping_no_hoses_soft_fails():
-    doc = hyd_schema.new_hydraulic("empty")
-    net = _net(doc)
+    net = _net(_empty_circuit())
     assert not net["ok"] and "no hoses" in net["reason"]
 
 
@@ -247,23 +276,23 @@ def test_tool_piping_handoff_engine_less_or_live():
     res = json.loads(tools["hydraulic_piping_handoff"](
         supply_pressure_bar=200.0, flow_lpm=30.0, load_pressure_bar=180.0,
         doc=json.dumps(doc)))
+    if not _HAVE_CORE:
+        # no libaicad staged: the wrapper degrades contract-shaped, never raises
+        assert res["ok"] is False and "core engine unavailable" in res["reason"]
+        return
     assert res["ok"]
     env = res["simhandoff"]
     assert sh.validate_envelope(env) == []
     assert env["coupling"] == "hydraulic_to_piping"
-    if HAVE_FLUIDS:
-        assert res["stage"] == "solved"
-        assert res["solve"]["ok"] and len(res["per_line_dp_kpa"]) == 2
-        assert "pump_margin_solved_bar" in res["margin"]
-        # the whole point: real losses move the margin off the estimate
-        assert res["verify"]["checks"]
-    else:
-        assert res["stage"] == "solve_pending"
-        assert res["solve"] is None
-        assert "fluids" in res["hint"]
-        assert res["margin"]["pump_margin_estimate_bar"] is not None
+    # the C++ core IS the solver: the live solve always runs (no solve_pending stage)
+    assert res["stage"] == "solved"
+    assert res["solve"]["ok"] and len(res["per_line_dp_kpa"]) == 2
+    assert "pump_margin_solved_bar" in res["margin"]
+    # the whole point: real losses move the margin off the estimate
+    assert res["verify"]["checks"]
 
 
+@pytest.mark.skipif(not _HAVE_CORE, reason="libaicad not staged — tool bodies are core RPCs")
 def test_tool_verify_piping_with_mock_solve():
     tools = _tools()
     doc = _circuit()
@@ -282,6 +311,7 @@ def test_tool_verify_piping_with_mock_solve():
     assert res["margin"]["pump_margin_solved_bar"] is not None
 
 
+@pytest.mark.skipif(not _HAVE_CORE, reason="libaicad not staged — tool bodies are core RPCs")
 def test_tool_fea_handoff_and_verify_roundtrip():
     tools = _tools()
     res = json.loads(tools["hydraulic_fea_handoff"](
@@ -301,6 +331,7 @@ def test_tool_fea_handoff_and_verify_roundtrip():
     assert v["simhandoff"]["handoff_id"] == res["simhandoff"]["id"]
 
 
+@pytest.mark.skipif(not _HAVE_CORE, reason="libaicad not staged — tool bodies are core RPCs")
 def test_tool_fea_handoff_input_guards():
     tools = _tools()
     assert not json.loads(tools["hydraulic_fea_handoff"](
@@ -340,7 +371,7 @@ def test_network_from_handoff_rejects_bad_envelopes():
     assert any("boundary missing" in e for e in errs)
 
 
-@pytest.mark.skipif(not HAVE_FLUIDS, reason="fluids not installed — live 1D solve skipped")
+@pytest.mark.skipif(not _HAVE_CORE, reason="libaicad not staged — live 1D solve skipped")
 def test_live_solve_estimate_vs_solve_within_tolerance():
     """With fluids installed the whole loop runs live: solve the generated network
     and require the per-hose Darcy estimate to agree with the solver within 30%."""

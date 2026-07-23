@@ -588,7 +588,7 @@ def test_xai_expired_token_skips_usage_waterfall(tmp_config, monkeypatch):
 
 
 def test_subscription_usage_rpc(tmp_config, monkeypatch):
-    from engine_oracle.parts_hub import subscription_rpc as rpc
+    from services.agent import worker_rpc as rpc
 
     sub_auth.save_credential("xai-sub", {
         "access_token": _jwt({"email": "g@x.ai", "plan": "SuperGrok", "sub": "x1"}),

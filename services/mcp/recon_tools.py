@@ -1613,7 +1613,7 @@ def register_photo_recon_tools(mcp: FastMCP) -> None:
         """
         try:
             # Lazy import so a missing qrcode/open3d can't break server startup
-            from engine.vision.capture_server import start_session
+            from services.vision.capture_server import start_session
 
             if port in _SESSIONS:
                 existing = _SESSIONS[port]
@@ -1660,9 +1660,9 @@ def register_photo_recon_tools(mcp: FastMCP) -> None:
         the round-trip from photos to an editable parametric feature tree.
         """
         try:
-            from engine.vision.capture_server import stop_session
-            from engine.vision import photogrammetry as _pg
-            from engine.vision import mesh_cleanup as _mc
+            from services.vision.capture_server import stop_session
+            from services.vision import photogrammetry as _pg
+            from services.vision import mesh_cleanup as _mc
             import os as _os
             import shutil as _shutil
             import tempfile

@@ -83,7 +83,6 @@ from .cad_common import (  # noqa: F401 — re-export compat facade
     _inspect_caption,
     _match_color_key,
     _match_point_cloud,
-    _materials_registry,
     _measure_match,
     _merge_face_sets,
     _merge_handoff_fragments,

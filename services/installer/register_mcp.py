@@ -20,7 +20,7 @@ import shutil
 import sys
 from pathlib import Path
 
-from engine import paths
+from services import paths
 
 SERVER_NAME = "billet"
 SERVER_NAME_LEGACY = "ai-cad"  # left in place on register; removed on --unregister

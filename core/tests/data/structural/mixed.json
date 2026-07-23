@@ -1,0 +1,108 @@
+{
+ "schema": "aicad.structure/1",
+ "name": "mixed",
+ "units": "mm",
+ "elements": [
+  {
+   "element_type": "post",
+   "id": "post1",
+   "section_name": "4x4",
+   "material": "cedar",
+   "length_mm": 2438.4,
+   "transform": [
+    1.0,
+    0,
+    0,
+    0,
+    0,
+    1.0,
+    0,
+    0,
+    0,
+    0,
+    1.0,
+    0,
+    0,
+    0,
+    0,
+    1
+   ]
+  },
+  {
+   "element_type": "beam",
+   "id": "beam1",
+   "section_name": "W8X31",
+   "material": "steel",
+   "length_mm": 3048.0,
+   "transform": [
+    0,
+    0,
+    1,
+    0,
+    0,
+    1,
+    0,
+    0,
+    1,
+    0,
+    0,
+    2438.4,
+    0,
+    0,
+    0,
+    1
+   ]
+  },
+  {
+   "element_type": "joist",
+   "id": "joist1",
+   "section_name": "2x10",
+   "material": "lumber",
+   "length_mm": 3657.6,
+   "transform": [
+    0,
+    0,
+    1,
+    0,
+    0,
+    1,
+    0,
+    300,
+    1,
+    0,
+    0,
+    2438.4,
+    0,
+    0,
+    0,
+    1
+   ]
+  },
+  {
+   "element_type": "joist",
+   "id": "joist2",
+   "section_name": "2x10",
+   "material": "lumber",
+   "length_mm": 3657.6,
+   "transform": [
+    0,
+    0,
+    1,
+    0,
+    0,
+    1,
+    0,
+    700,
+    1,
+    0,
+    0,
+    2438.4,
+    0,
+    0,
+    0,
+    1
+   ]
+  }
+ ],
+ "load_cases": []
+}

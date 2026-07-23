@@ -42,7 +42,7 @@ def _crash_dir() -> Path:
         d = Path(override)
     else:
         try:
-            from engine import paths as _paths
+            from services import paths as _paths
             d = _paths.ROOT / "crashes"  # alias-aware root, not the always-new dir
         except Exception:
             d = Path(os.environ.get("APPDATA") or "/tmp") / "AI-CAD" / "crashes"

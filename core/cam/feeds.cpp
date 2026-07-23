@@ -162,8 +162,14 @@ std::filesystem::path resolve_registry_path() {
     else if (const char* home = std::getenv("HOME"); home && home[0])
         root = fs::path(home) / ".local" / "share" / "AI-CAD";
 #endif
-    if (root.empty()) return {};
-    return root / "materials" / "registry.json";
+    if (!root.empty()) {
+        const fs::path p = root / "materials" / "registry.json";
+        if (fs::exists(p)) return p;
+    }
+#ifdef AICAD_BUNDLED_MATERIALS_REGISTRY
+    return fs::path(AICAD_BUNDLED_MATERIALS_REGISTRY);  // bundled repo seed (last resort)
+#endif
+    return {};
 }
 }  // namespace
 

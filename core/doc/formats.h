@@ -33,6 +33,24 @@ namespace aicad::doc {
 // Throws OpError("invalid_op") on an unknown extension.
 std::string detect_format(const std::string& path);
 
+// One row of the import/export format matrix (port of formats.py::FormatInfo). The
+// host builds its File > Open/Import/Export filters from this via the doc_formats
+// RPC, so the UI never lists a format the engine can't handle (and vice-versa).
+//   lane: "brep" (OCCT solids) | "mesh" (triangle soup) | "rhino" | "proprietary"
+struct FormatInfo {
+    std::string fmt;                 // format key, e.g. "step"
+    std::string label;               // human label, e.g. "STEP"
+    std::vector<std::string> exts;   // extensions incl. leading dot, primary first
+    std::string lane;
+    bool can_import = true;
+    bool can_export = true;
+};
+
+// The full format matrix in registry order — a byte-parity port of formats.py::
+// FORMAT_REGISTRY (the doc_formats RPC payload source). Single source of truth;
+// detect_format's extension map is a projection of these entries.
+const std::vector<FormatInfo>& format_registry();
+
 // True iff this machine can COM-automate SolidWorks (SldWorks.Application registered).
 // Cheap registry probe; never launches SolidWorks. Always false off Windows.
 bool solidworks_available();

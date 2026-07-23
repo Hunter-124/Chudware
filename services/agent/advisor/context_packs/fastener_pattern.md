@@ -1,5 +1,5 @@
 # Fastener pattern context pack
-# Source: engine_oracle/research/data/feeds_speeds.json (tap_drill.metric_coarse);
+# Source: services/research/data/feeds_speeds.json (tap_drill.metric_coarse);
 #         ISO 273:1979 Clearance holes for bolts and screws (medium series)
 
 ## Clearance hole series (ISO 273 medium series)

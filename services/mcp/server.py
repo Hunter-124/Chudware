@@ -357,7 +357,7 @@ register_plm_tools(mcp)
 from mcp_server.graph_tools import register_graph_tools
 register_graph_tools(_reg.view(mcp, "cad"))
 # Requirements (aicad.req/1): CRUD + markdown projection for design briefs.
-# Schema: contracts/requirements.md  Brain: engine_oracle/requirements/requirements.py
+# Schema: contracts/requirements.md  Brain: services/requirements/requirements.py
 from mcp_server.req_tools import register_req_tools
 register_req_tools(mcp)
 

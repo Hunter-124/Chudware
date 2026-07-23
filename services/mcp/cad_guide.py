@@ -732,7 +732,7 @@ def cad_guide_text(topic: str = "overview") -> str:
                  "brief", "design_brief", "layout_plan", "layout", "critical_dim"):
         return (
             "REQUIREMENTS (aicad.req/1) — design-brief CRUD + markdown projection\n\n"
-            "Schema: contracts/requirements.md  |  Engine: engine_oracle/requirements/\n\n"
+            "Schema: contracts/requirements.md  |  Engine: services/requirements/\n\n"
             "WORKFLOW:\n"
             "  req_create(title, body)              Create a new requirements doc; returns req_id.\n"
             "  req_update(req_id, needs?, reqs?)    Add/edit individual need or requirement rows.\n"

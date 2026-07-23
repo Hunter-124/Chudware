@@ -1,4 +1,4 @@
-"""Tests for canonical serialization (engine/doc/canonical.py) and
+"""Tests for canonical serialization (services/plm/canonical.py) and
 doc-level diffing (services/mcp/doc_diff_tools.py).
 
 Both modules are pure Python with no engine/bridge dependency and can be
@@ -43,7 +43,7 @@ except ImportError:
     sys.modules["mcp.server"] = _stub_server
     sys.modules["mcp.server.fastmcp"] = _stub_fastmcp
 
-from engine.doc.canonical import canonical_dump, round_floats_doc  # noqa: E402
+from services.plm.canonical import canonical_dump, round_floats_doc  # noqa: E402
 from services.mcp.doc_diff_tools import doc_diff  # noqa: E402
 
 

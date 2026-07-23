@@ -93,10 +93,10 @@ def parts_hub_with_metadata_part(monkeypatch):
             raise NotImplementedError("live-only test adapter")
 
     # Reset hub singleton so we start clean.
-    import engine_oracle.parts_hub as _hub_mod
+    import services.parts as _hub_mod
     _hub_mod._hub = None
 
-    from engine_oracle.parts_hub import register_provider
+    from services.parts import register_provider
     register_provider(_FakeMetadataAdapter())
 
     yield PART_ID, str(photo_path), str(ds_path)
@@ -245,7 +245,7 @@ class TestRevengPartsRoundtrip:
         # (The hub's provider-ordering means the original metadata adapter may
         # win hub_get() for the same part_id; we assert the RE adapter itself
         # returns the correct record since that's what reveng_attach_result guarantees.)
-        from engine_oracle.parts_hub.adapters.reveng_result_adapter import RevengResultAdapter
+        from services.parts.adapters.reveng_result_adapter import RevengResultAdapter
         adapter = RevengResultAdapter()
         record = adapter.get(PART_ID)
         assert record is not None, "RevengResultAdapter.get returned None after attach"
@@ -286,7 +286,7 @@ class TestRevengPartsRoundtrip:
         # don't need the native engine.  We also need hub.get() to return the RE
         # record (with geometry_ref), not the metadata-only record; mock it directly.
         import unittest.mock as mock
-        from engine_oracle.parts_hub.adapters.reveng_result_adapter import RevengResultAdapter
+        from services.parts.adapters.reveng_result_adapter import RevengResultAdapter
 
         re_adapter = RevengResultAdapter()
         re_record = re_adapter.get(PART_ID)
@@ -296,9 +296,9 @@ class TestRevengPartsRoundtrip:
         mock_cb.call.return_value = {"doc_id": "doc_mock_abc123", "body_count": 1}
 
         with mock.patch.dict("sys.modules", {"core_bridge": mock_cb}):
-            # place() does `from engine_oracle.parts_hub import get` inline;
+            # place() does `from services.parts import get` inline;
             # patch the module-level function so it returns the RE record.
-            with mock.patch("engine_oracle.parts_hub.get", return_value=re_record):
+            with mock.patch("services.parts.get", return_value=re_record):
                 from engine_oracle.parts_hub.place import place
                 result = place(PART_ID)
 

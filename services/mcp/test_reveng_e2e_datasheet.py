@@ -56,7 +56,7 @@ def test_ingest_datasheet_returns_ok():
     except ImportError:
         pytest.skip("pdfplumber not installed")
 
-    from engine_oracle.vision.datasheet_ingest import ingest_datasheet
+    from services.vision.datasheet_ingest import ingest_datasheet
 
     with tempfile.TemporaryDirectory() as tmpdir:
         result = ingest_datasheet(str(_BEARING_PDF), tmpdir)
@@ -74,7 +74,7 @@ def test_ingest_extracts_mpn_candidate():
     except ImportError:
         pytest.skip("pdfplumber not installed")
 
-    from engine_oracle.vision.datasheet_ingest import ingest_datasheet
+    from services.vision.datasheet_ingest import ingest_datasheet
 
     with tempfile.TemporaryDirectory() as tmpdir:
         result = ingest_datasheet(str(_BEARING_PDF), tmpdir)
@@ -149,7 +149,7 @@ def test_e2e_ingest_then_mpn_dims():
     except ImportError:
         pytest.skip("pdfplumber not installed")
 
-    from engine_oracle.vision.datasheet_ingest import ingest_datasheet
+    from services.vision.datasheet_ingest import ingest_datasheet
 
     with tempfile.TemporaryDirectory() as tmpdir:
         # Step 1: ingest datasheet
@@ -194,7 +194,7 @@ def test_e2e_ingest_then_mpn_dims():
 def test_reveng_session_ingest_via_mcp():
     """reveng_start_session creates a valid session; reveng_ingest_datasheet is registered.
 
-    NOTE: The MCP tool ``reveng_ingest_datasheet`` delegates to ``engine_oracle.vision.ingest.
+    NOTE: The MCP tool ``reveng_ingest_datasheet`` delegates to ``services.vision.ingest.
     ingest_pdf`` which does not yet exist (reveng_tools.py falls back to a docling-only stub).
     The session-create flow is tested live here; the ingest MCP path is skipped with a clear
     reason (contract gap: reveng_tools._ingest_pdf should wire to datasheet_ingest.ingest_datasheet).
@@ -262,7 +262,7 @@ def test_reveng_session_ingest_via_mcp():
 
 def _dense_available() -> bool:
     try:
-        from engine_oracle.vision.reveng_provision import reveng_status
+        from services.vision.reveng_provision import reveng_status
         caps = reveng_status().get("capabilities", {})
         return bool(caps.get("dense"))
     except Exception:

@@ -335,7 +335,7 @@ ROUTING_KEY = "routing"
 
 
 def _config_path():
-    from engine import paths  # lazy: keep import cost off module load
+    from services import paths  # lazy: keep import cost off module load
     return paths.CONFIG
 
 

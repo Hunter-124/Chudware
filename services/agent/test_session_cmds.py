@@ -60,7 +60,7 @@ Implement session command RPCs for /handoff and /btw.
 
 ## Critical Context
 - services/agent/session_cmds.py
-- engine_oracle/parts_hub/session_rpc.py
+- services/agent/worker_rpc.py (folded from engine_oracle/parts_hub/session_rpc.py in T-RF19)
 
 ## Next Steps
 1. Register SESSION_METHODS in worker_rpc.py
@@ -260,7 +260,7 @@ class TestCompactShakeDelegation(unittest.TestCase):
 
 class TestSessionRpc(unittest.TestCase):
     def test_methods_registered(self) -> None:
-        from engine_oracle.parts_hub.session_rpc import SESSION_METHODS
+        from services.agent.worker_rpc import SESSION_METHODS
 
         for name in (
             "session_compact",
@@ -272,7 +272,7 @@ class TestSessionRpc(unittest.TestCase):
             self.assertTrue(callable(SESSION_METHODS[name]))
 
     def test_rpc_handoff_and_btw_shapes(self) -> None:
-        from engine_oracle.parts_hub import session_rpc as rpc
+        from services.agent import worker_rpc as rpc
 
         prov = _MockProvider(_SAMPLE_HANDOFF)
         # Patch get_provider path by injecting provider object via params
@@ -311,7 +311,7 @@ class TestSessionRpc(unittest.TestCase):
         self.assertEqual(r2["answer"], "brief answer")
 
     def test_rpc_btw_requires_question(self) -> None:
-        from engine_oracle.parts_hub import session_rpc as rpc
+        from services.agent import worker_rpc as rpc
 
         r = rpc.SESSION_METHODS["session_btw"](
             {"messages": _history(), "provider": "mock", "model": "m"},
@@ -321,7 +321,7 @@ class TestSessionRpc(unittest.TestCase):
         self.assertIn("question", r.get("reason", "").lower())
 
     def test_rpc_compact_off(self) -> None:
-        from engine_oracle.parts_hub import session_rpc as rpc
+        from services.agent import worker_rpc as rpc
 
         r = rpc.SESSION_METHODS["session_compact"](
             {"messages": _history(), "strategy": "off"},
@@ -333,7 +333,7 @@ class TestSessionRpc(unittest.TestCase):
         self.assertEqual(len(r["kept_messages"]), 3)
 
     def test_rpc_shake_shape(self) -> None:
-        from engine_oracle.parts_hub import session_rpc as rpc
+        from services.agent import worker_rpc as rpc
 
         fake = {
             "messages": _history(),

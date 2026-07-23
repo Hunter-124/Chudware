@@ -70,6 +70,7 @@
 #include "doc/export2d.h"
 #include "doc/drawing_session.h"
 #include "doc/session.h"
+#include "doc/formats.h"
 #include "doc/validate.h"
 #include "doc/op_registry.h"
 #include "ecad/op_registry.h"
@@ -103,6 +104,14 @@
 #include "firmware/firmware_rpc.h"
 #include "sourcing/sourcing.h"
 #include "ecad/container.h"
+#include "hydraulic/hydraulic.h"
+#include "piping/piping.h"
+#include "structural/structural_rpc.h"
+#include "tolerance/stackup.h"
+#include "mechanical/mechanical.h"
+#include "materials/materials.h"
+#include "dfm/process_profiles.h"
+#include "parts/place.h"
 #include "sim/spice.h"
 
 using nlohmann::json;
@@ -879,6 +888,65 @@ static json cam_extract_from_doc(const std::string& part_doc_id, const json& par
 // becomes a clean JSON error with every lock_guard/DocLock already released by unwind.
 // Only a hardware fault (access violation) escapes as an SEH; that's caught one frame
 // up in aicad_call.
+// Factored body of the parts_make dispatch — shared by the `parts_make` branch and
+// the PlaceSeams::parts_make injection (core/parts/place). rc mirrors the old emit codes.
+static json parts_make_impl(const json& params, int& rc) {
+    rc = 0;
+    try {
+        const std::string family = params.value("family", std::string());
+        const std::string size = params.value("size", std::string());
+        double length = 0.0;
+        if (params.contains("length_mm") && params["length_mm"].is_number())
+            length = params["length_mm"].get<double>();
+        else if (params.contains("length") && params["length"].is_number())
+            length = params["length"].get<double>();
+        const json opts = (params.contains("options") && params["options"].is_object())
+                              ? params["options"]
+                              : json::object();
+        aicad::parts::PartBuild pb = aicad::parts::build(family, size, length, opts);
+        const std::string nm = params.value("name", pb.name);
+        json nresp = aicad::doc::doc_new("part", nm);
+        const std::string doc_id = nresp.value("doc_id", std::string());
+        if (doc_id.empty()) {
+            rc = 1;
+            return json{{"ok", false}, {"error", "parts_make: doc_new failed"}};
+        }
+        json aresp = aicad::doc::doc_apply_ops(doc_id, 0, pb.ops, false);
+        json out;
+        out["ok"] = true;
+        out["doc_id"] = doc_id;
+        out["name"] = nm;
+        out["meta"] = pb.meta;
+        // Extents + placement datum (Bug A-1); standard parts seat at z=0, axis +Z.
+        try {
+            json bb = aicad::doc::doc_bbox(doc_id);
+            out["bbox"] = bb;
+            const auto& mn = bb["min"]; const auto& mx = bb["max"];
+            out["datum"] = {
+                {"base_center", {(mn[0].get<double>() + mx[0].get<double>()) / 2.0,
+                                 (mn[1].get<double>() + mx[1].get<double>()) / 2.0,
+                                 mn[2].get<double>()}},
+                {"axis", {0, 0, 1}},
+                {"note", "base seats at z=0, axis +Z; translate base_center to the seat point"}};
+        } catch (...) {
+        }
+        if (aresp.contains("revision")) out["revision"] = aresp["revision"];
+        if (aresp.contains("tess")) out["tess"] = aresp["tess"];
+        if (aresp.contains("volume")) out["volume"] = aresp["volume"];
+        if (aresp.contains("rebuild")) out["rebuild"] = aresp["rebuild"];
+        const std::string sp = params.value("save_path", std::string());
+        if (!sp.empty()) {
+            json sresp = aicad::doc::doc_export_step(doc_id, sp);
+            out["step_path"] = sp;
+            out["step_ok"] = sresp.value("ok", true);
+        }
+        return out;
+    } catch (const std::exception& e) {
+        rc = 1;
+        return json{{"ok", false}, {"error", e.what()}};
+    }
+}
+
 // --- T-RF18: sourcing seams (production defaults for core/sourcing) ------------
 // The sourcing lib is pure; every side effect is injected here: assembly/board
 // loading via the doc/ecad sessions, vendor index reads, model building via
@@ -2849,8 +2917,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                 json ftypes = json::array();
                 for (const auto& t : aicad::doc::feature_type_names()) ftypes.push_back(t);
                 return emit(json{
-                    {"ok", true},
-                    {"ops", ops},
+                    {"ok", true},                    {"ops", ops},
                     {"feature_types", ftypes},
                     {"example_add_feature", json{
                         {"op", "add_feature"},
@@ -2869,6 +2936,8 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                              "op=add_feature. Call cad_guide() for worked examples."},
                 }, out_json, 0);
             }
+            if (m == "doc_formats")
+                return emit(aicad::doc::doc_formats(), out_json, 0);
             if (m == "doc_checkpoint")
                 return emit(aicad::doc::doc_checkpoint(params.value("doc_id", std::string())), out_json, 0);
             if (m == "doc_revert")
@@ -2975,60 +3044,8 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                 // {family, size, length_mm?, options?, name?, save_path?} -> build a
                 // NEW editable part doc from the catalog generator. With save_path,
                 // also export a .step so an assembly can asm_insert_component it.
-                try {
-                    const std::string family = params.value("family", std::string());
-                    const std::string size = params.value("size", std::string());
-                    double length = 0.0;
-                    if (params.contains("length_mm") && params["length_mm"].is_number())
-                        length = params["length_mm"].get<double>();
-                    else if (params.contains("length") && params["length"].is_number())
-                        length = params["length"].get<double>();
-                    const json opts = (params.contains("options") && params["options"].is_object())
-                                          ? params["options"]
-                                          : json::object();
-                    aicad::parts::PartBuild pb = aicad::parts::build(family, size, length, opts);
-                    const std::string nm = params.value("name", pb.name);
-                    json nresp = aicad::doc::doc_new("part", nm);
-                    const std::string doc_id = nresp.value("doc_id", std::string());
-                    if (doc_id.empty())
-                        return emit(json{{"ok", false}, {"error", "parts_make: doc_new failed"}},
-                                    out_json, 1);
-                    json aresp = aicad::doc::doc_apply_ops(doc_id, 0, pb.ops, false);
-                    json out;
-                    out["ok"] = true;
-                    out["doc_id"] = doc_id;
-                    out["name"] = nm;
-                    out["meta"] = pb.meta;
-                    // Hand back the extents + a placement datum so an assembly can position
-                    // this part WITHOUT a measure round-trip (Bug A-1). Standard parts seat
-                    // their base at z=0 with the axis along +Z, so the mating datum is the
-                    // base-centre at the bbox min-z. Fail-soft: omit if the box can't compute.
-                    try {
-                        json bb = aicad::doc::doc_bbox(doc_id);
-                        out["bbox"] = bb;
-                        const auto& mn = bb["min"]; const auto& mx = bb["max"];
-                        out["datum"] = {
-                            {"base_center", {(mn[0].get<double>() + mx[0].get<double>()) / 2.0,
-                                             (mn[1].get<double>() + mx[1].get<double>()) / 2.0,
-                                             mn[2].get<double>()}},
-                            {"axis", {0, 0, 1}},
-                            {"note", "base seats at z=0, axis +Z; translate base_center to the seat point"}};
-                    } catch (...) {
-                    }
-                    if (aresp.contains("revision")) out["revision"] = aresp["revision"];
-                    if (aresp.contains("tess")) out["tess"] = aresp["tess"];
-                    if (aresp.contains("volume")) out["volume"] = aresp["volume"];
-                    if (aresp.contains("rebuild")) out["rebuild"] = aresp["rebuild"];
-                    const std::string sp = params.value("save_path", std::string());
-                    if (!sp.empty()) {
-                        json sresp = aicad::doc::doc_export_step(doc_id, sp);
-                        out["step_path"] = sp;
-                        out["step_ok"] = sresp.value("ok", true);
-                    }
-                    return emit(std::move(out), out_json, 0);
-                } catch (const std::exception& e) {
-                    return emit(json{{"ok", false}, {"error", e.what()}}, out_json, 1);
-                }
+                int rc = 0;
+                return emit(parts_make_impl(params, rc), out_json, rc);
             }
             if (m == "doc_render_png")
                 return emit(aicad::doc::doc_render_png(
@@ -3054,6 +3071,12 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                                 params.value("out_path", std::string())),
                             out_json, 0);
             if (m == "sim_run_flow") {
+                // STL-shaped call (host sim-panel flow path; formerly the Python sim
+                // worker): voxelize the STL + run the tunnel via run_flow_stl. The
+                // doc_id shape below tessellates a document instead.
+                if (params.contains("stl_path") && params["stl_path"].is_string() &&
+                    !params["stl_path"].get<std::string>().empty())
+                    return emit(aicad::sim::run_flow_stl(params), out_json, 0);
                 // {doc_id, velocity, aoa?, fluid?, cells?, n_steps?} -> wind-tunnel LBM forces.
                 std::string doc_id = params.value("doc_id", std::string());
                 std::vector<aicm::AicmBody> bodies = aicad::doc::doc_tessellate_bodies(doc_id);
@@ -3840,6 +3863,56 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             json src_result;
             if (aicad::sourcing::call(m, params, build_sourcing_seams(), src_result)) {
                 return emit(std::move(src_result), out_json, 0);
+            }
+        }
+        // --- T-RF19: parts placement (core/parts/place) ---
+        // The parts hub FTS stays Python — callers pass `record` (get_record seam is a
+        // null fallback). parts_make/import_file/build_model wire to in-core paths.
+        {
+            aicad::parts::PlaceSeams ps;
+            ps.get_record = [](const std::string&) -> json { return json(); };
+            ps.parts_make = [](const json& p) -> json { int rc = 0; return parts_make_impl(p, rc); };
+            ps.import_file = [](const std::string& path, bool as_solid) -> json {
+                return aicad::doc::doc_import_file(path, std::string(), as_solid, std::string());
+            };
+            ps.build_model = [](const json& match) -> std::string {
+                return build_sourcing_seams().build_model(match);
+            };
+            json pl_result;
+            std::string pl_err;
+            if (aicad::parts::place_call(m, params, pl_result, pl_err, ps)) {
+                return emit(std::move(pl_result), out_json, 0);
+            }
+        }
+        // --- T-RF19 leaf 4: hydraulic + piping (core/hydraulic, core/piping) ---
+        // ojson preserves dict-insertion-order fidelity the Python envelopes rely on;
+        // dump/parse conversion is shortest-round-trip exact.
+        {
+            namespace py = aicad::pyutil;
+            py::ojson fp_params = py::ojson::parse(params.dump());
+            py::ojson fp_result;
+            if (aicad::hydraulic::call(m, fp_params, fp_result) ||
+                aicad::piping::call(m, fp_params, fp_result)) {
+                return emit(json::parse(fp_result.dump()), out_json, 0);
+            }
+        }
+        // --- T-RF19 leaf 5: structural (core/structural) ---
+        {
+            json st_result;
+            std::string st_err;
+            if (aicad::structural::call(m, params, st_result, st_err)) {
+                return emit(std::move(st_result), out_json, 0);
+            }
+        }
+        // --- T-RF19 leaf 6: tolerance / mechanical / materials / dfm ---
+        {
+            json sm_result;
+            std::string sm_err;
+            if (aicad::tolerance::call(m, params, sm_result, sm_err) ||
+                aicad::mechanical::call(m, params, sm_result, sm_err) ||
+                aicad::materials::call(m, params, sm_result, sm_err) ||
+                aicad::dfm::call(m, params, sm_result, sm_err)) {
+                return emit(std::move(sm_result), out_json, 0);
             }
         }
         // --- T-RF15: firmware engine surface (core/firmware) ---

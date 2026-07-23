@@ -94,35 +94,8 @@ class FormatInfo:
                 "can_import": self.can_import, "can_export": self.can_export}
 
 
-FORMAT_REGISTRY: list[FormatInfo] = [
-    FormatInfo("step", "STEP", [".step", ".stp"], "brep"),
-    FormatInfo("iges", "IGES", [".iges", ".igs"], "brep"),
-    FormatInfo("brep", "BREP (OpenCASCADE)", [".brep"], "brep"),
-    FormatInfo("stl", "STL", [".stl"], "mesh"),
-    FormatInfo("3mf", "3MF", [".3mf"], "mesh"),
-    FormatInfo("obj", "Wavefront OBJ", [".obj"], "mesh"),
-    FormatInfo("ply", "Stanford PLY", [".ply"], "mesh"),
-    FormatInfo("gltf", "glTF", [".gltf"], "mesh"),
-    FormatInfo("glb", "glTF binary", [".glb"], "mesh"),
-    FormatInfo("3dm", "Rhino", [".3dm"], "rhino"),
-    # DXF (2D vector drawings) — imported to planar B-rep wires/faces via ezdxf (MIT). Import-only
-    # for now; 2D-projection-from-3D DXF export is a separate follow-up, so can_export is False.
-    FormatInfo("dxf", "AutoCAD DXF", [".dxf"], "brep", can_export=False),
-    # DWG (AutoCAD binary) — imported by converting DWG→DXF with an external, user-provided
-    # converter (ODA File Converter / LibreDWG), then the DXF pipeline. Import-only; never written.
-    FormatInfo("dwg", "AutoCAD DWG", [".dwg"], "brep", can_export=False),
-    # Proprietary — import is experimental (SolidWorks COM → STEP, else preview/error); we never
-    # write these, so can_export is False (export STEP instead).
-    FormatInfo("sldprt", "SolidWorks part", [".sldprt"], "proprietary", can_export=False),
-    FormatInfo("sldasm", "SolidWorks assembly", [".sldasm"], "proprietary", can_export=False),
-    FormatInfo("x_t", "Parasolid (text)", [".x_t"], "proprietary", can_export=False),
-    FormatInfo("x_b", "Parasolid (binary)", [".x_b"], "proprietary", can_export=False),
-]
-
-
-def list_formats() -> list[dict]:
-    """The format matrix as plain dicts (for the ``doc_formats`` RPC / host filter generation)."""
-    return [fi.as_dict() for fi in FORMAT_REGISTRY]
+# FORMAT_REGISTRY + list_formats removed 2026-07-22 (T-RF19) — C++ owns the matrix
+# (core/doc/formats.cpp). _detect_format/_EXT_TO_FORMAT stay for the import/export helpers.
 
 
 def _detect_format(path: str | os.PathLike) -> str:
@@ -727,20 +700,7 @@ EmitFn = Callable[[dict], None]
 # the Python doc closure (session/compiler), which is gone. Both RPCs now run in the C++ core
 # (host routes them by the doc-cpp / minting rule). The pure helpers above — import_path() and
 # export_document() — survive and stay closure-free (engine.ecad.threed imports import_path).
-
-
-def _handler_doc_formats(params: dict, emit: EmitFn) -> dict:  # noqa: ARG001
-    """Worker handler for ``doc_formats`` — the import/export format matrix (D4).
-
-    The host builds its File ▸ Open / Import / Export filters from this so the UI never lists a
-    format the engine can't handle (and vice-versa). Returns ``{"formats": [FormatInfo, ...]}``."""
-    return {"formats": list_formats()}
-
-
-# The orchestrator wires these via: _METHODS.update(formats.WORKER_METHODS)
-# import_file / export_file now run in the C++ core (routed by doc-cpp / minting); only the
-# closure-free format-matrix probe stays in Python. The pure helpers above (import_path /
-# export_document) survive — engine.ecad.threed imports import_path.
-WORKER_METHODS: dict[str, Callable] = {
-    "doc_formats": _handler_doc_formats,
-}
+#
+# doc_formats + FORMAT_REGISTRY/list_formats were REMOVED 2026-07-22 (T-RF19): the format
+# matrix is C++ (core/doc/formats.cpp, byte-parity pinned by core/tests/test_formats_registry.cpp).
+# _detect_format/_EXT_TO_FORMAT below stay — the remaining import/export helpers use them.

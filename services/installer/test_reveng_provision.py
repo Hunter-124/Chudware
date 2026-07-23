@@ -10,7 +10,7 @@ import os
 
 import pytest
 
-from engine_oracle.vision import reveng_provision as rp
+from services.vision import reveng_provision as rp
 
 # Frozen §8.1 key sets.
 CAPABILITY_KEYS = {"sparse", "dense", "splat", "single_photo", "webcam", "gpu"}

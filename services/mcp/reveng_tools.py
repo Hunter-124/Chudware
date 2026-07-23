@@ -4,7 +4,7 @@
 The tool implementations now live in reveng_session_tools + reveng_build_tools over the
 shared reveng_common session/pipeline layer. This module re-exports the historical
 reveng_tools namespace (_ingest_pdf, _make_pipeline_agent_fn, register_reveng_tools, ...)
-so existing importers (services/dag, engine_oracle/reveng_rpc, tests) keep working
+so existing importers (services/dag, services/reveng/worker_rpc, tests) keep working
 unchanged."""
 from __future__ import annotations
 

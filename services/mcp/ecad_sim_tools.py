@@ -24,10 +24,13 @@ from .ecad_common import (
     _finite,
     _get_pcb,
     _get_sch,
+    _netlist_to_circuit,
     _provider_reachable,
     _round,
+    _rpc,
     _rs,
     _run_with_budget,
+    _sim_run,
     _simulate_advanced,
     _summarize_ac,
     _summarize_sweep,
@@ -35,6 +38,92 @@ from .ecad_common import (
     _summarize_tran,
     netlist_mod,
 )
+
+
+# --------------------------------------------------------------------------- impedance helpers
+#
+# engine.ecad.impedance is C++-ported (core/ecad/impedance.cpp) and dispatched via the
+# ecad_impedance RPC (modes: microstrip/stripline/coplanar/diff_pair/track). The two pure
+# doc-walking helpers it used client-side (_stackup_geometry, _track_length_mm) have no
+# per-helper RPC, so they are ported verbatim here.
+
+
+def _copper_thickness(layer: dict, default: float = 0.035) -> float:
+    return float(layer.get("thickness", default) or default)
+
+
+def _stackup_geometry(board: dict, layer: str) -> dict:
+    """Classify a copper layer in the stackup and pull the controlled-impedance geometry
+    (verbatim port of engine.ecad.impedance._stackup_geometry; reference-plane assumptions
+    documented there)."""
+    layers = board.get("stackup", {}).get("layers", [])
+    copper_idx = [i for i, ly in enumerate(layers) if ly.get("type") == "copper"]
+    pos = None
+    for i, ly in enumerate(layers):
+        if ly.get("id") == layer and ly.get("type") == "copper":
+            pos = i
+            break
+    if pos is None:
+        # Layer not in the explicit stackup -> fall back to a default 1.6mm/2 FR-4 microstrip.
+        return {"kind": "microstrip", "h": 0.2, "t": 0.035, "er": 4.3, "ref_planes": 1}
+
+    t = _copper_thickness(layers[pos])
+    is_outer = pos == copper_idx[0] or pos == copper_idx[-1]
+
+    def _diel(i: int) -> dict | None:
+        if 0 <= i < len(layers) and layers[i].get("type") != "copper":
+            return layers[i]
+        return None
+
+    if is_outer:
+        # Microstrip: the single dielectric between this copper and the next copper inward.
+        d = _diel(pos + 1) if pos == copper_idx[0] else _diel(pos - 1)
+        h = float(d.get("thickness", 0.2)) if d else 0.2
+        er = float(d.get("er", 4.3)) if d and d.get("er") is not None else 4.3
+        return {"kind": "microstrip", "h": h, "t": t, "er": er, "ref_planes": 1}
+
+    # Inner stripline: dielectric above + below to the nearest reference copper layers.
+    above = _diel(pos - 1)
+    below = _diel(pos + 1)
+    h_above = float(above.get("thickness", 0.2)) if above else 0.2
+    h_below = float(below.get("thickness", 0.2)) if below else 0.2
+    er_above = float(above.get("er", 4.3)) if above and above.get("er") is not None else 4.3
+    er_below = float(below.get("er", 4.3)) if below and below.get("er") is not None else 4.3
+    h = h_above + h_below
+    er = (er_above * h_above + er_below * h_below) / h if h > 0 else er_above
+    return {"kind": "stripline", "h": h, "t": t, "er": er, "ref_planes": 2}
+
+
+def _track_length_mm(board: dict, net: str | None, layer: str | None) -> float:
+    """Sum the length of every routed segment/arc on ``net`` (optionally restricted to ``layer``)."""
+    import math as _math
+    total = 0.0
+    for tr in board.get("tracks", []):
+        if net is not None and tr.get("net") != net:
+            continue
+        if layer is not None and tr.get("layer") != layer:
+            continue
+        if tr.get("kind", "segment") == "arc":
+            r = float(tr.get("radius", 0.0))
+            a0 = _math.radians(float(tr.get("a0", 0.0)))
+            a1 = _math.radians(float(tr.get("a1", 0.0)))
+            total += abs(a1 - a0) * r
+        else:
+            p1 = tr.get("p1", [0.0, 0.0]); p2 = tr.get("p2", [0.0, 0.0])
+            total += _math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+    return total
+
+
+def _track_impedance(session, track_or_net) -> dict:
+    """engine.ecad.impedance.track_impedance -> C++ ecad_impedance RPC (mode='track')."""
+    return _rpc("ecad_impedance", {"mode": "track", "doc_id": session.doc_id,
+                                   "track_or_net": track_or_net})
+
+
+def _diff_pair_z0(*, w: float, s: float, h: float, t: float, er: float, kind: str) -> dict:
+    """engine.ecad.impedance.diff_pair_z0 -> C++ ecad_impedance RPC (mode='diff_pair')."""
+    return _rpc("ecad_impedance", {"mode": "diff_pair", "w": w, "s": s, "h": h, "t": t,
+                                   "er": er, "kind": kind})
 
 def register_ecad_sim_tools(mcp: FastMCP) -> None:
     """ECAD simulation/analysis MCP tools (T-RF8 split of ecad_tools.py): ecad_simulate, run_pdn, sweep, fpga_check, impedance checks, run_sicheck, tf, design."""
@@ -87,13 +176,7 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
                         next_actions=["ecad_new_schematic('mydesign')"])
         doc = session.doc
         nl = netlist_mod.build_netlist(doc)
-        try:
-            from engine.sim.spice import netlist_to_spice_circuit
-            from engine.sim.circuit import simulate as sim_run
-        except Exception as e:  # noqa: BLE001
-            return _err(f"simulator unavailable ({type(e).__name__}: {e})",
-                        hint="The sim engine (numpy/scipy) is not importable here.")
-        circuit, warns = netlist_to_spice_circuit(nl)
+        circuit, warns = _netlist_to_circuit(nl)  # C++ sim_netlist_to_circuit RPC
         # tran/four honor per-symbol source waveforms (SIN/PULSE/PWL); every analysis
         # gets transistor polarity restored (see _apply_sim_source_params).
         _apply_sim_source_params(doc, circuit, warns,
@@ -179,7 +262,7 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
 
         study = {"analyses": [an], "probes": probe_list}
         _autosave_all_open_ecad()
-        status, result = _run_with_budget(lambda: sim_run(circuit, study, backend=backend))
+        status, result = _run_with_budget(lambda: _sim_run(circuit, study, backend=backend))
         if status == "timeout":
             return _budget_timeout_err(
                 f"{an['type']} simulation",
@@ -276,7 +359,7 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
                         next_actions=["ecad_new_pcb('myboard')"])
         doc = session.doc
         try:
-            from engine.ecad import pdn as pdn_mod  # lazy import (pulls scipy)
+            from engine.ecad import pdn as pdn_mod  # STAYS (T-RF20): no C++ counterpart; lazy import (pulls scipy)
         except Exception as e:  # noqa: BLE001
             return _err(f"PDN engine unavailable: {e}",
                         hint="numpy/scipy are required for the sparse solve.")
@@ -431,13 +514,7 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
                         next_actions=["ecad_sweep('R1', [1000, 2000, 5000])"])
         doc = session.doc
         nl = netlist_mod.build_netlist(doc)
-        try:
-            from engine.sim.spice import netlist_to_spice_circuit
-            from engine.sim.circuit import simulate as sim_run
-        except Exception as e:  # noqa: BLE001
-            return _err(f"simulator unavailable ({type(e).__name__}: {e})",
-                        hint="The sim engine (numpy/scipy) is not importable here.")
-        circuit, warns = netlist_to_spice_circuit(nl)
+        circuit, warns = _netlist_to_circuit(nl)  # C++ sim_netlist_to_circuit RPC
         _apply_sim_source_params(doc, circuit, warns,
                                  apply_waveforms=analysis in ("tran", "four"))
         if not circuit.get("devices"):
@@ -455,7 +532,7 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
         fvals = [float(v) for v in values]
         study = {"analyses": [an], "probes": probe_list,
                  "step": {"param": param, "values": fvals}}
-        result = sim_run(circuit, study)
+        result = _sim_run(circuit, study)
         step = result.get("step", {})
         runs = step.get("runs", [])
         trend, sweep_table, chosen = _summarize_sweep_steps(runs, an["type"], probe or None)
@@ -505,7 +582,7 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
             return _err(e.message, hint="FPGA checks run on a schematic.",
                         next_actions=["ecad_new_schematic('myfpga')"])
         try:
-            from engine.ecad import fpga
+            from engine.ecad import fpga  # STAYS (T-RF20): no C++ counterpart
         except Exception as e:  # noqa: BLE001
             return _err(f"fpga module unavailable ({type(e).__name__}: {e})")
         nl = netlist_mod.build_netlist(session.doc)
@@ -552,10 +629,10 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
         """
         # Lazy-import so a missing scipy/numpy degrades gracefully.
         try:
-            from engine.ecad import orchestrator as _orch  # type: ignore
+            from services import ecad_design as _orch  # type: ignore
         except ImportError as exc:
             return _err(f"orchestrator unavailable ({type(exc).__name__}: {exc})",
-                        hint="engine.ecad.orchestrator could not be imported "
+                        hint="services.ecad_design could not be imported "
                              "(numpy/scipy may be missing). "
                              "Build the schematic manually with ecad_place_symbol + ecad_wire.",
                         next_actions=["ecad_new_schematic('mydesign')",
@@ -669,7 +746,7 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
                 design, recipe_used, _evs = _orch.plan_design(request, provider=None)
             except Exception as exc:  # noqa: BLE001
                 return _err(f"ecad_design failed: {type(exc).__name__}: {exc}",
-                            hint="Check that engine.ecad.orchestrator and its deps are available.",
+                            hint="Check that services.ecad_design and its deps are available.",
                             next_actions=["ecad_status()"])
 
         # Snapshot the active-doc pointers BEFORE the single build so a late abandoned
@@ -684,7 +761,7 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
                 request, provider=None, design=design, recipe_used=recipe_used)
         except Exception as exc:  # noqa: BLE001
             return _err(f"ecad_design failed: {type(exc).__name__}: {exc}",
-                        hint="Check that engine.ecad.orchestrator and its deps are available.",
+                        hint="Check that services.ecad_design and its deps are available.",
                         next_actions=["ecad_status()"])
 
         doc_id: str | None = run.doc_id
@@ -813,13 +890,6 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
                         hint="Route the board first (ecad_autoroute or ecad_update_from_sch).",
                         next_actions=["ecad_autoroute()", "ecad_update_from_sch()"])
 
-        try:
-            from engine.ecad.impedance import track_impedance, _stackup_geometry  # lazy import
-        except ImportError as e:  # noqa: BLE001
-            return _err(f"impedance engine unavailable ({e})",
-                        hint="engine.ecad.impedance could not be imported.",
-                        next_actions=["ecad_run_drc()"])
-
         tol_pct = 10.0  # +/-10% is the standard controlled-impedance fab tolerance
 
         def _pct(z0: float) -> float:
@@ -838,7 +908,7 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
 
         if net_or_ref:
             try:
-                r = track_impedance(doc, net_or_ref)
+                r = _track_impedance(session, net_or_ref)
             except Exception as e:  # noqa: BLE001
                 nets_on_board = sorted({tr.get("net", "") for tr in tracks if tr.get("net")})
                 return _err(f"could not compute impedance for {net_or_ref!r}: {e}",
@@ -883,7 +953,7 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
                 continue
             seen_nets.add(net)
             try:
-                r = track_impedance(doc, tr)
+                r = _track_impedance(session, tr)
                 pct = _pct(r["z0"])
                 summaries.append({
                     "net": net, "layer": r["layer"], "z0": round(r["z0"], 1),
@@ -952,15 +1022,6 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
                         hint="Route the board first (ecad_autoroute).",
                         next_actions=["ecad_autoroute()"])
 
-        try:
-            from engine.ecad.impedance import (  # lazy import
-                track_impedance, _stackup_geometry, _track_length_mm, diff_pair_z0,
-            )
-        except ImportError as e:  # noqa: BLE001
-            return _err(f"impedance engine unavailable ({e})",
-                        hint="engine.ecad.impedance could not be imported.",
-                        next_actions=["ecad_run_drc()"])
-
         # Locate routed tracks for each net.
         def _first_track(net: str) -> dict | None:
             return next((t for t in tracks if t.get("net") == net), None)
@@ -1005,7 +1066,7 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
         kind = geo["kind"]  # 'microstrip' or 'stripline'
 
         try:
-            dz = diff_pair_z0(w=width_p, s=gap, h=h, t=t_cu, er=er, kind=kind)
+            dz = _diff_pair_z0(w=width_p, s=gap, h=h, t=t_cu, er=er, kind=kind)
         except Exception as e:  # noqa: BLE001
             return _err(f"diff_pair_z0 failed: {e}",
                         hint="Check that width/gap/h are positive and er >= 1.",
@@ -1105,7 +1166,7 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
             return _err(e.message, hint="Open a board first.",
                         next_actions=["ecad_new_pcb('myboard')"])
         try:
-            from engine.ecad import si_rules as si_mod
+            from engine.ecad import si_rules as si_mod  # STAYS (T-RF20): no C++ counterpart
             res = si_mod.run_sicheck(session.doc)
         except Exception as e:  # noqa: BLE001
             return _err(f"SI check engine error: {e}", hint="Inspect with ecad_status().")
@@ -1173,13 +1234,7 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
                         next_actions=["ecad_new_schematic('mydesign')"])
         doc = session.doc
         nl = netlist_mod.build_netlist(doc)
-        try:
-            from engine.sim.spice import netlist_to_spice_circuit
-            from engine.sim.circuit import simulate as sim_run
-        except Exception as e:  # noqa: BLE001
-            return _err(f"simulator unavailable ({type(e).__name__}: {e})",
-                        hint="The sim engine (numpy/scipy) is not importable here.")
-        circuit, warns = netlist_to_spice_circuit(nl)
+        circuit, warns = _netlist_to_circuit(nl)  # C++ sim_netlist_to_circuit RPC
         if not circuit.get("devices"):
             return _err("nothing to analyse -- netlist has no simulatable devices",
                         hint="Place R/C/V/I/op-amp parts with VALUES and wire them first.",
@@ -1188,7 +1243,7 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
 
         study = {"analyses": [{"type": "tf", "output": output, "source": source}],
                  "probes": [output]}
-        result = sim_run(circuit, study, backend=backend)
+        result = _sim_run(circuit, study, backend=backend)
         if result.get("backend_note"):
             warns.append(result["backend_note"])
         tf = result.get("tf", {})

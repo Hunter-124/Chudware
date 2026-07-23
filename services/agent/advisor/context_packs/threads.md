@@ -1,5 +1,5 @@
 # Thread / Tap context pack
-# Source: engine_oracle/research/data/feeds_speeds.json (tap_drill table, metric_coarse)
+# Source: services/research/data/feeds_speeds.json (tap_drill table, metric_coarse)
 #         Machinery's Handbook 31st ed. §Tap Drill Sizes; ISO 2306; ASME B94.9
 
 ## Callout format

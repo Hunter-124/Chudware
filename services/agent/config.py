@@ -20,7 +20,7 @@ import json
 import os
 from urllib.parse import urlparse
 
-from engine import paths
+from services import paths
 
 from .providers.base import Provider
 

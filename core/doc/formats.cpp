@@ -1031,6 +1031,40 @@ std::string detect_format(const std::string& path) {
                   {{"reason", "unknown extension"}, {"path", path}});
 }
 
+// --------------------------------------------------------------- format registry (D4)
+// Byte-parity port of engine/doc/formats.py::FORMAT_REGISTRY. Order and every field
+// (fmt/label/exts/lane/can_import/can_export) match the Python oracle exactly —
+// test_formats_registry compares the doc_formats payload against the oracle dump.
+// Note the matrix describes the FULL engine surface (some lanes still route through
+// deferred paths that raise a precise error at call time — same as the oracle).
+const std::vector<FormatInfo>& format_registry() {
+    static const std::vector<FormatInfo> kRegistry = {
+        {"step",   "STEP",                {".step", ".stp"}, "brep",        true,  true},
+        {"iges",   "IGES",                {".iges", ".igs"}, "brep",        true,  true},
+        {"brep",   "BREP (OpenCASCADE)",  {".brep"},         "brep",        true,  true},
+        {"stl",    "STL",                 {".stl"},          "mesh",        true,  true},
+        {"3mf",    "3MF",                 {".3mf"},          "mesh",        true,  true},
+        {"obj",    "Wavefront OBJ",       {".obj"},          "mesh",        true,  true},
+        {"ply",    "Stanford PLY",        {".ply"},          "mesh",        true,  true},
+        {"gltf",   "glTF",                {".gltf"},         "mesh",        true,  true},
+        {"glb",    "glTF binary",         {".glb"},          "mesh",        true,  true},
+        {"3dm",    "Rhino",               {".3dm"},          "rhino",       true,  true},
+        // DXF (2D vector drawings) — import-only; 2D-projection-from-3D DXF export is
+        // a separate follow-up, so can_export is false (oracle comment carried over).
+        {"dxf",    "AutoCAD DXF",         {".dxf"},          "brep",        true,  false},
+        // DWG (AutoCAD binary) — import-only via an external DWG->DXF converter; never
+        // written.
+        {"dwg",    "AutoCAD DWG",         {".dwg"},          "brep",        true,  false},
+        // Proprietary — import is experimental (SolidWorks COM -> STEP); we never write
+        // these, so can_export is false (export STEP instead).
+        {"sldprt", "SolidWorks part",     {".sldprt"},       "proprietary", true,  false},
+        {"sldasm", "SolidWorks assembly", {".sldasm"},       "proprietary", true,  false},
+        {"x_t",    "Parasolid (text)",    {".x_t"},          "proprietary", true,  false},
+        {"x_b",    "Parasolid (binary)",  {".x_b"},          "proprietary", true,  false},
+    };
+    return kRegistry;
+}
+
 // --------------------------------------------------------------- SolidWorks COM → STEP
 // Port of engine/doc/formats_solidworks.py (sw_com_export_step + solidworks_available) to
 // native Win32 IDispatch late-binding (no SolidWorks type library on the link line). The

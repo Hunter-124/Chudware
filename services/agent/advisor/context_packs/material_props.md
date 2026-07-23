@@ -1,6 +1,6 @@
 # Material properties context pack
 # Source: engine_oracle/sim/materials.json (E_mpa, yield_mpa, density_g_cm3, alpha_per_C)
-#         engine_oracle/research/data/feeds_speeds.json (SFM/chipload ranges per material)
+#         services/research/data/feeds_speeds.json (SFM/chipload ranges per material)
 
 ## Common materials (materials.json)
 | Material      | E [MPa]| Yield [MPa]| ρ [g/cm³]| α [×10⁻⁶/°C]|

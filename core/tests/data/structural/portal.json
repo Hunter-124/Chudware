@@ -1,0 +1,161 @@
+{
+ "schema": "aicad.structure/1",
+ "name": "portal",
+ "units": "mm",
+ "elements": [
+  {
+   "element_type": "footing",
+   "id": "f1",
+   "section_name": "600x600",
+   "material": "concrete",
+   "length_mm": 200.0,
+   "transform": [
+    1,
+    0,
+    0,
+    0,
+    0,
+    1,
+    0,
+    0,
+    0,
+    0,
+    1,
+    -200,
+    0,
+    0,
+    0,
+    1
+   ]
+  },
+  {
+   "element_type": "footing",
+   "id": "f2",
+   "section_name": "600x600",
+   "material": "concrete",
+   "length_mm": 200.0,
+   "transform": [
+    1,
+    0,
+    0,
+    3600,
+    0,
+    1,
+    0,
+    0,
+    0,
+    0,
+    1,
+    -200,
+    0,
+    0,
+    0,
+    1
+   ]
+  },
+  {
+   "element_type": "post",
+   "id": "p1",
+   "section_name": "100x100",
+   "material": "cedar",
+   "length_mm": 2400.0,
+   "transform": [
+    1.0,
+    0,
+    0,
+    0,
+    0,
+    1.0,
+    0,
+    0,
+    0,
+    0,
+    1.0,
+    0,
+    0,
+    0,
+    0,
+    1
+   ]
+  },
+  {
+   "element_type": "post",
+   "id": "p2",
+   "section_name": "100x100",
+   "material": "cedar",
+   "length_mm": 2400.0,
+   "transform": [
+    1,
+    0,
+    0,
+    3600,
+    0,
+    1,
+    0,
+    0,
+    0,
+    0,
+    1,
+    0,
+    0,
+    0,
+    0,
+    1
+   ]
+  },
+  {
+   "element_type": "beam",
+   "id": "b1",
+   "section_name": "50x150",
+   "material": "cedar",
+   "length_mm": 3600.0,
+   "transform": [
+    0,
+    0,
+    1,
+    0,
+    0,
+    1,
+    0,
+    0,
+    1,
+    0,
+    0,
+    2400,
+    0,
+    0,
+    0,
+    1
+   ]
+  }
+ ],
+ "load_cases": [
+  {
+   "id": "lc1",
+   "kind": "dead",
+   "gravity": [
+    0,
+    0,
+    -1
+   ],
+   "factor": 1.0,
+   "distributed": {
+    "w_n_per_mm": 1.2
+   }
+  },
+  {
+   "id": "lc2",
+   "kind": "live",
+   "gravity": [
+    0,
+    0,
+    -1
+   ],
+   "factor": 1.0,
+   "point": {
+    "at_mm": 1800.0,
+    "p_n": 2000.0
+   }
+  }
+ ]
+}

@@ -794,7 +794,7 @@ def _merge_trees(
                 conflicts.extend(cfl)
                 if merged_doc is not None:
                     try:
-                        from engine.doc.canonical import canonical_dump
+                        from services.plm.canonical import canonical_dump
                         out[path] = canonical_dump(merged_doc).encode("utf-8")
                     except Exception:  # noqa: BLE001
                         out[path] = json.dumps(

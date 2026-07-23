@@ -28,30 +28,27 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 # ---------------------------------------------------------------------------
-# Stub engine.paths and services.agent.config BEFORE importing the modules
+# Stub services.paths and services.agent.config BEFORE importing the modules
 # under test, so the lazy helpers inside them can fire without EnvironmentError.
 # ---------------------------------------------------------------------------
 import types as _types
 
-# engine.paths stub — the old bare-ModuleType("engine") injection was NOT harmless:
-# it replaced the real `engine` package in sys.modules with a non-package, breaking
-# `engine.piping` (etc.) imports in any test module collected AFTER this one
-# ("'engine' is not a package" — the last big cross-dir pollution root, 2026-07-04).
-# Import the real package when available and only fill in the paths attribute.
+# services.paths stub (T-RF19/20: engine/paths.py re-homed to services/paths.py) —
+# import the real module when available and only fill in the paths attribute.
 try:
-    import engine as _engine_pkg  # the real package (repo-root symlink -> engine_oracle)
+    import services as _services_pkg  # the real package
 except ImportError:
-    _engine_pkg = _types.ModuleType("engine")
-    sys.modules.setdefault("engine", _engine_pkg)
-if "engine.paths" not in sys.modules:
+    _services_pkg = _types.ModuleType("services")
+    sys.modules.setdefault("services", _services_pkg)
+if "services.paths" not in sys.modules:
     try:
-        import engine.paths as _engine_paths  # real module; has ROOT (DATA never existed)
+        import services.paths as _engine_paths  # real module; has ROOT (DATA never existed)
     except ImportError:
-        _engine_paths = _types.ModuleType("engine.paths")
-        sys.modules["engine.paths"] = _engine_paths
-        _engine_pkg.paths = _engine_paths
+        _engine_paths = _types.ModuleType("services.paths")
+        sys.modules["services.paths"] = _engine_paths
+        _services_pkg.paths = _engine_paths
 else:
-    _engine_paths = sys.modules["engine.paths"]
+    _engine_paths = sys.modules["services.paths"]
 if not hasattr(_engine_paths, "DATA"):
     _engine_paths.DATA = Path("/tmp/ai_cad_test_data")  # legacy attr some shadow tests read
 

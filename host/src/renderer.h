@@ -388,6 +388,25 @@ public:
     // value, or 0.5f if none was ever read back). Default true.
     void setBackdropEnabled(bool on);
 
+    // ---- T-RF13 (R3a): adaptive quality ladder ----
+    // Four steps trading fill cost for fidelity, applied at the real cost sites: MSAA sample
+    // count (GLES3 offscreen FBO), render scale (smaller render/resolve targets, upscaled by
+    // the ImGui image stretch), and Kawase backdrop-blur passes. FULL is the historical
+    // behavior. Policy: WASM starts ADAPTIVE at MED and climbs/drops by frame-time EMA;
+    // native desktop defaults to pinned FULL (zero behavior change). Env overrides (read
+    // once in init): AI_CAD_QUALITY_ADAPTIVE=0|1 forces the policy, AI_CAD_QUALITY_STEP=
+    // full|high|med|low pins a step, AI_CAD_QUALITY_FORCE_MS=<f> feeds a synthetic frame
+    // time (deterministic ladder test), AI_CAD_QUALITY_LOG=1 logs transitions to stderr.
+    enum class QualityStep { Full = 0, High, Med, Low };
+    // Feed the ladder once per viewport frame with the frame cadence in ms
+    // (ImGui io.DeltaTime carries the vsync-cliff signal). No-op unless adaptive.
+    void noteFrame(float dtMs);
+    bool adaptiveQuality() const { return adaptiveQuality_; }
+    QualityStep qualityStep() const { return qualityStep_; }
+    const char* qualityStepName() const;
+    float renderScale() const { return renderScale_; }  // 1 = full-res render targets
+    float frameMsEma() const { return frameMsEma_; }
+
 private:
     // GPU buffers for one body.
     struct Sub {
@@ -443,8 +462,9 @@ private:
     static constexpr int SS = 3;  // supersample factor for anti-aliasing (3x for crisp thin edges)
 #endif
     static constexpr int kBlurPasses = 4;  // 4-tap Kawase passes (GLASS_DESIGN_SPEC)
-    int w_ = 0, h_ = 0;           // final size
-    int sw_ = 0, sh_ = 0;         // supersampled size (sw_==w_ under BILLET_GLES3)
+    int w_ = 0, h_ = 0;           // final (display) size
+    int rw_ = 0, rh_ = 0;         // presentation size (w_*renderScale_); targets are this big
+    int sw_ = 0, sh_ = 0;         // supersampled size (sw_==rw_ under BILLET_GLES3)
     unsigned int fbo_ = 0, colorTex_ = 0, depthRbo_ = 0;
 #ifdef BILLET_GLES3
     unsigned int colorRbo_ = 0;   // multisampled color (0 when falling back to single-sample tex)
@@ -483,6 +503,22 @@ private:
     mutable int lumaW_ = 0, lumaH_ = 0;
     mutable bool lumaEverRead_ = false;  // averageLuminance() returns 0.5f until this is true
     bool backdropEnabled_ = true;
+
+    // ---- T-RF13 adaptive quality ladder state ----
+    void initQualityPolicy();   // platform defaults + env overrides; called by init()
+    void applyQualityStep();    // push qualityStep_ into msaaRequest_/renderScale_/blurPasses_
+    void setQualityStep(QualityStep s);  // realloc targets when MSAA/scale changed
+    QualityStep qualityStep_ = QualityStep::Full;
+    bool adaptiveQuality_ = false;    // ladder drives the step (default per platform)
+    bool qualityPinned_ = false;      // AI_CAD_QUALITY_STEP pinned a fixed step
+    bool qualityLog_ = false;         // AI_CAD_QUALITY_LOG=1
+    float qualityForceMs_ = -1.0f;    // AI_CAD_QUALITY_FORCE_MS synthetic frame time
+    int qualityLogFrames_ = 0;        // periodic status-print cadence
+    float renderScale_ = 1.0f;        // render/presentation scale for the active step
+    int blurPasses_ = kBlurPasses;    // active Kawase passes (quality-indexed)
+    int msaaRequest_ = 4;             // GLES3: requested MSAA samples (<=1 = single-sample)
+    float frameMsEma_ = 16.7f;        // frame-time EMA (~30-frame window)
+    float dwellDownS_ = 0.0f, dwellUpS_ = 0.0f;  // sustained breach/headroom accumulators
 
     // ---- F1 GPU pass timing: 2 queries per phase, ping-ponged so a result never blocks ----
     struct GpuTimerRing {

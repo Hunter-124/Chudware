@@ -21,7 +21,7 @@ import time
 from pathlib import Path
 from urllib.request import Request, urlopen
 
-from engine import paths
+from services import paths
 
 REPO = Path(__file__).resolve().parent.parent
 APP_LLAMA = paths.LLAMACPP

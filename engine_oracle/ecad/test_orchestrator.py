@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import json
 
-from engine.ecad import orchestrator as O
+from services.ecad_design import orchestrator as O
 from engine.ecad import recipes as R
 from engine.ecad import session as ecad_session
 from agent.providers.base import Provider

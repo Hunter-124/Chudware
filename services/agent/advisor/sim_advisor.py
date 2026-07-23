@@ -10,7 +10,7 @@ Design (per advisor review 2026-07-04):
     objects with kind ``"sim_bc"`` / ``"sim_margin"`` / ``"sim_divergence"`` /
     ``"sim_mesh"``; fix-providers registered in ``engine._FIX_PROVIDERS``; check-ids
     added to the ``sim`` battery in ``stages.py``.
-  * **Beam anchor**: ``engine_oracle.research.calcs.beam.beam_calc_raw`` is the
+  * **Beam anchor**: ``services.research.calcs.beam.beam_calc_raw`` is the
     hand-calc primitive.  The doc→beam mapping is *confident* only when:
       - aspect ratio L/√(A) > 3 (long-axis dominant geometry)
       - load pattern is a plausible cantilever or simply-supported point/UDL
@@ -43,7 +43,7 @@ from typing import Optional
 # Margin policy loader
 # ---------------------------------------------------------------------------
 
-_POLICY_PATH = pathlib.Path(__file__).parent.parent.parent.parent / "engine_oracle" / "sim" / "margin_policy.json"
+_POLICY_PATH = pathlib.Path(__file__).parent / "margin_policy.json"
 _POLICY: Optional[dict] = None
 
 
@@ -130,7 +130,7 @@ def compute_beam_anchor(
         return None
 
     try:
-        from engine_oracle.research.calcs.beam import beam_calc_raw  # noqa: PLC0415
+        from services.research.calcs.beam import beam_calc_raw  # noqa: PLC0415
     except ImportError:
         return None
 

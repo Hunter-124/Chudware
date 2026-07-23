@@ -424,7 +424,7 @@ def _check_fastener_passthrough(a_holes, b_holes, fastener, findings, a_id, b_id
         return {"status": "skip", "fastener": None, "stacks": [],
                 "summary": "no fastener given (pass fastener='M6' to check pass-through)"}
     try:
-        from engine.research.thread_spec import thread_spec as _thread_spec
+        from services.research.thread_spec import thread_spec as _thread_spec
         spec = _thread_spec(str(fastener))
     except Exception as e:  # noqa: BLE001
         return {"status": "skip", "fastener": fastener, "stacks": [],

@@ -1,0 +1,1082 @@
+[
+  {
+    "method": "dfm_get_profile",
+    "name": "profile_fdm",
+    "params": {
+      "process": "fdm"
+    },
+    "result": {
+      "ok": true,
+      "result": {
+        "material": {
+          "density_g_cm3": 1.24,
+          "name": "PLA"
+        },
+        "params": {
+          "draft": {
+            "min_deg": 0.0,
+            "required": false
+          },
+          "fit_classes_mm": {
+            "free": 0.5,
+            "location": 0.2,
+            "press": 0.1,
+            "slip": 0.4
+          },
+          "hole_comp_mm": 0.2,
+          "min_feature_mm": 0.8,
+          "min_wall_mm": 1.0,
+          "overhang": {
+            "max_bridge_mm": 5,
+            "max_deg": 45
+          },
+          "thread": {
+            "printed_ok_min": "M5",
+            "strategy": "heat_set_insert"
+          },
+          "tolerance_band_mm": 0.4
+        },
+        "process": "fdm"
+      }
+    }
+  },
+  {
+    "method": "dfm_get_profile",
+    "name": "profile_cnc_mill",
+    "params": {
+      "process": "cnc_mill"
+    },
+    "result": {
+      "ok": true,
+      "result": {
+        "material": {
+          "density_g_cm3": 2.7,
+          "name": "Aluminium 6061-T6"
+        },
+        "params": {
+          "draft": {
+            "min_deg": 0.0,
+            "required": false
+          },
+          "fit_classes_mm": {
+            "free": 0.1,
+            "location": 0.02,
+            "press": -0.02,
+            "slip": 0.05
+          },
+          "hole_comp_mm": 0.0,
+          "min_feature_mm": 0.5,
+          "min_wall_mm": 0.5,
+          "overhang": {
+            "max_bridge_mm": null,
+            "max_deg": null
+          },
+          "thread": {
+            "printed_ok_min": null,
+            "strategy": "tapped"
+          },
+          "tolerance_band_mm": 0.05
+        },
+        "process": "cnc_mill"
+      }
+    }
+  },
+  {
+    "method": "dfm_get_profile",
+    "name": "profile_lathe",
+    "params": {
+      "process": "lathe"
+    },
+    "result": {
+      "ok": true,
+      "result": {
+        "material": {
+          "density_g_cm3": 2.7,
+          "name": "Aluminium 6061-T6"
+        },
+        "params": {
+          "draft": {
+            "min_deg": 0.0,
+            "required": false
+          },
+          "fit_classes_mm": {
+            "free": 0.1,
+            "location": 0.02,
+            "press": -0.02,
+            "slip": 0.05
+          },
+          "hole_comp_mm": 0.0,
+          "min_feature_mm": 0.5,
+          "min_wall_mm": 0.5,
+          "overhang": {
+            "max_bridge_mm": null,
+            "max_deg": null
+          },
+          "thread": {
+            "printed_ok_min": null,
+            "strategy": "single_point_or_tapped"
+          },
+          "tolerance_band_mm": 0.05
+        },
+        "process": "lathe"
+      }
+    }
+  },
+  {
+    "method": "dfm_get_profile",
+    "name": "profile_sheet_metal",
+    "params": {
+      "process": "sheet_metal"
+    },
+    "result": {
+      "ok": true,
+      "result": {
+        "material": {
+          "density_g_cm3": 7.85,
+          "name": "Steel (mild)"
+        },
+        "params": {
+          "draft": {
+            "min_deg": 0.0,
+            "required": false
+          },
+          "fit_classes_mm": {
+            "free": null,
+            "location": null,
+            "press": null,
+            "slip": null
+          },
+          "hole_comp_mm": 0.0,
+          "min_feature_mm": 1.0,
+          "min_wall_mm": 1.0,
+          "overhang": {
+            "max_bridge_mm": null,
+            "max_deg": null
+          },
+          "thread": {
+            "printed_ok_min": null,
+            "strategy": "clinch_or_weld_nut"
+          },
+          "tolerance_band_mm": 0.1
+        },
+        "process": "sheet_metal"
+      }
+    }
+  },
+  {
+    "method": "dfm_get_profile",
+    "name": "profile_laser",
+    "params": {
+      "process": "laser"
+    },
+    "result": {
+      "ok": true,
+      "result": {
+        "material": {
+          "density_g_cm3": 1.18,
+          "name": "Acrylic"
+        },
+        "params": {
+          "draft": {
+            "min_deg": 0.0,
+            "required": false
+          },
+          "fit_classes_mm": {
+            "free": null,
+            "location": null,
+            "press": null,
+            "slip": null
+          },
+          "hole_comp_mm": 0.0,
+          "min_feature_mm": 0.5,
+          "min_wall_mm": 1.0,
+          "overhang": {
+            "max_bridge_mm": null,
+            "max_deg": null
+          },
+          "thread": {
+            "printed_ok_min": null,
+            "strategy": "none"
+          },
+          "tolerance_band_mm": 0.1
+        },
+        "process": "laser"
+      }
+    }
+  },
+  {
+    "method": "dfm_get_profile",
+    "name": "profile_injection",
+    "params": {
+      "process": "injection"
+    },
+    "result": {
+      "ok": true,
+      "result": {
+        "material": {
+          "density_g_cm3": 1.04,
+          "name": "ABS"
+        },
+        "params": {
+          "draft": {
+            "min_deg": 1.0,
+            "required": true
+          },
+          "fit_classes_mm": {
+            "free": 0.2,
+            "location": 0.05,
+            "press": 0.02,
+            "slip": 0.1
+          },
+          "hole_comp_mm": 0.0,
+          "min_feature_mm": 0.5,
+          "min_wall_mm": 1.0,
+          "overhang": {
+            "max_bridge_mm": null,
+            "max_deg": null
+          },
+          "thread": {
+            "printed_ok_min": null,
+            "strategy": "molded"
+          },
+          "tolerance_band_mm": 0.1
+        },
+        "process": "injection"
+      }
+    }
+  },
+  {
+    "method": "dfm_get_profile",
+    "name": "profile_case_norm",
+    "params": {
+      "process": "  FDM "
+    },
+    "result": {
+      "ok": true,
+      "result": {
+        "material": {
+          "density_g_cm3": 1.24,
+          "name": "PLA"
+        },
+        "params": {
+          "draft": {
+            "min_deg": 0.0,
+            "required": false
+          },
+          "fit_classes_mm": {
+            "free": 0.5,
+            "location": 0.2,
+            "press": 0.1,
+            "slip": 0.4
+          },
+          "hole_comp_mm": 0.2,
+          "min_feature_mm": 0.8,
+          "min_wall_mm": 1.0,
+          "overhang": {
+            "max_bridge_mm": 5,
+            "max_deg": 45
+          },
+          "thread": {
+            "printed_ok_min": "M5",
+            "strategy": "heat_set_insert"
+          },
+          "tolerance_band_mm": 0.4
+        },
+        "process": "fdm"
+      }
+    }
+  },
+  {
+    "method": "dfm_get_profile",
+    "name": "profile_overrides",
+    "params": {
+      "overrides": {
+        "bogus": 1,
+        "hole_comp": 0.3,
+        "xy_comp": 0.12,
+        "zzz": "x"
+      },
+      "process": "fdm"
+    },
+    "result": {
+      "ok": true,
+      "result": {
+        "material": {
+          "density_g_cm3": 1.24,
+          "name": "PLA"
+        },
+        "params": {
+          "_extra_overrides": {
+            "bogus": 1,
+            "zzz": "x"
+          },
+          "draft": {
+            "min_deg": 0.0,
+            "required": false
+          },
+          "fit_classes_mm": {
+            "free": 0.5,
+            "location": 0.2,
+            "press": 0.1,
+            "slip": 0.4
+          },
+          "hole_comp_mm": 0.3,
+          "min_feature_mm": 0.8,
+          "min_wall_mm": 1.0,
+          "overhang": {
+            "max_bridge_mm": 5,
+            "max_deg": 45
+          },
+          "thread": {
+            "printed_ok_min": "M5",
+            "strategy": "heat_set_insert"
+          },
+          "tolerance_band_mm": 0.52,
+          "xy_comp_mm": 0.12
+        },
+        "process": "fdm"
+      }
+    }
+  },
+  {
+    "method": "dfm_get_profile",
+    "name": "err_profile_unknown",
+    "params": {
+      "process": "lost_wax"
+    },
+    "result": {
+      "error": "Unknown process 'lost_wax'. Known processes: ['fdm', 'cnc_mill', 'lathe', 'sheet_metal', 'laser', 'injection'].",
+      "ok": false
+    }
+  },
+  {
+    "method": "dfm_known_processes",
+    "name": "known_processes",
+    "params": {},
+    "result": {
+      "ok": true,
+      "result": [
+        "fdm",
+        "cnc_mill",
+        "lathe",
+        "sheet_metal",
+        "laser",
+        "injection"
+      ]
+    }
+  },
+  {
+    "method": "dfm_fit_clearance",
+    "name": "fit_fdm_slip",
+    "params": {
+      "fit_class": "slip",
+      "process": "fdm"
+    },
+    "result": {
+      "ok": true,
+      "result": 0.4
+    }
+  },
+  {
+    "method": "dfm_fit_clearance",
+    "name": "fit_cnc_press",
+    "params": {
+      "fit_class": "press",
+      "process": "cnc_mill"
+    },
+    "result": {
+      "ok": true,
+      "result": -0.02
+    }
+  },
+  {
+    "method": "dfm_fit_clearance",
+    "name": "err_fit_sheet",
+    "params": {
+      "fit_class": "slip",
+      "process": "sheet_metal"
+    },
+    "result": {
+      "error": "Process 'sheet_metal' has no diametral 'slip' fit class (it is a flat/sheet process; holes are cut to size).",
+      "ok": false
+    }
+  },
+  {
+    "method": "dfm_fit_clearance",
+    "name": "err_fit_unknown_class",
+    "params": {
+      "fit_class": "snug",
+      "process": "fdm"
+    },
+    "result": {
+      "error": "Unknown fit class 'snug'. Known: ['free', 'location', 'press', 'slip'].",
+      "ok": false
+    }
+  },
+  {
+    "method": "dfm_fit_clearance",
+    "name": "err_fit_unknown_process",
+    "params": {
+      "fit_class": "slip",
+      "process": "lost_wax"
+    },
+    "result": {
+      "error": "Unknown process 'lost_wax'. Known: ['fdm', 'cnc_mill', 'lathe', 'sheet_metal', 'laser', 'injection'].",
+      "ok": false
+    }
+  },
+  {
+    "method": "dfm_modeled_dim",
+    "name": "modeled_fdm_slip_hole",
+    "params": {
+      "fit_class": "slip",
+      "is_hole": true,
+      "nominal_mm": 10.0,
+      "process": "fdm"
+    },
+    "result": {
+      "ok": true,
+      "result": {
+        "clearance_mm": 0.4,
+        "hole_comp_mm": 0.2,
+        "modeled_mm": 10.6,
+        "rationale": "10 mm nominal, fdm slip clearance +0.40 mm, + printed-hole comp 0.20 mm"
+      }
+    }
+  },
+  {
+    "method": "dfm_modeled_dim",
+    "name": "modeled_fdm_slip_shaft",
+    "params": {
+      "fit_class": "slip",
+      "nominal_mm": 10.0,
+      "process": "fdm"
+    },
+    "result": {
+      "ok": true,
+      "result": {
+        "clearance_mm": 0.4,
+        "hole_comp_mm": 0.0,
+        "modeled_mm": 10.4,
+        "rationale": "10 mm nominal, fdm slip clearance +0.40 mm"
+      }
+    }
+  },
+  {
+    "method": "dfm_modeled_dim",
+    "name": "modeled_cnc_press",
+    "params": {
+      "fit_class": "press",
+      "nominal_mm": 12.0,
+      "process": "cnc_mill"
+    },
+    "result": {
+      "ok": true,
+      "result": {
+        "clearance_mm": -0.02,
+        "hole_comp_mm": 0.0,
+        "modeled_mm": 11.98,
+        "rationale": "12 mm nominal, cnc_mill press clearance -0.02 mm"
+      }
+    }
+  },
+  {
+    "method": "dfm_resolve_process",
+    "name": "resolve_explicit_print",
+    "params": {
+      "request": "3d print a bracket"
+    },
+    "result": {
+      "ok": true,
+      "result": {
+        "ambiguous": false,
+        "assumptions": [],
+        "chosen": "fdm",
+        "clarification": null,
+        "confidence": 0.95,
+        "must_block": false,
+        "runner_up": null,
+        "why": "explicit 'fdm' process cue in the request"
+      }
+    }
+  },
+  {
+    "method": "dfm_resolve_process",
+    "name": "resolve_must_block_metal",
+    "params": {
+      "request": "3d print this steel gear"
+    },
+    "result": {
+      "ok": true,
+      "result": {
+        "ambiguous": true,
+        "assumptions": [],
+        "chosen": "fdm",
+        "clarification": {
+          "ask": "You asked to 3D-print this, but named a metal material. FDM cannot print metal. Switch to a metal process (CNC mill / sheet metal), or keep FDM with a plastic?",
+          "options": [
+            "cnc_mill",
+            "sheet_metal",
+            "fdm"
+          ],
+          "suggested": "cnc_mill"
+        },
+        "confidence": 0.99,
+        "must_block": true,
+        "runner_up": null,
+        "why": "explicit 3D-print cue but metal material is impossible for FDM"
+      }
+    }
+  },
+  {
+    "method": "dfm_resolve_process",
+    "name": "resolve_explicit_machine_from",
+    "params": {
+      "request": "machine from aluminum"
+    },
+    "result": {
+      "ok": true,
+      "result": {
+        "ambiguous": false,
+        "assumptions": [],
+        "chosen": "cnc_mill",
+        "clarification": null,
+        "confidence": 0.95,
+        "must_block": false,
+        "runner_up": null,
+        "why": "explicit 'cnc_mill' process cue in the request"
+      }
+    }
+  },
+  {
+    "method": "dfm_resolve_process",
+    "name": "resolve_explicit_laser",
+    "params": {
+      "request": "laser cut a gasket"
+    },
+    "result": {
+      "ok": true,
+      "result": {
+        "ambiguous": false,
+        "assumptions": [],
+        "chosen": "laser",
+        "clarification": null,
+        "confidence": 0.95,
+        "must_block": false,
+        "runner_up": null,
+        "why": "explicit 'laser' process cue in the request"
+      }
+    }
+  },
+  {
+    "method": "dfm_resolve_process",
+    "name": "resolve_metal_sheet_cue",
+    "params": {
+      "request": "constant 2mm steel plate with bends"
+    },
+    "result": {
+      "ok": true,
+      "result": {
+        "ambiguous": false,
+        "assumptions": [
+          "metal material -> sheet_metal (FDM impossible)"
+        ],
+        "chosen": "sheet_metal",
+        "clarification": null,
+        "confidence": 0.9,
+        "must_block": false,
+        "runner_up": null,
+        "why": "explicit metal material pins a metal process"
+      }
+    }
+  },
+  {
+    "method": "dfm_resolve_process",
+    "name": "resolve_metal_two_strong",
+    "params": {
+      "request": "threaded steel plate, constant thickness"
+    },
+    "result": {
+      "ok": true,
+      "result": {
+        "ambiguous": true,
+        "assumptions": [
+          "metal material -> not FDM, but two strong metal cues compete"
+        ],
+        "chosen": "cnc_mill",
+        "clarification": {
+          "ask": "Make this by CNC from plate/billet or sheet metal (laser+bend)? [suggested: CNC from plate/billet]",
+          "options": [
+            "cnc_mill",
+            "sheet_metal"
+          ],
+          "suggested": "cnc_mill"
+        },
+        "confidence": 0.5,
+        "must_block": false,
+        "runner_up": "sheet_metal",
+        "why": "metal pins a metal process but 'cnc_mill' and 'sheet_metal' cues compete; asking which"
+      }
+    }
+  },
+  {
+    "method": "dfm_resolve_process",
+    "name": "resolve_metal_no_cues",
+    "params": {
+      "request": "a steel widget"
+    },
+    "result": {
+      "ok": true,
+      "result": {
+        "ambiguous": false,
+        "assumptions": [
+          "metal material -> cnc_mill (FDM impossible)"
+        ],
+        "chosen": "cnc_mill",
+        "clarification": null,
+        "confidence": 0.9,
+        "must_block": false,
+        "runner_up": null,
+        "why": "explicit metal material pins a metal process"
+      }
+    }
+  },
+  {
+    "method": "dfm_resolve_process",
+    "name": "resolve_within_margin",
+    "params": {
+      "request": "bracket"
+    },
+    "result": {
+      "ok": true,
+      "result": {
+        "ambiguous": false,
+        "assumptions": [
+          "process FDM/PLA assumed (default)"
+        ],
+        "chosen": "fdm",
+        "clarification": null,
+        "confidence": 0.86,
+        "must_block": false,
+        "runner_up": "sheet_metal",
+        "why": "no non-FDM cues; FDM is the default prior"
+      }
+    }
+  },
+  {
+    "method": "dfm_resolve_process",
+    "name": "resolve_decisive_cnc",
+    "params": {
+      "request": "threaded flat plate, precision"
+    },
+    "result": {
+      "ok": true,
+      "result": {
+        "ambiguous": true,
+        "assumptions": [
+          "cnc_mill cue present but within margin of the FDM default"
+        ],
+        "chosen": "cnc_mill",
+        "clarification": {
+          "ask": "Make this by CNC from plate/billet or FDM 3D print? [suggested: CNC from plate/billet]",
+          "options": [
+            "cnc_mill",
+            "fdm"
+          ],
+          "suggested": "cnc_mill"
+        },
+        "confidence": 0.5,
+        "must_block": false,
+        "runner_up": "fdm",
+        "why": "'cnc_mill' cue scores within margin of the FDM default with no material/qty anchor"
+      }
+    }
+  },
+  {
+    "method": "dfm_resolve_process",
+    "name": "resolve_plastic",
+    "params": {
+      "request": "plastic housing"
+    },
+    "result": {
+      "ok": true,
+      "result": {
+        "ambiguous": false,
+        "assumptions": [
+          "process FDM/PLA assumed (default)"
+        ],
+        "chosen": "fdm",
+        "clarification": null,
+        "confidence": 0.9,
+        "must_block": false,
+        "runner_up": null,
+        "why": "explicit plastic material with no non-FDM cues"
+      }
+    }
+  },
+  {
+    "method": "dfm_resolve_process",
+    "name": "resolve_default_fdm",
+    "params": {
+      "request": "a knob"
+    },
+    "result": {
+      "ok": true,
+      "result": {
+        "ambiguous": false,
+        "assumptions": [
+          "process FDM/PLA assumed (default)"
+        ],
+        "chosen": "fdm",
+        "clarification": null,
+        "confidence": 0.86,
+        "must_block": false,
+        "runner_up": null,
+        "why": "no non-FDM cues; FDM is the default prior"
+      }
+    }
+  },
+  {
+    "method": "dfm_resolve_process",
+    "name": "resolve_injection_qty_text",
+    "params": {
+      "request": "draft housing, 5000 units"
+    },
+    "result": {
+      "ok": true,
+      "result": {
+        "ambiguous": false,
+        "assumptions": [
+          "injection selected over the FDM default by cue margin"
+        ],
+        "chosen": "injection",
+        "clarification": null,
+        "confidence": 0.9,
+        "must_block": false,
+        "runner_up": "fdm",
+        "why": "'injection' cues outscore the FDM default"
+      }
+    }
+  },
+  {
+    "method": "dfm_resolve_process",
+    "name": "resolve_explicit_turned",
+    "params": {
+      "request": "turned shaft from round bar"
+    },
+    "result": {
+      "ok": true,
+      "result": {
+        "ambiguous": false,
+        "assumptions": [],
+        "chosen": "lathe",
+        "clarification": null,
+        "confidence": 0.95,
+        "must_block": false,
+        "runner_up": null,
+        "why": "explicit 'lathe' process cue in the request"
+      }
+    }
+  },
+  {
+    "method": "dfm_resolve_process",
+    "name": "resolve_material_arg_metal",
+    "params": {
+      "material": "aluminum",
+      "request": "housing"
+    },
+    "result": {
+      "ok": true,
+      "result": {
+        "ambiguous": false,
+        "assumptions": [
+          "metal material -> cnc_mill (FDM impossible)"
+        ],
+        "chosen": "cnc_mill",
+        "clarification": null,
+        "confidence": 0.9,
+        "must_block": false,
+        "runner_up": null,
+        "why": "explicit metal material pins a metal process"
+      }
+    }
+  },
+  {
+    "method": "dfm_resolve_process",
+    "name": "resolve_qty_arg",
+    "params": {
+      "quantity": 5000,
+      "request": "widget"
+    },
+    "result": {
+      "ok": true,
+      "result": {
+        "ambiguous": false,
+        "assumptions": [
+          "injection selected over the FDM default by cue margin"
+        ],
+        "chosen": "injection",
+        "clarification": null,
+        "confidence": 0.63,
+        "must_block": false,
+        "runner_up": "fdm",
+        "why": "'injection' cues outscore the FDM default"
+      }
+    }
+  },
+  {
+    "method": "dfm_resolve_process",
+    "name": "resolve_dict_spec",
+    "params": {
+      "material": "steel",
+      "quantity": 25,
+      "request": {
+        "features": [
+          "2mm plate"
+        ],
+        "object": "bracket with bends and flanges"
+      }
+    },
+    "result": {
+      "ok": true,
+      "result": {
+        "ambiguous": false,
+        "assumptions": [
+          "metal material -> sheet_metal (FDM impossible)"
+        ],
+        "chosen": "sheet_metal",
+        "clarification": null,
+        "confidence": 0.9,
+        "must_block": false,
+        "runner_up": null,
+        "why": "explicit metal material pins a metal process"
+      }
+    }
+  },
+  {
+    "method": "dfm_resolve_process",
+    "name": "resolve_lathe_vs_cnc_tie",
+    "params": {
+      "request": "threaded turned shaft"
+    },
+    "result": {
+      "ok": true,
+      "result": {
+        "ambiguous": false,
+        "assumptions": [],
+        "chosen": "lathe",
+        "clarification": null,
+        "confidence": 0.95,
+        "must_block": false,
+        "runner_up": null,
+        "why": "explicit 'lathe' process cue in the request"
+      }
+    }
+  },
+  {
+    "method": "dfm_process_block_text",
+    "name": "block_fdm",
+    "params": {
+      "profile": {
+        "material": {
+          "density_g_cm3": 1.24,
+          "name": "PLA"
+        },
+        "params": {
+          "draft": {
+            "min_deg": 0.0,
+            "required": false
+          },
+          "fit_classes_mm": {
+            "free": 0.5,
+            "location": 0.2,
+            "press": 0.1,
+            "slip": 0.4
+          },
+          "hole_comp_mm": 0.2,
+          "min_feature_mm": 0.8,
+          "min_wall_mm": 1.0,
+          "overhang": {
+            "max_bridge_mm": 5,
+            "max_deg": 45
+          },
+          "thread": {
+            "printed_ok_min": "M5",
+            "strategy": "heat_set_insert"
+          },
+          "tolerance_band_mm": 0.4
+        },
+        "process": "fdm"
+      }
+    },
+    "result": {
+      "ok": true,
+      "result": "PROCESS BLOCK — manufacturing = FDM 3D PRINT / PLA\nCommit dimensions that PRINT/MACHINE on the first try, not textbook anchors.\n  - Min wall 1 mm; smallest feature 0.8 mm. Walls thinner than this warp or fail to form.\n  - Diametral fit clearance to ADD to the receptacle (mm): slip +0.40, location +0.20, press +0.10, free +0.50.\n    e.g. a slip-fit bore for a Dx shaft is modeled Ø(x+0.40); pick the class by how it must mate.\n  - Printed holes shrink: oversize every printed bore diameter by 0.2 mm to land on nominal.\n  - Threads: heat set insert (printed threads only ≥ M5).\n  - Overhangs steeper than 45° from vertical need support or a chamfer; bridges over 5 mm need support."
+    }
+  },
+  {
+    "method": "dfm_process_block_text",
+    "name": "block_injection",
+    "params": {
+      "profile": {
+        "material": {
+          "density_g_cm3": 1.04,
+          "name": "ABS"
+        },
+        "params": {
+          "draft": {
+            "min_deg": 1.0,
+            "required": true
+          },
+          "fit_classes_mm": {
+            "free": 0.2,
+            "location": 0.05,
+            "press": 0.02,
+            "slip": 0.1
+          },
+          "hole_comp_mm": 0.0,
+          "min_feature_mm": 0.5,
+          "min_wall_mm": 1.0,
+          "overhang": {
+            "max_bridge_mm": null,
+            "max_deg": null
+          },
+          "thread": {
+            "printed_ok_min": null,
+            "strategy": "molded"
+          },
+          "tolerance_band_mm": 0.1
+        },
+        "process": "injection"
+      }
+    },
+    "result": {
+      "ok": true,
+      "result": "PROCESS BLOCK — manufacturing = INJECTION MOLD / ABS\nCommit dimensions that PRINT/MACHINE on the first try, not textbook anchors.\n  - Min wall 1 mm; smallest feature 0.5 mm. Walls thinner than this warp or fail to form.\n  - Diametral fit clearance to ADD to the receptacle (mm): slip +0.10, location +0.05, press +0.02, free +0.20.\n    e.g. a slip-fit bore for a Dx shaft is modeled Ø(x+0.10); pick the class by how it must mate.\n  - Threads: molded.\n  - Draft REQUIRED ≥ 1° on every face along the pull, or it won't release."
+    }
+  },
+  {
+    "method": "dfm_process_block_text",
+    "name": "block_sheet_metal",
+    "params": {
+      "profile": {
+        "material": {
+          "density_g_cm3": 7.85,
+          "name": "Steel (mild)"
+        },
+        "params": {
+          "draft": {
+            "min_deg": 0.0,
+            "required": false
+          },
+          "fit_classes_mm": {
+            "free": null,
+            "location": null,
+            "press": null,
+            "slip": null
+          },
+          "hole_comp_mm": 0.0,
+          "min_feature_mm": 1.0,
+          "min_wall_mm": 1.0,
+          "overhang": {
+            "max_bridge_mm": null,
+            "max_deg": null
+          },
+          "thread": {
+            "printed_ok_min": null,
+            "strategy": "clinch_or_weld_nut"
+          },
+          "tolerance_band_mm": 0.1
+        },
+        "process": "sheet_metal"
+      }
+    },
+    "result": {
+      "ok": true,
+      "result": "PROCESS BLOCK — manufacturing = SHEET METAL (LASER+BEND) / Steel (mild)\nCommit dimensions that PRINT/MACHINE on the first try, not textbook anchors.\n  - Min wall 1 mm; smallest feature 1 mm. Walls thinner than this warp or fail to form.\n  - Threads: clinch or weld nut."
+    }
+  },
+  {
+    "method": "dfm_process_block_text",
+    "name": "block_cnc_mill",
+    "params": {
+      "profile": {
+        "material": {
+          "density_g_cm3": 2.7,
+          "name": "Aluminium 6061-T6"
+        },
+        "params": {
+          "draft": {
+            "min_deg": 0.0,
+            "required": false
+          },
+          "fit_classes_mm": {
+            "free": 0.1,
+            "location": 0.02,
+            "press": -0.02,
+            "slip": 0.05
+          },
+          "hole_comp_mm": 0.0,
+          "min_feature_mm": 0.5,
+          "min_wall_mm": 0.5,
+          "overhang": {
+            "max_bridge_mm": null,
+            "max_deg": null
+          },
+          "thread": {
+            "printed_ok_min": null,
+            "strategy": "tapped"
+          },
+          "tolerance_band_mm": 0.05
+        },
+        "process": "cnc_mill"
+      }
+    },
+    "result": {
+      "ok": true,
+      "result": "PROCESS BLOCK — manufacturing = CNC FROM PLATE/BILLET / Aluminium 6061-T6\nCommit dimensions that PRINT/MACHINE on the first try, not textbook anchors.\n  - Min wall 0.5 mm; smallest feature 0.5 mm. Walls thinner than this warp or fail to form.\n  - Diametral fit clearance to ADD to the receptacle (mm): slip +0.05, location +0.02, press -0.02, free +0.10.\n    e.g. a slip-fit bore for a Dx shaft is modeled Ø(x+0.05); pick the class by how it must mate.\n  - Threads: tapped."
+    }
+  },
+  {
+    "method": "dfm_process_block_text",
+    "name": "block_assumed",
+    "params": {
+      "profile": {
+        "assumed": true,
+        "material": {
+          "density_g_cm3": 1.24,
+          "name": "PLA"
+        },
+        "params": {
+          "draft": {
+            "min_deg": 0.0,
+            "required": false
+          },
+          "fit_classes_mm": {
+            "free": 0.5,
+            "location": 0.2,
+            "press": 0.1,
+            "slip": 0.4
+          },
+          "hole_comp_mm": 0.2,
+          "min_feature_mm": 0.8,
+          "min_wall_mm": 1.0,
+          "overhang": {
+            "max_bridge_mm": 5,
+            "max_deg": 45
+          },
+          "thread": {
+            "printed_ok_min": "M5",
+            "strategy": "heat_set_insert"
+          },
+          "tolerance_band_mm": 0.4
+        },
+        "process": "fdm"
+      }
+    },
+    "result": {
+      "ok": true,
+      "result": "PROCESS BLOCK — manufacturing = FDM 3D PRINT / PLA  (assumed default — confirm if wrong)\nCommit dimensions that PRINT/MACHINE on the first try, not textbook anchors.\n  - Min wall 1 mm; smallest feature 0.8 mm. Walls thinner than this warp or fail to form.\n  - Diametral fit clearance to ADD to the receptacle (mm): slip +0.40, location +0.20, press +0.10, free +0.50.\n    e.g. a slip-fit bore for a Dx shaft is modeled Ø(x+0.40); pick the class by how it must mate.\n  - Printed holes shrink: oversize every printed bore diameter by 0.2 mm to land on nominal.\n  - Threads: heat set insert (printed threads only ≥ M5).\n  - Overhangs steeper than 45° from vertical need support or a chamfer; bridges over 5 mm need support."
+    }
+  }
+]

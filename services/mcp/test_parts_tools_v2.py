@@ -90,7 +90,7 @@ def hub_search(monkeypatch):
             return [r for r in _BEARINGS if r["domain"] == "catalog"]
         return list(_BEARINGS)
 
-    import engine_oracle.parts_hub as hub
+    import services.parts as hub
     monkeypatch.setattr(hub, "search", _search)
     return calls
 
@@ -144,7 +144,7 @@ class TestSearchPartsV2:
         assert out["ok"] is False and "JSON" in out["reason"]
 
     def test_backend_failure_degrades(self, monkeypatch):
-        import engine_oracle.parts_hub as hub
+        import services.parts as hub
 
         def _boom(*a, **k):
             raise RuntimeError("index down")
@@ -410,7 +410,7 @@ _MATCH_ENVELOPE = {
 
 class TestMatchModel:
     def _patch(self, monkeypatch, capture=None):
-        from engine_oracle.parts_hub import model_matcher as mm
+        from services.parts import model_matcher as mm
 
         def _fake(product, *, limit=8):
             if capture is not None:
@@ -446,7 +446,7 @@ class TestMatchModel:
     def test_part_id_path_fetches_record(self, monkeypatch):
         cap: dict = {}
         self._patch(monkeypatch, cap)
-        import engine_oracle.parts_hub as hub
+        import services.parts as hub
         rec = {"part_id": "catalog:amazon::https://a/x", "title": "Acme Widget",
                "mpn": "1LNK-4B", "brand": "AcmeCorp"}
         monkeypatch.setattr(hub, "get", lambda pid: rec)
@@ -456,7 +456,7 @@ class TestMatchModel:
         assert cap["product"]["mpn"] == "1LNK-4B"
 
     def test_unknown_part_id_is_contract_error(self, monkeypatch):
-        import engine_oracle.parts_hub as hub
+        import services.parts as hub
         monkeypatch.setattr(hub, "get", lambda pid: None)
         out = pt.match_model_impl(part_id="catalog:x::none")
         assert out["ok"] is False and "not found" in out["reason"]
@@ -474,7 +474,7 @@ class TestMatchModel:
 
 class TestReverseEngineerProduct:
     def _patch(self, monkeypatch, capture=None):
-        from engine_oracle import reveng_rpc as re
+        from services.reveng import worker_rpc as re
 
         def _fake(params, emit):
             if capture is not None:

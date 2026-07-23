@@ -1,5 +1,5 @@
 # Molded-draft context pack
-# Source: engine_oracle/research/calcs/draft_check.py
+# Source: services/research/calcs/draft_check.py
 #         engine_oracle/dfm/process_profiles.py (injection profile: draft.min_deg=1.0)
 #         Reference: Bryce, Plastic Injection Molding Vol. 2 (draft guidelines)
 

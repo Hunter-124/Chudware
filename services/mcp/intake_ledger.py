@@ -1,7 +1,7 @@
 """IntakeLedger — the doc-scoped interaction answer store (contracts/interaction.md §5).
 
 Persists ``ask_user`` Q/A records inside the document's ``IntakeState``
-(``engine_oracle/intake/intake.py``), round-tripped as JSON into the ``.step+``
+(``services/intake/intake.py``), round-tripped as JSON into the ``.step+``
 record via ``doc_set_meta`` / ``doc_get_meta`` — the same opaque-doc-key mechanism
 ``confirm_dimensions`` uses for the critical-dimension ledger.  Contract §5:
 "Same records; different store."

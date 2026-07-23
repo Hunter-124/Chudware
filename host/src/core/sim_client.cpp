@@ -27,14 +27,10 @@ bool SimClient::ensureStarted(std::string& consoleNote) {
     }
 
     std::string err;
-    if (worker_.start(err, "engine.sim.worker")) {
-        consoleNote = "[sim] simulation worker started";
-        return true;
-    }
-#ifndef _WIN32
-    // No managed Python runtime on this platform — the FEA sim RPCs route in-process to
-    // libaicad (routeSimToCpp defaults on), so treat the backend as ready if the core loads.
-    // (sim_run_flow / sim_caps / sim_cancel have no C++ port yet and degrade gracefully.)
+    // No Python sim worker exists anymore (T-RF19: FEA + flow + cancel all route
+    // in-process to libaicad via routeSimToCpp; engine.sim.worker is deleted). Treat
+    // the backend as ready if the core loads. sim_caps / multiphysics ride the
+    // services-side worker (services.worker_main).
     std::string lerr;
     if (core::cpp_core().ensureLoaded(lerr)) {
         // Mark started so launch()'s worker_.call path can reach routeSimToCpp (and so
@@ -44,12 +40,8 @@ bool SimClient::ensureStarted(std::string& consoleNote) {
         consoleNote = "[sim] using in-process C++ core (libaicad) for simulation";
         return true;
     }
-    consoleNote = "[sim] could not start simulation worker and libaicad unavailable: " + lerr;
+    consoleNote = "[sim] could not load the simulation backend: " + lerr;
     return false;
-#else
-    consoleNote = "[sim] could not start simulation worker: " + err;
-    return false;
-#endif
 }
 
 void SimClient::cancel() {

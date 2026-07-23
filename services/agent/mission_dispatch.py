@@ -1275,7 +1275,7 @@ class MissionDispatch:
         if not part_id:
             return {"ok": False, "error": "part_get needs a part_id"}
         try:
-            from engine_oracle.parts_hub import get as _get  # noqa: PLC0415
+            from services.parts import get as _get  # noqa: PLC0415
             rec = _get(part_id)
             if rec is None:
                 return {"ok": False, "error": f"part_id not found: {part_id!r}",
@@ -1402,8 +1402,8 @@ class MissionDispatch:
             return {"ok": False, "error": f"file not found: {path}",
                     "hint": "Take artifact_path from scrape_queue_status on a done job."}
         try:
-            from engine_oracle.parts_hub.place import _place_import_file  # noqa: PLC0415
-            out = _place_import_file({"kind": "import_file", "path": path}, None, None)
+            from services.mcp import core_bridge as cb  # noqa: PLC0415 — ported to core (T-RF19)
+            out = cb.call("part_import_file", {"path": path})
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": f"import_artifact failed: {exc}",
                     "hint": "Ensure the native core (AI_CAD_LIBAICAD) is available."}

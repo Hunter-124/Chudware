@@ -83,7 +83,7 @@ def parts_hub_fake(monkeypatch):
         },
     }
 
-    fake_hub = ModuleType("engine_oracle.parts_hub")
+    fake_hub = ModuleType("services.parts")
     fake_hub.get = lambda ref: record if ref == PART_ID else None  # type: ignore[attr-defined]
 
     def _fake_reg(adapter):
@@ -91,6 +91,9 @@ def parts_hub_fake(monkeypatch):
 
     fake_hub.register_provider = _fake_reg  # type: ignore[attr-defined]
 
+    monkeypatch.setitem(sys.modules, "services.parts", fake_hub)
+    # Also shadow the legacy shim package so `import engine_oracle.parts_hub.place`
+    # below never executes the real shim (which would import the REAL services.parts).
     monkeypatch.setitem(sys.modules, "engine_oracle.parts_hub", fake_hub)
     return PART_ID, record
 
@@ -112,6 +115,11 @@ def _inject_place_mock(monkeypatch, ok: bool = True):
     place_mod = ModuleType("engine_oracle.parts_hub.place")
     place_mod.place = lambda ref, **kw: {"ok": ok, "doc_id": "doc_test", "editable": True}  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "engine_oracle.parts_hub.place", place_mod)
+    # `import engine_oracle.parts_hub.place as x` resolves the attribute on the
+    # parent package — which the fixture shadowed with the fake hub.
+    parent = sys.modules.get("engine_oracle.parts_hub")
+    if parent is not None:
+        monkeypatch.setattr(parent, "place", place_mod, raising=False)
 
 
 # ---------------------------------------------------------------------------
@@ -174,8 +182,12 @@ def test_known_mpn_model_present_and_place(
     assert sc["part_ref"] == PART_ID
     assert sc["schema"] == "aicad.reveng_result/1"
 
-    # part_place: confirm the injected place stub works for this part_ref
-    import engine_oracle.parts_hub.place as _place_mod  # type: ignore[import-untyped]
+    # part_place: confirm the injected place stub works for this part_ref.
+    # NOTE: `import engine_oracle.parts_hub.place as x` binds via attribute walk
+    # on the parent package and can pick up the REAL place module when another
+    # test imported it earlier — look the stub up in sys.modules directly.
+    import sys as _sys  # noqa: PLC0415
+    _place_mod = _sys.modules["engine_oracle.parts_hub.place"]
     pr = _place_mod.place(PART_ID)
     assert pr["ok"] is True
 

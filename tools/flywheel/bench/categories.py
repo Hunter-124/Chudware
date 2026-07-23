@@ -863,7 +863,7 @@ def run_reveng(repo: Path, out_dir: Path, logf) -> dict:
 
 def run_parts_research(repo: Path, out_dir: Path, logf) -> dict:
     targets = [
-        "engine_oracle/research/test_research.py",
+        "services/research/test_research.py",
         "services/mcp/test_reveng_e2e_datasheet.py",
     ]
     existing = [t for t in targets if (repo / t).is_file()]

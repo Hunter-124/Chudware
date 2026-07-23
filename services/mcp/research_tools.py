@@ -1,6 +1,6 @@
 """Research / look-it-up MCP tools — the Pillar 8 ``research_*`` family.
 
-Thin MCP adapter over ``engine.research`` (the pure brain). Contract:
+Thin MCP adapter over ``services.research`` (the pure brain). Contract:
 ``contracts/research_tools.md``. v1 exposes ``web_search`` + ``fetch_page``; every helper
 returns the §1 answer envelope (``{ok, answer, units, source_url, quote, fetched_ts,
 confidence, cached}``) so a limited model quotes it verbatim and a frontier model chains
@@ -25,8 +25,8 @@ from typing import Optional
 from mcp.server.fastmcp import FastMCP
 
 from mcp_server.cad_tools import _dumps, _err
-from engine import research
-import engine_oracle.research.calcs as _calcs  # registers all T-W4 calculators
+from services import research
+import services.research.calcs as _calcs  # registers all T-W4 calculators
 
 
 def register_research_tools(mcp: FastMCP) -> None:

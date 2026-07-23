@@ -2,7 +2,7 @@
 
 A "profile" is a Playwright persistent-context user-data directory keyed by a
 site id (e.g. ``"grabcad"``, ``"traceparts"``). LOCAL ONLY: profiles live under
-the app data dir (:data:`engine.paths.BROWSER_PROFILES`, mirroring the
+the app data dir (:data:`services.paths.BROWSER_PROFILES`, mirroring the
 ``vendor_parts`` convention) and are never synced or uploaded anywhere by this
 codebase.
 
@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from engine import paths
+from services import paths
 
 # ---------------------------------------------------------------------------
 # Per-site profile locks (Parts Library V2 / embedded browser).
@@ -65,7 +65,7 @@ def profile_dir(site: str) -> Path:
 
     Does not create the directory itself — Playwright's
     ``launch_persistent_context`` creates it on first login. The parent
-    (:data:`engine.paths.BROWSER_PROFILES`) is created eagerly so metadata can
+    (:data:`services.paths.BROWSER_PROFILES`) is created eagerly so metadata can
     be written even before a profile exists.
     """
     paths.BROWSER_PROFILES.mkdir(parents=True, exist_ok=True)

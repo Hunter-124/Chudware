@@ -17,7 +17,7 @@ import time
 import uuid
 from urllib.parse import parse_qs, urlparse
 
-from engine import paths
+from services import paths
 
 
 # ── PKCE (96-byte verifier to match reference clients) ──────────────────────

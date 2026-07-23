@@ -24,7 +24,7 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from engine.doc.canonical import canonical_dump, round_floats_doc
+from services.plm.canonical import canonical_dump, round_floats_doc
 
 
 # ---------------------------------------------------------------------------

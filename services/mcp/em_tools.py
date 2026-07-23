@@ -14,8 +14,8 @@ from __future__ import annotations
 import json
 from typing import Any, Optional
 
-from engine_oracle.sim.em import analytic
-from engine_oracle.sim.em.worker_rpc import WORKER_METHODS
+from services.sim.em import analytic
+from services.sim.em.worker_rpc import WORKER_METHODS
 
 
 def _dumps(payload: dict) -> str:

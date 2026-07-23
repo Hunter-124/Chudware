@@ -15,7 +15,7 @@ import pytest
 @pytest.fixture()
 def adapter_mods(tmp_path, monkeypatch):
     monkeypatch.setenv("APPDATA", str(tmp_path))
-    from engine import paths as engine_paths
+    from services import paths as engine_paths
     importlib.reload(engine_paths)
     from services.browser import profiles, session
     importlib.reload(profiles)
@@ -224,7 +224,7 @@ def test_terms_confirmation_required_shape(adapter_mods):
 
 def test_download_dir_is_created_under_browser_downloads(adapter_mods):
     adapters_pkg, _grabcad, _traceparts, _session, _amazon, _mcmaster, _jlcpcb, _pcbway = adapter_mods
-    from engine import paths
+    from services import paths
     d = adapters_pkg.download_dir("GrabCAD")
     assert d.exists()
     assert d == paths.BROWSER_DOWNLOADS / "grabcad"

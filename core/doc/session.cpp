@@ -10292,6 +10292,21 @@ json mesh_read_raw(const std::string& path, const std::string& fmt) {
     return json{{"objects", std::move(objects)}, {"format", f}};
 }
 
+json doc_formats() {
+    // Stateless — no session needed (the format matrix is a static registry). Byte-parity
+    // with engine/doc/formats.py::list_formats (test_formats_registry pins the oracle dump).
+    json formats = json::array();
+    for (const FormatInfo& fi : format_registry()) {
+        formats.push_back(json{{"fmt", fi.fmt},
+                               {"label", fi.label},
+                               {"exts", fi.exts},
+                               {"lane", fi.lane},
+                               {"can_import", fi.can_import},
+                               {"can_export", fi.can_export}});
+    }
+    return json{{"formats", std::move(formats)}};
+}
+
 // Bake any import feature that still carries only a source_path reference into a
 // self-contained `embedded_brep` blob, so the saved .step+ survives the source file
 // being deleted (Bug N-8 insurance — covers parts imported before embedding existed, or

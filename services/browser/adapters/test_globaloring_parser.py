@@ -77,7 +77,7 @@ ID: 56.00 MM (2.205 IN)                </td>
 @pytest.fixture()
 def globaloring_mod(tmp_path, monkeypatch):
     monkeypatch.setenv("APPDATA", str(tmp_path))
-    from engine import paths as engine_paths
+    from services import paths as engine_paths
     importlib.reload(engine_paths)
     from services.browser import profiles, session
     importlib.reload(profiles)

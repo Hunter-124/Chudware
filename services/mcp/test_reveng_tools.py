@@ -143,15 +143,15 @@ def _stub_ingest_pdf(path, out_dir):
 with (
     patch.dict("sys.modules", {
         "engine_oracle": types.ModuleType("engine_oracle"),
-        "engine_oracle.vision": types.ModuleType("engine_oracle.vision"),
-        "engine_oracle.vision.reveng_provision": types.ModuleType("engine_oracle.vision.reveng_provision"),
-        "engine_oracle.vision.frames": types.ModuleType("engine_oracle.vision.frames"),
-        "engine_oracle.vision.ingest": types.ModuleType("engine_oracle.vision.ingest"),
+        "services.vision": types.ModuleType("services.vision"),
+        "services.vision.reveng_provision": types.ModuleType("services.vision.reveng_provision"),
+        "services.vision.frames": types.ModuleType("services.vision.frames"),
+        "services.vision.ingest": types.ModuleType("services.vision.ingest"),
     }),
 ):
-    sys.modules["engine_oracle.vision.reveng_provision"].reveng_status = _stub_reveng_status
-    sys.modules["engine_oracle.vision.frames"].extract_frames_safe = _stub_extract_frames_safe
-    sys.modules["engine_oracle.vision.ingest"].ingest_pdf = _stub_ingest_pdf
+    sys.modules["services.vision.reveng_provision"].reveng_status = _stub_reveng_status
+    sys.modules["services.vision.frames"].extract_frames_safe = _stub_extract_frames_safe
+    sys.modules["services.vision.ingest"].ingest_pdf = _stub_ingest_pdf
 
     from services.mcp.reveng_tools import register_reveng_tools  # noqa: E402
 

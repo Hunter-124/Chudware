@@ -13,6 +13,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <vector>
 
@@ -489,7 +491,7 @@ void Renderer::setGroundShadow(float r, float g, float b, float maxAlpha) {
 
 bool Renderer::init(int width, int height, std::string& err) {
     w_ = width; h_ = height;
-    sw_ = w_ * SS; sh_ = h_ * SS;
+    initQualityPolicy();  // T-RF13: sets rw_/rh_/sw_/sh_ + msaaRequest_/blurPasses_ for the step
 
     prog_ = linkProgram(kVert, kFrag);
     edgeProg_ = linkProgram(kEdgeVert, kEdgeFrag);
@@ -552,6 +554,142 @@ bool Renderer::init(int width, int height, std::string& err) {
     return true;
 }
 
+// ---- T-RF13 (R3a): adaptive quality ladder ----
+namespace {
+struct QualitySpec { int msaa; float scale; int blur; };
+QualitySpec qualitySpecFor(Renderer::QualityStep s) {
+    switch (s) {
+        case Renderer::QualityStep::High: return {2, 1.00f, 4};
+        case Renderer::QualityStep::Med:  return {0, 1.00f, 2};
+        case Renderer::QualityStep::Low:  return {0, 0.60f, 1};
+        case Renderer::QualityStep::Full:
+        default:                        return {4, 1.00f, 4};
+    }
+}
+}  // namespace
+
+const char* Renderer::qualityStepName() const {
+    switch (qualityStep_) {
+        case QualityStep::High: return "HIGH";
+        case QualityStep::Med:  return "MED";
+        case QualityStep::Low:  return "LOW";
+        case QualityStep::Full:
+        default:                return "FULL";
+    }
+}
+
+void Renderer::initQualityPolicy() {
+#ifdef __EMSCRIPTEN__
+    // WASM is GPU-fill-bound on weak iGPUs (PERF_AUDIT_2026-07-16): start ADAPTIVE at MED
+    // and let the ladder climb to FULL if the EMA says there's headroom.
+    adaptiveQuality_ = true;
+    qualityStep_ = QualityStep::Med;
+#else
+    // Native desktop: pinned FULL — zero behavior change unless explicitly overridden.
+    adaptiveQuality_ = false;
+    qualityStep_ = QualityStep::Full;
+#endif
+    if (const char* e = std::getenv("AI_CAD_QUALITY_ADAPTIVE")) {
+        if (e[0] == '1') adaptiveQuality_ = true;
+        else if (e[0] == '0') adaptiveQuality_ = false;
+    }
+    if (const char* e = std::getenv("AI_CAD_QUALITY_STEP")) {
+        QualityStep s = qualityStep_;
+        if (!std::strcmp(e, "full"))      s = QualityStep::Full;
+        else if (!std::strcmp(e, "high")) s = QualityStep::High;
+        else if (!std::strcmp(e, "med"))  s = QualityStep::Med;
+        else if (!std::strcmp(e, "low"))  s = QualityStep::Low;
+        else std::fprintf(stderr, "[quality] unknown AI_CAD_QUALITY_STEP='%s' (ignored)\n", e);
+        if (!std::strcmp(e, "full") || !std::strcmp(e, "high") ||
+            !std::strcmp(e, "med") || !std::strcmp(e, "low")) {
+            qualityStep_ = s;
+            qualityPinned_ = true;
+        }
+    }
+    if (const char* e = std::getenv("AI_CAD_QUALITY_LOG"))
+        qualityLog_ = (e[0] == '1');
+    if (const char* e = std::getenv("AI_CAD_QUALITY_FORCE_MS")) {
+        const float v = (float)std::atof(e);
+        if (v > 0.0f) qualityForceMs_ = v;
+    }
+    // Adaptive without a pin starts at MED ("measure first"): the ladder climbs to FULL
+    // within a few seconds when the EMA shows headroom, instead of dropping frames at
+    // FULL while it learns the GPU is slow.
+    if (adaptiveQuality_ && !qualityPinned_) qualityStep_ = QualityStep::Med;
+    applyQualityStep();
+    rw_ = std::max(1, (int)std::lround(w_ * renderScale_));
+    rh_ = std::max(1, (int)std::lround(h_ * renderScale_));
+    sw_ = rw_ * SS; sh_ = rh_ * SS;
+    if (qualityLog_)
+        std::fprintf(stderr,
+                     "[quality] init: adaptive=%d pinned=%d step=%s scale=%.2f msaaReq=%d blur=%d forceMs=%.1f\n",
+                     adaptiveQuality_ ? 1 : 0, qualityPinned_ ? 1 : 0, qualityStepName(),
+                     renderScale_, msaaRequest_, blurPasses_, qualityForceMs_);
+}
+
+void Renderer::applyQualityStep() {
+    const QualitySpec qs = qualitySpecFor(qualityStep_);
+    msaaRequest_ = qs.msaa;
+    renderScale_ = qs.scale;
+    blurPasses_ = qs.blur;
+}
+
+void Renderer::setQualityStep(QualityStep s) {
+    if (s == qualityStep_) return;
+    const char* from = qualityStepName();
+    const float prevScale = renderScale_;
+    const int prevMsaa = msaaRequest_;
+    qualityStep_ = s;
+    applyQualityStep();
+    if (qualityLog_)
+        std::fprintf(stderr, "[quality] step %s -> %s (ema %.2f ms, scale %.2f, msaa %d, blur %d)\n",
+                     from, qualityStepName(), frameMsEma_, renderScale_, msaaRequest_,
+                     blurPasses_);
+    // Realloc render targets only when the MSAA count or render scale actually changed.
+    if (renderScale_ != prevScale || msaaRequest_ != prevMsaa) {
+        rw_ = std::max(1, (int)std::lround(w_ * renderScale_));
+        rh_ = std::max(1, (int)std::lround(h_ * renderScale_));
+        sw_ = rw_ * SS; sh_ = rh_ * SS;
+        allocTargets();
+    }
+}
+
+void Renderer::noteFrame(float dtMs) {
+    const float ms = (qualityForceMs_ > 0.0f) ? qualityForceMs_ : dtMs;
+    if (!(ms > 0.0f) || ms > 1000.0f) return;  // ignore garbage (tab restore, zero dt)
+    frameMsEma_ += (ms - frameMsEma_) * (1.0f / 30.0f);  // ~30-frame EMA window
+    if (qualityLog_ && ++qualityLogFrames_ >= 60) {
+        qualityLogFrames_ = 0;
+        std::fprintf(stderr, "[quality] step=%s ema=%.2f ms frame=%.2f ms scale=%.2f msaa=%d blur=%d\n",
+                     qualityStepName(), frameMsEma_, ms, renderScale_, msaaRequest_, blurPasses_);
+    }
+    if (!adaptiveQuality_ || qualityPinned_) return;
+    // Thresholds: sustained EMA above 20 ms can't hold a 60 Hz present; below 12.5 ms there
+    // is clear headroom under the 16.7 ms budget. Hysteresis: step DOWN fast (0.25 s of
+    // breach) but require ~1 s of continuous headroom before stepping back UP, so the
+    // ladder can't oscillate across the vsync cliff.
+    constexpr float kDownMs = 20.0f, kUpMs = 12.5f;
+    constexpr float kDwellDownS = 0.25f, kDwellUpS = 1.0f;
+    float dtS = dtMs * 0.001f;
+    if (!(dtS > 0.0f)) dtS = 0.0f;
+    if (dtS > 0.25f) dtS = 0.25f;  // clamp hitches so one stall can't fast-forward dwell
+    if (frameMsEma_ > kDownMs && qualityStep_ != QualityStep::Low) {
+        dwellDownS_ += dtS; dwellUpS_ = 0.0f;
+        if (dwellDownS_ >= kDwellDownS) {
+            setQualityStep(static_cast<QualityStep>(static_cast<int>(qualityStep_) + 1));
+            dwellDownS_ = 0.0f;
+        }
+    } else if (frameMsEma_ < kUpMs && qualityStep_ != QualityStep::Full) {
+        dwellUpS_ += dtS; dwellDownS_ = 0.0f;
+        if (dwellUpS_ >= kDwellUpS) {
+            setQualityStep(static_cast<QualityStep>(static_cast<int>(qualityStep_) - 1));
+            dwellUpS_ = 0.0f;
+        }
+    } else {
+        dwellDownS_ = dwellUpS_ = 0.0f;
+    }
+}
+
 void Renderer::allocTargets() {
     if (!fbo_) glGenFramebuffers(1, &fbo_);
     if (!colorTex_) glGenTextures(1, &colorTex_);
@@ -564,27 +702,28 @@ void Renderer::allocTargets() {
 
     // Final-size resolve target (ImGui samples this). Always a single-sample texture.
     glBindTexture(GL_TEXTURE_2D, resolvedTex_);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w_, h_, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, rw_, rh_, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
 #ifdef BILLET_GLES3
-    // WebGL2: prefer a multisampled offscreen FBO at final size (SS=1). Clamp samples to
-    // min(4, GL_MAX_SAMPLES). If MSAA FBO fails completeness, fall back to single-sample.
+    // WebGL2: prefer a multisampled offscreen FBO at presentation size (SS=1). Samples come
+    // from the quality ladder (msaaRequest_), clamped to GL_MAX_SAMPLES; <=1 takes the
+    // single-sample path. If MSAA FBO fails completeness, fall back to single-sample.
     GLint maxSamples = 0;
     glGetIntegerv(GL_MAX_SAMPLES, &maxSamples);
-    int samples = 4;
+    int samples = msaaRequest_;
     if (maxSamples > 0 && samples > maxSamples) samples = maxSamples;
     if (samples < 1) samples = 1;
 
     msaaSamples_ = 0;
-    if (samples > 1) {
+    if (msaaRequest_ > 1 && samples > 1) {
         glBindRenderbuffer(GL_RENDERBUFFER, colorRbo_);
-        glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples, GL_RGBA8, w_, h_);
+        glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples, GL_RGBA8, rw_, rh_);
         glBindRenderbuffer(GL_RENDERBUFFER, depthRbo_);
-        glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples, GL_DEPTH24_STENCIL8, w_, h_);
+        glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples, GL_DEPTH24_STENCIL8, rw_, rh_);
 
         glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
         glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, colorRbo_);
@@ -643,7 +782,9 @@ void Renderer::allocTargets() {
 void Renderer::resize(int width, int height) {
     if (width == w_ && height == h_) return;
     w_ = width; h_ = height;
-    sw_ = w_ * SS; sh_ = h_ * SS;
+    rw_ = std::max(1, (int)std::lround(w_ * renderScale_));
+    rh_ = std::max(1, (int)std::lround(h_ * renderScale_));
+    sw_ = rw_ * SS; sh_ = rh_ * SS;
     allocTargets();
 }
 
@@ -2220,7 +2361,7 @@ void Renderer::resolveColorTexture() const {
         glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFbo);
         glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo_);
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, resolveFbo_);
-        glBlitFramebuffer(0, 0, w_, h_, 0, 0, w_, h_, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        glBlitFramebuffer(0, 0, rw_, rh_, 0, 0, rw_, rh_, GL_COLOR_BUFFER_BIT, GL_NEAREST);
         glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
         resolvedDirty_ = false;
         backdropDirty_ = true;
@@ -2242,7 +2383,7 @@ void Renderer::resolveColorTexture() const {
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex0);
 
     glBindFramebuffer(GL_FRAMEBUFFER, resolveFbo_);
-    glViewport(0, 0, w_, h_);
+    glViewport(0, 0, rw_, rh_);
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_BLEND);
     glUseProgram(resolveProg_);
@@ -2269,8 +2410,8 @@ void Renderer::resolveColorTexture() const {
 
 void Renderer::updateBackdropBlur() const {
     if (!backdropDirty_ || !resolvedTex_ || !downsampleProg_ || !kawaseProg_) return;
-    const int bw = std::max(1, w_ / 4);
-    const int bh = std::max(1, h_ / 4);
+    const int bw = std::max(1, rw_ / 4);
+    const int bh = std::max(1, rh_ / 4);
     if (bw != blurW_ || bh != blurH_) {
         blurW_ = bw;
         blurH_ = bh;
@@ -2320,12 +2461,12 @@ void Renderer::updateBackdropBlur() const {
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, resolvedTex_);
     glUniform1i(glGetUniformLocation(downsampleProg_, "uSrc"), 0);
-    glUniform2f(glGetUniformLocation(downsampleProg_, "uInvSrcSize"), 1.0f / (float)w_,
-                1.0f / (float)h_);
+    glUniform2f(glGetUniformLocation(downsampleProg_, "uInvSrcSize"), 1.0f / (float)rw_,
+                1.0f / (float)rh_);
     glDrawArrays(GL_TRIANGLES, 0, 3);
 
     unsigned int srcTex = blurDownTex_;
-    for (int pass = 0; pass < kBlurPasses; ++pass) {
+    for (int pass = 0; pass < blurPasses_; ++pass) {
         unsigned int dstFbo = blurPingFbo_[pass & 1];
         unsigned int dstTex = blurPingTex_[pass & 1];
         glBindFramebuffer(GL_FRAMEBUFFER, dstFbo);
@@ -2367,7 +2508,7 @@ ViewportBackdrop Renderer::backdrop() const {
     ViewportBackdrop bd;
     if (!backdropEnabled_ || blurW_ <= 0 || blurH_ <= 0) return bd;
     // Final blur texture is whichever ping-pong buffer holds the last pass output.
-    unsigned int tex = blurPingTex_[(kBlurPasses - 1) & 1];
+    unsigned int tex = blurPingTex_[(blurPasses_ - 1) & 1];
     if (!tex) tex = blurDownTex_;
     bd.textureId = static_cast<std::uintptr_t>(tex);
     bd.uvMin[0] = 0.f;
@@ -2698,18 +2839,18 @@ unsigned int Renderer::resolvedColorTexture() const {
 std::vector<unsigned char> Renderer::readRGBA() const {
     resolveColorTexture();
 
-    std::vector<unsigned char> glPixels(w_ * h_ * 4);
+    std::vector<unsigned char> glPixels(rw_ * rh_ * 4);
     glBindFramebuffer(GL_FRAMEBUFFER, resolveFbo_);
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    glReadPixels(0, 0, w_, h_, GL_RGBA, GL_UNSIGNED_BYTE, glPixels.data());
+    glReadPixels(0, 0, rw_, rh_, GL_RGBA, GL_UNSIGNED_BYTE, glPixels.data());
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
-    // The texture is already box-resolved to final size; just flip vertically to top-left origin.
-    std::vector<unsigned char> out(w_ * h_ * 4);
-    for (int y = 0; y < h_; ++y) {
-        const unsigned char* src = &glPixels[y * w_ * 4];
-        unsigned char* dst = &out[(h_ - 1 - y) * w_ * 4];
-        std::copy(src, src + w_ * 4, dst);
+    // The texture is already box-resolved to presentation size; just flip to top-left origin.
+    std::vector<unsigned char> out(rw_ * rh_ * 4);
+    for (int y = 0; y < rh_; ++y) {
+        const unsigned char* src = &glPixels[y * rw_ * 4];
+        unsigned char* dst = &out[(rh_ - 1 - y) * rw_ * 4];
+        std::copy(src, src + rw_ * 4, dst);
     }
     return out;
 }

@@ -34,7 +34,7 @@ def default_runs_dir() -> Path:
     - Linux/macOS: $XDG_DATA_HOME/AI-CAD/runs/  (default ~/.local/share/AI-CAD/runs/)
     - Windows:     %APPDATA%\\AI-CAD\\runs\\
 
-    Note: engine/paths.py does not have a Linux XDG branch (known issue, out of scope
+    Note: services/paths.py does not have a Linux XDG branch (known issue, out of scope
     for T-A1).  This function is the authoritative runs-dir resolver for services/dag.
     Override via the runs_dir parameter to run() for hermetic tests.
     """

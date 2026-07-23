@@ -924,7 +924,7 @@ def run_test_pollution(out_md_path: Path | None) -> str:
     lines.append("   and `_PIPING` in `piping_tools.py` are module-level globals; a test that creates a")
     lines.append("   part leaves a live `doc_id` that breaks a later test expecting empty state.")
     lines.append("")
-    lines.append("3. **LoggingProvider / engine.paths singleton** — `engine.paths.DATA` AttributeError")
+    lines.append("3. **LoggingProvider / services.paths singleton** — `services.paths.DATA` AttributeError")
     lines.append("   (noted in task context as fixed 2026-07-03) may still surface in suites that do")
     lines.append("   not load the engine with the DATA path set.")
     lines.append("")

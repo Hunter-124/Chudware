@@ -30,7 +30,7 @@ from services.agent import geometry_helpers as gh          # noqa: E402
 from services.agent import roles                            # noqa: E402
 from services.agent.ledger import Ledger                    # noqa: E402
 from services.agent.pipeline import phases                  # noqa: E402
-from engine_oracle.research.calcs import run_calc           # noqa: E402
+from services.research.calcs import run_calc           # noqa: E402
 
 _TMP = os.environ.get("TMPDIR", "/tmp")
 

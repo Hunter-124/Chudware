@@ -283,8 +283,7 @@ add_library(aicad_cam STATIC
   cam/op_milling.cpp
   cam/op_drill.cpp
   cam/op_engrave.cpp
-  cam/op_adaptive.cpp
-  cam/heightfield.cpp
+  cam/op_adaptive.cpp  cam/heightfield.cpp
   cam/op_3d.cpp
   cam/op_cut.cpp
   cam/op_turn.cpp
@@ -400,6 +399,43 @@ set_target_properties(test_kicad_import PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME kicad_import COMMAND test_kicad_import)
 
+# T-RF19 (leaf 5): structural engine surface — aicad.structure/1 document model,
+# the direct-stiffness 3D frame solver (PyNite-equivalent subset: global-
+# direction point/distributed member loads, fully-fixed supports, ASCE 7
+# combos, beam-segmentation member-force/deflection extraction), the AISC +
+# lumber section libraries (embedded curated tables), the AISC-LRFD / NDS-ASD
+# D/C checks, the ENR-rate cost takeoff, and the struct_* RPC dispatch
+# (structural/structural_rpc.cpp). Pure Eigen + JSON like aicad_sim; OCCT-free.
+add_library(aicad_structural STATIC
+  structural/model.cpp
+  structural/solver.cpp
+  structural/sections.cpp
+  structural/checks.cpp
+  structural/estimate.cpp
+  structural/structural_rpc.cpp)
+target_include_directories(aicad_structural PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(aicad_structural PUBLIC Eigen3::Eigen nlohmann_json::nlohmann_json)
+
+add_executable(test_structural tests/test_structural.cpp)
+target_include_directories(test_structural PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_structural PRIVATE aicad_structural)
+# The structural tests read aicad.structure/1 fixtures + the ENR rate table
+# from the source tree; pass the absolute dirs so the test runs from the build dir.
+target_compile_definitions(test_structural PRIVATE
+  AICAD_TEST_DATA="${CMAKE_CURRENT_SOURCE_DIR}/tests/data/structural"
+  AICAD_STRUCT_DATA="${CMAKE_CURRENT_SOURCE_DIR}/structural")
+set_target_properties(test_structural PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME structural COMMAND test_structural)
+
+# struct_cli: differential-harness driver (same role as fw_cli) — reads
+# {"method","params"} and prints the structural::call result as one JSON line.
+# Used by the T-RF19 parity diffs against the Python (PyNite) oracle.
+add_executable(struct_cli structural/struct_cli.cpp)
+target_link_libraries(struct_cli PRIVATE aicad_structural)
+set_target_properties(struct_cli PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
 enable_testing()
 
 add_executable(test_sim tests/test_sim.cpp)
@@ -467,8 +503,8 @@ target_link_libraries(test_cam PRIVATE aicad_cam)
 # T-M4: the byte-identical feeds test reads the source-tree registry.json (the CAM fold-in
 # ground truth); pass its absolute path so the test runs from the build dir.
 target_compile_definitions(test_cam PRIVATE
-  AICAD_TEST_REGISTRY="${CMAKE_CURRENT_SOURCE_DIR}/../engine_oracle/materials/registry.json"
-  AICAD_TEST_MACHINES="${CMAKE_CURRENT_SOURCE_DIR}/../engine_oracle/research/data/machines.json")
+  AICAD_TEST_REGISTRY="${CMAKE_CURRENT_SOURCE_DIR}/data/materials/registry.json"
+  AICAD_TEST_MACHINES="${CMAKE_CURRENT_SOURCE_DIR}/../services/research/data/machines.json")
 set_target_properties(test_cam PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME cam COMMAND test_cam)
@@ -748,11 +784,18 @@ add_test(NAME aicm COMMAND test_aicm)
 # (only JSON; the doc engine compiles the geometry). The numbers mirror
 # agent/prompts/shared/cheatsheets/hardware.md. Linked into the libaicad DLL below
 # (parts_make / parts_catalog_list RPCs) and unit-tested in both configs.
+# parts/place.cpp (T-RF19 place.py port) is the part_place / part_import_file
+# placement router: the symbol_footprint leg drives aicad_ecad's apply_ops and
+# the fitting_id / fmu_component legs use the aicad_piping / aicad_hydraulic
+# schema factories — all still pure JSON / OCCT-free (the doc-creating RPCs and
+# the PartRecord hub lookup stay Seams injections wired in libaicad.cpp).
 add_library(aicad_parts STATIC
   parts/catalog.cpp
-  parts/generate.cpp)
+  parts/generate.cpp
+  parts/place.cpp)
 target_include_directories(aicad_parts PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(aicad_parts PUBLIC nlohmann_json::nlohmann_json)
+target_link_libraries(aicad_parts PUBLIC
+  nlohmann_json::nlohmann_json aicad_ecad aicad_hydraulic)
 
 add_executable(test_parts tests/test_parts.cpp)
 target_include_directories(test_parts PRIVATE ${doctest_SOURCE_DIR})
@@ -760,6 +803,13 @@ target_link_libraries(test_parts PRIVATE aicad_parts)
 set_target_properties(test_parts PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME parts COMMAND test_parts)
+
+add_executable(test_parts_place tests/test_parts_place.cpp)
+target_include_directories(test_parts_place PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_parts_place PRIVATE aicad_parts)
+set_target_properties(test_parts_place PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME parts_place COMMAND test_parts_place)
 
 # --- libaicad sourcing (BOM roll-up / cost model / spec-match / providers) -------
 # T-RF18: C++ port of engine_oracle/{bom,cost_model,spec_sheet_matcher,parts_providers,
@@ -787,6 +837,131 @@ target_link_libraries(test_sourcing PRIVATE aicad_sourcing)
 set_target_properties(test_sourcing PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME sourcing COMMAND test_sourcing)
+
+# --- libaicad tolerance / mechanical / materials / dfm (T-RF19 leaf 6) ------------
+# C++ ports of engine_oracle/{tolerance/stackup, mechanical/{gear_check,bearing_life},
+# materials/registry, dfm/process_profiles}.py — the small pure oracle modules behind
+# the MCP stackup_analyze / gear_check / bearing_life tools, the CAM materials seam,
+# the FEA material library and the intake/dimension-scheme DfM brain. PURE (OCCT-free,
+# no doc/ecad/agent linkage); each owns its methods behind a single
+# call(method, params, result, err) dispatch entry for the libaicad glue. Envelope
+# parity with the Python oracle is proven by golden fixtures under tests/data/
+# (generated from the oracle — see each test's header comment).
+add_library(aicad_tolerance STATIC
+  tolerance/stackup.cpp)
+target_include_directories(aicad_tolerance PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(aicad_tolerance PUBLIC nlohmann_json::nlohmann_json)
+
+add_library(aicad_mechanical STATIC
+  mechanical/mechanical.cpp)
+target_include_directories(aicad_mechanical PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(aicad_mechanical PUBLIC nlohmann_json::nlohmann_json)
+
+add_library(aicad_materials STATIC
+  materials/materials.cpp)
+target_include_directories(aicad_materials PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(aicad_materials PUBLIC nlohmann_json::nlohmann_json)
+# Bundled seed fallback for the registry resolver (env -> appdata -> this):
+target_compile_definitions(aicad_materials PRIVATE
+  AICAD_BUNDLED_MATERIALS_REGISTRY="${CMAKE_CURRENT_SOURCE_DIR}/data/materials/registry.json")
+target_compile_definitions(aicad_cam PRIVATE
+  AICAD_BUNDLED_MATERIALS_REGISTRY="${CMAKE_CURRENT_SOURCE_DIR}/data/materials/registry.json")
+
+add_library(aicad_dfm STATIC
+  dfm/process_profiles.cpp)
+target_include_directories(aicad_dfm PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(aicad_dfm PUBLIC aicad_materials nlohmann_json::nlohmann_json)
+
+add_executable(test_tolerance tests/test_tolerance.cpp)
+target_include_directories(test_tolerance PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_tolerance PRIVATE aicad_tolerance)
+target_compile_definitions(test_tolerance PRIVATE
+  AICAD_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
+set_target_properties(test_tolerance PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME tolerance COMMAND test_tolerance)
+
+add_executable(test_mechanical tests/test_mechanical.cpp)
+target_include_directories(test_mechanical PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_mechanical PRIVATE aicad_mechanical)
+target_compile_definitions(test_mechanical PRIVATE
+  AICAD_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
+set_target_properties(test_mechanical PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME mechanical COMMAND test_mechanical)
+
+add_executable(test_materials tests/test_materials.cpp)
+target_include_directories(test_materials PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_materials PRIVATE aicad_materials)
+target_compile_definitions(test_materials PRIVATE
+  AICAD_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data"
+  AICAD_TEST_REGISTRY="${CMAKE_CURRENT_SOURCE_DIR}/data/materials/registry.json")
+set_target_properties(test_materials PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME materials COMMAND test_materials)
+
+add_executable(test_dfm tests/test_dfm.cpp)
+target_include_directories(test_dfm PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_dfm PRIVATE aicad_dfm)
+target_compile_definitions(test_dfm PRIVATE
+  AICAD_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data"
+  AICAD_TEST_REGISTRY="${CMAKE_CURRENT_SOURCE_DIR}/data/materials/registry.json")
+set_target_properties(test_dfm PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME dfm COMMAND test_dfm)
+
+# --- libaicad piping + hydraulic (T-RF19 leaf 4) ------------------------------
+# C++ ports of engine_oracle/piping/ (1-D liquid + gas network solver, fluid
+# properties, B36 schedule catalog, CFD handoff math) and
+# engine_oracle/hydraulic/ (ISO 1219 circuit schema, cylinder/pump/accumulator/
+# valve sizing, BOM) plus the services/mcp tool envelopes for both families
+# (incl. the aicad.simhandoff/1 builders they share). PURE (OCCT-free, no
+# doc/ecad/agent linkage): the `fluids` algorithms the oracle calls (Clamond
+# friction factor, Rennels fitting K) are re-implemented and the B36.10M/19M
+# schedule tables + B16 fitting CSV are vendored (pipe_tables.h, generated
+# from the MIT fluids package; fittings_data.h), so the port always behaves
+# like a fluids-present box. Each family owns its methods behind a single
+# call(method, params, result) dispatch entry for the libaicad glue.
+add_library(aicad_piping STATIC
+  piping/catalog.cpp
+  piping/cfd.cpp
+  piping/fluid_properties.cpp
+  piping/piping.cpp
+  piping/schema.cpp
+  piping/simhandoff.cpp
+  piping/solve.cpp)
+target_include_directories(aicad_piping PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(aicad_piping PUBLIC nlohmann_json::nlohmann_json)
+
+add_library(aicad_hydraulic STATIC
+  hydraulic/bom.cpp
+  hydraulic/handoff.cpp
+  hydraulic/hydraulic.cpp
+  hydraulic/schema.cpp
+  hydraulic/solve.cpp)
+target_include_directories(aicad_hydraulic PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(aicad_hydraulic PUBLIC aicad_piping nlohmann_json::nlohmann_json)
+
+add_executable(test_piping tests/test_piping.cpp)
+target_include_directories(test_piping PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_piping PRIVATE aicad_piping)
+set_target_properties(test_piping PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME piping COMMAND test_piping)
+
+add_executable(test_hydraulic tests/test_hydraulic.cpp)
+target_include_directories(test_hydraulic PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_hydraulic PRIVATE aicad_hydraulic)
+set_target_properties(test_hydraulic PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME hydraulic COMMAND test_hydraulic)
+
+# {"method","params"} per line on stdin -> dispatch result per line; the T-RF19
+# parity harness drives this against the Python oracle (mirrors fw_cli).
+add_executable(rpc_cli piping/rpc_cli.cpp)
+target_link_libraries(rpc_cli PRIVATE aicad_hydraulic aicad_piping)
+set_target_properties(rpc_cli PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
 # --- Wave 2: OCCT geometry kernel (opt-in) -----------------------------------
 if(AICAD_WITH_OCCT)
@@ -1337,6 +1512,20 @@ if(AICAD_WITH_OCCT)
   add_test(NAME op_registry COMMAND test_op_registry)
   set_tests_properties(op_registry PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
+  # --- Format-registry parity (T-RF19): doc_formats payload vs the Python oracle
+  # dump (engine/doc/formats.py::list_formats) + detect_format lockstep. --------
+  add_executable(test_formats_registry
+    tests/test_formats_registry.cpp)
+  target_include_directories(test_formats_registry PRIVATE
+    ${doctest_SOURCE_DIR}
+    ${OpenCASCADE_INCLUDE_DIR})
+  target_link_libraries(test_formats_registry PRIVATE
+    aicad_doc aicad_geom_occt aicad_sketch aicad_geom aicad_util)
+  set_target_properties(test_formats_registry PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME formats_registry COMMAND test_formats_registry)
+  set_tests_properties(formats_registry PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+
   # --- sketch3d document layer: wire chaining, sweep spine/guide from a 3D
   # free-space sketch, and the sketch3d_health/drag session RPCs. --------------
   add_executable(test_sketch3d_doc
@@ -1728,7 +1917,7 @@ if(AICAD_WITH_OCCT)
   target_include_directories(aicad PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/hostd_gen)
   add_dependencies(aicad aicad_version_info)
   target_compile_definitions(aicad PRIVATE AICAD_BUILD_DLL)
-  target_link_libraries(aicad PRIVATE aicad_doc aicad_sim aicad_ecad aicad_cam aicad_agent aicad_parts aicad_sourcing aicad_firmware aicad_prof)
+  target_link_libraries(aicad PRIVATE aicad_doc aicad_sim aicad_ecad aicad_cam aicad_agent aicad_parts aicad_sourcing aicad_firmware aicad_structural aicad_prof aicad_tolerance aicad_mechanical aicad_materials aicad_dfm aicad_piping aicad_hydraulic)
   if(AICAD_WITH_NETGEN)
     target_link_libraries(aicad PRIVATE aicad_mesh)
     target_compile_definitions(aicad PRIVATE AICAD_WITH_NETGEN)  # enable the mesh RPCs in libaicad.cpp

@@ -14,6 +14,7 @@
 #include "../metrics.h"       // ui::metrics::px/U/stroke/rounding + ribbon tokens
 #include "../appearance_common.h"  // ui::kMaterials (material swatch colors)
 #include "../layout.h"        // ui::setEvalRibbonDock (Evaluate-tab inspector dock strip)
+#include "../web_capabilities.h"  // ui::webGapReason (T-RF12: WASM-build ribbon gating)
 
 #include <cmath>
 #include <cstdio>
@@ -94,15 +95,20 @@ static int s_workspace = 0;
 
 // sim-gui: dynamic command gating. Commands whose cmd_id starts with s_disabledPrefix render
 // disabled with s_disabledReason in their tooltip (instead of the static "Coming soon"). Used by
-// SimManager to grey the EM tools while the em_* solver backend is not installed. One prefix is
-// enough for now; generalize to a list if a second consumer appears.
+// SimManager to grey the EM tools while the em_* solver backend is not installed. A second
+// consumer exists: ribbon_dynDisabledReason also falls through to ui::webGapReason(cmd_id),
+// which greys web-unsupported commands in the WASM build (T-RF12, data-driven from
+// ui/web_capabilities.cpp — no per-command state here).
 static std::string s_disabledPrefix;
 static std::string s_disabledReason;
 static const char* ribbon_dynDisabledReason(const char* cmd_id) {
-    if (s_disabledPrefix.empty() || !cmd_id) return nullptr;
-    return std::strncmp(cmd_id, s_disabledPrefix.c_str(), s_disabledPrefix.size()) == 0
-               ? s_disabledReason.c_str()
-               : nullptr;
+    if (!cmd_id) return nullptr;
+    if (!s_disabledPrefix.empty() &&
+        std::strncmp(cmd_id, s_disabledPrefix.c_str(), s_disabledPrefix.size()) == 0)
+        return s_disabledReason.c_str();
+    // T-RF12: web-build capability gaps (ui/web_capabilities.cpp; folds to nullptr on
+    // native, so desktop rendering/tooltips are unchanged).
+    return ui::webGapReason(cmd_id);
 }
 // Effective enabled state for a row: the static schema-reserved flag (stretch) AND the dynamic
 // prefix gate above. Every button/flyout/overflow row goes through this.

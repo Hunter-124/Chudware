@@ -10,6 +10,7 @@ from .ecad_common import (
     _apply,
     _attach_board_ascii_readback,
     _attach_schematic_ascii_readback,
+    _compile_of,
     _component_eng,
     _dumps,
     _erc_lines,
@@ -21,6 +22,7 @@ from .ecad_common import (
     _power_totals,
     _pretty_pin,
     _resolve_ref_or_id,
+    _rpc,
     _rs,
     _unconnected_pins,
     ecad_session,
@@ -71,7 +73,7 @@ def register_ecad_sch_tools(mcp: FastMCP) -> None:
         PIN COUNT (symbols) so you know how many pins you'll have to wire. Hits are sorted best
         first. Pass the exact ``libid``/``fpid`` of a hit to ecad_place_symbol / a footprint op.
         """
-        from engine.ecad.library import resolve as lib_resolve  # local: pin-count lookup
+        from engine.ecad.library import resolve as lib_resolve  # STAYS (T-RF20): no ecad_library RPC; pin-count lookup
         hits = lib_search(query) or []
         out_hits: list[dict] = []
         for h in hits[:max(1, int(limit))]:
@@ -145,7 +147,7 @@ def register_ecad_sch_tools(mcp: FastMCP) -> None:
         # E7: Validate libid resolves BEFORE dispatching the op. An unresolvable libid would
         # silently produce a 2-pin stub with ok:true, which then corrupts the netlist. Fail fast
         # with a clear error and direct the user to ecad_find_part.
-        from engine.ecad import library as _lib
+        from engine.ecad import library as _lib  # STAYS (T-RF20): no ecad_library RPC
         if _lib.resolve(libid) is None:
             keyword = libid.split(":")[-1] if ":" in libid else libid
             return _err(
@@ -453,11 +455,10 @@ def register_ecad_sch_tools(mcp: FastMCP) -> None:
         for name, members in sorted(nl.get("nets", {}).items()):
             nets.append({"name": name, "size": len(members),
                          "members": [f"{m.get('ref')}.{m.get('pin')}" for m in members]})
-        # ERC
+        # ERC (from the C++ session compile — engine.ecad.erc runs inside compile_field)
         violations: list[dict] = []
         try:
-            from engine.ecad import erc as erc_mod
-            violations = erc_mod.run_erc(doc, nl)
+            violations = _compile_of(session).get("erc", []) or []
         except Exception:  # noqa: BLE001 — ERC is advisory; never break status
             violations = []
         erc = _erc_summary(violations)
@@ -514,8 +515,7 @@ def register_ecad_sch_tools(mcp: FastMCP) -> None:
         vias = doc.get("vias", [])
         violations: list[dict] = []
         try:
-            from engine.ecad import drc as drc_mod
-            res = drc_mod.run_drc(doc)
+            res = _compile_of(session).get("drc", [])  # C++ compile runs engine.ecad.drc
             violations = res if isinstance(res, list) else res.get("violations", [])
         except Exception:  # noqa: BLE001
             violations = []
@@ -580,11 +580,7 @@ def register_ecad_sch_tools(mcp: FastMCP) -> None:
                         next_actions=["ecad_new_schematic('mydesign')"])
         doc = session.doc
         nl = netlist_mod.build_netlist(doc)
-        try:
-            from engine.ecad import erc as erc_mod
-            violations = erc_mod.run_erc(doc, nl)
-        except Exception as e:  # noqa: BLE001
-            return _err(f"ERC engine error: {e}", hint="Inspect with ecad_status().")
+        violations = _compile_of(session).get("erc", []) or []  # C++ compile runs engine.ecad.erc
         summary = _erc_summary(violations)
         lines = _erc_lines(violations)
         first_errors = [v for v in violations if v.get("severity") == "error"][:3]
@@ -634,10 +630,9 @@ def register_ecad_sch_tools(mcp: FastMCP) -> None:
             return _err("no active board to sync INTO",
                         hint="Create a board first; it will be populated from the schematic.",
                         next_actions=["ecad_new_pcb('myboard')"])
-        from engine.ecad import rpc as ecad_rpc
         try:
-            resp = ecad_rpc._ecad_update_from_sch(
-                {"board_doc_id": pcb_id, "sch_doc_id": sch_id}, lambda _d: None)
+            resp = _rpc("ecad_update_from_sch",
+                        {"board_doc_id": pcb_id, "sch_doc_id": sch_id})
         except OpError as e:
             return _err(f"update_from_sch failed: {e.message}", hint=e.message,
                         next_actions=["ecad_status()"], detail=getattr(e, "detail", {}))

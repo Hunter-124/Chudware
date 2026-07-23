@@ -164,7 +164,7 @@ def _fix_interference(f: Finding) -> tuple[list[dict], list[str]]:
         fit = f.extra.get("fit") or "H7/g6"
         nominal = f.extra.get("nominal") or round(float(shaft_d), 3)
         try:
-            from engine_oracle.research.fits import fit_calc
+            from services.research.fits import fit_calc
             calc = fit_calc(nominal, fit, prefilled={"nominal": f.source_detail})
         except Exception:  # noqa: BLE001
             calc = None

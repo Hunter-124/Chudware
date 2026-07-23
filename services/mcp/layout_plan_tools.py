@@ -100,7 +100,7 @@ def _save_layout_plan(doc_id: str, plan: dict) -> None:
 def _load_req_doc(doc_id: str):
     """Load the aicad.req/1 doc associated with doc_id."""
     try:
-        from engine_oracle.requirements import RequirementsDoc
+        from services.requirements import RequirementsDoc
     except ImportError:
         return None
     cb = _core_bridge()
@@ -180,9 +180,9 @@ def register_layout_plan_tools(mcp: "FastMCP") -> None:
         """
         # Load or create the req doc
         try:
-            from engine_oracle.requirements import RequirementsDoc
+            from services.requirements import RequirementsDoc
         except ImportError:
-            return json.dumps({"ok": False, "error": "engine_oracle.requirements not available"})
+            return json.dumps({"ok": False, "error": "services.requirements not available"})
 
         req_doc = _load_req_doc(doc_id)
         created_new = req_doc is None

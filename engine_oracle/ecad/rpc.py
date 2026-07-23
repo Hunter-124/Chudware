@@ -768,19 +768,19 @@ def _zone_fill_summary(board: dict) -> dict:
 def _ecad_design(params: dict, _emit: EmitFn) -> dict:
     """Run the autonomous ECAD orchestrator for *request*.
 
-    Lazy-imports engine.ecad.orchestrator so a missing dependency (numpy/scipy) degrades
-    gracefully. When provider is absent or cannot be resolved, passes provider=None so the
-    orchestrator uses the deterministic recipe fallback -- the run ALWAYS produces a verified
-    schematic.
+    Lazy-imports services.ecad_design (re-homed from engine.ecad.orchestrator in T-RF20) so
+    a missing dependency (numpy/scipy) degrades gracefully. When provider is absent or
+    cannot be resolved, passes provider=None so the orchestrator uses the deterministic
+    recipe fallback -- the run ALWAYS produces a verified schematic.
     """
     request = str(_require(params, "request"))
     max_attempts = int(params.get("max_attempts") or 3)
 
     try:
-        from engine.ecad import orchestrator as _orch  # type: ignore
+        from services import ecad_design as _orch  # type: ignore
     except ImportError as exc:
         raise OpError("not_available",
-                      f"engine.ecad.orchestrator not available: {exc}",
+                      f"services.ecad_design not available: {exc}",
                       {"reason": "module not present", "feature": "ecad_design"}) from exc
 
     # Resolve provider (best-effort; fall back to None so the recipe path is used).

@@ -15,8 +15,11 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <functional>
+#include <iterator>
 #include <limits>
 #include <string>
 #include <vector>
@@ -401,6 +404,305 @@ LbmResult run_wind_tunnel(const std::vector<std::vector<float>>& body_pos,
         R.warning = R.warning.empty() ? governor_note : (R.warning + "; " + governor_note);
     if (R.ok) aicad::sim::cache::store(aicad::sim::cache::Kind::Cfd, input_hash, lbm_to_json(R));
     return R;
+}
+
+// ────────────────────────────────────────────────────────────────────────────────────────────
+// run_flow_stl — see flow_run.h. STL-shaped front-end mirroring the retired Python sim
+// worker's sim_run_flow (engine_oracle/sim/worker.py + engine_oracle/sim/lbm.py).
+// ────────────────────────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+// Grid presets — mirror engine_oracle/sim/lbm.py::_PRESETS exactly.
+struct FlowPreset { int cells; int steps; };
+FlowPreset flow_preset(const std::string& name, bool& known) {
+    known = true;
+    if (name == "coarse") return {48, 1500};
+    if (name == "medium") return {64, 3000};
+    if (name == "fine")   return {96, 6000};
+    if (name == "xfine")  return {128, 10000};
+    known = false;
+    return {48, 1500};
+}
+
+// Load an STL (binary or ASCII, units = mm) into a triangle soup: pos = flat 3*nverts, idx =
+// flat 3*ntris sequential (no vertex dedup — the X-scanline voxelizer indexes per-triangle,
+// so sharing vertices would not save work). Returns false with `err` on any malformed input.
+bool load_stl_soup(const std::string& path, std::vector<float>& pos,
+                   std::vector<uint32_t>& idx, std::string& err) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) { err = "cannot open STL: " + path; return false; }
+    std::string data((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    if (data.size() < 15) { err = "STL too small: " + path; return false; }
+
+    // ASCII detection: starts with "solid" and carries a "facet" keyword (a binary header may
+    // also start with the bytes "solid", so the facet check is what disambiguates).
+    bool ascii = false;
+    {
+        size_t i = data.find_first_not_of(" \t\r\n");
+        if (i != std::string::npos && data.compare(i, 5, "solid") == 0 &&
+            data.find("facet", i) != std::string::npos)
+            ascii = true;
+    }
+
+    if (ascii) {
+        // Every "vertex x y z" line contributes one vertex; each consecutive triple one tri.
+        const char* p = data.c_str();
+        std::vector<float> v;
+        while ((p = std::strstr(p, "vertex")) != nullptr) {
+            p += 6;
+            char* end = nullptr;
+            float x = std::strtof(p, &end); if (end == p) { ++p; continue; } p = end;
+            float y = std::strtof(p, &end); if (end == p) { err = "bad ASCII STL vertex"; return false; } p = end;
+            float z = std::strtof(p, &end); if (end == p) { err = "bad ASCII STL vertex"; return false; } p = end;
+            v.push_back(x); v.push_back(y); v.push_back(z);
+        }
+        if (v.size() < 9 || v.size() % 9 != 0) {
+            err = "ASCII STL vertex count not a multiple of 3 per triangle";
+            return false;
+        }
+        pos = std::move(v);
+    } else {
+        // Binary: 80-byte header, uint32 tri count, 50 bytes per tri (normal + 3 verts + attr).
+        if (data.size() < 84) { err = "binary STL shorter than header"; return false; }
+        uint32_t ntri = 0;
+        std::memcpy(&ntri, data.data() + 80, 4);
+        const uint64_t need = 84ull + 50ull * ntri;
+        if (need != data.size()) { err = "binary STL size mismatch (not an STL?)"; return false; }
+        pos.resize((size_t)ntri * 9);
+        for (uint32_t t = 0; t < ntri; ++t) {
+            const char* rec = data.data() + 84 + 50ull * t;
+            std::memcpy(pos.data() + (size_t)t * 9, rec + 12, 9 * sizeof(float));
+        }
+    }
+    const size_t ntri = pos.size() / 9;
+    idx.resize(ntri * 3);
+    for (uint32_t i = 0; i < (uint32_t)(ntri * 3); ++i) idx[i] = i;
+    return true;
+}
+
+struct Vec3 { double x, y, z; };
+Vec3 vcross(const Vec3& a, const Vec3& b) {
+    return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x};
+}
+double vnorm(const Vec3& a) { return std::sqrt(a.x * a.x + a.y * a.y + a.z * a.z); }
+Vec3 vscale(const Vec3& a, double s) { return {a.x * s, a.y * s, a.z * s}; }
+
+// Compose the incoming flow unit vector from a base axis + AoA + sideslip.
+// Mirrors engine_oracle/sim/lbm.py::_compose_flow_dir (world is Z-up).
+Vec3 compose_flow_dir(const Vec3& base, double aoa_deg, double sideslip_deg) {
+    const double pi = 3.14159265358979323846;
+    Vec3 f0 = vscale(base, 1.0 / (vnorm(base) + 1e-12));
+    Vec3 z{0.0, 0.0, 1.0};
+    Vec3 side0 = vcross(z, f0);
+    if (vnorm(side0) < 1e-9) side0 = {0.0, 1.0, 0.0};
+    side0 = vscale(side0, 1.0 / vnorm(side0));
+    Vec3 up0 = vcross(f0, side0);
+    up0 = vscale(up0, 1.0 / (vnorm(up0) + 1e-12));
+    const double a = aoa_deg * pi / 180.0, b = sideslip_deg * pi / 180.0;
+    Vec3 flow{
+        std::cos(a) * std::cos(b) * f0.x + std::sin(a) * up0.x + std::cos(a) * std::sin(b) * side0.x,
+        std::cos(a) * std::cos(b) * f0.y + std::sin(a) * up0.y + std::cos(a) * std::sin(b) * side0.y,
+        std::cos(a) * std::cos(b) * f0.z + std::sin(a) * up0.z + std::cos(a) * std::sin(b) * side0.z};
+    return vscale(flow, 1.0 / (vnorm(flow) + 1e-12));
+}
+
+nlohmann::json flow_error(const std::string& code, const std::string& msg) {
+    return nlohmann::json{{"ok", false}, {"error", msg}, {"code", code}, {"message", msg}};
+}
+
+}  // namespace
+
+nlohmann::json run_flow_stl(const nlohmann::json& params) {
+    // The OpenFOAM bridge was a Python-worker feature (engine.sim.openfoam); the C++ core is
+    // LBM-only. Fail loud rather than silently running the wrong solver.
+    const std::string solver = params.value("solver", std::string("lbm"));
+    if (solver == "openfoam")
+        return flow_error("unsupported_solver",
+                          "OpenFOAM is not available in the C++ flow core (LBM only).");
+
+    const std::string stl_path = params.value("stl_path", std::string());
+    if (stl_path.empty()) return flow_error("invalid_params", "sim_run_flow_stl: missing stl_path");
+
+    std::vector<float> pos;
+    std::vector<uint32_t> idx;
+    std::string lerr;
+    if (!load_stl_soup(stl_path, pos, idx, lerr)) return flow_error("invalid_stl", lerr);
+
+    // Params (defaults mirror the Python worker).
+    const double speed_mps = params.value("speed_mps", 10.0);
+    const double aoa_deg = params.value("aoa_deg", 0.0);
+    const double sideslip_deg = params.value("sideslip_deg", 0.0);
+    const double roughness_um = params.value("roughness_um", 0.0);
+    const double ref_area_mm2 = params.value("ref_area_mm2", 0.0);
+
+    bool preset_known = true;
+    const FlowPreset preset = flow_preset(params.value("preset", std::string("coarse")), preset_known);
+    if (!preset_known)
+        return flow_error("invalid_params", "unknown preset (coarse|medium|fine|xfine)");
+
+    // Fluid (default air; non-positive values fall back like the oracle).
+    std::string fluid_name = "air";
+    double rho_fluid = 1.225, nu_fluid = 1.5e-5;
+    if (params.contains("fluid") && params["fluid"].is_object()) {
+        const auto& fl = params["fluid"];
+        fluid_name = fl.value("name", fluid_name);
+        rho_fluid = fl.value("density_kgm3", rho_fluid);
+        nu_fluid = fl.value("kinematic_visc_m2s", nu_fluid);
+    }
+    if (rho_fluid <= 0.0) rho_fluid = 1.225;
+    if (nu_fluid <= 0.0) nu_fluid = 1.5e-5;
+
+    // Align the composed flow direction to the tunnel's +X. run_wind_tunnel assumes flow on
+    // CAD-X with lift on CAD-Z (it axis-swaps Z->LBM-Y), so rotate the soup into an
+    // orthonormal (drag, side, lift) basis: drag=flow_dir -> +X, side -> +Y, lift -> +Z.
+    // AoA/sideslip are baked into flow_dir, so FlowParams.aoa_deg stays 0.
+    Vec3 base{1.0, 0.0, 0.0};
+    if (params.contains("direction") && params["direction"].is_array() &&
+        params["direction"].size() == 3)
+        base = {params["direction"][0].get<double>(), params["direction"][1].get<double>(),
+                params["direction"][2].get<double>()};
+    const Vec3 drag_dir = compose_flow_dir(base, aoa_deg, sideslip_deg);
+    Vec3 side_raw = vcross({0.0, 0.0, 1.0}, drag_dir);
+    if (vnorm(side_raw) < 1e-9) side_raw = vcross({1.0, 0.0, 0.0}, drag_dir);
+    const Vec3 side_dir = vscale(side_raw, 1.0 / (vnorm(side_raw) + 1e-12));
+    const Vec3 lift_dir = vscale(vcross(drag_dir, side_dir),
+                                 1.0 / (vnorm(vcross(drag_dir, side_dir)) + 1e-12));
+    // p_rot = M p with M's rows = (drag_dir, side_dir, lift_dir).
+    for (size_t i = 0; i + 2 < pos.size(); i += 3) {
+        const double x = pos[i], y = pos[i + 1], z = pos[i + 2];
+        pos[i]     = (float)(drag_dir.x * x + drag_dir.y * y + drag_dir.z * z);
+        pos[i + 1] = (float)(side_dir.x * x + side_dir.y * y + side_dir.z * z);
+        pos[i + 2] = (float)(lift_dir.x * x + lift_dir.y * y + lift_dir.z * z);
+    }
+
+    FlowParams fp;
+    fp.velocity_ms = speed_mps;
+    fp.aoa_deg = 0.0;  // baked into the rotation above
+    fp.nu_fluid = nu_fluid;
+    fp.rho_fluid = rho_fluid;
+    fp.cells = params.value("cells", preset.cells);
+    fp.n_steps = params.value("n_steps", preset.steps);
+    fp.progress_path = params.value("progress_path", std::string());
+    fp.job_id = params.value("job_id", std::string());
+
+    double reynolds = 0.0;
+    LbmResult R = run_wind_tunnel({pos}, {idx}, fp, &reynolds);
+    if (!R.ok) return flow_error("sim_flow_error", R.error.empty() ? "flow solve failed" : R.error);
+
+    // ── Roughness skin-friction multiplier (qualitative) — mirror lbm.py ──
+    std::vector<std::string> notes;
+    double drag_n = R.drag_n;
+    const double lift_n = R.lift_n;
+    const double L_char_m = R.ref_length_mm * 1e-3;
+    const double friction_frac = 0.5;  // assumed friction fraction of total drag (oracle)
+    double roughness_factor = 1.0;
+    char nbuf[256];
+    if (roughness_um > 0.0 && L_char_m > 0.0) {
+        const double ks_m = roughness_um * 1e-6;
+        const double re_clamp = std::min(std::max(reynolds, 1e3), 1e9);
+        const double cf_smooth = 0.074 * std::pow(re_clamp, -0.2);
+        const double l_over_ks = std::max(L_char_m / ks_m, 1.0 + 1e-6);
+        const double cf_rough = std::pow(1.89 + 1.62 * std::log10(l_over_ks), -2.5);
+        roughness_factor = (cf_smooth > 0.0) ? std::max(1.0, cf_rough / cf_smooth) : 1.0;
+        std::snprintf(nbuf, sizeof nbuf,
+                      "Roughness Ks=%.1f um, Re=%.0f: Cf_smooth=%.4f, Cf_rough=%.4f, "
+                      "drag x%.3f on the friction fraction (~%.0f%%) - QUALITATIVE.",
+                      roughness_um, reynolds, cf_smooth, cf_rough,
+                      1.0 + friction_frac * (roughness_factor - 1.0), friction_frac * 100.0);
+        notes.push_back(nbuf);
+    } else {
+        notes.push_back("Roughness: smooth wall (Ks=0).");
+    }
+    if (roughness_factor > 1.0) drag_n *= (1.0 + friction_frac * (roughness_factor - 1.0));
+
+    // ── Coefficients (mirror lbm.py: user ref area override, else auto frontal) ──
+    const double ref_area_used_mm2 = (ref_area_mm2 > 0.0) ? ref_area_mm2 : R.frontal_area_mm2;
+    const char* ref_area_src = (ref_area_mm2 > 0.0) ? "user" : "auto-frontal";
+    const double ref_area_m2 = ref_area_used_mm2 * 1e-6;
+    const double dyn_pressure = 0.5 * rho_fluid * speed_mps * speed_mps;
+    double cd = 0.0, cl = 0.0;
+    if (ref_area_m2 > 0.0 && dyn_pressure > 0.0) {
+        cd = drag_n / (dyn_pressure * ref_area_m2);
+        cl = lift_n / (dyn_pressure * ref_area_m2);
+    }
+    const double ld = (std::abs(drag_n) > 1e-9) ? lift_n / drag_n : 0.0;
+
+    // vmax from the returned lattice velocity field (u_lat = 0.05, fixed in run_wind_tunnel).
+    double vmax_lat = 0.0;
+    for (size_t i = 0; i < R.ux.size(); ++i) {
+        const double m = std::sqrt((double)R.ux[i] * R.ux[i] + (double)R.uy[i] * R.uy[i] +
+                                   (double)R.uz[i] * R.uz[i]);
+        if (m > vmax_lat) vmax_lat = m;
+    }
+    const double vmax_mps = vmax_lat * (speed_mps / 0.05);
+
+    // ── Notes / reynolds_note (mirror the oracle's formats) ──
+    const double u_lat = 0.05, cs2 = 1.0 / 3.0;
+    const double dx_m = R.voxel_mm * 1e-3;
+    const double dt_s = (speed_mps > 0.0) ? u_lat * dx_m / speed_mps : 0.0;
+    double nu_lat = (reynolds > 0.0) ? u_lat * L_char_m / dx_m / reynolds : cs2 * 0.5;
+    nu_lat = std::max(nu_lat, cs2 * 0.01);
+    const double tau0 = std::min(1.99, std::max(0.51, nu_lat / cs2 + 0.5));
+    std::snprintf(nbuf, sizeof nbuf,
+                  "Domain %dx%dx%d, voxel %.2f mm; fluid %s (rho=%.1f kg/m^3, nu=%.2e m^2/s); "
+                  "Re=%.0f; u_lat=%.3f, tau=%.3f; AoA=%.1f deg, sideslip=%.1f deg; "
+                  "ref area=%.1f mm^2 (%s).",
+                  R.nx, R.ny, R.nz, R.voxel_mm, fluid_name.c_str(), rho_fluid, nu_fluid,
+                  reynolds, u_lat, tau0, aoa_deg, sideslip_deg, ref_area_used_mm2, ref_area_src);
+    notes.insert(notes.begin(), nbuf);
+    notes.push_back(
+        "QUALITATIVE LBM (Smagorinsky LES, half-way bounce-back) - not a validated CFD result.");
+    // side_n: the C++ kernel's momentum exchange reports drag/lift only (no span force yet).
+    notes.push_back("Side force not reported by the C++ LBM kernel (side_n=0).");
+    notes.push_back("Flow overlay (Cp colormap / streamlines / slice PNGs) not yet ported to the "
+                    "C++ core — forces only this run.");
+    if (!R.warning.empty()) notes.push_back(R.warning);
+
+    std::string reynolds_note;
+    {
+        char rbuf[384];
+        std::snprintf(rbuf, sizeof rbuf,
+                      "%s Re ~%.0f (u_lat=%.3f, tau=%.3f, Nu_lat=%.4f, dx=%.2f mm, dt=%.3f us, "
+                      "rho=%.1f kg/m^3, nu=%.2e m^2/s) - QUALITATIVE result; use a full CFD "
+                      "solver for engineering decisions.",
+                      fluid_name.c_str(), reynolds, u_lat, tau0, nu_lat, dx_m * 1e3, dt_s * 1e6,
+                      rho_fluid, nu_fluid);
+        reynolds_note = rbuf;
+    }
+
+    nlohmann::json out{
+        {"ok", true},
+        {"drag_n", drag_n},
+        {"lift_n", lift_n},
+        {"side_n", 0.0},
+        {"cd", cd},
+        {"cl", cl},
+        {"ld", ld},
+        {"reynolds", reynolds},
+        {"frontal_area_mm2", R.frontal_area_mm2},
+        {"ref_area_mm2", ref_area_used_mm2},
+        {"reynolds_note", reynolds_note},
+        {"diverged", R.diverged},
+        // The C++ kernel keeps no drag history (the oracle's trace list); the panel's live
+        // sparkline is driven by the progress_path side-channel instead.
+        {"trace", nlohmann::json::array()},
+        {"cp_min", -3.0},  // legend clamp, same constants as the oracle
+        {"cp_max", 1.5},
+        {"vmax_mps", vmax_mps},
+        {"solver_notes", notes},
+        {"scalar_fields", nlohmann::json::array()},
+        {"overlay_pending", true},  // honest marker: no overlay_aicm/lines_aicm/slice_pngs yet
+        {"steps_run", R.steps_run},
+        {"converged", R.converged},
+        {"residual", R.residual},
+        {"voxel_mm", R.voxel_mm},
+        {"min_feature_mm", R.min_feature_mm},
+        {"min_feature_voxels", R.min_feature_voxels},
+        {"grid", {R.nx, R.ny, R.nz}},
+    };
+    if (!R.warning.empty()) out["warning"] = R.warning;
+    return out;
 }
 
 }  // namespace sim

@@ -42,7 +42,7 @@ def _legacy_engine_mode(monkeypatch):
 
 class TestAutosaveDir:
     def test_env_override_wins(self, monkeypatch, tmp_path):
-        """AI_CAD_AUTOSAVE_DIR env var takes precedence over engine.paths."""
+        """AI_CAD_AUTOSAVE_DIR env var takes precedence over services.paths."""
         monkeypatch.setenv("AI_CAD_AUTOSAVE_DIR", str(tmp_path))
         monkeypatch.delenv("APPDATA", raising=False)
         d = cad_tools._autosave_dir()

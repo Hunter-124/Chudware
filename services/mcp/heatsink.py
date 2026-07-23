@@ -202,7 +202,7 @@ def library_candidates(env_name: str, h_w_m2k: float,
     component footprint are dropped (they cannot cover the die/case). Returns
     (candidates, notice)."""
     try:
-        from engine_oracle.parts_hub import search as parts_search
+        from services.parts import search as parts_search
         records = parts_search("heatsink", domain="thermal", include_live=False,
                                limit=limit)
     except Exception as exc:  # noqa: BLE001

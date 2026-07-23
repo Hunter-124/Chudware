@@ -402,8 +402,8 @@ def test_ai_vc_timeline_is_branch_scoped(tmp_path):
 
 
 def test_rpc_registration():
-    from engine_oracle.parts_hub.plm_branch_rpc import PLM_BRANCH_METHODS
-    from engine_oracle.parts_hub.worker_rpc import WORKER_METHODS
+    from services.plm.worker_rpc import PLM_BRANCH_METHODS
+    from services.plm.worker_rpc import WORKER_METHODS
 
     for name in (
         "plm_branch_create",
@@ -417,7 +417,7 @@ def test_rpc_registration():
 
 
 def test_rpc_create_list_merge_end_to_end(tmp_path):
-    from engine_oracle.parts_hub.plm_branch_rpc import PLM_BRANCH_METHODS
+    from services.plm.worker_rpc import PLM_BRANCH_METHODS
 
     _write(tmp_path, "Bracket.step+", _part())
     v = Vault.open(tmp_path)

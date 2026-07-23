@@ -13,7 +13,7 @@ Rules encoded
    centre-to-centre dim marked ``needs_user_confirm=False`` (deterministic geometry);
    the single datum-offset dim is function-critical → ``needs_user_confirm=True``.
 
-2. **Tolerance defaults by process** (from ``engine_oracle.dfm.process_profiles``):
+2. **Tolerance defaults by process** (from the C++ DfM process profiles, core/dfm):
    the ``tolerance_band_mm`` maps onto an approximate IT grade via a documented table
    defined here.  CNC/lathe → IT7 (±0.010–0.025 mm band); FDM → IT12 (±0.10–0.20 mm);
    sheet/laser → IT10; injection → IT11.  The IT grade selects the standard
@@ -40,7 +40,38 @@ from typing import Any, Optional
 from mcp.server.fastmcp import FastMCP
 
 from mcp_server.cad_tools import _dumps, _err, _doc
-from engine_oracle.dfm.process_profiles import get_profile, resolve_process, KNOWN_PROCESSES
+
+# DfM process data (profiles, resolver, known-process list) now lives in the C++ core
+# (core/dfm/process_profiles.cpp); reached via core_bridge, lazily, so this module still
+# imports + runs its offline fixture mode with no engine present.
+def _get_profile(process: str) -> dict:
+    """dfm_get_profile RPC; raises ValueError on the oracle's unknown-process envelope."""
+    from mcp_server import core_bridge as cb
+    r = cb.call("dfm_get_profile", {"process": process})
+    if not r.get("ok"):
+        raise ValueError(r.get("error") or "dfm_get_profile failed")
+    return r.get("result") or {}
+
+
+def _resolve_process(request: str) -> dict:
+    """dfm_resolve_process RPC (the FDM-default resolver + ambiguity gate)."""
+    from mcp_server import core_bridge as cb
+    r = cb.call("dfm_resolve_process", {"request": request})
+    if not r.get("ok"):
+        raise ValueError(r.get("error") or "dfm_resolve_process failed")
+    return r.get("result") or {}
+
+
+def _known_processes() -> list:
+    """dfm_known_processes RPC; falls back to the static list when no bridge is up."""
+    try:
+        from mcp_server import core_bridge as cb
+        r = cb.call("dfm_known_processes", {})
+        if r.get("ok") and isinstance(r.get("result"), list):
+            return r["result"]
+    except Exception:  # noqa: BLE001
+        pass
+    return ["fdm", "cnc_mill", "lathe", "sheet_metal", "laser", "injection"]
 
 try:
     from mcp_server.cad_tools import _CB as _cb_module  # noqa: F401 — presence check
@@ -200,14 +231,14 @@ def _plan_from_entities(entities: list[dict], process: str, it_grade: int,
     ``hole_comp_mm`` is the process-specific diameter compensation that must be added to
     the nominal modeled diameter so the finished hole meets the nominal size.  FDM prints
     shrink inward (hole_comp_mm=+0.20 → model the hole 0.20 mm larger); CNC has no comp.
-    This is sourced from ``process_profiles.PROFILES[process].hole_comp_mm``
-    (engine_oracle/dfm/process_profiles.py) — never invented.
+    This is sourced from the DfM profile's ``params.hole_comp_mm`` (C++ core/dfm
+    process_profiles, via ``_get_profile``) — never invented.
     """
     # Pull the hole compensation from the DFM profile (real values, never invented).
     # get_profile() wraps the DFM fields under a "params" key; fall back to top-level
     # for forward-compatibility.
     try:
-        profile = get_profile(process)
+        profile = _get_profile(process)
         params = profile.get("params") or profile  # nested or flat
         hole_comp_mm: float = float(params.get("hole_comp_mm") or 0.0)
     except Exception:
@@ -396,11 +427,11 @@ def register_dimension_scheme_tools(mcp: FastMCP) -> None:
             resolved_process = "fdm"  # default prior
             if process:
                 try:
-                    prof = resolve_process(process + (f" {material}" if material else ""))
+                    prof = _resolve_process(process + (f" {material}" if material else ""))
                     resolved_process = prof.get("process", process) if isinstance(prof, dict) else process
                 except Exception:
                     resolved_process = process.lower().strip().replace(" ", "_")
-                    if resolved_process not in KNOWN_PROCESSES:
+                    if resolved_process not in _known_processes():
                         resolved_process = "fdm"
 
             it_grade = _it_grade_for_process(resolved_process)

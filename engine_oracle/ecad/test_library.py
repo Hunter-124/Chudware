@@ -400,7 +400,7 @@ def test_multiunit_symbol() -> None:
 def test_default_footprints_pin_subset_of_pads() -> None:
     print("\n[9] _DEFAULT_FOOTPRINTS pin numbers ⊆ footprint pads")
     from engine.ecad.library.starter import SYMBOLS, FOOTPRINTS
-    from engine.ecad.orchestrator import _DEFAULT_FOOTPRINTS
+    from services.ecad_design.orchestrator import _DEFAULT_FOOTPRINTS
 
     assert _DEFAULT_FOOTPRINTS, "_DEFAULT_FOOTPRINTS must be non-empty"
     for libid, fpid in _DEFAULT_FOOTPRINTS.items():

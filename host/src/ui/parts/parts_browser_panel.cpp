@@ -20,6 +20,7 @@
 
 #include "ui/widgets/web_view_backend.h"
 #include "ui/widgets/cef/cef_trace_file.h"
+#include "ui/web_capabilities.h"  // ui::webGapReason (T-RF12: vendor sign-in is desktop-only on web)
 
 #include "parts_internal.h"
 #include "parts_widgets.h"
@@ -336,6 +337,13 @@ void startLoginWizard(AppState& st, const std::string& site) {
     auto& w = W();
     WIZ_TRACE("startLoginWizard(site='%s') entry (starting=%d active=%d)",
               site.c_str(), (int)w.starting, (int)w.active);
+    // T-RF12: web (WASM) build — no CEF, no Playwright worker. Every sign-in entry
+    // point ("Connect vendor accounts", per-vendor "Sign in") funnels here, so one
+    // guard turns a dead wizard into an explained toast. Folds away on desktop.
+    if (const char* why = ui::webGapReason("vendor_signin")) {
+        st.toast(ui::ToastLevel::Info, why);
+        return;
+    }
     if (w.starting || w.active) return;
     w.starting                 = true;
     w.singleSite               = !site.empty();

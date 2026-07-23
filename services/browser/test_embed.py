@@ -1,4 +1,4 @@
-"""Tests for services/browser/embed.py + engine_oracle/embed_rpc.py.
+"""Tests for services/browser/embed.py + services/parts/embed_rpc.py.
 
 Same posture as test_browser_session.py: no real Playwright launch, no real
 network — the async Playwright driver is injected through EmbedManager's
@@ -16,7 +16,7 @@ import uuid
 
 import pytest
 
-from engine import paths as engine_paths
+from services import paths as engine_paths
 from services.browser import embed, profiles, session
 from services.browser.embed import EmbedManager, classify_login_state
 
@@ -158,7 +158,7 @@ def _make_manager(*, html="<html>content page</html>", broken_cdp=False,
 
 @pytest.fixture()
 def tmp_profiles(tmp_path, monkeypatch):
-    """Point the profile store at a tmp dir (no engine.paths reload needed)."""
+    """Point the profile store at a tmp dir (no services.paths reload needed)."""
     monkeypatch.setattr(engine_paths, "BROWSER_PROFILES", tmp_path / "profiles")
     yield tmp_path / "profiles"
 
@@ -605,10 +605,10 @@ def test_wizard_empty_site_list_is_all_done(tmp_profiles, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# RPC wrappers (engine_oracle/embed_rpc.py)
+# RPC wrappers (services/parts/embed_rpc.py)
 
 def _rpc():
-    from engine_oracle import embed_rpc
+    from services.parts import embed_rpc
     return embed_rpc
 
 
@@ -657,7 +657,7 @@ def test_rpc_wizard_wrappers(monkeypatch, tmp_profiles):
 
 
 def test_rpc_registered_on_worker_seam():
-    from engine_oracle.parts_hub.worker_rpc import WORKER_METHODS
+    from services.parts.worker_rpc import WORKER_METHODS
     # browser_embed_* (JPEG screencast transport) removed with the CEF migration;
     # what remains is the URL resolver + the sign-in wizard state machine.
     for name in ("browser_start_url",

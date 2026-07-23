@@ -25,7 +25,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from engine.research import firecrawl_pool  # noqa: E402
+from services.research import firecrawl_pool  # noqa: E402
 
 
 def _cmd_search(args: argparse.Namespace) -> int:

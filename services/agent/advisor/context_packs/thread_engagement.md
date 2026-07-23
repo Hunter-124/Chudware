@@ -1,5 +1,5 @@
 # Thread engagement context pack
-# Source: engine_oracle/research/data/feeds_speeds.json (tap_drill table);
+# Source: services/research/data/feeds_speeds.json (tap_drill table);
 #         Machinery's Handbook 31st ed. §Screw Thread Systems — Engagement;
 #         Shigley's Mechanical Engineering Design 10th ed. §8-2
 

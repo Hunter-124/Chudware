@@ -1,0 +1,48 @@
+{
+ "schema": "aicad.structure/1",
+ "name": "post_axial",
+ "units": "mm",
+ "elements": [
+  {
+   "element_type": "post",
+   "id": "post1",
+   "section_name": "100x100",
+   "material": "cedar",
+   "length_mm": 2000.0,
+   "transform": [
+    1.0,
+    0,
+    0,
+    0,
+    0,
+    1.0,
+    0,
+    0,
+    0,
+    0,
+    1.0,
+    0,
+    0,
+    0,
+    0,
+    1
+   ]
+  }
+ ],
+ "load_cases": [
+  {
+   "id": "lc1",
+   "kind": "dead",
+   "gravity": [
+    0,
+    0,
+    -1
+   ],
+   "factor": 1.0,
+   "point": {
+    "at_mm": 2000.0,
+    "p_n": 1000.0
+   }
+  }
+ ]
+}

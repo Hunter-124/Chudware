@@ -45,7 +45,7 @@ import uuid
 from typing import Any, Callable
 from urllib.parse import urlparse
 
-from engine.research.common import fail
+from services.research.common import fail
 
 from . import challenge, profiles, stealth
 

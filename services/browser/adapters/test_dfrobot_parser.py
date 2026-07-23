@@ -54,7 +54,7 @@ DFROBOT_CHALLENGE_HTML = """
 @pytest.fixture()
 def dfrobot_mod(tmp_path, monkeypatch):
     monkeypatch.setenv("APPDATA", str(tmp_path))
-    import engine.paths as engine_paths
+    import services.paths as engine_paths
     import services.browser.session as session
     import services.browser.adapters.dfrobot as dfrobot
     importlib.reload(engine_paths)

@@ -13,7 +13,7 @@ def text_part(text: str) -> dict:
 
 
 def image_part(path: str, mime: str = "image/png") -> dict:
-    # `mime` lets ingested previews (e.g. downscaled JPEG photos, engine.vision) ride the same slot
+    # `mime` lets ingested previews (e.g. downscaled JPEG photos, services.vision) ride the same slot
     # without being mislabeled png; adapters honor it and default to png for back-compat.
     return {"type": "image", "path": str(path), "mime": mime}
 

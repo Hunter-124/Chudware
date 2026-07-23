@@ -8,7 +8,7 @@
 #   - prerun_calcs: [{calc, inputs_from: match|literal, input_map: {param: group}}]
 #   - budget_tokens: per-pack cap (≤ advisory slot budget)
 #   - cooldown_turns: suppress re-injection while pack is still in context
-# Numbers in packs sourced from: engine_oracle/research/data/iso286.json,
+# Numbers in packs sourced from: services/research/data/iso286.json,
 #   feeds_speeds.json, calcs/snap_fit.py, calcs/wall_thickness.py, materials.json.
 
 schema: aicad.trigger/1
@@ -310,7 +310,7 @@ triggers:
 
   # T-DP3: sheet-metal bend — contract design_pipeline.md §8 "helper to add".
   # Fires the bend_allowance calc so a folded flange's flat length is computed,
-  # never recalled. Numbers: engine_oracle/research/calcs/bend_allowance.py.
+  # never recalled. Numbers: services/research/calcs/bend_allowance.py.
   - id: sheet_bend
     match:
       keywords:

@@ -31,8 +31,10 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Callable
 
-from engine import paths
-from engine.kernel import run_code_multi
+from services import paths  # engine_oracle/paths.py re-homed to services/ (T-RF20)
+# T-RF20: the build123d code executor was re-homed to services/kernel_exec.py (it needs a
+# Python interpreter by nature and stays services-side, NOT in engine_oracle).
+from services.kernel_exec import run_code_multi
 
 logging.basicConfig(stream=sys.stderr, level=logging.WARNING)
 log = logging.getLogger("ai-cad.worker")
@@ -119,11 +121,10 @@ _METHODS = {
     "list_editable_prompts": _list_editable_prompts,
 }
 
-# Format-matrix probe (doc_formats). import_file / export_file moved to the C++ core; the pure
-# format helpers in engine.doc.formats stay (engine.ecad.threed imports import_path).
-from engine.doc import formats as _formats  # noqa: E402
-
-_METHODS.update(_formats.WORKER_METHODS)
+# Format-matrix probe (doc_formats) — REMOVED 2026-07-22 (T-RF19): the matrix is C++
+# (core/doc/formats.cpp, dispatched via libaicad). import_file / export_file moved to the C++
+# core earlier; the pure helpers in engine.doc.formats stay (engine.ecad.threed imports
+# import_path) but no longer register worker methods.
 
 # C22a orchestrator (M9) — agent_run_v2 / get_prompts_v2 run in the C++ core (libaicad); only the
 # no-op agent_cancel remains in Python (the C++ core owns v2 run lifecycles now).
@@ -136,7 +137,7 @@ _METHODS.update({
 _STRUCTURED_ERROR_METHODS: set[str] = set()
 
 # ---- Supplier/vendor parts cache (registry only; vendor_part_insert runs in the C++ core) ----
-from engine import vendor_parts as _vendor_parts  # noqa: E402
+from services.parts import vendor_parts as _vendor_parts  # noqa: E402 — re-homed (T-RF20)
 
 _METHODS.update(_vendor_parts.WORKER_METHODS)
 _STRUCTURED_ERROR_METHODS.update(_vendor_parts.WORKER_METHODS.keys())
@@ -157,7 +158,7 @@ except Exception as _ecad_import_err:  # noqa: BLE001
 # when installed, builtin FDFD eigensolver + analytic uniform-guide model always. GPL solver
 # modules are imported lazily inside their adapter only (contracts/license_debt.md).
 try:
-    from engine.sim.em.worker_rpc import WORKER_METHODS as _EM_METHODS  # noqa: E402
+    from services.sim.em.worker_rpc import WORKER_METHODS as _EM_METHODS  # noqa: E402
     _METHODS.update(_EM_METHODS)
 except Exception as _em_import_err:  # noqa: BLE001
     import logging as _logging
@@ -180,19 +181,34 @@ except Exception as _deliv_import_err:  # noqa: BLE001
 # === end Deliverables ===
 
 # === Parts library seam (T-U2, Pillar 17) — part_search / part_get / part_place ===
-# Reaches the unified parts hub (engine_oracle/parts_hub/) over the same worker seam so the
-# C++/ImGui parts browser panel (ui/imgui/src/ui/parts_panel.cpp) fetches results
-# asynchronously via AsyncRpc with no bespoke transport.  Degrades gracefully when the hub
-# or its backing data is unavailable (returns empty results, never a traceback).
+# Reaches the unified parts hub (services/parts/, re-homed from engine_oracle/parts_hub/
+# in T-RF19) over the same worker seam so the C++/ImGui parts browser panel
+# (host/src/ui/parts/) fetches results asynchronously via AsyncRpc with no bespoke
+# transport.  Degrades gracefully when the hub or its backing data is unavailable
+# (returns empty results, never a traceback).
 try:
-    from .parts_hub.worker_rpc import WORKER_METHODS as _PARTS_METHODS  # noqa: E402
+    from services.parts.worker_rpc import WORKER_METHODS as _PARTS_METHODS  # noqa: E402
     _METHODS.update(_PARTS_METHODS)
 except Exception as _parts_import_err:  # noqa: BLE001
     import logging as _logging
     _logging.getLogger("ai-cad.worker").warning(
-        "engine_oracle.parts_hub.worker_rpc unavailable — part_search/get/place not registered: %s",
+        "services.parts.worker_rpc unavailable — part_search/get/place not registered: %s",
         _parts_import_err)
 # === end Parts library ===
+# === Agent GUI seams (T-RF19) — subscription_* / session_* / skills_* / triggers_* /
+# ai_roles_* / model_rankings_* / bench_* ===
+# These tables used to squat in engine_oracle/parts_hub/ and were folded into
+# services/agent/worker_rpc.py — thin wrappers over services.agent.* with zero parts
+# coupling. Registered from their real home now; same graceful-absent pattern.
+try:
+    from services.agent.worker_rpc import WORKER_METHODS as _AGENT_GUI_METHODS  # noqa: E402
+    _METHODS.update(_AGENT_GUI_METHODS)
+except Exception as _agent_gui_import_err:  # noqa: BLE001
+    import logging as _logging
+    _logging.getLogger("ai-cad.worker").warning(
+        "services.agent.worker_rpc unavailable — subscription_*/session_*/skills_*/"
+        "triggers_*/ai_roles_*/bench_* not registered: %s", _agent_gui_import_err)
+# === end Agent GUI seams ===
 # === Reverse Engineering seam — list/get/start_session/add_images/ingest_datasheet ===
 # Worker surface for the RE tab (host/src/ui/reveng/) + the Parts Library
 # "Reverse-engineer this part" delivery action.  Thin bridge over the reveng
@@ -200,12 +216,12 @@ except Exception as _parts_import_err:  # noqa: BLE001
 # with no bespoke transport.  Gracefully absent when the RE suite isn't installed
 # (the tab degrades to "Reverse Eng tools unavailable").
 try:
-    from .reveng_rpc import REVENG_WORKER_METHODS as _REVENG_METHODS  # noqa: E402
+    from services.reveng.worker_rpc import REVENG_WORKER_METHODS as _REVENG_METHODS  # noqa: E402
     _METHODS.update(_REVENG_METHODS)
 except Exception as _reveng_import_err:  # noqa: BLE001
     import logging as _logging
     _logging.getLogger("ai-cad.worker").warning(
-        "engine_oracle.reveng_rpc unavailable — reverse-engineering RPCs not registered: %s",
+        "services.reveng.worker_rpc unavailable — reverse-engineering RPCs not registered: %s",
         _reveng_import_err)
 # === end Reverse Engineering ===
 # === BOM / sourcing seam (T-U4) — REMOVED 2026-07-22 (T-RF18) ===
@@ -273,7 +289,7 @@ except Exception as _plm_import_err:  # noqa: BLE001
 # desktop Simulate workspace drives the SAME implementations as the MCP tools.
 # Gracefully absent; the GUI's sim_caps doctor shows honest guidance instead.
 try:
-    from engine.sim.multiphysics_rpc import WORKER_METHODS as _MPHYS_METHODS  # noqa: E402
+    from services.sim.multiphysics_rpc import WORKER_METHODS as _MPHYS_METHODS  # noqa: E402
     _METHODS.update(_MPHYS_METHODS)
 except Exception as _mphys_import_err:  # noqa: BLE001
     import logging as _logging

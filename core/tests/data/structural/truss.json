@@ -1,0 +1,173 @@
+{
+ "schema": "aicad.structure/1",
+ "name": "truss",
+ "units": "mm",
+ "elements": [
+  {
+   "element_type": "footing",
+   "id": "f1",
+   "section_name": "600x600",
+   "material": "concrete",
+   "length_mm": 200.0,
+   "transform": [
+    1,
+    0,
+    0,
+    0,
+    0,
+    1,
+    0,
+    0,
+    0,
+    0,
+    1,
+    -200,
+    0,
+    0,
+    0,
+    1
+   ]
+  },
+  {
+   "element_type": "footing",
+   "id": "f2",
+   "section_name": "600x600",
+   "material": "concrete",
+   "length_mm": 200.0,
+   "transform": [
+    1,
+    0,
+    0,
+    4800,
+    0,
+    1,
+    0,
+    0,
+    0,
+    0,
+    1,
+    -200,
+    0,
+    0,
+    0,
+    1
+   ]
+  },
+  {
+   "element_type": "beam",
+   "id": "bc1",
+   "section_name": "2x4",
+   "material": "df",
+   "length_mm": 2400.0,
+   "transform": [
+    0,
+    0,
+    1,
+    0,
+    0,
+    1,
+    0,
+    0,
+    1,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    1
+   ]
+  },
+  {
+   "element_type": "beam",
+   "id": "bc2",
+   "section_name": "2x4",
+   "material": "df",
+   "length_mm": 2400.0,
+   "transform": [
+    0,
+    0,
+    1,
+    2400,
+    0,
+    1,
+    0,
+    0,
+    1,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    1
+   ]
+  },
+  {
+   "element_type": "beam",
+   "id": "tc1",
+   "section_name": "2x4",
+   "material": "df",
+   "length_mm": 2683.281572999748,
+   "transform": [
+    0.4472135954999579,
+    0.0,
+    0.8944271909999159,
+    0,
+    0.0,
+    1.0,
+    0.0,
+    0,
+    -0.8944271909999159,
+    0.0,
+    0.4472135954999579,
+    0,
+    0,
+    0,
+    0,
+    1
+   ]
+  },
+  {
+   "element_type": "beam",
+   "id": "tc2",
+   "section_name": "2x4",
+   "material": "df",
+   "length_mm": 2683.281572999748,
+   "transform": [
+    -0.4472135954999579,
+    0.0,
+    0.8944271909999159,
+    2400,
+    0.0,
+    1.0,
+    0.0,
+    0,
+    -0.8944271909999159,
+    0.0,
+    -0.4472135954999579,
+    1200,
+    0,
+    0,
+    0,
+    1
+   ]
+  }
+ ],
+ "load_cases": [
+  {
+   "id": "lc1",
+   "kind": "live",
+   "gravity": [
+    0,
+    0,
+    -1
+   ],
+   "factor": 1.0,
+   "point": {
+    "at_mm": 1200.0,
+    "p_n": 5000.0
+   }
+  }
+ ]
+}

@@ -14,6 +14,7 @@ from .ecad_common import (
     _attach_board_ascii_readback,
     _autosave_all_open_ecad,
     _budget_timeout_err,
+    _compile_of,
     _default_out_dir,
     _default_outline_shapes,
     _dumps,
@@ -23,11 +24,86 @@ from .ecad_common import (
     _get_pcb,
     _get_sch,
     _outline_bbox,
+    _parts_extents,
+    _rpc,
     _run_with_budget,
     _zone_polygon,
     ecad_session,
     netlist_mod,
 )
+
+# Gerber filename extensions per layer id (Protel/KiCad fab-house standard) — the C++
+# ecad_export RPC returns {layer_id: content}; the file naming mirrors
+# engine.ecad.fab.gerber._LAYER_EXT so exported filenames are unchanged.
+_GERBER_LAYER_EXT: dict[str, str] = {
+    "F.Cu": ".GTL", "B.Cu": ".GBL",
+    "F.SilkS": ".GTO", "B.SilkS": ".GBO",
+    "F.Mask": ".GTS", "B.Mask": ".GBS",
+    "F.Paste": ".GTP", "B.Paste": ".GBP",
+    "Edge.Cuts": ".GM1",
+    "F.Fab": ".GM2", "B.Fab": ".GM3",
+    "F.CrtYd": ".GM4", "B.CrtYd": ".GM5",
+}
+
+
+def _gerber_ext(layer_id: str) -> str:
+    if layer_id in _GERBER_LAYER_EXT:
+        return _GERBER_LAYER_EXT[layer_id]
+    import re
+    m = re.match(r"^In(\d+)\.Cu$", layer_id)
+    if m:
+        return f".G{int(m.group(1)) + 1}"
+    return f".G_{layer_id.replace('.', '_')}"
+
+
+def _write_fab_files(session, kind: str, out_dir: str) -> dict[str, str]:
+    """C++ ecad_export (gerber/drill) -> files on disk; returns {layer_id|pth/npth -> path},
+    mirroring engine.ecad.fab.write_gerbers / write_drill."""
+    resp = _rpc("ecad_export", {"kind": kind, "doc_id": session.doc_id})
+    contents = resp.get("files") or {}
+    board_name = (session.doc.get("name", "board") or "board").replace(" ", "_")
+    os.makedirs(out_dir, exist_ok=True)
+    out: dict[str, str] = {}
+    for key, content in contents.items():
+        fn = (f"{board_name}{_gerber_ext(key)}" if kind == "gerber"
+              else f"{board_name}-{key.upper()}.drl")
+        p = os.path.join(out_dir, fn)
+        with open(p, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(content)
+        out[key] = p
+    return out
+
+
+def _fab_text(session, kind: str, file_key: str) -> str:
+    """C++ ecad_export single-text kinds (bom/cpl) -> the text payload."""
+    resp = _rpc("ecad_export", {"kind": kind, "doc_id": session.doc_id})
+    return (resp.get("files") or {}).get(file_key, "")
+
+
+def _board_bbox(doc: dict) -> tuple[float, float, float, float]:
+    """Copper extent + a small pad — local port of engine.ecad.autoroute._board_bbox's
+    no-outline fallback (there is no per-helper RPC; used to size a whole-board pour)."""
+    xs: list[float] = []
+    ys: list[float] = []
+    ext = _parts_extents(doc)  # footprint origins + pad offsets
+    if ext is not None:
+        xs += [ext[0], ext[2]]
+        ys += [ext[1], ext[3]]
+    for t in doc.get("tracks", []) or []:
+        for key in ("p1", "p2"):
+            p = t.get(key)
+            if isinstance(p, (list, tuple)) and len(p) == 2:
+                xs.append(float(p[0]))
+                ys.append(float(p[1]))
+    for v in doc.get("vias", []) or []:
+        p = v.get("at")
+        if isinstance(p, (list, tuple)) and len(p) == 2:
+            xs.append(float(p[0]))
+            ys.append(float(p[1]))
+    if not xs:
+        return (0.0, 0.0, 1.0, 1.0)
+    pad = 2.0
+    return (min(xs) - pad, min(ys) - pad, max(xs) + pad, max(ys) + pad)
 
 def register_ecad_pcb_tools(mcp: FastMCP) -> None:
     """ECAD PCB MCP tools (T-RF8 split of ecad_tools.py): ecad_new_pcb, run_drc, run_hostcheck, run_dfm, autoroute, zones, export, to_3d, net classes, stackup, make_board, board_from_schematic, autoplace, optimize_traces."""
@@ -76,12 +152,8 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
             return _err(e.message, hint="Open a board first.",
                         next_actions=["ecad_new_pcb('myboard')"])
         doc = session.doc
-        try:
-            from engine.ecad import drc as drc_mod
-            res = drc_mod.run_drc(doc)
-            violations = res if isinstance(res, list) else res.get("violations", [])
-        except Exception as e:  # noqa: BLE001
-            return _err(f"DRC engine error: {e}", hint="Inspect with ecad_status().")
+        res = _compile_of(session).get("drc", [])  # C++ compile runs engine.ecad.drc
+        violations = res if isinstance(res, list) else res.get("violations", [])
         summary = _erc_summary(violations)
         lines = _erc_lines(violations)
         worst = lines[:5]
@@ -138,7 +210,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
                         next_actions=["ecad_new_pcb('myboard')"])
         doc = session.doc
         try:
-            from engine.ecad import hostboard_rules as hb_mod
+            from engine.ecad import hostboard_rules as hb_mod  # STAYS (T-RF20): no C++ counterpart
             violations = hb_mod.run_hostcheck(doc)
         except Exception as e:  # noqa: BLE001
             return _err(f"hostcheck engine error: {e}", hint="Inspect with ecad_status().")
@@ -186,14 +258,11 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
             return _err(e.message, hint="DFM needs an open board.",
                         next_actions=["ecad_new_pcb('myboard')"])
         doc = session.doc
-        try:
-            from engine.ecad import dfm as dfm_mod  # lazy import
-        except Exception as e:  # noqa: BLE001
-            return _err(f"DFM engine error: {e}", hint="Inspect with ecad_status().")
         # DFM walks every pad/track/courtyard — on a dense board it can run long. Budget-guard so an
         # overrun never times out the transport and kills the server (Gap (b)).
         _autosave_all_open_ecad()
-        status, violations = _run_with_budget(lambda: dfm_mod.run_dfm(doc))
+        status, dfm_resp = _run_with_budget(
+            lambda: _rpc("ecad_dfm", {"doc_id": session.doc_id}))
         if status == "timeout":
             return _budget_timeout_err(
                 "DFM check",
@@ -201,7 +270,8 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
                          "silk/copper, or check DRC first (ecad_run_drc).",
                 next_actions=["ecad_run_drc()", "ecad_status()"])
         if status == "error":
-            return _err(f"DFM engine error: {violations}", hint="Inspect with ecad_status().")
+            return _err(f"DFM engine error: {dfm_resp}", hint="Inspect with ecad_status().")
+        violations = dfm_resp.get("violations", []) if isinstance(dfm_resp, dict) else []
         summary = _erc_summary(violations)
         lines = _erc_lines(violations)
 
@@ -287,7 +357,6 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
         except OpError as e:
             return _err(e.message, hint="Routing needs an open board.",
                         next_actions=["ecad_new_pcb('myboard')"])
-        from engine.ecad import rpc as ecad_rpc
         opts: dict = {}
         if pitch and pitch > 0:
             opts["pitch"] = float(pitch)
@@ -304,8 +373,8 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
         # The Lee/A* router over a fine grid is one of the heaviest ECAD ops — budget-guard so an
         # overrun never times out the transport and kills the server (Gap (b)).
         _autosave_all_open_ecad()
-        status, resp = _run_with_budget(lambda: ecad_rpc._ecad_autoroute(
-            {"doc_id": session.doc_id, "opts": opts}, lambda _d: None))
+        status, resp = _run_with_budget(lambda: _rpc(
+            "ecad_autoroute", {"doc_id": session.doc_id, "opts": opts}))
         if status == "timeout":
             return _budget_timeout_err(
                 "autoroute",
@@ -466,13 +535,12 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
             return _err("the board has no copper pours to fill",
                         hint="Add a ground/power pour first.",
                         next_actions=["ecad_add_zone('GND')  # whole-board ground pour"])
-        from engine.ecad import rpc as ecad_rpc
         # Full-resolution zone fill rasterizes the whole board at 0.1mm (~1/res^2 cells) — a big or
         # fine-grid pour can run long. Budget-guard so an overrun never times out the transport and
         # kills the server (Gap (b); this was the make_board trigger in adb46f62).
         _autosave_all_open_ecad()
         status, resp = _run_with_budget(
-            lambda: ecad_rpc._ecad_fill_zones({"doc_id": session.doc_id}, lambda _d: None))
+            lambda: _rpc("ecad_fill_zones", {"doc_id": session.doc_id}))
         if status == "timeout":
             return _budget_timeout_err(
                 "zone fill",
@@ -529,7 +597,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
                             next_actions=["ecad_new_schematic('myfpga')",
                                           "ecad_place_symbol('FPGA:iCE40UP5K-SG48', 100, 100)"])
             try:
-                from engine.ecad import fpga
+                from engine.ecad import fpga  # STAYS (T-RF20): no C++ counterpart
             except Exception as e:  # noqa: BLE001
                 return _err(f"fpga module unavailable ({type(e).__name__}: {e})")
             nl = netlist_mod.build_netlist(session.doc)
@@ -565,23 +633,16 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
             return _err(e.message, hint="Export needs an open board.",
                         next_actions=["ecad_new_pcb('myboard')"])
         doc = session.doc
-        try:
-            from engine.ecad import fab
-        except Exception as e:  # noqa: BLE001
-            return _err(f"fab writers unavailable ({type(e).__name__}: {e})",
-                        hint="The engine.ecad.fab package failed to import.")
         out_dir = path or str(_default_out_dir(doc.get("name", "board")))
         try:
             if kind == "gerber":
-                os.makedirs(out_dir, exist_ok=True)
-                files = fab.write_gerbers(doc, out_dir)
+                files = _write_fab_files(session, "gerber", out_dir)
                 result = {"kind": "gerber", "dir": out_dir, "files": files}
             elif kind == "drill":
-                os.makedirs(out_dir, exist_ok=True)
-                files = fab.write_drill(doc, out_dir)
+                files = _write_fab_files(session, "drill", out_dir)
                 result = {"kind": "drill", "dir": out_dir, "files": files}
             elif kind == "bom":
-                text = fab.write_bom(doc, fmt="csv")
+                text = _fab_text(session, "bom", "bom")
                 fp = path or os.path.join(out_dir, "bom.csv")
                 os.makedirs(os.path.dirname(fp) or ".", exist_ok=True)
                 with open(fp, "w", encoding="utf-8") as fh:
@@ -591,7 +652,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
                 result = {"kind": "bom", "path": fp,
                           "rows": max(0, text.count("\n") - 1)}
             elif kind == "placement":
-                text = fab.write_placement(doc)
+                text = _fab_text(session, "cpl", "cpl")
                 fp = path or os.path.join(out_dir, "placement.csv")
                 os.makedirs(os.path.dirname(fp) or ".", exist_ok=True)
                 with open(fp, "w", encoding="utf-8") as fh:
@@ -655,7 +716,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
         _autosave_all_open_ecad()
 
         def _build():
-            from engine.ecad.threed import board_to_step  # lazy import; pulls in OCP/build123d
+            from engine.ecad.threed import board_to_step  # STAYS (T-RF20): no C++ counterpart; lazy import (OCP/build123d)
             return board_to_step(doc, out_path)
 
         bstatus, bval = _run_with_budget(_build)
@@ -770,7 +831,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
                 return _err(f"nets is not a valid list: {nets!r}")
         try:
             import copy as _copy
-            from engine.ecad import si_rules as si_mod
+            from engine.ecad import si_rules as si_mod  # STAYS (T-RF20): no C++ counterpart
             new_doc = _copy.deepcopy(session.doc)
             res = si_mod.set_net_class(new_doc, str(name), params or {}, nets or [])
             ecad_session.swap_doc(session, new_doc)
@@ -824,7 +885,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
         min_space).
         """
         try:
-            from engine.ecad import stackup as stackup_mod  # lazy import
+            from engine.ecad import stackup as stackup_mod  # STAYS (T-RF20): no C++ counterpart; lazy import
         except ImportError as e:  # noqa: BLE001
             return _err(f"stackup engine unavailable ({e})",
                         hint="engine.ecad.stackup could not be imported.",
@@ -998,8 +1059,6 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
         _ECAD["current"] = pcb_sess.doc_id
         _step("new_pcb", {"ok": True}, f"board '{pcb_name}' created ({pcb_sess.doc_id})")
 
-        from engine.ecad import rpc as ecad_rpc
-
         # The full sync->route->fill->DRC flow is the heaviest ECAD entry point — it was the
         # original transport-timeout trigger (adb46f62 fixed the 100x100 GND-pour symptom; this
         # bounds the whole flow). Run it under ONE wall-clock budget so its TOTAL time can never
@@ -1011,8 +1070,8 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
             # ---- 2. sync schematic -> board ----
             sync_ok = False
             try:
-                sync_resp = ecad_rpc._ecad_update_from_sch(
-                    {"board_doc_id": pcb_sess.doc_id, "sch_doc_id": sch_id}, lambda _: None)
+                sync_resp = _rpc("ecad_update_from_sch",
+                                 {"board_doc_id": pcb_sess.doc_id, "sch_doc_id": sch_id})
                 sync_rep = sync_resp.get("report", {})
                 added = sync_rep.get("added", [])
                 ratsnest = sync_resp.get("compile", {}).get("ratsnest", []) or []
@@ -1026,8 +1085,8 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
             # ---- 3. autoroute ----
             ar_ok = False
             try:
-                ar_resp = ecad_rpc._ecad_autoroute(
-                    {"doc_id": pcb_sess.doc_id, "opts": {}}, lambda _: None)
+                ar_resp = _rpc("ecad_autoroute",
+                               {"doc_id": pcb_sess.doc_id, "opts": {}})
                 ar_rep = ar_resp.get("report", {})
                 routed = ar_rep.get("routed", [])
                 failed = ar_rep.get("failed", [])
@@ -1090,6 +1149,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
             # ---- 4. fill zones (add GND zone automatically if board has none) ----
             fill_ok = False
             try:
+                ecad_session.tree(pcb_sess)  # refresh: sync+autoroute advanced the C++ doc
                 pcb_doc = pcb_sess.doc
                 if not pcb_doc.get("zones"):
                     # add a whole-board GND zone (need a bounding box for the polygon).
@@ -1100,17 +1160,16 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
                         # 100x100 zone filled at 0.1 mm resolution is ~1e6 cells (~5 s); for a small
                         # board that overran the MCP transport timeout in this SYNCHRONOUS flow, the
                         # server was killed, and every ECAD doc (Python, no autosave) was lost. The
-                        # tight extent fills in ~0.1 s. (engine.ecad.autoroute._board_bbox already
-                        # returns the copper extent + a small pad when there is no outline.)
-                        from engine.ecad import autoroute as _ar_bbox
-                        bx0, by0, bx1, by1 = _ar_bbox._board_bbox(pcb_doc)
+                        # tight extent fills in ~0.1 s. (_board_bbox already returns the copper
+                        # extent + a small pad when there is no outline.)
+                        bx0, by0, bx1, by1 = _board_bbox(pcb_doc)
                         m = 5.0  # pour margin beyond the copper
                         poly = (bx0 - m, by0 - m, bx1 + m, by1 + m)
                     x0, y0, x1, y1 = poly
                     poly_pts = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
                     _apply(pcb_sess, [{"op": "pcb_add_zone", "net": "GND", "layer": "F.Cu",
                                        "polygon": poly_pts}])
-                fill_resp = ecad_rpc._ecad_fill_zones({"doc_id": pcb_sess.doc_id}, lambda _: None)
+                fill_resp = _rpc("ecad_fill_zones", {"doc_id": pcb_sess.doc_id})
                 fs = fill_resp.get("fill_summary", {})
                 fill_ok = True
                 _step("fill_zones", {"ok": True},
@@ -1121,8 +1180,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
             # ---- 5. DRC ----
             drc_errors = 0; drc_warnings = 0; drc_lines: list[str] = []
             try:
-                from engine.ecad import drc as drc_mod
-                violations = drc_mod.run_drc(pcb_sess.doc)
+                violations = _compile_of(pcb_sess).get("drc", [])
                 if isinstance(violations, dict):
                     violations = violations.get("violations", [])
                 drc_sum = _erc_summary(violations)
@@ -1138,7 +1196,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
             hb_errors = 0; hb_warnings = 0; hb_lines: list[str] = []
             if hostcheck:
                 try:
-                    from engine.ecad import hostboard_rules as hb_mod
+                    from engine.ecad import hostboard_rules as hb_mod  # STAYS (T-RF20): no C++ counterpart
                     hb_v = hb_mod.run_hostcheck(pcb_sess.doc)
                     hb_sum = _erc_summary(hb_v)
                     hb_errors = hb_sum["errors"]

@@ -84,7 +84,7 @@ def test_overlay_merges_into_graph(tmp_path: Path):
 
 
 def test_overlay_link_rpc(tmp_path: Path):
-    from engine_oracle.parts_hub.cad_graph_rpc import CAD_GRAPH_METHODS
+    from services.plm.worker_rpc import CAD_GRAPH_METHODS
 
     def _emit(*_a, **_k):
         pass

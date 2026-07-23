@@ -2872,3 +2872,866 @@ gap in cost_tools.py:87 — flipped to `cb.call`). Structural suite 140/140 afte
 fix; `test_datasheet_ingest.py::test_extraction_ok` fails for an environmental reason
 (docling not installed — reproduces on pre-deletion code, pre-existing). Manual
 regenerated (drift clean, 344/344).
+
+---
+
+## R4e evaluation A (intake, reveng_rpc)
+
+Verdicts (no code changed — analysis only). **engine_oracle/intake (1,424 ln): re-home to
+services/, do NOT port to core/.** Pure stdlib decision logic over plain dicts (metrology
+confidence tiers, critical-dim ledger/gate, fit report) whose only production consumer is
+`services/mcp/intake_tools.py:26` (8 MCP tools); the host GUI never calls it (no intake RPC
+exists — `intake_status` is an MCP tool name, absent from `contracts/worker_rpc.md` and the
+libaicad dispatch, so the `contracts/web_parity.md` `web_unsupported` entry is a mis-listed
+MCP tool the probe will trivially fail forever; remove it at leaf-7 closeout with the same
+justification as `ecad_import_kicad`). Coupling flag for the integrator: intake imports
+`engine.dfm.process_profiles` (leaf 6) — sequence leaf 7 after leaf 6's port/re-home decision;
+recommended joint verdict is services-side re-home for both (static process data + policy, no
+kernel geometry). **engine_oracle/reveng_rpc.py (501 ln): re-home to services/ (e.g.
+`services/reveng/worker_rpc.py`), keep the worker-RPC seam.** It is the GUI-facing worker
+bridge (registered `engine_oracle/worker.py:203`) for the C++ RE tab
+(`host/src/ui/reveng/reveng_workspace.cpp:89,673`, `sources_panel.cpp:145`,
+`parts_workspace.cpp:588`) and `services/mcp/parts_tools.py:537`; it delegates to the T-RF8
+`services/mcp/reveng_*` layer, which drives `engine_oracle/vision/*` (colmap/ffwd_sfm/
+dense_backends/mesh_cleanup/segment_fit/cad_recode/datasheet_ingest/research_ingest/
+capture_server — cv2/trimesh/docling/external-tool orchestration). Port-to-core subset: NONE —
+the GUI consumes outputs as files (mesh_path/splat_path); the whole 9,145-ln vision stack is
+services-side orchestration and should re-home wholesale (services/vision or
+services/reveng/). Deleting either module breaks live surfaces (RE tab, Parts-Library
+reverse-engineer action, 20+ reveng MCP tools, DAG reveng mission templates,
+`verify.py` reveng_deviation gate) — neither is dead.
+
+---
+
+## R4e evaluation B (vision, research)
+
+Verdicts (no code changed — analysis only). **engine_oracle/vision (6,046 ln): re-home
+wholesale to `services/vision/`, port NOTHING to core/.** It is external-tool orchestration
+(COLMAP/OpenMVS/Brush subprocess pipelines, cv2 fiducials, trimesh cleanup, docling/pdfplumber
+datasheet ingest) returning file paths + ok:false envelopes; the host RE tab never imports it —
+it calls `reveng_*` worker RPCs (`host/src/ui/reveng/reveng_workspace.cpp:287,673`,
+`sources_panel.cpp:277`, `webcam_capture.cpp:415`, `parts_workspace.cpp:588`) bridged by
+`engine_oracle/reveng_rpc.py` (eval A: re-home that too). Live consumers:
+`services/mcp/reveng_common.py` (14 lazy sites), `reveng_build_tools.py:98,164`,
+`reveng_session_tools.py:171,504`, `recon_tools.py:1616-1665`, `intake_tools.py:29`
+(module-level `from engine import vision` — PhotoRegistry/measure_from_photo),
+`services/installer/provision.py:123`. Two dead-ish exceptions to the wholesale move:
+`vision/reveng_session.py` (367 ln — superseded by T-RF8 `services/mcp/reveng_session_tools.py`;
+only its own test imports it → delete with test) and `vision/scale_solver.py` (394 ln — no
+production caller; exercised only by `services/mcp/test_reveng_e2e_scan.py`; RE-09 roadmap item,
+keep-with-rehome unless integrator rules it dead).
+**engine_oracle/research (5,087 ln): re-home to `services/research/`, NOT core — zero
+engine-path imports** (doc/feature/sim/structural clean; the `structural/code_check.py:343`
+mention is docstring-only). Consumers are all services-side: `services/mcp/research_tools.py:28`,
+`cam_tools.py:498,537,564`, `interface_check_tools.py:427`, `services/agent/advisor/`
+(engine.py:167, triggers.py:920-943, prefill.py:194, sim_advisor.py:133),
+`services/agent/geometry_helpers.py` (7 sites), `services/browser/` (common.fail/now_ts only),
+`vision/research_ingest.py` (sys.modules seam on "engine_oracle.research" — the ordering-safe
+lazy-resolution pattern must be preserved across the rename), plus tools/{firecrawl_pool,
+scrape_knowledge}.py and tools/flywheel/bench/roundtrip_pipeline.py. services/dag imports NO
+research (board-prompt assumption wrong; only reveng mission-template keyword strings).
+Coupling flag: `core/cam/feeds.cpp` is already the C++ port of `research/machining.py`, and
+`core/tests/test_cam.cpp` byte-parity-reads `engine_oracle/research/data/machines.json` via
+`AICAD_TEST_MACHINES` (`core/CMakeLists.txt:471`) — the re-home must update that one CMake path
+(data/*.json travels with the module). Neither module appears in `contracts/web_parity.md` or
+`scripts/web_parity_probe.py`: both run server-side (research behind the MCP stdio server,
+vision behind MCP + hostd worker RPC), so the web story needs no port — only import fixups
+(~25 production sites vision, ~20 research, plus tests) and the one CMake path.
+
+---
+
+## T-RF19 leaf 1 (engine_oracle/doc formats cutover)
+
+Inventory: `engine_oracle/doc/formats.py::WORKER_METHODS` registers exactly ONE worker
+method — `doc_formats` (the import/export format matrix, D4). `import_file` /
+`export_file` were already removed from the Python surface when the doc engine went
+C++ (dispatch `core/api/libaicad.cpp:3311,3345`; minting routing
+`services/worker/worker_client.cpp:112`). Ported `doc_formats` to C++:
+`aicad::doc::FormatInfo` + `format_registry()` in `core/doc/formats.{h,cpp}`
+(byte-parity with the oracle's `FORMAT_REGISTRY`, all 16 rows in order),
+`aicad::doc::doc_formats()` payload builder in `core/doc/session.{h,cpp}` returning
+`{"formats":[...]}`. Parity pinned by `core/tests/test_formats_registry.cpp`
+(registered in `core/CMakeLists.txt` as test `formats_registry`): semantic equality
+of the payload against the captured oracle `list_formats()` dump, per-row field
+compare, `detect_format` ⇐ registry lockstep, unknown-extension OpError. Files
+touched: `core/doc/formats.{h,cpp}`, `core/doc/session.{h,cpp}`,
+`core/tests/test_formats_registry.cpp` (new), `core/CMakeLists.txt`. INTEGRATOR
+WIRING (integrator-owned files, not done by this leaf): (1) dispatch arm in
+`core/api/libaicad.cpp` next to `doc_list_ops` — `if (m == "doc_formats") return
+emit(aicad::doc::doc_formats(), out_json, 0);` (2) routing in
+`services/worker/worker_client.cpp::routeDocToCpp` — `doc_formats` carries no doc_id,
+so add `if (method == "doc_formats") return true;` beside the `parts_catalog_list`
+rule (with the same engine::ensureLoaded guard pattern as the T-RF18 block).
+ORACLE DELETION RECOMMENDATION: `formats.py` can only be PARTIALLY deleted at merge —
+delete `_handler_doc_formats`/`WORKER_METHODS`/`list_formats`/`FORMAT_REGISTRY` plus
+the `engine_oracle/worker.py:122-126` registration once the C++ dispatch is wired,
+but `import_path`/`export_document` and the mesh/3dm/3mf lanes must STAY:
+`engine_oracle/ecad/threed.py:547` imports `import_path` (ECAD leaf's cutover), and
+`engine_oracle/doc/tessellate.py` stays for `engine_oracle/sim/{worker,foam_post,
+overlay}.py` (sim leaf). `engine_oracle/doc/op_registry.py` stays only as the
+offline fallback in `services/mcp/op_vocab.py:20-26` (prefers libaicad
+`doc_list_ops`) and `services/agent/test_mega8_op_vocab.py` — deletable when MCP
+fallbacks are retired (integrator scope). No method is dead: `doc_formats` has no
+first-party caller today (host `feature_tree.cpp:3124` calls it "the future dynamic
+source") but is a live registered worker method, so it was ported rather than
+deleted. Gotcha: the oracle matrix lists lanes (3mf/3dm import, dxf export …) the
+C++ import/export paths still reject with precise errors — the matrix is
+byte-identical to the oracle anyway (capability honesty lives at the call sites,
+same as today).
+
+T-RF12 (node R2c) — web degradation UX. Added the web-build capability seam:
+`host/src/ui/web_capabilities.{h,cpp}` (new, in `BILLET_CORE_SOURCES` so native
+and WASM share it) — `ui::webBuild()` is constexpr on `__EMSCRIPTEN__`, and
+`ui::webGapReason(surfaceId)` answers from ONE static table (`kWebGaps`): panel
+surface ids `web_browser` / `vendor_signin` / `account_signin` (CEF- or
+Python-token-store-dependent) and the ribbon cmd_id `ecad_ai_design`
+(python-only `ecad_design`, mirrors `contracts/web_parity.md` web_unsupported;
+removal task T-RF20 noted in the string). On native every query folds to
+nullptr, so desktop behavior is unchanged by construction. Gated surfaces:
+(a) `host/src/ui/widgets/ribbon.cpp` `ribbon_dynDisabledReason` now falls
+through to `webGapReason(cmd_id)` after the SimManager EM-prefix gate — any
+ribbon cmd_id listed in the table renders disabled with the gap reason as its
+tooltip (gating, not deletion; commands still route, feature_surface_audit
+stays green); (b) `host/src/ui/web_panel.cpp` — the `!available()` branch shows
+the table's "desktop only" copy on web, keeps the SDK-less-CI message on
+desktop; (c) `host/src/ui/parts/parts_browser_panel.cpp` `startLoginWizard` —
+choke-point guard: every vendor sign-in entry ("Connect vendor accounts",
+per-vendor "Sign in") funnels here, so one early return + toast covers the
+wizard on web; (d) `host/src/ui/settings_modal.cpp` `drawSubscriptionAccounts` —
+Sign in / Add-another-account button renders `BeginDisabled` + the gap reason
+as tooltip (AllowWhenDisabled) on web. Verified: `ninja -C host/build-linux
+Billet` green (one rebuild needed after a T-RF13 leaf raced renderer.cpp
+mid-edit — `Renderer::initQualityPolicy` undefined at link, gone on rebuild);
+`python3 scripts/check.py` all 5 gates PASS; m1 shot exit 0 (native unchanged);
+WASM `cmake --build host/build-wasm --target Billet` exit 0, Billet.wasm links
+with web_capabilities.cpp in the target. DEFERRED (outside leaf write-set,
+recommend integrator follow-up): the title-bar Web chip click itself
+(`host/src/ui/title_bar.cpp:759` — currently opens the panel, which now shows
+the honest message; a disabled-chip affordance needs title_bar.cpp), the ECAD
+launchpad "Design with AI"/"AI Board" buttons (`host/src/ui/ecad/ecad_panel.cpp:1269-1283`
+— ribbon entry is gated, the in-panel buttons are not), and the per-vendor
+button-level disabled state (`host/src/ui/parts/parts_vendors.cpp:233` — covered
+by the startLoginWizard toast instead). No contracts edit: `web_parity.md`'s
+web_unsupported list is accurate as-is (only `ecad_design` has a ribbon/PM
+entry; hydraulic/pipe/struct/tolerance/render_part/intake have no host UI
+entry points — `render_part` appears only in a static MCP tool-family list in
+settings_modal.cpp, not a UI command).
+
+T-RF19 leaf 6 (small oracle modules): ported 4 of 5 to core, requirements is
+services-side. VERDICTS — (1) `tolerance/` PORTED to `core/tolerance/stackup.{h,cpp}`
+(live consumer: services/mcp/tolerance_tools.py `stackup_analyze`; contracts/
+web_parity.md web_unsupported). (2) `mechanical/` PORTED to
+`core/mechanical/mechanical.{h,cpp}` (live: services/mcp/mechanical_tools.py
+`gear_check`/`bearing_life`). (3) `materials/` PORTED to
+`core/materials/materials.{h,cpp}` (live: services/mcp/cam_tools.py CAM seam,
+services/mcp/cad_common.py FEA `_MATERIALS`/`_MATERIAL_ALIASES` seam,
+engine_oracle/research/material_lookup.py, engine_oracle/dfm density defaults;
+core/cam/feeds.cpp already reads the same registry.json — the C++ lib resolves the
+path EXACTLY like feeds.cpp: `AICAD_MATERIALS_REGISTRY` env, then appdata
+materials/registry.json, so there is still ONE seed file). `materials/
+export_sim_json.py` is dev codegen (regenerates the host-GUI sim mirror), not an
+engine port target — re-home to tools/ at oracle deletion. (4) `dfm/` PORTED to
+`core/dfm/process_profiles.{h,cpp}` (live: services/mcp/intake_tools.py,
+services/mcp/dimension_scheme_tools.py, services/agent/geometry_helpers.py;
+links aicad_materials for the T-F2 density defaults). (5) `requirements/` NOT
+PORTED — services-side concern: pure aicad.req/1 doc-CRUD/schema layer whose only
+consumers are services-side Python (services/mcp/req_tools.py +
+layout_plan_tools.py, services/dag/verify.py via req_tools, services/verify/
+battery.py's VALID_STATUSES import, tools/flywheel elicitation bench); zero worker
+_METHODS, zero host/ usage; integrator should re-home under services/ (not core)
+at oracle deletion. Each ported lib is PURE (OCCT-free) with a single
+`bool call(method, params, result, err)` dispatch entry; methods: stackup_analyze;
+gear_check/bearing_life; material_get/density/resolve_key/fea_table/fea_aliases/
+cam_data/cam_id/cam_materials/material_all; dfm_known_processes/get_profile/
+resolve_process/fit_clearance/modeled_dim/process_block_text. PARITY: golden
+fixtures generated from the LIVE oracle (`core/tests/data/gen_r4e6_fixtures.py`
+→ tolerance/mechanical/materials/dfm.json, 82 cases incl. error envelopes) replayed
+through the C++ dispatch in core/tests/test_{tolerance,mechanical,materials,dfm}.cpp
+with deep JSON equality — all green, plus unit suites mirroring the oracle's own
+pytest vectors. CMake: four static libs + four ctests added after the sourcing
+block; the four libs appended to the `aicad` SHARED link line. INTEGRATOR WIRING:
+route the new methods in core/api/libaicad.cpp dispatch (pattern: `json r; std::
+string err; if (aicad::tolerance::call(m, params, r, err)) {...}` chained like the
+T-RF18 sourcing glue at libaicad.cpp:3837), then flip services/worker routing and
+the four MCP call-sites (tolerance_tools, mechanical_tools, cam_tools `_resolve_
+cam_material`, cad_common `_MATERIALS`) to the core RPC; dfm consumers
+(intake_tools, dimension_scheme_tools, geometry_helpers) follow. Python subtleties
+replicated: round() half-even, stable sensitivity sort, dict-insertion-order
+max/tie-breaks in the resolver, repr-style error strings, int-vs-float JSON types.
+GOTCHAS: core/CMakeLists.txt + core/structural are shared with leaf 5 (one
+configure raced its mid-write file creation; re-running configure fixed it, no
+edit made). Verified: full ninja build (358 targets) green; ctest 74/76 — the
+only reds are EXTERNAL to this leaf: `structural` (leaf 5's own in-flight
+numeric asserts, tests/test_structural.cpp:56) and `cam` (pre-existing
+AICAD_TEST_MACHINES define at HEAD points at engine_oracle/research/data/
+machines.json, which another T-RF19 leaf deleted mid-flight with
+engine_oracle/research/ — test_cam.cpp:1574 missing-file REQUIRE; both fail
+identically with my changes reverted). `ctest -E '^(cam|structural)$'` =
+74/74 PASS; my four suites (tolerance/mechanical/materials/dfm) 4/4 PASS.
+
+## 2026-07-22 — node R3a (T-RF13): WASM adaptive-quality ladder (leaf)
+
+Implemented the dynamic quality ladder diagnosed in PERF_AUDIT_2026-07-16.
+`host/src/renderer.{h,cpp}`: new `Renderer::QualityStep` (FULL/HIGH/MED/LOW)
+driven by a ~30-frame frame-time EMA fed via `noteFrame()` from the viewport
+loop (io.DeltaTime carries the vsync-cliff signal); step down when EMA > 20 ms
+sustained 0.25 s, step up when EMA < 12.5 ms sustained 1.0 s (hysteresis).
+Cost sites: MSAA sample count is now quality-indexed (`msaaRequest_` in
+`allocTargets`, GLES3 only), render scale (FULL..MED = 1.0, LOW = 0.60) shrinks
+the render/resolve/blur targets (new `rw_/rh_` presentation size; the ImGui
+image stretch upscales), and Kawase backdrop blur passes are quality-indexed
+(4/4/2/1). Policy: WASM = adaptive starting at MED (climbs to FULL if fast),
+native desktop = pinned FULL (zero behavior change). Env overrides read once in
+`initQualityPolicy()`: `AI_CAD_QUALITY_ADAPTIVE=0|1`,
+`AI_CAD_QUALITY_STEP=full|high|med|low` (pin), `AI_CAD_QUALITY_FORCE_MS=<f>`
+(synthetic frame time for deterministic ladder tests), `AI_CAD_QUALITY_LOG=1`
+(stderr transitions + periodic status). `host/src/ui/viewport_panel.cpp`:
+`noteFrame()` hook after `renderer.resize`, overlay width scale now folds in
+`renderScale()` so authored line widths stay constant under upscale, and a
+subtle bottom-right HUD chip ("MED · 33 ms", palette.textDim @ 0.65 alpha)
+shown only when adaptive and below FULL. Verified: native build green; m1 shot
+exit 0 + pixel-plausible (native default FULL — unchanged);
+forced-adaptive native runs prove the ladder both directions (FORCE_MS=40:
+MED→LOW; FORCE_MS=5: MED→HIGH→FULL, periodic status lines stable at FULL);
+pinned-LOW m1 shot exit 0 with the HUD chip visible and edge-picking intact at
+0.6 scale (render-scale + id-pass consistency proven); `python3 scripts/check.py`
+all 5 gates PASS; WASM `cmake --build host/build-wasm --target Billet` green.
+Gotchas: id-pass picking, `cam_.vpWidth/Height`, and `averageLuminance` all map
+by ratio so they are render-scale invariant — do NOT "fix" them to rw_/rh_.
+`readRGBA()` now returns rw_×rh_ (== w_×h_ at FULL); the CLI render tools in
+main.cpp assume w×h and are only wrong under an explicit debug pin. DEFERRED /
+gaps: (1) no browser perf-beacon change — `POST /perf/client` exists in
+`Webservice/gateway/perf_client.py` but NOTHING in the WASM client or the app
+shell emits beacons today, and the gateway whitelist (`boot_ms/fps/rpc_ms/ua`)
+lives outside this leaf's write-set; adding a `quality` field is a one-line
+gateway edit + a new client emitter (integrator follow-up). (2)
+`Webservice/perf/baseline.json` untouched — the perf_probe measures WS RPC
+latency (needs BILLET_LIVE=1 against the live deployment) and cannot observe
+client-side GPU fill. (3) No real weak-iGPU hardware here — ladder thresholds
+(20/12.5 ms, 0.25/1.0 s dwell) and the LOW scale (0.60) are reasoned defaults,
+validated only under llvmpipe with synthetic frame times; tune on a real
+UHD-620-class browser. (4) Desktop Settings opt-in for adaptive not added (env
+override covers it; settings_modal.cpp untouched per minimal-scope).
+
+## R4e evaluation C (parts_hub)
+
+Verdicts (no code changed — analysis only). **engine_oracle/parts_hub (7,441 ln incl. tests):
+split — engine placement logic ports to core/, catalog/index/taxonomy/sourcing-hint layer
+re-homes to services/parts/, the mis-homed *_rpc modules re-home to their owning services.**
+Live surface: worker-RPC `part_search`/`part_get`/`part_place` + 16 GUI methods
+(`parts_*`, `vendor_*`, `vendors_health_*`; registered engine_oracle/worker.py:187 via
+parts_hub/worker_rpc.py:59-71) consumed by host/src/ui/parts/parts_workspace.cpp:45..676 —
+worker RPC only, never direct. MCP side (services/mcp/parts_tools.py:98-989) imports the
+hub directly (search/get/taxonomy/source/place/model_matcher); the copilot
+(services/agent/mission_dispatch.py:1246-1428) reuses those *_impl functions. ENGINE vs
+SERVICES: place.py (543 ln) is doc mutation — core_family/generate_model/import_file route
+through `services.mcp.core_bridge` (already libaicad) while symbol_footprint/section/
+fitting/FMU legs reach engine_oracle ecad_ops/structural/piping/hydraulic (T-RF19 family);
+hub.py+index.py+registry.py+taxonomy+source.py+model_matcher+product_media (~2,100 ln) are
+catalog orchestration (SQLite FTS5, JSON taxonomy, no geometry) → services, never core.
+C++ already owns the parametric catalog (core/parts, parts_catalog_list/parts_make/
+vendor_part_insert) — do NOT re-port. Port-to-core subset: only the place routing + geometry
+ops (~300 ln C++, after piping/hydraulic leaves land). The *_rpc squatters (bench_rpc,
+role_models_rpc, session_rpc, skills_rpc, triggers_rpc, cad_graph_rpc, plm_branch_rpc,
+subscription_rpc — ~1,900 ln) have zero parts coupling; each is a thin wrapper over
+services/agent or services/plm and should re-home there (plm_branch_rpc is already
+double-registered at services/plm/worker_rpc.py:805) — nothing is superseded, so no
+deletions. Browser/vendor-sign-in tier (services/browser ~55 adapters + embed_rpc
+browser_start_url/login_wizard_*) is CEF-bound on desktop; on web, T-RF12 gates
+`vendor_signin`/`account_signin`/`web_browser` (host/src/ui/web_capabilities.cpp:17) —
+browser fan-out silently contributes nothing (zero-profile rule, parts_provider.py). Web
+parity: no parts_hub method appears in contracts/web_parity.md (only C++
+`parts_catalog_list` is web_required); the Parts workspace compiles into WASM but its RPCs
+are python-worker-only — recommend adding `parts_search`/`part_place` to `web_unsupported`
+with `remove_at: T-RF21` and gating the workspace tab, unless a `parts_local_*` C++ local
+subset is defined for web. Files → destinations: place.py→core/parts/place (C++, after
+T-RF19 piping/hydraulic); hub/index/registry/taxonomy(.json)/source/model_matcher/
+product_media/adapters+gen_standard_thumbs→services/parts/; gui_rpc+worker_rpc→
+services/parts/worker_rpc.py; subscription/session/skills/triggers/role_models/bench→
+services/agent/worker_rpc (new, or per-module files); cad_graph/plm_branch→
+services/plm/worker_rpc.py; worker.py:187 registration keeps working through the strangler
+until the leaf moves it. Nothing in parts_hub is dead — deleting any module breaks a live
+surface (host Parts workspace, Settings panels, PLM graph tab, copilot missions, MCP
+parts_tools, reveng seeding at services/mcp/test_reveng_parts_roundtrip.py:96-151).
+
+---
+
+## T-RF19 leaf 5 (structural cutover — core/structural)
+
+Ported the PyNite-based structural engine surface to C++ as `aicad_structural`
+under `core/structural/`: `model.{h,cpp}` (aicad.structure/1 doc model +
+materials + section-property grammar + ASCE 7 combo presets),
+`solver.{h,cpp}` (from-scratch direct-stiffness 3D frame solver — a
+line-for-line port of the PyNite 3.0.0 subset the oracle exercises: direction
+cosines incl. the vertical/horizontal member rules, 12×12 ke, global-direction
+point/trapezoidal member loads via FixedEndReactions.py formulas, fully-fixed
+supports (footings else lowest node), dense Eigen LDLT solve per load
+combination, f = ke·d + fer member end forces, then PyNite's
+`_segment_member`/BeamSegY/BeamSegZ post-processing for max/min shear/moment
+and the 100-point-sampled deflection envelope), `sections.{h,cpp}` (AISC +
+lumber lookups against generated embedded tables `data_aisc.h`/`data_lumber.h`
+from the oracle's curated JSON), `checks.{h,cpp}` (AISC-LRFD / NDS-ASD D/C
+ratios, byte-exact disclaimer), `estimate.{h,cpp}` (board-feet / steel lbs /
+fasteners / ENR-rate takeoff; rates resolved explicit path →
+`AICAD_STRUCTURAL_RATES` → embedded defaults, merged per-key),
+`structural_rpc.{h,cpp}` (single-dispatch `aicad::structural::call` for
+`struct_analyze` / `struct_check` / `struct_estimate`, {code,message,detail}
+error envelopes), plus `struct_cli.cpp` (parity driver) and a shipped copy of
+`enr_rates.json`. CMake: `aicad_structural` static lib + `test_structural`
+doctest + `struct_cli` wired in `core/CMakeLists.txt` (integrator review),
+`aicad_structural` added to the `aicad` DLL link line. Fixtures in
+`core/tests/data/structural/` (cantilever, axial post, portal, truss,
+steel_frame w/ wind, mixed estimate doc); parity harness in
+`scratch/struct_parity/` (regenerate oracle dumps with gen_fixtures.py, diff
+with diff_parity.py). PARITY vs the PyNite oracle over every fixture × combo
+row: struct_analyze max rel err 1.16e-14, struct_check 4.9e-16 (governing
+limit + passed byte-identical), struct_estimate JSON exactly equal. Gotchas:
+(1) PyNite's `T()` is block-diagonal dirCos, so `T[a][6bi+r] =
+dirCos[a%3][r%3]` — transposing that index silently passes the cantilever
+(dirCos = identity) and breaks everything else; caught by the portal/truss
+fixtures. (2) `math.isclose` defaults (rel 1e-9, abs 0) and Python
+round-half-even at 3/10 decimals are replicated (`py_isclose`, `round3`,
+`round10`) — do not "simplify" them. (3) `max_deflection` is a 100-POINT
+SAMPLE, not an analytic envelope — midspan of a symmetric UDL beam is off the
+exact value by design; keep oracle tolerance 2% on hand-calc deflections.
+(4) PyNite "vertical" means along global Y; a +Z post takes the horizontal
+branch. (5) The parallel services/research CMake edit landed mid-build; the
+`cam` ctest red in this dir was configure staleness, cleared by re-running
+cmake configure. NOT PORTED (remainders for T-RF20+): code_check.py (deflection
+rule + post/fastener tables are simple, but agentic_rag/UserCorpusProvider is
+Python corpus retrieval), jurisdiction_meta.py, brep.py (OCCT B-rep for
+viewport), bom_bridge.py (integrator-patched), parts_hub/place.py's elements
+import, benchmarks/simsuite/multiphysics_misc_bench.py (imports analyze_doc).
+Integrator wiring: route the three struct_* methods to
+`aicad::structural::call` in core/api/libaicad.cpp + services/worker routing;
+struct_analyze is in contracts/web_parity.md web_unsupported until then.
+Verified: full build green, ctest 76/76 green in core/build-z-r4e5, oracle
+pytest suite (83 tests) still green.
+
+## T-RF19 leaf 6 (vision/research/reveng_rpc re-home to services/)
+
+Executed the two R4e verdicts: `engine_oracle/vision/` → `services/vision/`
+wholesale (23 modules + 12 test files), `engine_oracle/research/` →
+`services/research/` wholesale (incl. `calcs/` and `data/*.json`), and
+`engine_oracle/reveng_rpc.py` → `services/reveng/worker_rpc.py` (new package
+with `__init__.py`). DELETED `vision/reveng_session.py` + its test (dead —
+only its own test imported it; superseded by `services/mcp/reveng_session_tools.py`).
+`engine_oracle/test_reveng_rpc.py` moved with its module to
+`services/reveng/test_worker_rpc.py` (not in the listed fixups — its
+`from . import reveng_rpc` would have broken otherwise). Import fixups:
+`engine_oracle.vision`/`engine.vision` → `services.vision`,
+`engine_oracle.research`/`engine.research` → `services.research` across
+services/mcp (reveng_common, reveng_build_tools, reveng_session_tools,
+recon_tools, intake_tools, parts_tools, research_tools, cam_tools,
+interface_check_tools + 8 test files), services/agent (advisor engine/
+triggers/prefill/sim_advisor, geometry_helpers + 2 test files, context_packs +
+triggers.yaml source-citation comments), services/browser (session, embed,
+adapters — common.fail/now_ts only), services/installer (provision +
+test_reveng_provision), tools/ (firecrawl_pool, scrape_knowledge,
+flywheel/bench/roundtrip_pipeline + categories.py target path).
+`engine_oracle/worker.py` (integrator exception): the ONE reveng import line
+now reads `from services.reveng.worker_rpc import REVENG_WORKER_METHODS`
+(+ warning string). `core/CMakeLists.txt` (integrator exception):
+AICAD_TEST_MACHINES → `services/research/data/machines.json`.
+Gotchas: (1) `research/calcs/{snap_fit,press_fit,thread_engagement}.py`
+resolved `engine_oracle/sim/materials.json` as `__file__.parents[2]/"sim"` —
+re-pointed to `parents[3]/"engine_oracle"/"sim"` (sim/ has NOT moved); this
+was the only move-induced test breakage (15 calcs tests), caught and fixed.
+(2) `research/machining.py` `from ..materials import registry` →
+`from engine.materials import registry` (materials/ still in engine_oracle).
+(3) `reveng_rpc.py`'s dual try/except "engine_oracle vs engine symlink"
+import shims collapsed to single `services.vision.*` imports (same in
+services/mcp/reveng_common.py). (4) `services/vision/research_ingest.py`'s
+sys.modules sentinel is now `"services.research"` — the monkeypatch-through-
+sys.modules pattern is preserved (test_reveng_research_ingest.py fakes keyed
+to match). (5) `cad_recode.py`'s ML subprocess now runs
+`-m services.vision.cad_recode`. Verified: import smoke OK; pytest
+services/{mcp,vision,research,agent,reveng} -k 'reveng|research|cam_audit|
+dimension_scheme|geometry_helpers|sim_advisor|intake' = 3 failed / 450 passed
+vs baseline 3 failed / 132 passed (mcp subset, same 3 pre-existing failures:
+test_reveng_tools stub/pollution trio); full services/vision+research+reveng
+= 1 failed / 330 passed (the 1 = test_extraction_ok, docling not installed —
+pre-existing env failure); scripts/check.py all 5 gates PASS; worker boots
+and serves list_reveng_sessions from the new location. Left for integrator:
+stale path references in contracts/ (reveng.md, cam.md:102, research_tools.md,
+license_debt.md, licenses.md:64, sourcing.md:139), docs/ (REVENG_DEGRADATION.md,
+reference/*), work/ board files, root conftest.py + requirements.txt comments,
+engine_oracle/{structural/code_check.py:343, parts_hub/product_media.py:13}
+docstrings, core/cam/feeds.cpp:339,345 comments, and
+services/research/data/machines.json:17 "notes" string (left untouched —
+parity-sensitive data). graphify update NOT run (integrator).
+
+## T-RF19 leaf 4 (hydraulic + piping cutover — core/hydraulic, core/piping)
+
+Ported the pure-computation half of both fluid families to C++.
+`core/piping/` (aicad_piping, OCCT-free): `fluid_properties.{h,cpp}`
+(properties.py — built-in cited backend only: IAPWS/NIST water table +
+ideal-gas/Sutherland gases; CoolProp/thermo are NOT in requirements.txt, so
+"builtin" is the production answer), `schema.{h,cpp}` (aicad.piping/1
+factories + validators), `catalog.{h,cpp}` (nearest_pipe against vendored
+B36.10M/19M schedule tables `pipe_tables.h` — GENERATED from the MIT fluids
+1.3.1 schedule_lookup, 16 schema-legal schedules; B16 fitting CSV embedded
+as `fittings_data.h`), `solve.{h,cpp}` (the 1-D nodal Newton head solve with
+Reynolds-refreshed friction + backtracking line search, the laminar
+Hagen-Poiseuille closed form, pump curves with affinity scaling, the
+isothermal-compressible gas solve on P², pressure_drop_report,
+operating_point + NPSH; the fluids calls the oracle makes — Clamond
+friction_factor, Rennels bend_rounded/contraction_conical, K_from_f /
+dP_from_K / Reynolds — are re-implemented in-file, and numpy's LU solve is a
+partial-pivot LU), `cfd.{h,cpp}` (cfd_boundary_from_solve +
+verify_pressure_drop), `simhandoff.{h,cpp}` (aicad.simhandoff/1 builders +
+validator, shared with hydraulic), `piping.{h,cpp}` (single dispatch
+`piping::call` owning piping_solve / piping_report / piping_operating_point /
+piping_fluid / piping_cfd_boundary / piping_verify_cfd — the
+piping_tools.py tool envelopes). `core/hydraulic/` (aicad_hydraulic, links
+aicad_piping): `schema.{h,cpp}` (aicad.hydraulic/1), `solve.{h,cpp}`
+(size_cylinder/pump/accumulator/valve_flow + fmu_simulate as the always-
+skipped soft-fail envelope — no FMI runtime in the core), `bom.{h,cpp}`,
+`handoff.{h,cpp}` (estimate_line_dp, hoses_to_piping, the hydraulic_to_piping
+/ hydraulic_to_fea simhandoff envelopes + verifies, margin feedback),
+`hydraulic.{h,cpp}` (dispatch owning the 13 hydraulic_* methods — the
+hydraulic_tools.py tool envelopes; hydraulic_piping_handoff always runs the
+live solve, so the fluids-absent "solve_pending" stage does not exist on the
+C++ side). Shared helpers in `core/piping/pyutil.h` (Python-exact round/
+str/repr/f-format via correctly-rounded printf, ordered_json for dict-repr
+fidelity, uuid4/now_iso). Parity: /tmp/rf19/parity.py drives 84 fixtures
+through rpc_cli (`core/piping/rpc_cli.cpp`, mirrors fw_cli) vs the actual
+Python MCP tool closures + engine functions — 84/84 byte-identical after
+uuid/timestamp normalisation (covers both Newton solves end-to-end incl.
+iteration counts, gas demands in kg/h + Nm³/h, pump curves, NPSH, derived
+system curves, all error envelopes). Unit tests: core/tests/test_piping.cpp
+(24 cases) + test_hydraulic.cpp (13 cases) mirror the oracle suites; both
+green. CMake: aicad_piping/aicad_hydraulic static libs + tests + rpc_cli in
+core/CMakeLists.txt (integrator review) and on the aicad DLL link line.
+DEFERRED (kernel/orchestration, stays Python until a later leaf):
+engine_oracle/piping/threed.py (piping_to_step / piping_to_part_doc — OCCT
+sweep) and cfd_handoff.internal_volume (bore STEP extraction), plus the
+piping_cfd_handoff / piping_internal_volume MCP orchestration legs
+(core_bridge import + sim_run_flow); the 1D solve + CFD BC extraction those
+legs consume is ported. MCP session state (_HYD/_PIPING) stays MCP-side —
+core methods take explicit docs/results; hydraulic_add_component/add_hose
+return the updated doc under an ADDITIVE "doc" key for T-RF20 to store.
+Oracle deletion: engine_oracle/hydraulic/* and engine_oracle/piping/*
+(schema, properties, catalog, solve, cfd_handoff) can be deleted once the
+integrator wires the libaicad dispatch + worker routing and T-RF20 flips
+services/mcp/{hydraulic_tools,piping_tools}.py to core_bridge; threed.py +
+internal_volume need a kernel leaf first. graphify update NOT run
+(integrator).
+
+## 2026-07-22 — T-RF20 leaf (structural MCP flip to core_bridge)
+
+Flipped the structural MCP surface off the legacy Python oracle onto the C++
+`struct_*` RPCs (T-RF19's `core/structural`, dispatched via libaicad and routed
+in worker_client.cpp). `services/mcp/structural_tools.py`: all three tools
+(struct_analyze / struct_check / struct_estimate) now go through one
+`_struct_rpc()` helper (`from . import core_bridge as cb` + `cb.call`), passing
+`{doc_path, load_combo}` straight through; the C++ result IS the old handler
+payload minus `ok`, so the wrapper is `{"ok": True, **r}`. In-band soft failures
+(`{code, message, detail}` at rc 0 — structural_rpc.cpp always emits rc 0)
+map to the normal `{ok:False, error, code, detail}` envelope; `CoreError`
+(engine not staged / stale lib without the dispatch, i.e. the analogue of the
+old PyNite-absent ImportError path) maps to `code: "solver_unavailable"`.
+`_load_structure` and every `engine.structural.*` import are gone from the
+module. `services/mcp/code_compliance_tools.py`: `code_check.py` STAYS Python
+(agentic_rag/UserCorpusProvider is corpus retrieval) — the handler keeps its
+lazy `engine.structural.code_check` / `jurisdiction_meta` imports, but the
+deflection leg's `analyze_doc`/`StructureDoc` usage is now
+`cb.call("struct_analyze", {doc_path, load_combo})` with the span map read from
+the raw JSON doc; the old ImportError "PyNite unavailable" advisory row is now
+a CoreError "structural solver unavailable" row (same shape). DISCLAIMER is now
+imported from `engine.structural.code_check` (re-export) instead of
+`engine.structural.checks` — GOTCHA for the oracle-deletion leaf: when flipping
+code_check.py's `from engine.structural.checks import DISCLAIMER` /
+`from engine.structural.sections import get_lumber_section`, keep
+`code_check.DISCLAIMER` exported byte-exact (C++ kCheckDisclaimer) and keep
+`code_check` + `jurisdiction_meta` importable without checks.py/sections.py.
+`benchmarks/simsuite/multiphysics_misc_bench.py`: `_bench_struct` drives the
+inline-`doc` RPC form via core_bridge (engine-absent/CoreError → clean skip,
+in-band error → fail); rel_err 6.3e-16 vs Euler-Bernoulli. Tests
+(`services/mcp/test_multiphysics_misc.py`): no monkeypatch targets existed —
+the two struct tests were gated on HAVE_PYNITE; re-gated on a new
+`_STRUCT_ENGINE` skipif (`cb.available()`, same pattern as group 5), removed
+the now-unused HAVE_PYNITE, hoisted the shared `core_bridge` import (group 5's
+duplicate removed). Verify: both modules import clean as `services.mcp.*` and
+`mcp_server.*`; stub-FastMCP smoke of all four tools green (payload keys,
+line_item shape, bad-path envelope, code_check deflection+post+fastener legs,
+missing-doc leg). pytest `services/mcp -q -k 'struct or compliance'`
+(mcp-venv): BEFORE 11 passed / 5 skipped / 978 deselected → AFTER identical
+(11/5/978); the 2 struct tests run green against the engine (no env override
+needed — a hostd with the T-RF19 dispatch was live; with
+`AI_CAD_ENGINE_DAEMON=0 AI_CAD_LIBAICAD=core/build-linux/bin/libaicad.so` also
+green in-process). Grep proof: remaining `engine.structural` references outside
+engine_oracle are only the documented stay-Python imports in
+code_compliance_tools.py (code_check + jurisdiction_meta),
+`engine_oracle/parts_hub/place.py` (`..structural.elements` — DO NOT TOUCH,
+owned by a later parts_hub leaf), and `scripts/sim_audit.py` FAMILY 7
+(`from engine.structural import analysis` — audit script, NOT in this leaf's
+write-set; flag for the deletion leaf: either flip it to cb or retire FAMILY 7
+with the oracle). ENV CAVEAT: `core/build-occt-linux/bin/libaicad.so` (17:17)
+and `host/build-linux/bin` are stale — they predate T-RF19 and answer
+"unknown method: struct_analyze"; only `core/build-linux/bin/libaicad.so`
+(19:01) has the dispatch. The integrator's per-wave rebuild resolves this; the
+handlers degrade to `solver_unavailable` (not a crash) until then. Mid-run the
+parallel intake leaf's deletion of `engine_oracle/intake/` briefly broke
+collection of test_roundtrip.py (server.py → intake_tools) — pre-existing
+swarm state, fixed by that leaf, not this one. cad_guide('structural') /
+test_mcp_freshness expectations unchanged (tool names/signatures/response
+shapes identical). graphify update NOT run (integrator).
+
+## engine_oracle remainder map (closeout prep — T-RF19/T-RF21, read-only recon)
+
+Snapshot mid-wave (tree in flux: intake/kernel/embed_rpc/parts_hub-catalog/ecad.orchestrator
+already re-homed to services/): 214 files, ~68k py lines incl. 71 test files. Verdicts by
+family, all consumers evidence-grepped. SIM: `sim/worker.py` is LIVE — spawned by
+`host/src/core/sim_client.cpp:30` (`python -m engine.sim.worker`), serving sim_caps /
+sim_run_flow (LBM) / sim_cancel; its deps `lbm.py` + `overlay.py` (+`doc/tessellate.py`)
+stay until the host flow path flips to `core/sim/lbm.cpp` (already ported, stl-shape gap).
+`circuit/spice/devices/subckt/analysis_ext` — the MNA solver — is PORTED
+(`core/sim/spice.cpp`, `spice_sweep.cpp`, `netlist.cpp`; `ecad_simulate` libaicad-dispatched)
+but still directly imported by services/mcp (ecad_sim_tools, ecad_common, ascii2d,
+server.py warmup) + `services/ecad_design/orchestrator.py` + installer/provision.py
+(`ngspice_status`) → delete after T-RF20 flip. `vibration.py` (NOT ported — no C++
+Miles/PSD) lives via ecad_reliability/cad_sim_tools/multiphysics_rpc → port-to-core
+(core/sim vibration) or re-home with ecad_reliability. `fea_thermal_transient.py` ported
+(core/sim/fea_thermal transient), pending cad_sim_tools flip. `openfoam/foam_*` cluster
+(cohesive: openfoam→foam_case/cht/post→lbm/overlay/foam_runner) is the named T-RF19
+hold-back follow-up; live via cad_sim_tools/ecad_thermal/sim-worker caps probe.
+`multiphysics_rpc.py` (worker seam: sim_caps/buckling/contact/freq_response/handoffs)
+is a shim over services.mcp.* → re-home to services (needs vibration resolved first).
+`sim/em/*` HOLD-DEFERRED per T-SIM11 (live via em_tools/antenna_tools + worker em_*
+registration). `sim/thermal_conductivity.json` = PROOF OF DEATH (zero importers).
+ECAD: core/ecad ported (session/schema/ops/netlist/sync/autoroute/drc/dfm/erc/impedance/
+zonefill/library/kicad/fabformats/recipes); Linux routing C++-only
+(services/worker/worker_client.cpp:357) — the Python tree survives ONLY on MCP direct
+imports (ecad_pcb_tools, ecad_sch_tools, ecad_common, ecad_reliability, ecad_thermal,
+board_flow, gsl_tools, ascii2d, antenna_tools, ecad_sim_tools; services/parts
+ecad_kicad_adapter; services/ecad_design/orchestrator) + Windows default routing.
+No C++ counterpart: place, threed, pdn, antenna, si_rules, trace_opt, hostboard_rules,
+fpga, stackup, autosave, metadata, formats, demo (demo = delete-dead, no importers);
+rpc.py references to describe/pick/kicad_export are dead-optional (files absent).
+End state: T-RF20 flips MCP tools to RPC → ported modules delete; unported ones are
+port-to-core leaves or re-home to services/ecad_design (orchestrator still imports
+engine.ecad.{netlist,recipes,schema,session,ops,library.starter} + engine.sim.{circuit,
+spice} — it is a MOVE, not an engine-free cut). DOC: `tessellate.py` live (scripts
+sim_icons/fea_result_icons + sim/overlay) → port-to-core or re-home with overlay;
+`canonical.py` → re-home services (plm/snapshot, plm/branches, doc_diff_tools);
+`op_registry.py` → services/mcp/op_vocab fallback only (core/ecad/op_registry.cpp exists);
+`sw_feature_import/sw_translate.py` live via cad_exchange_tools/sw_fixture_author →
+port-or-re-home leaf; `formats.py`+`formats_dwg/dxf/solidworks`+`mesh_body` die once
+ecad/threed stops lazy-importing `doc.formats.import_path`. TOP-LEVEL: `paths.py`
+(~20 services importers) → re-home services; `vendor_parts.py`/`parts_library.py` worker-
+registered (vendor_part_register/list/context/scan_library; insert is C++) + services/
+parts local_library_adapter → re-home services/parts; `bolts_loader.py`+`data/bolts` →
+re-home services/parts (bolts_adapter); `run_model.py`/`render.py`/`samples/` = DEAD
+(kernel gone, zero invokers). `data/{enr_rates,lumber_table,jurisdiction_meta,aisc_shapes}`
+die with the structural flip (core embeds copies); `sim/margin_policy.json` read by path
+from services/agent/advisor/sim_advisor.py:46 → move data with advisor. worker.py final
+shell (R5a): ping/run_model(→services.kernel_exec)/get_prompts/list_editable_prompts/
+agent_cancel + fenced seams (vendor, ecad.rpc, em, deliverables, services.parts,
+services.agent, reveng, dag, subagent, plm, multiphysics) — deletion order: flip MCP
+(T-RF20) → delete ported families → resolve vibration/openfoam/EM holds → remove flags
++ spawn path (T-RF21) → delete tree + engine symlink. Graphify update NOT run
+(integrator); no code changed (read-only recon).
+
+T-RF20 (R4f, thin-client flip): `engine_oracle/kernel.py` → `services/kernel_exec.py`
+(build123d code execution needs a Python interpreter by nature — stays services-side,
+never ports to C++; `run_code_isolated` subprocess now runs `-m services.kernel_exec`).
+`engine_oracle/ecad/orchestrator.py` → `services/ecad_design/` (package; `__init__.py`
+re-exports run_design/plan_design/DesignRun/StageEvent/validate_design/build_design/
+simulate_design) — thin LLM state machine, not engine logic; note: the claimed "recipe
+fallback already C++" did NOT hold — `engine.ecad.recipes` is still pure-Python
+closed-form, only its imports (`engine.ecad.*`, `engine.sim.*`) remain transitional.
+Consumers flipped (import lines only): engine_oracle/worker.py:37 (kernel, integrator
+exception), engine_oracle/ecad/rpc.py:780 (ecad_design registration, integrator
+exception), engine_oracle/run_model.py, engine_oracle/test_kernel_aliases.py,
+engine_oracle/ecad/{demo,test_library,test_orchestrator}.py (consumers of moved
+modules), services/mcp/ecad_sim_tools.py + test_ecad_sim_e2e.py (MCP ecad_design refs),
+tools/ecad_round5_repro.py. agent_turn.py + its 6 consumers (dag/node_runner,
+plm/{assist,ai_vc}, subagent_rpc, mission_dispatch, reviewer_exec) needed NO flips —
+audit proves zero engine_oracle imports there except mission_dispatch's
+engine_oracle.parts_hub (other leaf's scope, allowlisted); services/dag likewise clean
+except test_intake_gate_ledger → engine.intake (transitional, allowlisted). New gate:
+`scripts/oracle_import_audit.py` (AST scan of services/**, fails on engine/
+engine_oracle imports outside `scripts/oracle_import_allowlist.txt` — 23 seeded
+transitional prefixes, each with a reason; delete entries as subsystems port) wired
+into `scripts/check.py` as gate 6. Gotcha: bare `import engine` in
+services/agent/test_h7_shadow.py is allowlisted as an exact-match-only entry — a
+prefix match on the bare root would allowlist the whole legacy package. Verified:
+worker ping + run_model ok (build123d 0.11.1), engine_oracle/ecad/test_orchestrator +
+test_kernel_aliases 9 passed, scope pytest no new failures vs baseline (pre-existing
+test_mission_dispatch::TestPartSearch::test_routes_to_parts_hub failure — parts_hub
+leaf mid-flight), `python3 scripts/check.py` all 6 gates PASS. Graphify update NOT run
+(integrator). Deferred: trimming allowlist entries as hydraulic/piping/structural/
+tolerance/materials/dfm/parts_hub leaves land.
+
+## T-RF19 leaf (parts_hub re-home — evaluation C execution)
+
+Executed the R4e evaluation C verdict. MOVES (plain `mv`, git rename-by-content):
+catalog layer `engine_oracle/parts_hub/{hub,index,registry,taxonomy,taxonomy.json,
+source,model_matcher,product_media,gen_standard_thumbs}.py` + `adapters/` →
+**`services/parts/`** (new package; `__init__.py` keeps the same public API:
+search/get/register_provider/rebuild_index/browser_bootstrap_error). RPC modules
+`gui_rpc.py` + `worker_rpc.py` → `services/parts/` (worker_rpc now registers ONLY
+part_search/get/place + GUI_WORKER_METHODS + the embed table). **embed_rpc
+decision:** `engine_oracle/embed_rpc.py` → `services/parts/embed_rpc.py` — it is
+registered exclusively through the parts worker_rpc chain and serves the parts
+workspace vendor sign-in; services/browser would be the purist home but is
+outside this leaf's write-set. **Squatter fold:** subscription/session/skills/
+triggers/role_models/bench `_rpc.py` folded VERBATIM (ast-stripped docstring+
+import headers, bodies byte-identical, zero symbol collisions) into one
+**`services/agent/worker_rpc.py`** (31 methods; each original table name
+preserved: SUBSCRIPTION/SESSION/SKILLS/TRIGGERS/ROLE_MODELS/BENCH_METHODS, plus
+merged WORKER_METHODS); originals deleted. **PLM fold:** cad_graph_rpc +
+plm_branch_rpc folded into `services/plm/worker_rpc.py` (replacing the :805
+double-registration try-import; CAD_GRAPH_METHODS/PLM_BRANCH_METHODS names kept,
+WORKER_METHODS.update at end); parts_hub copies deleted. **Shim decision:**
+kept `engine_oracle/parts_hub/__init__.py` as a thin shim re-exporting from
+services.parts (public API + moved submodule attributes) because place.py stays
+in that package until its core port and out-of-write-set stragglers
+(tools/flywheel/bench/roundtrip_pipeline.py, try/except-guarded) keep working —
+AND all in-write-set import sites were still repointed to services.parts.*
+directly. **place.py:** logic untouched; its one import line now
+`from services.parts import get`. **worker.py (integrator-owned, sanctioned
+registration lines only):** parts block import →
+`from services.parts.worker_rpc import WORKER_METHODS` + warning string; new
+"Agent GUI seams" block registering `services.agent.worker_rpc.WORKER_METHODS`
+(same graceful-absent pattern); PLM block unchanged (folded tables ride it).
+Import fixups: services/mcp/{parts_tools,reveng_session_tools,reveng_build_tools,
+heatsink}.py, services/agent/mission_dispatch.py, engine_oracle/{parts_library,
+vendor_parts}.py (index rebuild hooks), services/reveng/worker_rpc.py, and every
+importing test (services/mcp/test_parts_tools_v2, test_reveng_parts_roundtrip,
+test_reveng_make_part — its fake-hub sys.modules injection now shadows BOTH
+services.parts and engine_oracle.parts_hub so the real shim never executes, and
+the place-stub assertion reads sys.modules["engine_oracle.parts_hub.place"]
+directly (`import a.b.c as x` binds via attribute walk on the parent package
+and picks up the REAL place module when an earlier test imported it);
+services/reveng/test_worker_rpc, services/plm/test_{cad_graph,graph_links,
+branches}, services/agent/test_{subscription_auth,usage,role_models,
+mission_dispatch,session_cmds,skills}, advisor/test_triggers_crud,
+services/browser/test_embed, engine_oracle/test_parts_library — mock.patch
+targets repointed to services.parts.*). Tests moved with their modules: 9
+test files → services/parts/, test_bench_rpc → services/agent/. All path math
+is depth-preserving (taxonomy.json `with_name`, bench `_repo_root`
+parents[2]=root, gui_rpc parents[2]/services/mcp, adapters parents[4] data
+dirs — all still resolve). VERIFY (mcp-venv): 6-module import check OK; worker
+boot `ping` → pong; `python3 scripts/check.py` all 6 gates PASS; scope pytest
+**535 passed / 3 failed / 1 skipped — byte-identical to the pre-move baseline**
+(the 3 failures are the pre-existing test_parts_hub_p3 place tests:
+test_place_mech_family_shcs_m5, test_generate_model_imports_via_import_file,
+test_generate_model_none_is_error). Grep proof: zero stale code references to
+old module paths (remaining hits are legit `engine_oracle.parts_hub.place`
+references — place.py still lives there — plus T-RF19 provenance comments).
+GOTCHAS: (1) a parallel leaf was mid-rewrite of services/mcp/cad_tools +
+cad_common during this run (`_materials_registry`/`register_cad_tools`/
+`_publish_current` ImportErrors, cad_common mtime 19:14) — it broke 6
+unrelated services/mcp collection modules + order-dependent TestCadGuideParts
+(mcp_server.cad_tools importer) in combined runs; those pass in isolation and
+failed/passed identically before and after my edits. Integrator: re-run the
+full gate once that leaf lands. (2) dist/AppDir + Webservice/image/stage hold
+stale packaged copies of engine worker.py — regenerated on next packaging, not
+source. REMAINDERS for the place.py port leaf: engine_oracle/parts_hub/place.py
+(543 ln) + its __init__ shim; importers of place to flip when it lands:
+services/parts/{worker_rpc,gui_rpc}.py, services/mcp/parts_tools.py:796,989,
+services/agent/mission_dispatch.py:1405, services/mcp/test_reveng_make_part.py,
+test_reveng_parts_roundtrip.py:302, engine_oracle/test_parts_library.py:160,
+services/parts/test_{x3_browser_catalog,parts_hub_p3}.py.
+
+T-RF19 leaf 8 (2026-07-22): flipped every MCP/agent call site of the leaf-6
+C++ ports (tolerance / mechanical / materials / dfm) off the Python oracle and
+onto core_bridge, and re-homed engine_oracle/intake → services/intake.
+FLIP MAP (all response shapes unchanged — the C++ dispatch emits the same
+envelopes, verified live against libaicad): services/mcp/tolerance_tools.py
+(stackup_analyze → cb.call("stackup_analyze"); mode/input validation now done
+in core, engine_unavailable envelope kept on CoreError);
+services/mcp/mechanical_tools.py (gear_check, bearing_life → cb.call,
+pass-through envelopes); services/mcp/cam_tools.py (_resolve_cam_material →
+material_cam_id + material_resolve_key; _wire_materials_registry no longer
+imports engine.materials — it now defaults $AICAD_MATERIALS_REGISTRY to the
+bundled engine_oracle/materials/registry.json via a literal path, shared impl
+in cad_common._wire_materials_registry, called at IMPORT time in both modules
+because the core caches the registry once per process and a daemon spawned
+before the env is set serves empty material tables); services/mcp/cad_common.py
+(:1110 FEA seam — _MATERIALS/_MATERIAL_ALIASES now filled lazily in-place by
+material_fea_table/material_fea_aliases via _ensure_materials(); importing
+cad_common no longer requires any engine, and cad_tools' dead
+_materials_registry re-export was dropped); services/mcp/intake_tools.py
+(resolve_process/set_process/dfm_check → dfm_resolve_process/dfm_get_profile/
+dfm_process_block_text via a local _dfm() that re-raises ok:false as ValueError
+so the _err path is identical; DEFAULT_PROCESS literal); 
+services/mcp/dimension_scheme_tools.py (lazy _get_profile/_resolve_process/
+_known_processes wrappers, offline fixture mode preserved);
+services/agent/geometry_helpers.py (_KNOWN_PROFILE_IDS + _profile →
+dfm_known_processes/dfm_get_profile via `from services.mcp import core_bridge`,
+the guardrails.py/preflight.py pattern; literal fallback kept; provenance
+citations repointed at core/dfm/process_profiles.cpp). INTAKE MOVE: plain `mv
+engine_oracle/intake services/intake` (intake.py, __init__.py, test_intake.py,
+test_telemetry_consent.py). services/intake/intake.py's
+`from engine.dfm import process_profiles` is replaced by an in-module
+_ProcessProfilesBridge shim (DEFAULT_PROCESS, a lazy cached PROFILES map
+exposing .fit_classes_mm, modeled_dim, fit_clearance) over the dfm_* RPCs;
+test imports retargeted (services/mcp/test_intake_ledger.py:137,
+services/dag/test_intake_gate_ledger.py:421, services/vision/test_vision.py:138,
+the two moved test files); stale doc references swept in services/vision/
+__init__.py + services/mcp/intake_ledger.py. VERIFY (mcp-venv, daemon isolated
+via AICAD_INSTANCE_KEY): all touched modules import clean; scoped pytest
+(services/{mcp,agent,intake,dag} -k 'tolerance or mechanical or material or
+dfm or intake or dimension_scheme or geometry_helpers') **166 passed / 2
+skipped / 0 failed** vs pre-flip baseline 129 passed / 2 skipped / 0 failed
+(the +37 are the newly collected services/intake tests — no new failures);
+script-style `python -m services.intake.test_intake` 84/84 checks PASS;
+`python3 scripts/check.py` all 6 gates PASS (oracle_import_audit clean).
+Grep proof: zero engine.{tolerance,mechanical,materials,dfm,intake} imports in
+services/{mcp,agent,intake,dag,vision} production code; zero engine.intake /
+engine_oracle.intake references tree-wide. REMAINING engine.materials imports
+(out of scope, for the materials-deletion node): services/research/
+material_lookup.py:15 + machining.py:122, and parity-test imports
+services/mcp/test_cam_tools.py:99, test_dimension_scheme.py:127,377 (valid
+until engine_oracle/dfm+materials are deleted). GOTCHAS for the integrator:
+(1) **materials registry provisioning** — core/materials resolves
+registry.json ONLY via $AICAD_MATERIALS_REGISTRY or the AI-CAD data root; the
+in-repo copy is still engine_oracle/materials/registry.json, so when that dir
+dies the data file must be re-homed AND the installer must provision the
+data-root copy (a hostd started without the env serves material_fea_table={}
+— CAM feeds have an in-code fallback, the FEA table does not). (2) A stale
+env-less repo hostd (spawned mid-session before the import-time wiring) was
+left running at $XDG_RUNTIME_DIR/aicad/hostd-cea6d8a5b788c9ca.sock — if the
+GUI/MCP reports empty material tables, restart hostd. (3) engine_oracle/
+{tolerance,mechanical,materials,dfm} modules are now unreachable from services
+and can be deleted by the next node (their own oracle tests +
+core/tests/data/gen_r4e6_fixtures.py still import them — retarget to the
+parity fixtures when deleting).
+
+## 2026-07-22 — T-RF20 leaf (hydraulic + piping MCP flip to core_bridge)
+
+Flipped `services/mcp/hydraulic_tools.py` and `services/mcp/piping_tools.py`
+off the oracle onto the T-RF19 C++ dispatch (`from . import core_bridge as cb`
++ `cb.call("<method>", params)`), mirroring the cam_tools/firmware_tools
+reference flips. Every tool body is now a thin wrapper: MCP-side input parsing
+(`_load_doc`/`_as_obj`, byte-identical parse-error envelopes) → one
+`hydraulic_*`/`piping_*` RPC → `_dumps` of the core's envelope (byte-identical
+by the T-RF19 84/84 parity harness). Session state stays MCP-side per the port
+design: `_HYD["doc"]` is stored from the additive `doc` key that
+hydraulic_add_component/add_hose return; `_HYD["piping_handoff"]` /
+`_HYD["fea_handoff"]` from the handoff tools' `simhandoff`/`solve` keys;
+`_PIPING` stores the RESOLVED doc/boundary/fluid (explicit args overriding the
+source_handoff envelope, resolved via the kept pure-Python
+`network_from_handoff`) and `piping_report`'s no-arg leg passes
+doc+result+fluid explicitly (the core's `piping_report` accepts the additive
+`result`). `piping_cfd_handoff` flips its 1D-solve + CFD-BC legs to
+`piping_solve`/`piping_cfd_boundary` RPCs (the embedded solve payload strips
+the additive `node_menu` so it stays byte-identical to the old raw solve; the
+schema-error and boundary-required envelopes are reproduced exactly) and keeps
+the bore-extraction/CFD orchestration Python-side — including a real fix: the
+bore-STEP import leg referenced a nonexistent `core_bridge.CoreBridge` class
+(always ImportError → the CFD leg silently never ran), now the module-level
+`cb.call("import_file", ...)`. `piping_internal_volume` keeps
+`engine.piping.cfd_handoff` (the documented threed/internal_volume leg, not
+deleted this round) but validates via a boundary-less `piping_solve` probe
+(`_schema_errors_via_core`) since `engine.piping.schema` is deleted this
+round. Deleted from hydraulic_tools: `hoses_to_piping`/`_line_spec`/
+`_LINE_SPACING_MM` (ported to core/hydraulic/handoff.cpp); the pure
+simhandoff-envelope compositions and `estimate_line_dp`/`_margin_update` stay
+as the engine-less test seam (same shapes the core emits). Deleted from
+piping_tools: `_node_menu` (the core adds it). Tests:
+`services/mcp/test_hydraulic_handoff.py` retargeted to the new seam — engine
+schema imports replaced with inline aicad.hydraulic/1 fixtures, `_net()` now
+drives the flipped tool (skips cleanly without libaicad), the fluids-absent
+"solve_pending" branch is gone (the core always solves live), tool tests
+guarded on `core_bridge.available()`. Verify (mcp-venv): both modules import
+clean and register the same tool names; `pytest services/mcp -q --tb=short -k
+'hydraulic or piping'` 31 passed / 963 deselected — IDENTICAL to the pre-flip
+baseline (31/963), with test_simhandoff's byte-identity regression gate
+(C++ verify vs oracle verify_pressure_drop) green; `scripts/check.py` all 6
+gates PASS. Grep proof: hydraulic_tools.py has zero engine.* imports;
+piping_tools.py keeps only `from engine.piping import cfd_handoff` (the
+internal_volume leg). NOT flipped (no MCP tools exist — RPC surface routed in
+worker_client.cpp but never exposed as tools; adding them is a separate
+contract decision, YAGNI): hydraulic_size_accumulator, hydraulic_valve_flow,
+hydraulic_fmu_simulate. Follow-ups for the integrator/deletion round:
+engine_oracle/hydraulic/* and engine_oracle/piping/{schema,properties,
+catalog,solve}.py can now be deleted — but test_multiphysics_misc.py,
+test_simhandoff.py and engine_oracle/piping/test_cfd_handoff.py still import
+oracle modules for their own oracle-baseline asserts and must be retargeted
+(core RPC or C++ parity fixtures) in the same deletion commit.
+graphify update NOT run (integrator).
+
+T-RF19 (place.py port — last parts-hub engine piece): ported
+engine_oracle/parts_hub/place.py (543 lines, the part_place universal
+insertion router + _place_import_file) to core/parts/place.{h,cpp} behind
+`bool aicad::parts::place_call(method, params, result, err, seams)` owning
+methods `part_place` {part_id, record?, doc?, params?} and `part_import_file`
+{path, as_solid?}. Leg mapping: core_family/generate_model/import_file stay
+RPC legs (PlaceSeams: get_record/parts_make/import_file/build_model — the
+sourcing Seams pattern; libaicad wires production defaults), symbol_footprint
+runs REAL aicad::ecad::apply_ops (sch_add_symbol), section_profile appends the
+StructuralElement dict inline (elements.py to_dict, identity 4x4), fitting_id
+and fmu_component use the aicad_piping/aicad_hydraulic schema factories
+(new_fitting/new_component/next_id). Doc-mutating legs return the updated doc
+under result["doc"] (ADDITIVE key — the oracle mutates the caller's dict in
+place, impossible across an RPC). FILES: core/parts/place.{h,cpp} (new),
+core/tests/test_parts_place.cpp (new, 16 cases + `--parity-dump` mode),
+core/tests/parts_place_parity.py (new Python↔C++ diff harness, 12 scenarios,
+0 mismatches), core/CMakeLists.txt (place.cpp into aicad_parts, which now
+PUBLIC-links aicad_ecad + aicad_hydraulic — all still pure-JSON/OCCT-free).
+VERIFY: build-z-place full build + ctest green; parity harness PASS on all 7
+legs + 5 error envelopes (uuids/hex12 ids/paths masked). INTEGRATOR WIRING:
+(1) libaicad.cpp — dispatch `part_place`/`part_import_file` to
+aicad::parts::place_call with seams: parts_make → the existing parts_make
+dispatch body (factor it into a callable), import_file →
+aicad::doc::doc_import_file, build_model → the identical lambda already in
+build_sourcing_seams (s.build_model); get_record has NO C++ hub — the MCP
+flip must pass the PartRecord pre-fetched as params.record (services/parts
+stays Python), the seam is a tests-only hook. (2) worker_client.cpp — route
+part_place/part_import_file to C++ (pattern: the R4e6 list; get_record-less
+calls need params.record, so routing alone is insufficient without the MCP
+change). (3) MCP flip: services/mcp/parts_tools.py:796 (part_place) and :989
+(import_artifact) call place.place/_place_import_file directly — flip both to
+core_bridge.call, with part_place doing the services.parts.get lookup in
+Python and passing record=. DELETION: engine_oracle/parts_hub/place.py can
+die once the MCP flip lands (its __init__.py shim already notes place.py is
+the last engine piece there; services/parts/test_parts_hub_p3.py imports it —
+retarget to the C++ port or delete with it). GOTCHAS: (1) core/ecad's
+ensure_lib_def skips the engine.ecad.library.resolve leg and writes a stub
+def — pre-existing ecad gap, only affects lib_cache contents, the placed
+symbol op is identical (masked in the parity harness). (2)
+engine_oracle/spec_sheet_matcher.py is already deleted (generate_model ==
+sourcing build_model seam); place.py's `from .. import spec_sheet_matcher`
+is a stale import that only works via monkeypatch in its own tests.
+
+---
+
+## 2026-07-22 — Z-stream late phase: flips landed, big deletion sweep (integrator)
+
+The flip/re-home/port leaves (T-RF20 families) all landed; this entry records the
+integrator-side sweep. **Flips:** hydraulic_tools/piping_tools (all 19 methods →
+core_bridge, session state kept MCP-side), structural_tools/code_compliance_tools
+(struct_analyze/check/estimate; code_check stays Python), tolerance/mechanical/materials/
+dfm MCP+agent sites, intake re-homed to services/intake (dfm via RPC shim), parts_hub
+re-homed (services/parts catalog + worker_rpc/gui_rpc, squatters → services/agent/
+worker_rpc (1,345 ln), cad_graph+plm_branch → services/plm/worker_rpc),
+vision+research+reveng_rpc → services/{vision,research,reveng}, kernel.py →
+services/kernel_exec.py (run_model keeps working — build123d needs an interpreter by
+nature), ecad_design → services/ecad_design/ (verified end-to-end). **place.py →
+core/parts/place.{h,cpp}** (12/12 parity scenarios, all 7 legs); `parts_make_impl`
+factored in libaicad.cpp and shared with the PlaceSeams; `part_place`/`part_import_file`
+dispatched + routed + MCP-flipped; **engine_oracle/parts_hub deleted**.
+**render_part needed NO port** — MCP render tools already route to C++
+`doc_render_*` (software rasterizer in core/doc/session.cpp); the web_parity entry was
+an MCP tool name, removed like intake_status. **Materials hazard closed:** registry.json
+seed moved to `core/data/materials/` + `AICAD_BUNDLED_MATERIALS_REGISTRY` compile-time
+fallback in both resolvers (env → appdata → bundled; env-less resolution verified).
+**Deletions:** engine_oracle/{firmware (earlier), bom/cost/quote/parts_providers/
+spec_sheet_matcher/sourcing_worker_rpc/bolts_loader(tests), parts_hub, tolerance,
+mechanical, materials (seed+export_sim_json re-homed first), dfm, hydraulic,
+structural (ported half), sim/thermal_conductivity.json, ecad/demo.py, run_model.py,
+render.py, samples/, piping solve/properties+tests}. **Structural split:** code_check +
+jurisdiction_meta + sections + checks + data → services/structural/ (code_check stays
+Python per R4e-5); brep/elements/bom_bridge deleted as dead with analysis/estimate.
+**Gate lint:** `oracle_import_audit` (R4f's check.py gate 6 + allowlist ratchet) now
+enforces the thin-client state. **Still running:** big ecad+sim MCP flip, re-home
+sweep, host flow-path flip (stl → core LBM), hyd/piping baseline-test retarget.
+**Remaining for closeout:** ecad ported-half + MNA-stack deletions (after the flip
+leaf), sim/{worker,lbm,overlay} (after the flow-path leaf), piping threed/cfd_handoff
+port, paths.py + vendor/bolts/canonical re-homes (in flight), ecad non-ported modules
+(pdn/antenna/si_rules/trace_opt/hostboard_rules/stackup/fpga/place/autosave/metadata/
+threed) disposition, the services-side worker main (R5a), flag removal (R5a).

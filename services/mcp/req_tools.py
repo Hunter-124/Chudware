@@ -13,7 +13,7 @@ Persistence:
   If neither is given, the doc is returned in memory only (use ``req_create`` return value
   to persist it yourself).
 
-The pure brain is ``engine_oracle.requirements``.  This module is the thin MCP adapter.
+The pure brain is ``services.requirements``.  This module is the thin MCP adapter.
 """
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ from typing import Optional, TYPE_CHECKING
 if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
 
-from engine_oracle.requirements import RequirementsDoc
+from services.requirements import RequirementsDoc
 
 # Meta key used inside .step+ doc (same convention as intake/_K_INTAKE etc.)
 _K_REQUIREMENTS = "requirements"
@@ -351,7 +351,7 @@ def _markdown_with_battery_evidence(doc) -> str:
     """
     base = doc.to_markdown()
 
-    from engine_oracle.requirements.requirements import _sort_key
+    from services.requirements.requirements import _sort_key
 
     # Check if any requirements have battery evidence
     battery_lines: list[str] = []

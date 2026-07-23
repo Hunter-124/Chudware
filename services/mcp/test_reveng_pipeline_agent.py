@@ -145,16 +145,16 @@ def _install_backend(
     # colmap_pipeline
     if "colmap_pipeline" in fail_imports:
         monkeypatch.setitem(
-            sys.modules, "engine_oracle.vision.colmap_pipeline",
+            sys.modules, "services.vision.colmap_pipeline",
             types.ModuleType("broken"),
         )
         # Make import raise
         class _Boom:
             def __getattr__(self, _n):
                 raise ImportError("colmap missing")
-        monkeypatch.setitem(sys.modules, "engine_oracle.vision.colmap_pipeline", _Boom())  # type: ignore
+        monkeypatch.setitem(sys.modules, "services.vision.colmap_pipeline", _Boom())  # type: ignore
     else:
-        cp = _mod("engine_oracle.vision.colmap_pipeline")
+        cp = _mod("services.vision.colmap_pipeline")
 
         def run_sparse(image_dir, out_dir, **kw):
             calls["sparse"].append({"image_dir": image_dir, "out_dir": out_dir, **kw})
@@ -169,7 +169,7 @@ def _install_backend(
         cp.run_sparse = run_sparse
 
     # ffwd_sfm
-    ff = _mod("engine_oracle.vision.ffwd_sfm")
+    ff = _mod("services.vision.ffwd_sfm")
 
     def run_ffwd_sfm(image_paths, session_dir):
         calls["ffwd"].append({"image_paths": list(image_paths),
@@ -182,7 +182,7 @@ def _install_backend(
     ff.run_ffwd_sfm = run_ffwd_sfm
 
     # dense_backends
-    db = _mod("engine_oracle.vision.dense_backends")
+    db = _mod("services.vision.dense_backends")
 
     def run_openmvs(sparse_dir, session_dir, **kw):
         calls["openmvs"].append({"sparse_dir": sparse_dir, "session_dir": session_dir})
@@ -211,7 +211,7 @@ def _install_backend(
     db.run_brush = run_brush
 
     # mesh_cleanup
-    mc = _mod("engine_oracle.vision.mesh_cleanup")
+    mc = _mod("services.vision.mesh_cleanup")
 
     def cleanup_mesh(mesh_path, out_path, **kw):
         calls["cleanup"].append({"mesh_path": mesh_path, "out_path": out_path, **kw})
@@ -226,9 +226,9 @@ def _install_backend(
         class _BoomFit:
             def __getattr__(self, _n):
                 raise ImportError("open3d missing")
-        monkeypatch.setitem(sys.modules, "engine_oracle.vision.segment_fit", _BoomFit())  # type: ignore
+        monkeypatch.setitem(sys.modules, "services.vision.segment_fit", _BoomFit())  # type: ignore
     else:
-        sf = _mod("engine_oracle.vision.segment_fit")
+        sf = _mod("services.vision.segment_fit")
 
         def segment_fit(mesh_path=None, *, session_id="", **kw):
             calls["fit"].append({"mesh_path": mesh_path, "session_id": session_id, **kw})
@@ -256,9 +256,9 @@ def _install_backend(
         class _BoomML:
             def __getattr__(self, _n):
                 raise ImportError("cad_recode missing")
-        monkeypatch.setitem(sys.modules, "engine_oracle.vision.cad_recode", _BoomML())  # type: ignore
+        monkeypatch.setitem(sys.modules, "services.vision.cad_recode", _BoomML())  # type: ignore
     else:
-        cr = _mod("engine_oracle.vision.cad_recode")
+        cr = _mod("services.vision.cad_recode")
 
         def build_parametric(mesh_path, session_dir, scale_transform=None, device=None):
             calls["ml"].append({
@@ -373,8 +373,8 @@ class TestReconstructNode:
             def __getattr__(self, _n):
                 raise ImportError("no colmap")
 
-        monkeypatch.setitem(sys.modules, "engine_oracle.vision.colmap_pipeline", _Boom())
-        monkeypatch.setitem(sys.modules, "engine_oracle.vision.ffwd_sfm", _Boom())
+        monkeypatch.setitem(sys.modules, "services.vision.colmap_pipeline", _Boom())
+        monkeypatch.setitem(sys.modules, "services.vision.ffwd_sfm", _Boom())
         _patch_reveng_status(monkeypatch, lambda: {
             "ok": True,
             "capabilities": {"sparse": False, "dense": False},
@@ -501,7 +501,7 @@ class TestMcpToolUnstubs:
         sid, root, _mesh = session_env
         calls = {"sp": []}
 
-        sp = types.ModuleType("engine_oracle.vision.single_photo")
+        sp = types.ModuleType("services.vision.single_photo")
 
         def reconstruct_single_photo(image_path, session_id, *, quality="low",
                                      output_dir=None):
@@ -518,7 +518,7 @@ class TestMcpToolUnstubs:
             }
 
         sp.reconstruct_single_photo = reconstruct_single_photo
-        monkeypatch.setitem(sys.modules, "engine_oracle.vision.single_photo", sp)
+        monkeypatch.setitem(sys.modules, "services.vision.single_photo", sp)
         _patch_reveng_status(monkeypatch, lambda: {
             "ok": True,
             "capabilities": {"single_photo": True},

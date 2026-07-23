@@ -928,8 +928,8 @@ def audit_structural() -> None:
     # PyNite available — run a cantilever beam check
     # Cantilever: L=3000mm (3m), W200x100 I-beam, steel, P=5000N at tip
     # Expected: delta = P*L^3/(3*E*I)
-    from engine.structural import analysis as sa
-
+    # (engine.structural was ported to core/structural in T-RF19; this family audits
+    #  PyNite itself, no engine import needed.)
     try:
         import numpy as np
         from Pynite import FEModel3D  # PyNiteFEA installs module "Pynite"

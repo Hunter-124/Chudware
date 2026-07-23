@@ -1,5 +1,5 @@
 # Bearing seat fit context pack
-# Source: engine_oracle/research/data/iso286.json (IT grades, shaft deviations)
+# Source: services/research/data/iso286.json (IT grades, shaft deviations)
 #         ISO 286-1:2010; Shigley's Mechanical Engineering Design 10th ed. Table 11-1
 
 ## Callout format

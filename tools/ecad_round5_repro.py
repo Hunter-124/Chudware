@@ -5,7 +5,7 @@ self-contained. Run with the engine venv python from the repo root.
 """
 import sys, json, os, tempfile
 
-from engine.ecad import orchestrator as orch
+from services.ecad_design import orchestrator as orch
 from engine.ecad import session as ecad_session
 from engine.ecad import dfm as dfm_mod
 from engine.ecad import rpc as ecad_rpc

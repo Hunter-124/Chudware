@@ -305,7 +305,7 @@ def _cef(html, url="https://example.com/", status=200):
 def sess(tmp_path, monkeypatch):
     """Reload services.browser.* under an isolated APPDATA base (mirrors test_browser_session)."""
     monkeypatch.setenv("APPDATA", str(tmp_path))
-    from engine import paths as engine_paths
+    from services import paths as engine_paths
     importlib.reload(engine_paths)
     from services.browser import profiles, ratelimit, session
     importlib.reload(profiles)

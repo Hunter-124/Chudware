@@ -1,5 +1,5 @@
 # Tolerance and fit context pack
-# Source: engine_oracle/research/data/iso286.json (IT grades, shaft deviations)
+# Source: services/research/data/iso286.json (IT grades, shaft deviations)
 #         ISO 286-1:2010; ISO 286-2:2010; fit_recommendations.json
 
 ## Fit class guide (ISO 286, iso286.json + fit_recommendations.json)

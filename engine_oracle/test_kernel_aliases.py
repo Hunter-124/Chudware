@@ -8,7 +8,8 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
-from engine.kernel import run_code
+# T-RF20: executor re-homed to services (see services/kernel_exec.py).
+from services.kernel_exec import run_code
 
 
 def _build(code: str, name: str = "alias_test"):

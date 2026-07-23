@@ -10,6 +10,8 @@
 #include <string>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 #include "sim/lbm.h"
 
 namespace aicad {
@@ -39,6 +41,30 @@ struct FlowParams {
 LbmResult run_wind_tunnel(const std::vector<std::vector<float>>& body_pos,
                           const std::vector<std::vector<uint32_t>>& body_idx,
                           const FlowParams& fp, double* reynolds_out = nullptr);
+
+// ── sim_run_flow_stl (host sim-panel flow path; T-RF wave: kills the Python sim worker) ──
+//
+// JSON-in/JSON-out front-end mirroring the retired Python sim worker's sim_run_flow envelope
+// (engine_oracle/sim/worker.py). Params (all optional except stl_path):
+//   stl_path (str, mm), direction [x,y,z] (base flow axis, default [1,0,0]),
+//   speed_mps (float, 10), preset ("coarse"|"medium"|"fine"|"xfine" → cells/steps per the
+//   oracle's _PRESETS), cells?/n_steps? (explicit overrides), aoa_deg, sideslip_deg,
+//   fluid {name, density_kgm3, kinematic_visc_m2s} (default air), roughness_um,
+//   ref_area_mm2 (0 = auto frontal), solver ("lbm" only — "openfoam" returns a structured
+//   unsupported_solver error), job_id?, progress_path? (same side-channels as FlowParams).
+// The composed flow direction (base + AoA + sideslip, oracle _compose_flow_dir) is aligned to
+// the tunnel's +X by rotating the STL triangles, then the SAME X-scanline voxelization + LBM
+// as run_wind_tunnel runs (aoa is baked into the rotation — FlowParams.aoa_deg stays 0).
+//
+// Result mirrors the worker envelope the sim panel consumes: drag_n, lift_n, side_n, cd, cl,
+// ld, reynolds, frontal_area_mm2, ref_area_mm2, reynolds_note, diverged, trace (empty — the
+// C++ kernel keeps no drag history; the panel's live sparkline is progress-file driven),
+// cp_min, cp_max, vmax_mps, solver_notes, scalar_fields (empty). NOT PORTED: the overlay
+// package (flow_overlay AICM / streamlines / slice PNGs) — the result carries
+// "overlay_pending": true and no overlay_aicm; the panel degrades to forces-only.
+// side_n is 0.0: the C++ kernel's momentum exchange reports drag/lift only.
+// Failures return {"ok": false, "error", "code", "message"} (never throws).
+nlohmann::json run_flow_stl(const nlohmann::json& params);
 
 }  // namespace sim
 }  // namespace aicad

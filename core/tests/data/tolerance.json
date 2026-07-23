@@ -1,0 +1,729 @@
+[
+  {
+    "name": "textbook_3dim",
+    "params": {
+      "dims": [
+        {
+          "direction": 1.0,
+          "name": "A_slot_width",
+          "nominal": 40.0,
+          "tol": 0.05
+        },
+        {
+          "direction": -1.0,
+          "name": "B_block1_width",
+          "nominal": 17.0,
+          "tol": 0.025
+        },
+        {
+          "direction": -1.0,
+          "name": "C_block2_width",
+          "nominal": 20.0,
+          "tol": 0.04
+        }
+      ],
+      "mode": "both"
+    },
+    "result": {
+      "assumed_dims": [],
+      "contributors": [
+        {
+          "assumed": false,
+          "contrib_rss_sq": 0.0025,
+          "contrib_wc": 0.05,
+          "direction": 1.0,
+          "name": "A_slot_width",
+          "nominal": 40.0,
+          "pct_rss": 52.9101,
+          "pct_wc": 43.4783,
+          "ref": null,
+          "tol_half": 0.05
+        },
+        {
+          "assumed": false,
+          "contrib_rss_sq": 0.0016,
+          "contrib_wc": 0.04,
+          "direction": -1.0,
+          "name": "C_block2_width",
+          "nominal": 20.0,
+          "pct_rss": 33.8624,
+          "pct_wc": 34.7826,
+          "ref": null,
+          "tol_half": 0.04
+        },
+        {
+          "assumed": false,
+          "contrib_rss_sq": 0.000625,
+          "contrib_wc": 0.025,
+          "direction": -1.0,
+          "name": "B_block1_width",
+          "nominal": 17.0,
+          "pct_rss": 13.2275,
+          "pct_wc": 21.7391,
+          "ref": null,
+          "tol_half": 0.025
+        }
+      ],
+      "disclaimer": "Preliminary stack-up — not a certified tolerance analysis. Verify with a qualified dimensional-metrology engineer before release.",
+      "nominal_gap": 3.0,
+      "ok": true,
+      "rss": {
+        "gap_max": 3.06873864,
+        "gap_min": 2.93126136,
+        "total_tol": 0.06873864
+      },
+      "worst_case": {
+        "gap_max": 3.115,
+        "gap_min": 2.885,
+        "total_tol": 0.115
+      }
+    }
+  },
+  {
+    "name": "textbook_3dim_wc",
+    "params": {
+      "dims": [
+        {
+          "direction": 1.0,
+          "name": "A_slot_width",
+          "nominal": 40.0,
+          "tol": 0.05
+        },
+        {
+          "direction": -1.0,
+          "name": "B_block1_width",
+          "nominal": 17.0,
+          "tol": 0.025
+        },
+        {
+          "direction": -1.0,
+          "name": "C_block2_width",
+          "nominal": 20.0,
+          "tol": 0.04
+        }
+      ],
+      "mode": "worst_case"
+    },
+    "result": {
+      "assumed_dims": [],
+      "contributors": [
+        {
+          "assumed": false,
+          "contrib_rss_sq": 0.0025,
+          "contrib_wc": 0.05,
+          "direction": 1.0,
+          "name": "A_slot_width",
+          "nominal": 40.0,
+          "pct_rss": 52.9101,
+          "pct_wc": 43.4783,
+          "ref": null,
+          "tol_half": 0.05
+        },
+        {
+          "assumed": false,
+          "contrib_rss_sq": 0.0016,
+          "contrib_wc": 0.04,
+          "direction": -1.0,
+          "name": "C_block2_width",
+          "nominal": 20.0,
+          "pct_rss": 33.8624,
+          "pct_wc": 34.7826,
+          "ref": null,
+          "tol_half": 0.04
+        },
+        {
+          "assumed": false,
+          "contrib_rss_sq": 0.000625,
+          "contrib_wc": 0.025,
+          "direction": -1.0,
+          "name": "B_block1_width",
+          "nominal": 17.0,
+          "pct_rss": 13.2275,
+          "pct_wc": 21.7391,
+          "ref": null,
+          "tol_half": 0.025
+        }
+      ],
+      "disclaimer": "Preliminary stack-up — not a certified tolerance analysis. Verify with a qualified dimensional-metrology engineer before release.",
+      "nominal_gap": 3.0,
+      "ok": true,
+      "worst_case": {
+        "gap_max": 3.115,
+        "gap_min": 2.885,
+        "total_tol": 0.115
+      }
+    }
+  },
+  {
+    "name": "textbook_3dim_rss",
+    "params": {
+      "dims": [
+        {
+          "direction": 1.0,
+          "name": "A_slot_width",
+          "nominal": 40.0,
+          "tol": 0.05
+        },
+        {
+          "direction": -1.0,
+          "name": "B_block1_width",
+          "nominal": 17.0,
+          "tol": 0.025
+        },
+        {
+          "direction": -1.0,
+          "name": "C_block2_width",
+          "nominal": 20.0,
+          "tol": 0.04
+        }
+      ],
+      "mode": "rss"
+    },
+    "result": {
+      "assumed_dims": [],
+      "contributors": [
+        {
+          "assumed": false,
+          "contrib_rss_sq": 0.0025,
+          "contrib_wc": 0.05,
+          "direction": 1.0,
+          "name": "A_slot_width",
+          "nominal": 40.0,
+          "pct_rss": 52.9101,
+          "pct_wc": 43.4783,
+          "ref": null,
+          "tol_half": 0.05
+        },
+        {
+          "assumed": false,
+          "contrib_rss_sq": 0.0016,
+          "contrib_wc": 0.04,
+          "direction": -1.0,
+          "name": "C_block2_width",
+          "nominal": 20.0,
+          "pct_rss": 33.8624,
+          "pct_wc": 34.7826,
+          "ref": null,
+          "tol_half": 0.04
+        },
+        {
+          "assumed": false,
+          "contrib_rss_sq": 0.000625,
+          "contrib_wc": 0.025,
+          "direction": -1.0,
+          "name": "B_block1_width",
+          "nominal": 17.0,
+          "pct_rss": 13.2275,
+          "pct_wc": 21.7391,
+          "ref": null,
+          "tol_half": 0.025
+        }
+      ],
+      "disclaimer": "Preliminary stack-up — not a certified tolerance analysis. Verify with a qualified dimensional-metrology engineer before release.",
+      "nominal_gap": 3.0,
+      "ok": true,
+      "rss": {
+        "gap_max": 3.06873864,
+        "gap_min": 2.93126136,
+        "total_tol": 0.06873864
+      }
+    }
+  },
+  {
+    "name": "single_dim",
+    "params": {
+      "dims": [
+        {
+          "name": "d",
+          "nominal": 10.0,
+          "tol": 0.1
+        }
+      ],
+      "mode": "both"
+    },
+    "result": {
+      "assumed_dims": [],
+      "contributors": [
+        {
+          "assumed": false,
+          "contrib_rss_sq": 0.01,
+          "contrib_wc": 0.1,
+          "direction": 1.0,
+          "name": "d",
+          "nominal": 10.0,
+          "pct_rss": 100.0,
+          "pct_wc": 100.0,
+          "ref": null,
+          "tol_half": 0.1
+        }
+      ],
+      "disclaimer": "Preliminary stack-up — not a certified tolerance analysis. Verify with a qualified dimensional-metrology engineer before release.",
+      "nominal_gap": 10.0,
+      "ok": true,
+      "rss": {
+        "gap_max": 10.1,
+        "gap_min": 9.9,
+        "total_tol": 0.1
+      },
+      "worst_case": {
+        "gap_max": 10.1,
+        "gap_min": 9.9,
+        "total_tol": 0.1
+      }
+    }
+  },
+  {
+    "name": "mixed_assumed_ref_clamp",
+    "params": {
+      "dims": [
+        {
+          "assumed": true,
+          "name": "housing",
+          "nominal": 50.0,
+          "ref": "F12",
+          "tol": 0.05
+        },
+        {
+          "direction": -1.0,
+          "name": "gasket",
+          "nominal": 2.0,
+          "tol": 0.2
+        },
+        {
+          "direction": 2.5,
+          "name": "cover",
+          "nominal": 1.5,
+          "tol": 0.1
+        },
+        {
+          "direction": 0,
+          "name": "zero_dir",
+          "nominal": 3.25,
+          "tol": 0.02
+        }
+      ],
+      "mode": "both"
+    },
+    "result": {
+      "assumed_dims": [
+        "housing"
+      ],
+      "contributors": [
+        {
+          "assumed": false,
+          "contrib_rss_sq": 0.04,
+          "contrib_wc": 0.2,
+          "direction": -1.0,
+          "name": "gasket",
+          "nominal": 2.0,
+          "pct_rss": 75.6144,
+          "pct_wc": 54.0541,
+          "ref": null,
+          "tol_half": 0.2
+        },
+        {
+          "assumed": false,
+          "contrib_rss_sq": 0.01,
+          "contrib_wc": 0.1,
+          "direction": 1.0,
+          "name": "cover",
+          "nominal": 1.5,
+          "pct_rss": 18.9036,
+          "pct_wc": 27.027,
+          "ref": null,
+          "tol_half": 0.1
+        },
+        {
+          "assumed": true,
+          "contrib_rss_sq": 0.0025,
+          "contrib_wc": 0.05,
+          "direction": 1.0,
+          "name": "housing",
+          "nominal": 50.0,
+          "pct_rss": 4.7259,
+          "pct_wc": 13.5135,
+          "ref": "F12",
+          "tol_half": 0.05
+        },
+        {
+          "assumed": false,
+          "contrib_rss_sq": 0.0004,
+          "contrib_wc": 0.02,
+          "direction": 1.0,
+          "name": "zero_dir",
+          "nominal": 3.25,
+          "pct_rss": 0.7561,
+          "pct_wc": 5.4054,
+          "ref": null,
+          "tol_half": 0.02
+        }
+      ],
+      "disclaimer": "Preliminary stack-up — not a certified tolerance analysis. Verify with a qualified dimensional-metrology engineer before release.",
+      "nominal_gap": 52.75,
+      "ok": true,
+      "rss": {
+        "gap_max": 52.98,
+        "gap_min": 52.52,
+        "total_tol": 0.23
+      },
+      "worst_case": {
+        "gap_max": 53.12,
+        "gap_min": 52.38,
+        "total_tol": 0.37
+      }
+    }
+  },
+  {
+    "name": "zero_tol",
+    "params": {
+      "dims": [
+        {
+          "name": "d1",
+          "nominal": 5.0,
+          "tol": 0.0
+        },
+        {
+          "name": "d2",
+          "nominal": 5.0,
+          "tol": 0.1
+        }
+      ],
+      "mode": "both"
+    },
+    "result": {
+      "assumed_dims": [],
+      "contributors": [
+        {
+          "assumed": false,
+          "contrib_rss_sq": 0.01,
+          "contrib_wc": 0.1,
+          "direction": 1.0,
+          "name": "d2",
+          "nominal": 5.0,
+          "pct_rss": 100.0,
+          "pct_wc": 100.0,
+          "ref": null,
+          "tol_half": 0.1
+        },
+        {
+          "assumed": false,
+          "contrib_rss_sq": 0.0,
+          "contrib_wc": 0.0,
+          "direction": 1.0,
+          "name": "d1",
+          "nominal": 5.0,
+          "pct_rss": 0.0,
+          "pct_wc": 0.0,
+          "ref": null,
+          "tol_half": 0.0
+        }
+      ],
+      "disclaimer": "Preliminary stack-up — not a certified tolerance analysis. Verify with a qualified dimensional-metrology engineer before release.",
+      "nominal_gap": 10.0,
+      "ok": true,
+      "rss": {
+        "gap_max": 10.1,
+        "gap_min": 9.9,
+        "total_tol": 0.1
+      },
+      "worst_case": {
+        "gap_max": 10.1,
+        "gap_min": 9.9,
+        "total_tol": 0.1
+      }
+    }
+  },
+  {
+    "name": "equal_tols_4",
+    "params": {
+      "dims": [
+        {
+          "name": "d0",
+          "nominal": 1.0,
+          "tol": 0.1
+        },
+        {
+          "name": "d1",
+          "nominal": 1.0,
+          "tol": 0.1
+        },
+        {
+          "name": "d2",
+          "nominal": 1.0,
+          "tol": 0.1
+        },
+        {
+          "name": "d3",
+          "nominal": 1.0,
+          "tol": 0.1
+        }
+      ],
+      "mode": "both"
+    },
+    "result": {
+      "assumed_dims": [],
+      "contributors": [
+        {
+          "assumed": false,
+          "contrib_rss_sq": 0.01,
+          "contrib_wc": 0.1,
+          "direction": 1.0,
+          "name": "d0",
+          "nominal": 1.0,
+          "pct_rss": 25.0,
+          "pct_wc": 25.0,
+          "ref": null,
+          "tol_half": 0.1
+        },
+        {
+          "assumed": false,
+          "contrib_rss_sq": 0.01,
+          "contrib_wc": 0.1,
+          "direction": 1.0,
+          "name": "d1",
+          "nominal": 1.0,
+          "pct_rss": 25.0,
+          "pct_wc": 25.0,
+          "ref": null,
+          "tol_half": 0.1
+        },
+        {
+          "assumed": false,
+          "contrib_rss_sq": 0.01,
+          "contrib_wc": 0.1,
+          "direction": 1.0,
+          "name": "d2",
+          "nominal": 1.0,
+          "pct_rss": 25.0,
+          "pct_wc": 25.0,
+          "ref": null,
+          "tol_half": 0.1
+        },
+        {
+          "assumed": false,
+          "contrib_rss_sq": 0.01,
+          "contrib_wc": 0.1,
+          "direction": 1.0,
+          "name": "d3",
+          "nominal": 1.0,
+          "pct_rss": 25.0,
+          "pct_wc": 25.0,
+          "ref": null,
+          "tol_half": 0.1
+        }
+      ],
+      "disclaimer": "Preliminary stack-up — not a certified tolerance analysis. Verify with a qualified dimensional-metrology engineer before release.",
+      "nominal_gap": 4.0,
+      "ok": true,
+      "rss": {
+        "gap_max": 4.2,
+        "gap_min": 3.8,
+        "total_tol": 0.2
+      },
+      "worst_case": {
+        "gap_max": 4.4,
+        "gap_min": 3.6,
+        "total_tol": 0.4
+      }
+    }
+  },
+  {
+    "name": "tie_stable_sort",
+    "params": {
+      "dims": [
+        {
+          "name": "first",
+          "nominal": 1.0,
+          "tol": 0.1
+        },
+        {
+          "name": "second",
+          "nominal": 2.0,
+          "tol": 0.1
+        }
+      ],
+      "mode": "both"
+    },
+    "result": {
+      "assumed_dims": [],
+      "contributors": [
+        {
+          "assumed": false,
+          "contrib_rss_sq": 0.01,
+          "contrib_wc": 0.1,
+          "direction": 1.0,
+          "name": "first",
+          "nominal": 1.0,
+          "pct_rss": 50.0,
+          "pct_wc": 50.0,
+          "ref": null,
+          "tol_half": 0.1
+        },
+        {
+          "assumed": false,
+          "contrib_rss_sq": 0.01,
+          "contrib_wc": 0.1,
+          "direction": 1.0,
+          "name": "second",
+          "nominal": 2.0,
+          "pct_rss": 50.0,
+          "pct_wc": 50.0,
+          "ref": null,
+          "tol_half": 0.1
+        }
+      ],
+      "disclaimer": "Preliminary stack-up — not a certified tolerance analysis. Verify with a qualified dimensional-metrology engineer before release.",
+      "nominal_gap": 3.0,
+      "ok": true,
+      "rss": {
+        "gap_max": 3.14142136,
+        "gap_min": 2.85857864,
+        "total_tol": 0.14142136
+      },
+      "worst_case": {
+        "gap_max": 3.2,
+        "gap_min": 2.8,
+        "total_tol": 0.2
+      }
+    }
+  },
+  {
+    "name": "int_inputs",
+    "params": {
+      "dims": [
+        {
+          "direction": 1,
+          "name": "a",
+          "nominal": 40,
+          "tol": 1
+        }
+      ],
+      "mode": "both"
+    },
+    "result": {
+      "assumed_dims": [],
+      "contributors": [
+        {
+          "assumed": false,
+          "contrib_rss_sq": 1.0,
+          "contrib_wc": 1.0,
+          "direction": 1.0,
+          "name": "a",
+          "nominal": 40.0,
+          "pct_rss": 100.0,
+          "pct_wc": 100.0,
+          "ref": null,
+          "tol_half": 1.0
+        }
+      ],
+      "disclaimer": "Preliminary stack-up — not a certified tolerance analysis. Verify with a qualified dimensional-metrology engineer before release.",
+      "nominal_gap": 40.0,
+      "ok": true,
+      "rss": {
+        "gap_max": 41.0,
+        "gap_min": 39.0,
+        "total_tol": 1.0
+      },
+      "worst_case": {
+        "gap_max": 41.0,
+        "gap_min": 39.0,
+        "total_tol": 1.0
+      }
+    }
+  },
+  {
+    "name": "err_empty",
+    "params": {
+      "dims": [],
+      "mode": "both"
+    },
+    "result": {
+      "code": "invalid_input",
+      "error": "stackup_analyze requires at least one dimension",
+      "ok": false
+    }
+  },
+  {
+    "name": "err_negative_tol",
+    "params": {
+      "dims": [
+        {
+          "name": "d",
+          "nominal": 5.0,
+          "tol": -0.1
+        }
+      ],
+      "mode": "both"
+    },
+    "result": {
+      "code": "invalid_input",
+      "error": "Dimension 'd': 'tol' must be ≥ 0, got -0.1",
+      "ok": false
+    }
+  },
+  {
+    "name": "err_missing_nominal",
+    "params": {
+      "dims": [
+        {
+          "name": "d",
+          "tol": 0.1
+        }
+      ],
+      "mode": "both"
+    },
+    "result": {
+      "code": "invalid_input",
+      "error": "Dimension 'd': missing or invalid 'nominal'",
+      "ok": false
+    }
+  },
+  {
+    "name": "err_missing_tol",
+    "params": {
+      "dims": [
+        {
+          "name": "d",
+          "nominal": 0.1
+        }
+      ],
+      "mode": "both"
+    },
+    "result": {
+      "code": "invalid_input",
+      "error": "Dimension 'd': missing or invalid 'tol'",
+      "ok": false
+    }
+  },
+  {
+    "name": "err_bad_mode",
+    "params": {
+      "dims": [
+        {
+          "direction": 1.0,
+          "name": "A_slot_width",
+          "nominal": 40.0,
+          "tol": 0.05
+        },
+        {
+          "direction": -1.0,
+          "name": "B_block1_width",
+          "nominal": 17.0,
+          "tol": 0.025
+        },
+        {
+          "direction": -1.0,
+          "name": "C_block2_width",
+          "nominal": 20.0,
+          "tol": 0.04
+        }
+      ],
+      "mode": "wc"
+    },
+    "result": {
+      "code": "invalid_mode",
+      "error": "Invalid mode 'wc'. Choose: ['both', 'rss', 'worst_case']",
+      "ok": false
+    }
+  }
+]

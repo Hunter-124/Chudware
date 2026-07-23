@@ -40,9 +40,9 @@ sys.path.insert(0, str(_REPO))
 from tools.reveng.gen_bracket_fixture import build_fixture  # noqa: E402
 
 # RE-05 solver + provisioning probe
-from engine_oracle.vision.scale_solver import solve_scale_aruco  # noqa: E402
-from engine_oracle.vision.fiducial import HAVE_CV2  # noqa: E402
-from engine_oracle.vision.reveng_provision import reveng_status  # noqa: E402
+from services.vision.scale_solver import solve_scale_aruco  # noqa: E402
+from services.vision.fiducial import HAVE_CV2  # noqa: E402
+from services.vision.reveng_provision import reveng_status  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

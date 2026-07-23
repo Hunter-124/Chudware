@@ -418,7 +418,7 @@ class TestIntakeLedgerCrossSession:
         """IntakeState.from_dict(to_dict()) keeps the interaction records — the
         wipe hazard: intake tools that load/save the state via the dataclass must
         never drop answers recorded by the ledger."""
-        from engine.intake.intake import IntakeState
+        from services.intake.intake import IntakeState
 
         st = IntakeState(status="awaiting_user", doc_id="doc_x")
         st.interaction = {

@@ -291,7 +291,7 @@ class TestPartSearch:
         assert md.part_search("")["ok"] is False
 
     def test_routes_to_parts_hub(self, md, monkeypatch):
-        import engine_oracle.parts_hub as hub
+        import services.parts as hub
 
         monkeypatch.setattr(hub, "search",
                             lambda q, domain=None, limit=20, **kw:
@@ -335,7 +335,7 @@ class TestPartsV2Handlers:
         assert any(c["id"] == "fasteners" for c in out["children"])
 
     def test_part_get(self, md, monkeypatch):
-        import engine_oracle.parts_hub as hub
+        import services.parts as hub
         monkeypatch.setattr(hub, "get",
                             lambda pid: {"part_id": pid} if pid == "x:1" else None)
         assert md.part_get("x:1")["ok"] is True

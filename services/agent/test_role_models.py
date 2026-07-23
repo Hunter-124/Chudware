@@ -398,7 +398,7 @@ class TestSpawnDepthPolicy:
 
 class TestRpcRegistration:
     def test_methods_registered_on_worker(self):
-        from engine_oracle.parts_hub.worker_rpc import WORKER_METHODS
+        from services.agent.worker_rpc import WORKER_METHODS
 
         for name in (
             "ai_roles_get",
@@ -410,7 +410,7 @@ class TestRpcRegistration:
             assert callable(WORKER_METHODS[name])
 
     def test_ai_roles_get_shape(self, monkeypatch, tmp_path):
-        from engine_oracle.parts_hub import role_models_rpc as rpc
+        from services.agent import worker_rpc as rpc
 
         cfg_path = tmp_path / "config.json"
         cfg_path.write_text("{}", encoding="utf-8")
@@ -424,7 +424,7 @@ class TestRpcRegistration:
             assert r in out["roles"]
 
     def test_ai_roles_set_refuses_cloud_redaction(self, monkeypatch):
-        from engine_oracle.parts_hub import role_models_rpc as rpc
+        from services.agent import worker_rpc as rpc
 
         monkeypatch.setattr("services.agent.config.load_config", lambda: {})
         out = rpc.ROLE_MODELS_METHODS["ai_roles_set"](
@@ -435,7 +435,7 @@ class TestRpcRegistration:
         assert "loopback" in out["reason"].lower() or "HARD" in out["reason"]
 
     def test_model_rankings_get_shape(self, monkeypatch):
-        from engine_oracle.parts_hub import role_models_rpc as rpc
+        from services.agent import worker_rpc as rpc
 
         monkeypatch.setattr("services.agent.config.load_config", lambda: {})
         out = rpc.ROLE_MODELS_METHODS["model_rankings_get"](

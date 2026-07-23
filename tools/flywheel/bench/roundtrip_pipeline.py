@@ -120,7 +120,7 @@ def stage_parts_research(st: Stage, state: dict) -> None:
     if search is None:
         # Fall back to pure research.thread_spec / material as a smoke of research_*.
         try:
-            from engine import research
+            from services import research
             thr = research.thread_spec("M8")
             mat = research.material_lookup("6061-T6")
             if thr.get("ok") or thr.get("answer") or thr.get("major_mm") is not None:
@@ -269,8 +269,7 @@ def stage_datasheet_ingest(st: Stage, state: dict) -> None:
 
     ingest = None
     for path in (
-        "engine_oracle.vision.datasheet_ingest",
-        "engine.vision.datasheet_ingest",
+        "services.vision.datasheet_ingest",
     ):
         try:
             mod = __import__(path, fromlist=["ingest_datasheet"])

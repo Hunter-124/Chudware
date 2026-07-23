@@ -13,7 +13,7 @@ Cases (each vs a cited analytic reference where one exists):
                              (dry_run) envelope validity (regression-only, ref None)
 
 Engine cases run IN-PROCESS (AI_CAD_ENGINE_DAEMON=0, services/dist libaicad via
-services.mcp.core_bridge); optional deps (fluids / Pynite / build123d / engine lib)
+services.mcp.core_bridge); optional deps (fluids / build123d / engine lib)
 produce clean skips. All cases are light — quick and full modes differ only in the
 motion sweep sample count.
 """
@@ -157,27 +157,29 @@ def _bench_internal_volume() -> dict:
 
 
 def _bench_struct() -> dict:
-    if not _have("Pynite"):
-        return _skip("struct_cantilever_udl", "Pynite not installed")
-    from engine.structural.elements import StructureDoc
-    from engine.structural.analysis import analyze_doc
+    if not _engine_ok():
+        return _skip("struct_cantilever_udl", "libaicad not staged (engine unavailable)")
+    from mcp_server import core_bridge as cb
     L, w = 2000.0, 10.0
-    doc = StructureDoc.from_dict({
+    doc = {
         "schema": "aicad.structure/1",
         "elements": [{"element_type": "beam", "section_name": "100x100",
                       "material": "steel", "length_mm": L, "id": "b1",
                       "transform": [0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1]}],
         "load_cases": [{"kind": "dead", "factor": 1.0, "gravity": [0, 0, -1],
                         "distributed": {"w_n_per_mm": w}}],
-    })
+    }
     t0 = time.perf_counter()
     try:
-        res = analyze_doc(doc, "DEAD_ONLY")
-    except ImportError as exc:
-        return _skip("struct_cantilever_udl", f"structural stack unavailable: {exc}")
+        res = cb.call("struct_analyze", {"doc": doc, "load_combo": "DEAD_ONLY"})
+    except cb.CoreError as exc:
+        return _skip("struct_cantilever_udl", f"structural solver unavailable: {exc}")
     dt = time.perf_counter() - t0
+    if res.get("code") and res.get("message"):
+        return _case("struct_cantilever_udl", total_s=dt, solve_s=dt, status="fail",
+                     detail=f"struct_analyze: {res['message']}")
     row = res["results"][0]
-    E = 200000.0                    # steel E (MPa), analysis.py materials table
+    E = 200000.0                    # steel E (MPa), core/structural materials table
     I = 100.0 * 100.0 ** 3 / 12.0   # I = b*h^3/12, 100x100 square
     ref = 1.4 * w * L ** 4 / (8.0 * E * I)   # Euler-Bernoulli cantilever UDL, 1.4D combo
     return _case("struct_cantilever_udl", total_s=dt, solve_s=dt,

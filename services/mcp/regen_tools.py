@@ -30,7 +30,7 @@ def _journal_sink() -> Callable[[dict], None]:
     """
     def _sink(event: dict) -> None:
         try:
-            from engine import paths
+            from services import paths
             out = paths.CACHE / "telemetry" / "events.jsonl"
             out.parent.mkdir(parents=True, exist_ok=True)
             with out.open("a", encoding="utf-8") as fh:

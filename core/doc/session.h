@@ -440,6 +440,12 @@ nlohmann::json doc_vendor_part_insert(const std::string& into, const std::string
 // (engine.doc.formats._import_3mf). `fmt` defaults to detect_format(path) when empty.
 nlohmann::json mesh_read_raw(const std::string& path, const std::string& fmt);
 
+// The import/export format matrix (port of engine/doc/formats.py::doc_formats). Returns
+// {"formats": [{fmt, label, exts, lane, can_import, can_export}, ...]} sourced from
+// format_registry() — the host builds its Open/Import/Export filters from this so the
+// UI never lists a format the engine can't handle (and vice-versa). Stateless.
+nlohmann::json doc_formats();
+
 // Persist the session to `path` (or its current path if `path` is empty) as a
 // .step+ container. Clears the dirty flag, records the path. Returns {"path": ...}.
 // Throws OpError("io_error") if no path is available, or on a write failure.

@@ -917,30 +917,30 @@ def _run_prerun_calc(calc_spec: dict, text: str) -> Optional[dict]:
 
     try:
         if calc_id == "tap_drill":
-            from engine_oracle.research.machining import tap_drill  # noqa: PLC0415
+            from services.research.machining import tap_drill  # noqa: PLC0415
             result = tap_drill(inputs.get("thread", ""))
         elif calc_id == "fit_calc":
-            from engine_oracle.research.fits import fit_calc  # noqa: PLC0415
+            from services.research.fits import fit_calc  # noqa: PLC0415
             nominal = inputs.get("nominal")
             fit = inputs.get("fit", "H7/g6")
             if nominal is None:
                 return None
             result = fit_calc(float(nominal), str(fit))
         elif calc_id == "snap_fit":
-            from engine_oracle.research.calcs.snap_fit import snap_fit as _snap  # noqa: PLC0415
+            from services.research.calcs.snap_fit import snap_fit as _snap  # noqa: PLC0415
             result = _snap(**inputs)
         elif calc_id == "wall_thickness":
-            from engine_oracle.research.calcs.wall_thickness import wall_thickness as _wt  # noqa: PLC0415
+            from services.research.calcs.wall_thickness import wall_thickness as _wt  # noqa: PLC0415
             result = _wt(**inputs)
         elif calc_id == "bend_allowance":
-            from engine_oracle.research.calcs.bend_allowance import bend_allowance as _ba  # noqa: PLC0415
+            from services.research.calcs.bend_allowance import bend_allowance as _ba  # noqa: PLC0415
             result = _ba(**inputs)
         elif calc_id == "draft_check":
-            from engine_oracle.research.calcs.draft_check import draft_check as _dc  # noqa: PLC0415
+            from services.research.calcs.draft_check import draft_check as _dc  # noqa: PLC0415
             result = _dc(**inputs)
         else:
             # Try the generic calc registry
-            from engine_oracle.research.calcs.registry import run_calc  # noqa: PLC0415
+            from services.research.calcs.registry import run_calc  # noqa: PLC0415
             result = run_calc(calc_id, inputs)
     except Exception:  # noqa: BLE001
         return None

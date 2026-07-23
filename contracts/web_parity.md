@@ -53,19 +53,33 @@ Rules:
     {"method": "fw_sim_run",         "note": "firmware emulator, C++ (T-RF15 resume landed 2026-07-22)"},
     {"method": "bom_rollup",         "note": "sourcing/BOM, C++ (T-RF18 landed 2026-07-22)"},
     {"method": "bom_price",          "note": "sourcing/BOM, C++ (T-RF18 landed 2026-07-22)"},
-    {"method": "spec_sheet_match",   "note": "sourcing/spec-match, C++ (T-RF18 landed 2026-07-22)"}
+    {"method": "spec_sheet_match",   "note": "sourcing/spec-match, C++ (T-RF18 landed 2026-07-22)"},
+    {"method": "hydraulic_new",      "note": "hydraulic circuit, C++ (T-RF19 landed 2026-07-22)"},
+    {"method": "piping_solve",       "note": "piping network solve, C++ (T-RF19 landed 2026-07-22)"},
+    {"method": "struct_analyze",     "note": "structural frame solve, C++ (T-RF19 landed 2026-07-22)"},
+    {"method": "stackup_analyze",    "note": "tolerance stackup, C++ (T-RF19 landed 2026-07-22)"},
+    {"method": "part_place",         "note": "parts placement, C++ (T-RF19 landed 2026-07-22; callers pass record)"}
   ],
   "web_unsupported": [
     {"method": "ecad_design",        "family": "ECAD LLM orchestrator","remove_at": "T-RF20"},
-    {"method": "hydraulic_new",      "family": "hydraulic",            "remove_at": "T-RF19"},
-    {"method": "pipe_network",       "family": "piping",               "remove_at": "T-RF19"},
-    {"method": "struct_analyze",     "family": "structural",           "remove_at": "T-RF19"},
-    {"method": "tolerance_stack",    "family": "tolerance",            "remove_at": "T-RF19"},
-    {"method": "render_part",        "family": "headless render",      "remove_at": "T-RF19"},
-    {"method": "intake_status",      "family": "intake",               "remove_at": "T-RF19"}
+    {"method": "part_search",        "family": "parts hub FTS (Python services tier)","remove_at": "T-RF21"}
   ]
 }
 ```
+
+`render_part` was removed 2026-07-22: it is an MCP *tool* name, not a worker-RPC method
+(the tools route to `doc_render_png`/`doc_render_view`/`doc_render_contact_sheet`/
+`drawing_render_png` — all already C++ in `core/doc/session.cpp`). Same class as
+`intake_status` and `ecad_import_kicad`.
+
+`part_search` remains: the hub FTS is a services-side SQLite orchestration tier by design
+(evaluation C verdict) — resolve at T-RF21 either by a thin `parts_local_search` C++ query
+over the same index or by keeping the Parts workspace desktop-gated
+(`host/src/ui/web_capabilities.cpp`).
+
+`intake_status` was removed from the inventory 2026-07-22: it is an MCP *tool* name, not
+a worker-RPC method on either side (violates rule 3) — agent-orchestration state the web
+client never calls. Same class of removal as `ecad_import_kicad`.
 
 `ecad_import_kicad` was removed from the inventory 2026-07-22: it is not a real RPC
 method on either side (KiCad import is `ecad_open` dispatching on the `.kicad_sch`/

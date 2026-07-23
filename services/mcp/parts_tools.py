@@ -2,7 +2,7 @@
 
 Parts Library V2 additions (workstream 5): ``parts_taxonomy`` (category browse w/
 effective facets), ``part_search`` faceted/taxonomy-routed upgrade, ``part_source``
-(deterministic sourcing fan-out — engine_oracle/parts_hub/source.py),
+(deterministic sourcing fan-out — services/parts/source.py),
 ``vendors_health`` (adapter canary sweep) and ``cam_tool_import`` (cutting-tool
 part record → CAM tool library). The dict-returning implementations are
 module-level (search_parts_v2, taxonomy_browse, part_source_impl,
@@ -95,10 +95,10 @@ def taxonomy_browse(node_id: str = "", depth: int = 2,
                     include_facets: bool = True) -> dict:
     """Browse the parts category taxonomy: one node + its children + effective facets."""
     try:
-        from engine_oracle.parts_hub import taxonomy as _tax
+        from services.parts import taxonomy as _tax
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"taxonomy unavailable: {exc}",
-                "hint": "engine_oracle/parts_hub/taxonomy.py must be importable."}
+                "hint": "services/parts/taxonomy.py must be importable."}
     try:
         depth = max(1, min(int(depth or 1), 6))
         doc = _tax.load_taxonomy()
@@ -164,10 +164,10 @@ def search_parts_v2(query: str, domain: str = "", limit: int = 20,
         return {"ok": False, "reason": err,
                 "hint": 'Pass facets as a JSON dict string, e.g. \'{"od_mm": 25.4}\'.'}
     try:
-        from engine_oracle.parts_hub import search as _search
+        from services.parts import search as _search
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"part_search failed: {exc}",
-                "hint": "Check that engine_oracle/parts_hub is importable."}
+                "hint": "Check that services/parts is importable."}
     try:
         limit = max(1, min(int(limit or 20), 200))
         category_id = str(category_id or "").strip()
@@ -176,8 +176,8 @@ def search_parts_v2(query: str, domain: str = "", limit: int = 20,
         query_terms: list[str] = []
         facet_defs: list[dict] = []
         if category_id:
-            # Taxonomy routing — mirrors engine_oracle/parts_hub/gui_rpc._parts_search.
-            from engine_oracle.parts_hub import taxonomy as _tax
+            # Taxonomy routing — mirrors services/parts/gui_rpc._parts_search.
+            from services.parts import taxonomy as _tax
             if _tax.get_node(category_id) is not None:
                 routing = _tax.route(category_id)
                 dom = routing["domains"] or dom
@@ -230,13 +230,13 @@ def search_parts_v2(query: str, domain: str = "", limit: int = 20,
         if facets_q:
             # Facet post-filter with param-key alias tolerance (taxonomy keys like
             # "bore_mm" vs local record params like "bore" — source.facet_params_view).
-            from engine_oracle.parts_hub.source import facet_params_view as _fpv
-            from engine_oracle.parts_hub.taxonomy import match_facets as _mf
+            from services.parts.source import facet_params_view as _fpv
+            from services.parts.taxonomy import match_facets as _mf
             records = [r for r in records
                        if _mf(_fpv(r.get("params") or {}, facets_q.keys()),
                               facets_q, facet_defs)]
 
-        from engine_oracle.parts_hub.source import _first_price, _vendor_of
+        from services.parts.source import _first_price, _vendor_of
         try:
             price_max = float(price_max or 0.0)
         except (TypeError, ValueError):
@@ -261,7 +261,7 @@ def search_parts_v2(query: str, domain: str = "", limit: int = 20,
         # facet_summary: top value counts per facet key over THIS result set.
         summary_keys = [f.get("key") for f in facet_defs if f.get("key")] or \
             sorted(facets_q.keys())
-        from engine_oracle.parts_hub.source import facet_params_view as _fpv2
+        from services.parts.source import facet_params_view as _fpv2
         facet_summary: dict[str, list] = {}
         for key in summary_keys:
             counts: dict[str, int] = {}
@@ -294,7 +294,7 @@ def search_parts_v2(query: str, domain: str = "", limit: int = 20,
         return _rs.project_part_search(payload, opts)
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"part_search failed: {exc}",
-                "hint": "Check that engine_oracle/parts_hub is importable."}
+                "hint": "Check that services/parts is importable."}
 
 
 def vendors_health_impl(sites: str = "") -> dict:
@@ -363,7 +363,7 @@ def cam_tool_import_impl(part_id: str, number: int = 0, material: str = "", *,
                         "'tools.cutting_tools.end_mills', ...) or part_source()."}
     if _get_fn is None:
         try:
-            from engine_oracle.parts_hub import get as _get_fn
+            from services.parts import get as _get_fn
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "reason": f"parts hub unavailable: {exc}", "hint": ""}
     try:
@@ -428,7 +428,7 @@ def cam_tool_import_impl(part_id: str, number: int = 0, material: str = "", *,
         return {"ok": False, "reason": f"cam_tool_import failed: {exc}",
                 "hint": "Create/open a CAM job first (cam_new_job), then retry."}
 
-    from engine_oracle.parts_hub.source import _first_price, _vendor_of
+    from services.parts.source import _first_price, _vendor_of
     machining = {
         "part_id": part_id,
         "vendor": _vendor_of(rec),
@@ -458,12 +458,12 @@ def cam_tool_import_impl(part_id: str, number: int = 0, material: str = "", *,
 
 
 def part_source_impl(need: str, constraints: str = "", limit: int = 5) -> dict:
-    """Deterministic sourcing fan-out (engine_oracle/parts_hub/source.py)."""
+    """Deterministic sourcing fan-out (services/parts/source.py)."""
     try:
-        from engine_oracle.parts_hub.source import source as _source
+        from services.parts.source import source as _source
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"sourcing engine unavailable: {exc}",
-                "hint": "engine_oracle/parts_hub/source.py must be importable."}
+                "hint": "services/parts/source.py must be importable."}
     try:
         return _source(need, constraints or None, limit)
     except Exception as exc:  # noqa: BLE001
@@ -484,10 +484,10 @@ def match_model_impl(part_id: str = "", title: str = "", mpn: str = "",
     product: dict
     if part_id:
         try:
-            from engine_oracle.parts_hub import get as _get  # noqa: PLC0415
+            from services.parts import get as _get  # noqa: PLC0415
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "reason": f"parts hub unavailable: {exc}",
-                    "hint": "engine_oracle/parts_hub must be importable."}
+                    "hint": "services/parts must be importable."}
         try:
             rec = _get(part_id)
         except Exception as exc:  # noqa: BLE001
@@ -505,10 +505,10 @@ def match_model_impl(part_id: str = "", title: str = "", mpn: str = "",
         return {"ok": False, "reason": "no product to match",
                 "hint": "Pass a part_id, or a title/mpn/brand describing the product."}
     try:
-        from engine_oracle.parts_hub import model_matcher as _mm  # noqa: PLC0415
+        from services.parts import model_matcher as _mm  # noqa: PLC0415
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"model matcher unavailable: {exc}",
-                "hint": "engine_oracle/parts_hub/model_matcher.py must be importable."}
+                "hint": "services/parts/model_matcher.py must be importable."}
     try:
         return _mm.match_model(product, limit=max(1, min(int(limit or 8), 50)))
     except Exception as exc:  # noqa: BLE001
@@ -522,7 +522,7 @@ def reverse_engineer_product_impl(part_id: str = "", url: str = "", title: str =
 
     Calls the ``reveng_start_from_product`` worker path. Best-effort: zero media
     still stands up a session (the user adds their own photos). Imports lazily at
-    call time so tests can monkeypatch ``reveng_rpc._reveng_start_from_product``.
+    call time so tests can monkeypatch ``worker_rpc._reveng_start_from_product``.
     """
     seed = {k: v for k, v in
             {"part_id": str(part_id or "").strip(),
@@ -534,10 +534,10 @@ def reverse_engineer_product_impl(part_id: str = "", url: str = "", title: str =
         return {"ok": False, "reason": "no reference to reverse-engineer",
                 "hint": "Pass a part_id or a url pointing at the product page."}
     try:
-        from engine_oracle import reveng_rpc as _re  # noqa: PLC0415
+        from services.reveng import worker_rpc as _re  # noqa: PLC0415
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"reverse-engineer suite unavailable: {exc}",
-                "hint": "engine_oracle/reveng_rpc.py must be importable."}
+                "hint": "services/reveng/worker_rpc.py must be importable."}
     try:
         return _re._reveng_start_from_product(seed, None)
     except Exception as exc:  # noqa: BLE001
@@ -549,7 +549,7 @@ def register_parts_tools(mcp: FastMCP) -> None:
     """Register part_search, part_get, and part_place MCP tools (append-only).
 
     T-X3's browser catalog providers register themselves lazily, inside
-    ``engine_oracle.parts_hub.hub.PartsHub.bootstrap()`` (same timing as every
+    ``services.parts.hub.PartsHub.bootstrap()`` (same timing as every
     other provider, including T-P2's live-vendor adapter) — NOT here, so this
     function keeps the hub's existing "first real call" laziness intact.
     """
@@ -750,7 +750,7 @@ def register_parts_tools(mcp: FastMCP) -> None:
         the part_id is unknown.
         """
         try:
-            from engine_oracle.parts_hub import get as _get
+            from services.parts import get as _get
             rec = _get(part_id)
             if rec is None:
                 return _err(f"part_id not found: {part_id!r}",
@@ -758,7 +758,7 @@ def register_parts_tools(mcp: FastMCP) -> None:
             return json.dumps({"ok": True, "part": rec}, ensure_ascii=False)
         except Exception as exc:  # noqa: BLE001
             return _err(f"part_get failed: {exc}",
-                        "Check that engine_oracle/parts_hub is importable.")
+                        "Check that services/parts is importable.")
 
     @mcp.tool()
     def part_place(part_id: str, doc: str = "", params: str = "") -> str:
@@ -790,14 +790,6 @@ def register_parts_tools(mcp: FastMCP) -> None:
           2. part_place("fastener:ISO4762:M8") → creates editable mech part doc_id
           3. For ECAD: part_place("ecad:Device:R", doc=json.dumps(sch_doc), params='{"pos":...}')
         """
-        import json as _json
-
-        try:
-            from engine_oracle.parts_hub.place import place as _place
-        except Exception as exc:  # noqa: BLE001
-            return _err(f"part_place import failed: {exc}",
-                        "Check that engine_oracle/parts_hub/place.py is present.")
-
         # Parse doc and params from JSON strings (MCP tools only accept scalars).
         doc_dict: dict | None = None
         params_dict: dict | None = None
@@ -814,8 +806,17 @@ def register_parts_tools(mcp: FastMCP) -> None:
                 return _err("params argument is not valid JSON.",
                             "Pass params as a JSON string: '{\"pos\": {\"x\": 0, \"y\": 0}}'.")
 
+        # place.py was ported to core/parts (T-RF19): look the record up via the
+        # (Python) hub and hand it to the C++ placement dispatcher.
+        from services.parts import get as _hub_get
+        from . import core_bridge as cb
+        record = _hub_get(part_id)
+        if record is None:
+            return _err(f"unknown part_id: {part_id}",
+                        "Check part_id with part_get first.")
         try:
-            result = _place(part_id, doc=doc_dict, params=params_dict)
+            result = cb.call("part_place", {"part_id": part_id, "record": record,
+                                            "doc": doc_dict, "params": params_dict})
             return json.dumps(result, ensure_ascii=False)
         except Exception as exc:  # noqa: BLE001
             return _err(f"part_place failed: {exc}",
@@ -986,9 +987,9 @@ def register_parts_tools(mcp: FastMCP) -> None:
                         "Verify the artifact_path from scrape_queue_status. "
                         "The file may have been cleaned up.")
         try:
-            from engine_oracle.parts_hub.place import _place_import_file  # noqa: PLC0415
-            gref = {"kind": "import_file", "path": path}
-            result = _place_import_file(gref, None, None)
+            # _place_import_file was ported to core/parts (T-RF19).
+            from . import core_bridge as cb
+            result = cb.call("part_import_file", {"path": path})
             return json.dumps(result, ensure_ascii=False)
         except Exception as exc:  # noqa: BLE001
             return _err(f"import_artifact failed: {exc}",

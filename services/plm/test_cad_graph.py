@@ -323,19 +323,19 @@ def test_on_ai_vc_checkpoint_hook(project: Path):
 
 
 def test_rpc_methods_registered():
-    from engine_oracle.parts_hub.cad_graph_rpc import CAD_GRAPH_METHODS
+    from services.plm.worker_rpc import CAD_GRAPH_METHODS
     assert set(CAD_GRAPH_METHODS) == {
         "cad_graph_get", "cad_graph_blast", "cad_graph_path",
         "cad_graph_link_add", "cad_graph_link_remove", "cad_graph_link_list",
         "cad_graph_assembly_tree",
     }
-    from engine_oracle.parts_hub import worker_rpc
+    from services.plm import worker_rpc
     for name in CAD_GRAPH_METHODS:
         assert name in worker_rpc.WORKER_METHODS, name
 
 
 def test_rpc_get_and_blast(project: Path):
-    from engine_oracle.parts_hub.cad_graph_rpc import CAD_GRAPH_METHODS
+    from services.plm.worker_rpc import CAD_GRAPH_METHODS
 
     def _emit(*_a, **_k):
         pass

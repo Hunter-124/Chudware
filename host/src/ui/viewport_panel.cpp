@@ -2054,6 +2054,9 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         int vw = (int)mainVp->Size.x > 64 ? (int)mainVp->Size.x : 64;
         int vh = (int)(winBotY - winTopY) > 64 ? (int)(winBotY - winTopY) : 64;
         renderer.resize(vw, vh);
+        // T-RF13: feed the adaptive quality ladder this frame's cadence (io.DeltaTime carries
+        // the vsync-cliff signal the ladder keys on). No-op unless adaptive is enabled.
+        renderer.noteFrame(ImGui::GetIO().DeltaTime * 1000.0f);
         // C18: lock the camera normal to the sketch plane while editing a sketch — UNTIL the user
         // middle-drags to rotate (SolidWorks lets you orbit a sketch). s_sketchRotated latches that
         // and is cleared whenever we leave sketch mode (below), so re-entry starts normal-to again.
@@ -2426,7 +2429,10 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             st.overlays->setSectionClip(clipCount, clipN, clipOff);
             // HiDPI: overlay line/point widths are authored in logical px; the overlays draw into
             // the supersampled FBO, so fold BOTH the supersample factor and the UI scale in.
-            st.overlays->setWidthScale((float)renderer.supersample() * ui::uiScale);
+            // T-RF13: renderScale (adaptive quality) shrinks the FBO below display res — fold
+            // that in too so authored widths stay constant in screen px after the upscale.
+            st.overlays->setWidthScale((float)renderer.supersample() * renderer.renderScale() *
+                                       ui::uiScale);
             // Render the R32UI id buffer for this exact camera frame so picks are pixel-accurate.
             st.idPass->render(renderer.camera());
             st.pickReady = true;
@@ -2733,6 +2739,18 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // view so the live edits are clearly attributed to the AI (not the user). Same run-lifecycle
         // signal as the Activity panel; non-intrusive top-center pill.
         if (st.agentV2Running) drawAiActivityBadge(cr0, cr1, st.agentV2Status);
+        // T-RF13: subtle quality readout while the adaptive ladder is holding a reduced step
+        // (hidden at FULL or when adaptive is off — native default). Bottom-right, dim text.
+        if (renderer.adaptiveQuality() && renderer.qualityStep() != Renderer::QualityStep::Full) {
+            char qbuf[64];
+            std::snprintf(qbuf, sizeof(qbuf), "%s \xC2\xB7 %.0f ms",
+                          renderer.qualityStepName(), renderer.frameMsEma());
+            ImDrawList* qdl = ImGui::GetWindowDrawList();
+            const ImVec2 qts = ImGui::CalcTextSize(qbuf);
+            const float qS = ui::uiScale;
+            qdl->AddText(ImVec2(vr1.x - qts.x - 12.0f * qS, vr1.y - qts.y - 8.0f * qS),
+                         withAlpha(ui::palette.textDim, 0.65f), qbuf);
+        }
         // CAM sim transport bar (wave 3): bottom-center playhead over the viewport while a
         // framed sim is loaded in the Manufacture workspace.
         if (st.activeWorkspace == AppState::Workspace::Manufacture && ui::camSimHudActive())

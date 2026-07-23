@@ -1,6 +1,6 @@
 """Geometry auto-prefill for engineering calculators (T-W4).
 
-Maps calc input slots (declared in ``engine_oracle/research/calcs/registry``) to
+Maps calc input slots (declared in ``services/research/calcs/registry``) to
 live geometry queries so the advisory engine can pass measured values to calcs
 instead of asking the user.
 
@@ -191,7 +191,7 @@ def prefill_inputs(
 
     Unresolvable slots or slots already in user_inputs are silently skipped.
     """
-    from engine_oracle.research.calcs.registry import get_calc  # local import
+    from services.research.calcs.registry import get_calc  # local import
 
     q = querier if querier is not None else _DEFAULT_QUERIER
     r = refs or {}

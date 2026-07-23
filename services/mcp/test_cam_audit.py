@@ -106,7 +106,7 @@ def _sample_job() -> dict:
 
 # --------------------------------------------------------------------------- feeds_speeds
 def test_feeds_speeds_thread_m10_tap_drill():
-    from engine_oracle.research.machining import feeds_speeds
+    from services.research.machining import feeds_speeds
 
     r = feeds_speeds("alu_6061", "endmill_flat", 10.0, "roughing", thread="M10x1.5")
     assert "answer" in r, r
@@ -114,7 +114,7 @@ def test_feeds_speeds_thread_m10_tap_drill():
 
 
 def test_feeds_speeds_machine_haas_clamps_rpm():
-    from engine_oracle.research.machining import feeds_speeds, machine_profile
+    from services.research.machining import feeds_speeds, machine_profile
 
     prof = machine_profile("haas_vf2")
     assert float(prof["max_rpm"]) == 8100.0
@@ -132,7 +132,7 @@ def test_feeds_speeds_machine_haas_clamps_rpm():
 
 
 def test_machine_profile_unknown_lists_ids():
-    from engine_oracle.research.machining import machine_profile
+    from services.research.machining import machine_profile
 
     with pytest.raises(ValueError) as ei:
         machine_profile("not_a_real_machine")

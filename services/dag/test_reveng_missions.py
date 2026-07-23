@@ -110,7 +110,7 @@ _install_stubs()
 
 # NOTE: we do NOT stub the ``engine_oracle`` package — the real vision modules
 # (reveng_provision / frames) import cleanly, and shadowing the package would break
-# verify.py's ``engine_oracle.requirements`` import chain. reveng_tools' own
+# verify.py's ``services.requirements`` import chain. reveng_tools' own
 # fallback handles the one missing symbol (ingest.ingest_pdf). The mission walk
 # injects its own agent_fn, so the real all-False ``reveng_status`` is what we want
 # (honest degradation with no provisioned backend).

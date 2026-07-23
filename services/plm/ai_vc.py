@@ -328,7 +328,7 @@ def default_store_root(project_dir: str | os.PathLike | None = None) -> Path:
         p.mkdir(parents=True, exist_ok=True)
         return p
     try:
-        from engine import paths as _paths  # noqa: PLC0415
+        from services import paths as _paths  # noqa: PLC0415
 
         base = Path(getattr(_paths, "CACHE", None) or Path.home() / ".cache" / "billet")
     except Exception:  # noqa: BLE001

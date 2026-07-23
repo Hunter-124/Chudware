@@ -21,7 +21,7 @@ SEEED_SEARCH_HTML = r"""<div id="5639" class="ais_hit_product_bar"><a href="http
 @pytest.fixture()
 def seeed_mod(tmp_path, monkeypatch):
     monkeypatch.setenv("APPDATA", str(tmp_path))
-    from engine import paths as engine_paths
+    from services import paths as engine_paths
     importlib.reload(engine_paths)
     from services.browser import profiles, session
     importlib.reload(profiles)

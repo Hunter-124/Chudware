@@ -22,8 +22,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Protocol
 
-from engine import paths
-from engine.research.common import now_ts
+from services import paths
+from services.research.common import now_ts
 
 from ..profiles import slug
 
@@ -182,7 +182,7 @@ def is_login_wall(content: str, markers: tuple[str, ...]) -> bool:
 def download_dir(site: str) -> Path:
     """Local landing directory for artifacts acquired from ``site``.
 
-    A sibling of ``vendor_parts`` under the app data dir (``engine.paths``) —
+    A sibling of ``vendor_parts`` under the app data dir (``services.paths``) —
     T-X3 wires acquired files into the VendorPart registry proper; this is
     just where the bytes land first.
     """
@@ -232,7 +232,7 @@ from . import (servocity, pololu,  # robotics structural + motion / gearmotors  
 # ``register(...)`` side-effect does NOT run again). That would leave a reloaded
 # package with an empty registry, silently breaking ``all_adapters()`` /
 # ``login_wizard_sites()`` / ``get_adapter()`` for whatever runs next. Test
-# fixtures reload this package after tweaking ``engine.paths``/``session``, so
+# fixtures reload this package after tweaking ``services.paths``/``session``, so
 # re-register every already-imported adapter submodule here to keep reload a
 # no-op for the registry. On first import this is harmless (each key is already
 # present); on reload it repopulates the emptied registry.

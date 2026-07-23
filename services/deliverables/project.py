@@ -15,8 +15,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-try:  # engine.paths gives the app's %APPDATA%/AI-CAD root; degrade for a bare checkout.
-    from engine import paths as _paths
+try:  # services.paths gives the app's %APPDATA%/AI-CAD root; degrade for a bare checkout.
+    from services import paths as _paths
 
     _APP_ROOT = _paths.ROOT
 except Exception:  # noqa: BLE001

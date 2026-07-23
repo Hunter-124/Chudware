@@ -148,7 +148,7 @@ def _read_overlay(handle: str) -> bytes:
 
 def _parse_aicm(handle: str) -> dict:
     try:
-        from engine.doc.tessellate import read_aicm
+        from services.sim.tessellate import read_aicm
     except ImportError:
         from engine_oracle.doc.tessellate import read_aicm
     return read_aicm(_read_overlay(handle))

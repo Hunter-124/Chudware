@@ -151,7 +151,7 @@ def test_bad_keyword_rejected(user_dir):
 
 
 def test_rpc_list_shape(user_dir):
-    from engine_oracle.parts_hub.triggers_rpc import TRIGGERS_METHODS
+    from services.agent.worker_rpc import TRIGGERS_METHODS
     out = TRIGGERS_METHODS["triggers_list"]({}, lambda *a, **k: None)
     assert out["ok"] is True
     assert out["count"] >= 14

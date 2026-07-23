@@ -95,14 +95,15 @@ def _install_stubs():
     eng = types.ModuleType("engine")
     eng_materials = types.ModuleType("engine.materials")
     eng_materials.density = lambda name: None
-    eng_paths = types.ModuleType("engine.paths")
+    # T-RF19/20: paths re-homed to services.paths — stub it there (sys.modules
+    # fallback covers `from services import paths`).
+    eng_paths = types.ModuleType("services.paths")
     import pathlib
     eng_paths.CONFIG = pathlib.Path("/nonexistent/config.json")
     eng.materials = eng_materials
-    eng.paths = eng_paths
     _set("engine", eng)
     _set("engine.materials", eng_materials)
-    _set("engine.paths", eng_paths)
+    _set("services.paths", eng_paths)
 
     def restore():
         for key in added:
@@ -123,8 +124,12 @@ def _install_stubs():
 # whole-dir sweep never inherits a fake core_bridge / mcp SDK.
 _restore_stubs = _install_stubs()
 try:
-    from engine_oracle.research.fits import fit_calc, recommend_fit  # noqa: E402
-    from engine_oracle.dfm.process_profiles import get_profile  # noqa: E402
+    from services.research.fits import fit_calc, recommend_fit  # noqa: E402
+    # engine_oracle/dfm was ported to core (T-RF19); resolve profiles via the RPC.
+    from services.mcp import core_bridge as _cb  # noqa: E402
+
+    def get_profile(name):
+        return _cb.call("dfm_get_profile", {"process": name}).get("result")
 
     # Import dimension_scheme internals directly (not via MCP)
     from services.mcp.dimension_scheme_tools import (  # noqa: E402
@@ -374,7 +379,6 @@ class TestProcessDifferentiation(unittest.TestCase):
     def test_hole_comp_sourced_from_process_profiles(self):
         """The hole_comp values match process_profiles.PROFILES — they are never invented.
         get_profile() nests DFM params under a 'params' key; extract from there."""
-        from engine_oracle.dfm.process_profiles import get_profile
         cnc_prof = get_profile("cnc_mill")
         fdm_prof = get_profile("fdm")
 

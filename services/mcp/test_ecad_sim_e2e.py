@@ -450,7 +450,7 @@ def test_four_thd_linear_rc():
 def test_orchestrator_simulate_design_deterministic():
     """simulate_design on a hand-built design dict (no planner, no LLM): the divider
     op probe must hit the closed-form midpoint and pass its own expect gate."""
-    from engine.ecad import orchestrator as orch
+    from services.ecad_design import orchestrator as orch
     from engine.ecad import session as ecad_session
 
     doc = _new_sch("e2e_simdesign")

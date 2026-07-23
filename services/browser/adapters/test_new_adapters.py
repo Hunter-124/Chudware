@@ -16,7 +16,7 @@ import pytest
 @pytest.fixture()
 def adapter_mods(tmp_path, monkeypatch):
     monkeypatch.setenv("APPDATA", str(tmp_path))
-    from engine import paths as engine_paths
+    from services import paths as engine_paths
     importlib.reload(engine_paths)
     from services.browser import profiles, session
     importlib.reload(profiles)

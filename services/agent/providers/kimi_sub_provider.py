@@ -30,7 +30,7 @@ import uuid
 from pathlib import Path
 from typing import Callable
 
-from engine import paths
+from services import paths
 
 from .base import Provider
 from . import sub_auth

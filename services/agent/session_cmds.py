@@ -3,7 +3,7 @@
 Host-facing pure transforms. The host passes its transcript as ``messages[]``;
 we return a result the host applies to its store. Inputs are never mutated.
 
-RPCs live in ``engine_oracle.parts_hub.session_rpc`` and call these functions.
+RPCs live in ``services.agent.worker_rpc`` (folded from engine_oracle/parts_hub/session_rpc.py, T-RF19) and call these functions.
 """
 from __future__ import annotations
 

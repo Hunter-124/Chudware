@@ -1,0 +1,50 @@
+# oracle_import_allowlist.txt — transitional engine_oracle imports still allowed in services/
+#
+# One dotted module path prefix per line (# comments allowed). `engine` and
+# `engine_oracle` spellings canonicalize to the same entry. scripts/oracle_import_audit.py
+# FAILS on any engine import in services/ not covered here. DELETE an entry in the same
+# commit that ports/re-homes the subsystem — this list ratchets to zero as engine_oracle/
+# is strangled out (T-RF20). Every entry must state why it is still transitional.
+#
+# NOT listed (already re-homed to services/): the build123d kernel executor
+# (services/kernel_exec.py) and the ecad_design LLM orchestrator (services/ecad_design/).
+
+# --- infrastructure / config (pure path + env helpers, no engine logic; port last) ---
+engine.paths          # data-dir resolution used across services; transitional until a services.paths lands
+engine                # bare `import engine` only (test_h7_shadow sys.modules path probing); never submodules
+
+# --- worker / RPC seam (frozen legacy worker methods, contracts/worker_rpc.md) ---
+engine.worker         # services/reveng/test_worker_rpc.py exercises the frozen worker directly
+engine.bridge         # legacy core_bridge seam; transitional until the C++ routing flip lands
+engine.embed_rpc      # embedded-host RPC; transitional with the worker seam
+
+# --- parts hub (re-home owned by another T-RF leaf; place.py explicitly excluded from T-RF20) ---
+engine.parts_hub      # catalog/search/place/worker_rpc family; transitional until the parts_hub re-home lands
+engine.parts_hub.place
+engine.parts_providers # vendor credential/pricing chain used by parts adapters; ports with parts_hub
+engine.vendor_parts   # local vendor-parts library adapter; transitional until ported
+engine.bolts_loader   # standard-bolts catalog loader; transitional until ported
+engine.run_model      # legacy CLI shim (engine_oracle/run_model.py); thin wrapper over services.kernel_exec
+
+# --- doc / sketch / SW-import (port tracked by the core/ strangler) ---
+engine.doc            # canonical dump, op_registry, sw_feature_import/sw_translate; not yet ported
+
+# --- simulation / multiphysics (not yet ported to core/sim) ---
+engine.sim            # circuit/spice/fea/em/openfoam/multiphysics_rpc/ngspice; transitional
+
+# --- ecad kernel-side modules (session/netlist/drc/erc/ops/library/pdn/threed/antenna) ---
+# NOTE: the LLM ecad_design ORCHESTRATOR is re-homed (services/ecad_design/); only the
+# deterministic ECAD document/sim modules below remain transitional.
+engine.ecad
+
+# --- engineering domains (MCP tool-family flips owned by parallel T-RF leaves; entries
+#     dropped as each family lands in core/ or services/) ---
+engine.materials      # materials registry; flip owned by the materials leaf
+engine.dfm            # process profiles / DFM; flip owned by the dfm leaf
+engine.structural     # structural analysis/code checks; flip owned by the structural leaf
+engine.hydraulic      # hydraulic schema/solve; flip owned by the hydraulic leaf
+engine.piping         # piping schema/solve/catalog; flip owned by the piping leaf
+engine.mechanical     # gear/bearing checks; transitional until ported
+engine.tolerance      # tolerance stackup; flip owned by the tolerance leaf
+engine.requirements   # requirements doc; transitional until ported
+engine.intake         # intake state machine; transitional until ported

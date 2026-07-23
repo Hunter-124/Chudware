@@ -1,0 +1,48 @@
+{
+ "schema": "aicad.structure/1",
+ "name": "cantilever",
+ "units": "mm",
+ "elements": [
+  {
+   "element_type": "beam",
+   "id": "beam1",
+   "section_name": "150x150",
+   "material": "cedar",
+   "length_mm": 3000.0,
+   "transform": [
+    0,
+    0,
+    1,
+    0,
+    0,
+    1,
+    0,
+    0,
+    1,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    1
+   ]
+  }
+ ],
+ "load_cases": [
+  {
+   "id": "lc1",
+   "kind": "dead",
+   "gravity": [
+    0,
+    -1,
+    0
+   ],
+   "factor": 1.0,
+   "point": {
+    "at_mm": 3000.0,
+    "p_n": 500.0
+   }
+  }
+ ]
+}

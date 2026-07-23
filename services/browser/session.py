@@ -23,7 +23,7 @@ imports Playwright directly:
 the primary login surface is the interactive CEF panel in the GUI, and this
 headed fallback is retired once the panel is migrated onto the daemon (plan
 Phase 2b). The CEF daemon is lazily spawned and idle-exits, and all three
-functions degrade to the ``engine.research`` §6 failure shape
+functions degrade to the ``services.research`` §6 failure shape
 (``contracts/research_tools.md``) instead of raising.
 
 Captcha/2FA (T-X6): this module DETECTS these states (see :mod:`.challenge`) but
@@ -41,7 +41,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from engine.research.common import fail, now_ts
+from services.research.common import fail, now_ts
 
 from . import challenge, profiles, ratelimit, stealth
 

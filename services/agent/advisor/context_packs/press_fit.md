@@ -1,5 +1,5 @@
 # Press fit context pack
-# Source: engine_oracle/research/data/iso286.json (shaft deviations k/n/p/r/s tabulated,
+# Source: services/research/data/iso286.json (shaft deviations k/n/p/r/s tabulated,
 #         ISO 286-1:2010 Table 9); fits.py _shaft_es_um(); fit_recommendations.json
 
 ## Callout format

@@ -2,9 +2,10 @@
 
 Same design contract as ``piping_tools`` (project owner: "the AI is extremely limited; its tools
 must do the bookkeeping and return rich, actionable context"). Each tool returns a JSON string
-``{ok, ...result, warnings:[], hint:"...", next_actions:[...]}``, calls the engine helpers
-directly (``engine.hydraulic.schema`` / ``engine.hydraulic.solve`` / ``engine.hydraulic.bom``),
-and holds its own tiny session state so tools can reuse the last active circuit document.
+``{ok, ...result, warnings:[], hint:"...", next_actions:[...]}`` produced by the C++ core
+(T-RF19/T-RF20: the tool envelopes are owned by ``core/hydraulic`` behind the libaicad RPCs
+``hydraulic_*`` — reached via :mod:`services.mcp.core_bridge`); the MCP layer keeps only input
+parsing and its tiny session state so tools can reuse the last active circuit document.
 
 Tools:
   hydraulic_new             create a new aicad.hydraulic/1 circuit document
@@ -35,12 +36,7 @@ import math
 import os
 from typing import Any, Optional, Union
 
-from engine.hydraulic import schema as hyd_schema
-from engine.hydraulic import solve as hyd_solve
-from engine.hydraulic import bom as hyd_bom
-from engine.piping import schema as piping_schema
-from engine.piping import solve as piping_solve_mod
-
+from . import core_bridge as cb
 from services.mcp import simhandoff as sh
 
 # Session bookkeeping: the last active circuit document
@@ -89,6 +85,13 @@ def _active_doc() -> Optional[dict]:
 
 
 # ── hydraulic → piping / FEA handoff helpers (module-level: engine-less testable) ──
+#
+# The translators/verifies the tools used pre-T-RF20 now live in the C++ core
+# (core/hydraulic/handoff.cpp — estimate_line_dp, hoses_to_piping, both envelope
+# builders, the margin feedback); the tool bodies below are thin core_bridge
+# wrappers. The pure-Python copies kept here are the simhandoff-envelope
+# compositions the MCP test suite exercises engine-less (same shapes the core
+# emits — byte-parity proven by the T-RF19 harness).
 
 # ISO VG32 mineral hydraulic oil at ~40 °C — the default working fluid for line-loss
 # estimates and the piping solve (ν = 32 cSt, ρ = 870 kg/m³ → μ = ρ·ν ≈ 0.0278 Pa·s).
@@ -97,10 +100,6 @@ HYDRAULIC_OIL = {"name": "hydraulic_oil_iso_vg32", "rho": 870.0, "mu": 0.0278}
 # Default absolute roughness for hose/tube bore (m) — matches the piping solver's
 # commercial-steel default so estimate vs solve compare like-for-like.
 _HOSE_EPS_M = 4.6e-5
-
-# Lateral spacing (mm) between generated runs so endpoint snapping never merges
-# two independent hose lines into one network node.
-_LINE_SPACING_MM = 10_000.0
 
 
 def estimate_line_dp(*, flow_lpm: float, id_mm: float, length_mm: float,
@@ -136,85 +135,6 @@ def estimate_line_dp(*, flow_lpm: float, id_mm: float, length_mm: float,
         "regime": regime,
         "dp_kpa": round(dp_pa / 1000.0, 4),
     }
-
-
-def _line_spec(hose: dict, override: dict, default_id_mm: float,
-               default_length_mm: float, default_flow_lpm: float) -> dict:
-    """Resolve one hose's line geometry/flow: explicit override > hose fields > defaults."""
-    def pick(key, default):
-        v = override.get(key)
-        if v is None:
-            v = hose.get(key)
-        return float(v) if v is not None else float(default)
-    return {
-        "id_mm": pick("id_mm", default_id_mm),
-        "length_mm": pick("length_mm", default_length_mm),
-        "flow_lpm": pick("flow_lpm", default_flow_lpm),
-    }
-
-
-def hoses_to_piping(hyd_doc: dict, *, flow_lpm: float, supply_pressure_bar: float,
-                    lines: Optional[dict] = None,
-                    default_id_mm: float = 12.7,
-                    default_length_mm: float = 1000.0,
-                    fluid: Optional[dict] = None) -> dict:
-    """Translate a hydraulic circuit's hose nets into an ``aicad.piping/1`` network.
-
-    Each hose becomes one straight pipe run with an EXPLICIT ``bore_mm`` (hose inner
-    diameter — SAE dash sizes don't exist in the NPS schedule catalog, so the run
-    carries the exact bore and the solver skips the catalog lookup). Runs are spaced
-    apart so each line solves independently: boundary = supply pressure fixed at the
-    run start + the line's flow drawn at the run end.
-
-    Per-hose geometry/flow comes from (in priority order) the ``lines`` override map
-    ``{hose_id: {id_mm, length_mm, flow_lpm}}``, fields stored on the hose object
-    itself, then the defaults. Returns ``{ok, piping_doc, boundary, lines, fluid,
-    estimates, warnings}`` — ``estimates`` is the per-line Darcy prediction that the
-    later verify step cross-checks against the solve.
-    """
-    hoses = hyd_doc.get("hoses") or []
-    if not hoses:
-        return {"ok": False, "reason": "hydraulic circuit has no hoses",
-                "hint": "call hydraulic_add_hose first"}
-    lines = lines or {}
-    fl = dict(fluid) if fluid else dict(HYDRAULIC_OIL)
-
-    pdoc = piping_schema.new_piping(f"{hyd_doc.get('name', 'Hydraulic')} - hose runs")
-    boundary: list = []
-    line_rows: list = []
-    estimates: dict = {}
-    warnings: list = []
-    supply_kpa = supply_pressure_bar * 100.0
-
-    for i, hose in enumerate(hoses):
-        spec = _line_spec(hose, lines.get(hose.get("id"), {}) or {},
-                          default_id_mm, default_length_mm, flow_lpm)
-        rid = piping_schema.next_id(pdoc, "r")
-        y = i * _LINE_SPACING_MM
-        run = piping_schema.new_pipe_run(
-            rid, [[0.0, y, 0.0], [spec["length_mm"], y, 0.0]],
-            nps=round(spec["id_mm"] / 25.4, 4), schedule="40",
-            name=hose.get("net_name") or rid, bore_mm=spec["id_mm"])
-        pdoc["runs"].append(run)
-        q_m3h = spec["flow_lpm"] * 60.0 / 1000.0
-        boundary.append({"run": rid, "end": "start", "pressure": supply_kpa})
-        boundary.append({"run": rid, "end": "end", "demand": q_m3h})
-        est = estimate_line_dp(flow_lpm=spec["flow_lpm"], id_mm=spec["id_mm"],
-                               length_mm=spec["length_mm"],
-                               rho=fl.get("rho", HYDRAULIC_OIL["rho"]),
-                               mu=fl.get("mu", HYDRAULIC_OIL["mu"]))
-        if not est.get("ok"):
-            warnings.append(f"{hose.get('id')}: estimate failed: {est.get('reason')}")
-        estimates[rid] = est
-        line_rows.append({"hose_id": hose.get("id"), "net_name": hose.get("net_name"),
-                          "run_id": rid, **spec, "flow_m3h": round(q_m3h, 6)})
-
-    errs = piping_schema.validate(pdoc)
-    if errs:  # producer bug — surface loudly but contract-shaped
-        return {"ok": False, "reason": "generated piping doc failed schema validation",
-                "errors": errs}
-    return {"ok": True, "piping_doc": pdoc, "boundary": boundary, "lines": line_rows,
-            "fluid": fl, "estimates": estimates, "warnings": warnings}
 
 
 def _piping_handoff_envelope(hyd_doc: dict, net: dict,
@@ -463,18 +383,13 @@ def register_hydraulic_tools(mcp) -> None:
 
         Returns the initial document envelope with schema, id, and empty component/hose lists.
         """
-        doc = hyd_schema.new_hydraulic(name)
-        _HYD["doc"] = doc
-        return _dumps({
-            "ok": True,
-            "doc": doc,
-            "warnings": [],
-            "hint": "Use hydraulic_add_component to add ISO 1219 components.",
-            "next_actions": [
-                "call hydraulic_add_component to add pumps, cylinders, valves, etc.",
-                "call hydraulic_size_cylinder / hydraulic_size_pump to size components",
-            ],
-        })
+        try:
+            r = cb.call("hydraulic_new", {"name": name})
+        except Exception as exc:  # noqa: BLE001 — contract-shaped soft-fail, never raise
+            return _dumps(_err(f"core engine unavailable: {exc}"))
+        if r.get("ok") and isinstance(r.get("doc"), dict):
+            _HYD["doc"] = r["doc"]
+        return _dumps(r)
 
     @mcp.tool()
     def hydraulic_add_component(
@@ -511,37 +426,15 @@ def register_hydraulic_tools(mcp) -> None:
         except (ValueError, TypeError, OSError) as exc:
             return _dumps(_err(f"could not parse inputs: {exc}"))
 
-        if d is None:
-            return _dumps(_err("no active hydraulic circuit",
-                               hint="call hydraulic_new first, or pass doc=<circuit>"))
-
-        if type not in hyd_schema.HYD_COMPONENT_TYPES:
-            return _dumps(_err(
-                f"unknown component type {type!r}",
-                hint=f"valid types: {sorted(hyd_schema.HYD_COMPONENT_TYPES)}",
-            ))
-
-        comp_id = hyd_schema.next_id(d, "c")
-        comp = hyd_schema.new_component(comp_id, type, name=name or type, x=x, y=y, **p)
-        if s:
-            comp["sourcing"].update(s)
-
-        d["components"].append(comp)
-        _HYD["doc"] = d
-
-        errs = hyd_schema.validate_hydraulic(d)
-        return _dumps({
-            "ok": True,
-            "component_id": comp_id,
-            "component": comp,
-            "doc_component_count": len(d["components"]),
-            "warnings": errs,
-            "hint": None if not errs else "fix validation errors before proceeding",
-            "next_actions": [
-                "call hydraulic_add_hose to connect component ports",
-                "call hydraulic_size_cylinder / hydraulic_size_pump to size this component",
-            ],
-        })
+        try:
+            r = cb.call("hydraulic_add_component", {
+                "doc": d, "type": type, "name": name, "x": x, "y": y,
+                "params": p, "sourcing": s})
+        except Exception as exc:  # noqa: BLE001
+            return _dumps(_err(f"core engine unavailable: {exc}"))
+        if r.get("ok") and isinstance(r.get("doc"), dict):
+            _HYD["doc"] = r["doc"]  # additive "doc" key: the updated active circuit
+        return _dumps(r)
 
     @mcp.tool()
     def hydraulic_add_hose(
@@ -567,30 +460,14 @@ def register_hydraulic_tools(mcp) -> None:
         except (ValueError, TypeError, OSError) as exc:
             return _dumps(_err(f"could not parse inputs: {exc}"))
 
-        if d is None:
-            return _dumps(_err("no active hydraulic circuit",
-                               hint="call hydraulic_new first"))
-        if not isinstance(conns, list) or len(conns) < 2:
-            return _dumps(_err("connections must be a list of >= 2 port references",
-                               hint='e.g. [{"component_id":"c1","port":"p1"},{"component_id":"c2","port":"p1"}]'))
-
-        hose_id = hyd_schema.next_id(d, "h")
-        hose = hyd_schema.new_hose(hose_id, net_name, conns)
-        d["hoses"].append(hose)
-        _HYD["doc"] = d
-
-        errs = hyd_schema.validate_hydraulic(d)
-        return _dumps({
-            "ok": True,
-            "hose_id": hose_id,
-            "hose": hose,
-            "doc_hose_count": len(d["hoses"]),
-            "warnings": errs,
-            "hint": None if not errs else "fix validation errors before proceeding",
-            "next_actions": [
-                "call hydraulic_bom to get the sourcing bill of materials",
-            ],
-        })
+        try:
+            r = cb.call("hydraulic_add_hose", {
+                "doc": d, "net_name": net_name, "connections": conns})
+        except Exception as exc:  # noqa: BLE001
+            return _dumps(_err(f"core engine unavailable: {exc}"))
+        if r.get("ok") and isinstance(r.get("doc"), dict):
+            _HYD["doc"] = r["doc"]  # additive "doc" key: the updated active circuit
+        return _dumps(r)
 
     @mcp.tool()
     def hydraulic_size_cylinder(
@@ -614,22 +491,14 @@ def register_hydraulic_tools(mcp) -> None:
         All inputs in the circuit's native units (mm, bar). Returns a contract-shaped dict
         with all sizing results plus recommended pump flow.
         """
-        result = hyd_solve.size_cylinder(
-            bore_mm=bore_mm,
-            rod_mm=rod_mm,
-            pressure_bar=pressure_bar,
-            stroke_mm=stroke_mm,
-            velocity_mm_s=velocity_mm_s,
-            efficiency=efficiency,
-        )
-        if not result.get("ok"):
-            return _dumps(result)
-        result.setdefault("warnings", [])
-        result.setdefault("hint", (
-            f"Pump must supply >= {result['flow_extend_lpm']:.2f} L/min at {pressure_bar} bar. "
-            "Call hydraulic_size_pump with these values."
-        ))
-        return _dumps(result)
+        try:
+            r = cb.call("hydraulic_size_cylinder", {
+                "bore_mm": bore_mm, "rod_mm": rod_mm, "pressure_bar": pressure_bar,
+                "stroke_mm": stroke_mm, "velocity_mm_s": velocity_mm_s,
+                "efficiency": efficiency})
+        except Exception as exc:  # noqa: BLE001
+            return _dumps(_err(f"core engine unavailable: {exc}"))
+        return _dumps(r)
 
     @mcp.tool()
     def hydraulic_size_pump(
@@ -651,20 +520,13 @@ def register_hydraulic_tools(mcp) -> None:
         Returns displacement, power, and torque in a contract-shaped dict ready to pass to
         component selection.
         """
-        result = hyd_solve.size_pump(
-            flow_lpm=flow_lpm,
-            pressure_bar=pressure_bar,
-            efficiency=efficiency,
-            speed_rpm=speed_rpm,
-        )
-        if not result.get("ok"):
-            return _dumps(result)
-        result.setdefault("warnings", [])
-        result.setdefault("hint", (
-            f"Select a pump with >= {result['displacement_cc_rev']:.2f} cc/rev displacement "
-            f"and motor >= {result['shaft_power_kw']:.2f} kW shaft power."
-        ))
-        return _dumps(result)
+        try:
+            r = cb.call("hydraulic_size_pump", {
+                "flow_lpm": flow_lpm, "pressure_bar": pressure_bar,
+                "efficiency": efficiency, "speed_rpm": speed_rpm})
+        except Exception as exc:  # noqa: BLE001
+            return _dumps(_err(f"core engine unavailable: {exc}"))
+        return _dumps(r)
 
     @mcp.tool()
     def hydraulic_bom(doc: Union[str, dict, None] = None) -> str:
@@ -686,34 +548,11 @@ def register_hydraulic_tools(mcp) -> None:
         except (ValueError, TypeError, OSError) as exc:
             return _dumps(_err(f"could not parse inputs: {exc}"))
 
-        if d is None:
-            return _dumps(_err("no active hydraulic circuit",
-                               hint="call hydraulic_new first, or pass doc=<circuit>"))
-
-        errs = hyd_schema.validate_hydraulic(d)
-        if errs:
-            return _dumps(_err("hydraulic document failed schema validation",
-                               hint="fix errors before extracting BOM",
-                               errors=errs))
-
-        lines = hyd_bom.hydraulic_bom_lines(d)
-        summary = hyd_bom.sourcing_summary(d)
-        missing = summary["missing_mpn"]
-
-        return _dumps({
-            "ok": True,
-            "bom_lines": lines,
-            "summary": summary,
-            "warnings": [f"component {cid} has no MPN" for cid in missing],
-            "hint": (
-                "All components sourced." if not missing
-                else f"{len(missing)} component(s) missing MPN — add to sourcing fields."
-            ),
-            "next_actions": [
-                "add mpn/manufacturer to unsourced components via hydraulic_add_component sourcing=",
-                "pass bom_lines to bom_rollup at B-chain merge time (T-E5 seam)",
-            ],
-        })
+        try:
+            r = cb.call("hydraulic_bom", {"doc": d})
+        except Exception as exc:  # noqa: BLE001
+            return _dumps(_err(f"core engine unavailable: {exc}"))
+        return _dumps(r)
 
     @mcp.tool()
     def hydraulic_piping_handoff(supply_pressure_bar: float,
@@ -737,12 +576,12 @@ def register_hydraulic_tools(mcp) -> None:
         same keys are also read from fields stored on the hose object itself).
         ``fluid`` overrides the default ISO VG32 oil ``{"rho":870,"mu":0.0278}``.
 
-        When the ``fluids`` library is installed the piping solve runs LIVE here and
-        the result includes per-line dP + the updated pump margin
+        The piping solve ALWAYS runs live in the C++ core (it IS the solver — the old
+        fluids-absent ``solve_pending`` stage does not exist on the core path): the
+        result includes per-line dP + the updated pump margin
         (``margin.pump_margin_solved_bar`` = supply − load − real line losses, needs
-        ``load_pressure_bar``) plus the estimate-vs-solve verify verdict. When it is
-        absent the tool returns ``stage: "solve_pending"`` with everything needed to
-        run the solve elsewhere: ``piping_solve(source_handoff=<simhandoff>)``.
+        ``load_pressure_bar``) plus the estimate-vs-solve verify verdict. The generated
+        network can always be re-solved with ``piping_solve(source_handoff=<simhandoff>)``.
 
         Conforms to ``aicad.simhandoff/1`` (coupling ``hydraulic_to_piping``): the
         generated piping doc rides INLINE in the envelope's geometry ref, per-line
@@ -755,83 +594,22 @@ def register_hydraulic_tools(mcp) -> None:
             fl = _as_obj(fluid)
         except (ValueError, TypeError, OSError) as exc:
             return _dumps(_err(f"could not parse inputs: {exc}"))
-        if d is None:
-            return _dumps(_err("no active hydraulic circuit",
-                               hint="call hydraulic_new first, or pass doc=<circuit>"))
-        errs = hyd_schema.validate_hydraulic(d)
-        if errs:
-            return _dumps(_err("hydraulic document failed schema validation",
-                               errors=errs))
-        if supply_pressure_bar <= 0 or flow_lpm <= 0:
-            return _dumps(_err("supply_pressure_bar and flow_lpm must be > 0"))
 
-        net = hoses_to_piping(d, flow_lpm=flow_lpm,
-                              supply_pressure_bar=supply_pressure_bar,
-                              lines=ln, default_id_mm=default_id_mm,
-                              default_length_mm=default_length_mm, fluid=fl)
-        if not net.get("ok"):
-            return _dumps(net)
-
-        env = _piping_handoff_envelope(d, net, supply_pressure_bar)
-        est_loss_bar = None
-        ests = [e for e in net["estimates"].values() if e.get("ok")]
-        if ests:
-            est_loss_bar = round(sum(e["dp_kpa"] for e in ests) / 100.0, 4)
-
-        base = {
-            "ok": True,
-            "piping_doc": net["piping_doc"],
-            "boundary": net["boundary"],
-            "fluid": net["fluid"],
-            "lines": net["lines"],
-            "estimates": net["estimates"],
-            "warnings": net["warnings"],
-        }
-
-        if not piping_solve_mod.have_fluids():
-            base.update({
-                "stage": "solve_pending",
-                "solve": None,
-                "margin": _margin_update(supply_pressure_bar, load_pressure_bar,
-                                         est_loss_bar, None),
-                "hint": ("fluids library not installed — per-hose Darcy estimates "
-                         "returned; run the live solve with pip install fluids, then "
-                         "piping_solve(source_handoff=<this result's simhandoff>)"),
-                "next_actions": [
-                    "pip install fluids (MIT) to enable the live piping solve",
-                    "piping_solve(source_handoff=<simhandoff envelope>) elsewhere",
-                    "hydraulic_verify_piping(handoff, solve_result) once solved",
-                ],
-            })
-            return _dumps(sh.attach(base, env))
-
-        solve_res = piping_solve_mod.solve(net["piping_doc"],
-                                           boundary=net["boundary"],
-                                           fluid=net["fluid"])
-        if not solve_res.get("ok"):
-            base.update({"stage": "solve_failed", "solve": solve_res})
-            return _dumps(sh.attach(base, env))
-
-        _HYD["piping_handoff"] = {"handoff": env, "solve": solve_res}
-        verify_env, checks = _verify_piping_envelope(env, solve_res, tolerance_pct)
-        solved_loss_bar = round(sum(abs(lk.get("dp_kpa", 0.0))
-                                    for lk in solve_res.get("links", [])) / 100.0, 4)
-        base.update({
-            "stage": "solved",
-            "solve": solve_res,
-            "per_line_dp_kpa": {lk["id"]: lk.get("dp_kpa")
-                                for lk in solve_res.get("links", [])},
-            "margin": _margin_update(supply_pressure_bar, load_pressure_bar,
-                                     est_loss_bar, solved_loss_bar),
-            "verify": {"pass": verify_env["pass"], "verdict": verify_env["verdict"],
-                       "checks": checks},
-            "next_actions": [
-                "hydraulic_verify_piping() to get the full verify envelope",
-                "hydraulic_size_pump(flow_lpm, supply_pressure_bar) if the margin "
-                "went negative — hose losses are now real, not estimated",
-            ],
-        })
-        return _dumps(sh.attach(base, env))
+        try:
+            r = cb.call("hydraulic_piping_handoff", {
+                "doc": d, "supply_pressure_bar": supply_pressure_bar,
+                "flow_lpm": flow_lpm, "load_pressure_bar": load_pressure_bar,
+                "lines": ln, "fluid": fl, "default_id_mm": default_id_mm,
+                "default_length_mm": default_length_mm,
+                "tolerance_pct": tolerance_pct})
+        except Exception as exc:  # noqa: BLE001
+            return _dumps(_err(f"core engine unavailable: {exc}"))
+        if r.get("ok") and r.get("stage") == "solved":
+            # Session state stays MCP-side: remember the live handoff+solve pair
+            # so hydraulic_verify_piping can be called with no arguments.
+            _HYD["piping_handoff"] = {"handoff": r.get("simhandoff"),
+                                      "solve": r.get("solve")}
+        return _dumps(r)
 
     @mcp.tool()
     def hydraulic_verify_piping(handoff: Union[str, dict, None] = None,
@@ -862,41 +640,20 @@ def register_hydraulic_tools(mcp) -> None:
         sess = _HYD.get("piping_handoff") or {}
         if h is None:
             h = sess.get("handoff")
-        elif isinstance(h, dict) and h.get("schema") != sh.SCHEMA:
-            h = h.get("simhandoff")
         if srs is None:
             srs = sess.get("solve")
-        if not isinstance(h, dict) or h.get("kind") != "handoff":
-            return _dumps(_err("no hydraulic→piping handoff envelope",
-                               hint="call hydraulic_piping_handoff first, or pass "
-                                    "handoff=<result or its simhandoff envelope>"))
-        if not isinstance(srs, dict) or not srs.get("links"):
-            return _dumps(_err("no piping solve result with links to verify against",
-                               hint="pass solve_result=<piping_solve output>"))
 
-        env, checks = _verify_piping_envelope(h, srs, float(tolerance_pct))
-        if not checks:
-            return _dumps(_err("no comparable lines (expectations vs solve links)",
-                               hint="the handoff had no dP expectations or the solve "
-                                    "links don't match its run ids"))
-        solved_loss_bar = round(sum(abs(lk.get("dp_kpa", 0.0))
-                                    for lk in srs.get("links", [])) / 100.0, 4)
-        est_loss_bar = None
-        exps = h.get("expectations") or []
-        if exps:
-            est_loss_bar = round(sum(float(e["value"]) for e in exps) / 100.0, 4)
-        result = {
-            "ok": True,
-            "pass": env["pass"],
-            "verdict": env["verdict"],
-            "checks": checks,
-            "tolerance_pct": float(tolerance_pct),
-            "margin": (_margin_update(supply_pressure_bar, load_pressure_bar,
-                                      est_loss_bar, solved_loss_bar)
-                       if supply_pressure_bar is not None else None),
-            "warnings": [],
-        }
-        return _dumps(sh.attach(result, env))
+        try:
+            # The core also accepts the whole producer result for `handoff` (it pulls
+            # the envelope from its `simhandoff` key), exactly like the old handler.
+            r = cb.call("hydraulic_verify_piping", {
+                "handoff": h, "solve_result": srs,
+                "supply_pressure_bar": supply_pressure_bar,
+                "load_pressure_bar": load_pressure_bar,
+                "tolerance_pct": float(tolerance_pct)})
+        except Exception as exc:  # noqa: BLE001
+            return _dumps(_err(f"core engine unavailable: {exc}"))
+        return _dumps(r)
 
     @mcp.tool()
     def hydraulic_fea_handoff(bore_mm: float,
@@ -927,53 +684,23 @@ def register_hydraulic_tools(mcp) -> None:
         pass ``fea_args`` straight to ``run_fea_static(doc_id=target_doc_id, ...)``.
         """
         try:
-            ax = _unit3(_as_obj(axis))
+            ax = _as_obj(axis)
             d = _load_doc(doc) if doc is not None else _active_doc()
         except (ValueError, TypeError, OSError) as exc:
             return _dumps(_err(f"could not parse inputs: {exc}",
                                hint="axis must be a non-zero [x,y,z] vector"))
-        if bore_mm <= 0 or max_pressure_bar <= 0:
-            return _dumps(_err("bore_mm and max_pressure_bar must be > 0"))
-        if rod_mm < 0 or rod_mm >= bore_mm:
-            return _dumps(_err("rod_mm must be in [0, bore_mm)"))
-        if not (0.0 < efficiency <= 1.0):
-            return _dumps(_err("efficiency must be in (0, 1]"))
 
-        env = _fea_handoff_envelope(
-            bore_mm=float(bore_mm), rod_mm=float(rod_mm),
-            max_pressure_bar=float(max_pressure_bar), axis=ax,
-            efficiency=float(efficiency), load_face=load_face,
-            fixture_face=fixture_face,
-            doc_id=(d or {}).get("id") if isinstance(d, dict) else None,
-            target_doc_id=target_doc_id)
-        _HYD["fea_handoff"] = env
-
-        fea_args = {}
-        for cond in env["conditions"]:
-            if cond.get("kind") != "force":
-                continue
-            fea_args[cond["case"]] = {
-                "fixtures": [fixture_face],
-                "loads": [{"face": load_face, "force": cond["value"]}],
-                **({"doc_id": target_doc_id} if target_doc_id else {}),
-            }
-        forces = env["source"]["result_digest"]
-        result = {
-            "ok": True,
-            "extend_force_n": forces["extend_force_n"],
-            "retract_force_n": forces["retract_force_n"],
-            "axis": ax,
-            "cases": sorted(fea_args),
-            "fea_args": fea_args,
-            "warnings": [],
-            "hint": ("run each case: run_fea_static(**fea_args['extend_max_pressure']) "
-                     "etc., then hydraulic_verify_fea(fea_result=<summary>)"),
-            "next_actions": [
-                "run_fea_static(**fea_args[case]) for each load case",
-                "hydraulic_verify_fea() to cross-check force magnitude/direction",
-            ],
-        }
-        return _dumps(sh.attach(result, env))
+        try:
+            r = cb.call("hydraulic_fea_handoff", {
+                "bore_mm": float(bore_mm), "max_pressure_bar": float(max_pressure_bar),
+                "rod_mm": float(rod_mm), "axis": ax, "load_face": load_face,
+                "fixture_face": fixture_face, "efficiency": float(efficiency),
+                "target_doc_id": target_doc_id, "doc": d})
+        except Exception as exc:  # noqa: BLE001
+            return _dumps(_err(f"core engine unavailable: {exc}"))
+        if r.get("ok") and isinstance(r.get("simhandoff"), dict):
+            _HYD["fea_handoff"] = r["simhandoff"]  # session state stays MCP-side
+        return _dumps(r)
 
     @mcp.tool()
     def hydraulic_verify_fea(handoff: Union[str, dict, None] = None,
@@ -998,19 +725,12 @@ def register_hydraulic_tools(mcp) -> None:
             return _dumps(_err(f"could not parse inputs: {exc}"))
         if h is None:
             h = _HYD.get("fea_handoff")
-        elif isinstance(h, dict) and h.get("schema") != sh.SCHEMA:
-            h = h.get("simhandoff")
-        if not isinstance(h, dict) or h.get("kind") != "handoff" \
-                or not (h.get("meta") or {}).get("bore_mm"):
-            return _dumps(_err("no hydraulic→FEA handoff envelope",
-                               hint="call hydraulic_fea_handoff first, or pass "
-                                    "handoff=<result or its simhandoff envelope>"))
-        env = _verify_fea_envelope(h, float(tolerance_pct), fea_result=fr)
-        result = {
-            "ok": True,
-            "pass": env["pass"],
-            "verdict": env["verdict"],
-            "checks": env["checks"],
-            "warnings": env.get("warnings") or [],
-        }
-        return _dumps(sh.attach(result, env))
+
+        try:
+            # The core unwraps a whole producer result (pulls `simhandoff`) itself.
+            r = cb.call("hydraulic_verify_fea", {
+                "handoff": h, "fea_result": fr,
+                "tolerance_pct": float(tolerance_pct)})
+        except Exception as exc:  # noqa: BLE001
+            return _dumps(_err(f"core engine unavailable: {exc}"))
+        return _dumps(r)

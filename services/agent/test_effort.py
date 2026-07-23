@@ -5,7 +5,7 @@ conditions — plus tier aliasing, the freedom rule (never clamp), the ledger
 snapshot event, the shared tiers.resolve_effort path, and CLI-shape view().
 
 Offline discipline: no live model, no real config.json — every test passes an
-explicit ``config=`` dict; persistence tests monkeypatch engine.paths.CONFIG.
+explicit ``config=`` dict; persistence tests monkeypatch services.paths.CONFIG.
 """
 from __future__ import annotations
 
@@ -257,7 +257,7 @@ def test_view_shape_for_gui():
 # --------------------------------------------------------------------------- persistence
 
 def test_save_effort_settings_roundtrip(tmp_path, monkeypatch):
-    from engine import paths as engine_paths
+    from services import paths as engine_paths
     monkeypatch.setattr(engine_paths, "CONFIG", tmp_path / "config.json")
 
     saved = save_effort_settings({
@@ -276,7 +276,7 @@ def test_save_effort_settings_roundtrip(tmp_path, monkeypatch):
 
 
 def test_save_rejects_structural_garbage_but_not_absurd_values(tmp_path, monkeypatch):
-    from engine import paths as engine_paths
+    from services import paths as engine_paths
     monkeypatch.setattr(engine_paths, "CONFIG", tmp_path / "config.json")
 
     with pytest.raises(EffortError):

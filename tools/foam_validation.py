@@ -62,7 +62,7 @@ _CASES = {
 
 
 def run_case(name: str, preset: str) -> dict:
-    from engine.sim.openfoam import run_openfoam_tunnel
+    from services.sim.openfoam import run_openfoam_tunnel
 
     factory, speed, cd_ref, band, ref_area, note = _CASES[name]
     stl, auto_area = factory()
@@ -83,7 +83,7 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     try:
-        from engine.sim.foam_runner import get_runner
+        from services.sim.foam_runner import get_runner
         if get_runner() is None:
             print("[validation] No OpenFOAM available. Provision it with "
                   "`python -m tools.provision_openfoam --install`.")

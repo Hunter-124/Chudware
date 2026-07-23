@@ -745,7 +745,7 @@ def test_dispatcher_accounts_and_switch(tmp_config):
 
 def test_subscription_rpc_multi_account_shapes(tmp_config):
     """RPC shapes for accounts/switch + backward-compat status/logout."""
-    from engine_oracle.parts_hub import subscription_rpc as rpc
+    from services.agent import worker_rpc as rpc
 
     emit = lambda *_a, **_k: None  # noqa: E731
 
@@ -897,7 +897,7 @@ def test_ensure_fresh_refresh_failure_clean_error(tmp_config, monkeypatch):
     assert sub_auth.load_credential("anthropic-sub")["access_token"] == "old-at"
 
     # RPC seam mirrors the same shape.
-    from engine_oracle.parts_hub import subscription_rpc as rpc
+    from services.agent import worker_rpc as rpc
     emit = lambda _e: None  # noqa: E731
     rpc_out = rpc.SUBSCRIPTION_METHODS["subscription_ensure_fresh"](
         {"provider": "claude"}, emit
@@ -954,7 +954,7 @@ def test_each_provider_login_persists_and_rpc_manages_only_selected_account(
     monkeypatch.setattr(sl, "_instantiate", lambda name: FakeProvider())
     assert next(p for p in sl.providers() if p["id"] == friendly)["name"] == provider_name
 
-    from engine_oracle.parts_hub import subscription_rpc as rpc
+    from services.agent import worker_rpc as rpc
 
     emit = lambda *_a, **_k: None  # noqa: E731
     with rpc._login_lock:
@@ -1009,7 +1009,7 @@ def test_each_provider_login_persists_and_rpc_manages_only_selected_account(
 def test_subscription_login_thread_failure_does_not_leave_status_stuck(
     tmp_config, monkeypatch
 ):
-    from engine_oracle.parts_hub import subscription_rpc as rpc
+    from services.agent import worker_rpc as rpc
 
     with rpc._login_lock:
         rpc._login_state.clear()

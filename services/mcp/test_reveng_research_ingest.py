@@ -75,7 +75,7 @@ class TestResearchAndIngest:
     def _make_module(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         """Import research_ingest with seams patched."""
         # Stub out the heavy optional imports before importing the module
-        fake_research = types.ModuleType("engine_oracle.research")
+        fake_research = types.ModuleType("services.research")
         fake_research.web_search = mock.Mock(return_value={
             "results": [
                 {"url": "https://example.com/6204-2RS.pdf", "title": "Bearing datasheet"},
@@ -91,7 +91,7 @@ class TestResearchAndIngest:
         })
 
         # Patch sys.modules so research_ingest picks them up
-        monkeypatch.setitem(sys.modules, "engine_oracle.research", fake_research)
+        monkeypatch.setitem(sys.modules, "services.research", fake_research)
 
         # Stub spec_sheet_matcher
         fake_ssm = types.ModuleType("engine_oracle.spec_sheet_matcher")
@@ -99,19 +99,19 @@ class TestResearchAndIngest:
         monkeypatch.setitem(sys.modules, "engine_oracle.spec_sheet_matcher", fake_ssm)
 
         # Stub datasheet_ingest
-        fake_di = types.ModuleType("engine_oracle.vision.datasheet_ingest")
+        fake_di = types.ModuleType("services.vision.datasheet_ingest")
         fake_di.ingest_datasheet = mock.Mock(return_value={
             "ok": True,
             "dim_rows": [
                 {"od_mm": 47.0, "id_mm": 20.0, "width_mm": 14.0},
             ],
         })
-        monkeypatch.setitem(sys.modules, "engine_oracle.vision.datasheet_ingest", fake_di)
+        monkeypatch.setitem(sys.modules, "services.vision.datasheet_ingest", fake_di)
 
         # Remove cached module if present
-        monkeypatch.delitem(sys.modules, "engine_oracle.vision.research_ingest", raising=False)
+        monkeypatch.delitem(sys.modules, "services.vision.research_ingest", raising=False)
 
-        from engine_oracle.vision import research_ingest
+        from services.vision import research_ingest
         return research_ingest
 
     def test_query_mode_assembles_bundle(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -177,18 +177,18 @@ class TestResearchAndIngest:
     ):
         # Remove all optional seams so the module has nothing
         for mod in [
-            "engine_oracle.research",
+            "services.research",
             "engine_oracle.spec_sheet_matcher",
-            "engine_oracle.vision.datasheet_ingest",
+            "services.vision.datasheet_ingest",
             "services.browser.session",
         ]:
             monkeypatch.delitem(sys.modules, mod, raising=False)
-        monkeypatch.delitem(sys.modules, "engine_oracle.vision.research_ingest", raising=False)
+        monkeypatch.delitem(sys.modules, "services.vision.research_ingest", raising=False)
 
         # Patch builtins import to raise for the optional deps
         real_import = __builtins__.__import__ if hasattr(__builtins__, "__import__") else __import__
 
-        _offline_mods = {"engine_oracle.research", "services.browser.session"}
+        _offline_mods = {"services.research", "services.browser.session"}
 
         def _patched_import(name, *args, **kwargs):
             if name in _offline_mods:
@@ -197,7 +197,7 @@ class TestResearchAndIngest:
 
         with mock.patch("builtins.__import__", side_effect=_patched_import):
             # Just test the orchestrator logic with no seams available
-            from engine_oracle.vision import research_ingest as ri2
+            from services.vision import research_ingest as ri2
             # Patch module-level refs to None
             ri2._web_search = None
             ri2._fetch_page = None
@@ -362,8 +362,8 @@ def test_reveng_research_ingest_module_importable():
     """Smoke: research_ingest module loads without error (seams may be absent)."""
     import importlib
     # Remove cached copy to force fresh import
-    sys.modules.pop("engine_oracle.vision.research_ingest", None)
-    mod = importlib.import_module("engine_oracle.vision.research_ingest")
+    sys.modules.pop("services.vision.research_ingest", None)
+    mod = importlib.import_module("services.vision.research_ingest")
     assert hasattr(mod, "research_and_ingest")
     assert callable(mod.research_and_ingest)
 

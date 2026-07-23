@@ -62,18 +62,18 @@ GOLD_DIR = os.path.join(_REPO_ROOT, "training", "benches", "elicitation", "gold"
 # ---- schema-valid constants: reuse the real substrate module, fall back to a local copy
 # if the repo-root import path isn't wired (e.g. this module imported outside the pytest
 # conftest that adds the repo root to sys.path). Kept byte-identical to
-# engine_oracle/requirements/requirements.py / contracts/requirements.md §3.
+# services/requirements/requirements.py / contracts/requirements.md §3.
 try:
     if _REPO_ROOT not in sys.path:
         sys.path.insert(0, _REPO_ROOT)
-    from engine_oracle.requirements.requirements import (  # type: ignore
+    from services.requirements.requirements import (  # type: ignore
         VALID_KINDS,
         VALID_STATUSES,
         VALID_VERIFIERS,
     )
-    _CONSTANTS_SOURCE = "engine_oracle.requirements.requirements"
+    _CONSTANTS_SOURCE = "services.requirements.requirements"
 except Exception:
-    _CONSTANTS_SOURCE = "local fallback copy (engine_oracle import failed)"
+    _CONSTANTS_SOURCE = "local fallback copy (services.requirements import failed)"
     VALID_VERIFIERS = frozenset({
         "check_sketch", "check_feature_overlap", "check_interference", "check_symmetry",
         "compare_parts", "confirm_dimensions", "dfm_check", "draft_analysis", "fit_report",

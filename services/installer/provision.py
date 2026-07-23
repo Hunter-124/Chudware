@@ -22,7 +22,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from engine import paths
+from services import paths
 
 def _find_repo() -> Path:
     """Locate the repo root (the dir holding requirements.txt) by walking up from this file.
@@ -107,7 +107,7 @@ def converters_status() -> dict:
 # The heavy RE toolchain (COLMAP/OpenMVS/Brush binaries, TripoSR/TRELLIS/VGGT
 # weights) is NEVER part of the base runtime venv above — it is provisioned on
 # demand or discovered from user-provided binaries. The SHA-pinned descriptor
-# table + offline readiness probe live in engine_oracle/vision/reveng_provision.py
+# table + offline readiness probe live in services/vision/reveng_provision.py
 # (kept there so services/mcp/reveng_tools.reveng_status() can consume it without
 # importing the installer). OpenMVS is AGPL -> subprocess-only via OPENMVS_BIN,
 # never bundled/linked/auto-downloaded. This installer-facing wrapper reports
@@ -115,12 +115,12 @@ def converters_status() -> dict:
 def reveng_provisioning_status() -> dict:
     """Offline readiness of the Reverse Engineering toolchain (contract §8.1).
 
-    Delegates to engine_oracle.vision.reveng_provision.reveng_status(); returns a
+    Delegates to services.vision.reveng_provision.reveng_status(); returns a
     contract-shaped ``{ok, missing, ...}`` even if that module is unavailable, so
     the installer --check never raises on a partial tree.
     """
     try:
-        from engine_oracle.vision import reveng_provision
+        from services.vision import reveng_provision
     except Exception as exc:  # noqa: BLE001 - optional subsystem, never fatal
         return {"ok": False, "reason": "reveng_provision unavailable",
                 "hint": str(exc), "missing": [], "capabilities": {}}
@@ -136,7 +136,7 @@ def ngspice_provisioning_status() -> dict:
     Delegates to engine.sim.ngspice_backend.ngspice_status(); never raises.
     """
     try:
-        from engine_oracle.sim.ngspice_backend import ngspice_status
+        from services.installer.ngspice_backend import ngspice_status
     except Exception as exc:  # noqa: BLE001 - optional subsystem, never fatal
         return {"tool": "ngspice", "installed": False,
                 "hint": f"ngspice_backend unavailable: {exc}"}

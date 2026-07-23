@@ -37,9 +37,35 @@ import pytest
 # mcp/anyio packages (same rule as test_fea_advanced.py).
 from mcp_server.cad_tools import register_cad_tools as _register_cad_tools  # noqa: F401
 
-from engine.hydraulic import solve as hyd_solve
-from engine.piping import schema as piping_schema
-from engine.piping import solve as piping_solve_mod
+# engine_oracle/hydraulic + engine/piping/{solve,properties} were ported to core
+# (T-RF19) and deleted; these shims drive the same methods over the core bridge.
+from services.mcp import core_bridge as _cb_hyd
+
+
+class _HydSolveShim:
+    @staticmethod
+    def size_cylinder(**params):
+        return _cb_hyd.call("hydraulic_size_cylinder", params)
+
+    @staticmethod
+    def size_pump(**params):
+        return _cb_hyd.call("hydraulic_size_pump", params)
+
+
+class _PipingSolveShim:
+    @staticmethod
+    def solve(doc, boundary=None, fluid=None, pumps=None):
+        return _cb_hyd.call("piping_solve", {"doc": doc, "boundary": boundary,
+                                             "fluid": fluid, "pumps": pumps})
+
+    @staticmethod
+    def operating_point(csv, system=None):
+        return _cb_hyd.call("piping_operating_point", {"pump_curve": csv, "system": system})
+
+
+hyd_solve = _HydSolveShim()
+piping_solve_mod = _PipingSolveShim()
+from engine.piping import schema as piping_schema  # kept in engine_oracle (threed/cfd_handoff hold-back)
 from mcp_server import simhandoff as sh
 
 
@@ -52,7 +78,6 @@ def _have(mod: str) -> bool:
 
 
 HAVE_FLUIDS = _have("fluids")            # engine.piping.solve dependency (MIT)
-HAVE_PYNITE = _have("Pynite")            # engine.structural.analysis dependency (MIT)
 HAVE_BUILD123D = _have("build123d")      # piping_internal_volume OCP kernel
 
 
@@ -255,10 +280,19 @@ def test_piping_internal_volume_exact_cylinder(tmp_path):
 
 
 # ══════════════════════════════ group 3: structural (Euler-Bernoulli) ══════════
+#
+# The struct_* MCP tools are dispatched to the C++ core (libaicad struct_* RPCs via
+# core_bridge) — they need a staged engine, not PyNite. Same gate as group 5.
+
+from mcp_server import core_bridge as cb  # noqa: E402
+
+_STRUCT_ENGINE = pytest.mark.skipif(
+    not cb.available(),
+    reason="libaicad not staged; struct_* RPCs unavailable")
 
 
 def _cantilever_doc(tmp_path, L_mm: float, w_n_mm: float) -> str:
-    """One horizontal steel beam along +X, root at origin. build_pynite_model fixes the
+    """One horizontal steel beam along +X, root at origin. The model builder fixes the
     single lowest node (tie-break z,y,x -> the x=0 root) => a cantilever."""
     doc = {
         "schema": "aicad.structure/1",
@@ -277,7 +311,7 @@ def _cantilever_doc(tmp_path, L_mm: float, w_n_mm: float) -> str:
     return str(p)
 
 
-@pytest.mark.skipif(not HAVE_PYNITE, reason="Pynite not installed")
+@_STRUCT_ENGINE
 def test_struct_analyze_cantilever_udl_euler_bernoulli(tmp_path):
     """Cantilever + UDL closed forms (Euler-Bernoulli, e.g. Gere Table G-1):
     delta_max = w*L^4/(8*E*I), M_max = w*L^2/2, V_max = w*L. DEAD_ONLY combo = 1.4*D."""
@@ -287,7 +321,7 @@ def test_struct_analyze_cantilever_udl_euler_bernoulli(tmp_path):
                                            load_combo="DEAD_ONLY"))
     assert r["ok"], r
     row = r["results"][0]
-    E = 200000.0                       # steel E (MPa) — analysis.py _MATERIALS table
+    E = 200000.0                       # steel E (MPa) — core/structural materials table
     I = 100.0 * 100.0 ** 3 / 12.0      # I = b*h^3/12, square 100x100 section
     w_eff = 1.4 * w                    # ASCE 7 DEAD_ONLY = 1.4*D
     d_ref = w_eff * L ** 4 / (8.0 * E * I)      # Euler-Bernoulli cantilever UDL
@@ -298,7 +332,7 @@ def test_struct_analyze_cantilever_udl_euler_bernoulli(tmp_path):
     assert math.isclose(abs(row["shear_n"]), v_ref, rel_tol=0.02), (row, v_ref)
 
 
-@pytest.mark.skipif(not HAVE_PYNITE, reason="Pynite not installed")
+@_STRUCT_ENGINE
 def test_struct_check_payload_shape_and_disclaimer(tmp_path):
     tools = _structural_tools()
     r = json.loads(tools["struct_check"](_cantilever_doc(tmp_path, 2000.0, 10.0),
@@ -344,20 +378,23 @@ def test_hydraulic_piping_handoff_feeds_piping_solve():
     """Cross-seam chain: hydraulic_piping_handoff produces a handoff envelope whose
     inline piping doc + meta boundary/fluid piping_solve consumes directly, and the
     solve result records the handoff_id (provenance chain closed)."""
-    from engine.hydraulic import schema as hyd_schema
+    # engine.hydraulic.schema was ported to core (T-RF19): build the circuit doc
+    # through the C++ RPCs (component ids c1/c2 come from next_id in order).
     htools = _hydraulic_tools()
     ptools = _piping_tools()
     # minimal pump -> cylinder circuit with two hoses carrying real geometry
-    doc = hyd_schema.new_hydraulic("mp circuit")
-    doc["components"] += [hyd_schema.new_component("c1", "pump", name="pump"),
-                          hyd_schema.new_component("c2", "cylinder_linear", name="cyl",
-                                                   bore_mm=50.0, rod_mm=28.0)]
-    doc["hoses"].append(hyd_schema.new_hose(
-        "h1", "PRESSURE_LINE", [{"component_id": "c1", "port": "pressure"},
-                                {"component_id": "c2", "port": "work_a"}]))
+    doc = _cb_hyd.call("hydraulic_new", {"name": "mp circuit"})["doc"]
+    doc = _cb_hyd.call("hydraulic_add_component",
+                       {"doc": doc, "type": "pump", "name": "pump"})["doc"]
+    doc = _cb_hyd.call("hydraulic_add_component",
+                       {"doc": doc, "type": "cylinder_linear", "name": "cyl",
+                        "params": {"bore_mm": 50.0, "rod_mm": 28.0}})["doc"]
+    doc = _cb_hyd.call("hydraulic_add_hose",
+                       {"doc": doc, "net_name": "PRESSURE_LINE",
+                        "connections": [{"component_id": "c1", "port": "pressure"},
+                                        {"component_id": "c2", "port": "work_a"}]})["doc"]
     doc["hoses"][0]["id_mm"] = 12.7
     doc["hoses"][0]["length_mm"] = 2500.0
-    assert hyd_schema.validate_hydraulic(doc) == []
     r = json.loads(htools["hydraulic_piping_handoff"](
         supply_pressure_bar=200.0, flow_lpm=30.0, doc=doc))
     assert r["ok"], r
@@ -391,8 +428,6 @@ def test_piping_verify_envelope_shape_from_mock_results():
 
 
 # ══════════════════════════════ group 5: engine-backed motion ══════════════════
-
-from mcp_server import core_bridge as cb  # noqa: E402
 
 _ENGINE = pytest.mark.skipif(
     not cb.available(),

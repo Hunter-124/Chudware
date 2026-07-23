@@ -1067,7 +1067,7 @@ def register_ecad_airflow_tools(mcp) -> None:
 
     def _openfoam_runner():
         try:
-            from engine.sim.foam_runner import get_runner
+            from services.sim.foam_runner import get_runner
             r = get_runner()
             return r if (r is not None and r.available()) else None
         except Exception:  # noqa: BLE001
@@ -1227,7 +1227,7 @@ def register_ecad_airflow_tools(mcp) -> None:
 
         # ── live CHT via the T-SIM5 seam ────────────────────────────────────
         try:
-            from engine.sim.openfoam import run_openfoam_tunnel
+            from services.sim.openfoam import run_openfoam_tunnel
             res = run_openfoam_tunnel(
                 None, direction=(1.0, 0.0, 0.0), speed_mps=float(inlet_mps),
                 preset=preset,

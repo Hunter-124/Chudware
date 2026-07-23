@@ -1,0 +1,173 @@
+{
+ "schema": "aicad.structure/1",
+ "name": "steel_frame",
+ "units": "mm",
+ "elements": [
+  {
+   "element_type": "footing",
+   "id": "f1",
+   "section_name": "600x600",
+   "material": "concrete",
+   "length_mm": 200.0,
+   "transform": [
+    1,
+    0,
+    0,
+    0,
+    0,
+    1,
+    0,
+    0,
+    0,
+    0,
+    1,
+    -200,
+    0,
+    0,
+    0,
+    1
+   ]
+  },
+  {
+   "element_type": "footing",
+   "id": "f2",
+   "section_name": "600x600",
+   "material": "concrete",
+   "length_mm": 200.0,
+   "transform": [
+    1,
+    0,
+    0,
+    6000,
+    0,
+    1,
+    0,
+    0,
+    0,
+    0,
+    1,
+    -200,
+    0,
+    0,
+    0,
+    1
+   ]
+  },
+  {
+   "element_type": "column",
+   "id": "c1",
+   "section_name": "W200x100",
+   "material": "steel_a992",
+   "length_mm": 3000.0,
+   "transform": [
+    1.0,
+    0,
+    0,
+    0,
+    0,
+    1.0,
+    0,
+    0,
+    0,
+    0,
+    1.0,
+    0,
+    0,
+    0,
+    0,
+    1
+   ]
+  },
+  {
+   "element_type": "column",
+   "id": "c2",
+   "section_name": "W200x100",
+   "material": "steel_a992",
+   "length_mm": 3000.0,
+   "transform": [
+    1,
+    0,
+    0,
+    6000,
+    0,
+    1,
+    0,
+    0,
+    0,
+    0,
+    1,
+    0,
+    0,
+    0,
+    0,
+    1
+   ]
+  },
+  {
+   "element_type": "beam",
+   "id": "b1",
+   "section_name": "W8X31",
+   "material": "steel_a992",
+   "length_mm": 6000.0,
+   "transform": [
+    0,
+    0,
+    1,
+    0,
+    0,
+    1,
+    0,
+    0,
+    1,
+    0,
+    0,
+    3000,
+    0,
+    0,
+    0,
+    1
+   ]
+  }
+ ],
+ "load_cases": [
+  {
+   "id": "lc1",
+   "kind": "dead",
+   "gravity": [
+    0,
+    0,
+    -1
+   ],
+   "factor": 1.0,
+   "distributed": {
+    "w_n_per_mm": 3.5
+   }
+  },
+  {
+   "id": "lc2",
+   "kind": "live",
+   "gravity": [
+    0,
+    0,
+    -1
+   ],
+   "factor": 1.0,
+   "distributed": {
+    "w_n_per_mm": 2.0
+   }
+  },
+  {
+   "id": "lc3",
+   "kind": "wind",
+   "gravity": [
+    1,
+    0,
+    0
+   ],
+   "factor": 1.0,
+   "distributed": {
+    "w_n_per_mm": 0.8
+   }
+  }
+ ]
+}

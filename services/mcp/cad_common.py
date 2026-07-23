@@ -625,7 +625,7 @@ def _autosave_dir() -> Path:
 
     Resolution order:
       1. AI_CAD_AUTOSAVE_DIR env var (tests use this for hermeticity).
-      2. engine.paths.appdata_root() / "mcp_autosave"  — XDG-aware on Linux,
+      2. services.paths.appdata_root() / "mcp_autosave"  — XDG-aware on Linux,
          %APPDATA%\\AI-CAD on Windows.  Matches the C++ convention in paths.cpp.
       3. tempfile.gettempdir() / "AI-CAD" / "mcp_autosave" (last-resort fallback).
 
@@ -638,7 +638,7 @@ def _autosave_dir() -> Path:
         d = Path(override)
     else:
         try:
-            from engine import paths as _paths  # noqa: PLC0415
+            from services import paths as _paths  # noqa: PLC0415
             d = _paths.ROOT / "mcp_autosave"  # alias-aware root, not the always-new dir
         except Exception:  # noqa: BLE001
             d = Path(tempfile.gettempdir()) / "AI-CAD" / "mcp_autosave"
@@ -1109,14 +1109,42 @@ def _solve_sync_or_handoff(kind: str, fn, progress: Optional[dict] = None,
 
 # A small material library so FEA tools take a friendly name. Fields are exactly what the
 # host's study expects (host/src/ui/sim_manager.cpp): E in MPa, density g/cm^3, strengths MPa.
-# T-F2: these are now sourced from the unified `engine.materials` registry — the single
-# provenance-stamped first-party table — instead of a literal here, so the FEA path, DfM
-# and the `material_lookup` research helper can never drift apart. `fea_table()` reproduces
-# exactly the legacy 7-entry library + `fea_aliases()` the alias map (values unchanged).
-from engine import materials as _materials_registry  # noqa: E402
+# T-F2: these are sourced from the unified materials registry — the single provenance-stamped
+# first-party table — now served by the C++ core (core/materials, via the libaicad
+# material_fea_table / material_fea_aliases methods) instead of the retired Python
+# engine.materials module. `fea_table()` reproduces exactly the legacy 7-entry library +
+# `fea_aliases()` the alias map (values unchanged). Filled LAZILY on first material
+# resolution: importing cad_common must never require a live engine bridge. The dicts are
+# updated IN PLACE so names re-exported through cad_tools stay the same objects.
+_MATERIALS: dict = {}
+_MATERIAL_ALIASES: dict = {}
 
-_MATERIALS: dict = _materials_registry.fea_table()
-_MATERIAL_ALIASES: dict = _materials_registry.fea_aliases()
+
+def _wire_materials_registry() -> None:
+    """Point the C++ core at the bundled materials registry JSON when nothing else has.
+
+    The core resolves the registry via $AICAD_MATERIALS_REGISTRY (or a provisioned
+    data-root copy) and caches it once per process — so this must run at IMPORT time,
+    before the first engine RPC can spawn/attach an engine without it. ``setdefault``
+    never overrides an explicit user/installer path."""
+    try:
+        p = Path(__file__).resolve().parents[2] / "core" / "data" / "materials" / "registry.json"
+        if p.is_file():
+            os.environ.setdefault("AICAD_MATERIALS_REGISTRY", str(p))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+_wire_materials_registry()
+
+
+def _ensure_materials() -> None:
+    """Populate _MATERIALS / _MATERIAL_ALIASES from the C++ core on first use."""
+    if _MATERIALS:
+        return
+    _wire_materials_registry()
+    _MATERIALS.update(cb.call("material_fea_table", {}).get("result") or {})
+    _MATERIAL_ALIASES.update(cb.call("material_fea_aliases", {}).get("result") or {})
 
 
 def _resolve_material(material: Union[str, dict, None]) -> dict:
@@ -1130,6 +1158,7 @@ def _resolve_material(material: Union[str, dict, None]) -> dict:
     if isinstance(material, dict):
         mat = dict(material)  # copy: caller-supplied dicts are returned as a new copy too
     else:
+        _ensure_materials()
         key = (material or "steel").strip().lower()
         key = _MATERIAL_ALIASES.get(key, key)
         if key not in _MATERIALS:

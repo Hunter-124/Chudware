@@ -1,4 +1,4 @@
-"""Provision a working OpenFOAM for the CFD bridge (engine.sim.openfoam).
+"""Provision a working OpenFOAM for the CFD bridge (services.sim.openfoam).
 
 The bridge drives OpenFOAM three ways (see engine/sim/foam_runner.py) — always as
 subprocesses, never linked (GPL isolation, contracts/license_debt.md):
@@ -93,7 +93,7 @@ def report() -> int:
     """Print the detected runner; exit 0 if any OpenFOAM is reachable, else 1."""
     # Import lazily so the script runs even from a bare checkout.
     try:
-        from engine.sim.foam_runner import get_runner, reset_cache
+        from services.sim.foam_runner import get_runner, reset_cache
     except Exception as e:  # noqa: BLE001
         print(f"[provision] could not import foam_runner: {e}")
         return 1
@@ -123,7 +123,7 @@ def main(argv=None) -> int:
 
     if args.install:
         try:
-            from engine.sim.foam_runner import get_runner, reset_cache
+            from services.sim.foam_runner import get_runner, reset_cache
             reset_cache()
             if get_runner() is not None:
                 print("[provision] OpenFOAM already available — nothing to do.")

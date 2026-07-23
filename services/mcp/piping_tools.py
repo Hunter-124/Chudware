@@ -3,9 +3,14 @@
 
 Same design contract as ``ecad_tools`` (project owner: "the AI is extremely limited; its tools
 must do the bookkeeping and return rich, actionable context"). Each tool returns a JSON string
-``{ok, ...result, warnings:[], hint:"...", next_actions:[...]}``, calls the engine helpers
-directly (``engine.piping.solve`` / ``engine.piping.schema``), and holds its own tiny session
-state so ``piping_report`` can reuse the document / result of the last ``piping_solve``.
+``{ok, ...result, warnings:[], hint:"...", next_actions:[...]}`` produced by the C++ core
+(T-RF19/T-RF20: the 1-D solve / report / operating-point / fluid / CFD-BC / verify envelopes
+are owned by ``core/piping`` behind the libaicad ``piping_*`` RPCs — reached via
+:mod:`services.mcp.core_bridge`); the MCP layer keeps input parsing, its tiny session state
+(so ``piping_report`` can reuse the document / result of the last ``piping_solve``), and the
+kernel orchestration legs (``piping_internal_volume`` bore extraction + the
+``piping_cfd_handoff`` bore→CFD pipeline), which still call ``engine.piping.cfd_handoff``
+(OCCT sweep — ported by a later leaf).
 
 Tools:
   piping_solve           aicad.piping/1 doc + boundary conditions -> node pressures/heads + link
@@ -32,10 +37,11 @@ import json
 import os
 from typing import Any, Optional, Union
 
-from engine.piping import schema as piping_schema
-from engine.piping import solve as piping_solve_mod
+# The bore-extraction leg (OCCT sweep) stays Python until a kernel leaf ports it —
+# engine_oracle/piping/cfd_handoff.py is NOT deleted in this round.
 from engine.piping import cfd_handoff as piping_cfd_mod
 
+from . import core_bridge as cb
 from services.mcp import simhandoff as sh
 
 # Session bookkeeping: the last solved doc + result so piping_report can be called with no args.
@@ -113,9 +119,15 @@ def network_from_handoff(env: Any) -> "tuple[Optional[dict], Optional[list], Opt
     return doc, boundary, fluid, errs
 
 
-def _node_menu(nodes: list) -> list:
-    """A compact node reference table so the model can address boundary conditions."""
-    return [{"node": n["id"], "xyz": n["xyz"]} for n in nodes]
+def _schema_errors_via_core(d: dict) -> list:
+    """Validate an ``aicad.piping/1`` doc through the core (the schema validator lives in
+    libaicad now — ``engine.piping.schema`` is deleted in this round). A boundary-less
+    ``piping_solve`` returns the validator's error list under ``errors`` for a bad doc,
+    and the boundary-conditions error (no ``errors`` key) for a good one."""
+    r = cb.call("piping_solve", {"doc": d})
+    if isinstance(r, dict) and not r.get("ok") and isinstance(r.get("errors"), list):
+        return r["errors"]
+    return []
 
 
 def _handoff_envelope(solve_res: dict, bc_cfd: dict, step_path: Optional[str],
@@ -196,8 +208,8 @@ def register_piping_tools(mcp) -> None:
                      source_handoff: Union[str, dict, None] = None) -> str:
         """Solve an ``aicad.piping/1`` pipe network for node pressures/heads and link flows.
 
-        ``doc`` is the piping document (a dict, a JSON string, or a path to a ``.json`` file) as
-        built with the ``engine.piping.schema`` factories (runs + fittings). ``boundary`` is a
+        ``doc`` is the piping document (a dict, a JSON string, or a path to a ``.json`` file)
+        as built per ``contracts/piping_schema.md`` (runs + fittings). ``boundary`` is a
         list of per-node conditions — each entry names a node (``{"node":"n0"}`` /
         ``{"at":[x,y,z]}`` / ``{"run":"r1","end":"start"|"end"}``) plus ONE of: ``pressure`` (kPa
         gauge) or ``head`` (m) to fix it, or ``demand`` (m³/h, + leaves / − enters) /
@@ -206,8 +218,8 @@ def register_piping_tools(mcp) -> None:
         ``fluid`` selects the working fluid: ``null`` (water @20 °C), an explicit
         ``{"rho":kg/m³,"mu":Pa·s}`` override, or a **sourced lookup**
         ``{"name":"water"|"air"|"methane"|"natural_gas"|"nitrogen"|"carbon_dioxide","T":K,"P":Pa}``
-        (properties come from CoolProp/thermo if installed, else a cited built-in model — see
-        ``piping_fluid``). ``pumps`` is a list of
+        (properties come from the core's cited built-in models — IAPWS/NIST water +
+        ideal-gas/Sutherland gases; see ``piping_fluid``). ``pumps`` is a list of
         ``{"run":"r1","curve":<CSV text/path>,"speed_ratio":1.0,"direction":"a_to_b"}``.
 
         ``network_type`` = ``"liquid"`` (incompressible, default) or ``"gas"``
@@ -239,45 +251,25 @@ def register_piping_tools(mcp) -> None:
             return _dumps(_err(f"could not parse inputs: {exc}",
                                hint="pass doc as JSON/dict/path and boundary as a JSON list"))
 
-        handoff_id = None
-        if env is not None:
-            hdoc, hbc, hfl, herrs = network_from_handoff(env)
-            if herrs and (d is None or bc is None):
-                return _dumps(_err("could not consume source_handoff",
-                                   hint="pass a hydraulic_piping_handoff result or its "
-                                        "simhandoff envelope", errors=herrs))
-            d = d if d is not None else hdoc
-            bc = bc if bc is not None else hbc
-            fl = fl if fl is not None else hfl
-            inner = env.get("simhandoff") if env.get("schema") != sh.SCHEMA else env
-            handoff_id = (inner or {}).get("id")
-        if d is None:
-            return _dumps(_err("doc is required (directly or via source_handoff)",
-                               hint="pass doc=<aicad.piping/1> or "
-                                    "source_handoff=<handoff envelope>"))
+        try:
+            res = cb.call("piping_solve", {
+                "doc": d, "boundary": bc, "fluid": fl, "pumps": pp,
+                "network_type": network_type, "source_handoff": env})
+        except Exception as exc:  # noqa: BLE001 — contract-shaped soft-fail, never raise
+            return _dumps(_err(f"core engine unavailable: {exc}"))
 
-        errs = piping_schema.validate(d) if isinstance(d, dict) else ["doc is not an object"]
-        if errs:
-            return _dumps(_err("piping document failed schema validation",
-                               hint="fix the listed errors (see contracts/piping_schema.md)",
-                               errors=errs))
-        if bc is None:
-            return _dumps(_err("boundary conditions are required",
-                               hint='e.g. [{"node":"n0","pressure":300},{"node":"n1","demand":50}]'))
-
-        res = piping_solve_mod.solve(d, boundary=bc, fluid=fl, pumps=pp,
-                                     network_type=network_type)
-        if not res.get("ok"):
-            res.setdefault("next_actions", [
-                "check every run endpoint meets another run or a boundary node",
-                "ensure at least one boundary fixes pressure/head",
-            ])
-            return _dumps(res)
-
-        _PIPING.update({"doc": d, "result": res, "boundary": bc, "fluid": fl, "pumps": pp})
-        res["node_menu"] = _node_menu(res["nodes"])
-        if handoff_id:
-            res["handoff_id"] = handoff_id  # provenance: study spawned by a handoff
+        if res.get("ok"):
+            # Session bookkeeping stays MCP-side: remember the RESOLVED doc/boundary/
+            # fluid (explicit args override the handoff envelope's, exactly like the
+            # core does) so piping_report can be called with no arguments.
+            sd, sbc, sfl = d, bc, fl
+            if env is not None:
+                hdoc, hbc, hfl, _herrs = network_from_handoff(env)
+                sd = sd if sd is not None else hdoc
+                sbc = sbc if sbc is not None else hbc
+                sfl = sfl if sfl is not None else hfl
+            _PIPING.update({"doc": sd, "result": res, "boundary": sbc,
+                            "fluid": sfl, "pumps": pp})
         return _dumps(res)
 
     @mcp.tool()
@@ -302,20 +294,24 @@ def register_piping_tools(mcp) -> None:
             return _dumps(_err(f"could not parse inputs: {exc}"))
 
         if d is None:
+            # Session-free reporting: the core takes the prior solve's doc + result
+            # explicitly (``piping_report`` accepts an additive ``result`` for this).
             if _PIPING.get("result") is None:
                 return _dumps(_err("no prior piping_solve to report on",
                                    hint="call piping_solve first, or pass doc + boundary here"))
-            rep = piping_solve_mod.pressure_drop_report(
-                _PIPING["doc"], _PIPING["result"], fluid=_PIPING["fluid"])
+            try:
+                rep = cb.call("piping_report", {
+                    "doc": _PIPING["doc"], "result": _PIPING["result"],
+                    "fluid": _PIPING["fluid"]})
+            except Exception as exc:  # noqa: BLE001
+                return _dumps(_err(f"core engine unavailable: {exc}"))
             return _dumps(rep)
 
-        errs = piping_schema.validate(d) if isinstance(d, dict) else ["doc is not an object"]
-        if errs:
-            return _dumps(_err("piping document failed schema validation", errors=errs))
-        if bc is None:
-            return _dumps(_err("boundary conditions are required to solve before reporting",
-                               hint='pass boundary, e.g. [{"node":"n0","pressure":300}, ...]'))
-        rep = piping_solve_mod.pressure_drop_report(d, boundary=bc, fluid=fl, pumps=pp)
+        try:
+            rep = cb.call("piping_report", {
+                "doc": d, "boundary": bc, "fluid": fl, "pumps": pp})
+        except Exception as exc:  # noqa: BLE001
+            return _dumps(_err(f"core engine unavailable: {exc}"))
         return _dumps(rep)
 
     @mcp.tool()
@@ -350,10 +346,13 @@ def register_piping_tools(mcp) -> None:
             suc = _as_obj(suction)
         except (ValueError, TypeError, OSError) as exc:
             return _dumps(_err(f"could not parse inputs: {exc}"))
-        op = piping_solve_mod.operating_point(
-            pump_curve, system=sysd, doc=d, boundary=bc, fluid=fl,
-            suction=suc, npshr_curve=npshr_curve, q_ref_m3h=q_ref_m3h,
-            speed_ratio=speed_ratio)
+        try:
+            op = cb.call("piping_operating_point", {
+                "pump_curve": pump_curve, "system": sysd, "doc": d, "boundary": bc,
+                "fluid": fl, "suction": suc, "npshr_curve": npshr_curve,
+                "q_ref_m3h": q_ref_m3h, "speed_ratio": speed_ratio})
+        except Exception as exc:  # noqa: BLE001
+            return _dumps(_err(f"core engine unavailable: {exc}"))
         return _dumps(op)
 
     @mcp.tool()
@@ -362,12 +361,14 @@ def register_piping_tools(mcp) -> None:
 
         Supported: ``water, air, methane, natural_gas, nitrogen, carbon_dioxide``. Returns density
         (kg/m³), dynamic viscosity (Pa·s), saturation/vapour pressure (Pa; liquids), the backend
-        used (CoolProp / thermo / built-in) and a ``source`` citation — the same values the solver
-        pulls for ``fluid={"name":...}``. Never fabricates: an unknown fluid or out-of-range
-        condition returns ``{"ok": false, "reason", "hint"}``.
+        used (the core's cited built-in models) and a ``source`` citation — the same values the
+        solver pulls for ``fluid={"name":...}``. Never fabricates: an unknown fluid or
+        out-of-range condition returns ``{"ok": false, "reason", "hint"}``.
         """
-        from engine.piping import properties as piping_props
-        return _dumps(piping_props.fluid_properties(name, T=float(T), P=float(P)))
+        try:
+            return _dumps(cb.call("piping_fluid", {"name": name, "T": float(T), "P": float(P)}))
+        except Exception as exc:  # noqa: BLE001
+            return _dumps(_err(f"core engine unavailable: {exc}"))
 
     @mcp.tool()
     def piping_internal_volume(doc: Union[str, dict],
@@ -394,7 +395,13 @@ def register_piping_tools(mcp) -> None:
             return _dumps(_err(f"could not parse doc: {exc}",
                                hint="pass doc as a dict, JSON string, or file path"))
 
-        errs = piping_schema.validate(d) if isinstance(d, dict) else ["doc is not an object"]
+        if not isinstance(d, dict):
+            errs = ["doc is not an object"]
+        else:
+            try:
+                errs = _schema_errors_via_core(d)
+            except Exception as exc:  # noqa: BLE001
+                return _dumps(_err(f"core engine unavailable: {exc}"))
         if errs:
             return _dumps(_err("piping document failed schema validation",
                                hint="fix the listed errors", errors=errs))
@@ -463,28 +470,38 @@ def register_piping_tools(mcp) -> None:
             return _dumps(_err(f"could not parse inputs: {exc}",
                                hint="pass doc as JSON/dict/path and boundary as a JSON list"))
 
-        errs = piping_schema.validate(d) if isinstance(d, dict) else ["doc is not an object"]
-        if errs:
+        if not isinstance(d, dict):
             return _dumps(_err("piping document failed schema validation",
-                               errors=errs))
-        if bc is None:
-            return _dumps(_err("boundary conditions are required",
-                               hint='e.g. [{"node":"n0","pressure":300},{"node":"n1","demand":50}]'))
+                               errors=["doc is not an object"]))
 
-        solve_res = piping_solve_mod.solve(d, boundary=bc, fluid=fl, pumps=pp)
-        if not solve_res.get("ok"):
-            solve_res.setdefault("next_actions", [
-                "check every run endpoint meets another run or a boundary node",
-                "ensure at least one boundary fixes pressure/head",
-            ])
+        try:
+            res = cb.call("piping_solve", {
+                "doc": d, "boundary": bc, "fluid": fl, "pumps": pp})
+        except Exception as exc:  # noqa: BLE001
+            return _dumps(_err(f"core engine unavailable: {exc}"))
+        if not res.get("ok"):
+            if isinstance(res.get("errors"), list):
+                # schema-validation failure — same envelope the Python handler emitted
+                return _dumps(_err(res.get("reason", "piping document failed schema "
+                                                 "validation"),
+                                   errors=res["errors"]))
+            if res.get("reason") == "boundary conditions are required":
+                return _dumps(res)  # the core's jerr shape matches the old _err exactly
             return _dumps({"ok": False, "stage": "1d_solve",
-                           "reason": solve_res.get("reason", "1D solve failed"),
-                           "solve": solve_res})
+                           "reason": res.get("reason", "1D solve failed"),
+                           "solve": res})
 
+        # The old handler embedded the RAW solve (no node_menu) — strip the additive
+        # key the tool-shaped RPC carries so the embedded payload is byte-identical.
+        solve_res = {k: v for k, v in res.items() if k != "node_menu"}
         _PIPING.update({"doc": d, "result": solve_res, "boundary": bc, "fluid": fl, "pumps": pp})
 
         # ── extract CFD BCs from 1D result ────────────────────────────────────
-        bc_cfd = piping_cfd_mod.cfd_boundary_from_solve(solve_res, inlet_run_id=run_id)
+        try:
+            bc_cfd = cb.call("piping_cfd_boundary", {
+                "solve_result": solve_res, "inlet_run_id": run_id})
+        except Exception as exc:  # noqa: BLE001
+            return _dumps(_err(f"core engine unavailable: {exc}"))
         if not bc_cfd.get("ok"):
             return _dumps({"ok": False, "stage": "bc_extraction",
                            "reason": bc_cfd.get("reason"),
@@ -522,8 +539,6 @@ def register_piping_tools(mcp) -> None:
         # We invoke run_cfd_flow through the MCP bridge (core_bridge) if available;
         # otherwise we record the step_path and BCs so the user can invoke CFD manually.
         try:
-            from services.mcp.core_bridge import CoreBridge
-            cb = CoreBridge()
             # Import the bore STEP as a new part
             imp = cb.call("import_file", {"path": step_path, "format": "step"})
             bore_doc_id = imp.get("doc_id") if isinstance(imp, dict) else None
@@ -629,18 +644,14 @@ def register_piping_tools(mcp) -> None:
                                hint="pass solve_result and cfd_result as dicts or JSON strings"))
 
         if sr is None:
-            if _PIPING.get("result") is None:
-                return _dumps(_err("no prior piping_solve result in session",
-                                   hint="call piping_solve or piping_cfd_handoff first"))
-            sr = _PIPING["result"]
+            # Session fallback stays MCP-side; the core reports the same soft-fail
+            # envelope when solve_result is still null.
+            sr = _PIPING.get("result")
 
-        if cr is None:
-            return _dumps(_err("cfd_result is required",
-                               hint="pass the result from run_cfd_flow or piping_cfd_handoff['cfd']"))
-
-        result = piping_cfd_mod.verify_pressure_drop(
-            sr, cr, tolerance_pct=float(tolerance_pct), run_id=run_id
-        )
-        if result.get("ok"):
-            sh.attach(result, _verify_envelope(result))
+        try:
+            result = cb.call("piping_verify_cfd", {
+                "solve_result": sr, "cfd_result": cr,
+                "tolerance_pct": float(tolerance_pct), "run_id": run_id})
+        except Exception as exc:  # noqa: BLE001
+            return _dumps(_err(f"core engine unavailable: {exc}"))
         return _dumps(result)

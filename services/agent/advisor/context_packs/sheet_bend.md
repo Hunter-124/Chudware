@@ -1,5 +1,5 @@
 # Sheet-metal bend context pack
-# Source: engine_oracle/research/calcs/bend_allowance.py
+# Source: services/research/calcs/bend_allowance.py
 #         engine_oracle/dfm/process_profiles.py (sheet_metal profile)
 #         Reference: Machinery's Handbook 29th ed. (Bending Sheet Metal);
 #                    SME Die Design Handbook

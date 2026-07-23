@@ -21,7 +21,7 @@ from mcp_server.cad_tools import _dumps, _err  # type: ignore[attr-defined]
 
 # ── RE-29: research ingest orchestrator ────────────────────────────────────
 try:
-    from engine_oracle.vision.research_ingest import research_and_ingest as _research_and_ingest
+    from services.vision.research_ingest import research_and_ingest as _research_and_ingest
 except ImportError:
     _research_and_ingest = None  # type: ignore[assignment]
 
@@ -54,44 +54,35 @@ def _research_ingest(
 
 # ── RE-06: provisioning probe ───────────────────────────────────────────────
 try:
-    from engine_oracle.vision.reveng_provision import reveng_status as _reveng_status
+    from services.vision.reveng_provision import reveng_status as _reveng_status
 except ImportError:
-    try:
-        from engine.vision.reveng_provision import reveng_status as _reveng_status  # type: ignore
-    except ImportError:
-        def _reveng_status() -> dict:  # type: ignore[misc]
-            return {
-                "ok": True,
-                "capabilities": {k: False for k in
-                                 ("sparse", "dense", "splat", "single_photo", "webcam", "gpu")},
-                "provisioning": {k: False for k in
-                                 ("colmap", "openmvs", "brush", "triposr", "vggt", "docling")},
-                "banners": ["reveng_provision not available"],
-                "missing": ["colmap", "openmvs", "brush", "triposr", "vggt", "docling"],
-            }
+    def _reveng_status() -> dict:  # type: ignore[misc]
+        return {
+            "ok": True,
+            "capabilities": {k: False for k in
+                             ("sparse", "dense", "splat", "single_photo", "webcam", "gpu")},
+            "provisioning": {k: False for k in
+                             ("colmap", "openmvs", "brush", "triposr", "vggt", "docling")},
+            "banners": ["reveng_provision not available"],
+            "missing": ["colmap", "openmvs", "brush", "triposr", "vggt", "docling"],
+        }
 
 # ── RE-04: video frame extractor ────────────────────────────────────────────
 try:
-    from engine_oracle.vision.frames import extract_frames_safe as _extract_frames_safe
+    from services.vision.frames import extract_frames_safe as _extract_frames_safe
 except ImportError:
-    try:
-        from engine.vision.frames import extract_frames_safe as _extract_frames_safe  # type: ignore
-    except ImportError:
-        def _extract_frames_safe(video_path: str, out_dir: str, **kw) -> dict:  # type: ignore[misc]
-            return {
-                "ok": False,
-                "reason": "frames module not available",
-                "hint": "install opencv-python",
-            }
+    def _extract_frames_safe(video_path: str, out_dir: str, **kw) -> dict:  # type: ignore[misc]
+        return {
+            "ok": False,
+            "reason": "frames module not available",
+            "hint": "install opencv-python",
+        }
 
 # ── datasheet ingest (docling) ───────────────────────────────────────────────
 try:
-    from engine_oracle.vision.datasheet_ingest import ingest_datasheet as _ingest_datasheet
+    from services.vision.datasheet_ingest import ingest_datasheet as _ingest_datasheet
 except ImportError:
-    try:
-        from engine.vision.datasheet_ingest import ingest_datasheet as _ingest_datasheet  # type: ignore
-    except ImportError:
-        _ingest_datasheet = None  # type: ignore[assignment]
+    _ingest_datasheet = None  # type: ignore[assignment]
 
 
 def _ingest_pdf(path: str, out_dir: str) -> dict:
@@ -397,7 +388,7 @@ def _make_pipeline_agent_fn(session_id: str, *, strategy: str = "deterministic")
 
     strategy:
         ``deterministic`` (default) — reverse_engineer with fit hints.
-        ``ml`` — lazy-import engine_oracle.vision.cad_recode.build_parametric.
+        ``ml`` — lazy-import services.vision.cad_recode.build_parametric.
     """
     class _Result:
         def __init__(self, ok: bool, reason: str, data: Optional[dict] = None):
@@ -447,7 +438,7 @@ def _make_pipeline_agent_fn(session_id: str, *, strategy: str = "deterministic")
 
             # Primary sparse: COLMAP / pycolmap
             try:
-                from engine_oracle.vision.colmap_pipeline import run_sparse  # noqa: PLC0415
+                from services.vision.colmap_pipeline import run_sparse  # noqa: PLC0415
             except Exception as exc:  # noqa: BLE001
                 run_sparse = None  # type: ignore[assignment]
                 sparse_result = {
@@ -473,7 +464,7 @@ def _make_pipeline_agent_fn(session_id: str, *, strategy: str = "deterministic")
             )
             if weak:
                 try:
-                    from engine_oracle.vision.ffwd_sfm import run_ffwd_sfm  # noqa: PLC0415
+                    from services.vision.ffwd_sfm import run_ffwd_sfm  # noqa: PLC0415
                     ffwd = run_ffwd_sfm(images, session_dir) or {
                         "ok": False, "reason": "run_ffwd_sfm returned empty",
                     }
@@ -515,7 +506,7 @@ def _make_pipeline_agent_fn(session_id: str, *, strategy: str = "deterministic")
 
             if _os.environ.get("OPENMVS_BIN"):
                 try:
-                    from engine_oracle.vision.dense_backends import run_openmvs  # noqa: PLC0415
+                    from services.vision.dense_backends import run_openmvs  # noqa: PLC0415
                     omvs = run_openmvs(sparse_dir, session_dir) or {}
                     if omvs.get("ok") and omvs.get("mesh_path"):
                         mesh_path = omvs["mesh_path"]
@@ -531,7 +522,7 @@ def _make_pipeline_agent_fn(session_id: str, *, strategy: str = "deterministic")
             # Brush when provisioned (BRUSH_BIN) — also yields splat.
             if _os.environ.get("BRUSH_BIN") or caps.get("splat"):
                 try:
-                    from engine_oracle.vision.dense_backends import run_brush  # noqa: PLC0415
+                    from services.vision.dense_backends import run_brush  # noqa: PLC0415
                     brush = run_brush(sparse_dir, session_dir) or {}
                     if brush.get("ok"):
                         dense_ok = True
@@ -571,7 +562,7 @@ def _make_pipeline_agent_fn(session_id: str, *, strategy: str = "deterministic")
             cleaned = mesh_path
             if mesh_path:
                 try:
-                    from engine_oracle.vision.mesh_cleanup import cleanup_mesh  # noqa: PLC0415
+                    from services.vision.mesh_cleanup import cleanup_mesh  # noqa: PLC0415
                     out_clean = str(
                         _Path(session_dir) / "mesh" / "cleaned.ply"
                     )
@@ -636,7 +627,7 @@ def _make_pipeline_agent_fn(session_id: str, *, strategy: str = "deterministic")
                     {"detail": "run reconstruction first; session has no mesh_path"},
                 )
             try:
-                from engine_oracle.vision.segment_fit import segment_fit  # noqa: PLC0415
+                from services.vision.segment_fit import segment_fit  # noqa: PLC0415
             except Exception as exc:  # noqa: BLE001
                 return _Result(
                     False,
@@ -709,7 +700,7 @@ def _make_pipeline_agent_fn(session_id: str, *, strategy: str = "deterministic")
 
             if strat == "ml":
                 try:
-                    from engine_oracle.vision.cad_recode import (  # noqa: PLC0415
+                    from services.vision.cad_recode import (  # noqa: PLC0415
                         build_parametric,
                     )
                 except Exception as exc:  # noqa: BLE001
@@ -814,7 +805,7 @@ def _make_pipeline_agent_fn(session_id: str, *, strategy: str = "deterministic")
         if node_id in ("n_ingest", "n_mpn_fastpath", "n_datasheet_read"):
             # Datasheet pipeline nodes (RE-15 datasheet_ingest).
             try:
-                import engine_oracle.vision.datasheet_ingest  # noqa: F401
+                import services.vision.datasheet_ingest  # noqa: F401
                 return _Result(True, "datasheet stage complete")
             except Exception:  # noqa: BLE001
                 return _Result(False, "backend_not_provisioned: docling absent")

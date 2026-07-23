@@ -32,7 +32,7 @@ GUI extras beyond the MCP twins (additive, worker-seam only):
 
 Ease-of-use law (contract §8.1): no git vocabulary in any string a user could
 see. Registered append-only in ``engine/worker.py``, following the
-deliverables.worker_rpc / parts_hub.worker_rpc / dag.worker_rpc precedent.
+deliverables.worker_rpc / services.parts.worker_rpc / dag.worker_rpc precedent.
 """
 from __future__ import annotations
 
@@ -799,10 +799,312 @@ WORKER_METHODS = {
     "git_gh_auth_login": _git_gh_auth_login,
 }
 
-# Lightweight PLM branching (wave-2) — also registered via parts_hub.worker_rpc;
-# re-exported here so a plm-only import path still exposes them.
-try:
-    from engine_oracle.parts_hub.plm_branch_rpc import PLM_BRANCH_METHODS as _PLM_BRANCH_METHODS
-    WORKER_METHODS.update(_PLM_BRANCH_METHODS)
-except Exception:  # noqa: BLE001 — optional; parts_hub registration is the primary path
-    pass
+
+# ──── CAD project graph (contracts/cad_graph.md v1) ────
+# Folded in from engine_oracle/parts_hub/cad_graph_rpc.py (T-RF19) — a squatter
+# with zero parts coupling; every function is a thin wrapper over services.plm.*.
+
+
+def _cad_graph_get(params: dict, _emit: Callable) -> dict:
+    """``cad_graph_get {project_dir?|doc_id?} -> {ok, nodes, edges, generated_at, …}``.
+
+    Additive optional params (contracts/cad_graph.md addenda):
+      force, include_archive, max_nodes, max_edges, open_docs.
+    Response always includes node_count/edge_count/truncated/filter.
+    """
+    try:
+        from services.plm import cad_graph as cg
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"cad_graph unavailable: {exc}", "hint": ""}
+    try:
+        p = params or {}
+        project_dir = p.get("project_dir") or p.get("path") or None
+        doc_id = p.get("doc_id") or None
+        force = bool(p.get("force", False))
+        include_archive = bool(p.get("include_archive", False))
+        open_docs = p.get("open_docs") if isinstance(p.get("open_docs"), dict) else None
+        max_nodes = p.get("max_nodes", None)
+        max_edges = p.get("max_edges", None)
+        if max_nodes is not None:
+            try:
+                max_nodes = int(max_nodes)
+            except (TypeError, ValueError):
+                max_nodes = None
+        if max_edges is not None:
+            try:
+                max_edges = int(max_edges)
+            except (TypeError, ValueError):
+                max_edges = None
+        # Change-probe pass-through (contracts/cad_graph.md 2026-07 addendum).
+        if_mtimes_max = p.get("if_mtimes_max", None)
+        if if_mtimes_max is not None:
+            try:
+                if_mtimes_max = float(if_mtimes_max)
+            except (TypeError, ValueError):
+                if_mtimes_max = None
+        if_sources_count = p.get("if_sources_count", None)
+        if if_sources_count is not None:
+            try:
+                if_sources_count = int(if_sources_count)
+            except (TypeError, ValueError):
+                if_sources_count = None
+        return cg.get_graph(
+            project_dir, doc_id=doc_id, open_docs=open_docs, force=force,
+            include_archive=include_archive,
+            max_nodes=max_nodes, max_edges=max_edges,
+            if_mtimes_max=if_mtimes_max,
+            if_sources_count=if_sources_count,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"cad_graph_get failed: {exc}", "hint": ""}
+
+
+def _cad_graph_blast(params: dict, _emit: Callable) -> dict:
+    """``cad_graph_blast {node_id, project_dir?} -> {ok, affected, edges}``."""
+    try:
+        from services.plm import cad_graph as cg
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"cad_graph unavailable: {exc}", "hint": ""}
+    try:
+        p = params or {}
+        node_id = str(p.get("node_id") or "").strip()
+        if not node_id:
+            return {"ok": False, "reason": "node_id required",
+                    "hint": "pass the graph node id to blast from",
+                    "affected": [], "edges": []}
+        project_dir = p.get("project_dir") or p.get("path") or None
+        force = bool(p.get("force", False))
+        graph = None
+        if project_dir:
+            graph = cg.build_graph(project_dir, force=force)
+        return cg.blast_radius(node_id, graph, project_dir=project_dir)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"cad_graph_blast failed: {exc}",
+                "hint": "", "affected": [], "edges": []}
+
+
+def _cad_graph_path(params: dict, _emit: Callable) -> dict:
+    """``cad_graph_path {src, dst, project_dir?} -> {ok, path}``."""
+    try:
+        from services.plm import cad_graph as cg
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"cad_graph unavailable: {exc}", "hint": ""}
+    try:
+        p = params or {}
+        src = str(p.get("src") or "").strip()
+        dst = str(p.get("dst") or "").strip()
+        if not src or not dst:
+            return {"ok": False, "reason": "src and dst required",
+                    "hint": "pass graph node ids for both ends", "path": []}
+        project_dir = p.get("project_dir") or p.get("path") or None
+        force = bool(p.get("force", False))
+        graph = None
+        if project_dir:
+            graph = cg.build_graph(project_dir, force=force)
+        return cg.find_path(src, dst, graph, project_dir=project_dir)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"cad_graph_path failed: {exc}",
+                "hint": "", "path": []}
+
+
+def _cad_graph_link_add(params: dict, _emit: Callable) -> dict:
+    """``cad_graph_link_add {project_dir, src, dst, kind, note?, origin?}``."""
+    try:
+        from services.plm import graph_links as gl
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"graph_links unavailable: {exc}", "hint": ""}
+    try:
+        p = params or {}
+        project_dir = p.get("project_dir") or p.get("path") or ""
+        if not project_dir:
+            return {"ok": False, "reason": "project_dir required", "hint": ""}
+        return gl.add_link(
+            project_dir,
+            str(p.get("src") or ""), str(p.get("dst") or ""),
+            str(p.get("kind") or ""),
+            note=str(p.get("note") or ""),
+            origin=str(p.get("origin") or "manual"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"cad_graph_link_add failed: {exc}", "hint": ""}
+
+
+def _cad_graph_link_remove(params: dict, _emit: Callable) -> dict:
+    """``cad_graph_link_remove {project_dir, link_id}``."""
+    try:
+        from services.plm import graph_links as gl
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"graph_links unavailable: {exc}", "hint": ""}
+    try:
+        p = params or {}
+        project_dir = p.get("project_dir") or p.get("path") or ""
+        if not project_dir:
+            return {"ok": False, "reason": "project_dir required", "hint": ""}
+        return gl.remove_link(project_dir, str(p.get("link_id") or ""))
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"cad_graph_link_remove failed: {exc}", "hint": ""}
+
+
+def _cad_graph_link_list(params: dict, _emit: Callable) -> dict:
+    """``cad_graph_link_list {project_dir} -> {ok, links}``."""
+    try:
+        from services.plm import graph_links as gl
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"graph_links unavailable: {exc}", "hint": ""}
+    try:
+        p = params or {}
+        project_dir = p.get("project_dir") or p.get("path") or ""
+        if not project_dir:
+            return {"ok": False, "reason": "project_dir required", "hint": "", "links": []}
+        return {"ok": True, "links": gl.list_links(project_dir)}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"cad_graph_link_list failed: {exc}",
+                "hint": "", "links": []}
+
+
+def _cad_graph_assembly_tree(params: dict, _emit: Callable) -> dict:
+    """``cad_graph_assembly_tree {project_dir, doc_id?, max_depth?} -> {ok, trees}``."""
+    try:
+        from services.plm import cad_graph as cg
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"cad_graph unavailable: {exc}", "hint": ""}
+    try:
+        p = params or {}
+        project_dir = p.get("project_dir") or p.get("path") or None
+        doc_id = p.get("doc_id") or None
+        include_archive = bool(p.get("include_archive", False))
+        max_depth = p.get("max_depth", 12)
+        try:
+            max_depth = max(1, int(max_depth))
+        except (TypeError, ValueError):
+            max_depth = 12
+        return cg.assembly_tree(project_dir, doc_id=doc_id,
+                                include_archive=include_archive,
+                                max_depth=max_depth)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"cad_graph_assembly_tree failed: {exc}",
+                "hint": "", "trees": []}
+
+
+CAD_GRAPH_METHODS: dict[str, Callable[..., Any]] = {
+    "cad_graph_get": _cad_graph_get,
+    "cad_graph_blast": _cad_graph_blast,
+    "cad_graph_path": _cad_graph_path,
+    "cad_graph_link_add": _cad_graph_link_add,
+    "cad_graph_link_remove": _cad_graph_link_remove,
+    "cad_graph_link_list": _cad_graph_link_list,
+    "cad_graph_assembly_tree": _cad_graph_assembly_tree,
+}
+
+
+# ──── Lightweight PLM branching (wave-2) ────
+# Folded in from engine_oracle/parts_hub/plm_branch_rpc.py (T-RF19). This is now
+# the single registration path (the parts_hub copy is deleted).
+
+
+def _path(params: dict | None) -> str:
+    p = params or {}
+    return str(p.get("path") or p.get("project_dir") or "").strip()
+
+
+def _plm_branch_create(params: dict, _emit: Callable) -> dict:
+    """Create a named branch from HEAD (or ``from`` branch/commit)."""
+    try:
+        from services.plm import branches
+        from services.plm.vault import VaultError
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"branches unavailable: {exc}", "hint": ""}
+    path = _path(params)
+    if not path:
+        return {"ok": False, "reason": "invalid_project",
+                "hint": "no project folder given"}
+    name = str((params or {}).get("name") or "").strip()
+    from_ref = (params or {}).get("from") or (params or {}).get("from_ref") or None
+    if from_ref is not None:
+        from_ref = str(from_ref).strip() or None
+    try:
+        return branches.branch_create(path, name, from_ref=from_ref)
+    except VaultError as e:
+        return {"ok": False, "reason": e.reason, "hint": e.hint}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": "internal",
+                "hint": f"{type(exc).__name__}: {exc}"}
+
+
+def _plm_branch_list(params: dict, _emit: Callable) -> dict:
+    """List project branches + the active one."""
+    try:
+        from services.plm import branches
+        from services.plm.vault import VaultError
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"branches unavailable: {exc}", "hint": ""}
+    path = _path(params)
+    if not path:
+        return {"ok": False, "reason": "invalid_project",
+                "hint": "no project folder given"}
+    try:
+        return branches.branch_list(path)
+    except VaultError as e:
+        return {"ok": False, "reason": e.reason, "hint": e.hint}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": "internal",
+                "hint": f"{type(exc).__name__}: {exc}"}
+
+
+def _plm_branch_switch(params: dict, _emit: Callable) -> dict:
+    """Switch the active branch and materialize its working files."""
+    try:
+        from services.plm import branches
+        from services.plm.vault import VaultError
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"branches unavailable: {exc}", "hint": ""}
+    path = _path(params)
+    if not path:
+        return {"ok": False, "reason": "invalid_project",
+                "hint": "no project folder given"}
+    name = str((params or {}).get("name") or "").strip()
+    try:
+        return branches.branch_switch(path, name)
+    except VaultError as e:
+        return {"ok": False, "reason": e.reason, "hint": e.hint}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": "internal",
+                "hint": f"{type(exc).__name__}: {exc}"}
+
+
+def _plm_branch_merge(params: dict, _emit: Callable) -> dict:
+    """Merge *src* into *dst*. Returns structured conflicts (never silent)."""
+    try:
+        from services.plm import branches
+        from services.plm.vault import VaultError
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"branches unavailable: {exc}", "hint": ""}
+    path = _path(params)
+    if not path:
+        return {"ok": False, "reason": "invalid_project",
+                "hint": "no project folder given"}
+    src = str((params or {}).get("src") or "").strip()
+    dst = str((params or {}).get("dst") or "").strip()
+    message = str((params or {}).get("message") or "")
+    if not src or not dst:
+        return {"ok": False, "reason": "invalid_mode",
+                "hint": "both src and dst branch names are required"}
+    try:
+        return branches.branch_merge(path, src, dst, message=message)
+    except VaultError as e:
+        return {"ok": False, "reason": e.reason, "hint": e.hint}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": "internal",
+                "hint": f"{type(exc).__name__}: {exc}"}
+
+
+PLM_BRANCH_METHODS: dict[str, Callable[..., Any]] = {
+    "plm_branch_create": _plm_branch_create,
+    "plm_branch_list": _plm_branch_list,
+    "plm_branch_switch": _plm_branch_switch,
+    "plm_branch_merge": _plm_branch_merge,
+}
+
+
+WORKER_METHODS.update(CAD_GRAPH_METHODS)
+WORKER_METHODS.update(PLM_BRANCH_METHODS)

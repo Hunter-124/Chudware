@@ -21,7 +21,7 @@ gemma3-4b-qat
 
 Storage
 -------
-All GGUFs land in ``engine.paths.MODELS`` (project-level ``models/`` directory).
+All GGUFs land in ``services.paths.MODELS`` (project-level ``models/`` directory).
 
 Usage
 -----
@@ -41,7 +41,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from engine import paths
+from services import paths
 
 __all__ = [
     "provision",

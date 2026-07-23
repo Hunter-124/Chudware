@@ -6,7 +6,8 @@ reference, (3) DEMAND a typed caliper value for any measured-tier critical dim, 
 manufacturing process (FDM default, clarify if ambiguous), (5) build the receptacle to FIT with
 process clearances, and (6) emit a FitReport (+ optional printable fit-test coupon) before export.
 
-The pure brain is engine.intake.intake + engine.dfm.process_profiles. These tools are the thin MCP
+The pure brain is services.intake.intake + the C++ DfM process profiles (core/dfm, reached
+via the libaicad ``dfm_*`` methods through core_bridge). These tools are the thin MCP
 adapter: they drive the flow and PERSIST the artifacts inside the .step+ via doc_set_meta/doc_get_meta
 (the same opaque-doc-key mechanism as `studies`), so an MCP-built part reopens in-app intact. The
 elicitation is naturally multi-turn over MCP: a tool returns the ask, the user answers next turn.
@@ -22,11 +23,23 @@ from mcp.server.fastmcp import FastMCP
 
 from mcp_server import core_bridge as cb
 from mcp_server.cad_tools import _doc, _dumps, _err
-from engine.dfm import process_profiles as pp
-from engine.intake import intake as ik
+from services.intake import intake as ik
+
+
+def _dfm(method: str, params: dict):
+    """One C++ DfM RPC (core/dfm/process_profiles.cpp). Raises ValueError on the oracle's
+    error envelope so the tools' ``except Exception -> _err`` path is unchanged."""
+    r = cb.call(method, params)
+    if not r.get("ok"):
+        raise ValueError(r.get("error") or f"{method} failed")
+    return r.get("result")
+
+
+# The oracle's DEFAULT_PROCESS (engine_oracle/dfm/process_profiles.py) — FDM is the prior.
+_DEFAULT_PROCESS = "fdm"
 
 try:  # Vision is optional at runtime — a Pillow/module import hiccup must not stop server boot.
-    from engine import vision as _vz
+    from services import vision as _vz
 except Exception:  # noqa: BLE001
     _vz = None
 
@@ -118,7 +131,7 @@ def _process_id(doc_id: str) -> str:
     prof = _get(doc_id, _K_PROCESS)
     if isinstance(prof, dict) and prof.get("process"):
         return prof["process"]
-    return pp.DEFAULT_PROCESS
+    return _DEFAULT_PROCESS
 
 
 def _load_ledger(doc_id: str):
@@ -231,7 +244,8 @@ def register_intake_tools(mcp: FastMCP) -> None:
         Bind the resolved choice with set_process().
         """
         try:
-            resolution = pp.resolve_process(request, material=material, quantity=quantity)
+            resolution = _dfm("dfm_resolve_process", {
+                "request": request, "material": material, "quantity": quantity})
             result = dict(resolution)
             clarification = resolution.get("clarification")
             if clarification and resolution.get("ambiguous") and not resolution.get("must_block"):
@@ -280,12 +294,13 @@ def register_intake_tools(mcp: FastMCP) -> None:
         """
         try:
             d = _doc(doc_id)
-            prof = pp.get_profile(process, overrides=printer_overrides)
+            prof = _dfm("dfm_get_profile", {"process": process,
+                                            "overrides": printer_overrides})
             if material:
                 prof.setdefault("material", {})["default"] = material
             _set(d, _K_PROCESS, prof)
             return _dumps({"ok": True, "process": prof,
-                           "process_block": pp.process_block_text(prof)})
+                           "process_block": _dfm("dfm_process_block_text", {"profile": prof})})
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -300,7 +315,7 @@ def register_intake_tools(mcp: FastMCP) -> None:
         try:
             d = _doc(doc_id)
             proc = process or _process_id(d)
-            prof = pp.get_profile(proc)
+            prof = _dfm("dfm_get_profile", {"process": proc})
             params = prof.get("params", {})
             issues = []
             try:

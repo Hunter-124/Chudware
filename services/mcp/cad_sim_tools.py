@@ -450,7 +450,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         vmax_mps, converged, iters, notes}. If `converged` is false, raise the preset / iterations.
         """
         try:
-            from engine.sim.foam_runner import capabilities
+            from services.sim.foam_runner import capabilities
             caps = capabilities()
             if not caps.get("openfoam"):
                 import os as _os
@@ -480,7 +480,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                             text=ev.get("text", ""))
 
             def _solve() -> dict:
-                from engine.sim.openfoam import run_openfoam_tunnel
+                from services.sim.openfoam import run_openfoam_tunnel
                 r = run_openfoam_tunnel(stl, direction=(1.0, 0.0, 0.0),
                                         speed_mps=float(velocity), preset=preset,
                                         aoa_deg=float(aoa), fluid=fluid_dict,

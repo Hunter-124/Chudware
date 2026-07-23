@@ -13,6 +13,9 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <set>
 #include <string>
@@ -580,6 +583,181 @@ TEST_CASE("G4: run_wind_tunnel ref_length_mm equals the part's longest bbox span
         // Octahedron vertices sit exactly at ±25 → bbox is 50mm in all axes.
         CHECK(r.ref_length_mm == doctest::Approx(50.0).epsilon(1e-6));
     }
+}
+
+// ── run_flow_stl (sim_run_flow_stl): the STL-shaped front-end that replaces the retired ────
+// Python sim worker's sim_run_flow. Verifies: (1) binary+ASCII STL load, (2) forces parity
+// with the triangle-soup run_wind_tunnel path on the same geometry (direction +X / AoA 0 is
+// the identity rotation, so the soup — and the cache key — is identical), (3) the worker
+// envelope fields the sim panel consumes, (4) the ref-area / roughness post-processing,
+// (5) the progress_path side-channel, (6) honest error envelopes.
+TEST_CASE("run_flow_stl: STL front-end forces parity + worker envelope") {
+    using aicad::sim::FlowParams;
+    using aicad::sim::run_flow_stl;
+    using aicad::sim::run_wind_tunnel;
+    namespace fs = std::filesystem;
+
+    // 20mm cube, corner at origin, 12 triangles (outward winding irrelevant to the fill).
+    const std::vector<float> cube = {
+        0,0,0,  20,0,0,  20,20,0,  0,20,0,
+        0,0,20, 20,0,20, 20,20,20, 0,20,20,
+    };
+    const std::vector<uint32_t> cube_idx = {
+        0,2,1, 0,3,2,  4,5,6, 4,6,7,  0,1,5, 0,5,4,
+        2,3,7, 2,7,6,  0,4,7, 0,7,3,  1,2,6, 1,6,5,
+    };
+
+    const fs::path tmp = fs::temp_directory_path();
+    const std::string ascii_path = (tmp / "aicad_test_flow_cube_ascii.stl").string();
+    const std::string bin_path   = (tmp / "aicad_test_flow_cube_bin.stl").string();
+
+    // ASCII STL (facet/vertex soup; normals zero — the loader ignores them).
+    {
+        std::ofstream f(ascii_path, std::ios::trunc);
+        REQUIRE(f.good());
+        f << "solid cube\n";
+        for (size_t t = 0; t < cube_idx.size(); t += 3) {
+            f << " facet normal 0 0 0\n  outer loop\n";
+            for (int k = 0; k < 3; ++k) {
+                const uint32_t vi = cube_idx[t + k];
+                f << "   vertex " << cube[3 * vi] << " " << cube[3 * vi + 1] << " "
+                  << cube[3 * vi + 2] << "\n";
+            }
+            f << "  endloop\n endfacet\n";
+        }
+        f << "endsolid cube\n";
+    }
+    // Binary STL (80-byte header + uint32 count + 50-byte records).
+    {
+        std::ofstream f(bin_path, std::ios::binary | std::ios::trunc);
+        REQUIRE(f.good());
+        char header[80] = {};
+        f.write(header, sizeof header);
+        const uint32_t ntri = (uint32_t)(cube_idx.size() / 3);
+        f.write(reinterpret_cast<const char*>(&ntri), 4);
+        for (uint32_t t = 0; t < ntri; ++t) {
+            float rec[12] = {};  // normal(3) + 3 verts(9)
+            for (int k = 0; k < 3; ++k) {
+                const uint32_t vi = cube_idx[3 * t + k];
+                rec[3 + 3 * k + 0] = cube[3 * vi];
+                rec[3 + 3 * k + 1] = cube[3 * vi + 1];
+                rec[3 + 3 * k + 2] = cube[3 * vi + 2];
+            }
+            f.write(reinterpret_cast<const char*>(rec), sizeof rec);
+            const uint16_t attr = 0;
+            f.write(reinterpret_cast<const char*>(&attr), 2);
+        }
+    }
+
+    // Reference: the triangle-soup path on the same geometry, same resolution/steps.
+    FlowParams fp;
+    fp.velocity_ms = 10.0;
+    fp.cells = 32;
+    fp.n_steps = 120;
+    double re_ref = 0.0;
+    const aicad::sim::LbmResult ref = run_wind_tunnel({cube}, {cube_idx}, fp, &re_ref);
+    REQUIRE_MESSAGE(ref.ok, "reference run_wind_tunnel failed: ", ref.error);
+
+    const std::string prog_path = (tmp / "aicad_test_flow_progress.json").string();
+    nlohmann::json params = {
+        {"stl_path", ascii_path},
+        {"direction", {1, 0, 0}},
+        {"speed_mps", 10.0},
+        {"preset", "coarse"},
+        {"cells", 32},
+        {"n_steps", 120},
+        {"aoa_deg", 0.0},
+        {"sideslip_deg", 0.0},
+        {"fluid", {{"name", "air"}, {"density_kgm3", 1.225}, {"kinematic_visc_m2s", 1.5e-5}}},
+        {"job_id", "test_flow_stl"},
+        {"progress_path", prog_path},
+    };
+    const nlohmann::json r = run_flow_stl(params);
+    INFO("run_flow_stl result: ", r.dump());
+    REQUIRE_MESSAGE(r.value("ok", false), "run_flow_stl failed: ", r.value("error", std::string()));
+
+    // Forces parity: direction +X / AoA 0 is the identity rotation → same soup, same cache.
+    CHECK(r.value("drag_n", 0.0) == doctest::Approx(ref.drag_n).epsilon(1e-9));
+    CHECK(r.value("lift_n", 1.0) == doctest::Approx(ref.lift_n).epsilon(1e-9));
+    CHECK(r.value("frontal_area_mm2", 0.0) == doctest::Approx(ref.frontal_area_mm2).epsilon(1e-9));
+    CHECK(r.value("reynolds", 0.0) == doctest::Approx(re_ref).epsilon(1e-9));
+    CHECK(r.value("drag_n", 0.0) > 0.0);
+
+    // Envelope the sim panel consumes.
+    CHECK(r.value("side_n", 1.0) == 0.0);
+    CHECK(r.value("diverged", true) == false);
+    CHECK(r.contains("reynolds_note"));
+    CHECK(r.contains("solver_notes"));
+    CHECK(r.contains("trace"));
+    CHECK(r["scalar_fields"].is_array());
+    CHECK(r.value("overlay_pending", false) == true);
+    CHECK(!r.contains("overlay_aicm"));
+    // cd/cl use q·A_ref with auto-frontal area (mirror of the oracle's coefficients).
+    const double q = 0.5 * 1.225 * 10.0 * 10.0;
+    const double a_m2 = ref.frontal_area_mm2 * 1e-6;
+    CHECK(r.value("cd", 0.0) == doctest::Approx(ref.drag_n / (q * a_m2)).epsilon(1e-9));
+    CHECK(r.value("cl", 0.0) == doctest::Approx(ref.lift_n / (q * a_m2)).epsilon(1e-9));
+    CHECK(r.value("vmax_mps", 0.0) >= 10.0);  // inlet speed is the field minimum
+
+    // Binary STL → identical forces (same soup after load).
+    nlohmann::json pb = params;
+    pb["stl_path"] = bin_path;
+    pb["job_id"] = "test_flow_stl_bin";
+    const nlohmann::json rb = run_flow_stl(pb);
+    REQUIRE_MESSAGE(rb.value("ok", false), "binary STL run failed: ", rb.dump());
+    CHECK(rb.value("drag_n", 0.0) == doctest::Approx(ref.drag_n).epsilon(1e-9));
+
+    // Progress side-channel: the final LBM checkpoint always writes pct=100.
+    {
+        std::ifstream pf(prog_path);
+        REQUIRE_MESSAGE(pf.good(), "progress_path was not written");
+        const nlohmann::json pj = nlohmann::json::parse(pf, nullptr, false);
+        REQUIRE(!pj.is_discarded());
+        CHECK(pj.value("pct", 0) == 100);
+        CHECK(pj.value("stage", std::string()) == "lbm_solve");
+    }
+
+    // ref_area override: coefficients recompute against the USER area, drag unchanged.
+    nlohmann::json pa = params;
+    pa["ref_area_mm2"] = 800.0;  // 2x the 20x20 frontal
+    pa["job_id"] = "test_flow_stl_refarea";
+    const nlohmann::json ra = run_flow_stl(pa);
+    REQUIRE(ra.value("ok", false));
+    CHECK(ra.value("ref_area_mm2", 0.0) == doctest::Approx(800.0));
+    CHECK(ra.value("cd", 0.0) == doctest::Approx(ref.drag_n / (q * 800e-6)).epsilon(1e-9));
+
+    // Roughness: drag grows by the qualitative friction multiplier.
+    nlohmann::json pr = params;
+    pr["roughness_um"] = 100.0;
+    pr["job_id"] = "test_flow_stl_rough";
+    const nlohmann::json rr = run_flow_stl(pr);
+    REQUIRE(rr.value("ok", false));
+    CHECK(rr.value("drag_n", 0.0) > ref.drag_n);
+
+    // A rotated flow direction still solves (alignment rotation is well-formed).
+    nlohmann::json pd = params;
+    pd["direction"] = {0, 1, 0};
+    pd["aoa_deg"] = 5.0;
+    pd["sideslip_deg"] = 3.0;
+    pd["job_id"] = "test_flow_stl_dir";
+    const nlohmann::json rd = run_flow_stl(pd);
+    REQUIRE_MESSAGE(rd.value("ok", false), "rotated-direction run failed: ", rd.dump());
+    CHECK(rd.value("drag_n", 0.0) > 0.0);
+
+    // Honest error envelopes.
+    CHECK(run_flow_stl({{"stl_path", ascii_path}, {"solver", "openfoam"}})
+              .value("code", std::string()) == "unsupported_solver");
+    CHECK(run_flow_stl({{"stl_path", ascii_path}, {"preset", "ludicrous"}})
+              .value("code", std::string()) == "invalid_params");
+    CHECK(run_flow_stl({{"stl_path", (tmp / "no_such_file.stl").string()}})
+              .value("code", std::string()) == "invalid_stl");
+    CHECK(run_flow_stl(nlohmann::json::object()).value("code", std::string()) ==
+          "invalid_params");
+
+    std::error_code ec;
+    fs::remove(ascii_path, ec);
+    fs::remove(bin_path, ec);
+    fs::remove(prog_path, ec);
 }
 
 }  // namespace

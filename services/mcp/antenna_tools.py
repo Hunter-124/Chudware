@@ -15,7 +15,7 @@ import json
 from typing import Any, Optional
 
 from engine_oracle.ecad import antenna as antenna_mod
-from engine_oracle.sim.em import antenna_bridge as bridge
+from services.sim.em import antenna_bridge as bridge
 
 
 def _dumps(payload: dict) -> str:

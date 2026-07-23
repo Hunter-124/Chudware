@@ -267,7 +267,7 @@ def test_skills_rpc_list_nine_builtins():
     for k in ("AICAD_SKILLS_PROJECT_DIR", "AICAD_SKILLS_USER_DIR", "AICAD_SKILLS_BUILTIN_DIR"):
         os.environ.pop(k, None)
     sk.clear_cache()
-    from engine_oracle.parts_hub.skills_rpc import SKILLS_METHODS
+    from services.agent.worker_rpc import SKILLS_METHODS
     out = SKILLS_METHODS["skills_list"]({}, lambda *a, **k: None)
     assert out["ok"] is True
     names = {e["name"] for e in out["skills"]}

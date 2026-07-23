@@ -7,15 +7,21 @@ Registers:
     agentic RAG citations from the user's local code corpus.  Never scrapes copyrighted
     public code viewers — see ``work/questions/T-D4.md`` for the copyright fence ruling.
 
-Logic lives in ``engine_oracle/structural/code_check.py``; this file is thin glue only
-(mirrors the structural_tools.py pattern from T-D3).  All imports are lazy (inside the
-handler) so an absent dep never crashes server startup.
+Logic lives in ``engine_oracle/structural/code_check.py`` (stays Python — its
+agentic_rag/UserCorpusProvider is corpus retrieval, not ported); this file is thin
+glue only.  The deflection analysis it consumes is dispatched to the C++ core via
+``core_bridge`` (``struct_analyze`` RPC) so the module keeps working after the legacy
+structural oracle modules are deleted.  Oracle imports stay lazy (inside the handler)
+so an absent dep never crashes server startup.
 """
 from __future__ import annotations
 
 import json
 
 from mcp.server.fastmcp import FastMCP
+
+from . import core_bridge as cb
+from .core_bridge import CoreError
 
 from mcp_server.cad_tools import _dumps, _err
 
@@ -80,15 +86,15 @@ def register_code_compliance_tools(mcp: FastMCP) -> None:
               Verify with a licensed structural engineer before construction."
         """
         try:
-            from engine.structural.checks import DISCLAIMER
-            from engine.structural.code_check import (
+            from services.structural.code_check import (
+                DISCLAIMER,
                 UserCorpusProvider,
                 agentic_rag,
                 check_deflection,
                 check_fastener_schedule,
                 check_post_span,
             )
-            from engine.structural.jurisdiction_meta import get_jurisdiction
+            from services.structural.jurisdiction_meta import get_jurisdiction
         except ImportError as e:
             return _dumps({
                 "ok": False,
@@ -107,28 +113,29 @@ def register_code_compliance_tools(mcp: FastMCP) -> None:
             except KeyError:
                 meta = {}
 
-            # Deflection check — requires a structure doc + analysis
+            # Deflection check — requires a structure doc + analysis (C++ core RPC)
             if doc_path and doc_path.strip():
                 try:
                     import json as _json
                     with open(doc_path, "r", encoding="utf-8") as fh:
                         structure = _json.load(fh)
 
-                    from engine.structural.analysis import analyze_doc
-                    from engine.structural.elements import StructureDoc
+                    # element_id -> span (mm) map, straight from the raw doc
+                    span_by_id = {
+                        el.get("id"): el.get("length_mm")
+                        for el in structure.get("elements", [])
+                        if isinstance(el, dict)
+                    }
 
-                    doc = StructureDoc.from_dict(structure)
-                    analysis_out = analyze_doc(doc, load_combo)
+                    analysis_out = cb.call(
+                        "struct_analyze", {"doc_path": doc_path, "load_combo": load_combo})
+                    if analysis_out.get("code") and analysis_out.get("message"):
+                        # In-band soft failure from the core (bad schema, solver error).
+                        raise RuntimeError(analysis_out["message"])
 
                     for row in analysis_out.get("results", []):
                         defl = row.get("deflection_mm")
-                        span = None
-                        # Span: use element length from the doc
-                        eid = row.get("element_id", "")
-                        for el in doc.elements:
-                            if el.id == eid:
-                                span = el.length_mm
-                                break
+                        span = span_by_id.get(row.get("element_id", ""))
                         if span is not None and defl is not None:
                             rule_results.append(
                                 check_deflection(span, abs(float(defl))).to_dict()
@@ -144,8 +151,9 @@ def register_code_compliance_tools(mcp: FastMCP) -> None:
                         "detail": f"Document not found: {doc_path}",
                         "disclaimer": DISCLAIMER,
                     })
-                except ImportError:
-                    # PyNite/scipy unavailable — record an advisory row instead of
+                except CoreError as exc:
+                    # C++ engine unavailable (libaicad not staged / stale lib without
+                    # the struct_* dispatch) — record an advisory row instead of
                     # silently returning ok:true with no deflection result.
                     rule_results.append({
                         "rule_id": "deflection_L360",
@@ -156,8 +164,9 @@ def register_code_compliance_tools(mcp: FastMCP) -> None:
                         "unit": "mm",
                         "citation": "IBC 1604.3",
                         "detail": (
-                            "deflection check skipped: PyNite unavailable — install "
-                            "PyNiteFEA to enable structural deflection analysis."
+                            "deflection check skipped: structural solver unavailable "
+                            f"({exc}) — stage libaicad with the struct_* RPCs to enable "
+                            "structural deflection analysis."
                         ),
                         "disclaimer": DISCLAIMER,
                     })

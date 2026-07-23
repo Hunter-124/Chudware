@@ -532,10 +532,10 @@ def _adapt_check_kwargs(
 
 
 # ---------------------------------------------------------------------------
-# Canonical aicad.req/1 status constants (T-H3, engine_oracle/requirements).
+# Canonical aicad.req/1 status constants (T-H3, services/requirements).
 # Imported here so _gap_req_join doesn't carry its own stub copies.
 # ---------------------------------------------------------------------------
-from engine_oracle.requirements.requirements import VALID_STATUSES as _REQ_VALID_STATUSES
+from services.requirements.requirements import VALID_STATUSES as _REQ_VALID_STATUSES
 
 # "waived" is the one aicad.req/1 status that exempts a requirement from scoring.
 # Derived from the canonical set so any schema rename propagates automatically.
@@ -852,7 +852,7 @@ def _gap_dim_coverage(doc_id: str = None, source_doc_id: str = None, **_) -> str
 def _gap_req_join(doc_id: str = None, requirements: list = None, **_) -> str:
     """aicad.req/1 join — does each requirement's STATUS agree with its verifier EVIDENCE?
 
-    Status ladder from aicad.req/1 (T-H3, engine_oracle/requirements):
+    Status ladder from aicad.req/1 (T-H3, services/requirements):
     proposed | user_confirmed | verified | failed | waived (plus legacy aliases pass/ok).
     A "verified"/"pass" claim with an explicitly EMPTY trace.evidence list is
     INCONSISTENT — the exact failure this join exists to catch. "waived" is exempt

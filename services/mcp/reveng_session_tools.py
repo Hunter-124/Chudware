@@ -168,7 +168,7 @@ def register_reveng_session_tools(mcp: FastMCP) -> None:
             })
 
         try:
-            from engine_oracle.vision.deviation import compute_deviation
+            from services.vision.deviation import compute_deviation
             result = compute_deviation(
                 mesh_path,
                 ref_path,
@@ -264,7 +264,7 @@ def register_reveng_session_tools(mcp: FastMCP) -> None:
             seeded: dict = {}
             if part_ref:
                 try:
-                    from engine_oracle.parts_hub import get as _hub_get  # noqa: PLC0415
+                    from services.parts import get as _hub_get  # noqa: PLC0415
                     record = _hub_get(part_ref)
                     if record:
                         meta = record.get("metadata") or {}
@@ -374,7 +374,7 @@ def register_reveng_session_tools(mcp: FastMCP) -> None:
     ) -> str:
         """Extract blur-culled stills from a video orbit and add them to *session_id*.
 
-        Delegates to ``engine_oracle.vision.frames.extract_frames_safe`` (RE-04).
+        Delegates to ``services.vision.frames.extract_frames_safe`` (RE-04).
         Returns ``{ok, run_id, session}`` where ``run_id`` is a synthetic job token;
         the extraction runs synchronously (no DAG dispatch yet — RE-17).
         """
@@ -491,7 +491,7 @@ def register_reveng_session_tools(mcp: FastMCP) -> None:
         """Generate a printable ArUco scale-mat PDF for the RE pipeline.
 
         ``size`` is ``A4`` (default) or ``Letter``.
-        Delegates to ``engine_oracle.vision.scale_mat`` when available;
+        Delegates to ``services.vision.scale_mat`` when available;
         returns ``backend_not_provisioned`` if the module or its deps are absent.
         """
         if size not in ("A4", "Letter"):
@@ -501,10 +501,10 @@ def register_reveng_session_tools(mcp: FastMCP) -> None:
                 "hint": "must be 'A4' or 'Letter'",
             })
         try:
-            from engine_oracle.vision.scale_mat import generate_scale_mat  # type: ignore
+            from services.vision.scale_mat import generate_scale_mat  # type: ignore
         except ImportError:
             try:
-                from engine.vision.scale_mat import generate_scale_mat  # type: ignore
+                from services.vision.scale_mat import generate_scale_mat  # type: ignore
             except ImportError:
                 return _not_provisioned(
                     "scale_mat module not available; install opencv-python and reportlab"

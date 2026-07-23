@@ -32,7 +32,7 @@ import json
 import zipfile
 from dataclasses import dataclass, field
 
-from engine.doc.canonical import canonical_dump
+from services.plm.canonical import canonical_dump
 
 # Container entries we explode to first-class shadow-tree paths.
 _DOCUMENT = "document.json"

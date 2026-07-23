@@ -302,6 +302,14 @@ void drawSessionsPanel(AppState& st, bool busy) {
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
     ImGui::TextWrapped("Running sessions keep working in the background.");
     ImGui::PopStyleColor();
+
+    static bool s_showArchived = false;
+    ImGui::Checkbox("Show archived", &s_showArchived);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(s_showArchived
+            ? "Showing archived sessions only. Uncheck to return to your active list."
+            : "Archived sessions are hidden from this list \xe2\x80\x94 check to review or "
+              "restore them. Archiving keeps the full transcript (unlike Delete).");
     ImGui::Dummy(ImVec2(0, ui::metrics::U(1)));
 
     const ImGuiStyle& style = ImGui::GetStyle();
@@ -314,9 +322,11 @@ void drawSessionsPanel(AppState& st, bool busy) {
     const float subH  = fh * 0.92f;
     const float rowH  = padY * 2.0f + titleH + 2.0f * sc + subH;
     const float trashSz = ImGui::GetFrameHeight();
-
+    bool anyRowShown = false;
     for (int i = 0; i < (int)st.conversations.size(); ++i) {
         Conversation& c = st.conversations[i];
+        if (c.archived != s_showArchived) continue;
+        anyRowShown = true;
         std::string title = c.title.empty() ? ("Chat " + std::to_string(i + 1)) : c.title;
         const std::vector<ChatMsg>& msgs = (i == st.activeConv) ? st.chat : c.msgs;
         bool running = false;
@@ -333,6 +343,10 @@ void drawSessionsPanel(AppState& st, bool busy) {
             std::snprintf(sub, sizeof(sub), "1 message");
         else
             std::snprintf(sub, sizeof(sub), "%d messages", nMsg);
+        const char* archLabel = c.archived ? "Restore" : "Archive";
+        const float archBtnW = ImGui::CalcTextSize(archLabel).x + 16.0f * sc;
+        const float actionGap = 4.0f * sc;
+        const float actionsW = trashSz + archBtnW + actionGap;
 
         ImGui::PushID(i);
         const ImVec2 rowMin = ImGui::GetCursorScreenPos();
@@ -340,7 +354,7 @@ void drawSessionsPanel(AppState& st, bool busy) {
         const ImVec2 rowMax(rowMin.x + rowW, rowMin.y + rowH);
 
         bool picked = ImGui::InvisibleButton("##pickconv",
-                                            ImVec2(std::max(1.0f, rowW - trashSz - padX), rowH));
+                                            ImVec2(std::max(1.0f, rowW - actionsW - padX), rowH));
         bool rowHov = ImGui::IsItemHovered();
         if (picked && !busy) {
             // Always land in chat for the chosen session — including re-clicking
@@ -376,7 +390,7 @@ void drawSessionsPanel(AppState& st, bool busy) {
                                  : c.scopeClass == 2 ? "complex" : "epic";
             const ImVec2 lsz = ImGui::CalcTextSize(scopeLbl);
             // Right-aligned, kept clear of the hover/active trash button zone.
-            const float cx1 = rowMax.x - trashSz - padX;
+            const float cx1 = rowMax.x - actionsW - padX;
             const float cx0 = cx1 - lsz.x - 8.0f * sc;
             const float cy0 = rowMin.y + padY + (titleH - lsz.y) * 0.5f - 1.0f * sc;
             const float cy1 = cy0 + lsz.y + 2.0f * sc;
@@ -415,23 +429,43 @@ void drawSessionsPanel(AppState& st, bool busy) {
                     ImGui::ColorConvertFloat4ToU32(surf.textSecondary), sub);
 
         bool doDel = false;
+        bool doArchiveToggle = false;
         if (rowHov || active) {
             const float img  = trashSz - 8.0f * sc;
             const float btnW = img + style.FramePadding.x * 2.0f;
             const float btnH = img + style.FramePadding.y * 2.0f;
-            ImGui::SetCursorScreenPos(
-                ImVec2(rowMax.x - btnW - 4.0f * sc, rowMin.y + (rowH - btnH) * 0.5f));
+            const float delX = rowMax.x - btnW - 4.0f * sc;
+            ImGui::SetCursorScreenPos(ImVec2(delX, rowMin.y + (rowH - btnH) * 0.5f));
             IconUV trash = ui::getIcon("delete", 20);
             bool del = trash.valid
                 ? ImGui::ImageButton("##delconv", trash.texId, ImVec2(img, img), trash.uv0, trash.uv1)
                 : ImGui::SmallButton("x");
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Delete this session");
             doDel = del && !busy;
+
+            const float archX = delX - archBtnW - actionGap;
+            ImGui::SetCursorScreenPos(ImVec2(archX, rowMin.y + (rowH - btnH) * 0.5f));
+            bool archClick = ImGui::Button(archLabel, ImVec2(archBtnW, btnH));
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(c.archived
+                    ? "Restore to the active sessions list"
+                    : "Archive: hides from the default list but keeps the full transcript "
+                      "(unlike Delete). Toggle \"Show archived\" above to find it again.");
+            doArchiveToggle = archClick && !busy;
         }
 
         ImGui::SetCursorScreenPos(ImVec2(rowMin.x, rowMax.y + rowGap));
         ImGui::PopID();
         if (doDel) { closeConversation(st, i); break; }
+        if (doArchiveToggle) { archiveConversation(st, i, !c.archived); break; }
+    }
+    if (!anyRowShown) {
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+        ImGui::TextWrapped("%s", s_showArchived
+            ? "No archived sessions."
+            : "No active sessions yet. Start one above.");
+        ImGui::PopStyleColor();
+        ImGui::Dummy(ImVec2(0, ui::metrics::U(1)));
     }
 
     // ---- Other sessions: orphaned keys in chat_history.json (not the active doc) ----
@@ -686,96 +720,202 @@ static void drawTaskListPanel(AppState& st, bool busy) {
     }
 }
 
+// ============================ Session Artifacts presentation ============================
+// Presentation-only helpers for the Artifacts tab (no artifact data/model changes). Every
+// size goes through ui::metrics::px so the tab scales with DPI like the rest of the app, and
+// every tone comes from the adaptive glass surface (chatSurf) — no hardcoded colors.
+
+// Group header: one consistent tone, rhythm and optional count for EVERY Artifacts section,
+// closed by a hairline rule so the group below reads as belonging to it.
+static void artiSectionHeader(const ui::AdaptiveSurface& surf, const char* label, int count) {
+    ImGui::Dummy(ImVec2(0, ui::metrics::px(8.0f)));
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+    if (count > 0) ImGui::Text("%s  %d", label, count);
+    else           ImGui::TextUnformatted(label);
+    ImGui::PopStyleColor();
+    const float rowW = ImGui::GetContentRegionAvail().x;
+    const ImVec2 p   = ImGui::GetCursorScreenPos();
+    ImVec4 rule = surf.textTertiary; rule.w *= 0.35f;
+    ImGui::GetWindowDrawList()->AddLine(ImVec2(p.x, p.y + ui::metrics::px(2.0f)),
+                                        ImVec2(p.x + rowW, p.y + ui::metrics::px(2.0f)),
+                                        ImGui::ColorConvertFloat4ToU32(rule),
+                                        ui::metrics::stroke(1.0f));
+    ImGui::Dummy(ImVec2(0, ui::metrics::px(5.0f)));
+}
+
+// Styled empty state: dimmed, indented to the section body, and INFORMATIVE (says what will
+// appear here) instead of a bare "(none)".
+static void artiEmptyState(const ui::AdaptiveSurface& surf, const char* msg) {
+    const float ind = ui::metrics::px(10.0f);
+    ImGui::Indent(ind);
+    ImVec4 c = surf.textTertiary; c.w *= 0.85f;
+    ImGui::PushStyleColor(ImGuiCol_Text, c);
+    ImGui::TextWrapped("%s", msg);
+    ImGui::PopStyleColor();
+    ImGui::Unindent(ind);
+}
+
+// Clip a label to maxW with a real ellipsis, respecting UTF-8 boundaries.
+static std::string artiEllipsize(const std::string& s, float maxW) {
+    static const char* kEll = "\xe2\x80\xa6";
+    if (s.empty() || maxW <= 0.0f) return s;
+    if (ImGui::CalcTextSize(s.c_str()).x <= maxW) return s;
+    const float ew = ImGui::CalcTextSize(kEll).x;
+    std::string out;
+    for (size_t i = 0; i < s.size();) {
+        size_t n = 1;
+        const unsigned char c = (unsigned char)s[i];
+        if (c >= 0xF0) n = 4; else if (c >= 0xE0) n = 3; else if (c >= 0xC0) n = 2;
+        if (i + n > s.size()) n = s.size() - i;
+        std::string cand = out + s.substr(i, n);
+        if (ImGui::CalcTextSize(cand.c_str()).x + ew > maxW) break;
+        out.swap(cand);
+        i += n;
+    }
+    return out.empty() ? std::string(kEll) : out + kEll;
+}
+
+// One artifact row: bullet + single-line ellipsized name (tooltip carries the full text) with
+// the row actions RIGHT-ALIGNED inside the panel. The actions are measured against the
+// available width first; when the column is too narrow for them plus a readable name they
+// collapse into a single "…" menu, so they can never be clipped by the column edge.
+static void artiRow(AppState& st, const std::string& label, const std::string& tooltip,
+                    const std::string& path, const std::function<void()>& onOpen) {
+    const ui::AdaptiveSurface& surf = chatSurf();
+    const float padX = ImGui::GetStyle().FramePadding.x;
+    const float gap  = ui::metrics::px(6.0f);
+    auto btnW = [&](const char* t) { return ImGui::CalcTextSize(t).x + padX * 2.0f; };
+
+    const bool  hasFolder  = !path.empty();
+    const float fullActW   = btnW("Open") + (hasFolder ? gap + btnW("Folder") : 0.0f);
+    const float smallActW  = btnW("\xe2\x80\xa6");
+    const float avail      = ImGui::GetContentRegionAvail().x;
+    const float bulletW    = ui::metrics::px(14.0f);
+    const float minNameW   = ui::metrics::px(90.0f);
+    const bool  collapse   = (avail - bulletW - gap - fullActW) < minNameW;
+    const float actW       = collapse ? smallActW : fullActW;
+    const float nameW      = ImMax(ui::metrics::px(24.0f), avail - bulletW - gap - actW);
+
+    const float startX = ImGui::GetCursorPosX();
+    ImGui::Bullet();
+    ImGui::SameLine(0, 0);
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+    ImGui::TextUnformatted(artiEllipsize(label, nameW).c_str());
+    ImGui::PopStyleColor();
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        if (!tooltip.empty()) ImGui::SetTooltip("%s", tooltip.c_str());
+    }
+    if (ImGui::IsItemClicked() && onOpen) onOpen();
+
+    ImGui::SameLine(0, 0);
+    ImGui::SetCursorPosX(startX + avail - actW);
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+    if (collapse) {
+        if (ImGui::SmallButton("\xe2\x80\xa6")) ImGui::OpenPopup("##arti_acts");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Actions");
+        if (ImGui::BeginPopup("##arti_acts")) {
+            if (ImGui::MenuItem("Open")) { if (onOpen) onOpen(); }
+            if (hasFolder && ImGui::MenuItem("Show in file manager"))
+                chatArtifactReveal(st, path);
+            ImGui::EndPopup();
+        }
+    } else {
+        if (ImGui::SmallButton("Open")) { if (onOpen) onOpen(); }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Open in the viewport");
+        if (hasFolder) {
+            ImGui::SameLine(0, gap);
+            if (ImGui::SmallButton("Folder")) chatArtifactReveal(st, path);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Show in file manager\n%s", path.c_str());
+        }
+    }
+    ImGui::PopStyleColor();
+}
+
 // Session Artifacts panel — subagents, the plan, and session documents for this session.
 static void drawArtifactsPanel(AppState& st, bool busy) {
     (void)busy;
-    const float sc = ui::uiScale;
     const ui::AdaptiveSurface& surf = chatSurf();
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
     ImGui::TextUnformatted("Session Artifacts");
     ImGui::PopStyleColor();
-    ImGui::Dummy(ImVec2(0, 4 * sc));
-    bool any = false;
-    // Subagents (from plan_state subagent rows + agent.spawn activity).
-    ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-    ImGui::TextUnformatted("Subagents");
-    ImGui::PopStyleColor();
+
+    // ---- Subagents (from plan_state subagent rows + agent.spawn activity) ----
+    // Collected first so the section header can carry a count; the data selection is unchanged.
+    std::vector<std::string> subs;
     for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it) {
         if (it->fromUser) continue;
         if (it->planState.present)
             for (const auto& pi : it->planState.items)
-                if (pi.kind == "subagent") {
-                    any = true;
-                    ImGui::BulletText("%s%s", pi.title.c_str(),
-                                      pi.status.empty() ? "" : (" \xc2\xb7 " + pi.status).c_str());
-                }
+                if (pi.kind == "subagent")
+                    subs.push_back(pi.title +
+                                   (pi.status.empty() ? "" : (" \xc2\xb7 " + pi.status)));
         for (const auto& a : it->activity)
-            if (a.stage.rfind("agent:", 0) == 0 || a.title.rfind("Subagent", 0) == 0) {
-                any = true;
-                ImGui::BulletText("%s", a.title.empty() ? a.stage.c_str() : a.title.c_str());
-            }
+            if (a.stage.rfind("agent:", 0) == 0 || a.title.rfind("Subagent", 0) == 0)
+                subs.push_back(a.title.empty() ? a.stage : a.title);
     }
-    if (!any) { ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-                ImGui::TextWrapped("  (none)"); ImGui::PopStyleColor(); }
-    ImGui::Dummy(ImVec2(0, 6 * sc));
-    // Plan.
-    ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-    ImGui::TextUnformatted("Plan");
-    ImGui::PopStyleColor();
+    artiSectionHeader(surf, "Subagents", (int)subs.size());
+    if (subs.empty()) {
+        artiEmptyState(surf, "No subagents yet \xe2\x80\x94 spawned helpers appear here while a run is working.");
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+        for (const auto& s : subs) {
+            ImGui::Bullet();
+            ImGui::SameLine(0, 0);
+            const std::string shown = artiEllipsize(s, ImGui::GetContentRegionAvail().x);
+            ImGui::TextUnformatted(shown.c_str());
+            if (shown.size() != s.size() && ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", s.c_str());
+        }
+        ImGui::PopStyleColor();
+    }
+
+    // ---- Plan ----
+    artiSectionHeader(surf, "Plan", 0);
     const PlanState* ps = nullptr;
     for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
         if (!it->fromUser && it->planState.present) { ps = &it->planState; break; }
     if (ps) {
         int d = 0, t = 0; copilotTaskProgress(st, d, t);
-        ImGui::BulletText("%s (%d/%d)", ps->title.empty() ? "build plan" : ps->title.c_str(), d, t);
+        char line[320];
+        snprintf(line, sizeof(line), "%s (%d/%d)",
+                 ps->title.empty() ? "build plan" : ps->title.c_str(), d, t);
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+        ImGui::Bullet();
+        ImGui::SameLine(0, 0);
+        const std::string shown = artiEllipsize(line, ImGui::GetContentRegionAvail().x);
+        ImGui::TextUnformatted(shown.c_str());
+        ImGui::PopStyleColor();
+        if (shown.size() != strlen(line) && ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", line);
     } else {
-        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-        ImGui::TextWrapped("  (none)"); ImGui::PopStyleColor();
+        artiEmptyState(surf, "No plan yet \xe2\x80\x94 the agent's task list shows up here once a build starts.");
     }
-    ImGui::Dummy(ImVec2(0, 6 * sc));
-    // Documents (open doc tabs) + agent-created files from tool_call artifacts.
-    ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-    ImGui::TextUnformatted("Documents");
-    ImGui::PopStyleColor();
-    bool anyDoc = false;
-    if (!st.docTabs.empty()) {
-        anyDoc = true;
-        for (int ti = 0; ti < (int)st.docTabs.size(); ++ti) {
-            const auto& t = st.docTabs[ti];
-            ImGui::PushID(t.docId.empty() ? ti : (int)(std::hash<std::string>{}(t.docId) & 0x7fffffff));
-            ImGui::Bullet();
-            ImGui::SameLine();
-            ImGui::TextWrapped("%s", t.title.empty()
-                                         ? (t.path.empty() ? t.docId.c_str() : t.path.c_str())
-                                         : t.title.c_str());
-            if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-            if (ImGui::IsItemClicked()) st.switchToTab(ti);
-            // Row actions: (open) fronts the doc in the viewport (switchToTab — the same call
-            // the doc-tab strip uses); (folder) reveals the saved file in the OS file manager —
-            // only when the doc has an on-disk path (never-saved docs don't). Real SmallButtons
-            // so the click can't be swallowed by the wrapped title's item rect.
-            ImGui::SameLine(0, 6.0f * sc);
-            ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
-            if (ImGui::SmallButton("(open)")) st.switchToTab(ti);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Open in the viewport");
-            if (!t.path.empty()) {
-                ImGui::SameLine(0, 4.0f * sc);
-                if (ImGui::SmallButton("(folder)")) chatArtifactReveal(st, t.path);
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("Show in file manager\n%s", t.path.c_str());
-            }
-            ImGui::PopStyleColor();
-            ImGui::PopID();
-        }
+
+    // ---- Documents (open doc tabs) + agent-created files from tool_call artifacts ----
+    // Rows are gathered before drawing so the header can show a count; same sources as before.
+    struct ArtiDocRow {
+        std::string label, tooltip, path;
+        std::function<void()> open;
+    };
+    std::vector<ArtiDocRow> rows;
+    for (int ti = 0; ti < (int)st.docTabs.size(); ++ti) {
+        const auto& t = st.docTabs[ti];
+        ArtiDocRow r;
+        r.label = t.title.empty() ? (t.path.empty() ? t.docId : t.path) : t.title;
+        r.path  = t.path;
+        r.tooltip = r.path.empty() ? r.label : (r.label + "\n" + r.path);
+        r.open  = [&st, ti]() { st.switchToTab(ti); };
+        rows.push_back(std::move(r));
     }
-    // Agent-created files packed into activity detail after "\x1eART\x1e" (live + restored).
     {
         std::set<std::string> seen;
         for (const auto& m : st.chat) {
             if (m.fromUser) continue;
             for (const auto& a : m.activity) {
-                if (a.detail.find("\x1e" "ART\x1e") == std::string::npos) continue;
                 const size_t sep = a.detail.find("\x1e" "ART\x1e");
+                if (sep == std::string::npos) continue;
                 std::string blob = a.detail.substr(sep);
                 size_t nl = blob.find('\n');
                 if (nl != std::string::npos) blob = blob.substr(nl + 1);
@@ -787,30 +927,30 @@ static void drawArtifactsPanel(AppState& st, bool busy) {
                     std::string kindA = tab == std::string::npos ? "file" : line.substr(0, tab);
                     std::string path  = tab == std::string::npos ? line : line.substr(tab + 1);
                     if (path.empty() || !seen.insert(path).second) continue;
-                    anyDoc = true;
                     std::string base = path;
                     size_t slash = base.find_last_of("/\\");
                     if (slash != std::string::npos) base = base.substr(slash + 1);
-                    ImGui::PushID(path.c_str());
-                    ImGui::Bullet();
-                    ImGui::SameLine();
-                    ImGui::TextWrapped("%s  (%s)", base.c_str(), kindA.c_str());
-                    if (ImGui::IsItemHovered()) {
-                        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-                        ImGui::SetTooltip("%s", path.c_str());
-                    }
-                    if (ImGui::IsItemClicked()) chatArtifactOpenSmart(st, path);
-                    ImGui::SameLine(0, 6.0f * sc);
-                    chatArtifactActions(st, path);
-                    ImGui::PopID();
+                    ArtiDocRow r;
+                    r.label   = base + "  (" + kindA + ")";
+                    r.path    = path;
+                    r.tooltip = path;
+                    r.open    = [&st, path]() { chatArtifactOpenSmart(st, path); };
+                    rows.push_back(std::move(r));
                 }
             }
         }
     }
-    if (!anyDoc) {
-        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-        ImGui::TextWrapped("  (none)"); ImGui::PopStyleColor();
+    artiSectionHeader(surf, "Documents", (int)rows.size());
+    if (rows.empty()) {
+        artiEmptyState(surf, "No documents yet \xe2\x80\x94 parts you open and files the agent writes are listed here.");
+    } else {
+        for (size_t i = 0; i < rows.size(); ++i) {
+            ImGui::PushID((int)i);
+            artiRow(st, rows[i].label, rows[i].tooltip, rows[i].path, rows[i].open);
+            ImGui::PopID();
+        }
     }
+    ImGui::Dummy(ImVec2(0, ui::metrics::px(6.0f)));
 }
 
 

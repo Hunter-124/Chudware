@@ -34,7 +34,61 @@ void scopeClassColor(int scopeClass, float out[4]) {
     out[3] = 1.0f;
 }
 
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 namespace ui {
+
+// ---- durable atomic file write (crash safety) ----------------------------------------------
+// tmp + rename alone is NOT crash-safe: on ext4/xfs the rename metadata can hit the journal
+// before the tmp file's DATA does, so a hard crash right after a save could leave a
+// zero-length chat_history.json — every session gone. fsync the tmp file before the rename and
+// fsync the containing directory after it, so the visible file always has complete contents.
+// No-op on Windows/WASM (previous behavior preserved there).
+static void fsyncPath(const std::string& p, bool isDir) {
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
+    const int fd = ::open(p.c_str(), isDir ? (O_RDONLY | O_DIRECTORY) : O_RDONLY);
+    if (fd < 0) return;
+    ::fsync(fd);
+    ::close(fd);
+#else
+    (void)p;
+    (void)isDir;
+#endif
+}
+
+// Write `data` to `path` atomically and durably. Returns false if nothing was written (callers
+// treat that as "still dirty" so the next tick retries instead of silently losing the state).
+bool atomicWriteFileDurable(const std::string& path, const std::string& data) {
+    namespace fs = std::filesystem;
+    const std::string tmp = path + ".tmp";
+    try {
+        {
+            std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+            if (!out) return false;
+            out.write(data.data(), (std::streamsize)data.size());
+            out.flush();
+            if (!out) return false;
+        }
+        fsyncPath(tmp, /*isDir=*/false);
+        std::error_code ec;
+        fs::rename(tmp, path, ec);
+        if (ec) {
+            // Windows sometimes needs remove-then-rename; last-resort non-atomic.
+            fs::remove(path, ec);
+            ec.clear();
+            fs::rename(tmp, path, ec);
+            if (ec) return false;
+        }
+        const fs::path parent = fs::path(path).parent_path();
+        if (!parent.empty()) fsyncPath(parent.string(), /*isDir=*/true);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
 
 static std::string s_chatKeyToErase;
 std::string s_chatKeyHold;
@@ -183,18 +237,7 @@ void savePromptDraft(AppState& st, bool force) {
         if (promptDraftIsEmpty(draft)) root.erase(key);
         else root[key] = draft;
         fs::create_directories(appdataAppDir());
-        const std::string tmp = path + ".tmp";
-        {
-            std::ofstream out(tmp);
-            if (!out) return;
-            out << root.dump(1);
-        }
-        std::error_code ec;
-        fs::rename(tmp, path, ec);
-        if (ec) {
-            fs::remove(path, ec);
-            fs::rename(tmp, path, ec);
-        }
+        atomicWriteFileDurable(path, root.dump(1));
     } catch (...) {
     }
 }
@@ -212,18 +255,7 @@ void clearPromptDraft(AppState& st) {
         }
         if (!root.is_object()) return;
         if (root.erase(promptDraftKey(st)) == 0) return;
-        const std::string tmp = path + ".tmp";
-        {
-            std::ofstream out(tmp);
-            if (!out) return;
-            out << root.dump(1);
-        }
-        std::error_code ec;
-        fs::rename(tmp, path, ec);
-        if (ec) {
-            fs::remove(path, ec);
-            fs::rename(tmp, path, ec);
-        }
+        atomicWriteFileDurable(path, root.dump(1));
         // Reset debounce fingerprint so a subsequent empty composer doesn't rewrite.
     } catch (...) {
     }
@@ -372,8 +404,14 @@ void persistChatHistory(AppState& st) {
                            : ("(design run \xc2\xb7 " + std::to_string(steps) + " steps)");
             }
             // Keep turns that only carry a plan (no text body) so the task list survives reload.
-            if (body.empty() && !m.planState.present) continue;
+            // Also ALWAYS keep a still-running turn even when it has nothing yet: dropping it
+            // left a user prompt with no reply bubble after a mid-run crash, and the restore
+            // path below needs the row to stamp the "interrupted" marker on.
+            if (body.empty() && !m.planState.present && !m.running) continue;
             nlohmann::json entry = {{"u", m.fromUser}, {"t", body}, {"e", m.errKind}};
+            // In-flight marker: this turn was still streaming when the snapshot was taken. On
+            // reload it means the app died (or was killed) mid-run — see applyChatEntry.
+            if (!m.fromUser && m.running) entry["run"] = true;
             if (m.ts > 0.0) entry["ts"] = m.ts;   // send/receive time for the in-bubble age label
             if (!m.fromUser && !m.model.empty()) entry["m"] = m.model;
             if (m.copilotMode >= 0) entry["cm"] = m.copilotMode;
@@ -452,6 +490,7 @@ void persistChatHistory(AppState& st) {
                                  {"title", st.conversations[i].title},
                                  {"msgs", jm}};
         convObj["scope"] = st.conversations[i].scopeClass;  // rail color-code (-1 = unassessed)
+        if (st.conversations[i].archived) convObj["archived"] = true;
         if (i == st.activeConv) {
             // The live agent-execution DAG belongs to the active session's run — save it as a
             // session artifact so the workflow trace survives a reopen.
@@ -476,20 +515,9 @@ void persistChatHistory(AppState& st) {
     }
     try {
         fs::create_directories(appdataAppDir());
-        // Atomic write (tmp + rename) — same pattern as saveSettings/config.json.
-        const std::string tmp = path + ".tmp";
-        {
-            std::ofstream out(tmp);
-            if (!out) return;
-            out << root.dump(1);
-        }
-        std::error_code ec;
-        fs::rename(tmp, path, ec);
-        if (ec) {
-            // Windows sometimes needs remove-then-rename; last-resort non-atomic.
-            fs::remove(path, ec);
-            fs::rename(tmp, path, ec);
-        }
+        // Durable atomic write (tmp + fsync + rename + dir fsync) — a hard crash mid-run must
+        // never be able to leave a truncated/empty history behind.
+        if (!atomicWriteFileDurable(path, root.dump(1))) return;
         appstatePersistSync();  // WASM: flush IDBFS; no-op on desktop
 #ifdef __EMSCRIPTEN__
         // Also push this key to the shared workspace store (async; never block UI thread).
@@ -557,6 +585,13 @@ void maybePersistChatHistoryDebounced(AppState& st, bool force) {
     if (!force && !s_chatHistoryDirty.load(std::memory_order_relaxed)) return;
     const double now = ImGui::GetTime();
     if (!force && (now - s_chatHistoryLastPersist) < 1.0) return;
+    // persistChatHistory no-ops when the session binding isn't ready yet. Clearing the dirty
+    // flag in that case dropped the pending state on the floor until the NEXT event marked it
+    // dirty again — a run whose last event arrived before binding never got saved. Keep the
+    // flag set and retry on the following frame instead.
+    if (st.chatDocKey.empty() || st.activeConv < 0 ||
+        st.activeConv >= (int)st.conversations.size())
+        return;
     s_chatHistoryDirty.store(false, std::memory_order_relaxed);
     s_chatHistoryLastPersist = now;
     persistChatHistory(st);
@@ -591,18 +626,7 @@ void eraseChatHistoryKeys(const std::vector<std::string>& keys) {
     if (!changed) return;
     try {
         fs::create_directories(appdataAppDir());
-        const std::string tmp = path + ".tmp";
-        {
-            std::ofstream out(tmp);
-            if (!out) return;
-            out << root.dump(1);
-        }
-        std::error_code ec;
-        fs::rename(tmp, path, ec);
-        if (ec) {
-            fs::remove(path, ec);
-            fs::rename(tmp, path, ec);
-        }
+        if (!atomicWriteFileDurable(path, root.dump(1))) return;
         appstatePersistSync();
     } catch (...) {
     }
@@ -654,6 +678,7 @@ static void applyChatEntry(AppState& st, const nlohmann::json& e) {
         c.id = jc.value("id", newConvId(st));
         c.title = jc.value("title", std::string("Chat"));
         c.scopeClass = jc.value("scope", -1);  // legacy sessions omit the key
+        c.archived = jc.value("archived", false);
         for (const auto& m : jc.value("msgs", nlohmann::json::array())) {
             ChatMsg cm;
             cm.fromUser = m.value("u", false);
@@ -705,6 +730,17 @@ static void applyChatEntry(AppState& st, const nlohmann::json& e) {
                     artRow.detail = std::string("\x1e" "ART\x1e\n") + blob;
                     cm.activity.push_back(std::move(artRow));
                 }
+            }
+            // Crash recovery: a turn persisted as still-running never got a result — the app
+            // died mid-run. Never resume it as "running" (the worker is gone), but don't let it
+            // masquerade as a completed answer either: flag it partial and say so.
+            if (!cm.fromUser && m.value("run", false)) {
+                cm.resultPartial = true;
+                const char* note = "(Interrupted \xe2\x80\x94 the app closed while this run was "
+                                   "in progress. Nothing after this point was saved.)";
+                if (cm.text.empty()) cm.text = note;
+                else if (cm.text.find("Interrupted \xe2\x80\x94") == std::string::npos)
+                    cm.text += std::string("\n\n") + note;
             }
             cm.running = false;
             c.msgs.push_back(std::move(cm));
@@ -914,18 +950,7 @@ static void wasmApplySharedChatPending(AppState& st) {
 
     try {
         fs::create_directories(appdataAppDir());
-        const std::string tmp = path + ".tmp";
-        {
-            std::ofstream out(tmp);
-            if (!out) return;
-            out << local.dump(1);
-        }
-        std::error_code ec;
-        fs::rename(tmp, path, ec);
-        if (ec) {
-            fs::remove(path, ec);
-            fs::rename(tmp, path, ec);
-        }
+        if (!atomicWriteFileDurable(path, local.dump(1))) return;
         appstatePersistSync();
     } catch (...) {
         return;
@@ -1062,19 +1087,7 @@ void closeConversation(AppState& st, int idx) {
                 std::string key = st.chatDocKey.empty() ? convDocKey(st) : st.chatDocKey;
                 key += "/";
                 key += closedId;
-                if (root.erase(key) > 0) {
-                    const std::string tmp = path + ".tmp";
-                    {
-                        std::ofstream out(tmp);
-                        if (out) out << root.dump(1);
-                    }
-                    std::error_code ec;
-                    fs::rename(tmp, path, ec);
-                    if (ec) {
-                        fs::remove(path, ec);
-                        fs::rename(tmp, path, ec);
-                    }
-                }
+                if (root.erase(key) > 0) atomicWriteFileDurable(path, root.dump(1));
             }
         } catch (...) {
         }
@@ -1093,6 +1106,30 @@ void closeConversation(AppState& st, int idx) {
         restoreActiveConversation(st);
     } else if (idx < st.activeConv) {
         st.activeConv--;
+    }
+    persistChatHistory(st);
+}
+
+// Archive (or unarchive) a session in place: unlike closeConversation, the transcript and
+// all history stay — the session just drops out of the default Sessions list until "Show
+// archived" is toggled on. Archiving the ACTIVE session hops to the nearest non-archived one
+// (preferring later indices, matching closeConversation's "next" bias); if none are left,
+// starts a fresh session so the composer never lands on a hidden conversation.
+void archiveConversation(AppState& st, int idx, bool archived) {
+    if (idx < 0 || idx >= (int)st.conversations.size()) return;
+    if (st.conversations[idx].archived == archived) return;
+    st.conversations[idx].archived = archived;
+    if (archived && idx == st.activeConv) {
+        int target = -1;
+        for (int j = idx + 1; j < (int)st.conversations.size(); ++j)
+            if (!st.conversations[j].archived) { target = j; break; }
+        if (target < 0)
+            for (int j = idx - 1; j >= 0; --j)
+                if (!st.conversations[j].archived) { target = j; break; }
+        if (target < 0)
+            newConversation(st);   // every session archived — land somewhere visible
+        else
+            switchConversation(st, target);
     }
     persistChatHistory(st);
 }

@@ -52,6 +52,20 @@ def _now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def _fsync_dir(d: Path) -> None:
+    """fsync a directory so a rename into it is durable. No-op where unsupported."""
+    try:
+        fd = os.open(str(d), getattr(os, "O_DIRECTORY", os.O_RDONLY))
+    except (OSError, AttributeError):
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 def run_ledger_path(run_id: str) -> Path:
     """Return the path to the ledger.json for *run_id* (creates parent dirs)."""
     d = cache_root() / "runs" / run_id
@@ -303,12 +317,18 @@ class Ledger:
             pass
 
     def _append_event_jsonl(self, event: dict) -> None:
-        """Append one event line — O(1) regardless of ledger size."""
+        """Append one event line — O(1) regardless of ledger size.
+
+        fsync'd: the JSONL log is the source of truth (``_load_from_jsonl`` always
+        rematerializes state from it), so an unsynced append is exactly the work a
+        hard crash loses. A torn last line is tolerated by the reader.
+        """
         try:
             with self._events_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(event, ensure_ascii=False))
                 f.write("\n")
                 f.flush()
+                os.fsync(f.fileno())
         except OSError:
             # Best-effort — a failed save must not break the run
             pass
@@ -318,8 +338,15 @@ class Ledger:
         doc = {"state": self.state}
         tmp = self.path.with_suffix(".tmp")
         try:
-            tmp.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+            # fsync the temp file BEFORE the rename: on ext4/xfs the rename can be
+            # journalled ahead of the data, so a crash right after a save could leave a
+            # zero-length ledger.json behind.
+            with tmp.open("w", encoding="utf-8") as f:
+                f.write(json.dumps(doc, ensure_ascii=False))
+                f.flush()
+                os.fsync(f.fileno())
             tmp.replace(self.path)
+            _fsync_dir(self.path.parent)
         except OSError:
             # Best-effort — a failed save must not break the run
             pass

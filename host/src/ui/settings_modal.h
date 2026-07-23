@@ -22,4 +22,13 @@ namespace ui {
 // actions like "Load built-in prompt").
 void drawSettingsModal(AppState& state, bool busy);
 
+// Settings -> AI -> Harness "Session knobs": the full run-behavior grid (plan/subagent/
+// advisor preferences, role adoption, proactive advisor/company/vision/offline/thoughts/
+// memory/redact flags, refine-pass cap, max subagent nesting, memory budget, Eng. Firm
+// budget). Shared verbatim by the AI-tab command center's Options view (ai_workspace.cpp)
+// so both surfaces read/write the exact same config.json fields — no duplicate widget code.
+// Returns true if any field changed this frame (caller decides whether/when to saveSettings —
+// the modal saves once on close; the Options view saves immediately).
+bool drawHarnessSessionKnobs(AppState& state, float sc);
+
 }  // namespace ui

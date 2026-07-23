@@ -5750,6 +5750,14 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // conversation panel.
     if (ws != WS::AI && !webActive)
       ui::drawAIPanel(st, busy, canRun);
+    // Autosave safety net: the debounced chat_history flush used to live ONLY inside
+    // drawAIPanel / the AI workspace, so it stopped entirely whenever the Copilot column
+    // wasn't drawn (View > hide Copilot, the Web overlay, or an ImGui-clipped window). A long
+    // agent run in any of those states persisted nothing until the user reopened the panel —
+    // a crash lost the whole run. Run it unconditionally here; it no-ops until the session is
+    // bound (st.chatDocKey) and is debounced to ~1 Hz, so double-calling with the panel's own
+    // hook is free.
+    ui::maybePersistChatHistoryDebounced(st, /*force=*/false);
     // W3-H: standalone "Agent Activity" window (View > Activity / the pane's
     // Activity button / the activity shot). No-op unless st.showActivityPanel;
     // was previously unreachable because only the in-pane tab hosted drawBody.

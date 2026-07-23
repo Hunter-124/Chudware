@@ -2842,7 +2842,7 @@ static constexpr int kHarnessModeCount =
 
 // Settings → AI → Harness: mode grid + full quick-settings mirror (session knobs).
 static void drawHarnessOrganizationSection(AppState& st, float sc);
-static void drawHarnessSessionKnobs(AppState& st, float sc);
+bool        drawHarnessSessionKnobs(AppState& st, float sc);
 static void drawMemoryLearningSection(AppState& st, float sc);
 
 // ---- Eng. Firm model assignments (config.json eng_firm.models) ----------------
@@ -3149,8 +3149,9 @@ static void drawHarnessOrganizationSection(AppState& st, float sc) {
 // Settings → AI → Harness: full mirror of copilot Quick settings + extras that
 // only live in the modal (role adoption, company auto-route, Eng. Firm budget,
 // privacy). Laid out in a 2-column grid to save vertical space.
-static void drawHarnessSessionKnobs(AppState& st, float sc) {
+bool drawHarnessSessionKnobs(AppState& st, float sc) {
     Settings& settings = st.settings;
+    bool changed = false;
     static const char* kPrefLabels[] = {"Off", "Option", "Encourage", "Require"};
 
     auto prefCombo = [&](const char* label, const char* id, int* pref, const char* help) {
@@ -3166,6 +3167,7 @@ static void drawHarnessSessionKnobs(AppState& st, float sc) {
             *pref = v;
             if (pref == &settings.planPreference)
                 settings.planMode = (v != 0);
+            changed = true;
         }
     };
 
@@ -3200,8 +3202,10 @@ static void drawHarnessSessionKnobs(AppState& st, float sc) {
             ImGui::SetNextItemWidth(-1.0f);
             int ra = (settings.roleAdoption != 0) ? 1 : 0;
             const char* kAdopt[] = {"Supervised", "Free"};
-            if (ImGui::Combo("##h_role_adopt", &ra, kAdopt, 2))
+            if (ImGui::Combo("##h_role_adopt", &ra, kAdopt, 2)) {
                 settings.roleAdoption = ra;
+                changed = true;
+            }
         }
         ImGui::EndTable();
     }
@@ -3213,24 +3217,24 @@ static void drawHarnessSessionKnobs(AppState& st, float sc) {
                           ImGuiTableFlags_SizingStretchSame |
                           ImGuiTableFlags_NoPadOuterX)) {
         ImGui::TableNextColumn();
-        ImGui::Checkbox("Proactive advisor", &settings.proactiveAdvisor);
+        if (ImGui::Checkbox("Proactive advisor", &settings.proactiveAdvisor)) changed = true;
         helpMarker("Opt-in mid-run guidance on failure streaks and thrash. "
                    "Cheap deterministic notes by default; at most one short "
                    "advisor-model call on severe streaks (encourage/require). "
                    "Off = no proactive injects (pull request_advice still works).");
         ImGui::TableNextColumn();
-        ImGui::Checkbox("Company structure auto-route", &settings.corporateMode);
+        if (ImGui::Checkbox("Company structure auto-route", &settings.corporateMode)) changed = true;
         helpMarker("When on, complex cross-discipline requests may route as "
                    "company (director + departments). Default off — Agent will "
                    "not auto-invoke company; use Swarm / Eng. Firm modes or "
                    "turn this on when ready.");
 
         ImGui::TableNextColumn();
-        ImGui::Checkbox("Vision (send screenshots)", &settings.vision);
+        if (ImGui::Checkbox("Vision (send screenshots)", &settings.vision)) changed = true;
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Attach viewport screenshots so the model can see the part.");
         ImGui::TableNextColumn();
-        ImGui::Checkbox("Offline mode (local only)", &settings.offlineMode);
+        if (ImGui::Checkbox("Offline mode (local only)", &settings.offlineMode)) changed = true;
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip(
                 "Refuses any cloud provider. Only a local loopback endpoint is allowed.");
@@ -3240,7 +3244,7 @@ static void drawHarnessSessionKnobs(AppState& st, float sc) {
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Show the AI's reasoning steps inline in the conversation.");
         ImGui::TableNextColumn();
-        ImGui::Checkbox("Project memory (per-folder)", &settings.memoryEnabled);
+        if (ImGui::Checkbox("Project memory (per-folder)", &settings.memoryEnabled)) changed = true;
         helpMarker("Remembers decisions and notes under the PLM project "
                    "(.plm/memory.db). Auto-created; recall is token-budgeted.");
 
@@ -3276,8 +3280,9 @@ static void drawHarnessSessionKnobs(AppState& st, float sc) {
         ImGui::SameLine();
         helpMarker("0 = automatic (stops once the render matches).");
         ImGui::SetNextItemWidth(-1.0f);
-        ImGui::SliderInt("##h_miters", &settings.maxIters, 0, 64,
-                         settings.maxIters == 0 ? "automatic" : "%d passes");
+        if (ImGui::SliderInt("##h_miters", &settings.maxIters, 0, 64,
+                             settings.maxIters == 0 ? "automatic" : "%d passes"))
+            changed = true;
 
         ImGui::TableNextColumn();
         {
@@ -3303,8 +3308,9 @@ static void drawHarnessSessionKnobs(AppState& st, float sc) {
             ImGui::AlignTextToFramePadding();
             ImGui::TextUnformatted("Memory token budget");
             ImGui::SetNextItemWidth(-1.0f);
-            ImGui::SliderInt("##h_membudget", &settings.memoryTokenBudget, 100, 2000,
-                             "%d tokens");
+            if (ImGui::SliderInt("##h_membudget", &settings.memoryTokenBudget, 100, 2000,
+                                 "%d tokens"))
+                changed = true;
         } else {
             ImGui::Dummy(ImVec2(1, ImGui::GetFrameHeight()));
         }
@@ -3319,9 +3325,11 @@ static void drawHarnessSessionKnobs(AppState& st, float sc) {
         if (ImGui::InputDouble("##h_engfirmbudget", &b, 5.0, 25.0, "$%.2f")) {
             if (b < 0.0) b = 0.0;
             settings.companyBudgetUsd = b;
+            changed = true;
         }
         ImGui::EndTable();
     }
+    return changed;
 }
 
 // ---- agent.* memory/learning knobs (config.json) -----------------------------
@@ -4632,6 +4640,14 @@ const int kSettingsEntryCount =
 
 
 namespace ui {
+
+// settings_modal.h publishes drawHarnessSessionKnobs as ui::drawHarnessSessionKnobs (the AI
+// workspace reuses the same Options-tab run-behavior grid), but the definition above lives in
+// this file's anonymous namespace — which left the exported symbol undefined at link time.
+// Forward to it. (:: is required: unqualified here would resolve to this wrapper.)
+bool drawHarnessSessionKnobs(AppState& st, float sc) {
+    return ::drawHarnessSessionKnobs(st, sc);
+}
 
 void drawSettingsModal(AppState& st, bool busy) {
     Settings& settings = st.settings;

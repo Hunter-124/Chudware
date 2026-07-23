@@ -9,8 +9,9 @@
 //
 // v3 (Hunter's UI directive): the main conversation owns the left; EVERYTHING else lives in
 // the right utility panel, switched by a vertical nav menu (Agent Hub | Session Plan |
-// Active Work | Documents | Sessions | Leaderboard | Options). No permanent sessions rail,
-// no bottom options strip. "Agent Hub" (OMP-style) lists every registered sub-agent as
+// Active Work | Documents | Sessions | Leaderboard | Metrics | Options). No permanent
+// sessions rail, no bottom options strip. "Agent Hub" (OMP-style) lists every registered
+// sub-agent as
 // role-color-coded rows; clicking a row POPS UP a floating, role-themed chat window for that
 // sub-agent (several can be open at once) — the main chat is never replaced. New live
 // sub-agents auto-pop their chat (agent.ui_follow_active_session).
@@ -48,6 +49,8 @@
 #include "ui/ai/plan_board.h"
 #include "ui/ai/docs_panel.h"
 #include "ui/ai/ai_prefs.h"
+#include "ui/settings_modal.h"     // drawHarnessSessionKnobs (shared Options-tab run-behavior grid)
+#include "ui/ai/metrics_view.h"
 
 namespace ui {
 
@@ -71,7 +74,8 @@ struct DagRun {
 struct AiWsState {
     // Which view the right utility panel shows (v3 vertical nav): 0 = Agent Hub (sub-agent
     // rows + live agent-execution DAG), 1 = Session Plan (plan board over persisted buildgraph
-    // runs), 2 = Active Work, 3 = Documents, 4 = Sessions, 5 = Leaderboard, 6 = Options.
+    // runs), 2 = Active Work, 3 = Documents, 4 = Sessions, 5 = Leaderboard, 6 = Metrics,
+    // 7 = Options.
     // The conversation window is always visible on the left, never a tab.
     int  view = 0;     // default to Agent Hub
 
@@ -1832,6 +1836,7 @@ static void drawNavColumn(AppState& st, float navW) {
     if (navRow(3, "Documents",    s_ai.view == 3, surf))       s_ai.view = 3;
     if (navRow(4, "Sessions",     s_ai.view == 4, surf))       s_ai.view = 4;
     if (navRow(5, "Leaderboard",  s_ai.view == 5, surf))       s_ai.view = 5;
+    if (navRow(6, "Metrics",      s_ai.view == 6, surf))       s_ai.view = 6;
 
     // Hairline + the utility section.
     ImGui::Dummy(ImVec2(0, 4.0f * S));
@@ -1842,7 +1847,7 @@ static void drawNavColumn(AppState& st, float navW) {
     }
     ImGui::Dummy(ImVec2(0, 8.0f * S));
 
-    if (navRow(6, "Options",      s_ai.view == 6, surf))       s_ai.view = 6;
+    if (navRow(7, "Options",      s_ai.view == 7, surf))       s_ai.view = 7;
 
     ImGui::EndChild();
 }
@@ -1884,76 +1889,84 @@ static void drawChatCenter(AppState& st, bool busy, bool canRun) {
 }
 
 // ---- Options view (v3): run-behavior + workspace-visibility knobs -------------------
-// The model / reasoning-effort / max-tokens / context-window / API key / privacy / vision-
-// reviewer controls are reachable ONLY on the main Settings page (Settings -> AI). This view
-// keeps the run-behavior knobs (same config.json fields, no parallel store) + the command-
-// center visibility prefs (agent.ui_*), laid out as a proper form — label column left,
-// field right, one row per knob.
+// The model / reasoning-effort / API key / privacy controls are reachable ONLY on the main
+// Settings page (Settings -> AI). This view keeps the run-behavior knobs (same config.json
+// fields, no parallel store, shared verbatim with Settings -> AI -> Harness via
+// drawHarnessSessionKnobs) + a couple of generation knobs + the command-center visibility
+// prefs (agent.ui_*). 2-col stretch-same tables keep every label/control pair aligned
+// regardless of label length (a fixed SameLine(labelW) crowded longer labels against their
+// control) and a left indent keeps content off the panel's glass edge.
 static void drawOptionsView(AppState& st) {
     const float S = ui::uiScale;
     bool changed = false;
+    const ImGuiTableFlags gridFlags =
+        ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_NoPadOuterX;
 
-    const float labelW = 170.0f * S;
-    const float fieldW = 190.0f * S;
-    auto fieldRow = [&](const char* label) {
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextUnformatted(label);
-        ImGui::SameLine(labelW);
-        ImGui::SetNextItemWidth(fieldW);
-    };
+    ImGui::Indent(6.0f * S);
 
     sectionHeader("Workspace");
-    {
-        int v = aiUiVerbosity();
-        static const char* kVerb[] = {"Quiet", "Normal", "Full"};
-        fieldRow("Detail level");
-        if (ImGui::Combo("##ai_ws_verb", &v, kVerb, 3)) setAiUiVerbosity(v);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("How much the Agent Hub / Active Work views show: titles only, "
-                              "last operation, or full tickers + counts.");
-
-        bool follow = aiFollowActiveSession();
-        fieldRow("Follow live runs");
-        if (ImGui::Checkbox("##ai_ws_follow", &follow)) setAiFollowActiveSession(follow);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("New runs yank the panel to the Agent Hub, and new sub-agents "
-                              "pop their chat windows automatically.");
-
-        bool prev = aiActiveWorkPreviews();
-        fieldRow("Active Work previews");
-        if (ImGui::Checkbox("##ai_ws_prev", &prev)) setAiActiveWorkPreviews(prev);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Render iso-preview thumbnails for the docs agents are editing "
-                              "(worker render jobs; cached per saved revision).");
-    }
-    ImGui::Dummy(ImVec2(0, 6.0f * S));
-
-    sectionHeader("Workflow");
-    {
-        int pm = st.settings.planPreference;
-        if (pm < 0 || pm > 3) pm = st.settings.planMode ? 2 : 0;
-        static const char* kPref[] = {"Off", "Option", "Encourage", "Require"};
-        fieldRow("Plan preference");
-        if (ImGui::Combo("##ai_ws_planpref", &pm, kPref, 4)) {
-            st.settings.planPreference = pm;
-            st.settings.planMode = (pm != 0);
-            changed = true;
+    if (ImGui::BeginTable("##ai_ws_workspace", 2, gridFlags)) {
+        ImGui::TableNextColumn();
+        {
+            int v = aiUiVerbosity();
+            static const char* kVerb[] = {"Quiet", "Normal", "Full"};
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted("Detail level");
+            ImGui::SetNextItemWidth(-1.0f);
+            if (ImGui::Combo("##ai_ws_verb", &v, kVerb, 3)) setAiUiVerbosity(v);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("How much the Agent Hub / Active Work views show: titles "
+                                  "only, last operation, or full tickers + counts.");
         }
+        ImGui::TableNextColumn();
+        {
+            bool follow = aiFollowActiveSession();
+            if (ImGui::Checkbox("Follow live runs", &follow)) setAiFollowActiveSession(follow);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("New runs yank the panel to the Agent Hub, and new "
+                                  "sub-agents pop their chat windows automatically.");
+        }
+        ImGui::TableNextColumn();
+        {
+            bool prev = aiActiveWorkPreviews();
+            if (ImGui::Checkbox("Active Work previews", &prev)) setAiActiveWorkPreviews(prev);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Render iso-preview thumbnails for the docs agents are "
+                                  "editing (worker render jobs; cached per saved revision).");
+        }
+        ImGui::TableNextColumn();
+        ImGui::Dummy(ImVec2(1, ImGui::GetFrameHeight()));
+        ImGui::EndTable();
+    }
+    ImGui::Dummy(ImVec2(0, 8.0f * S));
 
+    // Shared with Settings -> AI -> Harness: the exact same widgets/fields, one source of
+    // truth. Covers plan/subagent/advisor preference, role adoption, proactive advisor,
+    // company auto-route, vision, offline mode, show-thoughts, project memory, redaction,
+    // refine-pass cap, max subagent nesting, memory budget, Eng. Firm budget.
+    sectionHeader("Workflow");
+    if (ui::drawHarnessSessionKnobs(st, S)) saveSettings(st.settings);
+    ImGui::Dummy(ImVec2(0, 8.0f * S));
+
+    sectionHeader("Generation");
+    if (ImGui::BeginTable("##ai_ws_gen", 2, gridFlags)) {
         auto intKnob = [&](const char* label, const char* id, int& v, const char* tip) {
-            fieldRow(label);
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted(label);
+            ImGui::SetNextItemWidth(-1.0f);
             if (ImGui::InputInt(id, &v, 0, 0)) { v = std::max(0, v); changed = true; }
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
         };
-        intKnob("Refine passes", "##ai_ws_iters", st.settings.maxIters,
-                "Refine-pass cap per turn. 0 = automatic.");
+        ImGui::TableNextColumn();
         intKnob("Max output tokens", "##ai_ws_maxtok", st.settings.maxTokens,
                 "Max output tokens per model call. 0 = provider default.");
+        ImGui::TableNextColumn();
         intKnob("Context window", "##ai_ws_ctx", st.settings.contextWindow,
                 "Model's total token window. 0 = automatic (cloud large, local 8192).");
+        ImGui::EndTable();
     }
     if (changed) saveSettings(st.settings);
-    ImGui::Dummy(ImVec2(0, 6.0f * S));
+    ImGui::Dummy(ImVec2(0, 8.0f * S));
 
     sectionHeader("More");
     if (ImGui::Button("Open full AI settings\xE2\x80\xA6")) {
@@ -1965,9 +1978,10 @@ static void drawOptionsView(AppState& st) {
         ImVec4(palette.textDisabled[0], palette.textDisabled[1],
                palette.textDisabled[2], 1.0f));
     ImGui::TextWrapped("Workflow knobs persist to config.json (shared with the docked Copilot). "
-                       "Model, reasoning effort, tokens, API key, privacy and the vision reviewer "
-                       "live on the main Settings page (Settings -> AI).");
+                       "Model, reasoning effort, API key and privacy live on the main Settings "
+                       "page (Settings -> AI).");
     ImGui::PopStyleColor();
+    ImGui::Unindent(6.0f * S);
 }
 
 }  // anonymous namespace
@@ -1975,7 +1989,7 @@ static void drawOptionsView(AppState& st) {
 // ---- public entry point ------------------------------------------------------------
 
 // The right-panel content view: one glass pane hosting the nav-selected view (Agent Hub |
-// Session Plan | Active Work | Documents | Sessions | Leaderboard | Options).
+// Session Plan | Active Work | Documents | Sessions | Leaderboard | Metrics | Options).
 static void drawViewPane(AppState& st, bool busy) {
     const float S = ui::uiScale;
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12 * S, 10 * S));
@@ -2037,7 +2051,10 @@ static void drawViewPane(AppState& st, bool busy) {
             }
             break;
         }
-        case 6:  // Options: run-behavior + workspace-visibility knobs.
+        case 6:  // Metrics: token spend / usage aggregation across every session.
+            drawMetricsView(st);
+            break;
+        case 7:  // Options: run-behavior + workspace-visibility knobs.
             drawOptionsView(st);
             break;
         default:

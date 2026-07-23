@@ -2154,12 +2154,26 @@ bool aiTurnActive(AppState& st) {
 // std::thread per click: on Emscripten, thread creation BLOCKS the caller when the
 // pthread pool (PTHREAD_POOL_SIZE=8) is exhausted — during an agent run the pool is
 // busy, so a Stop click that spawned a thread wedged the whole browser page.
+// AppState::log is a plain std::vector with NO internal locking (AppState::addLog does a bare
+// push_back/erase) — it is read every frame by the console/log panel on the GL thread. The
+// control-channel worker thread below used to call st->addLog(...) directly, racing that
+// GL-thread push_back/read on every Stop/steer click and corrupting the vector (observed as a
+// hard crash immediately after Stop). Fix: the worker thread only ever queues message strings
+// (under the SAME mtx that already guards the job deque); agentControlDrainLogs() drains that
+// queue into AppState::addLog() from the GL thread once per composer frame.
 struct AgentControlChannel {
     struct Job { std::string runId; std::string steer; };  // empty steer = cancel
     std::mutex mtx;
     std::condition_variable cv;
     std::deque<Job> q;
+    std::deque<std::string> pendingLogs;   // GL-thread-only drain via agentControlDrainLogs()
     std::atomic<AppState*> st{nullptr};
+
+    void pushLog(const std::string& msg) {
+        std::lock_guard<std::mutex> lk(mtx);
+        pendingLogs.push_back(msg);
+    }
+
     AgentControlChannel() {
         std::thread([this] {
             for (;;) {
@@ -2178,26 +2192,26 @@ struct AgentControlChannel {
                     try {
                         s->worker.callAgentCancel(job.runId, r, e);
                         if (!e.empty())
-                            s->addLog(std::string("[..] agent_cancel: ") + e);
+                            pushLog(std::string("[..] agent_cancel: ") + e);
                         else
-                            s->addLog("[..] agent_cancel ok cancelled=" +
-                                      std::string(r.value("cancelled", false) ? "true" : "false"));
+                            pushLog("[..] agent_cancel ok cancelled=" +
+                                    std::string(r.value("cancelled", false) ? "true" : "false"));
                     } catch (const std::exception& ex) {
-                        s->addLog(std::string("[..] agent_cancel exception: ") + ex.what());
+                        pushLog(std::string("[..] agent_cancel exception: ") + ex.what());
                     } catch (...) {
-                        s->addLog("[..] agent_cancel exception");
+                        pushLog("[..] agent_cancel exception");
                     }
                 } else {
                     s->worker.callAgentSteer(job.runId, job.steer, r, e);
                     if (!e.empty()) {
-                        s->addLog(std::string("[..] agent_steer: ") + e);
+                        pushLog(std::string("[..] agent_steer: ") + e);
                     } else if (!r.value("steered", false)) {
                         // Run finished between submit and delivery — tell the user their
                         // text was NOT consumed rather than silently dropping it.
-                        s->addLog("[..] agent_steer: run already finished "
-                                  "(steering not delivered — send again to continue)");
+                        pushLog("[..] agent_steer: run already finished "
+                                "(steering not delivered — send again to continue)");
                     } else {
-                        s->addLog("[..] agent_steer ok (delivered at next step)");
+                        pushLog("[..] agent_steer ok (delivered at next step)");
                     }
                 }
             }
@@ -2205,6 +2219,23 @@ struct AgentControlChannel {
     }
 };
 static AgentControlChannel g_agentCtl;
+
+// GL-thread drain of the control channel's queued log lines — the only safe place to touch
+// AppState::log from this subsystem. Cheap no-op when nothing queued; call once per composer
+// frame (covers both the docked Copilot and the AI-tab workspace host, since both draw the
+// composer every visible frame).
+static void agentControlDrainLogs(AppState& st) {
+    for (;;) {
+        std::string msg;
+        {
+            std::lock_guard<std::mutex> lk(g_agentCtl.mtx);
+            if (g_agentCtl.pendingLogs.empty()) return;
+            msg = std::move(g_agentCtl.pendingLogs.front());
+            g_agentCtl.pendingLogs.pop_front();
+        }
+        st.addLog(msg);
+    }
+}
 
 static void agentControlDispatch(AppState& st, const std::string& runId, const std::string& steer) {
     g_agentCtl.st.store(&st, std::memory_order_release);
@@ -2362,6 +2393,10 @@ static void drawComposerSendStop(AppState& st, const ImVec2& inMin, const ImVec2
 // ---- the composer: a rounded input box (in-box send) + inline toolbar (model, thinking, +) ----
 // Submits on Enter or the in-box send button. Returns nothing; runs the turn directly.
 void drawComposer(AppState& st, bool busy, bool canRun) {
+    // GL-thread-only drain of Stop/steer log lines queued by the control-channel worker
+    // thread (see AgentControlChannel above) — must run every visible frame, not just on
+    // Stop, so nothing queued right before a frame boundary is lost.
+    agentControlDrainLogs(st);
     // Forging busy affordance lives in drawComposerPrelude (inline between mode
     // dropdown and context meter) — no reserved row above the input.
 

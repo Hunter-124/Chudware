@@ -653,6 +653,9 @@ struct Conversation {
     // the model emits (the model also (re)names the session then). Drives the rail color-code.
     // -1 = unassessed, 0 = trivial, 1 = standard, 2 = complex, 3 = epic. See scopeClassColor().
     int scopeClass = -1;
+    // Archived sessions are hidden from the default Sessions list (Show archived toggle
+    // reveals them) but keep their transcript/history — a soft "trash" before real deletion.
+    bool archived = false;
 };
 
 // Rail/tab color-code for a Conversation::scopeClass (RGBA 0..1). Unassessed (-1) returns a

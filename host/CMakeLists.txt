@@ -235,6 +235,7 @@ set(CHUDWARE_CORE_SOURCES
   src/ui/ai/ai_workspace.cpp
   src/ui/ai/active_work.cpp     # Active Work: live grid of agent-modified docs + op tickers
   src/ui/ai/ai_prefs.cpp        # AI workspace UI prefs (verbosity / follow / previews)
+  src/ui/ai/metrics_view.cpp    # AI workspace Metrics view (token spend / usage aggregation)
   src/ui/ai/plan_board.cpp      # Interactive Session Plan board + ai_vc timeline/rollback
   src/ui/ai/docs_panel.cpp      # AI-tab document attach / preview / edit panel
   src/ui/reveng/reveng_workspace.cpp  # RE-03 Reverse Engineering workspace shell

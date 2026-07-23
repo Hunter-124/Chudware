@@ -258,6 +258,7 @@ bool        activeConversationRunning(AppState& st);
 void        newConversation(AppState& st);
 void        switchConversation(AppState& st, int idx);
 void        closeConversation(AppState& st, int idx);
+void        archiveConversation(AppState& st, int idx, bool archived);
 
 // ---- AI settings (settings) ----
 // Compact AI-settings popover body (provider + model + effort + run toggles + "All settings...");

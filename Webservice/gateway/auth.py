@@ -1,8 +1,11 @@
-"""Authentication middleware: CF Access JWT (prod) or X-Dev-User (dev)."""
+"""Authentication middleware: CF Access JWT (prod), oauth2-proxy shared-secret
+(Entra multi-tenant SSO front door), or X-Dev-User (dev)."""
 
 from __future__ import annotations
 
+import base64
 import logging
+import secrets
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -380,6 +383,28 @@ class AuthMiddleware:
             if user is None:
                 raise AuthError("not on the list", status=403, email=email)
             return user, (email if from_query else None)
+
+        # Multi-tenant Microsoft Entra front door (sso.chudware.com): oauth2-proxy
+        # verifies the OIDC login itself, then reverse-proxies here over loopback with
+        # HTTP Basic Auth (username=email, password=shared secret) — a real secret
+        # comparison, not a bare trusted header, so a stray local process can't forge
+        # identity by just setting X-Forwarded-Email. Independent of the CF Access path.
+        if self.cfg.sso_shared_secret and "cf-access-jwt-assertion" not in headers and "CF_Authorization" not in cookies:
+            basic = headers.get("authorization", "")
+            if basic[:6].lower() == "basic ":
+                try:
+                    decoded = base64.b64decode(basic[6:].strip()).decode("utf-8", "replace")
+                except Exception:
+                    decoded = ""
+                sso_email, sep, sso_secret = decoded.partition(":")
+                if sep and secrets.compare_digest(sso_secret, self.cfg.sso_shared_secret):
+                    email = sso_email.strip().lower()
+                    if not email or "@" not in email:
+                        raise AuthError("sso token missing email", status=401)
+                    user = self.directory.get(email) or _domain_auto_user(email, self.directory)
+                    if user is None:
+                        raise AuthError("not on the list", status=403, email=email)
+                    return user, None
 
         token = headers.get("cf-access-jwt-assertion")
         if not token:

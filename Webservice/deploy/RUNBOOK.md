@@ -85,12 +85,48 @@ Phase-1 login is:
 
 OTP proves control of the **email mailbox**. It is **not** Microsoft Entra / “sign in with school Microsoft account.”
 
-### Phase-2 Entra paths (from T-WEB1 Q2)
+### Entra SSO (implemented — 2b: self-hosted oauth2-proxy, path 2a still needs UA IT)
 
-| Path | When | What |
-|------|------|------|
-| **2a** | UA IT will register an enterprise app | CF Access **Entra IdP**, single-tenant UA Directory ID + client secret + admin consent; policy `@ua.edu`. |
-| **2b** | Need multi-tenant Entra without CF Entra connector | Self-hosted **oauth2-proxy** `entra-id` with `oidc_issuer_url = https://login.microsoftonline.com/common/v2.0` (+ optional tunnel for exposure only). UA tenant may still show **admin approval required**. |
+Path **2a** (Cloudflare Access's own Entra IdP) needs an app registered *inside*
+the ua.edu Entra tenant with admin consent — not something a student can self-serve.
+Path **2b** is what's actually live: a second, independent front door at
+`https://sso.chudware.com`, parallel to the Cloudflare Access app on `chudware.com`
+(OTP + Google unaffected). Full rationale in `research/auth.md`.
+
+```
+browser -> Cloudflare Tunnel -> sso.chudware.com -> oauth2-proxy (127.0.0.1:8301,
+  entra-id provider, oidc_issuer_url=.../common/v2.0, multi-tenant) -> verified login
+  -> reverse-proxy to gateway (127.0.0.1:8300) with HTTP Basic Auth
+  (username=email, password=shared secret) -> gateway/auth.py SSO branch
+```
+
+Already provisioned: DNS CNAME + tunnel ingress for `sso.chudware.com`, the
+`chudware-sso.service` unit (installed, **not started**), `oauth2-proxy` binary at
+`~/.local/bin/oauth2-proxy`, config skeleton at `~/chudware-web-data/oauth2-proxy.cfg`
+(template: `Webservice/deploy/oauth2-proxy.cfg.example`), and
+`CHUDWARE_WEB_SSO_SHARED_SECRET` in `gateway.env` matching the config's
+`basic_auth_password`.
+
+**Hunter's one remaining manual step** — register the Azure app (needs your Microsoft
+account, not scriptable):
+
+1. [portal.azure.com](https://portal.azure.com) → Microsoft Entra ID → App registrations → New registration.
+2. Supported account types: **Accounts in any organizational directory (Any Microsoft Entra ID tenant - Multitenant)**.
+3. Redirect URI (Web): `https://sso.chudware.com/oauth2/callback`.
+4. Certificates & secrets → New client secret → copy the **Value** immediately (shown once).
+5. API permissions → Microsoft Graph → Delegated → `openid`, `profile`, `email`, `offline_access`, `User.Read`. **Do not add** `Directory.Read.All`/`GroupMember.Read.All` — those force per-tenant admin consent and will wall out UA students whose IT hasn't approved this app.
+6. Copy the **Application (client) ID** + client secret **Value** into `~/chudware-web-data/oauth2-proxy.cfg` (`client_id` / `client_secret`), then:
+   ```bash
+   systemctl --user enable --now chudware-sso.service
+   journalctl --user -u chudware-sso.service -n 40 --no-pager   # confirm clean start
+   ```
+
+**Known limitation (not guaranteed to clear on its own):** UA's tenant may still show
+**"Need admin approval"** on first `@ua.edu` login if UA locks down user consent for
+third-party multi-tenant apps — common at universities. If that happens, the only
+fixes are a formal request to UA IT/security to approve this specific app, or falling
+back to path 2a. Test with one real `@ua.edu`/`@crimson.ua.edu` account after
+activation to find out which situation UA is in.
 
 ---
 

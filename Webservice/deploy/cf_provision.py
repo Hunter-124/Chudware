@@ -80,6 +80,12 @@ ACCESS_DOMAINS = ["ua.edu", "crimson.ua.edu"]
 # public domains go HERE (added to the app's self_hosted_domains), never as a new app.
 EXTRA_HOSTS = ["www.chudware.com"]
 
+# Multi-tenant Microsoft Entra (UA school accounts) front door: NOT behind the
+# chudware-web Access app (oauth2-proxy does its own auth), so it's wired
+# straight into tunnel ingress + DNS below rather than EXTRA_HOSTS/self_hosted_domains.
+SSO_HOSTNAME = "sso.chudware.com"
+SSO_SERVICE = "http://127.0.0.1:8301"
+
 
 def _include_list(emails: list[str]) -> list[dict]:
     """Access policy include = explicit allowlisted emails + whole-domain rules."""
@@ -195,8 +201,9 @@ def main() -> None:
     api("PUT", f"/accounts/{ACCOUNT_ID}/cfd_tunnel/{tid}/configurations", {
         "config": {"ingress":
             [{"hostname": h, "service": GATEWAY_SERVICE} for h in [host] + EXTRA_HOSTS]
+            + [{"hostname": SSO_HOSTNAME, "service": SSO_SERVICE}]
             + [{"service": "http_status:404"}]}})
-    print(f"ingress: {[host] + EXTRA_HOSTS} -> {GATEWAY_SERVICE}")
+    print(f"ingress: {[host] + EXTRA_HOSTS} -> {GATEWAY_SERVICE}; {SSO_HOSTNAME} -> {SSO_SERVICE}")
 
     # 3. DNS CNAME (proxied)
     zone = find(api("GET", "/zones"), "name", zone_name)
@@ -210,6 +217,14 @@ def main() -> None:
     else:
         api("POST", f"/zones/{zone['id']}/dns_records", rec_body)
     print(f"dns: {host} CNAME {tid}.cfargotunnel.com (proxied)")
+    sso_recs = api("GET", f"/zones/{zone['id']}/dns_records?name={SSO_HOSTNAME}")
+    sso_body = {"type": "CNAME", "name": SSO_HOSTNAME,
+                "content": f"{tid}.cfargotunnel.com", "proxied": True}
+    if sso_recs:
+        api("PUT", f"/zones/{zone['id']}/dns_records/{sso_recs[0]['id']}", sso_body)
+    else:
+        api("POST", f"/zones/{zone['id']}/dns_records", sso_body)
+    print(f"dns: {SSO_HOSTNAME} CNAME {tid}.cfargotunnel.com (proxied)")
     # Extra hosts live in their own zones — resolve each and upsert a proxied CNAME.
     for eh in EXTRA_HOSTS:
         ez = find(api("GET", "/zones"), "name", ".".join(eh.split(".")[-2:]))

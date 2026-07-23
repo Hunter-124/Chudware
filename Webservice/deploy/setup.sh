@@ -65,9 +65,28 @@ echo "==> installing gateway requirements"
 "${VENV}/bin/pip" install -r "${GATEWAY_DIR}/requirements.txt" -q
 echo "    venv ok: ${VENV}"
 
+# --- oauth2-proxy binary (Microsoft Entra multi-tenant SSO front door) -------
+OAUTH2_PROXY_VERSION="7.15.3"
+OAUTH2_PROXY_BIN="${HOME}/.local/bin/oauth2-proxy"
+if [[ ! -x "${OAUTH2_PROXY_BIN}" ]]; then
+  echo "==> installing oauth2-proxy v${OAUTH2_PROXY_VERSION}"
+  mkdir -p "${HOME}/.local/bin"
+  tmp="$(mktemp -d)"
+  curl -fsSL -o "${tmp}/oauth2-proxy.tar.gz" \
+    "https://github.com/oauth2-proxy/oauth2-proxy/releases/download/v${OAUTH2_PROXY_VERSION}/oauth2-proxy-v${OAUTH2_PROXY_VERSION}.linux-amd64.tar.gz"
+  tar -xzf "${tmp}/oauth2-proxy.tar.gz" -C "${tmp}"
+  install -m 755 "${tmp}/oauth2-proxy-v${OAUTH2_PROXY_VERSION}.linux-amd64/oauth2-proxy" "${OAUTH2_PROXY_BIN}"
+  rm -rf "${tmp}"
+  echo "    installed ${OAUTH2_PROXY_BIN}"
+else
+  echo "    oauth2-proxy present: ${OAUTH2_PROXY_BIN}"
+fi
+# Config (client id/secret/shared secret) is hand-provisioned, not written here —
+# see Webservice/deploy/oauth2-proxy.cfg.example + RUNBOOK.md §Entra SSO.
+
 # --- systemd user units ------------------------------------------------------
 mkdir -p "${UNIT_DIR}"
-for u in chudware-gateway.service chudware-cloudflared.service chudware-monitor.service chudware-monitor.timer chudware-backup.service chudware-backup.timer chudware-webd-sync.path chudware-webd-sync.service; do
+for u in chudware-gateway.service chudware-cloudflared.service chudware-monitor.service chudware-monitor.timer chudware-backup.service chudware-backup.timer chudware-webd-sync.path chudware-webd-sync.service chudware-sso.service; do
   src="${DEPLOY_DIR}/${u}"
   dst="${UNIT_DIR}/${u}"
   if [[ -f "${src}" ]]; then
@@ -128,6 +147,9 @@ cat <<EOF
   [ ] Confirm cf_provision.py wrote TUNNEL_TOKEN + CHUDWARE_CF_AUD into ${ENV_FILE}
   [ ] Edit Webservice/gateway/users.yaml (emails + heavy seats)
   [ ] Optional: Google IdP in CF Zero Trust (GCP OAuth client) — RUNBOOK.md
+  [ ] Optional: Microsoft Entra SSO for UA accounts — fill client_id/client_secret in
+      ${DATA_ROOT}/oauth2-proxy.cfg (see RUNBOOK.md §Entra SSO), then
+      systemctl --user enable --now chudware-sso.service
   [ ] Edit Access allowlist emails (dashboard or API)
   [ ] Pre-pull/build session image; optional warm seat
   [ ] systemctl --user start chudware-gateway chudware-cloudflared chudware-monitor.timer

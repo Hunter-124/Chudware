@@ -124,6 +124,13 @@ class Settings:
         )
     )
     cf_aud: str = field(default_factory=lambda: _env("CHUDWARE_WEB_CF_AUD", "") or "")
+    # Multi-tenant Microsoft Entra (UA school accounts) front door: oauth2-proxy on
+    # sso.chudware.com verifies the OIDC login itself, then reverse-proxies here over
+    # loopback with this value as its HTTP Basic Auth password (see auth.py). Equivalent
+    # defense-in-depth to the CF Access JWT signature check — empty disables the path.
+    sso_shared_secret: str = field(
+        default_factory=lambda: _env("CHUDWARE_WEB_SSO_SHARED_SECRET", "") or ""
+    )
     dev_mode: bool = field(default_factory=lambda: _env_bool("CHUDWARE_WEB_DEV", False))
     users_file: Path = field(default_factory=Path)
     healthcheck_timeout_sec: float = field(

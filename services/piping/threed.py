@@ -22,8 +22,8 @@ import os
 import uuid
 from dataclasses import dataclass, field
 
-from engine.piping import catalog
-from engine.piping.schema import SCHEMA_PIPING
+from services.piping import catalog
+from services.piping.schema import SCHEMA_PIPING
 
 _ARC_LEG = 1.0  # mm straight tangent stub kept either side of a fillet arc (sweep stability)
 

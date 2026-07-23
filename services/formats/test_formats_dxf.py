@@ -1,4 +1,4 @@
-"""Round-trip tests for the DXF importer (engine.doc.formats_dxf via import_path).
+"""Round-trip tests for the DXF importer (services.formats.formats_dxf via import_path).
 
 DXF is import-only, so "round-trip" here means: author a known DXF with ezdxf, import it through
 the public ``import_path`` surface, and assert the geometry (face areas, wire counts) matches.
@@ -10,7 +10,7 @@ import pytest
 
 ezdxf = pytest.importorskip("ezdxf")
 
-from engine.doc.formats import import_path, list_formats  # noqa: E402
+from services.formats.formats import import_path, list_formats  # noqa: E402
 
 
 def _write(tmp_path, build) -> str:

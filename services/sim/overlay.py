@@ -159,7 +159,7 @@ def _tessellate_stl_world(stl_path: str, color=(0.78, 0.80, 0.82)):
     """
     import trimesh
     from services.sim import tessellate as tess
-    from engine.doc.mesh_body import MeshBody
+    from services.formats.mesh_body import MeshBody
 
     mesh = trimesh.load(stl_path, force="mesh")
     verts = np.asarray(mesh.vertices, dtype=np.float32).reshape(-1, 3)

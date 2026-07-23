@@ -629,8 +629,9 @@ def _warm_core() -> None:
     """Load libaicad.dll up front (in the background) so the FIRST tool call doesn't eat the
     cold load (DLL + OCCT/gmsh deps can take many seconds) inside the client's call timeout."""
     # Arm ECAD autosave + recover any ECAD docs from a previous (possibly killed) session FIRST.
-    # ECAD is pure Python with no DLL dependency, so this never blocks on the C++ load and an ECAD
-    # recovery succeeds even if libaicad.dll is unavailable. ECAD docs live only in memory, so a
+    # ECAD sessions live in the C++ core now (T-RF20), but recovery reads plain-JSON autosave files
+    # and re-mints sessions via ecad_open, so it never blocks on the full DLL warm and an ECAD
+    # recovery succeeds even if the heavy OCCT deps are slow. ECAD docs live only in memory, so a
     # transport-timeout kill of a heavy ecad_* tool would otherwise lose every open schematic/board.
     try:
         from mcp_server.ecad_common import enable_ecad_autosave, recover_ecad_autosaved
@@ -643,15 +644,11 @@ def _warm_core() -> None:
     # window. This matters more than usual here: a cold-import overrun trips -32001, which KILLS the
     # server, so the import never gets cached — every retry re-pays it and times out again (a vicious
     # loop). Importing them once in the background breaks that. Best-effort; never blocks the DLL warm.
-    try:
-        # scipy-backed SPICE simulator (ecad_simulate) — ~0.4 s cold.
-        from engine.sim.spice import netlist_to_spice_circuit  # noqa: F401
-        from engine.sim.circuit import simulate as _sim_warm  # noqa: F401
-    except Exception:
-        pass
+    # T-RF20: the SPICE simulator is C++ now (sim_netlist_to_circuit / sim_spice RPCs) — no
+    # Python warm needed here; the core_bridge warm below covers the DLL + dispatch.
     try:
         # OCP/build123d 3D kernel (ecad_to_3d) — can be many seconds cold.
-        from engine.ecad.threed import board_to_step  # noqa: F401
+        from engine.ecad.threed import board_to_step  # noqa: F401  # STAYS (T-RF20): no C++ counterpart
     except Exception:
         pass
     try:

@@ -1002,7 +1002,7 @@ def _board_power_lines(engs: list, label: str) -> list:
     counted, never zero-filled (contracts/ecad/boardphys.md).
     """
     try:
-        from engine.ecad import metadata as eng_meta  # noqa: PLC0415
+        from engine.ecad import metadata as eng_meta  # STAYS (T-RF20): no C++ counterpart  # noqa: PLC0415
     except ImportError:
         return []
     totals = eng_meta.power_totals([e for _n, e in engs if e])
@@ -1045,17 +1045,8 @@ def _describe_board_text(doc_id: str) -> str:
     2. engine.ecad.netlist.build_netlist → components, nets
     3. engine.ecad.erc.run_erc → ERC/DRC violation summary
     """
-    try:
-        from engine.ecad import session as ecad_session  # noqa: PLC0415
-    except ImportError:
-        return _dumps({"ok": False,
-                       "error": "ECAD engine not available — "
-                                "open a schematic or PCB first (ecad_new_schematic / ecad_new_pcb)"})
-
-    try:
-        from engine.ecad import netlist as netlist_mod  # noqa: PLC0415
-    except ImportError:
-        netlist_mod = None  # type: ignore[assignment]
+    # T-RF20: the session/netlist facades route to the C++ core via core_bridge RPCs.
+    from mcp_server.ecad_common import _compile_of, ecad_session, netlist_mod  # noqa: PLC0415
 
     did = doc_id or ""
     try:
@@ -1090,8 +1081,7 @@ def _describe_board_text(doc_id: str) -> str:
         # DRC summary (best-effort)
         n_err = 0
         try:
-            from engine.ecad import drc as drc_mod  # noqa: PLC0415
-            res = drc_mod.run_drc(doc)
+            res = _compile_of(session).get("drc", [])  # C++ compile runs engine.ecad.drc
             viols = res if isinstance(res, list) else res.get("violations", [])
             n_err = sum(1 for v in viols if v.get("severity") == "error")
             n_warn = sum(1 for v in viols if v.get("severity") == "warning")
@@ -1107,7 +1097,7 @@ def _describe_board_text(doc_id: str) -> str:
             lines.append("\nNo footprints placed — use ecad_find_part then ecad_place_symbol.")
         if fps:
             try:
-                from engine.ecad import metadata as eng_meta  # noqa: PLC0415
+                from engine.ecad import metadata as eng_meta  # STAYS (T-RF20): no C++ counterpart  # noqa: PLC0415
                 engs = [(f.get("ref") or f.get("id") or "?",
                          eng_meta.eng_for_footprint(f)) for f in fps]
                 lines.extend(_board_power_lines(engs, "Board"))
@@ -1126,10 +1116,6 @@ def _describe_board_text(doc_id: str) -> str:
         return _dumps({"ok": True, "text": "\n".join(lines)})
 
     # ---- schematic ----
-    if netlist_mod is None:
-        return _dumps({"ok": False,
-                       "error": "engine.ecad.netlist not available — check your install."})
-
     nl = netlist_mod.build_netlist(doc)
     components = nl.get("components", [])
     nets_dict = nl.get("nets", {})
@@ -1157,7 +1143,7 @@ def _describe_board_text(doc_id: str) -> str:
     # Per-component power + total (T-FIN8; honest nulls — contracts/ecad/boardphys.md)
     if components:
         try:
-            from engine.ecad import metadata as eng_meta  # noqa: PLC0415
+            from engine.ecad import metadata as eng_meta  # STAYS (T-RF20): no C++ counterpart  # noqa: PLC0415
             engs = [(c.get("ref") or "?",
                      eng_meta.resolve_eng(libid=c.get("libid") or "",
                                           fpid=c.get("footprint") or "",
@@ -1181,8 +1167,7 @@ def _describe_board_text(doc_id: str) -> str:
     # ERC summary
     n_erc_err = 0
     try:
-        from engine.ecad import erc as erc_mod  # noqa: PLC0415
-        violations = erc_mod.run_erc(doc, nl)
+        violations = _compile_of(session).get("erc", []) or []  # C++ compile runs engine.ecad.erc
         n_erc_err = sum(1 for v in violations if v.get("severity") == "error")
         n_erc_warn = sum(1 for v in violations if v.get("severity") == "warning")
         if n_erc_err:

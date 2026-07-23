@@ -10,7 +10,7 @@ import json
 import subprocess
 import sys
 
-from engine import worker
+from services import worker_main as worker
 
 
 def test_run_model_assembly() -> None:

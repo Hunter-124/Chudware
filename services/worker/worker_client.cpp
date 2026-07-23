@@ -1135,7 +1135,7 @@ bool WorkerClient::callImpl(const std::string& method, const json& params, json&
     // Browser: no Python worker pipe. Fall-through methods (plm_*, git_*, ai_roles_*,
     // provider accounts, …) ride the same engine channel as doc_*/agent_* above —
     // engine::call → DaemonConn/EngineClient WS → gateway → hostd, which bridges
-    // engine-unknown methods to its lazily-spawned `python -m engine.worker`.
+    // engine-unknown methods to its lazily-spawned `python -m services.worker_main`.
     // Map the response into the pipe path's success/failure contract (structured
     // method errors return true with result={code,message,…}; transport fails false
     // + errorSink_). onEvent is supported by the daemon channel (live mid-call pushes).

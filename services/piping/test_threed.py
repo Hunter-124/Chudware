@@ -23,7 +23,7 @@ try:
 except Exception:  # noqa: BLE001
     pytest = None
 
-from engine.piping import catalog, schema, threed
+from services.piping import catalog, schema, threed
 
 
 def _have_kernel() -> bool:

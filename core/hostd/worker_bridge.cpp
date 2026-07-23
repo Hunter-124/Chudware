@@ -1,4 +1,4 @@
-// hostd → python -m engine.worker stdio bridge (POSIX). Windows: unavailable stub.
+// hostd → python -m services.worker_main stdio bridge (POSIX). Windows: unavailable stub.
 #include "worker_bridge.h"
 
 #include <cstdlib>
@@ -179,8 +179,8 @@ bool WorkerBridge::spawn(std::string& err) {
         if (!repo_.empty() && chdir(repo_.c_str()) != 0) {
             // Fall through; exec from current cwd. Worker import may still fail clearly.
         }
-        // Mirror worker_client.cpp: execlp(python, python, "-m", "engine.worker", nullptr)
-        execlp(python_.c_str(), python_.c_str(), "-m", "engine.worker", (char*)nullptr);
+        // Mirror worker_client.cpp: execlp(python, python, "-m", "services.worker_main", nullptr)
+        execlp(python_.c_str(), python_.c_str(), "-m", "services.worker_main", (char*)nullptr);
         _exit(127);
     }
 

@@ -6,7 +6,7 @@ of {path: expected_volume_mm3 (from SolidWorks itself)} the importer test compar
 import os
 import pythoncom
 import win32com.client as win32
-from engine.doc.sw_feature_import import _cast, _ensure_sw_module
+from services.sw_import.sw_feature_import import _cast, _ensure_sw_module
 
 M = 0.001  # mm -> m (SolidWorks API is metres)
 OUT = os.path.join(os.path.dirname(__file__), "..", "..", "corpora", "sw_fixtures")

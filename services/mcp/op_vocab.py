@@ -7,7 +7,7 @@ caches the result and provides:
   * ``cheatsheet_snippet()`` for one-shot agent middleware inject
   * ``unknown_op_help(kind)`` for rich rejection text offline
 
-Falls back to ``engine_oracle.doc.op_registry`` when libaicad is unavailable
+Falls back to ``services/mcp/op_registry`` when libaicad is unavailable
 (unit tests / offline), so middleware tests stay deterministic.
 """
 from __future__ import annotations
@@ -18,12 +18,8 @@ _CACHE: dict[str, Any] | None = None
 
 
 def _fallback():
-    try:
-        from engine.doc import op_registry as reg  # type: ignore
-        return reg
-    except Exception:  # noqa: BLE001
-        from engine_oracle.doc import op_registry as reg  # type: ignore
-        return reg
+    from services.mcp import op_registry as reg  # type: ignore
+    return reg
 
 
 def _load_from_core() -> dict[str, Any] | None:

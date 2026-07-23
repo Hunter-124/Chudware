@@ -31,7 +31,7 @@ import os
 import uuid
 from typing import Any, NamedTuple, Optional
 
-from engine.piping.schema import SCHEMA_PIPING
+from services.piping.schema import SCHEMA_PIPING
 
 
 class _BoreSpec(NamedTuple):
@@ -198,7 +198,7 @@ def internal_volume(
         )
 
     from build123d import Compound, export_step
-    from engine.piping import catalog
+    from services.piping import catalog
 
     warnings: list = []
     children = []

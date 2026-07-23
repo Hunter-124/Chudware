@@ -406,7 +406,7 @@ def _mesh_wire_edges(
     Each drawn edge becomes a 2-point polyline. Returns ``(edge_pts (2K,3) float32, [EdgeRec]*K)``.
     Skips extraction (shaded-only, no wireframe) above ``max_tris`` / ``max_edges`` so a huge import
     stays responsive."""
-    from engine.doc.mesh_body import face_normals
+    from services.formats.mesh_body import face_normals
 
     if len(tris) == 0 or len(tris) > max_tris:
         return np.zeros((0, 3), dtype=np.float32), []
@@ -463,7 +463,7 @@ def tessellate_mesh_body(
     metallic: float = 0.0,
     roughness: float = 0.5,
 ) -> BodyTess:
-    """Tessellate a :class:`engine.doc.mesh_body.MeshBody` directly into AICM geometry.
+    """Tessellate a :class:`services.formats.mesh_body.MeshBody` directly into AICM geometry.
 
     Unlike :func:`tessellate_body` this does NOT run ``BRepMesh`` — the triangles ARE the mesh. It
     emits one FaceRec spanning all triangles (so a pick selects the whole body), area-weighted

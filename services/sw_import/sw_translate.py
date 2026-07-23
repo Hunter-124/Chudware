@@ -1,4 +1,4 @@
-"""Translate a SolidWorks feature IR (:mod:`engine.doc.sw_feature_import`) into AI-CAD's native
+"""Translate a SolidWorks feature IR (:mod:`services.sw_import.sw_feature_import`) into AI-CAD's native
 ``add_features`` op list, so an imported SolidWorks part lands as an *editable* feature tree.
 
 Strict-fidelity contract: every feature this can rebuild is emitted as real ops; every feature it
@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from engine.doc.sw_feature_import import (
+from services.sw_import.sw_feature_import import (
     SWFeature, SWPart, SWUnsupported, extract_part)
 
 _PRINCIPAL_PLANE = {"top": "plane.top", "front": "plane.front", "right": "plane.right"}

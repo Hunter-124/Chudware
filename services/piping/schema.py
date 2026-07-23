@@ -2,7 +2,7 @@
 
 Executable form of ``contracts/piping_schema.md``. Structural validation only (envelopes,
 types, id prefixes, enum membership) — geometry realizability and catalog resolution are
-separate passes (:mod:`engine.piping.catalog` / :mod:`engine.piping.threed`), exactly as
+separate passes (:mod:`services.piping.catalog` / :mod:`services.piping.threed`), exactly as
 engine.ecad keeps DRC/3D out of its schema validator.
 
 Every ``validate_*`` returns a list of error strings (empty = valid), each prefixed with a

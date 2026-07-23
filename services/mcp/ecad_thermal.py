@@ -424,7 +424,7 @@ def thermal_handoff_impl(board_doc: dict, *,
 
     # ── 1. FEA solid + homogenized material ─────────────────────────────
     try:
-        from engine.ecad.threed import board_to_fea_step, BoardGeometryError
+        from engine.ecad.threed import board_to_fea_step, BoardGeometryError  # STAYS (T-RF20): no C++ counterpart
     except ImportError as e:
         return _err_d(f"3D kernel unavailable (ImportError: {e})",
                       hint="OCP/build123d not installed — the FEA solid cannot be built.",
@@ -660,7 +660,7 @@ def register_ecad_thermal_tools(mcp) -> None:
     # Same module identity the rest of the server uses (see piping_tools note on the
     # double-import/_PERIODIC_TIMER hazard).
     from mcp_server.ecad_tools import _get_pcb, _default_out_dir
-    from engine.ecad.ops import OpError
+    from mcp_server.ecad_common import OpError
 
     def _find_pdn_block(board_name: str, step_path: str) -> Optional[dict]:
         """Locate the aicad.boardphys/1 pdn block written by ecad_run_pdn: sidecar next
@@ -1063,7 +1063,7 @@ def register_ecad_airflow_tools(mcp) -> None:
     """Register ecad_airflow_handoff / ecad_verify_airflow on ``mcp`` (FastMCP)."""
 
     from mcp_server.ecad_tools import _get_pcb, _default_out_dir
-    from engine.ecad.ops import OpError
+    from mcp_server.ecad_common import OpError
 
     def _openfoam_runner():
         try:
@@ -1117,7 +1117,7 @@ def register_ecad_airflow_tools(mcp) -> None:
 
         out_dir = path or str(_default_out_dir(board_doc.get("name", "board")) / "airflow")
         try:
-            from engine.ecad.threed import board_to_fea_step, BoardGeometryError
+            from engine.ecad.threed import board_to_fea_step, BoardGeometryError  # STAYS (T-RF20): no C++ counterpart
         except ImportError as e:
             return _err(f"3D kernel unavailable (ImportError: {e})",
                         hint="OCP/build123d not installed — board geometry cannot be built.",

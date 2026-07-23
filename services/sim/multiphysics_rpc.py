@@ -22,7 +22,7 @@ Endpoints:
                       envelope (services/mcp/ecad_thermal.thermal_handoff_impl — the
                       same impl the MCP tool wraps).
   piping_verify_cfd   1D-vs-3D pressure-drop verification envelope
-                      (engine.piping.cfd_handoff.verify_pressure_drop).
+                      (services.piping.cfd_handoff.verify_pressure_drop).
 
 Graceful posture (firmware contract): expected failures come back as result payloads
 (``{ok:false, error|skipped, hint}``), never raised exceptions.
@@ -118,7 +118,7 @@ def _sim_caps(params: dict) -> dict:
         ecad_ok, ecad_hint = False, str(e)
     piping_hint = ""
     try:
-        from engine_oracle.piping.cfd_handoff import verify_pressure_drop  # noqa: F401
+        from services.piping.cfd_handoff import verify_pressure_drop  # noqa: F401
         piping_ok = True
     except Exception as e:  # noqa: BLE001
         piping_ok, piping_hint = False, str(e)
@@ -295,8 +295,8 @@ def _heatsink_select(params: dict) -> dict:
 
 def _piping_verify_cfd(params: dict) -> dict:
     """{solve_result: <piping_solve dict>, cfd_result: <run_cfd dict>,
-    tolerance_pct?, run_id?} -> verify envelope (engine.piping.cfd_handoff)."""
-    from engine_oracle.piping.cfd_handoff import verify_pressure_drop
+    tolerance_pct?, run_id?} -> verify envelope (services.piping.cfd_handoff)."""
+    from services.piping.cfd_handoff import verify_pressure_drop
     solve = params.get("solve_result")
     cfd = params.get("cfd_result")
     if not isinstance(solve, dict) or not isinstance(cfd, dict):

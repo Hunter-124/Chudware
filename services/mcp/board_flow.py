@@ -23,13 +23,19 @@ from __future__ import annotations
 
 from typing import Any, Optional, Union
 
-from engine.ecad import drc as drc_mod
-from engine.ecad import place as place_mod
-from engine.ecad import rpc as ecad_rpc
-from engine.ecad import schema
-from engine.ecad import session as ecad_session
-from engine.ecad import trace_opt as trace_opt_mod
-from engine.ecad.ops import OpError
+# T-RF20: session/schema/drc/sync/autoroute are C++-dispatched — consumed here via the
+# core_bridge-backed facades in ecad_common. place/trace_opt have NO C++ counterpart
+# (re-homed to services/ by another T-RF leaf) — the direct imports STAY.
+from engine.ecad import place as place_mod  # STAYS (T-RF20): no C++ counterpart
+from engine.ecad import trace_opt as trace_opt_mod  # STAYS (T-RF20): no C++ counterpart
+
+from mcp_server.ecad_common import (
+    OpError,
+    _compile_of,
+    _rpc,
+    ecad_session,
+    schema,
+)
 
 
 # --------------------------------------------------------------------------- helpers
@@ -91,10 +97,13 @@ def _resolve_pcb(opts: dict) -> ecad_session.EcadSession:
     return ecad_session.new_session("pcb", name)
 
 
-def _drc_residuals(board: dict) -> list[dict]:
-    """Compact residual DRC violations (errors first). Never suppress."""
+def _drc_residuals(session) -> list[dict]:
+    """Compact residual DRC violations (errors first). Never suppress.
+
+    Takes the board SESSION (T-RF20): the C++ session compile runs engine.ecad.drc on
+    every apply/tree, so the residual read is one ecad_tree RPC."""
     try:
-        viols = drc_mod.run_drc(board) or []
+        viols = _compile_of(session).get("drc") or []
     except Exception as exc:  # noqa: BLE001 — DRC is advisory; surface failure honestly
         return [{"rule": "drc_unavailable", "severity": "error",
                  "message": f"{type(exc).__name__}: {exc}", "items": []}]
@@ -389,16 +398,15 @@ def board_from_schematic(
 
     # ---- 1. sync schematic -> board (footprints + pad nets) ----------------
     try:
-        sync_resp = ecad_rpc._ecad_update_from_sch(
-            {
-                "board_doc_id": pcb.doc_id,
-                "sch_doc_id": sch.doc_id,
-                "prune": bool(opts.get("prune", False)),
-                **({"place_origin": opts["place_origin"]}
-                   if opts.get("place_origin") is not None else {}),
-            },
-            lambda _d: None,
-        )
+        sync_resp = _rpc("ecad_update_from_sch",
+                         {
+                             "board_doc_id": pcb.doc_id,
+                             "sch_doc_id": sch.doc_id,
+                             "prune": bool(opts.get("prune", False)),
+                             **({"place_origin": opts["place_origin"]}
+                                if opts.get("place_origin") is not None else {}),
+                         })
+        pcb._update(sync_resp)  # keep pcb.doc/revision current after the RPC mutation
         sync_rep = dict(sync_resp.get("report") or {})
         report["sync"] = sync_rep
         report["unresolved"] = list(sync_rep.get("unresolved") or [])
@@ -420,7 +428,7 @@ def board_from_schematic(
     except OpError as e:
         report["steps"].append({"step": "update_from_sch", "ok": False,
                                 "error": e.message})
-        residual = _drc_residuals(pcb.doc)
+        residual = _drc_residuals(pcb)
         return {
             "ok": False,
             "board_doc_id": pcb.doc_id,
@@ -508,7 +516,7 @@ def board_from_schematic(
 
     # Count airwires after placement (ratsnest_before for the route step).
     try:
-        rn_pre = drc_mod.ratsnest(pcb.doc) or []
+        rn_pre = _compile_of(pcb).get("ratsnest") or []  # C++ compile runs drc.ratsnest
         report["ratsnest_before"] = len(rn_pre)
     except Exception:  # noqa: BLE001
         pass
@@ -520,10 +528,9 @@ def board_from_schematic(
     routed_nets: list = []
     failed_nets: list = []
     try:
-        ar_resp = ecad_rpc._ecad_autoroute(
-            {"doc_id": pcb.doc_id, "opts": route_opts},
-            lambda _d: None,
-        )
+        ar_resp = _rpc("ecad_autoroute",
+                       {"doc_id": pcb.doc_id, "opts": route_opts})
+        pcb._update(ar_resp)  # keep pcb.doc/revision current after the RPC mutation
         ar_rep = dict(ar_resp.get("report") or {})
         report["route"] = ar_rep
         routed_nets = list(ar_rep.get("routed") or [])
@@ -604,7 +611,7 @@ def board_from_schematic(
         })
 
     # ---- 5. residual DRC (honest) ------------------------------------------
-    residual = _drc_residuals(pcb.doc)
+    residual = _drc_residuals(pcb)
     n_err = sum(1 for v in residual if v.get("severity") == "error")
     report["drc_errors"] = n_err
     report["drc_warnings"] = sum(1 for v in residual if v.get("severity") != "error")
@@ -617,7 +624,7 @@ def board_from_schematic(
 
     # Final ratsnest after full pipeline (may still have unrouted airwires).
     try:
-        rn_final = drc_mod.ratsnest(pcb.doc) or []
+        rn_final = _compile_of(pcb).get("ratsnest") or []
         report["ratsnest_after"] = len(rn_final)
     except Exception:  # noqa: BLE001
         pass
@@ -653,9 +660,9 @@ def board_from_schematic(
 def autoplace_board(pcb_session_or_doc: Any, opts: Optional[dict] = None) -> dict:
     """Connectivity-aware placement on an active board (standalone tool helper).
 
-    Accepts a PCB :class:`~engine.ecad.session.EcadSession` or ``doc_id``.
-    Uses :func:`engine.ecad.place.autoplace` when a live session is available,
-    otherwise :func:`engine.ecad.place.place_board` + ``swap_doc``.
+    Accepts a PCB session (:class:`mcp_server.ecad_common.EcadSession`) or ``doc_id``.
+    Pure :func:`engine.ecad.place.place_board` + ``swap_doc`` write-back (T-RF20: the
+    write-back goes through the C++-backed session facade).
     """
     opts = dict(opts or {})
     opts.setdefault("seed", int(opts.get("seed", 0)))
@@ -673,9 +680,19 @@ def autoplace_board(pcb_session_or_doc: Any, opts: Optional[dict] = None) -> dic
         raise OpError("invalid_op", "autoplace_board requires a pcb document",
                       {"reason": "wrong doc kind", "doc_id": session.doc_id})
 
-    resp = place_mod.autoplace(session, opts)
-    place_rep = dict(resp.get("place_report") or {})
-    residual = _drc_residuals(session.doc)
+    # engine.ecad.place.autoplace inlined (T-RF20): it wrote back through the deleted
+    # Python session registry; here place_board (pure) + the C++-backed facade swap_doc.
+    _pl = place_mod.place_board(session.doc, opts)
+    place_rep = dict(_pl.get("report") or {})
+    resp = ecad_session.swap_doc(
+        session, _pl["doc"], base_revision=session.revision,
+        warnings=[
+            f"autoplace: moved {place_rep.get('moved', 0)}/{place_rep.get('n_footprints', 0)} "
+            f"footprints; ratsnest={place_rep.get('ratsnest_len_mm', 0):.2f} mm; "
+            f"overlaps={place_rep.get('overlaps', 0)}"
+        ],
+    )
+    residual = _drc_residuals(session)
     return {
         "ok": True,
         "board_doc_id": session.doc_id,
@@ -724,7 +741,7 @@ def optimize_board_traces(
             f"nets_tuned={opt_rep.get('nets_tuned', 0)}"
         ],
     )
-    residual = _drc_residuals(session.doc)
+    residual = _drc_residuals(session)
     n_err = sum(1 for v in residual if v.get("severity") == "error")
     return {
         "ok": True,

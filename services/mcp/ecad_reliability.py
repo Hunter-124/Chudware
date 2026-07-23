@@ -142,7 +142,7 @@ def detect_mount_holes(board: dict, user_holes: Optional[list] = None) -> list:
                         "ref": f"user{i + 1}", "source": "user"})
         return out
 
-    from engine.ecad.schema import pad_world  # pad local frame -> board frame
+    from mcp_server.ecad_common import _pad_world as pad_world  # pad local frame -> board frame
 
     found: list = []
 
@@ -387,7 +387,7 @@ def register_ecad_reliability_tools(mcp) -> None:
     # Same module identity as the rest of the server (see piping_tools note on the
     # double-import hazard).
     from mcp_server.ecad_tools import _get_pcb, _default_out_dir
-    from engine.ecad.ops import OpError
+    from mcp_server.ecad_common import OpError
 
     @mcp.tool()
     def ecad_vibe_check(doc_id: str = "",
@@ -464,7 +464,7 @@ def register_ecad_reliability_tools(mcp) -> None:
 
         # ── FEA solid (T-FIN16, reused) + mass-corrected material ───────────
         try:
-            from engine.ecad.threed import board_to_fea_step, BoardGeometryError
+            from engine.ecad.threed import board_to_fea_step, BoardGeometryError  # STAYS (T-RF20): no C++ counterpart
         except ImportError as e:
             return _err(f"3D kernel unavailable (ImportError: {e})",
                         hint="OCP/build123d not installed — the FEA solid cannot be built.",
@@ -598,7 +598,7 @@ def register_ecad_reliability_tools(mcp) -> None:
         deflect: dict = {"available": False}
         response: dict = {"available": False}
         try:
-            from engine_oracle.sim.vibration import miles_response
+            from engine_oracle.sim.vibration import miles_response  # STAYS (T-RF20): no C++ counterpart
             shapes = res.get("mode_shapes") or []
             n_nodes = int(res.get("n_nodes", 0))
             if shapes and n_nodes > 0:

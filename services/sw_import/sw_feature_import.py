@@ -8,7 +8,7 @@ and the solid features built on them — and emits two things:
 
   * an **intermediate representation** (IR): a plain list of feature dicts, COM-free and JSON-able;
   * a translation of that IR into AI-CAD's native ``add_features`` op list (see
-    :func:`engine.doc.sw_translate.translate`), so the imported part lands as an *editable* feature
+    :func:`services.sw_import.sw_translate.translate`), so the imported part lands as an *editable* feature
     tree instead of one dead body.
 
 Design contract (per owner, 2026-06-26): **strict fidelity, no silent fallback.** Any feature — or
@@ -1008,12 +1008,12 @@ def part_to_dict(part: SWPart) -> dict:
     }
 
 
-if __name__ == "__main__":  # standalone probe: python -m engine.doc.sw_feature_import <part>
+if __name__ == "__main__":  # standalone probe: python -m services.sw_import.sw_feature_import <part>
     import json
     import sys
     target = sys.argv[1] if len(sys.argv) > 1 else None
     if not target:
-        print("usage: python -m engine.doc.sw_feature_import <path-to.sldprt>")
+        print("usage: python -m services.sw_import.sw_feature_import <path-to.sldprt>")
         raise SystemExit(2)
     p = extract_part(target, visible=False)
     print(json.dumps(part_to_dict(p), indent=2))

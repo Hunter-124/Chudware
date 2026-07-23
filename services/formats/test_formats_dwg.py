@@ -1,4 +1,4 @@
-"""Tests for the DWG importer (engine.doc.formats_dwg via import_path).
+"""Tests for the DWG importer (services.formats.formats_dwg via import_path).
 
 DWG has no free in-process reader, so import goes DWG→DXF (external converter) → the DXF pipeline.
 These tests exercise the wiring deterministically WITHOUT requiring a converter to be installed:
@@ -11,8 +11,8 @@ import pytest
 
 ezdxf = pytest.importorskip("ezdxf")
 
-from engine.doc.formats import import_path, list_formats  # noqa: E402
-from engine.doc import formats_dwg  # noqa: E402
+from services.formats.formats import import_path, list_formats  # noqa: E402
+from services.formats import formats_dwg  # noqa: E402
 
 
 def _square_circle_doc():

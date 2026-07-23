@@ -9,7 +9,7 @@ are owned by ``core/piping`` behind the libaicad ``piping_*`` RPCs — reached v
 :mod:`services.mcp.core_bridge`); the MCP layer keeps input parsing, its tiny session state
 (so ``piping_report`` can reuse the document / result of the last ``piping_solve``), and the
 kernel orchestration legs (``piping_internal_volume`` bore extraction + the
-``piping_cfd_handoff`` bore→CFD pipeline), which still call ``engine.piping.cfd_handoff``
+``piping_cfd_handoff`` bore→CFD pipeline), which still call ``services.piping.cfd_handoff``
 (OCCT sweep — ported by a later leaf).
 
 Tools:
@@ -39,7 +39,7 @@ from typing import Any, Optional, Union
 
 # The bore-extraction leg (OCCT sweep) stays Python until a kernel leaf ports it —
 # engine_oracle/piping/cfd_handoff.py is NOT deleted in this round.
-from engine.piping import cfd_handoff as piping_cfd_mod
+from services.piping import cfd_handoff as piping_cfd_mod
 
 from . import core_bridge as cb
 from services.mcp import simhandoff as sh
@@ -121,7 +121,7 @@ def network_from_handoff(env: Any) -> "tuple[Optional[dict], Optional[list], Opt
 
 def _schema_errors_via_core(d: dict) -> list:
     """Validate an ``aicad.piping/1`` doc through the core (the schema validator lives in
-    libaicad now — ``engine.piping.schema`` is deleted in this round). A boundary-less
+    libaicad now — ``services.piping.schema`` is deleted in this round). A boundary-less
     ``piping_solve`` returns the validator's error list under ``errors`` for a bad doc,
     and the boundary-conditions error (no ``errors`` key) for a good one."""
     r = cb.call("piping_solve", {"doc": d})

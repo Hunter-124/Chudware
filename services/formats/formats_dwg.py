@@ -4,7 +4,7 @@ DWG is a proprietary binary format with **no free in-process reader** (native DW
 Open Design Alliance's whole business). Rather than parse it ourselves, we mirror the
 ``formats_solidworks`` strategy: convert DWG→DXF with an external converter **the user provides**
 (never bundled, never linked — subprocess / mere aggregation only), then reuse the DXF importer's
-entity→geometry pipeline (:func:`engine.doc.formats_dxf.bodies_from_doc`). Every entry point
+entity→geometry pipeline (:func:`services.formats.formats_dxf.bodies_from_doc`). Every entry point
 degrades cleanly with an actionable error when no converter is present.
 
 Converters, in priority order (subprocess only, PATH/registry-discovered, never bundled):
@@ -82,7 +82,7 @@ def _select_converter() -> Optional[Callable[[Path], Any]]:
 
 
 # ---------------------------------------------------------------------------
-# Public import entry point (called from engine.doc.formats.import_path)
+# Public import entry point (called from services.formats.formats.import_path)
 # ---------------------------------------------------------------------------
 
 _NO_CONVERTER_HINT = (
@@ -100,7 +100,7 @@ def import_dwg(path: str | Path) -> list[tuple[str, Any]]:
     Raises ``ValueError`` with an actionable hint when no DWG→DXF converter is available, or when
     the converted drawing carries no importable 2D geometry.
     """
-    from engine.doc.formats_dxf import bodies_from_doc
+    from services.formats.formats_dxf import bodies_from_doc
 
     path = Path(path)
     convert = _select_converter()

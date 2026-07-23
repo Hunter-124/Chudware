@@ -1,4 +1,4 @@
-"""End-to-end test for SolidWorks feature-tree import (engine.doc.sw_feature_import + sw_translate).
+"""End-to-end test for SolidWorks feature-tree import (services.sw_import.sw_feature_import + sw_translate).
 
 Reconstructs the owner's reference SolidWorks parts into the C++ engine and checks the resulting
 volume matches what SolidWorks itself reports — proving the feature tree (sketches with relations,
@@ -18,8 +18,8 @@ import os
 
 import pytest
 
-from engine.doc.sw_feature_import import solidworks_available
-from engine.doc.sw_translate import resolve
+from services.sw_import.sw_feature_import import solidworks_available
+from services.sw_import.sw_translate import resolve
 from mcp_server import core_bridge as cb
 
 _SAMPLES = os.environ.get(
@@ -72,7 +72,7 @@ def _sw_mass(path):
     """Ground-truth (volume_mm3, com_mm[x,y,z]) from SolidWorks itself, in SW model coords."""
     import pythoncom
     import win32com.client as win32
-    from engine.doc.sw_feature_import import _cast
+    from services.sw_import.sw_feature_import import _cast
     pythoncom.CoInitialize()
     app = _cast(win32.Dispatch("SldWorks.Application"), "ISldWorks")
     app.Visible = False

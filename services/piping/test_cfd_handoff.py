@@ -1,4 +1,4 @@
-"""Tests for engine.piping.cfd_handoff (T-E4: 3D CFD handoff for pipe internals).
+"""Tests for services.piping.cfd_handoff (T-E4: 3D CFD handoff for pipe internals).
 
 Test groups:
   1. internal_volume — bore solid extraction (kernel-skipped when build123d absent).
@@ -23,8 +23,8 @@ try:
 except Exception:  # noqa: BLE001
     pytest = None
 
-from engine.piping import catalog, schema
-from engine.piping import cfd_handoff as ch
+from services.piping import catalog, schema
+from services.piping import cfd_handoff as ch
 
 # ── skip markers ──────────────────────────────────────────────────────────────
 

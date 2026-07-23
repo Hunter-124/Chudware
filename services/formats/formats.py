@@ -8,9 +8,9 @@ Formats supported
 * **BREP** — via ``build123d.export_brep`` / ``import_brep``.
 * **STL** — via ``build123d.export_stl`` / ``import_stl`` (mesh only; no parametrics).
 * **3MF** — via ``build123d.Mesher`` / ``lib3mf`` (mesh only).
-* **DXF** — via ``ezdxf`` (``engine.doc.formats_dxf``); 2D vector drawings → planar B-rep
+* **DXF** — via ``ezdxf`` (``services.formats.formats_dxf``); 2D vector drawings → planar B-rep
   wires/faces (import only). See that module for the entity coverage matrix.
-* **DWG** — via an external DWG→DXF converter + the DXF pipeline (``engine.doc.formats_dwg``);
+* **DWG** — via an external DWG→DXF converter + the DXF pipeline (``services.formats.formats_dwg``);
   import only, needs a user-provided converter (ODA File Converter / LibreDWG).
 
 Public API
@@ -159,7 +159,7 @@ def export_document(
     str
         The resolved absolute path that was written.
     """
-    from engine.doc.mesh_body import MeshBody
+    from services.formats.mesh_body import MeshBody
 
     path = Path(path)
     fmt = format or _detect_format(path)
@@ -279,16 +279,16 @@ def import_path(
     elif fmt == "3dm":
         return _import_3dm(path)
     elif fmt == "dxf":
-        from engine.doc.formats_dxf import import_dxf
+        from services.formats.formats_dxf import import_dxf
         return import_dxf(path)
     elif fmt == "dwg":
-        from engine.doc.formats_dwg import import_dwg
+        from services.formats.formats_dwg import import_dwg
         return import_dwg(path)
     elif fmt in ("sldprt", "sldasm"):
-        from engine.doc.formats_solidworks import import_solidworks
+        from services.formats.formats_solidworks import import_solidworks
         return import_solidworks(path)
     elif fmt in ("x_t", "x_b"):
-        from engine.doc.formats_solidworks import import_parasolid
+        from services.formats.formats_solidworks import import_parasolid
         return import_parasolid(path)
     else:
         raise ValueError(f"unsupported import format '{fmt}'")
@@ -411,7 +411,7 @@ def _import_3mf(path: Path) -> list[tuple[str, Any]]:
     import lib3mf
     import numpy as np
 
-    from engine.doc.mesh_body import MeshBody
+    from services.formats.mesh_body import MeshBody
 
     wrapper = lib3mf.Wrapper()
     model = wrapper.CreateModel()
@@ -445,7 +445,7 @@ def _export_3mf_lib3mf(session_bodies: list[tuple[str, Any]], path: Path) -> str
     import lib3mf
     import numpy as np
 
-    from engine.doc.mesh_body import MeshBody
+    from services.formats.mesh_body import MeshBody
 
     wrapper = lib3mf.Wrapper()
     model = wrapper.CreateModel()
@@ -505,7 +505,7 @@ def _load_mesh_trimesh(path: Path, fmt: str | None = None) -> list[tuple[str, An
     import numpy as np
     import trimesh
 
-    from engine.doc.mesh_body import MeshBody
+    from services.formats.mesh_body import MeshBody
 
     stem = Path(path).stem
     loaded = trimesh.load(str(path), force=None)
@@ -545,7 +545,7 @@ _TRIMESH_EXPORT_TYPE: dict[str, str] = {
 
 def _shape_to_triangles(shape):
     """Tessellate a build123d / OCCT shape to ``(verts (N,3), tris (M,3))`` for mesh export."""
-    from engine.doc import tessellate as tess
+    from services.sim import tessellate as tess
     bt = tess.tessellate_body(shape, body_id=0, name="x", color=(0.5, 0.5, 0.5))
     return bt.pos, bt.idx
 
@@ -555,7 +555,7 @@ def _export_mesh_trimesh(session_bodies: list[tuple[str, Any]], path: Path, fmt:
     import numpy as np
     import trimesh
 
-    from engine.doc.mesh_body import MeshBody
+    from services.formats.mesh_body import MeshBody
 
     meshes = []
     for _name, s in session_bodies:
@@ -603,7 +603,7 @@ def _import_3dm(path: Path) -> list[tuple[str, Any]]:
     """Rhino .3dm → MeshBody per Mesh / Extrusion object (rhino3dm, MIT)."""
     import rhino3dm as r
 
-    from engine.doc.mesh_body import MeshBody
+    from services.formats.mesh_body import MeshBody
 
     model = r.File3dm.Read(str(path))
     if model is None:
@@ -645,7 +645,7 @@ def _export_3dm(session_bodies: list[tuple[str, Any]], path: Path) -> str:
     import numpy as np
     import rhino3dm as r
 
-    from engine.doc.mesh_body import MeshBody
+    from services.formats.mesh_body import MeshBody
 
     model = r.File3dm()
     added = 0

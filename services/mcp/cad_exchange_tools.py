@@ -113,8 +113,8 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
                 return _dumps({"ok": False, "error": f"file not found: {path}"})
             # SolidWorks feature-tree resolution (opening as a NEW editable part/assembly).
             if resolve_features and not into and path.lower().endswith((".sldprt", ".sldasm")):
-                from engine.doc.sw_feature_import import SolidWorksUnavailable
-                from engine.doc.sw_translate import resolve as _sw_resolve
+                from services.sw_import.sw_feature_import import SolidWorksUnavailable
+                from services.sw_import.sw_translate import resolve as _sw_resolve
                 try:
                     plan = _sw_resolve(path)
                 except SolidWorksUnavailable as e:

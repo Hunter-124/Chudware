@@ -65,7 +65,7 @@ class _PipingSolveShim:
 
 hyd_solve = _HydSolveShim()
 piping_solve_mod = _PipingSolveShim()
-from engine.piping import schema as piping_schema  # kept in engine_oracle (threed/cfd_handoff hold-back)
+from services.piping import schema as piping_schema  # kept in engine_oracle (threed/cfd_handoff hold-back)
 from mcp_server import simhandoff as sh
 
 

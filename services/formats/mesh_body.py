@@ -8,7 +8,7 @@ B-rep body, but carries raw vertices + triangles (no topology):
   treats it as having no B-rep topology — no face/edge owner tags, no crash;
 * :func:`engine.doc.tessellate.tessellate_mesh_body` turns it straight into AICM geometry
   (no ``BRepMesh`` — raw triangles, area-weighted normals, naked + sharp wireframe edges);
-* :func:`engine.doc.formats.export_document` re-serialises it via the trimesh mesh writers;
+* :func:`services.formats.formats.export_document` re-serialises it via the trimesh mesh writers;
 * :func:`engine.doc.evaluate.mass_props` computes volume / area / centroid from the triangles.
 
 Downstream code dispatches on ``isinstance(shape, MeshBody)`` — robust to multi-body imports where

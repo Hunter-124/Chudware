@@ -171,7 +171,7 @@ def sldprt_extract_preview_mesh(path: str | os.PathLike):  # -> MeshBody | None
 
 
 # ---------------------------------------------------------------------------
-# Public import entry points (called from engine.doc.formats.import_path)
+# Public import entry points (called from services.formats.formats.import_path)
 # ---------------------------------------------------------------------------
 def _via_solidworks_com(path: str | os.PathLike) -> list[tuple[str, Any]] | None:
     """Try the COM→STEP path; return imported bodies, or None if SolidWorks isn't usable."""
@@ -181,7 +181,7 @@ def _via_solidworks_com(path: str | os.PathLike) -> list[tuple[str, Any]] | None
         step = sw_com_export_step(path)
     except Exception:  # noqa: BLE001
         return None
-    from engine.doc.formats import import_path
+    from services.formats.formats import import_path
     return import_path(step, "step")
 
 

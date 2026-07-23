@@ -2020,8 +2020,8 @@ def check_schematic(sch: dict) -> list[dict]:
         })
     # optional netlist-backed unconnected pins
     try:
-        from engine.ecad.netlist import build_netlist  # noqa: PLC0415
-        nl = build_netlist(sch)
+        from mcp_server.ecad_common import netlist_mod as _nl_mod  # noqa: PLC0415
+        nl = _nl_mod.build_netlist(sch)
         by_pin = nl.get("by_pin") or {}
         # count pins that never appear in by_pin if components list available
         for comp in nl.get("components") or []:
@@ -2842,7 +2842,7 @@ def apply_ascii_edits(kind: str, edits: Sequence[dict], *,
     """Plan (+ optionally apply) cell-addressed edits against a live/offline doc.
 
     When ``apply_live`` and not ``dry_run``:
-      - schematic/pcb → engine.ecad.session.apply_ops on the open session
+      - schematic/pcb → C++ ecad_apply_ops via the ecad_common session facade
       - sketch → mcp_server.cad_tools add_features path via core bridge
 
     Offline: pass ``doc`` + ``grid`` + ``index`` from a prior render; with
@@ -2878,7 +2878,7 @@ def apply_ascii_edits(kind: str, edits: Sequence[dict], *,
     if live_doc is None and apply_live and not dry_run:
         try:
             if kind_n in ("schematic", "pcb"):
-                from engine.ecad import session as ecad_session  # noqa: PLC0415
+                from mcp_server.ecad_common import ecad_session  # noqa: PLC0415
                 if doc_id:
                     session = ecad_session.get_session(doc_id)
                 else:
@@ -2927,7 +2927,7 @@ def apply_ascii_edits(kind: str, edits: Sequence[dict], *,
     # Apply
     try:
         if kind_n in ("schematic", "pcb"):
-            from engine.ecad import session as ecad_session  # noqa: PLC0415
+            from mcp_server.ecad_common import ecad_session  # noqa: PLC0415
             if session is None:
                 session = ecad_session.get_session(doc_id)
             resp = ecad_session.apply_ops(session, session.revision, plan["ops"])
@@ -3170,7 +3170,7 @@ def render_ascii_3d(polylines: Optional[list] = None,
 
 
 def _load_schematic(doc_id: str = "") -> dict:
-    from engine.ecad import session as ecad_session  # noqa: PLC0415
+    from mcp_server.ecad_common import ecad_session  # noqa: PLC0415
     if doc_id:
         session = ecad_session.get_session(doc_id)
     else:
@@ -3189,7 +3189,7 @@ def _load_schematic(doc_id: str = "") -> dict:
 
 
 def _load_board(doc_id: str = "") -> dict:
-    from engine.ecad import session as ecad_session  # noqa: PLC0415
+    from mcp_server.ecad_common import ecad_session  # noqa: PLC0415
     if doc_id:
         session = ecad_session.get_session(doc_id)
     else:
@@ -3319,11 +3319,11 @@ def register_ascii2d_tools(mcp: FastMCP) -> None:
             if doc_id or (not circuit and not spice_text and not netlist):
                 try:
                     sch = _load_schematic(doc_id)
-                    from engine.ecad.netlist import build_netlist  # noqa: PLC0415
-                    netlist = netlist or build_netlist(sch)
+                    from mcp_server.ecad_common import _netlist_to_circuit  # noqa: PLC0415
+                    from mcp_server.ecad_common import netlist_mod as _nl_mod  # noqa: PLC0415
+                    netlist = netlist or _nl_mod.build_netlist(sch)
                     try:
-                        from engine.sim.spice import netlist_to_spice_circuit  # noqa: PLC0415
-                        circuit, _warns = netlist_to_spice_circuit(netlist)
+                        circuit, _warns = _netlist_to_circuit(netlist)
                     except Exception:
                         pass
                 except Exception:

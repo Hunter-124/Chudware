@@ -1,12 +1,21 @@
-// Firmware workspace (T-FIN5) — see fw_workspace.h.
+// Firmware workspace — unified Arduino-style embedded IDE view (T-FIN5 restructure).
 //
 // Layout (full central band, same host window pattern as PLM/RevEng):
-//   left  : project rail (fw_projects, ASYNC) + New Project + selected project's sources
-//   center: Build section (fw_build → parsed-warnings console) over the Emulation section
-//           (platform + scenario assertions → fw_sim_run → live UART console) over the
-//           GPIO trace viewer (aicad.firmware.trace/1 waveforms, contract §7)
-//   right : backend doctor (fw_status, T-FIN4) + Flash/Debug — buttons exist ONLY when the
-//           doctor says the backend exists; otherwise the doctor's guidance banner shows.
+//   target bar : [Board/MCU chip][Toolchain][Port] .......... [Build][Flash][Debug][Monitor]
+//   left  rail : project/board tree (fw_projects, ASYNC) + New Project + selected project's
+//                sources | Pinmap (pins observed in the last emulation trace) | Backend doctor
+//                (fw_status, T-FIN4) — honest gating: missing tools show a guidance banner
+//                instead of a dead button.
+//   center     : tabs — Editor (read-only source preview) | Debug (fw_debug_gdb_* console:
+//                reset/halt/step, breakpoints, memory view) | Emulate (fw_sim_run /
+//                fw_emulate_renode / fw_emulate_simavr live UART + GPIO trace viewer, contract
+//                §7).
+//   right      : AI Copilot pane — reuses the docked Copilot's own chat state/send path
+//                (ui/copilot/copilot.h reuse hooks) so the firmware hub doesn't fork a second
+//                chat implementation.
+//   bottom dock: tabs — Build Log | Serial Monitor (fw_serial_*) | Flash Progress | GDB
+//                Console. Collapsible via ui::PanelCollapseAnim (vertical roll-up, same
+//                recipe as the FeatureManager column).
 //
 // Styling: the workspace speaks the shared "liquid glass" language (ui_theme.h) instead of
 // stock ImGui chrome — glass children, accent-gradient section headers, tinted status
@@ -14,15 +23,20 @@
 // from palette roles only (gui_lint).
 //
 // GL-thread rules honored throughout: every engine call is ASYNC (st.rpc.call + callbacks
-// run in the drain), listing is throttled, and nothing grabs focus per-frame.
+// run in the drain), listing is throttled, and nothing grabs focus per-frame. Every new
+// fw_debug_gdb_*/fw_serial_*/fw_avr_flash/fw_emulate_* control degrades gracefully — an
+// unknown-RPC error just surfaces as text in the relevant console instead of hiding the
+// control (the backend doctor still gates Flash/Debug on fw_status like before).
 #include "fw_workspace.h"
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -30,8 +44,10 @@
 #include <nlohmann/json.hpp>
 
 #include "core/app_state.h"
+#include "ui/copilot/copilot.h"
 #include "ui/icons.h"
 #include "ui/metrics.h"
+#include "ui/panel_collapse.h"
 #include "ui_theme.h"
 
 namespace ui {
@@ -78,7 +94,7 @@ struct FwState {
     std::string buildStderr, elfPath;
     double buildMs = 0.0;
 
-    // ---- emulation (fw_sim_run) ----
+    // ---- emulation (fw_sim_run / fw_emulate_renode / fw_emulate_simavr) ----
     bool simPending = false, simDone = false, simPassed = false;
     std::string uartLog, simErr, tracePath;
     double simMs = 0.0;
@@ -86,10 +102,40 @@ struct FwState {
     std::vector<GpioEvent> gpio;
     char assertBuf[256] = "";
 
-    // ---- hardware rail (fw_flash / fw_debug_*) ----
+    // ---- hardware rail (fw_flash / fw_avr_flash / fw_debug_start / fw_debug_halt) ----
     char chipBuf[64] = "STM32F407VGTx";
     bool hwPending = false;
     std::string hwOut;
+
+    // ---- unified target bar ----
+    char portBuf[64] = "";           // serial device, e.g. /dev/ttyACM0 — shared by
+                                      // fw_avr_flash and fw_serial_open
+    bool focusDebugTabOnce = false;  // top-bar "Debug" jumps the center tab strip
+    bool focusMonitorDockOnce = false;  // top-bar "Monitor" jumps the bottom dock strip
+
+    // ---- editor tab: read-only source preview (local disk, click-triggered) ----
+    int editorSelSrc = -1;
+    std::string editorContent, editorErr, editorPath;
+
+    // ---- debug tab: gdb console (fw_debug_gdb_*) ----
+    bool gdbPending = false;
+    std::string gdbConsole;   // running transcript of every gdb command's raw output
+    char bpFileLine[128] = "";
+    struct Breakpoint { std::string loc, status; bool pending = false; };
+    std::vector<Breakpoint> breakpoints;
+    char memAddrBuf[32] = "0x20000000";
+    char memLenBuf[16] = "64";
+    std::string memDump, memErr;
+
+    // ---- serial monitor (fw_serial_*) ----
+    bool serialOpen = false, serialPending = false;
+    std::string serialLog, serialErr;
+    char serialSendBuf[256] = "";
+    double lastSerialPollT = -1e9;
+
+    // ---- bottom dock ----
+    bool dockCollapsed = false;
+    ui::PanelCollapseAnim dockAnim;
 };
 
 static FwState& S() {
@@ -405,7 +451,8 @@ static void loadTraceArtifact(FwState& s) {
     }
 }
 
-// Apply a SimResult payload (contract §4/§7.1) to the state.
+// Apply a SimResult payload (contract §4/§7.1) to the state. Shared by fw_sim_run and the
+// backend-specific fw_emulate_renode / fw_emulate_simavr entry points — same result shape.
 static void applySimResult(FwState& s, const nlohmann::json& j) {
     s.simDone   = true;
     s.simPassed = j.value("passed", false);
@@ -484,7 +531,351 @@ bool firmwareProjectsExistOnDisk() {
     return cached;
 }
 
-// ---- left rail: projects + sources -------------------------------------------------------
+// ---- unified IDE triggers: build / flash / debug / emulate / serial ---------------------
+// Every one of these is a thin ASYNC wrapper over st.rpc.call — none ever block the GL
+// thread, and every completion callback captures nothing but small values (indices/strings),
+// reaching state ONLY through S() so it stays valid even if the AppState& that triggered the
+// call has moved on by the time the worker replies.
+
+// Generic {success, output/reason} envelope -> a one-line status string in s.hwOut (the
+// existing fw_flash/fw_debug_start/fw_debug_halt convention, now shared by fw_avr_flash too).
+static void hwCall(AppState& st, const char* method, nlohmann::json p) {
+    FwState& s = S();
+    s.hwPending = true;
+    s.hwOut.clear();
+    st.rpc.call(method, std::move(p), [](const core::RpcResult& r) {
+        FwState& s2 = S();
+        s2.hwPending = false;
+        if (!r.ok) { s2.hwOut = r.err.empty() ? "worker unreachable" : r.err; return; }
+        const auto& j = r.result;
+        if (!j.is_object()) { s2.hwOut = "unexpected result"; return; }
+        if (j.contains("code")) { s2.hwOut = j.value("message", std::string("failed")); return; }
+        std::string out = j.value("success", false) ? "OK" : "failed";
+        const std::string detail = j.contains("output") ? j.value("output", std::string())
+                                                          : j.value("reason", std::string());
+        if (!detail.empty()) out += ": " + detail;
+        s2.hwOut = out;
+    });
+}
+
+static void triggerBuild(AppState& st) {
+    FwState& s = S();
+    if (s.selected < 0 || s.selected >= (int)s.projects.size() || s.buildPending) return;
+    s.buildPending = true;
+    s.buildDone = false;
+    s.warnings.clear(); s.buildStderr.clear(); s.elfPath.clear();
+    nlohmann::json p{{"project_id", s.projects[s.selected].id}};
+    st.rpc.call("fw_build", std::move(p), [](const core::RpcResult& r) {
+        FwState& s2 = S();
+        s2.buildPending = false;
+        s2.buildDone = true;
+        if (!r.ok || !r.result.is_object()) {
+            s2.buildOk = false;
+            s2.buildStderr = r.err.empty() ? "worker unreachable" : r.err;
+            return;
+        }
+        const auto& j = r.result;
+        if (j.contains("code")) {   // error envelope (unknown project, ...)
+            s2.buildOk = false;
+            s2.buildStderr = j.value("message", std::string("build failed"));
+            return;
+        }
+        s2.buildOk = j.value("success", false);
+        s2.buildStderr = j.value("stderr", std::string());
+        s2.buildMs = j.value("ms", 0.0);
+        if (j.contains("elf_path") && j["elf_path"].is_string())
+            s2.elfPath = j["elf_path"].get<std::string>();
+        if (j.contains("warnings") && j["warnings"].is_array())
+            for (const auto& w : j["warnings"])
+                if (w.is_string()) s2.warnings.push_back(w.get<std::string>());
+    });
+}
+
+// Picks fw_avr_flash for avr-family projects (needs a serial port for avrdude-style
+// flashing), else the existing probe-rs fw_flash path.
+static void triggerFlash(AppState& st) {
+    FwState& s = S();
+    if (s.hwPending || s.elfPath.empty()) return;
+    const bool avr = s.selected >= 0 && s.selected < (int)s.projects.size() &&
+                     s.projects[s.selected].mcu == "avr";
+    nlohmann::json p{{"elf_path", s.elfPath}, {"chip", std::string(s.chipBuf)}};
+    if (avr && s.portBuf[0]) p["port"] = std::string(s.portBuf);
+    hwCall(st, avr ? "fw_avr_flash" : "fw_flash", std::move(p));
+}
+
+// gdb console call: fw_debug_gdb_reset/halt/step/set_breakpoint/read_mem all share the
+// generic {success, output, returncode, cmd, ms} envelope — no structured registers/
+// callstack/vars in that shape, so the raw "output" text is what surfaces (in the caller's
+// own display AND the shared GDB Console dock tab transcript).
+static void gdbCall(AppState& st, const char* method, nlohmann::json p,
+                    std::function<void(bool ok, const std::string& out)> onDone = nullptr) {
+    FwState& s = S();
+    s.gdbPending = true;
+    std::string cmdLabel = method;
+    st.rpc.call(method, std::move(p), [onDone, cmdLabel](const core::RpcResult& r) {
+        FwState& s2 = S();
+        s2.gdbPending = false;
+        bool ok = false;
+        std::string text;
+        if (!r.ok || !r.result.is_object()) {
+            text = r.err.empty() ? "worker unreachable" : r.err;
+        } else if (r.result.contains("code")) {
+            text = r.result.value("message", std::string("unavailable"));
+        } else {
+            const auto& j = r.result;
+            ok = j.value("success", false);
+            text = j.contains("output") ? j.value("output", std::string())
+                                        : j.value("reason", std::string());
+        }
+        std::string line = "$ " + cmdLabel + "\n" + (ok ? "OK" : "FAILED");
+        if (!text.empty()) line += "\n" + text;
+        if (!s2.gdbConsole.empty()) s2.gdbConsole += "\n";
+        s2.gdbConsole += line;
+        if (s2.gdbConsole.size() > 32000)   // cap the transcript so it never runs away
+            s2.gdbConsole.erase(0, s2.gdbConsole.size() - 32000);
+        if (onDone) onDone(ok, text);
+    });
+}
+
+// Split the ';'-separated scenario text (assertBuf) into an assertion array. Shared by
+// fw_sim_run and the two backend-specific emulate RPCs.
+static nlohmann::json parseAssertionBuf(const char* buf) {
+    nlohmann::json asserts = nlohmann::json::array();
+    std::string s(buf);
+    size_t start = 0;
+    while (start <= s.size()) {
+        size_t end = s.find(';', start);
+        std::string tok = s.substr(start, end == std::string::npos ? std::string::npos
+                                                                   : end - start);
+        const size_t a = tok.find_first_not_of(" \t");
+        const size_t b = tok.find_last_not_of(" \t");
+        if (a != std::string::npos) asserts.push_back(tok.substr(a, b - a + 1));
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+    return asserts;
+}
+
+static void runEmulation(AppState& st, const char* method) {
+    FwState& s = S();
+    if (s.selected < 0 || s.selected >= (int)s.projects.size() || s.simPending) return;
+    s.simPending = true;
+    s.simDone = false;
+    s.uartLog.clear(); s.assertionLines.clear(); s.gpio.clear();
+    s.tracePath.clear(); s.simErr.clear();
+    nlohmann::json p{{"project_id", s.projects[s.selected].id}};
+    nlohmann::json asserts = parseAssertionBuf(s.assertBuf);
+    if (!asserts.empty()) p["assertions"] = asserts;
+    st.rpc.call(method, std::move(p), [](const core::RpcResult& r) {
+        FwState& s2 = S();
+        s2.simPending = false;
+        if (!r.ok || !r.result.is_object()) {
+            s2.simDone = true;
+            s2.simPassed = false;
+            s2.simErr = r.err.empty() ? "worker unreachable" : r.err;
+            return;
+        }
+        if (r.result.contains("code")) {
+            s2.simDone = true;
+            s2.simPassed = false;
+            s2.simErr = r.result.value("message", std::string("emulation failed"));
+            return;
+        }
+        applySimResult(s2, r.result);
+    });
+}
+
+// Read-only source preview: local disk, one-shot on user click (same justification as
+// loadTraceArtifact — not per-frame, so a sync ifstream on the GL thread is fine).
+static void loadEditorFile(FwState& s, const FwProject& p, const std::string& rel) {
+    s.editorContent.clear();
+    s.editorErr.clear();
+    s.editorPath = rel;
+    namespace fs = std::filesystem;
+    const fs::path full = p.rootDir.empty() ? fs::path(rel) : fs::path(p.rootDir) / rel;
+    std::ifstream f(full, std::ios::binary);
+    if (!f.good()) { s.editorErr = "Could not open " + full.string(); return; }
+    std::ostringstream oss;
+    oss << f.rdbuf();
+    std::string content = oss.str();
+    constexpr size_t kMax = 96 * 1024;   // cap huge files so the preview never lags a frame
+    if (content.size() > kMax) {
+        content.resize(kMax);
+        content += "\n...(truncated)...\n";
+    }
+    s.editorContent = std::move(content);
+}
+
+// ---- serial monitor (fw_serial_*) --------------------------------------------------------
+
+static void triggerSerialOpen(AppState& st) {
+    FwState& s = S();
+    if (s.serialPending || s.serialOpen) return;
+    s.serialPending = true;
+    s.serialErr.clear();
+    nlohmann::json p{{"port", std::string(s.portBuf)}, {"baud", 115200}};
+    st.rpc.call("fw_serial_open", std::move(p), [](const core::RpcResult& r) {
+        FwState& s2 = S();
+        s2.serialPending = false;
+        if (!r.ok || !r.result.is_object()) {
+            s2.serialErr = r.err.empty() ? "worker unreachable" : r.err;
+            return;
+        }
+        if (r.result.contains("code")) {
+            s2.serialErr = r.result.value("message", std::string("open failed"));
+            return;
+        }
+        s2.serialOpen = r.result.value("success", false);
+        if (!s2.serialOpen) s2.serialErr = r.result.value("reason", std::string("open failed"));
+    });
+}
+
+static void triggerSerialClose(AppState& st) {
+    FwState& s = S();
+    if (s.serialPending) return;
+    s.serialPending = true;
+    st.rpc.call("fw_serial_close", nlohmann::json::object(), [](const core::RpcResult& r) {
+        FwState& s2 = S();
+        s2.serialPending = false;
+        s2.serialOpen = false;   // always end locally — a failed close still frees the UI
+        (void)r;
+    });
+}
+
+static void triggerSerialSend(AppState& st) {
+    FwState& s = S();
+    if (!s.serialOpen || !s.serialSendBuf[0]) return;
+    std::string data(s.serialSendBuf);
+    s.serialSendBuf[0] = '\0';
+    st.rpc.call("fw_serial_write", {{"data", data}}, [](const core::RpcResult& r) {
+        FwState& s2 = S();
+        if (!r.ok) { s2.serialErr = r.err.empty() ? "worker unreachable" : r.err; return; }
+        if (r.result.is_object() && r.result.contains("code"))
+            s2.serialErr = r.result.value("message", std::string("write failed"));
+    });
+}
+
+// Throttled poll while the port is open — mirrors loadStatus/loadProjects's pattern, just on
+// a much shorter period since serial data is latency-sensitive.
+static void pollSerial(AppState& st) {
+    FwState& s = S();
+    if (!s.serialOpen || s.serialPending || !st.workerStarted) return;
+    const double now = ImGui::GetTime();
+    if (now - s.lastSerialPollT < 0.2) return;
+    s.serialPending = true;
+    s.lastSerialPollT = now;
+    st.rpc.call("fw_serial_read", nlohmann::json::object(), [](const core::RpcResult& r) {
+        FwState& s2 = S();
+        s2.serialPending = false;
+        if (!r.ok || !r.result.is_object()) {
+            s2.serialErr = r.err.empty() ? "worker unreachable" : r.err;
+            return;
+        }
+        if (r.result.contains("code")) {
+            s2.serialErr = r.result.value("message", std::string("read failed"));
+            return;
+        }
+        if (!r.result.value("success", true)) {
+            s2.serialErr = r.result.value("reason", std::string("read failed"));
+            return;
+        }
+        const std::string data = r.result.value("data", r.result.value("output", std::string()));
+        if (!data.empty()) {
+            s2.serialLog += data;
+            s2.serialErr.clear();
+            constexpr size_t kMax = 64 * 1024;
+            if (s2.serialLog.size() > kMax) s2.serialLog.erase(0, s2.serialLog.size() - kMax);
+        }
+    });
+}
+
+// ---- target bar: Board/MCU + Toolchain + Port .. Build / Flash / Debug / Monitor ---------
+
+static void drawTargetBar(AppState& st) {
+    FwState& s = S();
+    const float sc = ui::uiScale;
+    const bool haveProject = s.selected >= 0 && s.selected < (int)s.projects.size();
+
+    ui::pushGlassChildStyle(10.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12 * sc, 8 * sc));
+    ImGui::BeginChild("##fw_targetbar", ImVec2(0, ImGui::GetFrameHeight() + 16.0f * sc),
+                      ImGuiChildFlags_Border);
+    ImGui::PopStyleVar();
+
+    const float rowStartX = ImGui::GetCursorPosX();
+    const float contentMaxX = rowStartX + ImGui::GetContentRegionAvail().x;
+
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextDisabled("Board/MCU");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(150.0f * sc);
+    ImGui::InputText("##fw_target_chip", s.chipBuf, sizeof(s.chipBuf));
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Target chip id used by Flash/Debug (probe-rs style, e.g. "
+                          "STM32F407VGTx)");
+
+    ImGui::SameLine(0.0f, 16.0f * sc);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextDisabled("Toolchain");
+    ImGui::SameLine();
+    ImGui::TextUnformatted(haveProject && !s.projects[s.selected].toolchain.empty()
+                           ? s.projects[s.selected].toolchain.c_str() : "-");
+
+    ImGui::SameLine(0.0f, 16.0f * sc);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextDisabled("Port");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(130.0f * sc);
+    ImGui::InputTextWithHint("##fw_target_port", "/dev/ttyACM0", s.portBuf, sizeof(s.portBuf));
+
+    // Right-aligned action cluster: Build / Flash / Debug / Monitor.
+    const float bw = 84.0f * sc;
+    const float gap = 8.0f * sc;
+    const float clusterW = bw * 4.0f + gap * 3.0f;
+    ImGui::SameLine(0.0f, 0.0f);
+    ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(), contentMaxX - clusterW));
+
+    const bool canBuildGo = haveProject && st.workerStarted && !s.buildPending &&
+                            (!s.statusLoaded || s.canBuild);
+    if (fwGlassButton("##fw_tb_build", s.buildPending ? "Building\xe2\x80\xa6" : "Build",
+                      "eng_firm", /*accent=*/true, bw, canBuildGo))
+        triggerBuild(st);
+    if (!canBuildGo && s.statusLoaded && !s.canBuild && ImGui::IsItemHovered())
+        ImGui::SetTooltip("Toolchain missing — see Backend panel for fw_status guidance");
+    ImGui::SameLine(0.0f, gap);
+
+    const bool canFlashGo = haveProject && st.workerStarted && !s.hwPending &&
+                            !s.elfPath.empty() && (!s.statusLoaded || s.canFlash);
+    if (fwGlassButton("##fw_tb_flash", s.hwPending ? "\xe2\x80\xa6" : "Flash", "issue_bug",
+                      /*accent=*/false, bw, canFlashGo))
+        triggerFlash(st);
+    if (!canFlashGo && ImGui::IsItemHovered()) {
+        if (s.elfPath.empty()) ImGui::SetTooltip("Build first — the last successful ELF is flashed");
+        else if (s.statusLoaded && !s.canFlash)
+            ImGui::SetTooltip("Flashing unavailable — see Backend panel for fw_status guidance");
+    }
+    ImGui::SameLine(0.0f, gap);
+
+    if (fwGlassButton("##fw_tb_debug", "Debug", "run_study", /*accent=*/false, bw,
+                      st.workerStarted)) {
+        s.focusDebugTabOnce = true;
+    }
+    ImGui::SameLine(0.0f, gap);
+
+    if (fwGlassButton("##fw_tb_monitor", s.serialOpen ? "Monitor*" : "Monitor", "activity",
+                      /*accent=*/false, bw, st.workerStarted)) {
+        s.focusMonitorDockOnce = true;
+        s.dockCollapsed = false;
+        if (!s.serialOpen && !s.serialPending && s.portBuf[0]) triggerSerialOpen(st);
+    }
+    if (!s.portBuf[0] && !s.serialOpen && ImGui::IsItemHovered())
+        ImGui::SetTooltip("Set a Port above to auto-open the serial monitor");
+
+    ImGui::EndChild();
+    ui::popGlassChildStyle();
+}
+
+// ---- left rail: project/board tree + sources + pinmap + backend doctor ------------------
 
 static void drawProjectRail(AppState& st, float w) {
     FwState& s = S();
@@ -552,6 +943,11 @@ static void drawProjectRail(AppState& st, float w) {
                     s.simDone = false;
                     s.uartLog.clear(); s.assertionLines.clear(); s.gpio.clear();
                     s.tracePath.clear();
+                    s.editorSelSrc = -1;
+                    s.editorContent.clear(); s.editorErr.clear(); s.editorPath.clear();
+                    s.breakpoints.clear();
+                    s.gdbConsole.clear();
+                    s.memDump.clear(); s.memErr.clear();
                 }
             }
             ImGui::PopID();
@@ -573,102 +969,232 @@ static void drawProjectRail(AppState& st, float w) {
             ImGui::TextWrapped("%s", p.rootDir.c_str());
         }
     }
+
+    // Pinmap: no dedicated pin-assignment RPC exists yet, so this surfaces pins OBSERVED
+    // during the last emulation trace rather than a synthesized full chip pinout — an
+    // honest, graceful stand-in until a real fw_pinmap-style RPC lands.
+    ImGui::Spacing();
+    fwSectionHeader("cat_electronics", "Pinmap (observed)");
+    if (s.gpio.empty()) {
+        ImGui::TextDisabled("Run an emulation (Emulate tab) to populate observed pins.");
+    } else {
+        std::vector<std::string> pins;
+        for (const GpioEvent& e : s.gpio)
+            if (std::find(pins.begin(), pins.end(), e.pin) == pins.end()) pins.push_back(e.pin);
+        for (const std::string& pin : pins) ImGui::BulletText("%s", pin.c_str());
+    }
+
+    // Backend doctor (fw_status) — moved here from the old right rail now that the right
+    // column hosts the AI Copilot pane. Flash/Debug actions themselves live in the target
+    // bar + Debug tab; this stays the honest-gating status readout.
+    ImGui::Spacing();
+    fwHeaderAction(s.statusPending ? "..." : "Recheck", 68.0f * sc,
+                   [&st]() { loadStatus(st, /*force=*/true); });
+    fwSectionHeader("health_check", "Backend");
+    if (!s.statusLoaded) {
+        ImGui::TextDisabled(s.statusErr.empty() ? "Checking fw_status\xe2\x80\xa6"
+                                                : s.statusErr.c_str());
+    } else {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const float dotR = 4.0f * sc;
+        for (const FwState::ToolRow& t : s.tools) {
+            const ImVec2 rp = ImGui::GetCursorScreenPos();
+            const float rowH = ImGui::GetFrameHeight();
+            const ImVec2 c(rp.x + dotR + 2.0f * sc, rp.y + rowH * 0.5f);
+            if (t.found) {
+                dl->AddCircleFilled(c, dotR + 2.5f * sc,
+                                    ImGui::GetColorU32(ImVec4(palette.statusOk[0],
+                                        palette.statusOk[1], palette.statusOk[2], 0.18f)));
+                dl->AddCircleFilled(c, dotR, palette.toU32(palette.statusOk));
+            } else {
+                dl->AddCircle(c, dotR, palette.toU32(palette.textDisabled), 0,
+                              ui::metrics::stroke(1.0f));
+            }
+            ImGui::Dummy(ImVec2(dotR * 2.0f + 10.0f * sc, rowH));
+            ImGui::SameLine(0.0f, 0.0f);
+            if (t.found) ImGui::TextUnformatted(t.name.c_str());
+            else         ImGui::TextDisabled("%s", t.name.c_str());
+            if (!t.info.empty() && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", t.info.c_str());
+        }
+        for (const std::string& b : s.banners) {
+            ImGui::Spacing();
+            fwBanner(b.c_str(), palette.statusWarn);
+        }
+    }
+
     ImGui::EndChild();
     ui::popGlassChildStyle();
 }
 
-// ---- center: build console + emulation + trace viewer ------------------------------------
+// ---- center tab: Editor (read-only source preview) --------------------------------------
 
-static void drawBuildSection(AppState& st, float h) {
+static void drawEditorTab(AppState& st) {
     FwState& s = S();
     const float sc = ui::uiScale;
-    ImGui::BeginChild("##fw_build_sec", ImVec2(0, h), ImGuiChildFlags_None);
-    fwSectionHeader("eng_firm", "Build");
-
     const bool haveProject = s.selected >= 0 && s.selected < (int)s.projects.size();
-    if (s.statusLoaded && !s.canBuild) {
-        // Honest gating: no dead Build button — the doctor's guidance instead.
-        fwBanner("Toolchain missing — install cmake + arm-none-eabi-gcc "
-                 "(see Backend panel for fw_status guidance).", palette.statusWarn);
+    if (!haveProject) {
+        ImGui::TextDisabled("Select a project on the left to browse its sources.");
+        return;
+    }
+    const FwProject& p = s.projects[s.selected];
+
+    const float listW = 190.0f * sc;
+    ui::pushGlassChildStyle(8.0f);
+    ImGui::BeginChild("##fw_editor_list", ImVec2(listW, 0), ImGuiChildFlags_Border);
+    fwSectionHeader(nullptr, "Sources");
+    if (p.srcs.empty()) {
+        ImGui::TextDisabled("(none registered)");
     } else {
-        const bool canGo = haveProject && st.workerStarted && !s.buildPending;
-        if (fwGlassButton("##fw_build_btn",
-                          s.buildPending ? "Building\xe2\x80\xa6" : "Build",
-                          "eng_firm", /*accent=*/true, 0.0f, canGo)) {
-            s.buildPending = true;
-            s.buildDone = false;
-            s.warnings.clear(); s.buildStderr.clear(); s.elfPath.clear();
-            nlohmann::json p{{"project_id", s.projects[s.selected].id}};
-            st.rpc.call("fw_build", p, [](const core::RpcResult& r) {
-                FwState& s2 = S();
-                s2.buildPending = false;
-                s2.buildDone = true;
-                if (!r.ok || !r.result.is_object()) {
-                    s2.buildOk = false;
-                    s2.buildStderr = r.err.empty() ? "worker unreachable" : r.err;
-                    return;
-                }
-                const auto& j = r.result;
-                if (j.contains("code")) {   // error envelope (unknown project, ...)
-                    s2.buildOk = false;
-                    s2.buildStderr = j.value("message", std::string("build failed"));
-                    return;
-                }
-                s2.buildOk = j.value("success", false);
-                s2.buildStderr = j.value("stderr", std::string());
-                s2.buildMs = j.value("ms", 0.0);
-                if (j.contains("elf_path") && j["elf_path"].is_string())
-                    s2.elfPath = j["elf_path"].get<std::string>();
-                if (j.contains("warnings") && j["warnings"].is_array())
-                    for (const auto& w : j["warnings"])
-                        if (w.is_string()) s2.warnings.push_back(w.get<std::string>());
-            });
-        }
-        if (!canGo && !haveProject && ImGui::IsItemHovered())
-            ImGui::SetTooltip("Select a project first");
-        if (s.buildDone) {
-            ImGui::SameLine(0.0f, 10.0f * sc);
-            if (s.buildOk) {
-                char buf[96];
-                std::snprintf(buf, sizeof(buf), "OK  \xc2\xb7  %.0f ms  \xc2\xb7  %zu warning(s)",
-                              s.buildMs, s.warnings.size());
-                fwStatusPill(buf, palette.statusOk);
-            } else {
-                fwStatusPill("FAILED", palette.statusErr);
+        for (int i = 0; i < (int)p.srcs.size(); ++i) {
+            ImGui::PushID(i);
+            if (ImGui::Selectable(p.srcs[i].c_str(), s.editorSelSrc == i)) {
+                s.editorSelSrc = i;
+                loadEditorFile(s, p, p.srcs[i]);
             }
+            ImGui::PopID();
         }
     }
+    ImGui::EndChild();
+    ui::popGlassChildStyle();
 
-    // Parsed-warnings console (monospace, glass).
+    ImGui::SameLine(0.0f, 8.0f * sc);
     ui::pushGlassChildStyle(8.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10 * sc, 8 * sc));
-    ImGui::BeginChild("##fw_build_console", ImVec2(0, 0), ImGuiChildFlags_Border);
+    ImGui::BeginChild("##fw_editor_view", ImVec2(0, 0), ImGuiChildFlags_Border);
     ImGui::PopStyleVar();
-    if (st.fonts.mono) ImGui::PushFont(st.fonts.mono);
-    if (!s.buildDone && !s.buildPending) {
-        ImGui::TextDisabled("Build output appears here.");
+    if (s.editorSelSrc < 0) {
+        ImGui::TextDisabled("Pick a source file on the left to preview it here.\n"
+                            "(Read-only preview for now — edit in your external editor.)");
+    } else if (!s.editorErr.empty()) {
+        fwBanner(s.editorErr.c_str(), palette.statusErr);
     } else {
-        for (const std::string& w : s.warnings) {
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.consoleWarn[0],
-                                                        palette.consoleWarn[1],
-                                                        palette.consoleWarn[2], 1));
-            ImGui::TextWrapped("%s", w.c_str());
-            ImGui::PopStyleColor();
-        }
-        if (!s.buildStderr.empty()) {
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.consoleDim[0],
-                                                        palette.consoleDim[1],
-                                                        palette.consoleDim[2], 1));
-            ImGui::TextWrapped("%s", s.buildStderr.c_str());
-            ImGui::PopStyleColor();
-        }
-        if (!s.elfPath.empty()) ImGui::TextDisabled("ELF: %s", s.elfPath.c_str());
+        ImGui::TextDisabled("%s", s.editorPath.c_str());
+        ImGui::Separator();
+        if (st.fonts.mono) ImGui::PushFont(st.fonts.mono);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.consoleDefault[0],
+                                                    palette.consoleDefault[1],
+                                                    palette.consoleDefault[2], 1));
+        ImGui::TextUnformatted(s.editorContent.c_str());
+        ImGui::PopStyleColor();
+        if (st.fonts.mono) ImGui::PopFont();
     }
+    ImGui::EndChild();
+    ui::popGlassChildStyle();
+}
+
+// ---- center tab: Debug (fw_debug_gdb_* console) ------------------------------------------
+
+static void drawDebugTab(AppState& st) {
+    FwState& s = S();
+    const float sc = ui::uiScale;
+    const bool haveProject = s.selected >= 0 && s.selected < (int)s.projects.size();
+
+    if (s.statusLoaded && !s.canFlash) {
+        fwBanner("Debug backend unavailable: `cargo install probe-rs-tools` (Cortex-M) or "
+                 "`pip install esptool` (ESP32). The controls below still degrade to a "
+                 "per-command error instead of hiding.", palette.statusWarn);
+    }
+    ImGui::TextDisabled("Target: %s", s.chipBuf[0] ? s.chipBuf : "(set a chip in the target bar)");
+
+    ImGui::Spacing();
+    fwSectionHeader("run_study", "Session");
+    const bool canHw = st.workerStarted && !s.hwPending && s.chipBuf[0] != '\0';
+    const float bw2 = 130.0f * sc;
+    if (fwGlassButton("##fw_dbg_run", s.hwPending ? "Working\xe2\x80\xa6" : "Reset + run",
+                      "run_study", /*accent=*/true, bw2, canHw && haveProject))
+        hwCall(st, "fw_debug_start", {{"chip", std::string(s.chipBuf)}});
+    ImGui::SameLine(0.0f, 8.0f * sc);
+    if (fwGlassButton("##fw_dbg_halt2", "Halt", nullptr, /*accent=*/false, bw2, canHw))
+        hwCall(st, "fw_debug_halt", {{"chip", std::string(s.chipBuf)}});
+    if (!s.hwOut.empty()) {
+        ImGui::Spacing();
+        fwBanner(s.hwOut.c_str(), s.hwOut.rfind("OK", 0) == 0 ? palette.statusOk
+                                                              : palette.statusErr);
+    }
+
+    ImGui::Spacing();
+    fwSectionHeader("health_check", "GDB controls");
+    const bool gdbGo = st.workerStarted && !s.gdbPending;
+    const float bw = 88.0f * sc;
+    if (fwGlassButton("##fw_gdb_reset", "Reset", nullptr, /*accent=*/false, bw, gdbGo))
+        gdbCall(st, "fw_debug_gdb_reset", {{"chip", std::string(s.chipBuf)}});
+    ImGui::SameLine();
+    if (fwGlassButton("##fw_gdb_halt", "Halt", nullptr, /*accent=*/false, bw, gdbGo))
+        gdbCall(st, "fw_debug_gdb_halt", {{"chip", std::string(s.chipBuf)}});
+    ImGui::SameLine();
+    if (fwGlassButton("##fw_gdb_step", "Step", nullptr, /*accent=*/false, bw, gdbGo))
+        gdbCall(st, "fw_debug_gdb_step", {{"chip", std::string(s.chipBuf)}});
+
+    ImGui::Spacing();
+    fwSectionHeader("milestone_flag", "Breakpoints");
+    const float addW = fwGlassButtonWidth("Add", nullptr);
+    ImGui::SetNextItemWidth(-(addW + 8.0f * sc));
+    ImGui::InputTextWithHint("##fw_bp_loc", "file:line, e.g. main.c:42", s.bpFileLine,
+                             sizeof(s.bpFileLine));
+    ImGui::SameLine(0.0f, 8.0f * sc);
+    if (fwGlassButton("##fw_bp_add", "Add", nullptr, /*accent=*/true, addW,
+                      gdbGo && s.bpFileLine[0] != '\0')) {
+        FwState::Breakpoint bp;
+        bp.loc = s.bpFileLine;
+        bp.pending = true;
+        s.breakpoints.push_back(bp);
+        const int idx = (int)s.breakpoints.size() - 1;
+        const std::string loc = s.bpFileLine;
+        gdbCall(st, "fw_debug_gdb_set_breakpoint", {{"location", loc}},
+                [idx](bool ok, const std::string& out) {
+            FwState& s3 = S();
+            if (idx >= 0 && idx < (int)s3.breakpoints.size()) {
+                s3.breakpoints[idx].pending = false;
+                s3.breakpoints[idx].status = ok ? "set" : (out.empty() ? "failed" : out);
+            }
+        });
+        s.bpFileLine[0] = '\0';
+    }
+    if (s.breakpoints.empty()) {
+        ImGui::TextDisabled("No breakpoints yet.");
+    } else {
+        for (const FwState::Breakpoint& bp : s.breakpoints) {
+            const std::string label = bp.pending ? "..." : (bp.status.empty() ? "?" : bp.status);
+            ImGui::BulletText("%s  [%s]", bp.loc.c_str(), label.c_str());
+        }
+    }
+
+    ImGui::Spacing();
+    fwSectionHeader(nullptr, "Memory");
+    ImGui::SetNextItemWidth(120.0f * sc);
+    ImGui::InputText("##fw_mem_addr", s.memAddrBuf, sizeof(s.memAddrBuf));
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(64.0f * sc);
+    ImGui::InputText("##fw_mem_len", s.memLenBuf, sizeof(s.memLenBuf));
+    ImGui::SameLine();
+    if (fwGlassButton("##fw_mem_read", "Read", nullptr, /*accent=*/true, 64.0f * sc, gdbGo)) {
+        int len = (int)std::strtol(s.memLenBuf, nullptr, 10);
+        if (len <= 0) len = 64;
+        s.memErr.clear();
+        gdbCall(st, "fw_debug_gdb_read_mem",
+                {{"address", std::string(s.memAddrBuf)}, {"length", len}},
+                [](bool ok, const std::string& out) {
+            FwState& s3 = S();
+            if (ok) { s3.memDump = out; s3.memErr.clear(); }
+            else    { s3.memErr = out.empty() ? "read failed" : out; }
+        });
+    }
+    ui::pushGlassChildStyle(6.0f);
+    ImGui::BeginChild("##fw_mem_dump", ImVec2(0, 90.0f * sc), ImGuiChildFlags_Border);
+    if (st.fonts.mono) ImGui::PushFont(st.fonts.mono);
+    if (!s.memErr.empty()) ImGui::TextWrapped("%s", s.memErr.c_str());
+    else if (s.memDump.empty()) ImGui::TextDisabled("Memory reads appear here.");
+    else ImGui::TextUnformatted(s.memDump.c_str());
     if (st.fonts.mono) ImGui::PopFont();
     ImGui::EndChild();
     ui::popGlassChildStyle();
-    ImGui::EndChild();
+
+    ImGui::Spacing();
+    ImGui::TextDisabled("Registers / call stack / locals: no dedicated RPC on this build yet —\n"
+                        "Reset/Halt/Step/Memory results stream into the GDB Console dock tab.");
 }
+
+// ---- center tab: Emulate (fw_sim_run / fw_emulate_renode / fw_emulate_simavr) ------------
 
 static void drawEmulationSection(AppState& st, float h) {
     FwState& s = S();
@@ -679,65 +1205,41 @@ static void drawEmulationSection(AppState& st, float h) {
     if (haveProject) {
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.textDim[0], palette.textDim[1],
                                                     palette.textDim[2], 1));
-        ImGui::Text("platform: %s  (Renode preferred, QEMU fallback)",
+        ImGui::Text("platform: %s  (Renode preferred, QEMU/simavr fallback)",
                     s.projects[s.selected].mcu.c_str());
         ImGui::PopStyleColor();
     }
 
     if (s.statusLoaded && !s.canEmulate) {
-        fwBanner("Emulation unavailable: install Renode (preferred) or qemu-system-arm.",
-                 palette.statusWarn);
+        fwBanner("Emulation unavailable: install Renode (preferred), simavr, or "
+                 "qemu-system-arm.", palette.statusWarn);
     } else {
         const char* runLabel = s.simPending ? "Running\xe2\x80\xa6" : "Run emulation";
         const float runW = fwGlassButtonWidth(runLabel, "run_study");
-        ImGui::SetNextItemWidth(-(runW + 8.0f * sc));
+        const float renodeW = fwGlassButtonWidth("Renode", "run_study");
+        const float avrW = fwGlassButtonWidth("simavr", "run_study");
+        ImGui::SetNextItemWidth(-(runW + renodeW + avrW + 24.0f * sc));
         ImGui::InputTextWithHint("##fw_asserts",
                                  "Scenario assertions, ';'-separated  e.g. uart:hello; gpio:PA5=1",
                                  s.assertBuf, sizeof(s.assertBuf));
-        ImGui::SameLine(0.0f, 8.0f * sc);
         const bool canGo = haveProject && st.workerStarted && !s.simPending;
-        if (fwGlassButton("##fw_sim_btn", runLabel, "run_study", /*accent=*/true, runW,
-                          canGo)) {
-            s.simPending = true;
-            s.simDone = false;
-            s.uartLog.clear(); s.assertionLines.clear(); s.gpio.clear();
-            s.tracePath.clear(); s.simErr.clear();
-            nlohmann::json p{{"project_id", s.projects[s.selected].id}};
-            // Split the ';'-separated scenario text into the assertion list.
-            nlohmann::json asserts = nlohmann::json::array();
-            std::string buf(s.assertBuf);
-            size_t start = 0;
-            while (start <= buf.size()) {
-                size_t end = buf.find(';', start);
-                std::string tok = buf.substr(
-                    start, end == std::string::npos ? std::string::npos : end - start);
-                const size_t a = tok.find_first_not_of(" \t");
-                const size_t b = tok.find_last_not_of(" \t");
-                if (a != std::string::npos) asserts.push_back(tok.substr(a, b - a + 1));
-                if (end == std::string::npos) break;
-                start = end + 1;
-            }
-            if (!asserts.empty()) p["assertions"] = asserts;
-            st.rpc.call("fw_sim_run", p, [](const core::RpcResult& r) {
-                FwState& s2 = S();
-                s2.simPending = false;
-                if (!r.ok || !r.result.is_object()) {
-                    s2.simDone = true;
-                    s2.simPassed = false;
-                    s2.simErr = r.err.empty() ? "worker unreachable" : r.err;
-                    return;
-                }
-                if (r.result.contains("code")) {
-                    s2.simDone = true;
-                    s2.simPassed = false;
-                    s2.simErr = r.result.value("message", std::string("emulation failed"));
-                    return;
-                }
-                applySimResult(s2, r.result);
-            });
-        }
+
+        ImGui::SameLine(0.0f, 8.0f * sc);
+        if (fwGlassButton("##fw_sim_btn", runLabel, "run_study", /*accent=*/true, runW, canGo))
+            runEmulation(st, "fw_sim_run");
         if (!canGo && !haveProject && ImGui::IsItemHovered())
             ImGui::SetTooltip("Select a project first");
+
+        // Backend-specific variants — same SimResult contract as fw_sim_run's auto-pick;
+        // useful when a project needs ONE backend forced (e.g. AVR chips only run under
+        // simavr, not Renode/QEMU).
+        ImGui::SameLine(0.0f, 6.0f * sc);
+        if (fwGlassButton("##fw_sim_renode", "Renode", "run_study", /*accent=*/false, renodeW,
+                          canGo))
+            runEmulation(st, "fw_emulate_renode");
+        ImGui::SameLine(0.0f, 6.0f * sc);
+        if (fwGlassButton("##fw_sim_avr", "simavr", "run_study", /*accent=*/false, avrW, canGo))
+            runEmulation(st, "fw_emulate_simavr");
     }
 
     if (s.simDone) {
@@ -889,102 +1391,240 @@ static void drawTraceViewer(AppState& st) {
     ImGui::EndChild();
 }
 
-// ---- right rail: backend doctor + gated flash/debug ---------------------------------------
+static void drawEmulateTab(AppState& st) {
+    const float availH = ImGui::GetContentRegionAvail().y;
+    drawEmulationSection(st, availH * 0.55f);
+    ImGui::Spacing();
+    drawTraceViewer(st);
+}
 
-static void drawBackendRail(AppState& st, float w) {
+// ---- center pane: tab strip (Editor | Debug | Emulate) -----------------------------------
+
+static void drawCenterTabs(AppState& st) {
+    FwState& s = S();
+    if (ImGui::BeginTabBar("##fw_center_tabs")) {
+        auto tf = [&](int idx) {
+            if (s.focusDebugTabOnce && idx == 1) {
+                s.focusDebugTabOnce = false;
+                return ImGuiTabItemFlags_SetSelected;
+            }
+            return ImGuiTabItemFlags_None;
+        };
+        if (ImGui::BeginTabItem("Editor", nullptr, tf(0))) { drawEditorTab(st); ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("Debug", nullptr, tf(1)))  { drawDebugTab(st);  ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("Emulate", nullptr, tf(2))) { drawEmulateTab(st); ImGui::EndTabItem(); }
+        ImGui::EndTabBar();
+    }
+}
+
+// ---- right pane: AI Copilot (reuses the docked Copilot's own chat state/send path) -------
+
+static void drawCopilotPane(AppState& st, float w) {
+    const float sc = ui::uiScale;
+    ui::pushGlassChildStyle(10.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10 * sc, 8 * sc));
+    ImGui::BeginChild("##fw_copilot", ImVec2(w, 0), ImGuiChildFlags_Border);
+    ImGui::PopStyleVar();
+
+    fwSectionHeader("ai_panel", "AI Copilot");
+
+    const bool busy = st.job.running.load();
+    const bool canRun = st.workerStarted && !busy;
+
+    // Same one-frame-lag composer-height trick the docked Copilot / AI workspace use, so the
+    // log fills exactly what the composer doesn't need.
+    static float s_composerH = 0.0f;
+    const float reserve = (s_composerH > 0.0f ? s_composerH
+                                               : ImGui::GetFrameHeightWithSpacing() * 4.0f) +
+                          10.0f * sc;
+    const float logH = std::max(80.0f * sc, ImGui::GetContentRegionAvail().y - reserve);
+
+    ImGui::BeginChild("##fw_copilot_log", ImVec2(0, logH), ImGuiChildFlags_None);
+    if (st.chat.empty()) {
+        ImGui::TextDisabled("Ask the copilot about this firmware project — it shares the "
+                            "same conversation as the docked panel.");
+    } else {
+        ui::chatDrawLog(st);
+        ui::chatLogStickToBottom();
+    }
+    ImGui::EndChild();
+
+    ImGui::Dummy(ImVec2(0, 4.0f * sc));
+    ImGui::BeginGroup();
+    ui::chatDrawComposer(st, busy, canRun);
+    ImGui::EndGroup();
+    s_composerH = ImGui::GetItemRectSize().y + 6.0f * sc;
+
+    ImGui::EndChild();
+    ui::popGlassChildStyle();
+}
+
+// ---- bottom dock: Build Log | Serial Monitor | Flash Progress | GDB Console --------------
+
+static void drawBuildLogDockTab(AppState& st) {
+    FwState& s = S();
+    if (s.buildDone) {
+        if (s.buildOk) {
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), "OK  \xc2\xb7  %.0f ms  \xc2\xb7  %zu warning(s)",
+                          s.buildMs, s.warnings.size());
+            fwStatusPill(buf, palette.statusOk);
+        } else {
+            fwStatusPill("FAILED", palette.statusErr);
+        }
+        ImGui::Spacing();
+    }
+    if (st.fonts.mono) ImGui::PushFont(st.fonts.mono);
+    if (!s.buildDone && !s.buildPending) {
+        ImGui::TextDisabled("Build output appears here. Use the Build button in the target bar.");
+    } else {
+        for (const std::string& w : s.warnings) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.consoleWarn[0],
+                                                        palette.consoleWarn[1],
+                                                        palette.consoleWarn[2], 1));
+            ImGui::TextWrapped("%s", w.c_str());
+            ImGui::PopStyleColor();
+        }
+        if (!s.buildStderr.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.consoleDim[0],
+                                                        palette.consoleDim[1],
+                                                        palette.consoleDim[2], 1));
+            ImGui::TextWrapped("%s", s.buildStderr.c_str());
+            ImGui::PopStyleColor();
+        }
+        if (!s.elfPath.empty()) ImGui::TextDisabled("ELF: %s", s.elfPath.c_str());
+    }
+    if (st.fonts.mono) ImGui::PopFont();
+}
+
+static void drawSerialDockTab(AppState& st) {
+    FwState& s = S();
+    const float sc = ui::uiScale;
+    if (!s.serialOpen) {
+        if (fwGlassButton("##fw_ser_open", s.serialPending ? "Opening\xe2\x80\xa6" : "Open port",
+                          "activity", /*accent=*/true, 120.0f * sc,
+                          st.workerStarted && !s.serialPending && s.portBuf[0] != '\0'))
+            triggerSerialOpen(st);
+        if (!s.portBuf[0] && ImGui::IsItemHovered())
+            ImGui::SetTooltip("Set a Port in the target bar first");
+    } else {
+        fwStatusPill("OPEN", palette.statusOk);
+        ImGui::SameLine(0.0f, 10.0f * sc);
+        if (fwGlassButton("##fw_ser_close", "Close", nullptr, /*accent=*/false, 90.0f * sc,
+                          st.workerStarted && !s.serialPending))
+            triggerSerialClose(st);
+    }
+    if (!s.serialErr.empty()) {
+        ImGui::SameLine(0.0f, 10.0f * sc);
+        ImGui::TextDisabled("%s", s.serialErr.c_str());
+    }
+
+    ui::pushGlassChildStyle(6.0f);
+    ImGui::BeginChild("##fw_ser_log", ImVec2(0, -ImGui::GetFrameHeightWithSpacing()),
+                      ImGuiChildFlags_Border);
+    if (st.fonts.mono) ImGui::PushFont(st.fonts.mono);
+    if (s.serialLog.empty()) {
+        ImGui::TextDisabled("Serial data appears here once the port is open.");
+    } else {
+        ImGui::TextUnformatted(s.serialLog.c_str());
+        if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 4.0f) ImGui::SetScrollHereY(1.0f);
+    }
+    if (st.fonts.mono) ImGui::PopFont();
+    ImGui::EndChild();
+    ui::popGlassChildStyle();
+
+    const float sendW = fwGlassButtonWidth("Send", nullptr);
+    ImGui::SetNextItemWidth(-(sendW + 8.0f * sc));
+    const bool enterSend = ImGui::InputTextWithHint("##fw_ser_send", "Send text + newline",
+                                                    s.serialSendBuf, sizeof(s.serialSendBuf),
+                                                    ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::SameLine(0.0f, 8.0f * sc);
+    if ((enterSend || fwGlassButton("##fw_ser_sendbtn", "Send", nullptr, /*accent=*/true, sendW,
+                                    s.serialOpen)) && s.serialOpen)
+        triggerSerialSend(st);
+}
+
+static void drawFlashDockTab(AppState& st) {
+    FwState& s = S();
+    ImGui::TextDisabled("ELF: %s", s.elfPath.empty() ? "(build first)" : s.elfPath.c_str());
+    ImGui::TextDisabled("Target: %s", s.chipBuf[0] ? s.chipBuf : "(none)");
+    ImGui::Spacing();
+    if (s.hwPending) {
+        fwStatusPill("Working\xe2\x80\xa6", palette.statusWarn);
+    } else if (!s.hwOut.empty()) {
+        const bool ok = s.hwOut.rfind("OK", 0) == 0;
+        fwStatusPill(ok ? "OK" : "FAILED", ok ? palette.statusOk : palette.statusErr);
+        ImGui::Spacing();
+        if (st.fonts.mono) ImGui::PushFont(st.fonts.mono);
+        ImGui::TextWrapped("%s", s.hwOut.c_str());
+        if (st.fonts.mono) ImGui::PopFont();
+    } else {
+        ImGui::TextDisabled("No flash attempt yet. Use the Flash button in the target bar.");
+    }
+}
+
+static void drawGdbConsoleDockTab(AppState& st) {
+    FwState& s = S();
+    if (st.fonts.mono) ImGui::PushFont(st.fonts.mono);
+    if (s.gdbConsole.empty()) {
+        ImGui::TextDisabled("GDB command output appears here (Reset/Halt/Step/Breakpoints/"
+                            "Memory, from the Debug tab).");
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.consoleDefault[0],
+                                                    palette.consoleDefault[1],
+                                                    palette.consoleDefault[2], 1));
+        ImGui::TextUnformatted(s.gdbConsole.c_str());
+        ImGui::PopStyleColor();
+        if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 4.0f) ImGui::SetScrollHereY(1.0f);
+    }
+    if (st.fonts.mono) ImGui::PopFont();
+}
+
+// Collapsible via ui::PanelCollapseAnim (same vertical roll-up recipe as the FeatureManager
+// column) — `h` is the ALREADY-ANIMATED height for this frame (computed by the caller so the
+// top row above can shrink/grow to match in the same frame, no one-frame lag).
+static void drawBottomDock(AppState& st, float h) {
     FwState& s = S();
     const float sc = ui::uiScale;
     ui::pushGlassChildStyle(10.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12 * sc, 10 * sc));
-    ImGui::BeginChild("##fw_backend", ImVec2(w, 0), ImGuiChildFlags_Border);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10 * sc, 6 * sc));
+    ImGui::BeginChild("##fw_dock", ImVec2(0, h), ImGuiChildFlags_Border);
     ImGui::PopStyleVar();
 
-    fwHeaderAction(s.statusPending ? "..." : "Recheck", 68.0f * sc,
-                   [&st]() { loadStatus(st, /*force=*/true); });
-    fwSectionHeader("health_check", "Backend");
+    ImGui::BeginGroup();
+    if (ImGui::SmallButton(s.dockCollapsed ? "v" : "^")) s.dockCollapsed = !s.dockCollapsed;
+    ImGui::SameLine();
+    ImGui::TextDisabled("Dock");
+    ImGui::EndGroup();
+    s.dockAnim.measureHeader();
 
-    if (!s.statusLoaded) {
-        ImGui::TextDisabled(s.statusErr.empty() ? "Checking fw_status\xe2\x80\xa6"
-                                                : s.statusErr.c_str());
-    } else {
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        const float dotR = 4.0f * sc;
-        for (const FwState::ToolRow& t : s.tools) {
-            const ImVec2 rp = ImGui::GetCursorScreenPos();
-            const float rowH = ImGui::GetFrameHeight();
-            const ImVec2 c(rp.x + dotR + 2.0f * sc, rp.y + rowH * 0.5f);
-            if (t.found) {
-                // Soft glow halo + solid core (the "tool present" look).
-                dl->AddCircleFilled(c, dotR + 2.5f * sc,
-                                    ImGui::GetColorU32(ImVec4(palette.statusOk[0],
-                                        palette.statusOk[1], palette.statusOk[2], 0.18f)));
-                dl->AddCircleFilled(c, dotR, palette.toU32(palette.statusOk));
-            } else {
-                dl->AddCircle(c, dotR, palette.toU32(palette.textDisabled), 0,
-                              ui::metrics::stroke(1.0f));
+    if (s.dockAnim.bodyVisible() && ImGui::BeginTabBar("##fw_dock_tabs")) {
+        auto tf = [&](int idx) {
+            if (s.focusMonitorDockOnce && idx == 1) {
+                s.focusMonitorDockOnce = false;
+                return ImGuiTabItemFlags_SetSelected;
             }
-            ImGui::Dummy(ImVec2(dotR * 2.0f + 10.0f * sc, rowH));
-            ImGui::SameLine(0.0f, 0.0f);
-            if (t.found) ImGui::TextUnformatted(t.name.c_str());
-            else         ImGui::TextDisabled("%s", t.name.c_str());
-            if (!t.info.empty() && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", t.info.c_str());
+            return ImGuiTabItemFlags_None;
+        };
+        if (ImGui::BeginTabItem("Build Log", nullptr, tf(0))) {
+            drawBuildLogDockTab(st);
+            ImGui::EndTabItem();
         }
-        for (const std::string& b : s.banners) {
-            ImGui::Spacing();
-            fwBanner(b.c_str(), palette.statusWarn);
+        if (ImGui::BeginTabItem("Serial Monitor", nullptr, tf(1))) {
+            drawSerialDockTab(st);
+            ImGui::EndTabItem();
         }
+        if (ImGui::BeginTabItem("Flash Progress", nullptr, tf(2))) {
+            drawFlashDockTab(st);
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("GDB Console", nullptr, tf(3))) {
+            drawGdbConsoleDockTab(st);
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
     }
 
-    ImGui::Spacing();
-    fwSectionHeader("issue_bug", "Flash & Debug");
-    // Honest gating (task DoD): the buttons only EXIST when fw_status says the backend
-    // (probe-rs / esptool) is present; otherwise the doctor's guidance shows instead.
-    if (!s.statusLoaded) {
-        ImGui::TextDisabled("Waiting for fw_status\xe2\x80\xa6");
-    } else if (!s.canFlash) {
-        fwBanner("Flashing/debug unavailable: `cargo install probe-rs-tools` (Cortex-M) "
-                 "or `pip install esptool` (ESP32).", palette.statusWarn);
-    } else {
-        ImGui::SetNextItemWidth(-1);
-        ImGui::InputTextWithHint("##fw_chip", "Chip (e.g. STM32F407VGTx)", s.chipBuf,
-                                 sizeof(s.chipBuf));
-        const bool haveElf = !s.elfPath.empty();
-        const bool canHw = st.workerStarted && !s.hwPending && s.chipBuf[0] != '\0';
-        auto hwCall = [&st, &s](const char* method, nlohmann::json p) {
-            s.hwPending = true;
-            s.hwOut.clear();
-            st.rpc.call(method, std::move(p), [](const core::RpcResult& r) {
-                FwState& s2 = S();
-                s2.hwPending = false;
-                if (!r.ok) { s2.hwOut = r.err.empty() ? "worker unreachable" : r.err; return; }
-                const auto& j = r.result;
-                if (!j.is_object()) { s2.hwOut = "unexpected result"; return; }
-                if (j.contains("code")) { s2.hwOut = j.value("message", std::string("failed")); return; }
-                std::string out = j.value("success", false) ? "OK" : "failed";
-                const std::string detail = j.contains("output") ? j.value("output", std::string())
-                                                                : j.value("reason", std::string());
-                if (!detail.empty()) out += ": " + detail;
-                s2.hwOut = out;
-            });
-        };
-        const float fullW = ImGui::GetContentRegionAvail().x;
-        if (fwGlassButton("##fw_flash", s.hwPending ? "Working\xe2\x80\xa6" : "Flash ELF",
-                          "eng_firm", /*accent=*/true, fullW, canHw && haveElf))
-            hwCall("fw_flash", {{"elf_path", s.elfPath}, {"chip", std::string(s.chipBuf)}});
-        if (!haveElf && ImGui::IsItemHovered())
-            ImGui::SetTooltip("Build first — the last successful ELF is flashed");
-        if (fwGlassButton("##fw_dbg_run", "Debug: reset + run", "run_study",
-                          /*accent=*/false, fullW, canHw))
-            hwCall("fw_debug_start", {{"chip", std::string(s.chipBuf)}});
-        if (fwGlassButton("##fw_dbg_halt", "Debug: halt", nullptr,
-                          /*accent=*/false, fullW, canHw))
-            hwCall("fw_debug_halt", {{"chip", std::string(s.chipBuf)}});
-        if (!s.hwOut.empty()) {
-            ImGui::Spacing();
-            const bool ok = s.hwOut.rfind("OK", 0) == 0;
-            fwBanner(s.hwOut.c_str(), ok ? palette.statusOk : palette.statusErr);
-        }
-    }
     ImGui::EndChild();
     ui::popGlassChildStyle();
 }
@@ -1032,34 +1672,47 @@ void seedFirmwareShotFixture() {
 static void drawFirmwareWorkspaceBody(AppState& st) {
     loadStatus(st);
     loadProjects(st);
+    pollSerial(st);
+    ui::chatWorkspaceSync(st);
 
+    FwState& s = S();
     const float sc = ui::uiScale;
-    const float railW = 250.0f * sc;
-    const float backW = 260.0f * sc;
     const float gutter = 10.0f * sc;
 
+    drawTargetBar(st);
+    ImGui::Spacing();
+
+    const float railW = 250.0f * sc;
+    const float copilotW = 320.0f * sc;
+    const float dockFullH = 220.0f * sc;
+    // Tick the dock's collapse animation ONCE per frame up front so the top row below can
+    // reclaim/cede exactly the space the dock animates through — no one-frame lag between
+    // the two (ui::PanelCollapseAnim, the same recipe the FeatureManager column uses).
+    const float dockH = s.dockAnim.tick(s.dockCollapsed, dockFullH);
+
+    const float bodyH = ImGui::GetContentRegionAvail().y;
+    const float topH = std::max(160.0f * sc, bodyH - dockH - gutter);
+
+    ImGui::BeginChild("##fw_top_row", ImVec2(0, topH), ImGuiChildFlags_None);
     drawProjectRail(st, railW);
     ImGui::SameLine(0.0f, gutter);
 
     const float midW =
-        std::max(220.0f * sc, ImGui::GetContentRegionAvail().x - backW - gutter);
+        std::max(220.0f * sc, ImGui::GetContentRegionAvail().x - copilotW - gutter);
     ui::pushGlassChildStyle(10.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14 * sc, 10 * sc));
     ImGui::BeginChild("##fw_center", ImVec2(midW, 0), ImGuiChildFlags_Border);
     ImGui::PopStyleVar();
-    {
-        const float availH = ImGui::GetContentRegionAvail().y;
-        drawBuildSection(st, availH * 0.32f);
-        ImGui::Spacing();
-        drawEmulationSection(st, availH * 0.34f);
-        ImGui::Spacing();
-        drawTraceViewer(st);
-    }
+    drawCenterTabs(st);
     ImGui::EndChild();
     ui::popGlassChildStyle();
 
     ImGui::SameLine(0.0f, gutter);
-    drawBackendRail(st, backW);
+    drawCopilotPane(st, copilotW);
+    ImGui::EndChild();   // ##fw_top_row
+
+    ImGui::Spacing();
+    drawBottomDock(st, dockH);
 }
 
 }  // namespace firmware

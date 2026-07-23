@@ -111,13 +111,17 @@ void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f * sc, 5.0f * sc));
     ImGui::BeginChild("##umsg", ImVec2(bw, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+    // Zero the default 9px inter-item spacing for this bubble's body -> meta bar
+    // stack: without it, ImGui inserts its own gap before AND after the Dummy
+    // below on top of the explicit one, doubling the visual gap the redpen flagged.
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(ImGui::GetStyle().ItemSpacing.x, 0.0f));
     // Body, then ONE meta bar INSIDE the bubble bottom: "You" (left) + AI-VC
     // rewind/edit buttons + age (right; hover for the absolute time).
     // Same selectable read-only InputText treatment as assistant prose (soft-wrap +
     // click-drag + Ctrl+C toast + right-click Copy).
     const std::string userBody = stripMdMarks(m.text);
     const ImGuiID textId = chatDrawSelectableText("##umsg_sel", userBody, chatSurf().textPrimary);
-    ImGui::Dummy(ImVec2(0, 1.5f * sc));
+    ImGui::Dummy(ImVec2(0, 3.0f * sc));
 
     // ---- meta bar: You [rewind edit] ......... age ----
     const double now = ImGui::GetTime();
@@ -157,8 +161,14 @@ void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
                     ImGui::ColorConvertFloat4ToU32(ImVec4(surf.textPrimary.x, surf.textPrimary.y,
                                                           surf.textPrimary.z, pending ? 0.18f : 0.10f)),
                     ui::metrics::rounding(4.0f));
-            drawDoubleRewindGlyph(dl, bmn, bmx,
-                ImGui::ColorConvertFloat4ToU32(pending ? surf.textPrimary : surf.textSecondary));
+            {
+                // Inset to match the pencil icon's 0.18 pad -- the raw glyph
+                // otherwise reads noticeably bigger/bolder than the pencil.
+                const float rp = btnSz * 0.18f;
+                drawDoubleRewindGlyph(dl, ImVec2(bmn.x + rp, bmn.y + rp),
+                                     ImVec2(bmx.x - rp, bmx.y - rp),
+                                     ImGui::ColorConvertFloat4ToU32(pending ? surf.textPrimary : surf.textSecondary));
+            }
             if (pending) ImGui::PopStyleColor();
             if (clicked) {
                 if (!pending) {
@@ -220,8 +230,9 @@ void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
     // Guarantee the cursor advances past the bar even when the age was left of the buttons.
     ImGui::SetCursorPosY(rowY + rowH);
     ImGui::Dummy(ImVec2(1.0f, 0.0f));
+    ImGui::PopStyleVar();   // ItemSpacing -- pushed after BeginChild, must pop before EndChild
     ImGui::EndChild();
-    ImGui::PopStyleVar();  // ##umsg WindowPadding
+    ImGui::PopStyleVar();   // ##umsg WindowPadding -- pushed before BeginChild, pops after
     ImRect bubble = endGlassBubble(gb);
     {
         ImU32 border = modeBorderColor(m.copilotMode);

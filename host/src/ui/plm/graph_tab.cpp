@@ -54,6 +54,7 @@ struct GNode {
   float lx = 0.0f, ly = 0.0f; // layout coords (graph space)
   float lz = 0.0f;            // depth coord (3D projection mode only)
   float radius = 14.0f;
+  float bubbleR = 0.0f; // packed containment bubble (0 = leaf/no children)
 };
 
 // Persisted / stashed node position (x, y + depth z).
@@ -1111,14 +1112,53 @@ void hierarchySeed(GraphTabState &G,
     leaves[static_cast<size_t>(u)] = std::max(s, 1);
   }
 
-  // Per-depth radii (virtual super-root at origin: real roots sit at depth 1).
-  std::vector<int> levelCount(static_cast<size_t>(maxDepth) + 2, 0);
-  for (int u : order)
-    ++levelCount[static_cast<size_t>(depth[static_cast<size_t>(u)]) + 1];
-  std::vector<float> radius(static_cast<size_t>(maxDepth) + 2, 0.0f);
-  for (size_t d = 1; d < radius.size(); ++d)
-    radius[d] = std::max(radius[d - 1] + hop * 1.8f,
-                         (float)levelCount[d] * hop / 6.2831853f);
+  // ---- nested circle packing ----------------------------------------------
+  // Bottom-up: leaf bubble = node disc radius + pad; each parent lays its
+  // children on an area-cumulative phyllotaxis spiral in its LOCAL frame and
+  // takes the smallest enclosing radius. Subassemblies render as bubbles
+  // MADE OF their contents (containment = nesting, not spokes) — the user's
+  // requested nested formatting. Wedges/spokes abandoned: 3500 feature/
+  // sketch leaves on outer rings dominated the zoomed-out view.
+  const float pad = spacing * 0.06f;
+  std::vector<float> bubR(static_cast<size_t>(V), 0.0f);
+  std::vector<float> locX(static_cast<size_t>(V), 0.0f),
+      locY(static_cast<size_t>(V), 0.0f); // child center in parent's frame
+  for (auto it = order.rbegin(); it != order.rend(); ++it) {
+    const int u = *it;
+    const auto &ch = kids[static_cast<size_t>(u)];
+    if (ch.empty()) {
+      bubR[static_cast<size_t>(u)] =
+          G.nodes[G.visibleIdx[static_cast<size_t>(u)]].radius + pad;
+      continue;
+    }
+    double acc = 0.0;
+    float need = 0.0f;
+    for (size_t i = 0; i < ch.size(); ++i) {
+      const int c = ch[i];
+      const float rc = bubR[static_cast<size_t>(c)];
+      acc += (double)(2.2f * rc) * (2.2f * rc);
+      const float r = (float)std::sqrt(acc / 3.14159265358979);
+      const float a = (float)i * GOLDEN;
+      const float x = r * std::cos(a), y = r * std::sin(a);
+      locX[static_cast<size_t>(c)] = x;
+      locY[static_cast<size_t>(c)] = y;
+      need = std::max(need, r + rc);
+    }
+    bubR[static_cast<size_t>(u)] = need + pad;
+  }
+  // Roots pack around a virtual super-root at the origin (same spiral).
+  {
+    double acc = 0.0;
+    for (size_t i = 0; i < roots.size(); ++i) {
+      const int r = roots[i];
+      const float rc = bubR[static_cast<size_t>(r)];
+      acc += (double)(2.2f * rc) * (2.2f * rc);
+      const float rr = (float)std::sqrt(acc / 3.14159265358979);
+      const float a = (float)i * GOLDEN;
+      locX[static_cast<size_t>(r)] = rr * std::cos(a);
+      locY[static_cast<size_t>(r)] = rr * std::sin(a);
+    }
+  }
 
   // Mean depth (z centring).
   double meanDepth = 0.0;
@@ -1127,43 +1167,32 @@ void hierarchySeed(GraphTabState &G,
   if (!order.empty())
     meanDepth /= (double)order.size();
 
-  // Place: roots partition the circle by subtree leaves.
-  double totalLeaves = 0.0;
-  for (int r : roots)
-    totalLeaves += leaves[static_cast<size_t>(r)];
-  double acc = 0.0;
-  for (int r : roots) {
-    const double span =
-        totalLeaves > 0.0
-            ? 6.28318530718 * leaves[static_cast<size_t>(r)] / totalLeaves
-            : 0.0;
-    std::vector<std::tuple<int, double, double>> st;
-    st.emplace_back(r, acc, acc + span);
-    acc += span;
-    while (!st.empty()) {
-      const auto t = st.back();
-      st.pop_back();
-      const int u = std::get<0>(t);
-      const double a0 = std::get<1>(t), a1 = std::get<2>(t);
-      const double mid = 0.5 * (a0 + a1);
-      const float rr =
-          radius[static_cast<size_t>(depth[static_cast<size_t>(u)]) + 1];
-      if (isFresh[static_cast<size_t>(u)]) {
-        outX[static_cast<size_t>(u)] = (float)(rr * std::cos(mid));
-        outY[static_cast<size_t>(u)] = (float)(rr * std::sin(mid));
-        outZ[static_cast<size_t>(u)] =
-            ((float)depth[static_cast<size_t>(u)] - (float)meanDepth) * hop;
-      }
-      double cacc = a0;
-      const double lu = (double)leaves[static_cast<size_t>(u)];
-      for (int v : kids[static_cast<size_t>(u)]) {
-        const double w =
-            lu > 0.0 ? (a1 - a0) * leaves[static_cast<size_t>(v)] / lu : 0.0;
-        st.emplace_back(v, cacc, cacc + w);
-        cacc += w;
-      }
+  // Top-down: global = parent's global + local offset (preorder ⇒ parents
+  // first). Cached nodes anchor at their persisted position; their subtree
+  // still packs around it.
+  for (int u : order) {
+    float gx, gy;
+    if (isFresh[static_cast<size_t>(u)]) {
+      gx = locX[static_cast<size_t>(u)];
+      gy = locY[static_cast<size_t>(u)];
+      outX[static_cast<size_t>(u)] = gx;
+      outY[static_cast<size_t>(u)] = gy;
+      outZ[static_cast<size_t>(u)] =
+          ((float)depth[static_cast<size_t>(u)] - (float)meanDepth) * hop;
+    } else {
+      const GNode &n = G.nodes[G.visibleIdx[static_cast<size_t>(u)]];
+      gx = n.lx;
+      gy = n.ly;
+    }
+    for (int c : kids[static_cast<size_t>(u)]) {
+      locX[static_cast<size_t>(c)] += gx;
+      locY[static_cast<size_t>(c)] += gy;
     }
   }
+  // Bubble radii onto nodes for outline drawing + fit extents.
+  for (int u : order)
+    G.nodes[G.visibleIdx[static_cast<size_t>(u)]].bubbleR =
+        bubR[static_cast<size_t>(u)];
 
   // Anchor pass: fresh non-tree nodes group onto phyllotaxis discs around
   // their first placed neighbor (ANY edge kind). 3 sweeps settle chains.
@@ -1507,6 +1536,7 @@ void rebuildForce(GraphTabState &G) {
       discR *= 1.30f;
     discR = std::clamp(discR, 11.0f * S, 36.0f * S);
     n.radius = discR; // drawing uses disc radius
+    n.bubbleR = 0.0f; // repacked below when the hierarchy seed runs
 
     const float labelW = ImGui::CalcTextSize(n.label.c_str()).x;
     const float collRadius =
@@ -1756,7 +1786,7 @@ void drawArcSpinner(ImDrawList *dl, ImVec2 c, float radius, ImU32 col) {
 // Bump kLayoutVersion whenever seed/clustering/force policy changes enough that
 // old positions would re-open as a hairball. Missing/mismatched version →
 // ignore the file and re-seed from the current algorithm (cluster wells).
-constexpr int kLayoutVersion = 6;
+constexpr int kLayoutVersion = 7;
 
 std::filesystem::path layoutCachePath(const GraphTabState &G) {
   return std::filesystem::path(G.projectDir) / ".plm" / "graph_layout.json";
@@ -2454,7 +2484,7 @@ void fitView(GraphTabState &G, ImVec2 canvasSz) {
     const GNode &n = G.nodes[vi];
     float px, py, persp;
     projectPoint(G, P, n.lx, n.ly, n.lz, px, py, persp);
-    const float r = n.radius * persp;
+    const float r = std::max(n.radius, n.bubbleR) * persp;
     minX = std::min(minX, px - r);
     minY = std::min(minY, py - r);
     maxX = std::max(maxX, px + r);
@@ -3131,6 +3161,22 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
       return false;
     return e.src == focusId || e.dst == focusId;
   };
+
+  // ---- Containment bubble outlines (under edges) --------------------------
+  // Nested packing makes every parent a bubble of its contents; outline it
+  // so assembly/part nesting reads at a glance. LOD-culled when tiny.
+  for (int vi : G.visibleIdx) {
+    const GNode &n = G.nodes[vi];
+    if (n.bubbleR <= n.radius + 1.0f)
+      continue;
+    float perspB = 1.0f;
+    const ImVec2 c = nodeScreen(n, perspB);
+    const float rb = n.bubbleR * perspB * G.zoom;
+    if (rb < 10.0f)
+      continue;
+    dl->AddCircleFilled(c, rb, kindColor(n.kind, 0.045f), 48);
+    dl->AddCircle(c, rb, kindColor(n.kind, 0.30f), 48, 1.5f);
+  }
 
   // ---- Edges (visibleEdges only) ------------------------------------------
   // Coarse LOD for huge webs: solid 1px lines, no mid-edge labels.
@@ -3857,8 +3903,8 @@ void drawGridView(AppState &st, ImVec2 canvasSz) {
     ImGui::Dummy(ImVec2(0, 24 * Sc));
     ImGui::TextColored(ImVec4(palette.textDim[0], palette.textDim[1],
                               palette.textDim[2], 1.0f),
-                       "%s", filtering
-                                 ? "No parts or assemblies match the search"
+                       "%s",
+                       filtering ? "No parts or assemblies match the search"
                                  : "No parts or assemblies in this view");
     ImGui::EndChild();
     return;
@@ -3869,15 +3915,14 @@ void drawGridView(AppState &st, ImVec2 canvasSz) {
   const float availW = ImGui::GetContentRegionAvail().x;
   const float gap = 10.0f * Sc;
   const float ideal = 168.0f * Sc;
-  const int cols =
-      std::max(1, (int)((availW + gap) / (ideal + gap)));
+  const int cols = std::max(1, (int)((availW + gap) / (ideal + gap)));
   const float cellW =
       std::min((availW - gap * (float)(cols - 1)) / (float)cols, 240.0f * Sc);
   const float pad = 6.0f * Sc;
   const float tile = cellW - 2.0f * pad; // square preview box
   const float lineH = ImGui::GetTextLineHeight();
-  const float cellH = pad + tile + 4.0f * Sc + lineH + 2.0f * Sc + lineH +
-                      6.0f * Sc;
+  const float cellH =
+      pad + tile + 4.0f * Sc + lineH + 2.0f * Sc + lineH + 6.0f * Sc;
   const int rows = ((int)items.size() + cols - 1) / cols;
 
   ImDrawList *dl = ImGui::GetWindowDrawList();
@@ -3896,8 +3941,7 @@ void drawGridView(AppState &st, ImVec2 canvasSz) {
         // The clipper positions the row cursor; columns are placed
         // explicitly from the row origin so they line up.
         const ImVec2 rowPos = ImGui::GetCursorScreenPos();
-        const ImVec2 cellPos(rowPos.x + (float)col * (cellW + gap),
-                             rowPos.y);
+        const ImVec2 cellPos(rowPos.x + (float)col * (cellW + gap), rowPos.y);
         ImGui::SetCursorScreenPos(cellPos);
 
         ImGui::PushID(n.id.c_str());
@@ -3918,16 +3962,16 @@ void drawGridView(AppState &st, ImVec2 canvasSz) {
         const ImVec2 p1(cellPos.x + cellW, cellPos.y + cellH);
         // Cell state fills (mirrors the list-row selection accents).
         if (sel) {
-          dl->AddRectFilled(cellPos, p1,
-                            ImGui::GetColorU32(ImVec4(
-                                palette.accent[0], palette.accent[1],
-                                palette.accent[2], 0.30f)),
-                            9.0f * Sc);
-          dl->AddRect(cellPos, p1,
-                      ImGui::GetColorU32(ImVec4(palette.accent[0],
-                                                palette.accent[1],
-                                                palette.accent[2], 0.85f)),
-                      9.0f * Sc, 0, 1.5f * Sc);
+          dl->AddRectFilled(
+              cellPos, p1,
+              ImGui::GetColorU32(ImVec4(palette.accent[0], palette.accent[1],
+                                        palette.accent[2], 0.30f)),
+              9.0f * Sc);
+          dl->AddRect(
+              cellPos, p1,
+              ImGui::GetColorU32(ImVec4(palette.accent[0], palette.accent[1],
+                                        palette.accent[2], 0.85f)),
+              9.0f * Sc, 0, 1.5f * Sc);
         } else if (inBlast) {
           dl->AddRectFilled(cellPos, p1,
                             ImGui::GetColorU32(ImVec4(
@@ -3935,11 +3979,11 @@ void drawGridView(AppState &st, ImVec2 canvasSz) {
                                 palette.statusWarn[2], 0.25f)),
                             9.0f * Sc);
         } else if (hov) {
-          dl->AddRectFilled(cellPos, p1,
-                            ImGui::GetColorU32(ImVec4(
-                                palette.text[0], palette.text[1],
-                                palette.text[2], 0.06f)),
-                            9.0f * Sc);
+          dl->AddRectFilled(
+              cellPos, p1,
+              ImGui::GetColorU32(ImVec4(palette.text[0], palette.text[1],
+                                        palette.text[2], 0.06f)),
+              9.0f * Sc);
         }
 
         // ---- square preview tile ----------------------------------------
@@ -3963,16 +4007,15 @@ void drawGridView(AppState &st, ImVec2 canvasSz) {
                        ImVec2(i0.x + tw, i0.y + thh));
         } else {
           // Placeholder: kind glyph disc (+ spinner while rendering).
-          const char *icon = n.kind == "assembly"  ? "assembly"
-                             : n.kind == "part"     ? "part"
-                                                    : "new_doc";
+          const char *icon = n.kind == "assembly" ? "assembly"
+                             : n.kind == "part"   ? "part"
+                                                  : "new_doc";
           const ImVec2 ic(t0.x + tile * 0.5f, t0.y + tile * 0.44f);
           dl->AddCircleFilled(ic, tile * 0.22f, kindColor(n.kind, 0.22f), 28);
-          ui::drawIconGlass(dl, icon, ic, 26.0f * Sc,
-                            kindColor(n.kind, 0.9f), 0);
+          ui::drawIconGlass(dl, icon, ic, 26.0f * Sc, kindColor(n.kind, 0.9f),
+                            0);
           if (th.pending) {
-            drawArcSpinner(dl,
-                           ImVec2(t0.x + tile * 0.5f, t0.y + tile * 0.78f),
+            drawArcSpinner(dl, ImVec2(t0.x + tile * 0.5f, t0.y + tile * 0.78f),
                            7.0f * Sc, kindColor(n.kind, 0.9f));
           }
         }
@@ -3981,8 +4024,7 @@ void drawGridView(AppState &st, ImVec2 canvasSz) {
         const float textX = cellPos.x + pad;
         const float textW = cellW - 2.0f * pad;
         float ty = t1.y + 4.0f * Sc;
-        dl->AddText(ImVec2(textX, ty), kindColor(n.kind),
-                    kindShort(n.kind));
+        dl->AddText(ImVec2(textX, ty), kindColor(n.kind), kindShort(n.kind));
         ty += lineH + 2.0f * Sc;
         const std::string lab = elideToWidth(n.label, textW);
         dl->AddText(ImVec2(textX, ty), Palette::toU32(palette.text),
@@ -3992,18 +4034,17 @@ void drawGridView(AppState &st, ImVec2 canvasSz) {
           ImGui::BeginTooltip();
           ImGui::TextUnformatted(n.label.c_str());
           if (!n.path.empty()) {
-            ImGui::PushStyleColor(
-                ImGuiCol_Text,
-                ImVec4(palette.textDisabled[0], palette.textDisabled[1],
-                       palette.textDisabled[2], 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                                  ImVec4(palette.textDisabled[0],
+                                         palette.textDisabled[1],
+                                         palette.textDisabled[2], 1.0f));
             ImGui::TextUnformatted(n.path.c_str());
             ImGui::PopStyleColor();
           }
           if (th.pending) {
-            ImGui::PushStyleColor(
-                ImGuiCol_Text,
-                ImVec4(palette.textDim[0], palette.textDim[1],
-                       palette.textDim[2], 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                                  ImVec4(palette.textDim[0], palette.textDim[1],
+                                         palette.textDim[2], 1.0f));
             ImGui::TextUnformatted("Preview rendering...");
             ImGui::PopStyleColor();
           }

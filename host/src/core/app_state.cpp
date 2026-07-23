@@ -264,8 +264,11 @@ void loadSettings(Settings& s) {
         // settings write.
         if (s.provider == 7) { s.provider = 6; model = "grok-4.5"; }
         if (prov == "moonshot") {
+            // Moonshot direct API (provider 5). The official wire id for Kimi K2.7 is
+            // `kimi-k2.7-code` — the bare `kimi-k2.7` 404s ("Not found the model kimi-k2.7").
+            // Map the GUI id up to the valid wire id; empty/kimi-for-coding fall back to K3.
             if (model.empty() || model == "kimi-for-coding") model = "kimi-k3";
-            else if (model == "kimi-k2.7-code") model = "kimi-k2.7";
+            else if (model == "kimi-k2.7") model = "kimi-k2.7-code";
         }
         copyStr(s.model, sizeof(s.model), model);
         std::string activeKey = j.value("api_key", "");

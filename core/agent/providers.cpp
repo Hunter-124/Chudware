@@ -609,6 +609,18 @@ std::string openai_normalize_base_url(const std::string& base_url) {
     return u;
 }
 
+std::string moonshot_normalize_model(const std::string& model) {
+    // `kimi-k3-256k` is our context-capped profile (see moonshot_provider.py); the API only
+    // accepts the bare `kimi-k3` wire id. Normalize those aliases to it.
+    if (model == "kimi-k3-256k" || model == "kimi-k3-1m" || model == "kimi-latest" ||
+        model == "moonshotai/kimi-k3")
+        return "kimi-k3";
+    // The official wire id for Kimi K2.7 is `kimi-k2.7-code`; the bare `kimi-k2.7` 404s
+    // ("Not found the model kimi-k2.7").
+    if (model == "kimi-k2.7") return "kimi-k2.7-code";
+    return model;
+}
+
 json openai_content(const json& part) {
     if (pstr(part, "type") == "text") {
         return json{{"type", "text"}, {"text", pstr(part, "text")}};
@@ -2032,12 +2044,8 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
                                                          : std::string(kOpenAIDefaultModel);
         std::string model = str_or(cfg, "model", def);
         if (model == "grok-4-5") model = "grok-4.5";  // normalize hyphen alias
-        // Moonshot (Kimi K3): the API accepts only `kimi-k3`. `kimi-k3-256k` is our
-        // context-capped profile (see moonshot_provider.py) — normalize to the wire id.
-        if (provider == "moonshot" &&
-            (model == "kimi-k3-256k" || model == "kimi-k3-1m" || model == "kimi-latest" ||
-             model == "moonshotai/kimi-k3"))
-            model = "kimi-k3";
+        // Moonshot (Kimi): map catalog/GUI aliases to the ids the moonshot.ai API accepts.
+        if (provider == "moonshot") model = moonshot_normalize_model(model);
         if ((provider == "xai" || provider == "xai-sub") && base_url.empty())
             base_url = "https://api.x.ai/v1";
         if (provider == "moonshot" && base_url.empty())
@@ -2224,8 +2232,9 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
 
     if (provider == "cursor" || provider == "cursor-sub") {
         res.error =
-            "cursor: no C++ chat completions transport (Connect-RPC/protobuf only). "
-            "Pick xAI, Claude, or OpenAI.";
+            "Cursor is not available for in-app agent runs (no REST transport; its API is "
+            "Connect-RPC/protobuf). Pick a different provider in Settings -> Providers.";
+        res.error_excerpt = truncate_excerpt(res.error);
         res.model = str_or(cfg, "model");
         res.endpoint = "cursor";
         return finish(std::move(res));

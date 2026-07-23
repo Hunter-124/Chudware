@@ -1297,6 +1297,32 @@ static const char* ompStateLabel(const OmpProviderRow& r) {
     return "signed out";
 }
 
+// Inline status dot + colored label on one line. The bundled UI font has no
+// Geometric-Shapes glyphs (U+25CF/U+25CB), so the old literal bullets rendered
+// as "?"; draw the dot with the draw-list instead (matches drawStatusDot in
+// plm_overview.cpp and the dozens of AddCircleFilled status dots elsewhere).
+// filled = solid dot (connected / key set); else a hollow ring (signed out).
+static void ompStatusDotText(const char* label, const float col[3], bool filled,
+                             const float* labelCol = nullptr) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float sc = ui::uiScale;
+    const float fh = ImGui::GetFontSize();
+    const float r = fh * 0.30f;
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const ImVec2 c(p.x + r + 1.0f * sc, p.y + fh * 0.5f);
+    const ImU32 u = ImGui::ColorConvertFloat4ToU32(ImVec4(col[0], col[1], col[2], 1.0f));
+    if (filled) dl->AddCircleFilled(c, r, u, 16);
+    else        dl->AddCircle(c, r, u, 16, 1.4f * sc);
+    ImGui::Dummy(ImVec2(r * 2.0f + 6.0f * sc, fh));  // reserve the dot's width
+    ImGui::SameLine(0, 0);
+    const ImU32 tu = labelCol
+        ? ImGui::ColorConvertFloat4ToU32(ImVec4(labelCol[0], labelCol[1], labelCol[2], 1.0f))
+        : u;
+    ImGui::PushStyleColor(ImGuiCol_Text, tu);
+    ImGui::TextUnformatted(label);
+    ImGui::PopStyleColor();
+}
+
 static void drawOmpProviderDetail(AppState& st, float sc) {
     const OmpProviderRow* row = nullptr;
     for (const auto& r : s_omp.rows)
@@ -1354,9 +1380,7 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
         ImGui::SameLine(0, 8.0f * sc);
     }
     if (state == "oauth_connected") {
-        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.statusOk));
-        ImGui::TextUnformatted("\xe2\x97\x8f OAuth connected");
-        ImGui::PopStyleColor();
+        ompStatusDotText("OAuth connected", pal.statusOk, /*filled=*/true);
         if (detailReady) {
             for (const auto& ac : s_omp.detail.accounts) {
                 ImGui::PushID(ac.credentialId);
@@ -1392,11 +1416,10 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
             });
         }
     } else if (state == "key_set") {
-        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.statusOk));
-        ImGui::TextUnformatted(prov.origin == "env" && !prov.envVar.empty()
-                                   ? (std::string("\xe2\x97\x8f key set via ") + prov.envVar).c_str()
-                                   : "\xe2\x97\x8f API key set");
-        ImGui::PopStyleColor();
+        ompStatusDotText(prov.origin == "env" && !prov.envVar.empty()
+                             ? (std::string("key set via ") + prov.envVar).c_str()
+                             : "API key set",
+                         pal.statusOk, /*filled=*/true);
         if (ImGui::SmallButton("Remove key")) {
             st.rpc.call("agent_provider_remove_key",
                         nlohmann::json{{"provider", prov.id}},
@@ -1413,9 +1436,7 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
     } else if (prov.keyless) {
         dimText("No credential needed — this provider serves models without a key.");
     } else {
-        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
-        ImGui::TextUnformatted("\xe2\x97\x8b signed out");
-        ImGui::PopStyleColor();
+        ompStatusDotText("signed out", pal.textDim, /*filled=*/false);
     }
 
     // OAuth entry point + in-flight flow.
@@ -1583,7 +1604,7 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
             ImGui::PopStyleColor();
         }
         if (!prov.consoleUrl.empty()) {
-            if (ImGui::SmallButton("Get a key \xe2\x86\x92")) {
+            if (ImGui::SmallButton("Get a key")) {
 #if defined(_WIN32)
                 std::system(("start \"\" \"" + prov.consoleUrl + "\"").c_str());
 #elif defined(__APPLE__)
@@ -1720,11 +1741,14 @@ static void drawOmpProviderManager(AppState& st) {
             const float* c = ompStateColor(r.state);
             const bool bullet = (r.state == "oauth_connected" || r.state == "key_set");
             char statusLine[160];
-            std::snprintf(statusLine, sizeof(statusLine), "%s %s",
-                          bullet ? "\xe2\x97\x8f" : "\xe2\x97\x8b", ompStateLabel(r));
-            dl->AddText(ImVec2(mn.x + 6.0f * sc, mn.y + 4.0f * sc + fh + 2.0f * sc),
-                        ImGui::ColorConvertFloat4ToU32(ImVec4(c[0], c[1], c[2], 1.0f)),
-                        statusLine);
+            std::snprintf(statusLine, sizeof(statusLine), "%s", ompStateLabel(r));
+            const float dotR = fh * 0.28f;
+            const float sy = mn.y + 4.0f * sc + fh + 2.0f * sc;
+            const ImU32 cu = ImGui::ColorConvertFloat4ToU32(ImVec4(c[0], c[1], c[2], 1.0f));
+            const ImVec2 dc(mn.x + 6.0f * sc + dotR, sy + fh * 0.5f);
+            if (bullet) dl->AddCircleFilled(dc, dotR, cu, 16);
+            else        dl->AddCircle(dc, dotR, cu, 16, 1.4f * sc);
+            dl->AddText(ImVec2(mn.x + 6.0f * sc + dotR * 2.0f + 5.0f * sc, sy), cu, statusLine);
             ImGui::PopID();
         }
         if (s_omp.rows.empty()) {
@@ -2930,8 +2954,8 @@ static void drawEngFirmAssignRow(AppState& st, const char* id, const char* label
 static void drawEngFirmModelAssignments(AppState& st, float sc) {
     if (!s_efModels.loaded) loadEngFirmModelsUi();
 
-    dimText("Empty rows inherit the active chat model. Eng. Firm runs resolve: discipline \xe2\x86\x92 "
-            "lead/subcontractor \xe2\x86\x92 chat model.");
+    dimText("Empty rows inherit the active chat model. Eng. Firm runs resolve: discipline -> "
+            "lead/subcontractor -> chat model.");
 
     const auto picks = buildRolePickList(st, /*localOnly=*/false);
 
@@ -4067,8 +4091,9 @@ static void drawSettingsContextTab(AppState& st, float S) {
                 }
                 ImGui::SameLine(0, 0);
                 ImGui::BeginGroup();
-                ImGui::Text("%s %s", tr.enabled ? "\xe2\x97\x8f" : "\xe2\x97\x8b",
-                            tr.id.c_str());
+                ompStatusDotText(tr.id.c_str(),
+                                 tr.enabled ? ui::palette.statusOk : ui::palette.textDim,
+                                 tr.enabled, ui::palette.text);
                 ImGui::SameLine();
                 {
                     const char* chip = tr.source.c_str();
@@ -4835,7 +4860,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                         settingsGlassSectionEnd();
 
                         settingsGlassSectionBegin("##ai_harness_session", "Session knobs");
-                        dimText("Same knobs as Copilot \xe2\x86\x92 Quick settings, plus modal-only "
+                        dimText("Same knobs as Copilot -> Quick settings, plus modal-only "
                                 "options (role adoption, company auto-route, Eng. Firm budget).");
                         ImGui::Dummy(ImVec2(0, 4.0f * sc));
                         drawHarnessSessionKnobs(st, sc);
@@ -5378,7 +5403,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
                                 ImGui::SetTooltip(
                                     "Rebuild the local Python/CAD runtime (same as "
-                                    "Chudware \xe2\x86\x92 Repair / install runtime).");
+                                    "Chudware -> Repair / install runtime).");
                             if (st.setupRunning.load()) {
                                 ImGui::SameLine();
                                 dimText("Running\xe2\x80\xa6");

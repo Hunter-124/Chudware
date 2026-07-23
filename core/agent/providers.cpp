@@ -1510,6 +1510,17 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
             for (auto it = rpatch.begin(); it != rpatch.end(); ++it)
                 sbody[it.key()] = it.value();
         }
+        // Moonshot kimi-k2.5+ / *-thinking stream their chain-of-thought as reasoning
+        // deltas BEFORE any content, and the wire max_tokens caps the SUM — at the default
+        // stage budget (~8k) the model burns it all thinking and returns content-empty
+        // ("endpoint returned no completion", modeler retry-death). Mirror the
+        // anthropic/gemini branches: give the ANSWER room on top of the thinking spend.
+        if (provider == "moonshot" &&
+            (model.find("thinking") != std::string::npos ||
+             model.find("k2.") != std::string::npos)) {
+            int mt = sbody.value("max_tokens", max_tokens);
+            sbody["max_tokens"] = mt + 24576;
+        }
         sbody["stream"] = true;
         const std::string stream_body = sbody.dump();
         // Keys to try: the resolved api_key first, then any signed-in fallback accounts

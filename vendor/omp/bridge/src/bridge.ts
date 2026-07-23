@@ -47,6 +47,7 @@ import {
 	handleAuthValidateKey,
 } from "./auth-context";
 import { handleCompact } from "./compact";
+import { handleCachePolicy } from "./cache";
 import { asObject, str, type Json } from "./json";
 import { handleMemoryRecall, handleMemoryRemember, handleMemoryStats } from "./memory";
 import { handleCostSummary, handleModelsList, modelInfo, resolveModel, type ProviderId } from "./models";
@@ -154,6 +155,25 @@ async function handleComplete(params: Json): Promise<Json> {
 	return collapse(result);
 }
 
+async function handleWarmCache(params: Json): Promise<Json> {
+	const provider = str(params.provider);
+	const modelId = str(params.model);
+	if (!provider || !modelId) throw new Error("warm_cache requires provider and model");
+	const model = resolveModel(provider, modelId, params.baseUrl ? str(params.baseUrl) : undefined);
+	const context: Context = { messages: convertMessages(readMessages(params.messages)) };
+	const system = str(params.system);
+	if (system) context.systemPrompt = [system];
+	// 1-token completion: forces the provider to read (and thus refresh) the cached prefix at
+	// ~1/10 the cost of a full re-send. cacheHit reports whether the prefix was actually cached.
+	const options: StreamOptions = { maxTokens: 1 };
+	if (params.apiKey) options.apiKey = str(params.apiKey);
+	const result = await stream(model, context, options).result();
+	const collapsed = collapse(result);
+	const usage = asObject(collapsed.usage);
+	const cacheRead = typeof usage.cacheRead === "number" ? usage.cacheRead : 0;
+	return { warmed: result.stopReason !== "error", cacheHit: cacheRead > 0, ...collapsed };
+}
+
 async function dispatch(method: string, params: Json): Promise<Json> {
 	switch (method) {
 		case "ping":
@@ -168,6 +188,10 @@ async function dispatch(method: string, params: Json): Promise<Json> {
 		}
 		case "complete":
 			return handleComplete(params);
+		case "warm_cache":
+			return handleWarmCache(params);
+		case "cache_policy":
+			return handleCachePolicy(params);
 		case "models_list":
 			return handleModelsList(params);
 		case "cost_summary":

@@ -169,13 +169,14 @@ static void drawCopilotHeader(AppState& st, bool busy) {
 
         cy1(bh);
         ImGui::SetCursorPosX(contentLeftInset);
-        if (busy) ImGui::BeginDisabled();
+        // NOTE: deliberately NOT gated on `busy` — these are read-only viewer panels
+        // (task list / artifacts / chat log / session switcher), not actions that could
+        // race a running turn. Users need to check progress while a run is in motion.
         if (drawHeaderTextButton("##hdr_tasks", tlLabel, st.showTaskList, tlW, "plan_board")) {
             const bool open = !st.showTaskList;
             st.showTaskList = open;
             if (open) { st.showArtifacts = st.showSessionsPicker = st.showAISettingsOverlay = false; }
         }
-        if (busy) ImGui::EndDisabled();
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Tasks \xc2\xb7 %d of %d done \xc2\xb7 click for the task list", tlDone, tlTotal);
 
@@ -210,13 +211,11 @@ static void drawCopilotHeader(AppState& st, bool busy) {
 
         ImGui::SameLine(colW - rightInset - artW);
         cy1(bh);
-        if (busy) ImGui::BeginDisabled();
         if (drawHeaderTextButton("##hdr_arts", "Artifacts", st.showArtifacts, artW, "team")) {
             const bool open = !st.showArtifacts;
             st.showArtifacts = open;
             if (open) { st.showTaskList = st.showSessionsPicker = st.showAISettingsOverlay = false; }
         }
-        if (busy) ImGui::EndDisabled();
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Session Artifacts \xc2\xb7 subagents, plan, documents");
         ImGui::SetCursorPosY(rowTop1 + wordLh);
@@ -240,26 +239,22 @@ static void drawCopilotHeader(AppState& st, bool busy) {
 
     centerY(lh);
     ImGui::SetCursorPosX(chatX);
-    if (busy) ImGui::BeginDisabled();
     if (drawHeaderTextButton("##hdr_chat", "Chat", chatOpen, chatW, "ai_panel")) {
         st.showSessionsPicker = false;
         st.showAISettingsOverlay = false;
         st.showTaskList = false;
         st.showArtifacts = false;
     }
-    if (busy) ImGui::EndDisabled();
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Chat — conversation with the agent.");
 
     centerY(lh);
     ImGui::SetCursorPosX(sessX);
-    if (busy) ImGui::BeginDisabled();
     if (drawHeaderTextButton("##hdr_sess", "Sessions", sessionsOpen, sessW, "history")) {
         const bool open = !st.showSessionsPicker;
         st.showSessionsPicker = open;
         if (open) { st.showAISettingsOverlay = st.showTaskList = st.showArtifacts = false; }
     }
-    if (busy) ImGui::EndDisabled();
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip(sessionsOpen ? "Sessions list is open."
                                        : "Sessions — switch between chats.");
@@ -775,32 +770,42 @@ static std::string artiEllipsize(const std::string& s, float maxW) {
     return out.empty() ? std::string(kEll) : out + kEll;
 }
 
-// One artifact row: bullet + single-line ellipsized name (tooltip carries the full text) with
-// the row actions RIGHT-ALIGNED inside the panel. The actions are measured against the
-// available width first; when the column is too narrow for them plus a readable name they
-// collapse into a single "…" menu, so they can never be clipped by the column edge.
+// One artifact row: a single grouped CARD (frosted background) per document — the name on
+// its own line up top, and its actions ("Open file" / "Open file location") stacked directly
+// beneath it inside the SAME card background, so each row visibly reads as one unit instead of
+// a name-left/buttons-right strip (the old layout put "Folder" so far from the name it read as
+// a separate, unrelated control).
 static void artiRow(AppState& st, const std::string& label, const std::string& tooltip,
                     const std::string& path, const std::function<void()>& onOpen) {
     const ui::AdaptiveSurface& surf = chatSurf();
-    const float padX = ImGui::GetStyle().FramePadding.x;
-    const float gap  = ui::metrics::px(6.0f);
-    auto btnW = [&](const char* t) { return ImGui::CalcTextSize(t).x + padX * 2.0f; };
+    const float S = ui::uiScale;
+    const bool hasFolder = !path.empty();
 
-    const bool  hasFolder  = !path.empty();
-    const float fullActW   = btnW("Open") + (hasFolder ? gap + btnW("Folder") : 0.0f);
-    const float smallActW  = btnW("\xe2\x80\xa6");
-    const float avail      = ImGui::GetContentRegionAvail().x;
-    const float bulletW    = ui::metrics::px(14.0f);
-    const float minNameW   = ui::metrics::px(90.0f);
-    const bool  collapse   = (avail - bulletW - gap - fullActW) < minNameW;
-    const float actW       = collapse ? smallActW : fullActW;
-    const float nameW      = ImMax(ui::metrics::px(24.0f), avail - bulletW - gap - actW);
+    const float padX  = ui::metrics::px(8.0f);
+    const float padY  = ui::metrics::px(6.0f);
+    const float rnd   = ui::metrics::px(6.0f);
+    const float rowW  = ImGui::GetContentRegionAvail().x;
+    const float nameH = ImGui::GetTextLineHeight();
+    const float btnH  = ImGui::GetFrameHeight();
+    const float innerGap = ui::metrics::px(4.0f);
+    const float cardH = padY * 2.0f + nameH + innerGap + btnH;
 
-    const float startX = ImGui::GetCursorPosX();
-    ImGui::Bullet();
-    ImGui::SameLine(0, 0);
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ui::glassRowBackground(dl, p0, ImVec2(p0.x + rowW, p0.y + cardH), rnd / S,
+                           /*stripe*/false, /*selected*/false, /*washAlpha*/0.30f);
+
+    // -- name line: a small dot marker (drawn directly, NOT ImGui::Bullet() — its trailing
+    // spacing is easy to accidentally cancel and clip into the label) + ellipsized name --
+    const float dotR = ui::metrics::px(2.2f);
+    const float nameX = p0.x + padX + dotR * 2.0f + ui::metrics::px(6.0f);
+    const ImVec2 dotC(p0.x + padX + dotR, p0.y + padY + nameH * 0.5f);
+    dl->AddCircleFilled(dotC, dotR, ImGui::ColorConvertFloat4ToU32(surf.textTertiary));
+
+    ImGui::SetCursorScreenPos(ImVec2(nameX, p0.y + padY));
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
-    ImGui::TextUnformatted(artiEllipsize(label, nameW).c_str());
+    const float nameMaxW = rowW - (nameX - p0.x) - padX;
+    ImGui::TextUnformatted(artiEllipsize(label, nameMaxW).c_str());
     ImGui::PopStyleColor();
     if (ImGui::IsItemHovered()) {
         ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
@@ -808,29 +813,23 @@ static void artiRow(AppState& st, const std::string& label, const std::string& t
     }
     if (ImGui::IsItemClicked() && onOpen) onOpen();
 
-    ImGui::SameLine(0, 0);
-    ImGui::SetCursorPosX(startX + avail - actW);
+    // -- action row: grouped directly under the name, inside the same card --
+    ImGui::SetCursorScreenPos(ImVec2(p0.x + padX, p0.y + padY + nameH + innerGap));
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
-    if (collapse) {
-        if (ImGui::SmallButton("\xe2\x80\xa6")) ImGui::OpenPopup("##arti_acts");
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Actions");
-        if (ImGui::BeginPopup("##arti_acts")) {
-            if (ImGui::MenuItem("Open")) { if (onOpen) onOpen(); }
-            if (hasFolder && ImGui::MenuItem("Show in file manager"))
-                chatArtifactReveal(st, path);
-            ImGui::EndPopup();
-        }
-    } else {
-        if (ImGui::SmallButton("Open")) { if (onOpen) onOpen(); }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Open in the viewport");
-        if (hasFolder) {
-            ImGui::SameLine(0, gap);
-            if (ImGui::SmallButton("Folder")) chatArtifactReveal(st, path);
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Show in file manager\n%s", path.c_str());
-        }
+    if (ImGui::SmallButton("Open file")) { if (onOpen) onOpen(); }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Open in the viewport");
+    if (hasFolder) {
+        ImGui::SameLine(0, ui::metrics::px(6.0f));
+        if (ImGui::SmallButton("Open file location")) chatArtifactReveal(st, path);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Show in file manager\n%s", path.c_str());
     }
     ImGui::PopStyleColor();
+
+    // Advance past the card + a small gap before the next one.
+    ImGui::SetCursorScreenPos(ImVec2(p0.x, p0.y + cardH));
+    ImGui::Dummy(ImVec2(rowW, 0));
+    ImGui::Dummy(ImVec2(0, ui::metrics::px(4.0f)));
 }
 
 // Session Artifacts panel — subagents, the plan, and session documents for this session.
@@ -861,8 +860,11 @@ static void drawArtifactsPanel(AppState& st, bool busy) {
     } else {
         ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
         for (const auto& s : subs) {
+            // Bullet() already appends its own trailing spacing; forcing SameLine(0,0)
+            // after it collapses that gap and the dot visually clips into the label
+            // (T-artifacts-bullet-clip). Use the default gap instead.
             ImGui::Bullet();
-            ImGui::SameLine(0, 0);
+            ImGui::SameLine();
             const std::string shown = artiEllipsize(s, ImGui::GetContentRegionAvail().x);
             ImGui::TextUnformatted(shown.c_str());
             if (shown.size() != s.size() && ImGui::IsItemHovered())
@@ -883,7 +885,7 @@ static void drawArtifactsPanel(AppState& st, bool busy) {
                  ps->title.empty() ? "build plan" : ps->title.c_str(), d, t);
         ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
         ImGui::Bullet();
-        ImGui::SameLine(0, 0);
+        ImGui::SameLine();
         const std::string shown = artiEllipsize(line, ImGui::GetContentRegionAvail().x);
         ImGui::TextUnformatted(shown.c_str());
         ImGui::PopStyleColor();

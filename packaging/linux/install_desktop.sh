@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
-# Install the Billet desktop entry + icon into the user's local XDG dirs so the
+# Install the chudware desktop entry + icon into the user's local XDG dirs so the
 # app shows a proper name/icon in the KDE/GNOME taskbar and launcher.
 #
-# The running window's WM_CLASS is "Billet" (set in host/src/app.cpp), and this
-# entry's StartupWMClass=Billet binds the live window to it — so the taskbar icon
+# The running window's WM_CLASS is "chudware" (set in host/src/app.cpp), and this
+# entry's StartupWMClass=chudware binds the live window to it — so the taskbar icon
 # resolves even for a window launched outside the launcher.
 #
-# The binary is named Billet (deep rename); an AI-CAD compat symlink ships beside
-# it for legacy scripts, but Exec points at the canonical host/build-linux/bin/Billet.
+# The binary is named chudware (deep rename); a Billet compat symlink ships beside
+# it for legacy scripts, but Exec points at the canonical host/build-linux/bin/chudware.
 #
 # Usage:  packaging/linux/install_desktop.sh
 #    or:  scripts/install_desktop.sh   (thin wrapper)
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-BIN="$REPO/host/build-linux/bin/Billet"
+BIN="$REPO/host/build-linux/bin/chudware"
 ICON_SRC="$REPO/assets/logo_icon.png"
 DOC_ICON_SRC="$REPO/assets/doc_icon.png"
 # freedesktop icon name for the native document MIME type (application/vnd.billet.stepplus,
@@ -83,7 +83,7 @@ else
 fi
 
 # Write the desktop entry with absolute Exec/Icon so it works without a PATH install.
-cat > "$APPS/Billet.desktop" <<EOF
+cat > "$APPS/chudware.desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Name=Chudware
@@ -92,12 +92,14 @@ Exec=$BIN %F
 Icon=Billet
 Categories=Graphics;Engineering;
 Terminal=false
-StartupWMClass=Billet
+StartupWMClass=chudware
 EOF
 
-# Migration cleanup: retire the pre-rename AI-CAD entry + hicolor icons, and the
-# stale ui/imgui entry (Exec pointed at the removed aicad2-dev binary).
-for STALE in "$APPS/AI-CAD.desktop" "$APPS/aicad2-dev.desktop"; do
+# Migration cleanup: retire the pre-rename AI-CAD entry + hicolor icons, the
+# stale ui/imgui entry (Exec pointed at the removed aicad2-dev binary), and the
+# pre-chudware-rename Billet.desktop (superseded by chudware.desktop above) so
+# old installs don't show a duplicate launcher entry.
+for STALE in "$APPS/AI-CAD.desktop" "$APPS/aicad2-dev.desktop" "$APPS/Billet.desktop"; do
   [ -f "$STALE" ] && { rm -f "$STALE"; echo "removed stale $STALE"; }
 done
 for s in 16 32 48 64 128 256; do
@@ -111,5 +113,5 @@ done
 command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$APPS" 2>/dev/null || true
 command -v gtk-update-icon-cache   >/dev/null 2>&1 && gtk-update-icon-cache -f -t "$ICONS" 2>/dev/null || true
 
-echo "installed Billet.desktop + icon."
-echo "If you have a pinned taskbar launcher, un-pin and re-pin it (it may cache the old AI-CAD/aicad2-dev entry)."
+echo "installed chudware.desktop + icon."
+echo "If you have a pinned taskbar launcher, un-pin and re-pin it (it may cache the old AI-CAD/aicad2-dev/Billet entry)."

@@ -251,7 +251,7 @@ _FULL_INSTRUCTIONS = (
 )
 
 mcp = FastMCP(
-    "AI-CAD",
+    "Chudware",
     instructions=_LITE_INSTRUCTIONS if _LITE else _FULL_INSTRUCTIONS,
 )
 

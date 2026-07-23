@@ -8,7 +8,7 @@
 #
 #  The ui/imgui / ui/abstract (AI-CAD2) app is retired. host/ is the single
 #  cross-platform GUI target (builds on Linux with GCC/Clang + on Windows with
-#  MSVC). Binary: host/build-linux/bin/Billet (plus an AI-CAD compat symlink)
+#  MSVC). Binary: host/build-linux/bin/chudware (plus AI-CAD and Billet compat symlinks)
 #
 #  Usage:
 #    ./build.sh            Default: build the host GUI.
@@ -139,7 +139,7 @@ build_daemon() {
     stage_libaicad_next_to_host
 }
 
-# Copy the full-engine libaicad.so next to host/build-linux/bin/Billet so the
+# Copy the full-engine libaicad.so next to host/build-linux/bin/chudware so the
 # running GUI's in-process cpp_core (resolve tier 3: next to executable) picks up
 # the latest engine. Without this, ./build.sh core/daemon updates trees the host
 # never loads. Atomic tmp+mv — never cp over a live mmap'd .so (SIGBUS risk).
@@ -227,6 +227,6 @@ esac
 
 echo ""
 echo "[build] DONE ($MODE)."
-BIN="$ROOT/host/build-linux/bin/Billet"
+BIN="$ROOT/host/build-linux/bin/chudware"
 [ -x "$BIN" ] && echo "[build] Run the GUI:  $BIN  (set AI_CAD_LIBAICAD to the built libaicad.so)"
 exit 0

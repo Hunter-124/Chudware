@@ -442,7 +442,8 @@ static ChipResult drawActiveProjectControl(AppState& st, ImVec2 p0, float h, ImF
 
     ImFont* font = boldFont ? boldFont : ImGui::GetFont();
     const float textW = font->CalcTextSizeA(font->FontSize, FLT_MAX, 0, name.c_str()).x;
-    const float w = padX + iconSz + iconGap + textW + chevGap + chevW + padX;
+    // +5*S leading room for the status spine drawn at the left edge below.
+    const float w = padX + 5.0f * S + iconSz + iconGap + textW + chevGap + chevW + padX;
     outW = w;
 
     ImGui::SetCursorScreenPos(p0);
@@ -453,19 +454,62 @@ static ChipResult drawActiveProjectControl(AppState& st, ImVec2 p0, float h, ImF
     const ImVec2 p1(p0.x + w, p0.y + h);
     const float rnd = h * 0.16f;  // tighter than tab/chip rounding (~0.28-0.30) — reads as a field
 
-    ui::glassBackground(dl, p0, p1, rnd / S);
-    const ImU32 borderCol = ImGui::GetColorU32(ImVec4(
-        ui::palette.accent[0], ui::palette.accent[1], ui::palette.accent[2], hovered ? 0.85f : 0.50f));
-    dl->AddRect(p0, p1, borderCol, rnd, 0, ui::metrics::stroke(1.3f));
-    if (held || hovered) {
-        dl->AddRectFilled(p0, p1, ImGui::GetColorU32(ImVec4(
-            ui::palette.accent[0], ui::palette.accent[1], ui::palette.accent[2],
-            held ? 0.16f : 0.09f)), rnd);
+    const float* A = ui::palette.accent;
+    const float* AD = ui::palette.accentDim;
+    auto accentU32 = [&](const float c[4], float a) {
+        return ImGui::GetColorU32(ImVec4(c[0], c[1], c[2], a));
+    };
+    const bool hasProject = !ui::plmProjectName(st).empty();
+
+    // ---- Outer accent bloom: 3 concentric rounded strokes fading outward, so the
+    // control reads as lit rather than merely outlined. This is the "it pops" pass —
+    // the title bar is otherwise all low-contrast frosted chips, so a soft halo is
+    // what separates persistent app state from the pill tabs beside it.
+    {
+        const float bloom = hovered ? 1.0f : 0.72f;
+        for (int i = 3; i >= 1; --i) {
+            const float g = (float)i;
+            const float a = (0.052f * bloom) / g;
+            dl->AddRect(ImVec2(p0.x - g * S, p0.y - g * S), ImVec2(p1.x + g * S, p1.y + g * S),
+                        accentU32(A, a), rnd + g * S, 0, ui::metrics::stroke(1.6f));
+        }
     }
+
+    ui::glassBackground(dl, p0, p1, rnd / S);
+
+    // ---- Always-on accent gradient wash (accentDim floor -> bright accent sheen at
+    // the top, owning the top corners). Previously this only appeared on hover, which
+    // is why the control read as an empty field.
+    {
+        const float aTop = held ? 0.46f : (hovered ? 0.38f : 0.26f);
+        const float aBot = held ? 0.24f : (hovered ? 0.19f : 0.12f);
+        dl->AddRectFilled(p0, p1, accentU32(AD, aBot), rnd);
+        const ImU32 cTop = accentU32(A, aTop);
+        const ImU32 cFade = accentU32(A, 0.0f);
+        dl->AddRectFilled(p0, ImVec2(p1.x, p0.y + rnd), cTop, rnd, ImDrawFlags_RoundCornersTop);
+        dl->AddRectFilledMultiColor(ImVec2(p0.x, p0.y + rnd), ImVec2(p1.x, p0.y + h * 0.60f),
+                                    cTop, cTop, cFade, cFade);
+    }
+
+    // ---- Leading status spine: a solid rounded accent bar hard against the left
+    // edge. Reads as a live indicator (green = a project is open, muted = none), and
+    // gives the eye an anchor at the start of the control.
+    {
+        const float spineW = 3.0f * S;
+        const float inset  = 3.0f * S;
+        const float* sc = hasProject ? ui::palette.statusOk : ui::palette.textDim;
+        dl->AddRectFilled(ImVec2(p0.x + inset, p0.y + inset),
+                          ImVec2(p0.x + inset + spineW, p1.y - inset),
+                          accentU32(sc, hasProject ? 0.95f : 0.45f), spineW * 0.5f);
+    }
+
+    dl->AddRect(p0, p1, accentU32(A, hovered ? 0.95f : 0.70f), rnd, 0,
+                ui::metrics::stroke(hovered ? 1.6f : 1.3f));
 
     const ImU32 textU32 = ImGui::ColorConvertFloat4ToU32(ImVec4(
         ui::palette.text[0], ui::palette.text[1], ui::palette.text[2], ui::palette.text[3]));
-    float x = p0.x + padX;
+    // Icon + label sit past the spine.
+    float x = p0.x + padX + 5.0f * S;
     ui::drawIconGlass(dl, "body_folder", ImVec2(x + iconSz * 0.5f, p0.y + h * 0.5f), iconSz, textU32, 0);
     x += iconSz + iconGap;
     dl->AddText(font, font->FontSize, ImVec2(x, p0.y + (h - font->FontSize) * 0.5f), textU32, name.c_str());

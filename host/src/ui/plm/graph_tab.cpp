@@ -2332,16 +2332,58 @@ void panelFieldLabel(const char *k) {
   ImGui::PopStyleColor();
 }
 
+// 3D projection (view3d mode only): yaw around Y, pitch around X, then a
+// weak perspective divide. O(1) per point per frame with precomputed trig;
+// the layout itself stays 2D (z is a static per-node attribute from the
+// harmonic seed), so compute cost is negligible and fully deterministic.
+struct Proj3 {
+  float cy = 1.0f, sy = 0.0f, cp = 1.0f, sp = 0.0f;
+  float focal = 2400.0f;
+};
+
+Proj3 makeProj(const GraphTabState &G) {
+  Proj3 P;
+  P.cy = std::cos(G.orbitYaw);
+  P.sy = std::sin(G.orbitYaw);
+  P.cp = std::cos(G.orbitPitch);
+  P.sp = std::sin(G.orbitPitch);
+  P.focal = 2400.0f * ui::uiScale;
+  return P;
+}
+
+// Returns perspective scale in perspOut (1 = at focal plane).
+void projectPoint(const GraphTabState &G, const Proj3 &P, float lx, float ly,
+                  float lz, float &px, float &py, float &perspOut) {
+  if (!G.view3d) {
+    px = lx;
+    py = ly;
+    perspOut = 1.0f;
+    return;
+  }
+  const float x1 = lx * P.cy + lz * P.sy;
+  const float z1 = -lx * P.sy + lz * P.cy;
+  const float y1 = ly * P.cp - z1 * P.sp;
+  const float z2 = ly * P.sp + z1 * P.cp;
+  const float persp = P.focal / std::max(200.0f * ui::uiScale, P.focal + z2);
+  px = x1 * persp;
+  py = y1 * persp;
+  perspOut = persp;
+}
+
 void fitView(GraphTabState &G, ImVec2 canvasSz) {
   if (G.visibleIdx.empty() || canvasSz.x < 1.0f || canvasSz.y < 1.0f)
     return;
+  const Proj3 P = makeProj(G);
   float minX = 1e9f, minY = 1e9f, maxX = -1e9f, maxY = -1e9f;
   for (int vi : G.visibleIdx) {
     const GNode &n = G.nodes[vi];
-    minX = std::min(minX, n.lx - n.radius);
-    minY = std::min(minY, n.ly - n.radius);
-    maxX = std::max(maxX, n.lx + n.radius);
-    maxY = std::max(maxY, n.ly + n.radius);
+    float px, py, persp;
+    projectPoint(G, P, n.lx, n.ly, n.lz, px, py, persp);
+    const float r = n.radius * persp;
+    minX = std::min(minX, px - r);
+    minY = std::min(minY, py - r);
+    maxX = std::max(maxX, px + r);
+    maxY = std::max(maxY, py + r);
   }
   float gw = std::max(40.0f, maxX - minX);
   float gh = std::max(40.0f, maxY - minY);
@@ -2356,8 +2398,11 @@ void fitView(GraphTabState &G, ImVec2 canvasSz) {
 }
 
 void centerOnNode(GraphTabState &G, const GNode &n, ImVec2 canvasSz) {
-  G.panX = canvasSz.x * 0.5f - n.lx * G.zoom;
-  G.panY = canvasSz.y * 0.5f - n.ly * G.zoom;
+  const Proj3 P = makeProj(G);
+  float px, py, persp;
+  projectPoint(G, P, n.lx, n.ly, n.lz, px, py, persp);
+  G.panX = canvasSz.x * 0.5f - px * G.zoom;
+  G.panY = canvasSz.y * 0.5f - py * G.zoom;
 }
 
 bool matchesSearch(const GNode &n, const char *q) {
@@ -2953,9 +2998,28 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
     G.panY += d.y;
   }
 
-  auto toScreen = [&](float lx, float ly) -> ImVec2 {
-    return ImVec2(origin.x + G.panX + lx * G.zoom,
-                  origin.y + G.panY + ly * G.zoom);
+  // Orbit: right-drag rotates the 3D projection (view3d only).
+  if (G.view3d && hovered && G.dragNode < 0 &&
+      ImGui::IsMouseDragging(ImGuiMouseButton_Right)) {
+    G.userNavigated = true;
+    ImVec2 d = ImGui::GetIO().MouseDelta;
+    G.orbitYaw += d.x * 0.008f;
+    G.orbitPitch = std::clamp(G.orbitPitch + d.y * 0.008f, -1.35f, 1.35f);
+  }
+
+  // 3D projection state: trig precomputed once per frame, O(1) per point.
+  const Proj3 P = makeProj(G);
+  auto toScreen = [&](float lx, float ly, float lz) -> ImVec2 {
+    float px, py, persp;
+    projectPoint(G, P, lx, ly, lz, px, py, persp);
+    return ImVec2(origin.x + G.panX + px * G.zoom,
+                  origin.y + G.panY + py * G.zoom);
+  };
+  auto nodeScreen = [&](const GNode &n, float &perspOut) -> ImVec2 {
+    float px, py;
+    projectPoint(G, P, n.lx, n.ly, n.lz, px, py, perspOut);
+    return ImVec2(origin.x + G.panX + px * G.zoom,
+                  origin.y + G.panY + py * G.zoom);
   };
 
   // Viewport culling helpers (screen space, padded past the clip rect).
@@ -3002,6 +3066,10 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
     if (e.kind == "CONTAINS" && std::fabs(a.ly - b.ly) < 1.0f)
       continue;
 
+    float perspA = 1.0f, perspB = 1.0f;
+    ImVec2 p0 = nodeScreen(a, perspA);
+    ImVec2 p1 = nodeScreen(b, perspB);
+
     bool dimf = filtering && !G.matchIds.count(a.id) && !G.matchIds.count(b.id);
     bool incident = edgeIncident(e);
     bool selEdge = (ei == G.selectedEdge);
@@ -3020,6 +3088,9 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
       alpha = 0.95f;
     else
       alpha = 0.55f;
+    // Depth cue: far edges fade back (3D mode only).
+    if (G.view3d)
+      alpha *= std::clamp(0.5f * (perspA + perspB), 0.55f, 1.0f);
 
     ImU32 col = edgeColor(e.kind, alpha);
     if (authored && !dimf && (incident || selEdge || !incidenceDim))
@@ -3031,8 +3102,6 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
                                       palette.statusWarn[1],
                                       palette.statusWarn[2], 0.90f));
 
-    ImVec2 p0 = toScreen(a.lx, a.ly);
-    ImVec2 p1 = toScreen(b.lx, b.ly);
     if (!onScreen(p0) && !onScreen(p1))
       continue; // viewport cull
     float thick = (edgeLod   ? 1.0f
@@ -3071,8 +3140,9 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
   if (hovered) {
     for (int vi : G.visibleIdx) {
       const GNode &n = G.nodes[vi];
-      ImVec2 c = toScreen(n.lx, n.ly);
-      float r = n.radius * G.zoom;
+      float persp = 1.0f;
+      ImVec2 c = nodeScreen(n, persp);
+      float r = n.radius * persp * G.zoom;
       float dx = mp.x - c.x, dy = mp.y - c.y;
       float d = dx * dx + dy * dy;
       if (d <= r * r && d < bestD) {
@@ -3104,8 +3174,26 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
         (G.dragNode < (int)G.forceSlot.size()) ? G.forceSlot[G.dragNode] : -1;
     if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
       if (slot >= 0) {
-        G.force.setPos(slot, (mp.x - origin.x - G.panX) / G.zoom,
-                       (mp.y - origin.y - G.panY) / G.zoom);
+        if (G.view3d) {
+          // Unproject the cursor onto the node's depth plane: convert the
+          // desired projected position back into graph x/y (z unchanged).
+          // First-order inverse — ignores the small pitch×yaw cross-term
+          // (~15% tracking skew at default orbit), intentional: exact
+          // inversion isn't worth the complexity for an interactive drag.
+          GNode &dn = G.nodes[G.dragNode];
+          float px, py, persp;
+          projectPoint(G, P, dn.lx, dn.ly, dn.lz, px, py, persp);
+          const float tx = (mp.x - origin.x - G.panX) / G.zoom;
+          const float ty = (mp.y - origin.y - G.panY) / G.zoom;
+          const float ux = (tx - px) / std::max(persp, 0.05f);
+          const float uy = (ty - py) / std::max(persp, 0.05f);
+          const float cyC = std::clamp(P.cy, 0.35f, 1.0f);
+          const float cpC = std::clamp(P.cp, 0.35f, 1.0f);
+          G.force.setPos(slot, dn.lx + ux / cyC, dn.ly + uy / cpC);
+        } else {
+          G.force.setPos(slot, (mp.x - origin.x - G.panX) / G.zoom,
+                         (mp.y - origin.y - G.panY) / G.zoom);
+        }
         G.force.reheat(0.06f); // neighbours react while dragging
       }
       ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
@@ -3162,8 +3250,8 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
       const GNode &b = G.nodes[di->second];
       if (e.kind == "CONTAINS" && std::fabs(a.ly - b.ly) < 1.0f)
         continue;
-      ImVec2 p0 = toScreen(a.lx, a.ly);
-      ImVec2 p1 = toScreen(b.lx, b.ly);
+      ImVec2 p0 = toScreen(a.lx, a.ly, a.lz);
+      ImVec2 p1 = toScreen(b.lx, b.ly, b.lz);
       float vx = p1.x - p0.x, vy = p1.y - p0.y;
       float wx = mp.x - p0.x, wy = mp.y - p0.y;
       float len2 = vx * vx + vy * vy;
@@ -3190,7 +3278,7 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
     auto eit = G.idIndex.find(G.blastEpicenter);
     if (eit != G.idIndex.end()) {
       const GNode &en = G.nodes[eit->second];
-      ImVec2 ec = toScreen(en.lx, en.ly);
+      ImVec2 ec = toScreen(en.lx, en.ly, en.lz);
       const float t = (float)(ImGui::GetTime() - G.blastT0);
       if (t >= 0.0f && t < 1.25f) {
         const float u = std::clamp(t / 1.2f, 0.0f, 1.0f);
@@ -3214,16 +3302,17 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
   int onScreenNodes = 0;
   for (int vi : G.visibleIdx) {
     const GNode &n = G.nodes[vi];
-    if (onScreen(toScreen(n.lx, n.ly)))
+    if (onScreen(toScreen(n.lx, n.ly, n.lz)))
       ++onScreenNodes;
   }
   const bool labelAll = onScreenNodes <= 150;
   for (int vi : G.visibleIdx) {
     const GNode &n = G.nodes[vi];
-    ImVec2 c = toScreen(n.lx, n.ly);
+    float persp = 1.0f;
+    ImVec2 c = nodeScreen(n, persp);
     if (!onScreen(c))
       continue; // viewport cull
-    float r = n.radius * G.zoom;
+    float r = n.radius * persp * G.zoom;
     bool dim = filtering && !G.matchIds.count(n.id);
     bool sel = (n.id == G.selectedId);
     bool hov = (n.id == G.hoverId);
@@ -3607,6 +3696,9 @@ void plmGraphOnProjectChanged() {
   G.edgeCountFull = 0;
   G.listView = false;
   G.listViewUserOverride = false;
+  G.asmView = false;
+  G.projPosStash.clear();
+  G.asmPosStash.clear();
   // Scope / visible caches — never open a new project inside a stale drill.
   G.scopeDocId.clear();
   G.scopeStack.clear();
@@ -3786,6 +3878,23 @@ void plmDrawGraphPage(AppState &st) {
           "loaded node (including features).");
     }
   }
+  ImGui::SameLine();
+  // 3D projection toggle: same layout, viewed with a depth dimension.
+  {
+    if (graphGlassButton("##graph_3d", G.view3d ? "3D \u25cf" : "3D", false,
+                         60 * S)) {
+      G.view3d = !G.view3d;
+      // Refit so the projected bounds frame correctly on entry.
+      G.fitRequested = true;
+      G.userNavigated = false;
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+      ImGui::SetTooltip(
+          "Project the layout with a depth dimension (right-drag to orbit).\n"
+          "Depth is deterministic — a structural gradient from the layout\n"
+          "solve, not random. Physics stays 2D; projection is O(N) per frame.");
+    }
+  }
   if (!G.generatedAt.empty()) {
     ImGui::SameLine();
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.textDisabled[0],
@@ -3946,6 +4055,19 @@ void plmDrawGraphPage(AppState &st) {
   if (graphGlassButton("##all_kinds", "All", false, 0.0f)) {
     G.hiddenKinds.clear();
     G.layoutDirty = true;
+  }
+  ImGui::SameLine();
+  // Assembly structure view: containment/instance tree + mates, layered.
+  if (graphGlassButton("##asm_view", G.asmView ? "Assembly \u25cf" : "Assembly",
+                       false, 0.0f)) {
+    toggleAsmView(G);
+  }
+  if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+    ImGui::SetTooltip(
+        "Assembly structure: assemblies + parts with containment, instance\n"
+        "and mate relations, laid out as a deterministic layered tree.\n"
+        "Arrangement is kept per-session (the layered layout is re-derived\n"
+        "deterministically on entry).");
   }
   for (const char *k : kEdgeKinds) {
     ImGui::SameLine();

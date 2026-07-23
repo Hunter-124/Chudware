@@ -61,8 +61,6 @@ Rules:
     {"method": "part_place",         "note": "parts placement, C++ (T-RF19 landed 2026-07-22; callers pass record)"}
   ],
   "web_unsupported": [
-    {"method": "ecad_design",        "family": "ECAD LLM orchestrator","remove_at": "T-RF20"},
-    {"method": "part_search",        "family": "parts hub FTS (Python services tier)","remove_at": "T-RF21"}
   ]
 }
 ```
@@ -72,10 +70,15 @@ Rules:
 `drawing_render_png` — all already C++ in `core/doc/session.cpp`). Same class as
 `intake_status` and `ecad_import_kicad`.
 
-`part_search` remains: the hub FTS is a services-side SQLite orchestration tier by design
-(evaluation C verdict) — resolve at T-RF21 either by a thin `parts_local_search` C++ query
-over the same index or by keeping the Parts workspace desktop-gated
-(`host/src/ui/web_capabilities.cpp`).
+`part_search` was removed 2026-07-23 (T-RF21 resolution): the hub FTS stays a
+services-side SQLite orchestration tier by design (evaluation C verdict), and the
+Parts workspace is desktop-gated for the web client (`host/src/ui/web_capabilities.cpp`)
+— no `parts_local_search` C++ query is built until a real web consumer exists (YAGNI).
+
+`ecad_design` was removed 2026-07-23 (T-RF21 resolution): it is LLM agent-orchestration
+(services/ecad_design), not a document-engine method — the same class as `intake_status`.
+The web client never drives server-side LLM orchestration; all deterministic ECAD
+document methods it CAN call are C++-served (web_required).
 
 `intake_status` was removed from the inventory 2026-07-22: it is an MCP *tool* name, not
 a worker-RPC method on either side (violates rule 3) — agent-orchestration state the web

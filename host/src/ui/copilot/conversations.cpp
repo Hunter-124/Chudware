@@ -6,6 +6,34 @@
 
 #include "copilot_internal.h"
 
+#include "ui/ai/ai_workspace.h"  // ui::agentDagToJson / agentDagFromJson — persist the live
+                                 // agent-execution DAG with the active session's artifacts.
+
+// Defined in feed.cpp — consumes the routing fields stashed by feedTurnActivity's
+// task_route/agent.classification/complexity branch (feedTurnActivity only sees a ChatMsg;
+// the GL draw path applies the assessment to the active Conversation here).
+bool takePendingScopeAssessment(std::string& domain, std::string& complexity,
+                                std::string& structure, std::string& execStyle,
+                                std::string& snippet);
+
+// Rail/tab color-code for Conversation::scopeClass (declared in core/app_state.h).
+// -1 unassessed -> neutral dim, 0 trivial -> iterBuilt, 1 standard -> accent,
+// 2 complex -> amber warn, 3 epic -> red err. RGBA 0..1, alpha 1.
+void scopeClassColor(int scopeClass, float out[4]) {
+    const float* src = ui::palette.textDim;
+    switch (scopeClass) {
+        case 0:  src = ui::palette.iterBuilt;  break;
+        case 1:  src = ui::palette.accent;     break;
+        case 2:  src = ui::palette.statusWarn; break;
+        case 3:  src = ui::palette.statusErr;  break;
+        default: break;  // -1 (unassessed) + unknown -> neutral
+    }
+    out[0] = src[0];
+    out[1] = src[1];
+    out[2] = src[2];
+    out[3] = 1.0f;
+}
+
 namespace ui {
 
 static std::string s_chatKeyToErase;
@@ -422,6 +450,14 @@ void persistChatHistory(AppState& st) {
         nlohmann::json convObj = {{"id", st.conversations[i].id},
                                  {"title", st.conversations[i].title},
                                  {"msgs", jm}};
+        convObj["scope"] = st.conversations[i].scopeClass;  // rail color-code (-1 = unassessed)
+        if (i == st.activeConv) {
+            // The live agent-execution DAG belongs to the active session's run — save it as a
+            // session artifact so the workflow trace survives a reopen.
+            nlohmann::json dag = ui::agentDagToJson();
+            if (dag.is_object() && dag.contains("nodes") && !dag["nodes"].empty())
+                convObj["agent_dag"] = std::move(dag);
+        }
         const int lct = (i == st.activeConv) ? st.lastContextTokens
                                              : st.conversations[i].lastContextTokens;
         if (lct > 0) convObj["last_context_tokens"] = lct;
@@ -463,8 +499,60 @@ void persistChatHistory(AppState& st) {
     }
 }
 
+// Map routing labels (complexity / structure / execution_style) to a scope class:
+// simple/solo -> 0, standard -> 1, complex -> 2, epic/huge -> 3.
+static int scopeClassFromRouting(const std::string& complexity, const std::string& structure,
+                                 const std::string& execStyle) {
+    auto norm = [](std::string s) {
+        for (char& ch : s) ch = (char)std::tolower((unsigned char)ch);
+        return s;
+    };
+    const std::string vals[3] = {norm(complexity), norm(structure), norm(execStyle)};
+    auto anyIs = [&](std::initializer_list<const char*> keys) {
+        for (const auto& v : vals)
+            for (const char* k : keys)
+                if (v == k) return true;
+        return false;
+    };
+    if (anyIs({"epic", "huge", "company", "eng_firm"})) return 3;
+    if (anyIs({"complex", "dag", "swarm"})) return 2;
+    if (anyIs({"simple", "solo", "trivial"})) return 0;
+    // "standard", "subagent", "edit", or any assessed-but-unrecognized label.
+    return 1;
+}
+
+// Consume the routing assessment stashed by feed.cpp and stamp the ACTIVE conversation on
+// its FIRST routing event (scopeClass -1 -> class): sets the rail color-code class and, when
+// the title is still the default "Chat N", a concise model-derived name from the routing
+// domain (+ short snippet when the classifier provided one).
+static void applyPendingScopeAssessment(AppState& st) {
+    std::string domain, complexity, structure, execStyle, snippet;
+    if (!takePendingScopeAssessment(domain, complexity, structure, execStyle, snippet)) return;
+    if (st.activeConv < 0 || st.activeConv >= (int)st.conversations.size()) return;
+    Conversation& c = st.conversations[st.activeConv];
+    if (c.scopeClass >= 0) return;  // first assessment wins; later routing events enrich only
+    c.scopeClass = scopeClassFromRouting(complexity, structure, execStyle);
+    const bool defaultTitle = c.title.empty() || c.title == "Chat" ||
+        (c.title.rfind("Chat ", 0) == 0 &&
+         c.title.find_first_not_of("0123456789", 5) == std::string::npos);
+    if (defaultTitle) {
+        std::string name = domain;
+        if (!name.empty()) name[0] = (char)std::toupper((unsigned char)name[0]);
+        if (!snippet.empty()) {
+            std::string s = snippet;
+            const size_t nl = s.find('\n');
+            if (nl != std::string::npos) s = s.substr(0, nl);
+            if (s.size() > 48) s = s.substr(0, 45) + "...";
+            if (!s.empty()) name += (name.empty() ? std::string() : std::string(" - ")) + s;
+        }
+        if (!name.empty()) c.title = name;
+    }
+    markChatHistoryDirty();
+}
+
 // Debounced flush while a turn is running (min 1.0s). Force bypasses the timer.
 void maybePersistChatHistoryDebounced(AppState& st, bool force) {
+    applyPendingScopeAssessment(st);
     if (!force && !s_chatHistoryDirty.load(std::memory_order_relaxed)) return;
     const double now = ImGui::GetTime();
     if (!force && (now - s_chatHistoryLastPersist) < 1.0) return;
@@ -564,6 +652,7 @@ static void applyChatEntry(AppState& st, const nlohmann::json& e) {
         Conversation c;
         c.id = jc.value("id", newConvId(st));
         c.title = jc.value("title", std::string("Chat"));
+        c.scopeClass = jc.value("scope", -1);  // legacy sessions omit the key
         for (const auto& m : jc.value("msgs", nlohmann::json::array())) {
             ChatMsg cm;
             cm.fromUser = m.value("u", false);
@@ -629,6 +718,13 @@ static void applyChatEntry(AppState& st, const nlohmann::json& e) {
     int act = e.value("active", 0);
     if (act < 0 || act >= (int)st.conversations.size()) act = 0;
     st.activeConv = act;
+    {
+        // Restore the active session's saved agent-execution DAG into the live store.
+        const auto& convsJson = e.value("conversations", nlohmann::json::array());
+        if (act < (int)convsJson.size() && convsJson[act].is_object() &&
+            convsJson[act].contains("agent_dag"))
+            ui::agentDagFromJson(convsJson[act]["agent_dag"]);
+    }
     st.chat = std::move(st.conversations[act].msgs);
     st.lastContextTokens = st.conversations[act].lastContextTokens;
     st.queuedPrompts = std::move(st.conversations[act].queuedPrompts);

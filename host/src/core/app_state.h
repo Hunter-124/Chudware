@@ -628,7 +628,15 @@ struct Conversation {
     std::vector<ChatMsg> msgs;      // populated only while INACTIVE (active lives in AppState::chat)
     int lastContextTokens = 0;     // per-session context meter (input tokens from last model call)
     std::vector<std::string> queuedPrompts;  // queued while this session's turn was active
+    // Assessed work scope for this session, set once from the first task_route/complexity event
+    // the model emits (the model also (re)names the session then). Drives the rail color-code.
+    // -1 = unassessed, 0 = trivial, 1 = standard, 2 = complex, 3 = epic. See scopeClassColor().
+    int scopeClass = -1;
 };
+
+// Rail/tab color-code for a Conversation::scopeClass (RGBA 0..1). Unassessed (-1) returns a
+// neutral tone. Defined in ui/copilot/conversations.cpp.
+void scopeClassColor(int scopeClass, float out[4]);
 
 // A progress event streamed from the worker (parsed off the worker thread, applied on the
 // main/GL thread so texture uploads stay on the GL context). kind: "status" | "iteration".

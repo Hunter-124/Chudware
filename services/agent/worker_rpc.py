@@ -1335,6 +1335,26 @@ BENCH_METHODS: dict[str, Callable] = {
 }
 
 
+# ──── office_extract worker RPC (T-office, contracts/office.md) ────
+# Shares the single extraction function with the office_extract MCP tool
+# (services/mcp/office_tools.py) so the read logic lives exactly once. This is the
+# FROZEN contract the host AI-tab docs_panel calls via st.rpc.call("office_extract", {path}).
+
+
+def _office_extract(params: dict, _emit: Callable) -> dict:
+    """``office_extract {path} -> {ok, kind, text, sheets?}`` (sheets only for xlsx/xlsm)."""
+    try:
+        from services.mcp.office_tools import extract_office
+        return extract_office((params or {}).get("path"))
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"office_extract failed: {exc}", "hint": ""}
+
+
+OFFICE_METHODS: dict[str, Callable] = {
+    "office_extract": _office_extract,
+}
+
+
 # Merged registration table (engine_oracle/worker.py does ``_METHODS.update``).
 WORKER_METHODS: dict[str, Callable] = {}
 WORKER_METHODS.update(SUBSCRIPTION_METHODS)
@@ -1343,3 +1363,4 @@ WORKER_METHODS.update(SKILLS_METHODS)
 WORKER_METHODS.update(TRIGGERS_METHODS)
 WORKER_METHODS.update(ROLE_MODELS_METHODS)
 WORKER_METHODS.update(BENCH_METHODS)
+WORKER_METHODS.update(OFFICE_METHODS)

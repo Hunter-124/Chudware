@@ -961,7 +961,6 @@ void drillInto(GraphTabState &G, const std::string &id) {
   G.scopeStack.push_back(G.scopeDocId);
   setScope(G, id);
 }
-
 void scopeBack(GraphTabState &G) {
   if (!G.scopeStack.empty()) {
     std::string up = std::move(G.scopeStack.back());
@@ -975,6 +974,7 @@ void scopeBack(GraphTabState &G) {
 void setScope(GraphTabState &G, const std::string &docId) {
   if (G.scopeDocId == docId)
     return;
+  const bool wasInScope = !G.scopeDocId.empty();
   G.scopeDocId = docId;
   G.selectedId.clear();
   G.selectedEdge = -1;
@@ -983,19 +983,48 @@ void setScope(GraphTabState &G, const std::string &docId) {
   G.userNavigated = false; // fresh scope → allow one auto-fit again
   // Assemblies (or anything with bom_items) open in decomposition view.
   G.scopeDecomp = false;
-  // Scopes run live sims; the balloon freeze resumes back in project view.
+  // Keep the deterministic frozen layout in scopes too — running the live
+  // force sim on a scoped subtree collapses it into a horizontal band (the
+  // "assembly breaks 2D/3D" bug). hierarchySeed builds its forest from
+  // visibleEdges, which is already scope-filtered, so it packs the scoped
+  // CONTAINS subtree correctly with the sim frozen.
   if (docId.empty()) {
     G.hierarchyLayout = G.projWasHierarchy;
+    // Restore flat project positions (stash first, then persisted cache) so
+    // the web view isn't distorted by the scoped repack we forced on entry.
+    for (auto &n : G.nodes) {
+      if (auto it = G.projPosStash.find(n.id); it != G.projPosStash.end()) {
+        n.lx = it->second.x;
+        n.ly = it->second.y;
+        n.lz = it->second.z;
+      } else if (auto it = G.layoutCache.find(n.id);
+                 it != G.layoutCache.end()) {
+        n.lx = it->second.x;
+        n.ly = it->second.y;
+        n.lz = it->second.z;
+      }
+    }
   } else {
-    if (G.scopeDocId.empty())
+    // Entering a scope from project view: save the freeze flag and stash the
+    // flat arrangement so scope-EXIT restores it exactly (no distortion).
+    // Nested drills (scope→scope) skip the stash — projPosStash still holds
+    // the true project layout, and scope positions are always re-derived.
+    if (!wasInScope) {
       G.projWasHierarchy = G.hierarchyLayout;
-    G.hierarchyLayout = false;
-  }
-  if (!docId.empty()) {
+      for (auto &n : G.nodes)
+        if (n.lx != 0.0f || n.ly != 0.0f || n.lz != 0.0f)
+          G.projPosStash[n.id] = {n.lx, n.ly, n.lz};
+    }
+    G.hierarchyLayout = true; // frozen deterministic structure in scope
     auto it = G.idIndex.find(docId);
     if (it != G.idIndex.end() &&
         (G.nodes[it->second].kind == "assembly" || hasBomChildren(G, docId)))
       G.scopeDecomp = true;
+    // Force a fresh deterministic repack of the scoped subtree (frozen sim).
+    // Without this the scoped nodes keep stale positions, the seed never
+    // fires, and the live force sim would collapse them into a band.
+    for (auto &n : G.nodes)
+      n.lx = n.ly = 0.0f;
   }
   rebuildVisible(G);
   // Fit on next canvas paint.
@@ -1190,8 +1219,11 @@ void hierarchySeed(GraphTabState &G,
       gy = locY[static_cast<size_t>(u)];
       outX[static_cast<size_t>(u)] = gx;
       outY[static_cast<size_t>(u)] = gy;
+      // z = containment depth, stretched 2.2x so 3D reads with real
+      // separation between levels instead of a near-flat disc.
       outZ[static_cast<size_t>(u)] =
-          ((float)depth[static_cast<size_t>(u)] - (float)meanDepth) * hop;
+          ((float)depth[static_cast<size_t>(u)] - (float)meanDepth) * hop *
+          2.2f;
     } else {
       const GNode &n = G.nodes[G.visibleIdx[static_cast<size_t>(u)]];
       gx = n.lx;
@@ -1349,7 +1381,7 @@ void hierarchySeed(GraphTabState &G,
 // Layered assembly-tree seed (Sugiyama-lite, deterministic). Layers =
 // containment/instance depth from root assemblies; within-layer order runs
 // barycenter sweeps over hierarchy + mates edges so mated siblings sit
-// together and hierarchy webs cross minimally. z = 0 (planar tree).
+// together and hierarchy webs cross minimally. z = depth (3D readable).
 void layeredAsmSeed(GraphTabState &G, const std::vector<float> &collR, float S,
                     std::vector<float> &outX, std::vector<float> &outY,
                     std::vector<float> &outZ) {
@@ -1457,8 +1489,11 @@ void layeredAsmSeed(GraphTabState &G, const std::vector<float> &collR, float S,
   }
 
   // Coordinates: rows by depth, x packed by collision radius, centered.
+  // z = depth so the 3D toggle gives the tree real vertical separation
+  // (was z=0 flat plane — the "asm view breaks 3D" bug).
   const float layerGap = 300.0f * S;
   const float xGap = 90.0f * S;
+  const float zMid = 0.5f * (float)(nLayer - 1);
   for (int li = 0; li < nLayer; ++li) {
     const auto &L = layers[static_cast<size_t>(li)];
     if (L.empty())
@@ -1468,10 +1503,12 @@ void layeredAsmSeed(GraphTabState &G, const std::vector<float> &collR, float S,
       width += 2.0f * collR[static_cast<size_t>(u)] + xGap;
     width -= xGap;
     float cursor = -0.5f * width;
+    const float lz = ((float)li - zMid) * layerGap * 0.9f;
     for (int u : L) {
       const float r = collR[static_cast<size_t>(u)];
       outX[static_cast<size_t>(u)] = cursor + r;
       outY[static_cast<size_t>(u)] = (float)li * layerGap;
+      outZ[static_cast<size_t>(u)] = lz;
       cursor += 2.0f * r + xGap;
     }
   }
@@ -4705,7 +4742,20 @@ void plmDrawGraphPage(AppState &st) {
                                        palette.accent[2], 1.0f)
                               : ImVec4(palette.textDim[0], palette.textDim[1],
                                        palette.textDim[2], 1.0f));
-    if (ImGui::SmallButton("▣ Project##bc_root")) {
+    // Project root crumb: atlas icon (no unicode glyphs — the app font
+    // lacks them and they render as "?"). body_folder reads as the project
+    // container.
+    {
+      ImGui::AlignTextToFramePadding();
+      const ImVec2 ip = ImGui::GetCursorScreenPos();
+      const float ic = 14.0f * S;
+      ImGui::Dummy(ImVec2(ic, ic));
+      ImGui::SameLine(0, 3.0f * S);
+      ui::drawIconGlass(ImGui::GetWindowDrawList(), "body_folder",
+                        ImVec2(ip.x + ic * 0.5f, ip.y + ic * 0.5f), ic,
+                        kindColor("project", 0.9f), 0);
+    }
+    if (ImGui::SmallButton("Project##bc_root")) {
       if (!G.scopeDocId.empty()) {
         G.scopeStack.clear();
         setScope(G, "");
@@ -4727,7 +4777,7 @@ void plmDrawGraphPage(AppState &st) {
                             ImVec4(palette.textDisabled[0],
                                    palette.textDisabled[1],
                                    palette.textDisabled[2], 1.0f));
-      ImGui::TextUnformatted("›");
+      ImGui::TextUnformatted(">"); // ASCII separator (font lacks U+203A)
       ImGui::PopStyleColor();
       ImGui::SameLine(0, 4 * S);
       std::string lab = crumbs[ci];

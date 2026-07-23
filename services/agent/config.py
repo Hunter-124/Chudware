@@ -559,6 +559,90 @@ def get_memory_token_budget(cfg: dict | None = None) -> int:
     return max(50, min(4000, b))
 
 
+# --------------------------------------------------------------------------- memory & learning backends
+# GUI Settings → AI → Memory & Learning writes these under ``agent`` (omp port):
+#   agent.memory_backend      "sqlite" | "mnemopi"   (default "sqlite")
+#   agent.compaction_backend  "builtin" | "omp"      (default "builtin")
+#   agent.cache_warming       bool                   (default False)
+#   agent.memory_learn        bool                   (default True)
+# Precedence is ENV > config.json > default: AI_CAD_MEMORY_BACKEND /
+# AI_CAD_COMPACTION_BACKEND still win when set (per-process override; the GUI
+# comboboxes write config.json only).
+
+MEMORY_BACKEND_KEY = "memory_backend"
+COMPACTION_BACKEND_KEY = "compaction_backend"
+CACHE_WARMING_KEY = "cache_warming"
+MEMORY_LEARN_KEY = "memory_learn"
+
+DEFAULT_MEMORY_BACKEND: str = "sqlite"
+DEFAULT_COMPACTION_BACKEND: str = "builtin"
+DEFAULT_CACHE_WARMING: bool = False
+DEFAULT_MEMORY_LEARN: bool = True
+
+_MEMORY_BACKEND_MNEMOPI = frozenset({"mnemopi", "omp", "bridge"})
+_COMPACTION_BACKEND_OMP = frozenset({"omp", "bridge", "mnemopi"})
+
+
+def memory_backend(cfg: dict | None = None) -> str:
+    """Return ``"sqlite"`` (default) or ``"mnemopi"``.
+
+    Precedence ENV > config.json > default (omp port): AI_CAD_MEMORY_BACKEND
+    wins when set; else ``agent.memory_backend``; else the default.
+    """
+    env = (os.environ.get("AI_CAD_MEMORY_BACKEND") or "").strip().lower()
+    if env:
+        return "mnemopi" if env in _MEMORY_BACKEND_MNEMOPI else DEFAULT_MEMORY_BACKEND
+    agent = _agent_block(cfg)
+    raw = agent.get(MEMORY_BACKEND_KEY)
+    if isinstance(raw, str) and raw.strip().lower() in _MEMORY_BACKEND_MNEMOPI:
+        return "mnemopi"
+    return DEFAULT_MEMORY_BACKEND
+
+
+def compaction_backend(cfg: dict | None = None) -> str:
+    """Return ``"builtin"`` (default) or ``"omp"``.
+
+    Precedence ENV > config.json > default (omp port): AI_CAD_COMPACTION_BACKEND
+    wins when set; else ``agent.compaction_backend``; else the legacy nested
+    ``agent.compaction.backend``; else the default.
+    """
+    env = (os.environ.get("AI_CAD_COMPACTION_BACKEND") or "").strip().lower()
+    if env:
+        return "omp" if env in _COMPACTION_BACKEND_OMP else DEFAULT_COMPACTION_BACKEND
+    agent = _agent_block(cfg)
+    raw = agent.get(COMPACTION_BACKEND_KEY)
+    if isinstance(raw, str):
+        s = raw.strip().lower()
+        if s in _COMPACTION_BACKEND_OMP:
+            return "omp"
+        if s in ("builtin", "local"):
+            return DEFAULT_COMPACTION_BACKEND
+    # Legacy nested key honored for back-compat (pre-flat-key configs).
+    comp = agent.get(COMPACTION_KEY)
+    backend = comp.get("backend") if isinstance(comp, dict) else None
+    if isinstance(backend, str) and backend.strip().lower() in _COMPACTION_BACKEND_OMP:
+        return "omp"
+    return DEFAULT_COMPACTION_BACKEND
+
+
+def cache_warming_enabled(cfg: dict | None = None) -> bool:
+    """Return ``agent.cache_warming`` (bool, default False).
+
+    When on, provider prompt caches are kept warm between runs.
+    """
+    agent = _agent_block(cfg)
+    return bool(agent.get(CACHE_WARMING_KEY, DEFAULT_CACHE_WARMING))
+
+
+def memory_learn_enabled(cfg: dict | None = None) -> bool:
+    """Return ``agent.memory_learn`` (bool, default True).
+
+    Learning switch: recall still works when off; nothing new is written.
+    """
+    agent = _agent_block(cfg)
+    return bool(agent.get(MEMORY_LEARN_KEY, DEFAULT_MEMORY_LEARN))
+
+
 # --------------------------------------------------------------------------- compaction / session cmds
 # Shared with host + session_cmds (omp port). Nested under ``agent`` unless noted.
 #

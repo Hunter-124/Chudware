@@ -17,7 +17,6 @@ from __future__ import annotations
 import copy
 import json
 import math
-import os
 import re
 from typing import Any, Iterable
 
@@ -592,9 +591,10 @@ def _plan_text_archive(text: str, edge_chars: int = TEXT_EDGE_CHARS) -> dict[str
 # OMP_INTEGRATION_PLAN.md §RPC CONTRACT, docs/omp-integration/01-DECISIONS.md
 # §Compaction) instead of the pure-Python path below. Off by default (unchanged
 # behavior); opt in with env AI_CAD_COMPACTION_BACKEND=omp or config.json
-# agent.compaction.backend="omp". Any bridge failure (bun/script missing, crash,
-# timeout, RPC error) raises omp_bridge.BridgeUnavailable, caught here to fall
-# back to the pure-Python path transparently.
+# agent.compaction_backend="omp" (legacy nested agent.compaction.backend still
+# honored). Any bridge failure (bun/script missing, crash, timeout, RPC error)
+# raises omp_bridge.BridgeUnavailable, caught here to fall back to the pure-Python
+# path transparently.
 
 def _bridge():
     from services.agent import omp_bridge  # noqa: PLC0415
@@ -602,23 +602,18 @@ def _bridge():
 
 
 def _compaction_backend(cfg: dict | None = None) -> str:
-    """``"local"`` (default) or ``"omp"``. Env wins over config.json."""
-    env = (os.environ.get("AI_CAD_COMPACTION_BACKEND") or "").strip().lower()
-    if env in ("omp", "bridge", "mnemopi"):
-        return "omp"
-    if env:
-        return "local"
+    """``"local"`` (default) or ``"omp"``.
+
+    Precedence ENV > config.json > default (omp port) — resolution lives in
+    services.agent.config.compaction_backend (returns "builtin"/"omp"; "builtin"
+    maps to this module's "local"); AI_CAD_COMPACTION_BACKEND still wins, and
+    config.json ``agent.compaction_backend`` is honored when the env is unset.
+    """
     try:
-        from services.agent.config import load_config  # noqa: PLC0415
-        c = cfg if cfg is not None else load_config()
-        agent = c.get("agent") if isinstance(c, dict) else None
-        comp = agent.get("compaction") if isinstance(agent, dict) else None
-        backend = comp.get("backend") if isinstance(comp, dict) else None
-        if isinstance(backend, str) and backend.strip().lower() in ("omp", "bridge", "mnemopi"):
-            return "omp"
+        from services.agent.config import compaction_backend  # noqa: PLC0415
+        return "omp" if compaction_backend(cfg) == "omp" else "local"
     except Exception:  # noqa: BLE001 — bad/missing config never breaks compaction
-        pass
-    return "local"
+        return "local"
 
 
 def _to_wire_message(msg: dict) -> dict[str, Any]:
@@ -806,7 +801,7 @@ def snapcompact_archive(
     Never cuts mid tool-result. Cumulative fold of ``prior_archive["text"]``.
 
     Hybrid backend: when gated on (env AI_CAD_COMPACTION_BACKEND=omp /
-    agent.compaction.backend="omp" in config.json), routes through the OMP
+    agent.compaction_backend="omp" in config.json), routes through the OMP
     bridge's ``compact`` RPC (vendor/omp/bridge) instead of the pure-Python
     path below, falling back here whenever the bridge is unavailable. Same
     return shape either way (see docstring above).

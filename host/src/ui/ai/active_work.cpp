@@ -1,10 +1,12 @@
 // See active_work.h. Slice 1: doc-activity grid + operation tickers + status frames.
-// The iso-preview textures plug into the single seam marked THUMB SEAM below (a worker
-// doc_render_png cache, modeled on ui/plm/graph_thumbs) — until then every card paints the
-// lightweight glass placeholder, so the view is fully functional without the render queue.
+// Iso-preview textures reuse the PLM Graph worker doc-render cache (ui/plm/graph_thumbs):
+// DocTab carries no content hash, so the cache key falls back to path+mtime — still one
+// cache entry per saved revision. Unsaved daemon WIP (no saved path) has nothing to key
+// off and always keeps the lightweight glass placeholder.
 #include "active_work.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <deque>
 #include <string>
 #include <unordered_map>
@@ -16,6 +18,7 @@
 #include "core/app_state.h"
 #include "ui_theme.h"      // ui::palette / uiScale / adaptivePanel / glassPanel / glassRowBackground
 #include "ai_prefs.h"
+#include "ui/plm/graph_thumbs.h"
 
 namespace ui {
 namespace {
@@ -133,9 +136,11 @@ void activeWorkFeedEvent(const std::string& kind, const nlohmann::json& data) {
 }
 
 void activeWorkPump(AppState& st) {
-    // THUMB SEAM (preview-texture slice): enqueue at most one worker doc_render_png per frame
-    // for visible cards missing a texture, keyed by docId + revision. No-op in slice 1.
-    (void)st;
+    // Drive at most one queued worker doc_render_png job per frame for cards missing a
+    // texture (see ui/plm/graph_thumbs.h) — gated on the user pref so previews can be
+    // switched off entirely without touching the render queue.
+    if (!aiActiveWorkPreviews()) return;
+    graphThumbsPump(st);
 }
 
 void activeWorkReset() {
@@ -148,6 +153,10 @@ void activeWorkReset() {
 void drawActiveWorkView(AppState& st) {
     const float S = ui::uiScale;
     const int   verbosity = aiUiVerbosity();
+    // Iso-preview textures (THUMB SEAM below) share the project dir the PLM Graph worker
+    // cache keys thumbnails under — resolved the same way graph_tab.cpp tracks G.projectDir.
+    const bool        previewsOn = aiActiveWorkPreviews();
+    const std::string projectDir = previewsOn ? st.plmProjectPath() : std::string();
 
     // One adaptive glass surface for the whole pane (idempotent per frame — same recipe as
     // chatSurf()/drawLeftPane): every card + strip fetches this cached contrast-matched tone.
@@ -275,18 +284,39 @@ void drawActiveWorkView(AppState& st) {
         }
         dl->AddRect(c0, c1, ImGui::ColorConvertFloat4ToU32(frame), 8.0f * S, 0, frameW);
 
-        // Preview area (THUMB SEAM: draw the cached iso texture here when available).
+        // Preview area: worker-rendered iso thumbnail when one is cached/available (THUMB
+        // SEAM), else the lightweight kind-tag placeholder. Docs with no saved path (unsaved
+        // daemon WIP) never have anything to render from and always keep the placeholder.
         {
             const ImVec2 p0(c0.x + 6 * S, c0.y + 6 * S);
             const ImVec2 p1(c1.x - 6 * S, c0.y + 6 * S + prevH - 12 * S);
-            ImVec4 fill(palette.accent[0], palette.accent[1], palette.accent[2],
-                        c.tab->aiPulse ? 0.10f : 0.05f);
-            dl->AddRectFilled(p0, p1, ImGui::ColorConvertFloat4ToU32(fill), 6.0f * S);
-            const char* tag = kindTag(*c.tab);
-            const ImVec2 ts = ImGui::CalcTextSize(tag);
-            dl->AddText(ImVec2(p0.x + (p1.x - p0.x - ts.x) * 0.5f,
-                               p0.y + (p1.y - p0.y - ts.y) * 0.5f),
-                        ImGui::ColorConvertFloat4ToU32(surf.textTertiary), tag);
+            GraphGridThumb gth;
+            if (previewsOn && !c.tab->path.empty() && !projectDir.empty()) {
+                // DocTab carries no content hash (that's a cad_graph concept) — the key falls
+                // back to path+mtime, still one cache entry per saved revision.
+                const std::string key = graphThumbKey(std::string(), 0.0, c.tab->path);
+                gth = graphThumbEnsure(st, projectDir, key, c.tab->path);
+            }
+            if (gth.tex != 0) {
+                const float pad  = 4.0f * S;
+                const float maxW = (p1.x - p0.x) - pad * 2.0f;
+                const float maxH = (p1.y - p0.y) - pad * 2.0f;
+                float tw = (float)gth.w, thh = (float)gth.h;
+                const float sc = std::min(maxW / std::max(tw, 1.0f), maxH / std::max(thh, 1.0f));
+                tw *= sc; thh *= sc;
+                const ImVec2 ip0(p0.x + ((p1.x - p0.x) - tw) * 0.5f,
+                                 p0.y + ((p1.y - p0.y) - thh) * 0.5f);
+                dl->AddImage((ImTextureID)(intptr_t)gth.tex, ip0, ImVec2(ip0.x + tw, ip0.y + thh));
+            } else {
+                ImVec4 fill(palette.accent[0], palette.accent[1], palette.accent[2],
+                            c.tab->aiPulse ? 0.10f : 0.05f);
+                dl->AddRectFilled(p0, p1, ImGui::ColorConvertFloat4ToU32(fill), 6.0f * S);
+                const char* tag = kindTag(*c.tab);
+                const ImVec2 ts = ImGui::CalcTextSize(tag);
+                dl->AddText(ImVec2(p0.x + (p1.x - p0.x - ts.x) * 0.5f,
+                                   p0.y + (p1.y - p0.y - ts.y) * 0.5f),
+                            ImGui::ColorConvertFloat4ToU32(surf.textTertiary), tag);
+            }
         }
 
         // Title + kind.

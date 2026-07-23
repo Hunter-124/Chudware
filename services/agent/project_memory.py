@@ -8,7 +8,6 @@ only top-k hits that fit. Never dump the whole DB into the model context.
 from __future__ import annotations
 
 import hashlib
-import os
 import re
 import sqlite3
 import threading
@@ -129,22 +128,17 @@ def _bridge():
 
 
 def _memory_backend(cfg: dict | None = None) -> str:
-    """``"sqlite"`` (default) or ``"mnemopi"``. Env wins over config.json."""
-    env = (os.environ.get("AI_CAD_MEMORY_BACKEND") or "").strip().lower()
-    if env in ("mnemopi", "omp", "bridge"):
-        return "mnemopi"
-    if env:
-        return "sqlite"
+    """``"sqlite"`` (default) or ``"mnemopi"``.
+
+    Precedence ENV > config.json > default (omp port) — resolution lives in
+    services.agent.config.memory_backend; AI_CAD_MEMORY_BACKEND still wins, and
+    config.json ``agent.memory_backend`` is honored when the env is unset.
+    """
     try:
-        from services.agent.config import load_config  # noqa: PLC0415
-        c = cfg if cfg is not None else load_config()
-        agent = c.get("agent") if isinstance(c, dict) else None
-        backend = agent.get("memory_backend") if isinstance(agent, dict) else None
-        if isinstance(backend, str) and backend.strip().lower() in ("mnemopi", "omp", "bridge"):
-            return "mnemopi"
+        from services.agent.config import memory_backend  # noqa: PLC0415
+        return memory_backend(cfg)
     except Exception:  # noqa: BLE001 — bad/missing config never breaks memory
-        pass
-    return "sqlite"
+        return "sqlite"
 
 
 def _stable_int_id(raw_id: Any) -> int:

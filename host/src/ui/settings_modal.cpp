@@ -26,6 +26,7 @@
 #include "../core/cpp_core.h"
 #include "../renderer.h"
 #include "copilot/copilot.h"  // ui::drawAiSettingsSection (glass-grouped AI tab sections)
+#include "ai/ai_prefs.h"  // ui::aiUiVerbosity/aiFollowActiveSession/aiActiveWorkPreviews
 #include "model_registry.h"  // ui::localPresets (experimental vision-review model presets)
 #include "leaderboard_ui.h"  // aicad.leaderboard/1 compact table (Settings > Benchmarks)
 #include "oauth_capture.h"  // in-app xAI multi-account CEF OAuth (Settings → Accounts)
@@ -2693,6 +2694,7 @@ static constexpr int kHarnessModeCount =
 // Settings → AI → Harness: mode grid + full quick-settings mirror (session knobs).
 static void drawHarnessOrganizationSection(AppState& st, float sc);
 static void drawHarnessSessionKnobs(AppState& st, float sc);
+static void drawMemoryLearningSection(AppState& st, float sc);
 
 // ---- Eng. Firm model assignments (config.json eng_firm.models) ----------------
 // Top-level roles + 8 disciplines. Auto = omit entry (ambient chat model). Merge-overlay
@@ -3153,6 +3155,182 @@ static void drawHarnessSessionKnobs(AppState& st, float sc) {
         }
         ImGui::EndTable();
     }
+}
+
+// ---- agent.* memory/learning knobs (config.json) -----------------------------
+// Same load-modify-write recipe as ui::loadMaxSubagentDepth/saveMaxSubagentDepth
+// (copilot/settings.cpp): read with a default, save via atomic .tmp rename.
+static std::string loadAgentConfigString(const char* key, const char* fallback) {
+    std::string v = fallback;
+    try {
+        std::ifstream in(configPath());
+        if (in) {
+            nlohmann::json j;
+            in >> j;
+            if (j.is_object()) {
+                auto agent = j.value("agent", nlohmann::json::object());
+                if (agent.is_object() && agent.contains(key) && agent[key].is_string())
+                    v = agent[key].get<std::string>();
+            }
+        }
+    } catch (...) {}
+    return v;
+}
+static bool loadAgentConfigBool(const char* key, bool fallback) {
+    bool v = fallback;
+    try {
+        std::ifstream in(configPath());
+        if (in) {
+            nlohmann::json j;
+            in >> j;
+            if (j.is_object()) {
+                auto agent = j.value("agent", nlohmann::json::object());
+                if (agent.is_object() && agent.contains(key) && agent[key].is_boolean())
+                    v = agent[key].get<bool>();
+            }
+        }
+    } catch (...) {}
+    return v;
+}
+static void saveAgentConfigValue(const char* key, const nlohmann::json& value) {
+    try {
+        nlohmann::json j = nlohmann::json::object();
+        {
+            std::ifstream in(configPath());
+            if (in) {
+                nlohmann::json old;
+                in >> old;
+                if (old.is_object()) j = std::move(old);
+            }
+        }
+        if (!j.contains("agent") || !j["agent"].is_object())
+            j["agent"] = nlohmann::json::object();
+        j["agent"][key] = value;
+        const std::string path = configPath();
+        const std::string tmp = path + ".tmp";
+        std::ofstream(tmp) << j.dump(2);
+        std::rename(tmp.c_str(), path.c_str());
+    } catch (...) {}
+}
+
+// Memory & Learning + Workspace visibility knobs (Settings > AI > Harness).
+// 2-col grid like the session knobs above. Backend/learning/cache knobs persist to
+// config.json agent.* via the recipe above; visibility knobs persist via ui/ai/ai_prefs.
+static void drawMemoryLearningSection(AppState& st, float sc) {
+    Settings& settings = st.settings;
+
+    static bool s_loaded = false;
+    static int s_memBackend = 0;      // 0 sqlite | 1 mnemopi  (agent.memory_backend)
+    static int s_compBackend = 0;     // 0 builtin | 1 omp     (agent.compaction_backend)
+    static bool s_learn = true;       // agent.memory_learn
+    static int s_verbosity = 2;       // ui::aiUiVerbosity (0 quiet | 1 normal | 2 full)
+    static bool s_follow = true;      // ui::aiFollowActiveSession
+    static bool s_previews = true;    // ui::aiActiveWorkPreviews
+    static bool s_cacheWarm = false;  // agent.cache_warming
+    if (!s_loaded) {
+        s_loaded = true;
+        s_memBackend = (loadAgentConfigString("memory_backend", "sqlite") == "mnemopi") ? 1 : 0;
+        s_compBackend = (loadAgentConfigString("compaction_backend", "builtin") == "omp") ? 1 : 0;
+        s_learn = loadAgentConfigBool("memory_learn", true);
+        s_verbosity = ui::aiUiVerbosity();
+        s_follow = ui::aiFollowActiveSession();
+        s_previews = ui::aiActiveWorkPreviews();
+        s_cacheWarm = loadAgentConfigBool("cache_warming", false);
+    }
+
+    static const char* kMemBackends[] = {"SQLite", "Mnemopi"};
+    static const char* kCompBackends[] = {"Builtin", "OMP snapcompact"};
+    static const char* kVerbosity[] = {"Quiet", "Normal", "Full"};
+
+    if (ImGui::BeginTable("##memory_learning", 2,
+                          ImGuiTableFlags_SizingStretchSame |
+                          ImGuiTableFlags_NoPadOuterX)) {
+        ImGui::TableNextColumn();
+        {
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted("Memory backend");
+            ImGui::SameLine();
+            helpMarker("Where project memory (decisions, notes, recall) is stored. "
+                       "SQLite = local .plm/memory.db (default). Mnemopi = OMP bridge "
+                       "memory. Saved to config.json agent.memory_backend.");
+            ImGui::SetNextItemWidth(-1.0f);
+            if (ImGui::Combo("##mem_backend", &s_memBackend, kMemBackends, 2))
+                saveAgentConfigValue("memory_backend", s_memBackend == 1 ? "mnemopi" : "sqlite");
+        }
+        ImGui::TableNextColumn();
+        {
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted("Compaction backend");
+            ImGui::SameLine();
+            helpMarker("How long transcripts are compacted. Builtin = pure-Python "
+                       "snapcompact archive (default). OMP snapcompact = OMP bridge "
+                       "compact engine. Saved to config.json agent.compaction_backend.");
+            ImGui::SetNextItemWidth(-1.0f);
+            if (ImGui::Combo("##comp_backend", &s_compBackend, kCompBackends, 2))
+                saveAgentConfigValue("compaction_backend", s_compBackend == 1 ? "omp" : "builtin");
+        }
+
+        ImGui::TableNextColumn();
+        ImGui::Checkbox("Project memory (per-folder)", &settings.memoryEnabled);
+        helpMarker("Remembers decisions and notes under the PLM project "
+                   "(.plm/memory.db). Auto-created; recall is token-budgeted.");
+        ImGui::TableNextColumn();
+        if (ImGui::Checkbox("Remember decisions & notes", &s_learn))
+            saveAgentConfigValue("memory_learn", s_learn);
+        helpMarker("Learning switch: when on, the agent writes decisions and notes it "
+                   "judges worth keeping into project memory (agent.memory_learn, "
+                   "default on). Recall still works when off; nothing new is learned.");
+
+        ImGui::TableNextColumn();
+        if (settings.memoryEnabled) {
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted("Memory token budget");
+            ImGui::SetNextItemWidth(-1.0f);
+            ImGui::SliderInt("##mem_budget_ml", &settings.memoryTokenBudget, 100, 2000,
+                             "%d tokens");
+        } else {
+            ImGui::Dummy(ImVec2(1, ImGui::GetFrameHeight()));
+        }
+        ImGui::TableNextColumn();
+        ImGui::Dummy(ImVec2(1, ImGui::GetFrameHeight()));
+        ImGui::EndTable();
+    }
+
+    // ---- Workspace visibility: how much the AI command-center views show ----
+    settingsSectionHeader("Workspace visibility");
+    if (ImGui::BeginTable("##workspace_vis", 2,
+                          ImGuiTableFlags_SizingStretchSame |
+                          ImGuiTableFlags_NoPadOuterX)) {
+        ImGui::TableNextColumn();
+        {
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted("Verbosity");
+            ImGui::SameLine();
+            helpMarker("How much the Agent Workflow / Active Work / Session Plan views "
+                       "render. Quiet = titles + status. Normal = last op. "
+                       "Full = op tickers, counts, token/latency detail (default).");
+            ImGui::SetNextItemWidth(-1.0f);
+            if (ImGui::Combo("##ws_verbosity", &s_verbosity, kVerbosity, 3))
+                ui::setAiUiVerbosity(s_verbosity);
+        }
+        ImGui::TableNextColumn();
+        if (ImGui::Checkbox("Autopopulate (follow active session)", &s_follow))
+            ui::setAiFollowActiveSession(s_follow);
+        helpMarker("Views follow the ACTIVE chat session / latest run automatically "
+                   "instead of manual picking.");
+
+        ImGui::TableNextColumn();
+        if (ImGui::Checkbox("Active-Work previews", &s_previews))
+            ui::setAiActiveWorkPreviews(s_previews);
+        helpMarker("Render iso preview thumbnails for agent-touched documents in the "
+                   "Active Work view. Off = lightweight placeholder only.");
+        ImGui::TableNextColumn();
+        if (ImGui::Checkbox("Provider cache-warming", &s_cacheWarm))
+            saveAgentConfigValue("cache_warming", s_cacheWarm);
+        ImGui::EndTable();
+    }
+    dimText("Cache-warming keeps provider prompt caches warm between runs "
+            "(agent.cache_warming, default off).");
 }
 
 }  // anonymous namespace
@@ -4661,6 +4839,10 @@ void drawSettingsModal(AppState& st, bool busy) {
                                 "options (role adoption, company auto-route, Eng. Firm budget).");
                         ImGui::Dummy(ImVec2(0, 4.0f * sc));
                         drawHarnessSessionKnobs(st, sc);
+                        settingsGlassSectionEnd();
+
+                        settingsGlassSectionBegin("##ai_memory", "Memory & Learning");
+                        drawMemoryLearningSection(st, sc);
                         settingsGlassSectionEnd();
 
                         settingsGlassSectionBegin("##ai_privacy", "Privacy");

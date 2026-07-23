@@ -711,6 +711,28 @@ static void mergeRoutingFields(ActivityItem& card, const nlohmann::json& data, c
 std::atomic<bool> s_chatHistoryDirty{false};
 double s_chatHistoryLastPersist = -1e9;
 
+// ---- session scope assessment handoff (conversations.cpp applies it) ----
+// feedTurnActivity folds the task_route/agent.classification/complexity events but only sees a
+// ChatMsg — the Conversation (scopeClass + title) needs AppState. Stash the latest routing
+// fields here; conversations.cpp's GL-draw-path hook (maybePersistChatHistoryDebounced)
+// consumes them and stamps the active session on its FIRST routing event.
+static bool        s_scopePending = false;
+static std::string s_scopeDomain, s_scopeComplexity, s_scopeStructure, s_scopeExecStyle,
+                   s_scopeSnippet;
+
+bool takePendingScopeAssessment(std::string& domain, std::string& complexity,
+                                std::string& structure, std::string& execStyle,
+                                std::string& snippet) {
+    if (!s_scopePending) return false;
+    domain     = std::move(s_scopeDomain);
+    complexity = std::move(s_scopeComplexity);
+    structure  = std::move(s_scopeStructure);
+    execStyle  = std::move(s_scopeExecStyle);
+    snippet    = std::move(s_scopeSnippet);
+    s_scopePending = false;
+    return true;
+}
+
 void markChatHistoryDirty() {
     s_chatHistoryDirty.store(true, std::memory_order_relaxed);
 }
@@ -1743,8 +1765,30 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             card = &m.activity.front();
         }
         mergeRoutingFields(*card, data, kind);
-        // task_route.structure is the decided execution style (solo/standard→edit,
-        // complex→swarm, or explicit mode). Stamp for the approve card if a user gate
+        // Session scope assessment handoff: conversations.cpp colors + names the session from
+        // these routing fields on the FIRST such event (see takePendingScopeAssessment).
+        s_scopeDomain.clear();
+        s_scopeComplexity.clear();
+        s_scopeStructure.clear();
+        s_scopeExecStyle.clear();
+        s_scopeSnippet.clear();
+        if (kind == "task_route") {
+            s_scopeDomain     = jstr(data, "domain");
+            s_scopeComplexity = jstr(data, "complexity");
+            s_scopeStructure  = jstr(data, "structure");
+            s_scopeExecStyle  = jstr(data, "execution_style");
+        } else if (kind == "agent.classification") {
+            s_scopeDomain     = jstr(data, "task_class");
+            s_scopeComplexity = jstr(data, "scaffold_level");
+            s_scopeSnippet    = jstr(data, "request_snippet");
+        } else {  // complexity
+            s_scopeComplexity = jstr(data, "level");
+            s_scopeStructure  = jstr(data, "structure");
+            s_scopeExecStyle  = jstr(data, "execution_style");
+        }
+        s_scopePending = true;
+        // task_route.structure is the decided execution style (solo/standard->edit,
+        // complex->swarm, or explicit mode). Stamp for the approve card if a user gate
         // ever lands; agent-decided plans ignore it for UX (no card).
         if (kind == "task_route") {
             std::string structure = jstr(data, "structure");

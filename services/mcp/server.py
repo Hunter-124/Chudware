@@ -358,6 +358,12 @@ register_doc_diff_tools(_reg.view(mcp, "cad"))
 # Engine: services/plm/. Zero user-facing git vocabulary (contract §8).
 from mcp_server.plm_tools import register_plm_tools
 register_plm_tools(_reg.view(mcp, "plm"))
+# Office documents (T-office, contracts/office.md): read+edit .pptx/.xlsx/.xlsm/.csv/.pdf/
+# .doc/.docx over python-pptx/openpyxl/python-docx/pypdfium2/pypdf + the LibreOffice-headless
+# bridge for legacy .doc. office_extract is the FROZEN contract also exposed as a worker RPC
+# (services/agent/worker_rpc.py) for the host AI-tab docs_panel.
+from mcp_server.office_tools import register_office_tools
+register_office_tools(_reg.view(mcp, "office"))
 # CAD link graph (1D): cad_graph traversal + cad_graph_link (AI overlay) +
 # assembly_plan_review. Over services/plm/cad_graph.py + graph_links.py.
 from mcp_server.graph_tools import register_graph_tools

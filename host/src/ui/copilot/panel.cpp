@@ -81,21 +81,23 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     const float gearW = measureBtn("Settings", "settings");
     const float minGap = style.ItemSpacing.x;
     const float rightInset = ui::metrics::U(0.5f);
-    // Collapse chip lives INSIDE the header at the column's right edge (was:
-    // parked in the viewport gutter, overlapping viewport buttons like
-    // Section View). Row content reserves chevSz + gap on the right via
-    // contentRightInset so nothing sits under the chip.
+    // Collapse chip sits on the left, vertically centered between row 1's
+    // 0/0 tasks chip and row 2's Chat button. Row content shifts right past
+    // it via contentLeftInset; right side keeps the plain rightInset so the
+    // block hugs the screen edge.
     const float chevSz  = 26.0f * sc;
-    const float contentRightInset = rightInset + chevSz + 4.0f * sc;
     const float leftInset = rightInset;
+    const float contentLeftInset = leftInset + chevSz + 6.0f * sc;
     const float colW = ImGui::GetContentRegionAvail().x;
 
-    // ---- Collapse chip (floating window just left of the column) ----
+    // ---- Collapse chip (floating window, left edge, between the two rows) ----
     {
         const ImVec2 winP0 = ImGui::GetWindowPos();
-        // Inside the header's right edge, vertically matched to row 1.
-        const ImVec2 c0(winP0.x + ImGui::GetWindowWidth() - rightInset - chevSz,
-                        winP0.y + ImGui::GetWindowContentRegionMin().y + 8.0f * sc);
+        const float row1H = 6.0f * sc + wordLh;      // top pad + row-1 height
+        const float row2H = std::max(lh, ImGui::GetFrameHeight()) + 6.0f * sc;
+        const float chipY = winP0.y + ImGui::GetWindowContentRegionMin().y +
+                            (row1H + row2H - chevSz) * 0.5f;
+        const ImVec2 c0(winP0.x + leftInset, chipY);
         ImGui::SetNextWindowPos(c0, ImGuiCond_Always);
         ImGui::SetNextWindowSize(ImVec2(chevSz, chevSz), ImGuiCond_Always);
         ImGui::SetNextWindowBgAlpha(0.0f);
@@ -122,8 +124,8 @@ static void drawCopilotHeader(AppState& st, bool busy) {
             const ImVec2 cc(b0.x + chevSz * 0.5f, b0.y + chevSz * 0.5f);
             const float ca = 3.5f * sc;
             const float stroke = 1.85f * sc;
-            // "»" double chevron to collapse, "«" to expand (mirrored).
-            const float dir = s_cpCollapsed ? -1.0f : 1.0f;
+            // "«" collapse to the left, "»" expand back right.
+            const float dir = s_cpCollapsed ? 1.0f : -1.0f;
             for (int i = 0; i < 2; ++i) {
                 const float ox = (i == 0 ? -2.5f : 2.5f) * sc;
                 wdl->AddLine(ImVec2(cc.x + dir * (ox - ca * 0.5f), cc.y - ca),
@@ -163,7 +165,7 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         const float artW = measureBtn("Artifacts", "team");
 
         cy1(bh);
-        ImGui::SetCursorPosX(leftInset);
+        ImGui::SetCursorPosX(contentLeftInset);
         if (busy) ImGui::BeginDisabled();
         if (drawHeaderTextButton("##hdr_tasks", tlLabel, st.showTaskList, tlW, "plan_board")) {
             const bool open = !st.showTaskList;
@@ -182,8 +184,8 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         const ImVec4 statusTint(statusCol[0], statusCol[1], statusCol[2], 1.0f);
 
         float logoLeft = (colW - logoW) * 0.5f;
-        logoLeft = std::max(leftInset + tlW + 6.0f * sc, logoLeft);
-        logoLeft = std::min(logoLeft, colW - contentRightInset - artW - logoW - 6.0f * sc);
+        logoLeft = std::max(contentLeftInset + tlW + 6.0f * sc, logoLeft);
+        logoLeft = std::min(logoLeft, colW - rightInset - artW - logoW - 6.0f * sc);
         ImGui::SameLine(logoLeft);
         {
             IconUV cube = ui::getIcon("context_cube", 20);
@@ -203,7 +205,7 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         ImGui::PopStyleColor();
         if (wordF) ImGui::PopFont();
 
-        ImGui::SameLine(colW - contentRightInset - artW);
+        ImGui::SameLine(colW - rightInset - artW);
         cy1(bh);
         if (busy) ImGui::BeginDisabled();
         if (drawHeaderTextButton("##hdr_arts", "Artifacts", st.showArtifacts, artW, "team")) {
@@ -222,8 +224,8 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     const float rowTop = ImGui::GetCursorPosY();
     auto centerY = [&](float h) { ImGui::SetCursorPosY(rowTop + (rowH - h) * 0.5f); };
 
-    const float usableL = leftInset;
-    const float usableR = colW - contentRightInset;
+    const float usableL = contentLeftInset;
+    const float usableR = colW - rightInset;
     const float free = usableR - usableL - chatW - sessW - gearW;
     float gapEq = free * 0.5f;
     if (gapEq < minGap) gapEq = minGap;
@@ -348,6 +350,42 @@ void drawSessionsPanel(AppState& st, bool busy) {
 
         float wash = active ? 0.55f : (rowHov ? 0.42f : 0.28f);
         ui::glassRowBackground(dl, rowMin, rowMax, 8.0f * sc, (i % 2) == 1, active, wash);
+
+        // Scope color-code: once the model has assessed the session (first routing event),
+        // tint the row with a 3px left-edge bar + subtle wash + a tiny class chip on the
+        // title line. semanticOnGlass keeps the chip ink legible over dark + light glass.
+        if (c.scopeClass >= 0) {
+            float scopeRgba[4];
+            scopeClassColor(c.scopeClass, scopeRgba);
+            const ImVec4 scopeCol = semanticOnGlass(scopeRgba, surf);
+            const float barW = 3.0f * sc;
+            ImVec4 barCol = scopeCol;
+            barCol.w = 0.95f;
+            dl->AddRectFilled(rowMin, ImVec2(rowMin.x + barW, rowMax.y),
+                              ImGui::ColorConvertFloat4ToU32(barCol), 8.0f * sc,
+                              ImDrawFlags_RoundCornersLeft);
+            ImVec4 washCol = scopeCol;
+            washCol.w = active ? 0.10f : 0.07f;
+            dl->AddRectFilled(rowMin, rowMax, ImGui::ColorConvertFloat4ToU32(washCol),
+                              8.0f * sc);
+
+            const char* scopeLbl = c.scopeClass == 0 ? "trivial" : c.scopeClass == 1 ? "standard"
+                                 : c.scopeClass == 2 ? "complex" : "epic";
+            const ImVec2 lsz = ImGui::CalcTextSize(scopeLbl);
+            // Right-aligned, kept clear of the hover/active trash button zone.
+            const float cx1 = rowMax.x - trashSz - padX;
+            const float cx0 = cx1 - lsz.x - 8.0f * sc;
+            const float cy0 = rowMin.y + padY + (titleH - lsz.y) * 0.5f - 1.0f * sc;
+            const float cy1 = cy0 + lsz.y + 2.0f * sc;
+            ImVec4 chipBg = scopeCol;
+            chipBg.w = 0.16f;
+            dl->AddRectFilled(ImVec2(cx0, cy0), ImVec2(cx1, cy1),
+                              ImGui::ColorConvertFloat4ToU32(chipBg), 4.0f * sc);
+            ImVec4 chipInk = scopeCol;
+            chipInk.w = 1.0f;
+            dl->AddText(ImVec2(cx0 + 4.0f * sc, cy0 + 1.0f * sc),
+                        ImGui::ColorConvertFloat4ToU32(chipInk), scopeLbl);
+        }
 
         const float titleY = rowMin.y + padY;
         ImU32 ink = ImGui::ColorConvertFloat4ToU32(surf.textPrimary);

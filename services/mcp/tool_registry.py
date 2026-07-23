@@ -45,7 +45,13 @@ _READ_EXACT = {"hover", "cad_guide", "intake_status", "ecad_status", "cam_job_tr
               # T-DP11: ledger_events returns raw events for the GUI transparency stream.
               "ledger_get", "ledger_events",
               # Workspace (T-W16): status/events are read-only poll tools.
-              "workspace_status", "workspace_doc_events"}
+              "workspace_status", "workspace_doc_events",
+              # Office read tools (T-office): office_extract is the frozen worker-RPC-shared
+              # extraction contract; the rest are read-only per-format structured reads. None
+              # match the get_/describe_/etc prefix classifier (all start with "office_"), so
+              # they need explicit entries. office_edit_* is left unclassified -> RISK_WRITE.
+              "office_extract", "office_read_pptx", "office_read_xlsx", "office_read_csv",
+              "office_read_pdf", "office_read_docx", "office_read_doc"}
 
 # Explicit overrides for names the classifier would mislabel. name -> risk.
 _RISK_OVERRIDES: dict[str, str] = {

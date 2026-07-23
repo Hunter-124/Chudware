@@ -1,8 +1,8 @@
 // AI workspace: full-viewport body for the AI title-bar tab (v2 layout, tracker M1-M8).
 // Compact, transparency-first shell:
-//   - UPPER main area: the DAG pane, switched by an Agent Workflow | Session Plan tab strip
-//     (Phase 1 renders the existing buildgraph view in both; Phase 2 swaps in the live
-//     agent-execution DAG for Agent Workflow). Left of it: the sessions/sub-agents rail.
+//   - UPPER main area: the DAG pane, switched by a five-chip tab strip (Agent Workflow |
+//     Session Plan | Active Work | Documents | Leaderboard — ai_workspace.cpp, s_ai.dagView).
+//     Left of it: the sessions/sub-agents rail.
 //   - LOWER-LEFT: the conversation window (message log + composer) — ALWAYS visible, no tab
 //     (SAME state/send path as the docked column, via the ui/copilot/copilot.h reuse hooks).
 //   - LOWER-RIGHT: AI *workflow* settings only (Supervised/Autopilot, refine passes, max output
@@ -34,5 +34,12 @@ void drawAiWorkspace(AppState& st);
 // unsourced kinds (agent.spawn / agent.advisor) — the latter simply add no nodes until a real
 // production sink emits them (honest empty-state, no fabrication). `run_started` resets the tree.
 void feedAgentDagEvent(const std::string& kind, const nlohmann::json& data);
+
+// Serialize / restore the live Agent Workflow DAG store (s_agdag) — every node field the
+// canvas draws (id, parentId, kind, actor, title, detail, status, refId, latencyMs, seq) plus
+// the run id and counters. Used to snapshot a run's execution tree as an artifact. GL-thread
+// only (same store, no mutex). Tolerates partial/corrupt input (skips bad records).
+nlohmann::json agentDagToJson();
+void agentDagFromJson(const nlohmann::json& j);
 
 }  // namespace ui

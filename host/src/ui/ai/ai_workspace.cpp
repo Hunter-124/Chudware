@@ -1,7 +1,7 @@
 // AI workspace — full-page AI hub for the AI title-bar tab (v2 redesign, tracker M1-M8, M21).
 //
 //   +----------------------------------------------------------------+
-//   | [rail] | chat        |  DAG pane [Agent Workflow|Session Plan] |   <- M21 layout
+//   | [rail] | chat        |  DAG pane [Workflow|Plan|Active|Docs|Board] | <- M21 layout
 //   |        | (narrow,    |                                         |
 //   |        |  full       +-----------------------------------------+
 //   |        |  height)    |  workflow options (re-flowed, M21)      |
@@ -32,12 +32,16 @@
 #include <vector>
 
 #include "imgui.h"
+#include "imgui_internal.h"   // ImRect (glassPanel/adaptivePanel rects)
 
 #include "core/app_state.h"
 #include "ui/copilot/copilot.h"
 #include "ui_theme.h"
 #include "ui/leaderboard_ui.h"
 #include "ui/ai/active_work.h"
+#include "ui/ai/plan_board.h"
+#include "ui/ai/docs_panel.h"
+#include "ui/ai/ai_prefs.h"
 
 namespace ui {
 
@@ -59,9 +63,9 @@ struct DagRun {
 };
 
 struct AiWsState {
-    // Which DAG the upper pane shows (M7): 0 = Agent Workflow, 1 = Session Plan, 2 = Leaderboard.
-    // Phase 1 renders the buildgraph view for BOTH workflow tabs; Phase 2 swaps a live
-    // agent-execution DAG into Agent Workflow. The conversation window is always visible below
+    // Which view the upper pane shows (M7): 0 = Agent Workflow (live agent-execution DAG),
+    // 1 = Session Plan (plan board over persisted buildgraph runs), 2 = Active Work,
+    // 3 = Documents, 4 = Leaderboard. The conversation window is always visible below
     // (M6), never a tab. Leaderboard reads benchmarks/leaderboard/leaderboard.json.
     int  dagView      = 0;     // default to Agent Workflow (Phase 2 live execution DAG)
     bool showSettings = true;
@@ -71,6 +75,11 @@ struct AiWsState {
     // data (Conversation has no run_id yet — see AI_WORKSPACE_V2_PLAN.md §2.1), so today the
     // view still lists every persisted run. Kept here so the scoping wiring is already in place.
     std::string selSession;
+
+    // Autopopulate (agent.ui_follow_active_session): the last live run id that yanked the
+    // pane to the Agent Workflow view — a NEW run switches the view once, then the user is
+    // free to pick another tab.
+    std::string lastAutoRun;
 
     // DAG run catalog (scanned from the persisted runs dir; Refresh re-scans).
     bool                runsScanned = false;
@@ -179,6 +188,28 @@ static AgNode& agUpsert(const std::string& id, const std::string& parentId) {
     return s_agdag.nodes.back();
 }
 
+// Stable serialization names for AgKind (distinct from the display tags in agKindTag below).
+static const char* agKindName(AgKind k) {
+    switch (k) {
+        case AgKind::Root:    return "root";
+        case AgKind::Tool:    return "tool";
+        case AgKind::Thought: return "thought";
+        case AgKind::Context: return "context";
+        case AgKind::Spawn:   return "spawn";
+        case AgKind::Advisor: return "advisor";
+        default:              return "other";
+    }
+}
+static AgKind agKindFromName(const std::string& s) {
+    if (s == "root")    return AgKind::Root;
+    if (s == "tool")    return AgKind::Tool;
+    if (s == "thought") return AgKind::Thought;
+    if (s == "context") return AgKind::Context;
+    if (s == "spawn")   return AgKind::Spawn;
+    if (s == "advisor") return AgKind::Advisor;
+    return AgKind::Other;
+}
+
 }  // close the file-level anonymous namespace so feedAgentDagEvent has external ui:: linkage
 
 // Feed one drained orchestrator event into the live Agent Workflow DAG (GL thread only).
@@ -269,6 +300,71 @@ void feedAgentDagEvent(const std::string& kind, const nlohmann::json& data) {
         s_agdag.sawAdvisor = true;
     }
     // Any other agent.* kind (artifact/question/answer) is tolerated but not graphed here.
+}
+
+// Serialize the live Agent Workflow DAG store (s_agdag) — every field the canvas draws.
+nlohmann::json agentDagToJson() {
+    nlohmann::json j;
+    j["runId"]        = s_agdag.runId;
+    j["seqCtr"]       = s_agdag.seqCtr;
+    j["sawSpawn"]     = s_agdag.sawSpawn;
+    j["sawAdvisor"]   = s_agdag.sawAdvisor;
+    j["toolCount"]    = s_agdag.toolCount;
+    j["thoughtCount"] = s_agdag.thoughtCount;
+    j["ctxCount"]     = s_agdag.ctxCount;
+    nlohmann::json arr = nlohmann::json::array();
+    for (const AgNode& n : s_agdag.nodes) {
+        nlohmann::json jn;
+        jn["id"]        = n.id;
+        jn["parentId"]  = n.parentId;
+        jn["kind"]      = agKindName(n.kind);
+        jn["actor"]     = n.actor;
+        jn["title"]     = n.title;
+        jn["detail"]    = n.detail;
+        jn["status"]    = n.status;
+        jn["refId"]     = n.refId;
+        jn["latencyMs"] = n.latencyMs;
+        jn["seq"]       = n.seq;
+        arr.push_back(std::move(jn));
+    }
+    j["nodes"] = std::move(arr);
+    return j;
+}
+
+// Restore a serialized tree (agentDagToJson) into the store. Rebuilds the id index; tree
+// links (children/depth) are re-derived by agResolveTree at draw time.
+void agentDagFromJson(const nlohmann::json& j) {
+    if (!j.is_object()) return;
+    s_agdag.reset(j.value("runId", std::string()));
+    s_agdag.sawSpawn     = j.value("sawSpawn", false);
+    s_agdag.sawAdvisor   = j.value("sawAdvisor", false);
+    s_agdag.toolCount    = j.value("toolCount", 0);
+    s_agdag.thoughtCount = j.value("thoughtCount", 0);
+    s_agdag.ctxCount     = j.value("ctxCount", 0);
+    if (j.contains("nodes") && j["nodes"].is_array()) {
+        for (const auto& jn : j["nodes"]) {
+            if (!jn.is_object()) continue;
+            AgNode n;
+            n.id        = jn.value("id", "");
+            n.parentId  = jn.value("parentId", "");
+            n.kind      = agKindFromName(jn.value("kind", std::string("other")));
+            n.actor     = jn.value("actor", "");
+            n.title     = jn.value("title", "");
+            n.detail    = jn.value("detail", "");
+            n.status    = jn.value("status", "");
+            n.refId     = jn.value("refId", "");
+            n.latencyMs = jn.value("latencyMs", -1);
+            n.seq       = jn.value("seq", (long long)0);
+            if (n.id.empty()) n.id = "_leaf" + std::to_string(n.seq);
+            if (s_agdag.byId.count(n.id)) continue;   // corrupt duplicate id — skip
+            s_agdag.byId[n.id] = (int)s_agdag.nodes.size();
+            s_agdag.nodes.push_back(std::move(n));
+        }
+    }
+    // Restore the arrival counter past every restored seq so new events keep ordering.
+    long long maxSeq = -1;
+    for (const AgNode& n : s_agdag.nodes) maxSeq = std::max(maxSeq, n.seq);
+    s_agdag.seqCtr = std::max(j.value("seqCtr", (long long)0), maxSeq + 1);
 }
 
 // Reopen the file-level anonymous namespace for the remaining internal helpers/renderers.
@@ -944,7 +1040,9 @@ static void agFlattenVisible(const std::vector<int>& roots, std::vector<int>& vi
     }
 }
 
-static void drawAgentDagCanvas(AppState& st) {
+// verbosity (agent.ui_verbosity): 0 = title only, 1 = + detail line, 2 = + actor / latency /
+// generous detail budget (the footer counts live in the view header above the canvas).
+static void drawAgentDagCanvas(AppState& st, int verbosity) {
     const float S = ui::uiScale;
 
     std::vector<int> roots;
@@ -1054,18 +1152,25 @@ static void drawAgentDagCanvas(AppState& st) {
         }
 
         if (z > 0.5f) {
-            char head[96];
-            std::snprintf(head, sizeof(head), "%s%s%s", agKindTag(n.kind),
-                          n.latencyMs >= 0 ? "  ·  " : "",
-                          n.latencyMs >= 0 ? (std::to_string(n.latencyMs) + " ms").c_str() : "");
+            char head[160];
+            if (verbosity >= 2) {
+                const std::string lat = n.latencyMs >= 0
+                    ? (std::to_string(n.latencyMs) + " ms") : std::string();
+                std::snprintf(head, sizeof(head), "%s%s%s%s%s", agKindTag(n.kind),
+                              n.actor.empty() ? "" : "  \xC2\xB7  ", n.actor.c_str(),
+                              lat.empty() ? "" : "  \xC2\xB7  ", lat.c_str());
+            } else {
+                std::snprintf(head, sizeof(head), "%s", agKindTag(n.kind));
+            }
             dl->AddText(ImVec2(p0.x + 10.0f * S * z, p0.y + 4.0f * S * z),
                 ImGui::ColorConvertFloat4ToU32(ImVec4(sc[0], sc[1], sc[2], 1.0f)), head);
-            // primary line = title, dim secondary = detail (target/label/verdict/thought)
+            // primary line = title; verbosity 1+ appends the dim detail (target/label/verdict/
+            // thought) with a wider budget at full verbosity (tooltip always carries ALL text)
             std::string lbl = n.title;
-            if (!n.detail.empty()) lbl += "  " + n.detail;
+            if (verbosity >= 1 && !n.detail.empty()) lbl += "  " + n.detail;
             if (s_agdag.nodes[idx].collapsed && hasKids)
                 lbl += "  (+" + std::to_string((int)n.children.size()) + ")";
-            const size_t maxCh = (size_t)std::max(10.0f, 34.0f * z);
+            const size_t maxCh = (size_t)std::max(10.0f, (verbosity >= 2 ? 72.0f : 34.0f) * z);
             if (lbl.size() > maxCh) lbl = lbl.substr(0, maxCh - 1) + "\xE2\x80\xA6";
             dl->AddText(ImVec2(p0.x + 10.0f * S * z, p0.y + nodeH * 0.46f),
                 ImGui::ColorConvertFloat4ToU32(
@@ -1108,16 +1213,108 @@ static void drawAgentDagCanvas(AppState& st) {
     ImGui::EndChild();
 }
 
-// The Agent Workflow tab body: live tree from the event store, honest empty-states throughout.
+// ---- orchestration tree ---------------------------------------------------------
+// The sub-agent registry (s_sub.sessions, populated by pollSubagentList) rendered as compact
+// glass agent cards — role / status / model / id — alongside the live execution DAG. Full
+// visibility: EVERY registered agent shows, always. Click opens that sub-agent's chat in the
+// conversation column (same M11 behavior as the DAG's spawn-node tap).
+static void drawOrchestrationTree(AppState& st, float treeW) {
+    const float S = ui::uiScale;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6 * S, 6 * S));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
+    ImGui::BeginChild("##ag_orch_tree", ImVec2(treeW, 0), ImGuiChildFlags_None);
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar();
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 w0 = ImGui::GetWindowPos();
+    const ImRect wRect(w0, ImVec2(w0.x + ImGui::GetWindowSize().x,
+                                  w0.y + ImGui::GetWindowSize().y));
+    const AdaptiveSurface& surf =
+        adaptivePanel(panelId("ai_ws_orch_glass"), wRect, GlassGroup::Global);
+    glassPanel(dl, wRect, GlassLevel::UltraThin, 8.0f * S, surf);
+
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+    ImGui::Text("Agents  (%d)", (int)s_sub.sessions.size());
+    ImGui::PopStyleColor();
+    ImGui::Spacing();
+
+    if (s_sub.sessions.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+        ImGui::TextWrapped("%s", st.workerStarted
+            ? "No sub-agents spawned. Delegated workers appear here live."
+            : "Start the worker service to see sub-agents.");
+        ImGui::PopStyleColor();
+    }
+
+    const float lineH = ImGui::GetTextLineHeightWithSpacing();
+    for (const auto& s : s_sub.sessions) {
+        ImGui::PushID(s.id.c_str());
+        const ImVec2 c0 = ImGui::GetCursorScreenPos();
+        const float  cw = ImGui::GetContentRegionAvail().x;
+        const float  ch = lineH * 3.0f + 10.0f * S;
+        const ImVec2 c1(c0.x + cw, c0.y + ch);
+        const bool open = s_sub.active && s_sub.cur.id == s.id;
+        const bool hov  = ImGui::IsMouseHoveringRect(c0, c1);
+        glassPanel(dl, ImRect(c0, c1), GlassLevel::Thin, 6.0f * S, surf,
+                   open ? 1.0f : (hov ? 0.85f : 0.7f));
+        const float* sc = statusColor(s.status);
+        dl->AddRect(c0, c1,
+            ImGui::ColorConvertFloat4ToU32(
+                ImVec4(sc[0], sc[1], sc[2], open ? 0.9f : 0.45f)),
+            6.0f * S, 0, 1.1f * S);
+        if (ImGui::InvisibleButton("##agentcard", ImVec2(cw, ch)))
+            openSubagentView(st, s.id, s.role);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Open this sub-agent's chat (view + steer).");
+
+        // line 1: status glyph + role
+        float y = c0.y + 4.0f * S;
+        ImGui::SetCursorScreenPos(ImVec2(c0.x + 8.0f * S, y));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(sc[0], sc[1], sc[2], 1.0f));
+        ImGui::TextUnformatted(s.status == "running" ? "[>]" : "[ ]");
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+        ImGui::TextUnformatted(s.role.empty() ? "sub-agent" : s.role.c_str());
+        ImGui::PopStyleColor();
+        // line 2: status
+        y += lineH;
+        ImGui::SetCursorScreenPos(ImVec2(c0.x + 8.0f * S, y));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(sc[0], sc[1], sc[2], 0.9f));
+        ImGui::TextUnformatted(s.status.empty() ? "status unknown" : s.status.c_str());
+        ImGui::PopStyleColor();
+        // line 3: model + id
+        y += lineH;
+        ImGui::SetCursorScreenPos(ImVec2(c0.x + 8.0f * S, y));
+        std::string meta = s.model.empty() ? s.id : (s.model + "  " + s.id);
+        if (meta.size() > 30) meta = meta.substr(0, 29) + "\xE2\x80\xA6";
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+        ImGui::TextUnformatted(meta.c_str());
+        ImGui::PopStyleColor();
+
+        ImGui::SetCursorScreenPos(ImVec2(c0.x, c1.y + 4.0f * S));
+        ImGui::PopID();
+    }
+    ImGui::EndChild();
+}
+
+// The Agent Workflow tab body: live tree from the event store + the orchestration tree of
+// registered sub-agents, honest empty-states throughout. Honors agent.ui_verbosity:
+//   0 = node titles only · 1 = + detail lines · 2 = + actor/latency, counts footer, full text.
 static void drawAgentWorkflowView(AppState& st) {
     const float S = ui::uiScale;
     const bool  busy = st.job.running.load();
+    const int   verbosity = aiUiVerbosity();
 
-    // Header strip: live counts + the honest state of the currently-unsourced branch kinds (M20).
-    if (!s_agdag.empty()) {
+    pollSubagentList(st);   // keep the registry snapshot warm (throttled + single in-flight)
+
+    // Header strip (verbosity 2): live counts + the honest state of the currently-unsourced
+    // branch kinds (M20).
+    if (verbosity >= 2 && !s_agdag.empty()) {
         ImGui::PushStyleColor(ImGuiCol_Text,
             ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
-        ImGui::Text("%d tool call%s · %d thought%s · %d context inject%s",
+        ImGui::Text("%d tool call%s \xC2\xB7 %d thought%s \xC2\xB7 %d context inject%s",
                     s_agdag.toolCount,   s_agdag.toolCount == 1 ? "" : "s",
                     s_agdag.thoughtCount,s_agdag.thoughtCount == 1 ? "" : "s",
                     s_agdag.ctxCount,    s_agdag.ctxCount == 1 ? "" : "s");
@@ -1129,14 +1326,17 @@ static void drawAgentWorkflowView(AppState& st) {
             ImVec4(palette.textDisabled[0], palette.textDisabled[1],
                    palette.textDisabled[2], 1.0f));
         if (!s_agdag.sawSpawn && !s_agdag.sawAdvisor)
-            ImGui::TextUnformatted("   · no sub-agent / advisor branches yet");
+            ImGui::TextUnformatted("   \xC2\xB7 no sub-agent / advisor branches yet");
         ImGui::PopStyleColor();
         ImGui::Spacing();
     }
 
-    if (s_agdag.empty()) {
+    const bool haveDag  = !s_agdag.empty();
+    const bool haveSubs = !s_sub.sessions.empty();
+
+    if (!haveDag && !haveSubs) {
         if (busy)
-            emptyState("[>]", "Agent is starting…",
+            emptyState("[>]", "Agent is starting\xE2\x80\xA6",
                        "Tool calls, thoughts and context injections will appear here as the run streams.");
         else
             emptyState("[/]", "No agent activity yet",
@@ -1144,7 +1344,19 @@ static void drawAgentWorkflowView(AppState& st) {
                        "context injections and (when they run) sub-agent / advisor branches, live.");
         return;
     }
-    drawAgentDagCanvas(st);
+
+    // Orchestration tree (registry agent cards) beside the live execution DAG.
+    if (haveSubs) {
+        drawOrchestrationTree(st, 216.0f * S);
+        ImGui::SameLine();
+    }
+    if (haveDag) {
+        drawAgentDagCanvas(st, verbosity);
+    } else {
+        // Registry has agents but the event stream hasn't produced spans yet — honest, not blank.
+        emptyState("[>]", busy ? "Agent is starting\xE2\x80\xA6" : "No agent events yet",
+                   "Tool calls, thoughts and context injections appear here as the run streams.");
+    }
 }
 
 // ---- DAG canvas ------------------------------------------------------------------
@@ -1261,7 +1473,9 @@ static void drawDagCanvas(AppState& st) {
     ImGui::EndChild();
 }
 
-static void drawDagView(AppState& st) {
+// Kept for reference: the legacy buildgraph canvas view. The Session Plan tab now dispatches
+// to drawPlanBoardView (ui/ai/plan_board.h); this path is no longer wired into the tab strip.
+[[maybe_unused]] static void drawDagView(AppState& st) {
     const float S = ui::uiScale;
     if (!s_ai.runsScanned) scanRuns();
 
@@ -1348,8 +1562,22 @@ static void drawDagView(AppState& st) {
 static void drawSessionsRail(AppState& st, float railW, bool busy) {
     const float S = ui::uiScale;
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10 * S, 8 * S));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
     ImGui::BeginChild("##ai_ws_rail", ImVec2(railW, 0), ImGuiChildFlags_None);
+    ImGui::PopStyleColor();
     ImGui::PopStyleVar();
+
+    // Liquid-glass slab behind the whole rail (same recipe as active_work.cpp): one adaptive
+    // surface, frosted panel, then the content rows ride on top.
+    {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec2 w0 = ImGui::GetWindowPos();
+        const ImRect wRect(w0, ImVec2(w0.x + ImGui::GetWindowSize().x,
+                                      w0.y + ImGui::GetWindowSize().y));
+        const AdaptiveSurface& surf =
+            adaptivePanel(panelId("ai_ws_rail_glass"), wRect, GlassGroup::Global);
+        glassPanel(dl, wRect, GlassLevel::Thin, 10.0f * S, surf);
+    }
 
     sectionHeader("Sessions");
     // The docked Copilot's exact session list (same rows, same switch/close/new behavior).
@@ -1484,8 +1712,21 @@ static void drawChatCenter(AppState& st, bool busy, bool canRun) {
 static void drawSettingsPane(AppState& st, float paneH, bool /*busy*/) {
     const float S = ui::uiScale;
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10 * S, 8 * S));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
     ImGui::BeginChild("##ai_ws_settings", ImVec2(0, paneH), ImGuiChildFlags_None);
+    ImGui::PopStyleColor();
     ImGui::PopStyleVar();
+
+    // Liquid-glass slab behind the options strip (same recipe as the rail above).
+    {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec2 w0 = ImGui::GetWindowPos();
+        const ImRect wRect(w0, ImVec2(w0.x + ImGui::GetWindowSize().x,
+                                      w0.y + ImGui::GetWindowSize().y));
+        const AdaptiveSurface& surf =
+            adaptivePanel(panelId("ai_ws_opts_glass"), wRect, GlassGroup::Global);
+        glassPanel(dl, wRect, GlassLevel::Thin, 10.0f * S, surf);
+    }
 
     bool changed = false;
     const bool twoCol = ImGui::GetContentRegionAvail().x > 480.0f * S;
@@ -1539,12 +1780,35 @@ static void drawSettingsPane(AppState& st, float paneH, bool /*busy*/) {
 
 // ---- public entry point ------------------------------------------------------------
 
-// The upper DAG pane: tab strip (Agent Workflow | Session Plan | Leaderboard) + gear.
+// The upper DAG pane: tab strip (Agent Workflow | Session Plan | Active Work | Documents |
+// Leaderboard) + gear.
 static void drawDagPane(AppState& st, bool /*busy*/) {
     const float S = ui::uiScale;
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10 * S, 8 * S));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
     ImGui::BeginChild("##ai_ws_dag", ImVec2(0, 0), ImGuiChildFlags_None);
+    ImGui::PopStyleColor();
     ImGui::PopStyleVar();
+
+    // Liquid-glass slab behind the whole pane (same recipe as active_work.cpp).
+    {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec2 w0 = ImGui::GetWindowPos();
+        const ImRect wRect(w0, ImVec2(w0.x + ImGui::GetWindowSize().x,
+                                      w0.y + ImGui::GetWindowSize().y));
+        const AdaptiveSurface& surf =
+            adaptivePanel(panelId("ai_ws_dag_glass"), wRect, GlassGroup::Global);
+        glassPanel(dl, wRect, GlassLevel::Thin, 10.0f * S, surf);
+    }
+
+    // Autopopulate (agent.ui_follow_active_session): a NEW live run yanks the pane to the
+    // Agent Workflow view so the streaming execution tree shows without manual picking; the
+    // Session Plan scope (s_ai.selSession) is bound each frame in drawAiWorkspace.
+    if (aiFollowActiveSession() && !s_agdag.runId.empty() &&
+        s_agdag.runId != s_ai.lastAutoRun) {
+        s_ai.lastAutoRun = s_agdag.runId;
+        s_ai.dagView     = 0;
+    }
 
     // Tab strip switches ONLY this pane (M7). Leaderboard is the aicad.leaderboard/1 consumer.
     if (viewChip("Agent Workflow", s_ai.dagView == 0)) s_ai.dagView = 0;
@@ -1553,7 +1817,9 @@ static void drawDagPane(AppState& st, bool /*busy*/) {
     ImGui::SameLine();
     if (viewChip("Active Work", s_ai.dagView == 2)) s_ai.dagView = 2;
     ImGui::SameLine();
-    if (viewChip("Leaderboard", s_ai.dagView == 3)) s_ai.dagView = 3;
+    if (viewChip("Documents", s_ai.dagView == 3)) s_ai.dagView = 3;
+    ImGui::SameLine();
+    if (viewChip("Leaderboard", s_ai.dagView == 4)) s_ai.dagView = 4;
     ImGui::SameLine();
     ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
                          std::max(0.0f, ImGui::GetContentRegionAvail().x - 84.0f * S));
@@ -1564,7 +1830,7 @@ static void drawDagPane(AppState& st, bool /*busy*/) {
         ImGui::SetTooltip("Show / hide the AI workflow options pane.");
     ImGui::Spacing();
 
-    if (s_ai.dagView == 3) {
+    if (s_ai.dagView == 4) {
         if (!s_ai.lbLoaded) {
             s_ai.lb = ui::leaderboard::load();
             s_ai.lbLoaded = true;
@@ -1575,18 +1841,21 @@ static void drawDagPane(AppState& st, bool /*busy*/) {
             s_ai.lb = ui::leaderboard::load();
             s_ai.lbLoaded = true;
         }
+    } else if (s_ai.dagView == 3) {
+        // Documents: in-tab office-document attach / preview / edit panel.
+        drawDocsPanel(st);
     } else if (s_ai.dagView == 2) {
         // Active Work: live grid of the docs agents are creating/editing right now.
         drawActiveWorkView(st);
     } else if (s_ai.dagView == 0) {
-        // Phase 2 (M9/M10): the LIVE agent-execution DAG.
+        // Phase 2 (M9/M10): the LIVE agent-execution DAG + orchestration tree.
         drawAgentWorkflowView(st);
     } else if (!st.workerStarted) {
         emptyState("[#]", "Worker not running",
                    "The Chudware worker service is required to load and steer plans.");
     } else {
-        // Session Plan: the persisted buildgraph view.
-        drawDagView(st);
+        // Session Plan: the plan board over persisted buildgraph runs.
+        drawPlanBoardView(st);
     }
     ImGui::EndChild();
 }

@@ -51,6 +51,11 @@ openpyxl==3.1.5             # MIT — .xlsx workbooks (live formulas)
 matplotlib==3.11.0          # PSF — charts/figures + csv/md preview rasterization
 reportlab==5.0.0            # BSD — direct PDF reports (in-process, no subprocess)
 pypdfium2==5.11.0           # BSD (pdfium) — PDF -> PNG page rasterization for previews
+# office_tools pack (T-office, contracts/office.md) — read+edit over EXISTING office files (as
+# opposed to the deliverables pack above, which authors fresh artifacts from a spec). pypdf is
+# the only new dep: pypdfium2 above is render/extract-only, pypdf adds page-level PDF edit
+# (rotate/delete/merge/metadata). python-pptx/openpyxl/python-docx are reused from above.
+pypdf==5.5.0                 # BSD-3 — PDF metadata + page-level ops (rotate/delete/merge)
 # piping discipline module (engine/piping): B36.10/19 pipe schedule tables via fluids (MIT).
 # fitting geometry is a bundled CSV (public manufacturer dims); ASME text is not shipped.
 fluids==1.3.1

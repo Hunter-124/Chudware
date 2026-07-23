@@ -27,6 +27,7 @@ from .ecad_common import (
     _parts_extents,
     _rpc,
     _run_with_budget,
+    _update_from_sch,
     _zone_polygon,
     ecad_session,
     netlist_mod,
@@ -210,7 +211,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
                         next_actions=["ecad_new_pcb('myboard')"])
         doc = session.doc
         try:
-            from engine.ecad import hostboard_rules as hb_mod  # STAYS (T-RF20): no C++ counterpart
+            from services.ecad import hostboard_rules as hb_mod  # STAYS (T-RF20): no C++ counterpart
             violations = hb_mod.run_hostcheck(doc)
         except Exception as e:  # noqa: BLE001
             return _err(f"hostcheck engine error: {e}", hint="Inspect with ecad_status().")
@@ -597,7 +598,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
                             next_actions=["ecad_new_schematic('myfpga')",
                                           "ecad_place_symbol('FPGA:iCE40UP5K-SG48', 100, 100)"])
             try:
-                from engine.ecad import fpga  # STAYS (T-RF20): no C++ counterpart
+                from services.ecad import fpga  # STAYS (T-RF20): no C++ counterpart
             except Exception as e:  # noqa: BLE001
                 return _err(f"fpga module unavailable ({type(e).__name__}: {e})")
             nl = netlist_mod.build_netlist(session.doc)
@@ -716,7 +717,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
         _autosave_all_open_ecad()
 
         def _build():
-            from engine.ecad.threed import board_to_step  # STAYS (T-RF20): no C++ counterpart; lazy import (OCP/build123d)
+            from services.ecad.threed import board_to_step  # STAYS (T-RF20): no C++ counterpart; lazy import (OCP/build123d)
             return board_to_step(doc, out_path)
 
         bstatus, bval = _run_with_budget(_build)
@@ -831,7 +832,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
                 return _err(f"nets is not a valid list: {nets!r}")
         try:
             import copy as _copy
-            from engine.ecad import si_rules as si_mod  # STAYS (T-RF20): no C++ counterpart
+            from services.ecad import si_rules as si_mod  # STAYS (T-RF20): no C++ counterpart
             new_doc = _copy.deepcopy(session.doc)
             res = si_mod.set_net_class(new_doc, str(name), params or {}, nets or [])
             ecad_session.swap_doc(session, new_doc)
@@ -885,7 +886,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
         min_space).
         """
         try:
-            from engine.ecad import stackup as stackup_mod  # STAYS (T-RF20): no C++ counterpart; lazy import
+            from services.ecad import stackup as stackup_mod  # STAYS (T-RF20): no C++ counterpart; lazy import
         except ImportError as e:  # noqa: BLE001
             return _err(f"stackup engine unavailable ({e})",
                         hint="engine.ecad.stackup could not be imported.",
@@ -1070,8 +1071,8 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
             # ---- 2. sync schematic -> board ----
             sync_ok = False
             try:
-                sync_resp = _rpc("ecad_update_from_sch",
-                                 {"board_doc_id": pcb_sess.doc_id, "sch_doc_id": sch_id})
+                sync_resp = _update_from_sch(pcb_sess, ecad_session.get_session(sch_id))
+                pcb_sess._update(sync_resp)  # keep pcb_sess current after the swap
                 sync_rep = sync_resp.get("report", {})
                 added = sync_rep.get("added", [])
                 ratsnest = sync_resp.get("compile", {}).get("ratsnest", []) or []
@@ -1087,6 +1088,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
             try:
                 ar_resp = _rpc("ecad_autoroute",
                                {"doc_id": pcb_sess.doc_id, "opts": {}})
+                pcb_sess._update(ar_resp)  # keep pcb_sess current after the RPC mutation
                 ar_rep = ar_resp.get("report", {})
                 routed = ar_rep.get("routed", [])
                 failed = ar_rep.get("failed", [])
@@ -1196,7 +1198,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
             hb_errors = 0; hb_warnings = 0; hb_lines: list[str] = []
             if hostcheck:
                 try:
-                    from engine.ecad import hostboard_rules as hb_mod  # STAYS (T-RF20): no C++ counterpart
+                    from services.ecad import hostboard_rules as hb_mod  # STAYS (T-RF20): no C++ counterpart
                     hb_v = hb_mod.run_hostcheck(pcb_sess.doc)
                     hb_sum = _erc_summary(hb_v)
                     hb_errors = hb_sum["errors"]

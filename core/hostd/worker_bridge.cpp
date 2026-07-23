@@ -193,7 +193,7 @@ bool WorkerBridge::spawn(std::string& err) {
     childStdinWr_ = inPipe[1];
     readBuf_.clear();
     running_ = true;
-    log().line("worker_bridge: spawned engine.worker pid=%d python=%s repo=%s", (int)pid,
+    log().line("worker_bridge: spawned services.worker_main pid=%d python=%s repo=%s", (int)pid,
                python_.c_str(), repo_.c_str());
     return true;
 }

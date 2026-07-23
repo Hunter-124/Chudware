@@ -16,6 +16,7 @@
 | `ecad_apply_ops` | `{doc_id, base_revision, ops}` → ops-response (see `ecad_ops.md §1`) |
 | `ecad_rebuild` | `{doc_id}` → ops-response (force netlist/ERC/DRC recompute) |
 | `ecad_tree` | `{doc_id}` → `{revision, kind, tree, compile}` (cached, no rebuild) |
+| `ecad_swap_doc` | `{doc_id, doc, base_revision?, warnings?}` → ops-response (wholesale doc replacement: validate → undo snapshot → swap → revision+1 → compile; `stale_revision` on mismatch) |
 | `ecad_undo` / `ecad_redo` | `{doc_id}` → ops-response |
 | `ecad_resolve_pick` | `{doc_id, layer?, xy, kinds?}` → `{selector}` (canvas pick → typed ref: pin/pad/track/via/net) |
 | `ecad_describe` | `{doc_id, budget?}` → compact text/JSON design summary for the AI (see `sim.md`/tools) |

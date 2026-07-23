@@ -64,9 +64,10 @@ _SITE_LABELS: dict[str, str] = {
     "metalsdepot":      "Metals Depot",
 }
 
-# API pricing providers (engine_oracle/parts_providers.py) and the credential
-# fields each needs. Shown in the vendor pane as "API" sources so the user can
-# configure them in-app instead of hand-editing config.json.
+# API pricing providers (the engine_oracle/parts_providers.py chain was deleted in
+# T-RF18 — the C++ sourcing RPC owns pricing; this pane still shows/configures the
+# credential slots) and the credential fields each needs. Shown in the vendor pane as
+# "API" sources so the user can configure them in-app instead of hand-editing config.json.
 _API_PROVIDERS: dict[str, dict[str, Any]] = {
     "nexar":   {"label": "Nexar (Octopart)", "fields": ["client_id", "client_secret"],
                 "env": {"client_id": "NEXAR_CLIENT_ID", "client_secret": "NEXAR_CLIENT_SECRET"}},
@@ -76,6 +77,31 @@ _API_PROVIDERS: dict[str, dict[str, Any]] = {
     "mouser":  {"label": "Mouser API", "fields": ["api_key"],
                 "env": {"api_key": "MOUSER_API_KEY"}},
 }
+
+
+def _resolve_creds(key: str, env_map: dict[str, str]) -> dict[str, str]:
+    """Resolve provider credentials from config first, then environment fallback.
+
+    Local home after parts_providers.py was deleted (T-RF18): config.json →
+    ``parts_providers.<key>`` (same section ``_vendor_creds_set`` writes), then env.
+    Absent credentials resolve to empty strings.
+    """
+    cfg: dict = {}
+    try:
+        from services import paths
+        cfg_path = paths.find_config()
+        if cfg_path.exists():
+            data = json.loads(cfg_path.read_text(encoding="utf-8"))
+            cfg = (data.get("parts_providers") or {}).get(key) or {}
+            if not isinstance(cfg, dict):
+                cfg = {}
+    except Exception:  # noqa: BLE001 — config is best-effort
+        cfg = {}
+    out: dict[str, str] = {}
+    for field_name, env_name in env_map.items():
+        val = cfg.get(field_name) or os.environ.get(env_name)
+        out[field_name] = str(val).strip() if val else ""
+    return out
 
 
 def _site_label(key: str, adapter: Any = None) -> str:
@@ -615,7 +641,6 @@ def _vendor_status(params: dict, _emit: Callable) -> dict:
 
         api: list[dict] = []
         try:
-            from engine_oracle.parts_providers import _resolve_creds
             for pid, spec in _API_PROVIDERS.items():
                 cfg_key = spec.get("config_key", pid)
                 creds = _resolve_creds(cfg_key, spec["env"])

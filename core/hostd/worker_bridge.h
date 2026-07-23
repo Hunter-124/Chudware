@@ -2,7 +2,7 @@
 //
 // On web the browser talks only to hostd (via the gateway websocket). Methods the
 // C++ engine does not implement (plm_*, git_*, ai_roles_*, provider accounts, …)
-// live in `python -m engine.worker`. This bridge owns ONE long-lived worker
+// live in `python -m services.worker_main`. This bridge owns ONE long-lived worker
 // subprocess and forwards those engine-unknown RPCs over stdio JSON-RPC — the
 // same protocol services/worker/worker_client.cpp uses on desktop.
 //

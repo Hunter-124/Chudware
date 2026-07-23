@@ -301,7 +301,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                             "set a material with density_g_cm3 and ensure the part has "
                             "solid volume"}
                 # Lazy import — keeps server module load independent of numpy availability.
-                from engine_oracle.sim.vibration import (
+                from services.sim.vibration import (
                     evaluate_vibration_spec, harmonic_response, miles_response)
                 harm = harmonic_response(
                     freqs_hz=freqs, mode_shapes_flat=shapes, n_nodes=n_nodes,

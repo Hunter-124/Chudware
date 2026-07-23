@@ -1,6 +1,6 @@
 """CatalogProvider adapter for ISO 1219 hydraulic components (T-P2).
 
-Wraps the HYD_COMPONENT_TYPES enum from engine_oracle/hydraulic/schema.py.
+Enumerates the HYD_COMPONENT_TYPES enum (now core/hydraulic/schema.cpp).
 One PartRecord per component type. Domain: "hydraulic".
 geometry_ref.kind = "fmu_component".
 
@@ -45,21 +45,17 @@ _PORT_TYPES = ("pressure", "tank", "work_a", "work_b", "drain", "generic")
 class HydraulicComponentsAdapter:
     """CatalogProvider for ISO 1219 hydraulic component types.
 
-    Enumerates one PartRecord per component type defined in
-    engine_oracle.hydraulic.schema.HYD_COMPONENT_TYPES. Degrades gracefully
-    to the hardcoded fallback list when the module is absent.
+    Enumerates one PartRecord per component type. The enum source
+    (engine_oracle/hydraulic/schema.py HYD_COMPONENT_TYPES) was ported to
+    core/hydraulic/schema.cpp with no list-RPC — the hardcoded _TITLES list
+    below is the catalog (same set the Python enum carried).
     """
 
     domain: str = "hydraulic"
     provider_id: str = "hydraulic_components"
 
     def _get_types(self) -> set:
-        try:
-            from engine_oracle.hydraulic.schema import HYD_COMPONENT_TYPES
-            return set(HYD_COMPONENT_TYPES)
-        except Exception as exc:  # noqa: BLE001
-            log.debug("HydraulicComponentsAdapter: schema unavailable: %s", exc)
-            return set(_TITLES.keys())
+        return set(_TITLES.keys())
 
     # ------------------------------------------------------------------
     # CatalogProvider protocol
@@ -138,7 +134,7 @@ def _make_record(component_type: str) -> dict:
         "sourcing":     [],
         "provenance":   (
             "ISO 1219 hydraulic component-type vocabulary (clean-room — type name strings, "
-            "not ISO text). Source: engine_oracle/hydraulic/schema.HYD_COMPONENT_TYPES. "
+            "not ISO text). Source: HYD_COMPONENT_TYPES (now core/hydraulic/schema.cpp). "
             "See contracts/licenses.md."
         ),
         "license":      "clean-room",

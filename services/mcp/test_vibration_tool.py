@@ -42,6 +42,13 @@ def _fake_cb_call(method: str, params: dict | None = None) -> dict:
                 "n_modes": 1, "n_nodes": 2, "n_dof": 6}
     if method == "eval_mass":
         return {"volume_mm3": 127388.5, "mass_g": 1000.0}
+    if method == "material_fea_table":
+        # cad_common._resolve_material now sources the library from the C++ core
+        # (material_fea_table RPC) instead of a Python module — fake one steel entry.
+        return {"result": {"steel": {"name": "Steel", "E_mpa": 200000.0, "nu": 0.29,
+                                     "density_g_cm3": 7.85, "yield_mpa": 250.0}}}
+    if method == "material_fea_aliases":
+        return {"result": {}}
     raise AssertionError(f"unexpected bridge method {method!r}")
 
 

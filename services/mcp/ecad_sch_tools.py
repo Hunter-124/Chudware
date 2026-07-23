@@ -25,6 +25,7 @@ from .ecad_common import (
     _rpc,
     _rs,
     _unconnected_pins,
+    _update_from_sch,
     ecad_session,
     lib_search,
     netlist_mod,
@@ -73,7 +74,7 @@ def register_ecad_sch_tools(mcp: FastMCP) -> None:
         PIN COUNT (symbols) so you know how many pins you'll have to wire. Hits are sorted best
         first. Pass the exact ``libid``/``fpid`` of a hit to ecad_place_symbol / a footprint op.
         """
-        from engine.ecad.library import resolve as lib_resolve  # STAYS (T-RF20): no ecad_library RPC; pin-count lookup
+        from services.ecad.library import resolve as lib_resolve  # STAYS (T-RF20): no ecad_library RPC; pin-count lookup
         hits = lib_search(query) or []
         out_hits: list[dict] = []
         for h in hits[:max(1, int(limit))]:
@@ -147,7 +148,7 @@ def register_ecad_sch_tools(mcp: FastMCP) -> None:
         # E7: Validate libid resolves BEFORE dispatching the op. An unresolvable libid would
         # silently produce a 2-pin stub with ok:true, which then corrupts the netlist. Fail fast
         # with a clear error and direct the user to ecad_find_part.
-        from engine.ecad import library as _lib  # STAYS (T-RF20): no ecad_library RPC
+        from services.ecad import library as _lib  # STAYS (T-RF20): no ecad_library RPC
         _resolved_def = _lib.resolve(libid)
         if _resolved_def is None:
             keyword = libid.split(":")[-1] if ":" in libid else libid
@@ -635,8 +636,8 @@ def register_ecad_sch_tools(mcp: FastMCP) -> None:
                         hint="Create a board first; it will be populated from the schematic.",
                         next_actions=["ecad_new_pcb('myboard')"])
         try:
-            resp = _rpc("ecad_update_from_sch",
-                        {"board_doc_id": pcb_id, "sch_doc_id": sch_id})
+            resp = _update_from_sch(ecad_session.get_session(pcb_id),
+                                    ecad_session.get_session(sch_id))
         except OpError as e:
             return _err(f"update_from_sch failed: {e.message}", hint=e.message,
                         next_actions=["ecad_status()"], detail=getattr(e, "detail", {}))

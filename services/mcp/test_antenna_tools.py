@@ -128,7 +128,7 @@ class TestAntennaMcpTools(unittest.TestCase):
 
     def test_analyze_monkeypatch_skip_envelope(self):
         t0 = time.perf_counter()
-        from engine_oracle.sim.em import antenna_bridge as bridge
+        from services.sim.em import antenna_bridge as bridge  # T-RF20: em re-homed services-side
         real = bridge.openems_available
 
         def _gone():

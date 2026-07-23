@@ -226,7 +226,7 @@ def _mock_cfd_result():
 
 def test_piping_handoff_envelope_conforms():
     from services.mcp.piping_tools import _handoff_envelope
-    from engine.piping import cfd_handoff as ch
+    from services.piping import cfd_handoff as ch
     solve = _mock_solve_result()
     bc = ch.cfd_boundary_from_solve(solve)
     assert bc["ok"], bc
@@ -244,7 +244,7 @@ def test_piping_handoff_envelope_conforms():
 def test_piping_handoff_envelope_no_bore_doc():
     # pending-manual-import path: no engine doc yet — still valid
     from services.mcp.piping_tools import _handoff_envelope
-    from engine.piping import cfd_handoff as ch
+    from services.piping import cfd_handoff as ch
     solve = _mock_solve_result()
     bc = ch.cfd_boundary_from_solve(solve)
     env = _handoff_envelope(solve, bc, "/tmp/x/bore.step", None, None)
@@ -255,7 +255,7 @@ def test_piping_verify_tool_embeds_envelope_without_changing_fields():
     """The regression gate: piping_verify_cfd's pre-existing fields are IDENTICAL to
     the raw engine verify result; the only addition is the `simhandoff` key."""
     from services.mcp.piping_tools import register_piping_tools
-    from engine.piping import cfd_handoff as ch
+    from services.piping import cfd_handoff as ch
 
     class _MCP:
         def __init__(self):

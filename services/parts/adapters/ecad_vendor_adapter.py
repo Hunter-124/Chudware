@@ -86,13 +86,12 @@ class EcadVendorAdapter:
 # ---------------------------------------------------------------------------
 
 def _get_chain():
-    """Return a ProviderChain instance, or None if unavailable."""
-    try:
-        from engine_oracle.parts_providers import default_pricing_chain
-        return default_pricing_chain()
-    except Exception as exc:  # noqa: BLE001
-        log.debug("EcadVendorAdapter: ProviderChain unavailable: %s", exc)
-        return None
+    """Return a ProviderChain instance, or None if unavailable.
+
+    parts_providers.py was deleted (T-RF18) — the C++ sourcing RPC owns pricing — so
+    the Python provider chain is permanently unavailable; the adapter degrades to
+    "no live results"."""
+    return None
 
 
 def _vendor_part_to_record(vp: dict) -> dict:

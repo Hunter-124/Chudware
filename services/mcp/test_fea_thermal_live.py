@@ -38,7 +38,7 @@ _ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from engine.sim.fea_thermal_transient import (  # noqa: E402
+from services.sim.fea_thermal_transient import (  # noqa: E402
     FluxLoad, Schedule, box_mesh, solve_transient)
 
 # ---------------------------------------------------------------------------

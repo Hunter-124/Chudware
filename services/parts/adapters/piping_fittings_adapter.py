@@ -1,7 +1,7 @@
 """CatalogProvider adapter for piping fittings (T-P2).
 
-Wraps the bundled B16 fittings catalog in engine/piping/catalog.py
-(``engine_oracle/piping/data/fittings.csv``). Pipes are NOT enumerated here —
+Wraps the bundled B16 fittings catalog in services/piping/catalog.py
+(``services/piping/data/fittings.csv``). Pipes are NOT enumerated here —
 this adapter covers fitting geometry only (elbow, tee, reducer, flange).
 
 Domain: "fitting". geometry_ref.kind = "fitting_id".
@@ -11,7 +11,7 @@ flange_class, od, thickness, bolt_circle, bolt_holes, bolt_dia) plus common core
 keys (nominal_size, standard).
 
 Provenance / license: B16.9 / B16.5 dimensional facts (not ASME text);
-see engine/piping/catalog.py module docstring and contracts/licenses.md.
+see services/piping/catalog.py module docstring and contracts/licenses.md.
 """
 from __future__ import annotations
 
@@ -80,7 +80,7 @@ class PipingFittingsAdapter:
 
 def _get_rows() -> tuple:
     try:
-        from engine_oracle.piping.catalog import _load_rows  # type: ignore[attr-defined]
+        from services.piping.catalog import _load_rows  # T-RF20: re-homed from engine_oracle
         return _load_rows()
     except Exception as exc:  # noqa: BLE001
         log.debug("PipingFittingsAdapter: catalog unavailable: %s", exc)
@@ -145,7 +145,7 @@ def _make_record(row: dict) -> dict | None:
         "sourcing":     [],
         "provenance":   (
             f"ASME B16 fitting dimensions (clean-room); {standard} dimensional facts. "
-            "Source: engine_oracle/piping/data/fittings.csv — ASME text not bundled. "
+            "Source: services/piping/data/fittings.csv — ASME text not bundled. "
             "See engine/piping/catalog.py module docstring and contracts/licenses.md."
         ),
         "license":      "clean-room",

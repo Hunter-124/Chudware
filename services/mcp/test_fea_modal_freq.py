@@ -263,7 +263,7 @@ def test_run_fea_modal_free_free_small_n_reports_rigid_modes():
 # ---------------------------------------------------------------------------
 
 def _freq_response(res: dict, **over):
-    from engine_oracle.sim.multiphysics_rpc import WORKER_METHODS
+    from services.sim.multiphysics_rpc import WORKER_METHODS
     n_modes = len(res["freqs_hz"])
     params = {
         "freqs_hz": res["freqs_hz"],

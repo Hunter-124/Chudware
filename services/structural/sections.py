@@ -28,7 +28,7 @@ from pathlib import Path
 
 # --------------------------------------------------------------------------- data paths
 
-_HERE = Path(__file__).parent.parent  # engine_oracle/
+_HERE = Path(__file__).parent  # services/structural/
 _AISC_PATH = _HERE / "data" / "aisc_shapes" / "aisc_shapes_curated.json"
 _LUMBER_PATH = _HERE / "data" / "lumber_table.json"
 

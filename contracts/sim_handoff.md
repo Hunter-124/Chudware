@@ -21,7 +21,7 @@ every coupling implements against one seam:
 3. **Study ref** — the provenance atom: enough fields that any sim result can name
    exactly what produced it (domain, tool, doc, study, upstream handoff).
 
-Known couplings this shape must carry (docs/SIM_FW_FINALIZE_PLAN_2026-07-10.md §3):
+Known couplings this shape must carry (SIM_FW_FINALIZE_PLAN_2026-07-10 §3 — plan doc pruned 2026-07-23 after the FIN wave shipped; couplings preserved here):
 
 | coupling id | source → target | notes on shape usage |
 |---|---|---|

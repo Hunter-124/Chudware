@@ -18,46 +18,34 @@ if str(_SVC_MCP) not in sys.path:
     sys.path.insert(0, str(_SVC_MCP))
 
 
-# ── _place_import_file (place.py) ────────────────────────────────────────────
+# ── import_file placer (core/parts/place.cpp behind the part_import_file RPC ──
+# ── engine_oracle.parts_hub.place was deleted in the zero-Python cutover) ─────
 
 def test_place_import_file_missing_path():
-    from engine_oracle.parts_hub.place import _place_import_file
-    r = _place_import_file({"kind": "import_file"}, None, None)
+    from services.mcp import core_bridge as cb
+    if not cb.available():
+        pytest.skip("native core (libaicad) not available in this environment")
+    r = cb.call("part_import_file", {})
     assert r["ok"] is False
     assert "path" in r["reason"]
 
 
 def test_place_import_file_file_not_found():
-    from engine_oracle.parts_hub.place import _place_import_file
-    r = _place_import_file({"kind": "import_file", "path": "/no/such/file.step"}, None, None)
+    from services.mcp import core_bridge as cb
+    if not cb.available():
+        pytest.skip("native core (libaicad) not available in this environment")
+    r = cb.call("part_import_file", {"path": "/no/such/file.step"})
     assert r["ok"] is False
     assert "not found" in r["reason"]
 
 
-def test_place_import_file_success(tmp_path, monkeypatch):
-    fake_step = tmp_path / "widget.step"
-    fake_step.write_text("ISO-10303-21;")
-
-    from services.mcp import core_bridge as cb  # canonical module place.py imports
-    monkeypatch.setattr(cb, "call", lambda verb, params: {"doc_id": "doc-abc", "body_count": 1})
-
-    from engine_oracle.parts_hub.place import _place_import_file
-    r = _place_import_file({"kind": "import_file", "path": str(fake_step)}, None, None)
-
-    assert r["ok"] is True
-    assert r["editable"] is True
-    assert r["doc_id"] == "doc-abc"
-    assert r["entity_id"] == "doc-abc"
-    assert "reverse_engineer" in r["detail"]["hint"]
-
-
 # ── REAL-CORE integration: the full import chain, no mocks ───────────────────
 # Proves the FINAL link of the browser-catalog chain on the native engine:
-#   real STEP on disk -> _place_import_file -> import_file RPC -> new editable doc.
+#   real STEP on disk -> part_import_file RPC -> new editable doc.
 # SKIPPED (not failed) when the native core (libaicad) is unavailable, so CI on a
 # core-less machine stays green while a machine that HAS the core proves the chain.
 # Regression guard for the daemon-mode "attempted relative import with no known
-# parent package" bug: _place_import_file imported core_bridge bare, zeroing its
+# parent package" bug: the placer imported core_bridge bare, zeroing its
 # __package__, so `from . import daemon_bridge` blew up in daemon mode (the default).
 
 def _core_available() -> bool:
@@ -72,8 +60,8 @@ def _core_available() -> bool:
                     reason="native core (libaicad) not available in this environment")
 def test_place_import_file_real_core_editable_doc(tmp_path):
     """End-to-end with the REAL engine: export a STEP from a core-built box, then
-    place it back via _place_import_file and assert a genuine editable doc_id — the
-    same import_file RPC the import_artifact / import_part MCP tools drive."""
+    place it back via the part_import_file RPC and assert a genuine editable doc_id —
+    the same RPC the import_artifact / import_part MCP tools drive."""
     from services.mcp import core_bridge as cb
 
     # Produce a real STEP with the core itself (self-contained: no dependence on a
@@ -91,20 +79,21 @@ def test_place_import_file_real_core_editable_doc(tmp_path):
     assert step.is_file() and step.stat().st_size > 0, f"export_file produced no file: {exp!r}"
 
     # The real placement: import the STEP as a NEW editable doc.
-    from engine_oracle.parts_hub.place import _place_import_file
-    r = _place_import_file({"kind": "import_file", "path": str(step)}, None, None)
+    r = cb.call("part_import_file", {"path": str(step)})
 
     assert r["ok"] is True, f"real import failed: {r.get('reason')!r}"
     assert r["editable"] is True
     assert r["doc_id"], "no doc_id from a real import_file"
     assert r["doc_id"].startswith("doc-"), f"unexpected doc_id shape: {r['doc_id']!r}"
+    assert r["entity_id"] == r["doc_id"]
     assert "reverse_engineer" in r["detail"]["hint"]
 
 
 def test_place_import_file_skips_cleanly_when_core_absent(tmp_path, monkeypatch):
     """The real-core test's skip gate must actually skip (not error) when the core
-    is unavailable. Force available()->False and confirm the placer degrades to a
-    clean {ok: False} error envelope rather than raising."""
+    is unavailable. Force available()->False and confirm the MCP tool surface
+    (import_artifact — the caller of the part_import_file RPC) degrades to a clean
+    {ok: False} error envelope rather than raising."""
     from services.mcp import core_bridge as cb
     fake_step = tmp_path / "widget.step"
     fake_step.write_text("ISO-10303-21;")
@@ -116,33 +105,50 @@ def test_place_import_file_skips_cleanly_when_core_absent(tmp_path, monkeypatch)
         raise cb.CoreError("libaicad.so not found")
     monkeypatch.setattr(cb, "call", _unavailable)
 
-    from engine_oracle.parts_hub.place import _place_import_file
-    r = _place_import_file({"kind": "import_file", "path": str(fake_step)}, None, None)
+    import json as _json
+    from services.mcp import parts_tools
+
+    class _StubMCP:
+        def __init__(self): self.tools = {}
+        def tool(self, *a, **k):
+            def deco(fn):
+                self.tools[fn.__name__] = fn
+                return fn
+            return deco
+
+    stub = _StubMCP()
+    parts_tools.register_parts_tools(stub)
+    r = _json.loads(stub.tools["import_artifact"](str(fake_step)))
     assert r["ok"] is False
-    assert "import_file RPC failed" in r["reason"]
+    assert "import_artifact failed" in r["reason"]
 
 
-def test_place_import_file_rpc_failure(tmp_path, monkeypatch):
-    fake_step = tmp_path / "widget.step"
-    fake_step.write_text("ISO-10303-21;")
-
-    from services.mcp import core_bridge as cb  # canonical module place.py imports
-
-    def _raise(verb, params):
-        raise RuntimeError("no core")
-
-    monkeypatch.setattr(cb, "call", _raise)
-
-    from engine_oracle.parts_hub.place import _place_import_file
-    r = _place_import_file({"kind": "import_file", "path": str(fake_step)}, None, None)
+def test_place_import_file_rpc_failure(tmp_path):
+    """An unimportable file with a LIVE core must come back as an {ok: False}
+    envelope from the C++ placer (import_file RPC failed) — never a traceback.
+    (A corrupt-but-.step file is NOT a failure: the importer opens it as an empty
+    doc, so the discriminating case is an unknown extension.)"""
+    from services.mcp import core_bridge as cb
+    if not cb.available():
+        pytest.skip("native core (libaicad) not available in this environment")
+    bad = tmp_path / "widget.xyz123"
+    bad.write_text("nonsense")
+    r = cb.call("part_import_file", {"path": str(bad)})
     assert r["ok"] is False
     assert "import_file RPC failed" in r["reason"]
 
 
 def test_place_dispatches_import_file_kind():
-    """place.py's public dispatch table must route the new kind."""
-    from engine_oracle.parts_hub.place import _PLACERS
-    assert "import_file" in _PLACERS
+    """The C++ dispatch table must route the import_file kind (an unknown kind's
+    hint enumerates the supported kinds)."""
+    from services.mcp import core_bridge as cb
+    if not cb.available():
+        pytest.skip("native core (libaicad) not available in this environment")
+    rec = {"part_id": "catalog:x::y", "domain": "catalog",
+           "geometry_ref": {"kind": "no_such_kind"}}
+    r = cb.call("part_place", {"part_id": "catalog:x::y", "record": rec})
+    assert r["ok"] is False
+    assert "import_file" in r["hint"]
 
 
 # ── login-degradation seam (walled catalog vendor → actionable next step) ────
@@ -178,10 +184,14 @@ def test_parts_provider_get_enriches_acquire_failure_with_identity():
 
 
 def _place_with_record(monkeypatch, record):
-    from services import parts as ph
-    monkeypatch.setattr(ph, "get", lambda pid: record)
-    from engine_oracle.parts_hub.place import place
-    return place("catalog:mcmaster::https://mcmaster.com/p/84881A248")
+    """Drive the C++ part_place dispatcher with the record inline (the pre-fetched
+    `record` param — no hub lookup needed)."""
+    from services.mcp import core_bridge as cb
+    if not cb.available():
+        pytest.skip("native core (libaicad) not available in this environment")
+    return cb.call("part_place", {
+        "part_id": "catalog:mcmaster::https://mcmaster.com/p/84881A248",
+        "record": record})
 
 
 def test_place_surfaces_login_required_actionably(monkeypatch):
@@ -226,10 +236,7 @@ def test_place_still_reports_plain_missing_geometry(monkeypatch):
     """A genuine PartRecord with no geometry_ref (not a failure envelope) keeps the
     original 'no geometry_ref' error — the seam must not swallow that case."""
     rec = {"part_id": "catalog:x::y", "domain": "catalog", "geometry_ref": None}
-    from services import parts as ph
-    monkeypatch.setattr(ph, "get", lambda pid: rec)
-    from engine_oracle.parts_hub.place import place
-    r = place("catalog:x::y")
+    r = _place_with_record(monkeypatch, rec)
     assert r["ok"] is False
     assert "no geometry_ref" in r["reason"]
 

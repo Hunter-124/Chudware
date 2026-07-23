@@ -87,7 +87,7 @@ def _build_divider_schematic(tools: dict, name: str = "bf_div",
 
     Nets: +5V = V1.+ — R1.1; MID = R1.2 — R2.1; GND = R2.2 (power port).
     """
-    from engine.ecad import session as ecad_session
+    from mcp_server.ecad_common import ecad_session
     from mcp_server.ecad_tools import _ECAD
 
     if not sch_id:
@@ -138,7 +138,7 @@ def test_tools_registered() -> None:
 
 def test_board_from_schematic_places_and_routes() -> None:
     """(a) board_from_schematic -> placed footprints + routed tracks (or residual nets)."""
-    from engine.ecad import session as ecad_session
+    from mcp_server.ecad_common import ecad_session
     from mcp_server.ecad_tools import _ECAD
 
     tools = _tools()
@@ -182,8 +182,8 @@ def test_board_from_schematic_places_and_routes() -> None:
 def test_reuses_place_and_optimize(monkeypatch: pytest.MonkeyPatch) -> None:
     """(b) place_board + optimize_traces are CALLED; report carries their keys."""
     from mcp_server import board_flow as bf
-    from engine.ecad import place as place_mod
-    from engine.ecad import trace_opt as trace_opt_mod
+    from services.ecad import place as place_mod
+    from services.ecad import trace_opt as trace_opt_mod
 
     tools = _tools()
     sch_id = _build_minimal_board_schematic(tools, name="bf_b")
@@ -210,7 +210,7 @@ def test_reuses_place_and_optimize(monkeypatch: pytest.MonkeyPatch) -> None:
 
     t0 = time.perf_counter()
     # Call the engine directly so the spy is unambiguous (tools also call it).
-    from engine.ecad import session as ecad_session
+    from mcp_server.ecad_common import ecad_session
     result = bf.board_from_schematic(ecad_session.get_session(sch_id),
                                      {"optimize": True, "seed": 0})
     dt = (time.perf_counter() - t0) * 1000.0
@@ -229,7 +229,7 @@ def test_reuses_place_and_optimize(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_determinism_two_runs() -> None:
     """(c) two runs on the same schematic -> identical placement + routing."""
     from mcp_server import board_flow as bf
-    from engine.ecad import session as ecad_session
+    from mcp_server.ecad_common import ecad_session
 
     tools = _tools()
     sch_id = _build_minimal_board_schematic(tools, name="bf_c")
@@ -256,7 +256,7 @@ def test_determinism_two_runs() -> None:
 
 def test_standalone_autoplace_and_optimize() -> None:
     """(d) ecad_autoplace + ecad_optimize_traces work on an active board."""
-    from engine.ecad import session as ecad_session
+    from mcp_server.ecad_common import ecad_session
     from mcp_server.ecad_tools import _ECAD
 
     tools = _tools()
@@ -328,7 +328,7 @@ if __name__ == "__main__":
     tools = _tools()
     sch_id = _build_minimal_board_schematic(tools, name="bf_main")
     from mcp_server import board_flow as bf
-    from engine.ecad import session as ecad_session
+    from mcp_server.ecad_common import ecad_session
     r = bf.board_from_schematic(ecad_session.get_session(sch_id), {"optimize": True})
     assert "ratsnest_after" in (r.get("report") or {})
     assert "corners_rounded" in (r.get("report") or {})

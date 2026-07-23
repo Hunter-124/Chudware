@@ -17,8 +17,7 @@ Protocol: newline-delimited JSON-RPC on stdio, identical to engine_oracle/worker
 (core/hostd/worker_bridge.cpp) spawns this module for engine-unknown methods; during
 the transition it may still spawn ``python -m engine.worker``, which forwards here.
 
-Imports are dual-path (services.* first, engine_oracle fallback) so the module works
-both before and after the re-home sweeps land.
+Imports are services.* throughout (the engine_oracle fallback is gone with the oracle).
 """
 from __future__ import annotations
 
@@ -31,10 +30,7 @@ from typing import Callable
 log = logging.getLogger("ai-cad.worker")
 EmitFn = Callable[[dict], None]
 
-try:
-    from services import paths  # type: ignore
-except Exception:  # noqa: BLE001 — transition: engine_oracle/paths.py not yet moved
-    from engine import paths  # type: ignore
+from services import paths  # type: ignore  # re-homed from engine_oracle/paths.py
 
 
 def _ping(_params: dict, _emit_event: EmitFn) -> dict:

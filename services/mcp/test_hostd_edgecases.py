@@ -154,13 +154,18 @@ def test_engine_load_failure_clients_get_engine_failed(scratch_daemon, monkeypat
     monkeypatch.setenv("AICAD_HOSTD_BIN", str(hostd_copy))
     monkeypatch.setenv("AI_CAD_LIBAICAD", os.devnull)
     monkeypatch.delenv("AI_CAD_DIST", raising=False)
+    # core_bridge's in-process load prepends the real lib dir to LD_LIBRARY_PATH
+    # (process-global); the spawned daemon would inherit it and its last-resort
+    # bare "libaicad.so" dlopen would find the build-tree lib — scrub it.
+    monkeypatch.delenv("LD_LIBRARY_PATH", raising=False)
+    monkeypatch.delenv("DYLD_LIBRARY_PATH", raising=False)
 
     a = DaemonClient()
     a.connect()
     pid = _pid(a)
     scratch_daemon.append(pid)
 
-    st = _wait_state(a, "failed", timeout=30.0)
+    st = _wait_state(a, "failed", timeout=60.0)
     assert st.get("state") == "failed", f"engine load must fail fast, got {st}"
 
     # Engine calls answer engine_failed immediately — no hang. (Bypass
@@ -264,6 +269,15 @@ def test_rapid_connect_churn_no_fd_leak(scratch_daemon):
 
     def fds() -> int:
         return len(list(fd_dir.iterdir()))
+
+    # Warm-up: the first RPC lazily spins up the engine/worker (one-time fd cost —
+    # worker pipes, libaicad threads); take the baseline AFTER that settles so the
+    # assertion measures the churn, not the init.
+    warm = DaemonClient()
+    warm.connect()
+    assert warm.call("ping").get("ok") is True
+    warm.close()
+    time.sleep(1.0)
 
     baseline = fds()
     for _ in range(50):

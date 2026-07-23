@@ -39,7 +39,6 @@ import importlib.abc
 import importlib.machinery
 
 _PKG_ALIASES = {
-    "engine": "engine_oracle",
     "agent": "services.agent",
     "dag": "services.dag",
     "deliverables": "services.deliverables",

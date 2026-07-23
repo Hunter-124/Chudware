@@ -103,7 +103,7 @@ def test_buckling_first_factor_matches_euler():
 @needs_ccx
 def test_buckling_via_multiphysics_rpc_endpoint():
     """The T-FIN24 worker endpoint (exact run_fea_buckling pipeline) end-to-end."""
-    from engine_oracle.sim import multiphysics_rpc as mp
+    from services.sim import multiphysics_rpc as mp
     out = mp._sim_run_buckling({"L_mm": BK_L, "b_mm": BK_B, "h_mm": BK_H,
                                 "E_mpa": BK_E, "nu": BK_NU, "load_n": BK_P})
     assert out.get("ok"), out
@@ -320,7 +320,7 @@ def test_engine_fatigue_plus_host_life_hand_checked():
 def test_missing_ccx_skips_cleanly_via_worker_endpoints(monkeypatch):
     """multiphysics_rpc buckling/contact must degrade to {ok:false, skipped:true}
     when ccx is absent — never raise, never fabricate."""
-    from engine_oracle.sim import multiphysics_rpc as mp
+    from services.sim import multiphysics_rpc as mp
     monkeypatch.setattr(fa, "ccx_path", lambda: None)
     for endpoint in (mp._sim_run_buckling, mp._sim_run_contact):
         out = endpoint({})
@@ -339,7 +339,7 @@ def test_malformed_inp_clean_error_not_fabricated_result():
     assert r.get("skipped") is None or r.get("skipped") is False
     assert r.get("dat_path") is None, "zero-byte .dat must not be a result"
     # Caller-level: the worker endpoint turns this into ok:false, not a crash.
-    from engine_oracle.sim import multiphysics_rpc as mp
+    from services.sim import multiphysics_rpc as mp
     orig = fa.build_buckling_column_inp
 
     def bad_gen(*a, **k):

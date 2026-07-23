@@ -281,26 +281,20 @@ class TestRevengPartsRoundtrip:
 
         _j(tools["reveng_attach_result"](session_id=sid, part_ref=PART_ID))
 
-        # part_place routes via geometry_ref.kind="import_file" to _place_import_file,
-        # which calls core_bridge.call("import_file", ...) — mock that RPC so we
-        # don't need the native engine.  We also need hub.get() to return the RE
-        # record (with geometry_ref), not the metadata-only record; mock it directly.
-        import unittest.mock as mock
+        # part_place is the C++ dispatcher now (core/parts/place.cpp behind the
+        # part_place RPC; engine_oracle.parts_hub.place is deleted): hand it the RE
+        # record inline (the Python hub lookup is the pre-fetched `record` param).
+        import pytest as _pytest
+        from services.mcp import core_bridge as cb
         from services.parts.adapters.reveng_result_adapter import RevengResultAdapter
 
         re_adapter = RevengResultAdapter()
         re_record = re_adapter.get(PART_ID)
         assert re_record is not None, "RevengResultAdapter has no record — attach may have failed"
 
-        mock_cb = mock.MagicMock()
-        mock_cb.call.return_value = {"doc_id": "doc_mock_abc123", "body_count": 1}
-
-        with mock.patch.dict("sys.modules", {"core_bridge": mock_cb}):
-            # place() does `from services.parts import get` inline;
-            # patch the module-level function so it returns the RE record.
-            with mock.patch("services.parts.get", return_value=re_record):
-                from engine_oracle.parts_hub.place import place
-                result = place(PART_ID)
+        if not cb.available():
+            _pytest.skip("native core (libaicad) not available in this environment")
+        result = cb.call("part_place", {"part_id": PART_ID, "record": re_record})
 
         assert result["ok"] is True, f"part_place failed: {result}"
         assert result.get("editable") is True

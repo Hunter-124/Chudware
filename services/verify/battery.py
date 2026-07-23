@@ -298,7 +298,7 @@ def _is_drawing_doc(doc_id: Optional[str]) -> bool:
 def _find_ecad_board_doc(preferred: Optional[str] = None) -> Optional[str]:
     """Locate an open PCB session doc_id for impedance checks."""
     try:
-        from engine.ecad import session as esess  # noqa: PLC0415
+        from services.mcp.ecad_common import ecad_session as esess  # noqa: PLC0415
     except Exception:  # noqa: BLE001
         esess = None
     if preferred and esess is not None:
@@ -337,7 +337,7 @@ def _find_ecad_board_doc(preferred: Optional[str] = None) -> Optional[str]:
 def _board_routed_nets(board_doc_id: str) -> list[str]:
     """Net names that have routed tracks on *board_doc_id*."""
     try:
-        from engine.ecad import session as esess  # noqa: PLC0415
+        from services.mcp.ecad_common import ecad_session as esess  # noqa: PLC0415
         s = esess.get_session(board_doc_id)
         doc = getattr(s, "doc", None) or {}
         tracks = doc.get("tracks") or []
@@ -512,7 +512,7 @@ def _adapt_check_kwargs(
         # Prefer schematic session when mechanical doc_id is wrong.
         if doc_id and "doc-cpp" in str(doc_id):
             try:
-                from engine.ecad import session as esess  # noqa: PLC0415
+                from services.mcp.ecad_common import ecad_session as esess  # noqa: PLC0415
                 for s in esess.iter_sessions():
                     kind = str(getattr(s, "kind", "") or "").lower()
                     did = getattr(s, "doc_id", None)

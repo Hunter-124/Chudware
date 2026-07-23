@@ -96,8 +96,10 @@ def _check_add_setup_material_resolution(check) -> None:
 
 
 def _registry_path():
-    from engine.materials import registry as _reg
-    return _reg.registry_path()
+    # engine.materials.registry was deleted with the oracle; the bundled registry
+    # the core loads (T-M4) lives at core/data/materials/registry.json.
+    from pathlib import Path
+    return Path(__file__).resolve().parents[2] / "core" / "data" / "materials" / "registry.json"
 
 
 def _check_hole_extraction(cb, check) -> None:  # noqa: ANN001 - cb module + check() closure

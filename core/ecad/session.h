@@ -31,6 +31,12 @@ nlohmann::json ecad_tree(const std::string& doc_id);     // no rebuild, no rev b
 nlohmann::json ecad_rebuild(const std::string& doc_id);  // recompute, no rev bump
 bool ecad_close(const std::string& doc_id);
 
+// ecad_swap_doc {doc_id, doc, base_revision?, warnings?} -> ops-response.
+// Wholesale document replacement (engine/ecad/session.py::swap_doc): validate ->
+// undo snapshot -> swap -> revision+1 -> compile. Throws stale_revision on mismatch.
+nlohmann::json ecad_swap_doc(const std::string& doc_id, const nlohmann::json& new_doc,
+                             long base_revision, const nlohmann::json& warnings);
+
 // ecad_describe {doc_id} -> minimal summary (the fallback the Python rpc builds
 // when engine.ecad.describe is absent).
 nlohmann::json ecad_describe(const std::string& doc_id);

@@ -44,8 +44,6 @@ constexpr double kQ = 1.602176634e-19;        // electron charge (C)
 constexpr double kTnomC = 27.0;               // nominal param temperature (deg C)
 constexpr double kEgSi = 1.11;                // silicon bandgap (eV)
 
-bool is_ground(const std::string& n) { return n == "0" || n == "gnd" || n == "GND"; }
-
 std::string upper(std::string s) {
     for (char& c : s) c = static_cast<char>(std::toupper((unsigned char)c));
     return s;
@@ -54,6 +52,43 @@ std::string lower(std::string s) {
     for (char& c : s) c = static_cast<char>(std::tolower((unsigned char)c));
     return s;
 }
+
+bool is_ground(const std::string& n) {
+    // Case-insensitive ground aliases, mirroring circuit.py::_Sim.resolve_node
+    // (mega-23): 0/gnd/ground/vss/vssa/agnd/dgnd.
+    const std::string low = lower(n);
+    return low == "0" || low == "gnd" || low == "ground" || low == "vss" ||
+           low == "vssa" || low == "agnd" || low == "dgnd";
+}
+
+// Case/format-tolerant node lookup, mirroring circuit.py::_Sim.resolve_node
+// (mega-23 AC5: accept v(3v3)/V(3V3)/+3V3 aliases against schematic nets).
+// Returns the index of `name` in `index`, or `missing` when truly unknown.
+inline int resolve_node_tolerant(const std::map<std::string, int>& index,
+                                 const std::string& name, int missing) {
+    auto it = index.find(name);
+    if (it != index.end()) return it->second;
+    if (is_ground(name)) return -1;
+    std::string bare = lower(name);
+    // strip a leading '+' and the net_/n$ decorations the schematic emitters add
+    if (!bare.empty() && bare[0] == '+') bare.erase(0, 1);
+    for (const std::string tag : {std::string("net_"), std::string("n$")}) {
+        size_t pos = 0;
+        while ((pos = bare.find(tag, pos)) != std::string::npos) bare.erase(pos, tag.size());
+    }
+    for (const std::string& cand : {bare, upper(bare)}) {
+        it = index.find(cand);
+        if (it != index.end()) return it->second;
+    }
+    for (const auto& [k, v] : index) {
+        const std::string kl = lower(k);
+        if (kl == lower(name) || kl == bare ||
+            (!kl.empty() && kl[0] == '+' && kl.substr(1) == bare))
+            return v;
+    }
+    return missing;
+}
+
 std::string trim(std::string s) {
     while (!s.empty() && std::isspace((unsigned char)s.front())) s.erase(s.begin());
     while (!s.empty() && std::isspace((unsigned char)s.back())) s.pop_back();
@@ -306,12 +341,10 @@ struct Setup {
     int maxiter = 100;
 
     int n(const std::string& name) const {
-        auto it = node_index.find(name);
-        return it == node_index.end() ? -1 : it->second;
+        return resolve_node_tolerant(node_index, name, -1);
     }
     int nodeRow(const std::string& name) const {  // -2 = unknown node
-        auto it = node_index.find(name);
-        return it == node_index.end() ? -2 : it->second;
+        return resolve_node_tolerant(node_index, name, -2);
     }
 };
 
@@ -2302,7 +2335,10 @@ json spice_simulate(const json& circuit, const json& study) {
                 }
             }
 
-            result["tf"] = {{"gain", gain}, {"rin", rin}, {"rout", rout},
+            // JSON has no Infinity: an open input (rin=inf) serializes as null, where the
+            // Python solver surfaced a huge number. Clamp to 1e30 on the success path.
+            auto clamp_tf = [&](double v) { return (tf_ok && !std::isfinite(v)) ? 1e30 : v; };
+            result["tf"] = {{"gain", gain}, {"rin", clamp_tf(rin)}, {"rout", clamp_tf(rout)},
                             {"output", output}, {"source", source}};
             result["convergence"]["tf"] = tf_ok;
         } else if (atype == "noise") {

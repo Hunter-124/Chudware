@@ -53,6 +53,9 @@ def _build_fake_mcp_modules() -> dict:
 # patcher so setUpClass/tearDownClass can install/remove without re-creating.
 _FAKE_MCP_MODULES: dict = _build_fake_mcp_modules()
 
+# core_bridge stub keys this module inserted (popped after the import window).
+_STUBBED_CORE_BRIDGE_KEYS: list = []
+
 
 def _install_stubs():
     """Install stubs needed to import reveng_tools at module scope.
@@ -64,12 +67,27 @@ def _install_stubs():
     into later test modules (e.g. test_reveng_e2e_datasheet) that need the
     real mcp.server.fastmcp.FastMCP with _tool_manager.
     """
-    # core_bridge stub
+    # core_bridge stub (carries CoreError: cad_common does
+    # ``from .core_bridge import CoreError`` at module scope since T-RF8, and this
+    # stub leaks into later modules' imports by design of setdefault)
     cb_mod = types.ModuleType("mcp_server.core_bridge")
     cb_mod.available = lambda: False
     cb_mod.call = lambda method, params=None: {}
-    sys.modules.setdefault("mcp_server.core_bridge", cb_mod)
-    sys.modules.setdefault("core_bridge", cb_mod)
+
+    class _StubCoreError(Exception):
+        def __init__(self, message: str, code: str = "", detail: dict | None = None):
+            super().__init__(message)
+            self.code = code
+            self.detail = detail or {}
+
+    cb_mod.CoreError = _StubCoreError
+    # Track which keys WE inserted so they can be removed after the import below —
+    # a leaked stub with call()->{} silently breaks later modules that drive the
+    # real core_bridge (e.g. test_reveng_e2e_datasheet's C++ match_part_number leg).
+    for _k in ("mcp_server.core_bridge", "core_bridge"):
+        if _k not in sys.modules:
+            sys.modules[_k] = cb_mod
+            _STUBBED_CORE_BRIDGE_KEYS.append(_k)
 
     # mcp package stub — installed temporarily; removed after import below
     for key, mod in _FAKE_MCP_MODULES.items():
@@ -158,6 +176,8 @@ with (
 # Remove the fake mcp stubs from sys.modules now that reveng_tools is imported.
 # Tests restore them only for their own class lifetime via setUpClass/tearDownClass.
 for _key in list(_FAKE_MCP_MODULES):
+    sys.modules.pop(_key, None)
+for _key in _STUBBED_CORE_BRIDGE_KEYS:
     sys.modules.pop(_key, None)
 
 
@@ -344,9 +364,16 @@ class TestRevengSessionLifecycle(_FakeMCPTestBase):
         create = _call(self.tools, "reveng_start_session", name="Bracket")
         sid = create["session_id"]
         # The stub extract_frames_safe doesn't need a real video file
-        # but reveng_add_video will call it with whatever path we give
-        r = _call(self.tools, "reveng_add_video",
-                  session_id=sid, path="/fake/orbit.mp4", max_frames=60)
+        # but reveng_add_video will call it with whatever path we give.
+        # Patch the seam directly (reveng_common binds the REAL frames module at
+        # import whenever another test module imported it first — import-order
+        # stubbing is not reliable in a full sweep).
+        import services.mcp.reveng_common as _rc
+        import services.mcp.reveng_session_tools as _rst
+        with patch.object(_rc, "_extract_frames_safe", _stub_extract_frames_safe), \
+                patch.object(_rst, "_extract_frames_safe", _stub_extract_frames_safe):
+            r = _call(self.tools, "reveng_add_video",
+                      session_id=sid, path="/fake/orbit.mp4", max_frames=60)
         self.assertTrue(r["ok"])
         self.assertIn("run_id", r)
         self.assertTrue(r["run_id"].startswith("run_"))
@@ -522,11 +549,30 @@ class TestRevengLongJobStubs(_FakeMCPTestBase):
         self._assert_not_provisioned(r)
 
     def test_reveng_single_photo_stub(self):
+        # The input guard fires first on an image-less session (honest no_images);
+        # with a photo seeded the backend guard must answer backend_not_provisioned.
+        r0 = _call(self.tools, "reveng_single_photo",
+                   session_id=self.sid, tier="triposr")
+        self.assertFalse(r0["ok"])
+        self.assertEqual(r0["reason"], "no_images")
+        imgdir = Path(self.tmp) / self.sid / "images"
+        imgdir.mkdir(parents=True, exist_ok=True)
+        (imgdir / "p.png").write_bytes(b"\x89PNG\r\n\x1a\n")
         r = _call(self.tools, "reveng_single_photo",
                   session_id=self.sid, tier="triposr")
         self._assert_not_provisioned(r)
 
     def test_reveng_fit_primitives_stub(self):
+        # Same shape: no mesh yet -> honest no_mesh; mesh seeded -> backend guard.
+        r0 = _call(self.tools, "reveng_fit_primitives", session_id=self.sid)
+        self.assertFalse(r0["ok"])
+        self.assertEqual(r0["reason"], "no_mesh")
+        sess_json = Path(self.tmp) / self.sid / "session.json"
+        sess = json.loads(sess_json.read_text())
+        mesh = Path(self.tmp) / self.sid / "mesh.ply"
+        mesh.write_text("ply\nformat ascii 1.0\nelement vertex 0\nend_header\n")
+        sess.setdefault("artifacts", {})["mesh_path"] = str(mesh)
+        sess_json.write_text(json.dumps(sess))
         r = _call(self.tools, "reveng_fit_primitives", session_id=self.sid)
         self._assert_not_provisioned(r)
 

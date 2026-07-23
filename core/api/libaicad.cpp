@@ -3654,6 +3654,12 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                 return emit(aicad::ecad::ecad_tree(params.value("doc_id", std::string())), out_json, 0);
             if (m == "ecad_rebuild")
                 return emit(aicad::ecad::ecad_rebuild(params.value("doc_id", std::string())), out_json, 0);
+            if (m == "ecad_swap_doc")
+                return emit(aicad::ecad::ecad_swap_doc(params.value("doc_id", std::string()),
+                                                       params.value("doc", json::object()),
+                                                       params.value("base_revision", -1L),
+                                                       params.value("warnings", json::array())),
+                            out_json, 0);
             if (m == "ecad_close")
                 return emit(json{{"closed", aicad::ecad::ecad_close(params.value("doc_id", std::string()))}},
                             out_json, 0);

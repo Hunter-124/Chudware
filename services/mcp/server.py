@@ -648,7 +648,7 @@ def _warm_core() -> None:
     # Python warm needed here; the core_bridge warm below covers the DLL + dispatch.
     try:
         # OCP/build123d 3D kernel (ecad_to_3d) — can be many seconds cold.
-        from engine.ecad.threed import board_to_step  # noqa: F401  # STAYS (T-RF20): no C++ counterpart
+        from services.ecad.threed import board_to_step  # noqa: F401  # STAYS (T-RF20): no C++ counterpart
     except Exception:
         pass
     try:

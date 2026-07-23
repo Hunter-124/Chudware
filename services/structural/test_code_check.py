@@ -25,8 +25,8 @@ from __future__ import annotations
 
 import pytest
 
-from engine.structural.checks import DISCLAIMER
-from engine.structural.code_check import (
+from services.structural.checks import DISCLAIMER
+from services.structural.code_check import (
     RuleResult,
     MockRAGProvider,
     agentic_rag,
@@ -35,7 +35,7 @@ from engine.structural.code_check import (
     check_post_span,
     run_checks,
 )
-from engine.structural.jurisdiction_meta import (
+from services.structural.jurisdiction_meta import (
     get_jurisdiction,
     jurisdiction_label,
     list_jurisdictions,

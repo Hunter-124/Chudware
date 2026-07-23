@@ -118,12 +118,15 @@ def _pad(net: str, n: str = "1", size: float = 1.2, x: float = 0.0, y: float = 0
 def build_sensor_node_board(tools: dict, name: str = "sensor_node_stm32") -> str:
     """STM32F4 sensor-node: regulator U1, MCU U2, I2C temp sensor U3, FPGA-lite U4,
     decoupling caps, crystal, BOOT0 pull-down, closed outline + power/I2C nets."""
-    from engine.ecad import session as ecad_session
+    # T-RF21: the ecad session lives in the C++ core; the facade mirrors the old
+    # engine.ecad.session API, but doc mutations need an explicit swap_doc write-back.
+    from services.mcp.ecad_common import ecad_session
     from mcp_server.ecad_tools import _ECAD
 
     _call(tools, "ecad_new_pcb", name=name)
     doc_id = _ECAD["current_pcb"]
-    doc = ecad_session.get_session(doc_id).doc
+    _sess = ecad_session.get_session(doc_id)
+    doc = _sess.doc
 
     # 50 x 40 mm closed outline
     pts = [(0, 0), (50, 0), (50, 40), (0, 40)]
@@ -194,11 +197,11 @@ def build_sensor_node_board(tools: dict, name: str = "sensor_node_stm32") -> str
     }
 
     doc["footprints"] = [
-        {"id": "fp_u1", "ref": "U1", "fpid": "Package_TO:TO-220", "value": "REG_3V3",
+        {"id": "fp1", "ref": "U1", "fpid": "Package_TO:TO-220", "value": "REG_3V3",
          "pos": [12.0, 12.0], "angle": 0.0, "side": "top",
          "pads": [_pad("+3V3", "1", size=6.0), _pad("GND", "2"), _pad("+3V3", "3")],
          "fields": {"height": 4.5, "Value": "REG_3V3"}, "eng_overrides": reg_eng},
-        {"id": "fp_u2", "ref": "U2", "fpid": "Package_QFP:LQFP-100", "value": "STM32F407",
+        {"id": "fp2", "ref": "U2", "fpid": "Package_QFP:LQFP-100", "value": "STM32F407",
          "pos": [30.0, 20.0], "angle": 0.0, "side": "top",
          "pads": [
              _pad("+3V3", "1", x=-5), _pad("GND", "2", x=-4),
@@ -207,32 +210,32 @@ def build_sensor_node_board(tools: dict, name: str = "sensor_node_stm32") -> str
              _pad("LED", "7", x=1), _pad("VCORE", "8", x=2),
          ],
          "fields": {"height": 1.6, "Value": "STM32F407VGT6"}, "eng_overrides": mcu_eng},
-        {"id": "fp_u3", "ref": "U3", "fpid": "Package_SO:SOT-23-6", "value": "TMP103",
+        {"id": "fp3", "ref": "U3", "fpid": "Package_SO:SOT-23-6", "value": "TMP103",
          "pos": [42.0, 30.0], "angle": 0.0, "side": "top",
          "pads": [_pad("+3V3", "1"), _pad("GND", "2"),
                   _pad("SCL", "3"), _pad("SDA", "4")],
          "fields": {"height": 0.8, "Value": "TMP103"}, "eng_overrides": sensor_eng},
-        {"id": "fp_u4", "ref": "U4", "fpid": "Package_BGA:BGA-121", "value": "iCE40HX1K",
+        {"id": "fp4", "ref": "U4", "fpid": "Package_BGA:BGA-121", "value": "iCE40HX1K",
          "pos": [18.0, 32.0], "angle": 0.0, "side": "top",
          "pads": [_pad("VCORE", "1"), _pad("VIO", "2"), _pad("GND", "3"),
                   _pad("SCL", "4"), _pad("SDA", "5")],
          "fields": {"height": 1.4, "Value": "iCE40HX1K"}, "eng_overrides": fpga_eng},
         # Decoupling near MCU rails (hostcheck)
-        {"id": "fp_c1", "ref": "C1", "fpid": "Capacitor_SMD:C_0402", "value": "100n",
+        {"id": "fp5", "ref": "C1", "fpid": "Capacitor_SMD:C_0402", "value": "100n",
          "pos": [28.0, 14.0], "angle": 0.0, "side": "top",
          "pads": [_pad("+3V3", "1"), _pad("GND", "2")],
          "fields": {"height": 0.5}},
-        {"id": "fp_c2", "ref": "C2", "fpid": "Capacitor_SMD:C_0402", "value": "100n",
+        {"id": "fp6", "ref": "C2", "fpid": "Capacitor_SMD:C_0402", "value": "100n",
          "pos": [32.0, 14.0], "angle": 0.0, "side": "top",
          "pads": [_pad("VCORE", "1"), _pad("GND", "2")],
          "fields": {"height": 0.5}},
         # Crystal (hostcheck crystal presence)
-        {"id": "fp_y1", "ref": "Y1", "fpid": "Crystal:Crystal_SMD", "value": "8MHz",
+        {"id": "fp7", "ref": "Y1", "fpid": "Crystal:Crystal_SMD", "value": "8MHz",
          "pos": [38.0, 12.0], "angle": 0.0, "side": "top",
          "pads": [_pad("GND", "1"), _pad("GND", "2")],
          "fields": {"height": 0.8}},
         # BOOT0 pull-down
-        {"id": "fp_r1", "ref": "R1", "fpid": "Resistor_SMD:R_0402", "value": "10k",
+        {"id": "fp8", "ref": "R1", "fpid": "Resistor_SMD:R_0402", "value": "10k",
          "pos": [34.0, 26.0], "angle": 0.0, "side": "top",
          "pads": [_pad("BOOT0", "1"), _pad("GND", "2")],
          "fields": {"height": 0.4}},
@@ -240,15 +243,16 @@ def build_sensor_node_board(tools: dict, name: str = "sensor_node_stm32") -> str
 
     # Power distribution + I2C bus tracks
     doc["tracks"] = [
-        {"id": "t_3v3", "kind": "segment", "p1": [12.0, 12.0], "p2": [30.0, 20.0],
+        {"id": "t1", "kind": "segment", "p1": [12.0, 12.0], "p2": [30.0, 20.0],
          "width": 0.5, "net": "+3V3", "layer": "F.Cu"},
-        {"id": "t_scl", "kind": "segment", "p1": [30.0, 20.0], "p2": [42.0, 30.0],
+        {"id": "t2", "kind": "segment", "p1": [30.0, 20.0], "p2": [42.0, 30.0],
          "width": 0.2, "net": "SCL", "layer": "F.Cu"},
-        {"id": "t_sda", "kind": "segment", "p1": [30.0, 20.0], "p2": [42.0, 31.0],
+        {"id": "t3", "kind": "segment", "p1": [30.0, 20.0], "p2": [42.0, 31.0],
          "width": 0.2, "net": "SDA", "layer": "F.Cu"},
-        {"id": "t_vcore", "kind": "segment", "p1": [30.0, 20.0], "p2": [18.0, 32.0],
+        {"id": "t4", "kind": "segment", "p1": [30.0, 20.0], "p2": [18.0, 32.0],
          "width": 0.4, "net": "VCORE", "layer": "F.Cu"},
     ]
+    ecad_session.swap_doc(_sess, doc)
     return doc_id
 
 
@@ -307,7 +311,7 @@ def main() -> int:
     def leg_board(leg: Leg) -> None:
         doc_id = build_sensor_node_board(tools)
         state["pcb_doc_id"] = doc_id
-        from engine.ecad import session as ecad_session
+        from services.mcp.ecad_common import ecad_session
         doc = ecad_session.get_session(doc_id).doc
         n_fp = len(doc.get("footprints") or [])
         assert n_fp >= 6, f"expected >=6 footprints, got {n_fp}"
@@ -432,7 +436,7 @@ def main() -> int:
     # ── 8. Firmware project + co-verify + optional sim ────────────────────
     def leg_firmware(leg: Leg) -> None:
         # Persist board JSON so fw tools can take a path ref
-        from engine.ecad import session as ecad_session
+        from services.mcp.ecad_common import ecad_session
         board_path = OUT_DIR / "sensor_node_board.json"
         board_doc = ecad_session.get_session(state["pcb_doc_id"]).doc
         board_path.write_text(json.dumps(board_doc, indent=2), encoding="utf-8")

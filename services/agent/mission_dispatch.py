@@ -1250,7 +1250,7 @@ class MissionDispatch:
                                    in_stock=in_stock)
         except Exception as exc:  # noqa: BLE001 — error is data for the model
             return {"ok": False, "error": f"part_search failed: {exc}",
-                    "hint": "Check that engine_oracle/parts_hub is importable."}
+                    "hint": "Check that services/parts (the parts hub) is importable."}
 
     def parts_taxonomy(self, node_id: str = "", depth: int = 2,
                        include_facets: bool = True, **_ignored: Any) -> dict:

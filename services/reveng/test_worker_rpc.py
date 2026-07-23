@@ -27,7 +27,7 @@ def _emit(*_a, **_k):  # the bridge never emits; a no-op sink
 
 def test_methods_registered_on_worker():
     """The bridge's methods land in the aggregated worker table (GUI reachability)."""
-    from engine import worker as w
+    from services import worker_main as w  # the post-oracle stdio worker (T-RF20)
     for name in ("list_reveng_sessions", "get_reveng_session", "reveng_start_session",
                  "reveng_add_images", "reveng_ingest_datasheet",
                  "reveng_start_from_product"):

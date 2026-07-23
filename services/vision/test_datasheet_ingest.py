@@ -95,6 +95,8 @@ class TestBearingExtraction:
         with tempfile.TemporaryDirectory() as tmpdir:
             result = _ingest(pdf, Path(tmpdir))
 
+        if result.get("reason") == "backend_not_provisioned":
+            pytest.skip("no datasheet backend (docling/pdfplumber) provisioned")
         assert result.get("ok") is True, (
             f"Expected ok=true, got: {result.get('reason')}"
         )

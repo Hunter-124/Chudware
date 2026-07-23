@@ -315,7 +315,7 @@ def test_sweep_guard(tools: dict) -> None:
 
 def _build_footprinted_divider(tools: dict) -> None:
     """Build a divider whose resistors carry a real footprint, so sync places them on the board."""
-    from engine.ecad import session as ecad_session
+    from mcp_server.ecad_common import ecad_session
     from mcp_server.ecad_tools import _ECAD
 
     _call(tools, "ecad_new_schematic", name="sync_div")
@@ -342,7 +342,7 @@ def _build_footprinted_divider(tools: dict) -> None:
 def test_sync_autoroute_zone_flow(tools: dict) -> None:
     """The full PCB capability chain via the AI tools: update_from_sch -> autoroute -> add_zone ->
     fill_zones, asserting the rich-context contract at each step."""
-    from engine.ecad import session as ecad_session
+    from mcp_server.ecad_common import ecad_session
     from mcp_server.ecad_tools import _ECAD
 
     _build_footprinted_divider(tools)
@@ -510,7 +510,7 @@ def test_simulate_four(tools: dict) -> None:
     _call(tools, "ecad_wire", from_ref="C1", from_pin="2", to_ref="V1", to_pin="-")
     _call(tools, "ecad_add_power", net="GND", x=0, y=3)
     # Sine source: set waveform to SIN so the tran has something to analyze.
-    from engine.ecad import session as ecad_session
+    from mcp_server.ecad_common import ecad_session
     from mcp_server.ecad_tools import _ECAD
     s = ecad_session.get_session(_ECAD["current_sch"])
     v_sym = next(sym for sym in s.doc.get("symbols", []) if sym.get("ref") == "V1")
@@ -593,7 +593,7 @@ def test_check_impedance_no_tracks(tools: dict) -> None:
 
 def test_check_impedance_routed(tools: dict) -> None:
     """ecad_check_impedance on a board with a routed trace must return a Z0 reading."""
-    from engine.ecad import session as ecad_session
+    from mcp_server.ecad_common import ecad_session
     from mcp_server.ecad_tools import _ECAD
 
     # Build a footprinted divider + route it.
@@ -668,14 +668,14 @@ def test_run_dfm_clean(tools: dict) -> None:
 
 def test_run_dfm_seeded(tools: dict) -> None:
     """ecad_run_dfm on a board with a seeded DFM violation must report it with a reading."""
-    from engine.ecad import session as ecad_session
+    from mcp_server.ecad_common import ecad_session
     from mcp_server.ecad_tools import _ECAD
 
     _call(tools, "ecad_new_pcb", name="dfm_seeded")
     pcb = ecad_session.get_session(_ECAD["current_pcb"])
 
     # Seed a courtyard_overlap: add two footprints at the same position (courtyards collide).
-    from engine.ecad.library.starter import FOOTPRINTS
+    from services.ecad.library.starter import FOOTPRINTS
     import copy as _copy
     fp_def = FOOTPRINTS.get("Resistor_SMD:R_0603")
     if fp_def is None:
@@ -718,7 +718,7 @@ def test_run_dfm_seeded(tools: dict) -> None:
 def test_autoroute_with_diff_pairs(tools: dict) -> None:
     """ecad_autoroute with diff_pairs=[['CLK_P','CLK_N']] must attempt coupled routing and
     return diff_pair_stats in the payload."""
-    from engine.ecad import session as ecad_session
+    from mcp_server.ecad_common import ecad_session
     from mcp_server.ecad_tools import _ECAD
 
     _build_footprinted_divider(tools)  # sets up a schematic with footprints
@@ -733,7 +733,7 @@ def test_autoroute_with_diff_pairs(tools: dict) -> None:
     _call(tools, "ecad_update_from_sch")
 
     # Add a second pair of pads for CLK_P/CLK_N nets by placing extra footprints directly.
-    from engine.ecad.library.starter import FOOTPRINTS
+    from services.ecad.library.starter import FOOTPRINTS
     import copy as _copy
     fp_def = FOOTPRINTS.get("Resistor_SMD:R_0603")
     if fp_def is None:
@@ -749,9 +749,11 @@ def test_autoroute_with_diff_pairs(tools: dict) -> None:
     for pad in fp_n.get("pads", []):
         pad["net"] = "CLK_N"
     # Pre-register nets so pcb_add_footprint's pads are valid.
+    # T-RF20: pcb.doc is a client copy of the C++ session doc — write the mutation back.
     pcb.doc.setdefault("nets", [])
     pcb.doc["nets"].append({"name": "CLK_P", "class": "default"})
     pcb.doc["nets"].append({"name": "CLK_N", "class": "default"})
+    ecad_session.swap_doc(pcb, pcb.doc)
     ecad_session.apply_ops(pcb, pcb.revision, [
         {"op": "pcb_add_footprint", "fpid": "Resistor_SMD:R_0603",
          "ref": "U1", "value": "CLK_P", "pos": [10.0, 20.0],
@@ -785,7 +787,7 @@ def test_autoroute_with_diff_pairs(tools: dict) -> None:
 
 def test_check_diff_impedance(tools: dict) -> None:
     """ecad_check_diff_impedance on a board with routed CLK_P/CLK_N tracks must return Z_diff."""
-    from engine.ecad import session as ecad_session
+    from mcp_server.ecad_common import ecad_session
     from mcp_server.ecad_tools import _ECAD
 
     # Start with a clean board.
@@ -797,6 +799,7 @@ def test_check_diff_impedance(tools: dict) -> None:
     pcb.doc.setdefault("nets", [])
     pcb.doc["nets"].append({"name": "CLK_P", "class": "default"})
     pcb.doc["nets"].append({"name": "CLK_N", "class": "default"})
+    ecad_session.swap_doc(pcb, pcb.doc)  # T-RF20: write the client-copy mutation back
 
     # Add two parallel tracks representing the diff pair via ops.
     ecad_session.apply_ops(pcb, pcb.revision, [
@@ -858,7 +861,7 @@ def test_e1_multiple_docs_coexist(tools: dict) -> None:
 
 def test_e2_led_driver_recipe(tools: dict) -> None:
     """E2: an 'LED driver' request must produce the LED-driver recipe (V->R->LED->GND), not an amp."""
-    from engine.ecad import recipes as _recipes
+    from services.ecad_design import recipes as _recipes
     # Matcher: LED requests map to led_driver; unrelated requests default to the divider, not amp.
     assert _recipes.closest_recipe("LED driver from a 3.3V supply")["name"] == "led_driver"
     assert _recipes.closest_recipe("an LED driver")["name"] == "led_driver"
@@ -880,8 +883,8 @@ def test_e2_led_driver_recipe(tools: dict) -> None:
 
 def test_e3_opamp_noninverting_gain(tools: dict) -> None:
     """E3: a non-inverting op-amp (Rf=10k,Rin=1k,Vin=1V) must simulate to V(OUT)~=11V, not 0."""
-    from engine.ecad import schema as ecad_schema
-    from engine.ecad import session as ecad_session
+    from mcp_server.ecad_common import schema as ecad_schema
+    from mcp_server.ecad_common import ecad_session
 
     s = _call(tools, "ecad_new_schematic", name="E3_noninv")
     sid = s["doc_id"]
@@ -1059,7 +1062,7 @@ def test_e9_noise_top_level_nonzero(tools: dict) -> None:
 def test_fin9_hostcheck_tool(tools: dict) -> None:
     """T-FIN9: ecad_run_hostcheck runs on the active board, reports the metadata-driven
     sequencing finding with a fix hint, and is clean on an empty board."""
-    from engine.ecad import session as ecad_session
+    from mcp_server.ecad_common import ecad_session
 
     # clean empty board -> no findings, teaching payload intact
     b = _call(tools, "ecad_new_pcb", name="FIN9_clean")
@@ -1072,6 +1075,8 @@ def test_fin9_hostcheck_tool(tools: dict) -> None:
     # the requirement travels entirely in eng_overrides).
     b2 = _call(tools, "ecad_new_pcb", name="FIN9_seeded")
     sess = ecad_session.get_session(b2["doc_id"])
+    # C++ schema validation (core/ecad/schema.cpp): a pad net must exist in board nets.
+    sess.doc["nets"].append({"name": "3V3", "class": "default"})
     sess.doc["footprints"].append({
         "id": "fp1", "fpid": "Test:FP", "libid": "", "ref": "U1", "value": "MCU",
         "pos": [0.0, 0.0], "angle": 0.0, "side": "top", "graphics": [],
@@ -1083,6 +1088,7 @@ def test_fin9_hostcheck_tool(tools: dict) -> None:
             "rails": [{"name": "3V3", "voltage_v_nom": 3.3}],
             "sequencing": ["VCORE before VIO"]}},
     })
+    ecad_session.swap_doc(sess, sess.doc)  # T-RF20: write the client-copy mutation back
     seeded = _call(tools, "ecad_run_hostcheck", doc_id=b2["doc_id"])
     assert seeded["ok"], seeded
     rules = {g["rule"] for g in seeded["by_rule"]}
@@ -1212,7 +1218,7 @@ def test_fin13_run_pdn(tools: dict) -> None:
     """T-FIN13: ecad_run_pdn flags an undersized 3 A trace (drop + current density) and
     exports the I2R map as the boardphys `pdn` sidecar extension."""
     import os
-    from engine.ecad import session as ecad_session
+    from mcp_server.ecad_common import ecad_session
     from mcp_server.ecad_tools import _ECAD
 
     _call(tools, "ecad_new_pcb", name="fin13_pdn")
@@ -1240,6 +1246,7 @@ def test_fin13_run_pdn(tools: dict) -> None:
     doc["tracks"].append({"id": "t1", "kind": "segment", "p1": [0.0, 0.0],
                           "p2": [30.0, 0.0], "width": 0.3, "net": "+5V",
                           "layer": "F.Cu"})
+    ecad_session.swap_doc(pcb, doc)  # T-RF20: write the client-copy fixture back
 
     r = _call(tools, "ecad_run_pdn", net="+5V", source_refs="J1")
     _assert_context(r, "ecad_run_pdn")
@@ -1280,6 +1287,7 @@ def test_fin13_run_pdn(tools: dict) -> None:
     doc["tracks"].append({"id": "t2", "kind": "segment", "p1": [0.0, 10.0],
                           "p2": [30.0, 10.0], "width": 3.0, "net": "+3V3",
                           "layer": "F.Cu"})
+    ecad_session.swap_doc(pcb, doc)  # T-RF20: write the client-copy fixture back
     r2 = _call(tools, "ecad_run_pdn", net="+3V3", source_refs="J2")
     assert r2["ok"] and not r2["violations"], f"clean net must pass: {r2.get('violations')}"
     u2 = next(d for d in r2["nets"][0]["drops"] if d["ref"] == "U2")
@@ -1398,7 +1406,7 @@ def _fin16_tools() -> dict:
 def _fin16_demo_board(tools: dict, name: str = "fin16_demo") -> str:
     """Regulator (~2 W) + MCU (0.3 W) + passives demo board with a closed outline and
     a skinny +5V trace (for the PDN/trace-heating leg). Returns the pcb doc_id."""
-    from engine.ecad import session as ecad_session
+    from mcp_server.ecad_common import ecad_session
     from mcp_server.ecad_tools import _ECAD
 
     _call(tools, "ecad_new_pcb", name=name)
@@ -1449,7 +1457,10 @@ def _fin16_demo_board(tools: dict, name: str = "fin16_demo") -> str:
     doc["tracks"].append({"id": "t1", "kind": "segment", "p1": [10.0, 15.0],
                           "p2": [30.0, 15.0], "width": 0.3, "net": "+5V",
                           "layer": "F.Cu"})
-    return doc_id
+    # T-RF20: doc is a client copy of the C++ session doc — write the fixture back.
+    sess = ecad_session.get_session(doc_id)
+    ecad_session.swap_doc(sess, doc)
+    return sess.doc_id
 
 
 def test_fin16_dry_run_handoff() -> None:
@@ -1690,12 +1701,15 @@ def test_fin17_library_candidates() -> None:
 def _fin17_board(tools: dict, name: str) -> str:
     """FIN16 demo board with the regulator turned up to a ~3 W part."""
     doc_id = _fin16_demo_board(tools, name=name)
-    from engine.ecad import session as ecad_session
+    from mcp_server.ecad_common import ecad_session
     doc = ecad_session.get_session(doc_id).doc
     for fp in doc["footprints"]:
         if fp["ref"] == "U1":
             fp["eng_overrides"]["power_w"] = {"typ": 3.0, "max": 3.5}
-    return doc_id
+    # T-RF20: write the client-copy mutation back into the C++ session.
+    sess = ecad_session.get_session(doc_id)
+    ecad_session.swap_doc(sess, doc)
+    return sess.doc_id
 
 
 def test_fin17_heatsink_select() -> None:
@@ -2170,7 +2184,7 @@ def test_fin19_handoff_dry_run() -> None:
 
 def _fin19_openfoam_available() -> bool:
     try:
-        from engine.sim.foam_runner import get_runner
+        from services.sim.foam_runner import get_runner
         r = get_runner()
         return bool(r is not None and r.available())
     except Exception:  # noqa: BLE001
@@ -2185,7 +2199,7 @@ def test_fin19_live_cht_smoke(tmp_path) -> None:
         print("  FIN19: OpenFOAM not available — live CHT smoke SKIPPED")
         return
     from mcp_server.ecad_thermal import build_airflow_solids, parse_region_temps
-    from engine.sim.openfoam import run_openfoam_tunnel
+    from services.sim.openfoam import run_openfoam_tunnel
     board = {"bbox_mm": [0.0, 0.0, 20.0, 20.0], "z_top_mm": 1.6, "z_bot_mm": 0.0,
              "thickness_mm": 1.6, "outline_area_mm2": 400.0}
     material = {"k_w_mk": 18.0}

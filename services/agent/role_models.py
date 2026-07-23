@@ -1,6 +1,6 @@
 """role_models.py — per-role model assignment + auto ranking pick (WS2 / WS4).
 
-Contract (AI_HARNESS_ROADMAP WS2 + wave Contract):
+Contract (docs/plans/AI_HARNESS_ROADMAP.md WS2 + wave Contract):
   * config.json ``ai_roles`` maps role → ``{provider, model}`` | ``"auto"``
     for: advisor | task | planning | vision | default | plm | redaction.
   * Each role entry MAY also carry ``thinking``: ``"auto"|"low"|"medium"|"high"``

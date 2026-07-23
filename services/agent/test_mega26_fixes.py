@@ -120,7 +120,7 @@ def test_mega25_ledger_old_topology_dc33_and_no_retry():
 
 def test_a26_v_source_value_is_parseable_not_dc_prefix():
     """Forced inject must use bare '3.3' (schematic _parse_value rejects 'DC 3.3')."""
-    from engine.sim.spice import _parse_value
+    from services.sim.spice import _parse_value
     from services.agent.agent_turn import _ecad_ensure_driven_rail, _ecad_forced_tool_args
 
     # Engine contract: "DC 3.3" fails; "3.3" works.

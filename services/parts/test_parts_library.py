@@ -151,18 +151,17 @@ def test_local_library_place_is_import_file(tmp_path, monkeypatch) -> None:
     assert part["geometry_ref"]["kind"] == "import_file"
     assert part["geometry_ref"]["path"] == str(src.resolve())
 
+    # part_place is the C++ dispatcher now (core/parts/place.cpp behind the
+    # part_place RPC; engine_oracle.parts_hub.place was deleted): hand it the
+    # record inline — the pre-fetched `record` param replaces the hub lookup.
+    import pytest
     from services.mcp import core_bridge as cb
-    monkeypatch.setattr(
-        cb, "call",
-        lambda verb, params: {"doc_id": "doc-lib-1", "body_count": 1}
-        if verb == "import_file" else {},
-    )
-    from .parts_hub.place import place
-    monkeypatch.setattr(ph, "get", lambda pid: part)
-    r = place(part["part_id"])
+    if not cb.available():
+        pytest.skip("native core (libaicad) not available in this environment")
+    r = cb.call("part_place", {"part_id": part["part_id"], "record": part})
     assert r["ok"] is True, f"place failed: {r}"
     assert r["editable"] is True
-    assert r["doc_id"] == "doc-lib-1"
+    assert r["doc_id"]
 
 def main() -> None:
     test_scan_registers_and_is_idempotent()

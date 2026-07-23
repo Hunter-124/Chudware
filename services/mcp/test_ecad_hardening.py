@@ -18,8 +18,8 @@ import tempfile
 import time
 
 import mcp_server.ecad_common as et  # T-RF8: budget/session internals moved
-from engine.ecad import autosave as eauto
-from engine.ecad import session as esess
+from services.ecad import autosave as eauto
+from mcp_server.ecad_common import ecad_session as esess
 from mcp_server.ecad_tools import register_ecad_tools
 
 
@@ -78,26 +78,27 @@ def test_budget_timeout_payload_shape() -> None:
 def test_autoroute_overrun_returns_clean_message() -> None:
     """A router that runs past the budget must yield a clean 'still running' payload, NOT hang the
     call until the client kills the server."""
-    from engine.ecad import rpc as ecad_rpc
+    import mcp_server.ecad_pcb_tools as _pcb_tools  # T-RF20: the tool RPCs via ecad_common._rpc
 
     tools = _tools()
     _call(tools, "ecad_new_pcb", name="HeavyBoard")
 
-    orig = ecad_rpc._ecad_autoroute
+    orig = _pcb_tools._rpc
     orig_budget = et._ECAD_HEAVY_BUDGET_S
     et._ECAD_HEAVY_BUDGET_S = 1.0  # tiny budget for the test
 
-    def _slow_autoroute(params, emit):  # noqa: ANN001
-        time.sleep(5)
-        return orig(params, emit)
+    def _slow_rpc(method, params=None):  # noqa: ANN001
+        if method == "ecad_autoroute":
+            time.sleep(5)
+        return orig(method, params)
 
-    ecad_rpc._ecad_autoroute = _slow_autoroute
+    _pcb_tools._rpc = _slow_rpc
     try:
         t0 = time.time()
         p = _call(tools, "ecad_autoroute")
         dt = time.time() - t0
     finally:
-        ecad_rpc._ecad_autoroute = orig
+        _pcb_tools._rpc = orig
         et._ECAD_HEAVY_BUDGET_S = orig_budget
 
     assert dt < 3, f"autoroute hung past its budget ({dt:.1f}s) — would trip the transport timeout"
@@ -108,7 +109,7 @@ def test_autoroute_overrun_returns_clean_message() -> None:
 
 def test_simulate_overrun_returns_clean_message() -> None:
     """ecad_simulate must budget-guard the solver call the same way."""
-    import engine.sim.circuit as circ
+    import mcp_server.ecad_sim_tools as _sim_tools  # T-RF20: tool runs the C++ sim via _sim_run
 
     tools = _tools()
     # minimal sim-able schematic: a source + resistor to ground (recipe via ecad_design is heavy;
@@ -120,7 +121,7 @@ def test_simulate_overrun_returns_clean_message() -> None:
     _call(tools, "ecad_wire", from_ref="V1", from_pin="1", to_ref="R1", to_pin="1")
     _call(tools, "ecad_add_power", net="GND", x=0, y=-10)
 
-    orig = circ.simulate
+    orig = _sim_tools._sim_run
     orig_budget = et._ECAD_HEAVY_BUDGET_S
     et._ECAD_HEAVY_BUDGET_S = 1.0
 
@@ -128,13 +129,13 @@ def test_simulate_overrun_returns_clean_message() -> None:
         time.sleep(5)
         return orig(circuit, study, **kw)
 
-    circ.simulate = _slow_sim
+    _sim_tools._sim_run = _slow_sim
     try:
         t0 = time.time()
         p = _call(tools, "ecad_simulate", analysis="op")
         dt = time.time() - t0
     finally:
-        circ.simulate = orig
+        _sim_tools._sim_run = orig
         et._ECAD_HEAVY_BUDGET_S = orig_budget
 
     assert dt < 3, f"ecad_simulate hung past its budget ({dt:.1f}s)"

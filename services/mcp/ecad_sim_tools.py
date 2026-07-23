@@ -359,7 +359,7 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
                         next_actions=["ecad_new_pcb('myboard')"])
         doc = session.doc
         try:
-            from engine.ecad import pdn as pdn_mod  # STAYS (T-RF20): no C++ counterpart; lazy import (pulls scipy)
+            from services.ecad import pdn as pdn_mod  # STAYS (T-RF20): no C++ counterpart; lazy import (pulls scipy)
         except Exception as e:  # noqa: BLE001
             return _err(f"PDN engine unavailable: {e}",
                         hint="numpy/scipy are required for the sparse solve.")
@@ -583,7 +583,7 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
             return _err(e.message, hint="FPGA checks run on a schematic.",
                         next_actions=["ecad_new_schematic('myfpga')"])
         try:
-            from engine.ecad import fpga  # STAYS (T-RF20): no C++ counterpart
+            from services.ecad import fpga  # STAYS (T-RF20): no C++ counterpart
         except Exception as e:  # noqa: BLE001
             return _err(f"fpga module unavailable ({type(e).__name__}: {e})")
         nl = netlist_mod.build_netlist(session.doc)
@@ -1167,7 +1167,7 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
             return _err(e.message, hint="Open a board first.",
                         next_actions=["ecad_new_pcb('myboard')"])
         try:
-            from engine.ecad import si_rules as si_mod  # STAYS (T-RF20): no C++ counterpart
+            from services.ecad import si_rules as si_mod  # STAYS (T-RF20): no C++ counterpart
             res = si_mod.run_sicheck(session.doc)
         except Exception as e:  # noqa: BLE001
             return _err(f"SI check engine error: {e}", hint="Inspect with ecad_status().")

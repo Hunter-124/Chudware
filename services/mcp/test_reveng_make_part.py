@@ -92,9 +92,6 @@ def parts_hub_fake(monkeypatch):
     fake_hub.register_provider = _fake_reg  # type: ignore[attr-defined]
 
     monkeypatch.setitem(sys.modules, "services.parts", fake_hub)
-    # Also shadow the legacy shim package so `import engine_oracle.parts_hub.place`
-    # below never executes the real shim (which would import the REAL services.parts).
-    monkeypatch.setitem(sys.modules, "engine_oracle.parts_hub", fake_hub)
     return PART_ID, record
 
 
@@ -110,16 +107,16 @@ def _inject_mission_mock(monkeypatch, result: dict):
     monkeypatch.setattr(rb, "_launch_reveng_mission", lambda *a, **kw: result)
 
 
-def _inject_place_mock(monkeypatch, ok: bool = True):
-    """Stub engine_oracle.parts_hub.place.place so part_place works."""
-    place_mod = ModuleType("engine_oracle.parts_hub.place")
-    place_mod.place = lambda ref, **kw: {"ok": ok, "doc_id": "doc_test", "editable": True}  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "engine_oracle.parts_hub.place", place_mod)
-    # `import engine_oracle.parts_hub.place as x` resolves the attribute on the
-    # parent package — which the fixture shadowed with the fake hub.
-    parent = sys.modules.get("engine_oracle.parts_hub")
-    if parent is not None:
-        monkeypatch.setattr(parent, "place", place_mod, raising=False)
+def _assert_placeable_record(part_id: str) -> None:
+    """After attach, the RevengResultAdapter must serve a record the C++ part_place
+    dispatcher (core/parts/place.cpp — engine_oracle.parts_hub.place is deleted)
+    accepts: an import_file geometry_ref pointing at the mission mesh."""
+    from services.parts.adapters.reveng_result_adapter import RevengResultAdapter
+    rec = RevengResultAdapter().get(part_id)
+    assert rec is not None, "RevengResultAdapter has no record — attach may have failed"
+    gref = rec.get("geometry_ref")
+    assert gref and gref.get("kind") == "import_file" and gref.get("path"), \
+        f"record not place-shaped after attach: {rec}"
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +158,6 @@ def test_known_mpn_model_present_and_place(
     import services.mcp.reveng_build_tools as rb  # T-RF8: tools look it up here
     import services.mcp.reveng_tools as rt
     monkeypatch.setattr(rb, "_launch_reveng_mission", _mission_with_mesh)
-    _inject_place_mock(monkeypatch)
 
     mcp, tools = _make_fake_mcp()
     rt.register_reveng_tools(mcp)
@@ -182,14 +178,12 @@ def test_known_mpn_model_present_and_place(
     assert sc["part_ref"] == PART_ID
     assert sc["schema"] == "aicad.reveng_result/1"
 
-    # part_place: confirm the injected place stub works for this part_ref.
-    # NOTE: `import engine_oracle.parts_hub.place as x` binds via attribute walk
-    # on the parent package and can pick up the REAL place module when another
-    # test imported it earlier — look the stub up in sys.modules directly.
-    import sys as _sys  # noqa: PLC0415
-    _place_mod = _sys.modules["engine_oracle.parts_hub.place"]
-    pr = _place_mod.place(PART_ID)
-    assert pr["ok"] is True
+    # part_place seam: the attached record must be place-shaped for the C++
+    # dispatcher (the actual core placement of a reveng result is covered by
+    # test_reveng_parts_roundtrip.py::test_part_place_succeeds_after_attach).
+    # Drop the fake hub first: the adapter import needs the REAL services.parts package.
+    monkeypatch.delitem(sys.modules, "services.parts", raising=False)
+    _assert_placeable_record(PART_ID)
 
 
 # ---------------------------------------------------------------------------

@@ -1068,7 +1068,7 @@ def test_new_part_seeds_volume_baseline_for_write_diff():
 
 
 # ================================================================ AI-experience lane
-# Appended tests (HANDOFF_AI_EXPERIENCE §TODO-2 TESTS-MCP): feature-overlap detection,
+# Appended tests (HANDOFF_AI_EXPERIENCE §TODO-2 TESTS-MCP — doc pruned 2026-07-23): feature-overlap detection,
 # add_features overlap warnings, coincident-contact interference, and the render caption.
 
 # --- pytest import-shadow repair --------------------------------------------------------

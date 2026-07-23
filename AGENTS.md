@@ -19,13 +19,14 @@ the GUI binary/target stays `Billet` with an `AI-CAD` compat symlink beside it.
 MCP server id is `billet` with `ai-cad` preserved.
 
 Architecture in one paragraph: the pure C++/CUDA kernel `libaicad` (under
-`core/`) is strangling out the legacy Python engine (`engine_oracle/`, with the
-root `engine` symlink preserving imports). The two are kept in lockstep by a
-per-subsystem parity corpus until each Python module is flipped off and
-deleted. The C++ host under `host/` is the **sole GUI target** (~110k LOC under
-`host/src/ui/`); it talks to the shared `aicad-hostd` daemon (which dlopens
-`libaicad`) over a unix socket, with the Python engine worker as fallback for
-not-yet-ported methods. The same `host/src/ui` tree compiles to WASM for the
+`core/`) IS the engine — the legacy Python engine (`engine_oracle/` + the root
+`engine` symlink) was fully strangled out and deleted in T-RF21 (zero-Python
+cutover, 2026-07-23); what Python remains lives under `services/` (MCP tools,
+agent, worker seam, pure-helper modules with no C++ counterpart). The C++ host
+under `host/` is the **sole GUI target** (~110k LOC under `host/src/ui/`); it
+talks to the shared `aicad-hostd` daemon (which dlopens `libaicad`) over a unix
+socket, with `python -m services.worker_main` as the stdio worker for the
+services-side methods. The same `host/src/ui` tree compiles to WASM for the
 web app (`Webservice/README.md`), so desktop and web stay at parity by
 construction. The host builds its own OpenGL pipeline under `host/src/render/`.
 
@@ -33,9 +34,9 @@ Canonical references:
 - `ARCHITECTURE.md` — system architecture and locked decisions.
 - `contracts/` — frozen interface contracts, the seams between components
   (append-only; see `contracts/README.md`).
-- `docs/PLAN.md` — design + milestones. `docs/REFACTOR_LOG.md` — refactor
+- `docs/REFACTOR_LOG.md` — refactor
   handoff log (each DAG node appends a paragraph: files touched, deferred,
-  gotchas).
+  gotchas). Active plans live under `docs/plans/`.
 - The active refactor plan (source of truth for the current consolidation
   effort — hygiene → agent harness → UI/UX → perf → zero-Python cutover):
   `docs/plans/2026-07-22-consolidation-refactor-dag.md`, tracked on the board
@@ -68,10 +69,9 @@ Canonical references:
 
 | Dir | Purpose |
 |-----|---------|
-| `core/` | Pure C++/CUDA kernel → `libaicad`: geom/doc/sketch/solver/cam/sim/ecad/mate/parts/agent/util/api/tests. The zero-Python engine target. |
+| `core/` | Pure C++/CUDA kernel → `libaicad`: geom/doc/sketch/solver/cam/sim/ecad/mate/parts/agent/util/api/tests. **The engine** (zero-Python since T-RF21). |
 | `host/` | **The single GUI target.** Production C++ desktop host (~110k LOC under `host/src/ui/`), cross-platform (Linux GCC/Clang + Windows MSVC); the same tree compiles to WASM for the web app. Binary: `host/build-linux/bin/Billet` (`AI-CAD` compat symlink). Own GL pipeline under `host/src/render/`. |
-| `engine_oracle/` | Frozen legacy Python engine, kept as differential parity oracle while `core/` catches up. Deleted LAST (node N6b). Root `engine` symlink preserves `python -m engine.*` imports. |
-| `services/` | Python services: `agent/` (built-in agent loop; root `agent` symlink), `mcp/` (MCP server for external agents; root `mcp_server` symlink), `worker/` (C++ engine routing seam, four modules: worker_client / engine_backend / cpp_core / worker_router), `installer/` (provisioning, MCP registration, packaging), plus `dag/`, `deliverables/`, `plm/`, `browser/`, `ipc/`, `serving/` (LoRA adapter routing — not the webservice; the webservice is top-level `Webservice/`), `verify/`, `dist/`. |
+| `services/` | Python services: `agent/` (built-in agent loop; root `agent` symlink), `mcp/` (MCP server for external agents; root `mcp_server` symlink), `worker/` (C++ engine routing seam, four modules: worker_client / engine_backend / cpp_core / worker_router), `worker_main.py` (the stdio worker hostd spawns), `installer/` (provisioning, MCP registration, packaging), `ecad/`+`sim/`+`structural/`+`piping/`+`formats/` (pure-helper re-homes from the deleted Python engine), plus `dag/`, `deliverables/`, `plm/`, `browser/`, `ipc/`, `serving/` (LoRA adapter routing — not the webservice; the webservice is top-level `Webservice/`), `verify/`, `dist/`. |
 | `ui/viewport/` | AICM mesh-format loader (`render/aicm_loader.*`) consumed by `core/` (libaicad tests/tools). The rest of the former "shared renderer" extraction was orphaned (host builds its own pipeline in `host/src/render/`) and was purged in T-RF2. `ui/imgui`/`ui/abstract` (the AI-CAD2 shell) are retired and gone. |
 | `platform/` | Cross-OS shims (dialogs, DPI, paths, resources, window) with `_linux`/`_win32` implementations. |
 | `contracts/` | Frozen interface contracts — THE seams. Append-only, integrator-owned. |
@@ -131,7 +131,7 @@ Other entry points:
   → `host/build-linux/bin/Billet`. (`build.bat` on Windows.)
 - Core presets (`CMakePresets.json`): `linux-core`, `windows-core` (MSVC,
   OCCT off, self-contained), `windows-occt` (auto-downloads OCCT 7.9.3 +
-  Netgen, cached under `third_party/`). See `docs/BUILD_WINDOWS.md`.
+  Netgen, cached under `third_party/`). See `docs/reference/BUILD_WINDOWS.md`.
 - Host GUI has its own CMakeLists: `cmake -S host -B host/build-linux
   -G Ninja -DCMAKE_BUILD_TYPE=Release && ninja -C host/build-linux Billet`.
   CEF (embedded vendor sign-in browser) defaults ON and needs the SDK under
@@ -181,11 +181,12 @@ Other entry points:
     exists.
   - Before adding a dependency (vendored, pip, or CMake), prove an existing
     in-repo capability can't do the job.
-- During the Python→C++ strangler migration, ported subsystems flip routing in
-  `services/worker/` and delete their Python module in `engine_oracle/` in the
-  same commit; `core/tests/` mirrors the Python suites (e.g. `test_sketch.cpp`
-  mirrors `engine/doc/test_sketch_solver.py`) and parity is proven with diff
-  harnesses (`tools/solver_diff.py`) before the switch.
+- The Python→C++ strangler migration is COMPLETE (T-RF21, 2026-07-23):
+  `engine_oracle/` is deleted, `scripts/oracle_import_allowlist.txt` is empty,
+  and `scripts/check.py`'s `oracle_import_audit` gate fails on any new
+  `engine.*`/`engine_oracle.*` import in `services/`. New engine functionality
+  lands in `core/` (C++) behind the RPC surface; services-side Python is for
+  MCP tools, the agent loop, and pure helpers with no C++ counterpart.
 - Subsystem-local `AGENTS.md` files exist (e.g. `engine/AGENTS.md`,
   `platform/AGENTS.md`); the deeper, more specific one wins. Keep them current
   when you change the conventions they describe.

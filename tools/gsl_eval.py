@@ -49,7 +49,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from mcp_server import core_bridge as cb  # noqa: E402
 
-# Gate thresholds (binding: tools/gsl_gnn/README.md + HANDOFF_AI_EXPERIENCE.md §TODO-3).
+# Gate thresholds (binding: tools/gsl_gnn/README.md + HANDOFF_AI_EXPERIENCE.md §TODO-3 — doc pruned 2026-07-23; rule survives in docs/review/RECOGNITION_RESIDUAL.md).
 GATE_MATCH_PCT = 90.0
 GATE_FACES_CLAIMED_PCT = 70.0
 TIME_BUDGET_S = 40 * 60
@@ -268,7 +268,7 @@ def _render_report(rows_by_family: dict[str, list[dict]], *, dataset_root: Path,
     L.append(f"- Total runtime: {total_s / 60.0:.1f} min")
     L.append("")
     L.append("This report is the **GNN adapter go/no-go input** (`tools/gsl_gnn/README.md` "
-             "gate). Binding rule (HANDOFF_AI_EXPERIENCE.md §TODO-3, review doc §3.4):")
+             "gate). Binding rule (HANDOFF_AI_EXPERIENCE.md §TODO-3 — pruned 2026-07-23, review doc §3.4):")
     L.append("")
     L.append(f"> Adapter training is justified ONLY for a family whose median match_pct < "
              f"{GATE_MATCH_PCT:.0f}% **or** median pct_faces_claimed < "

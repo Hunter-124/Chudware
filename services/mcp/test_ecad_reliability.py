@@ -53,7 +53,7 @@ def _demo_board(tools: dict, name: str = "fin21_demo", heavy: bool = False,
                 with_mounts: bool = True) -> str:
     """40x30 board, 4 corner NPTH mounting holes, an MCU + regulator; ``heavy=True``
     adds a large transformer-class body at the board center."""
-    from engine.ecad import session as ecad_session
+    from mcp_server.ecad_common import ecad_session
     from mcp_server.ecad_tools import _ECAD
 
     _call(tools, "ecad_new_pcb", name=name)
@@ -64,7 +64,7 @@ def _demo_board(tools: dict, name: str = "fin21_demo", heavy: bool = False,
         {"type": "line", "p1": list(pts[i]), "p2": list(pts[(i + 1) % 4])}
         for i in range(4)]}
 
-    def _smd(net="", n="1", size=1.2):
+    def _smd(net=None, n="1", size=1.2):
         return {"id": f"p{n}", "number": n, "pin": n, "pos": [0.0, 0.0], "angle": 0.0,
                 "shape": "rect", "size": [size, size], "type": "smd",
                 "layers": ["F.Cu"], "net": net}
@@ -89,15 +89,18 @@ def _demo_board(tools: dict, name: str = "fin21_demo", heavy: bool = False,
     if with_mounts:
         for i, (mx, my) in enumerate([(3, 3), (37, 3), (37, 27), (3, 27)]):
             fps.append(
-                {"id": f"mh{i + 1}", "ref": f"H{i + 1}",
+                {"id": f"fp{10 + i}", "ref": f"H{i + 1}",
                  "fpid": "MountingHole:MountingHole_3.2mm_M3",
                  "pos": [float(mx), float(my)], "angle": 0.0, "side": "top",
                  "pads": [{"id": "p1", "number": "1", "pin": "1", "pos": [0.0, 0.0],
                            "angle": 0.0, "shape": "circle", "size": [5.6, 5.6],
                            "type": "np_tht", "layers": ["F.Cu", "B.Cu"],
-                           "drill": {"diameter": 3.2}, "net": ""}]})
+                           "drill": {"diameter": 3.2}, "net": None}]})
     doc["footprints"].extend(fps)
-    return doc_id
+    # T-RF20: doc is a client copy of the C++ session doc — write the fixture back.
+    _sess = ecad_session.get_session(doc_id)
+    ecad_session.swap_doc(_sess, doc)
+    return _sess.doc_id
 
 
 # --------------------------------------------------------------------------- pure helpers

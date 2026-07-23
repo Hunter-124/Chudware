@@ -37,7 +37,7 @@ from mcp_server.ecad_thermal import (register_ecad_thermal_tools,
 from mcp_server.ecad_reliability import register_ecad_reliability_tools
 from mcp_server.heatsink import register_heatsink_tools
 from mcp_server.power_budget import register_power_budget_tools
-from engine.ecad import session as ecad_session
+from mcp_server.ecad_common import ecad_session
 
 
 def _has_3d() -> bool:
@@ -160,6 +160,12 @@ def build_reference_board(tools: dict, name: str = "ecad_packs_ref") -> str:
                           "p2": [10.0, 29.0], "width": 0.3, "net": "SHORTNET",
                           "layer": "F.Cu"})
 
+    # T-RF20: doc is a client copy of the C++ session doc — write the fixture back before
+    # the tools read board state (outline for the zone polygon, copper for PDN/SI checks).
+    _sess = ecad_session.get_session(doc_id)
+    ecad_session.swap_doc(_sess, doc)
+    doc_id = _sess.doc_id
+
     # GND zone filled over the board (the ground pour the packs expect to see).
     z = _call(tools, "ecad_add_zone", net="GND", doc_id=doc_id)
     assert z["ok"], f"add_zone failed: {z.get('error')}"
@@ -213,7 +219,7 @@ def test_pdn_ir_drop_matches_trace_resistance(tools, board):
     20 mm, so drop(U2) = 2A*R(10mm) + 1A*R(20mm) and drop(U1) = 2A*R(10mm).
     rho and t come from the SAME constants the solver uses (engine.ecad.pdn), so the
     comparison isolates the rasterised network solve, not the material data."""
-    from engine.ecad.pdn import RHO_CU_OHM_M, DEFAULT_COPPER_T_MM
+    from services.ecad.pdn import RHO_CU_OHM_M, DEFAULT_COPPER_T_MM
 
     r = _call(tools, "ecad_run_pdn", net="+5V", source_refs="J1", doc_id=board)
     _assert_context(r, "ecad_run_pdn")
@@ -342,6 +348,9 @@ def test_check_diff_impedance_reversed_digitisation(tools):
         {"id": "t4", "kind": "segment", "p1": [25.0, 20.45], "p2": [5.0, 20.45],
          "width": 0.25, "net": "REV_N", "layer": "F.Cu"},
     ]
+    _s = ecad_session.get_session(doc_id)
+    ecad_session.swap_doc(_s, doc)  # T-RF20: write the client-copy fixture back
+    doc_id = _s.doc_id
     fwd = _call(tools2, "ecad_check_diff_impedance", net_p="FWD_P", net_n="FWD_N",
                 doc_id=doc_id)
     rev = _call(tools2, "ecad_check_diff_impedance", net_p="REV_P", net_n="REV_N",
@@ -365,6 +374,8 @@ def test_hostcheck_seeded_sequencing_finding(tools):
     _call(tools, "ecad_new_pcb", name="ecad_packs_seq")
     doc_id = _ECAD["current_pcb"]
     doc = ecad_session.get_session(doc_id).doc
+    # C++ schema validation (core/ecad/schema.cpp): a pad net must exist in board nets.
+    doc["nets"].append({"name": "3V3", "class": "default"})
     doc["footprints"].append({
         "id": "fp1", "fpid": "Test:FP", "libid": "", "ref": "U1", "value": "MCU",
         "pos": [0.0, 0.0], "angle": 0.0, "side": "top", "graphics": [],
@@ -373,6 +384,7 @@ def test_hostcheck_seeded_sequencing_finding(tools):
         "eng_overrides": {"supply": {"rails": [{"name": "3V3", "voltage_v_nom": 3.3}],
                                      "sequencing": ["VCORE before VIO"]}},
     })
+    ecad_session.swap_doc(ecad_session.get_session(doc_id), doc)  # T-RF20 write-back
     r = _call(tools, "ecad_run_hostcheck", doc_id=doc_id)
     assert r["ok"], r
     rules = {g["rule"] for g in r["by_rule"]}
@@ -422,6 +434,9 @@ def test_stackup_solve_roundtrips_through_impedance_check(tools):
     doc["tracks"].append({"id": "t1", "kind": "segment", "p1": [5.0, 5.0],
                           "p2": [25.0, 5.0], "width": w50, "net": "Z50",
                           "layer": "F.Cu"})
+    _s = ecad_session.get_session(doc_id)
+    ecad_session.swap_doc(_s, doc)  # T-RF20: write the client-copy fixture back
+    doc_id = _s.doc_id
     chk = _call(tools, "ecad_check_impedance", net_or_ref="Z50", target=50.0,
                 doc_id=doc_id)
     assert chk["ok"] and chk["within_tolerance"] is True, chk

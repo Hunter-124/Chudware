@@ -357,6 +357,11 @@ class RoleCard:
             ]
             if not fam_names:
                 fam_names = list(_FAMILY_SEED_TOOLS.get(fam, ()))
+            else:
+                # The family's own namespace first: cross-tagged tools (e.g.
+                # ecad_antenna_design, tagged family "em") must not take the
+                # family's round-robin seat ahead of its ``<fam>_*`` tools.
+                fam_names.sort(key=lambda n: not n.startswith(f"{fam}_"))
             q: list[str] = []
             for name in fam_names:
                 if name and name not in seen and name not in q:

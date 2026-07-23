@@ -65,7 +65,7 @@ def test_event_wire_format() -> None:
 
 def test_subprocess_roundtrip() -> None:
     """Drive the real worker over stdio (the refactored (params, emit) dispatch) end to end."""
-    p = subprocess.Popen([sys.executable, "-m", "engine.worker"],
+    p = subprocess.Popen([sys.executable, "-m", "services.worker_main"],
                          stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                          text=True, bufsize=1)
 

@@ -86,6 +86,10 @@ def oracle_targets(tree: ast.AST) -> list[tuple[int, str]]:
                         or alias.name.startswith(ORACLE_ROOTS[1] + "."):
                     out.append((node.lineno, _canonical(alias.name)))
         elif isinstance(node, ast.ImportFrom):
+            # Relative imports (from .engine import …) can never reference the
+            # top-level legacy package — skip them.
+            if node.level:
+                continue
             mod = node.module or ""
             if mod in ORACLE_ROOTS or mod.startswith(ORACLE_ROOTS[0] + ".") \
                     or mod.startswith(ORACLE_ROOTS[1] + "."):

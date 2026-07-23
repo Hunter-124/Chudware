@@ -1002,7 +1002,7 @@ def _board_power_lines(engs: list, label: str) -> list:
     counted, never zero-filled (contracts/ecad/boardphys.md).
     """
     try:
-        from engine.ecad import metadata as eng_meta  # STAYS (T-RF20): no C++ counterpart  # noqa: PLC0415
+        from services.ecad import metadata as eng_meta  # STAYS (T-RF20): no C++ counterpart  # noqa: PLC0415
     except ImportError:
         return []
     totals = eng_meta.power_totals([e for _n, e in engs if e])
@@ -1097,7 +1097,7 @@ def _describe_board_text(doc_id: str) -> str:
             lines.append("\nNo footprints placed — use ecad_find_part then ecad_place_symbol.")
         if fps:
             try:
-                from engine.ecad import metadata as eng_meta  # STAYS (T-RF20): no C++ counterpart  # noqa: PLC0415
+                from services.ecad import metadata as eng_meta  # STAYS (T-RF20): no C++ counterpart  # noqa: PLC0415
                 engs = [(f.get("ref") or f.get("id") or "?",
                          eng_meta.eng_for_footprint(f)) for f in fps]
                 lines.extend(_board_power_lines(engs, "Board"))
@@ -1143,7 +1143,7 @@ def _describe_board_text(doc_id: str) -> str:
     # Per-component power + total (T-FIN8; honest nulls — contracts/ecad/boardphys.md)
     if components:
         try:
-            from engine.ecad import metadata as eng_meta  # STAYS (T-RF20): no C++ counterpart  # noqa: PLC0415
+            from services.ecad import metadata as eng_meta  # STAYS (T-RF20): no C++ counterpart  # noqa: PLC0415
             engs = [(c.get("ref") or "?",
                      eng_meta.resolve_eng(libid=c.get("libid") or "",
                                           fpid=c.get("footprint") or "",

@@ -1,12 +1,25 @@
-"""Audit: which library footprints put silk over pads, and does acid_trap fire on 90deg joints."""
+"""Audit: which library footprints put silk over pads, and does acid_trap fire on 90deg joints.
+
+Zero-Python cutover (T-RF20): the ECAD session is the C++ core via the ecad_common
+facade and DFM is the ``ecad_dfm`` RPC (engine.ecad.dfm is deleted).
+"""
 from collections import Counter
-from engine.ecad import session as ecad_session
-from engine.ecad import dfm as dfm_mod
-from engine.ecad.library import resolve_footprint
-from engine.ecad.library.starter import _make_footprints
+
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+
+from mcp_server.ecad_common import ecad_session
+from services.ecad.library.starter import _make_footprints
+from services.mcp import core_bridge as cb
+
 
 def _apply(sess, ops):
     return ecad_session.apply_ops(sess, sess.revision, ops)
+
+
+def _dfm(sess):
+    return cb.call("ecad_dfm", {"doc_id": sess.doc_id}).get("violations", [])
+
 
 print("=== silk_over_pad audit across ALL library footprints ===")
 fps = _make_footprints()
@@ -17,7 +30,7 @@ for fpid in sorted(fps):
         _apply(pcb, [{"op": "pcb_add_footprint", "fpid": fpid, "pos": [0, 0], "ref": "X1"}])
     except Exception as e:
         print(f"  (place failed {fpid}: {e})"); continue
-    v = dfm_mod.run_dfm(pcb.doc)
+    v = _dfm(pcb)
     c = Counter(x["rule"] for x in v)
     sop = c.get("silk_over_pad", 0)
     smw = c.get("silk_min_width", 0)
@@ -35,7 +48,7 @@ _apply(pcb, [
     {"op": "pcb_add_track", "net": "GND", "layer": "F.Cu", "width": 0.25, "p1": [5, 0], "p2": [5, 5]},   # 90deg
     {"op": "pcb_add_track", "net": "GND", "layer": "F.Cu", "width": 0.25, "p1": [5, 5], "p2": [8, 6]},   # ~71deg from vertical
 ])
-v = dfm_mod.run_dfm(pcb.doc)
+v = _dfm(pcb)
 for x in v:
     if x["rule"] == "acid_trap":
         print(f"  [{x['severity']}] {x['message']}")

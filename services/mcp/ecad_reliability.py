@@ -8,7 +8,7 @@ helpers module-level and engine-free so tests can drive them without OCP/libaica
 
 Tool:
   ecad_vibe_check   board -> fused board+components FEA solid (T-FIN16's
-                    engine.ecad.threed.board_to_fea_step, reused as-is) -> mount-hole
+                    services.ecad.threed.board_to_fea_step, reused as-is) -> mount-hole
                     detection (mounting-hole footprints / NPTH pads / user-passed
                     positions) -> fixed BCs at the mounts -> core modal solve
                     (sim_run_modal) -> natural frequencies flagged against the
@@ -18,7 +18,7 @@ Tool:
                     per component (HEURISTIC, cited — not a life prediction).
 
 THE MASS MODEL (documented honesty): the fused FEA solid flattens component bodies to
-thin caps (see engine.ecad.threed._FEA_MAX_BODY_H_MM) and would otherwise carry them
+thin caps (see services.ecad.threed._FEA_MAX_BODY_H_MM) and would otherwise carry them
 at the board's homogenized density. We therefore estimate the REAL masses — board =
 homogenized rho x substrate volume; each component = full package dims x a
 mold-compound density assumption (or explicit eng mass metadata where present) — and
@@ -406,7 +406,7 @@ def register_ecad_reliability_tools(mcp) -> None:
 
         Pipeline:
         1. Reuses the T-FIN16 fused board+components FEA solid
-           (engine.ecad.threed.board_to_fea_step). Component masses come from package
+           (services.ecad.threed.board_to_fea_step). Component masses come from package
            dims x a mold-compound density assumption (eng mass metadata wins where
            present); ONE effective density is scaled so the solid carries the total
            estimated mass (mass_model lists every number).
@@ -417,7 +417,7 @@ def register_ecad_reliability_tools(mcp) -> None:
            frequency inside [band_lo_hz, band_hi_hz] is FLAGGED (default 20-2000 Hz —
            the common random-vibe screening band).
         4. Random response at the worst in-band mode via Miles' equation
-           (participation-scaled, engine.sim.vibration). psd_breakpoints
+           (participation-scaled, services.sim.vibration). psd_breakpoints
            [[f_hz, g2_per_hz], ...] sets the input; DEFAULT = flat 0.04 g^2/Hz across
            the band (NAVMAT P-9492-class screening level, simplified flat — echoed in
            assumptions; pass the real qualification spectrum for a spec-true screen).
@@ -464,7 +464,7 @@ def register_ecad_reliability_tools(mcp) -> None:
 
         # ── FEA solid (T-FIN16, reused) + mass-corrected material ───────────
         try:
-            from engine.ecad.threed import board_to_fea_step, BoardGeometryError  # STAYS (T-RF20): no C++ counterpart
+            from services.ecad.threed import board_to_fea_step, BoardGeometryError  # STAYS (T-RF20): no C++ counterpart
         except ImportError as e:
             return _err(f"3D kernel unavailable (ImportError: {e})",
                         hint="OCP/build123d not installed — the FEA solid cannot be built.",
@@ -524,7 +524,7 @@ def register_ecad_reliability_tools(mcp) -> None:
             sh.study_ref("ecad", "ecad_vibe_check", doc_id=session.doc_id),
             sh.study_ref("structural_fea", "run_fea_modal"),
             geometry=[sh.geometry_ref("board", "step", path=built["step_path"],
-                                      derived_by="engine.ecad.threed.board_to_fea_step",
+                                      derived_by="services.ecad.threed.board_to_fea_step",
                                       meta={"fused_single_solid": True})],
             conditions=conditions,
             warnings=warnings or None,
@@ -598,7 +598,7 @@ def register_ecad_reliability_tools(mcp) -> None:
         deflect: dict = {"available": False}
         response: dict = {"available": False}
         try:
-            from engine_oracle.sim.vibration import miles_response  # STAYS (T-RF20): no C++ counterpart
+            from services.sim.vibration import miles_response  # STAYS (T-RF20): no C++ counterpart
             shapes = res.get("mode_shapes") or []
             n_nodes = int(res.get("n_nodes", 0))
             if shapes and n_nodes > 0:
@@ -648,7 +648,7 @@ def register_ecad_reliability_tools(mcp) -> None:
                 warnings.append("modal solve returned no mode shapes — response + "
                                 "deflection screen unavailable (modes table only)")
         except ImportError as e:
-            warnings.append(f"engine.sim.vibration unavailable ({e}) — response + "
+            warnings.append(f"services.sim.vibration unavailable ({e}) — response + "
                             "deflection screen skipped")
 
         result = sh.attach({

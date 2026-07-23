@@ -61,54 +61,47 @@ class DocQuerier(Protocol):
 # ---------------------------------------------------------------------------
 
 class BridgeQuerier:
-    """Concrete DocQuerier backed by the engine_oracle bridge.
+    """Concrete DocQuerier backed by the C++ core RPCs (via ``core_bridge``).
 
-    The bridge calls are imported lazily so this module loads without the C++
-    extension present (e.g. in CI without a built engine).
+    The bridge calls are imported lazily so this module loads without the built
+    core present (e.g. in CI without libaicad). Every query is best-effort:
+    any failure degrades to ``None`` (the advisor then skips that check).
     """
 
     def cylinder_diameter(self, doc_id: str, face_ref: Optional[str]) -> Optional[float]:
+        if not face_ref:
+            return None
         try:
-            from engine_oracle.bridge import doc_eval_measure  # type: ignore
-            result = doc_eval_measure(doc_id, "diameter", face_ref or "")
-            if result and result.get("ok"):
-                return float(result["value"])
+            from services.mcp import core_bridge as cb
+            result = cb.call("eval_measure", {"doc_id": doc_id, "refs": [face_ref]})
+            d = result.get("diameter")
+            return float(d) if d is not None else None
         except Exception:  # noqa: BLE001
-            pass
-        return None
+            return None
 
     def bbox(self, doc_id: str, body_ref: Optional[str]) -> Optional[dict[str, float]]:
         try:
-            from engine_oracle.bridge import doc_bbox  # type: ignore
-            result = doc_bbox(doc_id, body_ref or "")
-            if result and result.get("ok"):
-                return {
-                    "x_mm": float(result["x_mm"]),
-                    "y_mm": float(result["y_mm"]),
-                    "z_mm": float(result["z_mm"]),
-                }
+            from services.mcp import core_bridge as cb
+            result = cb.call("doc_bbox", {"doc_id": doc_id})
+            size = result.get("size")
+            if size and len(size) == 3:
+                return {"x_mm": float(size[0]), "y_mm": float(size[1]), "z_mm": float(size[2])}
         except Exception:  # noqa: BLE001
             pass
         return None
 
     def wall_thickness(self, doc_id: str, face_ref: Optional[str]) -> Optional[float]:
         try:
-            from engine_oracle.bridge import doc_eval_thickness  # type: ignore
-            result = doc_eval_thickness(doc_id, face_ref or "")
-            if result and result.get("ok"):
-                return float(result["value"])
+            from services.mcp import core_bridge as cb
+            result = cb.call("eval_thickness", {"doc_id": doc_id})
+            t = result.get("min_thickness_mm")
+            return float(t) if t is not None else None
         except Exception:  # noqa: BLE001
-            pass
-        return None
+            return None
 
     def material_id(self, doc_id: str, body_ref: Optional[str]) -> Optional[str]:
-        try:
-            from engine_oracle.bridge import doc_material  # type: ignore
-            result = doc_material(doc_id, body_ref or "")
-            if result and result.get("ok"):
-                return str(result["material_id"])
-        except Exception:  # noqa: BLE001
-            pass
+        # No C++ material-query RPC counterpart (the old engine bridge's doc_material
+        # was not ported) — degrade to None so the advisor skips material checks.
         return None
 
 

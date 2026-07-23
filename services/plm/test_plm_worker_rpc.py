@@ -89,6 +89,12 @@ def test_all_methods_envelope_on_missing_path():
             assert out.get("ok") is False and "reason" in out, name
             _assert_no_git_vocab(str(out.get("hint", "")))
             continue
+        if name in ("cad_graph_get", "cad_graph_assembly_tree"):
+            # cad_graph_get {project_dir?|doc_id?} — both optional per
+            # contracts/cad_graph.md: empty params are the open-docs view (ok True);
+            # cad_graph_assembly_tree degrades to an empty tree list the same way.
+            assert out.get("ok") is True, name
+            continue
         assert out.get("ok") is False, name
         assert "reason" in out, name
         _assert_no_git_vocab(str(out.get("hint", "")))

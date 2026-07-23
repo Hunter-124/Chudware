@@ -26,13 +26,14 @@ from typing import Any, Optional, Union
 # T-RF20: session/schema/drc/sync/autoroute are C++-dispatched — consumed here via the
 # core_bridge-backed facades in ecad_common. place/trace_opt have NO C++ counterpart
 # (re-homed to services/ by another T-RF leaf) — the direct imports STAY.
-from engine.ecad import place as place_mod  # STAYS (T-RF20): no C++ counterpart
-from engine.ecad import trace_opt as trace_opt_mod  # STAYS (T-RF20): no C++ counterpart
+from services.ecad import place as place_mod  # STAYS (T-RF20): no C++ counterpart
+from services.ecad import trace_opt as trace_opt_mod  # STAYS (T-RF20): no C++ counterpart
 
 from mcp_server.ecad_common import (
     OpError,
     _compile_of,
     _rpc,
+    _update_from_sch,
     ecad_session,
     schema,
 )
@@ -398,15 +399,12 @@ def board_from_schematic(
 
     # ---- 1. sync schematic -> board (footprints + pad nets) ----------------
     try:
-        sync_resp = _rpc("ecad_update_from_sch",
-                         {
-                             "board_doc_id": pcb.doc_id,
-                             "sch_doc_id": sch.doc_id,
-                             "prune": bool(opts.get("prune", False)),
-                             **({"place_origin": opts["place_origin"]}
-                                if opts.get("place_origin") is not None else {}),
-                         })
-        pcb._update(sync_resp)  # keep pcb.doc/revision current after the RPC mutation
+        sync_resp = _update_from_sch(
+            pcb, sch,
+            prune=bool(opts.get("prune", False)),
+            place_origin=(opts["place_origin"] if opts.get("place_origin") is not None
+                          else None),
+        )  # the helper swaps the board back and keeps pcb current
         sync_rep = dict(sync_resp.get("report") or {})
         report["sync"] = sync_rep
         report["unresolved"] = list(sync_rep.get("unresolved") or [])

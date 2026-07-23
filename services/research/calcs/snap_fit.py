@@ -39,7 +39,7 @@ from .registry import calc_envelope, calc_fail, register
 import json
 import pathlib
 
-_MAT_PATH = (pathlib.Path(__file__).parents[3] / "engine_oracle" / "sim" / "materials.json")
+_MAT_PATH = (pathlib.Path(__file__).parents[3] / "services" / "sim" / "materials.json")
 _MATERIALS: Optional[dict] = None
 
 

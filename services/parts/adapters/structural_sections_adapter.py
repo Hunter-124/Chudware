@@ -24,7 +24,8 @@ from typing import Iterator
 
 log = logging.getLogger(__name__)
 
-_DATA = Path(__file__).resolve().parent.parent.parent / "data"
+# Data files re-homed to services/structural/data/ with the structural modules (T-RF20).
+_DATA = Path(__file__).resolve().parents[2] / "structural" / "data"
 _AISC_PATH = _DATA / "aisc_shapes" / "aisc_shapes_curated.json"
 _LUMBER_PATH = _DATA / "lumber_table.json"
 

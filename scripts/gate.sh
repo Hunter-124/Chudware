@@ -445,7 +445,7 @@ stage_pytest() {
     # --- per-directory sweep ---
     # One invocation per top-level dir avoids cross-suite import-order pollution
     # (combined run has ~29 extra failures; T-V2 owns the cleanup).
-    local dirs=("mcp_server" "services" "engine_oracle" "tools" "training")
+    local dirs=("mcp_server" "services" "tools" "training")
     local total_collected=0
     local total_passed=0
     local any_hard_fail=0

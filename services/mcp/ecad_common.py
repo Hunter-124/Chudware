@@ -18,13 +18,13 @@ from mcp_server import core_bridge as cb
 # engine.ecad.{session,netlist,schema,ops} imports are replaced by the RPC-backed shims
 # below (ecad_session facade, netlist_mod facade, schema facade, OpError). Modules with NO
 # C++ counterpart stay as direct imports (re-homed by another T-RF leaf):
-#   - engine.ecad.library.search/resolve (no ecad_library RPC; reads starter/kicad_sym data)
-#   - engine.ecad.metadata (advisory eng-metadata layer, Python-only)
-#   - engine.ecad.autosave (lazy, crash-recovery; Python-only)
-from engine.ecad.library import search as lib_search  # STAYS: no ecad_library RPC surface
+#   - services.ecad.library.search/resolve (no ecad_library RPC; reads starter/kicad_sym data)
+#   - services.ecad.metadata (advisory eng-metadata layer, Python-only)
+#   - services.ecad.autosave (lazy, crash-recovery; Python-only)
+from services.ecad.library import search as lib_search  # STAYS: no ecad_library RPC surface
 
 try:  # T-FIN8 engineering-metadata layer — advisory, must never break the tools
-    from engine.ecad import metadata as _eng_metadata  # STAYS: no C++ counterpart
+    from services.ecad import metadata as _eng_metadata  # STAYS: no C++ counterpart
 except Exception:  # noqa: BLE001
     _eng_metadata = None  # type: ignore[assignment]
 
@@ -202,7 +202,7 @@ class _SessionFacade:
         called autosave_session; no-op unless armed). engine.ecad.autosave STAYS (no C++
         counterpart)."""
         try:
-            from engine.ecad import autosave as _eauto  # STAYS (T-RF20): no C++ counterpart
+            from services.ecad import autosave as _eauto  # STAYS (T-RF20): no C++ counterpart
             _eauto.autosave_session(session)
         except Exception:  # noqa: BLE001
             pass
@@ -225,7 +225,9 @@ class _SessionFacade:
         s = EcadSession(resp["doc_id"], resp.get("tree") or {},
                         revision=resp.get("revision", 0),
                         compile_field=resp.get("compile"))
-        return self._register(s)
+        self._register(s)
+        self._autosave(s)  # persist from creation (mirrors engine.ecad.session.new_session)
+        return s
 
     def get_session(self, doc_id: str) -> EcadSession:
         did = self._resolve(doc_id)
@@ -237,8 +239,33 @@ class _SessionFacade:
         s._update(resp)
         return self._register(s)
 
+    def open_session(self, doc: dict, path: str | None = None) -> EcadSession:
+        """engine.ecad.session.open_session: adopt an inline doc dict (autosave recovery)."""
+        resp = _mint_from_doc(doc)
+        s = EcadSession(resp["doc_id"], resp.get("tree") or {},
+                        revision=resp.get("revision", 0),
+                        compile_field=resp.get("compile"), path=path)
+        return self._register(s)
+
     def iter_sessions(self) -> list[EcadSession]:
         return list(self._by_id.values())
+
+    def close_session(self, doc_id: str) -> bool:
+        """engine.ecad.session.close_session: close the C++ doc and drop the handle."""
+        real = self._resolve(doc_id)
+        try:
+            _rpc("ecad_close", {"doc_id": real})
+        except OpError:
+            return False
+        self._by_id.pop(real, None)
+        if doc_id != real:
+            self._alias.pop(doc_id, None)
+        try:
+            from services.ecad import autosave as _eauto
+            _eauto.remove(real)  # closing removes the crash-recovery file (no resurrection)
+        except Exception:  # noqa: BLE001
+            pass
+        return True
 
     def apply_ops(self, session: EcadSession, base_revision: int | None, ops: list[dict],
                   emit=None) -> dict:
@@ -248,6 +275,7 @@ class _SessionFacade:
             "ops": _attach_lib_defs(session, ops),
         })
         session._update(resp)
+        self._autosave(session)
         return resp
 
     def rebuild(self, session: EcadSession, emit=None) -> dict:
@@ -262,32 +290,18 @@ class _SessionFacade:
 
     def swap_doc(self, session: EcadSession, new_doc: dict, *, base_revision: int | None = None,
                  warnings: list[str] | None = None, emit=None) -> dict:
-        """Wholesale doc replacement. GAP (T-RF20): swap_doc_locked exists in
-        core/ecad/session.cpp:507 but no ecad_swap_doc RPC is dispatched in libaicad.cpp —
-        until one lands we re-mint: write the doc to a temp .ecad+ container, ecad_open it
-        (which validates + compiles), alias the old doc_id to the new one, and close the old
-        session. Revision/undo history restart at 0 (the RPC gap is tracked in the handoff).
-        """
-        resp = _mint_from_doc(new_doc)
-        new_id = resp["doc_id"]
-        old_id = session.doc_id
-        if new_id != old_id:
-            self._alias[old_id] = new_id
-            # Re-point the MCP "active doc" pointers if they referenced the old id.
-            for key in ("current_sch", "current_pcb", "current"):
-                if _ECAD.get(key) == old_id:
-                    _ECAD[key] = new_id
-            try:
-                _rpc("ecad_close", {"doc_id": old_id})
-            except OpError:
-                pass
-            self._by_id.pop(old_id, None)
-        session.doc_id = new_id
+        """Wholesale doc replacement via the ecad_swap_doc RPC (T-RF21): validate ->
+        undo snapshot -> swap -> revision+1 -> compile, all inside the C++ session, so
+        doc_id and undo history survive (the pre-RPC re-mint restarted both)."""
+        resp = _rpc("ecad_swap_doc", {
+            "doc_id": session.doc_id,
+            "doc": new_doc,
+            "base_revision": base_revision if base_revision is not None else -1,
+            "warnings": list(warnings) if warnings else [],
+        })
         session._update(resp)
         self._register(session)
-        if warnings:
-            resp.setdefault("warnings", [])
-            resp["warnings"] = list(resp["warnings"]) + list(warnings)
+        self._autosave(session)
         return resp
 
 
@@ -315,7 +329,7 @@ def _attach_lib_defs(session: EcadSession, ops: list[dict]) -> list[dict]:
                     key == "libid" and ident in (session.doc.get("lib_cache") or {})):
                 if lib is None:
                     try:
-                        from engine.ecad import library as _lib  # STAYS: no ecad_library RPC
+                        from services.ecad import library as _lib  # STAYS: no ecad_library RPC
                         lib = _lib
                     except Exception:  # noqa: BLE001
                         lib = False
@@ -382,10 +396,167 @@ class _NetlistFacade:
         if nl is None:
             ecad_session.rebuild(s)
             nl = (s.last_compile or {}).get("netlist")
-        return nl or {}
+        nl = nl or {}
+        # C++ netlist.cpp parity gaps vs engine/ecad/netlist.py, enriched at the seam:
+        #  - pin-NAME aliases on comp["pins"] (netlist.py:451-461, Bug E3): a subckt-backed
+        #    part whose sim.pin_order is by name (op-amp IN+/IN-/OUT, 555) otherwise gets
+        #    "?" nodes and simulates to garbage. Only an UNAMBIGUOUS name (one pin of the
+        #    placed unit carries it) is aliased; a name never shadows a number key.
+        #  - per-symbol sim_params extras (netlist.py:478-487): ac_mag/ac_phase (AC sweep
+        #    stimulus, Bug E-1) and eng_overrides (T-FIN8 metadata).
+        by_ref = {sym.get("ref"): sym for sym in doc.get("symbols", [])}
+        cache = doc.get("lib_cache", {}) or {}
+        for comp in nl.get("components", []) or []:
+            sym = by_ref.get(comp.get("ref")) or {}
+            sdef = cache.get(sym.get("libid")) or {}
+            comp_pins = comp.get("pins")
+            if isinstance(comp_pins, dict):
+                unit = sym.get("unit", 1)
+                unit_pins = [p for p in sdef.get("pins", []) if p.get("unit", 1) in (unit, 0)]
+                name_counts: dict = {}
+                for p in unit_pins:
+                    nm = p.get("name")
+                    if nm and nm != "~" and str(nm) != str(p.get("number", "")):
+                        name_counts[nm] = name_counts.get(nm, 0) + 1
+                for p in unit_pins:
+                    nm = p.get("name")
+                    if not nm or nm == "~" or name_counts.get(nm, 0) != 1 or nm in comp_pins:
+                        continue
+                    num = str(p.get("number", ""))
+                    if num in comp_pins:
+                        comp_pins[nm] = comp_pins[num]
+            sp = sym.get("sim_params") or {}
+            if sp.get("ac_mag") is not None:
+                comp.setdefault("ac_mag", sp["ac_mag"])
+            if sp.get("ac_phase") is not None:
+                comp.setdefault("ac_phase", sp["ac_phase"])
+            if isinstance(sp.get("eng"), dict):
+                comp.setdefault("eng_overrides", sp["eng"])
+            # Third gap: the Python netlist->circuit translator fell back to the starter
+            # SYMBOLS library for a component's "sim" mapping (spice.py:766-770); the C++
+            # translator has no library server-side but DOES honor a "sim" carried on the
+            # component (pin_order, model). Attach it from the doc's lib_cache so Q/M/subckt
+            # parts get the right node order (pin_order) and model server-side.
+            sim_def = sdef.get("sim")
+            if sim_def is not None:
+                comp.setdefault("sim", sim_def)
+        return nl
 
 
 netlist_mod = _NetlistFacade()
+
+
+# Default footprint by libid (Bug E6) — verbatim from engine/ecad/sync.py::_DEFAULT_FOOTPRINTS.
+# The C++ sync (core/ecad/sync.cpp) has NO defaulting table, so the seam applies it to the
+# inline netlist it hands to ecad_update_from_sch_inline. Sources / power symbols are
+# intentionally absent (never on a board).
+_DEFAULT_FOOTPRINTS = {
+    "Device:R": "Resistor_SMD:R_0603",
+    "Device:C": "Capacitor_SMD:C_0603",
+    "Device:C_pol": "Capacitor_THT:CP_Radial_D5.0mm_P2.00mm",
+    "Device:L": "Inductor_SMD:L_0603",
+    "Device:Ferrite_Bead": "Inductor_SMD:FB_0603",
+    "Device:D": "Diode_SMD:D_SMA",
+    "Device:LED": "LED_SMD:LED_0805",
+    "Device:Q_NPN": "Package_TO_SOT_SMD:SOT-23",
+    "Device:Q_PNP": "Package_TO_SOT_SMD:SOT-23",
+    "Device:NMOS": "Package_TO_SOT_SMD:SOT-23",
+    "Device:PMOS": "Package_TO_SOT_SMD:SOT-23",
+    "Amplifier_Operational:OPAMP_dual": "Package_SO:SOIC-8",
+    "Amplifier_Operational:LM358": "Package_SO:SOIC-8",
+    "Timer:NE555": "Package_DIP:DIP-8",
+    "Regulator_Linear:AMS1117-3.3": "Package_TO_SOT_SMD:SOT-223",
+    "Regulator_Linear:7805": "Package_TO_SOT_THT:TO-220-3",
+    "MCU:Generic_QFP48": "Package_QFP:LQFP-48_7x7mm_P0.5mm",
+    "Connector:Header_2x03": "Connector_PinHeader_2.54mm:Header_2x03",
+    "Connector:Header_2x05": "Connector_PinHeader_2.54mm:Header_2x05",
+    "Connector:USB_C": "Connector_USB:USB_C",
+    "Connector:USB_B": "Connector_USB:USB_B",
+    "Sensor_Motion:MPU6050": "Package_DFN_QFN:QFN-24-1EP_4x4mm_P0.5mm",
+    "Sensor_Pressure:BMP280": "Package_LGA:LGA-8_2x2.5mm",
+    "Sensor_Magnetic:LIS3MDL": "Package_LGA:LGA-12_2x2mm",
+    "RF_GPS:NEO6M": "RF_Module:GPS_Castellated_1x6",
+    "Regulator_Switching:Buck_3V3": "Package_TO_SOT_SMD:SOT-23-6",
+    "Device:Crystal_32k768": "Crystal:Crystal_SMD_3215-2Pin",
+    "Device:Crystal_HSE": "Crystal:Crystal_HC49-4H_Vertical",
+    "Connector:SWD_2x5": "Connector_PinHeader_2.54mm:Header_2x05",
+    "Battery_Management:MCP73831": "Package_TO_SOT_SMD:SOT-23-5",
+    "Battery_Management:SwitchingCharger_SOP8": "Package_SO:SOIC-8",
+    "Device:NMOS_Power": "Package_SO:SOIC-8",
+    "Device:PMOS_Power": "Package_SO:SOIC-8",
+    "Device:PMOS_Reverse": "Package_TO_SOT_SMD:SOT-23",
+    "Device:R_Sense": "Resistor_SMD:R_2512",
+    "Power_Management:Load_Switch": "Package_TO_SOT_SMD:SOT-23-5",
+    "Power_Management:LVD_Comparator": "Package_TO_SOT_SMD:SOT-23-5",
+    "Device:NTC": "Resistor_SMD:R_0603",
+    "Device:L_Power": "Inductor_SMD:L_Power_7x7",
+}
+
+
+def _update_from_sch(board_session, sch_session, *, prune: bool = False,
+                     place_origin=None, base_revision: int | None = None) -> dict:
+    """engine.ecad.rpc._ecad_update_from_sch, composed over the inline C++ sync RPC.
+
+    The STATEFUL C++ ecad_update_from_sch builds its netlist server-side WITHOUT the Bug-E6
+    default-footprint table (core/ecad/sync.cpp gap) and without the seam netlist enrichment,
+    so a schematic whose parts carry no explicit footprint would sync to 0 footprints. This
+    mirrors the Python worker handler exactly: build the (enriched) netlist client-side, run
+    ecad_update_from_sch_inline, swap the mutated board back, attach the sync report.
+    """
+    if not _is_board(board_session.doc):
+        raise OpError("invalid_op",
+                      "ecad_update_from_sch: board_doc_id is not a pcb document",
+                      {"reason": "wrong doc kind", "doc_id": board_session.doc_id})
+    if not _is_schematic(sch_session.doc):
+        raise OpError("invalid_op",
+                      "ecad_update_from_sch: sch_doc_id is not a sch document",
+                      {"reason": "wrong doc kind", "doc_id": sch_session.doc_id})
+    netlist = dict(netlist_mod.build_netlist(sch_session.doc))
+    for comp in netlist.get("components", []) or []:
+        fpid = comp.get("footprint")
+        if not (isinstance(fpid, str) and fpid.strip()):
+            dflt = _DEFAULT_FOOTPRINTS.get(str(comp.get("libid", "")), "")
+            if dflt:
+                comp["footprint"] = dflt
+    # Carry the schematic's id so sync records board.linked_sch = the source schematic.
+    netlist["id"] = sch_session.doc.get("id")
+    params: dict = {"board": board_session.doc, "sch_netlist": netlist, "prune": bool(prune)}
+    if place_origin is not None:
+        params["place_origin"] = place_origin
+    result = _rpc("ecad_update_from_sch", params)  # inline path (a "board" object is present)
+    mutated = result.get("mutated_board")
+    report = result.get("report") or {}
+    if not isinstance(mutated, dict):
+        raise OpError("engine_error",
+                      "ecad_update_from_sch: sync returned no mutated_board", {})
+    # C++ sync.cpp::new_footprint drops the component's fields/libid/eng_overrides
+    # (engine/ecad/sync.py:230-241, T-FIN8 parity gap) — backfill them from the netlist so
+    # board-side metadata resolution (engine.ecad.metadata) works from the board alone.
+    comps_by_ref = {c.get("ref"): c for c in netlist.get("components", []) or []}
+    for fp in mutated.get("footprints", []) or []:
+        comp = comps_by_ref.get(fp.get("ref"))
+        if not comp:
+            continue
+        if not fp.get("libid"):
+            fp["libid"] = comp.get("libid", "")
+        if not isinstance(fp.get("fields"), dict) and isinstance(comp.get("fields"), dict):
+            fp["fields"] = comp["fields"]
+        if fp.get("eng_overrides") is None and isinstance(comp.get("eng_overrides"), dict):
+            fp["eng_overrides"] = comp["eng_overrides"]
+
+    warnings: list[str] = []
+    if report.get("unresolved"):
+        warnings.append("unresolved footprints (no def found): "
+                        + ", ".join(f"{ref}({fpid})" for ref, fpid in report["unresolved"]))
+    if report.get("removed") and not prune:
+        warnings.append("footprints no longer in schematic (not pruned): "
+                        + ", ".join(report["removed"]))
+
+    resp = ecad_session.swap_doc(board_session, mutated,
+                                 base_revision=base_revision, warnings=warnings or None)
+    resp["report"] = report
+    resp["doc_id"] = board_session.doc_id
+    return resp
 
 
 def _compile_of(session) -> dict:
@@ -401,7 +572,46 @@ def _netlist_to_circuit(nl: dict, sim_params: dict | None = None):
     """engine.sim.spice.netlist_to_spice_circuit -> C++ sim_netlist_to_circuit RPC.
     Returns (circuit, warnings)."""
     resp = _rpc("sim_netlist_to_circuit", {"netlist": nl, "sim_params": sim_params})
-    return resp.get("circuit") or {}, list(resp.get("warnings") or [])
+    circuit = resp.get("circuit") or {}
+    # C++ gap: the Python translator carries transistor polarity on device params
+    # (spice.py:860-866 — the seam both solvers read); the C++ port drops it, which
+    # silently simulates every schematic PMOS/PNP with INVERTED polarity. Re-attach
+    # from the component's sim model (attached by the netlist facade enrichment).
+    comps = {c.get("ref"): c for c in nl.get("components", []) or []}
+    for d in circuit.get("devices", []) or []:
+        if d.get("kind") in ("M", "Q"):
+            sim = (comps.get(d.get("name")) or {}).get("sim") or {}
+            pol = {"NMOS": "nmos", "PMOS": "pmos", "NPN": "npn", "PNP": "pnp"}.get(
+                str(sim.get("model", "")))
+            if pol:
+                d.setdefault("params", {}).setdefault("type", pol)
+    return circuit, list(resp.get("warnings") or [])
+
+
+def _sanitize_circuit(circuit: dict) -> dict:
+    """Drop explicit null ``model``/``value`` keys from circuit devices before sim_spice.
+
+    C++ spice.cpp parity gap: nlohmann .value() returns an explicit null and get<string>
+    throws ("type must be string, but is null"), where the Python solver treated null as
+    unset (device defaults). The netlist->circuit translators EMIT nulls for model-less
+    devices (e.g. an LED), so unsanitized studies crashed the RPC.
+    """
+    import copy as _copy
+    c = _copy.deepcopy(circuit)
+    for d in c.get("devices", []) or []:
+        for k in ("model", "value"):
+            if k in d and d[k] is None:
+                del d[k]
+        # Second C++ gap: E (VCVS) and G (VCCS) read their gain ONLY from "value"
+        # (core/sim/spice.cpp:403-412 dev_value), while the Python devices fall back to
+        # params.gain (devices.py VCVS/VCCS: value else _mp("gain", 1.0)) — and the subckt
+        # expansion emits the gain in params (e.g. the op-amp's Egain). F/H already have
+        # the fallback C++-side. Mirror the Python precedence here.
+        if d.get("kind") in ("E", "G") and "value" not in d:
+            g = (d.get("params") or {}).get("gain")
+            if isinstance(g, (int, float)):
+                d["value"] = g
+    return c
 
 
 def _sim_run(circuit: dict, study: dict, backend: str = "mna") -> dict:
@@ -409,24 +619,23 @@ def _sim_run(circuit: dict, study: dict, backend: str = "mna") -> dict:
 
     The ngspice subprocess backend has NO C++ counterpart (engine.sim.ngspice_backend shells
     out to the ngspice binary) — that leg STAYS a direct import, mirroring
-    circuit.simulate's resolve_backend dispatch so backend="ngspice"/"auto" degrade honestly.
+    circuit.simulate's resolve_backend dispatch so every backend choice degrades honestly.
     """
-    choice, note = "mna", ""
-    if (backend or "mna").lower() in ("ngspice", "auto"):
-        from engine.sim import ngspice_backend as _ng  # STAYS: no C++ counterpart
+    # STAYS (T-RF20): no C++ counterpart; re-homed from engine.sim to services/installer.
+    from services.installer import ngspice_backend as _ng
 
-        choice, note = _ng.resolve_backend(backend, circuit, study)
-        if choice == "ngspice":
-            try:
-                result = _ng.simulate_ngspice(circuit, study)
-                result["backend"] = "ngspice"
-                if note:
-                    result["backend_note"] = note
-                return result
-            except _ng.NgspiceError as e:
-                note = ((note + " ") if note else "") + \
-                    f"ngspice run failed ({e}) — fell back to the internal MNA solver."
-    result = _rpc("sim_spice", {"circuit": circuit, "study": study})
+    choice, note = _ng.resolve_backend(backend, circuit, study)
+    if choice == "ngspice":
+        try:
+            result = _ng.simulate_ngspice(circuit, study)
+            result["backend"] = "ngspice"
+            if note:
+                result["backend_note"] = note
+            return result
+        except _ng.NgspiceError as e:
+            note = ((note + " ") if note else "") + \
+                f"ngspice run failed ({e}) — fell back to the internal MNA solver."
+    result = _rpc("sim_spice", {"circuit": _sanitize_circuit(circuit), "study": study})
     result["backend"] = "mna"
     if note:
         result["backend_note"] = note
@@ -506,11 +715,11 @@ def enable_ecad_autosave() -> None:
     server._warm_core at startup. Best-effort.
 
     NOTE (T-RF20): with ECAD sessions in the C++ core, autosave is no longer mutation-hooked
-    (engine.ecad.session drove it before); it fires from _autosave_all_open_ecad — the pre-heavy-op
+    (the Python session drove it before); it fires from _autosave_all_open_ecad — the pre-heavy-op
     sweep — and from recovery. The OpenECAD docs remain invisible to the daemon's own part-doc
     autosave (core/hostd/autosave.cpp), so this stays armed in both engine modes."""
     try:
-        from engine.ecad import autosave as _eauto
+        from services.ecad import autosave as _eauto
         _eauto.enable(_ECAD_SESSION_ID)
     except Exception:  # noqa: BLE001
         pass
@@ -521,7 +730,7 @@ def recover_ecad_autosaved(scope: str = "recent"):
     and re-point _ECAD['current_*'] at the recovered docs so default-doc tool calls work. Returns
     the recovery list. Best-effort — never raises into startup.
 
-    T-RF20: the autosave FILES are still written by engine.ecad.autosave (no C++ counterpart —
+    T-RF20: the autosave FILES are still written by services.ecad.autosave (no C++ counterpart —
     the direct import stays), but recovery now re-mints the doc into the C++ session registry
     (temp .ecad+ container + ecad_open) instead of the deleted Python session registry.
 
@@ -532,7 +741,7 @@ def recover_ecad_autosaved(scope: str = "recent"):
     remain addressable by their explicit doc_id.
     """
     try:
-        from engine.ecad import autosave as _eauto  # STAYS: no C++ counterpart
+        from services.ecad import autosave as _eauto  # STAYS: no C++ counterpart
         _eauto.prune()
         files = sorted(_eauto.autosave_dir().glob("*.json"))
     except Exception:  # noqa: BLE001
@@ -615,7 +824,7 @@ def _autosave_all_open_ecad() -> None:
     (which the soft budget below can't always pre-empt) can never lose open work. Mirrors
     cad_tools._autosave_all_open for the C++ side. Best-effort."""
     try:
-        from engine.ecad import autosave as _eauto  # STAYS: no C++ counterpart
+        from services.ecad import autosave as _eauto  # STAYS: no C++ counterpart
         if not _eauto.is_enabled():
             return
         for s in ecad_session.iter_sessions():

@@ -40,7 +40,7 @@ from .bolted_joint import tensile_stress_area, _COARSE_PITCH, _PROOF_STRENGTH
 import json
 import pathlib
 
-_MAT_PATH = (pathlib.Path(__file__).parents[3] / "engine_oracle" / "sim" / "materials.json")
+_MAT_PATH = (pathlib.Path(__file__).parents[3] / "services" / "sim" / "materials.json")
 _MATERIALS: Optional[dict] = None
 
 

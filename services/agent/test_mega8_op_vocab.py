@@ -19,7 +19,7 @@ import pytest
 
 
 def test_doc_op_kinds_contains_core():
-    from engine_oracle.doc.op_registry import doc_op_kinds
+    from services.mcp.op_registry import doc_op_kinds
     kinds = doc_op_kinds()
     assert "add_feature" in kinds
     assert "sketch_add_entity" in kinds
@@ -28,7 +28,7 @@ def test_doc_op_kinds_contains_core():
 
 
 def test_unknown_box_points_at_add_feature():
-    from engine_oracle.doc.op_registry import (
+    from services.mcp.op_registry import (
         suggest_doc_ops, unknown_doc_op_message,
     )
     msg = unknown_doc_op_message(0, "box")
@@ -41,13 +41,13 @@ def test_unknown_box_points_at_add_feature():
 
 
 def test_suggest_prefers_sketch_family():
-    from engine_oracle.doc.op_registry import suggest_doc_ops
+    from services.mcp.op_registry import suggest_doc_ops
     sug = suggest_doc_ops("sketch_create", 5)
     assert any(s.startswith("sketch_") or s == "add_feature" for s in sug[:3])
 
 
 def test_cheatsheet_mentions_add_feature_and_box():
-    from engine_oracle.doc.op_registry import doc_ops_cheatsheet_snippet
+    from services.mcp.op_registry import doc_ops_cheatsheet_snippet
     s = doc_ops_cheatsheet_snippet()
     assert "add_feature" in s
     assert "box" in s
@@ -55,22 +55,22 @@ def test_cheatsheet_mentions_add_feature_and_box():
 
 
 def test_ecad_oracle_unknown_op_lists_closest():
-    from engine_oracle.ecad.ops import (
-        OpError, apply_ops, list_ecad_ops, suggest_ecad_ops,
-        unknown_ecad_op_message,
-    )
-    from engine_oracle.ecad import schema
-    assert "sch_add_symbol" in list_ecad_ops()
-    msg = unknown_ecad_op_message(0, "sch_add_symbl")
-    assert "unknown op 'sch_add_symbl'" in msg
-    assert "closest:" in msg
-    assert "sch_add_symbol" in msg
-    assert "see cad_guide()" in msg
-    doc = schema.new_schematic("t")
-    with pytest.raises(OpError) as ei:
-        apply_ops(doc, [{"op": "add_resistor"}])
+    """ECAD op errors come from the C++ core now (T-RF20): ecad_list_ops RPC for the
+    vocabulary, OpError (translated from the core's {code,message,detail} envelope by
+    the session facade) for unknown-op suggestions."""
+    from services.mcp import core_bridge as cb
+    from services.mcp.ecad_common import OpError, ecad_session
+    ops = cb.call("ecad_list_ops", {})["ops"]
+    assert "sch_add_symbol" in ops
+    sess = ecad_session.new_session("sch", "t")
+    try:
+        with pytest.raises(OpError) as ei:
+            ecad_session.apply_ops(sess, None, [{"op": "add_resistor"}])
+    finally:
+        ecad_session.close_session(sess.doc_id)
     assert "unknown op 'add_resistor'" in str(ei.value)
     assert "closest:" in str(ei.value)
+    assert "see cad_guide()" in str(ei.value)
     assert ei.value.detail.get("suggestions")
 
 

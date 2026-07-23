@@ -101,14 +101,16 @@ def _run_stage(name: str, fn: Callable[[Stage], None], stages: list[Stage]) -> S
 
 
 def _try_import_parts_search():
+    # parts_hub was re-homed to services/parts (T-RF19); engine_oracle is deleted.
     try:
-        from engine_oracle.parts_hub import search as hub_search  # type: ignore
+        from services.parts import search as hub_search  # type: ignore
         return hub_search
     except Exception:
         pass
     try:
-        from engine_oracle.parts_hub.hub import get_hub
-        hub = get_hub()
+        from services.parts.hub import PartsHub
+        hub = PartsHub()
+        hub.bootstrap()
         return lambda q, **kw: hub.search(q, **kw)
     except Exception:
         return None
@@ -190,28 +192,17 @@ def stage_parts_research(st: Stage, state: dict) -> None:
 def stage_research_dims(st: Stage, state: dict) -> None:
     """Resolve bearing dims via deterministic BOLTS / match_part_number if available."""
     dims = None
-    # Prefer engine standard-parts match.
-    for importer in (
-        lambda: __import__("engine_oracle.parts_hub.bolts", fromlist=["match_part_number"]),
-        lambda: __import__("engine.parts.bolts", fromlist=["match_part_number"]),
-    ):
-        try:
-            mod = importer()
-            fn = getattr(mod, "match_part_number", None) or getattr(mod, "match", None)
-            if fn is None:
-                continue
-            dims = fn(EXPECTED["mpn"])
-            break
-        except Exception:
-            continue
-
-    if dims is None:
-        # Try research path / standard bearing table.
-        try:
-            from engine_oracle.parts_hub import standard_parts as sp  # type: ignore
-            dims = sp.lookup(EXPECTED["mpn"]) if hasattr(sp, "lookup") else None
-        except Exception:
-            dims = None
+    # Prefer the standard-parts match (C++ match_part_number RPC — the Python
+    # parts_hub.bolts module is deleted; params carry bore/outer_d/width).
+    try:
+        from services.mcp import core_bridge as _cb
+        res = _cb.call("match_part_number", {"mpn": EXPECTED["mpn"], "generate": False})
+        match = (res or {}).get("match") or {}
+        if match.get("matched"):
+            dims = dict(match.get("params") or {})
+            dims["catalog_id"] = match.get("catalog_id")
+    except Exception:
+        dims = None
 
     if not dims:
         # Hardcode the known fixture ground truth as the "research" answer when

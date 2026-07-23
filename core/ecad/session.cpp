@@ -528,6 +528,14 @@ json swap_doc_locked(Session& s, const json& new_doc, long base_revision, const 
 }
 }  // namespace
 
+json ecad_swap_doc(const std::string& doc_id, const json& new_doc, long base_revision,
+                   const json& warnings) {
+    EcadLock lk;
+    Session& s = require_session(doc_id);
+    return swap_doc_locked(s, new_doc, base_revision,
+                           warnings.is_array() ? warnings : json::array());
+}
+
 json ecad_update_from_sch(const std::string& board_doc_id, const std::string& sch_doc_id, bool prune,
                           const json& place_origin, long base_revision) {
     EcadLock lk;

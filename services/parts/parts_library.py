@@ -152,20 +152,13 @@ def scan_library_folder(folder: str | None = None) -> dict:
 def resolve_priced_part(mpn: str) -> dict | None:
     """Resolve a manufacturer part number to a priced VendorPart record, or ``None``.
 
-    This is the default catalog-lookup resolver: it dispatches through the priced-provider
-    :class:`~engine.parts_providers.ProviderChain` (Nexar → Digi-Key → Mouser). Returns the
-    first provider's §1 record dict (contracts/sourcing_schema.md), or ``None`` when every
-    provider declines (no credentials / no results) — a graceful "no price feed" state, never a
-    raised traceback or a network call without configured keys. The provider chain is
-    constructed lazily so importing this scanner never pulls in the HTTP/provider surface.
+    This is the default catalog-lookup resolver. The priced-provider chain
+    (Nexar → Digi-Key → Mouser) was deleted with ``engine_oracle/parts_providers.py``
+    (T-RF18) — the C++ sourcing RPC owns pricing now — so this resolver always returns
+    ``None``: a graceful "no price feed" state, never a raised traceback or a network
+    call without configured keys.
     """
-    # parts_providers was deleted (T-RF18) — the C++ sourcing RPC owns pricing; degrade
-    # gracefully (docstring contract: "no price feed" state, never a traceback).
-    try:
-        from engine import parts_providers
-        return parts_providers.default_pricing_chain().fetch(str(mpn or ""))
-    except ImportError:
-        return None
+    return None
 
 
 EmitFn = Callable[[dict], None]

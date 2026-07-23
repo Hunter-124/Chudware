@@ -92,11 +92,16 @@ def test_mega22_a2_ac1_fingerprint_soft_zero_measure_between():
 
 
 def test_resolve_node_case_insensitive():
-    """Engine maps V(3v3)/v(3V3) onto schematic node 3V3."""
-    from engine.sim.circuit import _Sim
+    """Engine maps V(3v3)/v(3V3)/+3V3 aliases onto schematic net 3V3.
+
+    Retargeted 2026-07-22: engine.sim.circuit was deleted with the MNA stack
+    (T-RF20); the C++ spice (core/sim/spice.cpp resolve_node_tolerant) now
+    owns the behavior. Asserted at the RPC level; internals are covered by
+    core/tests/test_spice_netlist.cpp + test_spice_sweep.cpp."""
+    from services.mcp import core_bridge as cb
 
     circuit = {
-        "nodes": ["0", "3V3", "N$1"],
+        "nodes": ["0", "3V3"],
         "devices": [
             {"kind": "V", "name": "V1", "nodes": ["3V3", "0"], "value": 3.3},
             {"kind": "R", "name": "R1", "nodes": ["3V3", "0"], "value": 1000.0},
@@ -104,17 +109,16 @@ def test_resolve_node_case_insensitive():
         "models": {},
         "params": {},
     }
-    sim = _Sim(circuit, {})
-    assert sim.resolve_node("3V3") == sim.node_index["3V3"]
-    assert sim.resolve_node("3v3") == sim.node_index["3V3"]
-    assert sim.resolve_node("+3V3") == sim.node_index["3V3"]
-    assert sim.resolve_node("gnd") == -1
-    assert sim.resolve_node("GND") == -1
+    r = cb.call("sim_spice", {"circuit": circuit,
+                              "study": {"analyses": [{"type": "op"}],
+                                        "probes": ["V(3v3)", "V(3V3)", "V(+3V3)"]}})
+    op = r.get("op") or {}
+    assert op.get("V(3v3)") == 3.3 and op.get("V(3V3)") == 3.3 and op.get("V(+3V3)") == 3.3, r
 
 
 def test_probe_eval_accepts_lower_case_v3v3():
-    """OP probe V(3v3) returns finite voltage when node is 3V3."""
-    from engine.sim.circuit import simulate
+    """OP probe V(3v3) returns finite voltage when node is 3V3 (C++ spice, T-RF20)."""
+    from services.mcp import core_bridge as cb
 
     circuit = {
         "nodes": ["0", "3V3"],
@@ -126,12 +130,11 @@ def test_probe_eval_accepts_lower_case_v3v3():
         "params": {},
     }
     for probe in ("V(3V3)", "V(3v3)", "v(3v3)", "v(3V3)"):
-        res = simulate(
-            circuit,
-            {"analyses": [{"type": "op"}], "probes": [probe]},
-        )
+        res = cb.call("sim_spice", {
+            "circuit": circuit,
+            "study": {"analyses": [{"type": "op"}], "probes": [probe]},
+        })
         assert res["convergence"]["op"], (probe, res.get("log"))
-        # Key may preserve probe spelling; value must be finite ~3.3
         op = res["op"]
         vals = [v for k, v in op.items() if v is not None and math.isfinite(float(v))]
         assert vals, (probe, op)

@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 from typing import Any, Optional
 
-from engine_oracle.ecad import antenna as antenna_mod  # STAYS (T-RF20): no C++ counterpart
+from services.ecad import antenna as antenna_mod  # STAYS (T-RF20): no C++ counterpart
 from services.sim.em import antenna_bridge as bridge
 
 

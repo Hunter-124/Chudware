@@ -1,7 +1,7 @@
 """Optional ngspice subprocess backend for the circuit simulator (T-FIN14).
 
-The validated internal Python MNA solver (:mod:`engine.sim.circuit`) stays the
-deterministic DEFAULT. This module runs the SAME Circuit dict + study through a
+The validated MNA solver (C++ ``sim_spice``; formerly :mod:`engine.sim.circuit`)
+stays the deterministic DEFAULT. This module runs the SAME Circuit dict + study through a
 real ngspice binary as a subprocess and maps the results back into the exact
 result shape ``simulate()`` returns, so callers (services/mcp ecad_simulate /
 ecad_tf) can flip backends with one parameter and compare numbers 1:1.
@@ -149,7 +149,7 @@ def resolve_backend(requested: str, circuit: dict, study: dict) -> tuple[str, st
 def emit_deck(circuit: dict, study: dict) -> str:
     """SPICE deck for ngspice batch mode: elements (via write_spice) + vendor
     ``.include``/X cards + analysis cards + an ascii-rawfile ``.control`` block."""
-    from engine.sim.spice import write_spice
+    from services.sim.spice import write_spice  # T-RF20: pure deck serializer, STAYS services-side
 
     body = write_spice(circuit, None)
     lines = [ln for ln in body.splitlines() if ln.strip().lower() != ".end"]
@@ -287,6 +287,35 @@ class NgspiceError(RuntimeError):
     pass
 
 
+def _default_probes(circuit: dict) -> list[str]:
+    """Default probe set when the study specifies none: V(node) for every non-ground node, plus
+    I(Vname) for every independent voltage source.
+
+    Local home after engine.sim.circuit was deleted in the zero-Python cutover (the MNA
+    solver is C++ sim_spice now; this backend is the ngspice subprocess leg). Ground
+    aliases are excluded.
+    """
+    probes: list[str] = []
+    seen: set[str] = set()
+    grounds = {"0", "gnd", "GND"}
+    # Collect node names in a stable order: declared nodes first, then any device-only nodes.
+    nodes: list[str] = list(circuit.get("nodes", []))
+    for d in circuit.get("devices", []):
+        for nm in d.get("nodes", []):
+            if nm not in nodes:
+                nodes.append(nm)
+    for nm in nodes:
+        s = str(nm)
+        if s in grounds or s in seen:
+            continue
+        seen.add(s)
+        probes.append(f"V({s})")
+    for d in circuit.get("devices", []):
+        if d.get("kind") == "V":
+            probes.append(f"I({d.get('name')})")
+    return probes
+
+
 def _run_ngspice(deck: str, want_raw: bool) -> tuple[str, str]:
     """Run ngspice -b on ``deck``; return (rawfile_text, stdout). Raises NgspiceError."""
     exe = find_ngspice()
@@ -338,7 +367,6 @@ def simulate_ngspice(circuit: dict, study: dict) -> dict:
     result: dict = {"log": log, "convergence": {}}
     probes = list(study.get("probes", []))
     if not probes:
-        from engine.sim.circuit import _default_probes  # lazy; avoids import cycle
         probes = _default_probes(circuit)
         if probes:
             log.append(f"probes: none specified — defaulting to all {len(probes)} "

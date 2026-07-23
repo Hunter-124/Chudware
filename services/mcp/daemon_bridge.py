@@ -264,7 +264,7 @@ def daemon_socket_alive(hostd_bin: Optional[Path] = None) -> bool:
 
 # Every hostd we ever spawn, so exited children (e.g. flock-singleton race
 # losers) get reaped instead of lingering as zombies in this process — 12 such
-# zombies were observed parented to MCP servers (docs/PERF_AUDIT_2026-07-10.md §1).
+# zombies were observed parented to MCP servers (docs/review/PERF_AUDIT_2026-07-11.md §1).
 _SPAWNED: list = []
 
 

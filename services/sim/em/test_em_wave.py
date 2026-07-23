@@ -11,8 +11,9 @@ Extends test_em.py (which stays untouched) per the simsuite buildout:
   (the 5-point scheme is ~2nd order, so halving h must shrink the error);
 * adapter selection: openEMS is not installed on CI/dev boxes — requesting it
   must degrade to a clean EmSolverError / {"ok": False} envelope, never crash;
-* upstream seam: engine_oracle/worker.py imports ``engine.sim.em.worker_rpc``
-  through the ``engine`` -> ``engine_oracle`` symlink; that alias is asserted.
+* upstream seam: services/worker_main.py registers the EM RPCs from
+  ``services.sim.em.worker_rpc`` (post-cutover canonical home); that surface is
+  asserted.
 
 Nothing here is all-skip: only the two live-openEMS guards skip, and only when
 openEMS genuinely imports.
@@ -279,23 +280,16 @@ class TestWorkerRpcDegradation(unittest.TestCase):
 
 class TestUpstreamSeam(unittest.TestCase):
     def test_engine_alias_import_matches_worker_registration(self):
-        # engine_oracle/worker.py registers the EM RPCs via
-        # `from engine.sim.em.worker_rpc import WORKER_METHODS` — `engine` is a
-        # repo-root symlink to engine_oracle. If the alias breaks, em_* silently
-        # vanish from the worker (the try/except only logs). Assert it here.
-        import importlib
-        mod = importlib.import_module("engine.sim.em.worker_rpc")
-        self.assertEqual(set(mod.WORKER_METHODS),
+        # T-RF21: the engine->engine_oracle symlink is gone; services.worker_main
+        # registers the EM RPCs from services.sim.em.worker_rpc (dual-path first
+        # choice). Assert the canonical module surface and the registration entry.
+        from ...sim.em import worker_rpc as canonical
+        self.assertEqual(set(canonical.WORKER_METHODS),
                          {"em_status", "em_eigenmode", "em_driven",
                           "em_timedomain"})
-        # NOTE: the symlink means `engine.sim.em` and `engine_oracle.sim.em` are
-        # two module objects (classic dual-import); the RPC surface is stateless
-        # so only the method-name sets must agree.
-        from ...sim.em import worker_rpc as canonical
-        self.assertEqual(set(mod.WORKER_METHODS), set(canonical.WORKER_METHODS))
-        # the alias RPCs actually run
-        res = mod.WORKER_METHODS["em_eigenmode"]({"standard": "WR-90",
-                                                  "n_modes": 1}, None)
+        # the RPCs actually run
+        res = canonical.WORKER_METHODS["em_eigenmode"]({"standard": "WR-90",
+                                                       "n_modes": 1}, None)
         self.assertTrue(res["ok"])
 
 

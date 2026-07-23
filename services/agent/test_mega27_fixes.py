@@ -531,8 +531,8 @@ def test_b26_y25_s23_hold_sim_and_clearance_intent():
 
 def test_board_flow_outline_knobs_accepted():
     """Engine-side: board_flow._ensure_outline honors board_size / margin."""
-    from engine.ecad import session as ecad_session
-    from engine.ecad import schema
+    # T-RF20: board_flow drives the C++-backed facade now (services.mcp.ecad_common).
+    from mcp_server.ecad_common import ecad_session, schema
     from mcp_server import board_flow as bf
 
     pcb = ecad_session.new_session("pcb", "m27_outline")
@@ -551,6 +551,7 @@ def test_board_flow_outline_knobs_accepted():
                       "size": [0.8, 0.8], "type": "smd", "layers": ["F.Cu"]}],
         },
     ]
+    ecad_session.swap_doc(pcb, pcb.doc)  # T-RF20: pcb.doc is a client copy — write back
     report: dict = {"steps": []}
     warnings: list = []
     bf._ensure_outline(

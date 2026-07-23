@@ -1,4 +1,4 @@
-// Spawns the Python kernel worker (engine.worker) and talks to it over stdio with
+// Spawns the Python kernel worker (services.worker_main) and talks to it over stdio with
 // newline-delimited JSON-RPC. Windows pipes; one synchronous request/response per call.
 #pragma once
 #include <atomic>

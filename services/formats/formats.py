@@ -94,8 +94,14 @@ class FormatInfo:
                 "can_import": self.can_import, "can_export": self.can_export}
 
 
-# FORMAT_REGISTRY + list_formats removed 2026-07-22 (T-RF19) — C++ owns the matrix
+# FORMAT_REGISTRY removed 2026-07-22 (T-RF19) — C++ owns the matrix
 # (core/doc/formats.cpp). _detect_format/_EXT_TO_FORMAT stay for the import/export helpers.
+
+
+def list_formats() -> list[dict]:
+    """The import/export format matrix, from the C++ core's ``doc_formats`` RPC."""
+    from services.mcp import core_bridge as _cb
+    return list(_cb.call("doc_formats", {}).get("formats", []))
 
 
 def _detect_format(path: str | os.PathLike) -> str:

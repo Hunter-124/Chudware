@@ -547,10 +547,13 @@ class TestEmphasisHelpers:
 
 
 class TestGuideMentions:
-    def test_review_guide_mentions_inspect(self):
+    def test_review_guide_matches_cpp_review_stage(self):
+        # reviewer.md is the C++ review-stage prompt (slimmed in f81fcc1c: the reviewer
+        # has NO tools there — it judges the feature tree + MEASURED block and answers
+        # with the done-token). Assert the real contract, not the retired tool mentions.
         text = ct.cad_guide_text("review")
-        assert "inspect_part" in text
-        assert "look_around" in text
+        assert "MEASURED" in text
+        assert '{"done": true' in text
 
     def test_gsl_guide_mentions_inspect(self):
         text = ct.cad_guide_text("gsl")

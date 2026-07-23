@@ -100,7 +100,7 @@ class EcadKicadAdapter:
 def _load_starter() -> tuple[dict, dict]:
     """Return (SYMBOLS, FOOTPRINTS) from starter; empty dicts on failure."""
     try:
-        from engine.ecad.library.starter import SYMBOLS, FOOTPRINTS
+        from services.ecad.library.starter import SYMBOLS, FOOTPRINTS
         return dict(SYMBOLS), dict(FOOTPRINTS)
     except Exception as exc:  # noqa: BLE001
         log.debug("EcadKicadAdapter: starter unavailable: %s", exc)
@@ -110,7 +110,7 @@ def _load_starter() -> tuple[dict, dict]:
 def _lib_search(query: str) -> list[dict]:
     """Delegate to engine.ecad.library.search; return [] on failure."""
     try:
-        from engine.ecad.library import search as _search
+        from services.ecad.library import search as _search
         return _search(query) or []
     except Exception as exc:  # noqa: BLE001
         log.debug("EcadKicadAdapter: lib_search unavailable: %s", exc)
@@ -120,7 +120,7 @@ def _lib_search(query: str) -> list[dict]:
 def _load_user_sym_lib(path: str) -> Iterator[dict]:
     """Load a .kicad_sym file and yield PartRecords for each symbol."""
     try:
-        from engine.ecad.library.kicad_sym import load_kicad_sym
+        from services.ecad.library.kicad_sym import load_kicad_sym
         syms = load_kicad_sym(path)
         lib_name = os.path.splitext(os.path.basename(path))[0]
         provenance = f"User-supplied KiCad symbol library: {path}"

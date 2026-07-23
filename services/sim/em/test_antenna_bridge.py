@@ -12,7 +12,7 @@ import unittest
 
 import numpy as np
 
-from engine_oracle.ecad import antenna as ant
+from services.ecad import antenna as ant
 from ...sim.em import antenna_bridge as bridge
 
 

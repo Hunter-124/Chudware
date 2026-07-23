@@ -12,7 +12,7 @@ from pathlib import Path
 
 import numpy as np
 
-from engine.doc.tessellate import (
+from services.sim.tessellate import (
     BodyTess,
     disp_chunk,
     lines_chunk,

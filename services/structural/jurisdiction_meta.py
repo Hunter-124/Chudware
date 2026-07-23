@@ -10,7 +10,7 @@ citation references without quoting copyrighted standard text.
 
 Usage::
 
-    from engine.structural.jurisdiction_meta import get_jurisdiction, list_jurisdictions
+    from services.structural.jurisdiction_meta import get_jurisdiction, list_jurisdictions
 
     meta = get_jurisdiction("CA")
     # {"ibc_edition": "2022", "asce7_edition": "22", "nds_edition": "2018",

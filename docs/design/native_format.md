@@ -15,7 +15,7 @@ This document extends what already ships. It does **not** invent a greenfield fo
 | Writer/reader (C++) | `core/doc/stepplus.{h,cpp}`, `core/doc/session.cpp` (`doc_save` / `doc_open`) |
 | Assembly load | `core/doc/assembly.cpp` (component `.step+` + `cache.brep` fast path) |
 | Drawing embed | `core/doc/drawing_session.h` (`drawings_for_source`) |
-| PLM vault | `contracts/plm.md`, `docs/PLM_VERSION_CONTROL_PLAN.md`, `services/plm/{vault,snapshot,ai_vc}.py` |
+| PLM vault | `contracts/plm.md`, `docs/design/PLM_VERSION_CONTROL_PLAN.md`, `services/plm/{vault,snapshot,ai_vc}.py` |
 | AI silent VC | `contracts/ai_vc.md`, `services/plm/ai_vc.py` |
 | Prior format survey | `docs/reference/cad-file-formats.md` |
 
@@ -374,7 +374,7 @@ ZIP + DEFLATE is not mmap-friendly for JSON. Practical path:
 
 ### 4.1 Law: history is outside the working file
 
-Aligned with `contracts/plm.md` and `docs/PLM_VERSION_CONTROL_PLAN.md`:
+Aligned with `contracts/plm.md` and `docs/design/PLM_VERSION_CONTROL_PLAN.md`:
 
 | Layer | What | Where |
 |---|---|---|

@@ -7,7 +7,7 @@ validators without manual re-entry.
 
 ## 1. Material properties — first-party registry is sufficient (no MatWeb needed)
 
-`research_material_lookup` (`engine_oracle/research/material_lookup.py`) serves the
+`research_material_lookup` (`services/research/material_lookup.py`) serves the
 full mechanical property set for named alloys from the **first-party bundled
 registry** (`engine/materials/registry.json`, ASM/MMPDS nominal values), cited,
 `confidence:"bundled"`, offline-safe. Verified live for the rover alloys:

@@ -25,7 +25,7 @@ in this repo that check is `contracts/licenses.md`, not this file.
   - **LibreDWG** (GNU LGPL/GPL — check which; affects linking) — reads/writes DWG.
   - **libdxfrw** (permissive) — DXF + basic DWG.
 - **Reality check:** full DWG fidelity is a large effort (that's the ODA's whole
-  business). This repo's documented plan (`docs/PLATFORM_ADR.md` §5,
+  business). This repo's documented plan (`docs/design/PLATFORM_ADR.md` §5,
   `work/backlog/T-BL02.md`) is **DWG via an ODA membership later**; LibreDWG would
   be **subprocess-convert only** (its GPL/LGPL license is incompatible with
   in-process linking under this repo's GPL-clean posture — see

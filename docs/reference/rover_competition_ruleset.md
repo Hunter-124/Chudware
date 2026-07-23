@@ -6,7 +6,7 @@
   former "NASA Great Moonbuggy Race."
 - **Source document:** *NASA's Human Exploration Rover Challenge — 2025–2026 Handbook* (official NASA PDF).
 - **Source URL:** https://www.nasa.gov/wp-content/uploads/2025/08/nasas-herc-2026-handbook.pdf
-- **Found via:** repo research layer `engine_oracle.research.web_search("NASA Human Exploration Rover Challenge rules requirements handbook")`, fetched with `curl` (the `fetch_page` helper returns lossy-decoded bytes for large binary PDFs, so the raw PDF was pulled directly and text-extracted with `pdftotext -layout`).
+- **Found via:** repo research layer `services.research.web_search("NASA Human Exploration Rover Challenge rules requirements handbook")`, fetched with `curl` (the `fetch_page` helper returns lossy-decoded bytes for large binary PDFs, so the raw PDF was pulled directly and text-extracted with `pdftotext -layout`).
 - **Fetch date:** 2026-07-08
 - **One-time cache:** do NOT re-scrape on every build. Re-fetch only when a new handbook year is published.
 

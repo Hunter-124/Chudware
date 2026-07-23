@@ -3763,3 +3763,171 @@ the live web daemon keeps its old lib until the next webd-sync reinstall — exp
 by design. **Remaining:** ecad+sim flip leaf, then ecad/ + sim MNA deletions,
 vibration/fea_thermal disposition, R5a (flags, symlink, conftest alias, tree delete),
 R5b docs.
+
+## T-RF20 — ecad+sim MCP flip leaf (ecad_*/sim SPICE → core_bridge RPCs)
+
+Flipped the whole ECAD/SPICE MCP surface off direct `engine.ecad.*` / `engine.sim.*`
+imports onto `core_bridge` RPCs. **Centerpiece: `services/mcp/ecad_common.py`** — the old
+`engine.ecad.{session,netlist,schema,ops}` imports are replaced by drop-in facades over the
+C++ core: `_SessionFacade` (ecad_new/ecad_open/ecad_apply_ops/ecad_tree/ecad_rebuild/
+ecad_close RPCs; `EcadSession` handle with `.doc/.kind/.revision/.last_compile`; `_REGISTRY`
+compat; alias map for re-minted docs), `_NetlistFacade` (session compile carries
+netlist/erc/drc/ratsnest — compile_field in core/ecad/session.cpp), `_SchemaFacade` (pure
+doc-dict geometry ported verbatim), a local `OpError` (+ `_rpc` CoreError→OpError
+translation), `_sim_run`/`_netlist_to_circuit` (sim_spice / sim_netlist_to_circuit RPCs),
+and `_update_from_sch` composed over the inline `ecad_update_from_sch` RPC + swap. Family
+modules flipped: ecad_sch_tools, ecad_pcb_tools (drc/dfm/autoroute/fill_zones/fab→
+ecad_export with local gerber/drill file-writing + `_board_bbox` port), ecad_sim_tools
+(impedance → ecad_impedance RPC + `_stackup_geometry`/`_track_length_mm` ports), ecad_thermal
++ ecad_reliability (OpError/pad_world only), gsl_tools, board_flow (sync/autoroute/drc via
+facades; place.autoplace inlined as place_board+swap), ascii2d, server.py warmup (Python
+SPICE warm deleted; threed warm stays), services/ecad_design/orchestrator.py (recipes →
+ecad_recipe RPC for few-shots; netlist/sim via facades). **STAYS as direct imports (no C++
+counterpart; re-home owned by other leaves):** threed, place, trace_opt, pdn, si_rules,
+stackup, hostboard_rules, fpga, antenna, autosave, metadata, library.{search,resolve,
+starter,kicad_sym} (no ecad_library RPC surface), engine.sim.{vibration,foam_runner,
+openfoam,fea_thermal_transient,multiphysics_rpc}, and **engine.ecad.recipes for
+`closest_recipe` ONLY** (C++ recipes port covers 4/5 recipes — led_driver missing from
+core/ecad/recipes.cpp::recipe_metas, and a wrong fallback recipe fails VERIFY; few-shot
+examples use the C++ RPC). ngspice backend leg uses the re-homed
+`services.installer.ngspice_backend`. **Seam shims for C++ parity gaps found by the test
+suite (all in ecad_common, each commented):** (1) `_attach_lib_defs` — the C++ op handlers
+stub when an add-symbol/footprint op carries no `def` (no library server-side); the facade
+inlines resolved defs like the Python op fallback did; (2) swap_doc re-mint — NO
+ecad_swap_doc RPC exists (swap_doc_locked at core/ecad/session.cpp:507 is not dispatched in
+libaicad.cpp) — temp .ecad+ container + ecad_open + doc_id aliasing (revision/undo restart,
+tracked as an RPC-surface gap); (3) netlist enrichment — C++ netlist.cpp drops pin-name
+aliases (Bug E3 op-amp/555 subckt pins), ac_mag/ac_phase (Bug E-1), eng_overrides (T-FIN8),
+and per-comp `sim` (the Python translator's starter-library fallback); (4) sync backfill —
+C++ sync.cpp has no Bug-E6 default-footprint table (ported verbatim to
+`_DEFAULT_FOOTPRINTS`) and new_footprint drops libid/fields/eng_overrides; (5) circuit
+sanitize — C++ spice.cpp throws on explicit null model/value and reads E/G gain only from
+`value` (params.gain fallback missing); (6) transistor polarity re-attached to M/Q device
+params (C++ drops spice.py's type=npn/pnp/nmos/pmos seam — PMOS/PNP simulated inverted
+without it); (7) sweep probe selection prefers the study's probe order (nlohmann::json
+alphabetizes result keys). **Tests:** targeted suite
+(`services/mcp services/ecad_design -k 'ecad or gsl or board_flow or ascii2d or antenna or
+sim or spice or circuit or thermal or reliability'`): baseline 207 passed → after:
+**200 passed, 3 skipped, 1 xfailed, 3 failed**. The 3 failures are
+test_simhandoff piping tests (`from engine.piping import cfd_handoff` — the piping leaf
+deleted engine.piping mid-flight; cfd_handoff port is their remaining work — NOT this
+flip). The 3 skips are test_ecad_sim_e2e oracle legs (`engine.sim.circuit.simulate`
+unconditionally imports the ngspice_backend module another leaf deleted mid-flight —
+guarded with pytest.skip); 1 xfail is the I(D1) junction-current probe (documented
+core/sim/spice.cpp eval_probe gap, strict=False). Test fixtures retargeted: direct
+`engine.ecad.session` fixture imports → the facade, monkeypatched overrun tests →
+`_rpc`/`_sim_run`, and direct `session.doc` mutations now write back via
+`ecad_session.swap_doc` (test_ecad_tools, test_ecad_packs, test_ecad_reliability,
+test_board_flow, test_ecad_hardening, test_ecad_sim_e2e, test_antenna_tools
+(engine_oracle.sim.em→services.sim.em), services/agent/test_mega27_fixes.py).
+**scripts/check.py: all 6 gates PASS** — oracle_import_allowlist.txt ratcheted from the
+blanket `engine.ecad`/`engine.sim` entries to the named transitional set above (45
+prefixes), with engine.ecad.{session,schema,netlist,ops} kept ONLY for
+integrator-owned stragglers (verify/battery.py, agent oracle-vocab tests). **Needs-core
+(gaps for the closeout leaf):** ecad_swap_doc RPC (session.cpp:507 undispatched);
+led_driver in core/ecad/recipes.cpp; netlist.cpp pin-name aliases + sim_params extras
+(ac_mag/ac_phase/eng_overrides); sync.cpp default-footprint table + new_footprint
+libid/fields/eng_overrides; spice.cpp null-tolerance + E/G params.gain fallback +
+transistor type on schematic Q/M + eval_probe two-terminal junction currents I(Dx).
+**Deferred:** engine.ecad.autosave no longer fires per-mutation server-side (C++ sessions
+don't call it) — the facade drives it on new/apply/swap + the pre-heavy-op sweep, so
+coverage is equivalent; ecadcpp doc lifetime is daemon-shared now (get_session refetches
+via ecad_tree every call — foreign edits are seen, unlike the old in-process registry).
+
+---
+
+## T-RF20/T-RF21 — zero-Python cutover closeout (2026-07-23, integrator)
+
+**What landed.** The big ecad+sim MCP flip (agent-39) plus the final disposition
+sweep: `engine_oracle/ecad/` and `engine_oracle/sim/` deleted outright; non-ported
+modules re-homed to `services/ecad/` (antenna, autosave, fpga(+devices/golden),
+hostboard_rules, metadata, pdn, place, si_rules, stackup, threed, trace_opt,
+zonefill, session(shim), library/) and `services/sim/` (vibration,
+fea_thermal_transient, foam_*, lbm, openfoam, overlay, tessellate, em/,
+multiphysics_rpc, spice.py+subckt.py as PURE serialization helpers for the
+ngspice leg); `services/ecad_design/recipes.py` for the LLM orchestrator;
+`services/installer/ngspice_backend.py` already held the subprocess backend.
+`services/mcp/ecad_common.py` is now the single seam: `_SchemaFacade`,
+`_SessionFacade` (ecad_session), `_NetlistFacade` (netlist_mod), `OpError`, plus
+`_sim_run`/`_netlist_to_circuit` mirroring `circuit.simulate`'s backend dispatch
+(resolve_backend consulted for EVERY backend choice, so mna-with-vendor-attachments
+carries the same backend_note the oracle emitted).
+**Core additions (integrator-owned):** `ecad_swap_doc` RPC (core/ecad/session.{h,cpp}
+public wrapper over swap_doc_locked + libaicad.cpp dispatch + contracts/ecad/ecad_rpc.md
+row) — the facade's swap_doc no longer re-mints, so doc_id/undo/revision survive a
+wholesale swap; spice.cpp probe resolution made case/format-tolerant
+(resolve_node_tolerant: exact→ground-alias→bare→case-insensitive; is_ground now covers
+0/gnd/ground/vss/vssa/agnd/dgnd) fixing a REAL oracle parity gap (V(3v3)); tf rin/rout
+clamped to 1e30 when non-finite (JSON has no Infinity; oracle surfaced a huge number).
+**R5a:** `engine_oracle/` deleted (was: AGENTS.md + __init__.py + worker.py shim), root
+`engine` symlink and `services/engine` symlink removed, conftest `_PKG_ALIASES` engine
+entry dropped, gate.sh pytest dirs list updated, worker spawn targets all
+`services.worker_main` (hostd worker_bridge, worker_client default, test_worker_stream).
+`scripts/oracle_import_allowlist.txt` is EMPTY — the audit ratchet now keeps it that way.
+**Straggler retargets (agent-43 + integrator):** ~170 files — all remaining
+`from engine…`/`engine_oracle…` live imports across services/, mcp_server, tools/
+pointed at their services.* homes or the facades; test_ngspice_backend retargeted to
+`_sim_run` + services.installer.ngspice_backend + services.sim.spice (vendor-.subckt
+enrichment leg stays Python — C++ sim_netlist_to_circuit doesn't carry xdevices/includes,
+tracked gap); list_formats restored as a doc_formats RPC wrapper (services/formats).
+**Gate state at closeout:** check.py 6/6 PASS (oracle_import_audit clean, 0 allowlist
+entries); mcp_server collects 994 clean; services collects 5246 clean, full run
+5110 passed / 11 failed — ALL 11 triaged as non-regressions: em×3 (openEMS env,
+T-SIM11 parked), lbm test_sphere_basic (cd units bug predating this wave; the test
+didn't even collect at ae4d0c3f), verify_battery×3 (agent_turn chain logic — the
+mega-24 parked live regression, agent_turn untouched this wave), browser adapters×3
+(McMaster network/login-wall env), hostd_edgecases×1 (passes standalone; full-sweep
+fd/env isolation, T-V2 owns the ordering audit). Policy: FAIL-RECORDED, non-fatal.
+**Deferred / follow-ups (board-noted):** flow overlay package port (sim panel shows
+forces-only), `led_driver` missing in core/ecad/recipes.cpp, netlist.cpp gaps (pin-name
+aliases are seam-enriched; ac_mag/ac_phase/eng_overrides likewise), sync.cpp Bug-E6
+footprint table, spice.cpp transistor `type` for schematic Q/M + eval_probe junction
+currents (agent-39 xfail), part_search FTS web tier (T-RF21 web_unsupported),
+C++-side vendor-xdevices warning in sim_spice (today only the facade emits the note).
+
+### Docs prune (2026-07-23) — post-T-RF23 documentation consolidation
+Pruned and reorganized `docs/` now that the consolidation DAG (T-RF1..T-RF23) and the
+zero-Python cutover are done. **Deleted as stale:** the five `HANDOFF_*` session notes
+(AI_EXPERIENCE, GUI_GLASS_POLISH, GUI_OVERHAUL, pipeline_benchmarking, SHOPCRAFT_GUI_POLISH),
+`GUI_MIGRATION_DAG.md` (targeted the retired `ui/imgui` shell), `SPRINT_5DAY_PLAN.md` (sprint
+executed), `SIM_FW_FINALIZE_PLAN_2026-07-10.md` (FIN wave shipped), `FIN_CAPABILITY_MAP_2026-07-10.md`
+(point-in-time snapshot), `vendor_adapter_audit_2026-07-10.md`, `SESSION_VERIFY_2026-07-10_PERF.md`,
+`thread_tool_handoff.md`, `PROFILER_MULTIAGENT_PLAN.md` (profiler work landed), `PERF_AUDIT_2026-07-10.md`
+(superseded by the 07-11 re-audit), `PERF_AUDIT_2026-07-16.md` (web audit; verified-clean),
+`PERF_TAB_SWITCH.md`, `CPP_PERF.md` (two-engine snapshot; Python engine deleted, generator gone),
+`gui_parity_gaps.md` (self-marked SUPERSEDED; its two "unported" items are moot — they exist in
+`host/`, which IS the shipping GUI), `plans/2026-07-16-gui-session.md` (waves done),
+`review/_SUMMARY.md` + `review/tools-scripts-docs.md` (June review of pre-consolidation tree),
+all of `docs/sessions/` (arc log, stale session-card conventions, old shot assets) and
+`docs/perf_night/` (overnight results + WIP patch backup, landed), plus
+`docs/reference/handoff-7.14.txt` (misfiled handoff for an unrelated project).
+**Moved:** architecture specs → `docs/design/` (ADVISOR_ARCHITECTURE, AGENT_DESIGN_PIPELINE,
+COPILOT_MISSION_PIPELINE, PLATFORM_ADR, PLM_VERSION_CONTROL_PLAN, REDACTION_DESIGN,
+GLASS_DESIGN_SPEC, UI_PATTERN_LIBRARY, cef_webview); operator/reference docs → `docs/reference/`
+(HOSTD, BUILD_WINDOWS, PACKAGING_WINDOWS, serving_runbook, EM_SIMULATION, REVENG_DEGRADATION,
+FIN25_SENSOR_NODE_GOLDEN_DEMO); active plans/registers → `docs/plans/` (AI_HARNESS_ROADMAP,
+GUI_OVERHAUL_SPEC, SKETCH3D_PLAN); surveys/audits → `docs/review/` (GEOMETRY_LLM_REPRESENTATION_REVIEW,
+CUSTOM_MODEL_INTEGRATION_SURVEY, PLM_OSS_SURVEY, SOURCING_VENDOR_SURVEY, parts_supplier_research,
+VLM_OFFLINE_TRACK, RECOGNITION_RESIDUAL, TRANSLATOR_SHIP_VERDICT, PERF_AUDIT_2026-07-11 — the one
+audit with still-open items). Root keeps only SW_PARITY_SPEC, PORT_LEDGER, REFACTOR_LOG, and
+AI_TOOLING_MASTER_PLAN (frozen contracts + `services/agent/test_prohibited_auth.py` reference its
+exact path). **Fixed stale framing:** BUILD_WINDOWS + GLASS_DESIGN_SPEC + UI_PATTERN_LIBRARY +
+ADVISOR_ARCHITECTURE + AGENT_DESIGN_PIPELINE no longer describe `ui/imgui`/`engine_oracle` as
+current; EM_SIMULATION/REVENG_DEGRADATION/manual paths repointed at `services/`.
+**Follow-ups rescued:** (1) T-PERF6b out-of-line embedded_brep blob store + tcmalloc-in-host +
+quiet-box TBB re-measure remain open — see `docs/review/PERF_AUDIT_2026-07-11.md` §2/§4;
+(2) optional gateway-heartbeat hardening for alive-but-silent web daemon (from the pruned 07-16
+web audit, "not yet needed"); (3) `manual/guide-overview.md` duplicates `manual/overview.md` —
+both regenerated by `tools/manual_gen.py`, fix belongs there (skip the `overview` topic in the
+guide-* loop); (4) `docs/SW_PARITY_SPEC.md` still links `SW_PARITY_GAPS.md` and
+`design/PLATFORM_ADR.md` + `review/GEOMETRY_LLM_REPRESENTATION_REVIEW.md` referenced
+`INTAKE_MEASUREMENT_DFM_PLAN.md` — both were deleted in an earlier commit (bb29af1c/c97446d0);
+links neutralized in-place where touched. **Outside-docs references the integrator should sweep:**
+`contracts/sim_handoff.md` → SIM_FW_FINALIZE_PLAN; `contracts/{gsl_ser,parts,providers}.md` +
+`services/agent/test_prohibited_auth.py` → AI_TOOLING_MASTER_PLAN path (kept at root deliberately);
+`services/mcp/{daemon_bridge,core_bridge}.py` comments → PERF_AUDIT_2026-07-10;
+`services/mcp/test_cad_tools.py` + `tools/gsl_eval.py` → HANDOFF_AI_EXPERIENCE;
+`services/agent/role_models.py` comment → AI_HARNESS_ROADMAP (now `docs/plans/`);
+`AGENTS.md` references `docs/PLAN.md` (gone since bb29af1c) and `docs/BUILD_WINDOWS.md` (now
+`docs/reference/BUILD_WINDOWS.md`); numerous `work/tasks/*` records cite pruned docs (historical
+board entries — leave as history).

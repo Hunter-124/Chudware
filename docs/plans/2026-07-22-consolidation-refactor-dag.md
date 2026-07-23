@@ -5,7 +5,7 @@
 Exploration confirmed the desktop↔web parity architecture **already exists and is the right one**:
 the web app at chudware.com is the *same* `host/src/ui` tree compiled to WASM
 (`host/CMakeLists.txt:244-268`), served by the FastAPI gateway (`Webservice/gateway/app.py`),
-talking to the same `aicad-hostd` daemon + `libaicad` (`core/hostd/`, `docs/HOSTD.md`), with
+talking to the same `aicad-hostd` daemon + `libaicad` (`core/hostd/`, `docs/reference/HOSTD.md`), with
 `billet-webd-sync.path` auto-redeploying on every green master rebuild. **So: no new UI
 abstraction layer.** The old `ui/abstract` view-model effort was already built once and deleted
 (YAGNI won); this plan does not resurrect it. Parity work = closing the specific seams where web
@@ -34,13 +34,13 @@ Real gaps found, with evidence:
 4. **MCP god files.** 344 tools; `cad_tools.py` 7,952 lines / 68 tools, `ecad_tools.py` 4,479,
    `ascii2d.py` 3,516, `reveng_tools.py` 2,040; dual-import shims (`services.agent.X`/`agent.X`)
    in 5 modules. Registration itself is fine (registry pattern, `tool_registry.py`).
-5. **UI/UX backlog.** `docs/plans/2026-07-16-gui-session.md` 15-item feedback batch (ribbon icon
+5. **UI/UX backlog.** the 2026-07-16 GUI session plan (pruned 2026-07-23) 15-item feedback batch (ribbon icon
    artifacts, PM polish, RMB menu, zoom-to-fit, imperial defaults); pending items in
-   `docs/GUI_OVERHAUL_SPEC.md`; `app.cpp` is a 5,200-line monolith with one hardcoded dispatch
+   `docs/plans/GUI_OVERHAUL_SPEC.md`; `app.cpp` is a 5,200-line monolith with one hardcoded dispatch
    if-chain (`app.cpp:1534`); `AppState` is a 1,803-line god struct.
 6. **Perf (diagnosed, unbuilt).** WASM viewport GPU-fill-bound on weak iGPUs (23–25 FPS UHD 620):
    full-res 4× MSAA + `glBlitFramebuffer` resolve (`host/src/renderer.cpp:581`), glass/Kawase blur
-   (`renderer.cpp:2231`). Adaptive-quality ladder recommended in `PERF_AUDIT_2026-07-16.md`,
+   (`renderer.cpp:2231`). Adaptive-quality ladder recommended in the 2026-07-16 web audit (doc pruned 2026-07-23),
    never built. `doc_open` memmove floor (mmap/zero-copy noted as future).
 7. **Web parity holes (until zero-Python lands).** Python-worker-routed methods (firmware `fw_*`,
    CFD `sim_run_flow`, ECAD gaps, sourcing/BOM, ~25 oracle modules) cannot run for the WASM
@@ -148,7 +148,7 @@ flowchart TD
   Scope: top-level `AGENTS.md` (110k LOC, single-GUI reality, delete `ui/imgui`/`ui/abstract`
   references and the dead-doc links), `ARCHITECTURE.md` components section,
   `services/worker/AGENTS.md`, `ui/viewport/AGENTS.md`, `host/DEPRECATED.md` (verify staleness),
-  `docs/gui_parity_gaps.md` (stale), `README.md` pointer fixes. Retire stale board tasks
+  `docs/gui_parity_gaps.md` (stale — pruned 2026-07-23), `README.md` pointer fixes. Retire stale board tasks
   T-G5–T-G9 (mark superseded). Add a one-line note that `services/serving/` = LoRA adapter
   routing (name decoy). Supersede the old cursor plan in `docs/REFACTOR_LOG.md`.
   Write-set: the listed docs + `work/` board files (integrator-owned).
@@ -213,7 +213,7 @@ flowchart TD
 ### Wave 2 — UI/UX gap closure (parallel by area; desktop change == web change by construction)
 
 - **R2a — GUI feedback batch.** Execute the 15-item list in
-  `docs/plans/2026-07-16-gui-session.md` + pending `[~]` items in `docs/GUI_OVERHAUL_SPEC.md`
+  the pruned 2026-07-16 GUI session plan + pending `[~]` items in `docs/plans/GUI_OVERHAUL_SPEC.md`
   (ribbon icon artifacts, PM collapsed-sections/padding, washer extrude bug, RMB context-menu
   rework, zoom-to-fit timing, imperial-aware defaults). Split into 2–3 sub-nodes with disjoint
   files (ribbon/icons · PropertyManager · viewport/menus). Each verified with `AI_CAD_SHOT`

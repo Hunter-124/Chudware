@@ -31,7 +31,7 @@ short structural summary drawn from that public spec.
   linetype, style) by handle.
 - **This repo:** DWG import is **not yet implemented**; ShopCraft's documented plan
   is DWG via an ODA membership (or a subprocess-isolated LibreDWG conversion —
-  LibreDWG is GPL, so it stays out-of-process) — see `docs/PLATFORM_ADR.md` §5 and
+  LibreDWG is GPL, so it stays out-of-process) — see `docs/design/PLATFORM_ADR.md` §5 and
   `work/backlog/T-BL02.md`. Reference-only until that lands.
 
 ## 2. DXF — Drawing Exchange Format

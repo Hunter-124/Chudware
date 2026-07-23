@@ -1,0 +1,130 @@
+# Building AI-CAD on Windows
+
+Status: the **C++ core (with and without the OCCT geometry kernel)** and the **Python runtime +
+test suite** are verified on Windows 11 (MSVC 14.44 / VS 2022 Build Tools, CMake 4.3, Ninja 1.13,
+Python 3.12). The GUI on both Linux and Windows is the **`host/` tree** (binary `Billet`,
+`AI-CAD` compat symlink) — the interim `ui/imgui` shell is retired and deleted. Re-verifying the
+restored `host/` build under MSVC is an open item (see `docs/plans/GUI_OVERHAUL_SPEC.md`).
+
+## 0. One-time checkout fix — symlinks
+
+This repo uses git symlinks for short top-level names (`agent`→`services/agent`,
+`mcp_server`→`services/mcp`, `corpus`→`corpora/sketch`, …). A default Windows checkout has
+`core.symlinks=false`, so these land as **13-byte text files**, which breaks Python imports
+and data-file access under `corpus/` etc.
+
+Fix (pick one):
+
+```powershell
+# Recommended: convert them to directory junctions (no admin needed). Idempotent.
+powershell -File scripts\setup_windows_links.ps1
+```
+
+or enable real symlinks before cloning: `git config --global core.symlinks true` **and** turn on
+Windows **Developer Mode**, then re-clone.
+
+## 1. Toolchain
+
+- **Visual Studio 2022 Build Tools** with the *Desktop development with C++* workload
+  (MSVC + Windows SDK). Install elevated:
+  ```powershell
+  winget install Microsoft.VisualStudio.2022.BuildTools --override "--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended --quiet"
+  ```
+- **CMake** and **Ninja** (user scope, no admin):
+  ```powershell
+  winget install Kitware.CMake Ninja-build.Ninja
+  ```
+
+## 2. Build the C++ core
+
+MSVC's `cl`/`link` are only on PATH inside a developer environment. Use the **x64 Native Tools
+Command Prompt for VS 2022** (Start menu), or run `vcvars64.bat` first:
+
+```bat
+call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+cd /d <repo>
+cmake --preset windows-core
+cmake --build --preset windows-core
+ctest --test-dir build/windows-core --output-on-failure
+```
+
+Expected: clean build; **18/20 ctest pass**. Two known pre-existing failures (not Windows-build
+issues): `cam` writes to a hardcoded `/tmp` path, and `freecad_parity` has an MSVC-vs-GCC solver
+convergence difference.
+
+Windows portability notes baked into the build:
+- `core/cam` gets `_USE_MATH_DEFINES` (MSVC hides `M_PI` behind it; GCC/Clang don't).
+- `ui/abstract` links `nlohmann_json` explicitly (no ambient system include on Windows).
+- `test_cam` uses `temp_directory_path()` instead of a hardcoded `/tmp`.
+
+## 2b. Build the core WITH the OCCT geometry kernel
+
+```bat
+cmake --preset windows-occt
+cmake --build --preset windows-occt
+ctest --test-dir build/windows-occt --output-on-failure
+```
+
+The **first** configure downloads OCCT 7.9.3 (~250 MB) and builds Netgen once (cached under
+`third_party/`, a few minutes). Verified on Win11 + MSVC 14.44: **clean build, 48/49 ctest**
+(only `freecad_parity` fails — the same MSVC-vs-GCC solver-convergence diff as the OCCT-free build).
+
+Windows-specific fixes this required:
+- `core/CMakeLists.txt` defines `NOMINMAX` for MSVC — `<windows.h>` (pulled in by OCCT headers)
+  otherwise defines `min`/`max` macros that clobber `std::min`/`std::max`.
+- `ProvisionNetgen.cmake` picks the install target by generator (Ninja uses `install`, not the
+  Visual Studio `INSTALL`).
+
+## 3. Python runtime + tests
+
+Every dependency ships a prebuilt `cp312` wheel — **no compiler needed** for the Python side.
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python -m pip install -r requirements.txt pytest pytest-timeout
+# services-side Python suites (the C++ engine is exercised via ctest on the core build):
+.\.venv\Scripts\python -X utf8 -m pytest agent -q --timeout=90
+```
+
+The legacy `engine_oracle` Python suite is gone (zero-Python cutover, T-RF21) — engine
+correctness proof on Windows is `ctest` on the `windows-core` / `windows-occt` core builds.
+
+## Troubleshooting / gotchas
+
+- **NEVER `git stash` in this repo on Windows.** The step-0 compat symlinks get materialized as
+  absolute symlinks; a `git stash push`/`pop` cycle follows them and **deletes the real
+  target-directory contents** (hundreds of files across `services/`, `corpora/`).
+  Recovery is `git reset --hard HEAD` (history is never affected). To land a commit despite the
+  symlink "changes", `git add` only your edited file(s), then `git pull --rebase` / `git push` —
+  don't stash. Running `scripts/setup_windows_links.ps1` (junctions + skip-worktree) avoids the
+  dirty-symlink state entirely.
+- **`cl` / `cmake` "is not recognized"** — MSVC isn't on `PATH` in a normal shell. Build from the
+  **x64 Native Tools Command Prompt for VS 2022** (Start menu) or run `vcvars64.bat` first.
+- **Known ctest failure** `freecad_parity` (both `windows-core` 19/20 and `windows-occt` 48/49) is a
+  pre-existing MSVC-vs-GCC solver-convergence diff, not a build problem — don't chase it as a Windows
+  regression.
+- **Legacy `UnicodeEncodeError` on `work.py board`** was a cp1252-console bug, fixed on `master`
+  (`work.py` forces UTF-8 stdout). If you hit it on an old checkout, pull latest.
+
+## GUI app (`host/`) — Windows build
+
+The single cross-platform GUI is `host/` (target `Billet.exe`, `AI-CAD` compat name). It builds
+from its own CMakeLists with the MSVC toolchain after the core (`libaicad.dll` from the
+`windows-occt` preset). **Windows re-verification of the restored `host/` build is an open item**
+(`docs/plans/GUI_OVERHAUL_SPEC.md`) — the notes below record the `ui/imgui`-era bring-up seams,
+which largely carry over to `host/`'s CMake (same `/FI fix_math.h` shim, same engine-resolution
+fallback):
+
+- **`/FI fix_math.h` quoting (fatal C1083).** Under the **Ninja + MSVC** generator a repo path
+  containing a space leaks literal quote chars into the force-include filename. Fix: drop the
+  inner quotes (`/FI${path}`) so Ninja quotes the whole `/FI<path>` token, which `cl` unwraps.
+- **Engine resolution.** `AICAD_DEFAULT_LIBAICAD` is the runtime fallback when
+  `AI_CAD_LIBAICAD` is unset and no `libaicad.dll` sits next to the exe; it must point at the
+  Ninja preset output `build/windows-occt/bin/libaicad.dll`. `cpp_core`'s `SetDllDirectoryW` then
+  puts that directory on the process search path so the ~100 sibling OCCT/Netgen `TK*.dll`
+  **transitive** deps also load — no manual DLL staging needed. To use a different build, set
+  `AI_CAD_LIBAICAD=<absolute path to libaicad.dll>`.
+- **glad** lives at `extern/glad` (`GLAD_DIR`).
+
+`freecad_parity` (windows-occt 48/49) remains the one pre-existing MSVC-vs-GCC solver-convergence
+diff on the point-on-ellipse case — not a Windows regression, not chased.

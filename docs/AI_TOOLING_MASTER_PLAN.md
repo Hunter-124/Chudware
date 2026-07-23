@@ -6,9 +6,8 @@ architecture+training, distillation theory, eval metrics; ToS/license claims ver
 against primary sources 2026-07-02)
 **Date:** 2026-07-02
 **Owner:** Hunter + AI drivers
-**Companions:** [PLATFORM_ADR.md](PLATFORM_ADR.md) (pillars 1–6),
-[SPRINT_5DAY_PLAN.md](SPRINT_5DAY_PLAN.md), [GEOMETRY_LLM_REPRESENTATION_REVIEW.md](GEOMETRY_LLM_REPRESENTATION_REVIEW.md),
-[HANDOFF_AI_EXPERIENCE.md](HANDOFF_AI_EXPERIENCE.md)
+**Companions:** [PLATFORM_ADR.md](design/PLATFORM_ADR.md) (pillars 1–6),
+[GEOMETRY_LLM_REPRESENTATION_REVIEW.md](review/GEOMETRY_LLM_REPRESENTATION_REVIEW.md)
 
 ## 0. Why this plan exists
 
@@ -42,7 +41,7 @@ What already exists, so we build on it instead of duplicating:
 | Providers | **Fragmented ×3.** Python `services/agent/providers/` (Anthropic/OpenAI/Gemini/llama.cpp/LM Studio + offline/ITAR mode), C++ `core/agent/providers.cpp` (port of same), external MCP clients. No subscription-session auth. |
 | Tool governance | **Absent.** All ~150 MCP tools register unconditionally; no allow-listing (the DAG node contract requires it). |
 | Material data | **Fragmented ×3.** `engine/sim/materials.json` (FEA), CAM cutting DB, DFM process profiles — no unified registry, no live lookup. |
-| ML scaffold | **Gated scaffold.** `tools/gsl_dataset_gen.py` (7 families, per-face labels) + `tools/gsl_gnn/` GraphSAGE; hard go/no-go gate on `docs/RECOGNITION_RESIDUAL.md`. |
+| ML scaffold | **Gated scaffold.** `tools/gsl_dataset_gen.py` (7 families, per-face labels) + `tools/gsl_gnn/` GraphSAGE; hard go/no-go gate on `docs/review/RECOGNITION_RESIDUAL.md`. |
 
 ## 2. The seven capability pillars
 
@@ -232,7 +231,7 @@ The user-directed research track: a tiny trainable model (≤4B, runs in a coupl
 that *augments* the deterministic narration layer — plus NNUE-style micro-evaluators
 where cheap learned scoring beats hand tuning. Hard inherited gates: deterministic first;
 learned output feeds templated/verified text only; train only where a measured residual
-exists (`docs/RECOGNITION_RESIDUAL.md` pattern extends to each new domain).
+exists (`docs/review/RECOGNITION_RESIDUAL.md` pattern extends to each new domain).
 
 **Architecture principle (the boundary that decides everything):** deterministic engines
 compute the facts; the learned layer only narrates, semantically labels ("this is an
@@ -443,8 +442,8 @@ Engines (license-guardrail compliant per CONTRIBUTING.md):
 ### Pillar 16 — Data flywheel & training pipeline (`tools/flywheel/` + Workstream H)
 
 Added 2026-07-02 (custom-model integration survey — full text in
-[CUSTOM_MODEL_INTEGRATION_SURVEY.md](CUSTOM_MODEL_INTEGRATION_SURVEY.md); VLM research
-in [VLM_OFFLINE_TRACK.md](VLM_OFFLINE_TRACK.md)). Expands Pillar 13 from one translator
+[CUSTOM_MODEL_INTEGRATION_SURVEY.md](review/CUSTOM_MODEL_INTEGRATION_SURVEY.md); VLM research
+in [VLM_OFFLINE_TRACK.md](review/VLM_OFFLINE_TRACK.md)). Expands Pillar 13 from one translator
 into a product-wide program: 21 model insertion points, telemetry capture
 (`ai_artifact` envelope + accept/edit/reject actions extending `contracts/events.md`),
 consent tiers (off|meta|full; external default OFF; offline/ITAR forces off),
@@ -514,7 +513,7 @@ serialization + doc_diff · T-H3 aicad.req/1 (supersedes T-BL09) · T-H4 verifie
 T-H5 data store/Argilla · T-H6 fleet runner · T-H7 frontier logging + shadow ·
 T-H8 eval benches · T-H9 vLLM serving/canary (dep T-F9) · T-H10 offline VLM (dep T-F5) ·
 T-H11 regen-error diagnosis. Task map + rationale:
-[CUSTOM_MODEL_INTEGRATION_SURVEY.md](CUSTOM_MODEL_INTEGRATION_SURVEY.md) §7.
+[CUSTOM_MODEL_INTEGRATION_SURVEY.md](review/CUSTOM_MODEL_INTEGRATION_SURVEY.md) §7.
 
 ## 5. Execution decisions (recommended defaults — confirm before cutting tasks)
 
@@ -580,7 +579,7 @@ check-in), local-first with the sharing spectrum local → shared folder → any
 git remote → AI-CAD Cloud remote (seam only, Pillar-12 human gate). Team v1 = advisory
 locks + one-button Sync + copy-as-variant, NO merge UI. GUI: history panel/rev badges/
 compare in every editor (T-U1 kit) + a full-screen **Project Hub** master workspace.
-Source of truth: [PLM_VERSION_CONTROL_PLAN.md](PLM_VERSION_CONTROL_PLAN.md); contract
+Source of truth: [PLM_VERSION_CONTROL_PLAN.md](design/PLM_VERSION_CONTROL_PLAN.md); contract
 freezes at `contracts/plm.md` (T-R1). Supersedes backlog T-BL15/T-BL10. Execution:
 workstream R (T-R1 survey+contract → T-R2 vault core → T-R3 change intelligence ∥ T-R4
 items/releases → T-R5 editor GUI → T-R6 Project Hub; T-R7 sharing/sync parallel).

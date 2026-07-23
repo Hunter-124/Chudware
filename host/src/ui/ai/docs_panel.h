@@ -1,7 +1,7 @@
 // AI workspace — Documents panel.
 //
-// Per-session document attach / preview / edit surface for the AI tab (wired into the DAG
-// pane at dagView==3). LEFT: the active conversation's agent-created artifacts (parsed from
+// Per-session document attach / preview / edit surface for the AI tab (wired into the
+// utility panel at nav view 3). LEFT: the active conversation's agent-created artifacts (parsed from
 // the same "\x1eART\x1e" activity blobs conversations.cpp persists as {kind,path,tool}) plus
 // paths the user attached this session (native open dialog, or the manual path entry for
 // headless runs). RIGHT: an extension-keyed preview — text/source via drawCodeBox, CSV as a

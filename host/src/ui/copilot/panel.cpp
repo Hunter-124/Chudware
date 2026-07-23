@@ -297,7 +297,7 @@ void drawSessionsPanel(AppState& st, bool busy) {
 
     ImGui::Dummy(ImVec2(0, ui::metrics::U(1)));
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-    ImGui::TextWrapped("Switch sessions — running ones keep working in the background.");
+    ImGui::TextWrapped("Running sessions keep working in the background.");
     ImGui::PopStyleColor();
     ImGui::Dummy(ImVec2(0, ui::metrics::U(1)));
 
@@ -348,7 +348,7 @@ void drawSessionsPanel(AppState& st, bool busy) {
             st.showAISettingsOverlay = false;
         }
 
-        float wash = active ? 0.55f : (rowHov ? 0.42f : 0.28f);
+        float wash = active ? 0.55f : (rowHov ? 0.44f : 0.34f);
         ui::glassRowBackground(dl, rowMin, rowMax, 8.0f * sc, (i % 2) == 1, active, wash);
 
         // Scope color-code: once the model has assessed the session (first routing event),

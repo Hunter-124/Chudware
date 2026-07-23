@@ -433,22 +433,6 @@ static void emptyState(const char* icon, const char* msg, const char* sub = null
     ImGui::Dummy(ImVec2(0, 8.0f * S));
 }
 
-// Segmented view chip (Conversation | Project Plan) — accent card when active.
-static bool viewChip(const char* label, bool active) {
-    ImGui::PushStyleColor(ImGuiCol_Button,
-        active ? ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 0.30f)
-               : ImVec4(palette.button[0], palette.button[1], palette.button[2], 0.60f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-        ImVec4(palette.buttonHovered[0], palette.buttonHovered[1],
-               palette.buttonHovered[2], 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_Text,
-        active ? ImVec4(palette.text[0], palette.text[1], palette.text[2], 1.0f)
-               : ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
-    bool hit = ImGui::SmallButton(label);
-    ImGui::PopStyleColor(3);
-    return hit;
-}
-
 // ---- DAG run catalog (persisted sidecars — the store dag_status reads) ----------
 
 static std::string runsDir() {
@@ -680,7 +664,6 @@ struct SubChatState {
     bool termPending = false;
 };
 static std::unordered_map<std::string, SubChatState> s_subChats;
-static int s_popupCascade = 0;   // staggers newly-opened popup positions
 
 // Role color (v3): a stable hue per role string so a sub-agent's row, popup chrome and chat
 // accents all share one identity color. FNV-1a -> hue; fixed sat/val keeps it legible on glass.
@@ -871,157 +854,245 @@ static void requestSubagentTerminate(AppState& st, SubChatState& cs) {
     });
 }
 
-// The sub-agent conversation panel — swapped into the main conversation column (M11) with an
-// unmistakable recolor (M15), no easy end (M16), and read-only run parameters (M17).
-static void drawSubagentChat(AppState& st) {
-    const float S = ui::uiScale;
-    const float* wc = palette.statusWarn;   // the "you're in a sub-agent" accent hue (M15)
+// ==================================================================================
+// v3 popup sub-agent chats — one floating, role-themed window per open sub-agent.
+// Several can be open at once; they hover over the utility-panel area (s_popupAnchor).
+// Closing a window NEVER ends the sub-agent (M16); terminate stays confirm-gated.
+// ==================================================================================
 
-    fetchSubagentTranscript(st);
+static ImVec2     s_popupAnchor{120.0f, 120.0f};  // set each frame by drawAiWorkspace
+static std::string s_focusNext;                   // window to raise next frame
 
-    // --- header banner (M15): solid tinted strip naming the mode ------------------
-    {
-        ImVec2 p0 = ImGui::GetCursorScreenPos();
-        ImVec2 p1(p0.x + ImGui::GetContentRegionAvail().x,
-                  p0.y + ImGui::GetFrameHeight() * 1.9f);
-        ImGui::GetWindowDrawList()->AddRectFilled(p0, p1,
-            ImGui::ColorConvertFloat4ToU32(ImVec4(wc[0], wc[1], wc[2], 0.22f)), 5.0f * S);
-        ImGui::GetWindowDrawList()->AddRect(p0, p1,
-            ImGui::ColorConvertFloat4ToU32(ImVec4(wc[0], wc[1], wc[2], 0.85f)), 5.0f * S,
-            0, 1.5f * S);
-        ImGui::SetCursorScreenPos(ImVec2(p0.x + 8.0f * S, p0.y + 4.0f * S));
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(wc[0], wc[1], wc[2], 1.0f));
-        ImGui::Text("SUB-AGENT  ·  %s",
-                    s_sub.cur.role.empty() ? s_sub.cur.id.c_str() : s_sub.cur.role.c_str());
-        ImGui::PopStyleColor();
-        const float* sc = statusColor(s_sub.cur.status);
-        ImGui::SetCursorScreenPos(ImVec2(p0.x + 8.0f * S,
-                                         p0.y + 4.0f * S + ImGui::GetTextLineHeight()));
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(sc[0], sc[1], sc[2], 1.0f));
-        ImGui::TextUnformatted(s_sub.cur.status.empty() ? "status unknown"
-                                                        : s_sub.cur.status.c_str());
-        ImGui::PopStyleColor();
-        // M16: the ONLY exit is the explicit "Back to main chat" affordance — leaving the view
-        // never ends the sub-agent.
-        const char* backLbl = "Back to main chat";
-        float bw = ImGui::CalcTextSize(backLbl).x + 16.0f * S;
-        ImGui::SetCursorScreenPos(ImVec2(p1.x - bw - 6.0f * S,
-                                         p0.y + (p1.y - p0.y - ImGui::GetFrameHeight()) * 0.5f));
-        if (ImGui::SmallButton(backLbl)) { s_sub.active = false; }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Return to the main conversation. The sub-agent keeps running.");
-        ImGui::SetCursorScreenPos(ImVec2(p0.x, p1.y + 4.0f * S));
+// v3: open (or raise) a sub-agent's POPUP chat window. Never touches the main chat.
+static void openSubagentView(AppState& st, const std::string& subagentId,
+                             const std::string& roleHint) {
+    if (subagentId.empty()) return;
+    auto [it, inserted] = s_subChats.try_emplace(subagentId);
+    SubChatState& cs = it->second;
+    if (inserted) {
+        cs.cur.id   = subagentId;
+        cs.cur.role = roleHint;
+    } else if (cs.cur.role.empty() && !roleHint.empty()) {
+        cs.cur.role = roleHint;
     }
+    // Prefer the registry snapshot for instant header data.
+    for (const auto& s : s_sub.sessions)
+        if (s.id == subagentId) { cs.cur = s; break; }
+    fetchSubagentTranscript(st, cs, /*force=*/true);
+    s_focusNext = subagentId;   // raise even if the window was already open
+}
 
-    // --- read-only run parameters (M17) --------------------------------------------
-    ImGui::PushStyleColor(ImGuiCol_Text,
-        ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
-    ImGui::Text("Model: %s", s_sub.cur.model.empty()
-                                 ? "inherited from parent mission (read-only)"
-                                 : (s_sub.cur.model + "  (read-only)").c_str());
-    ImGui::Text("Effort / budget: %s%s",
-                s_sub.cur.budgetTokens > 0
-                    ? (std::to_string(s_sub.cur.budgetTokens) + " tokens").c_str()
-                    : "inherited",
-                "  (read-only)");
-    if (!s_sub.cur.brief.empty()) {
-        ImGui::TextUnformatted("Starting prompt (read-only):");
+// One popup's full content: role-tinted chrome, read-only run parameters (M17), live
+// transcript, steering composer (queued injections), confirm-gated terminate (M16).
+// Returns false when the user closed the window (erase after the draw loop).
+static bool drawSubagentChatWindow(AppState& st, SubChatState& cs, int cascadeIdx) {
+    const float S = ui::uiScale;
+    const std::string roleKey = cs.cur.role.empty() ? cs.cur.id : cs.cur.role;
+    float rc[3];
+    roleColorRgb(roleKey, rc);
+    const float* sc = statusColor(cs.cur.status);
+
+    fetchSubagentTranscript(st, cs);
+
+    // Role-themed chrome: the window bg + title bar carry the role identity color (M15
+    // evolved — unmistakable WHICH sub-agent a chat belongs to, several open at once).
+    auto mix = [&](const float base[4], float k, float a) {
+        return ImVec4(base[0] * (1.0f - k) + rc[0] * k,
+                      base[1] * (1.0f - k) + rc[1] * k,
+                      base[2] * (1.0f - k) + rc[2] * k, a);
+    };
+    ImGui::PushStyleColor(ImGuiCol_WindowBg,       mix(palette.popupBg, 0.16f, 0.98f));
+    ImGui::PushStyleColor(ImGuiCol_TitleBg,        mix(palette.headerBg, 0.30f, 0.92f));
+    ImGui::PushStyleColor(ImGuiCol_TitleBgActive,  mix(palette.headerBg, 0.45f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Border,         ImVec4(rc[0], rc[1], rc[2], 0.55f));
+
+    std::string shortId = cs.cur.id.size() > 10 ? cs.cur.id.substr(0, 10) : cs.cur.id;
+    std::string title = roleKey + "  ·  " + shortId + "###subchat_" + cs.cur.id;
+    const float step  = 28.0f * S;
+    ImGui::SetNextWindowPos(
+        ImVec2(s_popupAnchor.x + step * (float)(cascadeIdx % 6),
+               s_popupAnchor.y + step * (float)(cascadeIdx % 6)),
+        ImGuiCond_Appearing);
+    ImGui::SetNextWindowSize(ImVec2(470.0f * S, 540.0f * S), ImGuiCond_FirstUseEver);
+
+    bool open = true;
+    if (ImGui::Begin(title.c_str(), &open, ImGuiWindowFlags_NoCollapse)) {
+        if (s_focusNext == cs.cur.id) { ImGui::SetWindowFocus(); s_focusNext.clear(); }
+
+        // --- header strip: status chip + status + age ------------------------------
+        {
+            ImVec2 p0 = ImGui::GetCursorScreenPos();
+            ImVec2 p1(p0.x + ImGui::GetContentRegionAvail().x,
+                      p0.y + ImGui::GetFrameHeight() + 6.0f * S);
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            dl->AddRectFilled(p0, p1, ImGui::ColorConvertFloat4ToU32(
+                ImVec4(rc[0], rc[1], rc[2], 0.14f)), 6.0f * S);
+            dl->AddRect(p0, p1, ImGui::ColorConvertFloat4ToU32(
+                ImVec4(rc[0], rc[1], rc[2], 0.55f)), 6.0f * S, 0, 1.0f * S);
+            ImGui::SetCursorScreenPos(ImVec2(p0.x + 8.0f * S, p0.y + 4.0f * S));
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(rc[0], rc[1], rc[2], 1.0f));
+            ImGui::TextUnformatted("SUB-AGENT");
+            ImGui::PopStyleColor();
+            ImGui::SameLine(0, 10.0f * S);
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(sc[0], sc[1], sc[2], 1.0f));
+            ImGui::TextUnformatted(cs.cur.status.empty() ? "status unknown"
+                                                         : cs.cur.status.c_str());
+            ImGui::PopStyleColor();
+            const std::string age = fmtAge(cs.cur.updatedTs);
+            if (!age.empty()) {
+                ImGui::SameLine(0, 10.0f * S);
+                ImGui::PushStyleColor(ImGuiCol_Text,
+                    ImVec4(palette.textDisabled[0], palette.textDisabled[1],
+                           palette.textDisabled[2], 1.0f));
+                ImGui::TextUnformatted(age.c_str());
+                ImGui::PopStyleColor();
+            }
+            ImGui::SetCursorScreenPos(ImVec2(p0.x, p1.y + 6.0f * S));
+        }
+
+        // --- read-only run parameters (M17) ----------------------------------------
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
+        ImGui::Text("Model: %s", cs.cur.model.empty()
+                                     ? "inherited from parent mission (read-only)"
+                                     : (cs.cur.model + "  (read-only)").c_str());
+        ImGui::Text("Effort / budget: %s%s",
+                    cs.cur.budgetTokens > 0
+                        ? (std::to_string(cs.cur.budgetTokens) + " tokens").c_str()
+                        : "inherited",
+                    "  (read-only)");
+        if (!cs.cur.brief.empty()) {
+            ImGui::TextUnformatted("Starting prompt (read-only):");
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(palette.textDisabled[0], palette.textDisabled[1],
+                       palette.textDisabled[2], 1.0f));
+            ImGui::TextWrapped("%s", cs.cur.brief.c_str());
+            ImGui::PopStyleColor();
+        }
+        ImGui::PopStyleColor();
+        ImGui::Spacing();
+
+        // --- transcript -------------------------------------------------------------
+        const float composerH = ImGui::GetFrameHeightWithSpacing() * 4.6f;
+        float logH = ImGui::GetContentRegionAvail().y - composerH;
+        if (logH < 90.0f * S) logH = 90.0f * S;
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(rc[0], rc[1], rc[2], 0.06f));
+        ImGui::BeginChild("##subagent_log", ImVec2(0, logH), ImGuiChildFlags_None);
+        if (!cs.viewErr.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(palette.statusErr[0], palette.statusErr[1],
+                       palette.statusErr[2], 1.0f));
+            ImGui::TextWrapped("%s", cs.viewErr.c_str());
+            ImGui::PopStyleColor();
+        }
+        if (cs.msgs.empty() && cs.viewErr.empty()) {
+            emptyState("[sa]", cs.trPending ? "Loading transcript\xE2\x80\xA6" : "No transcript yet",
+                       "This sub-agent has not produced any messages yet. Its replies and your "
+                       "steering messages appear here.");
+        }
+        for (const auto& m : cs.msgs) {
+            const float* c = palette.text;
+            const char*  tag = "agent";
+            if (m.who == "user")        { c = palette.accent;       tag = "you"; }
+            else if (m.who == "system") { c = palette.textDisabled; tag = "sys"; }
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(rc[0], rc[1], rc[2], m.who == "system" ? 0.6f : 1.0f));
+            ImGui::TextUnformatted(tag);
+            ImGui::PopStyleColor();
+            ImGui::SameLine(0, 6.0f * S);
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(c[0], c[1], c[2], m.who == "system" ? 0.9f : 1.0f));
+            if (m.queued) {
+                ImGui::TextDisabled("(queued)");
+                ImGui::SameLine(0, 6.0f * S);
+            }
+            ImGui::TextWrapped("%s", m.text.c_str());
+            ImGui::PopStyleColor();
+            ImGui::Spacing();
+        }
+        if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 12) ImGui::SetScrollHereY(1.0f);
+        ImGui::EndChild();
+        ImGui::PopStyleColor();
+
+        // --- steering composer (queued injections) ----------------------------------
+        ImGui::Spacing();
+        ImGui::InputTextMultiline("##subagent_steer", cs.steerBuf, sizeof(cs.steerBuf),
+                                  ImVec2(-1.0f, ImGui::GetFrameHeight() * 1.9f));
+        const bool canSteer = st.workerStarted && !cs.steerPending &&
+                              cs.steerBuf[0] != '\0';
+        ImGui::BeginDisabled(!canSteer);
+        if (ImGui::SmallButton(cs.steerPending ? "Queuing\xE2\x80\xA6" : "Steer"))
+            sendSubagentSteer(st, cs);
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Inject a steering message. It is queued and read by the sub-agent "
+                              "at its next turn boundary (before its next model call).");
+        ImGui::SameLine();
         ImGui::PushStyleColor(ImGuiCol_Text,
             ImVec4(palette.textDisabled[0], palette.textDisabled[1],
                    palette.textDisabled[2], 1.0f));
-        ImGui::TextWrapped("%s", s_sub.cur.brief.c_str());
+        if (cs.cur.pendingSteers > 0)
+            ImGui::Text("%d steer%s pending", cs.cur.pendingSteers,
+                        cs.cur.pendingSteers == 1 ? "" : "s");
+        else
+            ImGui::TextUnformatted("applied at the sub-agent's next turn boundary");
         ImGui::PopStyleColor();
-    }
-    ImGui::PopStyleColor();
-    ImGui::Spacing();
-
-    // --- transcript ------------------------------------------------------------------
-    const float composerH = ImGui::GetFrameHeightWithSpacing() * 4.6f;
-    float logH = ImGui::GetContentRegionAvail().y - composerH;
-    if (logH < 90.0f * S) logH = 90.0f * S;
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(wc[0], wc[1], wc[2], 0.05f));
-    ImGui::BeginChild("##subagent_log", ImVec2(0, logH), ImGuiChildFlags_None);
-    if (!s_sub.viewErr.empty()) {
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(palette.statusErr[0], palette.statusErr[1], palette.statusErr[2], 1.0f));
-        ImGui::TextWrapped("%s", s_sub.viewErr.c_str());
-        ImGui::PopStyleColor();
-    }
-    if (s_sub.msgs.empty() && s_sub.viewErr.empty()) {
-        emptyState("[sa]", s_sub.trPending ? "Loading transcript…" : "No transcript yet",
-                   "This sub-agent has not produced any messages yet. Its replies and your "
-                   "steering messages appear here.");
-    }
-    for (const auto& m : s_sub.msgs) {
-        const float* c = palette.text;
-        const char*  tag = "";
-        if (m.who == "user")        { c = palette.accent;       tag = "you"; }
-        else if (m.who == "system") { c = palette.textDisabled; tag = "sys"; }
-        else                        { c = palette.text;         tag = "agent"; }
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(c[0], c[1], c[2], m.who == "system" ? 0.9f : 1.0f));
-        ImGui::TextWrapped("[%s]%s %s", tag, m.queued ? " (queued)" : "", m.text.c_str());
-        ImGui::PopStyleColor();
-        ImGui::Spacing();
-    }
-    if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 12) ImGui::SetScrollHereY(1.0f);
-    ImGui::EndChild();
-    ImGui::PopStyleColor();
-
-    // --- steering composer (M11: injections via subagent_steer) ----------------------
-    ImGui::Spacing();
-    ImGui::InputTextMultiline("##subagent_steer", s_sub.steerBuf, sizeof(s_sub.steerBuf),
-                              ImVec2(-1.0f, ImGui::GetFrameHeight() * 1.9f));
-    const bool canSteer = st.workerStarted && !s_sub.steerPending &&
-                          s_sub.steerBuf[0] != '\0';
-    ImGui::BeginDisabled(!canSteer);
-    if (ImGui::SmallButton(s_sub.steerPending ? "Queuing…" : "Steer")) sendSubagentSteer(st);
-    ImGui::EndDisabled();
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Inject a steering message. It is queued and read by the sub-agent "
-                          "at its next turn boundary (before its next model call).");
-    ImGui::SameLine();
-    ImGui::PushStyleColor(ImGuiCol_Text,
-        ImVec4(palette.textDisabled[0], palette.textDisabled[1],
-               palette.textDisabled[2], 1.0f));
-    if (s_sub.cur.pendingSteers > 0)
-        ImGui::Text("%d steer%s pending", s_sub.cur.pendingSteers,
-                    s_sub.cur.pendingSteers == 1 ? "" : "s");
-    else
-        ImGui::TextUnformatted("applied at the sub-agent's next turn boundary");
-    ImGui::PopStyleColor();
-    // M16: no close/end button anywhere in this view; terminate is deliberately small, off to the
-    // side, and gated behind an explicit confirm dialog.
-    ImGui::SameLine();
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
-                         std::max(0.0f, ImGui::GetContentRegionAvail().x - 88.0f * S));
-    ImGui::PushStyleColor(ImGuiCol_Text,
-        ImVec4(palette.textDisabled[0], palette.textDisabled[1],
-               palette.textDisabled[2], 1.0f));
-    if (ImGui::SmallButton("Terminate…")) ImGui::OpenPopup("##subagent_term_confirm");
-    ImGui::PopStyleColor();
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Stop this sub-agent (requires confirmation). It halts cleanly at "
-                          "its next turn boundary — never mid-action.");
-    if (ImGui::BeginPopupModal("##subagent_term_confirm", nullptr,
-                               ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::TextUnformatted("Terminate this sub-agent?");
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
-        ImGui::TextWrapped("The sub-agent stops cleanly at its next turn boundary. Work it has "
-                           "already handed off is kept.");
-        ImGui::PopStyleColor();
-        ImGui::Spacing();
-        if (ImGui::Button("Terminate")) { requestSubagentTerminate(st); ImGui::CloseCurrentPopup(); }
+        // M16: closing the window never ends the sub-agent; terminate is deliberately small,
+        // off to the side, and gated behind an explicit confirm dialog.
         ImGui::SameLine();
-        if (ImGui::Button("Keep running")) ImGui::CloseCurrentPopup();
-        ImGui::EndPopup();
-    }
-    if (!s_sub.steerNote.empty()) {
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
+                             std::max(0.0f, ImGui::GetContentRegionAvail().x - 88.0f * S));
         ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
-        ImGui::TextWrapped("%s", s_sub.steerNote.c_str());
+            ImVec4(palette.textDisabled[0], palette.textDisabled[1],
+                   palette.textDisabled[2], 1.0f));
+        if (ImGui::SmallButton("Terminate\xE2\x80\xA6")) ImGui::OpenPopup("##subagent_term_confirm");
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Stop this sub-agent (requires confirmation). It halts cleanly at "
+                              "its next turn boundary — never mid-action.");
+        if (ImGui::BeginPopupModal("##subagent_term_confirm", nullptr,
+                                   ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::TextUnformatted("Terminate this sub-agent?");
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
+            ImGui::TextWrapped("The sub-agent stops cleanly at its next turn boundary. Work it has "
+                               "already handed off is kept.");
+            ImGui::PopStyleColor();
+            ImGui::Spacing();
+            if (ImGui::Button("Terminate")) { requestSubagentTerminate(st, cs); ImGui::CloseCurrentPopup(); }
+            ImGui::SameLine();
+            if (ImGui::Button("Keep running")) ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+        }
+        if (!cs.steerNote.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
+            ImGui::TextWrapped("%s", cs.steerNote.c_str());
+            ImGui::PopStyleColor();
+        }
+        // Honest affordance note: the X closes the VIEW only.
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(palette.textDisabled[0], palette.textDisabled[1],
+                   palette.textDisabled[2], 0.9f));
+        ImGui::TextUnformatted("Closing this window never stops the sub-agent.");
         ImGui::PopStyleColor();
     }
+    ImGui::End();
+    ImGui::PopStyleColor(4);
+    return open;
+}
+
+// Draw every open popup; erase the ones closed this frame (after the loop — never mutate
+// the map mid-iteration).
+static void drawSubagentPopups(AppState& st) {
+    if (s_subChats.empty()) return;
+    std::vector<std::string> closeIds;
+    int idx = 0;
+    for (auto& kv : s_subChats) {
+        if (!drawSubagentChatWindow(st, kv.second, idx++))
+            closeIds.push_back(kv.first);
+    }
+    for (const auto& id : closeIds) s_subChats.erase(id);
 }
 
 // ---- Agent Workflow DAG (Phase 2, M9/M10) ---------------------------------------
@@ -1279,123 +1350,173 @@ static void drawAgentDagCanvas(AppState& st, int verbosity) {
     ImGui::EndChild();
 }
 
-// ---- orchestration tree ---------------------------------------------------------
-// The sub-agent registry (s_sub.sessions, populated by pollSubagentList) rendered as compact
-// glass agent cards — role / status / model / id — alongside the live execution DAG. Full
-// visibility: EVERY registered agent shows, always. Click opens that sub-agent's chat in the
-// conversation column (same M11 behavior as the DAG's spawn-node tap).
-static void drawOrchestrationTree(AppState& st, float treeW) {
+// ---- Agent Hub rows -------------------------------------------------------------
+// The sub-agent registry (s_sub.sessions, populated by pollSubagentList) rendered as
+// OMP-style rows: role-color wash + left bar, status glyph, role, right-aligned
+// model · age meta, and a dim brief line. Full visibility: EVERY registered agent shows,
+// live ones sorted first. Click pops that sub-agent's role-themed chat window (v3).
+static void drawAgentHubRows(AppState& st, const AdaptiveSurface& surf, float listH) {
     const float S = ui::uiScale;
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6 * S, 6 * S));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8 * S, 6 * S));
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
-    ImGui::BeginChild("##ag_orch_tree", ImVec2(treeW, 0), ImGuiChildFlags_None);
+    ImGui::BeginChild("##ag_hub_rows", ImVec2(0, listH), ImGuiChildFlags_None);
     ImGui::PopStyleColor();
     ImGui::PopStyleVar();
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    const ImVec2 w0 = ImGui::GetWindowPos();
-    const ImRect wRect(w0, ImVec2(w0.x + ImGui::GetWindowSize().x,
-                                  w0.y + ImGui::GetWindowSize().y));
-    const AdaptiveSurface& surf =
-        adaptivePanel(panelId("ai_ws_orch_glass"), wRect, GlassGroup::Global);
-    glassPanel(dl, wRect, GlassLevel::UltraThin, 8.0f * S, surf);
-
-    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
-    ImGui::Text("Agents  (%d)", (int)s_sub.sessions.size());
-    ImGui::PopStyleColor();
-    ImGui::Spacing();
-
-    if (s_sub.sessions.empty()) {
-        ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
-        ImGui::TextWrapped("%s", st.workerStarted
-            ? "No sub-agents spawned. Delegated workers appear here live."
-            : "Start the worker service to see sub-agents.");
-        ImGui::PopStyleColor();
-    }
-
     const float lineH = ImGui::GetTextLineHeightWithSpacing();
-    for (const auto& s : s_sub.sessions) {
+    const float rowH  = lineH * 2.0f + 12.0f * S;
+    const float gap   = 6.0f * S;
+
+    // Live first, then most-recently-updated (registry order is stable; updated_ts desc).
+    std::vector<int> order(s_sub.sessions.size());
+    for (int i = 0; i < (int)order.size(); ++i) order[i] = i;
+    auto isLive = [](const SubagentSession& s) {
+        return s.status == "running" || s.status == "pending" ||
+               s.status == "in_progress" || s.status == "waiting";
+    };
+    std::sort(order.begin(), order.end(), [&](int a, int b) {
+        const SubagentSession& A = s_sub.sessions[a];
+        const SubagentSession& B = s_sub.sessions[b];
+        const bool la = isLive(A), lb = isLive(B);
+        if (la != lb) return la > lb;
+        return A.updatedTs > B.updatedTs;   // ISO-8601 strings compare chronologically
+    });
+
+    const double tsec = ImGui::GetTime();
+    for (int oi : order) {
+        const SubagentSession& s = s_sub.sessions[oi];
         ImGui::PushID(s.id.c_str());
-        const ImVec2 c0 = ImGui::GetCursorScreenPos();
-        const float  cw = ImGui::GetContentRegionAvail().x;
-        const float  ch = lineH * 3.0f + 10.0f * S;
-        const ImVec2 c1(c0.x + cw, c0.y + ch);
-        const bool open = s_sub.active && s_sub.cur.id == s.id;
-        const bool hov  = ImGui::IsMouseHoveringRect(c0, c1);
-        glassPanel(dl, ImRect(c0, c1), GlassLevel::Thin, 6.0f * S, surf,
-                   open ? 1.0f : (hov ? 0.85f : 0.7f));
-        const float* sc = statusColor(s.status);
-        dl->AddRect(c0, c1,
-            ImGui::ColorConvertFloat4ToU32(
-                ImVec4(sc[0], sc[1], sc[2], open ? 0.9f : 0.45f)),
-            6.0f * S, 0, 1.1f * S);
-        if (ImGui::InvisibleButton("##agentcard", ImVec2(cw, ch)))
+
+        const ImVec2 r0 = ImGui::GetCursorScreenPos();
+        const float  rw = ImGui::GetContentRegionAvail().x;
+        const ImVec2 r1(r0.x + rw, r0.y + rowH);
+        const bool open = s_subChats.count(s.id) > 0;
+        const bool hov  = ImGui::IsMouseHoveringRect(r0, r1);
+
+        const std::string roleKey = s.role.empty() ? s.id : s.role;
+        float rc[3];
+        roleColorRgb(roleKey, rc);
+
+        // Role-colored wash + left identity bar; an open chat gets the glow border.
+        coloredRowWash(dl, r0, r1, 8.0f * S, rc,
+                       open ? 0.38f : (hov ? 0.30f : 0.20f), open);
+        dl->AddRectFilled(r0, ImVec2(r0.x + 3.0f * S, r1.y),
+            ImGui::ColorConvertFloat4ToU32(ImVec4(rc[0], rc[1], rc[2], 0.95f)),
+            8.0f * S, ImDrawFlags_RoundCornersLeft);
+
+        if (ImGui::InvisibleButton("##hubrow", ImVec2(rw, rowH)))
             openSubagentView(st, s.id, s.role);
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Open this sub-agent's chat (view + steer).");
+            ImGui::SetTooltip("%s this sub-agent's chat (view + steer).",
+                              open ? "Raise" : "Pop up");
 
-        // line 1: status glyph + role
-        float y = c0.y + 4.0f * S;
-        ImGui::SetCursorScreenPos(ImVec2(c0.x + 8.0f * S, y));
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(sc[0], sc[1], sc[2], 1.0f));
-        ImGui::TextUnformatted(s.status == "running" ? "[>]" : "[ ]");
-        ImGui::PopStyleColor();
-        ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
-        ImGui::TextUnformatted(s.role.empty() ? "sub-agent" : s.role.c_str());
-        ImGui::PopStyleColor();
-        // line 2: status
-        y += lineH;
-        ImGui::SetCursorScreenPos(ImVec2(c0.x + 8.0f * S, y));
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(sc[0], sc[1], sc[2], 0.9f));
-        ImGui::TextUnformatted(s.status.empty() ? "status unknown" : s.status.c_str());
-        ImGui::PopStyleColor();
-        // line 3: model + id
-        y += lineH;
-        ImGui::SetCursorScreenPos(ImVec2(c0.x + 8.0f * S, y));
-        std::string meta = s.model.empty() ? s.id : (s.model + "  " + s.id);
-        if (meta.size() > 30) meta = meta.substr(0, 29) + "\xE2\x80\xA6";
-        ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
-        ImGui::TextUnformatted(meta.c_str());
-        ImGui::PopStyleColor();
+        // line 1: status glyph (pulsing while running) + role ····· model · age
+        const float* sc = statusColor(s.status);
+        float glyphA = 1.0f;
+        if (s.status == "running")
+            glyphA = 0.55f + 0.45f * (float)std::sin(tsec * 4.0f);
+        const char* glyph = s.status == "running"    ? "[>]" :
+                            s.status == "failed"     ? "[x]" :
+                            s.status == "done"       ? "[v]" :
+                            s.status == "terminated" ? "[o]" : "[ ]";
+        float y = r0.y + 5.0f * S;
+        float x = r0.x + 10.0f * S;
+        dl->AddText(ImVec2(x, y), ImGui::ColorConvertFloat4ToU32(
+            ImVec4(sc[0], sc[1], sc[2], glyphA)), glyph);
+        x += ImGui::CalcTextSize(glyph).x + 8.0f * S;
+        dl->AddText(ImVec2(x, y), ImGui::ColorConvertFloat4ToU32(surf.textPrimary),
+                    roleKey.c_str());
+        // right-aligned meta: model · age
+        std::string meta;
+        if (!s.model.empty()) meta = s.model;
+        const std::string age = fmtAge(s.updatedTs);
+        if (!age.empty()) { if (!meta.empty()) meta += "  "; meta += age; }
+        if (!meta.empty()) {
+            const float mw = ImGui::CalcTextSize(meta.c_str()).x;
+            dl->AddText(ImVec2(r1.x - mw - 10.0f * S, y),
+                        ImGui::ColorConvertFloat4ToU32(surf.textTertiary), meta.c_str());
+        }
 
-        ImGui::SetCursorScreenPos(ImVec2(c0.x, c1.y + 4.0f * S));
+        // line 2: dim brief (or status), truncated to the row width; pending-steer badge
+        y += lineH;
+        std::string sub = s.brief.empty() ? s.status : s.brief;
+        const float subMaxW = rw - 20.0f * S - 90.0f * S;
+        while (!sub.empty() && ImGui::CalcTextSize(sub.c_str()).x > subMaxW)
+            sub.pop_back();
+        if (sub.size() < (s.brief.empty() ? s.status : s.brief).size())
+            sub += "\xE2\x80\xA6";
+        dl->AddText(ImVec2(r0.x + 10.0f * S, y),
+                    ImGui::ColorConvertFloat4ToU32(surf.textSecondary), sub.c_str());
+        if (s.pendingSteers > 0) {
+            char badge[24];
+            std::snprintf(badge, sizeof(badge), "%d queued", s.pendingSteers);
+            const float bw = ImGui::CalcTextSize(badge).x + 10.0f * S;
+            const ImVec2 b0(r1.x - bw - 8.0f * S, y - 1.0f * S);
+            const ImVec2 b1(r1.x - 8.0f * S, y + lineH - 2.0f * S);
+            dl->AddRectFilled(b0, b1, ImGui::ColorConvertFloat4ToU32(
+                ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 0.22f)),
+                4.0f * S);
+            dl->AddText(ImVec2(b0.x + 5.0f * S, b0.y + 1.0f * S),
+                        ImGui::ColorConvertFloat4ToU32(
+                            ImVec4(palette.accent[0], palette.accent[1],
+                                   palette.accent[2], 1.0f)), badge);
+        }
+
+        ImGui::SetCursorScreenPos(ImVec2(r0.x, r1.y + gap));
         ImGui::PopID();
     }
     ImGui::EndChild();
 }
 
-// The Agent Workflow tab body: live tree from the event store + the orchestration tree of
-// registered sub-agents, honest empty-states throughout. Honors agent.ui_verbosity:
-//   0 = node titles only · 1 = + detail lines · 2 = + actor/latency, counts footer, full text.
-static void drawAgentWorkflowView(AppState& st) {
+// The Agent Hub view: OMP-style roster header + rows + the live execution DAG below.
+// Honors agent.ui_verbosity:
+//   0 = node titles only · 1 = + detail lines · 2 = + actor/latency, counts, full text.
+static void drawAgentHubView(AppState& st) {
     const float S = ui::uiScale;
     const bool  busy = st.job.running.load();
     const int   verbosity = aiUiVerbosity();
 
-    pollSubagentList(st);   // keep the registry snapshot warm (throttled + single in-flight)
+    pollSubagentList(st);   // registry snapshot + auto-pop (throttled, single in-flight)
 
-    // Header strip (verbosity 2): live counts + the honest state of the currently-unsourced
-    // branch kinds (M20).
-    if (verbosity >= 2 && !s_agdag.empty()) {
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
-        ImGui::Text("%d tool call%s \xC2\xB7 %d thought%s \xC2\xB7 %d context inject%s",
-                    s_agdag.toolCount,   s_agdag.toolCount == 1 ? "" : "s",
-                    s_agdag.thoughtCount,s_agdag.thoughtCount == 1 ? "" : "s",
-                    s_agdag.ctxCount,    s_agdag.ctxCount == 1 ? "" : "s");
+    // Text tones come from the pane's adaptive surface (same id the host draws the slab with).
+    const ImVec2 w0 = ImGui::GetWindowPos();
+    const ImRect wRect(w0, ImVec2(w0.x + ImGui::GetWindowSize().x,
+                                  w0.y + ImGui::GetWindowSize().y));
+    const AdaptiveSurface& surf =
+        adaptivePanel(panelId("ai_ws_view_glass"), wRect, GlassGroup::Global);
+
+    // OMP-grammar header: "Agent Hub — N active · M parked" + live trace counts (verbosity 2).
+    int live = 0;
+    for (const auto& s : s_sub.sessions)
+        if (s.status == "running" || s.status == "pending" ||
+            s.status == "in_progress" || s.status == "waiting")
+            ++live;
+    const int total = (int)s_sub.sessions.size();
+    {
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+        ImGui::TextUnformatted("Agent Hub");
         ImGui::PopStyleColor();
-        ImGui::SameLine();
-        // Sub-agent / advisor branches: present only when a real production sink emits them. Until
-        // then this is an HONEST status, not a fabricated node (tracker M20).
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(palette.textDisabled[0], palette.textDisabled[1],
-                   palette.textDisabled[2], 1.0f));
-        if (!s_agdag.sawSpawn && !s_agdag.sawAdvisor)
-            ImGui::TextUnformatted("   \xC2\xB7 no sub-agent / advisor branches yet");
+        ImGui::SameLine(0, 10.0f * S);
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+        if (total == 0)
+            ImGui::TextUnformatted(st.workerStarted
+                ? "— no sub-agents yet"
+                : "— worker service not running");
+        else
+            ImGui::Text("— %d active · %d parked", live, total - live);
         ImGui::PopStyleColor();
-        ImGui::Spacing();
+        if (verbosity >= 2 && !s_agdag.empty()) {
+            ImGui::SameLine(0, 14.0f * S);
+            ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+            ImGui::Text("%d tool call%s · %d thought%s · %d context inject%s",
+                        s_agdag.toolCount,   s_agdag.toolCount == 1 ? "" : "s",
+                        s_agdag.thoughtCount,s_agdag.thoughtCount == 1 ? "" : "s",
+                        s_agdag.ctxCount,    s_agdag.ctxCount == 1 ? "" : "s");
+            ImGui::PopStyleColor();
+        }
     }
+    ImGui::Spacing();
 
     const bool haveDag  = !s_agdag.empty();
     const bool haveSubs = !s_sub.sessions.empty();
@@ -1406,19 +1527,26 @@ static void drawAgentWorkflowView(AppState& st) {
                        "Tool calls, thoughts and context injections will appear here as the run streams.");
         else
             emptyState("[/]", "No agent activity yet",
-                       "Send a message below — this graph traces the agent's tool calls, thoughts, "
-                       "context injections and (when they run) sub-agent / advisor branches, live.");
+                       "Send a message in the chat — delegated sub-agents list here live, each with a "
+                       "popup chat of its own, and the execution trace builds below.");
         return;
     }
 
-    // Orchestration tree (registry agent cards) beside the live execution DAG.
+    const float availH = ImGui::GetContentRegionAvail().y;
     if (haveSubs) {
-        drawOrchestrationTree(st, 216.0f * S);
-        ImGui::SameLine();
+        // Rows get what they need up to ~45% of the pane when the trace also shows; the
+        // child scrolls when the roster outgrows it.
+        const float lineH  = ImGui::GetTextLineHeightWithSpacing();
+        const float wantH  = total * (lineH * 2.0f + 12.0f * S + 6.0f * S) + 8.0f * S;
+        const float listH  = haveDag ? std::min(wantH, std::max(120.0f * S, availH * 0.45f))
+                                     : availH;
+        drawAgentHubRows(st, surf, listH);
+        ImGui::Spacing();
     }
     if (haveDag) {
+        sectionHeader("Execution trace");
         drawAgentDagCanvas(st, verbosity);
-    } else {
+    } else if (!haveSubs) {
         // Registry has agents but the event stream hasn't produced spans yet — honest, not blank.
         emptyState("[>]", busy ? "Agent is starting\xE2\x80\xA6" : "No agent events yet",
                    "Tool calls, thoughts and context injections appear here as the run streams.");
@@ -1623,103 +1751,98 @@ static void drawDagCanvas(AppState& st) {
     drawDagCanvas(st);
 }
 
-// ---- left rail: sessions + sub-agents --------------------------------------------
-
-static void drawSessionsRail(AppState& st, float railW, bool busy) {
+// ---- right-panel vertical nav ----------------------------------------------------
+// One row per utility-panel view. Selected = accent wash + glow (the same color-coded
+// grammar as the Layers/PLM rows); hover gets a glass wash. Returns true on click.
+static bool navRow(int id, const char* label, bool active, const AdaptiveSurface& surf,
+                   int badge = 0) {
     const float S = ui::uiScale;
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10 * S, 8 * S));
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImGui::PushID(id);
+    const ImVec2 r0 = ImGui::GetCursorScreenPos();
+    const float  rw = ImGui::GetContentRegionAvail().x;
+    const float  rh = ImGui::GetFrameHeight() + 8.0f * S;
+    const ImVec2 r1(r0.x + rw, r0.y + rh);
+    const bool hov = ImGui::IsMouseHoveringRect(r0, r1);
+    bool hit = ImGui::InvisibleButton("##navrow", ImVec2(rw, rh));
+
+    if (active) {
+        const float acc[3] = {palette.accent[0], palette.accent[1], palette.accent[2]};
+        coloredRowWash(dl, r0, r1, 8.0f * S, acc, 0.40f, true);
+    } else if (hov) {
+        glassRowBackground(dl, r0, r1, 8.0f * S, false, false, 0.32f);
+    }
+    const float textH = ImGui::GetTextLineHeight();
+    dl->AddText(ImVec2(r0.x + 12.0f * S, r0.y + (rh - textH) * 0.5f),
+                ImGui::ColorConvertFloat4ToU32(active ? surf.textPrimary
+                                                      : surf.textSecondary),
+                label);
+    if (badge > 0) {
+        // Live-count chip pinned to the row's right edge (Agent Hub active agents).
+        char b[16];
+        std::snprintf(b, sizeof(b), "%d", badge);
+        const float bw = ImGui::CalcTextSize(b).x + 12.0f * S;
+        const ImVec2 b0(r1.x - bw - 8.0f * S, r0.y + (rh - textH - 4.0f * S) * 0.5f);
+        const ImVec2 b1(b0.x + bw, b0.y + textH + 4.0f * S);
+        dl->AddRectFilled(b0, b1, ImGui::ColorConvertFloat4ToU32(
+            ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 0.26f)),
+            (b1.y - b0.y) * 0.5f);
+        dl->AddText(ImVec2(b0.x + 6.0f * S, b0.y + 2.0f * S),
+                    ImGui::ColorConvertFloat4ToU32(
+                        ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 1.0f)),
+                    b);
+    }
+    ImGui::SetCursorScreenPos(ImVec2(r0.x, r1.y + 4.0f * S));
+    ImGui::PopID();
+    return hit;
+}
+
+static void drawNavColumn(AppState& st, float navW) {
+    const float S = ui::uiScale;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8 * S, 8 * S));
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
-    ImGui::BeginChild("##ai_ws_rail", ImVec2(railW, 0), ImGuiChildFlags_None);
+    ImGui::BeginChild("##ai_ws_nav", ImVec2(navW, 0), ImGuiChildFlags_None);
     ImGui::PopStyleColor();
     ImGui::PopStyleVar();
 
-    // Liquid-glass slab behind the whole rail (same recipe as active_work.cpp): one adaptive
-    // surface, frosted panel, then the content rows ride on top.
+    // Liquid-glass slab behind the nav (same recipe as the chat column).
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 w0 = ImGui::GetWindowPos();
+    const ImRect wRect(w0, ImVec2(w0.x + ImGui::GetWindowSize().x,
+                                  w0.y + ImGui::GetWindowSize().y));
+    const AdaptiveSurface& surf =
+        adaptivePanel(panelId("ai_ws_nav_glass"), wRect, GlassGroup::Global);
+    glassPanel(dl, wRect, GlassLevel::Thin, 10.0f * S, surf);
+
+    ImGui::Dummy(ImVec2(0, 4.0f * S));
+
+    // Live-agent badge for the Agent Hub row; in-flight doc badge for Active Work.
+    int live = 0;
+    for (const auto& s : s_sub.sessions)
+        if (s.status == "running" || s.status == "pending" ||
+            s.status == "in_progress" || s.status == "waiting")
+            ++live;
+    int wip = 0;
+    for (const auto& t : st.docTabs)
+        if (t.aiHandoff || t.aiPulse || t.agentDone) ++wip;
+
+    if (navRow(0, "Agent Hub",    s_ai.view == 0, surf, live)) s_ai.view = 0;
+    if (navRow(1, "Session Plan", s_ai.view == 1, surf))       s_ai.view = 1;
+    if (navRow(2, "Active Work",  s_ai.view == 2, surf, wip))  s_ai.view = 2;
+    if (navRow(3, "Documents",    s_ai.view == 3, surf))       s_ai.view = 3;
+    if (navRow(4, "Sessions",     s_ai.view == 4, surf))       s_ai.view = 4;
+    if (navRow(5, "Leaderboard",  s_ai.view == 5, surf))       s_ai.view = 5;
+
+    // Hairline + the utility section.
+    ImGui::Dummy(ImVec2(0, 4.0f * S));
     {
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        const ImVec2 w0 = ImGui::GetWindowPos();
-        const ImRect wRect(w0, ImVec2(w0.x + ImGui::GetWindowSize().x,
-                                      w0.y + ImGui::GetWindowSize().y));
-        const AdaptiveSurface& surf =
-            adaptivePanel(panelId("ai_ws_rail_glass"), wRect, GlassGroup::Global);
-        glassPanel(dl, wRect, GlassLevel::Thin, 10.0f * S, surf);
+        const ImVec2 c = ImGui::GetCursorScreenPos();
+        dl->AddLine(ImVec2(c.x + 6.0f * S, c.y), ImVec2(c.x + navW - 22.0f * S, c.y),
+                    ui::Palette::toU32(palette.glassBorder), 1.0f * S);
     }
+    ImGui::Dummy(ImVec2(0, 8.0f * S));
 
-    sectionHeader("Sessions");
-    // The docked Copilot's exact session list (same rows, same switch/close/new behavior).
-    chatDrawSessionsList(st, busy);
-
-    ImGui::Spacing();
-    ImGui::Separator();
-    ImGui::Spacing();
-    sectionHeader("Sub-agents");
-    // Live registry sessions first (subagent_list, async — Phase 4 M11): every spawned
-    // sub-agent, clickable to open/steer its chat in the conversation column. Honest: the
-    // registry is empty until a mission actually delegates — no fabricated rows.
-    pollSubagentList(st);
-    int shown = 0;
-    for (const auto& s : s_sub.sessions) {
-        ImGui::PushID(s.id.c_str());
-        ImVec2 p0 = ImGui::GetCursorScreenPos();
-        ImVec2 p1(p0.x + ImGui::GetContentRegionAvail().x,
-                  p0.y + ImGui::GetFrameHeight() * 1.6f);
-        const bool open = s_sub.active && s_sub.cur.id == s.id;
-        ui::glassRowBackground(ImGui::GetWindowDrawList(), p0, p1, 4.0f,
-                               ImGui::IsMouseHoveringRect(p0, p1), open, 0.24f);
-        if (ImGui::InvisibleButton("##subrow", ImVec2(p1.x - p0.x, p1.y - p0.y)))
-            openSubagentView(st, s.id, s.role);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Open this sub-agent's chat (view + steer).");
-        ImGui::SetCursorScreenPos(ImVec2(p0.x + 4.0f * S, p0.y + 2.0f * S));
-        ImGui::BeginGroup();
-        const float* sc = statusColor(s.status);
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(sc[0], sc[1], sc[2], 1.0f));
-        ImGui::TextUnformatted(s.status == "running" ? "[>]" : "[ ]");
-        ImGui::PopStyleColor();
-        ImGui::SameLine();
-        ImGui::TextUnformatted(s.role.empty() ? s.id.c_str() : s.role.c_str());
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
-        ImGui::TextUnformatted(("  " + (s.brief.empty() ? s.status : s.brief).substr(0, 46))
-                                   .c_str());
-        ImGui::PopStyleColor();
-        ImGui::EndGroup();
-        ImGui::SetCursorScreenPos(ImVec2(p0.x, p1.y));
-        ImGui::Spacing();
-        ImGui::PopID();
-        ++shown;
-    }
-    // Plan-assignee rows (the selected Session Plan's assigned nodes) — a different, older
-    // surface kept beneath the live registry list.
-    for (const auto& n : s_ai.nodes) {
-        if (n.assigned.empty()) continue;
-        ImVec2 p0 = ImGui::GetCursorScreenPos();
-        ImVec2 p1(p0.x + ImGui::GetContentRegionAvail().x,
-                  p0.y + ImGui::GetFrameHeight() * 1.6f);
-        ui::glassRowBackground(ImGui::GetWindowDrawList(), p0, p1, 4.0f, false, false, 0.24f);
-        ImGui::BeginGroup();
-        const float* sc = statusColor(n.status);
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(sc[0], sc[1], sc[2], 1.0f));
-        ImGui::TextUnformatted(n.status == "running" ? "[>]" : "[ ]");
-        ImGui::PopStyleColor();
-        ImGui::SameLine();
-        ImGui::TextUnformatted(n.assigned.c_str());
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
-        ImGui::TextWrapped("  %s", n.label.c_str());
-        ImGui::PopStyleColor();
-        ImGui::EndGroup();
-        ImGui::Spacing();
-        ++shown;
-    }
-    if (shown == 0) {
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(palette.textDisabled[0], palette.textDisabled[1],
-                   palette.textDisabled[2], 1.0f));
-        ImGui::TextWrapped("None running. Sub-agents appear here while a mission plan is "
-                           "executing.");
-        ImGui::PopStyleColor();
-    }
+    if (navRow(6, "Options",      s_ai.view == 6, surf))       s_ai.view = 6;
 
     ImGui::EndChild();
 }
@@ -1729,13 +1852,8 @@ static void drawSessionsRail(AppState& st, float railW, bool busy) {
 static void drawChatCenter(AppState& st, bool busy, bool canRun) {
     const float S = ui::uiScale;
 
-    // Phase 4 (M11): while a sub-agent chat is open it REPLACES the main conversation in this
-    // column — recolored (M15), no easy end (M16), read-only run parameters (M17). The main
-    // chat state is untouched; "Back to main chat" restores it instantly.
-    if (s_sub.active) {
-        drawSubagentChat(st);
-        return;
-    }
+    // v3: the main conversation is NEVER replaced — sub-agent chats live in their own popup
+    // windows (drawSubagentPopups), opened from the Agent Hub rows or the trace's spawn nodes.
 
     // Reserve the composer height measured last frame so the log fills the rest
     // (same one-frame-lag trick as the docked Copilot).
@@ -1765,163 +1883,166 @@ static void drawChatCenter(AppState& st, bool busy, bool canRun) {
     s_composerH = ImGui::GetItemRectSize().y + 6.0f * S;
 }
 
-// ---- right: AI *workflow* settings ONLY (M2 wiped the inference block; M3 keeps these) ------
+// ---- Options view (v3): run-behavior + workspace-visibility knobs -------------------
 // The model / reasoning-effort / max-tokens / context-window / API key / privacy / vision-
-// reviewer controls were REMOVED from this pane (M2). They are reachable ONLY on the main
-// Settings page: Settings -> AI (ui::drawProviderModelPicker, which covers provider, model,
-// reasoning effort, max response tokens, model context window, API key, base URL, vision, and
-// the Privacy/Offline toggle) and Settings -> Experimental (the separate vision reviewer). This
-// pane keeps ONLY the run-behavior knobs — the same config.json fields, no parallel store.
-// M21: this pane now lives lower-RIGHT (below the DAG, beside the chat column) as a WIDE strip,
-// so the content re-flows into two side-by-side groups (Workflow mode | Limits) with the
-// persistence footnote spanning underneath; on a narrow strip it degrades to a single stack.
-static void drawSettingsPane(AppState& st, float paneH, bool /*busy*/) {
+// reviewer controls are reachable ONLY on the main Settings page (Settings -> AI). This view
+// keeps the run-behavior knobs (same config.json fields, no parallel store) + the command-
+// center visibility prefs (agent.ui_*), laid out as a proper form — label column left,
+// field right, one row per knob.
+static void drawOptionsView(AppState& st) {
     const float S = ui::uiScale;
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10 * S, 8 * S));
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
-    ImGui::BeginChild("##ai_ws_settings", ImVec2(0, paneH), ImGuiChildFlags_None);
-    ImGui::PopStyleColor();
-    ImGui::PopStyleVar();
-
-    // Liquid-glass slab behind the options strip (same recipe as the rail above).
-    {
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        const ImVec2 w0 = ImGui::GetWindowPos();
-        const ImRect wRect(w0, ImVec2(w0.x + ImGui::GetWindowSize().x,
-                                      w0.y + ImGui::GetWindowSize().y));
-        const AdaptiveSurface& surf =
-            adaptivePanel(panelId("ai_ws_opts_glass"), wRect, GlassGroup::Global);
-        glassPanel(dl, wRect, GlassLevel::Thin, 10.0f * S, surf);
-    }
-
     bool changed = false;
-    const bool twoCol = ImGui::GetContentRegionAvail().x > 480.0f * S;
 
-    ImGui::BeginGroup();
-    sectionHeader("Workflow");
-    int pm = st.settings.planPreference;
-    if (pm < 0 || pm > 3) pm = st.settings.planMode ? 2 : 0;
-    // Compact 4-way; falls back cleanly if only binary was known.
-    static const char* kPref[] = {"Off", "Option", "Encourage", "Require"};
-    ImGui::SetNextItemWidth(160.0f * S);
-    if (ImGui::Combo("Plan preference", &pm, kPref, 4)) {
-        st.settings.planPreference = pm;
-        st.settings.planMode = (pm != 0);
-        changed = true;
-    }
-    ImGui::EndGroup();
-
-    if (twoCol) ImGui::SameLine(0.0f, 28.0f * S);
-
-    ImGui::BeginGroup();
-    sectionHeader("Limits");
-    auto intKnob = [&](const char* label, int& v, const char* tip) {
-        ImGui::SetNextItemWidth(90.0f * S);
-        if (ImGui::InputInt(label, &v, 0, 0)) { v = std::max(0, v); changed = true; }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
+    const float labelW = 170.0f * S;
+    const float fieldW = 190.0f * S;
+    auto fieldRow = [&](const char* label) {
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(label);
+        ImGui::SameLine(labelW);
+        ImGui::SetNextItemWidth(fieldW);
     };
-    intKnob("Refine passes##ai_ws_iters", st.settings.maxIters,
-            "Refine-pass cap per turn. 0 = automatic.");
-    intKnob("Max output tokens##ai_ws_maxtok", st.settings.maxTokens,
-            "Max output tokens per model call. 0 = provider default.");
-    intKnob("Context window##ai_ws_ctx", st.settings.contextWindow,
-            "Model's total token window. 0 = automatic (cloud large, local 8192).");
-    ImGui::EndGroup();
 
+    sectionHeader("Workspace");
+    {
+        int v = aiUiVerbosity();
+        static const char* kVerb[] = {"Quiet", "Normal", "Full"};
+        fieldRow("Detail level");
+        if (ImGui::Combo("##ai_ws_verb", &v, kVerb, 3)) setAiUiVerbosity(v);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("How much the Agent Hub / Active Work views show: titles only, "
+                              "last operation, or full tickers + counts.");
+
+        bool follow = aiFollowActiveSession();
+        fieldRow("Follow live runs");
+        if (ImGui::Checkbox("##ai_ws_follow", &follow)) setAiFollowActiveSession(follow);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("New runs yank the panel to the Agent Hub, and new sub-agents "
+                              "pop their chat windows automatically.");
+
+        bool prev = aiActiveWorkPreviews();
+        fieldRow("Active Work previews");
+        if (ImGui::Checkbox("##ai_ws_prev", &prev)) setAiActiveWorkPreviews(prev);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Render iso-preview thumbnails for the docs agents are editing "
+                              "(worker render jobs; cached per saved revision).");
+    }
+    ImGui::Dummy(ImVec2(0, 6.0f * S));
+
+    sectionHeader("Workflow");
+    {
+        int pm = st.settings.planPreference;
+        if (pm < 0 || pm > 3) pm = st.settings.planMode ? 2 : 0;
+        static const char* kPref[] = {"Off", "Option", "Encourage", "Require"};
+        fieldRow("Plan preference");
+        if (ImGui::Combo("##ai_ws_planpref", &pm, kPref, 4)) {
+            st.settings.planPreference = pm;
+            st.settings.planMode = (pm != 0);
+            changed = true;
+        }
+
+        auto intKnob = [&](const char* label, const char* id, int& v, const char* tip) {
+            fieldRow(label);
+            if (ImGui::InputInt(id, &v, 0, 0)) { v = std::max(0, v); changed = true; }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
+        };
+        intKnob("Refine passes", "##ai_ws_iters", st.settings.maxIters,
+                "Refine-pass cap per turn. 0 = automatic.");
+        intKnob("Max output tokens", "##ai_ws_maxtok", st.settings.maxTokens,
+                "Max output tokens per model call. 0 = provider default.");
+        intKnob("Context window", "##ai_ws_ctx", st.settings.contextWindow,
+                "Model's total token window. 0 = automatic (cloud large, local 8192).");
+    }
     if (changed) saveSettings(st.settings);
+    ImGui::Dummy(ImVec2(0, 6.0f * S));
 
-    ImGui::Spacing();
+    sectionHeader("More");
+    if (ImGui::Button("Open full AI settings\xE2\x80\xA6")) {
+        st.openSettings    = true;
+        st.openSettingsTab = 2;   // Settings modal tab order: Appearance 0, General 1, AI 2
+    }
+    ImGui::Dummy(ImVec2(0, 4.0f * S));
     ImGui::PushStyleColor(ImGuiCol_Text,
         ImVec4(palette.textDisabled[0], palette.textDisabled[1],
                palette.textDisabled[2], 1.0f));
     ImGui::TextWrapped("Workflow knobs persist to config.json (shared with the docked Copilot). "
                        "Model, reasoning effort, tokens, API key, privacy and the vision reviewer "
-                       "live on the main Settings page (Settings \xE2\x86\x92 AI).");
+                       "live on the main Settings page (Settings -> AI).");
     ImGui::PopStyleColor();
-
-    ImGui::EndChild();
 }
 
 }  // anonymous namespace
 
 // ---- public entry point ------------------------------------------------------------
 
-// The upper DAG pane: tab strip (Agent Workflow | Session Plan | Active Work | Documents |
-// Leaderboard) + gear.
-static void drawDagPane(AppState& st, bool /*busy*/) {
+// The right-panel content view: one glass pane hosting the nav-selected view (Agent Hub |
+// Session Plan | Active Work | Documents | Sessions | Leaderboard | Options).
+static void drawViewPane(AppState& st, bool busy) {
     const float S = ui::uiScale;
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10 * S, 8 * S));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12 * S, 10 * S));
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
-    ImGui::BeginChild("##ai_ws_dag", ImVec2(0, 0), ImGuiChildFlags_None);
+    ImGui::BeginChild("##ai_ws_view", ImVec2(0, 0), ImGuiChildFlags_None);
     ImGui::PopStyleColor();
     ImGui::PopStyleVar();
 
-    // Liquid-glass slab behind the whole pane (same recipe as active_work.cpp).
+    // Liquid-glass slab behind the whole pane (shared adaptive surface — the views fetch the
+    // same panelId for their text tones).
     {
         ImDrawList* dl = ImGui::GetWindowDrawList();
         const ImVec2 w0 = ImGui::GetWindowPos();
         const ImRect wRect(w0, ImVec2(w0.x + ImGui::GetWindowSize().x,
                                       w0.y + ImGui::GetWindowSize().y));
         const AdaptiveSurface& surf =
-            adaptivePanel(panelId("ai_ws_dag_glass"), wRect, GlassGroup::Global);
+            adaptivePanel(panelId("ai_ws_view_glass"), wRect, GlassGroup::Global);
         glassPanel(dl, wRect, GlassLevel::Thin, 10.0f * S, surf);
     }
 
-    // Autopopulate (agent.ui_follow_active_session): a NEW live run yanks the pane to the
-    // Agent Workflow view so the streaming execution tree shows without manual picking; the
-    // Session Plan scope (s_ai.selSession) is bound each frame in drawAiWorkspace.
+    // Autopopulate (agent.ui_follow_active_session): a NEW live run yanks the panel to the
+    // Agent Hub view so the streaming roster + execution trace show without manual picking.
     if (aiFollowActiveSession() && !s_agdag.runId.empty() &&
         s_agdag.runId != s_ai.lastAutoRun) {
         s_ai.lastAutoRun = s_agdag.runId;
-        s_ai.dagView     = 0;
+        s_ai.view        = 0;
     }
 
-    // Tab strip switches ONLY this pane (M7). Leaderboard is the aicad.leaderboard/1 consumer.
-    if (viewChip("Agent Workflow", s_ai.dagView == 0)) s_ai.dagView = 0;
-    ImGui::SameLine();
-    if (viewChip("Session Plan", s_ai.dagView == 1)) s_ai.dagView = 1;
-    ImGui::SameLine();
-    if (viewChip("Active Work", s_ai.dagView == 2)) s_ai.dagView = 2;
-    ImGui::SameLine();
-    if (viewChip("Documents", s_ai.dagView == 3)) s_ai.dagView = 3;
-    ImGui::SameLine();
-    if (viewChip("Leaderboard", s_ai.dagView == 4)) s_ai.dagView = 4;
-    ImGui::SameLine();
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
-                         std::max(0.0f, ImGui::GetContentRegionAvail().x - 84.0f * S));
-    if (viewChip(s_ai.showSettings ? "Options \xE2\x96\xB8" : "\xE2\x97\x82 Options",
-                 s_ai.showSettings))
-        s_ai.showSettings = !s_ai.showSettings;
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Show / hide the AI workflow options pane.");
-    ImGui::Spacing();
-
-    if (s_ai.dagView == 4) {
-        if (!s_ai.lbLoaded) {
-            s_ai.lb = ui::leaderboard::load();
-            s_ai.lbLoaded = true;
+    switch (s_ai.view) {
+        case 0:  // Agent Hub: sub-agent roster + live agent-execution DAG.
+            drawAgentHubView(st);
+            break;
+        case 1:  // Session Plan: the plan board over persisted buildgraph runs.
+            if (!st.workerStarted)
+                emptyState("[#]", "Worker not running",
+                           "The Chudware worker service is required to load and steer plans.");
+            else
+                drawPlanBoardView(st);
+            break;
+        case 2:  // Active Work: live render grid of the docs agents are editing.
+            drawActiveWorkView(st);
+            break;
+        case 3:  // Documents: in-tab office-document attach / preview / edit panel.
+            drawDocsPanel(st);
+            break;
+        case 4:  // Sessions: the docked Copilot's exact session list, in a wider pane.
+            chatDrawSessionsList(st, busy);
+            break;
+        case 5: {  // Leaderboard (aicad.leaderboard/1).
+            if (!s_ai.lbLoaded) {
+                s_ai.lb = ui::leaderboard::load();
+                s_ai.lbLoaded = true;
+            }
+            bool wantRefresh = false;
+            ui::leaderboard::drawFullPane(s_ai.lb, wantRefresh);
+            if (wantRefresh) {
+                s_ai.lb = ui::leaderboard::load();
+                s_ai.lbLoaded = true;
+            }
+            break;
         }
-        bool wantRefresh = false;
-        ui::leaderboard::drawFullPane(s_ai.lb, wantRefresh);
-        if (wantRefresh) {
-            s_ai.lb = ui::leaderboard::load();
-            s_ai.lbLoaded = true;
-        }
-    } else if (s_ai.dagView == 3) {
-        // Documents: in-tab office-document attach / preview / edit panel.
-        drawDocsPanel(st);
-    } else if (s_ai.dagView == 2) {
-        // Active Work: live grid of the docs agents are creating/editing right now.
-        drawActiveWorkView(st);
-    } else if (s_ai.dagView == 0) {
-        // Phase 2 (M9/M10): the LIVE agent-execution DAG + orchestration tree.
-        drawAgentWorkflowView(st);
-    } else if (!st.workerStarted) {
-        emptyState("[#]", "Worker not running",
-                   "The Chudware worker service is required to load and steer plans.");
-    } else {
-        // Session Plan: the plan board over persisted buildgraph runs.
-        drawPlanBoardView(st);
+        case 6:  // Options: run-behavior + workspace-visibility knobs.
+            drawOptionsView(st);
+            break;
+        default:
+            s_ai.view = 0;
+            break;
     }
     ImGui::EndChild();
 }
@@ -1936,100 +2057,76 @@ void drawAiWorkspace(AppState& st) {
     refreshModelAvailability(st, false);
     chatWorkspaceSync(st);
     activeWorkPump(st);  // drive at most one Active Work preview render per frame (thumb queue)
+    // Registry poll lives at the workspace level (throttled, single in-flight) so the nav
+    // badge, the popup transcripts and the auto-pop of NEW live sub-agents work no matter
+    // which view is selected — not just while the Agent Hub is showing.
+    pollSubagentList(st);
 
-    // M8 plumbing: bind the Session Plan scope to the active chat session's id (see the TODO in
-    // drawDagView — the run filter itself waits on Phase-2 session->run_id data).
+    // M8 plumbing: bind the Session Plan scope to the active chat session's id.
     s_ai.selSession = (st.activeConv >= 0 && st.activeConv < (int)st.conversations.size())
                           ? st.conversations[st.activeConv].id
                           : std::string();
 
-    // M21 layout (Hunter's annotated screenshot):
-    //   [rail] | chat (narrow FULL-height left column) | DAG pane         (upper right)
-    //          |                                       | workflow options (lower right)
-    // Hairline dividers (theme glassBorder, same grammar as layout.cpp pane separators) mark the
-    // chat/right boundary and the DAG/options boundary.
+    // v3 layout (Hunter's directive): MAIN CHAT on the left, everything else in the right
+    // utility panel — a vertical nav menu + the selected view. No sessions rail, no bottom
+    // options strip. A hairline marks the chat/utility boundary (layout.cpp grammar).
     const float totalW = ImGui::GetContentRegionAvail().x;
-    const float railW  = 210.0f * S;                             // compacted from 235
-    const float bodyW  = totalW - railW - 8.0f * S;
+    const float gap    = 10.0f * S;
+    const float navW   = 168.0f * S;
 
-    drawSessionsRail(st, railW, busy);
-    ImGui::SameLine();
+    // Chat column: a generous main-chat slice — 44% with clean bounds so it never starves
+    // (min) or sprawls on ultrawide monitors (max). Full height: log + composer inside.
+    const float chatW = std::max(360.0f * S, std::min(totalW * 0.44f, 780.0f * S));
 
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-    ImGui::BeginChild("##ai_ws_body", ImVec2(bodyW, 0), ImGuiChildFlags_None);
-    ImGui::PopStyleVar();
-
-    const ImVec2 bodyPos  = ImGui::GetCursorScreenPos();
-    const float  bodyH    = ImGui::GetContentRegionAvail().y;
-    const float  gap      = 8.0f * S;
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
+    const float  bodyH  = ImGui::GetContentRegionAvail().y;
     const ImU32  hairline = ui::Palette::toU32(palette.glassBorder);
 
-    // Chat column: a small, consistent slice of the body — 30% with clean bounds so it never
-    // starves (min) or sprawls on wide monitors (max). Full height: log + composer inside.
-    const float chatW = std::max(300.0f * S, std::min(bodyW * 0.30f, 440.0f * S));
-
-    // M15: while viewing a sub-agent, the WHOLE conversation column recolors (tinted background
-    // + warm border) so there is no mistaking which chat you are in.
-    const bool subView = s_sub.active;
-    if (subView)
-        ImGui::PushStyleColor(ImGuiCol_ChildBg,
-            ImVec4(palette.statusWarn[0], palette.statusWarn[1], palette.statusWarn[2], 0.07f));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10 * S, 8 * S));
+    // ---- left: main chat ----------------------------------------------------------
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12 * S, 10 * S));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
     ImGui::BeginChild("##ai_ws_conv", ImVec2(chatW, 0), ImGuiChildFlags_None);
+    ImGui::PopStyleColor();
     ImGui::PopStyleVar();
-    drawChatCenter(st, busy, canRun);   // log + composer (mode tabs + prompt); no stray header
-    ImGui::EndChild();
-    if (subView) {
-        ImGui::PopStyleColor();
+    {
+        // Liquid-glass slab behind the conversation (same recipe as the view pane).
         ImDrawList* dl = ImGui::GetWindowDrawList();
-        ImVec2 c0 = ImGui::GetItemRectMin();
-        ImVec2 c1 = ImGui::GetItemRectMax();
-        dl->AddRect(c0, c1,
-            ImGui::ColorConvertFloat4ToU32(
-                ImVec4(palette.statusWarn[0], palette.statusWarn[1],
-                       palette.statusWarn[2], 0.75f)),
-            4.0f * S, 0, 2.0f * S);
+        const ImVec2 w0 = ImGui::GetWindowPos();
+        const ImRect wRect(w0, ImVec2(w0.x + ImGui::GetWindowSize().x,
+                                      w0.y + ImGui::GetWindowSize().y));
+        const AdaptiveSurface& surf =
+            adaptivePanel(panelId("ai_ws_conv_glass"), wRect, GlassGroup::Global);
+        glassPanel(dl, wRect, GlassLevel::Thin, 10.0f * S, surf);
     }
+    drawChatCenter(st, busy, canRun);   // log + composer (same state/send path as the dock)
+    ImGui::EndChild();
 
     ImGui::SameLine(0.0f, gap);
 
-    // Right stack: DAG pane on top, workflow options strip below (when shown).
+    // ---- right: utility panel (nav + view) -----------------------------------------
+    const ImVec2 rightPos = ImGui::GetCursorScreenPos();
+    // Popup sub-agent chats cascade from the view pane's top-left corner.
+    s_popupAnchor = ImVec2(rightPos.x + navW + gap + 16.0f * S, rightPos.y + 8.0f * S);
+
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
     ImGui::BeginChild("##ai_ws_right", ImVec2(0, 0), ImGuiChildFlags_None);
     ImGui::PopStyleVar();
 
-    const float rightH = ImGui::GetContentRegionAvail().y;
-    const float optH   = s_ai.showSettings
-                             ? std::max(150.0f * S, std::min(rightH * 0.34f, 260.0f * S))
-                             : 0.0f;
-    const float dagH   = std::max(160.0f * S,
-                                  rightH - (s_ai.showSettings ? optH + gap : 0.0f));
-
-    ImGui::BeginChild("##ai_ws_upper", ImVec2(0, dagH), ImGuiChildFlags_None);
-    drawDagPane(st, busy);
-    ImGui::EndChild();
-
-    if (s_ai.showSettings) {
-        // Horizontal hairline between the DAG pane and the options strip.
-        {
-            ImDrawList* dl = ImGui::GetWindowDrawList();
-            const float x0 = bodyPos.x + chatW + gap;
-            const float y  = bodyPos.y + dagH + gap * 0.5f;
-            dl->AddLine(ImVec2(x0, y), ImVec2(bodyPos.x + bodyW, y), hairline, 1.0f * S);
-        }
-        drawSettingsPane(st, ImGui::GetContentRegionAvail().y, busy);
-    }
+    drawNavColumn(st, navW);
+    ImGui::SameLine(0.0f, gap);
+    drawViewPane(st, busy);
 
     ImGui::EndChild();  // ##ai_ws_right
 
-    // Vertical hairline along the chat/right boundary (full body height).
+    // Vertical hairline along the chat/utility boundary (full height).
     {
         ImDrawList* dl = ImGui::GetWindowDrawList();
-        const float x = bodyPos.x + chatW + gap * 0.5f;
-        dl->AddLine(ImVec2(x, bodyPos.y), ImVec2(x, bodyPos.y + bodyH), hairline, 1.0f * S);
+        const float x = origin.x + chatW + gap * 0.5f;
+        dl->AddLine(ImVec2(x, origin.y), ImVec2(x, origin.y + bodyH), hairline, 1.0f * S);
     }
 
-    ImGui::EndChild();  // ##ai_ws_body
+    // Floating sub-agent chat windows draw last (above the whole workspace).
+    drawSubagentPopups(st);
 }
 
 }  // namespace ui

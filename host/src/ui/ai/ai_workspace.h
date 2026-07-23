@@ -1,13 +1,12 @@
-// AI workspace: full-viewport body for the AI title-bar tab (v2 layout, tracker M1-M8).
-// Compact, transparency-first shell:
-//   - UPPER main area: the DAG pane, switched by a five-chip tab strip (Agent Workflow |
-//     Session Plan | Active Work | Documents | Leaderboard — ai_workspace.cpp, s_ai.dagView).
-//     Left of it: the sessions/sub-agents rail.
-//   - LOWER-LEFT: the conversation window (message log + composer) — ALWAYS visible, no tab
+// AI workspace: full-viewport body for the AI title-bar tab (v3 layout).
+// Command-center shell:
+//   - LEFT: the main conversation (message log + composer) — ALWAYS visible, no tab
 //     (SAME state/send path as the docked column, via the ui/copilot/copilot.h reuse hooks).
-//   - LOWER-RIGHT: AI *workflow* settings only (Supervised/Autopilot, refine passes, max output
-//     tokens, context window). The inference block (model/effort/tokens/API key/privacy/vision)
-//     lives ONLY on the main Settings page now — persisted through saveSettings (config.json).
+//   - RIGHT: the utility panel — a vertical nav menu (Agent Hub | Session Plan | Active Work |
+//     Documents | Sessions | Leaderboard | Options — ai_workspace.cpp, s_ai.view) hosting the
+//     selected view. Sub-agent chats pop up as floating, role-themed windows (Agent Hub rows).
+//   - Inference settings (model/effort/tokens/API key/privacy/vision) live ONLY on the main
+//     Settings page; the Options view keeps the run-behavior + visibility knobs.
 #pragma once
 
 #include <string>

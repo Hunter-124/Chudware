@@ -308,9 +308,10 @@ void drawActiveWorkView(AppState& st) {
                                  p0.y + ((p1.y - p0.y) - thh) * 0.5f);
                 dl->AddImage((ImTextureID)(intptr_t)gth.tex, ip0, ImVec2(ip0.x + tw, ip0.y + thh));
             } else {
-                ImVec4 fill(palette.accent[0], palette.accent[1], palette.accent[2],
-                            c.tab->aiPulse ? 0.10f : 0.05f);
-                dl->AddRectFilled(p0, p1, ImGui::ColorConvertFloat4ToU32(fill), 6.0f * S);
+                // Liquid-glass gradient placeholder (accent wash, top-bright -> bottom-faint)
+                // with the doc kind tag centered — reads as a preview slot, not a flat box.
+                const float acc[3] = {palette.accent[0], palette.accent[1], palette.accent[2]};
+                glassCardWash(dl, p0, p1, 6.0f * S, acc, c.tab->aiPulse ? 0.16f : 0.09f);
                 const char* tag = kindTag(*c.tab);
                 const ImVec2 ts = ImGui::CalcTextSize(tag);
                 dl->AddText(ImVec2(p0.x + (p1.x - p0.x - ts.x) * 0.5f,

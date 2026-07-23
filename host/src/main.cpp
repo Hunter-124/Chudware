@@ -351,8 +351,7 @@ static void applyLegacyEnvCompat() {
 #if defined(_WIN32)
     char** envp = _environ;
 #else
-    extern char** environ;
-    char** envp = environ;
+    char** envp = environ;  // extern "C" declared at file scope above (line 167)
 #endif
     if (!envp) return;
     static const char* kPrefixes[] = {"AI_CAD_", "AICAD_", "BILLET_", "SHOPCRAFT_"};

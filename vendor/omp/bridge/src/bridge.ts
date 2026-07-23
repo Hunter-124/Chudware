@@ -20,9 +20,12 @@
  * auth_list_providers | auth_state{provider?} | auth_validate_key{provider,apiKey} |
  * auth_set_key{provider,apiKey} | auth_remove_key{provider,account?} |
  * auth_logout{provider,account?} | auth_begin_oauth{provider} | auth_oauth_poll{handle} |
- * auth_oauth_manual{handle,code} | auth_oauth_cancel{handle}. Auth/model/cost methods are
- * implemented in the sibling json.ts/models.ts/auth-context.ts/oauth-flow.ts modules and wired
- * in through dispatch() below; see those files for the OMP surface each one reuses.
+ * auth_oauth_manual{handle,code} | auth_oauth_cancel{handle} | memory_remember{root,content,
+ * kind?,source?,importance?} | memory_recall{root,query,limit?,tokenBudget?,kind?} |
+ * memory_stats{root} | compact{messages,keepRecentTokens?,priorArchive?,mode?}. Auth/model/
+ * cost methods are implemented in the sibling json.ts/models.ts/auth-context.ts/oauth-flow.ts
+ * modules; memory_* and compact live in memory.ts/compact.ts. All are wired in through dispatch()
+ * below; see those files for the OMP surface each one reuses.
  *
  * NOTE: `stream().result()` resolves (does not throw) on provider HTTP errors — the error is
  * embedded in the returned AssistantMessage (stopReason:"error", errorStatus, errorMessage).
@@ -43,7 +46,9 @@ import {
 	handleAuthState,
 	handleAuthValidateKey,
 } from "./auth-context";
+import { handleCompact } from "./compact";
 import { asObject, str, type Json } from "./json";
+import { handleMemoryRecall, handleMemoryRemember, handleMemoryStats } from "./memory";
 import { handleCostSummary, handleModelsList, modelInfo, resolveModel, type ProviderId } from "./models";
 import { handleAuthBeginOAuth, handleAuthOAuthCancel, handleAuthOAuthManual, handleAuthOAuthPoll } from "./oauth-flow";
 
@@ -187,6 +192,14 @@ async function dispatch(method: string, params: Json): Promise<Json> {
 			return handleAuthOAuthManual(params);
 		case "auth_oauth_cancel":
 			return handleAuthOAuthCancel(params);
+		case "memory_remember":
+			return handleMemoryRemember(params);
+		case "memory_recall":
+			return handleMemoryRecall(params);
+		case "memory_stats":
+			return handleMemoryStats(params);
+		case "compact":
+			return handleCompact(params);
 		default:
 			throw new Error(`unknown method: ${method}`);
 	}

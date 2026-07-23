@@ -11,6 +11,8 @@
       "dependencies": {
         "@oh-my-pi/pi-ai": "workspace:*",
         "@oh-my-pi/pi-catalog": "workspace:*",
+        "@oh-my-pi/pi-mnemopi": "workspace:*",
+        "@oh-my-pi/snapcompact": "workspace:*",
       },
     },
     "packages/ai": {

@@ -3,10 +3,12 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "CAD's bun sidecar that reuses OMP (oh-my-pi) subsystems verbatim (providers now; memory + snapcompact next) over a newline-delimited JSON-RPC stdio protocol. Not vendored — preserved across `scripts/vendor_omp.py` updates.",
+  "description": "CAD's bun sidecar that reuses OMP (oh-my-pi) subsystems verbatim (providers, memory, snapcompact) over a newline-delimited JSON-RPC stdio protocol. Not vendored — preserved across `scripts/vendor_omp.py` updates.",
   "main": "src/bridge.ts",
   "dependencies": {
     "@oh-my-pi/pi-ai": "workspace:*",
-    "@oh-my-pi/pi-catalog": "workspace:*"
+    "@oh-my-pi/pi-catalog": "workspace:*",
+    "@oh-my-pi/pi-mnemopi": "workspace:*",
+    "@oh-my-pi/snapcompact": "workspace:*"
   }
 }

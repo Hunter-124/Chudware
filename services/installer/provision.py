@@ -47,8 +47,13 @@ REQUIREMENTS = REPO / "requirements.txt"
 APP_PACKAGES = ("engine", "mcp_server", "agent", "installer")
 # Nested packages under services/ that the engine worker imports as services.X
 # (e.g. services.plm.worker_rpc for the PLM hub). Without these, plm_*/git_*
-# methods never register and the PLM tab sits on "Loading…".
-SERVICE_PACKAGES = ("plm", "dag", "browser", "deliverables", "ipc", "serving", "verify")
+# methods never register and the PLM tab sits on "Loading…". parts/reveng/sim
+# are the worker's own _register() tables; vision backs reveng status probes.
+SERVICE_PACKAGES = ("plm", "dag", "browser", "deliverables", "ipc", "serving", "verify",
+                    "parts", "reveng", "sim", "vision")
+# Top-level modules the worker needs at import time: worker_main itself (the
+# spawned module), paths (hard import), kernel_exec (run_model).
+SERVICE_MODULES = ("worker_main.py", "paths.py", "kernel_exec.py")
 STAMP = paths.RUNTIME / ".ready.json"
 
 
@@ -272,6 +277,10 @@ def ensure_app_code(src: Path = REPO) -> Path:
             s = services_src / name
             if s.exists():
                 shutil.copytree(s, services_dst / name, dirs_exist_ok=True, ignore=ignore)
+        for mod in SERVICE_MODULES:
+            s = services_src / mod
+            if s.exists():
+                shutil.copy2(s, services_dst / mod)
         # services.agent is also the top-level `agent` package (junction). Mirror it
         # under services/ so `from services.agent…` works without monorepo layout.
         agent_src = src / "agent" if (src / "agent").exists() else services_src / "agent"

@@ -26,13 +26,84 @@ carry a trailing ``:selector`` (design ported from the oh-my-pi read tool):
 Documents (.pdf/.docx/.pptx/.xlsx/.xlsm/.csv/.doc) route through the FROZEN
 ``office_tools.extract_office`` reader and are then paginated identically, so a 400-page PDF
 never floods context either.
+
+SCOPING (the "limited cases" the base tooling is deliberately narrowed for):
+  * A fixed, always-on credential-directory block applies to EVERY tool below (read and
+    write alike) — ~/.ssh, ~/.aws, ~/.gnupg, cloud CLI credential stores, .netrc, etc. are
+    refused outright regardless of any allow-list or env override; see ``_sensitive_block``.
+  * ``CHUDWARE_FS_ROOT`` (unset by default = no jail, matches historical behavior) opts a
+    caller into a workspace jail for the WRITE-class tools (fs_write, fs_edit, run_shell's
+    cwd): paths outside that root are refused. The DAG/mission runner sets this to the
+    active project directory before dispatching a role so a role acting "like an engineer"
+    stays inside the project it was asked to work in, not the whole filesystem.
+    ``CHUDWARE_FS_ALLOW_OUTSIDE_ROOT=1`` is the explicit escape hatch for a legitimate
+    cross-root need (e.g. importing a downloaded part from ~/Downloads).
+  * Read tools (fs_read/fs_list/fs_glob/fs_grep) are never root-jailed — only the
+    credential-directory block applies — since browsing/reading elsewhere on disk is the
+    normal "look things up like an engineer would" case and carries far less risk than a
+    write or an arbitrary shell command.
 """
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from pathlib import Path
 from typing import Any, Optional
+
+# --------------------------------------------------------------------------- scoping
+
+# Directories that are NEVER readable/writable/listable through these tools, no matter
+# what allow-list or CHUDWARE_FS_ROOT policy is active — credentials/keys an AI role has
+# no legitimate reason to touch. Matched as "resolved path is this dir or lives under it".
+_SENSITIVE_DIR_NAMES = (
+    ".ssh", ".aws", ".gnupg", ".gcloud", ".azure", ".kube", ".docker",
+)
+_SENSITIVE_FILE_NAMES = (
+    ".netrc", ".git-credentials", ".npmrc", ".pypirc", "id_rsa", "id_ed25519",
+)
+
+
+def _sensitive_block(raw_path: str) -> Optional[dict]:
+    """Refuse if *raw_path* resolves into a credential store. Applies to every fs_*
+    tool (read included) regardless of allow-list/root policy — see module docstring."""
+    try:
+        resolved = Path(raw_path).expanduser().resolve(strict=False)
+    except Exception:  # noqa: BLE001
+        return None  # unresolvable path — let the normal not_found path report it
+    parts = resolved.parts
+    if resolved.name in _SENSITIVE_FILE_NAMES or any(p in _SENSITIVE_DIR_NAMES for p in parts):
+        return _err("blocked_sensitive_path",
+                    f"{raw_path} resolves into a credential/key location and is never "
+                    "readable or writable through these tools")
+    return None
+
+
+def _workspace_root() -> Optional[Path]:
+    """The active jail root for write-class tools, or None (no jail — default)."""
+    raw = os.environ.get("CHUDWARE_FS_ROOT", "").strip()
+    if not raw:
+        return None
+    return Path(raw).expanduser().resolve(strict=False)
+
+
+def _root_block(raw_path: str) -> Optional[dict]:
+    """Refuse if *raw_path* falls outside the active CHUDWARE_FS_ROOT jail. Only called
+    from write-class tools (fs_write/fs_edit/run_shell's cwd) — see module docstring."""
+    if os.environ.get("CHUDWARE_FS_ALLOW_OUTSIDE_ROOT", "").strip().lower() in ("1", "true", "yes"):
+        return None
+    root = _workspace_root()
+    if root is None:
+        return None
+    try:
+        resolved = Path(raw_path).expanduser().resolve(strict=False)
+    except Exception:  # noqa: BLE001
+        return None
+    if resolved == root or root in resolved.parents:
+        return None
+    return _err("outside_workspace_root",
+                f"{raw_path} resolves outside the active project root ({root}); set "
+                "CHUDWARE_FS_ALLOW_OUTSIDE_ROOT=1 if this write is deliberately cross-root")
 
 # --------------------------------------------------------------------------- envelope
 
@@ -311,6 +382,9 @@ def register_fs_tools(mcp) -> None:
         Returns {ok, path, kind, text, total_lines, shown_lines, truncated, next_offset?}.
         """
         clean, sel = _split_path_selector(path)
+        blocked = _sensitive_block(clean)
+        if blocked:
+            return blocked
         ranges = _parse_ranges(sel) if sel else None
         if sel and sel.lower().find("raw") >= 0:
             raw = True
@@ -327,6 +401,9 @@ def register_fs_tools(mcp) -> None:
     def fs_list(path: str = ".", show_hidden: bool = False) -> dict:
         """List a directory's entries (name, dir flag, size). Capped at 1000 entries.
         Risk: read."""
+        blocked = _sensitive_block(path)
+        if blocked:
+            return blocked
         p = Path(path)
         if not p.exists():
             return _err("not_found", f"no such path: {path}")
@@ -338,6 +415,9 @@ def register_fs_tools(mcp) -> None:
     def fs_glob(pattern: str, path: str = ".", limit: int = 0) -> dict:
         """Find paths matching a glob (e.g. 'src/**/*.py'). Returns matches newest-first.
         Capped at 1000. Risk: read."""
+        blocked = _sensitive_block(path)
+        if blocked:
+            return blocked
         base = Path(path)
         if not base.exists():
             return _err("not_found", f"no such path: {path}")
@@ -359,6 +439,9 @@ def register_fs_tools(mcp) -> None:
                 max_matches: int = 0) -> dict:
         """Regex-search files under *path* (optionally filtered by *glob*, e.g. '*.py').
         Returns {file, line, text} matches, capped at 500. Risk: read."""
+        blocked = _sensitive_block(path)
+        if blocked:
+            return blocked
         try:
             rx = re.compile(pattern, re.I if ignore_case else 0)
         except re.error as exc:
@@ -399,6 +482,9 @@ def register_fs_tools(mcp) -> None:
     def fs_write(path: str, content: str, make_dirs: bool = True) -> dict:
         """Create or OVERWRITE a text file with *content*. Parent dirs are created by
         default. Returns {ok, path, bytes}. Risk: write."""
+        blocked = _sensitive_block(path) or _root_block(path)
+        if blocked:
+            return blocked
         p = Path(path)
         try:
             if make_dirs and p.parent and not p.parent.exists():
@@ -414,6 +500,9 @@ def register_fs_tools(mcp) -> None:
         """Replace text in an existing file. By default *old* MUST occur exactly once
         (a safe, unambiguous edit); set replace_all=True to replace every occurrence.
         Returns {ok, path, replacements}. Risk: write."""
+        blocked = _sensitive_block(path) or _root_block(path)
+        if blocked:
+            return blocked
         p = Path(path)
         if not p.is_file():
             return _err("not_found", f"no such file: {path}")
@@ -446,7 +535,11 @@ def register_shell_tools(mcp) -> None:
         """Run a shell command and capture combined stdout+stderr (byte-capped).
 
         Refuses obviously destructive commands (rm -rf /, mkfs, dd of=/dev/*, fork bombs,
-        shutdown/reboot, …). Output over ~96 KB is truncated. Returns
+        shutdown/reboot, …). When CHUDWARE_FS_ROOT is set, cwd defaults to and is jailed to
+        that root (a command that ``cd``s or uses absolute paths can still reach outside it
+        — this is a starting-directory jail, not a full sandbox; the destructive-pattern
+        guard above is the other half of the safety story, not a substitute for one).
+        Output over ~96 KB is truncated. Returns
         {ok, exit_code, output, truncated, timed_out}. Risk: write.
         """
         if not command.strip():
@@ -457,9 +550,14 @@ def register_shell_tools(mcp) -> None:
                             "command matches a destructive-pattern guard and was refused")
         timeout = max(1, min(int(timeout_s) if timeout_s else SHELL_DEFAULT_TIMEOUT_S,
                              SHELL_MAX_TIMEOUT_S))
-        workdir = cwd or None
+        root = _workspace_root()
+        workdir = cwd or (str(root) if root else None)
         if workdir and not Path(workdir).is_dir():
             return _err("bad_cwd", f"cwd is not a directory: {workdir}")
+        if workdir:
+            blocked = _sensitive_block(workdir) or _root_block(workdir)
+            if blocked:
+                return blocked
         try:
             proc = subprocess.run(
                 command, shell=True, cwd=workdir, capture_output=True,

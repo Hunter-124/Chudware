@@ -395,8 +395,18 @@ class RoleCard:
         After this, ``registry.is_allowed(name)`` is False for any tool outside the
         role's scope, and a dispatch of such a tool returns the contract-shaped
         refusal instead of running.
+
+        Unions in :data:`copilot_mode_tools.SHARED_DEFAULT_TOOLS` (research_web_search,
+        ask_user, doc lifecycle, fs_read/fs_glob/fs_grep, …) — the copilot-mode layer
+        already treats that floor as always-available, but ``set_policy`` is the actual
+        dispatch gate and previously only saw a role's own ``tool_allowlist``. Without
+        this union, any role card that doesn't explicitly list e.g. research_web_search
+        would have it offered by the mode layer yet REFUSED at dispatch — a silent
+        floor/enforcement mismatch, not an intentional restriction.
         """
-        tokens = self.allow_tokens
+        from services.agent.copilot_mode_tools import SHARED_DEFAULT_TOOLS  # noqa: PLC0415
+
+        tokens = list(dict.fromkeys([*self.allow_tokens, *SHARED_DEFAULT_TOOLS]))
         registry.set_policy(allow=tokens)
         return tokens
 

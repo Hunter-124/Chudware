@@ -75,6 +75,7 @@ static void drawMsgMetaRow(const ui::Fonts& fonts, const char* name, const ImVec
                            double ts) {
     const ui::AdaptiveSurface& surf = chatSurf();
     const std::string age = chatAgeLabel(ts);
+    if ((!name || !name[0]) && age.empty()) return;   // legacy turn, no model — no blank row
     if (name && name[0]) {
         ImGui::PushFont(fonts.medium);
         ImGui::TextColored(nameCol, "%s", name);

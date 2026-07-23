@@ -37,6 +37,7 @@
 #include "ui/copilot/copilot.h"
 #include "ui_theme.h"
 #include "ui/leaderboard_ui.h"
+#include "ui/ai/active_work.h"
 
 namespace ui {
 
@@ -1550,7 +1551,9 @@ static void drawDagPane(AppState& st, bool /*busy*/) {
     ImGui::SameLine();
     if (viewChip("Session Plan", s_ai.dagView == 1)) s_ai.dagView = 1;
     ImGui::SameLine();
-    if (viewChip("Leaderboard", s_ai.dagView == 2)) s_ai.dagView = 2;
+    if (viewChip("Active Work", s_ai.dagView == 2)) s_ai.dagView = 2;
+    ImGui::SameLine();
+    if (viewChip("Leaderboard", s_ai.dagView == 3)) s_ai.dagView = 3;
     ImGui::SameLine();
     ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
                          std::max(0.0f, ImGui::GetContentRegionAvail().x - 84.0f * S));
@@ -1561,7 +1564,7 @@ static void drawDagPane(AppState& st, bool /*busy*/) {
         ImGui::SetTooltip("Show / hide the AI workflow options pane.");
     ImGui::Spacing();
 
-    if (s_ai.dagView == 2) {
+    if (s_ai.dagView == 3) {
         if (!s_ai.lbLoaded) {
             s_ai.lb = ui::leaderboard::load();
             s_ai.lbLoaded = true;
@@ -1572,6 +1575,9 @@ static void drawDagPane(AppState& st, bool /*busy*/) {
             s_ai.lb = ui::leaderboard::load();
             s_ai.lbLoaded = true;
         }
+    } else if (s_ai.dagView == 2) {
+        // Active Work: live grid of the docs agents are creating/editing right now.
+        drawActiveWorkView(st);
     } else if (s_ai.dagView == 0) {
         // Phase 2 (M9/M10): the LIVE agent-execution DAG.
         drawAgentWorkflowView(st);
@@ -1594,6 +1600,7 @@ void drawAiWorkspace(AppState& st) {
     // Copilot column is not drawn (this hub replaces it in the AI workspace).
     refreshModelAvailability(st, false);
     chatWorkspaceSync(st);
+    activeWorkPump(st);  // drive at most one Active Work preview render per frame (thumb queue)
 
     // M8 plumbing: bind the Session Plan scope to the active chat session's id (see the TODO in
     // drawDagView — the run filter itself waits on Phase-2 session->run_id data).

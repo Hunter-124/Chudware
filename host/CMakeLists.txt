@@ -232,6 +232,8 @@ set(BILLET_CORE_SOURCES
   src/ui/plm/graph_thumbs.cpp   # PLM Graph grid-view iso thumbnails (.plm/thumbs cache)
   src/ui/plm_overview.cpp        # compact PLM overview (left manager tab, left of Explorer)
   src/ui/ai/ai_workspace.cpp
+  src/ui/ai/active_work.cpp     # Active Work: live grid of agent-modified docs + op tickers
+  src/ui/ai/ai_prefs.cpp        # AI workspace UI prefs (verbosity / follow / previews)
   src/ui/reveng/reveng_workspace.cpp  # RE-03 Reverse Engineering workspace shell
   src/ui/firmware/fw_workspace.cpp    # T-FIN5 Firmware workspace (projects/build/emulation/trace)
   src/ui/reveng/dim_review.cpp        # RE-22 dim-confirm review + deviation panels

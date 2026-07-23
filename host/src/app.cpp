@@ -107,6 +107,7 @@ inline void wasmBootDom(const char *msg) {
 #include "core/cpp_core.h" // sampling-profiler RPCs (prof_start/prof_stop) via libaicad
 #include "core/jobs.h"
 #include "ui/ai/ai_workspace.h" // AI workspace full-body hub (sessions + DAG + chat + settings)
+#include "ui/ai/active_work.h" // Active Work view live op feed
 #include "ui/appearance_common.h" // Appearance tab: MaterialPreset table (kMaterials) for presets
 #include "ui/cam/cam_panel.h" // CAM: manufacturing workspace (toolpaths / post / sim)
 #include "ui/config_panel.h" // Configurations (SolidWorks ConfigurationManager)
@@ -3774,6 +3775,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
               // turn). GL-thread only; the store is a plain static in
               // ai_workspace.cpp.
               ui::feedAgentDagEvent(orchKind, data);
+              ui::activeWorkFeedEvent(orchKind, data);
               // Fold the event into the running turn's inline activity timeline
               // so the conversation transparently shows what the AI is
               // doing/thinking.

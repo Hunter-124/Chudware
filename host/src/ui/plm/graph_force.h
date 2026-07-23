@@ -19,7 +19,8 @@
 //   4. Group / community pull — optional per-node group id; each free node is
 //      pulled toward its group's centroid (O(N) per substep). Used by the UI
 //      to cluster densely-connected components without O(N²) all-pairs work.
-//   5. Collision            — radius-aware non-overlap (d3-force collide analogue).
+//   5. Collision            — radius-aware non-overlap (d3-force collide
+//   analogue).
 //      After integration, 3 Gauss-Seidel passes push overlapping discs apart
 //      along their separation (cooling-independent). Uses its own spatial grid
 //      sized by max collDist so pairs collide even when outside the Coulomb
@@ -33,9 +34,9 @@
 // (step() early-outs).
 //
 // Units: positions/radii/rest lengths are abstract graph-space pixels. Time is
-// seconds. Defaults target a pleasant d3-force-like feel for CAD project graphs.
-// Deterministic: no unseeded RNG; index-hashed micro-jitter only when two nodes
-// coincide exactly.
+// seconds. Defaults target a pleasant d3-force-like feel for CAD project
+// graphs. Deterministic: no unseeded RNG; index-hashed micro-jitter only when
+// two nodes coincide exactly.
 //
 // Complexity notes (N nodes, E edges):
 //   rebuild grid  O(N)   (once for repulsion, once per collision pass)
@@ -53,144 +54,166 @@ namespace ui {
 
 class ForceGraph {
 public:
-    ForceGraph();
-    ~ForceGraph() = default;
+  ForceGraph();
+  ~ForceGraph() = default;
 
-    ForceGraph(const ForceGraph&) = delete;
-    ForceGraph& operator=(const ForceGraph&) = delete;
+  ForceGraph(const ForceGraph &) = delete;
+  ForceGraph &operator=(const ForceGraph &) = delete;
 
-    // Drop every node and edge; reset cooling to a cold start.
-    void clear();
+  // Drop every node and edge; reset cooling to a cold start.
+  void clear();
 
-    // Append a node at (x, y) with the given collision/radius weight.
-    // Returns the stable node index (0 .. nodeCount()-1). Radius feeds both
-    // the charge magnitude (∝ radius) and the minimum separation floor.
-    int addNode(float x, float y, float radius);
+  // Append a node at (x, y) with the given collision/radius weight.
+  // Returns the stable node index (0 .. nodeCount()-1). Radius feeds both
+  // the charge magnitude (∝ radius) and the minimum separation floor.
+  int addNode(float x, float y, float radius);
+  // 3D variant — z is ignored unless set3D(true).
+  int addNode(float x, float y, float z, float radius);
 
-    // Drop all edges; nodes and positions are kept.
-    void removeAllEdges();
+  // Optional third dimension. When enabled, every force (repulsion,
+  // springs, centering, group pull, collision) operates on (x, y, z) and
+  // the spatial hash gains a z axis (27-cell neighborhood). Off by
+  // default — 2D mode is byte-identical to the original engine.
+  void set3D(bool on);
+  bool is3D() const;
 
-    // Spring between nodes a and b. restLen <= 0 uses the default link distance
-    // (plus radii). strength is the Hooke coefficient (typical 0.2 … 1.0).
-    // Duplicate undirected pairs are ignored (first wins). Self-edges ignored.
-    // Prefer restLen >= ra+rb+collisionPad so springs do not fight collision.
-    void addEdge(int a, int b, float restLen, float strength);
+  // Drop all edges; nodes and positions are kept.
+  void removeAllEdges();
 
-    // Advance the simulation by real frame dt (seconds). Internally runs a
-    // fixed number of substeps so behavior is independent of frame rate.
-    // Near-free when settled().
-    void step(float dt);
+  // Spring between nodes a and b. restLen <= 0 uses the default link distance
+  // (plus radii). strength is the Hooke coefficient (typical 0.2 … 1.0).
+  // Duplicate undirected pairs are ignored (first wins). Self-edges ignored.
+  // Prefer restLen >= ra+rb+collisionPad so springs do not fight collision.
+  void addEdge(int a, int b, float restLen, float strength);
 
-    // Re-energize after a structural change (add/remove nodes or edges, bulk
-    // setPos). alpha is clamped to (alphaMin, 1].
-    void reheat(float alpha = 0.3f);
+  // Advance the simulation by real frame dt (seconds). Internally runs a
+  // fixed number of substeps so behavior is independent of frame rate.
+  // Near-free when settled().
+  void step(float dt);
 
-    // True when cooling has reached the settle floor — layout is effectively still.
-    bool settled() const;
+  // Re-energize after a structural change (add/remove nodes or edges, bulk
+  // setPos). alpha is clamped to (alphaMin, 1].
+  void reheat(float alpha = 0.3f);
 
-    float alpha() const;
+  // True when cooling has reached the settle floor — layout is effectively
+  // still.
+  bool settled() const;
 
-    // Pin / unpin. Pinned nodes ignore forces (infinite mass); drag them with setPos.
-    void setPinned(int i, bool pinned);
-    bool isPinned(int i) const;
+  float alpha() const;
 
-    // Teleport node i (e.g. preserve a seed layout or follow a pointer drag).
-    // Clears velocity. No-op for out-of-range indices. NaN inputs ignored.
-    void setPos(int i, float x, float y);
+  // Pin / unpin. Pinned nodes ignore forces (infinite mass); drag them with
+  // setPos.
+  void setPinned(int i, bool pinned);
+  bool isPinned(int i) const;
 
-    int   nodeCount() const;
-    float x(int i) const;
-    float y(int i) const;
+  // Teleport node i (e.g. preserve a seed layout or follow a pointer drag).
+  // Clears velocity. No-op for out-of-range indices. NaN inputs ignored.
+  void setPos(int i, float x, float y);
+  // Depth access (3D mode). setZ clears the z velocity.
+  float z(int i) const;
+  void setZ(int i, float z);
 
-    // Tuning knobs (sane defaults applied in the ctor).
-    void setRepulsion(float k);     // charge strength (default 900)
-    void setCentering(float k);     // gravity toward centroid (default 0.02)
-    void setLinkDistance(float d);  // default rest-length scale (default 60)
-    void setAlphaDecay(float d);    // cooling rate per substep (default ~0.023)
-    // Radius-aware non-overlap (d3 collide analogue). strength scales how hard
-    // each collision pass separates overlap (default 11 ≈ near-hard at ~0.1×
-    // blend per unit strength, clamped to 1); pad is the extra gap (default 3).
-    void setCollision(float strength, float pad);
-    // Velocity retain fraction after each substep integrate (default 0.6 → keep
-    // 40% of prior velocity). Lower = snappier settle; higher = more glide.
-    // Clamped to (0, 1].
-    void setVelocityDecay(float d);
-    // Community / component clustering. groupId < 0 means "no group".
-    // Pull strength is cooling-scaled like centering (default 0 = off).
-    void setGroup(int i, int groupId);
-    void setGroupPull(float k);     // default 0; typical 0.04 … 0.12
+  int nodeCount() const;
+  float x(int i) const;
+  float y(int i) const;
+
+  // Tuning knobs (sane defaults applied in the ctor).
+  void setRepulsion(float k);    // charge strength (default 900)
+  void setCentering(float k);    // gravity toward centroid (default 0.02)
+  void setLinkDistance(float d); // default rest-length scale (default 60)
+  void setAlphaDecay(float d);   // cooling rate per substep (default ~0.023)
+  // Radius-aware non-overlap (d3 collide analogue). strength scales how hard
+  // each collision pass separates overlap (default 11 ≈ near-hard at ~0.1×
+  // blend per unit strength, clamped to 1); pad is the extra gap (default 3).
+  void setCollision(float strength, float pad);
+  // Velocity retain fraction after each substep integrate (default 0.6 → keep
+  // 40% of prior velocity). Lower = snappier settle; higher = more glide.
+  // Clamped to (0, 1].
+  void setVelocityDecay(float d);
+  // Community / component clustering. groupId < 0 means "no group".
+  // Pull strength is cooling-scaled like centering (default 0 = off).
+  void setGroup(int i, int groupId);
+  void setGroupPull(float k); // default 0; typical 0.04 … 0.12
 
 private:
-    struct Node {
-        float x = 0.f, y = 0.f;
-        float vx = 0.f, vy = 0.f;
-        float radius = 14.f;
-        float charge = 1.f;   // ∝ radius; used as q_i in repulsion
-        bool  pinned = false;
-        int   group = -1;     // community id for group-pull; -1 = none
-    };
+  struct Node {
+    float x = 0.f, y = 0.f, z = 0.f;
+    float vx = 0.f, vy = 0.f, vz = 0.f;
+    float radius = 14.f;
+    float charge = 1.f; // ∝ radius; used as q_i in repulsion
+    bool pinned = false;
+    int group = -1; // community id for group-pull; -1 = none
+  };
 
-    struct Edge {
-        int   a = 0, b = 0;
-        float restLen = 60.f;
-        float strength = 0.5f;
-    };
+  struct Edge {
+    int a = 0, b = 0;
+    float restLen = 60.f;
+    float strength = 0.5f;
+  };
 
-    // Spatial hash: uniform grid over the current AABB, cell size = query cutoff.
-    // Singly-linked lists per cell (head[cell] → node, next[node] → next).
-    struct Grid {
-        float originX = 0.f, originY = 0.f;
-        float cell = 1.f;
-        int   cols = 0, rows = 0;
-        std::vector<int> head;
-        std::vector<int> next;
-    };
+  // Spatial hash: uniform grid over the current AABB, cell size = query cutoff.
+  // Singly-linked lists per cell (head[cell] → node, next[node] → next).
+  // 3D mode adds a z axis (slices > 1); 2D mode keeps slices == 1.
+  struct Grid {
+    float originX = 0.f, originY = 0.f, originZ = 0.f;
+    float cell = 1.f;
+    int cols = 0, rows = 0, slices = 1;
+    std::vector<int> head;
+    std::vector<int> next;
+  };
 
-    void substep(float h);
-    void applyRepulsion(std::vector<float>& fx, std::vector<float>& fy);
-    void applySprings(std::vector<float>& fx, std::vector<float>& fy);
-    void applyCentering(std::vector<float>& fx, std::vector<float>& fy);
-    void applyGroupPull(std::vector<float>& fx, std::vector<float>& fy);
-    // Multi-pass position/velocity non-overlap using a collDist-sized grid.
-    void resolveCollisions();
-    void rebuildGrid(float cellSize);
-    bool validNode(int i) const;
-    static float clampf(float v, float lo, float hi);
-    static bool  finitef(float v);
-    static std::uint64_t packEdge(int a, int b);
+  void substep(float h);
+  void applyRepulsion(std::vector<float> &fx, std::vector<float> &fy,
+                      std::vector<float> &fz);
+  void applySprings(std::vector<float> &fx, std::vector<float> &fy,
+                    std::vector<float> &fz);
+  void applyCentering(std::vector<float> &fx, std::vector<float> &fy,
+                      std::vector<float> &fz);
+  void applyGroupPull(std::vector<float> &fx, std::vector<float> &fy,
+                      std::vector<float> &fz);
+  // Multi-pass position/velocity non-overlap using a collDist-sized grid.
+  void resolveCollisions();
+  void rebuildGrid(float cellSize);
+  bool validNode(int i) const;
+  static float clampf(float v, float lo, float hi);
+  static bool finitef(float v);
+  static std::uint64_t packEdge(int a, int b);
 
-    std::vector<Node> nodes_;
-    std::vector<Edge> edges_;
-    // Sorted undirected edge keys ((min<<32)|max) for O(log E) duplicate reject.
-    std::vector<std::uint64_t> edgeKeys_;
+  std::vector<Node> nodes_;
+  std::vector<Edge> edges_;
+  // Sorted undirected edge keys ((min<<32)|max) for O(log E) duplicate reject.
+  std::vector<std::uint64_t> edgeKeys_;
 
-    Grid grid_;
+  Grid grid_;
 
-    // Force accumulators reused across substeps (sized to N).
-    std::vector<float> fx_;
-    std::vector<float> fy_;
+  // Force accumulators reused across substeps (sized to N).
+  std::vector<float> fx_;
+  std::vector<float> fy_;
+  std::vector<float> fz_;
 
-    float alpha_ = 1.f;
-    float alphaMin_ = 0.001f;
-    // ≈ 1 - pow(alphaMin, 1/300) — settles in ~300 substeps from alpha=1.
-    float alphaDecay_ = 0.0228f;
-    float velocityDecay_ = 0.6f;   // retain 40% of velocity each substep
+  bool threeD_ = false;
 
-    float repulsion_ = 900.f;
-    float centering_ = 0.02f;
-    float linkDistance_ = 60.f;
-    float cutoff_ = 96.f;          // repulsion cutoff (≈ 1.6 × default link)
-    float collStrength_ = 11.f;    // collision separation hardness (~10–12 hard)
-    float collPad_ = 3.f;          // extra gap kept between node radii
-    float groupPull_ = 0.f;        // pull toward per-group centroid (0 = off)
+  float alpha_ = 1.f;
+  float alphaMin_ = 0.001f;
+  // ≈ 1 - pow(alphaMin, 1/300) — settles in ~300 substeps from alpha=1.
+  float alphaDecay_ = 0.0228f;
+  float velocityDecay_ = 0.6f; // retain 40% of velocity each substep
 
-    // Fixed substep size and max substeps drained per step() call.
-    static constexpr float kSubstep = 1.f / 60.f;
-    static constexpr int   kMaxSubsteps = 4;
-    // Gauss-Seidel collision passes after integrate (positions update between).
-    static constexpr int   kCollIterations = 3;
+  float repulsion_ = 900.f;
+  float centering_ = 0.02f;
+  float linkDistance_ = 60.f;
+  float cutoff_ = 96.f;       // repulsion cutoff (≈ 1.6 × default link)
+  float collStrength_ = 11.f; // collision separation hardness (~10–12 hard)
+  float collPad_ = 3.f;       // extra gap kept between node radii
+  float groupPull_ = 0.f;     // pull toward per-group centroid (0 = off)
 
-    float dtAcc_ = 0.f;
+  // Fixed substep size and max substeps drained per step() call.
+  static constexpr float kSubstep = 1.f / 60.f;
+  static constexpr int kMaxSubsteps = 4;
+  // Gauss-Seidel collision passes after integrate (positions update between).
+  static constexpr int kCollIterations = 3;
+
+  float dtAcc_ = 0.f;
 };
 
-}  // namespace ui
+} // namespace ui

@@ -9,7 +9,7 @@ Two layers of proof (per the RE-14 acceptance):
      coaxial with a recovered feature (hole/turned base) is dropped as a duplicate;
      confidence and axis gates fire.
 
-  2. ENGINE-BACKED — skips cleanly when libaicad isn't staged (mirrors
+  2. ENGINE-BACKED — skips cleanly when libchudware isn't staged (mirrors
      test_recon_tools.py's skipif). A plate with a large convex Z cylinder boss: the boss
      radius > pass-5's fillet bound and it is not a bore, so every frozen pass leaves it
      `unclaimed`. Reverse-engineered WITHOUT hints it stays unrecovered; WITH the fit hint
@@ -122,7 +122,7 @@ def test_fit_coaxial_with_a_recovered_feature_is_a_duplicate():
 
 _needs_engine = pytest.mark.skipif(
     not cb.available(),
-    reason="libaicad not staged (build the C++ core); engine-backed hint test unavailable",
+    reason="libchudware not staged (build the C++ core); engine-backed hint test unavailable",
 )
 
 
@@ -180,7 +180,7 @@ def test_hinted_match_pct_ge_unhinted_on_a_cylinder_boss():
     # By construction (hints route through eval_compare keep-or-revert): hinted never worse.
     assert mh >= mu - 1e-6, (mh, mu)
     # And on this fixture the boss is real unrecovered volume, so the hint should WIN.
-    # Measured on the staged libaicad: unhinted 85.77 -> hinted 95.26 with segment_fit's
+    # Measured on the staged libchudware: unhinted 85.77 -> hinted 95.26 with segment_fit's
     # REAL origin=[0,0,0] convention (boss base defaults to the origin plane, so along-axis
     # placement is approximate — it still recovers most of the protrusion volume). A base-
     # aligned origin would reach 100.0; the approximation is a known, reported limitation.
@@ -195,7 +195,7 @@ if __name__ == "__main__":
     failed = 0
     for fn in fns:
         if not cb.available() and "hinted" in fn.__name__:
-            print(f"[SKIP] {fn.__name__} (libaicad not staged)")
+            print(f"[SKIP] {fn.__name__} (libchudware not staged)")
             continue
         try:
             fn()

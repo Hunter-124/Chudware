@@ -1,7 +1,7 @@
 """fea_static simsuite — shared geometry + study case library.
 
 Builds a diverse fleet of parts through REAL engine ops (services.mcp.core_bridge,
-in-process, AI_CAD_ENGINE_DAEMON=0), meshes them via ``sim_mesh`` (tet4 / tet10 /
+in-process, CHUDWARE_ENGINE_DAEMON=0), meshes them via ``sim_mesh`` (tet4 / tet10 /
 structured hex8) and solves linear statics via ``sim_run_static`` with an INLINE
 mesh (so the mesh-quality metrics, the solved nodal fields and the timings all
 refer to one and the same mesh).
@@ -45,7 +45,7 @@ import time
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
-os.environ.setdefault("AI_CAD_ENGINE_DAEMON", "0")
+os.environ.setdefault("CHUDWARE_ENGINE_DAEMON", "0")
 
 # Explicit material dict (never a named preset) so the analytic reference and the
 # solver always agree on the exact properties. density is g/cm³ (steel 7.85).
@@ -65,11 +65,11 @@ def solver_available() -> tuple[bool, str]:
     try:
         cb = _cb()
         if not cb.available():
-            return False, "core_bridge reports libaicad not loadable"
+            return False, "core_bridge reports libchudware not loadable"
         r = cb.call("sim_run_static", {"study": {}})
     except Exception as exc:  # noqa: BLE001 — CoreError('unknown method') or load fail
         if "unknown method" in str(exc):
-            return False, f"staged libaicad.so lacks sim_run_static (no AICAD_WITH_NETGEN): {exc}"
+            return False, f"staged libchudware.so lacks sim_run_static (no CHUDWARE_WITH_NETGEN): {exc}"
         return False, f"engine probe failed: {exc}"
     # A reachable solver rejects the empty study IN-BAND (ok:false), never rc!=0.
     if isinstance(r, dict) and r.get("ok") is False:

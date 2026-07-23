@@ -12,9 +12,9 @@
 #include <TopoDS_Face.hxx>
 #include <TopoDS_Shape.hxx>
 
-#include "geom/plane.h"  // aicad::geom::SketchPlane — projection target frame
+#include "geom/plane.h"  // chudware::geom::SketchPlane — projection target frame
 
-namespace aicad::doc {
+namespace chudware::doc {
 
 // C1 — eval_compare. Shape-vs-shape comparison, the geometric ground truth the WS-C
 // reverse-engineering loop scores its rebuild against (precedent: doc_eval_symmetry's
@@ -43,7 +43,7 @@ nlohmann::json compare_shapes(const TopoDS_Shape& a, const TopoDS_Shape& b);
 
 // C2 — convert-entities primitive. Converts one PLANAR face's boundary wires into doc-schema
 // §3.1 sketch entities expressed in the face's own 2D plane frame (origin = area centroid,
-// axes/normal built via aicad::geom::SketchPlane::from(origin, normal) — the SAME convention
+// axes/normal built via chudware::geom::SketchPlane::from(origin, normal) — the SAME convention
 // resolve_sketch_plane's face-sketch branch uses, so a sketch authored from this output lands
 // exactly where "sketch on this face" would).
 //
@@ -80,11 +80,11 @@ struct ProjectedEntity {
     nlohmann::json entity;  // doc-schema §3.1 entity WITHOUT an id (caller assigns on insert)
 };
 std::vector<ProjectedEntity> project_edges_to_plane(const std::vector<TopoDS_Edge>& edges,
-                                                    const aicad::geom::SketchPlane& plane,
+                                                    const chudware::geom::SketchPlane& plane,
                                                     bool& any_approx);
 
 // All boundary edges of a face (every wire, outer + holes) — the edge set "Convert Entities on
 // a whole face" projects. Order follows OCCT's TopExp_Explorer edge traversal.
 std::vector<TopoDS_Edge> face_boundary_edges(const TopoDS_Face& face);
 
-}  // namespace aicad::doc
+}  // namespace chudware::doc

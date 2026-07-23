@@ -22,8 +22,8 @@
 #include "piping/schema.h"
 #include "piping/solve.h"
 
-using namespace aicad::piping;
-using aicad::pyutil::ojson;
+using namespace chudware::piping;
+using chudware::pyutil::ojson;
 
 static ojson single_pipe_doc() {
     ojson doc = new_piping("case1");

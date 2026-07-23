@@ -14,7 +14,7 @@
 
 #include "ecad/schema.h"
 
-namespace aicad::ecad {
+namespace chudware::ecad {
 
 using nlohmann::json;
 
@@ -1173,4 +1173,4 @@ json apply_ops(const json& doc, const json& ops) {
     return json{{"id_map", id_map}, {"warnings", warnings}, {"doc", working}};
 }
 
-}  // namespace aicad::ecad
+}  // namespace chudware::ecad

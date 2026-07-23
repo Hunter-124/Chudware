@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Convenience wrapper — canonical installer lives under packaging/linux/.
-# Installs Billet.desktop + hicolor icons into ~/.local/share (no root).
+# Installs Chudware.desktop + hicolor icons into ~/.local/share (no root).
 # One-shot after a Linux build so the taskbar / launcher / alt-tab show the
-# Billet icon (matches WM_CLASS=Billet set in host/src/app.cpp).
+# Chudware icon (matches WM_CLASS=Chudware set in host/src/app.cpp).
 #
 # Usage (from repo root):  scripts/install_desktop.sh
 set -euo pipefail

@@ -132,31 +132,31 @@ except ImportError:
 
 # ---------------------------------------------------------------------------
 # Sub-agent registry isolation (Phase 4, M11): services/agent/subagent_registry.py
-# is file-backed under ~/.local/share/AI-CAD/cache/subagents by default, and
+# is file-backed under ~/.local/share/Chudware/cache/subagents by default, and
 # DelegationTree.request_delegation registers a session on EVERY spawn — so any
 # delegation-exercising test would pollute the real user registry (and the GUI's
 # Sub-agents list) unless redirected. Session-scoped autouse: every test run gets
-# a throwaway registry dir. An explicitly pre-set AICAD_SUBAGENTS_DIR is honored.
+# a throwaway registry dir. An explicitly pre-set CHUDWARE_SUBAGENTS_DIR is honored.
 import pytest as _pytest
 
 
 @_pytest.fixture(autouse=True, scope="session")
 def _isolated_subagent_registry(tmp_path_factory):
-    if os.environ.get("AICAD_SUBAGENTS_DIR"):
+    if os.environ.get("CHUDWARE_SUBAGENTS_DIR"):
         yield
         return
     d = tmp_path_factory.mktemp("subagents")
-    os.environ["AICAD_SUBAGENTS_DIR"] = str(d)
+    os.environ["CHUDWARE_SUBAGENTS_DIR"] = str(d)
     try:
         yield
     finally:
-        os.environ.pop("AICAD_SUBAGENTS_DIR", None)
+        os.environ.pop("CHUDWARE_SUBAGENTS_DIR", None)
 
 
 # ---------------------------------------------------------------------------
 # `live` marker (Parts Library V2): tests that hit real vendor sites over the
 # network under a saved browser profile. Skipped by default; opt in with
-# `pytest --live` or AICAD_LIVE_TESTS=1.
+# `pytest --live` or CHUDWARE_LIVE_TESTS=1.
 
 def pytest_addoption(parser):
     try:
@@ -169,12 +169,12 @@ def pytest_addoption(parser):
 def pytest_configure(config):
     config.addinivalue_line(
         "markers",
-        "live: hits real vendor sites over the network; opt in with --live or AICAD_LIVE_TESTS=1",
+        "live: hits real vendor sites over the network; opt in with --live or CHUDWARE_LIVE_TESTS=1",
     )
 
 
 def _live_enabled(config) -> bool:
-    if os.environ.get("AICAD_LIVE_TESTS") == "1":
+    if os.environ.get("CHUDWARE_LIVE_TESTS") == "1":
         return True
     try:
         return bool(config.getoption("--live"))
@@ -186,7 +186,7 @@ def pytest_collection_modifyitems(config, items):
     if _live_enabled(config):
         return
     skip_live = _pytest.mark.skip(
-        reason="live vendor test — opt in with --live or AICAD_LIVE_TESTS=1")
+        reason="live vendor test — opt in with --live or CHUDWARE_LIVE_TESTS=1")
     for item in items:
         if "live" in item.keywords:
             item.add_marker(skip_live)

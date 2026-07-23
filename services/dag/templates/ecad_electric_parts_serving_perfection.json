@@ -8,7 +8,7 @@
       "type": "gate",
       "name": "Freeze scope and disjoint write-sets",
       "inputs": {
-        "request": "Confirm FEA mesh/solver is OUT of scope (separate project). Freeze five disjoint write-sets: electric-sim (core/sim/spice+netlist, engine.sim.devices+em, new em MCP tools, server registration), emulators (engine_oracle/firmware, firmware MCP), parts-libs (core/parts, ecad/library/starter), providers (parts_providers, browser adapters), mcp-serving (new result_serving helper, ecad_status/part_search shaping). Preserve uncommitted host GUI edits; contracts/* and libaicad.h append-only."
+        "request": "Confirm FEA mesh/solver is OUT of scope (separate project). Freeze five disjoint write-sets: electric-sim (core/sim/spice+netlist, engine.sim.devices+em, new em MCP tools, server registration), emulators (engine_oracle/firmware, firmware MCP), parts-libs (core/parts, ecad/library/starter), providers (parts_providers, browser adapters), mcp-serving (new result_serving helper, ecad_status/part_search shaping). Preserve uncommitted host GUI edits; contracts/* and libchudware.h append-only."
       },
       "tools": null,
       "end_condition": "Every implementation node has an exact write set that does not overlap another running node.",

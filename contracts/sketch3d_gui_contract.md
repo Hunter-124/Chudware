@@ -3,7 +3,7 @@
 > The GUI-environment agent builds the 3D sketcher from THIS FILE ALONE.
 > Engine side: `core/sketch/sketch3d.{h,cpp}` (solver), `core/geom/profile3d.{h,cpp}` (wire
 > chaining), `core/doc/document.cpp` (`sketch3d` compile + sweep spine/guide consumption),
-> `core/doc/session.cpp` + `core/api/libaicad.cpp` (RPCs). Schema is normative in
+> `core/doc/session.cpp` + `core/api/libchudware.cpp` (RPCs). Schema is normative in
 > `doc_schema.md §3B` and `feature_params.md §sketch3d`; this file restates it with exact
 > request/response JSON. Tests proving every flow below: `core/tests/test_sketch3d.cpp`
 > (solver) and `core/tests/test_sketch3d_doc.cpp` (doc compile, sweep, RPC round-trip).

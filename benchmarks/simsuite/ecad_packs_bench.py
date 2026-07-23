@@ -50,7 +50,7 @@ def _fail(case: str, exc: Exception, dt: float) -> dict:
 
 def run(quick: bool = False) -> list[dict]:
     import os
-    os.environ.setdefault("AI_CAD_ENGINE_DAEMON", "0")
+    os.environ.setdefault("CHUDWARE_ENGINE_DAEMON", "0")
 
     from services.mcp.test_ecad_packs import (
         register_pack_tools, build_reference_board, _call,

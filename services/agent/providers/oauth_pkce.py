@@ -11,7 +11,7 @@ Flow (S256 PKCE):
   3. complete_login(code, code_verifier) -> {ok, key}; store `key` like any api_key.
 
 Feature-flagged: inert unless config `openrouter_pkce: true` or env
-AI_CAD_ENABLE_OPENROUTER_PKCE=1. The token exchange is transport-injectable, so CI drives
+CHUDWARE_ENABLE_OPENROUTER_PKCE=1. The token exchange is transport-injectable, so CI drives
 the whole flow with a fake transport and NO network / NO secrets. Every failure path returns
 a contract-shaped {"ok": false, "reason", "hint"} — never a traceback.
 """
@@ -28,7 +28,7 @@ from urllib.parse import urlencode
 
 AUTH_URL = "https://openrouter.ai/auth"
 KEYS_URL = "https://openrouter.ai/api/v1/auth/keys"
-FLAG_ENV = "AI_CAD_ENABLE_OPENROUTER_PKCE"
+FLAG_ENV = "CHUDWARE_ENABLE_OPENROUTER_PKCE"
 FLAG_CFG = "openrouter_pkce"
 
 

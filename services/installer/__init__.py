@@ -1,1 +1,1 @@
-"""AI-CAD installer / bootstrap: runtime provisioning + Claude MCP self-registration."""
+"""Chudware installer / bootstrap: runtime provisioning + Claude MCP self-registration."""

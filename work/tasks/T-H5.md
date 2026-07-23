@@ -14,7 +14,7 @@ kind: new
 ## Context
 
 Pillar 16 (`docs/CUSTOM_MODEL_INTEGRATION_SURVEY.md` §5.1–5.3). `tools/flywheel/export.py`
-scans `<appdata>/AI-CAD/cache/runs/**` + session dirs, applies consent filter
+scans `<appdata>/Chudware/cache/runs/**` + session dirs, applies consent filter
 (off|meta|full; offline mode ⇒ nothing), scrubs (keys/paths/usernames stripped, machine
 ids hashed), derives SFT / preference-pair / correction-trace records per the
 telemetry contract, and writes provenance-stamped JSONL shards into a DVC-tracked

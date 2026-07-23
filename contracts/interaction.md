@@ -91,8 +91,8 @@ caller, so a resumed or handed-off agent NEVER re-asks a resolved question.
 
 - **`scope: run`** → append to `<cache>/runs/<run_id>/interaction.jsonl`, one JSON record
   per line: `{"t": "question"|"answer", <object>}`. `<cache>` is resolved the same way the
-  C++ run machine resolves it (`core/agent/paths.cpp` — `%APPDATA%/AI-CAD/cache` on Windows,
-  `$XDG_DATA_HOME|~/.local/share`/`AI-CAD/cache` on Linux/macOS).
+  C++ run machine resolves it (`core/agent/paths.cpp` — `%APPDATA%/Chudware/cache` on Windows,
+  `$XDG_DATA_HOME|~/.local/share`/`Chudware/cache` on Linux/macOS).
 - **`scope: doc`** → the document's intake ledger (`IntakeState`,
   `engine_oracle/intake/intake.py`), round-tripped as JSON into the `.step+` record like
   today's `confirm_dimensions`. Same records; different store.

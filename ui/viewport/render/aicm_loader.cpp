@@ -202,10 +202,10 @@ bool parseAicm(const uint8_t* data, size_t size, DocMesh& out, std::string& err)
 
 bool loadAicmFile(const std::string& path, DocMesh& out, std::string& err) {
     // T-PERF10: aicm-shm:// URIs (and same-process cache) via aicm_handoff.
-    aicad::aicm_handoff::Mapping m;
-    if (!aicad::aicm_handoff::map(path, m, err)) return false;
+    chudware::aicm_handoff::Mapping m;
+    if (!chudware::aicm_handoff::map(path, m, err)) return false;
     const bool ok = parseAicm(m.data, m.size, out, err);
-    aicad::aicm_handoff::unmap(m);
+    chudware::aicm_handoff::unmap(m);
     return ok;
 }
 

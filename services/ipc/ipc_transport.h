@@ -1,13 +1,13 @@
-// IPC transport for the shared engine-host daemon (aicad-hostd).
+// IPC transport for the shared engine-host daemon (chudware-hostd).
 //
 // Newline-delimited JSON-RPC over a local stream transport — the same framing the
 // Python-worker seam uses (services/worker/worker_client.cpp): one JSON object per
 // line, `{"id":N,"method":M,"params":P}` requests, `{"id":N,"result":R|"error":E}`
 // responses, plus id-less `{"event":...,"data":...}` push lines.
 //
-// Linux: AF_UNIX SOCK_STREAM at $XDG_RUNTIME_DIR/aicad/hostd-<key>.sock
+// Linux: AF_UNIX SOCK_STREAM at $XDG_RUNTIME_DIR/chudware/hostd-<key>.sock
 //   (ipc_transport.cpp)
-// Windows: named pipe \\.\pipe\aicad-hostd-<SID>-<key>, byte mode, overlapped
+// Windows: named pipe \\.\pipe\chudware-hostd-<SID>-<key>, byte mode, overlapped
 //   handles, same-user DACL (ipc_transport_win.cpp)
 // EMSCRIPTEN: WebSocket to the gateway `WS /engine` (ipc_transport_wasm.cpp);
 //   path arg ignored; dials ws(s)://location.host/engine. Requires -lwebsocket.js.
@@ -20,7 +20,7 @@
 #include <memory>
 #include <string>
 
-namespace aicad_ipc {
+namespace chudware_ipc {
 
 // A connected stream. Move-only; closes on destruction.
 class IpcConn {
@@ -160,4 +160,4 @@ private:
 // Client-side connect. Returns an invalid conn (err filled) if nothing listens.
 IpcConn connectTo(const std::string& path, std::string& err);
 
-}  // namespace aicad_ipc
+}  // namespace chudware_ipc

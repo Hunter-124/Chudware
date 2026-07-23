@@ -14,7 +14,7 @@ priority: 2
 ## Context
 
 The web app (chudware.com) is the same host/src/ui compiled to WASM on the shared
-aicad-hostd daemon, but the gate never builds WASM and nothing detects when a
+chudware-hostd daemon, but the gate never builds WASM and nothing detects when a
 python-worker-only method becomes reachable from the web client (web can't spawn the
 Python worker). check.py currently runs RECORDED non-fatal on pre-existing reds.
 

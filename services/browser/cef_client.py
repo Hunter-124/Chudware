@@ -1,7 +1,7 @@
 """services/browser/cef_client.py — Python client for the CEF host daemon.
 
 The headless replacement for Playwright: instead of launching Playwright Chromium,
-we drive our OWN CEF Chromium (``AI-CAD --cef-daemon``) over a local socket. CEF is
+we drive our OWN CEF Chromium (``Chudware --cef-daemon``) over a local socket. CEF is
 driven through its native C++ API, so there is no CDP ``Runtime.enable`` handshake —
 the automation-protocol fingerprint that bot gates key on is absent (the whole
 reason for the migration; see the plan + services/browser/cef_headless.cpp).
@@ -51,13 +51,13 @@ def _fnv1a64_hex(s: str) -> str:
 
 
 def resolve_cef_bin() -> Optional[Path]:
-    """Locate the AI-CAD host binary that hosts CEF. env → dist → build dirs."""
-    if p := os.environ.get("AI_CAD_BIN"):
+    """Locate the Chudware host binary that hosts CEF. env → dist → build dirs."""
+    if p := os.environ.get("CHUDWARE_BIN"):
         return Path(p)
-    exe = "AI-CAD.exe" if sys.platform == "win32" else "AI-CAD"
+    exe = "Chudware.exe" if sys.platform == "win32" else "Chudware"
     root = _repo_root()
     for cand in (
-        Path(os.environ.get("AI_CAD_DIST") or "nonexistent") / exe,
+        Path(os.environ.get("CHUDWARE_DIST") or "nonexistent") / exe,
         root / "host" / "build-cef" / "bin" / exe,
         root / "host" / "build-linux" / "bin" / exe,
     ):
@@ -69,13 +69,13 @@ def resolve_cef_bin() -> Optional[Path]:
 def socket_path(cef_bin: Optional[Path]) -> Optional[str]:
     """The daemon endpoint (AF_UNIX path on POSIX). Keyed by the binary realpath so
     two checkouts don't collide, matching daemon_bridge's discovery scheme."""
-    if p := os.environ.get("AICAD_CEF_SOCKET"):
+    if p := os.environ.get("CHUDWARE_CEF_SOCKET"):
         return p
     if not cef_bin:
         return None
-    key = os.environ.get("AICAD_CEF_KEY") or _fnv1a64_hex(str(Path(cef_bin).resolve()))
-    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/aicad-{os.getuid()}"
-    return str(Path(runtime) / "aicad" / f"cefd-{key}.sock")
+    key = os.environ.get("CHUDWARE_CEF_KEY") or _fnv1a64_hex(str(Path(cef_bin).resolve()))
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/chudware-{os.getuid()}"
+    return str(Path(runtime) / "chudware" / f"cefd-{key}.sock")
 
 
 def _spawn_daemon_detached(cef_bin: Path, sock: str, idle_s: int) -> None:
@@ -103,7 +103,7 @@ class CefDaemon:
         cef_bin = resolve_cef_bin()
         sock_path = socket_path(cef_bin)
         if not sock_path:
-            raise CefDaemonError("cannot resolve CEF daemon socket (set AI_CAD_BIN or build host)")
+            raise CefDaemonError("cannot resolve CEF daemon socket (set CHUDWARE_BIN or build host)")
         if sys.platform == "win32":  # POSIX-only for now (see module docstring)
             raise CefDaemonError("CEF daemon client is POSIX-only pending named-pipe parity")
         deadline = time.monotonic() + budget_s
@@ -120,7 +120,7 @@ class CefDaemon:
                 if not spawned:
                     if not cef_bin:
                         raise CefDaemonError(
-                            "AI-CAD binary not found (set AI_CAD_BIN or build host with CEF)"
+                            "Chudware binary not found (set CHUDWARE_BIN or build host with CEF)"
                         ) from e
                     _spawn_daemon_detached(cef_bin, sock_path, self._idle_s)
                     spawned = True
@@ -203,7 +203,7 @@ class CefDaemon:
         """DIAGNOSTIC: load ``url``, run ``fill_js`` (fills + submits a login form in
         the page), and return {ok, status, final_url, html} of the response — so a
         bot-wall verdict (e.g. reCAPTCHA reject vs invalid-login) can be observed
-        headlessly. Requires the daemon to run with AI_CAD_CEF_PROBE=1."""
+        headlessly. Requires the daemon to run with CHUDWARE_CEF_PROBE=1."""
         return self._call("login_probe",
                           {"url": url, "fill_js": fill_js, "settle_ms": settle_ms,
                            "post_wait_ms": post_wait_ms, "profile": profile},

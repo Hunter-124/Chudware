@@ -54,7 +54,7 @@ passthrough result. Test added in `test_cam_tools.py`.
 clear (no false positive). MCP: `check_holder=True accepted; holder_collisions surfaced as int`.
 
 **Verified (real, not skipped).** `test_cam` 56/56 (3505 asserts); full core ctest 18/18 green;
-built `libaicad.so` (OCCT) from this branch and ran the mcp-venv cam-tool test against it →
+built `libchudware.so` (OCCT) from this branch and ran the mcp-venv cam-tool test against it →
 `ALL CAM SMOKE CHECKS PASSED` (the check_holder assertion executed live, not SKIP).
 `graphify update .` run.
 

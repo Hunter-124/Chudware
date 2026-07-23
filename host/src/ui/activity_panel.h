@@ -1,8 +1,8 @@
-// AI-CAD Agent Activity panel (C22b).
+// Chudware Agent Activity panel (C22b).
 //
 // Displays a tree of run -> stage -> attempt built from streamed orchestrator events
 // (run_started / stage_started / agent_call / agent_output / stage_result / run_finished)
-// and from events.jsonl replay (file-browser combo of %APPDATA%/AI-CAD/cache/runs/*).
+// and from events.jsonl replay (file-browser combo of %APPDATA%/Chudware/cache/runs/*).
 #pragma once
 #include <string>
 #include <vector>

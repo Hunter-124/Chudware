@@ -25,7 +25,7 @@ void drawDimReviewPanel(AppState& st);
 void drawDeviationPanel(AppState& st);
 
 // Seed the dim-review panel with a canned confirm_dimensions payload (used by
-// AI_CAD_SHOT=reveng_review headless verification — injected before the first frame).
+// CHUDWARE_SHOT=reveng_review headless verification — injected before the first frame).
 void seedCannedDimPayload();
 
 }  // namespace reveng

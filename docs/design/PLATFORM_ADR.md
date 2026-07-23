@@ -1,4 +1,4 @@
-# ADR-001: Idea-to-Production Platform on AI-CAD
+# ADR-001: Idea-to-Production Platform on Chudware
 
 **Status:** Proposed
 **Date:** 2026-07-02
@@ -6,7 +6,7 @@
 
 ## Context
 
-AI-CAD is already a working SolidWorks-class parametric modeler: OCCT kernel, feature tree,
+Chudware is already a working SolidWorks-class parametric modeler: OCCT kernel, feature tree,
 assemblies, sheet metal, drawings, FEA (static/modal), LBM CFD + OpenFOAM bridge, native SPICE,
 a complete ECAD module (schematic/PCB/sim/Gerber), a full CAM suite with cycle-time simulation,
 a three-tier standard/vendor parts library, GSL (deterministic geometry description for

@@ -27,7 +27,7 @@ DEVICE_TOKEN_URL = "https://auth.openai.com/api/accounts/deviceauth/token"
 DEVICE_REDIRECT_URI = "https://auth.openai.com/deviceauth/callback"
 DEVICE_AUTH_URL = "https://auth.openai.com/codex/device"
 PROVIDER_ID = "openai-codex"
-ORIGINATOR = "aicad"
+ORIGINATOR = "chudware"
 # NOTE: verify the valid model id for chatgpt.com/backend-api/responses on first live
 # call — the Codex backend expects codex/o-series ids, not necessarily "gpt-4o". Override
 # via config.json "model".
@@ -211,7 +211,7 @@ class CodexSubProvider(Provider):
             "OpenAI-Beta": "responses=experimental",
             "originator": ORIGINATOR,
             "User-Agent": (
-                f"aicad/1.0 ({platform.system()} {platform.release()}; "
+                f"chudware/1.0 ({platform.system()} {platform.release()}; "
                 f"{platform.machine()})"
             ),
             "Content-Type": "application/json",

@@ -6,7 +6,7 @@
 #include <thread>
 
 #include "app_state.h"  // jstr/jint/jnum/jbool safe JSON accessors
-#include "cpp_core.h"   // in-process C++ core (libaicad) — the sim backend when no Python worker
+#include "cpp_core.h"   // in-process C++ core (libchudware) — the sim backend when no Python worker
 #include "engine_backend.h"  // daemonMode — WASM/desktop hostd path (no child sim worker)
 
 namespace core {
@@ -28,7 +28,7 @@ bool SimClient::ensureStarted(std::string& consoleNote) {
 
     std::string err;
     // No Python sim worker exists anymore (T-RF19: FEA + flow + cancel all route
-    // in-process to libaicad via routeSimToCpp; engine.sim.worker is deleted). Treat
+    // in-process to libchudware via routeSimToCpp; engine.sim.worker is deleted). Treat
     // the backend as ready if the core loads. sim_caps / multiphysics ride the
     // services-side worker (services.worker_main).
     std::string lerr;
@@ -37,7 +37,7 @@ bool SimClient::ensureStarted(std::string& consoleNote) {
         // started() reports ready). running_ stays meaningless for a real pipe — call()
         // still routes FEA in-process before the pipe write.
         worker_.markStarted();
-        consoleNote = "[sim] using in-process C++ core (libaicad) for simulation";
+        consoleNote = "[sim] using in-process C++ core (libchudware) for simulation";
         return true;
     }
     consoleNote = "[sim] could not load the simulation backend: " + lerr;

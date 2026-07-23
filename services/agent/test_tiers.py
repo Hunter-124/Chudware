@@ -2,7 +2,7 @@
 
 Contract: contracts/advisor.md §8 + 1.3 addendum.
 
-Test venv: ~/.local/share/AI-CAD/mcp-venv/bin/python
+Test venv: ~/.local/share/Chudware/mcp-venv/bin/python
 Run: pytest services/agent/test_tiers.py -v
 
 Coverage:
@@ -295,7 +295,7 @@ class TestProviderForTier:
     """``provider_for_tier`` is the single tier->provider resolution seam shared
     by services.dag.node_runner and the gym bench (T-DP19). It must:
       * route local-* tiers to the bundled local model (never the ambient
-        default), unless AI_CAD_PROVIDER overrides;
+        default), unless CHUDWARE_PROVIDER overrides;
       * leave every non-local tier (and no tier at all) on the ordinary
         config.get_provider() resolution — no behaviour change there."""
 
@@ -327,7 +327,7 @@ class TestProviderForTier:
         from . import model_manager
         from .tiers import provider_for_tier
 
-        monkeypatch.delenv("AI_CAD_PROVIDER", raising=False)
+        monkeypatch.delenv("CHUDWARE_PROVIDER", raising=False)
         monkeypatch.setattr(model_manager, "get_model_path",
                             lambda model_id: Path("/models/qwen3-4b.gguf"))
 
@@ -347,13 +347,13 @@ class TestProviderForTier:
         assert cfg["llamacpp"]["model_path"] == "/models/qwen3-4b.gguf"
 
     def test_ai_cad_provider_env_override_wins_even_for_local_tier(self, monkeypatch):
-        """A human forcing AI_CAD_PROVIDER (e.g. to point a 'local' tier cell at a
+        """A human forcing CHUDWARE_PROVIDER (e.g. to point a 'local' tier cell at a
         frontier key for comparison, or a test pinning 'mock') always wins over
         the local-tier bundled-model resolution."""
         from . import config as agent_config
         from .tiers import provider_for_tier
 
-        monkeypatch.setenv("AI_CAD_PROVIDER", "mock")
+        monkeypatch.setenv("CHUDWARE_PROVIDER", "mock")
         calls = []
 
         def _tracked(name=None, cfg=None):
@@ -372,7 +372,7 @@ class TestProviderForTier:
         from . import model_manager
         from .tiers import provider_for_tier
 
-        monkeypatch.delenv("AI_CAD_PROVIDER", raising=False)
+        monkeypatch.delenv("CHUDWARE_PROVIDER", raising=False)
         monkeypatch.setattr(model_manager, "get_model_path", lambda model_id: None)
 
         with pytest.raises(model_manager.ModelProvisionError, match="qwen3-4b"):

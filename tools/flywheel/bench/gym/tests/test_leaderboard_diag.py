@@ -63,7 +63,7 @@ class TestOpenRouterTier:
         assert effort_tier_for("mid") == "mid"
 
     def test_provider_for_tier_openrouter(self, monkeypatch):
-        monkeypatch.delenv("AI_CAD_PROVIDER", raising=False)
+        monkeypatch.delenv("CHUDWARE_PROVIDER", raising=False)
         monkeypatch.setenv("OPENROUTER_API_KEY", "test-key-not-real")
         prov = provider_for_tier("openrouter:anthropic/claude-opus-4", cfg={})
         assert prov.name == "openrouter"
@@ -72,8 +72,8 @@ class TestOpenRouterTier:
             "claude-opus-4" in str(getattr(prov, "model", getattr(prov, "_model", "")))
 
     def test_provider_for_tier_env_override_wins(self, monkeypatch):
-        monkeypatch.setenv("AI_CAD_PROVIDER", "mock")
-        monkeypatch.setenv("AI_CAD_MOCK_REPLIES", "")
+        monkeypatch.setenv("CHUDWARE_PROVIDER", "mock")
+        monkeypatch.setenv("CHUDWARE_MOCK_REPLIES", "")
         prov = provider_for_tier("openrouter:anthropic/claude-opus-4")
         assert prov.name in ("mock", "mock-roles")
 
@@ -105,7 +105,7 @@ class TestXaiTier:
         assert effort_tier_for("xai:grok-4-5") == "frontier"
 
     def test_provider_for_tier_xai_api_key(self, monkeypatch):
-        monkeypatch.delenv("AI_CAD_PROVIDER", raising=False)
+        monkeypatch.delenv("CHUDWARE_PROVIDER", raising=False)
         monkeypatch.setenv("XAI_API_KEY", "test-key-not-real")
         # Ensure no subscription credential shadows the API-key path.
         from services.agent.providers import sub_auth

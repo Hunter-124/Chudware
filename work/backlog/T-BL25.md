@@ -76,7 +76,7 @@ so the per-process doc_id churn is irrelevant by construction.
   record → doc_save → doc_open (asserts the reopened doc_id DIFFERS) → fresh
   IntakeLedger from the doc alone replays with transport never invoked; same via
   ask_user's DEFAULT ledger path (nothing injected); confirm_dimensions call-site
-  answer survives save+reopen. All 3 PASS against libaicad.so.
+  answer survives save+reopen. All 3 PASS against libchudware.so.
 
 ### Test results (v2)
 

@@ -1,7 +1,7 @@
 """Integration tests for the run_fea_frequency_response MCP tool (T-BL17).
 
 Engine-free: the C++ bridge (cb.call) is monkeypatched with a canned modal result,
-so these run in CI without libaicad.so. The physics itself is validated separately
+so these run in CI without libchudware.so. The physics itself is validated separately
 in engine_oracle/sim/test_vibration.py against textbook references.
 
 Covers the DoD behaviours:

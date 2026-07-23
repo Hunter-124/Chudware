@@ -11,7 +11,7 @@ Key DoD assertions:
   5. Gate payload shaped as aicad.interaction/1 (T-F4 compat).
 
 NOTE: tests are pure Python (LangGraph + SQLite); they do NOT import core_bridge.
-The libaicad.so restage is a build-system obligation recorded separately.
+The libchudware.so restage is a build-system obligation recorded separately.
 """
 from __future__ import annotations
 

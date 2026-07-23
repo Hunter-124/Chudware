@@ -4,7 +4,7 @@ risk screen, conforming to ``aicad.simhandoff/1``.
 
 Same design contract as ``ecad_thermal`` (T-FIN16): JSON-string results with
 ``{ok, ..., warnings, hint, next_actions}``, engine helpers called directly, pure
-helpers module-level and engine-free so tests can drive them without OCP/libaicad.
+helpers module-level and engine-free so tests can drive them without OCP/libchudware.
 
 Tool:
   ecad_vibe_check   board -> fused board+components FEA solid (T-FIN16's
@@ -575,8 +575,8 @@ def register_ecad_reliability_tools(mcp) -> None:
                 **base, "solved": False, "dry_run": False,
                 "error_solve": f"FEA leg unavailable: {solve_err}",
                 "hint": "geometry + fixtures + envelope are valid; the mesher/solver "
-                        "(libaicad with Netgen) is not available in this environment.",
-                "next_actions": ["set AI_CAD_LIBAICAD to a sim-enabled libaicad build "
+                        "(libchudware with Netgen) is not available in this environment.",
+                "next_actions": ["set CHUDWARE_LIBCHUDWARE to a sim-enabled libchudware build "
                                  "and retry"],
             }, envelope))
 

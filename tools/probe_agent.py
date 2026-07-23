@@ -1,24 +1,24 @@
 import ctypes, json, os, sys
 
-dist = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dist", "AI-CAD")
+dist = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dist", "Chudware")
 os.add_dll_directory(dist)
-os.environ.setdefault("AI_CAD_PROMPTS_DIR", os.path.join(dist, "app", "agent", "prompts"))
+os.environ.setdefault("CHUDWARE_PROMPTS_DIR", os.path.join(dist, "app", "agent", "prompts"))
 
-dll = ctypes.CDLL(os.path.join(dist, "libaicad.dll"))
-dll.aicad_call.restype = ctypes.c_int
-dll.aicad_call.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p)]
-dll.aicad_free.argtypes = [ctypes.c_char_p]
+dll = ctypes.CDLL(os.path.join(dist, "libchudware.dll"))
+dll.chudware_call.restype = ctypes.c_int
+dll.chudware_call.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p)]
+dll.chudware_free.argtypes = [ctypes.c_char_p]
 
 def call(method, params):
     out = ctypes.c_char_p()
-    rc = dll.aicad_call(method.encode(), json.dumps(params).encode(), ctypes.byref(out))
+    rc = dll.chudware_call(method.encode(), json.dumps(params).encode(), ctypes.byref(out))
     s = out.value.decode() if out.value else ""
     # free
     if out.value:
-        dll.aicad_free(out)
+        dll.chudware_free(out)
     return rc, s
 
-print("PROMPTS_DIR=", os.environ.get("AI_CAD_PROMPTS_DIR"))
+print("PROMPTS_DIR=", os.environ.get("CHUDWARE_PROMPTS_DIR"))
 rc, s = call("doc_new", {"kind": "part"})
 print("doc_new rc=", rc, s[:200])
 doc = json.loads(s).get("doc_id") if s else None

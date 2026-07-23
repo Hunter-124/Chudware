@@ -5725,9 +5725,9 @@ bool SketchMode::drawDatumSelect(AppState& st, ImGuiIO& io, const ImVec2& imgMin
         for (const auto& c : pts) {
             ImVec2 s;
             if (!worldToScreen(cam, imgMin, vw, vh, c.wx, c.wy, c.wz, s)) continue;
-            // DIAG (AICAD_ORIGIN_PICK_DEBUG): mark exactly where the code thinks each datum point is,
+            // DIAG (CHUDWARE_ORIGIN_PICK_DEBUG): mark exactly where the code thinks each datum point is,
             // plus the grab ring, so we can see alignment vs. the click. Remove once verified.
-            static const bool kDbg = std::getenv("AICAD_ORIGIN_PICK_DEBUG") != nullptr;
+            static const bool kDbg = std::getenv("CHUDWARE_ORIGIN_PICK_DEBUG") != nullptr;
             if (kDbg) {
                 wdl->PushClipRect(imgMin, imgMax, true);
                 wdl->AddCircle(s, grabRadius, IM_COL32(255, 0, 255, 200), 24, 1.5f * ui::uiScale);

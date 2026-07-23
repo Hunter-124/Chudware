@@ -7,7 +7,7 @@ Also pins the _run_subagent fix contract: no more BARE sub-agents (hardcoded
 max_tool_calls=4, no role prompt, no allowlist) — budget-derived call caps,
 allowlist denial for out-of-scope tools, and bare fallback for unknown roles.
 
-MockProvider-scripted; no network, no LLM, no libaicad.
+MockProvider-scripted; no network, no LLM, no libchudware.
 """
 from __future__ import annotations
 
@@ -94,7 +94,7 @@ _HANDOFF = {
 
 @pytest.fixture()
 def env(tmp_path, monkeypatch):
-    monkeypatch.setenv("AICAD_CACHE_ROOT", str(tmp_path))
+    monkeypatch.setenv("CHUDWARE_CACHE_ROOT", str(tmp_path))
     # Hermetic: delegate() rebuilds a per-role provider from model assignment
     # (WS2/mega-5) — ambient config.json ai_roles on a dev machine, or the
     # ollama default when config is empty. Either replaces the scripted mock

@@ -1,4 +1,4 @@
-// aicad-hostd system tray (Linux + libappindicator3).
+// chudware-hostd system tray (Linux + libappindicator3).
 //
 // GTK runs on a dedicated thread so the daemon accept loop stays free. Status
 // updates and Quit are marshalled through g_idle_add. When the feature is
@@ -8,7 +8,7 @@
 
 #include <string>
 
-#if defined(AICAD_HOSTD_HAS_TRAY) && AICAD_HOSTD_HAS_TRAY && !defined(_WIN32)
+#if defined(CHUDWARE_HOSTD_HAS_TRAY) && CHUDWARE_HOSTD_HAS_TRAY && !defined(_WIN32)
 
 #include <algorithm>
 #include <atomic>
@@ -41,7 +41,7 @@ struct TrayState {
     GdkPixbuf* idlePb = nullptr;
     GdkPixbuf* busyPb = nullptr;
     GdkPixbuf* errorPb = nullptr;
-    std::string tip = "Billet hostd";
+    std::string tip = "Chudware hostd";
     TrayStatus status = TrayStatus::Idle;
     void (*quitFn)(void*) = nullptr;
     void* quitUd = nullptr;
@@ -51,7 +51,7 @@ struct TrayState {
 TrayState g;
 
 bool envDisabled() {
-    const char* v = std::getenv("AICAD_HOSTD_TRAY");
+    const char* v = std::getenv("CHUDWARE_HOSTD_TRAY");
     if (!v || !*v) return false;
     return v[0] == '0' || v[0] == 'n' || v[0] == 'N' || v[0] == 'f' || v[0] == 'F';
 }
@@ -105,8 +105,8 @@ std::string findLogoPng(const std::string& selfBinaryPath) {
         cands.push_back(exe / ".." / ".." / ".." / "assets" / "logo_icon.png");
     }
     if (const char* home = std::getenv("HOME"); home && *home) {
-        cands.push_back(fs::path(home) / ".local" / "share" / "AI-CAD" / "assets" / "logo_icon.png");
-        cands.push_back(fs::path(home) / ".local" / "share" / "Billet" / "assets" / "logo_icon.png");
+        cands.push_back(fs::path(home) / ".local" / "share" / "Chudware" / "assets" / "logo_icon.png");
+        cands.push_back(fs::path(home) / ".local" / "share" / "Chudware" / "assets" / "logo_icon.png");
     }
     cands.push_back("assets/logo_icon.png");
     for (const auto& p : cands) {
@@ -131,15 +131,15 @@ bool writePixbufPng(GdkPixbuf* pb, const fs::path& path) {
 void applyStatusLocked() {
     if (!g.ind) return;
     GdkPixbuf* pb = g.idlePb;
-    const char* name = "billet-hostd-idle";
+    const char* name = "chudware-hostd-idle";
     switch (g.status) {
         case TrayStatus::Busy:
             pb = g.busyPb ? g.busyPb : g.idlePb;
-            name = "billet-hostd-busy";
+            name = "chudware-hostd-busy";
             break;
         case TrayStatus::Error:
             pb = g.errorPb ? g.errorPb : g.idlePb;
-            name = "billet-hostd-error";
+            name = "chudware-hostd-error";
             break;
         case TrayStatus::Idle:
         default:
@@ -150,7 +150,7 @@ void applyStatusLocked() {
         if (writePixbufPng(pb, out)) {
             // AppIndicator wants an icon name under a theme path, or an absolute
             // path via app_indicator_set_icon_full on some builds. Use full path.
-            app_indicator_set_icon_full(g.ind, out.c_str(), "Billet hostd");
+            app_indicator_set_icon_full(g.ind, out.c_str(), "Chudware hostd");
         }
     }
     if (g.statusItem) {
@@ -213,7 +213,7 @@ void trayThreadMain(std::string logoPath, std::string cacheDir) {
     fs::create_directories(cacheDir, ec);
 
     GtkWidget* menu = gtk_menu_new();
-    GtkWidget* statusItem = gtk_menu_item_new_with_label("Billet hostd");
+    GtkWidget* statusItem = gtk_menu_item_new_with_label("Chudware hostd");
     gtk_widget_set_sensitive(statusItem, FALSE);
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), statusItem);
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
@@ -222,11 +222,11 @@ void trayThreadMain(std::string logoPath, std::string cacheDir) {
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), quitItem);
     gtk_widget_show_all(menu);
 
-    AppIndicator* ind = app_indicator_new("billet-hostd", "application-default-icon",
+    AppIndicator* ind = app_indicator_new("chudware-hostd", "application-default-icon",
                                           APP_INDICATOR_CATEGORY_APPLICATION_STATUS);
     app_indicator_set_status(ind, APP_INDICATOR_STATUS_ACTIVE);
     app_indicator_set_menu(ind, GTK_MENU(menu));
-    app_indicator_set_title(ind, "Billet hostd");
+    app_indicator_set_title(ind, "Chudware hostd");
 
     {
         std::lock_guard<std::mutex> lk(g.mu);
@@ -269,9 +269,9 @@ bool trayStart(const std::string& selfBinaryPath) {
         // Still try — thread paints a solid fallback square.
     }
 
-    std::string cache = "/tmp/billet-hostd-tray";
+    std::string cache = "/tmp/chudware-hostd-tray";
     if (const char* xdg = std::getenv("XDG_RUNTIME_DIR"); xdg && *xdg) {
-        cache = std::string(xdg) + "/billet-hostd-tray";
+        cache = std::string(xdg) + "/chudware-hostd-tray";
     }
 
     try {

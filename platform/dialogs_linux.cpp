@@ -10,7 +10,7 @@ namespace {
 
 std::string s_lastDir;
 
-bool dialogsDisabled() { return std::getenv("AI_CAD_NO_FILE_DIALOGS") != nullptr; }
+bool dialogsDisabled() { return std::getenv("CHUDWARE_NO_FILE_DIALOGS") != nullptr; }
 
 bool haveCmd(const char* c) {
     return std::system((std::string("command -v ") + c + " >/dev/null 2>&1").c_str()) == 0;

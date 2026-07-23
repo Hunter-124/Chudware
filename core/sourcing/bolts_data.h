@@ -11,7 +11,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad {
+namespace chudware {
 namespace sourcing {
 
 // One governing standard (engine/bolts_loader.py::Standard).
@@ -130,4 +130,4 @@ inline const std::vector<BoltStandard>& bolts_tables() {
 }
 
 }  // namespace sourcing
-}  // namespace aicad
+}  // namespace chudware

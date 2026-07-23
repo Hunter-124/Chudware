@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""work.py — git-tracked task coordination for AI-CAD.
+"""work.py — git-tracked task coordination for Chudware.
 
 Tasks are markdown files in work/tasks/ and work/backlog/ with flat YAML-ish
 front matter (key: value, inline lists like [T-A1, T-B2]). Stdlib only.

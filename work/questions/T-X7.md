@@ -8,7 +8,7 @@ LLM-generated."* But the `bom_price` price seam — `engine_oracle/parts_provide
 (`ProviderChain([Nexar, DigiKey, Mouser])`, consumed by `engine/bom.py:resolve_prices` via
 `services/mcp/sourcing_tools.py:bom_price`) — is **deliberately API-key-only and explicitly
 "no scraping."** That guarantee is load-bearing: it's stated in the module header, in
-`McMasterProvider.fetch`'s user-facing `ProviderError` ("AI-CAD does NOT scrape
+`McMasterProvider.fetch`'s user-facing `ProviderError` ("Chudware does NOT scrape
 mcmaster.com… download the CAD manually and register it"), and underpins the parts-library
 docs. The T-X7 wave-2 adapters, by contrast, are the **user's-own-authenticated-browser-
 session** mechanism blessed by Hunter's 2026-07-04 directive (`contracts/license_debt.md`

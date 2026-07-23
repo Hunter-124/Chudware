@@ -1,24 +1,24 @@
-"""Register Billet as a handler for the document types it owns (task 05).
+"""Register Chudware as a handler for the document types it owns (task 05).
 
-Makes a double-clicked file (or right-click -> Open with) open in Billet, and lets Billet be set
-as the default app. The native **.step+** document is the priority; the interchange formats Billet
+Makes a double-clicked file (or right-click -> Open with) open in Chudware, and lets Chudware be set
+as the default app. The native **.step+** document is the priority; the interchange formats Chudware
 natively loads are added to "Open with" without hijacking the user's existing handlers for them.
 
-The executable is now named Billet (2026-07 deep rename); an AI-CAD compat symlink ships
+The executable is now named Chudware (2026-07 deep rename); an Chudware compat symlink ships
 beside it for legacy scripts, and default_exe() falls back to the old name on stale builds. Register/unregister
-also clean up the pre-rename AICAD.* ProgIDs / ai-cad.* XDG files so a machine migrates cleanly.
+also clean up the pre-rename Chudware.* ProgIDs / ai-cad.* XDG files so a machine migrates cleanly.
 
 Idempotent, **per-user (no elevation)**, and reversible (`--unregister`) — modelled on
 installer/setup_mcp_clients.py (stdlib only, `--dry-run`, backups).
 
-  Windows: HKCU\\Software\\Classes — a ProgID with an Open command (`"Billet.exe" "%1"`) + a
+  Windows: HKCU\\Software\\Classes — a ProgID with an Open command (`"Chudware.exe" "%1"`) + a
            DefaultIcon pointing at the exe's SECOND icon group (the branded document icon from
            host/app.rc), the `.step+` extension defaulted to it, and every other extension wired
-           into OpenWithProgids so Billet shows in "Open with".
+           into OpenWithProgids so Chudware shows in "Open with".
   Linux:   a custom shared-mime-info type for `.step+` + a `.desktop` launcher in XDG_DATA_HOME,
            plus assets/doc_icon.png installed into hicolor/*/mimetypes as the type's icon,
            then update-mime-database / update-desktop-database / xdg-mime so the file manager
-           routes a double-click to Billet and shows the branded doc icon. Interchange formats are listed in the launcher's
+           routes a double-click to Chudware and shows the branded doc icon. Interchange formats are listed in the launcher's
            MimeType via their standard freedesktop types (Open-with), not redefined.
 
     python installer/setup_file_assoc.py [--exe <path>] [--unregister] [--dry-run]
@@ -32,27 +32,27 @@ import sys
 from pathlib import Path
 
 # Vendor identifiers for the native document type.
-APP_NAME = "Billet"
-PROGID_NATIVE = "Billet.stepplus"      # Windows ProgID for the native .step+ document
-PROGID_DOC = "Billet.document"         # Windows ProgID used for the interchange formats (Open-with)
-MIME_NATIVE = "application/vnd.billet.stepplus"  # custom MIME for .step+ (no system collision)
+APP_NAME = "Chudware"
+PROGID_NATIVE = "Chudware.stepplus"      # Windows ProgID for the native .step+ document
+PROGID_DOC = "Chudware.document"         # Windows ProgID used for the interchange formats (Open-with)
+MIME_NATIVE = "application/vnd.chudware.stepplus"  # custom MIME for .step+ (no system collision)
 MIME_ICON = MIME_NATIVE.replace("/", "-")        # freedesktop icon name for the MIME type
-DESKTOP_FILE = "billet.desktop"
-MIME_PACKAGE = "billet.xml"
+DESKTOP_FILE = "chudware.desktop"
+MIME_PACKAGE = "chudware.xml"
 ICON_SIZES = (16, 32, 48, 64, 128, 256)          # hicolor sizes for the document MIME icon
 
-# Pre-rename (AI-CAD) identifiers — register/unregister remove these so a machine that
-# had the old associations migrates cleanly to the Billet names.
-LEGACY_PROGIDS = ("AICAD.stepplus", "AICAD.document")
+# Pre-rename (Chudware) identifiers — register/unregister remove these so a machine that
+# had the old associations migrates cleanly to the Chudware names.
+LEGACY_PROGIDS = ("Chudware.stepplus", "Chudware.document")
 LEGACY_MIME_ICON = "application-vnd.aicad.stepplus"
 LEGACY_DESKTOP_FILE = "ai-cad.desktop"
 LEGACY_MIME_PACKAGE = "ai-cad.xml"
 
-# Extensions Billet owns / natively loads. `native` marks the priority .step+ document we DEFAULT to;
+# Extensions Chudware owns / natively loads. `native` marks the priority .step+ document we DEFAULT to;
 # the rest are added to "Open with" only (so we never steal the user's STL/STEP viewer). `mime` is the
 # standard freedesktop type used in the Linux launcher's MimeType (None -> skip on Linux Open-with).
 ASSOCIATIONS = [
-    {"ext": ".step+", "native": True,  "desc": "Billet Document",       "mime": MIME_NATIVE},
+    {"ext": ".step+", "native": True,  "desc": "Chudware Document",       "mime": MIME_NATIVE},
     {"ext": ".step",  "native": False, "desc": "STEP 3D Model",         "mime": "model/step"},
     {"ext": ".stp",   "native": False, "desc": "STEP 3D Model",         "mime": "model/step"},
     {"ext": ".iges",  "native": False, "desc": "IGES 3D Model",         "mime": "model/iges"},
@@ -65,16 +65,16 @@ ASSOCIATIONS = [
 
 def default_exe() -> str:
     """Best-guess path to the executable for this platform (overridable with --exe).
-    Prefers the canonical Billet binary; falls back to the pre-rename AI-CAD name so
-    stale build dirs / the dist/AI-CAD Windows stage layout keep working."""
+    Prefers the canonical Chudware binary; falls back to the pre-rename Chudware name so
+    stale build dirs / the dist/Chudware Windows stage layout keep working."""
     repo = Path(__file__).resolve().parent.parent
     if sys.platform.startswith("win"):
-        candidates = [repo / "dist" / "AI-CAD" / "Billet.exe",
-                      repo / "dist" / "AI-CAD" / "AI-CAD.exe"]
+        candidates = [repo / "dist" / "Chudware" / "Chudware.exe",
+                      repo / "dist" / "Chudware" / "Chudware.exe"]
     else:
-        # Linux/macOS: the host build output (host/build-linux/bin/Billet).
+        # Linux/macOS: the host build output (host/build-linux/bin/Chudware).
         bindir = repo / "host" / "build-linux" / "bin"
-        candidates = [bindir / "Billet", bindir / "AI-CAD"]
+        candidates = [bindir / "Chudware", bindir / "Chudware"]
     for c in candidates:
         if c.exists():
             return str(c)
@@ -101,22 +101,22 @@ def windows_registry_plan(exe: str) -> list[dict]:
         plan.append({"subkey": fr"Software\Classes\{pid}\shell\open\command",
                      "name": "", "value": f'"{exe}" "%1"'})
 
-    progid(PROGID_NATIVE, "Billet Document")
-    progid(PROGID_DOC, "Billet Model")
+    progid(PROGID_NATIVE, "Chudware Document")
+    progid(PROGID_DOC, "Chudware Model")
 
     for a in ASSOCIATIONS:
         ext, pid = a["ext"], (PROGID_NATIVE if a["native"] else PROGID_DOC)
         # Always advertise in "Open with".
         plan.append({"subkey": fr"Software\Classes\{ext}\OpenWithProgids",
                      "name": pid, "value": ""})
-        # Default ONLY the native .step+ to Billet (don't hijack the user's STEP/STL viewer).
+        # Default ONLY the native .step+ to Chudware (don't hijack the user's STEP/STL viewer).
         if a["native"]:
             plan.append({"subkey": fr"Software\Classes\{ext}", "name": "", "value": pid})
     return plan
 
 
 def windows_legacy_cleanup_plan() -> list[dict]:
-    """Pure description of the PRE-RENAME (AICAD.*) registry state to remove — list of
+    """Pure description of the PRE-RENAME (Chudware.*) registry state to remove — list of
     {"kind": "tree", "subkey": ...} (delete whole key tree) and
     {"kind": "value", "subkey": ..., "name": ...} (delete one value). Applied on BOTH
     register (migration) and unregister (full cleanup)."""
@@ -144,7 +144,7 @@ def register_windows(exe: str, unregister: bool, dry_run: bool) -> list[str]:
     msgs: list[str] = []
     if unregister:
         # Delete the ProgID trees + our OpenWithProgids values (current AND pre-rename
-        # AICAD.* names). Deepest keys first.
+        # Chudware.* names). Deepest keys first.
         progid_roots = [fr"Software\Classes\{PROGID_NATIVE}", fr"Software\Classes\{PROGID_DOC}"]
         if not dry_run:
             for root in progid_roots:
@@ -155,12 +155,12 @@ def register_windows(exe: str, unregister: bool, dry_run: bool) -> list[str]:
                                      fr"Software\Classes\{a['ext']}\OpenWithProgids", pid)
             apply_legacy_cleanup()
         msgs.append(f"{'would remove' if dry_run else 'removed'} {len(progid_roots)} ProgIDs "
-                    f"+ {len(ASSOCIATIONS)} associations (+ legacy AICAD.* names)")
+                    f"+ {len(ASSOCIATIONS)} associations (+ legacy Chudware.* names)")
         return msgs
 
     if not dry_run:
-        # Migration: drop the pre-rename AICAD.* ProgIDs/values FIRST, then write the
-        # Billet plan (which re-defaults .step+ to the new native ProgID).
+        # Migration: drop the pre-rename Chudware.* ProgIDs/values FIRST, then write the
+        # Chudware plan (which re-defaults .step+ to the new native ProgID).
         apply_legacy_cleanup()
     for e in plan:
         if not dry_run:
@@ -168,7 +168,7 @@ def register_windows(exe: str, unregister: bool, dry_run: bool) -> list[str]:
             winreg.SetValueEx(key, e["name"], 0, winreg.REG_SZ, e["value"])
             winreg.CloseKey(key)
     msgs.append(f"{'would write' if dry_run else 'wrote'} {len(plan)} HKCU\\Software\\Classes entries"
-                " (legacy AICAD.* entries removed)")
+                " (legacy Chudware.* entries removed)")
     return msgs
 
 
@@ -203,7 +203,7 @@ def _winreg_delete_value(winreg, hive, subkey: str, name: str) -> None:
 
 def linux_desktop_entry(exe: str) -> str:
     """The .desktop launcher. MimeType lists the native type first, then the interchange types'
-    standard freedesktop MIME (so Billet shows in Open-with for them); %f is the file to open."""
+    standard freedesktop MIME (so Chudware shows in Open-with for them); %f is the file to open."""
     mimes = [MIME_NATIVE]
     for a in ASSOCIATIONS:
         if not a["native"] and a["mime"] and a["mime"] not in mimes:
@@ -227,7 +227,7 @@ def linux_mime_xml() -> str:
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">\n'
         f'  <mime-type type="{MIME_NATIVE}">\n'
-        "    <comment>Billet Document</comment>\n"
+        "    <comment>Chudware Document</comment>\n"
         f'    <icon name="{MIME_ICON}"/>\n'
         '    <glob pattern="*.step+"/>\n'
         "  </mime-type>\n"
@@ -249,13 +249,13 @@ def _doc_icon_source() -> Path | None:
 
 def _mime_icon_paths(data: Path, icon_name: str = MIME_ICON) -> list[Path]:
     """hicolor mimetype icon paths for every size — the freedesktop lookup for a file of
-    type application/vnd.billet.stepplus is <theme>/<S>x<S>/mimetypes/<MIME '/'→'-'>.png."""
+    type application/vnd.chudware.stepplus is <theme>/<S>x<S>/mimetypes/<MIME '/'→'-'>.png."""
     return [data / "icons" / "hicolor" / f"{s}x{s}" / "mimetypes" / f"{icon_name}.png"
             for s in ICON_SIZES]
 
 
 def _legacy_linux_paths(data: Path) -> list[Path]:
-    """Pre-rename (AI-CAD) XDG artifacts removed on both register and unregister."""
+    """Pre-rename (Chudware) XDG artifacts removed on both register and unregister."""
     return [data / "applications" / LEGACY_DESKTOP_FILE,
             data / "mime" / "packages" / LEGACY_MIME_PACKAGE,
             *_mime_icon_paths(data, LEGACY_MIME_ICON)]
@@ -312,7 +312,7 @@ def register_linux(exe: str, unregister: bool, dry_run: bool) -> list[str]:
         apps.mkdir(parents=True, exist_ok=True)
         (mimedir / "packages").mkdir(parents=True, exist_ok=True)
         # Migration: drop the pre-rename ai-cad.desktop / ai-cad.xml / old mime icons so
-        # the shell doesn't keep a duplicate "AI-CAD" handler next to Billet.
+        # the shell doesn't keep a duplicate "Chudware" handler next to Chudware.
         for p in _legacy_linux_paths(data):
             p.unlink(missing_ok=True)
         desktop_path.write_text(linux_desktop_entry(exe), encoding="utf-8")
@@ -341,7 +341,7 @@ def register(exe: str, unregister: bool = False, dry_run: bool = False) -> list[
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--exe", default=default_exe(), help="Path to the Billet executable")
+    ap.add_argument("--exe", default=default_exe(), help="Path to the Chudware executable")
     ap.add_argument("--unregister", action="store_true", help="Remove the associations")
     ap.add_argument("--dry-run", action="store_true", help="Show what would change")
     args = ap.parse_args(argv)

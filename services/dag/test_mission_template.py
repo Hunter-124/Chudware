@@ -4,7 +4,7 @@ Regression coverage for the node_runner provider-leak fix: a mission compiled
 with ``tier=`` must record that tier on EVERY node's ``inputs`` (not just the
 entry node) so ``services.dag.node_runner`` can resolve the matching provider
 for internal nodes via ``services.agent.tiers.provider_for_tier`` instead of
-silently falling through to the ambient config.json / ``AI_CAD_PROVIDER``
+silently falling through to the ambient config.json / ``CHUDWARE_PROVIDER``
 cloud default.
 
 Run: pytest services/dag/test_mission_template.py -q

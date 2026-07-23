@@ -69,9 +69,9 @@ class ReplannError(ValueError):
 def _default_runs_dir() -> Path:
     if platform.system() == "Windows":
         appdata = os.environ.get("APPDATA") or os.path.expanduser(r"~\AppData\Roaming")
-        return Path(appdata) / "AI-CAD" / "runs"
+        return Path(appdata) / "Chudware" / "runs"
     xdg = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
-    return Path(xdg) / "AI-CAD" / "runs"
+    return Path(xdg) / "Chudware" / "runs"
 
 
 # ---------------------------------------------------------------------------

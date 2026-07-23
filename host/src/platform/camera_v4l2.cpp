@@ -14,7 +14,7 @@
 #include <vector>
 #include <algorithm>
 
-namespace aicad::platform {
+namespace chudware::platform {
 
 static uint8_t clamp_u8(int v) {
     return (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
@@ -141,6 +141,6 @@ std::unique_ptr<CameraBackend> createV4L2Camera() {
     return std::make_unique<V4L2CameraBackend>();
 }
 
-}  // namespace aicad::platform
+}  // namespace chudware::platform
 
 #endif  // __linux__

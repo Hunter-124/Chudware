@@ -1,5 +1,5 @@
 // T-RF15 (node R4a) — firmware engine surface unit tests, driving
-// aicad::firmware::call directly (no routing layer). Mirrors the Python
+// chudware::firmware::call directly (no routing layer). Mirrors the Python
 // suites engine_oracle/firmware/test_project.py / test_pinmap.py /
 // test_coverify.py / test_mcp_tools.py over the same fixture shapes.
 //
@@ -49,11 +49,11 @@ void unset_env(const char* key) {
 #endif
 }
 
-#ifndef AICAD_TEST_DATA
-#define AICAD_TEST_DATA "tests/data/firmware"
+#ifndef CHUDWARE_TEST_DATA
+#define CHUDWARE_TEST_DATA "tests/data/firmware"
 #endif
 
-const fs::path kData = fs::path(AICAD_TEST_DATA);
+const fs::path kData = fs::path(CHUDWARE_TEST_DATA);
 
 json read_json(const fs::path& p) {
     std::ifstream in(p);
@@ -70,18 +70,18 @@ std::string read_text(const fs::path& p) {
 }
 
 // Isolated firmware root per process (mirrors the Python tests' tmp_path +
-// AI_CAD_FIRMWARE_DIR override).
+// CHUDWARE_FIRMWARE_DIR override).
 struct FirmwareRootGuard {
     fs::path dir;
     FirmwareRootGuard() {
         dir = fs::temp_directory_path() /
-              ("aicad-fwtest-" + std::to_string(static_cast<long long>(
+              ("chudware-fwtest-" + std::to_string(static_cast<long long>(
                    std::chrono::system_clock::now().time_since_epoch().count())));
         fs::create_directories(dir);
-        set_env("AI_CAD_FIRMWARE_DIR", dir.string());
+        set_env("CHUDWARE_FIRMWARE_DIR", dir.string());
     }
     ~FirmwareRootGuard() {
-        unset_env("AI_CAD_FIRMWARE_DIR");
+        unset_env("CHUDWARE_FIRMWARE_DIR");
         std::error_code ec;
         fs::remove_all(dir, ec);
     }
@@ -90,7 +90,7 @@ struct FirmwareRootGuard {
 json call(const std::string& method, const json& params) {
     json result;
     std::string err;
-    bool handled = aicad::firmware::call(method, params, result, err);
+    bool handled = chudware::firmware::call(method, params, result, err);
     REQUIRE(handled);
     return result;
 }
@@ -115,10 +115,10 @@ const json kBlinkSrc = {
 TEST_CASE("dispatch: unknown methods fall through") {
     json result;
     std::string err;
-    CHECK_FALSE(aicad::firmware::call("bogus_method", json::object(), result, err));
+    CHECK_FALSE(chudware::firmware::call("bogus_method", json::object(), result, err));
     // The whole fw_* surface is ported (T-RF15 resume) — every fw_ method handles.
     for (const char* m : {"fw_sim_run", "fw_power_profile", "fw_sensor_scenario"}) {
-        CHECK(aicad::firmware::call(m, json::object(), result, err));
+        CHECK(chudware::firmware::call(m, json::object(), result, err));
     }
 }
 
@@ -141,7 +141,7 @@ TEST_CASE("fw_new_project: scaffold + template + compile_commands") {
     CHECK(fs::is_regular_file(root / "compile_commands.json"));
     CHECK(fs::is_regular_file(root / "CMakeLists.txt"));
     CHECK(fs::is_regular_file(root / "src" / "main.c"));
-    CHECK(fs::is_regular_file(root / "include" / "aicad_trace.h"));
+    CHECK(fs::is_regular_file(root / "include" / "chudware_trace.h"));
     // The synthetic compile_commands enumerates the template sources (§6).
     json cc = read_json(root / "compile_commands.json");
     REQUIRE(cc.is_array());
@@ -203,8 +203,8 @@ TEST_CASE("fw_build: graceful toolchain_not_found when the cross-compiler is abs
     json created = call("fw_new_project", {{"mcu_family", "stm32f4"}});
     std::string pid = created["project_id"];
 
-    bool have_cmake = !aicad::firmware::which("cmake").empty();
-    bool have_gcc = !aicad::firmware::which("arm-none-eabi-gcc").empty();
+    bool have_cmake = !chudware::firmware::which("cmake").empty();
+    bool have_gcc = !chudware::firmware::which("arm-none-eabi-gcc").empty();
     json r = call("fw_build", {{"project_id", pid}});
     if (have_cmake && have_gcc) {
         // Real build leg — the template must compile cleanly.
@@ -230,7 +230,7 @@ TEST_CASE("fw_build: graceful toolchain_not_found when the cross-compiler is abs
 
 TEST_CASE("pinmap: header generation is byte-identical to the Python golden") {
     json board = read_json(kData / "board_demo.json");
-    std::string header = aicad::firmware::generate_pinmap(board, "stm32f4");
+    std::string header = chudware::firmware::generate_pinmap(board, "stm32f4");
     CHECK(header == read_text(kData / "pinmap_demo.golden.h"));
     // Power/ground rails never emitted.
     CHECK(header.find("PIN_VDD") == std::string::npos);
@@ -354,7 +354,7 @@ TEST_CASE("fw_flash / fw_debug_*: envelopes + graceful tool_not_found") {
     r = call("fw_debug_read_mem", {{"chip", "STM32F407VGTx"}});
     CHECK(r.value("code", "") == "invalid_request");  // missing address/length
 
-    if (aicad::firmware::which("probe-rs").empty()) {
+    if (chudware::firmware::which("probe-rs").empty()) {
         r = call("fw_flash", {{"elf_path", "/tmp/fw.elf"}, {"chip", "STM32F407VGTx"}});
         CHECK(r.value("success", true) == false);
         CHECK(r.value("returncode", 0) == -1);
@@ -381,7 +381,7 @@ TEST_CASE("fw_flash / fw_debug_*: envelopes + graceful tool_not_found") {
     }
 
     // esptool route: explicit port + .bin.
-    if (aicad::firmware::which("esptool.py").empty()) {
+    if (chudware::firmware::which("esptool.py").empty()) {
         r = call("fw_flash", {{"elf_path", "/tmp/fw.bin"}, {"port", "/dev/ttyUSB0"}});
         CHECK(r.value("success", true) == false);
         CHECK(r.value("returncode", 0) == -1);
@@ -451,16 +451,16 @@ TEST_CASE("fw_projects: lists sidecars newest-first, skips corrupt ones") {
 TEST_CASE("emulator parsers: gpio/uart events + ODR snapshot (pure)") {
     std::string raw =
         "noise line\n"
-        "AICAD_GPIO_EVT PA5=1\n"
-        "AICAD_GPIO_EVT PA5=0 t=10ms\n"
-        "AICAD_GPIO_EVT PB3=1 t=2500us\n"
-        "AICAD_GPIO_EVT PB3=0 t=1s\n"
-        "AICAD_T_MARK 100\n"
+        "CHUDWARE_GPIO_EVT PA5=1\n"
+        "CHUDWARE_GPIO_EVT PA5=0 t=10ms\n"
+        "CHUDWARE_GPIO_EVT PB3=1 t=2500us\n"
+        "CHUDWARE_GPIO_EVT PB3=0 t=1s\n"
+        "CHUDWARE_T_MARK 100\n"
         "hello world\n"
-        "AICAD_GPIO_ODR_BEGIN A\n"
+        "CHUDWARE_GPIO_ODR_BEGIN A\n"
         "0x00000021\n"
-        "AICAD_GPIO_ODR_END A\n";
-    json ev = aicad::firmware::parse_gpio_events(raw);
+        "CHUDWARE_GPIO_ODR_END A\n";
+    json ev = chudware::firmware::parse_gpio_events(raw);
     REQUIRE(ev.size() == 4);
     CHECK(ev[0].value("pin", "") == "PA5");
     CHECK(ev[0]["t_ms"].is_null());          // Renode hook prints carry no t
@@ -469,7 +469,7 @@ TEST_CASE("emulator parsers: gpio/uart events + ODR snapshot (pure)") {
     CHECK(ev[3].value("t_ms", 0.0) == 1000.0);  // s
     CHECK(ev[0].value("seq", -1) == 1);
 
-    json uart = aicad::firmware::parse_uart_events(raw);
+    json uart = chudware::firmware::parse_uart_events(raw);
     // noise (pre-mark), hello world (after mark@100), and the raw ODR hex line
     // (not a marker — Python's filter only excludes *_EVT / *_ODR_ lines).
     REQUIRE(uart.size() == 3);
@@ -478,20 +478,20 @@ TEST_CASE("emulator parsers: gpio/uart events + ODR snapshot (pure)") {
     CHECK(uart[1].value("text", "") == "hello world");
     CHECK(uart[2].value("text", "") == "0x00000021");
 
-    json odr = aicad::firmware::parse_renode_gpio_odr(raw);
+    json odr = chudware::firmware::parse_renode_gpio_odr(raw);
     CHECK(odr.value("PA0", -1) == 1);
     CHECK(odr.value("PA5", -1) == 1);
     CHECK(odr.value("PA1", -1) == 0);
     CHECK(odr.size() == 16);
 
     // ODR snapshot wins over the last event on merge.
-    json states = aicad::firmware::derive_gpio_states(ev, odr);
+    json states = chudware::firmware::derive_gpio_states(ev, odr);
     CHECK(states.value("PA5", -1) == 1);
     CHECK(states.value("PB3", -1) == 0);
 }
 
 TEST_CASE("evaluate_assertions: full grammar (pure)") {
-    using aicad::firmware::evaluate_assertions;
+    using chudware::firmware::evaluate_assertions;
     json gpio_events = json::array({
         {{"type", "gpio"}, {"seq", 1}, {"t_ms", 10.0}, {"pin", "PA5"}, {"level", 1}},
         {{"type", "gpio"}, {"seq", 2}, {"t_ms", 60.0}, {"pin", "PA5"}, {"level", 0}},
@@ -542,7 +542,7 @@ TEST_CASE("evaluate_assertions: full grammar (pure)") {
 }
 
 TEST_CASE("scenario: validation + fixtures + plan (pure)") {
-    using namespace aicad::firmware;
+    using namespace chudware::firmware;
 
     // Fixture library
     auto names = list_fixtures();
@@ -601,12 +601,12 @@ TEST_CASE("scenario: validation + fixtures + plan (pure)") {
     ScenarioPlan no_port = build_scenario_plan(fx, get_capabilities("rp2040"), "");
     CHECK(!no_port.errors.empty());
 
-    // timeline rendering: sleep interleave + AICAD_T_MARK marks
+    // timeline rendering: sleep interleave + CHUDWARE_T_MARK marks
     auto lines = timeline_resc_lines({{100.0, "act1"}, {100.0, "act2"}, {250.0, "act3"}}, 1.0);
     REQUIRE(lines.size() >= 7);
-    CHECK(lines[0] == "echo \"AICAD_T_MARK 0\"");
+    CHECK(lines[0] == "echo \"CHUDWARE_T_MARK 0\"");
     CHECK(lines[1] == "sleep 0.100");
-    CHECK(lines[2] == "echo \"AICAD_T_MARK 100\"");
+    CHECK(lines[2] == "echo \"CHUDWARE_T_MARK 100\"");
     CHECK(lines[3] == "act1");
     CHECK(lines[4] == "act2");
     CHECK(lines[5] == "sleep 0.150");
@@ -651,21 +651,21 @@ TEST_CASE("fw_sim_run: envelopes + no-elf + esp32 refusal + invalid scenario") {
 // Compile the semihosting hello fixture when the cross-compiler is available;
 // returns "" when it cannot be built (test then SKIPs honestly).
 static std::string build_semi_hello(const fs::path& dir) {
-    if (aicad::firmware::which("arm-none-eabi-gcc").empty()) return "";
+    if (chudware::firmware::which("arm-none-eabi-gcc").empty()) return "";
     fs::path elf = dir / "semi_hello.elf";
     std::vector<std::string> cmd = {
         "arm-none-eabi-gcc", "-mcpu=cortex-m3", "-mthumb", "-nostdlib", "-nostartfiles",
         "-Os", "-T", (kData / "semi_hello.ld").string(),
         (kData / "semi_hello.c").string(), "-o", elf.string(),
     };
-    auto rr = aicad::firmware::run_capture(cmd, "", 60.0);
+    auto rr = chudware::firmware::run_capture(cmd, "", 60.0);
     if (rr.returncode != 0) return "";
     std::error_code ec;
     return fs::is_regular_file(elf, ec) ? elf.string() : "";
 }
 
 TEST_CASE("fw_sim_run LIVE: QEMU semihosting path (honest skip without tools)") {
-    bool have_qemu = !aicad::firmware::which("qemu-system-arm").empty();
+    bool have_qemu = !chudware::firmware::which("qemu-system-arm").empty();
     FirmwareRootGuard guard;
     std::string elf = build_semi_hello(guard.dir);
     if (!have_qemu || elf.empty()) {
@@ -705,12 +705,12 @@ TEST_CASE("fw_sim_run LIVE: QEMU semihosting path (honest skip without tools)") 
 }
 
 TEST_CASE("fw_sim_run LIVE: Renode UART path on stm32f4 (honest skip without tools)") {
-    bool have_renode = !aicad::firmware::which("renode").empty();
+    bool have_renode = !chudware::firmware::which("renode").empty();
     FirmwareRootGuard guard;
     std::string elf;
-    if (!aicad::firmware::which("arm-none-eabi-gcc").empty()) {
+    if (!chudware::firmware::which("arm-none-eabi-gcc").empty()) {
         elf = (guard.dir / "stm32_hello.elf").string();
-        auto rr = aicad::firmware::run_capture(
+        auto rr = chudware::firmware::run_capture(
             {"arm-none-eabi-gcc", "-mcpu=cortex-m4", "-mthumb", "-nostdlib", "-nostartfiles",
              "-Os", "-T", (kData / "stm32_hello.ld").string(),
              (kData / "stm32_hello.c").string(), "-o", elf},
@@ -838,7 +838,7 @@ TEST_CASE("fw_sensor_scenario: bridge builds a valid scenario + envelopes") {
 
 TEST_CASE("fw_verify_board: emulate=true takes the live path") {
     FirmwareRootGuard guard;
-    bool have_qemu = !aicad::firmware::which("qemu-system-arm").empty();
+    bool have_qemu = !chudware::firmware::which("qemu-system-arm").empty();
     std::string elf = build_semi_hello(guard.dir);
     if (!have_qemu || elf.empty()) {
         MESSAGE("SKIP live emulate=true leg: qemu-system-arm or arm-none-eabi-gcc absent");

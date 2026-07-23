@@ -1,4 +1,4 @@
-// AI-CAD 'S' shortcut bar (C25).
+// Chudware 'S' shortcut bar (C25).
 #include "shortcut_bar.h"
 
 #include "imgui.h"

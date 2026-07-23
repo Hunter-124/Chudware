@@ -1,4 +1,4 @@
-# Research: Web / Network / Auth Surfaces (Billet → multi-user web)
+# Research: Web / Network / Auth Surfaces (Chudware → multi-user web)
 
 Scope: Webservice/, .env (keys only), config.example.json, services/ipc/, services/browser/, services/agent/ (server/event surface only), services/mcp/ (transport/server only), docs/REDACTION_DESIGN.md, docs/AI_HARNESS_ROADMAP.md, opencode.json, .mcp.json, README webservice mentions, git posture of Webservice/Cloudflare-info.txt.
 
@@ -11,8 +11,8 @@ Read-only. Secret **values redacted** — only key names reported.
 | Surface | Transport | Bind / address | Evidence |
 |---|---|---|---|
 | **MCP server** | **stdio only** (JSON-RPC over stdin/stdout) | No TCP/HTTP port | `services/mcp/server.py:15` “Runs over stdio”; `services/mcp/AGENTS.md:5-8`; main uses `mcp.server.stdio.stdio_server` / `mcp.run()` at `server.py:682-700` |
-| **aicad-hostd** (engine daemon) | NDJSON over **AF_UNIX** (POSIX) / named pipe (Win) | `$XDG_RUNTIME_DIR/aicad/hostd-<key>.sock` (or `/run/user/<uid>/aicad/…` or `/tmp/aicad-<uid>/…`) | `services/ipc/ipc_transport.h:8-11`; `services/ipc/ipc_discovery.cpp:47-89` (`runtimeDir`, `socketPath`); `services/mcp/daemon_bridge.py:168-200`; `core/hostd/main.cpp:206-214` `listener.listen(sock)` |
-| **CEF daemon** (`--cef-daemon`) | NDJSON over **AF_UNIX** | `$XDG_RUNTIME_DIR/aicad/cefd-<key>.sock` or `/tmp/…` | `services/browser/cef_client.py:1-17,69-78,81-91` |
+| **chudware-hostd** (engine daemon) | NDJSON over **AF_UNIX** (POSIX) / named pipe (Win) | `$XDG_RUNTIME_DIR/chudware/hostd-<key>.sock` (or `/run/user/<uid>/chudware/…` or `/tmp/chudware-<uid>/…`) | `services/ipc/ipc_transport.h:8-11`; `services/ipc/ipc_discovery.cpp:47-89` (`runtimeDir`, `socketPath`); `services/mcp/daemon_bridge.py:168-200`; `core/hostd/main.cpp:206-214` `listener.listen(sock)` |
+| **CEF daemon** (`--cef-daemon`) | NDJSON over **AF_UNIX** | `$XDG_RUNTIME_DIR/chudware/cefd-<key>.sock` or `/tmp/…` | `services/browser/cef_client.py:1-17,69-78,81-91` |
 | **OAuth CallbackServer** (LLM subscription login) | **localhost HTTP** (stdlib `http.server.HTTPServer`) | **Fixed ports:** Codex `1455`, Anthropic `54545`; path `/auth/callback` or `/callback` | `services/agent/providers/sub_auth.py:47-143`; `codex_sub_provider.py:20-22`; `anthropic_sub_provider.py:26-28` |
 | **llama.cpp / local OpenAI-compat** | Outbound client + optional **child HTTP server** | Default example `http://127.0.0.1:1234/v1`; runtime can `_pick_free_port()` | `config.example.json:16-17`; `services/agent/local_runtime.py:161-165,227-256` |
 | **Chrome DevTools (login only)** | Ephemeral `http://127.0.0.1:<free_port>/json` | OS-assigned free port during native Chrome login | `services/browser/session.py:210-224` (`_free_port`, `_devtools_tabs`) |
@@ -30,8 +30,8 @@ IPC framing (reuse-worthy pattern, not a web server): newline-delimited JSON-RPC
 
 **What it is:** User-authenticated **headless browser acquisition** for parts vendors — **not** a web UI host.
 
-- Primary headless path: **host CEF daemon** (`AI-CAD --cef-daemon`) driven by `cef_client.py` over AF_UNIX JSON-RPC (`services/browser/README.md:1-12`; `cef_client.py:1-17`).
-- Residual: **Playwright / patchright / camoufox** factory in `driver.py` for headed login, embed, cookie export (`driver.py:1-27`; env `BILLET_PW_BACKEND`).
+- Primary headless path: **host CEF daemon** (`Chudware --cef-daemon`) driven by `cef_client.py` over AF_UNIX JSON-RPC (`services/browser/README.md:1-12`; `cef_client.py:1-17`).
+- Residual: **Playwright / patchright / camoufox** factory in `driver.py` for headed login, embed, cookie export (`driver.py:1-27`; env `CHUDWARE_PW_BACKEND`).
 - `session.py`: `browser_login` (headed), `browser_fetch` / `browser_download` (headless CEF) (`session.py:1-34`).
 - `embed.py`: **in-process** Chromium on a private asyncio thread; streams **JPEG frames via CDP screencast** to ImGui panels over engine worker RPCs — “plain request/response seam”, **not HTTP to a browser client** (`embed.py:1-20`).
 - Profiles: local only under app data (`README.md:34-38`); never synced.
@@ -168,7 +168,7 @@ Env examples (keys only):
 
 ## OPEN QUESTIONS
 
-1. Will each user container run full **Billet+GLFW+GL** (needs virtual GL/X as HeadlessScout noted) or a future headless/stream-native path?
+1. Will each user container run full **Chudware+GLFW+GL** (needs virtual GL/X as HeadlessScout noted) or a future headless/stream-native path?
 2. Shared hostd vs **one engine daemon per session** under cgroup GPU sharing (3–6 users, one 3080 Ti)?
 3. Shoutbox storage: extend PLM/git-vault, separate sqlite, or redis — and retention/moderation?
 4. Cloudflare role: **Tunnel only**, R2 for assets, or full edge auth — credentials file implies R2 ready; tunnel binary not installed yet on host.
@@ -181,5 +181,5 @@ Env examples (keys only):
 **`.env`:** `NEXAR_CLIENT_ID`, `NEXAR_CLIENT_SECRET`, `JLCPCB_ACCESS_KEY`, `JLCPCB_SECRET_KEY`  
 **`Webservice/Cloudflare-info.txt` labels:** Account ID, API Token, Access Key ID, Secret Access Key, S3 API endpoint  
 **`config.example.json`:** provider, model, api_key, reasoning_effort, max_output_tokens, context_window, openai.base_url, llamacpp.{base_url,model_path,auto_start,ctx_size,gpu_layers,vision}, telemetry_consent, experimental.*  
-**Browser env:** `BILLET_PW_BACKEND`, `AI_CAD_BIN`, `AICAD_CEF_SOCKET`, `AICAD_CEF_KEY`  
-**Hostd env:** `AICAD_HOSTD_SOCKET`, `AICAD_HOSTD_BIN`, `AICAD_INSTANCE_KEY`, `XDG_RUNTIME_DIR`
+**Browser env:** `CHUDWARE_PW_BACKEND`, `CHUDWARE_BIN`, `CHUDWARE_CEF_SOCKET`, `CHUDWARE_CEF_KEY`  
+**Hostd env:** `CHUDWARE_HOSTD_SOCKET`, `CHUDWARE_HOSTD_BIN`, `CHUDWARE_INSTANCE_KEY`, `XDG_RUNTIME_DIR`

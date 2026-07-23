@@ -2,7 +2,7 @@
 
 **Task:** T-V2  **Agent:** sonnet-vega  **Date:** 2026-07-02
 
-**Library:** `/home/hunter/Repositories/CAD/core/build-linux/bin/libaicad.so`
+**Library:** `/home/hunter/Repositories/CAD/core/build-linux/bin/libchudware.so`
 **Total registered tools:** 184
 
 ## Summary

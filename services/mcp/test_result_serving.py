@@ -19,7 +19,7 @@ def test_count_tokens_chars_per_token():
 
 
 def test_dumps_compact_by_default(monkeypatch):
-    monkeypatch.delenv("AICAD_MCP_PRETTY", raising=False)
+    monkeypatch.delenv("CHUDWARE_MCP_PRETTY", raising=False)
     s = rs.dumps({"ok": True, "x": [1, 2]})
     assert "\n" not in s
     assert ": " not in s  # compact separators
@@ -27,14 +27,14 @@ def test_dumps_compact_by_default(monkeypatch):
 
 
 def test_dumps_pretty_via_env(monkeypatch):
-    monkeypatch.setenv("AICAD_MCP_PRETTY", "1")
+    monkeypatch.setenv("CHUDWARE_MCP_PRETTY", "1")
     s = rs.dumps({"ok": True})
     assert "\n" in s
     assert json.loads(s)["ok"] is True
 
 
 def test_dumps_explicit_indent_wins(monkeypatch):
-    monkeypatch.delenv("AICAD_MCP_PRETTY", raising=False)
+    monkeypatch.delenv("CHUDWARE_MCP_PRETTY", raising=False)
     s = rs.dumps({"ok": True}, indent=2)
     assert "\n" in s
 
@@ -170,8 +170,8 @@ def test_pretty_vs_compact_ratio(monkeypatch):
         "nets": [{"name": f"N{i}", "size": 2} for i in range(40)],
         "hint": "h", "next_actions": ["n"], "warnings": [],
     }
-    monkeypatch.delenv("AICAD_MCP_PRETTY", raising=False)
+    monkeypatch.delenv("CHUDWARE_MCP_PRETTY", raising=False)
     compact = rs.dumps(payload)
-    monkeypatch.setenv("AICAD_MCP_PRETTY", "1")
+    monkeypatch.setenv("CHUDWARE_MCP_PRETTY", "1")
     pretty = rs.dumps(payload)
     assert len(pretty) / max(len(compact), 1) >= 1.3

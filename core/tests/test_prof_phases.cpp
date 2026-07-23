@@ -8,7 +8,7 @@
 // Part 2 proves the sim instrumentation: a small OCCT-free structured tet4 cantilever
 // through fea_static_solve must land its "solve.*" phases (recorded by FeaProf::mark at
 // the setup/assemble/factorize/back-substitute/stress-recovery boundaries) in an
-// enclosing study, without AI_CAD_FEA_PROFILE being set — the registry is always-on.
+// enclosing study, without CHUDWARE_FEA_PROFILE being set — the registry is always-on.
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
@@ -20,7 +20,7 @@
 #include "prof/phases.h"
 #include "sim/fea_static.h"
 
-namespace phases = aicad::prof::phases;
+namespace phases = chudware::prof::phases;
 using nlohmann::json;
 
 namespace {
@@ -152,10 +152,10 @@ TEST_CASE("fea_static_solve records solve.* phases into an enclosing study") {
         if (points[n * 3 + 0] > 40.0 - 1e-9) forces[n * 3 + 2] = 10.0;  // N
     }
 
-    aicad::sim::FeaStaticResult res;
+    chudware::sim::FeaStaticResult res;
     {
         phases::StudyScope study("unit_fea");
-        res = aicad::sim::fea_static_solve(points, tets, 200000.0 /*E MPa*/, 0.3 /*nu*/,
+        res = chudware::sim::fea_static_solve(points, tets, 200000.0 /*E MPa*/, 0.3 /*nu*/,
                                            250.0 /*yield MPa*/, fixed, forces,
                                            4 /*tet4*/);
     }

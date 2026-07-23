@@ -42,7 +42,7 @@ write-sets the DAG assigns and let the integrator gate own shared files.
 
 ## Definition of done
 
-- [x] `aicad_ui_viewport` compiles standalone, zero `#include` into `host/`
+- [x] `chudware_ui_viewport` compiles standalone, zero `#include` into `host/`
 - [x] Theme helpers compile; no literal colors outside `tokens.h`/`theme.*`
 - [x] Zero OS `#ifdef` outside `platform/`
 - [x] AI-CAD2 routes doc ops through `WorkerClient`

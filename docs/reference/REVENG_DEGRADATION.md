@@ -10,7 +10,7 @@ degradation scenarios.
 | Key | Meaning | Requirements |
 |-----|---------|--------------|
 | `gpu` | CUDA/GPU detected | `/dev/nvidia0` present, or `nvidia-smi` on PATH, or `CUDA_VISIBLE_DEVICES` set non-empty |
-| `webcam` | Live capture possible | `/dev/video0` present, or `AICAD_TEST_CAMERA=1` |
+| `webcam` | Live capture possible | `/dev/video0` present, or `CHUDWARE_TEST_CAMERA=1` |
 | `sparse` | Sparse SfM (COLMAP / VGGT) | `COLMAP_BIN` set + path exists, or `colmap` on PATH, or `VGGT_WEIGHTS` set |
 | `dense` | Dense mesh (OpenMVS) | `sparse` **and** `OPENMVS_BIN` set + path exists |
 | `splat` | 3DGS trainer (Brush) | `BRUSH_BIN` set, or Brush binary downloaded |

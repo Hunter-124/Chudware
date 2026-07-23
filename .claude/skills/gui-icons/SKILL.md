@@ -1,11 +1,11 @@
 ---
 name: gui-icons
-description: Billet (formerly AI-CAD) icon subsystem specialist — generating icons (procedural PIL icons and screenshot-based icons rendered from scripts that drive the modeling engine), editing the atlases, and wiring icons into the GUI. Use for any task mentioning icons, the icon atlas, ribbon/tree glyphs, icon recipes, contact sheets, or the icon pipeline. Workers dispatched by gui-orchestrator read this file first instead of searching the repo.
+description: Chudware (formerly Chudware) icon subsystem specialist — generating icons (procedural PIL icons and screenshot-based icons rendered from scripts that drive the modeling engine), editing the atlases, and wiring icons into the GUI. Use for any task mentioning icons, the icon atlas, ribbon/tree glyphs, icon recipes, contact sheets, or the icon pipeline. Workers dispatched by gui-orchestrator read this file first instead of searching the repo.
 ---
 
 # GUI Icons Specialist
 
-Scope: everything about how Billet icons are made, stored, and drawn. You do NOT need to know
+Scope: everything about how Chudware icons are made, stored, and drawn. You do NOT need to know
 anything about the Parts Library, sketcher, or other panels — if your task drifts there, that's
 a different specialist's job (`.claude/skills/gui-workspaces/SKILL.md` etc.).
 
@@ -24,7 +24,7 @@ theme atlases at TWO sizes:
 
 **2. Screenshot-based icons from modeling scripts** — `scripts/icon_pipeline.py` (T-G15/T-BL34).
 A recipe (name, camera, build steps) drives the REAL engine headlessly: the GUI runs with
-`AI_CAD_SHOT=iconpipe` + `AI_CAD_ICON_RECIPES=<json>`, builds each demo part (newPart +
+`CHUDWARE_SHOT=iconpipe` + `CHUDWARE_ICON_RECIPES=<json>`, builds each demo part (newPart +
 applyOps), renders through the transparent thumbnail path (no chrome, no gizmo, alpha=0) to
 `scratch/icon_render/<name>.png`, then fits the render into that icon's @32/@20 cells in BOTH
 atlases — all other cells preserved byte-for-byte.

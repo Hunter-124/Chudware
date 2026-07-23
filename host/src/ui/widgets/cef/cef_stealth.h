@@ -14,7 +14,7 @@
 // HTML is extracted natively via CefFrame::GetSource — never Runtime.evaluate —
 // precisely to keep the Runtime domain disabled.
 //
-// Compiled only with AI_CAD_ENABLE_CEF.
+// Compiled only with CHUDWARE_ENABLE_CEF.
 #pragma once
 
 #include "include/cef_browser.h"
@@ -50,7 +50,7 @@ const char* stealth_init_script();
 const char* recaptcha_login_helper_script();
 
 // DIAGNOSTIC (opt-in): a main-frame reCAPTCHA-flow logger. Inject ONLY when
-// AI_CAD_CEF_NETLOG=1, main frame only. Emits console '[RC] …' lines (routed to the
+// CHUDWARE_CEF_NETLOG=1, main frame only. Emits console '[RC] …' lines (routed to the
 // trace file by CefWebView's OnConsoleMessage) capturing challenge-iframe appearance,
 // login-POST status, and Magento's customer-data verdict — the root-cause trail for a
 // live panel login. Pure observation; not part of the production stealth surface.

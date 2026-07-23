@@ -44,7 +44,7 @@
 #include <gp_Pnt.hxx>
 #include <gp_Vec.hxx>
 
-namespace aicad::doc {
+namespace chudware::doc {
 
 // _RESOLVE_MAP_TOL_FRAC — the map tolerance is a small fraction of the bounding-box
 // diagonal (mirrors dress.py). The unique element should coincide with the descriptor
@@ -970,4 +970,4 @@ QueryPicks resolve_geom_query(const TopoDS_Shape& shape, const nlohmann::json& q
     return out;
 }
 
-}  // namespace aicad::doc
+}  // namespace chudware::doc

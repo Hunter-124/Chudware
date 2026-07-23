@@ -1,10 +1,10 @@
 // Regression test for the CIRCLE-RIM DRAG-RESIZE bug, exercised through the EXACT RPC
 // path the host uses (doc_sketch_enter -> doc_sketch_drag -> doc_sketch_drag_commit),
-// NOT the low-level aicad::sketch::drag() the parity test calls directly.
+// NOT the low-level chudware::sketch::drag() the parity test calls directly.
 //
 // THE BUG (as the user saw it): dragging a circle's rim made the WHOLE sketch vanish
 // mid-drag and never resized on release. Root cause was twofold:
-//   1. The staged libaicad.so the host dlopen()s was older than the core build, so the
+//   1. The staged libchudware.so the host dlopen()s was older than the core build, so the
 //      ".rim" drag handle (added to resolve_handle/drag) was not present in the running
 //      kernel -> drag() rejected the handle -> ok:false.
 //   2. doc_sketch_drag() returned a `{ok:false}` envelope WITHOUT an `entities` key on a
@@ -27,11 +27,11 @@
 #include "doc/session.h"
 
 using json = nlohmann::json;
-using aicad::doc::doc_new;
-using aicad::doc::doc_apply_ops;
-using aicad::doc::doc_sketch_enter;
-using aicad::doc::doc_sketch_drag;
-using aicad::doc::doc_sketch_drag_commit;
+using chudware::doc::doc_new;
+using chudware::doc::doc_apply_ops;
+using chudware::doc::doc_sketch_enter;
+using chudware::doc::doc_sketch_drag;
+using chudware::doc::doc_sketch_drag_commit;
 
 namespace {
 

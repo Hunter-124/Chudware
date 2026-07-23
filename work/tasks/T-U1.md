@@ -67,7 +67,7 @@ Kit landed exactly as scoped, derived from the existing T-F16 exemplar (`artifac
   placeholder precedent for scaffold panels.
 - `ui/abstract/scaffold_demo_view.h` + `ui/imgui/src/ui/scaffold_demo_panel.{h,cpp}` — the demo
   panel proving the kit end-to-end (view-model-first, search filter, row pills, empty state,
-  status footer). Wired as a one-shot scenario (`AI_CAD_SHOT=scaffold_demo`, added to
+  status footer). Wired as a one-shot scenario (`CHUDWARE_SHOT=scaffold_demo`, added to
   `ShotConfig`/`configureShot`), not a `ScenarioRunner` step machine, so it's unaffected by the
   T-G13 offscreen-deadlock issue. Floats centered (`ImGuiCond_Appearing`, `equations_dialog.cpp`
   pattern) rather than dock-registered — it's a kit demo, not a shipped feature.
@@ -86,7 +86,7 @@ Kit landed exactly as scoped, derived from the existing T-F16 exemplar (`artifac
   manual-regen stage), wired into the stage sequence before `stage_core_build`.
 
 **Verified:** `flock /tmp/host-build-linux.lock` build of `build/linux-app` (AI-CAD2) clean;
-headless `xvfb-run ... --shot AI_CAD_SHOT=scaffold_demo` screenshot confirms the scaffold header,
+headless `xvfb-run ... --shot CHUDWARE_SHOT=scaffold_demo` screenshot confirms the scaffold header,
 search row, three row-pill rows, and status footer all render correctly (glass row-pill z-order
 verified — background drawn before content, per the pitfall documented in the pattern library).
 Fixed one runtime bug found via the screenshot: an em-dash in the demo's status string rendered
@@ -106,4 +106,4 @@ No advisor questions — this task was fully spec'd (derive-don't-invent from an
 exemplar), no architectural ambiguity hit.
 
 ## Progress log
-- 2026-07-02 22:26 UTC [sonnet-reed] REVIEW T-U1 branch=task/T-U1-ui — UI style-conformance kit: docs/UI_PATTERN_LIBRARY.md (7 patterns w/ code pointers, derived from T-F16 artifact_view.h/preview_pane.cpp), panel_scaffold.{h,cpp} (header/search/content/footer on existing theme:: glass APIs), demo panel (ui/abstract/scaffold_demo_view.h + scaffold_demo_panel.{h,cpp}) wired as one-shot AI_CAD_SHOT=scaffold_demo (not a ScenarioRunner step machine, so unaffected by T-G13/issue #7), scripts/ui_style_check.py (literal-color/OS-ifdef/view-model-header rules, baseline absorbs 18 genuine pre-existing findings, --selftest green), scripts/ui_inventory.py auto-discovers PanelScaffoldSpec panels with zero manual registration (verified against scaffold_demo). Wired ui_style_check.py into gate.sh as an advisory stage (T-Q4 manual-regen pattern). Verified: flock'd build/linux-app build clean, headless --shot screenshot confirms header/search/row-pills/footer render + correct z-order (bg-before-content pitfall documented in the pattern lib); caught+fixed a runtime bug via the screenshot (em-dash rendered as '?' — font glyph-range gap, replaced with hyphen). Gate: core build+ctest 100% PASS, ui/imgui build+shot PASS, ui_style_check.py PASS; pytest+selftest FAIL-RECORDED are the pre-existing issue #6/T-INF1 no-venv gap (task touches no engine/Python code). graphify updated (25493 nodes/53181 edges). T-U2..T-U8 can now build on panel_scaffold.h.
+- 2026-07-02 22:26 UTC [sonnet-reed] REVIEW T-U1 branch=task/T-U1-ui — UI style-conformance kit: docs/UI_PATTERN_LIBRARY.md (7 patterns w/ code pointers, derived from T-F16 artifact_view.h/preview_pane.cpp), panel_scaffold.{h,cpp} (header/search/content/footer on existing theme:: glass APIs), demo panel (ui/abstract/scaffold_demo_view.h + scaffold_demo_panel.{h,cpp}) wired as one-shot CHUDWARE_SHOT=scaffold_demo (not a ScenarioRunner step machine, so unaffected by T-G13/issue #7), scripts/ui_style_check.py (literal-color/OS-ifdef/view-model-header rules, baseline absorbs 18 genuine pre-existing findings, --selftest green), scripts/ui_inventory.py auto-discovers PanelScaffoldSpec panels with zero manual registration (verified against scaffold_demo). Wired ui_style_check.py into gate.sh as an advisory stage (T-Q4 manual-regen pattern). Verified: flock'd build/linux-app build clean, headless --shot screenshot confirms header/search/row-pills/footer render + correct z-order (bg-before-content pitfall documented in the pattern lib); caught+fixed a runtime bug via the screenshot (em-dash rendered as '?' — font glyph-range gap, replaced with hyphen). Gate: core build+ctest 100% PASS, ui/imgui build+shot PASS, ui_style_check.py PASS; pytest+selftest FAIL-RECORDED are the pre-existing issue #6/T-INF1 no-venv gap (task touches no engine/Python code). graphify updated (25493 nodes/53181 edges). T-U2..T-U8 can now build on panel_scaffold.h.

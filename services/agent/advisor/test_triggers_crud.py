@@ -1,6 +1,6 @@
 """CRUD + merge tests for context-injection triggers (GUI surface).
 
-Offline: no LLM, no core, no network. Uses a temp AICAD_CONTEXT_INJECTION_DIR.
+Offline: no LLM, no core, no network. Uses a temp CHUDWARE_CONTEXT_INJECTION_DIR.
 """
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from services.agent.advisor import triggers
 @pytest.fixture()
 def user_dir(tmp_path, monkeypatch):
     d = tmp_path / "ctx"
-    monkeypatch.setenv("AICAD_CONTEXT_INJECTION_DIR", str(d))
+    monkeypatch.setenv("CHUDWARE_CONTEXT_INJECTION_DIR", str(d))
     triggers.clear_cache()
     yield d
     triggers.clear_cache()

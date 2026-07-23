@@ -1,6 +1,6 @@
 """Modal + frequency-response regression suite (domain fea_modal_freq).
 
-Drives the REAL in-process engine (AI_CAD_ENGINE_DAEMON=0, services/dist lib via
+Drives the REAL in-process engine (CHUDWARE_ENGINE_DAEMON=0, services/dist lib via
 services.mcp.core_bridge) exactly like the MCP tools do:
 
   * Cantilever natural frequencies vs analytic Euler-Bernoulli modes. A RECTANGULAR
@@ -29,9 +29,9 @@ TOLERANCE (modal vs Euler-Bernoulli): 5 %.
   beam), mode mis-ordering (adjacent analytic modes differ by 3x / 2.1x), and any
   unit slip (>= 1000x).
 
-Skips honestly when the loaded libaicad.so lacks the Netgen FEA RPCs.
+Skips honestly when the loaded libchudware.so lacks the Netgen FEA RPCs.
 
-Run:  AI_CAD_ENGINE_DAEMON=0 .venv-mcp/bin/python -X utf8 -m pytest \
+Run:  CHUDWARE_ENGINE_DAEMON=0 .venv-mcp/bin/python -X utf8 -m pytest \
           services/mcp/test_fea_modal_freq.py -v
 """
 from __future__ import annotations
@@ -43,7 +43,7 @@ import tempfile
 
 import pytest
 
-os.environ.setdefault("AI_CAD_ENGINE_DAEMON", "0")
+os.environ.setdefault("CHUDWARE_ENGINE_DAEMON", "0")
 
 # ---------------------------------------------------------------------------
 # Case constants + analytic references (every value derived here, with citation)
@@ -103,8 +103,8 @@ def _engine():
         cb.call("sim_run_modal", {"study": {}})
     except CoreError as exc:
         if "unknown method" in str(exc):
-            pytest.skip("loaded libaicad.so lacks sim_run_modal "
-                        "(no AICAD_WITH_NETGEN FEA plugin)")
+            pytest.skip("loaded libchudware.so lacks sim_run_modal "
+                        "(no CHUDWARE_WITH_NETGEN FEA plugin)")
         raise
     _CACHE["cb"] = cb
     return cb

@@ -34,7 +34,7 @@ source reads.**
   `services.agent.workspace.check_write_lease`. Read tools skip this entirely (fast path,
   L236-237) — CONFIRMED.
 - **Default policy = allow-all** (module docstring L14, `is_allowed`/`deny_reason` L162-211):
-  behavior-neutral until a DAG node `tools:` list or `AI_CAD_TOOLS_ALLOW`/`_DENY_RISK` env is
+  behavior-neutral until a DAG node `tools:` list or `CHUDWARE_TOOLS_ALLOW`/`_DENY_RISK` env is
   set — CONFIRMED, matches contract §6.
 
 ## 2. `_get_fn` dual-dispatch resolver — CONFIRMED (one live registry, multiple call surfaces)
@@ -71,7 +71,7 @@ source reads.**
 
 - Single source of truth: `contracts/copilot_modes.json` (`aicad.copilot_modes/1`), loaded once
   at import time (`_load_contract()`, L49-54) via `_contract_path()` (L36-46) which resolves
-  `AI_CAD_COPILOT_MODES_JSON` env override → `<repo>/contracts/copilot_modes.json`. Module
+  `CHUDWARE_COPILOT_MODES_JSON` env override → `<repo>/contracts/copilot_modes.json`. Module
   docstring (L1-9) states explicitly: "the Python (MCP/DAG) and C++ (in-app,
   `core/agent/copilot_modes.cpp`) runtimes cannot diverge" and parity is tested via
   `services/agent/test_copilot_modes_parity.py` vs `core/tests/test_copilot_modes.cpp` over the

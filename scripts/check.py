@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Aggregate standards gate for AI-CAD — runs the deterministic source-level checks and exits
+"""Aggregate standards gate for Chudware — runs the deterministic source-level checks and exits
 non-zero if any fail. One command for pre-commit / CI.
 
     python scripts/check.py

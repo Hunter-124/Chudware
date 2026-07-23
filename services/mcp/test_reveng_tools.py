@@ -4,7 +4,7 @@ Round-trips every live tool against the contract shapes.  Long-job tools
 (reconstruct / build_parametric / single_photo / fit_primitives) are verified
 to return the honest ``backend_not_provisioned`` envelope.
 
-Imports are standalone (no libaicad.so, no MCP server running): we stub
+Imports are standalone (no libchudware.so, no MCP server running): we stub
 FastMCP and core_bridge the same way test_mcp_freshness.py does, then call
 register_reveng_tools() directly with the stub MCP object and invoke the
 registered functions by name.
@@ -262,13 +262,13 @@ class TestRevengSessionLifecycle(_FakeMCPTestBase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
-        os.environ["AICAD_REVENG_DIR"] = self.tmp
+        os.environ["CHUDWARE_REVENG_DIR"] = self.tmp
         self.tools = _build_tools()
 
     def tearDown(self):
         import shutil
         shutil.rmtree(self.tmp, ignore_errors=True)
-        os.environ.pop("AICAD_REVENG_DIR", None)
+        os.environ.pop("CHUDWARE_REVENG_DIR", None)
 
     def test_start_session_returns_session_id(self):
         r = _call(self.tools, "reveng_start_session", name="Test bracket")
@@ -493,13 +493,13 @@ class TestRevengStatusTool(_FakeMCPTestBase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
-        os.environ["AICAD_REVENG_DIR"] = self.tmp
+        os.environ["CHUDWARE_REVENG_DIR"] = self.tmp
         self.tools = _build_tools()
 
     def tearDown(self):
         import shutil
         shutil.rmtree(self.tmp, ignore_errors=True)
-        os.environ.pop("AICAD_REVENG_DIR", None)
+        os.environ.pop("CHUDWARE_REVENG_DIR", None)
 
     def test_reveng_status_shape(self):
         """reveng_status() returns the contract §8.1 envelope."""
@@ -528,7 +528,7 @@ class TestRevengLongJobStubs(_FakeMCPTestBase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
-        os.environ["AICAD_REVENG_DIR"] = self.tmp
+        os.environ["CHUDWARE_REVENG_DIR"] = self.tmp
         self.tools = _build_tools()
         create = _call(self.tools, "reveng_start_session", name="Bracket")
         self.sid = create["session_id"]
@@ -536,7 +536,7 @@ class TestRevengLongJobStubs(_FakeMCPTestBase):
     def tearDown(self):
         import shutil
         shutil.rmtree(self.tmp, ignore_errors=True)
-        os.environ.pop("AICAD_REVENG_DIR", None)
+        os.environ.pop("CHUDWARE_REVENG_DIR", None)
 
     def _assert_not_provisioned(self, result: dict):
         self.assertFalse(result["ok"])
@@ -614,7 +614,7 @@ class TestRevengDeviationAndResult(_FakeMCPTestBase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
-        os.environ["AICAD_REVENG_DIR"] = self.tmp
+        os.environ["CHUDWARE_REVENG_DIR"] = self.tmp
         self.tools = _build_tools()
         create = _call(self.tools, "reveng_start_session", name="Bracket")
         self.sid = create["session_id"]
@@ -622,7 +622,7 @@ class TestRevengDeviationAndResult(_FakeMCPTestBase):
     def tearDown(self):
         import shutil
         shutil.rmtree(self.tmp, ignore_errors=True)
-        os.environ.pop("AICAD_REVENG_DIR", None)
+        os.environ.pop("CHUDWARE_REVENG_DIR", None)
 
     def test_get_deviation_no_model_yet(self):
         r = _call(self.tools, "get_reveng_deviation", session_id=self.sid)
@@ -639,13 +639,13 @@ class TestRevengPrintScaleMat(_FakeMCPTestBase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
-        os.environ["AICAD_REVENG_DIR"] = self.tmp
+        os.environ["CHUDWARE_REVENG_DIR"] = self.tmp
         self.tools = _build_tools()
 
     def tearDown(self):
         import shutil
         shutil.rmtree(self.tmp, ignore_errors=True)
-        os.environ.pop("AICAD_REVENG_DIR", None)
+        os.environ.pop("CHUDWARE_REVENG_DIR", None)
 
     def test_invalid_size(self):
         r = _call(self.tools, "reveng_print_scale_mat", size="A3")

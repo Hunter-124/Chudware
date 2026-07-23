@@ -24,7 +24,7 @@
 
 #include "ecad/schema.h"
 
-namespace aicad::ecad::kicad {
+namespace chudware::ecad::kicad {
 
 using nlohmann::json;
 
@@ -1252,4 +1252,4 @@ json import_kicad_pcb(const std::string& source) {
     return doc;
 }
 
-}  // namespace aicad::ecad::kicad
+}  // namespace chudware::ecad::kicad

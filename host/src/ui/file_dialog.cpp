@@ -97,7 +97,7 @@ std::string saveFileDialog(const char* /*filter*/, const char* defExt, const cha
     }
 
     // Folder browser + filename (server abs path under workspace).
-    std::string path = billet::browseWorkspace(billet::WorkspaceBrowseMode::SaveAs,
+    std::string path = chudware::browseWorkspace(chudware::WorkspaceBrowseMode::SaveAs,
                                                /*accept=*/nullptr, suggest.c_str());
     if (path.empty()) return {};
     path = ensureExt(path, defExt);
@@ -114,7 +114,7 @@ std::string openFileDialog(const char* filter) {
     // "Upload from my machine…" reads the file in JS (gesture-safe) into the pick
     // buffer, then returns "__UPLOAD__" so we consume + fsUpload here — never a
     // second input.click() after ASYNCIFY resume (that loses the user gesture).
-    std::string chosen = billet::browseWorkspace(billet::WorkspaceBrowseMode::OpenFile,
+    std::string chosen = chudware::browseWorkspace(chudware::WorkspaceBrowseMode::OpenFile,
                                                  accept.c_str(), /*suggestedName=*/nullptr);
     if (chosen.empty()) return {};  // cancel
 
@@ -125,13 +125,13 @@ std::string openFileDialog(const char* filter) {
         return chosen;
     }
 
-    // Bytes already delivered by billet_web_dialogs.js → billet_file_pick_done.
-    billet::PickedFile picked;
+    // Bytes already delivered by chudware_web_dialogs.js → billet_file_pick_done.
+    chudware::PickedFile picked;
     std::string err;
-    if (!billet::consumePickedFile(picked, err) || picked.name.empty() || picked.data.empty()) {
+    if (!chudware::consumePickedFile(picked, err) || picked.name.empty() || picked.data.empty()) {
         // Fallback for any caller that still signals __UPLOAD__ without bytes.
         if (err == "no pending upload") {
-            if (!billet::pickFile(accept.c_str(), picked, err) ||
+            if (!chudware::pickFile(accept.c_str(), picked, err) ||
                 picked.name.empty() || picked.data.empty()) {
                 if (!err.empty()) {
                     const std::string msg = "Upload failed: " + err;
@@ -153,7 +153,7 @@ std::string openFileDialog(const char* filter) {
             return {};
         }
     }
-    auto& fsb = billet::fsBackend();
+    auto& fsb = chudware::fsBackend();
     std::string root = s_lastDir.empty() ? fsb.defaultRoot() : s_lastDir;
     // Gateway wants a relative dir under the workspace; "" = root.
     // Upload into last-browsed folder when known, else workspace root.
@@ -171,7 +171,7 @@ std::string openFileDialog(const char* filter) {
         }
     }
     std::string upErr;
-    std::string abs = billet::fsUpload(dirRel, picked.name, picked.data.data(),
+    std::string abs = chudware::fsUpload(dirRel, picked.name, picked.data.data(),
                                        picked.data.size(), upErr);
     if (abs.empty()) {
         const std::string msg = "Upload failed: " +
@@ -188,7 +188,7 @@ std::string openFileDialog(const char* filter) {
 }
 
 std::string openFolderDialog() {
-    std::string chosen = billet::browseWorkspace(billet::WorkspaceBrowseMode::OpenFolder,
+    std::string chosen = chudware::browseWorkspace(chudware::WorkspaceBrowseMode::OpenFolder,
                                                  /*accept=*/nullptr, /*suggestedName=*/nullptr);
     if (chosen.empty()) return {};
     s_lastDir = chosen;
@@ -207,7 +207,7 @@ int promptImportMeshAsSolid() {
 }
 
 void afterFileWritten(const std::string& path) {
-    if (!path.empty()) billet::fsTriggerDownload(path);
+    if (!path.empty()) chudware::fsTriggerDownload(path);
 }
 
 }  // namespace ui
@@ -425,8 +425,8 @@ std::string homeDir() {
 
 std::string startDir() {
     if (!s_lastDir.empty()) return s_lastDir;
-    // Managed sessions (billet-web) point dialogs at the shared-projects tree.
-    if (const char* d = std::getenv("AI_CAD_START_DIR"); d && *d) return d;
+    // Managed sessions (chudware-web) point dialogs at the shared-projects tree.
+    if (const char* d = std::getenv("CHUDWARE_START_DIR"); d && *d) return d;
     return homeDir();
 }
 

@@ -1,4 +1,4 @@
-"""AI-CAD modeling kernel executor (services-side).
+"""Chudware modeling kernel executor (services-side).
 
 Re-homed from ``engine_oracle/kernel.py`` in T-RF20: executing AI-written build123d
 fundamentally needs a Python interpreter, so this module CANNOT be ported to the C++

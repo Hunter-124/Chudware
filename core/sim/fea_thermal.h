@@ -20,7 +20,7 @@
 // like fea_static. Never throws: a degenerate / singular model returns ok=false + error.
 //
 // UNITS. The kernel is length-unit agnostic but INTERNALLY CONSISTENT: every quantity is
-// expressed in the mesh length unit L (the AI-CAD mesh is millimetres). Callers pass
+// expressed in the mesh length unit L (the Chudware mesh is millimetres). Callers pass
 //   k  in  W/(L·K)      (conductivity per mesh-length; the glue converts W/(m·K) → W/(mm·K))
 //   q  in  W/L^2        (heat flux per mesh-area)
 //   h  in  W/(L^2·K)    (film coefficient per mesh-area)
@@ -48,7 +48,7 @@
 #include <string>
 #include <vector>
 
-namespace aicad::sim {
+namespace chudware::sim {
 
 // A convection (Robin) film boundary applied to a set of mesh nodes: every ELEMENT SURFACE
 // FACE whose corner nodes are all in `nodes` receives h·∫N N dS into K and h·T_amb·∫N dS
@@ -181,4 +181,4 @@ ThermalTransientResult fea_thermal_transient(
     const std::vector<ThermalConvection>& convections, const ThermalTransientOptions& opts,
     int nodes_per_elem = 4);
 
-}  // namespace aicad::sim
+}  // namespace chudware::sim

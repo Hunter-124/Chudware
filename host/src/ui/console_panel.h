@@ -1,4 +1,4 @@
-// AI-CAD Console panel: the runtime/agent log, color-coded by [tag].
+// Chudware Console panel: the runtime/agent log, color-coded by [tag].
 #pragma once
 
 struct AppState;

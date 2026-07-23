@@ -9,7 +9,7 @@
 #include "firmware/platform_db.h"
 #include "firmware/subprocess.h"
 
-namespace aicad::firmware {
+namespace chudware::firmware {
 namespace {
 
 constexpr double kVersionTimeoutS = 5.0;
@@ -204,4 +204,4 @@ nlohmann::json fw_status() {
     };
 }
 
-}  // namespace aicad::firmware
+}  // namespace chudware::firmware

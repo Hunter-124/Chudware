@@ -8,7 +8,7 @@
 #include <utility>
 #include <vector>
 
-namespace aicad::ecad {
+namespace chudware::ecad {
 namespace {
 
 // SINGLE SOURCE for ECAD op kinds. Keep ops.cpp::apply_one in lockstep.
@@ -151,4 +151,4 @@ std::string unknown_ecad_op_message(int index, const std::string& k) {
     return oss.str();
 }
 
-}  // namespace aicad::ecad
+}  // namespace chudware::ecad

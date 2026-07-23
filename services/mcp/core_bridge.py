@@ -1,18 +1,18 @@
-"""Thin ctypes bridge from the MCP server to the AI-CAD C++ core (``libaicad``).
+"""Thin ctypes bridge from the MCP server to the Chudware C++ core (``libchudware``).
 
 This is the SAME engine the desktop app loads: the native core library
-(``libaicad.dll`` on Windows, ``libaicad.so`` on Linux, ``libaicad.dylib`` on macOS)
+(``libchudware.dll`` on Windows, ``libchudware.so`` on Linux, ``libchudware.dylib`` on macOS)
 exposes every modeling / simulation / drawing capability as a string-in/string-out JSON
-RPC (``aicad_call(method, params_json, &out_json)``; see ``core/api/libaicad.cpp``). The
+RPC (``chudware_call(method, params_json, &out_json)``; see ``core/api/libchudware.cpp``). The
 in-app agent drives it through the host; here we drive it from Python so an MCP client
 (Claude) can do the same — write parametric feature ops, render, run FEA/CFD, export.
 
 Loading mirrors the proven probe loaders (``tools/vocab_battery.py``,
 ``tools/mesh_quality_verify.py``) and the host's own resolver (``cpp_core.cpp``): locate
-the library (``$AI_CAD_LIBAICAD`` explicit path → ``$AI_CAD_DIST`` dir → the platform's
+the library (``$CHUDWARE_LIBCHUDWARE`` explicit path → ``$CHUDWARE_DIST`` dir → the platform's
 known build/stage dirs), put its directory on the native dep search path (so the
 transitive OCCT / Netgen / lib3mf deps resolve — on Linux the .so's ``$ORIGIN`` RUNPATH
-already handles its siblings), point ``AI_CAD_PROMPTS_DIR`` at the prompts (so
+already handles its siblings), point ``CHUDWARE_PROMPTS_DIR`` at the prompts (so
 plain-English geometry queries + cheatsheets behave exactly like the engine), then
 ``CDLL`` the library and bind the two C-ABI entry points.
 
@@ -20,7 +20,7 @@ Public surface:
     call(method, params) -> dict     one RPC; raises CoreError on a hard failure
     dim(value) -> dict               a parametric dimension literal {"value":v,"expr":None}
     feat(type, name, params, refs)   an add_feature op for doc_apply_ops
-    dist_dir() -> str                the resolved dist/AI-CAD directory
+    dist_dir() -> str                the resolved dist/Chudware directory
 """
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ from typing import Any, Optional
 
 
 # ---------------------------------------------------------------- env var compatibility shim
-# BILLET_* is the new canonical name for all env vars. AI_CAD_* is the legacy name.
+# CHUDWARE_* is the new canonical name for all env vars. CHUDWARE_* is the legacy name.
 # Read sites use _env() to prefer new names while honoring old ones (with a one-time warn).
 # Write sites (gate.sh exports, test setdefault calls) are unchanged — they keep working
 # via the fallback.
@@ -44,7 +44,7 @@ _warned_vars: set = set()
 
 
 def _env(new_name: str, legacy_name: str | None = None, default: str | None = None) -> str | None:
-    """Read an env var preferring the BILLET_* name, falling back to AI_CAD_* legacy name.
+    """Read an env var preferring the CHUDWARE_* name, falling back to CHUDWARE_* legacy name.
 
     Emits a DeprecationWarning once per process per legacy-name when the legacy var is
     the active source, so callers know to update their scripts.
@@ -52,10 +52,10 @@ def _env(new_name: str, legacy_name: str | None = None, default: str | None = No
     val = os.environ.get(new_name)
     if val is not None:
         return val
-    # SHOPCRAFT_* never shipped but briefly existed as the T-G10 canonical prefix;
+    # CHUDWARE_* never shipped but briefly existed as the T-G10 canonical prefix;
     # accept it as a silent second fallback so any stray script keeps working.
-    if new_name.startswith("BILLET_"):
-        val = os.environ.get("SHOPCRAFT_" + new_name[len("BILLET_"):])
+    if new_name.startswith("CHUDWARE_"):
+        val = os.environ.get("CHUDWARE_" + new_name[len("CHUDWARE_"):])
         if val is not None:
             return val
     if legacy_name:
@@ -93,7 +93,7 @@ def _repo_root() -> Path:
     here = Path(__file__).resolve()
     for p in [here.parent, *here.parents]:
         if (p / "requirements.txt").is_file() and (
-            (p / "services" / "mcp").is_dir() or (p / "core" / "api" / "libaicad.h").is_file()
+            (p / "services" / "mcp").is_dir() or (p / "core" / "api" / "libchudware.h").is_file()
         ):
             return p
     # Fallback: pre-junction layout (repo/mcp_server/core_bridge.py)
@@ -103,37 +103,37 @@ def _repo_root() -> Path:
 def _lib_name() -> str:
     """Platform filename of the core library."""
     if sys.platform == "win32":
-        return "libaicad.dll"
+        return "libchudware.dll"
     if sys.platform == "darwin":
-        return "libaicad.dylib"
-    return "libaicad.so"
+        return "libchudware.dylib"
+    return "libchudware.so"
 
 
 def dist_dir() -> Path:
-    """The dist/AI-CAD directory holding the core library + its deps + staged prompts.
+    """The dist/Chudware directory holding the core library + its deps + staged prompts.
 
-    Honours $AI_CAD_DIST (absolute path to the dist dir); else defaults to the repo's
-    ``dist/AI-CAD`` (the Windows ``build.bat`` stage target). The directory is NOT
+    Honours $CHUDWARE_DIST (absolute path to the dist dir); else defaults to the repo's
+    ``dist/Chudware`` (the Windows ``build.bat`` stage target). The directory is NOT
     required to exist until the library is first loaded; on Linux there is no ``dist``
     stage and the library is found in a build dir instead (see ``_lib_candidates``).
     """
-    env = _env("BILLET_DIST", "AI_CAD_DIST")
+    env = _env("CHUDWARE_DIST", "CHUDWARE_DIST")
     if env:
         return Path(env)
-    return _repo_root() / "dist" / "AI-CAD"
+    return _repo_root() / "dist" / "Chudware"
 
 
 def _lib_candidates() -> list[Path]:
     """Ordered candidate paths to the core library, mirroring the host's resolver:
-    explicit ``$AI_CAD_LIBAICAD`` → the ``$AI_CAD_DIST`` / dist dir → the platform's
+    explicit ``$CHUDWARE_LIBCHUDWARE`` → the ``$CHUDWARE_DIST`` / dist dir → the platform's
     known build dirs. First existing one wins.
     """
     name = _lib_name()
     out: list[Path] = []
-    env_lib = _env("BILLET_LIBAICAD", "AI_CAD_LIBAICAD")
+    env_lib = _env("CHUDWARE_LIBCHUDWARE", "CHUDWARE_LIBCHUDWARE")
     if env_lib:
         out.append(Path(env_lib))
-    out.append(dist_dir() / name)  # honours $AI_CAD_DIST; Windows stage default
+    out.append(dist_dir() / name)  # honours $CHUDWARE_DIST; Windows stage default
     root = _repo_root()
     if sys.platform == "win32":
         # Full engine first (OCCT + Netgen) — same precedence as Linux build-occt-linux.
@@ -148,13 +148,13 @@ def _lib_candidates() -> list[Path]:
         # to the host exe). Its $ORIGIN RUNPATH resolves the sibling Netgen/lib3mf deps.
         # build-occt-linux is the FULL engine (OCCT + Netgen) the desktop app loads — it
         # carries the FEA/CFD sim RPCs (sim_run_static etc., gated behind #ifdef
-        # AICAD_WITH_NETGEN in libaicad.cpp). It MUST come before the slim "build-linux"
+        # CHUDWARE_WITH_NETGEN in libchudware.cpp). It MUST come before the slim "build-linux"
         # beachhead, which is OCCT/Netgen-free and silently lacks every sim + geometry RPC
         # the MCP exposes (loading it makes run_fea_static report "solver unavailable" even
         # though the UI works). See _warn_if_sim_missing below.
         out.append(root / "core" / "build-occt-linux" / "bin" / name)
         # core/build-linux is the standard cmake --build target used by gate.sh and CI.
-        # Added here to fix the "all-skip" incident where AI_CAD_LIBAICAD was required
+        # Added here to fix the "all-skip" incident where CHUDWARE_LIBCHUDWARE was required
         # even when the .so was already built at this well-known path (see issue #6).
         out.append(root / "core" / "build-linux" / "bin" / name)
         out.append(root / "host" / "build-linux" / "bin" / name)
@@ -170,7 +170,7 @@ def _resolve_lib() -> Path:
     name = _lib_name()
     hint = (
         "build.bat" if sys.platform == "win32"
-        else "cmake --build core/build-occt-linux (then set AI_CAD_LIBAICAD or AI_CAD_DIST)"
+        else "cmake --build core/build-occt-linux (then set CHUDWARE_LIBCHUDWARE or CHUDWARE_DIST)"
     )
     raise CoreError(
         f"{name} not found. Tried: {', '.join(str(p) for p in tried)}. "
@@ -179,7 +179,7 @@ def _resolve_lib() -> Path:
 
 
 def _prompts_default() -> Path:
-    """Where the staged/source agent prompts live for $AI_CAD_PROMPTS_DIR. Prefers the
+    """Where the staged/source agent prompts live for $CHUDWARE_PROMPTS_DIR. Prefers the
     Windows dist stage when present, else the repo source (``agent/prompts``)."""
     staged = dist_dir() / "app" / "agent" / "prompts"
     if staged.is_dir():
@@ -209,9 +209,9 @@ def _load() -> ctypes.CDLL:
 
             if not _daemon_mode() and daemon_bridge.daemon_socket_alive():
                 print(
-                    "[core_bridge] WARNING: an aicad-hostd daemon is running but this "
+                    "[core_bridge] WARNING: an chudware-hostd daemon is running but this "
                     "process is loading its OWN in-process engine "
-                    "(AI_CAD_ENGINE_DAEMON=0). Documents will NOT be shared with the "
+                    "(CHUDWARE_ENGINE_DAEMON=0). Documents will NOT be shared with the "
                     "daemon's clients. This becomes a hard refusal next release.",
                     file=sys.stderr,
                 )
@@ -236,21 +236,21 @@ def _load() -> ctypes.CDLL:
         # Geometry queries + the agent cheatsheets resolve relative to the prompts dir; point
         # it at the staged/source copy so the MCP behaves identically to the engine. Don't
         # clobber an explicit override.
-        # An explicit BILLET_PROMPTS_DIR override must reach the C++ core, which
-        # still reads AI_CAD_PROMPTS_DIR — propagate before the default kicks in.
-        _sc_prompts = os.environ.get("BILLET_PROMPTS_DIR")
+        # An explicit CHUDWARE_PROMPTS_DIR override must reach the C++ core, which
+        # still reads CHUDWARE_PROMPTS_DIR — propagate before the default kicks in.
+        _sc_prompts = os.environ.get("CHUDWARE_PROMPTS_DIR")
         if _sc_prompts:
-            os.environ.setdefault("AI_CAD_PROMPTS_DIR", _sc_prompts)
-        os.environ.setdefault("AI_CAD_PROMPTS_DIR", str(_prompts_default()))
-        os.environ.setdefault("BILLET_PROMPTS_DIR", os.environ["AI_CAD_PROMPTS_DIR"])
+            os.environ.setdefault("CHUDWARE_PROMPTS_DIR", _sc_prompts)
+        os.environ.setdefault("CHUDWARE_PROMPTS_DIR", str(_prompts_default()))
+        os.environ.setdefault("CHUDWARE_PROMPTS_DIR", os.environ["CHUDWARE_PROMPTS_DIR"])
         dll = ctypes.CDLL(str(lib_path))
-        dll.aicad_call.restype = ctypes.c_int
-        dll.aicad_call.argtypes = [
+        dll.chudware_call.restype = ctypes.c_int
+        dll.chudware_call.argtypes = [
             ctypes.c_char_p,
             ctypes.c_char_p,
             ctypes.POINTER(ctypes.c_char_p),
         ]
-        dll.aicad_free.argtypes = [ctypes.c_char_p]
+        dll.chudware_free.argtypes = [ctypes.c_char_p]
         _dll = dll
         _warn_if_sim_missing(dll, lib_path)
         return _dll
@@ -265,19 +265,19 @@ def _warn_if_sim_missing(dll: ctypes.CDLL, lib_path: Path) -> None:
     """
     try:
         out = ctypes.c_char_p()
-        rc = dll.aicad_call(b"sim_run_static", b"{}", ctypes.byref(out))
+        rc = dll.chudware_call(b"sim_run_static", b"{}", ctypes.byref(out))
         raw = out.value.decode("utf-8", "replace") if out.value else ""
         if out.value:
-            dll.aicad_free(out)
+            dll.chudware_free(out)
         # "unknown method" (rc != 0) => the sim RPCs aren't compiled into this .so.
         # A dispatched-but-invalid-study reply ("study must have ...") means sim IS present.
         if rc != 0 and "unknown method" in raw:
             sys.stderr.write(
-                "[core_bridge] WARNING: loaded a sim-less libaicad "
+                "[core_bridge] WARNING: loaded a sim-less libchudware "
                 f"({lib_path}) — FEA/CFD RPCs (sim_run_static) are NOT compiled in. "
                 "This is the slim OCCT/Netgen-free build; the MCP will report the FEA "
                 "solver as unavailable. Stage the full build-occt-linux engine into "
-                "dist/AI-CAD (or set AI_CAD_LIBAICAD to it) and restart the server.\n"
+                "dist/Chudware (or set CHUDWARE_LIBCHUDWARE to it) and restart the server.\n"
             )
             sys.stderr.flush()
     except Exception:
@@ -297,10 +297,10 @@ def available() -> bool:
 # ---------------------------------------------------------------- the one RPC call
 
 # Engine backend mode (shared-engine refactor, see hostd plan). Phase-8 flip:
-#   AI_CAD_ENGINE_DAEMON unset / =1 -> DEFAULT: route through the shared
-#     aicad-hostd daemon (ONE engine for the GUI + every MCP process; live doc
+#   CHUDWARE_ENGINE_DAEMON unset / =1 -> DEFAULT: route through the shared
+#     chudware-hostd daemon (ONE engine for the GUI + every MCP process; live doc
 #     sharing, no per-process copy).
-#   AI_CAD_ENGINE_DAEMON=0 -> explicit opt-out: legacy in-process ctypes load
+#   CHUDWARE_ENGINE_DAEMON=0 -> explicit opt-out: legacy in-process ctypes load
 #     (kept at least one release as the safety net; removal is a named N+1 task).
 # During release N a daemon TRANSPORT failure falls back to legacy with a loud
 # warning rather than bricking the session; N+1 makes it a hard error.
@@ -309,7 +309,7 @@ _DAEMON_FALLBACK_WARNED = False
 
 def _daemon_mode() -> bool:
     """Daemon mode is the default; only an explicit '0' selects legacy."""
-    return os.environ.get("AI_CAD_ENGINE_DAEMON", "1") != "0"
+    return os.environ.get("CHUDWARE_ENGINE_DAEMON", "1") != "0"
 
 
 def active_daemon_mode() -> bool:
@@ -394,14 +394,14 @@ def call(method: str, params: Optional[dict] = None) -> dict:
     # PROCESS-WIDE redirect installed once at server startup (see server.py), NOT by toggling
     # fd 1 here. A per-call toggle races the transport's response writer (FastMCP runs sync
     # tools off-thread) and silently drops replies -> "request timed out".
-    rc = dll.aicad_call(
+    rc = dll.chudware_call(
         method.encode("utf-8"),
         json.dumps(params or {}).encode("utf-8"),
         ctypes.byref(out),
     )
     raw = out.value.decode("utf-8") if out.value else ""
     if out.value:
-        dll.aicad_free(out)
+        dll.chudware_free(out)
     try:
         result = json.loads(raw) if raw else {}
     except json.JSONDecodeError:

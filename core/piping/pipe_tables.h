@@ -6,7 +6,7 @@
 // Regenerate with /tmp/rf19/gen_tables.py (do not hand-edit).
 #pragma once
 
-namespace aicad { namespace piping { namespace tables {
+namespace chudware { namespace piping { namespace tables {
 
 struct ScheduleTable { const char* name; int n; const double* nps; const double* di; const double* od; const double* wall; };
 
@@ -406,4 +406,4 @@ static const ScheduleTable SCHEDULES[] = {
 };
 static const int N_SCHEDULES = sizeof(SCHEDULES)/sizeof(SCHEDULES[0]);
 
-}}}  // namespace aicad::piping::tables
+}}}  // namespace chudware::piping::tables

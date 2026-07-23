@@ -22,9 +22,9 @@ from tools import provision_em as pe  # noqa: E402
 def isolate(monkeypatch, tmp_path):
     """Redirect prefix/src and neuter real import probes by default."""
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    monkeypatch.setenv("AICAD_OPENEMS", str(tmp_path / "openEMS"))
-    monkeypatch.delenv("AICAD_PYTHON", raising=False)
-    monkeypatch.delenv("AI_CAD_PYTHON", raising=False)
+    monkeypatch.setenv("CHUDWARE_OPENEMS", str(tmp_path / "openEMS"))
+    monkeypatch.delenv("CHUDWARE_PYTHON", raising=False)
+    monkeypatch.delenv("CHUDWARE_PYTHON", raising=False)
     (tmp_path / "home").mkdir()
     yield tmp_path
 

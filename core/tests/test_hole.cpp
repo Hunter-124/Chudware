@@ -39,8 +39,8 @@
 #include "aicm_loader.h"  // host loader (host/src/render on the include path)
 
 using json = nlohmann::json;
-using aicad::doc::CompileResult;
-using aicad::doc::compile_document;
+using chudware::doc::CompileResult;
+using chudware::doc::compile_document;
 
 namespace {
 
@@ -173,12 +173,12 @@ render::DocMesh parse(const CompileResult& r) {
 // drills the BODY CENTRE (the bore passes through the block's central axis).
 json plus_z_face_selector(double W, double H, double D) {
     TopoDS_Shape box = geom::make_box(W, H, D);
-    std::vector<aicad::doc::TopoInfo> infos = aicad::doc::describe_faces(box);
-    for (const aicad::doc::TopoInfo& info : infos) {
+    std::vector<chudware::doc::TopoInfo> infos = chudware::doc::describe_faces(box);
+    for (const chudware::doc::TopoInfo& info : infos) {
         if (!info.axis.has_value()) continue;
         if (std::abs(info.axis->z()) < 0.999) continue;     // not a +/-Z-normal face
         if (std::abs(info.centroid.z() - D) > 1e-6) continue; // not the +Z (z=D) face
-        return aicad::doc::make_selector(info);
+        return chudware::doc::make_selector(info);
     }
     return json(nullptr);  // not found (the test REQUIREs a real selector)
 }

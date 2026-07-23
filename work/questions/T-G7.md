@@ -5,22 +5,22 @@ Context: T-G7 (wave-3 core panels C1–C6 + G3 gate) chained off task/T-G6-migra
 workflow (REFACTOR_LOG §§ C1–C6), so this is mostly verify-and-close, with one real fix (below).
 
 ## Verified rendering (AI-CAD2, reused/rebuilt linux-app binary)
-- **C1 feature tree** — `AI_CAD_SHOT=tree` ✓ (real worker-built Part1/Origin/Base/Fillet/Shell)
-- **C3 copilot/activity/console** — `AI_CAD_SHOT=chat` ✓ (glass bubbles, action card, ShopCraft
-  branding — not the old "AI-CAD Copilot", per AI hint)
-- **C4 viewport HUD/tools** — `AI_CAD_SHOT=pick` ✓
-- **C5 asm/config/tables/equations** — `AI_CAD_SHOT=equations` ✓ (+ `assembly`, `plan` render)
+- **C1 feature tree** — `CHUDWARE_SHOT=tree` ✓ (real worker-built Part1/Origin/Base/Fillet/Shell)
+- **C3 copilot/activity/console** — `CHUDWARE_SHOT=chat` ✓ (glass bubbles, action card, Chudware
+  branding — not the old "Chudware Copilot", per AI hint)
+- **C4 viewport HUD/tools** — `CHUDWARE_SHOT=pick` ✓
+- **C5 asm/config/tables/equations** — `CHUDWARE_SHOT=equations` ✓ (+ `assembly`, `plan` render)
 - one-shots `ecad` ✓
 - **C2 property manager + 44 forms** — see Fix 1 (was broken; fixed in-lane).
 
 ## Fix 1 (in-lane, applied): pmform opened no PropertyManager form
-`AI_CAD_SHOT=pmform AI_CAD_PMCMD=extrude` rendered the Model Tree, not the Extrude form
+`CHUDWARE_SHOT=pmform CHUDWARE_PMCMD=extrude` rendered the Model Tree, not the Extrude form
 (status showed "Command: extrude"). Root cause: the pmform scenario called `st.dispatch(cmd)`,
 which routes to `actionBus.submit()` and *executes* the command (diff.ok → status set, returns)
 without ever setting `st.activeTool` or opening the PM. `drawInspector` is only called when
 `activeTool` is non-empty (application.cpp:159), and `pmApplyShotEnv`/`openForCommand` live
 *inside* `drawInspector` — so the whole PM-form path was dead for pmform. Fix: pmform now sets
-`st.activeTool = cmd` (opens the data-driven form; `pmApplyShotEnv` then applies AI_CAD_PMSET
+`st.activeTool = cmd` (opens the data-driven form; `pmApplyShotEnv` then applies CHUDWARE_PMSET
 presets). One-line change in `ui/imgui/src/ui/scenarios.cpp` (C6 write-set). Rebuilt + reverified.
 
 ## Question 1 (BLOCKING for the G3 gate DoD): step-machine scenarios blocked by issue #7

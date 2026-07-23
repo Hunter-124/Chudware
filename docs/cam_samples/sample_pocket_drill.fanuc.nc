@@ -1,6 +1,6 @@
 %
 N10 O1000
-N20 ( AICAD - S1)
+N20 ( Chudware - S1)
 N30 ( post: Fanuc  machine: Generic 3-axis mill)
 N40 G21
 N50 G90

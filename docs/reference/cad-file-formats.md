@@ -7,7 +7,7 @@
 > README's clean-room statement). Treat this file the same way: it documents
 > **formats**, not any vendor's implementation of them, and cites the public spec
 > to build from in each case. See `docs/reference/README.md` for how this fits
-> into ShopCraft's own interop work, and `contracts/licenses.md` for this repo's
+> into Chudware's own interop work, and `contracts/licenses.md` for this repo's
 > license posture.
 
 Scope: a survey of ~12 CAD/BIM/mesh format families, each with what it is, the
@@ -29,7 +29,7 @@ short structural summary drawn from that public spec.
   (handle→offset), and optional preview/summary/appinfo. Objects are handle-keyed
   records with bit-packed fields; entities reference symbol-table records (layer,
   linetype, style) by handle.
-- **This repo:** DWG import is **not yet implemented**; ShopCraft's documented plan
+- **This repo:** DWG import is **not yet implemented**; Chudware's documented plan
   is DWG via an ODA membership (or a subprocess-isolated LibreDWG conversion —
   LibreDWG is GPL, so it stays out-of-process) — see `docs/design/PLATFORM_ADR.md` §5 and
   `work/backlog/T-BL02.md`. Reference-only until that lands.
@@ -79,7 +79,7 @@ short structural summary drawn from that public spec.
 - **Structure:** STEP physical file (ISO 10303-21) encoding of the IFC EXPRESS
   schema — an object graph of building elements (`IfcWall`, `IfcSpace`, …) with
   relationships, property sets, and geometry (BREP / swept solids / CSG).
-- **This repo:** not on the current interop surface (ShopCraft is mechanical CAD,
+- **This repo:** not on the current interop surface (Chudware is mechanical CAD,
   not BIM); reference-only. If BIM interop is ever wanted, `IfcOpenShell` (LGPL) is
   the open-source route (see `building-format-support.md`).
 
@@ -150,7 +150,7 @@ short structural summary drawn from that public spec.
 ## Takeaway
 
 Every format above has a **first-party or ISO public specification**. The
-independent-implementation path is the same one ShopCraft already follows for
+independent-implementation path is the same one Chudware already follows for
 STEP/IGES/DXF/mesh formats: cite and build from the public spec (or an
 appropriately-licensed open-source library — see `building-format-support.md`),
 never from a proprietary binary. See `docs/reference/README.md` for how this

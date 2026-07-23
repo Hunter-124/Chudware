@@ -22,7 +22,7 @@ SIMULATION BACKENDS (ecad_simulate / ecad_tf, param backend=):
                    AND ngspice is installed.
   HONEST DEGRADE: no ngspice (or a failed run) falls back to MNA and says so in
   backend_note; result.backend always names the solver that actually ran.
-  Install: `dnf install ngspice` or point AI_CAD_NGSPICE at a binary; detection via
+  Install: `dnf install ngspice` or point CHUDWARE_NGSPICE at a binary; detection via
   the installer's --check (services/installer/provision.py: ngspice_provisioning_status).
 
 VENDOR MODEL IMPORT: attach a SPICE library to a component via its sim dict:
@@ -302,7 +302,7 @@ HEATSINK SELECTION LOOP (T-FIN17) — heatsink_select on the last thermal study:
       ecad_heatsink_to_thermal_fea) under result.simhandoff.
   HONESTY: an impossible target returns ok:true with target_met:false and the best
       achievable candidate NAMED (never a fake win); a target at/below ambient is
-      rejected outright; without a sim-enabled libaicad the tool runs a FLAGGED
+      rejected outright; without a sim-enabled libchudware the tool runs a FLAGGED
       mode="network_estimate" (Tj = Ta + P*(theta_jc + R_tim + R_sa) — board
       coupling ignored). Library theta_sa values are curated datasheet-class
       nominals: verify the chosen part's datasheet before release.

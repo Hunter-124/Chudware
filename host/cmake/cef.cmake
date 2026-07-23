@@ -1,12 +1,12 @@
-# host/cmake/cef.cmake — wire the CEF off-screen browser backend into Billet.
+# host/cmake/cef.cmake — wire the CEF off-screen browser backend into Chudware.
 #
-# Included ONLY when AI_CAD_ENABLE_CEF=ON (see host/CMakeLists.txt). Follows the
+# Included ONLY when CHUDWARE_ENABLE_CEF=ON (see host/CMakeLists.txt). Follows the
 # canonical CEF binary-distribution integration (cefsimple pattern): find the
 # SDK, build libcef_dll_wrapper from source, add the libcef_lib logical target,
-# compile the cef/ backend into Billet + the subprocess helper, and stage the
+# compile the cef/ backend into Chudware + the subprocess helper, and stage the
 # CEF runtime (libcef.so + *.pak + locales + helper) next to the binary.
 #
-#   cmake -S host -B host/build-cef -DAI_CAD_ENABLE_CEF=ON \
+#   cmake -S host -B host/build-cef -DCHUDWARE_ENABLE_CEF=ON \
 #         -DCEF_ROOT=extern/cef/cef_binary_..._linux64_minimal
 #
 # CEF_ROOT defaults to the checked-out SDK under extern/cef if unset. Its Chromium
@@ -21,7 +21,7 @@ if(NOT DEFINED CEF_ROOT OR CEF_ROOT STREQUAL "")
 endif()
 if(NOT CEF_ROOT OR NOT EXISTS "${CEF_ROOT}")
   message(FATAL_ERROR
-    "AI_CAD_ENABLE_CEF=ON but no CEF SDK found. Download a CEF binary distribution "
+    "CHUDWARE_ENABLE_CEF=ON but no CEF SDK found. Download a CEF binary distribution "
     "(Chromium ~149 to match the scraper) into extern/cef/ or pass -DCEF_ROOT=<dir>. "
     "See docs/cef_webview.md.")
 endif()
@@ -35,7 +35,7 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 
-# Billet (and the rest of the host) uses the dynamic CRT (/MD). CEF's stock
+# Chudware (and the rest of the host) uses the dynamic CRT (/MD). CEF's stock
 # cmake defaults the wrapper to /MT (sandbox-oriented). With no_sandbox we must
 # match /MD or the final link fails with LNK2038 RuntimeLibrary mismatch.
 if(MSVC)
@@ -59,31 +59,31 @@ endif()
 add_logical_target("libcef_lib" "${CEF_LIB_DEBUG}" "${CEF_LIB_RELEASE}")
 set_cef_target_out_dir()                         # → CEF_TARGET_OUT_DIR
 
-# --- OSR backend sources compiled INTO Billet (guarded by the compile define) ---
-target_sources(Billet PRIVATE
+# --- OSR backend sources compiled INTO Chudware (guarded by the compile define) ---
+target_sources(Chudware PRIVATE
   src/ui/widgets/cef/cef_web_view.cpp
   src/ui/widgets/cef/cef_rpc_bridge.cpp        # AppState/RPC side — NO CEF headers, stays C++17
   src/ui/widgets/cef/cef_osr_shot.cpp          # headless OSR render-to-PNG (--cef-shot)
   src/ui/widgets/cef/cef_stealth.cpp           # shared UA/hints + JS hardening
   src/ui/widgets/cef/cef_headless.cpp          # headless fetch/download (--cef-fetch/--cef-download)
-  src/ui/widgets/cef/cef_daemon.cpp            # CEF host daemon over aicad_ipc (--cef-daemon)
+  src/ui/widgets/cef/cef_daemon.cpp            # CEF host daemon over chudware_ipc (--cef-daemon)
   src/ui/widgets/cef/cef_app.cpp)
 if(WIN32)
-  target_sources(Billet PRIVATE src/ui/widgets/cef/cef_platform_windows.cpp)
+  target_sources(Chudware PRIVATE src/ui/widgets/cef/cef_platform_windows.cpp)
 else()
-  target_sources(Billet PRIVATE src/ui/widgets/cef/cef_platform_linux.cpp)
+  target_sources(Chudware PRIVATE src/ui/widgets/cef/cef_platform_linux.cpp)
 endif()
 
-target_compile_definitions(Billet PRIVATE AI_CAD_ENABLE_CEF=1)
-target_include_directories(Billet PRIVATE "${CEF_ROOT}")
-target_link_libraries(Billet PRIVATE libcef_lib libcef_dll_wrapper ${CEF_STANDARD_LIBS})
+target_compile_definitions(Chudware PRIVATE CHUDWARE_ENABLE_CEF=1)
+target_include_directories(Chudware PRIVATE "${CEF_ROOT}")
+target_link_libraries(Chudware PRIVATE libcef_lib libcef_dll_wrapper ${CEF_STANDARD_LIBS})
 
 # Load the STAGED libcef.so (next to the binary), not the SDK's build-time copy.
 # CEF's Chrome runtime resolves icudtl.dat / *.pak relative to libcef.so's dir,
 # and we stage those next to the binary — so libcef.so must load from $ORIGIN.
 # (The helper already gets this via set_executable_target_properties.)
-set_property(TARGET Billet APPEND PROPERTY BUILD_RPATH "$ORIGIN")
-set_property(TARGET Billet APPEND PROPERTY INSTALL_RPATH "$ORIGIN")
+set_property(TARGET Chudware APPEND PROPERTY BUILD_RPATH "$ORIGIN")
+set_property(TARGET Chudware APPEND PROPERTY INSTALL_RPATH "$ORIGIN")
 
 # CEF 149 headers use C++20 concepts (std::same_as, …). The host is C++17; only
 # the cef/*.cpp TUs include CEF headers, so bump JUST those to C++20 (ABI-
@@ -107,7 +107,7 @@ set_source_files_properties(
 
 # --- mandatory subprocess helper (its own executable) ---------------------------
 # CEF's render/GPU/utility processes re-exec this; CefExecuteProcess() dispatches
-# them. Must sit next to Billet at runtime.
+# them. Must sit next to Chudware at runtime.
 add_executable(ai_cad_cef_helper
   src/ui/widgets/cef/cef_helper_main.cpp
   src/ui/widgets/cef/cef_app.cpp
@@ -118,7 +118,7 @@ else()
   target_sources(ai_cad_cef_helper PRIVATE src/ui/widgets/cef/cef_platform_linux.cpp)
 endif()
 set_executable_target_properties(ai_cad_cef_helper)
-target_compile_definitions(ai_cad_cef_helper PRIVATE AI_CAD_ENABLE_CEF=1)
+target_compile_definitions(ai_cad_cef_helper PRIVATE CHUDWARE_ENABLE_CEF=1)
 target_include_directories(ai_cad_cef_helper PRIVATE "${CEF_ROOT}" ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(ai_cad_cef_helper libcef_lib libcef_dll_wrapper ${CEF_STANDARD_LIBS})
 # Helper TUs also include CEF headers (C++20 concepts on CEF 149+).
@@ -131,12 +131,12 @@ set_source_files_properties(
   TARGET_DIRECTORY ai_cad_cef_helper
   PROPERTIES COMPILE_OPTIONS "${_CEF_CXX20}")
 
-# --- stage the CEF runtime next to Billet ---------------------------------------
-set(CEF_TARGET_OUT_DIR "$<TARGET_FILE_DIR:Billet>")
-copy_files(Billet "${CEF_BINARY_FILES}"   "${CEF_BINARY_DIR}"   "${CEF_TARGET_OUT_DIR}")
-copy_files(Billet "${CEF_RESOURCE_FILES}" "${CEF_RESOURCE_DIR}" "${CEF_TARGET_OUT_DIR}")
-add_custom_command(TARGET Billet POST_BUILD
+# --- stage the CEF runtime next to Chudware ---------------------------------------
+set(CEF_TARGET_OUT_DIR "$<TARGET_FILE_DIR:Chudware>")
+copy_files(Chudware "${CEF_BINARY_FILES}"   "${CEF_BINARY_DIR}"   "${CEF_TARGET_OUT_DIR}")
+copy_files(Chudware "${CEF_RESOURCE_FILES}" "${CEF_RESOURCE_DIR}" "${CEF_TARGET_OUT_DIR}")
+add_custom_command(TARGET Chudware POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
           "$<TARGET_FILE:ai_cad_cef_helper>" "${CEF_TARGET_OUT_DIR}")
 
-message(STATUS "Billet: CEF backend enabled (CEF_ROOT=${CEF_ROOT}).")
+message(STATUS "Chudware: CEF backend enabled (CEF_ROOT=${CEF_ROOT}).")

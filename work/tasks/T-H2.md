@@ -48,7 +48,7 @@ ECAD's sorted-keys canonical dump is the precedent to generalize.
       → gate results (bash scripts/gate.sh, 2026-07-02):
         - check.py: FAIL-RECORDED (pre-existing feature_surface_audit + parity_audit
           red, non-fatal per gate.sh CHECK_PY_FATAL=0 — not this task)
-        - core build (libaicad, OCCT ON): PASS — canonical_doc_json compiles clean
+        - core build (libchudware, OCCT ON): PASS — canonical_doc_json compiles clean
         - ui/abstract build + ctest: PASS
         - ctest (core): PASS (100%)
         - pytest stage: SKIP (gate box has no provisioned venv); run manually with

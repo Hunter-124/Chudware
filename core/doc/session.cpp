@@ -132,7 +132,7 @@
 #include "sketch/sketch.h"
 #include "util/expr.h"
 
-namespace aicad::doc {
+namespace chudware::doc {
 
 using nlohmann::json;
 
@@ -151,7 +151,7 @@ namespace {
 // state is never reused across a doc edit (session.py: active_sketch.solve_state = None).
 struct SketchState {
     std::string sketch_fid;
-    std::optional<aicad::sketch::SolveState> solve_state;  // warm start (nullopt == cold)
+    std::optional<chudware::sketch::SolveState> solve_state;  // warm start (nullopt == cold)
     json last_entities = json::object();   // id -> solved coord dict (entity_map form)
     json last_statuses = json::object();   // id -> "under"|"full"|"over"
     std::string last_overall_status;       // "under"|"full"|"over"
@@ -162,7 +162,7 @@ struct SketchState {
     // drag_ctx_revision == the session revision it was built at — every applied op
     // batch (and undo/redo) bumps the revision monotonically, so a stale revision
     // means "rebuild". No extra locking: drag/commit/apply all run under DocLock.
-    std::shared_ptr<aicad::sketch::DragContext> drag_ctx;
+    std::shared_ptr<chudware::sketch::DragContext> drag_ctx;
     long drag_ctx_revision = -1;
 };
 
@@ -207,7 +207,7 @@ struct Session {
     // recompiles k..N only. Content-addressed (env+config+feature hashes), so undo/
     // redo/config switches can never be served stale geometry. Accessed only under
     // the per-doc mutex (DocLock).
-    std::shared_ptr<aicad::doc::CompileCache> compile_cache = aicad::doc::make_compile_cache();
+    std::shared_ptr<chudware::doc::CompileCache> compile_cache = chudware::doc::make_compile_cache();
 
     // C20 — assembly state. asm_result is the last assembly compile; asm_warm seeds the
     // next mate solve; explode_active/explode_factor drive tessellation-time offsets.
@@ -218,7 +218,7 @@ struct Session {
     // while built against the current asm_result (asm_describe_for); a rebuild swaps the pointer.
     std::map<std::string, std::vector<TopoInfo>> asm_describe_cache;
     const void* asm_describe_for = nullptr;
-    aicad::mate::WarmMap asm_warm;
+    chudware::mate::WarmMap asm_warm;
     bool explode_active = false;
     double explode_factor = 1.0;
 
@@ -256,24 +256,24 @@ constexpr std::size_t kCheckpointLimit = 32;                   // PM-cancel snap
 // ---- Undo disk journal (P2 multi-user / long sessions) -----------------------
 // Path: <stateDir>/hostd_undo/<instance-key>/<doc_id>/<seq>.json
 // stateDir mirrors services/ipc/ipc_discovery stateDir() without linking it
-// (libaicad must not pull the hostd IPC layer).
+// (libchudware must not pull the hostd IPC layer).
 static std::string undo_state_dir() {
     if (const char* x = std::getenv("XDG_DATA_HOME"); x && *x)
-        return std::string(x) + "/AI-CAD";
+        return std::string(x) + "/Chudware";
     if (const char* h = std::getenv("HOME"); h && *h)
-        return std::string(h) + "/.local/share/AI-CAD";
+        return std::string(h) + "/.local/share/Chudware";
 #ifdef _WIN32
     if (const char* a = std::getenv("APPDATA"); a && *a)
-        return std::string(a) + "\\AI-CAD";
+        return std::string(a) + "\\Chudware";
 #endif
-    return "AI-CAD";
+    return "Chudware";
 }
 
 static std::string undo_instance_key() {
-    if (const char* k = std::getenv("AICAD_INSTANCE_KEY"); k && *k) return k;
-    // Per-process fallback so two daemons without AICAD_INSTANCE_KEY never share
+    if (const char* k = std::getenv("CHUDWARE_INSTANCE_KEY"); k && *k) return k;
+    // Per-process fallback so two daemons without CHUDWARE_INSTANCE_KEY never share
     // hostd_undo/ (doc ids are sequential and would collide across processes).
-    // The real instance key is fnv1a(hostd realpath) — libaicad cannot see that
+    // The real instance key is fnv1a(hostd realpath) — libchudware cannot see that
     // path, so isolate by pid instead.
 #ifdef _WIN32
     return "inproc-" + std::to_string(static_cast<unsigned long>(::GetCurrentProcessId()));
@@ -833,18 +833,18 @@ void expand_standard_part(json& doc, const json& feat, std::size_t idx,
     if (family.empty()) {
         throw OpError("invalid_op",
                       "standard_part: params.family required; valid families: " +
-                          aicad::parts::family_keys_csv(),
+                          chudware::parts::family_keys_csv(),
                       {{"index", idx}, {"reason", "missing family"}});
     }
 
-    aicad::parts::PartBuild pb;
+    chudware::parts::PartBuild pb;
     try {
-        pb = aicad::parts::build(family, size, length_mm, options);
+        pb = chudware::parts::build(family, size, length_mm, options);
     } catch (const std::invalid_argument& e) {
         throw OpError("invalid_op",
                       std::string("standard_part: ") + e.what(),
                       {{"index", idx}, {"reason", e.what()},
-                       {"families", aicad::parts::family_keys_csv()}});
+                       {"families", chudware::parts::family_keys_csv()}});
     } catch (const std::exception& e) {
         throw OpError("invalid_op",
                       std::string("standard_part: ") + e.what(),
@@ -940,7 +940,7 @@ void op_add_feature(json& doc, const json& op, std::size_t idx, IdGen& gen, json
         throw OpError("invalid_op", "add_feature: 'feature' object required");
     }
     // Capture type early — standard_part is a MACRO that expands into a sub-batch
-    // of real features (via aicad::parts::build, same as parts_make). It must NOT
+    // of real features (via chudware::parts::build, same as parts_make). It must NOT
     // be stored as a feature itself (no compiler, would fail validation).
     const std::string ftype_early = feat.value("type", std::string());
     if (ftype_early == "standard_part") {
@@ -1131,9 +1131,9 @@ void op_reorder_feature(json& doc, const json& op) {
 // op_sketch_convert can project against compiled geometry from inside the ops path (T-BL43).
 // `pre` (optional) is an already-compiled result of THIS doc — passing it serves the
 // datums/face lookup without another full recompile.
-aicad::geom::SketchPlane resolve_sketch_plane_doc(const json& doc, const json& feat,
+chudware::geom::SketchPlane resolve_sketch_plane_doc(const json& doc, const json& feat,
                                                   const CompileResult* pre = nullptr);
-json project_external_refs(const json& doc, const aicad::geom::SketchPlane& plane,
+json project_external_refs(const json& doc, const chudware::geom::SketchPlane& plane,
                            const json& refs, const CompileResult* pre = nullptr,
                            bool strict = false);
 // T-BL49 associative Convert Entities — re-resolve + re-project every sketch's
@@ -1198,8 +1198,8 @@ std::vector<json> expand_sketch_entity(json ent, IdGen& gen) {
         const double aoa = ent.value("aoa", 0.0);
         const int pts = ent.value("points", 60);
         const bool closedTE = ent.value("closedTE", true);
-        aicad::geom::AirfoilProfile prof =
-            aicad::geom::airfoil_profile(naca, dat, chord, aoa, pts, closedTE);
+        chudware::geom::AirfoilProfile prof =
+            chudware::geom::airfoil_profile(naca, dat, chord, aoa, pts, closedTE);
         if (!prof.error.empty()) throw OpError("invalid_op", "airfoil: " + prof.error);
         if (prof.upper.size() < 2 || prof.lower.size() < 2)
             throw OpError("invalid_op", "airfoil: profile produced too few points");
@@ -1675,7 +1675,7 @@ void op_sketch_convert(json& doc, const json& op, std::size_t idx, IdGen& gen, j
     if (!refs.is_array() || refs.empty())
         throw OpError("invalid_op", "sketch_convert: 'refs' must be a non-empty list",
                       {{"reason", "bad refs"}});
-    aicad::geom::SketchPlane plane = resolve_sketch_plane_doc(doc, sk);
+    chudware::geom::SketchPlane plane = resolve_sketch_plane_doc(doc, sk);
     json res = project_external_refs(doc, plane, refs);
     const bool constr = op.value("construction", false);
     const bool fix = op.value("fix", true);
@@ -1850,7 +1850,7 @@ void op_sketch_toggle_construction(json& doc, const json& op, const json& id_map
 // 2D tools (trim/extend/offset/fillet/chamfer/mirror/pattern/move) — port of the
 // engine/doc/ops.py handlers over the engine/doc/sketch_geom curve math. Each mutates
 // the sketch's entity + constraint lists and flows through the normal rebuild.
-namespace sg = aicad::doc::sketchgeom;
+namespace sg = chudware::doc::sketchgeom;
 
 constexpr double kDeg = 3.14159265358979323846 / 180.0;
 constexpr double kRad = 180.0 / 3.14159265358979323846;
@@ -3725,7 +3725,7 @@ json env_from_doc(const json& doc) {
             const std::string expr = g.value("expr", std::string());
             if (name.empty()) continue;
             try {
-                double v = aicad::util::evaluate(expr, acc);
+                double v = chudware::util::evaluate(expr, acc);
                 acc[name] = v;
                 env[name] = v;
             } catch (...) { /* skip a bad global */ }
@@ -3746,13 +3746,13 @@ json env_from_doc(const json& doc) {
 // CompileCache). Every "compile s.doc now" callsite in this file funnels through
 // here so the whole RPC surface — edits, undo/redo, rebuilds, exports, measures —
 // benefits uniformly. Caller must hold the doc lock (they all do).
-// Kill-switch: AICAD_INC_REBUILD=0 forces the old always-full-rebuild path
+// Kill-switch: CHUDWARE_INC_REBUILD=0 forces the old always-full-rebuild path
 // (safety valve while the cache is young; also the A/B lever for benchmarks).
 // Shared by compile_session and the external-ref refresh compiles (apply_ops_locked /
 // doc_rebuild), so ONE env var disables every cached compile path uniformly.
 bool inc_rebuild_enabled() {
     static const bool enabled = []() {
-        const char* v = std::getenv("AICAD_INC_REBUILD");
+        const char* v = std::getenv("CHUDWARE_INC_REBUILD");
         return !(v && v[0] == '0' && v[1] == '\0');
     }();
     return enabled;
@@ -3791,7 +3791,7 @@ json warm_and_respond(Session& s, CompileResult r, const json& id_map, bool with
 
 // Legacy filesystem path (fallback only — prefer aicm_handoff::publish).
 std::filesystem::path aicm_file(const std::string& doc_id, long revision) {
-    std::filesystem::path dir = std::filesystem::temp_directory_path() / "aicad_cpp_docs";
+    std::filesystem::path dir = std::filesystem::temp_directory_path() / "chudware_cpp_docs";
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
     return dir / (doc_id + "_r" + std::to_string(revision) + ".aicm");
@@ -3802,8 +3802,8 @@ std::filesystem::path aicm_file(const std::string& doc_id, long revision) {
 std::string publish_doc_aicm(const std::string& doc_id, long revision,
                              const std::vector<uint8_t>& aicm) {
     if (aicm.empty()) return {};
-    const std::string key = aicad::aicm_handoff::key_for(doc_id, revision);
-    std::string uri = aicad::aicm_handoff::publish(key, aicm);
+    const std::string key = chudware::aicm_handoff::key_for(doc_id, revision);
+    std::string uri = chudware::aicm_handoff::publish(key, aicm);
     if (uri.empty()) {
         std::filesystem::path target = aicm_file(doc_id, revision);
         std::ofstream f(target, std::ios::binary | std::ios::trunc);
@@ -3818,7 +3818,7 @@ std::string publish_doc_aicm(const std::string& doc_id, long revision,
     // the host's async mesh loader (T-PERF3) may still be mapping the previous path
     // while this rebuild publishes the next.
     if (revision > 3)
-        aicad::aicm_handoff::release_older_than(doc_id, revision - 3);
+        chudware::aicm_handoff::release_older_than(doc_id, revision - 3);
     return uri;
 }
 
@@ -3940,7 +3940,7 @@ std::string config_active_name(const json& doc);  // defined below (configuratio
 void rebuild_assembly(Session& s) {
     std::string base_dir;
     if (!s.path.empty()) base_dir = std::filesystem::path(s.path).parent_path().string();
-    std::optional<aicad::mate::WarmMap> warm;
+    std::optional<chudware::mate::WarmMap> warm;
     if (!s.asm_warm.empty()) warm = s.asm_warm;
     AssemblyResult ares = compile_assembly(s.doc, base_dir, warm);
     // Persist solved transforms back into the document (matched by component id).
@@ -4389,7 +4389,7 @@ json sketch_params(const json& feat) {
 // now surfaces per-feature plane geometry — origin + x_dir/y_dir/normal). Only the
 // reserved factory frames are tried first; an unknown ref falls back to TOP. Throws on
 // no plane ref.
-aicad::geom::SketchPlane resolve_sketch_plane_doc(const json& doc, const json& feat,
+chudware::geom::SketchPlane resolve_sketch_plane_doc(const json& doc, const json& feat,
                                                   const CompileResult* pre) {
     json plane_ref;
     if (feat.contains("refs") && feat["refs"].is_object() && feat["refs"].contains("plane"))
@@ -4405,9 +4405,9 @@ aicad::geom::SketchPlane resolve_sketch_plane_doc(const json& doc, const json& f
         name = plane_ref["feature"].get<std::string>();
     std::string bare = name;
     if (bare.rfind("plane.", 0) == 0) bare = bare.substr(6);
-    if (bare == "top")   return aicad::geom::SketchPlane::top();
-    if (bare == "front") return aicad::geom::SketchPlane::front();
-    if (bare == "right") return aicad::geom::SketchPlane::right();
+    if (bare == "top")   return chudware::geom::SketchPlane::top();
+    if (bare == "front") return chudware::geom::SketchPlane::front();
+    if (bare == "right") return chudware::geom::SketchPlane::right();
 
     // Non-reserved ref: a created datum-plane feature (offset/midplane/angle/three_point/
     // …). Recompile and read its resolved frame from the datums side-channel so the sketch
@@ -4431,7 +4431,7 @@ aicad::geom::SketchPlane resolve_sketch_plane_doc(const json& doc, const json& f
                 if (!d.is_object() || d.value("id", std::string()) != name) continue;
                 const std::string k = d.value("kind", std::string());
                 if (k != "plane" && k != "csys") break;  // axis/point/curve aren't sketchable
-                aicad::geom::SketchPlane p;
+                chudware::geom::SketchPlane p;
                 p.origin = v3(d.value("origin", json()), Eigen::Vector3d(0, 0, 0));
                 p.uAxis  = v3(d.value("x_dir",  json()), Eigen::Vector3d(1, 0, 0));
                 p.vAxis  = v3(d.value("y_dir",  json()), Eigen::Vector3d(0, 1, 0));
@@ -4461,7 +4461,7 @@ aicad::geom::SketchPlane resolve_sketch_plane_doc(const json& doc, const json& f
                 const json& c = plane_ref.contains("centroid") ? plane_ref.at("centroid") : json();
                 if (c.is_array() && c.size() == 3 && c[0].is_number() && c[1].is_number() &&
                     c[2].is_number()) {
-                    aicad::doc::QueryPicks qp = aicad::doc::resolve_geom_query(
+                    chudware::doc::QueryPicks qp = chudware::doc::resolve_geom_query(
                         body, json{{"of", std::string("face")}, {"near", c}, {"count", 1}});
                     if (qp.error.empty() && !qp.faces.empty()) face = qp.faces.front();
                 }
@@ -4487,7 +4487,7 @@ aicad::geom::SketchPlane resolve_sketch_plane_doc(const json& doc, const json& f
                         GProp_GProps props;
                         BRepGProp::SurfaceProperties(face, props);
                         gp_Pnt cm = props.CentreOfMass();
-                        return aicad::geom::SketchPlane::from(
+                        return chudware::geom::SketchPlane::from(
                             Eigen::Vector3d(cm.X(), cm.Y(), cm.Z()),
                             Eigen::Vector3d(nd.X(), nd.Y(), nd.Z()));
                     }
@@ -4498,7 +4498,7 @@ aicad::geom::SketchPlane resolve_sketch_plane_doc(const json& doc, const json& f
             // through to the existing SketchPlane::top() fallback — behaviour unchanged.
         }
     }
-    return aicad::geom::SketchPlane::top();
+    return chudware::geom::SketchPlane::top();
 }
 
 // Session convenience wrapper (the original entry point — all pre-T-BL43 callers).
@@ -4506,7 +4506,7 @@ aicad::geom::SketchPlane resolve_sketch_plane_doc(const json& doc, const json& f
 // geometry-changing op bumps revision) already carries the datums side-channel and the
 // surviving shapes this resolution reads, so serve it instead of recompiling the tree
 // per plane lookup.
-aicad::geom::SketchPlane resolve_sketch_plane(Session& s, const json& feat) {
+chudware::geom::SketchPlane resolve_sketch_plane(Session& s, const json& feat) {
     const CompileResult* pre =
         (s.compiled && s.compiled_rev == s.revision) ? s.compiled.get() : nullptr;
     return resolve_sketch_plane_doc(s.doc, feat, pre);
@@ -4515,7 +4515,7 @@ aicad::geom::SketchPlane resolve_sketch_plane(Session& s, const json& feat) {
 // session.py::_plane_frame — 16-float row-major matrix mapping sketch (u,v,0,1) ->
 // world. Columns are x_dir(uAxis), y_dir(vAxis), z_dir(normal), origin; rows 0..2
 // are the affine rows, row 3 is [0,0,0,1].
-std::vector<double> plane_frame(const aicad::geom::SketchPlane& p) {
+std::vector<double> plane_frame(const chudware::geom::SketchPlane& p) {
     std::vector<double> out;
     out.reserve(16);
     for (int i = 0; i < 3; ++i) {
@@ -4600,7 +4600,7 @@ json sketch_constraints(const json& feat, const json& entity_coords) {
         if (c.contains("axis") && c["axis"].is_string() && !c["axis"].get<std::string>().empty())
             rec["axis"] = c["axis"];
         if (c.contains("cond") && c["cond"].is_array()) rec["cond"] = c["cond"];
-        auto m = aicad::sketch::measure_constraint(c, entity_coords);
+        auto m = chudware::sketch::measure_constraint(c, entity_coords);
         if (m) rec["measured"] = *m;
         out.push_back(std::move(rec));
     }
@@ -4612,7 +4612,7 @@ json sketch_constraints(const json& feat, const json& entity_coords) {
 // (conflicting non-empty OR not converged) geometry is frozen at the doc's current
 // coords and warm state is cleared.
 struct SolveActive {
-    std::optional<aicad::sketch::SolveState> state;  // nullopt when rejected
+    std::optional<chudware::sketch::SolveState> state;  // nullopt when rejected
     json entities;          // list of coord dicts carrying id + construction
     json entity_map;        // id -> coord dict
     json statuses;          // id -> "under"|"full"|"over"
@@ -4625,7 +4625,7 @@ struct SolveActive {
 };
 
 SolveActive solve_active(Session& s, const json& feat,
-                         const std::optional<aicad::sketch::SolveState>& warm) {
+                         const std::optional<chudware::sketch::SolveState>& warm) {
     json env = env_from_doc(s.doc);
     json params = sketch_params(feat);
     json sk;
@@ -4634,8 +4634,8 @@ SolveActive solve_active(Session& s, const json& feat,
 
     // Interactive solve (T-PERF8 LDLT + T-PERF9 component decomp). Exact/oracle
     // callers hit solve_sketch without interactive; this path is the live sketcher.
-    aicad::sketch::SketchSolution sol =
-        aicad::sketch::solve_sketch(sk, env, warm, /*time_budget_ms=*/std::nullopt,
+    chudware::sketch::SketchSolution sol =
+        chudware::sketch::solve_sketch(sk, env, warm, /*time_budget_ms=*/std::nullopt,
                                     /*interactive=*/true);
 
     SolveActive out;
@@ -4674,7 +4674,7 @@ SolveActive solve_active(Session& s, const json& feat,
 
     out.skipped_constraints.clear();  // C++ solver has no skipped_constraints field
 
-    out.state = out.rejected ? std::optional<aicad::sketch::SolveState>{} : sol.state;
+    out.state = out.rejected ? std::optional<chudware::sketch::SolveState>{} : sol.state;
     return out;
 }
 
@@ -4728,7 +4728,7 @@ json sketch_result(const json& feat, const SolveActive& packed,
 // ----------------------------------------------------------------- crash recovery
 // Drop orphaned per-doc mutexes left held by THIS thread after a Windows structured
 // exception (an access violation) unwound past a DocLock without running its C++
-// destructor under /EHsc. Called from the libaicad C dispatch boundary's __except
+// destructor under /EHsc. Called from the libchudware C dispatch boundary's __except
 // filter after such a fault, so the worker thread doesn't EDEADLK on its next call.
 //
 // SAFETY: unlocks only mutexes tracked by this thread's DocLock chain (g_mtx_held &&
@@ -5062,14 +5062,14 @@ json doc_solve_mates(const std::string& doc_id, const json& drag) {
     if (!s.path.empty()) base_dir = std::filesystem::path(s.path).parent_path().string();
     push_undo(s);
 
-    std::optional<aicad::mate::WarmMap> warm;
+    std::optional<chudware::mate::WarmMap> warm;
     if (!s.asm_warm.empty()) warm = s.asm_warm;
-    std::optional<aicad::mate::Drag> drag_opt;
+    std::optional<chudware::mate::Drag> drag_opt;
     if (drag.is_object() && drag.contains("component") && drag["component"].is_string()) {
         // session.py::_compile_assembly_drag: first a plain compile to warm + load, then
         // a second solve with the drag target seeded from that warm result. compile_assembly
         // accepts a drag arg directly here, threading it to the solver in one pass.
-        aicad::mate::Drag d;
+        chudware::mate::Drag d;
         d.component = drag["component"].get<std::string>();
         if (drag.contains("target") && drag["target"].is_array() && drag["target"].size() == 3)
             d.target = Eigen::Vector3d(drag["target"][0].get<double>(),
@@ -5311,7 +5311,7 @@ bool doc_close(const std::string& doc_id) {
     }
     wipe_undo_journal(doc_id);
     // T-PERF10: free AICM shared-memory objects for this doc (all revisions).
-    aicad::aicm_handoff::release_doc(doc_id);
+    chudware::aicm_handoff::release_doc(doc_id);
     return true;
 }
 
@@ -5916,7 +5916,7 @@ json doc_export_step(const std::string& doc_id, const std::string& path) {
                       {{"doc_id", doc_id}});
     // Path resolution: an absolute client/server path is honored verbatim (desktop non-daemon
     // keeps writing under the host appdata cache). Empty OR relative paths get a server-owned
-    // temp file under the same aicad_cpp_docs dir publish_doc_aicm uses — required for WASM /
+    // temp file under the same chudware_cpp_docs dir publish_doc_aicm uses — required for WASM /
     // daemon hosts where the client would otherwise send a browser-local path hostd can't use.
     // The resolved absolute path is always returned in the response so callers can seed step_path.
     std::string use_path = path;
@@ -5924,7 +5924,7 @@ json doc_export_step(const std::string& doc_id, const std::string& path) {
         const std::filesystem::path p(use_path);
         if (use_path.empty() || !p.is_absolute()) {
             std::filesystem::path dir =
-                std::filesystem::temp_directory_path() / "aicad_cpp_docs";
+                std::filesystem::temp_directory_path() / "chudware_cpp_docs";
             std::error_code ec;
             std::filesystem::create_directories(dir, ec);
             std::string ext = ".step";
@@ -6563,7 +6563,7 @@ static std::vector<RenderLabel> principal_face_labels(Session& s) {
             {"left",   "LEFT",   {-1, 0, 0}, {225, 140, 70}},
         };
         for (const Dir& dd : dirs) {
-            aicad::doc::QueryPicks qp = aicad::doc::resolve_geom_query(
+            chudware::doc::QueryPicks qp = chudware::doc::resolve_geom_query(
                 shp, json{{"of", "face"}, {"side", dd.side}});
             if (!qp.error.empty() || !qp.selectors.is_array() || qp.selectors.empty()) continue;
             const json& sel = qp.selectors.front();
@@ -6719,7 +6719,7 @@ json drawing_render_png(const std::string& doc_id, const std::string& out_path) 
     try {
         // drawing_get works on the drawing-session registry (its own locking); it throws
         // unknown_doc if doc_id isn't an open drawing.
-        json full = aicad::doc::drawing_get(doc_id);
+        json full = chudware::doc::drawing_get(doc_id);
 
         std::vector<std::vector<std::array<double, 2>>> visible, hidden;
         auto pool = [](const json& jpls,
@@ -7081,7 +7081,7 @@ json doc_query(const std::string& doc_id, const json& query) {
             throw_no_bodies(doc_id, r, "query");
         }
     }
-    aicad::doc::QueryPicks qp = aicad::doc::resolve_geom_query(shape, query);
+    chudware::doc::QueryPicks qp = chudware::doc::resolve_geom_query(shape, query);
     if (!qp.error.empty())
         throw OpError("invalid_op", qp.error);
     int count = qp.selectors.is_array() ? static_cast<int>(qp.selectors.size()) : 0;
@@ -7100,7 +7100,7 @@ json doc_adjacency(const std::string& doc_id) {
     if (r.shapes.empty())
         throw_no_bodies(doc_id, r, "adjacency");
     const TopoDS_Shape& shape = r.shapes.back();
-    std::vector<aicad::doc::TopoInfo> faces = aicad::doc::describe_faces(shape);
+    std::vector<chudware::doc::TopoInfo> faces = chudware::doc::describe_faces(shape);
 
     // Face ordinals MUST follow describe_faces (TopExp_Explorer), not MapShapes — query
     // matches and doc_resolve_pick face ids use that enumeration.
@@ -7160,7 +7160,7 @@ json doc_adjacency(const std::string& doc_id) {
 
     json jfaces = json::array();
     for (size_t i = 0; i < faces.size(); ++i) {
-        json sel = aicad::doc::make_selector(faces[i]);  // reuse Stage-0 side/surf
+        json sel = chudware::doc::make_selector(faces[i]);  // reuse Stage-0 side/surf
         json nb = json::array();
         for (int n : nbr[i]) nb.push_back(n);
         jfaces.push_back({{"ord", (int)i},
@@ -7945,9 +7945,9 @@ gp_Pln eval_resolve_plane(const json& plane_ref) {
                       {{"reason", "bad plane"}});
     // SketchPlane factory: top u=+X n=+Z; front u=+X n=-Y; right u=+Y n=+X — these
     // are exactly build123d's Plane.XY / .XZ / .YZ (origin, x_dir, z_dir).
-    aicad::geom::SketchPlane sp = (bare == "front") ? aicad::geom::SketchPlane::front()
-                                  : (bare == "right") ? aicad::geom::SketchPlane::right()
-                                                      : aicad::geom::SketchPlane::top();
+    chudware::geom::SketchPlane sp = (bare == "front") ? chudware::geom::SketchPlane::front()
+                                  : (bare == "right") ? chudware::geom::SketchPlane::right()
+                                                      : chudware::geom::SketchPlane::top();
     gp_Pnt origin(sp.origin.x(), sp.origin.y(), sp.origin.z());
     gp_Dir normal(sp.normal.x(), sp.normal.y(), sp.normal.z());
     gp_Dir xdir(sp.uAxis.x(), sp.uAxis.y(), sp.uAxis.z());
@@ -8280,7 +8280,7 @@ TopoDS_Shape eval_resolve_ref(const json& ref, const TopoDS_Shape& shape, double
     // 1) build the predicate-aware query for an edge/face ref.
     json query;
     bool singling = false;  // does the query explicitly single out ONE sub-shape?
-    if (aicad::doc::is_geom_query(ref)) {
+    if (chudware::doc::is_geom_query(ref)) {
         // A raw plain-words query — honour every predicate it carries. It is "singling" when it
         // names a pick/near/index or a count cap (the predicates that intentionally narrow to a
         // specific sub-shape and so license a deterministic tie-break on the survivors).
@@ -8303,7 +8303,7 @@ TopoDS_Shape eval_resolve_ref(const json& ref, const TopoDS_Shape& shape, double
     }
 
     if (!query.is_null()) {
-        aicad::doc::QueryPicks qp = aicad::doc::resolve_geom_query(shape, query);
+        chudware::doc::QueryPicks qp = chudware::doc::resolve_geom_query(shape, query);
         if (!qp.error.empty())
             throw OpError("invalid_op", "measure ref: " + qp.error, {{"reason", "bad query"}});
         const std::size_t n = qp.faces.size() + qp.edges.size();
@@ -9280,7 +9280,7 @@ json doc_eval_compare(const json& params) {
                       {{"reason", "missing doc id"}});
     TopoDS_Shape shape_a = eval_compare_pick_shape(doc_a_id, params, "body_a");
     TopoDS_Shape shape_b = eval_compare_pick_shape(doc_b_id, params, "body_b");
-    return aicad::doc::compare_shapes(shape_a, shape_b);
+    return chudware::doc::compare_shapes(shape_a, shape_b);
 }
 
 // C2 (WS-C) — resolve params.face into a live TopoDS_Face on `body`: either a stable "sid"
@@ -9292,11 +9292,11 @@ TopoDS_Face doc_face_wires_resolve(const TopoDS_Shape& body, const json& face_re
         throw OpError("invalid_op", "doc_face_wires: params.face must be an object",
                       {{"reason", "bad face ref"}});
     if (face_ref.contains("sid") && face_ref["sid"].is_string() && !face_ref.contains("kind") &&
-        !aicad::doc::is_geom_query(face_ref)) {
+        !chudware::doc::is_geom_query(face_ref)) {
         const std::string want = face_ref["sid"].get<std::string>();
         for (const TopoInfo& info : describe_faces(body)) {
             if (make_selector(info).value("sid", std::string()) != want) continue;
-            aicad::doc::QueryPicks qp = aicad::doc::resolve_geom_query(
+            chudware::doc::QueryPicks qp = chudware::doc::resolve_geom_query(
                 body, json{{"of", std::string("face")},
                           {"near", {info.centroid.x(), info.centroid.y(), info.centroid.z()}},
                           {"count", 1}});
@@ -9327,7 +9327,7 @@ json doc_face_wires(const std::string& doc_id, const json& params) {
         throw OpError("invalid_op", "doc_face_wires requires params.face",
                       {{"reason", "missing face"}});
     TopoDS_Face face = doc_face_wires_resolve(r.shapes.back(), face_ref);
-    return aicad::doc::face_wires(face);
+    return chudware::doc::face_wires(face);
 }
 
 
@@ -9445,7 +9445,7 @@ std::string field_write_temp_aicm(const aicm::AicmBody& body,
     static std::atomic<unsigned long long> seq{1};
     unsigned long long n = seq.fetch_add(1);
     const std::string key = "field_" + std::to_string(n);
-    std::string uri = aicad::aicm_handoff::publish(key, blob);
+    std::string uri = chudware::aicm_handoff::publish(key, blob);
     if (uri.empty())
         throw OpError("invalid_op", "failed to publish field aicm",
                       {{"reason", "aicm publish failed"}});
@@ -10183,34 +10183,34 @@ static std::string vendor_slug(const std::string& v) {
 // Insert a registered supplier/vendor CAD part as an `import` feature (port of
 // engine/vendor_parts.py::_vendor_part_insert, which is now removed from the Python worker — the
 // doc mutation lives here). The vendor REGISTRY stays in Python (register/list/context write
-// %APPDATA%/AI-CAD/vendor_parts/index.json); this reads that SAME index, resolves the cached CAD
+// %APPDATA%/Chudware/vendor_parts/index.json); this reads that SAME index, resolves the cached CAD
 // path + metadata, and applies an import op carrying the vendor_* params verbatim. `into` empty ->
 // mint a new part doc. Throws OpError on a missing index / unknown part / missing CAD file.
 json doc_vendor_part_insert(const std::string& into, const std::string& supplier,
                             const std::string& part_number, const std::string& name) {
     DocLock lk;
-    // %APPDATA%/AI-CAD/vendor_parts/index.json (mirror of engine/paths.py::appdata_root()).
-    // Resolve %APPDATA%/AI-CAD (Windows) or $XDG_DATA_HOME|~/.local/share /AI-CAD (POSIX) —
+    // %APPDATA%/Chudware/vendor_parts/index.json (mirror of engine/paths.py::appdata_root()).
+    // Resolve %APPDATA%/Chudware (Windows) or $XDG_DATA_HOME|~/.local/share /Chudware (POSIX) —
     // mirrors agent/paths.cpp::appdata_root() so the core and host agree on the data dir.
-    std::filesystem::path aicad_root;
+    std::filesystem::path chudware_root;
 #ifdef _WIN32
     const char* appdata = std::getenv("APPDATA");
     if (appdata && appdata[0]) {
-        aicad_root = std::filesystem::path(appdata) / "AI-CAD";
+        chudware_root = std::filesystem::path(appdata) / "Chudware";
     } else {
         const char* home = std::getenv("USERPROFILE");
-        aicad_root = std::filesystem::path(home && home[0] ? home : ".") / "AppData" / "Roaming" /
-                     "AI-CAD";
+        chudware_root = std::filesystem::path(home && home[0] ? home : ".") / "AppData" / "Roaming" /
+                     "Chudware";
     }
 #else
     if (const char* xdg = std::getenv("XDG_DATA_HOME"); xdg && xdg[0])
-        aicad_root = std::filesystem::path(xdg) / "AI-CAD";
+        chudware_root = std::filesystem::path(xdg) / "Chudware";
     else if (const char* home = std::getenv("HOME"); home && home[0])
-        aicad_root = std::filesystem::path(home) / ".local" / "share" / "AI-CAD";
+        chudware_root = std::filesystem::path(home) / ".local" / "share" / "Chudware";
     else
-        aicad_root = std::filesystem::path(".") / "AI-CAD";
+        chudware_root = std::filesystem::path(".") / "Chudware";
 #endif
-    const std::filesystem::path index = aicad_root / "vendor_parts" / "index.json";
+    const std::filesystem::path index = chudware_root / "vendor_parts" / "index.json";
     if (!std::filesystem::exists(index))
         throw OpError("invalid_op", "vendor_part_insert: no vendor parts registered",
                       {{"reason", "no vendor index"}, {"index", index.string()}});
@@ -10574,7 +10574,7 @@ json doc_open(const std::string& path, bool as_solid, bool detach_path) {
                     header.contains("response") && header["response"].is_object()) {
                     resp = header["response"];
                     // T-PERF10: re-materialize cached mesh via aicm-shm (same handoff as
-                    // live rebuilds). Avoids /tmp/aicad_cpp_docs storm on cold open.
+                    // live rebuilds). Avoids /tmp/chudware_cpp_docs storm on cold open.
                     std::vector<uint8_t> blob(ca->second.begin(), ca->second.end());
                     std::string ap = publish_doc_aicm(stored.doc_id, stored.revision, blob);
                     if (!ap.empty()) {
@@ -10651,7 +10651,7 @@ json doc_sketch_enter(const std::string& doc_id, const std::string& sketch_fid) 
     DocLock lk;
     Session& s = require_session(doc_id);
     json& feat = find_sketch_feature(s, sketch_fid);
-    aicad::geom::SketchPlane plane = resolve_sketch_plane(s, feat);
+    chudware::geom::SketchPlane plane = resolve_sketch_plane(s, feat);
     std::vector<double> frame = plane_frame(plane);
 
     SolveActive packed = solve_active(s, feat, std::nullopt);
@@ -10672,12 +10672,12 @@ json doc_sketch_solve(const std::string& doc_id, const std::string& sketch_fid) 
     DocLock lk;
     Session& s = require_session(doc_id);
     json& feat = find_sketch_feature(s, sketch_fid);
-    std::optional<aicad::sketch::SolveState> warm;
+    std::optional<chudware::sketch::SolveState> warm;
     if (s.active_sketch && s.active_sketch->sketch_fid == sketch_fid)
         warm = s.active_sketch->solve_state;
     SolveActive packed = solve_active(s, feat, warm);
     if (!s.active_sketch || s.active_sketch->sketch_fid != sketch_fid) {
-        aicad::geom::SketchPlane plane = resolve_sketch_plane(s, feat);
+        chudware::geom::SketchPlane plane = resolve_sketch_plane(s, feat);
         SketchState st;
         st.sketch_fid = sketch_fid;
         st.plane_frame = plane_frame(plane);
@@ -10697,7 +10697,7 @@ json doc_sketch_overview(const std::string& doc_id, const std::string& sketch_fi
     DocLock lk;
     Session& s = require_session(doc_id);
     json& feat = find_sketch_feature(s, sketch_fid);
-    aicad::geom::SketchPlane plane = resolve_sketch_plane(s, feat);
+    chudware::geom::SketchPlane plane = resolve_sketch_plane(s, feat);
     SolveActive packed = solve_active(s, feat, std::nullopt);  // never touches active_sketch
     json r;
     r["entities"] = packed.entities;
@@ -10718,7 +10718,7 @@ json doc_sketch_drag(const std::string& doc_id, const std::string& sketch_fid,
     // Not entered (or stale / cold) — enter implicitly so drag is still serviceable.
     if (!s.active_sketch || s.active_sketch->sketch_fid != sketch_fid ||
         !s.active_sketch->solve_state) {
-        aicad::geom::SketchPlane plane = resolve_sketch_plane(s, feat);
+        chudware::geom::SketchPlane plane = resolve_sketch_plane(s, feat);
         std::vector<double> frame = plane_frame(plane);
         SolveActive packed = solve_active(s, feat, std::nullopt);
         SketchState st;
@@ -10754,7 +10754,7 @@ json doc_sketch_drag(const std::string& doc_id, const std::string& sketch_fid,
     std::pair<double, double> target_xy{0.0, 0.0};
     if (xy.is_array() && xy.size() == 2)
         target_xy = {xy[0].get<double>(), xy[1].get<double>()};
-    json res = aicad::sketch::drag(*st.solve_state, handle, target_xy, sk, env,
+    json res = chudware::sketch::drag(*st.solve_state, handle, target_xy, sk, env,
                                    targets.is_null() ? json() : targets, &st.drag_ctx);
     st.drag_ctx_revision = s.revision;
 
@@ -10821,7 +10821,7 @@ json doc_sketch_drag_commit(const std::string& doc_id, const std::string& sketch
         coords = s.active_sketch->last_entities;
     else {
         // Nothing dragged — re-solve and persist solved positions (idempotent commit).
-        std::optional<aicad::sketch::SolveState> warm =
+        std::optional<chudware::sketch::SolveState> warm =
             s.active_sketch ? s.active_sketch->solve_state : std::nullopt;
         SolveActive packed = solve_active(s, feat, warm);
         coords = packed.entity_map;
@@ -10849,7 +10849,7 @@ json doc_sketch_drag_commit(const std::string& doc_id, const std::string& sketch
     if (s.active_sketch && s.active_sketch->sketch_fid == sketch_fid) {
         try {
             json& feat2 = find_sketch_feature(s, sketch_fid);
-            std::optional<aicad::sketch::SolveState> warm = s.active_sketch->solve_state;
+            std::optional<chudware::sketch::SolveState> warm = s.active_sketch->solve_state;
             SolveActive packed = solve_active(s, feat2, warm);
             s.active_sketch->solve_state = packed.state;
             s.active_sketch->last_entities = packed.entity_map;
@@ -10943,12 +10943,12 @@ bool reg_near(const Eigen::Vector2d& a, const Eigen::Vector2d& b) {
     return std::abs(a.x() - b.x()) < kRegEps && std::abs(a.y() - b.y()) < kRegEps;
 }
 
-gp_Pnt reg_lift(const aicad::geom::SketchPlane& pl, const Eigen::Vector2d& uv) {
+gp_Pnt reg_lift(const chudware::geom::SketchPlane& pl, const Eigen::Vector2d& uv) {
     Eigen::Vector3d w = pl.lift(uv);
     return gp_Pnt(w.x(), w.y(), w.z());
 }
 
-bool reg_build_edge(const json& ent, const aicad::geom::SketchPlane& pl, RegEdge& out) {
+bool reg_build_edge(const json& ent, const chudware::geom::SketchPlane& pl, RegEdge& out) {
     if (!ent.is_object() || !ent.contains("type")) return false;
     if (ent.value("construction", false)) return false;
     const std::string t = ent["type"];
@@ -11181,7 +11181,7 @@ TopoDS_Face reg_region_face(const RegLoop& outer, const std::vector<const RegLoo
 
 // (area_or_len, centroid[u,v]) from a face's surface properties, centroid projected
 // into the plane's local frame (sketch.py _region_descriptor).
-void reg_face_descriptor(const TopoDS_Face& face, const aicad::geom::SketchPlane& pl,
+void reg_face_descriptor(const TopoDS_Face& face, const chudware::geom::SketchPlane& pl,
                          double& area, double& cu, double& cv) {
     area = 0.0; cu = 0.0; cv = 0.0;
     try {
@@ -11198,7 +11198,7 @@ void reg_face_descriptor(const TopoDS_Face& face, const aicad::geom::SketchPlane
 
 // Hole-aware 2D triangulation of a region face in sketch-local (u,v) coords
 // (sketch.py region_triangles_2d).
-json reg_region_triangles_2d(const TopoDS_Face& face, const aicad::geom::SketchPlane& pl) {
+json reg_region_triangles_2d(const TopoDS_Face& face, const chudware::geom::SketchPlane& pl) {
     json out = json::array();
     try {
         BRepMesh_IncrementalMesh(face, 0.25, false, 0.5, true).Perform();
@@ -11242,7 +11242,7 @@ json poly_to_json(const std::vector<Eigen::Vector2d>& p) {
 // g_mtx (which would deadlock).
 json sketch_regions_locked(Session& s, const std::string& sketch_fid) {
     json& feat = find_sketch_feature(s, sketch_fid);
-    aicad::geom::SketchPlane plane = resolve_sketch_plane(s, feat);
+    chudware::geom::SketchPlane plane = resolve_sketch_plane(s, feat);
 
     // Solve the sketch to get current entity coords (regions are computed on the
     // SOLVED geometry, same as session.py sketch_regions builds edges off entities).
@@ -11377,7 +11377,7 @@ json doc_sketch_probe(const std::string& doc_id, const std::string& sketch_fid,
         base_params.contains("constraints") ? base_params["constraints"] : json::array();
 
     // COLD baseline solve of the unmodified copy for dof_before.
-    aicad::sketch::SketchSolution before = aicad::sketch::solve_sketch(base_sk, env, std::nullopt);
+    chudware::sketch::SketchSolution before = chudware::sketch::solve_sketch(base_sk, env, std::nullopt);
     int dof_before = before.dof;
 
     // Deep-copy and mutate the COPY only.
@@ -11456,7 +11456,7 @@ json doc_sketch_probe(const std::string& doc_id, const std::string& sketch_fid,
                     "set_dim / delete_constraint"}};
     }
 
-    aicad::sketch::SketchSolution after = aicad::sketch::solve_sketch(params, env, std::nullopt);
+    chudware::sketch::SketchSolution after = chudware::sketch::solve_sketch(params, env, std::nullopt);
     int dof_after = after.dof;
     const std::vector<std::string>& conflicting = after.conflicting;
     const std::vector<std::string>& redundant = after.redundant;
@@ -11543,8 +11543,8 @@ std::unordered_set<std::string> coincident_pair_set(const json& constraints) {
 json coincident_proposals(const json& solved_coords, const json& constraints,
                           double tol_mm,
                           const std::unordered_set<std::string>& touched_eids = {}) {
-    std::vector<aicad::sketch::Endpoint> eps =
-        aicad::sketch::entity_endpoints(solved_coords);
+    std::vector<chudware::sketch::Endpoint> eps =
+        chudware::sketch::entity_endpoints(solved_coords);
     const std::unordered_set<std::string> linked = coincident_pair_set(constraints);
     const bool scope = !touched_eids.empty();
     struct Cand { int i, j; double gap; };
@@ -11633,10 +11633,10 @@ std::unordered_set<std::string> touched_entity_ids(const json& ops, const json& 
 // one other endpoint; we report the count of endpoints still dangling (unmatched).
 // Returns {closed_chains_ok, open_endpoints:[handles]} — the narration source.
 json closure_summary(const json& solved_coords) {
-    std::vector<aicad::sketch::Endpoint> eps =
-        aicad::sketch::entity_endpoints(solved_coords);
+    std::vector<chudware::sketch::Endpoint> eps =
+        chudware::sketch::entity_endpoints(solved_coords);
     // circle/point centers are not chain endpoints; keep only p1/p2/start/end handles.
-    std::vector<aicad::sketch::Endpoint> chain;
+    std::vector<chudware::sketch::Endpoint> chain;
     for (const auto& e : eps) {
         auto dot = e.handle.find('.');
         if (dot == std::string::npos) continue;  // bare point / circle center handled below
@@ -11679,13 +11679,13 @@ int material_region_count(Session& s, const std::string& sketch_fid) {
 }
 
 // Solve `feat` cold and hand back the SketchSolution (for auto-constrain add/analyze).
-aicad::sketch::SketchSolution solve_feat_cold(Session& s, const json& feat) {
+chudware::sketch::SketchSolution solve_feat_cold(Session& s, const json& feat) {
     json env = env_from_doc(s.doc);
     json params = sketch_params(feat);
     json sk;
     sk["entities"] = params.contains("entities") ? params["entities"] : json::array();
     sk["constraints"] = params.contains("constraints") ? params["constraints"] : json::array();
-    return aicad::sketch::solve_sketch(sk, env, std::nullopt);
+    return chudware::sketch::solve_sketch(sk, env, std::nullopt);
 }
 
 // Add each proposal as a `coincident` constraint into `entities_ref`/`constraints_ref`
@@ -11721,8 +11721,8 @@ json apply_coincident_proposals(json& params, const json& proposals, const json&
         // Interactive when a wall-clock budget is set (apply_ops auto-coincident);
         // the explicit auto-constrain RPC leaves budget unset so the exact path is used.
         const bool interactive = solve_budget_ms.has_value();
-        aicad::sketch::SketchSolution sol =
-            aicad::sketch::solve_sketch(sk, env, std::nullopt, solve_budget_ms,
+        chudware::sketch::SketchSolution sol =
+            chudware::sketch::solve_sketch(sk, env, std::nullopt, solve_budget_ms,
                                         interactive);
         bool conflicts = false;
         for (const std::string& t : sol.conflicting)
@@ -11767,8 +11767,8 @@ void maybe_auto_constrain(json& working, const std::vector<std::string>& sketch_
                 json sk;
                 sk["entities"] = params.value("entities", json::array());
                 sk["constraints"] = params.value("constraints", json::array());
-                aicad::sketch::SketchSolution sol =
-                    aicad::sketch::solve_sketch(sk, env, std::nullopt,
+                chudware::sketch::SketchSolution sol =
+                    chudware::sketch::solve_sketch(sk, env, std::nullopt,
                                                 kInteractiveSolveBudgetMs,
                                                 /*interactive=*/true);
                 if (!sol.converged) break;  // don't auto-touch a broken sketch
@@ -11804,7 +11804,7 @@ json doc_sketch_auto_constrain(const std::string& doc_id, const std::string& ske
     }
 
     // Solve current geometry, gather the coincident proposals (read-only either way).
-    aicad::sketch::SketchSolution sol = solve_feat_cold(s, feat);
+    chudware::sketch::SketchSolution sol = solve_feat_cold(s, feat);
     json params = sketch_params(feat);
     json cons = params.contains("constraints") ? params["constraints"] : json::array();
     json proposals = coincident_proposals(sol.entities, cons, tol_mm);
@@ -11867,7 +11867,7 @@ json doc_sketch_health(const std::string& doc_id, const std::string& sketch_fid)
     sk["entities"] = params.contains("entities") ? params["entities"] : json::array();
     sk["constraints"] = params.contains("constraints") ? params["constraints"] : json::array();
 
-    aicad::sketch::SketchSolution sol = aicad::sketch::solve_sketch(sk, env, std::nullopt);
+    chudware::sketch::SketchSolution sol = chudware::sketch::solve_sketch(sk, env, std::nullopt);
 
     // ---- closure ------------------------------------------------------------
     json closure = closure_summary(sol.entities);
@@ -11877,7 +11877,7 @@ json doc_sketch_health(const std::string& doc_id, const std::string& sketch_fid)
     // ---- free-variable narration -------------------------------------------
     // Reuse the cold solve above (sol.x) — free_variables rebuilds the identical
     // system, so handing it the solved vector skips its redundant second cold solve.
-    std::vector<aicad::sketch::FreeVar> fvs = aicad::sketch::free_variables(sk, env, sol.x);
+    std::vector<chudware::sketch::FreeVar> fvs = chudware::sketch::free_variables(sk, env, sol.x);
     json free_vars = json::array();
     // Group per entity for a readable phrase ("line L4: end x, end y").
     std::map<std::string, std::vector<std::string>> by_ent;
@@ -12120,7 +12120,7 @@ std::pair<Eigen::Vector2d, Eigen::Vector2d> plane_plane_line_uv(
 // boundary to convert). Every emitted entity is construction:true (callers may override).
 // Returns {entities:[...(no ids)...], approx:bool, sources:[...]}; throws OpError on a bad
 // ref shape, no solid bodies (for face/edge refs), or a datum parallel to the sketch plane.
-json project_external_refs(const json& doc, const aicad::geom::SketchPlane& plane,
+json project_external_refs(const json& doc, const chudware::geom::SketchPlane& plane,
                            const json& refs, const CompileResult* pre, bool strict) {
     const Eigen::Vector3d O1 = plane.origin, u = plane.uAxis, v = plane.vAxis,
                           n1 = plane.normal;
@@ -12134,8 +12134,8 @@ json project_external_refs(const json& doc, const aicad::geom::SketchPlane& plan
     json sources = json::array();
     bool any_approx = false;
 
-    auto append_entities = [&](const std::vector<aicad::doc::ProjectedEntity>& pes) {
-        for (const aicad::doc::ProjectedEntity& pe : pes) all_entities.push_back(pe.entity);
+    auto append_entities = [&](const std::vector<chudware::doc::ProjectedEntity>& pes) {
+        for (const chudware::doc::ProjectedEntity& pe : pes) all_entities.push_back(pe.entity);
     };
 
     auto project_datum = [&](const std::string& name_in) {
@@ -12213,7 +12213,7 @@ json project_external_refs(const json& doc, const aicad::geom::SketchPlane& plan
                 std::vector<TopoInfo> infos;
                 infos.reserve(m.Extent());
                 for (int i = 1; i <= m.Extent(); ++i)
-                    infos.push_back(aicad::doc::edge_info(TopoDS::Edge(m.FindKey(i)), i - 1));
+                    infos.push_back(chudware::doc::edge_info(TopoDS::Edge(m.FindKey(i)), i - 1));
                 ResolveResult rr = resolve(s, infos, diag);
                 if (!rr.index.has_value()) throw dangle(rr);
                 if (*rr.index >= 0 && *rr.index < m.Extent())
@@ -12226,9 +12226,9 @@ json project_external_refs(const json& doc, const aicad::geom::SketchPlane& plan
         if (kind == "face") {
             TopoDS_Shape sub = resolve_sub(sel, "face");
             TopoDS_Face face = TopoDS::Face(sub);
-            std::vector<TopoDS_Edge> edges = aicad::doc::face_boundary_edges(face);
+            std::vector<TopoDS_Edge> edges = chudware::doc::face_boundary_edges(face);
             bool approx = false;
-            append_entities(aicad::doc::project_edges_to_plane(edges, plane, approx));
+            append_entities(chudware::doc::project_edges_to_plane(edges, plane, approx));
             any_approx = any_approx || approx;
             sources.push_back(json{{"kind", "face"}, {"selector", sel},
                                    {"edges", static_cast<int>(edges.size())}});
@@ -12237,7 +12237,7 @@ json project_external_refs(const json& doc, const aicad::geom::SketchPlane& plan
             TopoDS_Shape sub = resolve_sub(sel, "edge");
             TopoDS_Edge edge = TopoDS::Edge(sub);
             bool approx = false;
-            append_entities(aicad::doc::project_edges_to_plane({edge}, plane, approx));
+            append_entities(chudware::doc::project_edges_to_plane({edge}, plane, approx));
             any_approx = any_approx || approx;
             sources.push_back(json{{"kind", "edge"}, {"selector", sel}});
             stamp_count();
@@ -12391,7 +12391,7 @@ void refresh_sketch_external_refs(json& doc, CompileCache* cache) {
         if (!params.contains("external_refs") || !params["external_refs"].is_array() ||
             params["external_refs"].empty()) continue;
 
-        std::optional<aicad::geom::SketchPlane> plane;
+        std::optional<chudware::geom::SketchPlane> plane;
         try {
             plane = resolve_sketch_plane_doc(doc, f, &pre);
         } catch (...) { /* dangling plane -> every ref of this sketch goes stale below */ }
@@ -12409,7 +12409,7 @@ void refresh_sketch_external_refs(json& doc, CompileCache* cache) {
                 continue;
             }
             if (!new_ents.is_array() || new_ents.empty()) { xr["stale"] = true; continue; }
-            if (std::getenv("AICAD_XREF_DEBUG"))
+            if (std::getenv("CHUDWARE_XREF_DEBUG"))
                 std::fprintf(stderr, "[xref] sketch=%s ref=%s plane_o=(%g,%g,%g) n=(%g,%g,%g) new=%s\n",
                              f.value("id", std::string()).c_str(),
                              xr.value("id", std::string()).c_str(),
@@ -12528,7 +12528,7 @@ json doc_sketch_project_ref(const std::string& doc_id, const std::string& sketch
     DocLock lk;
     Session& s = require_session(doc_id);
     json& feat = find_sketch_feature(s, sketch_fid);
-    aicad::geom::SketchPlane plane = resolve_sketch_plane(s, feat);
+    chudware::geom::SketchPlane plane = resolve_sketch_plane(s, feat);
     Eigen::Vector3d O1 = plane.origin, u = plane.uAxis, v = plane.vAxis, n1 = plane.normal;
 
     if (!ref.is_object() || (!ref.contains("datum") && !ref.contains("kind")))
@@ -12671,7 +12671,7 @@ json doc_sketch_project_entities(const std::string& doc_id, const std::string& s
     DocLock lk;
     Session& s = require_session(doc_id);
     json& feat = find_sketch_feature(s, sketch_fid);
-    aicad::geom::SketchPlane plane = resolve_sketch_plane(s, feat);
+    chudware::geom::SketchPlane plane = resolve_sketch_plane(s, feat);
 
     if (!refs.is_array() || refs.empty())
         throw OpError("invalid_op",
@@ -12688,7 +12688,7 @@ json doc_sketch_project_entities(const std::string& doc_id, const std::string& s
 // Cross-document dependency registry (feat(xdoc))
 // ============================================================================
 //
-// Process-global: lives for the lifetime of the loaded libaicad, reset when
+// Process-global: lives for the lifetime of the loaded libchudware, reset when
 // all sessions are closed. Thread-safe: protected by the existing doc mutex
 // (DocLock) — same mutex serialises all doc_* calls so no extra lock needed.
 //
@@ -12836,7 +12836,7 @@ std::string mate_to_joint_type(const std::string& mate_type, const std::string& 
 json build_motion_dynamics(const std::string& doc_id,
                            const std::vector<std::map<std::string, Eigen::Matrix4d>>& poses,
                            double dt_s, const json& opts) {
-    namespace md = aicad::doc::motiondyn;
+    namespace md = chudware::doc::motiondyn;
     json warnings = json::array();
     std::vector<md::BodyProps> bodies;
     std::vector<md::JointDef> joints;
@@ -13372,7 +13372,7 @@ json doc_sketch3d_health(const std::string& doc_id, const std::string& sketch_fi
     json env = env_from_doc(s.doc);
     json sk = sketch3d_solver_input(feat);
 
-    aicad::sketch3d::Sketch3DSolution sol = aicad::sketch3d::solve_sketch3d(sk, env);
+    chudware::sketch3d::Sketch3DSolution sol = chudware::sketch3d::solve_sketch3d(sk, env);
 
     json statuses = json::object();
     for (const auto& kv : sol.statuses) statuses[kv.first] = kv.second;
@@ -13381,13 +13381,13 @@ json doc_sketch3d_health(const std::string& doc_id, const std::string& sketch_fi
     for (const auto& t : sol.conflicting) conflicting.push_back(t);
 
     json free_vars = json::array();
-    for (const auto& fv : aicad::sketch3d::free_variables3(sk, env))
+    for (const auto& fv : chudware::sketch3d::free_variables3(sk, env))
         free_vars.push_back({{"entity", fv.entity}, {"param", fv.param}, {"var", fv.var}});
 
     // Wire-chain report: how the solved entities connect (the same chains the
     // compiler hands a sweep as spine/guide, in the same deterministic order).
     json wires = json::array();
-    for (const TopoDS_Wire& w : aicad::geom::wires_from_sketch3d(sol.entities)) {
+    for (const TopoDS_Wire& w : chudware::geom::wires_from_sketch3d(sol.entities)) {
         int n_edges = 0;
         for (TopExp_Explorer ex(w, TopAbs_EDGE); ex.More(); ex.Next()) ++n_edges;
         wires.push_back({{"closed", static_cast<bool>(w.Closed())}, {"n_edges", n_edges}});
@@ -13420,13 +13420,13 @@ json doc_sketch3d_drag(const std::string& doc_id, const std::string& sketch_fid,
     // Stateless: a cold solve supplies the warm-start state for this drag step.
     // (Authored coords ARE the last committed positions — doc_schema §3.4 —
     // so the cold solve is already at/near the on-screen configuration.)
-    aicad::sketch3d::Sketch3DSolution base = aicad::sketch3d::solve_sketch3d(sk, env);
+    chudware::sketch3d::Sketch3DSolution base = chudware::sketch3d::solve_sketch3d(sk, env);
 
     Eigen::Vector3d target(0, 0, 0);
     if (xyz.is_array() && xyz.size() >= 3)
         target = Eigen::Vector3d(xyz[0].get<double>(), xyz[1].get<double>(),
                                  xyz[2].get<double>());
-    json res = aicad::sketch3d::drag3(base.state, handle, target, sk, env,
+    json res = chudware::sketch3d::drag3(base.state, handle, target, sk, env,
                                       targets.is_null() ? json() : targets);
 
     const json res_entities = res.contains("entities") ? res["entities"] : json::object();
@@ -13529,4 +13529,4 @@ nlohmann::json contention_report(bool reset) {
     return out;
 }
 
-}  // namespace aicad::doc
+}  // namespace chudware::doc

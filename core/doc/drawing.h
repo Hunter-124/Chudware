@@ -25,7 +25,7 @@
 #include <nlohmann/json.hpp>
 #include <TopoDS_Shape.hxx>
 
-namespace aicad::doc {
+namespace chudware::doc {
 
 // HLR-project `shapes` for one named orientation (front/back/top/bottom/right/left/
 // iso) into 2D sheet geometry. `scale` + `position` (sheet mm) map the projected
@@ -58,4 +58,4 @@ nlohmann::json project_detail(const nlohmann::json& parent_geom,
                               double scale, std::array<double, 2> position,
                               const std::string& view_id);
 
-}  // namespace aicad::doc
+}  // namespace chudware::doc

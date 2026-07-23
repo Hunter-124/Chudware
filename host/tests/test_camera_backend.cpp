@@ -1,22 +1,22 @@
 // RE-07: CameraBackend stub-backend ctest — pure CPU, no live device.
 // Verifies the frozen contract (contracts/reveng.md §7) surface:
 //   listDevices -> open -> lockExposure -> grabFrame returns a synthetic RGBA frame.
-// The live V4L2 path is exercised separately behind AICAD_TEST_CAMERA=1 (see below).
+// The live V4L2 path is exercised separately behind CHUDWARE_TEST_CAMERA=1 (see below).
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include "../src/platform/camera.h"
 
-using namespace aicad::platform;
+using namespace chudware::platform;
 
 // Deterministic stub check: force the synthetic backend so CI has no hardware
 // dependency. On Linux, CameraBackend::create() returns V4L2 by default; the
-// stub is selected with AICAD_FORCE_STUB_CAMERA=1.
+// stub is selected with CHUDWARE_FORCE_STUB_CAMERA=1.
 static int test_stub() {
 #if defined(__linux__) && !defined(_WIN32)
-    ::setenv("AICAD_FORCE_STUB_CAMERA", "1", 1);
-    ::unsetenv("AICAD_TEST_CAMERA");
+    ::setenv("CHUDWARE_FORCE_STUB_CAMERA", "1", 1);
+    ::unsetenv("CHUDWARE_TEST_CAMERA");
 #endif
     auto cam = CameraBackend::create();
     assert(cam && "create() must return a backend");
@@ -48,16 +48,16 @@ static int test_stub() {
     return 0;
 }
 
-// Optional live-device smoke, only when AICAD_TEST_CAMERA=1 is set by the caller.
+// Optional live-device smoke, only when CHUDWARE_TEST_CAMERA=1 is set by the caller.
 // Never fails CI when no camera is attached: open()/grab() falling back is tolerated.
 static int test_live_optional(bool live_requested) {
     if (!live_requested) {
-        std::cout << "live smoke skipped (AICAD_TEST_CAMERA != 1)\n";
+        std::cout << "live smoke skipped (CHUDWARE_TEST_CAMERA != 1)\n";
         return 0;
     }
 #if defined(__linux__) && !defined(_WIN32)
-    ::unsetenv("AICAD_FORCE_STUB_CAMERA");  // real V4L2 path
-    ::setenv("AICAD_TEST_CAMERA", "1", 1);
+    ::unsetenv("CHUDWARE_FORCE_STUB_CAMERA");  // real V4L2 path
+    ::setenv("CHUDWARE_TEST_CAMERA", "1", 1);
 #endif
     auto cam = CameraBackend::create();
     auto devices = cam->listDevices();
@@ -82,7 +82,7 @@ static int test_live_optional(bool live_requested) {
 }
 
 int main() {
-    const char* ev = std::getenv("AICAD_TEST_CAMERA");
+    const char* ev = std::getenv("CHUDWARE_TEST_CAMERA");
     bool live_requested = ev && std::strcmp(ev, "1") == 0;
     if (int rc = test_stub(); rc != 0) return rc;
     if (int rc = test_live_optional(live_requested); rc != 0) return rc;

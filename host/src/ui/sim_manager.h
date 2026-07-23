@@ -299,14 +299,14 @@ public:
     // the tab-switch hook to auto-reveal the Simulation workspace when a part has studies.
     int  studyCount() const { return (int)studies_.size(); }
 
-    // ---- scripted-shot helpers (AI_CAD_SHOT=fea), preserved from the old SimPanel ----
+    // ---- scripted-shot helpers (CHUDWARE_SHOT=fea), preserved from the old SimPanel ----
     void configureActive(AppState& st, float density, const std::string& materialKey);
 
-    // Scripted-shot helper (AI_CAD_SHOT=simdisclosure*): hold the "+ New Study" picker open
+    // Scripted-shot helper (CHUDWARE_SHOT=simdisclosure*): hold the "+ New Study" picker open
     // so the headless disclosure-matrix shots capture the offered study kinds.
     bool shotForcePicker = false;
 
-    // ---- scripted-shot helpers (AI_CAD_SHOT=motion) ----
+    // ---- scripted-shot helpers (CHUDWARE_SHOT=motion) ----
     // True when the selected study is a Motion type with a successful result.
     bool motionHasResult() const;
     // Number of frames in the active motion trajectory (0 when no result).
@@ -314,7 +314,7 @@ public:
     // Advance the active motion study to a specific frame and upload transforms to the viewport.
     // No-op when motionHasResult() is false.
     void applyMotionFramePublic(AppState& st, int frame);
-    // Scripted-shot helper (AI_CAD_SHOT=flow): set the active flow study's fluid / angles / resolution.
+    // Scripted-shot helper (CHUDWARE_SHOT=flow): set the active flow study's fluid / angles / resolution.
     void configureActiveFlow(AppState& st, int fluid, float aoaDeg, float sideslipDeg, int preset);
 
     // Material lookup (singleton: built-in engine/sim/materials.json + user custom_materials.json).
@@ -327,7 +327,7 @@ public:
     static const std::vector<Material>& materials();
     static int materialIndexByKey(const std::string& key);
 
-    // Add a user-defined material (persisted to %APPDATA%/AI-CAD/custom_materials.json) and merge it
+    // Add a user-defined material (persisted to %APPDATA%/Chudware/custom_materials.json) and merge it
     // into the live material list. Returns the assigned key.
     static std::string addCustomMaterial(const Material& m);
 

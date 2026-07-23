@@ -8,7 +8,7 @@ Cases
                      ref = 1/(2*pi*sqrt(L*C)) (series resonance).
   divider_op_cpp     C++ core (core/sim/spice.cpp via `sim_spice`) op on the 1k/2k
                      divider; metric = V(OUT), ref = V*R2/(R1+R2) (divider closed form).
-                     Skips cleanly when libaicad is unavailable.
+                     Skips cleanly when libchudware is unavailable.
   rc_ladder_N        N-section RC ladder transient (Python MNA solver) — the runtime-vs-
                      size scaling series. metric = final voltage of the LAST ladder node,
                      ref = source V (all series R, no DC load: every node settles to V;
@@ -16,7 +16,7 @@ Cases
                      R*C*N*(N+1)/2, so the slowest mode has fully settled).
 
 quick=True runs N in (10, 100); full mode adds N=500. Engine runs in-process
-(AI_CAD_ENGINE_DAEMON=0); no daemon, no GUI, no LLM paths.
+(CHUDWARE_ENGINE_DAEMON=0); no daemon, no GUI, no LLM paths.
 """
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ import time
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if REPO not in sys.path:
     sys.path.insert(0, REPO)
-os.environ.setdefault("AI_CAD_ENGINE_DAEMON", "0")
+os.environ.setdefault("CHUDWARE_ENGINE_DAEMON", "0")
 
 DOMAIN = "ecad_sim"
 
@@ -171,7 +171,7 @@ def _bench_divider_op_cpp() -> dict:
         solve_s = time.perf_counter() - t1
     except Exception as e:  # noqa: BLE001
         return _case("divider_op_cpp", total_s=round(time.perf_counter() - t0, 4),
-                     status="skip", detail=f"libaicad unavailable: {type(e).__name__}: {e}")
+                     status="skip", detail=f"libchudware unavailable: {type(e).__name__}: {e}")
     got = (cpp.get("op") or {}).get("V(OUT)")
     ref = 10.0 * 2000.0 / 3000.0  # divider: V*R2/(R1+R2)
     ok = got is not None

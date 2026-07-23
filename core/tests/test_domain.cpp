@@ -7,10 +7,10 @@
 
 #include "agent/domain.h"
 
-using aicad::agent::classify_domain;
-using aicad::agent::context_sheets_for_domain;
-using aicad::agent::Domain;
-using aicad::agent::tool_classes_for_domain;
+using chudware::agent::classify_domain;
+using chudware::agent::context_sheets_for_domain;
+using chudware::agent::Domain;
+using chudware::agent::tool_classes_for_domain;
 
 static bool has(const std::vector<std::string>& v, const std::string& s) {
     return std::find(v.begin(), v.end(), s) != v.end();
@@ -124,20 +124,20 @@ TEST_CASE("McMaster / parts-library is Sourcing capability") {
     auto v = classify_domain(
         "download a model from McMaster to test tooling for the parts library");
     CHECK(v.domain == Domain::Sourcing);
-    CHECK(aicad::agent::is_capability_request(
+    CHECK(chudware::agent::is_capability_request(
         "download a model from McMaster to test tooling for the parts library"));
-    CHECK_FALSE(aicad::agent::capability_request_reason(
+    CHECK_FALSE(chudware::agent::capability_request_reason(
                     "download a model from McMaster to test tooling for the parts library")
                     .empty());
 }
 
 TEST_CASE("capability helper accepts product surfaces, rejects garbage") {
-    CHECK(aicad::agent::is_capability_request("run FEA stress analysis at 200N"));
-    CHECK(aicad::agent::is_capability_request("generate milling toolpaths and post g-code"));
-    CHECK(aicad::agent::is_capability_request("make an engineering drawing with a section view"));
-    CHECK(aicad::agent::is_capability_request("reverse engineer this STEP into features"));
-    CHECK(aicad::agent::is_capability_request("measure mass properties of the bracket"));
-    CHECK_FALSE(aicad::agent::is_capability_request("asdf qwerty blah blah"));
-    CHECK_FALSE(aicad::agent::is_capability_request(""));
-    CHECK_FALSE(aicad::agent::is_capability_request("hello how are you"));
+    CHECK(chudware::agent::is_capability_request("run FEA stress analysis at 200N"));
+    CHECK(chudware::agent::is_capability_request("generate milling toolpaths and post g-code"));
+    CHECK(chudware::agent::is_capability_request("make an engineering drawing with a section view"));
+    CHECK(chudware::agent::is_capability_request("reverse engineer this STEP into features"));
+    CHECK(chudware::agent::is_capability_request("measure mass properties of the bracket"));
+    CHECK_FALSE(chudware::agent::is_capability_request("asdf qwerty blah blah"));
+    CHECK_FALSE(chudware::agent::is_capability_request(""));
+    CHECK_FALSE(chudware::agent::is_capability_request("hello how are you"));
 }

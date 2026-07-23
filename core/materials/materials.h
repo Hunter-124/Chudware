@@ -3,7 +3,7 @@
 // first-party fact table (registry.json) read by the FEA seam, the DfM density
 // defaults, the CAM CuttingDB fold-in and the material_lookup research helper.
 // PURE: no OCCT, no doc/agent linkage; reads the SAME registry.json the Python
-// oracle reads (env AICAD_MATERIALS_REGISTRY override, then the appdata data root —
+// oracle reads (env CHUDWARE_MATERIALS_REGISTRY override, then the appdata data root —
 // the exact resolution core/cam/feeds.cpp uses).
 #pragma once
 
@@ -11,7 +11,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad {
+namespace chudware {
 namespace materials {
 
 using nlohmann::json;
@@ -55,4 +55,4 @@ json cam_materials();
 bool call(const std::string& method, const json& params, json& result, std::string& err);
 
 }  // namespace materials
-}  // namespace aicad
+}  // namespace chudware

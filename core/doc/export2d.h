@@ -15,7 +15,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad::doc {
+namespace chudware::doc {
 
 // doc_drawing_views: compile `doc` with `env`, then HLR-project each view in `views`
 // (each {orientation, scale?, position?, show_hidden?, view_id?}) against the
@@ -49,4 +49,4 @@ nlohmann::json export_drawing(const std::string& doc_id, const std::string& path
 nlohmann::json export_flat_dxf(const std::string& doc_id, const std::string& path,
                                const std::string& fmt);
 
-}  // namespace aicad::doc
+}  // namespace chudware::doc

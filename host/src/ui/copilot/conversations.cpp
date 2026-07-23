@@ -1,6 +1,6 @@
 // Copilot conversations + persistence (T-RF6 split of legacy_chat.cpp): conversation tabs
 // (ensure/new/switch/close, park/restore around doc switches), chat-history and prompt-draft
-// persistence to %APPDATA%/AI-CAD/*.json (incl. the WASM shared-workspace chat sync), and the
+// persistence to %APPDATA%/Chudware/*.json (incl. the WASM shared-workspace chat sync), and the
 // per-frame chat-triggered OpenFOAM CFD poll. The slash commands that mutate sessions live
 // with the send path in composer.cpp.
 

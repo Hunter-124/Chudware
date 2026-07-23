@@ -236,7 +236,7 @@ def test_worker_rpc_imports_bench_methods():
 
 def test_bench_categories_lists_six(bench_env):
     br, repo, _reports, _calls = bench_env
-    # Point categories module at the temp repo via AI_CAD_REPO (already used by
+    # Point categories module at the temp repo via CHUDWARE_REPO (already used by
     # _repo_root monkeypatch on br; categories reads its own root — seed a
     # report so last is non-null for modeling).
     import tools.flywheel.bench.categories as cats

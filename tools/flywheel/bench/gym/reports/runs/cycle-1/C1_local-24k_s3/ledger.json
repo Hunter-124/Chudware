@@ -731,7 +731,7 @@
           "run_id": "flanged_bushing_design_20231005"
         },
         "ok": true,
-        "result": "{\n  \"ok\": false,\n  \"reason\": \"Build graph run 'flanged_bushing_design_20231005' not found\",\n  \"hint\": \"Check run_id (from buildgraph_plan) and runs_dir (default: /home/hunter/.local/share/AI-CAD/runs).\"\n}"
+        "result": "{\n  \"ok\": false,\n  \"reason\": \"Build graph run 'flanged_bushing_design_20231005' not found\",\n  \"hint\": \"Check run_id (from buildgraph_plan) and runs_dir (default: /home/hunter/.local/share/Chudware/runs).\"\n}"
       }
     },
     {
@@ -795,7 +795,7 @@
       "payload": {
         "event": "turn",
         "kind": "text",
-        "text": "The build graph run 'flanged_bushing_design_20231005' was not found, indicating either:  \n1. The project is uninitialised (no DAG run data)  \n2. The run ID is incorrect (check runs_dir: `/home/hunter/.local/share/AI-CAD/runs`)  \n\nTo proceed:  \n- Confirm the run ID exists in `runs_dir` (look for `flanged_bushing_design_20231005` in `/home/hunter/.local/share/AI-CAD/runs`)  \n- Or initiate a new proj"
+        "text": "The build graph run 'flanged_bushing_design_20231005' was not found, indicating either:  \n1. The project is uninitialised (no DAG run data)  \n2. The run ID is incorrect (check runs_dir: `/home/hunter/.local/share/Chudware/runs`)  \n\nTo proceed:  \n- Confirm the run ID exists in `runs_dir` (look for `flanged_bushing_design_20231005` in `/home/hunter/.local/share/Chudware/runs`)  \n- Or initiate a new proj"
       }
     },
     {
@@ -837,7 +837,7 @@
           "run_id": "flanged_bushing_design_20231005"
         },
         "ok": true,
-        "result": "{\n  \"ok\": false,\n  \"reason\": \"Build graph run 'flanged_bushing_design_20231005' not found\",\n  \"hint\": \"Check run_id (from buildgraph_plan) and runs_dir (default: /home/hunter/.local/share/AI-CAD/runs).\"\n}"
+        "result": "{\n  \"ok\": false,\n  \"reason\": \"Build graph run 'flanged_bushing_design_20231005' not found\",\n  \"hint\": \"Check run_id (from buildgraph_plan) and runs_dir (default: /home/hunter/.local/share/Chudware/runs).\"\n}"
       }
     },
     {

@@ -23,7 +23,7 @@ Pure moves + header splits — no behavior change.
 Break legacy_chat.cpp into host/src/ui/copilot/ modules: chat_log, composer,
 activity_timeline, cards (plan/clarify/swarm/ai-vc), panel host. One chat
 implementation, two layouts (overlay pane + full-page AI workspace). Rename away from
-"legacy". Verify with AI_CAD_SHOT scenarios (populated mission, empty state), EYEBALL
+"legacy". Verify with CHUDWARE_SHOT scenarios (populated mission, empty state), EYEBALL
 the PNGs.
 
 ## Definition of done

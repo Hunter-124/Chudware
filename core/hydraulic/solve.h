@@ -7,7 +7,7 @@
 
 #include "piping/pyutil.h"
 
-namespace aicad::hydraulic {
+namespace chudware::hydraulic {
 
 using pyutil::ojson;
 
@@ -28,4 +28,4 @@ ojson valve_flow(double Cv, double pressure_drop_bar, double fluid_sg = 0.87);
 ojson fmu_simulate(const ojson& circuit_doc, const ojson& fmu_path = nullptr,
                    double stop_time = 10.0);
 
-}  // namespace aicad::hydraulic
+}  // namespace chudware::hydraulic

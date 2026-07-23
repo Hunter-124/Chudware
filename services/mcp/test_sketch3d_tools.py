@@ -5,7 +5,7 @@ contracts/sketch3d_gui_contract.md): create/edit via doc_apply_ops, solve via th
 stateless sketch3d_health RPC, sweep consumption via the sweep path/guides refs.
 
 Pure-Python helpers (curve mapping, arc tessellation, path sampling, narration) are
-tested without the engine; everything else is skip-guarded on libaicad availability.
+tested without the engine; everything else is skip-guarded on libchudware availability.
 
 Run:
   cd /home/hunter/Repositories/CAD
@@ -205,7 +205,7 @@ class TestFreeNarration:
 
 @pytest.mark.skipif(
     not _engine_available,
-    reason="libaicad not staged — C++ engine not available",
+    reason="libchudware not staged — C++ engine not available",
 )
 class TestSketch3dDocTools:
     """The re-pointed surface: sketch3d features live in the doc, solved by the engine."""

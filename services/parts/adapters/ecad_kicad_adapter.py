@@ -2,19 +2,19 @@
 
 Indexable domain adapter (domain="ecad") that enumerates:
   1. The clean-room starter symbol + footprint library (engine/ecad/library/starter).
-  2. User .kicad_sym libraries listed in AICAD_KICAD_SYM_PATH (colon-separated
+  2. User .kicad_sym libraries listed in CHUDWARE_KICAD_SYM_PATH (colon-separated
      paths, same env var as ecad_find_part in ecad_tools.py).
 
 Wraps engine.ecad.library.search (the ecad_find_part surface) for runtime
 .search() calls, and directly enumerates starter.SYMBOLS / starter.FOOTPRINTS
 plus any user-lib files for iter_records() (index build).
 
-Live search of user libs beyond AICAD_KICAD_SYM_PATH is handled by ecad_vendor
+Live search of user libs beyond CHUDWARE_KICAD_SYM_PATH is handled by ecad_vendor
 (T-P2 live provider) — this adapter covers the LOCAL, deterministic set only.
 
 geometry_ref.kind = "symbol_footprint" (symbols) per contracts/parts.md §2.
 
-Provenance / license: starter library = clean-room (AI-CAD proprietary).
+Provenance / license: starter library = clean-room (Chudware proprietary).
 User libs: license = "user-supplied".
 """
 from __future__ import annotations
@@ -25,7 +25,7 @@ from typing import Iterator
 
 log = logging.getLogger(__name__)
 
-_ENV_VAR = "AICAD_KICAD_SYM_PATH"
+_ENV_VAR = "CHUDWARE_KICAD_SYM_PATH"
 
 
 class EcadKicadAdapter:
@@ -82,11 +82,11 @@ class EcadKicadAdapter:
         starter_syms, starter_fps = _load_starter()
         for libid, sdef in starter_syms.items():
             yield _symbol_record(libid, sdef, license_="proprietary",
-                                 provenance="AI-CAD clean-room starter symbol library")
+                                 provenance="Chudware clean-room starter symbol library")
         # Starter footprints
         for fpid, fpdef in starter_fps.items():
             yield _footprint_record(fpid, fpdef, license_="proprietary",
-                                    provenance="AI-CAD clean-room starter footprint library")
+                                    provenance="Chudware clean-room starter footprint library")
         # User-supplied .kicad_sym libraries
         sym_path = os.environ.get(_ENV_VAR, "")
         for lib_path in (p.strip() for p in sym_path.split(":") if p.strip()):

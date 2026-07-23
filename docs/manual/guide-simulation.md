@@ -181,7 +181,7 @@ CROSS-SIM HANDOFF (aicad.simhandoff/1 — contracts/sim_handoff.md):
   delta_vs_target_c, mass_g, cost_usd}; winner = lightest candidate meeting the
   target, its study kept, result carries a verify envelope (coupling
   ecad_heatsink_to_thermal_fea). IMPOSSIBLE targets are honest: target_met=false with
-  the best achievable candidate named; without a sim-enabled libaicad it degrades to
+  the best achievable candidate named; without a sim-enabled libchudware it degrades to
   a flagged network estimate (Tj = Ta + P*(theta_jc + R_tim + R_sa)).
   Helper builders/validator: services/mcp/simhandoff.py.
 
@@ -205,7 +205,7 @@ GOLDEN DEMO (T-FIN25 — living E2E worked example):
   board: verification ladder (ERC/DRC/hostcheck/sicheck/FPGA/PDN) → firmware project +
   co-verify (fw_sim_run with fixture:i2c_temp_tmp103 when Renode is present) →
   ecad_thermal_handoff → heatsink_select(U1, tj_target_c=85) → power_budget →
-  make_report. Wired into scripts/gate.sh as stage 4.7 (AICAD_SKIP_FIN25=1 to opt out).
+  make_report. Wired into scripts/gate.sh as stage 4.7 (CHUDWARE_SKIP_FIN25=1 to opt out).
   Narrative + artifacts: docs/FIN25_SENSOR_NODE_GOLDEN_DEMO.md. Prefer this script over
   inventing a new end-to-end recipe when demonstrating the content is finished.
 

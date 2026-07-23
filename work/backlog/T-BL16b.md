@@ -55,7 +55,7 @@ translation.
       (e.g. a red tick) so the user sees WHERE it clashes; scrubbing to that frame shows the clash.
 - [ ] The GUI obtains a trajectory by calling `simulate_motion` (via the app's MCP/agent path or
       a direct engine call) — no re-implementation of the solve/interference loop in the GUI.
-- [ ] Verification is HEADLESS only (xvfb / AI_CAD_SHOT), worker built from the task branch (NOT
+- [ ] Verification is HEADLESS only (xvfb / CHUDWARE_SHOT), worker built from the task branch (NOT
       demo mode); light + dark screenshots of a frame mid-motion, eyeballed. (See team memory
       "GUI migration shot-verify blocker" + the foreman's demo-mode-is-not-verification rule.)
 

@@ -1,6 +1,6 @@
 // web_panel.h — the "Web" title-bar chip's full-window in-app browser.
 //
-// A general-purpose Chromium tab living inside Billet: the Web chip (title_bar.cpp)
+// A general-purpose Chromium tab living inside Chudware: the Web chip (title_bar.cpp)
 // toggles st.showWeb, and app.cpp draws this panel over the whole central band while
 // it is set, so the user can browse and tab straight back to modeling. The page stays
 // alive between toggles (the backend is a function-local static, created lazily on the

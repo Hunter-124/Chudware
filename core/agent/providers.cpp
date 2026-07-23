@@ -19,7 +19,7 @@
 #include "agent/http.h"
 #include "agent/omp_bridge_client.h"
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 namespace {
 // Per-thread sink so a design/micro run can observe every HTTP completion without
@@ -1457,7 +1457,7 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
     }
 
     // OpenAI-compatible family: openai / llamacpp / xai / xai-sub / moonshot.
-    // billet's Python XAISubProvider posts to /v1/chat/completions with Bearer
+    // chudware's Python XAISubProvider posts to /v1/chat/completions with Bearer
     // (OAuth access_token or API key). OAuth tokens arrive already refreshed
     // (auth::ensure_fresh_for_run at resolve time, T-RF4).
     if (provider == "openai" || provider == "llamacpp" || provider == "xai" ||
@@ -1700,4 +1700,4 @@ AssistCompleteFn make_assist_provider(const json& descriptor) {
 }
 
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware

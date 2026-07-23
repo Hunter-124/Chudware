@@ -20,7 +20,7 @@ Format: `- [ ] (TASK) question — MY DEFAULT: <what I did / assumed>`
       NOT delete host/ on Linux green alone." I've agent-verified AI-CAD2 builds+runs on
       Windows (T-G25) and am verifying the windows-app Ninja preset now. MY DEFAULT: I will
       NOT delete host/ autonomously — I'm doing the safe X1 prep/verification only and leaving
-      the deletion + human sign-off for you. When you're ready: build ShopCraft on Windows,
+      the deletion + human sign-off for you. When you're ready: build Chudware on Windows,
       smoke-test (open part/sketch/extrude/save), record your name+date in work/tasks/T-G11.md,
       then the host/ deletion can proceed. Want me to do the deletion once you've recorded the
       human verify, or keep it fully human-owned?

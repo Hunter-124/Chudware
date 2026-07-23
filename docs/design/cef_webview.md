@@ -31,7 +31,7 @@ host/src/ui/widgets/
   web_view_backend.h    IWebViewBackend (open/attach/close/update/draw/url/loginState/…)
                         + makeWebView() factory  ← single backend-selection point
   web_view.{h,cpp}      ScreencastWebView : IWebViewBackend   (default, ships today)
-  web_view_backend.cpp  makeWebView(): CEF when AI_CAD_ENABLE_CEF + AI_CAD_WEBVIEW=cef, else screencast
+  web_view_backend.cpp  makeWebView(): CEF when CHUDWARE_ENABLE_CEF + CHUDWARE_WEBVIEW=cef, else screencast
   cef/                  CefWebView : IWebViewBackend          (this doc; opt-in)
 ```
 
@@ -39,7 +39,7 @@ host/src/ui/widgets/
 `makeWebView()` and never mentions a concrete backend. Selecting CEF changes one
 factory line, not the UI.
 
-Build: `option(AI_CAD_ENABLE_CEF OFF)` in `host/CMakeLists.txt`. OFF (default)
+Build: `option(CHUDWARE_ENABLE_CEF OFF)` in `host/CMakeLists.txt`. OFF (default)
 compiles only the screencast backend — CI and contributors never need the ~1 GB
 CEF SDK. ON includes `host/cmake/cef.cmake`.
 
@@ -133,7 +133,7 @@ freezes):
 ## Phasing
 
 1. ✅ **Seam**: `IWebViewBackend`, `ScreencastWebView` refactor, factory,
-   `AI_CAD_ENABLE_CEF` option — build-green with CEF OFF. *(done)*
+   `CHUDWARE_ENABLE_CEF` option — build-green with CEF OFF. *(done)*
 2. **CEF hello-world**: SDK via `cmake/cef.cmake`, subprocess helper,
    `CefExecuteProcess` in `main()`, OSR paints example.com into the panel.
    *(needs SDK + build loop)*

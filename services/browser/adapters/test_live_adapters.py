@@ -1,7 +1,7 @@
 """Live canary searches against the real vendor sites (Parts Library V2).
 
 Every test here is ``@pytest.mark.live`` — skipped by default and enabled only
-with ``pytest --live`` or ``AICAD_LIVE_TESTS=1`` (root conftest.py). They also
+with ``pytest --live`` or ``CHUDWARE_LIVE_TESTS=1`` (root conftest.py). They also
 need Playwright plus a saved per-site browser profile (``browser_login``);
 missing provisioning skips with a clear reason rather than failing.
 

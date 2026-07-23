@@ -8,10 +8,10 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad::firmware {
+namespace chudware::firmware {
 
 // {ok, tools, families, platforms, banners, missing} — see
 // engine_oracle/firmware/provision.py module docstring for the frozen shape.
 nlohmann::json fw_status();
 
-}  // namespace aicad::firmware
+}  // namespace chudware::firmware

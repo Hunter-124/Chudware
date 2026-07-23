@@ -667,9 +667,9 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
         #
         # BUDGET: plan + recipe-build must finish under the client's MCP tool timeout (~30 s).
         # Default 12 s plan budget leaves ~2 s for the deterministic build (usually <<1 s).
-        # Override with AI_CAD_ECAD_PLAN_BUDGET_S when the client allows a longer call.
+        # Override with CHUDWARE_ECAD_PLAN_BUDGET_S when the client allows a longer call.
         try:
-            _PLAN_BUDGET_S = float(os.environ.get("AI_CAD_ECAD_PLAN_BUDGET_S", "") or 12.0)
+            _PLAN_BUDGET_S = float(os.environ.get("CHUDWARE_ECAD_PLAN_BUDGET_S", "") or 12.0)
         except (TypeError, ValueError):
             _PLAN_BUDGET_S = 12.0
         if not (_PLAN_BUDGET_S > 0.0):

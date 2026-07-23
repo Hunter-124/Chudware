@@ -3,7 +3,7 @@
 #include <cstdlib>
 #include <cstring>
 
-namespace aicad::platform {
+namespace chudware::platform {
 
 class StubCameraBackend : public CameraBackend {
     bool opened_ = false;
@@ -46,8 +46,8 @@ std::unique_ptr<CameraBackend> createMFCamera();
 std::unique_ptr<CameraBackend> CameraBackend::create() {
 #if defined(__linux__) && !defined(_WIN32)
     // Production path: always prefer V4L2. Unit tests force the synthetic stub with
-    // AICAD_FORCE_STUB_CAMERA=1 so CI stays hardware-free.
-    const char* force_stub = std::getenv("AICAD_FORCE_STUB_CAMERA");
+    // CHUDWARE_FORCE_STUB_CAMERA=1 so CI stays hardware-free.
+    const char* force_stub = std::getenv("CHUDWARE_FORCE_STUB_CAMERA");
     if (force_stub && std::strcmp(force_stub, "1") == 0)
         return std::make_unique<StubCameraBackend>();
     return createV4L2Camera();
@@ -58,4 +58,4 @@ std::unique_ptr<CameraBackend> CameraBackend::create() {
 #endif
 }
 
-}  // namespace aicad::platform
+}  // namespace chudware::platform

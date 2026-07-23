@@ -12,7 +12,7 @@
 #include <map>
 #include <set>
 
-namespace aicad {
+namespace chudware {
 namespace sourcing {
 
 namespace {
@@ -248,4 +248,4 @@ json estimate_made_cost(const json& params) {
 }
 
 }  // namespace sourcing
-}  // namespace aicad
+}  // namespace chudware

@@ -205,13 +205,13 @@ def test_diverged_copy_as_variant(tmp_path):
     assert out["pushed"] is True
 
     # Bob syncs: diverged → remote (alice) wins Bracket; bob's copy survives
-    os.environ["AICAD_USER_ID"] = "bob"
-    os.environ["AICAD_USER_DISPLAY"] = "Bob"
+    os.environ["CHUDWARE_USER_ID"] = "bob"
+    os.environ["CHUDWARE_USER_DISPLAY"] = "Bob"
     try:
         out = remote.sync(b, remote="origin")
     finally:
-        os.environ.pop("AICAD_USER_ID", None)
-        os.environ.pop("AICAD_USER_DISPLAY", None)
+        os.environ.pop("CHUDWARE_USER_ID", None)
+        os.environ.pop("CHUDWARE_USER_DISPLAY", None)
     assert out["ok"] is True, out
     assert out.get("conflicts_copied"), out
     conflicts = out["conflicts_copied"]
@@ -259,45 +259,45 @@ def test_lock_cas_contention(tmp_path):
     assert remote.clone_from_remote(bare, a)["ok"]
     assert remote.clone_from_remote(bare, b)["ok"]
 
-    os.environ["AICAD_USER_ID"] = "alice"
-    os.environ["AICAD_USER_DISPLAY"] = "Alice"
+    os.environ["CHUDWARE_USER_ID"] = "alice"
+    os.environ["CHUDWARE_USER_DISPLAY"] = "Alice"
     try:
         out = remote.plm_lock(a, item_id, remote="origin")
     finally:
-        os.environ.pop("AICAD_USER_ID", None)
-        os.environ.pop("AICAD_USER_DISPLAY", None)
+        os.environ.pop("CHUDWARE_USER_ID", None)
+        os.environ.pop("CHUDWARE_USER_DISPLAY", None)
     assert out["ok"] is True, out
     assert out["lock"]["holder"] == "alice"
     assert out["lock"]["item_id"] == item_id
 
-    os.environ["AICAD_USER_ID"] = "bob"
-    os.environ["AICAD_USER_DISPLAY"] = "Bob"
+    os.environ["CHUDWARE_USER_ID"] = "bob"
+    os.environ["CHUDWARE_USER_DISPLAY"] = "Bob"
     try:
         out = remote.plm_lock(b, item_id, remote="origin")
     finally:
-        os.environ.pop("AICAD_USER_ID", None)
-        os.environ.pop("AICAD_USER_DISPLAY", None)
+        os.environ.pop("CHUDWARE_USER_ID", None)
+        os.environ.pop("CHUDWARE_USER_DISPLAY", None)
     assert out["ok"] is False
     assert out["reason"] == "locked"
     assert "Alice" in out.get("hint", "") or "alice" in out.get("hint", "").lower()
 
     # alice unlocks; bob can take it
-    os.environ["AICAD_USER_ID"] = "alice"
-    os.environ["AICAD_USER_DISPLAY"] = "Alice"
+    os.environ["CHUDWARE_USER_ID"] = "alice"
+    os.environ["CHUDWARE_USER_DISPLAY"] = "Alice"
     try:
         out = remote.plm_unlock(a, item_id, remote="origin")
     finally:
-        os.environ.pop("AICAD_USER_ID", None)
-        os.environ.pop("AICAD_USER_DISPLAY", None)
+        os.environ.pop("CHUDWARE_USER_ID", None)
+        os.environ.pop("CHUDWARE_USER_DISPLAY", None)
     assert out["ok"] is True, out
 
-    os.environ["AICAD_USER_ID"] = "bob"
-    os.environ["AICAD_USER_DISPLAY"] = "Bob"
+    os.environ["CHUDWARE_USER_ID"] = "bob"
+    os.environ["CHUDWARE_USER_DISPLAY"] = "Bob"
     try:
         out = remote.plm_lock(b, item_id, remote="origin")
     finally:
-        os.environ.pop("AICAD_USER_ID", None)
-        os.environ.pop("AICAD_USER_DISPLAY", None)
+        os.environ.pop("CHUDWARE_USER_ID", None)
+        os.environ.pop("CHUDWARE_USER_DISPLAY", None)
     assert out["ok"] is True, out
     assert out["lock"]["holder"] == "bob"
 
@@ -311,8 +311,8 @@ def test_author_env_injection_in_history(tmp_path):
     project.mkdir()
     _write_part(project, "Bracket.step+")
 
-    os.environ["AICAD_USER_ID"] = "sarah@ua.edu"
-    os.environ["AICAD_USER_DISPLAY"] = "Sarah"
+    os.environ["CHUDWARE_USER_ID"] = "sarah@ua.edu"
+    os.environ["CHUDWARE_USER_DISPLAY"] = "Sarah"
     try:
         assert _user_author() == {
             "kind": "user",
@@ -340,8 +340,8 @@ def test_author_env_injection_in_history(tmp_path):
         finally:
             v.close()
     finally:
-        os.environ.pop("AICAD_USER_ID", None)
-        os.environ.pop("AICAD_USER_DISPLAY", None)
+        os.environ.pop("CHUDWARE_USER_ID", None)
+        os.environ.pop("CHUDWARE_USER_DISPLAY", None)
 
 
 def test_reserved_aicad_cloud_remote(tmp_path):
@@ -352,9 +352,9 @@ def test_reserved_aicad_cloud_remote(tmp_path):
     v.save()
     v.close()
 
-    out = remote.add_remote(project, "Cloud", kind="aicad-cloud")
+    out = remote.add_remote(project, "Cloud", kind="chudware-cloud")
     assert out["ok"] is True, out
-    assert out["remote"]["kind"] == "aicad-cloud"
+    assert out["remote"]["kind"] == "chudware-cloud"
     assert out["remote"].get("reserved") is True
 
     out = remote.sync(project, remote="Cloud")

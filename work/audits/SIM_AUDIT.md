@@ -113,19 +113,19 @@ All three use IPC-2141A closed-form formulas. Accuracy ±5% vs field solver (qua
 
 ### Missing: `fluids` (MIT) — blocks piping live execution
 ```bash
-~/.local/share/AI-CAD/mcp-venv/bin/pip install fluids
+~/.local/share/Chudware/mcp-venv/bin/pip install fluids
 ```
 Verdict change: `piping_solve` would upgrade REAL → VALIDATED once installed.
 
 ### Missing: `PyNite` (MIT) — blocks struct_analyze
 ```bash
-~/.local/share/AI-CAD/mcp-venv/bin/pip install PyNite
+~/.local/share/Chudware/mcp-venv/bin/pip install PyNite
 ```
 Verdict change: `struct_analyze` would upgrade REAL → VALIDATED (live cantilever check included in audit script).
 
 ### Missing: `build123d` / OCP kernel — blocks piping 3D tools
 ```bash
-~/.local/share/AI-CAD/mcp-venv/bin/pip install build123d
+~/.local/share/Chudware/mcp-venv/bin/pip install build123d
 ```
 License: Apache 2.0. Enables `piping_internal_volume`, `piping_cfd_handoff`, `piping_verify_cfd`.  
 Verdict change: BROKEN → REAL (if code works) → VALIDATED.
@@ -144,7 +144,7 @@ The LBM (`run_cfd_flow`) is available. OpenFOAM adds validated absolute Cd/Cl ca
 
 ### Missing: `CoolProp` / `thermo` — piping_fluid degrades to built-in table
 ```bash
-~/.local/share/AI-CAD/mcp-venv/bin/pip install CoolProp   # MIT
+~/.local/share/Chudware/mcp-venv/bin/pip install CoolProp   # MIT
 ```
 Not critical — built-in table covers water and common fluids.
 
@@ -179,8 +179,8 @@ Not critical — built-in table covers water and common fluids.
 
 ```bash
 cd /home/hunter/Repositories/CAD-T-V1
-AI_CAD_LIBAICAD=/home/hunter/Repositories/CAD/core/build-linux/bin/libaicad.so \
-    ~/.local/share/AI-CAD/mcp-venv/bin/python scripts/sim_audit.py
+CHUDWARE_LIBCHUDWARE=/home/hunter/Repositories/CAD/core/build-linux/bin/libchudware.so \
+    ~/.local/share/Chudware/mcp-venv/bin/python scripts/sim_audit.py
 ```
 
 Expected: 8 executed, 3 BROKEN (all provisioning gaps), 0 wrong-physics failures.
@@ -225,9 +225,9 @@ cross-check) and thermal (plane-wall anchors + live conduction solve).
 
 The T-V1 claim that `sim_run_static`/`sim_run_modal` are "not accessible via the
 core_bridge JSON-RPC bridge" is true only for the plain `core/build-linux` .so.
-The **AICAD_WITH_NETGEN** build (`core/build-occt-linux/bin/libaicad.so`)
+The **CHUDWARE_WITH_NETGEN** build (`core/build-occt-linux/bin/libchudware.so`)
 registers `sim_run_static`, `sim_run_modal`, `sim_run_fatigue` and
-`sim_run_thermal` directly in `core/api/libaicad.cpp` — raw `cb.call()` reaches
+`sim_run_thermal` directly in `core/api/libchudware.cpp` — raw `cb.call()` reaches
 them with a pre-resolved study (step_path + facesets from
 `doc_query`/`doc_face_points`). No full MCP server needed. The standalone-pytest
 consequence: `services/mcp/test_fea_live_bridge.py` (T-SIM4) now runs
@@ -252,8 +252,8 @@ physics checks that could run on this machine but didn't.
 ### Re-run instructions (updated)
 
 ```bash
-AI_CAD_LIBAICAD=core/build-occt-linux/bin/libaicad.so \
-    ~/.local/share/AI-CAD/mcp-venv/bin/python scripts/sim_audit.py
+CHUDWARE_LIBCHUDWARE=core/build-occt-linux/bin/libchudware.so \
+    ~/.local/share/Chudware/mcp-venv/bin/python scripts/sim_audit.py
 ```
 
 Expected: 16 executed, 0 BROKEN, PASS. (With the plain build-linux .so the FEA

@@ -17,7 +17,7 @@ from services.agent.mission_dispatch import MissionDispatch, _normalize_question
 
 @pytest.fixture()
 def cache_root(tmp_path, monkeypatch):
-    monkeypatch.setenv("AICAD_CACHE_ROOT", str(tmp_path))
+    monkeypatch.setenv("CHUDWARE_CACHE_ROOT", str(tmp_path))
     return tmp_path
 
 

@@ -1,5 +1,5 @@
 // Unit tests for second-order (10-node) quadratic tetrahedra in the linear-static
-// FEA solver (aicad::sim::fea_static_solve with nodes_per_elem==10).
+// FEA solver (chudware::sim::fea_static_solve with nodes_per_elem==10).
 //
 // OCCT-free / gmsh-free: we build structured tet meshes of a box beam in code so the
 // numerics are exercised without meshing a STEP. Two gates:
@@ -20,8 +20,8 @@
 
 #include "sim/fea_static.h"
 
-using aicad::sim::fea_static_solve;
-using aicad::sim::FeaStaticResult;
+using chudware::sim::fea_static_solve;
+using chudware::sim::FeaStaticResult;
 
 namespace {
 

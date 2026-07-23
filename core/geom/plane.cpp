@@ -1,4 +1,4 @@
-// Implementation of aicad::geom::SketchPlane and polar helpers.
+// Implementation of chudware::geom::SketchPlane and polar helpers.
 // See plane.h for the full design rationale and datum-plane convention.
 // MSVC requires _USE_MATH_DEFINES before <cmath> to get M_PI etc.
 #define _USE_MATH_DEFINES
@@ -7,7 +7,7 @@
 #include <cmath>
 #include <stdexcept>
 
-namespace aicad::geom {
+namespace chudware::geom {
 
 // ---------------------------------------------------------------------------
 // SketchPlane implementation
@@ -140,4 +140,4 @@ void cartesianToPolar(const Eigen::Vector2d& p, const Eigen::Vector2d& pole,
     thetaRad = (r < 1e-14) ? 0.0 : std::atan2(d.y(), d.x());
 }
 
-}  // namespace aicad::geom
+}  // namespace chudware::geom

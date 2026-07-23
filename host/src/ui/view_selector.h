@@ -1,5 +1,5 @@
 #pragma once
-// AI-CAD View Selector — SolidWorks-style "glass box" (C25, wave W2-E).
+// Chudware View Selector — SolidWorks-style "glass box" (C25, wave W2-E).
 // Press Space while the viewport is hovered (and no text input is active, not in sketch mode) →
 // a translucent corner-truncated box is drawn around the model. Hovering a face or corner
 // highlights it; clicking animates the camera to that standard orientation.

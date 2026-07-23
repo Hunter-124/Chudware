@@ -2,8 +2,8 @@
 //
 // Mirrors core/agent/machine.cpp's agent cancel: a process-wide registry maps a job_id to a
 // shared atomic flag; the running job (the LBM wind tunnel) polls its token between steps
-// (lbm_run's should_cancel), and sim_cancel flips the flag. The dispatch entry (aicad_call
-// in core/api/libaicad.cpp) exposes sim_cancel(job_id) as an RPC; this header is the whole
+// (lbm_run's should_cancel), and sim_cancel flips the flag. The dispatch entry (chudware_call
+// in core/api/libchudware.cpp) exposes sim_cancel(job_id) as an RPC; this header is the whole
 // surface the sim subsystem needs.
 #pragma once
 
@@ -13,7 +13,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad {
+namespace chudware {
 namespace sim {
 
 // Shared cancel flag a running sim job polls between steps.
@@ -31,4 +31,4 @@ void sim_job_unregister(const std::string& job_id);
 nlohmann::json sim_cancel(const std::string& job_id);
 
 }  // namespace sim
-}  // namespace aicad
+}  // namespace chudware

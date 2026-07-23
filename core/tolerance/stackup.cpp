@@ -7,7 +7,7 @@
 #include <cmath>
 #include <vector>
 
-namespace aicad {
+namespace chudware {
 namespace tolerance {
 
 const char* const kDisclaimer =
@@ -227,4 +227,4 @@ bool call(const std::string& method, const json& params, json& result, std::stri
 }
 
 }  // namespace tolerance
-}  // namespace aicad
+}  // namespace chudware

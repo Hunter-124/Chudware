@@ -110,7 +110,7 @@ def build_frame(cb) -> dict:
     cb.call("doc_save", {"doc_id": doc_id, "path": str(OUTPUT_AICM)})
     # Engine-rendered thumbnail while the doc is still open (doc_render_png).
     # The old GUI-shot path captured an EMPTY shell 3x: AI-CAD2 has no
-    # AI_CAD_OPEN_FILE support, so --shot never loaded the doc (foreman fix).
+    # CHUDWARE_OPEN_FILE support, so --shot never loaded the doc (foreman fix).
     cb.call("doc_render_png", {"doc_id": doc_id, "out_path": str(OUTPUT_PNG)})
     cb.call("doc_close", {"doc_id": doc_id})
 
@@ -144,14 +144,14 @@ def make_thumbnail() -> bool:
         return False
     env = os.environ.copy()
     so_candidates = [
-        REPO / "core" / "build-linux" / "bin" / "libaicad.so",
-        REPO.parent / "CAD" / "core" / "build-linux" / "bin" / "libaicad.so",
+        REPO / "core" / "build-linux" / "bin" / "libchudware.so",
+        REPO.parent / "CAD" / "core" / "build-linux" / "bin" / "libchudware.so",
     ]
     so = next((s for s in so_candidates if s.exists()), None)
     if so:
-        env.setdefault("AI_CAD_LIBAICAD", str(so))
-    env["AI_CAD_NO_FILE_DIALOGS"] = "1"
-    env["AI_CAD_OPEN_FILE"] = str(OUTPUT_AICM)
+        env.setdefault("CHUDWARE_LIBCHUDWARE", str(so))
+    env["CHUDWARE_NO_FILE_DIALOGS"] = "1"
+    env["CHUDWARE_OPEN_FILE"] = str(OUTPUT_AICM)
     try:
         subprocess.run(
             ["xvfb-run", "-a", str(binary), "--shot", str(OUTPUT_PNG)],
@@ -170,7 +170,7 @@ def make_thumbnail() -> bool:
 def regen_and_verify() -> dict:
     from mcp_server import core_bridge as cb
     if not cb.available():
-        return {"ok": False, "error": "libaicad not available"}
+        return {"ok": False, "error": "libchudware not available"}
     result = build_frame(cb)
     vol = result["volume_mm3"]
     if vol <= 0:
@@ -184,7 +184,7 @@ def regen_and_verify() -> dict:
 if __name__ == "__main__":
     from mcp_server import core_bridge as cb
     if not cb.available():
-        print("FATAL: libaicad not available.")
+        print("FATAL: libchudware not available.")
         sys.exit(1)
     print("Building structural_frame/frame sample...")
     result = build_frame(cb)

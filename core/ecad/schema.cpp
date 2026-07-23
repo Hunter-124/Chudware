@@ -6,7 +6,7 @@
 #include <map>
 #include <regex>
 
-namespace aicad::ecad::schema {
+namespace chudware::ecad::schema {
 
 using nlohmann::json;
 
@@ -509,4 +509,4 @@ std::vector<std::string> validate(const json& doc) {
     return {std::string("schema: unknown '") + doc.value("schema", std::string()) + "'"};
 }
 
-}  // namespace aicad::ecad::schema
+}  // namespace chudware::ecad::schema

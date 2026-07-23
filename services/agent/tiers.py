@@ -13,7 +13,7 @@ What this module provides
   verbosity, deliberation level, tool-schema-trim flag.
 
 * ``detect_tier(context_length)`` / ``detect_tier_from_env()``
-  Map a model's context length to a tier (AI_CAD_TIER env override honoured).
+  Map a model's context length to a tier (CHUDWARE_TIER env override honoured).
 
 * ``TurnAssembler``
   Assembles one model turn slot-by-slot in §9.1 order, applying the budget
@@ -72,8 +72,8 @@ _CHARS_PER_TOKEN = 4
 STATE_FLOOR_TOKENS = 200   # minimum stage-state tokens to keep
 HISTORY_FLOOR_TOKENS = 0   # history can be emptied entirely if needed
 
-# Env override for manual tier selection (e.g. AI_CAD_TIER=frontier).
-TIER_ENV_VAR = "AI_CAD_TIER"
+# Env override for manual tier selection (e.g. CHUDWARE_TIER=frontier).
+TIER_ENV_VAR = "CHUDWARE_TIER"
 
 # Context-length thresholds → tier name.  Checked in order; first match wins.
 # A model with context_length < 32768 → local-24k (treated conservatively).
@@ -362,7 +362,7 @@ def provider_for_tier(tier: str | None, cfg: Optional[dict] = None):
     gym worked around it locally for gym cells only, while every OTHER caller
     of missions (mission_start/dag_run, or run_mission called directly) kept
     silently leaking internal DAG nodes to the ambient config.json /
-    AI_CAD_PROVIDER default.
+    CHUDWARE_PROVIDER default.
 
     A ``local-*`` tier (``local-24k`` / ``local-48k``) MUST run on the bundled
     local model (tiers.yaml ``local_models.fanout``, currently ``qwen3-4b``)
@@ -383,7 +383,7 @@ def provider_for_tier(tier: str | None, cfg: Optional[dict] = None):
     (``xai-sub``) when a credential is stored, else fall back to the classic
     API-key provider (``xai`` / ``XAI_API_KEY``).
 
-    An explicit ``AI_CAD_PROVIDER`` env override always wins (tests pin it to
+    An explicit ``CHUDWARE_PROVIDER`` env override always wins (tests pin it to
     ``mock``; a human can force a frontier key even for a nominally local
     tier run). Every non-local, non-openrouter, non-xai tier (``mid`` /
     ``frontier`` / ``None``/unset) falls straight through to the ordinary
@@ -399,8 +399,8 @@ def provider_for_tier(tier: str | None, cfg: Optional[dict] = None):
 
     from services.agent import config as _config
 
-    # Explicit env override always wins (tests pin AI_CAD_PROVIDER=mock).
-    if os.environ.get("AI_CAD_PROVIDER"):
+    # Explicit env override always wins (tests pin CHUDWARE_PROVIDER=mock).
+    if os.environ.get("CHUDWARE_PROVIDER"):
         return _config.get_provider(cfg=cfg)
 
     # Parameterized OpenRouter paid tiers: openrouter:<model-id>
@@ -526,7 +526,7 @@ def detect_tier(context_length: int) -> str:
 
 
 def detect_tier_from_env() -> Optional[str]:
-    """Return the tier name from ``AI_CAD_TIER`` env var, or ``None`` if unset.
+    """Return the tier name from ``CHUDWARE_TIER`` env var, or ``None`` if unset.
 
     The env var always wins over auto-detection (manual override).
     """

@@ -35,10 +35,10 @@
 #include "doc/session.h"  // doc_new / doc_apply_ops / doc_sketch_enter
 
 using json = nlohmann::json;
-using aicad::doc::doc_new;
-using aicad::doc::doc_apply_ops;
-using aicad::doc::doc_sketch_enter;
-using aicad::doc::doc_query;
+using chudware::doc::doc_new;
+using chudware::doc::doc_apply_ops;
+using chudware::doc::doc_sketch_enter;
+using chudware::doc::doc_query;
 
 namespace {
 

@@ -77,7 +77,7 @@ The emission landed at the equivalent apply point in **`core/agent/run.cpp`
 implementation:
 
 - `AI-CAD2` (the target that compiles `app/src/app/doc_engine.cpp`) does NOT compile
-  or link `core/agent` — it talks to core exclusively through the `libaicad` C-ABI
+  or link `core/agent` — it talks to core exclusively through the `libchudware` C-ABI
   bridge (`core::cpp_core().call("agent_run", ...)`; see `app/CMakeLists.txt:99-102`).
   Calling `emit_ai_artifact_action()` from `takeAgentResult()` would fail at link time.
 - The design run applies its ops to the live document **as it runs** (doc_apply_ops

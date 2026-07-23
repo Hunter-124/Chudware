@@ -1,7 +1,7 @@
 # Agent Design Pipeline — the guided design-thinking architecture
 
 **Status:** architecture of record (Hunter directive, 2026-07-05). This is the source of
-truth for how AI-CAD drives a design from intent to a coherent, verified model — especially
+truth for how Chudware drives a design from intent to a coherent, verified model — especially
 on **local 24k–48k-context models**, while never choking frontier models (Opus/Sonnet).
 Workstream **DP** implements it (T-DP1…T-DP14). It refines, it does not replace, the existing
 phase machine (`services/agent/pipeline/phases.py`), role roster (`services/agent/roles/`),

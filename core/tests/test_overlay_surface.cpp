@@ -1,4 +1,4 @@
-// Unit tests for the FEA boundary-surface extractor (aicad::sim::fea_surface_body).
+// Unit tests for the FEA boundary-surface extractor (chudware::sim::fea_surface_body).
 //
 // Result plots (stress colormap + deformed shape) must render on the FEA mesh
 // BOUNDARY surface — which has nodes all along the part — not the CAD body's OCCT
@@ -21,8 +21,8 @@
 
 #include "sim/overlay.h"
 
-using aicad::sim::fea_surface_body;
-using aicad::sim::FeaSurface;
+using chudware::sim::fea_surface_body;
+using chudware::sim::FeaSurface;
 
 namespace {
 

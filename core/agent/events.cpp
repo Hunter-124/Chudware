@@ -12,7 +12,7 @@
 
 namespace fs = std::filesystem;
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 
 std::string cap_raw(const std::string& text) {
@@ -693,4 +693,4 @@ json emit_doc_semantic_diff(RunEvents& ev,
 }
 
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware

@@ -36,7 +36,7 @@
 class TopoDS_Shape;
 class TopoDS_Edge;
 
-namespace aicad::doc {
+namespace chudware::doc {
 
 // Lightweight topology descriptor (port of selectors.py TopoInfo). Decoupled from
 // OCCT so the resolution algorithm is testable without a kernel.
@@ -118,4 +118,4 @@ ResolveResult resolve(const nlohmann::json& selector,
 double score_candidate(const nlohmann::json& selector, const TopoInfo& candidate,
                        double bbox_diag);
 
-}  // namespace aicad::doc
+}  // namespace chudware::doc

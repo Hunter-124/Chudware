@@ -1406,7 +1406,7 @@ class MissionDispatch:
             out = cb.call("part_import_file", {"path": path})
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": f"import_artifact failed: {exc}",
-                    "hint": "Ensure the native core (AI_CAD_LIBAICAD) is available."}
+                    "hint": "Ensure the native core (CHUDWARE_LIBCHUDWARE) is available."}
         if self.ledger is not None and isinstance(out, dict) and out.get("ok"):
             try:
                 self.ledger.append("agent", "artifact", {

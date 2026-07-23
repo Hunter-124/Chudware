@@ -1,9 +1,9 @@
 #pragma once
-// Routing policy for the worker seam: libaicad (C++) vs engine_oracle (Python).
+// Routing policy for the worker seam: libchudware (C++) vs engine_oracle (Python).
 // See contracts/worker_rpc.md and docs/CPP_MIGRATION.md.
 #include <string>
 
-namespace aicad::services {
+namespace chudware::services {
 
 enum class EngineBackend { CppCore, PythonOracle };
 
@@ -14,4 +14,4 @@ EngineBackend routeMethod(const std::string& method, const std::string& docId = 
 bool cppDocsEnabled();
 bool isCppDocId(const std::string& docId);
 
-} // namespace aicad::services
+} // namespace chudware::services

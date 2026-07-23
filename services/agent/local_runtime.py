@@ -57,7 +57,7 @@ __all__ = [
 # Pinned llama.cpp release the shipped runtime was built and VERIFIED against.
 #
 # Pin reconcile (T-W31): T-W26 recorded "b9871", but the runtime actually
-# installed at ~/.local/share/AI-CAD/llamacpp is release tag b9860 (commit
+# installed at ~/.local/share/Chudware/llamacpp is release tag b9860 (commit
 # fdb1db8) — both the CPU build (build/bin) and the CUDA build (build-cuda/bin,
 # sm_86) are compiled from that checkout. Everything we have evidence for ran
 # on b9860: the T-W29 tokenmaxx bench (GBNF 100% on gemma3-4b-qat, 476 tok/s
@@ -443,13 +443,13 @@ def register_routing_source(
 # The bench proves it by RUNNING against a real torch venv on this machine.
 #
 # torch/transformers venv (documented, kept OUT of the gate venv):
-#     ~/.local/share/AI-CAD/torch-venv   (torch cu124 + transformers)
+#     ~/.local/share/Chudware/torch-venv   (torch cu124 + transformers)
 # Point the bench / a backend consumer at it via that interpreter, e.g.
-#     ~/.local/share/AI-CAD/torch-venv/bin/python -m ...
+#     ~/.local/share/Chudware/torch-venv/bin/python -m ...
 #
 # Backend selection seam (env-driven, config-overridable):
-#     AICAD_LOCAL_BACKEND = "llamacpp" (default) | "transformers"
-#     AICAD_TRANSFORMERS_MODEL = HF repo id or local path (transformers backend only)
+#     CHUDWARE_LOCAL_BACKEND = "llamacpp" (default) | "transformers"
+#     CHUDWARE_TRANSFORMERS_MODEL = HF repo id or local path (transformers backend only)
 
 
 class BackendUnavailable(LocalRuntimeError):
@@ -488,7 +488,7 @@ class TransformersBackend:
         if not transformers_available():
             raise BackendUnavailable(
                 "transformers backend requires torch+transformers with CUDA. "
-                "Install into a SEPARATE venv (e.g. ~/.local/share/AI-CAD/torch-venv) "
+                "Install into a SEPARATE venv (e.g. ~/.local/share/Chudware/torch-venv) "
                 "— never the gate venv."
             )
         self.model_id = model_id
@@ -558,14 +558,14 @@ def select_backend(cfg: Optional[dict] = None) -> str:
     ``"transformers"``.
 
     Resolution order (later wins): built-in default -> ``cfg["local_backend"]`` ->
-    ``AICAD_LOCAL_BACKEND`` env. This is the documented seam (T-W29 DoD) that lets
+    ``CHUDWARE_LOCAL_BACKEND`` env. This is the documented seam (T-W29 DoD) that lets
     T-W27 gym cycle 2 pick a backend by config without forking the runtime.
     """
     import os as _os  # noqa: PLC0415
     backend = "llamacpp"
     if cfg and cfg.get("local_backend"):
         backend = str(cfg["local_backend"])
-    env = _os.environ.get("AICAD_LOCAL_BACKEND")
+    env = _os.environ.get("CHUDWARE_LOCAL_BACKEND")
     if env:
         backend = env
     if backend not in ("llamacpp", "transformers"):

@@ -14,10 +14,10 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad::ecad::library {
+namespace chudware::ecad::library {
 
 // Resolve a footprint def by fpid (starter library only). Returns the def dict
 // (matching engine/ecad/library/starter.py::FOOTPRINTS[fpid]) or null if unknown.
 nlohmann::json resolve_footprint(const std::string& fpid);
 
-}  // namespace aicad::ecad::library
+}  // namespace chudware::ecad::library

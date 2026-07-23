@@ -8,7 +8,7 @@
 #include <fstream>
 #include <stdexcept>
 
-namespace aicad::doc {
+namespace chudware::doc {
 
 namespace {
 
@@ -225,4 +225,4 @@ std::string write_dxf(const std::string& path, const DxfLayers& layers,
     return std::filesystem::absolute(p).string();
 }
 
-}  // namespace aicad::doc
+}  // namespace chudware::doc

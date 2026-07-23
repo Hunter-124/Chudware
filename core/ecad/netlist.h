@@ -10,10 +10,10 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad::ecad {
+namespace chudware::ecad {
 
 // build_netlist(sch) -> {"nets", "by_pin", "components", "warnings"}.
 // Pure: does not mutate `sch`. Mirrors engine/ecad/netlist.py::build_netlist.
 nlohmann::json build_netlist(const nlohmann::json& sch);
 
-}  // namespace aicad::ecad
+}  // namespace chudware::ecad

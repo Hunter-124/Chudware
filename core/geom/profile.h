@@ -1,6 +1,6 @@
 // Solved-sketch -> OCCT planar-profile compiler (C++ port of the loop/region core
 // of engine/doc/features/sketch.py). This is the missing link in the Wave 2
-// pipeline: it turns the 2D output of aicad::sketch::solve_sketch into the planar
+// pipeline: it turns the 2D output of chudware::sketch::solve_sketch into the planar
 // TopoDS_Face(s) that geom::extrude_face / geom::revolve_face consume to make 3D
 // solids — i.e. "solve a dimensioned sketch, get a face of exactly the right size".
 //
@@ -29,7 +29,7 @@
 
 #include "geom/plane.h"
 
-namespace aicad::geom {
+namespace chudware::geom {
 
 // Build planar faces (in 3D world space, lifted onto `plane`) from solved sketch
 // entities. `solved_entities` is SketchSolution::entities (id -> param dict).
@@ -58,4 +58,4 @@ std::vector<TopoDS_Face> all_region_faces_from_solved_sketch(
 TopoDS_Wire wire_from_solved_sketch(
     const nlohmann::json& solved_entities, const SketchPlane& plane);
 
-}  // namespace aicad::geom
+}  // namespace chudware::geom

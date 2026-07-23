@@ -1,4 +1,4 @@
-"""AI-CAD vision — image ingestion + fiducial metrology (Pillar 10 v1).
+"""Chudware vision — image ingestion + fiducial metrology (Pillar 10 v1).
 
 Architecture law (``docs/AI_TOOLING_MASTER_PLAN.md`` §Pillar 10): **VLMs pick pixels,
 deterministic code measures.** Frontier VLMs read physical scales at only 10–32% accuracy,

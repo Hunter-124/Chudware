@@ -1,7 +1,7 @@
 """WS /admin/terminal — admin-only shared browser terminals running omp.
 
-Sessions are backed by a persistent **tmux** server (socket ``$BILLET_TMUX_SOCKET``,
-default ``billet``) started inside its own systemd user scope, so:
+Sessions are backed by a persistent **tmux** server (socket ``$CHUDWARE_TMUX_SOCKET``,
+default ``chudware``) started inside its own systemd user scope, so:
 
   * they survive browser disconnects *and* gateway restarts (**saved**);
   * multiple admins can attach to the same named session at once and see/drive
@@ -51,7 +51,7 @@ except ImportError:  # uvicorn app:app from package dir
     from auth import get_current_user
     from config import settings
 
-log = logging.getLogger("billet-web.terminal")
+log = logging.getLogger("chudware-web.terminal")
 
 router = APIRouter(tags=["terminal"])
 
@@ -62,10 +62,10 @@ _KILL_GRACE_S = 0.5
 
 # tmux backing --------------------------------------------------------------
 _TMUX = shutil.which("tmux")
-_SOCKET = (os.environ.get("BILLET_TMUX_SOCKET") or "billet").strip() or "billet"
+_SOCKET = (os.environ.get("CHUDWARE_TMUX_SOCKET") or "chudware").strip() or "chudware"
 # tmux session-name prefix so the shared pool never collides with a personal
 # tmux and is trivially filterable in list-sessions.
-_PREFIX = "billet-"
+_PREFIX = "chudware-"
 _NAME_RE = re.compile(r"[^a-z0-9-]+")
 _LS_FMT = (
     "#{session_name}\t#{session_windows}\t#{session_attached}"
@@ -74,14 +74,14 @@ _LS_FMT = (
 
 
 def _repo_dir() -> Path:
-    env = (os.environ.get("BILLET_OMP_DIR") or "").strip()
+    env = (os.environ.get("CHUDWARE_OMP_DIR") or "").strip()
     if env:
         return Path(env).expanduser().resolve()
     return Path(__file__).resolve().parents[2]
 
 
 def _omp_cmd() -> str:
-    return (os.environ.get("BILLET_OMP_CMD") or "omp").strip() or "omp"
+    return (os.environ.get("CHUDWARE_OMP_CMD") or "omp").strip() or "omp"
 
 
 def _parse_size(ws: WebSocket) -> tuple[int, int]:
@@ -236,7 +236,7 @@ def _create_session(tmux_name: str, cols: int, rows: int, repo: Path) -> None:
     Later sessions attach to the existing server and inherit that scope.
     """
     env = _child_env(repo)
-    conf = Path(__file__).resolve().parent / "billet-tmux.conf"
+    conf = Path(__file__).resolve().parent / "chudware-tmux.conf"
     base = _tmux_cmd(
         *(["-f", str(conf)] if conf.exists() else []),
         "new-session",

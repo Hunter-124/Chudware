@@ -16,8 +16,8 @@ KIND_RELEASE = "release"
 KIND_RESTORE = "restore"
 ENTRY_KINDS = {KIND_AUTO, KIND_CHECKPOINT, KIND_RELEASE, KIND_RESTORE}
 
-_KIND_TRAILER = "aicad-plm-kind:"
-_SCOPE_TRAILER = "aicad-plm-scope:"
+_KIND_TRAILER = "chudware-plm-kind:"
+_SCOPE_TRAILER = "chudware-plm-scope:"
 
 # entry scope: design history (the timeline users watch) vs planning-store
 # mutations (tasks/issues/milestones), so the default timeline stays curated.

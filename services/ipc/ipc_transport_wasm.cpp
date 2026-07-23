@@ -34,7 +34,7 @@
 #include <emscripten.h>
 #include <emscripten/websocket.h>
 
-namespace aicad_ipc {
+namespace chudware_ipc {
 
 // Heap-shared connection state. Callbacks hold a raw pointer to this; IpcConn
 // holds a shared_ptr so the state outlives any moved-from IpcConn shell.
@@ -344,6 +344,6 @@ IpcConn connectTo(const std::string& /*path*/, std::string& err) {
     return IpcConn(std::move(st));
 }
 
-}  // namespace aicad_ipc
+}  // namespace chudware_ipc
 
 #endif  // __EMSCRIPTEN__

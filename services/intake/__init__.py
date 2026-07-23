@@ -1,4 +1,4 @@
-"""AI-CAD requirements-intake / photo-measurement / first-try-fit "intake brain".
+"""Chudware requirements-intake / photo-measurement / first-try-fit "intake brain".
 
 This package is the **pure decision logic** for the subsystem designed in
 ``docs/INTAKE_MEASUREMENT_DFM_PLAN.md`` — the part that decides *which* real-world

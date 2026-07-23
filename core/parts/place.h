@@ -5,17 +5,17 @@
 //
 // Routing table (keyed on geometry_ref["kind"], per contracts/parts.md §2):
 //
-//   core_family      → parts_make seam (libaicad wires doc_new + parts::build)
+//   core_family      → parts_make seam (libchudware wires doc_new + parts::build)
 //   generate_model   → build_model seam (bolts match → STEP) → import_file leg
-//   symbol_footprint → ecad sch_add_symbol op via aicad::ecad::apply_ops (in-core)
+//   symbol_footprint → ecad sch_add_symbol op via chudware::ecad::apply_ops (in-core)
 //   section_profile  → append StructuralElement dict to an aicad.structure/1 doc
-//   fitting_id       → aicad::piping::new_fitting into an aicad.piping/1 doc
-//   fmu_component    → aicad::hydraulic::new_component into an aicad.hydraulic/1 doc
+//   fitting_id       → chudware::piping::new_fitting into an aicad.piping/1 doc
+//   fmu_component    → chudware::hydraulic::new_component into an aicad.hydraulic/1 doc
 //   import_file      → import_file seam (browser-acquired STEP/IGES)
 //
 // The PartRecord lookup (services/parts hub) and the two doc-creating RPCs are
 // NOT core concerns, so — exactly like core/sourcing — they are Seams
-// injections: libaicad.cpp supplies the production defaults and tests stub
+// injections: libchudware.cpp supplies the production defaults and tests stub
 // them. Every placer returns a PlacementResult dict mirroring the oracle
 // byte-for-byte:
 //
@@ -33,11 +33,11 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad::parts {
+namespace chudware::parts {
 
 using nlohmann::json;
 
-// Side-effect injection points (mirrors aicad::sourcing::Seams). An unset
+// Side-effect injection points (mirrors chudware::sourcing::Seams). An unset
 // std::function makes the dependent leg fail with the oracle's "native core
 // unavailable" error envelope instead of crashing.
 struct PlaceSeams {
@@ -45,7 +45,7 @@ struct PlaceSeams {
     // when the part_id is unknown (oracle: parts_hub.get -> None).
     std::function<json(const std::string& part_id)> get_record;
     // parts_make RPC: {family, size, length_mm?, ...} -> {ok, doc_id, name,
-    // bbox, datum, error?}. libaicad wires the existing parts_make dispatch.
+    // bbox, datum, error?}. libchudware wires the existing parts_make dispatch.
     std::function<json(const json& call_params)> parts_make;
     // import_file RPC: (path, as_solid) -> {doc_id, body_count, ...}.
     std::function<json(const std::string& path, bool as_solid)> import_file;
@@ -69,4 +69,4 @@ struct PlaceSeams {
 bool place_call(const std::string& method, const json& params, json& result, std::string& err,
                 const PlaceSeams& seams);
 
-}  // namespace aicad::parts
+}  // namespace chudware::parts

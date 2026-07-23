@@ -3114,7 +3114,7 @@ void fmPaneHeaderChip(AppState& st, const char* title, const char* titleIcon, fl
 // "apply a just-opened doc" seam that resets the viewport AND refreshes the geometry (the old
 // path-strip open updated the tree but never loaded the mesh).
 
-// Save filter: native AI-CAD part only (a silent Save / first-save always writes .step+).
+// Save filter: native Chudware part only (a silent Save / first-save always writes .step+).
 // Save As writes the native .step+ ONLY — non-native formats live under File > Export (the Win32
 // dialog appends the default extension regardless of the chosen filter, so a multi-format Save As
 // silently wrote .step+ anyway).
@@ -3154,10 +3154,10 @@ static std::string pathBaseName(const std::string& p) {
 }
 
 // Escape hatch: headless shot scenarios / CI can't click a native dialog. With
-// AI_CAD_NO_FILE_DIALOGS set the bottom strip keeps the old raw-path InputText fallback and
+// CHUDWARE_NO_FILE_DIALOGS set the bottom strip keeps the old raw-path InputText fallback and
 // the dialog-needing paths refuse politely instead of blocking a headless run.
 static bool fileDialogsDisabled() {
-    static const bool disabled = std::getenv("AI_CAD_NO_FILE_DIALOGS") != nullptr;
+    static const bool disabled = std::getenv("CHUDWARE_NO_FILE_DIALOGS") != nullptr;
     return disabled;
 }
 
@@ -3225,7 +3225,7 @@ static void doSaveDoc(AppState& st, bool forceDialog) {
 
 // Apply a JUST-OPENED document (DocMirror::open already succeeded, so the mirror holds the new
 // doc id / revision / tree). Factored out so BOTH open paths (native dialog and the
-// AI_CAD_NO_FILE_DIALOGS path-strip fallback) take the identical route.
+// CHUDWARE_NO_FILE_DIALOGS path-strip fallback) take the identical route.
 //
 // Geometry refresh: the worker's doc_open response DOES carry a tess block, but
 // DocMirror::open() discards it (doc_mirror.cpp parses only doc_id/revision/tree and is owned
@@ -5760,7 +5760,7 @@ bool featureTreeOpenPath(AppState& st, const std::string& path, bool asSolid) {
 }
 
 // Live MCP handoff poll — see the header. The external MCP server (the engine Claude drives)
-// publishes the part it's working on to %APPDATA%\AI-CAD\handoff\ as a NATIVE .step+ doc plus a
+// publishes the part it's working on to %APPDATA%\Chudware\handoff\ as a NATIVE .step+ doc plus a
 // tiny live.json {rev, step}. We open/refresh a single tab from it so the user watches the AI
 // build in the viewport. Loading the native .step+ (not bare STEP) brings the whole feature tree.
 // One published part the MCP currently has open, parsed from the handoff control file.

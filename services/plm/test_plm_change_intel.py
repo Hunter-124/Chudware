@@ -520,7 +520,7 @@ def test_polish_not_called_when_flag_off(monkeypatch):
     calls = []
     summarize.set_polish_hook(lambda text, diff: calls.append(1) or "polished")
     try:
-        monkeypatch.delenv("AICAD_PLM_SUMMARY_POLISH", raising=False)
+        monkeypatch.delenv("CHUDWARE_PLM_SUMMARY_POLISH", raising=False)
         diff = doc_diff(_part(3.0), _part(5.0))
         s = summarize.summarize_diff(diff)
         assert calls == []  # deterministic-first: no hook without the flag
@@ -532,7 +532,7 @@ def test_polish_not_called_when_flag_off(monkeypatch):
 def test_polish_discarded_when_it_invents_numerals(monkeypatch):
     summarize.set_polish_hook(lambda text, diff: "Wall grew by 42 percent")
     try:
-        monkeypatch.setenv("AICAD_PLM_SUMMARY_POLISH", "1")
+        monkeypatch.setenv("CHUDWARE_PLM_SUMMARY_POLISH", "1")
         diff = doc_diff(_part(3.0), _part(5.0))
         s = summarize.summarize_diff(diff)
         assert "42" not in s  # invented numeral → deterministic text kept
@@ -543,7 +543,7 @@ def test_polish_discarded_when_it_invents_numerals(monkeypatch):
 def test_polish_discarded_on_git_vocab(monkeypatch):
     summarize.set_polish_hook(lambda text, diff: "Committed the wall change 3 5")
     try:
-        monkeypatch.setenv("AICAD_PLM_SUMMARY_POLISH", "1")
+        monkeypatch.setenv("CHUDWARE_PLM_SUMMARY_POLISH", "1")
         diff = doc_diff(_part(3.0), _part(5.0))
         s = summarize.summarize_diff(diff)
         assert "Committed" not in s
@@ -554,7 +554,7 @@ def test_polish_discarded_on_git_vocab(monkeypatch):
 def test_polish_applied_when_valid(monkeypatch):
     summarize.set_polish_hook(lambda text, diff: text.replace("Increased", "Grew"))
     try:
-        monkeypatch.setenv("AICAD_PLM_SUMMARY_POLISH", "1")
+        monkeypatch.setenv("CHUDWARE_PLM_SUMMARY_POLISH", "1")
         diff = doc_diff(_part(3.0), _part(5.0))
         s = summarize.summarize_diff(diff)
         assert "Grew" in s

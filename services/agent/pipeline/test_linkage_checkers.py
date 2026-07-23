@@ -10,7 +10,7 @@ Covers the T-DP4 Definition of Done:
   - Ledger.add_linkage round-trips through materialize → linkages().
   - Ledger.slice_for_stage("buildpath") returns linkages (consumed by Stage 4).
 
-Runs headless: no FastMCP, no libaicad, no network, no LLM.
+Runs headless: no FastMCP, no libchudware, no network, no LLM.
 """
 from __future__ import annotations
 

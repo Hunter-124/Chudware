@@ -118,7 +118,7 @@ def close_all() -> None:
 # memory_* RPCs (real reuse of vendor/omp/packages/mnemopi — see
 # OMP_INTEGRATION_PLAN.md §RPC CONTRACT, docs/omp-integration/01-DECISIONS.md §Memory)
 # instead of the SQLite+FTS5 path below. Off by default (unchanged behavior); opt in
-# with env AI_CAD_MEMORY_BACKEND=mnemopi or config.json agent.memory_backend="mnemopi".
+# with env CHUDWARE_MEMORY_BACKEND=mnemopi or config.json agent.memory_backend="mnemopi".
 # Any bridge failure (bun/script missing, crash, timeout, RPC error) raises
 # omp_bridge.BridgeUnavailable, caught here to fall back to SQLite+FTS5 transparently.
 
@@ -131,7 +131,7 @@ def _memory_backend(cfg: dict | None = None) -> str:
     """``"sqlite"`` (default) or ``"mnemopi"``.
 
     Precedence ENV > config.json > default (omp port) — resolution lives in
-    services.agent.config.memory_backend; AI_CAD_MEMORY_BACKEND still wins, and
+    services.agent.config.memory_backend; CHUDWARE_MEMORY_BACKEND still wins, and
     config.json ``agent.memory_backend`` is honored when the env is unset.
     """
     try:
@@ -243,7 +243,7 @@ def remember(
     """Insert a memory. Dedupes identical content (returns existing id). None if empty.
 
     Hybrid backend: routes through the OMP bridge (mnemopi) when
-    ``AI_CAD_MEMORY_BACKEND=mnemopi`` / ``agent.memory_backend`` is set, falling
+    ``CHUDWARE_MEMORY_BACKEND=mnemopi`` / ``agent.memory_backend`` is set, falling
     back to SQLite+FTS5 below when the bridge is unavailable. Same signature and
     return shape either way.
     """

@@ -1,6 +1,6 @@
 ---
 id: T-INF1
-title: Fix gate pytest stage (issue 6) - wire mcp-venv + AI_CAD_LIBAICAD into scripts/gate.sh
+title: Fix gate pytest stage (issue 6) - wire mcp-venv + CHUDWARE_LIBCHUDWARE into scripts/gate.sh
 workstream: V
 owner: sonnet-orin
 status: done
@@ -19,12 +19,12 @@ deselects/0-collects and the stage FAILs while the REAL suites are green in the
 mcp-venv. Every driver has been trained to shrug at a red gate stage — that
 normalization is how real breakage will eventually slip through. The manual
 workaround every agent types by hand:
-`AI_CAD_LIBAICAD=$PWD/core/build-linux/bin/libaicad.so ~/.local/share/AI-CAD/mcp-venv/bin/python -m pytest ...`
+`CHUDWARE_LIBCHUDWARE=$PWD/core/build-linux/bin/libchudware.so ~/.local/share/Chudware/mcp-venv/bin/python -m pytest ...`
 
 ## Driver notes (foreman)
 
 - Make scripts/gate.sh stage 4 use the mcp-venv python when present (fall back to
-  current behavior + a loud SKIP note when absent) and export AI_CAD_LIBAICAD to
+  current behavior + a loud SKIP note when absent) and export CHUDWARE_LIBCHUDWARE to
   the built core .so.
 - Scope the target dirs to match the foreman sweep: services engine_oracle tools
   training, with the four known pre-existing collection-error files ignored VIA
@@ -42,7 +42,7 @@ workaround every agent types by hand:
 ## Definition of done
 
 - [x] Gate pytest stage runs the real venv + engine and goes green on master
-- [x] core_bridge finds core/build-linux/bin/libaicad.so without the env var
+- [x] core_bridge finds core/build-linux/bin/libchudware.so without the env var
 - [x] Issue #6 closed with the root-cause writeup
 - [x] `graphify update .` run
 
@@ -51,7 +51,7 @@ workaround every agent types by hand:
 `bash scripts/gate.sh` on branch task/T-INF1-gate-pytest → RESULT: PASS
 - 1636 tests collected across services/engine_oracle/tools (training: 0/SKIP)
 - 1581 passed; pre-existing failures FAIL-RECORDED (non-fatal), same policy as check.py
-- core build auto-set AI_CAD_LIBAICAD; stage 4 ran real suites with the engine
+- core build auto-set CHUDWARE_LIBCHUDWARE; stage 4 ran real suites with the engine
 - 4 T-V2-tracked files explicitly --ignore'd with comment in gate.sh
 - core_bridge._lib_candidates now includes core/build-linux/bin/ as first Linux candidate
 

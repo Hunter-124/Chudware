@@ -18,7 +18,7 @@ The fuse silently no-ops; the two bodies stay disjoint and no error is raised.
 "disjoint fuse" error (or explicitly flag a non-manifold compound). Silent success with
 2 bodies breaks the "fuse => 1 connected solid" invariant downstream code relies on.
 
-**Repro:** `AI_CAD_LIBAICAD=$PWD/core/build-occt-linux/bin/libaicad.so PYTHONPATH=$PWD python3 scripts/modeling_battery.py` — see case `nc_disjoint_fuse`.
+**Repro:** `CHUDWARE_LIBCHUDWARE=$PWD/core/build-occt-linux/bin/libchudware.so PYTHONPATH=$PWD python3 scripts/modeling_battery.py` — see case `nc_disjoint_fuse`.
 
 **Severity:** low-medium (valid solids produced, but a promised invariant is unenforced).
 
@@ -26,8 +26,8 @@ The fuse silently no-ops; the two bodies stay disjoint and no error is raised.
 
 ## Coverage decisions taken autonomously (flag if you disagree)
 
-- **`.so` pinned to the OCCT build.** Only `core/build-occt-linux/bin/libaicad.so` has the
-  real geometry kernel (netgen + openNURBS + lib3mf). `core/build-linux/bin/libaicad.so`
+- **`.so` pinned to the OCCT build.** Only `core/build-occt-linux/bin/libchudware.so` has the
+  real geometry kernel (netgen + openNURBS + lib3mf). `core/build-linux/bin/libchudware.so`
   has no geometry — running the battery against it would ALL-SKIP, which the battery
   treats as a hard failure. The gate stage prefers the OCCT `.so`.
 

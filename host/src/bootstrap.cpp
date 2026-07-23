@@ -44,13 +44,13 @@ bool dirExists(const std::string &p) {
   return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
 }
 std::string appdataRoot() {
-  // Billet alias rule (mirrors engine/paths.py active_root()): an existing
-  // legacy AI-CAD dir wins (it holds the live runtime venv) unless the Billet
+  // Chudware alias rule (mirrors engine/paths.py active_root()): an existing
+  // legacy Chudware dir wins (it holds the live runtime venv) unless the Chudware
   // dir already has a real install marker (config.json); fresh installs get
-  // Billet.
+  // Chudware.
   const std::string base = env_or("APPDATA", "");
-  const std::string legacy = base + "\\AI-CAD";
-  const std::string neu = base + "\\Billet";
+  const std::string legacy = base + "\\Chudware";
+  const std::string neu = base + "\\Chudware";
   if (dirExists(legacy) && !fileExists(neu + "\\config.json"))
     return legacy;
   return neu;
@@ -119,14 +119,14 @@ bool findPayload(Payload &p) {
     return true;
   }
   // 2) explicit dev override.
-  std::string repo = env_or("AI_CAD_REPO", "");
+  std::string repo = env_or("CHUDWARE_REPO", "");
   if (!repo.empty() && hasSource(repo)) {
     p.srcDir = repo;
     if (dirExists(repo + "\\wheelhouse"))
       p.wheelhouse = repo + "\\wheelhouse";
     return true;
   }
-  // 3) running from a dev build (host\build\bin\Release\AI-CAD.exe): walk up to
+  // 3) running from a dev build (host\build\bin\Release\Chudware.exe): walk up to
   // the checkout.
   std::string d = dir;
   for (int i = 0; i < 6; ++i) {
@@ -178,7 +178,7 @@ std::string sha256hex16(const std::string &bytes) {
   return out;
 }
 
-// Pull "req_hash" out of %APPDATA%\AI-CAD\runtime\.ready.json (written by
+// Pull "req_hash" out of %APPDATA%\Chudware\runtime\.ready.json (written by
 // provision.py).
 std::string stampReqHash() {
   std::string s = readFileBytes(appdataRoot() + "\\runtime\\.ready.json");
@@ -222,8 +222,8 @@ bool provisionRuntime(bool force, std::string &log) {
   Payload pl;
   if (!findPayload(pl)) {
     log = "runtime payload not found - run the packaged build "
-          "(dist\\AI-CAD\\AI-CAD.exe) or "
-          "install.ps1, or set AI_CAD_REPO to your source checkout.";
+          "(dist\\Chudware\\Chudware.exe) or "
+          "install.ps1, or set CHUDWARE_REPO to your source checkout.";
     return false;
   }
   std::string base = resolveBasePython(exeDir());
@@ -257,7 +257,7 @@ std::string exeDir() {
 }
 
 std::string runtimePython() {
-  std::string envp = env_or("AI_CAD_PYTHON", "");
+  std::string envp = env_or("CHUDWARE_PYTHON", "");
   if (!envp.empty() && fileExists(envp))
     return envp;
   std::string installed =
@@ -288,7 +288,7 @@ std::string appDir() {
   // re-provisioning: explicit dev override -> payload shipped next to the exe
   // -> a source checkout above the exe -> the installed %APPDATA% copy (last
   // resort).
-  std::string repo = env_or("AI_CAD_REPO", "");
+  std::string repo = env_or("CHUDWARE_REPO", "");
   if (!repo.empty() && looksLikeAppDir(repo))
     return repo;
   std::string portable = exeDir() + "\\app";
@@ -310,12 +310,12 @@ bool runtimeReady() {
   std::string py = runtimePython();
   if (!fileExists(py))
     return false;
-  // An explicit dev python (AI_CAD_PYTHON) or a portable runtime shipped next
+  // An explicit dev python (CHUDWARE_PYTHON) or a portable runtime shipped next
   // to the exe is trusted as-is. Only the managed %APPDATA% venv gets the
   // stricter freshness check, so a stale venv (its python.exe exists but its
   // packages predate a requirements change) is re-provisioned instead of being
   // run against — which previously crashed mid-job with "No module named ...".
-  std::string envp = env_or("AI_CAD_PYTHON", "");
+  std::string envp = env_or("CHUDWARE_PYTHON", "");
   if (!envp.empty() && fileExists(envp))
     return true;
   if (py != appdataRoot() + "\\runtime\\venv\\Scripts\\python.exe")
@@ -323,8 +323,8 @@ bool runtimeReady() {
   return installedVenvFresh();
 }
 
-// Point the C++ core (libaicad) at the app's bundled agent prompts. The core
-// reads AI_CAD_PROMPTS_DIR for its role prompts + cheatsheets; if it is unset
+// Point the C++ core (libchudware) at the app's bundled agent prompts. The core
+// reads CHUDWARE_PROMPTS_DIR for its role prompts + cheatsheets; if it is unset
 // the core falls back to "agent/prompts" RELATIVE TO THE PROCESS CWD. When the
 // app is launched from its install dir (not the source tree) that relative path
 // does not exist, so agent_run throws "role prompt unreadable/empty:
@@ -332,16 +332,16 @@ bool runtimeReady() {
 // worker -> the in-app AI fails with "unknown method: agent_run_v2". appDir()
 // already resolves the dev-repo vs shipped-payload layouts, so its
 // agent/prompts is the right, CWD-independent location. Set it via BOTH
-// _putenv_s (host CRT) and the process block (so libaicad's own CRT,
+// _putenv_s (host CRT) and the process block (so libchudware's own CRT,
 // initialised when the DLL loads later, also sees it).
 void ensurePromptsDir() {
-  if (!env_or("AI_CAD_PROMPTS_DIR", "").empty())
+  if (!env_or("CHUDWARE_PROMPTS_DIR", "").empty())
     return; // respect an explicit override
   std::string p = appDir() + "\\agent\\prompts";
   if (!dirExists(p))
     return;
-  _putenv_s("AI_CAD_PROMPTS_DIR", p.c_str());
-  SetEnvironmentVariableA("AI_CAD_PROMPTS_DIR", p.c_str());
+  _putenv_s("CHUDWARE_PROMPTS_DIR", p.c_str());
+  SetEnvironmentVariableA("CHUDWARE_PROMPTS_DIR", p.c_str());
 }
 
 bool ensureRuntime(std::string &log) {
@@ -386,9 +386,9 @@ std::string shq(const std::string &s) {
   return o;
 }
 // XDG data root for the managed runtime/cache (mirrors %APPDATA% on Windows).
-// Billet alias rule (mirrors engine/paths.py active_root()): an existing legacy
-// AI-CAD dir wins (it holds the live runtime venv) unless the Billet dir
-// already has a real install marker (config.json); fresh installs get Billet.
+// Chudware alias rule (mirrors engine/paths.py active_root()): an existing legacy
+// Chudware dir wins (it holds the live runtime venv) unless the Chudware dir
+// already has a real install marker (config.json); fresh installs get Chudware.
 std::string appdataRoot() {
   fs::path base;
   std::string xdg = env_or("XDG_DATA_HOME", "");
@@ -399,8 +399,8 @@ std::string appdataRoot() {
     base = fs::path(home) / ".local" / "share";
   else
     base = fs::path(".");
-  const fs::path legacy = base / "AI-CAD";
-  const fs::path neu = base / "Billet";
+  const fs::path legacy = base / "Chudware";
+  const fs::path neu = base / "Chudware";
   std::error_code ec;
   if (fs::exists(legacy, ec) && !fs::exists(neu / "config.json", ec))
     return legacy.string();
@@ -456,7 +456,7 @@ bool findPayload(Payload &p) {
       p.wheelhouse = (fs::path(dir) / "wheelhouse").string();
     return true;
   }
-  std::string repo = env_or("AI_CAD_REPO", "");
+  std::string repo = env_or("CHUDWARE_REPO", "");
   if (!repo.empty() && hasSource(repo)) {
     p.srcDir = repo;
     if (dirExists((fs::path(repo) / "wheelhouse").string()))
@@ -486,7 +486,7 @@ bool provisionRuntime(bool force, std::string &log) {
   Payload pl;
   if (!findPayload(pl)) {
     log = "runtime payload not found - run from a source checkout or set "
-          "AI_CAD_REPO.";
+          "CHUDWARE_REPO.";
     return false;
   }
   std::string base = resolveBasePython();
@@ -520,7 +520,7 @@ std::string exeDir() {
 }
 
 std::string runtimePython() {
-  std::string envp = env_or("AI_CAD_PYTHON", "");
+  std::string envp = env_or("CHUDWARE_PYTHON", "");
   if (!envp.empty() && fileExists(envp))
     return envp;
   std::string installed =
@@ -550,7 +550,7 @@ static bool looksLikeAppDir(const fs::path &d) {
 }
 
 std::string appDir() {
-  std::string repo = env_or("AI_CAD_REPO", "");
+  std::string repo = env_or("CHUDWARE_REPO", "");
   if (!repo.empty() && looksLikeAppDir(fs::path(repo)))
     return repo;
   std::string portable = (fs::path(exeDir()) / "app").string();
@@ -576,12 +576,12 @@ bool runtimeReady() {
 }
 
 void ensurePromptsDir() {
-  if (!env_or("AI_CAD_PROMPTS_DIR", "").empty())
+  if (!env_or("CHUDWARE_PROMPTS_DIR", "").empty())
     return; // respect an explicit override
   std::string p = (fs::path(appDir()) / "agent" / "prompts").string();
   if (!dirExists(p))
     return;
-  setenv("AI_CAD_PROMPTS_DIR", p.c_str(), 1);
+  setenv("CHUDWARE_PROMPTS_DIR", p.c_str(), 1);
 }
 
 bool ensureRuntime(std::string &log) {

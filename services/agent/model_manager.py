@@ -1,7 +1,7 @@
 """Model manager for bundled llama.cpp GGUF integration — T-W26.
 
 This module handles model registry, download (with resume), and path resolution
-for the two default GGUF models bundled with the AI-CAD agent service.
+for the two default GGUF models bundled with the Chudware agent service.
 
 Model picks rationale
 ---------------------

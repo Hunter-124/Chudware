@@ -117,12 +117,12 @@ class PipelineFlags:
     build_council and overseer remain env-gated (T-W23 / T-W13 not merged).
 
     Environment overrides (always respected):
-      * ``AICAD_ORG_LAYER=0``      → disable Phase 2.5 ORGANIZE (test/compat).
-      * ``AICAD_ORG_LAYER=1``      → explicit enable (no-op; already on by default).
-      * ``AICAD_BUILD_COUNCIL=1``  → require build-strategy council synthesis at the
+      * ``CHUDWARE_ORG_LAYER=0``      → disable Phase 2.5 ORGANIZE (test/compat).
+      * ``CHUDWARE_ORG_LAYER=1``      → explicit enable (no-op; already on by default).
+      * ``CHUDWARE_BUILD_COUNCIL=1``  → require build-strategy council synthesis at the
         PLAN exit gate (contract §19).
-      * ``AICAD_OVERSEER=1``       → overseer audit triggers are live (T-W13).
-      * ``AICAD_DESIGN_PIPELINE=1`` → run the six-stage design-pipeline refinement
+      * ``CHUDWARE_OVERSEER=1``       → overseer audit triggers are live (T-W13).
+      * ``CHUDWARE_DESIGN_PIPELINE=1`` → run the six-stage design-pipeline refinement
         (T-DP1: DECOMPOSE→GEOMETRY→LINKAGE→BUILDPATH between SPECIFY and PLAN).
         Default OFF — the existing pipeline is unchanged when off (contract §6).
     """
@@ -139,10 +139,10 @@ class PipelineFlags:
                 return default
             return val in ("1", "true", "True")
         return cls(
-            org_layer=_on("AICAD_ORG_LAYER", True),   # default ON (T-W22)
-            build_council=_on("AICAD_BUILD_COUNCIL", False),
-            overseer=_on("AICAD_OVERSEER", False),
-            design_pipeline=_on("AICAD_DESIGN_PIPELINE", False),  # default OFF (T-DP1)
+            org_layer=_on("CHUDWARE_ORG_LAYER", True),   # default ON (T-W22)
+            build_council=_on("CHUDWARE_BUILD_COUNCIL", False),
+            overseer=_on("CHUDWARE_OVERSEER", False),
+            design_pipeline=_on("CHUDWARE_DESIGN_PIPELINE", False),  # default OFF (T-DP1)
         )
 
 

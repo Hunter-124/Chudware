@@ -9,8 +9,8 @@ Usage:
     emit = journal.wrap(existing_emit)
 
 The file lands at:
-    ~/.local/share/AI-CAD/cache/runs/<run_id>/events.jsonl  (Linux/macOS)
-    %APPDATA%\\AI-CAD\\cache\\runs\\<run_id>\\events.jsonl  (Windows)
+    ~/.local/share/Chudware/cache/runs/<run_id>/events.jsonl  (Linux/macOS)
+    %APPDATA%\\Chudware\\cache\\runs\\<run_id>\\events.jsonl  (Windows)
 
 Persist-then-callback: the file write + flush complete before control returns to the
 caller, so a crash after write leaves the record on disk (per telemetry.md §1.2).
@@ -33,9 +33,9 @@ from typing import Any, Callable, Optional
 def _default_cache_runs_dir() -> Path:
     if platform.system() == "Windows":
         appdata = os.environ.get("APPDATA") or os.path.expanduser(r"~\AppData\Roaming")
-        return Path(appdata) / "AI-CAD" / "cache" / "runs"
+        return Path(appdata) / "Chudware" / "cache" / "runs"
     xdg = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
-    return Path(xdg) / "AI-CAD" / "cache" / "runs"
+    return Path(xdg) / "Chudware" / "cache" / "runs"
 
 
 def run_events_path(run_id: str, runs_dir: Optional[Path] = None) -> Path:

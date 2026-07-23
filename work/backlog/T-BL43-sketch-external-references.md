@@ -67,7 +67,7 @@ tool work properly. Together these let a sketch reference the rest of the model.
   projection then classify (oblique circle → ellipse BY CONSTRUCTION; perpendicular edge → point;
   splines → sampled polyline w/ approx flag); (2) op_sketch_convert in session.cpp (contract-
   conformant: real geometry default, fix-pinned, $idx/$idx#k id_map, convert_failed) — fixes BOTH
-  GUIs with zero GUI changes; (3) read-only sketch_project_entities RPC (libaicad-dispatched) for
+  GUIs with zero GUI changes; (3) read-only sketch_project_entities RPC (libchudware-dispatched) for
   preview/agent flows; (4) resolve_sketch_plane refactored to doc-level (resolve_sketch_plane_doc)
   so the ops path can resolve planes.
 - 2026-07-04 opus-brae: contracts/doc_ops.md — appended dated amendment for the upgraded
@@ -97,13 +97,13 @@ tool work properly. Together these let a sketch reference the rest of the model.
   blanket allow-external change to the idle-tool sketch selection filter was made — deliberate,
   to avoid colliding with T-BL48's entry-dispatch wiring and T-BL44/41 in the same files.
 - 2026-07-04 opus-brae: added ctest regression test_sketch_convert (4 cases / 36 asserts,
-  commit 0867513a) + AI_CAD_SHOT=sketch_convert headless GUI scenario (scenarios.{h,cpp}) —
+  commit 0867513a) + CHUDWARE_SHOT=sketch_convert headless GUI scenario (scenarios.{h,cpp}) —
   box → empty sketch on top face → sketch_convert(bottom face) → sketch_enter → capture;
   intentionally OUTSIDE the gui_parity `sketch` diff set (host scenario has no convert step).
 - 2026-07-04 opus-brae RESUME (post-crash): rebased onto origin/master (+27 commits; T-BL48
   interactive sketch-entry wiring is at REVIEW, NOT merged — so no in-GUI click flow was built
   on it; the engine/MCP projection path stays the verifiable core, and the shot scenario reaches
-  sketch_enter via the worker directly, independent of T-BL48). REBUILT libaicad.so from the
+  sketch_enter via the worker directly, independent of T-BL48). REBUILT libchudware.so from the
   rebased tree (recon.cpp/session.cpp/document.cpp recompiled) and RE-VERIFIED against the fresh
   .so — stale pre-rebase evidence discarded. Evidence: (a) ctest test_sketch_convert PASS;
   (b) full real-flow MCP/core_bridge script ALL CHECKS PASSED — box→sketch on top face→

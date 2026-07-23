@@ -1,6 +1,6 @@
-"""Register the Billet MCP server into every MCP-capable client on this machine.
+"""Register the Chudware MCP server into every MCP-capable client on this machine.
 
-The server is registered under the new name ``billet`` (formerly ``ai-cad``). Existing
+The server is registered under the new name ``chudware`` (formerly ``ai-cad``). Existing
 ``ai-cad`` entries in client configs are left in place on normal registration so that
 tooling still referencing the old name continues to work; they are removed only on an
 explicit ``--unregister`` run.
@@ -13,7 +13,7 @@ for each of:
   * VS Code      -> <repo>/.vscode/mcp.json                  {"servers": {...}}  (type:stdio)
   * opencode     -> <repo>/opencode.json                     {"mcp": {...}}      (type:local)
                     + ~/.config/opencode/opencode.json(c)    (global user config)
-  * Grok         -> ~/.grok/config.toml                      [mcp_servers.billet]
+  * Grok         -> ~/.grok/config.toml                      [mcp_servers.chudware]
                     + <repo>/.grok/config.toml               (project-scoped)
   * Antigravity  -> ~/.gemini/<antigravity*>/mcp_config.json {"mcpServers": {...}} (global)
 
@@ -22,13 +22,13 @@ appears when you open this project, and so each machine gets paths that are corr
 Grok is written both user-global and project-scoped. Antigravity is global-only.
 
 ``--profile lite|full`` selects the MCP instruction/tool surface (env
-``AICAD_MCP_PROFILE``). ``lite`` keeps every CAD/sim capability but drops orchestration
+``CHUDWARE_MCP_PROFILE``). ``lite`` keeps every CAD/sim capability but drops orchestration
 scaffolding (DAG/mission/ledger/workspace) — preferred for capable models (Grok, Claude
 Code, opencode). Default is ``full`` for backward compatibility with small local models.
 
 The writes are idempotent and non-destructive: existing servers in each file are preserved,
-each file is backed up (*.aicad-bak) before the first change, and re-running only rewrites a
-file when the "billet" (or legacy "ai-cad") entry would actually change.
+each file is backed up (*.chudware-bak) before the first change, and re-running only rewrites a
+file when the "chudware" (or legacy "ai-cad") entry would actually change.
 
 Pure standard library on purpose -- it must run under any Python, including one without the
 engine's heavy dependencies installed.
@@ -49,7 +49,7 @@ import shutil
 import sys
 from pathlib import Path
 
-SERVER_NAME = "billet"
+SERVER_NAME = "chudware"
 SERVER_NAME_LEGACY = "ai-cad"
 
 
@@ -65,28 +65,28 @@ def _default_repo() -> str:
 def _env(repo: str, profile: str) -> dict:
     env = {"PYTHONPATH": repo}
     # Always pin the profile explicitly so clients don't inherit a stale shell default.
-    env["AICAD_MCP_PROFILE"] = profile
+    env["CHUDWARE_MCP_PROFILE"] = profile
     # Prefer the staged full engine (OCCT + Netgen) when present so MCP and GUI share one.
     for rel in (
-        Path("dist") / "AI-CAD" / "libaicad.dll",
-        Path("build") / "windows-occt" / "bin" / "libaicad.dll",
-        Path("dist") / "AI-CAD" / "libaicad.so",
-        Path("core") / "build-occt-linux" / "bin" / "libaicad.so",
+        Path("dist") / "Chudware" / "libchudware.dll",
+        Path("build") / "windows-occt" / "bin" / "libchudware.dll",
+        Path("dist") / "Chudware" / "libchudware.so",
+        Path("core") / "build-occt-linux" / "bin" / "libchudware.so",
     ):
         p = Path(repo) / rel
         if p.is_file():
-            env["BILLET_LIBAICAD"] = str(p)
-            env["AI_CAD_LIBAICAD"] = str(p)  # legacy name still honored
+            env["CHUDWARE_LIBCHUDWARE"] = str(p)
+            env["CHUDWARE_LIBCHUDWARE"] = str(p)  # legacy name still honored
             break
     for rel in (
-        Path("dist") / "AI-CAD" / "aicad-hostd.exe",
-        Path("build") / "windows-occt" / "bin" / "aicad-hostd.exe",
-        Path("dist") / "AI-CAD" / "aicad-hostd",
-        Path("core") / "build-occt-linux" / "bin" / "aicad-hostd",
+        Path("dist") / "Chudware" / "chudware-hostd.exe",
+        Path("build") / "windows-occt" / "bin" / "chudware-hostd.exe",
+        Path("dist") / "Chudware" / "chudware-hostd",
+        Path("core") / "build-occt-linux" / "bin" / "chudware-hostd",
     ):
         p = Path(repo) / rel
         if p.is_file():
-            env["AICAD_HOSTD_BIN"] = str(p)
+            env["CHUDWARE_HOSTD_BIN"] = str(p)
             break
     return env
 
@@ -219,7 +219,7 @@ def _toml_str(s: str) -> str:
 
 
 def _grok_section(entry: dict) -> str:
-    """Render a [mcp_servers.billet] TOML table for Grok's config.toml."""
+    """Render a [mcp_servers.chudware] TOML table for Grok's config.toml."""
     cmd = _toml_str(entry["command"])
     args = ", ".join(_toml_str(a) for a in entry["args"])
     env_pairs = []
@@ -262,7 +262,7 @@ def _toml_strip_table(text: str, table: str) -> str:
 def _toml_upsert_table(text: str, table: str, body: str) -> str:
     """Replace or append a TOML table. ``body`` is the full table including the header line."""
     stripped = _toml_strip_table(text, table).rstrip()
-    # Drop orphaned billet fragments left by older broken rewrites (env/args without a header).
+    # Drop orphaned chudware fragments left by older broken rewrites (env/args without a header).
     if table == f"mcp_servers.{SERVER_NAME}":
         cleaned: list[str] = []
         for line in stripped.splitlines(keepends=True):
@@ -270,8 +270,8 @@ def _toml_upsert_table(text: str, table: str, body: str) -> str:
             if not s:
                 cleaned.append(line)
                 continue
-            # Bare key/value lines that only make sense inside [mcp_servers.billet]
-            if s.startswith("env = {") and "AICAD_MCP_PROFILE" in s:
+            # Bare key/value lines that only make sense inside [mcp_servers.chudware]
+            if s.startswith("env = {") and "CHUDWARE_MCP_PROFILE" in s:
                 continue
             if s.startswith("args = [") and "mcp_server.server" in s:
                 continue
@@ -313,7 +313,7 @@ def _apply_grok(t: dict, unregister: bool, dry_run: bool) -> dict:
     if changed and not dry_run:
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists():
-            shutil.copy2(path, path.with_suffix(path.suffix + ".aicad-bak"))
+            shutil.copy2(path, path.with_suffix(path.suffix + ".chudware-bak"))
         path.write_text(new_txt, encoding="utf-8")
 
     status = ("would change" if dry_run else "wrote") if changed else "unchanged"
@@ -354,7 +354,7 @@ def _apply_one(t: dict, unregister: bool, dry_run: bool) -> dict:
     if changed and not dry_run:
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists():
-            shutil.copy2(path, path.with_suffix(path.suffix + ".aicad-bak"))
+            shutil.copy2(path, path.with_suffix(path.suffix + ".chudware-bak"))
         path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
 
     status = ("would change" if dry_run else "wrote") if changed else "unchanged"
@@ -368,7 +368,7 @@ def _status_of(t: dict) -> dict:
 
     ``present`` = the client has left a footprint on this machine (its config file or the
     directory that holds it already exists) -- a good-enough, stdlib-only heuristic for a
-    first-run "we found these clients" prompt. ``connected`` = billet is already registered.
+    first-run "we found these clients" prompt. ``connected`` = chudware is already registered.
     """
     path: Path = t["path"]
     if t.get("format") == "grok_toml":
@@ -395,7 +395,7 @@ def detect(py: str, repo: str, profile: str = "full") -> list[dict]:
 
 
 def _run_wizard(py: str, repo: str, dry_run: bool, profile: str = "full") -> list[dict]:
-    """Connect just the clients that are present but not yet wired to billet."""
+    """Connect just the clients that are present but not yet wired to chudware."""
     results = []
     for t in _targets(py, repo, profile):
         st = _status_of(t)
@@ -417,8 +417,8 @@ def main(argv: list[str]) -> int:
                     help="Repository root (default: auto-detect from this script)")
     ap.add_argument("--profile", choices=["lite", "full"], default="full",
                     help="MCP profile: lite (capable models) or full (supervised/local). "
-                         "Sets AICAD_MCP_PROFILE in every client entry.")
-    ap.add_argument("--unregister", action="store_true", help="Remove the billet/ai-cad entries")
+                         "Sets CHUDWARE_MCP_PROFILE in every client entry.")
+    ap.add_argument("--unregister", action="store_true", help="Remove the chudware/ai-cad entries")
     ap.add_argument("--dry-run", action="store_true", help="Show what would change")
     ap.add_argument("--detect", action="store_true",
                     help="Report which MCP clients are present / already connected, then exit")

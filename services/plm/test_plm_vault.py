@@ -444,8 +444,8 @@ def test_client_satisfies_bridge_protocol():
 
 
 def test_plm_bridge_uses_real_client_when_flag_on(tmp_path, monkeypatch):
-    # AICAD_PLM_BRIDGE=1 → the bridge imports our PLMVaultClient, not the mock
-    monkeypatch.setenv("AICAD_PLM_BRIDGE", "1")
+    # CHUDWARE_PLM_BRIDGE=1 → the bridge imports our PLMVaultClient, not the mock
+    monkeypatch.setenv("CHUDWARE_PLM_BRIDGE", "1")
     from services.agent import plm_bridge
     vault = plm_bridge._default_vault()
     assert type(vault).__name__ == "PLMVaultClient"

@@ -12,10 +12,10 @@
 
 #include "piping/pyutil.h"
 
-namespace aicad::piping {
+namespace chudware::piping {
 
 // Methods: piping_solve, piping_report, piping_operating_point, piping_fluid,
 // piping_cfd_boundary, piping_verify_cfd.
 bool call(const std::string& method, const pyutil::ojson& params, pyutil::ojson& result);
 
-}  // namespace aicad::piping
+}  // namespace chudware::piping

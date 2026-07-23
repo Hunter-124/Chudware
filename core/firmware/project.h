@@ -12,7 +12,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad::firmware {
+namespace chudware::firmware {
 
 inline constexpr const char* kProjectSchema = "aicad.firmware.project/1";
 
@@ -36,8 +36,8 @@ struct Project {
     static Project from_dict(const nlohmann::json& d, const std::filesystem::path& root);
 };
 
-// Base directory holding every firmware project: AI_CAD_FIRMWARE_DIR override,
-// else %APPDATA%/AI-CAD/firmware (temp dir fallback). Created if absent.
+// Base directory holding every firmware project: CHUDWARE_FIRMWARE_DIR override,
+// else %APPDATA%/Chudware/firmware (temp dir fallback). Created if absent.
 std::filesystem::path firmware_root();
 
 // Atomically write project.json (tmp + rename). Returns the final path.
@@ -59,4 +59,4 @@ Project new_project(const std::optional<std::string>& board_doc_ref,
                     const std::string& mcu, const std::string& toolchain,
                     const std::string& name = "");
 
-}  // namespace aicad::firmware
+}  // namespace chudware::firmware

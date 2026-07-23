@@ -7,7 +7,7 @@ caches the result and provides:
   * ``cheatsheet_snippet()`` for one-shot agent middleware inject
   * ``unknown_op_help(kind)`` for rich rejection text offline
 
-Falls back to ``services/mcp/op_registry`` when libaicad is unavailable
+Falls back to ``services/mcp/op_registry`` when libchudware is unavailable
 (unit tests / offline), so middleware tests stay deterministic.
 """
 from __future__ import annotations

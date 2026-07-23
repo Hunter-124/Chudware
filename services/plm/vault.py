@@ -1236,12 +1236,12 @@ def _iso(epoch: int) -> str:
 
 
 def _user_author() -> dict[str, Any]:
-    """Session-aware user author (billet-web injects AICAD_USER_* env).
+    """Session-aware user author (chudware-web injects CHUDWARE_USER_* env).
 
     Author lives ONLY in meta/commit (byte-stability law §0) — never document.json.
     """
-    uid = os.environ.get("AICAD_USER_ID") or "user"
-    display = os.environ.get("AICAD_USER_DISPLAY") or None
+    uid = os.environ.get("CHUDWARE_USER_ID") or "user"
+    display = os.environ.get("CHUDWARE_USER_DISPLAY") or None
     if not display:
         display = "User" if uid == "user" else uid
     return {"kind": "user", "id": uid, "display": display}

@@ -8,7 +8,7 @@ Strategy (offline-ML-track discipline — no all-skip):
     dedicated test cases.
   * ``get_model_path`` / ``list_models`` exercised against a temp directory.
 
-Live provisioning: marked skip unless AI_CAD_PROVISION_LIVE is set, to avoid
+Live provisioning: marked skip unless CHUDWARE_PROVISION_LIVE is set, to avoid
 downloading multi-GB GGUFs in CI.
 
 Co-Authored-By: sonnet-pike <noreply@anthropic.com>
@@ -494,14 +494,14 @@ class TestProvision(unittest.TestCase):
 
 
 @pytest.mark.skipif(
-    not os.environ.get("AI_CAD_PROVISION_LIVE"),
-    reason="Live provisioning: set AI_CAD_PROVISION_LIVE=1 to run (downloads GBs)",
+    not os.environ.get("CHUDWARE_PROVISION_LIVE"),
+    reason="Live provisioning: set CHUDWARE_PROVISION_LIVE=1 to run (downloads GBs)",
 )
 class TestLiveProvision(unittest.TestCase):
     """Actually downloads a real GGUF from HuggingFace — skip unless explicitly enabled.
 
     Recipe:
-        export AI_CAD_PROVISION_LIVE=1
+        export CHUDWARE_PROVISION_LIVE=1
         pytest services/agent/test_model_manager.py::TestLiveProvision -v -s
     """
 

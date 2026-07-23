@@ -75,7 +75,7 @@ long DocRegistry::sniffRevision(const json& result) {
 }
 
 int DocRegistry::holdSecs() const {
-    if (const char* h = std::getenv("AICAD_HOSTD_HOLD_SECS"); h && *h)
+    if (const char* h = std::getenv("CHUDWARE_HOSTD_HOLD_SECS"); h && *h)
         return std::max(1, std::atoi(h));
     return 120;
 }
@@ -83,14 +83,14 @@ int DocRegistry::holdSecs() const {
 // Doc-GC knobs. Base grace default 90 s: long enough for the GUI to adopt a doc a
 // disconnecting agent just minted (and for quick app relaunches), short enough
 // that zombie docs never pile up behind dead sessions.
-// Agent/mcp-origin docs get AICAD_DOC_GC_AGENT_GRACE_S (default 1800 s / 30 min)
+// Agent/mcp-origin docs get CHUDWARE_DOC_GC_AGENT_GRACE_S (default 1800 s / 30 min)
 // so mission-built parts remain listed after the agent detaches — the GUI can
 // still open them after a run finishes.
 static long long gcGraceMsBase() {
     static const long long ms = [] {
-        if (const char* v = std::getenv("AICAD_DOC_GC"); v && *v && std::atoi(v) == 0)
+        if (const char* v = std::getenv("CHUDWARE_DOC_GC"); v && *v && std::atoi(v) == 0)
             return -1LL;  // disabled
-        if (const char* v = std::getenv("AICAD_DOC_GC_GRACE_S"); v && *v)
+        if (const char* v = std::getenv("CHUDWARE_DOC_GC_GRACE_S"); v && *v)
             return (long long)std::max(1, std::atoi(v)) * 1000;
         return 90'000LL;
     }();
@@ -99,9 +99,9 @@ static long long gcGraceMsBase() {
 
 static long long gcAgentGraceMs() {
     static const long long ms = [] {
-        if (const char* v = std::getenv("AICAD_DOC_GC"); v && *v && std::atoi(v) == 0)
+        if (const char* v = std::getenv("CHUDWARE_DOC_GC"); v && *v && std::atoi(v) == 0)
             return -1LL;
-        if (const char* v = std::getenv("AICAD_DOC_GC_AGENT_GRACE_S"); v && *v)
+        if (const char* v = std::getenv("CHUDWARE_DOC_GC_AGENT_GRACE_S"); v && *v)
             return (long long)std::max(1, std::atoi(v)) * 1000;
         return 1'800'000LL;  // 30 min
     }();
@@ -333,10 +333,10 @@ bool DocRegistry::preCall(int clientId, const std::string& kind, const std::stri
                           json& params, json& err, std::string& warning) {
     // Agent undo gating (P2 multi-user): interactive undo/redo is human-only.
     // Agents keep doc_checkpoint/doc_revert + autosave/PLM for rollback. Kill-switch
-    // AICAD_UNDO_AGENTS=1 restores the old free-for-all behaviour.
+    // CHUDWARE_UNDO_AGENTS=1 restores the old free-for-all behaviour.
     if ((method == "doc_undo" || method == "doc_redo") &&
         (kind == "mcp" || kind == "agent")) {
-        const char* allow = std::getenv("AICAD_UNDO_AGENTS");
+        const char* allow = std::getenv("CHUDWARE_UNDO_AGENTS");
         if (!(allow && std::string(allow) == "1")) {
             err = json{{"code", "undo_denied"},
                        {"message",

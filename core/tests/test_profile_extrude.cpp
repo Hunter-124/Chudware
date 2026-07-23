@@ -1,7 +1,7 @@
 // Wave 2 milestone verification: solved 2D sketch -> OCCT planar profile ->
 // extrude/revolve -> tessellate -> AICM -> HOST render::parseAicm round-trip.
 // This is the end-to-end "solve a dimensioned sketch, get a solid of EXACTLY the
-// right size" proof that connects aicad::sketch::solve_sketch to 3D geometry.
+// right size" proof that connects chudware::sketch::solve_sketch to 3D geometry.
 //
 // It follows the EXACT round-trip pattern of test_geom_aicm.cpp: the host loader
 // (host/src/render/aicm_loader) is the contract oracle. Assertions are tight and
@@ -31,9 +31,9 @@
 #include "sketch/sketch.h"
 #include "aicm_loader.h"  // host loader (host/src/render on the include path)
 
-using aicad::geom::SketchPlane;
-using aicad::geom::faces_from_solved_sketch;
-using aicad::sketch::solve_sketch;
+using chudware::geom::SketchPlane;
+using chudware::geom::faces_from_solved_sketch;
+using chudware::sketch::solve_sketch;
 using json = nlohmann::json;
 
 namespace {
@@ -352,7 +352,7 @@ TEST_CASE("concentric circles: all-region inner disc extrudes to solid cylinder"
     auto sol = solve_sketch(s, json::object());
     REQUIRE(sol.converged);
 
-    auto all = aicad::geom::all_region_faces_from_solved_sketch(
+    auto all = chudware::geom::all_region_faces_from_solved_sketch(
         sol.entities, SketchPlane::top());
     // Two regions: outer-with-hole (washer) and inner solid disc.
     REQUIRE(all.size() == 2);

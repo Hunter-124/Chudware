@@ -109,11 +109,11 @@ def _prompts_override_dir() -> Path:
     import os
     xdg = os.environ.get("XDG_DATA_HOME")
     if xdg:
-        root = Path(xdg) / "AI-CAD"
+        root = Path(xdg) / "Chudware"
     else:
-        root = Path.home() / ".local" / "share" / "AI-CAD"
-    # Match C++ paths_root()/prompts when AI_CAD_APPDATA set
-    app = os.environ.get("AI_CAD_APPDATA") or os.environ.get("AI_CAD_DATA")
+        root = Path.home() / ".local" / "share" / "Chudware"
+    # Match C++ paths_root()/prompts when CHUDWARE_APPDATA set
+    app = os.environ.get("CHUDWARE_APPDATA") or os.environ.get("CHUDWARE_DATA")
     if app:
         root = Path(app)
     return root / "prompts"
@@ -131,7 +131,7 @@ def _prompt_builtin_md_path(role_id: str) -> Path:
 def resolve_role_system_prompt(role_id: str, yaml_prompt: str) -> str:
     """Resolution order for the *Python* live path (delegate / load_role):
 
-    1. User override  (~/.local/share/AI-CAD/prompts/<id>.md) — Settings → Prompts Save
+    1. User override  (~/.local/share/Chudware/prompts/<id>.md) — Settings → Prompts Save
     2. YAML card      system_prompt field (canonical for mission roles)
     3. Shipped .md    (services/agent/prompts/<id>.md) — fallback when no YAML text
 

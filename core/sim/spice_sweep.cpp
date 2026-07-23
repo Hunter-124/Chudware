@@ -12,7 +12,7 @@
 #include <string>
 #include <vector>
 
-namespace aicad::sim {
+namespace chudware::sim {
 namespace {
 
 using nlohmann::json;
@@ -140,14 +140,14 @@ std::vector<json> spice_sweep(const json& circuit, const std::string& param,
 
     const json study = make_study(analysis);
     const uint64_t est = estimate_sweep_bytes(circuit, n);
-    const aicad::governor::Plan plan =
-        aicad::governor::plan_for(est, "spice_sweep", /*want_workers=*/0);
+    const chudware::governor::Plan plan =
+        chudware::governor::plan_for(est, "spice_sweep", /*want_workers=*/0);
     // Cap workers at point count (no point oversubscribing empty slots).
     const int workers = std::max(1, std::min(plan.workers, n));
-    aicad::pool::shared().set_max_workers(workers);
+    chudware::pool::shared().set_max_workers(workers);
 
     std::vector<json> out(static_cast<std::size_t>(n));
-    aicad::pool::shared().parallel_for(n, [&](int i) {
+    chudware::pool::shared().parallel_for(n, [&](int i) {
         out[static_cast<std::size_t>(i)] =
             run_one(circuit, param, values[static_cast<std::size_t>(i)], study);
     });
@@ -162,4 +162,4 @@ std::vector<json> spice_sweep(const json& circuit, const std::string& param,
     return out;
 }
 
-}  // namespace aicad::sim
+}  // namespace chudware::sim

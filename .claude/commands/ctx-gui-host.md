@@ -1,7 +1,7 @@
 ---
 description: Work on the gui-host section — loads its maintained context pack (source map, entry points, debugging playbook)
 ---
-You are working on the **gui-host** section of AI-CAD. Its maintained context pack (tracked in git, kept current by agents):
+You are working on the **gui-host** section of Chudware. Its maintained context pack (tracked in git, kept current by agents):
 
 !`cat work/context/gui-host.md 2>/dev/null || echo "(context pack missing — run /work-ctx-refresh or explore with graphify)"`
 

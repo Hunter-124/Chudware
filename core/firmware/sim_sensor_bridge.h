@@ -11,7 +11,7 @@
 
 #include "firmware/sensor_models.h"
 
-namespace aicad::firmware {
+namespace chudware::firmware {
 
 // Build a validated aicad.fwscenario/1 dict from a FlightProfile / trajectory
 // dict / CFD summary + sensor map. Throws std::invalid_argument /
@@ -22,4 +22,4 @@ nlohmann::json build_sensor_scenario(const nlohmann::json& sim_result_or_profile
                                      const nlohmann::json& duration_s,  // null → profile span
                                      double dt_s, const std::string& name);
 
-}  // namespace aicad::firmware
+}  // namespace chudware::firmware

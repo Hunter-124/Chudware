@@ -33,7 +33,7 @@
 
 namespace fs = std::filesystem;
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 namespace auth {
 
@@ -1114,4 +1114,4 @@ std::string ensure_fresh_for_run(const std::string& name, json& cfg_inout) {
 
 }  // namespace auth
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware

@@ -48,7 +48,7 @@ local models viable across a whole mission.
 5. Wire the loop seam: `run_turn` creates/loads the run ledger, appends an `artifact`
    event per successful build (stl path, contact sheet) and a `decision` event when
    the model's json notes declare done. Keep changes minimal and behind a
-   `AI_CAD_LEDGER=1` env default-on flag.
+   `CHUDWARE_LEDGER=1` env default-on flag.
 6. Tests: event append/replay round-trip; renderer determinism + budget compliance at
    200/800/4000 tokens; provenance required on dimension events; MCP tool smoke test.
 7. MCP freshness rule (work/WORKFLOW.md §6): update server instructions to mention the
@@ -71,5 +71,5 @@ local models viable across a whole mission.
 - Do not invent extra ledger sections; additive changes need a contract minor bump.
 
 ## Progress log
-- 2026-07-05 00:11 UTC [sonnet-loam] Implemented aicad.ledger/1: Ledger class (event log + replay-from-events + budgeted renderer), ledger_get/ledger_note MCP tools (registered as ledger family, ledger_get classified as read via _READ_EXACT fix), loop.py artifact+decision seam behind AI_CAD_LEDGER flag. 33 tests pass: python -m pytest services/agent/test_ledger.py -q → 33 passed in 0.05s. Deviation: tool_registry.py added to files-touched to fix ledger_get risk classification (required by DoD step 4).
+- 2026-07-05 00:11 UTC [sonnet-loam] Implemented aicad.ledger/1: Ledger class (event log + replay-from-events + budgeted renderer), ledger_get/ledger_note MCP tools (registered as ledger family, ledger_get classified as read via _READ_EXACT fix), loop.py artifact+decision seam behind CHUDWARE_LEDGER flag. 33 tests pass: python -m pytest services/agent/test_ledger.py -q → 33 passed in 0.05s. Deviation: tool_registry.py added to files-touched to fix ledger_get risk classification (required by DoD step 4).
 - 2026-07-05 00:23 UTC [sonnet-loam] Post-review fixes (advisor-caught): (1) ledger_render now enforces strict priority order — once budget is exhausted by a high-priority section, all lower-priority sections are dropped, not skipped; (2) dropped footer counts data entries not sections; (3) answer_question no longer nulls the stored question text. 2 new discriminating tests added. 35 tests pass total. Branch re-pushed.

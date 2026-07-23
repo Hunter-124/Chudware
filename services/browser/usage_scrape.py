@@ -67,7 +67,7 @@ def daemon_cache_root() -> Path:
     Must match ``cef_platform::cache_root()`` when ``set_daemon_process(true)`` so
     profile paths the Python client passes land under the daemon's root_cache_path.
     """
-    if ov := os.environ.get("AI_CAD_CEF_CACHE_ROOT"):
+    if ov := os.environ.get("CHUDWARE_CEF_CACHE_ROOT"):
         return Path(ov)
     if xdg := os.environ.get("XDG_DATA_HOME"):
         if xdg.strip():
@@ -525,7 +525,7 @@ def _ok_result(
     }
     if details:
         out["details"] = details
-    if raw is not None and os.environ.get("AI_CAD_USAGE_SCRAPE_RAW"):
+    if raw is not None and os.environ.get("CHUDWARE_USAGE_SCRAPE_RAW"):
         out["raw"] = raw
     # Promote exhausted/warning if any row is depleted.
     for row in usage_rows:

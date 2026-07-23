@@ -1,6 +1,6 @@
 // AICM shared-memory handoff — avoid a temp-file round-trip on every rebuild.
 //
-// Producer (libaicad / hostd session): publish_aicm(key, bytes) writes the blob into
+// Producer (libchudware / hostd session): publish_aicm(key, bytes) writes the blob into
 // a POSIX shared-memory object (Linux) or named file mapping (Windows) and returns a
 // URI the consumer can open without touching disk:
 //
@@ -25,7 +25,7 @@
 #include <string>
 #include <vector>
 
-namespace aicad {
+namespace chudware {
 namespace aicm_handoff {
 
 // True when uri is an aicm-shm:// handoff (not a filesystem path).
@@ -64,7 +64,7 @@ void release_older_than(const std::string& doc_id, long keep_rev);
 void release_doc(const std::string& doc_id);
 
 // Release every cached publish (all docs). Call from hostd process teardown so
-// kill/drain does not leave orphaned /dev/shm/aicad_* objects. atexit-registered
+// kill/drain does not leave orphaned /dev/shm/chudware_* objects. atexit-registered
 // on first publish as a backstop for clean process exit.
 void release_all();
 
@@ -72,4 +72,4 @@ void release_all();
 std::string key_for(const std::string& doc_id, long revision);
 
 }  // namespace aicm_handoff
-}  // namespace aicad
+}  // namespace chudware

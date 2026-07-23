@@ -53,7 +53,7 @@ The AI path: the LLM extracts a dimension dict from a pasted datasheet or listin
       (isolated temp registry). `test_spec_sheet_demo.py` (4 tests).
 - [x] `python -m pytest engine_oracle/test_spec_sheet_matcher.py -q` passes (including AI path with mocked LLM)
       — 57 passed (matcher+demo); B-chain regression sweep (bom/cost_model/vendor_parts/parts_providers)
-      99 passed. Ran under mcp-venv with `AI_CAD_LIBAICAD` set.
+      99 passed. Ran under mcp-venv with `CHUDWARE_LIBCHUDWARE` set.
 
 ## Closeout (opus-vane, 2026-07-02)
 

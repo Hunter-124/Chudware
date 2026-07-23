@@ -25,7 +25,7 @@
 #include <gp_Dir.hxx>
 #include <gp_Pnt.hxx>
 
-namespace aicad::geom {
+namespace chudware::geom {
 
 namespace {
 
@@ -572,4 +572,4 @@ TopoDS_Wire wire_from_solved_sketch(
     return make_wire(edges);  // connects head-to-tail in entity order (open or closed)
 }
 
-}  // namespace aicad::geom
+}  // namespace chudware::geom

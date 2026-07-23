@@ -16,5 +16,5 @@ docs/PERF_AUDIT_2026-07-10.md §3 P4. Single-in-flight solve RPC per drag; each 
 
 ## Definition of done
 
-- [ ] no sync worker.call in any drag path (AI_CAD_RPC_TRACE clean)
+- [ ] no sync worker.call in any drag path (CHUDWARE_RPC_TRACE clean)
 - [ ] frame rate independent of solve latency; drag generation counter drops stale responses

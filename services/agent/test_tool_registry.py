@@ -2,7 +2,7 @@
 
 Lives under agent/ (the gate runs `pytest engine/doc agent`) but exercises
 `mcp_server.tool_registry` via the top-level `mcp_server` symlink — no FastMCP, no
-libaicad, no network. Contract: contracts/providers.md §6.
+libchudware, no network. Contract: contracts/providers.md §6.
 """
 from __future__ import annotations
 
@@ -124,9 +124,9 @@ def test_deny_risk_class():
 def test_env_fallback(monkeypatch):
     _register_sample()
     reg.reset_policy()
-    monkeypatch.setenv("AI_CAD_TOOLS_ALLOW", "describe_part, family:cad")
+    monkeypatch.setenv("CHUDWARE_TOOLS_ALLOW", "describe_part, family:cad")
     assert reg.is_allowed("add_features")  # via family:cad
-    monkeypatch.setenv("AI_CAD_TOOLS_ALLOW", "describe_part")
+    monkeypatch.setenv("CHUDWARE_TOOLS_ALLOW", "describe_part")
     assert not reg.is_allowed("add_features")
 
 

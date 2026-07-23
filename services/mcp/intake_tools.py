@@ -7,7 +7,7 @@ manufacturing process (FDM default, clarify if ambiguous), (5) build the recepta
 process clearances, and (6) emit a FitReport (+ optional printable fit-test coupon) before export.
 
 The pure brain is services.intake.intake + the C++ DfM process profiles (core/dfm, reached
-via the libaicad ``dfm_*`` methods through core_bridge). These tools are the thin MCP
+via the libchudware ``dfm_*`` methods through core_bridge). These tools are the thin MCP
 adapter: they drive the flow and PERSIST the artifacts inside the .step+ via doc_set_meta/doc_get_meta
 (the same opaque-doc-key mechanism as `studies`), so an MCP-built part reopens in-app intact. The
 elicitation is naturally multi-turn over MCP: a tool returns the ask, the user answers next turn.
@@ -157,7 +157,7 @@ def _load_photos(doc_id: str):
 
 
 def _photo_cache_dir(doc_id: str) -> str:
-    return _os.path.join(_tempfile.gettempdir(), "aicad_vision", str(doc_id))
+    return _os.path.join(_tempfile.gettempdir(), "chudware_vision", str(doc_id))
 
 
 def _register_photos(doc_id: str, photos: list) -> list:

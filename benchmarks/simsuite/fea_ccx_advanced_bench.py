@@ -35,7 +35,7 @@ REPO = Path(__file__).resolve().parents[2]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-os.environ.setdefault("AI_CAD_ENGINE_DAEMON", "0")
+os.environ.setdefault("CHUDWARE_ENGINE_DAEMON", "0")
 
 DOMAIN = "fea_ccx_advanced"
 
@@ -45,7 +45,7 @@ def _ccx_ready() -> bool:
     if fa.ccx_path() is None:
         default = Path.home() / ".local" / "bin" / "ccx"
         if default.exists():                     # documented install location
-            os.environ.setdefault("AI_CAD_CCX", str(default))
+            os.environ.setdefault("CHUDWARE_CCX", str(default))
     return fa.ccx_path() is not None
 
 
@@ -84,7 +84,7 @@ def _bench_buckling(quick: bool) -> dict:
     gen = fa.build_buckling_column_inp(L, b, h, E, nu, P, nx=nx, ny=4, nz=4)
     c["setup_s"] = time.time() - ts
     if not _ccx_ready():
-        c.update(status="skip", detail="ccx not on PATH/AI_CAD_CCX",
+        c.update(status="skip", detail="ccx not on PATH/CHUDWARE_CCX",
                  total_s=time.time() - t0)
         return c
     ts = time.time()
@@ -112,7 +112,7 @@ def _bench_contact(quick: bool) -> dict:
     gen = fa.build_contact_block_inp(L, b, h, E, nu, p)
     c["setup_s"] = time.time() - ts
     if not _ccx_ready():
-        c.update(status="skip", detail="ccx not on PATH/AI_CAD_CCX",
+        c.update(status="skip", detail="ccx not on PATH/CHUDWARE_CCX",
                  total_s=time.time() - t0)
         return c
     ts = time.time()
@@ -173,7 +173,7 @@ def _bench_fatigue_engine() -> dict:
     except CoreError as exc:
         if "unknown method" in str(exc):
             c.update(status="skip", total_s=time.time() - t0,
-                     detail="libaicad.so lacks sim_run_fatigue (no FEA plugin)")
+                     detail="libchudware.so lacks sim_run_fatigue (no FEA plugin)")
             return c
         c.update(status="fail", detail=str(exc)[-200:], total_s=time.time() - t0)
         return c

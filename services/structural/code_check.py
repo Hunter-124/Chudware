@@ -332,7 +332,7 @@ class RAGProvider(Protocol):
 class UserCorpusProvider:
     """Default RAG backend: searches user-supplied PDFs in a local corpus directory.
 
-    Set ``AICAD_CODE_CORPUS_PATH`` to a directory containing user-licensed PDF copies of
+    Set ``CHUDWARE_CODE_CORPUS_PATH`` to a directory containing user-licensed PDF copies of
     building codes.  If the directory is absent or empty, returns an empty citation list
     with a no-corpus advisory note (graceful no-op — never an error).
 
@@ -346,12 +346,12 @@ class UserCorpusProvider:
 
     _DEFAULT_CORPUS_DIR = os.path.join(
         os.path.expanduser("~"),
-        ".local", "share", "AI-CAD", "code_corpus",
+        ".local", "share", "Chudware", "code_corpus",
     )
 
     def __init__(self, corpus_dir: Optional[str] = None):
         self.corpus_dir = corpus_dir or os.environ.get(
-            "AICAD_CODE_CORPUS_PATH", self._DEFAULT_CORPUS_DIR
+            "CHUDWARE_CODE_CORPUS_PATH", self._DEFAULT_CORPUS_DIR
         )
 
     def _list_pdfs(self) -> list[str]:
@@ -391,7 +391,7 @@ class UserCorpusProvider:
             return [{
                 "text": (
                     "No user corpus found. Add licensed building-code PDFs to "
-                    f"{self.corpus_dir} (or set AICAD_CODE_CORPUS_PATH) to enable "
+                    f"{self.corpus_dir} (or set CHUDWARE_CODE_CORPUS_PATH) to enable "
                     "jurisdiction-specific citations."
                 ),
                 "source_url": f"file://{self.corpus_dir}",

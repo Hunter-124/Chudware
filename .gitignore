@@ -84,7 +84,7 @@ OCCT/
 
 # Loose build/debug artifacts that land in the repo root (never committed)
 /libtest*.obj
-/aicad_*.log
+/chudware_*.log
 /chain_dbg.json
 /session-continuation-prompt-*.txt
 core/build-occt/
@@ -98,7 +98,7 @@ core/build-occt/
 *.stp
 
 # MCP client-config backups (mcp_setup.bat writes these next to the regenerated configs)
-*.aicad-bak
+*.chudware-bak
 
 # Scratch render output from dev tools (leading-underscore convention, like _shot_*.png)
 tools/_*.png

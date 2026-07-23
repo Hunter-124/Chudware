@@ -105,7 +105,7 @@ Composer copilot toolbar icons for the chat context-reference feature:
 
 - `paperclip` — composer file-attach button (remade crisp diagonal double-wire clip;
   replaces the old inline ImDrawList glyph, now a proper atlas id).
-- `context_cube` — composer context-pick button; the Billet logo cube drawn outline-only
+- `context_cube` — composer context-pick button; the Chudware logo cube drawn outline-only
   (transparent background, theme stroke so the SDF tints by icon/text role). Arms the
   viewport/feature-tree context picker (AppState::contextPickActive).
 

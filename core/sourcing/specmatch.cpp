@@ -20,7 +20,7 @@
 
 namespace fs = std::filesystem;
 
-namespace aicad {
+namespace chudware {
 namespace sourcing {
 
 namespace {
@@ -573,4 +573,4 @@ json spec_sheet_match(const std::string& text_or_url, const std::string& mpn,
 }
 
 }  // namespace sourcing
-}  // namespace aicad
+}  // namespace chudware

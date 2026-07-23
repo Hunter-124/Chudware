@@ -7,7 +7,7 @@
   ],
   "notes": [
     "Canonical per-mode tool allowlists for the Agent|Plan|Swarm|Edit|Ask copilot modes. The .md is the prose contract (mode semantics); this file is the machine-readable data BOTH runtimes load at runtime.",
-    "Runtime resolution: C++ core/agent/copilot_modes.cpp honors AI_CAD_COPILOT_MODES_JSON (explicit file) then AI_CAD_CONTRACTS_DIR/<name> then the repo-relative contracts/copilot_modes.json (same CWD convention as core/agent/roles.cpp's agent/prompts fallback). Python services/agent/copilot_mode_tools.py honors AI_CAD_COPILOT_MODES_JSON then <repo>/contracts/copilot_modes.json via Path(__file__).parents[2].",
+    "Runtime resolution: C++ core/agent/copilot_modes.cpp honors CHUDWARE_COPILOT_MODES_JSON (explicit file) then CHUDWARE_CONTRACTS_DIR/<name> then the repo-relative contracts/copilot_modes.json (same CWD convention as core/agent/roles.cpp's agent/prompts fallback). Python services/agent/copilot_mode_tools.py honors CHUDWARE_COPILOT_MODES_JSON then <repo>/contracts/copilot_modes.json via Path(__file__).parents[2].",
     "mode_tools has no agent/swarm entry: those modes are unrestricted at the mode layer (unrestricted_modes) and a concrete list cannot express 'full catalog'.",
     "mutating_tools is the deny set applied to open-ended role cards in plan mode AND to ask mode; edit_denied is the extra deny set for edit mode; shared_default_tools is the floor UNIONed onto every restricted mode AFTER denylists (shared wins: new_part/close_part/import_part stay available in plan/ask/edit).",
     "Parity is enforced by core/tests/test_copilot_modes.cpp (doctest) and services/agent/test_copilot_modes_parity.py (pytest) over the same mode x tool verdict matrix."

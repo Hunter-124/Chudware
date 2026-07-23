@@ -35,7 +35,7 @@ _JPEG_MIN_QUALITY = 40
 
 
 def _preview_cache_dir(cache_dir: Optional[str]) -> Path:
-    d = Path(cache_dir) if cache_dir else Path(tempfile.gettempdir()) / "aicad_vision"
+    d = Path(cache_dir) if cache_dir else Path(tempfile.gettempdir()) / "chudware_vision"
     d.mkdir(parents=True, exist_ok=True)
     return d
 

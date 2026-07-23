@@ -269,7 +269,7 @@ def selftest() -> int:
 # ---- CLI -------------------------------------------------------------------------------------
 
 def main(argv) -> int:
-    ap = argparse.ArgumentParser(description="AI-CAD T-U1 panel style-conformance checker")
+    ap = argparse.ArgumentParser(description="Chudware T-U1 panel style-conformance checker")
     ap.add_argument("roots", nargs="*", default=None)
     ap.add_argument("--rule", default="all", choices=["all", "color", "ifdef", "viewmodel"])
     ap.add_argument("--report", default="text", choices=["text", "md"])

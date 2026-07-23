@@ -2,32 +2,32 @@
 # ===========================================================================
 #  update.sh — one-shot pull → rebuild → promote → redeploy for this host.
 # ---------------------------------------------------------------------------
-#  Keeps the desktop GUI + billet-web stack current with origin/master.
+#  Keeps the desktop GUI + chudware-web stack current with origin/master.
 #
 #  Usage:
 #    bash Webservice/deploy/update.sh              # pull + host GUI + engine + webd + gateway
 #    bash Webservice/deploy/update.sh --pull-only  # git pull only
 #    bash Webservice/deploy/update.sh --no-pull    # rebuild/redeploy current tree
-#    bash Webservice/deploy/update.sh --host-only  # desktop Billet binary only
+#    bash Webservice/deploy/update.sh --host-only  # desktop Chudware binary only
 #    bash Webservice/deploy/update.sh --web-only   # engine → install_webd + gateway
 #    bash Webservice/deploy/update.sh --image      # also rebuild session container
 #    bash Webservice/deploy/update.sh --wasm       # also rebuild wasm target
 #
 #  Env:
-#    BILLET_OMP_DIR / repo root detection (this script's ../../)
-#    BILLET_WEB_DATA   default ~/billet-web-data
-#    BILLET_UPDATE_REMOTE default origin
-#    BILLET_UPDATE_BRANCH default master
+#    CHUDWARE_OMP_DIR / repo root detection (this script's ../../)
+#    CHUDWARE_WEB_DATA   default ~/chudware-web-data
+#    CHUDWARE_UPDATE_REMOTE default origin
+#    CHUDWARE_UPDATE_BRANCH default master
 # ===========================================================================
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-REPO="${BILLET_OMP_DIR:-$REPO}"
+REPO="${CHUDWARE_OMP_DIR:-$REPO}"
 cd "$REPO"
 
-REMOTE="${BILLET_UPDATE_REMOTE:-origin}"
-BRANCH="${BILLET_UPDATE_BRANCH:-master}"
-LOGDIR="${BILLET_WEB_DATA:-$HOME/billet-web-data}/logs"
+REMOTE="${CHUDWARE_UPDATE_REMOTE:-origin}"
+BRANCH="${CHUDWARE_UPDATE_BRANCH:-master}"
+LOGDIR="${CHUDWARE_WEB_DATA:-$HOME/chudware-web-data}/logs"
 mkdir -p "$LOGDIR"
 LOGFILE="$LOGDIR/update.log"
 LOCK="$LOGDIR/deploy.lock"
@@ -80,7 +80,7 @@ _cleanup() {
 }
 trap _cleanup EXIT
 
-echo "=== billet update start $(date -Iseconds) repo=$REPO ==="
+echo "=== chudware update start $(date -Iseconds) repo=$REPO ==="
 echo "    pull=$DO_PULL host=$DO_HOST engine=$DO_ENGINE webd=$DO_WEBD gateway=$DO_GATEWAY image=$DO_IMAGE wasm=$DO_WASM"
 
 if [[ "$DO_PULL" = 1 ]]; then
@@ -130,7 +130,7 @@ if [[ "$DO_IMAGE" = 1 ]]; then
   echo
   echo "=== [$(date -Iseconds)] session image ==="
   Webservice/image/stage.sh
-  podman build -t localhost/billet-session:latest -f Webservice/image/Containerfile Webservice/image
+  podman build -t localhost/chudware-session:latest -f Webservice/image/Containerfile Webservice/image
 fi
 
 if [[ "$DO_WEBD" = 1 ]]; then
@@ -141,19 +141,19 @@ fi
 
 if [[ "$DO_GATEWAY" = 1 ]]; then
   echo
-  echo "=== [$(date -Iseconds)] restart billet-gateway ==="
-  if systemctl --user cat billet-gateway.service >/dev/null 2>&1; then
-    systemctl --user restart billet-gateway.service
-    systemctl --user is-active billet-gateway.service || true
+  echo "=== [$(date -Iseconds)] restart chudware-gateway ==="
+  if systemctl --user cat chudware-gateway.service >/dev/null 2>&1; then
+    systemctl --user restart chudware-gateway.service
+    systemctl --user is-active chudware-gateway.service || true
     curl -fsS --max-time 5 http://127.0.0.1:8300/healthz || true
     echo
   else
-    echo "    billet-gateway.service not installed — skip (run setup.sh once)"
+    echo "    chudware-gateway.service not installed — skip (run setup.sh once)"
   fi
 fi
 
 echo
-echo "=== billet update finished ok $(date -Iseconds) ==="
-echo "Desktop: host/build-linux/bin/Billet"
-echo "Shared:  ~/billet-web/billet-shared.sh  (AICAD_INSTANCE_KEY=billetweb)"
+echo "=== chudware update finished ok $(date -Iseconds) ==="
+echo "Desktop: host/build-linux/bin/Chudware"
+echo "Shared:  ~/chudware-web/chudware-shared.sh  (CHUDWARE_INSTANCE_KEY=chudwareweb)"
 exit 0

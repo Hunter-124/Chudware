@@ -11,7 +11,7 @@
 
 #include "cam/feeds.h"
 
-namespace aicad {
+namespace chudware {
 namespace cam {
 
 // ───────────────────────────────────────────────────── number formatting ──
@@ -599,4 +599,4 @@ SheetResult setup_sheet(const Job& job, const std::vector<std::vector<Toolpath>>
 }
 
 }  // namespace cam
-}  // namespace aicad
+}  // namespace chudware

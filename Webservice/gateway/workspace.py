@@ -7,7 +7,7 @@ SAME paths directly (doc_open/doc_save take server-side paths) — bytes only
 cross the wire for import/export.
 
 /files/aicm serves tessellation payloads the daemon publishes for its clients:
-either plain files (tmp aicad_cpp_docs / state dir / workspace) or POSIX shm
+either plain files (tmp chudware_cpp_docs / state dir / workspace) or POSIX shm
 objects (aicm-shm://name -> /dev/shm/<name>). Enforcement is server-side; the
 allowlist is the security boundary, the client clamp is only UX.
 """
@@ -30,12 +30,12 @@ try:
 except ImportError:  # uvicorn app:app from package dir
     from config import settings
 
-log = logging.getLogger("billet-web.workspace")
+log = logging.getLogger("chudware-web.workspace")
 
 router = APIRouter()
 
-# POSIX shm objects published by aicm_handoff (shm_object_name: "aicad_" + sanitized key).
-_SHM_NAME_RE = re.compile(r"^aicad_[A-Za-z0-9_.\-]{1,200}$")
+# POSIX shm objects published by aicm_handoff (shm_object_name: "chudware_" + sanitized key).
+_SHM_NAME_RE = re.compile(r"^chudware_[A-Za-z0-9_.\-]{1,200}$")
 # Revision-stable AICM keys end in _r<digits> (aicm_handoff::key_for). Immutable for a year.
 _AICM_REVID_RE = re.compile(r"_r\d+")
 
@@ -321,8 +321,8 @@ async def workspace_chat_put(request: Request) -> dict[str, Any]:
 
 def _aicm_allowlist() -> list[Path]:
     dirs = [
-        Path(tempfile.gettempdir()) / "aicad_cpp_docs",  # aicm_handoff publish_file
-        Path.home() / ".local" / "share" / "AI-CAD",     # hostd state dir (autosave etc.)
+        Path(tempfile.gettempdir()) / "chudware_cpp_docs",  # aicm_handoff publish_file
+        Path.home() / ".local" / "share" / "Chudware",     # hostd state dir (autosave etc.)
     ]
     try:
         dirs.append(_ws_root())

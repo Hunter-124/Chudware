@@ -19,7 +19,7 @@ Design (per advisor review 2026-07-04):
   * **Precheck-blocks-dispatch** is a deliberate deviation from the freedom rule
     (§9.3/§10): BC-lint blockers stop dispatch when the guard is config-enabled.
     This is documented here rather than in the contract so the contract stays frozen.
-    Gate: ``AI_CAD_SIM_PRECHECK_BLOCK`` env var, default ``"1"`` (enabled).
+    Gate: ``CHUDWARE_SIM_PRECHECK_BLOCK`` env var, default ``"1"`` (enabled).
 
 Anchor mock-prove note (citation honesty):
     The FEA solver does not run headlessly in CI.  The FEA-vs-beam-anchor divergence
@@ -567,7 +567,7 @@ def _mesh_suggestion(study: dict, doc_geom: Optional[dict] = None) -> Optional[s
 
 #: When True, BC-lint ``blocker`` items STOP dispatch before the solve.
 #: This is a deliberate deviation from the §9.3/§10 freedom rule — see module docstring.
-PRECHECK_BLOCK_ENABLED: bool = os.environ.get("AI_CAD_SIM_PRECHECK_BLOCK", "1") not in ("0", "false")
+PRECHECK_BLOCK_ENABLED: bool = os.environ.get("CHUDWARE_SIM_PRECHECK_BLOCK", "1") not in ("0", "false")
 
 
 def precheck(study: dict, doc_geom: Optional[dict] = None) -> list[dict]:
@@ -767,7 +767,7 @@ def _bc_fix(kind: str) -> dict:
 
 #: Maximum ratio of FEA stress to beam-anchor stress before emitting a divergence WARN.
 DIVERGENCE_WARN_RATIO: float = float(
-    os.environ.get("AI_CAD_SIM_DIVERGENCE_RATIO",
+    os.environ.get("CHUDWARE_SIM_DIVERGENCE_RATIO",
                    str(_load_policy().get("_doc", {}).get("divergence_warn_ratio", 5.0)))
 )
 

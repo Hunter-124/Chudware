@@ -22,7 +22,7 @@ python-pptx/docx/reportlab/OCP-class etc.), causing the 10 DEGRADED tool verdict
 
 ## Driver notes (foreman)
 
-- Provision in SMALL BATCHES into ~/.local/share/AI-CAD/mcp-venv (pip install from
+- Provision in SMALL BATCHES into ~/.local/share/Chudware/mcp-venv (pip install from
   requirements.txt pins), running the affected suite after each batch — never one
   big install you can't bisect. Watch RAM; flock any heavy builds.
 - After each batch: re-run scripts/mcp_runtime_audit.py — DEGRADED count should

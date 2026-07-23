@@ -165,7 +165,7 @@ bool initImGui() {
 }  // namespace
 
 int main(int /*argc*/, char** /*argv*/) {
-    std::fprintf(stderr, "[wasm] Billet WASM boot starting (PROXY_TO_PTHREAD main)\n");
+    std::fprintf(stderr, "[wasm] Chudware WASM boot starting (PROXY_TO_PTHREAD main)\n");
     setPageStatus("main() entered");
     if (!initGlfw()) return 1;
     if (!initImGui()) return 2;

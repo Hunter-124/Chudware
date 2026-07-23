@@ -117,7 +117,7 @@ TEST_CASE("thermal: 1D plane-wall Dirichlet reproduces the linear profile (tet4)
     std::vector<double> temps = uniform(m.x0.size(), T1);
     for (int nid : m.xL) { fixed.push_back(nid); temps.push_back(T2); }
 
-    auto r = aicad::sim::fea_thermal_solve(m.pts, m.tets, k, fixed, temps, /*flux_nodes*/ {},
+    auto r = chudware::sim::fea_thermal_solve(m.pts, m.tets, k, fixed, temps, /*flux_nodes*/ {},
                                            /*flux_q*/ 0.0, /*convections*/ {}, /*npe*/ 4);
     REQUIRE(r.ok);
     REQUIRE(r.temperature.size() == m.pts.size() / 3);
@@ -145,7 +145,7 @@ TEST_CASE("thermal: 1D plane-wall Dirichlet reproduces the linear profile (tet10
     std::vector<double> temps = uniform(m.x0.size(), T1);
     for (int nid : m.xL) { fixed.push_back(nid); temps.push_back(T2); }
 
-    auto r = aicad::sim::fea_thermal_solve(m.pts, m.tets, k, fixed, temps, {}, 0.0, {}, /*npe*/ 10);
+    auto r = chudware::sim::fea_thermal_solve(m.pts, m.tets, k, fixed, temps, {}, 0.0, {}, /*npe*/ 10);
     REQUIRE(r.ok);
     double max_abs_err = 0.0;
     for (size_t i = 0; i < r.temperature.size(); ++i) {
@@ -173,12 +173,12 @@ TEST_CASE("thermal: hot face + convection cold face matches series-resistance (t
     std::vector<int> fixed = m.x0;
     std::vector<double> temps = uniform(m.x0.size(), T_hot);
 
-    aicad::sim::ThermalConvection cv;
+    chudware::sim::ThermalConvection cv;
     cv.nodes = m.xL;
     cv.h = h;
     cv.t_amb = T_amb;
 
-    auto r = aicad::sim::fea_thermal_solve(m.pts, m.tets, k, fixed, temps, {}, 0.0, {cv}, /*npe*/ 4);
+    auto r = chudware::sim::fea_thermal_solve(m.pts, m.tets, k, fixed, temps, {}, 0.0, {cv}, /*npe*/ 4);
     REQUIRE(r.ok);
 
     const double R_cond = L / k;             // conduction resistance (per unit area)
@@ -206,11 +206,11 @@ TEST_CASE("thermal: hot face + convection cold face matches series-resistance (t
     Box10 m = to_tet10(b4);
     std::vector<int> fixed = m.x0;
     std::vector<double> temps = uniform(m.x0.size(), T_hot);
-    aicad::sim::ThermalConvection cv;
+    chudware::sim::ThermalConvection cv;
     cv.nodes = m.xL;
     cv.h = h;
     cv.t_amb = T_amb;
-    auto r = aicad::sim::fea_thermal_solve(m.pts, m.tets, k, fixed, temps, {}, 0.0, {cv}, /*npe*/ 10);
+    auto r = chudware::sim::fea_thermal_solve(m.pts, m.tets, k, fixed, temps, {}, 0.0, {cv}, /*npe*/ 10);
     REQUIRE(r.ok);
     const double q = (T_hot - T_amb) / (L / k + 1.0 / h);
     const double T_L_exact = T_amb + q / h;
@@ -233,7 +233,7 @@ TEST_CASE("thermal: applied flux + fixed cold face gives the conduction ΔT (tet
     std::vector<int> fixed = m.xL;
     std::vector<double> temps = uniform(m.xL.size(), T_cold);
 
-    auto r = aicad::sim::fea_thermal_solve(m.pts, m.tets, k, fixed, temps, /*flux_nodes*/ m.x0,
+    auto r = chudware::sim::fea_thermal_solve(m.pts, m.tets, k, fixed, temps, /*flux_nodes*/ m.x0,
                                            q_in, /*convections*/ {}, /*npe*/ 4);
     REQUIRE(r.ok);
     const double dT_exact = q_in * L / k;
@@ -249,7 +249,7 @@ TEST_CASE("thermal: applied flux + fixed cold face gives the conduction ΔT (tet
 TEST_CASE("thermal: pure-Neumann (no fixed-T, no convection) is reported singular") {
     Box m = box_mesh(20.0, 10.0, 10.0, 4, 1, 1);
     // Only a flux load — no temperature datum anywhere.
-    auto r = aicad::sim::fea_thermal_solve(m.pts, m.tets, 0.05, /*fixed*/ {}, /*temps*/ {},
+    auto r = chudware::sim::fea_thermal_solve(m.pts, m.tets, 0.05, /*fixed*/ {}, /*temps*/ {},
                                            /*flux_nodes*/ m.x0, /*flux_q*/ 0.01,
                                            /*convections*/ {}, /*npe*/ 4);
     CHECK_FALSE(r.ok);
@@ -272,12 +272,12 @@ TEST_CASE("thermal transient: 1D slab quench matches the Fourier series (tet4, l
     std::vector<double> temps = uniform(m.x0.size(), 0.0);
     for (int nid : m.xL) { fixed.push_back(nid); temps.push_back(0.0); }
 
-    aicad::sim::ThermalTransientOptions opts;
+    chudware::sim::ThermalTransientOptions opts;
     opts.rho_cp = rho_cp;
     opts.dt = t_star / 400.0;
     opts.t_end = t_star;
     opts.t_init = T0;
-    auto r = aicad::sim::fea_thermal_transient(m.pts, m.tets, k, fixed, temps, {}, {}, opts, 4);
+    auto r = chudware::sim::fea_thermal_transient(m.pts, m.tets, k, fixed, temps, {}, {}, opts, 4);
     REQUIRE(r.ok);
     REQUIRE(!r.frames.empty());
     CHECK(r.frames.back().time == doctest::Approx(t_star));
@@ -312,13 +312,13 @@ TEST_CASE("thermal transient: consistent capacitance agrees with lumped on the q
     std::vector<int> fixed = m.x0;
     std::vector<double> temps = uniform(m.x0.size(), 0.0);
     for (int nid : m.xL) { fixed.push_back(nid); temps.push_back(0.0); }
-    aicad::sim::ThermalTransientOptions opts;
+    chudware::sim::ThermalTransientOptions opts;
     opts.rho_cp = rho_cp;
     opts.dt = t_star / 400.0;
     opts.t_end = t_star;
     opts.t_init = T0;
     opts.lumped = false;
-    auto r = aicad::sim::fea_thermal_transient(m.pts, m.tets, k, fixed, temps, {}, {}, opts, 4);
+    auto r = chudware::sim::fea_thermal_transient(m.pts, m.tets, k, fixed, temps, {}, {}, opts, 4);
     REQUIRE(r.ok);
     double sumT = 0.0;
     int cnt = 0;
@@ -342,21 +342,21 @@ TEST_CASE("thermal transient: long-time limit matches the steady solve (tet10)")
     Box10 m = to_tet10(b4);
     std::vector<int> fixed = m.x0;
     std::vector<double> temps = uniform(m.x0.size(), T_hot);
-    aicad::sim::ThermalConvection cv;
+    chudware::sim::ThermalConvection cv;
     cv.nodes = m.xL;
     cv.h = h;
     cv.t_amb = T_amb;
 
-    auto steady = aicad::sim::fea_thermal_solve(m.pts, m.tets, k, fixed, temps, {}, 0.0, {cv}, 10);
+    auto steady = chudware::sim::fea_thermal_solve(m.pts, m.tets, k, fixed, temps, {}, 0.0, {cv}, 10);
     REQUIRE(steady.ok);
 
     const double tau = rho_cp * L * L / k;  // diffusion time scale
-    aicad::sim::ThermalTransientOptions opts;
+    chudware::sim::ThermalTransientOptions opts;
     opts.rho_cp = rho_cp;
     opts.t_end = 10.0 * tau;
     opts.dt = opts.t_end / 500.0;
     opts.t_init = T_amb;
-    auto r = aicad::sim::fea_thermal_transient(m.pts, m.tets, k, fixed, temps, {}, {cv}, opts, 10);
+    auto r = chudware::sim::fea_thermal_transient(m.pts, m.tets, k, fixed, temps, {}, {cv}, opts, 10);
     REQUIRE(r.ok);
     double max_dev = 0.0;
     for (size_t i = 0; i < r.frames.back().temperature.size(); ++i)
@@ -377,31 +377,31 @@ TEST_CASE("thermal transient: duty-cycle flux peaks above the mean-power steady 
     std::vector<double> temps = uniform(m.xL.size(), T_cold);
 
     // Steady reference at the AVERAGE power.
-    auto steady_avg = aicad::sim::fea_thermal_solve(m.pts, m.tets, k, fixed, temps, m.x0,
+    auto steady_avg = chudware::sim::fea_thermal_solve(m.pts, m.tets, k, fixed, temps, m.x0,
                                                     duty * q_in, {}, 4);
     REQUIRE(steady_avg.ok);
 
     const double tau = rho_cp * L * L / k;      // 180 s diffusion scale
     const double period = tau / 5.0;            // fast-ish cycling relative to diffusion
-    aicad::sim::ThermalFluxLoad fl;
+    chudware::sim::ThermalFluxLoad fl;
     fl.nodes = m.x0;
     fl.q = q_in;
     fl.schedule.times = {0.0, duty * period};
     fl.schedule.scales = {1.0, 0.0};
     fl.schedule.period = period;
 
-    aicad::sim::ThermalTransientOptions opts;
+    chudware::sim::ThermalTransientOptions opts;
     opts.rho_cp = rho_cp;
     opts.t_end = 12.0 * tau;                    // enough cycles to reach the periodic regime
     opts.dt = period / 40.0;
     opts.t_init = T_cold;
-    auto r = aicad::sim::fea_thermal_transient(m.pts, m.tets, k, fixed, temps, {fl}, {}, opts, 4);
+    auto r = chudware::sim::fea_thermal_transient(m.pts, m.tets, k, fixed, temps, {fl}, {}, opts, 4);
     REQUIRE(r.ok);
 
     MESSAGE("duty-cycle: steady_avg max=", steady_avg.max_temp, " envelope max=", r.max_temp);
     // The periodic peak exceeds the mean-power steady max, but stays below the 100%-on
     // steady max (q_in continuous) — the physically required bracket.
-    auto steady_full = aicad::sim::fea_thermal_solve(m.pts, m.tets, k, fixed, temps, m.x0,
+    auto steady_full = chudware::sim::fea_thermal_solve(m.pts, m.tets, k, fixed, temps, m.x0,
                                                      q_in, {}, 4);
     REQUIRE(steady_full.ok);
     CHECK(r.max_temp > steady_avg.max_temp);
@@ -413,18 +413,18 @@ TEST_CASE("thermal transient: duty-cycle flux peaks above the mean-power steady 
 
 // ── Case T5: schedule evaluation semantics (sample-and-hold + periodicity). ─────────────
 TEST_CASE("thermal transient: schedule scale is sample-and-hold and periodic") {
-    aicad::sim::ThermalSchedule s;
-    CHECK(aicad::sim::thermal_schedule_scale(s, 3.0) == 1.0);  // empty = always on
+    chudware::sim::ThermalSchedule s;
+    CHECK(chudware::sim::thermal_schedule_scale(s, 3.0) == 1.0);  // empty = always on
     s.times = {0.0, 2.0, 5.0};
     s.scales = {1.0, 0.25, 0.0};
-    CHECK(aicad::sim::thermal_schedule_scale(s, 0.0) == 1.0);
-    CHECK(aicad::sim::thermal_schedule_scale(s, 1.9) == 1.0);
-    CHECK(aicad::sim::thermal_schedule_scale(s, 2.0) == 0.25);
-    CHECK(aicad::sim::thermal_schedule_scale(s, 4.9) == 0.25);
-    CHECK(aicad::sim::thermal_schedule_scale(s, 7.0) == 0.0);   // last holds
+    CHECK(chudware::sim::thermal_schedule_scale(s, 0.0) == 1.0);
+    CHECK(chudware::sim::thermal_schedule_scale(s, 1.9) == 1.0);
+    CHECK(chudware::sim::thermal_schedule_scale(s, 2.0) == 0.25);
+    CHECK(chudware::sim::thermal_schedule_scale(s, 4.9) == 0.25);
+    CHECK(chudware::sim::thermal_schedule_scale(s, 7.0) == 0.0);   // last holds
     s.period = 10.0;
-    CHECK(aicad::sim::thermal_schedule_scale(s, 11.0) == 1.0);  // wraps
-    CHECK(aicad::sim::thermal_schedule_scale(s, 12.5) == 0.25);
+    CHECK(chudware::sim::thermal_schedule_scale(s, 11.0) == 1.0);  // wraps
+    CHECK(chudware::sim::thermal_schedule_scale(s, 12.5) == 0.25);
 }
 
 // ── Case T6: transient validation + frame selection. ────────────────────────────────────
@@ -432,20 +432,20 @@ TEST_CASE("thermal transient: invalid inputs rejected; frames land at requested 
     Box m = box_mesh(20.0, 10.0, 10.0, 4, 1, 1);
     std::vector<int> fixed = m.x0;
     std::vector<double> temps = uniform(m.x0.size(), 0.0);
-    aicad::sim::ThermalTransientOptions opts;
+    chudware::sim::ThermalTransientOptions opts;
     opts.rho_cp = 0.0;  // invalid
     opts.dt = 0.1;
     opts.t_end = 1.0;
-    auto r1 = aicad::sim::fea_thermal_transient(m.pts, m.tets, 0.05, fixed, temps, {}, {}, opts, 4);
+    auto r1 = chudware::sim::fea_thermal_transient(m.pts, m.tets, 0.05, fixed, temps, {}, {}, opts, 4);
     CHECK_FALSE(r1.ok);
     opts.rho_cp = 0.004;
     opts.dt = -1.0;  // invalid
-    auto r2 = aicad::sim::fea_thermal_transient(m.pts, m.tets, 0.05, fixed, temps, {}, {}, opts, 4);
+    auto r2 = chudware::sim::fea_thermal_transient(m.pts, m.tets, 0.05, fixed, temps, {}, {}, opts, 4);
     CHECK_FALSE(r2.ok);
     opts.dt = 0.1;
     opts.t_init = 50.0;
     opts.frame_times = {0.0, 0.35, 0.75};
-    auto r3 = aicad::sim::fea_thermal_transient(m.pts, m.tets, 0.05, fixed, temps, {}, {}, opts, 4);
+    auto r3 = chudware::sim::fea_thermal_transient(m.pts, m.tets, 0.05, fixed, temps, {}, {}, opts, 4);
     REQUIRE(r3.ok);
     REQUIRE(r3.frames.size() == 4);  // t=0, snap(0.35)->0.4, snap(0.75)->0.8, final 1.0
     CHECK(r3.frames[0].time == doctest::Approx(0.0));
@@ -453,10 +453,10 @@ TEST_CASE("thermal transient: invalid inputs rejected; frames land at requested 
     CHECK(r3.frames[2].time == doctest::Approx(0.8));
     CHECK(r3.frames[3].time == doctest::Approx(1.0));
     // A pure-Neumann transient (no datum) is well-posed: uniform heating, no error.
-    aicad::sim::ThermalFluxLoad fl;
+    chudware::sim::ThermalFluxLoad fl;
     fl.nodes = m.x0;
     fl.q = 0.001;
-    auto r4 = aicad::sim::fea_thermal_transient(m.pts, m.tets, 0.05, {}, {}, {fl}, {}, opts, 4);
+    auto r4 = chudware::sim::fea_thermal_transient(m.pts, m.tets, 0.05, {}, {}, {fl}, {}, opts, 4);
     CHECK(r4.ok);
     CHECK(r4.max_temp > 50.0);  // adiabatic body warms above the initial field
 }
@@ -465,11 +465,11 @@ TEST_CASE("thermal transient: invalid inputs rejected; frames land at requested 
 TEST_CASE("thermal: invalid inputs are rejected with ok=false") {
     Box m = box_mesh(20.0, 10.0, 10.0, 2, 1, 1);
     // k <= 0
-    auto r1 = aicad::sim::fea_thermal_solve(m.pts, m.tets, 0.0, m.x0, uniform(m.x0.size(), 10.0),
+    auto r1 = chudware::sim::fea_thermal_solve(m.pts, m.tets, 0.0, m.x0, uniform(m.x0.size(), 10.0),
                                             {}, 0.0, {}, 4);
     CHECK_FALSE(r1.ok);
     // fixed_nodes / fixed_temps length mismatch
-    auto r2 = aicad::sim::fea_thermal_solve(m.pts, m.tets, 0.05, m.x0, uniform(m.x0.size() + 1, 10.0),
+    auto r2 = chudware::sim::fea_thermal_solve(m.pts, m.tets, 0.05, m.x0, uniform(m.x0.size() + 1, 10.0),
                                             {}, 0.0, {}, 4);
     CHECK_FALSE(r2.ok);
 }
@@ -483,10 +483,10 @@ TEST_CASE("thermal: two flux loads superpose (same face, different magnitudes)")
     // Exact linear field: T(L) = T0 + (q1+q2)·L/k. The old collapse gave q2 only.
     const double L = 50.0, T0 = 20.0, k = 0.05, q1 = 0.002, q2 = 0.0007;
     Box m = box_mesh(L, 10.0, 10.0, 8, 2, 2);
-    aicad::sim::ThermalFluxLoad f1, f2;
+    chudware::sim::ThermalFluxLoad f1, f2;
     f1.nodes = m.xL; f1.q = q1;
     f2.nodes = m.xL; f2.q = q2;
-    auto r = aicad::sim::fea_thermal_solve(m.pts, m.tets, k, m.x0, uniform(m.x0.size(), T0),
+    auto r = chudware::sim::fea_thermal_solve(m.pts, m.tets, k, m.x0, uniform(m.x0.size(), T0),
                                            {f1, f2}, {}, 4);
     REQUIRE(r.ok);
     const double exactL = T0 + (q1 + q2) * L / k;
@@ -505,13 +505,13 @@ TEST_CASE("thermal: flux loads on different faces satisfy node-wise superpositio
     for (size_t n = 0; n < m.pts.size() / 3; ++n)
         if (std::abs(m.pts[n * 3 + 1]) < 1e-9) y0.push_back(static_cast<int>(n));
     REQUIRE(!y0.empty());
-    aicad::sim::ThermalFluxLoad f1, f2;
+    chudware::sim::ThermalFluxLoad f1, f2;
     f1.nodes = m.xL; f1.q = q1;
     f2.nodes = y0;   f2.q = q2;
     const std::vector<double> temps = uniform(m.x0.size(), T0);
-    auto rA  = aicad::sim::fea_thermal_solve(m.pts, m.tets, k, m.x0, temps, {f1}, {}, 4);
-    auto rB  = aicad::sim::fea_thermal_solve(m.pts, m.tets, k, m.x0, temps, {f2}, {}, 4);
-    auto rAB = aicad::sim::fea_thermal_solve(m.pts, m.tets, k, m.x0, temps, {f1, f2}, {}, 4);
+    auto rA  = chudware::sim::fea_thermal_solve(m.pts, m.tets, k, m.x0, temps, {f1}, {}, 4);
+    auto rB  = chudware::sim::fea_thermal_solve(m.pts, m.tets, k, m.x0, temps, {f2}, {}, 4);
+    auto rAB = chudware::sim::fea_thermal_solve(m.pts, m.tets, k, m.x0, temps, {f1, f2}, {}, 4);
     REQUIRE(rA.ok); REQUIRE(rB.ok); REQUIRE(rAB.ok);
     double max_err = 0.0;
     for (size_t i = 0; i < rAB.temperature.size(); ++i) {
@@ -526,11 +526,11 @@ TEST_CASE("thermal: flux loads on different faces satisfy node-wise superpositio
 TEST_CASE("thermal: legacy single-flux entry point delegates identically") {
     const double L = 40.0, T0 = 10.0, k = 0.05, q = 0.001;
     Box m = box_mesh(L, 10.0, 10.0, 6, 2, 2);
-    auto legacy = aicad::sim::fea_thermal_solve(m.pts, m.tets, k, m.x0,
+    auto legacy = chudware::sim::fea_thermal_solve(m.pts, m.tets, k, m.x0,
                                                 uniform(m.x0.size(), T0), m.xL, q, {}, 4);
-    aicad::sim::ThermalFluxLoad fl;
+    chudware::sim::ThermalFluxLoad fl;
     fl.nodes = m.xL; fl.q = q;
-    auto perload = aicad::sim::fea_thermal_solve(m.pts, m.tets, k, m.x0,
+    auto perload = chudware::sim::fea_thermal_solve(m.pts, m.tets, k, m.x0,
                                                  uniform(m.x0.size(), T0), {fl}, {}, 4);
     REQUIRE(legacy.ok); REQUIRE(perload.ok);
     REQUIRE(legacy.temperature.size() == perload.temperature.size());

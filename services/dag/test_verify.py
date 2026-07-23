@@ -2,7 +2,7 @@
 
 Runs without the C++ engine (mock tool_fn_override).
 One integration-smoke test with the real engine is included and skipped
-when AI_CAD_LIBAICAD is absent.
+when CHUDWARE_LIBCHUDWARE is absent.
 
 DoD coverage:
   - verify.run() dispatches all five check types (mock)
@@ -158,7 +158,7 @@ def test_backend_unavailable_escalates():
     pack = _pack(node, retry_remaining=3)
 
     def _raise(**_):
-        raise ImportError("libaicad not loaded")
+        raise ImportError("libchudware not loaded")
 
     verdict, out = verify_run(node, pack, tool_fn_override=_raise)
     assert verdict == VERDICT_ESCALATE
@@ -286,14 +286,14 @@ def test_events_emitted_on_fail():
 
 
 # ---------------------------------------------------------------------------
-# Integration smoke — real check_interference via libaicad.so
+# Integration smoke — real check_interference via libchudware.so
 # ---------------------------------------------------------------------------
 
-_LIBAICAD = os.environ.get("AI_CAD_LIBAICAD", "")
-_HAVE_ENGINE = bool(_LIBAICAD and os.path.exists(_LIBAICAD))
+_LIBCHUDWARE = os.environ.get("CHUDWARE_LIBCHUDWARE", "")
+_HAVE_ENGINE = bool(_LIBCHUDWARE and os.path.exists(_LIBCHUDWARE))
 
 
-@pytest.mark.skipif(not _HAVE_ENGINE, reason="AI_CAD_LIBAICAD not set or file absent")
+@pytest.mark.skipif(not _HAVE_ENGINE, reason="CHUDWARE_LIBCHUDWARE not set or file absent")
 def test_real_interference_no_clash():
     """Integration: a single-body part trivially passes interference check (no pairs)."""
     # We need at least one open doc; create a minimal one via core_bridge.

@@ -383,7 +383,7 @@ class EmbedManager:
     def _import_async_playwright(self) -> Callable[[], Any]:
         if self._async_playwright_factory is not None:
             return self._async_playwright_factory
-        # Residual async factory via :mod:`.driver` (BILLET_PW_BACKEND).
+        # Residual async factory via :mod:`.driver` (CHUDWARE_PW_BACKEND).
         from . import driver as _driver
         return _driver.resolve_async()
 

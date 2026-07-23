@@ -15,7 +15,7 @@
 #include "piping/fluid_properties.h"
 #include "piping/pyutil.h"
 
-namespace aicad::piping {
+namespace chudware::piping {
 
 using pyutil::ojson;
 
@@ -58,4 +58,4 @@ ojson operating_point(const ojson& pump_curve, const ojson& system = nullptr,
                       const ojson& npshr_curve = nullptr, const ojson& suction = nullptr,
                       double speed_ratio = 1.0);
 
-}  // namespace aicad::piping
+}  // namespace chudware::piping

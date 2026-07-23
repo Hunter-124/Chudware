@@ -12,7 +12,7 @@
 #include <utility>
 #include <vector>
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 
 // Thread-local cooperative-cancel for in-flight HTTP. complete()/run_design set this
@@ -61,4 +61,4 @@ HttpResponse http_post_stream(const std::string& url,
                               int idle_timeout_ms = 120000);
 
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware

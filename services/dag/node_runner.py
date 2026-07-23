@@ -39,8 +39,8 @@ from typing import Any, Callable, Optional
 # Advisory engine / foreman (T-W5, Pillar 20): after a node step, the foreman runs
 # the stage battery over the node's doc (if it carries one) and the advisory block
 # is attached to output_state["advisory"] for injection into the next node's
-# context pack.  Gated by AI_CAD_ADVISOR (default on); best-effort.
-_ADVISOR_ENABLED = os.environ.get("AI_CAD_ADVISOR", "1") not in ("0", "false", "False")
+# context pack.  Gated by CHUDWARE_ADVISOR (default on); best-effort.
+_ADVISOR_ENABLED = os.environ.get("CHUDWARE_ADVISOR", "1") not in ("0", "false", "False")
 
 # node_type → advisory stage (the stage whose battery the foreman runs post-step).
 _NODE_TYPE_STAGE: dict[str, str] = {
@@ -114,7 +114,7 @@ def make_default_agent_fn(ledger=None,
     the mission should run on (e.g. a gym cell's bundled local-tier model), but
     previously only used it for INTAKE — every internal DAG node independently
     called the bare ``config.get_provider()`` here and silently fell through to
-    the ambient config.json / ``AI_CAD_PROVIDER`` default (typically a cloud
+    the ambient config.json / ``CHUDWARE_PROVIDER`` default (typically a cloud
     provider), regardless of the tier the mission was started with.
     ``loop.run_mission`` now passes its own *provider* through to this
     constructor so internal nodes stay on it. Callers that build a graph
@@ -469,7 +469,7 @@ def _default_agent_fn(request: str, context_pack: dict[str, Any], *,
 
     Resolves the provider via ``_resolve_provider`` (an injected provider, else a
     node/graph-recorded tier via ``tiers.provider_for_tier``, else the ambient
-    ``config.get_provider`` seam — honours ``AI_CAD_PROVIDER`` / routing.yaml /
+    ``config.get_provider`` seam — honours ``CHUDWARE_PROVIDER`` / routing.yaml /
     the local llama.cpp default), then runs a bounded tool-calling turn
     (``agent_turn.run_turn``): the model proposes MCP tool calls, they are
     dispatched against the live engine, results are fed back, and a structured
@@ -529,7 +529,7 @@ def _default_agent_fn(request: str, context_pack: dict[str, Any], *,
     # turn length for a time-boxed real run), else the agent_turn default.
     max_tools = context_pack.get("max_tools_per_turn")
     if max_tools is None:
-        env_cap = os.environ.get("AI_CAD_AGENT_MAX_TOOL_CALLS")
+        env_cap = os.environ.get("CHUDWARE_AGENT_MAX_TOOL_CALLS")
         if env_cap:
             try:
                 max_tools = int(env_cap)
@@ -636,7 +636,7 @@ def _maybe_run_cheap_leaf_oneshot(
             return None
 
     # Force-disable via env for tests / emergency.
-    if os.environ.get("AI_CAD_LEAF_ONESHOT", "1") in ("0", "false", "False"):
+    if os.environ.get("CHUDWARE_LEAF_ONESHOT", "1") in ("0", "false", "False"):
         return None
 
     system = (
@@ -815,7 +815,7 @@ class _LeafOneshotResult:
 
 
 def _tier_profile():
-    """The ACTIVE tier's profile from ``AI_CAD_TIER`` (T-W28 seam), or None.
+    """The ACTIVE tier's profile from ``CHUDWARE_TIER`` (T-W28 seam), or None.
 
     Same manual-override knob the effort resolution path honours.  None when no
     tier is set or the tiers layer is unavailable — best-effort, never blocks

@@ -12,7 +12,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad::structural {
+namespace chudware::structural {
 
 extern const char* kCheckDisclaimer;  // byte-exact DISCLAIMER
 
@@ -41,4 +41,4 @@ double dc_ratio_bending_wood(double moment_nmm, double sx_mm3, double fb_mpa);
 CheckResult check_member(const nlohmann::json& member_result, const nlohmann::json& section,
                          const std::string& material);
 
-}  // namespace aicad::structural
+}  // namespace chudware::structural

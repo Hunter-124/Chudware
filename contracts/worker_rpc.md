@@ -493,6 +493,6 @@ Daemon clients may declare seat identity on the first `hello` handshake:
 {"code":"undo_denied","message":"agents use doc_checkpoint/doc_revert or PLM rollback"}
 ```
 
-unless env `AICAD_UNDO_AGENTS=1` is set (kill-switch restoring free undo for agents). Agents keep
+unless env `CHUDWARE_UNDO_AGENTS=1` is set (kill-switch restoring free undo for agents). Agents keep
 `doc_checkpoint` / `doc_revert` and PLM rollback for intentional rollback.
 

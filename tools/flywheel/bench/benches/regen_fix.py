@@ -202,7 +202,7 @@ def _core_err(e) -> str:
 def _make_live_verifier():
     """Return (opener, compare_fn) bound to the C++ core, or (None, None) when it can't be
     located/loaded — never a hardcoded path (resolution is core_bridge's, via
-    $AI_CAD_LIBAICAD / $AI_CAD_DIST / build dirs). Mirrors spec_sketch._make_doc_id_opener.
+    $CHUDWARE_LIBCHUDWARE / $CHUDWARE_DIST / build dirs). Mirrors spec_sketch._make_doc_id_opener.
 
         opener(document) -> {"doc_id": str|None, "rebuilt": bool, "error": str|None}
         compare_fn(a, b) -> match_pct float|None   (100 == identical; None == degraded)

@@ -354,8 +354,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = ap.parse_args(argv)
 
     if not cb.available():
-        print("FATAL: libaicad could not be located/loaded — build core first "
-              "(and restage services/dist/AI-CAD after rebuilds).", file=sys.stderr)
+        print("FATAL: libchudware could not be located/loaded — build core first "
+              "(and restage services/dist/Chudware after rebuilds).", file=sys.stderr)
         return 1
 
     dataset_root = Path(args.dataset)

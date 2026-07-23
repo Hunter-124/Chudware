@@ -38,13 +38,13 @@ std::string appdataDir() {
 
 std::string appdataRoot() {
     // T-G10 alias rule (mirrors engine/paths.py active_root()): a machine with an
-    // existing legacy AI-CAD dir (and no ShopCraft dir yet) keeps using it wholesale —
+    // existing legacy Chudware dir (and no Chudware dir yet) keeps using it wholesale —
     // it may hold the live runtime venv/config, and venvs do not survive relocation.
-    // Fresh installs get ShopCraft. No destructive migration.
+    // Fresh installs get Chudware. No destructive migration.
     static const std::string cached = [] {
         const std::string base = appdataDir();
-        const std::string neu = joinPath(base, "ShopCraft");
-        const std::string legacy = joinPath(base, "AI-CAD");
+        const std::string neu = joinPath(base, "Chudware");
+        const std::string legacy = joinPath(base, "Chudware");
         std::error_code ec;
         if (!std::filesystem::exists(neu, ec) && std::filesystem::exists(legacy, ec))
             return legacy;
@@ -91,6 +91,6 @@ std::string joinPath(const std::string& a, const std::string& b) {
     return a + "/" + b;
 }
 
-std::string appdataDisplayLabel() { return "%APPDATA%\\ShopCraft (legacy AI-CAD dir honored)"; }
+std::string appdataDisplayLabel() { return "%APPDATA%\\Chudware (legacy Chudware dir honored)"; }
 
 }  // namespace platform

@@ -8,7 +8,7 @@
 
 #include "cam/model.h"
 
-namespace aicad {
+namespace chudware {
 namespace cam {
 
 // Incrementally assembles a Toolpath, tracking the current XYZ so callers append in
@@ -61,4 +61,4 @@ std::vector<double> depth_levels(double top, double bottom, double stepdown,
                                  double stock_to_leave_axial);
 
 }  // namespace cam
-}  // namespace aicad
+}  // namespace chudware

@@ -9,7 +9,7 @@ Test strategy (offline-ML-track discipline, no all-skip):
     * Verify port allocation uses a free port when auto_port=True.
     * Verify dummy-GGUF checksum path via model_manager fixtures.
 
-  live mode (requires AI_CAD_LOCAL_ENDPOINT env var):
+  live mode (requires CHUDWARE_LOCAL_ENDPOINT env var):
     * Actually query a running llama-server's /props.
     * Verify tier detection from real n_ctx.
     Skipped in CI (env var absent).
@@ -457,15 +457,15 @@ class TestCudaVariantSelection(unittest.TestCase):
     def test_cuda_available_env_override(self) -> None:
         from installer import llamacpp
 
-        with patch.dict(os.environ, {"AICAD_LLAMA_VARIANT": "cuda"}):
+        with patch.dict(os.environ, {"CHUDWARE_LLAMA_VARIANT": "cuda"}):
             assert llamacpp.cuda_available() is True
-        with patch.dict(os.environ, {"AICAD_LLAMA_VARIANT": "cpu"}):
+        with patch.dict(os.environ, {"CHUDWARE_LLAMA_VARIANT": "cpu"}):
             assert llamacpp.cuda_available() is False
 
     def test_cuda_available_no_tool_is_false(self) -> None:
         from installer import llamacpp
 
-        with patch.dict(os.environ, {"AICAD_LLAMA_VARIANT": ""}), \
+        with patch.dict(os.environ, {"CHUDWARE_LLAMA_VARIANT": ""}), \
              patch("installer.llamacpp.subprocess.run",
                    side_effect=FileNotFoundError("nvidia-smi")):
             assert llamacpp.cuda_available() is False
@@ -588,23 +588,23 @@ class TestRuntimeInfo(unittest.TestCase):
 
 
 @pytest.mark.skipif(
-    not os.environ.get("AI_CAD_LOCAL_ENDPOINT"),
-    reason="Live mode: set AI_CAD_LOCAL_ENDPOINT to a running llama-server base URL",
+    not os.environ.get("CHUDWARE_LOCAL_ENDPOINT"),
+    reason="Live mode: set CHUDWARE_LOCAL_ENDPOINT to a running llama-server base URL",
 )
 class TestLiveSmoke(unittest.TestCase):
-    """Live smoke test — runs only when AI_CAD_LOCAL_ENDPOINT is set.
+    """Live smoke test — runs only when CHUDWARE_LOCAL_ENDPOINT is set.
 
     Recipe to run manually:
         # Start a llama-server first, e.g.:
         #   llama-server --model Qwen3-4B-Q4_K_M.gguf --port 8765
-        export AI_CAD_LOCAL_ENDPOINT=http://localhost:8765/v1
+        export CHUDWARE_LOCAL_ENDPOINT=http://localhost:8765/v1
         pytest services/agent/test_local_runtime.py::TestLiveSmoke -v
     """
 
     def test_props_returns_n_ctx(self) -> None:
         from services.agent.local_runtime import get_served_n_ctx
 
-        endpoint = os.environ["AI_CAD_LOCAL_ENDPOINT"]
+        endpoint = os.environ["CHUDWARE_LOCAL_ENDPOINT"]
         n_ctx = get_served_n_ctx(endpoint, timeout=5.0)
         assert n_ctx is not None, f"Could not read n_ctx from {endpoint}/props"
         assert isinstance(n_ctx, int)
@@ -615,7 +615,7 @@ class TestLiveSmoke(unittest.TestCase):
         from services.agent.local_runtime import get_served_n_ctx
         from services.agent.tiers import detect_tier
 
-        endpoint = os.environ["AI_CAD_LOCAL_ENDPOINT"]
+        endpoint = os.environ["CHUDWARE_LOCAL_ENDPOINT"]
         n_ctx = get_served_n_ctx(endpoint, timeout=5.0)
         if n_ctx is None:
             pytest.skip("Could not read n_ctx from live server")
@@ -634,23 +634,23 @@ class TestBackendSeam(unittest.TestCase):
     def test_select_backend_default_llamacpp(self) -> None:
         from services.agent.local_runtime import select_backend
         with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("AICAD_LOCAL_BACKEND", None)
+            os.environ.pop("CHUDWARE_LOCAL_BACKEND", None)
             assert select_backend() == "llamacpp"
 
     def test_select_backend_env_override(self) -> None:
         from services.agent.local_runtime import select_backend
-        with patch.dict(os.environ, {"AICAD_LOCAL_BACKEND": "transformers"}):
+        with patch.dict(os.environ, {"CHUDWARE_LOCAL_BACKEND": "transformers"}):
             assert select_backend() == "transformers"
 
     def test_select_backend_cfg(self) -> None:
         from services.agent.local_runtime import select_backend
         with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("AICAD_LOCAL_BACKEND", None)
+            os.environ.pop("CHUDWARE_LOCAL_BACKEND", None)
             assert select_backend({"local_backend": "transformers"}) == "transformers"
 
     def test_select_backend_rejects_unknown(self) -> None:
         from services.agent.local_runtime import LocalRuntimeError, select_backend
-        with patch.dict(os.environ, {"AICAD_LOCAL_BACKEND": "bogus"}):
+        with patch.dict(os.environ, {"CHUDWARE_LOCAL_BACKEND": "bogus"}):
             with pytest.raises(LocalRuntimeError, match="unknown local backend"):
                 select_backend()
 

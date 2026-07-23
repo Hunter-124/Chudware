@@ -9,7 +9,7 @@ rho*cp capacitance, implicit backward Euler at a fixed step:
     (K + C/dt) T^{n+1} = (C/dt) T^n + f(t^{n+1})
 
 Same unit convention as the kernel: everything in the mesh length unit L (mm in
-AI-CAD) — k in W/(L*K), q in W/L^2, h in W/(L^2*K), rho_cp VOLUMETRIC in J/(L^3*K).
+Chudware) — k in W/(L*K), q in W/L^2, h in W/(L^2*K), rho_cp VOLUMETRIC in J/(L^3*K).
 Dense numpy linear algebra (oracle meshes are small); the iteration matrix is
 factored once (numpy.linalg LU via scipy-free ``lu_factor`` equivalent: we simply
 pre-invert — acceptable at oracle scale) and reused across steps, mirroring the

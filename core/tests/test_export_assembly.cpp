@@ -29,23 +29,23 @@ namespace fs = std::filesystem;
 
 namespace {
 fs::path tmp(const std::string& name) {
-    return fs::temp_directory_path() / ("aicad_asmexp_" + name);
+    return fs::temp_directory_path() / ("chudware_asmexp_" + name);
 }
 
 // Build a two-component assembly: box A at the origin, box B offset along +X so the two
 // solids stay disjoint (no mates -> floating components rest at their source frame).
 std::string make_two_part_assembly(const fs::path& a_step, const fs::path& b_step) {
-    aicad::doc::export_bodies({BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 10.0, 10.0, 10.0).Shape()},
+    chudware::doc::export_bodies({BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 10.0, 10.0, 10.0).Shape()},
                               a_step.string(), "step");
-    aicad::doc::export_bodies({BRepPrimAPI_MakeBox(gp_Pnt(50, 0, 0), 10.0, 10.0, 10.0).Shape()},
+    chudware::doc::export_bodies({BRepPrimAPI_MakeBox(gp_Pnt(50, 0, 0), 10.0, 10.0, 10.0).Shape()},
                               b_step.string(), "step");
-    json nresp = aicad::doc::doc_new("assembly", "asm_export_test");
+    json nresp = chudware::doc::doc_new("assembly", "asm_export_test");
     const std::string did = nresp.at("doc_id").get<std::string>();
     json ops = json::array({
         {{"op", "asm_insert_component"}, {"source", {{"path", a_step.string()}}}},
         {{"op", "asm_insert_component"}, {"source", {{"path", b_step.string()}}}},
     });
-    aicad::doc::doc_apply_ops(did, -1, ops, false);
+    chudware::doc::doc_apply_ops(did, -1, ops, false);
     return did;
 }
 }  // namespace
@@ -55,7 +55,7 @@ TEST_CASE("assembly exports to STEP with all component solids (was: empty)") {
     fs::path a = tmp("a.step"), b = tmp("b.step"), out = tmp("asm_out.step");
     const std::string did = make_two_part_assembly(a, b);
 
-    json r = aicad::doc::doc_export_file(did, out.string(), "step", 0.0, 0.0, false, false);
+    json r = chudware::doc::doc_export_file(did, out.string(), "step", 0.0, 0.0, false, false);
     CHECK(fs::exists(out));
     CHECK(r.value("validated", false));                 // round-trip re-read passed
     CHECK(r.value("expected_solids", 0) == 2);          // both components handed to the writer
@@ -70,7 +70,7 @@ TEST_CASE("assembly exports via doc_export_step (was: no bodies to export)") {
     fs::path a = tmp("c.step"), b = tmp("d.step"), out = tmp("asm_step.step");
     const std::string did = make_two_part_assembly(a, b);
 
-    json r = aicad::doc::doc_export_step(did, out.string());
+    json r = chudware::doc::doc_export_step(did, out.string());
     CHECK(fs::exists(out));
     CHECK(fs::file_size(out) > 0);
     CHECK(r.contains("path"));
@@ -83,11 +83,11 @@ TEST_CASE("assembly exports to STL and estimates a non-empty mesh") {
     fs::path a = tmp("e.step"), b = tmp("f.step"), out = tmp("asm_out.stl");
     const std::string did = make_two_part_assembly(a, b);
 
-    json r = aicad::doc::doc_export_file(did, out.string(), "stl", 0.0, 0.0, false, false);
+    json r = chudware::doc::doc_export_file(did, out.string(), "stl", 0.0, 0.0, false, false);
     CHECK(fs::exists(out));
     CHECK(r.value("bytes", 0.0) > 0.0);
 
-    json est = aicad::doc::doc_export_estimate(did, 0.05, 0.35, false);
+    json est = chudware::doc::doc_export_estimate(did, 0.05, 0.35, false);
     CHECK(est.value("bodies", 0) == 2);                 // both components tessellated
     CHECK(est.value("triangles", 0) > 0);
 

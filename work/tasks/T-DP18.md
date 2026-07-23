@@ -20,7 +20,7 @@ machinery (workspace_bar.cpp, doc-tabs, the ECAD full-viewport takeover pattern,
 copilot overlay column, agent_panel, watch_grid), aicad.mission event streams,
 aicad.delegation/1 tree, aicad.buildgraph/1. ui/imgui is the ONLY live GUI (host/ reference-
 only). Design language LOCKED: pinned glass columns, no docked layout, dark-mode contrast per
-the T-U1 kit, ui_style_check clean. Verify HEADLESS only (xvfb-run AI_CAD_SHOT=...), never
+the T-U1 kit, ui_style_check clean. Verify HEADLESS only (xvfb-run CHUDWARE_SHOT=...), never
 launch headed; EYEBALL every shot PNG. Numbers cite real output.
 
 ## Scope

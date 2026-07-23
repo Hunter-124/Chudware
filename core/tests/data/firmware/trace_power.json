@@ -9,13 +9,13 @@
     {
       "seq": 1,
       "t_ms": 100.0,
-      "text": "AICAD_CPU_EVT sleep t=100ms",
+      "text": "CHUDWARE_CPU_EVT sleep t=100ms",
       "type": "uart"
     },
     {
       "seq": 2,
       "t_ms": 300.0,
-      "text": "AICAD_CPU_EVT run t=300ms",
+      "text": "CHUDWARE_CPU_EVT run t=300ms",
       "type": "uart"
     },
     {

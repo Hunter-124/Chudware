@@ -3,7 +3,7 @@
 // Everything is built from the modeler's own op vocabulary so the result is an
 // editable feature tree: primitives (cylinder/cone) combined by the running-body
 // model (mode "boss" fuses, "cut" bores), and a sketch+extrude for hex prisms.
-// No OCCT here — we only emit JSON; aicad::doc compiles the geometry.
+// No OCCT here — we only emit JSON; chudware::doc compiles the geometry.
 #include "parts/parts.h"
 #include "parts/parts_data.h"
 
@@ -13,7 +13,7 @@
 #include <cctype>
 
 
-namespace aicad {
+namespace chudware {
 namespace parts {
 
 namespace {
@@ -316,4 +316,4 @@ PartBuild build(const std::string& family, const std::string& size_in,
 }
 
 }  // namespace parts
-}  // namespace aicad
+}  // namespace chudware

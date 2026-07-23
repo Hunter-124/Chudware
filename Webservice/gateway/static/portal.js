@@ -1,9 +1,9 @@
-/* billet-web portal — vanilla session card + shoutbox client */
+/* chudware-web portal — vanilla session card + shoutbox client */
 (function () {
   "use strict";
 
-  var LS_CHAT = "billet.portal.chatOpen";
-  var LS_UNREAD = "billet.portal.unread";
+  var LS_CHAT = "chudware.portal.chatOpen";
+  var LS_UNREAD = "chudware.portal.unread";
 
   var state = {
     user: { email: "", display: "" },

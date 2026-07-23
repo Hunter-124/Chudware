@@ -11,7 +11,7 @@
 
 #include "piping/pyutil.h"
 
-namespace aicad::piping {
+namespace chudware::piping {
 
 using pyutil::ojson;
 
@@ -35,4 +35,4 @@ ojson fluid_properties(const ojson& name, double T = 293.15, double P = P_ATM,
 // unchanged by the solver.
 ojson resolve_solver_fluid(const ojson& fluid);
 
-}  // namespace aicad::piping
+}  // namespace chudware::piping

@@ -22,8 +22,8 @@ using doctest::Approx;
 namespace {
 
 std::string make_box_doc() {
-    using aicad::doc::doc_new;
-    using aicad::doc::doc_apply_ops;
+    using chudware::doc::doc_new;
+    using chudware::doc::doc_apply_ops;
     json nr = doc_new("part", "AppearanceTest");
     std::string id = nr.at("doc_id").get<std::string>();
     auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
@@ -42,7 +42,7 @@ std::string make_box_doc() {
 json set_appearance(const std::string& id, const json& op_extra) {
     json op = json{{"op", "set_appearance"}, {"id", "b1"}};
     op.update(op_extra);
-    return aicad::doc::doc_apply_ops(id, -1, json::array({op}), false);
+    return chudware::doc::doc_apply_ops(id, -1, json::array({op}), false);
 }
 
 }  // namespace
@@ -69,7 +69,7 @@ TEST_CASE("set_appearance: full material (color+metallic+roughness) writes doc a
     CHECK(body0.at("roughness").get<double>() == Approx(0.30));
 
     // (c) the render tessellation bakes it onto the actual AICM body (colour + material trailer).
-    std::vector<aicm::AicmBody> bodies = aicad::doc::doc_tessellate_bodies(id);
+    std::vector<aicm::AicmBody> bodies = chudware::doc::doc_tessellate_bodies(id);
     REQUIRE(bodies.size() == 1);
     CHECK(bodies[0].color[0] == Approx(0.80f));
     CHECK(bodies[0].color[1] == Approx(0.62f));
@@ -88,7 +88,7 @@ TEST_CASE("set_appearance: colour-only stores the bare [r,g,b] form and resets m
     REQUIRE(v.is_array());  // bare [r,g,b]
     CHECK(v[1].get<double>() == Approx(0.20));
 
-    std::vector<aicm::AicmBody> bodies = aicad::doc::doc_tessellate_bodies(id);
+    std::vector<aicm::AicmBody> bodies = chudware::doc::doc_tessellate_bodies(id);
     REQUIRE(bodies.size() == 1);
     CHECK(bodies[0].color[0] == Approx(0.10f));
     CHECK(bodies[0].metallic == Approx(0.0f));   // colour-only -> default dielectric
@@ -107,7 +107,7 @@ TEST_CASE("set_appearance: null colour clears back to the default grey") {
                    !tree.at("appearances").contains("b1");
     CHECK(cleared);
 
-    std::vector<aicm::AicmBody> bodies = aicad::doc::doc_tessellate_bodies(id);
+    std::vector<aicm::AicmBody> bodies = chudware::doc::doc_tessellate_bodies(id);
     REQUIRE(bodies.size() == 1);
     CHECK(bodies[0].color[0] == Approx(0.62f));  // back to the render default grey
 }
@@ -118,15 +118,15 @@ TEST_CASE("set_appearance: appearance round-trips through the native .step+ save
     set_appearance(id, json{{"color", json::array({0.80, 0.62, 0.28})},
                             {"metallic", 0.95}, {"roughness", 0.30}});
 
-    fs::path out = fs::temp_directory_path() / "aicad_appearance_roundtrip.step+";
-    json sv = aicad::doc::doc_save(id, out.string());
+    fs::path out = fs::temp_directory_path() / "chudware_appearance_roundtrip.step+";
+    json sv = chudware::doc::doc_save(id, out.string());
     REQUIRE(fs::exists(out));
 
-    json op = aicad::doc::doc_open(out.string());
+    json op = chudware::doc::doc_open(out.string());
     std::string nid = op.at("doc_id").get<std::string>();
 
     // The reopened doc still carries the appearance, baked onto its tessellated body.
-    std::vector<aicm::AicmBody> bodies = aicad::doc::doc_tessellate_bodies(nid);
+    std::vector<aicm::AicmBody> bodies = chudware::doc::doc_tessellate_bodies(nid);
     REQUIRE(bodies.size() == 1);
     CHECK(bodies[0].color[0] == Approx(0.80f));
     CHECK(bodies[0].color[2] == Approx(0.28f));
@@ -148,10 +148,10 @@ TEST_CASE("set_appearance: out-of-range components are clamped, missing id is re
     // A set_appearance without a body id is a contract error.
     bool threw = false;
     try {
-        aicad::doc::doc_apply_ops(
+        chudware::doc::doc_apply_ops(
             id, -1, json::array({json{{"op", "set_appearance"},
                                       {"color", json::array({0, 0, 0})}}}), false);
-    } catch (const aicad::doc::OpError&) {
+    } catch (const chudware::doc::OpError&) {
         threw = true;
     }
     CHECK(threw);

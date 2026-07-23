@@ -25,13 +25,13 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 
 using nlohmann::json;
 
 // run.py emit callback: every run event (the machine's stage events + the run_*
-// bookends) is delivered here. The libaicad wiring captures them into a vector.
+// bookends) is delivered here. The libchudware wiring captures them into a vector.
 using EmitFn = std::function<void(const json&)>;
 
 // run_design — drive the orchestrator against a LIVE doc session.
@@ -63,7 +63,7 @@ using EmitFn = std::function<void(const json&)>;
 //                is_sub_run?,      // true inside nested units (disables further delegate)
 //                firm_role_seed?   // specialist prompt prefix for eng_firm sub-runs
 //               }. run_id overrides the generated uuid hex[:12]; prompts_dir overrides
-//               AI_CAD_PROMPTS_DIR (the gate points both engines at the same agent/prompts).
+//               CHUDWARE_PROMPTS_DIR (the gate points both engines at the same agent/prompts).
 //
 // Returns {run_id, status, stop_reason, revision, doc_id, execution_style?} — or on plan_only
 // success {status:"plan_ready", plan, stop_reason:"plan_only"|"awaiting_plan_approval", ...}.
@@ -82,4 +82,4 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
                          const json& options = json::object());
 
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware

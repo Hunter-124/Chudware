@@ -1,7 +1,7 @@
 // core/agent/events.h — C++ port of agent/orchestrator/events.py.
 //
 // P52: hierarchical run-event emission + persistence to
-//   %APPDATA%/AI-CAD/cache/runs/<run_id>/events.jsonl
+//   %APPDATA%/Chudware/cache/runs/<run_id>/events.jsonl
 // Raw model outputs capped at 16 KB in the event (full text -> sidecar files).
 // The live-emit callback is a host concern; here we persist + return the event.
 #pragma once
@@ -12,7 +12,7 @@
 #include <vector>
 #include <nlohmann/json.hpp>
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 
 using nlohmann::json;
@@ -182,4 +182,4 @@ json emit_doc_semantic_diff(RunEvents& ev,
                             const std::string& consent);
 
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware

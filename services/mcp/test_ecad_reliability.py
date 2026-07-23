@@ -5,7 +5,7 @@ Coverage:
     (citation string + position factor + C table), deflection relation.
   * dry-run tool leg (needs build123d): mounts -> fixtures, mass model, valid
     aicad.simhandoff/1 envelope, honest no-holes error.
-  * live leg (needs sim-enabled libaicad): demo board solves — modes reported, band
+  * live leg (needs sim-enabled libchudware): demo board solves — modes reported, band
     verdict present, deflection screen carries the Steinberg citation; a seeded
     HEAVY component lowers f1 vs the bare board (sanity regression).
 
@@ -255,7 +255,7 @@ def test_no_mounts_error() -> None:
 def test_live_solve_and_heavy_regression() -> None:
     """LIVE leg: demo board solves (modes + band verdict + cited deflection screen);
     a seeded heavy component LOWERS f1 vs the bare board. Honest skip without a
-    sim-enabled libaicad."""
+    sim-enabled libchudware."""
     try:
         import build123d  # noqa: F401
     except ImportError:
@@ -265,7 +265,7 @@ def test_live_solve_and_heavy_regression() -> None:
         from mcp_server import core_bridge as cb
         cb.call("ping", {})
     except Exception as e:  # noqa: BLE001
-        print(f"  FIN21: libaicad not loadable ({type(e).__name__}) — live solve "
+        print(f"  FIN21: libchudware not loadable ({type(e).__name__}) — live solve "
               "SKIPPED (dry-run coverage above still exercises mounts/mass/envelope)")
         return
     tools = _tools()

@@ -31,7 +31,7 @@ everything (fasteners→ECAD→sections→fittings→hydraulics→vendor), inspe
 - [x] Detail card: params table, sourcing links, provenance/license line, Insert button
 - [x] Insert calls part_place and the result is an editable doc artifact (R1) — assert
       in a scenario test (test_parts_worker_rpc.py::TestPartPlace::test_place_r1_editable);
-      headless screenshot of populated panel (AI_CAD_SHOT=parts_browser, 6 results visible)
+      headless screenshot of populated panel (CHUDWARE_SHOT=parts_browser, 6 results visible)
 - [x] Empty/offline/key-less states use the pattern-library placeholder vocabulary
 - [x] ui_style_check green; flock'd build; gate PASS; graphify update .
 
@@ -56,11 +56,11 @@ BACKEND SEAM:
 C++ UI:
 - ui/abstract/parts_view.h: pure view-model (PartsPanelModel + state enum + sourcing/result/detail structs)
 - ui/imgui/src/ui/parts_panel.{h,cpp}: scaffold-built panel — search-as-you-type, 8 domain chips, result pill rows (badge+standard+designation+live/price), detail card (params table + sourcing + provenance/license + Insert button routing to part_place async RPC), typed empty/loading/error states throughout
-- Wired into application.cpp + scenarios.{h,cpp} (AI_CAD_SHOT=parts_browser worker-one-shot)
+- Wired into application.cpp + scenarios.{h,cpp} (CHUDWARE_SHOT=parts_browser worker-one-shot)
 
 VERIFICATION:
 - ui_style_check.py: 0 findings (clean)
 - gate.sh: PASS (core build + ctest 100% + ui/abstract + ui/imgui build+shot+selftest)
 - pytest engine_oracle/parts_hub/: 148 passed
-- AI_CAD_SHOT=parts_browser screenshot: 6 M8 results populated, all 8 domain chips, detail empty-state, 6 results status footer — panel renders correctly
-- 2026-07-02 23:07 UTC [sonnet-page] REVIEW — branch task/T-U2-ui pushed. Parts browser panel (Pillar 17) complete: backend seam (engine_oracle/parts_hub/worker_rpc.py + worker.py registration), C++ panel (ui/abstract/parts_view.h + ui/imgui/src/ui/parts_panel.*), 22 new Python tests (148 total pass), AI_CAD_SHOT=parts_browser screenshot shows 6 M8 results + 8 domain chips, gate PASS (core+ctest+ui/imgui build+shot+selftest), ui_style_check 0 findings.
+- CHUDWARE_SHOT=parts_browser screenshot: 6 M8 results populated, all 8 domain chips, detail empty-state, 6 results status footer — panel renders correctly
+- 2026-07-02 23:07 UTC [sonnet-page] REVIEW — branch task/T-U2-ui pushed. Parts browser panel (Pillar 17) complete: backend seam (engine_oracle/parts_hub/worker_rpc.py + worker.py registration), C++ panel (ui/abstract/parts_view.h + ui/imgui/src/ui/parts_panel.*), 22 new Python tests (148 total pass), CHUDWARE_SHOT=parts_browser screenshot shows 6 M8 results + 8 domain chips, gate PASS (core+ctest+ui/imgui build+shot+selftest), ui_style_check 0 findings.

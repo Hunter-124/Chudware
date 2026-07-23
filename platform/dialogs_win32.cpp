@@ -74,7 +74,7 @@ std::string ensureExt(std::string path, const char* defExt) {
     return path;
 }
 
-bool dialogsDisabled() { return std::getenv("AI_CAD_NO_FILE_DIALOGS") != nullptr; }
+bool dialogsDisabled() { return std::getenv("CHUDWARE_NO_FILE_DIALOGS") != nullptr; }
 
 }  // namespace
 

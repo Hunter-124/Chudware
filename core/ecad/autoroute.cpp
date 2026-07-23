@@ -20,7 +20,7 @@
 #include "ecad/drc.h"
 #include "ecad/schema.h"
 
-namespace aicad::ecad {
+namespace chudware::ecad {
 
 using nlohmann::json;
 
@@ -1733,4 +1733,4 @@ json route_diff_pair(const json& board, const std::string& net_p, const std::str
     return out;
 }
 
-}  // namespace aicad::ecad
+}  // namespace chudware::ecad

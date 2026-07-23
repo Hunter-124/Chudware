@@ -11,7 +11,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad::ecad {
+namespace chudware::ecad {
 
 inline constexpr double kZoneFillDefaultResolution = 0.1;
 
@@ -23,4 +23,4 @@ nlohmann::json fill_zone(const nlohmann::json& board, const nlohmann::json& zone
 nlohmann::json fill_zones(const nlohmann::json& board,
                           double resolution = kZoneFillDefaultResolution);
 
-}  // namespace aicad::ecad
+}  // namespace chudware::ecad

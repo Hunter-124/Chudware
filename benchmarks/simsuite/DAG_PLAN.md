@@ -57,7 +57,7 @@ Every builder: orient via graphify → read `AGENTS.md` + `work/context/core-sim
 of that layer (engine module = `main()`+asserts; `services/mcp` = pytest) →
 write `benchmarks/simsuite/<domain>_bench.py` (README contract, `quick` < 60 s)
 → fix real bugs *scoped to its own files*, report cross-file bugs as findings →
-run engine in-process (`AI_CAD_ENGINE_DAEMON=0`) → return structured JSON.
+run engine in-process (`CHUDWARE_ENGINE_DAEMON=0`) → return structured JSON.
 
 | domain | coverage | analytic references |
 |---|---|---|
@@ -109,7 +109,7 @@ accuracy flags → `benchmarks/simsuite/results/<UTC>/REPORT.md`.
 - `resguard.py` (test-side) + `core/util/resource_governor.*` (engine-side):
   fraction-of-host memory/CPU budgets, process-tree RSS watchdog, graceful
   degrade (coarsen mesh / shrink CFD grid / clean refusal) instead of OOM.
-  `SIMSUITE_*` / `AICAD_*` env knobs; ports to Windows/other hardware unchanged.
+  `SIMSUITE_*` / `CHUDWARE_*` env knobs; ports to Windows/other hardware unchanged.
   See [[hunter-hardware-limits]].
 
 ---

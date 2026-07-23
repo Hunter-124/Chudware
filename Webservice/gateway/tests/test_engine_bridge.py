@@ -15,8 +15,8 @@ GATEWAY_DIR = Path(__file__).resolve().parents[1]
 if str(GATEWAY_DIR.parent) not in sys.path:
     sys.path.insert(0, str(GATEWAY_DIR.parent))
 
-os.environ["BILLET_WEB_DEV"] = "1"
-os.environ.setdefault("BILLET_WEB_DATA_ROOT", str(Path.home() / "billet-web-data-test"))
+os.environ["CHUDWARE_WEB_DEV"] = "1"
+os.environ.setdefault("CHUDWARE_WEB_DATA_ROOT", str(Path.home() / "chudware-web-data-test"))
 
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -28,7 +28,7 @@ ADMIN_HEADERS = {"X-Dev-User": "haedmonds69@gmail.com"}
 
 
 class FakeDaemon:
-    """Newline-JSON-RPC unix-socket server mimicking aicad-hostd for the bridge.
+    """Newline-JSON-RPC unix-socket server mimicking chudware-hostd for the bridge.
 
     Records every hello it sees (identity-injection assertions) and broadcasts
     doc.* event lines to every connection like DocRegistry fanout does.

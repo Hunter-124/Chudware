@@ -18,11 +18,11 @@
 #
 # LICENSE NOTE: openNURBS is MIT-ish — McNeel's permissive "provided AS IS"
 # toolkit license (+ bundled zlib's permissive license). No copyleft obligation
-# on libaicad.dll (clean to link + distribute, unlike gmsh's GPL).
+# on libchudware.dll (clean to link + distribute, unlike gmsh's GPL).
 #
 # OUTPUT: the imported/aliased target `opennurbsStatic` (PUBLIC include dir is the
 # opennurbs source dir) and OPENNURBS_INCLUDE_DIR. The consumer (doc/formats.cpp,
-# guarded by AICAD_WITH_OPENNURBS) is the ONLY TU that includes opennurbs.h.
+# guarded by CHUDWARE_WITH_OPENNURBS) is the ONLY TU that includes opennurbs.h.
 
 set(OPENNURBS_RHINO3DM_TAG "8.17.0" CACHE STRING "rhino3dm git tag to provision opennurbs from")
 set(OPENNURBS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/rhino3dm-src"
@@ -72,7 +72,7 @@ endif()
 # Its own CMakeLists sets the MSVC defines (ON_COMPILING_OPENNURBS, UNICODE,
 # Z_PREFIX, MY_ZCALLOC), /bigobj, and Win32 system libs (Shlwapi, Usp10). Those
 # add_definitions/add_compile_options are scoped to this added subdirectory, so
-# they do NOT leak into the rest of aicad_core.
+# they do NOT leak into the rest of chudware_core.
 if(NOT TARGET opennurbsStatic)
   # opennurbs (and its android_uuid subdir) carry cmake_minimum_required values below CMake
   # 3.5's floor, which CMake 4.x rejects outright. Relax the minimum for this subtree — set as
@@ -82,7 +82,7 @@ if(NOT TARGET opennurbsStatic)
   add_subdirectory("${_on_dir}" "${CMAKE_BINARY_DIR}/opennurbs-build" EXCLUDE_FROM_ALL)
 endif()
 
-# Match the dynamic CRT the rest of core + the libaicad DLL use, so opennurbs's
+# Match the dynamic CRT the rest of core + the libchudware DLL use, so opennurbs's
 # allocations live on the same heap and the link is /MD-consistent (no LNK4098).
 foreach(_tgt opennurbsStatic OpenNURBS zlib)
   if(TARGET ${_tgt})

@@ -26,15 +26,15 @@ if str(GATEWAY_DIR.parent) not in sys.path:
 
 # Dev auth (X-Dev-User) requires dev mode; set BEFORE any gateway.config import so
 # the settings singleton reads dev=True (else the /app route 401s).
-os.environ["BILLET_WEB_DEV"] = "1"
-os.environ.setdefault("BILLET_WEB_DATA_ROOT", str(Path.home() / "billet-web-data"))
+os.environ["CHUDWARE_WEB_DEV"] = "1"
+os.environ.setdefault("CHUDWARE_WEB_DATA_ROOT", str(Path.home() / "chudware-web-data"))
 # Assets to probe and the minimum brotli compression ratio we expect over the wire.
 # wasm/js are highly compressible text-ish bytecode; .data is packed assets (partly
 # already-compressed images) so it earns a gentler floor.
 _ASSETS: dict[str, float] = {
-    "Billet.wasm": 3.0,
-    "Billet.js": 3.0,
-    "Billet.data": 1.5,
+    "Chudware.wasm": 3.0,
+    "Chudware.js": 3.0,
+    "Chudware.data": 1.5,
 }
 
 
@@ -55,7 +55,7 @@ def _staged_dir() -> Path | None:
     if not root:
         return None
     p = Path(root).expanduser()
-    return p if (p / "Billet.wasm").is_file() else None
+    return p if (p / "Chudware.wasm").is_file() else None
 
 
 def _transfer_size(client, name: str, accept: str) -> tuple[int, str | None]:
@@ -120,7 +120,7 @@ def report() -> dict[str, dict[str, Any]]:
 def test_web_asset_compression() -> None:
     """Assert the staged bundle is served compressed at the expected ratios."""
     if _staged_dir() is None:
-        pytest.skip("no staged web bundle (Billet.wasm) — run ./build.sh wasm first")
+        pytest.skip("no staged web bundle (Chudware.wasm) — run ./build.sh wasm first")
     m = measure()
     for name, floor in _ASSETS.items():
         s = m[name]

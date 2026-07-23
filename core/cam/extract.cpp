@@ -1,5 +1,5 @@
 // core/cam/extract.cpp — OCCT implementation of the CAM geometry extraction
-// adapter (declared OCCT-free in cam/extract.h). Lives in the aicad_doc lib, which
+// adapter (declared OCCT-free in cam/extract.h). Lives in the chudware_doc lib, which
 // links the OCCT data-exchange + topology toolkits. Bridges a live B-rep part to
 // the OCCT-free CAM operation generators.
 #include "cam/extract.h"
@@ -26,7 +26,7 @@
 
 #include "doc/formats.h"
 
-namespace aicad {
+namespace chudware {
 namespace cam {
 
 using nlohmann::json;
@@ -371,4 +371,4 @@ json cam_extract(const json& params) {
 }
 
 }  // namespace cam
-}  // namespace aicad
+}  // namespace chudware

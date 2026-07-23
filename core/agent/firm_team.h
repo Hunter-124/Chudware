@@ -15,7 +15,7 @@
 
 #include "agent/domain.h"
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 
 enum class Discipline {
@@ -60,4 +60,4 @@ std::vector<Domain> secondary_domains(const std::string& request, Domain primary
 std::vector<TeamMember> assemble_team(const std::string& request, Domain primary);
 
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware

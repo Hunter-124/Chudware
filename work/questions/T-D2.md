@@ -48,6 +48,6 @@ ratification if D3/D4 need targeted loads.
 ## Environment note (not a question)
 
 - PyNiteFEA (MIT) installed into **`.venv-mcp`** (Python 3.11), which is the venv carrying
-  numpy/scipy. The alternate `~/.local/share/AI-CAD/mcp-venv` (Python 3.14) has **no** scipy, so
+  numpy/scipy. The alternate `~/.local/share/Chudware/mcp-venv` (Python 3.14) has **no** scipy, so
   PyNite cannot run there — hence tests run under `.venv-mcp/bin/python`, overriding the prompt's
   mcp-venv hint on primary-evidence grounds. `licenses.md` row added.

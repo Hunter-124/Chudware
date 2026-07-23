@@ -714,7 +714,7 @@ void drawPartsLibraryWorkspace(AppState& st) {
             loadVendors(st);
             pollQueue(st);
         }
-        // RE-32 / AI_CAD_SHOT=parts: seed a synthetic no-model result so the
+        // RE-32 / CHUDWARE_SHOT=parts: seed a synthetic no-model result so the
         // "Generate 3D model" button is visible in the headless screenshot without
         // needing the worker to be running. The item has placeable=false so all
         // action buttons (including "Generate 3D model") render on hover.

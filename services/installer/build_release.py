@@ -1,12 +1,12 @@
-"""Assemble a distributable AI-CAD release (payload + installer scripts).
+"""Assemble a distributable Chudware release (payload + installer scripts).
 
-Produces  <out>/AI-CAD/  containing:
-    AI-CAD.exe              the native host (built separately via CMake)
+Produces  <out>/Chudware/  containing:
+    Chudware.exe              the native host (built separately via CMake)
     app/                    Python packages (engine, mcp_server, agent, installer) + requirements
     wheelhouse/             offline wheels for the runtime (pip download)   [--skip-wheels to omit]
     python-embed/           portable CPython for self-contained installs    [--with-python]
     install.ps1 / uninstall.ps1
-This is the "embed-and-extract" payload: install.ps1 provisions %APPDATA%/AI-CAD from it and
+This is the "embed-and-extract" payload: install.ps1 provisions %APPDATA%/Chudware from it and
 registers the MCP server. Optionally zips the folder.
 
     python -m installer.build_release [--out dist] [--skip-wheels] [--with-python] [--zip]
@@ -25,14 +25,14 @@ APP_PACKAGES = ("engine", "mcp_server", "agent", "installer")
 # Nested packages under services/ that the engine worker imports as services.X
 # (services.plm drives the PLM hub; without it plm_*/git_* never register).
 SERVICE_PACKAGES = ("plm", "dag", "browser", "deliverables", "ipc", "serving", "verify")
-HOST_EXE = REPO / "host" / "build-win" / "bin" / "Billet.exe"
+HOST_EXE = REPO / "host" / "build-win" / "bin" / "Chudware.exe"
 if not HOST_EXE.exists():
-    HOST_EXE = REPO / "host" / "build" / "bin" / "Release" / "AI-CAD.exe"
-# Engine host daemon (core/hostd). MSVC builds of aicad-hostd are new — absence is a
+    HOST_EXE = REPO / "host" / "build" / "bin" / "Release" / "Chudware.exe"
+# Engine host daemon (core/hostd). MSVC builds of chudware-hostd are new — absence is a
 # warning + skip, not a failure (the app falls back to legacy in-process engine mode).
 HOSTD_EXE_CANDIDATES = (
-    REPO / "core" / "build" / "bin" / "Release" / "aicad-hostd.exe",
-    REPO / "core" / "build" / "bin" / "aicad-hostd.exe",
+    REPO / "core" / "build" / "bin" / "Release" / "chudware-hostd.exe",
+    REPO / "core" / "build" / "bin" / "chudware-hostd.exe",
 )
 _IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc", "build", "samples", "test_*", ".ready.json")
 
@@ -96,7 +96,7 @@ def stage_wheels(dst: Path) -> dict:
 
 
 def build(out: Path, skip_wheels: bool, with_python: bool, make_zip: bool) -> dict:
-    dst = out / "AI-CAD"
+    dst = out / "Chudware"
     if dst.exists():
         shutil.rmtree(dst)
     dst.mkdir(parents=True)
@@ -104,23 +104,23 @@ def build(out: Path, skip_wheels: bool, with_python: bool, make_zip: bool) -> di
     manifest: dict = {"components": {}}
 
     if HOST_EXE.exists():
-        shutil.copy2(HOST_EXE, dst / "AI-CAD.exe")
+        shutil.copy2(HOST_EXE, dst / "Chudware.exe")
         manifest["components"]["exe"] = True
     else:
         manifest["components"]["exe"] = False  # build it with: cmake --build host/build --config Release
 
-    # aicad-hostd.exe (+ .pdb when present) — staged next to AI-CAD.exe/libaicad.dll so
-    # install.ps1 can stop/replace it and register_mcp can pin AICAD_HOSTD_BIN at it.
+    # chudware-hostd.exe (+ .pdb when present) — staged next to Chudware.exe/libchudware.dll so
+    # install.ps1 can stop/replace it and register_mcp can pin CHUDWARE_HOSTD_BIN at it.
     hostd = next((p for p in HOSTD_EXE_CANDIDATES if p.exists()), None)
     if hostd is not None:
-        shutil.copy2(hostd, dst / "aicad-hostd.exe")
+        shutil.copy2(hostd, dst / "chudware-hostd.exe")
         pdb = hostd.with_suffix(".pdb")
         if pdb.exists():
-            shutil.copy2(pdb, dst / "aicad-hostd.pdb")
+            shutil.copy2(pdb, dst / "chudware-hostd.pdb")
         manifest["components"]["hostd"] = True
     else:
-        print("warning: aicad-hostd.exe not found (cmake --build core\\build --config Release "
-              "--target aicad-hostd) — payload ships without the engine daemon", file=sys.stderr)
+        print("warning: chudware-hostd.exe not found (cmake --build core\\build --config Release "
+              "--target chudware-hostd) — payload ships without the engine daemon", file=sys.stderr)
         manifest["components"]["hostd"] = False
 
     # brand + font assets (loaded by the GUI from <exedir>/assets)
@@ -151,8 +151,8 @@ def build(out: Path, skip_wheels: bool, with_python: bool, make_zip: bool) -> di
     (dst / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     if make_zip:
-        archive = shutil.make_archive(str(out / "AI-CAD-release"), "zip", root_dir=dst.parent,
-                                      base_dir="AI-CAD")
+        archive = shutil.make_archive(str(out / "Chudware-release"), "zip", root_dir=dst.parent,
+                                      base_dir="Chudware")
         manifest["zip"] = archive
 
     manifest["dist"] = str(dst)
@@ -160,7 +160,7 @@ def build(out: Path, skip_wheels: bool, with_python: bool, make_zip: bool) -> di
 
 
 def main(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(description="Assemble an AI-CAD release.")
+    ap = argparse.ArgumentParser(description="Assemble an Chudware release.")
     ap.add_argument("--out", type=Path, default=REPO / "dist")
     ap.add_argument("--skip-wheels", action="store_true")
     ap.add_argument("--with-python", action="store_true")

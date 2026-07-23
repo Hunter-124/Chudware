@@ -39,7 +39,7 @@ regen-fix, IP-20 drawing/doc gen) lands here even before those features fully sh
       overhead <10 ms per call
       — `TestLoggingProviderOverhead`: 1000 calls assert <10s total; C++ wrap_logging
         in core/agent/logging_provider.h (header-only template, wired into run.cpp) compiles
-        clean (15/15 aicad_agent objects, libaicad_agent.a linked, verified by --clean-first)
+        clean (15/15 chudware_agent objects, libchudware_agent.a linked, verified by --clean-first)
 - [x] Shadow replay over ≥100 logged calls produces a comparison report (verifier
       scores, latency, cost) between two providers/adapters
       — `TestEndToEndReplayReport.test_replay_120_calls_to_report`: 120 synthetic ai_artifact
@@ -59,7 +59,7 @@ regen-fix, IP-20 drawing/doc gen) lands here even before those features fully sh
           fix on master; T-H7 touches only core/agent/ + services/agent/ (not ui/imgui)
         * pytest stage: venv path mismatch in gate.sh (0 collected, 61 deselected);
           T-H7 tests pass 36/36 when run directly via
-          ~/.local/share/AI-CAD/mcp-venv/bin/pytest services/agent/test_h7_shadow.py
+          ~/.local/share/Chudware/mcp-venv/bin/pytest services/agent/test_h7_shadow.py
 
 ## providers/1 conformance (T-F9 contract)
 

@@ -2,7 +2,7 @@
 Agent: HOVER-STATE SPOT-CHECK (Sonnet)
 Date: 2026-07-03
 Tasks: T-G14, T-G18
-Build: host/build-linux/bin/AI-CAD (2026-07-03 16:49, T-G14+T-G18 merged in master a43d9ed)
+Build: host/build-linux/bin/Chudware (2026-07-03 16:49, T-G14+T-G18 merged in master a43d9ed)
 Method: xvfb-run :55 (1920x1080x24) + xdotool mousemove + scrot capture
 
 ---
@@ -36,13 +36,13 @@ merged into master (commit a43d9ed). No rebuild needed.
 ---
 
 ## Methodology
-1. Launched AI-CAD interactively on Xvfb :55 (1920x1080) with part.step+ (box+fillet+shell).
+1. Launched Chudware interactively on Xvfb :55 (1920x1080) with part.step+ (box+fillet+shell).
 2. Used `xdotool mousemove <x> <y>` to park cursor on each FM row; confirmed ImGui DOES
    register synthetic position (pixel-color shifts measured — e.g. dark Material hovered:
    srgb(165,185,188) vs non-hovered: srgb(178,181,188)).
 3. Waited 400ms for hover animation, then scrot-captured full screen; cropped FM panel.
 4. For hover context-action popups (H5): waited 2.5s for tooltip timeout, then captured.
-5. For PM form (H1): used headless AI_CAD_SHOT=pmform + AI_CAD_PMCMD=fillet + AI_CAD_PMBOX=1
+5. For PM form (H1): used headless CHUDWARE_SHOT=pmform + CHUDWARE_PMCMD=fillet + CHUDWARE_PMBOX=1
    to capture the live form; inspected pmTooltip() source code.
 6. All apps killed after each capture set. Xvfb terminated. No processes left running.
 

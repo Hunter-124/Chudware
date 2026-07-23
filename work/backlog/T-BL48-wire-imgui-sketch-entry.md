@@ -42,7 +42,7 @@ Hunter re-confirmed the sketcher batch as a top priority 2026-07-04.
 - [x] **Exit works:** confirm/cancel leaves sketch mode cleanly, sketch data lands in the
       doc, downstream feature (e.g. extrude) can consume it.
 - [x] Real-flow verify in the GUI: new sketch on a datum plane → draw an element → exit →
-      extrude it. Screenshots light+dark; headless `AI_CAD_SHOT` scenario covering sketch
+      extrude it. Screenshots light+dark; headless `CHUDWARE_SHOT` scenario covering sketch
       entry if one exists or is cheap to add.
 - [x] After landing: post a FOREMAN.md note that T-BL44/T-BL41/T-BL46 are unblocked
       (T-BL44 depends_on is already relinked to this task).
@@ -77,9 +77,9 @@ Hunter re-confirmed the sketcher batch as a top priority 2026-07-04.
   pendingSketchReparentFid; feature_tree.cpp 3 deferred stubs filled (Edit Sketch +
   Edit Sketch Plane/Face ctx-menu, double-click on sketch row) via st.app-> (FmState mirror);
   viewport drain calls enterForFeature/beginPlaneEdit; dead void* sketchMode removed.
-- 2026-07-04 opus-tarn: proof scenario (39ed76f9): AI_CAD_SHOT=sketch_dispatch drives the
+- 2026-07-04 opus-tarn: proof scenario (39ed76f9): CHUDWARE_SHOT=sketch_dispatch drives the
   REAL path only (never force-sets inSketch). Both themes, xvfb, engine-attached
-  (AI_CAD_LIBAICAD -> built libaicad.so; demo-mode runs discarded per helm's ruling):
+  (CHUDWARE_LIBCHUDWARE -> built libchudware.so; demo-mode runs discarded per helm's ruling):
   entry drain inSketch=1 + overlay PNG (double-gated on inSketch AND active_), exit drain
   inSketch=0, reedit via pendingSketchEditFid inSketch=1 + f1's rect entities visible in
   editor (sketch_dispatch_04_reedit.png), extrude ok=1 (engine feature_status). PNGs

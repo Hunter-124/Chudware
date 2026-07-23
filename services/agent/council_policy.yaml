@@ -20,7 +20,7 @@
 #
 # Override discipline (lowest wins):
 #   1. Shipped defaults in this file (per stage+tier row, else the star fallback)
-#   2. effort_presets.yaml (AI_CAD_EFFORT_PRESET env / GUI preset selection)
+#   2. effort_presets.yaml (CHUDWARE_EFFORT_PRESET env / GUI preset selection)
 #   3. Per-tier user overrides (config.json ai_effort.council_* knobs, §23)
 #
 # Knobs exposed to Advanced mode (§23 table: council, council_seats,

@@ -40,7 +40,7 @@
 
 #include "doc/selectors.h"
 
-namespace aicad::doc {
+namespace chudware::doc {
 
 // Bounding-box diagonal of `shape` (Bnd_Box + BRepBndLib::Add; sqrt(dx^2+dy^2+dz^2)),
 // used to normalise selector centroid distances. Returns 1.0 for a degenerate box
@@ -139,4 +139,4 @@ QueryPicks resolve_geom_query(const TopoDS_Shape& shape, const nlohmann::json& q
 // Feature compilers use this to branch a query payload vs an explicit pick selector.
 bool is_geom_query(const nlohmann::json& v);
 
-}  // namespace aicad::doc
+}  // namespace chudware::doc

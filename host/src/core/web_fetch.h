@@ -12,10 +12,10 @@
 #include <string>
 #include <vector>
 
-namespace billet {
+namespace chudware {
 
 // GET `url`, return response body bytes. On failure returns empty and sets err
 // (HTTP non-2xx, network error, or native stub).
 std::vector<uint8_t> webFetch(const std::string& url, std::string& err);
 
-}  // namespace billet
+}  // namespace chudware

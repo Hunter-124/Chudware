@@ -90,7 +90,7 @@ def _default_config_path() -> Optional[Path]:
 
         return paths.CONFIG
     except Exception:  # noqa: BLE001 — running outside the repo tree (e.g. deployed tool)
-        legacy = Path.home() / ".local" / "share" / "AI-CAD" / "config.json"
+        legacy = Path.home() / ".local" / "share" / "Chudware" / "config.json"
         return legacy if legacy.exists() else None
 
 
@@ -132,7 +132,7 @@ def _state_path() -> Path:
     cfg = _default_config_path()
     if cfg is not None:
         return cfg.parent / "firecrawl_pool_state.json"
-    return Path.home() / ".local" / "share" / "AI-CAD" / "firecrawl_pool_state.json"
+    return Path.home() / ".local" / "share" / "Chudware" / "firecrawl_pool_state.json"
 
 
 def _kid(key: str) -> str:
@@ -204,7 +204,7 @@ def _post(key: str, path: str, payload: dict, timeout: float) -> tuple[int, Opti
         headers={
             "Authorization": f"Bearer {key}",
             "Content-Type": "application/json",
-            "User-Agent": "AI-CAD-research/1.1",
+            "User-Agent": "Chudware-research/1.1",
         },
     )
     try:

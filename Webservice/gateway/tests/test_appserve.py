@@ -13,8 +13,8 @@ GATEWAY_DIR = Path(__file__).resolve().parents[1]
 if str(GATEWAY_DIR.parent) not in sys.path:
     sys.path.insert(0, str(GATEWAY_DIR.parent))
 
-os.environ["BILLET_WEB_DEV"] = "1"
-os.environ.setdefault("BILLET_WEB_DATA_ROOT", str(Path.home() / "billet-web-data-test"))
+os.environ["CHUDWARE_WEB_DEV"] = "1"
+os.environ.setdefault("CHUDWARE_WEB_DATA_ROOT", str(Path.home() / "chudware-web-data-test"))
 
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -34,10 +34,10 @@ def app_tree(tmp_path, monkeypatch):
     """Point settings.app_dir at a tiny fake WASM client tree."""
     root = tmp_path / "app"
     root.mkdir()
-    (root / "index.html").write_text("<!doctype html><title>billet</title>\n", encoding="utf-8")
-    (root / "billet.js").write_text("/* wasm glue */\n", encoding="utf-8")
-    (root / "billet.wasm").write_bytes(b"\x00asm\x01\x00\x00\x00")
-    (root / "billet.data").write_bytes(b"PACK")
+    (root / "index.html").write_text("<!doctype html><title>chudware</title>\n", encoding="utf-8")
+    (root / "chudware.js").write_text("/* wasm glue */\n", encoding="utf-8")
+    (root / "chudware.wasm").write_bytes(b"\x00asm\x01\x00\x00\x00")
+    (root / "chudware.data").write_bytes(b"PACK")
     monkeypatch.setattr(settings, "app_dir", root)
     return root
 
@@ -62,7 +62,7 @@ class TestAppServe:
         assert r.headers["cross-origin-embedder-policy"] == "require-corp"
         assert r.headers.get("cache-control") == "no-cache"
         assert "text/html" in (r.headers.get("content-type") or "")
-        assert "billet" in r.text
+        assert "chudware" in r.text
 
     def test_app_bare_path_same_as_slash(self, client, app_tree):
         r = client.get("/app", headers=DEV_HEADERS)
@@ -71,7 +71,7 @@ class TestAppServe:
         assert r.headers["cross-origin-embedder-policy"] == "require-corp"
 
     def test_app_wasm_and_data_mime(self, client, app_tree):
-        rw = client.get("/app/billet.wasm", headers=DEV_HEADERS)
+        rw = client.get("/app/chudware.wasm", headers=DEV_HEADERS)
         assert rw.status_code == 200
         assert rw.headers["content-type"].startswith("application/wasm")
         assert rw.headers["cross-origin-opener-policy"] == "same-origin"
@@ -79,7 +79,7 @@ class TestAppServe:
         # Unhashed bundle files must be no-cache so js/wasm never skew across deploys.
         assert rw.headers.get("cache-control") == "no-cache"
 
-        rd = client.get("/app/billet.data", headers=DEV_HEADERS)
+        rd = client.get("/app/chudware.data", headers=DEV_HEADERS)
         assert rd.status_code == 200
         assert "octet-stream" in (rd.headers.get("content-type") or "")
         assert rd.headers["cross-origin-embedder-policy"] == "require-corp"
@@ -136,26 +136,26 @@ class TestContentEncoding:
     def test_prefers_brotli_over_gzip(self, app_tree):
         from gateway import appserve
 
-        target = app_tree / "billet.wasm"
-        (app_tree / "billet.wasm.br").write_bytes(b"BR")
-        (app_tree / "billet.wasm.gz").write_bytes(b"GZ")
+        target = app_tree / "chudware.wasm"
+        (app_tree / "chudware.wasm.br").write_bytes(b"BR")
+        (app_tree / "chudware.wasm.gz").write_bytes(b"GZ")
         served, enc = appserve._negotiate(target, self._req("gzip, br"))
         assert enc == "br"
-        assert served.name == "billet.wasm.br"
+        assert served.name == "chudware.wasm.br"
 
     def test_gzip_when_brotli_not_accepted(self, app_tree):
         from gateway import appserve
 
-        target = app_tree / "billet.wasm"
-        (app_tree / "billet.wasm.gz").write_bytes(b"GZ")
+        target = app_tree / "chudware.wasm"
+        (app_tree / "chudware.wasm.gz").write_bytes(b"GZ")
         served, enc = appserve._negotiate(target, self._req("gzip, deflate"))
         assert enc == "gzip"
-        assert served.name == "billet.wasm.gz"
+        assert served.name == "chudware.wasm.gz"
 
     def test_raw_when_no_variant(self, app_tree):
         from gateway import appserve
 
-        target = app_tree / "billet.wasm"
+        target = app_tree / "chudware.wasm"
         served, enc = appserve._negotiate(target, self._req("br, gzip"))
         assert enc is None
         assert served == target
@@ -163,8 +163,8 @@ class TestContentEncoding:
     def test_raw_when_encoding_not_accepted(self, app_tree):
         from gateway import appserve
 
-        target = app_tree / "billet.wasm"
-        (app_tree / "billet.wasm.br").write_bytes(b"BR")
+        target = app_tree / "chudware.wasm"
+        (app_tree / "chudware.wasm.br").write_bytes(b"BR")
         served, enc = appserve._negotiate(target, self._req("identity"))
         assert enc is None
         assert served == target
@@ -176,8 +176,8 @@ class TestContentEncoding:
 
         from gateway import appserve
 
-        target = app_tree / "billet.wasm"
-        variant = app_tree / "billet.wasm.br"
+        target = app_tree / "chudware.wasm"
+        variant = app_tree / "chudware.wasm.br"
         variant.write_bytes(b"BR")
         old = target.stat().st_mtime - 100
         os.utime(variant, (old, old))
@@ -197,4 +197,4 @@ class TestContentEncoding:
         assert r.headers.get("content-encoding") == "gzip"
         assert "accept-encoding" in (r.headers.get("vary", "").lower())
         assert r.headers.get("cache-control") == "no-cache"  # policy keys on original suffix
-        assert "billet" in r.text  # decoded transparently
+        assert "chudware" in r.text  # decoded transparently

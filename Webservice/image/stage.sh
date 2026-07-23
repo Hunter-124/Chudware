@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# stage.sh — assemble Webservice/image/stage/ from the host-built Billet tree.
+# stage.sh — assemble Webservice/image/stage/ from the host-built Chudware tree.
 # Build output only (not committed). Run from the repo root or any cwd.
 set -euo pipefail
 
@@ -10,35 +10,35 @@ BIN_SRC="$REPO/host/build-linux/bin"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
-[ -x "$BIN_SRC/Billet" ] || die "missing $BIN_SRC/Billet — build host GUI first"
-[ -f "$BIN_SRC/libaicad.so" ] || die "missing $BIN_SRC/libaicad.so"
+[ -x "$BIN_SRC/Chudware" ] || die "missing $BIN_SRC/Chudware — build host GUI first"
+[ -f "$BIN_SRC/libchudware.so" ] || die "missing $BIN_SRC/libchudware.so"
 
 echo "==> staging into $STAGE"
 rm -rf "$STAGE"
 mkdir -p "$STAGE/bin" "$STAGE/lib" "$STAGE/share"
 
-# ---- Billet binary + compat symlink -----------------------------------------
-cp -a "$BIN_SRC/Billet" "$STAGE/bin/Billet"
-ln -sfn Billet "$STAGE/bin/AI-CAD"
-chmod +x "$STAGE/bin/Billet"
+# ---- Chudware binary + compat symlink -----------------------------------------
+cp -a "$BIN_SRC/Chudware" "$STAGE/bin/Chudware"
+ln -sfn Chudware "$STAGE/bin/Chudware"
+chmod +x "$STAGE/bin/Chudware"
 
 # ---- Engine shared libs -----------------------------------------------------
 # Prefer the full OCCT engine from core/build-occt-linux; fall back to the
 # copy next to the GUI binary (host/build-linux/bin), then slim core/build-linux.
-LIBAICAD=""
+LIBCHUDWARE=""
 for cand in \
-    "$REPO/core/build-occt-linux/bin/libaicad.so" \
-    "$BIN_SRC/libaicad.so" \
-    "$REPO/core/build-linux/bin/libaicad.so"
+    "$REPO/core/build-occt-linux/bin/libchudware.so" \
+    "$BIN_SRC/libchudware.so" \
+    "$REPO/core/build-linux/bin/libchudware.so"
 do
-    if [ -f "$cand" ]; then LIBAICAD="$cand"; break; fi
+    if [ -f "$cand" ]; then LIBCHUDWARE="$cand"; break; fi
 done
-[ -n "$LIBAICAD" ] || die "libaicad.so not found"
-cp -a "$LIBAICAD" "$STAGE/lib/libaicad.so"
-# Also next to the exe — cpp_core ensureLoaded looks beside Billet first,
-# then $AI_CAD_LIBAICAD, then bare "libaicad.so" via LD_LIBRARY_PATH.
-cp -a "$LIBAICAD" "$STAGE/bin/libaicad.so"
-echo "    libaicad.so <- $LIBAICAD (lib/ + bin/)"
+[ -n "$LIBCHUDWARE" ] || die "libchudware.so not found"
+cp -a "$LIBCHUDWARE" "$STAGE/lib/libchudware.so"
+# Also next to the exe — cpp_core ensureLoaded looks beside Chudware first,
+# then $CHUDWARE_LIBCHUDWARE, then bare "libchudware.so" via LD_LIBRARY_PATH.
+cp -a "$LIBCHUDWARE" "$STAGE/bin/libchudware.so"
+echo "    libchudware.so <- $LIBCHUDWARE (lib/ + bin/)"
 
 if [ -f "$BIN_SRC/lib3mf.so" ]; then
     cp -a "$BIN_SRC/lib3mf.so" "$STAGE/lib/lib3mf.so"
@@ -46,7 +46,7 @@ if [ -f "$BIN_SRC/lib3mf.so" ]; then
     echo "    lib3mf.so"
 fi
 
-# Netgen (FEA meshing) — absolute RPATH on host libaicad; re-stage next to it.
+# Netgen (FEA meshing) — absolute RPATH on host libchudware; re-stage next to it.
 NG_LIB="$REPO/third_party/netgen/install/lib"
 if [ -f "$NG_LIB/libnglib.so" ]; then
     cp -a "$NG_LIB/libnglib.so" "$NG_LIB/libngcore.so" "$STAGE/lib/"
@@ -54,22 +54,22 @@ if [ -f "$NG_LIB/libnglib.so" ]; then
     echo "    netgen libnglib.so + libngcore.so"
 fi
 
-# ---- aicad-hostd (engine daemon) --------------------------------------------
+# ---- chudware-hostd (engine daemon) --------------------------------------------
 HOSTD=""
 for cand in \
-    "$REPO/core/build-occt-linux/bin/aicad-hostd" \
-    "$REPO/core/build-linux/bin/aicad-hostd" \
-    "$BIN_SRC/aicad-hostd" \
+    "$REPO/core/build-occt-linux/bin/chudware-hostd" \
+    "$REPO/core/build-linux/bin/chudware-hostd" \
+    "$BIN_SRC/chudware-hostd" \
     "$BIN_SRC/hostd"
 do
     if [ -x "$cand" ]; then HOSTD="$cand"; break; fi
 done
 if [ -n "$HOSTD" ]; then
-    cp -a "$HOSTD" "$STAGE/bin/aicad-hostd"
-    chmod +x "$STAGE/bin/aicad-hostd"
-    echo "    aicad-hostd <- $HOSTD"
+    cp -a "$HOSTD" "$STAGE/bin/chudware-hostd"
+    chmod +x "$STAGE/bin/chudware-hostd"
+    echo "    chudware-hostd <- $HOSTD"
 else
-    echo "WARNING: aicad-hostd not found — session will fall back to in-process engine" >&2
+    echo "WARNING: chudware-hostd not found — session will fall back to in-process engine" >&2
 fi
 
 # ---- Assets (fonts, icons, logos) — required at runtime next to the exe ----
@@ -90,14 +90,14 @@ if [ ! -d "$STAGE/bin/assets/fonts" ] && [ -d "$REPO/assets/fonts" ]; then
     echo "    assets/fonts/ (from repo assets/fonts)"
 fi
 
-# ---- CEF runtime (REQUIRED — AI_CAD_ENABLE_CEF is compile-time; no disable flag) ----
+# ---- CEF runtime (REQUIRED — CHUDWARE_ENABLE_CEF is compile-time; no disable flag) ----
 # Advisor §A6 asked to disable CEF for container stability. Grep of host/src shows
-# AI_CAD_ENABLE_CEF is a compile-time #ifdef only; the linked Billet NEEDs libcef.so
+# CHUDWARE_ENABLE_CEF is a compile-time #ifdef only; the linked Chudware NEEDs libcef.so
 # and CefInitialize aborts without icudtl.dat/pak next to the exe. Shipping stripped
-# CEF is the only viable path. AI_CAD_CEF_LAZY=1 (entrypoint) defers cold init.
+# CEF is the only viable path. CHUDWARE_CEF_LAZY=1 (entrypoint) defers cold init.
 echo "==> staging CEF runtime (cannot disable at runtime)"
 CEF_SRC="$BIN_SRC"
-[ -f "$CEF_SRC/libcef.so" ] || die "libcef.so missing — Billet will not load"
+[ -f "$CEF_SRC/libcef.so" ] || die "libcef.so missing — Chudware will not load"
 
 CEF_STRIPPED="$REPO/build/tools/libcef-stripped.so"
 mkdir -p "$REPO/build/tools"
@@ -135,8 +135,8 @@ chmod 4755 "$STAGE/bin/chrome-sandbox" 2>/dev/null || true
 
 # ---- Python app tree (AI agent worker runtime) ------------------------------
 # Mirrors services/installer/provision.py ensure_app_code() layout so bootstrap.cpp
-# can resolve AI_CAD_REPO (dir with engine/) + import agent/mcp_server/services.*.
-# Venv lives in the image layer (/opt/billet/runtime), NOT under HOME (bind-mounted).
+# can resolve CHUDWARE_REPO (dir with engine/) + import agent/mcp_server/services.*.
+# Venv lives in the image layer (/opt/chudware/runtime), NOT under HOME (bind-mounted).
 echo "==> staging Python app tree into $STAGE/app"
 python3 - "$REPO" "$STAGE/app" <<'PY'
 """Stage the app package tree the same way provision.ensure_app_code does.
@@ -246,8 +246,8 @@ PY
 # ---- Manifest ---------------------------------------------------------------
 {
     echo "staged_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    echo "billet=$(stat -c %s "$STAGE/bin/Billet" 2>/dev/null || echo '?')"
-    echo "libaicad_src=$LIBAICAD"
+    echo "chudware=$(stat -c %s "$STAGE/bin/Chudware" 2>/dev/null || echo '?')"
+    echo "libchudware_src=$LIBCHUDWARE"
     echo "hostd=${HOSTD:-none}"
     echo "cef=stripped"
     echo "app_python=1"

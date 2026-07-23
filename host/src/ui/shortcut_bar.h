@@ -1,5 +1,5 @@
 #pragma once
-// AI-CAD 'S' shortcut bar (C25).
+// Chudware 'S' shortcut bar (C25).
 // Press 'S' while the viewport is hovered (and no text input is active) →
 // a small floating toolbar appears at the mouse position with context-aware commands.
 // Model mode: sketch_new, extrude_boss, extrude_cut, revolve_boss, fillet, chamfer.

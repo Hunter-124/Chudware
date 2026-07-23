@@ -1,7 +1,7 @@
 """Smoke test for the CAM MCP surface — drives the cam_* RPCs through the C++ core
-(libaicad) the same way the MCP tools do, and checks the cad_guide('cam') text.
+(libchudware) the same way the MCP tools do, and checks the cad_guide('cam') text.
 
-House style: a plain main() runner. Skips gracefully if libaicad can't be located/
+House style: a plain main() runner. Skips gracefully if libchudware can't be located/
 loaded (e.g. the C++ core hasn't been built) so it never blocks a Python-only run.
 
     & $py -m mcp_server.test_cam_tools
@@ -31,7 +31,7 @@ def _build_part_step() -> str:
             "params": {"radius": dim(3), "height": dim(30), "centered": True, "mode": "cut"}}},
     ]
     cb.call("doc_apply_ops", {"doc_id": doc, "base_revision": -1, "ops": ops})
-    path = os.path.join(tempfile.gettempdir(), "aicad_camtest.step")
+    path = os.path.join(tempfile.gettempdir(), "chudware_camtest.step")
     cb.call("export_file", {"doc_id": doc, "path": path, "format": "step"})
     return path
 
@@ -54,7 +54,7 @@ def _check_registry_foldin(check) -> None:
     except Exception as e:  # noqa: BLE001
         print(f"  skip: registry fold-in setup ({e})")
         return
-    env = dict(os.environ, AICAD_MATERIALS_REGISTRY=p)
+    env = dict(os.environ, CHUDWARE_MATERIALS_REGISTRY=p)
     code = (
         "import sys; sys.path[:0]=['services/mcp','.']\n"
         "from mcp_server import core_bridge as cb\n"
@@ -69,7 +69,7 @@ def _check_registry_foldin(check) -> None:
         # And unset -> in-code stands (aluminum's builtin sfm_mill is 900). The raw RPC has no
         # cam_tools wiring, so with no env it falls back to the in-code table.
         env2 = dict(os.environ)
-        env2.pop("AICAD_MATERIALS_REGISTRY", None)
+        env2.pop("CHUDWARE_MATERIALS_REGISTRY", None)
         out2 = subprocess.run([sys.executable, "-c", code], env=env2, capture_output=True,
                              text=True, timeout=120, cwd=os.getcwd())
         val2 = float((out2.stdout.strip().splitlines() or ["0"])[-1])
@@ -140,7 +140,7 @@ def _check_hole_extraction(cb, check) -> None:  # noqa: ANN001 - cb module + che
               "cbore/csink/simple hole features built ok "
               f"({[s.get('error') for s in fs if not s.get('ok')]})")
 
-        path = os.path.join(tempfile.gettempdir(), "aicad_cam_holeextract.step")
+        path = os.path.join(tempfile.gettempdir(), "chudware_cam_holeextract.step")
         cb.call("export_file", {"doc_id": doc, "path": path, "format": "step"})
         ex = cb.call("cam_extract", {"path": path, "kind": "holes"})
         holes = ex.get("holes", [])
@@ -261,7 +261,7 @@ def _check_hole_extraction(cb, check) -> None:  # noqa: ANN001 - cb module + che
                 print("  skip: tilted-hole drill failed: "
                       f"{[s.get('error') for s in fs2 if not s.get('ok')]}")
             else:
-                path2 = os.path.join(tempfile.gettempdir(), "aicad_cam_tilted.step")
+                path2 = os.path.join(tempfile.gettempdir(), "chudware_cam_tilted.step")
                 cb.call("export_file", {"doc_id": tilt_doc, "path": path2, "format": "step"})
                 ext = cb.call("cam_extract", {"path": path2, "kind": "holes"})
                 tholes = ext.get("holes", [])
@@ -289,7 +289,7 @@ def _check_hole_extraction(cb, check) -> None:  # noqa: ANN001 - cb module + che
 
 def main() -> int:
     if not cb.available():
-        print("SKIP: libaicad not available (build the C++ core to run this test).")
+        print("SKIP: libchudware not available (build the C++ core to run this test).")
         return 0
 
     failures = []

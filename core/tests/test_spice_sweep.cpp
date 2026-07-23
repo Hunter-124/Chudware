@@ -27,10 +27,10 @@
 #include "util/thread_pool.h"
 
 using nlohmann::json;
-using aicad::sim::spice_simulate;
-using aicad::sim::spice_sweep;
-using aicad::sim::spice_sweep_serial;
-using aicad::sim::SpiceSweepStats;
+using chudware::sim::spice_simulate;
+using chudware::sim::spice_sweep;
+using chudware::sim::spice_sweep_serial;
+using chudware::sim::SpiceSweepStats;
 
 namespace {
 
@@ -115,7 +115,7 @@ TEST_CASE("spice_sweep: 1-point sweep works") {
 
 TEST_CASE("spice_sweep: divider R sweep parity + order vs serial single-runs") {
     const auto t0 = std::chrono::steady_clock::now();
-    aicad::sim::cache::clear();
+    chudware::sim::cache::clear();
     json circuit = divider_circuit();
     json study = op_study();
     const std::vector<double> values = {1000.0, 2000.0, 5000.0, 10000.0};
@@ -172,10 +172,10 @@ TEST_CASE("spice_sweep: divider R sweep parity + order vs serial single-runs") {
 
 TEST_CASE("spice_sweep: big sweep parallel not slower than serial + multi-worker") {
     // Force a multi-worker allotment so (b) is testable on any host.
-    put_env("AICAD_GOVERNOR", nullptr);
-    put_env("AI_CAD_SIM_THREADS", "4");
-    (void)aicad::pool::reconfigure_shared(0, "spice_sweep_test_prep");
-    aicad::sim::cache::clear();
+    put_env("CHUDWARE_GOVERNOR", nullptr);
+    put_env("CHUDWARE_SIM_THREADS", "4");
+    (void)chudware::pool::reconfigure_shared(0, "spice_sweep_test_prep");
+    chudware::sim::cache::clear();
 
     json circuit = divider_circuit();
     json study = op_study();
@@ -186,7 +186,7 @@ TEST_CASE("spice_sweep: big sweep parallel not slower than serial + multi-worker
     for (int i = 0; i < 48; ++i) values.push_back(500.0 + 250.0 * i);  // 500..12250
     SpiceSweepStats serial_st, parallel_st;
     auto serial = spice_sweep_serial(circuit, "R1", values, study, &serial_st);
-    aicad::sim::cache::clear();  // cold parallel: measure real solve, not cache hits
+    chudware::sim::cache::clear();  // cold parallel: measure real solve, not cache hits
     auto parallel = spice_sweep(circuit, "R1", values, study, &parallel_st);
 
     REQUIRE(serial.size() == values.size());
@@ -199,9 +199,9 @@ TEST_CASE("spice_sweep: big sweep parallel not slower than serial + multi-worker
         CHECK(op_equal(parallel[i], serial[i]));
     }
 
-    // (b) governor allots >1 worker under AI_CAD_SIM_THREADS=4.
+    // (b) governor allots >1 worker under CHUDWARE_SIM_THREADS=4.
     CHECK(parallel_st.workers > 1);
-    CHECK(aicad::pool::shared().max_workers() >= parallel_st.workers);
+    CHECK(chudware::pool::shared().max_workers() >= parallel_st.workers);
 
     // Parallel must not be slower than serial (allow 10% slack for scheduling noise).
     CHECK(parallel_st.wall_ms <= serial_st.wall_ms * 1.10 + 1.0);
@@ -214,9 +214,9 @@ TEST_CASE("spice_sweep: big sweep parallel not slower than serial + multi-worker
         parallel_st.plan_report.c_str());
 
     // Restore a modest shared pool for any later tests in-process.
-    put_env("AI_CAD_SIM_THREADS", "2");
-    (void)aicad::pool::reconfigure_shared(0, "spice_sweep_test_restore");
-    put_env("AI_CAD_SIM_THREADS", nullptr);
+    put_env("CHUDWARE_SIM_THREADS", "2");
+    (void)chudware::pool::reconfigure_shared(0, "spice_sweep_test_restore");
+    put_env("CHUDWARE_SIM_THREADS", nullptr);
 }
 
 TEST_CASE("spice_sweep: empty values returns empty") {

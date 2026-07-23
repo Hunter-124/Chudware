@@ -28,7 +28,7 @@
 #include <Eigen/Dense>
 #include <optional>
 
-namespace aicad::geom {
+namespace chudware::geom {
 
 // ---------------------------------------------------------------------------
 // SketchPlane — an orthonormal right-handed frame (origin, uAxis, vAxis, normal)
@@ -124,4 +124,4 @@ Eigen::Vector2d polarToCartesian(double r, double thetaRad);  // pole = origin
 void cartesianToPolar(const Eigen::Vector2d& p, const Eigen::Vector2d& pole,
                       double& r, double& thetaRad);
 
-}  // namespace aicad::geom
+}  // namespace chudware::geom

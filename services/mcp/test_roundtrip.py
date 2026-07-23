@@ -85,6 +85,6 @@ def _content_kinds(res):
 
 if __name__ == "__main__":
     if not cb.available():
-        print("SKIP: libaicad.dll not staged (run build.bat)")
+        print("SKIP: libchudware.dll not staged (run build.bat)")
     else:
         asyncio.run(main())

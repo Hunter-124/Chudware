@@ -23,11 +23,11 @@
 #include "doc/session.h"
 
 using json = nlohmann::json;
-using aicad::doc::doc_new;
-using aicad::doc::doc_apply_ops;
-using aicad::doc::doc_eval_interference;
-using aicad::doc::doc_eval_feature_overlap;
-using aicad::doc::doc_eval_compare;
+using chudware::doc::doc_new;
+using chudware::doc::doc_apply_ops;
+using chudware::doc::doc_eval_interference;
+using chudware::doc::doc_eval_feature_overlap;
+using chudware::doc::doc_eval_compare;
 
 namespace {
 

@@ -3,7 +3,7 @@
 // BYTE-IDENTICAL envelopes, so every place the oracle formats a number with
 // round()/str()/repr()/f-string spec or renders a value with repr() goes
 // through one of these helpers. Header-only; used by core/piping and
-// core/hydraulic (which links aicad_piping).
+// core/hydraulic (which links chudware_piping).
 #pragma once
 
 #include <chrono>
@@ -15,7 +15,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad::pyutil {
+namespace chudware::pyutil {
 
 // The ports preserve key-insertion order (Python dict semantics) so dict
 // repr()s inside error strings match the oracle byte-for-byte.
@@ -180,4 +180,4 @@ inline std::string now_iso() {
     return buf;
 }
 
-}  // namespace aicad::pyutil
+}  // namespace chudware::pyutil

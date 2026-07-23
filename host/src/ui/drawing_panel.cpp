@@ -1,4 +1,4 @@
-// AI-CAD Drawing panel — 2D sheet renderer. See drawing_panel.h.
+// Chudware Drawing panel — 2D sheet renderer. See drawing_panel.h.
 //
 // The drawing engine hands us, per sheet: size_mm:[w,h] (the paper) and a list of ViewGeometry, each
 // with `visible` (solid) and `hidden` (dashed) polylines already scaled + translated to sheet-mm at
@@ -29,11 +29,11 @@ namespace ui {
 
 // --- 2D export (DXF / PDF) for the active Drawing tab -----------------------------------------
 // Path choice: a native Save-As dialog when available (remembers the Documents folder); when file
-// dialogs are disabled (headless / AI_CAD_NO_FILE_DIALOGS) we fall back to writing next to nothing
+// dialogs are disabled (headless / CHUDWARE_NO_FILE_DIALOGS) we fall back to writing next to nothing
 // in the cwd as "<title>_drawing.<ext>" and toast the path. A future nicety: per-sheet export +
 // remembering the last export dir. The engine writes the file via export_drawing.
 static bool s_drawDialogsDisabled() {
-    static const bool disabled = std::getenv("AI_CAD_NO_FILE_DIALOGS") != nullptr;
+    static const bool disabled = std::getenv("CHUDWARE_NO_FILE_DIALOGS") != nullptr;
     return disabled;
 }
 

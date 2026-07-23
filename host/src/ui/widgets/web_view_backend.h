@@ -11,7 +11,7 @@
 //     OS UI (native <select> popups, the desktop clipboard, password-manager
 //     autofill) never renders into the frame stream.
 //
-//   * CefWebView (cef/cef_web_view.h, built only with AI_CAD_ENABLE_CEF) — an
+//   * CefWebView (cef/cef_web_view.h, built only with CHUDWARE_ENABLE_CEF) — an
 //     in-process Chromium Embedded Framework off-screen render straight to a GL
 //     texture. CEF composites its own <select>/popup layer and bridges the OS
 //     clipboard, so those interactions work. See docs/cef_webview.md for the
@@ -105,8 +105,8 @@ public:
 
 // Backend selection, single source of truth. Returns the in-process CefWebView —
 // the one and only embedded-browser backend — whenever built with
-// AI_CAD_ENABLE_CEF (the default on every OS; no runtime toggle). Only an
-// SDK-less build (AI_CAD_ENABLE_CEF=OFF, e.g. CI without the CEF binary dist)
+// CHUDWARE_ENABLE_CEF (the default on every OS; no runtime toggle). Only an
+// SDK-less build (CHUDWARE_ENABLE_CEF=OFF, e.g. CI without the CEF binary dist)
 // falls back to the inert NullWebView. Call sites stay backend-agnostic:
 // `auto web = ui::makeWebView();  web->open(...);`.
 std::unique_ptr<IWebViewBackend> makeWebView();

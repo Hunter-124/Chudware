@@ -2,7 +2,7 @@
 
 #include <cstdio>
 
-namespace aicad::firmware {
+namespace chudware::firmware {
 
 std::string fmt_g(double v) {
     char buf[64];
@@ -86,4 +86,4 @@ std::string py_repr(const nlohmann::json& v) {
     return "None";
 }
 
-}  // namespace aicad::firmware
+}  // namespace chudware::firmware

@@ -6,13 +6,13 @@
 #include "agent/complexity.h"
 #include "agent/domain.h"
 
-using aicad::agent::classify_complexity;
-using aicad::agent::classify_domain;
-using aicad::agent::Complexity;
-using aicad::agent::Domain;
-using aicad::agent::ExecStructure;
-using aicad::agent::recommend_structure;
-using aicad::agent::structure_label;
+using chudware::agent::classify_complexity;
+using chudware::agent::classify_domain;
+using chudware::agent::Complexity;
+using chudware::agent::Domain;
+using chudware::agent::ExecStructure;
+using chudware::agent::recommend_structure;
+using chudware::agent::structure_label;
 
 TEST_CASE("canonical standoff is SOLO (skips planner)") {
     // THE user's example: dimension-clause commas must NOT count as object joiners.

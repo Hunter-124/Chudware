@@ -10,7 +10,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad {
+namespace chudware {
 namespace tolerance {
 
 using nlohmann::json;
@@ -36,4 +36,4 @@ json stackup_analyze(const json& dims);
 bool call(const std::string& method, const json& params, json& result, std::string& err);
 
 }  // namespace tolerance
-}  // namespace aicad
+}  // namespace chudware

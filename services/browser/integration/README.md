@@ -35,8 +35,8 @@ Live cases are gated behind an env flag **and** a saved profile per source.
 3. **Run the gated suite** with the flag set:
 
    ```bash
-   AICAD_BROWSER_INTEGRATION_TESTS=1 \
-     ~/.local/share/AI-CAD/mcp-venv/bin/python -m pytest \
+   CHUDWARE_BROWSER_INTEGRATION_TESTS=1 \
+     ~/.local/share/Chudware/mcp-venv/bin/python -m pytest \
      services/browser/integration/ -v
    ```
 

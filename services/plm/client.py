@@ -9,7 +9,7 @@ deliberately un-widened (contract §7.1).
 
 Bridge enablement precedence (see ``services.agent.plm_bridge``):
     1. project manifest ``ai_mode == "managed"`` → real client (no env needed)
-    2. ``AICAD_PLM_BRIDGE=1`` → real client
+    2. ``CHUDWARE_PLM_BRIDGE=1`` → real client
     3. otherwise → MockVault (default off)
 
 Surface (frozen, must satisfy the Protocol verbatim):

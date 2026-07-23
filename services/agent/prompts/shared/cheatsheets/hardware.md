@@ -177,7 +177,7 @@ Two routes, both data-driven so the modeller context stays uniform:
    for catalog hardware; the geometry is owned, offline, and editable.
 2. **Register vendor CAD** — drop a STEP/BREP/STL into the watched parts-library folder (auto-
    registered), or call `vendor_part_register_local_cad(supplier, part_number, cad_path, specs)`.
-   Cached under `%APPDATA%/AI-CAD/vendor_parts`, surfaced to the agent via `context_card()` and
+   Cached under `%APPDATA%/Chudware/vendor_parts`, surfaced to the agent via `context_card()` and
    inserted with `vendor_part_insert` / `import_ops_for_part()` as a frozen import feature. The
    McMaster-Carr Product Information API and other supplier APIs populate the SAME registry when
    credentials are configured — **do not scrape supplier websites**; use approved APIs or downloads.

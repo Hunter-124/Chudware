@@ -1,4 +1,4 @@
-// In-process sampling profiler for the AI-CAD core.
+// In-process sampling profiler for the Chudware core.
 //
 // WHY this exists: modeling slowness (extrude/fillet/boolean/pattern/tessellate/rebuild)
 // lives mostly DEEP INSIDE OCCT and our sketch solver, where a per-feature stopwatch can
@@ -20,7 +20,7 @@
 //      LATER, in report(), when nothing is suspended, via DbgHelp (Sym*). This is the only
 //      place DbgHelp is touched, so its single-threaded lock is never contended.
 //
-// Symbols: libaicad.dll ships a PDB (see CMakeLists /Zi /DEBUG) so OUR frames resolve to
+// Symbols: libchudware.dll ships a PDB (see CMakeLists /Zi /DEBUG) so OUR frames resolve to
 // real names. OCCT prebuilt has no PDBs, so its frames resolve to module-level
 // "TKBO!0x1234" — which is exactly the attribution we want there ("70% of time in TKBO =
 // booleans dominate"). See docs/PROFILER.md.
@@ -36,14 +36,14 @@
 #include <string>
 #include <nlohmann/json.hpp>
 
-namespace aicad {
+namespace chudware {
 namespace prof {
 
 // Start the background sampler. Idempotent: a second start() while already running just
 // updates nothing and returns false. interval_us is the sampling period (clamped to a sane
 // floor); mode is informational ("modeling" | "all") and recorded in the report — the
 // actual scoping of WHICH thread/when is driven by the TargetScope guards placed by the
-// caller (see core/api/libaicad.cpp). Returns true if this call started the sampler.
+// caller (see core/api/libchudware.cpp). Returns true if this call started the sampler.
 bool start(unsigned interval_us, const std::string& mode);
 
 // Stop the background sampler and join its thread. Accumulated samples are RETAINED so a
@@ -105,4 +105,4 @@ nlohmann::json report(const nlohmann::json& opts);
 nlohmann::json tree_report(const nlohmann::json& opts = nlohmann::json::object());
 
 }  // namespace prof
-}  // namespace aicad
+}  // namespace chudware

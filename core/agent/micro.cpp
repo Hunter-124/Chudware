@@ -22,7 +22,7 @@
 #include "agent/domain.h"
 #include "agent/complexity.h"
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 
 namespace {
@@ -1166,4 +1166,4 @@ json run_micro_design(const std::string& request, const std::string& doc_id,
 }
 
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware

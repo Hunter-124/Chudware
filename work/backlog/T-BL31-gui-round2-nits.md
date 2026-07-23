@@ -21,7 +21,7 @@ fixes with 0 regressions and 0 blockers, and surfaced these small items. Full fi
 ## Definition of done
 
 - [x] **NEW-1 (verify FIRST, fix only if real):** REAL, not synthetic — reproduced with
-      `AI_CAD_SHOT=pmform AI_CAD_PMBOX=1 AI_CAD_PMCMD=extrude_boss` (a real box loaded, real
+      `CHUDWARE_SHOT=pmform CHUDWARE_PMBOX=1 CHUDWARE_PMCMD=extrude_boss` (a real box loaded, real
       extrude PM) in both themes: the C27-A parameter-callout chips ("Depth: 10mm",
       "Draft angle: 0deg", `viewport_panel.cpp` ~L3502-3574) dock/clamp against the raw
       viewport edge `cr1.x`, not `overlayColumnEdge(1)` the way sibling HUD elements in the
@@ -34,9 +34,9 @@ fixes with 0 regressions and 0 blockers, and surfaced these small items. Full fi
       `ui::overlayBand().minY` (the same ribbon-bottom Y the FeatureManager/Copilot columns
       already publish/consume), falling back to the old 64dp guess pre-publish. Verified
       light+dark: toast card now sits fully clear of the ribbon groups. (2) Capture-harness
-      ask: `AI_CAD_SHOT=ribbon` now suppresses toasts by default (`AppState::suppressToasts`,
+      ask: `CHUDWARE_SHOT=ribbon` now suppresses toasts by default (`AppState::suppressToasts`,
       checked in `AppState::toast()`) so per-tab icon verification isn't occluded;
-      `AI_CAD_SHOT_KEEPTOAST=1` re-enables + pushes the toast for testing its own
+      `CHUDWARE_SHOT_KEEPTOAST=1` re-enables + pushes the toast for testing its own
       position/styling. (3) Dark-theme styling: re-verified light+dark — the card renders
       legible (teal "Info" tag, white body text, dark glass) in both; did not reproduce a
       literal "white" card in either theme with the fix in place.

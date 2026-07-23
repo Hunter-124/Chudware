@@ -49,5 +49,5 @@ surface.
       scripted walkthrough; no manual reading required)
 - [ ] Per-project AI tier switchable in Hub settings; Copilot dock answers a
       what-changed query with cited history entries
-- [ ] T-U1 conformance + AI_CAD_SHOT scenarios (hub grid, release board, tour);
+- [ ] T-U1 conformance + CHUDWARE_SHOT scenarios (hub grid, release board, tour);
       gate + graphify update .

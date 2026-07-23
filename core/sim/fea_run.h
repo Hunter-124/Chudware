@@ -20,7 +20,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad::sim {
+namespace chudware::sim {
 
 // Resolve mesh nodes within tol_mm of ANY faceset sample point — a direct port
 // of engine/sim/fea_static.py:_nodes_in_faceset. points is n*3 flat, sample is
@@ -116,4 +116,4 @@ nlohmann::json fea_run_modal(const nlohmann::json& study, int n_modes);
 // Never throws: a bad mesh / singular model returns {ok:false, error}.
 nlohmann::json fea_run_thermal(const nlohmann::json& study);
 
-}  // namespace aicad::sim
+}  // namespace chudware::sim

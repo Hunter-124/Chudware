@@ -8,7 +8,7 @@
 
 #include <cmath>
 
-namespace aicad::hydraulic {
+namespace chudware::hydraulic {
 namespace {
 
 using pyutil::jerr;
@@ -181,4 +181,4 @@ ojson fmu_simulate(const ojson& /*circuit_doc*/, const ojson& /*fmu_path*/,
     return out;
 }
 
-}  // namespace aicad::hydraulic
+}  // namespace chudware::hydraulic

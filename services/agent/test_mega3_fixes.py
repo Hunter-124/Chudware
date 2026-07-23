@@ -180,11 +180,11 @@ def test_xai_max_concurrent_default_and_env(monkeypatch):
     from services.agent.providers import xai_sub_provider as xsp
 
     xsp._reset_request_semaphore_for_tests()
-    monkeypatch.delenv("AICAD_XAI_MAX_CONCURRENT", raising=False)
-    monkeypatch.delenv("AI_CAD_XAI_MAX_CONCURRENT", raising=False)
+    monkeypatch.delenv("CHUDWARE_XAI_MAX_CONCURRENT", raising=False)
+    monkeypatch.delenv("CHUDWARE_XAI_MAX_CONCURRENT", raising=False)
     assert xsp._max_concurrent_requests() == 3
 
-    monkeypatch.setenv("AICAD_XAI_MAX_CONCURRENT", "3")
+    monkeypatch.setenv("CHUDWARE_XAI_MAX_CONCURRENT", "3")
     assert xsp._max_concurrent_requests() == 3
     xsp._reset_request_semaphore_for_tests()
 
@@ -192,11 +192,11 @@ def test_xai_max_concurrent_default_and_env(monkeypatch):
 def test_xai_read_timeout_default_and_env(monkeypatch):
     from services.agent.providers import xai_sub_provider as xsp
 
-    monkeypatch.delenv("AICAD_XAI_READ_TIMEOUT", raising=False)
-    monkeypatch.delenv("AI_CAD_XAI_READ_TIMEOUT", raising=False)
+    monkeypatch.delenv("CHUDWARE_XAI_READ_TIMEOUT", raising=False)
+    monkeypatch.delenv("CHUDWARE_XAI_READ_TIMEOUT", raising=False)
     assert xsp._read_timeout_s() == 180.0
 
-    monkeypatch.setenv("AICAD_XAI_READ_TIMEOUT", "240")
+    monkeypatch.setenv("CHUDWARE_XAI_READ_TIMEOUT", "240")
     assert xsp._read_timeout_s() == 240.0
 
 
@@ -204,7 +204,7 @@ def test_xai_complete_ex_bounds_concurrency(monkeypatch):
     """At most N concurrent _post_once calls under the semaphore."""
     from services.agent.providers import xai_sub_provider as xsp
 
-    monkeypatch.setenv("AICAD_XAI_MAX_CONCURRENT", "1")
+    monkeypatch.setenv("CHUDWARE_XAI_MAX_CONCURRENT", "1")
     xsp._reset_request_semaphore_for_tests()
 
     in_flight = 0

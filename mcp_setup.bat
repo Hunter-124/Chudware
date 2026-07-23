@@ -1,14 +1,14 @@
 @echo off
 setlocal EnableDelayedExpansion
 REM ===========================================================================
-REM  Billet MCP setup  --  portable one-click installer
+REM  Chudware MCP setup  --  portable one-click installer
 REM
-REM  Wires the Billet MCP server (id "billet"; legacy "ai-cad" entries are
+REM  Wires the Chudware MCP server (id "chudware"; legacy "ai-cad" entries are
 REM  preserved) into every MCP client you have installed:
 REM      Claude Code, Cursor, VS Code, opencode, Antigravity.
 REM
 REM  What it does:
-REM    1. Finds a Python that already has the engine deps (the AI-CAD runtime,
+REM    1. Finds a Python that already has the engine deps (the Chudware runtime,
 REM       or a repo-local .venv). If none is found, it builds a .venv here and
 REM       installs requirements.txt.
 REM    2. Verifies the MCP server actually starts.
@@ -16,7 +16,7 @@ REM    3. Writes/merges the right config file for each client (non-destructive).
 REM
 REM  Usage:   mcp_setup.bat              install / re-register (full profile)
 REM           mcp_setup.bat lite         install lite profile (capable models)
-REM           mcp_setup.bat uninstall    remove the billet (and legacy ai-cad) entries
+REM           mcp_setup.bat uninstall    remove the chudware (and legacy ai-cad) entries
 REM ===========================================================================
 
 set "REPO=%~dp0"
@@ -36,7 +36,7 @@ if /i "%~2"=="--lite"      set "PROFILE=lite"
 
 echo(
 echo ===========================================================
-echo   Billet MCP setup  (%MODE%, profile=%PROFILE%)
+echo   Chudware MCP setup  (%MODE%, profile=%PROFILE%)
 echo   repo: %REPO%
 echo ===========================================================
 echo(
@@ -44,8 +44,8 @@ echo(
 REM ---- 1. locate a usable Python -------------------------------------------
 set "PYEXE="
 
-call :try_python "%APPDATA%\Billet\runtime\venv\Scripts\python.exe"
-if not defined PYEXE call :try_python "%APPDATA%\AI-CAD\runtime\venv\Scripts\python.exe"
+call :try_python "%APPDATA%\Chudware\runtime\venv\Scripts\python.exe"
+if not defined PYEXE call :try_python "%APPDATA%\Chudware\runtime\venv\Scripts\python.exe"
 if not defined PYEXE call :try_python "%REPO%\.venv\Scripts\python.exe"
 
 if not defined PYEXE (
@@ -91,10 +91,10 @@ if errorlevel 1 ( echo  ERROR: writing client configs failed. & goto :fail )
 echo(
 echo ===========================================================
 if /i "%MODE%"=="unregister" (
-    echo   Done. The billet (and legacy ai-cad) MCP server was removed from all clients.
+    echo   Done. The chudware (and legacy ai-cad) MCP server was removed from all clients.
 ) else (
     echo   Done. Restart any open client to pick up the server:
-    echo     - Claude Code : reopen this folder; approve "billet" when prompted
+    echo     - Claude Code : reopen this folder; approve "chudware" when prompted
     echo     - Cursor      : Settings ^> MCP  (or just reopen the project^)
     echo     - VS Code     : reopen the folder; Start the server in .vscode/mcp.json
     echo     - opencode    : run it from this folder

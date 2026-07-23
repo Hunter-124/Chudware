@@ -19,7 +19,7 @@ over-viewport surface on `glassPanel()`/`adaptiveSurface()`, shortcomings list i
 `docs/GLASS_DESIGN_SPEC.md` cleared), P2 full 21-scenario screenshot battery on both
 binaries with sign-off per pair, then the G5 cutover: retarget `scripts/check.py`,
 `scripts/feature_surface_audit.py`, `scripts/parity_audit.py` to `ui/imgui` +
-`ui/abstract`, and mark host EOL in `AGENTS.md`. After this task, AI-CAD2 (ShopCraft)
+`ui/abstract`, and mark host EOL in `AGENTS.md`. After this task, AI-CAD2 (Chudware)
 is the production GUI on Linux; `host/` survives only until T-G11's Windows check.
 
 ## Files / areas touched
@@ -83,16 +83,16 @@ is the production GUI on Linux; `host/` survives only until T-G11's Windows chec
   rendering unchanged.
 
   **Scope addition 1 — the 5 parity diff harnesses (DONE, clean-room 5/5 PASS, 22/22 checks):**
-  Infra: env-gated `AI_CAD_RPC_TRACE` JSONL trace at WorkerClient::call() — the single
+  Infra: env-gated `CHUDWARE_RPC_TRACE` JSONL trace at WorkerClient::call() — the single
   funnel both binaries' panel RPCs pass through regardless of routing (Python worker,
-  in-process libaicad, ECAD/agent C++ seams); services/worker is linked by BOTH binaries
+  in-process libchudware, ECAD/agent C++ seams); services/worker is linked by BOTH binaries
   so one hook instruments both. Credential fields (api_key etc.) are redacted. Off by
   default (tail call when env unset). Harnesses in `tools/gui_parity/` (common.py +
-  run_all.py): capture the same AI_CAD_SHOT scenario on both binaries, diff the
+  run_all.py): capture the same CHUDWARE_SHOT scenario on both binaries, diff the
   normalized domain request slice (engine-minted ids canonicalized; pure catalog reads
   order-free; timings/paths scrubbed — scrub lists are explicit in the code), then for
   gcode/DXF/PDF replay each binary's captured state-building requests through
-  mcp_server.core_bridge (same libaicad) and byte-diff the artifacts host-derived vs
+  mcp_server.core_bridge (same libchudware) and byte-diff the artifacts host-derived vs
   aicad2-derived. Results (fresh captures, both binaries):
     - gcode: requests PASS; all 8 post dialects byte-identical (centroid/fanuc/grbl/haas/
       linuxcnc/mach3/marlin/siemens .nc)

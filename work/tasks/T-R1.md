@@ -39,7 +39,7 @@ In work → Released → Superseded, advisory locks + no-merge team v1.
   registry, part numbers, rev letters, lifecycle, release pins, BOM freeze),
   shadow-tree layout, history-entry semantics (auto/checkpoint/release/restore,
   user vs AI attribution), lock manifest + atomic-push CAS protocol, remote
-  profile kinds (folder/ssh/https git; `aicad-cloud` kind RESERVED config-only
+  profile kinds (folder/ssh/https git; `chudware-cloud` kind RESERVED config-only
   per Pillar-12 human gate), plm_* MCP tool surface (names + envelopes).
 - docs/PLM_VERSION_CONTROL_PLAN.md — update with survey verdicts; mark contract
   frozen.

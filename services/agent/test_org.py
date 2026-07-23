@@ -8,7 +8,7 @@ DoD proofs required (per task file + advisor):
   4. Re-org revision bump: reorg() increments chart_revision.
   5. Report cadence: dept report emitted every N node completions.
 
-All tests run headless: no FastMCP, no libaicad, no LLM.  Ledger injection uses
+All tests run headless: no FastMCP, no libchudware, no LLM.  Ledger injection uses
 the real Ledger (T-W1, MERGED) against a tmp_path.
 """
 from __future__ import annotations
@@ -365,7 +365,7 @@ class TestSilentExpiryImpossible:
 
     def test_concern_ages_into_overseer_audit_context(self):
         """An unresolved concern surfaces in the overseer feed after one turn."""
-        os.environ["AICAD_OVERSEER"] = "1"
+        os.environ["CHUDWARE_OVERSEER"] = "1"
         try:
             org = OrgState(org_chart=build_org_chart({
                 "schema": "aicad.deliverables/1",
@@ -392,7 +392,7 @@ class TestSilentExpiryImpossible:
             # The request is STILL open (aging surfaces it, never drops it).
             assert org.open_requests() == [req]
         finally:
-            os.environ.pop("AICAD_OVERSEER", None)
+            os.environ.pop("CHUDWARE_OVERSEER", None)
             # Re-import to reset the module-level flag for other tests
             import importlib
             import services.agent.org as _org_mod
@@ -400,7 +400,7 @@ class TestSilentExpiryImpossible:
 
     def test_resolved_concern_does_not_surface_in_audit_feed(self):
         """A resolved concern never appears in the overseer feed."""
-        os.environ["AICAD_OVERSEER"] = "1"
+        os.environ["CHUDWARE_OVERSEER"] = "1"
         try:
             org = OrgState(org_chart=build_org_chart({
                 "schema": "aicad.deliverables/1",
@@ -417,14 +417,14 @@ class TestSilentExpiryImpossible:
             # Resolved concern must not appear in the audit feed.
             assert unresolved_concern_contexts(org) == []
         finally:
-            os.environ.pop("AICAD_OVERSEER", None)
+            os.environ.pop("CHUDWARE_OVERSEER", None)
             import importlib
             import services.agent.org as _org_mod
             importlib.reload(_org_mod)
 
     def test_concern_feed_empty_when_overseer_flag_off(self):
-        """When AICAD_OVERSEER is off, the audit feed is always empty."""
-        os.environ.pop("AICAD_OVERSEER", None)
+        """When CHUDWARE_OVERSEER is off, the audit feed is always empty."""
+        os.environ.pop("CHUDWARE_OVERSEER", None)
         org = OrgState(org_chart=build_org_chart({
             "schema": "aicad.deliverables/1",
             "request_verbatim": "x",
@@ -768,7 +768,7 @@ class TestOverseerConcernFeedIntegration:
 
     def _aged_concern_org(self):
         """Return an OrgState that has one aged unresolved concern."""
-        os.environ["AICAD_OVERSEER"] = "1"
+        os.environ["CHUDWARE_OVERSEER"] = "1"
         org = OrgState(org_chart=build_org_chart({
             "schema": "aicad.deliverables/1",
             "request_verbatim": "x",
@@ -805,7 +805,7 @@ class TestOverseerConcernFeedIntegration:
             )
             assert "[/ORG-CONCERNS]" in evidence
         finally:
-            os.environ.pop("AICAD_OVERSEER", None)
+            os.environ.pop("CHUDWARE_OVERSEER", None)
 
     def test_no_org_concerns_block_when_none_passed(self):
         """assemble_evidence without org_concerns → no [ORG-CONCERNS] block."""

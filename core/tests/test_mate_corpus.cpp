@@ -10,7 +10,7 @@
 #include <fstream>
 #include <string>
 
-using namespace aicad::mate;
+using namespace chudware::mate;
 using json = nlohmann::json;
 
 namespace {

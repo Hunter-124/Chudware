@@ -36,7 +36,7 @@ class TestPrecheckMode:
         rc, out = _run({"mode": "precheck",
                         "study": {"type": "static", "fixtures": [], "loads": [],
                                   "mesh_fineness": 0.15}},
-                       {"AI_CAD_SIM_PRECHECK_BLOCK": "0"})
+                       {"CHUDWARE_SIM_PRECHECK_BLOCK": "0"})
         assert rc == 0 and out["ok"] is True
         checks = [(i["check"], i["severity"]) for i in out["items"]]
         assert ("sim_bc", "action") in checks          # no_fixture (block gate off)
@@ -46,7 +46,7 @@ class TestPrecheckMode:
     def test_block_gate_passthrough(self):
         rc, out = _run({"mode": "precheck",
                         "study": {"type": "static", "fixtures": [], "loads": []}},
-                       {"AI_CAD_SIM_PRECHECK_BLOCK": "1"})
+                       {"CHUDWARE_SIM_PRECHECK_BLOCK": "1"})
         assert rc == 0
         assert out["block_enabled"] is True
         assert any(i["severity"] == "blocker" for i in out["items"])
@@ -90,8 +90,8 @@ class TestPostcheckMode:
 
 class TestLedgerEvent:
     def test_event_written_when_run_id_present(self, tmp_path):
-        # cache_root() honours the AICAD_CACHE_ROOT test seam (services/agent/interaction.py).
-        env = {"AICAD_CACHE_ROOT": str(tmp_path)}
+        # cache_root() honours the CHUDWARE_CACHE_ROOT test seam (services/agent/interaction.py).
+        env = {"CHUDWARE_CACHE_ROOT": str(tmp_path)}
         rc, out = _run({"mode": "precheck",
                         "study": {"type": "static", "fixtures": [], "loads": []},
                         "ledger_run_id": "r_test_sim3", "study_id": "study-abc"},

@@ -11,7 +11,7 @@ Monkeypatches vision backends (RE-34 research_ingest seam pattern) to prove:
   5. Missing imports degrade honestly (ok=False / backend_not_provisioned) — never
      a synthetic success.
 
-Hermetic: no COLMAP/OpenMVS/libaicad required. Run:
+Hermetic: no COLMAP/OpenMVS/libchudware required. Run:
 
   pytest services/mcp/test_reveng_pipeline_agent.py services/mcp/test_recon_hints.py -q
 """
@@ -102,8 +102,8 @@ def _patch_reveng_status(monkeypatch, value):
 
 @pytest.fixture()
 def session_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """Point AICAD_REVENG_DIR at tmp and seed a session with images + mesh."""
-    monkeypatch.setenv("AICAD_REVENG_DIR", str(tmp_path))
+    """Point CHUDWARE_REVENG_DIR at tmp and seed a session with images + mesh."""
+    monkeypatch.setenv("CHUDWARE_REVENG_DIR", str(tmp_path))
     sid = "re_pipe_test"
     root = tmp_path / sid
     images = root / "images"

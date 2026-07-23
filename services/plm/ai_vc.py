@@ -330,9 +330,9 @@ def default_store_root(project_dir: str | os.PathLike | None = None) -> Path:
     try:
         from services import paths as _paths  # noqa: PLC0415
 
-        base = Path(getattr(_paths, "CACHE", None) or Path.home() / ".cache" / "billet")
+        base = Path(getattr(_paths, "CACHE", None) or Path.home() / ".cache" / "chudware")
     except Exception:  # noqa: BLE001
-        base = Path.home() / ".cache" / "billet"
+        base = Path.home() / ".cache" / "chudware"
     p = base / "ai_vc"
     p.mkdir(parents=True, exist_ok=True)
     return p

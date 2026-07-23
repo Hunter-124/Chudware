@@ -545,7 +545,7 @@ def test_parse_xai_tier_and_provider_resolution(tmp_config, monkeypatch):
     assert parse_xai_tier("openrouter:x") is None
     assert effort_tier_for("xai:grok-4.5") == "frontier"
 
-    monkeypatch.delenv("AI_CAD_PROVIDER", raising=False)
+    monkeypatch.delenv("CHUDWARE_PROVIDER", raising=False)
 
     # No subscription → API-key path.
     calls = []
@@ -1284,7 +1284,7 @@ def test_xai_complete_ex_rotates_on_timeout(tmp_config, monkeypatch):
         lambda account_id, cred=None, force=True: dict(cred or {}) | {"account_id": account_id},
     )
     # No same-account timeout retries in this unit test — rotate immediately.
-    monkeypatch.setenv("AICAD_XAI_READ_TIMEOUT_RETRIES", "0")
+    monkeypatch.setenv("CHUDWARE_XAI_READ_TIMEOUT_RETRIES", "0")
     xsp._reset_request_semaphore_for_tests()
 
     p = xsp.XAISubProvider()

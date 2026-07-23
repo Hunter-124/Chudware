@@ -6,7 +6,7 @@
 
 #include "piping/pyutil.h"
 
-namespace aicad::hydraulic {
+namespace chudware::hydraulic {
 
 using pyutil::ojson;
 
@@ -17,4 +17,4 @@ ojson hydraulic_bom_lines(const ojson& doc);
 // {"total", "by_type", "missing_mpn", "sourced"} — by_type in first-seen order.
 ojson sourcing_summary(const ojson& doc);
 
-}  // namespace aicad::hydraulic
+}  // namespace chudware::hydraulic

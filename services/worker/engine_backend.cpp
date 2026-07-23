@@ -30,7 +30,7 @@ using nlohmann::json;
 
 namespace {
 
-aicad_ipc::EngineClient* g_client = nullptr;  // non-null iff daemon mode won
+chudware_ipc::EngineClient* g_client = nullptr;  // non-null iff daemon mode won
 bool g_daemon = false;
 std::once_flag g_once;
 
@@ -57,17 +57,17 @@ std::string selfExePath() {
 }  // namespace
 
 // hostd binary hint, mirroring services/mcp/daemon_bridge.py resolve_hostd_bin:
-// $AICAD_HOSTD_BIN is honored inside resolveHostdBin(); the hint covers
-// exe-adjacent (installed layout: dist/AI-CAD stages both binaries together)
+// $CHUDWARE_HOSTD_BIN is honored inside resolveHostdBin(); the hint covers
+// exe-adjacent (installed layout: dist/Chudware stages both binaries together)
 // then the repo dev-tree build.
 std::string hostdBinHint() {
     namespace fs = std::filesystem;
     std::error_code ec;
 #ifdef _WIN32
-    const char* exeName = "aicad-hostd.exe";
+    const char* exeName = "chudware-hostd.exe";
     const char* devBuildDir = "build";  // core\build: the build.bat / MSVC preset dir
 #else
-    const char* exeName = "aicad-hostd";
+    const char* exeName = "chudware-hostd";
     const char* devBuildDir = "build-occt-linux";
 #endif
     const std::string self = selfExePath();
@@ -90,7 +90,7 @@ namespace {
 
 // One-shot startup latency probe: N pings over the socket, logged to stderr so
 // the number lands in the app log/console (Phase 4 deliverable: <0.5 ms/call).
-void logPingLatency(aicad_ipc::EngineClient& c) {
+void logPingLatency(chudware_ipc::EngineClient& c) {
     json r;
     std::string e;
     const int N = 200;
@@ -107,19 +107,19 @@ void initOnce() {
     // Browser client is ALWAYS daemon mode. Do NOT connect here — first paint
     // must not block on WebSocket open/hello. maintainConnection() connects
     // with backoff once the frame loop is running.
-    auto* c = new aicad_ipc::EngineClient();
+    auto* c = new chudware_ipc::EngineClient();
     g_client = c;
     g_daemon = true;
     std::fprintf(stderr, "[engine] WASM daemon mode armed (connect deferred)\n");
     return;
 #else
     // Phase-8 flip: daemon mode is the DEFAULT. Only an explicit
-    // AI_CAD_ENGINE_DAEMON=0 forces the legacy in-process load (kept at least
+    // CHUDWARE_ENGINE_DAEMON=0 forces the legacy in-process load (kept at least
     // one release; removal is a named N+1 task).
-    const char* f = std::getenv("AI_CAD_ENGINE_DAEMON");
+    const char* f = std::getenv("CHUDWARE_ENGINE_DAEMON");
     if (f && f[0] == '0') return;  // explicit opt-out -> legacy in-process
-    auto* c = new aicad_ipc::EngineClient();
-    aicad_ipc::EngineClient::Options opts;
+    auto* c = new chudware_ipc::EngineClient();
+    chudware_ipc::EngineClient::Options opts;
     opts.hostdBin = hostdBinHint();
     opts.clientKind = "gui";
     std::string err;
@@ -127,14 +127,14 @@ void initOnce() {
         // core_bridge.py-style loud warning + legacy fallback.
         std::fprintf(stderr,
                      "[engine] WARNING: daemon mode (default) but hostd connect failed (%s) "
-                     "— falling back to in-process libaicad\n",
+                     "— falling back to in-process libchudware\n",
                      err.c_str());
         delete c;
         return;
     }
     g_client = c;
     g_daemon = true;
-    std::fprintf(stderr, "[engine] daemon mode: connected to aicad-hostd (state=%s)\n",
+    std::fprintf(stderr, "[engine] daemon mode: connected to chudware-hostd (state=%s)\n",
                  c->serverInfo().value("state", std::string("?")).c_str());
     logPingLatency(*c);
 #endif
@@ -143,7 +143,7 @@ void initOnce() {
 // Absorb {"code":"loading"}: the daemon binds before the (slow) OCCT load and
 // answers engine calls with a retriable loading error until ready. Mirror the
 // Python bridge: poll daemon_status, bounded.
-bool waitEngineReady(aicad_ipc::EngineClient& c, std::string& err) {
+bool waitEngineReady(chudware_ipc::EngineClient& c, std::string& err) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(300);
     while (std::chrono::steady_clock::now() < deadline) {
         json st;
@@ -165,7 +165,7 @@ bool daemonMode() {
     return g_daemon;
 }
 
-aicad_ipc::EngineClient* client() {
+chudware_ipc::EngineClient* client() {
     return daemonMode() ? g_client : nullptr;
 }
 

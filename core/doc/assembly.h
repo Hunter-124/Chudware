@@ -12,9 +12,9 @@
 //
 //   2. Mate-ref resolution — every mate ref {component, selector} resolves the selector
 //      against that component's LOCAL geometry (doc/selectors.{h,cpp}) into a
-//      aicad::mate::MateGeom (plane/axis/point/sphere) in the component's local frame.
+//      chudware::mate::MateGeom (plane/axis/point/sphere) in the component's local frame.
 //
-//   3. Mate solve — aicad::mate::solve_mates over the shared numeric core places every
+//   3. Mate solve — chudware::mate::solve_mates over the shared numeric core places every
 //      floating component (fixed components pinned). Solved transforms + a per-mate
 //      status list + the DOF summary are reported.
 //
@@ -37,7 +37,7 @@
 
 #include "mate/mate.h"
 
-namespace aicad::doc {
+namespace chudware::doc {
 
 // One placed component body in the assembly result.
 struct AsmBodyOut {
@@ -73,7 +73,7 @@ struct AsmMateStatus {
 struct AsmMateRefGeom {
     int ref_index = 0;                       // 0 or 1 (mate refs order)
     std::string component;                   // owning component id
-    aicad::mate::MateGeom geom;              // local-frame plane/axis/point/sphere
+    chudware::mate::MateGeom geom;              // local-frame plane/axis/point/sphere
 };
 
 // The result of compiling an assembly (mirror of assembly.py::AssemblyResult).
@@ -86,7 +86,7 @@ struct AssemblyResult {
     bool converged = true;
     std::string dof_summary;
     std::map<std::string, std::vector<double>> transforms;  // component_id -> 16f (solved)
-    aicad::mate::WarmMap warm;                               // component_id -> (t,w)
+    chudware::mate::WarmMap warm;                               // component_id -> (t,w)
     // mate_id -> its resolved refs (only refs whose selector resolved; T-FIN20 dynamics)
     std::map<std::string, std::vector<AsmMateRefGeom>> mate_geometry;
 };
@@ -96,8 +96,8 @@ struct AssemblyResult {
 // solve across re-solves. `drag` (optional) threads a soft-target through the solver.
 AssemblyResult compile_assembly(const nlohmann::json& doc,
                                 const std::string& base_dir = std::string(),
-                                const std::optional<aicad::mate::WarmMap>& warm = std::nullopt,
-                                const std::optional<aicad::mate::Drag>& drag = std::nullopt);
+                                const std::optional<chudware::mate::WarmMap>& warm = std::nullopt,
+                                const std::optional<chudware::mate::Drag>& drag = std::nullopt);
 
 // Fingerprints of every non-suppressed component's resolved source file
 // ([{path, size, mtime}] — same identity the in-memory component cache keys on). Written
@@ -126,4 +126,4 @@ TopoDS_Shape placed_world_shape(const AsmBodyOut& body,
 gp_Trsf placed_world_trsf(const AsmBodyOut& body,
                           const std::optional<Eigen::Vector3d>& explode_offset = std::nullopt);
 
-}  // namespace aicad::doc
+}  // namespace chudware::doc

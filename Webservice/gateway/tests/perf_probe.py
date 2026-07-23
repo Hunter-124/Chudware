@@ -2,11 +2,11 @@
 
 Run standalone (cwd = Webservice/gateway)::
 
-    BILLET_LIVE=1 .venv/bin/python tests/perf_probe.py [--rebaseline]
+    CHUDWARE_LIVE=1 .venv/bin/python tests/perf_probe.py [--rebaseline]
 
-Or via pytest (skipped unless BILLET_LIVE=1)::
+Or via pytest (skipped unless CHUDWARE_LIVE=1)::
 
-    BILLET_LIVE=1 .venv/bin/pytest -m perf tests/perf_probe.py
+    CHUDWARE_LIVE=1 .venv/bin/pytest -m perf tests/perf_probe.py
 """
 
 from __future__ import annotations
@@ -36,8 +36,8 @@ BASELINE_PATH = PERF_DIR / "baseline.json"
 TRACES_DIR = PERF_DIR / "traces"
 
 HOSTD_SOCK = os.environ.get(
-    "BILLET_WEBD_SOCKET",
-    f"{os.environ.get('XDG_RUNTIME_DIR', f'/tmp/aicad-{os.getuid()}')}/aicad/hostd-billetweb.sock",
+    "CHUDWARE_WEBD_SOCKET",
+    f"{os.environ.get('XDG_RUNTIME_DIR', f'/tmp/chudware-{os.getuid()}')}/chudware/hostd-chudwareweb.sock",
 )
 DEV_HEADERS = {"X-Dev-User": "haedmonds69@gmail.com"}
 N_ITERS = 20
@@ -110,9 +110,9 @@ def _utc_iso() -> str:
 
 
 def _require_live() -> None:
-    if os.environ.get("BILLET_LIVE") != "1":
+    if os.environ.get("CHUDWARE_LIVE") != "1":
         raise RuntimeError(
-            "BILLET_LIVE=1 is required to run the live perf probe "
+            "CHUDWARE_LIVE=1 is required to run the live perf probe "
             f"(socket {HOSTD_SOCK})"
         )
     if not Path(HOSTD_SOCK).exists():
@@ -296,11 +296,11 @@ def measure_direct() -> tuple[dict[str, dict[str, float]], str]:
 
 
 def _import_app():
-    """Import gateway app with BILLET_WEB_DEV=1 so X-Dev-User auth works."""
-    os.environ["BILLET_WEB_DEV"] = "1"
+    """Import gateway app with CHUDWARE_WEB_DEV=1 so X-Dev-User auth works."""
+    os.environ["CHUDWARE_WEB_DEV"] = "1"
     os.environ.setdefault(
-        "BILLET_WEB_DATA_ROOT",
-        str(Path.home() / "billet-web-data-perf"),
+        "CHUDWARE_WEB_DATA_ROOT",
+        str(Path.home() / "chudware-web-data-perf"),
     )
     # Prefer package import used by other tests; fall back to `from app import app`.
     parent = str(GATEWAY_DIR.parent)
@@ -573,7 +573,7 @@ def run_probe(*, rebaseline: bool = False) -> dict[str, Any]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Billet hostd/gateway perf probe")
+    parser = argparse.ArgumentParser(description="Chudware hostd/gateway perf probe")
     parser.add_argument(
         "--rebaseline",
         action="store_true",
@@ -592,8 +592,8 @@ def main(argv: list[str] | None = None) -> int:
 
 @pytest.mark.perf
 @pytest.mark.skipif(
-    os.environ.get("BILLET_LIVE") != "1",
-    reason="live hostd probe requires BILLET_LIVE=1",
+    os.environ.get("CHUDWARE_LIVE") != "1",
+    reason="live hostd probe requires CHUDWARE_LIVE=1",
 )
 def test_perf_probe() -> None:
     """Pytest entry: same battery + ratchet as the standalone script."""

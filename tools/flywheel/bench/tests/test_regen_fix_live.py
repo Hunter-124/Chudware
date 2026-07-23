@@ -2,8 +2,8 @@
 C++ core (compare_parts / eval_compare). Skipped with a reason when the core can't be located.
 
 Run against the built engine with:
-    AI_CAD_LIBAICAD=$PWD/core/build-linux/bin/libaicad.so \
-    PYTHONPATH=$PWD ~/.local/share/AI-CAD/mcp-venv/bin/python -m pytest \
+    CHUDWARE_LIBCHUDWARE=$PWD/core/build-linux/bin/libchudware.so \
+    PYTHONPATH=$PWD ~/.local/share/Chudware/mcp-venv/bin/python -m pytest \
     tools/flywheel/bench/tests/test_regen_fix_live.py -q
 """
 import copy
@@ -17,7 +17,7 @@ from tools.flywheel.bench.corpus import regen_corpus as RC
 
 _OPENER, _COMPARE = RF._make_live_verifier()
 pytestmark = pytest.mark.skipif(_OPENER is None,
-                                reason="C++ core not available (set AI_CAD_LIBAICAD)")
+                                reason="C++ core not available (set CHUDWARE_LIBCHUDWARE)")
 
 
 def _good():

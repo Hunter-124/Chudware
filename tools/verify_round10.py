@@ -1,8 +1,8 @@
 """Round-10 fix verification (post user's additional fixes + TEXT feature).
 
-Drives the engine via core_bridge against whatever libaicad.dll AI_CAD_DIST points at
+Drives the engine via core_bridge against whatever libchudware.dll CHUDWARE_DIST points at
 (defaults to the build-tree bin so it tests the freshest build). Run:
-  AI_CAD_DIST set automatically below; from repo root:
+  CHUDWARE_DIST set automatically below; from repo root:
   PYTHONPATH=. <runtime-venv-python> tools/verify_round10.py
 
 Checks (each prints PASS/FAIL with the observed value):
@@ -15,8 +15,8 @@ Checks (each prints PASS/FAIL with the observed value):
   7. inspect_section in-plane Ixx/Iyy correct for a FRONT (non-XY) section
 """
 import os, sys
-os.environ.setdefault("AI_CAD_DIST", os.path.abspath("core/build-occt/bin/Release"))
-import tools.aicad_drive as d
+os.environ.setdefault("CHUDWARE_DIST", os.path.abspath("core/build-occt/bin/Release"))
+import tools.chudware_drive as d
 from mcp_server import core_bridge as cb
 
 PI = 3.141592653589793

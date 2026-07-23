@@ -3,11 +3,11 @@
 All tests use injected mock agent functions (no live LLM, no engine build).
 
 Run with:
-    ~/.local/share/AI-CAD/mcp-venv/bin/pytest services/dag/test_node_runner.py -q
+    ~/.local/share/Chudware/mcp-venv/bin/pytest services/dag/test_node_runner.py -q
 
 Or with real engine available:
-    AI_CAD_LIBAICAD=$PWD/core/build-linux/bin/libaicad.so \\
-        ~/.local/share/AI-CAD/mcp-venv/bin/pytest services/dag/test_node_runner.py -q
+    CHUDWARE_LIBCHUDWARE=$PWD/core/build-linux/bin/libchudware.so \\
+        ~/.local/share/Chudware/mcp-venv/bin/pytest services/dag/test_node_runner.py -q
 """
 from __future__ import annotations
 
@@ -639,7 +639,7 @@ class TestDefaultAgentFnSeams:
         assert all(e["actor"] == "n_build" for e in events)
 
     def test_default_agent_fn_passes_tier_generation_budget(self, monkeypatch):
-        """AI_CAD_TIER set → run_turn gets that tier's generation_headroom as
+        """CHUDWARE_TIER set → run_turn gets that tier's generation_headroom as
         max_tokens (bounded by tier budgets, aicad.effort/1 seam)."""
         from services.agent import config as agent_config
         from services.agent import agent_turn as at
@@ -647,7 +647,7 @@ class TestDefaultAgentFnSeams:
 
         monkeypatch.setattr(agent_config, "get_provider",
                             lambda name=None, cfg=None: _TurnScriptedProvider())
-        monkeypatch.setenv("AI_CAD_TIER", "local-24k")
+        monkeypatch.setenv("CHUDWARE_TIER", "local-24k")
 
         seen = {}
         real_run_turn = at.run_turn
@@ -661,13 +661,13 @@ class TestDefaultAgentFnSeams:
         assert seen.get("max_tokens") == load_tier("local-24k").generation_headroom
 
     def test_default_agent_fn_no_tier_uses_default_cap(self, monkeypatch):
-        """No AI_CAD_TIER → max_tokens None → agent_turn's shipped 2048 default."""
+        """No CHUDWARE_TIER → max_tokens None → agent_turn's shipped 2048 default."""
         from services.agent import config as agent_config
         from services.agent import agent_turn as at
 
         monkeypatch.setattr(agent_config, "get_provider",
                             lambda name=None, cfg=None: _TurnScriptedProvider())
-        monkeypatch.delenv("AI_CAD_TIER", raising=False)
+        monkeypatch.delenv("CHUDWARE_TIER", raising=False)
 
         seen = {}
         real_run_turn = at.run_turn
@@ -938,7 +938,7 @@ class TestToolSchemaAndMissionDispatchWiring:
 
         monkeypatch.setattr(agent_config, "get_provider",
                             lambda name=None, cfg=None: _P())
-        monkeypatch.setenv("AI_CAD_TIER", "local-24k")
+        monkeypatch.setenv("CHUDWARE_TIER", "local-24k")
 
         led = Ledger("t_w32_slot", path=tmp_path / "ledger.json")
         monkeypatch.setattr(led, "_save", lambda: None)

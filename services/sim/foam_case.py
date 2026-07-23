@@ -90,7 +90,7 @@ def _header(cls: str, obj: str, loc: str = "") -> str:
     locline = f'    location    "{loc}";\n' if loc else ""
     return (
         "/*--------------------------------*- C++ -*----------------------------------*\\\n"
-        "| AI-CAD OpenFOAM bridge - generated case                                     |\n"
+        "| Chudware OpenFOAM bridge - generated case                                     |\n"
         "\\*---------------------------------------------------------------------------*/\n"
         "FoamFile\n{\n    version     2.0;\n    format      ascii;\n"
         f"    class       {cls};\n{locline}    object      {obj};\n}}\n"

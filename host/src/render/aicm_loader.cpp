@@ -295,11 +295,11 @@ bool loadAicmFile(const std::string& path, DocMesh& out, std::string& err) {
     std::vector<uint8_t> bytes;
     const bool cacheHit = aicmLru().lookup(path, bytes);
 
-    const bool is_shm = aicad::aicm_handoff::is_shm_uri(path);
+    const bool is_shm = chudware::aicm_handoff::is_shm_uri(path);
     if (!cacheHit) {
         std::string url;
         if (is_shm) {
-            // aicm-shm://[/]aicad_<key> → ?shm=aicad_<key> (gateway rejects a leading '/').
+            // aicm-shm://[/]chudware_<key> → ?shm=chudware_<key> (gateway rejects a leading '/').
             std::string name = path.substr(std::strlen("aicm-shm://"));
             while (!name.empty() && name.front() == '/') name.erase(name.begin());
             if (name.empty()) {
@@ -316,7 +316,7 @@ bool loadAicmFile(const std::string& path, DocMesh& out, std::string& err) {
         }
 
         std::string ferr;
-        bytes = billet::webFetch(url, ferr);
+        bytes = chudware::webFetch(url, ferr);
         if (bytes.empty()) {
             // 404 / network: fail the load as before. Do NOT cache empties.
             err = ferr.empty() ? ("empty AICM response for " + path) : ferr;
@@ -347,10 +347,10 @@ bool loadAicmFile(const std::string& path, DocMesh& out, std::string& err) {
 bool loadAicmFile(const std::string& path, DocMesh& out, std::string& err) {
     // T-PERF10: aicm-shm:// URIs (and same-process cache) via aicm_handoff. File paths
     // still use the handoff map_file path so one code path covers both.
-    aicad::aicm_handoff::Mapping m;
-    if (!aicad::aicm_handoff::map(path, m, err)) return false;
+    chudware::aicm_handoff::Mapping m;
+    if (!chudware::aicm_handoff::map(path, m, err)) return false;
     const bool ok = loadAicmBytes(m.data, m.size, out, err);
-    aicad::aicm_handoff::unmap(m);
+    chudware::aicm_handoff::unmap(m);
     return ok;
 }
 

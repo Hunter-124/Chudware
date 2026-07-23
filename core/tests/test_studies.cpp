@@ -9,7 +9,7 @@
 //   save + open -> the study survives the .step+ round-trip verbatim;
 //   delete -> the array empties.
 // doc_new / doc_open compile the (empty) document through OCCT, so this target is
-// gated on AICAD_WITH_OCCT exactly like test_document.
+// gated on CHUDWARE_WITH_OCCT exactly like test_document.
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
@@ -23,7 +23,7 @@
 #include "doc/session.h"
 
 using json = nlohmann::json;
-namespace doc = aicad::doc;
+namespace doc = chudware::doc;
 
 namespace {
 
@@ -99,7 +99,7 @@ TEST_CASE("sim study add/edit/list/save+open/delete round-trip") {
     namespace fs = std::filesystem;
     const auto stamp = std::chrono::high_resolution_clock::now().time_since_epoch().count();
     fs::path tmp = fs::temp_directory_path() /
-                   ("aicad_studies_" + std::to_string(stamp) + ".step+");
+                   ("chudware_studies_" + std::to_string(stamp) + ".step+");
     doc::doc_save(doc_id, tmp.string());
     REQUIRE(fs::exists(tmp));
 

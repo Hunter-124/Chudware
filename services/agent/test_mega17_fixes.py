@@ -172,7 +172,7 @@ def test_wire_missing_ref_retry_once(tmp_path, monkeypatch):
     from services.agent.ledger import Ledger
     from services.agent import agent_turn as at
 
-    monkeypatch.setenv("AICAD_CACHE_ROOT", str(tmp_path))
+    monkeypatch.setenv("CHUDWARE_CACHE_ROOT", str(tmp_path))
     ledger = Ledger("mega17_wire_retry", path=tmp_path / "ledger.json")
     seq = {"n": 0}
     wire_attempts = []
@@ -490,7 +490,7 @@ def test_force_inject_after_passive_is_add_power(tmp_path, monkeypatch):
     from services.agent.ledger import Ledger
     from services.agent import agent_turn as at
 
-    monkeypatch.setenv("AICAD_CACHE_ROOT", str(tmp_path))
+    monkeypatch.setenv("CHUDWARE_CACHE_ROOT", str(tmp_path))
     ledger = Ledger("mega17_power_inject", path=tmp_path / "ledger.json")
     seq = {"n": 0}
     refs = {"n": 0}

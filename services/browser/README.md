@@ -1,11 +1,11 @@
 # services/browser — user-authenticated headless-browser acquisition
 
 Headless production fetch/download uses the host **CEF daemon**
-(`cef_client.py` → `AI-CAD --cef-daemon`). Residual Playwright-compatible
+(`cef_client.py` → `Chudware --cef-daemon`). Residual Playwright-compatible
 surfaces (headed CLI login, embed, cookie export) go through
 `services/browser/driver.py`, selected by env:
 
-| `BILLET_PW_BACKEND` | Residual PW driver | Notes |
+| `CHUDWARE_PW_BACKEND` | Residual PW driver | Notes |
 |---------------------|--------------------|-------|
 | `cef` (**default**, unset) | stock `playwright` | Byte-identical to pre-factory; headless stays CEF |
 | `patchright` | `patchright` (Apache-2 drop-in) | `pip install patchright` then provision |
@@ -32,6 +32,6 @@ degrade to `{ok: false, reason: "playwright_not_installed", ...}`. Challenges
 (captcha/2FA) are **detected never solved** (`challenge.py`).
 
 Profiles created by `browser_login(site)` live under the app data dir
-(`~/.local/share/ShopCraft/browser_profiles/<site>/` or the Windows/legacy
+(`~/.local/share/Chudware/browser_profiles/<site>/` or the Windows/legacy
 equivalent — see `engine.paths.BROWSER_PROFILES`) and are **local only**:
 never synced, never uploaded, never bundled into crash reports or diagnostics.

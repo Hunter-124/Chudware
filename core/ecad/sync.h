@@ -12,7 +12,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad::ecad {
+namespace chudware::ecad {
 
 // update_board_from_sch(board, netlist, place_origin?, prune?) ->
 //   {"mutated_board": <board>, "report": {added, updated, removed, unresolved,
@@ -22,4 +22,4 @@ namespace aicad::ecad {
 nlohmann::json update_board_from_sch(const nlohmann::json& board, const nlohmann::json& netlist,
                                      const nlohmann::json& place_origin, bool prune);
 
-}  // namespace aicad::ecad
+}  // namespace chudware::ecad

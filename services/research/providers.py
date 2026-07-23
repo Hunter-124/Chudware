@@ -18,7 +18,7 @@ import time
 import urllib.parse
 from typing import Optional
 
-_UA = "Mozilla/5.0 (compatible; AI-CAD-research/1.0)"
+_UA = "Mozilla/5.0 (compatible; Chudware-research/1.0)"
 
 
 class SearchProvider:

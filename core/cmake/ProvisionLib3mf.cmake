@@ -21,7 +21,7 @@
 # next to the consuming binary so loadLibrary finds it.
 #
 # LICENSE NOTE: lib3mf is BSD-2-Clause — clean to vendor + link/distribute
-# (unlike gmsh's GPL). No copyleft obligation on libaicad.dll.
+# (unlike gmsh's GPL). No copyleft obligation on libchudware.dll.
 
 set(LIB3MF_VERSION "2.5.0" CACHE STRING "lib3mf version to provision")
 set(LIB3MF_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/lib3mf"
@@ -97,9 +97,9 @@ if(LIB3MF_IMPORT_LIB)
 endif()
 
 # Deploy the lib3mf runtime DLL next to a target's binary so the CppDynamic
-# binding's CWrapper::loadLibrary("lib3mf.dll") resolves when libaicad.dll is
+# binding's CWrapper::loadLibrary("lib3mf.dll") resolves when libchudware.dll is
 # loaded from the same directory.
-function(aicad_lib3mf_copy_dll tgt)
+function(chudware_lib3mf_copy_dll tgt)
   add_custom_command(TARGET ${tgt} POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different "${LIB3MF_DLL}" "$<TARGET_FILE_DIR:${tgt}>"
     COMMENT "[lib3mf] copying lib3mf.dll next to ${tgt}")

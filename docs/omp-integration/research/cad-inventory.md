@@ -44,7 +44,7 @@ What IS live and load-bearing:
   ai_roles_*/model_rankings_*, bench_*). Every RPC returns `{"ok": bool, ...}` —
   never a traceback; GUI hides on `unknown_method`.
 - **Event stream**: `contracts/agent_events.md` (frozen, bumped `/1`→`/2`) is the
-  single schema. Storage `~/.local/share/AI-CAD/cache/runs/<run_id>/events.jsonl`
+  single schema. Storage `~/.local/share/Chudware/cache/runs/<run_id>/events.jsonl`
   (persist-then-callback+fsync) via `services/dag/event_journal.py`
   `EventJournal.emit`. C++ side: `host/src/core/app_state.h` (`AgentEvent`
   struct), `host/src/core/jobs.cpp` (drain wrapper), `host/src/ui/ai/ai_workspace.cpp`
@@ -53,7 +53,7 @@ What IS live and load-bearing:
   pipe — an OMP TUI/event mechanism would NOT replace this; at most OMP's event
   *shape/kind vocabulary* could inform additions.
 - **Subagent registry/steering**: `subagent_registry.py` is file-backed
-  (`~/.local/share/AI-CAD/cache/subagents/<id>.{json,transcript.jsonl,steer.jsonl}`)
+  (`~/.local/share/Chudware/cache/subagents/<id>.{json,transcript.jsonl,steer.jsonl}`)
   specifically because subagents run in a different process than the GUI-facing
   worker; steering is queued and drained at the subagent's next turn boundary
   (never a hard interrupt). This is a cross-process design constraint any
@@ -75,7 +75,7 @@ What IS live and load-bearing:
 | Project memory | SQLite+FTS5 recall/remember, token-budgeted | `project_memory.py` (329L) | solid, small, self-contained | OMP `mnemopi` — comparable concept (durable project memory), but OMP's is a full package; CAD's is a lean 300-line module. Worth comparing designs (see OmpMemSnap) |
 | Compaction | Transcript archival compaction, shake, handoff | `compaction.py` (1054L), `session_cmds.py` (376L) | solid — **explicitly a direct port of OMP's `snapcompact` text-phase + `handoff-document.md`** (see file docstrings quoting omp verbatim) | Already ported/adapted from OMP `snapcompact`; frame/vision-phase compaction "deferred" — a gap where OMP might be MORE advanced (image/frame compaction) |
 | Advisors | Mid-run steering, sim triage, dissent/trigger system | `advisor/` (30+ files): `overseer.py` (38K), `triggers.py`+`triggers.yaml` (48K/16K), `sim_advisor.py` (43K), `failures.py` (32K), `change_request.py`, `reroute.py`, `preflight.py`, `engine.py`, context_packs/*.md | solid, CAD-domain-specific (sim/tolerance/thread/fit triage) | No direct OMP equivalent — this is CAD-domain knowledge (engineering triage), not a generic coding-agent feature. KEEP CAD's own |
-| Proactive advisor | Opt-in token-cheap mid-run nudges on thrash/failures | `proactive_advisor.py` (406L) | solid, deliberately conservative (cooldowns/caps) | Analogous to OMP's proactive-advisor concept per `billet-ai-session-settings` skill notes — likely CAD-originated already, or a close port; check overlap before touching |
+| Proactive advisor | Opt-in token-cheap mid-run nudges on thrash/failures | `proactive_advisor.py` (406L) | solid, deliberately conservative (cooldowns/caps) | Analogous to OMP's proactive-advisor concept per `chudware-ai-session-settings` skill notes — likely CAD-originated already, or a close port; check overlap before touching |
 | Councils | Multi-seat same-model deliberation w/ typed positions + dissent | `councils.py` (1059L), `council_policy.yaml` | solid, contract-frozen (§19) | No OMP equivalent — bespoke CAD design-review mechanism. KEEP |
 | Delegation | Hierarchical delegation tree, budget meter, approval chain, depth caps | `delegation.py` (1054L) | solid, contract-frozen (§12), heavily rail-guarded (max_subagent_depth, soft_depth_limit, max_agents, BudgetMeter) | OMP `swarm-extension`/`agent` packages have subagent spawning too (see OmpArch/OmpTuiEngine scouts) — compare depth/budget model; CAD's is CAD-specific but the *mechanism* (tree + approval + budget meter) is generic and a good PORT/compare candidate |
 | Coordination | Per-run resource-claim board (doc/feature/file ownership) to prevent parallel-worker clobber | `coordination.py` (488L) | solid, file-sidecar + flock | Generic concept; may overlap OMP's multi-agent coordination primitives — compare |
@@ -94,7 +94,7 @@ What IS live and load-bearing:
 | Skills | Progressive-disclosure skill discovery/activation, explicitly modeled on OMP skills | `skills/__init__.py` (903L) + `skills/builtin/` | solid, **explicitly "modeled on Anthropic Agent Skills / omp progressive disclosure"** | Direct conceptual port already done; compare CAD's `skill://` resolver against OMP's actual skill loader for feature gaps (trigger conditions, mid-prompt activation regex already present here) |
 | Subagent registry | Cross-process live subagent session registry + steering queue (file-backed) | `subagent_registry.py` (324L), `subagent_rpc.py` | solid, explicit honesty limits (steer/terminate only honored at next turn boundary) | OMP's in-process agent tree doesn't need this cross-process file-backed design — a SIDECAR bridge must account for this boundary explicitly |
 | worker_rpc / agent_events | Host (C++) RPC surface + event schema/builders | `worker_rpc.py` (1346L), `agent_events.py` (444L) | solid, frozen contracts | This IS the host boundary — see above. Not a "port OMP" target; OMP has nothing analogous to a C++ desktop-app RPC bridge (its own bun-sidecar-bridge work is the closest parallel infra CAD would reuse in reverse) |
-| Roles / role_models / role_catalog / role_adoption | Role card system (YAML `roles/*.yaml`), role→model overrides, role catalog, adoption rules (who may self-adopt vs must request) | `roles.py` (42.4K), `role_models.py` (71.6K!), `role_catalog.py`, `role_adoption.py`, `roles/*.yaml` (29 files) | solid, very large investment | Loosely parallels OMP's dual prompt/role systems (see `billet-prompt-catalog` skill — that skill is literally about this exact YAML-vs-.md prompt-system duality already) |
+| Roles / role_models / role_catalog / role_adoption | Role card system (YAML `roles/*.yaml`), role→model overrides, role catalog, adoption rules (who may self-adopt vs must request) | `roles.py` (42.4K), `role_models.py` (71.6K!), `role_catalog.py`, `role_adoption.py`, `roles/*.yaml` (29 files) | solid, very large investment | Loosely parallels OMP's dual prompt/role systems (see `chudware-prompt-catalog` skill — that skill is literally about this exact YAML-vs-.md prompt-system duality already) |
 | Regen / diagnosis / shadow | Regen-card diagnostics, shadow mode (H7 shadow tests referenced), gym/bench harness | `regen_diagnosis.py`, `regen_card.py`, `shadow.py`, `scripts/diag_*.py` | solid-ish, more diagnostic tooling than product feature | No OMP equivalent |
 | Buildgraph | DAG planner/executor/rules/schema for build strategy | `buildgraph/` (`planner.py` 17.5K, `executor.py`, `rules.py`, `schema.py`, `mcp_tools.py`) | solid | CAD-domain-specific (feature build ordering), not an OMP concept |
 

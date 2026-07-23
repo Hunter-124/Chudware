@@ -15,7 +15,7 @@ Result: a clean `master` checkout fails to compile AI-CAD2:
 
 ```
 property_manager.cpp:2263: cannot convert 'const std::string' to 'const char*'  (f.def->label)
-property_manager.cpp:2265: 'const struct aicad::ui::PanelField' has no member named 'selMulti'
+property_manager.cpp:2265: 'const struct chudware::ui::PanelField' has no member named 'selMulti'
 ```
 
 This is the "gate-selMulti-blocker" the DAG AI-hint warns about — but it is **not** a code
@@ -28,7 +28,7 @@ I ephemerally copied the main-checkout's staged `panel_spec.{cpp,h}` into the T-
 worktree (NOT committed), rebuilt, and:
 
 - `cmake --build ui/imgui/build` → **AI-CAD2 links clean** (exit 0, 9.5 MB binary).
-- `AI_CAD_NO_FILE_DIALOGS=1 AI-CAD2 --shot scratch/smoke.png` → **renders the full shell**
+- `CHUDWARE_NO_FILE_DIALOGS=1 AI-CAD2 --shot scratch/smoke.png` → **renders the full shell**
   (ribbon + Model Tree + liquid-glass panels + Copilot), exit 0, 1600×1000 PNG.
 
 Then reverted the worktree to keep this branch clean (panel_spec is C2's write-set, not

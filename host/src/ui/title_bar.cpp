@@ -1,4 +1,4 @@
-// AI-CAD title bar — left-group chips (File/Search/Settings) + centered workspace tabs +
+// Chudware title bar — left-group chips (File/Search/Settings) + centered workspace tabs +
 // window caption buttons. Publishes fine-grained chrome::HitLayout spans so every
 // interactive element is click-through on Windows and Linux; the remaining area is draggable.
 //

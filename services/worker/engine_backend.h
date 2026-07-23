@@ -2,12 +2,12 @@
 // GUI's C++-engine calls execute.
 //
 // Two backends behind one call() contract (the CppCore::call signature):
-//   * DaemonConn  — aicad_ipc::EngineClient over the hostd unix socket
+//   * DaemonConn  — chudware_ipc::EngineClient over the hostd unix socket
 //                   (clientKind "gui"). DEFAULT since the Phase-8 flip
-//                   (unset or AI_CAD_ENGINE_DAEMON=1).
-//   * InProcCore  — legacy: core::cpp_core() dlopens libaicad into the GUI
+//                   (unset or CHUDWARE_ENGINE_DAEMON=1).
+//   * InProcCore  — legacy: core::cpp_core() dlopens libchudware into the GUI
 //                   process. Selected ONCE at startup by an explicit
-//                   AI_CAD_ENGINE_DAEMON=0 (kept >= one release; N+1 removes
+//                   CHUDWARE_ENGINE_DAEMON=0 (kept >= one release; N+1 removes
 //                   it). On daemon connect/spawn failure we log
 //                   loudly and fall back to InProcCore (same pattern as
 //                   services/mcp/core_bridge.py), so the GUI never hard-breaks.
@@ -24,17 +24,17 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad_ipc { class EngineClient; }
+namespace chudware_ipc { class EngineClient; }
 
 namespace engine {
 
 // True iff the daemon backend was selected AND connected at startup (resolved
-// once, thread-safe). False = legacy in-process libaicad.
+// once, thread-safe). False = legacy in-process libchudware.
 bool daemonMode();
 
 // The live daemon connection (nullptr unless daemonMode()). GUI-thread event
 // drain + daemon-only methods (attach_doc / edit_hold / subscribe) go here.
-aicad_ipc::EngineClient* client();
+chudware_ipc::EngineClient* client();
 
 // hostd binary hint used for daemon discovery (exe-adjacent, then the repo
 // dev tree). Short-lived side-channel EngineClients MUST set

@@ -124,7 +124,7 @@ static const char* providerWireName(int provider) {
 
 // The explicit provider/model/effort override the GUI now attaches to EVERY agent-turn RPC
 // (agent_run_v2 / agent_ask_v2 / agent_clarify_v1 / agent_mission_v1). Without it the core
-// resolves from ambient config.json + process env, so an AI_CAD_PROVIDER env var (or a config
+// resolves from ambient config.json + process env, so an CHUDWARE_PROVIDER env var (or a config
 // edited behind the GUI's back) silently beat the picker (tracker O1). saveSettings still runs
 // before each send so descriptor details (base_url / api_key / model_path) match the picker;
 // these fields pin name + model + effort explicitly on top of that.
@@ -266,7 +266,7 @@ void launchDesignRun(AppState& st, const std::string& request,
     }
     st.clearViewportForNewDoc();
     // O1: pin the picker's provider/model/effort explicitly in the RPC payload (beats an
-    // ambient AI_CAD_PROVIDER env override in the core's resolve_provider). Merge call-site
+    // ambient CHUDWARE_PROVIDER env override in the core's resolve_provider). Merge call-site
     // extras (attachments / context_refs) on top.
     nlohmann::json payload = agentProviderOverride(st.settings);
     if (extra.is_object()) {
@@ -780,7 +780,7 @@ void submitTurn(AppState& st, const std::string& text) {
     // run uses exactly what the picker shows — closing the window where a freshly-picked local
     // model still ran against a stale, previously-saved cloud endpoint (the 403 "model_failed").
     // (O1 additionally pins provider/model/effort EXPLICITLY in each RPC payload below, so an
-    // AI_CAD_PROVIDER env var can no longer silently override the picker.)
+    // CHUDWARE_PROVIDER env var can no longer silently override the picker.)
     saveSettings(st.settings);
     // M23: fold pending attachments into THIS turn. `sendText` (what the model receives) gets
     // inlined text-file content / explicit paths appended; the chat shows a compact marker.
@@ -1338,7 +1338,7 @@ void submitTurn(AppState& st, const std::string& text) {
 // ---- runtime-not-ready banner (kept from the old Design body) ----
 void drawRuntimeBanner(AppState& st) {
     if (st.workerStarted) return;
-    // The in-process C++ core (libaicad) is a complete backend on its own (doc/agent/sim route
+    // The in-process C++ core (libchudware) is a complete backend on its own (doc/agent/sim route
     // through it), so don't nag about the Python runtime when it's loaded.
     if (core::cpp_core().available()) return;
     const auto& pal = ui::palette;
@@ -1355,7 +1355,7 @@ void drawRuntimeBanner(AppState& st) {
 #ifdef _WIN32
         dimText("Run the packaged build (dist) or install.ps1 so the engine can self-install.");
 #else
-        dimText("Place libaicad.so next to the AI-CAD executable, or set AI_CAD_LIBAICAD.");
+        dimText("Place libchudware.so next to the Chudware executable, or set CHUDWARE_LIBCHUDWARE.");
 #endif
         if (ImGui::Button("Try setup now")) st.startSetup(false);
     }
@@ -1573,9 +1573,9 @@ static void drawComposerPrelude(AppState& st, bool busy) {
                                ImVec2(cx + r * 1.6f, cy + r * 0.6f), tink);
     }
     if (trigClick) ImGui::OpenPopup("##aimodemenu");
-    // Shot-only hook (AI_CAD_CHAT_MODEMENU): hold the mode drop-up open for headless
+    // Shot-only hook (CHUDWARE_CHAT_MODEMENU): hold the mode drop-up open for headless
     // screenshot verification of the per-mode gradient rows. No-op in normal use.
-    if (std::getenv("AI_CAD_CHAT_MODEMENU")) ImGui::OpenPopup("##aimodemenu");
+    if (std::getenv("CHUDWARE_CHAT_MODEMENU")) ImGui::OpenPopup("##aimodemenu");
     if (trigHov && !ImGui::IsPopupOpen("##aimodemenu"))
         ImGui::SetTooltip("%s", modeTips[mode]);
 
@@ -1980,9 +1980,9 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
     ImGui::SameLine();
     {
         if (ImGui::Button("##attach", ImVec2(iconW, segH))) {
-            if (std::getenv("AI_CAD_NO_FILE_DIALOGS")) {
+            if (std::getenv("CHUDWARE_NO_FILE_DIALOGS")) {
                 st.toast(ui::ToastLevel::Info,
-                         "File dialogs are disabled (AI_CAD_NO_FILE_DIALOGS).");
+                         "File dialogs are disabled (CHUDWARE_NO_FILE_DIALOGS).");
             } else {
                 std::string p = openFileDialog("All files (*.*)\0*.*\0");
                 if (!p.empty() &&

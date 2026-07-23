@@ -10,7 +10,7 @@
 
 #include "cam/model.h"
 
-namespace aicad {
+namespace chudware {
 namespace cam {
 namespace geo {
 
@@ -97,4 +97,4 @@ std::vector<ArcSeg> fit_arcs(const Path2&, double tol);
 
 }  // namespace geo
 }  // namespace cam
-}  // namespace aicad
+}  // namespace chudware

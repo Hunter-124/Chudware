@@ -9,7 +9,7 @@
 
 #include "firmware/templates.h"
 
-namespace aicad::firmware {
+namespace chudware::firmware {
 namespace {
 
 // mcu_family substring patterns → canonical family key (first match wins).
@@ -115,7 +115,7 @@ std::string get_platform_file(const std::string& mcu_family) {
     namespace fs = std::filesystem;
     std::string family = canonical_family(mcu_family);
     std::string want = caps_table()[family]["file"].get<std::string>();
-    fs::path dir = fs::temp_directory_path() / "aicad_renode_platforms";
+    fs::path dir = fs::temp_directory_path() / "chudware_renode_platforms";
     std::error_code ec;
     fs::create_directories(dir, ec);
     for (const auto& tf : renode_platform_files()) {
@@ -139,4 +139,4 @@ std::string get_platform_file(const std::string& mcu_family) {
     return "";
 }
 
-}  // namespace aicad::firmware
+}  // namespace chudware::firmware

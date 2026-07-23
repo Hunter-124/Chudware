@@ -15,12 +15,12 @@ DAG gates use `scope=run` (the run JSONL). These are DIFFERENT scope namespaces.
 
 (a) Use the SAME `run_id` scope for both (`FileLedger`) — meaning intake confirmations
     must also be written to the run ledger alongside the doc ledger. This is simplest,
-    testable without libaicad.so, but slightly diverges from the contract §5 "doc-scoped"
+    testable without libchudware.so, but slightly diverges from the contract §5 "doc-scoped"
     language.
 
 (b) Add an `IntakeLedger` adapter in `services/mcp/` that wraps `MemoryLedger` in tests
     and the real doc store in production. This is contract-faithful but adds complexity
-    and requires libaicad.so for real integration.
+    and requires libchudware.so for real integration.
 
 (c) The test should use `run_id` as the shared key for BOTH mechanisms (both record to
     the same `FileLedger`/`MemoryLedger` in the test) — that's the real scenario (the MCP

@@ -1,5 +1,5 @@
 #pragma once
-// AI-CAD mouse gesture wheel (C25).
+// Chudware mouse gesture wheel (C25).
 // Right-drag in the 3D viewport → 8-segment radial wheel → view preset shortcuts.
 // Right-click WITHOUT drag is reserved for a future context menu (see kRmbContextMenuHook).
 #include "imgui.h"

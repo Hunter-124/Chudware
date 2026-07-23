@@ -7,9 +7,13 @@ document can be driven by hand or by any external agent (Claude Code, Cursor, �
 document model sits under every domain — and the same UI tree compiles to WASM for the web
 app, so desktop and web stay at parity by construction.
 
-Naming: the product **displays as Chudware**; the GUI binary/target stays `Billet` with an
-`AI-CAD` compat symlink beside it. `BILLET_*` env vars are canonical (`AI_CAD_*`/`AICAD_*`
-still honored); the MCP server id is `billet` (`ai-cad` preserved).
+Naming: the product is **Chudware** (chudware.com). The GUI target is `Chudware`; the binary
+is `chudware`. `CHUDWARE_*` env vars are canonical; legacy `AI_CAD_*`/`AICAD_*`/`BILLET_*`/
+`SHOPCRAFT_*` are still honored (mapped to `CHUDWARE_*` at startup). The MCP server id is
+`chudware`. Persisted on-disk / wire formats are intentionally NOT renamed for data
+compatibility: the appdata dir reads an existing `Billet`/`AI-CAD` install wholesale (fresh
+installs use `Chudware/`, no migration); the PLM vault dir `.aicadvault`, mesh format
+`.aicm`, git refs `refs/aicad/*`, and `aicad.<x>/<n>` contract schema ids are preserved.
 
 ## Features
 
@@ -25,10 +29,10 @@ still honored); the MCP server id is `billet` (`ai-cad` preserved).
 
 ## Architecture snapshot
 
-The pure C++/CUDA kernel **`libaicad`** ([core/](core)) **is the engine** — the legacy
+The pure C++/CUDA kernel **`libchudware`** ([core/](core)) **is the engine** — the legacy
 Python engine was fully strangled out and deleted in the zero-Python cutover (T-RF21,
 2026-07-23). The C++ host ([host/](host), ~110k LOC under `host/src/ui/`) is the sole GUI
-target; it talks to the shared **`aicad-hostd`** daemon (which dlopens `libaicad`) over a
+target; it talks to the shared **`chudware-hostd`** daemon (which dlopens `libchudware`) over a
 unix socket. The **same `host/src/ui` tree compiles to WASM** for the web app
 ([Webservice/README.md](Webservice/README.md)) — desktop/web parity by construction,
 enforced by `contracts/web_parity.md` + `scripts/web_parity_probe.py`. Python remains only
@@ -37,12 +41,12 @@ under [services/](services): the MCP server, the built-in agent loop, the stdio 
 
 ```
             ┌────────────────────────────────────────────────────┐
-            │  Billet GUI (host/, native C++ — same tree → WASM) │
+            │  Chudware GUI (host/, native C++ — same tree → WASM) │
  user ─────▶│  ribbon / sketcher / viewport (GL)   copilot chat  │
             └───────┬───────────────────────────┬────────────────┘
                     │ unix socket               │ stdio
                     ▼                           ▼
-            aicad-hostd ──dlopen──▶ libaicad   services.worker_main
+            chudware-hostd ──dlopen──▶ libchudware   services.worker_main
             (daemon, core C++/CUDA engine)     (services-side methods)
                     ▲
  external agent ────┘ MCP server (services/mcp, stdio JSON-RPC)
@@ -51,18 +55,18 @@ under [services/](services): the MCP server, the built-in agent loop, the stdio 
 ## Quickstart
 
 ```bash
-./build.sh                     # core → libaicad.so, then host GUI → host/build-linux/bin/Billet
-./host/build-linux/bin/Billet  # run
+./build.sh                     # core → libchudware.so, then host GUI → host/build-linux/bin/Chudware
+./host/build-linux/bin/Chudware  # run
 bash scripts/gate.sh           # full Linux gate (check.py + builds + ctest + smokes)
 python3 scripts/check.py       # fast stdlib-only gate
 ```
 
 - Core only: presets `linux-core` / `windows-core` / `windows-occt` in
   [CMakePresets.json](CMakePresets.json); test with `ctest --test-dir core/build-linux`.
-- Host only: `cmake -S host -B host/build-linux -G Ninja && ninja -C host/build-linux Billet`
-  (`-DAI_CAD_ENABLE_CEF=OFF` for an SDK-less build). Windows: see docs/reference/BUILD_WINDOWS.md.
-- Python suites: `~/.local/share/AI-CAD/mcp-venv/bin/python -m pytest <dir> -q`.
-- GUI verification: headless `AI_CAD_SHOT=<scenario>` under `xvfb-run`.
+- Host only: `cmake -S host -B host/build-linux -G Ninja && ninja -C host/build-linux Chudware`
+  (`-DCHUDWARE_ENABLE_CEF=OFF` for an SDK-less build). Windows: see docs/reference/BUILD_WINDOWS.md.
+- Python suites: `~/.local/share/Chudware/mcp-venv/bin/python -m pytest <dir> -q`.
+- GUI verification: headless `CHUDWARE_SHOT=<scenario>` under `xvfb-run`.
 - C++17 throughout.
 
 ## MCP / agents
@@ -88,7 +92,7 @@ verify with `bash scripts/gate.sh` before review.
 
 | Dir | Purpose |
 |-----|---------|
-| [core/](core) | Pure C++/CUDA kernel → `libaicad` — **the engine** (zero Python) |
+| [core/](core) | Pure C++/CUDA kernel → `libchudware` — **the engine** (zero Python) |
 | [host/](host) | Sole GUI target (native + WASM); own GL pipeline under `host/src/render/` |
 | [services/](services) | Python services: `mcp/`, `agent/`, `worker/` + `worker_main.py`, `installer/`, `ecad/`, `sim/`, `structural/`, `piping/`, `formats/`, `dag/`, `deliverables/`, `plm/`, … |
 | [ui/viewport/](ui/viewport) | AICM mesh-format loader consumed by `core/` |

@@ -14,7 +14,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad::ecad::schema {
+namespace chudware::ecad::schema {
 
 inline constexpr const char* kSchemaSch = "aicad.sch/1";
 inline constexpr const char* kSchemaPcb = "aicad.pcb/1";
@@ -59,4 +59,4 @@ std::vector<std::string> validate_schematic(const nlohmann::json& doc);
 std::vector<std::string> validate_board(const nlohmann::json& doc);
 std::vector<std::string> validate(const nlohmann::json& doc);
 
-}  // namespace aicad::ecad::schema
+}  // namespace chudware::ecad::schema

@@ -9,7 +9,7 @@ were orphaned (in no build). R0b deleted them.
 
 - `render/aicm_loader.{h,cpp}` — AICM v1 mesh-format reader (contract:
   `docs/contracts/mesh_format.md`). Pure CPU, no GL. Kept because
-  `core/CMakeLists.txt` compiles it into the libaicad test/tool targets
+  `core/CMakeLists.txt` compiles it into the libchudware test/tool targets
   (include dir `ui/viewport/render`). Depends only on
   `core/util/aicm_handoff.h`.
 

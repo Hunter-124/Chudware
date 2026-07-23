@@ -10,7 +10,7 @@
 
 #include "piping/pyutil.h"
 
-namespace aicad::piping::simhandoff {
+namespace chudware::piping::simhandoff {
 
 using pyutil::ojson;
 
@@ -56,4 +56,4 @@ std::vector<std::string> validate_envelope(const ojson& env);
 // oracle's ValueError). Returns result for chaining.
 ojson attach(ojson result, const ojson& env);
 
-}  // namespace aicad::piping::simhandoff
+}  // namespace chudware::piping::simhandoff

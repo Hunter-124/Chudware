@@ -222,7 +222,7 @@ def test_unknown_ref_errors():
 
 def _golden(name: str, text: str, regen: bool = False) -> None:
     path = os.path.join(GOLDEN_DIR, name)
-    if regen or os.environ.get("AICAD_REGEN_GOLDEN"):
+    if regen or os.environ.get("CHUDWARE_REGEN_GOLDEN"):
         os.makedirs(GOLDEN_DIR, exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(text)
@@ -288,7 +288,7 @@ def test_schematic_roundtrip():
 
 if __name__ == "__main__":  # pragma: no cover — golden regeneration helper
     if "--regen" in sys.argv:
-        os.environ["AICAD_REGEN_GOLDEN"] = "1"
+        os.environ["CHUDWARE_REGEN_GOLDEN"] = "1"
         test_golden_ice40_lpf_csv()
         test_golden_xc7_xdc_csv()
         print(f"regenerated goldens in {GOLDEN_DIR}")

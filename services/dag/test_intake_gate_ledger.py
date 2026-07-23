@@ -12,7 +12,7 @@ Three callers are tested:
   3. C++ clarify shape (interaction/1 envelope)        → validated in test_clarify_shape.py
 
 NOTE: These tests are pure Python (MemoryLedger injected for hermeticity).
-They do NOT import core_bridge or libaicad.so.
+They do NOT import core_bridge or libchudware.so.
 """
 from __future__ import annotations
 
@@ -164,16 +164,16 @@ class TestSharedLedgerReplay:
         """_gate_ledger uses FileLedger for real run_ids; MemoryLedger for 'unknown'."""
         import os
         run_id = f"r_{uuid.uuid4().hex[:8]}"
-        old_override = os.environ.get("AICAD_CACHE_ROOT")
+        old_override = os.environ.get("CHUDWARE_CACHE_ROOT")
         try:
-            os.environ["AICAD_CACHE_ROOT"] = str(tmp_path)
+            os.environ["CHUDWARE_CACHE_ROOT"] = str(tmp_path)
             led = _gate_ledger(run_id)
             assert isinstance(led, FileLedger)
         finally:
             if old_override is None:
-                os.environ.pop("AICAD_CACHE_ROOT", None)
+                os.environ.pop("CHUDWARE_CACHE_ROOT", None)
             else:
-                os.environ["AICAD_CACHE_ROOT"] = old_override
+                os.environ["CHUDWARE_CACHE_ROOT"] = old_override
 
     def test_gate_ledger_unknown_run_id_uses_memory_ledger(self):
         """'unknown' sentinel run_id must use MemoryLedger to avoid cross-run contamination."""

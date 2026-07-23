@@ -83,11 +83,11 @@ void drawToasts(AppState& st) {
     // lock for the whole pass — contention is a rare sub-microsecond push_back.
     std::lock_guard<std::mutex> lk(st.toastsMtx);
 
-    // Visual-QA hook: AI_CAD_TOAST_DEMO=1 seeds one representative batch (dup storm for the xN
+    // Visual-QA hook: CHUDWARE_TOAST_DEMO=1 seeds one representative batch (dup storm for the xN
     // badge, every severity, overflow rows for the "+N more" cap) with long ttls so a headless
     // --ui-screenshot can capture the styling. No effect unless the env var is set.
     static bool demoSeeded = false;
-    if (!demoSeeded && std::getenv("AI_CAD_TOAST_DEMO")) {
+    if (!demoSeeded && std::getenv("CHUDWARE_TOAST_DEMO")) {
         demoSeeded = true;
         auto push = [&](ToastLevel l, const char* m) {
             Toast t; t.level = l; t.msg = m; t.ttl = toastTtl(l) + 120.0;

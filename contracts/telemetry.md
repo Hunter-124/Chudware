@@ -8,7 +8,7 @@
 
 ## 1. Scope & Principles
 
-This contract governs **what is captured locally** when AI-CAD produces an AI artifact,
+This contract governs **what is captured locally** when Chudware produces an AI artifact,
 how users react to it, and how semantic document deltas are recorded. It does **not**
 specify upload code, scheduling, or staging — those are T-H5 responsibilities.
 
@@ -429,7 +429,7 @@ Sidecar files referenced by `input_ref`, `output_ref`, `edit_ops_ref`, and `diff
 are stored in the run's sidecar directory:
 
 ```
-%APPDATA%/AI-CAD/cache/runs/<run_id>/
+%APPDATA%/Chudware/cache/runs/<run_id>/
   events.jsonl
   attempt_<stage>_<n>.txt        ← existing (contracts/events.md §3)
   artifact_<artifact_id>_input.jsonl

@@ -55,8 +55,8 @@ user manual instead of hand-writing one.
 `user_manual` (report-kind, `lb_slots={}` — a manual is all free prose, no load-bearing numbers),
 mirroring the T-F15 `assembly_manual` precedent. No contract change; no new deps.
 
-TEST INVOCATION (pure Python, no core / no AI_CAD_LIBAICAD):
-  `~/.local/share/AI-CAD/mcp-venv/bin/python -m pytest tools/test_manual_gen.py -q` → 8 passed
+TEST INVOCATION (pure Python, no core / no CHUDWARE_LIBCHUDWARE):
+  `~/.local/share/Chudware/mcp-venv/bin/python -m pytest tools/test_manual_gen.py -q` → 8 passed
   (determinism, 225/225 coverage, drift-clean, no-fabrication ×2, render-degrades-cleanly,
    spec-shape, spec-validates-without-engine).
   `python -m tools.manual_gen` → wrote 13 files, coverage 225/225.

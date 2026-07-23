@@ -74,7 +74,7 @@ def _reveng_list_sessions(params: dict, _emit: Callable) -> dict:
 def _reveng_get_session(params: dict, _emit: Callable) -> dict:
     """Return full session manifest including artifacts.mesh_path / splat_path.
 
-    Paths are absolute under AICAD_REVENG_DIR/<sid>/ when present. GUI resolves
+    Paths are absolute under CHUDWARE_REVENG_DIR/<sid>/ when present. GUI resolves
     relative paths under the same root if ever relative.
     """
     try:
@@ -452,7 +452,7 @@ def _stop_capture_session(params: dict, _emit: Callable) -> dict:
             import os as _os
             import tempfile
 
-            recon_dir = tempfile.mkdtemp(prefix="aicad_recon_")
+            recon_dir = tempfile.mkdtemp(prefix="chudware_recon_")
             recon = _pg.reconstruct(
                 image_dir=str(work_dir) if work_dir else "",
                 out_dir=recon_dir,

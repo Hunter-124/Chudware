@@ -1,10 +1,10 @@
-"""Client for the shared engine-host daemon (aicad-hostd).
+"""Client for the shared engine-host daemon (chudware-hostd).
 
 The Python mirror of services/ipc/ipc_client.cpp: connect-or-spawn against the
 instance-key socket, newline-delimited JSON-RPC, one outstanding request per
 connection (Lock-serialized — FastMCP runs sync tools off-thread). core_bridge
 routes through here BY DEFAULT since the Phase-8 flip (unset or
-AI_CAD_ENGINE_DAEMON=1; only an explicit =0 selects the legacy in-process
+CHUDWARE_ENGINE_DAEMON=1; only an explicit =0 selects the legacy in-process
 path), keeping its call() signature so the ~200 tool call sites never change.
 
 Semantics preserved vs the legacy in-process ctypes path:
@@ -16,13 +16,13 @@ Semantics preserved vs the legacy in-process ctypes path:
     layers drain them via poll_events() to surface _foreign_edits notes.
 
 Discovery mirrors ipc_discovery.cpp / ipc_discovery_win.cpp — keep them in sync:
-  key    = $AICAD_INSTANCE_KEY or fnv1a64(realpath(hostd binary))
+  key    = $CHUDWARE_INSTANCE_KEY or fnv1a64(realpath(hostd binary))
            (Windows: fnv1a64 of the resolved path LOWERCASED — NTFS is
            case-insensitive and the C++ side lowercases before hashing)
-  POSIX  = $AICAD_HOSTD_SOCKET or $XDG_RUNTIME_DIR/aicad/hostd-<key>.sock
-           (fallback /tmp/aicad-<uid>/hostd-<key>.sock)
-  win32  = $AICAD_HOSTD_PIPE/$AICAD_HOSTD_SOCKET or
-           \\\\.\\pipe\\aicad-hostd-<SID>-<key>
+  POSIX  = $CHUDWARE_HOSTD_SOCKET or $XDG_RUNTIME_DIR/chudware/hostd-<key>.sock
+           (fallback /tmp/chudware-<uid>/hostd-<key>.sock)
+  win32  = $CHUDWARE_HOSTD_PIPE/$CHUDWARE_HOSTD_SOCKET or
+           \\\\.\\pipe\\chudware-hostd-<SID>-<key>
 
 Windows transport choice (documented per the Phase 6 plan): the pipe is opened
 with the plain builtin ``open(path, 'r+b', buffering=0)``. CPython never
@@ -55,7 +55,7 @@ class DaemonError(RuntimeError):
 
 
 def _fnv1a64_hex(s: str) -> str:
-    # Offset basis MUST byte-match aicad_ipc::fnv1aHex (services/ipc/ipc_discovery.cpp),
+    # Offset basis MUST byte-match chudware_ipc::fnv1aHex (services/ipc/ipc_discovery.cpp),
     # which — like every other FNV site in the C++ tree — uses 1469598103934665603
     # (the textbook 14695981039346656037 with its last digit dropped). It's a
     # rendezvous protocol constant: agreement with the deployed binaries is what
@@ -137,20 +137,20 @@ def _repo_root() -> Path:
 
 
 def resolve_hostd_bin() -> Optional[Path]:
-    """Locate the aicad-hostd binary. Mirrors the libaicad candidate order in
+    """Locate the chudware-hostd binary. Mirrors the libchudware candidate order in
     core_bridge (env -> dist -> full OCCT build -> slim build)."""
-    if p := os.environ.get("AICAD_HOSTD_BIN"):
+    if p := os.environ.get("CHUDWARE_HOSTD_BIN"):
         return Path(p)
-    exe = "aicad-hostd.exe" if sys.platform == "win32" else "aicad-hostd"
+    exe = "chudware-hostd.exe" if sys.platform == "win32" else "chudware-hostd"
     root = _repo_root()
     if sys.platform == "win32":
         cands = (
-            Path(os.environ.get("AI_CAD_DIST") or "nonexistent") / exe,
+            Path(os.environ.get("CHUDWARE_DIST") or "nonexistent") / exe,
             root / "core" / "build" / "bin" / exe,  # build.bat / MSVC preset dir
         )
     else:
         cands = (
-            Path(os.environ.get("AI_CAD_DIST") or "nonexistent") / exe,
+            Path(os.environ.get("CHUDWARE_DIST") or "nonexistent") / exe,
             root / "core" / "build-occt-linux" / "bin" / exe,
             root / "core" / "build-linux" / "bin" / exe,
         )
@@ -164,11 +164,11 @@ def socket_path(hostd_bin: Optional[Path]) -> Optional[str]:
     """The daemon endpoint: unix-socket path on POSIX, \\\\.\\pipe\\... name on
     win32 (transport-neutral name, matching ipc_discovery's socketPath())."""
     if sys.platform == "win32":
-        if p := os.environ.get("AICAD_HOSTD_PIPE"):
+        if p := os.environ.get("CHUDWARE_HOSTD_PIPE"):
             return p
-    if p := os.environ.get("AICAD_HOSTD_SOCKET"):
+    if p := os.environ.get("CHUDWARE_HOSTD_SOCKET"):
         return p
-    key = os.environ.get("AICAD_INSTANCE_KEY")
+    key = os.environ.get("CHUDWARE_INSTANCE_KEY")
     if not key:
         if not hostd_bin:
             return None
@@ -177,9 +177,9 @@ def socket_path(hostd_bin: Optional[Path]) -> Optional[str]:
             resolved = resolved.lower()  # NTFS case-insensitive; C++ side lowercases too
         key = _fnv1a64_hex(resolved)
     if sys.platform == "win32":
-        return f"\\\\.\\pipe\\aicad-hostd-{_windows_user_sid()}-{key}"
+        return f"\\\\.\\pipe\\chudware-hostd-{_windows_user_sid()}-{key}"
     if xdg := os.environ.get("XDG_RUNTIME_DIR"):
-        return f"{xdg}/aicad/hostd-{key}.sock"
+        return f"{xdg}/chudware/hostd-{key}.sock"
     # No XDG_RUNTIME_DIR (common for agent-spawned processes): fall back to the
     # canonical /run/user/<uid> BEFORE /tmp so every client resolves the SAME
     # directory as desktop-launched ones — otherwise two "singleton" daemons
@@ -188,10 +188,10 @@ def socket_path(hostd_bin: Optional[Path]) -> Optional[str]:
     try:
         st = os.lstat(run_user)
         if stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid():
-            return f"{run_user}/aicad/hostd-{key}.sock"
+            return f"{run_user}/chudware/hostd-{key}.sock"
     except OSError:
         pass
-    return f"/tmp/aicad-{os.getuid()}/hostd-{key}.sock"
+    return f"/tmp/chudware-{os.getuid()}/hostd-{key}.sock"
 
 
 def _pid_alive(pid: int) -> bool:
@@ -222,8 +222,8 @@ _DISK_BUILD_ID_CACHE: dict = {}  # str(path) -> (mtime_ns, build_id)
 
 
 def _disk_build_id(hostd: Optional[Path]) -> str:
-    """Build id of the hostd binary ON DISK (`aicad-hostd --version` prints
-    "aicad-hostd <git-describe id>"). Cached per (path, mtime) so the subprocess
+    """Build id of the hostd binary ON DISK (`chudware-hostd --version` prints
+    "chudware-hostd <git-describe id>"). Cached per (path, mtime) so the subprocess
     runs once per binary change per process — steady-state connects are free.
     Returns "" on any failure (treated as not-stale). Client half of the version
     drain-replace: compared against hello.git_rev, the RUNNING daemon's id."""
@@ -278,7 +278,7 @@ def _watch_spawned(p: "subprocess.Popen") -> "subprocess.Popen":
     drained daemon used to sit <defunct> in this process for its whole life;
     a dedicated wait() thread collects it immediately."""
     _SPAWNED.append(p)
-    threading.Thread(target=p.wait, name="aicad-hostd-reaper", daemon=True).start()
+    threading.Thread(target=p.wait, name="chudware-hostd-reaper", daemon=True).start()
     return p
 
 
@@ -304,9 +304,9 @@ def _spawn_hostd_detached(hostd: Path) -> "subprocess.Popen":
             return _watch_spawned(p)
         except OSError:
             print(
-                "[daemon_bridge] WARNING: job breakaway denied — aicad-hostd will die "
+                "[daemon_bridge] WARNING: job breakaway denied — chudware-hostd will die "
                 "with this process's Job Object (e.g. when the agent session ends). "
-                "Start the AI-CAD GUI first for a durable daemon.",
+                "Start the Chudware GUI first for a durable daemon.",
                 file=sys.stderr,
             )
             p = subprocess.Popen([str(hostd)], creationflags=flags, close_fds=True,
@@ -323,7 +323,7 @@ def _spawn_hostd_detached(hostd: Path) -> "subprocess.Popen":
 
 
 class DaemonClient:
-    """One connection to aicad-hostd. Thread-safe; reconnects once on EOF."""
+    """One connection to chudware-hostd. Thread-safe; reconnects once on EOF."""
 
     ENGINE_READY_BUDGET_S = 300.0  # cold OCCT load headroom
 
@@ -345,9 +345,9 @@ class DaemonClient:
         hostd = resolve_hostd_bin()
         self._sock_path = socket_path(hostd)
         if not self._sock_path:
-            raise DaemonError("cannot resolve hostd socket (no binary / AICAD_HOSTD_BIN)")
+            raise DaemonError("cannot resolve hostd socket (no binary / CHUDWARE_HOSTD_BIN)")
         try:
-            budget_s = float(os.environ.get("AICAD_HOSTD_CONNECT_BUDGET_S", "") or budget_s)
+            budget_s = float(os.environ.get("CHUDWARE_HOSTD_CONNECT_BUDGET_S", "") or budget_s)
         except ValueError:
             pass
         deadline = time.monotonic() + budget_s
@@ -374,7 +374,7 @@ class DaemonClient:
                 if child is None:
                     if not hostd:
                         raise DaemonError(
-                            "aicad-hostd binary not found (set AICAD_HOSTD_BIN or build core)"
+                            "chudware-hostd binary not found (set CHUDWARE_HOSTD_BIN or build core)"
                         ) from e
                     try:
                         child = _spawn_hostd_detached(hostd)
@@ -397,7 +397,7 @@ class DaemonClient:
                         raise DaemonError(
                             "hostd rendezvous broken: a daemon holds the singleton "
                             f"lock but its socket is unreachable ({e}). "
-                            "`pkill aicad-hostd` and retry."
+                            "`pkill chudware-hostd` and retry."
                         ) from e
                 if time.monotonic() > deadline:
                     raise DaemonError(f"hostd spawn timed out ({e})") from e
@@ -577,8 +577,8 @@ def agent_worker_env(extra: Optional[dict] = None) -> dict:
     """Environment for a daemon-supervised agent worker: daemon mode ON plus
     instance-key/binary/socket passthrough, so the child's own engine calls
     land on the SAME daemon that supervises it (never a second instance)."""
-    env = {"AI_CAD_ENGINE_DAEMON": "1"}
-    for k in ("AICAD_INSTANCE_KEY", "AICAD_HOSTD_BIN", "AICAD_HOSTD_SOCKET"):
+    env = {"CHUDWARE_ENGINE_DAEMON": "1"}
+    for k in ("CHUDWARE_INSTANCE_KEY", "CHUDWARE_HOSTD_BIN", "CHUDWARE_HOSTD_SOCKET"):
         v = os.environ.get(k)
         if v:
             env[k] = v
@@ -589,7 +589,7 @@ def agent_worker_env(extra: Optional[dict] = None) -> dict:
 
 def spawn_agent_worker(argv: list, mission_id: str = "", doc_id: str = "",
                        env: Optional[dict] = None) -> dict:
-    """Spawn an agent worker as a supervised child of aicad-hostd.
+    """Spawn an agent worker as a supervised child of chudware-hostd.
 
     Returns the daemon's {child_id, pid, pgid, log} (or the error payload with
     _is_error). Stop via client().call("agent_stop", {"child_id": ..}); list

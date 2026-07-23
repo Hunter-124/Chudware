@@ -16,7 +16,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 
 using nlohmann::json;
@@ -126,4 +126,4 @@ std::string interface_mate_of(const InterfaceSpec& iface, const std::string& nam
 std::string iface_norm_name(const std::string& s);
 
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware

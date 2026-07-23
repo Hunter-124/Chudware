@@ -1,15 +1,15 @@
 """Provider configuration — resolve which backend + key to use.
 
-Order of precedence: explicit arg → AI_CAD_PROVIDER env var → %APPDATA%/AI-CAD/config.json →
+Order of precedence: explicit arg → CHUDWARE_PROVIDER env var → %APPDATA%/Chudware/config.json →
 default. The env var outranks config.json on purpose: it is a per-process override (tests use
-AI_CAD_PROVIDER=mock to guarantee no live model is called), while config.json is ambient user
+CHUDWARE_PROVIDER=mock to guarantee no live model is called), while config.json is ambient user
 state. config.json shape:
     {
       "provider": "anthropic",          // or "openai" / "llamacpp"
       "model": "claude-opus-4-8",
       "api_key": "sk-ant-...",          // optional; else read from env
       "openai": {"base_url": "http://localhost:1234/v1"},
-      "llamacpp": {"model_path": "%APPDATA%/AI-CAD/models/model.gguf"},
+      "llamacpp": {"model_path": "%APPDATA%/Chudware/models/model.gguf"},
       "compliance_mode": "off",         // "off" | "redact" | "local_only" (WS3)
       "offline_mode": false             // legacy hard local-only (still honored)
     }
@@ -100,8 +100,8 @@ def workspace_dir(cfg: dict | None = None) -> "Path":
 
     Mirrors host ``defaultWorkspaceDir`` / ``AppState::workspaceDir``:
       1. config.json ``workspace_dir`` when set (absolute or ~-expanded)
-      2. existing ``~/Documents/AI-CAD`` (legacy alias wins)
-      3. else ``~/Documents/Billet``
+      2. existing ``~/Documents/Chudware`` (legacy alias wins)
+      3. else ``~/Documents/Chudware``
 
     Always returns a Path; creates the directory when missing (best-effort).
     """
@@ -114,11 +114,11 @@ def workspace_dir(cfg: dict | None = None) -> "Path":
     else:
         home = Path(os.path.expanduser("~"))
         docs = home / "Documents"
-        legacy = docs / "AI-CAD"
+        legacy = docs / "Chudware"
         if legacy.is_dir():
             d = legacy
         else:
-            d = docs / "Billet"
+            d = docs / "Chudware"
     try:
         d.mkdir(parents=True, exist_ok=True)
     except OSError:
@@ -279,7 +279,7 @@ def get_corporate_config(cfg: dict | None = None) -> dict:
 
 # --------------------------------------------------------------------------- advisor (foreman)
 # GUI Settings / host options write ``agent.advisor`` (bool, default True).
-# Env ``AI_CAD_ADVISOR`` still honored (0/false disables). Used by loop.py and
+# Env ``CHUDWARE_ADVISOR`` still honored (0/false disables). Used by loop.py and
 # MissionDispatch so every agent/subagent can reach the advisor.
 
 ADVISOR_KEY = "advisor"
@@ -290,13 +290,13 @@ def advisor_enabled(cfg: dict | None = None) -> bool:
     """Return whether the foreman advisor is on (default True).
 
     Precedence:
-      1. Env ``AI_CAD_ADVISOR`` — when set to 0/false/False, force off.
+      1. Env ``CHUDWARE_ADVISOR`` — when set to 0/false/False, force off.
          When set to 1/true/True, force on (overrides config).
       2. ``agent.advisor`` in config.json (bool, default True).
     """
     import os
 
-    env = os.environ.get("AI_CAD_ADVISOR")
+    env = os.environ.get("CHUDWARE_ADVISOR")
     if env is not None and str(env).strip() != "":
         return str(env).strip().lower() not in ("0", "false", "no", "off")
     agent = _agent_block(cfg)
@@ -387,10 +387,10 @@ def get_role_adoption_mode(cfg: dict | None = None) -> str:
 
 
 def get_advisor_preference(cfg: dict | None = None) -> str:
-    """off|option|encourage|require. Env AI_CAD_ADVISOR=0 forces off."""
+    """off|option|encourage|require. Env CHUDWARE_ADVISOR=0 forces off."""
     import os
 
-    env = os.environ.get("AI_CAD_ADVISOR")
+    env = os.environ.get("CHUDWARE_ADVISOR")
     if env is not None and str(env).strip() != "":
         if str(env).strip().lower() in ("0", "false", "no", "off"):
             return "off"
@@ -410,17 +410,17 @@ def proactive_advisor_enabled(cfg: dict | None = None) -> bool:
     """Opt-in mid-run proactive advisor (default False).
 
     Separate from advisor_preference (tone/frequency). Hard gate for the
-    agent_turn proactive inject path. Env ``AI_CAD_PROACTIVE_ADVISOR`` forces
+    agent_turn proactive inject path. Env ``CHUDWARE_PROACTIVE_ADVISOR`` forces
     on/off when set. Also off when advisor preference is off.
     """
     import os
 
-    env = os.environ.get("AI_CAD_PROACTIVE_ADVISOR")
+    env = os.environ.get("CHUDWARE_PROACTIVE_ADVISOR")
     if env is not None and str(env).strip() != "":
         if str(env).strip().lower() in ("0", "false", "no", "off"):
             return False
         if str(env).strip().lower() in ("1", "true", "yes", "on"):
-            # Still respect advisor preference off / AI_CAD_ADVISOR=0.
+            # Still respect advisor preference off / CHUDWARE_ADVISOR=0.
             return get_advisor_preference(cfg) != "off"
     if get_advisor_preference(cfg) == "off":
         return False
@@ -437,7 +437,7 @@ def proactive_advisor_enabled(cfg: dict | None = None) -> bool:
 # ---------------------------------------------------------------------------
 # Tool families (Settings → AI → Tools)
 # agent.tool_families: { "cad": true, "em": false, ... }
-# Missing key = enabled (backward compatible). Env AI_CAD_TOOLS_ALLOW still wins
+# Missing key = enabled (backward compatible). Env CHUDWARE_TOOLS_ALLOW still wins
 # at the registry layer when set.
 # ---------------------------------------------------------------------------
 DEFAULT_TOOL_FAMILIES = (
@@ -565,8 +565,8 @@ def get_memory_token_budget(cfg: dict | None = None) -> int:
 #   agent.compaction_backend  "builtin" | "omp"      (default "builtin")
 #   agent.cache_warming       bool                   (default False)
 #   agent.memory_learn        bool                   (default True)
-# Precedence is ENV > config.json > default: AI_CAD_MEMORY_BACKEND /
-# AI_CAD_COMPACTION_BACKEND still win when set (per-process override; the GUI
+# Precedence is ENV > config.json > default: CHUDWARE_MEMORY_BACKEND /
+# CHUDWARE_COMPACTION_BACKEND still win when set (per-process override; the GUI
 # comboboxes write config.json only).
 
 MEMORY_BACKEND_KEY = "memory_backend"
@@ -586,10 +586,10 @@ _COMPACTION_BACKEND_OMP = frozenset({"omp", "bridge", "mnemopi"})
 def memory_backend(cfg: dict | None = None) -> str:
     """Return ``"sqlite"`` (default) or ``"mnemopi"``.
 
-    Precedence ENV > config.json > default (omp port): AI_CAD_MEMORY_BACKEND
+    Precedence ENV > config.json > default (omp port): CHUDWARE_MEMORY_BACKEND
     wins when set; else ``agent.memory_backend``; else the default.
     """
-    env = (os.environ.get("AI_CAD_MEMORY_BACKEND") or "").strip().lower()
+    env = (os.environ.get("CHUDWARE_MEMORY_BACKEND") or "").strip().lower()
     if env:
         return "mnemopi" if env in _MEMORY_BACKEND_MNEMOPI else DEFAULT_MEMORY_BACKEND
     agent = _agent_block(cfg)
@@ -602,11 +602,11 @@ def memory_backend(cfg: dict | None = None) -> str:
 def compaction_backend(cfg: dict | None = None) -> str:
     """Return ``"builtin"`` (default) or ``"omp"``.
 
-    Precedence ENV > config.json > default (omp port): AI_CAD_COMPACTION_BACKEND
+    Precedence ENV > config.json > default (omp port): CHUDWARE_COMPACTION_BACKEND
     wins when set; else ``agent.compaction_backend``; else the legacy nested
     ``agent.compaction.backend``; else the default.
     """
-    env = (os.environ.get("AI_CAD_COMPACTION_BACKEND") or "").strip().lower()
+    env = (os.environ.get("CHUDWARE_COMPACTION_BACKEND") or "").strip().lower()
     if env:
         return "omp" if env in _COMPACTION_BACKEND_OMP else DEFAULT_COMPACTION_BACKEND
     agent = _agent_block(cfg)
@@ -919,7 +919,7 @@ def get_provider(name: str | None = None, cfg: dict | None = None,
     against ``provider_offline_safe`` AFTER (catches the empty-name local default + edge cases).
 
     *role* (optional) is a routing.yaml role tag (e.g. ``"overseer"``, ``"fixer"``, or a DAG
-    node name) — see ``_resolve_via_routing``. When *name* / ``AI_CAD_PROVIDER`` is not given,
+    node name) — see ``_resolve_via_routing``. When *name* / ``CHUDWARE_PROVIDER`` is not given,
     routing.yaml's role->source assignment (contract §14) is consulted BEFORE falling back to
     config.json's flat ``provider`` field, so a source registered into routing.yaml (e.g. the
     bundled llama.cpp runtime's ``register_routing_source``) actually gets picked up here.
@@ -1009,7 +1009,7 @@ def _resolve_via_routing(role: str | None, cfg: dict) -> tuple[str, str | None, 
 def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> Provider:
     routed_model: str | None = None
     routed_base_url: str | None = None
-    if not name and not os.environ.get("AI_CAD_PROVIDER"):
+    if not name and not os.environ.get("CHUDWARE_PROVIDER"):
         routed = _resolve_via_routing(role, cfg)
         if routed is not None:
             name, routed_model, routed_base_url = routed
@@ -1026,7 +1026,7 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
             cfg[sub_key] = dict(cfg.get(sub_key) or {})
             cfg[sub_key].setdefault("base_url", routed_base_url)
 
-    name = (name or os.environ.get("AI_CAD_PROVIDER") or cfg.get("provider") or "").lower()
+    name = (name or os.environ.get("CHUDWARE_PROVIDER") or cfg.get("provider") or "").lower()
     offline = offline_enabled(cfg) or compliance_mode(cfg) == "local_only"
 
     # Offline mode: refuse cloud providers OUTRIGHT before constructing them (no client, no key
@@ -1106,13 +1106,13 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
 
     if name == "mock":
         # Deterministic mock provider for tests (no API key, no network). Scripted replies load
-        # from the JSON file named by AI_CAD_MOCK_REPLIES (a list[str], or a {role: list[str]} map
+        # from the JSON file named by CHUDWARE_MOCK_REPLIES (a list[str], or a {role: list[str]} map
         # consumed by a role-sniffing provider) — keeps the subprocess worker test self-contained.
         from .providers.mock_provider import MockProvider
 
         replies: list[str] = []
         by_role: dict | None = None
-        path = os.environ.get("AI_CAD_MOCK_REPLIES")
+        path = os.environ.get("CHUDWARE_MOCK_REPLIES")
         if path and os.path.exists(path):
             with open(path, encoding="utf-8") as fh:
                 data = json.load(fh)

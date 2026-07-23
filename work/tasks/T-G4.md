@@ -68,8 +68,8 @@ delete what's dead, and skip cosmetic refactors that the migration will subsume.
         deletion commits (flock'd). Scenario shots m1 (6 steps), sketch (3), appearance (1)
         + fea final frame, all exit 0; eyeballed m1_05_edit.png + appearance_01_settings.png:
         FM tree rows, PM panel, Copilot bubbles, Settings tabs all render correctly.
-        (Scenario harness in a fresh worktree needs services/dist/AI-CAD + bin libaicad.so
-        staged from the main repo and AI_CAD_REPO=$PWD — gitignored, done locally.)
+        (Scenario harness in a fresh worktree needs services/dist/Chudware + bin libchudware.so
+        staged from the main repo and CHUDWARE_REPO=$PWD — gitignored, done locally.)
         NOTE: m1 reopen step logs "TREE MISMATCH" + STEP parse errors — pre-existing stale
         staged .so (FOREMAN: "staged .so predates sim_run_static"), not this branch.
 - [x] `graphify update .` run

@@ -8,7 +8,7 @@
 #include "doc_mirror.h"
 #include "async_rpc.h"
 #include "../worker_client.h"
-#include "cpp_core.h"  // strangler diagnostic: parity probe against libaicad.dll
+#include "cpp_core.h"  // strangler diagnostic: parity probe against libchudware.dll
 
 namespace core {
 

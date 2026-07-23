@@ -4,7 +4,7 @@
 #include <map>
 #include <mutex>
 
-namespace aicad {
+namespace chudware {
 namespace sim {
 
 namespace {
@@ -40,4 +40,4 @@ nlohmann::json sim_cancel(const std::string& job_id) {
 }
 
 }  // namespace sim
-}  // namespace aicad
+}  // namespace chudware

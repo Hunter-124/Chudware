@@ -24,7 +24,7 @@
 #include <string>
 #include <vector>
 
-namespace aicad::solver {
+namespace chudware::solver {
 
 // A residual function maps the sub-vector of its variables to an m-vector.
 using ResidualFunc = std::function<Eigen::VectorXd(const Eigen::VectorXd&)>;
@@ -180,4 +180,4 @@ private:
     bool interactive_ = false;
 };
 
-}  // namespace aicad::solver
+}  // namespace chudware::solver

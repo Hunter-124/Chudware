@@ -4,7 +4,7 @@
 real, measured positive residual** (RECOGNITION_RESIDUAL discipline). They are the
 capture-now-train-later plan made concrete, not a training run. `guard.py` enforces this:
 every runner calls `assert_training_allowed()`, which refuses under CI and without an
-explicit `AICAD_ALLOW_VLM_TRAINING=1` opt-in.
+explicit `CHUDWARE_ALLOW_VLM_TRAINING=1` opt-in.
 
 ## The recipe (VLM_OFFLINE_TRACK.md §2 feasibility verdict)
 

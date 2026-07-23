@@ -17,7 +17,7 @@
 
 #include "util/resource_governor.h"
 
-using namespace aicad::governor;
+using namespace chudware::governor;
 
 namespace {
 void put_env(const char* k, const char* v) {
@@ -52,8 +52,8 @@ TEST_CASE("host_mem is sane") {
 
 TEST_CASE("budget within (0, total] and tracks the cap") {
     const auto t0 = std::chrono::steady_clock::now();
-    put_env("AICAD_GOVERNOR", nullptr);
-    put_env("AICAD_MEM_CAP_GB", nullptr);
+    put_env("CHUDWARE_GOVERNOR", nullptr);
+    put_env("CHUDWARE_MEM_CAP_GB", nullptr);
     const HostMem m = host_mem();
     if (m.total == 0) {
         std::printf("[governor] budget: platform unknown (SKIP) wall=%.3f ms\n",
@@ -64,19 +64,19 @@ TEST_CASE("budget within (0, total] and tracks the cap") {
     CHECK(b > 0);
     CHECK(b <= m.total);
 
-    put_env("AICAD_MEM_CAP_GB", "2");
+    put_env("CHUDWARE_MEM_CAP_GB", "2");
     const uint64_t capped = budget_bytes();
     // The floor (min(3GB, 40% total)) may sit above a 2 GB cap on big machines;
     // either way the capped budget can never exceed the uncapped one.
     CHECK(capped <= b);
-    put_env("AICAD_MEM_CAP_GB", nullptr);
+    put_env("CHUDWARE_MEM_CAP_GB", nullptr);
     std::printf("[governor] budget uncapped=%llu capped2GB=%llu wall=%.3f ms\n",
                 (unsigned long long)b, (unsigned long long)capped, wall_ms(t0));
 }
 
 TEST_CASE("admit small, refuse absurd, message carries the knobs") {
     const auto t0 = std::chrono::steady_clock::now();
-    put_env("AICAD_GOVERNOR", nullptr);
+    put_env("CHUDWARE_GOVERNOR", nullptr);
     const HostMem m = host_mem();
     if (m.total == 0) {
         std::printf("[governor] admit: platform unknown (SKIP) wall=%.3f ms\n",
@@ -89,48 +89,48 @@ TEST_CASE("admit small, refuse absurd, message carries the knobs") {
     // 64x total RAM can never fit any fraction-based budget.
     CHECK_FALSE(admit(m.total * 64ull, "absurd study", why));
     CHECK(why.find("absurd study") != std::string::npos);
-    CHECK(why.find("AICAD_MEM_FRAC") != std::string::npos);
+    CHECK(why.find("CHUDWARE_MEM_FRAC") != std::string::npos);
     // Observability: last_report carries the refusal.
     CHECK(last_report().find("absurd study") != std::string::npos);
     std::printf("[governor] admit refuse why_len=%zu wall=%.3f ms\n", why.size(),
                 wall_ms(t0));
 }
 
-TEST_CASE("AICAD_GOVERNOR=0 admits everything") {
+TEST_CASE("CHUDWARE_GOVERNOR=0 admits everything") {
     const auto t0 = std::chrono::steady_clock::now();
-    put_env("AICAD_GOVERNOR", "0");
+    put_env("CHUDWARE_GOVERNOR", "0");
     std::string why;
     CHECK(admit(UINT64_MAX / 2, "monster", why));
     CHECK(budget_bytes() == UINT64_MAX);
     CHECK_FALSE(low_memory_now());
     // plan_for with governor off: full workers, admitted.
-    put_env("AI_CAD_SIM_THREADS", "5");
+    put_env("CHUDWARE_SIM_THREADS", "5");
     const Plan p = plan_for(UINT64_MAX / 4, "monster_plan", 0);
     CHECK(p.admitted);
     CHECK(p.workers == 5);
     CHECK(p.report.find("governor off") != std::string::npos);
-    put_env("AI_CAD_SIM_THREADS", nullptr);
-    put_env("AICAD_GOVERNOR", nullptr);
+    put_env("CHUDWARE_SIM_THREADS", nullptr);
+    put_env("CHUDWARE_GOVERNOR", nullptr);
     std::printf("[governor] disabled workers=%d wall=%.3f ms\n", p.workers,
                 wall_ms(t0));
 }
 
 TEST_CASE("solver_threads positive and honors the env cap") {
     const auto t0 = std::chrono::steady_clock::now();
-    put_env("AI_CAD_SIM_THREADS", nullptr);
+    put_env("CHUDWARE_SIM_THREADS", nullptr);
     CHECK(solver_threads() >= 1);
-    put_env("AI_CAD_SIM_THREADS", "3");
+    put_env("CHUDWARE_SIM_THREADS", "3");
     CHECK(solver_threads() == 3);
-    put_env("AI_CAD_SIM_THREADS", nullptr);
+    put_env("CHUDWARE_SIM_THREADS", nullptr);
     std::printf("[governor] solver_threads default>=1 env=3 wall=%.3f ms\n",
                 wall_ms(t0));
 }
 
 TEST_CASE("plan_for ample memory returns ~all allotted cores") {
     const auto t0 = std::chrono::steady_clock::now();
-    put_env("AICAD_GOVERNOR", nullptr);
-    put_env("AICAD_MEM_CAP_GB", nullptr);
-    put_env("AI_CAD_SIM_THREADS", "6");
+    put_env("CHUDWARE_GOVERNOR", nullptr);
+    put_env("CHUDWARE_MEM_CAP_GB", nullptr);
+    put_env("CHUDWARE_SIM_THREADS", "6");
     // Tiny estimate: pressure ~0 => full allotment, no self-throttle.
     const Plan p = plan_for(1ull * 1024 * 1024, "tiny_cpu", 0);
     CHECK(p.workers == 6);
@@ -140,7 +140,7 @@ TEST_CASE("plan_for ample memory returns ~all allotted cores") {
     }
     CHECK(p.report.find("workers=6") != std::string::npos);
     CHECK(last_report().find("tiny_cpu") != std::string::npos);
-    put_env("AI_CAD_SIM_THREADS", nullptr);
+    put_env("CHUDWARE_SIM_THREADS", nullptr);
     std::printf("[governor] ample plan workers=%d reserve=%llu budget=%llu wall=%.3f ms\n",
                 p.workers, (unsigned long long)p.reserve_bytes,
                 (unsigned long long)p.budget, wall_ms(t0));
@@ -148,17 +148,17 @@ TEST_CASE("plan_for ample memory returns ~all allotted cores") {
 
 TEST_CASE("plan_for low-memory reduces workers and never reserves past headroom") {
     const auto t0 = std::chrono::steady_clock::now();
-    put_env("AICAD_GOVERNOR", nullptr);
-    put_env("AI_CAD_SIM_THREADS", "8");
+    put_env("CHUDWARE_GOVERNOR", nullptr);
+    put_env("CHUDWARE_SIM_THREADS", "8");
     // Force a tight budget via absolute cap. Floor may lift the budget on big
     // boxes, so drive pressure with an estimate far above budget.
-    put_env("AICAD_MEM_CAP_GB", "1");
-    put_env("AICAD_HEADROOM_GB", "4");
+    put_env("CHUDWARE_MEM_CAP_GB", "1");
+    put_env("CHUDWARE_HEADROOM_GB", "4");
     const HostMem m = host_mem();
     if (m.total == 0) {
-        put_env("AICAD_MEM_CAP_GB", nullptr);
-        put_env("AICAD_HEADROOM_GB", nullptr);
-        put_env("AI_CAD_SIM_THREADS", nullptr);
+        put_env("CHUDWARE_MEM_CAP_GB", nullptr);
+        put_env("CHUDWARE_HEADROOM_GB", nullptr);
+        put_env("CHUDWARE_SIM_THREADS", nullptr);
         std::printf("[governor] low-mem plan: platform unknown (SKIP) wall=%.3f ms\n",
                     wall_ms(t0));
         return;
@@ -183,19 +183,19 @@ TEST_CASE("plan_for low-memory reduces workers and never reserves past headroom"
         "admitted=%d wall=%.3f ms\n",
         p.workers, p.reserve_bytes / 1e9, p.budget / 1e9, p.admitted ? 1 : 0,
         wall_ms(t0));
-    put_env("AICAD_MEM_CAP_GB", nullptr);
-    put_env("AICAD_HEADROOM_GB", nullptr);
-    put_env("AI_CAD_SIM_THREADS", nullptr);
+    put_env("CHUDWARE_MEM_CAP_GB", nullptr);
+    put_env("CHUDWARE_HEADROOM_GB", nullptr);
+    put_env("CHUDWARE_SIM_THREADS", nullptr);
 }
 
 TEST_CASE("plan_for mid pressure scales workers between 1 and allotment") {
     const auto t0 = std::chrono::steady_clock::now();
-    put_env("AICAD_GOVERNOR", nullptr);
-    put_env("AICAD_MEM_CAP_GB", nullptr);
-    put_env("AI_CAD_SIM_THREADS", "8");
+    put_env("CHUDWARE_GOVERNOR", nullptr);
+    put_env("CHUDWARE_MEM_CAP_GB", nullptr);
+    put_env("CHUDWARE_SIM_THREADS", "8");
     const HostMem m = host_mem();
     if (m.total == 0) {
-        put_env("AI_CAD_SIM_THREADS", nullptr);
+        put_env("CHUDWARE_SIM_THREADS", nullptr);
         std::printf("[governor] mid-pressure: platform unknown (SKIP) wall=%.3f ms\n",
                     wall_ms(t0));
         return;
@@ -210,5 +210,5 @@ TEST_CASE("plan_for mid pressure scales workers between 1 and allotment") {
     CHECK(p.reserve_bytes <= p.budget);
     std::printf("[governor] mid-pressure workers=%d/8 reserve=%.3fGB wall=%.3f ms\n",
                 p.workers, p.reserve_bytes / 1e9, wall_ms(t0));
-    put_env("AI_CAD_SIM_THREADS", nullptr);
+    put_env("CHUDWARE_SIM_THREADS", nullptr);
 }

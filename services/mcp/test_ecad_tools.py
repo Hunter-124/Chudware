@@ -1580,7 +1580,7 @@ def test_fin16_verify_thermal() -> None:
 
 def test_fin16_live_solve() -> None:
     """T-FIN16 (live leg): full board -> solved temperature field with zero manual BC
-    setup, when a sim-enabled libaicad is loadable. Honest skip otherwise."""
+    setup, when a sim-enabled libchudware is loadable. Honest skip otherwise."""
     try:
         import build123d  # noqa: F401
     except ImportError:
@@ -1590,7 +1590,7 @@ def test_fin16_live_solve() -> None:
         from mcp_server import core_bridge as cb
         cb.call("ping", {})
     except Exception as e:  # noqa: BLE001
-        print(f"  FIN16: libaicad not loadable ({type(e).__name__}) — live solve SKIPPED "
+        print(f"  FIN16: libchudware not loadable ({type(e).__name__}) — live solve SKIPPED "
               "(dry-run coverage above still exercises geometry/BC/envelope)")
         return
     tools = _fin16_tools()
@@ -1715,7 +1715,7 @@ def _fin17_board(tools: dict, name: str) -> str:
 def test_fin17_heatsink_select() -> None:
     """T-FIN17 (DoD demo): ~3 W regulator at an 85 C limit — heatsink_select ranks
     library + parametric candidates, the winner meets target in the re-solve (live
-    FEA when libaicad is available, honest network_estimate otherwise), the ranked
+    FEA when libchudware is available, honest network_estimate otherwise), the ranked
     table carries {candidate, achieved_tj_c, delta_vs_target, mass_g, cost}, and the
     result embeds a valid aicad.simhandoff/1 verify envelope. Also: the impossible-
     target fixture is reported honestly (best achievable named, target_met=false)."""

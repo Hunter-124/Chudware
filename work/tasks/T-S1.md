@@ -46,7 +46,7 @@ Only two of six keys obtained so far — Digi-Key, Mouser, Xometry, McMaster sti
 (Erik hasn't gotten to those applications yet).
 
 - **Nexar: ACTIVE, verified live.** `client_id`/`client_secret` in
-  `~/.local/share/AI-CAD/config.json` under `parts_providers.nexar` (the app's real
+  `~/.local/share/Chudware/config.json` under `parts_providers.nexar` (the app's real
   credential source per `_resolve_creds` — `.env` is env-var fallback only and nothing
   in this repo auto-loads it). Ran `NexarProvider().fetch("NE555P")` against the real
   API and got live pricing/stock back.

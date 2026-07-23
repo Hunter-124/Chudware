@@ -1,6 +1,6 @@
 # docs/reference/ — clean-room CAD format & data-model reference
 
-This directory holds general-purpose CAD reference material — **not** ShopCraft
+This directory holds general-purpose CAD reference material — **not** Chudware
 design docs. It was folded in from a sibling clean-room project, **Clean Engine**
 (`D:\Clean Engine\ODA\`), whose README states explicitly that its contents are
 sourced *only* from public specifications, ISO/ASTM/ASPRS standards, and
@@ -9,7 +9,7 @@ decompiled code. That clean-room framing is preserved verbatim in each file belo
 treat it as load-bearing (it's what keeps this material safe to have in the tree
 alongside a product with license obligations — see `contracts/licenses.md`).
 
-Nothing in this directory describes ShopCraft internals. It describes the public
+Nothing in this directory describes Chudware internals. It describes the public
 CAD format landscape and the classic AutoCAD-lineage data model, then cross-links
 to where this repo's *actual* interop surface sits today.
 
@@ -29,7 +29,7 @@ to where this repo's *actual* interop surface sits today.
   regime) and a recommended layered architecture, annotated with what this repo
   has already built vs. what a future format would need.
 
-## How this fits into ShopCraft's interop work
+## How this fits into Chudware's interop work
 
 This repo's actual format-interop surface — what's implemented, not just
 referenced — lives here:

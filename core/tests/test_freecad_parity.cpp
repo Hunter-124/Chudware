@@ -11,7 +11,7 @@
 //     radius mm, start/end_angle -> degrees) into xy[0], so each maps to ONE solver
 //     variable and only that DOF moves -- the centre never drifts.
 // Behavioural gates (positions / on-curve membership), not Python-parity coordinates,
-// because the soft drag path is wall-clock-budgeted. Link: aicad_sketch.
+// because the soft drag path is wall-clock-budgeted. Link: chudware_sketch.
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
@@ -21,9 +21,9 @@
 #include <string>
 #include <vector>
 
-using aicad::sketch::solve_sketch;
-using aicad::sketch::drag;
-using aicad::sketch::SketchSolution;
+using chudware::sketch::solve_sketch;
+using chudware::sketch::drag;
+using chudware::sketch::SketchSolution;
 using json = nlohmann::json;
 
 namespace {

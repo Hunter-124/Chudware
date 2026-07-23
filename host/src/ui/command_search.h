@@ -1,4 +1,4 @@
-// AI-CAD unified command + settings search widget (W2-Search).
+// Chudware unified command + settings search widget (W2-Search).
 // Opened by the top-bar "Search" menu item; searches both ribbon modeling commands and
 // settings entries. Calls must be placed per-frame in app.cpp (see INTEGRATION NEEDED).
 #pragma once

@@ -4,7 +4,7 @@
 
 #include "agent/machine.h"
 
-using aicad::agent::err_sig;
+using chudware::agent::err_sig;
 
 TEST_CASE("err_sig picks the last exception line") {
     std::string err = "line one\nValueError: bad dim\nline three";

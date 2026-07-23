@@ -27,7 +27,7 @@
 
 #include "doc/motion_dynamics.h"
 
-namespace md = aicad::doc::motiondyn;
+namespace md = chudware::doc::motiondyn;
 using Eigen::Matrix3d;
 using Eigen::Matrix4d;
 using Eigen::Vector3d;

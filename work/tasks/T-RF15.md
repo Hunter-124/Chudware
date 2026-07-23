@@ -16,7 +16,7 @@ priority: 3
 Zero-Python stream: firmware RPC (fw_*) is Python-only in engine_oracle/firmware/
 (contracts/firmware_rpc.md already frozen). Web client cannot reach python-worker
 methods, so firmware is desktop-only until this lands. Routing table in
-services/worker/worker_client.cpp is integrator-owned; core/api/libaicad.h merges go
+services/worker/worker_client.cpp is integrator-owned; core/api/libchudware.h merges go
 through the integrator.
 
 ## Scope
@@ -28,6 +28,6 @@ Mirror tests in core/tests/.
 
 ## Definition of done
 
-- [x] fw_* served by libaicad with corpus parity; Python module deleted same commit.
+- [x] fw_* served by libchudware with corpus parity; Python module deleted same commit.
 - [x] MCP firmware tools unchanged on the surface (freshness rule if touched).
 - [x] gate.sh green; REFACTOR_LOG handoff; web_parity inventory shrinks.

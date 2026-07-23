@@ -15,7 +15,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 
 using nlohmann::json;
@@ -109,4 +109,4 @@ json script_escape_op(const std::string& code, const std::string& name = "Script
 std::optional<std::string> extract_script(const std::string& reply);
 
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware

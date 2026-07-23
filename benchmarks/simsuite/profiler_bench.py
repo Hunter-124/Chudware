@@ -14,15 +14,15 @@ Cases (same in quick and full mode; the instrumented solves are already coarse):
   * phases_fea_modal   : sim_run_modal -> fea_modal study with mesh+solve phases.
   * phases_mesh_cache  : re-running the SAME static study must mesh via the content
         cache — metric = number of full mesh_tet studies recorded during the re-run
-        (must be 0; guards the mesh_step_cached overlay fix in core/api/libaicad.cpp).
+        (must be 0; guards the mesh_step_cached overlay fix in core/api/libchudware.cpp).
   * phases_lbm         : tiny sim_run_flow -> lbm study with init/loop/convergence/
         output phases + a flow_run study wrapping it.
   * phases_rpc_overhead: mean prof_phases round-trip (regression-only; the report is
         a bounded ring, so this must stay ~sub-millisecond engine-side).
 
-Solver lib: whatever services.mcp.core_bridge resolves ($AI_CAD_LIBAICAD ->
+Solver lib: whatever services.mcp.core_bridge resolves ($CHUDWARE_LIBCHUDWARE ->
 core/build-occt-linux fallback). A lib without the prof_phases RPC (not yet rebuilt
-with core/prof/phases.cpp) or without sim_run_static (no AICAD_WITH_NETGEN) produces
+with core/prof/phases.cpp) or without sim_run_static (no CHUDWARE_WITH_NETGEN) produces
 clean, reasoned skips.
 
 No analytic references: every metric here is a structural/timing regression, so
@@ -78,18 +78,18 @@ def _capabilities() -> tuple[bool, str]:
     cb = _cb()
     try:
         if not cb.available():
-            return False, "core_bridge reports libaicad not loadable"
+            return False, "core_bridge reports libchudware not loadable"
         cb.call("prof_phases", {})
     except Exception as exc:  # noqa: BLE001
         if "unknown method" in str(exc):
-            return False, ("loaded libaicad.so predates the per-phase timers "
+            return False, ("loaded libchudware.so predates the per-phase timers "
                            "(rebuild core with prof/phases.cpp): %s" % exc)
         return False, f"engine probe failed: {exc}"
     try:
         cb.call("sim_run_static", {"study": {}})
     except Exception as exc:  # noqa: BLE001
         if "unknown method" in str(exc):
-            return False, f"libaicad.so lacks sim_run_static (no AICAD_WITH_NETGEN): {exc}"
+            return False, f"libchudware.so lacks sim_run_static (no CHUDWARE_WITH_NETGEN): {exc}"
         return False, f"engine probe failed: {exc}"
     return True, ""
 
@@ -192,7 +192,7 @@ def _case_fea_modal(cb, step: str, fix: dict) -> dict:
 def _case_mesh_cache(cb, study_req: dict) -> dict:
     # The fixture solve already ran once, so the mesh content-cache is warm: a re-run
     # must NOT record a full mesh_tet study (resolve_mesh AND the overlay recovery both
-    # go through mesh_step_cached — the latter is the libaicad.cpp fix this guards).
+    # go through mesh_step_cached — the latter is the libchudware.cpp fix this guards).
     t0 = time.perf_counter()
     cb.call("prof_phases", {"reset": True})
     res = cb.call("sim_run_static", {"study": study_req})
@@ -256,7 +256,7 @@ def _case_rpc_overhead(cb) -> dict:
 # ------------------------------------------------------------------ entry point
 
 def run(quick: bool = False) -> list[dict]:
-    os.environ.setdefault("AI_CAD_ENGINE_DAEMON", "0")
+    os.environ.setdefault("CHUDWARE_ENGINE_DAEMON", "0")
     ok, reason = _capabilities()
     if not ok:
         return [_skip(cid, reason) for cid in _CASE_IDS]

@@ -1,7 +1,7 @@
 // 3D rigid-transform mate solver — C++ port of engine/doc/mate_solver.py.
 //
 // SolidWorks-style assembly mates solved as a least-squares constraint system on
-// the SAME shared numeric core (aicad::solver, the C++ port of nsolve). Each
+// the SAME shared numeric core (chudware::solver, the C++ port of nsolve). Each
 // floating component is parameterized by 6 variables: a translation t = (tx,ty,tz)
 // (mm) and an absolute rotation vector w = (wx,wy,wz) (Rodrigues / exp map). Fixed
 // components are pinned and contribute no variables.
@@ -26,7 +26,7 @@
 #include <string>
 #include <vector>
 
-namespace aicad::mate {
+namespace chudware::mate {
 
 // Local-frame geometry a single mate ref resolves to. kind in
 // {plane, axis, point, sphere}. Fields are in the owning component's local frame.
@@ -96,4 +96,4 @@ Eigen::Vector3d mat_to_rotvec(const Eigen::Matrix3d& R);
 // Returns the result as a JSON object (see mate_cli.cpp for the schema).
 nlohmann::json solve_mates_json(const nlohmann::json& input);
 
-}  // namespace aicad::mate
+}  // namespace chudware::mate

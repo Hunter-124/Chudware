@@ -9,7 +9,7 @@
 #include <regex>
 #include <stdexcept>
 
-namespace aicad::structural {
+namespace chudware::structural {
 
 const char* kSchema = "aicad.structure/1";
 
@@ -254,4 +254,4 @@ LoadCombo get_combo(const std::string& name) {
     throw std::out_of_range("unknown load combo '" + name + "'");
 }
 
-}  // namespace aicad::structural
+}  // namespace chudware::structural

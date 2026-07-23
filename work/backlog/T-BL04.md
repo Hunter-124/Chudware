@@ -64,9 +64,9 @@ Expose all four as MCP tools and DAG verify-node end conditions, same pattern as
   `sim_run_fatigue`, GUI-wired) — the tool routes to it, matching the
   `run_fea_static→sim_run_static` pattern, instead of a Python reimplementation.
 - **Netgen-gated backend:** on Linux (no Netgen) `sim_run_fatigue`/`sim_run_static`
-  are compiled out (`#ifdef AICAD_WITH_NETGEN`), so fatigue degrades `{skipped:true}`
+  are compiled out (`#ifdef CHUDWARE_WITH_NETGEN`), so fatigue degrades `{skipped:true}`
   exactly like `run_fea_static` does today; ccx is not installed here either, so the
   three ccx tools also degrade honestly. No fabricated results anywhere.
 - **License:** CalculiX row in `contracts/licenses.md` expanded (T-BL20 V&V →
-  T-BL04 tools); GPL-2.0 subprocess-only, PATH-discovered (`AI_CAD_CCX` override),
+  T-BL04 tools); GPL-2.0 subprocess-only, PATH-discovered (`CHUDWARE_CCX` override),
   never linked/bundled, clean-room `.inp` (no CalculiX example text copied).

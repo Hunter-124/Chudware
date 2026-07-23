@@ -1,8 +1,8 @@
 """Managed llama.cpp runtime support.
 
-AI-CAD talks to local models through OpenAI-compatible chat completions. llama.cpp's
+Chudware talks to local models through OpenAI-compatible chat completions. llama.cpp's
 ``llama-server`` exposes that API, so the app can either connect to a user-managed server or launch
-a bundled headless server from ``%APPDATA%\\AI-CAD\\llamacpp``.
+a bundled headless server from ``%APPDATA%\\Chudware\\llamacpp``.
 
 This module deliberately does not download binaries from the internet. Packaging is clean and
 auditable: if a release bundle includes a ``llamacpp`` folder containing ``llama-server.exe`` (or
@@ -45,16 +45,16 @@ SERVER_NAMES = ("llama-server.exe", "server.exe", "llama-server", "server")
 # CPU build is used (graceful fallback — a CUDA binary without a driver would
 # fail to load libggml-cuda). Detection is env-overridable for CI and users:
 #
-#   AICAD_LLAMA_VARIANT=cuda|cpu   force a variant (wins over detection)
+#   CHUDWARE_LLAMA_VARIANT=cuda|cpu   force a variant (wins over detection)
 # ---------------------------------------------------------------------------
 
-_VARIANT_ENV = "AICAD_LLAMA_VARIANT"
+_VARIANT_ENV = "CHUDWARE_LLAMA_VARIANT"
 
 
 def cuda_available() -> bool:
     """Best-effort NVIDIA GPU probe: ``nvidia-smi -L`` exits 0 and lists a GPU.
 
-    Env override: ``AICAD_LLAMA_VARIANT=cuda`` forces True, ``=cpu`` forces
+    Env override: ``CHUDWARE_LLAMA_VARIANT=cuda`` forces True, ``=cpu`` forces
     False. Never raises; absence of the tool means no usable GPU.
     """
     forced = os.environ.get(_VARIANT_ENV, "").strip().lower()
@@ -280,7 +280,7 @@ def ensure_server_running(cfg: dict | None = None) -> dict:
 
 
 def main(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(description="Install/check/launch AI-CAD's managed llama.cpp server")
+    ap = argparse.ArgumentParser(description="Install/check/launch Chudware's managed llama.cpp server")
     ap.add_argument("--install", action="store_true")
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--launch", action="store_true")

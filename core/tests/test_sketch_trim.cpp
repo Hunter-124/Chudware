@@ -32,10 +32,10 @@
 #include "doc/sketch_geom.h"   // split_entity_ex (the pure geometry the op sits on)
 
 using json = nlohmann::json;
-using aicad::doc::doc_apply_ops;
-using aicad::doc::doc_new;
-using aicad::doc::doc_sketch_overview;
-namespace sg = aicad::doc::sketchgeom;
+using chudware::doc::doc_apply_ops;
+using chudware::doc::doc_new;
+using chudware::doc::doc_sketch_overview;
+namespace sg = chudware::doc::sketchgeom;
 
 namespace {
 

@@ -18,7 +18,7 @@ namespace ui::cef_platform {
 // other platform ignores the unused parameter.
 CefMainArgs main_args(int argc, char** argv);
 
-// Absolute path to the directory holding the AI-CAD executable — CEF resources
+// Absolute path to the directory holding the Chudware executable — CEF resources
 // (*.pak, locales/, libcef) and the subprocess helper are staged next to it.
 std::string executable_dir();
 
@@ -41,7 +41,7 @@ std::string helper_path();
 //   GUI:    …/ai-cad/cef_cache_gui
 //   daemon: …/ai-cad/cef_cache_daemon
 // Windows: %LOCALAPPDATA%\ai-cad\cef_cache_{gui,daemon}. Override both with
-// AI_CAD_CEF_CACHE_ROOT (tests / --cef-shot isolation).
+// CHUDWARE_CEF_CACHE_ROOT (tests / --cef-shot isolation).
 std::string cache_root();
 
 // Call before initialize() in the --cef-daemon process so cache_root() picks the

@@ -1,6 +1,6 @@
 // ui::webBuild / ui::webGapReason — web-build capability gaps (T-RF12).
 //
-// The web app is this same host/src/ui tree compiled to WASM, talking to aicad-hostd
+// The web app is this same host/src/ui tree compiled to WASM, talking to chudware-hostd
 // with NO Python worker and NO CEF. Surfaces that depend on either must degrade to an
 // honest "desktop only" affordance instead of a dead button/panel. This header is the
 // single source of truth: ribbon buttons (widgets/ribbon.cpp), panels and settings rows

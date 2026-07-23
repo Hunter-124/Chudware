@@ -15,7 +15,7 @@
 #include "agent/complexity.h"
 #include "agent/domain.h"
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 
 struct TokenEstimate {
@@ -58,4 +58,4 @@ std::vector<Bid> collect_bids(const std::string& request, Complexity cx, Domain 
                               double usd_per_1k, double budget_usd);
 
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware

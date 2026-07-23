@@ -2,21 +2,21 @@
 failed or missed in the battery, so we can see exactly what the model emitted and why."""
 import ctypes, json, os, sys
 
-DIST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dist", "AI-CAD")
+DIST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dist", "Chudware")
 os.add_dll_directory(DIST)
-os.environ["AI_CAD_PROMPTS_DIR"] = os.path.join(DIST, "app", "agent", "prompts")
-dll = ctypes.CDLL(os.path.join(DIST, "libaicad.dll"))
-dll.aicad_call.restype = ctypes.c_int
-dll.aicad_call.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p)]
-dll.aicad_free.argtypes = [ctypes.c_char_p]
+os.environ["CHUDWARE_PROMPTS_DIR"] = os.path.join(DIST, "app", "agent", "prompts")
+dll = ctypes.CDLL(os.path.join(DIST, "libchudware.dll"))
+dll.chudware_call.restype = ctypes.c_int
+dll.chudware_call.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p)]
+dll.chudware_free.argtypes = [ctypes.c_char_p]
 
 
 def call(method, params):
     out = ctypes.c_char_p()
-    rc = dll.aicad_call(method.encode(), json.dumps(params).encode(), ctypes.byref(out))
+    rc = dll.chudware_call(method.encode(), json.dumps(params).encode(), ctypes.byref(out))
     s = out.value.decode() if out.value else ""
     if out.value:
-        dll.aicad_free(out)
+        dll.chudware_free(out)
     try:
         return rc, (json.loads(s) if s else {})
     except Exception:

@@ -50,7 +50,7 @@ def test_delegate_emits_model_assignment_event(tmp_path, monkeypatch):
     from services.agent.mission_dispatch import MissionDispatch
     from services.agent.role_models import RoleModelAssignment
 
-    monkeypatch.setenv("AICAD_CACHE_ROOT", str(tmp_path))
+    monkeypatch.setenv("CHUDWARE_CACHE_ROOT", str(tmp_path))
     ledger = Ledger("mega5_assign", path=tmp_path / "ledger.json")
 
     class _Tree:
@@ -219,7 +219,7 @@ def test_delegate_assigns_without_ai_roles_config(tmp_path, monkeypatch):
     from services.agent.ledger import Ledger
     from services.agent.mission_dispatch import MissionDispatch
 
-    monkeypatch.setenv("AICAD_CACHE_ROOT", str(tmp_path))
+    monkeypatch.setenv("CHUDWARE_CACHE_ROOT", str(tmp_path))
     ledger = Ledger("mega5_no_ai_roles", path=tmp_path / "ledger.json")
 
     class _Tree:
@@ -528,7 +528,7 @@ def test_delegate_soft_truncates_overlong_brief(tmp_path, monkeypatch):
     from services.agent.ledger import Ledger
     from services.agent.mission_dispatch import MissionDispatch
 
-    monkeypatch.setenv("AICAD_CACHE_ROOT", str(tmp_path))
+    monkeypatch.setenv("CHUDWARE_CACHE_ROOT", str(tmp_path))
     ledger = Ledger("mega5_brief", path=tmp_path / "ledger.json")
 
     class _Tree:
@@ -649,8 +649,8 @@ def test_xai_default_max_concurrent_is_three(monkeypatch):
     from services.agent.providers import xai_sub_provider as xsp
 
     xsp._reset_request_semaphore_for_tests()
-    monkeypatch.delenv("AICAD_XAI_MAX_CONCURRENT", raising=False)
-    monkeypatch.delenv("AI_CAD_XAI_MAX_CONCURRENT", raising=False)
+    monkeypatch.delenv("CHUDWARE_XAI_MAX_CONCURRENT", raising=False)
+    monkeypatch.delenv("CHUDWARE_XAI_MAX_CONCURRENT", raising=False)
     assert xsp._max_concurrent_requests() == 3
     assert xsp._DEFAULT_MAX_CONCURRENT == 3
     xsp._reset_request_semaphore_for_tests()
@@ -659,8 +659,8 @@ def test_xai_default_max_concurrent_is_three(monkeypatch):
 def test_xai_semaphore_stats_track_occupancy(monkeypatch):
     from services.agent.providers import xai_sub_provider as xsp
 
-    monkeypatch.setenv("AICAD_XAI_MAX_CONCURRENT", "1")
-    monkeypatch.setenv("AICAD_XAI_READ_TIMEOUT_RETRIES", "0")
+    monkeypatch.setenv("CHUDWARE_XAI_MAX_CONCURRENT", "1")
+    monkeypatch.setenv("CHUDWARE_XAI_READ_TIMEOUT_RETRIES", "0")
     xsp._reset_request_semaphore_for_tests()
 
     class _Prov(xsp.XAISubProvider):
@@ -713,8 +713,8 @@ def test_xai_semaphore_stats_track_occupancy(monkeypatch):
 def test_xai_read_timeout_retries_once(monkeypatch):
     from services.agent.providers import xai_sub_provider as xsp
 
-    monkeypatch.setenv("AICAD_XAI_MAX_CONCURRENT", "2")
-    monkeypatch.setenv("AICAD_XAI_READ_TIMEOUT_RETRIES", "1")
+    monkeypatch.setenv("CHUDWARE_XAI_MAX_CONCURRENT", "2")
+    monkeypatch.setenv("CHUDWARE_XAI_READ_TIMEOUT_RETRIES", "1")
     xsp._reset_request_semaphore_for_tests()
 
     calls = {"n": 0}

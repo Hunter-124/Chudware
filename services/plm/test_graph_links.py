@@ -1,4 +1,4 @@
-"""services.plm.test_graph_links — manual/AI CAD graph overlay (1B)."""
+"""services.plm.test_graph_links — manual/Chudware graph overlay (1B)."""
 from __future__ import annotations
 
 import io

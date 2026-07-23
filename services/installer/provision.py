@@ -1,4 +1,4 @@
-"""Provision the AI-CAD runtime into %APPDATA%/AI-CAD on first launch.
+"""Provision the Chudware runtime into %APPDATA%/Chudware on first launch.
 
 Ensures an isolated Python venv with build123d/OCCT/pyvista/mcp/etc. exists, plus a copy
 of the app's Python packages (engine, mcp_server, agent, installer) so the MCP server and
@@ -135,7 +135,7 @@ def reveng_provisioning_status() -> dict:
 def ngspice_provisioning_status() -> dict:
     """Availability of the OPTIONAL ngspice SPICE backend (T-FIN14) — never installs.
 
-    ngspice is subprocess-only: discovered via the ``AI_CAD_NGSPICE`` env var or PATH,
+    ngspice is subprocess-only: discovered via the ``CHUDWARE_NGSPICE`` env var or PATH,
     never bundled. Its absence is not an error — ecad_simulate/ecad_tf degrade honestly
     to the internal MNA solver (backend='mna', the default) with a ``backend_note``.
     Delegates to engine.sim.ngspice_backend.ngspice_status(); never raises.
@@ -254,7 +254,7 @@ def _write_stamp() -> None:
 
 
 def ensure_app_code(src: Path = REPO) -> Path:
-    """Copy the app's Python packages into %APPDATA%/AI-CAD/app."""
+    """Copy the app's Python packages into %APPDATA%/Chudware/app."""
     app = paths.ROOT / "app"
     app.mkdir(parents=True, exist_ok=True)
     ignore = shutil.ignore_patterns("__pycache__", "*.pyc", "build", "test_*", "tests")
@@ -344,9 +344,9 @@ def ensure_runtime(base_python: str | None = None, wheelhouse: Path | None = Non
         pass
 
     # Optional sim/firmware backends (Renode, openEMS). Best-effort, non-fatal,
-    # idempotent. Controlled by AICAD_PROVISION_OPTIONAL_SIM (default: "1" = try).
+    # idempotent. Controlled by CHUDWARE_PROVISION_OPTIONAL_SIM (default: "1" = try).
     # Set to "0"/"false" to skip network/source builds during a minimal install.
-    opt_flag = os.environ.get("AICAD_PROVISION_OPTIONAL_SIM", "1").strip().lower()
+    opt_flag = os.environ.get("CHUDWARE_PROVISION_OPTIONAL_SIM", "1").strip().lower()
     if opt_flag not in ("0", "false", "no", "off"):
         try:
             ensure_optional_sim_tools(install=True)
@@ -371,13 +371,13 @@ def _find_base_python() -> str:
 
 
 def main(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(description="Provision the AI-CAD runtime.")
+    ap = argparse.ArgumentParser(description="Provision the Chudware runtime.")
     ap.add_argument("--check", action="store_true", help="report readiness only")
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--base-python", default=None)
     ap.add_argument("--wheelhouse", type=Path, default=None)
     ap.add_argument("--with-app-code", action="store_true",
-                    help="also copy app packages into %%APPDATA%%/AI-CAD/app")
+                    help="also copy app packages into %%APPDATA%%/Chudware/app")
     args = ap.parse_args(argv)
 
     if args.check:

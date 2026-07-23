@@ -46,7 +46,7 @@ from typing import Any, Callable
 
 _NO_VAULT = {"ok": False, "reason": "no_vault",
              "hint": "Version history needs a one-time setup on this machine. "
-                     "Restart AI-CAD to finish setting it up."}
+                     "Restart Chudware to finish setting it up."}
 
 
 def _with_vault(params: dict, fn: Callable[[Any], dict]) -> dict:
@@ -306,12 +306,12 @@ def _plm_settings_get(params: dict, _emit: Callable) -> dict:
     """Per-machine vault-local settings + the project auto-record flag.
 
     Also surfaces ``ai_mode`` and bridge enablement hints so Settings can show
-    that Managed mode turns on AI→vault checkpoints without AICAD_PLM_BRIDGE.
-    Precedence: managed ai_mode > AICAD_PLM_BRIDGE env > off.
+    that Managed mode turns on AI→vault checkpoints without CHUDWARE_PLM_BRIDGE.
+    Precedence: managed ai_mode > CHUDWARE_PLM_BRIDGE env > off.
     """
     def run(v: Any) -> dict:
         mode = v.ai_mode()
-        env_on = os.environ.get("AICAD_PLM_BRIDGE", "").strip() == "1"
+        env_on = os.environ.get("CHUDWARE_PLM_BRIDGE", "").strip() == "1"
         return {
             "ok": True,
             "settings": v.get_local_config(),
@@ -446,7 +446,7 @@ def _plm_compare(params: dict, _emit: Callable) -> dict:
             import tempfile
 
             od = str((params or {}).get("out_dir", "") or "")
-            od = od or tempfile.mkdtemp(prefix="aicad_plm_compare_")
+            od = od or tempfile.mkdtemp(prefix="chudware_plm_compare_")
             try:
                 out["eval_compare"] = compare_mod.visual_compare(doc_a, doc_b, od)
             except Exception as e:  # noqa: BLE001 — visual half degrades gracefully
@@ -526,7 +526,7 @@ def _local_provider() -> Any | None:
     used for drafting — this returns None for them, which the caller maps to
     the plain manual box. Only loopback-served local models qualify.
     """
-    if os.environ.get("AICAD_PLM_DRAFT_LOCAL", "1") == "0":
+    if os.environ.get("CHUDWARE_PLM_DRAFT_LOCAL", "1") == "0":
         return None
     try:
         from services.agent import config as agent_config
@@ -683,7 +683,7 @@ def _git_gh_auth_login(params, _emit):  return _git_rpc(params, _emit, "gh_auth_
 # ---------------------------------------------------------------------------
 
 def _plm_add_remote(params: dict, _emit: Callable) -> dict:
-    """Register a remote profile (folder/ssh/https/aicad-cloud config)."""
+    """Register a remote profile (folder/ssh/https/chudware-cloud config)."""
     try:
         from services.plm import remote as remote_mod
     except ImportError:

@@ -4,7 +4,7 @@ interface_fitment.
 Contract: contracts/advisor.md §3 (advisory item shape, FROZEN), §5 (failure card), §20 (triggers).
 
 Design:
-  * Interference test is REAL: builds an overlapping-solid doc via the libaicad.so
+  * Interference test is REAL: builds an overlapping-solid doc via the libchudware.so
     kernel (same path as production), calls eval_interference, and asserts that the
     advisory names the correct axis and depth derived from real AABB numbers.
   * DFM, wall_thickness, interface_fitment tests use fixture dicts that mirror the
@@ -128,31 +128,31 @@ class TestOverlapAxisFromBboxes(unittest.TestCase):
 
 # ===========================================================================
 # 2. Real-engine interference test
-#    Builds two overlapping bodies via libaicad.so, runs eval_interference,
+#    Builds two overlapping bodies via libchudware.so, runs eval_interference,
 #    runs the full advisor pipeline, and asserts the finding names the axis.
 # ===========================================================================
 
-def _libaicad_path() -> str | None:
-    """Return the first libaicad.so found under known build paths, or None."""
-    env = os.environ.get("AI_CAD_LIBAICAD")
+def _libchudware_path() -> str | None:
+    """Return the first libchudware.so found under known build paths, or None."""
+    env = os.environ.get("CHUDWARE_LIBCHUDWARE")
     if env and pathlib.Path(env).exists():
         return env
     candidates = [
-        _REPO / "core" / "build-linux" / "bin" / "libaicad.so",
-        _REPO / "core" / "build-occt-linux" / "bin" / "libaicad.so",
+        _REPO / "core" / "build-linux" / "bin" / "libchudware.so",
+        _REPO / "core" / "build-occt-linux" / "bin" / "libchudware.so",
     ]
     for c in candidates:
         if c.exists():
             return str(c)
     # Try sibling worktrees (CI shares builds between tasks)
-    for sibling in (_REPO.parent).glob("CAD-*/core/build-linux/bin/libaicad.so"):
+    for sibling in (_REPO.parent).glob("CAD-*/core/build-linux/bin/libchudware.so"):
         return str(sibling)
     return None
 
 
-_SO = _libaicad_path()
+_SO = _libchudware_path()
 _SKIP_ENGINE = _SO is None
-_SKIP_REASON = "libaicad.so not found — set AI_CAD_LIBAICAD or build core/build-linux"
+_SKIP_REASON = "libchudware.so not found — set CHUDWARE_LIBCHUDWARE or build core/build-linux"
 
 
 @unittest.skipIf(_SKIP_ENGINE, _SKIP_REASON)
@@ -161,7 +161,7 @@ class TestInterferenceAdvisorRealEngine(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        os.environ["AI_CAD_LIBAICAD"] = _SO  # type: ignore[arg-type]
+        os.environ["CHUDWARE_LIBCHUDWARE"] = _SO  # type: ignore[arg-type]
         from services.mcp import core_bridge as cb  # noqa: PLC0415
         cls._cb = cb
 

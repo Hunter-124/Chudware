@@ -16,8 +16,8 @@ that boundary, so every record lives on disk:
     <subagents_dir>/<subagent_id>.transcript.jsonl  — append-only conversation transcript
     <subagents_dir>/<subagent_id>.steer.jsonl       — append-only steering queue
 
-``subagents_dir`` defaults to ``~/.local/share/AI-CAD/cache/subagents`` (the same
-cache subtree as the agent-events journal); ``AICAD_SUBAGENTS_DIR`` overrides it
+``subagents_dir`` defaults to ``~/.local/share/Chudware/cache/subagents`` (the same
+cache subtree as the agent-events journal); ``CHUDWARE_SUBAGENTS_DIR`` overrides it
 (tests point it at a tmpdir).
 
 Steering (injection) semantics — HONEST
@@ -58,15 +58,15 @@ STATUSES = ("pending", "approved", "running", "done", "failed", "revoked", "term
 
 def subagents_dir() -> Path:
     """The registry directory (created on demand).  Env-overridable for tests."""
-    env = os.environ.get("AICAD_SUBAGENTS_DIR")
+    env = os.environ.get("CHUDWARE_SUBAGENTS_DIR")
     if env:
         p = Path(env)
     elif platform.system() == "Windows":
         appdata = os.environ.get("APPDATA") or os.path.expanduser(r"~\AppData\Roaming")
-        p = Path(appdata) / "AI-CAD" / "cache" / "subagents"
+        p = Path(appdata) / "Chudware" / "cache" / "subagents"
     else:
         xdg = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
-        p = Path(xdg) / "AI-CAD" / "cache" / "subagents"
+        p = Path(xdg) / "Chudware" / "cache" / "subagents"
     p.mkdir(parents=True, exist_ok=True)
     return p
 

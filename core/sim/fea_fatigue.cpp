@@ -2,7 +2,7 @@
 //
 // Strategy: reuse fea_run_static(study) for the per-node von Mises field (the peak
 // operating stress) and the n_nodes/n_elems/n_dof counts. Re-resolve the mesh points
-// (inline or re-mesh the STEP, exactly as the libaicad overlay path does) so the
+// (inline or re-mesh the STEP, exactly as the libchudware overlay path does) so the
 // fatigue overlay can map per-node results to the surface. The static numerics are
 // untouched — this layer only post-processes the stress field.
 //
@@ -26,7 +26,7 @@
 
 using nlohmann::json;
 
-namespace aicad::sim {
+namespace chudware::sim {
 
 namespace {
 
@@ -117,12 +117,12 @@ ResolvedMesh resolve_mesh_for_overlay(const json& study) {
 nlohmann::json fea_run_fatigue(const nlohmann::json& study) {
     // Per-phase record (prof/phases.h): "static" (the reused static solve — which also opens
     // its own nested fea_static study with the finer split), "damage", "overlay".
-    aicad::prof::phases::StudyScope _study("fea_fatigue");
+    chudware::prof::phases::StudyScope _study("fea_fatigue");
     try {
         // ── 1. Static stress field (reuse the existing parity-proven path) ────
         json st;
         try {
-            aicad::prof::phases::PhaseScope _p("static");
+            chudware::prof::phases::PhaseScope _p("static");
             st = fea_run_static(study);
         } catch (const std::exception& e) {
             return json{{"ok", false},
@@ -287,14 +287,14 @@ nlohmann::json fea_run_fatigue(const nlohmann::json& study) {
             life_log10[i] = std::log10(N);
         }
 
-        aicad::prof::phases::add(
+        chudware::prof::phases::add(
             "damage", std::chrono::duration<double, std::milli>(
                           std::chrono::steady_clock::now() - t_damage0).count());
 
         // ── 5. Fatigue overlay (best-effort, only when a STEP path is given) ──
         std::string overlay_path;
         if (study.contains("step_path") && study["step_path"].is_string()) {
-            aicad::prof::phases::PhaseScope _p("overlay");
+            chudware::prof::phases::PhaseScope _p("overlay");
             ResolvedMesh rm = resolve_mesh_for_overlay(study);
             if (rm.ok && rm.points.size() / 3 == vm.size()) {
                 overlay_path = fatigue_overlay(study["step_path"].get<std::string>(),
@@ -339,4 +339,4 @@ nlohmann::json fea_run_fatigue(const nlohmann::json& study) {
     }
 }
 
-}  // namespace aicad::sim
+}  // namespace chudware::sim

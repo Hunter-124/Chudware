@@ -14,7 +14,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-namespace aicad::doc::sketchgeom {
+namespace chudware::doc::sketchgeom {
 
 using nlohmann::json;
 
@@ -586,4 +586,4 @@ json chamfer_corner(const json& la, const json& lb, double dist_a, double dist_b
             {"end_a", co.end_a}, {"end_b", co.end_b}};
 }
 
-}  // namespace aicad::doc::sketchgeom
+}  // namespace chudware::doc::sketchgeom

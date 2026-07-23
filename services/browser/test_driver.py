@@ -15,12 +15,12 @@ import pytest
 
 @pytest.fixture()
 def driver_mod(monkeypatch):
-    """driver module with a clean BILLET_PW_BACKEND env each test.
+    """driver module with a clean CHUDWARE_PW_BACKEND env each test.
 
     selected_backend() / resolve_* read the env at call time, so no reload is
     required (and popping sys.modules races the parent package attribute cache).
     """
-    monkeypatch.delenv("BILLET_PW_BACKEND", raising=False)
+    monkeypatch.delenv("CHUDWARE_PW_BACKEND", raising=False)
     from services.browser import driver as d
     yield d
 
@@ -31,33 +31,33 @@ def driver_mod(monkeypatch):
 
 
 def test_default_backend_is_cef_when_env_unset(driver_mod, monkeypatch):
-    monkeypatch.delenv("BILLET_PW_BACKEND", raising=False)
+    monkeypatch.delenv("CHUDWARE_PW_BACKEND", raising=False)
     assert driver_mod.selected_backend() == "cef"
     assert driver_mod.DEFAULT_BACKEND == "cef"
 
 
 def test_backend_env_patchright(driver_mod, monkeypatch):
-    monkeypatch.setenv("BILLET_PW_BACKEND", "patchright")
+    monkeypatch.setenv("CHUDWARE_PW_BACKEND", "patchright")
     assert driver_mod.selected_backend() == "patchright"
 
 
 def test_backend_env_camoufox(driver_mod, monkeypatch):
-    monkeypatch.setenv("BILLET_PW_BACKEND", "camoufox")
+    monkeypatch.setenv("CHUDWARE_PW_BACKEND", "camoufox")
     assert driver_mod.selected_backend() == "camoufox"
 
 
 def test_backend_env_cef_explicit(driver_mod, monkeypatch):
-    monkeypatch.setenv("BILLET_PW_BACKEND", "cef")
+    monkeypatch.setenv("CHUDWARE_PW_BACKEND", "cef")
     assert driver_mod.selected_backend() == "cef"
 
 
 def test_backend_env_unknown_falls_back_to_cef(driver_mod, monkeypatch):
-    monkeypatch.setenv("BILLET_PW_BACKEND", "zendriver")
+    monkeypatch.setenv("CHUDWARE_PW_BACKEND", "zendriver")
     assert driver_mod.selected_backend() == "cef"
 
 
 def test_backend_env_case_and_whitespace(driver_mod, monkeypatch):
-    monkeypatch.setenv("BILLET_PW_BACKEND", "  PatchRight  ")
+    monkeypatch.setenv("CHUDWARE_PW_BACKEND", "  PatchRight  ")
     assert driver_mod.selected_backend() == "patchright"
 
 
@@ -86,7 +86,7 @@ def _install_fake_module(monkeypatch, full_name: str, attrs: dict[str, Any] | No
 
 def test_resolve_sync_default_uses_playwright(driver_mod, monkeypatch):
     """Default (cef) residual path imports stock playwright.sync_api."""
-    monkeypatch.delenv("BILLET_PW_BACKEND", raising=False)
+    monkeypatch.delenv("CHUDWARE_PW_BACKEND", raising=False)
     sentinel = object()
 
     def _fake_sync():
@@ -102,7 +102,7 @@ def test_resolve_sync_default_uses_playwright(driver_mod, monkeypatch):
 
 
 def test_resolve_async_default_uses_playwright(driver_mod, monkeypatch):
-    monkeypatch.delenv("BILLET_PW_BACKEND", raising=False)
+    monkeypatch.delenv("CHUDWARE_PW_BACKEND", raising=False)
 
     def _fake_async():
         return "async-pw"
@@ -116,7 +116,7 @@ def test_resolve_async_default_uses_playwright(driver_mod, monkeypatch):
 
 
 def test_resolve_sync_patchright_when_selected(driver_mod, monkeypatch):
-    monkeypatch.setenv("BILLET_PW_BACKEND", "patchright")
+    monkeypatch.setenv("CHUDWARE_PW_BACKEND", "patchright")
 
     def _fake_pr_sync():
         return "pr-sync"
@@ -130,7 +130,7 @@ def test_resolve_sync_patchright_when_selected(driver_mod, monkeypatch):
 
 
 def test_resolve_async_patchright_when_selected(driver_mod, monkeypatch):
-    monkeypatch.setenv("BILLET_PW_BACKEND", "patchright")
+    monkeypatch.setenv("CHUDWARE_PW_BACKEND", "patchright")
 
     def _fake_pr_async():
         return "pr-async"
@@ -145,7 +145,7 @@ def test_resolve_async_patchright_when_selected(driver_mod, monkeypatch):
 
 def test_resolve_sync_playwright_missing_raises_runtimeerror(driver_mod, monkeypatch):
     """ImportError of stock playwright degrades to RuntimeError (session shape)."""
-    monkeypatch.delenv("BILLET_PW_BACKEND", raising=False)
+    monkeypatch.delenv("CHUDWARE_PW_BACKEND", raising=False)
     # Ensure a failed import: remove any real/fake playwright modules and
     # install a meta_path finder that raises ImportError for playwright*.
     for key in list(sys.modules):
@@ -167,7 +167,7 @@ def test_resolve_sync_playwright_missing_raises_runtimeerror(driver_mod, monkeyp
 
 
 def test_resolve_sync_patchright_missing_raises_runtimeerror(driver_mod, monkeypatch):
-    monkeypatch.setenv("BILLET_PW_BACKEND", "patchright")
+    monkeypatch.setenv("CHUDWARE_PW_BACKEND", "patchright")
     for key in list(sys.modules):
         if key == "patchright" or key.startswith("patchright."):
             monkeypatch.delitem(sys.modules, key, raising=False)
@@ -187,7 +187,7 @@ def test_resolve_sync_patchright_missing_raises_runtimeerror(driver_mod, monkeyp
 
 
 def test_resolve_async_patchright_missing_raises_runtimeerror(driver_mod, monkeypatch):
-    monkeypatch.setenv("BILLET_PW_BACKEND", "patchright")
+    monkeypatch.setenv("CHUDWARE_PW_BACKEND", "patchright")
     for key in list(sys.modules):
         if key == "patchright" or key.startswith("patchright."):
             monkeypatch.delitem(sys.modules, key, raising=False)
@@ -205,7 +205,7 @@ def test_resolve_async_patchright_missing_raises_runtimeerror(driver_mod, monkey
 
 
 def test_resolve_sync_camoufox_missing_raises_runtimeerror(driver_mod, monkeypatch):
-    monkeypatch.setenv("BILLET_PW_BACKEND", "camoufox")
+    monkeypatch.setenv("CHUDWARE_PW_BACKEND", "camoufox")
     for key in list(sys.modules):
         if key == "camoufox" or key.startswith("camoufox."):
             monkeypatch.delitem(sys.modules, key, raising=False)
@@ -225,7 +225,7 @@ def test_resolve_sync_camoufox_missing_raises_runtimeerror(driver_mod, monkeypat
 
 def test_resolve_sync_camoufox_present_not_dropin(driver_mod, monkeypatch):
     """Camoufox imports but is not a sync_playwright drop-in — clear RuntimeError."""
-    monkeypatch.setenv("BILLET_PW_BACKEND", "camoufox")
+    monkeypatch.setenv("CHUDWARE_PW_BACKEND", "camoufox")
     _install_fake_module(monkeypatch, "camoufox")
     with pytest.raises(RuntimeError) as ei:
         driver_mod.resolve_sync()
@@ -313,7 +313,7 @@ def test_provision_browser_unknown(driver_mod):
 
 
 def test_provision_browser_install_package_missing(driver_mod, monkeypatch):
-    monkeypatch.setenv("BILLET_PW_BACKEND", "patchright")
+    monkeypatch.setenv("CHUDWARE_PW_BACKEND", "patchright")
     for key in list(sys.modules):
         if key == "patchright" or key.startswith("patchright."):
             monkeypatch.delitem(sys.modules, key, raising=False)
@@ -375,11 +375,11 @@ def test_descriptors_schema_valid(driver_mod):
 
 
 def test_describe_backends_shape(driver_mod, monkeypatch):
-    monkeypatch.delenv("BILLET_PW_BACKEND", raising=False)
+    monkeypatch.delenv("CHUDWARE_PW_BACKEND", raising=False)
     info = driver_mod.describe_backends()
     assert info["selected"] == "cef"
     assert info["default"] == "cef"
-    assert info["env_key"] == "BILLET_PW_BACKEND"
+    assert info["env_key"] == "CHUDWARE_PW_BACKEND"
     assert "cef" in info["backends"]
     assert "patchright" in info["backends"]
     assert "camoufox" in info["backends"]
@@ -391,7 +391,7 @@ def test_describe_backends_shape(driver_mod, monkeypatch):
 
 
 def test_session_import_seam_uses_driver(monkeypatch):
-    monkeypatch.delenv("BILLET_PW_BACKEND", raising=False)
+    monkeypatch.delenv("CHUDWARE_PW_BACKEND", raising=False)
     from services.browser import driver as d
     from services.browser import session
 
@@ -405,7 +405,7 @@ def test_session_import_seam_uses_driver(monkeypatch):
 
 
 def test_embed_import_seam_uses_driver(monkeypatch):
-    monkeypatch.delenv("BILLET_PW_BACKEND", raising=False)
+    monkeypatch.delenv("CHUDWARE_PW_BACKEND", raising=False)
     from services.browser import driver as d
     from services.browser.embed import EmbedManager
 

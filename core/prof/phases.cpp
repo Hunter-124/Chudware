@@ -12,7 +12,7 @@
 
 using nlohmann::json;
 
-namespace aicad {
+namespace chudware {
 namespace prof {
 namespace phases {
 
@@ -268,4 +268,4 @@ void reset() {
 
 }  // namespace phases
 }  // namespace prof
-}  // namespace aicad
+}  // namespace chudware

@@ -564,9 +564,9 @@ void AsmPanels::drawInsertBody(AppState& st) {
 
     // Browse from disk — prominent, in addition to open/recent + workspace lists.
     if (ImGui::Button("Browse from disk\xe2\x80\xa6", ImVec2(-1, 0))) {
-        if (std::getenv("AI_CAD_NO_FILE_DIALOGS")) {
+        if (std::getenv("CHUDWARE_NO_FILE_DIALOGS")) {
             st.toast(ui::ToastLevel::Info,
-                     "File dialogs disabled (AI_CAD_NO_FILE_DIALOGS).");
+                     "File dialogs disabled (CHUDWARE_NO_FILE_DIALOGS).");
         } else {
             std::string path = openFileDialog(kInsertFilter);
             if (!path.empty()) {

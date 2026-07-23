@@ -25,7 +25,7 @@ try:
 except ImportError:  # allow `python -c 'import chat'` from package dir
     from config import settings  # type: ignore
 
-log = logging.getLogger("billet.gateway.chat")
+log = logging.getLogger("chudware.gateway.chat")
 
 router = APIRouter()
 

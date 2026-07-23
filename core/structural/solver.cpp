@@ -12,7 +12,7 @@
 
 #include <Eigen/Dense>
 
-namespace aicad::structural {
+namespace chudware::structural {
 namespace {
 
 using Vec3 = std::array<double, 3>;
@@ -808,4 +808,4 @@ std::vector<AnalysisRow> analyze_doc(const StructureDoc& doc,
     return results;
 }
 
-}  // namespace aicad::structural
+}  // namespace chudware::structural

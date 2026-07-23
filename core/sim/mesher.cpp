@@ -9,15 +9,15 @@
 //   Ng_GetNP/Ng_GetPoint + Ng_GetNE/Ng_GetVolumeElement (tet4 NG_TET / tet10 NG_TET10).
 //
 // LICENSE: Netgen/nglib is LGPL-2.1 (commercial-safe under DYNAMIC linking — we ship
-// nglib.dll + ngcore.dll next to libaicad.dll and offer the Netgen source). This replaced
-// gmsh (GPL-2+, no linking exception) which had been linked into libaicad.dll — the #1
+// nglib.dll + ngcore.dll next to libchudware.dll and offer the Netgen source). This replaced
+// gmsh (GPL-2+, no linking exception) which had been linked into libchudware.dll — the #1
 // commercialization blocker. gmsh already wrapped Netgen for its OptimizeNetgen pass, so
 // the volume optimizer is literally the same engine; quality parity is therefore realistic.
 //
 // IMPLEMENTATION NOTE — the nglib C interface (Ng_*) is the cleanest, most stable surface
 // and mirrors the old gmshc.h C-API pattern. Netgen is BUILT FROM SOURCE with MSVC against
 // our exact OCCT 7.9.3 (core/cmake/ProvisionNetgen.cmake), so (a) the C++ ABI matches MSVC
-// and (b) nglib.dll and libaicad.dll share ONE OCCT — Ng_OCC_Load_STEP reads the STEP with
+// and (b) nglib.dll and libchudware.dll share ONE OCCT — Ng_OCC_Load_STEP reads the STEP with
 // the same kernel, no two-OCCT symbol clash. nglib defines its functions inside
 // `namespace nglib`, so we include the header in that namespace and qualify the calls.
 //
@@ -98,7 +98,7 @@ namespace nglib {
 // meshed fine in a fresh process). Cleared at every session start below.
 extern "C" void Ng_UnSetTerminate(void);
 
-namespace aicad::sim {
+namespace chudware::sim {
 
 namespace {
 
@@ -170,7 +170,7 @@ size_t component_mesh_bytes(const MeshOut& m) {
            m.error.size() + 256;
 }
 uint64_t component_cache_budget() {
-    const uint64_t host = aicad::governor::budget_bytes();
+    const uint64_t host = chudware::governor::budget_bytes();
     if (host == UINT64_MAX) return 512ull * 1024ull * 1024ull;
     return std::max<uint64_t>(64ull * 1024ull * 1024ull, host / 8);
 }
@@ -641,11 +641,11 @@ MeshOut mesh_step(const std::string& step_path, const MeshOptions& options) {
     // path-based, so the bonded shape goes through a temp STEP beside the original. Fuse
     // failure falls through to the raw compound — single-solid behavior and its error
     // surfaces are unchanged.
-    // Stage tracing for long assembly meshes (AI_CAD_MESH_TRACE=1): every bonded-path
+    // Stage tracing for long assembly meshes (CHUDWARE_MESH_TRACE=1): every bonded-path
     // stage stamps wall time to stderr, so a stuck stage is identifiable without waiting
     // for the study-scope report that only prints on completion.
     const bool trace = [] {
-        const char* e = std::getenv("AI_CAD_MESH_TRACE");
+        const char* e = std::getenv("CHUDWARE_MESH_TRACE");
         return e && *e && *e != '0';
     }();
     const auto t_start = std::chrono::steady_clock::now();
@@ -685,14 +685,14 @@ MeshOut mesh_step(const std::string& step_path, const MeshOptions& options) {
         // meshes fine as tet4 and refuses as tet10), and for a bonded load-path study the
         // discretization error is dominated by the gap-tie idealization anyway.
         // resolve_mesh takes the stride from the RESULT, so the solver follows.
-        // AICAD_ASM_TET10=1 opts back in.
+        // CHUDWARE_ASM_TET10=1 opts back in.
         std::string order_note;
         if (bopt.order == 2) {
-            const char* o2 = std::getenv("AICAD_ASM_TET10");
+            const char* o2 = std::getenv("CHUDWARE_ASM_TET10");
             if (!(o2 && *o2 && *o2 != '0')) {
                 bopt.order = 1;
                 order_note = "assembly meshed first-order (tet4) — tet10 elevation is "
-                             "unreliable on assembly parts (AICAD_ASM_TET10=1 forces it)";
+                             "unreliable on assembly parts (CHUDWARE_ASM_TET10=1 forces it)";
             }
         }
         // Sizing is deliberately PER PART (auto): pinning the assembly-wide size as an
@@ -813,9 +813,9 @@ MeshOut mesh_step(const std::string& step_path, const MeshOptions& options) {
                         ? vols[static_cast<std::size_t>(solid_no - 1)] / vol_total
                         : 1.0;
                 // Skip threshold for unmeshable parts (% of assembly volume).
-                // Default 0.5%; AI_CAD_FEA_SKIP_UNMESHABLE_PCT overrides.
+                // Default 0.5%; CHUDWARE_FEA_SKIP_UNMESHABLE_PCT overrides.
                 double skip_pct = 0.5;
-                if (const char* sp = std::getenv("AI_CAD_FEA_SKIP_UNMESHABLE_PCT")) {
+                if (const char* sp = std::getenv("CHUDWARE_FEA_SKIP_UNMESHABLE_PCT")) {
                     const double v = std::atof(sp);
                     if (v >= 0.0) skip_pct = v;
                 }
@@ -995,7 +995,7 @@ SizeBand resolve_size_band(const TopoDS_Shape& shape, const MeshOptions& options
     // same diagonal stays small (measured: a 120x100x150 block hit 412k DOF / 96k tets at
     // fineness 0.7). For AUTO sizing, estimate the linear-tet count and coarsen `base` upward so
     // an interactive study stays fast. Budget scales with fineness (Draft small .. Fine large)
-    // and is overridable via AI_CAD_MESH_MAX_ELEMS. Explicit target_size_mm is honored verbatim.
+    // and is overridable via CHUDWARE_MESH_MAX_ELEMS. Explicit target_size_mm is honored verbatim.
     // n_tets ~= C * vol / base^3, C~=6 (empirical Netgen tet packing).
     // Host-memory ceiling on the element count (governor). The downstream SOLVE is the
     // real OOM risk — tet10 assembly+factorization runs tens of KB per element (same
@@ -1003,9 +1003,9 @@ SizeBand resolve_size_band(const TopoDS_Shape& shape, const MeshOptions& options
     // — so on a low-end machine the mesh coarsens here, with a note, instead of the solve
     // OOM-crashing the app. Applies to BOTH auto sizing (folded into the interactivity
     // budget below) and an explicit target_size_mm (verbatim honor yields only under
-    // memory pressure — graceful lag beats a crash). AICAD_GOVERNOR=0 disables.
+    // memory pressure — graceful lag beats a crash). CHUDWARE_GOVERNOR=0 disables.
     const long mem_max_elems = [&]() -> long {
-        const uint64_t mem_budget = aicad::governor::budget_bytes();
+        const uint64_t mem_budget = chudware::governor::budget_bytes();
         if (mem_budget == UINT64_MAX) return 0;  // governor off / unknowable host
         const int npe = (options.order == 2) ? 10 : 4;
         const double band = 3.0 * npe;
@@ -1018,7 +1018,7 @@ SizeBand resolve_size_band(const TopoDS_Shape& shape, const MeshOptions& options
     if (!explicit_size) {
         const double vol = vol_est;
         long budget = static_cast<long>(8000.0 + 52000.0 * fineness);  // ~8k Draft .. 60k Fine
-        if (const char* e = std::getenv("AI_CAD_MESH_MAX_ELEMS")) {
+        if (const char* e = std::getenv("CHUDWARE_MESH_MAX_ELEMS")) {
             const long b = std::atol(e);
             if (b > 0) budget = b;
         }
@@ -1047,7 +1047,7 @@ SizeBand resolve_size_band(const TopoDS_Shape& shape, const MeshOptions& options
             std::snprintf(buf, sizeof(buf),
                 "governor: target size %.2f mm would need ~%.0fk elements, beyond this "
                 "machine's memory budget (~%ldk) -> element size raised to %.2f mm "
-                "(raise AICAD_MEM_FRAC or use a smaller model for more detail)",
+                "(raise CHUDWARE_MEM_FRAC or use a smaller model for more detail)",
                 base, est / 1000.0, mem_max_elems / 1000, base_new);
             append_note(buf);
             base = base_new;
@@ -1090,7 +1090,7 @@ MeshOut mesh_step_netgen(const std::string& step_path, const MeshOptions& option
     std::lock_guard<std::mutex> mesh_lock(mesh_mutex());  // serialize: Netgen is not thread-safe
     // Per-phase record (prof/phases.h): load_step / generate / second_order / extract.
     // Opened AFTER the meshing mutex so lock-wait is not misattributed to meshing time.
-    aicad::prof::phases::StudyScope _study("mesh_tet");
+    chudware::prof::phases::StudyScope _study("mesh_tet");
     MeshOut out;
 
     // Second-order (tet10) selection. order==1 produces 4-node tets (NG_TET); order==2
@@ -1135,11 +1135,11 @@ MeshOut mesh_step_netgen(const std::string& step_path, const MeshOptions& option
     NetgenSession sess;
 
     try {
-        // Load the OCC geometry from the STEP via Netgen's OCCT (the SAME OCCT libaicad
+        // Load the OCC geometry from the STEP via Netgen's OCCT (the SAME OCCT libchudware
         // links). Raises a netgen exception on unreadable geometry; treat null OR throw as a
         // load failure so the heal-and-retry wrapper can take over.
         {
-            aicad::prof::phases::PhaseScope _p("load_step");
+            chudware::prof::phases::PhaseScope _p("load_step");
             sess.geo = nglib::Ng_OCC_Load_STEP(step_path.c_str());
         }
         if (!sess.geo) return fail("could not load the OCC geometry from the STEP");
@@ -1200,7 +1200,7 @@ MeshOut mesh_step_netgen(const std::string& step_path, const MeshOptions& option
         // so the field is accepted for API compatibility but intentionally not mapped.
 
         {
-            aicad::prof::phases::PhaseScope _p("generate");
+            chudware::prof::phases::PhaseScope _p("generate");
             nglib::Ng_OCC_SetLocalMeshSize(sess.geo, sess.mesh, &mp);
             if (nglib::Ng_OCC_GenerateEdgeMesh(sess.geo, sess.mesh, &mp) != nglib::NG_OK)
                 return fail("edge meshing failed (check that the geometry is a valid solid)");
@@ -1213,7 +1213,7 @@ MeshOut mesh_step_netgen(const std::string& step_path, const MeshOptions& option
             // Elevate to 10-node tets; the OCC refinement PROJECTS the new mid-edge nodes
             // onto the CAD surface (curved elements) so tet10 stress on fillets/holes is
             // accurate.
-            aicad::prof::phases::PhaseScope _p("second_order");
+            chudware::prof::phases::PhaseScope _p("second_order");
             nglib::Ng_OCC_Generate_SecondOrder(sess.geo, sess.mesh);
         }
     } catch (const std::exception& e) {
@@ -1224,7 +1224,7 @@ MeshOut mesh_step_netgen(const std::string& step_path, const MeshOptions& option
 
     // Extraction + quality fill — timed as one "extract" phase (runs to function exit;
     // destroyed before _study, so it lands inside the mesh_tet study).
-    aicad::prof::phases::PhaseScope _p_extract("extract");
+    chudware::prof::phases::PhaseScope _p_extract("extract");
     // Extract nodes (1-based in Netgen) into a flat n*3 row-major array (0-based).
     const int np = nglib::Ng_GetNP(sess.mesh);
     if (np <= 0) return fail("mesh produced no points");
@@ -1324,7 +1324,7 @@ MeshOut mesh_stl_netgen(const TopoDS_Shape& shape, const MeshOptions& options,
                         const TopoDS_Shape* size_ref, double defl_scale,
                         bool force_direct) {
     std::lock_guard<std::mutex> mesh_lock(mesh_mutex());  // serialize: Netgen is not thread-safe
-    aicad::prof::phases::StudyScope _study("mesh_stl");
+    chudware::prof::phases::StudyScope _study("mesh_stl");
     MeshOut out;
 
     const bool order2 = (options.order == 2);
@@ -1343,7 +1343,7 @@ MeshOut mesh_stl_netgen(const TopoDS_Shape& shape, const MeshOptions& options,
     if (!sb.note.empty()) out.note = sb.note;
 
     const bool trace = [] {
-        const char* e = std::getenv("AI_CAD_MESH_TRACE");
+        const char* e = std::getenv("CHUDWARE_MESH_TRACE");
         return e && *e && *e != '0';
     }();
     const auto t_start = std::chrono::steady_clock::now();
@@ -1397,7 +1397,7 @@ MeshOut mesh_stl_netgen(const TopoDS_Shape& shape, const MeshOptions& options,
     };
 
     try {
-        aicad::prof::phases::PhaseScope _p("tessellate");
+        chudware::prof::phases::PhaseScope _p("tessellate");
         trace_stage("tessellate: start");
         BRepMesh_IncrementalMesh mesher(shape, defl, Standard_False, 0.5, Standard_True);
         mesher.Perform();
@@ -1535,7 +1535,7 @@ MeshOut mesh_stl_netgen(const TopoDS_Shape& shape, const MeshOptions& options,
 
     // Extraction shared by both routes below.
     auto extract = [&](const char* type_tag) -> bool {
-        aicad::prof::phases::PhaseScope _p_extract("extract");
+        chudware::prof::phases::PhaseScope _p_extract("extract");
         const int np = nglib::Ng_GetNP(mesh);
         if (np <= 0) return false;
         out.points.assign(static_cast<size_t>(np) * 3, 0.0);
@@ -1647,7 +1647,7 @@ MeshOut mesh_stl_netgen(const TopoDS_Shape& shape, const MeshOptions& options,
         trace_stage("direct: skipped (small part -> remesh route)");
     }
     if (manifold) try {
-        aicad::prof::phases::PhaseScope _p("generate");
+        chudware::prof::phases::PhaseScope _p("generate");
         mesh = nglib::Ng_NewMesh();
         double xyz[3];
         for (size_t i = 0; i + 2 < vpts.size(); i += 3) {
@@ -1665,7 +1665,7 @@ MeshOut mesh_stl_netgen(const TopoDS_Shape& shape, const MeshOptions& options,
         } else {
             trace_stage("direct: volume mesh done");
             if (order2) {
-                aicad::prof::phases::PhaseScope _p2("second_order");
+                chudware::prof::phases::PhaseScope _p2("second_order");
                 nglib::Ng_Generate_SecondOrder(mesh);  // straight mid-edge nodes
             }
             if (extract(order2 ? "tet10-stl-direct" : "tet4-stl-direct")) {
@@ -1685,7 +1685,7 @@ MeshOut mesh_stl_netgen(const TopoDS_Shape& shape, const MeshOptions& options,
     // ── Route B: Netgen STL pipeline (chart build + surface remesh + volume) ────────
     try {
         {
-            aicad::prof::phases::PhaseScope _p("stl_init");
+            chudware::prof::phases::PhaseScope _p("stl_init");
             geo = nglib::Ng_STL_NewGeometry();
             if (!geo) return fail("could not create the STL geometry [" + direct_err + "]");
             for (const auto& t : vtris) {
@@ -1701,7 +1701,7 @@ MeshOut mesh_stl_netgen(const TopoDS_Shape& shape, const MeshOptions& options,
         }
         mesh = nglib::Ng_NewMesh();
         {
-            aicad::prof::phases::PhaseScope _p("generate");
+            chudware::prof::phases::PhaseScope _p("generate");
             if (nglib::Ng_STL_MakeEdges(geo, mesh, &mp) != nglib::NG_OK) {
                 cleanup_mesh();
                 return fail("STL edge detection failed [" + direct_err + "]");
@@ -1719,7 +1719,7 @@ MeshOut mesh_stl_netgen(const TopoDS_Shape& shape, const MeshOptions& options,
             trace_stage("volume mesh: done");
         }
         if (order2) {
-            aicad::prof::phases::PhaseScope _p("second_order");
+            chudware::prof::phases::PhaseScope _p("second_order");
             nglib::Ng_STL_Generate_SecondOrder(geo, mesh);
         }
         if (!extract(order2 ? "tet10-stl" : "tet4-stl")) {
@@ -1738,4 +1738,4 @@ MeshOut mesh_stl_netgen(const TopoDS_Shape& shape, const MeshOptions& options,
     return out;
 }
 
-}  // namespace aicad::sim
+}  // namespace chudware::sim

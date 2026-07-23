@@ -8,7 +8,7 @@ Covers:
   * cam_add_setup(machine_profile=...) merges machine max_rpm
 
 Run:
-  ~/.local/share/AI-CAD/mcp-venv/bin/python -X utf8 -m pytest services/mcp/test_cam_audit.py -q
+  ~/.local/share/Chudware/mcp-venv/bin/python -X utf8 -m pytest services/mcp/test_cam_audit.py -q
 """
 from __future__ import annotations
 
@@ -53,7 +53,7 @@ def _write_cam_plus(path: str, job: dict) -> None:
     data = json.dumps(job).encode("utf-8")
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("job.json", data)
-        zf.writestr("MANIFEST", "aicad-cam/1\n")
+        zf.writestr("MANIFEST", "chudware-cam/1\n")
 
 
 def _sample_job() -> dict:

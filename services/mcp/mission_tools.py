@@ -19,7 +19,7 @@ Process model (Phase-5 note): missions planned here execute IN-PROCESS —
 ``dag_run`` drives the compiled graph inside the calling MCP/GUI-worker
 process; nothing here spawns worker subprocesses. Any future subprocess-based
 agent worker must go through ``daemon_bridge.spawn_agent_worker`` so it runs
-as a supervised child of aicad-hostd (survives client exit, dies with the
+as a supervised child of chudware-hostd (survives client exit, dies with the
 daemon, blocks daemon idle-exit while running).
 """
 from __future__ import annotations
@@ -56,7 +56,7 @@ def register_mission_tools(mcp) -> None:
         tier recorded here is how ``dag_run`` keeps this mission on the requested
         tier's provider (resolved via ``services.agent.tiers.provider_for_tier`` —
         e.g. a ``local-*`` tier stays on the bundled local model instead of silently
-        leaking to the ambient config.json / ``AI_CAD_PROVIDER`` cloud default).
+        leaking to the ambient config.json / ``CHUDWARE_PROVIDER`` cloud default).
         Omitting it (the default) produces exactly the graph this tool has always
         returned — no behaviour change.
         """

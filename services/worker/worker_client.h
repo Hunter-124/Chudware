@@ -23,12 +23,12 @@ public:
     using ErrorSink = std::function<void(const std::string& method, const std::string& err)>;
     void setErrorSink(ErrorSink sink) { errorSink_ = std::move(sink); }
 
-    // Resolve python exe + repo/cwd from env (AI_CAD_PYTHON, AI_CAD_REPO) or the
-    // %APPDATA%/AI-CAD defaults, then spawn `python -m <module>`. The default module is the
+    // Resolve python exe + repo/cwd from env (CHUDWARE_PYTHON, CHUDWARE_REPO) or the
+    // %APPDATA%/Chudware defaults, then spawn `python -m <module>`. The default module is the
     // doc worker; C19 spawns a second instance with module="engine.sim.worker".
     bool start(std::string& err, const std::string& module = "services.worker_main");
     bool started() const { return running_; }
-    // Synthetic ready flag for daemon/WASM (and in-process libaicad FEA): no child process,
+    // Synthetic ready flag for daemon/WASM (and in-process libchudware FEA): no child process,
     // but launch()/caps() gates and non-routed methods need started()==true. routeSimToCpp
     // still runs before the pipe write; markStarted does not open a pipe.
     void markStarted() { running_ = true; }
@@ -59,8 +59,8 @@ public:
 
 private:
     // Real call() body; the public call() wraps it with the T-G9 parity trace (env
-    // AI_CAD_RPC_TRACE=<file> appends one JSONL record per RPC — method/params/ok/result —
-    // regardless of routing: Python worker, in-process libaicad, ECAD/agent C++ paths).
+    // CHUDWARE_RPC_TRACE=<file> appends one JSONL record per RPC — method/params/ok/result —
+    // regardless of routing: Python worker, in-process libchudware, ECAD/agent C++ paths).
     // Off (no env) = byte-for-byte the previous behavior.
     bool callImpl(const std::string& method, const nlohmann::json& params,
                   nlohmann::json& result, std::string& err, int timeoutMs,

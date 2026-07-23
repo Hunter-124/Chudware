@@ -13,7 +13,7 @@
 #include <string>
 #include <vector>
 
-namespace aicad::doc {
+namespace chudware::doc {
 
 // One drawn polyline + its dashed flag (hidden lines are dashed). polyline is a
 // list of [x,y] mm points; polylines with <2 points are skipped.
@@ -50,4 +50,4 @@ std::string write_pdf(const std::string& path, const std::vector<PdfLine>& lines
                       const std::vector<PdfText>& texts, bool auto_page = true,
                       double page_w_mm = 0.0, double page_h_mm = 0.0);
 
-}  // namespace aicad::doc
+}  // namespace chudware::doc

@@ -26,7 +26,7 @@ run_cfd_flow / run_cfd_accurate / ecad_simulate. CFD-accurate (OpenFOAM) is stil
 "Still Python-only: CFD" (README); LBM flow + FEA + SPICE are cut over to C++.
 
 ## Debugging playbook
-- Build core: `cmake -S core -B core/build-occt -DAICAD_WITH_OCCT=ON && cmake --build core/build-occt`
+- Build core: `cmake -S core -B core/build-occt -DCHUDWARE_WITH_OCCT=ON && cmake --build core/build-occt`
 - Sim tests: `ctest --test-dir core/build-occt -R "sim|modal|tet10|spice_netlist|fatigue|studies" --output-on-failure`
 - Other targets: `netgen_mesh`, `mesher_autopick`, `mesh_quality`, `overlay_surface` (fatigue/studies are OCCT-gated)
 - Python side (needs runtime venv): `<venv>/python -X utf8 -m pytest engine/sim -q` (SKIP if venv absent — AGENTS.md)

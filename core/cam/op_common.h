@@ -13,7 +13,7 @@
 #include "cam/operations.h"
 #include "cam/toolpath.h"
 
-namespace aicad {
+namespace chudware {
 namespace cam {
 
 // ── geometry readers (Operation::geometry is the resolved input) ─────────────
@@ -170,4 +170,4 @@ inline double link_ring(PathBuilder& pb, const Vec2& from, const Vec2& to, doubl
 }
 
 }  // namespace cam
-}  // namespace aicad
+}  // namespace chudware

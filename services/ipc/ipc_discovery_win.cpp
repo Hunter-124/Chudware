@@ -3,8 +3,8 @@
 // the manual checklist in docs/PACKAGING_WINDOWS.md runs on a real box.
 //
 // The function names stay transport-neutral on purpose:
-//   socketPath(key) -> \\.\pipe\aicad-hostd-<SID>-<key>   (a pipe NAME, not a file)
-//   lockPath(key)   -> Global\aicad-hostd-<SID>-<key>     (a named-MUTEX name)
+//   socketPath(key) -> \\.\pipe\chudware-hostd-<SID>-<key>   (a pipe NAME, not a file)
+//   lockPath(key)   -> Global\chudware-hostd-<SID>-<key>     (a named-MUTEX name)
 // so hostd/main.cpp and ipc_client.cpp compile unchanged on both platforms.
 //
 // The user SID in both names gives per-user isolation for free (pipe and mutex
@@ -30,7 +30,7 @@
 #include <cwctype>
 #include <vector>
 
-namespace aicad_ipc {
+namespace chudware_ipc {
 
 namespace {
 
@@ -94,7 +94,7 @@ std::string fnv1aHex(const std::string& s) {
 }
 
 std::string instanceKey(const std::string& hostdBin) {
-    if (const char* k = std::getenv("AICAD_INSTANCE_KEY"); k && *k) return k;
+    if (const char* k = std::getenv("CHUDWARE_INSTANCE_KEY"); k && *k) return k;
     std::string id = hostdBin;
     if (!id.empty()) {
         // Canonicalize: GetFullPathNameW (the realpath analog for identity —
@@ -120,26 +120,26 @@ std::string runtimeDir() {
 
 std::string stateDir() {
     if (const char* a = std::getenv("APPDATA"); a && *a)
-        return std::string(a) + "\\AI-CAD";
-    return "AI-CAD";  // last resort: relative to cwd (matches bootstrap fallback spirit)
+        return std::string(a) + "\\Chudware";
+    return "Chudware";  // last resort: relative to cwd (matches bootstrap fallback spirit)
 }
 
 std::string socketPath(const std::string& key) {
     // Full-name overrides, checked in the same order daemon_bridge.py uses.
-    if (const char* p = std::getenv("AICAD_HOSTD_PIPE"); p && *p) return p;
-    if (const char* p = std::getenv("AICAD_HOSTD_SOCKET"); p && *p) return p;
-    return "\\\\.\\pipe\\aicad-hostd-" + currentUserSid() + "-" + key;
+    if (const char* p = std::getenv("CHUDWARE_HOSTD_PIPE"); p && *p) return p;
+    if (const char* p = std::getenv("CHUDWARE_HOSTD_SOCKET"); p && *p) return p;
+    return "\\\\.\\pipe\\chudware-hostd-" + currentUserSid() + "-" + key;
 }
 
 std::string lockPath(const std::string& key) {
     // A named-mutex name, not a file path (see SingleInstance below). The
     // "Global" prefix spans sessions, so two logons of the same user still
     // share one daemon.
-    return "Global\\aicad-hostd-" + currentUserSid() + "-" + key;
+    return "Global\\chudware-hostd-" + currentUserSid() + "-" + key;
 }
 
 std::string resolveHostdBin(const std::string& hint) {
-    if (const char* b = std::getenv("AICAD_HOSTD_BIN"); b && *b) return b;
+    if (const char* b = std::getenv("CHUDWARE_HOSTD_BIN"); b && *b) return b;
     if (!hint.empty()) {
         DWORD attrs = GetFileAttributesW(widen(hint).c_str());
         if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY))
@@ -225,9 +225,9 @@ bool spawnDetached(const std::string& exe, const std::string& arg, std::string& 
                 if (lf & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
                     std::fprintf(
                         stderr,
-                        "[aicad-hostd] WARNING: spawner is inside a KILL_ON_JOB_CLOSE "
+                        "[chudware-hostd] WARNING: spawner is inside a KILL_ON_JOB_CLOSE "
                         "job that denies breakaway — the daemon will DIE with this "
-                        "job (e.g. when the agent session ends). Start the AI-CAD "
+                        "job (e.g. when the agent session ends). Start the Chudware "
                         "GUI first for a durable daemon.\n");
                 e = tryCreate(base);
                 if (e == ERROR_SUCCESS) return true;
@@ -238,6 +238,6 @@ bool spawnDetached(const std::string& exe, const std::string& arg, std::string& 
     return false;
 }
 
-}  // namespace aicad_ipc
+}  // namespace chudware_ipc
 
 #endif  // _WIN32

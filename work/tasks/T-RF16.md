@@ -14,7 +14,7 @@ priority: 3
 ## Context
 
 FEA already routes C++ by default. Probe-verified 2026-07-22 (contracts/web_parity.md):
-`sim_run_flow` (LBM path) is ALREADY libaicad-dispatched — this node shrinks to
+`sim_run_flow` (LBM path) is ALREADY libchudware-dispatched — this node shrinks to
 `sim_cancel` (unrouted everywhere today) + verifying the OpenFOAM solver path. Scope is
 much smaller than originally estimated.
 
@@ -27,6 +27,6 @@ LBM module in the same commit. Thermal-transient tests that ride along must stay
 
 ## Definition of done
 
-- [x] sim_run_flow served by libaicad; simsuite flow parity green.
+- [x] sim_run_flow served by libchudware; simsuite flow parity green.
 - [x] Python LBM deleted same commit; routing flipped (integrator merge).
 - [x] gate.sh green; REFACTOR_LOG handoff; web_parity inventory shrinks.

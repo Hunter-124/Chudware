@@ -48,8 +48,8 @@ Workstream C day 1 establishes the firmware pillar's contract and scaffold. `con
   so there is no heavy Python "doc-meta" subsystem. Board linking is a loose id/path string
   reference (`board_doc_ref`) — the same mechanism `ecad_update_from_sch` uses to pair a board
   and schematic. Persistence is a `project.json` sidecar written with the atomic tmp+`os.replace`
-  idiom from `engine.ecad.autosave`. Workspace dir: `AI_CAD_FIRMWARE_DIR` override → else
-  `%APPDATA%/AI-CAD/firmware` (temp fallback).
+  idiom from `engine.ecad.autosave`. Workspace dir: `CHUDWARE_FIRMWARE_DIR` override → else
+  `%APPDATA%/Chudware/firmware` (temp fallback).
 - **`compile_commands.json` guarantee** (contract §6): `new_project` writes a synthetic
   `compile_commands.json` enumerating template sources so the artifact always exists without a
   cross-toolchain; a real `CMakeToolchain.build()` configure regenerates the accurate one.
@@ -70,7 +70,7 @@ causes nor can fix this within its allowed files. Gate summary at review time:
 
 ```
 check.py     FAIL-RECORDED  (pre-existing, non-fatal)
-core build   PASS  (libaicad, OCCT ON)
+core build   PASS  (libchudware, OCCT ON)
 ui/abstract  PASS
 ctest        PASS  (100%)
 pytest       SKIP  (no provisioned venv; firmware suite verified separately — 10 passed)

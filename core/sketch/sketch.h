@@ -32,7 +32,7 @@
 #include <string>
 #include <vector>
 
-namespace aicad::sketch {
+namespace chudware::sketch {
 
 // Opaque warm-start state — C++ port of sketch_solver.py's SolveState. Returned by
 // solve_sketch (inside SketchSolution::state) and accepted by both solve_sketch (warm)
@@ -172,4 +172,4 @@ nlohmann::json drag(const SolveState& state, const std::string& handle,
                     const nlohmann::json& targets = nlohmann::json(),
                     std::shared_ptr<DragContext>* ctx_io = nullptr);
 
-}  // namespace aicad::sketch
+}  // namespace chudware::sketch

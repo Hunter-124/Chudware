@@ -29,7 +29,7 @@ Exposes these tools over the federated parts hub:
 
 The hub is lazy-initialized on the first call; subsequent calls reuse the in-memory FTS index.
 No network, no keys, no core dependency for the fastener/bearing adapter (they run on the
-bundled clean-room YAML tables). The core-families adapter degrades gracefully when libaicad
+bundled clean-room YAML tables). The core-families adapter degrades gracefully when libchudware
 is absent. All T-P2 adapters degrade gracefully (empty results, not tracebacks) when their
 backing data or credentials are absent — CI-safe. T-X3's browser catalog providers degrade
 the SAME way: no saved browser login profile for a site = that provider contributes zero
@@ -993,4 +993,4 @@ def register_parts_tools(mcp: FastMCP) -> None:
             return json.dumps(result, ensure_ascii=False)
         except Exception as exc:  # noqa: BLE001
             return _err(f"import_artifact failed: {exc}",
-                        "Ensure the native core (AI_CAD_LIBAICAD) is available.")
+                        "Ensure the native core (CHUDWARE_LIBCHUDWARE) is available.")

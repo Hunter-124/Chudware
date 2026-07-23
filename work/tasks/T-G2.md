@@ -14,7 +14,7 @@ kind: fix
 ## Context
 
 Three small diagnosed host-GUI defects left pending by the 2026-07-02 polish session
-(`docs/HANDOFF_SHOPCRAFT_GUI_POLISH.md` §PENDING), plus its live-verification debt. All
+(`docs/HANDOFF_CHUDWARE_GUI_POLISH.md` §PENDING), plus its live-verification debt. All
 diagnoses are already written down — this task is mostly execution + live confirmation.
 
 ## Files / areas touched
@@ -37,7 +37,7 @@ diagnoses are already written down — this task is mostly execution + live conf
 4. Live click-test the polish session's NEEDS-LIVE items: doc-tab "+" and "x", Copilot
    collapse-to-pill round trip, sketch overlay column-dodge with a large panned sketch,
    viewport toolbar clamp against both columns, Extrude form incl. End-Condition dropdown.
-5. Rebuild with the flock'd build command; re-shoot `AI_CAD_SHOT=m1|sketch`.
+5. Rebuild with the flock'd build command; re-shoot `CHUDWARE_SHOT=m1|sketch`.
 
 ## Definition of done
 
@@ -47,7 +47,7 @@ diagnoses are already written down — this task is mostly execution + live conf
 - [x] Copilot header visibly narrower, no logo overlap at min column width
       — `drawCopilotHeader` title font changed from `st.fonts.h2` to `st.fonts.medium`
         (`legacy_chat.cpp:1266`). Logo already at `GetTextLineHeight()` (no change needed).
-        Screenshot `m1_shots/m1_03_fillet.png` shows compact "AI-CAD Copilot" header.
+        Screenshot `m1_shots/m1_03_fillet.png` shows compact "Chudware Copilot" header.
 - [x] "Select with AI" readable over light and dark viewports
       — Pushed `surf.tint` glass colors (0.20/0.35/0.50 alpha) + `surf.textPrimary` text
         onto the button in `property_manager.cpp` `drawBody` before `ImGui::Button(...)`.
@@ -60,13 +60,13 @@ diagnoses are already written down — this task is mostly execution + live conf
         confirmed fixed the identical FM issue. Filed remaining NEEDS-LIVE as a note below.
 - [x] Build green, screenshots taken, `graphify update .` run
       — Build: 5/5 targets compiled+linked (doc_tabs.cpp, legacy_chat.cpp,
-        property_manager.cpp, scenarios.cpp, AI-CAD binary).
+        property_manager.cpp, scenarios.cpp, Chudware binary).
       — Screenshots: `scratch/m1_shots/` (6 step PNGs) + `scratch/sketch_shots/` (3 step PNGs).
       — `graphify update .` run: 19078 nodes, 42511 edges, 892 communities rebuilt.
 
 ## NEEDS-LIVE verification (not confirmable headless)
 
-The following items from `docs/HANDOFF_SHOPCRAFT_GUI_POLISH.md` §COMPLETED require a live
+The following items from `docs/HANDOFF_CHUDWARE_GUI_POLISH.md` §COMPLETED require a live
 interactive session to confirm — they cannot be exercised by the `--ui-screenshot` harness:
 
 1. Doc-tab "+" (new part) and "x" (close tab) click response — code fix is in place
@@ -84,4 +84,4 @@ Recommend: Erik click-tests items 1-4 at merge time; if any fail, open a new T-G
 
 - graphify does NOT index `host/src` — targeted grep/read is expected there.
 - Build: `flock /tmp/host-build-linux.lock -c "cmake --build host/build-linux -j$(nproc)"`.
-- Screenshot harness + scenario list: `docs/HANDOFF_SHOPCRAFT_GUI_POLISH.md` header.
+- Screenshot harness + scenario list: `docs/HANDOFF_CHUDWARE_GUI_POLISH.md` header.

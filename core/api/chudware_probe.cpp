@@ -1,8 +1,8 @@
-// aicad_probe — a standalone exe that loads libaicad.dll at RUNTIME (LoadLibrary
+// chudware_probe — a standalone exe that loads libchudware.dll at RUNTIME (LoadLibrary
 // + GetProcAddress), exactly the way the host (host/src/core/cpp_core.cpp) will.
 //
 // This deliberately does NOT link the core static libs or OCCT. Its whole purpose
-// is to de-risk the boundary in isolation: prove that libaicad.dll loads, that its
+// is to de-risk the boundary in isolation: prove that libchudware.dll loads, that its
 // OCCT dependency DLLs (TK*, jemalloc, tbb12) resolve from the exe directory, that
 // the C ABI is callable across a pure-C boundary, and that a real
 // solve->extrude->tessellate compile runs through the DLL and produces AICM bytes.
@@ -28,13 +28,13 @@ using nlohmann::json;
 
 namespace {
 
-using aicad_call_fn = int (*)(const char*, const char*, char**);
-using aicad_free_fn = void (*)(char*);
-using aicad_abi_fn = const char* (*)(void);
+using chudware_call_fn = int (*)(const char*, const char*, char**);
+using chudware_free_fn = void (*)(char*);
+using chudware_abi_fn = const char* (*)(void);
 
-aicad_call_fn g_call = nullptr;
-aicad_free_fn g_free = nullptr;
-aicad_abi_fn g_abi = nullptr;
+chudware_call_fn g_call = nullptr;
+chudware_free_fn g_free = nullptr;
+chudware_abi_fn g_abi = nullptr;
 
 int fail(const char* msg) {
     std::fprintf(stderr, "[probe] FAIL: %s\n", msg);
@@ -93,7 +93,7 @@ json box_doc() {
 int call(const std::string& method, const json& params, json& out, int& rc) {
     char* result = nullptr;
     rc = g_call(method.c_str(), params.dump().c_str(), &result);
-    if (!result) return fail("aicad_call returned null out_json");
+    if (!result) return fail("chudware_call returned null out_json");
     std::string s(result);
     g_free(result);
     try {
@@ -109,19 +109,19 @@ int call(const std::string& method, const json& params, json& out, int& rc) {
 
 int main() {
 #if defined(_WIN32)
-    HMODULE dll = LoadLibraryW(L"libaicad.dll");
+    HMODULE dll = LoadLibraryW(L"libchudware.dll");
     if (!dll) {
-        std::fprintf(stderr, "[probe] LoadLibrary(libaicad.dll) failed: %lu\n", GetLastError());
+        std::fprintf(stderr, "[probe] LoadLibrary(libchudware.dll) failed: %lu\n", GetLastError());
         return 2;
     }
-    g_call = reinterpret_cast<aicad_call_fn>(GetProcAddress(dll, "aicad_call"));
-    g_free = reinterpret_cast<aicad_free_fn>(GetProcAddress(dll, "aicad_free"));
-    g_abi = reinterpret_cast<aicad_abi_fn>(GetProcAddress(dll, "aicad_abi_version"));
+    g_call = reinterpret_cast<chudware_call_fn>(GetProcAddress(dll, "chudware_call"));
+    g_free = reinterpret_cast<chudware_free_fn>(GetProcAddress(dll, "chudware_free"));
+    g_abi = reinterpret_cast<chudware_abi_fn>(GetProcAddress(dll, "chudware_abi_version"));
 #else
-    // POSIX: dlopen libaicad.so. Prefer AI_CAD_LIBAICAD, else the copy next to this exe
+    // POSIX: dlopen libchudware.so. Prefer CHUDWARE_LIBCHUDWARE, else the copy next to this exe
     // (probe + lib are co-located in bin/), else the loader's default search.
-    std::string libpath = "libaicad.so";
-    if (const char* env = std::getenv("AI_CAD_LIBAICAD"); env && env[0]) {
+    std::string libpath = "libchudware.so";
+    if (const char* env = std::getenv("CHUDWARE_LIBCHUDWARE"); env && env[0]) {
         libpath = env;
     } else {
         char buf[4096];
@@ -130,7 +130,7 @@ int main() {
             buf[n] = '\0';
             std::string p(buf);
             size_t slash = p.find_last_of('/');
-            if (slash != std::string::npos) libpath = p.substr(0, slash) + "/libaicad.so";
+            if (slash != std::string::npos) libpath = p.substr(0, slash) + "/libchudware.so";
         }
     }
     void* dll = dlopen(libpath.c_str(), RTLD_NOW | RTLD_LOCAL);
@@ -138,13 +138,13 @@ int main() {
         std::fprintf(stderr, "[probe] dlopen(%s) failed: %s\n", libpath.c_str(), dlerror());
         return 2;
     }
-    g_call = reinterpret_cast<aicad_call_fn>(dlsym(dll, "aicad_call"));
-    g_free = reinterpret_cast<aicad_free_fn>(dlsym(dll, "aicad_free"));
-    g_abi = reinterpret_cast<aicad_abi_fn>(dlsym(dll, "aicad_abi_version"));
+    g_call = reinterpret_cast<chudware_call_fn>(dlsym(dll, "chudware_call"));
+    g_free = reinterpret_cast<chudware_free_fn>(dlsym(dll, "chudware_free"));
+    g_abi = reinterpret_cast<chudware_abi_fn>(dlsym(dll, "chudware_abi_version"));
 #endif
     if (!g_call || !g_free || !g_abi) return fail("symbol lookup for an export failed");
 
-    std::printf("[probe] libaicad ABI version: %s\n", g_abi());
+    std::printf("[probe] libchudware ABI version: %s\n", g_abi());
 
     // 1. ping
     {

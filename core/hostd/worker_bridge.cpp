@@ -138,17 +138,17 @@ bool WorkerBridge::spawn(std::string& err) {
     // Caller holds mtx_. running_ must be false / fds closed.
     if (!pathsResolved_) {
         const std::string home = homeDir();
-        python_ = envOr("AI_CAD_PYTHON",
+        python_ = envOr("CHUDWARE_PYTHON",
                         home.empty() ? std::string("python3")
-                                     : home + "/.local/share/AI-CAD/runtime/venv/bin/python");
-        repo_ = envOr("AI_CAD_REPO",
+                                     : home + "/.local/share/Chudware/runtime/venv/bin/python");
+        repo_ = envOr("CHUDWARE_REPO",
                       home.empty() ? std::string(".") : home + "/Repositories/CAD");
         pathsResolved_ = true;
     }
 
     if (!fileExists(python_)) {
         err = "Python runtime not installed. Expected: " + python_ +
-              " (set AI_CAD_PYTHON or provision the AI-CAD runtime venv)";
+              " (set CHUDWARE_PYTHON or provision the Chudware runtime venv)";
         log().line("worker_bridge: spawn failed: %s", err.c_str());
         return false;
     }

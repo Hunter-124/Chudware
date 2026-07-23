@@ -82,7 +82,7 @@ def test_ecad_oracle_unknown_op_lists_closest():
 def test_op_vocab_bridge_fallback():
     from services.mcp import op_vocab
     op_vocab._CACHE = None  # force reload
-    # Without libaicad, falls back to Python twin.
+    # Without libchudware, falls back to Python twin.
     ops = op_vocab.doc_ops()
     assert "add_feature" in ops
     block = op_vocab.vocab_block_for_tool_description()

@@ -3,7 +3,7 @@
 When ``reveng_attach_result`` links a completed RE session to a parts-hub
 ``part_ref`` it writes a ``reveng_result.json`` sidecar into the session
 directory.  This adapter scans all session directories under
-``$AICAD_REVENG_DIR`` and exposes each sidecar as a PartRecord with
+``$CHUDWARE_REVENG_DIR`` and exposes each sidecar as a PartRecord with
 ``geometry_ref.kind = "import_file"`` so that ``part_place`` can route it
 through the existing ``_place_import_file`` placer.
 
@@ -23,11 +23,11 @@ SIDECAR_NAME = "reveng_result.json"
 
 
 def _reveng_dir() -> Path:
-    base = os.environ.get("AICAD_REVENG_DIR")
+    base = os.environ.get("CHUDWARE_REVENG_DIR")
     if base:
         return Path(base).expanduser()
     xdg = os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share"))
-    return Path(xdg) / "AI-CAD" / "reveng"
+    return Path(xdg) / "Chudware" / "reveng"
 
 
 def _load_sidecar(path: Path) -> dict | None:

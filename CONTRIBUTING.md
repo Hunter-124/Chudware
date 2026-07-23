@@ -7,7 +7,7 @@ anything.
 
 - CMake + Ninja + a C++17 toolchain (GCC/Clang on Linux, MSVC/VS 2022 on Windows)
 - Python 3.11 for services/agent/MCP work (managed venv:
-  `~/.local/share/AI-CAD/mcp-venv/`)
+  `~/.local/share/Chudware/mcp-venv/`)
 - The repo knowledge graph: run `graphify update .` after any code change
 
 ---
@@ -45,7 +45,7 @@ created. Contracts are append-only and integrator-owned.
 
 **Scoped write-sets.** Each task's `file_list` defines what it may touch; parallel tasks
 must have disjoint file lists. Extending a shared/append-only file (`contracts/*`,
-top-level CMake, `core/api/libaicad.h`, `AGENTS.md`, `scripts/gate.sh`) is the
+top-level CMake, `core/api/libchudware.h`, `AGENTS.md`, `scripts/gate.sh`) is the
 integrator's job — coordinate first.
 
 **New engine functionality lands in `core/` (C++).** The Python engine is deleted

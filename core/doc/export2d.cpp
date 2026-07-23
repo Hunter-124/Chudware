@@ -35,7 +35,7 @@
 
 using nlohmann::json;
 
-namespace aicad::doc {
+namespace chudware::doc {
 
 namespace {
 
@@ -541,4 +541,4 @@ json export_flat_dxf(const std::string& doc_id, const std::string& path, const s
             {"flat_area", flat_area}, {"entities", n_ent}};
 }
 
-}  // namespace aicad::doc
+}  // namespace chudware::doc

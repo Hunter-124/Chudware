@@ -10,10 +10,10 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad::sim {
+namespace chudware::sim {
 
 // Run the requested analyses of `study` on `circuit`. Never throws — a malformed
 // device / singular matrix sets convergence.<type>=false with a log diagnostic.
 nlohmann::json spice_simulate(const nlohmann::json& circuit, const nlohmann::json& study);
 
-}  // namespace aicad::sim
+}  // namespace chudware::sim

@@ -22,9 +22,9 @@ inline std::string trace_file_path() {
 }
 
 inline void trace_file_line(const std::string& line) {
-    // Same gate as CEF_TRACE's stderr sink: on by default, AI_CAD_CEF_TRACE=0 silences.
+    // Same gate as CEF_TRACE's stderr sink: on by default, CHUDWARE_CEF_TRACE=0 silences.
     static const bool on = [] {
-        const char* v = std::getenv("AI_CAD_CEF_TRACE");
+        const char* v = std::getenv("CHUDWARE_CEF_TRACE");
         return !(v && v[0] == '0');
     }();
     if (!on) return;

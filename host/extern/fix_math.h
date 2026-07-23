@@ -1,7 +1,7 @@
 // Workaround for MSVC 14.51 (VS 2026) missing C99 float math function declarations.
 // The <cmath> header in this toolchain expects these to exist in the global namespace,
 // but the UCRT headers don't declare them.
-// This header is force-included via /FI on the AI-CAD target only (C++ files).
+// This header is force-included via /FI on the Chudware target only (C++ files).
 
 #pragma once
 #include <math.h>

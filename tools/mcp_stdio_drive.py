@@ -1,8 +1,8 @@
-"""Drive the AI-CAD MCP server over real stdio like the desktop app does: initialize, then
+"""Drive the Chudware MCP server over real stdio like the desktop app does: initialize, then
 call tools, measuring latency and asserting replies actually arrive (the -32001 repro)."""
 import json, os, subprocess, sys, time, threading, queue
 
-VENV = os.path.join(os.environ.get("APPDATA", ""), "AI-CAD", "runtime", "venv", "Scripts", "python.exe")
+VENV = os.path.join(os.environ.get("APPDATA", ""), "Chudware", "runtime", "venv", "Scripts", "python.exe")
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 env = dict(os.environ, PYTHONPATH=REPO)
 

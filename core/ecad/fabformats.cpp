@@ -15,7 +15,7 @@
 
 #include "ecad/schema.h"
 
-namespace aicad::ecad::fab {
+namespace chudware::ecad::fab {
 namespace {
 
 using nlohmann::json;
@@ -850,4 +850,4 @@ std::string write_placement(const json& board, bool exclude_tht, bool exclude_vi
     return out;
 }
 
-}  // namespace aicad::ecad::fab
+}  // namespace chudware::ecad::fab

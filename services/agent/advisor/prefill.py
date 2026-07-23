@@ -64,7 +64,7 @@ class BridgeQuerier:
     """Concrete DocQuerier backed by the C++ core RPCs (via ``core_bridge``).
 
     The bridge calls are imported lazily so this module loads without the built
-    core present (e.g. in CI without libaicad). Every query is best-effort:
+    core present (e.g. in CI without libchudware). Every query is best-effort:
     any failure degrades to ``None`` (the advisor then skips that check).
     """
 

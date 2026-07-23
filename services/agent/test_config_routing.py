@@ -107,7 +107,7 @@ class TestRoutingYamlDrivesGetProvider(unittest.TestCase):
             self.assertEqual(provider.name, "mock")
 
     def test_explicit_name_bypasses_routing(self) -> None:
-        """An explicit `name=` argument (or AI_CAD_PROVIDER) must outrank routing.yaml —
+        """An explicit `name=` argument (or CHUDWARE_PROVIDER) must outrank routing.yaml —
         routing.yaml only fills in when the caller didn't ask for something specific."""
         with tempfile.TemporaryDirectory() as td:
             routing_path = Path(td) / "routing.yaml"

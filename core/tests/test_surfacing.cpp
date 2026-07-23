@@ -28,8 +28,8 @@
 #include "geom/features.h"  // make_box (harvest the body-edge selectors off raw topology)
 
 using nlohmann::json;
-using aicad::doc::CompileResult;
-using aicad::doc::compile_document;
+using chudware::doc::CompileResult;
+using chudware::doc::compile_document;
 
 namespace {
 
@@ -71,13 +71,13 @@ json corner_box(const char* id, double L, double W, double H) {
 // once per incident face, so we match on axis (vertical) + rounded xy centroid.
 json vertical_edge_selector_at(double W, double H, double D, double cx, double cy) {
     TopoDS_Shape box = geom::make_box(W, H, D);
-    std::vector<aicad::doc::TopoInfo> infos = aicad::doc::describe_edges(box);
-    for (const aicad::doc::TopoInfo& info : infos) {
+    std::vector<chudware::doc::TopoInfo> infos = chudware::doc::describe_edges(box);
+    for (const chudware::doc::TopoInfo& info : infos) {
         if (!info.axis.has_value()) continue;
         if (std::abs(info.axis->z()) < 0.999) continue;              // not vertical
         if (std::abs(info.centroid.x() - cx) > 1e-4) continue;
         if (std::abs(info.centroid.y() - cy) > 1e-4) continue;
-        return aicad::doc::make_selector(info);
+        return chudware::doc::make_selector(info);
     }
     return json(nullptr);
 }
@@ -126,17 +126,17 @@ TEST_CASE("surf_fill from four body edges builds a patch (T-BL28)") {
 
     // Harvest the 4 top-face (z=D) edges, deduped by rounded centroid.
     TopoDS_Shape box = geom::make_box(W, H, D);
-    std::vector<aicad::doc::TopoInfo> infos = aicad::doc::describe_edges(box);
+    std::vector<chudware::doc::TopoInfo> infos = chudware::doc::describe_edges(box);
     json edges = json::array();
     std::set<std::tuple<long long, long long, long long>> seen;
-    for (const aicad::doc::TopoInfo& info : infos) {
+    for (const chudware::doc::TopoInfo& info : infos) {
         if (std::abs(info.centroid.z() - D) > 1e-4) continue;  // not on the top face
         auto key = std::make_tuple(
             static_cast<long long>(std::llround(info.centroid.x() * 1e4)),
             static_cast<long long>(std::llround(info.centroid.y() * 1e4)),
             static_cast<long long>(std::llround(info.centroid.z() * 1e4)));
         if (!seen.insert(key).second) continue;
-        edges.push_back(aicad::doc::make_selector(info));
+        edges.push_back(chudware::doc::make_selector(info));
     }
     REQUIRE(edges.size() == 4);  // the 4 perimeter edges of the top face
 
@@ -186,17 +186,17 @@ TEST_CASE("surf_boundary from body edges builds a patch (T-BL28)") {
     const double W = 40.0, H = 30.0, D = 20.0;
 
     TopoDS_Shape box = geom::make_box(W, H, D);
-    std::vector<aicad::doc::TopoInfo> infos = aicad::doc::describe_edges(box);
+    std::vector<chudware::doc::TopoInfo> infos = chudware::doc::describe_edges(box);
     json dir1 = json::array();
     std::set<std::tuple<long long, long long, long long>> seen;
-    for (const aicad::doc::TopoInfo& info : infos) {
+    for (const chudware::doc::TopoInfo& info : infos) {
         if (std::abs(info.centroid.z() - D) > 1e-4) continue;  // top-face edges only
         auto key = std::make_tuple(
             static_cast<long long>(std::llround(info.centroid.x() * 1e4)),
             static_cast<long long>(std::llround(info.centroid.y() * 1e4)),
             static_cast<long long>(std::llround(info.centroid.z() * 1e4)));
         if (!seen.insert(key).second) continue;
-        dir1.push_back(aicad::doc::make_selector(info));
+        dir1.push_back(chudware::doc::make_selector(info));
     }
     REQUIRE(dir1.size() == 4);
 

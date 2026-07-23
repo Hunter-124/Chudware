@@ -32,8 +32,8 @@ from .registry import ProviderRegistry
 from .index import PartsIndex
 
 # Overall wall-clock budget for the synchronous live-vendor fan-out (seconds).
-# Override with AI_CAD_PARTS_LIVE_BUDGET_S. Per-site budget defaults to the same
-# value (AI_CAD_PARTS_LIVE_SITE_BUDGET_S) so one stall cannot dominate the call.
+# Override with CHUDWARE_PARTS_LIVE_BUDGET_S. Per-site budget defaults to the same
+# value (CHUDWARE_PARTS_LIVE_SITE_BUDGET_S) so one stall cannot dominate the call.
 _DEFAULT_LIVE_BUDGET_S = 4.0
 
 
@@ -167,7 +167,7 @@ class PartsHub:
         Fallback: when the index returns no results AND domain matches a live
         provider (e.g. ecad_vendor for domain=ecad or unfiltered), query each
         live-only provider concurrently under a wall-clock budget
-        (``AI_CAD_PARTS_LIVE_BUDGET_S``, default a few seconds). Live results
+        (``CHUDWARE_PARTS_LIVE_BUDGET_S``, default a few seconds). Live results
         carry source:"live" and are NEVER indexed. Timed-out sites surface as
         notice stubs (no part_id/title) so callers can render honest per-site
         timeout notices. ``include_live=False`` does ZERO network.
@@ -309,7 +309,7 @@ class PartsHub:
                 "site": site,
                 "reason": "timeout",
                 "hint": (f"live vendor '{site}' exceeded "
-                         f"{budget:g}s budget (AI_CAD_PARTS_LIVE_BUDGET_S)"),
+                         f"{budget:g}s budget (CHUDWARE_PARTS_LIVE_BUDGET_S)"),
             })
         real = [r for r in live_results
                 if r.get("part_id") and str(r.get("title") or "").strip()]
@@ -349,12 +349,12 @@ def _env_float(name: str, default: float) -> float:
 
 def _live_budget_s() -> float:
     """Overall wall budget for one live fan-out call."""
-    return _env_float("AI_CAD_PARTS_LIVE_BUDGET_S", _DEFAULT_LIVE_BUDGET_S)
+    return _env_float("CHUDWARE_PARTS_LIVE_BUDGET_S", _DEFAULT_LIVE_BUDGET_S)
 
 
 def _live_site_budget_s(overall: float) -> float:
     """Per-site wait slice (capped by the overall budget)."""
-    return min(overall, _env_float("AI_CAD_PARTS_LIVE_SITE_BUDGET_S", overall))
+    return min(overall, _env_float("CHUDWARE_PARTS_LIVE_SITE_BUDGET_S", overall))
 
 # ── Provider-overlap deduplication (T-P3 — contract-additive) ────────────────
 

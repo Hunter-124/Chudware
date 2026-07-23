@@ -9,7 +9,7 @@
 
 #include "cam/model.h"
 
-namespace aicad {
+namespace chudware {
 namespace cam {
 
 // Context passed to every generator: the owning setup's machine/stock/wcs and the
@@ -74,4 +74,4 @@ GenResult gen_cut2d(const Operation&, const OpContext&);
 GenResult gen_probe(const Operation&, const OpContext&);
 
 }  // namespace cam
-}  // namespace aicad
+}  // namespace chudware

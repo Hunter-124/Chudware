@@ -36,13 +36,13 @@ core sim overhaul (T-SIM1..4) lands and Hunter opts in.
 ## Completion notes (2026-07-10, branch task/T-SIM5-openfoam)
 
 - NEW `LinuxRunner` in engine_oracle/sim/foam_runner.py — posix detection (sourced env /
-  AICAD_OPENFOAM / system roots / user-space conda envs + tarballs), strict subprocess exec.
+  CHUDWARE_OPENFOAM / system roots / user-space conda envs + tarballs), strict subprocess exec.
   Previously OpenFOAM could never be detected on Linux (runners were Windows-native + WSL only).
 - Provisioning: `python -m tools.provision_openfoam --install` now does a USER-SPACE
   conda-forge install on Linux (no sudo). Installed live on this box (OpenFOAM v2412).
 - LIVE validation on this machine: sphere Cd 0.329 in [0.25,0.55] PASS (7 s), cube Cd 1.696
   in [1.20,2.20] PASS (13 s) via tools/foam_validation.py; sim_audit gains an opt-in live leg
-  (AICAD_SIM_AUDIT_LIVE_FOAM=1) plus the source-audit verdict + honest skip.
+  (CHUDWARE_SIM_AUDIT_LIVE_FOAM=1) plus the source-audit verdict + honest skip.
 - CHT multi-solid seam for T-FIN19: build_cht_case(solids=[{name, stl_path, kappa_w_mk,
   power_w}, ...]) / run_openfoam_tunnel(thermal={mode:"conjugate", solids:[...]}).
   Live-verified 2-solid board+chip case (chip 129 C peak, per-region summary + overlay).

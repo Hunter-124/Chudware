@@ -1,4 +1,4 @@
-// AI-CAD status bar: state + live agent phase (left), provider/model summary (right).
+// Chudware status bar: state + live agent phase (left), provider/model summary (right).
 #pragma once
 
 #include "imgui.h"

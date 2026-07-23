@@ -3,7 +3,7 @@
 Team concurrency v1 = advisory locks + sync, no merging (``aicad.plm/1`` §6).
 Folder kind only in this subset: a bare git repo on a filesystem path.
 
-Public surface (used by MCP / worker_rpc and by billet-web session bootstrap)::
+Public surface (used by MCP / worker_rpc and by chudware-web session bootstrap)::
 
     seed_remote(project_dir, remote_path)
     clone_from_remote(remote_path, dest_project_dir)
@@ -230,7 +230,7 @@ def _commit_files(
     when = int(time.time())
     c.author_time = c.commit_time = when
     c.author_timezone = c.commit_timezone = 0
-    trailer = f"aicad-plm-kind: {kind}\n"
+    trailer = f"chudware-plm-kind: {kind}\n"
     c.message = (f"{message}\n\n{trailer}").encode("utf-8")
     repo.object_store.add_object(c)
     return c.id
@@ -465,7 +465,7 @@ def seed_remote(project_dir: str | os.PathLike, remote_path: str | os.PathLike) 
                 tip = _branch_tip(local)
                 if tip is not None:
                     _ensure_branch_and_head(local, tip)
-                    # push all heads + any aicad refs
+                    # push all heads + any chudware refs
                     refspecs = []
                     for ref in local.refs.keys():
                         if ref.startswith(b"refs/heads/") or ref.startswith(b"refs/aicad/"):
@@ -581,7 +581,7 @@ def add_remote(
 ) -> dict[str, Any]:
     """Register a remote profile in the project manifest (contract §6.1 / §7).
 
-    ``aicad-cloud`` is accepted config-only (reserved). Folder remotes also get
+    ``chudware-cloud`` is accepted config-only (reserved). Folder remotes also get
     a dulwich ``remote.<name>.url`` entry for fetch/push.
     """
     try:
@@ -591,7 +591,7 @@ def add_remote(
         name = (name or "").strip() or "origin"
         remote_url = url if url is not None else (str(path) if path is not None else None)
 
-        if kind == "aicad-cloud":
+        if kind == "chudware-cloud":
             remote_url = None
         elif kind == "folder":
             if not remote_url:
@@ -618,7 +618,7 @@ def add_remote(
                 "url": remote_url,
                 "name": name,
             }
-            if kind == "aicad-cloud":
+            if kind == "chudware-cloud":
                 entry["reserved"] = True
             if existing is not None:
                 existing.update(entry)
@@ -671,8 +671,8 @@ def sync(project_dir: str | os.PathLike, remote: str = "origin") -> dict[str, An
                     break
         if entry is None:
             return _err("not_found", f"no remote named {remote!r}")
-        if entry.get("kind") == "aicad-cloud":
-            return _err("reserved_remote", "AI-CAD Cloud is not available yet")
+        if entry.get("kind") == "chudware-cloud":
+            return _err("reserved_remote", "Chudware Cloud is not available yet")
         if entry.get("kind") != "folder":
             return _err(
                 "invalid_mode",
@@ -1011,8 +1011,8 @@ def _lock_mutate(
                         break
             if entry is None:
                 return _err("not_found", f"no remote named {remote!r}")
-            if entry.get("kind") == "aicad-cloud":
-                return _err("reserved_remote", "AI-CAD Cloud is not available yet")
+            if entry.get("kind") == "chudware-cloud":
+                return _err("reserved_remote", "Chudware Cloud is not available yet")
             if entry.get("kind") != "folder":
                 return _err("invalid_mode", "only folder remotes support locks in this version")
             remote_url = entry.get("url")

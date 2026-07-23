@@ -1,5 +1,5 @@
 """
-Verification script for the freshly-staged libaicad.dll.
+Verification script for the freshly-staged libchudware.dll.
 Drives the engine directly through mcp_server.core_bridge (no live MCP server).
 
 Tests:
@@ -660,9 +660,9 @@ def test_transform_zero():
 # ===========================================================================
 def main():
     print("=" * 70)
-    print("AI-CAD Engine Verification — libaicad.dll black-box tests")
+    print("Chudware Engine Verification — libchudware.dll black-box tests")
     print(f"Repo: {REPO}")
-    print(f"DLL:  {cb.dist_dir() / 'libaicad.dll'}")
+    print(f"DLL:  {cb.dist_dir() / 'libchudware.dll'}")
     print("=" * 70)
 
     # Quick DLL availability check

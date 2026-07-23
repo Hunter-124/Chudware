@@ -328,7 +328,7 @@ class TestTokenRequired:
             resp = urllib.request.urlopen(url, timeout=3)
             assert resp.status == 200
             body = resp.read().decode("utf-8")
-            assert "AI-CAD Photo Capture" in body
+            assert "Chudware Photo Capture" in body
         finally:
             if session is not None:
                 stop_session(session)

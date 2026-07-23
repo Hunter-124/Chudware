@@ -3,7 +3,7 @@
 Two independent paths:
 
 * ``test_envelope_backend_absent`` monkeypatches the backend flags to False and
-  asserts the exact ``aicad`` degradation envelope. This must pass regardless of
+  asserts the exact ``chudware`` degradation envelope. This must pass regardless of
   what is installed, so no ``importorskip`` guard.
 * ``test_box_cylinder_fit`` builds a box + cylindrical boss with trimesh, runs the
   fitter, and asserts the recovered plane offset and cylinder radius/axis are within

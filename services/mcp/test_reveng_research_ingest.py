@@ -60,8 +60,8 @@ def tmp_session(tmp_path: Path):
 
 @pytest.fixture()
 def mock_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """Point AICAD_REVENG_DIR at tmp_path so sessions land there."""
-    monkeypatch.setenv("AICAD_REVENG_DIR", str(tmp_path))
+    """Point CHUDWARE_REVENG_DIR at tmp_path so sessions land there."""
+    monkeypatch.setenv("CHUDWARE_REVENG_DIR", str(tmp_path))
     return tmp_path
 
 
@@ -231,7 +231,7 @@ class TestRevengResearchSourceTool:
 
         reveng_dir = tmp_path / "reveng"
         reveng_dir.mkdir()
-        monkeypatch.setenv("AICAD_REVENG_DIR", str(reveng_dir))
+        monkeypatch.setenv("CHUDWARE_REVENG_DIR", str(reveng_dir))
 
         self._session_id = "re_test_mcp29"
         dest = reveng_dir / self._session_id

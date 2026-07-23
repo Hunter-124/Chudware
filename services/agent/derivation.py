@@ -17,7 +17,7 @@ Key invariants
   the round-trip by reading back the geometry value.
 
 T-W13 change-plan routing is feature-flagged: set env var
-``AICAD_CHANGE_PLAN_T_W13=1`` to route the impact report through the T-W13
+``CHUDWARE_CHANGE_PLAN_T_W13=1`` to route the impact report through the T-W13
 change-plan path.  Default: returns the report dict directly.
 """
 from __future__ import annotations
@@ -256,7 +256,7 @@ def mark_faulty(
            affected_checks, recommended}``.
 
     The report is routed as a change plan (§11) — assessed, not auto-executed.
-    When env var ``AICAD_CHANGE_PLAN_T_W13=1`` is set, it is forwarded through
+    When env var ``CHUDWARE_CHANGE_PLAN_T_W13=1`` is set, it is forwarded through
     the T-W13 change-plan path; otherwise it is returned directly.
     """
     dag = build_dag(ledger)
@@ -320,7 +320,7 @@ def mark_faulty(
     }
 
     # T-W13 feature-flag routing
-    if os.environ.get("AICAD_CHANGE_PLAN_T_W13") == "1":
+    if os.environ.get("CHUDWARE_CHANGE_PLAN_T_W13") == "1":
         return _route_change_plan(report)
     return report
 

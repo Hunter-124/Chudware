@@ -1,18 +1,18 @@
 // core/cam/model.h — the CAM (computer-aided machining) data model.
 //
-// This is the shared contract for the whole `aicad::cam` subsystem: stock, work
+// This is the shared contract for the whole `chudware::cam` subsystem: stock, work
 // coordinate systems, machine/platform definitions, the tool library, cutting
 // data, machining operations, the generated toolpaths (classified moves), and the
 // Job/Setup tree that ties them together.
 //
 // Design notes
-//  - OCCT-FREE. Like aicad::sim and aicad::ecad, the CAM core is pure numerics +
+//  - OCCT-FREE. Like chudware::sim and chudware::ecad, the CAM core is pure numerics +
 //    JSON so it builds in the fast standalone config and is unit-testable headless.
 //    Geometry to machine (regions, section profiles, drill points, a triangle mesh)
 //    is supplied to operations as plain data; a separate OCCT extraction adapter
 //    pulls that data out of a live document for the product.
 //  - Everything (de)serializes through nlohmann::json: the same shape persists in
-//    the .cam+ document, crosses the libaicad C ABI, and round-trips in tests.
+//    the .cam+ document, crosses the libchudware C ABI, and round-trips in tests.
 //  - All lengths are millimetres, angles degrees, feeds mm/min, speeds rev/min,
 //    times seconds, unless a field says otherwise.
 #pragma once
@@ -24,7 +24,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad {
+namespace chudware {
 namespace cam {
 
 using nlohmann::json;
@@ -443,4 +443,4 @@ TriMesh trimesh_from_json(const json&);
 json to_json(const TriMesh&);
 
 }  // namespace cam
-}  // namespace aicad
+}  // namespace chudware

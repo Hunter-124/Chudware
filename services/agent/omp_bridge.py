@@ -10,7 +10,7 @@ child): one JSON object per line each direction —
 
 Spawn/path-resolution + respawn-on-crash semantics are structurally mirrored on
 ``core/agent/omp_bridge_client.{h,cpp}`` (the C++ client of the same bridge):
-same env overrides (``AI_CAD_BUN``, ``AI_CAD_OMP_BRIDGE``), same bun discovery
+same env overrides (``CHUDWARE_BUN``, ``CHUDWARE_OMP_BRIDGE``), same bun discovery
 order, same "child death -> reap + respawn once, then fail" retry rule. This
 module is the *Python* seam used by ``project_memory.py`` / ``compaction.py``
 (services run in-process in Python; the C++ core has its own client for
@@ -60,11 +60,11 @@ def _env_or(key: str, default: str) -> str:
 
 
 def _resolve_bun_exe() -> str:
-    """bun discovery order: ``AI_CAD_BUN`` override, common install locations,
+    """bun discovery order: ``CHUDWARE_BUN`` override, common install locations,
     else the bare ``"bun"`` name (resolved against ``$PATH`` by the OS when we
     spawn it). Mirrors ``resolveBunExe()`` in ``omp_bridge_client.cpp``.
     """
-    env = os.environ.get("AI_CAD_BUN")
+    env = os.environ.get("CHUDWARE_BUN")
     if env:
         return env
     home = os.environ.get("HOME") or ""
@@ -83,13 +83,13 @@ def _bridge_marker(root: str | os.PathLike) -> Path:
 
 
 def _resolve_repo_root() -> str:
-    """Repo root resolution: ``AI_CAD_REPO`` override (validated), else walk up
+    """Repo root resolution: ``CHUDWARE_REPO`` override (validated), else walk up
     from this file looking for the ``vendor/omp/bridge/src/bridge.ts`` marker
     (this file always lives at ``<repo>/services/agent/omp_bridge.py``, so the
     walk succeeds from any cwd/venv), else ``$HOME/Repositories/CAD`` as a last
     resort. Mirrors ``resolveRepoRoot()`` in ``omp_bridge_client.cpp``.
     """
-    env = os.environ.get("AI_CAD_REPO")
+    env = os.environ.get("CHUDWARE_REPO")
     if env and _bridge_marker(env).is_file():
         return env
     here = Path(__file__).resolve()
@@ -101,7 +101,7 @@ def _resolve_repo_root() -> str:
 
 
 def _resolve_bridge_script() -> str:
-    return _env_or("AI_CAD_OMP_BRIDGE", str(_bridge_marker(_resolve_repo_root())))
+    return _env_or("CHUDWARE_OMP_BRIDGE", str(_bridge_marker(_resolve_repo_root())))
 
 
 class OmpBridgeClient:
@@ -129,7 +129,7 @@ class OmpBridgeClient:
         if not os.path.isfile(self._bridge_script):
             raise BridgeUnavailable(
                 f"OMP bridge script not found: {self._bridge_script} (set "
-                "AI_CAD_OMP_BRIDGE to the script path, or AI_CAD_REPO to a "
+                "CHUDWARE_OMP_BRIDGE to the script path, or CHUDWARE_REPO to a "
                 "checkout containing vendor/omp/)"
             )
         self._paths_resolved = True

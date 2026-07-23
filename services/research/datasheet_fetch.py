@@ -105,7 +105,7 @@ def _read_bytes(source: str) -> tuple[Optional[bytes], Optional[dict], Optional[
         try:
             import httpx  # BSD, already a dep
             r = httpx.get(s, follow_redirects=True, timeout=30.0,
-                          headers={"User-Agent": "AI-CAD-research/1.0"})
+                          headers={"User-Agent": "Chudware-research/1.0"})
             if r.status_code in (401, 403):
                 data, session_profile_used = _try_browser_fallback(s)
                 if data is not None:

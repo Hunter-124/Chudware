@@ -174,7 +174,7 @@ class OpenEmsAdapter(EmAdapter):
             ports.append(fdtd.AddRectWaveGuidePort(
                 p["nr"], start, stop, "z", p["a_mm"] * plan["unit_m"],
                 p["b_mm"] * plan["unit_m"], p["mode"], excite=p["excite"]))
-        sim_path = tempfile.mkdtemp(prefix="aicad_em_")
+        sim_path = tempfile.mkdtemp(prefix="chudware_em_")
         fdtd.Run(sim_path, cleanup=True)
 
         fr = plan["freq"]

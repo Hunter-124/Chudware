@@ -24,7 +24,7 @@ The seven capability blocks (matching the task spec and the plan sections):
 
 It depends on the DfM "fit brain" for the clearance/fit math (``modeled_dim``,
 ``get_profile``, the known-process list). That brain now lives in the C++ core
-(``core/dfm/process_profiles.cpp``, dispatched via the libaicad ``dfm_*`` methods), so this
+(``core/dfm/process_profiles.cpp``, dispatched via the libchudware ``dfm_*`` methods), so this
 module reaches it through ``core_bridge`` — the fit numbers stay identical to the planner's.
 """
 from __future__ import annotations
@@ -1171,7 +1171,7 @@ def _provenance_label(row: CriticalDimension, feat: Optional[MeasuredFeature]) -
 
 def coupon_spec(interface_feature: Any, process: str = process_profiles.DEFAULT_PROCESS,
                 ) -> dict[str, Any]:
-    """A printable fit-test coupon spec for one interface — an AI-CAD feature **op-list** (no geometry).
+    """A printable fit-test coupon spec for one interface — an Chudware feature **op-list** (no geometry).
 
     Scoped to the plan's three easy archetypes (§6 gate 3): ``shaft_in_bore`` (bore),
     ``bolt_pattern`` (hole pattern), and ``connector_cutout``. Returns a small box plus the

@@ -1,4 +1,4 @@
-// AI-CAD UI theme implementation.
+// Chudware UI theme implementation.
 // Two named palettes: Dark (original teal-on-dark brand) and Light (SolidWorks-style).
 // applyTheme(Theme, scale) populates both ui::palette and ImGuiStyle from the chosen set.
 // Panels read ONLY ui::palette — never hardcode color literals.

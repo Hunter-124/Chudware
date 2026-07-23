@@ -38,7 +38,7 @@ def check(cond: bool, msg: str) -> None:
 
 
 def test_windows_plan() -> None:
-    exe = r"C:\Apps\AI-CAD\AI-CAD.exe"
+    exe = r"C:\Apps\Chudware\Chudware.exe"
     plan = fa.windows_registry_plan(exe)
 
     def has(subkey, name, value_pred):
@@ -54,14 +54,14 @@ def test_windows_plan() -> None:
     for pid in (fa.PROGID_NATIVE, fa.PROGID_DOC):
         check(has(fr"Software\Classes\{pid}\DefaultIcon", "", lambda v: v == f"{exe},1"),
               f"windows: {pid} DefaultIcon = <exe>,1 (doc icon group)")
-    # Billet identity (2026-07 rename): ProgIDs + user-visible type names say Billet, not AI-CAD.
-    check(fa.PROGID_NATIVE == "Billet.stepplus" and fa.PROGID_DOC == "Billet.document",
-          "windows: ProgIDs use the Billet identity")
-    check(has(fr"Software\Classes\{fa.PROGID_NATIVE}", "", lambda v: v == "Billet Document"),
-          "windows: native ProgID type name is 'Billet Document'")
-    check(not any("AI-CAD" in e["value"] or "AICAD" in e["subkey"]
+    # Chudware identity (2026-07 rename): ProgIDs + user-visible type names say Chudware, not Chudware.
+    check(fa.PROGID_NATIVE == "Chudware.stepplus" and fa.PROGID_DOC == "Chudware.document",
+          "windows: ProgIDs use the Chudware identity")
+    check(has(fr"Software\Classes\{fa.PROGID_NATIVE}", "", lambda v: v == "Chudware Document"),
+          "windows: native ProgID type name is 'Chudware Document'")
+    check(not any("Chudware" in e["value"] or "Chudware" in e["subkey"]
                   for e in plan if e["subkey"].count("\\") == 2 and e["name"] == ""),
-          "windows: no AI-CAD branding left in ProgID type names")
+          "windows: no Chudware branding left in ProgID type names")
     # .step+ defaults to the native ProgID; all listed extensions advertise in Open-with.
     check(has(r"Software\Classes\.step+", "", lambda v: v == fa.PROGID_NATIVE),
           "windows: .step+ defaults to the native ProgID")
@@ -71,7 +71,7 @@ def test_windows_plan() -> None:
               f"windows: {a['ext']} -> OpenWithProgids {pid}")
     # A non-native interchange type must NOT be forced as the default handler.
     check(not has(r"Software\Classes\.stl", "", lambda v: v in (fa.PROGID_NATIVE, fa.PROGID_DOC)),
-          "windows: .stl is NOT defaulted to Billet (Open-with only)")
+          "windows: .stl is NOT defaulted to Chudware (Open-with only)")
     # Every plan value is a string (REG_SZ) and every subkey is under Software\Classes.
     check(all(isinstance(e["value"], str) and e["subkey"].startswith(r"Software\Classes")
               for e in plan),
@@ -90,13 +90,13 @@ def test_windows_legacy_cleanup_plan() -> None:
         check(any(e["kind"] == "value" and e["name"] == pid
                   and e["subkey"] == fr"Software\Classes\{a['ext']}\OpenWithProgids" for e in plan),
               f"windows-legacy: {a['ext']} old OpenWithProgids {pid} is deleted")
-    # The cleanup plan never touches the NEW Billet ProgIDs.
+    # The cleanup plan never touches the NEW Chudware ProgIDs.
     check(not any(fa.PROGID_NATIVE in e["subkey"] or fa.PROGID_DOC in e["subkey"] for e in plan),
-          "windows-legacy: cleanup plan leaves the Billet ProgIDs alone")
+          "windows-legacy: cleanup plan leaves the Chudware ProgIDs alone")
 
 
 def test_linux_content() -> None:
-    exe = "/opt/ai-cad/AI-CAD"
+    exe = "/opt/ai-cad/Chudware"
     desk = fa.linux_desktop_entry(exe)
     check("[Desktop Entry]" in desk and "Type=Application" in desk, "linux: .desktop is well-formed")
     check(f'Exec="{exe}" %f' in desk, "linux: Exec runs the exe with the file arg")
@@ -113,24 +113,24 @@ def test_linux_content() -> None:
     check(fa.MIME_ICON == fa.MIME_NATIVE.replace("/", "-"),
           "linux: icon name is the MIME type with '/' -> '-'")
 
-    # Billet identity (2026-07 rename): launcher name, MIME vendor tree and file names.
-    check("Name=Billet" in desk, "linux: launcher Name is Billet")
-    check(fa.MIME_NATIVE == "application/vnd.billet.stepplus",
-          "linux: native MIME is application/vnd.billet.stepplus")
-    check("Billet Document" in xml and "AI-CAD" not in xml,
-          "linux: MIME comment says Billet Document (no AI-CAD branding)")
-    check(fa.DESKTOP_FILE == "billet.desktop" and fa.MIME_PACKAGE == "billet.xml",
-          "linux: XDG file names use the billet identity")
+    # Chudware identity (2026-07 rename): launcher name, MIME vendor tree and file names.
+    check("Name=Chudware" in desk, "linux: launcher Name is Chudware")
+    check(fa.MIME_NATIVE == "application/vnd.chudware.stepplus",
+          "linux: native MIME is application/vnd.chudware.stepplus")
+    check("Chudware Document" in xml and "Chudware" not in xml,
+          "linux: MIME comment says Chudware Document (no Chudware branding)")
+    check(fa.DESKTOP_FILE == "chudware.desktop" and fa.MIME_PACKAGE == "chudware.xml",
+          "linux: XDG file names use the chudware identity")
 
 
 def test_linux_register_roundtrip() -> None:
-    exe = "/opt/ai-cad/AI-CAD"
+    exe = "/opt/ai-cad/Chudware"
     with tempfile.TemporaryDirectory() as tmp:
         os.environ["XDG_DATA_HOME"] = tmp
         desktop = Path(tmp) / "applications" / fa.DESKTOP_FILE
         mime = Path(tmp) / "mime" / "packages" / fa.MIME_PACKAGE
 
-        # Pre-seed the PRE-RENAME (AI-CAD) artifacts so register can prove the migration cleanup.
+        # Pre-seed the PRE-RENAME (Chudware) artifacts so register can prove the migration cleanup.
         legacy_desktop = Path(tmp) / "applications" / fa.LEGACY_DESKTOP_FILE
         legacy_mime = Path(tmp) / "mime" / "packages" / fa.LEGACY_MIME_PACKAGE
         legacy_icon = (Path(tmp) / "icons" / "hicolor" / "256x256" / "mimetypes"

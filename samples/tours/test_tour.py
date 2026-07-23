@@ -2,7 +2,7 @@
 samples/tours/test_tour.py — T-Q3 DoD: one tour script runs end-to-end headless.
 
 Usage:
-  AI_CAD_LIBAICAD=<path>/libaicad.so python -m pytest samples/tours/test_tour.py -v
+  CHUDWARE_LIBCHUDWARE=<path>/libchudware.so python -m pytest samples/tours/test_tour.py -v
 """
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ def cb():
     except ImportError:
         pytest.skip("mcp_server not importable")
     if not _cb.available():
-        pytest.skip("libaicad not available — set AI_CAD_LIBAICAD=<path>")
+        pytest.skip("libchudware not available — set CHUDWARE_LIBCHUDWARE=<path>")
     return _cb
 
 

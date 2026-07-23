@@ -7,7 +7,7 @@
 > Open Design Alliance's public `Db*/Ge/Gi/Gs` API naming convention. Nothing here
 > comes from proprietary internals — it's the standard model in the DXF spec, the
 > ODA public .dwg spec, and vendor developer docs. See `docs/reference/README.md`
-> for how this cross-links to ShopCraft's own document model.
+> for how this cross-links to Chudware's own document model.
 
 ## The four subsystems (public naming convention)
 
@@ -20,9 +20,9 @@
 
 Separation of concerns: **Db** = what's stored, **Ge** = math, **Gi** = "draw me",
 **Gs** = "put pixels on screen". This is a clean architectural reference point —
-not a prescription that ShopCraft's own document model (`contracts/doc_schema.md`,
+not a prescription that Chudware's own document model (`contracts/doc_schema.md`,
 `contracts/doc_ops.md`) must mirror it, though the separation of concerns rhymes:
-ShopCraft's own document/geometry/tessellation split (`.step+` document JSON →
+Chudware's own document/geometry/tessellation split (`.step+` document JSON →
 build123d/OCCT B-rep → AICM tessellation, see `contracts/stepplus.md` and
 `contracts/mesh_format.md`) follows the same logic for different reasons (a
 parametric feature-history CAD kernel rather than a drawing-database editor).
@@ -93,7 +93,7 @@ Standard computational-geometry primitives, independent of persistence:
 - Operations: intersection, projection, parameterization, bounding volumes.
 
 This is textbook CAGD (Computer-Aided Geometric Design). Sources: any NURBS/CAGD
-text (e.g., Piegl & Tiller, *The NURBS Book*); no vendor code required. ShopCraft's
+text (e.g., Piegl & Tiller, *The NURBS Book*); no vendor code required. Chudware's
 own geometry layer is OpenCASCADE (OCCT, LGPL-2.1) via `build123d`/`cadquery-ocp`
 — see `contracts/licenses.md` — which already implements this layer; this section
 is background for understanding *why* it's shaped the way it is, not a build target.
@@ -108,7 +108,7 @@ is background for understanding *why* it's shaped the way it is, not a build tar
 
 Clean-room design lesson: keep entities emitting abstract primitives (a `Gi`-style
 boundary), and swap render backends behind a `Gs`-style boundary. This is standard
-retained/immediate-mode graphics architecture, widely documented. ShopCraft's own
+retained/immediate-mode graphics architecture, widely documented. Chudware's own
 AICM tessellation format (`contracts/mesh_format.md`) plays a comparable role: a
 single binary format the C++ host renders from (B-rep tessellation + picking
 metadata + scalar/displacement overlays), decoupling entity geometry from the

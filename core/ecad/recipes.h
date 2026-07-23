@@ -13,7 +13,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad::ecad::recipes {
+namespace chudware::ecad::recipes {
 
 nlohmann::json voltage_divider(double vin = 5.0, double vout = 2.5);
 nlohmann::json rc_lowpass(double fc = 1000.0);
@@ -32,4 +32,4 @@ nlohmann::json all_recipes();
 // keyword scoring + numeric extraction). Always returns a fully-built design.
 nlohmann::json closest_recipe(const std::string& request);
 
-}  // namespace aicad::ecad::recipes
+}  // namespace chudware::ecad::recipes

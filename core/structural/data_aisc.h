@@ -5,7 +5,7 @@
 
 #include <structural/sections.h>
 
-namespace aicad::structural {
+namespace chudware::structural {
 
 static const AiscShape kAiscShapes[] = {
     {"W4X13", 2452, 106.7, 103.09999999999999, 8.8000000000000007, 7.0999999999999996, 8870000, 166300, 190100, 3860000, 74900, 114500, 20200, 12600000000},
@@ -28,4 +28,4 @@ static const AiscShape kAiscShapes[] = {
     {"C6X13", 2452, 152.40000000000001, 57.200000000000003, 10.199999999999999, 7.9000000000000004, 17940000, 235500, 290000, 1230000, 31900, 63400, 36100, 2740000000},
 };
 
-}  // namespace aicad::structural
+}  // namespace chudware::structural

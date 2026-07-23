@@ -4,7 +4,7 @@ point-lookups of material properties from external materials-info websites.
 Posture (be factual): this tool was added at the owner's explicit direction on
 2026-07-08. It is:
 
-* **OPT-IN** — env-gated behind ``AI_CAD_ENABLE_MATERIAL_WEB`` and **DISABLED by
+* **OPT-IN** — env-gated behind ``CHUDWARE_ENABLE_MATERIAL_WEB`` and **DISABLED by
   default**. With the flag unset every call returns a ``disabled`` degradation and
   performs no network I/O.
 * **Rate-limited** — all fetches go through ``services.browser.session.browser_fetch``,
@@ -52,7 +52,7 @@ _PROP_ALIASES = {
     "poisson": "nu", "poissons_ratio": "nu", "nu": "nu",
 }
 
-_ENABLE_ENV = "AI_CAD_ENABLE_MATERIAL_WEB"
+_ENABLE_ENV = "CHUDWARE_ENABLE_MATERIAL_WEB"
 
 
 # --- source registry ----------------------------------------------------------------

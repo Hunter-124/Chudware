@@ -21,7 +21,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 
 // Use ordered_json so object key iteration preserves INSERTION order, matching
@@ -164,4 +164,4 @@ void set_context_advisory(const std::string& text);
 void clear_context_advisory();
 
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware

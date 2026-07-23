@@ -1,5 +1,5 @@
-// Unit tests for the FEA static solver (aicad::sim::fea_static_solve) and the
-// wind-tunnel LBM front-end (aicad::sim::run_wind_tunnel).
+// Unit tests for the FEA static solver (chudware::sim::fea_static_solve) and the
+// wind-tunnel LBM front-end (chudware::sim::run_wind_tunnel).
 //
 // The FEA tests are OCCT-free, oracle-free sanity checks on the numerics. The
 // CFD test (G4) verifies that ref_length_mm comes from the PART bounding box, not
@@ -28,8 +28,8 @@
 #include "sim/lbm.h"
 #include "sim/sim_cancel.h"
 
-using aicad::sim::fea_static_solve;
-using aicad::sim::FeaStaticResult;
+using chudware::sim::fea_static_solve;
+using chudware::sim::FeaStaticResult;
 
 namespace {
 
@@ -490,8 +490,8 @@ TEST_CASE("cantilever tip deflection matches F L^3/(3 E I) within tolerance") {
 //   - A 50×25×10 box → ref_length_mm == 50 (longest span).
 //   - At AoA=0 all three pass; at nonzero AoA the rotated spans must still be finite.
 TEST_CASE("G4: run_wind_tunnel ref_length_mm equals the part's longest bbox span") {
-    using aicad::sim::FlowParams;
-    using aicad::sim::run_wind_tunnel;
+    using chudware::sim::FlowParams;
+    using chudware::sim::run_wind_tunnel;
 
     // Build a watertight box mesh for a cuboid [lo,hi]^3 in each axis.
     // 6 faces × 2 triangles each = 12 triangles; vertices at the 8 corners.
@@ -592,9 +592,9 @@ TEST_CASE("G4: run_wind_tunnel ref_length_mm equals the part's longest bbox span
 // envelope fields the sim panel consumes, (4) the ref-area / roughness post-processing,
 // (5) the progress_path side-channel, (6) honest error envelopes.
 TEST_CASE("run_flow_stl: STL front-end forces parity + worker envelope") {
-    using aicad::sim::FlowParams;
-    using aicad::sim::run_flow_stl;
-    using aicad::sim::run_wind_tunnel;
+    using chudware::sim::FlowParams;
+    using chudware::sim::run_flow_stl;
+    using chudware::sim::run_wind_tunnel;
     namespace fs = std::filesystem;
 
     // 20mm cube, corner at origin, 12 triangles (outward winding irrelevant to the fill).
@@ -608,8 +608,8 @@ TEST_CASE("run_flow_stl: STL front-end forces parity + worker envelope") {
     };
 
     const fs::path tmp = fs::temp_directory_path();
-    const std::string ascii_path = (tmp / "aicad_test_flow_cube_ascii.stl").string();
-    const std::string bin_path   = (tmp / "aicad_test_flow_cube_bin.stl").string();
+    const std::string ascii_path = (tmp / "chudware_test_flow_cube_ascii.stl").string();
+    const std::string bin_path   = (tmp / "chudware_test_flow_cube_bin.stl").string();
 
     // ASCII STL (facet/vertex soup; normals zero — the loader ignores them).
     {
@@ -655,10 +655,10 @@ TEST_CASE("run_flow_stl: STL front-end forces parity + worker envelope") {
     fp.cells = 32;
     fp.n_steps = 120;
     double re_ref = 0.0;
-    const aicad::sim::LbmResult ref = run_wind_tunnel({cube}, {cube_idx}, fp, &re_ref);
+    const chudware::sim::LbmResult ref = run_wind_tunnel({cube}, {cube_idx}, fp, &re_ref);
     REQUIRE_MESSAGE(ref.ok, "reference run_wind_tunnel failed: ", ref.error);
 
-    const std::string prog_path = (tmp / "aicad_test_flow_progress.json").string();
+    const std::string prog_path = (tmp / "chudware_test_flow_progress.json").string();
     nlohmann::json params = {
         {"stl_path", ascii_path},
         {"direction", {1, 0, 0}},
@@ -765,10 +765,10 @@ TEST_CASE("run_flow_stl: STL front-end forces parity + worker envelope") {
 
 // ── Acceleration caches (mesh / factor / faceset / LBM backend) ─────────────────
 TEST_CASE("factor cache: load-only tet10 repeat hits and matches") {
-    using aicad::sim::fea_static_solve;
-    using aicad::sim::fea_factor_cache_clear;
-    using aicad::sim::fea_factor_cache_reset_stats;
-    using aicad::sim::fea_factor_cache_stats;
+    using chudware::sim::fea_static_solve;
+    using chudware::sim::fea_factor_cache_clear;
+    using chudware::sim::fea_factor_cache_reset_stats;
+    using chudware::sim::fea_factor_cache_stats;
 
     fea_factor_cache_clear();
     fea_factor_cache_reset_stats();
@@ -815,8 +815,8 @@ TEST_CASE("factor cache: load-only tet10 repeat hits and matches") {
 }
 
 TEST_CASE("LBM CPU backend reports backend=cpu") {
-    using aicad::sim::lbm_run;
-    using aicad::sim::LbmParams;
+    using chudware::sim::lbm_run;
+    using chudware::sim::LbmParams;
     const int nx = 16, ny = 8, nz = 8;
     std::vector<uint8_t> solid(static_cast<size_t>(nx * ny * nz), 0);
     // Small solid block in the middle.
@@ -837,9 +837,9 @@ TEST_CASE("LBM CPU backend reports backend=cpu") {
 }
 
 TEST_CASE("LBM CUDA path skips cleanly or matches CPU within float32 tol") {
-    using aicad::sim::lbm_run;
-    using aicad::sim::lbm_cuda_available;
-    using aicad::sim::LbmParams;
+    using chudware::sim::lbm_run;
+    using chudware::sim::lbm_cuda_available;
+    using chudware::sim::LbmParams;
     const int nx = 16, ny = 8, nz = 8;
     std::vector<uint8_t> solid(static_cast<size_t>(nx * ny * nz), 0);
     for (int x = 6; x < 10; ++x)
@@ -880,9 +880,9 @@ TEST_CASE("LBM CUDA path skips cleanly or matches CPU within float32 tol") {
 // ── sim_cancel: run/cancel registry + cooperative LBM cancel (T-RF16) ───────────
 
 TEST_CASE("sim_cancel registry: running job cancels, unknown/finished reports cleanly") {
-    using aicad::sim::sim_cancel;
-    using aicad::sim::sim_job_register;
-    using aicad::sim::sim_job_unregister;
+    using chudware::sim::sim_cancel;
+    using chudware::sim::sim_job_register;
+    using chudware::sim::sim_job_unregister;
 
     // Unknown job (never registered): ok, but nothing cancelled (mirrors agent::cancel_run).
     auto miss = sim_cancel("sim-test-no-such-job");
@@ -912,8 +912,8 @@ TEST_CASE("sim_cancel registry: running job cancels, unknown/finished reports cl
 }
 
 TEST_CASE("lbm_run stops at a checkpoint when should_cancel fires") {
-    using aicad::sim::lbm_run;
-    using aicad::sim::LbmParams;
+    using chudware::sim::lbm_run;
+    using chudware::sim::LbmParams;
     const int nx = 16, ny = 8, nz = 8;
     std::vector<uint8_t> solid(static_cast<size_t>(nx * ny * nz), 0);
     for (int x = 6; x < 10; ++x)
@@ -943,10 +943,10 @@ TEST_CASE("lbm_run stops at a checkpoint when should_cancel fires") {
 }
 
 TEST_CASE("run_wind_tunnel is cancellable through FlowParams.job_id (sim_cancel)") {
-    using aicad::sim::FlowParams;
-    using aicad::sim::LbmResult;
-    using aicad::sim::run_wind_tunnel;
-    using aicad::sim::sim_cancel;
+    using chudware::sim::FlowParams;
+    using chudware::sim::LbmResult;
+    using chudware::sim::run_wind_tunnel;
+    using chudware::sim::sim_cancel;
 
     // Watertight 50mm cube (same construction as G4): 8 corners, 12 triangles.
     std::vector<float> pos = {

@@ -28,7 +28,7 @@ tool would be a scraper proxy.
 Implement `agentic_rag()` as a **pluggable interface** with two backends:
 
 1. **`UserCorpusProvider` (default, fence-safe):** indexes user-supplied PDF files from a
-   local folder (`AICAD_CODE_CORPUS_PATH` env var or `~/.local/share/AI-CAD/code_corpus/`).
+   local folder (`CHUDWARE_CODE_CORPUS_PATH` env var or `~/.local/share/Chudware/code_corpus/`).
    Searches the local index via keyword/BM25 (stdlib only — no new deps); assembles a
    prompt; calls an LLM via `select_provider()` (T-F9 pattern); returns citations whose
    `source_url` is the file path. No copyrighted text is bundled or fetched — the user
@@ -37,7 +37,7 @@ Implement `agentic_rag()` as a **pluggable interface** with two backends:
 2. **`LiveViewerProvider` (deferred, never default):** the runtime-fetch approach from step 5.
    Not implemented until Fable rules it clears the fence. Would need legal review: does
    "retrieve at runtime, attribute URL, never cache" clear the CC-BY license restriction on
-   ICC codes? Our reading is: it's still scraping. Gate behind `AICAD_CODE_LIVE_VIEWER=1`.
+   ICC codes? Our reading is: it's still scraping. Gate behind `CHUDWARE_CODE_LIVE_VIEWER=1`.
 
 ### What this task ships
 

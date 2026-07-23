@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""notify_discord.py — push AI-CAD human-attention events to a Discord channel.
+"""notify_discord.py — push Chudware human-attention events to a Discord channel.
 
 Two entry paths share one dedupe ledger (work/sync/notify-state.json) so the same
 event is never pinged twice:
@@ -313,7 +313,7 @@ def _post(token, channel, user, embeds, mention=True):
         data=json.dumps(payload).encode("utf-8"),
         headers={"Authorization": f"Bot {token}",
                  "Content-Type": "application/json",
-                 "User-Agent": "aicad-notify/1.0"},
+                 "User-Agent": "chudware-notify/1.0"},
         method="POST")
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
@@ -621,7 +621,7 @@ def _stats_embed(commits, owners, days):
     own = _ranked(owners, 10)
     owner_lines = "\n".join(f"`{n:>2}`  {who}" for who, n in own) or "_none active_"
     return {
-        "title": f"AI-CAD stats — last {days} day(s)",
+        "title": f"Chudware stats — last {days} day(s)",
         "description": f"**{total}** commit(s) from **{len(commits)}** contributor(s).",
         "color": COLORS["digest"],
         "fields": [
@@ -643,7 +643,7 @@ def _leaderboard_embed(main, cfg):
         lines.append(f"{badge}  **{who}** — {n}")
     body = "\n".join(lines) if lines else "_no commits yet_"
     return {
-        "title": "\U0001F3C6 AI-CAD all-time commit leaderboard",
+        "title": "\U0001F3C6 Chudware all-time commit leaderboard",
         "description": body[:4096],
         "color": 0xF1C40F,                              # gold
         "footer": {"text": f"{sum(counts.values())} commits · {len(counts)} contributors"},
@@ -677,7 +677,7 @@ def _digest_embed(main, cfg, period_days, label):
         {"name": "Task activity", "value": f"{board_updates} board update(s)", "inline": True},
     ]
     embed = {
-        "title": f"AI-CAD {label} digest",
+        "title": f"Chudware {label} digest",
         "description": (f"Progress over the last {period_days} day(s). "
                         f"Master Plan: `docs/AI_TOOLING_MASTER_PLAN.md`"),
         "color": COLORS["digest"],

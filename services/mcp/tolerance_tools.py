@@ -3,7 +3,7 @@
   stackup_analyze(dims, mode)  -> 1D worst-case + RSS tolerance stack-up report
 
 The pure math lives in the C++ core (``core/tolerance/stackup.cpp``, dispatched via the
-libaicad ``stackup_analyze`` method through ``core_bridge``); this module is the thin
+libchudware ``stackup_analyze`` method through ``core_bridge``); this module is the thin
 MCP wrapper.
 
 Registration note: append-only in ``server.py`` (sibling to structural_tools).

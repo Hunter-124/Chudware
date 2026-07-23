@@ -117,8 +117,8 @@ def execution_probe() -> ExecProbe:
 # fix is a re-exec-at-entry guard, not interpreter propagation across a spawn.
 # ---------------------------------------------------------------------------
 
-_REEXEC_SENTINEL = "_AICAD_GYM_REEXEC"
-_MCP_VENV_PY = Path(os.path.expanduser("~")) / ".local/share/AI-CAD/mcp-venv/bin/python"
+_REEXEC_SENTINEL = "_CHUDWARE_GYM_REEXEC"
+_MCP_VENV_PY = Path(os.path.expanduser("~")) / ".local/share/Chudware/mcp-venv/bin/python"
 
 
 def _dag_deps_importable() -> bool:
@@ -133,7 +133,7 @@ def _dag_deps_importable() -> bool:
 
 
 def _capable_interpreter() -> str | None:
-    """Resolve a python that has the DAG deps: $AI_CAD_PYTHON, then the shared mcp-venv.
+    """Resolve a python that has the DAG deps: $CHUDWARE_PYTHON, then the shared mcp-venv.
 
     Mirrors how scripts/gate.sh resolves its runner. Returns None when neither resolves
     to an existing executable distinct from the current one (e.g. CI without the
@@ -144,7 +144,7 @@ def _capable_interpreter() -> str | None:
     and wrongly skip it, discarding exactly the site-packages (langgraph) we need."""
     import sys
     here = os.path.abspath(sys.executable)
-    for cand in (os.environ.get("AI_CAD_PYTHON"), str(_MCP_VENV_PY)):
+    for cand in (os.environ.get("CHUDWARE_PYTHON"), str(_MCP_VENV_PY)):
         if cand and os.path.exists(cand) and os.path.abspath(cand) != here:
             return cand
     return None
@@ -198,17 +198,17 @@ def _real_agent_fn_present() -> bool:
 
 
 def _core_so_present() -> bool:
-    """Is a libaicad .so resolvable WITHOUT loading it? Checks the same env knobs
-    core_bridge honours ($AI_CAD_LIBAICAD / $AI_CAD_DIST) plus the conventional build
+    """Is a libchudware .so resolvable WITHOUT loading it? Checks the same env knobs
+    core_bridge honours ($CHUDWARE_LIBCHUDWARE / $CHUDWARE_DIST) plus the conventional build
     output path — pure filesystem inspection, no dlopen, no import side effect."""
-    direct = os.environ.get("AI_CAD_LIBAICAD")
+    direct = os.environ.get("CHUDWARE_LIBCHUDWARE")
     if direct and Path(direct).exists():
         return True
-    dist = os.environ.get("AI_CAD_DIST")
-    if dist and (Path(dist) / "libaicad.so").exists():
+    dist = os.environ.get("CHUDWARE_DIST")
+    if dist and (Path(dist) / "libchudware.so").exists():
         return True
-    for p in (_repo_root() / "core" / "build-linux" / "bin" / "libaicad.so",
-              _repo_root() / "core" / "build" / "bin" / "libaicad.so"):
+    for p in (_repo_root() / "core" / "build-linux" / "bin" / "libchudware.so",
+              _repo_root() / "core" / "build" / "bin" / "libchudware.so"):
         if p.exists():
             return True
     return False
@@ -216,7 +216,7 @@ def _core_so_present() -> bool:
 
 def _local_model_present() -> bool:
     home = Path(os.path.expanduser("~"))
-    for base in (home / ".local/share/AI-CAD/models",):
+    for base in (home / ".local/share/Chudware/models",):
         if base.exists() and any(base.rglob("*.gguf")):
             return True
     return False
@@ -578,7 +578,7 @@ def _provider_for_tier(tier: str):
     (default ``http://127.0.0.1:11434/v1``) — the workstation local tier when the
     bundled llama.cpp model is not the target under test.
 
-    An explicit ``AI_CAD_PROVIDER`` override always wins — tests set it to ``mock``; a
+    An explicit ``CHUDWARE_PROVIDER`` override always wins — tests set it to ``mock``; a
     human can force a frontier key for a frontier-tier comparison. Non-local tiers fall
     through to the default resolution. Actual tier->provider resolution is delegated to
     ``services.agent.tiers.provider_for_tier`` (shared with node_runner); the gym only
@@ -592,7 +592,7 @@ def _provider_for_tier(tier: str):
         LOCAL_TIER_MODELS, load_local_models, parse_openrouter_tier, parse_xai_tier,
         provider_for_tier,
     )
-    if os.environ.get("AI_CAD_PROVIDER"):
+    if os.environ.get("CHUDWARE_PROVIDER"):
         return config.get_provider()
     # OpenRouter paid tiers: cache by model id (no VRAM server, but reuse adapter).
     or_model = parse_openrouter_tier(tier)

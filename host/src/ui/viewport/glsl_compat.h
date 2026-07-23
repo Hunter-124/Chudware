@@ -1,9 +1,9 @@
-// GLSL source shim for the WASM/WebGL2 path (BILLET_GLES3).
+// GLSL source shim for the WASM/WebGL2 path (CHUDWARE_GLES3).
 // Desktop: zero-cost const-char* passthrough (no allocation).
 // GLES: rewrite a leading "#version 330 core" to "#version 300 es" + highp precision.
 #pragma once
 
-#ifdef BILLET_GLES3
+#ifdef CHUDWARE_GLES3
 
 #include <cstring>
 #include <string>
@@ -29,11 +29,11 @@ inline std::string shaderSrc(const char* body) {
     return std::string(body);
 }
 
-#else  // !BILLET_GLES3
+#else  // !CHUDWARE_GLES3
 
 // Zero-cost passthrough — return the original pointer, no allocation.
 inline const char* shaderSrc(const char* body) noexcept {
     return body;
 }
 
-#endif  // BILLET_GLES3
+#endif  // CHUDWARE_GLES3

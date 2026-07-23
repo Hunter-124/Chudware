@@ -39,9 +39,9 @@ stock-to-leave lines CONDITIONAL (they render if/when the tree carries them) and
 the contract documents the gap. Alternative: extend `tree_of` in
 `core/cam/session.cpp` to include op params — core change, out of scope fence.
 
-## Q4 (environment, FYI): staged libaicad.so predates sim_run_static
+## Q4 (environment, FYI): staged libchudware.so predates sim_run_static
 
-The staged `services/dist/AI-CAD/libaicad.so` (built Jul 1) has `sim_study_list`/
+The staged `services/dist/Chudware/libchudware.so` (built Jul 1) has `sim_study_list`/
 `sim_study_add`/`cam_*` but NOT `sim_run_static`. Tests therefore seed studies
 through `sim_study_add` — the same RPC `_persist_study` writes through after a real
 solve — giving deterministic exact-slot fixtures instead of solver-dependent ones.

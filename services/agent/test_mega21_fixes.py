@@ -256,7 +256,7 @@ def test_loop_deliver_gate_blocks_zero_mech(monkeypatch):
     from services.agent.pipeline.phases import Phase, PhaseMachine
 
     at._MECH_FORCE_ONCE.clear()
-    monkeypatch.setenv("AI_CAD_ADVISOR", "0")
+    monkeypatch.setenv("CHUDWARE_ADVISOR", "0")
 
     # Force gate to refuse (simulates force already spent / failed).
     monkeypatch.setattr(

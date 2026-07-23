@@ -122,7 +122,7 @@ fastener_passthrough}. Field names/`version` are frozen; additive-only changes b
   coaxiality now matches boss/shaft-in-bore both directions) and re-wired the callsites.
   Confirmed the body_id doc_query change is on-branch (commit e98b4b90) and unit-tested; stray
   main-checkout edit was NOT needed. Rebased on origin/master (clean). All 8 tests PASS against
-  the real engine (core/build-linux/bin/libaicad.so) — verified executed, not skipped.
+  the real engine (core/build-linux/bin/libchudware.so) — verified executed, not skipped.
 - **INTEGRATOR / T-BL50 join point:** once `services/mcp/layout_plan_tools.py` lands, add
   `"interface_check"` to its `_INTERFACE_VERIFIERS` map so the layout coverage gate consumes
   this tool's output. Gate reads top-level `ok` + any `findings[].severity=="fail"` (advisory
@@ -130,5 +130,5 @@ fastener_passthrough}. Field names/`version` are frozen; additive-only changes b
   `version`). NOTE: the ctypes bridge (`mcp_server/core_bridge.py`) resolves the .so root as
   `parents[1]` = the repo's `services/` dir, so its default search paths point under
   `services/core/build-*` which do not exist in a normal checkout; set
-  `AI_CAD_LIBAICAD=<repo>/core/build-linux/bin/libaicad.so` (or stage the .so) to run the
+  `CHUDWARE_LIBCHUDWARE=<repo>/core/build-linux/bin/libchudware.so` (or stage the .so) to run the
   engine-backed tests — otherwise `cb.available()` is False and the suite silently all-skips.

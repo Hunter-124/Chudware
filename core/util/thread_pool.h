@@ -5,7 +5,7 @@
 // regions that oversubscribe. Nested parallel_for / submit from a pool worker
 // runs inline on the caller — never grows past max_workers().
 //
-// Env: AI_CAD_SIM_THREADS / AICAD_CPU_FRAC (via governor) set the default size;
+// Env: CHUDWARE_SIM_THREADS / CHUDWARE_CPU_FRAC (via governor) set the default size;
 // reconfigure() re-reads the governor after a plan_for() decision.
 #pragma once
 
@@ -17,7 +17,7 @@
 #include <thread>
 #include <vector>
 
-namespace aicad::pool {
+namespace chudware::pool {
 
 class ThreadPool {
 public:
@@ -70,4 +70,4 @@ ThreadPool& shared();
 // Returns the workers applied. Observability: governor::last_report() after this.
 int reconfigure_shared(uint64_t estimate_bytes = 0, const char* what = nullptr);
 
-}  // namespace aicad::pool
+}  // namespace chudware::pool

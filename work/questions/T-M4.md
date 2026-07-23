@@ -37,7 +37,7 @@ RPC** (not hand-typed). Two tests pin it:
 
 ## Runtime registry location
 
-Core reads (in order): env `AICAD_MATERIALS_REGISTRY` → `appdata_root()/materials/registry.json`
+Core reads (in order): env `CHUDWARE_MATERIALS_REGISTRY` → `appdata_root()/materials/registry.json`
 → (none) in-code fallback. Mirrors `core/agent/paths.cpp` / `config.cpp`. The env override makes the
 runtime-load path testable from the repo tree (ctest + mcp-venv point it at
 `engine_oracle/materials/registry.json`) and keeps installed/headless working when unset. A future

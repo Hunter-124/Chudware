@@ -26,7 +26,7 @@ files don't even collect in mcp-venv), engine.paths.DATA AttributeError
 
 - For every registered MCP tool in services/mcp/server.py (~150+): actually CALL
   it (harmless args / a scratch doc) through the real mcp-venv with
-  AI_CAD_LIBAICAD set, and record WORKS / DEGRADED (graceful absence-path) /
+  CHUDWARE_LIBCHUDWARE set, and record WORKS / DEGRADED (graceful absence-path) /
   DEAD (import error, missing binary, AttributeError).
 - Deliverable: work/audits/MCP_RUNTIME_AUDIT.md + re-runnable
   scripts/mcp_runtime_audit.py (drives the tool surface, emits the verdict

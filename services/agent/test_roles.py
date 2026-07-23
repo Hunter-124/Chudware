@@ -14,7 +14,7 @@ Covers the T-W7 Definition of Done:
     The org-layer tools (channel_send, request_resolve, council_convene, request_raise)
     are now registered via services/mcp/org_tools.py (T-W22). FEATURE_FLAGGED_TOOLS is empty.
 
-Runs headless: no FastMCP, no libaicad, no network, no LLM. The tool catalog is
+Runs headless: no FastMCP, no libchudware, no network, no LLM. The tool catalog is
 built by registering the MCP tool modules against a stub (the same pattern
 test_tool_registry.py uses).
 """
@@ -34,7 +34,7 @@ if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
 # A local temp dir for throwaway ledgers. We pass explicit ledger paths (below) and
-# deliberately do NOT set AICAD_CACHE_ROOT — clobbering that shared env var at import
+# deliberately do NOT set CHUDWARE_CACHE_ROOT — clobbering that shared env var at import
 # time leaks into other modules' tests (e.g. the ledger MCP tools resolve run paths
 # from it), so this suite stays hermetic by using explicit paths only.
 _TMP_CACHE = tempfile.mkdtemp(prefix="test_roles_cache_")

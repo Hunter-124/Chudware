@@ -21,7 +21,7 @@
 #include "agent/events.h"
 #include "agent/state.h"
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 
 using nlohmann::json;
@@ -148,4 +148,4 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
                  const json& budgets = json::object(), RunControl control = RunControl());
 
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware

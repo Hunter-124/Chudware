@@ -25,10 +25,10 @@ This document extends what already ships. It does **not** invent a greenfield fo
 
 ### 1.1 What it is
 
-`.step+` is already the **native working file**: a **ZIP** that “travels like STEP.” Any CAD that understands AP214 can open the embedded geometry snapshot; Billet restores the full parametric document.
+`.step+` is already the **native working file**: a **ZIP** that “travels like STEP.” Any CAD that understands AP214 can open the embedded geometry snapshot; Chudware restores the full parametric document.
 
 - Contract: `aicad.step+/1` (`contracts/stepplus.md`).
-- Implementation: `aicad::doc::stepplus_save` / `stepplus_open` via **miniz** (`core/doc/stepplus.cpp`).
+- Implementation: `chudware::doc::stepplus_save` / `stepplus_open` via **miniz** (`core/doc/stepplus.cpp`).
 - Atomic save: write `<path>.tmp` → rename.
 - Forward-compat rule: **unknown ZIP entries are preserved** on resave.
 
@@ -140,7 +140,7 @@ flowchart LR
 | Option | Pros | Cons | Recommendation |
 |---|---|---|---|
 | Keep `.step+` | Zero user migration; shell associations; already everywhere (missions, PLM, webservice) | Name suggests “STEP with extras,” not drawings/sim | **Keep** as primary extension |
-| Add alias `.billet` / `.blt` | Clean brand | Dual extensions, dual filters forever | Optional Save-As alias later; same container magic |
+| Add alias `.chudware` / `.blt` | Clean brand | Dual extensions, dual filters forever | Optional Save-As alias later; same container magic |
 | Directory bundle (`.step+/` folder) | Git-friendly working tree | Breaks “single file share,” shell preview, atomic rename | **Not** the working format; PLM shadow tree already is the directory form |
 
 **Decision: single-file ZIP remains the interchange + working unit.** Directory form = PLM shadow tree only.
@@ -498,7 +498,7 @@ Writers MUST continue to preserve unknown entries (existing rule).
 5. **Whether to write `geometry.step` on every save or only release** — contract says every successful rebuild; PLM only *versions* it on release. Working file can still contain it for interchange (size cost).
 6. **CAM jobs** — confirm all CAM state fits in document JSON vs needs `cam/` section binaries (toolpath caches analogous to `cache.aicm`).
 7. **Cross-platform mtime fingerprints** in asm cache — known fragility; prefer content `doc_hash` of components when component is `.step+`.
-8. **Container brand string** — keep `aicad.step+/N` vs rename to `billet.step+/N` (compat alias).
+8. **Container brand string** — keep `aicad.step+/N` vs rename to `chudware.step+/N` (compat alias).
 
 ---
 
@@ -537,7 +537,7 @@ Writers MUST continue to preserve unknown entries (existing rule).
 
 ### Phase 5 — Polish
 
-1. Optional `.billet` alias.
+1. Optional `.chudware` alias.
 2. File-dialog preview via thumbnail only.
 3. Docs/manual update; `contracts/stepplus.md` append-only revision (integrator).
 
@@ -559,7 +559,7 @@ Writers MUST continue to preserve unknown entries (existing rule).
 ```json
 {
   "container": "aicad.step+/2",
-  "app_version": "Billet/…",
+  "app_version": "Chudware/…",
   "kind": "part",
   "schema": "aicad.part/1",
   "created": "2026-07-16T12:00:00Z",

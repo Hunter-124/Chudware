@@ -26,7 +26,7 @@
 #include "sim/spice.h"
 
 using nlohmann::json;
-using aicad::sim::cache::Kind;
+using chudware::sim::cache::Kind;
 namespace fs = std::filesystem;
 
 namespace {
@@ -101,19 +101,19 @@ void unit_cube_tris(std::vector<float>& pos, std::vector<uint32_t>& idx) {
 }
 
 fs::path tmp_path(const std::string& name) {
-    return fs::temp_directory_path() / ("aicad_test_sim_cache_" + name);
+    return fs::temp_directory_path() / ("chudware_test_sim_cache_" + name);
 }
 
 }  // namespace
 
 TEST_CASE("sim_cache: FEA static HIT / MISS / wall-times") {
-    aicad::sim::cache::clear();
-    aicad::sim::cache::reset_stats();
+    chudware::sim::cache::clear();
+    chudware::sim::cache::reset_stats();
 
     const json study = cube_static_study();
 
     const auto t0 = std::chrono::steady_clock::now();
-    json r1 = aicad::sim::fea_run_static(study);
+    json r1 = chudware::sim::fea_run_static(study);
     const double ms1 = ms_since(t0);
     REQUIRE(r1.value("ok", false));
     CHECK_FALSE(r1.value("cache_hit", true));  // first solve is a miss
@@ -125,7 +125,7 @@ TEST_CASE("sim_cache: FEA static HIT / MISS / wall-times") {
 
     // Byte-identical result on the second run (HIT).
     const auto t1 = std::chrono::steady_clock::now();
-    json r2 = aicad::sim::fea_run_static(study);
+    json r2 = chudware::sim::fea_run_static(study);
     const double ms2 = ms_since(t1);
     REQUIRE(r2.value("ok", false));
     CHECK(r2.value("cache_hit", false));
@@ -154,7 +154,7 @@ TEST_CASE("sim_cache: FEA static HIT / MISS / wall-times") {
     json study_load = study;
     study_load["loads"][0]["vector"] = {0.0, 0.0, 25000.0};  // half force
     const auto t2 = std::chrono::steady_clock::now();
-    json r3 = aicad::sim::fea_run_static(study_load);
+    json r3 = chudware::sim::fea_run_static(study_load);
     const double ms3 = ms_since(t2);
     REQUIRE(r3.value("ok", false));
     CHECK_FALSE(r3.value("cache_hit", true));
@@ -167,7 +167,7 @@ TEST_CASE("sim_cache: FEA static HIT / MISS / wall-times") {
     // Material mutate -> MISS.
     json study_mat = study;
     study_mat["material"]["E_mpa"] = 100000.0;
-    json r4 = aicad::sim::fea_run_static(study_mat);
+    json r4 = chudware::sim::fea_run_static(study_mat);
     REQUIRE(r4.value("ok", false));
     CHECK_FALSE(r4.value("cache_hit", true));
     CHECK(r4.value("input_hash", std::string()) != hash1);
@@ -175,26 +175,26 @@ TEST_CASE("sim_cache: FEA static HIT / MISS / wall-times") {
     // Mesh mutate (shift a free node) -> MISS.
     json study_mesh = study;
     study_mesh["points"][3 * 5 + 2] = 1.05;  // nudge node 5 z
-    json r5 = aicad::sim::fea_run_static(study_mesh);
+    json r5 = chudware::sim::fea_run_static(study_mesh);
     REQUIRE(r5.value("ok", false));
     CHECK_FALSE(r5.value("cache_hit", true));
     CHECK(r5.value("input_hash", std::string()) != hash1);
 
-    auto st = aicad::sim::cache::stats();
+    auto st = chudware::sim::cache::stats();
     CHECK(st.hits >= 1);
     CHECK(st.misses >= 1);
     CHECK(st.stores >= 1);
 }
 
 TEST_CASE("sim_cache: SPICE HIT / invalidate-on-input-change") {
-    aicad::sim::cache::clear();
-    aicad::sim::cache::reset_stats();
+    chudware::sim::cache::clear();
+    chudware::sim::cache::reset_stats();
 
     const json circuit = simple_spice_circuit(1000.0, 1.0);
     const json study = spice_op_study();
 
     const auto t0 = std::chrono::steady_clock::now();
-    json r1 = aicad::sim::spice_simulate(circuit, study);
+    json r1 = chudware::sim::spice_simulate(circuit, study);
     const double ms1 = ms_since(t0);
     REQUIRE(r1["convergence"].value("op", false));
     CHECK_FALSE(r1.value("cache_hit", true));
@@ -203,7 +203,7 @@ TEST_CASE("sim_cache: SPICE HIT / invalidate-on-input-change") {
     const std::string h1 = r1.value("input_hash", std::string());
 
     const auto t1 = std::chrono::steady_clock::now();
-    json r2 = aicad::sim::spice_simulate(circuit, study);
+    json r2 = chudware::sim::spice_simulate(circuit, study);
     const double ms2 = ms_since(t1);
     REQUIRE(r2["convergence"].value("op", false));
     CHECK(r2.value("cache_hit", false));
@@ -214,33 +214,33 @@ TEST_CASE("sim_cache: SPICE HIT / invalidate-on-input-change") {
 
     // Deck change (series R) -> MISS.
     json circuit2 = simple_spice_circuit(2000.0, 1.0);
-    json r3 = aicad::sim::spice_simulate(circuit2, study);
+    json r3 = chudware::sim::spice_simulate(circuit2, study);
     REQUIRE(r3["convergence"].value("op", false));
     CHECK_FALSE(r3.value("cache_hit", true));
     CHECK(r3.value("input_hash", std::string()) != h1);
     // Voltage divider still 0.5*V but through different R — same Vout for equal divider,
     // so change probe by changing V instead:
     json circuit3 = simple_spice_circuit(1000.0, 2.0);
-    json r4 = aicad::sim::spice_simulate(circuit3, study);
+    json r4 = chudware::sim::spice_simulate(circuit3, study);
     REQUIRE(r4["convergence"].value("op", false));
     CHECK_FALSE(r4.value("cache_hit", true));
     CHECK(r4["op"]["V(OUT)"].get<double>() == doctest::Approx(2.0 * vout1).epsilon(1e-9));
 }
 
 TEST_CASE("sim_cache: CFD HIT / invalidate-on-input-change") {
-    aicad::sim::cache::clear();
-    aicad::sim::cache::reset_stats();
+    chudware::sim::cache::clear();
+    chudware::sim::cache::reset_stats();
 
     std::vector<float> pos;
     std::vector<uint32_t> idx;
     unit_cube_tris(pos, idx);
-    aicad::sim::FlowParams fp;
+    chudware::sim::FlowParams fp;
     fp.cells = 24;     // tiny grid for a fast deterministic test
     fp.n_steps = 40;
     fp.velocity_ms = 10.0;
 
     const auto t0 = std::chrono::steady_clock::now();
-    auto r1 = aicad::sim::run_wind_tunnel({pos}, {idx}, fp);
+    auto r1 = chudware::sim::run_wind_tunnel({pos}, {idx}, fp);
     const double ms1 = ms_since(t0);
     REQUIRE(r1.ok);
     const double drag1 = r1.drag_n;
@@ -248,7 +248,7 @@ TEST_CASE("sim_cache: CFD HIT / invalidate-on-input-change") {
     const double ref1 = r1.ref_length_mm;
 
     const auto t1 = std::chrono::steady_clock::now();
-    auto r2 = aicad::sim::run_wind_tunnel({pos}, {idx}, fp);
+    auto r2 = chudware::sim::run_wind_tunnel({pos}, {idx}, fp);
     const double ms2 = ms_since(t1);
     REQUIRE(r2.ok);
     CHECK(r2.drag_n == doctest::Approx(drag1).epsilon(1e-12));
@@ -258,22 +258,22 @@ TEST_CASE("sim_cache: CFD HIT / invalidate-on-input-change") {
     MESSAGE("CFD miss ms=", ms1, " hit ms=", ms2);
 
     // Input change (velocity) -> MISS (different forces, or at least a recompute path).
-    aicad::sim::cache::Stats before = aicad::sim::cache::stats();
+    chudware::sim::cache::Stats before = chudware::sim::cache::stats();
     fp.velocity_ms = 20.0;
-    auto r3 = aicad::sim::run_wind_tunnel({pos}, {idx}, fp);
+    auto r3 = chudware::sim::run_wind_tunnel({pos}, {idx}, fp);
     REQUIRE(r3.ok);
-    aicad::sim::cache::Stats after = aicad::sim::cache::stats();
+    chudware::sim::cache::Stats after = chudware::sim::cache::stats();
     // A new key must have been a miss (stores or misses increased).
     CHECK(after.misses + after.stores > before.misses + before.stores - 1);
     CHECK(after.misses >= before.misses);
 }
 
 TEST_CASE("sim_cache: .step+ save->reopen restores study result") {
-    aicad::sim::cache::clear();
+    chudware::sim::cache::clear();
 
     // Run a small FEA study, embed the result into a .step+ via the reserved seam.
     json study = cube_static_study();
-    json res = aicad::sim::fea_run_static(study);
+    json res = chudware::sim::fea_run_static(study);
     REQUIRE(res.value("ok", false));
     const std::string input_hash = res.value("input_hash", std::string());
     REQUIRE_FALSE(input_hash.empty());
@@ -300,23 +300,23 @@ TEST_CASE("sim_cache: .step+ save->reopen restores study result") {
 
     std::map<std::string, std::string> extra;
     // Erase-first discipline (geometry cache style).
-    aicad::doc::stepplus_erase_study_results(extra);
-    REQUIRE(aicad::doc::stepplus_put_study_result(extra, "s_static", "fea_static", input_hash,
+    chudware::doc::stepplus_erase_study_results(extra);
+    REQUIRE(chudware::doc::stepplus_put_study_result(extra, "s_static", "fea_static", input_hash,
                                                   payload));
-    REQUIRE(extra.count(aicad::doc::stepplus_study_result_entry("s_static")) == 1);
+    REQUIRE(extra.count(chudware::doc::stepplus_study_result_entry("s_static")) == 1);
 
     const fs::path path = tmp_path("study_results.step+");
     std::error_code ec;
     fs::remove(path, ec);
-    const std::string saved = aicad::doc::stepplus_save(doc, path.string(), extra);
+    const std::string saved = chudware::doc::stepplus_save(doc, path.string(), extra);
     CHECK(fs::exists(saved));
 
-    aicad::doc::StepPlusDoc loaded = aicad::doc::stepplus_open(saved);
+    chudware::doc::StepPlusDoc loaded = chudware::doc::stepplus_open(saved);
     CHECK(loaded.doc.value("name", std::string()) == "SimCachePart");
 
     std::string kind_out, hash_out;
     json result_out;
-    REQUIRE(aicad::doc::stepplus_get_study_result(loaded.extra, "s_static", kind_out, hash_out,
+    REQUIRE(chudware::doc::stepplus_get_study_result(loaded.extra, "s_static", kind_out, hash_out,
                                                   result_out));
     CHECK(kind_out == "fea_static");
     CHECK(hash_out == input_hash);
@@ -329,20 +329,20 @@ TEST_CASE("sim_cache: .step+ save->reopen restores study result") {
     // Validate-on-open: a mismatched input_hash is the caller's job to reject.
     // Corrupt the engine key by hand-editing the blob -> get returns false.
     {
-        std::string& blob = loaded.extra[aicad::doc::stepplus_study_result_entry("s_static")];
+        std::string& blob = loaded.extra[chudware::doc::stepplus_study_result_entry("s_static")];
         if (blob.size() > 20) blob[12] = static_cast<char>(blob[12] ^ 0x5a);  // corrupt header
         std::string k2, h2;
         json r2;
-        CHECK_FALSE(aicad::doc::stepplus_get_study_result(loaded.extra, "s_static", k2, h2, r2));
+        CHECK_FALSE(chudware::doc::stepplus_get_study_result(loaded.extra, "s_static", k2, h2, r2));
     }
 
     // 20 MB cap: oversized payload is refused (honest drop).
     {
         std::map<std::string, std::string> e2;
         json huge = {{"ok", true}, {"blob", std::string(21ull * 1024ull * 1024ull, 'x')}};
-        CHECK_FALSE(aicad::doc::stepplus_put_study_result(e2, "big", "fea_static", "deadbeef",
+        CHECK_FALSE(chudware::doc::stepplus_put_study_result(e2, "big", "fea_static", "deadbeef",
                                                           huge));
-        CHECK(e2.count(aicad::doc::stepplus_study_result_entry("big")) == 0);
+        CHECK(e2.count(chudware::doc::stepplus_study_result_entry("big")) == 0);
     }
 
     fs::remove(path, ec);
@@ -352,11 +352,11 @@ TEST_CASE("sim_cache: .step+ save->reopen restores study result") {
 
 TEST_CASE("sim_cache: hash is stable and kind-scoped") {
     json s = cube_static_study();
-    const std::string a = aicad::sim::cache::hash_fea_study(Kind::FeaStatic, s);
-    const std::string b = aicad::sim::cache::hash_fea_study(Kind::FeaStatic, s);
+    const std::string a = chudware::sim::cache::hash_fea_study(Kind::FeaStatic, s);
+    const std::string b = chudware::sim::cache::hash_fea_study(Kind::FeaStatic, s);
     CHECK(a == b);
-    const std::string modal = aicad::sim::cache::hash_fea_study(Kind::FeaModal, s);
+    const std::string modal = chudware::sim::cache::hash_fea_study(Kind::FeaModal, s);
     CHECK(modal != a);  // kinds never collide
     s["material"]["E_mpa"] = 100000.0;
-    CHECK(aicad::sim::cache::hash_fea_study(Kind::FeaStatic, s) != a);
+    CHECK(chudware::sim::cache::hash_fea_study(Kind::FeaStatic, s) != a);
 }

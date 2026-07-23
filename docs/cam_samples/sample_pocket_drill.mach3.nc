@@ -1,4 +1,4 @@
-( AICAD - S1)
+( Chudware - S1)
 ( post: Mach3/Mach4  machine: Generic 3-axis mill)
 G21
 G90

@@ -10,7 +10,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad::firmware {
+namespace chudware::firmware {
 
 inline constexpr const char* kPowerProfileSchema = "aicad.powerprofile/1";
 inline constexpr const char* kPowerModelNote =
@@ -29,4 +29,4 @@ nlohmann::json build_power_profile(const nlohmann::json& trace, const nlohmann::
 std::optional<std::string> write_profile_artifact(const nlohmann::json& profile,
                                                   const std::string& elf_path);
 
-}  // namespace aicad::firmware
+}  // namespace chudware::firmware

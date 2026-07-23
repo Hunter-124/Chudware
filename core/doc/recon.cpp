@@ -11,7 +11,7 @@
 #include <vector>
 
 #include "doc/session.h"  // OpError
-#include "geom/plane.h"   // aicad::geom::SketchPlane — face-plane frame convention
+#include "geom/plane.h"   // chudware::geom::SketchPlane — face-plane frame convention
 
 #include <Bnd_Box.hxx>
 #include <BRepAdaptor_Curve.hxx>
@@ -48,7 +48,7 @@
 
 using nlohmann::json;
 
-namespace aicad::doc {
+namespace chudware::doc {
 
 namespace {
 
@@ -258,12 +258,12 @@ double norm_deg(double deg) {
     return d;
 }
 
-std::array<double, 2> project2(const aicad::geom::SketchPlane& plane, const gp_Pnt& p) {
+std::array<double, 2> project2(const chudware::geom::SketchPlane& plane, const gp_Pnt& p) {
     const Eigen::Vector2d uv = plane.project(Eigen::Vector3d(p.X(), p.Y(), p.Z()));
     return {uv.x(), uv.y()};
 }
 
-std::array<double, 2> project_dir2(const aicad::geom::SketchPlane& plane, const gp_Dir& d) {
+std::array<double, 2> project_dir2(const chudware::geom::SketchPlane& plane, const gp_Dir& d) {
     const Eigen::Vector2d uv = plane.projectDir(Eigen::Vector3d(d.X(), d.Y(), d.Z()));
     return {uv.x(), uv.y()};
 }
@@ -271,7 +271,7 @@ std::array<double, 2> project_dir2(const aicad::geom::SketchPlane& plane, const 
 // session.cpp::plane_frame — 16-float row-major matrix mapping sketch (u,v,0,1) -> world.
 // Duplicated here (rather than shared) to keep this file Session/session.cpp-free; the
 // convention MUST stay byte-identical to session.cpp's plane_frame().
-std::vector<double> plane_frame_of(const aicad::geom::SketchPlane& p) {
+std::vector<double> plane_frame_of(const chudware::geom::SketchPlane& p) {
     std::vector<double> out;
     out.reserve(16);
     for (int i = 0; i < 3; ++i) {
@@ -303,7 +303,7 @@ bool wire_is_single_closed_edge(const TopoDS_Wire& wire, TopoDS_Edge& out_edge) 
 // start->end (false samples end->start, i.e. the edge is reversed relative to the curve's own
 // parametrization). Appends "line" entities to `entities`; returns their ids in order.
 std::vector<std::string> sample_curve_polyline(json& entities, BRepAdaptor_Curve& ca,
-                                               const aicad::geom::SketchPlane& plane,
+                                               const chudware::geom::SketchPlane& plane,
                                                int& next_id, const gp_Pnt& p_start,
                                                const gp_Pnt& p_end, bool forward) {
     constexpr int kSegments = 24;
@@ -333,7 +333,7 @@ std::vector<std::string> sample_curve_polyline(json& entities, BRepAdaptor_Curve
 // One TRIMMED edge inside a multi-edge wire -> 1 entity (line/arc/ellipse_arc) or a sampled
 // polyline for anything else. `entity_ids` is appended to `entities`; returns the id(s).
 std::vector<std::string> emit_edge_entities(json& entities, const TopoDS_Edge& edge,
-                                            const aicad::geom::SketchPlane& plane, int& next_id,
+                                            const chudware::geom::SketchPlane& plane, int& next_id,
                                             bool& any_approx) {
     BRepAdaptor_Curve ca(edge);
     TopoDS_Vertex v1, v2;
@@ -396,7 +396,7 @@ std::vector<std::string> emit_edge_entities(json& entities, const TopoDS_Edge& e
 // A whole wire that is a single closed edge (full circle/ellipse/spline hole boundary) -> 1
 // "circle"/"ellipse" entity, or a closed sampled polyline for anything else.
 std::vector<std::string> emit_full_loop_entities(json& entities, const TopoDS_Edge& edge,
-                                                 const aicad::geom::SketchPlane& plane,
+                                                 const chudware::geom::SketchPlane& plane,
                                                  int& next_id, bool& any_approx) {
     BRepAdaptor_Curve ca(edge);
     const GeomAbs_CurveType ct = ca.GetType();
@@ -441,7 +441,7 @@ json face_wires(const TopoDS_Face& face) {
     gp_Dir normal_dir = surf.Plane().Axis().Direction();
     if (face.Orientation() == TopAbs_REVERSED) normal_dir.Reverse();
 
-    const aicad::geom::SketchPlane plane = aicad::geom::SketchPlane::from(
+    const chudware::geom::SketchPlane plane = chudware::geom::SketchPlane::from(
         Eigen::Vector3d(centroid.X(), centroid.Y(), centroid.Z()),
         Eigen::Vector3d(normal_dir.X(), normal_dir.Y(), normal_dir.Z()));
 
@@ -486,7 +486,7 @@ namespace {
 
 // Build the OCCT Geom_Plane matching a SketchPlane frame (origin + u/v/normal). Used as the
 // projection target for GeomProjLib::ProjectOnPlane (orthographic drop along the sketch normal).
-Handle(Geom_Plane) geom_plane_of(const aicad::geom::SketchPlane& p) {
+Handle(Geom_Plane) geom_plane_of(const chudware::geom::SketchPlane& p) {
     gp_Pnt o(p.origin.x(), p.origin.y(), p.origin.z());
     gp_Dir n(p.normal.x(), p.normal.y(), p.normal.z());
     gp_Dir u(p.uAxis.x(), p.uAxis.y(), p.uAxis.z());
@@ -496,7 +496,7 @@ Handle(Geom_Plane) geom_plane_of(const aicad::geom::SketchPlane& p) {
 // True iff the whole edge collapses to (near) a single point once projected onto `plane` — i.e.
 // the edge is (near) perpendicular to the plane, so its orthographic image is a point, not a
 // curve. Callers emit a "point" reference entity (or skip) rather than a zero-length curve.
-bool projected_edge_is_point(const TopoDS_Edge& edge, const aicad::geom::SketchPlane& plane,
+bool projected_edge_is_point(const TopoDS_Edge& edge, const chudware::geom::SketchPlane& plane,
                              std::array<double, 2>& pt_out) {
     BRepAdaptor_Curve ca(edge);
     const double t0 = ca.FirstParameter(), t1 = ca.LastParameter();
@@ -520,7 +520,7 @@ bool projected_edge_is_point(const TopoDS_Edge& edge, const aicad::geom::SketchP
 // "circle"/"ellipse" entity via emit_full_loop_entities. Perpendicular edges collapse to a
 // "point" reference entity. Appends to `entities`; returns the new entity ids.
 std::vector<std::string> emit_projected_edge(json& entities, const TopoDS_Edge& src_edge,
-                                             const aicad::geom::SketchPlane& plane, int& next_id,
+                                             const chudware::geom::SketchPlane& plane, int& next_id,
                                              bool& any_approx) {
     // Perpendicular edge -> single reference point (nothing to project into a curve).
     std::array<double, 2> pt{};
@@ -577,7 +577,7 @@ std::vector<std::string> emit_projected_edge(json& entities, const TopoDS_Edge& 
 }  // namespace
 
 std::vector<ProjectedEntity> project_edges_to_plane(const std::vector<TopoDS_Edge>& edges,
-                                                    const aicad::geom::SketchPlane& plane,
+                                                    const chudware::geom::SketchPlane& plane,
                                                     bool& any_approx) {
     json entities = json::array();
     int next_id = 1;
@@ -602,4 +602,4 @@ std::vector<TopoDS_Edge> face_boundary_edges(const TopoDS_Face& face) {
     return edges;
 }
 
-}  // namespace aicad::doc
+}  // namespace chudware::doc

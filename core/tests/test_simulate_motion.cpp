@@ -16,7 +16,7 @@
 //   - Steps < 2 throws immediately.
 //   - Invalid doc_id throws.
 //
-// Requires AICAD_WITH_OCCT (STEP writer + assembly compile path).
+// Requires CHUDWARE_WITH_OCCT (STEP writer + assembly compile path).
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
@@ -36,12 +36,12 @@
 
 using json = nlohmann::json;
 namespace fs = std::filesystem;
-namespace doc = aicad::doc;
+namespace doc = chudware::doc;
 
 namespace {
 
 fs::path tmp_path(const std::string& name) {
-    return fs::temp_directory_path() / ("aicad_simmotion_" + name);
+    return fs::temp_directory_path() / ("chudware_simmotion_" + name);
 }
 
 // Build a 10x10x10 box STEP file at the given X offset.
@@ -261,7 +261,7 @@ TEST_CASE("doc_simulate_motion: steps < 2 throws") {
     bool threw = false;
     try {
         doc::doc_simulate_motion("any-doc", "", 0.0, 90.0, 1, false, 0.0);
-    } catch (const aicad::doc::OpError& e) {
+    } catch (const chudware::doc::OpError& e) {
         threw = true;
         CHECK(std::string(e.what()).find("steps") != std::string::npos);
     }

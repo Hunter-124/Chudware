@@ -1,7 +1,7 @@
-# Auth gateway research — Billet web service (home host)
+# Auth gateway research — Chudware web service (home host)
 
 **Scope:** External research only (no repo edits / installs).  
-**Goal:** Auth for a self-hosted multi-user Billet web service (~3–6 concurrent users) on Fedora 44 + rootless Podman, with Microsoft Entra (University of Alabama / ua.edu) + whitelisted Google accounts, plus tunnel/exposure and streaming constraints.  
+**Goal:** Auth for a self-hosted multi-user Chudware web service (~3–6 concurrent users) on Fedora 44 + rootless Podman, with Microsoft Entra (University of Alabama / ua.edu) + whitelisted Google accounts, plus tunnel/exposure and streaming constraints.  
 **Date:** 2026-07-14.
 
 ---
@@ -99,7 +99,7 @@ Official ([Validate JWTs](https://developers.cloudflare.com/cloudflare-one/acces
   - Free-tier long-lived connections often discussed as **~100s of minutes to 24h** class limits depending on product path — plan reconnect/backoff for streaming sessions.
   - Video-ish streams over **WS/TCP** through free edge will work for low concurrent users but expect **extra latency vs LAN**, no QoS, and possible idle timeouts. For 3–6 CAD stream sessions this is usually acceptable if codec/framerate are modest; not a live-production CDN.
 
-**Streaming design implication for Billet:** Prefer **WebSocket or WebTransport-over-HTTP** (or fMP4/WebCodecs over HTTPS) rather than browser WebRTC media unless you run a separate public TURN (UDP) outside free Tunnel.
+**Streaming design implication for Chudware:** Prefer **WebSocket or WebTransport-over-HTTP** (or fMP4/WebCodecs over HTTPS) rather than browser WebRTC media unless you run a separate public TURN (UDP) outside free Tunnel.
 
 ### Option A pros/cons (summary)
 
@@ -124,7 +124,7 @@ Official ([Validate JWTs](https://developers.cloudflare.com/cloudflare-one/acces
 ### Shape
 
 ```
-Internet → (router port 443 or alternate tunnel) → Caddy (TLS) → oauth2-proxy → Billet gateway / session router
+Internet → (router port 443 or alternate tunnel) → Caddy (TLS) → oauth2-proxy → Chudware gateway / session router
 ```
 
 - **Google OAuth:** personal GCP project, External consent, redirect `https://app.example/oauth2/callback`. Email restriction via oauth2-proxy `--email-domain` / `--authenticated-emails-file`.
@@ -300,7 +300,7 @@ Notes:
 
 - Prefer header over cookie for non-browser clients.
 - Cache JWKS; handle key rotation via `kid`.
-- After Access, map `email` → Billet user id / container session.
+- After Access, map `email` → Chudware user id / container session.
 - WebSocket: validate JWT on **HTTP upgrade** request (browsers send Access cookie automatically on same site; non-browser clients need header).
 
 ### D. Streaming checklist under winner

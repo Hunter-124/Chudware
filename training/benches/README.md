@@ -25,7 +25,7 @@ python -m tools.flywheel.bench.runner --all --smoke    # gate-size (what gate.sh
 python -m tools.flywheel.bench.runner regen_fix        # one bench
 ```
 
-`scripts/gate.sh` stage 6 runs `--smoke --all` only when `AICAD_RUN_BENCH=1` (env-gated SKIP,
+`scripts/gate.sh` stage 6 runs `--smoke --all` only when `CHUDWARE_RUN_BENCH=1` (env-gated SKIP,
 OCCT-style) so the gate stays green without the flywheel.
 
 ## Design invariants (see `tools/flywheel/bench/DESIGN.md`)

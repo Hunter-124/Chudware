@@ -2,7 +2,7 @@
 
 **These recipes never execute in CI** and must not start until the eval harness shows the
 ship gates are reachable. `guard.py` enforces it (`assert_training_allowed()` refuses under
-CI and without `AICAD_ALLOW_TRANSLATOR_TRAINING=1`). Same discipline as T-H6/T-H10.
+CI and without `CHUDWARE_ALLOW_TRANSLATOR_TRAINING=1`). Same discipline as T-H6/T-H10.
 
 ## The recipe (master plan §Pillar 13)
 

@@ -69,11 +69,11 @@ public:
     // True while the Component Pattern form is open (the selection observer routes component picks).
     bool patternFormActive() const { return patternOpen_; }
 
-    // --- scripted scenario helpers (AI_CAD_SHOT=asm) ---
+    // --- scripted scenario helpers (CHUDWARE_SHOT=asm) ---
     // Scenario/shot helper — opens state only. Prefer handleCommand(st,"asm_mate") so the form
     // hosts in the left PM column (openPmGuest). Callers with AppState should use handleCommand.
     void openMateForm() { beginMateForm(); }
-    // Preselect a mate type for a headless shot (AI_CAD_MATETYPE=gear), so the type-aware
+    // Preselect a mate type for a headless shot (CHUDWARE_MATETYPE=gear), so the type-aware
     // parameter block renders. Mirrors PropertyManager::presetFieldForShot. No-op if the type
     // is unknown; the mate form must already be open.
     void presetMateTypeForShot(const std::string& type);

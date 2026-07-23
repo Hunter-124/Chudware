@@ -11,7 +11,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad::firmware {
+namespace chudware::firmware {
 
 constexpr double kG0 = 9.80665;
 constexpr double kREarth = 6371000.0;
@@ -79,4 +79,4 @@ nlohmann::json gnss_series(const std::vector<TrajectorySample>& samples,
 nlohmann::json pitot_series(const std::vector<TrajectorySample>& samples,
                             const std::optional<std::vector<double>>& airspeed_m_s);
 
-}  // namespace aicad::firmware
+}  // namespace chudware::firmware

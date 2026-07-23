@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# packaging/linux/build_appimage.sh — assemble a self-contained AppImage for the Billet
-# host GUI (binary named Billet; an AI-CAD compat symlink ships beside it).
+# packaging/linux/build_appimage.sh — assemble a self-contained AppImage for the Chudware
+# host GUI (binary named Chudware; an Chudware compat symlink ships beside it).
 # Mirrors services/installer/build_release.py's "embed-and-extract" payload shape
 # (app/ Python packages + wheelhouse/ offline wheels) so the SAME bootstrap.cpp
 # findPayload()/provisionRuntime() logic that already runs on Windows also works unmodified
@@ -8,18 +8,18 @@
 #
 # Requires a prior build of the host GUI:
 #   cmake -S host -B host/build-linux -G Ninja -DCMAKE_BUILD_TYPE=Release
-#   ninja -C host/build-linux Billet
+#   ninja -C host/build-linux Chudware
 #
 # Usage:
-#   packaging/linux/build_appimage.sh [--out DIR] [--skip-wheels] [--no-libaicad] [--keep-appdir]
+#   packaging/linux/build_appimage.sh [--out DIR] [--skip-wheels] [--no-libchudware] [--keep-appdir]
 #
 #   --out DIR           output directory for the .AppImage (default: <repo>/dist)
 #   --skip-wheels       omit the offline wheelhouse (smaller AppImage; runtime provisioning
 #                        then needs network access instead of being fully offline-friendly)
-#   --no-libaicad       do NOT bundle libaicad.so (demo mode / smaller image). Bundling is
+#   --no-libchudware       do NOT bundle libchudware.so (demo mode / smaller image). Bundling is
 #                        the DEFAULT for release builds: the full FEA engine from
 #                        core/build-occt-linux is preferred, the slim core/build-linux one
-#                        is a loud-warning fallback. (--with-libaicad is accepted as a
+#                        is a loud-warning fallback. (--with-libchudware is accepted as a
 #                        no-op for backward compatibility.)
 #   --keep-appdir       don't delete the staged AppDir/ after building (for inspection)
 set -euo pipefail
@@ -27,27 +27,27 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 OUT="$REPO/dist"
 SKIP_WHEELS=0
-WITH_LIBAICAD=1
+WITH_LIBCHUDWARE=1
 KEEP_APPDIR=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --out) OUT="$2"; shift 2 ;;
         --skip-wheels) SKIP_WHEELS=1; shift ;;
-        --with-libaicad) WITH_LIBAICAD=1; shift ;;   # legacy no-op (now the default)
-        --no-libaicad) WITH_LIBAICAD=0; shift ;;
+        --with-libchudware) WITH_LIBCHUDWARE=1; shift ;;   # legacy no-op (now the default)
+        --no-libchudware) WITH_LIBCHUDWARE=0; shift ;;
         --keep-appdir) KEEP_APPDIR=1; shift ;;
         *) echo "unknown arg: $1" >&2; exit 2 ;;
     esac
 done
 
-BIN="$REPO/host/build-linux/bin/Billet"
+BIN="$REPO/host/build-linux/bin/Chudware"
 # Stale build dirs may only have the old binary name; fall back so packaging still works.
-[ -e "$BIN" ] || BIN="$REPO/host/build-linux/bin/AI-CAD"
+[ -e "$BIN" ] || BIN="$REPO/host/build-linux/bin/Chudware"
 if [ ! -x "$BIN" ]; then
     echo "error: $BIN not found — build it first:" >&2
     echo '  cmake -S host -B host/build-linux -G Ninja -DCMAKE_BUILD_TYPE=Release' >&2
-    echo '  ninja -C host/build-linux Billet' >&2
+    echo '  ninja -C host/build-linux Chudware' >&2
     exit 1
 fi
 
@@ -59,8 +59,8 @@ rm -rf "$APPDIR"
 mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/lib"
 
 echo "==> staging binary + resources"
-cp "$BIN" "$APPDIR/usr/bin/Billet"
-ln -sf Billet "$APPDIR/usr/bin/AI-CAD"  # compat symlink for legacy launch paths
+cp "$BIN" "$APPDIR/usr/bin/Chudware"
+ln -sf Chudware "$APPDIR/usr/bin/Chudware"  # compat symlink for legacy launch paths
 if [ -d "$REPO/host/build-linux/bin/assets" ]; then
     cp -a "$REPO/host/build-linux/bin/assets" "$APPDIR/usr/bin/assets"
 fi
@@ -92,54 +92,54 @@ else
     echo "WARNING: CEF runtime not found in $CEF_SRC — the packaged GUI will abort at startup (CefInitialize needs icudtl.dat/pak next to the exe)" >&2
 fi
 
-# Engine host daemon (aicad-hostd, core/hostd) — the shared engine process the GUI
-# and MCP servers attach to (AI_CAD_ENGINE_DAEMON=1). Same build-dir preference as
+# Engine host daemon (chudware-hostd, core/hostd) — the shared engine process the GUI
+# and MCP servers attach to (CHUDWARE_ENGINE_DAEMON=1). Same build-dir preference as
 # the engine below: full occt build first, slim fallback with a loud warning.
 HOSTD=""
-for cand in "$REPO/core/build-occt-linux/bin/aicad-hostd" "$REPO/core/build-linux/bin/aicad-hostd"; do
+for cand in "$REPO/core/build-occt-linux/bin/chudware-hostd" "$REPO/core/build-linux/bin/chudware-hostd"; do
     [ -x "$cand" ] && { HOSTD="$cand"; break; }
 done
 if [ -n "$HOSTD" ]; then
     case "$HOSTD" in
-        */build-linux/*) echo "WARNING: staging aicad-hostd from the SLIM core/build-linux tree (core/build-occt-linux/bin/aicad-hostd not built) — daemon will load whatever engine AppRun points it at, but rebuild the occt tree for release" >&2 ;;
+        */build-linux/*) echo "WARNING: staging chudware-hostd from the SLIM core/build-linux tree (core/build-occt-linux/bin/chudware-hostd not built) — daemon will load whatever engine AppRun points it at, but rebuild the occt tree for release" >&2 ;;
     esac
-    cp "$HOSTD" "$APPDIR/usr/bin/aicad-hostd"
-    echo "==> staged aicad-hostd ($HOSTD)"
+    cp "$HOSTD" "$APPDIR/usr/bin/chudware-hostd"
+    echo "==> staged chudware-hostd ($HOSTD)"
 else
-    echo "WARNING: aicad-hostd not built (core/build-occt-linux or core/build-linux) — AppImage ships WITHOUT the engine daemon; daemon mode (the default) will fall back to in-process" >&2
+    echo "WARNING: chudware-hostd not built (core/build-occt-linux or core/build-linux) — AppImage ships WITHOUT the engine daemon; daemon mode (the default) will fall back to in-process" >&2
 fi
 
-if [ "$WITH_LIBAICAD" = "1" ]; then
+if [ "$WITH_LIBCHUDWARE" = "1" ]; then
     # Prefer the FULL engine (FEA/sim, OCCT geometry) from core/build-occt-linux; the
     # slim core/build-linux .so has no sim solvers and is only a loud-warning fallback.
     # (This was a real shipped bug: the AppImage used to bundle the slim engine.)
-    LIBAICAD=""
-    for cand in "$REPO/core/build-occt-linux/bin/libaicad.so" "$REPO/core/build-linux/bin/libaicad.so"; do
-        [ -f "$cand" ] && { LIBAICAD="$cand"; break; }
+    LIBCHUDWARE=""
+    for cand in "$REPO/core/build-occt-linux/bin/libchudware.so" "$REPO/core/build-linux/bin/libchudware.so"; do
+        [ -f "$cand" ] && { LIBCHUDWARE="$cand"; break; }
     done
-    if [ -n "$LIBAICAD" ]; then
-        case "$LIBAICAD" in
+    if [ -n "$LIBCHUDWARE" ]; then
+        case "$LIBCHUDWARE" in
             */build-linux/*) echo "WARNING: bundling the SLIM core/build-linux engine (no FEA/sim) — build core/build-occt-linux for a release AppImage" >&2 ;;
         esac
-        cp "$LIBAICAD" "$APPDIR/usr/lib/libaicad.so"
+        cp "$LIBCHUDWARE" "$APPDIR/usr/lib/libchudware.so"
         # Sibling runtime .so deps that live next to the occt engine (Netgen mesher,
-        # lib3mf export) — libaicad.so resolves them via its RUNPATH/LD_LIBRARY_PATH,
+        # lib3mf export) — libchudware.so resolves them via its RUNPATH/LD_LIBRARY_PATH,
         # so they must ride along or FEA meshing breaks on a clean machine. (The full
         # OCCT 7.9 closure is bundled by the excludelist walk just below.)
-        LIBDIR="$(dirname "$LIBAICAD")"
+        LIBDIR="$(dirname "$LIBCHUDWARE")"
         for sib in libnglib.so libngcore.so lib3mf.so; do
             if [ -f "$LIBDIR/$sib" ]; then
                 cp "$LIBDIR/$sib" "$APPDIR/usr/lib/$sib"
             fi
         done
-        echo "==> bundled libaicad.so + siblings from $LIBDIR (real engine, not demo mode)"
+        echo "==> bundled libchudware.so + siblings from $LIBDIR (real engine, not demo mode)"
 
         # OCCT 7.9 + engine runtime closure. The engine links 34 libTK*.so.7.9 plus
         # TBB and a networking tail; none of it is bundled by default, so the AppImage
         # cannot open a document on a machine without OCCT 7.9 installed (verified: the
         # libTK* deps resolve to /lib64 on the build host but are "not found" in a clean
         # fedora:rawhide container). ldd emits the FULL flattened transitive closure, so
-        # seeding with libaicad.so (+ the mesh/export siblings and aicad-hostd, which
+        # seeding with libchudware.so (+ the mesh/export siblings and chudware-hostd, which
         # dlopens the engine) captures OCCT and everything OCCT itself pulls. We copy
         # every resolved dep whose basename is NOT on the AppImage excludelist — glibc,
         # libstdc++/libgcc_s, the GL/X11 graphics-driver stack, and freetype/fontconfig/
@@ -161,9 +161,9 @@ if [ "$WITH_LIBAICAD" = "1" ]; then
             for e in "${EXCL[@]}"; do case "$base" in "$e"*) return 0 ;; esac; done
             return 1
         }
-        SEEDS=("$LIBAICAD")
+        SEEDS=("$LIBCHUDWARE")
         for s in "$APPDIR/usr/lib/libnglib.so" "$APPDIR/usr/lib/libngcore.so" \
-                 "$APPDIR/usr/lib/lib3mf.so" "$APPDIR/usr/bin/aicad-hostd"; do
+                 "$APPDIR/usr/lib/lib3mf.so" "$APPDIR/usr/bin/chudware-hostd"; do
             [ -e "$s" ] && SEEDS+=("$s")
         done
         echo "==> bundling engine runtime closure (OCCT 7.9 + deps) into usr/lib"
@@ -179,7 +179,7 @@ if [ "$WITH_LIBAICAD" = "1" ]; then
         echo "==> usr/lib now has $nlib shared objects ($ntk OCCT libTK*)"
         [ "$ntk" -ge 30 ] || echo "WARNING: only $ntk OCCT libs bundled (expected ~34) — engine may not load on a clean machine" >&2
     else
-        echo "WARNING: no libaicad.so found in core/build-occt-linux or core/build-linux — shipping demo mode (use --no-libaicad to silence)" >&2
+        echo "WARNING: no libchudware.so found in core/build-occt-linux or core/build-linux — shipping demo mode (use --no-libchudware to silence)" >&2
     fi
 fi
 
@@ -217,10 +217,10 @@ cat > "$APPDIR/AppRun" <<'EOF'
 #!/bin/sh
 HERE="$(dirname "$(readlink -f "$0")")"
 export LD_LIBRARY_PATH="$HERE/usr/lib:${LD_LIBRARY_PATH:-}"
-if [ -f "$HERE/usr/lib/libaicad.so" ] && [ -z "${AI_CAD_LIBAICAD:-}" ]; then
-    export AI_CAD_LIBAICAD="$HERE/usr/lib/libaicad.so"
+if [ -f "$HERE/usr/lib/libchudware.so" ] && [ -z "${CHUDWARE_LIBCHUDWARE:-}" ]; then
+    export CHUDWARE_LIBCHUDWARE="$HERE/usr/lib/libchudware.so"
 fi
-# Engine host daemon (aicad-hostd): point clients at the bundled binary, and pin
+# Engine host daemon (chudware-hostd): point clients at the bundled binary, and pin
 # the daemon instance key to the AppImage FILE path ($APPIMAGE, set by the runtime).
 # The squashfs mount point is randomized per launch, so hashing the resolved hostd
 # binary path (the default in ipc_discovery) would mint a NEW key — and daemon —
@@ -228,20 +228,20 @@ fi
 # two different AppImage versions still get different keys and coexist. Socket/lock
 # live in $XDG_RUNTIME_DIR (host fs) — nothing daemon-related inside this read-only
 # mount. Respect pre-set env so tests/dev can override.
-if [ -x "$HERE/usr/bin/aicad-hostd" ] && [ -z "${AICAD_HOSTD_BIN:-}" ]; then
-    export AICAD_HOSTD_BIN="$HERE/usr/bin/aicad-hostd"
+if [ -x "$HERE/usr/bin/chudware-hostd" ] && [ -z "${CHUDWARE_HOSTD_BIN:-}" ]; then
+    export CHUDWARE_HOSTD_BIN="$HERE/usr/bin/chudware-hostd"
 fi
-if [ -z "${AICAD_INSTANCE_KEY:-}" ]; then
-    export AICAD_INSTANCE_KEY="$(printf %s "${APPIMAGE:-$HERE}" | sha256sum | cut -c1-12)"
+if [ -z "${CHUDWARE_INSTANCE_KEY:-}" ]; then
+    export CHUDWARE_INSTANCE_KEY="$(printf %s "${APPIMAGE:-$HERE}" | sha256sum | cut -c1-12)"
 fi
-exec "$HERE/usr/bin/Billet" "$@"
+exec "$HERE/usr/bin/Chudware" "$@"
 EOF
 chmod +x "$APPDIR/AppRun"
-# The staged binary is usr/bin/Billet (with an AI-CAD compat symlink), matching the
-# .desktop's Exec=Billet.
-cp "$REPO/packaging/linux/Billet.desktop" "$APPDIR/Billet.desktop"
-cp "$REPO/assets/logo_icon.png" "$APPDIR/Billet.png"
-ln -sf Billet.png "$APPDIR/.DirIcon"
+# The staged binary is usr/bin/Chudware (with an Chudware compat symlink), matching the
+# .desktop's Exec=Chudware.
+cp "$REPO/packaging/linux/Chudware.desktop" "$APPDIR/Chudware.desktop"
+cp "$REPO/assets/logo_icon.png" "$APPDIR/Chudware.png"
+ln -sf Chudware.png "$APPDIR/.DirIcon"
 
 APPIMAGETOOL="$REPO/build/tools/appimagetool"
 if [ ! -x "$APPIMAGETOOL" ]; then
@@ -253,7 +253,7 @@ if [ ! -x "$APPIMAGETOOL" ]; then
 fi
 
 mkdir -p "$OUT"
-OUTFILE="$OUT/Billet-$VERSION-x86_64.AppImage"
+OUTFILE="$OUT/Chudware-$VERSION-x86_64.AppImage"
 echo "==> building $OUTFILE"
 if ! ARCH=x86_64 VERSION="$VERSION" "$APPIMAGETOOL" "$APPDIR" "$OUTFILE" 2>"$OUT/appimagetool.log"; then
     echo "==> direct run failed, retrying with --appimage-extract-and-run (no-FUSE environments)"

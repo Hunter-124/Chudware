@@ -253,9 +253,9 @@ class GitBinding:
         # self-describing without a side table (contract §3.1). meta.json in the
         # tree carries the same for readers that don't parse commit trailers.
         body = meta.message or ""
-        trailer = f"aicad-plm-kind: {meta.kind}\n"
+        trailer = f"chudware-plm-kind: {meta.kind}\n"
         if meta.scope and meta.scope != "design":
-            trailer += f"aicad-plm-scope: {meta.scope}\n"
+            trailer += f"chudware-plm-scope: {meta.scope}\n"
         commit.message = (f"{body}\n\n{trailer}").encode("utf-8")
 
         obj_store.add_object(commit)

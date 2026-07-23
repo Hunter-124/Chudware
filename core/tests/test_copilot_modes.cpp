@@ -15,10 +15,10 @@
 #include <algorithm>
 #include <vector>
 
-using aicad::agent::CopilotModes;
-using aicad::agent::copilot_apply_mode_tools;
-using aicad::agent::copilot_normalize_mode;
-using aicad::agent::copilot_tool_allowed;
+using chudware::agent::CopilotModes;
+using chudware::agent::copilot_apply_mode_tools;
+using chudware::agent::copilot_normalize_mode;
+using chudware::agent::copilot_tool_allowed;
 
 namespace {
 

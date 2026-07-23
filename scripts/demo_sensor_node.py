@@ -11,14 +11,14 @@ One scripted mission exercises the FIN content surface end-to-end:
     → make_report verification deliverable
 
 Fast path (<5 min): uses dry-run-friendly legs where solvers are absent, live FEA when
-``AI_CAD_LIBAICAD`` points at a sim-enabled libaicad, and honest SKIP markers for
+``CHUDWARE_LIBCHUDWARE`` points at a sim-enabled libchudware, and honest SKIP markers for
 Renode/OpenFOAM-gated legs. Exit 0 on overall PASS (SKIPs allowed); exit 1 on FAIL.
 
 Gate wiring: ``scripts/gate.sh`` stage_fin_content invokes this with the mcp-venv.
 Artifacts land under ``$OUT_DIR`` (default ``scratch/fin25_sensor_node/``).
 
 Run:
-  AI_CAD_LIBAICAD=$PWD/core/build-occt-linux/bin/libaicad.so \\
+  CHUDWARE_LIBCHUDWARE=$PWD/core/build-occt-linux/bin/libchudware.so \\
     python3 scripts/demo_sensor_node.py
 """
 from __future__ import annotations
@@ -37,9 +37,9 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 OUT_DIR = Path(os.environ.get(
-    "AICAD_FIN25_OUT", str(REPO / "scratch" / "fin25_sensor_node")))
+    "CHUDWARE_FIN25_OUT", str(REPO / "scratch" / "fin25_sensor_node")))
 MARKER_DIR = Path(os.environ.get(
-    "AICAD_FIN25_MARKERS", str(OUT_DIR / "markers")))
+    "CHUDWARE_FIN25_MARKERS", str(OUT_DIR / "markers")))
 
 
 # ── harness ──────────────────────────────────────────────────────────────────
@@ -302,7 +302,7 @@ def main() -> int:
 
     print("=== T-FIN25 golden demo: STM32 sensor-node ===")
     print(f"  out: {OUT_DIR}")
-    print(f"  AI_CAD_LIBAICAD={os.environ.get('AI_CAD_LIBAICAD', '<unset>')}")
+    print(f"  CHUDWARE_LIBCHUDWARE={os.environ.get('CHUDWARE_LIBCHUDWARE', '<unset>')}")
 
     tools = register_all_tools()
     state: dict[str, Any] = {}
@@ -506,7 +506,7 @@ def main() -> int:
         except ImportError:
             leg.skip("build123d not installed — FEA solid path unavailable")
             return
-        dry = os.environ.get("AICAD_FIN25_THERMAL_DRY", "").strip() in ("1", "true", "yes")
+        dry = os.environ.get("CHUDWARE_FIN25_THERMAL_DRY", "").strip() in ("1", "true", "yes")
         r = _call(tools, "ecad_thermal_handoff", doc_id=state["pcb_doc_id"],
                   dry_run=dry, mesh_fineness=0.3)
         state["thermal"] = r
@@ -647,7 +647,7 @@ def main() -> int:
             leg.skip(f"deliverables unavailable: {exc}")
             return
 
-        os.environ.setdefault("AICAD_PROJECT_DIR", str(OUT_DIR / "project"))
+        os.environ.setdefault("CHUDWARE_PROJECT_DIR", str(OUT_DIR / "project"))
         dproj.project_dir()  # ensure
 
         # Attach key leg results as provenance bag

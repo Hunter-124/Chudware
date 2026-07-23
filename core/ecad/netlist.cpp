@@ -14,7 +14,7 @@
 
 #include "ecad/schema.h"
 
-namespace aicad::ecad {
+namespace chudware::ecad {
 
 using nlohmann::json;
 
@@ -646,4 +646,4 @@ json build_netlist(const json& sch) {
                 {"warnings", warn_out}};
 }
 
-}  // namespace aicad::ecad
+}  // namespace chudware::ecad

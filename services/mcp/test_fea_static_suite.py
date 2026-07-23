@@ -20,7 +20,7 @@ Coverage:
     against a fixed .so; the dynamic xfail remains as a regression tripwire —
     do not delete it.
 
-Skips honestly (with the probe reason) when the staged libaicad.so lacks the
+Skips honestly (with the probe reason) when the staged libchudware.so lacks the
 Netgen FEA RPCs. Meshes are kept coarse — the whole module is a smoke-priced
 suite, the timing baseline lives in benchmarks/simsuite/.
 """

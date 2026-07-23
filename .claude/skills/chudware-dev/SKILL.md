@@ -1,9 +1,9 @@
 ---
-name: aicad-dev
-description: Generalist skill for ANY change to the Billet program (formerly AI-CAD/ShopCraft) in this repo — engine/kernel work, agent loop, MCP server, contracts, scripts, tests, docs, bug fixes, features — whenever the task isn't purely GUI (purely-GUI batches go to gui-orchestrator, which this skill points to). Carries the verified repo map, build/test commands, git workflow, and Hunter's working preferences, so read this before searching the repo or asking basics.
+name: chudware-dev
+description: Generalist skill for ANY change to the Chudware program (formerly Chudware) in this repo — engine/kernel work, agent loop, MCP server, contracts, scripts, tests, docs, bug fixes, features — whenever the task isn't purely GUI (purely-GUI batches go to gui-orchestrator, which this skill points to). Carries the verified repo map, build/test commands, git workflow, and Hunter's working preferences, so read this before searching the repo or asking basics.
 ---
 
-# Billet Generalist Dev (formerly AI-CAD)
+# Chudware Generalist Dev (formerly Chudware)
 
 How to work in this repo, regardless of which part you're changing. GUI-heavy batches:
 hand off to `.claude/skills/gui-orchestrator/SKILL.md` (it has the panel-level map and
@@ -45,7 +45,7 @@ Trust build.sh/gate.sh and this map over AGENTS.md's repo-map rows where they co
 
 | Dir | What it is |
 |---|---|
-| `core/` | Pure C++/CUDA kernel → `libaicad`: geom/doc/sketch/solver/cam/sim/ecad/mate/parts/agent/util/api/tests. Public API seam: `core/api/libaicad.h` (append-only) |
+| `core/` | Pure C++/CUDA kernel → `libchudware`: geom/doc/sketch/solver/cam/sim/ecad/mate/parts/agent/util/api/tests. Public API seam: `core/api/libchudware.h` (append-only) |
 | `engine_oracle/` (symlink `engine/`) | Python parity oracle (build123d on OpenCASCADE) — frozen while `core/` strangles it out; kept in lockstep via parity corpus; deleted last |
 | `host/` | **The production GUI** — C++ GLFW/ImGui desktop app. `host/src/app.cpp` frame loop, `host/src/ui/` panels (52k LOC), `host/src/core/app_state.h` central data model. Details: the gui-* skills |
 | `ui/viewport/` | Shared OpenGL render module (renderer/mesh/camera, id-pass picking, AICM loader) |
@@ -60,10 +60,10 @@ Trust build.sh/gate.sh and this map over AGENTS.md's repo-map rows where they co
 | `work/` | Task board (`work/tools/work.py`) + backlog cards `work/backlog/T-*.md` |
 | `assets/` | Icons + generators (`make_icons.py`, `pack_icons.py`), logo |
 | `tools/`, `benchmarks/`, `training/`, `dag/`, `deliverables/` | Dev tools, benches, ML training, DAG missions, deliverable templates |
-| `Webservice/` | billet-web: self-hosted multi-user streamed sessions — `gateway/` (FastAPI portal+auth+session mgr+chat), `image/` (Fedora 44 session container), `deploy/` (systemd user units, cf_provision.py, RUNBOOK.md), `DESIGN.md`. T-R7 PLM remote subset lives in `services/plm/remote.py`. Secrets NEVER committed (`Cloudflare-info.txt` gitignored) |
+| `Webservice/` | chudware-web: self-hosted multi-user streamed sessions — `gateway/` (FastAPI portal+auth+session mgr+chat), `image/` (Fedora 44 session container), `deploy/` (systemd user units, cf_provision.py, RUNBOOK.md), `DESIGN.md`. T-R7 PLM remote subset lives in `services/plm/remote.py`. Secrets NEVER committed (`Cloudflare-info.txt` gitignored) |
 | `scratch/` | Throwaway output — never commit anything load-bearing here |
 
-Env/naming compat: `SHOPCRAFT_*` env vars canonical, `AI_CAD_*` honored; MCP id `shopcraft`
+Env/naming compat: `CHUDWARE_*` env vars canonical, `CHUDWARE_*` honored; MCP id `chudware`
 with `ai-cad` preserved.
 
 ## Commands
@@ -73,7 +73,7 @@ with `ai-cad` preserved.
 ./build.sh core         # C++ kernel only (linux-core preset; needs system OCCT)
 ./build.sh all          # core, then GUI
 ./build.sh clean        # wipe host/build-linux (core kept — OCCT reconfig is expensive)
-./host/build-linux/bin/Billet                     # run the app
+./host/build-linux/bin/Chudware                     # run the app
 scripts/gate.sh         # THE gate: check.py → core build+ctest → host build → pytest → shot smoke
 python3 scripts/check.py                          # fast stdlib gate (gui_lint, audits) — always runnable
 python3 work/tools/work.py ready|board            # task board
@@ -82,15 +82,15 @@ python3 work/tools/work.py ready|board            # task board
 Gate semantics: OCCT-absent and runtime-venv-absent are **SKIPs, not failures** — the gate
 stays green on an unprovisioned box. Engine+agent pytest runs as
 `<venv>/python -X utf8 -m pytest engine/doc agent -q` when the venv exists.
-Scripted GUI launches use `xvfb-run` automatically; set `AI_CAD_SHOT_HEADED=1` to see a real
-window. Headless scenario smoke: `AI_CAD_SHOT=<m1|sketch|asm|fea|flow|drawing|…>
-./host/build-linux/bin/Billet --ui-screenshot scratch/smoke.png` (crash check, not visual
+Scripted GUI launches use `xvfb-run` automatically; set `CHUDWARE_SHOT_HEADED=1` to see a real
+window. Headless scenario smoke: `CHUDWARE_SHOT=<m1|sketch|asm|fea|flow|drawing|…>
+./host/build-linux/bin/Chudware --ui-screenshot scratch/smoke.png` (crash check, not visual
 judgment).
 
 ## Rules that bind every change
 
 - **Contracts and seam files are append-only** and integrator-owned: `contracts/*`,
-  `core/api/libaicad.h`, top-level CMake, `scripts/gate.sh`, `AGENTS.md`. If you're a
+  `core/api/libchudware.h`, top-level CMake, `scripts/gate.sh`, `AGENTS.md`. If you're a
   subagent, request these edits from your orchestrator instead of making them.
 - **Subagents never run git**; the session driver commits. Parallel agents need disjoint
   write-sets. **No git worktrees in this repo** — they branch from a stale base and have
@@ -105,17 +105,17 @@ judgment).
 
 ## Daemon / mission lifecycle (don't regress these)
 
-- **hostd control:** `aicad-hostd --status` / `--stop` / `--stop --force`. Bare `--stop`
+- **hostd control:** `chudware-hostd --status` / `--stop` / `--stop --force`. Bare `--stop`
   refuses while agent children run; `--force` stops children (TERM → grace → KILL) first.
   If the control socket is dead but the pidfile process still lives, `--stop` escalates
   via pidfile: SIGTERM → 3 s → SIGKILL (`core/hostd/main.cpp`).
-- **Doc-GC:** abandoned docs: `AICAD_DOC_GC_GRACE_S` (default 90 s); agent/mcp-origin
-  docs use floor `AICAD_DOC_GC_AGENT_GRACE_S` (default 1800 s) so mission-built parts stay
-  openable from the GUI after the agent detaches; `AICAD_DOC_GC=0` disables
+- **Doc-GC:** abandoned docs: `CHUDWARE_DOC_GC_GRACE_S` (default 90 s); agent/mcp-origin
+  docs use floor `CHUDWARE_DOC_GC_AGENT_GRACE_S` (default 1800 s) so mission-built parts stay
+  openable from the GUI after the agent detaches; `CHUDWARE_DOC_GC=0` disables
   (`core/hostd/doc_registry.*`).
 - **GUI reconnect:** status bar shows a sticky unreachable chip; `engine_events` reconnects
   with backoff and re-bootstraps doc tabs on `reconnectGeneration` bump
-  (`AI_CAD_SHOT=daemon_h2`). See gui-workspaces for the status-bar surface.
+  (`CHUDWARE_SHOT=daemon_h2`). See gui-workspaces for the status-bar surface.
 - **Mission terminal:** loop autosaves mission-minted geometry as `.step+` into the run
   `parts/` dir + GUI workspace, then closes those docs (GUI-adopted exempt)
   (`services/agent/loop.py` `_terminal_autosave_close_docs`).

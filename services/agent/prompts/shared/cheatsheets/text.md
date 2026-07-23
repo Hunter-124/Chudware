@@ -4,7 +4,7 @@ do NOT build glyph outlines or booleans yourself — the `text` feature renders 
 and cuts/raises them, with robustness built in.
 
 REQUIRED:
-  text             — the string to mark (e.g. "PN-42", "AI-CAD", "v1.0"). Aliases: the
+  text             — the string to mark (e.g. "PN-42", "Chudware", "v1.0"). Aliases: the
                      compiler also accepts "string" or "value".
   refs.target_face — the PLANAR face to mark. Address it in plain words, e.g.
                      {"of":"face","side":"top"} or {"of":"face","side":"front"}, or the
@@ -56,7 +56,7 @@ TYPICAL USAGE — engrave a part number on the top of a block:
 Emboss a raised logo on a face, shifted up-left with a second label below:
 [
  {"op":"add_feature","feature":{"type":"text","name":"Logo",
-  "params":{"text":"AI-CAD","height":{"value":6,"expr":null},
+  "params":{"text":"Chudware","height":{"value":6,"expr":null},
             "depth":{"value":0.8,"expr":null},"mode":"emboss",
             "offset":[0,8]},
   "refs":{"target_face":{"of":"face","side":"front"}}}},

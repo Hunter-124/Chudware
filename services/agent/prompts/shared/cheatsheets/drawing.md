@@ -10,7 +10,7 @@ ONE-SHOT (preferred starting point - tiny, ideal for small/local models):
   "model_items":true,                            // auto-dimension every ortho view (default true)
   "hole_callouts":true,                          // add "n x (diameter)d" callouts to holes
   "sections":[{"parent":"front","axis":"vertical","mode":"half"}],  // optional auto-sections
-  "title":{"title":"BRACKET","drawn_by":"AI-CAD","material":"AL 6061","scale":"1:1","rev":"A"}
+  "title":{"title":"BRACKET","drawn_by":"Chudware","material":"AL 6061","scale":"1:1","rev":"A"}
 }}
 
 `sections` cut a parent view through its centre - NO sheet-mm math needed. Each: {"parent":"front"|view_id, "axis":"vertical"|"horizontal", "mode":"full"|"half", "reverse":false, "label":"A"}.

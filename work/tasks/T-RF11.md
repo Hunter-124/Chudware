@@ -30,4 +30,4 @@ this node owns app.cpp exclusively within wave 2 — sequence it to land FIRST.
 
 - [x] Ribbon dispatch is table-driven; app.cpp shrinks materially.
 - [x] All ~150 ribbon commands still route (feature_surface_audit green).
-- [x] Behavior unchanged (AI_CAD_SHOT scenarios); gate.sh green; REFACTOR_LOG handoff.
+- [x] Behavior unchanged (CHUDWARE_SHOT scenarios); gate.sh green; REFACTOR_LOG handoff.

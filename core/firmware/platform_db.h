@@ -8,7 +8,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad::firmware {
+namespace chudware::firmware {
 
 // Map a free-form mcu_family string to a canonical capability key
 // (stm32f4/stm32f1/nrf52/rp2040/esp32/cortex-m — unknown → cortex-m).
@@ -27,4 +27,4 @@ nlohmann::json capability_matrix();
 // generic Cortex-M platform exactly like the Python module.
 std::string get_platform_file(const std::string& mcu_family);
 
-}  // namespace aicad::firmware
+}  // namespace chudware::firmware

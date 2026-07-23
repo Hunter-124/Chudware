@@ -1,7 +1,7 @@
 # Contract: `.step+` container — v1
 
-> AI-CAD's native file. A ZIP that travels like a STEP file: any other CAD opens the embedded
-> `geometry.step`; AI-CAD gets the full parametric document, studies, and AI memory back.
+> Chudware's native file. A ZIP that travels like a STEP file: any other CAD opens the embedded
+> `geometry.step`; Chudware gets the full parametric document, studies, and AI memory back.
 
 ## 1. ZIP layout
 

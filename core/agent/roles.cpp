@@ -19,7 +19,7 @@
 
 namespace fs = std::filesystem;
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 
 // Ordered catalog for Settings → AI → Prompts and load_prompt().
@@ -101,7 +101,7 @@ std::string read_text(const fs::path& path) {
 
 fs::path builtin_dir(const std::string& prompts_dir) {
     if (!prompts_dir.empty()) return fs::path(prompts_dir);
-    const char* env = std::getenv("AI_CAD_PROMPTS_DIR");
+    const char* env = std::getenv("CHUDWARE_PROMPTS_DIR");
     if (env && env[0]) return fs::path(env);
     return fs::path("agent") / "prompts";
 }
@@ -377,4 +377,4 @@ std::string load_cheatsheet(const std::string& feature_type, const std::string& 
 }
 
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware

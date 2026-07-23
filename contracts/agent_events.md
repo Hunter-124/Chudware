@@ -37,8 +37,8 @@
 
 ## 1. Storage & transport
 
-**Location:** `~/.local/share/AI-CAD/cache/runs/<run_id>/events.jsonl` (Linux/macOS)
-or `%APPDATA%\AI-CAD\cache\runs\<run_id>\events.jsonl` (Windows).
+**Location:** `~/.local/share/Chudware/cache/runs/<run_id>/events.jsonl` (Linux/macOS)
+or `%APPDATA%\Chudware\cache\runs\<run_id>\events.jsonl` (Windows).
 
 One JSON object per line. The DAG executor writes this file via its `emit` callback
 using `EventJournal` (services/dag/event_journal.py — created by T-F17). The built-in
@@ -47,7 +47,7 @@ agent loop (services/agent/loop.py) already writes to the same path pattern via
 wrapping a DAG run.
 
 **Replay:** The mission-control panel (`host/src/ui/mission_control_panel.cpp`) scans
-`~/.local/share/AI-CAD/cache/runs/` for directories containing `events.jsonl` and
+`~/.local/share/Chudware/cache/runs/` for directories containing `events.jsonl` and
 presents them as replayable runs. Loading is triggered on panel open; it re-reads the
 file if the mtime changed.
 
@@ -263,8 +263,8 @@ Producers: core/agent/machine.cpp (build_plan after plan pass; checklist from pl
 | execute_as | agent|swarm | — | how an approved plan resumes |
 | corporate_force | bool | false (true when mode=swarm) | force subagent-manager/corporate |
 | scope | obj | {} | edit targeting {doc_id, feature_ids?, selection?, section?} |
-| advisor | bool | true | advisor on for run + subagents; config agent.advisor default true, env AI_CAD_ADVISOR honored |
-Mode→role: agent→default, plan→planning, swarm→default(+corporate), edit→task, ask→default(read-only). Mode→tools (Python copilot_mode_tools): ask=read-only; plan=read+plan no mutation; edit=doc mutators no new_part/mission; agent=full+delegate; swarm=full+corporate/delegate. Subagents available in every mode. Plan gate: mode=plan → plan_only run → GUI drawPlanApproveCard (Execute as Agent/Swarm/Cancel) → resend approved_plan+execute_as. C++ (run.cpp/libaicad.cpp) parses these; absent mode = legacy byte-identical.
+| advisor | bool | true | advisor on for run + subagents; config agent.advisor default true, env CHUDWARE_ADVISOR honored |
+Mode→role: agent→default, plan→planning, swarm→default(+corporate), edit→task, ask→default(read-only). Mode→tools (Python copilot_mode_tools): ask=read-only; plan=read+plan no mutation; edit=doc mutators no new_part/mission; agent=full+delegate; swarm=full+corporate/delegate. Subagents available in every mode. Plan gate: mode=plan → plan_only run → GUI drawPlanApproveCard (Execute as Agent/Swarm/Cancel) → resend approved_plan+execute_as. C++ (run.cpp/libchudware.cpp) parses these; absent mode = legacy byte-identical.
 
 ## Mid-run steering (2026-07-19, additive)
 - `agent_steer` (new kind): emitted by the C++ run machine when a queued user steering

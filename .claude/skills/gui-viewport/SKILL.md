@@ -1,6 +1,6 @@
 ---
 name: gui-viewport
-description: Billet (formerly AI-CAD) 3D viewport specialist — OpenGL rendering, orbit camera, mesh display, face/edge picking, selection highlighting, HUD overlays, section views, splat/point rendering. Use for any task about the 3D view, what's drawn in it, how clicks select geometry, or viewport visual effects. Workers dispatched by gui-orchestrator read this file first instead of searching the repo.
+description: Chudware (formerly Chudware) 3D viewport specialist — OpenGL rendering, orbit camera, mesh display, face/edge picking, selection highlighting, HUD overlays, section views, splat/point rendering. Use for any task about the 3D view, what's drawn in it, how clicks select geometry, or viewport visual effects. Workers dispatched by gui-orchestrator read this file first instead of searching the repo.
 ---
 
 # GUI Viewport Specialist
@@ -37,7 +37,7 @@ the selection. Per-doc state lives on `AppState::DocTab` (`host/src/core/app_sta
   (`scripts/icon_pipeline.py`) — changing its background/alpha behavior breaks icon generation.
 - Colors: never hardcode — pull from `ui_theme` (`host/src/ui_theme.h`);
   `scripts/gui_lint.py --rule theme` fails the gate otherwise.
-- Headless render modes exist for testing: `Billet --render <in.stl> <out.png>` and
+- Headless render modes exist for testing: `Chudware --render <in.stl> <out.png>` and
   `--contact <in.stl> <out.png>`.
 
 ## In-context component edit (ghost mesh)
@@ -60,7 +60,7 @@ the selection. Per-doc state lives on `AppState::DocTab` (`host/src/core/app_sta
 
 ```bash
 ./build.sh                        # repo root; 2–3 min
-AI_CAD_SHOT=m1 ./host/build-linux/bin/Billet --ui-screenshot scratch/vp_smoke.png
+CHUDWARE_SHOT=m1 ./host/build-linux/bin/Chudware --ui-screenshot scratch/vp_smoke.png
 ```
 The `m1` scenario (box + fillet + edit + undo, `host/src/ui/scenarios.cpp`) exercises the
 viewport end to end — use it to confirm nothing crashes, not to judge visuals. Never run git;

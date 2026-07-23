@@ -4,25 +4,25 @@ run_assembly_design builds each part in its own doc, doc_saves it, then creates 
 assembly doc, inserts the parts as positioned components, and doc_saves the assembly to
 `asm_path` (now returned in the agent_run result). The host opens THAT file as a tab.
 
-This harness exercises the same doc-level op sequence directly via libaicad (no LLM), then
+This harness exercises the same doc-level op sequence directly via libchudware (no LLM), then
 asserts the produced assembly .step+ is a valid aicad.asm/1 container referencing the parts.
 """
 import ctypes, json, os, sys, tempfile, zipfile
 
-DIST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dist", "AI-CAD")
+DIST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dist", "Chudware")
 os.add_dll_directory(DIST)
-lib = ctypes.WinDLL(os.path.join(DIST, "libaicad.dll"))
-lib.aicad_call.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p)]
-lib.aicad_call.restype = ctypes.c_int
-lib.aicad_free.argtypes = [ctypes.c_char_p]
+lib = ctypes.WinDLL(os.path.join(DIST, "libchudware.dll"))
+lib.chudware_call.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p)]
+lib.chudware_call.restype = ctypes.c_int
+lib.chudware_free.argtypes = [ctypes.c_char_p]
 
 
 def call(method, params):
     out = ctypes.c_char_p()
-    rc = lib.aicad_call(method.encode(), json.dumps(params).encode(), ctypes.byref(out))
+    rc = lib.chudware_call(method.encode(), json.dumps(params).encode(), ctypes.byref(out))
     raw = out.value.decode() if out.value else ""
     if out.value:
-        lib.aicad_free(out)
+        lib.chudware_free(out)
     data = json.loads(raw) if raw else {}
     if rc != 0 or (isinstance(data, dict) and data.get("code")):
         raise RuntimeError(f"{method} failed rc={rc}: {raw[:300]}")
@@ -85,10 +85,10 @@ print("PASS: assembly file is a valid aicad.asm/1 the host can open via the Pyth
 # 4) Confirm the C++ core REJECTS opening this assembly with code "unsupported" — the exact
 #    trigger the host relies on to route the assembly open to the Python worker (worker_client.cpp).
 out = ctypes.c_char_p()
-rc = lib.aicad_call(b"doc_open", json.dumps({"path": asm_path}).encode(), ctypes.byref(out))
+rc = lib.chudware_call(b"doc_open", json.dumps({"path": asm_path}).encode(), ctypes.byref(out))
 resp = json.loads(out.value.decode()) if out.value else {}
 if out.value:
-    lib.aicad_free(out)
+    lib.chudware_free(out)
 code = resp.get("code", "")
 print(f"[ok] C++ doc_open(assembly) -> rc={rc} code={code!r}")
 assert code == "unsupported", f"expected 'unsupported' (route-to-Python trigger), got {code!r}"

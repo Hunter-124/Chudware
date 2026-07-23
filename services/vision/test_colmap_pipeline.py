@@ -9,7 +9,7 @@ Behaviour
 
 The bracket_fixture is at corpora/reveng/bracket_fixture/ (8 PNG renders +
 camera_poses.json).  The test locates it relative to the repo root via
-AICAD_ROOT env var (defaults to two levels above this file).
+CHUDWARE_ROOT env var (defaults to two levels above this file).
 """
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ import pytest
 # ---------------------------------------------------------------------------
 
 def _repo_root() -> Path:
-    env = os.environ.get("AICAD_ROOT")
+    env = os.environ.get("CHUDWARE_ROOT")
     if env:
         return Path(env)
     # services/vision/test_colmap_pipeline.py  → go up 3 levels

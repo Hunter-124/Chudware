@@ -1,6 +1,6 @@
 """Cost-out MCP tools: made-part cost estimate + on-demand manufacturing quotes (workstream B).
 
-Thin MCP adapters over the C++ core (libaicad ``request_quote`` RPC via
+Thin MCP adapters over the C++ core (libchudware ``request_quote`` RPC via
 :mod:`services.mcp.core_bridge`). ``cam_cost_estimate`` still rides the oracle
 cost_model — the C++ port (core/sourcing/cost.cpp) dispatched via the
 ``estimate_made_cost`` worker-RPC method (T-RF18); the oracle module was deleted.
@@ -131,7 +131,7 @@ def register_cost_tools(mcp: FastMCP) -> None:
                     doc_id = opened.get("doc_id") if isinstance(opened, dict) else None
                     if doc_id:
                         step = os.path.join(tempfile.gettempdir(),
-                                            f"aicad_quote_{os.getpid()}.step")
+                                            f"chudware_quote_{os.getpid()}.step")
                         cb.call("export_file", {"doc_id": doc_id, "path": step, "format": "step"})
                         part_file = step
                 except Exception:  # noqa: BLE001 (export unavailable -> pass the doc path through)

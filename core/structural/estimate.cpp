@@ -13,7 +13,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace aicad::structural {
+namespace chudware::structural {
 
 const char* kEstimateDisclaimer =
     "Preliminary cost estimate — not a contractor bid.  "
@@ -141,7 +141,7 @@ RateTable load_rates(const std::string& rates_path) {
     RateTable rates;
     std::string path = rates_path;
     if (path.empty()) {
-        if (const char* env = std::getenv("AICAD_STRUCTURAL_RATES")) path = env;
+        if (const char* env = std::getenv("CHUDWARE_STRUCTURAL_RATES")) path = env;
     }
     if (path.empty()) return rates;
     std::ifstream fh(path);
@@ -284,4 +284,4 @@ nlohmann::json estimate(const StructureDoc& doc, const RateTable& rates) {
             {"disclaimer", kEstimateDisclaimer}};
 }
 
-}  // namespace aicad::structural
+}  // namespace chudware::structural

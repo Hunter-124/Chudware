@@ -13,7 +13,7 @@
 
 namespace fs = std::filesystem;
 
-namespace aicad {
+namespace chudware {
 namespace sourcing {
 
 namespace {
@@ -110,4 +110,4 @@ json register_local_cad(const std::string& supplier, const std::string& part_num
 }
 
 }  // namespace sourcing
-}  // namespace aicad
+}  // namespace chudware

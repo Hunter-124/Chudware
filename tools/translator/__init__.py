@@ -1,4 +1,4 @@
-"""AI-CAD learned-translator track (Pillar 13).
+"""Chudware learned-translator track (Pillar 13).
 
 Stage-0 home: the frozen `gsl-ser/v1` serialization (`gsl_ser`), the groundedness
 seam shared with T-H4 (`groundedness`), and the slot-fidelity eval harness (`eval/`).

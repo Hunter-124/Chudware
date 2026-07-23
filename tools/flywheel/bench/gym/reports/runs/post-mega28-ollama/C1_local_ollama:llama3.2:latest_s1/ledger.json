@@ -3166,7 +3166,7 @@
             "name": "rocket_plane_airframe",
             "paths": [
               "/home/hunter/Repositories/CAD/reports/runs/gym_C1_local_ollama:llama3.2:latest_s1/parts/rocket_plane_airframe_-cpp0000000f.step+",
-              "/home/hunter/Documents/AI-CAD/rocket_plane_airframe_-cpp0000000f.step+"
+              "/home/hunter/Documents/Chudware/rocket_plane_airframe_-cpp0000000f.step+"
             ]
           }
         ]

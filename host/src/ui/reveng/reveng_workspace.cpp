@@ -66,7 +66,7 @@ void feedRevEngEvent(const RevEngEvent& ev) {
 void seedSplatFixture() {
     RevEngState& s = S();
     if (s.splatLoaded) return;
-    const char* repo = std::getenv("AI_CAD_REPO");
+    const char* repo = std::getenv("CHUDWARE_REPO");
     std::string base = repo ? std::string(repo) : std::string(".");
     std::string plyPath = base + "/host/tests/fixtures/splat_tiny.ply";
     s.splatLoaded = true;
@@ -122,7 +122,7 @@ static void loadSessions(AppState& st, bool force = false) {
     });
 }
 
-// Resolve a session-relative artifact path against $AICAD_REVENG_DIR/<sid>/.
+// Resolve a session-relative artifact path against $CHUDWARE_REVENG_DIR/<sid>/.
 static std::string resolveSessionPath(const std::string& session_id,
                                       const std::string& rel_or_abs) {
     if (rel_or_abs.empty()) return {};
@@ -130,17 +130,17 @@ static std::string resolveSessionPath(const std::string& session_id,
 #if defined(_WIN32)
     if (rel_or_abs.size() > 2 && rel_or_abs[1] == ':') return rel_or_abs;
 #endif
-    const char* override = std::getenv("AICAD_REVENG_DIR");
+    const char* override = std::getenv("CHUDWARE_REVENG_DIR");
     std::string root;
     if (override && override[0]) {
         root = override;
     } else {
         const char* xdg = std::getenv("XDG_DATA_HOME");
-        if (xdg && xdg[0]) root = std::string(xdg) + "/AI-CAD/reveng";
+        if (xdg && xdg[0]) root = std::string(xdg) + "/Chudware/reveng";
         else {
             const char* home = std::getenv("HOME");
             root = (home && home[0] ? std::string(home) : std::string(".")) +
-                   "/.local/share/AI-CAD/reveng";
+                   "/.local/share/Chudware/reveng";
         }
     }
     if (!root.empty() && root.back() != '/') root += '/';
@@ -244,7 +244,7 @@ static void ensureSplatForSession(RevEngState& s) {
         want = s.artifactSplatPath;
     } else if (s.recon.done) {
         // Explicit demo fallback — only when reconstruction completed with no splat_path.
-        const char* repo = std::getenv("AI_CAD_REPO");
+        const char* repo = std::getenv("CHUDWARE_REPO");
         std::string base = repo ? std::string(repo) : std::string(".");
         want = base + "/host/tests/fixtures/splat_tiny.ply";
         demoFallback = true;

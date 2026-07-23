@@ -882,7 +882,7 @@ const PMFormDef* pmFormForCommand(const std::string& cmdId, std::string& mode) {
     if (cmdId == "surf_untrim")       return pmFindForm("surf_untrim");
     if (cmdId == "surf_delete_face")  return pmFindForm("surf_delete_face");
     if (cmdId == "surf_replace_face") return pmFindForm("surf_replace_face");
-    // Primitive quick-start commands (AI-CAD extensions; not in the C14 ribbon but reachable
+    // Primitive quick-start commands (Chudware extensions; not in the C14 ribbon but reachable
     // via the M1 scenario / future "Insert > Primitive" entries).
     if (cmdId == "box")           return pmFindForm("box");
     if (cmdId == "cylinder")      return pmFindForm("cylinder");

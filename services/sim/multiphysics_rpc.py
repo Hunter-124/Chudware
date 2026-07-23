@@ -99,7 +99,7 @@ def _sim_caps(params: dict) -> dict:
         caps["ccx"] = {"found": bool(ccx), "path": ccx or "",
                        "hint": "" if ccx else
                        "CalculiX (ccx) not on PATH — buckling/contact studies need it. "
-                       "Install ccx or set AI_CAD_CCX."}
+                       "Install ccx or set CHUDWARE_CCX."}
     except Exception as e:  # noqa: BLE001
         caps["ccx"] = {"found": False, "path": "", "hint": f"fea_advanced unavailable: {e}"}
     try:

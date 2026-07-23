@@ -711,8 +711,8 @@ def test_live_ac7_text_wrapped_fw_build_json():
     evidence = {
         "text": (
             '{\n  "success": true,\n'
-            '  "elf_path": "/tmp/AI-CAD/firmware/bc70b9ea15b4/build/firmware.elf",\n'
-            '  "map_path": "/tmp/AI-CAD/firmware/bc70b9ea15b4/build/firmware.map",\n'
+            '  "elf_path": "/tmp/Chudware/firmware/bc70b9ea15b4/build/firmware.elf",\n'
+            '  "map_path": "/tmp/Chudware/firmware/bc70b9ea15b4/build/firmware.map",\n'
             '  "stderr": "-- The C compiler identification is GNU 15.2.0'
         ),
         "source": "ledger_tool_call",
@@ -734,7 +734,7 @@ def test_live_ac7_artifact_fallback(monkeypatch):
     led = _MemLedger()
     led.append("builder", "artifact", {
         "ac": "AC7", "success": True,
-        "elf_path": "/tmp/AI-CAD/firmware/bc70b9ea15b4/build/firmware.elf",
+        "elf_path": "/tmp/Chudware/firmware/bc70b9ea15b4/build/firmware.elf",
         "verdict": "PASS",
     })
     # Also seed a text-wrapped prior tool_call that normalizes to success.
@@ -744,7 +744,7 @@ def test_live_ac7_artifact_fallback(monkeypatch):
         "ok": True,
         "result": (
             '{"success": true, '
-            '"elf_path": "/tmp/AI-CAD/firmware/bc70b9ea15b4/build/firmware.elf", '
+            '"elf_path": "/tmp/Chudware/firmware/bc70b9ea15b4/build/firmware.elf", '
             '"returncode": 0}'
         ),
     })

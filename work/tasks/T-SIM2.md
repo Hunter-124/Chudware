@@ -40,13 +40,13 @@ Current plumbing:
       ("Show contour"). Deformed-shape scale factor optional but nice.
 - [ ] Works for static (stress + displacement) and modal (mode shape displacement) today;
       field-generic so thermal drops in later.
-- [ ] Headless verify: AI_CAD_SHOT scenario capturing a contour-rendered study on a demo
+- [ ] Headless verify: CHUDWARE_SHOT scenario capturing a contour-rendered study on a demo
       part (bracket under load), light + dark, eyeballed and described in the work note.
 - [ ] scripts/gate.sh green (issue #16 known failures excepted); `graphify update .` run.
 
 ## Driver notes
 
-- Python test venv: `~/.local/share/AI-CAD/mcp-venv/bin/python`.
+- Python test venv: `~/.local/share/Chudware/mcp-venv/bin/python`.
 - graphify rule: `graphify query "<question>"` before raw-file reading.
 - Branch task/T-SIM2-contour-results, worktree ../CAD-T-SIM2. Stop at status: review.
 - ADDITIVE SEAMS ONLY vs T-SIM1 (runs in parallel): do not modify fea_thermal files;
@@ -55,13 +55,13 @@ Current plumbing:
   legend/toggles live in the sim panel column, the contour lives in the viewport.
 
 ## Progress log
-- 2026-07-05 04:28 UTC [opus-vosk] INVESTIGATION (opus-vosk): T-SIM2's premise (no spatial FEA visualization) points at the wrong panel. The full color-mapped contour pipeline ALREADY EXISTS and is live in the Simulate workspace: backend core/sim/overlay.cpp static_overlay/modal_overlay/fatigue_overlay skin the tet-volume boundary to surface tris + map nodal scalars (von_mises/disp/fos/principals) + displacement into an AICM (SCLR/DISP chunks); ui/imgui viewport.cpp viewportLoadResultAicm -> C19 colormap LUT + deformed shape; legend.cpp draws the jet min/max/units bar; sim_manager.cpp drawResultControls has a 'Show colormap' toggle + field combo (thermal-ready kFlowFields incl temperature) + deform slider. Built in commits 845b9217 (P55b FEA overlay) + 7f3516bd/7aee4805 (T-G8/G9 SimManager port). Genuine remaining gaps I will close: (1) no documented size cap/decimation in overlay.cpp [DoD-explicit]; (2) AI_CAD_SHOT=fea uses a box not a bracket + no light/dark pair; (3) 'Show colormap' checkbox uses a per-frame local bool (state not reflected). NOTE: T-SIM3 concurrently edits sim_manager.cpp -> my only edits there are the contour toggle fix + legend, additive seams. Question for lead surfaced separately: is the floating sim_panel.cpp studies list intended to also carry contour, or is the Simulate workspace the primary contour UI?
+- 2026-07-05 04:28 UTC [opus-vosk] INVESTIGATION (opus-vosk): T-SIM2's premise (no spatial FEA visualization) points at the wrong panel. The full color-mapped contour pipeline ALREADY EXISTS and is live in the Simulate workspace: backend core/sim/overlay.cpp static_overlay/modal_overlay/fatigue_overlay skin the tet-volume boundary to surface tris + map nodal scalars (von_mises/disp/fos/principals) + displacement into an AICM (SCLR/DISP chunks); ui/imgui viewport.cpp viewportLoadResultAicm -> C19 colormap LUT + deformed shape; legend.cpp draws the jet min/max/units bar; sim_manager.cpp drawResultControls has a 'Show colormap' toggle + field combo (thermal-ready kFlowFields incl temperature) + deform slider. Built in commits 845b9217 (P55b FEA overlay) + 7f3516bd/7aee4805 (T-G8/G9 SimManager port). Genuine remaining gaps I will close: (1) no documented size cap/decimation in overlay.cpp [DoD-explicit]; (2) CHUDWARE_SHOT=fea uses a box not a bracket + no light/dark pair; (3) 'Show colormap' checkbox uses a per-frame local bool (state not reflected). NOTE: T-SIM3 concurrently edits sim_manager.cpp -> my only edits there are the contour toggle fix + legend, additive seams. Question for lead surfaced separately: is the floating sim_panel.cpp studies list intended to also carry contour, or is the Simulate workspace the primary contour UI?
 - 2026-07-05 [opus-sweep] FINDING (flagged by Hunter): work/questions/T-SIM2-shots/contour_light.png
   and contour_dark.png are stale — captured before the day-10..12 GUI polish wave (T-G14/16/21/22/
   23/24/25) and show the old chrome. Rebuilt AI-CAD2 on Windows (T-G25's doc_tabs.h fix was the
-  build blocker, now on master) and re-ran `AI_CAD_SHOT=fea_overlay` against the committed
+  build blocker, now on master) and re-ran `CHUDWARE_SHOT=fea_overlay` against the committed
   contracts/fixtures/sim2_cantilever_result.aicm fixture to recapture — but found the FEA legend
-  (and separately, the orientation-gizmo cube) currently render HIDDEN behind the ShopCraft Copilot
+  (and separately, the orientation-gizmo cube) currently render HIDDEN behind the Chudware Copilot
   panel: both are positioned off the viewport rect's nominal right edge (viewport.cpp's `b.x`),
   which no longer accounts for the Copilot panel's width now that it renders on top. Confirmed via
   a temporary debug probe that legendOn is true every frame — this is a draw-position bug, not a
@@ -69,7 +69,7 @@ Current plumbing:
   current committed ones) and did NOT attempt a fix (viewport-rect/layout code affects several
   other elements — gestures, view-selector, heads-up toolbar — and deserves its own scoped look).
   Repro: build ui/imgui (see docs/BUILD_WINDOWS.md), stage build/windows-occt DLLs next to
-  AI-CAD2.exe, run `AI_CAD_SHOT=fea_overlay AI_CAD_REPO=<repo root> AI-CAD2.exe --shot out.png`
+  AI-CAD2.exe, run `CHUDWARE_SHOT=fea_overlay CHUDWARE_REPO=<repo root> AI-CAD2.exe --shot out.png`
   with the Copilot panel open (default state) — legend/gizmo absent; likely present if the panel
   is collapsed. Next step: fix the viewport-rect calc (or give legend/gizmo their own Copilot-aware
   bound) in ui/imgui/src/ui/viewport.cpp, then recapture both this task's contact shots and T-G25's.

@@ -27,7 +27,7 @@ the model does NOT capture: heat spreading beyond the component footprint throug
 sink base overhang (conservative — a large overhung sink performs slightly better
 than modeled), and sink-to-board radiation/bypass. Both are listed in assumptions.
 
-When no sim-enabled libaicad is loadable, the tool degrades HONESTLY to
+When no sim-enabled libchudware is loadable, the tool degrades HONESTLY to
 mode="network_estimate": achieved_tj = T_amb + P*(theta_jc + R_tim + R_sa) — a
 series-resistance hand calc that IGNORES board coupling/neighbor heating, flagged as
 such in warnings.
@@ -76,7 +76,7 @@ def _err(reason: str, hint: str = "", next_actions: Optional[list] = None,
 
 
 # --------------------------------------------------------------------------- pure helpers
-# Engine-free so tests can drive the generator/physics without OCP/libaicad.
+# Engine-free so tests can drive the generator/physics without OCP/libchudware.
 
 
 def validate_sink_spec(spec: dict) -> list:
@@ -370,7 +370,7 @@ def heatsink_select_impl(component_ref: str,
         warnings.append(
             "network_estimate mode: Tj = Ta + P*(theta_jc + R_tim + R_sa) — "
             "board spreading and NEIGHBOR HEATING are ignored (optimistic). "
-            "Run ecad_thermal_handoff() live (sim-enabled libaicad) for the "
+            "Run ecad_thermal_handoff() live (sim-enabled libchudware) for the "
             "FEA re-solve per candidate.")
 
     conv_base, fixtures = _base_convection(ctx)
@@ -572,7 +572,7 @@ def register_heatsink_tools(mcp) -> None:
            convection h_eff = 1/((R_tim + R_sa) * A_top) over the component top —
            board spreading + neighbor heating stay fully in the FEA re-solve.
         3. RE-SOLVE — one thermal solve per candidate, sequentially, REUSING the
-           cached board mesh (geometry unchanged). Without a sim-enabled libaicad
+           cached board mesh (geometry unchanged). Without a sim-enabled libchudware
            the tool degrades honestly to mode="network_estimate"
            (Tj = Ta + P*(theta_jc + R_tim + R_sa); board coupling ignored, flagged).
         4. RANKED TABLE — {candidate, achieved_tj_c, delta_vs_target_c, mass_g,

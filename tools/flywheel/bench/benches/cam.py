@@ -28,7 +28,7 @@ Two evaluation paths:
     by calling `cam_simulate` for real, so the live path is a genuine, non-recorded check.
     Guarded skip-if-no-core, mirroring `regen_fix`'s live path and gate.sh's OCCT-absent
     skip. Never hardcodes a sibling worktree's `.so` path -- resolution is entirely
-    `mcp_server.core_bridge`'s own `$AI_CAD_LIBAICAD` / `$AI_CAD_DIST` / platform search.
+    `mcp_server.core_bridge`'s own `$CHUDWARE_LIBCHUDWARE` / `$CHUDWARE_DIST` / platform search.
 
 The deterministic baseline is not a separately-run competing strategy here: the fixtures
 ARE the deterministic candidate's own recorded results (a fixed roughing+finishing op-plan
@@ -244,7 +244,7 @@ def make_live_sim() -> Optional[LiveSim]:
     """Build a `live_sim` callable if the C++ core is available; else None (skip).
 
     Never hardcodes a sibling worktree's `.so` path -- resolution goes entirely through
-    `mcp_server.core_bridge`'s own `$AI_CAD_LIBAICAD` / `$AI_CAD_DIST` / platform search.
+    `mcp_server.core_bridge`'s own `$CHUDWARE_LIBCHUDWARE` / `$CHUDWARE_DIST` / platform search.
     """
     try:
         from mcp_server import core_bridge as cb

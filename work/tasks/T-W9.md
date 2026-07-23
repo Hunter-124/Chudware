@@ -90,7 +90,7 @@ integration target for this task. Changes vs the original spec:
 - `precheck(study, doc_geom)` — BC lint (no fixture/load → blocker, all-fixed/dangling → action), mesh-size suggestion from min fillet/wall, beam_calc_raw anchor (aspect ≥ 3 → confident; else "no anchor"). Returns aicad.advisory/1-shaped items.
 - `postcheck(study, precheck_items, doc_geom)` — margin-policy verdict (PASS/WARN/FAIL per SF), FEA/anchor divergence WARN (>5× ratio, both directions), Kt-pattern suggestion for fillet/sharp-edge max-stress faces.
 - `narrate_postcheck(r)` — additive text appended to describe_results output.
-- `AI_CAD_SIM_PRECHECK_BLOCK` env gate (default on) — deliberate §9.3 deviation documented in module docstring.
+- `CHUDWARE_SIM_PRECHECK_BLOCK` env gate (default on) — deliberate §9.3 deviation documented in module docstring.
 
 **engine_oracle/sim/margin_policy.json** (new):
 metal_steel SF=1.5/2.0, metal_aluminium SF=1.5/2.5, metal_titanium SF=1.4/2.0, polymer SF=2.0/3.0, general SF=2.0/3.0. Sources: Shigley 10th §6-12.

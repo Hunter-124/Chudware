@@ -12,7 +12,7 @@
 #include <string>
 #include <vector>
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 
 enum class Domain {
@@ -56,4 +56,4 @@ std::vector<std::string> tool_classes_for_domain(Domain d);
 std::vector<std::string> context_sheets_for_domain(Domain d);
 
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware

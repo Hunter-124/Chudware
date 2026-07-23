@@ -6,8 +6,8 @@ flight-computer design (MCU + 3V3 buck + MPU6050 + BMP280 + LIS3MDL + NEO-6M).
 ## Run
 
 ```bash
-AI_CAD_ECAD_HEAVY_BUDGET_S=180 \
-  /home/hunter/.local/share/AI-CAD/mcp-venv/bin/python \
+CHUDWARE_ECAD_HEAVY_BUDGET_S=180 \
+  /home/hunter/.local/share/Chudware/mcp-venv/bin/python \
   scripts/bench_flight_computer.py
 ```
 
@@ -31,7 +31,7 @@ Exit code `0` when no leg is `FAIL` (`SKIP` / `WARN` allowed).
 
 ## Artifacts
 
-Written under this directory (override with `AICAD_FC_OUT`):
+Written under this directory (override with `CHUDWARE_FC_OUT`):
 
 - `summary.json` — machine-readable leg table + wall_ms
 - `VERDICT.txt` — human card
@@ -41,7 +41,7 @@ Written under this directory (override with `AICAD_FC_OUT`):
 
 ## Gate / simsuite wiring (Main)
 
-- Env-gate: `AICAD_RUN_BENCH_FC=1` → run `scripts/bench_flight_computer.py`
+- Env-gate: `CHUDWARE_RUN_BENCH_FC=1` → run `scripts/bench_flight_computer.py`
 - Do **not** hard-fail the gate on `SKIP` (Renode/openEMS/build123d optional paths)
 - simsuite: optional thin wrapper that shells this script and maps
   `summary.json` legs into the simsuite case list

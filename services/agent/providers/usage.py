@@ -62,7 +62,7 @@ DASHBOARD_URLS = {
 XAI_SOURCE_JWT = "jwt_inference"
 XAI_SOURCE_BROWSER = "browser_scrape"
 XAI_SOURCE_API = "api"
-# Prefer live billing + userinfo. Override with env AICAD_XAI_USAGE_SOURCE.
+# Prefer live billing + userinfo. Override with env CHUDWARE_XAI_USAGE_SOURCE.
 XAI_USAGE_SOURCE = XAI_SOURCE_API
 
 XAI_USERINFO_URL = "https://auth.x.ai/oauth2/userinfo"
@@ -287,7 +287,7 @@ def _xai_auth_headers(cred: dict, *, proxy: bool = False) -> dict[str, str]:
         headers["x-grok-client-version"] = "0.1.210"
         headers["x-grok-client-mode"] = "headless"
         headers["x-authenticateresponse"] = "authenticate-response"
-        headers["x-grok-client-identifier"] = "billet"
+        headers["x-grok-client-identifier"] = "chudware"
         uid = cred.get("account_id") or cred.get("user_id") or cred.get("sub")
         if uid is not None and str(uid).strip():
             headers["x-userid"] = str(uid).strip()
@@ -1758,7 +1758,7 @@ def fetch_xai_usage_api(cred: dict) -> dict:
                 rate_rows = list(liveish or cred["last_usage"])
 
         import os as _os
-        probe = str(_os.environ.get("AICAD_XAI_USAGE_PROBE") or "").strip().lower() in (
+        probe = str(_os.environ.get("CHUDWARE_XAI_USAGE_PROBE") or "").strip().lower() in (
             "1", "true", "yes", "on",
         )
         if not rate_rows and not usage_rows and probe:
@@ -1838,12 +1838,12 @@ def fetch_xai_usage(cred: dict) -> dict:
     """Dispatch xAI usage by pluggable source enum.
 
     Default is live API (cli-chat-proxy billing + userinfo). Env
-    ``AICAD_XAI_USAGE_SOURCE`` may force ``api`` / ``browser_scrape`` /
+    ``CHUDWARE_XAI_USAGE_SOURCE`` may force ``api`` / ``browser_scrape`` /
     ``jwt_inference``.
     """
     import os as _os
     src = (
-        str(_os.environ.get("AICAD_XAI_USAGE_SOURCE") or "").strip().lower()
+        str(_os.environ.get("CHUDWARE_XAI_USAGE_SOURCE") or "").strip().lower()
         or str(XAI_USAGE_SOURCE or "").strip().lower()
         or XAI_SOURCE_API
     )

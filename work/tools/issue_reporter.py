@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""issue_reporter.py — AI-guided issue/idea intake GUI for AI-CAD contributors.
+"""issue_reporter.py — AI-guided issue/idea intake GUI for Chudware contributors.
 
 Tkinter (stdlib only — no pip installs needed). Draft a bug/idea report, optionally
 ask the local `claude` CLI (headless `claude -p`, researching the repo itself) to
@@ -8,7 +8,7 @@ issue + a work/backlog task so it actually enters the plan instead of getting lo
 in chat history. A live graphify preview panel helps you ground the report in real
 files before asking the AI.
 
-This is internal dev-team tooling for BUILDING AI-CAD — separate from the product's
+This is internal dev-team tooling for BUILDING Chudware — separate from the product's
 own MCP server (services/mcp/) and agent loop. It never touches product code.
 
 Run:  python3 work/tools/issue_reporter.py   (or work/report.sh / work/report.bat)
@@ -40,7 +40,7 @@ PY = sys.executable or "python3"
 SEVERITIES = ["low", "medium", "high", "critical"]
 WORKSTREAMS = ["A", "B", "C", "D", "E", "F", "G", "integration", "backlog"]
 
-ELABORATION_PROMPT = """You are helping a contributor to the AI-CAD repo turn a rough bug/idea report into a well-scoped, actionable one. Research the repo as needed (use `graphify query`/`graphify explain` first per this repo's own CLAUDE.md policy, then targeted grep/read) to ground your answer in real files — do not guess.
+ELABORATION_PROMPT = """You are helping a contributor to the Chudware repo turn a rough bug/idea report into a well-scoped, actionable one. Research the repo as needed (use `graphify query`/`graphify explain` first per this repo's own CLAUDE.md policy, then targeted grep/read) to ground your answer in real files — do not guess.
 
 Draft report from the contributor:
 ---
@@ -178,7 +178,7 @@ Suggested workstream: {ws} (AI guess — human should confirm before scheduling)
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("AI-CAD — Report an Issue / Idea")
+        self.title("Chudware — Report an Issue / Idea")
         self.geometry("900x760")
         self.result_queue = queue.Queue()
         self._build_ui()

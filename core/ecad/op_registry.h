@@ -7,10 +7,10 @@
 #include <string>
 #include <vector>
 
-namespace aicad::ecad {
+namespace chudware::ecad {
 
 std::vector<std::string> ecad_op_kinds();
 std::vector<std::string> suggest_ecad_ops(const std::string& unknown, std::size_t n = 5);
 std::string unknown_ecad_op_message(int index, const std::string& k);
 
-}  // namespace aicad::ecad
+}  // namespace chudware::ecad

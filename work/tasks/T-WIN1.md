@@ -18,7 +18,7 @@ The OCCT-free C++ core already compiles under MSVC (windows-core preset;
 been shown to build+run on Win11 after a fix_math.h guard + build.bat staging
 fix. This task takes the FULL app the rest of the way on Windows 10 / MSVC:
 full OCCT core, the ui/imgui GUI, app launch, a part actually rendering, then the
-AI_CAD_SHOT headless capture battery with an honest eyeballed parity report vs
+CHUDWARE_SHOT headless capture battery with an honest eyeballed parity report vs
 Linux.
 
 This task file is being PROPOSED by the gissa session because the WIN workstream
@@ -50,14 +50,14 @@ untouched.
 1. Full OCCT core build under MSVC via the windows-occt preset
    (`cmake --build --preset windows-occt`). Capture the exact first error if it
    breaks; math errors -> check fix_math.h /FI wiring before anything else.
-2. Stage libaicad.dll + OCCT/Netgen sibling DLLs next to the exe (build.bat path
+2. Stage libchudware.dll + OCCT/Netgen sibling DLLs next to the exe (build.bat path
    already handles both layouts) and confirm the host loads the in-process C++
-   engine (no AI_CAD_LIBAICAD override).
+   engine (no CHUDWARE_LIBCHUDWARE override).
 3. Build the ui/imgui GUI on MSVC; fix Windows-only compile/link seams (guarded).
 4. Launch the app; confirm it opens and can create geometry (doc/sketch/extrude
    ops backed by the C++ core, not the Python worker).
 5. Render a part in-app; eyeball it against the Linux render.
-6. Run the AI_CAD_SHOT headless capture battery; produce an honest, eyeballed
+6. Run the CHUDWARE_SHOT headless capture battery; produce an honest, eyeballed
    parity report vs Linux (documented broken stage + exact error is a GOOD result;
    "mostly builds" is NOT).
 7. Docs: fold every real gotcha into docs/BUILD_WINDOWS.md.
@@ -68,7 +68,7 @@ untouched.
 - [ ] Core DLLs stage next to the exe; host loads the in-process C++ engine
 - [ ] ui/imgui GUI builds and the app launches on Windows 10
 - [ ] A part renders in-app
-- [ ] AI_CAD_SHOT headless battery runs; eyeballed Linux-parity report attached to
+- [ ] CHUDWARE_SHOT headless battery runs; eyeballed Linux-parity report attached to
       the progress log (per-stage PASS / documented-break with exact error)
 - [ ] Every Windows fix is a platform seam; Linux build verified untouched
 - [ ] docs/BUILD_WINDOWS.md updated with the real bring-up path + gotchas
@@ -80,7 +80,7 @@ untouched.
   `git stash` in this repo on Windows), windows-board-cp1252-fix.
 - `python3` is not on PATH on this Windows box; use `python` (3.12.10).
 - Robocopy staging in build.bat uses /R:2 /W:1 — a locked DLL means a running
-  app/MCP is holding libaicad.dll / OCCT TK*.dll; close them and rerun.
+  app/MCP is holding libchudware.dll / OCCT TK*.dll; close them and rerun.
 
 ## Reviewer summary (current state — 2026-07-05)
 
@@ -98,7 +98,7 @@ VERIFIED on Windows (Win11, MSVC 14.44 / VS2022):
 OPEN — headless viewport parity screenshot is UNVERIFIED. Root-caused to a camera-framing
 bug (NOT a render gap) and fixed on this branch (commit 82c785bf), but the fix is unverified
 because re-capture is blocked by the standing worker-start hang (below). Closes via a 2-min
-interactive eyeball (launch AI-CAD.exe → create a part → press F to Zoom-to-Fit) OR the
+interactive eyeball (launch Chudware.exe → create a part → press F to Zoom-to-Fit) OR the
 worker-start fix.
 
 FIX ON THIS BRANCH FOR REVIEW — commit 82c785bf, `host/src/ui/scenarios.cpp` sketch step 2:
@@ -108,11 +108,11 @@ solid framed off-centre. Fix resets `st.pan[0..2]=0` before capture, mirroring
 interactive launch path is UNCHANGED. Status: UNVERIFIED (see OPEN above).
 
 STANDING BLOCKER (buddy / app-gui territory — NOT a WIN-lane fix; do not touch without sign-off):
-`AppState::tryStartWorker()` gates the in-process libaicad fallback `#ifndef _WIN32`
+`AppState::tryStartWorker()` gates the in-process libchudware fallback `#ifndef _WIN32`
 (`host/src/core/app_state.cpp:580`) = Linux-only, so on Windows the app requires the managed
 Python worker; when worker-start / the venv-freshness re-provision stalls, headless scenarios
 hang with NO stdout diagnostic (errors go to the in-app log only). **Observed twice:**
-(1) `AI_CAD_SHOT=m1`, (2) `AI_CAD_SHOT=sketch` re-capture — both recorded here for whoever
+(1) `CHUDWARE_SHOT=m1`, (2) `CHUDWARE_SHOT=sketch` re-capture — both recorded here for whoever
 picks up the Windows worker-start fix.
 
 ## Progress log
@@ -128,10 +128,10 @@ picks up the Windows worker-start fix.
     = **48/49** (mesher_autopick PASSES at 159s — earlier "timeout" was only a 120s
     ctest limit; the one real fail is `freecad_parity` point-on-ellipse solver
     non-convergence, which matches the documented Windows baseline, pre-existing).
-  * Stage 2 — libaicad.dll + OCCT TK*.dll stage into dist\AI-CAD\ next to the exe (✓).
-  * Stage 3 — host imgui GUI (AI-CAD.exe) builds via build.bat + stages (✓).
+  * Stage 2 — libchudware.dll + OCCT TK*.dll stage into dist\Chudware\ next to the exe (✓).
+  * Stage 3 — host imgui GUI (Chudware.exe) builds via build.bat + stages (✓).
   STAGE 4-6 PARTIAL, honest findings:
-  * The GUI renders fully on Windows (verified from headless `AI_CAD_SHOT=sketch`
+  * The GUI renders fully on Windows (verified from headless `CHUDWARE_SHOT=sketch`
     captures in scratch/sketch_shots): ribbon, FeatureManager, Copilot, dark theme all
     correct; sketch solver = "Fully Defined DOF: 0"; engine created a real parametric
     solid (Sketch1 -> Boss-Extrude1 -> Solid Bodies(1)/Body1). => kernel + solver + UI
@@ -140,8 +140,8 @@ picks up the Windows worker-start fix.
     plane/triad render, but the profile/solid aren't visibly framed) — needs an
     INTERACTIVE visible-window eyeball on Windows to confirm final render parity. This
     is the right spot for gissa (human at the GUI) to verify.
-  * BLOCKER: `AI_CAD_SHOT=m1` hangs headless — Windows `tryStartWorker()` needs the
-    Python worker (in-process libaicad fallback is `#ifndef _WIN32`, Linux-only,
+  * BLOCKER: `CHUDWARE_SHOT=m1` hangs headless — Windows `tryStartWorker()` needs the
+    Python worker (in-process libchudware fallback is `#ifndef _WIN32`, Linux-only,
     host/src/core/app_state.cpp:580); worker-start / venv-freshness re-provision stalls
     with no stdout diagnostic (errors go to the in-app log). Flagged for app-gui/engine
     owner; NOT a WIN-lane fix (deliberate "Python worker is the Windows production path"
@@ -161,8 +161,8 @@ picks up the Windows worker-start fix.
   platform-agnostic (correct on Linux too), does NOT touch engine/worker routing.
   DEVIATION FROM NORMAL LAUNCH PATH: none at runtime — the fix is in the scenario code,
   not an env/flag; normal interactive launch is unchanged.
-  STATUS: UNVERIFIED. Rebuilt host (build.bat host, exit 0) + re-ran AI_CAD_SHOT=sketch
-  headless (AI_CAD_HIDDEN=1, AI_CAD_PYTHON=venv) but it produced NO fresh capture in 78s
+  STATUS: UNVERIFIED. Rebuilt host (build.bat host, exit 0) + re-ran CHUDWARE_SHOT=sketch
+  headless (CHUDWARE_HIDDEN=1, CHUDWARE_PYTHON=venv) but it produced NO fresh capture in 78s
   — the app hung on worker-start AGAIN (same tryStartWorker `#ifndef _WIN32` blocker as
   m1; the prior 05:34 sketch_shots were from a session where the worker DID start). So
   the framing fix is correct-by-inspection but I could not produce a fresh framed
@@ -178,11 +178,11 @@ RESULTS:
   (1) /FI fix_math.h C1083 â€” inner-quoted /FI"..." + space-in-repo-path ("AI PROJECTS") under
       Ninja+MSVC leaked literal quotes into the filename; dropped inner quotes so Ninja quotes the
       whole /FI<path> token. (host/ VS-generator build never hit this.)
-  (2) AICAD_DEFAULT_LIBAICAD repointed from dead VS layout core/build-occt/bin/Release to the Ninja
-      preset output build/windows-occt/bin/libaicad.dll (main.cpp uses it as the runtime fallback;
+  (2) CHUDWARE_DEFAULT_LIBCHUDWARE repointed from dead VS layout core/build-occt/bin/Release to the Ninja
+      preset output build/windows-occt/bin/libchudware.dll (main.cpp uses it as the runtime fallback;
       SetDllDirectoryW then resolves the ~100 transitive OCCT TK*.dll).
   (3) stale glad FATAL_ERROR msg (host/extern/glad -> extern/glad).
-- AI-CAD2.exe --selftest (NO env override) -> save=1 open=1 features=3 -> OK (in-process libaicad).
+- AI-CAD2.exe --selftest (NO env override) -> save=1 open=1 features=3 -> OK (in-process libchudware).
 - AI-CAD2.exe --shot -> 1616x1039 PNG: ribbon+icons+fonts, FeatureManager (Base/Fillet/Shell),
   dark theme, 3D viewport solid FRAMED correctly. CLOSES the host/-era unverified viewport-framing gap.
 - Python engine_oracle: 1229 passed / 5 failed / 10 errors / 10 skipped â€” all pre-existing/env

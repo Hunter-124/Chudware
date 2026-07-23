@@ -2,7 +2,7 @@
 #include <cstdlib>
 #include <cstring>
 
-namespace aicad::services {
+namespace chudware::services {
 
 bool cppDocsEnabled() {
     // R5a (T-RF21): unconditional — the C++ doc engine is the only backend.
@@ -28,4 +28,4 @@ EngineBackend routeMethod(const std::string& method, const std::string& docId) {
     return EngineBackend::PythonOracle;
 }
 
-} // namespace aicad::services
+} // namespace chudware::services

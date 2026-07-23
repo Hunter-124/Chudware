@@ -1,7 +1,7 @@
 // webcam_capture.cpp — live webcam preview + coverage overlay + shutter (RE-19)
 // Draws a panel with:
 //   1. Live preview via CameraBackend (V4L2 on Linux, MF stub on Windows, synthetic
-//      stub as fallback when no device / open fails — keeps AI_CAD_SHOT=reveng_capture
+//      stub as fallback when no device / open fails — keeps CHUDWARE_SHOT=reveng_capture
 //      working headless).
 //   2. OpenScan-style 11-shot dome coverage ring (ImDrawList) — green=captured, amber=blurred.
 //   3. Shutter button: encodes the latest frame as JPEG (stb_image_write), fires async
@@ -63,8 +63,8 @@ struct WebcamState {
     bool   haveFrame = false;
 
     // Camera backend
-    std::unique_ptr<aicad::platform::CameraBackend> cam;
-    std::vector<aicad::platform::CameraInfo> devices;
+    std::unique_ptr<chudware::platform::CameraBackend> cam;
+    std::vector<chudware::platform::CameraInfo> devices;
     int    deviceIdx = -1;
     bool   camOpened = false;
     bool   usingStub = true;       // true when falling back to synthetic frames
@@ -168,7 +168,7 @@ static void uploadPreviewTex(const unsigned char* px, int w, int h) {
 static void ensureCamera() {
     WebcamState& ws = g_wcam;
     if (!ws.cam) {
-        ws.cam = aicad::platform::CameraBackend::create();
+        ws.cam = chudware::platform::CameraBackend::create();
         ws.enumDone = false;
         ws.camOpened = false;
         ws.usingStub = true;
@@ -232,7 +232,7 @@ static void updatePreviewFrame() {
     }
     ws.lastGrabT = now;
 
-    aicad::platform::CameraFrame frame;
+    chudware::platform::CameraFrame frame;
     bool got = false;
     if (ws.camOpened && ws.cam) {
         got = ws.cam->grabFrame(frame);
@@ -325,18 +325,18 @@ static void drawCoverageRing(ImDrawList* dl, ImVec2 centre, float radius,
 static std::string defaultSessionDir(const std::string& session_id) {
     // Mirror services/mcp/reveng_tools._reveng_dir default so JPEGs land next to
     // the session the worker knows about.
-    const char* override = std::getenv("AICAD_REVENG_DIR");
+    const char* override = std::getenv("CHUDWARE_REVENG_DIR");
     std::string root;
     if (override && override[0]) {
         root = override;
     } else {
         const char* xdg = std::getenv("XDG_DATA_HOME");
         if (xdg && xdg[0]) {
-            root = std::string(xdg) + "/AI-CAD/reveng";
+            root = std::string(xdg) + "/Chudware/reveng";
         } else {
             const char* home = std::getenv("HOME");
             root = (home && home[0] ? std::string(home) : std::string(".")) +
-                   "/.local/share/AI-CAD/reveng";
+                   "/.local/share/Chudware/reveng";
         }
     }
     if (!session_id.empty()) {

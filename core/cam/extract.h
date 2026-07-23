@@ -3,14 +3,14 @@
 // a triangle mesh, planar Z-section regions, and drill-hole points) that the
 // OCCT-FREE operation generators consume.
 //
-// The DECLARATION is OCCT-free (json in / json out) so the libaicad dispatch can
+// The DECLARATION is OCCT-free (json in / json out) so the libchudware dispatch can
 // include it unconditionally; the IMPLEMENTATION (extract.cpp) is OCCT and lives
-// in the aicad_doc lib (which links the OCCT data-exchange toolkits).
+// in the chudware_doc lib (which links the OCCT data-exchange toolkits).
 #pragma once
 
 #include <nlohmann/json.hpp>
 
-namespace aicad {
+namespace chudware {
 namespace cam {
 
 // cam_extract {path, kind, ...} -> extracted geometry.
@@ -28,4 +28,4 @@ namespace cam {
 nlohmann::json cam_extract(const nlohmann::json& params);
 
 }  // namespace cam
-}  // namespace aicad
+}  // namespace chudware

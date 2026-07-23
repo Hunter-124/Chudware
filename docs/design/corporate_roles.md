@@ -5,7 +5,7 @@ Status: **design** (2026-07-16). Grounded on first-cut commit `f538b36c` and liv
 `role_models.py`, `config.py`, `test_corporate.py`, `contracts/agent_events.md`, and the
 Corporate Roles settings box in `host/src/ui/legacy_chat.cpp` (`drawOvCorporateRolesBox`).
 
-This document is the design of record for Corporate Roles **org mode** — how Billet's copilot
+This document is the design of record for Corporate Roles **org mode** — how Chudware's copilot
 runs complex multi-domain missions as a company instead of a flat spawn tree. The first cut
 landed a real data model + enforcement core; this design freezes intent, fills missing lifecycle
 pieces, and lists concrete gaps before we deepen the feature.

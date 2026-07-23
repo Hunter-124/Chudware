@@ -806,7 +806,7 @@
           "runs_dir_override": null
         },
         "ok": true,
-        "result": "{\n  \"ok\": false,\n  \"reason\": \"Build graph run 'gym_C1_local-24k_s1' not found\",\n  \"hint\": \"Check run_id (from buildgraph_plan) and runs_dir (default: /home/hunter/.local/share/AI-CAD/runs).\"\n}"
+        "result": "{\n  \"ok\": false,\n  \"reason\": \"Build graph run 'gym_C1_local-24k_s1' not found\",\n  \"hint\": \"Check run_id (from buildgraph_plan) and runs_dir (default: /home/hunter/.local/share/Chudware/runs).\"\n}"
       }
     },
     {

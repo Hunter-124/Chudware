@@ -6,7 +6,7 @@ Contracts: none (build-test is purely infrastructure; test contracts are implici
 ## Entry points
 - scripts/gate.sh:1 — Linux build+test gate, orchestrates 6 sequential stages (check, core build, ui/abstract, ctest, pytest, ui/imgui smoke)
 - scripts/gate.sh:39 `stage_check()` — runs scripts/check.py (gui_lint icons/theme, feature_surface_audit ribbon→handlers, parity_audit spec drift)
-- scripts/gate.sh:72 `stage_core_build()` — cmake configure/build core/ as libaicad.so with -DAICAD_WITH_OCCT=ON; detects OCCT via find_occt_config() (L58)
+- scripts/gate.sh:72 `stage_core_build()` — cmake configure/build core/ as libchudware.so with -DCHUDWARE_WITH_OCCT=ON; detects OCCT via find_occt_config() (L58)
 - scripts/gate.sh:129 `stage_ctest()` — runs `ctest --test-dir core/build-linux` (constraint solver, geometry, sim tests; see core/CMakeLists.txt:224–294)
 - scripts/gate.sh:154 `stage_pytest()` — runs `pytest engine/doc agent -q` if venv/pytest is available; SKIP if not provisioned
 - scripts/gate.sh:183 `stage_ui_imgui()` — cmake preset linux-app, build, smoke test via `--shot` (headless render) + optional `--selftest`
@@ -14,12 +14,12 @@ Contracts: none (build-test is purely infrastructure; test contracts are implici
 - corpora/README.md:1–14 — test fixtures layout: sketch/ (solver JSON), render/ (SVG outputs), sw_parity/ (SolidWorks parity JSON), sw_fixtures/ (.SLDPRT imports)
 
 ## How it connects
-gate.sh orchestrates Linux CI across the entire stack: `stage_check` (stdlib-only source/docs gates, ~1s), `stage_core_build` (libaicad with OCCT geometry kernel), `stage_ctest` (doctest-based C++ tests), `stage_pytest` (Python oracle + agent tests), `stage_ui_imgui` (ImGui desktop app build + headless render smoke test). Each stage can SKIP if dependencies are absent (OCCT, cmake, venv) without failing the gate — only hard failures (code errors, missing binaries) fail. corpora/ feeds all solver/render/parity tests: fixture JSON files in sketch/, render outputs validate against expected SVG, sw_parity/ cross-checks Python sketch solver vs SolidWorks, sw_fixtures/ tests SLDPRT import.
+gate.sh orchestrates Linux CI across the entire stack: `stage_check` (stdlib-only source/docs gates, ~1s), `stage_core_build` (libchudware with OCCT geometry kernel), `stage_ctest` (doctest-based C++ tests), `stage_pytest` (Python oracle + agent tests), `stage_ui_imgui` (ImGui desktop app build + headless render smoke test). Each stage can SKIP if dependencies are absent (OCCT, cmake, venv) without failing the gate — only hard failures (code errors, missing binaries) fail. corpora/ feeds all solver/render/parity tests: fixture JSON files in sketch/, render outputs validate against expected SVG, sw_parity/ cross-checks Python sketch solver vs SolidWorks, sw_fixtures/ tests SLDPRT import.
 
 ## Debugging playbook
 - Full gate: `bash scripts/gate.sh` (uses core/build-linux as build dir for stages 2–3)
 - Just check.py: `python3 scripts/check.py` (runs gui_lint + feature_surface_audit + parity_audit)
-- Just core build: `cmake -S core -B core/build-linux -DAICAD_WITH_OCCT=ON && cmake --build core/build-linux --config Release`
+- Just core build: `cmake -S core -B core/build-linux -DCHUDWARE_WITH_OCCT=ON && cmake --build core/build-linux --config Release`
 - Just ctest: `ctest --test-dir core/build-linux -C Release --output-on-failure` (requires successful core build)
 - Just pytest: `python3 -X utf8 -m pytest engine/doc agent -q` (requires venv at runtime/venv/bin/python or .venv/bin/python)
 - Just ui/imgui: `cmake --preset linux-app && cmake --build build/linux-app --config Release`

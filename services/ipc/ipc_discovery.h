@@ -1,22 +1,22 @@
-// Daemon discovery + lifecycle primitives shared by aicad-hostd and every client
+// Daemon discovery + lifecycle primitives shared by chudware-hostd and every client
 // (GUI DaemonConn, Python daemon_bridge reimplements the same contract).
 //
 // Instance identity: every socket/lock name embeds an "instance key" so a dev
 // tree and an installed app (or two installed versions) never share a daemon:
-//   1. $AICAD_INSTANCE_KEY (explicit override — tests, AppImage AppRun which
+//   1. $CHUDWARE_INSTANCE_KEY (explicit override — tests, AppImage AppRun which
 //      derives it from $APPIMAGE because squashfs mounts are randomized), else
 //   2. hash of the canonical (realpath) hostd binary path.
 // The key is 16 hex chars of FNV-1a 64 (stable across builds/platforms; this is
 // a namespacing key, not a security boundary — the 0700 runtime dir is that).
 //
-// Endpoints (Linux): $XDG_RUNTIME_DIR/aicad/hostd-<key>.sock, falling back to
-// /tmp/aicad-<uid>/hostd-<key>.sock (dir created 0700, ownership verified).
-// $AICAD_HOSTD_SOCKET overrides the full path.
+// Endpoints (Linux): $XDG_RUNTIME_DIR/chudware/hostd-<key>.sock, falling back to
+// /tmp/chudware-<uid>/hostd-<key>.sock (dir created 0700, ownership verified).
+// $CHUDWARE_HOSTD_SOCKET overrides the full path.
 #pragma once
 
 #include <string>
 
-namespace aicad_ipc {
+namespace chudware_ipc {
 
 // FNV-1a 64 of `s`, as 16 lowercase hex chars.
 std::string fnv1aHex(const std::string& s);
@@ -28,14 +28,14 @@ std::string instanceKey(const std::string& hostdBin);
 std::string socketPath(const std::string& key);
 std::string lockPath(const std::string& key);
 
-// Runtime dir ($XDG_RUNTIME_DIR/aicad or /tmp/aicad-<uid>), created 0700 with
+// Runtime dir ($XDG_RUNTIME_DIR/chudware or /tmp/chudware-<uid>), created 0700 with
 // ownership verified (refuses a dir owned by someone else). "" on failure.
 std::string runtimeDir();
 
-// State dir for logs/autosaves: ~/.local/share/AI-CAD (or $XDG_DATA_HOME/AI-CAD).
+// State dir for logs/autosaves: ~/.local/share/Chudware (or $XDG_DATA_HOME/Chudware).
 std::string stateDir();
 
-// Resolve the hostd binary to spawn: $AICAD_HOSTD_BIN, else `hint` (a path the
+// Resolve the hostd binary to spawn: $CHUDWARE_HOSTD_BIN, else `hint` (a path the
 // caller knows, e.g. next to its own binary), else "" (caller reports failure).
 std::string resolveHostdBin(const std::string& hint);
 
@@ -73,4 +73,4 @@ private:
 // the replacement for the weak std::system() spawn in host/src/bootstrap.cpp.
 bool spawnDetached(const std::string& exe, const std::string& arg, std::string& err);
 
-}  // namespace aicad_ipc
+}  // namespace chudware_ipc

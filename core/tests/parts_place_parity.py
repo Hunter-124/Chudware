@@ -190,7 +190,7 @@ def mask(node, _key=None):
 
 
 def main() -> int:
-    tmp = Path(tempfile.mkdtemp(prefix="aicad_place_parity_"))
+    tmp = Path(tempfile.mkdtemp(prefix="chudware_place_parity_"))
     step = tmp / "generated.step"
     step.write_text("ISO-10303-21;\nEND-ISO-10303-21;\n", encoding="utf-8")
     _install_stubs(str(step))

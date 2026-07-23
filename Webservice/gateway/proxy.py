@@ -17,7 +17,7 @@ try:
 except ImportError:
     from sessions import manager
 
-log = logging.getLogger("billet-web.proxy")
+log = logging.getLogger("chudware-web.proxy")
 
 router = APIRouter(tags=["stream"])
 
@@ -73,7 +73,7 @@ async def proxy_http(sid: str, request: Request, path: str = "") -> Response:
         if k.lower() not in HOP_BY_HOP and k.lower() != "cookie"
     }
     if user is not None:
-        headers["X-Billet-User"] = user.email
+        headers["X-Chudware-User"] = user.email
 
     body = await request.body()
     client = httpx.AsyncClient(timeout=None)

@@ -21,7 +21,7 @@
 #include <unistd.h>
 #endif
 
-namespace aicad::firmware {
+namespace chudware::firmware {
 namespace {
 
 constexpr size_t kOutputCap = 32000;
@@ -501,4 +501,4 @@ FlashResult renode_run(const std::string& resc_path, double run_s, int gdb_port,
     return run_bounded_emulate(cmd, run_s, t0);
 }
 
-}  // namespace aicad::firmware
+}  // namespace chudware::firmware

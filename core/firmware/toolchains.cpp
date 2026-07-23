@@ -8,7 +8,7 @@
 
 #include "firmware/subprocess.h"
 
-namespace aicad::firmware {
+namespace chudware::firmware {
 namespace {
 
 namespace fs = std::filesystem;
@@ -193,4 +193,4 @@ BuildResult build(const Project& project, double timeout_s) {
     return r;
 }
 
-}  // namespace aicad::firmware
+}  // namespace chudware::firmware

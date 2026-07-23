@@ -19,7 +19,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad::ecad::fab {
+namespace chudware::ecad::fab {
 
 // One Gerber layer as an RS-274X string (trailing '\n').
 std::string write_gerber_layer(const nlohmann::json& board, const std::string& layer_id);
@@ -40,4 +40,4 @@ std::string write_bom(const nlohmann::json& board, const std::string& fmt = "csv
 std::string write_placement(const nlohmann::json& board, bool exclude_tht = true,
                             bool exclude_virtual = true);
 
-}  // namespace aicad::ecad::fab
+}  // namespace chudware::ecad::fab

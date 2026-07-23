@@ -13,7 +13,7 @@
 
 #include "agent/state.h"  // ojson
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 
 extern const char* kPmAssistRole;    // "pm_assist"
@@ -60,4 +60,4 @@ ojson assist_property_manager(const ojson& params, const ojson& doc, const std::
                               const PmCompleteFn& complete);
 
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware

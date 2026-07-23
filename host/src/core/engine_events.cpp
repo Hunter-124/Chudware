@@ -418,7 +418,7 @@ void handleEvent(AppState& st, const json& evt) {
 // orphan-recovery protocol): count them and raise the AppState prompt flag — the
 // modal itself renders in app.cpp alongside the other app-scope confirmations.
 // Best-effort: an old daemon without recovery_list just fails the call quietly.
-void checkOrphanRecovery(AppState& st, aicad_ipc::EngineClient& c) {
+void checkOrphanRecovery(AppState& st, chudware_ipc::EngineClient& c) {
     json rl;
     std::string e;
     if (!c.call("recovery_list", json::object(), rl, e)) return;
@@ -430,7 +430,7 @@ void checkOrphanRecovery(AppState& st, aicad_ipc::EngineClient& c) {
     st.recoveryPromptCount = n;
 }
 
-bool tryBootstrap(AppState& st, aicad_ipc::EngineClient& c) {
+bool tryBootstrap(AppState& st, chudware_ipc::EngineClient& c) {
     json r;
     std::string e;
     if (!c.call("subscribe", json{{"doc_ids", "*"}}, r, e)) return false;

@@ -27,7 +27,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad::doc {
+namespace chudware::doc {
 
 // --- persistence (W12+ drawing embedding in the .step+ container) --------------
 // drawings_for_source: serialize every OPEN drawing whose live source is `source_doc_id`
@@ -201,10 +201,10 @@ bool drawing_close(const std::string& doc_id);
 // CRASH RECOVERY (P0 deadlock fix — mirrors force_release_doc_lock in session.h).
 // Drop an orphaned drawing-session g_mtx lock left held by THIS thread after a
 // Windows structured exception (access violation) unwound past a DrawingLock without
-// running its C++ destructor under /EHsc. Called from the libaicad C dispatch
+// running its C++ destructor under /EHsc. Called from the libchudware C dispatch
 // boundary's __except filter alongside force_release_doc_lock so ANY hardware fault
 // releases ALL orphaned registry locks. Idempotent: no-ops if the lock is not held
 // by the current thread. Returns true if it actually released an orphaned lock.
 bool force_release_drawing_lock();
 
-}  // namespace aicad::doc
+}  // namespace chudware::doc

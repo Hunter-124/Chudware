@@ -38,7 +38,7 @@ risk. Need autosave/journal recovery and crash diagnostics that respect consent.
         upload hook dispatched ONLY at consent="full". Tests: test_upload_NOT_called_at_off,
         test_upload_NOT_called_at_meta, test_upload_called_at_full — all pass.
 - [x] Autosave cadence configurable; measurable overhead < 50ms p95 per snapshot
-      — AI_CAD_AUTOSAVE_INTERVAL_S (default 60s) controls cadence; start/stop_periodic_autosave()
+      — CHUDWARE_AUTOSAVE_INTERVAL_S (default 60s) controls cadence; start/stop_periodic_autosave()
         in cad_tools.py. autosave_p95_ms() exposes current p95 latency. Warning logged
         when p95 > 50 ms. Test confirms timer fires and is stoppable.
 - [x] gate; graphify update .
@@ -46,9 +46,9 @@ risk. Need autosave/journal recovery and crash diagnostics that respect consent.
 ## Implementation notes
 
 - Fixed `_autosave_dir()` Linux bug: `os.environ.get("APPDATA")` returned None → /tmp
-  on Linux, scattering autosaves outside AI-CAD data tree. Now uses
-  `engine.paths.appdata_root()` (XDG_DATA_HOME/~/.local/share/AI-CAD). Supports
-  AI_CAD_AUTOSAVE_DIR override for test hermeticity.
+  on Linux, scattering autosaves outside Chudware data tree. Now uses
+  `engine.paths.appdata_root()` (XDG_DATA_HOME/~/.local/share/Chudware). Supports
+  CHUDWARE_AUTOSAVE_DIR override for test hermeticity.
 - New module: `services/mcp/crash_bundle.py` — crash bundle writer, consent-gated
   upload dispatch (default off), signal handlers (SIGTERM/SIGABRT), idempotent install(),
   reset_for_testing() for test hermetics. Upload hook is a no-op stub; real endpoint to

@@ -45,7 +45,7 @@ All numbers below come from `results/matrix.json`, produced by `bench.py` on a
    production's "parallel slots under llama.cpp" path **currently runs on CPU**. For this
    bench I built a **CUDA llama-server at the exact same commit** (`fdb1db8`, sm_86, via
    `-allow-unsupported-compiler` for gcc 16 vs CUDA 13.3) into
-   `~/.local/share/AI-CAD/llamacpp/build-cuda/` — **no pin change, bundled binary
+   `~/.local/share/Chudware/llamacpp/build-cuda/` — **no pin change, bundled binary
    untouched.** GPU offload verified (E4B load: VRAM 264→3706 MB, no fallback warning).
    **Recommendation: production should ship a CUDA build.**
 2. **Version mismatch:** `local_runtime.py` / `model_manager` claim pin **b9871**; the
@@ -143,12 +143,12 @@ on-GPU here anyway.
 ## Transformers GPU backend seam (DoD)
 
 `services/agent/local_runtime.py` gained an **extras-guarded** `TransformersBackend` +
-`select_backend()` (env `AICAD_LOCAL_BACKEND` / cfg `local_backend`). Proven to actually
+`select_backend()` (env `CHUDWARE_LOCAL_BACKEND` / cfg `local_backend`). Proven to actually
 run on the 3080 Ti (`results/transformers_backend_seam.json`): loaded Qwen2.5-0.5B fp16,
 988 MB VRAM, emitted valid JSON. In the **gate venv** (no torch) it degrades honestly —
 `transformers_available()=False`, `TransformersBackend(...)` raises `BackendUnavailable`;
 6 gate-safe tests (`TestBackendSeam`) cover this. torch/transformers live in a **separate
-venv**: `~/.local/share/AI-CAD/torch-venv` (torch 2.6.0+cu124, transformers 5.13.0) —
+venv**: `~/.local/share/Chudware/torch-venv` (torch 2.6.0+cu124, transformers 5.13.0) —
 never the gate venv. This is the seam T-W27 gym cycle 2 selects by config, not a fork.
 Note: the transformers path has **no GBNF engine**, so structured output there is
 prompted-JSON + `validate_handoff` — the same asymmetry the diffusion NO-GO hinges on.
@@ -216,11 +216,11 @@ the recommendation but is worth weighing when comparing the two families directl
 
 ```bash
 # CUDA llama-server built at same commit as bundled b9860 (fdb1db8), sm_86:
-export TOKENMAXX_LLAMA_SERVER=~/.local/share/AI-CAD/llamacpp/build-cuda/bin/llama-server
-~/.local/share/AI-CAD/mcp-venv/bin/python benchmarks/tokenmaxx/bench.py \
+export TOKENMAXX_LLAMA_SERVER=~/.local/share/Chudware/llamacpp/build-cuda/bin/llama-server
+~/.local/share/Chudware/mcp-venv/bin/python benchmarks/tokenmaxx/bench.py \
     --models qwen3-4b gemma3-4b-qat gemma4-e4b --parallel 1 2 4 8 --trials 6
 # results -> benchmarks/tokenmaxx/results/{matrix.json,<model>.json}
 # transformers seam proof (separate torch venv):
-~/.local/share/AI-CAD/torch-venv/bin/python -c "import sys; sys.path.insert(0,'.'); \
+~/.local/share/Chudware/torch-venv/bin/python -c "import sys; sys.path.insert(0,'.'); \
     from services.agent import local_runtime as lr; print(lr.transformers_available())"
 ```

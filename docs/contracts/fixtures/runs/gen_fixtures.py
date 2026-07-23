@@ -3,7 +3,7 @@
 
 These run dirs are the *replayable troubleshooting mode*: the Agent Inspector,
 Watch Grid, and Settings panels render from them with **no live backend** — this
-is also how the AI_CAD_SHOT scenarios capture headlessly.
+is also how the CHUDWARE_SHOT scenarios capture headlessly.
 
 Layout produced under docs/contracts/fixtures/runs/:
 

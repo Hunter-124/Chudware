@@ -1,5 +1,5 @@
 // mega-28 E28 — autorouter honours min clearance (no sub-clearance pad/track pairs).
-// Pure JSON, OCCT-free; links aicad_ecad only.
+// Pure JSON, OCCT-free; links chudware_ecad only.
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "ecad/autoroute.h"
 #include "ecad/drc.h"
@@ -12,8 +12,8 @@
 #include <doctest/doctest.h>
 
 using nlohmann::json;
-using aicad::ecad::autoroute;
-using aicad::ecad::run_drc;
+using chudware::ecad::autoroute;
+using chudware::ecad::run_drc;
 
 namespace {
 
@@ -57,7 +57,7 @@ json rect_outline(double w, double h) {
 
 // Two QFN-like footprints with interleaved nets — the mega-24..27 clearance stress shape.
 json tight_ic_board() {
-    json b = aicad::ecad::schema::new_board("e28");
+    json b = chudware::ecad::schema::new_board("e28");
     b["rules"]["clearance"] = 0.2;
     b["net_classes"]["default"] = json{{"clearance", 0.2},
                                        {"track_width", 0.15},
@@ -128,7 +128,7 @@ TEST_CASE("autoroute: routed geometry respects 0.2mm clearance (E28)") {
 }
 
 TEST_CASE("autoroute: segment pairs keep edge gap >= min_clearance (E28 spacing)") {
-    json board = aicad::ecad::schema::new_board("e28gap");
+    json board = chudware::ecad::schema::new_board("e28gap");
     board["rules"]["clearance"] = 0.2;
     board["net_classes"]["default"] = json{{"clearance", 0.2},
                                            {"track_width", 0.25},

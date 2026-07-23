@@ -53,7 +53,7 @@ def main() -> int:
     ap.add_argument("--out", default="", help="results dir override")
     args = ap.parse_args()
 
-    os.environ.setdefault("AI_CAD_ENGINE_DAEMON", "0")
+    os.environ.setdefault("CHUDWARE_ENGINE_DAEMON", "0")
     sys.path.insert(0, str(SUITE_DIR))
     import resguard
     budget = resguard.install()  # before any engine/solver library loads

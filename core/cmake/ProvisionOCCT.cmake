@@ -60,7 +60,7 @@ if(WIN32)
   # font/image paths used elsewhere. Note jemalloc's dir is named `jemalloc-vc14-64`.
   # ffmpeg (avcodec/avformat/avutil/swscale) + openvr are IMPORT-TABLE deps of TKService,
   # which the data-exchange toolkits (TKDESTEP/TKDEIGES/TKDESTL -> TKDE/TKXCAF -> ... ->
-  # TKService) link transitively: the DLLs must be loadable for libaicad to load, even
+  # TKService) link transitively: the DLLs must be loadable for libchudware to load, even
   # though the headless import/export path never records video or drives a VR display.
   set(OCCT_3RDPARTY_BINS "")
   foreach(_dep jemalloc tbb freetype freeimage ffmpeg)
@@ -72,7 +72,7 @@ if(WIN32)
   list(APPEND OCCT_3RDPARTY_BINS ${_ovr})
 
   # Deploy the release DLLs next to a target's exe (for the shipped host later).
-  function(aicad_occt_copy_dlls tgt)
+  function(chudware_occt_copy_dlls tgt)
     add_custom_command(TARGET ${tgt} POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_directory "${OCCT_DLL_DIR}" "$<TARGET_FILE_DIR:${tgt}>"
       COMMENT "[occt] copying toolkit DLLs next to ${tgt}")
@@ -100,7 +100,7 @@ else()
   # default search path. Leave the deploy helper as a no-op so call sites stay portable.
   set(OCCT_DLL_DIR "" CACHE PATH "OCCT toolkit DLLs (unused on non-Windows)" FORCE)
   set(OCCT_3RDPARTY_BINS "")
-  function(aicad_occt_copy_dlls tgt)
+  function(chudware_occt_copy_dlls tgt)
     # no-op on non-Windows
   endfunction()
 endif()

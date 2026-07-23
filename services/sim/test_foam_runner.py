@@ -110,8 +110,8 @@ def test_linux_runner_runs_and_streams():
 @pytest.mark.skipif(not _POSIX, reason="LinuxRunner is posix-only")
 def test_linux_runner_env_var_root(monkeypatch):
     root = _stub_install(Path(tempfile.mkdtemp()))
-    monkeypatch.setenv("AICAD_OPENFOAM", str(root))
-    r = fr.LinuxRunner()          # no explicit root: must find it via AICAD_OPENFOAM
+    monkeypatch.setenv("CHUDWARE_OPENFOAM", str(root))
+    r = fr.LinuxRunner()          # no explicit root: must find it via CHUDWARE_OPENFOAM
     # PATH may already carry a real OpenFOAM; only assert when the stub is what resolves.
     if not fr.LinuxRunner()._probe(""):
         assert r.available() is True

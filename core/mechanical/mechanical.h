@@ -11,7 +11,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad {
+namespace chudware {
 namespace mechanical {
 
 using nlohmann::json;
@@ -47,4 +47,4 @@ json bearing_life(const json& params);
 bool call(const std::string& method, const json& params, json& result, std::string& err);
 
 }  // namespace mechanical
-}  // namespace aicad
+}  // namespace chudware

@@ -438,7 +438,7 @@ def _with_usage(result: dict, tu_mod: Any = None) -> dict:
     return result
 
 _SYSTEM_BASE = (
-    "You are an AI-CAD role agent executing one node of a mission. You may call "
+    "You are an Chudware role agent executing one node of a mission. You may call "
     "tools to inspect and modify the engine. To call a tool, reply with a single "
     "fenced json block:\n"
     "```json\n{\"tool\": \"<tool_name>\", \"args\": {<kwargs>}}\n```\n"

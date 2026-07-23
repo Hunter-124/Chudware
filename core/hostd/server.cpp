@@ -34,7 +34,7 @@ static long long monoMs() {
         .count();
 }
 
-Server::Server(aicad_ipc::IpcListener listener, std::string buildId)
+Server::Server(chudware_ipc::IpcListener listener, std::string buildId)
     : listener_(std::move(listener)), buildId_(std::move(buildId)) {
     registry_.setEventSender(
         [this](int clientId, const std::string& line) { sendEventTo(clientId, line); });
@@ -44,7 +44,7 @@ Server::Server(aicad_ipc::IpcListener listener, std::string buildId)
     });
     touch();
     // Engine-call watchdog ceiling (interactive RPCs only; see engine_watchdog.h). 0 disables.
-    if (const char* w = std::getenv("AICAD_HOSTD_ENGINE_WATCHDOG_S"); w && *w)
+    if (const char* w = std::getenv("CHUDWARE_HOSTD_ENGINE_WATCHDOG_S"); w && *w)
         engineWatchdogMs_ = (long long)std::max(0, std::atoi(w)) * 1000;
 }
 
@@ -134,13 +134,13 @@ void Server::touch() { status_.lastActivityMs = monoMs(); }
 
 // Stale-binary self-drain backstop (Phase 8; plan Design A "Version &
 // staleness"). Deploys are temp+RENAME (never cp over a live .so — SIGBUS), so
-// an mtime change on the hostd binary or the loaded libaicad means a NEW file
+// an mtime change on the hostd binary or the loaded libchudware means a NEW file
 // sits at that path: drain so existing clients finish, new connects are refused
 // with daemon.draining, and the next client respawns the fresh build. Installers
 // calling --stop are the primary path; this covers dev rebuilds.
 void Server::staleBinaryTick() {
     static const long long intervalMs = [] {
-        if (const char* s = std::getenv("AICAD_HOSTD_STALECHECK_S"); s && *s)
+        if (const char* s = std::getenv("CHUDWARE_HOSTD_STALECHECK_S"); s && *s)
             return (long long)std::max(1, std::atoi(s)) * 1000;
         return 60000LL;
     }();
@@ -181,7 +181,7 @@ void Server::run(int lingerSecs) {
     if (engineWatchdogMs_ > 0)
         watchdog_ = std::thread([this] { watchdogLoop(); });
     while (!stopping_) {
-        aicad_ipc::IpcConn conn = listener_.accept(500);
+        chudware_ipc::IpcConn conn = listener_.accept(500);
         if (conn.valid()) {
             if (status_.draining) {
                 conn.writeLine(json{{"event", "daemon.draining"}}.dump());
@@ -202,7 +202,7 @@ void Server::run(int lingerSecs) {
         // expired with no attached client are retired + closed here so dead
         // sessions can never pile zombie docs into the shared engine.
         for (const std::string& id : registry_.tick()) gcCloseDoc(id);
-        staleBinaryTick();  // mtime watch on hostd binary + libaicad (self-drain)
+        staleBinaryTick();  // mtime watch on hostd binary + libchudware (self-drain)
         if (status_.draining && status_.clients == 0 && status_.inflight == 0) break;
         if (idleExpired(lingerSecs)) {
             log().line("idle for %ds with no clients — exiting", lingerSecs);
@@ -315,7 +315,7 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
                     {"abi", core::cpp_core().abiVersion()},
                     {"git_rev", buildId_},
                     // "" while the engine loads or when the .so predates the
-                    // aicad_build_id export — clients tolerate absence.
+                    // chudware_build_id export — clients tolerate absence.
                     {"engine_build_id", core::cpp_core().buildId()},
                     {"daemon_pid", selfPid()},
                     {"state", stateNames[status_.engineState.load()]},
@@ -330,7 +330,7 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
     // TEST-ONLY (env-gated; "__hostd_test_stall" is never a real client RPC): register an
     // in-flight engine call and sleep, to exercise the watchdog end-to-end. Returns ok if the
     // ceiling exceeds the sleep; otherwise the watchdog restarts the daemon mid-sleep.
-    if (const char* sm = std::getenv("AICAD_HOSTD_TEST_STALL_MS");
+    if (const char* sm = std::getenv("CHUDWARE_HOSTD_TEST_STALL_MS");
         sm && *sm && method == "__hostd_test_stall") {
         beginInflight(c.id, method);
         std::this_thread::sleep_for(std::chrono::milliseconds(std::max(0, std::atoi(sm))));
@@ -360,7 +360,7 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
                 isError = true;
                 return json{{"code", "mission_active"},
                             {"message", "agent children are running; stop them or "
-                                        "pass {\"force\":true} (aicad-hostd --stop --force)"}};
+                                        "pass {\"force\":true} (chudware-hostd --stop --force)"}};
             }
             children_.stopAll();  // TERM -> grace -> KILL, reaped before we drain
         }

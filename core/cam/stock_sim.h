@@ -9,7 +9,7 @@
 #include "cam/heightfield.h"
 #include "cam/model.h"
 
-namespace aicad {
+namespace chudware {
 namespace cam {
 
 struct SimOptions {
@@ -64,4 +64,4 @@ double estimate_time(const Toolpath&, const Machine&);
 json backplot(const Toolpath&);
 
 }  // namespace cam
-}  // namespace aicad
+}  // namespace chudware

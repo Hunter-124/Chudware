@@ -1,7 +1,7 @@
 // ID-buffer picking pass (PLAN §3.1). Renders the DocMesh into an offscreen R32UI attachment
 // where every fragment carries a packed topology id (body|kind|topo-id); a 1x1 glReadPixels under
 // the cursor decodes to a PickHit. Draw order + a depth bias give vertices priority over edges
-// over faces at equal depth. An RGBA8-encoded fallback (env AI_CAD_IDBUF=rgba8) covers drivers /
+// over faces at equal depth. An RGBA8-encoded fallback (env CHUDWARE_IDBUF=rgba8) covers drivers /
 // contexts without integer color attachments.
 //
 // The pass owns its own GPU buffers built from the DocMesh (independent of Renderer's STL Subs)
@@ -145,7 +145,7 @@ private:
     void allocTargets(int w, int h);
 
     bool built_ = false;
-    bool rgba8_ = false;  // fallback encoding (env AI_CAD_IDBUF=rgba8)
+    bool rgba8_ = false;  // fallback encoding (env CHUDWARE_IDBUF=rgba8)
 
     // offscreen target
     unsigned int fbo_ = 0, idTex_ = 0, depthRbo_ = 0;

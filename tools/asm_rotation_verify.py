@@ -7,20 +7,20 @@ formula and confirms that inserting a long-X part with rot=[0,0,90] swaps its wo
 """
 import ctypes, json, math, os, tempfile
 
-DIST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dist", "AI-CAD")
+DIST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dist", "Chudware")
 os.add_dll_directory(DIST)
-lib = ctypes.WinDLL(os.path.join(DIST, "libaicad.dll"))
-lib.aicad_call.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p)]
-lib.aicad_call.restype = ctypes.c_int
-lib.aicad_free.argtypes = [ctypes.c_char_p]
+lib = ctypes.WinDLL(os.path.join(DIST, "libchudware.dll"))
+lib.chudware_call.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p)]
+lib.chudware_call.restype = ctypes.c_int
+lib.chudware_free.argtypes = [ctypes.c_char_p]
 
 
 def call(method, params):
     out = ctypes.c_char_p()
-    rc = lib.aicad_call(method.encode(), json.dumps(params).encode(), ctypes.byref(out))
+    rc = lib.chudware_call(method.encode(), json.dumps(params).encode(), ctypes.byref(out))
     raw = out.value.decode() if out.value else ""
     if out.value:
-        lib.aicad_free(out)
+        lib.chudware_free(out)
     data = json.loads(raw) if raw else {}
     if rc != 0 or (isinstance(data, dict) and data.get("code")):
         raise RuntimeError(f"{method} failed rc={rc}: {raw[:300]}")

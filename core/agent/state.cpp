@@ -10,7 +10,7 @@
 
 #include "agent/roles.h"
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 
 
@@ -762,4 +762,4 @@ BuiltContext build_context(const DesignState& state, const std::string& role,
 }
 
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware

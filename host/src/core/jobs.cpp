@@ -1,4 +1,4 @@
-// AI-CAD worker job launcher (extracted from gui_app.cpp).
+// Chudware worker job launcher (extracted from gui_app.cpp).
 #include <cstdio>
 #include <mutex>
 #include <string>

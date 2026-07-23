@@ -1,6 +1,6 @@
 """Tests for the GSL (Geometry-Semantics Layer) MCP tools (services/mcp/gsl_tools.py).
 
-Drives the registered tools end-to-end against the STAGED libaicad (the same engine the
+Drives the registered tools end-to-end against the STAGED libchudware (the same engine the
 app loads): describe_part's placement narrative, hover's progressive disclosure,
 query_adjacency's face graph, describe_sketch's entity/DOF text, and describe_scene's
 per-view visibility text. Skipped cleanly when the core library isn't built/staged.
@@ -56,7 +56,7 @@ from mcp_server import core_bridge as cb  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
     not cb.available(),
-    reason="libaicad not staged (build the C++ core); engine-backed MCP tools unavailable",
+    reason="libchudware not staged (build the C++ core); engine-backed MCP tools unavailable",
 )
 
 
@@ -801,7 +801,7 @@ def test_dod4_health_text_state_c_conflicting():
 
 if __name__ == "__main__":
     if not cb.available():
-        print("SKIP: libaicad not staged")
+        print("SKIP: libchudware not staged")
         sys.exit(0)
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0

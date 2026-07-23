@@ -1,6 +1,6 @@
 %
 N10 O1000
-N20 ( AICAD - S1)
+N20 ( Chudware - S1)
 N30 ( post: Haas  machine: Generic 3-axis mill)
 N40 G0 G17 G40 G49 G80 G90
 N50 G21

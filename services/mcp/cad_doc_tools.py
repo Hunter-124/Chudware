@@ -551,7 +551,7 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
 
         Multi-user note: from mcp/agent connections the daemon rejects this with
         code ``undo_denied`` (agents use doc_checkpoint/doc_revert or PLM rollback).
-        Set env ``AICAD_UNDO_AGENTS=1`` only as a deliberate kill-switch.
+        Set env ``CHUDWARE_UNDO_AGENTS=1`` only as a deliberate kill-switch.
 
         VERIFY LOOP: after undo, call render_part()/render_views() (and inspect_feature on the
         affected region) to confirm the rolled-back state, then verify_battery before done.
@@ -572,7 +572,7 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
 
         Multi-user note: from mcp/agent connections the daemon rejects this with
         code ``undo_denied`` (agents use doc_checkpoint/doc_revert or PLM rollback).
-        Set env ``AICAD_UNDO_AGENTS=1`` only as a deliberate kill-switch.
+        Set env ``CHUDWARE_UNDO_AGENTS=1`` only as a deliberate kill-switch.
 
         VERIFY LOOP: after redo, call render_part()/render_views() to SEE the restored state
         and verify_battery before declaring done.
@@ -589,7 +589,7 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def show_in_app(doc_id: Optional[str] = None) -> str:
-        """Push the current part to the OPEN AI-CAD desktop app's 3D viewport so the user can see it.
+        """Push the current part to the OPEN Chudware desktop app's 3D viewport so the user can see it.
 
         Modeling tools already do this automatically after each change; call this to force a refresh
         (e.g. after switching the current part). No-op effect if the desktop app isn't running — the
@@ -675,7 +675,7 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def save_part(path: Optional[str] = None, doc_id: Optional[str] = None) -> str:
-        """Save the part as AI-CAD's NATIVE .step+ — the editable, reopenable format. PREFER THIS.
+        """Save the part as Chudware's NATIVE .step+ — the editable, reopenable format. PREFER THIS.
 
         .step+ is the only format that round-trips the full PARAMETRIC feature tree (so the user
         can keep editing parameters/features), its SIMULATION STUDIES (FEA/CFD setups + results),
@@ -763,7 +763,7 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         daemon retired (unclosed docs from ended sessions — they were saved and closed instead of
         lingering forever; nothing reopens them except this call or the GUI's recovery prompt).
         Each entry returns its fresh `doc_id` plus the saved `name` and `original_doc_id` so you
-        can re-map old handles. Stale autosaves (older than AI_CAD_AUTOSAVE_MAX_AGE_DAYS,
+        can re-map old handles. Stale autosaves (older than CHUDWARE_AUTOSAVE_MAX_AGE_DAYS,
         default 7) are pruned automatically.
         """
         try:

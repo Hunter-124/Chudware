@@ -13,7 +13,7 @@
 #include "structural/sections.h"
 #include "structural/solver.h"
 
-namespace aicad::structural {
+namespace chudware::structural {
 namespace {
 
 nlohmann::json err_env(const std::string& code, const std::string& message,
@@ -138,4 +138,4 @@ bool call(const std::string& method, const nlohmann::json& params, nlohmann::jso
     }
 }
 
-}  // namespace aicad::structural
+}  // namespace chudware::structural

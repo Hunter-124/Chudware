@@ -11,12 +11,12 @@
 
 using nlohmann::json;
 
-namespace aicad::doc {
+namespace chudware::doc {
 
 namespace {
 
-#ifndef AICAD_PI
-#define AICAD_PI 3.14159265358979323846
+#ifndef CHUDWARE_PI
+#define CHUDWARE_PI 3.14159265358979323846
 #endif
 
 // Paper-space sizing constants (mm) — annotations scale with the sheet like real CAD.
@@ -53,7 +53,7 @@ struct Draw {
         arcs.push_back(json{{"center", json::array({c[0], c[1]})}, {"radius", r},
                             {"a0", a0}, {"a1", a1}});
     }
-    void circle(P2 c, double r) { arc(c, r, 0.0, 2.0 * AICAD_PI); }
+    void circle(P2 c, double r) { arc(c, r, 0.0, 2.0 * CHUDWARE_PI); }
     void tri(P2 a, P2 b, P2 c) {
         tris.push_back(json::array({json::array({a[0], a[1]}), json::array({b[0], b[1]}),
                                     json::array({c[0], c[1]})}));
@@ -154,9 +154,9 @@ void geom_symbol(Draw& d, const std::string& sym, double x, double y, double s) 
         L(0.06, 0.16, 0.34, 0.84);
         L(0.66, 0.16, 0.94, 0.84);
     } else if (sym == "profile_line") {
-        A(0.5, 0.32, 0.42, 0.0, AICAD_PI);  // upper half arc, open at bottom
+        A(0.5, 0.32, 0.42, 0.0, CHUDWARE_PI);  // upper half arc, open at bottom
     } else if (sym == "profile_surface") {
-        A(0.5, 0.32, 0.42, 0.0, AICAD_PI);
+        A(0.5, 0.32, 0.42, 0.0, CHUDWARE_PI);
         L(0.08, 0.32, 0.92, 0.32);  // closed baseline
     } else if (sym == "perpendicularity") {
         L(0.5, 0.12, 0.5, 0.92);
@@ -565,7 +565,7 @@ json compile_hatch(const json& polygon, double spacing, double angle_deg) {
         maxx = std::max(maxx, q[0]); maxy = std::max(maxy, q[1]);
     }
     if (poly.size() < 3) return json{{"segments", json::array()}};
-    double ang = angle_deg * AICAD_PI / 180.0;
+    double ang = angle_deg * CHUDWARE_PI / 180.0;
     P2 dir = {std::cos(ang), std::sin(ang)};
     P2 nrm = perp(dir);
     // Project corners onto the hatch normal to get the band of offsets to sweep.
@@ -600,4 +600,4 @@ json compile_hatch(const json& polygon, double spacing, double angle_deg) {
     return json{{"segments", d.segments}};
 }
 
-}  // namespace aicad::doc
+}  // namespace chudware::doc

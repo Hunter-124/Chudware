@@ -13,7 +13,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad {
+namespace chudware {
 namespace dfm {
 
 using nlohmann::json;
@@ -62,4 +62,4 @@ std::string process_block_text(const json& profile);
 bool call(const std::string& method, const json& params, json& result, std::string& err);
 
 }  // namespace dfm
-}  // namespace aicad
+}  // namespace chudware

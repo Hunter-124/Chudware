@@ -15,7 +15,7 @@
 #include "piping/pyutil.h"
 #include "piping/schema.h"
 
-namespace aicad::parts {
+namespace chudware::parts {
 namespace {
 
 using pyutil::ojson;
@@ -117,7 +117,7 @@ json place_core_family(const json& gref, const json& /*doc*/, const json& params
                        {"datum", get(r, "datum")}});
     } catch (const std::exception& e) {
         return err_env(domain, std::string("parts_make RPC failed: ") + e.what(),
-                       "Ensure the native core is available (AI_CAD_LIBAICAD).");
+                       "Ensure the native core is available (CHUDWARE_LIBCHUDWARE).");
     }
 }
 
@@ -148,7 +148,7 @@ json place_import_file(const json& gref, const json& /*doc*/, const json& params
                        {"hint", kReverseEngineerHint}});
     } catch (const std::exception& e) {
         return err_env(domain, std::string("import_file RPC failed: ") + e.what(),
-                       "Ensure the native core is available (AI_CAD_LIBAICAD).");
+                       "Ensure the native core is available (CHUDWARE_LIBCHUDWARE).");
     }
 }
 
@@ -198,7 +198,7 @@ json place_generate_model(const json& gref, const json& doc, const json& params,
 }
 
 // symbol_footprint: ecad sch_add_symbol op into a schematic doc (editable
-// doc-schema op) via aicad::ecad::apply_ops.
+// doc-schema op) via chudware::ecad::apply_ops.
 json place_symbol_footprint(const json& gref, const json& doc_context, const json& params) {
     const std::string domain = "symbol_footprint";
     const std::string libid = get_str(gref, "libid");
@@ -549,4 +549,4 @@ bool place_call(const std::string& method, const json& params, json& result, std
     return false;
 }
 
-}  // namespace aicad::parts
+}  // namespace chudware::parts

@@ -1,4 +1,4 @@
-// AI-CAD ribbon command table — C14.
+// Chudware ribbon command table — C14.
 // ONE static table: {cmd_id, label, icon, tab, group, big, sub_of, stretch}.
 // Sorted by tab / group / big-first to keep later-card appends clean.
 // stretch=true = schema-reserved, rendered disabled in v1.
@@ -427,7 +427,7 @@ static const RibbonCmd kCmds[] = {
     { "dwg_bom_table",    "Bill of Mat.",  "bom",           "Annotation", "Tables", true,  nullptr, false },
 
     // --- Tab: Evaluate, Group: Performance --- sampling profiler for modeling perf.
-    // Toggles the in-process stack sampler in libaicad (prof_start/prof_stop). See
+    // Toggles the in-process stack sampler in libchudware (prof_start/prof_stop). See
     // docs/PROFILER.md. Click to start; model; click again to stop + save a report.
     { "prof_toggle",      "Profiler",      "results",       "Evaluate", "Performance",   true,  nullptr, false },
 

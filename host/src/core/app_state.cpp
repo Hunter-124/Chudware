@@ -1,4 +1,4 @@
-// AI-CAD shared application state + data model — implementations (extracted from gui_app.cpp).
+// Chudware shared application state + data model — implementations (extracted from gui_app.cpp).
 #include "gl_compat.h"
 //
 #define GLFW_INCLUDE_NONE
@@ -29,7 +29,7 @@
 #endif
 
 #include "../bootstrap.h"
-#include "cpp_core.h"  // in-process C++ core (libaicad) — the backend when no Python runtime
+#include "cpp_core.h"  // in-process C++ core (libchudware) — the backend when no Python runtime
 #include "../mesh.h"
 #include "../renderer.h"
 
@@ -60,29 +60,38 @@ std::string appdataDir() {
     const char* a = std::getenv("APPDATA");
     return std::string(a ? a : ".");
 #else
-    // Parent of the AI-CAD data dir (callers append "/AI-CAD/..."): XDG data home, else
-    // ~/.local/share — matching bootstrap.cpp's appdataRoot() (~/.local/share/AI-CAD).
+    // Parent of the Chudware data dir (callers append "/Chudware/..."): XDG data home, else
+    // ~/.local/share — matching bootstrap.cpp's appdataRoot() (~/.local/share/Chudware).
     if (const char* x = std::getenv("XDG_DATA_HOME")) { if (*x) return std::string(x); }
     if (const char* h = std::getenv("HOME")) { if (*h) return std::string(h) + "/.local/share"; }
     return ".";
 #endif
 }
-// Billet deep-rename, alias/read-both rule (mirrors engine/paths.py active_root() and
-// core/agent/paths.cpp pick_app_dir() EXACTLY): a machine with an existing legacy AI-CAD
-// data dir keeps using it wholesale (it holds the live runtime venv/config — venvs do not
-// survive relocation) UNLESS the new Billet dir already holds a real install marker
-// (config.json); fresh installs get Billet. Never moves or deletes the old dir.
+// Chudware deep-rename, alias/read-both rule (mirrors engine/paths.py active_root() and
+// core/agent/paths.cpp pick_app_dir() EXACTLY): once the Chudware dir holds a real install
+// marker (config.json) it wins; otherwise an existing legacy data dir is kept using wholesale
+// (it holds the live runtime venv/config — venvs do not survive relocation), preferring the
+// most recent legacy name (Billet) over the oldest (AI-CAD). Fresh installs get Chudware.
+// Never moves or deletes the old dir.
 std::string appdataAppDir() {
     static const std::string cached = [] {
         namespace fs = std::filesystem;
         const fs::path base = appdataDir();
-        const fs::path legacy = base / "AI-CAD";
-        const fs::path neu = base / "Billet";
+        const fs::path neu = base / "Chudware";
         std::error_code ec;
-        std::string chosen = (fs::exists(legacy, ec) && !fs::exists(neu / "config.json", ec))
-                                 ? legacy.string()
-                                 : neu.string();
-        std::fprintf(stderr, "[billet] data dir: %s\n", chosen.c_str());
+        std::string chosen = neu.string();
+        if (!fs::exists(neu / "config.json", ec)) {
+            // Prefer a legacy dir with a real install marker (config.json), newest name
+            // first, so a stray cache-only dir can't shadow a real install; else keep an
+            // existing legacy dir wholesale.
+            bool picked = false;
+            for (const char* legacy : {"Billet", "AI-CAD"})
+                if (fs::exists(base / legacy / "config.json", ec)) { chosen = (base / legacy).string(); picked = true; break; }
+            if (!picked)
+                for (const char* legacy : {"Billet", "AI-CAD"})
+                    if (fs::exists(base / legacy, ec)) { chosen = (base / legacy).string(); break; }
+        }
+        std::fprintf(stderr, "[chudware] data dir: %s\n", chosen.c_str());
         return chosen;
     }();
     return cached;
@@ -103,17 +112,17 @@ void appstateInitPersist() {
             try { FS.mkdir(root); } catch (e) {}
             try { FS.mount(IDBFS, {}, root); } catch (e) {
                 // Already mounted on a hot restart — keep going and re-populate.
-                console.warn('[billet] IDBFS mount:', e);
+                console.warn('[chudware] IDBFS mount:', e);
             }
             FS.syncfs(true, function(err) {
-                if (err) console.warn('[billet] IDBFS populate failed:', err);
-                else console.log('[billet] IDBFS populated at /persist');
-                // Ensure Billet appdata subdir exists after populate (empty store).
-                try { FS.mkdir(root + '/Billet'); } catch (e2) {}
+                if (err) console.warn('[chudware] IDBFS populate failed:', err);
+                else console.log('[chudware] IDBFS populated at /persist');
+                // Ensure Chudware appdata subdir exists after populate (empty store).
+                try { FS.mkdir(root + '/Chudware'); } catch (e2) {}
                 Module.__billetPersistReady = true;
             });
         } catch (e) {
-            console.error('[billet] IDBFS init failed:', e);
+            console.error('[chudware] IDBFS init failed:', e);
             Module.__billetPersistReady = true;  // fail open so boot continues
         }
     });
@@ -137,7 +146,7 @@ void appstatePersistSync() {
         Module.__billetPersistSyncTimer = setTimeout(function() {
             Module.__billetPersistSyncTimer = null;
             FS.syncfs(false, function(err) {
-                if (err) console.warn('[billet] IDBFS flush failed:', err);
+                if (err) console.warn('[chudware] IDBFS flush failed:', err);
             });
         }, 50);
     });
@@ -148,8 +157,8 @@ bool appstatePersistReady() { return true; }
 void appstatePersistSync() {}
 #endif
 
-// Default workspace dir under Documents — same alias rule: an existing Documents/AI-CAD
-// keeps being used; otherwise the default is Documents/Billet (created on first use by
+// Default workspace dir under Documents — same alias rule: an existing Documents/Billet or Documents/AI-CAD
+// keeps being used wholesale; otherwise the default is Documents/Chudware (created on first use by
 // the File Explorer). Falls back to the appdata base when no home/Documents resolves.
 std::string defaultWorkspaceDir() {
 #ifdef __EMSCRIPTEN__
@@ -164,15 +173,15 @@ std::string defaultWorkspaceDir() {
     const fs::path base = home && *home ? fs::path(home) / "Documents" : fs::path(appdataDir());
 #endif
     std::error_code ec;
-    const fs::path legacy = base / "AI-CAD";
-    if (fs::exists(legacy, ec)) return legacy.string();
-    return (base / "Billet").string();
+    for (const char* legacy : {"Billet", "AI-CAD"})
+        if (fs::exists(base / legacy, ec)) return (base / legacy).string();
+    return (base / "Chudware").string();
 #endif
 }
-const char* kDefaultLlamaModelPath = "%APPDATA%\\AI-CAD\\models\\model.gguf";
+const char* kDefaultLlamaModelPath = "%APPDATA%\\Chudware\\models\\model.gguf";
 
 // User-provided Gemini key, seeded as the out-of-box default so the copilot works on first
-// launch. Replaceable in Settings → AI. (Stored plaintext in %APPDATA%/AI-CAD/config.json,
+// launch. Replaceable in Settings → AI. (Stored plaintext in %APPDATA%/Chudware/config.json,
 // same as every other provider key.)
 const char* kSeededGeminiKey = "AQ.Ab8RN6KgQVaemw7y3lReGzhLlD4VpUnyCYCxgT7ABxbNe1QKbA";
 
@@ -194,7 +203,7 @@ void loadSettings(Settings& s) {
 #ifdef __EMSCRIPTEN__
         // Web: no config yet under IDBFS — still hydrate recents from the workspace.
         std::string rerr;
-        auto durable = billet::fsBackend().loadRecents(rerr);
+        auto durable = chudware::fsBackend().loadRecents(rerr);
         if (!durable.empty()) s.recentFiles = std::move(durable);
 #endif
         return;
@@ -416,7 +425,7 @@ void loadSettings(Settings& s) {
         // Web: prefer durable workspace recents when present (legacy path; IDBFS now holds config).
         {
             std::string rerr;
-            auto durable = billet::fsBackend().loadRecents(rerr);
+            auto durable = chudware::fsBackend().loadRecents(rerr);
             if (!durable.empty()) s.recentFiles = std::move(durable);
         }
 #endif
@@ -651,7 +660,7 @@ void saveSettings(const Settings& s) {
     // Web: also write durable recents under the workspace (belt-and-suspenders with IDBFS config).
     {
         std::string rerr;
-        billet::fsBackend().saveRecents(s.recentFiles, rerr);
+        chudware::fsBackend().saveRecents(s.recentFiles, rerr);
     }
 #endif
     if (!s.hiddenModels.empty())
@@ -839,10 +848,10 @@ void freeChatTextures(std::vector<ChatMsg>& chat) {
 void AppState::addLog(const std::string& s) {
     log.push_back(s);
     if (log.size() > 500) log.erase(log.begin());
-    // C40: tee to a file when AI_CAD_LOG_FILE is set — the in-app console is hard to reach
+    // C40: tee to a file when CHUDWARE_LOG_FILE is set — the in-app console is hard to reach
     // when diagnosing interaction bugs (and stdout is lost for a windowed exe).
     static FILE* tee = [] {
-        const char* p = std::getenv("AI_CAD_LOG_FILE");
+        const char* p = std::getenv("CHUDWARE_LOG_FILE");
         return (p && *p) ? std::fopen(p, "a") : nullptr;
     }();
     if (tee) { std::fputs(s.c_str(), tee); std::fputc('\n', tee); std::fflush(tee); }
@@ -984,14 +993,14 @@ void AppState::startSetup(bool force) {
 // Start the kernel worker; if it can't start, self-heal once instead of dead-ending.
 void AppState::tryStartWorker() {
 #ifdef __EMSCRIPTEN__
-    // Browser client: the shared aicad-hostd (daemon mode) is the ONLY backend — there is no
-    // Python worker to spawn and no in-process libaicad to dlopen. The ~50 workerStarted gates
+    // Browser client: the shared chudware-hostd (daemon mode) is the ONLY backend — there is no
+    // Python worker to spawn and no in-process libchudware to dlopen. The ~50 workerStarted gates
     // (FeatureManager toolbar / doc ops / panels) must pass so the UI is live; engine::call
     // routes to the daemon over the WS bridge with reconnect backoff (engine_events tick).
     workerStarted = true;
     status = "Ready.";
     statusKind = 0;
-    addLog("[ok] daemon mode (web): shared aicad-hostd is the backend");
+    addLog("[ok] daemon mode (web): shared chudware-hostd is the backend");
     return;
 #endif
     workerStarted = worker.start(werr);
@@ -1003,34 +1012,34 @@ void AppState::tryStartWorker() {
     }
     addLog("[err] worker: " + werr);
 #ifndef _WIN32
-    // No managed Python runtime on this platform — the in-process C++ core (libaicad) is the
+    // No managed Python runtime on this platform — the in-process C++ core (libchudware) is the
     // backend (doc/agent/sim ops route through cpp_core). If it loads, the app is ready; do NOT
     // dead-end into Python provisioning. On Windows the Python worker stays the production path.
     //
-    // NOTE: when AI_CAD_ENGINE_DAEMON is unset/1 (default), engine::call goes to aicad-hostd,
-    // which dlopens its OWN libaicad. The path logged here is the GUI process's in-proc load
+    // NOTE: when CHUDWARE_ENGINE_DAEMON is unset/1 (default), engine::call goes to chudware-hostd,
+    // which dlopens its OWN libchudware. The path logged here is the GUI process's in-proc load
     // (fallback / parity); hostd's path is in its stderr "[cpp_core] loaded ..." line and in
     // daemon hello engine_build_id. Stale hostd holding an old .so is the classic trap —
-    // `aicad-hostd --stop` after a core rebuild, or wait for hostd's mtime self-drain.
+    // `chudware-hostd --stop` after a core rebuild, or wait for hostd's mtime self-drain.
     {
         std::string lerr;
         if (core::cpp_core().ensureLoaded(lerr)) {
             // Treat the in-process C++ core as the live backend: the ~50 `workerStarted` gates
             // across the UI (FeatureManager toolbar / doc ops / panels) must pass, since RPCs
-            // route to libaicad via worker_client. (worker_client's own `running_` stays false,
-            // so methods libaicad can't serve still fail cleanly rather than hit a dead pipe.)
+            // route to libchudware via worker_client. (worker_client's own `running_` stays false,
+            // so methods libchudware can't serve still fail cleanly rather than hit a dead pipe.)
             workerStarted = true;
             status = "Ready.";
             statusKind = 0;
             const std::string path = core::cpp_core().loadedPath();
             const std::string bid = core::cpp_core().buildId();
-            addLog("[ok] in-process C++ core (libaicad) ready path=" +
+            addLog("[ok] in-process C++ core (libchudware) ready path=" +
                    (path.empty() ? std::string("?") : path) +
                    " abi=" + core::cpp_core().abiVersion() +
                    (bid.empty() ? std::string() : (" build_id=" + bid)));
             return;
         }
-        addLog("[..] libaicad not loaded: " + lerr);
+        addLog("[..] libchudware not loaded: " + lerr);
     }
 #endif
     if (!autoSetupTried && !setupRunning.load()) {

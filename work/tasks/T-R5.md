@@ -53,7 +53,7 @@ schematic/PCB, CAM workspace (T-U3), and the U7 viewers.
 - [ ] Rev badge on tabs; Released read-only + start-next-rev path works
 - [ ] Zero git vocabulary audit: string scan of new UI text for
       commit/branch/merge/push/pull/repo = no hits
-- [ ] T-U1 style-conformance checks pass; AI_CAD_SHOT headless scenarios added
+- [ ] T-U1 style-conformance checks pass; CHUDWARE_SHOT headless scenarios added
       for panel/compare/release flows; gate + graphify update .
 
 ## Locked decisions (Hunter, 2026-07-05 planning session)

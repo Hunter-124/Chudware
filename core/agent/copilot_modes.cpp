@@ -12,7 +12,7 @@
 
 namespace fs = std::filesystem;
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 
 namespace {
@@ -44,9 +44,9 @@ bool read_set(const nlohmann::json& j, const char* key, std::set<std::string>& o
 }  // namespace
 
 fs::path CopilotModes::default_path() {
-    if (const char* env = std::getenv("AI_CAD_COPILOT_MODES_JSON"); env && env[0])
+    if (const char* env = std::getenv("CHUDWARE_COPILOT_MODES_JSON"); env && env[0])
         return fs::path(env);
-    if (const char* dir = std::getenv("AI_CAD_CONTRACTS_DIR"); dir && dir[0])
+    if (const char* dir = std::getenv("CHUDWARE_CONTRACTS_DIR"); dir && dir[0])
         return fs::path(dir) / "copilot_modes.json";
     // Repo-relative fallback — same CWD convention as roles.cpp's agent/prompts.
     return fs::path("contracts") / "copilot_modes.json";
@@ -139,4 +139,4 @@ bool copilot_tool_allowed(const CopilotModes& cm, const std::string& tool,
 }
 
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware

@@ -4,26 +4,26 @@
   "configurePresets": [
     {
       "name": "linux-core",
-      "displayName": "Linux core (libaicad, Ninja, OCCT)",
-      "description": "Configure the pure-C++ core libaicad with the OCCT geometry kernel (core/).",
+      "displayName": "Linux core (libchudware, Ninja, OCCT)",
+      "description": "Configure the pure-C++ core libchudware with the OCCT geometry kernel (core/).",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/linux-core",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "AICAD_BUILD_CORE": "ON",
-        "AICAD_WITH_OCCT": "ON"
+        "CHUDWARE_BUILD_CORE": "ON",
+        "CHUDWARE_WITH_OCCT": "ON"
       }
     },
     {
       "name": "windows-core",
-      "displayName": "Windows core (libaicad, Ninja + MSVC, OCCT off)",
+      "displayName": "Windows core (libchudware, Ninja + MSVC, OCCT off)",
       "description": "Configure the C++ core with MSVC. Run from an 'x64 Native Tools Command Prompt for VS 2022' (or after vcvars64.bat) so cl/link are on PATH. OCCT off = the self-contained fast build; verified on Win11 + MSVC 14.44. See docs/BUILD_WINDOWS.md.",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/windows-core",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "AICAD_BUILD_CORE": "ON",
-        "AICAD_WITH_OCCT": "OFF"
+        "CHUDWARE_BUILD_CORE": "ON",
+        "CHUDWARE_WITH_OCCT": "OFF"
       },
       "condition": {
         "type": "equals",
@@ -33,14 +33,14 @@
     },
     {
       "name": "windows-occt",
-      "displayName": "Windows core + OCCT (libaicad, Ninja + MSVC, OCCT on)",
+      "displayName": "Windows core + OCCT (libchudware, Ninja + MSVC, OCCT on)",
       "description": "Configure the C++ core with the OCCT geometry kernel + Netgen mesher on MSVC. First configure auto-downloads OCCT 7.9.3 (~250 MB) and builds Netgen once (cached under third_party/). Run from an 'x64 Native Tools Command Prompt for VS 2022'. Verified on Win11 + MSVC 14.44: clean build, 48/49 ctest. See docs/BUILD_WINDOWS.md.",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/windows-occt",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "AICAD_BUILD_CORE": "ON",
-        "AICAD_WITH_OCCT": "ON"
+        "CHUDWARE_BUILD_CORE": "ON",
+        "CHUDWARE_WITH_OCCT": "ON"
       },
       "condition": {
         "type": "equals",

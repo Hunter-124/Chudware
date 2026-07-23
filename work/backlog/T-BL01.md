@@ -26,7 +26,7 @@ Run MacNeal-Harder (public domain), CoFEA, and NASA TMR cases in CI against our 
 - `scripts/vv_benchmark.py` — V&V harness (new file); 8 solver families, 20 cases,
   tolerance tiers (EXACT/PRECISE/ENGINEERING/TREND), JSON + MD report generation,
   pytest TestSmoke (7 cases, no .so) + TestFull (5 cases, needs deps)
-- `scripts/gate.sh` — added `stage_vv` (stage 4.5) env-gated by `AICAD_RUN_VV=smoke|full`
+- `scripts/gate.sh` — added `stage_vv` (stage 4.5) env-gated by `CHUDWARE_RUN_VV=smoke|full`
 - `reports/vv/vv_report.md` — generated V&V report (committed sample run)
 - `reports/vv/vv_results.json` — machine-readable results table
 
@@ -60,16 +60,16 @@ Run MacNeal-Harder (public domain), CoFEA, and NASA TMR cases in CI against our 
 PYTHONPATH=/path/to/CAD pytest scripts/vv_benchmark.py::TestSmoke -q
 
 # Full suite:
-AICAD_RUN_VV=full AI_CAD_LIBAICAD=/path/to/libaicad.so \
+CHUDWARE_RUN_VV=full CHUDWARE_LIBCHUDWARE=/path/to/libchudware.so \
     pytest scripts/vv_benchmark.py -q
 
 # Standalone (generates reports/vv/):
-AI_CAD_LIBAICAD=/path/to/libaicad.so \
-    ~/.local/share/AI-CAD/mcp-venv/bin/python scripts/vv_benchmark.py
+CHUDWARE_LIBCHUDWARE=/path/to/libchudware.so \
+    ~/.local/share/Chudware/mcp-venv/bin/python scripts/vv_benchmark.py
 ```
 
 **CI gate:** `scripts/gate.sh` stage 4.5 — SKIP by default; opt in with
-`AICAD_RUN_VV=smoke` (fast, no .so) or `AICAD_RUN_VV=full` (full suite).
+`CHUDWARE_RUN_VV=smoke` (fast, no .so) or `CHUDWARE_RUN_VV=full` (full suite).
 
 **Claim note:** `work.py claim` was BUSY-looping (docs/sessions/demo_sprint_day5/capstone_run.log
 stale dirty in main checkout). Task file updated directly on branch; owner/status committed

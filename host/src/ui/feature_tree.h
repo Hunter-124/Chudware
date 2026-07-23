@@ -151,9 +151,9 @@ void featureTreeSaveDocToPath(AppState& st, const std::string& path, bool requir
 // component context menu.
 void openComponentPart(AppState& st, const std::string& absPath);
 
-// Live MCP handoff: a separate process (the AI-CAD MCP server Claude drives) builds parts in
+// Live MCP handoff: a separate process (the Chudware MCP server Claude drives) builds parts in
 // its OWN engine, so its docs are invisible here. It publishes the part it's working on to
-// %APPDATA%\AI-CAD\handoff\ (live.step + a live.json carrying a monotonically rising "rev").
+// %APPDATA%\Chudware\handoff\ (live.step + a live.json carrying a monotonically rising "rev").
 // Call this once per frame: when the rev changes it opens/refreshes a single "AI Live" tab from
 // that file so the user SEES the part the AI is building. Cheap (an mtime check most frames);
 // a no-op when the worker isn't up, an in-app run is active, or there's nothing new. Never throws.

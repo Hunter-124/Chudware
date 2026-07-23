@@ -583,7 +583,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
         (FPGA pin-constraint files from the design netlist: native XDC for Xilinx / LPF for
         Lattice + a neutral CSV pinout per FPGA — the board is the source of truth for the
         HDL flow; see ecad_fpga_check). ``path`` is the output directory (gerber/drill/
-        constraints) or file (bom/placement); defaults under the AI-CAD cache. Returns the
+        constraints) or file (bom/placement); defaults under the Chudware cache. Returns the
         written path(s).
         """
         kind = (kind or "").lower()
@@ -692,7 +692,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
         handoff, PDN, power budget, host-board rules) read the sidecar.
 
         Returns the STEP path, sidecar path, volume summary + power totals, and a hint telling
-        the user to open the STEP as an import feature in the AI-CAD app so they can design an
+        the user to open the STEP as an import feature in the Chudware app so they can design an
         enclosure around the board.
 
         Falls back to a clean, actionable error (never raises) when the board has no outline or
@@ -705,7 +705,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
                         next_actions=["ecad_new_pcb('myboard')"])
         doc = session.doc
 
-        # Build the output path (default: AI-CAD cache dir named after the board).
+        # Build the output path (default: Chudware cache dir named after the board).
         out_path = path or str(_default_out_dir(doc.get("name", "board")) / "board.step")
 
         # The FIRST ecad_to_3d call cold-imports OCP/build123d (OpenCASCADE Python bindings) — that

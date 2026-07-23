@@ -225,7 +225,7 @@ def _gpu_available() -> bool:
 
 def _webcam_available() -> bool:
     """Offline webcam check: opt-in test flag or a Linux video device node."""
-    if os.environ.get("AICAD_TEST_CAMERA", "").strip() == "1":
+    if os.environ.get("CHUDWARE_TEST_CAMERA", "").strip() == "1":
         return True
     return os.path.exists("/dev/video0")
 

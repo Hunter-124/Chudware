@@ -7,7 +7,7 @@ sync. Before the first real upload, Erik must decide the bucket name, region, an
 IAM credentials. What should the shipped default be?
 
 **Recommended answer:** Ship with a plain local directory path as the default remote
-(`/data/aicad-training` or user-configured). DVC makes the cloud swap a one-line URL
+(`/data/chudware-training` or user-configured). DVC makes the cloud swap a one-line URL
 change (path → `s3://bucket/prefix`). No code change required.
 
 **ANSWER (Fable): APPROVED per Erik 2026-07-02.** DVC remote = LOCAL/NAS (plain
@@ -16,7 +16,7 @@ Implementation: `dvc_init.py` `remote_url` parameter defaults to a local path;
 `flywheel export --remote /path/to/nas` overrides at runtime.
 
 **Erik provisioning action needed (when ready):**
-- Decide NAS mount point or cloud bucket (s3://bucket/aicad-training-data)
+- Decide NAS mount point or cloud bucket (s3://bucket/chudware-training-data)
 - For S3: create IAM user with `s3:PutObject` / `s3:GetObject` on that prefix
 - Run: `python -m tools.flywheel.dvc_init --repo training --remote s3://bucket/prefix init`
 
@@ -39,7 +39,7 @@ Argilla client remains optional/stubbed so all tests pass offline without contai
 2. Edit `.env.argilla` — set `ARGILLA_API_KEY` and `ARGILLA_AUTH_SECRET_KEY`
 3. `docker compose -f tools/flywheel/docker-compose.argilla.yml --env-file tools/flywheel/.env.argilla up -d`
 4. Set `ARGILLA_API_URL=http://localhost:6900` and `ARGILLA_API_KEY=<key>` in shell
-   or in `~/.local/share/AI-CAD/config.json` under `"argilla"` key
+   or in `~/.local/share/Chudware/config.json` under `"argilla"` key
 5. Load first batch: `python -c "from tools.flywheel.argilla_loader import load_shards_to_argilla; ..."`
 
 ---

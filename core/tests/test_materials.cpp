@@ -3,7 +3,7 @@
 // legacy-shape seam, the CAM fold-in seam) plus a GOLDEN parity replay of
 // tests/data/materials.json (generated from the live oracle by
 // core/tests/data/gen_r4e6_fixtures.py). The registry read is pointed at the
-// source-tree engine_oracle/materials/registry.json (AICAD_TEST_REGISTRY) — the
+// source-tree engine_oracle/materials/registry.json (CHUDWARE_TEST_REGISTRY) — the
 // SAME file the Python oracle reads — so parity is over the identical seed.
 #define DOCTEST_CONFIG_IMPLEMENT
 #include <doctest/doctest.h>
@@ -13,14 +13,14 @@
 
 #include "materials/materials.h"
 
-using namespace aicad::materials;
+using namespace chudware::materials;
 using nlohmann::json;
 
 int main(int argc, char** argv) {
 #ifdef _WIN32
-    _putenv_s("AICAD_MATERIALS_REGISTRY", AICAD_TEST_REGISTRY);
+    _putenv_s("CHUDWARE_MATERIALS_REGISTRY", CHUDWARE_TEST_REGISTRY);
 #else
-    setenv("AICAD_MATERIALS_REGISTRY", AICAD_TEST_REGISTRY, 1);
+    setenv("CHUDWARE_MATERIALS_REGISTRY", CHUDWARE_TEST_REGISTRY, 1);
 #endif
     doctest::Context ctx(argc, argv);
     return ctx.run();
@@ -83,8 +83,8 @@ TEST_CASE("dispatch: ownership + envelope") {
 }
 
 TEST_CASE("golden parity: every oracle fixture deep-equals (tests/data/materials.json)") {
-    std::ifstream f(std::string(AICAD_TEST_DATA_DIR) + "/materials.json");
-    REQUIRE_MESSAGE(f.good(), "materials.json golden not found at AICAD_TEST_DATA_DIR");
+    std::ifstream f(std::string(CHUDWARE_TEST_DATA_DIR) + "/materials.json");
+    REQUIRE_MESSAGE(f.good(), "materials.json golden not found at CHUDWARE_TEST_DATA_DIR");
     const json cases = json::parse(f);
     for (const json& c : cases) {
         CAPTURE(c["name"]);

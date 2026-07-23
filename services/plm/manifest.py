@@ -26,7 +26,7 @@ ITEM_KINDS = {
     "part", "assembly", "drawing", "ecad", "cam", "requirements", "deliverable",
 }
 AI_MODES = {"manual", "assisted", "managed"}
-REMOTE_KINDS = {"folder", "ssh", "https", "aicad-cloud"}
+REMOTE_KINDS = {"folder", "ssh", "https", "chudware-cloud"}
 
 
 def new_item_id() -> str:

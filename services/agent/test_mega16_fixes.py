@@ -39,7 +39,7 @@ def test_provider_for_tier_openrouter_deepseek_uses_keys_map(monkeypatch):
     from services.agent import config as agent_config
     from services.agent.tiers import provider_for_tier
 
-    monkeypatch.delenv("AI_CAD_PROVIDER", raising=False)
+    monkeypatch.delenv("CHUDWARE_PROVIDER", raising=False)
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     calls = []
 

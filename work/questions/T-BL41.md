@@ -17,14 +17,14 @@ With SmartDim armed the user can also:
   gap, so no blocking question.
 
 ## Screenshot evidence (PROVEN NOW, headless, engine attached)
-Captured via a new deterministic `AI_CAD_SHOT=sketch_autohide` scenario
+Captured via a new deterministic `CHUDWARE_SHOT=sketch_autohide` scenario
 (`ui/imgui/src/ui/scenarios.cpp`) that builds a genuinely constrained sketch
 (80×40 rectangle with per-edge horizontal/vertical + chained coincident relations
 AND a driving 80 mm distance dimension), enters the EXISTING sketch via the real
 dispatch→drain path (`pendingSketchEditFid` → `enterForFeature`, `inSketch=1`), then
 captures two static states. Run engine-attached under xvfb (never demo mode):
 
-    AI_CAD_SHOT=sketch_autohide AI_CAD_LIBAICAD=<core .so> \
+    CHUDWARE_SHOT=sketch_autohide CHUDWARE_LIBCHUDWARE=<core .so> \
       xvfb-run -a build/linux-app/bin/AI-CAD2 [--light] --shot <path> --frames 400
 
 Artifacts (committed under `docs/sessions/assets/`):

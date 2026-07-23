@@ -1,6 +1,6 @@
 """CAM (computer-aided machining) MCP tools — toolpath generation, feeds & speeds,
 material-removal simulation, and post-processed G-code, driven through the C++ core
-(libaicad ``cam_*`` RPCs). Mirrors the in-app CAM workspace.
+(libchudware ``cam_*`` RPCs). Mirrors the in-app CAM workspace.
 
 Call ``cad_guide("cam")`` for the workflow. The typical loop:
     cam_new_job -> cam_add_tool -> cam_extract (stock/holes/regions from the part)
@@ -334,7 +334,7 @@ def register_cam_tools(mcp: FastMCP) -> None:
                 doc = _CUR.get("doc_id")
                 if not doc:
                     raise ValueError("No current part and no path=. Build/open a part first, or pass path=.")
-                p = os.path.join(tempfile.gettempdir(), f"aicad_cam_extract_{os.getpid()}.step")
+                p = os.path.join(tempfile.gettempdir(), f"chudware_cam_extract_{os.getpid()}.step")
                 cb.call("export_file", {"doc_id": doc, "path": p, "format": "step"})
             params: dict = {"path": p, "kind": kind, "deflection": deflection}
             if z is not None:
@@ -379,7 +379,7 @@ def register_cam_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def cam_post(dialect: Optional[str] = None, setup_id: Optional[str] = None,
-                 program_name: str = "AICAD", program_number: int = 1000,
+                 program_name: str = "Chudware", program_number: int = 1000,
                  sequence_numbers: bool = False) -> str:
         """Post-process to controller G-code. `dialect` overrides the job default. Returns the
         NC program text + line count, tool changes, and estimated time."""

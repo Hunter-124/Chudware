@@ -1,5 +1,5 @@
-// Minimal size-rotated file logger for aicad-hostd. Logs live in the state dir
-// (~/.local/share/AI-CAD/logs/hostd.log) — never the runtime dir, which is tmpfs.
+// Minimal size-rotated file logger for chudware-hostd. Logs live in the state dir
+// (~/.local/share/Chudware/logs/hostd.log) — never the runtime dir, which is tmpfs.
 // Rotation: rename-based (hostd.log -> hostd.log.1 -> .2), 5 MB x 3 generations;
 // rename-not-overwrite per the project's live-file rule.
 #pragma once

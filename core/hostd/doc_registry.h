@@ -1,4 +1,4 @@
-// Doc access registry + event bus for aicad-hostd (Phase 3 of the shared-engine
+// Doc access registry + event bus for chudware-hostd (Phase 3 of the shared-engine
 // plan). Everything here is daemon-layer policy — the engine stays completely
 // client-ignorant; the registry only inspects requests/responses passing through
 // Server::dispatch.
@@ -29,7 +29,7 @@
 // MUTATING-METHOD CLASSIFICATION (the documented choice): enforcement applies
 // to any engine method whose params carry a "doc_id" and whose name is NOT in
 // the read-only allowlist below (exact names + prefixes). The allowlist covers
-// every pure-read family in core/api/libaicad.cpp dispatch: doc_tree/doc_query/
+// every pure-read family in core/api/libchudware.cpp dispatch: doc_tree/doc_query/
 // doc_bbox/doc_get_meta/render/describe/eval_*/sim_* solves (read geometry,
 // write no doc state)/doc_export/prof_*/sketch probes. Anything new therefore
 // FAILS SAFE as mutating — a false positive costs an ro client an error, never
@@ -95,9 +95,9 @@ public:
 
     // Client disconnected: drop its attachments/holds/subscriptions and notify
     // remaining subscribers (doc.lease_change). Docs left with NO attached
-    // client start the doc-GC grace countdown (AICAD_DOC_GC_GRACE_S, default
-    // 90 s; AICAD_DOC_GC=0 disables) — swept by tick(). Agent/mcp-origin docs
-    // use AICAD_DOC_GC_AGENT_GRACE_S (default 1800 s) so a just-finished
+    // client start the doc-GC grace countdown (CHUDWARE_DOC_GC_GRACE_S, default
+    // 90 s; CHUDWARE_DOC_GC=0 disables) — swept by tick(). Agent/mcp-origin docs
+    // use CHUDWARE_DOC_GC_AGENT_GRACE_S (default 1800 s) so a just-finished
     // mission's parts stay openable from the GUI after the agent detaches.
     void onDisconnect(int clientId, const std::string& kind);
 
@@ -156,7 +156,7 @@ private:
     static long sniffRevision(const nlohmann::json& result);
     int holdSecs() const;
     // Start/refresh the GC countdown when `d` has no attachments; clear it when
-    // it does. Agent/mcp-origin docs get a longer grace (AICAD_DOC_GC_AGENT_GRACE_S).
+    // it does. Agent/mcp-origin docs get a longer grace (CHUDWARE_DOC_GC_AGENT_GRACE_S).
     // No-op when doc-GC is disabled.
     static void updateOrphanDeadlineLocked(DocState& d);
     int rwCountLocked(const DocState& d) const;

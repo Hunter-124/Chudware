@@ -18,7 +18,7 @@ clients) onto one frozen `contracts/providers.md`; add per-context tool allow-li
 (the DAG node contract requires `tools:` lists); spike the BLESSED session-auth routes
 only. READ `docs/AI_TOOLING_MASTER_PLAN.md` §Pillar 12 — the prohibited list is binding
 (NEVER consumer OAuth token reuse for Claude/Gemini; OpenRouter PKCE is the blessed
-default; AI-CAD Cloud relay is a config seam only, human-gated).
+default; Chudware Cloud relay is a config seam only, human-gated).
 
 ## Files / areas touched
 
@@ -40,7 +40,7 @@ default; AI-CAD Cloud relay is a config seam only, human-gated).
 
 - `contracts/providers.md` v1 frozen: neutral message/adapter/thinking/streaming schema,
   token budgets, auth kinds (api_key | oauth_pkce | none/local), OpenRouter PKCE §4.1,
-  BINDING prohibited-auth §4.2, AI-CAD Cloud relay config seam §4.3, offline invariant §5,
+  BINDING prohibited-auth §4.2, Chudware Cloud relay config seam §4.3, offline invariant §5,
   tool registry + allow-listing §6, RESERVED `routing` §7 (T-H9). Corrected cite:
   `call_budget_for` is in `core/agent/run.cpp:48-63` (not config.cpp).
 - Registry: `services/mcp/tool_registry.py` tags {family,risk} via name-pattern classifier
@@ -78,8 +78,8 @@ default; AI-CAD Cloud relay is a config seam only, human-gated).
 - **Prohibited list is binding and testable:** grep-level CI assertion that no code
   references Claude/Gemini consumer OAuth endpoints. OpenRouter PKCE is the one new
   auth path; feature-flagged, key stored via the existing config.json mechanism
-  (`core/agent/config.cpp` resolution, `%APPDATA%/AI-CAD/config.json`).
-- **AI-CAD Cloud relay = one config entry** ("openai-compatible base_url + account
+  (`core/agent/config.cpp` resolution, `%APPDATA%/Chudware/config.json`).
+- **Chudware Cloud relay = one config entry** ("openai-compatible base_url + account
   auth kind"), no code path. Write the seam into the contract; implementation is
   human-gated (master plan Pillar 12).
 - **New consumer to plan for (don't build):** T-H9 adds an `adapter` field for

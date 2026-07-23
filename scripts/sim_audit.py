@@ -13,8 +13,8 @@ Independent reference values are derived from first principles INSIDE this scrip
 (never read from the engine under test), so a wrong docstring would be caught.
 
 Usage:
-    AI_CAD_LIBAICAD=/path/to/libaicad.so \\
-        ~/.local/share/AI-CAD/mcp-venv/bin/python scripts/sim_audit.py
+    CHUDWARE_LIBCHUDWARE=/path/to/libchudware.so \\
+        ~/.local/share/Chudware/mcp-venv/bin/python scripts/sim_audit.py
 
 Exit code: 0 if all checks pass or skip-with-reason; 1 if any BROKEN finding.
 """
@@ -447,19 +447,19 @@ def audit_ecad_sim() -> None:
 
 # ===========================================================================
 # FAMILY 5: FEA static + modal + fatigue + thermal (core C++ via core_bridge)
-# Requires libaicad.so. T-SIM4 UPDATE: the AICAD_WITH_NETGEN build
+# Requires libchudware.so. T-SIM4 UPDATE: the CHUDWARE_WITH_NETGEN build
 # (core/build-occt-linux) registers sim_run_static/modal/fatigue/thermal
-# DIRECTLY on the raw cb.call() bridge (core/api/libaicad.cpp), so the audit
+# DIRECTLY on the raw cb.call() bridge (core/api/libchudware.cpp), so the audit
 # now solves LIVE when that build is staged. The T-V1-era "not exposed on the
 # raw bridge" finding only holds for the plain build-linux .so.
 # ===========================================================================
 
 def _load_core_bridge():
     """Import core_bridge (or return (None, reason))."""
-    lib_path = os.environ.get("AI_CAD_LIBAICAD", "")
+    lib_path = os.environ.get("CHUDWARE_LIBCHUDWARE", "")
     if not lib_path or not os.path.exists(lib_path):
-        return None, ("AI_CAD_LIBAICAD not set or .so not found — "
-                      "export AI_CAD_LIBAICAD=core/build-occt-linux/bin/libaicad.so "
+        return None, ("CHUDWARE_LIBCHUDWARE not set or .so not found — "
+                      "export CHUDWARE_LIBCHUDWARE=core/build-occt-linux/bin/libchudware.so "
                       "(the netgen build carries the FEA RPCs)")
     mcp_path = os.path.join(_PROJECT_ROOT, "services", "mcp")
     if mcp_path not in sys.path:
@@ -571,11 +571,11 @@ def audit_fea() -> None:
                 _record("run_fea_static", "REAL",
                         "geometry pre-step OK but this .so lacks the netgen FEA RPCs "
                         "(sim_run_static: unknown method). Stage "
-                        "core/build-occt-linux/bin/libaicad.so to solve live. "
+                        "core/build-occt-linux/bin/libchudware.so to solve live. "
                         f"E-B reference: delta={delta_expected_mm:.4f} mm.",
                         executed=False)
                 _record("run_fea_modal", "REAL",
-                        "same build limitation — needs the AICAD_WITH_NETGEN .so. "
+                        "same build limitation — needs the CHUDWARE_WITH_NETGEN .so. "
                         f"Beam-theory reference: f1={f1_expected_hz:.2f} Hz.",
                         executed=False)
                 return
@@ -710,7 +710,7 @@ def audit_fatigue() -> None:
     except CoreError as exc:
         if "unknown method" in str(exc):
             _skip("run_fea_fatigue [live]",
-                  "this .so lacks sim_run_fatigue (needs AICAD_WITH_NETGEN build)")
+                  "this .so lacks sim_run_fatigue (needs CHUDWARE_WITH_NETGEN build)")
         else:
             _record("run_fea_fatigue [live]", "BROKEN", f"CoreError: {exc}")
     except Exception as exc:  # noqa: BLE001
@@ -820,7 +820,7 @@ def audit_thermal() -> None:
     except CoreError as exc:
         if "unknown method" in str(exc):
             _skip("sim_run_thermal [live]",
-                  "this .so lacks sim_run_thermal (needs AICAD_WITH_NETGEN build)")
+                  "this .so lacks sim_run_thermal (needs CHUDWARE_WITH_NETGEN build)")
         else:
             _record("sim_run_thermal [live]", "BROKEN", f"CoreError: {exc}")
     except Exception as exc:  # noqa: BLE001
@@ -873,8 +873,8 @@ def audit_cfd() -> None:
                     "layers. Validation gate: tools/foam_validation.py (sphere/cube Cd bands).",
                     executed=False)
             # LIVE validation leg (opt-in — a coarse sphere solve takes ~10-30 s):
-            #   AICAD_SIM_AUDIT_LIVE_FOAM=1 python scripts/sim_audit.py
-            if os.environ.get("AICAD_SIM_AUDIT_LIVE_FOAM"):
+            #   CHUDWARE_SIM_AUDIT_LIVE_FOAM=1 python scripts/sim_audit.py
+            if os.environ.get("CHUDWARE_SIM_AUDIT_LIVE_FOAM"):
                 try:
                     from tools.foam_validation import run_case
                     res = run_case("sphere", "coarse")
@@ -993,7 +993,7 @@ def main() -> int:
     print("=" * 70)
     print("sim_audit.py — T-V1 Simulation Backend Audit")
     print(f"Python: {sys.executable}")
-    print(f"AI_CAD_LIBAICAD: {os.environ.get('AI_CAD_LIBAICAD', '(not set)')}")
+    print(f"CHUDWARE_LIBCHUDWARE: {os.environ.get('CHUDWARE_LIBCHUDWARE', '(not set)')}")
     print("=" * 70)
 
     t0 = time.perf_counter()

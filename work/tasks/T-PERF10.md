@@ -37,5 +37,5 @@ All parking-lot items:
 - [x] scrape pool (per-site workers)
 - [x] idle render throttle (`glfwWaitEventsTimeout`)
 - [x] **AICM shared-mem handoff** — `aicm-shm://` via `core/util/aicm_handoff.*`; session publish + host `loadAicmFile` map; release on doc_close
-- [x] **CEF lazy init** — default skip `CefInitialize` at cold GUI launch; first `CefWebView::open` initializes; `AI_CAD_CEF_EARLY=1` restores eager path
+- [x] **CEF lazy init** — default skip `CefInitialize` at cold GUI launch; first `CefWebView::open` initializes; `CHUDWARE_CEF_EARLY=1` restores eager path
 - [x] **profiler cadence + symbols** — absolute `clock_nanosleep` cadence (~1 kHz under load); ucontext leaf PC (not handler self-time); ELF `.symtab` fallback for unstripped modules

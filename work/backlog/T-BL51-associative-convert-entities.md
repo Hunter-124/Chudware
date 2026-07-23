@@ -42,7 +42,7 @@ projected entity back to its source face/edge selector is stored; when the sourc
 
 ## Driver notes
 
-- Kernel pieces already exist from T-BL43: `aicad::doc::project_edges_to_plane` /
+- Kernel pieces already exist from T-BL43: `chudware::doc::project_edges_to_plane` /
   `face_boundary_edges` (core/doc/recon.{h,cpp}) and the shared `project_external_refs` helper in
   core/doc/session.cpp — associativity is a doc-schema + rebuild-hook problem, not new projection
   math.

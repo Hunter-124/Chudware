@@ -125,7 +125,7 @@ Canonical store: `engine_oracle/research/data/machines.json`
 ```
 
 Core `cam_machines` returns the same records (built-ins + optional
-`AICAD_MACHINES_REGISTRY` override file). Wire field names on the C++ `Machine`
+`CHUDWARE_MACHINES_REGISTRY` override file). Wire field names on the C++ `Machine`
 struct (`rapid_xy`, `travel`, …) may differ at the RPC edge; adapters map to this
 schema for JSON files and cross-checks.
 

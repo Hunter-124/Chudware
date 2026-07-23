@@ -1,20 +1,20 @@
 import ctypes, json, os, glob
 
-dist = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dist", "AI-CAD")
+dist = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dist", "Chudware")
 os.add_dll_directory(dist)
-os.environ.setdefault("AI_CAD_PROMPTS_DIR", os.path.join(dist, "app", "agent", "prompts"))
+os.environ.setdefault("CHUDWARE_PROMPTS_DIR", os.path.join(dist, "app", "agent", "prompts"))
 
-dll = ctypes.CDLL(os.path.join(dist, "libaicad.dll"))
-dll.aicad_call.restype = ctypes.c_int
-dll.aicad_call.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p)]
-dll.aicad_free.argtypes = [ctypes.c_char_p]
+dll = ctypes.CDLL(os.path.join(dist, "libchudware.dll"))
+dll.chudware_call.restype = ctypes.c_int
+dll.chudware_call.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p)]
+dll.chudware_free.argtypes = [ctypes.c_char_p]
 
 def call(method, params):
     out = ctypes.c_char_p()
-    rc = dll.aicad_call(method.encode(), json.dumps(params).encode(), ctypes.byref(out))
+    rc = dll.chudware_call(method.encode(), json.dumps(params).encode(), ctypes.byref(out))
     s = out.value.decode() if out.value else ""
     if out.value:
-        dll.aicad_free(out)
+        dll.chudware_free(out)
     return rc, s
 
 provider = {
@@ -44,7 +44,7 @@ except Exception as e:
 
 # Replay the per-stage events to see exactly where/why it died.
 run_id = res.get("run_id")
-runs = os.path.join(os.environ["APPDATA"], "AI-CAD", "cache", "runs")
+runs = os.path.join(os.environ["APPDATA"], "Chudware", "cache", "runs")
 d = os.path.join(runs, run_id) if run_id else max(glob.glob(os.path.join(runs, "run-*")), key=os.path.getmtime)
 print("\n=== events", os.path.basename(d), "===")
 for line in open(os.path.join(d, "events.jsonl"), encoding="utf-8"):

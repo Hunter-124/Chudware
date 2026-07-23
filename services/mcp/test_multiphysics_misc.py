@@ -10,7 +10,7 @@ test_hydraulic_handoff.py):
      Euler-Bernoulli closed forms.
   2. MCP-tool seam smokes via a stub FastMCP (payload-shape asserts for the
      hydraulic->FEA and hydraulic->piping->solve handoff chain).
-  3. Engine-backed motion checks (skipped cleanly when libaicad isn't staged):
+  3. Engine-backed motion checks (skipped cleanly when libchudware isn't staged):
      driven-distance displacement and quasi-static joint reactions vs m*g.
 
 Every analytic reference value cites its formula next to the number — no
@@ -281,14 +281,14 @@ def test_piping_internal_volume_exact_cylinder(tmp_path):
 
 # ══════════════════════════════ group 3: structural (Euler-Bernoulli) ══════════
 #
-# The struct_* MCP tools are dispatched to the C++ core (libaicad struct_* RPCs via
+# The struct_* MCP tools are dispatched to the C++ core (libchudware struct_* RPCs via
 # core_bridge) — they need a staged engine, not PyNite. Same gate as group 5.
 
 from mcp_server import core_bridge as cb  # noqa: E402
 
 _STRUCT_ENGINE = pytest.mark.skipif(
     not cb.available(),
-    reason="libaicad not staged; struct_* RPCs unavailable")
+    reason="libchudware not staged; struct_* RPCs unavailable")
 
 
 def _cantilever_doc(tmp_path, L_mm: float, w_n_mm: float) -> str:
@@ -431,7 +431,7 @@ def test_piping_verify_envelope_shape_from_mock_results():
 
 _ENGINE = pytest.mark.skipif(
     not cb.available(),
-    reason="libaicad not staged; engine-backed motion tools unavailable")
+    reason="libchudware not staged; engine-backed motion tools unavailable")
 
 
 def _call(name: str, args: dict):

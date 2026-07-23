@@ -38,8 +38,8 @@
 #include "aicm_loader.h"  // host loader (host/src/render on the include path)
 
 using json = nlohmann::json;
-using aicad::doc::CompileResult;
-using aicad::doc::compile_document;
+using chudware::doc::CompileResult;
+using chudware::doc::compile_document;
 
 namespace {
 
@@ -167,12 +167,12 @@ render::DocMesh parse(const CompileResult& r) {
 // returned selector resolves the SAME +X face on a rebuilt box of the same size.
 json plus_x_face_selector(double W, double H, double D) {
     TopoDS_Shape box = geom::make_box(W, H, D);
-    std::vector<aicad::doc::TopoInfo> infos = aicad::doc::describe_faces(box);
-    for (const aicad::doc::TopoInfo& info : infos) {
+    std::vector<chudware::doc::TopoInfo> infos = chudware::doc::describe_faces(box);
+    for (const chudware::doc::TopoInfo& info : infos) {
         if (!info.axis.has_value()) continue;
         if (std::abs(info.axis->x()) < 0.999) continue;     // not an +/-X-normal face
         if (std::abs(info.centroid.x() - W) > 1e-6) continue; // not the +X (x=W) face
-        return aicad::doc::make_selector(info);
+        return chudware::doc::make_selector(info);
     }
     return json(nullptr);  // not found (the test REQUIREs a real selector)
 }

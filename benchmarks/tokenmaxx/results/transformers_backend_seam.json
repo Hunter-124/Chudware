@@ -1,7 +1,7 @@
 {
-  "purpose": "Proof the extras-guarded transformers GPU backend (services/agent/local_runtime.py TransformersBackend) actually runs on this machine (T-W29 DoD: no all-skip). This is the seam gym cycle 2 (T-W27) reuses via AICAD_LOCAL_BACKEND / select_backend().",
+  "purpose": "Proof the extras-guarded transformers GPU backend (services/agent/local_runtime.py TransformersBackend) actually runs on this machine (T-W29 DoD: no all-skip). This is the seam gym cycle 2 (T-W27) reuses via CHUDWARE_LOCAL_BACKEND / select_backend().",
   "machine": "RTX 3080 Ti 12GB",
-  "torch_venv": "~/.local/share/AI-CAD/torch-venv (torch 2.6.0+cu124, transformers 5.13.0)",
+  "torch_venv": "~/.local/share/Chudware/torch-venv (torch 2.6.0+cu124, transformers 5.13.0)",
   "gate_venv_behavior": "transformers_available()=False; TransformersBackend(...) raises BackendUnavailable (honest skip, no import crash) -- verified by 6 passing TestBackendSeam tests in the gate venv",
   "smoke_run": {
     "model": "Qwen/Qwen2.5-0.5B-Instruct",

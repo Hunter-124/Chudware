@@ -1,21 +1,21 @@
-// aicad-hostd — the shared engine-host daemon.
+// chudware-hostd — the shared engine-host daemon.
 //
-// Owns the ONE libaicad instance and serves it over local IPC to every client:
+// Owns the ONE libchudware instance and serves it over local IPC to every client:
 // the desktop GUI, each MCP server process, and (Phase 5) supervised agent
 // workers. Whichever client starts first spawns the daemon (detached, via
-// aicad_ipc::spawnDetached); the daemon self-exits after AICAD_HOSTD_LINGER_SECS
+// chudware_ipc::spawnDetached); the daemon self-exits after CHUDWARE_HOSTD_LINGER_SECS
 // of no clients + no work. See ~/.claude plan "shared engine host daemon" and
 // docs/HOSTD.md (Phase 7).
 //
-//   aicad-hostd                 run (assumes already detached by the spawner)
-//   aicad-hostd --foreground    same, explicit (dev convenience)
-//   aicad-hostd --status        print daemon_status of the running instance
-//   aicad-hostd --stop          ask the running instance to drain and exit
+//   chudware-hostd                 run (assumes already detached by the spawner)
+//   chudware-hostd --foreground    same, explicit (dev convenience)
+//   chudware-hostd --status        print daemon_status of the running instance
+//   chudware-hostd --stop          ask the running instance to drain and exit
 //                               (refused while agent children run; add --force
 //                               to stop them first). If the socket is dead but
 //                               the pidfile process still lives, escalate:
 //                               SIGTERM, wait 3s, then SIGKILL.
-//   aicad-hostd --version       print build id + engine ABI
+//   chudware-hostd --version       print build id + engine ABI
 //
 // Startup order matters: acquire instance lock -> bind socket -> THEN load the
 // engine asynchronously. Racing clients connect immediately and see state:
@@ -59,7 +59,7 @@
 static hostd::Server* g_server = nullptr;
 
 static void trayQuitThunk(void*) {
-    // When systemd supervises us (billet-hostd.service Restart=always), a bare
+    // When systemd supervises us (chudware-hostd.service Restart=always), a bare
     // process exit is respawned in ~2s — the tray "Quit hostd" bounce users hit.
     // systemctl --user stop is a manual stop and stays down.
     //
@@ -82,7 +82,7 @@ static void trayQuitThunk(void*) {
             ::close(fd);
             if (n > 0) {
                 buf[n] = 0;
-                under_unit = std::string(buf, (size_t)n).find("billet-hostd.service") !=
+                under_unit = std::string(buf, (size_t)n).find("chudware-hostd.service") !=
                              std::string::npos;
             }
         }
@@ -96,7 +96,7 @@ static void trayQuitThunk(void*) {
                 ::setenv("DBUS_SESSION_BUS_ADDRESS", bus.c_str(), /*overwrite=*/0);
             }
         }
-        std::system("systemctl --user stop billet-hostd.service >/dev/null 2>&1 &");
+        std::system("systemctl --user stop chudware-hostd.service >/dev/null 2>&1 &");
         // SIGTERM lands in a moment (onSignal -> stop()). Do NOT also in-process
         // stop here: a clean self-exit before the stop job registers = Restart=
         // always bounce. If the stop call somehow fails, the next Quit click retries.
@@ -124,25 +124,25 @@ static void trayStatusTick(hostd::Server* server) {
     char tip[256];
     if (eng == 2) {
         ts = TrayStatus::Error;
-        std::snprintf(tip, sizeof tip, "Billet hostd — engine failed");
+        std::snprintf(tip, sizeof tip, "Chudware hostd — engine failed");
     } else if (draining) {
         ts = TrayStatus::Busy;
-        std::snprintf(tip, sizeof tip, "Billet hostd — draining (%d client%s)",
+        std::snprintf(tip, sizeof tip, "Chudware hostd — draining (%d client%s)",
                       clients, clients == 1 ? "" : "s");
     } else if (eng == 0) {
         ts = TrayStatus::Busy;
-        std::snprintf(tip, sizeof tip, "Billet hostd — loading engine…");
+        std::snprintf(tip, sizeof tip, "Chudware hostd — loading engine…");
     } else if (engInflight > 0) {
         ts = TrayStatus::Busy;
-        std::snprintf(tip, sizeof tip, "Billet hostd — %d client%s, %d in-flight",
+        std::snprintf(tip, sizeof tip, "Chudware hostd — %d client%s, %d in-flight",
                       clients, clients == 1 ? "" : "s", engInflight);
     } else if (clients > 0) {
         ts = TrayStatus::Idle;
-        std::snprintf(tip, sizeof tip, "Billet hostd — %d client%s (idle)",
+        std::snprintf(tip, sizeof tip, "Chudware hostd — %d client%s (idle)",
                       clients, clients == 1 ? "" : "s");
     } else {
         ts = TrayStatus::Idle;
-        std::snprintf(tip, sizeof tip, "Billet hostd — idle (ready)");
+        std::snprintf(tip, sizeof tip, "Chudware hostd — idle (ready)");
     }
     hostd::traySetStatus(ts, tip);
 }
@@ -230,17 +230,17 @@ static bool pidAlive(long pid) {
 // Returns 0 if the process was killed (or already gone); 1 if nothing to kill.
 static int stopViaPidfile(const std::string& reason) {
     const std::string self = selfPath();
-    const std::string key = aicad_ipc::instanceKey(self);
-    const std::string lock = aicad_ipc::lockPath(key);
+    const std::string key = chudware_ipc::instanceKey(self);
+    const std::string lock = chudware_ipc::lockPath(key);
     const long pid = readLockPid(lock);
     if (pid <= 1) {
         std::fprintf(stderr,
-                     "aicad-hostd: no running instance (%s); no live pid in %s\n",
+                     "chudware-hostd: no running instance (%s); no live pid in %s\n",
                      reason.c_str(), lock.empty() ? "(no lock path)" : lock.c_str());
         return 1;
     }
     std::fprintf(stderr,
-                 "aicad-hostd: socket dead (%s); escalating --stop to pid %ld via pidfile\n",
+                 "chudware-hostd: socket dead (%s); escalating --stop to pid %ld via pidfile\n",
                  reason.c_str(), pid);
     if (::kill((pid_t)pid, SIGTERM) != 0) {
         if (errno == ESRCH) {
@@ -249,7 +249,7 @@ static int stopViaPidfile(const std::string& reason) {
                         pid);
             return 0;
         }
-        std::fprintf(stderr, "aicad-hostd: SIGTERM pid %ld failed: %s\n", pid,
+        std::fprintf(stderr, "chudware-hostd: SIGTERM pid %ld failed: %s\n", pid,
                      std::strerror(errno));
         return 1;
     }
@@ -266,10 +266,10 @@ static int stopViaPidfile(const std::string& reason) {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
     std::fprintf(stderr,
-                 "aicad-hostd: pid %ld still alive after SIGTERM; sending SIGKILL\n",
+                 "chudware-hostd: pid %ld still alive after SIGTERM; sending SIGKILL\n",
                  pid);
     if (::kill((pid_t)pid, SIGKILL) != 0 && errno != ESRCH) {
-        std::fprintf(stderr, "aicad-hostd: SIGKILL pid %ld failed: %s\n", pid,
+        std::fprintf(stderr, "chudware-hostd: SIGKILL pid %ld failed: %s\n", pid,
                      std::strerror(errno));
         return 1;
     }
@@ -287,7 +287,7 @@ static int stopViaPidfile(const std::string& reason) {
 // Windows lock is a named mutex (no pidfile). Socket-dead escalation is a
 // no-op beyond reporting the original connect failure.
 static int stopViaPidfile(const std::string& reason) {
-    std::fprintf(stderr, "aicad-hostd: no running instance (%s)\n", reason.c_str());
+    std::fprintf(stderr, "chudware-hostd: no running instance (%s)\n", reason.c_str());
     return 1;
 }
 #endif
@@ -298,15 +298,15 @@ static int stopViaPidfile(const std::string& reason) {
 static int controlCommand(const char* method,
                           const nlohmann::json& params = nlohmann::json::object(),
                           bool stopEscalation = false) {
-    aicad_ipc::EngineClient cli;
-    aicad_ipc::EngineClient::Options opts;
+    chudware_ipc::EngineClient cli;
+    chudware_ipc::EngineClient::Options opts;
     opts.hostdBin = selfPath();
     opts.clientKind = "control";
     opts.allowSpawn = false;
     std::string err;
     if (!cli.connectOrSpawn(opts, err)) {
         if (stopEscalation) return stopViaPidfile(err);
-        std::fprintf(stderr, "aicad-hostd: no running instance (%s)\n", err.c_str());
+        std::fprintf(stderr, "chudware-hostd: no running instance (%s)\n", err.c_str());
         return 1;
     }
     nlohmann::json result;
@@ -319,7 +319,7 @@ static int controlCommand(const char* method,
             cli.disconnect();
             return stopViaPidfile(err);
         }
-        std::fprintf(stderr, "aicad-hostd: %s failed: %s\n", method, err.c_str());
+        std::fprintf(stderr, "chudware-hostd: %s failed: %s\n", method, err.c_str());
         return 1;
     }
     std::printf("%s\n", result.dump(2).c_str());
@@ -329,7 +329,7 @@ static int controlCommand(const char* method,
 int main(int argc, char** argv) {
     std::string mode = argc > 1 ? argv[1] : "";
     if (mode == "--version") {
-        std::printf("aicad-hostd %s\n", AICAD_HOSTD_BUILD_ID);
+        std::printf("chudware-hostd %s\n", CHUDWARE_HOSTD_BUILD_ID);
         return 0;
     }
     if (mode == "--status") return controlCommand("daemon_status");
@@ -343,25 +343,25 @@ int main(int argc, char** argv) {
     }
     if (!mode.empty() && mode != "--foreground") {
         std::fprintf(stderr,
-                     "usage: aicad-hostd [--foreground|--status|--stop [--force]|--version]\n");
+                     "usage: chudware-hostd [--foreground|--status|--stop [--force]|--version]\n");
         return 2;
     }
 
     const std::string self = selfPath();
-    const std::string key = aicad_ipc::instanceKey(self);
-    const std::string lock = aicad_ipc::lockPath(key);
-    const std::string sock = aicad_ipc::socketPath(key);
+    const std::string key = chudware_ipc::instanceKey(self);
+    const std::string lock = chudware_ipc::lockPath(key);
+    const std::string sock = chudware_ipc::socketPath(key);
     if (lock.empty() || sock.empty()) {
-        std::fprintf(stderr, "aicad-hostd: no usable runtime dir\n");
+        std::fprintf(stderr, "chudware-hostd: no usable runtime dir\n");
         return 1;
     }
 
-    hostd::log().open(aicad_ipc::stateDir() + "/logs");
+    hostd::log().open(chudware_ipc::stateDir() + "/logs");
 
     // 1. Single instance. Losing the race is SUCCESS for a spawn-on-demand
     //    daemon: the winner serves everyone; exit 0 so the spawner's retry
     //    loop lands on it.
-    aicad_ipc::SingleInstance instance;
+    chudware_ipc::SingleInstance instance;
     std::string err;
     if (!instance.acquire(lock, err)) {
         // T-PERF10: spawn-loser flock-wait. The incumbent may be mid-drain with
@@ -373,7 +373,7 @@ int main(int argc, char** argv) {
             std::chrono::steady_clock::now() + std::chrono::seconds(5);
         while (std::chrono::steady_clock::now() < deadline) {
             std::string cerr;
-            aicad_ipc::IpcConn probe = aicad_ipc::connectTo(sock, cerr);
+            chudware_ipc::IpcConn probe = chudware_ipc::connectTo(sock, cerr);
             if (probe.valid()) {
                 hostd::log().line("incumbent reachable — exiting 0 for client reconnect");
                 return 0;
@@ -404,7 +404,7 @@ int main(int argc, char** argv) {
             const std::string name = e.path().filename().string();
             if (name.rfind("hostd-", 0) != 0 || e.path().extension() != ".lock") continue;
             if (e.path().string() == lock) continue;
-            aicad_ipc::SingleInstance probe;
+            chudware_ipc::SingleInstance probe;
             std::string perr;
             if (!probe.acquire(e.path().string(), perr)) continue;  // owner alive
             fs::remove(e.path(), ec);
@@ -417,16 +417,16 @@ int main(int argc, char** argv) {
 #endif
 
     // 2. Bind before engine load.
-    aicad_ipc::IpcListener listener;
+    chudware_ipc::IpcListener listener;
     if (!listener.listen(sock, err)) {
         hostd::log().line("listen failed: %s", err.c_str());
-        std::fprintf(stderr, "aicad-hostd: %s\n", err.c_str());
+        std::fprintf(stderr, "chudware-hostd: %s\n", err.c_str());
         return 1;
     }
 
-    hostd::Server server(std::move(listener), AICAD_HOSTD_BUILD_ID);
-    server.children().setLogDir(aicad_ipc::stateDir() + "/logs");
-    server.setSelfBinary(self);  // stale-binary self-drain watches this + libaicad
+    hostd::Server server(std::move(listener), CHUDWARE_HOSTD_BUILD_ID);
+    server.children().setLogDir(chudware_ipc::stateDir() + "/logs");
+    server.setSelfBinary(self);  // stale-binary self-drain watches this + libchudware
     g_server = &server;
 #ifdef _WIN32
     SetConsoleCtrlHandler(onConsoleCtrl, TRUE);
@@ -438,14 +438,14 @@ int main(int argc, char** argv) {
     std::signal(SIGPIPE, SIG_IGN);  // dead client mid-write must not kill the daemon
 #endif
 
-    hostd::log().line("hostd %s starting: key=%s sock=%s pid=%ld", AICAD_HOSTD_BUILD_ID,
+    hostd::log().line("hostd %s starting: key=%s sock=%s pid=%ld", CHUDWARE_HOSTD_BUILD_ID,
                       key.c_str(), sock.c_str(), selfPid());
 
     // Optional system tray (Linux + libappindicator). No-op when disabled,
     // headless, or the feature was not compiled in.
     hostd::trayStart(self);
     hostd::traySetQuitHandler(&trayQuitThunk, nullptr);
-    hostd::traySetStatus(hostd::TrayStatus::Busy, "Billet hostd — starting…");
+    hostd::traySetStatus(hostd::TrayStatus::Busy, "Chudware hostd — starting…");
     std::atomic<bool> trayTickerStop{false};
     std::thread trayTicker([&server, &trayTickerStop] {
         while (!trayTickerStop.load()) {
@@ -472,12 +472,12 @@ int main(int argc, char** argv) {
     // 4. Autosave scheduler + prior-session recovery (Phase 3). Keyed by
     //    instance so scratch/test daemons never touch the real one's sessions.
     hostd::Autosave autosave;
-    autosave.start(aicad_ipc::stateDir() + "/hostd_autosave/" + key,
+    autosave.start(chudware_ipc::stateDir() + "/hostd_autosave/" + key,
                    &server.status().engineState);
     server.setAutosave(&autosave);
 
     int linger = 120;
-    if (const char* l = std::getenv("AICAD_HOSTD_LINGER_SECS"); l && *l)
+    if (const char* l = std::getenv("CHUDWARE_HOSTD_LINGER_SECS"); l && *l)
         linger = std::max(1, std::atoi(l));
     server.run(linger);
 

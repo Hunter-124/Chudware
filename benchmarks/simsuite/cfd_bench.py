@@ -74,7 +74,7 @@ def _sim_lbm(cb, solid, nx, ny, nz, tau0, n_steps, u_lat=0.05, backend=None):
     params = {"u_lat": u_lat, "tau0": tau0, "voxel_mm": 1.0,
               "dx_m": dx_m, "dt_s": dt_s, "rho_air": 1.225}
     # Additive backend select (auto|cpu|cuda); default leaves CPU unless env set.
-    be = backend if backend is not None else os.environ.get("AI_CAD_LBM_BACKEND")
+    be = backend if backend is not None else os.environ.get("CHUDWARE_LBM_BACKEND")
     if be:
         params["backend"] = be
     return cb.call("sim_lbm", {
@@ -369,7 +369,7 @@ def _bench_foam_solve(quick: bool) -> dict:
 
 def run(quick: bool = False) -> list[dict]:
     resguard.install()
-    os.environ.setdefault("AI_CAD_ENGINE_DAEMON", "0")
+    os.environ.setdefault("CHUDWARE_ENGINE_DAEMON", "0")
     from services.mcp import core_bridge as cb
 
     cases: list[dict] = []

@@ -10,8 +10,8 @@
 #include <string>
 #include <vector>
 
-using aicad::sketch3d::drag3;
-using aicad::sketch3d::solve_sketch3d;
+using chudware::sketch3d::drag3;
+using chudware::sketch3d::solve_sketch3d;
 using json = nlohmann::json;
 
 namespace {

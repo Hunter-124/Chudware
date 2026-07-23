@@ -10,7 +10,7 @@
 //
 // The library is PURE: no OCCT, no doc/ecad/agent linkage. Every side effect
 // (assembly/board loading, vendor-registry lookup, HTTP transport, LLM extraction,
-// model building) is an injectable seam on `Seams` — the libaicad dispatch glue
+// model building) is an injectable seam on `Seams` — the libchudware dispatch glue
 // supplies the production defaults (doc_open/doc_tree, ecad_container_open,
 // agent::http_post), tests inject in-memory fakes, exactly like the Python
 // oracle's injectable loaders. Network calls NEVER happen without configured
@@ -26,7 +26,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad {
+namespace chudware {
 namespace sourcing {
 
 using nlohmann::json;
@@ -148,13 +148,13 @@ std::string jlcpcb_sign(const std::string& method, const std::string& path,
 
 // ---- config -----------------------------------------------------------------------------------
 // The user config.json path — mirrors agent/paths.cpp::paths_config (same APPDATA /
-// XDG / legacy-AI-CAD pick logic) so the C++ providers read the SAME file the Python
+// XDG / legacy-Chudware pick logic) so the C++ providers read the SAME file the Python
 // engine reads. Exposed for tests (they point XDG_DATA_HOME at a fixture dir).
 std::string config_path();
 json load_config();  // {} on any read/parse failure (never hard-fails)
 
 // ---- vendor registry (engine_oracle/vendor_parts.py) -------------------------------------------
-// %APPDATA%/AI-CAD/vendor_parts (mirror of engine/paths.py::VENDOR_PARTS).
+// %APPDATA%/Chudware/vendor_parts (mirror of engine/paths.py::VENDOR_PARTS).
 std::string vendor_parts_dir();
 // Register a local CAD file in the vendor-parts index (port of register_local_cad with
 // copy_file=True): copies the file under vendor_parts/<slug>/<slug>/, writes the record
@@ -172,4 +172,4 @@ json register_local_cad(const std::string& supplier, const std::string& part_num
 bool call(const std::string& method, const json& params, const Seams& seams, json& result);
 
 }  // namespace sourcing
-}  // namespace aicad
+}  // namespace chudware

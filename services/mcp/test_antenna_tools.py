@@ -1,7 +1,7 @@
 """MCP antenna tools — design + analyze envelopes, openEMS skip.
 
 Run:
-  /home/hunter/.local/share/AI-CAD/mcp-venv/bin/python -X utf8 -m pytest \\
+  /home/hunter/.local/share/Chudware/mcp-venv/bin/python -X utf8 -m pytest \\
       services/mcp/test_antenna_tools.py -q
 """
 from __future__ import annotations

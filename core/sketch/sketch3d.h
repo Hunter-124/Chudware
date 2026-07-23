@@ -1,6 +1,6 @@
 // 3D free-space sketch constraint solver (feature type "sketch3d").
 //
-// Parameterizes 3D sketch entities into the shared aicad::solver::System variable
+// Parameterizes 3D sketch entities into the shared chudware::solver::System variable
 // vector (core/solver/nsolve.h — the same residual/Jacobian framework the 2D
 // sketch solver and the mate solver ride) and wires each schema constraint to one
 // or more residual blocks. dict-in / dict-out via nlohmann::json, mirroring
@@ -42,9 +42,9 @@
 #include <string>
 #include <vector>
 
-namespace aicad::sketch3d {
+namespace chudware::sketch3d {
 
-// Opaque warm-start state (mirror of aicad::sketch::SolveState).
+// Opaque warm-start state (mirror of chudware::sketch::SolveState).
 struct SolveState3 {
     Eigen::VectorXd x;                                 // last solved variable vector
     std::map<std::string, std::vector<int>> var_map;   // entity id -> variable indices
@@ -74,7 +74,7 @@ Sketch3DSolution solve_sketch3d(const nlohmann::json& sketch, const nlohmann::js
                                 const std::optional<SolveState3>& warm);
 
 // One free (unconstrained) degree of freedom, named in plain words for the GUI /
-// advisor ("p1 x", "point 2 z"). Mirrors aicad::sketch::FreeVar.
+// advisor ("p1 x", "point 2 z"). Mirrors chudware::sketch::FreeVar.
 struct FreeVar3 {
     std::string entity;
     std::string param;
@@ -86,7 +86,7 @@ struct FreeVar3 {
 std::vector<FreeVar3> free_variables3(const nlohmann::json& sketch,
                                       const nlohmann::json& env);
 
-// Constrained drag — 3D mirror of aicad::sketch::drag. Rebuilds the system from
+// Constrained drag — 3D mirror of chudware::sketch::drag. Rebuilds the system from
 // `sketch`, soft-targets the dragged handle at weight 0.01, warm-starts from
 // state.x when the topology matches, and solves with a 10 ms time budget.
 // Returns {ok, entities, statuses, converged, budget_exceeded, rejected_handles}.
@@ -98,4 +98,4 @@ nlohmann::json drag3(const SolveState3& state, const std::string& handle,
                      const nlohmann::json& sketch, const nlohmann::json& env,
                      const nlohmann::json& targets = nlohmann::json());
 
-}  // namespace aicad::sketch3d
+}  // namespace chudware::sketch3d

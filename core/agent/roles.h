@@ -2,9 +2,9 @@
 //
 // P52: role registry + editable-prompt resolution. The BUILTIN prompts dir is
 // product DATA (not under the binary's control at runtime); it is supplied via
-// the AI_CAD_PROMPTS_DIR env var (default "agent/prompts"), and a per-call
+// the CHUDWARE_PROMPTS_DIR env var (default "agent/prompts"), and a per-call
 // override `prompts_dir` lets the parity gate point C++ at the same files Python
-// reads. The user OVERRIDE dir is %APPDATA%/AI-CAD/prompts/<role>.md.
+// reads. The user OVERRIDE dir is %APPDATA%/Chudware/prompts/<role>.md.
 #pragma once
 
 #include <set>
@@ -13,7 +13,7 @@
 #include <vector>
 #include <nlohmann/json.hpp>
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 
 using nlohmann::json;
@@ -21,7 +21,7 @@ using nlohmann::json;
 extern const std::vector<std::string> kRoles;  // canonical order; extras via dir scan.
 
 // (text, source). source is the absolute path the text came from. Ops roles get
-// the ops cheatsheet appended. `prompts_dir` overrides AI_CAD_PROMPTS_DIR.
+// the ops cheatsheet appended. `prompts_dir` overrides CHUDWARE_PROMPTS_DIR.
 // When `solo` is true, modeler/fixer get the slim ops_cheatsheet_solo.md instead
 // of the full ~28KB sheet (Standard/Complex keep the full sheet). When
 // `tool_scope_full` is true the full sheet is forced even on Solo. Each entry in
@@ -43,4 +43,4 @@ json get_prompts_v2(const std::string& prompts_dir = "");
 std::string load_cheatsheet(const std::string& feature_type, const std::string& prompts_dir = "");
 
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware

@@ -4,9 +4,9 @@ ECAD documents live ONLY in memory — the :mod:`engine.ecad.session` registry h
 backing. A heavy MCP tool (ecad_simulate / ecad_make_board / ecad_design / autoroute / fill / dfm)
 can overrun the MCP client's per-call transport timeout; the client then KILLS the server and every
 open schematic/board is gone. C++ part docs survive that because cad_tools autosaves them to
-``%APPDATA%/AI-CAD/mcp_autosave`` and ``recover_autosaved`` reloads them on restart. This module
+``%APPDATA%/Chudware/mcp_autosave`` and ``recover_autosaved`` reloads them on restart. This module
 gives ECAD the same protection: every session is persisted to
-``%APPDATA%/AI-CAD/ecad_autosave/<doc_id>.json`` after every mutation, and
+``%APPDATA%/Chudware/ecad_autosave/<doc_id>.json`` after every mutation, and
 :func:`recover_ecad_autosaved` reopens them at server startup.
 
 Design constraints:
@@ -14,7 +14,7 @@ Design constraints:
     with a standalone script (build a session, mutate, recover).
   * BEST-EFFORT — a write/read failure is swallowed; autosave must never break the op that succeeded.
   * DISABLED BY DEFAULT — unit tests don't touch disk. The MCP server calls :func:`enable` at
-    startup; tests enable() with an env-overridden directory (``AI_CAD_ECAD_AUTOSAVE_DIR``).
+    startup; tests enable() with an env-overridden directory (``CHUDWARE_ECAD_AUTOSAVE_DIR``).
   * ATOMIC writes (tmp + os.replace) so a kill mid-write can't leave a half-written JSON that fails
     to reload.
 """
@@ -33,7 +33,7 @@ _STATE: dict = {"enabled": False, "session_id": None}
 
 # Autosaves older than this are pruned on recovery so the directory can't grow forever.
 try:
-    _MAX_AGE_DAYS = float(os.environ.get("AI_CAD_ECAD_AUTOSAVE_MAX_AGE_DAYS", "") or 7.0)
+    _MAX_AGE_DAYS = float(os.environ.get("CHUDWARE_ECAD_AUTOSAVE_MAX_AGE_DAYS", "") or 7.0)
 except (TypeError, ValueError):
     _MAX_AGE_DAYS = 7.0
 
@@ -59,14 +59,14 @@ def session_id() -> Optional[str]:
 
 
 def autosave_dir() -> Path:
-    """The directory autosaves live in. ``AI_CAD_ECAD_AUTOSAVE_DIR`` overrides it wholesale (tests),
-    else ``%APPDATA%/AI-CAD/ecad_autosave`` (falling back to the temp dir when APPDATA is unset)."""
-    override = os.environ.get("AI_CAD_ECAD_AUTOSAVE_DIR")
+    """The directory autosaves live in. ``CHUDWARE_ECAD_AUTOSAVE_DIR`` overrides it wholesale (tests),
+    else ``%APPDATA%/Chudware/ecad_autosave`` (falling back to the temp dir when APPDATA is unset)."""
+    override = os.environ.get("CHUDWARE_ECAD_AUTOSAVE_DIR")
     if override:
         d = Path(override)
     else:
         base = os.environ.get("APPDATA") or tempfile.gettempdir()
-        d = Path(base) / "AI-CAD" / "ecad_autosave"
+        d = Path(base) / "Chudware" / "ecad_autosave"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -126,7 +126,7 @@ def remove(doc_id: Optional[str]) -> None:
 # restart and old-session files (younger than the age cutoff) never get cleaned. Keep only the most
 # recent few dozen by mtime.
 try:
-    _MAX_FILES = int(os.environ.get("AI_CAD_ECAD_AUTOSAVE_MAX_FILES", "") or 40)
+    _MAX_FILES = int(os.environ.get("CHUDWARE_ECAD_AUTOSAVE_MAX_FILES", "") or 40)
 except (TypeError, ValueError):
     _MAX_FILES = 40
 if _MAX_FILES < 1:

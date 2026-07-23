@@ -59,7 +59,7 @@ per-face overlay). T-BL34 turns that from an open question into scoped work.
 - [x] **Author the Manufacture toolpath icons from scratch** (Hunter directive) — DONE
       for ALL 19 op buttons across all five sub-groups. `scripts/cam_toolpath_icons.py`
       drives the REAL chain per tile (`cam_new → cam_apply_ops(add_tool/add_setup/
-      add_operation) → cam_generate → cam_simulate`) via the libaicad core_bridge (no
+      add_operation) → cam_generate → cam_simulate`) via the libchudware core_bridge (no
       GUI, no demo mode) and renders the returned Move list over the stock silhouette
       using the in-app backplot palette (rapid/lead/cut/plunge/arc from ui_theme.cpp).
       2.5D: face/contour/pocket/adaptive/slot/chamfer/engrave; Holes: drill(peck)/
@@ -82,7 +82,7 @@ per-face overlay). T-BL34 turns that from an open question into scoped work.
       scripts/icon_pipeline.py --render`, idempotent, exit 0, zero failed steps).
       Contact sheets scratch/icon_contact_sheet_{dark,light}.png (each tile at review
       size + true 32px) for Hunter's review; every tile eyeballed by the driver,
-      including in-context AI_CAD_SHOT=ribbon manufacture-tab captures dark+light
+      including in-context CHUDWARE_SHOT=ribbon manufacture-tab captures dark+light
       (scratch/ribbon_manufacture_{dark,light}.png) proving the C++ loader reads the
       extended atlas.
 - [x] scripts/gate.sh + `graphify update .` before review (see progress log).
@@ -98,7 +98,7 @@ not let it fall off the board.
 
 ## Driver notes
 
-- Pipeline: `scripts/icon_pipeline.py` RECIPES + `AI_CAD_SHOT=iconpipe`;
+- Pipeline: `scripts/icon_pipeline.py` RECIPES + `CHUDWARE_SHOT=iconpipe`;
   `host/src/ui/renderer.{h,cpp}` renderThumbnail; `host/src/ui/scenarios.cpp` runIconPipe
   (face ref-selectors live here). See work/tasks/T-G15.md HANDOFF 2 for the per-face
   overlay design constraints already mapped.
@@ -108,7 +108,7 @@ not let it fall off the board.
 ## Open follow-ups (tracked, not silently dropped)
 
 - [ ] TRUE per-face emphasis in renderThumbnail (see DoD item above) — renderer work.
-- [ ] T-G11 dependency: the pipeline hooks (AI_CAD_SHOT=iconpipe in host/src/ui/
+- [ ] T-G11 dependency: the pipeline hooks (CHUDWARE_SHOT=iconpipe in host/src/ui/
       scenarios.cpp, ribbon_def.cpp icon map) live in the DEPRECATED host/ tree. When
       T-G11 deletes host/, iconpipe + the cam_* button mapping must migrate to
       ui/imgui (ui/abstract/command_registry has NO cam_op entries yet — when the
@@ -126,7 +126,7 @@ not let it fall off the board.
   greenlights" park is lifted; the Manufacture-toolpath DoD item is the binding
   interpretation of his directive. Dependency T-BL29 is done. NOTE: driver-notes paths
   reference deprecated host/src — the pipeline hooks may have moved to ui/imgui during the
-  migration waves; verify where AI_CAD_SHOT=iconpipe lives NOW before editing.
+  migration waves; verify where CHUDWARE_SHOT=iconpipe lives NOW before editing.
 ### sonnet-ivo — 2026-07-04 (v2 delivered, status: review)
 
 **What shipped (branch task/T-BL34-icon-pipeline-v2-color-annotate):**
@@ -146,10 +146,10 @@ not let it fall off the board.
 - Atlases + atlas.json regenerated via pipeline; 41 tiles injected; raster_only updated.
 
 **Verification:** pipeline exit 0 / 159 ok / 0 failed steps; contact sheets dark+light
-eyeballed tile-by-tile; AI_CAD_SHOT=ribbon manufacture tab captured dark+light headless
-(xvfb, real engine libaicad staged — no demo mode) and eyeballed: new 20px toolpath
+eyeballed tile-by-tile; CHUDWARE_SHOT=ribbon manufacture tab captured dark+light headless
+(xvfb, real engine libchudware staged — no demo mode) and eyeballed: new 20px toolpath
 icons render in-context from the extended atlas. gate.sh + graphify update run before
-review. Known cosmetic: the first-run ShopCraft info toast overlays the Job group in
+review. Known cosmetic: the first-run Chudware info toast overlays the Job group in
 headless ribbon shots (pre-existing, affects captures of every tab).
 
 **Design decisions:** per-body v1 emphasis (foreman-approved) with per-face left as

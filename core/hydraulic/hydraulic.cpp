@@ -11,7 +11,7 @@
 #include "piping/simhandoff.h"
 #include "piping/solve.h"
 
-namespace aicad::hydraulic {
+namespace chudware::hydraulic {
 namespace {
 
 using pyutil::fmt_f;
@@ -491,4 +491,4 @@ bool call(const std::string& method, const ojson& params, ojson& result) {
     return false;
 }
 
-}  // namespace aicad::hydraulic
+}  // namespace chudware::hydraulic

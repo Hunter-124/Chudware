@@ -6,7 +6,7 @@
 
 #include "agent/firm_bid.h"
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 
 namespace {
@@ -133,4 +133,4 @@ std::vector<TeamMember> assemble_team(const std::string& request, Domain primary
 }
 
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware

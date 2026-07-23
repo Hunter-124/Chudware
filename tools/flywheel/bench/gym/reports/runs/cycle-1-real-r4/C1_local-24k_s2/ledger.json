@@ -611,7 +611,7 @@
           "run_id": "flanged_bushing_design_20231005"
         },
         "ok": true,
-        "result": "{\n  \"ok\": false,\n  \"reason\": \"Build graph run 'flanged_bushing_design_20231005' not found\",\n  \"hint\": \"Check run_id (from buildgraph_plan) and runs_dir (default: /home/hunter/.local/share/AI-CAD/runs).\"\n}"
+        "result": "{\n  \"ok\": false,\n  \"reason\": \"Build graph run 'flanged_bushing_design_20231005' not found\",\n  \"hint\": \"Check run_id (from buildgraph_plan) and runs_dir (default: /home/hunter/.local/share/Chudware/runs).\"\n}"
       }
     },
     {
@@ -757,7 +757,7 @@
           "runs_dir_override": null
         },
         "ok": true,
-        "result": "{\n  \"ok\": false,\n  \"reason\": \"Build graph run 'flanged_bushing_design_run' not found\",\n  \"hint\": \"Check run_id (from buildgraph_plan) and runs_dir (default: /home/hunter/.local/share/AI-CAD/runs).\"\n}"
+        "result": "{\n  \"ok\": false,\n  \"reason\": \"Build graph run 'flanged_bushing_design_run' not found\",\n  \"hint\": \"Check run_id (from buildgraph_plan) and runs_dir (default: /home/hunter/.local/share/Chudware/runs).\"\n}"
       }
     },
     {
@@ -837,7 +837,7 @@
           "runs_dir_override": null
         },
         "ok": true,
-        "result": "{\n  \"ok\": false,\n  \"reason\": \"Build graph run 'gym_C1_local-24k_s2' not found\",\n  \"hint\": \"Check run_id (from buildgraph_plan) and runs_dir (default: /home/hunter/.local/share/AI-CAD/runs).\"\n}"
+        "result": "{\n  \"ok\": false,\n  \"reason\": \"Build graph run 'gym_C1_local-24k_s2' not found\",\n  \"hint\": \"Check run_id (from buildgraph_plan) and runs_dir (default: /home/hunter/.local/share/Chudware/runs).\"\n}"
       }
     },
     {
@@ -1142,7 +1142,7 @@
           }
         },
         "ok": true,
-        "result": "{\n  \"ok\": true,\n  \"run_id\": \"a79b3bb3-67f4-4460-a623-58252eae17b2\",\n  \"graph\": {\n    \"schema\": \"aicad.buildgraph/1\",\n    \"mission\": \"\",\n    \"nodes\": []\n  },\n  \"advisories\": [\n    {\n      \"schema\": \"aicad.advisory/1\",\n      \"seq\": 5,\n      \"stage\": \"build_plan\",\n      \"items\": [\n        {\n          \"id\": \"adv_a01e36ef\",\n          \"severity\": \"hint\",\n          \"check\": \"empty_graph\",\n          \"finding\": \"Build graph has no nodes; nothing to validate.\",\n          \"refs\": {},\n          \"numbers\": {},\n          \"candidate_fixes\": [],\n          \"helper_tools\": [],\n          \"source\": {\n            \"kind\": \"calc\",\n            \"detail\": \"buildgraph_validator\"\n          }\n        }\n      ]\n    }\n  ],\n  \"sidecar_path\": \"/home/hunter/.local/share/AI-CAD/runs/a79b3bb3-67f4-4460-a623-58252eae17b2.buildgraph.json\",\n  \"node_count\": 0,\n  \"advisory_count\": 1,\n  \"blocker_count\": 0,\n  \"hint\": \"Use buildgraph_status(run_id) to inspect node statuses. Review any advisory findings before executing \\u2014 bl…"
+        "result": "{\n  \"ok\": true,\n  \"run_id\": \"a79b3bb3-67f4-4460-a623-58252eae17b2\",\n  \"graph\": {\n    \"schema\": \"aicad.buildgraph/1\",\n    \"mission\": \"\",\n    \"nodes\": []\n  },\n  \"advisories\": [\n    {\n      \"schema\": \"aicad.advisory/1\",\n      \"seq\": 5,\n      \"stage\": \"build_plan\",\n      \"items\": [\n        {\n          \"id\": \"adv_a01e36ef\",\n          \"severity\": \"hint\",\n          \"check\": \"empty_graph\",\n          \"finding\": \"Build graph has no nodes; nothing to validate.\",\n          \"refs\": {},\n          \"numbers\": {},\n          \"candidate_fixes\": [],\n          \"helper_tools\": [],\n          \"source\": {\n            \"kind\": \"calc\",\n            \"detail\": \"buildgraph_validator\"\n          }\n        }\n      ]\n    }\n  ],\n  \"sidecar_path\": \"/home/hunter/.local/share/Chudware/runs/a79b3bb3-67f4-4460-a623-58252eae17b2.buildgraph.json\",\n  \"node_count\": 0,\n  \"advisory_count\": 1,\n  \"blocker_count\": 0,\n  \"hint\": \"Use buildgraph_status(run_id) to inspect node statuses. Review any advisory findings before executing \\u2014 bl…"
       }
     },
     {

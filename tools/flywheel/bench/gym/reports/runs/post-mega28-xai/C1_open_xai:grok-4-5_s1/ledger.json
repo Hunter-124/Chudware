@@ -1219,7 +1219,7 @@
           "domain": ""
         },
         "ok": true,
-        "result": "{\"ok\": true, \"count\": 0, \"has_live\": false, \"results\": [], \"notices\": [{\"site\": \"amazon\", \"reason\": \"timeout\", \"hint\": \"live vendor 'amazon' exceeded 4s budget (AI_CAD_PARTS_LIVE_BUDGET_S)\"}, {\"site\": \"3dcontentcentral\", \"reason\": \"timeout\", \"hint\": \"live vendor '3dcontentcentral' exceeded 4s budget (AI_CAD_PARTS_LIVE_BUDGET_S)\"}, {\"site\": \"digikey\", \"reason\": \"timeout\", \"hint\": \"live vendor 'digikey' exceeded 4s budget (AI_CAD_PARTS_LIVE_BUDGET_S)\"}, {\"site\": \"grabcad\", \"reason\": \"timeout\", \"hint\": \"live vendor 'grabcad' exceeded 4s budget (AI_CAD_PARTS_LIVE_BUDGET_S)\"}, {\"site\": \"jlcpcb\", \"reason\": \"timeout\", \"hint\": \"live vendor 'jlcpcb' exceeded 4s budget (AI_CAD_PARTS_LIVE_BUDGET_S)\"}, {\"site\": \"lcsc\", \"reason\": \"timeout\", \"hint\": \"live vendor 'lcsc' exceeded 4s budget (AI_CAD_PARTS_LIVE_BUDGET_S)\"}, {\"site\": \"mcmaster\", \"reason\": \"timeout\", \"hint\": \"live vendor 'mcmaster' exceeded 4s budget (AI_CAD_PARTS_LIVE_BUDGET_S)\"}, {\"site\": \"misumi\", \"reason\": \"timeout\", \"hint\": \"live vend…"
+        "result": "{\"ok\": true, \"count\": 0, \"has_live\": false, \"results\": [], \"notices\": [{\"site\": \"amazon\", \"reason\": \"timeout\", \"hint\": \"live vendor 'amazon' exceeded 4s budget (CHUDWARE_PARTS_LIVE_BUDGET_S)\"}, {\"site\": \"3dcontentcentral\", \"reason\": \"timeout\", \"hint\": \"live vendor '3dcontentcentral' exceeded 4s budget (CHUDWARE_PARTS_LIVE_BUDGET_S)\"}, {\"site\": \"digikey\", \"reason\": \"timeout\", \"hint\": \"live vendor 'digikey' exceeded 4s budget (CHUDWARE_PARTS_LIVE_BUDGET_S)\"}, {\"site\": \"grabcad\", \"reason\": \"timeout\", \"hint\": \"live vendor 'grabcad' exceeded 4s budget (CHUDWARE_PARTS_LIVE_BUDGET_S)\"}, {\"site\": \"jlcpcb\", \"reason\": \"timeout\", \"hint\": \"live vendor 'jlcpcb' exceeded 4s budget (CHUDWARE_PARTS_LIVE_BUDGET_S)\"}, {\"site\": \"lcsc\", \"reason\": \"timeout\", \"hint\": \"live vendor 'lcsc' exceeded 4s budget (CHUDWARE_PARTS_LIVE_BUDGET_S)\"}, {\"site\": \"mcmaster\", \"reason\": \"timeout\", \"hint\": \"live vendor 'mcmaster' exceeded 4s budget (CHUDWARE_PARTS_LIVE_BUDGET_S)\"}, {\"site\": \"misumi\", \"reason\": \"timeout\", \"hint\": \"live vend…"
       }
     },
     {
@@ -4207,7 +4207,7 @@
             "name": "flanged_bushing",
             "paths": [
               "/home/hunter/Repositories/CAD/reports/runs/gym_C1_open_xai:grok-4-5_s1/parts/flanged_bushing_-cpp00000001.step+",
-              "/home/hunter/Documents/AI-CAD/flanged_bushing_-cpp00000001.step+"
+              "/home/hunter/Documents/Chudware/flanged_bushing_-cpp00000001.step+"
             ]
           },
           {
@@ -4215,7 +4215,7 @@
             "name": "flanged_bushing2",
             "paths": [
               "/home/hunter/Repositories/CAD/reports/runs/gym_C1_open_xai:grok-4-5_s1/parts/flanged_bushing2_-cpp00000008.step+",
-              "/home/hunter/Documents/AI-CAD/flanged_bushing2_-cpp00000008.step+"
+              "/home/hunter/Documents/Chudware/flanged_bushing2_-cpp00000008.step+"
             ]
           },
           {
@@ -4223,7 +4223,7 @@
             "name": "flanged_bushing3",
             "paths": [
               "/home/hunter/Repositories/CAD/reports/runs/gym_C1_open_xai:grok-4-5_s1/parts/flanged_bushing3_-cpp0000000a.step+",
-              "/home/hunter/Documents/AI-CAD/flanged_bushing3_-cpp0000000a.step+"
+              "/home/hunter/Documents/Chudware/flanged_bushing3_-cpp0000000a.step+"
             ]
           }
         ]

@@ -31,7 +31,7 @@
 
 #include <Eigen/Dense>
 
-namespace aicad::sim {
+namespace chudware::sim {
 
 using nlohmann::json;
 
@@ -1036,9 +1036,9 @@ json eval_probe(const Setup& s, const std::vector<double>& x, const std::string&
 }  // namespace
 
 json spice_simulate(const json& circuit, const json& study) {
-    const std::string input_hash = aicad::sim::cache::hash_spice(circuit, study);
+    const std::string input_hash = chudware::sim::cache::hash_spice(circuit, study);
     {
-        auto hit = aicad::sim::cache::lookup(aicad::sim::cache::Kind::Spice, input_hash);
+        auto hit = chudware::sim::cache::lookup(chudware::sim::cache::Kind::Spice, input_hash);
         if (hit.hit) {
             json out = hit.result;
             out["cache_hit"] = true;
@@ -1052,7 +1052,7 @@ json spice_simulate(const json& circuit, const json& study) {
         result.erase("cache_hit");
         result.erase("cache_reason");
         result.erase("input_hash");
-        aicad::sim::cache::store(aicad::sim::cache::Kind::Spice, input_hash, result);
+        chudware::sim::cache::store(chudware::sim::cache::Kind::Spice, input_hash, result);
         result["cache_hit"] = false;
         result["cache_reason"] = "miss";
         result["input_hash"] = input_hash;
@@ -2544,4 +2544,4 @@ json spice_simulate(const json& circuit, const json& study) {
     return finish(std::move(result));
 }
 
-}  // namespace aicad::sim
+}  // namespace chudware::sim

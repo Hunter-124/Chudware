@@ -8,7 +8,7 @@ ecad_tf) can flip backends with one parameter and compare numbers 1:1.
 
 Contract:
   * ngspice is OPTIONAL. Nothing here installs it; :func:`ngspice_status`
-    detects it (env ``AI_CAD_NGSPICE`` wins, else PATH) and reports an honest
+    detects it (env ``CHUDWARE_NGSPICE`` wins, else PATH) and reports an honest
     install hint (``dnf install ngspice``). When it is absent, callers degrade
     to the MNA backend with a note — never an exception.
   * Supported analyses: op, dc, tran, ac, tf. Everything else (four/mc/temp/
@@ -43,7 +43,7 @@ from typing import Any, Optional
 # Analyses this backend can hand to ngspice; anything else stays on MNA.
 SUPPORTED_ANALYSES = {"op", "dc", "tran", "ac", "tf"}
 
-_TIMEOUT_S = float(os.environ.get("AI_CAD_NGSPICE_TIMEOUT_S", "60"))
+_TIMEOUT_S = float(os.environ.get("CHUDWARE_NGSPICE_TIMEOUT_S", "60"))
 
 # --------------------------------------------------------------------------- detection
 
@@ -51,8 +51,8 @@ _FIND_CACHE: dict = {}
 
 
 def find_ngspice() -> Optional[str]:
-    """Absolute path to the ngspice binary, or None. Env AI_CAD_NGSPICE overrides PATH."""
-    key = os.environ.get("AI_CAD_NGSPICE", "")
+    """Absolute path to the ngspice binary, or None. Env CHUDWARE_NGSPICE overrides PATH."""
+    key = os.environ.get("CHUDWARE_NGSPICE", "")
     if key in _FIND_CACHE:
         return _FIND_CACHE[key]
     path: Optional[str] = None
@@ -94,7 +94,7 @@ def ngspice_status() -> dict:
         "purpose": ("optional SPICE backend for ecad_simulate/ecad_tf "
                     "(vendor .SUBCKT/.MODEL libraries the internal MNA solver can't run)"),
         "install_hint": "" if path else
-            "sudo dnf install ngspice   (or set AI_CAD_NGSPICE=/path/to/ngspice)",
+            "sudo dnf install ngspice   (or set CHUDWARE_NGSPICE=/path/to/ngspice)",
         "fallback": "internal MNA solver (backend='mna', the default) — always available",
     }
 
@@ -126,7 +126,7 @@ def resolve_backend(requested: str, circuit: dict, study: dict) -> tuple[str, st
         if req == "ngspice":
             return "mna", ("ngspice is not installed on this machine — degraded to the "
                            "internal MNA solver. Install: sudo dnf install ngspice "
-                           "(or set AI_CAD_NGSPICE).")
+                           "(or set CHUDWARE_NGSPICE).")
         # auto: mna is the honest default when ngspice is absent
         note = ""
         if needs_vendor:
@@ -321,7 +321,7 @@ def _run_ngspice(deck: str, want_raw: bool) -> tuple[str, str]:
     exe = find_ngspice()
     if not exe:
         raise NgspiceError("ngspice binary not found")
-    with tempfile.TemporaryDirectory(prefix="aicad-ngspice-") as td:
+    with tempfile.TemporaryDirectory(prefix="chudware-ngspice-") as td:
         cir = os.path.join(td, "deck.cir")
         rawp = os.path.join(td, "out.raw")
         with open(cir, "w", encoding="utf-8") as f:

@@ -7,7 +7,7 @@
 #include <algorithm>
 #include <cmath>
 
-namespace aicad {
+namespace chudware {
 namespace cam {
 
 namespace {
@@ -525,4 +525,4 @@ void SimResult::frames_to_json(json& j) const {
 }
 
 }  // namespace cam
-}  // namespace aicad
+}  // namespace chudware

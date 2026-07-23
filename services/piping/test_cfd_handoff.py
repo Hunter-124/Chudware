@@ -9,7 +9,7 @@ Test groups:
 Run from repo root:
     python -m engine.piping.test_cfd_handoff
     # or via pytest:
-    ~/.local/share/AI-CAD/mcp-venv/bin/pytest engine/piping/test_cfd_handoff.py -q
+    ~/.local/share/Chudware/mcp-venv/bin/pytest engine/piping/test_cfd_handoff.py -q
 """
 
 from __future__ import annotations

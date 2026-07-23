@@ -17,7 +17,7 @@
 #include <cstring>
 #endif
 
-namespace aicad::firmware {
+namespace chudware::firmware {
 
 namespace {
 // Python's subprocess.run(text=True) applies universal-newline translation
@@ -274,4 +274,4 @@ RunResult run_capture(const std::vector<std::string>& argv, const std::string& c
 
 #endif
 
-}  // namespace aicad::firmware
+}  // namespace chudware::firmware

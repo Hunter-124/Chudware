@@ -1,6 +1,6 @@
-# billet-web RUNBOOK (Hunter)
+# chudware-web RUNBOOK (Hunter)
 
-Host: Fedora 44, rootless podman, gateway `127.0.0.1:8300`, data `~/billet-web-data/`.
+Host: Fedora 44, rootless podman, gateway `127.0.0.1:8300`, data `~/chudware-web-data/`.
 Public: `https://chudware.com` via Cloudflare Tunnel + Access.
 
 ---
@@ -14,14 +14,14 @@ Public: `https://chudware.com` via Cloudflare Tunnel + Access.
 1. **Cloudflare API token**
    - Dashboard → My Profile → API Tokens → find/revoke the leaked token.
    - Create a replacement with least privilege needed for `cf_provision.py` (Access apps, tunnels, DNS on `chudware.com`).
-   - Store the new token **only** outside git (password manager / `~/billet-web-data/secrets/`). Never re-commit.
+   - Store the new token **only** outside git (password manager / `~/chudware-web-data/secrets/`). Never re-commit.
 
 2. **R2 Access Key ID + Secret**
    - Dashboard → R2 → Manage R2 API Tokens → revoke the leaked pair.
    - Create a new R2 token if you still need object storage; put keys in the same secrets dir / env — not the repo.
 
 3. **Tunnel token**
-   - Remotely-managed tunnel token lives in `~/billet-web-data/gateway.env` as `TUNNEL_TOKEN=…`.
+   - Remotely-managed tunnel token lives in `~/chudware-web-data/gateway.env` as `TUNNEL_TOKEN=…`.
    - If the old API token could mint tunnel credentials, rotate the tunnel token after API token rotation (`cloudflared tunnel token <name>` or re-run provision).
 
 ### Optional history rewrite (explicit approval only)
@@ -51,19 +51,19 @@ Do **not** hand-create these if provision already ran:
 | Team domain | `https://bruh234324.cloudflareaccess.com` |
 | One-Time PIN IdP | already enabled |
 | Zone | `chudware.com` active |
-| Tunnel | `billet-web` (remotely-managed) |
+| Tunnel | `chudware-web` (remotely-managed) |
 | Public hostname | `chudware.com` → `http://127.0.0.1:8300` (WSS over same HTTPS) |
 | Access application | self-hosted app for `chudware.com` |
 
-`cf_provision.py` is **driver-owned** and lands beside these deploy files — DeployOps does not implement it. It should write into **`~/billet-web-data/gateway.env`** (never committed):
+`cf_provision.py` is **driver-owned** and lands beside these deploy files — DeployOps does not implement it. It should write into **`~/chudware-web-data/gateway.env`** (never committed):
 
 ```bash
 TUNNEL_TOKEN=...                 # cloudflared tunnel run --token
-BILLET_CF_TEAM_DOMAIN=https://bruh234324.cloudflareaccess.com
-BILLET_CF_AUD=...                # Access Application Audience (AUD) tag
+CHUDWARE_CF_TEAM_DOMAIN=https://bruh234324.cloudflareaccess.com
+CHUDWARE_CF_AUD=...                # Access Application Audience (AUD) tag
 ```
 
-Gateway verifies `Cf-Access-Jwt-Assertion` against team JWKS (`…/cdn-cgi/access/certs`) with `iss` = team domain and `aud` = `BILLET_CF_AUD`. JWKS rotates ~every 6 weeks (previous key valid ~7 days) — always fetch remotely, match `kid`.
+Gateway verifies `Cf-Access-Jwt-Assertion` against team JWKS (`…/cdn-cgi/access/certs`) with `iss` = team domain and `aud` = `CHUDWARE_CF_AUD`. JWKS rotates ~every 6 weeks (previous key valid ~7 days) — always fetch remotely, match `kid`.
 
 ### Hunter remaining manual steps
 
@@ -110,7 +110,7 @@ users:
     heavy: false
 ```
 
-- Email must match Access JWT `email` claim (or `X-Dev-User` when `BILLET_WEB_DEV=1`).
+- Email must match Access JWT `email` claim (or `X-Dev-User` when `CHUDWARE_WEB_DEV=1`).
 - **heavy: true** → session may get CDI GPU + `nvh264enc`; default seats are CPU `x264enc` / llvmpipe.
 - Cap: demo default **3** sessions; hard **4**; **≤2** concurrent heavy. Edit list before demo; restart gateway if it only loads users at boot.
 
@@ -118,16 +118,16 @@ users:
 
 ## (d) Demo-day checklist
 
-- [ ] Secrets rotated; `gateway.env` has `TUNNEL_TOKEN`, `BILLET_CF_TEAM_DOMAIN`, `BILLET_CF_AUD` (mode 600).
+- [ ] Secrets rotated; `gateway.env` has `TUNNEL_TOKEN`, `CHUDWARE_CF_TEAM_DOMAIN`, `CHUDWARE_CF_AUD` (mode 600).
 - [ ] `bash Webservice/deploy/setup.sh` already run; linger enabled.
-- [ ] `systemctl --user start billet-gateway billet-cloudflared billet-monitor.timer`
-- [ ] Session image present: `podman image exists localhost/billet-session:latest`
+- [ ] `systemctl --user start chudware-gateway chudware-cloudflared chudware-monitor.timer`
+- [ ] Session image present: `podman image exists localhost/chudware-session:latest`
 - [ ] Optional warm seat: start one session as admin, leave idle for fast first guest.
 - [ ] `curl -sS http://127.0.0.1:8300/healthz` — sessions, free RAM, VRAM, image bit look sane.
 - [ ] Access allowlist + `users.yaml` include every demo attendee email.
 - [ ] Browser smoke: `https://chudware.com` → Access challenge → portal → stream iframe.
 - [ ] Know the “not on the list” path (Access deny vs portal allowlist page).
-- [ ] Confirm `REFUSE_NEW` is absent unless disk is actually critical: `ls ~/billet-web-data/REFUSE_NEW`.
+- [ ] Confirm `REFUSE_NEW` is absent unless disk is actually critical: `ls ~/chudware-web-data/REFUSE_NEW`.
 
 ---
 
@@ -135,7 +135,7 @@ users:
 
 ### JWKS / 401 after Access login
 
-- Confirm `BILLET_CF_AUD` matches Access app → Overview / Additional settings → Application Audience.
+- Confirm `CHUDWARE_CF_AUD` matches Access app → Overview / Additional settings → Application Audience.
 - Team domain must be exactly `https://bruh234324.cloudflareaccess.com` (no trailing slash mismatch vs gateway config).
 - Force JWKS refresh: restart gateway after Access app recreation (AUD changes if app is recreated).
 - CF rotates Access signing keys ~6 weeks; gateway must use live JWKS URL, not a pinned PEM.
@@ -143,10 +143,10 @@ users:
 ### cloudflared not connecting
 
 ```bash
-systemctl --user status billet-cloudflared
-journalctl --user -u billet-cloudflared -n 80 --no-pager
+systemctl --user status chudware-cloudflared
+journalctl --user -u chudware-cloudflared -n 80 --no-pager
 # token present?
-grep -E '^TUNNEL_TOKEN=' ~/billet-web-data/gateway.env | sed 's/=.*/=***/'
+grep -E '^TUNNEL_TOKEN=' ~/chudware-web-data/gateway.env | sed 's/=.*/=***/'
 ```
 
 Binary: `/usr/local/bin/cloudflared` (v2026.7.1 on this host). Unit runs:  
@@ -155,19 +155,19 @@ Binary: `/usr/local/bin/cloudflared` (v2026.7.1 on this host). Unit runs:
 ### Gateway / uvicorn
 
 ```bash
-systemctl --user status billet-gateway
-journalctl --user -u billet-gateway -n 80 --no-pager
+systemctl --user status chudware-gateway
+journalctl --user -u chudware-gateway -n 80 --no-pager
 curl -sS http://127.0.0.1:8300/healthz
 ```
 
-Env file: `~/billet-web-data/gateway.env`. Unit `MemoryMax=1G`.
+Env file: `~/chudware-web-data/gateway.env`. Unit `MemoryMax=1G`.
 
 ### Session container logs
 
 ```bash
-podman ps -a --filter name=billet-sess-
-podman logs --tail 200 billet-sess-<slug>
-podman inspect billet-sess-<slug> --format '{{.State.Status}} {{.HostConfig.Memory}}'
+podman ps -a --filter name=chudware-sess-
+podman logs --tail 200 chudware-sess-<slug>
+podman inspect chudware-sess-<slug> --format '{{.State.Status}} {{.HostConfig.Memory}}'
 ```
 
 Published ports: host `127.0.0.1:8400+n` → container `:8080`.
@@ -175,13 +175,13 @@ Published ports: host `127.0.0.1:8400+n` → container `:8080`.
 ### Monitor / reaper
 
 ```bash
-systemctl --user status billet-monitor.timer
+systemctl --user status chudware-monitor.timer
 python3 Webservice/deploy/monitor.py --dry-run   # one JSONL sample
-tail -n 5 ~/billet-web-data/logs/monitor.jsonl
+tail -n 5 ~/chudware-web-data/logs/monitor.jsonl
 ```
 
 - `MemAvailable < 4 GiB` → `podman stop` oldest idle session (idle from `/healthz` if available).
-- Disk free &lt; 10% on data root or container storage → touches `~/billet-web-data/REFUSE_NEW`; gateway `sessions.start` returns **503** until free space recovers and monitor clears the flag.
+- Disk free &lt; 10% on data root or container storage → touches `~/chudware-web-data/REFUSE_NEW`; gateway `sessions.start` returns **503** until free space recovers and monitor clears the flag.
 
 ### GPU CDI after driver update
 
@@ -232,7 +232,7 @@ reach the container's X clipboard). 20k char cap, argv-passed (no shell).
 
 The `/admin` browser terminal is now **shared, saved, and concurrent**. Each
 session is a named **tmux** session on the gateway host (socket
-`$BILLET_TMUX_SOCKET`, default `billet`), so it survives browser disconnects
+`$CHUDWARE_TMUX_SOCKET`, default `chudware`), so it survives browser disconnects
 *and* a gateway restart, and several admins can attach to the same session at
 once — they see and drive the same `omp` instance, which makes it easy to keep
 track of the actual work in flight.
@@ -252,24 +252,24 @@ track of the actual work in flight.
   falls back to the old private, per-connection shell (not shared or saved).
 - Sessions persist with zero clients (`destroy-unattached off`); they die only
   on an explicit kill or when the shell/`omp` in them exits. List/inspect from a
-  shell with `tmux -L billet ls`.
+  shell with `tmux -L chudware ls`.
 
 ### Nightly backups
 
-`billet-backup.timer` (03:30 + jitter, `Persistent=true`) runs
+`chudware-backup.timer` (03:30 + jitter, `Persistent=true`) runs
 `Webservice/deploy/backup.sh`:
 
-- Tars **all of `~/billet-web-data/`** (PLM bare repos, users.yaml, chat.db,
+- Tars **all of `~/chudware-web-data/`** (PLM bare repos, users.yaml, chat.db,
   per-user homes incl. unpushed WIP, env files) minus caches/logs/tmp.
 - Homes are subuid-owned → tar runs under **`podman unshare`**.
-- Destination `~/billet-web-backups/` (mode 700, tarballs 600), newest
-  **14** kept. Override via `BILLET_WEB_BACKUP_DIR` / `BILLET_WEB_BACKUP_KEEP`.
+- Destination `~/chudware-web-backups/` (mode 700, tarballs 600), newest
+  **14** kept. Override via `CHUDWARE_WEB_BACKUP_DIR` / `CHUDWARE_WEB_BACKUP_KEEP`.
 
 ```bash
-systemctl --user start billet-backup.service     # manual backup now
-systemctl --user list-timers billet-backup.timer # next run
+systemctl --user start chudware-backup.service     # manual backup now
+systemctl --user list-timers chudware-backup.timer # next run
 # restore (same subuid mapping):
-podman unshare tar -xzf ~/billet-web-backups/billet-web-data-<stamp>.tar.gz -C ~
+podman unshare tar -xzf ~/chudware-web-backups/chudware-web-data-<stamp>.tar.gz -C ~
 ```
 
 Off-host copies are on you: rsync the backup dir somewhere that isn't this
@@ -287,29 +287,29 @@ bash Webservice/deploy/update.sh
 # Variants
 bash Webservice/deploy/update.sh --pull-only   # git only
 bash Webservice/deploy/update.sh --no-pull     # rebuild current tree
-bash Webservice/deploy/update.sh --host-only   # desktop Billet binary
+bash Webservice/deploy/update.sh --host-only   # desktop Chudware binary
 bash Webservice/deploy/update.sh --web-only    # engine + webd + gateway
 bash Webservice/deploy/update.sh --image       # also rebuild session container
 bash Webservice/deploy/update.sh --wasm        # also wasm
 ```
 
-Logs/lock: `~/billet-web-data/logs/update.log`, `deploy.lock`, `deploy-status.json`
+Logs/lock: `~/chudware-web-data/logs/update.log`, `deploy.lock`, `deploy-status.json`
 (shared with admin `rebuild.sh` / `redeploy.sh`).
 
-**Auto-promote engine → webd:** `billet-webd-sync.path` watches
-`core/build-occt-linux/bin/aicad-hostd` and re-runs `install_webd.sh --restart`
+**Auto-promote engine → webd:** `chudware-webd-sync.path` watches
+`core/build-occt-linux/bin/chudware-hostd` and re-runs `install_webd.sh --restart`
 (idle-wait when sessions are connected). Enabled by `setup.sh` and
 `install_webd.sh`. Confirm with:
 
 ```bash
-systemctl --user is-enabled billet-webd-sync.path
-systemctl --user status billet-webd-sync.path --no-pager
+systemctl --user is-enabled chudware-webd-sync.path
+systemctl --user status chudware-webd-sync.path --no-pager
 ```
 
 Desktop against the **shared** daemon (same engine as web sessions):
 
 ```bash
-~/billet-web/billet-shared.sh
+~/chudware-web/chudware-shared.sh
 ```
 
 ---
@@ -321,12 +321,12 @@ Desktop against the **shared** daemon (same engine as web sessions):
 | `Webservice/deploy/setup.sh` | Idempotent dirs, venv, unit install, enable |
 | `Webservice/deploy/update.sh` | **Day-to-day:** pull → rebuild host/engine → webd → gateway |
 | `Webservice/deploy/rebuild.sh` / `redeploy.sh` | Admin-locked rebuild targets / gateway restart |
-| `Webservice/deploy/install_webd.sh` | Promote engine build → `~/billet-web` + hostd unit |
-| `Webservice/deploy/billet-*.service` / `.timer` / `.path` | systemd **user** units (incl. webd-sync) |
+| `Webservice/deploy/install_webd.sh` | Promote engine build → `~/chudware-web` + hostd unit |
+| `Webservice/deploy/chudware-*.service` / `.timer` / `.path` | systemd **user** units (incl. webd-sync) |
 | `Webservice/deploy/monitor.py` | Host sample + reaper (stdlib) |
 | `Webservice/deploy/cf_provision.py` | Driver: tunnel/DNS/Access via API |
-| `~/billet-web-data/gateway.env` | Secrets + CF team/AUD/token (gitignored conceptually; never commit) |
-| `~/billet-web-data/{homes,plm,logs,chat.db}` | Runtime data |
+| `~/chudware-web-data/gateway.env` | Secrets + CF team/AUD/token (gitignored conceptually; never commit) |
+| `~/chudware-web-data/{homes,plm,logs,chat.db}` | Runtime data |
 | `Webservice/gateway/users.yaml` | Allowlist + heavy seats |
 
 ## AI modeling agent (remote/subscription models)
@@ -334,17 +334,17 @@ Desktop against the **shared** daemon (same engine as web sessions):
 Sessions run the in-app AI agent against **remote providers only** — no local
 models on this host. Two ways to give sessions credentials:
 
-1. **Shared keys (yours):** create `~/billet-web-data/ai_providers.env`
+1. **Shared keys (yours):** create `~/chudware-web-data/ai_providers.env`
    (`chmod 600`) with `KEY=VALUE` lines (`OPENROUTER_API_KEY=`,
    `ANTHROPIC_API_KEY=`, `OPENAI_API_KEY=`, `XAI_API_KEY=`, `GEMINI_API_KEY=`, …).
    The gateway forwards every UPPER_CASE var in that file into each session
    container at start. Restart is NOT needed — the file is re-read per session
    start; running seats keep their old env until restarted.
-2. **Bring-your-own:** users open Billet ▸ Settings ▸ AI provider inside their
+2. **Bring-your-own:** users open Chudware ▸ Settings ▸ AI provider inside their
    session and enter their own key / subscription login. It persists in their
-   private HOME volume (`~/billet-web-data/homes/<slug>`), never on the shared
+   private HOME volume (`~/chudware-web-data/homes/<slug>`), never on the shared
    image and never visible to other users.
 
-The session image bakes the Python worker runtime at `/opt/billet/runtime/venv`
-(`AI_CAD_PYTHON`) + app payload at `/opt/billet/app` (`AI_CAD_REPO`), so the
+The session image bakes the Python worker runtime at `/opt/chudware/runtime/venv`
+(`CHUDWARE_PYTHON`) + app payload at `/opt/chudware/app` (`CHUDWARE_REPO`), so the
 agent works out of the box once a provider credential exists.

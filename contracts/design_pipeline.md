@@ -248,7 +248,7 @@ INTAKE → [CLARIFY] → SPECIFY
            → [ORGANIZE] → PLAN → BUILD → VERIFY → [CORRECT ↺] → DELIVER
 ```
 
-- Flag: `PipelineFlags.design_pipeline` (env `AICAD_DESIGN_PIPELINE`), **default False**.
+- Flag: `PipelineFlags.design_pipeline` (env `CHUDWARE_DESIGN_PIPELINE`), **default False**.
 - When OFF: `next_phase(SPECIFY)` returns the next enabled phase exactly as today
   (`ORGANIZE` when the org flag is on, else `PLAN`). The four new phases are `continue`d
   over — no structural change, current phase tests stay green.

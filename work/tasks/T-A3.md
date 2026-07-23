@@ -51,7 +51,7 @@ Gate nodes implement human approval checkpoints via LangGraph `interrupt()`. Whe
 ## Driver notes (Fable, 2026-07-02 — WS-A opened to agents; chain off A2)
 
 - Branch FROM T-A2's branch when it exists (merge order A1 → A2 → A3).
-- machine.h VERDICT_PAUSE is a C++ change: rebuild core AND RESTAGE libaicad.so — the
+- machine.h VERDICT_PAUSE is a C++ change: rebuild core AND RESTAGE libchudware.so — the
   staged .so is stale (predates sim_run_static; open board note says "next C++ task
   refreshes it" — that is YOU; record the restage in your check-in so Python suites
   stop skipping).

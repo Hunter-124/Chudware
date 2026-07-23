@@ -10,9 +10,9 @@
 | `window.h` | Borderless chrome: `installWindowChrome`, `tickWindowChrome`, GLFW init hints |
 | `paths.h` | `exeDir`, `appdataDir`, `appdataRoot`, `configPath`, `cacheDir`, `tempDir`, `resourcesDir` |
 | `resources.h` | `setWindowIcon` (PNG → GLFW icons) |
-| `dpi.h` | `readContentScale`, `applyScaleOverride` (AI_CAD_SCALE) |
+| `dpi.h` | `readContentScale`, `applyScaleOverride` (CHUDWARE_SCALE) |
 
-Implementations split by OS: `*_win32.cpp`, `*_linux.cpp`. Build via `platform/CMakeLists.txt` → static lib `aicad_platform`.
+Implementations split by OS: `*_win32.cpp`, `*_linux.cpp`. Build via `platform/CMakeLists.txt` → static lib `chudware_platform`.
 
 ## AI-CAD2 wrappers
 
@@ -20,7 +20,7 @@ Implementations split by OS: `*_win32.cpp`, `*_linux.cpp`. Build via `platform/C
 
 ## Headless
 
-`AI_CAD_NO_FILE_DIALOGS=1` → all dialog calls return empty / -1 (CI / `--shot`).
+`CHUDWARE_NO_FILE_DIALOGS=1` → all dialog calls return empty / -1 (CI / `--shot`).
 
 ## Migration source
 

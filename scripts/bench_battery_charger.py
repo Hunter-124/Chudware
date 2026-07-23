@@ -18,11 +18,11 @@ companion ecad_simulate call on a library-backed sense/rail schematic still
 exercises the MCP tool surface.
 
 Env:
-  AICAD_BC_OUT          output dir (default benchmarks/battery_charger)
-  AICAD_BC_MARKERS      marker dir (default $OUT/markers)
-  AI_CAD_ECAD_HEAVY_BUDGET_S  heavy-tool budget seconds (default 180)
-  AICAD_BC_SIM_BUDGET_S Renode fw_sim_run budget (default 120)
-  AICAD_BC_SEED         deterministic seed (default 0)
+  CHUDWARE_BC_OUT          output dir (default benchmarks/battery_charger)
+  CHUDWARE_BC_MARKERS      marker dir (default $OUT/markers)
+  CHUDWARE_ECAD_HEAVY_BUDGET_S  heavy-tool budget seconds (default 180)
+  CHUDWARE_BC_SIM_BUDGET_S Renode fw_sim_run budget (default 120)
+  CHUDWARE_BC_SEED         deterministic seed (default 0)
 """
 from __future__ import annotations
 
@@ -35,20 +35,20 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 # Heavy ECAD tools budget-guarded at import time — set BEFORE mcp_server imports.
-os.environ.setdefault("AI_CAD_ECAD_HEAVY_BUDGET_S", "180")
-os.environ.setdefault("AI_CAD_ENGINE_DAEMON", "0")
+os.environ.setdefault("CHUDWARE_ECAD_HEAVY_BUDGET_S", "180")
+os.environ.setdefault("CHUDWARE_ENGINE_DAEMON", "0")
 
 REPO = Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 OUT_DIR = Path(os.environ.get(
-    "AICAD_BC_OUT", str(REPO / "benchmarks" / "battery_charger")))
+    "CHUDWARE_BC_OUT", str(REPO / "benchmarks" / "battery_charger")))
 MARKER_DIR = Path(os.environ.get(
-    "AICAD_BC_MARKERS", str(OUT_DIR / "markers")))
+    "CHUDWARE_BC_MARKERS", str(OUT_DIR / "markers")))
 
-SEED = int(os.environ.get("AICAD_BC_SEED", "0") or "0")
-SIM_BUDGET_S = float(os.environ.get("AICAD_BC_SIM_BUDGET_S", "120") or "120")
+SEED = int(os.environ.get("CHUDWARE_BC_SEED", "0") or "0")
+SIM_BUDGET_S = float(os.environ.get("CHUDWARE_BC_SIM_BUDGET_S", "120") or "120")
 
 # Fixed thresholds (deterministic design targets).
 V_CV = 4.2          # Li-ion CV clamp (V)
@@ -596,8 +596,8 @@ def main() -> int:
     print("=== B2 battery-charger E2E benchmark ===")
     print(f"  out: {OUT_DIR}")
     print(f"  seed: {SEED}")
-    print(f"  AI_CAD_ECAD_HEAVY_BUDGET_S="
-          f"{os.environ.get('AI_CAD_ECAD_HEAVY_BUDGET_S')}")
+    print(f"  CHUDWARE_ECAD_HEAVY_BUDGET_S="
+          f"{os.environ.get('CHUDWARE_ECAD_HEAVY_BUDGET_S')}")
     print(f"  sim_budget_s={SIM_BUDGET_S}")
     print(f"  thresholds: Vcv={V_CV} Icc={I_CC} Vlvd={V_LVD} "
           f"Vovp={V_OVP} Iocp={I_OCP}")
@@ -1101,10 +1101,10 @@ def main() -> int:
         if not ref:
             leg.skip("no board to link")
             return
-        # Absolute firmware root — relative AI_CAD_FIRMWARE_DIR can double-prefix.
+        # Absolute firmware root — relative CHUDWARE_FIRMWARE_DIR can double-prefix.
         fw_root = (OUT_DIR / "firmware").resolve()
         fw_root.mkdir(parents=True, exist_ok=True)
-        os.environ["AI_CAD_FIRMWARE_DIR"] = str(fw_root)
+        os.environ["CHUDWARE_FIRMWARE_DIR"] = str(fw_root)
 
         r = _call(tools, "fw_new_project", name="battery_charger_fw",
                   mcu_family="stm32f4", board_doc_ref=str(ref))

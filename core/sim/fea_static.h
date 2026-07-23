@@ -17,7 +17,7 @@
 #include <string>
 #include <vector>
 
-namespace aicad::sim {
+namespace chudware::sim {
 
 struct FeaStaticResult {
     std::vector<double> displacement;    // n*3, row-major (node i -> [3i,3i+1,3i+2]) mm
@@ -99,4 +99,4 @@ FeaStaticResult fea_static_solve(const std::vector<double>& points,
                                  int nodes_per_elem = 4,
                                  const std::vector<BondSpring>& bond_springs = {});
 
-}  // namespace aicad::sim
+}  // namespace chudware::sim

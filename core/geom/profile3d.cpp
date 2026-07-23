@@ -21,7 +21,7 @@
 #include <map>
 #include <string>
 
-namespace aicad::geom {
+namespace chudware::geom {
 
 namespace {
 
@@ -165,4 +165,4 @@ std::vector<TopoDS_Wire> wires_from_sketch3d(const json& solved_entities) {
     return wires;
 }
 
-}  // namespace aicad::geom
+}  // namespace chudware::geom

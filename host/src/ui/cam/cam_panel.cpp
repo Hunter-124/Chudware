@@ -210,7 +210,7 @@ std::string currentDialect() {
 void writeGcodeFile(const std::string& dialect) {
 #ifndef __EMSCRIPTEN__
     std::filesystem::path p =
-        std::filesystem::temp_directory_path() / ("aicad_cam." + dialect + ".nc");
+        std::filesystem::temp_directory_path() / ("chudware_cam." + dialect + ".nc");
     std::ofstream f(p);
     if (f) {
         f << g.gcode;
@@ -229,7 +229,7 @@ void downloadGcode() {
         return;
     }
     const std::string dialect = currentDialect();
-    const std::string fname = "aicad_cam." + dialect + ".nc";
+    const std::string fname = "chudware_cam." + dialect + ".nc";
 #ifdef __EMSCRIPTEN__
     EM_ASM({
         var text = UTF8ToString($0);
@@ -890,7 +890,7 @@ void camRequestFocus() {
 }
 
 // Shot-only hook: make the CAM panel float (undock + centre) so a headless screenshot of the
-// AI_CAD_SHOT=cam scenario can actually show the populated workspace. Never called in normal use.
+// CHUDWARE_SHOT=cam scenario can actually show the populated workspace. Never called in normal use.
 void camFloatForShot() { g.floatForShot = true; g.show = true; }
 
 // Adopt an existing CAM job doc (built core-side by the copilot's CAM fast-path) into the
@@ -968,7 +968,7 @@ void drawCamManager(AppState& st) {
     // Pop the CAM tab forward the frame the workspace first becomes visible (the user switched to
     // the Manufacture ribbon), so the docked CAM editor surfaces instead of staying behind the
     // Viewport tab. Mirrors the ECAD panel. Docked into the central node by buildDefaultLayout.
-    // Shot-only (set via camFloatForShot() from the AI_CAD_SHOT=cam scenario): float the panel
+    // Shot-only (set via camFloatForShot() from the CHUDWARE_SHOT=cam scenario): float the panel
     // (undock + centre) so a headless capture sees the populated workspace — a central-node-docked
     // tab won't surface over the full-bleed 3D in an offscreen render. No-op in normal use.
     if (g.floatForShot) {
@@ -1339,8 +1339,8 @@ void drawCamTreeBody(AppState& st) {
         } else {
             lbl += " — (none)";
         }
-        // Inlined (not leafRow) so the icon slot draws a clean stock-billet glyph instead of the
-        // "extrude" atlas name falling through to the bare "K" text fallback. The billet replicates
+        // Inlined (not leafRow) so the icon slot draws a clean stock-chudware glyph instead of the
+        // "extrude" atlas name falling through to the bare "K" text fallback. The chudware replicates
         // treeIcon()'s geometry exactly (reserve a frame-height Dummy, paint centered in it) so it
         // shares the size/baseline of the gear/csys glyphs on the neighbouring rows.
         const bool stockSel = (g.selKind == 3);
@@ -1358,7 +1358,7 @@ void drawCamTreeBody(AppState& st) {
             ImVec4 tc = ImGui::GetStyleColorVec4(ImGuiCol_Text); tc.w *= 0.85f;
             const ImU32 ink = ImGui::ColorConvertFloat4ToU32(tc);
             const float th = std::max(1.0f, 1.2f * S);
-            // billet box: a front face + a back face pushed up-right, joined at the 4 corners.
+            // chudware box: a front face + a back face pushed up-right, joined at the 4 corners.
             const float x0 = p0.x + insetX, y0 = p0.y + (rowH - px) * 0.5f;
             const float d  = px * 0.28f;                 // isometric depth offset
             const float fw = px - d, fh = px - d;        // front-face extent (leaves room for depth)

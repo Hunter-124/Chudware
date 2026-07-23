@@ -11,7 +11,7 @@
 
 #include "piping/pyutil.h"
 
-namespace aicad::hydraulic {
+namespace chudware::hydraulic {
 
 using pyutil::ojson;
 
@@ -42,4 +42,4 @@ std::vector<std::string> validate_hose(const ojson& hose,
 std::vector<std::string> validate_hydraulic(const ojson& doc);
 inline std::vector<std::string> validate(const ojson& doc) { return validate_hydraulic(doc); }
 
-}  // namespace aicad::hydraulic
+}  // namespace chudware::hydraulic

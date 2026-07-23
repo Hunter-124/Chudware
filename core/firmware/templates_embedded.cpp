@@ -4,11 +4,11 @@
 // docs/REFACTOR_LOG.md if the Python template tree changes during the overlap window.
 #include "firmware/templates.h"
 
-namespace aicad::firmware {
+namespace chudware::firmware {
 
 const std::vector<TemplateFile>& cmake_arm_template_files() {
     static const std::vector<TemplateFile> kFiles = {
-        {"CMakeLists.txt", R"AICAD_TMPL(# Bare-metal ARM Cortex-M firmware — AI-CAD firmware template (cmake_arm baseline).
+        {"CMakeLists.txt", R"CHUDWARE_TMPL(# Bare-metal ARM Cortex-M firmware — Chudware firmware template (cmake_arm baseline).
 #
 # Cross-compiled with arm-none-eabi via cmake/arm-none-eabi-toolchain.cmake. Configure with:
 #   cmake -S . -B build -G Ninja \
@@ -62,8 +62,8 @@ add_executable(${CMAKE_PROJECT_NAME}.elf
 # `include/`, so both paths are needed.
 target_include_directories(${CMAKE_PROJECT_NAME}.elf PRIVATE include ${CMAKE_BINARY_DIR}/include)
 set_target_properties(${CMAKE_PROJECT_NAME}.elf PROPERTIES LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/linker.ld)
-)AICAD_TMPL"},
-        {"cmake/arm-none-eabi-toolchain.cmake", R"AICAD_TMPL(# CMake toolchain file for the arm-none-eabi (GNU Arm Embedded) cross-compiler.
+)CHUDWARE_TMPL"},
+        {"cmake/arm-none-eabi-toolchain.cmake", R"CHUDWARE_TMPL(# CMake toolchain file for the arm-none-eabi (GNU Arm Embedded) cross-compiler.
 # Selected by CMakeToolchain.build() via -DCMAKE_TOOLCHAIN_FILE. arm-none-eabi-gcc must be on PATH.
 # It is invoked purely as a subprocess (GPL-with-runtime-exception, GPL-clean by aggregation —
 # see contracts/licenses.md and contracts/firmware_rpc.md §1).
@@ -82,63 +82,63 @@ set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
 set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
-)AICAD_TMPL"},
-        {"include/aicad_trace.h", R"AICAD_TMPL(/* aicad_trace.h — firmware-side pin-event shim for the QEMU emulation fallback (T-FIN1).
+)CHUDWARE_TMPL"},
+        {"include/chudware_trace.h", R"CHUDWARE_TMPL(/* chudware_trace.h — firmware-side pin-event shim for the QEMU emulation fallback (T-FIN1).
  *
  * QEMU (mps2-an385) has no external GPIO observer the host can poll, so the firmware
  * reports its own pin transitions over the semihosting console in a machine-readable
  * line the host-side parser (engine/firmware/emulator.py) picks up:
  *
- *     AICAD_GPIO_EVT <PIN>=<level> t=<ms>ms
+ *     CHUDWARE_GPIO_EVT <PIN>=<level> t=<ms>ms
  *
  * Usage (semihosting must be enabled — fw_sim_run's QEMU path passes -semihosting):
  *
- *     #include "aicad_trace.h"
- *     AICAD_GPIO_TRACE("PA5", 1, millis());   // pin name, level (0/1), timestamp in ms
- *     AICAD_GPIO_TRACE_NT("PA5", 0);          // no-timestamp variant
+ *     #include "chudware_trace.h"
+ *     CHUDWARE_GPIO_TRACE("PA5", 1, millis());   // pin name, level (0/1), timestamp in ms
+ *     CHUDWARE_GPIO_TRACE_NT("PA5", 0);          // no-timestamp variant
  *
  * The same line format is what Renode's generated state-change hooks print, so
  * assertions ("gpio:PA5=1", timeline "gpio:PA5=1@>10ms") work identically on both
  * backends. Plain printf is enough: the mps2-an385 semihosting console is stdout.
  */
-#ifndef AICAD_TRACE_H
-#define AICAD_TRACE_H
+#ifndef CHUDWARE_TRACE_H
+#define CHUDWARE_TRACE_H
 
 #include <stdio.h>
 
-#define AICAD_GPIO_TRACE(pin_str, level, t_ms) \
-    printf("AICAD_GPIO_EVT %s=%d t=%lums\n", (pin_str), ((level) ? 1 : 0), \
+#define CHUDWARE_GPIO_TRACE(pin_str, level, t_ms) \
+    printf("CHUDWARE_GPIO_EVT %s=%d t=%lums\n", (pin_str), ((level) ? 1 : 0), \
            (unsigned long)(t_ms))
 
-#define AICAD_GPIO_TRACE_NT(pin_str, level) \
-    printf("AICAD_GPIO_EVT %s=%d\n", (pin_str), ((level) ? 1 : 0))
+#define CHUDWARE_GPIO_TRACE_NT(pin_str, level) \
+    printf("CHUDWARE_GPIO_EVT %s=%d\n", (pin_str), ((level) ? 1 : 0))
 
 /* CPU run/sleep residency markers (T-FIN7, optional). Print around sleep entry/exit
  * (e.g. before/after __WFI()) so the power-profile derivation (aicad.powerprofile/1)
  * can integrate measured run/sleep residency instead of assuming always-active:
  *
- *     AICAD_CPU_TRACE("sleep", millis());  __WFI();  AICAD_CPU_TRACE("run", millis());
+ *     CHUDWARE_CPU_TRACE("sleep", millis());  __WFI();  CHUDWARE_CPU_TRACE("run", millis());
  *
  * state_str must be "run" or "sleep". Works on both backends (plain UART/semihosting
  * text); the host parser is engine/firmware/powerprofile.py. */
-#define AICAD_CPU_TRACE(state_str, t_ms) \
-    printf("AICAD_CPU_EVT %s t=%lums\n", (state_str), (unsigned long)(t_ms))
+#define CHUDWARE_CPU_TRACE(state_str, t_ms) \
+    printf("CHUDWARE_CPU_EVT %s t=%lums\n", (state_str), (unsigned long)(t_ms))
 
-#endif /* AICAD_TRACE_H */
-)AICAD_TMPL"},
-        {"include/board.h", R"AICAD_TMPL(/* Board/pin definitions — AI-CAD firmware template (cmake_arm baseline).
+#endif /* CHUDWARE_TRACE_H */
+)CHUDWARE_TMPL"},
+        {"include/board.h", R"CHUDWARE_TMPL(/* Board/pin definitions — Chudware firmware template (cmake_arm baseline).
  *
  * When the project is linked to an ECAD board (board_doc_ref), the agent regenerates this header
  * from the board's net/pin assignments so firmware pin names track the schematic.
  */
-#ifndef AICAD_BOARD_H
-#define AICAD_BOARD_H
+#ifndef CHUDWARE_BOARD_H
+#define CHUDWARE_BOARD_H
 
-#define AICAD_TEMPLATE_VERSION 1
+#define CHUDWARE_TEMPLATE_VERSION 1
 
-#endif /* AICAD_BOARD_H */
-)AICAD_TMPL"},
-        {"linker.ld", R"AICAD_TMPL(/* Minimal Cortex-M linker script — AI-CAD firmware template (cmake_arm baseline).
+#endif /* CHUDWARE_BOARD_H */
+)CHUDWARE_TMPL"},
+        {"linker.ld", R"CHUDWARE_TMPL(/* Minimal Cortex-M linker script — Chudware firmware template (cmake_arm baseline).
  *
  * Generic Cortex-M4 memory map (matches the STM32F4 family this template targets by default,
  * and Renode's templates/renode_platforms/stm32f4_discovery.repl: flash @ 0x08000000/1M,
@@ -184,8 +184,8 @@ SECTIONS
 
     _estack = ORIGIN(RAM) + LENGTH(RAM);
 }
-)AICAD_TMPL"},
-        {"src/main.c", R"AICAD_TMPL(/* Bare-metal blink skeleton — AI-CAD firmware template (cmake_arm baseline).
+)CHUDWARE_TMPL"},
+        {"src/main.c", R"CHUDWARE_TMPL(/* Bare-metal blink skeleton — Chudware firmware template (cmake_arm baseline).
  *
  * Register addresses here are illustrative placeholders; the agent rewrites main() for the target
  * MCU/board (pulling pin assignments from the linked ECAD board_doc_ref when present). The point of
@@ -213,8 +213,8 @@ int main(void)
     }
     return 0;
 }
-)AICAD_TMPL"},
-        {"src/startup.c", R"AICAD_TMPL(/* Minimal reset/vector table — AI-CAD firmware template (cmake_arm baseline).
+)CHUDWARE_TMPL"},
+        {"src/startup.c", R"CHUDWARE_TMPL(/* Minimal reset/vector table — Chudware firmware template (cmake_arm baseline).
  *
  * A real target's CMSIS device pack supplies the full vector table (every NVIC IRQ) + a fuller
  * startup; this covers just the fixed Cortex-M core exceptions (enough to boot and run on any
@@ -269,14 +269,14 @@ void Default_Handler(void)
     for (;;) {
     }
 }
-)AICAD_TMPL"},
+)CHUDWARE_TMPL"},
     };
     return kFiles;
 }
 
 const std::vector<TemplateFile>& renode_platform_files() {
     static const std::vector<TemplateFile> kFiles = {
-        {"LICENSE", R"AICAD_TMPL(MIT License
+        {"LICENSE", R"CHUDWARE_TMPL(MIT License
 
 Copyright (c) Antmicro Ltd. and Renode contributors
 
@@ -302,8 +302,8 @@ Note: These platform description files are adapted from Renode's open-source
 platform infrastructure (https://github.com/renode/renode-infrastructure),
 used under the MIT License.  The Renode binary is invoked as a subprocess and
 is not vendored or linked into this project.
-)AICAD_TMPL"},
-        {"cortex_m_generic.repl", R"AICAD_TMPL(// Generic Cortex-M platform description for Renode (MIT)
+)CHUDWARE_TMPL"},
+        {"cortex_m_generic.repl", R"CHUDWARE_TMPL(// Generic Cortex-M platform description for Renode (MIT)
 // Minimal: flash + SRAM + CPU + NVIC only; no other peripheral mapping.
 // License: MIT — see templates/renode_platforms/LICENSE
 //
@@ -327,8 +327,8 @@ flash: Memory.MappedMemory @ sysbus 0x08000000
 
 sram: Memory.MappedMemory @ sysbus 0x20000000
     size: 0x20000
-)AICAD_TMPL"},
-        {"esp32_stub.repl", R"AICAD_TMPL(// ESP32 stub platform description for Renode (MIT)
+)CHUDWARE_TMPL"},
+        {"esp32_stub.repl", R"CHUDWARE_TMPL(// ESP32 stub platform description for Renode (MIT)
 // License: MIT — see templates/renode_platforms/LICENSE
 //
 // T-FIN2 DECISION — ESP32 is BUILD + FLASH ONLY, no emulation.
@@ -347,8 +347,8 @@ flash: Memory.MappedMemory @ sysbus 0x3F400000
 
 sram: Memory.MappedMemory @ sysbus 0x3FFB0000
     size: 0x50000
-)AICAD_TMPL"},
-        {"nrf52840.repl", R"AICAD_TMPL(// nRF52840 platform description for Renode (MIT)
+)CHUDWARE_TMPL"},
+        {"nrf52840.repl", R"CHUDWARE_TMPL(// nRF52840 platform description for Renode (MIT)
 // Source: renode/renode platforms/cpus/nrf52840.repl (upstream master, fetched 2026-07-10)
 // https://github.com/renode/renode/blob/master/platforms/cpus/nrf52840.repl
 // License: MIT — see templates/renode_platforms/LICENSE and upstream renode LICENSE.
@@ -475,8 +475,8 @@ sysbus:
         Tag <0x100000a0, 0x100000a3> "DEVICEADDRTYPE" 0x1 # random address
         Tag <0x100000a4, 0x100000a7> "DEVICEADDR[0]" 0xAABBCCDD
         Tag <0x10001200, 0x10001203> "PSELRESET"
-)AICAD_TMPL"},
-        {"rp2040.repl", R"AICAD_TMPL(// RP2040 (Raspberry Pi Pico) minimal platform description for Renode (MIT)
+)CHUDWARE_TMPL"},
+        {"rp2040.repl", R"CHUDWARE_TMPL(// RP2040 (Raspberry Pi Pico) minimal platform description for Renode (MIT)
 // License: MIT — see templates/renode_platforms/LICENSE
 //
 // T-FIN2 HONESTY NOTE: stock Renode ships NO RP2040 SoC model (checked upstream
@@ -513,8 +513,8 @@ uart0: UART.PL011 @ sysbus 0x40034000
 
 uart1: UART.PL011 @ sysbus 0x40038000
     -> nvic@21
-)AICAD_TMPL"},
-        {"stm32f103.repl", R"AICAD_TMPL(// STM32F103 platform description for Renode (MIT)
+)CHUDWARE_TMPL"},
+        {"stm32f103.repl", R"CHUDWARE_TMPL(// STM32F103 platform description for Renode (MIT)
 // Source: renode 1.16.1 platforms/cpus/stm32f103.repl (bundled)
 // License: MIT — see templates/renode_platforms/LICENSE and upstream renode LICENSE.
 //
@@ -730,8 +730,8 @@ timer14:
 sysbus:
     init:
         Tag <0x40021000, 0x40021003> "RCC_CR" 0x0A020083
-)AICAD_TMPL"},
-        {"stm32f4_discovery.repl", R"AICAD_TMPL(// STM32F4 Discovery platform description for Renode (MIT)
+)CHUDWARE_TMPL"},
+        {"stm32f4_discovery.repl", R"CHUDWARE_TMPL(// STM32F4 Discovery platform description for Renode (MIT)
 // Source: based on Renode's STM32F4 platform files (https://github.com/renode/renode-infrastructure)
 // License: MIT — see templates/renode_platforms/LICENSE
 //
@@ -837,9 +837,9 @@ timer5: Timers.STM32_Timer @ sysbus 0x40000C00
     -> nvic@50
     frequency: 10000000
     initialLimit: 0xFFFFFFFF
-)AICAD_TMPL"},
+)CHUDWARE_TMPL"},
     };
     return kFiles;
 }
 
-}  // namespace aicad::firmware
+}  // namespace chudware::firmware

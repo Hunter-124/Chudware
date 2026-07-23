@@ -2,10 +2,10 @@
 # Admin rebuild — wasm / image / engine targets. Serialized by deploy.lock.
 set -euo pipefail
 
-LOGDIR="${BILLET_WEB_DATA:-$HOME/billet-web-data}/logs"
+LOGDIR="${CHUDWARE_WEB_DATA:-$HOME/chudware-web-data}/logs"
 mkdir -p "$LOGDIR"
 
-REPO="${BILLET_OMP_DIR:-$HOME/Repositories/CAD}"
+REPO="${CHUDWARE_OMP_DIR:-$HOME/Repositories/CAD}"
 cd "$REPO"
 
 STATUS="$LOGDIR/deploy-status.json"
@@ -54,7 +54,7 @@ for target in "$@"; do
       ;;
     image)
       Webservice/image/stage.sh
-      podman build -t localhost/billet-session:latest -f Webservice/image/Containerfile Webservice/image
+      podman build -t localhost/chudware-session:latest -f Webservice/image/Containerfile Webservice/image
       ;;
     engine)
       ./build.sh core

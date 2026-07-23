@@ -81,18 +81,18 @@ def test_no_fabrication_stub_is_generic_only():
 
 
 def test_render_pdf_degrades_cleanly(data, tmp_path):
-    project_dir = tmp_path / "aicad_project"
+    project_dir = tmp_path / "chudware_project"
     project_dir.mkdir()
-    old = os.environ.get("AICAD_PROJECT_DIR")
-    os.environ["AICAD_PROJECT_DIR"] = str(project_dir)
+    old = os.environ.get("CHUDWARE_PROJECT_DIR")
+    os.environ["CHUDWARE_PROJECT_DIR"] = str(project_dir)
     try:
         spec = build_report_spec(data)
         record = render_pdf(REPO, spec)
     finally:
         if old is None:
-            os.environ.pop("AICAD_PROJECT_DIR", None)
+            os.environ.pop("CHUDWARE_PROJECT_DIR", None)
         else:
-            os.environ["AICAD_PROJECT_DIR"] = old
+            os.environ["CHUDWARE_PROJECT_DIR"] = old
 
     assert isinstance(record, dict)
     assert "ok" in record

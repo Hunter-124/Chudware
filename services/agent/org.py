@@ -43,7 +43,7 @@ Interface-change gating (§18 → advisor/stages.py):
       checks this; an unacked change blocks the SENDER's stage exit.
 
 Feature-flagged seams:
-    * Overseer concern feed is gated on ``AICAD_OVERSEER=1`` (mirrors overseer.py).
+    * Overseer concern feed is gated on ``CHUDWARE_OVERSEER=1`` (mirrors overseer.py).
     * council_convene delegates to councils.council_convene (T-W9, MERGED, real).
 """
 from __future__ import annotations
@@ -78,7 +78,7 @@ RESOLUTION_ACTIONS = frozenset({"grant", "deny", "escalate"})
 _DEFAULT_REPORT_EVERY = int(os.environ.get("ORG_REPORT_EVERY", "3"))
 
 # Overseer seam flag (mirrors overseer.py).
-_OVERSEER_ENABLED = os.environ.get("AICAD_OVERSEER", "0") in ("1", "true", "True")
+_OVERSEER_ENABLED = os.environ.get("CHUDWARE_OVERSEER", "0") in ("1", "true", "True")
 
 
 # ---------------------------------------------------------------------------
@@ -479,10 +479,10 @@ class OrgState:
         Aging does NOT remove or close the request — it surfaces it for human
         attention while leaving resolution required.
 
-        Returns empty list when the AICAD_OVERSEER env flag is off.
+        Returns empty list when the CHUDWARE_OVERSEER env flag is off.
         """
         # Read env var dynamically (not at module import) so tests can toggle it.
-        overseer_on = os.environ.get("AICAD_OVERSEER", "0") in ("1", "true", "True")
+        overseer_on = os.environ.get("CHUDWARE_OVERSEER", "0") in ("1", "true", "True")
         if not overseer_on:
             return []
         aged = []
@@ -661,7 +661,7 @@ class OrgState:
 def unresolved_concern_contexts(org_state: OrgState) -> list[dict]:
     """Public helper: collect aged unresolved concerns from org_state.
 
-    Feature-flagged on AICAD_OVERSEER (mirrors overseer.py).  Returns [] when
+    Feature-flagged on CHUDWARE_OVERSEER (mirrors overseer.py).  Returns [] when
     flag is off, so callers are safe to call unconditionally.
     """
     return org_state.unresolved_concern_contexts()

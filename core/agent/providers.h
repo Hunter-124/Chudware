@@ -20,7 +20,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 
 using nlohmann::json;
@@ -191,4 +191,4 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
                         const json& messages, int max_tokens = 8000);
 
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware

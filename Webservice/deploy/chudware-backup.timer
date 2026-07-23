@@ -1,5 +1,5 @@
 [Unit]
-Description=Nightly billet-web data backup
+Description=Nightly chudware-web data backup
 
 [Timer]
 OnCalendar=*-*-* 03:30:00

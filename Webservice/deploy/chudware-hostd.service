@@ -1,32 +1,32 @@
-# billet-hostd — the SHARED Billet engine daemon serving web + local + agent
+# chudware-hostd — the SHARED Chudware engine daemon serving web + local + agent
 # clients (one live session for everyone). Installed/templated by
-# install_webd.sh (@BIN@ -> ~/billet-web/bin); do not edit the installed copy.
+# install_webd.sh (@BIN@ -> ~/chudware-web/bin); do not edit the installed copy.
 [Unit]
-Description=Billet shared web engine daemon (billet-webd)
+Description=Chudware shared web engine daemon (chudware-webd)
 After=default.target
 
 [Service]
 Type=simple
-ExecStart=@BIN@/aicad-hostd --foreground
-# Verbatim instance key: socket = $XDG_RUNTIME_DIR/aicad/hostd-billetweb.sock,
+ExecStart=@BIN@/chudware-hostd --foreground
+# Verbatim instance key: socket = $XDG_RUNTIME_DIR/chudware/hostd-chudwareweb.sock,
 # never shared with dev daemons (those key on binary realpath).
-Environment=AICAD_INSTANCE_KEY=billetweb
+Environment=CHUDWARE_INSTANCE_KEY=chudwareweb
 # A shared team daemon must not self-exit between working sessions.
-Environment=AICAD_HOSTD_LINGER_SECS=86400
+Environment=CHUDWARE_HOSTD_LINGER_SECS=86400
 # The C++ agent (agent_run_v2) reads its role prompts (intake/decomposer/executor/...)
-# from AI_CAD_PROMPTS_DIR; without it the daemon resolves the relative "agent/prompts"
+# from CHUDWARE_PROMPTS_DIR; without it the daemon resolves the relative "agent/prompts"
 # against its CWD (none here) and every agent run throws "role prompt unreadable/empty".
 # install_webd.sh deploys the prompt tree to @PROMPTS@ and stamps this path.
-Environment=AI_CAD_PROMPTS_DIR=@PROMPTS@
+Environment=CHUDWARE_PROMPTS_DIR=@PROMPTS@
 # Python worker bridge (hostd/worker_bridge.cpp): engine-unknown methods
 # (plm_*, git_*, ai_roles_*, provider accounts — the whole PLM + Settings
 # surface) are forwarded to a lazily-spawned `python -m engine.worker`
-# subprocess. AI_CAD_PYTHON = runtime venv interpreter; AI_CAD_REPO = repo
+# subprocess. CHUDWARE_PYTHON = runtime venv interpreter; CHUDWARE_REPO = repo
 # root used as the worker CWD so `import services`/`engine_oracle` resolve.
 # These defaults match worker_bridge.cpp's built-in fallbacks; stamped
 # explicitly so the unit is self-documenting and overridable.
-Environment=AI_CAD_PYTHON=%h/.local/share/AI-CAD/runtime/venv/bin/python
-Environment=AI_CAD_REPO=%h/Repositories/CAD
+Environment=CHUDWARE_PYTHON=%h/.local/share/Chudware/runtime/venv/bin/python
+Environment=CHUDWARE_REPO=%h/Repositories/CAD
 # always — shared webd must come back after clean exits too (binary replace
 # during install_webd without --restart, unexpected idle-exit, etc.). systemctl
 # stop still stays down; only unexpected death auto-recovers.

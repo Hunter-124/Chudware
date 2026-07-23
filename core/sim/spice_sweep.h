@@ -1,6 +1,6 @@
 // Batched SPICE parameter sweep — N independent points of the same circuit with
 // one component/param varied (`.step` / Monte-Carlo style). Points run in
-// parallel on the Wave-1 shared aicad::pool, sized by resource_governor::plan_for.
+// parallel on the Wave-1 shared chudware::pool, sized by resource_governor::plan_for.
 //
 // Each point invokes the single-run spice_simulate entry (sim/spice.h). Results
 // are returned in input order and are bit-identical (same JSON payload) to the
@@ -12,7 +12,7 @@
 #include <string>
 #include <vector>
 
-namespace aicad::sim {
+namespace chudware::sim {
 
 // Observability for the last (or this) sweep: workers the governor allotted,
 // point count, wall time, and the plan report string.
@@ -41,4 +41,4 @@ std::vector<nlohmann::json> spice_sweep_serial(const nlohmann::json& circuit,
                                                const nlohmann::json& analysis,
                                                SpiceSweepStats* stats = nullptr);
 
-}  // namespace aicad::sim
+}  // namespace chudware::sim

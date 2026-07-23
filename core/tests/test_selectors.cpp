@@ -35,10 +35,10 @@
 #include "doc/selectors.h"
 #include "geom/features.h"
 
-using aicad::doc::TopoInfo;
-using aicad::doc::ResolveResult;
-using aicad::doc::make_selector;
-using aicad::doc::resolve;
+using chudware::doc::TopoInfo;
+using chudware::doc::ResolveResult;
+using chudware::doc::make_selector;
+using chudware::doc::resolve;
 using json = nlohmann::json;
 
 namespace {
@@ -388,7 +388,7 @@ TEST_CASE("A8 coaxial cylinders resolve by selector area (bore vs boss)") {
 TEST_CASE("B7 describe_faces(box): 6 planes, unit axes, areas + the +Z top face") {
     const double DX = 20.0, DY = 10.0, DZ = 6.0;
     TopoDS_Shape box = geom::make_box(DX, DY, DZ);
-    std::vector<TopoInfo> faces = aicad::doc::describe_faces(box);
+    std::vector<TopoInfo> faces = chudware::doc::describe_faces(box);
 
     REQUIRE(faces.size() == 6);
     double area_sum = 0.0;
@@ -431,7 +431,7 @@ TEST_CASE("B8 describe_edges/vertices(box): line edges + corner vertices (explor
     const double DX = 20.0, DY = 10.0, DZ = 6.0;
     TopoDS_Shape box = geom::make_box(DX, DY, DZ);
 
-    std::vector<TopoInfo> edges = aicad::doc::describe_edges(box);
+    std::vector<TopoInfo> edges = chudware::doc::describe_edges(box);
     REQUIRE(edges.size() == 24);  // 12 unique edges x 2 incident faces (explorer dup)
     double len_sum = 0.0;
     for (const TopoInfo& e : edges) {
@@ -445,7 +445,7 @@ TEST_CASE("B8 describe_edges/vertices(box): line edges + corner vertices (explor
     // Unique total length is 4*(dx+dy+dz); each unique edge appears twice -> *2.
     CHECK(len_sum == doctest::Approx(2.0 * 4.0 * (DX + DY + DZ)));
 
-    std::vector<TopoInfo> verts = aicad::doc::describe_vertices(box);
+    std::vector<TopoInfo> verts = chudware::doc::describe_vertices(box);
     REQUIRE(verts.size() == 48);  // 8 unique corners, visited once per edge occurrence
     for (const TopoInfo& v : verts) {
         CHECK_FALSE(v.surf.has_value());   // vertices have no surf
@@ -469,7 +469,7 @@ TEST_CASE("B8 describe_edges/vertices(box): line edges + corner vertices (explor
 TEST_CASE("B9 describe_faces(cylinder): 1 cylinder face + 2 planar caps") {
     const double R = 5.0, Hgt = 10.0;
     TopoDS_Shape cyl = BRepPrimAPI_MakeCylinder(R, Hgt).Shape();  // axis = +Z by default
-    std::vector<TopoInfo> faces = aicad::doc::describe_faces(cyl);
+    std::vector<TopoInfo> faces = chudware::doc::describe_faces(cyl);
 
     int n_cyl = 0, n_plane = 0, n_other = 0;
     for (const TopoInfo& f : faces) {
@@ -503,7 +503,7 @@ TEST_CASE("B10 end-to-end: selector resolves to its face, and survives a resize"
     // --- Original box: build a selector from its +Z top face. ---
     const double DX = 20.0, DY = 10.0, DZ = 6.0;
     TopoDS_Shape box = geom::make_box(DX, DY, DZ);
-    std::vector<TopoInfo> faces = aicad::doc::describe_faces(box);
+    std::vector<TopoInfo> faces = chudware::doc::describe_faces(box);
 
     int top_idx = -1;
     const TopoInfo* top = nullptr;
@@ -540,7 +540,7 @@ TEST_CASE("B10 end-to-end: selector resolves to its face, and survives a resize"
     // --- Resize: a DIFFERENT box. The SAME selector must still find the +Z top. ---
     const double DX2 = 22.0, DY2 = 11.0, DZ2 = 6.5;
     TopoDS_Shape box2 = geom::make_box(DX2, DY2, DZ2);
-    std::vector<TopoInfo> faces2 = aicad::doc::describe_faces(box2);
+    std::vector<TopoInfo> faces2 = chudware::doc::describe_faces(box2);
 
     ResolveResult r1 = resolve(sel, faces2, bbox_diag(DX2, DY2, DZ2));
     REQUIRE(r1.index.has_value());

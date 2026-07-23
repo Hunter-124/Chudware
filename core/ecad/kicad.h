@@ -18,7 +18,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad::ecad::kicad {
+namespace chudware::ecad::kicad {
 
 // engine/ecad/library/sexpr.py::parse — parse full S-expression text into a
 // nested json tree. Throws std::runtime_error on malformed input.
@@ -32,4 +32,4 @@ nlohmann::json import_kicad_sch(const std::string& source);
 // engine/ecad/formats.py::import_kicad_pcb — same contract, aicad.pcb/1 result.
 nlohmann::json import_kicad_pcb(const std::string& source);
 
-}  // namespace aicad::ecad::kicad
+}  // namespace chudware::ecad::kicad

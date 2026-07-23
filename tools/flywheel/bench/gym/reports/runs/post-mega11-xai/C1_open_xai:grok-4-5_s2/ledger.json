@@ -745,7 +745,7 @@
         "tool": "list_parts",
         "args": {},
         "ok": true,
-        "result": "{\n  \"docs\": [\n    {\n      \"dirty\": false,\n      \"doc_id\": \"doc-cpp00000012\",\n      \"kind\": \"part\",\n      \"name\": \"flanged_bushing\",\n      \"origin_kind\": \"mcp\",\n      \"path\": \"/home/hunter/.local/share/AI-CAD/mcp_autosave/661df12a81d7-doc-cpp00000012.step+\",\n      \"revision\": 2\n    }\n  ]\n}"
+        "result": "{\n  \"docs\": [\n    {\n      \"dirty\": false,\n      \"doc_id\": \"doc-cpp00000012\",\n      \"kind\": \"part\",\n      \"name\": \"flanged_bushing\",\n      \"origin_kind\": \"mcp\",\n      \"path\": \"/home/hunter/.local/share/Chudware/mcp_autosave/661df12a81d7-doc-cpp00000012.step+\",\n      \"revision\": 2\n    }\n  ]\n}"
       }
     },
     {

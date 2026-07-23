@@ -1,4 +1,4 @@
-// core/sourcing/sourcing.cpp — the single dispatch entry the libaicad method table
+// core/sourcing/sourcing.cpp — the single dispatch entry the libchudware method table
 // routes through. Envelopes mirror the Python worker wrappers
 // (engine_oracle/sourcing_worker_rpc.py + parts_providers.WORKER_METHODS):
 //   bom_rollup / bom_price  {doc_path}        -> {ok, bom:[BomLine...]}
@@ -10,7 +10,7 @@
 //   list_spec_templates     {}                -> {ok, templates:[...]}
 #include "sourcing/sourcing.h"
 
-namespace aicad {
+namespace chudware {
 namespace sourcing {
 
 namespace {
@@ -29,7 +29,7 @@ int int_param(const json& params, const char* key, int dflt) {
 
 json require_assembly(const json& params, const Seams& seams) {
     if (!seams.load_assembly)
-        throw ProviderError("no assembly loader configured (libaicad dispatch must "
+        throw ProviderError("no assembly loader configured (libchudware dispatch must "
                             "supply Seams::load_assembly)");
     return seams.load_assembly(str_param(params, "doc_path"));
 }
@@ -128,4 +128,4 @@ bool call(const std::string& method, const json& params, const Seams& seams, jso
 }
 
 }  // namespace sourcing
-}  // namespace aicad
+}  // namespace chudware

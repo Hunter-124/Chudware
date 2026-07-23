@@ -1,4 +1,4 @@
-# OMP → CAD (Billet): Integration Options & Decisions
+# OMP → CAD (Chudware): Integration Options & Decisions
 
 Consolidated synthesis of 11 research dossiers (see `./research/`). Purpose: give you a
 feature-by-feature menu of **KEEP / PORT / SIDECAR / FORK / GLUE** choices so we can decide

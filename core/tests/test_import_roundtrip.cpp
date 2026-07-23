@@ -37,28 +37,28 @@ int body_count(const json& resp) {
     return -1;
 }
 fs::path tmp(const std::string& name) {
-    return fs::temp_directory_path() / ("aicad_imp_" + name);
+    return fs::temp_directory_path() / ("chudware_imp_" + name);
 }
 }  // namespace
 
 // --- N-8 mechanism: the BREP base64 round-trip is lossless (volume preserved). --------
 TEST_CASE("shape <-> brep base64 round-trips exactly") {
     TopoDS_Shape box = BRepPrimAPI_MakeBox(10.0, 20.0, 30.0).Shape();
-    std::string b64 = aicad::doc::shape_to_brep_b64(box);
+    std::string b64 = chudware::doc::shape_to_brep_b64(box);
     REQUIRE_FALSE(b64.empty());
-    TopoDS_Shape back = aicad::doc::brep_b64_to_shape(b64);
+    TopoDS_Shape back = chudware::doc::brep_b64_to_shape(b64);
     REQUIRE_FALSE(back.IsNull());
     CHECK(vol(back) == doctest::Approx(vol(box)).epsilon(1e-9));
 }
 
 // --- N-5: a two-solid STEP imports as TWO separate bodies. -----------------------------
 TEST_CASE("multi-solid STEP imports as separate bodies") {
-    using aicad::doc::doc_import_file;
+    using chudware::doc::doc_import_file;
     fs::path step = tmp("two_solids.step");
     std::vector<TopoDS_Shape> bodies = {
         BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 10.0, 10.0, 10.0).Shape(),
         BRepPrimAPI_MakeBox(gp_Pnt(50, 0, 0), 10.0, 10.0, 10.0).Shape()};
-    aicad::doc::export_bodies(bodies, step.string(), "step");
+    chudware::doc::export_bodies(bodies, step.string(), "step");
 
     json r = doc_import_file(step.string(), "", false, "");
     CHECK(body_count(r) == 2);  // the bug merged them into one compound body
@@ -67,13 +67,13 @@ TEST_CASE("multi-solid STEP imports as separate bodies") {
 
 // --- N-8 + manual import + N-4 round-trip. ---------------------------------------------
 TEST_CASE("saved .step+ survives source deletion; open/import route by extension") {
-    using aicad::doc::doc_import_file;
-    using aicad::doc::doc_open;
-    using aicad::doc::doc_save;
+    using chudware::doc::doc_import_file;
+    using chudware::doc::doc_open;
+    using chudware::doc::doc_save;
 
     fs::path step = tmp("one_solid.step");
     std::vector<TopoDS_Shape> one = {BRepPrimAPI_MakeBox(12.0, 12.0, 12.0).Shape()};
-    aicad::doc::export_bodies(one, step.string(), "step");
+    chudware::doc::export_bodies(one, step.string(), "step");
 
     // Manual import: doc_open on a NON-.step+ file imports it as a fresh part doc.
     json opened = doc_open(step.string(), false);

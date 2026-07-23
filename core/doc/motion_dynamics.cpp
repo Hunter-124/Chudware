@@ -6,7 +6,7 @@
 #include <algorithm>
 #include <cmath>
 
-namespace aicad::doc::motiondyn {
+namespace chudware::doc::motiondyn {
 
 namespace {
 
@@ -103,7 +103,7 @@ DynResult solve_inverse_dynamics(const std::vector<BodyProps>& bodies,
             const int lo = std::max(0, f - 1), hi = std::min(nf - 1, f + 1);
             const double span = (hi - lo) * dt;
             vel[b][f] = (p[b][hi] - p[b][lo]) / span;
-            omg[b][f] = aicad::mate::mat_to_rotvec(R[b][hi] * R[b][lo].transpose()) / span;
+            omg[b][f] = chudware::mate::mat_to_rotvec(R[b][hi] * R[b][lo].transpose()) / span;
         }
         for (int f = 1; f + 1 < nf; ++f)
             acc[b][f] = (p[b][f + 1] - 2.0 * p[b][f] + p[b][f - 1]) / (dt * dt);
@@ -216,4 +216,4 @@ DynResult solve_inverse_dynamics(const std::vector<BodyProps>& bodies,
     return out;
 }
 
-}  // namespace aicad::doc::motiondyn
+}  // namespace chudware::doc::motiondyn

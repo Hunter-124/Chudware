@@ -18,7 +18,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad::ecad {
+namespace chudware::ecad {
 
 // autoroute(board, opts) -> {"tracks": [...], "vias": [...], "report": {...}}.
 // Mirrors engine/ecad/autoroute.py::autoroute exactly. PURE.
@@ -29,4 +29,4 @@ nlohmann::json autoroute(const nlohmann::json& board, const nlohmann::json& opts
 nlohmann::json route_diff_pair(const nlohmann::json& board, const std::string& net_p,
                                const std::string& net_n, const nlohmann::json& opts);
 
-}  // namespace aicad::ecad
+}  // namespace chudware::ecad

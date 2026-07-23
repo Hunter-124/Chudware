@@ -18,7 +18,7 @@
 #include "ecad/drc.h"
 #include "ecad/schema.h"
 
-namespace aicad::ecad {
+namespace chudware::ecad {
 
 using nlohmann::json;
 
@@ -626,4 +626,4 @@ json fill_zones(const json& board, double resolution) {
     return out;
 }
 
-}  // namespace aicad::ecad
+}  // namespace chudware::ecad

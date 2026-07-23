@@ -87,7 +87,7 @@ def test_join_synthesises_handoff_when_child_omits_envelope(tmp_path, monkeypatc
     from services.agent.ledger import Ledger
     from services.agent.mission_dispatch import MissionDispatch
 
-    monkeypatch.setenv("AICAD_CACHE_ROOT", str(tmp_path))
+    monkeypatch.setenv("CHUDWARE_CACHE_ROOT", str(tmp_path))
     ledger = Ledger("mega6_join", path=tmp_path / "ledger.json")
 
     class _Tree:
@@ -235,7 +235,7 @@ def test_agent_turn_records_usage_in_result(tmp_path, monkeypatch):
     from services.agent import agent_turn as at
     from services.agent.providers import token_usage as tu
 
-    monkeypatch.setenv("AICAD_CACHE_ROOT", str(tmp_path))
+    monkeypatch.setenv("CHUDWARE_CACHE_ROOT", str(tmp_path))
     ledger = Ledger("mega6_usage", path=tmp_path / "ledger.json")
 
     class _Prov:
@@ -282,7 +282,7 @@ def test_build_role_tool_floor_at_least_eight(tmp_path, monkeypatch):
     from services.agent.ledger import Ledger
     from services.agent.mission_dispatch import MissionDispatch
 
-    monkeypatch.setenv("AICAD_CACHE_ROOT", str(tmp_path))
+    monkeypatch.setenv("CHUDWARE_CACHE_ROOT", str(tmp_path))
     ledger = Ledger("mega6_build", path=tmp_path / "ledger.json")
 
     class _Tree:
@@ -485,7 +485,7 @@ def test_new_part_without_add_features_not_auto_done(tmp_path, monkeypatch):
     from services.agent.ledger import Ledger
     from services.agent import agent_turn as at
 
-    monkeypatch.setenv("AICAD_CACHE_ROOT", str(tmp_path))
+    monkeypatch.setenv("CHUDWARE_CACHE_ROOT", str(tmp_path))
     ledger = Ledger("mega6_build_mut", path=tmp_path / "ledger.json")
 
     seq = {"n": 0}

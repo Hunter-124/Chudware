@@ -1,7 +1,7 @@
 ---
 description: Work on the gui-imgui section — loads its maintained context pack (source map, entry points, debugging playbook)
 ---
-You are working on the **gui-imgui** section of AI-CAD. Its maintained context pack (tracked in git, kept current by agents):
+You are working on the **gui-imgui** section of Chudware. Its maintained context pack (tracked in git, kept current by agents):
 
 !`cat work/context/gui-imgui.md 2>/dev/null || echo "(context pack missing — run /work-ctx-refresh or explore with graphify)"`
 

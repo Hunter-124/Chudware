@@ -29,8 +29,8 @@
 #include "aicm_loader.h"  // host loader (host/src/render on the include path)
 
 using json = nlohmann::json;
-using aicad::doc::CompileResult;
-using aicad::doc::compile_document;
+using chudware::doc::CompileResult;
+using chudware::doc::compile_document;
 
 namespace {
 
@@ -312,7 +312,7 @@ TEST_CASE("over-cap linear pattern errors instead of hanging (K1)") {
 
     CompileResult r = compile_document(doc, json::object());
     CHECK_FALSE(r.ok);  // the pattern feature failed
-    const aicad::doc::FeatureStatus* lp = nullptr;
+    const chudware::doc::FeatureStatus* lp = nullptr;
     for (const auto& s : r.statuses) if (s.id == "lp") lp = &s;
     REQUIRE(lp != nullptr);
     CHECK_FALSE(lp->ok);
@@ -333,7 +333,7 @@ TEST_CASE("over-cap circular pattern errors instead of hanging (K1)") {
     });
     CompileResult r = compile_document(doc, json::object());
     CHECK_FALSE(r.ok);
-    const aicad::doc::FeatureStatus* cp = nullptr;
+    const chudware::doc::FeatureStatus* cp = nullptr;
     for (const auto& s : r.statuses) if (s.id == "cp") cp = &s;
     REQUIRE(cp != nullptr);
     CHECK_FALSE(cp->ok);

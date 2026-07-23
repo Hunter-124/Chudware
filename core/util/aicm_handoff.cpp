@@ -29,7 +29,7 @@
 #include <unistd.h>
 #endif
 
-namespace aicad {
+namespace chudware {
 namespace aicm_handoff {
 namespace {
 
@@ -86,7 +86,7 @@ std::string name_from_uri(const std::string& uri) {
 
 std::string publish_file(const std::string& key, const uint8_t* data, size_t n) {
     std::error_code ec;
-    std::filesystem::path dir = std::filesystem::temp_directory_path(ec) / "aicad_cpp_docs";
+    std::filesystem::path dir = std::filesystem::temp_directory_path(ec) / "chudware_cpp_docs";
     std::filesystem::create_directories(dir, ec);
     std::filesystem::path target = dir / (sanitize(key) + ".aicm");
     std::ofstream f(target, std::ios::binary | std::ios::trunc);
@@ -98,7 +98,7 @@ std::string publish_file(const std::string& key, const uint8_t* data, size_t n) 
 }
 
 #ifdef _WIN32
-std::string shm_object_name(const std::string& key) { return "Local\\aicad_" + sanitize(key); }
+std::string shm_object_name(const std::string& key) { return "Local\\chudware_" + sanitize(key); }
 
 std::string publish_shm(const std::string& key, const uint8_t* data, size_t n) {
     const std::string name = shm_object_name(key);
@@ -165,7 +165,7 @@ void unlink_shm_name(const std::string& name) {
 #elif defined(__EMSCRIPTEN__)
 // Browser client: no POSIX shm. publish falls back to publish_file (MEMFS);
 // consumers fetch aicm-shm:// via GET /files/aicm?shm=… (see loadAicmFile).
-std::string shm_object_name(const std::string& key) { return "/aicad_" + sanitize(key); }
+std::string shm_object_name(const std::string& key) { return "/chudware_" + sanitize(key); }
 
 std::string publish_shm(const std::string& /*key*/, const uint8_t* /*data*/, size_t /*n*/) {
     return {};
@@ -178,7 +178,7 @@ bool map_shm(const std::string& name, Mapping& /*out*/, std::string& err) {
 
 void unlink_shm_name(const std::string& /*name*/) {}
 #else  // POSIX
-std::string shm_object_name(const std::string& key) { return "/aicad_" + sanitize(key); }
+std::string shm_object_name(const std::string& key) { return "/chudware_" + sanitize(key); }
 
 std::string publish_shm(const std::string& key, const uint8_t* data, size_t n) {
     const std::string name = shm_object_name(key);
@@ -429,4 +429,4 @@ void release_doc(const std::string& doc_id) {
 }
 
 }  // namespace aicm_handoff
-}  // namespace aicad
+}  // namespace chudware

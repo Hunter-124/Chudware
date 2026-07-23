@@ -9,7 +9,7 @@ aicad.part/1 ops batch (the same op vocabulary documented in
 ``services/agent/prompts/shared/ops_cheatsheet.md`` and built with the ``dim``/``feat``
 helpers from ``services/mcp/core_bridge.py``).
 
-Every sample is built on the REAL C++ engine (``core_bridge`` -> ``libaicad``), so every
+Every sample is built on the REAL C++ engine (``core_bridge`` -> ``libchudware``), so every
 face/edge/feature label comes for free from the engine's own feature tree and owner_map —
 no manual annotation, no learned model. This is exactly the "free synthetic labels" the
 review doc names in §3.4.
@@ -247,7 +247,7 @@ FAMILIES: dict[str, Callable[[random.Random], list[dict]]] = {
 # groundedness seam AND the round-trip re-extraction diff before it may enter the set —
 # never trust the paraphraser (the master plan's binding rule). It is engine-FREE: it
 # builds gsl-ser/v1 STATE dicts directly (the `_digest`/domain shape), so the mix runs in
-# CI with no libaicad. When the engine IS available, real B-rep digests can be substituted
+# CI with no libchudware. When the engine IS available, real B-rep digests can be substituted
 # for `synth_brep_state` without changing the pipeline.
 
 # §Pillar-13 data-mix table (fractions sum to 1.0). B-rep dominates; the "what changed"
@@ -618,7 +618,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--translator-pairs", type=int, default=None, metavar="N",
                     help="ENGINE-FREE: emit N verified gsl-ser/v1 translator pairs following "
                          "the §Pillar-13 DOMAIN_MIX (paraphrased + groundedness re-checked) "
-                         "to --pairs-out, then exit (no libaicad needed).")
+                         "to --pairs-out, then exit (no libchudware needed).")
     ap.add_argument("--pairs-out", type=str, default="corpora/translator_pairs.jsonl",
                     help="output JSONL for --translator-pairs")
     args = ap.parse_args(argv)
@@ -634,7 +634,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 0
 
     if not cb.available():
-        print("FATAL: the AI-CAD core engine library (libaicad) could not be located/loaded — "
+        print("FATAL: the Chudware core engine library (libchudware) could not be located/loaded — "
               "build core/build-linux (or core/build-occt-linux) first.", file=sys.stderr)
         return 1
 

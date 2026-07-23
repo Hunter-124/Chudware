@@ -10,7 +10,7 @@
 //
 // run_micro_design() parallels run_design() (run.h) and reuses the same already-
 // ported primitives (providers / ops_emit / events / state / roles / config) and
-// the live doc session (doc/session.h). The libaicad boundary exposes:
+// the live doc session (doc/session.h). The libchudware boundary exposes:
 //   agent_run_micro          — the live end-to-end run (returns {result + events}).
 //   agent_should_engage      — the pure engagement decision (truth table).
 //   agent_micro_normalize_steps / agent_micro_summarize_doc /
@@ -25,7 +25,7 @@
 
 #include "agent/state.h"  // ojson
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 
 using nlohmann::json;
@@ -104,4 +104,4 @@ json run_micro_design(const std::string& request, const std::string& doc_id,
                       const json& options = json::object());
 
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware

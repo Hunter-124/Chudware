@@ -151,7 +151,7 @@ def test_detect_challenge_blocked():
 
 
 def test_account_site_key_and_profile_paths(tmp_path, monkeypatch):
-    monkeypatch.setenv("AI_CAD_CEF_CACHE_ROOT", str(tmp_path / "cef_root"))
+    monkeypatch.setenv("CHUDWARE_CEF_CACHE_ROOT", str(tmp_path / "cef_root"))
     key = us.account_site_key("User/One@x")
     assert key.startswith("xai--")
     assert "@" not in key
@@ -196,7 +196,7 @@ def _sentinel_html(payload: dict | str, *, page: str = "ok") -> str:
 
 
 def test_fetch_grok_usage_ok_flat_schema(tmp_path, monkeypatch):
-    monkeypatch.setenv("AI_CAD_CEF_CACHE_ROOT", str(tmp_path / "cef"))
+    monkeypatch.setenv("CHUDWARE_CEF_CACHE_ROOT", str(tmp_path / "cef"))
     monkeypatch.setattr(
         "services.paths.BROWSER_PROFILES", tmp_path / "pw_profiles", raising=False,
     )
@@ -240,7 +240,7 @@ def test_fetch_grok_usage_ok_flat_schema(tmp_path, monkeypatch):
 
 
 def test_fetch_grok_usage_nested_schema(tmp_path, monkeypatch):
-    monkeypatch.setenv("AI_CAD_CEF_CACHE_ROOT", str(tmp_path / "cef"))
+    monkeypatch.setenv("CHUDWARE_CEF_CACHE_ROOT", str(tmp_path / "cef"))
     import services.paths as engine_paths
     monkeypatch.setattr(engine_paths, "BROWSER_PROFILES", tmp_path / "pw_profiles")
     (tmp_path / "pw_profiles").mkdir(parents=True, exist_ok=True)
@@ -257,7 +257,7 @@ def test_fetch_grok_usage_nested_schema(tmp_path, monkeypatch):
 
 
 def test_fetch_grok_usage_needs_login_401(tmp_path, monkeypatch):
-    monkeypatch.setenv("AI_CAD_CEF_CACHE_ROOT", str(tmp_path / "cef"))
+    monkeypatch.setenv("CHUDWARE_CEF_CACHE_ROOT", str(tmp_path / "cef"))
     import services.paths as engine_paths
     monkeypatch.setattr(engine_paths, "BROWSER_PROFILES", tmp_path / "pw_profiles")
     (tmp_path / "pw_profiles").mkdir(parents=True, exist_ok=True)
@@ -275,7 +275,7 @@ def test_fetch_grok_usage_needs_login_401(tmp_path, monkeypatch):
 
 
 def test_fetch_grok_usage_needs_login_redirect(tmp_path, monkeypatch):
-    monkeypatch.setenv("AI_CAD_CEF_CACHE_ROOT", str(tmp_path / "cef"))
+    monkeypatch.setenv("CHUDWARE_CEF_CACHE_ROOT", str(tmp_path / "cef"))
     import services.paths as engine_paths
     monkeypatch.setattr(engine_paths, "BROWSER_PROFILES", tmp_path / "pw_profiles")
     (tmp_path / "pw_profiles").mkdir(parents=True, exist_ok=True)
@@ -290,7 +290,7 @@ def test_fetch_grok_usage_needs_login_redirect(tmp_path, monkeypatch):
 
 
 def test_fetch_grok_usage_challenge_blocked(tmp_path, monkeypatch):
-    monkeypatch.setenv("AI_CAD_CEF_CACHE_ROOT", str(tmp_path / "cef"))
+    monkeypatch.setenv("CHUDWARE_CEF_CACHE_ROOT", str(tmp_path / "cef"))
     import services.paths as engine_paths
     monkeypatch.setattr(engine_paths, "BROWSER_PROFILES", tmp_path / "pw_profiles")
     (tmp_path / "pw_profiles").mkdir(parents=True, exist_ok=True)
@@ -313,7 +313,7 @@ def test_fetch_grok_usage_challenge_blocked(tmp_path, monkeypatch):
 
 
 def test_fetch_grok_usage_cef_failure_raises(tmp_path, monkeypatch):
-    monkeypatch.setenv("AI_CAD_CEF_CACHE_ROOT", str(tmp_path / "cef"))
+    monkeypatch.setenv("CHUDWARE_CEF_CACHE_ROOT", str(tmp_path / "cef"))
     import services.paths as engine_paths
     monkeypatch.setattr(engine_paths, "BROWSER_PROFILES", tmp_path / "pw_profiles")
     (tmp_path / "pw_profiles").mkdir(parents=True, exist_ok=True)
@@ -327,7 +327,7 @@ def test_fetch_grok_usage_cef_failure_raises(tmp_path, monkeypatch):
 
 
 def test_fetch_grok_usage_empty_parse_raises(tmp_path, monkeypatch):
-    monkeypatch.setenv("AI_CAD_CEF_CACHE_ROOT", str(tmp_path / "cef"))
+    monkeypatch.setenv("CHUDWARE_CEF_CACHE_ROOT", str(tmp_path / "cef"))
     import services.paths as engine_paths
     monkeypatch.setattr(engine_paths, "BROWSER_PROFILES", tmp_path / "pw_profiles")
     (tmp_path / "pw_profiles").mkdir(parents=True, exist_ok=True)

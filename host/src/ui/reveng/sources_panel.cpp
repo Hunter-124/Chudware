@@ -407,7 +407,7 @@ static void drawScanEntry(AppState& st) {
         ImGui::Spacing();
 
         // RE-19: live webcam capture widget (CameraBackend; stub fallback).
-        // session_dir empty → widget resolves $AICAD_REVENG_DIR/<sid>/images.
+        // session_dir empty → widget resolves $CHUDWARE_REVENG_DIR/<sid>/images.
         drawWebcamCapture(st, sid, /*session_dir=*/"");
         ImGui::Spacing();
 

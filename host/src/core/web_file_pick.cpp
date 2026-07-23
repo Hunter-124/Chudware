@@ -9,7 +9,7 @@
 #include <emscripten.h>
 #endif
 
-namespace billet {
+namespace chudware {
 
 #ifdef __EMSCRIPTEN__
 
@@ -79,7 +79,7 @@ extern "C" EMSCRIPTEN_KEEPALIVE void billet_ws_browse_done(int ok, const char* p
     }
 }
 
-// JS-library entry (host/wasm/billet_web_dialogs.js) — runs on main thread via __proxy:sync.
+// JS-library entry (host/wasm/chudware_web_dialogs.js) — runs on main thread via __proxy:sync.
 extern "C" void billet_ws_browse(int mode, const char* accept, const char* suggested);
 
 
@@ -280,4 +280,4 @@ std::string browseWorkspace(WorkspaceBrowseMode /*mode*/,
 
 #endif
 
-}  // namespace billet
+}  // namespace chudware

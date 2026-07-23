@@ -1,6 +1,6 @@
 """flywheel/export.py — Consent-filtered telemetry exporter (T-H5).
 
-Scans <appdata>/AI-CAD/cache/runs/**  +  per-doc session journals, applies
+Scans <appdata>/Chudware/cache/runs/**  +  per-doc session journals, applies
 consent gating (off|meta|full; offline_enabled ⇒ nothing), scrubs PII, derives
 SFT / preference-pair / correction-trace records per contracts/telemetry.md §5,
 and writes provenance-stamped JSONL shards into a DVC-tracked staging directory.
@@ -558,7 +558,7 @@ class ExportConfig:
     """Configuration for a flywheel export run.
 
     Args:
-        runs_dir: Root of the runs cache (default: APPDATA/AI-CAD/cache/runs).
+        runs_dir: Root of the runs cache (default: APPDATA/Chudware/cache/runs).
                   Injectable for testing — point at a fixture directory.
         out_dir:  Local staging directory where shards are written.
                   The user can inspect this before any upload.
@@ -700,7 +700,7 @@ def run_export(cfg: ExportConfig) -> ExportResult:
 def _default_runs_dir() -> Path:
     """Return the default runs cache directory."""
     appdata = os.environ.get("APPDATA") or os.path.expanduser(r"~\AppData\Roaming")
-    return Path(appdata) / "AI-CAD" / "cache" / "runs"
+    return Path(appdata) / "Chudware" / "cache" / "runs"
 
 
 def main() -> None:
@@ -713,7 +713,7 @@ def main() -> None:
         "--runs-dir",
         type=Path,
         default=None,
-        help="Root of the runs cache (default: APPDATA/AI-CAD/cache/runs)",
+        help="Root of the runs cache (default: APPDATA/Chudware/cache/runs)",
     )
     parser.add_argument(
         "--out-dir",
@@ -725,7 +725,7 @@ def main() -> None:
         "--config",
         type=Path,
         default=None,
-        help="Path to config.json (default: APPDATA/AI-CAD/config.json)",
+        help="Path to config.json (default: APPDATA/Chudware/config.json)",
     )
     parser.add_argument(
         "--app-version",
@@ -750,7 +750,7 @@ def main() -> None:
     config_path = args.config
     if config_path is None:
         appdata = os.environ.get("APPDATA") or os.path.expanduser(r"~\AppData\Roaming")
-        config_path = Path(appdata) / "AI-CAD" / "config.json"
+        config_path = Path(appdata) / "Chudware" / "config.json"
     if config_path and config_path.exists():
         try:
             app_config = json.loads(config_path.read_text(encoding="utf-8"))

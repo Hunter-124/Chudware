@@ -23,7 +23,7 @@
 
 #include "structural/model.h"
 
-namespace aicad::structural {
+namespace chudware::structural {
 
 struct AnalysisRow {
     std::string element_id;
@@ -45,4 +45,4 @@ struct AnalysisRow {
 std::vector<AnalysisRow> analyze_doc(const StructureDoc& doc,
                                      const std::vector<LoadCombo>& combos);
 
-}  // namespace aicad::structural
+}  // namespace chudware::structural

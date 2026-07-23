@@ -1,4 +1,4 @@
-// AI-CAD overlay layout + the pinned FeatureManager glass column — see layout.h.
+// Chudware overlay layout + the pinned FeatureManager glass column — see layout.h.
 //
 // Overlay redesign: buildDefaultLayout() builds ONE splitless central node (Viewport / ECAD / CAM
 // tabbed) so the 3D surface spans the full dockspace; drawLeftPane() renders the SolidWorks-style
@@ -336,9 +336,9 @@ void drawLeftPane(AppState& st,
     // T-G21 screenshot hook: --ui-screenshot always resets the overlay columns for determinism
     // (io.IniFilename is nulled in shot mode, so DockBuilderGetNode is always null and the reset
     // branch above always fires) — the persisted collapse setting can't survive that on its own.
-    // AI_CAD_FM_COLLAPSED forces the collapsed capture the same way AI_CAD_COPILOT_NARROW forces
+    // CHUDWARE_FM_COLLAPSED forces the collapsed capture the same way CHUDWARE_COPILOT_NARROW forces
     // a pane width; no effect outside a screenshot run.
-    if (std::getenv("AI_CAD_FM_COLLAPSED")) {
+    if (std::getenv("CHUDWARE_FM_COLLAPSED")) {
         s_collapsed = true;
         s_anim.snap(true, colH);  // snap immediately — headless captures must not depend on frame count
     }

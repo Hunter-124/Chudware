@@ -7,8 +7,8 @@ Skills are folders of instructions + resources the copilot (and humans) can invo
 modeled on Anthropic Agent Skills / omp.sh progressive disclosure:
 metadata always in context (~100 tokens/skill), full body injected on activation only.
 
-- Locations (precedence): project `.billet/skills/<name>/SKILL.md` > user
-  `~/.local/share/AI-CAD/skills/` > builtin `services/agent/skills/builtin/<name>/SKILL.md`.
+- Locations (precedence): project `.chudware/skills/<name>/SKILL.md` > user
+  `~/.local/share/Chudware/skills/` > builtin `services/agent/skills/builtin/<name>/SKILL.md`.
 - Frontmatter (YAML): `name`, `description` (required); `triggers: {keywords: [..], tools: [..], phases: [..]}`,
   `inject: auto|manual` (default manual), `roles: [..]` (optional allowlist).
 - Activation: (a) explicit `/skill:<name>` or `/<name>` slash command from user or agent;

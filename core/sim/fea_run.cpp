@@ -31,7 +31,7 @@
 
 using nlohmann::json;
 
-namespace aicad::sim {
+namespace chudware::sim {
 
 namespace {
 
@@ -332,13 +332,13 @@ void add_midside_face_nodes(const std::vector<int>& tets, int nodes_per_elem,
 // bounded above by half the triplets (duplicates merge). Factor fill-in is the honest
 // unknown and the real killer — CHOLMOD's supernodal fill on bulky 3D solids was
 // MEASURED at multi-GB (see the CHOLMOD note in core/CMakeLists.txt) — so it enters
-// as a multiplier of K, env-tunable via AICAD_FEA_FILL for hosts where the default
+// as a multiplier of K, env-tunable via CHUDWARE_FEA_FILL for hosts where the default
 // proves loose/tight. Result fields (~20 doubles/node) are minor but included.
 uint64_t fea_estimate_bytes(size_t n_elems, size_t n_nodes, int npe, int dof_per_node) {
     const double band = static_cast<double>(dof_per_node * npe);
     const double triplets = static_cast<double>(n_elems) * band * band * 16.0;
     double fill = 6.0;
-    if (const char* e = std::getenv("AICAD_FEA_FILL")) {
+    if (const char* e = std::getenv("CHUDWARE_FEA_FILL")) {
         const double v = std::atof(e);
         if (v > 0.0) fill = v;
     }
@@ -677,9 +677,9 @@ nlohmann::json fea_run_static(const nlohmann::json& study) {
     // (O(load)); ANY input change is a MISS. Tag the result with cache_hit so callers
     // / tests can observe the path honestly.
     const std::string input_hash =
-        aicad::sim::cache::hash_fea_study(aicad::sim::cache::Kind::FeaStatic, study);
+        chudware::sim::cache::hash_fea_study(chudware::sim::cache::Kind::FeaStatic, study);
     {
-        auto hit = aicad::sim::cache::lookup(aicad::sim::cache::Kind::FeaStatic, input_hash);
+        auto hit = chudware::sim::cache::lookup(chudware::sim::cache::Kind::FeaStatic, input_hash);
         if (hit.hit) {
             json out = hit.result;
             out["cache_hit"] = true;
@@ -691,11 +691,11 @@ nlohmann::json fea_run_static(const nlohmann::json& study) {
     // Per-study structured phase record (prof/phases.h): "mesh" / "setup" / "solve" here,
     // plus the solver-internal "solve.<label>" phases from fea_static_solve's FeaProf marks.
     // Surfaced via the prof_phases RPC (engine_profile action="phases").
-    aicad::prof::phases::StudyScope _study("fea_static");
-    // AI_CAD_FEA_PROFILE=1 -> coarse mesh-vs-solve wall-clock split on stderr (the per-solve
+    chudware::prof::phases::StudyScope _study("fea_static");
+    // CHUDWARE_FEA_PROFILE=1 -> coarse mesh-vs-solve wall-clock split on stderr (the per-solve
     // phase breakdown is emitted by fea_static_solve under the same env var). Flushed so it
     // survives an abort() on a too-fine mesh.
-    const char* pe = std::getenv("AI_CAD_FEA_PROFILE");
+    const char* pe = std::getenv("CHUDWARE_FEA_PROFILE");
     const bool fprof = pe && pe[0] && pe[0] != '0';
     const auto t_start = std::chrono::steady_clock::now();
 
@@ -705,7 +705,7 @@ nlohmann::json fea_run_static(const nlohmann::json& study) {
     std::string mesh_type_used, mesh_note;
     std::string err;
     {
-        aicad::prof::phases::PhaseScope _p("mesh");
+        chudware::prof::phases::PhaseScope _p("mesh");
         if (!resolve_mesh(study, points, tets, nodes_per_elem, mesh_type_used, mesh_note, err))
             return json{{"ok", false}, {"error", err}};
     }
@@ -727,7 +727,7 @@ nlohmann::json fea_run_static(const nlohmann::json& study) {
     {
         std::string why;
         const size_t n_elems_est = tets.size() / static_cast<size_t>(nodes_per_elem);
-        if (!aicad::governor::admit(
+        if (!chudware::governor::admit(
                 fea_estimate_bytes(n_elems_est, static_cast<size_t>(n_nodes), nodes_per_elem, 3),
                 "static FEA solve", why))
             return json{{"ok", false}, {"error", why}};
@@ -883,7 +883,7 @@ nlohmann::json fea_run_static(const nlohmann::json& study) {
     // tie each cross-component node pair closer than the gap tolerance with stiff penalty
     // springs (k = E * char_len — element-stiffness scale), the standard bonded-contact
     // idealization. Single-component meshes skip all of this (empty springs, no behaviour
-    // change). Gap default 1 mm, override AI_CAD_FEA_BOND_GAP_MM.
+    // change). Gap default 1 mm, override CHUDWARE_FEA_BOND_GAP_MM.
     std::vector<BondSpring> bond_springs;
     {
         const int n_nodes_i = static_cast<int>(points.size() / 3);
@@ -926,7 +926,7 @@ nlohmann::json fea_run_static(const nlohmann::json& study) {
             }
             const double char_len = (h_n > 0 && h_sum > 0.0) ? (h_sum / h_n) : 1.0;
             double gap_mm = 1.0;
-            if (const char* env = std::getenv("AI_CAD_FEA_BOND_GAP_MM")) {
+            if (const char* env = std::getenv("CHUDWARE_FEA_BOND_GAP_MM")) {
                 const double g = std::atof(env);
                 if (g > 0.0) gap_mm = g;
             }
@@ -982,7 +982,7 @@ nlohmann::json fea_run_static(const nlohmann::json& study) {
                             " disconnected component(s): " +
                             std::to_string(bond_springs.size()) +
                             " bonded gap tie(s) added (gap <= " + std::to_string(gap_mm) +
-                            " mm; AI_CAD_FEA_BOND_GAP_MM overrides)");
+                            " mm; CHUDWARE_FEA_BOND_GAP_MM overrides)");
 
             // ── Reachability: EVERY cluster must have a stiffness path to a fixture ──
             // A free-floating cluster — even an UNLOADED one — contributes unconstrained
@@ -1042,7 +1042,7 @@ nlohmann::json fea_run_static(const nlohmann::json& study) {
                         notes.push_back(std::to_string(groots.size()) +
                                         " unloaded part cluster(s) had no contact path to "
                                         "any fixture and were rigidly grounded (they carry "
-                                        "no load; raise AI_CAD_FEA_BOND_GAP_MM to bond "
+                                        "no load; raise CHUDWARE_FEA_BOND_GAP_MM to bond "
                                         "them instead)");
                     }
                     break;
@@ -1114,11 +1114,11 @@ nlohmann::json fea_run_static(const nlohmann::json& study) {
     }
 
     const auto t_solve0 = std::chrono::steady_clock::now();
-    aicad::prof::phases::add("setup", std::chrono::duration<double, std::milli>(
+    chudware::prof::phases::add("setup", std::chrono::duration<double, std::milli>(
                                           t_solve0 - t_setup0).count());
     FeaStaticResult r = fea_static_solve(points, tets, E_mpa, nu, yield_mpa, fixed_nodes,
                                          nodal_forces, nodes_per_elem, bond_springs);
-    aicad::prof::phases::add("solve", std::chrono::duration<double, std::milli>(
+    chudware::prof::phases::add("solve", std::chrono::duration<double, std::milli>(
                                           std::chrono::steady_clock::now() - t_solve0).count());
     if (fprof) {
         const auto now = std::chrono::steady_clock::now();
@@ -1135,14 +1135,14 @@ nlohmann::json fea_run_static(const nlohmann::json& study) {
             msg += " — the assembly mesh has disconnected part clusters and " +
                    std::to_string(bond_springs.size()) +
                    " bonded gap ties were added, but a loaded part may still not reach any "
-                   "fixtured part. Raise AI_CAD_FEA_BOND_GAP_MM (default 1.0) or check the "
+                   "fixtured part. Raise CHUDWARE_FEA_BOND_GAP_MM (default 1.0) or check the "
                    "assembly's contact/clearances.";
         return json{{"ok", false}, {"error", msg}, {"notes", notes}};
     }
     if (nodes_per_elem == 10) notes.push_back("second-order (tet10) elements");
     // Post-processing (failure criteria + result packaging) — dtor fires at function exit,
     // BEFORE _study's (declared earlier), so the phase lands inside this study.
-    aicad::prof::phases::PhaseScope _post("post");
+    chudware::prof::phases::PhaseScope _post("post");
 
     // ── Additive failure-criterion summary (Tresca / Rankine) ────────────────
     // Computed from the per-node principal stresses the solver already produced;
@@ -1198,7 +1198,7 @@ nlohmann::json fea_run_static(const nlohmann::json& study) {
                   {"max_tresca_mpa", round_nd(max_tresca, 4)},
                   {"max_abs_principal_mpa", round_nd(max_abs_principal, 4)}}},
                 {"solver_notes", notes}};
-    aicad::sim::cache::store(aicad::sim::cache::Kind::FeaStatic, input_hash, out);
+    chudware::sim::cache::store(chudware::sim::cache::Kind::FeaStatic, input_hash, out);
     out["cache_hit"] = false;
     out["cache_reason"] = "miss";
     out["input_hash"] = input_hash;
@@ -1210,9 +1210,9 @@ nlohmann::json fea_run_modal(const nlohmann::json& study, int n_modes) {
     json modal_key = study.is_object() ? study : json::object();
     modal_key["n_modes"] = n_modes;
     const std::string input_hash =
-        aicad::sim::cache::hash_fea_study(aicad::sim::cache::Kind::FeaModal, modal_key);
+        chudware::sim::cache::hash_fea_study(chudware::sim::cache::Kind::FeaModal, modal_key);
     {
-        auto hit = aicad::sim::cache::lookup(aicad::sim::cache::Kind::FeaModal, input_hash);
+        auto hit = chudware::sim::cache::lookup(chudware::sim::cache::Kind::FeaModal, input_hash);
         if (hit.hit) {
             json out = hit.result;
             out["cache_hit"] = true;
@@ -1221,7 +1221,7 @@ nlohmann::json fea_run_modal(const nlohmann::json& study, int n_modes) {
             return out;
         }
     }
-    aicad::prof::phases::StudyScope _study("fea_modal");  // per-phase record (prof/phases.h)
+    chudware::prof::phases::StudyScope _study("fea_modal");  // per-phase record (prof/phases.h)
     std::vector<double> points;
     std::vector<int> tets;
     int nodes_per_elem = 4;
@@ -1238,7 +1238,7 @@ nlohmann::json fea_run_modal(const nlohmann::json& study, int n_modes) {
     if (modal_study.contains("nodes_per_elem"))
         modal_study["nodes_per_elem"] = (want_order == 2) ? 10 : 4;
     {
-        aicad::prof::phases::PhaseScope _p("mesh");
+        chudware::prof::phases::PhaseScope _p("mesh");
         if (!resolve_mesh(modal_study, points, tets, nodes_per_elem, mesh_type_used, mesh_note,
                           err))
             return json{{"ok", false}, {"error", err}};
@@ -1251,7 +1251,7 @@ nlohmann::json fea_run_modal(const nlohmann::json& study, int n_modes) {
     {
         std::string why;
         const size_t ne = tets.size() / static_cast<size_t>(nodes_per_elem);
-        if (!aicad::governor::admit(
+        if (!chudware::governor::admit(
                 2 * fea_estimate_bytes(ne, points.size() / 3, nodes_per_elem, 3),
                 "modal FEA solve", why))
             return json{{"ok", false}, {"error", why}};
@@ -1274,7 +1274,7 @@ nlohmann::json fea_run_modal(const nlohmann::json& study, int n_modes) {
     std::sort(fixed_nodes.begin(), fixed_nodes.end());
 
     FeaModalResult r = [&] {
-        aicad::prof::phases::PhaseScope _p("solve");  // assemble + shift-invert eigensolve
+        chudware::prof::phases::PhaseScope _p("solve");  // assemble + shift-invert eigensolve
         return fea_modal_solve(points, tets, E_mpa, nu, density_g_cm3, fixed_nodes,
                                n_modes, nodes_per_elem);
     }();
@@ -1288,7 +1288,7 @@ nlohmann::json fea_run_modal(const nlohmann::json& study, int n_modes) {
                 {"n_dof", r.n_dof},
                 {"mesh_type_used", mesh_type_used},
                 {"solver_notes", notes}};
-    aicad::sim::cache::store(aicad::sim::cache::Kind::FeaModal, input_hash, out);
+    chudware::sim::cache::store(chudware::sim::cache::Kind::FeaModal, input_hash, out);
     out["cache_hit"] = false;
     out["cache_reason"] = "miss";
     out["input_hash"] = input_hash;
@@ -1320,7 +1320,7 @@ namespace {
 // {duty, period_s} — the direct mapping for an aicad.powerprofile/1 rail — or the general
 // piecewise form {points:[[t_s,scale],...], period_s?}. An absent/empty schedule = always
 // on. Returns false + err on a malformed schedule.
-bool parse_thermal_schedule(const nlohmann::json& js, aicad::sim::ThermalSchedule& out,
+bool parse_thermal_schedule(const nlohmann::json& js, chudware::sim::ThermalSchedule& out,
                             std::string& err) {
     using nlohmann::json;
     if (js.is_null() || !js.is_object()) return true;  // no schedule = constant
@@ -1353,9 +1353,9 @@ bool parse_thermal_schedule(const nlohmann::json& js, aicad::sim::ThermalSchedul
 
 nlohmann::json fea_run_thermal(const nlohmann::json& study) {
     const std::string input_hash =
-        aicad::sim::cache::hash_fea_study(aicad::sim::cache::Kind::FeaThermal, study);
+        chudware::sim::cache::hash_fea_study(chudware::sim::cache::Kind::FeaThermal, study);
     {
-        auto hit = aicad::sim::cache::lookup(aicad::sim::cache::Kind::FeaThermal, input_hash);
+        auto hit = chudware::sim::cache::lookup(chudware::sim::cache::Kind::FeaThermal, input_hash);
         if (hit.hit) {
             json out = hit.result;
             out["cache_hit"] = true;
@@ -1364,14 +1364,14 @@ nlohmann::json fea_run_thermal(const nlohmann::json& study) {
             return out;
         }
     }
-    aicad::prof::phases::StudyScope _study("fea_thermal");  // per-phase record (prof/phases.h)
+    chudware::prof::phases::StudyScope _study("fea_thermal");  // per-phase record (prof/phases.h)
     std::vector<double> points;
     std::vector<int> tets;
     int nodes_per_elem = 4;
     std::string mesh_type_used, mesh_note;
     std::string err;
     {
-        aicad::prof::phases::PhaseScope _p("mesh");
+        chudware::prof::phases::PhaseScope _p("mesh");
         if (!resolve_mesh(study, points, tets, nodes_per_elem, mesh_type_used, mesh_note, err))
             return json{{"ok", false}, {"error", err}};
     }
@@ -1384,7 +1384,7 @@ nlohmann::json fea_run_thermal(const nlohmann::json& study) {
     {
         std::string why;
         const size_t ne = tets.size() / static_cast<size_t>(nodes_per_elem);
-        if (!aicad::governor::admit(
+        if (!chudware::governor::admit(
                 fea_estimate_bytes(ne, points.size() / 3, nodes_per_elem, 1),
                 "thermal FEA solve", why))
             return json{{"ok", false}, {"error", why}};
@@ -1422,8 +1422,8 @@ nlohmann::json fea_run_thermal(const nlohmann::json& study) {
     }
 
     // ── Loads: heat flux + convection film ──────────────────────────────────────────────
-    std::vector<aicad::sim::ThermalConvection> convections;
-    std::vector<aicad::sim::ThermalFluxLoad> flux_loads;  // per-load: steady AND transient
+    std::vector<chudware::sim::ThermalConvection> convections;
+    std::vector<chudware::sim::ThermalFluxLoad> flux_loads;  // per-load: steady AND transient
     struct FluxFaceLog { size_t n_nodes; double q_wm2; bool scheduled; };
     std::vector<FluxFaceLog> flux_log;
     const bool transient = study.contains("transient") && study["transient"].is_object();
@@ -1444,7 +1444,7 @@ nlohmann::json fea_run_thermal(const nlohmann::json& study) {
                 // Every load stays SEPARATE with its own node set + magnitude (+ schedule for
                 // transient). The old steady path collapsed all loads onto one node set with
                 // the LAST load's magnitude — silently wrong for >1 flux load (C3 defect).
-                aicad::sim::ThermalFluxLoad fl;
+                chudware::sim::ThermalFluxLoad fl;
                 fl.nodes = ids;
                 fl.q = q_wm2 / 1.0e6;  // W/m^2 -> W/mm^2
                 std::string serr;
@@ -1454,7 +1454,7 @@ nlohmann::json fea_run_thermal(const nlohmann::json& study) {
                 if (!transient && load.contains("schedule"))
                     notes.push_back("Flux schedule ignored in a steady-state study");
             } else if (type == "convection") {
-                aicad::sim::ThermalConvection cv;
+                chudware::sim::ThermalConvection cv;
                 cv.nodes = ids;
                 // h in W/(m^2·K) -> W/(mm^2·K) = h/1e6; t_amb in °C (same scale as fixed temps).
                 cv.h = (load.value("h", 0.0)) / 1.0e6;
@@ -1478,7 +1478,7 @@ nlohmann::json fea_run_thermal(const nlohmann::json& study) {
             return json{{"ok", false},
                         {"error", "transient thermal needs material.cp_j_kgk (J/kg·K) and "
                                   "density (density_g_cm3 or rho_kg_m3)"}};
-        aicad::sim::ThermalTransientOptions opts;
+        chudware::sim::ThermalTransientOptions opts;
         opts.rho_cp = rho_kg_m3 * cp / 1.0e9;
         opts.t_end = tr.value("t_end_s", 0.0);
         opts.dt = tr.value("dt_s", 0.0);
@@ -1491,9 +1491,9 @@ nlohmann::json fea_run_thermal(const nlohmann::json& study) {
             notes.push_back("transient dt_s not given — defaulted to t_end_s/200");
         }
 
-        aicad::sim::ThermalTransientResult r = [&] {
-            aicad::prof::phases::PhaseScope _p("solve.transient");
-            return aicad::sim::fea_thermal_transient(
+        chudware::sim::ThermalTransientResult r = [&] {
+            chudware::prof::phases::PhaseScope _p("solve.transient");
+            return chudware::sim::fea_thermal_transient(
                 points, tets, k_cond, fixed_nodes, fixed_temps, flux_loads, convections,
                 opts, nodes_per_elem);
         }();
@@ -1528,16 +1528,16 @@ nlohmann::json fea_run_thermal(const nlohmann::json& study) {
                                                   r.frames.back().temperature.end()), 4)}}},
                     {"flux_summary", flux_summary},
                     {"solver_notes", notes}};
-        aicad::sim::cache::store(aicad::sim::cache::Kind::FeaThermal, input_hash, out);
+        chudware::sim::cache::store(chudware::sim::cache::Kind::FeaThermal, input_hash, out);
         out["cache_hit"] = false;
         out["cache_reason"] = "miss";
         out["input_hash"] = input_hash;
         return out;
     }
 
-    aicad::sim::ThermalResult r = [&] {
-        aicad::prof::phases::PhaseScope _p("solve");
-        return aicad::sim::fea_thermal_solve(
+    chudware::sim::ThermalResult r = [&] {
+        chudware::prof::phases::PhaseScope _p("solve");
+        return chudware::sim::fea_thermal_solve(
             points, tets, k_cond, fixed_nodes, fixed_temps, flux_loads, convections,
             nodes_per_elem);
     }();
@@ -1563,7 +1563,7 @@ nlohmann::json fea_run_thermal(const nlohmann::json& study) {
                  {{"max_temp_c", round_nd(r.max_temp, 4)}, {"min_temp_c", round_nd(r.min_temp, 4)}}},
                 {"flux_summary", flux_summary},
                 {"solver_notes", notes}};
-    aicad::sim::cache::store(aicad::sim::cache::Kind::FeaThermal, input_hash, out);
+    chudware::sim::cache::store(chudware::sim::cache::Kind::FeaThermal, input_hash, out);
     out["cache_hit"] = false;
     out["cache_reason"] = "miss";
     out["input_hash"] = input_hash;
@@ -1588,7 +1588,7 @@ size_t mesh_out_bytes(const MeshOut& m) {
            m.error.size() + 256;
 }
 uint64_t mesh_cache_budget_bytes() {
-    const uint64_t host = aicad::governor::budget_bytes();
+    const uint64_t host = chudware::governor::budget_bytes();
     if (host == UINT64_MAX) return 512ull * 1024ull * 1024ull;  // 512 MiB when governor off
     // Cap mesh-cache residency at 12.5% of the study budget, floored at 64 MiB so a
     // small machine still keeps a couple of warm meshes.
@@ -1762,4 +1762,4 @@ MeshOut mesh_step_cached(const std::string& step_path, const MeshOptions& option
     return *mesh_step_cached_ptr(step_path, options);  // legacy by-value form (one copy)
 }
 
-}  // namespace aicad::sim
+}  // namespace chudware::sim

@@ -758,7 +758,7 @@ ROLE_MODELS_METHODS: dict[str, Callable] = {
 
 
 def _repo_root() -> Path:
-    env = os.environ.get("AI_CAD_REPO") or os.environ.get("AICAD_ROOT")
+    env = os.environ.get("CHUDWARE_REPO") or os.environ.get("CHUDWARE_ROOT")
     if env:
         return Path(env).expanduser().resolve()
     # services/agent/worker_rpc.py → repo root (depth preserved from the T-RF19 fold)
@@ -902,7 +902,7 @@ def _run_pipeline(mode: str, tiers: list[str], cycle: str) -> None:
     root = _repo_root()
     cmd = _build_cmd(mode, tiers, cycle)
     env = os.environ.copy()
-    env.setdefault("AI_CAD_REPO", str(root))
+    env.setdefault("CHUDWARE_REPO", str(root))
     # Never inherit interactive TTY assumptions into the detached child.
     env.setdefault("PYTHONUNBUFFERED", "1")
 
@@ -1045,7 +1045,7 @@ def _run_category_pipeline(category: str, cycle: str, mode: str | None = None) -
         return
 
     env = os.environ.copy()
-    env.setdefault("AI_CAD_REPO", str(root))
+    env.setdefault("CHUDWARE_REPO", str(root))
     env.setdefault("PYTHONUNBUFFERED", "1")
 
     log_dir = _reports_dir() / "gui_bench"
@@ -1316,7 +1316,7 @@ def _bench_categories(params: dict, _emit: Callable) -> dict:
     """Return the category registry + last-result snapshots for the Benchmarks tab."""
     try:
         cats = _import_categories()
-        # Optional repo override for tests via AI_CAD_REPO already handled in cats.
+        # Optional repo override for tests via CHUDWARE_REPO already handled in cats.
         categories = cats.list_categories(_repo_root())
         return {"ok": True, "categories": categories}
     except Exception as exc:  # noqa: BLE001

@@ -1,6 +1,6 @@
 // gen_sim2_result_fixture — regenerate the committed T-SIM2 result-contour AICM fixture.
 //
-// The AI_CAD_SHOT=fea_overlay headless scenario (ui/imgui/src/ui/scenarios.cpp) renders a
+// The CHUDWARE_SHOT=fea_overlay headless scenario (ui/imgui/src/ui/scenarios.cpp) renders a
 // color-mapped FEA contour from a precomputed result AICM. That AICM is produced HERE, by the
 // REAL solver + overlay pipeline, WITHOUT the Netgen tet mesher (which is not provisionable in
 // every environment): a structured cantilever tet mesh is hand-built in code (mesher substitute,
@@ -66,7 +66,7 @@ int main(int argc, char** argv) {
     const double totalN = -400.0;
     for (int id : tipNodes) forces[id * 3 + 2] = totalN / static_cast<double>(tipNodes.size());
 
-    auto res = aicad::sim::fea_static_solve(m.points, m.tets, 200000.0, 0.29, 250.0,
+    auto res = chudware::sim::fea_static_solve(m.points, m.tets, 200000.0, 0.29, 250.0,
                                             fixed, forces, /*nodes_per_elem=*/4);
     std::printf("solve ok=%d n_nodes=%d n_elems=%d max_vm=%.2f MPa max_disp=%.4f mm min_fos=%.2f\n",
                 (int)res.ok, res.n_nodes, res.n_elems, res.max_von_mises_mpa, res.max_disp_mm,
@@ -75,7 +75,7 @@ int main(int argc, char** argv) {
 
     nlohmann::json summary = {{"max_von_mises_mpa", res.max_von_mises_mpa},
                               {"max_disp_mm", res.max_disp_mm}, {"min_fos", res.min_fos}};
-    const std::string aicm = aicad::sim::static_overlay(
+    const std::string aicm = chudware::sim::static_overlay(
         /*step_path=*/"", m.points, m.tets, /*nodes_per_elem=*/4,
         res.von_mises, res.disp_magnitude, res.displacement,
         res.principal1, res.principal3, res.max_shear, 250.0, summary);

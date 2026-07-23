@@ -117,7 +117,7 @@
 #include "geom/profile3d.h"
 #include "util/expr.h"
 
-namespace aicad::doc {
+namespace chudware::doc {
 
 using nlohmann::json;
 using EnvMap = std::map<std::string, double>;
@@ -137,7 +137,7 @@ inline double radians(double deg) { return deg * PI / 180.0; }
 // on (downstream extrude/revolve default their direction to the plane normal).
 struct SketchResult {
     std::vector<TopoDS_Face> faces;
-    aicad::geom::SketchPlane plane;
+    chudware::geom::SketchPlane plane;
     nlohmann::json entities;  // solved entities (for a sweep path / rib trace wire)
 };
 
@@ -150,7 +150,7 @@ struct SolidResult {
 // offset plane for a loft section). Never tessellates; not a body. Also carries a
 // `csys` flag so a csys datum (which is geometrically a Plane) round-trips its kind.
 struct PlaneResult {
-    aicad::geom::SketchPlane plane;
+    chudware::geom::SketchPlane plane;
     bool is_csys = false;
 };
 
@@ -172,7 +172,7 @@ struct PointResult {
 // _sketch_regions path contract). Never a body. Port of curves.py.
 struct CurveResult {
     TopoDS_Wire wire;                 // local-frame curve
-    aicad::geom::SketchPlane base;    // lift frame
+    chudware::geom::SketchPlane base;    // lift frame
 };
 
 // A 3D free-space sketch result: the solved entities chained into WORLD-space
@@ -297,7 +297,7 @@ static std::atomic<uint64_t> g_cc_features_executed{0};
 static std::atomic<uint64_t> g_cc_bodies_reused{0};    // tessellation+stats served from body cache
 static std::atomic<uint64_t> g_cc_bodies_tessellated{0};
 
-}  // namespace (hop out: CompileCache is the aicad::doc::CompileCache the header
+}  // namespace (hop out: CompileCache is the chudware::doc::CompileCache the header
    // forward-declares — inside the anonymous namespace it would be a DIFFERENT,
    // ambiguous type. Its CompileCkpt members are internal-linkage types, which is
    // fine: this TU is the only place the struct is ever complete.)
@@ -370,11 +370,11 @@ constexpr long long kPatternInstanceLimit = 4000;
 // the per-feature try/catch turns that into an error status.
 double num_or_expr(const json& v, const EnvMap& env) {
     if (v.is_number()) return v.get<double>();
-    if (v.is_string()) return aicad::util::evaluate(v.get<std::string>(), env);
+    if (v.is_string()) return chudware::util::evaluate(v.get<std::string>(), env);
     if (v.is_object()) {
         auto e = v.find("expr");
         if (e != v.end() && e->is_string() && !e->get<std::string>().empty())
-            return aicad::util::evaluate(e->get<std::string>(), env);
+            return chudware::util::evaluate(e->get<std::string>(), env);
         auto val = v.find("value");
         if (val != v.end() && val->is_number()) return val->get<double>();
         throw std::runtime_error("dim object has neither a usable 'expr' nor numeric 'value'");
@@ -400,10 +400,10 @@ Eigen::Vector3d req_vec3(const json& feat, const char* key) {
 
 // Map a plane name to a SketchPlane factory. Defaults to top() for an unknown/absent
 // name (forward-tolerant), matching the most natural work plane.
-aicad::geom::SketchPlane plane_from_name(const std::string& name) {
-    if (name == "front") return aicad::geom::SketchPlane::front();
-    if (name == "right") return aicad::geom::SketchPlane::right();
-    return aicad::geom::SketchPlane::top();  // "top" or anything else
+chudware::geom::SketchPlane plane_from_name(const std::string& name) {
+    if (name == "front") return chudware::geom::SketchPlane::front();
+    if (name == "right") return chudware::geom::SketchPlane::right();
+    return chudware::geom::SketchPlane::top();  // "top" or anything else
 }
 
 // Look up a referenced feature result by id, requiring it be a SOLID body. Throws a
@@ -479,10 +479,10 @@ TopoDS_Wire sketch3d_ref_wire(const Sketch3DResult& s3, const json& ref,
 // sketch produced NO closed region, so it can never alter a model that already closed
 // its own profile — it only turns a guaranteed failure into a likely success.
 std::vector<TopoDS_Face> close_profile_to_axis(
-    const nlohmann::json& solved_entities, const aicad::geom::SketchPlane& plane,
+    const nlohmann::json& solved_entities, const chudware::geom::SketchPlane& plane,
     const Eigen::Vector3d& axis_pt, const Eigen::Vector3d& axis_dir) {
     std::vector<TopoDS_Face> out;
-    TopoDS_Wire open = aicad::geom::wire_from_solved_sketch(solved_entities, plane);
+    TopoDS_Wire open = chudware::geom::wire_from_solved_sketch(solved_entities, plane);
     if (open.IsNull()) return out;
     TopoDS_Vertex va, vb;
     ShapeAnalysis::FindBounds(open, va, vb);          // free ends of the open wire
@@ -522,7 +522,7 @@ std::vector<TopoDS_Face> close_profile_to_axis(
 //     OUTWARD normal. gp_Pln::XAxis() is an arbitrary artifact of surface
 //     parameterization (one extrude's front face measured u→+Z,v→−X while a primitive's
 //     top face measured u→+X,v→+Y) — unplaceable without trial and error.
-static aicad::geom::SketchPlane hole_face_frame(const TopoDS_Face& face,
+static chudware::geom::SketchPlane hole_face_frame(const TopoDS_Face& face,
                                                 const Eigen::Vector3d& outward_normal) {
     const TopoDS_Face* measured = &face;
     TopoDS_Face outer_only;
@@ -540,7 +540,7 @@ static aicad::geom::SketchPlane hole_face_frame(const TopoDS_Face& face,
     GProp_GProps props;
     BRepGProp::SurfaceProperties(*measured, props);
     gp_Pnt c = props.CentreOfMass();
-    return aicad::geom::SketchPlane::from(Eigen::Vector3d(c.X(), c.Y(), c.Z()),
+    return chudware::geom::SketchPlane::from(Eigen::Vector3d(c.X(), c.Y(), c.Z()),
                                           outward_normal);
 }
 
@@ -619,7 +619,7 @@ std::optional<std::pair<Eigen::Vector3d, Eigen::Vector3d>> plane_pt_normal_from_
     }
     if (name.rfind("plane.", 0) == 0) name = name.substr(6);
     if (name != "top" && name != "front" && name != "right") return std::nullopt;
-    aicad::geom::SketchPlane p = plane_from_name(name);
+    chudware::geom::SketchPlane p = plane_from_name(name);
     return std::make_pair(p.origin, p.normal);
 }
 
@@ -666,7 +666,7 @@ double face_surface_area(const TopoDS_Face& f) {
 // Project a face's area-centroid into the sketch plane's (u,v) frame — same frame
 // doc_sketch_regions stamps on region descriptors (session.cpp::reg_face_descriptor).
 Eigen::Vector2d face_uv_centroid(const TopoDS_Face& f,
-                                 const aicad::geom::SketchPlane& plane) {
+                                 const chudware::geom::SketchPlane& plane) {
     GProp_GProps props;
     BRepGProp::SurfaceProperties(f, props);
     gp_Pnt cm = props.CentreOfMass();
@@ -748,7 +748,7 @@ std::vector<TopoDS_Face> resolve_profile_faces(const FeatureResultMap& results,
     // Targeted pick: build the FULL region face list (material + void), matching
     // doc_sketch_regions so index/centroid can address the inner disc of a washer.
     std::vector<TopoDS_Face> all_faces =
-        aicad::geom::all_region_faces_from_solved_sketch(src.entities, src.plane);
+        chudware::geom::all_region_faces_from_solved_sketch(src.entities, src.plane);
     if (all_faces.empty())
         throw std::runtime_error("profile sketch has no closed face");
 
@@ -1421,7 +1421,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
     // Resolve a ref to a datum PLANE (origin, normal): a reserved plane.top/front/
     // right, OR a plane/csys datum feature id (its SketchPlane). nullopt otherwise.
     auto resolve_plane_ref =
-        [&](const json& ref) -> std::optional<aicad::geom::SketchPlane> {
+        [&](const json& ref) -> std::optional<chudware::geom::SketchPlane> {
         std::string fid;
         if (ref.is_string()) fid = ref.get<std::string>();
         else if (ref.is_object() && ref.value("kind", std::string()) == "datum" &&
@@ -1466,15 +1466,15 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
         // way a dressed feature's query does — so any face REF (sketch plane, hole target,
         // draft neutral, mirror plane, datum base) can be named "the top face" in words
         // instead of carrying a clicked centroid selector. (A real selector has no "of".)
-        if (aicad::doc::is_geom_query(sel)) {
-            aicad::doc::QueryPicks qp = aicad::doc::resolve_geom_query(body, sel);
+        if (chudware::doc::is_geom_query(sel)) {
+            chudware::doc::QueryPicks qp = chudware::doc::resolve_geom_query(body, sel);
             if (!qp.error.empty())
                 throw std::runtime_error(std::string(slot) + ": " + qp.error);
             if (qp.faces.empty())
                 throw std::runtime_error(std::string(slot) + ": query matched no face");
             return qp.faces.front();
         }
-        aicad::doc::FacePicks fp = aicad::doc::resolve_face_picks(body, sel, slot);
+        chudware::doc::FacePicks fp = chudware::doc::resolve_face_picks(body, sel, slot);
         if (fp.faces.empty()) {
             std::string reason = fp.dangling.empty() ? std::string("unresolved")
                                                      : fp.dangling.front();
@@ -1485,15 +1485,15 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
     // Resolve an EDGE selector against the running body -> the unique TopoDS_Edge.
     auto resolve_edge_sel = [&](const json& sel, const char* slot) -> TopoDS_Edge {
         const TopoDS_Shape& body = last_body_shape(slot);
-        if (aicad::doc::is_geom_query(sel)) {  // word-vocabulary query (see resolve_face_sel)
-            aicad::doc::QueryPicks qp = aicad::doc::resolve_geom_query(body, sel);
+        if (chudware::doc::is_geom_query(sel)) {  // word-vocabulary query (see resolve_face_sel)
+            chudware::doc::QueryPicks qp = chudware::doc::resolve_geom_query(body, sel);
             if (!qp.error.empty())
                 throw std::runtime_error(std::string(slot) + ": " + qp.error);
             if (qp.edges.empty())
                 throw std::runtime_error(std::string(slot) + ": query matched no edge");
             return qp.edges.front();
         }
-        aicad::doc::EdgePicks ep = aicad::doc::resolve_edge_picks(body, sel);
+        chudware::doc::EdgePicks ep = chudware::doc::resolve_edge_picks(body, sel);
         if (ep.edges.empty()) {
             std::string reason = ep.dangling.empty() ? std::string("unresolved")
                                                      : ep.dangling.front();
@@ -1520,7 +1520,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
         auto it = sk.empty() ? results.end() : results.find(sk);
         if (it != results.end() && std::holds_alternative<SketchResult>(*it->second)) {
             const SketchResult& src = std::get<SketchResult>(*it->second);
-            TopoDS_Wire w = aicad::geom::wire_from_solved_sketch(src.entities, src.plane);
+            TopoDS_Wire w = chudware::geom::wire_from_solved_sketch(src.entities, src.plane);
             if (w.IsNull())
                 throw std::runtime_error(std::string("surf: ") + slot + " sketch produced no wire");
             return w;
@@ -1689,7 +1689,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
     // build123d uses the face centroid as the plane origin + the orientation-aware
     // surface normal as z_dir. Throws on a non-planar face.
     auto face_plane = [&](const TopoDS_Face& face, const char* slot)
-        -> aicad::geom::SketchPlane {
+        -> chudware::geom::SketchPlane {
         BRepAdaptor_Surface ad(face);
         if (ad.GetType() != GeomAbs_Plane)
             throw std::runtime_error(std::string(slot) + ": face is not planar");
@@ -1697,12 +1697,12 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
         GProp_GProps props;
         BRepGProp::SurfaceProperties(face, props);
         gp_Pnt cm = props.CentreOfMass();
-        return aicad::geom::SketchPlane::from(Eigen::Vector3d(cm.X(), cm.Y(), cm.Z()), n);
+        return chudware::geom::SketchPlane::from(Eigen::Vector3d(cm.X(), cm.Y(), cm.Z()), n);
     };
     // Resolve a "planar datum OR planar face selector" ref to a SketchPlane
     // (datum.py::_plane_of). A datum ref goes through resolve_plane_ref; a face
     // selector resolves against the last body.
-    auto plane_of = [&](const json& ref, const char* slot) -> aicad::geom::SketchPlane {
+    auto plane_of = [&](const json& ref, const char* slot) -> chudware::geom::SketchPlane {
         if (is_datum_ref(ref)) {
             auto p = resolve_plane_ref(ref);
             if (!p)
@@ -1718,11 +1718,11 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
     auto vertex_point = [&](const json& ref, const char* slot) -> Eigen::Vector3d {
         if (is_datum_ref(ref)) return resolve_point(ref, slot);
         const TopoDS_Shape& body = last_body_shape(slot);
-        std::vector<aicad::doc::TopoInfo> infos = aicad::doc::describe_vertices(body);
-        const double diag = aicad::doc::bbox_diag(body);
-        std::optional<int> idx = aicad::doc::resolve_with_hint_fallback(ref, infos, diag);
+        std::vector<chudware::doc::TopoInfo> infos = chudware::doc::describe_vertices(body);
+        const double diag = chudware::doc::bbox_diag(body);
+        std::optional<int> idx = chudware::doc::resolve_with_hint_fallback(ref, infos, diag);
         if (!idx) {
-            aicad::doc::ResolveResult rr = aicad::doc::resolve(ref, infos, diag);
+            chudware::doc::ResolveResult rr = chudware::doc::resolve(ref, infos, diag);
             throw std::runtime_error(std::string(slot) + ": vertex selector dangling — " +
                                      rr.dangling_reason.value_or(std::string("unresolved")));
         }
@@ -2057,7 +2057,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 json sk;
                 sk["entities"] = feat.value("entities", json::array());
                 sk["constraints"] = feat.value("constraints", json::array());
-                aicad::sketch::SketchSolution sol = aicad::sketch::solve_sketch(sk, env_json);
+                chudware::sketch::SketchSolution sol = chudware::sketch::solve_sketch(sk, env_json);
                 if (!sol.converged)
                     throw std::runtime_error("sketch did not converge");
 
@@ -2070,13 +2070,13 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 // world Z. (plane_of's face path needs a body; base datums need none.)
                 const json pref = feat.contains("plane") && !feat.at("plane").is_null()
                                       ? feat.at("plane") : json("plane.top");
-                aicad::geom::SketchPlane plane = plane_of(pref, "sketch plane");
+                chudware::geom::SketchPlane plane = plane_of(pref, "sketch plane");
                 // Optional `offset`: shift the resolved plane along its normal (a sketch N
                 // mm above a datum/face), matching the loft-on-offset cheatsheet usage.
                 if (feat.contains("offset") && !feat.at("offset").is_null())
                     plane.origin += plane.normal * num_or_expr(feat.at("offset"), env);
                 std::vector<TopoDS_Face> faces =
-                    aicad::geom::faces_from_solved_sketch(sol.entities, plane);
+                    chudware::geom::faces_from_solved_sketch(sol.entities, plane);
                 // NB: an open sketch (no closed loop) is NOT an error here — it is a
                 // valid path/trace for a sweep/rib. A consuming feature that needs a
                 // face (extrude/revolve) raises if faces is empty.
@@ -2141,12 +2141,12 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                                 {"refs", json::array({rid})}});
                     }
                 }
-                aicad::sketch3d::Sketch3DSolution sol =
-                    aicad::sketch3d::solve_sketch3d(sk, env_json);
+                chudware::sketch3d::Sketch3DSolution sol =
+                    chudware::sketch3d::solve_sketch3d(sk, env_json);
                 if (!sol.converged)
                     throw std::runtime_error("sketch3d did not converge");
                 std::vector<TopoDS_Wire> wires =
-                    aicad::geom::wires_from_sketch3d(sol.entities);
+                    chudware::geom::wires_from_sketch3d(sol.entities);
                 // NB: zero wires is NOT an error here — a points-only skeleton is
                 // valid; a consuming sweep raises if it needs a wire.
                 results[id] = Sketch3DResult{std::move(wires), sol.entities};
@@ -2179,10 +2179,10 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     // accepting a face here is a deliberate SW-parity superset that does not
                     // affect datum-offset parity.)
                     const json bref = feat.contains("base") ? feat.at("base") : json("plane.top");
-                    aicad::geom::SketchPlane bp = plane_of(bref, "base");
+                    chudware::geom::SketchPlane bp = plane_of(bref, "base");
                     const double off =
                         feat.contains("offset") ? num_or_expr(feat.at("offset"), env) : 0.0;
-                    aicad::geom::SketchPlane p = bp;
+                    chudware::geom::SketchPlane p = bp;
                     p.origin = bp.origin + bp.normal * off;
                     results[id] = PlaneResult{p};
 
@@ -2191,15 +2191,15 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     // _plane_of). mid origin = (a.origin + b.origin)/2 ; orientation = a's frame.
                     const json aref = feat.contains("base") ? feat.at("base") : json("plane.top");
                     const json bref = feat.contains("second") ? feat.at("second") : json("plane.top");
-                    aicad::geom::SketchPlane a = plane_of(aref, "base");
-                    aicad::geom::SketchPlane b = plane_of(bref, "second");
-                    aicad::geom::SketchPlane p = a;
+                    chudware::geom::SketchPlane a = plane_of(aref, "base");
+                    chudware::geom::SketchPlane b = plane_of(bref, "second");
+                    chudware::geom::SketchPlane p = a;
                     p.origin = (a.origin + b.origin) * 0.5;
                     results[id] = PlaneResult{p};
 
                 } else if (method == "angle") {
                     const json bref = feat.contains("base") ? feat.at("base") : json("plane.top");
-                    aicad::geom::SketchPlane base = plane_of(bref, "base");
+                    chudware::geom::SketchPlane base = plane_of(bref, "base");
                     if (!feat.contains("second"))
                         throw std::runtime_error("plane angle: refs.second (a hinge edge) is required");
                     // The hinge is a datum axis OR a picked model edge (datum.py: edge
@@ -2232,7 +2232,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     Eigen::Vector3d o = xf_pt(base.origin);
                     Eigen::Vector3d nrm = xf_dir(base.normal);
                     Eigen::Vector3d uref = xf_dir(base.uAxis);
-                    results[id] = PlaneResult{aicad::geom::SketchPlane::from(o, nrm, uref)};
+                    results[id] = PlaneResult{chudware::geom::SketchPlane::from(o, nrm, uref)};
 
                 } else if (method == "three_point") {
                     auto pit = feat.find("points");
@@ -2248,19 +2248,19 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     if (n.norm() < 1e-9 || v1.norm() < 1e-9 || v2.norm() < 1e-9)
                         throw std::runtime_error(
                             "plane three_point: the three points are colinear (no unique plane)");
-                    results[id] = PlaneResult{aicad::geom::SketchPlane::from(p0, n, v1)};
+                    results[id] = PlaneResult{chudware::geom::SketchPlane::from(p0, n, v1)};
 
                 } else if (method == "parallel_point") {
                     // base is a planar datum OR a picked planar face; the through-point is
                     // a point datum OR a picked vertex (datum.py parallel_point).
                     const json bref = feat.contains("base") ? feat.at("base") : json("plane.top");
-                    aicad::geom::SketchPlane base = plane_of(bref, "base");
+                    chudware::geom::SketchPlane base = plane_of(bref, "base");
                     auto pit = feat.find("points");
                     if (pit == feat.end() || !pit->is_array() || pit->empty())
                         throw std::runtime_error(
                             "plane parallel_point: refs.points[0] (a through-point) is required");
                     Eigen::Vector3d thru = vertex_point((*pit)[0], "points[0]");
-                    aicad::geom::SketchPlane p = base;
+                    chudware::geom::SketchPlane p = base;
                     p.origin = thru;
                     results[id] = PlaneResult{p};
 
@@ -2288,7 +2288,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     Eigen::Vector3d normal = req_vec3(feat, "normal");
                     if (normal.norm() < 1e-12)
                         throw std::runtime_error("plane point_normal: normal is zero-length");
-                    results[id] = PlaneResult{aicad::geom::SketchPlane::from(origin, normal)};
+                    results[id] = PlaneResult{chudware::geom::SketchPlane::from(origin, normal)};
 
                 } else if (method == "normal_to_curve") {
                     // A plane whose NORMAL is the tangent of a curve at a landing point
@@ -2324,7 +2324,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                         std::tie(origin, normal) =
                             curve_point_tangent(edge, fraction, param, near_pt, "second");
                     }
-                    results[id] = PlaneResult{aicad::geom::SketchPlane::from(origin, normal)};
+                    results[id] = PlaneResult{chudware::geom::SketchPlane::from(origin, normal)};
 
                 } else if (method == "on_surface") {
                     // A plane TANGENT to a surface at a point: z_dir = the surface normal at
@@ -2346,7 +2346,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                         near_pt = Eigen::Vector3d(cm.X(), cm.Y(), cm.Z());
                     }
                     auto [origin, normal] = surface_point_normal(face, near_pt, "base");
-                    results[id] = PlaneResult{aicad::geom::SketchPlane::from(origin, normal)};
+                    results[id] = PlaneResult{chudware::geom::SketchPlane::from(origin, normal)};
 
                 } else {
                     throw std::runtime_error("plane: method '" + method + "' not supported");
@@ -2397,8 +2397,8 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 } else if (method == "plane_intersect") {
                     // Line shared by two planes (datum or picked planar face). direction =
                     // na × nb; a point on the line solves [na; nb; dir]·x = [na·oa; nb·ob; 0].
-                    aicad::geom::SketchPlane pa = plane_of(feat.at("a"), "a");
-                    aicad::geom::SketchPlane pb = plane_of(feat.at("b"), "b");
+                    chudware::geom::SketchPlane pa = plane_of(feat.at("a"), "a");
+                    chudware::geom::SketchPlane pb = plane_of(feat.at("b"), "b");
                     Eigen::Vector3d na = pa.normal, nb = pb.normal;
                     Eigen::Vector3d dir = na.cross(nb);
                     if (dir.norm() < 1e-9)
@@ -2584,7 +2584,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     if (ad.GetType() == GeomAbs_Plane && have_uv) {
                         // Planar face + uv -> lift on the orientation-aware plane frame
                         // (face_plane builds origin=centroid, axes matching Plane(face)).
-                        aicad::geom::SketchPlane pl = face_plane(f, "target");
+                        chudware::geom::SketchPlane pl = face_plane(f, "target");
                         const double u = (*uvit)[0].get<double>();
                         const double v = (*uvit)[1].get<double>();
                         p = pl.lift(Eigen::Vector2d(u, v));
@@ -2665,9 +2665,9 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 if (auto xd = dir_from("x_dir")) xax = std::make_pair(o, *xd);
                 std::optional<std::pair<Eigen::Vector3d, Eigen::Vector3d>> yax;
                 if (auto yd = dir_from("y_dir")) yax = std::make_pair(o, *yd);
-                aicad::geom::SketchPlane p;
+                chudware::geom::SketchPlane p;
                 if (!xax) {
-                    p = aicad::geom::SketchPlane::top();
+                    p = chudware::geom::SketchPlane::top();
                     p.origin = o;
                 } else {
                     // Gram-Schmidt: x = x_dir; y = y hint ⟂ x; z = x×y (matches datum.py
@@ -2686,7 +2686,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                         y = (ref - x * x.dot(ref)).normalized();
                     }
                     Eigen::Vector3d z = x.cross(y).normalized();
-                    p = aicad::geom::SketchPlane::from(o, z, x);
+                    p = chudware::geom::SketchPlane::from(o, z, x);
                 }
                 results[id] = PlaneResult{p, true};
                 st.ok = true;
@@ -2700,7 +2700,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 // face (plane_of, same as the ref-plane offset base); standalone helices fall
                 // back to the `radius` param. Stores a CurveResult a sweep consumes.
                 const json bref = feat.contains("base") ? feat.at("base") : json("plane.top");
-                aicad::geom::SketchPlane base = plane_of(bref, "base");
+                chudware::geom::SketchPlane base = plane_of(bref, "base");
 
                 const double start_angle =
                     feat.contains("start_angle") ? num_or_expr(feat.at("start_angle"), env) : 0.0;
@@ -3028,9 +3028,9 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     // centroid of the matched face/edge on the current body, so a model can
                     // say "a boss on the top face" with no coordinates.
                     if (at_it != feat.end() && at_it->is_object() &&
-                        aicad::doc::is_geom_query(*at_it)) {
+                        chudware::doc::is_geom_query(*at_it)) {
                         const TopoDS_Shape& abody = last_body_shape("at");
-                        aicad::doc::QueryPicks qp = aicad::doc::resolve_geom_query(abody, *at_it);
+                        chudware::doc::QueryPicks qp = chudware::doc::resolve_geom_query(abody, *at_it);
                         if (!qp.error.empty())
                             throw std::runtime_error(std::string("at: ") + qp.error);
                         if (qp.selectors.empty())
@@ -3219,8 +3219,8 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                             if (!std::holds_alternative<SolidResult>(*results.at(cand))) continue;
                             const TopoDS_Shape& cb = std::get<SolidResult>(*results.at(cand)).shape;
                             if (cb.IsNull()) continue;
-                            aicad::doc::FacePicks fp =
-                                aicad::doc::resolve_face_picks(cb, tool, "tool");
+                            chudware::doc::FacePicks fp =
+                                chudware::doc::resolve_face_picks(cb, tool, "tool");
                             if (!fp.faces.empty()) {
                                 tool_face = fp.faces.front();
                                 owner_id = cand;
@@ -3313,7 +3313,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 // n∈[0,2*reach] in the plane's local frame, so its near face IS the
                 // cutting plane and it fills the +normal side (mirrors split.py's
                 // make_box(2r,2r,2r).translate(-r,-r,0) placed by the cut plane).
-                aicad::geom::SketchPlane cut = aicad::geom::SketchPlane::from(point, normal);
+                chudware::geom::SketchPlane cut = chudware::geom::SketchPlane::from(point, normal);
                 Eigen::Vector3d corner = cut.origin - cut.uAxis * reach - cut.vAxis * reach;
                 gp_Ax2 box_frame(gp_Pnt(corner.x(), corner.y(), corner.z()),
                                  gp_Dir(cut.normal.x(), cut.normal.y(), cut.normal.z()),
@@ -3473,7 +3473,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                         if (!feat.contains("start_ref"))
                             throw std::runtime_error("extrude: " + start +
                                 " needs a `start_ref` plane/surface reference");
-                        aicad::geom::SketchPlane sp =
+                        chudware::geom::SketchPlane sp =
                             plane_of(feat.at("start_ref"), "start_ref");
                         start_shift = dir.dot(sp.origin - face_center(faces[0]));
                         if (start == "offset_from_reference") start_shift += soff;
@@ -3489,14 +3489,14 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 // depth and then trimmed to `trim_plane` (+ optional offset) after the
                 // build, so the end cap conforms to the reference plane/planar surface.
                 bool trim_to_plane = false;
-                aicad::geom::SketchPlane trim_plane;
+                chudware::geom::SketchPlane trim_plane;
                 double end_offset_val = 0.0;
 
                 double depth;
                 if (end == "through_all") {
                     if (!tgt_id.empty()) {
                         const TopoDS_Shape& tb = require_solid(results, tgt_id, "target");
-                        const double diag = aicad::doc::bbox_diag(tb);
+                        const double diag = chudware::doc::bbox_diag(tb);
                         if (!(diag > 0.0))
                             throw std::runtime_error("extrude through_all: body has no extent");
                         depth = diag * 2.2;   // span the whole body...
@@ -3565,7 +3565,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                             ? num_or_expr(feat.at("depth2"), env) : 10.0;
                     } else if (end2 == "through_all") {
                         depth2 = !tgt_id.empty()
-                            ? aicad::doc::bbox_diag(require_solid(results, tgt_id, "target")) * 2.2
+                            ? chudware::doc::bbox_diag(require_solid(results, tgt_id, "target")) * 2.2
                             : 1.05 * (bbox_diag_of_face(faces[0]) * 2.0);
                     } else {
                         throw std::runtime_error("extrude: end2 '" + end2 + "' not supported");
@@ -3613,9 +3613,9 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     // profile); a positive offset extends material that far past the plane.
                     Eigen::Vector3d removalN = ((pc - q).dot(n) >= 0) ? -n : n;
                     Eigen::Vector3d cutPoint = q + removalN * end_offset_val;
-                    double reach = aicad::doc::bbox_diag(solid) * 2.0 + 50.0;
-                    aicad::geom::SketchPlane cut =
-                        aicad::geom::SketchPlane::from(cutPoint, removalN);
+                    double reach = chudware::doc::bbox_diag(solid) * 2.0 + 50.0;
+                    chudware::geom::SketchPlane cut =
+                        chudware::geom::SketchPlane::from(cutPoint, removalN);
                     Eigen::Vector3d corner =
                         cut.origin - cut.uAxis * reach - cut.vAxis * reach;
                     gp_Ax2 box_frame(gp_Pnt(corner.x(), corner.y(), corner.z()),
@@ -3971,7 +3971,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     std::holds_alternative<CurveResult>(*path_it->second)) {
                     const CurveResult& cr = std::get<CurveResult>(*path_it->second);
                     // Lift local (x,y,z) -> origin + x*u + y*v + z*n (the base frame).
-                    const aicad::geom::SketchPlane& b = cr.base;
+                    const chudware::geom::SketchPlane& b = cr.base;
                     gp_Trsf lift;
                     lift.SetValues(
                         b.uAxis.x(), b.vAxis.x(), b.normal.x(), b.origin.x(),
@@ -3986,7 +3986,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                                               *pit, "path");
                 } else {
                     const SketchResult& pathsk = require_sketch(results, path_id, "path");
-                    spine = aicad::geom::wire_from_solved_sketch(pathsk.entities, pathsk.plane);
+                    spine = chudware::geom::wire_from_solved_sketch(pathsk.entities, pathsk.plane);
                 }
                 if (spine.IsNull())
                     throw std::runtime_error(
@@ -4031,7 +4031,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     if (git2 != results.end() &&
                         std::holds_alternative<CurveResult>(*git2->second)) {
                         const CurveResult& cr = std::get<CurveResult>(*git2->second);
-                        const aicad::geom::SketchPlane& b = cr.base;
+                        const chudware::geom::SketchPlane& b = cr.base;
                         gp_Trsf lift;
                         lift.SetValues(
                             b.uAxis.x(), b.vAxis.x(), b.normal.x(), b.origin.x(),
@@ -4044,7 +4044,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                                                gsel, "guide");
                     } else {
                         const SketchResult& gsk = require_sketch(results, gid, "guide");
-                        gw = aicad::geom::wire_from_solved_sketch(gsk.entities, gsk.plane);
+                        gw = chudware::geom::wire_from_solved_sketch(gsk.entities, gsk.plane);
                     }
                     if (gw.IsNull())
                         throw std::runtime_error(
@@ -4223,7 +4223,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     throw std::runtime_error("missing string ref 'profile'");
                 const SketchResult& src = require_sketch(results, prof, prof.c_str());
                 TopoDS_Wire contour =
-                    aicad::geom::wire_from_solved_sketch(src.entities, src.plane);
+                    chudware::geom::wire_from_solved_sketch(src.entities, src.plane);
                 if (contour.IsNull())
                     throw std::runtime_error("rib: profile sketch produced no contour");
 
@@ -4242,7 +4242,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 Eigen::Vector3d mid((q1.X() + q2.X()) / 2, (q1.Y() + q2.Y()) / 2,
                                     (q1.Z() + q2.Z()) / 2);
                 Eigen::Vector3d toward = bc - mid;
-                const double reach = aicad::doc::bbox_diag(body) * 1.5;
+                const double reach = chudware::doc::bbox_diag(body) * 1.5;
 
                 TopoDS_Shape slab = ::geom::make_rib_slab(contour, src.plane.normal,
                                                           toward, thickness, reach);
@@ -4371,9 +4371,9 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 const bool list_has_query =
                     has_edge_sel && edges_it->is_array() &&
                     std::any_of(edges_it->begin(), edges_it->end(),
-                                [](const json& e) { return aicad::doc::is_geom_query(e); });
-                if (has_edge_sel && aicad::doc::is_geom_query(*edges_it)) {
-                    aicad::doc::QueryPicks qp = aicad::doc::resolve_geom_query(body, *edges_it);
+                                [](const json& e) { return chudware::doc::is_geom_query(e); });
+                if (has_edge_sel && chudware::doc::is_geom_query(*edges_it)) {
+                    chudware::doc::QueryPicks qp = chudware::doc::resolve_geom_query(body, *edges_it);
                     if (!qp.error.empty())
                         throw std::runtime_error(type + ": " + qp.error);
                     if (qp.edges.empty())
@@ -4384,8 +4384,8 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     TopTools_IndexedMapOfShape seen;
                     json plain = json::array();
                     for (const json& el : *edges_it) {
-                        if (aicad::doc::is_geom_query(el)) {
-                            aicad::doc::QueryPicks qp = aicad::doc::resolve_geom_query(body, el);
+                        if (chudware::doc::is_geom_query(el)) {
+                            chudware::doc::QueryPicks qp = chudware::doc::resolve_geom_query(body, el);
                             if (!qp.error.empty())
                                 throw std::runtime_error(type + ": " + qp.error);
                             for (TopoDS_Edge& e : qp.edges)
@@ -4395,7 +4395,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                         }
                     }
                     if (!plain.empty()) {
-                        aicad::doc::EdgePicks picks = aicad::doc::resolve_edge_picks(body, plain);
+                        chudware::doc::EdgePicks picks = chudware::doc::resolve_edge_picks(body, plain);
                         n_dangling += (int)picks.dangling.size();
                         for (TopoDS_Edge& e : picks.edges)
                             if (seen.Add(e)) all.push_back(e);
@@ -4404,8 +4404,8 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                         throw std::runtime_error(type + ": edge query/selectors matched no edges");
                     picked = std::move(all);
                 } else if (has_edge_sel) {
-                    aicad::doc::EdgePicks picks =
-                        aicad::doc::resolve_edge_picks(body, *edges_it);
+                    chudware::doc::EdgePicks picks =
+                        chudware::doc::resolve_edge_picks(body, *edges_it);
                     n_dangling = (int)picks.dangling.size();
                     // Don't fail the WHOLE feature when one freshly-picked selector is stale (a very
                     // common case while editing a fillet to add edges — the pick is captured against
@@ -4844,8 +4844,8 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     plane_it->value("kind", std::string()) == "face";
                 if (face_plane) {
                     validate_selector_refs(*plane_it, "mirror plane");  // Bug K4
-                    aicad::doc::FacePicks fp =
-                        aicad::doc::resolve_face_picks(body, *plane_it, "plane");
+                    chudware::doc::FacePicks fp =
+                        chudware::doc::resolve_face_picks(body, *plane_it, "plane");
                     if (!fp.dangling.empty()) {
                         std::string msg = "mirror: plane selector dangling: ";
                         for (std::size_t k = 0; k < fp.dangling.size(); ++k) {
@@ -5020,15 +5020,15 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                         "hole: 'face' selector is required (the planar face to drill into)");
                 validate_selector_refs(*face_it, "hole face");  // Bug K4
                 TopoDS_Face face;
-                if (aicad::doc::is_geom_query(*face_it)) {
+                if (chudware::doc::is_geom_query(*face_it)) {
                     // word query: "drill the top face" -> {"of":"face","side":"top"}.
-                    aicad::doc::QueryPicks qp = aicad::doc::resolve_geom_query(body, *face_it);
+                    chudware::doc::QueryPicks qp = chudware::doc::resolve_geom_query(body, *face_it);
                     if (!qp.error.empty()) throw std::runtime_error("hole: " + qp.error);
                     if (qp.faces.empty()) throw std::runtime_error("hole: query matched no face");
                     face = qp.faces.front();
                 } else {
-                    aicad::doc::FacePicks fp =
-                        aicad::doc::resolve_face_picks(body, *face_it, "face");
+                    chudware::doc::FacePicks fp =
+                        chudware::doc::resolve_face_picks(body, *face_it, "face");
                     if (!fp.dangling.empty()) {
                         std::string msg = "hole: face selector dangling: ";
                         for (std::size_t k = 0; k < fp.dangling.size(); ++k) {
@@ -5064,7 +5064,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 // of the solid. drill_dir then points INTO the material (the watch-point:
                 // get this wrong and the cut removes nothing).
                 if (face.Orientation() == TopAbs_REVERSED) normal = -normal;
-                const aicad::geom::SketchPlane fframe = hole_face_frame(face, normal);
+                const chudware::geom::SketchPlane fframe = hole_face_frame(face, normal);
                 const Eigen::Vector3d origin = fframe.origin;
                 const Eigen::Vector3d xdir = fframe.uAxis;
                 const Eigen::Vector3d ydir = fframe.vAxis;
@@ -5137,7 +5137,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 if (end == "through_all") {
                     // Over-length so the bore fully penetrates; the cut only removes the
                     // in-body part, so over-length is harmless.
-                    depth = aicad::doc::bbox_diag(body) * 1.1;
+                    depth = chudware::doc::bbox_diag(body) * 1.1;
                 } else if (end == "blind") {
                     depth = num_or_expr(feat.at("depth"), env);
                     if (!(depth > 0.0))
@@ -5202,7 +5202,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 // happens to equal the stock exactly is legitimate, so we never reject it.)
                 if (end == "blind") {
                     ::geom::HoleDims thru_dims = tool_dims;
-                    thru_dims.depth = aicad::doc::bbox_diag(body) * 1.1 + lift;
+                    thru_dims.depth = chudware::doc::bbox_diag(body) * 1.1 + lift;
                     if (style == ::geom::HoleStyle::Cbore)
                         thru_dims.cbore_depth = dims.cbore_depth + lift;
                     TopoDS_Shape thru_union;
@@ -5275,15 +5275,15 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                                           : json{{"of", "face"}, {"side", "top"}};
                 validate_selector_refs(face_ref, "bolt_circle face");  // Bug K4
                 TopoDS_Face face;
-                if (aicad::doc::is_geom_query(face_ref)) {
-                    aicad::doc::QueryPicks qp = aicad::doc::resolve_geom_query(body, face_ref);
+                if (chudware::doc::is_geom_query(face_ref)) {
+                    chudware::doc::QueryPicks qp = chudware::doc::resolve_geom_query(body, face_ref);
                     if (!qp.error.empty()) throw std::runtime_error("bolt_circle: " + qp.error);
                     if (qp.faces.empty())
                         throw std::runtime_error("bolt_circle: query matched no face");
                     face = qp.faces.front();
                 } else {
-                    aicad::doc::FacePicks fp =
-                        aicad::doc::resolve_face_picks(body, face_ref, "face");
+                    chudware::doc::FacePicks fp =
+                        chudware::doc::resolve_face_picks(body, face_ref, "face");
                     if (fp.faces.empty())
                         throw std::runtime_error("bolt_circle: target face not resolved");
                     face = fp.faces.front();
@@ -5299,7 +5299,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 // axes — see hole_face_frame (W2): stable when the face already carries
                 // holes, and the same u/v convention as the `hole` feature.
                 Eigen::Vector3d normal = src_face_normal(face);
-                aicad::geom::SketchPlane fr = hole_face_frame(face, normal);
+                chudware::geom::SketchPlane fr = hole_face_frame(face, normal);
                 const Eigen::Vector3d drill_dir = -normal;
 
                 // Ring geometry.
@@ -5350,7 +5350,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 }
                 const std::string end = feat.value("end", std::string("through_all"));
                 double depth;
-                if (end == "through_all") depth = aicad::doc::bbox_diag(body) * 1.1;
+                if (end == "through_all") depth = chudware::doc::bbox_diag(body) * 1.1;
                 else if (end == "blind") {
                     depth = num_or_expr(feat.at("depth"), env);
                     if (!(depth > 0.0)) throw std::runtime_error("bolt_circle: blind depth must be > 0");
@@ -5413,9 +5413,9 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 auto rm = feat.find("remove");
                 if (rm != feat.end() && !rm->is_null())
                     validate_selector_refs(*rm, "shell remove");  // Bug K4
-                if (rm != feat.end() && aicad::doc::is_geom_query(*rm)) {
+                if (rm != feat.end() && chudware::doc::is_geom_query(*rm)) {
                     // Query the open face(s) by name: {"of":"face","side":"+z"} = open top.
-                    aicad::doc::QueryPicks qp = aicad::doc::resolve_geom_query(body, *rm);
+                    chudware::doc::QueryPicks qp = chudware::doc::resolve_geom_query(body, *rm);
                     if (!qp.error.empty())
                         throw std::runtime_error("shell: " + qp.error);
                     if (qp.faces.empty())
@@ -5423,8 +5423,8 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     remove = std::move(qp.faces);
                 } else if (rm != feat.end() &&
                     (rm->is_object() || (rm->is_array() && !rm->empty()))) {
-                    aicad::doc::FacePicks fp =
-                        aicad::doc::resolve_face_picks(body, *rm, "remove");
+                    chudware::doc::FacePicks fp =
+                        chudware::doc::resolve_face_picks(body, *rm, "remove");
                     if (!fp.dangling.empty()) {
                         std::string msg = "shell: remove selector dangling: ";
                         for (std::size_t k = 0; k < fp.dangling.size(); ++k) {
@@ -5568,17 +5568,17 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     // always dangled ("neutral face not resolved") even though the identical
                     // query resolves via doc_query and via the faces slot. (Bug A1, neutral.)
                     TopoDS_Face neutral_face;
-                    if (aicad::doc::is_geom_query(*nit)) {
-                        aicad::doc::QueryPicks nq =
-                            aicad::doc::resolve_geom_query(body, *nit);
+                    if (chudware::doc::is_geom_query(*nit)) {
+                        chudware::doc::QueryPicks nq =
+                            chudware::doc::resolve_geom_query(body, *nit);
                         if (!nq.error.empty())
                             throw std::runtime_error("draft: neutral " + nq.error);
                         if (nq.faces.empty())
                             throw std::runtime_error("draft: neutral face query matched no faces");
                         neutral_face = nq.faces[0];
                     } else {
-                        aicad::doc::FacePicks fp =
-                            aicad::doc::resolve_face_picks(body, *nit, "neutral");
+                        chudware::doc::FacePicks fp =
+                            chudware::doc::resolve_face_picks(body, *nit, "neutral");
                         if (!fp.dangling.empty() || fp.faces.empty())
                             throw std::runtime_error("draft: neutral face not resolved");
                         neutral_face = fp.faces[0];
@@ -5607,16 +5607,16 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 // candidates of matching kind") even though the identical query resolves
                 // via query_geometry and via fillet's refs.edges. (Bug A1.)
                 std::vector<TopoDS_Face> draft_faces;
-                if (aicad::doc::is_geom_query(*fit)) {
-                    aicad::doc::QueryPicks qp = aicad::doc::resolve_geom_query(body, *fit);
+                if (chudware::doc::is_geom_query(*fit)) {
+                    chudware::doc::QueryPicks qp = chudware::doc::resolve_geom_query(body, *fit);
                     if (!qp.error.empty())
                         throw std::runtime_error("draft: " + qp.error);
                     if (qp.faces.empty())
                         throw std::runtime_error("draft: faces query matched no faces");
                     draft_faces = std::move(qp.faces);
                 } else {
-                    aicad::doc::FacePicks fp =
-                        aicad::doc::resolve_face_picks(body, *fit, "faces");
+                    chudware::doc::FacePicks fp =
+                        chudware::doc::resolve_face_picks(body, *fit, "faces");
                     if (!fp.dangling.empty()) {
                         std::string msg = "draft: faces selector dangling: ";
                         for (std::size_t k = 0; k < fp.dangling.size(); ++k) {
@@ -5714,8 +5714,8 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 auto edge_it = feat.find("edge");
                 if (edge_it == feat.end())
                     throw std::runtime_error(type + ": refs.edge is required (the bend line)");
-                aicad::doc::EdgePicks picks =
-                    aicad::doc::resolve_edge_picks(body, *edge_it);
+                chudware::doc::EdgePicks picks =
+                    chudware::doc::resolve_edge_picks(body, *edge_it);
                 if (!picks.dangling.empty()) {
                     std::string msg = type + ": edge selector dangling: ";
                     for (std::size_t k = 0; k < picks.dangling.size(); ++k) {
@@ -6218,7 +6218,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     double best_d = std::numeric_limits<double>::max();
                     for (const std::string& bid : live) {
                         const TopoDS_Shape& body = std::get<SolidResult>(*results.at(bid)).shape;
-                        aicad::doc::FacePicks fp = aicad::doc::resolve_face_picks(body, sel, slot);
+                        chudware::doc::FacePicks fp = chudware::doc::resolve_face_picks(body, sel, slot);
                         for (const TopoDS_Face& fc : fp.faces) {
                             double d = 0.0;
                             if (have_want) {
@@ -6451,7 +6451,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 const std::string path_id = selector_owner_id(*pit);
                 const SketchResult& pathsk = require_sketch(results, path_id, "path");
                 TopoDS_Wire spine =
-                    aicad::geom::wire_from_solved_sketch(pathsk.entities, pathsk.plane);
+                    chudware::geom::wire_from_solved_sketch(pathsk.entities, pathsk.plane);
                 if (spine.IsNull())
                     throw std::runtime_error("surf_sweep: path produced no wire");
                 TopoDS_Shape shell = ::geom::surf_sweep_walls(faces, spine);
@@ -6511,8 +6511,8 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 auto fit = feat.find("faces");
                 if (fit == feat.end())
                     throw std::runtime_error("surf_offset: refs.faces is required");
-                aicad::doc::FacePicks picks =
-                    aicad::doc::resolve_face_picks(body, *fit, "faces");
+                chudware::doc::FacePicks picks =
+                    chudware::doc::resolve_face_picks(body, *fit, "faces");
                 if (!picks.dangling.empty())
                     throw std::runtime_error("surf_offset: face selector(s) dangling");
                 if (picks.faces.empty())
@@ -6602,8 +6602,8 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 auto fit = feat.find("faces");
                 if (fit == feat.end())
                     throw std::runtime_error("surf_delete_face: refs.faces is required");
-                aicad::doc::FacePicks picks =
-                    aicad::doc::resolve_face_picks(body, *fit, "faces");
+                chudware::doc::FacePicks picks =
+                    chudware::doc::resolve_face_picks(body, *fit, "faces");
                 if (!picks.dangling.empty())
                     throw std::runtime_error("surf_delete_face: face selector(s) dangling");
                 if (picks.faces.empty())
@@ -6611,7 +6611,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 std::vector<Eigen::Vector3d> cents;
                 for (const TopoDS_Face& f : picks.faces)
                     cents.push_back(::geom::face_centroid(f));
-                double tol = std::max(aicad::doc::bbox_diag(body), 1.0) * 1e-4;
+                double tol = std::max(chudware::doc::bbox_diag(body), 1.0) * 1e-4;
                 TopoDS_Shape shell = ::geom::surf_delete_faces(body, cents, tol);
                 if (shell.IsNull())
                     throw std::runtime_error("surf_delete_face: nothing left after delete");
@@ -6637,13 +6637,13 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 auto fit = feat.find("faces");
                 if (fit == feat.end())
                     throw std::runtime_error("surf_untrim: refs.faces is required");
-                aicad::doc::FacePicks picks =
-                    aicad::doc::resolve_face_picks(body, *fit, "faces");
+                chudware::doc::FacePicks picks =
+                    chudware::doc::resolve_face_picks(body, *fit, "faces");
                 if (!picks.dangling.empty())
                     throw std::runtime_error("surf_untrim: face selector(s) dangling");
                 if (picks.faces.empty())
                     throw std::runtime_error("surf_untrim: no faces resolved");
-                const double utol = std::max(aicad::doc::bbox_diag(body), 1.0) * 1e-6;
+                const double utol = std::max(chudware::doc::bbox_diag(body), 1.0) * 1e-6;
                 BRep_Builder ubb;
                 TopoDS_Compound ucomp;
                 ubb.MakeCompound(ucomp);
@@ -6704,8 +6704,8 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                         if (!std::holds_alternative<SolidResult>(*results.at(cand))) continue;
                         const TopoDS_Shape& cb = std::get<SolidResult>(*results.at(cand)).shape;
                         if (cb.IsNull()) continue;
-                        aicad::doc::FacePicks tp =
-                            aicad::doc::resolve_face_picks(cb, *tit, "tool");
+                        chudware::doc::FacePicks tp =
+                            chudware::doc::resolve_face_picks(cb, *tit, "tool");
                         if (!tp.faces.empty()) { tool_face = tp.faces.front(); tool_ok = true; break; }
                     }
                 }
@@ -6745,8 +6745,8 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 auto fit = feat.find("faces");
                 if (fit == feat.end())
                     throw std::runtime_error("surf_replace_face: refs.faces is required");
-                aicad::doc::FacePicks picks =
-                    aicad::doc::resolve_face_picks(solid, *fit, "faces");
+                chudware::doc::FacePicks picks =
+                    chudware::doc::resolve_face_picks(solid, *fit, "faces");
                 if (picks.faces.empty())
                     throw std::runtime_error("surf_replace_face: no target faces resolved");
                 auto ssel = feat.find("surface");
@@ -6767,8 +6767,8 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                         if (!std::holds_alternative<SolidResult>(*results.at(cand))) continue;
                         const TopoDS_Shape& cb = std::get<SolidResult>(*results.at(cand)).shape;
                         if (cb.IsNull()) continue;
-                        aicad::doc::FacePicks rp =
-                            aicad::doc::resolve_face_picks(cb, *ssel, "surface");
+                        chudware::doc::FacePicks rp =
+                            chudware::doc::resolve_face_picks(cb, *ssel, "surface");
                         if (!rp.faces.empty()) { replacement = rp.faces.front(); break; }
                     }
                 }
@@ -6779,7 +6779,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     cents.push_back(::geom::face_centroid(f));
                 TopoDS_Shape healed =
                     ::geom::surf_replace_face_solid(solid, cents, replacement,
-                                                    aicad::doc::bbox_diag(solid));
+                                                    chudware::doc::bbox_diag(solid));
                 if (healed.IsNull())
                     throw std::runtime_error("surf_replace_face: could not heal a solid");
                 consumed.insert(body_id);
@@ -7231,7 +7231,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 gp_Dir xdir = pln.XAxis().Direction();
                 // READING DIRECTION. A planar face's parametric X axis is arbitrary — on a
                 // VERTICAL wall (a box side) OCCT's X often points along world Z, which would
-                // lay the text out VERTICALLY and overflow a short wall (e.g. "AI-CAD" on a
+                // lay the text out VERTICALLY and overflow a short wall (e.g. "Chudware" on a
                 // 60x10 front face -> detached/overhang). For any non-horizontal face, override
                 // xdir to the HORIZONTAL in-plane direction so the text reads left-to-right with
                 // "up" toward +Z, the way a person letters a side face. Horizontal faces
@@ -7415,11 +7415,11 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
     // so meshing the second instance finds the shared faces already triangulated and skips.)
     std::map<std::pair<const void*, bool>, std::tuple<double, double, int, int>> body_stats_cache;
     // Cross-compile per-body cache (see CachedBody/CompileCache). `use_cache` already
-    // gates the whole incremental machinery; AICAD_TESS_CACHE=0 disables just this layer
+    // gates the whole incremental machinery; CHUDWARE_TESS_CACHE=0 disables just this layer
     // for A/B. new_body_cache holds the bodies THIS compile produced/reused (replaces the
     // old set wholesale so a discarded body's mesh is freed).
     static const bool tess_cache_on = []() {
-        const char* v = std::getenv("AICAD_TESS_CACHE");
+        const char* v = std::getenv("CHUDWARE_TESS_CACHE");
         return !(v && v[0] == '0' && v[1] == '\0');
     }();
     CompileCache* bc = (use_cache && tess_cache_on) ? cache : nullptr;
@@ -7621,7 +7621,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                  {"dir",   {a.dir.x(),   a.dir.y(),   a.dir.z()}}};
         } else if (std::holds_alternative<PlaneResult>(*rit->second)) {
             const PlaneResult& p = std::get<PlaneResult>(*rit->second);
-            const aicad::geom::SketchPlane& pl = p.plane;
+            const chudware::geom::SketchPlane& pl = p.plane;
             d = {{"kind", p.is_csys ? "csys" : "plane"},
                  {"origin", {pl.origin.x(), pl.origin.y(), pl.origin.z()}},
                  {"x_dir",  {pl.uAxis.x(),  pl.uAxis.y(),  pl.uAxis.z()}},
@@ -7636,7 +7636,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
             // sample it into a polyline the host can draw AND pick as a sweep path.
             const CurveResult& cr = std::get<CurveResult>(*rit->second);
             if (cr.wire.IsNull()) continue;
-            const aicad::geom::SketchPlane& b = cr.base;
+            const chudware::geom::SketchPlane& b = cr.base;
             gp_Trsf lift;
             lift.SetValues(
                 b.uAxis.x(), b.vAxis.x(), b.normal.x(), b.origin.x(),
@@ -7714,7 +7714,7 @@ nlohmann::json resolve_pick(const CompileResult& r, int body_id,
                 }
         }
     }
-    return aicad::doc::make_pick_selector(shape, kind, topo_id, owner);
+    return chudware::doc::make_pick_selector(shape, kind, topo_id, owner);
 }
 
 nlohmann::json resolve_pick(const json& doc, const json& env, int body_id,
@@ -8030,4 +8030,4 @@ PushPullPlan plan_push_pull(const json& doc, const json& env, int body_id, int t
     return plan;
 }
 
-}  // namespace aicad::doc
+}  // namespace chudware::doc

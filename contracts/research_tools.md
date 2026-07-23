@@ -121,12 +121,12 @@ Returns the §1 envelope plus:
 
 ## 4. Cache — per-user local, `knowledge/` under appdata
 
-- **Root:** `<appdata>/AI-CAD/knowledge/`, where `<appdata>` = `engine.paths.appdata_root()`
-  (the single app-wide root — `%APPDATA%/AI-CAD` on Windows; when a cross-platform
-  `paths.py` lands, `knowledge/` moves with it). `AI_CAD_KNOWLEDGE_DIR` overrides the root
+- **Root:** `<appdata>/Chudware/knowledge/`, where `<appdata>` = `engine.paths.appdata_root()`
+  (the single app-wide root — `%APPDATA%/Chudware` on Windows; when a cross-platform
+  `paths.py` lands, `knowledge/` moves with it). `CHUDWARE_KNOWLEDGE_DIR` overrides the root
   (used by tests for a hermetic cache). Master-plan target for the eventual cross-platform
-  root: Windows `%APPDATA%/AI-CAD`, Linux `~/.local/share/AI-CAD`, macOS
-  `~/Library/Application Support/AI-CAD`.
+  root: Windows `%APPDATA%/Chudware`, Linux `~/.local/share/Chudware`, macOS
+  `~/Library/Application Support/Chudware`.
 - **Key:** `sha256(url)` (+ a short hash of any provider/params that change the content);
   raw content + metadata (`fetched_ts`, `source_url`, tier) stored side by side.
 - **Tiered TTLs** (staleness → refetch when online; serve stale when offline):

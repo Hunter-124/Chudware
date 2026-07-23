@@ -1,4 +1,4 @@
-// AI-CAD desktop GUI — branded, themed, docked, with AI chat + provider
+// Chudware desktop GUI — branded, themed, docked, with AI chat + provider
 // settings.
 //
 // run_gui(): GLFW/ImGui init, the dockspace host, the per-frame panel calls
@@ -101,10 +101,10 @@ inline void wasmBootDom(const char *msg) {
 #include "ipc_client.h"     // services/ipc EngineClient (orphan recovery RPCs)
 #include "ipc_discovery.h" // H2 shot: spawnDetached/resolveHostdBin for hostd bounce
 
-#ifdef AI_CAD_ENABLE_CEF
+#ifdef CHUDWARE_ENABLE_CEF
 #include "ui/widgets/cef/cef_app.h" // CEF process lifecycle (init/pump/shutdown)
 #endif
-#include "core/cpp_core.h" // sampling-profiler RPCs (prof_start/prof_stop) via libaicad
+#include "core/cpp_core.h" // sampling-profiler RPCs (prof_start/prof_stop) via libchudware
 #include "core/jobs.h"
 #include "ui/ai/ai_workspace.h" // AI workspace full-body hub (sessions + DAG + chat + settings)
 #include "ui/ai/active_work.h" // Active Work view live op feed
@@ -862,7 +862,7 @@ static void exportFlatDxf(AppState &st) {
     base = "part";
   base += "_flat";
 
-  const bool dialogsDisabled = std::getenv("AI_CAD_NO_FILE_DIALOGS") != nullptr;
+  const bool dialogsDisabled = std::getenv("CHUDWARE_NO_FILE_DIALOGS") != nullptr;
   std::string path;
   if (dialogsDisabled) {
     path = (std::filesystem::current_path() / (base + ".dxf")).string();
@@ -1085,7 +1085,7 @@ static void exportFile3d(AppState &st, const std::string &fmt) {
   if (base.empty())
     base = "part";
 
-  const bool dialogsDisabled = std::getenv("AI_CAD_NO_FILE_DIALOGS") != nullptr;
+  const bool dialogsDisabled = std::getenv("CHUDWARE_NO_FILE_DIALOGS") != nullptr;
   std::string path;
   if (dialogsDisabled) {
     path = (std::filesystem::current_path() / (base + "." + ext)).string();
@@ -1243,7 +1243,7 @@ billet_web_drop_done(int ok, const char *name, const uint8_t *data, int len,
   }
 }
 
-// JS library (billet_web_dialogs.js) — installs dragover/drop on the canvas.
+// JS library (chudware_web_dialogs.js) — installs dragover/drop on the canvas.
 extern "C" void billet_install_canvas_drop(void);
 
 static void drainWebFileDrop(AppState &st) {
@@ -1283,7 +1283,7 @@ static void drainWebFileDrop(AppState &st) {
   // Upload into workspace root (same plumbing as openFileDialog's pickFile
   // path).
   std::string abs =
-      billet::fsUpload(/*dir=*/"", name, bytes.data(), bytes.size(), upErr);
+      chudware::fsUpload(/*dir=*/"", name, bytes.data(), bytes.size(), upErr);
   if (abs.empty()) {
     st.addLog("[dnd] web drop upload failed: " + upErr);
     st.toast(ui::ToastLevel::Error,
@@ -1734,13 +1734,13 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   // via the WndProc in chrome::install.)
   glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
 #endif
-  // T-G15 dev/test hook: AI_CAD_HIDDEN=1 creates the window unmapped so
+  // T-G15 dev/test hook: CHUDWARE_HIDDEN=1 creates the window unmapped so
   // headless shot runs never enter the compositor's present path (on an
   // unattended desktop the compositor can starve a new window's swaps
   // indefinitely — observed as multi-minute drmSyncobjTimelineWait stalls). GL
   // rendering + glReadPixels work as normal on the hidden window's framebuffer.
   // Shot-mode only.
-  if (shot && std::getenv("AI_CAD_HIDDEN"))
+  if (shot && std::getenv("CHUDWARE_HIDDEN"))
     glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
   // Stable window class / app_id so the desktop shell (KDE/GNOME) matches the
   // window to the installed .desktop entry (StartupWMClass=chudware) and shows
@@ -1750,12 +1750,12 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   glfwWindowHintString(GLFW_X11_CLASS_NAME, "chudware");
   glfwWindowHintString(GLFW_X11_INSTANCE_NAME, "chudware");
   glfwWindowHintString(GLFW_WAYLAND_APP_ID, "chudware");
-  // AI_CAD_WIN_SIZE=WxH: explicit window geometry for managed/headless sessions
-  // (billet-web streams a fixed-size Xvfb display with no WM, so maximize hints
+  // CHUDWARE_WIN_SIZE=WxH: explicit window geometry for managed/headless sessions
+  // (chudware-web streams a fixed-size Xvfb display with no WM, so maximize hints
   // are no-ops there — the window must be created at display size and at 0,0).
   int winW = shot ? 1340 : 1440, winH = shot ? 838 : 900;
   bool winSized = false;
-  if (const char *ws = std::getenv("AI_CAD_WIN_SIZE")) {
+  if (const char *ws = std::getenv("CHUDWARE_WIN_SIZE")) {
     int w = 0, h = 0;
     if (std::sscanf(ws, "%dx%d", &w, &h) == 2 && w >= 640 && h >= 480 &&
         w <= 16384 && h <= 16384) {
@@ -1814,10 +1814,10 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   float xs = 1.0f, ys = 1.0f;
   glfwGetWindowContentScale(win, &xs, &ys);
   float scale = shot ? 1.0f : (xs > ys ? xs : ys);
-  // AI_CAD_SCALE overrides the content scale (incl. in screenshot mode) so
+  // CHUDWARE_SCALE overrides the content scale (incl. in screenshot mode) so
   // HiDPI layout can be reproduced/verified headlessly. Clamped to a sane
   // range.
-  if (const char *envScale = std::getenv("AI_CAD_SCALE")) {
+  if (const char *envScale = std::getenv("CHUDWARE_SCALE")) {
     float v = (float)std::atof(envScale);
     if (v >= 0.5f && v <= 4.0f)
       scale = v;
@@ -1840,12 +1840,12 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   }
 #endif
 
-  // Theme: honour AI_CAD_THEME env override, then persisted setting, then LIGHT
+  // Theme: honour CHUDWARE_THEME env override, then persisted setting, then LIGHT
   // default (owner default 2026-07-14). Applied once here; the settings load at
   // first frame re-applies the persisted choice, and the View-menu toggle calls
   // applyTheme() again.
   {
-    const char *envTheme = std::getenv("AI_CAD_THEME");
+    const char *envTheme = std::getenv("CHUDWARE_THEME");
     ui::Theme initTheme = ui::Theme::Light;
     if (envTheme && std::strcmp(envTheme, "dark") == 0)
       initTheme = ui::Theme::Dark;
@@ -2130,7 +2130,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
 
   // Wave 3 (GUI rework): seed the File Explorer's live state from persisted
   // settings and ensure the workspace directory exists (default
-  // <Documents>/AI-CAD). recentFiles/workspaceDir are the live copies the
+  // <Documents>/Chudware). recentFiles/workspaceDir are the live copies the
   // Explorer + File menu read; pushRecentFile() mirrors changes back into
   // settings.
   st.recentFiles = st.settings.recentFiles;
@@ -2140,7 +2140,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   // Re-apply theme from persisted settings (env override already applied above;
   // if a saved setting differs, the persisted value wins unless env was set).
   {
-    const char *envTheme = std::getenv("AI_CAD_THEME");
+    const char *envTheme = std::getenv("CHUDWARE_THEME");
     if (!envTheme) {
       // No env override — use the saved setting.
       ui::Theme t =
@@ -2755,16 +2755,16 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   });
 
   // ---------- runtime + worker ----------
-  // ITEM 15: on interactive launches, DEFER tryStartWorker (libaicad dlopen +
+  // ITEM 15: on interactive launches, DEFER tryStartWorker (libchudware dlopen +
   // OCCT + daemon hello) off the pre-loop path so the first frames can paint
   // chrome and become interactive. Shot/scenario mode still boots synchronously
   // so captures stay deterministic.
   st.rtReady = runtimeReady();
 
 #ifndef _WIN32
-  // On Linux/macOS the backend is the in-process C++ core (libaicad), not a
-  // managed Python venv — route through tryStartWorker, whose libaicad guard
-  // reports readiness and only falls back to Python provisioning if libaicad is
+  // On Linux/macOS the backend is the in-process C++ core (libchudware), not a
+  // managed Python venv — route through tryStartWorker, whose libchudware guard
+  // reports readiness and only falls back to Python provisioning if libchudware is
   // genuinely unavailable.
   if (shot) {
     st.tryStartWorker();
@@ -2787,7 +2787,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   } else {
     st.status = "Runtime not installed";
     st.statusKind = 2;
-    st.addLog("[!] runtime not found at %APPDATA%\\AI-CAD\\runtime");
+    st.addLog("[!] runtime not found at %APPDATA%\\Chudware\\runtime");
     st.autoSetupTried = true;
     // Provisioning is already on a background thread; mark the status-bar
     // startup chip so the left loading readout shows while the first-run venv
@@ -2809,7 +2809,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   // welcome Assistant seed bubble.
 
   const char *shotMode =
-      std::getenv("AI_CAD_SHOT"); // screenshot-only:
+      std::getenv("CHUDWARE_SHOT"); // screenshot-only:
                                   // settings|chat|assembly|plan|ribbon|pmform
   st.wantSettings = shot && shotMode && std::strcmp(shotMode, "settings") == 0;
   st.wantChat = shot && shotMode && std::strcmp(shotMode, "chat") == 0;
@@ -2925,20 +2925,20 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   if (st.wantWorkspace) {
     st.showRibbon = true;
   }
-  // AI_CAD_SHOT=motion: kinematic motion study end-to-end (2-body asm + angle
+  // CHUDWARE_SHOT=motion: kinematic motion study end-to-end (2-body asm + angle
   // mate + playback).
   st.wantMotion = shot && shotMode && std::strcmp(shotMode, "motion") == 0;
   if (st.wantMotion) {
     st.showRibbon = true;
     st.activeWorkspace = AppState::Workspace::Simulate;
   }
-  // AI_CAD_SHOT=aiws: open the AI workspace full-body hub for headless visual
+  // CHUDWARE_SHOT=aiws: open the AI workspace full-body hub for headless visual
   // verification.
   if (shot && shotMode && std::strcmp(shotMode, "aiws") == 0) {
     st.showRibbon = true;
     st.activeWorkspace = AppState::Workspace::AI;
   }
-  // AI_CAD_SHOT=firmware: open the Firmware workspace with the canned project +
+  // CHUDWARE_SHOT=firmware: open the Firmware workspace with the canned project +
   // build console + emulation UART log + GPIO trace fixture — headless visual
   // verification of T-FIN5 (project visible, build console output, emulation
   // trace rendered). fw_status / fw_projects still hit the live worker, so the
@@ -2948,7 +2948,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     st.activeWorkspace = AppState::Workspace::Firmware;
     ui::firmware::seedFirmwareShotFixture();
   }
-  // AI_CAD_SHOT=reveng: open the Reverse Engineering full-body workspace shell
+  // CHUDWARE_SHOT=reveng: open the Reverse Engineering full-body workspace shell
   // (RE-03) for headless visual verification of the new tab. Same inline flag
   // pattern as aiws — the generic per-frame shot capture grabs it (no scenario
   // state machine needed).
@@ -2975,7 +2975,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     rs.lastListT = 1e9;    // block live list reload for the whole shot
     rs.gallerySession = 0; // skip the session-change state reset
   };
-  // AI_CAD_SHOT=reveng_review: open the RE workspace on the Review stage with a
+  // CHUDWARE_SHOT=reveng_review: open the RE workspace on the Review stage with a
   // canned confirm_dimensions payload + deviation result — headless visual
   // verification of RE-22.
   if (shot && shotMode && std::strcmp(shotMode, "reveng_review") == 0) {
@@ -2987,7 +2987,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     seedRevengCanned("re_canned00", "Gear motor (canned)", "review", 11);
     ui::reveng::S().stage = ui::reveng::Stage::Review;
   }
-  // AI_CAD_SHOT=reveng_capture: open RE workspace on the Source stage (RE-19
+  // CHUDWARE_SHOT=reveng_capture: open RE workspace on the Source stage (RE-19
   // capture suite
   // + webcam widget + image gallery) with a canned selected session so the
   // panels draw.
@@ -2997,14 +2997,14 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     seedRevengCanned("re_canned_cap", "Bracket scan (canned)", "capturing", 3);
     ui::reveng::S().stage = ui::reveng::Stage::Source;
   }
-  // AI_CAD_SHOT=reveng_scale: Scale stage with a canned session.
+  // CHUDWARE_SHOT=reveng_scale: Scale stage with a canned session.
   if (shot && shotMode && std::strcmp(shotMode, "reveng_scale") == 0) {
     st.showRibbon = true;
     st.activeWorkspace = AppState::Workspace::ReverseEng;
     seedRevengCanned("re_canned_cap", "Bracket scan (canned)", "capturing", 12);
     ui::reveng::S().stage = ui::reveng::Stage::Scale;
   }
-  // AI_CAD_SHOT=reveng_recon: open the RE workspace on the Reconstruct stage
+  // CHUDWARE_SHOT=reveng_recon: open the RE workspace on the Reconstruct stage
   // with a canned session + mid-run progress state — headless visual
   // verification of RE-21.
   if (shot && shotMode && std::strcmp(shotMode, "reveng_recon") == 0) {
@@ -3020,7 +3020,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     ev.msg = "dense";
     ui::reveng::feedRevEngEvent(ev);
   }
-  // AI_CAD_SHOT=reveng_model: Model stage with a canned session.
+  // CHUDWARE_SHOT=reveng_model: Model stage with a canned session.
   if (shot && shotMode && std::strcmp(shotMode, "reveng_model") == 0) {
     st.showRibbon = true;
     st.activeWorkspace = AppState::Workspace::ReverseEng;
@@ -3028,14 +3028,14 @@ int run_gui(const char *screenshotPath, const char *openPath) {
                      12);
     ui::reveng::S().stage = ui::reveng::Stage::Model;
   }
-  // AI_CAD_SHOT=reveng_deliver: Deliver stage with a canned session.
+  // CHUDWARE_SHOT=reveng_deliver: Deliver stage with a canned session.
   if (shot && shotMode && std::strcmp(shotMode, "reveng_deliver") == 0) {
     st.showRibbon = true;
     st.activeWorkspace = AppState::Workspace::ReverseEng;
     seedRevengCanned("re_canned_done", "Bracket scan (canned)", "done", 12);
     ui::reveng::S().stage = ui::reveng::Stage::Deliver;
   }
-  // AI_CAD_SHOT=parts: open the Parts Library workspace with a synthetic
+  // CHUDWARE_SHOT=parts: open the Parts Library workspace with a synthetic
   // no-model result row so the "Generate 3D model" action (RE-32) is visible in
   // the shot.
   if (shot && shotMode && std::strcmp(shotMode, "parts") == 0) {
@@ -3043,12 +3043,12 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     st.activeWorkspace = AppState::Workspace::PartsLibrary;
     st.wantPartsShot = true;
   }
-  // AI_CAD_SHOT=git: open the PLM hub on the new Git page for headless
+  // CHUDWARE_SHOT=git: open the PLM hub on the new Git page for headless
   // verification.
   if (shot && shotMode && std::strcmp(shotMode, "git") == 0) {
     st.showRibbon = true;
     st.activeWorkspace = AppState::Workspace::PLM;
-    const char *pg = std::getenv("AI_CAD_PLM_PAGE");
+    const char *pg = std::getenv("CHUDWARE_PLM_PAGE");
     if (pg && std::strcmp(pg, "planning") == 0)
       ui::plmSelectPlanningPage();
     else if (pg && std::strcmp(pg, "overview") == 0)
@@ -3068,14 +3068,14 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   // C20b: assembly shot — author base/peg parts, new assembly, insert + mate +
   // interference.
   st.wantAsm = shot && shotMode && std::strcmp(shotMode, "asm") == 0;
-  // AI_CAD_MATEFORM: a lightweight Mate-form-only variant of the asm shot for
+  // CHUDWARE_MATEFORM: a lightweight Mate-form-only variant of the asm shot for
   // visual verification of the mate PM (Standard + Mechanical/Advanced sections
   // + the type-aware param block). It skips the heavy author/insert/mate state
   // machine and just opens the Mate form so the generic frame-6 capture grabs
-  // it (mirrors the pmform scenario). AI_CAD_MATETYPE=<type> preselects a
+  // it (mirrors the pmform scenario). CHUDWARE_MATETYPE=<type> preselects a
   // mechanical/advanced type (e.g. "gear") so its parameter field renders.
   const bool wantMateForm =
-      st.wantAsm && std::getenv("AI_CAD_MATEFORM") != nullptr;
+      st.wantAsm && std::getenv("CHUDWARE_MATEFORM") != nullptr;
   if (st.wantAsm) {
     st.showRibbon = true;
     st.ribbonTab = AppState::RT_Features; // Assembly tools live on Features tab
@@ -3085,39 +3085,39 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       st.wantAsm = false; // suppress the scripted scenario; just show the form
       asmPanels.handleCommand(
           st, "asm_mate"); // open the PM-guest mate form (left column)
-      if (const char *mt = std::getenv("AI_CAD_MATETYPE"))
+      if (const char *mt = std::getenv("CHUDWARE_MATETYPE"))
         if (*mt)
           asmPanels.presetMateTypeForShot(mt);
     }
   }
-  // ribbon shot: show Features tab by default; AI_CAD_TAB=<0..12> selects which
+  // ribbon shot: show Features tab by default; CHUDWARE_TAB=<0..12> selects which
   // tab to capture (0=Features 1=Sketch 2=Evaluate 3=Simulation 4=Assembly
   // 5=Sheet Metal 6=Weldments 7=PCB 8=Surfaces .. 11=Appearance 12=Manufacture)
   // for headless per-tab verification.
   if (st.wantRibbon) {
     st.showRibbon = true;
     st.ribbonTab = AppState::RT_Features;
-    // T-BL31 NEW-3: the Billet on-load toast pins over the ribbon's top-left
+    // T-BL31 NEW-3: the Chudware on-load toast pins over the ribbon's top-left
     // and occluded icon verification (weld_gusset, appr_mat_aluminum/steel in
     // the T-G12 round-2 walkthrough). Suppress toasts for per-tab ribbon
-    // captures by default; AI_CAD_SHOT_KEEPTOAST=1 re-enables them (for
+    // captures by default; CHUDWARE_SHOT_KEEPTOAST=1 re-enables them (for
     // verifying the toast's own position/theming against the ribbon).
-    if (!(std::getenv("AI_CAD_SHOT_KEEPTOAST") &&
-          *std::getenv("AI_CAD_SHOT_KEEPTOAST")))
+    if (!(std::getenv("CHUDWARE_SHOT_KEEPTOAST") &&
+          *std::getenv("CHUDWARE_SHOT_KEEPTOAST")))
       st.suppressToasts = true;
     else
       st.toast(
           ui::ToastLevel::Info,
           "Chudware: live view of the AI's part — it updates as it builds");
-    if (const char *tabEnv = std::getenv("AI_CAD_TAB")) {
+    if (const char *tabEnv = std::getenv("CHUDWARE_TAB")) {
       int t = std::atoi(tabEnv);
       if (t >= 0 && t <= AppState::RT_Manufacture)
         st.ribbonTab = t;
     }
-    // T-G15: named alias for AI_CAD_TAB so in-context icon verification reads
-    // self-documenting (e.g. AI_CAD_RIBBON_TAB=appearance). Also unblocks
+    // T-G15: named alias for CHUDWARE_TAB so in-context icon verification reads
+    // self-documenting (e.g. CHUDWARE_RIBBON_TAB=appearance). Also unblocks
     // T-G16's per-tab ribbon-glass captures.
-    if (const char *tn = std::getenv("AI_CAD_RIBBON_TAB")) {
+    if (const char *tn = std::getenv("CHUDWARE_RIBBON_TAB")) {
       const std::string t = tn;
       int idx = -1;
       if (t == "features")
@@ -3145,12 +3145,12 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       if (idx >= 0)
         st.ribbonTab = idx;
       else {
-        std::fprintf(stderr, "AI_CAD_RIBBON_TAB: unknown tab '%s'\n", tn);
+        std::fprintf(stderr, "CHUDWARE_RIBBON_TAB: unknown tab '%s'\n", tn);
       }
     }
   }
   // pmform shot: open a PropertyManager form headlessly for visual verification
-  // of its field layout/sizing. AI_CAD_PMCMD=<cmd_id> (e.g. "extrude",
+  // of its field layout/sizing. CHUDWARE_PMCMD=<cmd_id> (e.g. "extrude",
   // "surf_loft") selects which form; the left pane auto-switches to the
   // PropertyManager tab when a form is active (see left_pane.cpp).
   // openForCommand is safe pre-worker: with no doc the checkpoint is skipped
@@ -3164,8 +3164,8 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // DARK text over the light viewport) is where Erik's dark-mode
     // black-on-black actually manifests; without a loaded doc the panes fall
     // back to the theme palette (light text) and hide the bug. Gated on
-    // AI_CAD_PMBOX=1 so the default pmform shot is unchanged.
-    if (const char *box = std::getenv("AI_CAD_PMBOX");
+    // CHUDWARE_PMBOX=1 so the default pmform shot is unchanged.
+    if (const char *box = std::getenv("CHUDWARE_PMBOX");
         box && *box && std::strcmp(box, "0") != 0) {
       std::string aicm;
       const char *candidates[] = {
@@ -3187,17 +3187,17 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         st.pitch = 28;
         st.zoom = 1.0f; // iso so the box fills the viewport
       } else {
-        std::fprintf(stderr, "pmform: AI_CAD_PMBOX load failed (%s): %s\n",
+        std::fprintf(stderr, "pmform: CHUDWARE_PMBOX load failed (%s): %s\n",
                      aicm.empty() ? "not found" : aicm.c_str(), lerr.c_str());
       }
     }
-    if (const char *cmd = std::getenv("AI_CAD_PMCMD"))
+    if (const char *cmd = std::getenv("CHUDWARE_PMCMD"))
       if (*cmd && !st.propertyManager->openForCommand(st, cmd))
         std::fprintf(stderr, "pmform: no form for command '%s'\n", cmd);
-    // AI_CAD_PMSET="key=value;key2=value2" presets fields so type-gated rows
+    // CHUDWARE_PMSET="key=value;key2=value2" presets fields so type-gated rows
     // render (e.g. "type=face" to show a fillet's face-set wells,
     // "end=up_to_surface", "thin=true").
-    if (const char *setEnv = std::getenv("AI_CAD_PMSET")) {
+    if (const char *setEnv = std::getenv("CHUDWARE_PMSET")) {
       std::string spec = setEnv;
       size_t pos = 0;
       while (pos < spec.size()) {
@@ -3218,10 +3218,10 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   if (st.wantPick) {
     // C15 picking demo/verification: load the golden box AICM, assert its
     // topology counts, and (in the frame loop) simulate a center-screen pick +
-    // highlight. The AICM path can be overridden via AI_CAD_AICM; otherwise we
+    // highlight. The AICM path can be overridden via CHUDWARE_AICM; otherwise we
     // probe the repo fixture relative to the exe.
     std::string aicm;
-    if (const char *env = std::getenv("AI_CAD_AICM"))
+    if (const char *env = std::getenv("CHUDWARE_AICM"))
       aicm = env;
     if (aicm.empty()) {
       const char *candidates[] = {
@@ -3440,7 +3440,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   }
 
   // Scripted screenshot/test scenarios
-  // (AI_CAD_SHOT=m1/sketch/asm/fea/evalmass/activity): the six step machines +
+  // (CHUDWARE_SHOT=m1/sketch/asm/fea/evalmass/activity): the six step machines +
   // their per-step backbuffer captures, extracted to ui::ScenarioRunner
   // (ui/scenarios.cpp). tick() advances the active scenario before each frame;
   // endFrame() handles the captures and the scenario-driven swap+continue /
@@ -3448,7 +3448,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   ui::ScenarioRunner scenarios(activityPanel);
 
   auto desiredThemeForFrame = [&st]() {
-    if (const char *envTheme = std::getenv("AI_CAD_THEME")) {
+    if (const char *envTheme = std::getenv("CHUDWARE_THEME")) {
       if (std::strcmp(envTheme, "light") == 0)
         return ui::Theme::Light;
       if (std::strcmp(envTheme, "dark") == 0)
@@ -3567,10 +3567,10 @@ int run_gui(const char *screenshotPath, const char *openPath) {
 #endif // 20 Hz idle floor
       }
     }
-#ifdef AI_CAD_ENABLE_CEF
+#ifdef CHUDWARE_ENABLE_CEF
     ui::cef::pump_if_due(); // drive CEF's message loop when its deadline is due
     {
-      static const char *dbgVendor = std::getenv("AI_CAD_DEBUG_CEF_VENDOR");
+      static const char *dbgVendor = std::getenv("CHUDWARE_DEBUG_CEF_VENDOR");
       static long dbgFrame = 0;
       if (dbgVendor && dbgVendor[0]) {
         ++dbgFrame;
@@ -3638,7 +3638,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
 
     // ITEM 15: deferred engine bootstrap. Interactive launches set
     // workerBootPending so the first frames can paint chrome before
-    // tryStartWorker (libaicad/OCCT/daemon hello) blocks the UI thread. Wait ~2
+    // tryStartWorker (libchudware/OCCT/daemon hello) blocks the UI thread. Wait ~2
     // frames so at least one swap has presented. Daemon reconnect lifecycle is
     // untouched (engineEventsTick / workerStarted gates).
     if (st.workerBootPending) {
@@ -3698,7 +3698,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // safe to destroy once rpc is idle.
     st.sweepRetiredSessions();
 
-    // Live MCP handoff: if the external AI-CAD MCP server (the engine Claude
+    // Live MCP handoff: if the external Chudware MCP server (the engine Claude
     // drives) published a new part, open/refresh it in the viewport so the user
     // watches the AI build. Self-guards and no-ops the vast majority of frames
     // (a single mtime stat). In daemon mode the live preview arrives as
@@ -3714,10 +3714,10 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     ui::pollChatOpenFoam(st);
 
     // C48: click telemetry for interaction debugging — only when
-    // AI_CAD_DEBUG_INPUT is set (pairs with AI_CAD_LOG_FILE). Logs what ImGui
+    // CHUDWARE_DEBUG_INPUT is set (pairs with CHUDWARE_LOG_FILE). Logs what ImGui
     // thinks is under every click.
     {
-      static const bool dbgInput = std::getenv("AI_CAD_DEBUG_INPUT") != nullptr;
+      static const bool dbgInput = std::getenv("CHUDWARE_DEBUG_INPUT") != nullptr;
       if (dbgInput && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
         ImGuiContext *g = ImGui::GetCurrentContext();
         char b[256];
@@ -4126,7 +4126,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
               // Web: workspace lives on the gateway FS — never std::filesystem
               // for host paths.
               {
-                auto &fsb = billet::fsBackend();
+                auto &fsb = chudware::fsBackend();
                 std::string ferr;
                 if (dir.empty() || dir == "/workspace") {
                   // defaultRoot() calls ensureRoot internally.
@@ -4539,10 +4539,10 @@ int run_gui(const char *screenshotPath, const char *openPath) {
           std::string le;
           st.loadDocMesh(r1.aicm_path, le);
         }
-        // Headless appearance smoke (AI_CAD_APPR): apply a vivid colour so a
+        // Headless appearance smoke (CHUDWARE_APPR): apply a vivid colour so a
         // screenshot confirms the GL renderer reflects a set_appearance colour
         // (not the default grey).
-        if (std::getenv("AI_CAD_APPR")) {
+        if (std::getenv("CHUDWARE_APPR")) {
           float orange[3] = {0.95f, 0.45f, 0.10f};
           applyModelAppearance(st, orange, 0.6f, 0.35f);
           std::printf("appr: applied orange\n");
@@ -4628,19 +4628,19 @@ int run_gui(const char *screenshotPath, const char *openPath) {
           ::kill((pid_t)pid, SIGKILL);
         } else {
           // Fallback: instance-keyed --stop --force.
-          std::string bin = aicad_ipc::resolveHostdBin("");
+          std::string bin = chudware_ipc::resolveHostdBin("");
           if (bin.empty())
-            bin = "core/build-occt-linux/bin/aicad-hostd";
+            bin = "core/build-occt-linux/bin/chudware-hostd";
           std::string cmd = "\"" + bin + "\" --stop --force 2>/dev/null";
           int rc = std::system(cmd.c_str());
           (void)rc;
         }
         // Drop the instance sock so reconnect doesn't race a half-dead peer.
-        std::string bin = aicad_ipc::resolveHostdBin("");
+        std::string bin = chudware_ipc::resolveHostdBin("");
         if (bin.empty())
-          bin = "core/build-occt-linux/bin/aicad-hostd";
+          bin = "core/build-occt-linux/bin/chudware-hostd";
         const std::string sock =
-            aicad_ipc::socketPath(aicad_ipc::instanceKey(bin));
+            chudware_ipc::socketPath(chudware_ipc::instanceKey(bin));
         if (!sock.empty())
           ::unlink(sock.c_str());
 #endif
@@ -4649,12 +4649,12 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         std::string err;
         // Prefer the same resolve path EngineClient uses so we hit the right
         // binary.
-        std::string bin = aicad_ipc::resolveHostdBin("");
+        std::string bin = chudware_ipc::resolveHostdBin("");
         if (bin.empty()) {
           // Dev-tree fallback next to the known layout.
-          bin = "core/build-occt-linux/bin/aicad-hostd";
+          bin = "core/build-occt-linux/bin/chudware-hostd";
         }
-        return aicad_ipc::spawnDetached(bin, "", err);
+        return chudware_ipc::spawnDetached(bin, "", err);
       };
       if (st.daemonH2Phase == 0) {
         // Seed a live part so the pre-kill session has a real doc tab.
@@ -4777,7 +4777,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // Wave N: ECAD GUI shot — build a verified design via the worker and load
     // it into the editor mirror so the screenshot shows a live schematic/board
     // (mirrors the wantTree flow). Default shows the schematic (always
-    // populated via the orchestrator's recipe fallback); AI_CAD_ECAD_KIND=pcb
+    // populated via the orchestrator's recipe fallback); CHUDWARE_ECAD_KIND=pcb
     // shows the laid-out + autorouted board instead.
     if (st.wantEcad && !st.ecadShotDone && st.workerStarted) {
       st.ecadShotDone = true;
@@ -4791,7 +4791,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         std::fflush(stdout);
         return ok && !(out.is_object() && out.contains("code"));
       };
-      const char *kindEnv = std::getenv("AI_CAD_ECAD_KIND");
+      const char *kindEnv = std::getenv("CHUDWARE_ECAD_KIND");
       const bool wantPcb = kindEnv && std::strcmp(kindEnv, "pcb") == 0;
       const bool want3d = kindEnv && std::strcmp(kindEnv, "3d") == 0;
       const bool wantAi = kindEnv && std::strcmp(kindEnv, "ai") == 0;
@@ -5090,7 +5090,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     }
 
     // ---------- scripted scenarios
-    // (AI_CAD_SHOT=m1/sketch/asm/fea/evalmass/activity) ---------- Frame-driven
+    // (CHUDWARE_SHOT=m1/sketch/asm/fea/evalmass/activity) ---------- Frame-driven
     // state machines that issue scripted ops through the REAL worker, drive the
     // panels, and request per-step screenshots; extracted to ui::ScenarioRunner
     // (ui/scenarios.cpp).
@@ -6518,33 +6518,33 @@ int run_gui(const char *screenshotPath, const char *openPath) {
                              // context is still live
   ui::freeIcons(); // C14: release atlas textures while GL context is still live
   ui::destroyCursors(); // W1-B: free the GLFW standard cursors
-  if (std::getenv("AI_CAD_DEBUG_SHUTDOWN"))
+  if (std::getenv("CHUDWARE_DEBUG_SHUTDOWN"))
     std::fprintf(stderr, "[td] rpc.shutdown\n");
   st.rpc.shutdown(); // C39: drop pending async calls + abort the in-flight one
-  if (std::getenv("AI_CAD_DEBUG_SHUTDOWN"))
+  if (std::getenv("CHUDWARE_DEBUG_SHUTDOWN"))
     std::fprintf(stderr, "[td] stopMeshLoader\n");
   st.stopMeshLoader(); // T-PERF3: join mesh thread before static dtors (avoid
                        // terminate)
-  if (std::getenv("AI_CAD_DEBUG_SHUTDOWN"))
+  if (std::getenv("CHUDWARE_DEBUG_SHUTDOWN"))
     std::fprintf(stderr, "[td] worker.stop\n");
   st.worker.stop();
-  if (std::getenv("AI_CAD_DEBUG_SHUTDOWN"))
+  if (std::getenv("CHUDWARE_DEBUG_SHUTDOWN"))
     std::fprintf(stderr, "[td] simClient.stop\n");
   simClient.stop(); // C19: shut down the second worker process
-#ifdef AI_CAD_ENABLE_CEF
-  if (std::getenv("AI_CAD_DEBUG_SHUTDOWN"))
+#ifdef CHUDWARE_ENABLE_CEF
+  if (std::getenv("CHUDWARE_DEBUG_SHUTDOWN"))
     std::fprintf(stderr, "[td] cef.shutdown\n");
   ui::cef::shutdown(); // no-op unless CEF was initialised (browsers close in
                        // their dtors)
 #endif
-  if (std::getenv("AI_CAD_DEBUG_SHUTDOWN"))
+  if (std::getenv("CHUDWARE_DEBUG_SHUTDOWN"))
     std::fprintf(stderr, "[td] imgui/glfw shutdown\n");
   ImGui_ImplOpenGL3_Shutdown();
   ImGui_ImplGlfw_Shutdown();
   ImGui::DestroyContext();
   glfwDestroyWindow(win);
   glfwTerminate();
-  if (std::getenv("AI_CAD_DEBUG_SHUTDOWN"))
+  if (std::getenv("CHUDWARE_DEBUG_SHUTDOWN"))
     std::fprintf(stderr, "[td] done\n");
   return 0;
 }

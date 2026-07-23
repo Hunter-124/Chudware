@@ -2,7 +2,7 @@
   "model_id": "gemma4-e4b",
   "license": "Gemma-ToU",
   "note": "Gemma 4 E-series (successor to '3n E4B'); MatFormer edge model",
-  "server_bin": "/home/hunter/.local/share/AI-CAD/llamacpp/build-cuda/bin/llama-server",
+  "server_bin": "/home/hunter/.local/share/Chudware/llamacpp/build-cuda/bin/llama-server",
   "timestamp": "2026-07-05T01:13:34",
   "free_vram_mb_before": 11683,
   "gpu_offloaded": true,

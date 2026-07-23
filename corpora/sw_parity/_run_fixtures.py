@@ -2,7 +2,7 @@
 compare against expect block and geometric checks, print a NOTES-style report.
 
 Run from repo root:
-    & "$env:APPDATA\\AI-CAD\\runtime\\venv\\Scripts\\python.exe" corpus_sw_parity/_run_fixtures.py
+    & "$env:APPDATA\\Chudware\\runtime\\venv\\Scripts\\python.exe" corpus_sw_parity/_run_fixtures.py
 """
 from __future__ import annotations
 import json

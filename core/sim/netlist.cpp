@@ -23,7 +23,7 @@
 #include <string>
 #include <vector>
 
-namespace aicad::sim {
+namespace chudware::sim {
 
 using nlohmann::json;
 
@@ -895,8 +895,8 @@ std::string model_to_kind(const std::string& model_name, const std::string& ref)
 // and builds a pin-name->pin-number map from SYMBOLS[libid]["pins"] (used when a
 // sim.pin_order entry is a pin NAME rather than a number-keyed netlist pin).
 //
-// That table is reproduced here as a self-contained map so aicad_sim stays free of
-// any dependency on aicad_ecad (aicad_ecad already depends on aicad_sim — adding
+// That table is reproduced here as a self-contained map so chudware_sim stays free of
+// any dependency on chudware_ecad (chudware_ecad already depends on chudware_sim — adding
 // the reverse edge would be a cycle). Only the two fields the resolver consumes are
 // ported: the `sim` dict and the pin name->number map. Every SYMBOLS entry that has
 // a `sim` field is covered (R/C/C_pol/L/D/LED/Zener/Q_NPN/Q_PNP/NMOS/PMOS/OPAMP_dual/
@@ -1148,4 +1148,4 @@ json netlist_to_spice_circuit(const json& netlist, const json& sim_params) {
     return json{{"circuit", circuit}, {"warnings", warnings}};
 }
 
-}  // namespace aicad::sim
+}  // namespace chudware::sim

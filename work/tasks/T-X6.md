@@ -46,7 +46,7 @@ provision tests must prove the code path executes, not just skip cleanly).
 - `services/browser/test_hardening.py` — captcha/2FA detection triggers the
   correct pause/abort path (faked page content, no real captcha/2FA involved).
 - `services/browser/integration/` — NEW: per-source integration tests gated
-  behind `AICAD_BROWSER_INTEGRATION_TESTS=1` (or similar — match any existing
+  behind `CHUDWARE_BROWSER_INTEGRATION_TESTS=1` (or similar — match any existing
   env-flag convention in the repo's test suite if one exists, check via
   graphify first). These run against real sites with a real (developer-
   provided, out-of-band) logged-in profile — never CI, never committed
@@ -82,7 +82,7 @@ provision tests must prove the code path executes, not just skip cleanly).
 - [x] Gated integration tests exist and are proven to exercise real adapter
       code paths when opted in (documented manual verification, since CI can't
       run them) — not a suite that's structurally incapable of running
-- [x] Full existing test suite (`~/.local/share/AI-CAD/mcp-venv/bin/python -m
+- [x] Full existing test suite (`~/.local/share/Chudware/mcp-venv/bin/python -m
       pytest`) still green with zero new regressions  *(gate at commit time)*
 
 ## Results (2026-07-06, opus-x6)
@@ -103,7 +103,7 @@ provision tests must prove the code path executes, not just skip cleanly).
   seam (fetch aborts on captcha & 2fa; fetch passes ordinary; login detects+reports and
   makes zero solve calls). Existing `test_browser_session.py` still green (8/8).
 - **`services/browser/integration/`** — gated live suite behind
-  `AICAD_BROWSER_INTEGRATION_TESTS=1` + a per-source saved profile. Two ALWAYS-RUN cases
+  `CHUDWARE_BROWSER_INTEGRATION_TESTS=1` + a per-source saved profile. Two ALWAYS-RUN cases
   keep it from being all-skip: registry-wired check + a real `GrabCADAdapter.search()`
   run end-to-end offline (browser_fetch faked to a login-wall page). 6 live cases skip
   with clear "no profile for <site>" messages. README documents opt-in + safety posture.

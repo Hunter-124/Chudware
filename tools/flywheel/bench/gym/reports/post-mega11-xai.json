@@ -110,7 +110,7 @@
     {
       "trigger_class": "incoherent_geometry",
       "occurrences": 3,
-      "knob": "AI_CAD_COUNCIL_FEATURE_THRESHOLD",
+      "knob": "CHUDWARE_COUNCIL_FEATURE_THRESHOLD",
       "action": "lower the build-strategy-council feature threshold so more parts get the four-seat review before build (more machinery for weaker models)",
       "kind": "config/data"
     },

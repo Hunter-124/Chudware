@@ -17,7 +17,7 @@
 #include <windows.h>
 #include <winhttp.h>
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 
 namespace {
@@ -101,7 +101,7 @@ HttpResponse http_post(const std::string& url,
     INTERNET_PORT port = uc.nPort;
 
     // --- session / connect / request ----------------------------------------
-    Handle session(WinHttpOpen(L"aicad-agent/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+    Handle session(WinHttpOpen(L"chudware-agent/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
                                WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
     if (!session) {
         out.error = last_error("WinHttpOpen");
@@ -211,7 +211,7 @@ HttpResponse http_get(const std::string& url,
     bool secure = (uc.nScheme == INTERNET_SCHEME_HTTPS);
     INTERNET_PORT port = uc.nPort;
 
-    Handle session(WinHttpOpen(L"aicad-agent/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+    Handle session(WinHttpOpen(L"chudware-agent/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
                                WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
     if (!session) {
         out.error = last_error("WinHttpOpen");
@@ -294,14 +294,14 @@ HttpResponse http_post_stream(const std::string& url,
 }
 
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware
 
 #else  // ---------------------------------------------------------------------
        // POSIX (Linux/macOS): libcurl backend.
 
 #include <curl/curl.h>
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 
 namespace {
@@ -369,7 +369,7 @@ HttpResponse curl_request(const std::string& url,
 
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     if (hdrs) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "aicad-agent/1.0");
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "chudware-agent/1.0");
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &out.body);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, static_cast<long>(timeout_ms));
@@ -445,7 +445,7 @@ HttpResponse curl_stream_request(const std::string& url,
     StreamCtx ctx{&out.body, &on_chunk};
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     if (hdrs) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "aicad-agent/1.0");
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "chudware-agent/1.0");
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, stream_write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ctx);
     // IDLE timeout: abort only when < 1 byte/sec is sustained for idle_timeout_ms
@@ -508,6 +508,6 @@ HttpResponse http_post_stream(const std::string& url,
 }
 
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware
 
 #endif  // _WIN32

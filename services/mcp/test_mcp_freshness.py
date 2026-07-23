@@ -6,14 +6,14 @@ capability additions can't silently become invisible to agents.
 
 How it works:
   1. Import the FastMCP instance from server.py (NO C++ engine needed — just Python
-     imports).  Use a lightweight mock for core_bridge so libaicad.so is not required.
+     imports).  Use a lightweight mock for core_bridge so libchudware.so is not required.
   2. Collect all registered tool names from mcp.tools.
   3. Build a combined coverage corpus: server instructions text + all cad_guide topics.
   4. Assert every tool name appears at least once in that corpus.
 
 Run:
   python -m pytest services/mcp/test_mcp_freshness.py -v
-  # or, without libaicad.so present (CI):
+  # or, without libchudware.so present (CI):
   python -m pytest services/mcp/test_mcp_freshness.py -v -k freshness
 """
 from __future__ import annotations
@@ -131,7 +131,7 @@ def _ensure_stubs():
 # ---------------------------------------------------------------------------
 
 # We enumerate tools from the source directly to avoid the full import chain
-# (which requires libaicad.so, scipy, kicad, etc.).  This is more robust for CI.
+# (which requires libchudware.so, scipy, kicad, etc.).  This is more robust for CI.
 #
 # The canonical list is derived from the @mcp.tool() decorated functions in each
 # *_tools.py module.  We maintain it here as a flat set; the test below will

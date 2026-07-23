@@ -1,6 +1,6 @@
 // cef/cef_stealth.cpp — see cef_stealth.h. Kept in sync with the client-side
 // patches in services/browser/stealth.py (INIT_SCRIPT) so the headless-fetch and
-// interactive surfaces share ONE fingerprint. Compiled only with AI_CAD_ENABLE_CEF.
+// interactive surfaces share ONE fingerprint. Compiled only with CHUDWARE_ENABLE_CEF.
 #include "cef_stealth.h"
 
 #include <string>
@@ -58,7 +58,7 @@ const char* kInitScript = R"JS(
   // but ONLY when the driver really is software. The getParameter hook is itself a top
   // bot-scan tell: Function.prototype.toString.call(getParameter) exposes the wrapper
   // source no matter how we mask the function's own .toString, and reCAPTCHA reads that
-  // vector. So on a REAL GPU (AI_CAD_CEF_GPU=1) we leave getParameter NATIVE — honest
+  // vector. So on a REAL GPU (CHUDWARE_CEF_GPU=1) we leave getParameter NATIVE — honest
   // real-Intel values with zero tampering, the clean path for a reCAPTCHA login. On the
   // SwiftShader fallback (default) we keep the spoof: masking the software renderer is
   // what lets naive bot-walls (the parts-fetch vendors) serve us, and reCAPTCHA login
@@ -183,7 +183,7 @@ const char* kRecaptchaLoginHelper = R"JS(
 })();
 )JS";
 
-// DIAGNOSTIC (opt-in, injected only when AI_CAD_CEF_NETLOG=1): a main-frame logger
+// DIAGNOSTIC (opt-in, injected only when CHUDWARE_CEF_NETLOG=1): a main-frame logger
 // that captures the REAL captcha flow of a live panel login into the app trace file
 // (via console '[RC]…' → OnConsoleMessage → trace_file). Answers the three open
 // questions at once: (1) does reCAPTCHA raise a CHALLENGE (bframe) iframe that can't

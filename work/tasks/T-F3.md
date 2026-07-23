@@ -59,7 +59,7 @@ either stalling or guessing.
 - **Answer persistence precedent:** intake's ledger round-trips as JSON into the
   `.step+` doc (`engine_oracle/intake/intake.py`, `to_dict/from_dict`). Persist
   ask_user answers the same way for doc-scoped questions, and to the run record
-  (`<appdata>/AI-CAD/cache/runs/<run_id>/`) for run-scoped ones. Emit an event per
+  (`<appdata>/Chudware/cache/runs/<run_id>/`) for run-scoped ones. Emit an event per
   Q and per A through the existing `RunEvents`/events.jsonl layer
   (`core/agent/events.cpp:41-60`, persist-then-callback order is a contract).
 - **In-app dialog:** put the form logic in `ui/abstract/` panel-spec level if

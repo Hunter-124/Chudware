@@ -1,4 +1,4 @@
-You are the DRIVER for task {{TASK_ID}} in the AI-CAD repo. You run as an Opus
+You are the DRIVER for task {{TASK_ID}} in the Chudware repo. You run as an Opus
 agent in Claude Code. Your job: land this one task, merge-ready, and nothing else.
 
 ## Setup (do first, in order)

@@ -156,7 +156,7 @@ Scope: `scratch/omp-src/packages/ai` + `packages/catalog` (pinned `6ae7cdbf`) vs
 
 - `config.py:925` `_resolve_provider(name, cfg, role)` — the CAD analogue of OMP's
   provider-registration + catalog lookup **combined into one function**. Precedence
-  (`:1-6` docstring): explicit arg → `AI_CAD_PROVIDER` env → `config.json` → default.
+  (`:1-6` docstring): explicit arg → `CHUDWARE_PROVIDER` env → `config.json` → default.
   `:897-923` `_resolve_via_routing(role, cfg)` layers `routing.yaml` resolution *underneath* that
   precedence (only consulted when no explicit name/env var is set, `:928-931`), translating a
   routing `kind` (`anthropic|openai|openrouter|gemini|xai|llamacpp|vllm|mock|lmstudio|ollama|

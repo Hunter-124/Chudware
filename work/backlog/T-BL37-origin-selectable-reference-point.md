@@ -86,7 +86,7 @@ Gate: PASS (scripts/gate.sh — ctest 100%, check.py PASS, ui/imgui PASS). 60/60
 - 2026-07-04 20:56 UTC [sonnet-alba] Parity redo complete (sonnet-alba). Rebased onto origin/master (741eae0e). Commit 8dabd612: ui/imgui parity — feature_tree Origin row selectable + eye toggle, viewport syncRefDatums injects synthetic point.origin, PM routeDatumPoint/activeWellWantsPoint, panel_spec SelectorKinds.point. Build clean. Gate PASS (build+shot+selftest). MCP round-trip: box + circular_pattern 4x about axis.z (world origin) all ok. Headless shots docs/sessions/assets/bl37_{light,dark}_origin.png — engine live (WorkerClient rev 3), Reference section shows Origin row + nested planes. Branch pushed (force after rebase). Ready for foreman merge.
 - 2026-07-04 21:32 UTC [sonnet-alba] Evidence upgraded (addressing review gap re: visible+selected origin glyph).
 
-Added AI_CAD_SHOT=origin headless scenario (scenarios.h/cpp + featureTreeUnhideOrigin/featureTreeSelectOrigin setters in feature_tree.h/cpp). Shot creates an 80x60x40 box with engine ATTACHED (box ok=1 rev=1), then unhides the origin point datum and selects it.
+Added CHUDWARE_SHOT=origin headless scenario (scenarios.h/cpp + featureTreeUnhideOrigin/featureTreeSelectOrigin setters in feature_tree.h/cpp). Shot creates an 80x60x40 box with engine ATTACHED (box ok=1 rev=1), then unhides the origin point datum and selects it.
 
 New evidence screenshots (commit 7a07691e):
 - docs/sessions/assets/bl37_dark_origin.png — dark theme, Origin row teal-highlighted (selected), live 3D box in viewport, status "Origin: point glyph visible + selected"

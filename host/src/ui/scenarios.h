@@ -1,6 +1,6 @@
 // Scripted screenshot/test scenarios (extracted from app.cpp's run_gui frame loop).
 //
-// ScenarioRunner hosts the frame-driven state machines keyed on AI_CAD_SHOT
+// ScenarioRunner hosts the frame-driven state machines keyed on CHUDWARE_SHOT
 // (m1 / sketch / asm / fea / evalmass / activity / multidoc / appearance). tick() runs once per
 // frame before
 // ImGui::NewFrame() and advances whichever scenario is active; endFrame() runs after
@@ -48,7 +48,7 @@ public:
     explicit ScenarioRunner(ActivityPanel& activityPanel);
     ~ScenarioRunner();
 
-    // Advance the active scenario's step machine (no-op when no AI_CAD_SHOT scenario mode
+    // Advance the active scenario's step machine (no-op when no CHUDWARE_SHOT scenario mode
     // is active). Call once per frame, before ImGui::NewFrame().
     void tick(AppState& st);
 
@@ -60,7 +60,7 @@ public:
 private:
     ActivityPanel& activityPanel;
 
-    // ---------- C17 M1 integration scenario (AI_CAD_SHOT=m1) ----------
+    // ---------- C17 M1 integration scenario (CHUDWARE_SHOT=m1) ----------
     int m1Step = 0;            // which scenario step we are on
     int m1Settle = 0;          // frames waited since the step's ops ran (let mesh repaint)
     std::string m1FilletId;    // feature id of the fillet (for the edit step)
@@ -72,47 +72,47 @@ private:
     // capture consumes it).
     std::string m1Capture;
 
-    // ---------- C18 sketch scenario (AI_CAD_SHOT=sketch) ----------
+    // ---------- C18 sketch scenario (CHUDWARE_SHOT=sketch) ----------
     int skStep = 0, skSettle = 0;
     std::string skSavePath, skFid;
     std::string skL0, skL1, skL2, skL3, skWidthCid;
     bool skDirReady = false;
     std::string sketchCapture;  // same per-step capture mechanism, separate path slot
 
-    // ---------- 3D sketch scenario (AI_CAD_SHOT=sketch3d) ----------
+    // ---------- 3D sketch scenario (CHUDWARE_SHOT=sketch3d) ----------
     int s3Step = 0, s3Settle = 0;
     std::string s3SavePath, s3Fid;
     bool s3DirReady = false;
     std::string s3Capture;  // same per-step capture mechanism, separate path slot
 
-    // ---------- C20b assembly scenario (AI_CAD_SHOT=asm) ----------
+    // ---------- C20b assembly scenario (CHUDWARE_SHOT=asm) ----------
     int asmStep = 0, asmSettle = 0;
     std::string asmSavePath, asmBasePath, asmPegPath, asmDoc, asmK2;
     double asmSolvedZ = -999.0;
     bool asmDirReady = false;
     std::string asmCapture;  // same per-step capture mechanism, separate path slot
 
-    // ---------- C19 FEA scenario (AI_CAD_SHOT=fea) ----------
+    // ---------- C19 FEA scenario (CHUDWARE_SHOT=fea) ----------
     int feaStep = 0, feaSettle = 0, feaWaitFrames = 0;
 
-    // ---------- T-FIN24 disclosure-matrix scenario (AI_CAD_SHOT=simdisc_mech|simdisc_ecad) ----------
+    // ---------- T-FIN24 disclosure-matrix scenario (CHUDWARE_SHOT=simdisc_mech|simdisc_ecad) ----------
     int sdStep = 0, sdSettle = 0;
 
-    // ---------- external-flow scenario (AI_CAD_SHOT=flow) ----------
+    // ---------- external-flow scenario (CHUDWARE_SHOT=flow) ----------
     int flowStep = 0, flowSettle = 0, flowWaitFrames = 0;
 
-    // ---------- W17 engineering-drawing scenario (AI_CAD_SHOT=drawing) ----------
+    // ---------- W17 engineering-drawing scenario (CHUDWARE_SHOT=drawing) ----------
     void runDrawing(AppState& st);
     int dwgStep = 0, dwgSettle = 0;
     bool dwgDirReady = false;
     std::string dwgSavePath, dwgCapture;
 
-    // ---------- C19 evalmass scenario (AI_CAD_SHOT=evalmass) ----------
+    // ---------- C19 evalmass scenario (CHUDWARE_SHOT=evalmass) ----------
     int evalStep = 0, evalSettle = 0;
 
-    // ---------- appearance scenario (AI_CAD_SHOT=appearance) ----------
+    // ---------- appearance scenario (CHUDWARE_SHOT=appearance) ----------
     // Model a part, open the Settings modal on the Appearance tab (glass knobs + live glass
-    // preview over the viewport), capture. Self-contained: the runner reads AI_CAD_SHOT itself
+    // preview over the viewport), capture. Self-contained: the runner reads CHUDWARE_SHOT itself
     // (no AppState want-flag), seeded once on the first tick (apInit).
     void runAppearance(AppState& st);
     bool apInit = false, apWant = false, apDone = false;
@@ -120,8 +120,8 @@ private:
     std::string apSavePath, apCapture;
     bool apDirReady = false;
 
-    // ---------- T-G15 icon pipeline (AI_CAD_SHOT=iconpipe) ----------
-    // Recipe-driven clean-viewport icon generator: read a JSON recipe list (env AI_CAD_ICON_RECIPES),
+    // ---------- T-G15 icon pipeline (CHUDWARE_SHOT=iconpipe) ----------
+    // Recipe-driven clean-viewport icon generator: read a JSON recipe list (env CHUDWARE_ICON_RECIPES),
     // and for each recipe build a demo part (newPart + applyOps), render it through the renderer's
     // transparent thumbnail path (no chrome, no gizmo, alpha=0 background) at the recipe camera, and
     // write out_dir/<name>.png. Doubles as a smoke test that every tool's op actually runs.
@@ -133,10 +133,10 @@ private:
     std::string ipOutDir;
     std::vector<nlohmann::json> ipRecipes;
 
-    // ---------- RE-28 3DGS splat scenario (AI_CAD_SHOT=reveng_splat) ----------
+    // ---------- RE-28 3DGS splat scenario (CHUDWARE_SHOT=reveng_splat) ----------
     // Load a canned Gaussian-splat .ply fixture and draw it as camera-facing billboards into the
     // backbuffer (real render::SplatRenderer draw path), then capture. Self-contained: reads
-    // AI_CAD_SHOT itself, no doc/worker geometry needed. Proves the loader + GL draw don't crash.
+    // CHUDWARE_SHOT itself, no doc/worker geometry needed. Proves the loader + GL draw don't crash.
     void runRevengSplat(AppState& st);
     bool rsInit = false, rsWant = false, rsDone = false;
     int rsSettle = 0;
@@ -144,13 +144,13 @@ private:
     bool rsDirReady = false, rsLoaded = false;
     std::unique_ptr<render::SplatRenderer> rsRenderer;
 
-    // ---------- C22b activity scenario (AI_CAD_SHOT=activity) ----------
+    // ---------- C22b activity scenario (CHUDWARE_SHOT=activity) ----------
     int actStep = 0, actSettle = 0, actWaitFrames = 0;
     std::string actCapture;
     std::string actSavePath;
     bool actDirReady = false;
 
-    // ---------- multi-document scenario (AI_CAD_SHOT=multidoc) ----------
+    // ---------- multi-document scenario (CHUDWARE_SHOT=multidoc) ----------
     // Verifies the per-document DocSession refactor: open a feature-edit PM form mid-edit on Part A
     // (with a viewport selection + a hidden body), switch to Part B and measure, switch back to A —
     // A's PM form / selection / hidden-body mask are intact and B is independent. Same step-machine /
@@ -173,14 +173,14 @@ private:
     bool mdPassChop[4] = {false, false, false, false};  // A<->C hop verdicts (A,C,A,C)
 
 
-    // ---------- tabperf scenario (AI_CAD_SHOT=tabperf) ----------
+    // ---------- tabperf scenario (CHUDWARE_SHOT=tabperf) ----------
     // Opens two real parts, then hammers A<->B switchToTab for >=20 switches so logTabPerf
     // ([perf] tab_switch ...) can be collected from stderr. Measurement-only; no UI assertions.
     void runTabPerf(AppState& st);
     int tpStep = 0, tpSettle = 0, tpSwitches = 0;
     int tpIdxA = -1, tpIdxB = -1;
     static constexpr int kTabPerfSwitches = 24;  // 12 A->B + 12 B->A
-    // ---------- workspaces scenario (AI_CAD_SHOT=workspaces) ----------
+    // ---------- workspaces scenario (CHUDWARE_SHOT=workspaces) ----------
     // Cycles all 8 workspace tabs (Model, Drawing, Simulate, Electronics, Manufacture, PLM,
     // PartsLibrary, AI), capturing one screenshot per workspace. Acceptance gate for the
     // workspace routing switch. Per-step backbuffer-capture pattern matches multidoc/m1.
@@ -189,7 +189,7 @@ private:
     bool wsDirReady = false;
     std::string wsSavePath, wsCapture;
 
-    // ---------- motion scenario (AI_CAD_SHOT=motion) ----------
+    // ---------- motion scenario (CHUDWARE_SHOT=motion) ----------
     // Builds a 2-body assembly with an angle mate, runs a Motion study, captures t0/t1/t2
     // where body positions differ. Proves kinematic motion playback is end-to-end live.
     void runMotion(AppState& st);

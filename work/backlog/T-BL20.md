@@ -63,7 +63,7 @@ Delivered in `scripts/vv_benchmark.py`:
   PRECISE, 0.36% err), FEA3 (uniform pressure load, ENGINEERING — **xfail**, see
   below), M1 (modal cantilever square, PRECISE, 0.22% err), M2 (modal cantilever
   rect weak-axis, PRECISE, 0.49% err). All calibrated against a live OCCT build
-  (`core/build-occt-linux/bin/libaicad.so`) before landing.
+  (`core/build-occt-linux/bin/libchudware.so`) before landing.
 - **CalculiX** (family `calculix`): `bench_calculix()` + `_write_calculix_cantilever_inp()`
   generate a clean-room C3D8 hex-mesh `.inp` for the FEA1 geometry, run `ccx` as a
   PATH-discovered subprocess (GPL-2 isolation, `contracts/licenses.md` row added),
@@ -91,7 +91,7 @@ Delivered in `scripts/vv_benchmark.py`:
 
 **Verification performed:**
 - `pytest scripts/vv_benchmark.py::TestSmoke -q` — 8 passed (pure Python, no .so).
-- `AICAD_RUN_VV=full AI_CAD_LIBAICAD=<build-occt-linux>/libaicad.so pytest
+- `CHUDWARE_RUN_VV=full CHUDWARE_LIBCHUDWARE=<build-occt-linux>/libchudware.so pytest
   scripts/vv_benchmark.py -q` — 17 passed, 1 skipped (ccx absent), 1 xfailed
   (issue #9), 0 unexpected failures.
 - Same full run against the plain `build-linux` .so (no OCCT) — all FEA/modal/ccx

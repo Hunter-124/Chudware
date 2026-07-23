@@ -20,7 +20,7 @@ machinery (workspace_bar.cpp, doc-tabs, the ECAD full-viewport takeover pattern,
 copilot overlay column, agent_panel, watch_grid), aicad.mission event streams,
 aicad.delegation/1 tree, aicad.buildgraph/1. ui/imgui is the ONLY live GUI (host/ reference-
 only). Design language LOCKED: pinned glass columns, no docked layout, dark-mode contrast per
-the T-U1 kit, ui_style_check clean. Verify HEADLESS only (xvfb-run AI_CAD_SHOT=...), never
+the T-U1 kit, ui_style_check clean. Verify HEADLESS only (xvfb-run CHUDWARE_SHOT=...), never
 launch headed; EYEBALL every shot PNG. Numbers cite real output.
 
 ## Scope
@@ -51,8 +51,8 @@ Shipped:
 - scenarios.cpp — fixture with 6 nodes across 5 layers (mission + 3 delegation sub-agents + verify + gate) seeding both shots
 
 Shot scenarios (HEADLESS, eyeballed):
-- AI_CAD_SHOT=agent_dag (full mode, 1600x1000): floating Agent DAG window, all 6 nodes visible, bezier edges, detail pane for geometry_designer (role/model/tool/ledger/tokens), status colors: teal=done, teal-highlight=running, amber=blocked, red=failed
-- AI_CAD_SHOT=agent_dag_compact (compact mode, 1600x1000): canvas-only embedded panel, all 6 nodes including red failed VFY and amber blocked GATE visible at depth 4, no scaffold header
+- CHUDWARE_SHOT=agent_dag (full mode, 1600x1000): floating Agent DAG window, all 6 nodes visible, bezier edges, detail pane for geometry_designer (role/model/tool/ledger/tokens), status colors: teal=done, teal-highlight=running, amber=blocked, red=failed
+- CHUDWARE_SHOT=agent_dag_compact (compact mode, 1600x1000): canvas-only embedded panel, all 6 nodes including red failed VFY and amber blocked GATE visible at depth 4, no scaffold header
 
 Fixes from advisor review (commit b21ab4e7):
 - agentDagShotForceMode() seam: compact branch now has real execution coverage

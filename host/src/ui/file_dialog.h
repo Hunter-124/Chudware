@@ -4,7 +4,7 @@
 // Contract:
 //   - `filter` uses the classic common-dialog form, pairs of (description, pattern) separated
 //     by embedded NULs and terminated by a double NUL when written as a string literal, e.g.
-//         "AI-CAD part (*.step+)\0*.step+\0All files (*.*)\0*.*\0"
+//         "Chudware part (*.step+)\0*.step+\0All files (*.*)\0*.*\0"
 //     (a C literal supplies the final extra NUL itself).
 //   - `defExt` is appended (with a dot) when the user types a name with no extension. We do
 //     this ourselves instead of via lpstrDefExt because the OFN field only honors the first

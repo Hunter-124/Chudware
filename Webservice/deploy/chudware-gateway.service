@@ -1,5 +1,5 @@
 [Unit]
-Description=billet-web gateway (FastAPI / uvicorn on 127.0.0.1:8300)
+Description=chudware-web gateway (FastAPI / uvicorn on 127.0.0.1:8300)
 Documentation=file://%h/Repositories/CAD/Webservice/deploy/RUNBOOK.md
 After=network-online.target
 Wants=network-online.target
@@ -7,9 +7,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=%h/Repositories/CAD/Webservice/gateway
-EnvironmentFile=-%h/billet-web-data/gateway.env
-EnvironmentFile=-%h/billet-web/webd.env
-Environment=BILLET_WEB_DATA=%h/billet-web-data
+EnvironmentFile=-%h/chudware-web-data/gateway.env
+EnvironmentFile=-%h/chudware-web/webd.env
+Environment=CHUDWARE_WEB_DATA=%h/chudware-web-data
 # venv + uvicorn; app module owned by GatewayCore
 ExecStart=%h/Repositories/CAD/Webservice/gateway/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 8300 --proxy-headers --forwarded-allow-ips=127.0.0.1 --ws-max-size 268435456
 Restart=on-failure

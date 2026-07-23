@@ -1,1 +1,1 @@
-"""AI-CAD built-in agent loop and provider adapters."""
+"""Chudware built-in agent loop and provider adapters."""

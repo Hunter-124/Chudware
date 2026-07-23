@@ -17,7 +17,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-namespace aicad_ipc {
+namespace chudware_ipc {
 
 std::string fnv1aHex(const std::string& s) {
     // Rendezvous protocol constant, mirrored byte-for-byte in
@@ -36,7 +36,7 @@ std::string fnv1aHex(const std::string& s) {
 }
 
 std::string instanceKey(const std::string& hostdBin) {
-    if (const char* k = std::getenv("AICAD_INSTANCE_KEY"); k && *k) return k;
+    if (const char* k = std::getenv("CHUDWARE_INSTANCE_KEY"); k && *k) return k;
     std::string id = hostdBin;
     char real[PATH_MAX];
     if (!id.empty() && ::realpath(id.c_str(), real)) id = real;
@@ -49,21 +49,21 @@ std::string runtimeDir() {
     // discover the daemon: the flock singleton only works if the GUI, the MCP
     // bridges, and the daemon all agree on one directory. Agent-spawned
     // processes often lack XDG_RUNTIME_DIR, so an env-only rule split the
-    // world into /run/user/<uid> and /tmp/aicad-<uid> — two live "singletons"
+    // world into /run/user/<uid> and /tmp/chudware-<uid> — two live "singletons"
     // with the same instance key. When the env var is unset, fall back to the
     // canonical /run/user/<uid> (if it exists and is ours) BEFORE /tmp.
     // Mirrored in daemon_bridge.py socket_path().
     std::string dir;
     if (const char* x = std::getenv("XDG_RUNTIME_DIR"); x && *x) {
-        dir = std::string(x) + "/aicad";
+        dir = std::string(x) + "/chudware";
     } else {
         const std::string runUser = "/run/user/" + std::to_string((long)::getuid());
         struct stat ru{};
         if (::lstat(runUser.c_str(), &ru) == 0 && S_ISDIR(ru.st_mode) &&
             ru.st_uid == ::getuid())
-            dir = runUser + "/aicad";
+            dir = runUser + "/chudware";
         else
-            dir = "/tmp/aicad-" + std::to_string((long)::getuid());
+            dir = "/tmp/chudware-" + std::to_string((long)::getuid());
     }
     if (::mkdir(dir.c_str(), 0700) != 0 && errno != EEXIST) return "";
     // Refuse a dir we don't own or that others can write (symlink squat defence).
@@ -79,11 +79,11 @@ std::string stateDir() {
     if (const char* x = std::getenv("XDG_DATA_HOME"); x && *x) base = x;
     else if (const char* h = std::getenv("HOME"); h && *h) base = std::string(h) + "/.local/share";
     else base = ".";
-    return base + "/AI-CAD";
+    return base + "/Chudware";
 }
 
 std::string socketPath(const std::string& key) {
-    if (const char* p = std::getenv("AICAD_HOSTD_SOCKET"); p && *p) return p;
+    if (const char* p = std::getenv("CHUDWARE_HOSTD_SOCKET"); p && *p) return p;
     std::string dir = runtimeDir();
     return dir.empty() ? "" : dir + "/hostd-" + key + ".sock";
 }
@@ -94,7 +94,7 @@ std::string lockPath(const std::string& key) {
 }
 
 std::string resolveHostdBin(const std::string& hint) {
-    if (const char* b = std::getenv("AICAD_HOSTD_BIN"); b && *b) return b;
+    if (const char* b = std::getenv("CHUDWARE_HOSTD_BIN"); b && *b) return b;
     if (!hint.empty() && ::access(hint.c_str(), X_OK) == 0) return hint;
     return "";
 }
@@ -169,6 +169,6 @@ bool spawnDetached(const std::string& exe, const std::string& arg, std::string& 
     return true;
 }
 
-}  // namespace aicad_ipc
+}  // namespace chudware_ipc
 
 #endif  // !_WIN32

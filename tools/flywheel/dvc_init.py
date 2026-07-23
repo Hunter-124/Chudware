@@ -6,7 +6,7 @@ push/pull/status helpers for the CI round-trip test.
 
 DVC remote hierarchy:
   local testing : file:///abs/path/to/dvc-remote   (no credentials needed)
-  production    : s3://bucket/aicad-training-data   (HUMAN-GATED — see work/questions/T-H5.md)
+  production    : s3://bucket/chudware-training-data   (HUMAN-GATED — see work/questions/T-H5.md)
 
 DVC license: Apache-2.0. In-process use permitted (see contracts/licenses.md row added
 by T-H5 commit).

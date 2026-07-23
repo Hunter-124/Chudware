@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Web parity probe (stdlib-only) — enforces contracts/web_parity.md.
 
-The web (WASM) client talks to aicad-hostd, a pure C++ engine daemon with no
+The web (WASM) client talks to chudware-hostd, a pure C++ engine daemon with no
 Python-worker fallback. This probe spawns a scratch hostd, calls every method
 listed in contracts/web_parity.md, and asserts:
 
@@ -13,8 +13,8 @@ listed in contracts/web_parity.md, and asserts:
                      cutover landed — shrink the inventory (probe fails until
                      you do).
 
-Usage: scripts/web_parity_probe.py [path/to/aicad-hostd]
-Exit 0 = parity contract holds. Uses a scratch AICAD_INSTANCE_KEY; never
+Usage: scripts/web_parity_probe.py [path/to/chudware-hostd]
+Exit 0 = parity contract holds. Uses a scratch CHUDWARE_INSTANCE_KEY; never
 touches a live daemon. Methods are called with {} — classification depends
 only on the error KIND, never on side effects.
 """
@@ -39,16 +39,16 @@ WORKER_MARKERS = ("worker_error", "worker bridge", "python runtime not installed
 def find_hostd() -> str:
     if len(sys.argv) > 1:
         return sys.argv[1]
-    for rel in ("core/build-occt-linux/bin/aicad-hostd", "core/build-linux/bin/aicad-hostd"):
+    for rel in ("core/build-occt-linux/bin/chudware-hostd", "core/build-linux/bin/chudware-hostd"):
         p = os.path.join(REPO, rel)
         if os.access(p, os.X_OK):
             return p
-    sys.exit("web_parity_probe: no aicad-hostd binary found (build core first)")
+    sys.exit("web_parity_probe: no chudware-hostd binary found (build core first)")
 
 
 def runtime_dir() -> str:
-    base = os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/aicad-{os.getuid()}"
-    return os.path.join(base, "aicad") if os.environ.get("XDG_RUNTIME_DIR") else base
+    base = os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/chudware-{os.getuid()}"
+    return os.path.join(base, "chudware") if os.environ.get("XDG_RUNTIME_DIR") else base
 
 
 def load_contract() -> dict:
@@ -60,7 +60,7 @@ def load_contract() -> dict:
 
 
 class Client:
-    """Minimal mirror of aicad_ipc::EngineClient (connect-or-spawn + line RPC)."""
+    """Minimal mirror of chudware_ipc::EngineClient (connect-or-spawn + line RPC)."""
 
     def __init__(self, hostd: str, key: str, budget_s: float = 15.0):
         self.sock_path = os.path.join(runtime_dir(), f"hostd-{key}.sock")
@@ -106,7 +106,7 @@ class Client:
 
 
 def is_python_or_unknown(resp: dict) -> bool:
-    """True when the call was NOT served by libaicad: either the method is
+    """True when the call was NOT served by libchudware: either the method is
     unknown everywhere, or hostd tried the (disabled) Python worker bridge.
     With the bridge disabled this is exactly what the web client experiences."""
     err = resp.get("error") or {}
@@ -124,18 +124,18 @@ def is_python_or_unknown(resp: dict) -> bool:
 def main() -> int:
     hostd = find_hostd()
     contract = load_contract()
-    if not os.environ.get("AI_CAD_LIBAICAD"):
-        lib = os.path.join(os.path.dirname(hostd), "libaicad.so")
+    if not os.environ.get("CHUDWARE_LIBCHUDWARE"):
+        lib = os.path.join(os.path.dirname(hostd), "libchudware.so")
         if os.path.exists(lib):
-            os.environ["AI_CAD_LIBAICAD"] = lib
-    os.environ["AICAD_HOSTD_LINGER_SECS"] = "3"
+            os.environ["CHUDWARE_LIBCHUDWARE"] = lib
+    os.environ["CHUDWARE_HOSTD_LINGER_SECS"] = "3"
     # Simulate the web deployment: no Python worker bridge. hostd's lazy
-    # fallback (core/hostd/worker_bridge.cpp) honors AI_CAD_PYTHON — point it at
+    # fallback (core/hostd/worker_bridge.cpp) honors CHUDWARE_PYTHON — point it at
     # a nonexistent interpreter so python-only methods fail exactly as they do
     # for the WASM client.
-    os.environ["AI_CAD_PYTHON"] = "/nonexistent-web-parity-probe"
+    os.environ["CHUDWARE_PYTHON"] = "/nonexistent-web-parity-probe"
     key = "parity-" + uuid.uuid4().hex[:8]
-    os.environ["AICAD_INSTANCE_KEY"] = key
+    os.environ["CHUDWARE_INSTANCE_KEY"] = key
 
     fails: list[str] = []
     c = Client(hostd, key)

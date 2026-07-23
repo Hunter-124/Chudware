@@ -1,4 +1,4 @@
-// Lazily-spawned Python worker bridge for aicad-hostd.
+// Lazily-spawned Python worker bridge for chudware-hostd.
 //
 // On web the browser talks only to hostd (via the gateway websocket). Methods the
 // C++ engine does not implement (plm_*, git_*, ai_roles_*, provider accounts, …)

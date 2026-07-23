@@ -25,10 +25,10 @@ namespace {
 // Where a fresh Web tab lands. Overridable so a deployment can point it at an intranet
 // start page; falls back to a plain, dependency-free search home.
 std::string homeUrl() {
-    if (const char* e = std::getenv("AI_CAD_WEB_HOME")) {
+    if (const char* e = std::getenv("CHUDWARE_WEB_HOME")) {
         if (e[0]) return std::string(e);
     }
-    if (const char* e = std::getenv("SHOPCRAFT_WEB_HOME")) {
+    if (const char* e = std::getenv("CHUDWARE_WEB_HOME")) {
         if (e[0]) return std::string(e);
     }
     return "https://www.google.com";

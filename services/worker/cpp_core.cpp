@@ -6,7 +6,7 @@
 #include <vector>
 
 #if defined(__EMSCRIPTEN__)
-// Browser never dlopens libaicad; keep platform helpers out of the TU.
+// Browser never dlopens libchudware; keep platform helpers out of the TU.
 #elif defined(_WIN32)
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
@@ -29,7 +29,7 @@ std::wstring widen(const std::string& s) {
     return w;
 }
 
-// Directory containing the running host exe (where libaicad.dll is staged for a
+// Directory containing the running host exe (where libchudware.dll is staged for a
 // shipped build / by build.bat).
 std::wstring exe_dir() {
     wchar_t buf[MAX_PATH];
@@ -39,7 +39,7 @@ std::wstring exe_dir() {
     return slash == std::wstring::npos ? std::wstring() : p.substr(0, slash);
 }
 #elif !defined(__EMSCRIPTEN__)
-// Directory containing the running host exe (where libaicad.so is staged).
+// Directory containing the running host exe (where libchudware.so is staged).
 std::string exe_dir() {
     char buf[4096];
     ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
@@ -56,22 +56,22 @@ std::string exe_dir() {
 bool CppCore::ensureLoaded(std::string& err) {
     std::lock_guard<std::mutex> lk(mtx_);
     if (tried_) {
-        if (!loaded_) err = "libaicad.dll not available (prior load failed)";
+        if (!loaded_) err = "libchudware.dll not available (prior load failed)";
         return loaded_;
     }
     tried_ = true;
 
 #if defined(__EMSCRIPTEN__)
-    err = "WASM: in-process libaicad not available (daemon mode only)";
+    err = "WASM: in-process libchudware not available (daemon mode only)";
     return false;
 #elif !defined(_WIN32)
-// POSIX: dlopen libaicad.so.
+// POSIX: dlopen libchudware.so.
 // Resolve order (first successful load wins — keep this deterministic so a
 // staged dist/exe-dir binary cannot silently lose to a stale LD_LIBRARY_PATH):
-//   1. $AI_CAD_LIBAICAD (or $BILLET_LIBAICAD) — explicit absolute path
-//   2. AICAD_DEFAULT_LIBAICAD (compile-time build-tree path, if set by CMake)
-//   3. libaicad.so next to the running host/hostd executable (staged install)
-//   4. bare "libaicad.so" via the dynamic loader (rpath / LD_LIBRARY_PATH)
+//   1. $CHUDWARE_LIBCHUDWARE (or $CHUDWARE_LIBCHUDWARE) — explicit absolute path
+//   2. CHUDWARE_DEFAULT_LIBCHUDWARE (compile-time build-tree path, if set by CMake)
+//   3. libchudware.so next to the running host/hostd executable (staged install)
+//   4. bare "libchudware.so" via the dynamic loader (rpath / LD_LIBRARY_PATH)
 // Note: when the GUI is in daemon mode (default), hostd is the process that
 // actually dlopens; the GUI only sees hostd's engine_build_id via hello.
 // A long-lived hostd holding a stale .so is the "builds go elsewhere" trap —
@@ -81,14 +81,14 @@ auto push_env = [&](const char* name) {
     if (const char* env = std::getenv(name); env && env[0])
         candidates.push_back(env);
 };
-push_env("BILLET_LIBAICAD");
-push_env("AI_CAD_LIBAICAD");
-#ifdef AICAD_DEFAULT_LIBAICAD
-candidates.push_back(AICAD_DEFAULT_LIBAICAD);  // build-tree fallback (set by CMake)
+push_env("CHUDWARE_LIBCHUDWARE");
+push_env("CHUDWARE_LIBCHUDWARE");
+#ifdef CHUDWARE_DEFAULT_LIBCHUDWARE
+candidates.push_back(CHUDWARE_DEFAULT_LIBCHUDWARE);  // build-tree fallback (set by CMake)
 #endif
 std::string dir = exe_dir();
-if (!dir.empty()) candidates.push_back(dir + "/libaicad.so");
-candidates.push_back("libaicad.so");  // last resort: loader search
+if (!dir.empty()) candidates.push_back(dir + "/libchudware.so");
+candidates.push_back("libchudware.so");  // last resort: loader search
 
 void* h = nullptr;
 std::string loadDiag;
@@ -100,25 +100,25 @@ for (const std::string& path : candidates) {
     loadDiag += "[" + path + " -> " + (de ? de : "?") + "] ";
 }
 if (!h) {
-    err = "could not load libaicad.so: " + loadDiag;
-    if (const char* lp = std::getenv("AI_CAD_LOG_FILE"); lp && lp[0]) {
+    err = "could not load libchudware.so: " + loadDiag;
+    if (const char* lp = std::getenv("CHUDWARE_LOG_FILE"); lp && lp[0]) {
         if (FILE* f = std::fopen(lp, "a")) {
             std::fprintf(f, "[diag] cpp_core load FAILED: %s\n", loadDiag.c_str());
             std::fclose(f);
         }
     }
-    std::fprintf(stderr, "[cpp_core] libaicad load FAILED: %s\n", loadDiag.c_str());
+    std::fprintf(stderr, "[cpp_core] libchudware load FAILED: %s\n", loadDiag.c_str());
     return false;
 }
-call_ = reinterpret_cast<int (*)(const char*, const char*, char**)>(dlsym(h, "aicad_call"));
-free_ = reinterpret_cast<void (*)(char*)>(dlsym(h, "aicad_free"));
-abi_fn_ = reinterpret_cast<const char* (*)(void)>(dlsym(h, "aicad_abi_version"));
+call_ = reinterpret_cast<int (*)(const char*, const char*, char**)>(dlsym(h, "chudware_call"));
+free_ = reinterpret_cast<void (*)(char*)>(dlsym(h, "chudware_free"));
+abi_fn_ = reinterpret_cast<const char* (*)(void)>(dlsym(h, "chudware_abi_version"));
 if (!call_ || !free_ || !abi_fn_) {
     dlclose(h);
     call_ = nullptr;
     free_ = nullptr;
     abi_fn_ = nullptr;
-    err = "libaicad.so missing an expected export";
+    err = "libchudware.so missing an expected export";
     return false;
 }
 dll_ = h;
@@ -126,15 +126,15 @@ abi_ = abi_fn_();
 path_ = winner;
 // Optional export (older engines predate it): the configure-time git-describe
 // build id, surfaced by hostd as engine_build_id for staleness checks.
-if (auto bid = reinterpret_cast<const char* (*)(void)>(dlsym(h, "aicad_build_id")))
+if (auto bid = reinterpret_cast<const char* (*)(void)>(dlsym(h, "chudware_build_id")))
     build_id_ = bid();
 // Optional streaming export (older engines predate it): resolved best-effort, no-op if absent.
 set_event_sink_ = reinterpret_cast<void (*)(void (*)(const char*, void*), void*)>(
-    dlsym(h, "aicad_set_event_sink"));
+    dlsym(h, "chudware_set_event_sink"));
 loaded_ = true;
 // One-shot startup diagnostic: which lib actually serves in-proc agent runs.
 std::fprintf(stderr,
-             "[cpp_core] loaded libaicad abi=%s build_id=%s path=%s\n",
+             "[cpp_core] loaded libchudware abi=%s build_id=%s path=%s\n",
              abi_.c_str(),
              build_id_.empty() ? "?" : build_id_.c_str(),
              path_.c_str());
@@ -147,26 +147,26 @@ return true;
         if (const char* env = std::getenv(name); env && env[0])
             candidates.push_back(widen(env));
     };
-    push_env("BILLET_LIBAICAD");
-    push_env("AI_CAD_LIBAICAD");
+    push_env("CHUDWARE_LIBCHUDWARE");
+    push_env("CHUDWARE_LIBCHUDWARE");
     std::wstring dir = exe_dir();
-    if (!dir.empty()) candidates.push_back(dir + L"\\libaicad.dll");
+    if (!dir.empty()) candidates.push_back(dir + L"\\libchudware.dll");
     // Dev-tree fallbacks: Ninja windows-occt preset, then VS multi-config OCCT build.
     // Walk up from the exe (…/host/build-win/bin → repo root) when present.
     if (!dir.empty()) {
         // host/build-win/bin → ../../../build/windows-occt/bin
         // host/build/bin/Release → ../../../../build/windows-occt/bin (rare)
         const wchar_t* rels[] = {
-            L"\\..\\..\\..\\build\\windows-occt\\bin\\libaicad.dll",
-            L"\\..\\..\\..\\..\\build\\windows-occt\\bin\\libaicad.dll",
-            L"\\..\\..\\..\\core\\build-occt\\bin\\Release\\libaicad.dll",
-            L"\\..\\..\\..\\dist\\AI-CAD\\libaicad.dll",
-            L"\\..\\..\\..\\..\\dist\\AI-CAD\\libaicad.dll",
+            L"\\..\\..\\..\\build\\windows-occt\\bin\\libchudware.dll",
+            L"\\..\\..\\..\\..\\build\\windows-occt\\bin\\libchudware.dll",
+            L"\\..\\..\\..\\core\\build-occt\\bin\\Release\\libchudware.dll",
+            L"\\..\\..\\..\\dist\\Chudware\\libchudware.dll",
+            L"\\..\\..\\..\\..\\dist\\Chudware\\libchudware.dll",
         };
         for (const wchar_t* rel : rels)
             candidates.push_back(dir + rel);
     }
-    candidates.push_back(L"libaicad.dll");  // last resort: default search order
+    candidates.push_back(L"libchudware.dll");  // last resort: default search order
 
     HMODULE h = nullptr;
     std::string loadDiag;
@@ -174,10 +174,10 @@ return true;
     for (const std::wstring& path : candidates) {
         // Resolve the DLL's directory and add it to the PROCESS search path. This is the
         // crucial bit: LOAD_WITH_ALTERED_SEARCH_PATH adds that directory only for
-        // libaicad's DIRECT imports — it does NOT cover TRANSITIVE deps (a dep loaded by
+        // libchudware's DIRECT imports — it does NOT cover TRANSITIVE deps (a dep loaded by
         // an OCCT TK*.dll or gmsh-4.15.dll). Those transitive loads use the normal process
         // search, so an OCCT-internal sibling that lives only in the build dir came back
-        // ERROR_MOD_NOT_FOUND (126) inside the host, even though libaicad itself was found.
+        // ERROR_MOD_NOT_FOUND (126) inside the host, even though libchudware itself was found.
         // SetDllDirectoryW puts the build dir on the process search path, which DOES apply
         // to the whole dependency chain.
         size_t slash = path.find_last_of(L"\\/");
@@ -191,8 +191,8 @@ return true;
     }
     SetDllDirectoryW(nullptr);  // restore the default search path
     if (!h) {
-        err = "could not load libaicad.dll: " + loadDiag;
-        if (const char* lp = std::getenv("AI_CAD_LOG_FILE"); lp && lp[0]) {
+        err = "could not load libchudware.dll: " + loadDiag;
+        if (const char* lp = std::getenv("CHUDWARE_LOG_FILE"); lp && lp[0]) {
             if (FILE* f = std::fopen(lp, "a")) {
                 std::fprintf(f, "[diag] cpp_core load FAILED: %s\n", loadDiag.c_str());
                 std::fclose(f);
@@ -202,15 +202,15 @@ return true;
     }
 
     call_ = reinterpret_cast<int (*)(const char*, const char*, char**)>(
-        GetProcAddress(h, "aicad_call"));
-    free_ = reinterpret_cast<void (*)(char*)>(GetProcAddress(h, "aicad_free"));
-    abi_fn_ = reinterpret_cast<const char* (*)(void)>(GetProcAddress(h, "aicad_abi_version"));
+        GetProcAddress(h, "chudware_call"));
+    free_ = reinterpret_cast<void (*)(char*)>(GetProcAddress(h, "chudware_free"));
+    abi_fn_ = reinterpret_cast<const char* (*)(void)>(GetProcAddress(h, "chudware_abi_version"));
     if (!call_ || !free_ || !abi_fn_) {
         FreeLibrary(h);
         call_ = nullptr;
         free_ = nullptr;
         abi_fn_ = nullptr;
-        err = "libaicad.dll missing an expected export";
+        err = "libchudware.dll missing an expected export";
         return false;
     }
     dll_ = h;
@@ -225,11 +225,11 @@ return true;
     }
     // Optional export (older engines predate it) — see the POSIX branch.
     if (auto bid = reinterpret_cast<const char* (*)(void)>(
-            GetProcAddress(h, "aicad_build_id")))
+            GetProcAddress(h, "chudware_build_id")))
         build_id_ = bid();
     // Optional streaming export (older engines predate it): resolved best-effort.
     set_event_sink_ = reinterpret_cast<void (*)(void (*)(const char*, void*), void*)>(
-        GetProcAddress(h, "aicad_set_event_sink"));
+        GetProcAddress(h, "chudware_set_event_sink"));
     loaded_ = true;
     return true;
 #endif
@@ -257,7 +257,7 @@ bool CppCore::call(const std::string& method, const nlohmann::json& params,
     if (rc != 0) {
         err = result.contains("error") && result["error"].is_string()
                   ? result["error"].get<std::string>()
-                  : ("aicad_call returned " + std::to_string(rc));
+                  : ("chudware_call returned " + std::to_string(rc));
         return false;
     }
     return true;

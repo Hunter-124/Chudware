@@ -372,7 +372,7 @@ def test_live_force_inject_turn_hits_add_power(tmp_path, monkeypatch):
     from services.agent.ledger import Ledger
     from services.agent import agent_turn as at
 
-    monkeypatch.setenv("AICAD_CACHE_ROOT", str(tmp_path))
+    monkeypatch.setenv("CHUDWARE_CACHE_ROOT", str(tmp_path))
     ledger = Ledger("mega18_z2r", path=tmp_path / "ledger.json")
     seq = {"n": 0}
     refs = {"n": 0}

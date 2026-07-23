@@ -35,7 +35,7 @@ def reveng_dir(tmp_path, monkeypatch):
     """Redirect RE session storage to a temp directory."""
     d = tmp_path / "reveng"
     d.mkdir()
-    monkeypatch.setenv("AICAD_REVENG_DIR", str(d))
+    monkeypatch.setenv("CHUDWARE_REVENG_DIR", str(d))
     return d
 
 
@@ -293,7 +293,7 @@ class TestRevengPartsRoundtrip:
         assert re_record is not None, "RevengResultAdapter has no record — attach may have failed"
 
         if not cb.available():
-            _pytest.skip("native core (libaicad) not available in this environment")
+            _pytest.skip("native core (libchudware) not available in this environment")
         result = cb.call("part_place", {"part_id": PART_ID, "record": re_record})
 
         assert result["ok"] is True, f"part_place failed: {result}"

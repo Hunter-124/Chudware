@@ -1,7 +1,7 @@
 {
   "_schema": "aicad.feeds_speeds/1",
   "_note": "Conservative first-pass machining envelope data. Values are clean-room first-party compilation from public machining references — nominal ranges a user is expected to tune. Material IDs match engine_oracle/sim/materials.json and engine_oracle/materials/registry.json. Cutting-group IDs (cam_id) map to core/cam/feeds.cpp CuttingDB entries.",
-  "_citation": "Machinery's Handbook 31st ed. (Industrial Press); consistent with in-repo core/cam/feeds.cpp CuttingDB builtin table (first-party, AI-CAD project).",
+  "_citation": "Machinery's Handbook 31st ed. (Industrial Press); consistent with in-repo core/cam/feeds.cpp CuttingDB builtin table (first-party, Chudware project).",
   "_license": "first-party compilation — see contracts/license_debt.md",
   "_oss_survey": "Surveyed 2026-07-04: FSWizard (proprietary), HSMAdvisor (proprietary), OpenCAMLib (LGPL, no feeds/speeds data), FreeCAD Path module (LGPL, no bundled data tables). No permissively-licensed open dataset found. Values seeded from Machinery's Handbook public ranges and anchored to core/cam/feeds.cpp CuttingDB which is already in-repo first-party.",
 

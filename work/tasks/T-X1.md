@@ -39,7 +39,7 @@ and workstream W's branches are out of scope for this workstream — do not touc
     content/response for an adapter to parse. Both are the only two entry points
     adapters (T-X2+) call — no direct Playwright use outside this module.
   - `profiles.py` — profile directory layout under the app data dir (mirror the
-    existing `%APPDATA%/AI-CAD/` / `~/.local/share/AI-CAD/` convention used by
+    existing `%APPDATA%/Chudware/` / `~/.local/share/Chudware/` convention used by
     `engine_oracle/vendor_parts.py` config), one persistent-context dir per site,
     metadata sidecar (`{site, created_ts, last_used_ts, last_login_ts}` — never
     credentials/cookie values in metadata, those live only inside Playwright's own
@@ -83,7 +83,7 @@ and workstream W's branches are out of scope for this workstream — do not touc
    crash any MCP server startup — lazy-import inside the functions, `ok:false`
    with a clear "playwright not installed" hint otherwise.
 7. Tests with mocked Playwright objects (monkeypatch `sync_playwright`), run via
-   `~/.local/share/AI-CAD/mcp-venv/bin/python -m pytest services/browser/`.
+   `~/.local/share/Chudware/mcp-venv/bin/python -m pytest services/browser/`.
 
 ## Definition of done
 

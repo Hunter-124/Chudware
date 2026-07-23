@@ -3,7 +3,7 @@ Dimension params are objects: {"value": <num>, "expr": null}. A later op refers 
 created earlier IN THE SAME ARRAY as "$<index>" (0-based op position); refer to existing tree
 features by their id (e.g. "f1").
 
-NATIVE FORMAT — AI-CAD's native, editable file is .step+. It stores the WHOLE parametric feature
+NATIVE FORMAT — Chudware's native, editable file is .step+. It stores the WHOLE parametric feature
 tree plus its simulation studies (and any 2D drawings) in one container the app reopens fully
 editable. Save deliverables as .step+ so the user keeps an editable part; a plain STEP/STL is a
 flattened export (geometry only — no feature history, no studies).

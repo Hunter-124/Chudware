@@ -2,7 +2,7 @@
 
 #include <map>
 
-namespace aicad::firmware {
+namespace chudware::firmware {
 namespace {
 
 nlohmann::json rail(const char* name, nlohmann::json vmin, nlohmann::json vnom,
@@ -105,4 +105,4 @@ std::vector<nlohmann::json> eng_supply_rails(const nlohmann::json& fp) {
     return {};
 }
 
-}  // namespace aicad::firmware
+}  // namespace chudware::firmware

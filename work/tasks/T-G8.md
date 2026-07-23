@@ -34,7 +34,7 @@ anti-spaghetti guarantee that behavior survived the port.
    split IS the modularity payoff, don't port it as one file.
 3. Build the diff harnesses (G-code, netlist JSON, DXF/PDF, study JSON) and run them
    against the same jobs on both binaries.
-4. G4 gate: all domain diffs green + `AI_CAD_SHOT=asm` screenshot.
+4. G4 gate: all domain diffs green + `CHUDWARE_SHOT=asm` screenshot.
 
 ## Definition of done
 
@@ -48,7 +48,7 @@ anti-spaghetti guarantee that behavior survived the port.
 - Port from current host/src: sketch DOF pill is top-center, accept/deny lives in the
   Sketch ribbon tab (`sketch_exit`/`sketch_cancel`), overlays dodge columns via
   `overlayColumnEdge(0/1)`.
-- `AI_CAD_SHOT=flow` needs a ~240s timeout.
+- `CHUDWARE_SHOT=flow` needs a ~240s timeout.
 
 ## Orchestration plan + state (opus-sky, 2026-07-02)
 
@@ -71,16 +71,16 @@ study JSON) compare the NEW panel's engine-driven output against the HOST binary
 post/ECAD netlist/etc. computation lives in the ENGINE (`cam_*`/`ecad_*`/sim worker RPCs),
 not the panel, so a faithful panel port that drives the identical engine calls should diff
 clean. Building those diff harnesses (run same job on both binaries, compare artifacts) is
-integrator infra — treat as a distinct sub-deliverable. Shot verification (`AI_CAD_SHOT=cam/
+integrator infra — treat as a distinct sub-deliverable. Shot verification (`CHUDWARE_SHOT=cam/
 ecad/drawing/fea/flow/sketch/asm`) now works headless thanks to T-G13 (issue #7 fix); real
-captures need `AI_CAD_PYTHON`/venv provisioned.
+captures need `CHUDWARE_PYTHON`/venv provisioned.
 
 ### Progress
 
 - **H1 CAM — DONE (commit e158e31).** Ported `ui/imgui/src/ui/cam/{cam_panel,cam_mirror}`
   (718 LOC) following the `preview_pane` body-only convention; RPCs byte-identical to host.
   Dispatch site: `application.cpp` `Begin("CAM")/drawCamManager(s)` after the Viewport block
-  (the "CAM" dock window was pre-registered in `layout.cpp:52`). Build green; `AI_CAD_SHOT=cam`
+  (the "CAM" dock window was pre-registered in `layout.cpp:52`). Build green; `CHUDWARE_SHOT=cam`
   captures exit 0. GAP: no Manufacture/CAM `Workspace` enum value exists, so the cam scenario
   shows the Model viewport, not the CAM panel — surfacing it needs a CAM workspace (ribbon +
   command_registry, outside cam/**) or a persistent focus mechanism. Backplot-over-viewport
@@ -134,20 +134,20 @@ GLOB_RECURSEs `src/*.cpp` — no CMakeLists edit needed for new files.
 1. **H5 sketch — ALREADY PORTED (earlier waves; H5 "spans waves 2-4").**
    `ui/imgui/src/ui/sketch/` is already 8,631 LOC across the modular split
    (sketch_mode/tools/constraints/edit/overlay/internal/seam/palette + airfoil) — the split
-   payoff is DONE. `AI_CAD_SHOT=sketch` already renders (Sketch ribbon + "Fully Defined" + real
+   payoff is DONE. `CHUDWARE_SHOT=sketch` already renders (Sketch ribbon + "Fully Defined" + real
    geometry — verified during T-G13). Remaining H5 DoD is only the **solver op-batch diff vs
-   host** (a harness, item 2), NOT more porting. Confirm `AI_CAD_SHOT=asm` too.
-2. **Diff harnesses** (integrator infra, `tools/`): run the SAME job on host AI-CAD + new AI-CAD2
+   host** (a harness, item 2), NOT more porting. Confirm `CHUDWARE_SHOT=asm` too.
+2. **Diff harnesses** (integrator infra, `tools/`): run the SAME job on host Chudware + new AI-CAD2
    and byte/JSON-diff artifacts — G-code across 8 post dialects, netlist JSON + ERC, DXF/PDF
    export, study JSON. Since the compute is engine-side and RPCs were kept byte-identical, these
    should diff clean; the harness proves it.
 3. **CAM/ECAD surfacing fix** (see central follow-up above).
-4. **G4 gate**: `bash scripts/gate.sh` green + all domain diffs + `AI_CAD_SHOT=asm`.
+4. **G4 gate**: `bash scripts/gate.sh` green + all domain diffs + `CHUDWARE_SHOT=asm`.
 
-Verify offscreen via `xvfb-run -a`, worker present (`AI_CAD_PYTHON=$(command -v python3)`);
-flow needs ~240s, fea >120s. Prebuilt libaicad: `/home/hunter/Repositories/CAD/core/build-occt-linux/bin/libaicad.so`.
+Verify offscreen via `xvfb-run -a`, worker present (`CHUDWARE_PYTHON=$(command -v python3)`);
+flow needs ~240s, fea >120s. Prebuilt libchudware: `/home/hunter/Repositories/CAD/core/build-occt-linux/bin/libchudware.so`.
 
 ## Progress log
 - 2026-07-02 23:54 UTC [opus-sky] WIP branch pushed. Done: H1 CAM (e158e31), H3 drawing (17a7844) — both build green, shots verified via the merged T-G13 fix. H2 ECAD in progress. Remaining: H4 sim, H5 sketch-split, diff harnesses (G-code/netlist/DXF/study), G4 gate. Orchestration plan + per-node handoff in the task file. Flagged a probable engine doc-id-resolution bug (scenario doc2 stays empty) to Fable.
 - 2026-07-03 01:00 UTC [opus-sky] CHECKPOINT (branch pushed @9940535). PORTS DONE: H1 CAM (e158e31), H2 ECAD (565eb96), H3 drawing (17a7844), H4 sim (dbd79fa) — all build green + shot-verified offscreen via the merged T-G13 fix. H5 sketch was ALREADY ported in earlier waves (8.6k LOC modular split present; sketch+asm shots render). So all 5 subsystems' panels exist. Drawing + sim surface perfectly (workspace content-swap); CAM + ECAD render+execute but aren't forward in headless shots — tab-bar-hidden central dock node; I tried SetNextWindowFocus AND SelectedTabId, both fail (documented in task file), fix = restructure CAM/ECAD to content-swap inside Viewport like drawing/sim. REMAINING (fresh-session scope): (1) CAM/ECAD content-swap surfacing, (2) the DoD diff harnesses (G-code 8 posts / netlist+ERC / DXF+PDF / study JSON / sketch solver op-batch — engine RPCs kept byte-identical so should diff clean), (3) G4 gate. Full plan + per-node handoff in work/tasks/T-G8.md. NOT review-ready yet (DoD diffs+gate outstanding); keeping owned. Also flagged a probable engine doc-id-resolution bug (scenario doc2 stays empty) to Fable earlier.
-- 2026-07-03 [sonnet-gable] FINISHER NOTE (branch task/T-G8-finish). Crediting sky's full port work (H1-H4 commits e158e31/565eb96/17a7844/dbd79fa; H5 was pre-existing). This session completed: (1) CAM/ECAD content-swap fix (commits 92196dd + a95caad): moved drawCamManager()/drawEcadEditor() inside drawViewport() as workspace/flag-gated early returns, matching the H3/H4 pattern. ECAD gates on effectiveWorkspace()==Schematic||Board; CAM gates on st.camActive (new bool in AppState), set by camHandleCommand()/camLoadJob()/scenario, cleared on workspace-chip click and file open. application.cpp Begin("CAM")/Begin("ECAD") are now no-draw stubs to prevent double-submit. (2) G4 shot battery: full 14-scenario battery run twice — worker-absent (all exit 0) and worker+engine-present (AI_CAD_PYTHON + AI_CAD_LIBAICAD). Engine-present eyeball results: cam=PASS (CAM panel forward, job tree visible, `cam-shot: ok=1`, "No setups" expected — camLoadJob auto-wire deferred from sky); ecad=PASS (Schematic workspace, AI-ECAD launchpad forward; ecad_orchestrate unknown method is engine-side pre-existing); drawing=PASS (Drafting ribbon, sheet area); sketch=PASS (real box geometry + Fully Defined); asm=PASS; m1=PASS (filleted box); fea=PASS (`ok=1 frames=5401`, real FEA solve); flow=PASS; evalmass/glassperf/multidoc/activity/wantTree/parts_browser all exit 0. (3) gate.sh: RESULT PASS — core build/ctest PASS, ui/abstract PASS, ui/imgui build+shot+selftest PASS, pytest/tools PASS 239; check.py + ui_style_check + pytest suites are FAIL-RECORDED pre-existing. (4) graphify update: 28117 nodes, 57812 edges. OUTSTANDING (DoD not closed by this session — finisher scope): G-code 8-dialect byte-diff harness, netlist+ERC diff, DXF/PDF export diff, study JSON diff, sketch solver op-batch diff. Engine RPCs are byte-identical to host so these should diff clean; the harness infra in tools/ remains unbuilt.
+- 2026-07-03 [sonnet-gable] FINISHER NOTE (branch task/T-G8-finish). Crediting sky's full port work (H1-H4 commits e158e31/565eb96/17a7844/dbd79fa; H5 was pre-existing). This session completed: (1) CAM/ECAD content-swap fix (commits 92196dd + a95caad): moved drawCamManager()/drawEcadEditor() inside drawViewport() as workspace/flag-gated early returns, matching the H3/H4 pattern. ECAD gates on effectiveWorkspace()==Schematic||Board; CAM gates on st.camActive (new bool in AppState), set by camHandleCommand()/camLoadJob()/scenario, cleared on workspace-chip click and file open. application.cpp Begin("CAM")/Begin("ECAD") are now no-draw stubs to prevent double-submit. (2) G4 shot battery: full 14-scenario battery run twice — worker-absent (all exit 0) and worker+engine-present (CHUDWARE_PYTHON + CHUDWARE_LIBCHUDWARE). Engine-present eyeball results: cam=PASS (CAM panel forward, job tree visible, `cam-shot: ok=1`, "No setups" expected — camLoadJob auto-wire deferred from sky); ecad=PASS (Schematic workspace, AI-ECAD launchpad forward; ecad_orchestrate unknown method is engine-side pre-existing); drawing=PASS (Drafting ribbon, sheet area); sketch=PASS (real box geometry + Fully Defined); asm=PASS; m1=PASS (filleted box); fea=PASS (`ok=1 frames=5401`, real FEA solve); flow=PASS; evalmass/glassperf/multidoc/activity/wantTree/parts_browser all exit 0. (3) gate.sh: RESULT PASS — core build/ctest PASS, ui/abstract PASS, ui/imgui build+shot+selftest PASS, pytest/tools PASS 239; check.py + ui_style_check + pytest suites are FAIL-RECORDED pre-existing. (4) graphify update: 28117 nodes, 57812 edges. OUTSTANDING (DoD not closed by this session — finisher scope): G-code 8-dialect byte-diff harness, netlist+ERC diff, DXF/PDF export diff, study JSON diff, sketch solver op-batch diff. Engine RPCs are byte-identical to host so these should diff clean; the harness infra in tools/ remains unbuilt.

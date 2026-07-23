@@ -3,7 +3,7 @@
 
 This is the Python worker that survives the engine_oracle/ deletion: every ENGINE method
 (doc/sketch/sim/ecad/cam/sourcing/hydraulic/piping/structural/firmware/parts-placement)
-runs in the C++ core (libaicad) and is routed there by services/worker/worker_client.cpp;
+runs in the C++ core (libchudware) and is routed there by services/worker/worker_client.cpp;
 what remains here are the services-side orchestration surfaces that legitimately stay
 Python:
 

@@ -3,7 +3,7 @@
 Same design contract as ``piping_tools`` (project owner: "the AI is extremely limited; its tools
 must do the bookkeeping and return rich, actionable context"). Each tool returns a JSON string
 ``{ok, ...result, warnings:[], hint:"...", next_actions:[...]}`` produced by the C++ core
-(T-RF19/T-RF20: the tool envelopes are owned by ``core/hydraulic`` behind the libaicad RPCs
+(T-RF19/T-RF20: the tool envelopes are owned by ``core/hydraulic`` behind the libchudware RPCs
 ``hydraulic_*`` — reached via :mod:`services.mcp.core_bridge`); the MCP layer keeps only input
 parsing and its tiny session state so tools can reuse the last active circuit document.
 

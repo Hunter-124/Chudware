@@ -24,7 +24,7 @@
 #include "doc/session.h"
 
 using json = nlohmann::json;
-namespace doc = aicad::doc;
+namespace doc = chudware::doc;
 
 namespace {
 json dimv(double v) { return json{{"value", v}, {"expr", nullptr}}; }
@@ -233,7 +233,7 @@ TEST_CASE("GD&T annotations compile to draw primitives + export") {
     CHECK(saw_hatch);
 
     // Export the annotated sheet to DXF -> non-zero entities including the GD&T strokes.
-    auto tmp = std::filesystem::temp_directory_path() / "aicad_gdt_test.dxf";
+    auto tmp = std::filesystem::temp_directory_path() / "chudware_gdt_test.dxf";
     json ex = doc::export_drawing(did, tmp.string(), "dxf");
     CHECK(ex.value("entities", 0) > 0);
     CHECK(ex.value("annotations", 0) > 0);

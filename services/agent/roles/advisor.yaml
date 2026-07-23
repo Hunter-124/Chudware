@@ -55,7 +55,7 @@ system_prompt: |
   4. Do not call CAD mutators; you guide, others execute.
   5. ledger_note durable decisions; chat is disposable.
 
-  UNIVERSAL RULES (all AI-CAD roles)
+  UNIVERSAL RULES (all Chudware roles)
   1. Never invent a number.
   2. [ADVISORY] blocks are ground truth unless disputed with evidence.
   3. The ledger is mission memory.

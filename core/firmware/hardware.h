@@ -10,7 +10,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad::firmware {
+namespace chudware::firmware {
 
 // Outcome of a flash/debug operation (mirrors hardware.FlashResult).
 struct FlashResult {
@@ -130,7 +130,7 @@ FlashResult renode_run(const std::string& resc_path, double run_s = 2.0, int gdb
 // Raw termios (POSIX 8N1, non-canonical, non-blocking reads) — no pyserial/serialport-rs
 // dependency added to the C++ core, per the landscape dossier's "minimal robust path" note
 // for the serial transport layer. Handles are process-local (an in-core registry in
-// hardware.cpp), valid for the lifetime of the hosting process (aicad-hostd). Non-POSIX
+// hardware.cpp), valid for the lifetime of the hosting process (chudware-hostd). Non-POSIX
 // builds: serial_open always fails with `err = "unsupported_platform: ..."`.
 
 // Opens `port` at `baud` (8N1). Returns a handle id >= 0 on success, or -1 with `err` set.
@@ -144,4 +144,4 @@ size_t serial_write(int handle, const std::string& data);
 // Closes and releases `handle`. Returns false (no-op) if already closed/unknown.
 bool serial_close(int handle);
 
-}  // namespace aicad::firmware
+}  // namespace chudware::firmware

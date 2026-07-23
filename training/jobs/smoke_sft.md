@@ -5,7 +5,7 @@ dataset_hash: corpus/IP-13/v1
 recipe: training/recipes/sft_lora.yaml
 base_model: Qwen/Qwen3-4B
 adapter_out: training/adapters/smoke-sft-001
-eval_bench: aicad_basic
+eval_bench: chudware_basic
 requires_os: any
 requires_vram_gb: 8
 requires_cuda: true
@@ -22,7 +22,7 @@ dataset pull → LoRA fine-tune → adapter push → MLflow run logged.
 - **Recipe:** `training/recipes/sft_lora.yaml` — 50 steps, batch 1, grad accum 4
 - **Dataset:** `corpus/IP-13/v1` — small IP-13 export (placeholder; swap for real shard)
 - **Adapter out:** `training/adapters/smoke-sft-001/`
-- **Eval:** `aicad_basic` benchmark (basic CAD prompt correctness)
+- **Eval:** `chudware_basic` benchmark (basic CAD prompt correctness)
 - **VRAM:** 8 GB minimum (4-bit quant via Unsloth)
 
 ### Definition of done for this job

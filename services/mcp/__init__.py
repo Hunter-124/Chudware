@@ -1,4 +1,4 @@
-"""AI-CAD MCP server package (named mcp_server to avoid shadowing the `mcp` SDK).
+"""Chudware MCP server package (named mcp_server to avoid shadowing the `mcp` SDK).
 
 ``mcp_server`` is a filesystem symlink to ``services/mcp``, but Python keys modules by
 import name — without the alias below both packages (and every submodule) load twice

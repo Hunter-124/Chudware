@@ -1,5 +1,5 @@
 // cef/cef_headless.cpp — see cef_headless.h. CEF-native replacement for the
-// Playwright headless fetch/download. Compiled only with AI_CAD_ENABLE_CEF.
+// Playwright headless fetch/download. Compiled only with CHUDWARE_ENABLE_CEF.
 #include "cef_headless.h"
 
 #include <chrono>

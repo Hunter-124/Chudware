@@ -733,7 +733,7 @@
           "run_id": "flanged_bushing_design_20231005"
         },
         "ok": true,
-        "result": "{\n  \"ok\": false,\n  \"reason\": \"Build graph run 'flanged_bushing_design_20231005' not found\",\n  \"hint\": \"Check run_id (from buildgraph_plan) and runs_dir (default: /home/hunter/.local/share/AI-CAD/runs).\"\n}"
+        "result": "{\n  \"ok\": false,\n  \"reason\": \"Build graph run 'flanged_bushing_design_20231005' not found\",\n  \"hint\": \"Check run_id (from buildgraph_plan) and runs_dir (default: /home/hunter/.local/share/Chudware/runs).\"\n}"
       }
     },
     {
@@ -957,7 +957,7 @@
           }
         },
         "ok": true,
-        "result": "{\n  \"ok\": true,\n  \"run_id\": \"5c378306-a27f-45ce-82eb-760f9132a058\",\n  \"graph\": {\n    \"schema\": \"aicad.buildgraph/1\",\n    \"mission\": \"\",\n    \"nodes\": [\n      {\n        \"id\": \"bg_62619258\",\n        \"kind\": \"part\",\n        \"label\": \"unknown_part\",\n        \"doc_id\": \"\",\n        \"refs\": {\n          \"features\": [],\n          \"parts\": []\n        },\n        \"requires\": [],\n        \"why\": \"part root for 'unknown_part'\",\n        \"status\": \"pending\",\n        \"assigned\": null\n      },\n      {\n        \"id\": \"bg_05509187\",\n        \"kind\": \"checkpoint\",\n        \"label\": \"unknown_part_done\",\n        \"doc_id\": \"\",\n        \"refs\": {\n          \"features\": [],\n          \"parts\": [\n            \"unknown_part\"\n          ]\n        },\n        \"requires\": [\n          \"bg_62619258\"\n        ],\n        \"why\": \"PLM checkpoint: all features of 'unknown_part' complete\",\n        \"status\": \"pending\",\n        \"assigned\": null\n      }\n    ]\n  },\n  \"advisories\": [],\n  \"sidecar_path\": \"/home/hunter/.local/share/AI-CAD/runs…"
+        "result": "{\n  \"ok\": true,\n  \"run_id\": \"5c378306-a27f-45ce-82eb-760f9132a058\",\n  \"graph\": {\n    \"schema\": \"aicad.buildgraph/1\",\n    \"mission\": \"\",\n    \"nodes\": [\n      {\n        \"id\": \"bg_62619258\",\n        \"kind\": \"part\",\n        \"label\": \"unknown_part\",\n        \"doc_id\": \"\",\n        \"refs\": {\n          \"features\": [],\n          \"parts\": []\n        },\n        \"requires\": [],\n        \"why\": \"part root for 'unknown_part'\",\n        \"status\": \"pending\",\n        \"assigned\": null\n      },\n      {\n        \"id\": \"bg_05509187\",\n        \"kind\": \"checkpoint\",\n        \"label\": \"unknown_part_done\",\n        \"doc_id\": \"\",\n        \"refs\": {\n          \"features\": [],\n          \"parts\": [\n            \"unknown_part\"\n          ]\n        },\n        \"requires\": [\n          \"bg_62619258\"\n        ],\n        \"why\": \"PLM checkpoint: all features of 'unknown_part' complete\",\n        \"status\": \"pending\",\n        \"assigned\": null\n      }\n    ]\n  },\n  \"advisories\": [],\n  \"sidecar_path\": \"/home/hunter/.local/share/Chudware/runs…"
       }
     },
     {

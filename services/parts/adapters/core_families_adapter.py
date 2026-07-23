@@ -4,9 +4,9 @@ Wraps the `parts_catalog_list` core RPC (same call as the `list_standard_parts`
 MCP tool in cad_tools.py). Domain = 'mech_family'.
 
 No core dependency at import time — the adapter degrades gracefully (returns zero
-records) when the native libaicad.so is absent (offline / CI without AI_CAD_LIBAICAD).
+records) when the native libchudware.so is absent (offline / CI without CHUDWARE_LIBCHUDWARE).
 
-Provenance / license: core/parts parametric families; proprietary AI-CAD catalog.
+Provenance / license: core/parts parametric families; proprietary Chudware catalog.
 """
 from __future__ import annotations
 
@@ -130,6 +130,6 @@ def _make_record(family: str, size: str, description: str) -> dict:
             "size":   size,
         },
         "sourcing":     [],
-        "provenance":   "AI-CAD core/parts parametric catalog; proprietary.",
+        "provenance":   "Chudware core/parts parametric catalog; proprietary.",
         "license":      "proprietary",
     }

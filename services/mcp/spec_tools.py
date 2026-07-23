@@ -1,6 +1,6 @@
 """Spec-sheet matching MCP tools (deterministic BOLTS/KiCad lookup, workstream B / T-B4).
 
-Thin MCP adapter over the C++ core (libaicad ``match_part_number`` / ``spec_sheet_match`` /
+Thin MCP adapter over the C++ core (libchudware ``match_part_number`` / ``spec_sheet_match`` /
 ``list_spec_templates`` RPCs via :mod:`services.mcp.core_bridge`, T-RF18). ``match_part_number``
 takes a purchased manufacturer/vendor part number, strips vendor packaging suffixes, and resolves
 it against the clean-room ISO/DIN standard-part tables (fasteners, bearings) — falling back to the
@@ -27,7 +27,7 @@ def register_spec_tools(mcp: FastMCP) -> None:
         Strips vendor/packaging suffixes (e.g. `M3x8-ND` → `M3x8`, `608-2RS-CT-ND` → `608-2RS`),
         then looks the designation up deterministically: clean-room ISO/DIN fastener + bearing
         tables first (BOLTS-format, bundled), then the user's own installed KiCad symbol libraries
-        (via AICAD_KICAD_SYM_PATH; KiCad's official libs are never vendored). On a hit it also
+        (via CHUDWARE_KICAD_SYM_PATH; KiCad's official libs are never vendored). On a hit it also
         builds real EDITABLE geometry from the `core/parts` catalog and returns the saved
         `model_path`. Returns {ok, matched, source ("bolts"|"kicad"|null), normalized, catalog_id,
         params, model_path, family, size, length_mm}. A part that cannot be matched comes back

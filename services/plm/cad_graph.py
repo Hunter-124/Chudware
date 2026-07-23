@@ -22,7 +22,7 @@ Walk policy
   double-counted; nested vault *working trees* (the real CAD files beside the
   shadow dir) are still walked — they are live design content.
 * Archive/stale dirs (``_archive_stale``, ``_archive``, ``archive``, ``.trash``
-  by default; override via ``exclude_dirs`` / ``AICAD_GRAPH_EXCLUDE_DIRS``) are
+  by default; override via ``exclude_dirs`` / ``CHUDWARE_GRAPH_EXCLUDE_DIRS``) are
   pruned from the walk so ME489-scale trees don't bloat the graph. Pass
   ``include_archive=True`` to keep them (nodes then carry ``meta.archive``).
 
@@ -84,7 +84,7 @@ _SYSTEM_SKIP_DIRS = frozenset({
 
 # Archive/stale dir basenames excluded by default (case-sensitive match on the
 # directory name as it appears on disk). Overridable via exclude_dirs kwarg or
-# AICAD_GRAPH_EXCLUDE_DIRS (os.pathsep-separated).
+# CHUDWARE_GRAPH_EXCLUDE_DIRS (os.pathsep-separated).
 DEFAULT_ARCHIVE_DIR_NAMES = frozenset({
     "_archive_stale", "_archive", "archive", ".trash",
 })
@@ -117,7 +117,7 @@ def _archive_dir_names(
     """Resolve the archive/stale dir-name set (defaults + env override)."""
     if exclude_dirs is not None:
         return frozenset(str(d) for d in exclude_dirs if d)
-    env = os.environ.get("AICAD_GRAPH_EXCLUDE_DIRS", "").strip()
+    env = os.environ.get("CHUDWARE_GRAPH_EXCLUDE_DIRS", "").strip()
     if env:
         parts = [p for p in env.split(os.pathsep) if p]
         if parts:
@@ -180,7 +180,7 @@ def build_graph(
         When True, keep them; nodes under those dirs get ``meta.archive=True``.
     exclude_dirs
         Optional override for archive dir basenames (defaults:
-        :data:`DEFAULT_ARCHIVE_DIR_NAMES` / ``AICAD_GRAPH_EXCLUDE_DIRS``).
+        :data:`DEFAULT_ARCHIVE_DIR_NAMES` / ``CHUDWARE_GRAPH_EXCLUDE_DIRS``).
     """
     root = Path(project_dir).resolve() if project_dir else None
     archive_names = _archive_dir_names(exclude_dirs)

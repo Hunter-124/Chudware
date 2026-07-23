@@ -22,7 +22,7 @@
 #else
 #  include <process.h>
 #endif
-namespace aicad::sim::cache {
+namespace chudware::sim::cache {
 
 using nlohmann::json;
 namespace fs = std::filesystem;
@@ -30,7 +30,7 @@ namespace fs = std::filesystem;
 namespace {
 
 constexpr const char* kBlobMagic = "AICRES1";
-constexpr const char* kCacheSchema = "aicad-simcache/1";
+constexpr const char* kCacheSchema = "chudware-simcache/1";
 constexpr size_t kMemCapEntries = 64;
 
 // ── FNV-1a (same constants as stepplus_doc_hash) ────────────────────────────
@@ -107,7 +107,7 @@ void touch_lru(MemStore& s, const std::string& key) {
     }
 }
 
-bool low_mem() { return aicad::governor::low_memory_now(); }
+bool low_mem() { return chudware::governor::low_memory_now(); }
 
 // STEP content fingerprint (path string when unreadable — still deterministic).
 std::string step_content_fingerprint(const std::string& path) {
@@ -329,15 +329,15 @@ std::string sidecar_dir() {
         std::lock_guard<std::mutex> lk(st.mtx);
         if (!st.sidecar.empty()) return st.sidecar;
     }
-    if (const char* env = std::getenv("AICAD_SIM_CACHE_DIR")) {
+    if (const char* env = std::getenv("CHUDWARE_SIM_CACHE_DIR")) {
         if (env[0]) return std::string(env);
     }
-    // Process-private temp: $TMPDIR/aicad-sim-cache-<pid>
+    // Process-private temp: $TMPDIR/chudware-sim-cache-<pid>
     fs::path base;
     if (const char* t = std::getenv("TMPDIR")) base = t;
     else if (const char* t = std::getenv("TEMP")) base = t;
     else base = "/tmp";
-    return (base / ("aicad-sim-cache-" + std::to_string(static_cast<long long>(
+    return (base / ("chudware-sim-cache-" + std::to_string(static_cast<long long>(
 #if defined(_WIN32)
                                             _getpid()
 #else
@@ -445,4 +445,4 @@ bool get_study_result(const std::map<std::string, std::string>& extra,
     return decode_result_blob(it->second, kind_out, input_hash_out, result_out);
 }
 
-}  // namespace aicad::sim::cache
+}  // namespace chudware::sim::cache

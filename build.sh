@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # ===========================================================================
-#  Billet build script (Linux) — thin wrapper around CMake/Ninja.
+#  Chudware build script (Linux) — thin wrapper around CMake/Ninja.
 # ---------------------------------------------------------------------------
-#  Builds the native CMake/Ninja projects that make up Billet (formerly AI-CAD):
-#    core -> the C++ OCCT kernel (libaicad.so)
-#    app  -> Billet host GUI (cmake -S host -B host/build-linux + ninja Billet)
+#  Builds the native CMake/Ninja projects that make up Chudware (formerly Chudware):
+#    core -> the C++ OCCT kernel (libchudware.so)
+#    app  -> Chudware host GUI (cmake -S host -B host/build-linux + ninja Chudware)
 #
 #  The ui/imgui / ui/abstract (AI-CAD2) app is retired. host/ is the single
 #  cross-platform GUI target (builds on Linux with GCC/Clang + on Windows with
-#  MSVC). Binary: host/build-linux/bin/chudware (plus AI-CAD and Billet compat symlinks)
+#  MSVC). Binary: host/build-linux/bin/chudware (plus Chudware and Chudware compat symlinks)
 #
 #  Usage:
 #    ./build.sh            Default: build the host GUI.
@@ -16,10 +16,10 @@
 #    ./build.sh core       Only the C++ kernel (linux-core preset).
 #    ./build.sh all        core, then host GUI.
 #    ./build.sh wasm       Emscripten WASM host (full app); stages to
-#                          ~/billet-web/app/. Requires emsdk (~/.emsdk).
-#    ./build.sh stage      Deploy the built engine (libaicad.so + Netgen/lib3mf
-#                          sibling .so files) AND the aicad-hostd daemon from
-#                          core/build-occt-linux/bin into services/dist/AI-CAD/
+#                          ~/chudware-web/app/. Requires emsdk (~/.emsdk).
+#    ./build.sh stage      Deploy the built engine (libchudware.so + Netgen/lib3mf
+#                          sibling .so files) AND the chudware-hostd daemon from
+#                          core/build-occt-linux/bin into services/dist/Chudware/
 #                          — the dist dir core_bridge/daemon_bridge resolve
 #                          first. This replaces the old doc'd manual cp+mv;
 #                          both binaries MUST come from the same build tree or
@@ -27,8 +27,8 @@
 #    ./build.sh clean      Wipe host/build-linux (core kept — OCCT is expensive
 #                          to reconfigure), then run the default build.
 #
-#  Close any running Billet / MCP server first if a link step reports the output
-#  is busy (both hold libaicad.so).
+#  Close any running Chudware / MCP server first if a link step reports the output
+#  is busy (both hold libchudware.so).
 # ===========================================================================
 set -euo pipefail
 
@@ -41,14 +41,14 @@ command -v ninja >/dev/null 2>&1 || { echo "[build] ERROR: ninja not found on PA
 build_core() { cmake --preset linux-core && cmake --build --preset linux-core; }
 build_app()  {
     cmake -S "$ROOT/host" -B "$ROOT/host/build-linux" -G Ninja -DCMAKE_BUILD_TYPE=Release
-    ninja -C "$ROOT/host/build-linux" Billet
-    # Host dlopens libaicad next to the executable (cpp_core resolve tier 3). Keep it
+    ninja -C "$ROOT/host/build-linux" Chudware
+    # Host dlopens libchudware next to the executable (cpp_core resolve tier 3). Keep it
     # in sync with the OCCT engine so core fixes (e.g. extrude flip) actually reach the GUI.
-    stage_libaicad_next_to_host
+    stage_libchudware_next_to_host
 }
 # Emscripten web client (full app). Sources emsdk, configures host/ with
-# emcmake (CEF off), builds Billet, stages html/js/wasm/data into
-# ~/billet-web/app/ (served by the gateway /app or host/wasm/coop_server.py).
+# emcmake (CEF off), builds Chudware, stages html/js/wasm/data into
+# ~/chudware-web/app/ (served by the gateway /app or host/wasm/coop_server.py).
 build_wasm() {
     local emsdk_dir="${EMSDK:-$HOME/.emsdk}"
     if [ ! -f "$emsdk_dir/emsdk_env.sh" ]; then
@@ -62,18 +62,18 @@ build_wasm() {
     echo "[build] emcc: $(emcc -v 2>&1 | head -1)"
     emcmake cmake -S "$ROOT/host" -B "$ROOT/host/build-wasm" -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
-        -DAI_CAD_ENABLE_CEF=OFF
-    cmake --build "$ROOT/host/build-wasm" --target Billet
+        -DCHUDWARE_ENABLE_CEF=OFF
+    cmake --build "$ROOT/host/build-wasm" --target Chudware
     local out="$ROOT/host/build-wasm/bin"
-    local stage="${BILLET_WEB_APP:-$HOME/billet-web/app}"
+    local stage="${CHUDWARE_WEB_APP:-$HOME/chudware-web/app}"
     mkdir -p "$stage"
     # Stage the emscripten bundle (html/js/wasm + any .data preload packs).
-    # emcc embeds pthread workers in Billet.js (no separate Billet.worker.js); the app
+    # emcc embeds pthread workers in Chudware.js (no separate Chudware.worker.js); the app
     # runs main-thread ImGui + ASYNCIFY, not PROXY_TO_PTHREAD. Still stage any *worker*.js
     # if a future toolchain emits one.
     local staged_names=""
-    for f in "$out"/Billet.html "$out"/Billet.js "$out"/Billet.wasm \
-             "$out"/Billet.data "$out"/Billet.worker.js "$out"/*worker*.js; do
+    for f in "$out"/Chudware.html "$out"/Chudware.js "$out"/Chudware.wasm \
+             "$out"/Chudware.data "$out"/Chudware.worker.js "$out"/*worker*.js; do
         [ -e "$f" ] || continue
         local base
         base="$(basename "$f")"
@@ -86,22 +86,22 @@ build_wasm() {
     cp -f "$ROOT/host/wasm/coi-serviceworker.js" "$stage/" 2>/dev/null \
         && echo "[build] staged coi-serviceworker.js -> $stage/"
     # Prefer the canonical shell name index.html for the static server root.
-    if [ -f "$stage/Billet.html" ]; then
-        cp -f "$stage/Billet.html" "$stage/index.html"
-        echo "[build] staged index.html (copy of Billet.html)"
+    if [ -f "$stage/Chudware.html" ]; then
+        cp -f "$stage/Chudware.html" "$stage/index.html"
+        echo "[build] staged index.html (copy of Chudware.html)"
     fi
-    # Cache-bust: version the bundle URLs so browsers never pair a fresh Billet.js with a
-    # stale Billet.wasm/.data (fatal LinkError). VER = short wasm content hash. index.html is
+    # Cache-bust: version the bundle URLs so browsers never pair a fresh Chudware.js with a
+    # stale Chudware.wasm/.data (fatal LinkError). VER = short wasm content hash. index.html is
     # served no-cache, so every client picks up the new versioned URLs immediately.
-    if [ -f "$stage/Billet.wasm" ]; then
-        VER="$(sha1sum "$stage/Billet.wasm" | cut -c1-12)"
-        for hf in "$stage/index.html" "$stage/Billet.html"; do
+    if [ -f "$stage/Chudware.wasm" ]; then
+        VER="$(sha1sum "$stage/Chudware.wasm" | cut -c1-12)"
+        for hf in "$stage/index.html" "$stage/Chudware.html"; do
             [ -f "$hf" ] || continue
             sed -i \
-                -e "s/__BILLET_VER__/$VER/g" \
-                -e "s#src=Billet\.js#src=\"Billet.js?v=$VER\"#g" \
+                -e "s/__CHUDWARE_VER__/$VER/g" \
+                -e "s#src=Chudware\.js#src=\"Chudware.js?v=$VER\"#g" \
                 -e "s#src=coi-serviceworker\.js#src=\"coi-serviceworker.js?v=$VER\"#g" \
-                -e "s#src=\"Billet\.js\"#src=\"Billet.js?v=$VER\"#g" \
+                -e "s#src=\"Chudware\.js\"#src=\"Chudware.js?v=$VER\"#g" \
                 -e "s#src=\"coi-serviceworker\.js\"#src=\"coi-serviceworker.js?v=$VER\"#g" \
                 "$hf"
         done
@@ -112,8 +112,8 @@ build_wasm() {
     # Generated AFTER the cache-bust sed so index.html variants carry the versioned URLs;
     # freshly written (mtime > original) so appserve's staleness guard always accepts them.
     if command -v brotli >/dev/null 2>&1 || command -v gzip >/dev/null 2>&1; then
-        for cf in "$stage"/Billet.wasm "$stage"/Billet.js "$stage"/Billet.data \
-                  "$stage"/index.html "$stage"/Billet.html "$stage"/coi-serviceworker.js; do
+        for cf in "$stage"/Chudware.wasm "$stage"/Chudware.js "$stage"/Chudware.data \
+                  "$stage"/index.html "$stage"/Chudware.html "$stage"/coi-serviceworker.js; do
             [ -f "$cf" ] || continue
             command -v brotli >/dev/null 2>&1 && brotli -f -q 11 -o "$cf.br" "$cf"
             command -v gzip  >/dev/null 2>&1 && gzip  -f -k -9 "$cf"
@@ -124,7 +124,7 @@ build_wasm() {
 }
 
 
-# Full-engine OCCT tree (libaicad.so + aicad-hostd) — the binaries the LIVE
+# Full-engine OCCT tree (libchudware.so + chudware-hostd) — the binaries the LIVE
 # daemon actually serves. Not covered by `core` (slim linux-core preset) or
 # `app`: engine-behavior changes MUST rebuild this (then restart/drain hostd)
 # or the running daemon keeps executing old code — mega-8 F7/F8 root cause.
@@ -135,33 +135,33 @@ build_daemon() {
         echo "[build] ERROR: core/build-occt-linux is not configured (OCCT tree; see docs/HOSTD.md)"
         return 1
     fi
-    cmake --build "$ROOT/core/build-occt-linux" --target aicad aicad-hostd
-    stage_libaicad_next_to_host
+    cmake --build "$ROOT/core/build-occt-linux" --target chudware chudware-hostd
+    stage_libchudware_next_to_host
 }
 
-# Copy the full-engine libaicad.so next to host/build-linux/bin/chudware so the
+# Copy the full-engine libchudware.so next to host/build-linux/bin/chudware so the
 # running GUI's in-process cpp_core (resolve tier 3: next to executable) picks up
 # the latest engine. Without this, ./build.sh core/daemon updates trees the host
 # never loads. Atomic tmp+mv — never cp over a live mmap'd .so (SIGBUS risk).
-stage_libaicad_next_to_host() {
+stage_libchudware_next_to_host() {
     local src=""
-    if [ -f "$ROOT/core/build-occt-linux/bin/libaicad.so" ]; then
-        src="$ROOT/core/build-occt-linux/bin/libaicad.so"
-    elif [ -f "$ROOT/core/build-linux/bin/libaicad.so" ]; then
-        src="$ROOT/core/build-linux/bin/libaicad.so"
+    if [ -f "$ROOT/core/build-occt-linux/bin/libchudware.so" ]; then
+        src="$ROOT/core/build-occt-linux/bin/libchudware.so"
+    elif [ -f "$ROOT/core/build-linux/bin/libchudware.so" ]; then
+        src="$ROOT/core/build-linux/bin/libchudware.so"
     else
         return 0
     fi
     local dst_dir="$ROOT/host/build-linux/bin"
     if [ -d "$dst_dir" ]; then
-        local tmp="$dst_dir/.libaicad.so.staging.$$"
+        local tmp="$dst_dir/.libchudware.so.staging.$$"
         cp "$src" "$tmp"
-        mv -f "$tmp" "$dst_dir/libaicad.so"
-        echo "[stage] libaicad.so -> $dst_dir/ (host in-process engine)"
+        mv -f "$tmp" "$dst_dir/libchudware.so"
+        echo "[stage] libchudware.so -> $dst_dir/ (host in-process engine)"
     fi
 }
 
-# Stage the engine + hostd daemon into services/dist/AI-CAD (the $AI_CAD_DIST
+# Stage the engine + hostd daemon into services/dist/Chudware (the $CHUDWARE_DIST
 # dir that core_bridge's _lib_candidates and daemon_bridge's resolve_hostd_bin
 # try FIRST). Every file is deployed copy-to-temp + atomic `mv` in the target
 # dir — NEVER `cp` over a live in-use .so/binary (SIGBUS in the mmap'ed
@@ -169,27 +169,27 @@ stage_libaicad_next_to_host() {
 # flip and self-drains; MCP engines reload on respawn.
 stage_dist() {
     local src=""
-    if [ -f "$ROOT/core/build-occt-linux/bin/libaicad.so" ]; then
+    if [ -f "$ROOT/core/build-occt-linux/bin/libchudware.so" ]; then
         src="$ROOT/core/build-occt-linux/bin"
-    elif [ -f "$ROOT/core/build-linux/bin/libaicad.so" ]; then
+    elif [ -f "$ROOT/core/build-linux/bin/libchudware.so" ]; then
         src="$ROOT/core/build-linux/bin"
         echo "[stage] WARNING: staging the SLIM core/build-linux engine (no OCCT/Netgen —"
         echo "[stage]          FEA/CFD RPCs unavailable). Build core/build-occt-linux for the full engine."
     else
-        echo "[stage] ERROR: no built libaicad.so (run ./build.sh core first)"
+        echo "[stage] ERROR: no built libchudware.so (run ./build.sh core first)"
         return 1
     fi
-    local dst="$ROOT/services/dist/AI-CAD"
+    local dst="$ROOT/services/dist/Chudware"
     mkdir -p "$dst"
-    # libaicad.so first, then its RUNPATH ($ORIGIN) sibling deps, then the
-    # daemon that dlopens it. aicad-hostd MUST be staged from the SAME build
-    # tree as libaicad.so: clients key the daemon instance on the hostd
-    # binary's realpath, so a dist libaicad with a build-dir hostd silently
+    # libchudware.so first, then its RUNPATH ($ORIGIN) sibling deps, then the
+    # daemon that dlopens it. chudware-hostd MUST be staged from the SAME build
+    # tree as libchudware.so: clients key the daemon instance on the hostd
+    # binary's realpath, so a dist libchudware with a build-dir hostd silently
     # splits clients across two engines.
     local staged=0 f tmp
-    for f in libaicad.so libngcore.so libnglib.so lib3mf.so aicad-hostd; do
+    for f in libchudware.so libngcore.so libnglib.so lib3mf.so chudware-hostd; do
         if [ ! -e "$src/$f" ]; then
-            if [ "$f" = "libaicad.so" ] || [ "$f" = "aicad-hostd" ]; then
+            if [ "$f" = "libchudware.so" ] || [ "$f" = "chudware-hostd" ]; then
                 echo "[stage] WARNING: $f not found in $src — skipped"
             fi
             continue
@@ -201,7 +201,7 @@ stage_dist() {
         echo "[stage] $f -> $dst/"
     done
     echo "[stage] staged $staged file(s) from $src"
-    stage_libaicad_next_to_host
+    stage_libchudware_next_to_host
 }
 
 case "$MODE" in
@@ -228,5 +228,5 @@ esac
 echo ""
 echo "[build] DONE ($MODE)."
 BIN="$ROOT/host/build-linux/bin/chudware"
-[ -x "$BIN" ] && echo "[build] Run the GUI:  $BIN  (set AI_CAD_LIBAICAD to the built libaicad.so)"
+[ -x "$BIN" ] && echo "[build] Run the GUI:  $BIN  (set CHUDWARE_LIBCHUDWARE to the built libchudware.so)"
 exit 0

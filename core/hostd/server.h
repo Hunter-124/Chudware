@@ -1,9 +1,9 @@
-// aicad-hostd server core: accept loop, per-client connection threads, the
+// chudware-hostd server core: accept loop, per-client connection threads, the
 // hello handshake, and raw passthrough of engine methods into the ONE loaded
-// libaicad (via core::CppCore, the same loader every other consumer uses).
+// libchudware (via core::CppCore, the same loader every other consumer uses).
 //
 // Phase-1 scope (see plan): daemon-level methods hello/ping/daemon_status/
-// daemon_drain; everything else goes straight to aicad_call. The doc registry
+// daemon_drain; everything else goes straight to chudware_call. The doc registry
 // (attach modes, events, edit holds) layers on top in Phase 3 — the per-conn
 // write mutex and client table are already shaped for it.
 #pragma once
@@ -34,7 +34,7 @@ struct ClientConn {
     std::string userId;
     std::string userDisplay;
     long pid = 0;
-    aicad_ipc::IpcConn conn;
+    chudware_ipc::IpcConn conn;
     std::mutex writeMtx;  // response writes and (Phase 3) event pushes interleave
     std::thread thread;
 };
@@ -51,7 +51,7 @@ public:
         std::atomic<long long> lastActivityMs{0};  // monotonic ms of last disconnect/RPC
     };
 
-    Server(aicad_ipc::IpcListener listener, std::string buildId);
+    Server(chudware_ipc::IpcListener listener, std::string buildId);
     ~Server();
 
     // T-PERF10: close the listen fd without unlinking the sock, and return the
@@ -66,7 +66,7 @@ public:
     // Phase 5: supervised agent children (agent_spawn/agent_stop/agent_list).
     ChildSupervisor& children() { return children_; }
     // Phase 8: stale-binary self-drain backstop. The accept-loop tick stats the
-    // hostd binary itself + the loaded libaicad every AICAD_HOSTD_STALECHECK_S
+    // hostd binary itself + the loaded libchudware every CHUDWARE_HOSTD_STALECHECK_S
     // (default 60 s); an mtime change (dev rebuild, installer upgrade) flips the
     // daemon to draining so the next client respawns the new build.
     void setSelfBinary(std::string path) { selfBinary_ = std::move(path); }
@@ -106,11 +106,11 @@ private:
     void sendEventToAll(const std::string& line);
     // Live agent-event streaming (transparency): push one emitted run event to a client as a
     // {"event":"agent.event","data":<ev>} notification. streamThunk is the C sink registered
-    // with the engine (aicad_set_event_sink); its `ud` is a StreamCtx{this, clientId}.
+    // with the engine (chudware_set_event_sink); its `ud` is a StreamCtx{this, clientId}.
     void sendAgentEvent(int clientId, const char* eventJson);
     static void streamThunk(const char* eventJson, void* ud);
 
-    aicad_ipc::IpcListener listener_;
+    chudware_ipc::IpcListener listener_;
     std::string buildId_;
     Status status_;
     std::atomic<bool> stopping_{false};
@@ -133,7 +133,7 @@ private:
     // one could not even be reproduced) yet BELOW the 120s client RPC timeout, so a wedged
     // interactive op self-heals (restart -> socket close -> gateway closes the WS) before the
     // client gives up with a raw "engine call timed out" — the client reconnects instead.
-    // 0 = disabled. Env override: AICAD_HOSTD_ENGINE_WATCHDOG_S.
+    // 0 = disabled. Env override: CHUDWARE_HOSTD_ENGINE_WATCHDOG_S.
     long long engineWatchdogMs_ = 90000;
 };
 

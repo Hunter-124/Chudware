@@ -48,4 +48,4 @@ cost seam), T-X7 vendor adapters, T-X8 headed sessions.
 - Branch task/T-X9-in-app-ordering, worktree ../CAD-T-X9. Stop at status: review.
 - This is the task that makes the parts library "actually pivoted" to Hunter's #4 —
   if scope forces a cut, cut vendors, not the confirmation boundary or the ledger.
-- Python venv for gate: `~/.local/share/AI-CAD/mcp-venv/bin/python`.
+- Python venv for gate: `~/.local/share/Chudware/mcp-venv/bin/python`.

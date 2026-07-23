@@ -1,4 +1,4 @@
-// doctest unit tests for aicad::geom::SketchPlane and polar helpers.
+// doctest unit tests for chudware::geom::SketchPlane and polar helpers.
 //
 // Conventions verified:
 //   - Standard-plane frames are orthonormal, right-handed, and match Z-up.
@@ -15,9 +15,9 @@
 
 #include <cmath>
 
-using aicad::geom::SketchPlane;
-using aicad::geom::polarToCartesian;
-using aicad::geom::cartesianToPolar;
+using chudware::geom::SketchPlane;
+using chudware::geom::polarToCartesian;
+using chudware::geom::cartesianToPolar;
 
 static constexpr double kEps = 1e-12;
 

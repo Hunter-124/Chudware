@@ -333,7 +333,7 @@ def main() -> int:
 
         cfg = Path(getattr(agent_paths, "CONFIG", ""))
     except Exception:
-        cfg = Path.home() / ".local" / "share" / "AI-CAD" / "config.json"
+        cfg = Path.home() / ".local" / "share" / "Chudware" / "config.json"
     # sub_auth uses services.paths.CONFIG — report that too when available.
     try:
         from services import paths as eng_paths  # type: ignore

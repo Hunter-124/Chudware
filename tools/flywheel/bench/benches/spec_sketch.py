@@ -313,7 +313,7 @@ def _to_op_feature(sketch: dict) -> dict:
 def _make_doc_id_opener():
     """Guarded live-core opener: None when the C++ core cannot be located/loaded (never a
     hardcoded sibling-worktree path — resolution is entirely core_bridge's, via
-    $AI_CAD_LIBAICAD / $AI_CAD_DIST / the build dirs)."""
+    $CHUDWARE_LIBCHUDWARE / $CHUDWARE_DIST / the build dirs)."""
     try:
         from mcp_server import core_bridge as cb  # noqa: local import, core-only path
     except Exception:

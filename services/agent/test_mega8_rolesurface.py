@@ -435,7 +435,7 @@ def test_leaf_oneshot_success_skips_tool_loop(monkeypatch):
     from services.dag import node_runner as nr
 
     rm.reset_leaf_miss_count()
-    monkeypatch.setenv("AI_CAD_LEAF_ONESHOT", "1")
+    monkeypatch.setenv("CHUDWARE_LEAF_ONESHOT", "1")
 
     class _Prov:
         name = "ollama"
@@ -491,7 +491,7 @@ def test_leaf_oneshot_miss_increments_and_falls_back(monkeypatch):
     from services.dag import node_runner as nr
 
     rm.reset_leaf_miss_count()
-    monkeypatch.setenv("AI_CAD_LEAF_ONESHOT", "1")
+    monkeypatch.setenv("CHUDWARE_LEAF_ONESHOT", "1")
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
 
     class _BadProv:

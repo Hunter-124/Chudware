@@ -13,7 +13,7 @@ Stages:
   5. Summary: What you learned + next steps
 
 Usage (headless, CI-friendly):
-  AI_CAD_LIBAICAD=<path>/libaicad.so python samples/tours/bracket_tour.py
+  CHUDWARE_LIBCHUDWARE=<path>/libchudware.so python samples/tours/bracket_tour.py
 
 Returns exit code 0 on success, 1 on any step failure.
 """
@@ -97,7 +97,7 @@ def run_bracket_tour(cb) -> dict:
     state: dict = {}   # mutable across steps
 
     # ── Step 1: Welcome ──────────────────────────────────────────────────────
-    s1 = TourStep("welcome", "Welcome to AI-CAD", """
+    s1 = TourStep("welcome", "Welcome to Chudware", """
 Welcome! In this tour, we'll design a machined aluminium mounting bracket
 from scratch — the kind used to bolt a motor controller to a machine frame.
 
@@ -123,7 +123,7 @@ Every bracket starts with a flat base plate. Ours is:
   • 100 mm long × 60 mm wide × 12 mm thick
   • Aluminium 6061 (lightweight, machinable, strong enough for most mounts)
 
-We'll use a "box" feature — AI-CAD's simplest solid. Just give it length,
+We'll use a "box" feature — Chudware's simplest solid. Just give it length,
 width, and height and the engine builds a precise rectangular solid.
 """)
 
@@ -150,7 +150,7 @@ width, and height and the engine builds a precise rectangular solid.
 A flat plate alone would flex under load. We add an upright rib along the
 back edge for stiffness — a classic L-bracket cross-section.
 
-AI-CAD merges multiple box primitives automatically (the second box fuses
+Chudware merges multiple box primitives automatically (the second box fuses
 into the existing body). We'll add a 100×10×30 mm rib.
 """)
 
@@ -239,7 +239,7 @@ the top-facing edges. No need to select individual edges by number.
 
     # ── Step 6: Material ──────────────────────────────────────────────────────
     s6 = TourStep("material", "Step 5 — Set Material", """
-Setting the material lets AI-CAD compute accurate mass properties and
+Setting the material lets Chudware compute accurate mass properties and
 feed the right cutting parameters to the CAM module.
 
 For a machined bracket, we'll use Aluminium 6061 — the most common
@@ -285,7 +285,7 @@ Here's a summary of the finished part:
 
     # ── Step 8: CAM ───────────────────────────────────────────────────────────
     s8 = TourStep("cam", "Step 6 — Generate a CAM Program", """
-AI-CAD can generate a complete G-code machining program from the 3D part
+Chudware can generate a complete G-code machining program from the 3D part
 automatically. The "cam_program" command analyses the geometry and creates:
 
   • A facing pass to flatten the stock top
@@ -319,7 +319,7 @@ estimates the cycle time on a generic 3-axis mill.
     # ── Step 9: Wrap up ───────────────────────────────────────────────────────
     s9 = TourStep("summary", "Tour Complete!", """
 Congratulations! You've just designed a real, production-ready mounting bracket
-from scratch using AI-CAD's parametric engine. Here's what you covered:
+from scratch using Chudware's parametric engine. Here's what you covered:
 
   ✓ Box primitives with automatic body merge
   ✓ Bolt-circle hole patterns (bolt_circle feature)
@@ -351,11 +351,11 @@ if __name__ == "__main__":
     from mcp_server import core_bridge as cb
 
     print("=" * 60)
-    print("AI-CAD GUIDED TOUR: Designing a Mounting Bracket")
+    print("Chudware GUIDED TOUR: Designing a Mounting Bracket")
     print("=" * 60)
 
     if not cb.available():
-        print("\nFATAL: libaicad not available. Set AI_CAD_LIBAICAD=<path>.")
+        print("\nFATAL: libchudware not available. Set CHUDWARE_LIBCHUDWARE=<path>.")
         sys.exit(1)
 
     result = run_bracket_tour(cb)

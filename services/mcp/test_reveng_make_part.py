@@ -28,8 +28,8 @@ import pytest
 # ---------------------------------------------------------------------------
 
 def _load_reveng_tools(tmp_path: Path, monkeypatch) -> Any:
-    """Import reveng_tools with AICAD_REVENG_DIR pointed at *tmp_path*."""
-    monkeypatch.setenv("AICAD_REVENG_DIR", str(tmp_path / "reveng"))
+    """Import reveng_tools with CHUDWARE_REVENG_DIR pointed at *tmp_path*."""
+    monkeypatch.setenv("CHUDWARE_REVENG_DIR", str(tmp_path / "reveng"))
 
     # Reload to pick up the env var
     import services.mcp.reveng_tools as rt
@@ -64,7 +64,7 @@ def _call(tools: dict, name: str, **kwargs) -> dict:
 def reveng_tmp(tmp_path, monkeypatch):
     d = tmp_path / "reveng"
     d.mkdir()
-    monkeypatch.setenv("AICAD_REVENG_DIR", str(d))
+    monkeypatch.setenv("CHUDWARE_REVENG_DIR", str(d))
     return d
 
 
@@ -143,7 +143,7 @@ def test_known_mpn_model_present_and_place(
         from services.mcp import reveng_tools as rt  # noqa: PLC0415
         from pathlib import Path as _P  # noqa: PLC0415
         import os  # noqa: PLC0415
-        sess_dir = _P(os.environ["AICAD_REVENG_DIR"]) / session_id
+        sess_dir = _P(os.environ["CHUDWARE_REVENG_DIR"]) / session_id
         mesh_dir = sess_dir / "mesh"
         mesh_dir.mkdir(parents=True, exist_ok=True)
         mesh_file = mesh_dir / "part.ply"

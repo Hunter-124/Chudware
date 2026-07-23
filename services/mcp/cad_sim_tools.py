@@ -356,7 +356,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                      background: bool = False) -> str:
         """Wind-tunnel CFD over the current part/assembly (LBM). Returns drag, lift, Cd, Reynolds.
 
-        CONVENTIONS (AI-CAD is Z-up): freestream is along +X; LIFT is the +Z (up) force; SPAN is Y.
+        CONVENTIONS (Chudware is Z-up): freestream is along +X; LIFT is the +Z (up) force; SPAN is Y.
         +aoa pitches the nose up (rotation about Y), so a cambered wing makes +lift. `reynolds` and
         `cd` use ref_length_mm = the part's LONGEST span (NOT chord) — for an airfoil, simulate the
         wing alone or read `ref_length_mm` and renormalise to chord yourself.
@@ -436,7 +436,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         ~10-15% of experiment (regression gate: tools/foam_validation.py). It body-fits a
         snappyHexMesh with boundary layers and solves to convergence, so it takes MINUTES and
         requires OpenFOAM installed — detected automatically on Linux (sourced env / system install /
-        user-space conda env / AICAD_OPENFOAM root), native Windows blueCFD, or WSL openfoam2412.
+        user-space conda env / CHUDWARE_OPENFOAM root), native Windows blueCFD, or WSL openfoam2412.
         All OpenFOAM invocations are subprocesses (GPL isolation — never linked). It ALWAYS runs in
         the background: returns a job_id immediately; poll get_job(job_id) (which reports live
         meshing/solve progress) for the result.
@@ -456,10 +456,10 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 import os as _os
                 how = ("`python -m tools.provision_openfoam --install` (user-space conda-forge "
                        "env, no sudo), or unpack an openfoam.com tarball under ~/OpenFOAM/, or "
-                       "set AICAD_OPENFOAM to an install root"
+                       "set CHUDWARE_OPENFOAM to an install root"
                        if _os.name == "posix" else
                        "`python -m tools.provision_openfoam --install` (WSL openfoam2412) or "
-                       "install blueCFD-Core natively and set %AICAD_OPENFOAM%")
+                       "install blueCFD-Core natively and set %CHUDWARE_OPENFOAM%")
                 return _dumps({"ok": False, "skipped": True, "reason": "openfoam_not_installed",
                                "error": "OpenFOAM is not available on this machine. Provision it "
                                f"with {how}. The coarse LBM run_cfd_flow still works."})

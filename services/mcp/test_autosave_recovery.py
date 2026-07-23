@@ -33,7 +33,7 @@ def _legacy_engine_mode(monkeypatch):
     """This module tests the LEGACY in-process autosave/recovery path. Daemon
     mode is the default since the Phase-8 flip (hostd owns autosave), so opt
     out explicitly for every test here."""
-    monkeypatch.setenv("AI_CAD_ENGINE_DAEMON", "0")
+    monkeypatch.setenv("CHUDWARE_ENGINE_DAEMON", "0")
 
 
 # ---------------------------------------------------------------------------
@@ -42,8 +42,8 @@ def _legacy_engine_mode(monkeypatch):
 
 class TestAutosaveDir:
     def test_env_override_wins(self, monkeypatch, tmp_path):
-        """AI_CAD_AUTOSAVE_DIR env var takes precedence over services.paths."""
-        monkeypatch.setenv("AI_CAD_AUTOSAVE_DIR", str(tmp_path))
+        """CHUDWARE_AUTOSAVE_DIR env var takes precedence over services.paths."""
+        monkeypatch.setenv("CHUDWARE_AUTOSAVE_DIR", str(tmp_path))
         monkeypatch.delenv("APPDATA", raising=False)
         d = cad_tools._autosave_dir()
         assert d == tmp_path
@@ -53,14 +53,14 @@ class TestAutosaveDir:
         if os.name == "nt":
             pytest.skip("Windows-only failure mode not applicable on NT")
         monkeypatch.delenv("APPDATA", raising=False)
-        monkeypatch.delenv("AI_CAD_AUTOSAVE_DIR", raising=False)
+        monkeypatch.delenv("CHUDWARE_AUTOSAVE_DIR", raising=False)
         d = cad_tools._autosave_dir()
         assert "\\" not in str(d), f"Path contains backslash on Linux: {d}"
         assert str(d).startswith("/"), f"Expected absolute path, got: {d}"
 
     def test_dir_is_created(self, monkeypatch, tmp_path):
         target = str(tmp_path / "autosave_subdir")
-        monkeypatch.setenv("AI_CAD_AUTOSAVE_DIR", target)
+        monkeypatch.setenv("CHUDWARE_AUTOSAVE_DIR", target)
         d = cad_tools._autosave_dir()
         assert d.exists() and d.is_dir()
 
@@ -72,7 +72,7 @@ class TestAutosaveDir:
 class TestKill9Recovery:
     """Simulate a prior session's autosaves and prove recover_autosaved() works.
 
-    Does NOT require libaicad.so: exercises autosave metadata / sidecar path
+    Does NOT require libchudware.so: exercises autosave metadata / sidecar path
     logic and session-scoping by writing .step+ stubs + sidecar JSON files,
     then patching cb.call to simulate doc_open.
     """
@@ -92,7 +92,7 @@ class TestKill9Recovery:
         """Core kill-9 scenario: prior session's autosave reloads to intact tree."""
         autosave_dir = tmp_path / "autosave"
         autosave_dir.mkdir()
-        monkeypatch.setenv("AI_CAD_AUTOSAVE_DIR", str(autosave_dir))
+        monkeypatch.setenv("CHUDWARE_AUTOSAVE_DIR", str(autosave_dir))
 
         prior_session = "deadbeef0001"
         doc_id_a = "doc_aaa"
@@ -133,7 +133,7 @@ class TestKill9Recovery:
         """Docs from THIS session must not be re-loaded (already in memory)."""
         autosave_dir = tmp_path / "autosave2"
         autosave_dir.mkdir()
-        monkeypatch.setenv("AI_CAD_AUTOSAVE_DIR", str(autosave_dir))
+        monkeypatch.setenv("CHUDWARE_AUTOSAVE_DIR", str(autosave_dir))
 
         cur_session = "CURRENT_SESS"
         monkeypatch.setattr(cad_tools, "_SESSION_ID", cur_session)
@@ -157,7 +157,7 @@ class TestKill9Recovery:
         """Autosaves older than max_age_days are pruned at recovery time."""
         autosave_dir = tmp_path / "autosave3"
         autosave_dir.mkdir()
-        monkeypatch.setenv("AI_CAD_AUTOSAVE_DIR", str(autosave_dir))
+        monkeypatch.setenv("CHUDWARE_AUTOSAVE_DIR", str(autosave_dir))
 
         monkeypatch.setattr(cad_tools, "_SESSION_ID", "cur_sess")
         monkeypatch.setattr(cad_tools, "_AUTOSAVE_MAX_AGE_DAYS", 1)
@@ -229,7 +229,7 @@ class TestCrashBundle:
     def _fresh_crash_dir(self, tmp_path, monkeypatch) -> pathlib.Path:
         d = tmp_path / "crashes"
         d.mkdir()
-        monkeypatch.setenv("AI_CAD_CRASH_DIR", str(d))
+        monkeypatch.setenv("CHUDWARE_CRASH_DIR", str(d))
         return d
 
     def _patch_consent(self, monkeypatch, tier: str):

@@ -1,4 +1,4 @@
-// AI-CAD UI theme: named palette roles, two palettes (dark/teal + SolidWorks-light),
+// Chudware UI theme: named palette roles, two palettes (dark/teal + SolidWorks-light),
 // runtime-switchable. applyTheme(Theme, scale) fills ImGuiStyle + the global palette;
 // all panels read ONLY role fields — never hardcode ImVec4/ImU32 colors in panel code.
 #pragma once

@@ -7,7 +7,7 @@ T-G12 round-1 ask), then injects them into the icon atlases the C++ loader consu
 
 Flow (see docs in each function):
   1. RECIPES  -> a JSON recipe list (name, camera, build steps).
-  2. The AI-CAD GUI, run headless with AI_CAD_SHOT=iconpipe + AI_CAD_ICON_RECIPES,
+  2. The Chudware GUI, run headless with CHUDWARE_SHOT=iconpipe + CHUDWARE_ICON_RECIPES,
      builds each demo part (newPart + applyOps, the real engine) and renders it through
      the renderer's TRANSPARENT thumbnail path (no chrome, no gizmo, alpha=0 background)
      to scratch/icon_render/<name>.png at 2x-ish resolution.
@@ -58,16 +58,16 @@ REPO = Path(__file__).resolve().parent.parent
 
 
 def _find_host_bin() -> Path:
-    """Locate the host GUI binary (Billet, with AI-CAD fallback for stale build dirs).
+    """Locate the host GUI binary (Chudware, with Chudware fallback for stale build dirs).
     Checks Windows layout first, then Linux/Ninja."""
     base = REPO / "host" / "build-linux" / "bin"
-    for c in (base / "Release" / "Billet.exe", base / "Billet.exe",
-              base / "Release" / "Billet", base / "Billet",
-              base / "Release" / "AI-CAD.exe", base / "AI-CAD.exe",
-              base / "Release" / "AI-CAD", base / "AI-CAD"):
+    for c in (base / "Release" / "Chudware.exe", base / "Chudware.exe",
+              base / "Release" / "Chudware", base / "Chudware",
+              base / "Release" / "Chudware.exe", base / "Chudware.exe",
+              base / "Release" / "Chudware", base / "Chudware"):
         if c.exists():
             return c
-    return base / "Billet"  # default (nonexistent -> run_app prints a clear build hint)
+    return base / "Chudware"  # default (nonexistent -> run_app prints a clear build hint)
 
 
 BIN = _find_host_bin()
@@ -683,12 +683,12 @@ RECIPES: dict[str, dict] = {
         accent(),
     ]},
 
-    # stock: a rectangular raw billet for the Manufacture > Stock button. A plain
+    # stock: a rectangular raw chudware for the Manufacture > Stock button. A plain
     # machined-aluminium block (bright metal, mid roughness) that reads as "raw
-    # stock material". No annotation -- the billet IS the icon.
+    # stock material". No annotation -- the chudware IS the icon.
     "stock": {"yaw": 32, "pitch": 24, "steps": [
         box(56, 40, 26),
-        appearance(0.90, 0.32, (0.80, 0.82, 0.85)),   # aluminium billet
+        appearance(0.90, 0.32, (0.80, 0.82, 0.85)),   # aluminium chudware
     ]},
 
     # -----------------------------------------------------------------------
@@ -1216,7 +1216,7 @@ RECIPES: dict[str, dict] = {
     # -----------------------------------------------------------------------
     # Appearance -> Display: display_* are line-art SDF glyphs, NOT photographic.
     # SDF invisible-icon bug (kFar int32 overflow) fixed in T-G15 (kFar=1<<12).
-    # In-context verification via AI_CAD_RIBBON_TAB=Appearance is the right check.
+    # In-context verification via CHUDWARE_RIBBON_TAB=Appearance is the right check.
     # Not added here -- photographic renders would override correct line-art glyphs.
     # -----------------------------------------------------------------------
 }
@@ -1239,7 +1239,7 @@ ANNOTATIONS: dict[str, dict] = {
     "extrude_cut":      {"arrow": [0.50, 0.14, 0.50, 0.46]},   # cut plunges down into the pocket
     "draft":            {"arrow": [0.30, 0.30, 0.20, 0.66]},   # taper slope cue on the drafted wall
     "rib":              {"ring": [0.52, 0.52, 0.15]},          # look-here on the reinforcing web
-    # stock: no annotation -- the raw billet IS the icon.
+    # stock: no annotation -- the raw chudware IS the icon.
     "revolve_boss":     {"arc": [0.50, 0.22, 0.17, 210, 330]},
     "revolve_cut":      {"arc": [0.50, 0.22, 0.17, 210, 330]},
     "sweep":            {"arrow": [0.68, 0.52, 0.68, 0.16]},
@@ -1440,9 +1440,9 @@ def write_recipes(path: Path) -> None:
 
 
 def run_app(recipes_json: Path, theme: str = "dark", timeout_s: int = 300) -> int:
-    """Run the host GUI headless (AI_CAD_SHOT=iconpipe) to render every recipe to RENDER_DIR.
+    """Run the host GUI headless (CHUDWARE_SHOT=iconpipe) to render every recipe to RENDER_DIR.
 
-    Targets host/build-linux/bin/Billet (ui/imgui / AI-CAD2 is retired — see docs/PORT_LEDGER.md).
+    Targets host/build-linux/bin/Chudware (ui/imgui / AI-CAD2 is retired — see docs/PORT_LEDGER.md).
     On Linux we wrap in xvfb-run (llvmpipe) for a deterministic, GPU-independent server; on
     Windows the desktop session supplies GL, so the exe runs directly. One invocation drains ALL
     recipes in a single tick.
@@ -1450,18 +1450,18 @@ def run_app(recipes_json: Path, theme: str = "dark", timeout_s: int = 300) -> in
     if not BIN.exists():
         sys.exit(f"binary not found: {BIN} -- build the host GUI first:\n"
                  f"  cmake -S host -B host/build-linux -G Ninja -DCMAKE_BUILD_TYPE=Release\n"
-                 f"  ninja -C host/build-linux Billet")
+                 f"  ninja -C host/build-linux Chudware")
     RENDER_DIR.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
     env.update({
-        "AI_CAD_NO_FILE_DIALOGS": "1",
-        "AI_CAD_REPO": str(REPO),
-        "AI_CAD_SHOT": "iconpipe",
-        "AI_CAD_ICON_RECIPES": str(recipes_json),
-        "AI_CAD_THEME": theme,
+        "CHUDWARE_NO_FILE_DIALOGS": "1",
+        "CHUDWARE_REPO": str(REPO),
+        "CHUDWARE_SHOT": "iconpipe",
+        "CHUDWARE_ICON_RECIPES": str(recipes_json),
+        "CHUDWARE_THEME": theme,
         # Create the GLFW window unmapped so the headless capture-then-exit path
         # runs cleanly under xvfb without ever mapping a visible window.
-        "AI_CAD_HIDDEN": "1",
+        "CHUDWARE_HIDDEN": "1",
     })
     throwaway = REPO / "scratch" / "iconpipe_final.png"
     # The headless capture-then-exit path is entered ONLY via --ui-screenshot
@@ -1571,7 +1571,7 @@ def main(argv=None) -> int:
     ap.add_argument("--render", action="store_true", help="run the app, regenerate, inject")
     ap.add_argument("--inject-only", action="store_true", help="re-tile from existing renders")
     ap.add_argument("--list", action="store_true", help="print the recipe table and exit")
-    ap.add_argument("--theme", default="dark", help="AI_CAD_THEME for the render run")
+    ap.add_argument("--theme", default="dark", help="CHUDWARE_THEME for the render run")
     args = ap.parse_args(argv)
 
     if args.list:
@@ -1594,7 +1594,7 @@ def main(argv=None) -> int:
 
     if args.render or args.inject_only:
         # Append any missing atlas cells for RECIPE names too (e.g. a brand-new
-        # `stock` billet tile); no-ops names that already have cells.
+        # `stock` chudware tile); no-ops names that already have cells.
         ensure_cells(list(RECIPES.keys()) + CAM_CELLS)
         done = inject(names)
         contact_sheet(names)

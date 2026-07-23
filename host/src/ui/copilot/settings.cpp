@@ -206,7 +206,7 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
         } else if (s.provider == ui::PROV_LLAMACPP) {
             std::strncpy(s.baseUrl, "http://127.0.0.1:1234/v1", sizeof(s.baseUrl) - 1);
             if (!std::strstr(s.model, ".gguf"))
-                std::strncpy(s.model, "%APPDATA%\\AI-CAD\\models\\model.gguf",
+                std::strncpy(s.model, "%APPDATA%\\Chudware\\models\\model.gguf",
                              sizeof(s.model) - 1);
             s.vision = false;
         } else if (s.provider == ui::PROV_CLOUDCOMPAT) {
@@ -1217,7 +1217,7 @@ bool moonshotKeyPresent(AppState& st) {
 }
 
 // ============================ OMP bridge model catalog + session cost (S-UI-PROV) ===
-// Static OMP catalog (capabilities + $/Mtok cost) via the libaicad `agent_models_list` C-ABI
+// Static OMP catalog (capabilities + $/Mtok cost) via the libchudware `agent_models_list` C-ABI
 // (bridge `models_list`), and the per-session cost strip via `agent_cost_summary` (a pure
 // calculator — the UI supplies the session's token events, the bridge prices them). Both
 // degrade permanently on unknown_method (sibling slice absent / older core) and quietly keep

@@ -80,7 +80,7 @@ real engine round-trip. The inline card rendering and scenario proof are complet
 - `BlockKind::Question` in `AgentBlock`; `InlineFieldState` with multi-select bool-array
 - C++ consumer in `tickDemoAgent`: handles `ask_question` events and `waiting_for_answer`
   result status — wired and ready but **currently inert** (Python never emits these)
-- Headless screenshot scenario (`AI_CAD_SHOT=question`): light + dark captures eyeballed,
+- Headless screenshot scenario (`CHUDWARE_SHOT=question`): light + dark captures eyeballed,
   choice (radio + checkbox) and short-answer + dimension and multiline + approval all visible
 - `gate.sh` PASS
 

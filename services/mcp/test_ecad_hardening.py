@@ -150,8 +150,8 @@ def test_mcp_autosave_and_recover() -> None:
     """Driving the MCP tools with autosave armed persists docs; the server-layer recovery wrapper
     reloads them and re-points the active-doc pointers."""
     d = tempfile.mkdtemp(prefix="ecad-mcp-autosave-")
-    prev_env = os.environ.get("AI_CAD_ECAD_AUTOSAVE_DIR")
-    os.environ["AI_CAD_ECAD_AUTOSAVE_DIR"] = d
+    prev_env = os.environ.get("CHUDWARE_ECAD_AUTOSAVE_DIR")
+    os.environ["CHUDWARE_ECAD_AUTOSAVE_DIR"] = d
     eauto.disable()
     eauto._STATE["session_id"] = None
     esess._REGISTRY.clear()
@@ -184,9 +184,9 @@ def test_mcp_autosave_and_recover() -> None:
         eauto.disable()
         eauto._STATE["session_id"] = None
         if prev_env is None:
-            os.environ.pop("AI_CAD_ECAD_AUTOSAVE_DIR", None)
+            os.environ.pop("CHUDWARE_ECAD_AUTOSAVE_DIR", None)
         else:
-            os.environ["AI_CAD_ECAD_AUTOSAVE_DIR"] = prev_env
+            os.environ["CHUDWARE_ECAD_AUTOSAVE_DIR"] = prev_env
 
 
 # --------------------------------------------------------------------------- dual-import identity
@@ -211,8 +211,8 @@ def test_ecad_module_identity_dual_import() -> None:
 def test_recover_never_overwrites_active_docs() -> None:
     """Warm autosave recovery fills only EMPTY current_* defaults — never a just-created doc."""
     d = tempfile.mkdtemp(prefix="ecad-mcp-mono-")
-    prev_env = os.environ.get("AI_CAD_ECAD_AUTOSAVE_DIR")
-    os.environ["AI_CAD_ECAD_AUTOSAVE_DIR"] = d
+    prev_env = os.environ.get("CHUDWARE_ECAD_AUTOSAVE_DIR")
+    os.environ["CHUDWARE_ECAD_AUTOSAVE_DIR"] = d
     eauto.disable()
     eauto._STATE["session_id"] = None
     esess._REGISTRY.clear()
@@ -249,9 +249,9 @@ def test_recover_never_overwrites_active_docs() -> None:
         eauto.disable()
         eauto._STATE["session_id"] = None
         if prev_env is None:
-            os.environ.pop("AI_CAD_ECAD_AUTOSAVE_DIR", None)
+            os.environ.pop("CHUDWARE_ECAD_AUTOSAVE_DIR", None)
         else:
-            os.environ["AI_CAD_ECAD_AUTOSAVE_DIR"] = prev_env
+            os.environ["CHUDWARE_ECAD_AUTOSAVE_DIR"] = prev_env
 
 
 def test_multi_doc_explicit_doc_id_isolation() -> None:
@@ -301,8 +301,8 @@ def test_ecad_design_slow_provider_falls_back_promptly() -> None:
     produce exactly one verified schematic, and leave ecad_status responsive."""
     tools = _tools()
     slow = _SlowProvider(delay_s=30.0)
-    orig_budget = os.environ.get("AI_CAD_ECAD_PLAN_BUDGET_S")
-    os.environ["AI_CAD_ECAD_PLAN_BUDGET_S"] = "1.0"
+    orig_budget = os.environ.get("CHUDWARE_ECAD_PLAN_BUDGET_S")
+    os.environ["CHUDWARE_ECAD_PLAN_BUDGET_S"] = "1.0"
 
     # Force the configured provider path and skip the TCP pre-flight.
     import services.agent.config as _cfg  # T-RF8: canonical path (ecad_design uses it)
@@ -323,9 +323,9 @@ def test_ecad_design_slow_provider_falls_back_promptly() -> None:
             _cfg.get_provider = orig_get  # type: ignore[attr-defined]
         et_sim._provider_reachable = orig_reach  # type: ignore[assignment]
         if orig_budget is None:
-            os.environ.pop("AI_CAD_ECAD_PLAN_BUDGET_S", None)
+            os.environ.pop("CHUDWARE_ECAD_PLAN_BUDGET_S", None)
         else:
-            os.environ["AI_CAD_ECAD_PLAN_BUDGET_S"] = orig_budget
+            os.environ["CHUDWARE_ECAD_PLAN_BUDGET_S"] = orig_budget
 
     # Must return well under the 30 s MCP transport deadline (plan budget 1 s + build ~2 s).
     assert dt < 8.0, f"slow-provider design hung for {dt:.1f}s (would trip transport timeout)"

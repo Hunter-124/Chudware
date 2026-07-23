@@ -1,6 +1,6 @@
 """Smoke tests for the CAD-graph MCP tools (services/mcp/graph_tools.py, 1D).
 
-Pure-Python — no libaicad DLL required. Registers the tools on a throwaway
+Pure-Python — no libchudware DLL required. Registers the tools on a throwaway
 FastMCP and drives them against a tmp project.
 """
 from __future__ import annotations

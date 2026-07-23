@@ -23,8 +23,8 @@ complaint is real and independently confirmed.
    (`host/src/ui/pm_forms.cpp`, `property_manager.cpp::buildOpFeature`) → engine handlers
    (`core/doc/document.cpp` ~L5509–5960, `core/geom/surfacing.cpp`) and the pick→selector
    path (`core/doc/document.cpp::resolve_pick`, `core/doc/selectors.cpp::make_pick_selector`).
-3. **GUI level:** headless screenshots via `AI_CAD_SHOT=ribbon AI_CAD_TAB=8` (Surfaces
-   ribbon, **light + dark**) and `AI_CAD_SHOT=pmform AI_CAD_PMCMD=surf_*` (PM forms). Every
+3. **GUI level:** headless screenshots via `CHUDWARE_SHOT=ribbon CHUDWARE_TAB=8` (Surfaces
+   ribbon, **light + dark**) and `CHUDWARE_SHOT=pmform CHUDWARE_PMCMD=surf_*` (PM forms). Every
    PNG was inspected, not trusted by exit code. Artifacts in scratchpad `g20_shots/`.
 
 ## Verdict table

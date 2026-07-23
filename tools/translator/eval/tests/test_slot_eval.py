@@ -4,7 +4,7 @@
 Covers the invariants of `gsl_ser` (round-trip, version tag), `eval.slot_accuracy`
 (template baseline, intrinsic/extrinsic/missing detection), the `groundedness` seam
 (stub behaviour + checker swap), and `eval.harness` (gold loading, fold evaluation,
-ROC-AUC). Engine-free: everything operates on plain state dicts, no libaicad.
+ROC-AUC). Engine-free: everything operates on plain state dicts, no libchudware.
 
 Run from the repo root:
 

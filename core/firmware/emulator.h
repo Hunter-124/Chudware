@@ -10,7 +10,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad::firmware {
+namespace chudware::firmware {
 
 // contracts/firmware_rpc.md §4 (+ §7.1 gpio_events/trace_path).
 struct SimResult {
@@ -27,12 +27,12 @@ struct SimResult {
 
 // ── pure parsing (no I/O) ───────────────────────────────────────────────────
 
-// AICAD_GPIO_EVT lines → [{"type","seq","t_ms","pin","level"}] (t_ms null when
+// CHUDWARE_GPIO_EVT lines → [{"type","seq","t_ms","pin","level"}] (t_ms null when
 // the emitting side had no timestamp).
 nlohmann::json parse_gpio_events(const std::string& text);
 
 // Non-marker, non-trace lines → [{"type":"uart","seq","t_ms","text"}],
-// time-stamped from AICAD_T_MARK markers.
+// time-stamped from CHUDWARE_T_MARK markers.
 nlohmann::json parse_uart_events(const std::string& text);
 
 // Renode ODR snapshot blocks → {"PA0": 0, ..., "PA15": 0}.
@@ -78,4 +78,4 @@ SimResult run_simulation(const std::string& elf_path, const std::string& mcu_fam
                          const std::vector<std::string>& assertions, double timeout_s = 30.0,
                          const nlohmann::json& scenario = nlohmann::json());
 
-}  // namespace aicad::firmware
+}  // namespace chudware::firmware

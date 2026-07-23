@@ -2,7 +2,7 @@
   "model_id": "gemma3-4b-qat",
   "license": "Gemma-ToU",
   "note": "QAT alt",
-  "server_bin": "/home/hunter/.local/share/AI-CAD/llamacpp/build-cuda/bin/llama-server",
+  "server_bin": "/home/hunter/.local/share/Chudware/llamacpp/build-cuda/bin/llama-server",
   "timestamp": "2026-07-05T01:12:06",
   "free_vram_mb_before": 11683,
   "gpu_offloaded": true,

@@ -7,7 +7,7 @@ DoD coverage:
   - dag_replan rejects id collisions with existing nodes (ReplannError)
   - dag_replan produces a merged graph that passes validate_graph()
   - dag_replan writes merged graph to sidecar
-  - Integration smoke: run → replan → resume terminates (gated on AI_CAD_LIBAICAD)
+  - Integration smoke: run → replan → resume terminates (gated on CHUDWARE_LIBCHUDWARE)
 """
 from __future__ import annotations
 
@@ -352,8 +352,8 @@ def test_template_has_at_least_one_back_edge(template_file):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.skipif(
-    not os.environ.get("AI_CAD_LIBAICAD"),
-    reason="AI_CAD_LIBAICAD not set — skipping live engine integration test",
+    not os.environ.get("CHUDWARE_LIBCHUDWARE"),
+    reason="CHUDWARE_LIBCHUDWARE not set — skipping live engine integration test",
 )
 def test_replan_run_resume_terminates(tmp_path):
     """Start a 1-node run, replan to add a splice node, resume, verify termination."""

@@ -2,7 +2,7 @@
 //
 // Renders the "Explorer" tab of the SolidWorks-faithful tabbed left pane (ui::drawLeftPane in
 // layout.cpp routes kLeftPaneExplorer here). A workspace file browser: a recursive, lazy-expand
-// directory tree rooted at AppState::workspaceDir (default Documents/AI-CAD), filtered to known
+// directory tree rooted at AppState::workspaceDir (default Documents/Chudware), filtered to known
 // CAD/ECAD extensions, plus a "Recent" section backed by AppState::recentFiles.
 //
 // Like drawFeatureTreeBody, this draws into the caller's container child — it does NOT open its own
@@ -17,7 +17,7 @@ struct AppState;
 namespace ui {
 
 // Ensure AppState::workspaceDir is set + the directory exists. Idempotent; safe to call every
-// frame. Defaults workspaceDir to <Documents>/AI-CAD (creating it) when empty, falling back to
+// frame. Defaults workspaceDir to <Documents>/Chudware (creating it) when empty, falling back to
 // the app data dir if Documents can't be resolved. Never throws.
 void ensureWorkspaceDir(AppState& st);
 

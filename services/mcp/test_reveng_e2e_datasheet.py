@@ -205,7 +205,7 @@ def test_reveng_session_ingest_via_mcp():
     import asyncio
 
     with tempfile.TemporaryDirectory() as reveng_dir:
-        os.environ["AICAD_REVENG_DIR"] = reveng_dir
+        os.environ["CHUDWARE_REVENG_DIR"] = reveng_dir
 
         from mcp.server.fastmcp import FastMCP
         from services.mcp.reveng_tools import register_reveng_tools
@@ -253,7 +253,7 @@ def test_reveng_session_ingest_via_mcp():
                 "contract gap: should wire to datasheet_ingest.ingest_datasheet for pdfplumber fallback)"
             )
 
-        del os.environ["AICAD_REVENG_DIR"]
+        del os.environ["CHUDWARE_REVENG_DIR"]
 
 
 # ---------------------------------------------------------------------------
@@ -283,7 +283,7 @@ def test_reveng_build_parametric_bearing():
     import asyncio
 
     with tempfile.TemporaryDirectory() as reveng_dir:
-        os.environ["AICAD_REVENG_DIR"] = reveng_dir
+        os.environ["CHUDWARE_REVENG_DIR"] = reveng_dir
         mcp = FastMCP("test-reveng-build")
         register_reveng_tools(mcp)
 
@@ -309,4 +309,4 @@ def test_reveng_build_parametric_bearing():
             return build_data
 
         asyncio.run(_run())
-        del os.environ["AICAD_REVENG_DIR"]
+        del os.environ["CHUDWARE_REVENG_DIR"]

@@ -13,7 +13,7 @@
 #include <string>
 #include <vector>
 
-namespace billet {
+namespace chudware {
 
 struct PickedFile {
     std::string           name;
@@ -49,4 +49,4 @@ std::string browseWorkspace(WorkspaceBrowseMode mode,
                             const char* accept,
                             const char* suggestedName);
 
-}  // namespace billet
+}  // namespace chudware

@@ -29,7 +29,7 @@ static const char* kOracleFormats = R"JSON(
 )JSON";
 
 TEST_CASE("doc_formats payload matches the Python oracle byte-for-byte (semantic)") {
-    const json payload = aicad::doc::doc_formats();
+    const json payload = chudware::doc::doc_formats();
     REQUIRE(payload.is_object());
     REQUIRE(payload.contains("formats"));
     // nlohmann object equality is key-order-insensitive; array order IS compared,
@@ -38,7 +38,7 @@ TEST_CASE("doc_formats payload matches the Python oracle byte-for-byte (semantic
 }
 
 TEST_CASE("format_registry exposes the full matrix in oracle order") {
-    const auto& reg = aicad::doc::format_registry();
+    const auto& reg = chudware::doc::format_registry();
     const json oracle = json::parse(kOracleFormats);
     REQUIRE(reg.size() == oracle.size());
     for (std::size_t i = 0; i < reg.size(); ++i) {
@@ -56,14 +56,14 @@ TEST_CASE("detect_format resolves every registry extension to its fmt") {
     // The extension map must be a projection of the registry (formats.py::
     // _EXT_TO_FORMAT is derived from the same registry — drift here means the
     // host offers a format the sniffer then rejects).
-    for (const auto& fi : aicad::doc::format_registry()) {
+    for (const auto& fi : chudware::doc::format_registry()) {
         for (const std::string& ext : fi.exts) {
             CAPTURE(ext);
-            CHECK(aicad::doc::detect_format("some/path/Body" + ext) == fi.fmt);
+            CHECK(chudware::doc::detect_format("some/path/Body" + ext) == fi.fmt);
             // Case-insensitive, like formats.py::_detect_format (suffix.lower()).
             std::string upper = ext;
             for (char& c : upper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-            CHECK(aicad::doc::detect_format("BODY" + upper) == fi.fmt);
+            CHECK(chudware::doc::detect_format("BODY" + upper) == fi.fmt);
         }
     }
 }
@@ -71,8 +71,8 @@ TEST_CASE("detect_format resolves every registry extension to its fmt") {
 TEST_CASE("detect_format rejects an unknown extension like the oracle") {
     bool threw = false;
     try {
-        (void)aicad::doc::detect_format("model.xyz");
-    } catch (const aicad::doc::OpError& e) {
+        (void)chudware::doc::detect_format("model.xyz");
+    } catch (const chudware::doc::OpError& e) {
         threw = true;
         CHECK(e.code == "invalid_op");
     }

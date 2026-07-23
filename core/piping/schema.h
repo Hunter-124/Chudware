@@ -10,7 +10,7 @@
 
 #include "piping/pyutil.h"
 
-namespace aicad::piping {
+namespace chudware::piping {
 
 using pyutil::ojson;
 
@@ -36,4 +36,4 @@ std::vector<std::string> validate_fitting(const ojson& ft,
 std::vector<std::string> validate_piping(const ojson& doc);
 inline std::vector<std::string> validate(const ojson& doc) { return validate_piping(doc); }
 
-}  // namespace aicad::piping
+}  // namespace chudware::piping

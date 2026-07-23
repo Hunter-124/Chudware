@@ -15,7 +15,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad::doc::sketchgeom {
+namespace chudware::doc::sketchgeom {
 
 // A path entity that is not a line/circle/arc (mirrors sketch_geom.UnsupportedEntity).
 struct UnsupportedEntity : std::runtime_error {
@@ -69,4 +69,4 @@ nlohmann::json fillet_corner(const nlohmann::json& la, const nlohmann::json& lb,
 nlohmann::json chamfer_corner(const nlohmann::json& la, const nlohmann::json& lb,
                               double dist_a, double dist_b);
 
-}  // namespace aicad::doc::sketchgeom
+}  // namespace chudware::doc::sketchgeom

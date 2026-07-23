@@ -3,7 +3,7 @@
 The first supported workflow is intentionally compliance-friendly:
 
 * register a CAD file the user downloaded manually or through an approved supplier API;
-* cache supplier metadata next to the CAD file under %APPDATA%/AI-CAD/vendor_parts;
+* cache supplier metadata next to the CAD file under %APPDATA%/Chudware/vendor_parts;
 * expose compact records that a small local model can reason over without re-reading catalogs;
 * insert cached CAD into a document as normal `import` features.
 
@@ -234,7 +234,7 @@ def _vendor_part_fetch(params: dict, emit: EmitFn) -> dict:
 
 
 # vendor_part_insert moved to the C++ core (doc_vendor_part_insert): it mutates a doc by applying
-# an `import` feature, which now lives in libaicad. The registry above (register/list/context +
+# an `import` feature, which now lives in libchudware. The registry above (register/list/context +
 # import_ops_for_part, get_part) is pure metadata and stays in Python — the C++ insert reads the
 # SAME index.json this module writes. import_ops_for_part is retained as the op-shape contract.
 WORKER_METHODS = {

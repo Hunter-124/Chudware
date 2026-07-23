@@ -12,7 +12,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace aicad::solver {
+namespace chudware::solver {
 namespace {
 
 // Steady-clock seconds, for the drag time budget. Returns a monotonic count.
@@ -672,4 +672,4 @@ Analysis System::analyze(const Eigen::VectorXd& x, double tol) {
     return a;
 }
 
-}  // namespace aicad::solver
+}  // namespace chudware::solver

@@ -3,7 +3,7 @@
 tools and sequences.
 
 Erik can't hand-test every modeling feature and combination; this battery carries that
-coverage headlessly. It drives the real C++ feature engine (libaicad.so) through the
+coverage headlessly. It drives the real C++ feature engine (libchudware.so) through the
 core_bridge doc RPCs (doc_new + doc_apply_ops), exercising every registered modeling op
 once (single-op pass) plus a curated pairwise/sequence matrix and a few realistic
 recipes, and asserts on real geometry results:
@@ -22,15 +22,15 @@ Report conventions mirror the T-BL01 V&V harness (`scripts/vv_benchmark.py`):
 JSON results + Markdown report under `reports/modeling/`.
 
 Run:
-    # Full battery (needs the OCCT libaicad.so), writes reports/modeling/:
-    AI_CAD_LIBAICAD=$PWD/core/build-occt-linux/bin/libaicad.so PYTHONPATH=$PWD \\
+    # Full battery (needs the OCCT libchudware.so), writes reports/modeling/:
+    CHUDWARE_LIBCHUDWARE=$PWD/core/build-occt-linux/bin/libchudware.so PYTHONPATH=$PWD \\
         python3 scripts/modeling_battery.py
 
     # Registry-integrity smoke (no .so):
     PYTHONPATH=$PWD pytest scripts/modeling_battery.py::TestSmoke -q
 
     # Full pytest (needs .so):
-    AI_CAD_LIBAICAD=$PWD/core/build-occt-linux/bin/libaicad.so PYTHONPATH=$PWD \\
+    CHUDWARE_LIBCHUDWARE=$PWD/core/build-occt-linux/bin/libchudware.so PYTHONPATH=$PWD \\
         pytest scripts/modeling_battery.py -q
 """
 from __future__ import annotations
@@ -49,7 +49,7 @@ REPORT_DIR = REPO / "reports" / "modeling"
 # Feature ops in the CLOSED vocabulary documented by cad_guide("overview")
 # (services/agent/prompts/shared/ops_cheatsheet.md) and registered in
 # core/doc/validate.cpp. These builders emit the exact JSON the engine's doc_apply_ops
-# RPC accepts. Every op dict below is proven to rebuild live against libaicad.so.
+# RPC accepts. Every op dict below is proven to rebuild live against libchudware.so.
 
 
 def dim(v: float) -> dict:
@@ -479,10 +479,10 @@ class EngineUnavailable(RuntimeError):
 def _engine():
     """Return the core_bridge module, or raise EngineUnavailable. Lazy so the module
     imports (and TestSmoke runs) without the .so."""
-    so = os.environ.get("AI_CAD_LIBAICAD")
+    so = os.environ.get("CHUDWARE_LIBCHUDWARE")
     if not so or not os.path.exists(so):
         raise EngineUnavailable(
-            "AI_CAD_LIBAICAD not set to an existing libaicad.so — cannot run live geometry")
+            "CHUDWARE_LIBCHUDWARE not set to an existing libchudware.so — cannot run live geometry")
     try:
         from mcp_server import core_bridge as cb  # noqa: PLC0415
         cb.call("doc_new", {"kind": "part", "name": "_probe"})
@@ -683,12 +683,12 @@ def write_reports(results: list[dict], cov: dict, so_path: str, elapsed: float):
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     s = _summarize(results)
     (REPORT_DIR / "modeling_results.json").write_text(json.dumps(
-        {"summary": s, "coverage": cov, "libaicad": so_path,
+        {"summary": s, "coverage": cov, "libchudware": so_path,
          "generated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
          "results": results}, indent=2))
 
     lines = [
-        "# Modeling-Op Combination Battery — AI-CAD Feature Engine",
+        "# Modeling-Op Combination Battery — Chudware Feature Engine",
         "",
         f"**Generated:** {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}  ",
         "**Script:** `scripts/modeling_battery.py` (T-BL19)  ",
@@ -739,7 +739,7 @@ def write_reports(results: list[dict], cov: dict, so_path: str, elapsed: float):
 # --------------------------------------------------------------------------- main
 def run_battery(run_overlap: bool = True) -> tuple[list[dict], dict, str]:
     cb = _engine()   # raises EngineUnavailable
-    so = os.environ.get("AI_CAD_LIBAICAD", "")
+    so = os.environ.get("CHUDWARE_LIBCHUDWARE", "")
     results = [run_case(cb, c, run_overlap=run_overlap) for c in CASES]
     return results, coverage(), so
 
@@ -751,7 +751,7 @@ def main() -> int:
     except EngineUnavailable as e:
         print(f"FATAL: {e}")
         print("A modeling battery with no live engine is an ALL-SKIP run — that is a "
-              "FAILURE, not a pass. Set AI_CAD_LIBAICAD to the OCCT libaicad.so.")
+              "FAILURE, not a pass. Set CHUDWARE_LIBCHUDWARE to the OCCT libchudware.so.")
         return 2
     elapsed = time.time() - t0
     s = _summarize(results)
@@ -807,14 +807,14 @@ class TestSmoke:
         assert _summarize([])["executed"] == 0
 
     def test_engine_unavailable_raises(self, monkeypatch):
-        monkeypatch.delenv("AI_CAD_LIBAICAD", raising=False)
+        monkeypatch.delenv("CHUDWARE_LIBCHUDWARE", raising=False)
         import pytest
         with pytest.raises(EngineUnavailable):
             _engine()
 
 
 class TestFull:
-    """Live battery — needs AI_CAD_LIBAICAD pointing at the OCCT libaicad.so."""
+    """Live battery — needs CHUDWARE_LIBCHUDWARE pointing at the OCCT libchudware.so."""
 
     def _run(self):
         import pytest

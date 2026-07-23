@@ -13,7 +13,7 @@
 
 #include "ecad/ops.h"  // OpError
 
-namespace aicad::ecad::recipes {
+namespace chudware::ecad::recipes {
 
 using nlohmann::json;
 
@@ -281,4 +281,4 @@ json closest_recipe(const std::string& request) {
     return voltage_divider();
 }
 
-}  // namespace aicad::ecad::recipes
+}  // namespace chudware::ecad::recipes

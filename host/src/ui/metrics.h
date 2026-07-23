@@ -1,6 +1,6 @@
 #pragma once
 // -------------------------------------------------------------------------------------------------
-// AI-CAD GUI metrics — the SINGLE place GUI dimensions are defined.
+// Chudware GUI metrics — the SINGLE place GUI dimensions are defined.
 //
 // Rationale (docs/GUI_STYLE_GUIDE.md): sizing was scattered as raw pixel literals across ~25 files,
 // which drifted and mis-scaled at HiDPI. This header centralizes the dimensions so they can be

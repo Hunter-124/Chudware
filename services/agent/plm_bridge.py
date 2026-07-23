@@ -11,7 +11,7 @@ Design decisions
 * Enablement precedence (default OFF):
     1. project manifest ``ai_mode == "managed"`` → real PLMVaultClient
        (agent CAD-touching milestones auto-checkpoint; no env needed)
-    2. ``AICAD_PLM_BRIDGE=1`` → real PLMVaultClient
+    2. ``CHUDWARE_PLM_BRIDGE=1`` → real PLMVaultClient
     3. otherwise → MockVault (safe offline default)
   Reachable without the env flag via PLM Settings → AI assistance → Managed
   (``plm_set_ai_mode`` / worker twin already round-trip the tier).
@@ -169,8 +169,8 @@ class MockVault:
 # ---------------------------------------------------------------------------
 
 def bridge_enabled_by_env() -> bool:
-    """True when ``AICAD_PLM_BRIDGE=1`` (case/whitespace-tolerant)."""
-    return os.environ.get("AICAD_PLM_BRIDGE", "").strip() == "1"
+    """True when ``CHUDWARE_PLM_BRIDGE=1`` (case/whitespace-tolerant)."""
+    return os.environ.get("CHUDWARE_PLM_BRIDGE", "").strip() == "1"
 
 
 def _project_dir_is_managed(project_dir: str | os.PathLike | None) -> bool:
@@ -195,7 +195,7 @@ def _project_dir_is_managed(project_dir: str | os.PathLike | None) -> bool:
 def bridge_should_use_real(
     project_dir: str | os.PathLike | None = None,
 ) -> bool:
-    """Enablement gate: managed ai_mode > AICAD_PLM_BRIDGE env > off.
+    """Enablement gate: managed ai_mode > CHUDWARE_PLM_BRIDGE env > off.
 
     Default remains OFF. Managed mode is reachable from PLM Settings without
     setting the env var; the env flag forces the real client for any tier
@@ -211,7 +211,7 @@ def _default_vault(
 ) -> VaultClient:
     """Return the vault client selected by the enablement gate.
 
-    Precedence: managed ai_mode > AICAD_PLM_BRIDGE=1 > MockVault.
+    Precedence: managed ai_mode > CHUDWARE_PLM_BRIDGE=1 > MockVault.
     Uses the process-wide :func:`services.plm.client.shared_client` so
     ``register_run`` / ``register_project`` stick across bridge instances.
     """

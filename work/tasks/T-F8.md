@@ -68,12 +68,12 @@ real engine — the 13 pre-existing T-F7-era tests (regression check on the
 How: the worktree lacks `core/build-occt-linux/bin/` and `host/build-linux/bin/`
 (the two Linux dirs `core_bridge._lib_candidates()` probes), so `cb.available()`
 was False and everything skipped. The gate's own stage-2 build (OCCT ON) lands at
-`core/build-linux/bin/libaicad.so` in this worktree — pointed the documented
+`core/build-linux/bin/libchudware.so` in this worktree — pointed the documented
 escape hatch at it:
 
 ```
-AI_CAD_LIBAICAD=$PWD/core/build-linux/bin/libaicad.so \
-  ~/.local/share/AI-CAD/mcp-venv/bin/python -m pytest services/mcp/test_gsl_tools.py -q
+CHUDWARE_LIBCHUDWARE=$PWD/core/build-linux/bin/libchudware.so \
+  ~/.local/share/Chudware/mcp-venv/bin/python -m pytest services/mcp/test_gsl_tools.py -q
 ```
 
 Also verified: `services/agent/loop.py` imports cleanly and `_format_fit` resolves

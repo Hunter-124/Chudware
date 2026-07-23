@@ -1,6 +1,6 @@
 // struct_cli: differential-harness driver (same role as fw_cli / sketch_cli) —
 // reads one {"method","params"} JSON document on stdin and prints the
-// aicad::structural::call result as one JSON line. Used by the T-RF19 parity
+// chudware::structural::call result as one JSON line. Used by the T-RF19 parity
 // diffs against the Python oracle.
 
 #include <iostream>
@@ -20,7 +20,7 @@ int main() {
     }
     nlohmann::json result;
     std::string err;
-    const bool handled = aicad::structural::call(
+    const bool handled = chudware::structural::call(
         req["method"].get<std::string>(),
         req.contains("params") ? req["params"] : nlohmann::json::object(), result, err);
     if (!handled) {

@@ -8,7 +8,7 @@
 
 #include "cam/model.h"
 
-namespace aicad {
+namespace chudware {
 namespace cam {
 
 // A regular grid over [min..max] in XY storing the highest mesh Z at each node
@@ -62,4 +62,4 @@ std::vector<std::vector<Path2>> waterline_sections(const TriMesh&,
                                                    double tolerance = 0.01);
 
 }  // namespace cam
-}  // namespace aicad
+}  // namespace chudware

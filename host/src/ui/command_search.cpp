@@ -1,4 +1,4 @@
-// AI-CAD unified command + settings search widget (W2-Search).
+// Chudware unified command + settings search widget (W2-Search).
 // Floating glass window, centered, opened when AppState::showCommandSearch is true.
 // Results: (a) ribbon modeling commands from getRibbonCmds(); (b) settings entries from
 // kSettingsEntries[]. Activates on click or Enter (first match); ESC closes.

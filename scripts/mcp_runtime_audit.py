@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """MCP Runtime Audit — sonnet-vega, T-V2.
 
-Calls every registered MCP tool through the real mcp-venv with AI_CAD_LIBAICAD set
+Calls every registered MCP tool through the real mcp-venv with CHUDWARE_LIBCHUDWARE set
 and records WORKS / DEGRADED / DEAD / INCONCLUSIVE verdicts.
 
 Usage:
-    AI_CAD_LIBAICAD=/home/hunter/Repositories/CAD/core/build-linux/bin/libaicad.so \\
-        /home/hunter/.local/share/AI-CAD/mcp-venv/bin/python scripts/mcp_runtime_audit.py
+    CHUDWARE_LIBCHUDWARE=/home/hunter/Repositories/CAD/core/build-linux/bin/libchudware.so \\
+        /home/hunter/.local/share/Chudware/mcp-venv/bin/python scripts/mcp_runtime_audit.py
 
     # Or with a custom output path:
-    AI_CAD_LIBAICAD=... python scripts/mcp_runtime_audit.py --out work/audits/MCP_RUNTIME_AUDIT.md
+    CHUDWARE_LIBCHUDWARE=... python scripts/mcp_runtime_audit.py --out work/audits/MCP_RUNTIME_AUDIT.md
 
 Verdict definitions:
   WORKS       - tool called, returned a result (even an error-envelope result)
@@ -39,13 +39,13 @@ from typing import Any
 _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO))
 
-LIBAICAD = os.environ.get(
-    "AI_CAD_LIBAICAD",
-    str(_REPO / "core/build-linux/bin/libaicad.so"),
+LIBCHUDWARE = os.environ.get(
+    "CHUDWARE_LIBCHUDWARE",
+    str(_REPO / "core/build-linux/bin/libchudware.so"),
 )
-os.environ.setdefault("AI_CAD_LIBAICAD", LIBAICAD)
+os.environ.setdefault("CHUDWARE_LIBCHUDWARE", LIBCHUDWARE)
 # Suppress OCCT noise on stdout (audit script is not an MCP stdio server)
-os.environ.setdefault("AI_CAD_QUIET", "1")
+os.environ.setdefault("CHUDWARE_QUIET", "1")
 
 # ---------------------------------------------------------------------------
 # Families and their registration functions (mirrors server.py exactly)
@@ -319,7 +319,7 @@ DEGRADED_REASONS = (
     "missing key",
     "not found",        # for nonexistent file paths (graceful degradation)
     "no such file",
-    "libaicad",
+    "libchudware",
     "core not available",
     "core unavailable",
     "dll not available",
@@ -420,7 +420,7 @@ def run_audit(out_path: Path | None = None) -> dict:
     from mcp.server.fastmcp import FastMCP
     import mcp_server.tool_registry as _reg
 
-    mcp = FastMCP("AI-CAD-audit")
+    mcp = FastMCP("Chudware-audit")
 
     # Per-family import results
     family_import: dict[str, str] = {}  # family -> "OK" | "FAILED: ..."
@@ -621,7 +621,7 @@ def run_audit(out_path: Path | None = None) -> dict:
         "declared_missing": declared_missing,
         "undeclared_deps": undeclared,
         "total_tools": len(all_tools),
-        "libaicad": LIBAICAD,
+        "libchudware": LIBCHUDWARE,
     }
 
 
@@ -634,7 +634,7 @@ def make_markdown(data: dict) -> str:
     lines.append("")
     lines.append("**Task:** T-V2  **Agent:** sonnet-vega  **Date:** 2026-07-02")
     lines.append("")
-    lines.append(f"**Library:** `{data['libaicad']}`")
+    lines.append(f"**Library:** `{data['libchudware']}`")
     lines.append(f"**Total registered tools:** {data['total_tools']}")
     lines.append("")
 
@@ -928,7 +928,7 @@ def run_test_pollution(out_md_path: Path | None) -> str:
     lines.append("   (noted in task context as fixed 2026-07-03) may still surface in suites that do")
     lines.append("   not load the engine with the DATA path set.")
     lines.append("")
-    lines.append("4. **Env-var mutations** — tests that set `AI_CAD_LIBAICAD` or `TAVILY_API_KEY`")
+    lines.append("4. **Env-var mutations** — tests that set `CHUDWARE_LIBCHUDWARE` or `TAVILY_API_KEY`")
     lines.append("   without restoring them pollute subsequent suite imports.")
     lines.append("")
     lines.append("**Proposed follow-up task:** T-V3 — Add `conftest.py` fixtures to reset MCP")
@@ -955,7 +955,7 @@ def main() -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     print(f"=== MCP Runtime Audit T-V2 ===")
-    print(f"Library: {LIBAICAD}")
+    print(f"Library: {LIBCHUDWARE}")
     print(f"Venv: {sys.executable}")
     print()
 

@@ -8,7 +8,7 @@
 
 using nlohmann::json;
 
-namespace aicad {
+namespace chudware {
 namespace prof {
 namespace tree {
 
@@ -328,4 +328,4 @@ Node build_phase_tree(
 
 }  // namespace tree
 }  // namespace prof
-}  // namespace aicad
+}  // namespace chudware

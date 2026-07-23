@@ -12,7 +12,7 @@
 #include <string>
 #include <vector>
 
-using aicad::sketch::solve_sketch;
+using chudware::sketch::solve_sketch;
 using json = nlohmann::json;
 
 namespace {

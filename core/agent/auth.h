@@ -22,7 +22,7 @@
 
 #include "agent/http.h"
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 namespace auth {
 
@@ -74,4 +74,4 @@ void set_http_post_for_testing(HttpPostFn fn);
 
 }  // namespace auth
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware

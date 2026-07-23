@@ -4,7 +4,7 @@
 
 #include "agent/firm_bid.h"
 
-using namespace aicad::agent;
+using namespace chudware::agent;
 
 TEST_CASE("token estimate scales with complexity") {
     auto solo = estimate_task_tokens("a nut", Complexity::Solo, Domain::Modeling);

@@ -1,6 +1,6 @@
 // In-app sampling-profiler window — implementation. See profiler_window.h.
 //
-// Drives the libaicad sampling profiler over core::cpp_core() (prof_start / prof_stop /
+// Drives the libchudware sampling profiler over core::cpp_core() (prof_start / prof_stop /
 // prof_report — the same RPCs app.cpp's Evaluate>Profiler toggle uses), then renders the
 // returned report: a module self-time table, flat self/total tables, and a flame graph parsed
 // from the "folded" stacks. The parsed flame layout is cached in this TU and rebuilt only when
@@ -40,7 +40,7 @@ void pushText(const float c[4]) {
 
 // ----------------------------------------------------------------- module colours
 // Mirror tools/flamegraph.py's fixed palette so a subsystem keeps its colour, then a stable
-// hash-derived warm colour for everything else. "aicad" aliases "libaicad" (the Linux module
+// hash-derived warm colour for everything else. "chudware" aliases "libchudware" (the Linux module
 // name strips the leading "lib").
 uint32_t fnv1a(const std::string& s) {
     uint32_t h = 2166136261u;
@@ -57,8 +57,8 @@ ImU32 flameColorForModule(const std::string& mod) {
         ImU32 c;
     };
     static const Entry kPal[] = {
-        {"libaicad", IM_COL32(0x4e, 0x79, 0xa7, 255)},
-        {"aicad", IM_COL32(0x4e, 0x79, 0xa7, 255)},
+        {"libchudware", IM_COL32(0x4e, 0x79, 0xa7, 255)},
+        {"chudware", IM_COL32(0x4e, 0x79, 0xa7, 255)},
         {"TKBO", IM_COL32(0xe1, 0x57, 0x59, 255)},
         {"TKBRep", IM_COL32(0xf2, 0x8e, 0x2b, 255)},
         {"TKFillet", IM_COL32(0xed, 0xc9, 0x48, 255)},
@@ -323,7 +323,7 @@ bool profCall(AppState& st, const char* method, const json& params, json& res) {
         st.toast(ui::ToastLevel::Error,
                  std::string("Profiler ") + method + " failed: " +
                      (err.empty()
-                          ? std::string("engine unavailable - rebuild + restart so libaicad "
+                          ? std::string("engine unavailable - rebuild + restart so libchudware "
                                         "exposes prof_*")
                           : err));
         return false;

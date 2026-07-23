@@ -1,7 +1,7 @@
 """Admin-only rebuild / redeploy ops.
 
 Jobs are launched DETACHED (systemd-run --user scope, with a setsid/nohup
-fallback) so redeploy can restart billet-gateway without suiciding the worker
+fallback) so redeploy can restart chudware-gateway without suiciding the worker
 that answered the request. A flock on deploy.lock serializes concurrent runs
 inside the shell scripts; the Python side also gates on deploy-status.json.
 """
@@ -28,7 +28,7 @@ except ImportError:  # uvicorn app:app from package dir
     from config import settings
     from auth import get_current_user
 
-log = logging.getLogger("billet-web.deploy")
+log = logging.getLogger("chudware-web.deploy")
 
 router = APIRouter(prefix="/api/admin", tags=["deploy"])
 
@@ -62,7 +62,7 @@ def _log_path(kind: str) -> Path:
 
 
 def _repo_dir() -> Path:
-    env = (os.environ.get("BILLET_OMP_DIR") or "").strip()
+    env = (os.environ.get("CHUDWARE_OMP_DIR") or "").strip()
     if env:
         return Path(env).expanduser().resolve()
     return Path(__file__).resolve().parents[2]
@@ -176,10 +176,10 @@ def _launch_detached(argv: list[str], *, delay: float = 0, logfile: Path | None 
 
     sd = shutil.which("systemd-run")
     if sd:
-        # Force BILLET_WEB_DATA to the SAME root Python reads (settings.data_root)
+        # Force CHUDWARE_WEB_DATA to the SAME root Python reads (settings.data_root)
         # so the scripts write status/log/lock exactly where the API reads them.
-        # They otherwise key off different env names (BILLET_WEB_DATA in the
-        # scripts vs BILLET_WEB_DATA_ROOT in config.py) that coincide only by
+        # They otherwise key off different env names (CHUDWARE_WEB_DATA in the
+        # scripts vs CHUDWARE_WEB_DATA_ROOT in config.py) that coincide only by
         # default path in prod — relocating the data root would silently split them.
         setenv = {}
         for key in ("HOME", "PATH"):
@@ -187,9 +187,9 @@ def _launch_detached(argv: list[str], *, delay: float = 0, logfile: Path | None 
             if val:
                 setenv[key] = val
         for key, val in os.environ.items():
-            if key.startswith("BILLET_") and val:
+            if key.startswith("CHUDWARE_") and val:
                 setenv[key] = val
-        setenv["BILLET_WEB_DATA"] = str(settings.data_root)
+        setenv["CHUDWARE_WEB_DATA"] = str(settings.data_root)
         cmd = [sd, "--user", "--collect", "--quiet",
                f"--working-directory={_repo_dir()}"]
         for key, val in setenv.items():
@@ -241,7 +241,7 @@ def _launch_detached(argv: list[str], *, delay: float = 0, logfile: Path | None 
     else:
         final = inner
 
-    child_env = {**os.environ, "BILLET_WEB_DATA": str(settings.data_root)}
+    child_env = {**os.environ, "CHUDWARE_WEB_DATA": str(settings.data_root)}
     try:
         subprocess.Popen(  # noqa: S603
             final,
@@ -325,7 +325,7 @@ async def deploy_redeploy(request: Request) -> JSONResponse:
         raise HTTPException(status_code=500, detail=f"missing redeploy script: {script}")
 
     _write_status_starting("redeploy")
-    # delay=2 so the 202 response flushes before billet-gateway is restarted.
+    # delay=2 so the 202 response flushes before chudware-gateway is restarted.
     argv = ["bash", str(script)]
     _launch_detached(argv, delay=2, logfile=_log_path("redeploy"))
     return JSONResponse(

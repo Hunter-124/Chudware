@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """V&V Benchmark Harness — T-BL01.
 
-Systematic validation of AI-CAD simulation and analysis backends against
+Systematic validation of Chudware simulation and analysis backends against
 INDEPENDENT analytic reference solutions (textbook cases, NAFEMS-style
 benchmarks where freely reproducible).
 
@@ -16,14 +16,14 @@ Reference values are derived INDEPENDENTLY in this script (never read from the e
 under test). Every formula is cited in the inline comment above it.
 
 Usage (standalone):
-    AI_CAD_LIBAICAD=/path/to/libaicad.so \\
-        ~/.local/share/AI-CAD/mcp-venv/bin/python scripts/vv_benchmark.py
+    CHUDWARE_LIBCHUDWARE=/path/to/libchudware.so \\
+        ~/.local/share/Chudware/mcp-venv/bin/python scripts/vv_benchmark.py
 
 Usage (pytest smoke — no .so needed):
     pytest scripts/vv_benchmark.py -q
 
 Usage (full suite via pytest):
-    AICAD_RUN_VV=full AI_CAD_LIBAICAD=... pytest scripts/vv_benchmark.py -q
+    CHUDWARE_RUN_VV=full CHUDWARE_LIBCHUDWARE=... pytest scripts/vv_benchmark.py -q
 
 Exit code: 0 if all executed checks within tolerance (or skip-with-reason); 1 on failure.
 Zero executed checks = failure (all-skip = failure, per sprint policy).
@@ -733,16 +733,16 @@ def _mcp_call(name: str, args: dict) -> dict:
 
 def _fea_ready() -> tuple[bool, str]:
     """Whether the C++ engine is staged and reachable through mcp_server.core_bridge."""
-    lib_path = os.environ.get("AI_CAD_LIBAICAD", "")
+    lib_path = os.environ.get("CHUDWARE_LIBCHUDWARE", "")
     if not lib_path or not os.path.exists(lib_path):
-        return False, ("AI_CAD_LIBAICAD not set — C++ FEA is only reachable through the "
+        return False, ("CHUDWARE_LIBCHUDWARE not set — C++ FEA is only reachable through the "
                         "full MCP server (run_fea_static/run_fea_modal)")
     try:
         from mcp_server import core_bridge as cb
     except ImportError as exc:
         return False, f"mcp_server import failed: {exc}"
     if not cb.available():
-        return False, "core_bridge reports libaicad not loadable"
+        return False, "core_bridge reports libchudware not loadable"
     return True, ""
 
 
@@ -1013,10 +1013,10 @@ def bench_cfd_lbm_trend() -> None:
     """
     print("\n--- [cfd-lbm] LBM drag trend (Cd velocity-independence) ---")
 
-    lib_path = os.environ.get("AI_CAD_LIBAICAD", "")
+    lib_path = os.environ.get("CHUDWARE_LIBCHUDWARE", "")
     if not lib_path or not os.path.exists(lib_path):
         _skip("cfd-lbm", "LBM-T1-drag-velocity-squared",
-              "AI_CAD_LIBAICAD not set — C++ LBM only accessible through full MCP server; "
+              "CHUDWARE_LIBCHUDWARE not set — C++ LBM only accessible through full MCP server; "
               "TREND test requires two sim_run_flow calls with different velocities",
               "Drag equation: F=½ρCdAV² → Cd=const for fixed Re regime")
         return
@@ -1393,7 +1393,7 @@ def _generate_report(elapsed: float) -> str:
     n_skip = sum(1 for r in _RESULTS if not r.executed)
 
     lines = [
-        "# V&V Benchmark Report — AI-CAD Simulation Backends",
+        "# V&V Benchmark Report — Chudware Simulation Backends",
         "",
         f"**Generated:** {now}  ",
         f"**Script:** `scripts/vv_benchmark.py` (T-BL01)  ",
@@ -1468,12 +1468,12 @@ def _generate_report(elapsed: float) -> str:
         "pytest scripts/vv_benchmark.py -k 'smoke' -q",
         "",
         "# Full suite:",
-        "AICAD_RUN_VV=full AI_CAD_LIBAICAD=/path/to/libaicad.so \\",
+        "CHUDWARE_RUN_VV=full CHUDWARE_LIBCHUDWARE=/path/to/libchudware.so \\",
         "    pytest scripts/vv_benchmark.py -q",
         "```",
         "",
         "Gate integration: `gate.sh` stage 4.5 runs the smoke subset when "
-        "`AICAD_RUN_VV` is set (skipped by default, same pattern as `AICAD_RUN_BENCH`).",
+        "`CHUDWARE_RUN_VV` is set (skipped by default, same pattern as `CHUDWARE_RUN_BENCH`).",
     ]
 
     return "\n".join(lines)
@@ -1491,8 +1491,8 @@ def main() -> int:
     print("=" * 70)
     print("vv_benchmark.py — T-BL01 V&V Benchmark Harness")
     print(f"Python: {sys.executable}")
-    print(f"AI_CAD_LIBAICAD: {os.environ.get('AI_CAD_LIBAICAD', '(not set)')}")
-    print(f"AICAD_RUN_VV: {os.environ.get('AICAD_RUN_VV', '(not set = smoke)')}")
+    print(f"CHUDWARE_LIBCHUDWARE: {os.environ.get('CHUDWARE_LIBCHUDWARE', '(not set)')}")
+    print(f"CHUDWARE_RUN_VV: {os.environ.get('CHUDWARE_RUN_VV', '(not set = smoke)')}")
     print("=" * 70)
 
     t0 = time.perf_counter()
@@ -1786,14 +1786,14 @@ class TestSmoke:
 
 
 class TestFull:
-    """Full suite: requires AI_CAD_LIBAICAD and external deps.
-    Run with AICAD_RUN_VV=full.
+    """Full suite: requires CHUDWARE_LIBCHUDWARE and external deps.
+    Run with CHUDWARE_RUN_VV=full.
     """
 
     @pytest.fixture(autouse=True)
     def _require_full(self):
-        if os.environ.get("AICAD_RUN_VV", "") != "full":
-            pytest.skip("set AICAD_RUN_VV=full to run full V&V suite")
+        if os.environ.get("CHUDWARE_RUN_VV", "") != "full":
+            pytest.skip("set CHUDWARE_RUN_VV=full to run full V&V suite")
 
     def test_piping_darcy_weisbach(self):
         """P1: Piping Darcy-Weisbach single run — ENGINEERING tier."""

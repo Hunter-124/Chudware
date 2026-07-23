@@ -660,7 +660,7 @@ def _describe_toolpaths_text(job_id: Optional[str] = None, audit: bool = True) -
     gcode_text = None
     try:
         post_r = cb.call("cam_post", {"doc_id": jid,
-                                      "options": {"program_name": "AICAD",
+                                      "options": {"program_name": "Chudware",
                                                   "program_number": 1000}})
         gcode_text = post_r.get("gcode")
     except Exception:  # noqa: BLE001

@@ -7,7 +7,7 @@ slender steel cantilever clamped at one end with a transverse tip load, so it be
 visibly and stress concentrates at the root. NEVER a stylized glyph: the deformed
 shape and the von-Mises colormap are the solver's own output.
 
-Pipeline (drives the same libaicad RPC bridge the MCP server / test_fea_live_bridge
+Pipeline (drives the same libchudware RPC bridge the MCP server / test_fea_live_bridge
 use, all raw core-bridge method names):
 
     doc_new -> doc_apply_ops(add_feature box) -> doc_export_step
@@ -45,13 +45,13 @@ SS = 4  # supersample for crisp triangle edges when the tile is shrunk to 32/20 
 sys.path.insert(0, str(REPO))
 
 
-def _resolve_libaicad() -> None:
-    """Point core_bridge at a FEA-capable libaicad.so. The plain build-linux .so
+def _resolve_libchudware() -> None:
+    """Point core_bridge at a FEA-capable libchudware.so. The plain build-linux .so
     does NOT carry the Netgen FEA RPCs ("unknown method: sim_run_static"), so we
     prefer build-occt-linux. Worktrees carry no build dir -> fall back to the main
     checkout via the git common dir (same probe as cam_toolpath_icons.py)."""
     import subprocess
-    if os.environ.get("AI_CAD_LIBAICAD"):
+    if os.environ.get("CHUDWARE_LIBCHUDWARE"):
         return
     roots = [REPO]
     try:
@@ -63,16 +63,16 @@ def _resolve_libaicad() -> None:
     except Exception:
         pass
     for root in roots:
-        # occt build FIRST — it is the one with AICAD_WITH_NETGEN / the FEA plugin.
-        for rel in ("core/build-occt-linux/bin/libaicad.so",
-                    "host/build-occt-linux/bin/libaicad.so"):
+        # occt build FIRST — it is the one with CHUDWARE_WITH_NETGEN / the FEA plugin.
+        for rel in ("core/build-occt-linux/bin/libchudware.so",
+                    "host/build-occt-linux/bin/libchudware.so"):
             p = root / rel
             if p.exists():
-                os.environ["AI_CAD_LIBAICAD"] = str(p)
+                os.environ["CHUDWARE_LIBCHUDWARE"] = str(p)
                 return
 
 
-_resolve_libaicad()
+_resolve_libchudware()
 
 
 # ---------------------------------------------------------------------------
@@ -147,8 +147,8 @@ def _read_overlay(handle: str) -> bytes:
 
     The engine emits two forms (matches scripts/sim_icons.py._read_overlay):
       * a plain filesystem path (older engine / file fallback), and
-      * ``aicm-shm:///aicad_overlay_N`` -> POSIX shm object ``/aicad_overlay_N``,
-        i.e. ``/dev/shm/aicad_overlay_N``, whose layout is an 8-byte little-endian
+      * ``aicm-shm:///chudware_overlay_N`` -> POSIX shm object ``/chudware_overlay_N``,
+        i.e. ``/dev/shm/chudware_overlay_N``, whose layout is an 8-byte little-endian
         size header followed by exactly that many AICM payload bytes
         (core/util/aicm_handoff.cpp publish_shm: memcpy(p,&sz,8); memcpy(p+8,data,n)).
     """
@@ -156,7 +156,7 @@ def _read_overlay(handle: str) -> bytes:
         raise RuntimeError("empty overlay handle")
     prefix = "aicm-shm://"
     if handle.startswith(prefix):
-        name = handle[len(prefix):]          # "/aicad_overlay_0"
+        name = handle[len(prefix):]          # "/chudware_overlay_0"
         name = "/" + name.lstrip("/")        # normalize to a single leading slash
         shm_path = Path("/dev/shm") / name.lstrip("/")
         if not shm_path.exists():
@@ -304,9 +304,9 @@ def main() -> int:
     except Exception:
         import core_bridge as cb  # type: ignore
 
-    if not os.environ.get("AI_CAD_LIBAICAD"):
-        print("[fea_icons] FAILED: no FEA-capable libaicad.so found "
-              "(need core/build-occt-linux/bin/libaicad.so with AICAD_WITH_NETGEN)")
+    if not os.environ.get("CHUDWARE_LIBCHUDWARE"):
+        print("[fea_icons] FAILED: no FEA-capable libchudware.so found "
+              "(need core/build-occt-linux/bin/libchudware.so with CHUDWARE_WITH_NETGEN)")
         return 1
 
     parsed, summary, stats = solve_cantilever(cb)

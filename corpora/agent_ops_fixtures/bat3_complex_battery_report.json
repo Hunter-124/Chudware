@@ -1,5 +1,5 @@
 {
-  "socket": "/run/user/1000/aicad/hostd-bat3.sock",
+  "socket": "/run/user/1000/chudware/hostd-bat3.sock",
   "engine_build": "night2-3237-gf81fcc1c-dirty (later runs); earlier crashes on night2-3236-g11e3a140-dirty",
   "prompts": [
     {
@@ -296,7 +296,7 @@
     {
       "rank": 1,
       "problem": "doc_dry_run_ops / sketch add_distance SIGSEGV on single-ref distance constraints",
-      "evidence": "P1 and P4 both SIGSEGV in aicad::sketch::add_distance during dry-run after modeler returned sketch_add_constraint type=distance refs:[line_id]. Core pid 2621550 bt: add_distance\u2190solve_sketch\u2190doc_dry_run_ops\u2190run_design. Ops saved /tmp/bat3_p1_crash_ops.json and /tmp/bat3_p4_crash_ops.json. Bad constraint must be validation error, not hostd death."
+      "evidence": "P1 and P4 both SIGSEGV in chudware::sketch::add_distance during dry-run after modeler returned sketch_add_constraint type=distance refs:[line_id]. Core pid 2621550 bt: add_distance\u2190solve_sketch\u2190doc_dry_run_ops\u2190run_design. Ops saved /tmp/bat3_p1_crash_ops.json and /tmp/bat3_p4_crash_ops.json. Bad constraint must be validation error, not hostd death."
     },
     {
       "rank": 2,
@@ -306,7 +306,7 @@
     {
       "rank": 3,
       "problem": "Assembly multi-part builds are fragile; hostd crash aborts entire assembly after first part modeler",
-      "evidence": "P1 correctly decomposed to 2 parts but died on bracket_a model dry-run; no isolation/recovery; client sees EOF/no final RPC; also bat hostds started without AI_CAD_PROMPTS_DIR until fixed (cwd /tmp/batN)."
+      "evidence": "P1 correctly decomposed to 2 parts but died on bracket_a model dry-run; no isolation/recovery; client sees EOF/no final RPC; also bat hostds started without CHUDWARE_PROMPTS_DIR until fixed (cwd /tmp/batN)."
     }
   ],
   "sheetmetal_tool_access_finding_spelled_out": "For Standard-classified sheetmetal domain runs, the modeler's cheatsheet tier DOES include sm_* ops. task_route grants tool_classes+=sheetmetal and context_sheets=['sheetmetal','box','hole']; roles.cpp appends shared/ops_cheatsheet.md (full, not solo) plus DOMAIN CHEATSHEET (sheetmetal) because complexity!=Solo. Live proof: modeler emitted add_feature type=sm_base_flange and agent.tool_call apply succeeded with doc.preview revision=1. No validation errors of the form 'unknown op sm_*', no request_tools, no tool_scope auto-escalation. Early 'ops failed validation' were sketch authoring issues (constraints before entities), not tier gaps. sm_hem was planned but the run did not complete far enough to apply the hem."

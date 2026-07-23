@@ -25,12 +25,12 @@
 #include "structural/structural_rpc.h"
 
 using nlohmann::json;
-using namespace aicad::structural;
+using namespace chudware::structural;
 
 namespace {
 
 std::string fixture_path(const std::string& name) {
-    return std::string(AICAD_TEST_DATA) + "/" + name;
+    return std::string(CHUDWARE_TEST_DATA) + "/" + name;
 }
 
 json load_fixture(const std::string& name) {
@@ -44,7 +44,7 @@ json load_fixture(const std::string& name) {
 json rpc(const std::string& method, const json& params) {
     json result;
     std::string err;
-    const bool handled = aicad::structural::call(method, params, result, err);
+    const bool handled = chudware::structural::call(method, params, result, err);
     REQUIRE(handled);
     return result;
 }
@@ -371,7 +371,7 @@ TEST_CASE("error envelopes") {
     json result;
     std::string err;
     // Unknown method falls through (integrator routes to the next layer).
-    CHECK(!aicad::structural::call("not_a_struct_method", json::object(), result, err));
+    CHECK(!chudware::structural::call("not_a_struct_method", json::object(), result, err));
     // Bad schema.
     result = rpc("struct_analyze", {{"doc", json::object({{"schema", "nope"}})}});
     CHECK(result["code"] == "invalid_schema");

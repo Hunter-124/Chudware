@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""billet-web host monitor — sample host health, reaper actions, JSONL log.
+"""chudware-web host monitor — sample host health, reaper actions, JSONL log.
 
 stdlib only. Run by systemd user timer every 2 min, or:
   python3 monitor.py            # sample + act + append JSONL
@@ -20,20 +20,20 @@ from pathlib import Path
 from typing import Any
 
 # --- knobs -----------------------------------------------------------------
-DATA_ROOT = Path(os.environ.get("BILLET_WEB_DATA", Path.home() / "billet-web-data"))
+DATA_ROOT = Path(os.environ.get("CHUDWARE_WEB_DATA", Path.home() / "chudware-web-data"))
 LOG_PATH = DATA_ROOT / "logs" / "monitor.jsonl"
 REFUSE_FLAG = DATA_ROOT / "REFUSE_NEW"
-GATEWAY_HEALTHZ = os.environ.get("BILLET_GATEWAY_HEALTHZ", "http://127.0.0.1:8300/healthz")
+GATEWAY_HEALTHZ = os.environ.get("CHUDWARE_GATEWAY_HEALTHZ", "http://127.0.0.1:8300/healthz")
 CONTAINER_STORAGE = Path(
     os.environ.get(
-        "BILLET_CONTAINER_STORAGE",
+        "CHUDWARE_CONTAINER_STORAGE",
         Path.home() / ".local/share/containers/storage",
     )
 )
-MEM_ACT_BYTES = int(os.environ.get("BILLET_MONITOR_MEM_ACT", str(4 * 1024**3)))  # 4 GiB
-DISK_REFUSE_PCT = float(os.environ.get("BILLET_MONITOR_DISK_REFUSE_PCT", "10"))
+MEM_ACT_BYTES = int(os.environ.get("CHUDWARE_MONITOR_MEM_ACT", str(4 * 1024**3)))  # 4 GiB
+DISK_REFUSE_PCT = float(os.environ.get("CHUDWARE_MONITOR_DISK_REFUSE_PCT", "10"))
 LOG_ROTATE_BYTES = 10 * 1024 * 1024  # 10 MiB
-SESSION_NAME_PREFIX = "billet-sess-"
+SESSION_NAME_PREFIX = "chudware-sess-"
 
 
 def _run(cmd: list[str], timeout: float = 15.0) -> tuple[int, str, str]:
@@ -225,7 +225,7 @@ def set_refuse(want: bool, dry_run: bool) -> dict[str, Any] | None:
         if not dry_run:
             REFUSE_FLAG.parent.mkdir(parents=True, exist_ok=True)
             REFUSE_FLAG.write_text(
-                f"set by billet-monitor at {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
+                f"set by chudware-monitor at {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
                 "disk free below threshold; gateway must refuse new sessions\n",
                 encoding="utf-8",
             )
@@ -322,7 +322,7 @@ def append_jsonl(record: dict[str, Any], dry_run: bool) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="billet-web host monitor")
+    ap = argparse.ArgumentParser(description="chudware-web host monitor")
     ap.add_argument(
         "--dry-run",
         action="store_true",

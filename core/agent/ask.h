@@ -16,7 +16,7 @@
 
 #include "agent/state.h"  // ojson
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 
 extern const char* kAskRole;    // "ask"
@@ -58,4 +58,4 @@ std::string answer_question(const std::string& question, const ojson& doc,
                             const ojson& feature_status, const AskCompleteFn& complete);
 
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware

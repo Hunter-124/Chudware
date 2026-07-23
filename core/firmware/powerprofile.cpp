@@ -16,12 +16,12 @@
 #include "firmware/pinmap.h"
 #include "firmware/pyfmt.h"
 
-namespace aicad::firmware {
+namespace chudware::firmware {
 namespace {
 
-// Firmware-side CPU state marker: AICAD_CPU_EVT run t=120ms | sleep t=120000us.
+// Firmware-side CPU state marker: CHUDWARE_CPU_EVT run t=120ms | sleep t=120000us.
 const std::regex kCpuEvtRe(
-    R"(AICAD_CPU_EVT\s+(run|sleep)(?:\s+t=([0-9]+(?:\.[0-9]+)?)(ms|us|s)?)?)");
+    R"(CHUDWARE_CPU_EVT\s+(run|sleep)(?:\s+t=([0-9]+(?:\.[0-9]+)?)(ms|us|s)?)?)");
 
 const std::set<std::string> kGroundNames = {"GND", "GNDA", "GNDD", "AGND", "DGND", "PGND",
                                             "EGND", "VSS", "VSSA", "EARTH", "CHASSIS"};
@@ -125,13 +125,13 @@ nlohmann::json cpu_residency(const nlohmann::json& uart_events,
             {"sleep_s", round_n((1.0 - frac) * window / 1000.0, 6)},
             {"source", "cpu_markers"},
             {"note", std::to_string(marks.size()) +
-                         " AICAD_CPU_EVT marker(s) integrated over " + fmt_g(window) +
+                         " CHUDWARE_CPU_EVT marker(s) integrated over " + fmt_g(window) +
                          "ms window"},
         };
     }
     std::string note =
-        "no time-stamped AICAD_CPU_EVT markers in trace — assuming CPU always active "
-        "(conservative). Instrument sleep entry/exit with AICAD_CPU_TRACE in aicad_trace.h "
+        "no time-stamped CHUDWARE_CPU_EVT markers in trace — assuming CPU always active "
+        "(conservative). Instrument sleep entry/exit with CHUDWARE_CPU_TRACE in chudware_trace.h "
         "for measured residency.";
     bool have_window = window_ms.is_number() && window > 0;
     return {
@@ -278,8 +278,8 @@ nlohmann::json build_power_profile(const nlohmann::json& trace, const nlohmann::
     nlohmann::json notes = nlohmann::json::array({kPowerModelNote});
     if (window.is_null()) {
         notes.push_back("no time-stamped events in trace — duty cycles limited to "
-                        "final-state/assumed values (run a scenario for AICAD_T_MARK "
-                        "timestamps, or use AICAD_GPIO_TRACE/AICAD_CPU_TRACE)");
+                        "final-state/assumed values (run a scenario for CHUDWARE_T_MARK "
+                        "timestamps, or use CHUDWARE_GPIO_TRACE/CHUDWARE_CPU_TRACE)");
     }
 
     nlohmann::json rails_out = nlohmann::json::array();
@@ -460,4 +460,4 @@ std::optional<std::string> write_profile_artifact(const nlohmann::json& profile,
     }
 }
 
-}  // namespace aicad::firmware
+}  // namespace chudware::firmware

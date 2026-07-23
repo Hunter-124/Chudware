@@ -46,7 +46,7 @@
 #include <gp_Dir.hxx>
 #include <gp_Pnt.hxx>
 
-namespace aicad::doc {
+namespace chudware::doc {
 
 namespace {
 
@@ -706,4 +706,4 @@ ResolveResult resolve(const nlohmann::json& selector,
     return ResolveResult{std::nullopt, best_score, second_score, reason};
 }
 
-}  // namespace aicad::doc
+}  // namespace chudware::doc

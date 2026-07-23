@@ -2,7 +2,7 @@
 // (docs/contracts/stepplus.md).
 //
 // A `.step+` is a ZIP container that travels like a STEP file: any CAD opens the
-// embedded `geometry.step`; AI-CAD gets the full parametric document back. This
+// embedded `geometry.step`; Chudware gets the full parametric document back. This
 // port covers the PARAMETRIC round-trip (the load-bearing path):
 //   save(doc, path, extra)  -> writes thumbnail.png (STORED), meta.json,
 //                              document.json + any preserved unknown entries. Atomic.
@@ -22,7 +22,7 @@
 #include <nlohmann/json.hpp>
 #include <TopoDS_Shape.hxx>
 
-namespace aicad::doc {
+namespace chudware::doc {
 
 // The result of opening a .step+ container.
 struct StepPlusDoc {
@@ -92,4 +92,4 @@ std::string brep_cache_encode(const std::vector<TopoDS_Shape>& bodies);
 // Throws OpError("io_error", ...) on a corrupt blob; callers treat that as a cache miss.
 std::vector<TopoDS_Shape> brep_cache_decode(const std::string& blob);
 
-}  // namespace aicad::doc
+}  // namespace chudware::doc

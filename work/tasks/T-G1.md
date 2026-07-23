@@ -17,7 +17,7 @@ kind: overhaul
 
 The main checkout carries two sessions of verified-but-uncommitted GUI work on `master`:
 the GUI-overhaul Commit A set (`docs/HANDOFF_GUI_OVERHAUL.md` §6) and the glass-polish
-session's 7-file set with its 6-piece commit plan (`docs/HANDOFF_SHOPCRAFT_GUI_POLISH.md`
+session's 7-file set with its 6-piece commit plan (`docs/HANDOFF_CHUDWARE_GUI_POLISH.md`
 §COMMIT PLAN). Everything downstream in workstream G builds on top of this tree, so it
 must land first, in reviewable pieces — not one blob.
 
@@ -35,9 +35,9 @@ checkout, human-supervised (owner stays `main-checkout`). Commits land directly 
 ## Steps
 
 1. Verify green build first: `flock /tmp/host-build-linux.lock -c "cmake --build host/build-linux -j$(nproc)"`.
-2. Re-shoot smoke scenarios (`AI_CAD_SHOT=m1|sketch|fea|appearance`) and eyeball them.
+2. Re-shoot smoke scenarios (`CHUDWARE_SHOT=m1|sketch|fea|appearance`) and eyeball them.
 3. Commit the glass-polish set in the 6 pieces listed in
-   `docs/HANDOFF_SHOPCRAFT_GUI_POLISH.md` §COMMIT PLAN (`git add <exact files>`, by hunks
+   `docs/HANDOFF_CHUDWARE_GUI_POLISH.md` §COMMIT PLAN (`git add <exact files>`, by hunks
    where a file spans pieces).
 4. Commit the remaining pre-existing GUI-overhaul host/src edits as Commit A per
    `docs/HANDOFF_GUI_OVERHAUL.md` §6 (append the GUI-lane paragraph to
@@ -54,7 +54,7 @@ checkout, human-supervised (owner stays `main-checkout`). Commits land directly 
 
 ## AI hints
 
-- The full reasoning trail for every piece is in `docs/HANDOFF_SHOPCRAFT_GUI_POLISH.md`
+- The full reasoning trail for every piece is in `docs/HANDOFF_CHUDWARE_GUI_POLISH.md`
   and `docs/HANDOFF_GUI_OVERHAUL.md` §3/§6.
 - Commit-message style: short imperative summary, no emojis, end with
   `Co-Authored-By: Claude <noreply@anthropic.com>`.

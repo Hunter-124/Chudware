@@ -20,7 +20,7 @@
 #include <unistd.h>
 #endif
 
-namespace aicad::governor {
+namespace chudware::governor {
 
 namespace {
 
@@ -35,7 +35,7 @@ double env_f(const char* name, double fallback) {
 }
 
 bool disabled() {
-    const char* e = std::getenv("AICAD_GOVERNOR");
+    const char* e = std::getenv("CHUDWARE_GOVERNOR");
     return e && e[0] == '0' && e[1] == '\0';
 }
 
@@ -51,16 +51,16 @@ void store_report(std::string s) {
     g_last_report = std::move(s);
 }
 
-// CPU allotment before memory pressure: AI_CAD_SIM_THREADS, else frac of hw.
+// CPU allotment before memory pressure: CHUDWARE_SIM_THREADS, else frac of hw.
 // Pure CPU budget — no GUI reserve here (callers / plan_for apply that).
 int cpu_allotment() {
-    if (const char* e = std::getenv("AI_CAD_SIM_THREADS")) {
+    if (const char* e = std::getenv("CHUDWARE_SIM_THREADS")) {
         const int v = std::atoi(e);
         if (v > 0) return v;
     }
     const unsigned hc = std::thread::hardware_concurrency();
     const unsigned hw = hc ? hc : 4u;
-    const double frac = std::clamp(env_f("AICAD_CPU_FRAC", 0.75), 0.05, 1.0);
+    const double frac = std::clamp(env_f("CHUDWARE_CPU_FRAC", 0.75), 0.05, 1.0);
     return std::max(1, static_cast<int>(static_cast<double>(hw) * frac + 1e-9));
 }
 
@@ -69,7 +69,7 @@ int cpu_allotment() {
 uint64_t free_envelope(const HostMem& m) {
     if (m.avail == 0) return 0;
     const uint64_t headroom =
-        static_cast<uint64_t>(std::max(0.0, env_f("AICAD_HEADROOM_GB", 4.0)) *
+        static_cast<uint64_t>(std::max(0.0, env_f("CHUDWARE_HEADROOM_GB", 4.0)) *
                               static_cast<double>(kGB));
     return (m.avail > headroom) ? (m.avail - headroom) : 0;
 }
@@ -148,13 +148,13 @@ uint64_t budget_bytes() {
     if (disabled()) return UINT64_MAX;
     const HostMem m = host_mem();
     if (m.total == 0) return UINT64_MAX;  // unknowable platform: never block work
-    const double frac = std::clamp(env_f("AICAD_MEM_FRAC", 0.5), 0.05, 1.0);
+    const double frac = std::clamp(env_f("CHUDWARE_MEM_FRAC", 0.5), 0.05, 1.0);
     uint64_t budget = static_cast<uint64_t>(static_cast<double>(m.total) * frac);
-    const double cap_gb = env_f("AICAD_MEM_CAP_GB", 0.0);
+    const double cap_gb = env_f("CHUDWARE_MEM_CAP_GB", 0.0);
     if (cap_gb > 0.0)
         budget = std::min(budget, static_cast<uint64_t>(cap_gb * static_cast<double>(kGB)));
     const uint64_t headroom =
-        static_cast<uint64_t>(std::max(0.0, env_f("AICAD_HEADROOM_GB", 4.0)) *
+        static_cast<uint64_t>(std::max(0.0, env_f("CHUDWARE_HEADROOM_GB", 4.0)) *
                               static_cast<double>(kGB));
     if (m.avail > 0) {
         const uint64_t now_free = (m.avail > headroom) ? (m.avail - headroom) : 0;
@@ -181,7 +181,7 @@ bool admit(uint64_t estimate_bytes, const char* what, std::string& why) {
     std::snprintf(buf, sizeof buf,
                   "%s needs an estimated %.1f GB but this machine's budget is %.1f GB "
                   "(%.0f GB RAM, %.1f GB available) — use a coarser mesh / fewer cells / "
-                  "first-order elements, or raise AICAD_MEM_FRAC / AICAD_MEM_CAP_GB",
+                  "first-order elements, or raise CHUDWARE_MEM_FRAC / CHUDWARE_MEM_CAP_GB",
                   what && what[0] ? what : "this study", gb(estimate_bytes), gb(budget),
                   gb(m.total), gb(m.avail));
     why = buf;
@@ -194,7 +194,7 @@ bool low_memory_now() {
     const HostMem m = host_mem();
     if (m.avail == 0) return false;  // unknowable: never trip
     const uint64_t headroom =
-        static_cast<uint64_t>(std::max(0.0, env_f("AICAD_HEADROOM_GB", 4.0)) *
+        static_cast<uint64_t>(std::max(0.0, env_f("CHUDWARE_HEADROOM_GB", 4.0)) *
                               static_cast<double>(kGB));
     return m.avail < std::max(kGB, headroom / 2);
 }
@@ -224,8 +224,8 @@ Plan plan_for(uint64_t estimate_bytes, const char* what, int want_workers) {
         std::snprintf(buf, sizeof buf,
                       "governor: plan what=%s workers=%d reserve=%.2fGB budget=inf "
                       "rss=%.2fGB avail=%.2fGB total=%.2fGB pressure=0 admitted=1 "
-                      "(governor off or host unknown) knobs=AICAD_GOVERNOR,AI_CAD_SIM_THREADS,"
-                      "AICAD_CPU_FRAC",
+                      "(governor off or host unknown) knobs=CHUDWARE_GOVERNOR,CHUDWARE_SIM_THREADS,"
+                      "CHUDWARE_CPU_FRAC",
                       label, p.workers, gb(p.reserve_bytes), gb(p.rss), gb(p.avail),
                       gb(p.total));
         p.report = buf;
@@ -273,8 +273,8 @@ Plan plan_for(uint64_t estimate_bytes, const char* what, int want_workers) {
     std::snprintf(buf, sizeof buf,
                   "governor: plan what=%s workers=%d/%d reserve=%.2fGB budget=%.2fGB "
                   "rss=%.2fGB avail=%.2fGB total=%.2fGB pressure=%.2f admitted=%d "
-                  "knobs=AICAD_MEM_FRAC,AICAD_MEM_CAP_GB,AICAD_HEADROOM_GB,"
-                  "AICAD_CPU_FRAC,AI_CAD_SIM_THREADS",
+                  "knobs=CHUDWARE_MEM_FRAC,CHUDWARE_MEM_CAP_GB,CHUDWARE_HEADROOM_GB,"
+                  "CHUDWARE_CPU_FRAC,CHUDWARE_SIM_THREADS",
                   label, p.workers, allot, gb(p.reserve_bytes), gb(p.budget), gb(p.rss),
                   gb(p.avail), gb(p.total), pressure, p.admitted ? 1 : 0);
     p.report = buf;
@@ -287,4 +287,4 @@ std::string last_report() {
     return g_last_report;
 }
 
-}  // namespace aicad::governor
+}  // namespace chudware::governor

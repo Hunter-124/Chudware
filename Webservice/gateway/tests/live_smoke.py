@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Live hostd bridge smoke — two AF_UNIX clients against billet-webd.
+"""Live hostd bridge smoke — two AF_UNIX clients against chudware-webd.
 
 Direct socket only (no gateway). Client 1 creates a doc and applies a box
 feature; client 2 (subscribed to *) must receive doc.opened + doc.changed for
 that doc.
 
 Standalone:
-  BILLET_LIVE=1 .venv/bin/python tests/live_smoke.py
+  CHUDWARE_LIVE=1 .venv/bin/python tests/live_smoke.py
 
-Pytest (skipped unless BILLET_LIVE=1):
+Pytest (skipped unless CHUDWARE_LIVE=1):
   .venv/bin/python -m pytest tests/live_smoke.py -q
-  BILLET_LIVE=1 .venv/bin/python -m pytest tests/live_smoke.py -q
+  CHUDWARE_LIVE=1 .venv/bin/python -m pytest tests/live_smoke.py -q
 """
 from __future__ import annotations
 
@@ -25,8 +25,8 @@ from pathlib import Path
 import pytest
 
 SOCK = os.environ.get(
-    "AICAD_HOSTD_SOCKET",
-    "/run/user/1000/aicad/hostd-billetweb.sock",
+    "CHUDWARE_HOSTD_SOCKET",
+    "/run/user/1000/chudware/hostd-chudwareweb.sock",
 )
 
 # Exact add_feature box shape from services/mcp/cad_tools.py (add_features docstring)
@@ -44,11 +44,11 @@ BOX_OP = {
     },
 }
 
-_LIVE = os.environ.get("BILLET_LIVE") == "1"
+_LIVE = os.environ.get("CHUDWARE_LIVE") == "1"
 
 pytestmark = pytest.mark.skipif(
     not _LIVE,
-    reason="set BILLET_LIVE=1 to run against live hostd socket",
+    reason="set CHUDWARE_LIVE=1 to run against live hostd socket",
 )
 
 
@@ -248,8 +248,8 @@ def test_live_hostd_event_fanout() -> None:
 def main() -> int:
     if not _LIVE:
         print(
-            "BILLET_LIVE is not set — refusing to hit the live daemon.\n"
-            "Re-run with: BILLET_LIVE=1 python tests/live_smoke.py",
+            "CHUDWARE_LIVE is not set — refusing to hit the live daemon.\n"
+            "Re-run with: CHUDWARE_LIVE=1 python tests/live_smoke.py",
             file=sys.stderr,
         )
         return 2

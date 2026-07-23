@@ -8,7 +8,7 @@
 
 #include "cam/model.h"
 
-namespace aicad {
+namespace chudware {
 namespace cam {
 
 // Audit posted (or supplied) G-code. `source` is "cam_post" or "supplied".
@@ -22,4 +22,4 @@ json audit_program(const Job& job,
                    const std::string& machine_profile_id = {});
 
 }  // namespace cam
-}  // namespace aicad
+}  // namespace chudware

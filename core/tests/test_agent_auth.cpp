@@ -28,8 +28,8 @@
 
 namespace fs = std::filesystem;
 using nlohmann::json;
-using aicad::agent::HttpResponse;
-using aicad::agent::auth::EnsureFreshResult;
+using chudware::agent::HttpResponse;
+using chudware::agent::auth::EnsureFreshResult;
 
 namespace {
 
@@ -40,13 +40,13 @@ long long now_ms() {
 }
 
 // Redirect the app-data root into a per-test scratch dir. paths.cpp reads the
-// env live, so this fully isolates the store (fresh dir → <root>/Billet).
+// env live, so this fully isolates the store (fresh dir → <root>/Chudware).
 struct ScratchConfig {
     fs::path root;
     ScratchConfig() {
         static std::atomic<int> seq{0};
         root = fs::temp_directory_path() /
-               ("aicad-auth-test-" + std::to_string(
+               ("chudware-auth-test-" + std::to_string(
 #ifdef _WIN32
                     _getpid()
 #else
@@ -70,7 +70,7 @@ struct ScratchConfig {
         std::error_code ec;
         fs::remove_all(root, ec);
     }
-    fs::path cfg_dir() const { return root / "Billet"; }
+    fs::path cfg_dir() const { return root / "Chudware"; }
     fs::path cfg_path() const { return cfg_dir() / "config.json"; }
     void write_cfg(const json& j) const {
         fs::create_directories(cfg_dir());
@@ -163,25 +163,25 @@ json xai_store(const json& accounts, const std::string& active) {
 TEST_CASE("fresh token skips the network entirely") {
     ScratchConfig scratch;
     FakeHttp fake;
-    aicad::agent::auth::set_http_post_for_testing(
+    chudware::agent::auth::set_http_post_for_testing(
         [&fake](const std::string& u, const std::vector<std::pair<std::string, std::string>>& h,
                 const std::string& b, int t) { return fake(u, h, b, t); });
 
     scratch.write_cfg(xai_store({{"default", xai_account("at-live", "rt-1", now_ms() + 3600'000)}},
                                 "default"));
 
-    EnsureFreshResult r = aicad::agent::auth::ensure_fresh("xai");
+    EnsureFreshResult r = chudware::agent::auth::ensure_fresh("xai");
     CHECK(r.ok);
     CHECK_FALSE(r.refreshed);
     CHECK(r.expires_in_s > 3500);
     CHECK(fake.calls.load() == 0);
 
     // Alias resolution: xai-sub / XAI reach the same credential.
-    CHECK(aicad::agent::auth::ensure_fresh("xai-sub").ok);
-    CHECK(aicad::agent::auth::ensure_fresh("XAI").ok);
+    CHECK(chudware::agent::auth::ensure_fresh("xai-sub").ok);
+    CHECK(chudware::agent::auth::ensure_fresh("XAI").ok);
     CHECK(fake.calls.load() == 0);
 
-    aicad::agent::auth::set_http_post_for_testing(nullptr);
+    chudware::agent::auth::set_http_post_for_testing(nullptr);
 }
 
 TEST_CASE("expired xai token refreshes and the rotated refresh token is written back") {
@@ -193,14 +193,14 @@ TEST_CASE("expired xai token refreshes and the rotated refresh token is written 
                                    {"refresh_token", "rt-new"},
                                    {"expires_in", 3600}});
     };
-    aicad::agent::auth::set_http_post_for_testing(
+    chudware::agent::auth::set_http_post_for_testing(
         [&fake](const std::string& u, const std::vector<std::pair<std::string, std::string>>& h,
                 const std::string& b, int t) { return fake(u, h, b, t); });
 
     scratch.write_cfg(xai_store({{"default", xai_account("at-old", "rt-old", now_ms() - 1000)}},
                                 "default"));
 
-    EnsureFreshResult r = aicad::agent::auth::ensure_fresh("xai");
+    EnsureFreshResult r = chudware::agent::auth::ensure_fresh("xai");
     REQUIRE(r.ok);
     CHECK(r.refreshed);
     CHECK(fake.calls.load() == 1);
@@ -221,10 +221,10 @@ TEST_CASE("expired xai token refreshes and the rotated refresh token is written 
     CHECK(fs::exists(scratch.cfg_dir() / "config.json.lock", ec));
 
     // The C++ reader now sees the rotated token.
-    json cred = aicad::agent::auth::load_credential("xai-sub");
+    json cred = chudware::agent::auth::load_credential("xai-sub");
     CHECK(cred["access_token"] == "at-new");
 
-    aicad::agent::auth::set_http_post_for_testing(nullptr);
+    chudware::agent::auth::set_http_post_for_testing(nullptr);
 }
 
 TEST_CASE("codex refresh keeps the old RT when the response omits it; legacy flat store migrates") {
@@ -235,7 +235,7 @@ TEST_CASE("codex refresh keeps the old RT when the response omits it; legacy fla
         return json_response(200, {{"access_token", "at-codex-new"},
                                    {"expires_in", 3600}});  // no refresh_token
     };
-    aicad::agent::auth::set_http_post_for_testing(
+    chudware::agent::auth::set_http_post_for_testing(
         [&fake](const std::string& u, const std::vector<std::pair<std::string, std::string>>& h,
                 const std::string& b, int t) { return fake(u, h, b, t); });
 
@@ -247,7 +247,7 @@ TEST_CASE("codex refresh keeps the old RT when the response omits it; legacy fla
                                {"expires_at_ms", now_ms() - 5000},
                                {"account_id", "acct-123"}}}}}});
 
-    EnsureFreshResult r = aicad::agent::auth::ensure_fresh("codex");
+    EnsureFreshResult r = chudware::agent::auth::ensure_fresh("codex");
     REQUIRE(r.ok);
     CHECK(r.refreshed);
     REQUIRE(fake.calls.load() == 1);
@@ -267,7 +267,7 @@ TEST_CASE("codex refresh keeps the old RT when the response omits it; legacy fla
     CHECK(acct["access_token"] == "at-codex-new");
     CHECK(acct["refresh_token"] == "rt-codex-old");
 
-    aicad::agent::auth::set_http_post_for_testing(nullptr);
+    chudware::agent::auth::set_http_post_for_testing(nullptr);
 }
 
 TEST_CASE("anthropic refresh request shape and skew-subtracted expiry") {
@@ -278,7 +278,7 @@ TEST_CASE("anthropic refresh request shape and skew-subtracted expiry") {
                                    {"refresh_token", "rt-claude-new"},
                                    {"expires_in", 3600}});
     };
-    aicad::agent::auth::set_http_post_for_testing(
+    chudware::agent::auth::set_http_post_for_testing(
         [&fake](const std::string& u, const std::vector<std::pair<std::string, std::string>>& h,
                 const std::string& b, int t) { return fake(u, h, b, t); });
 
@@ -293,7 +293,7 @@ TEST_CASE("anthropic refresh request shape and skew-subtracted expiry") {
                                    {"plan", "max"},
                                    {"display_name", "Claude (max)"}}}}}}}}}});
 
-    EnsureFreshResult r = aicad::agent::auth::ensure_fresh("claude");
+    EnsureFreshResult r = chudware::agent::auth::ensure_fresh("claude");
     REQUIRE(r.ok);
     REQUIRE(fake.calls.load() == 1);
 
@@ -318,7 +318,7 @@ TEST_CASE("anthropic refresh request shape and skew-subtracted expiry") {
     CHECK(acct["plan"] == "max");
     CHECK(acct["display_name"] == "Claude (max)");
 
-    aicad::agent::auth::set_http_post_for_testing(nullptr);
+    chudware::agent::auth::set_http_post_for_testing(nullptr);
 }
 
 TEST_CASE("dead active account rotates to a fresh sibling and is marked revoked") {
@@ -329,7 +329,7 @@ TEST_CASE("dead active account rotates to a fresh sibling and is marked revoked"
         return json_response(400, {{"error", "invalid_grant"},
                                    {"error_description", "Refresh token has been revoked"}});
     };
-    aicad::agent::auth::set_http_post_for_testing(
+    chudware::agent::auth::set_http_post_for_testing(
         [&fake](const std::string& u, const std::vector<std::pair<std::string, std::string>>& h,
                 const std::string& b, int t) { return fake(u, h, b, t); });
 
@@ -338,7 +338,7 @@ TEST_CASE("dead active account rotates to a fresh sibling and is marked revoked"
          {"acct-b", xai_account("at-b", "rt-b", now_ms() + 3600'000)}},
         "acct-a"));
 
-    EnsureFreshResult r = aicad::agent::auth::ensure_fresh("xai");
+    EnsureFreshResult r = chudware::agent::auth::ensure_fresh("xai");
     REQUIRE(r.ok);
     CHECK_FALSE(r.refreshed);  // sibling was already fresh — promoted, not refreshed
     CHECK(fake.calls.load() == 1);  // one dead attempt on the active account
@@ -350,13 +350,13 @@ TEST_CASE("dead active account rotates to a fresh sibling and is marked revoked"
     CHECK(entry["accounts"]["acct-a"]["refresh_revoked"] == true);
     CHECK(entry["accounts"]["acct-a"].contains("auth_error"));
 
-    aicad::agent::auth::set_http_post_for_testing(nullptr);
+    chudware::agent::auth::set_http_post_for_testing(nullptr);
 }
 
 TEST_CASE("every stored account revoked -> hard failure with re-auth message") {
     ScratchConfig scratch;
     FakeHttp fake;
-    aicad::agent::auth::set_http_post_for_testing(
+    chudware::agent::auth::set_http_post_for_testing(
         [&fake](const std::string& u, const std::vector<std::pair<std::string, std::string>>& h,
                 const std::string& b, int t) { return fake(u, h, b, t); });
 
@@ -365,13 +365,13 @@ TEST_CASE("every stored account revoked -> hard failure with re-auth message") {
     acct["auth_error"] = "invalid_grant";
     scratch.write_cfg(xai_store({{"acct-a", acct}}, "acct-a"));
 
-    EnsureFreshResult r = aicad::agent::auth::ensure_fresh("xai");
+    EnsureFreshResult r = chudware::agent::auth::ensure_fresh("xai");
     CHECK_FALSE(r.ok);
     CHECK(r.error.find("revoked") != std::string::npos);
     CHECK(r.error.find("Re-authenticate") != std::string::npos);
     CHECK(fake.calls.load() == 0);  // revoked markers never hit the network
 
-    aicad::agent::auth::set_http_post_for_testing(nullptr);
+    chudware::agent::auth::set_http_post_for_testing(nullptr);
 }
 
 TEST_CASE("concurrent refreshes serialize on the store lock (single network exchange)") {
@@ -385,7 +385,7 @@ TEST_CASE("concurrent refreshes serialize on the store lock (single network exch
                                    {"refresh_token", "rt-raced"},
                                    {"expires_in", 3600}});
     };
-    aicad::agent::auth::set_http_post_for_testing(
+    chudware::agent::auth::set_http_post_for_testing(
         [&fake](const std::string& u, const std::vector<std::pair<std::string, std::string>>& h,
                 const std::string& b, int t) { return fake(u, h, b, t); });
 
@@ -396,7 +396,7 @@ TEST_CASE("concurrent refreshes serialize on the store lock (single network exch
     std::vector<char> oks(4, 0);
     for (int i = 0; i < 4; ++i)
         threads.emplace_back([i, &oks] {
-            oks[i] = aicad::agent::auth::ensure_fresh("xai").ok ? 1 : 0;
+            oks[i] = chudware::agent::auth::ensure_fresh("xai").ok ? 1 : 0;
         });
     for (auto& t : threads) t.join();
 
@@ -408,33 +408,33 @@ TEST_CASE("concurrent refreshes serialize on the store lock (single network exch
     CHECK(disk["subscription_auth"]["xai-sub"]["accounts"]["default"]["refresh_token"] ==
           "rt-raced");
 
-    aicad::agent::auth::set_http_post_for_testing(nullptr);
+    chudware::agent::auth::set_http_post_for_testing(nullptr);
 }
 
 TEST_CASE("malformed store is tolerated (no credential -> graceful no-op)") {
     ScratchConfig scratch;
     FakeHttp fake;
-    aicad::agent::auth::set_http_post_for_testing(
+    chudware::agent::auth::set_http_post_for_testing(
         [&fake](const std::string& u, const std::vector<std::pair<std::string, std::string>>& h,
                 const std::string& b, int t) { return fake(u, h, b, t); });
 
     scratch.write_raw("{ not valid json !!!");
-    EnsureFreshResult r = aicad::agent::auth::ensure_fresh("xai");
+    EnsureFreshResult r = chudware::agent::auth::ensure_fresh("xai");
     CHECK(r.ok);  // no stored credential is NOT a refresh failure
     CHECK_FALSE(r.refreshed);
 
     scratch.write_cfg(json{{"subscription_auth", "a string, not an object"}});
-    r = aicad::agent::auth::ensure_fresh("xai");
+    r = chudware::agent::auth::ensure_fresh("xai");
     CHECK(r.ok);
     CHECK_FALSE(r.refreshed);
 
     // Unknown provider id is the only hard pre-flight failure.
-    r = aicad::agent::auth::ensure_fresh("not-a-provider");
+    r = chudware::agent::auth::ensure_fresh("not-a-provider");
     CHECK_FALSE(r.ok);
     CHECK(r.error.find("unknown subscription provider") != std::string::npos);
     CHECK(fake.calls.load() == 0);
 
-    aicad::agent::auth::set_http_post_for_testing(nullptr);
+    chudware::agent::auth::set_http_post_for_testing(nullptr);
 }
 
 TEST_CASE("expiry margin: 5-minute ensure-fresh skew") {
@@ -445,30 +445,30 @@ TEST_CASE("expiry margin: 5-minute ensure-fresh skew") {
                                    {"refresh_token", "rt-new"},
                                    {"expires_in", 3600}});
     };
-    aicad::agent::auth::set_http_post_for_testing(
+    chudware::agent::auth::set_http_post_for_testing(
         [&fake](const std::string& u, const std::vector<std::pair<std::string, std::string>>& h,
                 const std::string& b, int t) { return fake(u, h, b, t); });
 
     SUBCASE("expiring in 60s is stale (inside the skew)") {
         scratch.write_cfg(xai_store(
             {{"default", xai_account("at", "rt", now_ms() + 60'000)}}, "default"));
-        CHECK(aicad::agent::auth::ensure_fresh("xai").ok);
+        CHECK(chudware::agent::auth::ensure_fresh("xai").ok);
         CHECK(fake.calls.load() == 1);
     }
     SUBCASE("expiring in 10min is fresh (outside the skew)") {
         scratch.write_cfg(xai_store(
             {{"default", xai_account("at", "rt", now_ms() + 600'000)}}, "default"));
-        CHECK(aicad::agent::auth::ensure_fresh("xai").ok);
+        CHECK(chudware::agent::auth::ensure_fresh("xai").ok);
         CHECK(fake.calls.load() == 0);
     }
     SUBCASE("is_expired matches sub_auth semantics") {
         json c = json{{"expires_at_ms", now_ms() + 100'000}};
-        CHECK(aicad::agent::auth::is_expired(c, 0) == false);
-        CHECK(aicad::agent::auth::is_expired(c, 200'000) == true);
-        CHECK(aicad::agent::auth::is_expired(json::object(), 0) == true);
+        CHECK(chudware::agent::auth::is_expired(c, 0) == false);
+        CHECK(chudware::agent::auth::is_expired(c, 200'000) == true);
+        CHECK(chudware::agent::auth::is_expired(json::object(), 0) == true);
     }
 
-    aicad::agent::auth::set_http_post_for_testing(nullptr);
+    chudware::agent::auth::set_http_post_for_testing(nullptr);
 }
 
 TEST_CASE("cursor refresh: bearer exchange with JWT exp claim expiry") {
@@ -480,7 +480,7 @@ TEST_CASE("cursor refresh: bearer exchange with JWT exp claim expiry") {
         return json_response(
             200, {{"accessToken", make_jwt({{"sub", "user-9"}, {"exp", jwt_exp}})}});
     };
-    aicad::agent::auth::set_http_post_for_testing(
+    chudware::agent::auth::set_http_post_for_testing(
         [&fake](const std::string& u, const std::vector<std::pair<std::string, std::string>>& h,
                 const std::string& b, int t) { return fake(u, h, b, t); });
 
@@ -490,7 +490,7 @@ TEST_CASE("cursor refresh: bearer exchange with JWT exp claim expiry") {
     json cursor_entry = {{"active", "default"}, {"accounts", {{"default", cursor_acct}}}};
     scratch.write_cfg(json{{"subscription_auth", {{"cursor", cursor_entry}}}});
 
-    EnsureFreshResult r = aicad::agent::auth::ensure_fresh("cursor");
+    EnsureFreshResult r = chudware::agent::auth::ensure_fresh("cursor");
     REQUIRE(r.ok);
     REQUIRE(fake.calls.load() == 1);
     CHECK(fake.header(fake.requests[0], "Authorization") == "Bearer rt-cursor-old");
@@ -501,13 +501,13 @@ TEST_CASE("cursor refresh: bearer exchange with JWT exp claim expiry") {
     // exp claim (s) * 1000 - 5min skew.
     CHECK(acct["expires_at_ms"].get<long long>() == jwt_exp * 1000 - 300'000);
 
-    aicad::agent::auth::set_http_post_for_testing(nullptr);
+    chudware::agent::auth::set_http_post_for_testing(nullptr);
 }
 
 TEST_CASE("ensure_fresh_for_run reloads cfg with the rotated token; failure is a refusal") {
     ScratchConfig scratch;
     FakeHttp fake;
-    aicad::agent::auth::set_http_post_for_testing(
+    chudware::agent::auth::set_http_post_for_testing(
         [&fake](const std::string& u, const std::vector<std::pair<std::string, std::string>>& h,
                 const std::string& b, int t) { return fake(u, h, b, t); });
 
@@ -520,7 +520,7 @@ TEST_CASE("ensure_fresh_for_run reloads cfg with the rotated token; failure is a
         json cfg = xai_store({{"default", xai_account("at-stale", "rt-stale", now_ms() - 1000)}},
                              "default");
         scratch.write_cfg(cfg);
-        std::string err = aicad::agent::auth::ensure_fresh_for_run("xai-sub", cfg);
+        std::string err = chudware::agent::auth::ensure_fresh_for_run("xai-sub", cfg);
         CHECK(err.empty());
         CHECK(fake.calls.load() == 1);
         const json& acct = cfg["subscription_auth"]["xai-sub"]["accounts"]["default"];
@@ -534,7 +534,7 @@ TEST_CASE("ensure_fresh_for_run reloads cfg with the rotated token; failure is a
         json cfg = xai_store({{"default", xai_account("at-stale", "rt-stale", now_ms() - 1000)}},
                              "default");
         scratch.write_cfg(cfg);
-        std::string err = aicad::agent::auth::ensure_fresh_for_run("xai-sub", cfg);
+        std::string err = chudware::agent::auth::ensure_fresh_for_run("xai-sub", cfg);
         CHECK_FALSE(err.empty());
         CHECK(err.find("re-authenticate") != std::string::npos);
         CHECK(err.find("token refresh failed") != std::string::npos);
@@ -545,12 +545,12 @@ TEST_CASE("ensure_fresh_for_run reloads cfg with the rotated token; failure is a
                              "default");
         scratch.write_cfg(cfg);
         int before = fake.calls.load();
-        std::string err = aicad::agent::auth::ensure_fresh_for_run("xai-sub", cfg);
+        std::string err = chudware::agent::auth::ensure_fresh_for_run("xai-sub", cfg);
         CHECK(err.empty());
         CHECK(fake.calls.load() == before);
     }
 
-    aicad::agent::auth::set_http_post_for_testing(nullptr);
+    chudware::agent::auth::set_http_post_for_testing(nullptr);
 }
 
 TEST_CASE("api-key fallback: a stale leftover subscription credential does not brick xai key mode") {
@@ -559,7 +559,7 @@ TEST_CASE("api-key fallback: a stale leftover subscription credential does not b
     fake.handler = [](const FakeHttp::Request&) {
         return HttpResponse{500, "server error", ""};  // non-auth failure
     };
-    aicad::agent::auth::set_http_post_for_testing(
+    chudware::agent::auth::set_http_post_for_testing(
         [&fake](const std::string& u, const std::vector<std::pair<std::string, std::string>>& h,
                 const std::string& b, int t) { return fake(u, h, b, t); });
 
@@ -569,10 +569,10 @@ TEST_CASE("api-key fallback: a stale leftover subscription credential does not b
     cfg["api_key"] = "xai-console-key-abc";
     scratch.write_cfg(cfg);
 
-    EnsureFreshResult r = aicad::agent::auth::ensure_fresh("xai");
+    EnsureFreshResult r = chudware::agent::auth::ensure_fresh("xai");
     CHECK(r.ok);  // API-key path soft-passes (mirrors _has_api_key_fallback)
     CHECK_FALSE(r.refreshed);
     CHECK(fake.calls.load() == 1);
 
-    aicad::agent::auth::set_http_post_for_testing(nullptr);
+    chudware::agent::auth::set_http_post_for_testing(nullptr);
 }

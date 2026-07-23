@@ -46,7 +46,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
-os.environ.setdefault("AI_CAD_ENGINE_DAEMON", "0")
+os.environ.setdefault("CHUDWARE_ENGINE_DAEMON", "0")
 
 DOMAIN = "fea_modal_freq"
 
@@ -119,8 +119,8 @@ def run(quick: bool = False) -> list[dict]:
     except CoreError as exc:
         if "unknown method" in str(exc):
             return [_case("engine_load", status="skip", total_s=time.time() - t0,
-                          detail="libaicad.so lacks sim_run_modal "
-                                 "(no AICAD_WITH_NETGEN FEA plugin)")]
+                          detail="libchudware.so lacks sim_run_modal "
+                                 "(no CHUDWARE_WITH_NETGEN FEA plugin)")]
         # anything else falls through — an empty study is expected to error
 
     fineness = 0.3 if quick else 0.5

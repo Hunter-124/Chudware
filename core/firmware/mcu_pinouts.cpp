@@ -11,7 +11,7 @@
 #include "ecad/schema.h"
 #include "ecad/session.h"
 
-namespace aicad::firmware {
+namespace chudware::firmware {
 namespace {
 
 // Prefix (case-insensitive substring) → firmware mcu_family. Order matters:
@@ -101,9 +101,9 @@ std::vector<nlohmann::json> iter_bom_components(const nlohmann::json& doc) {
     std::vector<nlohmann::json> out;
     if (!doc.is_object()) return out;
     const nlohmann::json* items = nullptr;
-    if (aicad::ecad::schema::is_board(doc) && doc.contains("footprints"))
+    if (chudware::ecad::schema::is_board(doc) && doc.contains("footprints"))
         items = &doc["footprints"];
-    else if (aicad::ecad::schema::is_schematic(doc) && doc.contains("symbols"))
+    else if (chudware::ecad::schema::is_schematic(doc) && doc.contains("symbols"))
         items = &doc["symbols"];
     else if (doc.contains("footprints") && doc["footprints"].is_array())
         items = &doc["footprints"];
@@ -130,7 +130,7 @@ nlohmann::json resolve_board_doc(const std::string& ref) {
     if (ref.empty()) return nlohmann::json();
     // 1) open ECAD session registry (doc_id) — ecad_session_doc throws on a miss.
     try {
-        nlohmann::json doc = aicad::ecad::ecad_session_doc(ref);
+        nlohmann::json doc = chudware::ecad::ecad_session_doc(ref);
         if (doc.is_object()) return doc;
     } catch (...) {
     }
@@ -139,7 +139,7 @@ nlohmann::json resolve_board_doc(const std::string& ref) {
         std::error_code ec;
         if (std::filesystem::exists(ref, ec)) {
             if (ref.size() >= 6 && ref.compare(ref.size() - 6, 6, ".ecad+") == 0) {
-                auto opened = aicad::ecad::ecad_container_open(ref);
+                auto opened = chudware::ecad::ecad_container_open(ref);
                 if (opened.doc.is_object()) return opened.doc;
             } else {
                 std::ifstream in(ref);
@@ -198,4 +198,4 @@ std::optional<int> resolve_pin(const std::string& net_name, const std::string& /
     return std::nullopt;
 }
 
-}  // namespace aicad::firmware
+}  // namespace chudware::firmware

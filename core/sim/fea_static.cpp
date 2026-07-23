@@ -31,27 +31,27 @@
 #include <Eigen/SparseCore>
 #include <Eigen/SparseLU>
 
-#ifdef AICAD_WITH_CHOLMOD
+#ifdef CHUDWARE_WITH_CHOLMOD
 #include <Eigen/CholmodSupport>  // Eigen::CholmodSupernodalLLT (SuiteSparse BLAS3 Cholesky)
 #endif
-#ifdef AICAD_HAVE_OPENMP
+#ifdef CHUDWARE_HAVE_OPENMP
 #include <omp.h>
 #endif
 
 #include "util/resource_governor.h"
 #include "util/thread_pool.h"
 
-namespace aicad::sim {
+namespace chudware::sim {
 
 namespace {
 
 // Cap the solver's worker threads so a long solve never eats every core — the GUI/render
 // threads must keep running (Hunter: "let the GUI continue on at least 1 thread"). Caps both
 // CHOLMOD's own OpenMP loops and the OpenMP-based system BLAS (FlexiBLAS/OpenBLAS) it calls.
-// Env AI_CAD_FEA_THREADS overrides; default = governor plan capped at hw-2 / 8.
+// Env CHUDWARE_FEA_THREADS overrides; default = governor plan capped at hw-2 / 8.
 // Size-adaptive: tiny systems stay serial (thread spawn costs more than the work).
 int fea_solver_threads(long n_free) {
-    if (const char* e = std::getenv("AI_CAD_FEA_THREADS")) {
+    if (const char* e = std::getenv("CHUDWARE_FEA_THREADS")) {
         const int n = std::atoi(e);
         if (n >= 1) return n;
     }
@@ -70,9 +70,9 @@ int fea_solver_threads(long n_free) {
     else if (n_free <  60000) want = 4;
     else                      want = 8;
     // Fold through the shared governor/pool so nested solves share one budget.
-    const auto plan = aicad::governor::plan_for(0, "fea_solver", want);
+    const auto plan = chudware::governor::plan_for(0, "fea_solver", want);
     const int governed = std::max(1, std::min({want, plan.workers, hw_cap, 8}));
-    aicad::pool::shared().set_max_workers(governed);
+    chudware::pool::shared().set_max_workers(governed);
     return governed;
 }
 
@@ -80,15 +80,15 @@ int fea_solver_threads(long n_free) {
 // per-element compute (B^T C B dense products) with deterministic output slots, so they
 // scale near-linearly; unlike the factorization they don't saturate memory bandwidth
 // early. Small meshes stay serial (thread spawn costs more than the work). Honours the
-// same AI_CAD_FEA_THREADS override as the solver cap; budget comes from the shared
+// same CHUDWARE_FEA_THREADS override as the solver cap; budget comes from the shared
 // governor/pool so nested FEA+CFD cannot oversubscribe.
 int fea_assembly_threads(int n_elems) {
-#ifndef AICAD_HAVE_OPENMP
+#ifndef CHUDWARE_HAVE_OPENMP
     (void)n_elems;
     return 1;
 #else
     if (n_elems < 4000) return 1;
-    if (const char* e = std::getenv("AI_CAD_FEA_THREADS")) {
+    if (const char* e = std::getenv("CHUDWARE_FEA_THREADS")) {
         const int n = std::atoi(e);
         if (n >= 1) return n;
     }
@@ -97,9 +97,9 @@ int fea_assembly_threads(int n_elems) {
     const int hw_cap = std::max(1, std::min(static_cast<int>(hw) - 2, 8));
     // ~1 KB working set per element as a coarse peak estimate for the assembly pass.
     const uint64_t est = static_cast<uint64_t>(std::max(0, n_elems)) * 1024ull;
-    const auto plan = aicad::governor::plan_for(est, "fea_assembly", hw_cap);
+    const auto plan = chudware::governor::plan_for(est, "fea_assembly", hw_cap);
     const int n = std::max(1, std::min(plan.workers, hw_cap));
-    aicad::pool::shared().set_max_workers(n);
+    chudware::pool::shared().set_max_workers(n);
     return n;
 #endif
 }
@@ -127,7 +127,7 @@ void assemble_elements_par(int n_tets, const std::vector<int>& tets,
     }
     trips.assign(off[static_cast<std::size_t>(n_tets)], Eigen::Triplet<double>(0, 0, 0.0));
     const int nthreads = fea_assembly_threads(n_tets);
-#if defined(AICAD_HAVE_OPENMP)
+#if defined(CHUDWARE_HAVE_OPENMP)
 #pragma omp parallel for schedule(static) num_threads(nthreads) if (nthreads > 1)
 #endif
     for (int e = 0; e < n_tets; ++e) {
@@ -152,7 +152,7 @@ void assemble_elements_par(int n_tets, const std::vector<int>& tets,
 }
 
 void apply_solver_thread_cap(int n) {
-#ifdef AICAD_HAVE_OPENMP
+#ifdef CHUDWARE_HAVE_OPENMP
     omp_set_num_threads(n);
 #endif
     // Belt-and-suspenders for BLAS backends that read the env (FlexiBLAS/OpenBLAS honour these).
@@ -168,7 +168,7 @@ void apply_solver_thread_cap(int n) {
 }
 
 // ── Lightweight, env-gated phase profiler ────────────────────────────────────────
-// Set AI_CAD_FEA_PROFILE=1 to get a per-phase wall-clock + size/memory breakdown of a
+// Set CHUDWARE_FEA_PROFILE=1 to get a per-phase wall-clock + size/memory breakdown of a
 // static solve on stderr. Each line is flushed immediately so, if the solve aborts
 // (e.g. std::bad_alloc on a too-fine mesh -> SIGABRT), the LAST line printed localizes
 // the death — a sampling profiler's report() never runs after an abort, this does.
@@ -182,7 +182,7 @@ struct FeaProf {
     bool on = false;
     std::chrono::steady_clock::time_point t0;
     explicit FeaProf() {
-        const char* e = std::getenv("AI_CAD_FEA_PROFILE");
+        const char* e = std::getenv("CHUDWARE_FEA_PROFILE");
         on = e && e[0] && e[0] != '0';
         t0 = std::chrono::steady_clock::now();
     }
@@ -193,7 +193,7 @@ struct FeaProf {
         const double ms =
             std::chrono::duration<double, std::milli>(now - t0).count();
         t0 = now;
-        aicad::prof::phases::add((std::string("solve.") + label).c_str(), ms);
+        chudware::prof::phases::add((std::string("solve.") + label).c_str(), ms);
         if (!on) return;
         std::fprintf(stderr, "[fea] %-22s %10.2f ms\n", label, ms);
         std::fflush(stderr);
@@ -429,11 +429,11 @@ struct FactorSolver {
     virtual Eigen::VectorXd solve(const Eigen::VectorXd& ff) = 0;
     virtual bool ok() const = 0;
 };
-#ifdef AICAD_WITH_CHOLMOD
+#ifdef CHUDWARE_WITH_CHOLMOD
 struct CholmodFactorSolver : FactorSolver {
     Eigen::CholmodSupernodalLLT<Eigen::SparseMatrix<double>> chol;
     explicit CholmodFactorSolver(const Eigen::SparseMatrix<double>& K) {
-        const char* ord = std::getenv("AI_CAD_FEA_ORDER");
+        const char* ord = std::getenv("CHUDWARE_FEA_ORDER");
         const int n_free = static_cast<int>(K.rows());
         const std::string o = ord ? ord : (n_free >= 50000 ? "metis" : "default");
         cholmod_common& cc = chol.cholmod();
@@ -496,7 +496,7 @@ inline FactorCacheState& factor_cache_state() {
     return s;
 }
 inline uint64_t factor_cache_budget() {
-    const uint64_t host = aicad::governor::budget_bytes();
+    const uint64_t host = chudware::governor::budget_bytes();
     if (host == UINT64_MAX) return 1024ull * 1024ull * 1024ull;
     return std::max<uint64_t>(128ull * 1024ull * 1024ull, host / 6);
 }
@@ -508,7 +508,7 @@ using fea_factor_cache_detail::FactorSolver;
 using fea_factor_cache_detail::PreparedSystem;
 using fea_factor_cache_detail::factor_cache_state;
 using fea_factor_cache_detail::factor_cache_budget;
-#ifdef AICAD_WITH_CHOLMOD
+#ifdef CHUDWARE_WITH_CHOLMOD
 using fea_factor_cache_detail::CholmodFactorSolver;
 #endif
 using fea_factor_cache_detail::LdltFactorSolver;
@@ -795,7 +795,7 @@ FeaStaticResult fea_static_solve(const std::vector<double>& points, const std::v
             const int nthreads = fea_solver_threads(n_free);
             apply_solver_thread_cap(nthreads);
             std::unique_ptr<FactorSolver> built;
-#ifdef AICAD_WITH_CHOLMOD
+#ifdef CHUDWARE_WITH_CHOLMOD
             prof.note("solver=CholmodSupernodalLLT (SuiteSparse, %d threads)", nthreads);
             {
                 auto chol = std::make_unique<CholmodFactorSolver>(Kff);
@@ -812,7 +812,7 @@ FeaStaticResult fea_static_solve(const std::vector<double>& points, const std::v
 #endif
             if (!solved) {
                 prof.note("solver=SimplicialLDLT (Cholesky, SPD)%s",
-#ifdef AICAD_WITH_CHOLMOD
+#ifdef CHUDWARE_WITH_CHOLMOD
                           " (CHOLMOD unavailable/failed)"
 #else
                           ""
@@ -940,7 +940,7 @@ FeaStaticResult fea_static_solve(const std::vector<double>& points, const std::v
     if (hex8) {
         // ── hex8: average stress over the 8 Gauss points, scatter to all corners. ──
         const HexGauss8 hg;
-#if defined(AICAD_HAVE_OPENMP)
+#if defined(CHUDWARE_HAVE_OPENMP)
 #pragma omp parallel for schedule(static) num_threads(st_threads) if (st_threads > 1)
 #endif
         for (int e = 0; e < n_tets; ++e) {
@@ -970,7 +970,7 @@ FeaStaticResult fea_static_solve(const std::vector<double>& points, const std::v
         }
     } else if (!tet10) {
         // ── tet4 (parity-critical: element math UNCHANGED) ────────────────────────
-#if defined(AICAD_HAVE_OPENMP)
+#if defined(CHUDWARE_HAVE_OPENMP)
 #pragma omp parallel for schedule(static) num_threads(st_threads) if (st_threads > 1)
 #endif
         for (int e = 0; e < n_tets; ++e) {
@@ -994,7 +994,7 @@ FeaStaticResult fea_static_solve(const std::vector<double>& points, const std::v
         }
     } else {
         // ── tet10: average the 4 Gauss points, scatter to all 10 nodes. ──────────
-#if defined(AICAD_HAVE_OPENMP)
+#if defined(CHUDWARE_HAVE_OPENMP)
 #pragma omp parallel for schedule(static) num_threads(st_threads) if (st_threads > 1)
 #endif
         for (int e = 0; e < n_tets; ++e) {
@@ -1121,4 +1121,4 @@ FeaStaticResult fea_static_solve(const std::vector<double>& points, const std::v
     return res;
 }
 
-}  // namespace aicad::sim
+}  // namespace chudware::sim

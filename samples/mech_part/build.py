@@ -9,7 +9,7 @@ Verify contract (called by samples/test_regen.py):
   regen_and_verify() -> dict with keys: ok, volume_mm3, body_count, feature_count
 
 Usage:
-  AI_CAD_LIBAICAD=<path>/libaicad.so python samples/mech_part/build.py
+  CHUDWARE_LIBCHUDWARE=<path>/libchudware.so python samples/mech_part/build.py
 """
 from __future__ import annotations
 
@@ -124,7 +124,7 @@ def build_bracket(cb) -> dict:
     cb.call("doc_save", {"doc_id": doc_id, "path": str(OUTPUT_AICM)})
     # Engine-rendered thumbnail while the doc is still open (doc_render_png).
     # The old GUI-shot path captured an EMPTY shell 3x: AI-CAD2 has no
-    # AI_CAD_OPEN_FILE support, so --shot never loaded the doc (foreman fix).
+    # CHUDWARE_OPEN_FILE support, so --shot never loaded the doc (foreman fix).
     cb.call("doc_render_png", {"doc_id": doc_id, "out_path": str(OUTPUT_PNG)})
     cb.call("doc_close", {"doc_id": doc_id})
 
@@ -168,14 +168,14 @@ def make_thumbnail() -> bool:
 
     env = os.environ.copy()
     so_candidates = [
-        REPO / "core" / "build-linux" / "bin" / "libaicad.so",
-        REPO.parent / "CAD" / "core" / "build-linux" / "bin" / "libaicad.so",
+        REPO / "core" / "build-linux" / "bin" / "libchudware.so",
+        REPO.parent / "CAD" / "core" / "build-linux" / "bin" / "libchudware.so",
     ]
     so = next((s for s in so_candidates if s.exists()), None)
     if so:
-        env.setdefault("AI_CAD_LIBAICAD", str(so))
-    env["AI_CAD_NO_FILE_DIALOGS"] = "1"
-    env["AI_CAD_OPEN_FILE"] = str(OUTPUT_AICM)
+        env.setdefault("CHUDWARE_LIBCHUDWARE", str(so))
+    env["CHUDWARE_NO_FILE_DIALOGS"] = "1"
+    env["CHUDWARE_OPEN_FILE"] = str(OUTPUT_AICM)
 
     try:
         import subprocess
@@ -200,7 +200,7 @@ def regen_and_verify() -> dict:
     from mcp_server import core_bridge as cb
 
     if not cb.available():
-        return {"ok": False, "error": "libaicad not available"}
+        return {"ok": False, "error": "libchudware not available"}
 
     result = build_bracket(cb)
 
@@ -228,7 +228,7 @@ if __name__ == "__main__":
     from mcp_server import core_bridge as cb
 
     if not cb.available():
-        print("FATAL: libaicad not available. Set AI_CAD_LIBAICAD=<path>.")
+        print("FATAL: libchudware not available. Set CHUDWARE_LIBCHUDWARE=<path>.")
         sys.exit(1)
 
     print("Building mech_part/bracket sample...")

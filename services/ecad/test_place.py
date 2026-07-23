@@ -12,7 +12,7 @@ from starter footprints, then asserts:
 Prints wall-times via time.perf_counter.
 
 Run:
-  /home/hunter/.local/share/AI-CAD/mcp-venv/bin/python -X utf8 -m pytest \\
+  /home/hunter/.local/share/Chudware/mcp-venv/bin/python -X utf8 -m pytest \\
       engine_oracle/ecad/test_place.py -q
 """
 

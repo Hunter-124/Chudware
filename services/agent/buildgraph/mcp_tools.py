@@ -50,9 +50,9 @@ def _runs_dir() -> Path:
     """Platform default runs directory (mirrors executor.default_runs_dir)."""
     if platform.system() == "Windows":
         appdata = os.environ.get("APPDATA") or os.path.expanduser(r"~\AppData\Roaming")
-        return Path(appdata) / "AI-CAD" / "runs"
+        return Path(appdata) / "Chudware" / "runs"
     xdg = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
-    return Path(xdg) / "AI-CAD" / "runs"
+    return Path(xdg) / "Chudware" / "runs"
 
 
 def _sidecar_path(run_id: str, runs_dir: Path) -> Path:
@@ -113,7 +113,7 @@ def register_buildgraph_tools(mcp, runs_dir: Optional[Path] = None) -> None:
                 Optional human label for the resulting graph.
             runs_dir_override:
                 Optional filesystem path to store the buildgraph sidecar.
-                Defaults to the platform runs dir (~/.local/share/AI-CAD/runs/).
+                Defaults to the platform runs dir (~/.local/share/Chudware/runs/).
 
         Returns:
             {ok, run_id, graph, advisories, sidecar_path}

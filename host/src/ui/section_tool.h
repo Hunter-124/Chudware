@@ -1,5 +1,5 @@
 #pragma once
-// AI-CAD Section View — SolidWorks-style multi-plane section (C28-C, wave C28).
+// Chudware Section View — SolidWorks-style multi-plane section (C28-C, wave C28).
 // Up to 3 simultaneous clip planes; the visible solid is their intersection (zonal).
 // Each plane has its own preset/offset/flip controls and an orange drag arrow.
 // Panel: Section 1 row (always on), + collapsible Section 2 / Section 3 rows.

@@ -1,27 +1,27 @@
 """Live end-to-end check of the plain-language geometry vocabulary against the STAGED
-libaicad.dll (the one the app loads) — and an optional live run on the local LM Studio
+libchudware.dll (the one the app loads) — and an optional live run on the local LM Studio
 model. Part A drives the real doc_apply_ops RPC (which also runs validate.cpp), proving
 the staged DLL accepts: word-query fillet, sketch-on-a-named-face, relational `at`,
 query-target hole, and the new bolt_circle feature. Part B asks Gemma to use them.
 """
 import ctypes, json, os, sys
 
-DIST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dist", "AI-CAD")
+DIST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dist", "Chudware")
 os.add_dll_directory(DIST)
-os.environ.setdefault("AI_CAD_PROMPTS_DIR", os.path.join(DIST, "app", "agent", "prompts"))
+os.environ.setdefault("CHUDWARE_PROMPTS_DIR", os.path.join(DIST, "app", "agent", "prompts"))
 
-dll = ctypes.CDLL(os.path.join(DIST, "libaicad.dll"))
-dll.aicad_call.restype = ctypes.c_int
-dll.aicad_call.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p)]
-dll.aicad_free.argtypes = [ctypes.c_char_p]
+dll = ctypes.CDLL(os.path.join(DIST, "libchudware.dll"))
+dll.chudware_call.restype = ctypes.c_int
+dll.chudware_call.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p)]
+dll.chudware_free.argtypes = [ctypes.c_char_p]
 
 
 def call(method, params):
     out = ctypes.c_char_p()
-    rc = dll.aicad_call(method.encode(), json.dumps(params).encode(), ctypes.byref(out))
+    rc = dll.chudware_call(method.encode(), json.dumps(params).encode(), ctypes.byref(out))
     s = out.value.decode() if out.value else ""
     if out.value:
-        dll.aicad_free(out)
+        dll.chudware_free(out)
     try:
         return rc, json.loads(s) if s else {}
     except Exception:
@@ -75,7 +75,7 @@ def scenario(title, ops):
     return ok
 
 
-print("PROMPTS_DIR =", os.environ.get("AI_CAD_PROMPTS_DIR"))
+print("PROMPTS_DIR =", os.environ.get("CHUDWARE_PROMPTS_DIR"))
 print("=" * 72)
 print("PART A — plain-language vocabulary through the staged DLL (doc_apply_ops)")
 print("=" * 72)

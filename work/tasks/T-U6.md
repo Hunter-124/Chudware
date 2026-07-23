@@ -44,11 +44,11 @@ what ran, on what, verdicts, and the narration.
 What changed:
 - NEW ui/abstract/sim_view.h: pure view-model (SimPanelModel, SimStudyRow, SimPanelState, SimRunState) — no ImGui/GL includes, follows ui/abstract/ convention
 - NEW ui/imgui/src/ui/sim_panel.h + sim_panel.cpp: Simulation Studies Manager panel built on panel_scaffold + theme:: tokens; study list rendered via BeginTable with RowBg (bg1/bg2 tokens for legibility over glass window); result scalars per study type; FEA mesh-convergence caveat always shown, CFD Cd-uncalibrated warning for cpp-lbm engine (both TCOL(warn)); describe_results narration collapsible verbatim; per-study Re-run via AsyncRpc (run_fea_static/modal 180s, run_cfd_flow 300s)
-- MODIFIED ui/imgui/src/ui/scenarios.h/cpp: AI_CAD_SHOT=sim_studies scenario — fixture seeding (FEA static + CFD flow) fires unconditionally in ScenarioRunner::tick() (no workerStarted guard); gFixtureSeeded flag absorbs first docId without clearing rows
+- MODIFIED ui/imgui/src/ui/scenarios.h/cpp: CHUDWARE_SHOT=sim_studies scenario — fixture seeding (FEA static + CFD flow) fires unconditionally in ScenarioRunner::tick() (no workerStarted guard); gFixtureSeeded flag absorbs first docId without clearing rows
 - MODIFIED ui/imgui/src/app/application.cpp: panel Begin/End wiring centered at 560x520, after BOM panel block
 
 How verified:
-- Headless screenshot (AI_CAD_SHOT=sim_studies, 150 frames) shows populated table: FEA Static row (FoS 3.41, 73.4 MPa, ⚠ convergence) + CFD Flow row (Cd 1.8720, D 0.214 N, ⚠ uncalibrated) — both rows legible on dark bg1/bg2 table backing
+- Headless screenshot (CHUDWARE_SHOT=sim_studies, 150 frames) shows populated table: FEA Static row (FoS 3.41, 73.4 MPa, ⚠ convergence) + CFD Flow row (Cd 1.8720, D 0.214 N, ⚠ uncalibrated) — both rows legible on dark bg1/bg2 table backing
 - ui_style_check.py: 0 findings (clean)
 - Build: cmake --build clean, no warnings on new files
 

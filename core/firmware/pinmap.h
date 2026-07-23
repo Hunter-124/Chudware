@@ -8,7 +8,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad::firmware {
+namespace chudware::firmware {
 
 struct Project;  // project.h — only needed by write_pinmap
 
@@ -27,6 +27,6 @@ nlohmann::json pin_model(const nlohmann::json& board_doc,
 // The generated C header text (deterministic, byte-stable vs the Python port).
 std::string generate_pinmap(const nlohmann::json& board_doc,
                             const std::string& mcu_family = "",
-                            const std::string& guard = "AICAD_PINMAP_H");
+                            const std::string& guard = "CHUDWARE_PINMAP_H");
 
-}  // namespace aicad::firmware
+}  // namespace chudware::firmware

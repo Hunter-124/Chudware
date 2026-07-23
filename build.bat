@@ -1,20 +1,20 @@
 @echo off
 setlocal EnableExtensions
 rem ===========================================================================
-rem  Billet (AI-CAD) Windows build  --  rebuild host + stage dist\AI-CAD\
+rem  Chudware (Chudware) Windows build  --  rebuild host + stage dist\Chudware\
 rem ---------------------------------------------------------------------------
 rem  Usage:
-rem    build.bat            Default: compile Billet (Release) and sync exe +
-rem                         core DLLs + app code + assets into dist\AI-CAD\.
+rem    build.bat            Default: compile Chudware (Release) and sync exe +
+rem                         core DLLs + app code + assets into dist\Chudware\.
 rem    build.bat host       Only compile the C++ host (does not touch dist\).
-rem    build.bat core       Only rebuild libaicad + aicad-hostd (windows-occt).
+rem    build.bat core       Only rebuild libchudware + chudware-hostd (windows-occt).
 rem    build.bat app        Only sync Python app code into dist\ (no compile).
 rem    build.bat full       Full clean release via installer.build_release
 rem                         (re-downloads the wheelhouse; needs network).
 rem    build.bat clean      Wipe host\build-win and dist\, then default build.
 rem    build.bat shortcut   Install/refresh the user Start Menu shortcut only.
 rem ---------------------------------------------------------------------------
-rem  Close any running Billet.exe first, or the exe/DLL copy will fail (lock).
+rem  Close any running Chudware.exe first, or the exe/DLL copy will fail (lock).
 rem  Requires VS 2022/2025 Build Tools or Community with C++ workload.
 rem  Run from a normal shell; this script loads vcvars64 when needed.
 rem ===========================================================================
@@ -25,8 +25,8 @@ set "MODE=%~1"
 if "%MODE%"=="" set "MODE=default"
 
 set "BUILD=%ROOT%\host\build-win"
-set "EXE=%BUILD%\bin\Billet.exe"
-set "DIST=%ROOT%\dist\AI-CAD"
+set "EXE=%BUILD%\bin\Chudware.exe"
+set "DIST=%ROOT%\dist\Chudware"
 set "CORE_BUILD=%ROOT%\build\windows-occt"
 set "CORE_BIN=%CORE_BUILD%\bin"
 
@@ -50,7 +50,7 @@ if not defined CMAKE (
 
 rem --- locate a Python for the staging / release steps -----------------------
 set "PY="
-set "VENVPY=%APPDATA%\AI-CAD\runtime\venv\Scripts\python.exe"
+set "VENVPY=%APPDATA%\Chudware\runtime\venv\Scripts\python.exe"
 if exist "%VENVPY%" set "PY=%VENVPY%"
 if not defined PY for /f "delims=" %%p in ('py -3.11 -c "import sys;print(sys.executable)" 2^>nul') do set "PY=%%p"
 if not defined PY for /f "delims=" %%p in ('py -3.12 -c "import sys;print(sys.executable)" 2^>nul') do set "PY=%%p"
@@ -86,8 +86,8 @@ if /i "%MODE%"=="core" (
 rem --- configure + compile the native host (skipped for 'app') ---------------
 if /i not "%MODE%"=="app" (
   rem Prefer a staged core so modeling works out of the box.
-  if not exist "%CORE_BIN%\libaicad.dll" (
-    echo [build] libaicad.dll missing — building windows-occt core first ...
+  if not exist "%CORE_BIN%\libchudware.dll" (
+    echo [build] libchudware.dll missing — building windows-occt core first ...
     call :build_core || goto :fail
   )
 
@@ -102,16 +102,16 @@ if /i not "%MODE%"=="app" (
     )
     if defined CEF_ROOT_CFG (
       set "CEF_ROOT_CFG=%CEF_ROOT_CFG:\=/%"
-      echo [build] CEF SDK found — enabling AI_CAD_ENABLE_CEF
-      "%CMAKE%" -S "%ROOT%\host" -B "%BUILD%" -G Ninja -DCMAKE_BUILD_TYPE=Release -DAI_CAD_ENABLE_CEF=ON -DCEF_ROOT=%CEF_ROOT_CFG% || goto :fail
+      echo [build] CEF SDK found — enabling CHUDWARE_ENABLE_CEF
+      "%CMAKE%" -S "%ROOT%\host" -B "%BUILD%" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCHUDWARE_ENABLE_CEF=ON -DCEF_ROOT=%CEF_ROOT_CFG% || goto :fail
     ) else (
       echo [build] no CEF SDK under extern\cef — building without browser backend
       echo [build]          ^(run scripts\fetch_cef_windows.ps1 to enable CEF^)
-      "%CMAKE%" -S "%ROOT%\host" -B "%BUILD%" -G Ninja -DCMAKE_BUILD_TYPE=Release -DAI_CAD_ENABLE_CEF=OFF || goto :fail
+      "%CMAKE%" -S "%ROOT%\host" -B "%BUILD%" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCHUDWARE_ENABLE_CEF=OFF || goto :fail
     )
   )
-  echo [build] compiling Billet.exe ^(Release^) ...
-  "%CMAKE%" --build "%BUILD%" --config Release --target Billet || goto :fail
+  echo [build] compiling Chudware.exe ^(Release^) ...
+  "%CMAKE%" --build "%BUILD%" --config Release --target Chudware || goto :fail
   if not exist "%EXE%" (
     echo [build] ERROR: exe was not produced at %EXE%
     goto :fail
@@ -135,15 +135,15 @@ if /i "%MODE%"=="full" (
 )
 
 rem --- default / app: refresh the dist payload in place ----------------------
-echo [build] syncing dist\AI-CAD\ ...
+echo [build] syncing dist\Chudware\ ...
 if not exist "%DIST%" mkdir "%DIST%"
 
 if /i not "%MODE%"=="app" (
-  copy /y "%EXE%" "%DIST%\Billet.exe" >nul || goto :fail
-  if exist "%BUILD%\bin\Billet.pdb" copy /y "%BUILD%\bin\Billet.pdb" "%DIST%\Billet.pdb" >nul
-  rem Compat name for older scripts that still look for AI-CAD.exe
-  copy /y "%EXE%" "%DIST%\AI-CAD.exe" >nul 2>nul
-  rem CEF helper + runtime (libcef.dll, *.pak, locales/) when built with AI_CAD_ENABLE_CEF
+  copy /y "%EXE%" "%DIST%\Chudware.exe" >nul || goto :fail
+  if exist "%BUILD%\bin\Chudware.pdb" copy /y "%BUILD%\bin\Chudware.pdb" "%DIST%\Chudware.pdb" >nul
+  rem Compat name for older scripts that still look for Chudware.exe
+  copy /y "%EXE%" "%DIST%\Chudware.exe" >nul 2>nul
+  rem CEF helper + runtime (libcef.dll, *.pak, locales/) when built with CHUDWARE_ENABLE_CEF
   if exist "%BUILD%\bin\ai_cad_cef_helper.exe" (
     copy /y "%BUILD%\bin\ai_cad_cef_helper.exe" "%DIST%\ai_cad_cef_helper.exe" >nul
   )
@@ -171,29 +171,29 @@ if /i not "%MODE%"=="app" (
 
   rem Stage C++ core DLLs + hostd next to the exe (in-process engine).
   set "CORE_BIN_STAGE="
-  if exist "%ROOT%\build\windows-occt\bin\libaicad.dll" set "CORE_BIN_STAGE=%ROOT%\build\windows-occt\bin"
-  if not defined CORE_BIN_STAGE if exist "%ROOT%\core\build-occt\bin\Release\libaicad.dll" set "CORE_BIN_STAGE=%ROOT%\core\build-occt\bin\Release"
+  if exist "%ROOT%\build\windows-occt\bin\libchudware.dll" set "CORE_BIN_STAGE=%ROOT%\build\windows-occt\bin"
+  if not defined CORE_BIN_STAGE if exist "%ROOT%\core\build-occt\bin\Release\libchudware.dll" set "CORE_BIN_STAGE=%ROOT%\core\build-occt\bin\Release"
   if defined CORE_BIN_STAGE (
     echo [build] staging C++ core DLLs from %CORE_BIN_STAGE% ...
     robocopy "%CORE_BIN_STAGE%" "%DIST%" *.dll /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >nul
     if errorlevel 8 (
-      echo [build] ERROR: could not stage core DLLs -- a DLL is locked. Close Billet.exe AND any
-      echo [build]        running Billet/AI-CAD MCP server, then rerun.
+      echo [build] ERROR: could not stage core DLLs -- a DLL is locked. Close Chudware.exe AND any
+      echo [build]        running Chudware MCP server, then rerun.
       goto :fail
     )
-    if exist "%CORE_BIN_STAGE%\aicad-hostd.exe" (
-      robocopy "%CORE_BIN_STAGE%" "%DIST%" aicad-hostd.exe aicad-hostd.pdb /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >nul
+    if exist "%CORE_BIN_STAGE%\chudware-hostd.exe" (
+      robocopy "%CORE_BIN_STAGE%" "%DIST%" chudware-hostd.exe chudware-hostd.pdb /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >nul
       if errorlevel 8 (
-        echo [build] ERROR: could not stage aicad-hostd.exe -- it is locked ^(daemon running^).
-        echo [build]        Stop it first:  "%DIST%\aicad-hostd.exe" --stop   then rerun.
+        echo [build] ERROR: could not stage chudware-hostd.exe -- it is locked ^(daemon running^).
+        echo [build]        Stop it first:  "%DIST%\chudware-hostd.exe" --stop   then rerun.
         goto :fail
       )
     ) else (
-      echo [build] WARNING: aicad-hostd.exe not found in %CORE_BIN_STAGE% -- engine daemon NOT staged.
+      echo [build] WARNING: chudware-hostd.exe not found in %CORE_BIN_STAGE% -- engine daemon NOT staged.
       echo [build]          Build it:  build.bat core
     )
   ) else (
-    echo [build] WARNING: libaicad.dll not found under build\windows-occt\bin
+    echo [build] WARNING: libchudware.dll not found under build\windows-occt\bin
     echo [build]          -- C++ core NOT staged. App opens but cannot create geometry.
     echo [build]          Build the core:  build.bat core
   )
@@ -240,8 +240,8 @@ call :install_shortcut
 
 :done
 echo.
-echo [build] DONE (%MODE%).  Run: "%DIST%\Billet.exe"
-echo [build]        Start Menu: Billet
+echo [build] DONE (%MODE%).  Run: "%DIST%\Chudware.exe"
+echo [build]        Start Menu: Chudware
 endlocal & exit /b 0
 
 :fail
@@ -266,13 +266,13 @@ for %%V in (
 exit /b 1
 
 :build_core
-echo [build] building C++ core ^(windows-occt: aicad + aicad-hostd^) ...
+echo [build] building C++ core ^(windows-occt: chudware + chudware-hostd^) ...
 if not exist "%CORE_BUILD%\build.ninja" if not exist "%CORE_BUILD%\CMakeCache.txt" (
   "%CMAKE%" --preset windows-occt || exit /b 1
 )
-"%CMAKE%" --build "%CORE_BUILD%" --config Release --target aicad aicad-hostd || exit /b 1
-if not exist "%CORE_BIN%\libaicad.dll" (
-  echo [build] ERROR: libaicad.dll not produced
+"%CMAKE%" --build "%CORE_BUILD%" --config Release --target chudware chudware-hostd || exit /b 1
+if not exist "%CORE_BIN%\libchudware.dll" (
+  echo [build] ERROR: libchudware.dll not produced
   exit /b 1
 )
 exit /b 0
@@ -283,17 +283,17 @@ goto :done
 
 :install_shortcut
 set "PROGRAMS=%APPDATA%\Microsoft\Windows\Start Menu\Programs"
-set "LNK=%PROGRAMS%\Billet.lnk"
-set "TARGET=%DIST%\Billet.exe"
+set "LNK=%PROGRAMS%\Chudware.lnk"
+set "TARGET=%DIST%\Chudware.exe"
 if not exist "%TARGET%" set "TARGET=%EXE%"
 if not exist "%TARGET%" (
-  echo [build] WARNING: no Billet.exe to shortcut yet
+  echo [build] WARNING: no Chudware.exe to shortcut yet
   exit /b 0
 )
 set "WORKDIR=%DIST%"
-if not exist "%WORKDIR%\Billet.exe" set "WORKDIR=%BUILD%\bin"
+if not exist "%WORKDIR%\Chudware.exe" set "WORKDIR=%BUILD%\bin"
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$w=New-Object -ComObject WScript.Shell; $s=$w.CreateShortcut('%LNK%'); $s.TargetPath='%TARGET%'; $s.WorkingDirectory='%WORKDIR%'; $s.Description='Billet parametric CAD'; $s.IconLocation='%TARGET%,0'; $s.Save()"
+  "$w=New-Object -ComObject WScript.Shell; $s=$w.CreateShortcut('%LNK%'); $s.TargetPath='%TARGET%'; $s.WorkingDirectory='%WORKDIR%'; $s.Description='Chudware parametric CAD'; $s.IconLocation='%TARGET%,0'; $s.Save()"
 if exist "%LNK%" (
   echo [build] Start Menu shortcut: %LNK%
 ) else (

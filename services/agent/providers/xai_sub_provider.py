@@ -64,7 +64,7 @@ REFRESH_SKEW_MS = 5 * 60 * 1000
 # Concurrent chat-completion cap (mega-2 fingerprint: provider_read_timeout_storm).
 # 5-way SPECIFY fan-out + later pairs hammered xAI with parallel long reads →
 # "The read operation timed out" classified as budget death. Bound sibling
-# complete_ex calls process-wide. Override via AICAD_XAI_MAX_CONCURRENT (int ≥1).
+# complete_ex calls process-wide. Override via CHUDWARE_XAI_MAX_CONCURRENT (int ≥1).
 # mega-5: default raised to 3 so serialization under fan-out is less likely to
 # starve long PLAN/BUILD reads; occupancy + queue_wait telemetry is emitted so
 # we can tell serialization vs load-induced timeouts.
@@ -83,8 +83,8 @@ _sem_total_wait_ms: float = 0.0
 
 def _max_concurrent_requests() -> int:
     raw = (
-        os.environ.get("AICAD_XAI_MAX_CONCURRENT")
-        or os.environ.get("AI_CAD_XAI_MAX_CONCURRENT")
+        os.environ.get("CHUDWARE_XAI_MAX_CONCURRENT")
+        or os.environ.get("CHUDWARE_XAI_MAX_CONCURRENT")
         or ""
     ).strip()
     if raw:
@@ -97,8 +97,8 @@ def _max_concurrent_requests() -> int:
 
 def _read_timeout_s() -> float:
     raw = (
-        os.environ.get("AICAD_XAI_READ_TIMEOUT")
-        or os.environ.get("AI_CAD_XAI_READ_TIMEOUT")
+        os.environ.get("CHUDWARE_XAI_READ_TIMEOUT")
+        or os.environ.get("CHUDWARE_XAI_READ_TIMEOUT")
         or ""
     ).strip()
     if raw:
@@ -111,8 +111,8 @@ def _read_timeout_s() -> float:
 
 def _read_timeout_retries() -> int:
     raw = (
-        os.environ.get("AICAD_XAI_READ_TIMEOUT_RETRIES")
-        or os.environ.get("AI_CAD_XAI_READ_TIMEOUT_RETRIES")
+        os.environ.get("CHUDWARE_XAI_READ_TIMEOUT_RETRIES")
+        or os.environ.get("CHUDWARE_XAI_READ_TIMEOUT_RETRIES")
         or ""
     ).strip()
     if raw:

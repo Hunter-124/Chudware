@@ -1,4 +1,4 @@
-// AI-CAD overlay layout + the pinned FeatureManager glass column.
+// Chudware overlay layout + the pinned FeatureManager glass column.
 //
 // Overlay redesign: the dockspace hosts ONLY the central document windows (Viewport / ECAD / CAM,
 // tabbed) so the 3D surface runs edge to edge between the ribbon and the status bar. The old

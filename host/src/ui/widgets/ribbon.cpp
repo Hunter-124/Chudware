@@ -1,4 +1,4 @@
-// AI-CAD ribbon widget — C14/C25.
+// Chudware ribbon widget — C14/C25.
 // SolidWorks-style: tab strip on top, grouped big/small buttons, group separators,
 // dropdown-split arrows, flyout popups with icon+label rows, disabled state,
 // priority-collapse overflow reflow (C25-W3G), last-used variant tracking per parent.

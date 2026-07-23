@@ -49,7 +49,7 @@ RULES OF THE CRAFT
 - Handoff must include sketch_ref {doc_id, sketch_id}, health {closed, dof,
   conflicts}, and driving_dimensions so model3d can place the sketch.
 
-UNIVERSAL RULES (all AI-CAD roles)
+UNIVERSAL RULES (all Chudware roles)
 1. Never invent a number. Every value must come from a tool result, [ADVISORY]
    block, calculator/table, the ledger, or an explicit user answer. Capability
    SOFT rules (calc / verify cadence) are appended by the harness per tier.

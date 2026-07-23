@@ -1,10 +1,10 @@
 // cef/cef_app.h — CEF process lifecycle + the browser-process CefApp.
 //
-// SCAFFOLDING (docs/cef_webview.md phase 2); compiled only with AI_CAD_ENABLE_CEF.
+// SCAFFOLDING (docs/cef_webview.md phase 2); compiled only with CHUDWARE_ENABLE_CEF.
 //
 // Two entry points, both of which MUST run CefExecuteProcess at the very top of
 // their process's main():
-//   * cef::execute_subprocess() — called first in BOTH AI-CAD's main() and the
+//   * cef::execute_subprocess() — called first in BOTH Chudware's main() and the
 //     helper's main(). In a helper (render/GPU/utility) process it blocks and
 //     returns the process exit code; in the browser process it returns -1 and
 //     execution continues.
@@ -28,7 +28,7 @@ int execute_subprocess(int argc, char** argv);
 // (and available()==false) if CEF failed to start, so callers fall back to the
 // screencast backend. Safe to call once; also the T-PERF10 lazy-init entry —
 // first CefWebView::open() calls this if main() did not (default). Force early
-// init with AI_CAD_CEF_EARLY=1.
+// init with CHUDWARE_CEF_EARLY=1.
 bool initialize();
 
 // True after a successful initialize(). CefWebView::processReady() forwards this.

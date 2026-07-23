@@ -1,6 +1,6 @@
 // cef/cef_daemon.cpp — see cef_daemon.h. The lazily-spawned CEF host that serves
-// headless fetch/download to the Python scraper over an aicad_ipc socket, then
-// idle-exits. Compiled only with AI_CAD_ENABLE_CEF.
+// headless fetch/download to the Python scraper over an chudware_ipc socket, then
+// idle-exits. Compiled only with CHUDWARE_ENABLE_CEF.
 #include "cef_daemon.h"
 
 #include <chrono>
@@ -12,7 +12,7 @@
 
 #include <nlohmann/json.hpp>
 
-#include "ipc_transport.h"  // aicad_ipc::IpcListener / IpcConn
+#include "ipc_transport.h"  // chudware_ipc::IpcListener / IpcConn
 
 #include "cef_app.h"        // initialize()/shutdown()/initialized()
 #include "cef_headless.h"   // headless_fetch()/headless_download()
@@ -31,7 +31,7 @@ namespace {
 // OSCrypt (raw dir-sharing can't hand a session across processes — see MEMORY
 // vendor-login-session-handoff).
 std::string warm_profile_dir() {
-    if (const char* ov = std::getenv("AI_CAD_CEF_PROFILE_DIR"); ov && ov[0]) return ov;
+    if (const char* ov = std::getenv("CHUDWARE_CEF_PROFILE_DIR"); ov && ov[0]) return ov;
     return cef_platform::cache_root() + "/_warm_profile";
 }
 
@@ -124,12 +124,12 @@ json handle(const std::string& line, bool& stop) {
         if (r.ok) result["html"] = r.html;
         return json{{"id", id}, {"result", result}};
     }
-    // DIAGNOSTIC (opt-in AI_CAD_CEF_PROBE): drive a real form login headlessly to
+    // DIAGNOSTIC (opt-in CHUDWARE_CEF_PROBE): drive a real form login headlessly to
     // observe a bot-wall verdict. Executes caller JS in the page, so it is gated off
     // by default and never part of the normal fetch/download surface.
     if (method == "login_probe") {
-        if (const char* g = std::getenv("AI_CAD_CEF_PROBE"); !(g && g[0] && g[0] != '0'))
-            return err("login_probe disabled (set AI_CAD_CEF_PROBE=1)");
+        if (const char* g = std::getenv("CHUDWARE_CEF_PROBE"); !(g && g[0] && g[0] != '0'))
+            return err("login_probe disabled (set CHUDWARE_CEF_PROBE=1)");
         const std::string url = p.value("url", "");
         const std::string js = p.value("fill_js", "");
         if (url.empty() || js.empty()) return err("missing url/fill_js");
@@ -153,7 +153,7 @@ int run_cef_daemon(const std::string& sock_path, int idle_secs) {
     cef_platform::set_daemon_process(true);
     if (!initialize()) { std::fprintf(stderr, "[cef-daemon] CEF init failed\n"); return 1; }
 
-    aicad_ipc::IpcListener listener;
+    chudware_ipc::IpcListener listener;
     std::string err;
     if (!listener.listen(sock_path, err)) {
         std::fprintf(stderr, "[cef-daemon] listen(%s) failed: %s\n", sock_path.c_str(), err.c_str());
@@ -165,7 +165,7 @@ int run_cef_daemon(const std::string& sock_path, int idle_secs) {
     auto last = std::chrono::steady_clock::now();
     bool stop = false;
     while (!stop) {
-        aicad_ipc::IpcConn c = listener.accept(/*timeoutMs=*/250);
+        chudware_ipc::IpcConn c = listener.accept(/*timeoutMs=*/250);
         if (c.valid()) {
             last = std::chrono::steady_clock::now();
             std::string line;

@@ -1,6 +1,6 @@
 ---
 name: gui-workspaces
-description: Billet (formerly AI-CAD) workspace-tab specialist — Parts Library, Assembly panels, CAM, ECAD, PLM, Reverse-Engineering, AI/Activity workspace, Drawing, Simulation manager, plus doc tabs, file explorer, console and status bar. Use for any task about one of these workspace tabs or auxiliary panels. Workers dispatched by gui-orchestrator read this file first, then work only in their own workspace's files.
+description: Chudware (formerly Chudware) workspace-tab specialist — Parts Library, Assembly panels, CAM, ECAD, PLM, Reverse-Engineering, AI/Activity workspace, Drawing, Simulation manager, plus doc tabs, file explorer, console and status bar. Use for any task about one of these workspace tabs or auxiliary panels. Workers dispatched by gui-orchestrator read this file first, then work only in their own workspace's files.
 ---
 
 # GUI Workspaces Specialist
@@ -10,7 +10,7 @@ your assigned workspace's files** — e.g. an icon-generation task never needs t
 section below, and vice versa. Shared plumbing (app.cpp dispatch, AppState seams) is
 integrator-owned.
 
-The app has 8 workspaces cycled by the `AI_CAD_SHOT=workspaces` scenario; each is drawn from
+The app has 8 workspaces cycled by the `CHUDWARE_SHOT=workspaces` scenario; each is drawn from
 the frame loop in `host/src/app.cpp`.
 
 ## Per-workspace file map
@@ -26,7 +26,7 @@ the frame loop in `host/src/app.cpp`.
 | **AI / Activity** | `host/src/ui/ai/ai_workspace.cpp/.h`, `host/src/ui/activity_panel.cpp`, `host/src/ui/legacy_chat.cpp` (Copilot Settings: Agents/Prompts/Skills/**Context**/Permissions/Providers) | Agent run tree, role-prompt editor, live progress; Context Injection tab edits `aicad.trigger/1` via `triggers_*` RPCs; events per `contracts/agent_events.md` |
 | **Drawing** | `host/src/ui/drawing_panel.cpp` | Sheet layout, views, DXF export |
 | **Simulation** | `host/src/ui/sim_manager.cpp`, `host/src/ui/evaluate_dialogs.cpp` | Study tree, fixtures/loads, results; Evaluate dialogs (measure, mass props, …) |
-| **Firmware** | `host/src/ui/firmware/fw_workspace.cpp/.h` | T-FIN5: project rail + sources, build console (parsed warnings), emulation + UART console, GPIO trace viewer (`contracts/firmware_rpc.md` §7/§8); fw_status-gated Flash/Debug; tab is progressively disclosed (`ui::firmwareTabVisible`); shot: `AI_CAD_SHOT=firmware` |
+| **Firmware** | `host/src/ui/firmware/fw_workspace.cpp/.h` | T-FIN5: project rail + sources, build console (parsed warnings), emulation + UART console, GPIO trace viewer (`contracts/firmware_rpc.md` §7/§8); fw_status-gated Flash/Debug; tab is progressively disclosed (`ui::firmwareTabVisible`); shot: `CHUDWARE_SHOT=firmware` |
 
 ## Auxiliary panels
 
@@ -54,7 +54,7 @@ gains a major new flow).
 ## Build & verify
 
 `./build.sh` from repo root must compile. Headless smoke per workspace where one exists:
-`AI_CAD_SHOT=<asm|fea|flow|drawing|activity|workspaces|motion> ./host/build-linux/bin/Billet
+`CHUDWARE_SHOT=<asm|fea|flow|drawing|activity|workspaces|motion> ./host/build-linux/bin/Chudware
 --ui-screenshot scratch/ws_smoke.png` — crash check only. Never run git. Return files changed
 + a one-line user check, e.g. "Parts Library > type in search — results stream while typing,
 filters stay responsive."

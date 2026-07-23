@@ -56,7 +56,7 @@ def run_openfoam_tunnel(
         raise RuntimeError(
             "OpenFOAM is not available. Provision it with "
             "`python -m tools.provision_openfoam --install` (WSL) or install blueCFD-Core "
-            "natively and set %AICAD_OPENFOAM%."
+            "natively and set %CHUDWARE_OPENFOAM%."
         )
 
     # Conjugate heat transfer (solid + fluid) is a different solver/mesh path.
@@ -72,7 +72,7 @@ def run_openfoam_tunnel(
             data["trace_point"] = trace_point
         on_progress(data)
 
-    case_dir = tempfile.mkdtemp(prefix="aicad_foam_")
+    case_dir = tempfile.mkdtemp(prefix="chudware_foam_")
     try:
         kind = "thermal" if (thermal and thermal.get("enabled")) else "aero"
         prog("mesh", 2, f"Building OpenFOAM {kind} case ({preset})...")
@@ -112,7 +112,7 @@ def run_openfoam_tunnel(
     finally:
         # Keep the case on disk only if explicitly requested for debugging.
         import os
-        if not os.environ.get("AICAD_FOAM_KEEP"):
+        if not os.environ.get("CHUDWARE_FOAM_KEEP"):
             shutil.rmtree(case_dir, ignore_errors=True)
 
 
@@ -134,7 +134,7 @@ def run_openfoam_cht(stl_path, direction, speed_mps, preset, on_progress,
             d["trace_point"] = trace_point
         on_progress(d)
 
-    case_dir = tempfile.mkdtemp(prefix="aicad_cht_")
+    case_dir = tempfile.mkdtemp(prefix="chudware_cht_")
     try:
         prog("mesh", 2, f"Building CHT case ({preset})...")
         info = build_cht_case(
@@ -179,7 +179,7 @@ def run_openfoam_cht(stl_path, direction, speed_mps, preset, on_progress,
         return result
     finally:
         import os
-        if not os.environ.get("AICAD_FOAM_KEEP"):
+        if not os.environ.get("CHUDWARE_FOAM_KEEP"):
             shutil.rmtree(case_dir, ignore_errors=True)
 
 

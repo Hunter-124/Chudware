@@ -9,7 +9,7 @@ Covers, per the task DoD:
     no all-skip).
 
 Run with the gate venv (has yaml):
-    ~/.local/share/AI-CAD/mcp-venv/bin/python -m pytest \
+    ~/.local/share/Chudware/mcp-venv/bin/python -m pytest \
         services/agent/pipeline/test_pipeline.py -q
 """
 from __future__ import annotations
@@ -335,11 +335,11 @@ def test_design_pipeline_flag_on_visits_four_stages():
 
 def test_dp_flag_from_env():
     import os
-    os.environ["AICAD_DESIGN_PIPELINE"] = "1"
+    os.environ["CHUDWARE_DESIGN_PIPELINE"] = "1"
     try:
         assert PipelineFlags.from_env().design_pipeline is True
     finally:
-        del os.environ["AICAD_DESIGN_PIPELINE"]
+        del os.environ["CHUDWARE_DESIGN_PIPELINE"]
     assert PipelineFlags.from_env().design_pipeline is False
 
 

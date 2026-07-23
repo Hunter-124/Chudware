@@ -1,4 +1,4 @@
-// AI-CAD ribbon widget — C14.
+// Chudware ribbon widget — C14.
 // SolidWorks-style tab strip + grouped big/small icon buttons, driven by ribbon_def.cpp.
 // Pure ImGui drawing, no new dependencies, theme-role colors only.
 #pragma once

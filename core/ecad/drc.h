@@ -15,7 +15,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad::ecad {
+namespace chudware::ecad {
 
 // A normalized copper item for clearance math (drc.py::_Shape).
 struct Shape {
@@ -43,4 +43,4 @@ nlohmann::json run_drc(const nlohmann::json& board);
 // ratsnest(board) -> deterministic list of {net, p1, p2} airwires.
 nlohmann::json ratsnest(const nlohmann::json& board);
 
-}  // namespace aicad::ecad
+}  // namespace chudware::ecad

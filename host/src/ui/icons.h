@@ -1,4 +1,4 @@
-// AI-CAD icon loader (C14).
+// Chudware icon loader (C14).
 // Loads atlas_dark.png / atlas_light.png + atlas.json at startup (stb_image vendored).
 // ui::Icon(name, size) -> IconUV{ImTextureID, uv0, uv1}.
 // Theme switch swaps the active texture; UVs are constant.

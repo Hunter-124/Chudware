@@ -9,7 +9,7 @@
 //
 // Both calls require initialize() to have succeeded and pump the CEF loop inline,
 // so they must run on the browser-process main thread (the same context that
-// --cef-shot uses). Compiled only with AI_CAD_ENABLE_CEF.
+// --cef-shot uses). Compiled only with CHUDWARE_ENABLE_CEF.
 #pragma once
 
 #include <string>
@@ -49,7 +49,7 @@ bool headless_download(const std::string& url, const std::string& dest_path,
 // no-automation-tell guarantee holds) to fill + submit the login form, waits up to
 // `post_wait_ms` for the response, and returns the resulting main-frame HTML — search
 // it for the vendor's "reCAPTCHA verification failed" vs "invalid login" message.
-// Opt-in only (daemon gates on AI_CAD_CEF_PROBE); local diagnostics, not a product path.
+// Opt-in only (daemon gates on CHUDWARE_CEF_PROBE); local diagnostics, not a product path.
 FetchResult headless_login_probe(const std::string& url, const std::string& fill_submit_js,
                                  int settle_ms, int post_wait_ms,
                                  const std::string& profile_dir = "");
@@ -64,7 +64,7 @@ FetchResult headless_login_probe(const std::string& url, const std::string& fill
 // until that element appears (or `timeout_ms` elapses) and returns the final HTML —
 // the caller extracts the sentinel's contents. `settle_ms` is dwell after load
 // before the script runs (default 4000). Unlike login_probe this is a normal
-// capability (no AI_CAD_CEF_PROBE gate, no synthetic mouse) — it is the reusable
+// capability (no CHUDWARE_CEF_PROBE gate, no synthetic mouse) — it is the reusable
 // primitive behind client-generated download URLs on SPA configurators (McMaster
 // CAD FilePath, Misumi/cadenas series→SKU). `profile_dir` as in headless_fetch.
 FetchResult headless_interact(const std::string& url, const std::string& script,

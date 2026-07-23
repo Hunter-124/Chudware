@@ -26,7 +26,7 @@
 
 #include <TopoDS_Shape.hxx>
 
-namespace aicad::doc {
+namespace chudware::doc {
 
 // Detect the format code from a path's extension: "step"/"iges"/"brep"/"stl"/"obj"/
 // "ply"/"gltf"/"glb"/"3mf"/"3dm"/"sldprt"/… (mirrors formats.py::_EXT_TO_FORMAT).
@@ -138,4 +138,4 @@ std::vector<std::pair<std::string, TopoDS_Shape>> import_bodies(const std::strin
 std::string shape_to_brep_b64(const TopoDS_Shape& shape);
 TopoDS_Shape brep_b64_to_shape(const std::string& b64);
 
-}  // namespace aicad::doc
+}  // namespace chudware::doc

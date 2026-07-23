@@ -6,7 +6,7 @@
 // symmetric and which the hex8 path in fea_static consumes (nodes_per_elem==8).
 //
 // This is OCCT-backed (reads the STEP, checks the solid is an axis-aligned box) and lives
-// in the aicad_mesh target, which already links aicad_geom_occt for OCCT access.
+// in the chudware_mesh target, which already links chudware_geom_occt for OCCT access.
 #pragma once
 
 #include <string>
@@ -15,7 +15,7 @@
 
 class TopoDS_Shape;  // OCCT fwd decl — shape overloads below skip the STEP re-parse (P4)
 
-namespace aicad::sim {
+namespace chudware::sim {
 
 // Cheap geometry classification shared by the structured-hex path and the Simple-mode
 // auto-pick in mesher.cpp. Reads the STEP and reports whether the solid is a mappable
@@ -45,4 +45,4 @@ MeshOut mesh_box_hex(const std::string& step_path, const MeshOptions& options);
 // Shape overload (P4): same mesh from an already-parsed shape (no STEP re-read).
 MeshOut mesh_box_hex(const TopoDS_Shape& shape, const MeshOptions& options);
 
-}  // namespace aicad::sim
+}  // namespace chudware::sim

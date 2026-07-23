@@ -1,4 +1,4 @@
-"""Round-4 fix verification — drives the freshly-staged dist/AI-CAD/libaicad.dll in a
+"""Round-4 fix verification — drives the freshly-staged dist/Chudware/libchudware.dll in a
 fresh process (so it loads the NEW core, not the running MCP's in-memory old copy).
 
 Covers the items ctest can't reach end-to-end:

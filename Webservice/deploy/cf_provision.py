@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Idempotent Cloudflare provisioning for billet-web.
+"""Idempotent Cloudflare provisioning for chudware-web.
 
-Creates/updates: the `billet-web` remotely-managed tunnel + ingress to the local
+Creates/updates: the `chudware-web` remotely-managed tunnel + ingress to the local
 gateway, the DNS CNAME, the Zero Trust Access application + allow policy, and
 writes TUNNEL token / team domain / AUD into the gateway env file.
 
 Secrets: reads the API token from $CF_API_TOKEN or Webservice/Cloudflare-info.txt
-(gitignored). Writes secrets ONLY to ~/billet-web-data/gateway.env (0600).
+(gitignored). Writes secrets ONLY to ~/chudware-web-data/gateway.env (0600).
 
 Usage: python3 cf_provision.py [--hostname chudware.com] [--emails a@x,b@y]
 """
@@ -25,10 +25,10 @@ import yaml
 
 API = "https://api.cloudflare.com/client/v4"
 ACCOUNT_ID = "9a800a5f674233fe127cdb44b395ebfa"
-TUNNEL_NAME = "billet-web"
-APP_NAME = "Billet Web"
+TUNNEL_NAME = "chudware-web"
+APP_NAME = "Chudware Web"
 GATEWAY_SERVICE = "http://127.0.0.1:8300"
-ENV_FILE = Path.home() / "billet-web-data" / "gateway.env"
+ENV_FILE = Path.home() / "chudware-web-data" / "gateway.env"
 
 
 def token() -> str:
@@ -70,7 +70,7 @@ def find(items: list[dict], key: str, value: str) -> dict | None:
 ACCESS_DOMAINS = ["ua.edu", "crimson.ua.edu"]
 
 # Additional hostnames served by the SAME tunnel and gated by the SAME Access app.
-# One app => one AUD => the gateway's single BILLET_WEB_CF_AUD keeps validating; a
+# One app => one AUD => the gateway's single CHUDWARE_WEB_CF_AUD keeps validating; a
 # separate per-domain app would mint a different AUD and break JWT validation. So new
 # public domains go HERE (added to the app's self_hosted_domains), never as a new app.
 EXTRA_HOSTS = ["www.chudware.com"]
@@ -99,7 +99,7 @@ def upsert_env(updates: dict[str, str]) -> None:
 def _users_yaml_emails() -> list[str]:
     """Read the gateway allowlist (single source of truth for people).
 
-    Prefers the runtime file ($BILLET_WEB_USERS_FILE, or the data-root copy the
+    Prefers the runtime file ($CHUDWARE_WEB_USERS_FILE, or the data-root copy the
     /admin page edits) over the repo template. Parsed as real YAML (not line
     scraping): a quoted, flow-style, or mixed-case entry must never silently
     drop someone from the Access policy, because a missing or malformed email
@@ -107,8 +107,8 @@ def _users_yaml_emails() -> list[str]:
     lowercased and de-duplicated; example.com rows are dev-only and skipped.
     """
     candidates = [
-        os.environ.get("BILLET_WEB_USERS_FILE"),
-        str(Path.home() / "billet-web-data" / "users.yaml"),
+        os.environ.get("CHUDWARE_WEB_USERS_FILE"),
+        str(Path.home() / "chudware-web-data" / "users.yaml"),
         str(Path(__file__).resolve().parents[1] / "gateway" / "users.yaml"),
     ]
     users_file = next(Path(c) for c in candidates if c and Path(c).is_file())
@@ -144,15 +144,15 @@ def sync_users(host: str) -> None:
         sys.exit(f"no Access app for {host} — run full provisioning first")
     pols = api("GET", f"/accounts/{ACCOUNT_ID}/access/apps/{app['id']}/policies")
     pol_body = {
-        "name": "billet-users", "decision": "allow", "precedence": 1,
+        "name": "chudware-users", "decision": "allow", "precedence": 1,
         "include": _include_list(emails),
     }
-    pol = find(pols, "name", "billet-users")
+    pol = find(pols, "name", "chudware-users")
     if pol:
         api("PUT", f"/accounts/{ACCOUNT_ID}/access/apps/{app['id']}/policies/{pol['id']}", pol_body)
     else:
         api("POST", f"/accounts/{ACCOUNT_ID}/access/apps/{app['id']}/policies", pol_body)
-    print(f"Access policy billet-users synced from users.yaml: {len(emails)} email(s)")
+    print(f"Access policy chudware-users synced from users.yaml: {len(emails)} email(s)")
     for e in emails:
         print(f"  - {e}")
 
@@ -233,24 +233,24 @@ def main() -> None:
     # 5. allow policy (exact-email allowlist; OTP + any configured IdP)
     pols = api("GET", f"/accounts/{ACCOUNT_ID}/access/apps/{app['id']}/policies")
     pol_body = {
-        "name": "billet-users", "decision": "allow", "precedence": 1,
+        "name": "chudware-users", "decision": "allow", "precedence": 1,
         "include": _include_list(emails),
     }
-    pol = find(pols, "name", "billet-users")
+    pol = find(pols, "name", "chudware-users")
     if pol:
         api("PUT", f"/accounts/{ACCOUNT_ID}/access/apps/{app['id']}/policies/{pol['id']}", pol_body)
     else:
         api("POST", f"/accounts/{ACCOUNT_ID}/access/apps/{app['id']}/policies", pol_body)
-    print(f"policy billet-users: {len(emails)} email(s)")
+    print(f"policy chudware-users: {len(emails)} email(s)")
 
     # 6. org team domain + tunnel token -> env file
     org = api("GET", f"/accounts/{ACCOUNT_ID}/access/organizations")
     tunnel_token = api("GET", f"/accounts/{ACCOUNT_ID}/cfd_tunnel/{tid}/token")
     upsert_env({
         "TUNNEL_TOKEN": tunnel_token,
-        "BILLET_WEB_CF_TEAM_DOMAIN": org["auth_domain"],
-        "BILLET_WEB_CF_AUD": app["aud"],
-        "BILLET_WEB_PUBLIC_URL": f"https://{host}",
+        "CHUDWARE_WEB_CF_TEAM_DOMAIN": org["auth_domain"],
+        "CHUDWARE_WEB_CF_AUD": app["aud"],
+        "CHUDWARE_WEB_PUBLIC_URL": f"https://{host}",
     })
     print(f"env written: {ENV_FILE} (team={org['auth_domain']})")
     print("NOTE: Google IdP is a manual dashboard step (see RUNBOOK.md); "

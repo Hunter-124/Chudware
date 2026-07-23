@@ -554,16 +554,16 @@ def test_build_strategy_needed():
     assert build_strategy_needed(10) is True
 
     # Override via env var
-    original = os.environ.get("AI_CAD_COUNCIL_FEATURE_THRESHOLD")
+    original = os.environ.get("CHUDWARE_COUNCIL_FEATURE_THRESHOLD")
     try:
-        os.environ["AI_CAD_COUNCIL_FEATURE_THRESHOLD"] = "3"
+        os.environ["CHUDWARE_COUNCIL_FEATURE_THRESHOLD"] = "3"
         assert build_strategy_needed(2) is False
         assert build_strategy_needed(3) is True
     finally:
         if original is None:
-            os.environ.pop("AI_CAD_COUNCIL_FEATURE_THRESHOLD", None)
+            os.environ.pop("CHUDWARE_COUNCIL_FEATURE_THRESHOLD", None)
         else:
-            os.environ["AI_CAD_COUNCIL_FEATURE_THRESHOLD"] = original
+            os.environ["CHUDWARE_COUNCIL_FEATURE_THRESHOLD"] = original
 
 
 # ---------------------------------------------------------------------------

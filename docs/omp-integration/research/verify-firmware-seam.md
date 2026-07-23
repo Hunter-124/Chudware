@@ -28,7 +28,7 @@
 ## 1. `core/firmware/subprocess.{h,cpp}` — external-process launch API
 
 File: `core/firmware/subprocess.h` (35 lines), `core/firmware/subprocess.cpp` (278 lines).
-Namespace `aicad::firmware`.
+Namespace `chudware::firmware`.
 
 ```cpp
 struct RunResult {
@@ -79,14 +79,14 @@ File: `services/mcp/firmware_tools.py` (405 lines). Pattern: identical to `ecad_
   and a top-level `call()` dispatcher at firmware_rpc.cpp:557).
 - `core_bridge.call` path: `services/mcp/core_bridge.py` — `call(method, params)` is a **ctypes**
   bridge, NOT literally "JSON-RPC over a socket" for the in-process MCP-server mode. It loads
-  `libaicad.{so,dll,dylib}` once (`_load()`, L196-256), and the single exposed entry point is
-  `dll.aicad_call(method: char*, params_json: char*, &out_json: char**)` (string-in/string-out
-  JSON). There is a separate `daemon_bridge` mode (`AI_CAD_ENGINE_DAEMON`) referenced at L207-219
-  that routes over a real socket to `aicad-hostd` instead of loading the DLL in-process — the
+  `libchudware.{so,dll,dylib}` once (`_load()`, L196-256), and the single exposed entry point is
+  `dll.chudware_call(method: char*, params_json: char*, &out_json: char**)` (string-in/string-out
+  JSON). There is a separate `daemon_bridge` mode (`CHUDWARE_ENGINE_DAEMON`) referenced at L207-219
+  that routes over a real socket to `chudware-hostd` instead of loading the DLL in-process — the
   in-process ctypes call and the daemon socket call are two alternate transports behind the same
   `cb.call()` surface (not read in full here; flagged as present but out of this dossier's scope).
 - **Verdict: CONFIRMED** exactly as the plan describes: register a tool → `cb.call(rpc_name, params)`
-  → `aicad_call()` C-ABI → `core/firmware/firmware_rpc.cpp` dispatcher → handler.
+  → `chudware_call()` C-ABI → `core/firmware/firmware_rpc.cpp` dispatcher → handler.
 
 ## 3. `host/src/ui/firmware/fw_workspace.cpp` — panels + build/flash/emulate invocation
 
@@ -133,7 +133,7 @@ File: 1089 lines, `namespace ui::firmware`. Header comment (L1-17) states layout
   profile, T-FIN7).
 - Error envelope fixed since §1: `{code, message, detail}`, same as `worker_rpc.md`/`ecad_rpc.md`.
 - Licensing posture (§1, binding): every toolchain/programmer backend is invoked **as an
-  unmodified subprocess only** — never linked into `libaicad`. This is the constraint any new
+  unmodified subprocess only** — never linked into `libchudware`. This is the constraint any new
   debugger (openocd GPL-2, gdb GPL-3, avrdude GPL-2) MUST honor — subprocess-only, exactly the
   `hardware.cpp` + `subprocess.cpp` pattern already used for probe-rs/esptool.
 - **Verdict: CONFIRMED** shape/intent; **CORRECTED** — do not treat §5 as the complete tool list;

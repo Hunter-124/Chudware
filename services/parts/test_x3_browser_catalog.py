@@ -24,7 +24,7 @@ if str(_SVC_MCP) not in sys.path:
 def test_place_import_file_missing_path():
     from services.mcp import core_bridge as cb
     if not cb.available():
-        pytest.skip("native core (libaicad) not available in this environment")
+        pytest.skip("native core (libchudware) not available in this environment")
     r = cb.call("part_import_file", {})
     assert r["ok"] is False
     assert "path" in r["reason"]
@@ -33,7 +33,7 @@ def test_place_import_file_missing_path():
 def test_place_import_file_file_not_found():
     from services.mcp import core_bridge as cb
     if not cb.available():
-        pytest.skip("native core (libaicad) not available in this environment")
+        pytest.skip("native core (libchudware) not available in this environment")
     r = cb.call("part_import_file", {"path": "/no/such/file.step"})
     assert r["ok"] is False
     assert "not found" in r["reason"]
@@ -42,7 +42,7 @@ def test_place_import_file_file_not_found():
 # ── REAL-CORE integration: the full import chain, no mocks ───────────────────
 # Proves the FINAL link of the browser-catalog chain on the native engine:
 #   real STEP on disk -> part_import_file RPC -> new editable doc.
-# SKIPPED (not failed) when the native core (libaicad) is unavailable, so CI on a
+# SKIPPED (not failed) when the native core (libchudware) is unavailable, so CI on a
 # core-less machine stays green while a machine that HAS the core proves the chain.
 # Regression guard for the daemon-mode "attempted relative import with no known
 # parent package" bug: the placer imported core_bridge bare, zeroing its
@@ -57,7 +57,7 @@ def _core_available() -> bool:
 
 
 @pytest.mark.skipif(not _core_available(),
-                    reason="native core (libaicad) not available in this environment")
+                    reason="native core (libchudware) not available in this environment")
 def test_place_import_file_real_core_editable_doc(tmp_path):
     """End-to-end with the REAL engine: export a STEP from a core-built box, then
     place it back via the part_import_file RPC and assert a genuine editable doc_id —
@@ -102,7 +102,7 @@ def test_place_import_file_skips_cleanly_when_core_absent(tmp_path, monkeypatch)
     assert not _core_available()
 
     def _unavailable(verb, params):
-        raise cb.CoreError("libaicad.so not found")
+        raise cb.CoreError("libchudware.so not found")
     monkeypatch.setattr(cb, "call", _unavailable)
 
     import json as _json
@@ -130,7 +130,7 @@ def test_place_import_file_rpc_failure(tmp_path):
     doc, so the discriminating case is an unknown extension.)"""
     from services.mcp import core_bridge as cb
     if not cb.available():
-        pytest.skip("native core (libaicad) not available in this environment")
+        pytest.skip("native core (libchudware) not available in this environment")
     bad = tmp_path / "widget.xyz123"
     bad.write_text("nonsense")
     r = cb.call("part_import_file", {"path": str(bad)})
@@ -143,7 +143,7 @@ def test_place_dispatches_import_file_kind():
     hint enumerates the supported kinds)."""
     from services.mcp import core_bridge as cb
     if not cb.available():
-        pytest.skip("native core (libaicad) not available in this environment")
+        pytest.skip("native core (libchudware) not available in this environment")
     rec = {"part_id": "catalog:x::y", "domain": "catalog",
            "geometry_ref": {"kind": "no_such_kind"}}
     r = cb.call("part_place", {"part_id": "catalog:x::y", "record": rec})
@@ -188,7 +188,7 @@ def _place_with_record(monkeypatch, record):
     `record` param — no hub lookup needed)."""
     from services.mcp import core_bridge as cb
     if not cb.available():
-        pytest.skip("native core (libaicad) not available in this environment")
+        pytest.skip("native core (libchudware) not available in this environment")
     return cb.call("part_place", {
         "part_id": "catalog:mcmaster::https://mcmaster.com/p/84881A248",
         "record": record})

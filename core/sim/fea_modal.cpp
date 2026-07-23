@@ -18,10 +18,10 @@
 
 #include <Eigen/Dense>
 #include <Eigen/SparseCore>
-#ifdef AICAD_WITH_CHOLMOD
+#ifdef CHUDWARE_WITH_CHOLMOD
 #include <Eigen/CholmodSupport>  // Eigen::CholmodSupernodalLLT (SuiteSparse BLAS3 Cholesky)
 #endif
-#ifdef AICAD_HAVE_OPENMP
+#ifdef CHUDWARE_HAVE_OPENMP
 #include <omp.h>
 #endif
 
@@ -29,13 +29,13 @@
 #include <Spectra/MatOp/SymShiftInvert.h>
 #include <Spectra/SymGEigsShiftSolver.h>
 
-namespace aicad::sim {
+namespace chudware::sim {
 
 namespace {
 
 constexpr double kPi = 3.14159265358979323846;
 
-#ifdef AICAD_WITH_CHOLMOD
+#ifdef CHUDWARE_WITH_CHOLMOD
 // Spectra shift-invert op backed by CHOLMOD supernodal LLT (P2). Spectra's stock
 // SymShiftInvert factorizes (K - sigma*M) with Eigen's scalar single-threaded LDLT —
 // the dominant modal cost on real meshes. sigma < 0 here (see the shift note below),
@@ -428,7 +428,7 @@ FeaModalResult fea_modal_solve(const std::vector<double>& points, const std::vec
         // Prefer the CHOLMOD-backed shift-invert (multithreaded BLAS3 factorization of
         // K + |sigma|·M); fall back to Spectra's stock single-threaded LDLT op when
         // SuiteSparse is absent or its strict-SPD LLT rejects the system.
-#ifdef AICAD_WITH_CHOLMOD
+#ifdef CHUDWARE_WITH_CHOLMOD
         try {
             CholmodShiftInvert op(Kff, Mff);
             if (run_geigs(op, ks)) return true;
@@ -500,4 +500,4 @@ FeaModalResult fea_modal_solve(const std::vector<double>& points, const std::vec
     return res;
 }
 
-}  // namespace aicad::sim
+}  // namespace chudware::sim

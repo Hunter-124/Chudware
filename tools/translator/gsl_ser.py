@@ -22,7 +22,7 @@ The eval harness (`tools/translator/eval/`) scores captions against `enumerate_s
 the groundedness seam (`tools/translator/groundedness.py`, T-H4-owned impl) gates
 extrinsic (invented) numerals. This file is engine-free: it operates on state DICTS
 (the `_digest`-shaped payload the deterministic describers already produce), so it runs
-in CI with no libaicad.
+in CI with no libchudware.
 
 Versioning: the header line `#gsl-ser/v1 ...` is tagged in every serialization AND must
 be tagged in every prompt (per the spec). Bump to `/v2` only via an advisor-approved

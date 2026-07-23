@@ -11,7 +11,7 @@
 #include "piping/schema.h"
 #include "piping/simhandoff.h"
 
-namespace aicad::hydraulic {
+namespace chudware::hydraulic {
 namespace {
 
 using pyutil::fmt_f;
@@ -446,4 +446,4 @@ ojson verify_fea_envelope(const ojson& handoff, double tolerance_pct,
                             warnings.empty() ? ojson(nullptr) : warnings);
 }
 
-}  // namespace aicad::hydraulic
+}  // namespace chudware::hydraulic

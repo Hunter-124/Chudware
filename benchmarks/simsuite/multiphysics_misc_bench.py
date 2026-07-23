@@ -12,7 +12,7 @@ Cases (each vs a cited analytic reference where one exists):
   handoff_seams_smoke        hydraulic->FEA + hydraulic->piping->solve + motion->FEA
                              (dry_run) envelope validity (regression-only, ref None)
 
-Engine cases run IN-PROCESS (AI_CAD_ENGINE_DAEMON=0, services/dist libaicad via
+Engine cases run IN-PROCESS (CHUDWARE_ENGINE_DAEMON=0, services/dist libchudware via
 services.mcp.core_bridge); optional deps (fluids / build123d / engine lib)
 produce clean skips. All cases are light — quick and full modes differ only in the
 motion sweep sample count.
@@ -30,7 +30,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
-os.environ.setdefault("AI_CAD_ENGINE_DAEMON", "0")
+os.environ.setdefault("CHUDWARE_ENGINE_DAEMON", "0")
 
 DOMAIN = "multiphysics_misc"
 
@@ -158,7 +158,7 @@ def _bench_internal_volume() -> dict:
 
 def _bench_struct() -> dict:
     if not _engine_ok():
-        return _skip("struct_cantilever_udl", "libaicad not staged (engine unavailable)")
+        return _skip("struct_cantilever_udl", "libchudware not staged (engine unavailable)")
     from mcp_server import core_bridge as cb
     L, w = 2000.0, 10.0
     doc = {
@@ -243,7 +243,7 @@ def _swing_arm(tmp_dir: str):
 
 def _bench_motion(quick: bool) -> dict:
     if not _engine_ok():
-        return _skip("motion_swing_kinematics", "libaicad not staged (engine unavailable)")
+        return _skip("motion_swing_kinematics", "libchudware not staged (engine unavailable)")
     steps = 5 if quick else 13
     tmp = tempfile.mkdtemp(prefix="mp_bench_motion_")
     t0 = time.perf_counter()

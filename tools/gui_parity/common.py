@@ -5,21 +5,21 @@ tools/gui_parity/common.py — shared infra for the T-G9 host↔AI-CAD2 parity h
 How it works (see work/tasks/T-G9.md scope additions):
   1. Both GUI binaries link services/worker; WorkerClient::call() is the single funnel
      every panel RPC passes through regardless of routing (Python worker subprocess,
-     in-process libaicad, ECAD/agent C++ paths). With AI_CAD_RPC_TRACE=<file> set it
+     in-process libchudware, ECAD/agent C++ paths). With CHUDWARE_RPC_TRACE=<file> set it
      appends one JSONL record {method, params, ok, result|err} per RPC.
-  2. Each harness runs the SAME AI_CAD_SHOT scenario on BOTH binaries offscreen and
+  2. Each harness runs the SAME CHUDWARE_SHOT scenario on BOTH binaries offscreen and
      captures the two streams.
   3. Request-parity: the domain-relevant subsequence (method allowlist) of the two
      request streams must match after normalization. The new shell legitimately fires
      extra panel-init RPCs (gallery/parts/artifact list, etc.) — those are reported as
      informational, never as failures, and never hidden.
   4. Artifact-parity (gcode/DXF/PDF): the state-building requests from EACH binary's
-     captured stream are replayed through mcp_server.core_bridge (the same libaicad the
+     captured stream are replayed through mcp_server.core_bridge (the same libchudware the
      binaries load in-process), then the artifact RPCs (cam_post x8, export_drawing) are
      issued on top of each replayed state. host-derived vs aicad2-derived artifacts are
      byte-diffed. A panel that drove different engine calls => different artifacts.
 
-Stdlib only (core_bridge itself needs AI_CAD_LIBAICAD; see resolve_env()).
+Stdlib only (core_bridge itself needs CHUDWARE_LIBCHUDWARE; see resolve_env()).
 """
 from __future__ import annotations
 
@@ -35,10 +35,10 @@ import time
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SCRATCH = os.path.join(REPO, "scratch", "gui_parity")
 
-HOST_BIN = os.path.join(REPO, "host", "build-linux", "bin", "AI-CAD")
+HOST_BIN = os.path.join(REPO, "host", "build-linux", "bin", "Chudware")
 NEW_BIN = os.path.join(REPO, "ui", "imgui", "build", "bin", "AI-CAD2")
-# ShopCraft is a post-build symlink/copy of AI-CAD2 (T-G10). Both names work.
-SHOPCRAFT_BIN = os.path.join(REPO, "ui", "imgui", "build", "bin", "ShopCraft")
+# Chudware is a post-build symlink/copy of AI-CAD2 (T-G10). Both names work.
+CHUDWARE_BIN = os.path.join(REPO, "ui", "imgui", "build", "bin", "Chudware")
 
 BINARIES = {"host": HOST_BIN, "aicad2": NEW_BIN}
 
@@ -49,14 +49,14 @@ VOLATILE_KEYS = {"elapsed_ms", "elapsed_s", "wall_ms", "time_ms", "path", "png",
 
 
 
-def _default_libaicad() -> str:
+def _default_libchudware() -> str:
     """Prefer a core build in this checkout; fall back to known prebuilt locations
     (worktrees usually have no core build — T-G8 finisher pattern)."""
     cands = [
-        os.path.join(REPO, "core", "build-occt-linux", "bin", "libaicad.so"),
-        os.path.join(REPO, "core", "build-linux", "bin", "libaicad.so"),
-        "/home/hunter/Repositories/CAD/core/build-occt-linux/bin/libaicad.so",
-        "/home/hunter/Repositories/CAD/core/build-linux/bin/libaicad.so",
+        os.path.join(REPO, "core", "build-occt-linux", "bin", "libchudware.so"),
+        os.path.join(REPO, "core", "build-linux", "bin", "libchudware.so"),
+        "/home/hunter/Repositories/CAD/core/build-occt-linux/bin/libchudware.so",
+        "/home/hunter/Repositories/CAD/core/build-linux/bin/libchudware.so",
     ]
     for c in cands:
         if os.path.isfile(c):
@@ -65,11 +65,11 @@ def _default_libaicad() -> str:
 
 def resolve_env(extra: dict | None = None) -> dict:
     env = dict(os.environ)
-    env.setdefault("AI_CAD_PYTHON", shutil.which("python3") or sys.executable)
-    env.setdefault("AI_CAD_LIBAICAD",
-                   _default_libaicad())
-    env["AI_CAD_NO_FILE_DIALOGS"] = "1"
-    env["AI_CAD_REPO"] = REPO
+    env.setdefault("CHUDWARE_PYTHON", shutil.which("python3") or sys.executable)
+    env.setdefault("CHUDWARE_LIBCHUDWARE",
+                   _default_libchudware())
+    env["CHUDWARE_NO_FILE_DIALOGS"] = "1"
+    env["CHUDWARE_REPO"] = REPO
     if extra:
         env.update(extra)
     return env
@@ -77,7 +77,7 @@ def resolve_env(extra: dict | None = None) -> dict:
 
 def run_scenario(binary_key: str, scenario: str, timeout_s: int = 300,
                  run_dir: str | None = None) -> str:
-    """Run AI_CAD_SHOT=<scenario> on one binary offscreen with the RPC trace enabled.
+    """Run CHUDWARE_SHOT=<scenario> on one binary offscreen with the RPC trace enabled.
     Returns the trace path. Raises on missing binary or nonzero exit."""
     bin_path = BINARIES[binary_key]
     if not os.path.isfile(bin_path):
@@ -88,12 +88,12 @@ def run_scenario(binary_key: str, scenario: str, timeout_s: int = 300,
     shot = os.path.join(run_dir, f"{scenario}.png")
     if os.path.exists(trace):
         os.unlink(trace)
-    env = resolve_env({"AI_CAD_SHOT": scenario, "AI_CAD_RPC_TRACE": trace})
+    env = resolve_env({"CHUDWARE_SHOT": scenario, "CHUDWARE_RPC_TRACE": trace})
     # Both binaries accept --shot; host also honors --ui-screenshot but --shot is common.
     flag = "--ui-screenshot" if binary_key == "host" else "--shot"
-    # Use xvfb-run unless AI_CAD_SHOT_HEADED=1 (interactive walkthrough mode). This
+    # Use xvfb-run unless CHUDWARE_SHOT_HEADED=1 (interactive walkthrough mode). This
     # overrides DISPLAY so scripted runs never pop windows onto the user's desktop.
-    if os.environ.get("AI_CAD_SHOT_HEADED", "0") == "1":
+    if os.environ.get("CHUDWARE_SHOT_HEADED", "0") == "1":
         cmd = [bin_path, flag, shot]
     else:
         cmd = ["xvfb-run", "-a", bin_path, flag, shot]
@@ -109,7 +109,7 @@ def run_scenario(binary_key: str, scenario: str, timeout_s: int = 300,
                            f"after {time.time()-t0:.0f}s (log: {log})")
     if not os.path.exists(trace):
         raise RuntimeError(f"{binary_key}/{scenario}: no RPC trace written ({trace}) — "
-                           f"is the AI_CAD_RPC_TRACE build current?")
+                           f"is the CHUDWARE_RPC_TRACE build current?")
     return trace
 
 
@@ -181,8 +181,8 @@ def bridge():
     """Import mcp_server.core_bridge with the repo on sys.path."""
     if REPO not in sys.path:
         sys.path.insert(0, REPO)
-    os.environ.setdefault("AI_CAD_LIBAICAD",
-                          _default_libaicad())
+    os.environ.setdefault("CHUDWARE_LIBCHUDWARE",
+                          _default_libchudware())
     from mcp_server import core_bridge  # noqa: PLC0415
     return core_bridge
 

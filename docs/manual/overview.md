@@ -1,7 +1,7 @@
 # Overview
 
 ```text
-AI-CAD MODELING GUIDE (C++ parametric engine — same as the desktop app).
+Chudware MODELING GUIDE (C++ parametric engine — same as the desktop app).
 
 WORKFLOW
   1. new_part(name)                         start an editable part document.
@@ -18,7 +18,7 @@ WORKFLOW
                                             downstream feature breaks — WITHOUT touching the live
                                             doc. Returns aicad.preflight/1 with advisory_items.
                                             A fail verdict is advisory (never blocks); add_features
-                                            runs preflight automatically (AI_CAD_PREFLIGHT=1).
+                                            runs preflight automatically (CHUDWARE_PREFLIGHT=1).
   3. render_part()                          SEE it — an annotated, colour-coded image (faces
                                             tinted + labelled TOP/FRONT/RIGHT...). Self-review
                                             against the request; iterate add_features to fix.
@@ -39,7 +39,7 @@ WORKFLOW
   6. save_part()                            save the NATIVE .step+ — the editable feature tree
                                             PLUS its simulation studies + any drawings, in one
                                             file the desktop app reopens fully editable. This is
-                                            AI-CAD's native format; save to it to hand the user a
+                                            Chudware's native format; save to it to hand the user a
                                             part they can keep working on (not a flattened mesh).
   7. export_part(fmt) / make_drawing()      hand off a NON-native interchange/mesh file
                                             (STEP/IGES/BREP exact, STL/OBJ/3MF mesh) or a
@@ -67,7 +67,7 @@ Dimension params are objects: {"value": <num>, "expr": null}. A later op refers 
 created earlier IN THE SAME ARRAY as "$<index>" (0-based op position); refer to existing tree
 features by their id (e.g. "f1").
 
-NATIVE FORMAT — AI-CAD's native, editable file is .step+. It stores the WHOLE parametric feature
+NATIVE FORMAT — Chudware's native, editable file is .step+. It stores the WHOLE parametric feature
 tree plus its simulation studies (and any 2D drawings) in one container the app reopens fully
 editable. Save deliverables as .step+ so the user keeps an editable part; a plain STEP/STL is a
 flattened export (geometry only — no feature history, no studies).

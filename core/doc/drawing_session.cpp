@@ -25,12 +25,12 @@
 
 using nlohmann::json;
 
-namespace aicad::doc {
+namespace chudware::doc {
 
 namespace {
 
-#ifndef AICAD_PI
-#define AICAD_PI 3.14159265358979323846
+#ifndef CHUDWARE_PI
+#define CHUDWARE_PI 3.14159265358979323846
 #endif
 
 constexpr const char* kSchemaDrawing = "aicad.drawing/1";
@@ -722,7 +722,7 @@ double angle_between_lines(const json& a, const json& b, const json& c, const js
     auto u = line_dir(a, b);
     auto v = line_dir(c, d);
     double dot = std::max(-1.0, std::min(1.0, u[0] * v[0] + u[1] * v[1]));
-    return std::acos(dot) * 180.0 / AICAD_PI;
+    return std::acos(dot) * 180.0 / CHUDWARE_PI;
 }
 
 json line_intersection(const json& a, const json& b, const json& c, const json& d) {
@@ -2080,7 +2080,7 @@ bool drawing_close(const std::string& doc_id) {
 // exception (access violation) unwound past a DrawingLock without running its C++
 // destructor under /EHsc. Mirrors force_release_doc_lock in core/doc/session.cpp —
 // same pattern, same safety contract, same idempotency guarantee.
-// Called from the libaicad C dispatch boundary's __except filter alongside
+// Called from the libchudware C dispatch boundary's __except filter alongside
 // force_release_doc_lock so ANY hardware fault releases ALL orphaned registry locks.
 bool force_release_drawing_lock() {
     if (!g_mtx_held.load(std::memory_order_acquire)) return false;
@@ -2090,4 +2090,4 @@ bool force_release_drawing_lock() {
     return true;
 }
 
-}  // namespace aicad::doc
+}  // namespace chudware::doc

@@ -19,7 +19,7 @@ glfwTerminate done), the process does not exit — ~30 Chromium threads
 (ThreadPoolForeg, Chrome_InProcGp, ANGLE-GC, NetworkService, CacheThread_Blo,
 CrShutdownDetec) stay alive and static/AtExit destruction never finishes ("No valid
 task runner, exiting ungracefully."). Diagnosed via /proc task dump + teardown
-tracing (AI_CAD_DEBUG_SHUTDOWN=1). The --ui-screenshot smoke path now exits via
+tracing (CHUDWARE_DEBUG_SHUTDOWN=1). The --ui-screenshot smoke path now exits via
 `_Exit(rc)` after run_gui returns (main.cpp) so the gate is unblocked — the
 INTERACTIVE exit path (user closes the window) still hangs the same way.
 
@@ -34,6 +34,6 @@ infeasible, escalate with evidence before widening the _Exit scope.
 
 ## Definition of done
 
-- [x] Interactive close exits the process (no lingering Billet + Chromium threads).
+- [x] Interactive close exits the process (no lingering Chudware + Chromium threads).
 - [x] The _Exit escape on --ui-screenshot removed or justified in a comment.
 - [ ] gate.sh green; REFACTOR_LOG handoff.

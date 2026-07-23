@@ -192,7 +192,7 @@ def _err(e: Exception) -> str:
 
 
 def _tmp(suffix: str) -> str:
-    fd, path = tempfile.mkstemp(suffix=suffix, prefix="aicad_mcp_")
+    fd, path = tempfile.mkstemp(suffix=suffix, prefix="chudware_mcp_")
     os.close(fd)
     return path
 
@@ -235,7 +235,7 @@ def _sanitize_output_path(path: str) -> str:
 # its doc sessions. To make the AI's part visible in the app's viewport, we publish it as a
 # native .step+ doc plus a tiny live.json {rev, step} into <appdata>/<app>/handoff/; the GUI
 # polls that control file each frame (ui::pollAiCadHandoff) and opens/refreshes one tab from it.
-# <app> follows the T-G10 alias rule (Billet, or the legacy AI-CAD dir when it already
+# <app> follows the T-G10 alias rule (Chudware, or the legacy Chudware dir when it already
 # exists), matching platform::appdataRoot() so publisher and reader agree.
 _PUB: dict = {"rev": None, "docs": {}, "active": None}
 
@@ -249,8 +249,8 @@ def _handoff_dir() -> Path:
             # Match platform/paths_linux.cpp appdataDir() — the old tempdir fallback put
             # the handoff where the GUI never looked on Linux.
             base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
-    new_root = Path(base) / "Billet"
-    legacy_root = Path(base) / "AI-CAD"
+    new_root = Path(base) / "Chudware"
+    legacy_root = Path(base) / "Chudware"
     root = legacy_root if (not new_root.exists() and legacy_root.exists()) else new_root
     d = root / "handoff"
     d.mkdir(parents=True, exist_ok=True)
@@ -444,10 +444,10 @@ def _merge_handoff_fragments(d: Path) -> None:
 # Two guards, both per-doc:
 #   • revision-skip — the engine's monotonic doc revision hasn't moved since our last
 #     publish (e.g. an activation republish), so the .step+ on disk is already current.
-#   • burst-coalescing — publishes inside AI_CAD_PUBLISH_MIN_INTERVAL_S of the previous
+#   • burst-coalescing — publishes inside CHUDWARE_PUBLISH_MIN_INTERVAL_S of the previous
 #     one are deferred to ONE trailing publish (daemon Timer), so a rapid edit burst
 #     writes the mirror once at the end instead of per edit. 0 disables.
-_PUBLISH_MIN_INTERVAL_S: float = float(os.environ.get("AI_CAD_PUBLISH_MIN_INTERVAL_S", "0.25") or 0.25)
+_PUBLISH_MIN_INTERVAL_S: float = float(os.environ.get("CHUDWARE_PUBLISH_MIN_INTERVAL_S", "0.25") or 0.25)
 _PUB_THROTTLE: dict = {}  # doc_id -> {"revision": int|None, "t": float, "timer": Timer|None, "last": dict|None}
 
 
@@ -473,7 +473,7 @@ def _publish_current(doc_id: str, _deferred: bool = False) -> Optional[dict]:
     Daemon mode (the default since the Phase-8 flip): the GUI shares the daemon's
     docs live and IGNORES handoff files, so writing them would only burn a full
     doc serialization per op batch and leave a stale second source of truth —
-    skip entirely. The legacy path (explicit AI_CAD_ENGINE_DAEMON=0, or daemon
+    skip entirely. The legacy path (explicit CHUDWARE_ENGINE_DAEMON=0, or daemon
     transport fallback) keeps publishing; the whole publisher is deleted in N+1.
     """
     if cb.active_daemon_mode():
@@ -500,7 +500,7 @@ def _publish_current(doc_id: str, _deferred: bool = False) -> Optional[dict]:
                 timer = _t.Timer(delay, lambda: (_PUB_THROTTLE.get(doc_id, {}).update(timer=None),
                                                  _publish_current(doc_id, _deferred=True)))
                 timer.daemon = True
-                timer.name = f"aicad-publish-{doc_id}"
+                timer.name = f"chudware-publish-{doc_id}"
                 st["timer"] = timer
                 timer.start()
             return st["last"]
@@ -584,7 +584,7 @@ _HANDOFF_PID = os.getpid()
 # owning process is alive (PID probe) and its file is fresh. PID-liveness closes a restarted
 # server's stale tabs immediately (no duplicate-across-restart window); the mtime TTL is a backstop
 # for the rare PID-reuse case.
-_HANDOFF_FRAG_TTL_S = float(os.environ.get("AI_CAD_HANDOFF_TTL_S", "1800") or 1800)
+_HANDOFF_FRAG_TTL_S = float(os.environ.get("CHUDWARE_HANDOFF_TTL_S", "1800") or 1800)
 
 
 def _pid_alive(pid: int) -> bool:
@@ -617,23 +617,23 @@ def _cleanup_handoff_fragment() -> None:
     except Exception:  # noqa: BLE001
         pass
 # Autosaves older than this are pruned at startup so the directory can't grow forever.
-_AUTOSAVE_MAX_AGE_DAYS = float(os.environ.get("AI_CAD_AUTOSAVE_MAX_AGE_DAYS", "7") or 7)
+_AUTOSAVE_MAX_AGE_DAYS = float(os.environ.get("CHUDWARE_AUTOSAVE_MAX_AGE_DAYS", "7") or 7)
 
 
 def _autosave_dir() -> Path:
     """Return (and create) the autosave directory.
 
     Resolution order:
-      1. AI_CAD_AUTOSAVE_DIR env var (tests use this for hermeticity).
+      1. CHUDWARE_AUTOSAVE_DIR env var (tests use this for hermeticity).
       2. services.paths.appdata_root() / "mcp_autosave"  — XDG-aware on Linux,
-         %APPDATA%\\AI-CAD on Windows.  Matches the C++ convention in paths.cpp.
-      3. tempfile.gettempdir() / "AI-CAD" / "mcp_autosave" (last-resort fallback).
+         %APPDATA%\\Chudware on Windows.  Matches the C++ convention in paths.cpp.
+      3. tempfile.gettempdir() / "Chudware" / "mcp_autosave" (last-resort fallback).
 
     NOTE: The prior implementation fell back to os.environ.get("APPDATA") which
     silently resolved to /tmp on Linux (APPDATA unset), scattering autosave files
-    outside the AI-CAD data tree.  Fixed to use appdata_root() (XDG-aware).
+    outside the Chudware data tree.  Fixed to use appdata_root() (XDG-aware).
     """
-    override = os.environ.get("AI_CAD_AUTOSAVE_DIR")
+    override = os.environ.get("CHUDWARE_AUTOSAVE_DIR")
     if override:
         d = Path(override)
     else:
@@ -641,7 +641,7 @@ def _autosave_dir() -> Path:
             from services import paths as _paths  # noqa: PLC0415
             d = _paths.ROOT / "mcp_autosave"  # alias-aware root, not the always-new dir
         except Exception:  # noqa: BLE001
-            d = Path(tempfile.gettempdir()) / "AI-CAD" / "mcp_autosave"
+            d = Path(tempfile.gettempdir()) / "Chudware" / "mcp_autosave"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -689,7 +689,7 @@ def _autosave_all_open() -> None:
     Called on the periodic timer and before a heavy solve so a transport timeout that
     kills the server can never lose an unrelated open part (Bug R-1)."""
     if cb._daemon_mode():
-        # Daemon mode: aicad-hostd is THE single autosave authority (start_periodic_autosave
+        # Daemon mode: chudware-hostd is THE single autosave authority (start_periodic_autosave
         # is gated off here too). A per-doc doc_save to the MCP autosave dir would repoint the
         # daemon doc's `path` OUTSIDE the daemon's recovery tier AND clear its dirty flag —
         # which DEFEATS the daemon's retire-if-unsaved GC gate (server.cpp gcCloseDoc:
@@ -721,16 +721,16 @@ def _autosave_all_open() -> None:
 # ---------------------------------------------------------------------------
 # Periodic autosave timer
 # ---------------------------------------------------------------------------
-# Cadence: AI_CAD_AUTOSAVE_INTERVAL_S (seconds, float, default 60).  Set to 0
+# Cadence: CHUDWARE_AUTOSAVE_INTERVAL_S (seconds, float, default 60).  Set to 0
 # to disable.  The timer is a daemon thread so it never prevents process exit.
 # Overhead is measured per sweep; a warning is logged when p95 > 50 ms.
 
-_AUTOSAVE_INTERVAL_S: float = float(os.environ.get("AI_CAD_AUTOSAVE_INTERVAL_S", "60") or 60)
+_AUTOSAVE_INTERVAL_S: float = float(os.environ.get("CHUDWARE_AUTOSAVE_INTERVAL_S", "60") or 60)
 _PERIODIC_TIMER: list = [None]  # [Timer | None]  — list so it's mutable from inner scope
 # Generation token for the timer chain. start/stop each bump it; a tick only
 # reschedules while its captured generation is still current, so an in-flight tick
 # that fires across a stop/start cycle dies instead of re-arming an orphan chain
-# (the historical 12x "aicad-autosave" thread leak).
+# (the historical 12x "chudware-autosave" thread leak).
 _AUTOSAVE_GEN: list = [0]
 _AUTOSAVE_LATENCIES: list = []  # float seconds — rolling window of sweep durations
 _LATENCY_WINDOW = 100
@@ -767,7 +767,7 @@ def _tick_autosave(gen: int) -> None:
     if interval > 0 and gen == _AUTOSAVE_GEN[0]:
         timer = _t.Timer(interval, _tick_autosave, args=(gen,))
         timer.daemon = True
-        timer.name = "aicad-autosave"
+        timer.name = "chudware-autosave"
         _PERIODIC_TIMER[0] = timer
         timer.start()
 
@@ -775,14 +775,14 @@ def _tick_autosave(gen: int) -> None:
 def start_periodic_autosave(interval_s: float | None = None) -> None:
     """Arm the periodic autosave timer.  Call once from server startup.
 
-    interval_s: cadence override (seconds); None → read AI_CAD_AUTOSAVE_INTERVAL_S
+    interval_s: cadence override (seconds); None → read CHUDWARE_AUTOSAVE_INTERVAL_S
     (default 60 s).  Passing 0 disables the timer.  Idempotent: if already running
     the old timer is cancelled and a new one started with the new interval.
     """
     import threading as _t
 
     if cb._daemon_mode():
-        # Daemon mode (the default): aicad-hostd runs THE one autosave scheduler (core/hostd/
+        # Daemon mode (the default): chudware-hostd runs THE one autosave scheduler (core/hostd/
         # autosave.cpp). Arming a per-process Timer chain here would recreate the
         # exact thread-leak class the shared daemon exists to kill.
         return
@@ -797,7 +797,7 @@ def start_periodic_autosave(interval_s: float | None = None) -> None:
     _seed_autosave_revisions()
     timer = _t.Timer(_AUTOSAVE_INTERVAL_S, _tick_autosave, args=(gen,))
     timer.daemon = True
-    timer.name = "aicad-autosave"
+    timer.name = "chudware-autosave"
     _PERIODIC_TIMER[0] = timer
     timer.start()
 
@@ -873,7 +873,7 @@ def _autosave_session_of(step_path: Path) -> tuple[Optional[str], float, str, st
 
 
 def _recover_via_daemon() -> list:
-    """Daemon-mode recovery: aicad-hostd already recovered the prior session's
+    """Daemon-mode recovery: chudware-hostd already recovered the prior session's
     autosaves itself (core/hostd/autosave.cpp) — we just consume the daemon's
     {old_id: new_id} rebind map into _DOC_ALIASES instead of re-opening files.
     Waits briefly for the daemon's recovery pass (it runs right after the engine
@@ -1028,7 +1028,7 @@ _JOB_LOCK = _threading.Lock()
 # long OpenFOAM run (which may take minutes) never returns "unknown job_id".  We keep:
 #   - ALL running jobs (never evict while in-flight)
 #   - completed/errored jobs for at least this many seconds after completion
-_JOB_DONE_TTL_S: float = float(os.environ.get("AI_CAD_JOB_TTL_S", "600") or 600)  # 10 min
+_JOB_DONE_TTL_S: float = float(os.environ.get("CHUDWARE_JOB_TTL_S", "600") or 600)  # 10 min
 
 
 def _evict_old_jobs() -> None:
@@ -1065,14 +1065,14 @@ def _start_job(kind: str, fn, progress: Optional[dict] = None) -> str:
                 _JOBS[jid].update(status="error", error=str(e), done_at=time.time())
 
     # Daemon thread: a long OpenFOAM/FEA solve must never block server (or test) shutdown.
-    _threading.Thread(target=_run, name=f"aicad-job-{kind}", daemon=True).start()
+    _threading.Thread(target=_run, name=f"chudware-job-{kind}", daemon=True).start()
     return jid
 
 
 # How long a "synchronous" heavy solve may block the MCP call before we hand it off to
 # the background so the call returns BEFORE the transport timeout can kill the server
 # (Bug R-1). Stay safely under a typical 60s transport timeout.
-_SYNC_SOLVE_BUDGET_S = float(os.environ.get("AI_CAD_MCP_SYNC_BUDGET_S", "45") or 45)
+_SYNC_SOLVE_BUDGET_S = float(os.environ.get("CHUDWARE_MCP_SYNC_BUDGET_S", "45") or 45)
 
 
 def _solve_sync_or_handoff(kind: str, fn, progress: Optional[dict] = None,
@@ -1110,7 +1110,7 @@ def _solve_sync_or_handoff(kind: str, fn, progress: Optional[dict] = None,
 # A small material library so FEA tools take a friendly name. Fields are exactly what the
 # host's study expects (host/src/ui/sim_manager.cpp): E in MPa, density g/cm^3, strengths MPa.
 # T-F2: these are sourced from the unified materials registry — the single provenance-stamped
-# first-party table — now served by the C++ core (core/materials, via the libaicad
+# first-party table — now served by the C++ core (core/materials, via the libchudware
 # material_fea_table / material_fea_aliases methods) instead of the retired Python
 # engine.materials module. `fea_table()` reproduces exactly the legacy 7-entry library +
 # `fea_aliases()` the alias map (values unchanged). Filled LAZILY on first material
@@ -1123,14 +1123,14 @@ _MATERIAL_ALIASES: dict = {}
 def _wire_materials_registry() -> None:
     """Point the C++ core at the bundled materials registry JSON when nothing else has.
 
-    The core resolves the registry via $AICAD_MATERIALS_REGISTRY (or a provisioned
+    The core resolves the registry via $CHUDWARE_MATERIALS_REGISTRY (or a provisioned
     data-root copy) and caches it once per process — so this must run at IMPORT time,
     before the first engine RPC can spawn/attach an engine without it. ``setdefault``
     never overrides an explicit user/installer path."""
     try:
         p = Path(__file__).resolve().parents[2] / "core" / "data" / "materials" / "registry.json"
         if p.is_file():
-            os.environ.setdefault("AICAD_MATERIALS_REGISTRY", str(p))
+            os.environ.setdefault("CHUDWARE_MATERIALS_REGISTRY", str(p))
     except Exception:  # noqa: BLE001
         pass
 

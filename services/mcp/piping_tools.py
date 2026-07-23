@@ -5,7 +5,7 @@ Same design contract as ``ecad_tools`` (project owner: "the AI is extremely limi
 must do the bookkeeping and return rich, actionable context"). Each tool returns a JSON string
 ``{ok, ...result, warnings:[], hint:"...", next_actions:[...]}`` produced by the C++ core
 (T-RF19/T-RF20: the 1-D solve / report / operating-point / fluid / CFD-BC / verify envelopes
-are owned by ``core/piping`` behind the libaicad ``piping_*`` RPCs — reached via
+are owned by ``core/piping`` behind the libchudware ``piping_*`` RPCs — reached via
 :mod:`services.mcp.core_bridge`); the MCP layer keeps input parsing, its tiny session state
 (so ``piping_report`` can reuse the document / result of the last ``piping_solve``), and the
 kernel orchestration legs (``piping_internal_volume`` bore extraction + the
@@ -121,7 +121,7 @@ def network_from_handoff(env: Any) -> "tuple[Optional[dict], Optional[list], Opt
 
 def _schema_errors_via_core(d: dict) -> list:
     """Validate an ``aicad.piping/1`` doc through the core (the schema validator lives in
-    libaicad now — ``services.piping.schema`` is deleted in this round). A boundary-less
+    libchudware now — ``services.piping.schema`` is deleted in this round). A boundary-less
     ``piping_solve`` returns the validator's error list under ``errors`` for a bad doc,
     and the boundary-conditions error (no ``errors`` key) for a good one."""
     r = cb.call("piping_solve", {"doc": d})

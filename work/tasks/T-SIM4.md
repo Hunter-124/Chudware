@@ -33,7 +33,7 @@ T-V1 audit left validation debt on solvers that are REAL but never live-checked:
       must run in the local gate).
       (services/mcp/test_fea_live_bridge.py, 5 tests: raw-bridge sim_run_static/modal on
       the netgen build; live 3.1876 mm vs 3.2000 Roark (0.39%), 40.86 Hz vs 40.77 Rao
-      (0.22%); probes $AI_CAD_LIBAICAD then build-occt-linux in this checkout then the
+      (0.22%); probes $CHUDWARE_LIBCHUDWARE then build-occt-linux in this checkout then the
       main checkout behind the worktree, fresh subprocess per candidate.)
 - [x] scripts/sim_audit.py re-run: skip count reduced, updated verdict table appended to
       work/audits/SIM_AUDIT.md with date. (8->16 executed, 23->15 skipped, 0 BROKEN;
@@ -45,7 +45,7 @@ T-V1 audit left validation debt on solvers that are REAL but never live-checked:
 
 ## Driver notes
 
-- Python test venv: `~/.local/share/AI-CAD/mcp-venv/bin/python`.
+- Python test venv: `~/.local/share/Chudware/mcp-venv/bin/python`.
 - graphify rule: `graphify query "<question>"` before raw-file reading.
 - Branch task/T-SIM4-solver-validation, worktree ../CAD-T-SIM4. Stop at status: review.
 - OpenFOAM integration is NOT this task (see T-SIM5, deferred).

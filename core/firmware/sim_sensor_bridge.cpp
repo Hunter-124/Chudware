@@ -10,7 +10,7 @@
 #include "firmware/pyfmt.h"
 #include "firmware/scenario.h"
 
-namespace aicad::firmware {
+namespace chudware::firmware {
 namespace {
 
 // Default 7-bit addresses matching common breakout / flight-computer wiring.
@@ -288,4 +288,4 @@ nlohmann::json build_sensor_scenario(const nlohmann::json& sim_result_or_profile
     return scenario;
 }
 
-}  // namespace aicad::firmware
+}  // namespace chudware::firmware

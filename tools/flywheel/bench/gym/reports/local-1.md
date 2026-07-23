@@ -43,7 +43,7 @@
 
 ## Recommended dial adjustments (config/data only)
 
-- **incoherent_geometry** ×3 → knob `AI_CAD_COUNCIL_FEATURE_THRESHOLD`: lower the build-strategy-council feature threshold so more parts get the four-seat review before build (more machinery for weaker models)
+- **incoherent_geometry** ×3 → knob `CHUDWARE_COUNCIL_FEATURE_THRESHOLD`: lower the build-strategy-council feature threshold so more parts get the four-seat review before build (more machinery for weaker models)
 - **grind** ×1 → knob `gym grind_threshold / anti-grind replan gate`: the anti-grind rule (2 attempts then replan) is the lever; ensure the replan gate is enabled so a 3rd identical attempt cannot happen
 
 ## Lead-owned findings (prompt/workflow — NOT applied here)

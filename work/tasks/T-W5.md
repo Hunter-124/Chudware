@@ -52,7 +52,7 @@ the hot path.
    T-W10; read the layout from docs §3), lowest-severity-first drops, always append
    drop-count, [ADVISORY]…[/ADVISORY] delimiters, §9 precedence (user-override
    downgrade).
-5. Wire both hosts behind `AI_CAD_ADVISOR=1` (default on): loop.py — after each
+5. Wire both hosts behind `CHUDWARE_ADVISOR=1` (default on): loop.py — after each
    build/tool result, engine runs and the block is prepended to the next user-role
    message; DAG runner — per node step. Advisories also logged to the ledger.
 6. `advise`/`stage_set`/`advisory_dispute` MCP tools (dispute logs to ledger; kernel-
@@ -70,7 +70,7 @@ the hot path.
       open-profile/rebuild classes (engine.py; interference→fit_calc on the doc path,
       heuristic on the loop path where no diameters exist — §3-compliant)
 - [x] Budgeted rendering with §9 precedence + no silent truncation (render.py)
-- [x] Injection live in loop.py AND dag node runner behind default-on AI_CAD_ADVISOR
+- [x] Injection live in loop.py AND dag node runner behind default-on CHUDWARE_ADVISOR
 - [x] advise/stage_set/advisory_dispute registered; tests pass (19 new, 223 agent
       suite pass; 2 pre-existing unrelated failures documented below)
 
@@ -117,4 +117,4 @@ integration target for this task. Changes vs the original spec:
   required (that serves our own agents).
 
 ## Progress log
-- 2026-07-05 02:43 UTC [opus-hale] Advisory engine (foreman) landed on task/T-W5-advisory-engine. New pkg services/agent/advisor/{stages,engine,render,adapters}.py: deterministic stage vocab + tool-stage inference, pure engine over normalized observations -> aicad.advisory/1 with kernel/table candidate fixes, budgeted §9 render w/ never-silent drops. Seams live behind AI_CAD_ADVISOR (default on) in loop.py (res.fit/res.error, ledger-logged) AND dag node_runner (doc battery -> output_state.advisory). MCP: advise/stage_set/advisory_dispute. Tests: 19 pass (stage inference, two-body interference->fit_calc fix, budget drops, blocker gates exit not action, §3 non-info-requires-fix invariant, loop+dag injection goldens, dispute waiver). Full suite: 223 passed, 1 skipped, 2 FAILED — both confirmed pre-existing on clean master via stash+compare (test_providers_conformance neutral helpers; test_h7_shadow offline order-pollution). Deferred: DAG-path advisories injected but not ledger-logged (no run_id handle; T-W19 glue). graphify updated.
+- 2026-07-05 02:43 UTC [opus-hale] Advisory engine (foreman) landed on task/T-W5-advisory-engine. New pkg services/agent/advisor/{stages,engine,render,adapters}.py: deterministic stage vocab + tool-stage inference, pure engine over normalized observations -> aicad.advisory/1 with kernel/table candidate fixes, budgeted §9 render w/ never-silent drops. Seams live behind CHUDWARE_ADVISOR (default on) in loop.py (res.fit/res.error, ledger-logged) AND dag node_runner (doc battery -> output_state.advisory). MCP: advise/stage_set/advisory_dispute. Tests: 19 pass (stage inference, two-body interference->fit_calc fix, budget drops, blocker gates exit not action, §3 non-info-requires-fix invariant, loop+dag injection goldens, dispute waiver). Full suite: 223 passed, 1 skipped, 2 FAILED — both confirmed pre-existing on clean master via stash+compare (test_providers_conformance neutral helpers; test_h7_shadow offline order-pollution). Deferred: DAG-path advisories injected but not ledger-logged (no run_id handle; T-W19 glue). graphify updated.

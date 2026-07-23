@@ -5,7 +5,7 @@
 
 #include <structural/sections.h>
 
-namespace aicad::structural {
+namespace chudware::structural {
 
 static const LumberShape kLumberShapes[] = {
     {"2x4", 38, 89, 3382, 2236000, 50250, 406400, 21400},
@@ -27,4 +27,4 @@ static const LumberShape kLumberShapes[] = {
     {"6x12", 140, 286, 40040, 271400000, 1898000, 65230000, 931900},
 };
 
-}  // namespace aicad::structural
+}  // namespace chudware::structural

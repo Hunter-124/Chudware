@@ -13,7 +13,7 @@ _GUIDE_PROMPTS = ["overview", "review", "simulation", "motion"]
 
 
 def _prompts_dir() -> Path:
-    d = os.environ.get("AI_CAD_PROMPTS_DIR")
+    d = os.environ.get("CHUDWARE_PROMPTS_DIR")
     if d and Path(d).is_dir():
         return Path(d)
     # Fall backs: the staged dist prompts, then the repo source prompts.
@@ -212,7 +212,7 @@ CROSS-SIM HANDOFF (aicad.simhandoff/1 — contracts/sim_handoff.md):
   delta_vs_target_c, mass_g, cost_usd}; winner = lightest candidate meeting the
   target, its study kept, result carries a verify envelope (coupling
   ecad_heatsink_to_thermal_fea). IMPOSSIBLE targets are honest: target_met=false with
-  the best achievable candidate named; without a sim-enabled libaicad it degrades to
+  the best achievable candidate named; without a sim-enabled libchudware it degrades to
   a flagged network estimate (Tj = Ta + P*(theta_jc + R_tim + R_sa)).
   Helper builders/validator: services/mcp/simhandoff.py.
 
@@ -236,7 +236,7 @@ GOLDEN DEMO (T-FIN25 — living E2E worked example):
   board: verification ladder (ERC/DRC/hostcheck/sicheck/FPGA/PDN) → firmware project +
   co-verify (fw_sim_run with fixture:i2c_temp_tmp103 when Renode is present) →
   ecad_thermal_handoff → heatsink_select(U1, tj_target_c=85) → power_budget →
-  make_report. Wired into scripts/gate.sh as stage 4.7 (AICAD_SKIP_FIN25=1 to opt out).
+  make_report. Wired into scripts/gate.sh as stage 4.7 (CHUDWARE_SKIP_FIN25=1 to opt out).
   Narrative + artifacts: docs/FIN25_SENSOR_NODE_GOLDEN_DEMO.md. Prefer this script over
   inventing a new end-to-end recipe when demonstrating the content is finished.
 
@@ -351,7 +351,7 @@ GOTCHAS
 """
 
 _OVERVIEW_HEADER = """\
-AI-CAD MODELING GUIDE (C++ parametric engine — same as the desktop app).
+Chudware MODELING GUIDE (C++ parametric engine — same as the desktop app).
 
 WORKFLOW
   1. new_part(name)                         start an editable part document.
@@ -368,7 +368,7 @@ WORKFLOW
                                             downstream feature breaks — WITHOUT touching the live
                                             doc. Returns aicad.preflight/1 with advisory_items.
                                             A fail verdict is advisory (never blocks); add_features
-                                            runs preflight automatically (AI_CAD_PREFLIGHT=1).
+                                            runs preflight automatically (CHUDWARE_PREFLIGHT=1).
   3. render_part()                          SEE it — an annotated, colour-coded image (faces
                                             tinted + labelled TOP/FRONT/RIGHT...). Self-review
                                             against the request; iterate add_features to fix.
@@ -389,7 +389,7 @@ WORKFLOW
   6. save_part()                            save the NATIVE .step+ — the editable feature tree
                                             PLUS its simulation studies + any drawings, in one
                                             file the desktop app reopens fully editable. This is
-                                            AI-CAD's native format; save to it to hand the user a
+                                            Chudware's native format; save to it to hand the user a
                                             part they can keep working on (not a flattened mesh).
   7. export_part(fmt) / make_drawing()      hand off a NON-native interchange/mesh file
                                             (STEP/IGES/BREP exact, STL/OBJ/3MF mesh) or a
@@ -1027,7 +1027,7 @@ def cad_guide_text(topic: str = "overview") -> str:
             "                                       gpio:PA5=1@>10ms (timeline). Emits a JSON\n"
             "                                       trace artifact (trace_path) of pin+UART\n"
             "                                       events; QEMU pin events need the project's\n"
-            "                                       aicad_trace.h AICAD_GPIO_TRACE macro.\n"
+            "                                       chudware_trace.h CHUDWARE_GPIO_TRACE macro.\n"
             "  fw_verify_board(board_doc_ref, ...)  Firmware<->board co-verification (T-FIN6)\n"
             "                                       BEFORE fab: static checks (every PIN_<NET>\n"
             "                                       exists on the MCU/net, strap/reset pins\n"
@@ -1042,7 +1042,7 @@ def cad_guide_text(topic: str = "overview") -> str:
             "  fw_power_profile(trace_path, ...)    Power/duty-cycle profile (T-FIN7,\n"
             "                                       aicad.powerprofile/1, contract §11) from\n"
             "                                       an existing trace: CPU run/sleep residency\n"
-            "                                       (AICAD_CPU_TRACE markers, else assumed\n"
+            "                                       (CHUDWARE_CPU_TRACE markers, else assumed\n"
             "                                       active), per-pin GPIO duty, and per-rail\n"
             "                                       i_avg/i_peak from the board's T-FIN8\n"
             "                                       eng.supply.rails currents weighted by duty.\n"
@@ -1267,7 +1267,7 @@ def cad_guide_text(topic: str = "overview") -> str:
             "    Best-practice structure review before a large build.\n\n"
             "AI ENABLEMENT (bridge precedence):\n"
             "  1. manifest ai_mode='managed'  → agent milestones auto-checkpoint\n"
-            "  2. AICAD_PLM_BRIDGE=1          → real vault client (still needs managed\n"
+            "  2. CHUDWARE_PLM_BRIDGE=1          → real vault client (still needs managed\n"
             "                                   for AI-authored cuts)\n"
             "  3. default off                 → MockVault / no project History writes\n"
             "AI-VC (plm_timeline) is always-on for agent docs and is separate from\n"
@@ -1419,11 +1419,11 @@ def cad_guide_text(topic: str = "overview") -> str:
             "  MCP tools: confirm_dimensions(session_id), describe_results(session_id)\n\n"
             "DELIVER: Export bundle / Add to Parts Hub / Print scale mat.\n\n"
             "SHOT MODES for headless verification:\n"
-            "  AI_CAD_SHOT=reveng          full workspace shell\n"
-            "  AI_CAD_SHOT=reveng_capture  Source/capture stage (RE-19 panels)\n"
-            "  AI_CAD_SHOT=reveng_recon    Reconstruct stage + splat indicator (RE-27)\n"
-            "  AI_CAD_SHOT=reveng_review   Review stage with canned dim payload (RE-22)\n"
-            "  AI_CAD_SHOT=reveng_splat    standalone SplatRenderer draw into own FBO (RE-28)\n\n"
+            "  CHUDWARE_SHOT=reveng          full workspace shell\n"
+            "  CHUDWARE_SHOT=reveng_capture  Source/capture stage (RE-19 panels)\n"
+            "  CHUDWARE_SHOT=reveng_recon    Reconstruct stage + splat indicator (RE-27)\n"
+            "  CHUDWARE_SHOT=reveng_review   Review stage with canned dim payload (RE-22)\n"
+            "  CHUDWARE_SHOT=reveng_splat    standalone SplatRenderer draw into own FBO (RE-28)\n\n"
             "See also: cad_guide('reverse') for the engine import path, "
             "cad_guide('parts') for the Parts Hub integration.\n"
         )

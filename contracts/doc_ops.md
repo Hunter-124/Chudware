@@ -370,5 +370,5 @@ Engine method `{doc_id}` → `{ok:true, doc_id}`: empties undo_stack + redo_stac
 
 `doc_undo` / `doc_redo` from mcp/agent clients return
 `{"code":"undo_denied","message":"agents use doc_checkpoint/doc_revert or PLM rollback"}`
-unless `AICAD_UNDO_AGENTS=1`. Added to the error envelope vocabulary of §5.
+unless `CHUDWARE_UNDO_AGENTS=1`. Added to the error envelope vocabulary of §5.
 

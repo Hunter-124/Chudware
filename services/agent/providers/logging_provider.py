@@ -78,7 +78,7 @@ class LoggingProvider(Provider):
         The EventFn sink (same signature as loop.py's on_event callback).
     sidecar_dir:
         Directory to write request/response sidecar JSONL files.  Created on first
-        write.  If None, defaults to XDG_DATA_HOME/AI-CAD/telemetry/sidecars.
+        write.  If None, defaults to XDG_DATA_HOME/Chudware/telemetry/sidecars.
     insertion_point:
         The insertion-point tag for this call site (e.g. "IP-12").  Default "IP-1".
     suppress_emit:
@@ -221,7 +221,7 @@ class LoggingProvider(Provider):
 # ---------------------------------------------------------------------------
 
 def _default_sidecar_dir() -> Path:
-    # services.paths exports ROOT (the %APPDATA%/AI-CAD | XDG data root), not DATA —
+    # services.paths exports ROOT (the %APPDATA%/Chudware | XDG data root), not DATA —
     # the old attribute reference made the default sidecar dir a runtime AttributeError
     # on every platform (T-B5 finding; callers had to pass sidecar_dir explicitly).
     import services.paths as _paths  # type: ignore[import]

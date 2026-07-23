@@ -18,7 +18,7 @@
 #include "ecad/drc.h"     // same_net
 #include "ecad/schema.h"  // pad_world, is_board
 
-namespace aicad::ecad {
+namespace chudware::ecad {
 
 using nlohmann::json;
 
@@ -942,4 +942,4 @@ json run_dfm(const json& board, const json& rules) {
     return out;
 }
 
-}  // namespace aicad::ecad
+}  // namespace chudware::ecad

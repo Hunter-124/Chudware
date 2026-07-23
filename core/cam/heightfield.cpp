@@ -7,7 +7,7 @@
 
 #include "cam/heightfield.h"
 
-namespace aicad {
+namespace chudware {
 namespace cam {
 
 namespace {
@@ -304,4 +304,4 @@ std::vector<std::vector<Path2>> waterline_sections(const TriMesh& mesh,
 }
 
 }  // namespace cam
-}  // namespace aicad
+}  // namespace chudware

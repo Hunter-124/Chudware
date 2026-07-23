@@ -10,10 +10,10 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad::ecad {
+namespace chudware::ecad {
 
 // Structured op error -> the host's {code, message, detail} envelope. Mirrors
-// engine.ecad.ops.OpError (same shape as aicad::doc::OpError).
+// engine.ecad.ops.OpError (same shape as chudware::doc::OpError).
 struct OpError : std::runtime_error {
     std::string code;
     nlohmann::json detail;
@@ -28,4 +28,4 @@ struct OpError : std::runtime_error {
 // {"id_map":{...}, "warnings":[...], "doc": <mutated working copy>}.
 nlohmann::json apply_ops(const nlohmann::json& doc, const nlohmann::json& ops);
 
-}  // namespace aicad::ecad
+}  // namespace chudware::ecad

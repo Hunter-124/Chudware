@@ -394,9 +394,9 @@ public:
     // the ImGui image stretch), and Kawase backdrop-blur passes. FULL is the historical
     // behavior. Policy: WASM starts ADAPTIVE at MED and climbs/drops by frame-time EMA;
     // native desktop defaults to pinned FULL (zero behavior change). Env overrides (read
-    // once in init): AI_CAD_QUALITY_ADAPTIVE=0|1 forces the policy, AI_CAD_QUALITY_STEP=
-    // full|high|med|low pins a step, AI_CAD_QUALITY_FORCE_MS=<f> feeds a synthetic frame
-    // time (deterministic ladder test), AI_CAD_QUALITY_LOG=1 logs transitions to stderr.
+    // once in init): CHUDWARE_QUALITY_ADAPTIVE=0|1 forces the policy, CHUDWARE_QUALITY_STEP=
+    // full|high|med|low pins a step, CHUDWARE_QUALITY_FORCE_MS=<f> feeds a synthetic frame
+    // time (deterministic ladder test), CHUDWARE_QUALITY_LOG=1 logs transitions to stderr.
     enum class QualityStep { Full = 0, High, Med, Low };
     // Feed the ladder once per viewport frame with the frame cadence in ms
     // (ImGui io.DeltaTime carries the vsync-cliff signal). No-op unless adaptive.
@@ -456,7 +456,7 @@ private:
     // WebGL2/GLES: SS=1 + multisampled color/depth renderbuffers (see allocTargets);
     // 3x SS blows common WebGL MAX_TEXTURE_SIZE budgets and costs 9x fill. MSAA is the
     // WebGL-legal AA path; samples clamped to min(4, GL_MAX_SAMPLES) at alloc time.
-#ifdef BILLET_GLES3
+#ifdef CHUDWARE_GLES3
     static constexpr int SS = 1;
 #else
     static constexpr int SS = 3;  // supersample factor for anti-aliasing (3x for crisp thin edges)
@@ -464,9 +464,9 @@ private:
     static constexpr int kBlurPasses = 4;  // 4-tap Kawase passes (GLASS_DESIGN_SPEC)
     int w_ = 0, h_ = 0;           // final (display) size
     int rw_ = 0, rh_ = 0;         // presentation size (w_*renderScale_); targets are this big
-    int sw_ = 0, sh_ = 0;         // supersampled size (sw_==rw_ under BILLET_GLES3)
+    int sw_ = 0, sh_ = 0;         // supersampled size (sw_==rw_ under CHUDWARE_GLES3)
     unsigned int fbo_ = 0, colorTex_ = 0, depthRbo_ = 0;
-#ifdef BILLET_GLES3
+#ifdef CHUDWARE_GLES3
     unsigned int colorRbo_ = 0;   // multisampled color (0 when falling back to single-sample tex)
     int msaaSamples_ = 0;        // active sample count; 0 = single-sample colorTex_ path
 #endif
@@ -510,9 +510,9 @@ private:
     void setQualityStep(QualityStep s);  // realloc targets when MSAA/scale changed
     QualityStep qualityStep_ = QualityStep::Full;
     bool adaptiveQuality_ = false;    // ladder drives the step (default per platform)
-    bool qualityPinned_ = false;      // AI_CAD_QUALITY_STEP pinned a fixed step
-    bool qualityLog_ = false;         // AI_CAD_QUALITY_LOG=1
-    float qualityForceMs_ = -1.0f;    // AI_CAD_QUALITY_FORCE_MS synthetic frame time
+    bool qualityPinned_ = false;      // CHUDWARE_QUALITY_STEP pinned a fixed step
+    bool qualityLog_ = false;         // CHUDWARE_QUALITY_LOG=1
+    float qualityForceMs_ = -1.0f;    // CHUDWARE_QUALITY_FORCE_MS synthetic frame time
     int qualityLogFrames_ = 0;        // periodic status-print cadence
     float renderScale_ = 1.0f;        // render/presentation scale for the active step
     int blurPasses_ = kBlurPasses;    // active Kawase passes (quality-indexed)

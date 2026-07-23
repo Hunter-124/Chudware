@@ -1,4 +1,4 @@
-// AI-CAD Settings modal (Appearance / General / AI / Providers / Benchmarks /
+// Chudware Settings modal (Appearance / General / AI / Providers / Benchmarks /
 // Prompts / Agent / Experimental tabs) and the About modal.
 #include <algorithm>
 #include <cctype>
@@ -979,7 +979,7 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
 
 // ---- OMP provider manager (Settings → Providers) — S-UI-PROV ----------------------
 // Two-pane provider sign-in/manager per docs/omp-integration/research/design-provider-signin-ui.md
-// §3.1, driven by the frozen libaicad C-ABI methods (OMP_INTEGRATION_PLAN.md RPC CONTRACT),
+// §3.1, driven by the frozen libchudware C-ABI methods (OMP_INTEGRATION_PLAN.md RPC CONTRACT),
 // which proxy the bun bridge auth_*/models_list methods. The UI holds no auth truth — it
 // renders the last agent_provider_list/agent_provider_state response and re-polls on open +
 // short TTL (mirrors drawSubscriptionAccounts above). Degrade: unknown_method (sibling slice
@@ -4704,9 +4704,9 @@ void drawSettingsModal(AppState& st, bool busy) {
                 {
                     static std::string s_wsDefaultWeb;
                     if (s_wsDefaultWeb.empty()) {
-                        s_wsDefaultWeb = billet::fsBackend().defaultRoot();
+                        s_wsDefaultWeb = chudware::fsBackend().defaultRoot();
                         if (s_wsDefaultWeb.empty() || s_wsDefaultWeb == "/workspace")
-                            s_wsDefaultWeb = billet::fsBackend().defaultRoot();
+                            s_wsDefaultWeb = chudware::fsBackend().defaultRoot();
                     }
                     static const std::string s_wsHelpWeb =
                         "The File Explorer's root folder on the server workspace. "
@@ -4749,7 +4749,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                 }
 #else
                 // Truthful default label: defaultWorkspaceDir() applies the alias rule
-                // (existing Documents/AI-CAD wins, else Documents/Billet).
+                // (existing Documents/Chudware wins, else Documents/Chudware).
                 static const std::string s_wsDefault = defaultWorkspaceDir();
                 static const std::string s_wsHelp =
                     "The File Explorer's root folder and the default save location. "
@@ -4764,7 +4764,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                 if (ImGui::Button("Apply", ImVec2(100.0f * sc, 0))) {
                     settings.workspaceDir = s_wsBuf.data();
                     saveSettings(settings);
-                    // Re-resolve the live root: empty falls back to Documents/AI-CAD inside
+                    // Re-resolve the live root: empty falls back to Documents/Chudware inside
                     // the Explorer's ensureWorkspaceDir.
                     st.workspaceDir = settings.workspaceDir;
                     st.addLog("[ok] workspace folder set: " +
@@ -4778,24 +4778,24 @@ void drawSettingsModal(AppState& st, bool busy) {
                 // profiler are status/launchers, folded under one System section (audit P2).
                 settingsSectionHeader("System");
                 // R5a (T-RF21): routing is unconditional — the C++ core IS the engine
-                // (the AI_CAD_CPP_* escape hatches were removed with the Python oracle).
+                // (the CHUDWARE_CPP_* escape hatches were removed with the Python oracle).
                 if (core::cpp_core().available()) {
-                    ImGui::TextUnformatted("Active engine: C++ core (libaicad)");
+                    ImGui::TextUnformatted("Active engine: C++ core (libchudware)");
                     helpMarker("The in-process C++ core is the only modeling engine — documents, "
                                "sketching, FEA/CFD, CAM, ECAD, firmware, sourcing and the AI agent "
                                "all run on it. Services-side Python handles orchestration surfaces "
                                "(parts catalog, reverse engineering, vendor sign-in, missions).");
-                    dimText(("C++ core: libaicad loaded (ABI " +
+                    dimText(("C++ core: libchudware loaded (ABI " +
                              core::cpp_core().abiVersion() + ")").c_str());
                     ImGui::BulletText("Modeling / documents / sketch: C++ core");
                     ImGui::BulletText("Simulation (FEA + CFD) / CAM / ECAD / firmware: C++ core");
                     ImGui::BulletText("AI agent (copilot runs): C++ core");
                 } else {
-                    ImGui::TextUnformatted("Active engine: UNAVAILABLE (libaicad not loaded)");
-                    helpMarker("The C++ core (libaicad) is NOT loaded, and it is the only engine "
-                               "(the Python oracle was removed). Set the AI_CAD_LIBAICAD "
+                    ImGui::TextUnformatted("Active engine: UNAVAILABLE (libchudware not loaded)");
+                    helpMarker("The C++ core (libchudware) is NOT loaded, and it is the only engine "
+                               "(the Python oracle was removed). Set the CHUDWARE_LIBCHUDWARE "
                                "environment variable to the built library "
-                               "(core/build-occt-linux/bin/libaicad.so) or stage it next to the "
+                               "(core/build-occt-linux/bin/libchudware.so) or stage it next to the "
                                "executable, then restart.");
                     dimText("C++ core: not loaded");
                 }

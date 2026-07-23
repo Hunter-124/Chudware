@@ -1,6 +1,6 @@
 {
   "meta": {
-    "server_bin": "/home/hunter/.local/share/AI-CAD/llamacpp/build-cuda/bin/llama-server",
+    "server_bin": "/home/hunter/.local/share/Chudware/llamacpp/build-cuda/bin/llama-server",
     "roles_real": true,
     "headroom_mb": 2048,
     "parallel_ns": [
@@ -18,7 +18,7 @@
       "model_id": "qwen3-4b",
       "license": "Apache-2.0",
       "note": "baseline; tool-calling primary",
-      "server_bin": "/home/hunter/.local/share/AI-CAD/llamacpp/build-cuda/bin/llama-server",
+      "server_bin": "/home/hunter/.local/share/Chudware/llamacpp/build-cuda/bin/llama-server",
       "timestamp": "2026-07-05T01:10:35",
       "free_vram_mb_before": 11675,
       "gpu_offloaded": true,
@@ -145,7 +145,7 @@
       "model_id": "gemma3-4b-qat",
       "license": "Gemma-ToU",
       "note": "QAT alt",
-      "server_bin": "/home/hunter/.local/share/AI-CAD/llamacpp/build-cuda/bin/llama-server",
+      "server_bin": "/home/hunter/.local/share/Chudware/llamacpp/build-cuda/bin/llama-server",
       "timestamp": "2026-07-05T01:12:06",
       "free_vram_mb_before": 11683,
       "gpu_offloaded": true,
@@ -268,7 +268,7 @@
       "model_id": "gemma4-e4b",
       "license": "Gemma-ToU",
       "note": "Gemma 4 E-series (successor to '3n E4B'); MatFormer edge model",
-      "server_bin": "/home/hunter/.local/share/AI-CAD/llamacpp/build-cuda/bin/llama-server",
+      "server_bin": "/home/hunter/.local/share/Chudware/llamacpp/build-cuda/bin/llama-server",
       "timestamp": "2026-07-05T01:13:34",
       "free_vram_mb_before": 11683,
       "gpu_offloaded": true,

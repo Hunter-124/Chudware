@@ -25,7 +25,7 @@
 #include "parts/place.h"
 #include "piping/schema.h"
 
-using namespace aicad::parts;
+using namespace chudware::parts;
 using nlohmann::json;
 
 namespace fs = std::filesystem;
@@ -41,9 +41,9 @@ static json struct_doc() {
                 {"load_cases", json::array()}};
 }
 
-static json sch_doc() { return aicad::ecad::schema::new_schematic("TestSchematic"); }
-static json piping_doc() { return aicad::piping::new_piping("TestPiping"); }
-static json hydraulic_doc() { return aicad::hydraulic::new_hydraulic("TestHydraulic"); }
+static json sch_doc() { return chudware::ecad::schema::new_schematic("TestSchematic"); }
+static json piping_doc() { return chudware::piping::new_piping("TestPiping"); }
+static json hydraulic_doc() { return chudware::hydraulic::new_hydraulic("TestHydraulic"); }
 
 // A PartRecord stub for part_place (services/parts hub shape).
 static json record_with_gref(json gref, const std::string& domain = "fastener") {
@@ -280,7 +280,7 @@ TEST_CASE("core_family: missing family/size is an oracle error") {
 }
 
 TEST_CASE("generate_model: produced STEP imports as a real doc id") {
-    const fs::path step = fs::temp_directory_path() / "aicad_place_test_gen.step";
+    const fs::path step = fs::temp_directory_path() / "chudware_place_test_gen.step";
     { std::ofstream f(step); f << "ISO-10303-21;\nEND-ISO-10303-21;\n"; }
     PlaceSeams seams = stub_seams(step.string());
     json result;
@@ -321,7 +321,7 @@ TEST_CASE("part_import_file: file-not-found and success envelopes") {
     CHECK(result["ok"] == false);
     CHECK(result["reason"] == "file not found: /nonexistent/model.step");
 
-    const fs::path step = fs::temp_directory_path() / "aicad_place_test_import.step";
+    const fs::path step = fs::temp_directory_path() / "chudware_place_test_import.step";
     { std::ofstream f(step); f << "ISO-10303-21;\nEND-ISO-10303-21;\n"; }
     CHECK(place_call("part_import_file", json{{"path", step.string()}}, result, err, seams));
     CHECK(result["ok"] == true);

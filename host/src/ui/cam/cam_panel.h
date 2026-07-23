@@ -33,7 +33,7 @@ void camEnsureVisible();
 // central dock node). Call every frame when the Manufacture workspace is active so the CAM tab
 // wins the docked-tab race against the Viewport window.
 void camRequestFocus();
-// Shot-only: float the panel so a headless AI_CAD_SHOT=cam capture can show the populated tree.
+// Shot-only: float the panel so a headless CHUDWARE_SHOT=cam capture can show the populated tree.
 void camFloatForShot();
 // Adopt an EXISTING CAM job doc (e.g. one the copilot's CAM fast-path just built) into the
 // panel: point the panel at docId, load its tree, and reveal it. Lets a core-side cam_* run

@@ -1,4 +1,4 @@
-; AICAD - S1
+; Chudware - S1
 ; post: Marlin  machine: Generic 3-axis mill
 G21
 G90

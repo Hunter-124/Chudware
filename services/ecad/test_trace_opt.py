@@ -2,7 +2,7 @@
 
 Run::
 
-    /home/hunter/.local/share/AI-CAD/mcp-venv/bin/python -X utf8 -m pytest \\
+    /home/hunter/.local/share/Chudware/mcp-venv/bin/python -X utf8 -m pytest \\
         engine_oracle/ecad/test_trace_opt.py -q
 """
 from __future__ import annotations

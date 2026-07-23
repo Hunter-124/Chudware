@@ -33,11 +33,11 @@ harness — closed by the G3 integrator gate (full panel screenshot battery).
 3. Port from current host/src (post-polish; feature readout panel, sketch ribbon
    accept/deny cluster, PM-inside-FM are the current design).
 4. Run leaves in parallel per DAG write-sets; C6 last (references all panels).
-5. G3 gate: all 21 `AI_CAD_SHOT` scenarios captured on AI-CAD2, diffed vs host baselines.
+5. G3 gate: all 21 `CHUDWARE_SHOT` scenarios captured on AI-CAD2, diffed vs host baselines.
 
 ## Definition of done
 
-- [~] All 44 panel_spec forms render data-driven (`AI_CAD_SHOT=pmform AI_CAD_PMCMD=extrude`)
+- [~] All 44 panel_spec forms render data-driven (`CHUDWARE_SHOT=pmform CHUDWARE_PMCMD=extrude`)
       — **FIXED in-lane** (was broken: pmform `dispatch()`'d/executed the command instead of
       opening its PM form; now sets `activeTool` so `drawInspector` renders the form). Extrude
       form reverified; the 44-form registry is data-driven so extrude exercises the path.
@@ -51,14 +51,14 @@ harness — closed by the G3 integrator gate (full panel screenshot battery).
       command_registry test) and **ui/imgui build + --shot PASS** (my scenarios.cpp change
       compiles + shots clean). RESULT: FAIL is ONLY the known pre-existing reds (identical to
       T-G6): check.py audits; pytest "107 deselected" (issue #6); `--selftest` non-fatal env-gap
-      (no `AI_CAD_LIBAICAD` in gate). My two hunks are gate-clean. `graphify update .`: touches
+      (no `CHUDWARE_LIBCHUDWARE` in gate). My two hunks are gate-clean. `graphify update .`: touches
       2 code files — foreman regenerates at merge (graphify-out/ is in the foreman main checkout).
 
 ## Verification (opus-gale, 2026-07-03) — chained off T-G6 (merge order T-G6 → T-G7)
 
 C1–C6 code already on master from the prior overhaul run (REFACTOR_LOG §§ C1–C6); this task
 verifies it renders + fixes the C2 pmform PM-form path. Shots in `scratch/tg7-shots/`.
-Verified render: **C1** tree ✓, **C3** chat ✓ (ShopCraft branding, glass bubbles + action card),
+Verified render: **C1** tree ✓, **C3** chat ✓ (Chudware branding, glass bubbles + action card),
 **C4** pick ✓, **C5** equations/assembly/plan ✓, ecad ✓. **C2** pmform fixed (see DoD).
 **Blocker:** G3 21-scenario battery gated on issue #7 (10 step-machine scenarios deadlock) —
 foreman decision requested in work/questions/T-G7.md.
@@ -66,5 +66,5 @@ foreman decision requested in work/questions/T-G7.md.
 ## AI hints
 
 - graphify DOES index ui/abstract — `graphify query "panel spec forms"` before reading.
-- The copilot port (C3) should carry the ShopCraft branding and shrunken header from
-  T-G2/T-G3, not the old h2-font "AI-CAD Copilot".
+- The copilot port (C3) should carry the Chudware branding and shrunken header from
+  T-G2/T-G3, not the old h2-font "Chudware Copilot".

@@ -320,7 +320,7 @@ def build_mission_graph(
                          reads ``inputs.tier`` and resolves it via
                          ``services.agent.tiers.provider_for_tier`` — the same seam the
                          gym bench (T-DP19) uses — instead of silently falling through
-                         to the ambient config.json / ``AI_CAD_PROVIDER`` default.
+                         to the ambient config.json / ``CHUDWARE_PROVIDER`` default.
                          ``None`` (the default) leaves every node's ``inputs`` exactly
                          as before — no behaviour change for callers that don't pass it.
 

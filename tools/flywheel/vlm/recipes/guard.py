@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import os
 
-OPT_IN_ENV = "AICAD_ALLOW_VLM_TRAINING"
+OPT_IN_ENV = "CHUDWARE_ALLOW_VLM_TRAINING"
 _CI_ENVS = ("CI", "GITHUB_ACTIONS", "GITLAB_CI", "BUILDKITE", "JENKINS_URL")
 
 

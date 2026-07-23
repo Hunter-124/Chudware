@@ -164,9 +164,9 @@ def _commit_with_parents(
     commit.author_time = commit.commit_time = when
     commit.author_timezone = commit.commit_timezone = 0
     body = meta.message or ""
-    trailer = f"aicad-plm-kind: {meta.kind}\n"
+    trailer = f"chudware-plm-kind: {meta.kind}\n"
     if meta.scope and meta.scope != "design":
-        trailer += f"aicad-plm-scope: {meta.scope}\n"
+        trailer += f"chudware-plm-scope: {meta.scope}\n"
     commit.message = (f"{body}\n\n{trailer}").encode("utf-8")
     obj_store.add_object(commit)
     cid = commit.id.decode("ascii")

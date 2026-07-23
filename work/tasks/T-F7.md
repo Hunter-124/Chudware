@@ -51,7 +51,7 @@ content in the deliverables suite (T-F15).
   (core/cam/session.cpp, stock_sim.cpp, post.cpp; sim_study_list records).
 - `describe_toolpaths` + `describe_results` in services/mcp/gsl_tools.py, registered in
   register_gsl_tools (server.py already wires that in); cad_guide("narration") topic added.
-- Tests: services/mcp/test_gsl_tools.py 14/14 PASS against the staged libaicad.so
+- Tests: services/mcp/test_gsl_tools.py 14/14 PASS against the staged libchudware.so
   (deterministic seeded-study fixtures via sim_study_add — the same RPC _persist_study
   uses; exact slot assertions incl. rounding and attribution strings).
 - Baseline: full `pytest services/mcp/` — master: 7 failed / 64 passed / 15 skipped /
@@ -63,7 +63,7 @@ content in the deliverables suite (T-F15).
   test evidence above covers it; the ui/imgui selMulti gate failure is documented
   pre-existing (FOREMAN pitfalls).
 - `graphify update .` run (19252 nodes rebuilt).
-- Staged lib gap: services/dist/AI-CAD/libaicad.so predates sim_run_static — noted in
+- Staged lib gap: services/dist/Chudware/libchudware.so predates sim_run_static — noted in
   work/questions/T-F7.md (Q4) with the seeding rationale.
 - Open decisions flagged for review in work/questions/T-F7.md: Q2 (max-stress location
   not persisted — honest degradation + BC-face sid join), Q3 (per-op stepdown/stepover

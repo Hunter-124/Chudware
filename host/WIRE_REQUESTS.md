@@ -1,7 +1,7 @@
 # Wire requests — cross-agent shared-file edits
 
 Append-only. If you need a change in a file you do NOT own, add a bullet here
-(under `flock /tmp/aicad-git.lock`) with: requesting agent, target file:line,
+(under `flock /tmp/chudware-git.lock`) with: requesting agent, target file:line,
 exact change wanted, and why. The integrator applies these at the end.
 
 Format:
@@ -43,9 +43,9 @@ Format:
   Build is RED until resolved.
 
 ## dialogs agent (fix(dialogs)) — Command Search screenshot scenario
-- [ ] (dialogs) `host/src/ui/scenarios.cpp` — Add a `dialogs` scenario (AI_CAD_SHOT=dialogs) that:
+- [ ] (dialogs) `host/src/ui/scenarios.cpp` — Add a `dialogs` scenario (CHUDWARE_SHOT=dialogs) that:
   1. On step 0: sets `st.showCommandSearch = true` and settles 8 frames.
-  2. On step 1: captures to `scratch/dialog_shots/search_dark.png` (use AI_CAD_REPO env like appearance scenario).
+  2. On step 1: captures to `scratch/dialog_shots/search_dark.png` (use CHUDWARE_REPO env like appearance scenario).
   3. On step 2: sets `st.openSettings = true`, `st.openSettingsTab = 0`, settles 8 frames.
   4. On step 3: captures to `scratch/dialog_shots/settings_verify.png`.
   Also add `runDialogs(AppState&)` declaration to ScenarioRunner in scenarios.h and a dispatch call
@@ -69,7 +69,7 @@ Format:
 
 ## sim-kinematics agent — motion scenario (2026-07-06)
 - [x] (sim-kinematics) `host/src/ui/scenarios.cpp` — DONE e5e90805. Add a `motion` scenario
-  (AI_CAD_SHOT=motion) that validates the Motion study viewport playback end-to-end.
+  (CHUDWARE_SHOT=motion) that validates the Motion study viewport playback end-to-end.
   The scenario should:
   1. On step 0: build a minimal 2-body assembly (box + arm) with one angle mate driven
      0→120 deg, then open the Simulate workspace and create a Motion study via
@@ -128,7 +128,7 @@ Format:
   }
   ```
 
-- [x] (furniture) `host/src/app.cpp` — DONE e5e90805. live window title "<doc name>[*] — AI-CAD" via
+- [x] (furniture) `host/src/app.cpp` — DONE e5e90805. live window title "<doc name>[*] — Chudware" via
   glfwSetWindowTitle on doc/tab/dirty change. Once per frame (anywhere after the doc-tab state is
   settled, e.g. near the per-frame display-flag derivation at ~L2804), cheap change-detection:
 
@@ -140,9 +140,9 @@ Format:
           const auto& tab = st.docTabs[st.activeTab];
           title = tab.title.empty() ? "Untitled" : tab.title;   // use the tab-strip display name field
           if (tab.dirty) title += "*";
-          title += " \xe2\x80\x94 AI-CAD";                      // " — AI-CAD"
+          title += " \xe2\x80\x94 Chudware";                      // " — Chudware"
       } else {
-          title = "AI-CAD";
+          title = "Chudware";
       }
       static std::string lastTitle;
       if (title != lastTitle) { lastTitle = title; glfwSetWindowTitle(window, title.c_str()); }
@@ -153,7 +153,7 @@ Format:
 
 ## ai-workspace agent — route WS::AI to the full AI hub (2026-07-06)
 - [ ] (ai-workspace) `host/src/app.cpp` — 3 edits wire the new full-page AI hub
-  (`host/src/ui/ai/ai_workspace.cpp`, already built + linked into AI-CAD):
+  (`host/src/ui/ai/ai_workspace.cpp`, already built + linked into Chudware):
 
   1. Add the include next to the other ui includes (~L50, beside `ui/legacy_chat.h`):
   ```cpp
@@ -219,7 +219,7 @@ Format:
   `titleIcon == "history"` renders a purpose-built line-art feature-tree glyph (root + two branch
   children, row-icon stroke weight). Owner: explorer-restyle (feature_tree.cpp side already done).
 
-- **scenarios.cpp — add an `explorer` AI_CAD_SHOT scenario** that sets
+- **scenarios.cpp — add an `explorer` CHUDWARE_SHOT scenario** that sets
   `st.leftPaneTab = AppState::LP_Explorer;` (one line, first frame) so the Explorer tab is
   headless-screenshot coverable like the other 21 scenarios. Verified manually this session via a
   temporary hook (since removed); proof at /tmp/hunter-verify/explorer_restyle.png.
@@ -281,7 +281,7 @@ Format:
   - **Reserved key:** the payload NEVER contains a sub-field named `kind` (would clobber the envelope
     discriminator) — spawn/advisor use `spawn_kind`/`advisor_kind`. The GUI parser can rely on the
     top-level `kind` always being the true event kind.
-  - **Persistence/replay:** all of these also land in `~/.local/share/AI-CAD/cache/runs/<run_id>/events.jsonl`
+  - **Persistence/replay:** all of these also land in `~/.local/share/Chudware/cache/runs/<run_id>/events.jsonl`
     (existing `EventJournal`), so the replay/rescan path (à la `ActivityPanel`/mission_control) reads them
     with no change beyond tolerating the new kinds/fields (already required by §5).
   Backend commit + emit points: services/agent/agent_events.py (builders), agent_turn.py (tool_call),

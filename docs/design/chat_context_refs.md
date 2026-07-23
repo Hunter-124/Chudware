@@ -10,7 +10,7 @@ or explaining. A powerful, intuitive "point at what you mean" affordance.
 Row order, filling the full width, evenly aligned (uiScale-aware): 
 `[ model picker ] [ thinking effort ] ......... [ paperclip ] [ context-cube ] [ new ]`
 - Paperclip icon: REMADE (cleaner glyph) — file attachments (unchanged behavior).
-- Context-cube button (NEW): the Billet logo cube drawn with BLACK outline lines on a
+- Context-cube button (NEW): the Chudware logo cube drawn with BLACK outline lines on a
   TRANSPARENT background. Toggles context-pick mode.
 - Buttons distribute so there is no dead gap: left group (model, thinking) left-aligned;
   right group (paperclip, cube, new) right-aligned; spacer between.

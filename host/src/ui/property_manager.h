@@ -256,7 +256,7 @@ public:
     // Open the form for an existing feature, populated from its params/refs (tree "Edit").
     bool openForEdit(AppState& st, const std::string& featureId);
 
-    // Headless test hook (AI_CAD_SHOT=pmform): set a field's value by key so type-gated fields
+    // Headless test hook (CHUDWARE_SHOT=pmform): set a field's value by key so type-gated fields
     // can be rendered for screenshot verification. value matches a Combo option, a Check
     // ("true"/"false"/"1"/"0"), or a Dim/Int number. No-op if no field has that key.
     void presetFieldForShot(const std::string& key, const std::string& value);

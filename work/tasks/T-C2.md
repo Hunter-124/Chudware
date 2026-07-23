@@ -40,7 +40,7 @@ Day 2's killer feature: the MCU selected in the ECAD schematic BOM seeds the fir
 - [x] `generate_pinmap()` produces a valid C header from ECAD net names — `pinmap.py`; board
   `nets` list or schematic `build_netlist`; power/ground rails skipped; positional names (`PA5`→5,
   `GPIO4`→4, `D13`→13) decode via `mcu_pinouts.resolve_pin`, named nets get logical indices (≥1000);
-  guarded `#ifndef AICAD_PINMAP_H` header.
+  guarded `#ifndef CHUDWARE_PINMAP_H` header.
 - [x] `new_project()` auto-selects MCU family from ECAD BOM when `mcu` param not specified —
   `project.new_project` (`mcu` now optional) + `mcu_pinouts.select_mcu_family`/`resolve_board_doc`
   (resolves an open doc_id or a `.ecad+`/`.json` path). STM32*→cortex-m4, ESP32*→xtensa-lx6,
@@ -62,7 +62,7 @@ Day 2's killer feature: the MCU selected in the ECAD schematic BOM seeds the fir
   This branch is chained off `task/T-C1-firmware-scaffold`, which predates that fix; I touched **zero**
   C++/ui files (`git diff --stat …-- '*.cpp' '*.h'` is empty). Rebases away once C1→C2 land post-b569020.
 - gate `pytest` FAILs because it runs system `python3 -m pytest` (deselects all 25 — the known
-  venv-skip trap). Under `~/.local/share/AI-CAD/mcp-venv` my paths are green (above). The wider
+  venv-skip trap). Under `~/.local/share/Chudware/mcp-venv` my paths are green (above). The wider
   `engine/ecad` suite has pre-existing failures/errors under py3.14 (`test_impedance` import,
   `test_sync`) in files I never touched.
 - `check.py` (feature_surface_audit + parity_audit) = FAIL-RECORDED non-fatal (pre-existing, per the

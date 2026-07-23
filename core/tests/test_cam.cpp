@@ -1,4 +1,4 @@
-// Unit tests for the CAM suite (aicad::cam). OCCT-free; links aicad_cam
+// Unit tests for the CAM suite (chudware::cam). OCCT-free; links chudware_cam
 // (+ Clipper2 + miniz). Grows with each CAM wave: model serialization, geometry
 // (offset/boolean/pocket/raster), feeds, operation generators, post, sim.
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
@@ -19,7 +19,7 @@
 #include "cam/session.h"
 #include "cam/model.h"
 
-using namespace aicad::cam;
+using namespace chudware::cam;
 
 namespace {
 Region square(double cx, double cy, double half) {
@@ -255,10 +255,10 @@ TEST_CASE("feeds: merge_cam overwrites only the feeds fields, preserves identity
     CHECK(db.material_ids().size() == before);
 }
 
-#ifdef AICAD_TEST_REGISTRY
+#ifdef CHUDWARE_TEST_REGISTRY
 TEST_CASE("feeds: registry cam fold-in reproduces the in-code table byte-identically (T-M4)") {
-    std::ifstream fh(AICAD_TEST_REGISTRY);
-    REQUIRE_MESSAGE(fh.good(), "registry.json not found at AICAD_TEST_REGISTRY");
+    std::ifstream fh(CHUDWARE_TEST_REGISTRY);
+    REQUIRE_MESSAGE(fh.good(), "registry.json not found at CHUDWARE_TEST_REGISTRY");
     json doc = json::parse(fh, nullptr, /*allow_exceptions=*/false);
     REQUIRE_FALSE(doc.is_discarded());
 
@@ -1171,7 +1171,7 @@ TEST_CASE("session: new / apply_ops / generate / post / undo / save+open") {
     CHECK(cam_tree(doc)["stats"]["operations"].get<int>() == 1);
 
     // save + open round-trip (portable temp path — /tmp doesn't exist on Windows)
-    std::string path = (std::filesystem::temp_directory_path() / "aicad_test.cam+").string();
+    std::string path = (std::filesystem::temp_directory_path() / "chudware_test.cam+").string();
     json sv = cam_save(doc, path);
     CHECK(sv["path"] == path);
     json op2 = cam_open(path);
@@ -1568,10 +1568,10 @@ TEST_CASE("session: cam_feeds aluminum/endmill nonzero and unknown material erro
     cam_close(doc);
 }
 
-#ifdef AICAD_TEST_MACHINES
+#ifdef CHUDWARE_TEST_MACHINES
 TEST_CASE("MachineDB: five built-ins match machines.json (wave 2)") {
-    std::ifstream fh(AICAD_TEST_MACHINES);
-    REQUIRE_MESSAGE(fh.good(), "machines.json not found at AICAD_TEST_MACHINES");
+    std::ifstream fh(CHUDWARE_TEST_MACHINES);
+    REQUIRE_MESSAGE(fh.good(), "machines.json not found at CHUDWARE_TEST_MACHINES");
     json doc = json::parse(fh, nullptr, /*allow_exceptions=*/false);
     REQUIRE_FALSE(doc.is_discarded());
     REQUIRE(doc.contains("machines"));

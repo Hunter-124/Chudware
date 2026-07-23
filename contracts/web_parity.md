@@ -1,22 +1,22 @@
 # Web parity contract (aicad.webparity/1)
 
 The web app (chudware.com) is the same `host/src/ui` tree compiled to WASM, talking to the
-same `aicad-hostd` daemon. hostd serves methods from `libaicad` and falls back to a lazily
+same `chudware-hostd` daemon. hostd serves methods from `libchudware` and falls back to a lazily
 spawned Python worker (`core/hostd/worker_bridge.cpp`) for engine-unknown methods — a
 fallback the web deployment must never need. This contract makes the split **explicit and
 gate-enforced** so web never silently diverges from desktop:
 
 - `web_required` — representative methods the web client depends on. The probe
   (`scripts/web_parity_probe.py`) spawns a scratch hostd **with the Python bridge disabled**
-  (`AI_CAD_PYTHON=/nonexistent`, exactly what the WASM client faces) and asserts each IS
-  served by libaicad (any response except the unknown-method / worker-bridge class).
+  (`CHUDWARE_PYTHON=/nonexistent`, exactly what the WASM client faces) and asserts each IS
+  served by libchudware (any response except the unknown-method / worker-bridge class).
 - `web_unsupported` — known python-only (or unrouted) methods. The probe asserts each DOES
   fail with the unknown/worker-bridge class. An entry that starts succeeding means a
   cutover landed — **remove the entry in the same commit** (the probe fails until you do;
   that is the loud part of "fail loud").
 
 Verified-C++ notes (2026-07-22, probe run): `sim_run_flow` (LBM path), `ecad_fill_zones`,
-`ecad_simulate` are already libaicad-dispatched — earlier docs listing them as python-only
+`ecad_simulate` are already libchudware-dispatched — earlier docs listing them as python-only
 were stale. `sim_run_flow` is not live-called here because empty params take the LBM run
 path (side-effect risk in a gate); it belongs in spirit to `web_required`.
 
@@ -28,7 +28,7 @@ Rules:
 2. Z-stream nodes (`T-RF15`–`T-RF19`) delete their entries from `web_unsupported` as they
    land. At `T-RF21` closeout the list is **empty by construction** (no Python engine
    left); the probe stays as a regression gate.
-3. Method names are worker-RPC names (`contracts/worker_rpc.md` + `core/api/libaicad.cpp`
+3. Method names are worker-RPC names (`contracts/worker_rpc.md` + `core/api/libchudware.cpp`
    dispatch table). One representative method per family is enough — full coverage arrives
    for free at zero-Python.
 

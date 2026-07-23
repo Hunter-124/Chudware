@@ -18,8 +18,8 @@
 #include "hydraulic/solve.h"
 #include "piping/simhandoff.h"
 
-using namespace aicad::hydraulic;
-using aicad::pyutil::ojson;
+using namespace chudware::hydraulic;
+using chudware::pyutil::ojson;
 
 // ── schema factories + validation (test_hydraulic.py) ────────────────────────
 
@@ -356,7 +356,7 @@ TEST_CASE("dispatch: hydraulic→piping handoff runs the live solve + verify") {
     const ojson env = result["simhandoff"];
     CHECK(env["coupling"] == "hydraulic_to_piping");
     CHECK(env["kind"] == "handoff");
-    CHECK(aicad::piping::simhandoff::validate_envelope(env).empty());
+    CHECK(chudware::piping::simhandoff::validate_envelope(env).empty());
     // one hose line: inline piping doc + boundary + estimate + solve agree
     CHECK(result["lines"].size() == 1);
     CHECK(result["piping_doc"]["runs"].size() == 1);
@@ -380,7 +380,7 @@ TEST_CASE("dispatch: hydraulic→piping handoff runs the live solve + verify") {
     CHECK(v["checks"].size() == 1);
     CHECK(v["simhandoff"]["kind"] == "verify");
     CHECK(v["simhandoff"]["coupling"] == "hydraulic_to_piping");
-    CHECK(aicad::piping::simhandoff::validate_envelope(v["simhandoff"]).empty());
+    CHECK(chudware::piping::simhandoff::validate_envelope(v["simhandoff"]).empty());
     CHECK(v["margin"]["pump_margin_solved_bar"] ==
           result["margin"]["pump_margin_solved_bar"]);
 
@@ -410,7 +410,7 @@ TEST_CASE("dispatch: hydraulic→FEA handoff + verify envelopes") {
     CHECK(result["fea_args"]["extend_max_pressure"]["loads"][0]["force"].size() == 3);
     const ojson env = result["simhandoff"];
     CHECK(env["coupling"] == "hydraulic_to_fea");
-    CHECK(aicad::piping::simhandoff::validate_envelope(env).empty());
+    CHECK(chudware::piping::simhandoff::validate_envelope(env).empty());
     CHECK(env["conditions"].size() == 3);  // extend + retract + fixture
 
     // verify: the envelope's own conditions match the independent recompute
@@ -420,7 +420,7 @@ TEST_CASE("dispatch: hydraulic→FEA handoff + verify envelopes") {
     CHECK(v["pass"] == true);
     CHECK(v["checks"].size() == 2);
     CHECK(v["simhandoff"]["kind"] == "verify");
-    CHECK(aicad::piping::simhandoff::validate_envelope(v["simhandoff"]).empty());
+    CHECK(chudware::piping::simhandoff::validate_envelope(v["simhandoff"]).empty());
 
     // a tampered condition (off-axis force) fails magnitude + flags colinearity
     ojson tampered = env;

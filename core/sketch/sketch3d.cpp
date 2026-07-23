@@ -11,9 +11,9 @@
 #include <set>
 #include <stdexcept>
 
-namespace aicad::sketch3d {
+namespace chudware::sketch3d {
 
-using aicad::solver::System;
+using chudware::solver::System;
 using Eigen::Matrix3d;
 using Eigen::MatrixXd;
 using Eigen::Vector3d;
@@ -53,8 +53,8 @@ double resolve_dim(const json& c, const json& env) {
             if (env.is_object() && env.contains(e) && env[e].is_number())
                 return env[e].get<double>();
             try {
-                return aicad::util::evaluate(e, env_to_map(env));
-            } catch (const aicad::util::ExprError&) {
+                return chudware::util::evaluate(e, env_to_map(env));
+            } catch (const chudware::util::ExprError&) {
             }
         }
         if (v.contains("value") && v["value"].is_number()) return v["value"].get<double>();
@@ -77,14 +77,14 @@ void perp_basis(const Vector3d& axis, Vector3d& e1, Vector3d& e2) {
 }
 
 // eq_curve3d: evaluate x(t)/y(t)/z(t) expression strings (doc equation grammar,
-// aicad::util::evaluate — degrees trig, `env` globals, `t` bound per-call) at a
-// given parameter value. Throws aicad::util::ExprError on a bad expression.
+// chudware::util::evaluate — degrees trig, `env` globals, `t` bound per-call) at a
+// given parameter value. Throws chudware::util::ExprError on a bad expression.
 Vector3d eval_eq_curve3d(const json& e, double t, const json& env) {
     std::map<std::string, double> m = env_to_map(env);
     m["t"] = t;
-    double x = aicad::util::evaluate(e.value("xt", std::string("0")), m);
-    double y = aicad::util::evaluate(e.value("yt", std::string("0")), m);
-    double z = aicad::util::evaluate(e.value("zt", std::string("0")), m);
+    double x = chudware::util::evaluate(e.value("xt", std::string("0")), m);
+    double y = chudware::util::evaluate(e.value("yt", std::string("0")), m);
+    double z = chudware::util::evaluate(e.value("zt", std::string("0")), m);
     return Vector3d(x, y, z);
 }
 
@@ -120,7 +120,7 @@ std::vector<int> allocate_entity(System& sys, const json& e, const json& env) {
             Vector3d a = eval_eq_curve3d(e, num(e.value("t1", json(0.0))), env);
             Vector3d b = eval_eq_curve3d(e, num(e.value("t2", json(1.0))), env);
             return sys.add_vars(6, {a.x(), a.y(), a.z(), b.x(), b.y(), b.z()});
-        } catch (const aicad::util::ExprError&) {
+        } catch (const chudware::util::ExprError&) {
             return sys.add_vars(6, {0, 0, 0, 0, 0, 0});
         }
     }
@@ -698,7 +698,7 @@ json extract_entities(const VectorXd& x, const json& entities_list, const VarMap
             try {
                 for (const Vector3d& p : sample_eq_curve3d(e, env))
                     samples.push_back(json::array({p.x(), p.y(), p.z()}));
-            } catch (const aicad::util::ExprError&) {
+            } catch (const chudware::util::ExprError&) {
                 // leave samples empty — profile3d skips a bad eq_curve3d edge
             }
             rec["samples"] = std::move(samples);
@@ -1038,4 +1038,4 @@ json drag3(const SolveState3& state, const std::string& handle,
                 {"converged", res.converged}, {"budget_exceeded", res.budget_exceeded}};
 }
 
-}  // namespace aicad::sketch3d
+}  // namespace chudware::sketch3d

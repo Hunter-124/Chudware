@@ -72,7 +72,7 @@ def test_provider_for_tier_xai_no_creds_raises_mission_auth_error(monkeypatch):
     from services.agent.tiers import MissionAuthError, provider_for_tier
     from services.agent.providers import sub_auth
 
-    monkeypatch.delenv("AI_CAD_PROVIDER", raising=False)
+    monkeypatch.delenv("CHUDWARE_PROVIDER", raising=False)
     monkeypatch.delenv("XAI_API_KEY", raising=False)
     monkeypatch.setattr(sub_auth, "load_credential", lambda *_a, **_k: None)
 
@@ -90,7 +90,7 @@ def test_provider_for_tier_xai_with_key_constructs(monkeypatch):
     from services.agent.tiers import provider_for_tier
     from services.agent.providers import sub_auth
 
-    monkeypatch.delenv("AI_CAD_PROVIDER", raising=False)
+    monkeypatch.delenv("CHUDWARE_PROVIDER", raising=False)
     monkeypatch.setattr(sub_auth, "load_credential", lambda *_a, **_k: None)
     monkeypatch.setenv("XAI_API_KEY", "test-key-not-real")
     calls = []

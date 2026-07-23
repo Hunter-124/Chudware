@@ -16,7 +16,7 @@
 #include <set>
 #include <vector>
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 
 namespace {
@@ -505,4 +505,4 @@ std::optional<std::string> extract_script(const std::string& reply) {
 }
 
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware

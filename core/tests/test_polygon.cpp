@@ -21,8 +21,8 @@ namespace {
 // new part -> add an empty sketch on plane.top -> add ONE entity -> return the sketch's expanded
 // entities array. The sketch is the first op, so its placeholder ref is "$0".
 json expand_polygon_entity(const json& entity) {
-    using aicad::doc::doc_apply_ops;
-    using aicad::doc::doc_new;
+    using chudware::doc::doc_apply_ops;
+    using chudware::doc::doc_new;
     std::string id = doc_new("part", "PolyTest").at("doc_id").get<std::string>();
 
     json sketch_feat = {{"type", "sketch"}, {"name", "profile"},
@@ -88,7 +88,7 @@ TEST_CASE("size conventions all build the loop") {
 }
 
 TEST_CASE("degenerate polygons are rejected") {
-    using aicad::doc::OpError;
+    using chudware::doc::OpError;
     // sides < 3 is not a polygon.
     CHECK_THROWS_AS(
         expand_polygon_entity({{"type", "polygon"}, {"sides", 2}, {"across_flats", 10.0}}), OpError);

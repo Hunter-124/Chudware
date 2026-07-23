@@ -142,7 +142,7 @@ BOM so a released rev is exact even if the rebuild engine evolves.
 | Local | per-project hidden vault, no network | yes (T-R2) |
 | Shared folder / USB | vault sync to a filesystem remote | yes (T-R7) |
 | Self-hosted | any git remote the user controls (bare repo over SSH, Gitea, GitHub…) | yes (T-R7) |
-| AI-CAD Cloud | our hosted remote + accounts + web view | seam only (config entry), Pillar-12 human gate before any implementation |
+| Chudware Cloud | our hosted remote + accounts + web view | seam only (config entry), Pillar-12 human gate before any implementation |
 
 Team concurrency v1 = **advisory edit locks + sync, no merging** (merging
 feature trees is where every PLM gets complicated). "Sync" is one button:
@@ -233,5 +233,5 @@ R3; R6 is the capstone; R7 can run parallel to R5/R6.
 - Custom lifecycle states, approval workflows, e-signatures (later, behind
   Advanced, if ever)
 - ECO/change-order management
-- Server implementation for AI-CAD Cloud (seam reserved only; Pillar-12 human
+- Server implementation for Chudware Cloud (seam reserved only; Pillar-12 human
   gate before any build)

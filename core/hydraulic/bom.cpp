@@ -1,7 +1,7 @@
 // core/hydraulic/bom.cpp — port of engine_oracle/hydraulic/bom.py.
 #include "hydraulic/bom.h"
 
-namespace aicad::hydraulic {
+namespace chudware::hydraulic {
 
 ojson hydraulic_bom_lines(const ojson& doc) {
     ojson lines = ojson::array();
@@ -54,4 +54,4 @@ ojson sourcing_summary(const ojson& doc) {
     return out;
 }
 
-}  // namespace aicad::hydraulic
+}  // namespace chudware::hydraulic

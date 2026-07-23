@@ -27,7 +27,7 @@
 #include <sys/types.h>
 #endif
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 
 class OmpBridgeClient {
@@ -75,7 +75,7 @@ private:
     bool running_ = false;
     // Resolved once on first spawn. Defaults to a PATH-searched "bun" (or a common
     // curl-installer location) and <repo root>/vendor/omp/bridge/src/bridge.ts; both are
-    // overridable (AI_CAD_BUN, AI_CAD_OMP_BRIDGE) for checkouts/installs that don't sit under
+    // overridable (CHUDWARE_BUN, CHUDWARE_OMP_BRIDGE) for checkouts/installs that don't sit under
     // $HOME/Repositories/CAD or don't have bun on PATH.
     std::string bunExe_;
     std::string bridgeScript_;
@@ -86,4 +86,4 @@ private:
 };
 
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware

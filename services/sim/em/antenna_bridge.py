@@ -426,7 +426,7 @@ def _openems_run_antenna(plan: dict) -> dict:
 
     # Cap cell count for CI: if still huge after smooth, accept it — wall-time
     # budget is enforced by NrTS.
-    sim_path = tempfile.mkdtemp(prefix="aicad_ant_")
+    sim_path = tempfile.mkdtemp(prefix="chudware_ant_")
     # openEMS's fdtd.Run chdirs into sim_path and cleanup=True deletes it,
     # leaving the PROCESS CWD a dead directory — which breaks every later
     # CWD-relative read in this process (pytest suite pollution). Restore it.

@@ -92,12 +92,12 @@ def camera_poses(fixture_dir):
 @pytest.fixture()
 def reveng_env(tmp_path, monkeypatch):
     """Isolate the reveng session + DAG-run stores under tmp so the test is hermetic."""
-    monkeypatch.setenv("AICAD_REVENG_DIR", str(tmp_path / "reveng"))
-    monkeypatch.setenv("AICAD_REVENG_RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setenv("CHUDWARE_REVENG_DIR", str(tmp_path / "reveng"))
+    monkeypatch.setenv("CHUDWARE_REVENG_RUNS_DIR", str(tmp_path / "runs"))
     # make_reveng_emit's EventJournal falls back to XDG cache; redirect it under tmp too
     # so the aicad.reveng_events/1 records are captured hermetically.
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
-    # Import inside the env so the session-store helpers pick up AICAD_REVENG_DIR.
+    # Import inside the env so the session-store helpers pick up CHUDWARE_REVENG_DIR.
     from services.mcp import reveng_tools as rt
     return rt
 
@@ -219,11 +219,11 @@ def test_mission_partial_run_with_stage_events(reveng_env, tools, fixture_dir):
     assert result.get("run_id")
 
     # Stage events were journaled as aicad.reveng_events/1 (GUI stepper drain source).
-    # The executor writes under AICAD_REVENG_RUNS_DIR; make_reveng_emit's journal falls
+    # The executor writes under CHUDWARE_REVENG_RUNS_DIR; make_reveng_emit's journal falls
     # back to the XDG cache runs dir — both are redirected under tmp, so scan both.
     search_roots = [
-        Path(os.environ["AICAD_REVENG_RUNS_DIR"]),
-        Path(os.environ["XDG_DATA_HOME"]) / "AI-CAD" / "cache" / "runs",
+        Path(os.environ["CHUDWARE_REVENG_RUNS_DIR"]),
+        Path(os.environ["XDG_DATA_HOME"]) / "Chudware" / "cache" / "runs",
     ]
     events_files = [f for root in search_roots if root.exists()
                     for f in root.rglob("events.jsonl")]

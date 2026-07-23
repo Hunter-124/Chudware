@@ -1,7 +1,7 @@
-# Billet WASM public demo runbook
+# Chudware WASM public demo runbook
 
 **When:** ~40 min stakeholder demo  
-**Client:** browser WASM (`~/billet-web/app/`) → shared `aicad-hostd` via gateway  
+**Client:** browser WASM (`~/chudware-web/app/`) → shared `chudware-hostd` via gateway  
 **Do not** restart hostd mid-demo. Gateway restart is required once before showtime (see Blocker).
 
 ---
@@ -18,7 +18,7 @@ Notes:
 
 - Local fallback (no CF Access):  
   `http://127.0.0.1:8399/app/?dev_user=haedmonds69@gmail.com`  
-  (dev uvicorn with `BILLET_WEB_DEV=1` only — not the public path.)
+  (dev uvicorn with `CHUDWARE_WEB_DEV=1` only — not the public path.)
 
 ---
 
@@ -28,7 +28,7 @@ Notes:
 2. Cloudflare Access interstitial: **Sign in · Cloudflare Access** for host `chudware.com`.
 3. Authenticate with an allowlisted email (OTP and/or Google IdP if configured).
    - Hunter admin emails: `haedmonds69@gmail.com`, `haedmonds@crimson.ua.edu`
-   - Allowlist lives in `~/billet-web-data/users.yaml` and CF Access policy `billet-users`.
+   - Allowlist lives in `~/chudware-web-data/users.yaml` and CF Access policy `chudware-users`.
 4. After Access sets the `CF_Authorization` cookie, the gateway validates `Cf-Access-Jwt-Assertion` and serves the WASM shell.
 5. Session duration is Access app default (**24h**). Re-auth only if cookie expired.
 
@@ -38,7 +38,7 @@ Notes:
 
 | Checkpoint | Expected |
 |---|---|
-| Page load | Dark shell; `#status` moves past “Loading Billet WASM…” |
+| Page load | Dark shell; `#status` moves past “Loading Chudware WASM…” |
 | Isolation | DevTools console: `crossOriginIsolated === true` (required for pthreads / SharedArrayBuffer) |
 | UI | Full ImGui chrome: **ribbon** + **FeatureManager** tree visible |
 | Daemon | Status bar / HUD shows **Ready** and **daemon connected** (WS to `/engine` on same origin) |
@@ -66,7 +66,7 @@ Cloudflare Tunnel is expected **not** to strip these origin headers on authentic
 
 If after Access login DevTools shows `crossOriginIsolated === false` (headers missing on HTML/JS/WASM):
 
-1. Vendor **`coi-serviceworker`** into `~/billet-web/app/` and register it from `index.html` so the service worker rewrites responses to inject COOP/COEP (standard COI polyfill path).
+1. Vendor **`coi-serviceworker`** into `~/chudware-web/app/` and register it from `index.html` so the service worker rewrites responses to inject COOP/COEP (standard COI polyfill path).
 2. Hard-reload (or unregister old SW) once.
 3. Re-check `crossOriginIsolated === true`, then proceed with demo.
 
@@ -78,41 +78,41 @@ This is the **only** planned isolation fallback; do not try random header hacks 
 
 ```bash
 # 1) REQUIRED if gateway predates appserve (see verification notes)
-systemctl --user restart billet-gateway
+systemctl --user restart chudware-gateway
 
 # 2) Confirm services
-systemctl --user is-active billet-gateway billet-cloudflared billet-hostd
+systemctl --user is-active chudware-gateway chudware-cloudflared chudware-hostd
 
 # 3) Local auth probe of MIME + isolation headers (dev server already good;
 #    after prod restart, use a real CF JWT or temporary local smoke)
 curl -sI -X GET 'http://127.0.0.1:8399/app/?dev_user=haedmonds69@gmail.com' | grep -iE 'HTTP/|cross-origin|content-type'
-curl -sI -X GET 'http://127.0.0.1:8399/app/Billet.wasm?dev_user=haedmonds69@gmail.com' | grep -iE 'HTTP/|cross-origin|content-type'
+curl -sI -X GET 'http://127.0.0.1:8399/app/Chudware.wasm?dev_user=haedmonds69@gmail.com' | grep -iE 'HTTP/|cross-origin|content-type'
 
 # Expect on 200s:
 #   cross-origin-opener-policy: same-origin
 #   cross-origin-embedder-policy: require-corp
-#   content-type: application/wasm   (for Billet.wasm)
+#   content-type: application/wasm   (for Chudware.wasm)
 
 # 4) Public path reaches Access (unauthenticated)
 curl -sI https://chudware.com/app/ | head -15
 # Expect 302 → bruh234324.cloudflareaccess.com/.../login/chudware.com
 ```
 
-Bundle on disk (served from `BILLET_WEB_APP_DIR` default `~/billet-web/app/`):
+Bundle on disk (served from `CHUDWARE_WEB_APP_DIR` default `~/chudware-web/app/`):
 
-- `index.html` / `Billet.html`
-- `Billet.js`
-- `Billet.wasm` (~9.2 MiB)
-- `Billet.data` (~2.5 MiB)
+- `index.html` / `Chudware.html`
+- `Chudware.js`
+- `Chudware.wasm` (~9.2 MiB)
+- `Chudware.data` (~2.5 MiB)
 
 ---
 
 ## Architecture (one line)
 
-Browser → Cloudflare Access → tunnel (`billet-cloudflared`) → `billet-gateway` `:8300` → static `/app` + WS `/engine` → shared `billet-hostd` (`aicad-hostd`).
+Browser → Cloudflare Access → tunnel (`chudware-cloudflared`) → `chudware-gateway` `:8300` → static `/app` + WS `/engine` → shared `chudware-hostd` (`chudware-hostd`).
 
 ---
 
 ## Talk track (30s)
 
-“This is the real Billet GUI compiled to WASM, not a VNC stream. After Cloudflare Access, the browser loads the same ribbon and FeatureManager as desktop, talks to Hunter’s shared engine daemon over WebSocket, and stays cross-origin isolated so multi-threaded WASM can use SharedArrayBuffer.”
+“This is the real Chudware GUI compiled to WASM, not a VNC stream. After Cloudflare Access, the browser loads the same ribbon and FeatureManager as desktop, talks to Hunter’s shared engine daemon over WebSocket, and stays cross-origin isolated so multi-threaded WASM can use SharedArrayBuffer.”

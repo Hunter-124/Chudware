@@ -24,7 +24,7 @@ ALWAYS deterministic-path-or-frontier (kill-switch rule). Rollout ladder: shadow
 → promote (human audit gate #2, needs the T-H8 bench report). Rollback = routing-table
 flip to the previous DVC-versioned adapter; nothing overwritten. Serving state visible
 in Settings — the user always knows which brain answered. HUMAN-GATED: promotion
-criteria sign-off and any hosted-relay interaction (master plan AI-CAD Cloud seam).
+criteria sign-off and any hosted-relay interaction (master plan Chudware Cloud seam).
 
 ## Files / areas touched
 
@@ -124,4 +124,4 @@ wasn't updated. One-line test fix; out of T-H9 scope.
   provider stack; LoggingProvider (T-H7) must wrap it unchanged.
 - Settings visibility: read-only "which brain answered" line; if the settings panel files
   are contested by a G-wave owner, post a question file per first-claimer rule.
-- Anything touching AI-CAD Cloud relay = HUMAN-GATED, do not build; batch to Erik.
+- Anything touching Chudware Cloud relay = HUMAN-GATED, do not build; batch to Erik.

@@ -79,7 +79,7 @@ system_prompt: |
     does not provide.
   - Capability SOFT rules may append HARD floors; obey them.
 
-  UNIVERSAL RULES (all AI-CAD roles)
+  UNIVERSAL RULES (all Chudware roles)
   1. Never invent a number. Every value must come from a tool result, [ADVISORY]
      block, calculator/table, the ledger, or an explicit user answer.
   2. [ADVISORY] blocks are ground truth for kernel/table items; dispute with

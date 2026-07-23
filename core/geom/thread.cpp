@@ -142,9 +142,9 @@ TopoDS_Face build_profile_face(const gp_Pnt& origin, const gp_Dir& radial,
     return mkf.Face();
 }
 
-// Diagnostic trace, gated on $AI_CAD_THREAD_DEBUG (dev-only; silent in production).
+// Diagnostic trace, gated on $CHUDWARE_THREAD_DEBUG (dev-only; silent in production).
 inline void tt(const char* msg, double a = 0, double b = 0) {
-    static const bool on = std::getenv("AI_CAD_THREAD_DEBUG") != nullptr;
+    static const bool on = std::getenv("CHUDWARE_THREAD_DEBUG") != nullptr;
     if (on) std::fprintf(stderr, "[thread] %s a=%.4f b=%.4f\n", msg, a, b);
 }
 

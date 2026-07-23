@@ -1,4 +1,4 @@
-# services/mcp — MCP server (AI-CAD engine exposed to external agents)
+# services/mcp — MCP server (Chudware engine exposed to external agents)
 
 Scope: services/mcp/**, root `mcp_server` symlink (the stdio MCP server)
 Contracts: contracts/doc_ops.md, contracts/doc_schema.md, contracts/worker_rpc.md,
@@ -11,7 +11,7 @@ Contracts: contracts/doc_ops.md, contracts/doc_schema.md, contracts/worker_rpc.m
 - services/mcp/server.py:26 `mcp` FastMCP instance — root MCP server; registers all 26
   tool families via `register_*` functions (L60–185). Instructions string (L29–51) is the
   agent's first-contact map of the full capability surface.
-- services/mcp/server.py:298 `main()` — entrypoint; spawns libaicad.so warmup thread,
+- services/mcp/server.py:298 `main()` — entrypoint; spawns libchudware.so warmup thread,
   redirects native stdout (OCCT prints) to a log file to protect the JSON-RPC channel.
 - services/mcp/cad_tools.py — COMPAT FACADE (T-RF8 split): re-exports the historical
   cad_tools namespace + register_cad_tools(mcp) composite. The mechanical-CAD tools now
@@ -117,16 +117,16 @@ Contracts: contracts/doc_ops.md, contracts/doc_schema.md, contracts/worker_rpc.m
 - services/mcp/design_review_tools.py:32 `register_design_review_tools(mcp)` — one-call
   geometry battery narrated via contracts/narration.md: design_review(doc_id, checks?).
 - services/mcp/intake_ledger.py `IntakeLedger(doc_id)` — doc-scoped interaction answer store (contracts/interaction.md §5): persists ask_user Q/A inside the doc's IntakeState meta record (rides the .step+, survives save/reopen — doc_id is per-process, the record travels with the doc); no FastMCP import, get/set injectable for engine-less tests. Used by intake_tools._ask_via_contract and ask_user's scope=doc default ledger (T-BL25)
-- services/mcp/core_bridge.py:20 `call(method, params)` — the one engine funnel (JSON string-in/out). DEFAULT (Phase-8 flip): routes through the shared aicad-hostd daemon via daemon_bridge.py; explicit AI_CAD_ENGINE_DAEMON=0 = legacy in-process ctypes load (resolves library via $AI_CAD_LIBAICAD / $AI_CAD_DIST / build dirs)
+- services/mcp/core_bridge.py:20 `call(method, params)` — the one engine funnel (JSON string-in/out). DEFAULT (Phase-8 flip): routes through the shared chudware-hostd daemon via daemon_bridge.py; explicit CHUDWARE_ENGINE_DAEMON=0 = legacy in-process ctypes load (resolves library via $CHUDWARE_LIBCHUDWARE / $CHUDWARE_DIST / build dirs)
 - services/mcp/test_roundtrip.py:5 `python -m mcp_server.test_roundtrip` — integration test: list tools, new_part, add_features, render, measure, run_fea_static, export
 
 ## How it connects
 
-The stdio MCP server (server.py) wraps the SAME C++ core (`libaicad.so`) that the desktop
+The stdio MCP server (server.py) wraps the SAME C++ core (`libchudware.so`) that the desktop
 app uses, exposing it to external MCP clients (Claude Code, Cursor, etc.) as a tool palette.
 Each tool group registers its tools via FastMCP decorators (`@mcp.tool()`) and dispatches
 into the C++ engine through `core_bridge.call()` — a ctypes wrapper over the native
-`aicad_call(method, params_json)` C-ABI entry. The tool_registry `view()` wrapper stamps
+`chudware_call(method, params_json)` C-ABI entry. The tool_registry `view()` wrapper stamps
 each registration with a `{family, risk}` tag and enforces a per-context allow-list at
 dispatch. Default policy = everything allowed; DAG nodes + env can restrict it.
 
@@ -136,9 +136,9 @@ MCP tools, NOT through the worker socket. ECAD is pure Python until 3D (board_to
 ## Debugging playbook
 
 - Run: `python -m mcp_server.test_roundtrip` — full MCP roundtrip (new_part, add_features,
-  render, FEA, export); prints each step. Requires libaicad.so.
+  render, FEA, export); prints each step. Requires libchudware.so.
 - Run: `python -m pytest services/mcp/test_mcp_freshness.py -v` — freshness/consistency
-  test: every tool family discoverable from server instructions + cad_guide. No libaicad needed.
+  test: every tool family discoverable from server instructions + cad_guide. No libchudware needed.
 - Run: `python -m pytest services/mcp/test_cad_tools.py -v` — mechanical CAD tool suite.
 - Run: `python -m pytest services/mcp/test_gsl_tools.py -v` — GSL describe/query/hover tests.
 - Run: `python -m pytest services/mcp/test_recon_tools.py -v` — reverse-engineering tests.
@@ -146,11 +146,11 @@ MCP tools, NOT through the worker socket. ECAD is pure Python until 3D (board_to
 - Run: `python -m pytest services/mcp/test_cam_tools.py -v` — CAM tool tests.
 - Run: `python -m pytest services/mcp/test_req_tools.py -v` — requirements CRUD tests.
 - Run: `python -m pytest services/mcp/test_autosave_recovery.py -v` — autosave recovery.
-- Environment: `$AI_CAD_LIBAICAD=/path/to/libaicad.so` (Linux) or `$AI_CAD_DIST=dist/AI-CAD`
+- Environment: `$CHUDWARE_LIBCHUDWARE=/path/to/libchudware.so` (Linux) or `$CHUDWARE_DIST=dist/Chudware`
   (Windows); core_bridge.py L75–92 lists candidates.
 - Gotcha: server.py `_install_clean_stdout()` redirects fd 1 to a log file — native C++ prints
   (OCCT, Netgen, gmsh) corrupt the JSON-RPC channel; set $TEMP to see logs.
-- Gotcha: `_warm_core()` pre-loads libaicad.so + ECAD deps in a background thread to avoid
+- Gotcha: `_warm_core()` pre-loads libchudware.so + ECAD deps in a background thread to avoid
   transport timeouts on the first tool call; the thread also runs ECAD autosave recovery.
 
 ## MCP freshness rule (WORKFLOW.md §6 — enforced mechanically)
@@ -160,7 +160,7 @@ in server.py instructions OR a cad_guide topic in cad_guide.py:cad_guide_text() 
 through the cad_tools facade). When adding
 a new tool family: (1) add it to `_TOOL_FAMILIES` in the test, (2) add its signal to
 `_FAMILY_SIGNALS`, (3) update either server.py instructions or cad_guide_text() with a topic.
-The test runs in the pytest gate stage (no libaicad.so needed).
+The test runs in the pytest gate stage (no libchudware.so needed).
 
 ## Graphify starters
 

@@ -123,7 +123,7 @@ def run_feature_id(provider: Any, *, seed: int = 1) -> dict[str, Any]:
     _ = seed
     supports_vision = bool(getattr(provider, "supports_vision", True))
     system = (
-        "You are an AI-CAD feature identifier. Given describe_part text "
+        "You are an Chudware feature identifier. Given describe_part text "
         "(and optionally a render), name the ONE feature that should be edited. "
         "Reply with the feature name only — no prose."
     )

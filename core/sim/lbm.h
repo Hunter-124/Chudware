@@ -27,7 +27,7 @@
 #include <string>
 #include <vector>
 
-namespace aicad::sim {
+namespace chudware::sim {
 
 // Lattice parameters — the SAME scalars run_wind_tunnel computes from the mesh +
 // preset, passed in already-resolved so this core is the pure kernel.
@@ -39,7 +39,7 @@ struct LbmParams {
     double dt_s = 1.0e-6;    // physical timestep (s)
     double rho_air = 1.225;  // reference air density (kg/m^3)
     // Runtime backend select: "auto" (CUDA if built+available else CPU), "cpu", "cuda".
-    // Empty string = honour AI_CAD_LBM_BACKEND env, else "auto". Additive — default keeps
+    // Empty string = honour CHUDWARE_LBM_BACKEND env, else "auto". Additive — default keeps
     // every existing caller on the portable OpenMP CPU path unless they opt in.
     std::string backend;
 };
@@ -95,7 +95,7 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
                   const std::function<void(int, int)>& on_progress = {},
                   const std::function<bool()>& should_cancel = {});
 
-// True when this build was compiled with AICAD_WITH_CUDA and a CUDA device is present.
+// True when this build was compiled with CHUDWARE_WITH_CUDA and a CUDA device is present.
 bool lbm_cuda_available();
 
-}  // namespace aicad::sim
+}  // namespace chudware::sim

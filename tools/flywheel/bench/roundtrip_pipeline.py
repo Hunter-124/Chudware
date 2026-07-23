@@ -29,7 +29,7 @@ from typing import Any, Callable
 
 
 def _repo_root() -> Path:
-    env = os.environ.get("AI_CAD_REPO") or os.environ.get("AICAD_ROOT")
+    env = os.environ.get("CHUDWARE_REPO") or os.environ.get("CHUDWARE_ROOT")
     if env:
         return Path(env).expanduser().resolve()
     return Path(__file__).resolve().parents[3]
@@ -324,7 +324,7 @@ def stage_reveng_session(st: Stage, state: dict) -> None:
     # Isolate sessions under work_dir.
     re_root = Path(state["work_dir"]) / "reveng"
     re_root.mkdir(parents=True, exist_ok=True)
-    os.environ["AICAD_REVENG_DIR"] = str(re_root)
+    os.environ["CHUDWARE_REVENG_DIR"] = str(re_root)
 
     try:
         mcp = FastMCP("roundtrip")
@@ -465,7 +465,7 @@ def stage_store_result(st: Stage, state: dict) -> None:
         return
 
     # Inject a placeholder mesh so attach has something to register when build skipped.
-    re_root = Path(os.environ.get("AICAD_REVENG_DIR", state["work_dir"]))
+    re_root = Path(os.environ.get("CHUDWARE_REVENG_DIR", state["work_dir"]))
     sess_dir = re_root / str(sid)
     sess_json = sess_dir / "session.json"
     if sess_json.is_file():

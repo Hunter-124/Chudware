@@ -6,7 +6,7 @@ results:
 
 - the **Python oracle** — `engine.doc.sketch_solver.solve_sketch(sketch, env)`
 - the **C++ port** — `core/build/bin/Release/sketch_cli.exe` (calls
-  `aicad::sketch::solve_sketch`)
+  `chudware::sketch::solve_sketch`)
 
 A fixture **passes** when the two engines agree on `converged`, `dof`, the
 per-entity `statuses`, the `redundant` / `conflicting` constraint sets, and every
@@ -86,5 +86,5 @@ matches `expect` too (coordinates are not checked against `expect`, only
 See `tools/solver_diff.py` (run from the repo root). Quick version:
 
 ```powershell
-& "$env:APPDATA\AI-CAD\runtime\venv\Scripts\python.exe" tools/solver_diff.py
+& "$env:APPDATA\Chudware\runtime\venv\Scripts\python.exe" tools/solver_diff.py
 ```

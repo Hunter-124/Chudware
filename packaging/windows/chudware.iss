@@ -5,15 +5,15 @@
 ; (Start Menu entry, Programs-and-Features uninstall entry, a single .exe to hand a user).
 ;
 ; Build (on a Windows host with Inno Setup 6 installed — ISCC.exe on PATH):
-;   1. python -m installer.build_release --zip          (produces dist\AI-CAD\...)
-;   2. ISCC packaging\windows\chudware.iss /DPayloadDir=dist\AI-CAD /DAppVersion=1.0.0
+;   1. python -m installer.build_release --zip          (produces dist\Chudware\...)
+;   2. ISCC packaging\windows\chudware.iss /DPayloadDir=dist\Chudware /DAppVersion=1.0.0
 ;
 ; See docs/PACKAGING_WINDOWS.md for the full walkthrough (this repo's Linux box cannot run
 ; Inno Setup or produce a real Windows chudware.exe, so this script is documented, not verified,
 ; here — see that doc for exactly what to check on a Windows host).
 
 #ifndef PayloadDir
-  #define PayloadDir "..\..\dist\AI-CAD"
+  #define PayloadDir "..\..\dist\Chudware"
 #endif
 #ifndef AppVersion
   #define AppVersion "0.0.0-dev"
@@ -36,9 +36,9 @@ ArchitecturesInstallIn64BitMode=x64compatible
 ; real external release; a bare-bones installer is fine for internal dogfooding builds).
 WizardStyle=modern
 ; Ask Windows Restart Manager to close apps holding files under {app} (chudware.exe and any
-; aicad-hostd.exe daemon) before install/uninstall. Belt-and-braces with install.ps1's own
+; chudware-hostd.exe daemon) before install/uninstall. Belt-and-braces with install.ps1's own
 ; targeted daemon --stop step; the daemon is also staged/replaced by the payload copy below
-; (the [Files] {#PayloadDir}\* glob picks up aicad-hostd.exe/.pdb automatically once
+; (the [Files] {#PayloadDir}\* glob picks up chudware-hostd.exe/.pdb automatically once
 ; build_release.py stages them — no extra [Files] entry needed).
 CloseApplications=yes
 RestartApplications=no

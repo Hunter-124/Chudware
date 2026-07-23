@@ -2,10 +2,10 @@
 //
 // Proves the whole off-screen pipeline WITHOUT a display or GL: create a
 // windowless CEF browser, navigate, capture OnPaint's BGRA buffer, write a PNG.
-// Exposed as `AI-CAD --cef-shot <url> <out.png>` and used to verify CEF actually
+// Exposed as `Chudware --cef-shot <url> <out.png>` and used to verify CEF actually
 // renders real pages before wiring it into the interactive panel.
 //
-// Compiled only with AI_CAD_ENABLE_CEF.
+// Compiled only with CHUDWARE_ENABLE_CEF.
 #include "cef_osr_shot.h"
 
 #include <chrono>
@@ -28,7 +28,7 @@
 #include "include/cef_version.h"   // CHROME_VERSION_* for Sec-CH-UA alignment
 #include <cstdio>
 
-#include "stb_image_write.h"  // implementation lives in stb_impl.cpp (linked into AI-CAD)
+#include "stb_image_write.h"  // implementation lives in stb_impl.cpp (linked into Chudware)
 
 #include "cef_app.h"
 #include "cef_stealth.h"
@@ -63,11 +63,11 @@ public:
     CefRefPtr<CefResourceRequestHandler> GetResourceRequestHandler(
         CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>, CefRefPtr<CefRequest>,
         bool, bool, const CefString&, bool&) override {
-        // DIAGNOSTIC A/B: AI_CAD_CEF_NO_RRH=1 returns nullptr so the request
+        // DIAGNOSTIC A/B: CHUDWARE_CEF_NO_RRH=1 returns nullptr so the request
         // takes the default network-service path with NO app resource handler.
         // Isolates whether returning a passive handler is what breaks challenge
         // (Turnstile/reCAPTCHA) sub-resources with ERR_INVALID_ARGUMENT.
-        if (const char* v = std::getenv("AI_CAD_CEF_NO_RRH"); v && v[0] == '1')
+        if (const char* v = std::getenv("CHUDWARE_CEF_NO_RRH"); v && v[0] == '1')
             return nullptr;
         return this;
     }
@@ -76,7 +76,7 @@ public:
     ReturnValue OnBeforeResourceLoad(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>,
                                      CefRefPtr<CefRequest> request,
                                      CefRefPtr<CefCallback>) override {
-        if (const char* v = std::getenv("AI_CAD_CEF_SHOT_CONSOLE"); v && v[0] == '1' && request) {
+        if (const char* v = std::getenv("CHUDWARE_CEF_SHOT_CONSOLE"); v && v[0] == '1' && request) {
             const std::string u = request->GetURL().ToString();
             if (u.find("turnstile") != std::string::npos ||
                 u.find("challenge-platform") != std::string::npos) {
@@ -95,7 +95,7 @@ public:
     void OnResourceRedirect(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>,
                             CefRefPtr<CefRequest> request, CefRefPtr<CefResponse> response,
                             CefString& new_url) override {
-        if (const char* v = std::getenv("AI_CAD_CEF_SHOT_CONSOLE"); v && v[0] == '1' && request) {
+        if (const char* v = std::getenv("CHUDWARE_CEF_SHOT_CONSOLE"); v && v[0] == '1' && request) {
             const std::string u = request->GetURL().ToString();
             if (u.find("turnstile") != std::string::npos)
                 std::fprintf(stderr, "[cef-redir] %d %s -> %s\n",
@@ -109,7 +109,7 @@ public:
                                 CefRefPtr<CefRequest> request,
                                 CefRefPtr<CefResponse> response,
                                 URLRequestStatus status, int64_t) override {
-        if (const char* v = std::getenv("AI_CAD_CEF_SHOT_CONSOLE"); !(v && v[0] == '1')) return;
+        if (const char* v = std::getenv("CHUDWARE_CEF_SHOT_CONSOLE"); !(v && v[0] == '1')) return;
         const std::string u = request ? request->GetURL().ToString() : "?";
         const int http = response ? response->GetStatus() : -1;
         const bool interesting = u.find("cloudflare") != std::string::npos ||
@@ -123,13 +123,13 @@ public:
                          (int)status, http, err, u.c_str());
     }
 
-    // Console capture — AI_CAD_CEF_SHOT_CONSOLE=1 dumps page console to stderr so
+    // Console capture — CHUDWARE_CEF_SHOT_CONSOLE=1 dumps page console to stderr so
     // a --cef-shot of a challenge page reveals why a widget (e.g. Cloudflare
     // Turnstile) fails to initialise in the CEF single-process/OSR runtime.
     bool OnConsoleMessage(CefRefPtr<CefBrowser>, cef_log_severity_t level,
                           const CefString& message, const CefString& source,
                           int line) override {
-        if (const char* v = std::getenv("AI_CAD_CEF_SHOT_CONSOLE"); v && v[0] == '1')
+        if (const char* v = std::getenv("CHUDWARE_CEF_SHOT_CONSOLE"); v && v[0] == '1')
             std::fprintf(stderr, "[cef-console] sev=%d %s (%s:%d)\n", (int)level,
                          message.ToString().c_str(), source.ToString().c_str(), line);
         return false;
@@ -171,13 +171,13 @@ private:
     IMPLEMENT_REFCOUNTING(ShotClient);
 };
 
-// AI_CAD_CEF_SHOT_EXTPUMP=1 drives the loop through the INTERACTIVE pump path
+// CHUDWARE_CEF_SHOT_EXTPUMP=1 drives the loop through the INTERACTIVE pump path
 // (cef::pump_if_due, fed by the live-browser counter) instead of a raw
 // CefDoMessageLoopWork, so this tool can verify the same pump the vendor panel
 // uses actually renders a page headlessly.
 bool ext_pump() {
     static const bool on = [] {
-        const char* v = std::getenv("AI_CAD_CEF_SHOT_EXTPUMP");
+        const char* v = std::getenv("CHUDWARE_CEF_SHOT_EXTPUMP");
         return v && v[0] == '1';
     }();
     return on;
@@ -220,8 +220,8 @@ bool render_url_to_png(const std::string& url, int w, int h, const std::string& 
     pump(300);  // let late paints (fonts/images) land
     // Challenge pages (Cloudflare Turnstile etc.) run JS/worker challenges for
     // several seconds after load; give them time so the console + final PNG show
-    // the settled widget state. AI_CAD_CEF_SHOT_SETTLE_MS overrides.
-    if (const char* s = std::getenv("AI_CAD_CEF_SHOT_SETTLE_MS")) {
+    // the settled widget state. CHUDWARE_CEF_SHOT_SETTLE_MS overrides.
+    if (const char* s = std::getenv("CHUDWARE_CEF_SHOT_SETTLE_MS")) {
         int ms = std::atoi(s);
         while (ms > 0) { const int chunk = ms > 500 ? 500 : ms; pump(chunk); ms -= chunk; }
         if (client->browser()) client->browser()->GetHost()->Invalidate(PET_VIEW);

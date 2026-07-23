@@ -15,7 +15,7 @@
 #include "agent/providers.h"  // is_omp_bridge_provider() (S-CORE: bridge-routed provider ids)
 #include "agent/state.h"  // kContextTokenCap (the lean input-cap ceiling for big windows)
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 
 const char* kDefaultLocalModel = "gemma-4-e4b";
@@ -101,7 +101,7 @@ std::vector<std::string> all_subscription_access_tokens(const json& cfg, const c
 }  // namespace
 
 // load_config — mirror agent/config.py load_config(): read paths_config()
-// (%APPDATA%/AI-CAD/config.json) and parse it. Returns {} on a missing file or any
+// (%APPDATA%/Chudware/config.json) and parse it. Returns {} on a missing file or any
 // parse error (matching the Python try/except that swallows failures).
 json load_config() {
     std::error_code ec;
@@ -259,10 +259,10 @@ bool provider_offline_safe(const json& provider) {
 json resolve_provider(const std::optional<std::string>& name_arg, json cfg,
                       const json& env) {
     bool offline = offline_enabled(cfg);
-    // name = (name_arg or env AI_CAD_PROVIDER or cfg.provider or "").lower()
+    // name = (name_arg or env CHUDWARE_PROVIDER or cfg.provider or "").lower()
     std::optional<std::string> name_opt = name_arg;
     if (!name_opt || name_opt->empty()) {
-        auto ev = env_get(env, "AI_CAD_PROVIDER");
+        auto ev = env_get(env, "CHUDWARE_PROVIDER");
         if (ev && !ev->empty()) name_opt = ev;
     }
     if (!name_opt || name_opt->empty()) {
@@ -965,4 +965,4 @@ std::string eng_firm_discipline_key(Discipline d) {
 }
 
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware

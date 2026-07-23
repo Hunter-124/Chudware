@@ -32,7 +32,7 @@ def make_box_doc():
 
 
 def main():
-    tmp = tempfile.mkdtemp(prefix="aicad_repro_")
+    tmp = tempfile.mkdtemp(prefix="chudware_repro_")
 
     # ---------- .step+ case ----------
     print("=== .step+ case ===")

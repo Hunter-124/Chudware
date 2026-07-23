@@ -12,7 +12,7 @@
 
 #include "piping/pyutil.h"
 
-namespace aicad::hydraulic {
+namespace chudware::hydraulic {
 
 // Methods: hydraulic_new, hydraulic_add_component, hydraulic_add_hose,
 // hydraulic_size_cylinder, hydraulic_size_pump, hydraulic_size_accumulator,
@@ -21,4 +21,4 @@ namespace aicad::hydraulic {
 // hydraulic_verify_fea.
 bool call(const std::string& method, const pyutil::ojson& params, pyutil::ojson& result);
 
-}  // namespace aicad::hydraulic
+}  // namespace chudware::hydraulic

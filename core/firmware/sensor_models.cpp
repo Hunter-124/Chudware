@@ -6,7 +6,7 @@
 #include <map>
 #include <stdexcept>
 
-namespace aicad::firmware {
+namespace chudware::firmware {
 namespace {
 
 // MPU6050 registers.
@@ -541,4 +541,4 @@ nlohmann::json pitot_series(const std::vector<TrajectorySample>& samples,
     return out;
 }
 
-}  // namespace aicad::firmware
+}  // namespace chudware::firmware

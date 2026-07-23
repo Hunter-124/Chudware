@@ -1,9 +1,9 @@
-# Building AI-CAD on Windows
+# Building Chudware on Windows
 
 Status: the **C++ core (with and without the OCCT geometry kernel)** and the **Python runtime +
 test suite** are verified on Windows 11 (MSVC 14.44 / VS 2022 Build Tools, CMake 4.3, Ninja 1.13,
-Python 3.12). The GUI on both Linux and Windows is the **`host/` tree** (binary `Billet`,
-`AI-CAD` compat symlink) — the interim `ui/imgui` shell is retired and deleted. Re-verifying the
+Python 3.12). The GUI on both Linux and Windows is the **`host/` tree** (binary `Chudware`,
+`Chudware` compat symlink) — the interim `ui/imgui` shell is retired and deleted. Re-verifying the
 restored `host/` build under MSVC is an open item (see `docs/plans/GUI_OVERHAUL_SPEC.md`).
 
 ## 0. One-time checkout fix — symlinks
@@ -108,8 +108,8 @@ correctness proof on Windows is `ctest` on the `windows-core` / `windows-occt` c
 
 ## GUI app (`host/`) — Windows build
 
-The single cross-platform GUI is `host/` (target `Billet.exe`, `AI-CAD` compat name). It builds
-from its own CMakeLists with the MSVC toolchain after the core (`libaicad.dll` from the
+The single cross-platform GUI is `host/` (target `Chudware.exe`, `Chudware` compat name). It builds
+from its own CMakeLists with the MSVC toolchain after the core (`libchudware.dll` from the
 `windows-occt` preset). **Windows re-verification of the restored `host/` build is an open item**
 (`docs/plans/GUI_OVERHAUL_SPEC.md`) — the notes below record the `ui/imgui`-era bring-up seams,
 which largely carry over to `host/`'s CMake (same `/FI fix_math.h` shim, same engine-resolution
@@ -118,12 +118,12 @@ fallback):
 - **`/FI fix_math.h` quoting (fatal C1083).** Under the **Ninja + MSVC** generator a repo path
   containing a space leaks literal quote chars into the force-include filename. Fix: drop the
   inner quotes (`/FI${path}`) so Ninja quotes the whole `/FI<path>` token, which `cl` unwraps.
-- **Engine resolution.** `AICAD_DEFAULT_LIBAICAD` is the runtime fallback when
-  `AI_CAD_LIBAICAD` is unset and no `libaicad.dll` sits next to the exe; it must point at the
-  Ninja preset output `build/windows-occt/bin/libaicad.dll`. `cpp_core`'s `SetDllDirectoryW` then
+- **Engine resolution.** `CHUDWARE_DEFAULT_LIBCHUDWARE` is the runtime fallback when
+  `CHUDWARE_LIBCHUDWARE` is unset and no `libchudware.dll` sits next to the exe; it must point at the
+  Ninja preset output `build/windows-occt/bin/libchudware.dll`. `cpp_core`'s `SetDllDirectoryW` then
   puts that directory on the process search path so the ~100 sibling OCCT/Netgen `TK*.dll`
   **transitive** deps also load — no manual DLL staging needed. To use a different build, set
-  `AI_CAD_LIBAICAD=<absolute path to libaicad.dll>`.
+  `CHUDWARE_LIBCHUDWARE=<absolute path to libchudware.dll>`.
 - **glad** lives at `extern/glad` (`GLAD_DIR`).
 
 `freecad_parity` (windows-occt 48/49) remains the one pre-existing MSVC-vs-GCC solver-convergence

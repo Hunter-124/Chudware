@@ -7,13 +7,13 @@
 //      models:{name:{type,...}}, params:{TEMP:27,...}}
 // matching the Python oracle's output byte-for-byte (modulo JSON key order +
 // float formatting), so the result can feed the already-ported C++ simulator
-// (aicad::sim::spice_simulate).
+// (chudware::sim::spice_simulate).
 #pragma once
 
 #include <nlohmann/json.hpp>
 #include <string>
 
-namespace aicad::sim {
+namespace chudware::sim {
 
 // Parse a full SPICE deck into the Circuit dict (study is discarded, matching
 // spice.parse_spice). Built-in subckts (OPAMP, NE555) are always available and
@@ -41,4 +41,4 @@ nlohmann::json parse_netlist(const std::string& text);
 nlohmann::json netlist_to_spice_circuit(const nlohmann::json& netlist,
                                         const nlohmann::json& sim_params);
 
-}  // namespace aicad::sim
+}  // namespace chudware::sim

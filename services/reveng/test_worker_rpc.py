@@ -17,7 +17,7 @@ from services.reveng import worker_rpc as reveng_rpc
 def reveng_dir(tmp_path, monkeypatch):
     d = tmp_path / "reveng"
     d.mkdir()
-    monkeypatch.setenv("AICAD_REVENG_DIR", str(d))
+    monkeypatch.setenv("CHUDWARE_REVENG_DIR", str(d))
     return d
 
 

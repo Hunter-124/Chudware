@@ -8,7 +8,7 @@
 #include <cstring>
 #endif
 
-namespace billet {
+namespace chudware {
 
 #ifdef __EMSCRIPTEN__
 
@@ -49,4 +49,4 @@ std::vector<uint8_t> webFetch(const std::string& url, std::string& err) {
 
 #endif
 
-}  // namespace billet
+}  // namespace chudware

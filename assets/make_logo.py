@@ -1,4 +1,4 @@
-"""Generate the Billet brand assets (logo tile, wordmark, window icon, doc icons) with Pillow.
+"""Generate the Chudware brand assets (logo tile, wordmark, window icon, doc icons) with Pillow.
 
 Run with the runtime venv python:
     python assets/make_logo.py

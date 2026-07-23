@@ -1,9 +1,9 @@
 """Phase-3 hostd doc-registry tests: attach modes, edit-holds, overlap CAS,
 event bus, _foreign_edits piggyback, daemon-side autosave + recovery.
 
-Each test uses a scratch AICAD_INSTANCE_KEY (its own daemon, its own
+Each test uses a scratch CHUDWARE_INSTANCE_KEY (its own daemon, its own
 hostd_autosave/<key> dir) so a live dev/installed daemon is never touched.
-Skips when no aicad-hostd binary is built (mirrors test_daemon_bridge.py).
+Skips when no chudware-hostd binary is built (mirrors test_daemon_bridge.py).
 """
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from mcp_server.daemon_bridge import DaemonClient
 
 HOSTD = daemon_bridge.resolve_hostd_bin()
 
-pytestmark = pytest.mark.skipif(HOSTD is None, reason="aicad-hostd not built")
+pytestmark = pytest.mark.skipif(HOSTD is None, reason="chudware-hostd not built")
 
 # A minimal valid mutating op (verified against the engine's add_feature schema).
 BOX_OPS = [{"op": "add_feature",
@@ -47,11 +47,11 @@ def _box_ops(name: str) -> list:
 def scratch_daemon(monkeypatch):
     """Fresh instance key + fast linger/hold/autosave; kills the daemon on teardown."""
     key = "pytest-reg-" + uuid.uuid4().hex[:8]
-    monkeypatch.setenv("AICAD_INSTANCE_KEY", key)
-    monkeypatch.setenv("AICAD_HOSTD_LINGER_SECS", "3")
-    monkeypatch.setenv("AICAD_HOSTD_HOLD_SECS", "1")
-    monkeypatch.setenv("AI_CAD_AUTOSAVE_INTERVAL_S", "1")
-    monkeypatch.delenv("AICAD_HOSTD_SOCKET", raising=False)
+    monkeypatch.setenv("CHUDWARE_INSTANCE_KEY", key)
+    monkeypatch.setenv("CHUDWARE_HOSTD_LINGER_SECS", "3")
+    monkeypatch.setenv("CHUDWARE_HOSTD_HOLD_SECS", "1")
+    monkeypatch.setenv("CHUDWARE_AUTOSAVE_INTERVAL_S", "1")
+    monkeypatch.delenv("CHUDWARE_HOSTD_SOCKET", raising=False)
     pids: list = []
     yield pids
     for pid in pids:
@@ -158,7 +158,7 @@ def test_edit_hold_blocks_then_expires(scratch_daemon):
     assert r.get("code") == "busy_preview"
     assert r.get("retry_ms") == 500
 
-    # AICAD_HOSTD_HOLD_SECS=1: the hold expires and the accept-loop tick emits
+    # CHUDWARE_HOSTD_HOLD_SECS=1: the hold expires and the accept-loop tick emits
     # doc.lease_change; B's mutation then proceeds.
     time.sleep(1.8)
     lease = _events(b, "doc.lease_change")
@@ -304,10 +304,10 @@ def test_gc_retires_only_undelivered_docs(scratch_daemon, monkeypatch, tmp_path)
     when an abandoned doc is GC'd, one SAVED to a real user file closes clean (NO recovery
     entry -> the user is never nagged about already-delivered AI work), while an unsaved doc
     IS retired to the orphan tier (recoverable). Discriminates ship from regression."""
-    monkeypatch.setenv("AICAD_DOC_GC_GRACE_S", "1")  # reap abandoned docs fast
+    monkeypatch.setenv("CHUDWARE_DOC_GC_GRACE_S", "1")  # reap abandoned docs fast
     # mcp-origin docs use the longer agent grace; pin it short so this test still
     # exercises GC retirement within a few seconds.
-    monkeypatch.setenv("AICAD_DOC_GC_AGENT_GRACE_S", "1")
+    monkeypatch.setenv("CHUDWARE_DOC_GC_AGENT_GRACE_S", "1")
     keep = DaemonClient()
     keep.connect()  # stays connected so the daemon doesn't linger-exit mid-test
     scratch_daemon.append(_pid(keep))
@@ -359,7 +359,7 @@ def test_foreign_edits_piggyback(scratch_daemon):
 def test_foreign_edits_surface_in_tool_note(scratch_daemon, monkeypatch):
     """core_bridge strips _foreign_edits into a buffer; cad_tools._dumps appends
     the human-readable note."""
-    monkeypatch.setenv("AI_CAD_ENGINE_DAEMON", "1")
+    monkeypatch.setenv("CHUDWARE_ENGINE_DAEMON", "1")
     monkeypatch.setattr(daemon_bridge, "_client", None)
     from mcp_server import cad_tools, core_bridge
 
@@ -391,7 +391,7 @@ def test_crash_recovery_prompts_via_orphan_tier(scratch_daemon):
     pid = _pid(a)
     doc = a.call("doc_new", {"name": "recover-me"})["doc_id"]
     a.call("doc_apply_ops", {"doc_id": doc, "ops": BOX_OPS})
-    time.sleep(2.5)  # AI_CAD_AUTOSAVE_INTERVAL_S=1 -> at least one tick saved it
+    time.sleep(2.5)  # CHUDWARE_AUTOSAVE_INTERVAL_S=1 -> at least one tick saved it
 
     os.kill(pid, signal.SIGKILL)  # hard crash: no final save, autosave is all we have
     time.sleep(0.3)
@@ -435,7 +435,7 @@ def test_recover_autosaved_uses_daemon_remap(scratch_daemon, monkeypatch):
     """After a crash, cad_tools.recover_autosaved (daemon mode) restores the
     survivor from the orphan tier (recovery_open) and aliases the agent's old
     handle to the freshly-minted id."""
-    monkeypatch.setenv("AI_CAD_ENGINE_DAEMON", "1")
+    monkeypatch.setenv("CHUDWARE_ENGINE_DAEMON", "1")
     monkeypatch.setattr(daemon_bridge, "_client", None)
     from mcp_server import cad_tools, core_bridge
 
@@ -523,7 +523,7 @@ def test_doc_close_kills_autosave_artifact(scratch_daemon):
     scratch_daemon.append(pid)
     doc = a.call("doc_new", {"name": "closed-for-good"})["doc_id"]
     a.call("doc_apply_ops", {"doc_id": doc, "ops": BOX_OPS})
-    time.sleep(2.5)  # AI_CAD_AUTOSAVE_INTERVAL_S=1 -> the autosave file exists
+    time.sleep(2.5)  # CHUDWARE_AUTOSAVE_INTERVAL_S=1 -> the autosave file exists
     assert a.call("doc_close", {"doc_id": doc}).get("_is_error") is None
 
     os.kill(pid, signal.SIGKILL)  # crash AFTER the close
@@ -550,8 +550,8 @@ def test_doc_gc_retires_abandoned_docs(scratch_daemon, monkeypatch):
     is RETIRED to the recovery tier after the GC grace, then closed to free memory
     — the work stays recoverable. (A clean app quit sends doc_discard first, so
     only crash-abandoned docs reach this path.)"""
-    monkeypatch.setenv("AICAD_DOC_GC_GRACE_S", "1")
-    monkeypatch.setenv("AICAD_DOC_GC_AGENT_GRACE_S", "1")
+    monkeypatch.setenv("CHUDWARE_DOC_GC_GRACE_S", "1")
+    monkeypatch.setenv("CHUDWARE_DOC_GC_AGENT_GRACE_S", "1")
     a, b = DaemonClient(), DaemonClient()
     a.connect()
     pid = _pid(a)
@@ -584,8 +584,8 @@ def test_doc_discard_then_gc_leaves_no_recovery(scratch_daemon, monkeypatch):
     """The clean-exit path: a client that doc_discards its doc before leaving must
     NOT leave a recovery entry — that is what keeps a normal app quit from flooding
     the recovery prompt (contrast the crash path above)."""
-    monkeypatch.setenv("AICAD_DOC_GC_GRACE_S", "1")
-    monkeypatch.setenv("AICAD_DOC_GC_AGENT_GRACE_S", "1")
+    monkeypatch.setenv("CHUDWARE_DOC_GC_GRACE_S", "1")
+    monkeypatch.setenv("CHUDWARE_DOC_GC_AGENT_GRACE_S", "1")
     a, b = DaemonClient(), DaemonClient()
     a.connect()
     scratch_daemon.append(_pid(a))
@@ -636,8 +636,8 @@ def test_doc_discard_keeps_doc_with_other_holder(scratch_daemon):
 def test_attached_doc_survives_gc(scratch_daemon, monkeypatch):
     """A doc still attached by ANY client (e.g. a GUI mirror tab) is never GC'd
     when another client disconnects."""
-    monkeypatch.setenv("AICAD_DOC_GC_GRACE_S", "1")
-    monkeypatch.setenv("AICAD_DOC_GC_AGENT_GRACE_S", "1")
+    monkeypatch.setenv("CHUDWARE_DOC_GC_GRACE_S", "1")
+    monkeypatch.setenv("CHUDWARE_DOC_GC_AGENT_GRACE_S", "1")
     a, b = DaemonClient(), DaemonClient()
     a.connect()
     scratch_daemon.append(_pid(a))
@@ -652,11 +652,11 @@ def test_attached_doc_survives_gc(scratch_daemon, monkeypatch):
 
 
 def test_agent_origin_survives_base_gc_grace(scratch_daemon, monkeypatch):
-    """H3: mcp/agent-origin docs use AICAD_DOC_GC_AGENT_GRACE_S (default 30 min),
+    """H3: mcp/agent-origin docs use CHUDWARE_DOC_GC_AGENT_GRACE_S (default 30 min),
     not the 90 s base grace. A disconnecting MCP client must leave its part
     listed past the short base window so the GUI can still open it."""
-    monkeypatch.setenv("AICAD_DOC_GC_GRACE_S", "1")
-    monkeypatch.setenv("AICAD_DOC_GC_AGENT_GRACE_S", "8")  # > base, still test-fast
+    monkeypatch.setenv("CHUDWARE_DOC_GC_GRACE_S", "1")
+    monkeypatch.setenv("CHUDWARE_DOC_GC_AGENT_GRACE_S", "8")  # > base, still test-fast
     keep = DaemonClient()
     keep.connect()
     scratch_daemon.append(_pid(keep))
@@ -682,28 +682,28 @@ def test_agent_origin_survives_base_gc_grace(scratch_daemon, monkeypatch):
 
 
 def test_no_python_autosave_timer_in_daemon_mode(scratch_daemon, monkeypatch):
-    monkeypatch.setenv("AI_CAD_ENGINE_DAEMON", "1")
+    monkeypatch.setenv("CHUDWARE_ENGINE_DAEMON", "1")
     from mcp_server import cad_tools
 
     cad_tools.start_periodic_autosave()
     time.sleep(0.1)
     names = [t.name for t in threading.enumerate()]
-    assert "aicad-autosave" not in names, names
+    assert "chudware-autosave" not in names, names
     assert cad_tools._PERIODIC_TIMER[0] is None
 
 
 def test_instance_key_parity_with_cpp(tmp_path, monkeypatch):
-    """The default (no AICAD_INSTANCE_KEY) rendezvous: Python must hash the hostd
+    """The default (no CHUDWARE_INSTANCE_KEY) rendezvous: Python must hash the hostd
     path to the SAME instance key the C++ daemon computes for itself, or the MCP
     and the GUI split into two engines and live doc mirroring silently dies.
-    Every other test here pins AICAD_INSTANCE_KEY, which is exactly how the
+    Every other test here pins CHUDWARE_INSTANCE_KEY, which is exactly how the
     truncated-vs-textbook FNV basis mismatch stayed invisible. Isolated from any
     live daemon via a scratch XDG_RUNTIME_DIR (both sides derive the socket dir
     from it), so the path-derived key lands on a fresh socket."""
-    monkeypatch.delenv("AICAD_INSTANCE_KEY", raising=False)
-    monkeypatch.delenv("AICAD_HOSTD_SOCKET", raising=False)
+    monkeypatch.delenv("CHUDWARE_INSTANCE_KEY", raising=False)
+    monkeypatch.delenv("CHUDWARE_HOSTD_SOCKET", raising=False)
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
-    monkeypatch.setenv("AICAD_HOSTD_LINGER_SECS", "3")
+    monkeypatch.setenv("CHUDWARE_HOSTD_LINGER_SECS", "3")
     c = DaemonClient()
     try:
         c.connect()  # spawns hostd; connect only succeeds if the keys agree

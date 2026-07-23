@@ -43,7 +43,7 @@ model. It is unmeasurable offline (needs a served, SFT'd model). Exact spec for 
 
 1. **Provision + SFT** a candidate (out-of-band, never CI):
    `python -c "from tools.translator.candidates import provision_instructions as p; print(p('all'))"`
-   then run `tools/translator/recipes/sft_qlora.yaml` with `AICAD_ALLOW_TRANSLATOR_TRAINING=1`.
+   then run `tools/translator/recipes/sft_qlora.yaml` with `CHUDWARE_ALLOW_TRANSLATOR_TRAINING=1`.
 2. **Fidelity gate first** (must pass before the kill-switch even runs):
    `python -m tools.translator.candidate_eval` against a served endpoint → require
    fidelity ≥ 0.995, coverage ≥ 0.98, unsupported < 0.001 on held-out **structures**, and

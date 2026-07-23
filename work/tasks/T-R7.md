@@ -19,13 +19,13 @@ folder/USB, or any git remote the user controls (bare repo over SSH, Gitea,
 GitHub…) = self-hosting for free. Team v1 is deliberately merge-free: advisory
 edit locks + one-button Sync; a genuine collision preserves the loser's work as
 copy-as-new-item ("Bracket (Sarah's edits)") — never a merge UI, never data loss.
-The AI-CAD Cloud hosted remote is a RESERVED config kind only (Pillar-12 human
+The Chudware Cloud hosted remote is a RESERVED config kind only (Pillar-12 human
 gate before any server work).
 
 ## Files / areas touched
 
 - services/plm/remote.py — NEW: remote profiles per contracts/plm.md
-  (folder/ssh/https kinds; `aicad-cloud` kind parses but refuses activation with
+  (folder/ssh/https kinds; `chudware-cloud` kind parses but refuses activation with
   a "not yet available" message), sync = fetch + fast-forward or
   collision-detect + push
 - services/plm/locks.py — NEW: advisory lock manifest at the remote, atomic-push
@@ -48,7 +48,7 @@ gate before any server work).
 - [ ] Forced collision (both edit same item while offline) → loser preserved as
       copy-as-new-item with provenance; NO merge prompt, NO lost state; test
       proves both end states restorable
-- [ ] aicad-cloud remote kind: config parses, activation politely refused
+- [ ] chudware-cloud remote kind: config parses, activation politely refused
       (seam verified, nothing built — Pillar-12 gate note in code comment)
 - [ ] Sync failure modes are plain-language (no git stderr leaks to UI)
 - [ ] Tests incl. CAS lock races + offline queue; gate + graphify update .

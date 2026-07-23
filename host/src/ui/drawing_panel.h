@@ -1,4 +1,4 @@
-// AI-CAD Drawing panel — 2D sheet renderer for the DRAWINGS module.
+// Chudware Drawing panel — 2D sheet renderer for the DRAWINGS module.
 //
 // When the active document tab is a Drawing (AppState::DocTab kind == Drawing), the central area
 // hosts this 2D sheet renderer instead of the 3D viewport. It draws the sheet border (from the

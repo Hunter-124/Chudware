@@ -17,7 +17,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad::firmware {
+namespace chudware::firmware {
 
 // Normalized rail dicts for a footprint: every rail carries all keys
 // (name, voltage_v_min, voltage_v_nom, voltage_v_max, current_a_active,
@@ -25,4 +25,4 @@ namespace aicad::firmware {
 // nor the embedded library table provides rails.
 std::vector<nlohmann::json> eng_supply_rails(const nlohmann::json& fp);
 
-}  // namespace aicad::firmware
+}  // namespace chudware::firmware

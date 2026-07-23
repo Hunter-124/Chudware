@@ -1,4 +1,4 @@
-// Unit tests for the high-cycle fatigue study (aicad::sim::fea_run_fatigue).
+// Unit tests for the high-cycle fatigue study (chudware::sim::fea_run_fatigue).
 //
 // OCCT/oracle-free: an inline-meshed unit cube (6 tets) fixed at z=0 and pulled in
 // +z gives a finite stress field; we assert the fatigue solver runs and returns the
@@ -13,7 +13,7 @@
 #include "sim/fea_fatigue.h"
 
 using nlohmann::json;
-using aicad::sim::fea_run_fatigue;
+using chudware::sim::fea_run_fatigue;
 
 namespace {
 

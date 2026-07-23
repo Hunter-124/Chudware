@@ -34,7 +34,7 @@ from typing import Any, Callable
 
 
 def _repo_root() -> Path:
-    env = os.environ.get("AI_CAD_REPO") or os.environ.get("AICAD_ROOT")
+    env = os.environ.get("CHUDWARE_REPO") or os.environ.get("CHUDWARE_ROOT")
     if env:
         return Path(env).expanduser().resolve()
     # tools/flywheel/bench/categories.py → repo root (parents[3])
@@ -634,7 +634,7 @@ def _parse_pytest_output(text: str) -> dict[str, int]:
 
 def run_modeling(repo: Path, out_dir: Path, logf, *, mode: str = "smoke") -> dict:
     env = os.environ.copy()
-    env.setdefault("AI_CAD_REPO", str(repo))
+    env.setdefault("CHUDWARE_REPO", str(repo))
     env.setdefault("PYTHONUNBUFFERED", "1")
     py = sys.executable or "python3"
     steps: list[dict] = []
@@ -680,9 +680,9 @@ def run_modeling(repo: Path, out_dir: Path, logf, *, mode: str = "smoke") -> dic
 
 def run_ecad(repo: Path, out_dir: Path, logf) -> dict:
     env = os.environ.copy()
-    env.setdefault("AI_CAD_REPO", str(repo))
+    env.setdefault("CHUDWARE_REPO", str(repo))
     env.setdefault("PYTHONUNBUFFERED", "1")
-    env.setdefault("AI_CAD_ENGINE_DAEMON", "0")
+    env.setdefault("CHUDWARE_ENGINE_DAEMON", "0")
     py = sys.executable or "python3"
     scripts = [
         ("flight_computer", repo / "scripts" / "bench_flight_computer.py"),
@@ -721,9 +721,9 @@ def run_ecad(repo: Path, out_dir: Path, logf) -> dict:
 
 def run_simulation(repo: Path, out_dir: Path, logf) -> dict:
     env = os.environ.copy()
-    env.setdefault("AI_CAD_REPO", str(repo))
+    env.setdefault("CHUDWARE_REPO", str(repo))
     env.setdefault("PYTHONUNBUFFERED", "1")
-    env.setdefault("AI_CAD_ENGINE_DAEMON", "0")
+    env.setdefault("CHUDWARE_ENGINE_DAEMON", "0")
     py = sys.executable or "python3"
     steps: list[dict] = []
 
@@ -780,7 +780,7 @@ def _run_pytest_bundle(
     targets: list[str],
 ) -> dict:
     env = os.environ.copy()
-    env.setdefault("AI_CAD_REPO", str(repo))
+    env.setdefault("CHUDWARE_REPO", str(repo))
     env.setdefault("PYTHONUNBUFFERED", "1")
     # Capture pytest output to a side file for count parsing.
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -890,7 +890,7 @@ def run_parts_research(repo: Path, out_dir: Path, logf) -> dict:
 
 def run_roundtrip(repo: Path, out_dir: Path, logf) -> dict:
     env = os.environ.copy()
-    env.setdefault("AI_CAD_REPO", str(repo))
+    env.setdefault("CHUDWARE_REPO", str(repo))
     env.setdefault("PYTHONUNBUFFERED", "1")
     py = sys.executable or "python3"
     script = repo / "tools" / "flywheel" / "bench" / "roundtrip_pipeline.py"

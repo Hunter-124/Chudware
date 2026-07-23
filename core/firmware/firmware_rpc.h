@@ -1,5 +1,5 @@
-// Firmware RPC dispatch (T-RF15) — the single entry the libaicad integrator
-// wires into core/api/libaicad.cpp. Mirrors the frozen surface of
+// Firmware RPC dispatch (T-RF15) — the single entry the libchudware integrator
+// wires into core/api/libchudware.cpp. Mirrors the frozen surface of
 // contracts/firmware_rpc.md §5/§8 as implemented by
 // engine_oracle/firmware/mcp_tools.py + worker_rpc.py: dict in → dict out,
 // expected failures come back INSIDE the result as the {code, message, detail}
@@ -21,7 +21,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad::firmware {
+namespace chudware::firmware {
 
 // Dispatch one fw_* method. Returns false when `method` is not a ported
 // firmware method (caller falls through to the next dispatch layer / the
@@ -32,4 +32,4 @@ namespace aicad::firmware {
 bool call(const std::string& method, const nlohmann::json& params, nlohmann::json& result,
           std::string& err);
 
-}  // namespace aicad::firmware
+}  // namespace chudware::firmware

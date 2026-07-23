@@ -27,7 +27,7 @@ effective lattice Re of O(100) and Cd comes out an order of magnitude above
 textbook values. These tests therefore anchor the kernel in the low-Re regime
 it can actually resolve and treat high-Re Cd as regression-only.
 
-Run: AI_CAD_ENGINE_DAEMON=0 .venv-mcp/bin/python -X utf8 -m pytest \
+Run: CHUDWARE_ENGINE_DAEMON=0 .venv-mcp/bin/python -X utf8 -m pytest \
          services/mcp/test_cfd_lbm_live.py -v
 """
 from __future__ import annotations
@@ -38,7 +38,7 @@ import sys
 
 import pytest
 
-os.environ.setdefault("AI_CAD_ENGINE_DAEMON", "0")
+os.environ.setdefault("CHUDWARE_ENGINE_DAEMON", "0")
 _ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)

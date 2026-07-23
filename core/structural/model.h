@@ -13,7 +13,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad::structural {
+namespace chudware::structural {
 
 // ---------------------------------------------------------------- elements
 
@@ -84,4 +84,4 @@ struct LoadCombo {
 // std::out_of_range on an unknown name (mirrors load_cases.get_combo).
 LoadCombo get_combo(const std::string& name);
 
-}  // namespace aicad::structural
+}  // namespace chudware::structural

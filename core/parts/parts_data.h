@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-namespace aicad {
+namespace chudware {
 namespace parts {
 namespace data {
 
@@ -47,4 +47,4 @@ const BearingRow* find_bearing(const std::string& size);
 
 }  // namespace data
 }  // namespace parts
-}  // namespace aicad
+}  // namespace chudware

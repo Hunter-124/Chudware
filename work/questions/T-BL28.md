@@ -40,7 +40,7 @@ DoD item 3 reads: "drive each form to a successful surface, screenshot light+dar
 every PNG." Under A the forms are unchanged, so the *only* thing a screenshot proves is that
 the (already-correct) form renders — the behavioural change is entirely engine-side.
 
-There is **no existing `AI_CAD_SHOT` scenario that scripts a viewport edge-pick → OK →
+There is **no existing `CHUDWARE_SHOT` scenario that scripts a viewport edge-pick → OK →
 built surface**; the scenarios (`scenarios.h`) are programmatic step-machines, so authoring
 one for all three forms (ruled/fill/boundary) is real host-side work.
 

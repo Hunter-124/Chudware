@@ -27,7 +27,7 @@ ALREADY DONE — its status log records every wave committed (0d717a1a, ba9b1f77
 ## Scope
 
 Audit GUI_OVERHAUL_SPEC.md `[~]` items: fix what is still open (small GUI fixes,
-screenshot-verified with AI_CAD_SHOT), close what is already done with a note. Append the
+screenshot-verified with CHUDWARE_SHOT), close what is already done with a note. Append the
 feature_params.md defaults note (integrator-owned contract). Ensure the
 doc_import_feature_tree gap is captured for T-RF19's evaluation (do not build it here).
 

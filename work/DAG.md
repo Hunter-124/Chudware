@@ -121,7 +121,7 @@ graph TD
   end
   subgraph WS_G["workstream G"]
     T_G1["T-G1: Land the uncommitted GUI working tree in scoped commits"]:::done
-    T_G10["T-G10: ShopCraft rename tiers 2+3 - build targets, env vars, MCP id, appdata"]:::done
+    T_G10["T-G10: Chudware rename tiers 2+3 - build targets, env vars, MCP id, appdata"]:::done
     T_G11["T-G11: Windows build verify, then delete host/ and all deprecated GUI code — CLOSED AS REVERSED"]:::done
     T_G12["T-G12: Human UI walkthrough - recursive element-by-element feedback loop until converged"]:::doing
     T_G13["T-G13: Fix issue 7 (scenario deadlock) - ScenarioRunner step-machine scenarios deadlock offscreen"]:::done
@@ -138,7 +138,7 @@ graph TD
     T_G23["T-G23: imgui chrome parity - port host's pinned glass FM column + SW-style ribbon into ui/imgui, delete docked layout"]:::done
     T_G24["T-G24: GUI dead-weight cleanup + guardrails - delete stale app/, host reference-only policy, headless shot hardening"]:::done
     T_G25["T-G25: Re-port host polish into imgui chrome - icon atlases, copilot tab cleanup, FM restyle, dark-mode fixes"]:::done
-    T_G3["T-G3: ShopCraft rename tier 1 - user-visible branding strings"]:::done
+    T_G3["T-G3: Chudware rename tier 1 - user-visible branding strings"]:::done
     T_G4["T-G4: GUI dead-code and cleanliness pass on host/"]:::done
     T_G5["T-G5: GUI migration wave 1 - foundation libs (F1-F4 + G1 gate)"]:::done
     T_G6["T-G6: GUI migration wave 2 - shell chrome (S1-S6, H5 start, G2 gate)"]:::done
@@ -239,7 +239,7 @@ graph TD
     T_RF19["T-RF19: RF stream-Z long-tail oracle modules cutover (node R4e)"]:::todo
     T_RF2["T-RF2: RF wave-0 dead-code purge — services/worker dupes + orphaned ui/viewport (node R0b)"]:::todo
     T_RF20["T-RF20: RF stream-Z MCP + DAG thin-client flip — no engine imports in Python (node R4f)"]:::todo
-    T_RF21["T-RF21: RF closeout — remove AI_CAD_CPP_* fallback flags, delete engine_oracle (node R5a)"]:::todo
+    T_RF21["T-RF21: RF closeout — remove CHUDWARE_CPP_* fallback flags, delete engine_oracle (node R5a)"]:::todo
     T_RF22["T-RF22: RF closeout — final docs, contract index, cross-platform build check (node R5b)"]:::todo
     T_RF3["T-RF3: RF wave-0 gate hardening — WASM smoke + web parity probe + check.py fatal (node R0c)"]:::todo
     T_RF4["T-RF4: RF wave-1 subscription auth/token-refresh ported to core/agent C++ (node R1a)"]:::todo
@@ -270,7 +270,7 @@ graph TD
     T_U9["T-U9: Gallery panel + first-run sample wiring"]:::done
   end
   subgraph WS_V["workstream V"]
-    T_INF1["T-INF1: Fix gate pytest stage (issue 6) - wire mcp-venv + AI_CAD_LIBAICAD into scripts/gate.sh"]:::done
+    T_INF1["T-INF1: Fix gate pytest stage (issue 6) - wire mcp-venv + CHUDWARE_LIBCHUDWARE into scripts/gate.sh"]:::done
     T_INF2["T-INF2: Retire the last pre-existing gate reds (check.py audits) - full-green gate"]:::done
     T_V1["T-V1: Simulation-backend correctness audit - real/validated/stub/broken verdict per solver"]:::done
     T_V2["T-V2: MCP runtime reality audit - dead tools, undeclared deps, missing binaries"]:::done

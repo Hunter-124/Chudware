@@ -1,4 +1,4 @@
-# billet-web allowlist — email must match Access/JWT (prod) or X-Dev-User (dev).
+# chudware-web allowlist — email must match Access/JWT (prod) or X-Dev-User (dev).
 # role: admin | user;  heavy: true = GPU seat when available (≤ max_heavy).
 #
 # After editing, push the same list into the Cloudflare Access policy:

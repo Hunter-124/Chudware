@@ -590,7 +590,7 @@ def _plan_text_archive(text: str, edge_chars: int = TEXT_EDGE_CHARS) -> dict[str
 # (real reuse of OMP's snapcompact engine over vendor/omp/bridge — see
 # OMP_INTEGRATION_PLAN.md §RPC CONTRACT, docs/omp-integration/01-DECISIONS.md
 # §Compaction) instead of the pure-Python path below. Off by default (unchanged
-# behavior); opt in with env AI_CAD_COMPACTION_BACKEND=omp or config.json
+# behavior); opt in with env CHUDWARE_COMPACTION_BACKEND=omp or config.json
 # agent.compaction_backend="omp" (legacy nested agent.compaction.backend still
 # honored). Any bridge failure (bun/script missing, crash, timeout, RPC error)
 # raises omp_bridge.BridgeUnavailable, caught here to fall back to the pure-Python
@@ -606,7 +606,7 @@ def _compaction_backend(cfg: dict | None = None) -> str:
 
     Precedence ENV > config.json > default (omp port) — resolution lives in
     services.agent.config.compaction_backend (returns "builtin"/"omp"; "builtin"
-    maps to this module's "local"); AI_CAD_COMPACTION_BACKEND still wins, and
+    maps to this module's "local"); CHUDWARE_COMPACTION_BACKEND still wins, and
     config.json ``agent.compaction_backend`` is honored when the env is unset.
     """
     try:
@@ -800,7 +800,7 @@ def snapcompact_archive(
     No LLM call. PNG frames are intentionally omitted (future/vision phase).
     Never cuts mid tool-result. Cumulative fold of ``prior_archive["text"]``.
 
-    Hybrid backend: when gated on (env AI_CAD_COMPACTION_BACKEND=omp /
+    Hybrid backend: when gated on (env CHUDWARE_COMPACTION_BACKEND=omp /
     agent.compaction_backend="omp" in config.json), routes through the OMP
     bridge's ``compact`` RPC (vendor/omp/bridge) instead of the pure-Python
     path below, falling back here whenever the bridge is unavailable. Same

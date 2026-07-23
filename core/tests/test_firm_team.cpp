@@ -6,7 +6,7 @@
 
 #include "agent/firm_team.h"
 
-using namespace aicad::agent;
+using namespace chudware::agent;
 
 static bool hasFirm(const std::vector<TeamMember>& t, const std::string& id) {
     return std::any_of(t.begin(), t.end(), [&](const TeamMember& m) { return m.firm_id == id; });

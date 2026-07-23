@@ -20,7 +20,7 @@
 #include <TopoDS_Vertex.hxx>
 #include <gp_Pnt.hxx>
 
-namespace aicad::sim {
+namespace chudware::sim {
 
 namespace {
 
@@ -158,7 +158,7 @@ MeshOut mesh_box_hex(const std::string& step_path, const MeshOptions& options) {
 
 MeshOut mesh_box_hex(const TopoDS_Shape& shape, const MeshOptions& options) {
     // Per-phase record (prof/phases.h): "detect" (classification) + "generate" (grid).
-    aicad::prof::phases::StudyScope _study("mesh_hex");
+    chudware::prof::phases::StudyScope _study("mesh_hex");
     MeshOut out;
     out.nodes_per_elem = 8;
     if (shape.IsNull()) {
@@ -170,7 +170,7 @@ MeshOut mesh_box_hex(const TopoDS_Shape& shape, const MeshOptions& options) {
     // not a mappable axis-aligned box, surface its error (the caller — mesh_step — falls back
     // to tet meshing when options.fallback_to_tet is set).
     const BoxGeomInfo info = [&] {
-        aicad::prof::phases::PhaseScope _p("detect");
+        chudware::prof::phases::PhaseScope _p("detect");
         return detect_box_geometry(shape);
     }();
     if (!info.is_box) {
@@ -178,7 +178,7 @@ MeshOut mesh_box_hex(const TopoDS_Shape& shape, const MeshOptions& options) {
         return out;
     }
     const double Lx = info.Lx, Ly = info.Ly, Lz = info.Lz;
-    aicad::prof::phases::PhaseScope _p_generate("generate");
+    chudware::prof::phases::PhaseScope _p_generate("generate");
 
     // World-space bbox MIN corner for grid placement: the mesh must sit at the CAD part's
     // actual position so FEA fixtures/loads resolve by node coordinate (BoxGeomInfo carries
@@ -258,4 +258,4 @@ MeshOut mesh_box_hex(const TopoDS_Shape& shape, const MeshOptions& options) {
     return out;
 }
 
-}  // namespace aicad::sim
+}  // namespace chudware::sim

@@ -7,7 +7,7 @@ Consumes a :class:`~tools.flywheel.bench.gym.runner.CycleResult` and produces:
     (never a prompt-wording change; those are lead-owned and filed as work notes).
 
 Dial knobs the recommender may touch (all config/data, per the discipline rule):
-  * ``AI_CAD_COUNCIL_FEATURE_THRESHOLD`` env / councils._DEFAULT_FEATURE_THRESHOLD
+  * ``CHUDWARE_COUNCIL_FEATURE_THRESHOLD`` env / councils._DEFAULT_FEATURE_THRESHOLD
   * tiers.yaml per-slot ``budgets`` (advisory/ledger/state), ``deliberation``,
     ``playbook_enforcement``, ``max_tools_per_role``
   * trigger-pack enablement (foreman advisory injection)
@@ -34,7 +34,7 @@ CLASS_TO_DIAL: dict[str, dict[str, str]] = {
                   "blocking-ambiguity check is enforced before Phase 2 (config, not prose)",
     },
     "incoherent_geometry": {
-        "knob": "AI_CAD_COUNCIL_FEATURE_THRESHOLD",
+        "knob": "CHUDWARE_COUNCIL_FEATURE_THRESHOLD",
         "action": "lower the build-strategy-council feature threshold so more parts get "
                   "the four-seat review before build (more machinery for weaker models)",
     },

@@ -1,5 +1,5 @@
-// Optional Linux system-tray status for aicad-hostd (libappindicator3).
-// No-ops on Windows, when AICAD_HOSTD_HAS_TRAY is off, AICAD_HOSTD_TRAY=0,
+// Optional Linux system-tray status for chudware-hostd (libappindicator3).
+// No-ops on Windows, when CHUDWARE_HOSTD_HAS_TRAY is off, CHUDWARE_HOSTD_TRAY=0,
 // or DISPLAY is missing.
 #pragma once
 

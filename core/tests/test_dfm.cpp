@@ -3,7 +3,7 @@
 // ambiguity-gate rules, the fit math) plus a GOLDEN parity replay of
 // tests/data/dfm.json (generated from the live oracle by
 // core/tests/data/gen_r4e6_fixtures.py). The material-density defaults read the
-// source-tree registry.json (AICAD_TEST_REGISTRY), same as the oracle.
+// source-tree registry.json (CHUDWARE_TEST_REGISTRY), same as the oracle.
 #define DOCTEST_CONFIG_IMPLEMENT
 #include <doctest/doctest.h>
 
@@ -12,14 +12,14 @@
 
 #include "dfm/process_profiles.h"
 
-using namespace aicad::dfm;
+using namespace chudware::dfm;
 using nlohmann::json;
 
 int main(int argc, char** argv) {
 #ifdef _WIN32
-    _putenv_s("AICAD_MATERIALS_REGISTRY", AICAD_TEST_REGISTRY);
+    _putenv_s("CHUDWARE_MATERIALS_REGISTRY", CHUDWARE_TEST_REGISTRY);
 #else
-    setenv("AICAD_MATERIALS_REGISTRY", AICAD_TEST_REGISTRY, 1);
+    setenv("CHUDWARE_MATERIALS_REGISTRY", CHUDWARE_TEST_REGISTRY, 1);
 #endif
     doctest::Context ctx(argc, argv);
     return ctx.run();
@@ -132,8 +132,8 @@ TEST_CASE("dispatch: ownership + envelope") {
 }
 
 TEST_CASE("golden parity: every oracle fixture deep-equals (tests/data/dfm.json)") {
-    std::ifstream f(std::string(AICAD_TEST_DATA_DIR) + "/dfm.json");
-    REQUIRE_MESSAGE(f.good(), "dfm.json golden not found at AICAD_TEST_DATA_DIR");
+    std::ifstream f(std::string(CHUDWARE_TEST_DATA_DIR) + "/dfm.json");
+    REQUIRE_MESSAGE(f.good(), "dfm.json golden not found at CHUDWARE_TEST_DATA_DIR");
     const json cases = json::parse(f);
     for (const json& c : cases) {
         CAPTURE(c["name"]);

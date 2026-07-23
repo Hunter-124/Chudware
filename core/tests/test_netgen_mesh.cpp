@@ -26,7 +26,7 @@
 #include <TopoDS_Shape.hxx>
 #include <gp_Pnt.hxx>
 
-using namespace aicad::sim;
+using namespace chudware::sim;
 using nlohmann::json;
 
 namespace {
@@ -35,7 +35,7 @@ constexpr double L = 100.0, W = 10.0, H = 10.0;
 
 std::string write_beam_step() {
     TopoDS_Shape box = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), L, W, H).Shape();
-    auto p = std::filesystem::temp_directory_path() / "aicad_netgen_beam.step";
+    auto p = std::filesystem::temp_directory_path() / "chudware_netgen_beam.step";
     STEPControl_Writer wr;
     REQUIRE(wr.Transfer(box, STEPControl_AsIs) == IFSelect_RetDone);
     REQUIRE(wr.Write(p.string().c_str()) == IFSelect_RetDone);

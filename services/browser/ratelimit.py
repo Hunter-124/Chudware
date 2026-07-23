@@ -32,7 +32,7 @@ serialises every persistent-context open for a site — so this module does not
 re-implement it.
 
 All knobs read conservative defaults that can be raised or lowered via env vars
-(``AI_CAD_BROWSER_*``); nothing here ever raises — ceiling/cooldown states are
+(``CHUDWARE_BROWSER_*``); nothing here ever raises — ceiling/cooldown states are
 reported back as data for the caller to degrade on.
 """
 from __future__ import annotations
@@ -61,13 +61,13 @@ def _env_int(name: str, default: int) -> int:
 
 
 #: Default minimum seconds between two fetches of the same site.
-DEFAULT_MIN_INTERVAL_S = _env_float("AI_CAD_BROWSER_MIN_INTERVAL_S", 3.0)
+DEFAULT_MIN_INTERVAL_S = _env_float("CHUDWARE_BROWSER_MIN_INTERVAL_S", 3.0)
 #: Exponential-backoff base (first 429/403 cooldown) and ceiling.
-BACKOFF_BASE_S = _env_float("AI_CAD_BROWSER_BACKOFF_BASE_S", 30.0)
-BACKOFF_MAX_S = _env_float("AI_CAD_BROWSER_BACKOFF_MAX_S", 900.0)
+BACKOFF_BASE_S = _env_float("CHUDWARE_BROWSER_BACKOFF_BASE_S", 30.0)
+BACKOFF_MAX_S = _env_float("CHUDWARE_BROWSER_BACKOFF_MAX_S", 900.0)
 #: Runaway-guard ceilings: max fetches per site and per whole process, per run.
-MAX_REQ_PER_SITE = _env_int("AI_CAD_BROWSER_MAX_REQ_PER_SITE", 120)
-MAX_REQ_PER_PROCESS = _env_int("AI_CAD_BROWSER_MAX_REQ_PER_PROCESS", 600)
+MAX_REQ_PER_SITE = _env_int("CHUDWARE_BROWSER_MAX_REQ_PER_SITE", 120)
+MAX_REQ_PER_PROCESS = _env_int("CHUDWARE_BROWSER_MAX_REQ_PER_PROCESS", 600)
 #: How long a fetched robots.txt crawl-delay is cached before we re-read it.
 _ROBOTS_TTL_S = 24 * 3600.0
 #: HTTP statuses that mean "the site is asking us to slow down / backing us off".
@@ -128,7 +128,7 @@ def _fetch_robots_crawl_delay(host: str) -> float | None:
     try:
         req = urllib.request.Request(
             f"https://{host}/robots.txt",
-            headers={"User-Agent": "Mozilla/5.0 (AI-CAD parts browser)"})
+            headers={"User-Agent": "Mozilla/5.0 (Chudware parts browser)"})
         with urllib.request.urlopen(req, timeout=5.0) as resp:  # noqa: S310 — https host only
             text = resp.read(65536).decode("utf-8", "replace")
     except Exception:  # noqa: BLE001 — no robots / network error → no published delay

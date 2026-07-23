@@ -14,9 +14,9 @@
 // Bound: CAM 50 snapshots, ECAD 100 snapshots (mirrors in-memory limits).
 // Location: NEXT TO the .step+ / .ecad+ container, NOT inside the ZIP.
 // The exporter (T-H5) reads these journals to build correction traces.
-namespace aicad {
+namespace chudware {
 namespace agent {
 constexpr int kCamJournalLimit  = 50;
 constexpr int kEcadJournalLimit = 100;
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware

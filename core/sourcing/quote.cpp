@@ -16,7 +16,7 @@
 #include <map>
 #include <random>
 
-namespace aicad {
+namespace chudware {
 namespace sourcing {
 
 namespace {
@@ -338,7 +338,7 @@ json request_quote(const std::string& part_file, const std::string& vendor, int 
             return degraded(
                 "xometry",
                 "Xometry API key not configured (no quote_providers.xometry.api_key and no "
-                "XOMETRY_API_KEY). AI-CAD does not scrape; an approved instant-quote API key "
+                "XOMETRY_API_KEY). Chudware does not scrape; an approved instant-quote API key "
                 "is required to quote out.",
                 "add 'quote_providers.xometry.api_key' to " + config_path() +
                     " (or set XOMETRY_API_KEY) then retry request_quote.");
@@ -424,4 +424,4 @@ json request_quote(const std::string& part_file, const std::string& vendor, int 
 }
 
 }  // namespace sourcing
-}  // namespace aicad
+}  // namespace chudware

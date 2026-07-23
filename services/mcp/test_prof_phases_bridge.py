@@ -3,7 +3,7 @@
 Drives the REAL engine in-process on the raw core bridge (no MCP server), the same
 bootstrap as test_fea_live_bridge.py: probe candidate .so paths in a fresh subprocess
 each (core_bridge binds one .so per process) and run against the first that exposes
-BOTH prof_phases (core built with prof/phases.cpp) and sim_run_static (AICAD_WITH_NETGEN).
+BOTH prof_phases (core built with prof/phases.cpp) and sim_run_static (CHUDWARE_WITH_NETGEN).
 It skips honestly, with the probed reasons, when no candidate has the phase timers —
 e.g. before the core rebuild that ships them.
 
@@ -14,11 +14,11 @@ Asserts, after one small box-cantilever sim_run_static + sim_run_modal:
   * a mesh_tet study exists with load_step/generate/extract;
   * a fea_modal study exists with mesh+solve;
   * re-running the same study records NO new mesh_tet study (warm content cache —
-    guards the mesh_step_cached overlay fix in core/api/libaicad.cpp);
+    guards the mesh_step_cached overlay fix in core/api/libchudware.cpp);
   * prof_report carries the additive "phases" key (shape extension, never a break);
   * prof_status carries the additive "phase_studies" counter.
 
-Run directly:  AI_CAD_LIBAICAD=core/build-prof/bin/libaicad.so \
+Run directly:  CHUDWARE_LIBCHUDWARE=core/build-prof/bin/libchudware.so \
                python -m pytest services/mcp/test_prof_phases_bridge.py -v
 """
 from __future__ import annotations
@@ -44,7 +44,7 @@ def _driver() -> None:
     from services.mcp import core_bridge as cb  # never bare `import core_bridge`
     from services.mcp.core_bridge import CoreError
 
-    so_path = os.environ.get("AI_CAD_LIBAICAD", "<default resolution>")
+    so_path = os.environ.get("CHUDWARE_LIBCHUDWARE", "<default resolution>")
     for method, params in (("prof_phases", {}), ("sim_run_static", {"study": {}})):
         try:
             cb.call(method, params)
@@ -133,12 +133,12 @@ def _so_candidates() -> list:
     except (OSError, subprocess.SubprocessError):
         pass
     out = []
-    env = os.environ.get("AI_CAD_LIBAICAD")
+    env = os.environ.get("CHUDWARE_LIBCHUDWARE")
     if env and Path(env).exists():
         out.append(Path(env))
     for root in roots:
-        for rel in ("core/build-prof/bin/libaicad.so",
-                    "core/build-occt-linux/bin/libaicad.so"):
+        for rel in ("core/build-prof/bin/libchudware.so",
+                    "core/build-occt-linux/bin/libchudware.so"):
             p = root / rel
             if p.exists() and p not in out:
                 out.append(p)
@@ -147,9 +147,9 @@ def _so_candidates() -> list:
 
 def _run_driver(so: Path | None) -> dict:
     env = dict(os.environ)
-    env["AI_CAD_ENGINE_DAEMON"] = "0"
+    env["CHUDWARE_ENGINE_DAEMON"] = "0"
     if so is not None:
-        env["AI_CAD_LIBAICAD"] = str(so)
+        env["CHUDWARE_LIBCHUDWARE"] = str(so)
     proc = subprocess.run(
         [sys.executable, "-X", "utf8", __file__, "--driver"],
         capture_output=True, text=True, timeout=600, env=env, cwd=str(_repo_root()),
@@ -174,7 +174,7 @@ def _find(report: dict, domain: str) -> dict | None:
 def test_prof_phases_live() -> None:
     candidates = _so_candidates()
     if not candidates:
-        pytest.skip("no libaicad.so candidate found (no OCCT build in this checkout)")
+        pytest.skip("no libchudware.so candidate found (no OCCT build in this checkout)")
     reasons = []
     result = None
     for so in candidates:

@@ -1,7 +1,7 @@
 // webcam_capture.h — live webcam preview + shutter widget (RE-19)
 // Draws an ImGui child panel with:
 //   • Live preview via CameraBackend (V4L2 on Linux, MF stub on Windows; synthetic
-//     test pattern when no device / open fails so AI_CAD_SHOT=reveng_capture stays green).
+//     test pattern when no device / open fails so CHUDWARE_SHOT=reveng_capture stays green).
 //   • Coverage overlay: OpenScan-style 11-shot dome ring drawn with ImDrawList.
 //     Captured positions = green, pending = white, blurred/uncertain = amber.
 //   • Shutter button: writes JPEG to the session dir and fires async reveng_add_images.

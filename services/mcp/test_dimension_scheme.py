@@ -15,11 +15,11 @@ import types
 import unittest
 
 # ---------------------------------------------------------------------------
-# Stubs so imports succeed without libaicad.so or live MCP server
+# Stubs so imports succeed without libchudware.so or live MCP server
 # ---------------------------------------------------------------------------
 
 def _install_stubs():
-    """Install lightweight stubs so dimension_scheme_tools + deps import without libaicad.so.
+    """Install lightweight stubs so dimension_scheme_tools + deps import without libchudware.so.
 
     Returns a `restore()` callable. The stubs are needed ONLY at import time (every test
     here exercises pure offline logic — no bridge call at run time), so the module wraps

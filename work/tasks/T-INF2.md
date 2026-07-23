@@ -77,7 +77,7 @@ docs/SW_PARITY_SPEC.md` and there is no migration. Restoring is the least-surpri
 (e.g. `compile_assembly`, `compile_sm_base_flange`, `compile_weld_member`) from a
 planned-but-never-built Python feature-compiler architecture (`engine/doc/features/*.py`
 with `@register()` decorators). That directory has never existed; the engine is C++
-(libaicad.so). The `harvest_compilers()` function harvested 0 compilers, which made the
+(libchudware.so). The `harvest_compilers()` function harvested 0 compilers, which made the
 drift check classify every `compile_*` reference as a broken pointer.
 
 Fix: updated 12 evidence cells to cite the actual verifiable artifacts that DO exist:

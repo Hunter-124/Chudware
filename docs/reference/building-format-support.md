@@ -43,7 +43,7 @@ in this repo that check is `contracts/licenses.md`, not this file.
 
 - **Fully open.** Use **IfcOpenShell** (LGPL) or implement from **ISO 16739** +
   buildingSMART's public EXPRESS schema. No proprietary dependency at all. Not on
-  this repo's current interop surface (ShopCraft is mechanical CAD, not BIM), but
+  this repo's current interop surface (Chudware is mechanical CAD, not BIM), but
   IfcOpenShell already appears in `contracts/licenses.md` for a different purpose
   (BOLTS/clean-room posture reference) — worth checking that entry before adding
   IFC support so the license posture stays consistent.

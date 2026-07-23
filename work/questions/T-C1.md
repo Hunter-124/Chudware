@@ -8,7 +8,7 @@ The gate's `ui/imgui` stage fails to build with:
 
 ```
 ui/imgui/src/ui/property_manager.cpp:2265:45: error:
-  'const struct aicad::ui::PanelField' has no member named 'selMulti'
+  'const struct chudware::ui::PanelField' has no member named 'selMulti'
 ```
 
 `property_manager.cpp` references `def->selMulti` in **10** places (lines 846, 902, 1072,

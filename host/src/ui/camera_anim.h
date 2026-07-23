@@ -1,5 +1,5 @@
 #pragma once
-// AI-CAD camera animation (W2-D).
+// Chudware camera animation (W2-D).
 //
 // Smoothly tweens the orbit camera (yaw / pitch / zoom / pan) between view states so HUD presets,
 // the gesture wheel, Normal-To and zoom-to-fit ease into place instead of snapping. The tween's

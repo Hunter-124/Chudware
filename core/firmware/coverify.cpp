@@ -12,7 +12,7 @@
 #include "firmware/mcu_pinouts.h"
 #include "firmware/pinmap.h"
 
-namespace aicad::firmware {
+namespace chudware::firmware {
 namespace {
 
 // Ground-ish rail names — supply rails that need no decoupling check.
@@ -45,7 +45,7 @@ void sort_findings(nlohmann::json& findings) {
 const std::regex kPinRefRe(R"(\bPIN_([A-Za-z0-9_]+)\b)");
 const std::regex kWriteRe(
     R"(\b(?:HAL_GPIO_WritePin|HAL_GPIO_TogglePin|LL_GPIO_SetOutputPin|LL_GPIO_ResetOutputPin|)"
-    R"(gpio_set|gpio_clear|gpio_write|gpio_toggle|gpio_put|digitalWrite|AICAD_GPIO_TRACE)\b)");
+    R"(gpio_set|gpio_clear|gpio_write|gpio_toggle|gpio_put|digitalWrite|CHUDWARE_GPIO_TRACE)\b)");
 const std::regex kReadRe(
     R"(\b(?:HAL_GPIO_ReadPin|LL_GPIO_ReadInputPort|gpio_read|gpio_get|digitalRead)\b)");
 const std::regex kModeOutRe(
@@ -107,8 +107,8 @@ std::vector<std::string> external_strong_drivers(const nlohmann::json& sch,
                                                  const std::string& net,
                                                  const std::set<std::string>& mcu_refs) {
     std::vector<std::string> out;
-    if (!sch.is_object() || !aicad::ecad::schema::is_schematic(sch)) return out;
-    nlohmann::json nl = aicad::ecad::build_netlist(sch);
+    if (!sch.is_object() || !chudware::ecad::schema::is_schematic(sch)) return out;
+    nlohmann::json nl = chudware::ecad::build_netlist(sch);
     if (!nl.contains("nets") || !nl["nets"].is_object() || !nl["nets"].contains(net)) return out;
     std::map<std::string, std::string> sym_ref;
     if (sch.contains("symbols") && sch["symbols"].is_array()) {
@@ -464,4 +464,4 @@ nlohmann::json summarize(const nlohmann::json& findings) {
     };
 }
 
-}  // namespace aicad::firmware
+}  // namespace chudware::firmware

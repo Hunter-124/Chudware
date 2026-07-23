@@ -3,19 +3,19 @@
 
 #include <vector>
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 
 const char* kAskRole = "ask";
 const char* kAskSystem =
-    "You are the AI-CAD assistant in Ask mode. You answer QUESTIONS about the software, "
+    "You are the Chudware assistant in Ask mode. You answer QUESTIONS about the software, "
     "engineering practice, and the user's open parametric CAD parts. "
     "Be concise and concrete: quote the real feature names, ids and dimensions from the document "
     "context below your instructions (units are stated there; the default MMGS means millimeters, "
     "grams, seconds). You never modify the document in this mode — if the user asks for a change, "
     "briefly confirm what you would change and note that the assistant can apply it directly "
     "(the harness will auto-switch to build it). "
-    "If no document is open, answer as a general CAD / AI-CAD usage assistant.";
+    "If no document is open, answer as a general CAD / Chudware usage assistant.";
 
 namespace {
 
@@ -182,7 +182,7 @@ std::string ask_status_line(const ojson& feature_status) {
 std::string build_doc_context(const ojson& doc, const std::string& doc_id, long revision,
                               const ojson& feature_status) {
     if (doc.is_null() || !doc.is_object())
-        return "NO DOCUMENT IS OPEN. Answer as a general CAD / AI-CAD usage assistant "
+        return "NO DOCUMENT IS OPEN. Answer as a general CAD / Chudware usage assistant "
                "(suggest Design-new mode to start a part).";
     ojson feats = (doc.contains("features") && doc["features"].is_array()) ? doc["features"]
                                                                           : ojson::array();
@@ -225,4 +225,4 @@ std::string answer_question(const std::string& question, const ojson& doc,
 }
 
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware

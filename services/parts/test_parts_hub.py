@@ -10,7 +10,7 @@ Covers:
   - Index rebuild idempotency and p95 latency
 
 Run with:
-    ~/.local/share/AI-CAD/mcp-venv/bin/python -m pytest services/parts/ -q -k parts
+    ~/.local/share/Chudware/mcp-venv/bin/python -m pytest services/parts/ -q -k parts
 """
 from __future__ import annotations
 
@@ -353,8 +353,8 @@ class TestPartsHub:
         the slow site surfaces as a timeout notice."""
         import time as _time
 
-        monkeypatch.setenv("AI_CAD_PARTS_LIVE_BUDGET_S", "0.4")
-        monkeypatch.setenv("AI_CAD_PARTS_LIVE_SITE_BUDGET_S", "0.4")
+        monkeypatch.setenv("CHUDWARE_PARTS_LIVE_BUDGET_S", "0.4")
+        monkeypatch.setenv("CHUDWARE_PARTS_LIVE_SITE_BUDGET_S", "0.4")
 
         class _FastLive:
             domain = "catalog"

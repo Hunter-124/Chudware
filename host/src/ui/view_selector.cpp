@@ -1,4 +1,4 @@
-// AI-CAD View Selector — SolidWorks-style "glass box" (C25, wave W2-E).
+// Chudware View Selector — SolidWorks-style "glass box" (C25, wave W2-E).
 #include "view_selector.h"
 
 #include <algorithm>

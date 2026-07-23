@@ -35,7 +35,7 @@ All tiles share the fea_result_icons iso camera family (yaw 35 / pitch 26) and r
 module's proven helpers (_iso / _fit / _cmap / painter) by import -- no copy-paste.
 
 The overlay handoff changed: sim_run_* now returns overlay_aicm as a POSIX shared-memory
-URI ("aicm-shm:///aicad_overlay_N") mapping to /dev/shm/aicad_overlay_N, an 8-byte LE size
+URI ("aicm-shm:///chudware_overlay_N") mapping to /dev/shm/chudware_overlay_N, an 8-byte LE size
 header + AICM payload (core/util/aicm_handoff.cpp). _read_overlay() below resolves both a
 plain file path AND that shm URI, so this script works against the current engine (the
 older fea_result_icons.py assumed a file path and now trips on the shm handle).
@@ -119,8 +119,8 @@ def _read_overlay(handle: str) -> bytes:
 
     Handles two forms the engine emits:
       * a plain filesystem path (older engine / file fallback)
-      * "aicm-shm:///aicad_overlay_N" -> POSIX shm object /aicad_overlay_N, i.e.
-        /dev/shm/aicad_overlay_N, whose layout is an 8-byte little-endian size header
+      * "aicm-shm:///chudware_overlay_N" -> POSIX shm object /chudware_overlay_N, i.e.
+        /dev/shm/chudware_overlay_N, whose layout is an 8-byte little-endian size header
         followed by exactly that many AICM payload bytes (core/util/aicm_handoff.cpp
         publish_shm: memcpy(p, &sz, 8); memcpy(p+8, data, n)).
     """
@@ -128,7 +128,7 @@ def _read_overlay(handle: str) -> bytes:
         raise RuntimeError("empty overlay handle")
     prefix = "aicm-shm://"
     if handle.startswith(prefix):
-        name = handle[len(prefix):]          # "/aicad_overlay_0"
+        name = handle[len(prefix):]          # "/chudware_overlay_0"
         name = "/" + name.lstrip("/")        # normalize to a single leading slash
         shm_path = Path("/dev/shm") / name.lstrip("/")
         if not shm_path.exists():
@@ -612,9 +612,9 @@ def render_all() -> list[str]:
     fails: list[str] = []
     parsed = None  # static surface, reused by the setup glyphs
 
-    if not os.environ.get("AI_CAD_LIBAICAD"):
-        print("[sim_icons] FAILED: no FEA-capable libaicad.so "
-              "(need core/build-occt-linux/bin/libaicad.so with AICAD_WITH_NETGEN)")
+    if not os.environ.get("CHUDWARE_LIBCHUDWARE"):
+        print("[sim_icons] FAILED: no FEA-capable libchudware.so "
+              "(need core/build-occt-linux/bin/libchudware.so with CHUDWARE_WITH_NETGEN)")
         return []
 
     # --- static-backed families (proven on this box) ---

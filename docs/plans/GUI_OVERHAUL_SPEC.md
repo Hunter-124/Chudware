@@ -1,7 +1,7 @@
 # GUI Overhaul Requirement Register (Hunter, 2026-07-06)
 
 Canonical, durable register of every GUI requirement from the 2026-07-06 direction reset.
-The host/ GUI (`host/build-linux/bin/AI-CAD`) is THE product GUI; ui/imgui (AI-CAD2) is deleted
+The host/ GUI (`host/build-linux/bin/Chudware`) is THE product GUI; ui/imgui (AI-CAD2) is deleted
 (port ledger: `docs/PORT_LEDGER.md`). **Nothing on this list may be silently dropped** — items
 not implemented tonight stay checked-off here and on the work board until done.
 
@@ -21,7 +21,7 @@ Status legend: `[ ]` pending · `[~]` in progress (fleet wf_b556d138-1bf) · `[x
   title_bar.cpp:790-878; narrow windows compress left-aligned by design. Shot /tmp/r2a1-search.png.)
 - [x] Each tab replaces the viewport (and toolbar where sensible); views stay attached to the
   main window (no floating top-level windows for tabs).
-  (T-RF10 2026-07-22: AI_CAD_SHOT=workspaces 8 captures — scratch/workspace_shots/*.png — each
+  (T-RF10 2026-07-22: CHUDWARE_SHOT=workspaces 8 captures — scratch/workspace_shots/*.png — each
   workspace swaps the central body in-place; PLM/Parts Library/AI are full-page bodies.)
 - [x] Title-bar drag hit-testing stays correct on Windows AND Linux.
   (T-RF10 2026-07-22: Linux functionally verified under Xvfb+xdotool — empty caption drags the
@@ -104,7 +104,7 @@ Status legend: `[ ]` pending · `[~]` in progress (fleet wf_b556d138-1bf) · `[x
   Simulate entry and greys the set via setRibbonDisabledPrefix when missing
   (sim_manager.cpp:1075-1098); setup forms dispatch the real RPCs (openEmForm →
   em_eigenmode/em_driven/em_timedomain, sim_manager.cpp:1185-1212). EM tab confirmed present
-  in the Simulate ribbon tab row — /tmp/r2a2-em-simulate.png (AI_CAD_SHOT=simdisc_mech).
+  in the Simulate ribbon tab row — /tmp/r2a2-em-simulate.png (CHUDWARE_SHOT=simdisc_mech).
   Remaining dependency is engine-side, NOT GUI: a full-wave openEMS install for non-analytic
   solves (tracked under the sim DAG, T-SIM11; the GUI degrades honestly without it.)
 - [x] **Tool-invoked setup panels** (Hunter red-pen 2026-07-07): the numbered always-open
@@ -168,8 +168,8 @@ Status legend: `[ ]` pending · `[~]` in progress (fleet wf_b556d138-1bf) · `[x
   consumed by core/); no app/ dir; build.sh header documents the retirement.)
 - [x] `./build.sh app` builds host/; gate.sh builds + shot-smokes host/.
   (T-RF10 R2a 2026-07-22: build.sh build_app() = cmake -S host -B host/build-linux +
-  ninja Billet (build.sh:42-47); gate.sh stage 2b builds the host GUI and stage 5 runs the
-  AI_CAD_SHOT=m1 headless shot smoke (gate.sh:176-187 + stage-5 header).)
+  ninja Chudware (build.sh:42-47); gate.sh stage 2b builds the host GUI and stage 5 runs the
+  CHUDWARE_SHOT=m1 headless shot smoke (gate.sh:176-187 + stage-5 header).)
 - [x] host/ CMake points at shared `extern/glad` + top-level `assets/` (single icon atlas).
 - [x] Launcher/taskbar pin → host binary.
 - [ ] Windows build of restored host/ re-verified (MSVC preset; fix_math.h /FI shim).

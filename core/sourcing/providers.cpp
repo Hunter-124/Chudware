@@ -14,7 +14,7 @@
 #include <cstdlib>
 #include <map>
 
-namespace aicad {
+namespace chudware {
 namespace sourcing {
 
 namespace {
@@ -201,8 +201,8 @@ json nexar_fetch(const std::string& mpn, const Seams& seams) {
     if (client_id.empty() || client_secret.empty())
         throw ProviderError(
             "Nexar provider is not configured. Add 'parts_providers.nexar' with "
-            "'client_id' and 'client_secret' to %APPDATA%/AI-CAD/config.json (or set "
-            "NEXAR_CLIENT_ID / NEXAR_CLIENT_SECRET). AI-CAD does NOT scrape Octopart; it "
+            "'client_id' and 'client_secret' to %APPDATA%/Chudware/config.json (or set "
+            "NEXAR_CLIENT_ID / NEXAR_CLIENT_SECRET). Chudware does NOT scrape Octopart; it "
             "uses the approved Nexar GraphQL API with your own credentials. "
             "See docs/PARTS_LIBRARY.md.");
 
@@ -352,8 +352,8 @@ json digikey_fetch(const std::string& mpn, const Seams& seams) {
     if (client_id.empty() || client_secret.empty())
         throw ProviderError(
             "Digi-Key provider is not configured. Add 'parts_providers.digikey' with "
-            "'client_id' and 'client_secret' to %APPDATA%/AI-CAD/config.json (or set "
-            "DIGIKEY_CLIENT_ID / DIGIKEY_CLIENT_SECRET). AI-CAD does NOT scrape digikey.com; "
+            "'client_id' and 'client_secret' to %APPDATA%/Chudware/config.json (or set "
+            "DIGIKEY_CLIENT_ID / DIGIKEY_CLIENT_SECRET). Chudware does NOT scrape digikey.com; "
             "it uses the approved Product Information API v4. See docs/PARTS_LIBRARY.md.");
 
     const json tok = http_post_form("https://api.digikey.com/v1/oauth2/token",
@@ -471,7 +471,7 @@ json mouser_fetch(const std::string& mpn, const Seams& seams) {
     if (api_key.empty())
         throw ProviderError(
             "Mouser provider is not configured. Add 'parts_providers.mouser' with "
-            "'api_key' to %APPDATA%/AI-CAD/config.json (or set MOUSER_API_KEY). AI-CAD does "
+            "'api_key' to %APPDATA%/Chudware/config.json (or set MOUSER_API_KEY). Chudware does "
             "NOT scrape mouser.com; it uses the approved Search API v2. "
             "See docs/PARTS_LIBRARY.md.");
 
@@ -675,8 +675,8 @@ json provider_fetch(const std::string& supplier, const std::string& part_number,
             throw ProviderError(
                 "McMaster-Carr provider is not configured. McMaster requires an approved "
                 "Product Information API account with a client certificate and login "
-                "credentials. AI-CAD does NOT scrape mcmaster.com. To enable it, add a "
-                "'parts_providers.mcmaster' section to %APPDATA%/AI-CAD/config.json with "
+                "credentials. Chudware does NOT scrape mcmaster.com. To enable it, add a "
+                "'parts_providers.mcmaster' section to %APPDATA%/Chudware/config.json with "
                 "'enabled': true, 'api_url', 'username', 'password', and 'client_cert' "
                 "(see docs/PARTS_LIBRARY.md). Until then, download the CAD for '" + mpn +
                 "' from mcmaster.com and register it with vendor_part_register_local_cad.");
@@ -702,4 +702,4 @@ json provider_fetch(const std::string& supplier, const std::string& part_number,
 }
 
 }  // namespace sourcing
-}  // namespace aicad
+}  // namespace chudware

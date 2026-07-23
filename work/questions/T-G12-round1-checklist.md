@@ -1,4 +1,4 @@
-# AI-CAD UI Walkthrough Checklist — Round 1
+# Chudware UI Walkthrough Checklist — Round 1
 
 **Instructions for Erik:**
 1. Launch the app with the scenario shown in the *launch* column.
@@ -21,14 +21,14 @@ These four items were flagged by T-G2 as requiring a live interactive session.
 |----|------|----------|--------|---------------|-------|
 | `doc_tab_plus_x` | Doc Tabs | Doc-tab strip — '+' (new part) and 'x' (close tab) buttons | Live app — open a part, click '+' then 'x' on the tab | `[ ]` keep / `[ ]` fix / `[ ]` kill | **T-G2 NEEDS-LIVE #1**: code fix (NoBringToFrontOnFocus removed) in place; confirm click response |
 | `copilot_collapse_pill` | Copilot Panel | Copilot header chevron → collapse to pill → click pill to re-expand | Live app — Copilot panel visible, click chevron then pill | `[ ]` keep / `[ ]` fix / `[ ]` kill | **T-G2 NEEDS-LIVE #2**: collapse-to-pill round trip requires live click |
-| `viewport_toolbar_clamp` | Viewport Toolbar | Viewport toolbar left-edge clamp against FeatureManager column | AI_CAD_SHOT=sketch — open sketch, pan a large sketch; check toolbar doesn't overlap FM | `[ ]` keep / `[ ]` fix / `[ ]` kill | **T-G2 NEEDS-LIVE #3**: added in T-G1 polish; needs live sketch pan to confirm dodge |
-| `extrude_end_condition_dropdown` | PM Form — Extrude | Extrude PM → End Condition dropdown (Direction 1) | AI_CAD_SHOT=m1 (PM active after fillet edit) — or launch live and run Extrude | `[ ]` keep / `[ ]` fix / `[ ]` kill | **T-G2 NEEDS-LIVE #4**: FrameBg fix applied; confirm dropdown text readable over light/dark |
+| `viewport_toolbar_clamp` | Viewport Toolbar | Viewport toolbar left-edge clamp against FeatureManager column | CHUDWARE_SHOT=sketch — open sketch, pan a large sketch; check toolbar doesn't overlap FM | `[ ]` keep / `[ ]` fix / `[ ]` kill | **T-G2 NEEDS-LIVE #3**: added in T-G1 polish; needs live sketch pan to confirm dodge |
+| `extrude_end_condition_dropdown` | PM Form — Extrude | Extrude PM → End Condition dropdown (Direction 1) | CHUDWARE_SHOT=m1 (PM active after fillet edit) — or launch live and run Extrude | `[ ]` keep / `[ ]` fix / `[ ]` kill | **T-G2 NEEDS-LIVE #4**: FrameBg fix applied; confirm dropdown text readable over light/dark |
 
 ---
 
 ## Ribbon — Features Tab
 
-Launch: `AI_CAD_SHOT=m1  — box+fillet+shell, PM active after fillet edit`
+Launch: `CHUDWARE_SHOT=m1  — box+fillet+shell, PM active after fillet edit`
 
 | id | area | location | launch | keep/fix/kill | notes |
 |----|------|----------|--------|---------------|-------|
@@ -62,7 +62,7 @@ Launch: `AI_CAD_SHOT=m1  — box+fillet+shell, PM active after fillet edit`
 
 ## Ribbon — Sketch Tab
 
-Launch: `AI_CAD_SHOT=sketch — enter sketch, draw, add dim, exit to solid`
+Launch: `CHUDWARE_SHOT=sketch — enter sketch, draw, add dim, exit to solid`
 
 | id | area | location | launch | keep/fix/kill | notes |
 |----|------|----------|--------|---------------|-------|
@@ -118,7 +118,7 @@ Launch: `AI_CAD_SHOT=sketch — enter sketch, draw, add dim, exit to solid`
 
 ## Ribbon — Evaluate Tab
 
-Launch: `AI_CAD_SHOT=m1  — box+fillet+shell, PM active after fillet edit`
+Launch: `CHUDWARE_SHOT=m1  — box+fillet+shell, PM active after fillet edit`
 
 | id | area | location | launch | keep/fix/kill | notes |
 |----|------|----------|--------|---------------|-------|
@@ -138,7 +138,7 @@ Launch: `AI_CAD_SHOT=m1  — box+fillet+shell, PM active after fillet edit`
 
 ## Ribbon — Simulation Tab
 
-Launch: `AI_CAD_SHOT=fea — static FEA study`
+Launch: `CHUDWARE_SHOT=fea — static FEA study`
 
 | id | area | location | launch | keep/fix/kill | notes |
 |----|------|----------|--------|---------------|-------|
@@ -157,7 +157,7 @@ Launch: `AI_CAD_SHOT=fea — static FEA study`
 
 ## Ribbon — Assembly Tab
 
-Launch: `AI_CAD_SHOT=asm — assembly with mate`
+Launch: `CHUDWARE_SHOT=asm — assembly with mate`
 
 | id | area | location | launch | keep/fix/kill | notes |
 |----|------|----------|--------|---------------|-------|
@@ -172,7 +172,7 @@ Launch: `AI_CAD_SHOT=asm — assembly with mate`
 
 ## Ribbon — Sheet Metal Tab
 
-Launch: `AI_CAD_SHOT=m1  — box+fillet+shell, PM active after fillet edit`
+Launch: `CHUDWARE_SHOT=m1  — box+fillet+shell, PM active after fillet edit`
 
 | id | area | location | launch | keep/fix/kill | notes |
 |----|------|----------|--------|---------------|-------|
@@ -185,7 +185,7 @@ Launch: `AI_CAD_SHOT=m1  — box+fillet+shell, PM active after fillet edit`
 
 ## Ribbon — Weldments Tab
 
-Launch: `AI_CAD_SHOT=m1  — box+fillet+shell, PM active after fillet edit`
+Launch: `CHUDWARE_SHOT=m1  — box+fillet+shell, PM active after fillet edit`
 
 | id | area | location | launch | keep/fix/kill | notes |
 |----|------|----------|--------|---------------|-------|
@@ -226,7 +226,7 @@ Launch: `Live app`
 
 ## Ribbon — Surfaces Tab
 
-Launch: `AI_CAD_SHOT=m1  — box+fillet+shell, PM active after fillet edit`
+Launch: `CHUDWARE_SHOT=m1  — box+fillet+shell, PM active after fillet edit`
 
 | id | area | location | launch | keep/fix/kill | notes |
 |----|------|----------|--------|---------------|-------|
@@ -248,7 +248,7 @@ Launch: `AI_CAD_SHOT=m1  — box+fillet+shell, PM active after fillet edit`
 
 ## Ribbon — View Layout Tab
 
-Launch: `AI_CAD_SHOT=drawing — engineering drawing sheet with views`
+Launch: `CHUDWARE_SHOT=drawing — engineering drawing sheet with views`
 
 | id | area | location | launch | keep/fix/kill | notes |
 |----|------|----------|--------|---------------|-------|
@@ -270,7 +270,7 @@ Launch: `AI_CAD_SHOT=drawing — engineering drawing sheet with views`
 
 ## Ribbon — Annotation Tab
 
-Launch: `AI_CAD_SHOT=drawing — engineering drawing sheet with views`
+Launch: `CHUDWARE_SHOT=drawing — engineering drawing sheet with views`
 
 | id | area | location | launch | keep/fix/kill | notes |
 |----|------|----------|--------|---------------|-------|
@@ -292,7 +292,7 @@ Launch: `AI_CAD_SHOT=drawing — engineering drawing sheet with views`
 
 ## Ribbon — Appearance Tab
 
-Launch: `AI_CAD_SHOT=appearance — appearance/material scenario`
+Launch: `CHUDWARE_SHOT=appearance — appearance/material scenario`
 
 | id | area | location | launch | keep/fix/kill | notes |
 |----|------|----------|--------|---------------|-------|
@@ -311,7 +311,7 @@ Launch: `AI_CAD_SHOT=appearance — appearance/material scenario`
 
 ## Ribbon — Manufacture Tab
 
-Launch: `AI_CAD_SHOT=cam — CAM job fast-path`
+Launch: `CHUDWARE_SHOT=cam — CAM job fast-path`
 
 | id | area | location | launch | keep/fix/kill | notes |
 |----|------|----------|--------|---------------|-------|

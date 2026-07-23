@@ -28,7 +28,7 @@ every whole-tree commit (`plm.md` Appendix B.2 carry-forward law).
 ## 2. Scope — planning entries stay out of the design timeline
 
 A planning mutation cuts an ordinary history commit tagged **`scope:"planning"`**
-(commit trailer `aicad-plm-scope: planning`). `plm_history` defaults to
+(commit trailer `chudware-plm-scope: planning`). `plm_history` defaults to
 `scope:"design"` and hides them, so the curated timeline a user watches shows
 design changes only; `scope:"planning"` or `scope:"all"` surface the board's own
 history. A planning commit never re-reads working design files, so it cannot

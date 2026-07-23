@@ -48,15 +48,15 @@ The claim-time blocker above was resolved by the foreman (stale stash discarded)
 execution I touched two files outside the listed write-set; both feel within the spirit of
 the foreman scope additions but are recorded here for advisor review:
 
-1. `services/worker/worker_client.{h,cpp}` — added the env-gated `AI_CAD_RPC_TRACE` JSONL
+1. `services/worker/worker_client.{h,cpp}` — added the env-gated `CHUDWARE_RPC_TRACE` JSONL
    trace wrapper at `WorkerClient::call()` (+ credential redaction). RATIONALE: the mandated
    parity harnesses need to observe the RPC stream each binary drives; `call()` is the single
-   funnel covering ALL routing (Python worker subprocess, in-process libaicad doc/CAM,
+   funnel covering ALL routing (Python worker subprocess, in-process libchudware doc/CAM,
    ECAD/agent C++ seams), and services/worker is linked by both binaries, so one off-by-default
    hook instruments both without touching host/src. When the env var is unset (all production
    paths) the wrapper is a tail call.
-   ALTERNATIVE CONSIDERED: an AI_CAD_PYTHON stdio shim — rejected because doc-cpp/CAM/ECAD
-   calls route in-process to libaicad and never cross the subprocess boundary.
+   ALTERNATIVE CONSIDERED: an CHUDWARE_PYTHON stdio shim — rejected because doc-cpp/CAM/ECAD
+   calls route in-process to libchudware and never cross the subprocess boundary.
 
 2. `ui/imgui/src/ui/sim_manager.cpp` — restored host's `captureSelectionInto()` in the
    sim_fixture / sim_load_force / sim_load_pressure command branches. RATIONALE: real

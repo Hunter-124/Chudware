@@ -46,7 +46,7 @@ edge. No `ImGui::Begin`/`End` inside it: call it from inside your own docked/clo
 convention as `ui::drawPreviewPane()` (pattern 5).
 
 **Code pointer:** `ui/imgui/src/ui/panel_scaffold.{h,cpp}`. Working example:
-`ui/imgui/src/ui/scaffold_demo_panel.{h,cpp}` (headless-verifiable via `AI_CAD_SHOT=scaffold_demo`).
+`ui/imgui/src/ui/scaffold_demo_panel.{h,cpp}` (headless-verifiable via `CHUDWARE_SHOT=scaffold_demo`).
 
 ---
 
@@ -190,9 +190,9 @@ Never draw an icon by raw glyph/codepoint. Three call shapes, from `ui/imgui/src
 
 ## Screenshots
 
-Headless verification for any new panel: `AI_CAD_SHOT=<scenario>` + `--shot out.png` (see the
+Headless verification for any new panel: `CHUDWARE_SHOT=<scenario>` + `--shot out.png` (see the
 GUI-verification notes in `AGENTS.md` for the harness). The scaffold demo panel's scenario is
-`AI_CAD_SHOT=scaffold_demo` — a one-shot UI scenario (not a `ScenarioRunner` step machine), so it is
+`CHUDWARE_SHOT=scaffold_demo` — a one-shot UI scenario (not a `ScenarioRunner` step machine), so it is
 unaffected by the step-machine offscreen-deadlock issue tracked as T-G13/issue #7. New panels that
 only need a static screenshot (no multi-frame document mutation) should follow the same one-shot
 pattern in `ui/imgui/src/ui/scenarios.cpp` (`configureShot`'s "Simple one-frame UI shots" group)

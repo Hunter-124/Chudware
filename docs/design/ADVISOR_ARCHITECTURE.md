@@ -45,7 +45,7 @@ Design rules:
 |---|---|---|
 | Agent loop (plan→code→render→verify, 4-level compaction) | `services/agent/loop.py` | Host for advisory injection (seam: message assembly before `provider.complete_ex`) |
 | DAG orchestrator, autonomy dial, `dag_replan` | `services/dag/` | Host for role cards per node; escalation target |
-| Tool registry w/ risk classes + allow-lists | `services/mcp/tool_registry.py` | Enforcement of role-card tool scopes (already supports `AI_CAD_TOOLS_ALLOW` / node `tools:`) |
+| Tool registry w/ risk classes + allow-lists | `services/mcp/tool_registry.py` | Enforcement of role-card tool scopes (already supports `CHUDWARE_TOOLS_ALLOW` / node `tools:`) |
 | GSL describers (`describe_part/sketch/scene/...`) | `services/mcp/gsl_tools.py` | State→text for ledger snapshots and role handoffs |
 | Solver analysis: DOF, redundant/conflicting tags, per-entity under/full/over | `core/solver/nsolve.h` (`System::analyze`), `core/sketch/` | Raw signal for the sketch completion suite |
 | Closed-region detection | `session.h` `doc_sketch_regions()` | Profile-closure + auto-coincident targeting |

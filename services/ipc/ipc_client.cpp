@@ -50,8 +50,8 @@ bool pidGone(long pid) {
 #endif
 }
 
-// Build id of the hostd binary ON DISK: `aicad-hostd --version` prints
-// "aicad-hostd <git-describe id>". One subprocess per (path, mtime) — cached, so
+// Build id of the hostd binary ON DISK: `chudware-hostd --version` prints
+// "chudware-hostd <git-describe id>". One subprocess per (path, mtime) — cached, so
 // steady-state reconnects never exec anything. "" on any failure (callers treat
 // unknown as not-stale). This is the client half of the version drain-replace:
 // hello.git_rev (the RUNNING daemon's configure-time id) vs what a fresh spawn
@@ -101,7 +101,7 @@ std::string diskBuildId(const std::string& bin) {
 }
 }  // namespace
 
-namespace aicad_ipc {
+namespace chudware_ipc {
 
 using nlohmann::json;
 
@@ -188,7 +188,7 @@ bool EngineClient::connectInner(const Options& opts, std::string& err) {
     }
     const std::string bin = resolveHostdBin(opts.hostdBin);
     if (bin.empty()) {
-        err = "hostd binary not found (set AICAD_HOSTD_BIN); connect failed: " + firstErr;
+        err = "hostd binary not found (set CHUDWARE_HOSTD_BIN); connect failed: " + firstErr;
         return false;
     }
     if (!spawnDetached(bin, "", err)) return false;
@@ -415,4 +415,4 @@ std::vector<json> EngineClient::drainEvents() {
     return out;
 }
 
-}  // namespace aicad_ipc
+}  // namespace chudware_ipc

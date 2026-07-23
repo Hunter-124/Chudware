@@ -1,7 +1,7 @@
 #include "renderer.h"
 
 #include "gl_compat.h"
-#ifdef BILLET_GLES3
+#ifdef CHUDWARE_GLES3
 // GLES3 lacks polygon-offset-line (desktop-only); map to fill offset.
 #ifndef GL_POLYGON_OFFSET_LINE
 #  define GL_POLYGON_OFFSET_LINE GL_POLYGON_OFFSET_FILL
@@ -337,7 +337,7 @@ void main(){
 
 unsigned int compile(unsigned int type, const char* src) {
     unsigned int s = glCreateShader(type);
-#ifdef BILLET_GLES3
+#ifdef CHUDWARE_GLES3
     const std::string rewritten = shaderSrc(src);
     const char* p = rewritten.c_str();
 #else
@@ -385,7 +385,7 @@ Renderer::~Renderer() {
     if (fbo_) glDeleteFramebuffers(1, &fbo_);
     if (colorTex_) glDeleteTextures(1, &colorTex_);
     if (depthRbo_) glDeleteRenderbuffers(1, &depthRbo_);
-#ifdef BILLET_GLES3
+#ifdef CHUDWARE_GLES3
     if (colorRbo_) glDeleteRenderbuffers(1, &colorRbo_);
 #endif
     if (resolveFbo_) glDeleteFramebuffers(1, &resolveFbo_);
@@ -589,26 +589,26 @@ void Renderer::initQualityPolicy() {
     adaptiveQuality_ = false;
     qualityStep_ = QualityStep::Full;
 #endif
-    if (const char* e = std::getenv("AI_CAD_QUALITY_ADAPTIVE")) {
+    if (const char* e = std::getenv("CHUDWARE_QUALITY_ADAPTIVE")) {
         if (e[0] == '1') adaptiveQuality_ = true;
         else if (e[0] == '0') adaptiveQuality_ = false;
     }
-    if (const char* e = std::getenv("AI_CAD_QUALITY_STEP")) {
+    if (const char* e = std::getenv("CHUDWARE_QUALITY_STEP")) {
         QualityStep s = qualityStep_;
         if (!std::strcmp(e, "full"))      s = QualityStep::Full;
         else if (!std::strcmp(e, "high")) s = QualityStep::High;
         else if (!std::strcmp(e, "med"))  s = QualityStep::Med;
         else if (!std::strcmp(e, "low"))  s = QualityStep::Low;
-        else std::fprintf(stderr, "[quality] unknown AI_CAD_QUALITY_STEP='%s' (ignored)\n", e);
+        else std::fprintf(stderr, "[quality] unknown CHUDWARE_QUALITY_STEP='%s' (ignored)\n", e);
         if (!std::strcmp(e, "full") || !std::strcmp(e, "high") ||
             !std::strcmp(e, "med") || !std::strcmp(e, "low")) {
             qualityStep_ = s;
             qualityPinned_ = true;
         }
     }
-    if (const char* e = std::getenv("AI_CAD_QUALITY_LOG"))
+    if (const char* e = std::getenv("CHUDWARE_QUALITY_LOG"))
         qualityLog_ = (e[0] == '1');
-    if (const char* e = std::getenv("AI_CAD_QUALITY_FORCE_MS")) {
+    if (const char* e = std::getenv("CHUDWARE_QUALITY_FORCE_MS")) {
         const float v = (float)std::atof(e);
         if (v > 0.0f) qualityForceMs_ = v;
     }
@@ -696,7 +696,7 @@ void Renderer::allocTargets() {
     if (!depthRbo_) glGenRenderbuffers(1, &depthRbo_);
     if (!resolveFbo_) glGenFramebuffers(1, &resolveFbo_);
     if (!resolvedTex_) glGenTextures(1, &resolvedTex_);
-#ifdef BILLET_GLES3
+#ifdef CHUDWARE_GLES3
     if (!colorRbo_) glGenRenderbuffers(1, &colorRbo_);
 #endif
 
@@ -708,7 +708,7 @@ void Renderer::allocTargets() {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
-#ifdef BILLET_GLES3
+#ifdef CHUDWARE_GLES3
     // WebGL2: prefer a multisampled offscreen FBO at presentation size (SS=1). Samples come
     // from the quality ladder (msaaRequest_), clamped to GL_MAX_SAMPLES; <=1 takes the
     // single-sample path. If MSAA FBO fails completeness, fall back to single-sample.
@@ -2354,7 +2354,7 @@ void Renderer::renderOrbit(float yawDeg, float pitchDeg, float zoom, const float
 
 void Renderer::resolveColorTexture() const {
     if (!resolvedDirty_ || !resolveFbo_ || !resolvedTex_) return;
-#ifdef BILLET_GLES3
+#ifdef CHUDWARE_GLES3
     // Multisampled path: resolve via blit (WebGL2 requires NEAREST for MSAA resolve).
     if (msaaSamples_ > 0) {
         GLint prevFbo = 0;
@@ -2598,7 +2598,7 @@ bool Renderer::averageBackdropStats(float x0, float y0, float x1, float y1,
 
 // ---- F1 GPU pass timing: 2 queries per phase, ping-ponged so a result never blocks ----
 void Renderer::beginGpuTimer(GpuTimerRing& t) {
-#ifdef BILLET_GLES3
+#ifdef CHUDWARE_GLES3
     (void)t;  // WebGL2 has no reliable TIME_ELAPSED timer queries
 #else
     if (!t.id[0]) glGenQueries(2, t.id);
@@ -2607,7 +2607,7 @@ void Renderer::beginGpuTimer(GpuTimerRing& t) {
 }
 
 void Renderer::endGpuTimer(GpuTimerRing& t, float& outMs, bool& outValid) {
-#ifdef BILLET_GLES3
+#ifdef CHUDWARE_GLES3
     (void)t; (void)outMs; outValid = false;
 #else
     glEndQuery(GL_TIME_ELAPSED);

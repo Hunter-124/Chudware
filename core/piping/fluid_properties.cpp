@@ -6,7 +6,7 @@
 #include <algorithm>
 #include <cctype>
 
-namespace aicad::piping {
+namespace chudware::piping {
 namespace {
 
 using pyutil::fmt_f;
@@ -233,4 +233,4 @@ ojson resolve_solver_fluid(const ojson& fluid) {
                 "{'rho':998.2,'mu':1.002e-3}");
 }
 
-}  // namespace aicad::piping
+}  // namespace chudware::piping

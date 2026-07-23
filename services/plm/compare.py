@@ -11,7 +11,7 @@ Orchestrates — never re-specifies — the two existing engines (contract §9):
   overlay blend of the two sheets.
 
 The visual half is BEST-EFFORT: when the engine library is not available
-(e.g. a test box without ``libaicad``), it degrades to a structured
+(e.g. a test box without ``libchudware``), it degrades to a structured
 ``{degraded: true, reason: …}`` block and the semantic half still answers —
 compare never hard-fails on a machine without the core (ease-of-use §8).
 

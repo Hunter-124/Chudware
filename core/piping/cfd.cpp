@@ -4,7 +4,7 @@
 
 #include <cmath>
 
-namespace aicad::piping {
+namespace chudware::piping {
 namespace {
 
 using pyutil::fmt_f;
@@ -234,4 +234,4 @@ ojson verify_pressure_drop(const ojson& solve_result, const ojson& cfd_result,
     return out;
 }
 
-}  // namespace aicad::piping
+}  // namespace chudware::piping

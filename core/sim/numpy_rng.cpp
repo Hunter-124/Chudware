@@ -11,7 +11,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace aicad::sim {
+namespace chudware::sim {
 namespace {
 
 // ---------------------------------------------------------------------------
@@ -557,4 +557,4 @@ double NumpyGenerator::standard_normal() {
     }
 }
 
-}  // namespace aicad::sim
+}  // namespace chudware::sim

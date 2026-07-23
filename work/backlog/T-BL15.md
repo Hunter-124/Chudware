@@ -17,11 +17,11 @@ human (Erik) to refine the idea and decide an approach before it becomes real wo
 Recorded 2026-07-02 per explicit instruction while building this repo's *dev-team*
 git/issue coordination tooling (`work/tools/teamsync.py`, `team_mcp.py`,
 `issue_reporter.py` — see [work/context/work-system.md](../context/work-system.md)):
-that tooling is deliberately internal-only, for developing AI-CAD itself, and is
+that tooling is deliberately internal-only, for developing Chudware itself, and is
 **not** what this proposal is about.
 
 The idea: once the dev-team tooling above is up and proven, evaluate adding
-**source/version control for the documents AI-CAD's *users* create** — i.e. history,
+**source/version control for the documents Chudware's *users* create** — i.e. history,
 branching/comparison, and possibly multi-user coordination for `.step+` parametric
 documents and assemblies, analogous to PDM/PLM version control in SolidWorks/Onshape,
 not to be confused with this repo's own git history. Open questions a human needs to
@@ -31,7 +31,7 @@ settle before this is schedulable:
   style diffable history of doc_ops (contracts/doc_ops.md already gives an append-only
   op vocabulary, which may make this cheaper than it looks), snapshot/checkpoint saves,
   or true branching/merging of feature trees?
-- Local-only (like git) vs. requiring AI-CAD Cloud / an account (ties into
+- Local-only (like git) vs. requiring Chudware Cloud / an account (ties into
   `docs/AI_TOOLING_MASTER_PLAN.md` pillar 12's provider/session layer and the
   company-hosted relay)?
 - Multi-user concurrent editing of one document — in scope at all, or out of scope
@@ -65,8 +65,8 @@ file's open questions → answers:
 - *What "version control" means for a feature-tree doc* → snapshot-based on the
   T-H2 canonical `document.json` (contracts/plm.md §0, §2; plan §3.1). Not
   op-log, not branch/merge (non-goal, plan §6).
-- *Local-only vs AI-CAD Cloud/account* → local-first, zero-account; any git remote
-  the user controls for self-hosting; `aicad-cloud` remote RESERVED config-only
+- *Local-only vs Chudware Cloud/account* → local-first, zero-account; any git remote
+  the user controls for self-hosting; `chudware-cloud` remote RESERVED config-only
   behind the Pillar-12 gate (contracts/plm.md §6.1).
 - *Multi-user concurrent editing* → out of scope; team v1 = advisory locks +
   no-merge + copy-as-new-item conflict guard (contracts/plm.md §6).

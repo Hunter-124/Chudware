@@ -1,4 +1,4 @@
-// AI-CAD ribbon command table — C14.
+// Chudware ribbon command table — C14.
 // ribbon_def.cpp owns the static table; ribbon.cpp and app.cpp call getRibbonCmds().
 // Later cards APPEND to ribbon_def.cpp (never edit existing rows).
 #pragma once

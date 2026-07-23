@@ -1,4 +1,4 @@
-# Custom Model Integration Survey — ShopCraft (AI-CAD)
+# Custom Model Integration Survey — Chudware (Chudware)
 
 **Status:** Exploratory directive executed 2026-07-02; decisions in §0 confirmed by Erik
 same day. Companion to [AI_TOOLING_MASTER_PLAN.md](../AI_TOOLING_MASTER_PLAN.md) (pillars
@@ -94,7 +94,7 @@ loopback-only) is already the right seam for IP-21 — it just has no model behi
    persists `run_started / stage_started / agent_call (prompt_hash, context) /
    agent_output (raw ≤16 KB + uncapped sidecar, parsed_ok, duration) / stage_result
    (pass|retry|fail) / run_finished` to
-   `<appdata>/AI-CAD/cache/runs/<run_id>/events.jsonl` (`core/agent/events.cpp`,
+   `<appdata>/Chudware/cache/runs/<run_id>/events.jsonl` (`core/agent/events.cpp`,
    `contracts/events.md`). Persist-then-callback, replayable, tested against. **A
    failed attempt followed by a passing retry is a free preference pair with a
    verifier-backed justification — being logged today, harvested by nobody.**
@@ -294,7 +294,7 @@ off third parties) · **vLLM** (server adapters) · llama.cpp/GGUF (in-app local
 No Prefect/Dagster initially — see orchestration.
 
 1. **Telemetry export path:** `tools/flywheel/export.py` scans
-   `<appdata>/AI-CAD/cache/runs/**` + session dirs → consent-filtered, scrubbed JSONL
+   `<appdata>/Chudware/cache/runs/**` + session dirs → consent-filtered, scrubbed JSONL
    shards → DVC-tracked `training-data/` repo (S3-compatible remote; fleet spans
    states, so remote storage is the sync point). Provenance stamped per record.
 2. **Data versioning:** DVC; datasets are immutable versioned snapshots

@@ -11,7 +11,7 @@
         "PYTHONPATH": "/home/hunter/Repositories/CAD"
       }
     },
-    "aicad-team": {
+    "chudware-team": {
       "command": "python3",
       "args": [
         "/home/hunter/Repositories/CAD/work/tools/team_mcp.py"

@@ -7,7 +7,7 @@
 #include <algorithm>
 #include <cmath>
 
-namespace aicad {
+namespace chudware {
 namespace cam {
 
 // ───────────────────────────────────────────────────────── depth stepping ──
@@ -303,4 +303,4 @@ Toolpath PathBuilder::take(int tool_number, const Machine& m) {
 }
 
 }  // namespace cam
-}  // namespace aicad
+}  // namespace chudware

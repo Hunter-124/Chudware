@@ -12,7 +12,7 @@ Edge cases covered:
     source_kind == "mcp" and an aicm_path
   * ro gui attach upgrades to rw (the GUI's first-edit auto-upgrade path)
 
-Scratch AICAD_INSTANCE_KEY per test = private daemon, never touches a live one.
+Scratch CHUDWARE_INSTANCE_KEY per test = private daemon, never touches a live one.
 """
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ from mcp_server.daemon_bridge import DaemonClient
 
 HOSTD = daemon_bridge.resolve_hostd_bin()
 
-pytestmark = pytest.mark.skipif(HOSTD is None, reason="aicad-hostd not built")
+pytestmark = pytest.mark.skipif(HOSTD is None, reason="chudware-hostd not built")
 
 BOX = [{"op": "add_feature",
         "feature": {"type": "box", "name": "b1",
@@ -41,7 +41,7 @@ BOX2 = [{"op": "add_feature",
                                 "at": [30, 0, 0]},
                      "refs": {}}}]
 
-HANDOFF_DIR = Path(os.path.expanduser("~/.local/share/AI-CAD/handoff"))
+HANDOFF_DIR = Path(os.path.expanduser("~/.local/share/Chudware/handoff"))
 
 
 def _handoff_snapshot() -> set:
@@ -53,10 +53,10 @@ def _handoff_snapshot() -> set:
 @pytest.fixture()
 def scratch_daemon(monkeypatch):
     key = "pytest-lp-" + uuid.uuid4().hex[:8]
-    monkeypatch.setenv("AICAD_INSTANCE_KEY", key)
-    monkeypatch.setenv("AICAD_HOSTD_LINGER_SECS", "3")
-    monkeypatch.setenv("AICAD_HOSTD_HOLD_SECS", "2")
-    monkeypatch.delenv("AICAD_HOSTD_SOCKET", raising=False)
+    monkeypatch.setenv("CHUDWARE_INSTANCE_KEY", key)
+    monkeypatch.setenv("CHUDWARE_HOSTD_LINGER_SECS", "3")
+    monkeypatch.setenv("CHUDWARE_HOSTD_HOLD_SECS", "2")
+    monkeypatch.delenv("CHUDWARE_HOSTD_SOCKET", raising=False)
     pids: list = []
     yield pids
     for pid in pids:
@@ -118,7 +118,7 @@ def test_live_preview_events_no_handoff_files(scratch_daemon):
     assert d["source_kind"] == "mcp"
     assert d.get("aicm_path"), "doc.changed must carry the mesh path (live preview)"
     # Since 94b9124f the engine may emit a shared-memory mesh URI
-    # (e.g. "aicm-shm:/aicad_doc-...") instead of a filesystem path, matching the
+    # (e.g. "aicm-shm:/chudware_doc-...") instead of a filesystem path, matching the
     # GUI's loadDocMesh / filesystem::exists guard. Accept either form.
     aicm = d["aicm_path"]
     assert aicm.startswith("aicm-shm:") or Path(aicm).is_file(), aicm

@@ -4,7 +4,7 @@
   struct_check(doc_path, load_combo)    -> D/C ratio checks (axial yield + bending) per member
   struct_estimate(doc_path)             -> line-item cost estimate (ENR rate table)
 
-All three are dispatched to the C++ core (libaicad ``struct_*`` RPCs, ``core/structural/``)
+All three are dispatched to the C++ core (libchudware ``struct_*`` RPCs, ``core/structural/``)
 via ``core_bridge`` — the legacy Python oracle (``engine_oracle/structural/``) is no longer
 imported here. The RPC params take ``doc`` (inline aicad.structure/1 object) or ``doc_path``;
 results mirror these handlers' payloads minus the transport ``ok`` wrapper.
@@ -121,7 +121,7 @@ def register_structural_tools(mcp: FastMCP) -> None:
 
         Raises
         ------
-        Returns ``{ok:False, error, code}`` when the C++ core is unavailable (libaicad not
+        Returns ``{ok:False, error, code}`` when the C++ core is unavailable (libchudware not
         staged / stale lib without the ``struct_estimate`` dispatch) or on invalid doc
         path/schema.
 

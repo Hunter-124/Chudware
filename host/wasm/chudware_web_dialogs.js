@@ -6,7 +6,7 @@ mergeInto(LibraryManager.library, {
     var suggested = sugPtr ? UTF8ToString(sugPtr) : '';
 
     // Tear down any leftover overlay.
-    var old = document.getElementById('billet-ws-browse');
+    var old = document.getElementById('chudware-ws-browse');
     if (old) try { old.remove(); } catch (e) {}
 
     var finished = false;
@@ -14,7 +14,7 @@ mergeInto(LibraryManager.library, {
       if (finished) return;
       finished = true;
       try {
-        var el = document.getElementById('billet-ws-browse');
+        var el = document.getElementById('chudware-ws-browse');
         if (el) el.remove();
       } catch (e) {}
       var pathPtr = 0;
@@ -46,7 +46,7 @@ mergeInto(LibraryManager.library, {
     }
 
     var overlay = document.createElement('div');
-    overlay.id = 'billet-ws-browse';
+    overlay.id = 'chudware-ws-browse';
     overlay.style.cssText =
       'position:fixed;inset:0;z-index:999999;background:rgba(0,0,0,0.45);' +
       'display:flex;align-items:center;justify-content:center;font-family:' +

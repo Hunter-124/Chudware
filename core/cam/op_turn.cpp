@@ -7,7 +7,7 @@
 
 #include "cam/op_common.h"
 
-namespace aicad {
+namespace chudware {
 namespace cam {
 
 namespace {
@@ -444,4 +444,4 @@ GenResult gen_turn_drill(const Operation& opIn, const OpContext& ctx) {
 }
 
 } // namespace cam
-} // namespace aicad
+} // namespace chudware

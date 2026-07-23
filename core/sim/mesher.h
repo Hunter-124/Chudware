@@ -7,11 +7,11 @@
 // MSH_TET_10 mid-edge ordering) so the FEA solvers stay backend-agnostic.
 //
 // This header is intentionally mesher-backend-FREE (nglib.h is included only in mesher.cpp),
-// so it is always includable regardless of the AICAD_WITH_OCCT / Netgen-link config.
+// so it is always includable regardless of the CHUDWARE_WITH_OCCT / Netgen-link config.
 //
 // LICENSE NOTE: Netgen/nglib is LGPL-2.1 (commercial-safe under dynamic linking). It
-// replaced gmsh (GPL-2+, no linking exception), which had been linked into libaicad.dll.
-// The implementation (mesher.cpp) is compiled only under AICAD_WITH_OCCT.
+// replaced gmsh (GPL-2+, no linking exception), which had been linked into libchudware.dll.
+// The implementation (mesher.cpp) is compiled only under CHUDWARE_WITH_OCCT.
 #pragma once
 
 #include <memory>
@@ -19,7 +19,7 @@
 #include <string>
 #include <vector>
 
-namespace aicad::sim {
+namespace chudware::sim {
 
 struct MeshOut {
     std::vector<double> points;  // n*3 flat, row-major (node i -> [3i,3i+1,3i+2]) mm
@@ -156,7 +156,7 @@ std::shared_ptr<const MeshOut> mesh_step_cached_ptr(const std::string& step_path
 // Observable mesh-cache counters (whole-STEP + per-solid component cache).
 // generations increments only when Netgen/hex actually produces a new MeshOut;
 // hits/misses cover both the whole-file LRU and the per-solid component store.
-// Used by tests and AI_CAD_FEA_PROFILE / prof phases. Thread-safe.
+// Used by tests and CHUDWARE_FEA_PROFILE / prof phases. Thread-safe.
 struct MeshCacheStats {
     uint64_t hits = 0;          // content-key lookup found a resident mesh
     uint64_t misses = 0;        // content-key lookup had to generate
@@ -174,4 +174,4 @@ void mesh_cache_note_generation();
 void mesh_cache_note_component_hit();
 void mesh_cache_note_component_miss();
 
-}  // namespace aicad::sim
+}  // namespace chudware::sim

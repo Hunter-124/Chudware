@@ -1,4 +1,4 @@
-# AI-CAD managed runtime — core pins (provisioned into %APPDATA%\AI-CAD\runtime).
+# Chudware managed runtime — core pins (provisioned into %APPDATA%\Chudware\runtime).
 # The shipped installer pre-bundles these wheels for embed-and-extract; this file is the
 # source of truth for what goes in.
 # T-V4 pin note: build123d 0.10.0 not available for Python 3.14; 0.11.1 installed (API-compatible).

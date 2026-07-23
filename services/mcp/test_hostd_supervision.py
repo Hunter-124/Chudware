@@ -2,8 +2,8 @@
 PDEATHSIG containment, mission.exited events, lifetime policy (no idle-exit
 with children; drain refusal / --stop --force), per-child logs, spawn edges.
 
-Each test uses a scratch AICAD_INSTANCE_KEY (its own daemon, never the real
-one) — the pattern from test_hostd_registry.py. Skips when aicad-hostd is not
+Each test uses a scratch CHUDWARE_INSTANCE_KEY (its own daemon, never the real
+one) — the pattern from test_hostd_registry.py. Skips when chudware-hostd is not
 built.
 """
 from __future__ import annotations
@@ -21,7 +21,7 @@ from mcp_server.daemon_bridge import DaemonClient
 
 HOSTD = daemon_bridge.resolve_hostd_bin()
 
-pytestmark = pytest.mark.skipif(HOSTD is None, reason="aicad-hostd not built")
+pytestmark = pytest.mark.skipif(HOSTD is None, reason="chudware-hostd not built")
 
 PY = "python3"
 SLEEPER = [PY, "-c", "import time; time.sleep(30)"]
@@ -56,10 +56,10 @@ def _wait_ready(spawn_result: dict, timeout_s: float = 5.0) -> None:
 def scratch_daemon(monkeypatch):
     """Fresh instance key + fast linger; kills any daemon we started on teardown."""
     key = "pytest-sup-" + uuid.uuid4().hex[:8]
-    monkeypatch.setenv("AICAD_INSTANCE_KEY", key)
-    monkeypatch.setenv("AICAD_HOSTD_LINGER_SECS", "2")
-    monkeypatch.setenv("AI_CAD_AUTOSAVE_INTERVAL_S", "0")
-    monkeypatch.delenv("AICAD_HOSTD_SOCKET", raising=False)
+    monkeypatch.setenv("CHUDWARE_INSTANCE_KEY", key)
+    monkeypatch.setenv("CHUDWARE_HOSTD_LINGER_SECS", "2")
+    monkeypatch.setenv("CHUDWARE_AUTOSAVE_INTERVAL_S", "0")
+    monkeypatch.delenv("CHUDWARE_HOSTD_SOCKET", raising=False)
     pids: list = []
     yield pids
     for pid in pids:

@@ -1,19 +1,19 @@
 # Flywheel — Training Data Store (T-H5)
 
 Consent-filtered telemetry exporter, DVC versioning, and Argilla human-audit gate
-for the AI-CAD custom-model training pipeline (Pillar 16).
+for the Chudware custom-model training pipeline (Pillar 16).
 
 ---
 
 ## Architecture overview
 
 ```
-AI-CAD app
+Chudware app
   └── events.jsonl  ←  ai_artifact / ai_artifact_action / doc_semantic_diff
                        (per-run, per-doc; consent stamped at emission by T-H1)
 
 flywheel export (user-initiated or scheduled)
-  ├── Scanner:   <appdata>/AI-CAD/cache/runs/**/events.jsonl
+  ├── Scanner:   <appdata>/Chudware/cache/runs/**/events.jsonl
   │              + per-doc undo journals (.cam_journal.jsonl / .ecad_journal.jsonl)
   ├── Consent gate:
   │     offline_enabled → hard OFF → nothing exported
@@ -111,9 +111,9 @@ And a `legal_cleanliness` field (one of):
 
 ```bash
 python -m tools.flywheel.export \
-  --runs-dir ~/.local/share/AI-CAD/cache/runs \
+  --runs-dir ~/.local/share/Chudware/cache/runs \
   --out-dir training \
-  --config ~/.local/share/AI-CAD/config.json \
+  --config ~/.local/share/Chudware/config.json \
   --app-version 0.1.0
 ```
 
@@ -123,13 +123,13 @@ Add `--dry-run` to preview without writing files.
 
 ```bash
 # Initialise (local NAS path — swap for s3:// when ready)
-python -m tools.flywheel.dvc_init --repo training --remote /mnt/nas/aicad-training init
+python -m tools.flywheel.dvc_init --repo training --remote /mnt/nas/chudware-training init
 
 # Push after export
 python -m tools.flywheel.dvc_init --repo training push
 
 # Pull on a second machine
-python -m tools.flywheel.dvc_init --repo training --remote /mnt/nas/aicad-training pull
+python -m tools.flywheel.dvc_init --repo training --remote /mnt/nas/chudware-training pull
 ```
 
 ### Argilla audit gate (requires running docker-compose stack)
@@ -172,7 +172,7 @@ print(result)
 python -m dvc --cd training remote list
 
 # Change to cloud (one-line swap):
-python -m dvc --cd training remote modify origin url s3://my-bucket/aicad-training-data
+python -m dvc --cd training remote modify origin url s3://my-bucket/chudware-training-data
 python -m dvc --cd training remote modify origin access_key_id <key>
 python -m dvc --cd training remote modify origin secret_access_key <secret>
 ```

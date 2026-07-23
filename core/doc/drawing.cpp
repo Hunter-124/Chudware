@@ -37,12 +37,12 @@
 
 using nlohmann::json;
 
-namespace aicad::doc {
+namespace chudware::doc {
 
 namespace {
 
-#ifndef AICAD_PI
-#define AICAD_PI 3.14159265358979323846
+#ifndef CHUDWARE_PI
+#define CHUDWARE_PI 3.14159265358979323846
 #endif
 
 using Vec3 = std::array<double, 3>;
@@ -179,7 +179,7 @@ void compound_arcs(const TopoDS_Shape& compound, double scale,
             {"start_angle", fp},
             {"end_angle", lp},
             {"span", span},
-            {"closed", std::fabs(std::fabs(span) - 2.0 * AICAD_PI) < 1e-6},
+            {"closed", std::fabs(std::fabs(span) - 2.0 * CHUDWARE_PI) < 1e-6},
             {"layer", layer},
         });
     }
@@ -758,4 +758,4 @@ json project_detail(const json& parent_geom, std::array<double, 2> center,
     return base;
 }
 
-}  // namespace aicad::doc
+}  // namespace chudware::doc

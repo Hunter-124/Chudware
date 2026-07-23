@@ -12,7 +12,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad::firmware {
+namespace chudware::firmware {
 
 inline constexpr const char* kScenarioSchema = "aicad.fwscenario/1";
 
@@ -50,12 +50,12 @@ ScenarioPlan build_scenario_plan(const nlohmann::json& scenario, const nlohmann:
                                  const std::string& platform_text);
 
 // Render a t_ms-sorted timeline into monitor sleep/action lines covering
-// run_seconds, with AICAD_T_MARK echoes after every sleep. Pure.
+// run_seconds, with CHUDWARE_T_MARK echoes after every sleep. Pure.
 std::vector<std::string> timeline_resc_lines(
     const std::vector<std::pair<double, std::string>>& timeline, double run_seconds);
 
-// Write plan aux files into `directory` and substitute {AICAD_SCENARIO_DIR}
+// Write plan aux files into `directory` and substitute {CHUDWARE_SCENARIO_DIR}
 // in the plan's setup lines with its absolute path (mutates the plan).
 void materialize_aux_files(ScenarioPlan& plan, const std::string& directory);
 
-}  // namespace aicad::firmware
+}  // namespace chudware::firmware

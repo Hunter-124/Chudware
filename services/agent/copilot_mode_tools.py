@@ -36,11 +36,11 @@ from typing import Any, Iterable, Optional
 def _contract_path() -> Path:
     """Locate contracts/copilot_modes.json (canonical mode data).
 
-    Resolution: ``AI_CAD_COPILOT_MODES_JSON`` (explicit file, tests) →
+    Resolution: ``CHUDWARE_COPILOT_MODES_JSON`` (explicit file, tests) →
     ``<repo>/contracts/copilot_modes.json`` via this file's parents[2]
     (services/agent/ → repo root). Mirrors the C++ loader's order.
     """
-    env = os.environ.get("AI_CAD_COPILOT_MODES_JSON")
+    env = os.environ.get("CHUDWARE_COPILOT_MODES_JSON")
     if env:
         return Path(env)
     return Path(__file__).resolve().parents[2] / "contracts" / "copilot_modes.json"

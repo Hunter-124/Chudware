@@ -33,7 +33,7 @@ namespace fs = std::filesystem;
 #include "sim/netlist.h"
 #include "sim/spice.h"
 
-namespace aicad::ecad {
+namespace chudware::ecad {
 
 using nlohmann::json;
 
@@ -361,7 +361,7 @@ static json dfm_response(const json& board, const json& rules) {
 
 json ecad_dfm(const std::string& doc_id, const json& rules) {
     // Inline-board fast path (parity harness passes the board verbatim via rules
-    // wrapper is not used; the libaicad dispatch passes a board when doc_id empty).
+    // wrapper is not used; the libchudware dispatch passes a board when doc_id empty).
     // Standard path: look up the open session by doc_id.
     EcadLock lk;
     Session& s = require_session(doc_id);
@@ -786,7 +786,7 @@ json ecad_simulate(const std::string& doc_id, const json& study_in, const json& 
     }
     nl = build_netlist(doc);
 
-    json conv = aicad::sim::netlist_to_spice_circuit(nl, sim_params);
+    json conv = chudware::sim::netlist_to_spice_circuit(nl, sim_params);
     json circuit = conv["circuit"];
     json warns = conv["warnings"];
 
@@ -862,7 +862,7 @@ json ecad_simulate(const std::string& doc_id, const json& study_in, const json& 
         }
     }
 
-    json results = aicad::sim::spice_simulate(circuit, study);
+    json results = chudware::sim::spice_simulate(circuit, study);
     json conv_field = results.is_object() && results.contains("convergence")
                           ? results["convergence"]
                           : json::object();
@@ -894,7 +894,7 @@ json ecad_session_doc(const std::string& doc_id) {
 // exception (access violation) unwound past an EcadLock without running its C++
 // destructor under /EHsc. Mirrors force_release_doc_lock in core/doc/session.cpp —
 // same pattern, same safety contract, same idempotency guarantee.
-// Called from the libaicad C dispatch boundary's __except filter alongside
+// Called from the libchudware C dispatch boundary's __except filter alongside
 // force_release_doc_lock and force_release_drawing_lock so ANY hardware fault releases
 // ALL orphaned registry locks.
 bool force_release_ecad_lock() {
@@ -905,4 +905,4 @@ bool force_release_ecad_lock() {
     return true;
 }
 
-}  // namespace aicad::ecad
+}  // namespace chudware::ecad

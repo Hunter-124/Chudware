@@ -20,7 +20,7 @@ dedicated test — it is the easiest §3 rule to breach.
 
 Candidate-fix providers are feature-flagged individually (task note: "T-W2/T-W3
 may merge mid-task; feature-flag the candidate-fix providers individually") via
-``AI_CAD_ADVISOR_FIX_<NAME>`` env vars, all default-on.
+``CHUDWARE_ADVISOR_FIX_<NAME>`` env vars, all default-on.
 """
 from __future__ import annotations
 
@@ -84,7 +84,7 @@ class Observation:
 # ---------------------------------------------------------------------------
 
 def _fix_enabled(name: str) -> bool:
-    return os.environ.get(f"AI_CAD_ADVISOR_FIX_{name.upper()}", "1") not in ("0", "false", "False")
+    return os.environ.get(f"CHUDWARE_ADVISOR_FIX_{name.upper()}", "1") not in ("0", "false", "False")
 
 
 # ---------------------------------------------------------------------------
@@ -547,7 +547,7 @@ def build_advisory(obs: Observation) -> dict:
     _trigger_on = True
     try:
         from services.agent.effort import resolve_effort  # noqa: PLC0415
-        _tier = (getattr(obs, "tier", None) or os.environ.get("AI_CAD_TIER")
+        _tier = (getattr(obs, "tier", None) or os.environ.get("CHUDWARE_TIER")
                  or "mid")
         _trigger_on = bool(
             resolve_effort(str(_tier)).values.get("trigger_injection", True)

@@ -1,6 +1,6 @@
 """Watched "parts library" folder -> auto-register into the vendor-part registry.
 
-Users (or the host) drop CAD files into ``%APPDATA%/AI-CAD/parts_library``; scanning the
+Users (or the host) drop CAD files into ``%APPDATA%/Chudware/parts_library``; scanning the
 folder registers every new or changed file into the same registry that ``vendor_parts``
 owns (and that the C++ core reads via ``index.json``). This module is a thin scanner on
 top of :mod:`services.parts.vendor_parts`; that module remains the registry owner.

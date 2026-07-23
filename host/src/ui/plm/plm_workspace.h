@@ -11,7 +11,7 @@ namespace ui {
 // empty-state when the PLM vault is not initialized.
 void drawPlmWorkspace(AppState& st);
 
-// Select a hub page (used by the AI_CAD_SHOT=git headless capture).
+// Select a hub page (used by the CHUDWARE_SHOT=git headless capture).
 void plmSelectGitPage();
 void plmSelectPlanningPage();
 void plmSelectOverviewPage();

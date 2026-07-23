@@ -6,7 +6,7 @@
 recover the implementation.
 
 **Deletion date:** 2026-07-06  
-**Active GUI going forward:** `host/` — binary at `host/build-linux/bin/AI-CAD`
+**Active GUI going forward:** `host/` — binary at `host/build-linux/bin/Chudware`
 
 ---
 
@@ -106,9 +106,9 @@ Key commits:
 - `6ac4878d` Merge T-BL36 animated selection border
 - `e17cad0e` feat(gui): T-BL36 animated accent border
 
-### Headless Screenshot Scenario Harness (21+ AI_CAD_SHOT scenarios)
+### Headless Screenshot Scenario Harness (21+ CHUDWARE_SHOT scenarios)
 The full scenario/shot system: `ui/imgui/src/ui/scenarios.cpp`. Every named
-`AI_CAD_SHOT=<name>` environment variable seeds fixture state and writes a PNG.
+`CHUDWARE_SHOT=<name>` environment variable seeds fixture state and writes a PNG.
 
 Named scenarios (all in `scenarios.cpp`, parseable via `grep "eq("`):
 `settings`, `chat`, `assembly`, `plan`, `pick`, `ribbon`, `origin`, `tree`,

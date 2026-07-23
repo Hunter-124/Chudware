@@ -53,7 +53,7 @@ License exclusions binding: OpenMVS AGPL, PyMeshLab GPL-in-process, CGAL shape d
       - **Human walkthrough** (requires real phone + Meshroom/COLMAP install):
         1. Set `MESHROOM_BIN=/path/to/meshroom_batch` or `COLMAP_BIN=/path/to/colmap`.
         2. Call MCP tool `start_capture_session(port=8742, scale_marker_mm=50)` — returns
-           `upload_url` and `qr` (PNG data URL). Display QR in the AI-CAD agent panel or
+           `upload_url` and `qr` (PNG data URL). Display QR in the Chudware agent panel or
            print `upload_url` to terminal.
         3. On phone: scan QR or open URL in browser. Upload one photo per guided angle
            (11 angles: top, front, right, back, left, bottom, 4× 45° angled). Shiny/

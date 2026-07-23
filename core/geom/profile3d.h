@@ -1,6 +1,6 @@
 // Solved 3D-sketch -> OCCT wire compiler (the sketch3d counterpart of
 // profile.h's wire_from_solved_sketch). Turns the world-space output of
-// aicad::sketch3d::solve_sketch3d into TopoDS_Wire chains a sweep consumes as
+// chudware::sketch3d::solve_sketch3d into TopoDS_Wire chains a sweep consumes as
 // its spine/path or guide (and a future loft consumes as guide curves).
 //
 // ALGORITHM:
@@ -22,7 +22,7 @@
 #include <nlohmann/json.hpp>
 #include <TopoDS_Wire.hxx>
 
-namespace aicad::geom {
+namespace chudware::geom {
 
 // Build 3D wires from solved sketch3d entities (Sketch3DSolution::entities,
 // id -> param dict). Construction geometry and points are skipped; entities that
@@ -30,4 +30,4 @@ namespace aicad::geom {
 // defensive, never throws across the API boundary. Empty when nothing builds.
 std::vector<TopoDS_Wire> wires_from_sketch3d(const nlohmann::json& solved_entities);
 
-}  // namespace aicad::geom
+}  // namespace chudware::geom

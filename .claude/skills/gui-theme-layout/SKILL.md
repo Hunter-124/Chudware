@@ -1,6 +1,6 @@
 ---
 name: gui-theme-layout
-description: Billet (formerly AI-CAD) theming and layout specialist — the Liquid Glass v2 visual system, dark/light palettes, glass window helpers, elevation levels, DPI-aware metrics, the dockspace/pinned-column layout, overlay band, and app-level modals (Settings, file dialog, equations, profiler). Use for any task about colors, styling, glass effects, panel docking/collapse, window layout, DPI scaling, or app dialogs. Workers dispatched by gui-orchestrator read this file first instead of searching the repo.
+description: Chudware (formerly Chudware) theming and layout specialist — the Liquid Glass v2 visual system, dark/light palettes, glass window helpers, elevation levels, DPI-aware metrics, the dockspace/pinned-column layout, overlay band, and app-level modals (Settings, file dialog, equations, profiler). Use for any task about colors, styling, glass effects, panel docking/collapse, window layout, DPI scaling, or app dialogs. Workers dispatched by gui-orchestrator read this file first instead of searching the repo.
 ---
 
 # GUI Theme & Layout Specialist
@@ -30,7 +30,7 @@ modals. What individual panels *contain* belongs to their own specialist skills.
 - **Hard rule, lint-enforced:** no hardcoded colors outside `ui_theme.*`.
   `python3 scripts/gui_lint.py --rule theme` fails the gate on violations, and also catches
   the `applyTheme(., 1.0f)` HiDPI-collapse bug — never pass a literal scale.
-- The `AI_CAD_SHOT=appearance` scenario live-previews glass knobs headlessly.
+- The `CHUDWARE_SHOT=appearance` scenario live-previews glass knobs headlessly.
 
 ## The layout system (layout.cpp)
 
@@ -49,7 +49,7 @@ modals. What individual panels *contain* belongs to their own specialist skills.
 ```bash
 ./build.sh
 python3 scripts/gui_lint.py --rule theme     # mandatory when touching this subsystem
-AI_CAD_SHOT=appearance ./host/build-linux/bin/Billet --ui-screenshot scratch/theme_smoke.png
+CHUDWARE_SHOT=appearance ./host/build-linux/bin/Chudware --ui-screenshot scratch/theme_smoke.png
 ```
 Smoke = crash check only. Never run git. Return files changed + a one-line user check, e.g.
 "Settings > toggle light theme — glass columns re-tint, icons swap, nothing stays dark."

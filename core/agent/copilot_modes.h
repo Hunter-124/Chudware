@@ -8,8 +8,8 @@
 // apply_mode_tools / is_tool_allowed semantics of the Python module.
 //
 // Resolution (mirrors roles.cpp's repo-relative convention):
-//   1. $AI_CAD_COPILOT_MODES_JSON  — explicit file (tests / parity gate)
-//   2. $AI_CAD_CONTRACTS_DIR/copilot_modes.json
+//   1. $CHUDWARE_COPILOT_MODES_JSON  — explicit file (tests / parity gate)
+//   2. $CHUDWARE_CONTRACTS_DIR/copilot_modes.json
 //   3. contracts/copilot_modes.json relative to the CWD (repo root in dev;
 //      tests run with WORKING_DIRECTORY=repo root like test_agent).
 #pragma once
@@ -20,7 +20,7 @@
 #include <string>
 #include <vector>
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 
 struct CopilotModes {
@@ -61,4 +61,4 @@ bool copilot_tool_allowed(const CopilotModes& cm, const std::string& tool,
                           bool plan_only = false);
 
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware

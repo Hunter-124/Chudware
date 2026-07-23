@@ -121,7 +121,7 @@ from services.mcp import reveng_tools as rt  # noqa: E402
 
 def _read_reveng_events(cache_root: Path, run_id: str) -> list[dict]:
     """Return the aicad.reveng_events/1 records for *run_id* in emission order."""
-    path = cache_root / "AI-CAD" / "cache" / "runs" / run_id / "events.jsonl"
+    path = cache_root / "Chudware" / "cache" / "runs" / run_id / "events.jsonl"
     if not path.exists():
         return []
     out = []

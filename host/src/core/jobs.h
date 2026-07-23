@@ -1,4 +1,4 @@
-// AI-CAD worker job launcher: spawns design/mission jobs on a background thread and streams
+// Chudware worker job launcher: spawns design/mission jobs on a background thread and streams
 // agent progress events back to the main thread.
 #pragma once
 

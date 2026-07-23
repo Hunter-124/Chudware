@@ -4,7 +4,7 @@ Tests run against the stub handlers; real capability dispatch arrives in T-A2.
 All checkpoint files are written to a pytest tmp_path dir — never to the real runs dir.
 
 Run with:
-    ~/.local/share/AI-CAD/mcp-venv/bin/pytest services/dag/test_executor.py -q
+    ~/.local/share/Chudware/mcp-venv/bin/pytest services/dag/test_executor.py -q
 """
 from __future__ import annotations
 
@@ -249,5 +249,5 @@ class TestDefaultRunsDir:
     def test_returns_path_object(self) -> None:
         d = executor.default_runs_dir()
         assert isinstance(d, Path)
-        assert "AI-CAD" in str(d)
+        assert "Chudware" in str(d)
         assert "runs" in str(d)

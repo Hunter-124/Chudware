@@ -63,7 +63,7 @@ TextResult emboss_text(const TopoDS_Shape& body, const gp_Pnt& face_origin,
 // `font` param: an absolute path to a font file (used verbatim if it exists), or a
 // friendly name ("rubik"/"sans", "mono"/"jetbrains", "bold", "medium") mapped to a
 // BUNDLED font. Searches, in order: an explicit existing path; the assets/fonts dir
-// beside the loaded libaicad module; $AI_CAD_DIST/assets/fonts; the repo host/assets/
+// beside the loaded libchudware module; $CHUDWARE_DIST/assets/fonts; the repo host/assets/
 // fonts (dev); and finally a Windows system font (arial/segoeui). Returns "" if nothing
 // is found (emboss_text then falls back gracefully and leaves the part unmarked).
 std::string resolve_font_path(const std::string& req);

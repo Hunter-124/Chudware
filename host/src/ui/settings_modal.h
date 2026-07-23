@@ -1,4 +1,4 @@
-// AI-CAD Settings modal (Appearance / General / AI / Providers / Experimental)
+// Chudware Settings modal (Appearance / General / AI / Providers / Experimental)
 // and the About modal. AI absorbs Prompts, Benchmarks, Tools, Roles.
 #pragma once
 

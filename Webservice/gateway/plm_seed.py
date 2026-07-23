@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Host-side PLM bare-remote seed for billet-web (T-WEB2 §Q2).
+"""Host-side PLM bare-remote seed for chudware-web (T-WEB2 §Q2).
 
-Creates ``~/billet-web-data/plm/<name>.git`` with a real ``refs/heads/master``
+Creates ``~/chudware-web-data/plm/<name>.git`` with a real ``refs/heads/master``
 tip so session clones register ``origin`` and can sync later.
 
 Usage (from Webservice/gateway)::
@@ -35,7 +35,7 @@ _CONTAINER_SUFFIXES = (".step+", ".ecad+")
 
 
 def default_plm_dir() -> Path:
-    return Path.home() / "billet-web-data" / "plm"
+    return Path.home() / "chudware-web-data" / "plm"
 
 
 def _looks_like_bare(path: Path) -> bool:
@@ -169,7 +169,7 @@ def seed(name: str, *, from_dir: Path | None = None, plm_dir: Path | None = None
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         prog="plm_seed",
-        description="Seed a billet-web PLM bare remote with a real tip commit.",
+        description="Seed a chudware-web PLM bare remote with a real tip commit.",
     )
     p.add_argument("name", help="Project name (becomes <name>.git under plm_dir)")
     p.add_argument(
@@ -182,7 +182,7 @@ def main(argv: list[str] | None = None) -> int:
         "--plm-dir",
         dest="plm_dir",
         default=None,
-        help="Bare-remote root (default: ~/billet-web-data/plm)",
+        help="Bare-remote root (default: ~/chudware-web-data/plm)",
     )
     args = p.parse_args(argv)
     from_dir = Path(args.from_dir).expanduser() if args.from_dir else None

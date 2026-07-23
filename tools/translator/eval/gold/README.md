@@ -3,7 +3,7 @@
 Small, **human-audited** examples that validate the automatic slot-accuracy metric
 (master plan: extraction-based checks missed ~2/3 of number errors when audited — a
 human-audited gold set validates the automatic metric itself). Engine-free: each example
-is a state dict + captions, so the harness runs in CI without libaicad.
+is a state dict + captions, so the harness runs in CI without libchudware.
 
 Each `*.json` file is one example object (or a list of them):
 

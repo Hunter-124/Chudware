@@ -9,7 +9,7 @@ tests prove that:
   * scope="recent" recovers only the most-recent prior session, "all" recovers everything;
   * a deliberately closed session's autosave is removed (no resurrection).
 
-Each test points AI_CAD_ECAD_AUTOSAVE_DIR at a fresh temp dir so nothing touches %APPDATA%.
+Each test points CHUDWARE_ECAD_AUTOSAVE_DIR at a fresh temp dir so nothing touches %APPDATA%.
 Run:  python -m pytest engine/ecad/test_autosave.py -q
 """
 from __future__ import annotations
@@ -30,7 +30,7 @@ from services.ecad.library.starter import SYMBOLS
 def _fresh_dir() -> str:
     """A clean autosave dir for one test + reset all autosave/session global state."""
     d = tempfile.mkdtemp(prefix="ecad-autosave-test-")
-    os.environ["AI_CAD_ECAD_AUTOSAVE_DIR"] = d
+    os.environ["CHUDWARE_ECAD_AUTOSAVE_DIR"] = d
     autosave.disable()
     autosave._STATE["session_id"] = None
     session._REGISTRY.clear()

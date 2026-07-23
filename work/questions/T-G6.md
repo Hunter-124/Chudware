@@ -18,7 +18,7 @@ mid-frame-loop `newPart` re-entry.
 
 **Impact on T-G6.** Blocks the *screenshot* verification of the `multidoc` (S2) and `sketch`
 (H5) scenarios only. The S2 doc-tab band and H5 sketch-mode chrome + DOF solver both render
-(proven via static scenarios: `ribbon`+`AI_CAD_TAB=1` shows the sketch ribbon + "Fully
+(proven via static scenarios: `ribbon`+`CHUDWARE_TAB=1` shows the sketch ribbon + "Fully
 Defined"). This is F4/C6 worker-seam territory (C6 REFACTOR_LOG already flagged "complex
 scenarios use DocMirror/worker directly until C1–C5/H1–H4 panels land"), outside my
 `ui/imgui/src/ui/**` shell-chrome write-set.

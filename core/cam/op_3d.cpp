@@ -13,7 +13,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-namespace aicad {
+namespace chudware {
 namespace cam {
 
 namespace {
@@ -605,4 +605,4 @@ GenResult gen_spiral_finish3d(const Operation& opIn, const OpContext& ctx) {
 }
 
 }  // namespace cam
-}  // namespace aicad
+}  // namespace chudware

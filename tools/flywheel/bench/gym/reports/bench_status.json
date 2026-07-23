@@ -14,7 +14,7 @@
   "exit_code": 0,
   "cycle": "gui-diag-1784201986",
   "cmd": [
-    "/home/hunter/.local/share/AI-CAD/runtime/venv/bin/python",
+    "/home/hunter/.local/share/Chudware/runtime/venv/bin/python",
     "-m",
     "tools.flywheel.bench.gym.cli",
     "diag",

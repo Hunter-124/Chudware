@@ -1,6 +1,6 @@
 # Narration Style Guide
 
-Shared contract for all AI-CAD text-narration tools (`describe_toolpaths`, `describe_results`,
+Shared contract for all Chudware text-narration tools (`describe_toolpaths`, `describe_results`,
 and any future narration tool). Tools that produce structured text about CAD/CAM/FEA data
 **must** follow this guide instead of ad-hoc formatting.
 

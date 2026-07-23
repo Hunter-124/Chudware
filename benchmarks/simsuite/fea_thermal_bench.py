@@ -41,7 +41,7 @@ import time
 REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 if REPO not in sys.path:
     sys.path.insert(0, REPO)
-os.environ.setdefault("AI_CAD_ENGINE_DAEMON", "0")
+os.environ.setdefault("CHUDWARE_ENGINE_DAEMON", "0")
 
 DOMAIN = "fea_thermal"
 
@@ -108,7 +108,7 @@ def run(quick: bool = False) -> list:
             cb = _cb
         except CoreError as exc:
             if "unknown method" in str(exc):
-                engine_skip = f"libaicad lacks sim_run_thermal: {exc}"
+                engine_skip = f"libchudware lacks sim_run_thermal: {exc}"
             else:
                 cb = _cb  # RPC exists (it rejected the empty study)
     except Exception as exc:  # noqa: BLE001
@@ -336,7 +336,7 @@ def run(quick: bool = False) -> list:
     try:
         from services.mcp import fea_advanced as fa
         if fa.ccx_path() is None:
-            c.update(status="skip", detail="ccx (CalculiX) not on PATH/AI_CAD_CCX",
+            c.update(status="skip", detail="ccx (CalculiX) not on PATH/CHUDWARE_CCX",
                      total_s=time.time() - t0)
         else:
             nx = 8 if quick else 40

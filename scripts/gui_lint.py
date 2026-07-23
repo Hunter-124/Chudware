@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GUI sizing / icon / theme linter for the AI-CAD host (Dear ImGui, C++).
+"""GUI sizing / icon / theme linter for the Chudware host (Dear ImGui, C++).
 
 A lightweight "typechecker" for the GUI sizing standard in docs/GUI_STYLE_GUIDE.md. It catches the
 exact bug classes the 2026-06 GUI audit found, so they cannot silently ship again and so the sizing
@@ -317,7 +317,7 @@ def load_baseline(path):
 # ---- main -----------------------------------------------------------------------------------------
 
 def main(argv) -> int:
-    ap = argparse.ArgumentParser(description="AI-CAD GUI sizing/icon/theme linter")
+    ap = argparse.ArgumentParser(description="Chudware GUI sizing/icon/theme linter")
     ap.add_argument("roots", nargs="*", default=None)
     ap.add_argument("--rule", default="all", choices=["all", "icons", "theme", "scale"])
     ap.add_argument("--report", default="text", choices=["text", "md"])

@@ -140,7 +140,7 @@ def format_role_catalog_block(
 
 def harness_context_block() -> str:
     """Big-picture harness facts for the main system prompt."""
-    return """## Billet / Chudware harness (how this program works)
+    return """## Chudware / Chudware harness (how this program works)
 - Kernel: OpenCASCADE B-rep via the CAD engine; geometry is parametric (features + sketches), not meshes.
 - Units: millimeters unless the user says otherwise.
 - Tools: MCP tool families (cad, ecad, cam, sim, plm, …). Call real tools — never invent measurements.

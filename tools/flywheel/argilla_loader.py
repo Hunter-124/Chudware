@@ -58,7 +58,7 @@ def _require_argilla() -> None:
 # ---------------------------------------------------------------------------
 
 DEFAULT_ARGILLA_URL = "http://localhost:6900"
-_DATASET_NAME = "aicad-flywheel"
+_DATASET_NAME = "chudware-flywheel"
 _WORKSPACE = "admin"
 
 # Labels used in the Argilla annotation task

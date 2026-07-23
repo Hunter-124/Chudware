@@ -5,9 +5,9 @@ dir** so the record is portable with the project. Everything a ``make_*`` writes
 ``<project>/artifacts/``; previews live under ``<project>/artifacts/.previews/``; the artifact
 registry is ``<project>/artifacts/registry.json``.
 
-The project dir is ``$AICAD_PROJECT_DIR`` when set (tests and the host point it at the active
+The project dir is ``$CHUDWARE_PROJECT_DIR`` when set (tests and the host point it at the active
 project), else ``paths.ROOT / "project"`` — the single-project fallback under the app's
-``%APPDATA%/AI-CAD`` root. Resolving it lazily (not at import) lets a test set the env var
+``%APPDATA%/Chudware`` root. Resolving it lazily (not at import) lets a test set the env var
 per-case.
 """
 from __future__ import annotations
@@ -15,7 +15,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-try:  # services.paths gives the app's %APPDATA%/AI-CAD root; degrade for a bare checkout.
+try:  # services.paths gives the app's %APPDATA%/Chudware root; degrade for a bare checkout.
     from services import paths as _paths
 
     _APP_ROOT = _paths.ROOT
@@ -28,7 +28,7 @@ _REGISTRY = "registry.json"
 
 
 def project_dir() -> Path:
-    env = os.environ.get("AICAD_PROJECT_DIR")
+    env = os.environ.get("CHUDWARE_PROJECT_DIR")
     root = Path(env) if env else (_APP_ROOT / "project")
     root.mkdir(parents=True, exist_ok=True)
     return root

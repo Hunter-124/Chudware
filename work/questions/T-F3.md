@@ -38,7 +38,7 @@ bare float" requirement.
 else `~/.local/share`. The interaction ledger must land where the C++ run machine looks.
 
 **Recommendation (taken):** `interaction.cache_root()` mirrors the C++ resolution (APPDATA
-on Windows; XDG on Linux/macOS), with an `AICAD_CACHE_ROOT` override for tests. Did NOT edit
+on Windows; XDG on Linux/macOS), with an `CHUDWARE_CACHE_ROOT` override for tests. Did NOT edit
 the shared `paths.py` modules (out of scope, other callers depend on them). Suggest a
 follow-up to reconcile `paths.py` to the C++ logic repo-wide.
 
@@ -58,6 +58,6 @@ that T-F2's `unit_convert` must reuse/extend it, never a parallel implementation
 Reject-never-coerce on unknown/mismatched units is correct.
 
 **Q3 — APPROVED as recommended.** Mirror the C++ resolution (APPDATA / XDG) locally
-with the `AICAD_CACHE_ROOT` test override; leaving shared `paths.py` untouched is
+with the `CHUDWARE_CACHE_ROOT` test override; leaving shared `paths.py` untouched is
 right. The repo-wide `paths.py`/XDG reconciliation is now tracked as a GitHub issue
 (also hit independently by T-F1) — do not fix it in this task.

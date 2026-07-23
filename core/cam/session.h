@@ -1,6 +1,6 @@
 // core/cam/session.h — the stateful CAM job document session: new / apply_ops /
 // tree / generate / simulate / post / save / open, with a revision counter and
-// bounded JSON-snapshot undo/redo. Mirrors the aicad::ecad::session contract so
+// bounded JSON-snapshot undo/redo. Mirrors the chudware::ecad::session contract so
 // the host routes cam_* exactly like ecad_*.
 //
 // The CAM Job (core/cam/model.h) is the document. Operations carry their geometry
@@ -12,12 +12,12 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad {
+namespace chudware {
 namespace cam {
 
 using nlohmann::json;
 
-// Error envelope, identical shape to aicad::ecad::OpError / aicad::doc::OpError:
+// Error envelope, identical shape to chudware::ecad::OpError / chudware::doc::OpError:
 // {code, message, detail}. Thrown by the session; the C ABI converts to a nonzero
 // return carrying the envelope.
 struct OpError : std::runtime_error {
@@ -89,4 +89,4 @@ json cam_open(const std::string& path);
 bool force_release_cam_lock();
 
 }  // namespace cam
-}  // namespace aicad
+}  // namespace chudware

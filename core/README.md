@@ -1,4 +1,4 @@
-# `core/` — the pure-C++ engine (libaicad)
+# `core/` — the pure-C++ engine (libchudware)
 
 The clean-slate C++ rewrite of the Python `engine/`. See
 `docs/` plan *Core Rewrite: Python Engine → Pure C++* (and the approved plan in
@@ -8,7 +8,7 @@ End state: this becomes a static library linked directly into the C++ host
 (single process, no stdio RPC). During migration the legacy Python engine stays
 the **oracle** — a differential harness runs both on identical inputs and diffs
 the results — so each subsystem is proven at parity before the host switches to
-calling `libaicad` in-process.
+calling `libchudware` in-process.
 
 ## Layout
 

@@ -3,11 +3,11 @@
 Selects the residual Playwright-compatible driver used by headed login /
 embed / cookie-export surfaces. Headless production fetch stays on the CEF
 daemon (:mod:`.cef_client`) and is **byte-identical** when
-``BILLET_PW_BACKEND`` is unset (default ``cef``).
+``CHUDWARE_PW_BACKEND`` is unset (default ``cef``).
 
 Env
 ---
-``BILLET_PW_BACKEND``:
+``CHUDWARE_PW_BACKEND``:
 
 - ``cef`` (default) — residual paths keep stock ``playwright``; headless
   ``browser_fetch`` / ``browser_download`` stay on CefDaemon (unchanged).
@@ -35,7 +35,7 @@ import sys
 from typing import Any, Callable
 
 #: Env key that selects the residual PW-compatible backend.
-ENV_PW_BACKEND = "BILLET_PW_BACKEND"
+ENV_PW_BACKEND = "CHUDWARE_PW_BACKEND"
 
 #: Canonical backend ids. Unknown values fall back to DEFAULT_BACKEND.
 BACKENDS: tuple[str, ...] = ("cef", "patchright", "camoufox")
@@ -97,7 +97,7 @@ BROWSER_DESCRIPTORS: dict[str, dict[str, Any]] = {
         "kind": "binary",
         "license": "BSD-style (Chromium/CEF)",
         "mode": "env",
-        "env_var": None,  # host ships AI-CAD --cef-daemon; no Python fetch
+        "env_var": None,  # host ships Chudware --cef-daemon; no Python fetch
         "url": None,
         "sha256": None,
         "note": (
@@ -109,7 +109,7 @@ BROWSER_DESCRIPTORS: dict[str, dict[str, Any]] = {
 
 
 def selected_backend() -> str:
-    """Return the active ``BILLET_PW_BACKEND`` (normalised), default ``cef``."""
+    """Return the active ``CHUDWARE_PW_BACKEND`` (normalised), default ``cef``."""
     raw = (os.environ.get(ENV_PW_BACKEND) or "").strip().lower()
     if raw in BACKENDS:
         return raw
@@ -176,7 +176,7 @@ def _import_camoufox_sync() -> Callable[[], Any]:
     raise RuntimeError(
         "camoufox is an opt-in Firefox hard-site backend, not a drop-in "
         "sync_playwright() for residual login/embed — set "
-        "BILLET_PW_BACKEND=patchright (or leave unset for cef/stock "
+        "CHUDWARE_PW_BACKEND=patchright (or leave unset for cef/stock "
         "playwright) for those surfaces; use a camoufox-specific fetch path "
         "for hard sites after provision_browser('camoufox', install=True)"
     )
@@ -189,7 +189,7 @@ def _import_camoufox_async() -> Callable[[], Any]:
         raise RuntimeError(_not_installed_msg("camoufox")) from exc
     raise RuntimeError(
         "camoufox is an opt-in Firefox hard-site backend, not a drop-in "
-        "async_playwright() for residual embed — set BILLET_PW_BACKEND="
+        "async_playwright() for residual embed — set CHUDWARE_PW_BACKEND="
         "patchright (or leave unset for cef/stock playwright); provision "
         "camoufox only for hard-site fallbacks"
     )

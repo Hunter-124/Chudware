@@ -14,7 +14,7 @@
 
 ## 1. Toolchain posture (licensing)
 
-Every toolchain backend is invoked **as an unmodified subprocess** — never linked into `libaicad`
+Every toolchain backend is invoked **as an unmodified subprocess** — never linked into `libchudware`
 or any shipped binary. This is the same isolation policy `contracts/licenses.md` grants ngspice:
 mere aggregation of a separate GPL tool does not impose its license on our code. No toolchain
 source is copied or vendored; we drive documented CLIs only.
@@ -136,14 +136,14 @@ Event object:
 - **Renode**: the generated `.resc` registers a per-pin `AddStateChangedHook` for every pin
   referenced by a `gpio:P<X><n>...` assertion (only when the platform declares `gpioPort<X>`;
   `stm32f4_discovery.repl` now declares ports A–E), each printing an
-  `AICAD_GPIO_EVT <PIN>=<level>` line; after the run sleep it reads each referenced port's
-  ODR between `AICAD_GPIO_ODR_BEGIN/END <port>` echo markers for the final snapshot
+  `CHUDWARE_GPIO_EVT <PIN>=<level>` line; after the run sleep it reads each referenced port's
+  ODR between `CHUDWARE_GPIO_ODR_BEGIN/END <port>` echo markers for the final snapshot
   (snapshot wins over the last event on merge). Hook prints carry no timestamp
   (`t_ms: null`); ordering is preserved via `seq`.
 - **QEMU** (semihosting shim): QEMU exposes no external pin observer, so the firmware
-  reports its own transitions via `AICAD_GPIO_TRACE(pin_str, level, t_ms)` /
-  `AICAD_GPIO_TRACE_NT(pin_str, level)` from the project template header
-  `include/aicad_trace.h` — a printf of the same `AICAD_GPIO_EVT` line
+  reports its own transitions via `CHUDWARE_GPIO_TRACE(pin_str, level, t_ms)` /
+  `CHUDWARE_GPIO_TRACE_NT(pin_str, level)` from the project template header
+  `include/chudware_trace.h` — a printf of the same `CHUDWARE_GPIO_EVT` line
   (optionally `t=<n>ms`, also accepting `us`/`s`) over the semihosting console.
 
 ### 7.3 Timeline assertion form (extends the `fw_sim_run` assertion grammar)
@@ -208,7 +208,7 @@ Track kinds (per-kind fields beyond `kind`):
 
 Timing model: timed actions are realised by monitor `sleep` interleaving (wall-clock, the
 same idiom as the base run window); after every sleep the script echoes
-`AICAD_T_MARK <ms>`, which the parser uses to coarsely time-stamp subsequent UART lines
+`CHUDWARE_T_MARK <ms>`, which the parser uses to coarsely time-stamp subsequent UART lines
 (`t_ms` on §7 uart events — previously always null, now filled when a scenario ran).
 Renode-side stimulus syntax is [~] not live-verified (Renode absent on the dev box);
 canned .resc-generation + schema tests carry coverage, per the §7 precedent.
@@ -300,8 +300,8 @@ figure names its source heuristic; unknowable activity is *assumed always active
 | `coverage` | obj | `{components_total, components_with_rails, unknown_active_current:[ref:rail], notes:[str]}` |
 
 `cpu` residency — `{active_frac, sleep_frac, active_s|null, sleep_s|null, source, note}`.
-`source`: `"cpu_markers"` (optional firmware-side `AICAD_CPU_TRACE(state, t_ms)` macro in
-`aicad_trace.h` prints `AICAD_CPU_EVT <run|sleep> t=<n>ms`; integrated piecewise, state
+`source`: `"cpu_markers"` (optional firmware-side `CHUDWARE_CPU_TRACE(state, t_ms)` macro in
+`chudware_trace.h` prints `CHUDWARE_CPU_EVT <run|sleep> t=<n>ms`; integrated piecewise, state
 before the first marker assumed `run`) or `"assumed_active"` (no markers → 100 % active,
 never guessed from UART silence).
 
@@ -347,7 +347,7 @@ Closes the three gaps `docs/omp-integration/research/verify-firmware-seam.md` an
 point, no live physical-device serial/UART monitor (as opposed to the §7 emulator UART
 capture). Same toolchain posture as §1: every backend below is invoked as an **unmodified
 subprocess only** (avrdude GPL-2.0+, OpenOCD GPL-2.0, gdb/`arm-none-eabi-gdb`/`avr-gdb`
-GPL-3.0, simavr dual GPL/LGPL, Renode MIT) — never linked into `libaicad`. Attach point:
+GPL-3.0, simavr dual GPL/LGPL, Renode MIT) — never linked into `libchudware`. Attach point:
 `core/firmware/hardware.{h,cpp}` (mirrors the existing `probe_rs_*`/`esptool_flash`
 wrappers around `subprocess.cpp`'s `run_capture()`); dispatched via
 `core/firmware/firmware_rpc.cpp`'s `call()`; MCP tools registered inside the SAME

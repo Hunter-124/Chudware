@@ -40,7 +40,7 @@ __all__ = [
 
 MODELS_DEV_URL = "https://models.dev/api.json"
 _CACHE_NAME = "models_dev_cache.json"
-_DEFAULT_UA = "billet-model-catalog/1.0"
+_DEFAULT_UA = "chudware-model-catalog/1.0"
 
 # Provider name as used by config.py / agent_list_models -> models.dev provider key.
 _MODELS_DEV_PROVIDER = {

@@ -9,9 +9,9 @@
 #include "sim/netlist.h"
 #include "sim/spice.h"
 
-using aicad::sim::netlist_to_spice_circuit;
-using aicad::sim::parse_netlist;
-using aicad::sim::spice_simulate;
+using chudware::sim::netlist_to_spice_circuit;
+using chudware::sim::parse_netlist;
+using chudware::sim::spice_simulate;
 using nlohmann::json;
 
 static double pct_err(double got, double exp) {

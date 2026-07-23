@@ -44,7 +44,7 @@ see reqs, their status, and verification verdicts inline.
 Branch: task/T-U5-ui (commit 54c6471)
 Build: clean (0 errors, 0 warnings on requirements_panel.cpp)
 Style: ui_style_check.py 0 findings
-Shot: AI_CAD_SHOT=requirements captured (1600x1000) — panel renders behind first-run dialog (pre-existing behavior, same as bom/ecad shots in same env)
+Shot: CHUDWARE_SHOT=requirements captured (1600x1000) — panel renders behind first-run dialog (pre-existing behavior, same as bom/ecad shots in same env)
 
 Files:
 - ui/abstract/req_view.h — pure view-model: ReqRow, BatteryCheckRow, ReqPanelModel, filterReqRows()

@@ -223,15 +223,15 @@ def test_select_provider_fallback_and_key(monkeypatch=None):
 def test_knowledge_root_env_override():
     import os
 
-    saved = os.environ.get("AI_CAD_KNOWLEDGE_DIR")
+    saved = os.environ.get("CHUDWARE_KNOWLEDGE_DIR")
     try:
-        os.environ["AI_CAD_KNOWLEDGE_DIR"] = "/tmp/ai-cad-knowledge-test"
+        os.environ["CHUDWARE_KNOWLEDGE_DIR"] = "/tmp/ai-cad-knowledge-test"
         assert str(cache_mod.knowledge_root()) == "/tmp/ai-cad-knowledge-test"
     finally:
         if saved is None:
-            os.environ.pop("AI_CAD_KNOWLEDGE_DIR", None)
+            os.environ.pop("CHUDWARE_KNOWLEDGE_DIR", None)
         else:
-            os.environ["AI_CAD_KNOWLEDGE_DIR"] = saved
+            os.environ["CHUDWARE_KNOWLEDGE_DIR"] = saved
 
 
 def main() -> None:

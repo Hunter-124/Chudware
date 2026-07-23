@@ -62,7 +62,7 @@ def clean_env(monkeypatch):
     """Strip every provisioning env var so the probe sees a bare, offline machine."""
     for var in ("COLMAP_BIN", "OPENMVS_BIN", "BRUSH_BIN", "MESHROOM_BIN",
                 "TRIPOSR_WEIGHTS", "TRELLIS_WEIGHTS", "VGGT_WEIGHTS",
-                "AICAD_TEST_CAMERA", "CUDA_VISIBLE_DEVICES"):
+                "CHUDWARE_TEST_CAMERA", "CUDA_VISIBLE_DEVICES"):
         monkeypatch.delenv(var, raising=False)
     # neutralize PATH-based tool discovery so the offline assertions are deterministic
     monkeypatch.setattr(rp.shutil, "which", lambda *_a, **_k: None)

@@ -13,12 +13,12 @@ run_leg / register_all_tools). Honest PASS / WARN / FAIL / SKIP verdicts with
 actual wall-times. main() returns 0 when no FAIL (SKIP allowed).
 
 Env:
-  AICAD_FC_OUT          output dir (default benchmarks/flight_computer)
-  AICAD_FC_MARKERS      marker dir (default $OUT/markers)
-  AI_CAD_ECAD_HEAVY_BUDGET_S  heavy-tool budget seconds (default 180 here)
-  AICAD_FC_ANT_FULLWAVE_BUDGET_S  openEMS full-wave budget (default 90)
-  AICAD_FC_SIM_BUDGET_S Renode fw_sim_run budget (default 120)
-  AICAD_FC_SEED         deterministic seed (default 0; fixed inputs)
+  CHUDWARE_FC_OUT          output dir (default benchmarks/flight_computer)
+  CHUDWARE_FC_MARKERS      marker dir (default $OUT/markers)
+  CHUDWARE_ECAD_HEAVY_BUDGET_S  heavy-tool budget seconds (default 180 here)
+  CHUDWARE_FC_ANT_FULLWAVE_BUDGET_S  openEMS full-wave budget (default 90)
+  CHUDWARE_FC_SIM_BUDGET_S Renode fw_sim_run budget (default 120)
+  CHUDWARE_FC_SEED         deterministic seed (default 0; fixed inputs)
 """
 from __future__ import annotations
 
@@ -32,22 +32,22 @@ from typing import Any, Callable, Optional
 
 # Heavy ECAD tools (board_from_schematic / autoroute / 3d / dfm) are budget-
 # guarded at import time — set BEFORE importing mcp_server.ecad_tools.
-os.environ.setdefault("AI_CAD_ECAD_HEAVY_BUDGET_S", "180")
-os.environ.setdefault("AI_CAD_ENGINE_DAEMON", "0")
+os.environ.setdefault("CHUDWARE_ECAD_HEAVY_BUDGET_S", "180")
+os.environ.setdefault("CHUDWARE_ENGINE_DAEMON", "0")
 
 REPO = Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 OUT_DIR = Path(os.environ.get(
-    "AICAD_FC_OUT", str(REPO / "benchmarks" / "flight_computer")))
+    "CHUDWARE_FC_OUT", str(REPO / "benchmarks" / "flight_computer")))
 MARKER_DIR = Path(os.environ.get(
-    "AICAD_FC_MARKERS", str(OUT_DIR / "markers")))
+    "CHUDWARE_FC_MARKERS", str(OUT_DIR / "markers")))
 
-SEED = int(os.environ.get("AICAD_FC_SEED", "0") or "0")
+SEED = int(os.environ.get("CHUDWARE_FC_SEED", "0") or "0")
 ANT_FULLWAVE_BUDGET_S = float(
-    os.environ.get("AICAD_FC_ANT_FULLWAVE_BUDGET_S", "90") or "90")
-SIM_BUDGET_S = float(os.environ.get("AICAD_FC_SIM_BUDGET_S", "120") or "120")
+    os.environ.get("CHUDWARE_FC_ANT_FULLWAVE_BUDGET_S", "90") or "90")
+SIM_BUDGET_S = float(os.environ.get("CHUDWARE_FC_SIM_BUDGET_S", "120") or "120")
 
 # Fixed flight-computer BOM (libids from engine.ecad.library.starter).
 REQUIRED_PARTS: list[tuple[str, str]] = [
@@ -383,8 +383,8 @@ def main() -> int:
     print("=== B1 flight-computer E2E benchmark ===")
     print(f"  out: {OUT_DIR}")
     print(f"  seed: {SEED}")
-    print(f"  AI_CAD_ECAD_HEAVY_BUDGET_S="
-          f"{os.environ.get('AI_CAD_ECAD_HEAVY_BUDGET_S')}")
+    print(f"  CHUDWARE_ECAD_HEAVY_BUDGET_S="
+          f"{os.environ.get('CHUDWARE_ECAD_HEAVY_BUDGET_S')}")
     print(f"  ant_fullwave_budget_s={ANT_FULLWAVE_BUDGET_S} "
           f"sim_budget_s={SIM_BUDGET_S}")
 

@@ -136,14 +136,14 @@ def reset_policy() -> None:
 
 
 def _env_allow() -> set[str] | None:
-    raw = os.environ.get("AI_CAD_TOOLS_ALLOW", "").strip()
+    raw = os.environ.get("CHUDWARE_TOOLS_ALLOW", "").strip()
     if not raw:
         return None
     return {t.strip() for t in raw.split(",") if t.strip()}
 
 
 def _env_deny_risk() -> set[str] | None:
-    raw = os.environ.get("AI_CAD_TOOLS_DENY_RISK", "").strip()
+    raw = os.environ.get("CHUDWARE_TOOLS_DENY_RISK", "").strip()
     if not raw:
         return None
     return {t.strip().lower() for t in raw.split(",") if t.strip()}
@@ -184,7 +184,7 @@ def deny_reason(name: str) -> str | None:
     except Exception:
         pass
     # Config agent.tool_families — disabled families blocked unless env/policy allow
-    # list is active (AI_CAD_TOOLS_ALLOW still wins via _current_allow below).
+    # list is active (CHUDWARE_TOOLS_ALLOW still wins via _current_allow below).
     try:
         from services.agent.config import is_tool_family_enabled  # lazy: avoid import cycles
         fam = (_CATALOG.get(name) or {}).get("family")
@@ -206,7 +206,7 @@ def deny_reason(name: str) -> str | None:
     deny_risk = _current_deny_risk()
     if deny_risk and risk in deny_risk:
         return (f"tool {name!r} is risk-class {risk!r}, which is denied by the active "
-                f"policy (AI_CAD_TOOLS_DENY_RISK)")
+                f"policy (CHUDWARE_TOOLS_DENY_RISK)")
     allow = _current_allow()
     if allow is None:
         return None  # default: everything allowed
@@ -214,7 +214,7 @@ def deny_reason(name: str) -> str | None:
     if name in allow or (family and f"family:{family}" in allow):
         return None
     return (f"tool {name!r} is not in the active allow-list "
-            f"(set AI_CAD_TOOLS_ALLOW or the DAG node tools: list to permit it)")
+            f"(set CHUDWARE_TOOLS_ALLOW or the DAG node tools: list to permit it)")
 
 
 def refusal(name: str) -> dict:
@@ -223,7 +223,7 @@ def refusal(name: str) -> dict:
         "ok": False,
         "reason": deny_reason(name) or f"tool {name!r} is not permitted",
         "hint": ("This tool is gated by the per-context allow-list. Permit it via the DAG "
-                 "node's tools: list, or AI_CAD_TOOLS_ALLOW / AI_CAD_TOOLS_DENY_RISK."),
+                 "node's tools: list, or CHUDWARE_TOOLS_ALLOW / CHUDWARE_TOOLS_DENY_RISK."),
     }
 
 

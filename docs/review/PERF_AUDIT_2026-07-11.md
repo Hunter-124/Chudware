@@ -7,15 +7,15 @@ number here is **fresh**, measured with the (now-working) in-process sampling pr
 
 > **Measurement discipline.** The box was under real load (~16 on 12 cores — other agents
 > modeling live) so *absolute* ms are inflated, but self-time **%** ranking within one op is
-> stable across runs. All runs were **in-process** (`AI_CAD_ENGINE_DAEMON=0`), a separate
+> stable across runs. All runs were **in-process** (`CHUDWARE_ENGINE_DAEMON=0`), a separate
 > process that COW-maps the dist `.so` and contacts **no daemon** — it never touched the live
 > hostd/MCP engines. Profiler cadence + symbolization now work (T-PERF10 fix): e.g. the `open`
 > run got 3868 samples / 14 unresolved, vs the audit's "76 of 10k / all unresolved".
 >
 > Reproduce (safe, in-process):
 > ```
-> AI_CAD_ENGINE_DAEMON=0 python3 tools/profile_modeling.py --workload open --seconds 4 --hz 999
-> AI_CAD_ENGINE_DAEMON=0 python3 tools/profile_modeling.py --workload all  --seconds 5 --hz 999
+> CHUDWARE_ENGINE_DAEMON=0 python3 tools/profile_modeling.py --workload open --seconds 4 --hz 999
+> CHUDWARE_ENGINE_DAEMON=0 python3 tools/profile_modeling.py --workload all  --seconds 5 --hz 999
 > ```
 
 ## 0. The profiler works now — use it, not the old audit's numbers
@@ -23,9 +23,9 @@ number here is **fresh**, measured with the (now-working) in-process sampling pr
 Confirmed working on Linux (the audit's "blind on Linux" predates the T-PERF10 sampler
 rewrite: absolute-time `clock_nanosleep` cadence + ucontext leaf frame + ELF `.symtab` walk).
 Two constraints when profiling on this machine:
-1. **Always `AI_CAD_ENGINE_DAEMON=0`.** `core_bridge` defaults to daemon mode; without the
+1. **Always `CHUDWARE_ENGINE_DAEMON=0`.** `core_bridge` defaults to daemon mode; without the
    opt-out the profiler routes into the **live shared engine** the other agents are using.
-2. Point at a freshly-built engine with `AI_CAD_LIBAICAD=/abs/path/libaicad.so` to profile a
+2. Point at a freshly-built engine with `CHUDWARE_LIBCHUDWARE=/abs/path/libchudware.so` to profile a
    change without staging over the live dist `.so`.
 
 ## 1. SHIPPED — doc_open was 81% zip CRC32 + inflate → now memmove-bound (~5.2×)
@@ -36,8 +36,8 @@ part):
 
 | frame | before | after |
 |---|---:|---:|
-| `aicad!mz_crc32` | **47.3%** | 0.5% |
-| `aicad!tinfl_decompress` | **33.8%** | 1.0% |
+| `chudware!mz_crc32` | **47.3%** | 0.5% |
+| `chudware!tinfl_decompress` | **33.8%** | 1.0% |
 | `c!__memmove_avx512` | 13.8% | 75.2% (now the floor) |
 | **throughput** | **85 opens/s** | **440 opens/s (~5.2×)** |
 
@@ -68,10 +68,10 @@ the floor; a future zero-copy (mmap the STORED entry, parse AICM in place) would
 - Only cost is a modestly larger `.step+` (mesh no longer deflated); for the transient handoff
   files this is free, and the mesh was already being stored either way.
 
-**Deploy note:** built + verified in `core/build-linux/bin/libaicad.so`. **NOT** staged to
-`services/dist/AI-CAD/libaicad.so` — the live MCP servers mmap it (overwriting mid-run =
+**Deploy note:** built + verified in `core/build-linux/bin/libchudware.so`. **NOT** staged to
+`services/dist/Chudware/libchudware.so` — the live MCP servers mmap it (overwriting mid-run =
 SIGBUS). Stage + restart when the live sessions finish. Same maintenance rule as §B applies
-(bump `aicad-geomcache/1` on any geometry-compiler output change).
+(bump `chudware-geomcache/1` on any geometry-compiler output change).
 
 ## 2. Ranked menu — remaining opportunities (measured, not folklore)
 
@@ -105,7 +105,7 @@ RESULTS.md (2026-07-09) shipped tcmalloc for the **MCP** engine (server.py LD_PR
 but the **host GUI** binary still uses glibc malloc. In-process runs (no preload) show
 `_int_malloc`/`_int_free`/`calloc` ~3–4% self-time; OCCT boolean/mesh work is allocation-heavy.
 Link `libtcmalloc_minimal` directly into the `host/` binary (host is the main executable, not a
-dlopen, so linking works — unlike libaicad). Clean win; can't runtime-verify while the GUI is
+dlopen, so linking works — unlike libchudware). Clean win; can't runtime-verify while the GUI is
 live, so implement + document as ready-to-measure.
 
 ### [P2] Zero-copy AICM open (shave the remaining 75% memmove)

@@ -42,7 +42,7 @@
 
 using nlohmann::json;
 
-namespace aicad::ecad {
+namespace chudware::ecad {
 
 namespace {
 
@@ -263,7 +263,7 @@ TopoDS_Face outline_face(const json& outline, double& outer_area_out) {
 // World position of a footprint pad. Bottom-side footprints mirror across x.
 // Reuses the ECAD schema helper for exact parity with the oracle.
 Pt pad_world_pt(const json& fp, const json& pad) {
-    auto [wx, wy] = aicad::ecad::schema::pad_world(fp, pad);
+    auto [wx, wy] = chudware::ecad::schema::pad_world(fp, pad);
     return {wx, wy};
 }
 
@@ -586,4 +586,4 @@ json board_to_3d_step(const json& board, const json& opts, const std::string& ou
     return result;
 }
 
-}  // namespace aicad::ecad
+}  // namespace chudware::ecad

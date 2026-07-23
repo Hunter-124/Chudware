@@ -2,7 +2,7 @@
 // (the design ported from services/mcp/cad_tools.py, whose per-process
 // threading.Timer chains this replaces in daemon mode).
 //
-// One std::thread + condition_variable loop. Each tick (AI_CAD_AUTOSAVE_INTERVAL_S,
+// One std::thread + condition_variable loop. Each tick (CHUDWARE_AUTOSAVE_INTERVAL_S,
 // default 60 s, 0 disables): engine doc_list -> every DIRTY doc whose revision
 // changed since its last autosave is doc_save'd (geometry cache embedded) into
 //   <stateDir>/hostd_autosave/<instance-key>/<session-id>/<doc_id>.step+
@@ -23,7 +23,7 @@
 //    (an app/agent crash) is doc_save'd into the ORPHAN tier (<baseDir>/orphaned/,
 //    {stem}.step+ + {stem}.json meta) and then closed to free memory. A clean doc
 //    already safe in a real user file is just closed. This is the long-lived
-//    disk recovery store (AICAD_ORPHAN_KEEP entries).
+//    disk recovery store (CHUDWARE_ORPHAN_KEEP entries).
 //
 //  * CRASH tier — a prior session dir that still exists means that daemon itself
 //    died hard (clean shutdown removes its session dir). Its autosaves are NOT
@@ -110,7 +110,7 @@ private:
     void loop();
     void recoverPriorSession();
     void saveDirtyDocs();
-    void sweepOrphans();  // keep the newest AICAD_ORPHAN_KEEP (default 20)
+    void sweepOrphans();  // keep the newest CHUDWARE_ORPHAN_KEEP (default 20)
 
     std::string baseDir_;
     std::string sessionDir_;

@@ -96,7 +96,7 @@ private:
 };
 
 // Build a canned sparse fixture: a roughly spherical cloud of 200 points + 6 frusta arranged
-// around the origin, suitable for the AI_CAD_SHOT=reveng_recon headless shot.
+// around the origin, suitable for the CHUDWARE_SHOT=reveng_recon headless shot.
 void buildCannedSparseFixture(std::vector<SparsePoint>& pts, std::vector<CameraFrustum>& frusta);
 
 }  // namespace render

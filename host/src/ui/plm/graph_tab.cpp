@@ -4430,12 +4430,12 @@ void plmDrawGraphPage(AppState &st) {
     return;
   }
 
-  // Shot-only hook (AI_CAD_PLM_GRAPH_VIEW=grid): force Grid view so headless
-  // --ui-screenshot runs can capture it (mirrors AI_CAD_FM_COLLAPSED). No-op
+  // Shot-only hook (CHUDWARE_PLM_GRAPH_VIEW=grid): force Grid view so headless
+  // --ui-screenshot runs can capture it (mirrors CHUDWARE_FM_COLLAPSED). No-op
   // in normal use.
   {
     static const bool shotGrid = [] {
-      const char *v = std::getenv("AI_CAD_PLM_GRAPH_VIEW");
+      const char *v = std::getenv("CHUDWARE_PLM_GRAPH_VIEW");
       return v && std::strcmp(v, "grid") == 0;
     }();
     if (shotGrid && !G.listViewUserOverride) {

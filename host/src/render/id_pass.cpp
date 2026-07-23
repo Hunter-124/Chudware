@@ -60,7 +60,7 @@ void main(){
 
 unsigned int compile(unsigned int type, const char* src) {
     unsigned int s = glCreateShader(type);
-#ifdef BILLET_GLES3
+#ifdef CHUDWARE_GLES3
     const std::string rewritten = shaderSrc(src);
     const char* p = rewritten.c_str();
 #else
@@ -151,7 +151,7 @@ void IdPass::allocTargets(int w, int h) {
 
 bool IdPass::setDoc(const DocMesh& doc, std::string& err) {
     // Decide encoding once (env-gated fallback) and build the matching program.
-    const char* mode = std::getenv("AI_CAD_IDBUF");
+    const char* mode = std::getenv("CHUDWARE_IDBUF");
 #ifdef __EMSCRIPTEN__
     // WebGL2 has no reliable R32UI integer color attachment — force the RGBA8 path.
     rgba8_ = true;
@@ -330,7 +330,7 @@ void IdPass::render(const Renderer::CameraXform& cam) {
     // Verts win over everything: largest depth bias, fat points. One draw call per body — each
     // point carries its own id via the attribute, so no per-point uniform churn.
     glDepthRange(0.0, 0.998);
-#ifndef BILLET_GLES3
+#ifndef CHUDWARE_GLES3
     glEnable(GL_PROGRAM_POINT_SIZE);
 #ifdef GL_POINT_SPRITE
     glEnable(GL_POINT_SPRITE);

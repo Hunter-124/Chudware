@@ -6,7 +6,7 @@
 
 #include "cam/op_common.h"
 
-namespace aicad {
+namespace chudware {
 namespace cam {
 
 GenResult generate(const Operation& op, const OpContext& ctx) {
@@ -58,4 +58,4 @@ GenResult generate(const Operation& op, const OpContext& ctx) {
 }
 
 }  // namespace cam
-}  // namespace aicad
+}  // namespace chudware

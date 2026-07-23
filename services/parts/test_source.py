@@ -1,6 +1,6 @@
 """Tests for services/parts/source.py — deterministic sourcing fan-out.
 
-Fixture-provider scenarios (no network, no libaicad): the rover tube need ranks
+Fixture-provider scenarios (no network, no libchudware): the rover tube need ranks
 the spec-matching tube first with a facet-fit rationale; the bearing need finds
 the 12 mm-bore record; artifact plans follow the contracts/sourcing.md vocabulary;
 same input → same output (determinism).

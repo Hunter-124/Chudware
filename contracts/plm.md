@@ -245,18 +245,18 @@ never data loss.
 {"id": "r1", "kind": "folder", "url": "/mnt/share/Gearbox.git", "name": "Team NAS"}
 {"id": "r2", "kind": "ssh",    "url": "git@host:gearbox.git",     "name": "Self-host"}
 {"id": "r3", "kind": "https",  "url": "https://git.example/gearbox.git", "name": "Gitea"}
-{"id": "r4", "kind": "aicad-cloud", "url": null, "name": "AI-CAD Cloud", "reserved": true}
+{"id": "r4", "kind": "chudware-cloud", "url": null, "name": "Chudware Cloud", "reserved": true}
 ```
 
-- **`kind`** ∈ **`folder` | `ssh` | `https` | `aicad-cloud`**.
+- **`kind`** ∈ **`folder` | `ssh` | `https` | `chudware-cloud`**.
 - `folder` = a bare git repo on a filesystem path (shared drive / USB, plan §3.3
   Tier "Shared folder"). `ssh`/`https` = any git remote the user controls (bare
   repo over SSH, Gitea, GitHub, …) — self-hosting for free.
-- **`aicad-cloud` is RESERVED, config-only.** It MAY appear in the manifest as a
+- **`chudware-cloud` is RESERVED, config-only.** It MAY appear in the manifest as a
   configured entry, but **no `plm_*` tool implements sync against it in
   `aicad.plm/1`** — every remote tool MUST return
-  `{ok:false, reason:"reserved_remote", hint:"AI-CAD Cloud is not available yet"}`
-  for a `kind:"aicad-cloud"` remote. Implementation is behind the **Pillar-12
+  `{ok:false, reason:"reserved_remote", hint:"Chudware Cloud is not available yet"}`
+  for a `kind:"chudware-cloud"` remote. Implementation is behind the **Pillar-12
   human gate** (plan §3.3, non-goal §6). The seam exists so the config surface is
   stable; the behavior is deliberately absent.
 
@@ -336,8 +336,8 @@ envelope. Signatures take one object; responses are the shape shown.
 | `plm_compare` | `{project_id, commit_a, commit_b, item_id}` | `{ok, doc_diff, eval_compare?}` | **Reuses** `doc_diff` (semantic) + `eval_compare` (visual); this tool orchestrates, it does not re-specify diffing. **T-R3/R5** |
 | `plm_status` | `{project_id}` | `{ok, items:[…], head, dirty, ai_mode, remotes, locks}` | Project state for the Hub/badges. **T-R2** |
 | `plm_set_ai_mode` | `{project_id, mode}` | `{ok, ai_mode}` | `mode` ∈ `manual|assisted|managed` (§4). **T-R3** |
-| `plm_add_remote` | `{project_id, kind, url?, name}` | `{ok, remote}` | Register a remote profile (§6.1); `aicad-cloud` accepted config-only. **T-R7** |
-| `plm_sync` | `{project_id, remote_id}` | `{ok, pulled, pushed, conflicts_copied:[…]}` | One-button sync (§6.3–6.4). `aicad-cloud` → `reserved_remote`. **T-R7** |
+| `plm_add_remote` | `{project_id, kind, url?, name}` | `{ok, remote}` | Register a remote profile (§6.1); `chudware-cloud` accepted config-only. **T-R7** |
+| `plm_sync` | `{project_id, remote_id}` | `{ok, pulled, pushed, conflicts_copied:[…]}` | One-button sync (§6.3–6.4). `chudware-cloud` → `reserved_remote`. **T-R7** |
 | `plm_lock` | `{project_id, item_id, remote_id}` | `{ok, lock}` | Advisory lock via CAS (§6.3). **T-R7** |
 | `plm_unlock` | `{project_id, item_id, remote_id}` | `{ok}` | Release a lock via CAS. **T-R7** |
 
@@ -361,7 +361,7 @@ That client is a normative seam of `aicad.plm/1` so T-R2 builds exactly what the
 already-shipped bridge imports; it is not a parallel API.
 
 - **Class + import path (frozen):** `services.plm.client.PLMVaultClient`. The
-  bridge imports it lazily behind the `AICAD_PLM_BRIDGE=1` feature flag and falls
+  bridge imports it lazily behind the `CHUDWARE_PLM_BRIDGE=1` feature flag and falls
   back to its in-memory `MockVault` when the import fails (T-R2 not yet merged) or
   the flag is unset. T-R2 MUST provide `PLMVaultClient` at exactly this dotted
   path with the surface below; renaming either is a breaking change (version bump).

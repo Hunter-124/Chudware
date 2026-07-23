@@ -10,11 +10,11 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad::ecad {
+namespace chudware::ecad {
 
 // run_dfm(board, rules?) -> deterministic sorted list of DFM violations.
 // `rules` is an optional dict of threshold overrides (defaults match dfm.py).
 nlohmann::json run_dfm(const nlohmann::json& board,
                        const nlohmann::json& rules = nlohmann::json(nullptr));
 
-}  // namespace aicad::ecad
+}  // namespace chudware::ecad

@@ -5,7 +5,7 @@
 #include <cstring>
 #include <unordered_map>
 
-namespace aicad {
+namespace chudware {
 namespace cam {
 
 // ─────────────────────────────────────────────────────── enum string tables ──
@@ -532,4 +532,4 @@ Job Job::from_json(const json& j) {
 }
 
 }  // namespace cam
-}  // namespace aicad
+}  // namespace chudware

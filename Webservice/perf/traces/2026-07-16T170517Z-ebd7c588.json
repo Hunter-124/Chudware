@@ -61,5 +61,5 @@
   },
   "note": "measure_part unavailable on hostd (unknown method: measure_part); doc_apply_ops + doc_undo only",
   "n_iters": 20,
-  "socket": "/run/user/1000/aicad/hostd-billetweb.sock"
+  "socket": "/run/user/1000/chudware/hostd-chudwareweb.sock"
 }

@@ -5,7 +5,7 @@
 #include <cctype>
 #include <set>
 
-namespace aicad::hydraulic {
+namespace chudware::hydraulic {
 namespace {
 
 using pyutil::py_repr;
@@ -271,4 +271,4 @@ std::vector<std::string> validate_hydraulic(const ojson& doc) {
     return errs;
 }
 
-}  // namespace aicad::hydraulic
+}  // namespace chudware::hydraulic

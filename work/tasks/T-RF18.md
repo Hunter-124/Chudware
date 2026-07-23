@@ -26,6 +26,6 @@ delete the Python modules in the same commit. MCP sourcing tools surface unchang
 
 ## Definition of done
 
-- [x] bom_*/quote/spec-match/parts-hub methods served by libaicad; parity green.
+- [x] bom_*/quote/spec-match/parts-hub methods served by libchudware; parity green.
 - [x] Python modules deleted same commit; routing flipped (integrator merge).
 - [x] gate.sh green; REFACTOR_LOG handoff; web_parity inventory shrinks.

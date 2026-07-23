@@ -1,5 +1,5 @@
 // core/cam/session.cpp — the stateful CAM job document session + the cam_* RPC
-// entry points the libaicad C ABI dispatches to. Mirrors aicad::ecad::session:
+// entry points the libchudware C ABI dispatches to. Mirrors chudware::ecad::session:
 // a global store keyed by doc_id, a revision counter, bounded JSON-snapshot
 // undo/redo, and an OpError-enveloped ops vocabulary.
 #include "cam/session.h"
@@ -23,7 +23,7 @@ namespace fs = std::filesystem;
 #include "cam/heightfield.h"
 #include "miniz.h"
 
-namespace aicad {
+namespace chudware {
 namespace cam {
 
 namespace {
@@ -687,7 +687,7 @@ json cam_save(const std::string& doc_id, const std::string& path_in) {
     if (!mz_zip_writer_init_file(&zip, path.c_str(), 0))
         throw OpError("io_error", "cannot open file for write: " + path, json::object());
     bool ok = mz_zip_writer_add_mem(&zip, "job.json", data.data(), data.size(), MZ_BEST_COMPRESSION);
-    ok = ok && mz_zip_writer_add_mem(&zip, "MANIFEST", "aicad-cam/1\n", 12, MZ_BEST_COMPRESSION);
+    ok = ok && mz_zip_writer_add_mem(&zip, "MANIFEST", "chudware-cam/1\n", 12, MZ_BEST_COMPRESSION);
     mz_zip_writer_finalize_archive(&zip);
     mz_zip_writer_end(&zip);
     if (!ok) throw OpError("io_error", "failed to write .cam+ archive", json::object());
@@ -725,4 +725,4 @@ bool force_release_cam_lock() {
 }
 
 }  // namespace cam
-}  // namespace aicad
+}  // namespace chudware

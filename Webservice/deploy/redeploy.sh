@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Admin redeploy — restart billet-gateway (detached; API already delayed launch).
+# Admin redeploy — restart chudware-gateway (detached; API already delayed launch).
 set -euo pipefail
 
-LOGDIR="${BILLET_WEB_DATA:-$HOME/billet-web-data}/logs"
+LOGDIR="${CHUDWARE_WEB_DATA:-$HOME/chudware-web-data}/logs"
 mkdir -p "$LOGDIR"
 
-REPO="${BILLET_OMP_DIR:-$HOME/Repositories/CAD}"
+REPO="${CHUDWARE_OMP_DIR:-$HOME/Repositories/CAD}"
 cd "$REPO"
 
 STATUS="$LOGDIR/deploy-status.json"
@@ -37,11 +37,11 @@ echo "=== admin-redeploy start $(date -Iseconds) ==="
 # Extra beat so any in-flight 202 has fully flushed even if delay=2 was skipped.
 sleep 1
 
-echo "[$(date -Iseconds)] systemctl --user restart billet-gateway"
-systemctl --user restart billet-gateway
+echo "[$(date -Iseconds)] systemctl --user restart chudware-gateway"
+systemctl --user restart chudware-gateway
 
-echo "[$(date -Iseconds)] systemctl --user is-active billet-gateway"
-systemctl --user is-active billet-gateway || true
+echo "[$(date -Iseconds)] systemctl --user is-active chudware-gateway"
+systemctl --user is-active chudware-gateway || true
 
 echo "[$(date -Iseconds)] curl healthz"
 curl -fsS http://127.0.0.1:8300/healthz || true

@@ -10,7 +10,7 @@ triggers:
 
 # Edit Part
 
-How to model one solid part in Billet. Prefer standard editable features over freeform code.
+How to model one solid part in Chudware. Prefer standard editable features over freeform code.
 
 ## Sequence
 

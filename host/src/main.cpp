@@ -1,9 +1,9 @@
-// AI-CAD native host.
+// Chudware native host.
 //
 // Modes:
-//   AI-CAD --render  <in.stl> <out.png> [view]   single offscreen view (iso/front/right/top)
-//   AI-CAD --contact <in.stl> <out.png>          2x2 contact sheet
-//   AI-CAD [--gui]                               interactive desktop app (ImGui)
+//   Chudware --render  <in.stl> <out.png> [view]   single offscreen view (iso/front/right/top)
+//   Chudware --contact <in.stl> <out.png>          2x2 contact sheet
+//   Chudware [--gui]                               interactive desktop app (ImGui)
 //
 // The offscreen modes need only a hidden GL context, so they verify the whole render
 // path headlessly. GUI mode is in gui.cpp.
@@ -32,7 +32,7 @@
 #include "renderer.h"
 #include "worker_client.h"
 
-#ifdef AI_CAD_ENABLE_CEF
+#ifdef CHUDWARE_ENABLE_CEF
 #include "ui/widgets/cef/cef_app.h"
 #include "ui/widgets/cef/cef_osr_shot.h"
 #include "ui/widgets/cef/cef_headless.h"
@@ -52,7 +52,7 @@ namespace {
 #ifdef _WIN32
 // ---- crash diagnostics ---------------------------------------------------------------------
 // On any unhandled SEH fault (access violation, etc.) write a symbolized call stack + a minidump
-// next to the exe (and append the stack to $AI_CAD_LOG_FILE when set) so an "instant hard crash"
+// next to the exe (and append the stack to $CHUDWARE_LOG_FILE when set) so an "instant hard crash"
 // reported in the field gives us the exact faulting frame instead of a silent window-close.
 LONG WINAPI aicadCrashFilter(EXCEPTION_POINTERS* ep) {
     char dir[MAX_PATH] = {0};
@@ -73,7 +73,7 @@ LONG WINAPI aicadCrashFilter(EXCEPTION_POINTERS* ep) {
         std::fprintf(stderr, "%s\n", line.c_str());
     };
     char hdr[128];
-    std::snprintf(hdr, sizeof(hdr), "Billet CRASH  code=0x%08lX  addr=%p",
+    std::snprintf(hdr, sizeof(hdr), "Chudware CRASH  code=0x%08lX  addr=%p",
                   ep->ExceptionRecord->ExceptionCode,
                   ep->ExceptionRecord->ExceptionAddress);
     emit(hdr);
@@ -147,7 +147,7 @@ LONG WINAPI aicadCrashFilter(EXCEPTION_POINTERS* ep) {
     }
 
     // Mirror the stack into the running log file if one is configured.
-    if (const char* lf = std::getenv("AI_CAD_LOG_FILE")) {
+    if (const char* lf = std::getenv("CHUDWARE_LOG_FILE")) {
         std::ifstream in(stackPath, std::ios::binary);
         std::ofstream log(lf, std::ios::app | std::ios::binary);
         if (in && log) log << "\n" << in.rdbuf() << "(minidump: " << dmpPath << ")\n";
@@ -167,10 +167,10 @@ void installCrashHandler() {}
 extern "C" char** environ;
 #endif
 
-// ---- Billet env-var shim -------------------------------------------------------------------
-// BILLET_* is the canonical public env-var prefix (deep-rename); AI_CAD_* / AICAD_* remain the
-// internal transport read throughout the codebase. For every BILLET_X present in the
-// environment, set AI_CAD_X and AICAD_X when not already set, so a user exporting only the new
+// ---- Chudware env-var shim -------------------------------------------------------------------
+// CHUDWARE_* is the canonical public env-var prefix (deep-rename); CHUDWARE_* / CHUDWARE_* remain the
+// internal transport read throughout the codebase. For every CHUDWARE_X present in the
+// environment, set CHUDWARE_X and CHUDWARE_X when not already set, so a user exporting only the new
 // names reaches every legacy read site. Never overwrites an explicitly-set legacy var.
 void propagateBilletEnv() {
 #ifdef _WIN32
@@ -179,7 +179,7 @@ void propagateBilletEnv() {
     char** envp = environ;
 #endif
     if (!envp) return;
-    constexpr const char* kPrefix = "BILLET_";
+    constexpr const char* kPrefix = "CHUDWARE_";
     constexpr size_t kPrefixLen = 7;
     for (char** e = envp; *e; ++e) {
         const char* kv = *e;
@@ -189,7 +189,7 @@ void propagateBilletEnv() {
         const std::string suffix(kv + kPrefixLen, static_cast<size_t>(eq - (kv + kPrefixLen)));
         if (suffix.empty()) continue;
         const std::string value(eq + 1);
-        for (const std::string& legacy : {"AI_CAD_" + suffix, "AICAD_" + suffix}) {
+        for (const std::string& legacy : {"CHUDWARE_" + suffix, "CHUDWARE_" + suffix}) {
             if (!std::getenv(legacy.c_str())) {
 #ifdef _WIN32
                 _putenv_s(legacy.c_str(), value.c_str());
@@ -344,7 +344,43 @@ int buildAndRender(const std::string& src, const std::string& out) {
     return renderContact(stl, out);
 }
 
+// Map legacy AI_CAD_/AICAD_/BILLET_/SHOPCRAFT_ environment variables onto their CHUDWARE_
+// equivalents when the new name is unset, so pre-rename scripts and environments keep
+// working after the Chudware rename. Runs before anything reads config/env.
+static void applyLegacyEnvCompat() {
+#if defined(_WIN32)
+    char** envp = _environ;
+#else
+    extern char** environ;
+    char** envp = environ;
+#endif
+    if (!envp) return;
+    static const char* kPrefixes[] = {"AI_CAD_", "AICAD_", "BILLET_", "SHOPCRAFT_"};
+    std::vector<std::string> entries;
+    for (char** e = envp; *e; ++e) entries.emplace_back(*e);  // snapshot: setenv may realloc environ
+    for (const std::string& kv : entries) {
+        const std::size_t eq = kv.find('=');
+        if (eq == std::string::npos) continue;
+        const std::string key = kv.substr(0, eq);
+        for (const char* pfx : kPrefixes) {
+            const std::size_t plen = std::strlen(pfx);
+            if (key.size() > plen && key.compare(0, plen, pfx) == 0) {
+                const std::string neu = "CHUDWARE_" + key.substr(plen);
+                if (!std::getenv(neu.c_str())) {
+#if defined(_WIN32)
+                    _putenv_s(neu.c_str(), kv.substr(eq + 1).c_str());
+#else
+                    setenv(neu.c_str(), kv.substr(eq + 1).c_str(), 0);
+#endif
+                }
+                break;
+            }
+        }
+    }
+}
+
 int main(int argc, char** argv) {
+    applyLegacyEnvCompat();  // legacy env-var back-compat (pre-Chudware rename)
 #ifdef __EMSCRIPTEN__
     // Web client: skip desktop CLI modes entirely. Report progress via Module.setStatus
     // (shell.html) which is reliable from the browser main thread.
@@ -381,17 +417,17 @@ int main(int argc, char** argv) {
     }, rc);
     return rc;
 #else
-    // FIRST: mirror BILLET_* env vars onto the legacy AI_CAD_*/AICAD_* names every
+    // FIRST: mirror CHUDWARE_* env vars onto the legacy CHUDWARE_*/CHUDWARE_* names every
     // subsystem (and every child process we spawn) actually reads.
     propagateBilletEnv();
-#ifdef AI_CAD_ENABLE_CEF
+#ifdef CHUDWARE_ENABLE_CEF
     // A separate subprocess executable (ai_cad_cef_helper) is configured via
     // CefSettings.browser_subprocess_path, so this main binary is ALWAYS the
     // browser process and must NOT call CefExecuteProcess. Initialise CEF HERE,
     // before GLFW/X11 grab the display and signal handlers — CefInitialize wants
     // to bootstrap Chromium first. Only when the CEF backend is selected.
     ui::cef::stash_args(argc, argv);
-    // Headless OSR self-test: `AI-CAD --cef-shot <url> <out.png>` renders a page
+    // Headless OSR self-test: `Chudware --cef-shot <url> <out.png>` renders a page
     // off-screen via CEF and writes a PNG — proves the browser pipeline with no
     // display. Returns before any GUI/GLFW setup.
     if (argc >= 4 && std::strcmp(argv[1], "--cef-shot") == 0) {
@@ -401,7 +437,7 @@ int main(int argc, char** argv) {
         ui::cef::shutdown();
         return ok ? 0 : 1;
     }
-    // Headless page fetch: `AI-CAD --cef-fetch <url> [out.html]` drives CEF (not
+    // Headless page fetch: `Chudware --cef-fetch <url> [out.html]` drives CEF (not
     // Playwright) to load a page and print/write its post-JS HTML. This is the
     // production headless path the Python scraper calls via RPC; the CLI form is
     // the standalone/one-off entry. Prints HTML to stdout when no file is given.
@@ -420,7 +456,7 @@ int main(int argc, char** argv) {
                      r.ok ? "OK" : "FAILED", r.status, r.final_url.c_str());
         ui::cef::shutdown_and_exit(r.ok ? 0 : 1);  // watchdog'd; does not return
     }
-    // Headless file download: `AI-CAD --cef-download <url> <dest>` pulls raw bytes
+    // Headless file download: `Chudware --cef-download <url> <dest>` pulls raw bytes
     // (datasheet/CAD) through CEF's network stack with the profile's cookies.
     if (argc >= 4 && std::strcmp(argv[1], "--cef-download") == 0) {
         const bool ok = ui::cef::initialize() &&
@@ -428,7 +464,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "[cef-download] %s -> %s\n", ok ? "OK" : "FAILED", argv[3]);
         ui::cef::shutdown_and_exit(ok ? 0 : 1);  // watchdog'd; does not return
     }
-    // CEF host daemon: `AI-CAD --cef-daemon <sock> [idle_secs]` serves headless
+    // CEF host daemon: `Chudware --cef-daemon <sock> [idle_secs]` serves headless
     // fetch/download to the Python scraper over the socket and idle-exits. Lazily
     // spawned by services/browser/cef_client.py; the sole CEF owner (Phase 2).
     if (argc >= 3 && std::strcmp(argv[1], "--cef-daemon") == 0) {
@@ -452,24 +488,24 @@ int main(int argc, char** argv) {
         std::printf("%s\n", log.c_str());
         return ok ? 0 : 1;
     }
-#ifdef AI_CAD_ENABLE_CEF
+#ifdef CHUDWARE_ENABLE_CEF
     // GUI path always boots CEF here — before run_gui / GLFW. Chromium must own
     // display + signal setup first; initializing after GLFW (true "lazy" first-
     // web-surface) aborts on Linux vendor open (SIGABRT / joinable-thread
     // terminate on the way out). Headless CEF modes above already returned.
-    // Experimental only: AI_CAD_CEF_LAZY=1 skips cold init (CefWebView::open
+    // Experimental only: CHUDWARE_CEF_LAZY=1 skips cold init (CefWebView::open
     // still calls initialize()); do not use for vendor sign-in.
     const bool cefLazy = [] {
-        const char* v = std::getenv("AI_CAD_CEF_LAZY");
+        const char* v = std::getenv("CHUDWARE_CEF_LAZY");
         return v && v[0] && v[0] != '0';
     }();
-    // AI_CAD_CEF_EARLY=1 remains accepted as an alias for "eager" (no-op when
+    // CHUDWARE_CEF_EARLY=1 remains accepted as an alias for "eager" (no-op when
     // lazy is unset). Prefer leaving both unset for the production path.
     if (!cefLazy) ui::cef::initialize();
 #endif
     if (argc >= 2 && std::strcmp(argv[1], "--ui-screenshot") == 0) {
         // Headless UI capture. An explicit output path is optional; when omitted (the common
-        // smoke-test invocation `AI-CAD --ui-screenshot`), default to a PNG next to the exe so
+        // smoke-test invocation `Chudware --ui-screenshot`), default to a PNG next to the exe so
         // `shot` is still enabled and the capture-then-exit path runs (otherwise we'd fall
         // through to interactive GUI mode and hang headlessly, never writing a PNG).
         static std::string defShot = exeDir() + "/ui_screenshot.png";

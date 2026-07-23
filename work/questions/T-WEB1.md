@@ -1,9 +1,9 @@
-# T-WEB1 — Billet web service (per-user streamed sessions) — advisor consult
+# T-WEB1 — Chudware web service (per-user streamed sessions) — advisor consult
 
 Driver: web-service session (Hunter away; standing instruction: consult advisor, decide, build).
 Research corpus: `Webservice/research/{headless,plm,websurface,streaming,auth}.md`.
 
-## Proposed architecture (v1 "billet-web")
+## Proposed architecture (v1 "chudware-web")
 
 ```
 Browser ──HTTPS/WSS──> Cloudflare Tunnel ──> Access (Google IdP whitelist + OTP for ua.edu)
@@ -12,7 +12,7 @@ Browser ──HTTPS/WSS──> Cloudflare Tunnel ──> Access (Google IdP whit
                         Gateway (FastAPI, host, rootless) — portal page, JWT verify,
                         session manager (podman), chat shoutbox WS, reverse proxy
                                       ▼ per-user
-                        Session container (Selkies nvidia-glx-desktop base + Billet,
+                        Session container (Selkies nvidia-glx-desktop base + Chudware,
                         NVENC, --device nvidia.com/gpu=all, mem/cpu caps, per-user HOME vol)
                                       ▼
                         Shared PLM: central bare vault repos on host + per-session sync
@@ -36,14 +36,14 @@ contracts/plm.md §6 but UNBUILT. Options:
 - (a) bind-mount one shared project dir into all containers; rely on HEAD CAS + retries.
   Zero engine work; races on packed-refs/index; scout says don't.
 - (b) implement minimal T-R7 subset now: `services/plm/remote.py` — central bare repo on host
-  (`/srv/billet/plm/<project>.git`), per-session clone, `plm_sync` = fetch+ff / CAS push,
+  (`/srv/chudware/plm/<project>.git`), per-session clone, `plm_sync` = fetch+ff / CAS push,
   conflict → copy-as-variant per §6; wire `plm_add_remote`/`plm_sync` worker+MCP tools already
   reserved in contract. Additive, no contract bump.
 Recommend (b). Ratify scope (no locks UI, no merge)?
 
 ## Q4 Session image
-Selkies base is Ubuntu 24.04; Billet builds on Fedora 44. Options: (a) run the AppImage
-(bundles libaicad/OCCT/hostd/CEF) inside the Ubuntu base; (b) rebuild Billet inside an
+Selkies base is Ubuntu 24.04; Chudware builds on Fedora 44. Options: (a) run the AppImage
+(bundles libchudware/OCCT/hostd/CEF) inside the Ubuntu base; (b) rebuild Chudware inside an
 Ubuntu image layer; (c) Fedora base + hand-rolled Selkies install. Recommend (a) with (b) as
 fallback if glibc/GL deps fail. Ratify?
 
@@ -82,20 +82,20 @@ Selkies (MPL-2.0, default WebSocket+WebCodecs, NVENC + `x264enc` fallback, singl
 **Reject (a)** shared bind-mount of one working tree: `gitbind` HEAD CAS + `Vault.save` 6× retry is real, but “No cross-process lock”; working `.step+`, `config.json` RMW, `ai_vc/`, and restore-vs-open races remain. `status()["locks"]=[]` stub; `_user_author()` is always `{id:"user"}`. Contract §6 is **one checkout per user + remote sync**, not N writers on one tree.
 
 **Do (b) with these scope pins (still additive `aicad.plm/1`, no contract bump):**
-1. Host central **bare** folder remotes under e.g. `/srv/billet/plm/<project>.git`; per-session private project dir + private `.aicadvault`.
+1. Host central **bare** folder remotes under e.g. `/srv/chudware/plm/<project>.git`; per-session private project dir + private `.aicadvault`.
 2. Implement `services/plm/remote.py` for **folder** kind first: seed/clone, `plm_add_remote`, `plm_sync` = fetch + linear replay of unpublished locals + expected-old push; same-`item_id` collision → copy-as-variant (§6.4). Wire MCP + `worker_rpc.WORKER_METHODS` (today neither registers remote tools; MCP line 18 defers T-R7).
 3. **dulwich is sufficient for folder remotes** (verified: `porcelain.clone` path, bare clone, `push` to `file://` bare). Caveat: `fetch` into a fresh bare may leave symbolic HEAD without resolving branch tips — remote code must set `refs/heads/*` + HEAD explicitly after seed/fetch.
 4. **Defer locks UI** for demo if needed, but implement `plm_lock`/`plm_unlock` CAS on `refs/aicad/locks` in the same T-R7 subset if two humans share a project (contract model is locks+sync, not merge). No merge UI — ratified.
 5. **Mandatory additive:** inject session author `{kind,id,display}` from Access email into vault saves (replace stub); gateway auto-`plm_sync` on session start/end (T-R7 open Q1 for web). Never confuse `gitscm.py` (project `.git`) with vault remotes.
 
 ### Q4 Session image — **REJECTED (a); MODIFIED → (c) Fedora-native stack**
-**Reject (a) AppImage-in-Ubuntu-Selkies as primary.** `build_appimage.sh` leaves **glibc/libstdc++/GL/X11 host-provided**; host build is **glibc 2.43** (Fedora 44). Ubuntu 24.04 container glibc is **2.39**. Fedora-built Billet/libaicad needing `GLIBC_2.43` will not load on 24.04. Selkies GHCR tags are only **20.04 / 22.04 / 24.04** — no 25.x/26.04 base with newer glibc.
+**Reject (a) AppImage-in-Ubuntu-Selkies as primary.** `build_appimage.sh` leaves **glibc/libstdc++/GL/X11 host-provided**; host build is **glibc 2.43** (Fedora 44). Ubuntu 24.04 container glibc is **2.39**. Fedora-built Chudware/libchudware needing `GLIBC_2.43` will not load on 24.04. Selkies GHCR tags are only **20.04 / 22.04 / 24.04** — no 25.x/26.04 base with newer glibc.
 
-**Reject (b) rebuild-inside-Ubuntu-24.04 as primary.** Host engine links **system OCCT 7.9.3** (`/usr/lib64/libTKernel.so.7.9*` from `opencascade-*-7.9.3-2.fc44`). Ubuntu 24.04’s OCCT is older; rebuilding the full OCCT/libaicad/hostd/CEF stack on Ubuntu is a second product build, not a thin layer. High demo risk.
+**Reject (b) rebuild-inside-Ubuntu-24.04 as primary.** Host engine links **system OCCT 7.9.3** (`/usr/lib64/libTKernel.so.7.9*` from `opencascade-*-7.9.3-2.fc44`). Ubuntu 24.04’s OCCT is older; rebuilding the full OCCT/libchudware/hostd/CEF stack on Ubuntu is a second product build, not a thin layer. High demo risk.
 
 **Ratify (c) — specific combo:**
 - Base: **Fedora 44** container (matches host toolchain).
-- CAD stack: **dnf opencascade 7.9** + staged/build Billet + hostd + libaicad (same ABI as workstation), or extract AppImage **onto Fedora** (glibc match).
+- CAD stack: **dnf opencascade 7.9** + staged/build Chudware + hostd + libchudware (same ABI as workstation), or extract AppImage **onto Fedora** (glibc match).
 - Display: **Xvfb** (or Xorg dummy) + **VirtualGL / EGL** so NVIDIA GL is available under headless X (matches headless research: real X11 window required).
 - Stream: **selkies via pip/official install** into that image (not `FROM nvidia-glx-desktop:24.04`).
 - GPU: rootless Podman + CDI `--device nvidia.com/gpu=…`, `NVIDIA_DRIVER_CAPABILITIES` including graphics+video; SELinux `container_use_devices`.
@@ -118,7 +118,7 @@ Direction is sound (cgroup caps, idle reaper, gateway MemoryMax, NVENC ≤8). Ad
 | pids-limit + HOME quota | OK | Ratify |
 
 ### Q6 Chat/shoutbox — **RATIFIED**
-Portal chrome + gateway WS fan-out + SQLite + presence from live sessions. Keep out of Billet binary. Reuse org `channel_send` / agent_events shapes as patterns only (websurface research).
+Portal chrome + gateway WS fan-out + SQLite + presence from live sessions. Keep out of Chudware binary. Reuse org `channel_send` / agent_events shapes as patterns only (websurface research).
 
 ### Q7 Code placement — **MODIFIED**
 `Webservice/{gateway,image,deploy,research,DESIGN.md}` + T-R7 in `services/plm/` (+ MCP/worker wiring) is correct. Gate: gateway pytest + image build + smoke. **Add:** gitignore secrets under `Webservice/` (Cloudflare-info.txt is a live secret risk per websurface scout); never commit tokens. Prefer `Webservice/config.example.env` only.
@@ -133,19 +133,19 @@ Reject for v1. Full OCCT/CUDA-adjacent/CEF/ImGui desktop is not a product WASM p
 2. **Session reconnect:** refresh/WS drop must reattach to **same** container (session id cookie/map), not spawn a second 5 GiB seat; Selkies one-browser-at-a-time messaging.
 3. **Project bootstrap:** empty seat with no project is a fail — control plane seeds bare remote + private clone, or “Open demo project” one-click; auto-sync on start/end.
 4. **File in/out:** browser upload/download of STEP/step+ (Selkies clipboard/files or gateway `/transfer`) — PLM alone is not enough for “I brought a file on my laptop.”
-5. **Cold start latency:** Fedora image pull + Xvfb + Billet first launch can be minutes; pre-pull image, warm pool of 1 idle seat, healthcheck before iframe.
-6. **CEF in container:** may need `--no-sandbox` / disable vendor browser for demo stability (`AI_CAD` CEF abort without icudtl already documented).
+5. **Cold start latency:** Fedora image pull + Xvfb + Chudware first launch can be minutes; pre-pull image, warm pool of 1 idle seat, healthcheck before iframe.
+6. **CEF in container:** may need `--no-sandbox` / disable vendor browser for demo stability (`Chudware` CEF abort without icudtl already documented).
 7. **Identity on timeline:** without author injection every commit is “User” — looks broken in shared PLM.
 8. **Secret/gitignore** and tunnel hostname ready before demo day.
 
 ### B) Encoder / GPU seat policy — **YES, default CPU x264; reserve NVENC+GPU-GL**
-Default every session: `SELKIES_ENCODER=x264enc` (or software) + software/llvmpipe **or** light VirtualGL only if measured safe. **Reserve ≤2 “heavy” seats** with GPU GL + `nvh264enc` for demos that need real viewport feel. Rationale: 12 GiB VRAM shared across KDE/Xorg/Billet/NVENC contexts; streaming research estimates 1–3 GiB/session GPU path; 4 full GPU seats on one 3080 Ti is the most likely live OOM. CPU encode costs cores (7600X3D 6C/12T) — cap concurrent x264 interactive seats at ~3 with reaper.
+Default every session: `SELKIES_ENCODER=x264enc` (or software) + software/llvmpipe **or** light VirtualGL only if measured safe. **Reserve ≤2 “heavy” seats** with GPU GL + `nvh264enc` for demos that need real viewport feel. Rationale: 12 GiB VRAM shared across KDE/Xorg/Chudware/NVENC contexts; streaming research estimates 1–3 GiB/session GPU path; 4 full GPU seats on one 3080 Ti is the most likely live OOM. CPU encode costs cores (7600X3D 6C/12T) — cap concurrent x264 interactive seats at ~3 with reaper.
 
 ### C) Minimum viable monitoring (Hunter away)
 1. **systemd user/system units** for gateway + cloudflared: `Restart=on-failure`, `MemoryMax` already on gateway.
-2. **Host watchdogs (cron or simple timer every 1–5 min):** free RAM ≥8 GiB, load, disk on `/srv/billet` + container storage; if free RAM &lt;4 GiB or disk &lt;10% → stop oldest idle session, optionally refuse new starts.
+2. **Host watchdogs (cron or simple timer every 1–5 min):** free RAM ≥8 GiB, load, disk on `/srv/chudware` + container storage; if free RAM &lt;4 GiB or disk &lt;10% → stop oldest idle session, optionally refuse new starts.
 3. **`nvidia-smi` poll:** VRAM used, GPU util, encoder sessions; alert/log if VRAM &gt;10 GiB or process count anomaly.
-4. **Podman:** list billet-* containers; kill any without recent gateway WS heartbeat; enforce max_sessions.
+4. **Podman:** list chudware-* containers; kill any without recent gateway WS heartbeat; enforce max_sessions.
 5. **Logs:** gateway access + session start/stop + OOM kills to a rotating file; optional Discord notify on OOM/disk (existing notify pattern).
 6. **Health URL** behind Access: `/healthz` shows session count, free RAM, VRAM, image pre-pulled bit — for remote glance.
 7. **No** full Prometheus required for v1; a 50-line Python/bash sampler writing JSONL is enough so the box does not melt unattended.

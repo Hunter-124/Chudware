@@ -6,7 +6,7 @@
 // threads the supernodal DGEMM saturates memory bandwidth on this class of desktop and
 // oversubscribes against CHOLMOD's own OpenMP pool, so the cap is min(governed, 8)
 // after leaving 2 cores for the GUI when possible.
-// AI_CAD_FEA_THREADS overrides for benchmarking.
+// CHUDWARE_FEA_THREADS overrides for benchmarking.
 //
 // F3: the cap is sourced from the resource governor / shared thread pool so nested
 // solves share ONE budget instead of each ad-hoc OMP region oversubscribing.
@@ -23,24 +23,24 @@
 #include "util/resource_governor.h"
 #include "util/thread_pool.h"
 
-#ifdef AICAD_HAVE_OPENMP
+#ifdef CHUDWARE_HAVE_OPENMP
 #include <omp.h>
 #endif
 
-namespace aicad::sim {
+namespace chudware::sim {
 
 // Governed host thread budget for heavy solver kernels: min(pool max, hw-2, 8),
-// with AI_CAD_FEA_THREADS as an absolute override. Always >= 1.
+// with CHUDWARE_FEA_THREADS as an absolute override. Always >= 1.
 inline int governed_solver_threads() {
-    if (const char* e = std::getenv("AI_CAD_FEA_THREADS")) {
+    if (const char* e = std::getenv("CHUDWARE_FEA_THREADS")) {
         const int want = std::atoi(e);
         if (want >= 1) return want;
     }
     // Prefer the live shared-pool size (already governor-clamped); fall back to a
     // fresh plan_for so a never-reconfigured process still gets a sane number.
-    int pool_n = aicad::pool::shared().max_workers();
+    int pool_n = chudware::pool::shared().max_workers();
     if (pool_n < 1) {
-        const auto plan = aicad::governor::plan_for(0, "solver_threads", 0);
+        const auto plan = chudware::governor::plan_for(0, "solver_threads", 0);
         pool_n = plan.workers;
     }
     unsigned hw = std::thread::hardware_concurrency();
@@ -50,7 +50,7 @@ inline int governed_solver_threads() {
 }
 
 inline void cap_solver_threads_for_host() {
-#if defined(AICAD_HAVE_OPENMP)
+#if defined(CHUDWARE_HAVE_OPENMP)
     const int want = governed_solver_threads();
     omp_set_num_threads(want);
     // Belt-and-suspenders for BLAS backends that read the env (FlexiBLAS/OpenBLAS).
@@ -67,4 +67,4 @@ inline void cap_solver_threads_for_host() {
 #endif
 }
 
-}  // namespace aicad::sim
+}  // namespace chudware::sim

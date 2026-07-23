@@ -13,9 +13,9 @@
 #include <cmath>
 #include <string>
 
-using aicad::sketch::solve_sketch;
-using aicad::sketch::drag;
-using aicad::sketch::SketchSolution;
+using chudware::sketch::solve_sketch;
+using chudware::sketch::drag;
+using chudware::sketch::SketchSolution;
 using json = nlohmann::json;
 
 namespace {

@@ -10,7 +10,7 @@
 #include <utility>
 #include <vector>
 
-namespace aicad::doc {
+namespace chudware::doc {
 namespace {
 
 // SINGLE SOURCE for document op kinds. Keep session.cpp::apply_one handlers in
@@ -242,4 +242,4 @@ std::string doc_ops_cheatsheet_snippet() {
     return oss.str();
 }
 
-}  // namespace aicad::doc
+}  // namespace chudware::doc

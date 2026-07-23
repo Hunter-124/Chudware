@@ -38,7 +38,7 @@ echo === windows-occt ===
 "$cmake" --preset windows-occt || exit /b 1
 "$cmake" --build --preset windows-occt --parallel || exit /b 1
 echo === host GUI ===
-"$cmake" -S host -B host\build-win -G Ninja -DCMAKE_BUILD_TYPE=Release -DAI_CAD_ENABLE_CEF=OFF || exit /b 1
+"$cmake" -S host -B host\build-win -G Ninja -DCMAKE_BUILD_TYPE=Release -DCHUDWARE_ENABLE_CEF=OFF || exit /b 1
 "$cmake" --build host\build-win --parallel || exit /b 1
 exit /b 0
 "@
@@ -58,6 +58,6 @@ if (Test-Path $py) {
 }
 
 Write-Host ""
-Write-Host "DONE. Run: dist\AI-CAD\Billet.exe"
-Write-Host "  or:    host\build-win\bin\Billet.exe"
-Write-Host "MCP: restart Grok / Claude Code / OpenCode to pick up billet (lite)."
+Write-Host "DONE. Run: dist\Chudware\Chudware.exe"
+Write-Host "  or:    host\build-win\bin\Chudware.exe"
+Write-Host "MCP: restart Grok / Claude Code / OpenCode to pick up chudware (lite)."

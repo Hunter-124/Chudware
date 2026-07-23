@@ -8,7 +8,7 @@ External tool:
 
 Internal seam:
     ``run_auto_preflight(doc_id, tool, ops)`` — called by add_features / mutating
-    tools when ``AI_CAD_PREFLIGHT=1`` (default on).  Returns the preflight result
+    tools when ``CHUDWARE_PREFLIGHT=1`` (default on).  Returns the preflight result
     dict; caller attaches ``advisory_items`` to its own response and, if the
     verdict is ``fail``, calls ``log_preflight_override`` after applying.
 
@@ -29,9 +29,9 @@ def run_auto_preflight(doc_id: str, tool: str, ops: list) -> dict:
     """Run preflight automatically inside mutating tools.
 
     Returns an aicad.preflight/1 dict, or ``{"verdict": "skipped", "skipped": "disabled"}``
-    when AI_CAD_PREFLIGHT=0.  Never raises.
+    when CHUDWARE_PREFLIGHT=0.  Never raises.
     """
-    enabled = os.environ.get("AI_CAD_PREFLIGHT", "1").strip().lower()
+    enabled = os.environ.get("CHUDWARE_PREFLIGHT", "1").strip().lower()
     if enabled in ("0", "false", "off", "no"):
         return {
             "schema": "aicad.preflight/1",
@@ -39,7 +39,7 @@ def run_auto_preflight(doc_id: str, tool: str, ops: list) -> dict:
             "target": {"doc_id": doc_id, "tool": tool, "ops_hash": ""},
             "verdict": "skipped",
             "skipped": "disabled",
-            "skipped_detail": "AI_CAD_PREFLIGHT=0",
+            "skipped_detail": "CHUDWARE_PREFLIGHT=0",
             "checks": [],
             "predicted": {},
             "downstream": [],

@@ -1,7 +1,7 @@
 """Managed llama.cpp provider.
 
 Wraps the generic OpenAI-compatible provider, but first ensures a local llama.cpp server is
-reachable. This keeps the agent/provider layer clean while giving AI-CAD a real packaging seam for a
+reachable. This keeps the agent/provider layer clean while giving Chudware a real packaging seam for a
 headless local model backend.
 """
 from __future__ import annotations

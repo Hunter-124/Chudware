@@ -13,7 +13,7 @@ DETERMINISTIC-FIRST (Pillar 13, normative for this module):
 * Feature display labels come from the documents ONLY when they carry no
   digits; otherwise the feature id (which appears verbatim in the diff) is
   used, so label text can never smuggle in a numeral absent from the diff.
-* Any learned polish is optional garnish behind ``AICAD_PLM_SUMMARY_POLISH=1``
+* Any learned polish is optional garnish behind ``CHUDWARE_PLM_SUMMARY_POLISH=1``
   plus an explicitly registered hook; its output is validated (numeral subset
   + no git vocabulary) and discarded in favor of the deterministic text on any
   violation. With the flag unset this module never calls anything learned.
@@ -39,14 +39,14 @@ _MAX_CLAUSES = 6
 _NUMERAL_RE = re.compile(r"\d+(?:\.\d+)?")
 
 # Optional learned-polish hook (garnish only; see module docstring).
-_POLISH_FLAG = "AICAD_PLM_SUMMARY_POLISH"
+_POLISH_FLAG = "CHUDWARE_PLM_SUMMARY_POLISH"
 _polish_hook: Callable[[str, dict], str] | None = None
 
 
 def set_polish_hook(fn: Callable[[str, dict], str] | None) -> None:
     """Register (or clear) the optional learned-polish hook.
 
-    The hook is only ever consulted when ``AICAD_PLM_SUMMARY_POLISH=1``; its
+    The hook is only ever consulted when ``CHUDWARE_PLM_SUMMARY_POLISH=1``; its
     output must preserve the deterministic numeral set and stay free of git
     vocabulary or it is discarded.
     """

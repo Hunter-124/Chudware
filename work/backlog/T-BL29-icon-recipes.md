@@ -23,7 +23,7 @@ python3 scripts/icon_pipeline.py --render
 
 That command reads the RECIPES table in `scripts/icon_pipeline.py`, builds demo parts via
 the real engine, captures clean GL-viewport thumbnails (no gizmo/labels) via
-`AI_CAD_SHOT=iconpipe`, composites them into BOTH theme atlases (byte-preserving all other
+`CHUDWARE_SHOT=iconpipe`, composites them into BOTH theme atlases (byte-preserving all other
 cells), marks photographic tiles `raster_only` in `atlas.json` (so they never get
 SDF-flattened), and writes a contact sheet.
 
@@ -83,7 +83,7 @@ recipe-writing + eyeballing + any scenario-side extensions called out below.
 ### Sheet Metal — Create
 - [ ] Sheet Metal tab renders EMPTY headless without doc context (T-G15 HANDOFF 2 noted:
       contextual gating). **Resolve: either add a doc/workspace-mode hook or verify the
-      `AI_CAD_SHOT=iconpipe` path can construct a sheet-metal doc** before writing recipes
+      `CHUDWARE_SHOT=iconpipe` path can construct a sheet-metal doc** before writing recipes
 - [ ] Recipes for Sheet Metal Create group cells
 - [ ] All generated Sheet Metal Create icons eyeballed
 
@@ -102,7 +102,7 @@ recipe-writing + eyeballing + any scenario-side extensions called out below.
 
   **Note:** Both presets require the Appearance/Display GL state to be active in the
   viewport during capture. T-G15 HANDOFF 2 flags this as needing "appearance-display
-  scenes" — likely a new `AI_CAD_SHOT=iconpipe` recipe variant or a new scenario hook that
+  scenes" — likely a new `CHUDWARE_SHOT=iconpipe` recipe variant or a new scenario hook that
   applies the appearance preset before thumbnail capture.
 
 ### Manufacture — 2.5D, Holes, 3D, Turning, Cutting
@@ -123,7 +123,7 @@ recipe-writing + eyeballing + any scenario-side extensions called out below.
 ### Wrap-up
 - [ ] `python3 scripts/icon_pipeline.py --render` succeeds end-to-end with full recipe set
 - [ ] Contact sheet committed to `work/questions/` for Hunter's round-2 review (all groups)
-- [ ] `AI_CAD_SHOT=ribbon + AI_CAD_RIBBON_TAB=<tab>` in-context verification for each
+- [ ] `CHUDWARE_SHOT=ribbon + CHUDWARE_RIBBON_TAB=<tab>` in-context verification for each
       newly covered ribbon tab, dark AND light — look at every PNG (PNG-eyeball trap)
 - [ ] `graphify update .` run after any source changes
 

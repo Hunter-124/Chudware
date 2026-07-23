@@ -16,7 +16,7 @@
 
 #include "agent/state.h"  // ojson
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 
 extern const char* kClarifyRole;    // "clarify"
@@ -45,4 +45,4 @@ ojson clarify(const std::string& request, const ojson& doc, const std::string& d
               long revision, const ojson& feature_status, const ClarifyCompleteFn& complete);
 
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware

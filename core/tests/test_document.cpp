@@ -48,8 +48,8 @@
 #include "aicm_loader.h"  // host loader (host/src/render on the include path)
 
 using json = nlohmann::json;
-using aicad::doc::CompileResult;
-using aicad::doc::compile_document;
+using chudware::doc::CompileResult;
+using chudware::doc::compile_document;
 
 namespace {
 
@@ -193,7 +193,7 @@ render::DocMesh parse(const CompileResult& r) {
 
 // Locate a feature's compile status by id (the regression tests below assert on the
 // error / warning text of a specific feature). Returns nullptr when absent.
-const aicad::doc::FeatureStatus* status_of(const CompileResult& r, const char* id) {
+const chudware::doc::FeatureStatus* status_of(const CompileResult& r, const char* id) {
     for (const auto& s : r.statuses)
         if (s.id == id) return &s;
     return nullptr;
@@ -314,7 +314,7 @@ TEST_CASE("revolve accepts an explicit axis vector under an invented wrapper") {
                                                      {"centroid", {6, 15}}, {"hint_index", 0}}})},
                        {"axis", axis_ref}}}},
     });
-    std::vector<std::string> verrs = aicad::doc::validate_document(canon);
+    std::vector<std::string> verrs = chudware::doc::validate_document(canon);
     for (const auto& e : verrs) MESSAGE("unexpected validation error: " << e);
     CHECK(verrs.empty());
 
@@ -344,8 +344,8 @@ TEST_CASE("revolve accepts an explicit axis vector under an invented wrapper") {
 //     dropped -> the bore FUSED with no error. The hoist relocates it into params; the
 //     tube must now form (pi*(20^2-12^2)*50 = 40212, NOT the 67356 of a dropped cut).
 TEST_CASE("add_feature hoists a top-level option into params -> cut is not dropped") {
-    using aicad::doc::doc_new;
-    using aicad::doc::doc_apply_ops;
+    using chudware::doc::doc_new;
+    using chudware::doc::doc_apply_ops;
     json nr = doc_new("part", "TubeTest");
     const std::string id = nr.at("doc_id").get<std::string>();
     auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
@@ -382,7 +382,7 @@ TEST_CASE("chamfer accepts a LIST of edge queries (both ends of a shaft)") {
         json{{"id", "f2"}, {"type", "chamfer"}, {"name", "Ends"}, {"suppressed", false},
              {"params", {{"length", 1.5}}}, {"refs", {{"edges", edges}}}},
     });
-    std::vector<std::string> verrs = aicad::doc::validate_document(canon);
+    std::vector<std::string> verrs = chudware::doc::validate_document(canon);
     for (const auto& e : verrs) MESSAGE("unexpected validation error: " << e);
     CHECK(verrs.empty());
 
@@ -429,7 +429,7 @@ TEST_CASE("hole positions accept a list of [u,v] coordinate pairs (a row of hole
                          {"positions", positions}}},
              {"refs", {{"face", json{{"of", "face"}, {"side", "top"}}}}}},
     });
-    std::vector<std::string> verrs = aicad::doc::validate_document(canon);
+    std::vector<std::string> verrs = chudware::doc::validate_document(canon);
     for (const auto& e : verrs) MESSAGE("unexpected validation error: " << e);
     CHECK(verrs.empty());
 
@@ -478,8 +478,8 @@ TEST_CASE("buried primitive boss errors loudly instead of silently adding nothin
 //     boxes. A Ø10 through-hole in a 40x40x20 box must remove pi*5^2*20 = 1571 (vol 30429),
 //     not a corner quarter-bore (vol ~31607).
 TEST_CASE("hole on a primitive face drills a centred full-diameter bore") {
-    using aicad::doc::doc_new;
-    using aicad::doc::doc_apply_ops;
+    using chudware::doc::doc_new;
+    using chudware::doc::doc_apply_ops;
     json nr = doc_new("part", "HoleCentre");
     const std::string id = nr.at("doc_id").get<std::string>();
     auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
@@ -502,8 +502,8 @@ TEST_CASE("hole on a primitive face drills a centred full-diameter bore") {
 // hole. Also covers a diameter SYNONYM ("dia"). Regression for the gemma "key 'diameter' not
 // found" crash: a missing-but-named-by-standard bore must build, not throw.
 TEST_CASE("hole by fastener standard (M3) and diameter synonym resolve the bore") {
-    using aicad::doc::doc_new;
-    using aicad::doc::doc_apply_ops;
+    using chudware::doc::doc_new;
+    using chudware::doc::doc_apply_ops;
     auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
 
     // (a) standard:"M3", no diameter -> clearance 3.4mm bore.
@@ -544,8 +544,8 @@ TEST_CASE("hole by fastener standard (M3) and diameter synonym resolve the bore"
 // region); the polygon entity gives a clean closed hex. Full hex-standoff path: hexagon -> extrude
 // -> M3 clearance bore, the exact part that previously failed.
 TEST_CASE("polygon entity builds a closed hexagon -> hex standoff extrudes + bores") {
-    using aicad::doc::doc_new;
-    using aicad::doc::doc_apply_ops;
+    using chudware::doc::doc_new;
+    using chudware::doc::doc_apply_ops;
     json nr = doc_new("part", "HexStandoff");
     const std::string id = nr.at("doc_id").get<std::string>();
     json ops = json::array({
@@ -1211,7 +1211,7 @@ TEST_CASE("A1: draft resolves a plain-English face query and tapers it") {
     CompileResult r = compile_document(doc, json::object());
     for (const auto& s : r.statuses)
         if (!s.ok) MESSAGE("feature " << s.id << " error: " << s.error);
-    const aicad::doc::FeatureStatus* dr = status_of(r, "dr");
+    const chudware::doc::FeatureStatus* dr = status_of(r, "dr");
     REQUIRE(dr != nullptr);
     CHECK(dr->ok);                       // the face QUERY resolved (was: dangling)
     CHECK(dr->error.empty());
@@ -1259,7 +1259,7 @@ TEST_CASE("A1b: draft skips non-draftable caps and tapers the rest; errors only 
     // (a) all faces -> the 4 sides draft, the 2 caps are silently skipped -> OK.
     {
         CompileResult r = run(json{{"of", "face"}});
-        const aicad::doc::FeatureStatus* dr = status_of(r, "dr");
+        const chudware::doc::FeatureStatus* dr = status_of(r, "dr");
         REQUIRE(dr != nullptr);
         if (!dr->ok) MESSAGE("A1b(a) all-faces draft error: " << dr->error);
         CHECK(dr->ok);
@@ -1269,7 +1269,7 @@ TEST_CASE("A1b: draft skips non-draftable caps and tapers the rest; errors only 
     //     CLEAR error (not the opaque "unknown error during feature compile").
     {
         CompileResult r = run(json{{"of", "face"}, {"side", "top"}});
-        const aicad::doc::FeatureStatus* dr = status_of(r, "dr");
+        const chudware::doc::FeatureStatus* dr = status_of(r, "dr");
         REQUIRE(dr != nullptr);
         CHECK_FALSE(dr->ok);
         CHECK(dr->error.find("unknown error") == std::string::npos);
@@ -1291,7 +1291,7 @@ TEST_CASE("A2/A3: shell rejects impossible thickness and remove-all, allows a va
             json{{"id", "sh"}, {"type", "shell"}, {"body", "cube"}, {"thickness", 12.0}},
         });
         CompileResult r = compile_document(doc, json::object());
-        const aicad::doc::FeatureStatus* sh = status_of(r, "sh");
+        const chudware::doc::FeatureStatus* sh = status_of(r, "sh");
         REQUIRE(sh != nullptr);
         // The core regression: the impossible shell must NOT silently succeed with the
         // geometry unchanged. The volume guard reports "too large"; if instead the kernel
@@ -1313,7 +1313,7 @@ TEST_CASE("A2/A3: shell rejects impossible thickness and remove-all, allows a va
                  {"remove", json{{"of", "face"}}}},  // every face
         });
         CompileResult r = compile_document(doc, json::object());
-        const aicad::doc::FeatureStatus* sh = status_of(r, "sh");
+        const chudware::doc::FeatureStatus* sh = status_of(r, "sh");
         REQUIRE(sh != nullptr);
         CHECK_FALSE(sh->ok);
         CHECK(sh->error.find("cannot remove all faces") != std::string::npos);
@@ -1328,7 +1328,7 @@ TEST_CASE("A2/A3: shell rejects impossible thickness and remove-all, allows a va
                  {"remove", json{{"of", "face"}, {"side", "top"}}}},
         });
         CompileResult r = compile_document(doc, json::object());
-        const aicad::doc::FeatureStatus* sh = status_of(r, "sh");
+        const chudware::doc::FeatureStatus* sh = status_of(r, "sh");
         REQUIRE(sh != nullptr);
         CHECK(sh->ok);                  // a real shell still works (no regression)
         REQUIRE(r.ok);
@@ -1350,7 +1350,7 @@ TEST_CASE("A2/A3: shell rejects impossible thickness and remove-all, allows a va
                  {"remove", json{{"of", "face"}, {"side", "top"}}}},
         });
         CompileResult r = compile_document(doc, json::object());
-        const aicad::doc::FeatureStatus* sh = status_of(r, "sh");
+        const chudware::doc::FeatureStatus* sh = status_of(r, "sh");
         REQUIRE(sh != nullptr);
         REQUIRE_MESSAGE(sh->ok, "thick-but-valid shell wrongly rejected: " << sh->error);
         REQUIRE(r.ok);
@@ -1403,7 +1403,7 @@ TEST_CASE("A-CLOSED: a closed shell (no face removed) hollows to a sealed wall, 
             json{{"id", "sh"}, {"type", "shell"}, {"body", "cube"}, {"thickness", t}},
         });
         CompileResult r = compile_document(doc, json::object());
-        const aicad::doc::FeatureStatus* sh = status_of(r, "sh");
+        const chudware::doc::FeatureStatus* sh = status_of(r, "sh");
         REQUIRE(sh != nullptr);
         REQUIRE_MESSAGE(sh->ok, "closed shell failed: " << sh->error);
         REQUIRE(r.ok);
@@ -1432,7 +1432,7 @@ TEST_CASE("A-CLOSED: a closed shell (no face removed) hollows to a sealed wall, 
                  {"remove", json{{"of", "face"}, {"side", "top"}}}},
         });
         CompileResult r = compile_document(doc, json::object());
-        const aicad::doc::FeatureStatus* sh = status_of(r, "sh");
+        const chudware::doc::FeatureStatus* sh = status_of(r, "sh");
         REQUIRE(sh != nullptr);
         REQUIRE_MESSAGE(sh->ok, "open bucket shell failed: " << sh->error);
         REQUIRE(r.ok);
@@ -1481,7 +1481,7 @@ TEST_CASE("S1: shell on a spline-revolve (freeform) body errors clearly, never s
     CompileResult r = compile_document(doc, json::object());
 
     // The revolve must build the vase (else the test isn't exercising a freeform body).
-    const aicad::doc::FeatureStatus* rev = status_of(r, "rev");
+    const chudware::doc::FeatureStatus* rev = status_of(r, "rev");
     REQUIRE(rev != nullptr);
     REQUIRE_MESSAGE(rev->ok, "revolve failed: " << rev->error);
 
@@ -1489,7 +1489,7 @@ TEST_CASE("S1: shell on a spline-revolve (freeform) body errors clearly, never s
     // and, if it could not produce a watertight hollow, it FAILED LOUDLY — it must never
     // be a silent no-op. (If OCCT on this platform DOES manage a valid hollow, that is also
     // acceptable — what is forbidden is the silent-skip / open-shell commit.)
-    const aicad::doc::FeatureStatus* sh = status_of(r, "sh");
+    const chudware::doc::FeatureStatus* sh = status_of(r, "sh");
     REQUIRE_MESSAGE(sh != nullptr, "shell feature vanished from feature_status (S1 bug)");
     if (!sh->ok) {
         MESSAGE("S1 shell error (expected, clear): " << sh->error);
@@ -1526,7 +1526,7 @@ TEST_CASE("S2: a fillet never commits an open (free-edge) body") {
                  {"edges", json{{"of", "edge"}}}},  // all 12 edges
         });
         CompileResult r = compile_document(doc, json::object());
-        const aicad::doc::FeatureStatus* fl = status_of(r, "fl");
+        const chudware::doc::FeatureStatus* fl = status_of(r, "fl");
         REQUIRE(fl != nullptr);
         REQUIRE_MESSAGE(fl->ok, "normal fillet failed: " << fl->error);
         REQUIRE(r.shapes.size() == 1);
@@ -1545,7 +1545,7 @@ TEST_CASE("S2: a fillet never commits an open (free-edge) body") {
                  {"edges", json{{"of", "edge"}}}},  // all 12 edges, radius > half-thickness
         });
         CompileResult r = compile_document(doc, json::object());
-        const aicad::doc::FeatureStatus* fl = status_of(r, "fl");
+        const chudware::doc::FeatureStatus* fl = status_of(r, "fl");
         REQUIRE(fl != nullptr);
         if (fl->ok) {
             // Committed -> MUST be a closed solid (the S2 invariant: no silent open shell).
@@ -1577,7 +1577,7 @@ TEST_CASE("A4: fillet on an empty edge query reports 'no edges matched', not 'to
              {"edges", json{{"of", "edge"}, {"surf", "round"}}}},  // no round edges on a box
     });
     CompileResult r = compile_document(doc, json::object());
-    const aicad::doc::FeatureStatus* fl = status_of(r, "fl");
+    const chudware::doc::FeatureStatus* fl = status_of(r, "fl");
     REQUIRE(fl != nullptr);
     CHECK_FALSE(fl->ok);
     // The message must name the empty match ("...matched no edges" from the query path,
@@ -1597,7 +1597,7 @@ TEST_CASE("A6: box validates length/width/height up front") {
             json{{"id", "b"}, {"type", "box"}, {"length", 40.0}, {"width", 30.0}, {"height", 0.0}},
         });
         CompileResult r = compile_document(doc, json::object());
-        const aicad::doc::FeatureStatus* b = status_of(r, "b");
+        const chudware::doc::FeatureStatus* b = status_of(r, "b");
         REQUIRE(b != nullptr);
         CHECK_FALSE(b->ok);
         CHECK(b->error.find("must be > 0") != std::string::npos);
@@ -1628,7 +1628,7 @@ TEST_CASE("B1: blind hole deeper than the stock warns it was clamped") {
                  {"face", json{{"of", "face"}, {"side", "top"}}}},
         });
         CompileResult r = compile_document(doc, json::object());
-        const aicad::doc::FeatureStatus* h = status_of(r, "h");
+        const chudware::doc::FeatureStatus* h = status_of(r, "h");
         REQUIRE(h != nullptr);
         CHECK(h->ok);                                   // still drills (never-raise)
         CHECK(h->warning.find("exceeds the available stock") != std::string::npos);
@@ -1643,7 +1643,7 @@ TEST_CASE("B1: blind hole deeper than the stock warns it was clamped") {
                  {"face", json{{"of", "face"}, {"side", "top"}}}},
         });
         CompileResult r = compile_document(doc, json::object());
-        const aicad::doc::FeatureStatus* h = status_of(r, "h");
+        const chudware::doc::FeatureStatus* h = status_of(r, "h");
         REQUIRE(h != nullptr);
         CHECK(h->ok);
         CHECK(h->warning.empty());                      // no false clamp warning
@@ -1668,14 +1668,14 @@ TEST_CASE("B2: linear_pattern rejects zero spacing when count >= 2") {
     };
     {   // spacing1 == 0 with count1 == 3 -> error.
         CompileResult r = compile_document(make_doc(0.0), json::object());
-        const aicad::doc::FeatureStatus* lp = status_of(r, "lp");
+        const chudware::doc::FeatureStatus* lp = status_of(r, "lp");
         REQUIRE(lp != nullptr);
         CHECK_FALSE(lp->ok);
         CHECK(lp->error.find("spacing must be non-zero") != std::string::npos);
     }
     {   // a real 15mm spacing still patterns three holes.
         CompileResult r = compile_document(make_doc(15.0), json::object());
-        const aicad::doc::FeatureStatus* lp = status_of(r, "lp");
+        const chudware::doc::FeatureStatus* lp = status_of(r, "lp");
         REQUIRE(lp != nullptr);
         CHECK(lp->ok);
     }
@@ -1697,7 +1697,7 @@ TEST_CASE("B4: revolve of an open profile warns it was auto-closed") {
              {"axis", json{{"kind", "datum"}, {"feature", "axis.z"}}}, {"angle", 360.0}},
     });
     CompileResult r = compile_document(doc, json::object());
-    const aicad::doc::FeatureStatus* rev = status_of(r, "rev");
+    const chudware::doc::FeatureStatus* rev = status_of(r, "rev");
     REQUIRE(rev != nullptr);
     CHECK(rev->ok);                                            // still builds the solid
     CHECK(rev->warning.find("auto-closed") != std::string::npos);
@@ -1719,7 +1719,7 @@ TEST_CASE("K4: fillet with an unknown feature-ref selector errors, never corrupt
                             {"centroid", json::array({0, 0, D})}}}},
     });
     CompileResult r = compile_document(doc, json::object());
-    const aicad::doc::FeatureStatus* f1 = status_of(r, "f1");
+    const chudware::doc::FeatureStatus* f1 = status_of(r, "f1");
     REQUIRE(f1 != nullptr);
     CHECK_FALSE(f1->ok);
     CHECK(f1->error.find("unknown feature") != std::string::npos);
@@ -1766,7 +1766,7 @@ TEST_CASE("K6: a sub-tolerance fillet warns that no material was removed") {
              {"dir", json::array({0, 0, 1})}},
     });
     CompileResult r = compile_document(doc, json::object());
-    const aicad::doc::FeatureStatus* f1 = status_of(r, "f1");
+    const chudware::doc::FeatureStatus* f1 = status_of(r, "f1");
     REQUIRE(f1 != nullptr);
     CHECK(f1->ok);  // still compiles (the body passes through unchanged)
     CHECK(f1->warning.find("below tolerance") != std::string::npos);
@@ -1782,7 +1782,7 @@ TEST_CASE("K7: a sub-tolerance box dim reports a clear tolerance error") {
         json{{"id", "b"}, {"type", "box"}, {"length", 40.0}, {"width", 30.0}, {"height", 1e-9}},
     });
     CompileResult r = compile_document(doc, json::object());
-    const aicad::doc::FeatureStatus* b = status_of(r, "b");
+    const chudware::doc::FeatureStatus* b = status_of(r, "b");
     REQUIRE(b != nullptr);
     CHECK_FALSE(b->ok);
     CHECK(b->error.find("below the minimum tolerance") != std::string::npos);
@@ -1803,8 +1803,8 @@ TEST_CASE("K9: a duplicate feature name is accepted with a warning") {
     });
     CompileResult r = compile_document(doc, json::object());
     REQUIRE(r.ok);  // NOT a hard error
-    const aicad::doc::FeatureStatus* b1 = status_of(r, "b1");
-    const aicad::doc::FeatureStatus* b2 = status_of(r, "b2");
+    const chudware::doc::FeatureStatus* b1 = status_of(r, "b1");
+    const chudware::doc::FeatureStatus* b2 = status_of(r, "b2");
     REQUIRE(b1 != nullptr);
     REQUIRE(b2 != nullptr);
     CHECK(b1->warning.empty());                              // first use: no warning
@@ -1823,10 +1823,10 @@ TEST_CASE("K9: a duplicate feature name is accepted with a warning") {
 //     no-op on the live session, and a single undo must revert the LAST SUCCESSFUL feature
 //     (the box), not a ghost.
 TEST_CASE("C2/C3/C4: a compile-rejected batch leaves the doc and undo stacks untouched") {
-    using aicad::doc::doc_new;
-    using aicad::doc::doc_apply_ops;
-    using aicad::doc::doc_undo;
-    using aicad::doc::doc_tree;
+    using chudware::doc::doc_new;
+    using chudware::doc::doc_apply_ops;
+    using chudware::doc::doc_undo;
+    using chudware::doc::doc_tree;
     auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
 
     json nr = doc_new("part", "FailBatchUndo");
@@ -1882,11 +1882,11 @@ TEST_CASE("C2/C3/C4: a compile-rejected batch leaves the doc and undo stacks unt
 // no deadlock, no error leak across docs. (doctest runs cases on one thread, so a held
 // lock would surface here as exactly the EDEADLK the users saw.)
 TEST_CASE("P0: a rejected batch never deadlocks subsequent calls on any doc") {
-    using aicad::doc::doc_new;
-    using aicad::doc::doc_apply_ops;
-    using aicad::doc::doc_tree;
-    using aicad::doc::doc_list;
-    using aicad::doc::doc_rebuild;
+    using chudware::doc::doc_new;
+    using chudware::doc::doc_apply_ops;
+    using chudware::doc::doc_tree;
+    using chudware::doc::doc_list;
+    using chudware::doc::doc_rebuild;
     auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
 
     json na = doc_new("part", "DeadlockA");
@@ -1939,9 +1939,9 @@ TEST_CASE("P0: a rejected batch never deadlocks subsequent calls on any doc") {
 //     loudly. The INVARIANT is the regression: the total volume AND every surviving
 //     body's volume must be finite and >= 0 — never the old -89753 mm^3 corruption.
 TEST_CASE("N2: a deep tree never silently commits a negative-volume solid") {
-    using aicad::doc::doc_new;
-    using aicad::doc::doc_apply_ops;
-    using aicad::doc::doc_rebuild;
+    using chudware::doc::doc_new;
+    using chudware::doc::doc_apply_ops;
+    using chudware::doc::doc_rebuild;
     auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
 
     json nr = doc_new("part", "NegVolGuard");
@@ -1983,8 +1983,8 @@ TEST_CASE("N2: a deep tree never silently commits a negative-volume solid") {
 //     component for assembly). It must NOT error "transform: no motion ..." (the old
 //     rejection was a deadlock trigger via the rollback). The body survives unchanged.
 TEST_CASE("A2: a zero-motion transform succeeds as an at-origin no-op") {
-    using aicad::doc::doc_new;
-    using aicad::doc::doc_apply_ops;
+    using chudware::doc::doc_new;
+    using chudware::doc::doc_apply_ops;
     auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
 
     json nr = doc_new("part", "ZeroXform");
@@ -2106,7 +2106,7 @@ TEST_CASE("N4: validate_document accepts same-batch placeholder in refs.features
              {"params", json::object()},
              {"refs", {{"plane", "plane.right"}, {"features", json::array({"$1"})}}}},
     });
-    std::vector<std::string> verrs = aicad::doc::validate_document(canon);
+    std::vector<std::string> verrs = chudware::doc::validate_document(canon);
     for (const auto& e : verrs) MESSAGE("N4 placeholder validation error: " << e);
     // No error should reference refs.features (the placeholder gate).
     bool feat_gate_fired = false;
@@ -2136,7 +2136,7 @@ TEST_CASE("N5: validate_document accepts refs.offset on a sketch feature") {
              {"params", {{"entities", json::array()}, {"constraints", json::array()}}},
              {"refs", {{"plane", "plane.top"}, {"offset", offset_dim}}}},
     });
-    std::vector<std::string> verrs = aicad::doc::validate_document(canon);
+    std::vector<std::string> verrs = chudware::doc::validate_document(canon);
     for (const auto& e : verrs) MESSAGE("N5 sketch offset validation error: " << e);
     bool unknown_slot = false;
     for (const auto& e : verrs) {
@@ -2173,7 +2173,7 @@ TEST_CASE("B6-2: oversize all-edges fillet errors clearly and leaves the body in
     CompileResult r = compile_document(doc, json::object());
 
     // The fillet status MUST be present (never vanished) and clearly failed.
-    const aicad::doc::FeatureStatus* fil = status_of(r, "fil");
+    const chudware::doc::FeatureStatus* fil = status_of(r, "fil");
     REQUIRE_MESSAGE(fil != nullptr, "fillet feature vanished from feature_status (B6-2 bug)");
     CHECK_FALSE_MESSAGE(fil->ok, "oversize all-edges fillet must FAIL, not silently no-op/destroy");
     MESSAGE("B6-2 fillet error (expected, clear): " << fil->error);
@@ -2229,7 +2229,7 @@ TEST_CASE("B6-3: sweep on a near-straight spline path never silently vanishes") 
     CompileResult r = compile_document(doc, json::object());
 
     // The sweep status must be present (never vanished).
-    const aicad::doc::FeatureStatus* sw = status_of(r, "sw");
+    const chudware::doc::FeatureStatus* sw = status_of(r, "sw");
     REQUIRE_MESSAGE(sw != nullptr, "sweep feature vanished from feature_status (B6-3 bug)");
     if (sw->ok) {
         // A valid pipe: ~one body, volume close to pi*R^2*Hh (a real swept tube, not a
@@ -2262,7 +2262,7 @@ TEST_CASE("B6-4: cylinder mode:boss on a box fuses and increases the volume") {
     });
     CompileResult r = compile_document(doc, json::object());
 
-    const aicad::doc::FeatureStatus* boss = status_of(r, "boss");
+    const chudware::doc::FeatureStatus* boss = status_of(r, "boss");
     REQUIRE_MESSAGE(boss != nullptr, "boss feature vanished from feature_status (B6-4)");
     REQUIRE_MESSAGE(boss->ok, "cylinder boss failed to fuse: " << boss->error);
     REQUIRE(r.body_count == 1);  // fused into ONE body, not a 2nd disjoint cylinder
@@ -2286,8 +2286,8 @@ TEST_CASE("B6-4: cylinder mode:boss on a box fuses and increases the volume") {
 //     When dropped the feature built only ONE hole at the face centre; after the hoist
 //     it must cut N distinct bores (volume loss proportional to N).
 TEST_CASE("W1: top-level positions on hole feature produces N holes (not just 1)") {
-    using aicad::doc::doc_new;
-    using aicad::doc::doc_apply_ops;
+    using chudware::doc::doc_new;
+    using chudware::doc::doc_apply_ops;
     auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
 
     // A 60×60×20 plate.  Two holes: [u,v]=(-15,0) and (+15,0) on the top face.
@@ -2329,8 +2329,8 @@ TEST_CASE("W1: top-level positions on hole feature produces N holes (not just 1)
 //      actionable error rather than silently moving the wrong (current/last) body.
 //      The error message must mention the advice to use a feature id like 'f3'.
 TEST_CASE("E10: numeric body index in transform gives a clear actionable error") {
-    using aicad::doc::doc_new;
-    using aicad::doc::doc_apply_ops;
+    using chudware::doc::doc_new;
+    using chudware::doc::doc_apply_ops;
     auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
 
     json nr = doc_new("part", "E10NumericBodyIndex");
@@ -2421,7 +2421,7 @@ TEST_CASE("thread: M8 external cut reduces a Ø8x20 cylinder's volume to a valid
     CompileResult r = compile_document(doc, json::object());
     for (const auto& s : r.statuses)
         if (!s.ok) MESSAGE("feature " << s.id << " error: " << s.error);
-    const aicad::doc::FeatureStatus* thr = status_of(r, "thr");
+    const chudware::doc::FeatureStatus* thr = status_of(r, "thr");
     REQUIRE(thr != nullptr);
     CHECK(thr->ok);                       // the thread feature ran (cut or graceful fallback)
     REQUIRE(r.ok);
@@ -2460,7 +2460,7 @@ TEST_CASE("thread: cosmetic mode succeeds with no geometry change") {
     CompileResult r = compile_document(doc, json::object());
     for (const auto& s : r.statuses)
         if (!s.ok) MESSAGE("feature " << s.id << " error: " << s.error);
-    const aicad::doc::FeatureStatus* thr = status_of(r, "thr");
+    const chudware::doc::FeatureStatus* thr = status_of(r, "thr");
     REQUIRE(thr != nullptr);
     CHECK(thr->ok);
     CHECK(thr->error.empty());
@@ -2500,7 +2500,7 @@ TEST_CASE("text: engrave on a box top face removes material to a valid solid") {
     CompileResult r = compile_document(doc, json::object());
     for (const auto& s : r.statuses)
         if (!s.ok) MESSAGE("feature " << s.id << " error: " << s.error);
-    const aicad::doc::FeatureStatus* tx = status_of(r, "txt");
+    const chudware::doc::FeatureStatus* tx = status_of(r, "txt");
     REQUIRE(tx != nullptr);
     CHECK(tx->ok);                        // the text feature ran (mark or graceful fallback)
     REQUIRE(r.ok);
@@ -2536,7 +2536,7 @@ TEST_CASE("text: emboss on a box top face adds material to a valid solid") {
     CompileResult r = compile_document(doc, json::object());
     for (const auto& s : r.statuses)
         if (!s.ok) MESSAGE("feature " << s.id << " error: " << s.error);
-    const aicad::doc::FeatureStatus* tx = status_of(r, "txt");
+    const chudware::doc::FeatureStatus* tx = status_of(r, "txt");
     REQUIRE(tx != nullptr);
     CHECK(tx->ok);
     REQUIRE(r.ok);
@@ -2570,7 +2570,7 @@ TEST_CASE("text: an emboss that overhangs the face is rejected (no detached lett
              {"depth", 1.2}, {"mode", "emboss"}, {"target_face", top_face}},
     });
     CompileResult r = compile_document(doc, json::object());
-    const aicad::doc::FeatureStatus* tx = status_of(r, "txt");
+    const chudware::doc::FeatureStatus* tx = status_of(r, "txt");
     REQUIRE(tx != nullptr);
     CHECK(tx->ok);                       // ran (graceful fallback is still ok=true)
     REQUIRE(r.ok);
@@ -2590,7 +2590,7 @@ TEST_CASE("text: an emboss that overhangs the face is rejected (no detached lett
 
 // Side-face reading direction (regression). On a VERTICAL face a planar face's parametric X axis
 // often points along world Z, which laid the text out VERTICALLY and overflowed a short wall — e.g.
-// "AI-CAD" on a 60x10 front face came out detached -> "overhang"/unmarked fallback. The handler now
+// "Chudware" on a 60x10 front face came out detached -> "overhang"/unmarked fallback. The handler now
 // overrides xdir to the horizontal in-plane direction (with "up" toward +Z) for any non-horizontal
 // face, so a string that fits the face WIDTH marks cleanly even when far taller than the face HEIGHT.
 TEST_CASE("text: emboss on a vertical FRONT face reads horizontally (not off the short axis)") {
@@ -2600,13 +2600,13 @@ TEST_CASE("text: emboss on a vertical FRONT face reads horizontally (not off the
     json doc;
     doc["features"] = json::array({
         json{{"id", "blk"}, {"type", "box"}, {"length", L}, {"width", W}, {"height", Hh}},
-        json{{"id", "txt"}, {"type", "text"}, {"text", "AI-CAD"}, {"height", 5.0},
+        json{{"id", "txt"}, {"type", "text"}, {"text", "Chudware"}, {"height", 5.0},
              {"depth", 0.8}, {"mode", "emboss"}, {"target_face", front_face}},
     });
     CompileResult r = compile_document(doc, json::object());
     for (const auto& s : r.statuses)
         if (!s.ok) MESSAGE("feature " << s.id << " error: " << s.error);
-    const aicad::doc::FeatureStatus* tx = status_of(r, "txt");
+    const chudware::doc::FeatureStatus* tx = status_of(r, "txt");
     REQUIRE(tx != nullptr);
     CHECK(tx->ok);
     REQUIRE(r.ok);
@@ -2616,7 +2616,7 @@ TEST_CASE("text: emboss on a vertical FRONT face reads horizontally (not off the
     const double marked_vol = total_shape_volume(r);
     MESSAGE("front emboss: plain_vol=" << plain_vol << " marked_vol=" << marked_vol
             << " warning='" << tx->warning << "'");
-    // The fix: "AI-CAD" (~25 mm wide) fits the 60 mm face WIDTH and must not overhang the 10 mm
+    // The fix: "Chudware" (~25 mm wide) fits the 60 mm face WIDTH and must not overhang the 10 mm
     // height. With the old vertical xdir it overflowed -> "overhang"/"unmarked"; now it marks.
     CHECK(tx->warning.find("overhang") == std::string::npos);
     CHECK(tx->warning.find("unmarked") == std::string::npos);
@@ -2639,7 +2639,7 @@ TEST_CASE("boolean: a consumed (auto-merged) operand errors instead of a silent 
         json{{"id", "cmn"}, {"type", "boolean"}, {"op", "common"}, {"a", "ba"}, {"b", "bb"}},
     });
     CompileResult r = compile_document(doc, json::object());
-    const aicad::doc::FeatureStatus* st = status_of(r, "cmn");
+    const chudware::doc::FeatureStatus* st = status_of(r, "cmn");
     REQUIRE(st != nullptr);
     CHECK_FALSE(st->ok);                                   // not a silent success
     CHECK(st->error.find("merge") != std::string::npos);  // tells the caller to use merge:false
@@ -2665,9 +2665,9 @@ TEST_CASE("boolean: common of two merge:false boxes intersects to the true overl
 // Wave-2 evaluate: doc_eval_measure on a face ref must carry anchor [x,y,z] (surface
 // centroid) and a non-empty outer-wire polyline (world mm, <=128 pts).
 TEST_CASE("eval_measure: face ref carries anchor and polyline") {
-    using aicad::doc::doc_new;
-    using aicad::doc::doc_apply_ops;
-    using aicad::doc::doc_eval_measure;
+    using chudware::doc::doc_new;
+    using chudware::doc::doc_apply_ops;
+    using chudware::doc::doc_eval_measure;
     auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
     json nr = doc_new("part", "MeasureFace");
     const std::string id = nr.at("doc_id").get<std::string>();
@@ -2716,9 +2716,9 @@ TEST_CASE("eval_measure: face ref carries anchor and polyline") {
 // compound into its connected sub-solids, not the top-level compound count (1). The combined
 // volume/COM were already correct; this locks the body_count + per-body breakdown.
 TEST_CASE("eval_mass counts disconnected sub-solids in a fused compound (not 1)") {
-    using aicad::doc::doc_new;
-    using aicad::doc::doc_apply_ops;
-    using aicad::doc::doc_eval_mass;
+    using chudware::doc::doc_new;
+    using chudware::doc::doc_apply_ops;
+    using chudware::doc::doc_eval_mass;
     auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
     json nr = doc_new("part", "DisjointFuse");
     const std::string id = nr.at("doc_id").get<std::string>();
@@ -2781,8 +2781,8 @@ TEST_CASE("eval_mass counts disconnected sub-solids in a fused compound (not 1)"
 // failed feature (so it never persists), so the broken feature can only arrive via a
 // reopened .step+. We craft exactly that on disk via stepplus_save, then reopen it.
 TEST_CASE("eval_mass on a reopened doc with a failed-rebuild feature names the culprit") {
-    using aicad::doc::doc_open;
-    using aicad::doc::doc_eval_mass;
+    using chudware::doc::doc_open;
+    using chudware::doc::doc_eval_mass;
     namespace fs = std::filesystem;
 
     // A self-contained part doc whose single feature is an import pointing at a file that
@@ -2800,8 +2800,8 @@ TEST_CASE("eval_mass on a reopened doc with a failed-rebuild feature names the c
     });
 
     const std::string path =
-        (fs::temp_directory_path() / "aicad_broken_import_eval.step+").string();
-    aicad::doc::stepplus_save(doc, path, {});
+        (fs::temp_directory_path() / "chudware_broken_import_eval.step+").string();
+    chudware::doc::stepplus_save(doc, path, {});
 
     // doc_open succeeds (a malformed feature is non-fatal) but compiles to no bodies; the
     // open response carries volume 0 and a rebuild warning — NOT a real volume.
@@ -2813,7 +2813,7 @@ TEST_CASE("eval_mass on a reopened doc with a failed-rebuild feature names the c
     std::string msg;
     try {
         doc_eval_mass(oid, 0, 7.85);
-    } catch (const aicad::doc::OpError& e) {
+    } catch (const chudware::doc::OpError& e) {
         threw = true;
         msg = e.what();
     }
@@ -2836,8 +2836,8 @@ TEST_CASE("eval_mass on a reopened doc with a failed-rebuild feature names the c
 // ({"centroid":[0,0],"hint_index":0}). Regression for "washer extrudes as a solid disc"
 // through the op path (all_region_faces + centroid pick).
 TEST_CASE("op-path: two concentric circles extrude to an annular washer (untargeted + targeted)") {
-    using aicad::doc::doc_new;
-    using aicad::doc::doc_apply_ops;
+    using chudware::doc::doc_new;
+    using chudware::doc::doc_apply_ops;
     auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
     const double R = 10.0, r = 4.0, D = 5.0;
     const double expected = PI * (R * R - r * r) * D;   // annular ring
@@ -2889,9 +2889,9 @@ TEST_CASE("op-path: two concentric circles extrude to an annular washer (untarge
 // opposite side of the sketch plane. Regression for the GUI "Reverse direction does nothing"
 // report — engine must actually flip, not just toggle a checkbox.
 TEST_CASE("op-path: extrude flip puts solid on the opposite side of the sketch plane") {
-    using aicad::doc::doc_new;
-    using aicad::doc::doc_apply_ops;
-    using aicad::doc::doc_bbox;
+    using chudware::doc::doc_new;
+    using chudware::doc::doc_apply_ops;
+    using chudware::doc::doc_bbox;
     auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
     const double R = 8.0, D = 20.0;
 
@@ -2935,8 +2935,8 @@ TEST_CASE("op-path: extrude flip puts solid on the opposite side of the sketch p
 // key `alu_6061` (engine/sim/materials.json + kPhysicalMaterials) — the same key the FeatureManager
 // "set material" writes and that FEA/mass/appearance resolve. Assemblies stay material-free.
 TEST_CASE("blank part defaults material key to alu_6061 (6061-T6 aluminum)") {
-    using aicad::doc::doc_new;
-    using aicad::doc::doc_tree;
+    using chudware::doc::doc_new;
+    using chudware::doc::doc_tree;
     json nr = doc_new("part", "DefaultMat");
     const std::string id = nr.at("doc_id").get<std::string>();
     json tree = doc_tree(id);
@@ -2947,8 +2947,8 @@ TEST_CASE("blank part defaults material key to alu_6061 (6061-T6 aluminum)") {
     CHECK(mat["key"].get<std::string>() == "alu_6061");
 
     // Density path: a 10×10×10 mm cube at 2.70 g/cm³ → mass = 2.70 g.
-    using aicad::doc::doc_apply_ops;
-    using aicad::doc::doc_eval_mass;
+    using chudware::doc::doc_apply_ops;
+    using chudware::doc::doc_eval_mass;
     auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
     json ops = json::array({
         json{{"op", "add_feature"},
@@ -2973,9 +2973,9 @@ TEST_CASE("blank part defaults material key to alu_6061 (6061-T6 aluminum)") {
 // Wave 3 Evaluate: section props accept an arbitrary {origin,normal} plane
 // (not only named datums), returning area_mm2 > 0 and finite Ixx/Iyy.
 TEST_CASE("eval_section_props accepts origin+normal plane on a box") {
-    using aicad::doc::doc_new;
-    using aicad::doc::doc_apply_ops;
-    using aicad::doc::doc_eval_section_props;
+    using chudware::doc::doc_new;
+    using chudware::doc::doc_apply_ops;
+    using chudware::doc::doc_eval_section_props;
     auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
 
     json nr = doc_new("part", "SectionPlane");

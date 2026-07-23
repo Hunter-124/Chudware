@@ -1,4 +1,4 @@
-// AI-CAD Agent Activity panel (C22b).
+// Chudware Agent Activity panel (C22b).
 #include <algorithm>
 #include <cstdio>
 #include <cstring>

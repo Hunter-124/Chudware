@@ -92,9 +92,9 @@ Every provider declares exactly one auth kind:
 | `oauth_pkce` | "Sign in with OpenRouter" — the ONE blessed session login. | key minted by PKCE exchange, then stored like `api_key` |
 | `none` / `local` | local model server (LM Studio / llama.cpp / Ollama), loopback endpoint. | none required (`"lm-studio"`/`"llama-cpp"` placeholder) |
 
-Resolution precedence (both ports): explicit arg → `AI_CAD_PROVIDER` env → `config.json`
+Resolution precedence (both ports): explicit arg → `CHUDWARE_PROVIDER` env → `config.json`
 `provider` → default (local loopback openai-compatible). Config file:
-`%APPDATA%/AI-CAD/config.json` (Windows) / `$XDG_DATA_HOME/AI-CAD/config.json` (POSIX).
+`%APPDATA%/Chudware/config.json` (Windows) / `$XDG_DATA_HOME/Chudware/config.json` (POSIX).
 
 ### 4.1 OpenRouter PKCE (blessed default session auth)
 
@@ -112,7 +112,7 @@ one login → hundreds of models → user-balance billing). Flow (S256 PKCE):
    `https://openrouter.ai/api/v1` (base_url).
 
 - **Feature-flagged.** The PKCE login is inert unless enabled: config `openrouter_pkce: true`
-  or env `AI_CAD_ENABLE_OPENROUTER_PKCE=1`. Disabled → helper returns a contract-shaped
+  or env `CHUDWARE_ENABLE_OPENROUTER_PKCE=1`. Disabled → helper returns a contract-shaped
   `{ok: false, reason, hint}`, never a traceback.
 - The network exchange is transport-injectable so CI exercises the full flow with a fake
   transport and NO network/secrets.
@@ -120,7 +120,7 @@ one login → hundreds of models → user-balance billing). Flow (S256 PKCE):
 ### 4.2 Prohibited auth (CI-enforced — see §4.4 for authorized exceptions)
 
 By default, consumer Claude Pro/Max or Gemini subscription OAuth tokens MUST NOT appear in
-AI-CAD code outside of explicitly allowlisted provider files. Gemini consumer OAuth remains
+Chudware code outside of explicitly allowlisted provider files. Gemini consumer OAuth remains
 fully prohibited (Google mass-bans). A CI assertion greps the tree and fails if code
 references consumer OAuth token-reuse endpoints for Claude/Gemini in non-allowlisted files
 (`test_prohibited_auth.py`). The allowlist covers:
@@ -146,7 +146,7 @@ Cursor 5min). Auth retry ladder: retry same → force-refresh → re-login promp
 
 These providers are NEVER offline-safe (cloud endpoints, §5).
 
-### 4.3 AI-CAD Cloud relay (config seam ONLY — human-gated)
+### 4.3 Chudware Cloud relay (config seam ONLY — human-gated)
 
 The company-hosted inference relay is **one config entry, no code path**: an
 OpenAI-compatible provider with `base_url` = the relay endpoint and an account-tied auth
@@ -192,8 +192,8 @@ edits — `services/mcp/tool_registry.py` + the wiring in `services/mcp/server.p
 ### 6.1 Allow-list semantics (frozen)
 
 - **Default = everything allowed** (no behavior change vs. today). An allow-list is opt-in.
-- Sources, most specific first: explicit call arg → env `AI_CAD_TOOLS_ALLOW`
-  (comma-separated tool names and/or `family:<name>`) → config `tools.allow`. `AI_CAD_TOOLS_DENY_RISK`
+- Sources, most specific first: explicit call arg → env `CHUDWARE_TOOLS_ALLOW`
+  (comma-separated tool names and/or `family:<name>`) → config `tools.allow`. `CHUDWARE_TOOLS_DENY_RISK`
   (comma-separated risk classes) additionally denies whole risk classes.
 - Enforcement point: the dispatch wrapper around `mcp.call_tool(name, args)`. A disallowed
   call returns a **contract-shaped** `{"ok": false, "reason": ..., "hint": ...}` — never a
@@ -274,7 +274,7 @@ Canary responses (`RouteDecision.is_canary`) are thereby distinguishable in tele
 
 ### 7.6 Human-gated seams (out of scope here)
 
-Promotion sign-off (§7.4) and any AI-CAD Cloud relay interaction (§4.3) are human-gated. The
+Promotion sign-off (§7.4) and any Chudware Cloud relay interaction (§4.3) are human-gated. The
 C++ read-side (`core/agent/run.cpp` provider selection + the `adapter` telemetry slot) follows
 §8 (Python-first, C++ matches later); T-H9 lands the Python seam and the frozen schema above.
 

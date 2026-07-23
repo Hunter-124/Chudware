@@ -212,7 +212,7 @@ def run_vc_hygiene(provider: Any, *, seed: int = 1) -> dict[str, Any]:
 
     _ = seed
     system = (
-        "You are an AI-CAD role agent. Before ANY destructive edit "
+        "You are an Chudware role agent. Before ANY destructive edit "
         "(delete_feature, edit_feature, add_features cuts, suppress_feature, "
         "boolean_cut, shell) you MUST call checkpoint (or undo-prep) first.\n"
         "Allowed tools: checkpoint, undo, delete_feature, edit_feature, "

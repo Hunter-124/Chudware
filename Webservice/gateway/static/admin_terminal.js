@@ -1,4 +1,4 @@
-/* billet-web /admin — shared, saved, concurrent xterm.js terminals
+/* chudware-web /admin — shared, saved, concurrent xterm.js terminals
  *
  * Sessions are named tmux sessions that live on the host: they persist across
  * disconnects/gateway restarts and can be driven by several admins at once.

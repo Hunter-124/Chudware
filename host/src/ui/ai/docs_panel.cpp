@@ -125,7 +125,7 @@ std::string fmtSize(unsigned long long n) {
 
 // Same headless guard as feature_tree.cpp's fileDialogsDisabled().
 bool dialogsDisabled() {
-    static const bool disabled = std::getenv("AI_CAD_NO_FILE_DIALOGS") != nullptr;
+    static const bool disabled = std::getenv("CHUDWARE_NO_FILE_DIALOGS") != nullptr;
     return disabled;
 }
 

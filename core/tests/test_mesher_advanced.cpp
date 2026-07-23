@@ -60,14 +60,14 @@
 #include <gp_Trsf.hxx>
 #include <gp_Vec.hxx>
 
-using namespace aicad::sim;
+using namespace chudware::sim;
 using nlohmann::json;
 
 namespace {
 
 // ── STEP + boundary-condition helpers (mirror test_netgen_mesh.cpp) ────────────────────────
 std::string write_step(const TopoDS_Shape& shape, const std::string& name) {
-    auto p = std::filesystem::temp_directory_path() / ("aicad_adv_" + name + ".step");
+    auto p = std::filesystem::temp_directory_path() / ("chudware_adv_" + name + ".step");
     STEPControl_Writer wr;
     REQUIRE(wr.Transfer(shape, STEPControl_AsIs) == IFSelect_RetDone);
     REQUIRE(wr.Write(p.string().c_str()) == IFSelect_RetDone);

@@ -1,8 +1,8 @@
 """T-SIM4 live FEA bridge integration test — cantilever static + modal vs beam theory.
 
 Drives the REAL engine exactly like a user session would, on the RAW core bridge
-(no full MCP server needed — the AICAD_WITH_NETGEN build registers
-``sim_run_static``/``sim_run_modal`` directly in core/api/libaicad.cpp):
+(no full MCP server needed — the CHUDWARE_WITH_NETGEN build registers
+``sim_run_static``/``sim_run_modal`` directly in core/api/libchudware.cpp):
 
   1. engine doc-load contract: ``doc_new`` + ``eq_set`` + ``add_feature``
      (box driven through an equation global, so the eq path is exercised),
@@ -25,16 +25,16 @@ Assertions are BEAM-THEORY ANCHORS with physical-sanity bounds, not exact floats
     Table 8.1: β₁L = 1.87510). A square section must also give a near-degenerate
     second mode (two orthogonal bending planes).
 
-Solver selection (no all-skip trap): the gate auto-points AI_CAD_LIBAICAD at the
+Solver selection (no all-skip trap): the gate auto-points CHUDWARE_LIBCHUDWARE at the
 plain core/build-linux .so, which does NOT carry the Netgen FEA RPCs ("unknown
 method: sim_run_static"). This test therefore probes candidates in order —
-$AI_CAD_LIBAICAD first, then core/build-occt-linux/bin/libaicad.so — and runs
+$CHUDWARE_LIBCHUDWARE first, then core/build-occt-linux/bin/libchudware.so — and runs
 against the first one that exposes the FEA RPCs, so it EXECUTES in the local
 gate where the occt build exists. It skips honestly (with the probed reasons)
 only when no candidate .so has the FEA plugin. Each candidate is probed in a
 fresh subprocess because core_bridge binds one .so per process.
 
-Run directly:  AI_CAD_LIBAICAD=core/build-occt-linux/bin/libaicad.so \
+Run directly:  CHUDWARE_LIBCHUDWARE=core/build-occt-linux/bin/libchudware.so \
                python -m pytest services/mcp/test_fea_live_bridge.py -v
 """
 from __future__ import annotations
@@ -81,7 +81,7 @@ F1_REF_HZ = _modal_ref_hz()  # 40.77 Hz — the documented ~40.8 Hz anchor
 
 def _drive(so_path: str, out_path: str) -> None:
     """Build the cantilever through the doc-load contract and solve static+modal."""
-    os.environ["AI_CAD_LIBAICAD"] = so_path
+    os.environ["CHUDWARE_LIBCHUDWARE"] = so_path
     here = os.path.dirname(os.path.abspath(__file__))
     if here not in sys.path:
         sys.path.insert(0, here)
@@ -96,7 +96,7 @@ def _drive(so_path: str, out_path: str) -> None:
         cb.call("sim_run_static", {"study": {}})
     except CoreError as exc:
         if "unknown method" in str(exc):
-            _emit({"skipped": f"build lacks sim_run_static (no AICAD_WITH_NETGEN): "
+            _emit({"skipped": f"build lacks sim_run_static (no CHUDWARE_WITH_NETGEN): "
                               f"{so_path}"})
             return
         raise
@@ -191,12 +191,12 @@ def _so_candidates() -> list:
         pass
 
     out = []
-    env = os.environ.get("AI_CAD_LIBAICAD", "")
+    env = os.environ.get("CHUDWARE_LIBCHUDWARE", "")
     if env and os.path.exists(env):
         out.append(env)
     for root in roots:
-        for rel in ("core/build-occt-linux/bin/libaicad.so",
-                    "core/build-linux/bin/libaicad.so"):
+        for rel in ("core/build-occt-linux/bin/libchudware.so",
+                    "core/build-linux/bin/libchudware.so"):
             p = str(root / rel)
             if os.path.exists(p) and p not in out:
                 out.append(p)
@@ -215,7 +215,7 @@ def _live_results():
 
     candidates = _so_candidates()
     if not candidates:
-        pytest.skip("no libaicad.so found (AI_CAD_LIBAICAD unset, no build dirs) — "
+        pytest.skip("no libchudware.so found (CHUDWARE_LIBCHUDWARE unset, no build dirs) — "
                     "live FEA bridge test needs the engine")
 
     reasons = []
@@ -306,5 +306,5 @@ if __name__ == "__main__":
     if len(sys.argv) == 4 and sys.argv[1] == "--driver":
         _drive(sys.argv[2], sys.argv[3])
     else:
-        sys.exit("usage: test_fea_live_bridge.py --driver <libaicad.so> <out.json> "
+        sys.exit("usage: test_fea_live_bridge.py --driver <libchudware.so> <out.json> "
                  "(or run via pytest)")

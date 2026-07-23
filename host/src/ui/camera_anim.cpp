@@ -1,4 +1,4 @@
-// AI-CAD camera animation (W2-D). See camera_anim.h.
+// Chudware camera animation (W2-D). See camera_anim.h.
 #include "camera_anim.h"
 
 #include <cmath>

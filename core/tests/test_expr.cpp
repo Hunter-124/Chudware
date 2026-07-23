@@ -1,4 +1,4 @@
-// doctest unit tests for aicad::util::evaluate — the dimension-expression
+// doctest unit tests for chudware::util::evaluate — the dimension-expression
 // arithmetic evaluator (C++ port of engine/doc/equations.py `evaluate`).
 //
 // Expected values below were captured from the Python oracle (equations.evaluate)
@@ -18,8 +18,8 @@
 #include <map>
 #include <string>
 
-using aicad::util::evaluate;
-using aicad::util::ExprError;
+using chudware::util::evaluate;
+using chudware::util::ExprError;
 
 static const std::map<std::string, double> kEnv = {
     {"A", 3.0}, {"B", 4.0}, {"H", 10.0}, {"W", 80.0}, {"R", 5.0}};

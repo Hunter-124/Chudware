@@ -1,6 +1,6 @@
 ---
 name: gui-evaluate
-description: Billet (formerly AI-CAD) Evaluate toolset for measurement, interference/fitment, and analysis — the MCP measure tool (color-coded multi-element measurement + annotated render), interference detection (overlap solids + measurements), mass props, and how agents drive them to analyze/fix parts. Use for any task about measuring faces/edges, clash/clearance checks, Evaluate ribbon analysis, or fitment diagnosis.
+description: Chudware (formerly Chudware) Evaluate toolset for measurement, interference/fitment, and analysis — the MCP measure tool (color-coded multi-element measurement + annotated render), interference detection (overlap solids + measurements), mass props, and how agents drive them to analyze/fix parts. Use for any task about measuring faces/edges, clash/clearance checks, Evaluate ribbon analysis, or fitment diagnosis.
 ---
 
 # Evaluate / Measure Specialist

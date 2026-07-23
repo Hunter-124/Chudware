@@ -1,10 +1,10 @@
 // ECAD -> 3D bridge: turn an aicad.pcb/1 BoardDocument into an OCCT solid model
 // (substrate + analytic component proxies) — C++ port of engine/ecad/threed.py.
 //
-// WHY this lives in the OCCT-linked target (aicad_geom_occt), NOT aicad_ecad:
+// WHY this lives in the OCCT-linked target (chudware_geom_occt), NOT chudware_ecad:
 //   threed.py builds OCCT SOLIDS (extrude the Edge.Cuts outline by stackup
 //   thickness, subtract drill cylinders, place per-footprint box proxies). The
-//   pure-JSON ECAD library (aicad_ecad) is OCCT-free, so the bridge must sit in a
+//   pure-JSON ECAD library (chudware_ecad) is OCCT-free, so the bridge must sit in a
 //   module that #includes both the ECAD board accessors (ecad/schema.h) and the
 //   OCCT geom helpers (geom/features.h, booleans.h, transform.h, profile.h).
 //
@@ -26,7 +26,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad::ecad {
+namespace chudware::ecad {
 
 // Convert `board` (an aicad.pcb/1 doc dict) into a 3D model and return the
 // geometry summary + volume stats. `opts` mirrors engine.ecad.threed
@@ -41,7 +41,7 @@ namespace aicad::ecad {
 //     "total_volume": <substrate + analytic-proxy volumes summed>
 //   }
 //
-// Throws aicad::ecad::OpError("invalid_op") for an empty / open / non-closing
+// Throws chudware::ecad::OpError("invalid_op") for an empty / open / non-closing
 // Edge.Cuts outline or a non-positive stackup thickness (the oracle raises
 // BoardGeometryError — here it becomes the structured OpError the worker expects).
 nlohmann::json board_to_3d(const nlohmann::json& board, const nlohmann::json& opts);
@@ -60,4 +60,4 @@ nlohmann::json board_to_3d(const nlohmann::json& board, const nlohmann::json& op
 nlohmann::json board_to_3d_step(const nlohmann::json& board, const nlohmann::json& opts,
                                 const std::string& out_path);
 
-}  // namespace aicad::ecad
+}  // namespace chudware::ecad

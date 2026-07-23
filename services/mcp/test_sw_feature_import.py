@@ -5,10 +5,10 @@ volume matches what SolidWorks itself reports — proving the feature tree (sket
 reference planes, extrude/cut/loft) was rebuilt faithfully, not just imported as a frozen body.
 
 Requirements (else the whole module SKIPS): SOLIDWORKS installed + pywin32 (COM extraction) and a
-staged ``dist/AI-CAD/libaicad.dll`` (the engine). Runnable two ways:
+staged ``dist/Chudware/libchudware.dll`` (the engine). Runnable two ways:
     python -m mcp_server.test_sw_feature_import      # script style, prints a table
     pytest mcp_server/test_sw_feature_import.py       # parametrised
-The sample parts are the owner's (not in the repo); set AI_CAD_SW_SAMPLES to the folder holding
+The sample parts are the owner's (not in the repo); set CHUDWARE_SW_SAMPLES to the folder holding
 them, or it defaults to the known dev path. Missing files are skipped individually.
 """
 
@@ -23,7 +23,7 @@ from services.sw_import.sw_translate import resolve
 from mcp_server import core_bridge as cb
 
 _SAMPLES = os.environ.get(
-    "AI_CAD_SW_SAMPLES", r"C:\Users\dev\Desktop\AI-opencad\sldprt reversing")
+    "CHUDWARE_SW_SAMPLES", r"C:\Users\dev\Desktop\AI-opencad\sldprt reversing")
 
 # file name -> volume (mm^3) SolidWorks reports for it (ground truth, captured via COM).
 _PART_VOLUMES = {
@@ -37,7 +37,7 @@ _ASSEMBLY = ("assembly-(cylinder inside cylinder with bore, faces mated at one e
 
 _skip = pytest.mark.skipif(
     not (solidworks_available() and cb.available()),
-    reason="needs SOLIDWORKS (COM) + a staged libaicad.dll")
+    reason="needs SOLIDWORKS (COM) + a staged libchudware.dll")
 
 
 def _build_volume(path: str):
@@ -97,7 +97,7 @@ def _T(p):
 # Authored fixtures (engine.doc.sw_fixture_author writes them) — one per feature concept. Each is
 # validated by comparing the engine's reconstructed volume AND center-of-mass to SolidWorks' own.
 _FIXTURE_DIR = os.environ.get(
-    "AI_CAD_SW_FIXTURES", os.path.join(os.path.dirname(__file__), "..", "..", "corpora", "sw_fixtures"))
+    "CHUDWARE_SW_FIXTURES", os.path.join(os.path.dirname(__file__), "..", "..", "corpora", "sw_fixtures"))
 _FIXTURES = [
     "asym_top.SLDPRT", "asym_front.SLDPRT", "asym_right.SLDPRT", "extrude_front_40x30x20.SLDPRT",
     "revolve_ring.SLDPRT", "fillet_box.SLDPRT", "chamfer_box.SLDPRT", "shell_box.SLDPRT",
@@ -178,7 +178,7 @@ def test_assembly_reconstructs_and_places_components():
 
 if __name__ == "__main__":  # script-style run with a readable table
     if not (solidworks_available() and cb.available()):
-        print("SKIP: needs SOLIDWORKS (COM) + staged libaicad.dll")
+        print("SKIP: needs SOLIDWORKS (COM) + staged libchudware.dll")
         raise SystemExit(0)
     print(f"{'part':60} {'engine mm^3':>14} {'SolidWorks':>14}  verdict")
     ok = True

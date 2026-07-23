@@ -15,18 +15,18 @@
 // solves never oversubscribe.
 //
 // Env knobs (all optional; shared naming with benchmarks/simsuite/resguard.py):
-//   AICAD_GOVERNOR=0     disable every check (admit everything, full threads)
-//   AICAD_MEM_FRAC       fraction of total RAM one study may claim   (default 0.5)
-//   AICAD_MEM_CAP_GB     absolute ceiling applied on top of the fraction
-//   AICAD_HEADROOM_GB    RAM always left to the OS/GUI               (default 4)
-//   AICAD_CPU_FRAC       fraction of logical cores for heavy ops     (default 0.75)
-//   AI_CAD_SIM_THREADS   absolute solver thread cap (also set by the Python resguard)
+//   CHUDWARE_GOVERNOR=0     disable every check (admit everything, full threads)
+//   CHUDWARE_MEM_FRAC       fraction of total RAM one study may claim   (default 0.5)
+//   CHUDWARE_MEM_CAP_GB     absolute ceiling applied on top of the fraction
+//   CHUDWARE_HEADROOM_GB    RAM always left to the OS/GUI               (default 4)
+//   CHUDWARE_CPU_FRAC       fraction of logical cores for heavy ops     (default 0.75)
+//   CHUDWARE_SIM_THREADS   absolute solver thread cap (also set by the Python resguard)
 #pragma once
 
 #include <cstdint>
 #include <string>
 
-namespace aicad::governor {
+namespace chudware::governor {
 
 struct HostMem {
     uint64_t total = 0;  // physical RAM, bytes (0 = unknown platform)
@@ -57,7 +57,7 @@ bool admit(uint64_t estimate_bytes, const char* what, std::string& why);
 // checkpoint. Always false when the governor is disabled.
 bool low_memory_now();
 
-// Solver thread budget: AI_CAD_SIM_THREADS if set, else AICAD_CPU_FRAC of
+// Solver thread budget: CHUDWARE_SIM_THREADS if set, else CHUDWARE_CPU_FRAC of
 // logical cores (default 0.75), always >= 1. Does NOT apply memory pressure —
 // prefer plan_for() when the op has a known byte estimate.
 int solver_threads();
@@ -91,4 +91,4 @@ Plan plan_for(uint64_t estimate_bytes, const char* what = nullptr, int want_work
 // Thread-safe snapshot of the last report string.
 std::string last_report();
 
-}  // namespace aicad::governor
+}  // namespace chudware::governor

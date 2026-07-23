@@ -2,7 +2,7 @@
 //
 // Reproduces the GUI "rectangular beam bending" study OUTSIDE the daemon/GUI (so no IPC
 // lock convoy, no viewport draw) and instruments the pure numerical solve two ways:
-//   1. Phase wall-clock split via AI_CAD_FEA_PROFILE (mesh / assemble / factorize /
+//   1. Phase wall-clock split via CHUDWARE_FEA_PROFILE (mesh / assemble / factorize /
 //      back-substitute / stress-recovery) — printed by fea_run_static + fea_static_solve.
 //   2. The in-process SAMPLING profiler (core/prof) wrapped around the whole run, so we see
 //      WHICH function eats the solve (Eigen factorize vs assembly vs meshing).
@@ -10,9 +10,9 @@
 // It sweeps the mesh-fineness slider so the scaling curve (n_dof, time, memory) is explicit
 // — this is the data needed to decide the fix (solver swap vs default cap vs async).
 //
-// Build: part of core/build-occt-linux (AICAD_WITH_OCCT). Run:
-//   AI_CAD_FEA_PROFILE=1 ./bin/fea_profile [L W H  f0 f1 ...]
-// e.g.  AI_CAD_FEA_PROFILE=1 ./bin/fea_profile 200 20 20 0.3 0.5 0.7 0.85 1.0
+// Build: part of core/build-occt-linux (CHUDWARE_WITH_OCCT). Run:
+//   CHUDWARE_FEA_PROFILE=1 ./bin/fea_profile [L W H  f0 f1 ...]
+// e.g.  CHUDWARE_FEA_PROFILE=1 ./bin/fea_profile 200 20 20 0.3 0.5 0.7 0.85 1.0
 #include <cmath>
 #include <cstdlib>
 #include <cstdio>
@@ -31,14 +31,14 @@
 #include <TopoDS_Shape.hxx>
 #include <gp_Pnt.hxx>
 
-using namespace aicad::sim;
+using namespace chudware::sim;
 using nlohmann::json;
 
 static double gL = 200.0, gW = 20.0, gH = 20.0;  // beam dims (mm), overridable by argv
 
 static std::string write_beam_step() {
     TopoDS_Shape box = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), gL, gW, gH).Shape();
-    auto p = std::filesystem::temp_directory_path() / "aicad_fea_profile_beam.step";
+    auto p = std::filesystem::temp_directory_path() / "chudware_fea_profile_beam.step";
     STEPControl_Writer wr;
     wr.Transfer(box, STEPControl_AsIs);
     wr.Write(p.string().c_str());
@@ -81,9 +81,9 @@ int main(int argc, char** argv) {
 
     // Start the built-in sampling profiler (1 kHz). TargetScope below registers the worker
     // thread (here: main) so its stacks are sampled during the solves.
-    aicad::prof::start(/*interval_us=*/1000, /*mode=*/"all");
+    chudware::prof::start(/*interval_us=*/1000, /*mode=*/"all");
     {
-        aicad::prof::TargetScope scope(true);
+        chudware::prof::TargetScope scope(true);
         for (double f : fins) {
             std::fprintf(stderr, "\n----- fineness = %.2f -----\n", f);
             json out = fea_run_static(beam_study(step, f));
@@ -98,13 +98,13 @@ int main(int argc, char** argv) {
                          out["summary"].value("max_disp_mm", 0.0));
         }
     }
-    aicad::prof::stop();
+    chudware::prof::stop();
 
     // Symbolize + emit the sampling report: flat top-frames to stderr, folded stacks to a file
     // for flamegraph/speedscope.
     const std::string folded =
         (std::filesystem::temp_directory_path() / "fea_profile.folded").string();
-    json rep = aicad::prof::report(json{{"write_folded", folded}, {"top", 25}});
+    json rep = chudware::prof::report(json{{"write_folded", folded}, {"top", 25}});
     std::fprintf(stderr, "\n=== sampling profiler: hottest frames ===\n%s\n",
                  rep.dump(2).c_str());
     std::fprintf(stderr, "folded stacks -> %s\n", folded.c_str());

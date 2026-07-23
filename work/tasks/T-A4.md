@@ -68,6 +68,6 @@ What landed:
 - services/dag/mcp_tools.py: dag_plan/dag_run/dag_status/dag_approve/dag_abort handlers. dag_approve = executor.resume(decision="approve") — ONE implementation. dag_status is restart-safe from .graph.json sidecar.
 - services/dag/graph_loader.py: verify nodes WITH check_type routed to vr.run(); WITHOUT check_type fall through to node_runner (agent path, backward compat).
 - services/mcp/server.py: append-only registration of register_dag_tools(mcp).
-- Tests: 125 passed, 1 skipped (real engine, AI_CAD_LIBAICAD gate). Gate: PASS.
+- Tests: 125 passed, 1 skipped (real engine, CHUDWARE_LIBCHUDWARE gate). Gate: PASS.
 
 [~] bom_price/fw_sim_run/struct_check degrade to ESCALATE if WS-B/C/D not merged (mocked in tests per driver rules).

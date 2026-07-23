@@ -253,7 +253,7 @@ subprocess servers.
   through Python isn't).
 - ACP bridge (`index.ts:283-284`, `getClientBridge`) routes fs/terminal/
   permission requests to a connected editor host when running under ACP
-  instead of the TUI — relevant if the firmware agent embeds in Billet via
+  instead of the TUI — relevant if the firmware agent embeds in Chudware via
   ACP rather than owning its own TUI.
 
 **Firmware reuse plan**: PORT unmodified. Extend tier classification

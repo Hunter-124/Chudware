@@ -67,7 +67,7 @@ All under `CAD/core/firmware/` (C++ engine, 33 files) + `CAD/host/src/ui/firmwar
 - `host/src/ui/firmware/fw_workspace.{h,cpp}` — GUI workspace ("T-FIN5"): project rail + sources,
   build console (parsed warnings), **emulation + live UART console**, **GPIO trace/waveform
   viewer**, `fw_status`-gated Flash/Debug button rail. Progressive disclosure via
-  `firmwareTabVisible()`. `AI_CAD_SHOT=firmware` headless-shot fixture support.
+  `firmwareTabVisible()`. `CHUDWARE_SHOT=firmware` headless-shot fixture support.
 - `core/tests/test_firmware.cpp` — mirrors the old Python test suites (`test_project.py`,
   `test_pinmap.py`, `test_coverify.py`, `test_mcp_tools.py`); external-tool legs (arm-none-eabi-gcc/
   probe-rs/esptool) **skip honestly** when absent.

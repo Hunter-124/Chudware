@@ -10,7 +10,7 @@ import pytest
 from services.browser import session as bsession
 from . import material_web_lookup as mwl
 
-_ENV = "AI_CAD_ENABLE_MATERIAL_WEB"
+_ENV = "CHUDWARE_ENABLE_MATERIAL_WEB"
 _FIXTURE = os.path.join(os.path.dirname(__file__), "_testdata_makeitfrom_6061t6.html")
 
 

@@ -10,7 +10,7 @@
 // nearest-node map via map_to_surface — still available for diagnostics, but a flat
 // STEP face has only its corner verts so a bent beam rendered as a straight tilt.)
 //
-// Lives in the OCCT lib (aicad_geom_occt) alongside the AICM writer; the sim-result
+// Lives in the OCCT lib (chudware_geom_occt) alongside the AICM writer; the sim-result
 // vectors are passed in as plain doubles, so there is no link dep on the mesher libs.
 #pragma once
 
@@ -21,7 +21,7 @@
 
 #include "geom/aicm.h"
 
-namespace aicad::sim {
+namespace chudware::sim {
 
 // The FEA boundary surface extracted from the VOLUME tet mesh: an AICM body whose
 // vertices are the unique boundary nodes of the volume mesh (so a result plot has
@@ -105,4 +105,4 @@ std::string modal_overlay(const std::string& step_path,
                           const std::vector<int>& tets, int nodes_per_elem,
                           const std::vector<double>& mode_shape, double freq_hz);
 
-}  // namespace aicad::sim
+}  // namespace chudware::sim

@@ -441,7 +441,7 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
         """Is the part mirror-symmetric about a principal datum plane? Returns the deviation.
 
         plane : "top" (XY, mirror across Z), "front" (XZ, mirror across Y), or "right" (YZ,
-                mirror across X) — the reserved AI-CAD datum planes (Z-up).
+                mirror across X) — the reserved Chudware datum planes (Z-up).
         Mirrors the active body across the plane and measures the symmetric-difference volume.
         Returns {symmetric: bool, deviation_mm3}: symmetric is True when the leftover volume is
         within a tiny tolerance (1e-3 of the part volume). Handy to confirm a feature you meant
@@ -469,7 +469,7 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
         resulting cut face — the cross-section a draftsman would dimension.
 
         plane : "top" (XY, normal +Z), "front" (XZ, normal -Y), or "right" (YZ, normal +X) —
-                the reserved AI-CAD datum planes (Z-up). The cut passes through the origin.
+                the reserved Chudware datum planes (Z-up). The cut passes through the origin.
 
         Returns {ok, area_mm2, centroid:[x,y,z], Ixx, Iyy, Ixy, summary}:
           * area_mm2 — the cross-section area (mm^2), the headline number. For a solid this is

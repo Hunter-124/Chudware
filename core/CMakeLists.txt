@@ -1,15 +1,15 @@
 cmake_minimum_required(VERSION 3.20)
-project(aicad_core LANGUAGES C CXX)  # C enabled for aicad_miniz (miniz.c); the VS generator
+project(chudware_core LANGUAGES C CXX)  # C enabled for chudware_miniz (miniz.c); the VS generator
                                      # tolerates an implicit C, but Ninja/Make + GCC/Clang need it explicit.
 
-# The new pure-C++ engine (libaicad). Wave 1 = the constraint solver core; later
+# The new pure-C++ engine (libchudware). Wave 1 = the constraint solver core; later
 # waves add doc/geom (OCCT) and sim (CUDA). Built standalone here so the solver is
 # the cleanest possible beachhead — no OCCT, no GUI, no FFI. The host will
 # add_subdirectory(core) once a subsystem reaches parity (see docs plan).
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-# Build all static libs position-independent so they can be linked into the libaicad
+# Build all static libs position-independent so they can be linked into the libchudware
 # SHARED library on ELF platforms (Linux/macOS): GCC/Clang reject non-PIC .o in a .so
 # ("recompile with -fPIC"). No-op on MSVC (DLLs are inherently relocatable).
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -20,12 +20,12 @@ endif()
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 # Link-time optimization (IPO/LTO). OFF by default: it's a large link-time + memory hit with
-# the OCCT-linked libaicad, and normal dev/gate builds don't need it. Turn on for release
-# artifacts with -DAICAD_LTO=ON. Guarded by check_ipo_supported so an unsupported toolchain
+# the OCCT-linked libchudware, and normal dev/gate builds don't need it. Turn on for release
+# artifacts with -DCHUDWARE_LTO=ON. Guarded by check_ipo_supported so an unsupported toolchain
 # degrades to a warning instead of a hard configure error. Only meaningful in a Release build
 # (where -O3/-DNDEBUG already apply); a no-op inliner across TU boundaries otherwise.
-option(AICAD_LTO "Enable interprocedural (link-time) optimization for release artifacts" OFF)
-if(AICAD_LTO)
+option(CHUDWARE_LTO "Enable interprocedural (link-time) optimization for release artifacts" OFF)
+if(CHUDWARE_LTO)
   # CMP0069 NEW makes INTERPROCEDURAL_OPTIMIZATION actually take effect (else it's silently
   # ignored on targets whose effective policy is OLD); propagate the default to sub-projects.
   if(POLICY CMP0069)
@@ -36,19 +36,19 @@ if(AICAD_LTO)
   check_ipo_supported(RESULT _ipo_ok OUTPUT _ipo_msg LANGUAGES CXX)
   if(_ipo_ok)
     set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
-    message(STATUS "AICAD_LTO: interprocedural optimization ENABLED")
+    message(STATUS "CHUDWARE_LTO: interprocedural optimization ENABLED")
   else()
-    message(WARNING "AICAD_LTO requested but IPO unsupported by this toolchain: ${_ipo_msg}")
+    message(WARNING "CHUDWARE_LTO requested but IPO unsupported by this toolchain: ${_ipo_msg}")
   endif()
 endif()
 
 # Wave 2: provision + link the OCCT 3D B-rep kernel. OFF keeps the fast solver
-# build (Wave 1) self-contained; -DAICAD_WITH_OCCT=ON auto-downloads OCCT and
+# build (Wave 1) self-contained; -DCHUDWARE_WITH_OCCT=ON auto-downloads OCCT and
 # builds the geometry kernel + smoke test (see cmake/ProvisionOCCT.cmake).
-option(AICAD_WITH_OCCT "Provision + link the OCCT geometry kernel (Wave 2)" OFF)
+option(CHUDWARE_WITH_OCCT "Provision + link the OCCT geometry kernel (Wave 2)" OFF)
 
 # MSVC: <windows.h> (pulled in transitively by OCCT headers) defines min()/max() macros that
-# clobber std::min / std::max / std::numeric_limits<>::min, breaking e.g. core/api/libaicad.cpp.
+# clobber std::min / std::max / std::numeric_limits<>::min, breaking e.g. core/api/libchudware.cpp.
 # Suppress project-wide. Harmless without OCCT (windows.h isn't included then); mirrors the
 # per-file `#define NOMINMAX` already present in a few sources.
 if(MSVC)
@@ -83,11 +83,11 @@ FetchContent_GetProperties(miniz)
 if(NOT miniz_POPULATED)
   FetchContent_Populate(miniz)
 endif()
-add_library(aicad_miniz STATIC ${miniz_SOURCE_DIR}/miniz.c)
-target_include_directories(aicad_miniz PUBLIC ${miniz_SOURCE_DIR})
+add_library(chudware_miniz STATIC ${miniz_SOURCE_DIR}/miniz.c)
+target_include_directories(chudware_miniz PUBLIC ${miniz_SOURCE_DIR})
 # Match the dynamic CRT the rest of the core + the DLL use (silences LNK4098 and keeps
 # miniz's malloc/free on the same heap as the DLL that calls mz_free).
-set_property(TARGET aicad_miniz PROPERTY
+set_property(TARGET chudware_miniz PROPERTY
   MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 
 # --- Spectra (header-only eigensolvers over Eigen; modal FEA shift-invert) ----
@@ -123,75 +123,75 @@ FetchContent_Declare(clipper2
   GIT_SHALLOW TRUE
   SOURCE_SUBDIR _no_cmake_)
 FetchContent_MakeAvailable(clipper2)
-add_library(aicad_clipper2 STATIC
+add_library(chudware_clipper2 STATIC
   ${clipper2_SOURCE_DIR}/CPP/Clipper2Lib/src/clipper.engine.cpp
   ${clipper2_SOURCE_DIR}/CPP/Clipper2Lib/src/clipper.offset.cpp
   ${clipper2_SOURCE_DIR}/CPP/Clipper2Lib/src/clipper.rectclip.cpp)
-target_include_directories(aicad_clipper2 PUBLIC
+target_include_directories(chudware_clipper2 PUBLIC
   ${clipper2_SOURCE_DIR}/CPP/Clipper2Lib/include)
-set_property(TARGET aicad_clipper2 PROPERTY
+set_property(TARGET chudware_clipper2 PROPERTY
   MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 
-# --- aicad_prof: in-process sampling profiler (Windows + Linux; no-op elsewhere) ----
+# --- chudware_prof: in-process sampling profiler (Windows + Linux; no-op elsewhere) ----
 # Windows: periodically suspends the registered modeling thread and walks its stack lock-free
 # (RtlVirtualUnwind), symbolizing with DbgHelp at report time. Linux: a sampler thread signals
 # the work thread, an async-signal-safe backtrace() feeds a ring, and dladdr/__cxa_demangle
-# symbolize at report time. OCCT-free + tiny, so it links cleanly into libaicad.{dll,so} and the
+# symbolize at report time. OCCT-free + tiny, so it links cleanly into libchudware.{dll,so} and the
 # unit test. See core/prof/sampler.{h,cpp} and docs/PROFILER.md.
-add_library(aicad_prof STATIC
+add_library(chudware_prof STATIC
   prof/sampler.cpp
   prof/phases.cpp
   prof/tree.cpp)
-target_include_directories(aicad_prof PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(aicad_prof PUBLIC nlohmann_json::nlohmann_json)
+target_include_directories(chudware_prof PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(chudware_prof PUBLIC nlohmann_json::nlohmann_json)
 if(WIN32)
-  target_link_libraries(aicad_prof PUBLIC dbghelp)
+  target_link_libraries(chudware_prof PUBLIC dbghelp)
 else()
   # Linux/Unix: dladdr (symbolization) is in libdl on older glibc (CMAKE_DL_LIBS -> "dl" or "");
   # the sampler/drain run on a std::thread and the handler uses pthread_sigmask, so the POSIX
   # threads lib is required too. PUBLIC so both land on every consumer's final link line
-  # (libaicad.so + test_prof).
+  # (libchudware.so + test_prof).
   find_package(Threads REQUIRED)
-  target_link_libraries(aicad_prof PUBLIC ${CMAKE_DL_LIBS} Threads::Threads)
+  target_link_libraries(chudware_prof PUBLIC ${CMAKE_DL_LIBS} Threads::Threads)
 endif()
-set_property(TARGET aicad_prof PROPERTY
+set_property(TARGET chudware_prof PROPERTY
   MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 
-# --- libaicad solver ---------------------------------------------------------
-add_library(aicad_solver STATIC
+# --- libchudware solver ---------------------------------------------------------
+add_library(chudware_solver STATIC
   solver/nsolve.cpp)
-target_include_directories(aicad_solver PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(aicad_solver PUBLIC Eigen3::Eigen)
+target_include_directories(chudware_solver PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(chudware_solver PUBLIC Eigen3::Eigen)
 
-# --- libaicad geom (sketch-plane 2D<->3D lift + polar helpers) ---------------
-add_library(aicad_geom STATIC
+# --- libchudware geom (sketch-plane 2D<->3D lift + polar helpers) ---------------
+add_library(chudware_geom STATIC
   geom/plane.cpp
   geom/airfoil.cpp)
-target_include_directories(aicad_geom PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(aicad_geom PUBLIC Eigen3::Eigen)
+target_include_directories(chudware_geom PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(chudware_geom PUBLIC Eigen3::Eigen)
 
-# --- libaicad util (dimension-expression arithmetic evaluator + AICM handoff) -
+# --- libchudware util (dimension-expression arithmetic evaluator + AICM handoff) -
 # C++ port of engine/doc/equations.py (the `evaluate` entry point) so the sketch
 # solver's resolve_dim() matches the Python oracle for expr:"A*B"-style dims.
 # aicm_handoff: POSIX shm / Win named mapping for tess mesh (T-PERF10).
-add_library(aicad_util STATIC
+add_library(chudware_util STATIC
   util/expr.cpp
   util/aicm_handoff.cpp
   util/resource_governor.cpp
   util/thread_pool.cpp)
-target_include_directories(aicad_util PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(aicad_util PUBLIC Threads::Threads)
+target_include_directories(chudware_util PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(chudware_util PUBLIC Threads::Threads)
 if(UNIX AND NOT APPLE)
   # shm_open/shm_unlink live in librt on older glibc; harmless empty on new glibc.
-  target_link_libraries(aicad_util PUBLIC rt)
+  target_link_libraries(chudware_util PUBLIC rt)
 endif()
 
-# --- libaicad sim (simulation solvers) ---------------------------------------
+# --- libchudware sim (simulation solvers) ---------------------------------------
 # C++ port of engine/sim. FEA static linear elasticity first (tet4 + Eigen::SparseLU,
 # the oracle is engine/sim/fea_static.py); modal / LBM / SPICE follow. OCCT-free —
 # pure Eigen — so it builds in the standalone config too. CUDA acceleration is a
 # later layer on top of these correct CPU cores.
-add_library(aicad_sim STATIC
+add_library(chudware_sim STATIC
   sim/fea_static.cpp
   sim/fea_modal.cpp
   sim/fea_thermal.cpp
@@ -203,78 +203,78 @@ add_library(aicad_sim STATIC
   sim/sim_cache.cpp
   sim/sim_cancel.cpp
   sim/spice_sweep.cpp)
-target_include_directories(aicad_sim PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_include_directories(aicad_sim PRIVATE ${spectra_SOURCE_DIR}/include)
-# aicad_util: host resource_governor (memory admission/degrade). aicad_prof: the per-phase
-# sim timers (prof/phases.h) every solver records into. PUBLIC so aicad_mesh (fea_run/mesher)
-# and the final aicad DLL inherit both links.
-target_link_libraries(aicad_sim PUBLIC Eigen3::Eigen nlohmann_json::nlohmann_json aicad_util aicad_prof)
+target_include_directories(chudware_sim PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(chudware_sim PRIVATE ${spectra_SOURCE_DIR}/include)
+# chudware_util: host resource_governor (memory admission/degrade). chudware_prof: the per-phase
+# sim timers (prof/phases.h) every solver records into. PUBLIC so chudware_mesh (fea_run/mesher)
+# and the final chudware DLL inherit both links.
+target_link_libraries(chudware_sim PUBLIC Eigen3::Eigen nlohmann_json::nlohmann_json chudware_util chudware_prof)
 
 # --- Optional CHOLMOD (SuiteSparse) supernodal Cholesky for the SPD FEA solve ------
 # Eigen's SimplicialLDLT is scalar + single-threaded; on a bulky 3D solid its fill-in
 # explodes (measured: 300s+, multi-GB RSS, one core pegged). CholmodSupernodalLLT runs
 # BLAS3 kernels on dense supernodes over the threaded system BLAS -> 10-50x faster AND
-# multithreaded. OPTIONAL: aicad_sim still builds pure-Eigen when SuiteSparse is absent
+# multithreaded. OPTIONAL: chudware_sim still builds pure-Eigen when SuiteSparse is absent
 # (fea_static falls back to SimplicialLDLT at runtime), so the standalone config is intact.
 # OpenMP is linked so fea_static can cap the solver's thread count (leave cores for the GUI).
-option(AICAD_WITH_CHOLMOD "Use SuiteSparse CHOLMOD supernodal Cholesky for FEA (SPD)" ON)
-if(AICAD_WITH_CHOLMOD)
+option(CHUDWARE_WITH_CHOLMOD "Use SuiteSparse CHOLMOD supernodal Cholesky for FEA (SPD)" ON)
+if(CHUDWARE_WITH_CHOLMOD)
   find_path(CHOLMOD_INCLUDE_DIR cholmod.h PATH_SUFFIXES suitesparse)
   find_library(CHOLMOD_LIBRARY cholmod)
   find_library(SUITESPARSECONFIG_LIBRARY suitesparseconfig)
   if(CHOLMOD_INCLUDE_DIR AND CHOLMOD_LIBRARY)
-    message(STATUS "aicad_sim: CHOLMOD supernodal FEA solver ENABLED (${CHOLMOD_LIBRARY})")
-    target_compile_definitions(aicad_sim PRIVATE AICAD_WITH_CHOLMOD)
-    target_include_directories(aicad_sim PRIVATE ${CHOLMOD_INCLUDE_DIR})
-    target_link_libraries(aicad_sim PUBLIC ${CHOLMOD_LIBRARY})
+    message(STATUS "chudware_sim: CHOLMOD supernodal FEA solver ENABLED (${CHOLMOD_LIBRARY})")
+    target_compile_definitions(chudware_sim PRIVATE CHUDWARE_WITH_CHOLMOD)
+    target_include_directories(chudware_sim PRIVATE ${CHOLMOD_INCLUDE_DIR})
+    target_link_libraries(chudware_sim PUBLIC ${CHOLMOD_LIBRARY})
     if(SUITESPARSECONFIG_LIBRARY)
-      target_link_libraries(aicad_sim PUBLIC ${SUITESPARSECONFIG_LIBRARY})
+      target_link_libraries(chudware_sim PUBLIC ${SUITESPARSECONFIG_LIBRARY})
     endif()
   else()
-    message(STATUS "aicad_sim: CHOLMOD not found — FEA uses Eigen SimplicialLDLT fallback")
+    message(STATUS "chudware_sim: CHOLMOD not found — FEA uses Eigen SimplicialLDLT fallback")
   endif()
 endif()
 find_package(OpenMP QUIET)
 if(OpenMP_CXX_FOUND)
-  target_link_libraries(aicad_sim PRIVATE OpenMP::OpenMP_CXX)
-  target_compile_definitions(aicad_sim PRIVATE AICAD_HAVE_OPENMP)
+  target_link_libraries(chudware_sim PRIVATE OpenMP::OpenMP_CXX)
+  target_compile_definitions(chudware_sim PRIVATE CHUDWARE_HAVE_OPENMP)
 endif()
 
 
 # --- Optional CUDA LBM backend (D3Q19 collide/stream/BC) -------------------------
 # Default OFF so CPU-only builds stay unchanged. When ON, finds CUDAToolkit at the
-# CUDA 13.3 toolkit path if present and compiles sim/lbm_cuda.cu into aicad_sim.
-option(AICAD_WITH_CUDA "Build optional CUDA LBM backend (requires CUDAToolkit 13+)" OFF)
-if(AICAD_WITH_CUDA)
+# CUDA 13.3 toolkit path if present and compiles sim/lbm_cuda.cu into chudware_sim.
+option(CHUDWARE_WITH_CUDA "Build optional CUDA LBM backend (requires CUDAToolkit 13+)" OFF)
+if(CHUDWARE_WITH_CUDA)
   if(NOT DEFINED CMAKE_CUDA_COMPILER AND EXISTS "/usr/local/cuda-13.3/bin/nvcc")
     set(CMAKE_CUDA_COMPILER "/usr/local/cuda-13.3/bin/nvcc" CACHE FILEPATH "nvcc" FORCE)
   endif()
   enable_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
-  message(STATUS "aicad_sim: CUDA LBM backend ENABLED (${CUDAToolkit_VERSION})")
-  target_sources(aicad_sim PRIVATE sim/lbm_cuda.cu)
-  target_compile_definitions(aicad_sim PUBLIC AICAD_WITH_CUDA)
-  target_link_libraries(aicad_sim PUBLIC CUDA::cudart)
-  set_target_properties(aicad_sim PROPERTIES
+  message(STATUS "chudware_sim: CUDA LBM backend ENABLED (${CUDAToolkit_VERSION})")
+  target_sources(chudware_sim PRIVATE sim/lbm_cuda.cu)
+  target_compile_definitions(chudware_sim PUBLIC CHUDWARE_WITH_CUDA)
+  target_link_libraries(chudware_sim PUBLIC CUDA::cudart)
+  set_target_properties(chudware_sim PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_ARCHITECTURES "75;86"
     CUDA_STANDARD 17)
   # sm_75 (Turing) + sm_86 (Ampere, RTX 3080 Ti). allow-unsupported-compiler is
   # needed when the host GCC is newer than nvcc's official support ceiling.
-  target_compile_options(aicad_sim PRIVATE
+  target_compile_options(chudware_sim PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-allow-unsupported-compiler>)
 endif()
 
 
-# --- libaicad cam (computer-aided machining: toolpaths + post + sim) ----------
+# --- libchudware cam (computer-aided machining: toolpaths + post + sim) ----------
 # The CAM suite: stock/tool/machine/op model, Clipper2-backed 2D geometry, the
 # 2.5D/3D/turning/cutting toolpath generators, feeds & speeds, the data-driven
 # post-processor (GRBL/LinuxCNC/Fanuc/Haas/Mach3/Marlin/Siemens/Centroid), the
 # material-removal sim, and the stateful job session. OCCT-FREE — pure numerics +
-# JSON like aicad_sim/aicad_ecad, so it builds in the standalone config and is
+# JSON like chudware_sim/chudware_ecad, so it builds in the standalone config and is
 # unit-tested headless (test_cam). A separate OCCT extraction adapter (geom layer)
 # feeds live-part geometry into operations for the product. See docs/CAM_PLAN.md.
-add_library(aicad_cam STATIC
+add_library(chudware_cam STATIC
   cam/model.cpp
   cam/geometry.cpp
   cam/feeds.cpp
@@ -291,25 +291,25 @@ add_library(aicad_cam STATIC
   cam/stock_sim.cpp
   cam/audit.cpp
   cam/session.cpp)
-target_include_directories(aicad_cam PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(aicad_cam PUBLIC
-  aicad_clipper2 aicad_miniz nlohmann_json::nlohmann_json)
+target_include_directories(chudware_cam PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(chudware_cam PUBLIC
+  chudware_clipper2 chudware_miniz nlohmann_json::nlohmann_json)
 # MSVC only defines M_PI et al. in <cmath> when _USE_MATH_DEFINES is set; the CAM math
 # (helix/adaptive/stock-sim) relies on them. GCC/Clang expose them by default, so this is
 # a no-op there. Target-scoped to avoid redefinition warnings in files that set it locally.
 if(MSVC)
   # PUBLIC so consumers (e.g. test_cam) that use M_PI via the CAM headers get it too.
-  target_compile_definitions(aicad_cam PUBLIC _USE_MATH_DEFINES)
+  target_compile_definitions(chudware_cam PUBLIC _USE_MATH_DEFINES)
 endif()
-set_property(TARGET aicad_cam PROPERTY
+set_property(TARGET chudware_cam PROPERTY
   MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 
-# --- libaicad ecad (ECAD document model: schema + ops + session) -------------
+# --- libchudware ecad (ECAD document model: schema + ops + session) -------------
 # C++ port of engine/ecad (schema.py + ops.py + session.py). OCCT-free — the
-# ECAD doc/ops layer is pure JSON (like aicad_sim) — so it builds in the
+# ECAD doc/ops layer is pure JSON (like chudware_sim) — so it builds in the
 # standalone config and stays fast + isolated. Netlist/ERC/DRC/autoroute/Gerber/
 # 3D are DEFERRED to later waves.
-add_library(aicad_ecad STATIC
+add_library(chudware_ecad STATIC
   ecad/schema.cpp
   ecad/ops.cpp
   ecad/op_registry.cpp
@@ -327,18 +327,18 @@ add_library(aicad_ecad STATIC
   ecad/container.cpp
   ecad/kicad.cpp
   ecad/session.cpp)
-target_include_directories(aicad_ecad PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-# aicad_miniz is the ZIP read/write lib (shared with the .step+ container) — the
+target_include_directories(chudware_ecad PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+# chudware_miniz is the ZIP read/write lib (shared with the .step+ container) — the
 # .ecad+ container (container.cpp) writes/reads its archive through it.
-# aicad_sim provides the SPICE circuit builder + MNA simulator that ecad_simulate
-# (session.cpp) drives (schematic netlist -> SPICE circuit -> run). aicad_sim is
-# pure-JSON and does NOT depend on aicad_ecad, so this introduces no cycle.
-target_link_libraries(aicad_ecad PUBLIC nlohmann_json::nlohmann_json aicad_miniz aicad_sim)
+# chudware_sim provides the SPICE circuit builder + MNA simulator that ecad_simulate
+# (session.cpp) drives (schematic netlist -> SPICE circuit -> run). chudware_sim is
+# pure-JSON and does NOT depend on chudware_ecad, so this introduces no cycle.
+target_link_libraries(chudware_ecad PUBLIC nlohmann_json::nlohmann_json chudware_miniz chudware_sim)
 
 # mega-28 E28: autorouter min-clearance (pad/track spacing) — pure JSON, OCCT-free.
 add_executable(test_autoroute tests/test_autoroute.cpp)
 target_include_directories(test_autoroute PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_autoroute PRIVATE aicad_ecad)
+target_link_libraries(test_autoroute PRIVATE chudware_ecad)
 set_target_properties(test_autoroute PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME autoroute COMMAND test_autoroute)
@@ -347,9 +347,9 @@ add_test(NAME autoroute COMMAND test_autoroute)
 # toolchain/build wrappers + probe-rs/esptool hardware path + co-verification +
 # the Renode/QEMU emulator leg (fw_sim_run incl. §7 trace + §9 scenarios,
 # fw_power_profile, fw_sensor_scenario) + the fw_* RPC dispatch
-# (firmware/firmware_rpc.cpp). Pure JSON like aicad_sim/aicad_ecad; links
-# aicad_ecad for session/netlist/schema/container resolution of board_doc_ref.
-add_library(aicad_firmware STATIC
+# (firmware/firmware_rpc.cpp). Pure JSON like chudware_sim/chudware_ecad; links
+# chudware_ecad for session/netlist/schema/container resolution of board_doc_ref.
+add_library(chudware_firmware STATIC
   firmware/subprocess.cpp
   firmware/templates_embedded.cpp
   firmware/mcu_pinouts.cpp
@@ -368,16 +368,16 @@ add_library(aicad_firmware STATIC
   firmware/sensor_models.cpp
   firmware/sim_sensor_bridge.cpp
   firmware/firmware_rpc.cpp)
-target_include_directories(aicad_firmware PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(aicad_firmware PUBLIC nlohmann_json::nlohmann_json aicad_ecad)
+target_include_directories(chudware_firmware PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(chudware_firmware PUBLIC nlohmann_json::nlohmann_json chudware_ecad)
 
 add_executable(test_firmware tests/test_firmware.cpp)
 target_include_directories(test_firmware PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_firmware PRIVATE aicad_firmware)
+target_link_libraries(test_firmware PRIVATE chudware_firmware)
 # The fw_* tests read small ECAD board/schematic/trace fixtures from the source
 # tree; pass the absolute dir so the test runs from the build dir.
 target_compile_definitions(test_firmware PRIVATE
-  AICAD_TEST_DATA="${CMAKE_CURRENT_SOURCE_DIR}/tests/data/firmware")
+  CHUDWARE_TEST_DATA="${CMAKE_CURRENT_SOURCE_DIR}/tests/data/firmware")
 set_target_properties(test_firmware PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME firmware COMMAND test_firmware)
@@ -386,7 +386,7 @@ add_test(NAME firmware COMMAND test_firmware)
 # {"method","params"} and prints the firmware::call result as one JSON line.
 # Used by the T-RF15 parity diffs against the Python oracle.
 add_executable(fw_cli firmware/fw_cli.cpp)
-target_link_libraries(fw_cli PRIVATE aicad_firmware)
+target_link_libraries(fw_cli PRIVATE chudware_firmware)
 set_target_properties(fw_cli PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
@@ -394,7 +394,7 @@ set_target_properties(fw_cli PROPERTIES
 # .kicad_* extension dispatch — mirrors engine/ecad/test_formats.py tests 3-6.
 add_executable(test_kicad_import tests/test_kicad_import.cpp)
 target_include_directories(test_kicad_import PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_kicad_import PRIVATE aicad_ecad)
+target_link_libraries(test_kicad_import PRIVATE chudware_ecad)
 set_target_properties(test_kicad_import PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME kicad_import COMMAND test_kicad_import)
@@ -405,25 +405,25 @@ add_test(NAME kicad_import COMMAND test_kicad_import)
 # combos, beam-segmentation member-force/deflection extraction), the AISC +
 # lumber section libraries (embedded curated tables), the AISC-LRFD / NDS-ASD
 # D/C checks, the ENR-rate cost takeoff, and the struct_* RPC dispatch
-# (structural/structural_rpc.cpp). Pure Eigen + JSON like aicad_sim; OCCT-free.
-add_library(aicad_structural STATIC
+# (structural/structural_rpc.cpp). Pure Eigen + JSON like chudware_sim; OCCT-free.
+add_library(chudware_structural STATIC
   structural/model.cpp
   structural/solver.cpp
   structural/sections.cpp
   structural/checks.cpp
   structural/estimate.cpp
   structural/structural_rpc.cpp)
-target_include_directories(aicad_structural PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(aicad_structural PUBLIC Eigen3::Eigen nlohmann_json::nlohmann_json)
+target_include_directories(chudware_structural PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(chudware_structural PUBLIC Eigen3::Eigen nlohmann_json::nlohmann_json)
 
 add_executable(test_structural tests/test_structural.cpp)
 target_include_directories(test_structural PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_structural PRIVATE aicad_structural)
+target_link_libraries(test_structural PRIVATE chudware_structural)
 # The structural tests read aicad.structure/1 fixtures + the ENR rate table
 # from the source tree; pass the absolute dirs so the test runs from the build dir.
 target_compile_definitions(test_structural PRIVATE
-  AICAD_TEST_DATA="${CMAKE_CURRENT_SOURCE_DIR}/tests/data/structural"
-  AICAD_STRUCT_DATA="${CMAKE_CURRENT_SOURCE_DIR}/structural")
+  CHUDWARE_TEST_DATA="${CMAKE_CURRENT_SOURCE_DIR}/tests/data/structural"
+  CHUDWARE_STRUCT_DATA="${CMAKE_CURRENT_SOURCE_DIR}/structural")
 set_target_properties(test_structural PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME structural COMMAND test_structural)
@@ -432,7 +432,7 @@ add_test(NAME structural COMMAND test_structural)
 # {"method","params"} and prints the structural::call result as one JSON line.
 # Used by the T-RF19 parity diffs against the Python (PyNite) oracle.
 add_executable(struct_cli structural/struct_cli.cpp)
-target_link_libraries(struct_cli PRIVATE aicad_structural)
+target_link_libraries(struct_cli PRIVATE chudware_structural)
 set_target_properties(struct_cli PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
@@ -440,24 +440,24 @@ enable_testing()
 
 add_executable(test_sim tests/test_sim.cpp)
 target_include_directories(test_sim PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_sim PRIVATE aicad_sim)
+target_link_libraries(test_sim PRIVATE chudware_sim)
 set_target_properties(test_sim PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME sim COMMAND test_sim)
 
 # Second-order (tet10) quadratic-tet FEA gate: node-ordering sanity + axial accuracy
 # + cantilever bending (tet10 relieves tet4 shear-locking). OCCT-/gmsh-free (inline
-# structured box meshes), so it links only aicad_sim like test_sim.
+# structured box meshes), so it links only chudware_sim like test_sim.
 add_executable(test_modal tests/test_modal.cpp)
 target_include_directories(test_modal PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_modal PRIVATE aicad_sim)
+target_link_libraries(test_modal PRIVATE chudware_sim)
 set_target_properties(test_modal PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME modal COMMAND test_modal)
 
 add_executable(test_tet10 tests/test_tet10.cpp)
 target_include_directories(test_tet10 PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_tet10 PRIVATE aicad_sim)
+target_link_libraries(test_tet10 PRIVATE chudware_sim)
 set_target_properties(test_tet10 PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME tet10 COMMAND test_tet10)
@@ -465,20 +465,20 @@ add_test(NAME tet10 COMMAND test_tet10)
 # T-SIM1: steady-state thermal (heat-conduction) FEA gate — validates the conduction
 # kernel against the closed-form 1D plane-wall (Dirichlet) and wall+convection (Robin)
 # solutions, on tet4 and tet10. OCCT-/mesher-free (inline structured box meshes), so it
-# links only aicad_sim like test_sim / test_modal.
+# links only chudware_sim like test_sim / test_modal.
 add_executable(test_thermal tests/test_thermal.cpp)
 target_include_directories(test_thermal PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_thermal PRIVATE aicad_sim)
+target_link_libraries(test_thermal PRIVATE chudware_sim)
 set_target_properties(test_thermal PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME thermal COMMAND test_thermal)
 
 # SPICE deck parser + schematic->circuit mapper (parse_netlist / netlist_to_spice_circuit,
-# incl. the starter SYMBOL libid fallback via symbol_sim_table). OCCT-free, links aicad_sim.
+# incl. the starter SYMBOL libid fallback via symbol_sim_table). OCCT-free, links chudware_sim.
 add_executable(test_spice_netlist
   tests/test_spice_netlist.cpp)
 target_include_directories(test_spice_netlist PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_spice_netlist PRIVATE aicad_sim)
+target_link_libraries(test_spice_netlist PRIVATE chudware_sim)
 set_target_properties(test_spice_netlist PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME spice_netlist COMMAND test_spice_netlist)
@@ -487,7 +487,7 @@ add_test(NAME spice_netlist COMMAND test_spice_netlist)
 add_executable(test_spice_sweep
   tests/test_spice_sweep.cpp)
 target_include_directories(test_spice_sweep PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_spice_sweep PRIVATE aicad_sim)
+target_link_libraries(test_spice_sweep PRIVATE chudware_sim)
 set_target_properties(test_spice_sweep PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME spice_sweep COMMAND test_spice_sweep)
@@ -495,33 +495,33 @@ add_test(NAME spice_sweep COMMAND test_spice_sweep)
 # CAM suite tests: model serialization round-trips, Clipper2 geometry (offset /
 # boolean / pocket clearing / raster), feeds & speeds, the toolpath generators,
 # the post-processor dialects, and the material-removal sim. OCCT-free; links
-# aicad_cam (which pulls in Clipper2 + miniz). Grows with each CAM wave.
+# chudware_cam (which pulls in Clipper2 + miniz). Grows with each CAM wave.
 add_executable(test_cam
   tests/test_cam.cpp)
 target_include_directories(test_cam PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_cam PRIVATE aicad_cam)
+target_link_libraries(test_cam PRIVATE chudware_cam)
 # T-M4: the byte-identical feeds test reads the source-tree registry.json (the CAM fold-in
 # ground truth); pass its absolute path so the test runs from the build dir.
 target_compile_definitions(test_cam PRIVATE
-  AICAD_TEST_REGISTRY="${CMAKE_CURRENT_SOURCE_DIR}/data/materials/registry.json"
-  AICAD_TEST_MACHINES="${CMAKE_CURRENT_SOURCE_DIR}/../services/research/data/machines.json")
+  CHUDWARE_TEST_REGISTRY="${CMAKE_CURRENT_SOURCE_DIR}/data/materials/registry.json"
+  CHUDWARE_TEST_MACHINES="${CMAKE_CURRENT_SOURCE_DIR}/../services/research/data/machines.json")
 set_target_properties(test_cam PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME cam COMMAND test_cam)
 
-# --- libaicad sketch (parameterization + constraints over the solver core) ---
-add_library(aicad_sketch STATIC
+# --- libchudware sketch (parameterization + constraints over the solver core) ---
+add_library(chudware_sketch STATIC
   sketch/sketch.cpp
   sketch/sketch3d.cpp)
-target_include_directories(aicad_sketch PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(aicad_sketch PUBLIC aicad_solver aicad_util nlohmann_json::nlohmann_json)
+target_include_directories(chudware_sketch PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(chudware_sketch PUBLIC chudware_solver chudware_util nlohmann_json::nlohmann_json)
 
 # --- sketch_cli (differential-harness driver; see tools/solver_diff.py) -------
 # Reads { "sketch":{...}, "env":{...} } from argv[1] (or stdin if "-") and prints
 # the solve_sketch result as one JSON line. Output to bin/ alongside the tests.
 add_executable(sketch_cli
   sketch/sketch_cli.cpp)
-target_link_libraries(sketch_cli PRIVATE aicad_sketch)
+target_link_libraries(sketch_cli PRIVATE chudware_sketch)
 set_target_properties(sketch_cli PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
@@ -529,7 +529,7 @@ set_target_properties(sketch_cli PROPERTIES
 add_executable(test_nsolve
   tests/test_nsolve.cpp)
 target_include_directories(test_nsolve PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_nsolve PRIVATE aicad_solver)
+target_link_libraries(test_nsolve PRIVATE chudware_solver)
 set_target_properties(test_nsolve PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME nsolve COMMAND test_nsolve)
@@ -541,7 +541,7 @@ add_test(NAME nsolve COMMAND test_nsolve)
 add_executable(test_prof
   tests/test_prof.cpp)
 target_include_directories(test_prof PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_prof PRIVATE aicad_prof)
+target_link_libraries(test_prof PRIVATE chudware_prof)
 set_target_properties(test_prof PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 if(MSVC)
@@ -556,11 +556,11 @@ add_test(NAME prof COMMAND test_prof)
 
 # --- per-phase sim timer unit test (OCCT-free) --------------------------------
 # Exercises prof/phases.{h,cpp} directly (StudyScope/PhaseScope/add/report) AND proves the
-# fea_static solver records its solve.* phases end to end (aicad_sim is OCCT-free).
+# fea_static solver records its solve.* phases end to end (chudware_sim is OCCT-free).
 add_executable(test_prof_phases
   tests/test_prof_phases.cpp)
 target_include_directories(test_prof_phases PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_prof_phases PRIVATE aicad_prof aicad_sim)
+target_link_libraries(test_prof_phases PRIVATE chudware_prof chudware_sim)
 set_target_properties(test_prof_phases PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME prof_phases COMMAND test_prof_phases)
@@ -569,7 +569,7 @@ add_test(NAME prof_phases COMMAND test_prof_phases)
 add_executable(test_prof_tree
   tests/test_prof_tree.cpp)
 target_include_directories(test_prof_tree PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_prof_tree PRIVATE aicad_prof)
+target_link_libraries(test_prof_tree PRIVATE chudware_prof)
 set_target_properties(test_prof_tree PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME prof_tree COMMAND test_prof_tree)
@@ -577,7 +577,7 @@ add_test(NAME prof_tree COMMAND test_prof_tree)
 add_executable(test_sketch
   tests/test_sketch.cpp)
 target_include_directories(test_sketch PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_sketch PRIVATE aicad_sketch)
+target_link_libraries(test_sketch PRIVATE chudware_sketch)
 set_target_properties(test_sketch PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME sketch COMMAND test_sketch)
@@ -585,7 +585,7 @@ add_test(NAME sketch COMMAND test_sketch)
 add_executable(test_sketch3d
   tests/test_sketch3d.cpp)
 target_include_directories(test_sketch3d PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_sketch3d PRIVATE aicad_sketch)
+target_link_libraries(test_sketch3d PRIVATE chudware_sketch)
 set_target_properties(test_sketch3d PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME sketch3d COMMAND test_sketch3d)
@@ -593,7 +593,7 @@ add_test(NAME sketch3d COMMAND test_sketch3d)
 add_executable(test_drag
   tests/test_drag.cpp)
 target_include_directories(test_drag PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_drag PRIVATE aicad_sketch)
+target_link_libraries(test_drag PRIVATE chudware_sketch)
 set_target_properties(test_drag PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME drag COMMAND test_drag)
@@ -601,7 +601,7 @@ add_test(NAME drag COMMAND test_drag)
 add_executable(test_freecad_parity
   tests/test_freecad_parity.cpp)
 target_include_directories(test_freecad_parity PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_freecad_parity PRIVATE aicad_sketch)
+target_link_libraries(test_freecad_parity PRIVATE chudware_sketch)
 set_target_properties(test_freecad_parity PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME freecad_parity COMMAND test_freecad_parity)
@@ -609,7 +609,7 @@ add_test(NAME freecad_parity COMMAND test_freecad_parity)
 add_executable(test_plane
   tests/test_plane.cpp)
 target_include_directories(test_plane PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_plane PRIVATE aicad_geom)
+target_link_libraries(test_plane PRIVATE chudware_geom)
 set_target_properties(test_plane PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME plane COMMAND test_plane)
@@ -617,7 +617,7 @@ add_test(NAME plane COMMAND test_plane)
 add_executable(test_expr
   tests/test_expr.cpp)
 target_include_directories(test_expr PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_expr PRIVATE aicad_util)
+target_link_libraries(test_expr PRIVATE chudware_util)
 set_target_properties(test_expr PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME expr COMMAND test_expr)
@@ -625,7 +625,7 @@ add_test(NAME expr COMMAND test_expr)
 add_executable(test_governor
   tests/test_governor.cpp)
 target_include_directories(test_governor PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_governor PRIVATE aicad_util)
+target_link_libraries(test_governor PRIVATE chudware_util)
 set_target_properties(test_governor PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME governor COMMAND test_governor)
@@ -634,25 +634,25 @@ add_test(NAME governor COMMAND test_governor)
 add_executable(test_thread_pool
   tests/test_thread_pool.cpp)
 target_include_directories(test_thread_pool PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_thread_pool PRIVATE aicad_util)
+target_link_libraries(test_thread_pool PRIVATE chudware_util)
 set_target_properties(test_thread_pool PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME thread_pool COMMAND test_thread_pool)
 
-# --- libaicad geom-aicm (OCCT-free AICM v1 writer) ---------------------------
+# --- libchudware geom-aicm (OCCT-free AICM v1 writer) ---------------------------
 # The encoder half of engine/doc/tessellate.py, kept OCCT-free so it builds and
-# unit-tests in the default (AICAD_WITH_OCCT=OFF) configuration too. The OCCT
+# unit-tests in the default (CHUDWARE_WITH_OCCT=OFF) configuration too. The OCCT
 # tessellator below links this same lib.
-add_library(aicad_aicm STATIC
+add_library(chudware_aicm STATIC
   geom/aicm.cpp)
-target_include_directories(aicad_aicm PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(chudware_aicm PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
-# --- libaicad agent (LLM provider layer; WinHTTP TLS, OCCT-free) -------------
+# --- libchudware agent (LLM provider layer; WinHTTP TLS, OCCT-free) -------------
 # P51: C++ port of agent/providers/*.py — the request builders + response parsers
 # for Anthropic / OpenAI-compatible / llama.cpp / mock providers, plus a native
-# WinHTTP POST (no libcurl/OpenSSL). Top-level (NOT inside if(AICAD_WITH_OCCT)) so
-# it builds in both configs. Dynamic CRT to match aicad_miniz / the DLL heap.
-add_library(aicad_agent STATIC
+# WinHTTP POST (no libcurl/OpenSSL). Top-level (NOT inside if(CHUDWARE_WITH_OCCT)) so
+# it builds in both configs. Dynamic CRT to match chudware_miniz / the DLL heap.
+add_library(chudware_agent STATIC
   agent/http.cpp
   agent/omp_bridge_client.cpp
   agent/auth.cpp
@@ -675,22 +675,22 @@ add_library(aicad_agent STATIC
   agent/firm_team.cpp
   agent/iface_plan.cpp
   agent/pm_assist.cpp)
-target_include_directories(aicad_agent PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(aicad_agent PUBLIC nlohmann_json::nlohmann_json)
+target_include_directories(chudware_agent PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(chudware_agent PUBLIC nlohmann_json::nlohmann_json)
 if(WIN32)
-  target_link_libraries(aicad_agent PUBLIC winhttp bcrypt)
+  target_link_libraries(chudware_agent PUBLIC winhttp bcrypt)
 else()
   # POSIX HTTP backend (agent/http.cpp #else branch): libcurl over the system TLS/CA store.
   find_package(CURL REQUIRED)
-  target_link_libraries(aicad_agent PUBLIC CURL::libcurl)
+  target_link_libraries(chudware_agent PUBLIC CURL::libcurl)
 endif()
-set_property(TARGET aicad_agent PROPERTY
+set_property(TARGET chudware_agent PROPERTY
   MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 
 add_executable(test_agent
   tests/test_agent.cpp)
 target_include_directories(test_agent PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_agent PRIVATE aicad_agent)
+target_link_libraries(test_agent PRIVATE chudware_agent)
 set_target_properties(test_agent PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 # test_agent loads role prompts from the repo-relative agent/prompts/ — run it from
@@ -698,40 +698,40 @@ set_target_properties(test_agent PROPERTIES
 add_test(NAME agent COMMAND test_agent WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
 # subscription-auth store + pre-run refresh (agent/auth.cpp). OCCT-free, links
-# aicad_agent; all cases run against a scratch XDG config dir with a fake HTTP seam.
+# chudware_agent; all cases run against a scratch XDG config dir with a fake HTTP seam.
 add_executable(test_agent_auth
   tests/test_agent_auth.cpp)
 target_include_directories(test_agent_auth PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_agent_auth PRIVATE aicad_agent)
+target_link_libraries(test_agent_auth PRIVATE chudware_agent)
 set_target_properties(test_agent_auth PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME agent_auth COMMAND test_agent_auth)
 
-# err_sig identical-failure detector (agent/machine.cpp). OCCT-free, links aicad_agent.
+# err_sig identical-failure detector (agent/machine.cpp). OCCT-free, links chudware_agent.
 add_executable(test_machine
   tests/test_machine.cpp)
 target_include_directories(test_machine PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_machine PRIVATE aicad_agent)
+target_link_libraries(test_machine PRIVATE chudware_agent)
 set_target_properties(test_machine PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME machine COMMAND test_machine)
 
-# complexity router (agent/complexity.cpp). OCCT-free, links aicad_agent.
+# complexity router (agent/complexity.cpp). OCCT-free, links chudware_agent.
 add_executable(test_complexity
   tests/test_complexity.cpp)
 target_include_directories(test_complexity PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_complexity PRIVATE aicad_agent)
+target_link_libraries(test_complexity PRIVATE chudware_agent)
 set_target_properties(test_complexity PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME complexity COMMAND test_complexity)
 
 # Copilot mode tool-gating contract (agent/copilot_modes.cpp ←
-# contracts/copilot_modes.json). OCCT-free, links aicad_agent. Runs from the
+# contracts/copilot_modes.json). OCCT-free, links chudware_agent. Runs from the
 # repo root (like test_agent) so the repo-relative contracts/ fallback resolves.
 add_executable(test_copilot_modes
   tests/test_copilot_modes.cpp)
 target_include_directories(test_copilot_modes PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_copilot_modes PRIVATE aicad_agent)
+target_link_libraries(test_copilot_modes PRIVATE chudware_agent)
 set_target_properties(test_copilot_modes PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME copilot_modes COMMAND test_copilot_modes
@@ -741,7 +741,7 @@ add_test(NAME copilot_modes COMMAND test_copilot_modes
 add_executable(test_domain
   tests/test_domain.cpp)
 target_include_directories(test_domain PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_domain PRIVATE aicad_agent)
+target_link_libraries(test_domain PRIVATE chudware_agent)
 set_target_properties(test_domain PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME domain COMMAND test_domain)
@@ -750,7 +750,7 @@ add_test(NAME domain COMMAND test_domain)
 add_executable(test_firm_bid
   tests/test_firm_bid.cpp)
 target_include_directories(test_firm_bid PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_firm_bid PRIVATE aicad_agent)
+target_link_libraries(test_firm_bid PRIVATE chudware_agent)
 set_target_properties(test_firm_bid PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME firm_bid COMMAND test_firm_bid)
@@ -759,7 +759,7 @@ add_test(NAME firm_bid COMMAND test_firm_bid)
 add_executable(test_firm_team
   tests/test_firm_team.cpp)
 target_include_directories(test_firm_team PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_firm_team PRIVATE aicad_agent)
+target_link_libraries(test_firm_team PRIVATE chudware_agent)
 set_target_properties(test_firm_team PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME firm_team COMMAND test_firm_team)
@@ -772,55 +772,55 @@ add_executable(test_aicm
 target_include_directories(test_aicm PRIVATE
   ${doctest_SOURCE_DIR}
   ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render)
-target_link_libraries(test_aicm PRIVATE aicad_aicm aicad_util)
+target_link_libraries(test_aicm PRIVATE chudware_aicm chudware_util)
 target_sources(test_aicm PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
 set_target_properties(test_aicm PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME aicm COMMAND test_aicm)
 
-# --- libaicad parts (parametric standard-parts catalog) ----------------------
+# --- libchudware parts (parametric standard-parts catalog) ----------------------
 # Generates EDITABLE geometry for off-the-shelf hardware (fasteners/nuts/washers/
 # standoffs/bearings/inserts/dowels) by EMITTING document ops — so it is OCCT-free
 # (only JSON; the doc engine compiles the geometry). The numbers mirror
-# agent/prompts/shared/cheatsheets/hardware.md. Linked into the libaicad DLL below
+# agent/prompts/shared/cheatsheets/hardware.md. Linked into the libchudware DLL below
 # (parts_make / parts_catalog_list RPCs) and unit-tested in both configs.
 # parts/place.cpp (T-RF19 place.py port) is the part_place / part_import_file
-# placement router: the symbol_footprint leg drives aicad_ecad's apply_ops and
-# the fitting_id / fmu_component legs use the aicad_piping / aicad_hydraulic
+# placement router: the symbol_footprint leg drives chudware_ecad's apply_ops and
+# the fitting_id / fmu_component legs use the chudware_piping / chudware_hydraulic
 # schema factories — all still pure JSON / OCCT-free (the doc-creating RPCs and
-# the PartRecord hub lookup stay Seams injections wired in libaicad.cpp).
-add_library(aicad_parts STATIC
+# the PartRecord hub lookup stay Seams injections wired in libchudware.cpp).
+add_library(chudware_parts STATIC
   parts/catalog.cpp
   parts/generate.cpp
   parts/place.cpp)
-target_include_directories(aicad_parts PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(aicad_parts PUBLIC
-  nlohmann_json::nlohmann_json aicad_ecad aicad_hydraulic)
+target_include_directories(chudware_parts PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(chudware_parts PUBLIC
+  nlohmann_json::nlohmann_json chudware_ecad chudware_hydraulic)
 
 add_executable(test_parts tests/test_parts.cpp)
 target_include_directories(test_parts PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_parts PRIVATE aicad_parts)
+target_link_libraries(test_parts PRIVATE chudware_parts)
 set_target_properties(test_parts PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME parts COMMAND test_parts)
 
 add_executable(test_parts_place tests/test_parts_place.cpp)
 target_include_directories(test_parts_place PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_parts_place PRIVATE aicad_parts)
+target_link_libraries(test_parts_place PRIVATE chudware_parts)
 set_target_properties(test_parts_place PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME parts_place COMMAND test_parts_place)
 
-# --- libaicad sourcing (BOM roll-up / cost model / spec-match / providers) -------
+# --- libchudware sourcing (BOM roll-up / cost model / spec-match / providers) -------
 # T-RF18: C++ port of engine_oracle/{bom,cost_model,spec_sheet_matcher,parts_providers,
 # quote_providers}.py backing the worker methods bom_rollup / bom_price /
 # request_quote / match_part_number / vendor_part_fetch and the MCP spec_sheet_match
 # lane. PURE (OCCT-free, no doc/ecad/agent linkage): every side effect — assembly /
 # board loading, HTTP transport, model building — is a Seams injection point, so the
-# libaicad dispatch glue supplies the production defaults and tests run fully
-# offline. Linked into the libaicad DLL below and unit-tested in both configs.
-add_library(aicad_sourcing STATIC
+# libchudware dispatch glue supplies the production defaults and tests run fully
+# offline. Linked into the libchudware DLL below and unit-tested in both configs.
+add_library(chudware_sourcing STATIC
   sourcing/bom.cpp
   sourcing/config.cpp
   sourcing/cost.cpp
@@ -829,89 +829,89 @@ add_library(aicad_sourcing STATIC
   sourcing/sourcing.cpp
   sourcing/specmatch.cpp
   sourcing/vendorreg.cpp)
-target_include_directories(aicad_sourcing PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(aicad_sourcing PUBLIC nlohmann_json::nlohmann_json)
+target_include_directories(chudware_sourcing PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(chudware_sourcing PUBLIC nlohmann_json::nlohmann_json)
 
 add_executable(test_sourcing tests/test_sourcing.cpp)
 target_include_directories(test_sourcing PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_sourcing PRIVATE aicad_sourcing)
+target_link_libraries(test_sourcing PRIVATE chudware_sourcing)
 set_target_properties(test_sourcing PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME sourcing COMMAND test_sourcing)
 
-# --- libaicad tolerance / mechanical / materials / dfm (T-RF19 leaf 6) ------------
+# --- libchudware tolerance / mechanical / materials / dfm (T-RF19 leaf 6) ------------
 # C++ ports of engine_oracle/{tolerance/stackup, mechanical/{gear_check,bearing_life},
 # materials/registry, dfm/process_profiles}.py — the small pure oracle modules behind
 # the MCP stackup_analyze / gear_check / bearing_life tools, the CAM materials seam,
 # the FEA material library and the intake/dimension-scheme DfM brain. PURE (OCCT-free,
 # no doc/ecad/agent linkage); each owns its methods behind a single
-# call(method, params, result, err) dispatch entry for the libaicad glue. Envelope
+# call(method, params, result, err) dispatch entry for the libchudware glue. Envelope
 # parity with the Python oracle is proven by golden fixtures under tests/data/
 # (generated from the oracle — see each test's header comment).
-add_library(aicad_tolerance STATIC
+add_library(chudware_tolerance STATIC
   tolerance/stackup.cpp)
-target_include_directories(aicad_tolerance PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(aicad_tolerance PUBLIC nlohmann_json::nlohmann_json)
+target_include_directories(chudware_tolerance PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(chudware_tolerance PUBLIC nlohmann_json::nlohmann_json)
 
-add_library(aicad_mechanical STATIC
+add_library(chudware_mechanical STATIC
   mechanical/mechanical.cpp)
-target_include_directories(aicad_mechanical PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(aicad_mechanical PUBLIC nlohmann_json::nlohmann_json)
+target_include_directories(chudware_mechanical PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(chudware_mechanical PUBLIC nlohmann_json::nlohmann_json)
 
-add_library(aicad_materials STATIC
+add_library(chudware_materials STATIC
   materials/materials.cpp)
-target_include_directories(aicad_materials PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(aicad_materials PUBLIC nlohmann_json::nlohmann_json)
+target_include_directories(chudware_materials PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(chudware_materials PUBLIC nlohmann_json::nlohmann_json)
 # Bundled seed fallback for the registry resolver (env -> appdata -> this):
-target_compile_definitions(aicad_materials PRIVATE
-  AICAD_BUNDLED_MATERIALS_REGISTRY="${CMAKE_CURRENT_SOURCE_DIR}/data/materials/registry.json")
-target_compile_definitions(aicad_cam PRIVATE
-  AICAD_BUNDLED_MATERIALS_REGISTRY="${CMAKE_CURRENT_SOURCE_DIR}/data/materials/registry.json")
+target_compile_definitions(chudware_materials PRIVATE
+  CHUDWARE_BUNDLED_MATERIALS_REGISTRY="${CMAKE_CURRENT_SOURCE_DIR}/data/materials/registry.json")
+target_compile_definitions(chudware_cam PRIVATE
+  CHUDWARE_BUNDLED_MATERIALS_REGISTRY="${CMAKE_CURRENT_SOURCE_DIR}/data/materials/registry.json")
 
-add_library(aicad_dfm STATIC
+add_library(chudware_dfm STATIC
   dfm/process_profiles.cpp)
-target_include_directories(aicad_dfm PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(aicad_dfm PUBLIC aicad_materials nlohmann_json::nlohmann_json)
+target_include_directories(chudware_dfm PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(chudware_dfm PUBLIC chudware_materials nlohmann_json::nlohmann_json)
 
 add_executable(test_tolerance tests/test_tolerance.cpp)
 target_include_directories(test_tolerance PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_tolerance PRIVATE aicad_tolerance)
+target_link_libraries(test_tolerance PRIVATE chudware_tolerance)
 target_compile_definitions(test_tolerance PRIVATE
-  AICAD_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
+  CHUDWARE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
 set_target_properties(test_tolerance PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME tolerance COMMAND test_tolerance)
 
 add_executable(test_mechanical tests/test_mechanical.cpp)
 target_include_directories(test_mechanical PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_mechanical PRIVATE aicad_mechanical)
+target_link_libraries(test_mechanical PRIVATE chudware_mechanical)
 target_compile_definitions(test_mechanical PRIVATE
-  AICAD_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
+  CHUDWARE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
 set_target_properties(test_mechanical PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME mechanical COMMAND test_mechanical)
 
 add_executable(test_materials tests/test_materials.cpp)
 target_include_directories(test_materials PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_materials PRIVATE aicad_materials)
+target_link_libraries(test_materials PRIVATE chudware_materials)
 target_compile_definitions(test_materials PRIVATE
-  AICAD_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data"
-  AICAD_TEST_REGISTRY="${CMAKE_CURRENT_SOURCE_DIR}/data/materials/registry.json")
+  CHUDWARE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data"
+  CHUDWARE_TEST_REGISTRY="${CMAKE_CURRENT_SOURCE_DIR}/data/materials/registry.json")
 set_target_properties(test_materials PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME materials COMMAND test_materials)
 
 add_executable(test_dfm tests/test_dfm.cpp)
 target_include_directories(test_dfm PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_dfm PRIVATE aicad_dfm)
+target_link_libraries(test_dfm PRIVATE chudware_dfm)
 target_compile_definitions(test_dfm PRIVATE
-  AICAD_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data"
-  AICAD_TEST_REGISTRY="${CMAKE_CURRENT_SOURCE_DIR}/data/materials/registry.json")
+  CHUDWARE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data"
+  CHUDWARE_TEST_REGISTRY="${CMAKE_CURRENT_SOURCE_DIR}/data/materials/registry.json")
 set_target_properties(test_dfm PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME dfm COMMAND test_dfm)
 
-# --- libaicad piping + hydraulic (T-RF19 leaf 4) ------------------------------
+# --- libchudware piping + hydraulic (T-RF19 leaf 4) ------------------------------
 # C++ ports of engine_oracle/piping/ (1-D liquid + gas network solver, fluid
 # properties, B36 schedule catalog, CFD handoff math) and
 # engine_oracle/hydraulic/ (ISO 1219 circuit schema, cylinder/pump/accumulator/
@@ -922,8 +922,8 @@ add_test(NAME dfm COMMAND test_dfm)
 # schedule tables + B16 fitting CSV are vendored (pipe_tables.h, generated
 # from the MIT fluids package; fittings_data.h), so the port always behaves
 # like a fluids-present box. Each family owns its methods behind a single
-# call(method, params, result) dispatch entry for the libaicad glue.
-add_library(aicad_piping STATIC
+# call(method, params, result) dispatch entry for the libchudware glue.
+add_library(chudware_piping STATIC
   piping/catalog.cpp
   piping/cfd.cpp
   piping/fluid_properties.cpp
@@ -931,28 +931,28 @@ add_library(aicad_piping STATIC
   piping/schema.cpp
   piping/simhandoff.cpp
   piping/solve.cpp)
-target_include_directories(aicad_piping PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(aicad_piping PUBLIC nlohmann_json::nlohmann_json)
+target_include_directories(chudware_piping PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(chudware_piping PUBLIC nlohmann_json::nlohmann_json)
 
-add_library(aicad_hydraulic STATIC
+add_library(chudware_hydraulic STATIC
   hydraulic/bom.cpp
   hydraulic/handoff.cpp
   hydraulic/hydraulic.cpp
   hydraulic/schema.cpp
   hydraulic/solve.cpp)
-target_include_directories(aicad_hydraulic PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(aicad_hydraulic PUBLIC aicad_piping nlohmann_json::nlohmann_json)
+target_include_directories(chudware_hydraulic PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(chudware_hydraulic PUBLIC chudware_piping nlohmann_json::nlohmann_json)
 
 add_executable(test_piping tests/test_piping.cpp)
 target_include_directories(test_piping PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_piping PRIVATE aicad_piping)
+target_link_libraries(test_piping PRIVATE chudware_piping)
 set_target_properties(test_piping PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME piping COMMAND test_piping)
 
 add_executable(test_hydraulic tests/test_hydraulic.cpp)
 target_include_directories(test_hydraulic PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_hydraulic PRIVATE aicad_hydraulic)
+target_link_libraries(test_hydraulic PRIVATE chudware_hydraulic)
 set_target_properties(test_hydraulic PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME hydraulic COMMAND test_hydraulic)
@@ -960,12 +960,12 @@ add_test(NAME hydraulic COMMAND test_hydraulic)
 # {"method","params"} per line on stdin -> dispatch result per line; the T-RF19
 # parity harness drives this against the Python oracle (mirrors fw_cli).
 add_executable(rpc_cli piping/rpc_cli.cpp)
-target_link_libraries(rpc_cli PRIVATE aicad_hydraulic aicad_piping)
+target_link_libraries(rpc_cli PRIVATE chudware_hydraulic chudware_piping)
 set_target_properties(rpc_cli PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
 # --- Wave 2: OCCT geometry kernel (opt-in) -----------------------------------
-if(AICAD_WITH_OCCT)
+if(CHUDWARE_WITH_OCCT)
   include(ProvisionOCCT)
 
   # --- Heavy from-source third-party sub-deps (opt-in per platform) -----------
@@ -973,7 +973,7 @@ if(AICAD_WITH_OCCT)
   # matched binary). No Linux/macOS provisioning path exists yet (Fedora has no
   # nglib-capable Netgen, no rhino3dm, and only an older lib3mf), so they DEFAULT
   # OFF off-Windows and the dependent code is compiled out (doc/formats.cpp already
-  # #ifdef-guards AICAD_WITH_LIB3MF / AICAD_WITH_OPENNURBS; the Netgen mesher path
+  # #ifdef-guards CHUDWARE_WITH_LIB3MF / CHUDWARE_WITH_OPENNURBS; the Netgen mesher path
   # is gated below). The OCCT geometry/document kernel itself needs none of them.
   # Flip any ON once a system package or Linux provisioning is wired up.
   if(WIN32)
@@ -981,20 +981,20 @@ if(AICAD_WITH_OCCT)
   else()
     set(_aicad_subdep_default OFF)
   endif()
-  option(AICAD_WITH_NETGEN    "Netgen/nglib FEA tet mesher (sim/mesher.cpp, fea_run)" ${_aicad_subdep_default})
-  option(AICAD_WITH_LIB3MF    "lib3mf 3MF reader/writer (doc/formats.cpp)"            ${_aicad_subdep_default})
-  option(AICAD_WITH_OPENNURBS "openNURBS Rhino .3dm reader/writer (doc/formats.cpp)"  ${_aicad_subdep_default})
+  option(CHUDWARE_WITH_NETGEN    "Netgen/nglib FEA tet mesher (sim/mesher.cpp, fea_run)" ${_aicad_subdep_default})
+  option(CHUDWARE_WITH_LIB3MF    "lib3mf 3MF reader/writer (doc/formats.cpp)"            ${_aicad_subdep_default})
+  option(CHUDWARE_WITH_OPENNURBS "openNURBS Rhino .3dm reader/writer (doc/formats.cpp)"  ${_aicad_subdep_default})
 
   # --- P50: Netgen / nglib tet mesher (LGPL-2.1 — commercial-safe) -----------
   # BUILD Netgen from source against OUR OCCT (no prebuilt SDK exists); see
   # ProvisionNetgen.cmake. nglib.h lives ONLY in mesher.cpp (mesher.h is backend-
-  # free); aicad_mesh links nglib's import lib and nglib.dll + ngcore.dll are staged
-  # next to libaicad.dll. This replaced gmsh (GPL-2+, no linking exception) — the #1
+  # free); chudware_mesh links nglib's import lib and nglib.dll + ngcore.dll are staged
+  # next to libchudware.dll. This replaced gmsh (GPL-2+, no linking exception) — the #1
   # commercialization blocker. MUST come AFTER ProvisionOCCT (shares its OCCT + zlib).
-  if(AICAD_WITH_NETGEN)
+  if(CHUDWARE_WITH_NETGEN)
     include(ProvisionNetgen)
     # ELF runtime-path: nglib lives in the Netgen install lib dir (out of the loader's default
-    # search). Bake that dir into the BUILD_RPATH of every target defined below (libaicad + the
+    # search). Bake that dir into the BUILD_RPATH of every target defined below (libchudware + the
     # FEA-mesh tests) so they resolve libnglib.so; libnglib itself has $ORIGIN rpath so it then
     # finds its sibling libngcore.so. No-op on Windows (DLLs are co-located/staged instead).
     if(NOT WIN32)
@@ -1008,9 +1008,9 @@ if(AICAD_WITH_OCCT)
   # wraps via the `lib3mf` wheel, so the 3MF mesh extraction (vertex coords +
   # triangle indices) is bit-identical. The header-only CppDynamic binding lives
   # ONLY in doc/formats.cpp and dlopens lib3mf.dll at runtime (no import lib on
-  # the link line); aicad_doc compiles with AICAD_WITH_LIB3MF + the binding's
-  # include dir, and lib3mf.dll is staged next to libaicad.dll below.
-  if(AICAD_WITH_LIB3MF)
+  # the link line); chudware_doc compiles with CHUDWARE_WITH_LIB3MF + the binding's
+  # include dir, and lib3mf.dll is staged next to libchudware.dll below.
+  if(CHUDWARE_WITH_LIB3MF)
     include(ProvisionLib3mf)
   endif()
 
@@ -1018,26 +1018,26 @@ if(AICAD_WITH_OCCT)
   # Provision + build opennurbsStatic from the SAME rhino3dm v8.17.0 the Python
   # oracle (engine/doc/formats.py) wraps via the `rhino3dm 8.17.0` wheel, so the
   # .3dm mesh extraction (ON_Mesh m_V float32 + m_F quad/tri) is bit-identical.
-  # opennurbs.h lives ONLY in doc/formats.cpp; aicad_doc compiles with
-  # AICAD_WITH_OPENNURBS + the include dir and links opennurbsStatic below.
-  if(AICAD_WITH_OPENNURBS)
+  # opennurbs.h lives ONLY in doc/formats.cpp; chudware_doc compiles with
+  # CHUDWARE_WITH_OPENNURBS + the include dir and links opennurbsStatic below.
+  if(CHUDWARE_WITH_OPENNURBS)
     include(ProvisionOpenNURBS)
   endif()
 
   # P50b: sim/fea_run.cpp (the combined mesh+resolve+solve glue) joins the mesher
   # target — it is the only sim source that needs the mesher, and adding it here
   # keeps the mesher-backend confinement intact (fea_run.h itself is nglib-free).
-  # aicad_mesh gains a PUBLIC dep on aicad_sim so fea_run.cpp can call the FEA solvers.
-  # Gated on AICAD_WITH_NETGEN: the mesher (mesher.cpp) is the only nglib consumer.
-  if(AICAD_WITH_NETGEN)
-    add_library(aicad_mesh STATIC sim/mesher.cpp sim/hex_mesher.cpp sim/fea_run.cpp sim/fea_fatigue.cpp)
-    target_include_directories(aicad_mesh PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-    target_include_directories(aicad_mesh PRIVATE ${NETGEN_INCLUDE_DIRS})
+  # chudware_mesh gains a PUBLIC dep on chudware_sim so fea_run.cpp can call the FEA solvers.
+  # Gated on CHUDWARE_WITH_NETGEN: the mesher (mesher.cpp) is the only nglib consumer.
+  if(CHUDWARE_WITH_NETGEN)
+    add_library(chudware_mesh STATIC sim/mesher.cpp sim/hex_mesher.cpp sim/fea_run.cpp sim/fea_fatigue.cpp)
+    target_include_directories(chudware_mesh PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+    target_include_directories(chudware_mesh PRIVATE ${NETGEN_INCLUDE_DIRS})
     # nglib's import lib is PUBLIC so it propagates onto the final link line of the
-    # `aicad` DLL that consumes this static lib (a STATIC lib's link deps aren't pulled
+    # `chudware` DLL that consumes this static lib (a STATIC lib's link deps aren't pulled
     # in transitively otherwise). nglib.h decorates its prototypes dllimport on WIN32.
-    target_link_libraries(aicad_mesh PUBLIC ${NETGEN_IMPORT_LIB} aicad_sim nlohmann_json::nlohmann_json)
-    set_property(TARGET aicad_mesh PROPERTY
+    target_link_libraries(chudware_mesh PUBLIC ${NETGEN_IMPORT_LIB} chudware_sim nlohmann_json::nlohmann_json)
+    set_property(TARGET chudware_mesh PROPERTY
       MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
   endif()
   # Smoke test: box -> volume (BRepGProp) -> tessellation (BRepMesh). Proves the
@@ -1063,9 +1063,9 @@ if(AICAD_WITH_OCCT)
   # --- Wave 2 geom kernel: OCCT tessellation -> AICM emitter -----------------
   # tessellate.cpp + features.cpp + profile.cpp (OCCT) on top of the OCCT-free
   # aicm.cpp writer. profile.cpp compiles solved sketches (nlohmann::json) into
-  # planar faces (lifted via aicad_geom's SketchPlane), so this lib now also links
-  # aicad_geom (SketchPlane/Eigen) and nlohmann_json.
-  add_library(aicad_geom_occt STATIC
+  # planar faces (lifted via chudware_geom's SketchPlane), so this lib now also links
+  # chudware_geom (SketchPlane/Eigen) and nlohmann_json.
+  add_library(chudware_geom_occt STATIC
     geom/tessellate.cpp
     geom/features.cpp
     geom/profile.cpp
@@ -1084,19 +1084,19 @@ if(AICAD_WITH_OCCT)
     doc/drawing.cpp
     sim/overlay.cpp
     geom/aicm.cpp)
-  target_include_directories(aicad_geom_occt PUBLIC
+  target_include_directories(chudware_geom_occt PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR})
   # Modelling toolkits for box/prism (TKPrim), revolve (TKPrim), polygon->face->wire
   # (TKBRep/TKTopAlgo), adaptors + GC_MakeArcOfCircle (TKGeomBase/TKGeomAlgo), mesh
   # (TKMesh), healing (TKShHealing). booleans.cpp adds Fuse/Cut/Common (TKBO) and
-  # dress.cpp adds MakeFillet/MakeChamfer (TKFillet). aicad_geom brings SketchPlane +
+  # dress.cpp adds MakeFillet/MakeChamfer (TKFillet). chudware_geom brings SketchPlane +
   # Eigen3::Eigen; nlohmann_json for the solved-entity dicts profile.cpp consumes.
-  target_link_libraries(aicad_geom_occt PUBLIC
-    aicad_geom
-    aicad_prof   # per-phase sim timers (sim/overlay.cpp overlay_* studies)
-    aicad_util   # aicm_handoff publish for sim/overlay AICM (T-PERF10)
-    aicad_ecad   # ecad/schema.h pad_world + ecad/ops.h OpError for geom/ecad_3d.cpp
+  target_link_libraries(chudware_geom_occt PUBLIC
+    chudware_geom
+    chudware_prof   # per-phase sim timers (sim/overlay.cpp overlay_* studies)
+    chudware_util   # aicm_handoff publish for sim/overlay AICM (T-PERF10)
+    chudware_ecad   # ecad/schema.h pad_world + ecad/ops.h OpError for geom/ecad_3d.cpp
     nlohmann_json::nlohmann_json
     TKernel TKMath TKG2d TKG3d TKGeomBase TKGeomAlgo
     TKBRep TKTopAlgo TKPrim TKMesh TKShHealing TKBO TKFillet
@@ -1108,7 +1108,7 @@ if(AICAD_WITH_OCCT)
     TKOffset
     # TKV3d: StdPrs_BRepFont + StdPrs_BRepTextBuilder (FreeType glyph -> B-rep faces) for
     # the `text` emboss/engrave feature (geom/text.cpp). Pulls the FreeType-backed Font
-    # package; its DLL is already staged by aicad_occt_copy_dlls.
+    # package; its DLL is already staged by chudware_occt_copy_dlls.
     TKV3d
     # Data-exchange (doc/formats.cpp): the NON-CAF control classes — STEPControl_*
     # (TKDESTEP), IGESControl_* (TKDEIGES), StlAPI_Writer + RWStl (TKDESTL) over the XS
@@ -1121,31 +1121,31 @@ if(AICAD_WITH_OCCT)
     # TKCDF + the Bin persistence drivers TKBin/TKBinL/TKBinXCAF that XCAFApp_Application
     # ::NewDocument("BinXCAF") needs). OBJ/STL import use the non-CAF Poly_Triangulation
     # API (RWObj::ReadFile / RWStl::ReadFile); OBJ/PLY export use hand writers. All these
-    # toolkit DLLs are already staged by aicad_occt_copy_dlls (copy_directory of the
+    # toolkit DLLs are already staged by chudware_occt_copy_dlls (copy_directory of the
     # whole OCCT bin dir).
     TKRWMesh TKDEOBJ TKDEGLTF TKXCAF TKLCAF TKCDF TKBin TKBinL TKBinXCAF)
 
-  # --- Netgen-mesher-dependent wiring + tests (gated on AICAD_WITH_NETGEN) ----
-  if(AICAD_WITH_NETGEN)
-  # sim/fea_fatigue.cpp (in aicad_mesh, defined above) calls fatigue_overlay from
-  # sim/overlay.cpp (in aicad_geom_occt). Wire that dep here — AFTER aicad_geom_occt
+  # --- Netgen-mesher-dependent wiring + tests (gated on CHUDWARE_WITH_NETGEN) ----
+  if(CHUDWARE_WITH_NETGEN)
+  # sim/fea_fatigue.cpp (in chudware_mesh, defined above) calls fatigue_overlay from
+  # sim/overlay.cpp (in chudware_geom_occt). Wire that dep here — AFTER chudware_geom_occt
   # exists — so the fatigue solver can package its display overlay. PRIVATE: only
-  # fea_fatigue.cpp's TU needs it; consumers of aicad_mesh link aicad_geom_occt on
-  # their own (the final aicad DLL already does).
-  target_link_libraries(aicad_mesh PRIVATE aicad_geom_occt)
+  # fea_fatigue.cpp's TU needs it; consumers of chudware_mesh link chudware_geom_occt on
+  # their own (the final chudware DLL already does).
+  target_link_libraries(chudware_mesh PRIVATE chudware_geom_occt)
 
   # Fatigue solver smoke test: inline 6-tet cube under tension -> fea_run_fatigue.
   # No STEP path -> no overlay, so it needs no OCCT DLL PATH munging, but it still
-  # links the OCCT-gated targets (this whole block is AICAD_WITH_OCCT-only).
+  # links the OCCT-gated targets (this whole block is CHUDWARE_WITH_OCCT-only).
   add_executable(test_fatigue tests/test_fatigue.cpp)
   target_include_directories(test_fatigue PRIVATE ${doctest_SOURCE_DIR})
-  target_link_libraries(test_fatigue PRIVATE aicad_mesh aicad_geom_occt)
+  target_link_libraries(test_fatigue PRIVATE chudware_mesh chudware_geom_occt)
   set_target_properties(test_fatigue PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME fatigue COMMAND test_fatigue)
   # Netgen + OCCT DLLs must be on PATH for the static solve (fea_run_static meshes only
-  # when a STEP path is present — the inline-mesh test does not — but aicad_mesh pulls
-  # the nglib import lib, and aicad_geom_occt pulls OCCT, so stage both dirs to be safe).
+  # when a STEP path is present — the inline-mesh test does not — but chudware_mesh pulls
+  # the nglib import lib, and chudware_geom_occt pulls OCCT, so stage both dirs to be safe).
   set(_fatigue_envmod "PATH=path_list_prepend:${OCCT_DLL_DIR}")
   foreach(_b ${OCCT_3RDPARTY_BINS})
     list(APPEND _fatigue_envmod "PATH=path_list_prepend:${_b}")
@@ -1162,7 +1162,7 @@ if(AICAD_WITH_OCCT)
   add_executable(test_netgen_mesh tests/test_netgen_mesh.cpp)
   target_include_directories(test_netgen_mesh PRIVATE
     ${doctest_SOURCE_DIR} ${OpenCASCADE_INCLUDE_DIR})
-  target_link_libraries(test_netgen_mesh PRIVATE aicad_mesh aicad_geom_occt)
+  target_link_libraries(test_netgen_mesh PRIVATE chudware_mesh chudware_geom_occt)
   set_target_properties(test_netgen_mesh PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME netgen_mesh COMMAND test_netgen_mesh)
@@ -1170,10 +1170,10 @@ if(AICAD_WITH_OCCT)
 
   # fea_profile: standalone profiling harness for the static-stress solve (NOT a ctest — a
   # manual perf tool). Meshes a beam -> fea_run_static under the in-process sampling profiler
-  # + AI_CAD_FEA_PROFILE phase timers, sweeping fineness. Same OCCT/Netgen DLL deps as above.
+  # + CHUDWARE_FEA_PROFILE phase timers, sweeping fineness. Same OCCT/Netgen DLL deps as above.
   add_executable(fea_profile tools/fea_profile.cpp)
   target_include_directories(fea_profile PRIVATE ${OpenCASCADE_INCLUDE_DIR})
-  target_link_libraries(fea_profile PRIVATE aicad_mesh aicad_geom_occt aicad_prof)
+  target_link_libraries(fea_profile PRIVATE chudware_mesh chudware_geom_occt chudware_prof)
   set_target_properties(fea_profile PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
@@ -1182,7 +1182,7 @@ if(AICAD_WITH_OCCT)
   add_executable(test_mesher_autopick tests/test_mesher_autopick.cpp)
   target_include_directories(test_mesher_autopick PRIVATE
     ${doctest_SOURCE_DIR} ${OpenCASCADE_INCLUDE_DIR})
-  target_link_libraries(test_mesher_autopick PRIVATE aicad_mesh aicad_geom_occt)
+  target_link_libraries(test_mesher_autopick PRIVATE chudware_mesh chudware_geom_occt)
   set_target_properties(test_mesher_autopick PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME mesher_autopick COMMAND test_mesher_autopick)
@@ -1193,7 +1193,7 @@ if(AICAD_WITH_OCCT)
   add_executable(test_mesh_quality tests/test_mesh_quality.cpp)
   target_include_directories(test_mesh_quality PRIVATE
     ${doctest_SOURCE_DIR} ${OpenCASCADE_INCLUDE_DIR})
-  target_link_libraries(test_mesh_quality PRIVATE aicad_mesh aicad_geom_occt)
+  target_link_libraries(test_mesh_quality PRIVATE chudware_mesh chudware_geom_occt)
   set_target_properties(test_mesh_quality PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME mesh_quality COMMAND test_mesh_quality)
@@ -1207,31 +1207,31 @@ if(AICAD_WITH_OCCT)
   add_executable(test_mesher_advanced tests/test_mesher_advanced.cpp)
   target_include_directories(test_mesher_advanced PRIVATE
     ${doctest_SOURCE_DIR} ${OpenCASCADE_INCLUDE_DIR})
-  target_link_libraries(test_mesher_advanced PRIVATE aicad_mesh aicad_geom_occt)
+  target_link_libraries(test_mesher_advanced PRIVATE chudware_mesh chudware_geom_occt)
   set_target_properties(test_mesher_advanced PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME mesher_advanced COMMAND test_mesher_advanced)
   set_tests_properties(mesher_advanced PROPERTIES ENVIRONMENT_MODIFICATION "${_fatigue_envmod}")
 
   # Durable sim solve-state cache: FEA static HIT/MISS + .step+ studies/*.npz round-trip
-  # + SPICE/CFD result cache invalidation. Needs the real mesh path (aicad_mesh) + stepplus
-  # (aicad_doc) so it links the OCCT+Netgen targets like test_fatigue (same _fatigue_envmod).
+  # + SPICE/CFD result cache invalidation. Needs the real mesh path (chudware_mesh) + stepplus
+  # (chudware_doc) so it links the OCCT+Netgen targets like test_fatigue (same _fatigue_envmod).
   add_executable(test_sim_cache tests/test_sim_cache.cpp)
   target_include_directories(test_sim_cache PRIVATE ${doctest_SOURCE_DIR} ${OpenCASCADE_INCLUDE_DIR})
-  target_link_libraries(test_sim_cache PRIVATE aicad_mesh aicad_doc aicad_geom_occt aicad_sim aicad_sketch aicad_geom aicad_util)
+  target_link_libraries(test_sim_cache PRIVATE chudware_mesh chudware_doc chudware_geom_occt chudware_sim chudware_sketch chudware_geom chudware_util)
   set_target_properties(test_sim_cache PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME sim_cache COMMAND test_sim_cache)
   set_tests_properties(sim_cache PROPERTIES ENVIRONMENT_MODIFICATION "${_fatigue_envmod}")
-  endif()  # AICAD_WITH_NETGEN
+  endif()  # CHUDWARE_WITH_NETGEN
 
   # FEA boundary-surface extractor: fea_surface_body (the result-plot display surface,
   # so a bent beam renders curved). No STEP/mesher — builds structured tet meshes in
-  # code — but fea_surface_body lives in aicad_geom_occt, so it links + needs OCCT DLLs.
+  # code — but fea_surface_body lives in chudware_geom_occt, so it links + needs OCCT DLLs.
   add_executable(test_overlay_surface tests/test_overlay_surface.cpp)
   target_include_directories(test_overlay_surface PRIVATE
     ${doctest_SOURCE_DIR} ${OpenCASCADE_INCLUDE_DIR})
-  target_link_libraries(test_overlay_surface PRIVATE aicad_geom_occt)
+  target_link_libraries(test_overlay_surface PRIVATE chudware_geom_occt)
   set_target_properties(test_overlay_surface PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME overlay_surface COMMAND test_overlay_surface)
@@ -1239,13 +1239,13 @@ if(AICAD_WITH_OCCT)
     ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
   # T-SIM2: regenerator for the committed result-contour AICM fixture used by the
-  # AI_CAD_SHOT=fea_overlay headless scenario. Builds a structured cantilever tet mesh in code
+  # CHUDWARE_SHOT=fea_overlay headless scenario. Builds a structured cantilever tet mesh in code
   # (Netgen-free — the mesher is the only unavailable piece in CI), runs the real fea_static_solve,
-  # and skins + field-maps it via static_overlay (in aicad_geom_occt). Not a ctest (it writes a
+  # and skins + field-maps it via static_overlay (in chudware_geom_occt). Not a ctest (it writes a
   # file); run by hand to refresh contracts/fixtures/sim2_cantilever_result.aicm.
   add_executable(gen_sim2_result_fixture tests/gen_sim2_result_fixture.cpp)
   target_include_directories(gen_sim2_result_fixture PRIVATE ${OpenCASCADE_INCLUDE_DIR})
-  target_link_libraries(gen_sim2_result_fixture PRIVATE aicad_geom_occt aicad_sim)
+  target_link_libraries(gen_sim2_result_fixture PRIVATE chudware_geom_occt chudware_sim)
   set_target_properties(gen_sim2_result_fixture PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
@@ -1255,7 +1255,7 @@ if(AICAD_WITH_OCCT)
   add_executable(test_surf_replace_face_heal tests/test_surf_replace_face_heal.cpp)
   target_include_directories(test_surf_replace_face_heal PRIVATE
     ${doctest_SOURCE_DIR} ${OpenCASCADE_INCLUDE_DIR})
-  target_link_libraries(test_surf_replace_face_heal PRIVATE aicad_geom_occt)
+  target_link_libraries(test_surf_replace_face_heal PRIVATE chudware_geom_occt)
   set_target_properties(test_surf_replace_face_heal PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME surf_replace_face_heal COMMAND test_surf_replace_face_heal)
@@ -1271,7 +1271,7 @@ if(AICAD_WITH_OCCT)
     ${doctest_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render)
-  target_link_libraries(test_geom_aicm PRIVATE aicad_geom_occt aicad_util)
+  target_link_libraries(test_geom_aicm PRIVATE chudware_geom_occt chudware_util)
   # Compile the host loader straight into the test target (the contract oracle).
   target_sources(test_geom_aicm PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
@@ -1282,10 +1282,10 @@ if(AICAD_WITH_OCCT)
   set_tests_properties(geom_aicm PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
   # --- Wave 2 milestone: solved sketch -> profile -> extrude/revolve ---------
-  # End-to-end: aicad::sketch::solve_sketch -> faces_from_solved_sketch ->
+  # End-to-end: chudware::sketch::solve_sketch -> faces_from_solved_sketch ->
   # extrude_face/revolve_face -> tessellate -> write_aicm -> HOST render::parseAicm.
-  # Links aicad_sketch for solve_sketch (aicad_geom_occt already brings the geom
-  # kernel + aicad_geom + nlohmann_json transitively).
+  # Links chudware_sketch for solve_sketch (chudware_geom_occt already brings the geom
+  # kernel + chudware_geom + nlohmann_json transitively).
   add_executable(test_profile_extrude
     tests/test_profile_extrude.cpp)
   target_include_directories(test_profile_extrude PRIVATE
@@ -1293,7 +1293,7 @@ if(AICAD_WITH_OCCT)
     ${OpenCASCADE_INCLUDE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render)
   target_link_libraries(test_profile_extrude PRIVATE
-    aicad_geom_occt aicad_sketch aicad_geom aicad_util)
+    chudware_geom_occt chudware_sketch chudware_geom chudware_util)
   # Compile the host loader straight into the test target (the contract oracle).
   target_sources(test_profile_extrude PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
@@ -1306,7 +1306,7 @@ if(AICAD_WITH_OCCT)
   # --- Wave 2 milestone: boolean + dress-up ops compose into real parts ------
   # End-to-end: make_box/extrude_face base -> fuse/cut/common (booleans.h) +
   # fillet/chamfer (dress.h) -> tessellate -> write_aicm -> HOST render::parseAicm.
-  # Same wiring as test_profile_extrude (aicad_geom_occt now carries TKBO/TKFillet).
+  # Same wiring as test_profile_extrude (chudware_geom_occt now carries TKBO/TKFillet).
   add_executable(test_ops
     tests/test_ops.cpp)
   target_include_directories(test_ops PRIVATE
@@ -1314,7 +1314,7 @@ if(AICAD_WITH_OCCT)
     ${OpenCASCADE_INCLUDE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render)
   target_link_libraries(test_ops PRIVATE
-    aicad_geom_occt aicad_sketch aicad_geom aicad_util)
+    chudware_geom_occt chudware_sketch chudware_geom chudware_util)
   # Compile the host loader straight into the test target (the contract oracle).
   target_sources(test_ops PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
@@ -1333,7 +1333,7 @@ if(AICAD_WITH_OCCT)
     ${doctest_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR})
   target_link_libraries(test_sweep PRIVATE
-    aicad_geom_occt aicad_geom)
+    chudware_geom_occt chudware_geom)
   set_target_properties(test_sweep PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME sweep COMMAND test_sweep)
@@ -1347,7 +1347,7 @@ if(AICAD_WITH_OCCT)
     ${doctest_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR})
   target_link_libraries(test_profile_arc PRIVATE
-    aicad_geom_occt aicad_geom)
+    chudware_geom_occt chudware_geom)
   set_target_properties(test_profile_arc PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME profile_arc COMMAND test_profile_arc)
@@ -1361,7 +1361,7 @@ if(AICAD_WITH_OCCT)
     ${OpenCASCADE_INCLUDE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render)
   target_link_libraries(test_import_roundtrip PRIVATE
-    aicad_doc aicad_geom_occt aicad_sketch aicad_geom aicad_util)
+    chudware_doc chudware_geom_occt chudware_sketch chudware_geom chudware_util)
   target_sources(test_import_roundtrip PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
   set_target_properties(test_import_roundtrip PROPERTIES
@@ -1378,7 +1378,7 @@ if(AICAD_WITH_OCCT)
     ${doctest_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR})
   target_link_libraries(test_export_assembly PRIVATE
-    aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
+    chudware_doc chudware_geom_occt chudware_sketch chudware_geom)
   set_target_properties(test_export_assembly PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME export_assembly COMMAND test_export_assembly)
@@ -1393,7 +1393,7 @@ if(AICAD_WITH_OCCT)
     ${doctest_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR})
   target_link_libraries(test_insert_component PRIVATE
-    aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
+    chudware_doc chudware_geom_occt chudware_sketch chudware_geom)
   set_target_properties(test_insert_component PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME insert_component COMMAND test_insert_component)
@@ -1401,14 +1401,14 @@ if(AICAD_WITH_OCCT)
 
   # --- simulate_motion: assembly kinematic sweep smoke test -------------------
   # Exercises doc_simulate_motion end-to-end: assembly + angle mate + sweep 0->90 deg.
-  # Linked like test_export_assembly (needs STEP writer via aicad_geom_occt).
+  # Linked like test_export_assembly (needs STEP writer via chudware_geom_occt).
   add_executable(test_simulate_motion
     tests/test_simulate_motion.cpp)
   target_include_directories(test_simulate_motion PRIVATE
     ${doctest_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR})
   target_link_libraries(test_simulate_motion PRIVATE
-    aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
+    chudware_doc chudware_geom_occt chudware_sketch chudware_geom)
   set_target_properties(test_simulate_motion PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME simulate_motion COMMAND test_simulate_motion)
@@ -1418,9 +1418,9 @@ if(AICAD_WITH_OCCT)
   # core/doc/document.cpp orchestrates solve_sketch -> faces_from_solved_sketch ->
   # extrude/revolve -> fuse/cut/common -> fillet/chamfer into a part, keyed by
   # feature id, and RE-RUNS on a parameter edit (the parametric payoff). It links
-  # aicad_geom_occt (the OCCT kernel + aicad_geom + nlohmann_json, transitively),
-  # aicad_sketch (solve_sketch), and aicad_util (the expr evaluator for expr dims).
-  add_library(aicad_doc STATIC
+  # chudware_geom_occt (the OCCT kernel + chudware_geom + nlohmann_json, transitively),
+  # chudware_sketch (solve_sketch), and chudware_util (the expr evaluator for expr dims).
+  add_library(chudware_doc STATIC
     doc/document.cpp
     doc/selectors.cpp
     doc/picks.cpp
@@ -1439,48 +1439,48 @@ if(AICAD_WITH_OCCT)
     doc/export2d.cpp
     doc/drawing_session.cpp
     cam/extract.cpp)
-  target_include_directories(aicad_doc PUBLIC
+  target_include_directories(chudware_doc PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR})
   # 3MF (doc/formats.cpp): the lib3mf CppDynamic binding header + the enabling
   # define, PRIVATE so the binding stays confined to formats.cpp's TU and does
-  # not leak onto aicad_doc's public include interface. (gated: AICAD_WITH_LIB3MF —
+  # not leak onto chudware_doc's public include interface. (gated: CHUDWARE_WITH_LIB3MF —
   # formats.cpp compiles out its 3MF path when the define is absent.)
-  if(AICAD_WITH_LIB3MF)
-    target_include_directories(aicad_doc PRIVATE ${LIB3MF_INCLUDE_DIR})
-    target_compile_definitions(aicad_doc PRIVATE AICAD_WITH_LIB3MF)
+  if(CHUDWARE_WITH_LIB3MF)
+    target_include_directories(chudware_doc PRIVATE ${LIB3MF_INCLUDE_DIR})
+    target_compile_definitions(chudware_doc PRIVATE CHUDWARE_WITH_LIB3MF)
   endif()
   # openNURBS (.3dm): the opennurbs include dir + the enabling define, PRIVATE so
   # opennurbs.h stays confined to formats.cpp's TU; opennurbsStatic is linked
-  # PUBLIC so it propagates onto the final libaicad DLL link line. UNICODE/_UNICODE
+  # PUBLIC so it propagates onto the final libchudware DLL link line. UNICODE/_UNICODE
   # are required by opennurbs.h (its ON_wString APIs assume the wide CRT) — set
-  # PRIVATE on aicad_doc so only this lib's TUs see them. (gated: AICAD_WITH_OPENNURBS —
+  # PRIVATE on chudware_doc so only this lib's TUs see them. (gated: CHUDWARE_WITH_OPENNURBS —
   # formats.cpp compiles out its .3dm path when the define is absent.)
-  if(AICAD_WITH_OPENNURBS)
-    target_include_directories(aicad_doc PRIVATE ${OPENNURBS_INCLUDE_DIR})
-    target_compile_definitions(aicad_doc PRIVATE AICAD_WITH_OPENNURBS UNICODE _UNICODE)
+  if(CHUDWARE_WITH_OPENNURBS)
+    target_include_directories(chudware_doc PRIVATE ${OPENNURBS_INCLUDE_DIR})
+    target_compile_definitions(chudware_doc PRIVATE CHUDWARE_WITH_OPENNURBS UNICODE _UNICODE)
   endif()
-  target_link_libraries(aicad_doc PUBLIC
-    aicad_geom_occt aicad_sketch aicad_geom aicad_util aicad_sim
-    aicad_mate
-    aicad_miniz
-    aicad_parts
+  target_link_libraries(chudware_doc PUBLIC
+    chudware_geom_occt chudware_sketch chudware_geom chudware_util chudware_sim
+    chudware_mate
+    chudware_miniz
+    chudware_parts
     nlohmann_json::nlohmann_json)
-  if(AICAD_WITH_OPENNURBS)
+  if(CHUDWARE_WITH_OPENNURBS)
     if(WIN32)
-      target_link_libraries(aicad_doc PUBLIC opennurbsStatic)
+      target_link_libraries(chudware_doc PUBLIC opennurbsStatic)
     else()
       # opennurbsStatic (MY_ZCALLOC -> it provides zcalloc/zcfree) and its bundled `zlib`
       # archive (which CALLS zcfree but, built with MY_ZCALLOC, doesn't define it) form a
       # circular static-lib dependency. MSVC's linker rescans automatically; GNU ld needs
       # both archives inside one --start-group/--end-group, which $<LINK_GROUP:RESCAN> emits.
-      target_link_libraries(aicad_doc PUBLIC "$<LINK_GROUP:RESCAN,opennurbsStatic,zlib>")
+      target_link_libraries(chudware_doc PUBLIC "$<LINK_GROUP:RESCAN,opennurbsStatic,zlib>")
     endif()
   endif()
 
   # Verification: compile a document -> write_aicm -> HOST render::parseAicm, with
   # the parametric-rebuild case (same doc, two envs -> two solids). Same wiring as
-  # test_ops; aicad_doc carries the OCCT toolkits transitively via aicad_geom_occt.
+  # test_ops; chudware_doc carries the OCCT toolkits transitively via chudware_geom_occt.
   add_executable(test_document
     tests/test_document.cpp)
   target_include_directories(test_document PRIVATE
@@ -1488,7 +1488,7 @@ if(AICAD_WITH_OCCT)
     ${OpenCASCADE_INCLUDE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render)
   target_link_libraries(test_document PRIVATE
-    aicad_doc aicad_geom_occt aicad_sketch aicad_geom aicad_util)
+    chudware_doc chudware_geom_occt chudware_sketch chudware_geom chudware_util)
   # Compile the host loader straight into the test target (the contract oracle).
   target_sources(test_document PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
@@ -1507,7 +1507,7 @@ if(AICAD_WITH_OCCT)
     ${doctest_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR})
   target_link_libraries(test_op_registry PRIVATE
-    aicad_doc aicad_ecad aicad_geom_occt aicad_sketch aicad_geom aicad_util)
+    chudware_doc chudware_ecad chudware_geom_occt chudware_sketch chudware_geom chudware_util)
   set_target_properties(test_op_registry PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME op_registry COMMAND test_op_registry)
@@ -1521,7 +1521,7 @@ if(AICAD_WITH_OCCT)
     ${doctest_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR})
   target_link_libraries(test_formats_registry PRIVATE
-    aicad_doc aicad_geom_occt aicad_sketch aicad_geom aicad_util)
+    chudware_doc chudware_geom_occt chudware_sketch chudware_geom chudware_util)
   set_target_properties(test_formats_registry PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME formats_registry COMMAND test_formats_registry)
@@ -1535,7 +1535,7 @@ if(AICAD_WITH_OCCT)
     ${doctest_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR})
   target_link_libraries(test_sketch3d_doc PRIVATE
-    aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
+    chudware_doc chudware_geom_occt chudware_sketch chudware_geom)
   set_target_properties(test_sketch3d_doc PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME sketch3d_doc COMMAND test_sketch3d_doc)
@@ -1553,7 +1553,7 @@ if(AICAD_WITH_OCCT)
     ${doctest_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR})
   target_link_libraries(test_sketch_on_face PRIVATE
-    aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
+    chudware_doc chudware_geom_occt chudware_sketch chudware_geom)
   set_target_properties(test_sketch_on_face PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME sketch_on_face COMMAND test_sketch_on_face)
@@ -1569,7 +1569,7 @@ if(AICAD_WITH_OCCT)
     ${doctest_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR})
   target_link_libraries(test_sketch_drag_rpc PRIVATE
-    aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
+    chudware_doc chudware_geom_occt chudware_sketch chudware_geom)
   set_target_properties(test_sketch_drag_rpc PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME sketch_drag_rpc COMMAND test_sketch_drag_rpc)
@@ -1585,7 +1585,7 @@ if(AICAD_WITH_OCCT)
     ${doctest_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR})
   target_link_libraries(test_sketch_autoconstrain PRIVATE
-    aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
+    chudware_doc chudware_geom_occt chudware_sketch chudware_geom)
   set_target_properties(test_sketch_autoconstrain PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME sketch_autoconstrain COMMAND test_sketch_autoconstrain)
@@ -1601,7 +1601,7 @@ if(AICAD_WITH_OCCT)
     ${doctest_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR})
   target_link_libraries(test_sketch_convert PRIVATE
-    aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
+    chudware_doc chudware_geom_occt chudware_sketch chudware_geom)
   set_target_properties(test_sketch_convert PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME sketch_convert COMMAND test_sketch_convert)
@@ -1617,7 +1617,7 @@ if(AICAD_WITH_OCCT)
     ${doctest_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR})
   target_link_libraries(test_sketch_trim PRIVATE
-    aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
+    chudware_doc chudware_geom_occt chudware_sketch chudware_geom)
   set_target_properties(test_sketch_trim PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME sketch_trim COMMAND test_sketch_trim)
@@ -1626,15 +1626,15 @@ if(AICAD_WITH_OCCT)
   # --- Simulation-study persistence + mutate RPCs (doc_sim_study_*) -----------
   # Exercises the full study lifecycle (add/edit/list/save+open/delete) on a blank
   # part. doc_new/doc_open compile the empty document through OCCT, so this is gated
-  # under AICAD_WITH_OCCT and links aicad_doc (which carries the OCCT toolkits via
-  # aicad_geom_occt). No AICM loader needed — it asserts on the studies JSON directly.
+  # under CHUDWARE_WITH_OCCT and links chudware_doc (which carries the OCCT toolkits via
+  # chudware_geom_occt). No AICM loader needed — it asserts on the studies JSON directly.
   add_executable(test_studies
     tests/test_studies.cpp)
   target_include_directories(test_studies PRIVATE
     ${doctest_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR})
   target_link_libraries(test_studies PRIVATE
-    aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
+    chudware_doc chudware_geom_occt chudware_sketch chudware_geom)
   set_target_properties(test_studies PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME studies COMMAND test_studies)
@@ -1644,14 +1644,14 @@ if(AICAD_WITH_OCCT)
   # --- On-request labelled views (task 03: doc_render_view / contact sheet) -----
   # Builds an asymmetric box session doc and renders named / parametric-angle / explicit-dir views
   # plus a multi-view contact sheet, asserting distinct cameras yield distinct PNGs and equivalent
-  # specs are byte-identical. Links aicad_doc (OCCT toolkits via aicad_geom_occt).
+  # specs are byte-identical. Links chudware_doc (OCCT toolkits via chudware_geom_occt).
   add_executable(test_render_view
     tests/test_render_view.cpp)
   target_include_directories(test_render_view PRIVATE
     ${doctest_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR})
   target_link_libraries(test_render_view PRIVATE
-    aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
+    chudware_doc chudware_geom_occt chudware_sketch chudware_geom)
   set_target_properties(test_render_view PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME render_view COMMAND test_render_view)
@@ -1667,7 +1667,7 @@ if(AICAD_WITH_OCCT)
     ${doctest_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR})
   target_link_libraries(test_appearance PRIVATE
-    aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
+    chudware_doc chudware_geom_occt chudware_sketch chudware_geom)
   set_target_properties(test_appearance PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME appearance COMMAND test_appearance)
@@ -1677,14 +1677,14 @@ if(AICAD_WITH_OCCT)
   # --- Regular-polygon convenience entity (named ngons + generic sides:N) -------
   # Drives sketch_add_entity with named polygons (triangle..dodecagon) and {type:"polygon",sides:N}
   # through doc_apply_ops, asserting each expands to the right count of closed line segments. Links
-  # aicad_doc (OCCT toolkits via aicad_geom_occt) since doc_new/doc_apply_ops compile the document.
+  # chudware_doc (OCCT toolkits via chudware_geom_occt) since doc_new/doc_apply_ops compile the document.
   add_executable(test_polygon
     tests/test_polygon.cpp)
   target_include_directories(test_polygon PRIVATE
     ${doctest_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR})
   target_link_libraries(test_polygon PRIVATE
-    aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
+    chudware_doc chudware_geom_occt chudware_sketch chudware_geom)
   set_target_properties(test_polygon PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME polygon COMMAND test_polygon)
@@ -1701,7 +1701,7 @@ if(AICAD_WITH_OCCT)
     ${doctest_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR})
   target_link_libraries(test_rectangle PRIVATE
-    aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
+    chudware_doc chudware_geom_occt chudware_sketch chudware_geom)
   set_target_properties(test_rectangle PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME rectangle COMMAND test_rectangle)
@@ -1710,15 +1710,15 @@ if(AICAD_WITH_OCCT)
   # --- GD&T + custom-section drawing coverage (annot_draw + section modes) ------
   # Builds a real holed block, makes a drawing, adds every GD&T element + a half
   # section, and asserts the shared annotation compiler emits primitives, the section
-  # produces faces + hatch, and the DXF export pools the GD&T strokes. aicad_doc carries
-  # the OCCT toolkits via aicad_geom_occt.
+  # produces faces + hatch, and the DXF export pools the GD&T strokes. chudware_doc carries
+  # the OCCT toolkits via chudware_geom_occt.
   add_executable(test_drawing_gdt
     tests/test_drawing_gdt.cpp)
   target_include_directories(test_drawing_gdt PRIVATE
     ${doctest_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR})
   target_link_libraries(test_drawing_gdt PRIVATE
-    aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
+    chudware_doc chudware_geom_occt chudware_sketch chudware_geom)
   set_target_properties(test_drawing_gdt PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME drawing_gdt COMMAND test_drawing_gdt)
@@ -1731,7 +1731,7 @@ if(AICAD_WITH_OCCT)
   # in the simplified id-ref model). The test round-trips a linear + a circular pattern
   # document through the host AICM loader (the contract oracle) and asserts analytic,
   # OCCT-version-independent invariants (face counts, bbox, mesh volume). Same wiring as
-  # test_document; aicad_doc carries the OCCT toolkits transitively via aicad_geom_occt.
+  # test_document; chudware_doc carries the OCCT toolkits transitively via chudware_geom_occt.
   add_executable(test_pattern
     tests/test_pattern.cpp)
   target_include_directories(test_pattern PRIVATE
@@ -1739,7 +1739,7 @@ if(AICAD_WITH_OCCT)
     ${OpenCASCADE_INCLUDE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render)
   target_link_libraries(test_pattern PRIVATE
-    aicad_doc aicad_geom_occt aicad_sketch aicad_geom aicad_util)
+    chudware_doc chudware_geom_occt chudware_sketch chudware_geom chudware_util)
   # Compile the host loader straight into the test target (the contract oracle).
   target_sources(test_pattern PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
@@ -1757,7 +1757,7 @@ if(AICAD_WITH_OCCT)
   # round-trips an explicit-plane merge, a face-selector merge, and a no-merge
   # document through the host AICM loader (the contract oracle) and asserts analytic,
   # OCCT-version-independent invariants (face counts, bbox, mesh volume). Same wiring
-  # as test_pattern; aicad_doc carries the OCCT toolkits transitively via aicad_geom_occt.
+  # as test_pattern; chudware_doc carries the OCCT toolkits transitively via chudware_geom_occt.
   add_executable(test_mirror
     tests/test_mirror.cpp)
   target_include_directories(test_mirror PRIVATE
@@ -1765,7 +1765,7 @@ if(AICAD_WITH_OCCT)
     ${OpenCASCADE_INCLUDE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render)
   target_link_libraries(test_mirror PRIVATE
-    aicad_doc aicad_geom_occt aicad_sketch aicad_geom aicad_util)
+    chudware_doc chudware_geom_occt chudware_sketch chudware_geom chudware_util)
   # Compile the host loader straight into the test target (the contract oracle).
   target_sources(test_mirror PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
@@ -1787,7 +1787,7 @@ if(AICAD_WITH_OCCT)
   target_include_directories(test_interference PRIVATE
     ${doctest_SOURCE_DIR})
   target_link_libraries(test_interference PRIVATE
-    aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
+    chudware_doc chudware_geom_occt chudware_sketch chudware_geom)
   set_target_properties(test_interference PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME interference COMMAND test_interference)
@@ -1804,7 +1804,7 @@ if(AICAD_WITH_OCCT)
   # through, cbore-through, csink-through, multi-position) through the host AICM loader
   # (the contract oracle) and asserts analytic, OCCT-version-independent invariants
   # (face counts incl. the bore cylinder / csink cone, bbox, mesh volume). Same wiring
-  # as test_mirror; aicad_doc carries the OCCT toolkits transitively via aicad_geom_occt.
+  # as test_mirror; chudware_doc carries the OCCT toolkits transitively via chudware_geom_occt.
   add_executable(test_hole
     tests/test_hole.cpp)
   target_include_directories(test_hole PRIVATE
@@ -1812,7 +1812,7 @@ if(AICAD_WITH_OCCT)
     ${OpenCASCADE_INCLUDE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render)
   target_link_libraries(test_hole PRIVATE
-    aicad_doc aicad_geom_occt aicad_sketch aicad_geom aicad_util)
+    chudware_doc chudware_geom_occt chudware_sketch chudware_geom chudware_util)
   # Compile the host loader straight into the test target (the contract oracle).
   target_sources(test_hole PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
@@ -1829,14 +1829,14 @@ if(AICAD_WITH_OCCT)
   # symmetric ambiguity). The test has two groups: PURE resolution (hand-built
   # TopoInfo proving §3/§5 with hand-computed scores) and OCCT describers + an
   # end-to-end resolve that survives a dimension change. No host AICM loader
-  # needed; links aicad_doc (carries selectors.cpp) + the OCCT kernel.
+  # needed; links chudware_doc (carries selectors.cpp) + the OCCT kernel.
   add_executable(test_selectors
     tests/test_selectors.cpp)
   target_include_directories(test_selectors PRIVATE
     ${doctest_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR})
   target_link_libraries(test_selectors PRIVATE
-    aicad_doc aicad_geom_occt aicad_geom)
+    chudware_doc chudware_geom_occt chudware_geom)
   set_target_properties(test_selectors PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME selectors COMMAND test_selectors)
@@ -1857,7 +1857,7 @@ if(AICAD_WITH_OCCT)
     ${OpenCASCADE_INCLUDE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render)
   target_link_libraries(test_picks PRIVATE
-    aicad_doc aicad_geom_occt aicad_geom aicad_util)
+    chudware_doc chudware_geom_occt chudware_geom chudware_util)
   # Compile the host loader straight into the test target (the contract oracle).
   target_sources(test_picks PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
@@ -1876,35 +1876,35 @@ if(AICAD_WITH_OCCT)
     ${doctest_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR})
   target_link_libraries(test_surfacing PRIVATE
-    aicad_doc aicad_geom_occt aicad_geom)
+    chudware_doc chudware_geom_occt chudware_geom)
   set_target_properties(test_surfacing PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME surfacing COMMAND test_surfacing)
   set_tests_properties(surfacing PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
-  # --- libaicad: the C ABI SHARED library (the host-integration seam) ---------
-  # api/libaicad.{h,cpp} exposes a flat C ABI (aicad_call/aicad_free/aicad_abi_version)
-  # over aicad::doc::compile_document so the host can load this lib at runtime
+  # --- libchudware: the C ABI SHARED library (the host-integration seam) ---------
+  # api/libchudware.{h,cpp} exposes a flat C ABI (chudware_call/chudware_free/chudware_abi_version)
+  # over chudware::doc::compile_document so the host can load this lib at runtime
   # (LoadLibrary on Windows / dlopen on Linux) and route ported methods to the in-process
-  # C++ core (the strangler seam; see docs/CPP_MIGRATION.md). aicad_doc (STATIC) drags in
-  # the whole OCCT geom kernel transitively. The Netgen FEA-mesh RPCs in libaicad.cpp are
-  # compiled out unless AICAD_WITH_NETGEN, so the lib builds without the mesher (geometry,
+  # C++ core (the strangler seam; see docs/CPP_MIGRATION.md). chudware_doc (STATIC) drags in
+  # the whole OCCT geom kernel transitively. The Netgen FEA-mesh RPCs in libchudware.cpp are
+  # compiled out unless CHUDWARE_WITH_NETGEN, so the lib builds without the mesher (geometry,
   # sketch, features, STEP/IGES/STL still work — those need only OCCT).
-  # Build id (git describe) shared by libaicad (aicad_build_id export) and
-  # aicad-hostd, so a matched-build engine + daemon report the SAME id (version
+  # Build id (git describe) shared by libchudware (chudware_build_id export) and
+  # chudware-hostd, so a matched-build engine + daemon report the SAME id (version
   # drain-replace). Seeded at configure time so the header always exists, then
-  # REFRESHED at build time by the aicad_version_info target below — a
+  # REFRESHED at build time by the chudware_version_info target below — a
   # configure-time-only stamp goes stale on dev rebuilds and blinds the
   # daemon_bridge staleness check (mega-8 F7/F8 root cause).
   execute_process(COMMAND git describe --tags --always --dirty
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    OUTPUT_VARIABLE AICAD_HOSTD_BUILD_ID
+    OUTPUT_VARIABLE CHUDWARE_HOSTD_BUILD_ID
     OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
-  if(NOT AICAD_HOSTD_BUILD_ID)
-    set(AICAD_HOSTD_BUILD_ID "unknown")
+  if(NOT CHUDWARE_HOSTD_BUILD_ID)
+    set(CHUDWARE_HOSTD_BUILD_ID "unknown")
   endif()
   configure_file(hostd/version_info.h.in ${CMAKE_CURRENT_BINARY_DIR}/hostd_gen/version_info.h @ONLY)
-  add_custom_target(aicad_version_info
+  add_custom_target(chudware_version_info
     COMMAND ${CMAKE_COMMAND}
             -DSRC_DIR=${CMAKE_CURRENT_SOURCE_DIR}
             -DOUT_HEADER=${CMAKE_CURRENT_BINARY_DIR}/hostd_gen/version_info.h
@@ -1912,69 +1912,69 @@ if(AICAD_WITH_OCCT)
     BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/hostd_gen/version_info.h
     COMMENT "Refreshing build id (git describe)")
 
-  add_library(aicad SHARED
-    api/libaicad.cpp)
-  target_include_directories(aicad PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-  target_include_directories(aicad PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/hostd_gen)
-  add_dependencies(aicad aicad_version_info)
-  target_compile_definitions(aicad PRIVATE AICAD_BUILD_DLL)
-  target_link_libraries(aicad PRIVATE aicad_doc aicad_sim aicad_ecad aicad_cam aicad_agent aicad_parts aicad_sourcing aicad_firmware aicad_structural aicad_prof aicad_tolerance aicad_mechanical aicad_materials aicad_dfm aicad_piping aicad_hydraulic)
-  if(AICAD_WITH_NETGEN)
-    target_link_libraries(aicad PRIVATE aicad_mesh)
-    target_compile_definitions(aicad PRIVATE AICAD_WITH_NETGEN)  # enable the mesh RPCs in libaicad.cpp
+  add_library(chudware SHARED
+    api/libchudware.cpp)
+  target_include_directories(chudware PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+  target_include_directories(chudware PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/hostd_gen)
+  add_dependencies(chudware chudware_version_info)
+  target_compile_definitions(chudware PRIVATE CHUDWARE_BUILD_DLL)
+  target_link_libraries(chudware PRIVATE chudware_doc chudware_sim chudware_ecad chudware_cam chudware_agent chudware_parts chudware_sourcing chudware_firmware chudware_structural chudware_prof chudware_tolerance chudware_mechanical chudware_materials chudware_dfm chudware_piping chudware_hydraulic)
+  if(CHUDWARE_WITH_NETGEN)
+    target_link_libraries(chudware PRIVATE chudware_mesh)
+    target_compile_definitions(chudware PRIVATE CHUDWARE_WITH_NETGEN)  # enable the mesh RPCs in libchudware.cpp
   endif()
-  # Ship a usable PDB next to libaicad.dll WITHOUT dropping optimization, so the sampling
+  # Ship a usable PDB next to libchudware.dll WITHOUT dropping optimization, so the sampling
   # profiler resolves OUR frames to real names (OCCT stays module-level — no OCCT PDBs).
   if(MSVC)
-    target_compile_options(aicad PRIVATE /Zi)
-    target_link_options(aicad PRIVATE /DEBUG /OPT:REF /OPT:ICF)
+    target_compile_options(chudware PRIVATE /Zi)
+    target_link_options(chudware PRIVATE /DEBUG /OPT:REF /OPT:ICF)
   elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     # Keep our symbols in the dynamic symbol table so the sampling profiler's dladdr() resolves
     # OUR frames to real names (OCCT's exported symbols already resolve). GCC/Clang export shared-
     # library symbols by default, but make it explicit + robust to any future -fvisibility=hidden.
-    target_link_options(aicad PRIVATE -Wl,--export-dynamic)
+    target_link_options(chudware PRIVATE -Wl,--export-dynamic)
   endif()
-  set_target_properties(aicad PROPERTIES
-    OUTPUT_NAME libaicad   # Windows: libaicad.dll. With PREFIX "" below, Linux: libaicad.so
-    PREFIX ""              # don't prepend the usual lib -> the host loads it as "libaicad.{dll,so}"
+  set_target_properties(chudware PROPERTIES
+    OUTPUT_NAME libchudware   # Windows: libchudware.dll. With PREFIX "" below, Linux: libchudware.so
+    PREFIX ""              # don't prepend the usual lib -> the host loads it as "libchudware.{dll,so}"
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-  # Stage the OCCT toolkit + 3rdparty DLLs next to libaicad (no-op on non-Windows: the
+  # Stage the OCCT toolkit + 3rdparty DLLs next to libchudware (no-op on non-Windows: the
   # system loader resolves the .so dependencies).
-  aicad_occt_copy_dlls(aicad)
-  if(AICAD_WITH_NETGEN)
-    aicad_netgen_copy_dlls(aicad)  # nglib.dll + ngcore.dll + zlib.dll (aicad_mesh runtime deps)
+  chudware_occt_copy_dlls(chudware)
+  if(CHUDWARE_WITH_NETGEN)
+    chudware_netgen_copy_dlls(chudware)  # nglib.dll + ngcore.dll + zlib.dll (chudware_mesh runtime deps)
   endif()
-  if(AICAD_WITH_LIB3MF)
-    aicad_lib3mf_copy_dll(aicad)   # lib3mf.dll for the CppDynamic 3MF binding
+  if(CHUDWARE_WITH_LIB3MF)
+    chudware_lib3mf_copy_dll(chudware)   # lib3mf.dll for the CppDynamic 3MF binding
   endif()
 
-  # --- aicad_probe: load libaicad the way the HOST will (dlopen / LoadLibrary) -
+  # --- chudware_probe: load libchudware the way the HOST will (dlopen / LoadLibrary) -
   # Links NEITHER the core static libs NOR OCCT — only nlohmann_json. It loads
-  # libaicad, exercises ping + doc_compile_cpp + the unknown-method fallback signal,
+  # libchudware, exercises ping + doc_compile_cpp + the unknown-method fallback signal,
   # and asserts a real box compile produced AICM bytes — validating the entire
   # runtime-load + dependency-discovery story before any host code changes.
-  add_executable(aicad_probe api/aicad_probe.cpp)
-  target_include_directories(aicad_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-  target_link_libraries(aicad_probe PRIVATE nlohmann_json::nlohmann_json)
-  set_target_properties(aicad_probe PROPERTIES
+  add_executable(chudware_probe api/chudware_probe.cpp)
+  target_include_directories(chudware_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(chudware_probe PRIVATE nlohmann_json::nlohmann_json)
+  set_target_properties(chudware_probe PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-  add_dependencies(aicad_probe aicad)  # lib built (+ OCCT DLLs staged) before the probe runs
-  add_test(NAME probe COMMAND aicad_probe)
+  add_dependencies(chudware_probe chudware)  # lib built (+ OCCT DLLs staged) before the probe runs
+  add_test(NAME probe COMMAND chudware_probe)
   # Same OCCT DLL PATH prepend as the other OCCT tests, as a backup to the staged DLLs.
   set_tests_properties(probe PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
-  # --- aicad-hostd: the shared engine-host daemon -------------------------------
-  # Owns the ONE libaicad instance and serves it to the GUI + every MCP process
-  # over local IPC (unix socket / named pipe). Like aicad_probe it dlopens the
+  # --- chudware-hostd: the shared engine-host daemon -------------------------------
+  # Owns the ONE libchudware instance and serves it to the GUI + every MCP process
+  # over local IPC (unix socket / named pipe). Like chudware_probe it dlopens the
   # engine (via services/worker/cpp_core.cpp) rather than linking it, so the
   # daemon binary is tiny, engine-version-agnostic, and reuses the exact loader
   # every other consumer runs. See the hostd plan + docs/HOSTD.md.
-  # (Build id header configured above, next to the aicad target — shared.)
+  # (Build id header configured above, next to the chudware target — shared.)
   # Both platform backends are always listed; each file self-selects via
   # #ifdef _WIN32 / #ifndef _WIN32, so there is one source list to maintain.
-  add_executable(aicad-hostd
+  add_executable(chudware-hostd
     hostd/main.cpp
     hostd/server.cpp
     hostd/worker_bridge.cpp           # lazy python worker for engine-unknown RPCs (web PLM/AI roles)
@@ -1990,57 +1990,57 @@ if(AICAD_WITH_OCCT)
     ${CMAKE_CURRENT_SOURCE_DIR}/../services/ipc/ipc_discovery_win.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../services/ipc/ipc_client.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../services/worker/cpp_core.cpp)
-  target_include_directories(aicad-hostd PRIVATE
+  target_include_directories(chudware-hostd PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/hostd_gen)
-  target_link_libraries(aicad-hostd PRIVATE nlohmann_json::nlohmann_json aicad_miniz)
+  target_link_libraries(chudware-hostd PRIVATE nlohmann_json::nlohmann_json chudware_miniz)
   if(WIN32)
     # advapi32: pipe DACL (SetEntriesInAclW), token/SID (OpenProcessToken,
     # ConvertSidToStringSidW, CreateWellKnownSid). Everything else (named pipes,
     # Job Objects, CreateProcessW) is kernel32, linked by default.
-    target_link_libraries(aicad-hostd PRIVATE advapi32)
+    target_link_libraries(chudware-hostd PRIVATE advapi32)
   else()
     # Optional system tray (libappindicator3). Disable at runtime with
-    # AICAD_HOSTD_TRAY=0, or at configure time by leaving the package missing.
+    # CHUDWARE_HOSTD_TRAY=0, or at configure time by leaving the package missing.
     find_package(PkgConfig QUIET)
     if(PkgConfig_FOUND)
       pkg_check_modules(APPINDICATOR QUIET appindicator3-0.1)
     endif()
     if(APPINDICATOR_FOUND)
-      target_compile_definitions(aicad-hostd PRIVATE AICAD_HOSTD_HAS_TRAY=1)
-      target_include_directories(aicad-hostd PRIVATE ${APPINDICATOR_INCLUDE_DIRS})
-      target_link_libraries(aicad-hostd PRIVATE ${APPINDICATOR_LIBRARIES})
+      target_compile_definitions(chudware-hostd PRIVATE CHUDWARE_HOSTD_HAS_TRAY=1)
+      target_include_directories(chudware-hostd PRIVATE ${APPINDICATOR_INCLUDE_DIRS})
+      target_link_libraries(chudware-hostd PRIVATE ${APPINDICATOR_LIBRARIES})
       if(APPINDICATOR_CFLAGS_OTHER)
-        target_compile_options(aicad-hostd PRIVATE ${APPINDICATOR_CFLAGS_OTHER})
+        target_compile_options(chudware-hostd PRIVATE ${APPINDICATOR_CFLAGS_OTHER})
       endif()
-      message(STATUS "aicad-hostd: system tray enabled (appindicator3)")
+      message(STATUS "chudware-hostd: system tray enabled (appindicator3)")
     else()
-      message(STATUS "aicad-hostd: system tray disabled (appindicator3 not found)")
+      message(STATUS "chudware-hostd: system tray disabled (appindicator3 not found)")
     endif()
   endif()
-  set_target_properties(aicad-hostd PROPERTIES
+  set_target_properties(chudware-hostd PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-  add_dependencies(aicad-hostd aicad)  # engine staged before the daemon can serve it
+  add_dependencies(chudware-hostd chudware)  # engine staged before the daemon can serve it
 endif()
 
 # === 3D assembly mate solver (C++ port of engine/doc/mate_solver.py) ==========
 # Standalone, OCCT-free: rigid-component placement over the shared solver core
-# (aicad_solver) + Eigen + json. Mirrors the sketch lib/cli/diff-harness shape.
-add_library(aicad_mate STATIC
+# (chudware_solver) + Eigen + json. Mirrors the sketch lib/cli/diff-harness shape.
+add_library(chudware_mate STATIC
   mate/mate.cpp
   # numpy_rng.cpp is a standalone (stdlib-only) bit-exact clone of numpy's
   # default_rng().standard_normal(); the antipodal-escape restart in mate.cpp draws from it
   # so the C++ random restarts land on the SAME points as the Python oracle. Compiled in
-  # directly (not via aicad_sim) to keep aicad_mate OCCT-/sim-free.
+  # directly (not via chudware_sim) to keep chudware_mate OCCT-/sim-free.
   sim/numpy_rng.cpp)
-target_include_directories(aicad_mate PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(aicad_mate PUBLIC aicad_solver Eigen3::Eigen nlohmann_json::nlohmann_json)
+target_include_directories(chudware_mate PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(chudware_mate PUBLIC chudware_solver Eigen3::Eigen nlohmann_json::nlohmann_json)
 
 # mate_cli (differential-harness driver; see tools/mate_diff.py). Reads the
 # {components, mates, resolved_geometry, warm?, drag?} fixture from argv[1] (or
 # stdin if "-") and prints the solve_mates result as one JSON line.
 add_executable(mate_cli
   mate/mate_cli.cpp)
-target_link_libraries(mate_cli PRIVATE aicad_mate)
+target_link_libraries(mate_cli PRIVATE chudware_mate)
 set_target_properties(mate_cli PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
@@ -2050,7 +2050,7 @@ if(TARGET test_nsolve)
   add_executable(test_mate
     tests/test_mate.cpp)
   target_include_directories(test_mate PRIVATE ${doctest_SOURCE_DIR})
-  target_link_libraries(test_mate PRIVATE aicad_mate)
+  target_link_libraries(test_mate PRIVATE chudware_mate)
   set_target_properties(test_mate PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME mate COMMAND test_mate)
@@ -2060,7 +2060,7 @@ if(TARGET test_nsolve)
   add_executable(test_mate_corpus
     tests/test_mate_corpus.cpp)
   target_include_directories(test_mate_corpus PRIVATE ${doctest_SOURCE_DIR})
-  target_link_libraries(test_mate_corpus PRIVATE aicad_mate)
+  target_link_libraries(test_mate_corpus PRIVATE chudware_mate)
   set_target_properties(test_mate_corpus PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME mate_corpus COMMAND test_mate_corpus)
@@ -2072,7 +2072,7 @@ if(TARGET test_nsolve)
     doc/motion_dynamics.cpp)
   target_include_directories(test_motion_dynamics PRIVATE
     ${doctest_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
-  target_link_libraries(test_motion_dynamics PRIVATE aicad_mate)
+  target_link_libraries(test_motion_dynamics PRIVATE chudware_mate)
   set_target_properties(test_motion_dynamics PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME motion_dynamics COMMAND test_motion_dynamics)

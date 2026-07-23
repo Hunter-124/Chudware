@@ -1,49 +1,49 @@
 #!/usr/bin/env bash
-# entrypoint.sh — Xvfb + Billet + stream backend (novnc default, selkies optional)
+# entrypoint.sh — Xvfb + Chudware + stream backend (novnc default, selkies optional)
 set -euo pipefail
 
-log() { echo "[billet-session $(date -u +%H:%M:%S)] $*" >&2; }
+log() { echo "[chudware-session $(date -u +%H:%M:%S)] $*" >&2; }
 
 # ---- Contract defaults ------------------------------------------------------
 export DISPLAY="${DISPLAY:-:0}"
 export HOME="${HOME:-/home/user}"
-export BILLET_PLM_DIR="${BILLET_PLM_DIR:-/plm}"
+export CHUDWARE_PLM_DIR="${CHUDWARE_PLM_DIR:-/plm}"
 export STREAM_BACKEND="${STREAM_BACKEND:-novnc}"   # novnc | selkies
 export SELKIES_ENCODER="${SELKIES_ENCODER:-x264enc}"
-export BILLET_HEAVY="${BILLET_HEAVY:-0}"
-export AI_CAD_USER_ID="${AICAD_USER_ID:-${BILLET_USER_EMAIL:-user}}"
-export AICAD_USER_ID="${AICAD_USER_ID:-$AI_CAD_USER_ID}"
-export AI_CAD_USER_DISPLAY="${AICAD_USER_DISPLAY:-${BILLET_USER_DISPLAY:-User}}"
-export AICAD_USER_DISPLAY="${AICAD_USER_DISPLAY:-$AI_CAD_USER_DISPLAY}"
+export CHUDWARE_HEAVY="${CHUDWARE_HEAVY:-0}"
+export CHUDWARE_USER_ID="${CHUDWARE_USER_ID:-${CHUDWARE_USER_EMAIL:-user}}"
+export CHUDWARE_USER_ID="${CHUDWARE_USER_ID:-$CHUDWARE_USER_ID}"
+export CHUDWARE_USER_DISPLAY="${CHUDWARE_USER_DISPLAY:-${CHUDWARE_USER_DISPLAY:-User}}"
+export CHUDWARE_USER_DISPLAY="${CHUDWARE_USER_DISPLAY:-$CHUDWARE_USER_DISPLAY}"
 
 # CEF: compile-time linked; lazy cold-init reduces container start risk.
 # no_sandbox already set in cef_platform_linux.cpp; single-process default on.
-export AI_CAD_CEF_LAZY="${AI_CAD_CEF_LAZY:-1}"
-export AI_CAD_CEF_TRACE="${AI_CAD_CEF_TRACE:-0}"
+export CHUDWARE_CEF_LAZY="${CHUDWARE_CEF_LAZY:-1}"
+export CHUDWARE_CEF_TRACE="${CHUDWARE_CEF_TRACE:-0}"
 
-BILLET_ROOT="${BILLET_ROOT:-/opt/billet}"
-export PATH="$BILLET_ROOT/bin:$PATH"
-export LD_LIBRARY_PATH="$BILLET_ROOT/lib:$BILLET_ROOT/bin:${LD_LIBRARY_PATH:-}"
+CHUDWARE_ROOT="${CHUDWARE_ROOT:-/opt/chudware}"
+export PATH="$CHUDWARE_ROOT/bin:$PATH"
+export LD_LIBRARY_PATH="$CHUDWARE_ROOT/lib:$CHUDWARE_ROOT/bin:${LD_LIBRARY_PATH:-}"
 # Explicit path so cpp_core ensureLoaded finds the engine even if dlopen
 # candidates miss (see services/worker/cpp_core.cpp).
-export AI_CAD_LIBAICAD="${AI_CAD_LIBAICAD:-$BILLET_ROOT/bin/libaicad.so}"
+export CHUDWARE_LIBCHUDWARE="${CHUDWARE_LIBCHUDWARE:-$CHUDWARE_ROOT/bin/libchudware.so}"
 
 # Python AI worker (bootstrap.cpp runtimePython/appDir). Venv is image-layer
-# under /opt/billet — never under HOME (gateway bind-mounts HOME).
+# under /opt/chudware — never under HOME (gateway bind-mounts HOME).
 # Provider keys (OPENROUTER_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY,
 # XAI_API_KEY, GEMINI_API_KEY, …) are passed through by the gateway; we never
 # unset or filter *_API_KEY from the environment.
-export AI_CAD_PYTHON="${AI_CAD_PYTHON:-$BILLET_ROOT/runtime/venv/bin/python}"
-export AI_CAD_REPO="${AI_CAD_REPO:-$BILLET_ROOT/app}"
-export AI_CAD_PROMPTS_DIR="${AI_CAD_PROMPTS_DIR:-$BILLET_ROOT/app/agent/prompts}"
+export CHUDWARE_PYTHON="${CHUDWARE_PYTHON:-$CHUDWARE_ROOT/runtime/venv/bin/python}"
+export CHUDWARE_REPO="${CHUDWARE_REPO:-$CHUDWARE_ROOT/app}"
+export CHUDWARE_PROMPTS_DIR="${CHUDWARE_PROMPTS_DIR:-$CHUDWARE_ROOT/app/agent/prompts}"
 
-# Screen geometry — matches Xvfb; Billet is told to fill it (AI_CAD_WIN_SIZE,
+# Screen geometry — matches Xvfb; Chudware is told to fill it (CHUDWARE_WIN_SIZE,
 # app.cpp) since there is no window manager to maximize into.
 SCREEN_W="${SCREEN_W:-1920}"
 SCREEN_H="${SCREEN_H:-1080}"
 SCREEN_D="${SCREEN_D:-24}"
 STREAM_PORT="${STREAM_PORT:-8080}"
-export AI_CAD_WIN_SIZE="${AI_CAD_WIN_SIZE:-${SCREEN_W}x${SCREEN_H}}"
+export CHUDWARE_WIN_SIZE="${CHUDWARE_WIN_SIZE:-${SCREEN_W}x${SCREEN_H}}"
 VNC_PORT="${VNC_PORT:-5900}"
 
 # HOME may be a bind-mount; don't fail the seat if mkdir races or perms lag.
@@ -54,22 +54,22 @@ chmod 1777 /tmp/.X11-unix 2>/dev/null || true
 cd "$HOME" 2>/dev/null || cd /
 
 # ---- PLM bootstrap (T-WEB2 §Q2.2): clone or start pull-only; NEVER push -----
-# Shared bare remotes live under BILLET_PLM_DIR (/plm). Private working trees
+# Shared bare remotes live under CHUDWARE_PLM_DIR (/plm). Private working trees
 # land in $HOME/Projects/<name>. Failures log + continue so the seat still boots.
 plm_bootstrap() {
-    local plm_root="${BILLET_PLM_DIR:-/plm}"
-    local py="${AI_CAD_PYTHON:-}"
-    local repo="${AI_CAD_REPO:-}"
+    local plm_root="${CHUDWARE_PLM_DIR:-/plm}"
+    local py="${CHUDWARE_PYTHON:-}"
+    local repo="${CHUDWARE_REPO:-}"
     if [ ! -d "$plm_root" ]; then
         log "[plm] no $plm_root mount — skip bootstrap"
         return 0
     fi
     if [ -z "$py" ] || [ ! -x "$py" ]; then
-        log "[plm] WARN AI_CAD_PYTHON missing/unusable — skip bootstrap"
+        log "[plm] WARN CHUDWARE_PYTHON missing/unusable — skip bootstrap"
         return 0
     fi
     if [ -z "$repo" ] || [ ! -d "$repo" ]; then
-        log "[plm] WARN AI_CAD_REPO missing — skip bootstrap"
+        log "[plm] WARN CHUDWARE_REPO missing — skip bootstrap"
         return 0
     fi
     mkdir -p "$HOME/Projects" 2>/dev/null || true
@@ -162,7 +162,7 @@ plm_bootstrap
 PIDS=()
 cleanup() {
     log "SIGTERM/EXIT — shutting down (${#PIDS[@]} children)"
-    # Reverse order: streamer, billet, vnc, xvfb
+    # Reverse order: streamer, chudware, vnc, xvfb
     local pid
     for ((i=${#PIDS[@]}-1; i>=0; i--)); do
         pid="${PIDS[$i]}"
@@ -203,7 +203,7 @@ log "Xvfb ready"
 # VirtualGL's libvglfaker.so leaves eglGetProcAddress / glXGetProcAddressARB
 # undefined (resolved from already-loaded libEGL/libGL). Preload those with
 # RTLD_GLOBAL semantics via LD_PRELOAD so vglrun -d egl can start.
-BILLET_PREFIX=()
+CHUDWARE_PREFIX=()
 USE_VGL=0
 HAS_NVIDIA=0
 if [ -e /dev/nvidia0 ] || [ -e /dev/nvidiactl ]; then
@@ -216,13 +216,13 @@ enable_llvmpipe() {
     export LIBGL_ALWAYS_SOFTWARE=1
     export GALLIUM_DRIVER=llvmpipe
     unset VGL_DISPLAY 2>/dev/null || true
-    BILLET_PREFIX=()
+    CHUDWARE_PREFIX=()
     USE_VGL=0
 }
 
-if [ "$BILLET_HEAVY" = "1" ] && [ "$HAS_NVIDIA" = "1" ]; then
+if [ "$CHUDWARE_HEAVY" = "1" ] && [ "$HAS_NVIDIA" = "1" ]; then
     if command -v vglrun >/dev/null 2>&1; then
-        log "BILLET_HEAVY=1 + NVIDIA — using VirtualGL (vglrun -d egl)"
+        log "CHUDWARE_HEAVY=1 + NVIDIA — using VirtualGL (vglrun -d egl)"
         export VGL_DISPLAY="${VGL_DISPLAY:-egl}"
         export VGL_LOGO=0
         # Preload dispatch + EGL + GL so libvglfaker resolves GetProcAddress symbols.
@@ -244,20 +244,20 @@ if [ "$BILLET_HEAVY" = "1" ] && [ "$HAS_NVIDIA" = "1" ]; then
         # Don't force software GL under VGL.
         unset LIBGL_ALWAYS_SOFTWARE 2>/dev/null || true
         unset GALLIUM_DRIVER 2>/dev/null || true
-        BILLET_PREFIX=(vglrun -d egl)
+        CHUDWARE_PREFIX=(vglrun -d egl)
         USE_VGL=1
     else
-        log "WARNING: BILLET_HEAVY=1 but VirtualGL/vglrun missing — falling back to llvmpipe"
+        log "WARNING: CHUDWARE_HEAVY=1 but VirtualGL/vglrun missing — falling back to llvmpipe"
         enable_llvmpipe
     fi
 else
-    if [ "$BILLET_HEAVY" = "1" ] && [ "$HAS_NVIDIA" != "1" ]; then
-        log "BILLET_HEAVY=1 but no NVIDIA devices — llvmpipe"
+    if [ "$CHUDWARE_HEAVY" = "1" ] && [ "$HAS_NVIDIA" != "1" ]; then
+        log "CHUDWARE_HEAVY=1 but no NVIDIA devices — llvmpipe"
     fi
     enable_llvmpipe
 fi
 
-# ---- Stream backend first (so /health of stream is up while Billet boots) ----
+# ---- Stream backend first (so /health of stream is up while Chudware boots) ----
 start_novnc() {
     log "STREAM_BACKEND=novnc — x11vnc :$VNC_PORT + websockify :$STREAM_PORT"
     # -forever -shared: reconnect-friendly; -nopw: gateway terminates auth
@@ -318,35 +318,35 @@ case "$STREAM_BACKEND" in
     novnc|*) start_novnc ;;
 esac
 
-# ---- Billet -----------------------------------------------------------------
-BILLET_BIN="$BILLET_ROOT/bin/Billet"
-if [ ! -x "$BILLET_BIN" ]; then
-    log "FATAL: $BILLET_BIN not executable"
+# ---- Chudware -----------------------------------------------------------------
+CHUDWARE_BIN="$CHUDWARE_ROOT/bin/Chudware"
+if [ ! -x "$CHUDWARE_BIN" ]; then
+    log "FATAL: $CHUDWARE_BIN not executable"
     exit 1
 fi
 # File dialogs / Feature-Manager explorer start in the shared projects tree.
-export AI_CAD_START_DIR="${AI_CAD_START_DIR:-$HOME/Projects}"
+export CHUDWARE_START_DIR="${CHUDWARE_START_DIR:-$HOME/Projects}"
 
 # Default project: open its work-in-progress document at startup (bare path
 # argv = the app's file-association open path). Pull-only PLM bootstrap above
 # has already cloned /plm/*.git into $HOME/Projects/. "WIP" = the most
 # recently modified .step+ in the project.
-BILLET_OPEN_ARGS=()
-if [ -n "${BILLET_DEFAULT_PROJECT:-}" ]; then
-    proj_dir="$HOME/Projects/${BILLET_DEFAULT_PROJECT}"
+CHUDWARE_OPEN_ARGS=()
+if [ -n "${CHUDWARE_DEFAULT_PROJECT:-}" ]; then
+    proj_dir="$HOME/Projects/${CHUDWARE_DEFAULT_PROJECT}"
     if [ -d "$proj_dir" ]; then
         doc=""
-        if [ -n "${BILLET_OPEN_DOC:-}" ] && [ -f "$proj_dir/$BILLET_OPEN_DOC" ]; then
-            doc="$proj_dir/$BILLET_OPEN_DOC"
+        if [ -n "${CHUDWARE_OPEN_DOC:-}" ] && [ -f "$proj_dir/$CHUDWARE_OPEN_DOC" ]; then
+            doc="$proj_dir/$CHUDWARE_OPEN_DOC"
         else
-            [ -n "${BILLET_OPEN_DOC:-}" ] && log "WARN BILLET_OPEN_DOC not found: $proj_dir/$BILLET_OPEN_DOC"
+            [ -n "${CHUDWARE_OPEN_DOC:-}" ] && log "WARN CHUDWARE_OPEN_DOC not found: $proj_dir/$CHUDWARE_OPEN_DOC"
             doc="$(find "$proj_dir" -maxdepth 2 -name '*.step+' -type f -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2-)"
         fi
         if [ -n "$doc" ]; then
-            BILLET_OPEN_ARGS=("$doc")
-            log "default project '$BILLET_DEFAULT_PROJECT' — opening $(basename "$doc")"
+            CHUDWARE_OPEN_ARGS=("$doc")
+            log "default project '$CHUDWARE_DEFAULT_PROJECT' — opening $(basename "$doc")"
         else
-            log "default project '$BILLET_DEFAULT_PROJECT' has no .step+ document yet"
+            log "default project '$CHUDWARE_DEFAULT_PROJECT' has no .step+ document yet"
         fi
     else
         log "WARN default project dir missing: $proj_dir"
@@ -354,39 +354,39 @@ if [ -n "${BILLET_DEFAULT_PROJECT:-}" ]; then
 fi
 
 launch_billet() {
-    log "launching Billet as ${BILLET_USER_EMAIL:-?} / ${AICAD_USER_DISPLAY}"
-    log "  DISPLAY=$DISPLAY STREAM_BACKEND=$STREAM_BACKEND HEAVY=$BILLET_HEAVY USE_VGL=$USE_VGL"
-    log "  prefix=${BILLET_PREFIX[*]:-(none)}"
-    if [ ${#BILLET_PREFIX[@]} -gt 0 ]; then
-        "${BILLET_PREFIX[@]}" "$BILLET_BIN" "${BILLET_OPEN_ARGS[@]}" &
+    log "launching Chudware as ${CHUDWARE_USER_EMAIL:-?} / ${CHUDWARE_USER_DISPLAY}"
+    log "  DISPLAY=$DISPLAY STREAM_BACKEND=$STREAM_BACKEND HEAVY=$CHUDWARE_HEAVY USE_VGL=$USE_VGL"
+    log "  prefix=${CHUDWARE_PREFIX[*]:-(none)}"
+    if [ ${#CHUDWARE_PREFIX[@]} -gt 0 ]; then
+        "${CHUDWARE_PREFIX[@]}" "$CHUDWARE_BIN" "${CHUDWARE_OPEN_ARGS[@]}" &
     else
-        "$BILLET_BIN" "${BILLET_OPEN_ARGS[@]}" &
+        "$CHUDWARE_BIN" "${CHUDWARE_OPEN_ARGS[@]}" &
     fi
-    BILLET_PID=$!
-    # Replace any previous Billet pid in PIDS with the live one.
+    CHUDWARE_PID=$!
+    # Replace any previous Chudware pid in PIDS with the live one.
     local cleaned=()
     local p
     for p in "${PIDS[@]:-}"; do
-        [ "$p" = "${PREV_BILLET_PID:-}" ] && continue
+        [ "$p" = "${PREV_CHUDWARE_PID:-}" ] && continue
         cleaned+=("$p")
     done
     PIDS=("${cleaned[@]}")
-    PIDS+=("$BILLET_PID")
-    PREV_BILLET_PID=$BILLET_PID
-    log "Billet pid=$BILLET_PID"
+    PIDS+=("$CHUDWARE_PID")
+    PREV_CHUDWARE_PID=$CHUDWARE_PID
+    log "Chudware pid=$CHUDWARE_PID"
 }
 
 launch_billet
 
-# If VirtualGL fails (missing EGL symbols, bad CDI libs, …) Billet dies immediately.
+# If VirtualGL fails (missing EGL symbols, bad CDI libs, …) Chudware dies immediately.
 # Detect early exit and relaunch under llvmpipe so the seat stays usable.
 if [ "$USE_VGL" = "1" ]; then
     set +e
     for _i in 1 2 3 4 5 6 7 8; do
-        if ! kill -0 "$BILLET_PID" 2>/dev/null; then
-            wait "$BILLET_PID" 2>/dev/null
+        if ! kill -0 "$CHUDWARE_PID" 2>/dev/null; then
+            wait "$CHUDWARE_PID" 2>/dev/null
             _rc=$?
-            log "WARNING: Billet under VirtualGL exited within ${_i}s (rc=${_rc}) — falling back to llvmpipe"
+            log "WARNING: Chudware under VirtualGL exited within ${_i}s (rc=${_rc}) — falling back to llvmpipe"
             enable_llvmpipe
             launch_billet
             break
@@ -396,10 +396,10 @@ if [ "$USE_VGL" = "1" ]; then
     set -e
 fi
 
-# Wait on Billet; if it dies later, tear everything down.
+# Wait on Chudware; if it dies later, tear everything down.
 set +e
-wait "$BILLET_PID"
+wait "$CHUDWARE_PID"
 rc=$?
 set -e
-log "Billet exited rc=$rc"
+log "Chudware exited rc=$rc"
 exit "$rc"

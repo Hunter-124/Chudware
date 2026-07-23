@@ -8,9 +8,9 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad::ecad {
+namespace chudware::ecad {
 
 // run_erc(sch, netlist) -> array of violation dicts (deterministic order).
 nlohmann::json run_erc(const nlohmann::json& sch, const nlohmann::json& netlist);
 
-}  // namespace aicad::ecad
+}  // namespace chudware::ecad

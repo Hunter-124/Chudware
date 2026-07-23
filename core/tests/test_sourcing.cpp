@@ -13,7 +13,7 @@
 
 #include "sourcing/sourcing.h"
 
-using namespace aicad::sourcing;
+using namespace chudware::sourcing;
 using nlohmann::json;
 
 // ---------------------------------------------------------------------------
@@ -542,7 +542,7 @@ TEST_CASE("dispatch: envelopes mirror the Python worker wrappers") {
 TEST_CASE("vendor registry: register_local_cad copies + indexes the record") {
     namespace fs = std::filesystem;
     const fs::path root = vendor_parts_dir();
-    const fs::path src = fs::temp_directory_path() / "aicad_spec_model_test.step";
+    const fs::path src = fs::temp_directory_path() / "chudware_spec_model_test.step";
     {
         std::ofstream f(src);
         f << "ISO-10303-21;\nEND-ISO-10303-21;\n";
@@ -570,7 +570,7 @@ int main(int argc, char** argv) {
     // Isolate ALL config/vendor-registry reads to a scratch XDG dir: the providers and
     // the cost model must see an empty user config (no live machine state in tests).
     const std::string scratch =
-        (std::filesystem::temp_directory_path() / "aicad_sourcing_test_xdg").string();
+        (std::filesystem::temp_directory_path() / "chudware_sourcing_test_xdg").string();
     std::error_code ec;
     std::filesystem::remove_all(scratch, ec);
     std::filesystem::create_directories(scratch, ec);

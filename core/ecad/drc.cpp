@@ -17,7 +17,7 @@
 
 #include "ecad/schema.h"
 
-namespace aicad::ecad {
+namespace chudware::ecad {
 
 using nlohmann::json;
 
@@ -850,4 +850,4 @@ json run_drc(const json& board) {
     return out;
 }
 
-}  // namespace aicad::ecad
+}  // namespace chudware::ecad

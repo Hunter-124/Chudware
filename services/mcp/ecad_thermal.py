@@ -81,7 +81,7 @@ def _err_d(reason: str, hint: str = "", next_actions: Optional[list] = None,
 
 
 # --------------------------------------------------------------------------- pure helpers
-# Module-level and engine-free so tests can drive them without OCP/libaicad.
+# Module-level and engine-free so tests can drive them without OCP/libchudware.
 
 
 def resolve_environment(environment: str, h_w_m2k: Optional[float],
@@ -398,7 +398,7 @@ def thermal_handoff_impl(board_doc: dict, *,
                          dry_run: bool = False,
                          out_path: str = "",
                          find_pdn=None) -> dict:
-    """Board doc (aicad ECAD board JSON) -> solved thermal FEA study dict.
+    """Board doc (chudware ECAD board JSON) -> solved thermal FEA study dict.
 
     Returns the same payload shape as the ecad_thermal_handoff MCP tool (dict, not
     JSON string), with a validated aicad.simhandoff/1 envelope under "simhandoff".
@@ -420,7 +420,7 @@ def thermal_handoff_impl(board_doc: dict, *,
     if not out_path:
         import tempfile
         out_path = os.path.join(tempfile.gettempdir(),
-                                f"aicad_board_fea_{os.getpid()}.step")
+                                f"chudware_board_fea_{os.getpid()}.step")
 
     # ── 1. FEA solid + homogenized material ─────────────────────────────
     try:
@@ -601,8 +601,8 @@ def thermal_handoff_impl(board_doc: dict, *,
             **base, "solved": False, "dry_run": False,
             "error_solve": f"FEA leg unavailable: {mesh_err}",
             "hint": "geometry + BCs + envelope are valid; the mesher/solver "
-                    "(libaicad with Netgen) is not available in this environment.",
-            "next_actions": ["set AI_CAD_LIBAICAD to a sim-enabled libaicad build "
+                    "(libchudware with Netgen) is not available in this environment.",
+            "next_actions": ["set CHUDWARE_LIBCHUDWARE to a sim-enabled libchudware build "
                              "and retry"],
         }, envelope)
 
@@ -1242,7 +1242,7 @@ def register_ecad_airflow_tools(mcp) -> None:
                 "hint": "case inputs + envelope are valid; the OpenFOAM run itself "
                         "failed — see skip_reason.",
                 "next_actions": [lbm_advisory,
-                                 "set AICAD_FOAM_KEEP=1 and retry to inspect the case"],
+                                 "set CHUDWARE_FOAM_KEEP=1 and retry to inspect the case"],
             }, envelope))
 
         region_temps = parse_region_temps(list(res.solver_notes or []))

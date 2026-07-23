@@ -9,7 +9,7 @@
 #include <memory>
 #include <utility>
 
-namespace aicad::pool {
+namespace chudware::pool {
 
 namespace {
 
@@ -23,7 +23,7 @@ thread_local ThreadPool* tls_pool = nullptr;
 }  // namespace
 
 ThreadPool::ThreadPool(int max_workers) {
-    if (max_workers <= 0) max_workers = aicad::governor::solver_threads();
+    if (max_workers <= 0) max_workers = chudware::governor::solver_threads();
     max_workers_ = std::max(1, max_workers);
     start_workers(max_workers_);
 }
@@ -195,10 +195,10 @@ ThreadPool& shared() {
 }
 
 int reconfigure_shared(uint64_t estimate_bytes, const char* what) {
-    const aicad::governor::Plan plan =
-        aicad::governor::plan_for(estimate_bytes, what ? what : "pool", 0);
+    const chudware::governor::Plan plan =
+        chudware::governor::plan_for(estimate_bytes, what ? what : "pool", 0);
     shared().set_max_workers(plan.workers);
     return plan.workers;
 }
 
-}  // namespace aicad::pool
+}  // namespace chudware::pool

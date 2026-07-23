@@ -9,7 +9,7 @@
 #include <utility>
 #include <vector>
 
-namespace aicad::structural {
+namespace chudware::structural {
 
 const char* kCheckDisclaimer =
     "Preliminary check — not sealed engineering. "
@@ -144,4 +144,4 @@ CheckResult check_member(const nlohmann::json& member_result, const nlohmann::js
     return r;
 }
 
-}  // namespace aicad::structural
+}  // namespace chudware::structural

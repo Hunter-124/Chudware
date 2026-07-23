@@ -1,13 +1,13 @@
 # T-G12 Walkthrough — Round 2 Feedback (AI-delegated reviewer, Opus)
 
 **Reviewer:** Opus walkthrough agent (Hunter delegated round-2 to AI, 2026-07-03)
-**Method:** READ-ONLY. Headless xvfb captures (`--ui-screenshot`, `AI_CAD_THEME=light|dark`),
+**Method:** READ-ONLY. Headless xvfb captures (`--ui-screenshot`, `CHUDWARE_THEME=light|dark`),
 every PNG eyeballed (Read renders images). No source changed, no board touched.
-**Binary:** host/build-linux/bin/AI-CAD (current master, build up to date — round-1 fixes T-G14..T-G20+T-BL19 compiled in).
+**Binary:** host/build-linux/bin/Chudware (current master, build up to date — round-1 fixes T-G14..T-G20+T-BL19 compiled in).
 **Screenshots:** kept in this scratchpad under `shots/`.
 
 Two documented false-verify traps honored (advisor-flagged):
-- **T-G14 PM dark-mode** captured with `AI_CAD_PMBOX=1` (without a loaded doc, panes fall back to light theme text and HIDE the black-on-black bug — app.cpp ~1499).
+- **T-G14 PM dark-mode** captured with `CHUDWARE_PMBOX=1` (without a loaded doc, panes fall back to light theme text and HIDE the black-on-black bug — app.cpp ~1499).
 - **T-G19 extrude double-display** captured with FULL-WINDOW scenarios (m1), NOT isolated `pmform` (the duplicate readout lived far-right behind the Copilot tab — pmform crops it out).
 
 ---
@@ -34,7 +34,7 @@ _(filled in as captures are eyeballed)_
 
 | Round-1 item (task) | Verdict | Evidence |
 |---------------------|---------|----------|
-| **T-G14** docked PM readable in dark (no black-on-black) | **PASS** | `crop_pm_dark.png`, `crop_extrudepm_dark.png` — Fillet+Extrude PM panes: light text over glass pane, all labels legible, borders present. Captured with `AI_CAD_PMBOX=1` (the bug regime). |
+| **T-G14** docked PM readable in dark (no black-on-black) | **PASS** | `crop_pm_dark.png`, `crop_extrudepm_dark.png` — Fillet+Extrude PM panes: light text over glass pane, all labels legible, borders present. Captured with `CHUDWARE_PMBOX=1` (the bug regime). |
 | **T-G14** app-wide dark readability (ribbon/menus/status) | **PASS (static)** | `crop_ribbon_dark.png`, `final_*_dark.png` across all scenarios — menubar, ribbon group titles, status bar all readable in dark. |
 | **T-G19** OK/Cancel relocated to pane top row, wider | **PASS** | `crop_pm_dark.png`, `crop_extrudepm_dark.png` — green ✓ (OK) + dark ✗ (Cancel) sit in the top row between config icons and the `«` collapse chevron, exactly as specified. |
 | **T-G19** far-right duplicate "Active Feature" readout PANEL removed | **PASS (panel) — but symptom recurs, see NEW-1** | The mirrored readout PANEL is removed (viewport_panel.cpp L3247-3252) AND absent for Fillet (`crop_copilot_dark.png` clean). HOWEVER the depth/draft-behind-Copilot *symptom* recurs via a different widget (in-viewport dim chips) in the Extrude pmform harness — see NEW-1. Whether that reproduces in a real edit needs a live check (residual). |
@@ -43,7 +43,7 @@ _(filled in as captures are eyeballed)_
 | **T-G15** photographic screenshot icons (Dress-up) | **PASS** | `crop_sketchgrp_05_edit.png` — Fillet + Chamfer buttons show real rendered part screenshots with the modified edges emphasized, per directive. |
 | **T-G15** `sketch_new` needs a text label | **NOT HONORED — but by explicit design** | `crop_sketchbtn_only_light.png` — New Sketch button is still icon-only. ROOT CAUSE FOUND: `ribbon.cpp::ribbon_displayLabel` (L132-135) hard-returns `""` for `sketch_new` with comment *"intentionally icon-only; the tooltip keeps the full name."* So this is a deliberate choice, NOT a regression/unlanded fix. It still does not satisfy Erik's round-1 ask ("needs a text label like the others"). Needs an Erik design call — see NEW-2 (downgraded to nit). Single-button groups DO caption (control: Assembly "Mate" group shows a "Mate" caption above its group title — `settle_asm_components_dark.png`), so the blank here is specific to the sketch_new override, confirmed in code. |
 | **T-G15** `appr_mat_dark` / `appr_mat_brass` icons show | **PASS** | `crop_apprmat_light.png`, `crop_apprribbon_dark.png` — Dark Metal + Brass render real material-swatch cubes. |
-| **T-G15** `appr_mat_aluminum` / `appr_mat_steel` icons | **UNVERIFIABLE** | Occluded by the ShopCraft info toast in every appearance capture (NEW-5). Same swatch-button family as Brass/Dark which pass. |
+| **T-G15** `appr_mat_aluminum` / `appr_mat_steel` icons | **UNVERIFIABLE** | Occluded by the Chudware info toast in every appearance capture (NEW-5). Same swatch-button family as Brass/Dark which pass. |
 | **T-G15** `display_hlr` (Hidden Removed) icon shows | **PASS** | `crop_apprribbon_dark.png` — real hidden-line-removal glyph in Display group, both themes. |
 | **T-G15** `asm_parts_library` (Std. Parts) icon remade | **PASS** | `settle_asm_components_dark.png` (toast-free asm interference frame) — Std. Parts shows a real component-with-badge icon + caption; Insert/Move Comp./Comp. Pattern also real. |
 | **T-G15** `weld_gusset` (Gusset) icon shows | **UNVERIFIABLE** | Dress group fully under the info toast in all weldments captures (NEW-5). |
@@ -74,19 +74,19 @@ _Format: element/tab · theme · severity · issue · screenshot · fix directio
 - **Verdict:** The deliberate icon-only choice directly conflicts with Erik's round-1 request. This needs Erik to decide: keep icon-only (and close the round-1 item as "won't do"), or restore the "New Sketch" caption (delete the L134 special-case). Downgraded from FAIL to nit because it's an intentional, tooltip-backed choice, not a bug.
 - **Screenshots:** `crop_sketchbtn_only_light.png` (5× zoom), `crop_newsketch2_dark.png`.
 
-### NEW-3 · On-load "ShopCraft: live view of the AI's part" info toast is pinned over the ribbon's top-left in headless captures · light+dark · **nit (capture-quality) / possible ugly** · **new**
-- **What:** A white/light info card ("Info — ShopCraft: live view of the AI's part — it updates as it builds") is anchored at the viewport upper-left and, in most `ribbon_*` / early-scenario frames, overlaps the leftmost 1-2 ribbon groups. In dark mode the card is a light/white panel (dark text on white) even though the app is dark — a minor dark-mode inconsistency if that persists on real windows.
+### NEW-3 · On-load "Chudware: live view of the AI's part" info toast is pinned over the ribbon's top-left in headless captures · light+dark · **nit (capture-quality) / possible ugly** · **new**
+- **What:** A white/light info card ("Info — Chudware: live view of the AI's part — it updates as it builds") is anchored at the viewport upper-left and, in most `ribbon_*` / early-scenario frames, overlaps the leftmost 1-2 ribbon groups. In dark mode the card is a light/white panel (dark text on white) even though the app is dark — a minor dark-mode inconsistency if that persists on real windows.
 - **Impact on this review:** It occluded the leftmost group on nearly every ribbon-tab capture, blocking round-2 verification of `asm_parts_library`, `weld_gusset`, `appr_mat_aluminum`, `appr_mat_steel` (all UNVERIFIABLE above).
 - **Screenshots:** `crop_apprmat_dark.png` (white card over Material group in dark), `crop_surfacesribbon_dark.png`, `crop_featuresribbon_dark.png`.
-- **Fix direction:** Likely benign in live use (the toast auto-dismisses), so primary ask is a capture-harness one: suppress/auto-dismiss the ShopCraft toast for `AI_CAD_SHOT=ribbon` so per-tab icon verification isn't occluded. Secondary: confirm the toast card honors the dark palette (white-in-dark looks off).
+- **Fix direction:** Likely benign in live use (the toast auto-dismisses), so primary ask is a capture-harness one: suppress/auto-dismiss the Chudware toast for `CHUDWARE_SHOT=ribbon` so per-tab icon verification isn't occluded. Secondary: confirm the toast card honors the dark palette (white-in-dark looks off).
 
 ### NEW-4 · Mass Properties window: Material + Density fields render as empty dark pills · dark (and light) · **nit** · **new**
 - **What:** The Mass Properties evaluate window shows two dark rounded fields at the top labeled "Material" and "Density" that are blank — no material name / density value populated (the box scenario part may have no material assigned, but the empty pills read as unstyled/placeholder).
 - **Screenshot:** `crop_evalmass_dark.png`.
 - **Fix direction:** Either populate (show "— / not set") or hide the fields when no material is assigned; verify they're not black-on-black-empty vs. intentionally blank.
 
-### NEW-5 · Contextual ribbon tabs (Simulation, PCB) not capturable via `AI_CAD_SHOT=ribbon` alias · n/a · **note (residual, not a product defect)** · **new**
-- **What:** `AI_CAD_RIBBON_TAB=simulation` and `=pcb` fall back to the Features tab because those tabs are gated on `st.showSimulationTools` / `st.showPcbTools`, which the plain `ribbon` shot doesn't enable. The default tab bar shows 9 tabs (Features, Sketch, Evaluate, Assembly, Sheet Metal, Weldments, Surfaces, Appearance, Manufacture). The Simulation tab DOES render correctly in the `fea` scenario (`final_fea_dark.png`), confirming it's contextual-by-design, not missing.
+### NEW-5 · Contextual ribbon tabs (Simulation, PCB) not capturable via `CHUDWARE_SHOT=ribbon` alias · n/a · **note (residual, not a product defect)** · **new**
+- **What:** `CHUDWARE_RIBBON_TAB=simulation` and `=pcb` fall back to the Features tab because those tabs are gated on `st.showSimulationTools` / `st.showPcbTools`, which the plain `ribbon` shot doesn't enable. The default tab bar shows 9 tabs (Features, Sketch, Evaluate, Assembly, Sheet Metal, Weldments, Surfaces, Appearance, Manufacture). The Simulation tab DOES render correctly in the `fea` scenario (`final_fea_dark.png`), confirming it's contextual-by-design, not missing.
 - **Screenshots:** `ribbon_pcb_dark.png` (shows Features active), `crop_tabbar_dark.png` (9-tab bar), `final_fea_dark.png` (Simulation tab present with context).
 - **Impact:** Simulation and PCB ribbon *icons* were NOT round-2-verified this pass (Simulation partially visible in fea; PCB not at all). RESIDUAL — capture needs the feature-flag context.
 
@@ -105,7 +105,7 @@ UNVERIFIABLE (2, blocked by NEW-3 toast — no toast-free capture exists): `weld
 **NEW findings (round 2):**
 - NEW-1 (ugly, verify-live): Extrude in-viewport Depth/Draft dim chips bleed behind the Copilot column — but seen only in the profile-less pmform harness; may be a harness artifact. Needs a live extrude to confirm.
 - NEW-2 (nit, design call): `sketch_new` deliberately icon-only vs Erik's round-1 label request.
-- NEW-3 (nit/capture): ShopCraft info toast pinned over ribbon top-left; occludes leftmost groups; renders white-in-dark.
+- NEW-3 (nit/capture): Chudware info toast pinned over ribbon top-left; occludes leftmost groups; renders white-in-dark.
 - NEW-4 (nit): Mass Properties Material/Density empty pills.
 - NEW-5 (note/residual): Simulation + PCB ribbon tabs are contextual — not capturable via the plain ribbon alias; not verified this pass (Simulation confirmed present in the fea scenario).
 
@@ -114,7 +114,7 @@ UNVERIFIABLE (2, blocked by NEW-3 toast — no toast-free capture exists): `weld
 
 **KNOWN issues seen but NOT re-filed (per instructions):** surf_ruled/surf_thicken/surf_fill duplicate icons (T-G15/T-BL28 in flight); surf_revolve axis well + ruled/fill/boundary edge-well wiring (T-BL28); replace_face heal (T-BL27).
 
-**Convergence:** NOT YET converged, but close — zero blockers, zero regressions. Open items are 1 design call (sketch_new icon-only, Erik decides), 1 ugly-but-harness-caveated item needing a live extrude (NEW-1), and 3 nits. A short round-3 should confirm: (a) Erik's sketch_new decision, (b) NEW-1 in a real edit, (c) the 2 toast-occluded icons (weld_gusset, aluminum/steel) with the ShopCraft toast suppressed. None of these is a hard must-fix blocker on its own; the largest round-1 batches (dark mode, ribbon glass, OK/Cancel, FM, Copilot chrome, icons) all verified PASS.
+**Convergence:** NOT YET converged, but close — zero blockers, zero regressions. Open items are 1 design call (sketch_new icon-only, Erik decides), 1 ugly-but-harness-caveated item needing a live extrude (NEW-1), and 3 nits. A short round-3 should confirm: (a) Erik's sketch_new decision, (b) NEW-1 in a real edit, (c) the 2 toast-occluded icons (weld_gusset, aluminum/steel) with the Chudware toast suppressed. None of these is a hard must-fix blocker on its own; the largest round-1 batches (dark mode, ribbon glass, OK/Cancel, FM, Copilot chrome, icons) all verified PASS.
 
 ## Checks that still genuinely need a human / live session
 1. All 4 T-G2 NEEDS-LIVE: doc-tab +/x click, Copilot collapse-to-pill round trip, viewport-toolbar clamp on live pan, Extrude End-Condition dropdown-open readability.

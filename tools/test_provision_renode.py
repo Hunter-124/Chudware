@@ -27,7 +27,7 @@ def clean_path(monkeypatch, tmp_path):
     monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
     monkeypatch.setenv("APPDATA", str(tmp_path / "roaming"))
-    monkeypatch.delenv("AICAD_RENODE", raising=False)
+    monkeypatch.delenv("CHUDWARE_RENODE", raising=False)
     monkeypatch.delenv("RENODE_ROOT", raising=False)
     # Empty PATH so shutil.which cannot find a real renode.
     monkeypatch.setenv("PATH", str(tmp_path / "empty_bin"))
@@ -38,7 +38,7 @@ def clean_path(monkeypatch, tmp_path):
         pr, "_KNOWN_ROOTS_POSIX",
         (
             Path(tmp_path / "home") / ".local" / "opt" / "renode",
-            Path(tmp_path / "home") / ".local" / "share" / "AI-CAD" / "renode",
+            Path(tmp_path / "home") / ".local" / "share" / "Chudware" / "renode",
         ),
     )
     monkeypatch.setattr(
@@ -98,7 +98,7 @@ def test_status_present_via_env_root(clean_path, monkeypatch):
     binary = root / ("renode.exe" if os.name == "nt" else "renode")
     binary.write_text("x", encoding="utf-8")
     binary.chmod(0o755)
-    monkeypatch.setenv("AICAD_RENODE", str(root))
+    monkeypatch.setenv("CHUDWARE_RENODE", str(root))
     monkeypatch.setattr(pr, "probe_version", lambda _b: "Renode v1.0-env")
 
     t0 = time.perf_counter()

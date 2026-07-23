@@ -42,7 +42,7 @@ using json = nlohmann::json;
 // that every registry name appears in suggest_doc_ops for a near miss.
 
 TEST_CASE("doc_op_kinds is non-empty and contains the core modeling ops") {
-    auto kinds = aicad::doc::doc_op_kinds();
+    auto kinds = chudware::doc::doc_op_kinds();
     REQUIRE(kinds.size() >= 20);
     std::set<std::string> s(kinds.begin(), kinds.end());
     CHECK(s.count("add_feature") == 1);
@@ -54,7 +54,7 @@ TEST_CASE("doc_op_kinds is non-empty and contains the core modeling ops") {
 }
 
 TEST_CASE("feature_type_names includes primitives and solids") {
-    auto ft = aicad::doc::feature_type_names();
+    auto ft = chudware::doc::feature_type_names();
     REQUIRE(ft.size() >= 10);
     std::set<std::string> s(ft.begin(), ft.end());
     CHECK(s.count("box") == 1);
@@ -65,7 +65,7 @@ TEST_CASE("feature_type_names includes primitives and solids") {
 }
 
 TEST_CASE("unknown doc op error lists closest + cad_guide") {
-    const std::string msg = aicad::doc::unknown_doc_op_message(0, "sketch_add_entty");
+    const std::string msg = chudware::doc::unknown_doc_op_message(0, "sketch_add_entty");
     CHECK(msg.find("unknown op 'sketch_add_entty'") != std::string::npos);
     CHECK(msg.find("closest:") != std::string::npos);
     CHECK(msg.find("see cad_guide()") != std::string::npos);
@@ -74,18 +74,18 @@ TEST_CASE("unknown doc op error lists closest + cad_guide") {
 }
 
 TEST_CASE("feature type used as op points at add_feature envelope") {
-    const std::string msg = aicad::doc::unknown_doc_op_message(0, "box");
+    const std::string msg = chudware::doc::unknown_doc_op_message(0, "box");
     CHECK(msg.find("unknown op 'box'") != std::string::npos);
     CHECK(msg.find("feature TYPE") != std::string::npos);
     CHECK(msg.find("add_feature") != std::string::npos);
     CHECK(msg.find("see cad_guide()") != std::string::npos);
-    auto sug = aicad::doc::suggest_doc_ops("box", 5);
+    auto sug = chudware::doc::suggest_doc_ops("box", 5);
     REQUIRE(!sug.empty());
     CHECK(sug.front() == "add_feature");
 }
 
 TEST_CASE("suggest_doc_ops prefers sketch_ family for sketch_create") {
-    auto sug = aicad::doc::suggest_doc_ops("sketch_create", 5);
+    auto sug = chudware::doc::suggest_doc_ops("sketch_create", 5);
     REQUIRE(sug.size() >= 3);
     // All top suggestions should be sketch_* or add_feature (feature-type boost).
     int sketchish = 0;
@@ -96,8 +96,8 @@ TEST_CASE("suggest_doc_ops prefers sketch_ family for sketch_create") {
 }
 
 TEST_CASE("doc_apply_ops rejects invented op with rich error envelope") {
-    using aicad::doc::doc_new;
-    using aicad::doc::doc_apply_ops;
+    using chudware::doc::doc_new;
+    using chudware::doc::doc_apply_ops;
     json nr = doc_new("part", "OpVocabTest");
     const std::string id = nr.at("doc_id").get<std::string>();
     json ops = json::array({json{{"op", "cylinder"}}});
@@ -106,7 +106,7 @@ TEST_CASE("doc_apply_ops rejects invented op with rich error envelope") {
     json detail;
     try {
         doc_apply_ops(id, -1, ops, false);
-    } catch (const aicad::doc::OpError& e) {
+    } catch (const chudware::doc::OpError& e) {
         threw = true;
         msg = e.what();
         detail = e.detail;
@@ -121,7 +121,7 @@ TEST_CASE("doc_apply_ops rejects invented op with rich error envelope") {
 }
 
 TEST_CASE("ecad_op_kinds covers sch_ and pcb_ families") {
-    auto kinds = aicad::ecad::ecad_op_kinds();
+    auto kinds = chudware::ecad::ecad_op_kinds();
     REQUIRE(kinds.size() >= 20);
     std::set<std::string> s(kinds.begin(), kinds.end());
     CHECK(s.count("sch_add_symbol") == 1);
@@ -131,7 +131,7 @@ TEST_CASE("ecad_op_kinds covers sch_ and pcb_ families") {
 }
 
 TEST_CASE("unknown ecad op error lists closest + cad_guide") {
-    const std::string msg = aicad::ecad::unknown_ecad_op_message(0, "sch_add_symbl");
+    const std::string msg = chudware::ecad::unknown_ecad_op_message(0, "sch_add_symbl");
     CHECK(msg.find("unknown op 'sch_add_symbl'") != std::string::npos);
     CHECK(msg.find("closest:") != std::string::npos);
     CHECK(msg.find("sch_add_symbol") != std::string::npos);
@@ -139,13 +139,13 @@ TEST_CASE("unknown ecad op error lists closest + cad_guide") {
 }
 
 TEST_CASE("ecad apply_ops rejects invented op with suggestions") {
-    json doc = aicad::ecad::schema::new_schematic("OpVocabSch");
+    json doc = chudware::ecad::schema::new_schematic("OpVocabSch");
     json ops = json::array({json{{"op", "add_resistor"}}});
     bool threw = false;
     std::string msg;
     try {
-        aicad::ecad::apply_ops(doc, ops);
-    } catch (const aicad::ecad::OpError& e) {
+        chudware::ecad::apply_ops(doc, ops);
+    } catch (const chudware::ecad::OpError& e) {
         threw = true;
         msg = e.what();
         CHECK(e.detail.contains("suggestions"));
@@ -157,7 +157,7 @@ TEST_CASE("ecad apply_ops rejects invented op with suggestions") {
 }
 
 TEST_CASE("cheatsheet snippet mentions add_feature and box") {
-    const std::string s = aicad::doc::doc_ops_cheatsheet_snippet();
+    const std::string s = chudware::doc::doc_ops_cheatsheet_snippet();
     CHECK(s.find("add_feature") != std::string::npos);
     CHECK(s.find("box") != std::string::npos);
     CHECK(s.find("cad_guide()") != std::string::npos);

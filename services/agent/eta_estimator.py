@@ -1,4 +1,4 @@
-"""ETA estimator for AI-CAD missions — T-DP18.
+"""ETA estimator for Chudware missions — T-DP18.
 
 Live ETA-to-part-complete:
 

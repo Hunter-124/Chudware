@@ -5,7 +5,7 @@
 #include <array>
 #include <cctype>
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 
 namespace {
@@ -248,4 +248,4 @@ const char *structure_label(ExecStructure s) {
 }
 
 } // namespace agent
-} // namespace aicad
+} // namespace chudware

@@ -19,7 +19,7 @@
 
 #include <cstdint>
 
-namespace aicad::sim {
+namespace chudware::sim {
 
 // A 128-bit unsigned integer with just the wrap-around mul/add PCG64 needs. We do NOT rely
 // on a compiler __int128 (MSVC lacks it) — this portable struct gives identical results.
@@ -48,4 +48,4 @@ private:
     void pcg_step();
 };
 
-}  // namespace aicad::sim
+}  // namespace chudware::sim

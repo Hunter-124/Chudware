@@ -47,7 +47,7 @@ _GUIDED_PAGE_TEMPLATE = """\
 <!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>AI-CAD Photo Capture</title>
+<title>Chudware Photo Capture</title>
 <style>
   body {{ font-family: sans-serif; max-width: 480px; margin: 0 auto; padding: 1em; }}
   h2 {{ color: #333; }}
@@ -60,7 +60,7 @@ _GUIDED_PAGE_TEMPLATE = """\
 </style>
 </head>
 <body>
-<h2>AI-CAD Photo Capture</h2>
+<h2>Chudware Photo Capture</h2>
 <p>Upload photos for each angle. After all shots, close this page.</p>
 <p>Received: <strong>{received_count}</strong> / {total_count}</p>
 <ul>
@@ -257,7 +257,7 @@ def start_session(port: int = 8742, token: Optional[str] = None) -> CaptureSessi
     """
     if token is None:
         token = secrets.token_urlsafe(16)
-    work_dir = tempfile.mkdtemp(prefix="aicad_capture_")   # persists past stop_session
+    work_dir = tempfile.mkdtemp(prefix="chudware_capture_")   # persists past stop_session
     session = CaptureSession(
         port=port,
         token=token,
@@ -268,7 +268,7 @@ def start_session(port: int = 8742, token: Optional[str] = None) -> CaptureSessi
     server = HTTPServer(("0.0.0.0", port), handler_class)
     session.port = server.server_address[1]                # resolves port=0 -> real port
     session._server = server
-    t = threading.Thread(target=server.serve_forever, name=f"aicad-capture-{port}", daemon=True)
+    t = threading.Thread(target=server.serve_forever, name=f"chudware-capture-{port}", daemon=True)
     t.start()
     session._thread = t
     return session

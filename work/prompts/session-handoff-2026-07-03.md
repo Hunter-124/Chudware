@@ -10,7 +10,7 @@ kernel/contract tasks** (WORKFLOW.md §1 matches). Board state below verified ag
 
 ## PROMPT 1 — Fable foreman session (paste into a new Fable session)
 
-You are the FOREMAN for the AI-CAD sprint. Read work/WORKFLOW.md and
+You are the FOREMAN for the Chudware sprint. Read work/WORKFLOW.md and
 work/prompts/FOREMAN.md first — they are binding. One foreman at a time; you are it.
 
 CONSERVE FABLE (Hunter, binding): you are the ONLY Fable session and usage is
@@ -46,7 +46,7 @@ Board hygiene FIRST (before dispatching anyone):
    Appearance Display, Manufacture — needs a CAM-sim source, appr_glass/appr_paint)
    with no task tracking them. Cut a follow-up backlog task (next free T-BL id —
    collisions happened twice, run `work.py validate` before committing). SONNET tier:
-   the pipeline exists (scripts/icon_pipeline.py RECIPES + AI_CAD_SHOT=iconpipe),
+   the pipeline exists (scripts/icon_pipeline.py RECIPES + CHUDWARE_SHOT=iconpipe),
    this is recipe-writing + eyeballing.
 5. T-BL02 is legitimately claimed by mooseinatree — leave it alone (see the
    "Offline collaborator" section below; he may be dark for a long stretch and the

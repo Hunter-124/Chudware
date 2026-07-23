@@ -12,7 +12,7 @@
 
 #include "sim/lbm.h"
 
-#ifdef AICAD_WITH_CUDA
+#ifdef CHUDWARE_WITH_CUDA
 #include "sim/lbm_cuda.h"
 #endif
 
@@ -27,11 +27,11 @@
 #include <cstdint>
 #include <cstdlib>
 #include <thread>
-#ifdef AICAD_HAVE_OPENMP
+#ifdef CHUDWARE_HAVE_OPENMP
 #include <omp.h>
 #endif
 
-namespace aicad::sim {
+namespace chudware::sim {
 
 namespace {
 
@@ -160,16 +160,16 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
         return R;
     }
 
-    // Backend select: params.backend, else AI_CAD_LBM_BACKEND, else "auto".
+    // Backend select: params.backend, else CHUDWARE_LBM_BACKEND, else "auto".
     // "cuda" / "auto" may pick CUDA when built+available; always fall back to CPU.
     std::string want = p.backend;
     if (want.empty()) {
-        if (const char* e = std::getenv("AI_CAD_LBM_BACKEND")) want = e;
+        if (const char* e = std::getenv("CHUDWARE_LBM_BACKEND")) want = e;
         else want = "auto";
     }
     for (char& c : want) if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
     R.backend = "cpu";
-#ifdef AICAD_WITH_CUDA
+#ifdef CHUDWARE_WITH_CUDA
     const bool try_cuda = (want == "cuda" || want == "auto");
     if (try_cuda) {
         if (!lbm_cuda_device_available()) {
@@ -200,13 +200,13 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
     }
 #else
     if (want == "cuda") {
-        R.backend_fallback = "CUDA not built into this libaicad (AICAD_WITH_CUDA=OFF)";
+        R.backend_fallback = "CUDA not built into this libchudware (CHUDWARE_WITH_CUDA=OFF)";
     }
 #endif
 
     // Per-phase record (prof/phases.h): init / loop (+ accumulated convergence sampling)
     // / output. Opened after arg validation so trivially-rejected calls don't pollute it.
-    aicad::prof::phases::StudyScope _study("lbm");
+    chudware::prof::phases::StudyScope _study("lbm");
     const auto t_init0 = std::chrono::steady_clock::now();
 
     // Stride along q for the (Nx,Ny,Nz,19) C-order layout.
@@ -229,26 +229,26 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
 
     // P3/F3: worker threads for the per-step lattice loops. Budget comes from the
     // shared governor + pool so nested solves cannot oversubscribe; tiny lattices
-    // stay serial (spawn overhead > work). AI_CAD_LBM_THREADS overrides for
+    // stay serial (spawn overhead > work). CHUDWARE_LBM_THREADS overrides for
     // benchmarking. Every parallel loop below writes DISJOINT indices and computes
     // each cell with the exact serial arithmetic, so results stay bit-identical to
     // the oracle parity gate.
     const int lbm_threads = [&]() -> int {
-#ifndef AICAD_HAVE_OPENMP
+#ifndef CHUDWARE_HAVE_OPENMP
         return 1;
 #else
         if (ncell < 64 * 1024) return 1;
-        if (const char* e = std::getenv("AI_CAD_LBM_THREADS")) {
+        if (const char* e = std::getenv("CHUDWARE_LBM_THREADS")) {
             const int n = std::atoi(e);
             if (n >= 1) return n;
         }
         // Estimate lattice peak (~256 B/cell: f+scratch+macros) so plan_for can
         // grade under memory pressure; ample RAM keeps full allotted cores.
         const uint64_t est = static_cast<uint64_t>(ncell) * 256ull;
-        const auto plan = aicad::governor::plan_for(est, "lbm", 0);
+        const auto plan = chudware::governor::plan_for(est, "lbm", 0);
         const int n = std::max(1, std::min(plan.workers, 8));
         // Align shared pool with this op's budget (nested solves share one cap).
-        aicad::pool::shared().set_max_workers(n);
+        chudware::pool::shared().set_max_workers(n);
         return n;
 #endif
     }();
@@ -311,7 +311,7 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
     // P3: pure gather — every (q,x,y,z) writes its own slot in G from a snapshot F, so
     // the (q,x) collapse parallelizes with zero interaction (bit-identical copies).
     auto stream = [&](const std::vector<float>& F, std::vector<float>& G) {
-#if defined(AICAD_HAVE_OPENMP)
+#if defined(CHUDWARE_HAVE_OPENMP)
 #pragma omp parallel for collapse(2) schedule(static) num_threads(lbm_threads) \
     if (lbm_threads > 1)
 #endif
@@ -445,7 +445,7 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
     const int sample_every = std::max(1, n_steps / 50);
 
     const auto t_loop0 = std::chrono::steady_clock::now();
-    aicad::prof::phases::add("init", std::chrono::duration<double, std::milli>(
+    chudware::prof::phases::add("init", std::chrono::duration<double, std::milli>(
                                          t_loop0 - t_init0).count());
     double convergence_ms = 0.0;  // accumulated checkpoint-sampling time inside the loop
 
@@ -459,7 +459,7 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
         // (pairwise sums, float32 expression order) is exactly the old sequence, so the
         // lattice walk stays bit-identical to the oracle; cells write disjoint slots, so
         // the OpenMP split changes nothing.
-#if defined(AICAD_HAVE_OPENMP)
+#if defined(CHUDWARE_HAVE_OPENMP)
 #pragma omp parallel for schedule(static) num_threads(lbm_threads) if (lbm_threads > 1)
 #endif
         for (std::int64_t ci = 0; ci < static_cast<std::int64_t>(ncell); ++ci) {
@@ -581,7 +581,7 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
             const int q = lk.q;
             const int oq = OPP[q];
             const std::int64_t n_lk = static_cast<std::int64_t>(lk.cells.size());
-#if defined(AICAD_HAVE_OPENMP)
+#if defined(CHUDWARE_HAVE_OPENMP)
 #pragma omp parallel for schedule(static) num_threads(lbm_threads) \
     if (lbm_threads > 1 && n_lk > 4096)
 #endif
@@ -592,7 +592,7 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
         // Zero solid cells (precomputed list — O(solid), not O(ncell)).
         {
             const std::int64_t n_sc = static_cast<std::int64_t>(solid_cells.size());
-#if defined(AICAD_HAVE_OPENMP)
+#if defined(CHUDWARE_HAVE_OPENMP)
 #pragma omp parallel for schedule(static) num_threads(lbm_threads) \
     if (lbm_threads > 1 && n_sc > 4096)
 #endif
@@ -626,8 +626,8 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
             // itself was admitted up-front, so this means some other process is eating
             // RAM. Stop gracefully at this checkpoint instead of letting the OS swap or
             // OOM-kill the app. Never trips in the parity gate (fixed small grids, and
-            // AICAD_GOVERNOR=0 disables outright).
-            if (aicad::governor::low_memory_now()) {
+            // CHUDWARE_GOVERNOR=0 disables outright).
+            if (chudware::governor::low_memory_now()) {
                 R.ok = false;
                 R.error = "CFD run stopped at step " + std::to_string(step) +
                           ": host memory critically low (governor) — close other "
@@ -637,13 +637,13 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
         }
     }
     step = n_steps;  // loop exits with step == n_steps+1; oracle's `step` is last value
-    aicad::prof::phases::add("loop", std::chrono::duration<double, std::milli>(
+    chudware::prof::phases::add("loop", std::chrono::duration<double, std::milli>(
                                          std::chrono::steady_clock::now() - t_loop0).count(),
                              static_cast<unsigned long long>(n_steps > 0 ? n_steps : 0));
-    aicad::prof::phases::add("convergence", convergence_ms,
+    chudware::prof::phases::add("convergence", convergence_ms,
                              static_cast<unsigned long long>(drag_hist.size()));
     // Post-processing to function exit ("output"): final macros + drag/Cd + residual.
-    aicad::prof::phases::PhaseScope _p_output("output");
+    chudware::prof::phases::PhaseScope _p_output("output");
 
     // ---- Post-processing: final macros + drag/Cd --------------------------------
     macros(f);
@@ -719,11 +719,11 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
 }
 
 bool lbm_cuda_available() {
-#ifdef AICAD_WITH_CUDA
+#ifdef CHUDWARE_WITH_CUDA
     return lbm_cuda_device_available();
 #else
     return false;
 #endif
 }
 
-}  // namespace aicad::sim
+}  // namespace chudware::sim

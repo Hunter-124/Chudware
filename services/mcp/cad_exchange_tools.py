@@ -96,7 +96,7 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
 
         SOLIDWORKS (.sldprt): with `resolve_features=True` (default) and no `into`, the part is
         opened by RECONSTRUCTING its SolidWorks feature tree (sketches with relations, reference
-        planes, extrude/cut/revolve/loft, …) into a fully EDITABLE AI-CAD part — not a frozen
+        planes, extrude/cut/revolve/loft, …) into a fully EDITABLE Chudware part — not a frozen
         body. This needs SolidWorks installed locally (driven via its COM API). If any feature
         can't be faithfully rebuilt the import is REFUSED with the exact list of what blocked it
         (so the gap can be fixed) — it does NOT silently fall back to a dumb solid. Set
@@ -147,7 +147,7 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
                                        "degraded": plan["degraded"]})
                     # Component .step+ sidecars live in a cache dir (NOT the user's source folder);
                     # the assembly references them, so they must persist for the session.
-                    sidecar = os.path.join(tempfile.gettempdir(), "aicad_sw_components",
+                    sidecar = os.path.join(tempfile.gettempdir(), "chudware_sw_components",
                                            plan["name"])
                     os.makedirs(sidecar, exist_ok=True)
                     built: dict = {}   # part_key -> .step+ path

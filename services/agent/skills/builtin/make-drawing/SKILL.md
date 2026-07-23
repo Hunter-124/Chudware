@@ -10,7 +10,7 @@ triggers:
 
 # Make Drawing
 
-How to produce a manufacturing 2D drawing from a part in Billet. Views first, measured dims only, finish with title block and export.
+How to produce a manufacturing 2D drawing from a part in Chudware. Views first, measured dims only, finish with title block and export.
 
 ## Sequence
 

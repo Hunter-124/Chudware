@@ -35,7 +35,7 @@ Manager and are **auto-hidden** in the viewport until the user clicks the eye ic
       Ghost becomes visible in viewport. Implemented in both ui/imgui and host feature_tree.
 - [x] Screenshots light+dark: feature with absorbed sketch nested under Boss-Extrude1,
       scratch/bl42_shots/sketch_{dark,light}.png + scratch/sketch_shots/. Eyeballed OK.
-- [x] Real-flow verify: `--extrudetest` ok=1 features=2 rev=1 OK. `AI_CAD_SHOT=sketch`
+- [x] Real-flow verify: `--extrudetest` ok=1 features=2 rev=1 OK. `CHUDWARE_SHOT=sketch`
       scenario: new sketch → rect → exit → extrude region depth 10 ok=1 → "scenario
       complete". Tree shows Boss-Extrude1 with Sketch1 nested underneath (both modes).
 - [x] flock GUI build: 296 targets, binary AI-CAD2 built clean. scripts/check.py: all 4
@@ -57,4 +57,4 @@ Manager and are **auto-hidden** in the viewport until the user clicks the eye ic
 - Related: T-BL37 (origin ref), T-BL41 (sketch dim auto-hide), T-BL43 (external refs).
 
 ## Progress log
-- 2026-07-04 17:00 UTC [sonnet-gorm] Core nesting was already shipped in master (C37/C48/C48b). This branch adds the remaining DoD gap: eye-toggle un-hide on absorbed sketch now selects+highlights it (tree selection card + selectFeatureInViewport). Both ui/imgui and host feature_tree.cpp patched identically. Verified: AI_CAD_SHOT=sketch scenario completes with Boss-Extrude1/Sketch1 nesting in dark+light mode screenshots; extrudetest OK. Branch: task/T-BL42-feature-sketch-absorption. Shared-sketch placement decision: nests under first (only) consumer; stays flat when shared by 2+ features or when consumer is rolled-back/errored.
+- 2026-07-04 17:00 UTC [sonnet-gorm] Core nesting was already shipped in master (C37/C48/C48b). This branch adds the remaining DoD gap: eye-toggle un-hide on absorbed sketch now selects+highlights it (tree selection card + selectFeatureInViewport). Both ui/imgui and host feature_tree.cpp patched identically. Verified: CHUDWARE_SHOT=sketch scenario completes with Boss-Extrude1/Sketch1 nesting in dark+light mode screenshots; extrudetest OK. Branch: task/T-BL42-feature-sketch-absorption. Shared-sketch placement decision: nests under first (only) consumer; stays flat when shared by 2+ features or when consumer is rolled-back/errored.

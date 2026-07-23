@@ -549,18 +549,18 @@ _PACK_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_\-]{0,63}$")
 
 
 def user_context_dir() -> pathlib.Path:
-    """``~/.local/share/AI-CAD/context_injection`` (Windows: %APPDATA%/AI-CAD/...).
+    """``~/.local/share/Chudware/context_injection`` (Windows: %APPDATA%/Chudware/...).
 
-    Override with ``AICAD_CONTEXT_INJECTION_DIR`` (tests).
+    Override with ``CHUDWARE_CONTEXT_INJECTION_DIR`` (tests).
     """
-    override = os.environ.get("AICAD_CONTEXT_INJECTION_DIR")
+    override = os.environ.get("CHUDWARE_CONTEXT_INJECTION_DIR")
     if override:
         return pathlib.Path(override)
     if sys.platform.startswith("win"):
         base = os.environ.get("APPDATA") or os.path.expanduser(r"~\AppData\Roaming")
     else:
         base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
-    return pathlib.Path(base) / "AI-CAD" / "context_injection"
+    return pathlib.Path(base) / "Chudware" / "context_injection"
 
 
 def user_triggers_path() -> pathlib.Path:
@@ -799,7 +799,7 @@ def load_table() -> list[dict]:
     """Compile the trigger table and cache it.
 
     Runtime source: shipped ``triggers.yaml`` / builtin mirror, merged with
-    user overrides from ``~/.local/share/AI-CAD/context_injection/triggers.json``.
+    user overrides from ``~/.local/share/Chudware/context_injection/triggers.json``.
     Disabled triggers are compiled but skipped by :func:`match_triggers`.
 
     Each entry is compiled into a matcher-ready form with pre-compiled

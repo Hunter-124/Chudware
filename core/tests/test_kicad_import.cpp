@@ -1,7 +1,7 @@
 // T-RF17 — KiCad importers (ecad/kicad.cpp) + the ecad_open extension dispatch.
 // Mirrors engine/ecad/test_formats.py tests 3-6 (import_kicad_sch /
 // import_kicad_pcb / file-based import / open dispatch) against the same inline
-// fixtures. Pure JSON, OCCT-free; links aicad_ecad only.
+// fixtures. Pure JSON, OCCT-free; links chudware_ecad only.
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "ecad/kicad.h"
 #include "ecad/schema.h"
@@ -124,10 +124,10 @@ std::string write_temp(const std::string& name, const std::string& text) {
 }  // namespace
 
 TEST_CASE("kicad: import_kicad_sch (inline text)") {
-    const json doc = aicad::ecad::kicad::import_kicad_sch(kMinimalSch);
+    const json doc = chudware::ecad::kicad::import_kicad_sch(kMinimalSch);
 
     CHECK(doc.value("schema", std::string()) == "aicad.sch/1");
-    const auto errs = aicad::ecad::schema::validate_schematic(doc);
+    const auto errs = chudware::ecad::schema::validate_schematic(doc);
     CHECK(errs.empty());
 
     // 2 placed symbols (R1, C1)
@@ -167,10 +167,10 @@ TEST_CASE("kicad: import_kicad_sch (inline text)") {
 }
 
 TEST_CASE("kicad: import_kicad_pcb (inline text)") {
-    const json doc = aicad::ecad::kicad::import_kicad_pcb(kMinimalPcb);
+    const json doc = chudware::ecad::kicad::import_kicad_pcb(kMinimalPcb);
 
     CHECK(doc.value("schema", std::string()) == "aicad.pcb/1");
-    const auto errs = aicad::ecad::schema::validate_board(doc);
+    const auto errs = chudware::ecad::schema::validate_board(doc);
     CHECK(errs.empty());
 
     // 2 footprints (R1, R2), 2 pads each
@@ -207,8 +207,8 @@ TEST_CASE("kicad: import_kicad_pcb (inline text)") {
 
 TEST_CASE("kicad: import from file (name stems from path)") {
     const std::string sch_path = write_temp("r4c_test.kicad_sch", kMinimalSch);
-    const json doc = aicad::ecad::kicad::import_kicad_sch(sch_path);
-    const auto errs = aicad::ecad::schema::validate_schematic(doc);
+    const json doc = chudware::ecad::kicad::import_kicad_sch(sch_path);
+    const auto errs = chudware::ecad::schema::validate_schematic(doc);
     CHECK(errs.empty());
     CHECK(doc.value("name", std::string()) == "r4c_test");
     std::remove(sch_path.c_str());
@@ -216,26 +216,26 @@ TEST_CASE("kicad: import from file (name stems from path)") {
 
 TEST_CASE("kicad: ecad_open dispatches .kicad_sch/.kicad_pcb to the importers") {
     const std::string sch_path = write_temp("r4c_open.kicad_sch", kMinimalSch);
-    const json resp = aicad::ecad::ecad_open(sch_path);
+    const json resp = chudware::ecad::ecad_open(sch_path);
     CHECK(resp.contains("doc_id"));
     CHECK(resp.contains("warnings"));
     CHECK(resp.value("kind", std::string()) == "sch");
-    CHECK(aicad::ecad::ecad_close(resp.value("doc_id", std::string())));
+    CHECK(chudware::ecad::ecad_close(resp.value("doc_id", std::string())));
     std::remove(sch_path.c_str());
 
     const std::string pcb_path = write_temp("r4c_open.kicad_pcb", kMinimalPcb);
-    const json resp2 = aicad::ecad::ecad_open(pcb_path);
+    const json resp2 = chudware::ecad::ecad_open(pcb_path);
     CHECK(resp2.value("kind", std::string()) == "pcb");
-    CHECK(aicad::ecad::ecad_close(resp2.value("doc_id", std::string())));
+    CHECK(chudware::ecad::ecad_close(resp2.value("doc_id", std::string())));
     std::remove(pcb_path.c_str());
 }
 
 TEST_CASE("kicad: ecad_open import failure mirrors the oracle's io_error envelope") {
     const std::string bad_path = write_temp("r4c_bad.kicad_sch", "(not_a_schematic 1 2 3)");
     try {
-        (void)aicad::ecad::ecad_open(bad_path);
+        (void)chudware::ecad::ecad_open(bad_path);
         FAIL("expected OpError");
-    } catch (const aicad::ecad::OpError& oe) {
+    } catch (const chudware::ecad::OpError& oe) {
         CHECK(oe.envelope().value("code", std::string()) == "io_error");
         const std::string msg = oe.envelope().value("message", std::string());
         CHECK(msg.find("import_kicad_sch failed for '") == 0);
@@ -245,9 +245,9 @@ TEST_CASE("kicad: ecad_open import failure mirrors the oracle's io_error envelop
 }
 
 TEST_CASE("kicad: sexpr parser error shapes (sexpr.py)") {
-    CHECK_THROWS_WITH(aicad::ecad::kicad::sexpr_parse(""), "Empty input");
-    CHECK_THROWS_WITH(aicad::ecad::kicad::sexpr_parse("(a b"),
+    CHECK_THROWS_WITH(chudware::ecad::kicad::sexpr_parse(""), "Empty input");
+    CHECK_THROWS_WITH(chudware::ecad::kicad::sexpr_parse("(a b"),
                       "Unexpected end of input: unmatched '('");
-    CHECK_THROWS_WITH(aicad::ecad::kicad::sexpr_parse("(a) (b)"),
+    CHECK_THROWS_WITH(chudware::ecad::kicad::sexpr_parse("(a) (b)"),
                       "Trailing content at token 3: '('");
 }

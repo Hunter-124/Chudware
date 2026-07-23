@@ -3,7 +3,7 @@
 
 #include <algorithm>
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 
 namespace {
@@ -116,4 +116,4 @@ std::vector<Bid> collect_bids(const std::string& request, Complexity cx, Domain 
 }
 
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware

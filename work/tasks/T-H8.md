@@ -84,20 +84,20 @@ shape) and scores `check_sketch` **through the T-H4 battery on a live doc**. Liv
 spec_sketch/CAM/VLM are guarded skip-if-no-core (gate stage 6, env-gated like OCCT), never
 hardcode a `.so` path.
 
-**Tests:** 63 passing under `~/.local/share/AI-CAD/mcp-venv/bin/pytest tools/flywheel/bench/`
+**Tests:** 63 passing under `~/.local/share/Chudware/mcp-venv/bin/pytest tools/flywheel/bench/`
 (metrics 7, dataset 5, regen_fix 5, elicitation 12, spec_sketch 10, cam 9, vlm 15).
 
 **No new dependencies** (stdlib + in-repo engine/battery) → no `contracts/licenses.md` row.
 `services/mcp/server.py` unchanged beyond the append-only H3+H4 merge.
 
-**Gate result** (`AICAD_RUN_BENCH=1 bash scripts/gate.sh`) — all T-H8-added stages GREEN;
+**Gate result** (`CHUDWARE_RUN_BENCH=1 bash scripts/gate.sh`) — all T-H8-added stages GREEN;
 overall FAIL is two pre-existing base reds this task did not introduce:
 - `check.py` FAIL-RECORDED — pre-existing, non-fatal (docs/REFACTOR_LOG.md).
-- **core build PASS** (libaicad OCCT ON) · **ctest PASS 100%** · **ui/abstract PASS** ·
+- **core build PASS** (libchudware OCCT ON) · **ctest PASS 100%** · **ui/abstract PASS** ·
   **bench (T-H8) PASS** (all 5 smoke benches ran, both baseline rows each).
 - `pytest` FAIL — the known venv/marker skip: `107 deselected, 0 collected` (gate's
   `engine/doc agent` selection collects nothing on this runtime). T-H8's own suite is 63
-  passing via `~/.local/share/AI-CAD/mcp-venv/bin/pytest tools/flywheel/bench/`.
+  passing via `~/.local/share/Chudware/mcp-venv/bin/pytest tools/flywheel/bench/`.
 - `ui/imgui` FAIL — pre-existing selMulti/panel_spec break: `property_manager.cpp` expects
   post-`b569020` `PanelField` members (`key`/`comboOptions`/`SelectorKinds`); this branch's
   base (origin/task/T-H3) predates `b569020`, exactly as flagged at dispatch. No C++/UI code

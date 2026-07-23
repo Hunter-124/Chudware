@@ -1,4 +1,4 @@
-// AI-CAD Copilot: ONE chat implementation, two host layouts.
+// Chudware Copilot: ONE chat implementation, two host layouts.
 //
 // The docked host is a PINNED, full-height, rounded liquid-glass column overlaid on the
 // viewport's right edge (~12dp margins; the only docked layout — no docked fallback). Slim
@@ -59,7 +59,7 @@ bool providerUsable(AppState& state, int provider);
 
 // ---- OMP bridge-backed model catalog + session cost (S-UI-PROV) -------------------
 // Static OMP catalog metadata (capabilities + cost) for bridge-routed providers, fetched via
-// the libaicad `agent_models_list` C-ABI (bridge `models_list`). Distinct from the live
+// the libchudware `agent_models_list` C-ABI (bridge `models_list`). Distinct from the live
 // agent_list_models probe above: that one asks a keyed endpoint what it can serve right now;
 // this is the static catalog the model picker uses for ctx/cost/capability sublabels and the
 // Providers-tab Models section. Degrades silently (empty catalog) when the bridge method is
@@ -110,7 +110,7 @@ int  loadMaxSubagentDepth();
 void saveMaxSubagentDepth(int depth);
 
 // Persist the active document's conversations (the active one synced from state.chat) to
-// %APPDATA%/AI-CAD/chat_history.json. Safe to call any time; no-op if nothing to save.
+// %APPDATA%/Chudware/chat_history.json. Safe to call any time; no-op if nothing to save.
 void persistChatHistory(AppState& state);
 
 // Per-frame: if a chat-triggered accurate (OpenFOAM) CFD launched on the SimClient channel has

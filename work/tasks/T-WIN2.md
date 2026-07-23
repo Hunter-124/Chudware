@@ -22,11 +22,11 @@ code/notes first; do not start this task until T-W26 is merged).
 
 1. Read T-W26's merged local_runtime/model_manager + its Windows-seam notes.
 2. Windows binary path: pinned llama.cpp Windows release fetch + checksum, app-data
-   paths (%APPDATA%/AI-CAD), server lifecycle on Windows (process mgmt differences).
+   paths (%APPDATA%/Chudware), server lifecycle on Windows (process mgmt differences).
 3. Packaging skeleton: installer or portable-zip layout that carries the app, the
    runtime fetcher, and first-run provisioning; document signing as future work.
 4. Live smoke on your box: provision a model, run one bench turn against the
-   bundled server (tools/flywheel/bench/benches/roles_local.py, AI_CAD_LOCAL_ENDPOINT).
+   bundled server (tools/flywheel/bench/benches/roles_local.py, CHUDWARE_LOCAL_ENDPOINT).
 
 ## Definition of done
 

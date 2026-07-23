@@ -8,13 +8,13 @@
 //                      is the matching drag TARGET.
 //
 // kFileDragPayload is the ImGui payload-type string both sides agree on. ImGui requires it to be at
-// most 32 chars (incl. the null terminator); "AICAD_FILE" is 10.
+// most 32 chars (incl. the null terminator); "CHUDWARE_FILE" is 10.
 #pragma once
 
 namespace ui {
 
 // ImGui drag-drop payload type for an in-app file drag (Explorer row -> viewport). The payload data
 // is the dragged file's absolute path as a NUL-terminated char buffer (length includes the NUL).
-inline constexpr const char* kFileDragPayload = "AICAD_FILE";
+inline constexpr const char* kFileDragPayload = "CHUDWARE_FILE";
 
 }  // namespace ui

@@ -8,7 +8,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace aicad::doc {
+namespace chudware::doc {
 
 namespace {
 
@@ -216,4 +216,4 @@ std::string write_pdf(const std::string& path, const std::vector<PdfLine>& lines
     return std::filesystem::absolute(p).string();
 }
 
-}  // namespace aicad::doc
+}  // namespace chudware::doc

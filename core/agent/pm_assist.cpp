@@ -7,12 +7,12 @@
 
 #include "agent/ask.h"  // build_doc_context
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 
 const char* kPmAssistRole = "pm_assist";
 const char* kPmAssistSystem =
-    "You are AI-CAD's PropertyManager assistant. Return ONLY strict JSON. "
+    "You are Chudware's PropertyManager assistant. Return ONLY strict JSON. "
     "You help fill the currently active feature form using the provided visible field schema. "
     "Allowed top-level keys: answer, patches, activate_well, reveal_fields, highlights, questions. "
     "patches is an array of {key,value}; patch only ordinary fields from the visible schema. "
@@ -492,4 +492,4 @@ ojson assist_property_manager(const ojson& params, const ojson& doc, const std::
 }
 
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware

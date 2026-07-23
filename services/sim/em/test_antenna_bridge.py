@@ -1,7 +1,7 @@
 """Antenna EM bridge — analytic always + openEMS full-wave / honest skip.
 
 Run:
-  /home/hunter/.local/share/AI-CAD/mcp-venv/bin/python -X utf8 -m pytest \\
+  /home/hunter/.local/share/Chudware/mcp-venv/bin/python -X utf8 -m pytest \\
       engine_oracle/sim/em/test_antenna_bridge.py -q
 """
 from __future__ import annotations

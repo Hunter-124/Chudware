@@ -472,7 +472,7 @@ def _preview_text(fid: str, name: str, h: dict) -> str:
 
 
 def _tmp(suffix: str) -> str:
-    fd, path = tempfile.mkstemp(suffix=suffix, prefix="aicad_s3d_")
+    fd, path = tempfile.mkstemp(suffix=suffix, prefix="chudware_s3d_")
     os.close(fd)
     return path
 

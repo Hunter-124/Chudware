@@ -13,13 +13,13 @@ Layers covered:
     box-proxy 1-D bar run_fea_thermal(steady) drives; skips honestly without ccx.
 
 Everything runs the engine IN-PROCESS on the services/dist lib
-(AI_CAD_ENGINE_DAEMON=0) with INLINE Kuhn box meshes (engine_oracle box_mesh), so
+(CHUDWARE_ENGINE_DAEMON=0) with INLINE Kuhn box meshes (engine_oracle box_mesh), so
 the studies are deterministic, mesher-free and fast; facesets are passed as exact
 node coordinates with a tight tol_mm. Convection facesets are built one plane at a
 time — a merged multi-plane node set makes interior diagonal faces count as surface
 in the element-face enumeration (documented node-set semantics, both stacks).
 
-Run:  AI_CAD_ENGINE_DAEMON=0 .venv-mcp/bin/python -X utf8 -m pytest \
+Run:  CHUDWARE_ENGINE_DAEMON=0 .venv-mcp/bin/python -X utf8 -m pytest \
           services/mcp/test_fea_thermal_live.py -q
 """
 
@@ -32,7 +32,7 @@ import sys
 import numpy as np
 import pytest
 
-os.environ.setdefault("AI_CAD_ENGINE_DAEMON", "0")
+os.environ.setdefault("CHUDWARE_ENGINE_DAEMON", "0")
 
 _ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _ROOT not in sys.path:
@@ -54,7 +54,7 @@ try:
         cb.call("sim_run_thermal", {"study": {}})
     except CoreError as exc:
         if "unknown method" in str(exc):
-            _SKIP_REASON = f"loaded libaicad lacks sim_run_thermal: {exc}"
+            _SKIP_REASON = f"loaded libchudware lacks sim_run_thermal: {exc}"
         # any other CoreError means the RPC exists (it rejected the empty study)
 except Exception as exc:  # noqa: BLE001 — no engine at all
     cb = None
@@ -251,7 +251,7 @@ def _ccx_available() -> bool:
     return fa.ccx_path() is not None
 
 
-@pytest.mark.skipif(not _ccx_available(), reason="ccx (CalculiX) not on PATH/AI_CAD_CCX")
+@pytest.mark.skipif(not _ccx_available(), reason="ccx (CalculiX) not on PATH/CHUDWARE_CCX")
 def test_ccx_steady_bar_mid_plane_temperature():
     # The exact study run_fea_thermal(steady) builds: *HEAT TRANSFER, STEADY STATE
     # box bar, hot end / cold end. 1-D linear conduction ⇒ mid-plane = (Th+Tc)/2.

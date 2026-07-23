@@ -19,7 +19,7 @@
 #include "ecad/ops.h"  // OpError
 #include "ecad/schema.h"
 
-namespace aicad::ecad {
+namespace chudware::ecad {
 
 using nlohmann::json;
 
@@ -266,4 +266,4 @@ EcadContainerDoc ecad_container_open(const std::string& path) {
     return result;
 }
 
-}  // namespace aicad::ecad
+}  // namespace chudware::ecad

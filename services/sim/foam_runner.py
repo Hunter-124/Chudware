@@ -9,9 +9,9 @@ Three runners are provided:
 * :class:`NativeRunner` — a native-Windows OpenFOAM build (blueCFD-Core, an ESI/MinGW port
   that keeps the classic ``simpleFoam`` solver names).  This is the user-preferred target:
   no WSL hop, no path translation.  Detected from a vendored ``third_party/openfoam``, the
-  ``AICAD_OPENFOAM`` env var, or a ``C:\\Program Files\\blueCFD-Core*`` install.
+  ``CHUDWARE_OPENFOAM`` env var, or a ``C:\\Program Files\\blueCFD-Core*`` install.
 * :class:`LinuxRunner` — OpenFOAM on a Linux/posix host.  Detected from (in order) an
-  already-sourced environment (``simpleFoam`` on PATH), the ``AICAD_OPENFOAM`` env var
+  already-sourced environment (``simpleFoam`` on PATH), the ``CHUDWARE_OPENFOAM`` env var
   (an install root containing ``etc/bashrc`` OR a flat ``bin/`` layout like the
   conda-forge package), and the usual system/user install roots (``/usr/lib/openfoam``,
   ``/opt``, ``~/OpenFOAM``, ``~/openfoam*``, ``~/micromamba/envs/*``, ``~/.conda/envs/*``,
@@ -229,7 +229,7 @@ class LinuxRunner(FoamRunner):
     Detection (no root needed, cached after the first probe):
 
       1. Already-sourced environment: ``simpleFoam`` resolvable on PATH.
-      2. ``AICAD_OPENFOAM`` env var: an install root — either a classic tree with
+      2. ``CHUDWARE_OPENFOAM`` env var: an install root — either a classic tree with
          ``etc/bashrc`` (openfoam.com tarball) or a flat prefix whose ``bin/`` holds the
          executables (conda-forge package, which also ships ``etc/bashrc``).
       3. Well-known roots, system and user-space::
@@ -246,7 +246,7 @@ class LinuxRunner(FoamRunner):
     kind = "linux"
 
     def __init__(self, root: Optional[str] = None):
-        self._root = root           # explicit install root (tests / AICAD_OPENFOAM)
+        self._root = root           # explicit install root (tests / CHUDWARE_OPENFOAM)
         self._checked = False
         self._ok = False
         self._bashrc = ""           # "" => rely on the already-sourced PATH
@@ -258,7 +258,7 @@ class LinuxRunner(FoamRunner):
             return [r / "etc" / "bashrc", *sorted(r.glob("OpenFOAM-*/etc/bashrc"))]
         home = Path.home()
         cands: List[Path] = []
-        env = os.environ.get("AICAD_OPENFOAM")
+        env = os.environ.get("CHUDWARE_OPENFOAM")
         if env:
             cands += LinuxRunner._bashrc_candidates(env)
         globs = (
@@ -365,7 +365,7 @@ class NativeRunner(FoamRunner):
             if cand.exists():
                 roots.append(cand)
                 break
-        env = os.environ.get("AICAD_OPENFOAM")
+        env = os.environ.get("CHUDWARE_OPENFOAM")
         if env:
             roots.append(Path(env))
         for base in (r"C:\Program Files", r"C:\\"):

@@ -4,7 +4,7 @@ Covers the module-level implementations shared with the copilot's mission
 dispatch: envelope shapes, taxonomy routing + facet forwarding, facet_summary,
 post-filters, vendors_health degradation/needs_human_login, and the
 cam_tool_import mapping with an injected add_tool seam. Mocked — no network,
-no libaicad, no CAM job.
+no libchudware, no CAM job.
 """
 from __future__ import annotations
 

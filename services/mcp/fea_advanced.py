@@ -44,7 +44,7 @@ _CCX_NAMES = ("ccx", "ccx_2.20", "ccx_2.21", "ccx_2.19", "calculix")
 
 def ccx_path() -> Optional[str]:
     """Return the CalculiX executable on PATH, or None (subprocess-only discovery)."""
-    env = os.environ.get("AI_CAD_CCX")
+    env = os.environ.get("CHUDWARE_CCX")
     if env and shutil.which(env):
         return shutil.which(env)
     for name in _CCX_NAMES:
@@ -63,7 +63,7 @@ def _ccx_absent_result(kind: str, extra: Optional[dict] = None) -> dict:
             f"CalculiX (ccx) not found on PATH — {kind} is a subprocess-only, "
             "PATH-discovered backend (GPL-2.0 isolation per contracts/licenses.md, "
             "same posture as ngspice/Renode/QEMU). Install CalculiX (e.g. `ccx_2.20`) "
-            "and put it on PATH, or set AI_CAD_CCX to its full path. The .inp generator "
+            "and put it on PATH, or set CHUDWARE_CCX to its full path. The .inp generator "
             "and result parser are exercised without the binary by the unit tests."
         ),
         "backend": "calculix (ccx)",
@@ -86,7 +86,7 @@ def run_ccx(inp_text: str, job: str = "job", timeout: float = 300.0,
     ccx = ccx_path()
     if not ccx:
         return _ccx_absent_result("this analysis")
-    workdir = tempfile.mkdtemp(prefix="aicad_ccx_")
+    workdir = tempfile.mkdtemp(prefix="chudware_ccx_")
     inp_path = os.path.join(workdir, f"{job}.inp")
     Path(inp_path).write_text(inp_text, encoding="utf-8")
     try:

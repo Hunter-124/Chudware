@@ -1,5 +1,5 @@
 // cef/cef_platform_linux.cpp — Linux half of the CEF platform seam.
-// SCAFFOLDING (docs/cef_webview.md phase 2); compiled only with AI_CAD_ENABLE_CEF.
+// SCAFFOLDING (docs/cef_webview.md phase 2); compiled only with CHUDWARE_ENABLE_CEF.
 #include "cef_platform.h"
 
 #include <limits.h>
@@ -35,10 +35,10 @@ bool g_daemon_process = false;
 void set_daemon_process(bool daemon) { g_daemon_process = daemon; }
 
 std::string cache_root() {
-    // AI_CAD_CEF_CACHE_ROOT lets a --cef-shot diagnostic run alongside the live
+    // CHUDWARE_CEF_CACHE_ROOT lets a --cef-shot diagnostic run alongside the live
     // app: the process singleton is keyed on root_cache_path, so a distinct dir
     // dodges "CefInitialize FAILED / Opening in existing browser session".
-    if (const char* ov = std::getenv("AI_CAD_CEF_CACHE_ROOT"); ov && ov[0])
+    if (const char* ov = std::getenv("CHUDWARE_CEF_CACHE_ROOT"); ov && ov[0])
         return std::string(ov);
     // GUI vs daemon: separate ProcessSingleton roots (see cef_platform.h).
     const char* leaf = g_daemon_process ? "cef_cache_daemon" : "cef_cache_gui";

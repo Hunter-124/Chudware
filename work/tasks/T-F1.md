@@ -35,7 +35,7 @@ per-user local caches only).
    (pricing=hours, datasheets=days, standards≈immutable), offline/ITAR degradation.
 2. Implement `web_search` + `fetch_page` (readability→markdown; Firecrawl `/scrape`
    optional when `FIRECRAWL_API_KEY` present).
-3. Cache under `%APPDATA%/AI-CAD/knowledge/` keyed by URL+hash; `fetched_ts` surfaced.
+3. Cache under `%APPDATA%/Chudware/knowledge/` keyed by URL+hash; `fetched_ts` surfaced.
 4. Register MCP tools; add a `cad_guide('research')` topic.
 5. Tests: provider-mocked search/fetch, cache hit/expiry, offline mode serves cache only.
 
@@ -56,7 +56,7 @@ per-user local caches only).
 - **Design decisions:** (1) shared helpers in `engine/research/common.py` (envelope +
   offline gate + ts) to avoid an engine↔agent import cycle — offline gate lazily imports
   `agent.config.offline_enabled` (mirrors `ecad_tools`), with a `config.json` fallback.
-  (2) Cache root = `AI_CAD_KNOWLEDGE_DIR` env override → else `engine.paths.appdata_root()
+  (2) Cache root = `CHUDWARE_KNOWLEDGE_DIR` env override → else `engine.paths.appdata_root()
   /knowledge` (reuses the named reference; env override makes tests hermetic). Note:
   `engine/paths.py` is Windows-flavored (no Linux XDG branch); when a cross-platform
   paths.py lands, `knowledge/` moves with it — contract §4 documents this.
@@ -75,8 +75,8 @@ per-user local caches only).
   helpers must consult the same config flag; in offline mode serve cache + bundled
   data only, with `cached: true` and a clear "offline" confidence note.
 - **Cache root:** resolve per-user appdata via the same convention as
-  `core/agent/paths.cpp:31-54` / `engine/paths.py` (Windows `%APPDATA%/AI-CAD`, Linux
-  `~/.local/share/AI-CAD`) → `knowledge/` subdir. Key = URL + content hash; store
+  `core/agent/paths.cpp:31-54` / `engine/paths.py` (Windows `%APPDATA%/Chudware`, Linux
+  `~/.local/share/Chudware`) → `knowledge/` subdir. Key = URL + content hash; store
   `fetched_ts`; tiered TTLs as specced. Never sync this cache anywhere (legal rule).
 - **Provider pattern to copy:** `services/agent/providers/` — small classes behind one
   interface, mock provider for tests (`mock_provider.py`). Mirror that shape for

@@ -1,13 +1,13 @@
-"""aicad_drive.py - ergonomic driver for the AI-CAD *fixed* engine via core_bridge.
+"""chudware_drive.py - ergonomic driver for the Chudware *fixed* engine via core_bridge.
 
 The live MCP server is bypassed (it was deadlocked on the old DLL); this loads the freshly
-staged dist/AI-CAD/libaicad.dll directly through mcp_server.core_bridge. Run from the repo
-root (PYTHONPATH=. or run a script that imports `tools.aicad_drive`), ideally with the
+staged dist/Chudware/libchudware.dll directly through mcp_server.core_bridge. Run from the repo
+root (PYTHONPATH=. or run a script that imports `tools.chudware_drive`), ideally with the
 runtime venv python:
-  %APPDATA%\\AI-CAD\\runtime\\venv\\Scripts\\python.exe
+  %APPDATA%\\Chudware\\runtime\\venv\\Scripts\\python.exe
 
 Quick use:
-  import tools.aicad_drive as eng
+  import tools.chudware_drive as eng
   d = eng.new_part("demo")
   r = eng.ops(d, [eng.box("Base", 80, 50, 20)])      # r['ok'], r['volume_mm3'], r['features']
   print(eng.measure(d))                               # volume_mm3, mass_g, com, inertia, bodies

@@ -1,4 +1,4 @@
-// Supervised agent children for aicad-hostd (Phase 5 of the shared-engine
+// Supervised agent children for chudware-hostd (Phase 5 of the shared-engine
 // plan). The daemon becomes the parent of every agent worker process so:
 //   * GUI/MCP client death does NOT kill a running mission (the child belongs
 //     to the daemon, not to the spawning client);
@@ -22,7 +22,7 @@
 //   agent_list -> live children with status.
 //
 // A reaper thread waitpid()s each REGISTERED pid individually (never wait(-1):
-// that would steal aicad_ipc::spawnDetached's self-reaped intermediate forks)
+// that would steal chudware_ipc::spawnDetached's self-reaped intermediate forks)
 // and broadcasts {"event":"mission.exited","data":{child_id,pid,exit_code,
 // signal,mission_id}} to clients on exit.
 //

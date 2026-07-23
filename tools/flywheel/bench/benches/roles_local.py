@@ -16,16 +16,16 @@ Two evaluation paths (offline-ML-track discipline — no all-skip):
     logic executes against fixture data.  It is NOT an all-skip stub.
 
   * live mode (local endpoint present):
-    When AI_CAD_LOCAL_ENDPOINT env var is set, the bench calls the endpoint for
+    When CHUDWARE_LOCAL_ENDPOINT env var is set, the bench calls the endpoint for
     real, submits the assembled context, and parses + validates the model's actual
     handoff JSON.  Guarded by a pytest.skip when the endpoint is absent.
 
     Live recipe (run once you have a local model):
-        export AI_CAD_LOCAL_ENDPOINT=http://localhost:1234/v1
-        export AI_CAD_LOCAL_MODEL=lmstudio-community/Qwen2.5-Coder-7B-Instruct-GGUF
+        export CHUDWARE_LOCAL_ENDPOINT=http://localhost:1234/v1
+        export CHUDWARE_LOCAL_MODEL=lmstudio-community/Qwen2.5-Coder-7B-Instruct-GGUF
         pytest tools/flywheel/bench/benches/roles_local.py -v
 
-CI behaviour: AI_CAD_LOCAL_ENDPOINT is not set in CI → fixture mode runs (real
+CI behaviour: CHUDWARE_LOCAL_ENDPOINT is not set in CI → fixture mode runs (real
 code paths, no HTTP); live mode auto-skips with a clear message.
 
 Fixtures: inline in this file (no external fixture directory needed for v1).
@@ -301,12 +301,12 @@ def run_frontier_dial_check() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Live mode (guarded by AI_CAD_LOCAL_ENDPOINT)
+# Live mode (guarded by CHUDWARE_LOCAL_ENDPOINT)
 
 def run_live_sketcher(endpoint: str, model: str) -> dict:
     """Run the sketcher fixture turn against a real local model endpoint.
 
-    Only called when AI_CAD_LOCAL_ENDPOINT is set.  Not used in CI.
+    Only called when CHUDWARE_LOCAL_ENDPOINT is set.  Not used in CI.
     """
     from services.agent.providers.openai_provider import OpenAIProvider
     from services.agent.tiers import (
@@ -461,20 +461,20 @@ if _PYTEST_AVAILABLE:
             assert r["advisory_verbosity"] == "compact"
 
     class TestLiveMode:
-        """Live-mode tests — auto-skip when AI_CAD_LOCAL_ENDPOINT is not set."""
+        """Live-mode tests — auto-skip when CHUDWARE_LOCAL_ENDPOINT is not set."""
 
         @pytest.mark.skipif(
-            not os.environ.get("AI_CAD_LOCAL_ENDPOINT"),
+            not os.environ.get("CHUDWARE_LOCAL_ENDPOINT"),
             reason=(
-                "AI_CAD_LOCAL_ENDPOINT not set — live mode skipped. "
+                "CHUDWARE_LOCAL_ENDPOINT not set — live mode skipped. "
                 "Set it to a running llama.cpp or LM Studio endpoint to run live tests. "
-                "Example: export AI_CAD_LOCAL_ENDPOINT=http://localhost:1234/v1"
+                "Example: export CHUDWARE_LOCAL_ENDPOINT=http://localhost:1234/v1"
             ),
         )
         def test_live_sketcher_no_overflow_valid_handoff(self):
-            endpoint = os.environ["AI_CAD_LOCAL_ENDPOINT"]
+            endpoint = os.environ["CHUDWARE_LOCAL_ENDPOINT"]
             model = os.environ.get(
-                "AI_CAD_LOCAL_MODEL", "lmstudio-community/Qwen2.5-Coder-7B-Instruct-GGUF"
+                "CHUDWARE_LOCAL_MODEL", "lmstudio-community/Qwen2.5-Coder-7B-Instruct-GGUF"
             )
             r = run_live_sketcher(endpoint, model)
             assert not r["overflow"], f"Context overflow in live run: {r}"

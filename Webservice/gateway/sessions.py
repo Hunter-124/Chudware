@@ -21,7 +21,7 @@ except ImportError:
     from auth import User
     from config import Settings, settings
 
-log = logging.getLogger("billet-web.sessions")
+log = logging.getLogger("chudware-web.sessions")
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 
@@ -261,7 +261,7 @@ class SessionManager:
             slug = email_slug(email)
             host_port = self._alloc_port()
             sid = uuid.uuid4().hex[:12]
-            container = f"billet-sess-{slug}"
+            container = f"chudware-sess-{slug}"
             home = self.cfg.homes_dir / slug
             home.mkdir(parents=True, exist_ok=True)
             self.cfg.plm_dir.mkdir(parents=True, exist_ok=True)
@@ -381,7 +381,7 @@ class SessionManager:
             await self.run_podman(["rm", "-f", name], timeout=60)
 
     async def adopt_running(self) -> int:
-        """Rebuild session records from live billet-sess-* containers.
+        """Rebuild session records from live chudware-sess-* containers.
 
         Session state is in-memory; after a gateway restart (systemd
         Restart=on-failure) running seats would otherwise be orphaned —
@@ -390,12 +390,12 @@ class SessionManager:
         rc, out, _ = await self.run_podman(
             [
                 "ps",
-                "--filter", "name=^billet-sess-",
+                "--filter", "name=^chudware-sess-",
                 "--filter", "status=running",
                 "--format",
-                '{{.ID}}\t{{index .Labels "billet.sid"}}\t{{index .Labels "billet.email"}}\t'
-                '{{index .Labels "billet.display"}}\t{{index .Labels "billet.slug"}}\t'
-                '{{index .Labels "billet.port"}}\t{{index .Labels "billet.heavy"}}\t{{.Names}}',
+                '{{.ID}}\t{{index .Labels "chudware.sid"}}\t{{index .Labels "chudware.email"}}\t'
+                '{{index .Labels "chudware.display"}}\t{{index .Labels "chudware.slug"}}\t'
+                '{{index .Labels "chudware.port"}}\t{{index .Labels "chudware.heavy"}}\t{{.Names}}',
             ],
             timeout=30,
         )
@@ -436,15 +436,15 @@ class SessionManager:
     async def _podman_run(self, sess: Session, user: User, home: Path) -> str:
         encoder = "nvh264enc" if sess.heavy else "x264enc"
         env = {
-            "BILLET_USER_EMAIL": user.email,
-            "BILLET_USER_DISPLAY": user.display,
-            "AICAD_USER_ID": user.email,
-            "AICAD_USER_DISPLAY": user.display,
+            "CHUDWARE_USER_EMAIL": user.email,
+            "CHUDWARE_USER_DISPLAY": user.display,
+            "CHUDWARE_USER_ID": user.email,
+            "CHUDWARE_USER_DISPLAY": user.display,
             "STREAM_BACKEND": self.cfg.stream_backend,
             "SELKIES_ENCODER": encoder,
-            "BILLET_HEAVY": "1" if sess.heavy else "0",
+            "CHUDWARE_HEAVY": "1" if sess.heavy else "0",
             "DISPLAY": ":0",
-            "BILLET_PLM_DIR": "/plm",
+            "CHUDWARE_PLM_DIR": "/plm",
         }
         shared_project_mount: str | None = None
         if user.project:
@@ -456,13 +456,13 @@ class SessionManager:
                 proj = Path(user.project)
                 if proj.is_dir():
                     shared_project_mount = str(proj)
-                    env["BILLET_DEFAULT_PROJECT"] = proj.name
+                    env["CHUDWARE_DEFAULT_PROJECT"] = proj.name
                 else:
                     log.warning("default project dir missing on host: %s", proj)
             else:
-                env["BILLET_DEFAULT_PROJECT"] = user.project
+                env["CHUDWARE_DEFAULT_PROJECT"] = user.project
         if user.doc:
-            env["BILLET_OPEN_DOC"] = user.doc
+            env["CHUDWARE_OPEN_DOC"] = user.doc
         # Shared remote-model provider credentials (host-owned file); per-user
         # subscriptions live in the app's own Settings inside the HOME volume.
         provider_vars = self.cfg.ai_provider_vars()
@@ -486,17 +486,17 @@ class SessionManager:
             "--pids-limit",
             str(self.cfg.session_pids_limit),
             "--label",
-            f"billet.sid={sess.sid}",
+            f"chudware.sid={sess.sid}",
             "--label",
-            f"billet.email={sess.email}",
+            f"chudware.email={sess.email}",
             "--label",
-            f"billet.display={sess.display}",
+            f"chudware.display={sess.display}",
             "--label",
-            f"billet.slug={sess.slug}",
+            f"chudware.slug={sess.slug}",
             "--label",
-            f"billet.port={sess.host_port}",
+            f"chudware.port={sess.host_port}",
             "--label",
-            f"billet.heavy={'1' if sess.heavy else '0'}",
+            f"chudware.heavy={'1' if sess.heavy else '0'}",
             "-p",
             f"127.0.0.1:{sess.host_port}:8080",
             "-v",

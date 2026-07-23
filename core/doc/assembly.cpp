@@ -43,7 +43,7 @@
 #include "doc/session.h"  // OpError
 #include "util/expr.h"
 
-namespace aicad::doc {
+namespace chudware::doc {
 
 using nlohmann::json;
 
@@ -105,7 +105,7 @@ json env_from_doc(const json& doc) {
             const std::string expr = g.value("expr", std::string());
             if (name.empty()) continue;
             try {
-                double v = aicad::util::evaluate(expr, acc);
+                double v = chudware::util::evaluate(expr, acc);
                 acc[name] = v;
                 env[name] = v;
             } catch (...) { /* skip a bad global */ }
@@ -283,7 +283,7 @@ Eigen::Vector3d circle_centre(const TopoDS_Shape& edge_shape, const Eigen::Vecto
 // Resolve a selector against a component's LOCAL geometry into a MateGeom (port of
 // assembly.py::_selector_to_mategeom). Returns false (out-param unset) on a dangle.
 bool selector_to_mategeom(const json& selector, const LoadedComponent& lc,
-                          aicad::mate::MateGeom& out) {
+                          chudware::mate::MateGeom& out) {
     const std::string kind = selector.value("kind", std::string());
     double diag = bbox_diag(lc.bodies);
 
@@ -565,8 +565,8 @@ std::vector<AsmBodyOut> compile_component_patterns(const json& doc,
 }  // namespace
 
 AssemblyResult compile_assembly(const json& doc, const std::string& base_dir,
-                                const std::optional<aicad::mate::WarmMap>& warm,
-                                const std::optional<aicad::mate::Drag>& drag) {
+                                const std::optional<chudware::mate::WarmMap>& warm,
+                                const std::optional<chudware::mate::Drag>& drag) {
     AssemblyResult res;
 
     // non-suppressed components, in tree order
@@ -581,9 +581,9 @@ AssemblyResult compile_assembly(const json& doc, const std::string& base_dir,
     // Prefetch pass: components are independent, so uncached loads (compile or cache.brep
     // decode, both CPU-bound) run in parallel worker threads; the per-key shared_future in
     // load_component dedups same-file components. The serial loop below then hits the cache.
-    // Kill-switch: AICAD_ASM_PARALLEL_LOAD=0.
+    // Kill-switch: CHUDWARE_ASM_PARALLEL_LOAD=0.
     {
-        const char* env = std::getenv("AICAD_ASM_PARALLEL_LOAD");
+        const char* env = std::getenv("CHUDWARE_ASM_PARALLEL_LOAD");
         const bool par = !(env && env[0] == '0');
         if (par && components.size() > 1) {
             std::vector<std::string> paths;
@@ -635,7 +635,7 @@ AssemblyResult compile_assembly(const json& doc, const std::string& base_dir,
     }
 
     // --- resolve mate refs to local-frame MateGeom ----------------------
-    aicad::mate::ResolvedGeometry resolved_geometry;
+    chudware::mate::ResolvedGeometry resolved_geometry;
     std::map<std::string, std::vector<std::string>> dangling;  // mate_id -> refs[i] strings
     for (const json& mate : mates) {
         if (mate.value("suppressed", false)) continue;
@@ -653,7 +653,7 @@ AssemblyResult compile_assembly(const json& doc, const std::string& base_dir,
                 dangling[mid].push_back("refs[" + std::to_string(i) + "]");
                 continue;
             }
-            aicad::mate::MateGeom geom;
+            chudware::mate::MateGeom geom;
             if (!selector_to_mategeom(sel_obj, *lit->second, geom)) {
                 dangling[mid].push_back("refs[" + std::to_string(i) + "]");
                 continue;
@@ -673,8 +673,8 @@ AssemblyResult compile_assembly(const json& doc, const std::string& base_dir,
         solve_components.push_back({{"id", cid}, {"transform", tf},
                                     {"fixed", c.value("fixed", false)}, {"suppressed", false}});
     }
-    aicad::mate::MateSolveResult solve_res =
-        aicad::mate::solve_mates(solve_components, mates, resolved_geometry, warm, drag);
+    chudware::mate::MateSolveResult solve_res =
+        chudware::mate::solve_mates(solve_components, mates, resolved_geometry, warm, drag);
 
     // --- build placed bodies --------------------------------------------
     int ordinal = 0;
@@ -713,7 +713,7 @@ AssemblyResult compile_assembly(const json& doc, const std::string& base_dir,
     }
 
     // mate status (merge dangling)
-    for (const aicad::mate::MateStatus& m : solve_res.mate_status) {
+    for (const chudware::mate::MateStatus& m : solve_res.mate_status) {
         AsmMateStatus st;
         st.id = m.mate_id;
         st.type = m.type;
@@ -806,4 +806,4 @@ TopoDS_Shape placed_world_shape(const AsmBodyOut& body,
     return xf.Shape();
 }
 
-}  // namespace aicad::doc
+}  // namespace chudware::doc

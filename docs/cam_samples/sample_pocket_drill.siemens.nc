@@ -1,5 +1,5 @@
 %
-N10 ; AICAD - S1
+N10 ; Chudware - S1
 N20 ; post: Siemens 840D  machine: Generic 3-axis mill
 N30 G21
 N40 G90

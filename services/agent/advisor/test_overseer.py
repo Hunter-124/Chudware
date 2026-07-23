@@ -503,7 +503,7 @@ def test_dag_stage_exit_seam_fires_when_wired(tmp_path, monkeypatch):
     from services.dag import node_runner
     # Drive the in-app audit's ledger cache root at a temp dir so the seam can load
     # the run's ledger.  monkeypatch scopes the env change to this test only.
-    monkeypatch.setenv("AICAD_CACHE_ROOT", str(tmp_path))
+    monkeypatch.setenv("CHUDWARE_CACHE_ROOT", str(tmp_path))
     from services.agent.ledger import Ledger, run_ledger_path
     led = Ledger("run_seam", run_ledger_path("run_seam"))
     led.upsert_dimension("intake", "DIM1", "bore diameter", 19.8, "mm",

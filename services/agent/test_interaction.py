@@ -28,7 +28,7 @@ from agent.interaction import (
 def _isolated_cache(tmp_path, monkeypatch):
     """Every ask_user() call in this module may construct a run-scoped FileLedger;
     redirect it under tmp_path so nothing ever touches the real ~/.local/share."""
-    monkeypatch.setenv("AICAD_CACHE_ROOT", str(tmp_path))
+    monkeypatch.setenv("CHUDWARE_CACHE_ROOT", str(tmp_path))
     yield
 
 

@@ -10,8 +10,8 @@ Usage:
     python -m tools.provision_em --install  # source-build into a user prefix + pip install
 
 Install layout (``--install``):
-    * prefix:  $AICAD_OPENEMS or ~/.local/opt/openEMS (Linux/macOS)
-    * source:  ~/.cache/billet/openEMS-Project (git clone --recursive)
+    * prefix:  $CHUDWARE_OPENEMS or ~/.local/opt/openEMS (Linux/macOS)
+    * source:  ~/.cache/chudware/openEMS-Project (git clone --recursive)
     * python:  openEMS's own venv under <prefix>/venv is preferred for detection;
                ``--install`` also tries to pip-install into mcp-venv / runtime venv
 
@@ -22,7 +22,7 @@ once the modules are importable.
 
 Manual options (all auto-detected afterwards):
     * build with ./update_openEMS.sh ~/opt/openEMS --python and pip-install the modules
-    * set AICAD_OPENEMS to the install prefix
+    * set CHUDWARE_OPENEMS to the install prefix
 """
 
 from __future__ import annotations
@@ -56,7 +56,7 @@ _FEDORA_DEPS = (
 
 
 def _default_prefix() -> Path:
-    env = os.environ.get("AICAD_OPENEMS") or os.environ.get("OPENEMS_PREFIX")
+    env = os.environ.get("CHUDWARE_OPENEMS") or os.environ.get("OPENEMS_PREFIX")
     if env:
         return Path(os.path.expanduser(os.path.expandvars(env)))
     if os.name == "nt":
@@ -67,7 +67,7 @@ def _default_prefix() -> Path:
 
 def _src_dir() -> Path:
     cache = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
-    return Path(cache) / "billet" / "openEMS-Project"
+    return Path(cache) / "chudware" / "openEMS-Project"
 
 
 def _candidate_pythons() -> list[Path]:
@@ -98,13 +98,13 @@ def _candidate_pythons() -> list[Path]:
         seen.add(key)
         out.append(path)
 
-    add(os.environ.get("AICAD_PYTHON") or os.environ.get("AI_CAD_PYTHON"))
+    add(os.environ.get("CHUDWARE_PYTHON") or os.environ.get("CHUDWARE_PYTHON"))
 
     # openEMS's own install venv (created by update_openEMS.sh --python).
     add(_default_prefix() / "venv" / ("Scripts" if win else "bin") / ("python.exe" if win else "python"))
 
     home = Path.home()
-    for root_name in ("AI-CAD", "Billet"):
+    for root_name in ("Chudware", "Chudware"):
         if win:
             appdata = Path(os.environ.get("APPDATA") or (home / "AppData" / "Roaming"))
             add(appdata / root_name / "mcp-venv" / "Scripts" / "python.exe")

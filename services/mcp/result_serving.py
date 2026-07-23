@@ -6,7 +6,7 @@ summary-first and token-bounded while preserving teaching fields
 
 Token heuristic matches the agent stack (``CHARS_PER_TOKEN = 4`` —
 services/agent/tiers.py / ledger.py). Default JSON is compact; set
-``AICAD_MCP_PRETTY=1`` for indented dumps during debugging.
+``CHUDWARE_MCP_PRETTY=1`` for indented dumps during debugging.
 """
 from __future__ import annotations
 
@@ -114,12 +114,12 @@ def dumps(obj: Any, indent: Optional[int] = None, **kwargs: Any) -> str:
     """Serialize ``obj`` to JSON.
 
     Default is compact (no indent, tight separators). When ``indent`` is None and
-    env ``AICAD_MCP_PRETTY=1``, pretty-print with indent=2. Explicit ``indent``
+    env ``CHUDWARE_MCP_PRETTY=1``, pretty-print with indent=2. Explicit ``indent``
     always wins.
     """
     pretty = False
     if indent is None:
-        env = (os.environ.get("AICAD_MCP_PRETTY") or "").strip().lower()
+        env = (os.environ.get("CHUDWARE_MCP_PRETTY") or "").strip().lower()
         pretty = env in ("1", "true", "yes", "on")
         indent = 2 if pretty else None
     seps = (", ", ": ") if indent is not None else (",", ":")

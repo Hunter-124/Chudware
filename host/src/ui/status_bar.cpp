@@ -1,4 +1,4 @@
-// AI-CAD status bar — state + live agent phase (left), provider/model summary (right).
+// Chudware status bar — state + live agent phase (left), provider/model summary (right).
 #include <cmath>
 #include <string>
 
@@ -229,7 +229,7 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
         ImGui::TextUnformatted(chip.c_str());
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip(
-                "The engine host daemon (aicad-hostd) is not reachable.\n"
+                "The engine host daemon (chudware-hostd) is not reachable.\n"
                 "Chudware will keep retrying (1s, 2s, 5s, then every 10s).\n"
                 "Agent/shared docs reappear automatically on reconnect.");
         ImGui::PopStyleColor();
@@ -256,7 +256,7 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
     // Uses the same glass-background pill as the agent livePhase chip above so the two styles
     // are consistent.  The text pulses slightly so it is obviously alive even when stage is
     // stuck on "Solving" for a long static analysis.
-    const bool simForce = std::getenv("AI_CAD_SIMPROG") != nullptr;  // headless smoke: force the chip
+    const bool simForce = std::getenv("CHUDWARE_SIMPROG") != nullptr;  // headless smoke: force the chip
     if ((st.simClient && st.simClient->busy()) || simForce) {
         static const char* kSpin[] = {"|", "/", "-", "\\"};
         int si = static_cast<int>(ImGui::GetTime() * 8.0) & 3;

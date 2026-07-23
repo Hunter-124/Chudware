@@ -5,7 +5,7 @@
 // the CPU go" statistically, but the orchestrator optimizing simulation throughput needs a
 // deterministic, always-on answer to "how long did mesh vs assemble vs factorize vs post
 // take FOR THIS study". The env-gated FeaProf stderr printer (fea_static.cpp,
-// AI_CAD_FEA_PROFILE=1) proved the value of the phase split but is (a) FEA-static only and
+// CHUDWARE_FEA_PROFILE=1) proved the value of the phase split but is (a) FEA-static only and
 // (b) text-on-stderr, invisible to RPC callers. This module is the structured, always-on,
 // engine-wide generalization: coarse RAII scopes record into an in-memory registry that the
 // `prof_phases` RPC (and `prof_report`/`prof_stop`, additively) surface as JSON.
@@ -36,7 +36,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad {
+namespace chudware {
 namespace prof {
 namespace phases {
 
@@ -106,4 +106,4 @@ void reset();
 
 }  // namespace phases
 }  // namespace prof
-}  // namespace aicad
+}  // namespace chudware

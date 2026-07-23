@@ -1,5 +1,5 @@
 // cef/cef_app.cpp — CEF process lifecycle + browser-process CefApp.
-// SCAFFOLDING (docs/cef_webview.md phase 2); compiled only with AI_CAD_ENABLE_CEF.
+// SCAFFOLDING (docs/cef_webview.md phase 2); compiled only with CHUDWARE_ENABLE_CEF.
 // TODO(cef) markers flag the spots that need verification against a live SDK.
 #include "cef_app.h"
 
@@ -81,9 +81,9 @@ public:
         // protected login form whose token field is empty at submit; no-op otherwise.
         if (frame->IsMain()) {
             frame->ExecuteJavaScript(recaptcha_login_helper_script(), frame->GetURL(), 0);
-            // Opt-in captcha-flow trace (AI_CAD_CEF_NETLOG=1): logs the real reCAPTCHA
+            // Opt-in captcha-flow trace (CHUDWARE_CEF_NETLOG=1): logs the real reCAPTCHA
             // verdict of a live panel login to the trace file. Off by default.
-            if (const char* nl = std::getenv("AI_CAD_CEF_NETLOG"); nl && nl[0] && nl[0] != '0')
+            if (const char* nl = std::getenv("CHUDWARE_CEF_NETLOG"); nl && nl[0] && nl[0] != '0')
                 frame->ExecuteJavaScript(recaptcha_trace_script(), frame->GetURL(), 0);
         }
     }
@@ -123,12 +123,12 @@ public:
         // the submission even though the widget renders. The crash that forces
         // SwiftShader is specific to NVIDIA+Wayland EGL; an Intel/Mesa (or other
         // non-crashing) box can drive its REAL GL context for canvas/WebGL and present
-        // an honest, consistent GPU fingerprint. Opt in with AI_CAD_CEF_GPU=1 to use the
+        // an honest, consistent GPU fingerprint. Opt in with CHUDWARE_CEF_GPU=1 to use the
         // real GL backend (disable-gpu-compositing above keeps OSR presentation software,
         // so paint is unaffected). Default stays SwiftShader — safe on the NVIDIA box this
         // workaround targets. Validate in the HEADED GUI (a display-less daemon has no EGL
         // surface and hangs at CefInitialize under real GL).
-        const char* real_gpu = std::getenv("AI_CAD_CEF_GPU");
+        const char* real_gpu = std::getenv("CHUDWARE_CEF_GPU");
         if (!(real_gpu && real_gpu[0] && real_gpu[0] != '0')) {
             cmd->AppendSwitchWithValue("use-gl", "angle");
             cmd->AppendSwitchWithValue("use-angle", "swiftshader");
@@ -141,15 +141,15 @@ public:
         // build) the multi-process helper handshake fails Chromium's subprocess
         // ICU file-descriptor hand-off ("Invalid file descriptor to ICU data
         // received"), which crash-loops the GPU + network services so OSR never
-        // paints — the "stuck on Loading" bug. Proven empirically: `AI-CAD
+        // paints — the "stuck on Loading" bug. Proven empirically: `Chudware
         // --cef-shot` renders a correct PNG ONLY in single-process mode; the
         // multi-process path crash-loops to "GPU process isn't usable. Goodbye."
         // Single-process ≠ single-thread — Chromium still runs the renderer on
         // its own threads, so the GL/UI thread is not blocked by page JS; the
         // only cost is software (SwiftShader) rasterisation, fine for OSR login
-        // pages. Override with AI_CAD_CEF_SINGLE_PROCESS=0 to test multi-process
+        // pages. Override with CHUDWARE_CEF_SINGLE_PROCESS=0 to test multi-process
         // once the subprocess ICU hand-off is fixed for this distro.
-        if (const char* sp = std::getenv("AI_CAD_CEF_SINGLE_PROCESS"); !(sp && sp[0] == '0'))
+        if (const char* sp = std::getenv("CHUDWARE_CEF_SINGLE_PROCESS"); !(sp && sp[0] == '0'))
             cmd->AppendSwitch("single-process");
         // ANTI-DETECTION (mirror services/browser/stealth.launch_args): vendor
         // login pages run bot-walls (Cloudflare/Turnstile) that reject anything
@@ -166,7 +166,7 @@ public:
         // addScript cannot reach. Do NOT re-add a per-browser CDP inject in
         // cef_web_view.cpp; only the Sec-CH-UA override there genuinely needs CDP.
         // NOTE: the software (SwiftShader) WebGL vendor is a residual tell removable
-        // only via AI_CAD_CEF_GPU=1 (see use-angle above) on non-NVIDIA boxes; strict
+        // only via CHUDWARE_CEF_GPU=1 (see use-angle above) on non-NVIDIA boxes; strict
         // walls may still trip on the software canvas pixels.
         // CLIPBOARD: DO NOT pin --ozone-platform=x11. It was tried as an OS
         // clipboard bridge (the default headless Ozone clipboard is an in-memory
@@ -187,10 +187,10 @@ public:
         // ["en-US","en"] + header "en-US,en;q=0.9". (Mirrors stealth._CDP_ACCEPT_LANGUAGE.)
         if (!cmd->HasSwitch("accept-lang"))
             cmd->AppendSwitchWithValue("accept-lang", "en-US,en");
-        // EXPERIMENT HOOK: AI_CAD_CEF_EXTRA_SWITCHES="a=1;b;c=2" appends extra
+        // EXPERIMENT HOOK: CHUDWARE_CEF_EXTRA_SWITCHES="a=1;b;c=2" appends extra
         // Chromium switches (';'-separated, 'key' or 'key=value') so flag
         // hypotheses can be tested against the --cef-shot repro without a rebuild.
-        if (const char* extra = std::getenv("AI_CAD_CEF_EXTRA_SWITCHES")) {
+        if (const char* extra = std::getenv("CHUDWARE_CEF_EXTRA_SWITCHES")) {
             std::string s(extra), tok;
             std::size_t i = 0;
             while (i <= s.size()) {
@@ -219,7 +219,7 @@ public:
     // StartupBrowserCreator → WebContentsImpl::CreateWithOpener, PID 18704): CEF 149
     // runs on the Chrome runtime, which holds a process-singleton lock keyed on
     // root_cache_path. When something (an OAuth/external-protocol navigation during
-    // a vendor login, or the user re-launching AI-CAD) rendezvouses a second launch
+    // a vendor login, or the user re-launching Chudware) rendezvouses a second launch
     // into this instance, CEF's DEFAULT relaunch behavior "creates a new default
     // styled Chrome window" — a brand-new top-level WebContents, i.e. a second
     // renderer process, which is fatal under --single-process. Returning true here
@@ -292,7 +292,7 @@ bool initialize() {
     CefMainArgs args = cef_platform::main_args(g_argc, g_argv);
 #else
     static char  lang_sw[]     = "--lang=en-US";
-    static char* clean_argv[2] = {g_argv ? g_argv[0] : const_cast<char*>("AI-CAD"),
+    static char* clean_argv[2] = {g_argv ? g_argv[0] : const_cast<char*>("Chudware"),
                                   lang_sw};
     CefMainArgs args(2, clean_argv);
 #endif

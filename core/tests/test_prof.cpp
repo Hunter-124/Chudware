@@ -51,7 +51,7 @@ TEST_CASE("sampling profiler captures multi-frame stacks") {
 #if !defined(_WIN32) && !defined(__linux__)
     MESSAGE("sampling profiler is unsupported on this platform; skipping");
 #else
-    using namespace aicad;
+    using namespace chudware;
     std::atomic<bool> go{false};
     std::atomic<bool> done{false};
 

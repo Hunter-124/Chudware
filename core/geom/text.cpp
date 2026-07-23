@@ -264,9 +264,9 @@ std::string resolve_font_path(const std::string& req) {
         }
     }
 #endif
-    if (const char* d = std::getenv("AI_CAD_DIST"))
+    if (const char* d = std::getenv("CHUDWARE_DIST"))
         dirs.push_back(fs::path(d) / "assets" / "fonts");
-    dirs.push_back(fs::path("dist") / "AI-CAD" / "assets" / "fonts");  // repo-root run
+    dirs.push_back(fs::path("dist") / "Chudware" / "assets" / "fonts");  // repo-root run
     dirs.push_back(fs::path("host") / "assets" / "fonts");             // dev tree
 
     for (const fs::path& d : dirs) {

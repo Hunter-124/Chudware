@@ -61,10 +61,10 @@ geometry/netlists/analyses and PASS on evidence. This is the first-Erik-demo tar
 ## Progress log
 - 2026-07-03 08:57 UTC [sonnet-yarrow] REVIEW T-A6 branch=task/T-A6-capstone-live @ 0e49973 — capstone round 2 live-backend verify.
 
-Phase 3 added to run_capstone_demo.py. Builds 6 real artifacts before executor.run(), wires doc_ids/paths/project_id into verify node inputs. Key finding: doc_id sharing works because libaicad C++ session store and ECAD session store are process-global singletons — artifact created in setup_live_artifacts() is visible inside executor.run() without any special wiring.
+Phase 3 added to run_capstone_demo.py. Builds 6 real artifacts before executor.run(), wires doc_ids/paths/project_id into verify node inputs. Key finding: doc_id sharing works because libchudware C++ session store and ECAD session store are process-global singletons — artifact created in setup_live_artifacts() is visible inside executor.run() without any special wiring.
 
 Results (5/6 PASS, 1 honest FAIL):
-  interference  PASS — libaicad box doc doc-cpp00000001 (80×50×30mm ABS enclosure), 0 pairs
+  interference  PASS — libchudware box doc doc-cpp00000001 (80×50×30mm ABS enclosure), 0 pairs
   erc           PASS — ecad_new_schematic "soil_sensor_sch", 0 ERC errors, 0 warnings
   drc           PASS — ecad_new_pcb "soil_sensor_pcb", 0 DRC errors, 1 advisory warning (no Edge.Cuts)
   firmware      FAIL (honest) — arm-none-eabi-gcc 15.2.0 build succeeded; Renode not on PATH (T-C5 worktree removed, portable tarball not committed); QEMU semihosting cannot capture STM32F4 UART register writes; on_fail=skip so run advances to gate

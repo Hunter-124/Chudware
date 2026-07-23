@@ -11,7 +11,7 @@
 ## 0. Design intent
 
 The DAG orchestrator runs a **directed acyclic graph of capability nodes** over the
-AI-CAD engine. Each node represents one bounded capability (design, simulate, verify,
+Chudware engine. Each node represents one bounded capability (design, simulate, verify,
 …). The executor loads a graph JSON, builds a LangGraph `StateGraph`, runs it with
 SQLite-persisted checkpoints, and surfaces run state for mission-control UIs and
 agent-loop integrations.
@@ -179,8 +179,8 @@ Conditional branching (e.g., `on_fail` routing) is expressed by the executor log
 
 **Location:** `<base_dir>/<run_id>.db`
 
-- **Default `base_dir`** (set by the executor): `~/.local/share/AI-CAD/runs/` on Linux/macOS;
-  `%APPDATA%\AI-CAD\runs\` on Windows. Callers may override via the `runs_dir` parameter to
+- **Default `base_dir`** (set by the executor): `~/.local/share/Chudware/runs/` on Linux/macOS;
+  `%APPDATA%\Chudware\runs\` on Windows. Callers may override via the `runs_dir` parameter to
   `executor.run()` — required for hermetic tests.
 - The directory is created on first use.
 

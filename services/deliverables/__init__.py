@@ -1,4 +1,4 @@
-"""AI-CAD deliverables — spec-driven office artifacts (contract ``deliverables/1``).
+"""Chudware deliverables — spec-driven office artifacts (contract ``deliverables/1``).
 
 The engineering premise (contract §4): **the model never types a load-bearing number.**
 The model authors structure and prose (an ``outline`` of blocks); every load-bearing value

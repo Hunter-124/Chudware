@@ -63,7 +63,7 @@
 
 using nlohmann::json;
 
-namespace aicad {
+namespace chudware {
 namespace prof {
 
 namespace {
@@ -159,12 +159,12 @@ std::string build_speedscope(
     for (auto* f : frames) fr.push_back(json{{"name", *f}});
     json doc = {
         {"$schema", "https://www.speedscope.app/file-format-schema.json"},
-        {"name", "aicad-modeling"},
+        {"name", "chudware-modeling"},
         {"activeProfileIndex", 0},
         {"shared", {{"frames", fr}}},
         {"profiles", json::array({json{
             {"type", "sampled"},
-            {"name", "aicad modeling"},
+            {"name", "chudware modeling"},
             {"unit", "microseconds"},
             {"startValue", 0},
             {"endValue", end_value},
@@ -421,7 +421,7 @@ bool g_sym_ok = false;
 void ensure_sym() {
     std::call_once(g_sym_once, []() {
         SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
-        // invade=TRUE enumerates already-loaded modules (libaicad, TK*, gmsh, ...). If the
+        // invade=TRUE enumerates already-loaded modules (libchudware, TK*, gmsh, ...). If the
         // host already SymInitialize'd, this returns FALSE; we proceed regardless and never
         // SymCleanup (which would break the host's session).
         g_sym_ok = SymInitialize(GetCurrentProcess(), nullptr, TRUE) != FALSE;
@@ -625,7 +625,7 @@ void sampler_main() {
 
 // ---- symbolization (report path only; off the signal path) --------------------------
 // basename(path), stripped of a leading "lib" and a trailing ".so*": libTKMath.so.7.6 ->
-// "TKMath", libaicad.so -> "aicad", and an executable like /path/test_prof -> "test_prof".
+// "TKMath", libchudware.so -> "chudware", and an executable like /path/test_prof -> "test_prof".
 std::string clean_module(const char* path) {
     std::string p = path ? path : "";
     auto slash = p.find_last_of('/');
@@ -769,7 +769,7 @@ std::string resolve_addr(uintptr_t a, unsigned long long* unresolved) {
         std::string mod = clean_module(info.dli_fname);
         std::string sname = info.dli_sname ? std::string(info.dli_sname) : std::string();
         // T-PERF10: dladdr only sees .dynsym. Walk .symtab for static / hidden frames
-        // so unstripped libaicad.so reports real function names instead of aicad!0x….
+        // so unstripped libchudware.so reports real function names instead of chudware!0x….
         if (sname.empty()) sname = elf_lookup(info.dli_fname, info.dli_fbase, a);
         if (!sname.empty()) {
             return mod + "!" + demangle(sname);
@@ -853,7 +853,7 @@ bool start(unsigned interval_us, const std::string& mode) {
     // Best-effort: name the sampler + try a mild priority boost so under load it still
     // wakes near the requested cadence (the original sleep_for path starved to ~1.7 Hz).
     {
-        pthread_setname_np(g_thread.native_handle(), "aicad-prof");
+        pthread_setname_np(g_thread.native_handle(), "chudware-prof");
 #if defined(__linux__)
         struct sched_param sp {};
         sp.sched_priority = 0;
@@ -1060,4 +1060,4 @@ json tree_report(const json& opts) {
 }
 
 }  // namespace prof
-}  // namespace aicad
+}  // namespace chudware

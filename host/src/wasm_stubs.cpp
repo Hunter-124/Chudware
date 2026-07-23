@@ -27,7 +27,7 @@ bool repairRuntime(std::string& log) {
 void ensurePromptsDir() {}
 
 // ---- IPC discovery / spawn (browser never forks hostd) --------------------
-namespace aicad_ipc {
+namespace chudware_ipc {
 
 bool spawnDetached(const std::string& /*exe*/, const std::string& /*arg*/, std::string& err) {
     err = "WASM: spawnDetached not available (gateway-hosted daemon)";
@@ -44,7 +44,7 @@ std::string resolveHostdBin(const std::string& /*hint*/) { return ""; }
 
 std::string instanceKey(const std::string& /*exePath*/) { return "wasm"; }
 
-std::string lockPath(const std::string& key) { return "/tmp/aicad-lock-" + key; }
+std::string lockPath(const std::string& key) { return "/tmp/chudware-lock-" + key; }
 
 std::string stateDir() { return "/tmp"; }
 
@@ -71,6 +71,6 @@ bool SingleInstance::acquire(const std::string& /*lockFile*/, std::string& err) 
 }
 void SingleInstance::release() {}
 
-}  // namespace aicad_ipc
+}  // namespace chudware_ipc
 
 #endif  // __EMSCRIPTEN__

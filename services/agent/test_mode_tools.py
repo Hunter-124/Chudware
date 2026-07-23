@@ -348,25 +348,25 @@ class TestModeOptionsFromMapping:
 
 class TestAdvisorEnabled:
     def test_default_true(self, monkeypatch):
-        monkeypatch.delenv("AI_CAD_ADVISOR", raising=False)
+        monkeypatch.delenv("CHUDWARE_ADVISOR", raising=False)
         # Empty agent block → default True
         assert agent_config.advisor_enabled({"agent": {}}) is True
         assert agent_config.advisor_enabled({}) is True
 
     def test_config_false(self, monkeypatch):
-        monkeypatch.delenv("AI_CAD_ADVISOR", raising=False)
+        monkeypatch.delenv("CHUDWARE_ADVISOR", raising=False)
         assert agent_config.advisor_enabled({"agent": {"advisor": False}}) is False
 
     def test_config_true(self, monkeypatch):
-        monkeypatch.delenv("AI_CAD_ADVISOR", raising=False)
+        monkeypatch.delenv("CHUDWARE_ADVISOR", raising=False)
         assert agent_config.advisor_enabled({"agent": {"advisor": True}}) is True
 
     def test_env_overrides_config_off(self, monkeypatch):
-        monkeypatch.setenv("AI_CAD_ADVISOR", "0")
+        monkeypatch.setenv("CHUDWARE_ADVISOR", "0")
         assert agent_config.advisor_enabled({"agent": {"advisor": True}}) is False
 
     def test_env_overrides_config_on(self, monkeypatch):
-        monkeypatch.setenv("AI_CAD_ADVISOR", "1")
+        monkeypatch.setenv("CHUDWARE_ADVISOR", "1")
         assert agent_config.advisor_enabled({"agent": {"advisor": False}}) is True
 
     def test_default_constant(self):

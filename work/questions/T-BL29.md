@@ -24,7 +24,7 @@ renderer changes; (b) id-pass selection overlay — needs more render passes.
 
 **Context:** The Sheet Metal ribbon tab renders EMPTY headless (contextual gating —
 the tab only populates when a sheet-metal doc is active). This affects IN-CONTEXT
-VERIFICATION but NOT the icon render itself: the icons come from `AI_CAD_SHOT=iconpipe`
+VERIFICATION but NOT the icon render itself: the icons come from `CHUDWARE_SHOT=iconpipe`
 which builds parts through applyOps, bypassing the tab rendering entirely.
 
 **Decision:** sm_base_flange and sm_flat_pattern can be fully rendered via iconpipe —

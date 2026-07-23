@@ -40,7 +40,7 @@
 #include <memory>
 #include <vector>
 
-namespace aicad_ipc {
+namespace chudware_ipc {
 
 namespace {
 
@@ -456,6 +456,6 @@ IpcConn connectTo(const std::string& path, std::string& err) {
     return IpcConn((void*)h);
 }
 
-}  // namespace aicad_ipc
+}  // namespace chudware_ipc
 
 #endif  // _WIN32

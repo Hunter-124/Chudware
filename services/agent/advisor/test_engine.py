@@ -216,7 +216,7 @@ def test_user_override_downgrades_to_info():
 # ---------------------------------------------------------------------------
 
 def test_advisory_dispute_kernel_requires_waiver(tmp_path, monkeypatch):
-    monkeypatch.setenv("AI_CAD_CACHE_ROOT", str(tmp_path))
+    monkeypatch.setenv("CHUDWARE_CACHE_ROOT", str(tmp_path))
     from services.mcp import advisor_tools
 
     captured = {}
@@ -239,7 +239,7 @@ def test_advisory_dispute_kernel_requires_waiver(tmp_path, monkeypatch):
 
 
 def test_stage_set_records_override(tmp_path, monkeypatch):
-    monkeypatch.setenv("AI_CAD_CACHE_ROOT", str(tmp_path))
+    monkeypatch.setenv("CHUDWARE_CACHE_ROOT", str(tmp_path))
     from services.mcp import advisor_tools
 
     captured = {}
@@ -280,7 +280,7 @@ def _fake_overlap_rpc(method, **kw):
 def test_node_runner_injects_advisory(monkeypatch):
     from services.dag import node_runner
     monkeypatch.setattr(adapters, "_default_rpc", lambda: _fake_overlap_rpc)
-    monkeypatch.setenv("AI_CAD_ADVISOR", "1")
+    monkeypatch.setenv("CHUDWARE_ADVISOR", "1")
 
     class _R:
         stop_reason = "confirmed"

@@ -42,7 +42,7 @@ literal upstream BOLTS `.blt` files vendored, that needs an explicit GPL-data ex
 **not vendored** — "users point at their own installed KiCad libs".
 
 **Recommended answer (implemented).** `match_kicad` reads only `.kicad_sym` libraries the user
-points at via the `AICAD_KICAD_SYM_PATH` env var, using the existing clean-room `.kicad_sym`
+points at via the `CHUDWARE_KICAD_SYM_PATH` env var, using the existing clean-room `.kicad_sym`
 parser (`engine_oracle/ecad/library/kicad_sym.py` — no KiCad code imported). With no path
 configured (CI/offline default) it returns `None` gracefully. Nothing KiCad is bundled.
 
@@ -54,7 +54,7 @@ configured (CI/offline default) it returns `None` gracefully. Nothing KiCad is b
 `match_part_number`; the FOREMAN addendum requires `server.py` edits to be **append-only hunks**.
 The established idiom (confirmed for T-B3 Q1) is one `*_tools.py` module per family + a
 registration line in `server.py`. Separately, `generate_model` needs the native core
-(`parts_make` RPC) to build geometry, which is unavailable in CI (`libaicad.so` not built).
+(`parts_make` RPC) to build geometry, which is unavailable in CI (`libchudware.so` not built).
 
 **Recommended answer (implemented).** New `services/mcp/spec_tools.py` with
 `register_spec_tools(mcp)` (mirroring `sourcing_tools.py`/`cost_tools.py`) + a 3-line

@@ -179,23 +179,23 @@ The E3 hooks (`ai_reverse_engineer`, `ai_explain_part`, `importSummary`) are **n
 
 ### Raw grep results
 
-`grep -n "appearance|AI_CAD_SHOT" host/src/ui/scenarios.cpp` (first 20 lines):
+`grep -n "appearance|CHUDWARE_SHOT" host/src/ui/scenarios.cpp` (first 20 lines):
 ```
-52:     // ---------- C17 M1 integration scenario (AI_CAD_SHOT=m1) ----------
+52:     // ---------- C17 M1 integration scenario (CHUDWARE_SHOT=m1) ----------
 158:                             mop.push_back({{"op","set_appearance"},{"id","b1"},
-268:     // ---------- C18 sketch scenario (AI_CAD_SHOT=sketch) ----------
-397:     // ---------- C20b assembly scenario (AI_CAD_SHOT=asm) ----------
-587:     // ---------- C19 FEA scenario (AI_CAD_SHOT=fea) ----------
-675:     // ---------- CAM copilot fast-path scenario (AI_CAD_SHOT=cam) ----------
-725:     // ---------- external-flow scenario (AI_CAD_SHOT=flow) ----------
-783:     // ---------- C19 evalmass scenario (AI_CAD_SHOT=evalmass) ----------
-815:     // --- C22b activity scenario (AI_CAD_SHOT=activity) ---
-883:     // ---------- multi-document scenario (AI_CAD_SHOT=multidoc) ----------
-886:     // ---------- W17 engineering-drawing scenario (AI_CAD_SHOT=drawing) ----------
-889:     // ---------- appearance scenario (AI_CAD_SHOT=appearance) ----------
-893:  // Appearance scenario (AI_CAD_SHOT=appearance). ...
-897:  // scenarios this one has no AppState want-flag: the runner reads AI_CAD_SHOT itself
-902:         const char* sm = std::getenv("AI_CAD_SHOT");
+268:     // ---------- C18 sketch scenario (CHUDWARE_SHOT=sketch) ----------
+397:     // ---------- C20b assembly scenario (CHUDWARE_SHOT=asm) ----------
+587:     // ---------- C19 FEA scenario (CHUDWARE_SHOT=fea) ----------
+675:     // ---------- CAM copilot fast-path scenario (CHUDWARE_SHOT=cam) ----------
+725:     // ---------- external-flow scenario (CHUDWARE_SHOT=flow) ----------
+783:     // ---------- C19 evalmass scenario (CHUDWARE_SHOT=evalmass) ----------
+815:     // --- C22b activity scenario (CHUDWARE_SHOT=activity) ---
+883:     // ---------- multi-document scenario (CHUDWARE_SHOT=multidoc) ----------
+886:     // ---------- W17 engineering-drawing scenario (CHUDWARE_SHOT=drawing) ----------
+889:     // ---------- appearance scenario (CHUDWARE_SHOT=appearance) ----------
+893:  // Appearance scenario (CHUDWARE_SHOT=appearance). ...
+897:  // scenarios this one has no AppState want-flag: the runner reads CHUDWARE_SHOT itself
+902:         const char* sm = std::getenv("CHUDWARE_SHOT");
 903:         apWant = st.shot && sm && std::strcmp(sm, "appearance") == 0;
 910:         apSavePath = base + "/scratch/appearance_shots";
 920:                 std::printf("appearance: new_part FAILED: %s\n", err.c_str());
@@ -204,12 +204,12 @@ The E3 hooks (`ai_reverse_engineer`, `ai_explain_part`, `importSummary`) are **n
 
 ### Analysis
 
-The `appearance` scenario (`AI_CAD_SHOT=appearance`) is **fully implemented** in `ScenarioRunner::runAppearance` (scenarios.cpp:899). It:
+The `appearance` scenario (`CHUDWARE_SHOT=appearance`) is **fully implemented** in `ScenarioRunner::runAppearance` (scenarios.cpp:899). It:
 1. Creates a new part with a box (60×40×10) so the Appearance tab previews real geometry.
 2. Opens Settings modal jumped to the Appearance tab (index 0).
-3. Settles for `kSettle*2` frames, then captures `appearance_01_settings.png` to `$AI_CAD_REPO/scratch/appearance_shots/`.
+3. Settles for `kSettle*2` frames, then captures `appearance_01_settings.png` to `$CHUDWARE_REPO/scratch/appearance_shots/`.
 
-This scenario differs from older ones in that it reads `AI_CAD_SHOT` directly rather than using an `AppState` want-flag. The scenario is wired into the main `run()` dispatch at line 890 (`runAppearance(st)`).
+This scenario differs from older ones in that it reads `CHUDWARE_SHOT` directly rather than using an `AppState` want-flag. The scenario is wired into the main `run()` dispatch at line 890 (`runAppearance(st)`).
 
 Line 158 (`set_appearance` op in the m1 scenario) is unrelated — it's the m1 scenario calling the CAD `set_appearance` operation, not the appearance screenshot scenario.
 
@@ -228,4 +228,4 @@ Line 158 (`set_appearance` op in the m1 scenario) is unrelated — it's the m1 s
 
 - **Q6 (E3 hooks):** `ai_reverse_engineer` and `ai_explain_part` palette commands are **not implemented**. If E3 hooks are on the roadmap, these need to be wired: palette command registration, a toast/import-summary display, and (optionally) a `drawImportSummary` widget in the copilot column post-import flow.
 
-- **Q7 (scenarios):** `AI_CAD_SHOT=appearance` scenario is fully implemented and wired. No action needed.
+- **Q7 (scenarios):** `CHUDWARE_SHOT=appearance` scenario is fully implemented and wired. No action needed.

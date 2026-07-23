@@ -9,7 +9,7 @@
 #include <string>
 #include <vector>
 
-namespace aicad {
+namespace chudware {
 namespace geom {
 
 struct AirfoilProfile {
@@ -34,4 +34,4 @@ AirfoilProfile airfoil_profile(const std::string& naca, const std::string& dat, 
                                double aoaDeg, int nPts, bool closedTE);
 
 }  // namespace geom
-}  // namespace aicad
+}  // namespace chudware

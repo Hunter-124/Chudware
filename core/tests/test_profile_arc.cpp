@@ -20,8 +20,8 @@
 #include "geom/profile.h"
 
 using nlohmann::json;
-using aicad::geom::SketchPlane;
-using aicad::geom::wire_from_solved_sketch;
+using chudware::geom::SketchPlane;
+using chudware::geom::wire_from_solved_sketch;
 
 namespace {
 constexpr double kPi = 3.14159265358979323846;

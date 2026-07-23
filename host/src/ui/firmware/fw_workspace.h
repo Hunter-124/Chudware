@@ -24,7 +24,7 @@ void drawFirmwareWorkspace(AppState& st);
 bool firmwareTabVisible(AppState& st);
 
 namespace firmware {
-// AI_CAD_SHOT=firmware fixture: seeds a canned project + build console + emulation UART
+// CHUDWARE_SHOT=firmware fixture: seeds a canned project + build console + emulation UART
 // log + GPIO trace so the headless scenario shot exercises the full workspace rendering
 // path without requiring arm-none-eabi-gcc / Renode on the box.
 void seedFirmwareShotFixture();

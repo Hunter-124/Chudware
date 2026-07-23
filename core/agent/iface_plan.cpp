@@ -8,7 +8,7 @@
 #include <set>
 #include <sstream>
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 
 namespace {
@@ -835,4 +835,4 @@ std::string build_mismatch_fix_advisory(const std::vector<InterfaceMismatch>& mi
 }
 
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware

@@ -22,7 +22,7 @@ from ._doc import Doc, render
 
 
 def _build(resolved: dict, fmt: str, out_path: Path) -> None:
-    doc = Doc(resolved.get("title", "AI-CAD User Manual"))
+    doc = Doc(resolved.get("title", "Chudware User Manual"))
     for blk in resolved["blocks"]:
         btype = blk.get("type")
         if btype == "title":

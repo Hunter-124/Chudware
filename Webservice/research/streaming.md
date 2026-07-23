@@ -1,4 +1,4 @@
-# Streaming a containerized Billet (GLFW/OpenGL) session to browsers
+# Streaming a containerized Chudware (GLFW/OpenGL) session to browsers
 
 **Date:** 2026-07-14  
 **Scope:** External research only — rootless Podman on Fedora 44, RTX 3080 Ti (driver 580), 3–6 concurrent users, per-user session containers, OAuth gateway in front.  
@@ -12,14 +12,14 @@ Hostd (in-repo) is an AF_UNIX engine daemon and does **not** replace a remote GU
 
 | Rank | Stack | Verdict for us |
 |------|--------|----------------|
-| **1 (winner)** | **Selkies + GLX desktop image (custom Billet layer)** | Best browser-native WebSocket/WebRTC path, unprivileged-container design, NVENC, single reverse-proxy port, identity via HTTP auth / gateway |
+| **1 (winner)** | **Selkies + GLX desktop image (custom Chudware layer)** | Best browser-native WebSocket/WebRTC path, unprivileged-container design, NVENC, single reverse-proxy port, identity via HTTP auth / gateway |
 | 2 | **neko (m1k1o) + custom XFCE/KDE image** | Strong multi-viewer WebRTC, Apache-2.0, NVENC images exist; multi-control model is watch-party oriented, not ideal for private CAD sessions |
 | 3 | **Wolf / Games-on-Whales** | Excellent multi-tenant Moonlight + Docker orchestration, MIT; **native Moonlight client**, not first-class browser; needs docker.sock / host network — awkward for rootless Podman + our OAuth HTML gateway |
 | 4 | **Sunshine + moonlight-web-stream** | Best encode latency for native clients; web path is third-party GPL, pairing UX, multi-port GameStream heritage |
 | 5 | **VirtualGL + TurboVNC/x11vnc + noVNC** | Proven OpenGL remote path; high latency vs H.264 game-stream; fine as **CPU/no-NVENC fallback** |
 | 6 | **Xpra HTML5** | Great for app persistence; HTML5 client often falls off NVENC/video path to picture encodings — wrong for dense 3D CAD |
 
-**WASM:** Do **not** ship Billet as WASM for multi-user production. OCCT-in-WASM demos exist; full desktop + CUDA-adjacent stack is not realistic. WASM does **not** protect IP.
+**WASM:** Do **not** ship Chudware as WASM for multi-user production. OCCT-in-WASM demos exist; full desktop + CUDA-adjacent stack is not realistic. WASM does **not** protect IP.
 
 ---
 
@@ -39,7 +39,7 @@ First-class. Official images:
 - `docker-selkies-egl-desktop` — EGL + VirtualGL path, better multi-container sharing of one GPU  
 
 Images designed for **unprivileged Docker/Kubernetes**, no systemd, no privileged mode. Tags: Ubuntu 20.04/22.04/24.04.  
-**Per-user model:** one container per session (exactly our tenancy). Bake Billet + deps into a `FROM ghcr.io/selkies-project/nvidia-glx-desktop:24.04` derivative; launch one Podman container per authenticated user.
+**Per-user model:** one container per session (exactly our tenancy). Bake Chudware + deps into a `FROM ghcr.io/selkies-project/nvidia-glx-desktop:24.04` derivative; launch one Podman container per authenticated user.
 
 ### GPU encode (NVENC)
 - `SELKIES_ENCODER=nvh264enc` (and related) when GPU lists H.264 under NVENC matrix; else `x264enc` / VP8/VP9 software.  
@@ -64,7 +64,7 @@ Supported (Opus); we can ignore/disable.
 
 ### Maintenance / license
 - Active: ~1.9k stars, CI image builds, Discord, docs site.  
-- **MPL-2.0** — file-level copyleft; fine as **standalone container process** (not linked into Billet). Prefer not to link MPL into proprietary binary; run side-by-side.
+- **MPL-2.0** — file-level copyleft; fine as **standalone container process** (not linked into Chudware). Prefer not to link MPL into proprietary binary; run side-by-side.
 
 ### Fit score for us
 **Best overall.** Matches headless-ish workstation VDI, OpenGL X11, NVENC, browser-only clients, reverse-proxy friendliness, rootless-friendly design.
@@ -277,7 +277,7 @@ podman run --rm --device nvidia.com/gpu=all --security-opt label=disable \
 
 | Resource | Per active CAD session (estimate) | 6 users (upper) |
 |----------|-----------------------------------|-----------------|
-| RAM | 2–6 GiB (desktop + Billet + OCC model) + ~200–400 MiB streamer | 12–36 GiB (host has 32 GiB → **cap ~4–5 heavy sessions** or limit model size) |
+| RAM | 2–6 GiB (desktop + Chudware + OCC model) + ~200–400 MiB streamer | 12–36 GiB (host has 32 GiB → **cap ~4–5 heavy sessions** or limit model size) |
 | CPU | 0.5–2 cores interactive; software encode +2–4 cores if no NVENC | Prefer NVENC always |
 | VRAM | 1–3 GiB viewport/meshes + small NVENC context; shared 12 GiB | **Budget ~1.5–2 GiB/user** → 6 users tight; enforce resolution/AA limits |
 | Encode | NVENC session ×1 per user (≤8 OK) | |
@@ -290,9 +290,9 @@ Host: 6C/12T Ryzen — fine for 3–6 light sessions with NVENC; CPU encode fall
 
 | Question | Answer |
 |----------|--------|
-| Realistic to compile full Billet (C++/OCC/OpenGL/CUDA-adjacent, ImGui/GLFW desktop) to WASM? | **No** as a product path. OCCT **samples** and community ports (`opencascade.js`, occt-wasm ~4–5 MB brotli kernels, Cascade Studio) prove **kernel subsets** work under Emscripten. Full parametric app + native UI + CUDA/GPU compute + hostd/PLM integration does not. |
+| Realistic to compile full Chudware (C++/OCC/OpenGL/CUDA-adjacent, ImGui/GLFW desktop) to WASM? | **No** as a product path. OCCT **samples** and community ports (`opencascade.js`, occt-wasm ~4–5 MB brotli kernels, Cascade Studio) prove **kernel subsets** work under Emscripten. Full parametric app + native UI + CUDA/GPU compute + hostd/PLM integration does not. |
 | Sources | https://dev.opencascade.org/doc/occt-7.7.0/overview/html/occt_samples_webgl.html · https://github.com/donalffons/opencascade.js · https://github.com/andymai/occt-wasm |
-| Does WASM protect IP? | **No.** Clients download the `.wasm` module; it is reverse-engineerable (wasm-decompile, WABT, dynamic tracing). Complexity is only an obstacle, not protection. OCCT itself is **LGPL-2.1** — shipping modified kernel has obligations. Proprietary Billet logic in WASM is still on the attacker’s machine. Real IP control = **server-side execution** (our container sessions), licenses, and not shipping kernels to untrusted clients. |
+| Does WASM protect IP? | **No.** Clients download the `.wasm` module; it is reverse-engineerable (wasm-decompile, WABT, dynamic tracing). Complexity is only an obstacle, not protection. OCCT itself is **LGPL-2.1** — shipping modified kernel has obligations. Proprietary Chudware logic in WASM is still on the attacker’s machine. Real IP control = **server-side execution** (our container sessions), licenses, and not shipping kernels to untrusted clients. |
 
 **Decision:** stream native Linux sessions; keep engine on the workstation.
 
@@ -306,13 +306,13 @@ Host: 6C/12T Ryzen — fine for 3–6 light sessions with NVENC; CPU encode fall
 Why this wins (≤3 bullets):
 1. **Browser-native, single HTTP(S)+WebSocket port** — maps cleanly to Cloudflare/our gateway without Moonlight pairing or multi-port GameStream.  
 2. **Built for unprivileged GPU containers + isolated Xorg** — matches GLFW/OpenGL 3.3 X11 app and rootless Podman/CDI; official GLX desktop is the closest turnkey to “CAD workstation in a box.”  
-3. **NVENC with software fallback**, MPL-2.0 standalone process (not linked into Billet), active maintenance; multi-tenancy = container-per-user by design.
+3. **NVENC with software fallback**, MPL-2.0 standalone process (not linked into Chudware), active maintenance; multi-tenancy = container-per-user by design.
 
 ### Exact container approach
 ```text
 FROM ghcr.io/selkies-project/nvidia-glx-desktop:24.04
-# Install Billet runtime deps, copy billet binary + OCC libs
-# ENTRYPOINT: existing supervisord → Xorg + Selkies + start billet (or session script)
+# Install Chudware runtime deps, copy chudware binary + OCC libs
+# ENTRYPOINT: existing supervisord → Xorg + Selkies + start chudware (or session script)
 ENV SELKIES_ENCODER=nvh264enc
 ENV SELKIES_FRAMERATE=60
 ENV SELKIES_VIDEO_BITRATE=8000
@@ -322,8 +322,8 @@ ENV SELKIES_ENABLE_BASIC_AUTH=true   # or false if gateway-only
 
 Orchestrator (our gateway service):
 1. OAuth completes → mint session id.  
-2. `podman run -d --name billet-$user --device nvidia.com/gpu=0 --security-opt label=disable \`  
-   `-e PASSWD=... -e SELKIES_BASIC_AUTH_PASSWORD=$token -p 127.0.0.1:$port:8080 billet-selkies:latest`  
+2. `podman run -d --name chudware-$user --device nvidia.com/gpu=0 --security-opt label=disable \`  
+   `-e PASSWD=... -e SELKIES_BASIC_AUTH_PASSWORD=$token -p 127.0.0.1:$port:8080 chudware-selkies:latest`  
 3. Reverse proxy `https://cad.example/$user/` → `localhost:$port` with auth cookie; optional disable Selkies basic auth if proxy is sole gate.  
 4. Idle timeout → `podman stop/rm`.  
 5. Mount shared PLM git-vault read/write via bind mount (`:U`/uidmap as needed).
@@ -357,12 +357,12 @@ Alternative if many containers share one GPU poorly on GLX: evaluate **egl-deskt
 
 ## OPEN QUESTIONS
 
-1. **VRAM packing:** Real Billet viewport VRAM at 1080p/1440p with typical student assemblies — measure before promising 6 concurrent seats on 12 GiB.  
+1. **VRAM packing:** Real Chudware viewport VRAM at 1080p/1440p with typical student assemblies — measure before promising 6 concurrent seats on 12 GiB.  
 2. **Rootless + Xorg inside container:** Confirm Selkies GLX image under rootless Podman on Fedora SELinux without `label=disable`; may need custom SELinux module.  
 3. **TURN vs WebSocket-only:** Default Selkies WebSocket mode may avoid TURN for same-site reverse proxy; validate WAN users through Cloudflare (WebSocket OK; UDP WebRTC may need separate path).  
 4. **Clipboard / file upload:** Selkies supports clipboard; do we expose folder mounts only via PLM, or also container home bind mounts?  
 5. **Idle reclaim & GPU reset:** Policy when user disconnects but container holds VRAM.  
-6. **EGL vs GLX final pick** after one spike: run Billet under both Selkies GLX and EGL images once toolkit is installed.  
+6. **EGL vs GLX final pick** after one spike: run Chudware under both Selkies GLX and EGL images once toolkit is installed.  
 7. **License distribution:** Shipping Selkies MPL-2.0 in image requires providing MPL corresponding source for modified MPL files — process checklist.  
 8. **Audio:** Keep disabled to save cycles?  
 9. **Cloudflare Tunnel:** Single tunnel to gateway vs per-session ports — recommend gateway multiplex only.  

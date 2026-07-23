@@ -2,20 +2,20 @@
 actual bore radius from the volume removed (full-through => vol = pi*r^2*20)."""
 import ctypes, json, os, math
 
-DIST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dist", "AI-CAD")
+DIST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dist", "Chudware")
 os.add_dll_directory(DIST)
-dll = ctypes.CDLL(os.path.join(DIST, "libaicad.dll"))
-dll.aicad_call.restype = ctypes.c_int
-dll.aicad_call.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p)]
-dll.aicad_free.argtypes = [ctypes.c_char_p]
+dll = ctypes.CDLL(os.path.join(DIST, "libchudware.dll"))
+dll.chudware_call.restype = ctypes.c_int
+dll.chudware_call.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p)]
+dll.chudware_free.argtypes = [ctypes.c_char_p]
 
 
 def call(m, p):
     o = ctypes.c_char_p()
-    dll.aicad_call(m.encode(), json.dumps(p).encode(), ctypes.byref(o))
+    dll.chudware_call(m.encode(), json.dumps(p).encode(), ctypes.byref(o))
     s = o.value.decode() if o.value else ""
     if o.value:
-        dll.aicad_free(o)
+        dll.chudware_free(o)
     return json.loads(s) if s else {}
 
 

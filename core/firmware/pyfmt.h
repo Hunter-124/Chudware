@@ -8,7 +8,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad::firmware {
+namespace chudware::firmware {
 
 // Python f"{v:g}" (== C %g: 6 significant digits, trailing zeros stripped).
 std::string fmt_g(double v);
@@ -23,4 +23,4 @@ std::string py_repr(const nlohmann::json& v);
 // Python f"{x:#x}".
 std::string fmt_hex(long long v);
 
-}  // namespace aicad::firmware
+}  // namespace chudware::firmware

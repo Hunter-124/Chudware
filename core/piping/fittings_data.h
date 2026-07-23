@@ -3,7 +3,7 @@
 // no ASME text) so the C++ catalog needs no runtime data file.
 #pragma once
 
-namespace aicad { namespace piping { inline const char* FITTINGS_CSV = R"CSV(
+namespace chudware { namespace piping { inline const char* FITTINGS_CSV = R"CSV(
 type,nps,nps2,center_to_end,length,flange_class,od,thickness,bolt_circle,bolt_holes,bolt_dia
 elbow,0.5,,38.1,,,,,,,
 tee,0.5,,25.4,,,,,,,
@@ -50,4 +50,4 @@ flange,8.0,,,,150,342.9,28.45,298.45,8,22.35
 flange,10.0,,,,150,406.4,30.23,361.95,12,25.4
 flange,12.0,,,,150,482.6,31.75,431.8,12,25.4
 )CSV";
-}}  // namespace aicad::piping
+}}  // namespace chudware::piping

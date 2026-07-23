@@ -1,6 +1,6 @@
-"""AI-CAD modeling perf-regression harness — time the geometry kernel, catch slowdowns.
+"""Chudware modeling perf-regression harness — time the geometry kernel, catch slowdowns.
 
-Drives the SAME libaicad the app + MCP use (via core_bridge), times a fixed battery of
+Drives the SAME libchudware the app + MCP use (via core_bridge), times a fixed battery of
 deterministic modeling workloads, and compares against a committed baseline. Built for CI:
 a regression beyond the threshold exits non-zero with a readable diff.
 
@@ -20,7 +20,7 @@ Usage:
   python tools/perf_regression.py --iters 9 --threshold 0.30
   python tools/perf_regression.py --json out.json # also write the full run record
 
-Point at a specific engine with AI_CAD_LIBAICAD=/path/to/libaicad.so (else the resolved dist .so).
+Point at a specific engine with CHUDWARE_LIBCHUDWARE=/path/to/libchudware.so (else the resolved dist .so).
 """
 from __future__ import annotations
 
@@ -99,7 +99,7 @@ def _time_build(ops, iters, warmup=1):
 
 def _time_open(iters, warmup=1):
     """Median/min/max ms to cold-open a saved .step+ (full rebuild each open)."""
-    path = str(Path(tempfile.gettempdir()) / "aicad_perf_open.step+")
+    path = str(Path(tempfile.gettempdir()) / "chudware_perf_open.step+")
     d = cb.call("doc_new", {"kind": "part", "name": "perf_open"})["doc_id"]
     cb.call("doc_apply_ops", {"doc_id": d, "ops": OPEN_PART})
     cb.call("doc_save", {"doc_id": d, "path": path})
@@ -186,7 +186,7 @@ def run(iters):
     builds = {name: _time_build(ops, iters) for name, ops in WORKLOADS.items()}
     builds["open_cold"] = _time_open(iters)
     return {
-        "engine": os.environ.get("AI_CAD_LIBAICAD", str(getattr(cb, "dist_dir", lambda: "?")())),
+        "engine": os.environ.get("CHUDWARE_LIBCHUDWARE", str(getattr(cb, "dist_dir", lambda: "?")())),
         "git_sha": _git_sha(),
         "iters": iters,
         "metrics": builds,
@@ -240,11 +240,11 @@ def main(argv):
     args = ap.parse_args(argv[1:])
 
     if not cb.available():
-        print("ERROR: libaicad not loadable. Build core (build-occt-linux) and set "
-              "AI_CAD_LIBAICAD, or stage services/dist. See docs/PROFILER.md.")
+        print("ERROR: libchudware not loadable. Build core (build-occt-linux) and set "
+              "CHUDWARE_LIBCHUDWARE, or stage services/dist. See docs/PROFILER.md.")
         return 2
 
-    print(f"AI-CAD perf-regression  ·  iters={args.iters}  threshold={args.threshold:.0%}  "
+    print(f"Chudware perf-regression  ·  iters={args.iters}  threshold={args.threshold:.0%}  "
           f"sha={_git_sha()}")
     current = run(args.iters)
 

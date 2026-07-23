@@ -1,7 +1,7 @@
 """ECAD → 3D bridge: turn a ``BoardDocument`` into a STEP solid + a CAD ``aicad.part/1`` doc.
 
 This is *the* headline integration (docs/contracts/ecad/fab_outputs.md §5): a finished PCB drops
-straight into the existing AI-CAD 3D workspace so the user can model an enclosure around it.
+straight into the existing Chudware 3D workspace so the user can model an enclosure around it.
 
 Public surface
 --------------

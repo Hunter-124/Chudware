@@ -10,7 +10,7 @@
 >
 > **Compliance is normative.** No website scraping. Providers use a supplier's *approved* API
 > with the customer's own credentials, or user-registered downloads. Provider API keys are
-> configuration (`%APPDATA%/AI-CAD/config.json`), never committed. See `docs/PARTS_LIBRARY.md`
+> configuration (`%APPDATA%/Chudware/config.json`), never committed. See `docs/PARTS_LIBRARY.md`
 > and `CONTRIBUTING.md`.
 
 ## 0. Conventions

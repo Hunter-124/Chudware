@@ -1029,7 +1029,7 @@
           "run_id": "gym_C1_open_xai:grok-4-5_s3"
         },
         "ok": true,
-        "result": "{\n  \"ok\": false,\n  \"reason\": \"Build graph run 'gym_C1_open_xai:grok-4-5_s3' not found\",\n  \"hint\": \"Check run_id (from buildgraph_plan) and runs_dir (default: /home/hunter/.local/share/AI-CAD/runs).\"\n}"
+        "result": "{\n  \"ok\": false,\n  \"reason\": \"Build graph run 'gym_C1_open_xai:grok-4-5_s3' not found\",\n  \"hint\": \"Check run_id (from buildgraph_plan) and runs_dir (default: /home/hunter/.local/share/Chudware/runs).\"\n}"
       }
     },
     {

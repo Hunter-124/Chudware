@@ -1,10 +1,10 @@
-// libaicad C ABI implementation — see libaicad.h.
+// libchudware C ABI implementation — see libchudware.h.
 //
 // Dispatches string-in/string-out JSON calls to the C++ core. Today it serves:
 //   ping             liveness + ABI echo (no kernel work; used by the host to
 //                    confirm the DLL loaded and its OCCT deps resolved).
 //   doc_compile_cpp  DIAGNOSTIC compile: takes a full document feature tree +
-//                    env, runs aicad::doc::compile_document, writes the surviving
+//                    env, runs chudware::doc::compile_document, writes the surviving
 //                    bodies to an AICM file, and returns the per-feature statuses
 //                    + body count + the AICM path. This is the strangler's
 //                    parity probe (Step 2 of docs/CPP_MIGRATION.md): the host can
@@ -14,10 +14,10 @@
 // Everything here is exception-safe: any throw becomes a nonzero return with an
 // {"error":...} payload so a bug in the C++ core can never crash the host.
 
-#include "api/libaicad.h"
+#include "api/libchudware.h"
 
 #include "util/aicm_handoff.h"
-#include "version_info.h"  // CMake-configured AICAD_HOSTD_BUILD_ID (shared with aicad-hostd)
+#include "version_info.h"  // CMake-configured CHUDWARE_HOSTD_BUILD_ID (shared with chudware-hostd)
 
 #include <algorithm>
 #include <array>
@@ -86,16 +86,16 @@
 #include "cam/extract.h"
 #include "geom/aicm.h"
 #include "geom/ecad_3d.h"
-#ifdef AICAD_WITH_NETGEN
+#ifdef CHUDWARE_WITH_NETGEN
 #include "sim/fea_fatigue.h"
 #endif
 #include "sim/fea_modal.h"
-#ifdef AICAD_WITH_NETGEN
+#ifdef CHUDWARE_WITH_NETGEN
 #include "sim/fea_run.h"
 #endif
 #include "sim/fea_static.h"
 #include "sim/lbm.h"
-#ifdef AICAD_WITH_NETGEN
+#ifdef CHUDWARE_WITH_NETGEN
 #include "sim/mesher.h"
 #endif
 #include "sim/netlist.h"
@@ -119,7 +119,7 @@ using nlohmann::json;
 
 namespace {
 
-// malloc a NUL-terminated copy of `s` so the host frees it with aicad_free()
+// malloc a NUL-terminated copy of `s` so the host frees it with chudware_free()
 // (std::free). Returns nullptr only on allocation failure.
 char* dup_cstr(const std::string& s) {
     char* p = static_cast<char*>(std::malloc(s.size() + 1));
@@ -164,7 +164,7 @@ int emit_error(const std::string& msg, char** out_json) {
 json omp_bridge_proxy(const char* bridge_method, const json& bridge_params) {
     json result;
     std::string err;
-    const bool ok = aicad::agent::OmpBridgeClient::instance().call(bridge_method, bridge_params,
+    const bool ok = chudware::agent::OmpBridgeClient::instance().call(bridge_method, bridge_params,
                                                                     result, err);
     if (!ok) {
         std::string msg = (result.is_object() && result.contains("message") &&
@@ -204,42 +204,42 @@ bool prof_is_modeling_method(const std::string& m) {
     return false;
 }
 
-// Default output directory for env-var auto-profile reports: %APPDATA%/AI-CAD/prof
+// Default output directory for env-var auto-profile reports: %APPDATA%/Chudware/prof
 // (matches the handoff/cache convention used elsewhere), falling back to the temp dir.
 std::filesystem::path prof_default_out_dir() {
     std::error_code ec;
     const char* appdata = std::getenv("APPDATA");
     std::filesystem::path base;
     if (appdata && appdata[0]) {
-        base = std::filesystem::path(appdata) / "AI-CAD" / "prof";
+        base = std::filesystem::path(appdata) / "Chudware" / "prof";
     } else {
-        base = std::filesystem::temp_directory_path(ec) / "AI-CAD-prof";
+        base = std::filesystem::temp_directory_path(ec) / "Chudware-prof";
     }
     std::filesystem::create_directories(base, ec);
     return base;
 }
 
-// One-time env-var auto-profile: AI_CAD_PROFILE=1 starts the sampler (modeling mode) for
+// One-time env-var auto-profile: CHUDWARE_PROFILE=1 starts the sampler (modeling mode) for
 // the whole process; on exit a report (folded + speedscope + a flat .txt) is written under
-// AI_CAD_PROFILE_OUT (default %APPDATA%/AI-CAD/prof). AI_CAD_PROFILE_HZ tunes the rate.
+// CHUDWARE_PROFILE_OUT (default %APPDATA%/Chudware/prof). CHUDWARE_PROFILE_HZ tunes the rate.
 // Zero-touch: just launch the app/MCP with the var set, model normally, close it.
 std::once_flag g_prof_env_once;
 void prof_env_init_once() {
     std::call_once(g_prof_env_once, []() {
-        const char* on = std::getenv("AI_CAD_PROFILE");
+        const char* on = std::getenv("CHUDWARE_PROFILE");
         if (!on || on[0] == '\0' || on[0] == '0') return;
         unsigned hz = 1000;
-        if (const char* h = std::getenv("AI_CAD_PROFILE_HZ")) {
+        if (const char* h = std::getenv("CHUDWARE_PROFILE_HZ")) {
             int v = std::atoi(h);
             if (v > 0) hz = static_cast<unsigned>(v);
         }
         unsigned interval_us = hz > 0 ? (1000000u / hz) : 1000u;
-        if (!aicad::prof::start(interval_us, "modeling")) return;
+        if (!chudware::prof::start(interval_us, "modeling")) return;
         std::atexit([]() {
-            if (!aicad::prof::active()) return;
-            aicad::prof::stop();
+            if (!chudware::prof::active()) return;
+            chudware::prof::stop();
             std::filesystem::path dir;
-            if (const char* o = std::getenv("AI_CAD_PROFILE_OUT")) {
+            if (const char* o = std::getenv("CHUDWARE_PROFILE_OUT")) {
                 std::error_code ec;
                 dir = std::filesystem::path(o);
                 std::filesystem::create_directories(dir, ec);
@@ -250,7 +250,7 @@ void prof_env_init_once() {
                 {"top", 60},
                 {"write_folded", (dir / "modeling.folded").string()},
                 {"write_speedscope", (dir / "modeling.speedscope.json").string()}};
-            aicad::prof::report(opts);
+            chudware::prof::report(opts);
         });
     });
 }
@@ -307,7 +307,7 @@ std::filesystem::path aicm_target(const json& params) {
     static std::atomic<unsigned long long> seq{0};
     unsigned long long n = seq.fetch_add(1);
     std::filesystem::path dir = std::filesystem::temp_directory_path();
-    return dir / ("aicad_cpp_" + std::to_string(n) + ".aicm");
+    return dir / ("chudware_cpp_" + std::to_string(n) + ".aicm");
 }
 
 // Prefer aicm-shm handoff for diagnostic compiles too (same consumer path as session).
@@ -324,7 +324,7 @@ std::string publish_or_write_aicm(const json& params, const std::vector<uint8_t>
     static std::atomic<unsigned long long> seq{0};
     unsigned long long n = seq.fetch_add(1);
     const std::string key = "compile_" + std::to_string(n);
-    std::string uri = aicad::aicm_handoff::publish(key, aicm);
+    std::string uri = chudware::aicm_handoff::publish(key, aicm);
     if (!uri.empty()) return uri;
     std::filesystem::path target = aicm_target(params);
     std::ofstream f(target, std::ios::binary | std::ios::trunc);
@@ -350,7 +350,7 @@ int handle_compile(const json& params, char** out_json) {
     }
     json env = params.contains("env") ? params["env"] : json::object();
 
-    aicad::doc::CompileResult res = aicad::doc::compile_document(doc, env);
+    chudware::doc::CompileResult res = chudware::doc::compile_document(doc, env);
 
     json statuses = json::array();
     for (const auto& s : res.statuses) {
@@ -415,7 +415,7 @@ void hydrate_assist_from_session(nlohmann::ordered_json& op, const std::string& 
     if (!need_doc && !need_rev && !need_fs) return;
     try {
         // doc_tree -> {revision, tree}. Throws OpError for an unknown doc.
-        json t = aicad::doc::doc_tree(doc_id);
+        json t = chudware::doc::doc_tree(doc_id);
         if (need_doc && t.contains("tree"))
             op["doc"] = ojson::parse(t["tree"].dump());
         if (need_rev && t.contains("revision") && t["revision"].is_number())
@@ -423,7 +423,7 @@ void hydrate_assist_from_session(nlohmann::ordered_json& op, const std::string& 
         if (need_fs) {
             // feature_status lives in the rebuild response (doc_rebuild forces a
             // recompile without bumping the revision).
-            json rb = aicad::doc::doc_rebuild(doc_id);
+            json rb = chudware::doc::doc_rebuild(doc_id);
             if (rb.contains("rebuild") && rb["rebuild"].contains("feature_status"))
                 op["feature_status"] = ojson::parse(rb["rebuild"]["feature_status"].dump());
         }
@@ -453,18 +453,18 @@ static nlohmann::json apply_model_overrides(nlohmann::json desc, const nlohmann:
 // explicit provider, so this fallback never runs under them.
 // O1: params.provider may now also be a provider NAME string (the GUI picker's explicit
 // override) — resolved via resolve_provider(name, cfg, env) so it beats an ambient
-// AI_CAD_PROVIDER env var, then params.model / params.reasoning_effort refine the descriptor.
+// CHUDWARE_PROVIDER env var, then params.model / params.reasoning_effort refine the descriptor.
 // The offline (ITAR) guard still applies — a refused name returns {error:...} as before.
 nlohmann::json resolve_assist_provider(const nlohmann::json& params) {
     if (params.contains("provider") && params["provider"].is_object() &&
         !params["provider"].empty())
         return params["provider"];  // explicit descriptor (gate mock / full host override)
-    json cfg = aicad::agent::load_config();
+    json cfg = chudware::agent::load_config();
     std::optional<std::string> name;
     if (params.contains("provider") && params["provider"].is_string() &&
         !params["provider"].get<std::string>().empty())
         name = params["provider"].get<std::string>();
-    json desc = aicad::agent::resolve_provider(name, cfg, nlohmann::json::object());
+    json desc = chudware::agent::resolve_provider(name, cfg, nlohmann::json::object());
     return apply_model_overrides(std::move(desc), params);
 }
 
@@ -480,7 +480,7 @@ nlohmann::json run_flow_sim(const std::string& doc_id, const std::string& reques
     std::string lo = request;
     std::transform(lo.begin(), lo.end(), lo.begin(),
                    [](unsigned char c) { return (char)std::tolower(c); });
-    aicad::sim::FlowParams fp;
+    chudware::sim::FlowParams fp;
     // velocity: explicit param wins; else parse "<n> m/s|mps|mph|km/h|kph|knots".
     if (params.contains("velocity")) {
         fp.velocity_ms = params.value("velocity", 10.0);
@@ -510,7 +510,7 @@ nlohmann::json run_flow_sim(const std::string& doc_id, const std::string& reques
     fp.cells = params.value("cells", 96);
     fp.n_steps = params.value("n_steps", 2000);
 
-    std::vector<aicm::AicmBody> bodies = aicad::doc::doc_tessellate_bodies(doc_id);
+    std::vector<aicm::AicmBody> bodies = chudware::doc::doc_tessellate_bodies(doc_id);
     if (bodies.empty())
         return json{{"ok", false},
                     {"answer", "There's no solid geometry to simulate yet — model "
@@ -525,8 +525,8 @@ nlohmann::json run_flow_sim(const std::string& doc_id, const std::string& reques
     if (params.value("solver", std::string()) == "openfoam") {
         try {
             std::filesystem::path p = std::filesystem::temp_directory_path() /
-                ("aicad_cfd_" + doc_id + ".stl");
-            aicad::doc::doc_export_file(doc_id, p.string(), "stl", 0.0, 0.0, false, false);
+                ("chudware_cfd_" + doc_id + ".stl");
+            chudware::doc::doc_export_file(doc_id, p.string(), "stl", 0.0, 0.0, false, false);
             return json{{"ok", true}, {"needs_openfoam", true}, {"stl_path", p.string()},
                         {"velocity_ms", fp.velocity_ms}, {"aoa_deg", fp.aoa_deg},
                         {"fluid", fluid},
@@ -541,7 +541,7 @@ nlohmann::json run_flow_sim(const std::string& doc_id, const std::string& reques
     std::vector<std::vector<uint32_t>> bi;
     for (auto& b : bodies) { bp.push_back(b.pos); bi.push_back(b.idx); }
     double re = 0.0;
-    aicad::sim::LbmResult r = aicad::sim::run_wind_tunnel(bp, bi, fp, &re);
+    chudware::sim::LbmResult r = chudware::sim::run_wind_tunnel(bp, bi, fp, &re);
     if (!r.ok)
         return json{{"ok", false}, {"answer", "The flow sim could not run: " + r.error}};
     std::string warn = r.warning.empty() ? std::string() : (" WARNING: " + r.warning);
@@ -569,25 +569,25 @@ nlohmann::json run_flow_sim(const std::string& doc_id, const std::string& reques
 
 extern "C" {
 
-AICAD_API const char* aicad_abi_version(void) { return "1"; }
+CHUDWARE_API const char* chudware_abi_version(void) { return "1"; }
 
-// Same configure_file'd id aicad-hostd embeds (core/hostd/version_info.h.in) —
+// Same configure_file'd id chudware-hostd embeds (core/hostd/version_info.h.in) —
 // one source of truth, so a matched-build daemon + engine report ONE id.
-AICAD_API const char* aicad_build_id(void) { return AICAD_HOSTD_BUILD_ID; }
+CHUDWARE_API const char* chudware_build_id(void) { return CHUDWARE_HOSTD_BUILD_ID; }
 
-AICAD_API void aicad_free(char* s) { std::free(s); }
+CHUDWARE_API void chudware_free(char* s) { std::free(s); }
 
 // Live event streaming: bridge the flat C callback to the core's thread-local run-event sink
 // (agent::set_stream_event_sink). Called on the host/daemon dispatch thread right before an
-// agent_* aicad_call so run events surface AS THEY HAPPEN; cleared (cb=NULL) right after.
-AICAD_API void aicad_set_event_sink(void (*cb)(const char* event_json, void* ud), void* ud) {
+// agent_* chudware_call so run events surface AS THEY HAPPEN; cleared (cb=NULL) right after.
+CHUDWARE_API void chudware_set_event_sink(void (*cb)(const char* event_json, void* ud), void* ud) {
     if (cb) {
-        aicad::agent::set_stream_event_sink([cb, ud](const nlohmann::json& ev) {
+        chudware::agent::set_stream_event_sink([cb, ud](const nlohmann::json& ev) {
             const std::string s = ev.dump();
             cb(s.c_str(), ud);
         });
     } else {
-        aicad::agent::set_stream_event_sink({});
+        chudware::agent::set_stream_event_sink({});
     }
 }
 
@@ -651,16 +651,16 @@ static json cam_program_from_part(const std::string& part_doc_id, const json& op
     // --- export the part to a temp STEP, then extract what the chosen ops need ------
     std::error_code ec;
     std::filesystem::path step =
-        std::filesystem::temp_directory_path(ec) / ("aicad_cam_" + part_doc_id + ".step");
+        std::filesystem::temp_directory_path(ec) / ("chudware_cam_" + part_doc_id + ".step");
     try {
-        aicad::doc::doc_export_step(part_doc_id, step.string());
+        chudware::doc::doc_export_step(part_doc_id, step.string());
     } catch (const std::exception& e) {
         return json{{"ok", false}, {"error", std::string("export failed: ") + e.what()}};
     }
     auto extract = [&](const char* kind, double z, bool useZ) -> json {
         json p = {{"path", step.string()}, {"kind", kind}, {"deflection", 0.1}};
         if (useZ) p["z"] = z;
-        try { return aicad::cam::cam_extract(p); } catch (...) { return json::object(); }
+        try { return chudware::cam::cam_extract(p); } catch (...) { return json::object(); }
     };
 
     json ex = extract("all", 0, false);
@@ -695,13 +695,13 @@ static json cam_program_from_part(const std::string& part_doc_id, const json& op
     // --- create the job ------------------------------------------------------------
     std::string partName;
     try {
-        json t = aicad::doc::doc_tree(part_doc_id);
+        json t = chudware::doc::doc_tree(part_doc_id);
         if (t.contains("tree")) partName = t["tree"].value("name", std::string());
     } catch (...) {}
     if (partName.empty()) partName = "Part";
     std::string cam_id;
     try {
-        json nj = aicad::cam::cam_new(json{{"name", partName + " CAM"}, {"post", dialect}});
+        json nj = chudware::cam::cam_new(json{{"name", partName + " CAM"}, {"post", dialect}});
         cam_id = nj.value("doc_id", std::string());
     } catch (const std::exception& e) {
         return json{{"ok", false}, {"error", std::string("cam_new: ") + e.what()}};
@@ -802,7 +802,7 @@ static json cam_program_from_part(const std::string& part_doc_id, const json& op
                                          {"stock", setupStock}}}});
     json applied;
     try {
-        applied = aicad::cam::cam_apply_ops(cam_id, -1, setupBatch);
+        applied = chudware::cam::cam_apply_ops(cam_id, -1, setupBatch);
     } catch (const std::exception& e) {
         return json{{"ok", false}, {"error", std::string("setup/tools: ") + e.what()}};
     }
@@ -816,7 +816,7 @@ static json cam_program_from_part(const std::string& part_doc_id, const json& op
 
     for (auto& o : opBatch) o["setup_id"] = setupId;  // patch the "$S" placeholder
     try {
-        aicad::cam::cam_apply_ops(cam_id, -1, opBatch);
+        chudware::cam::cam_apply_ops(cam_id, -1, opBatch);
     } catch (const std::exception& e) {
         return json{{"ok", false}, {"error", std::string("operations: ") + e.what()}};
     }
@@ -824,12 +824,12 @@ static json cam_program_from_part(const std::string& part_doc_id, const json& op
     // --- generate, simulate, post --------------------------------------------------
     json gen, sim, post;
     try {
-        gen = aicad::cam::cam_generate(cam_id, json::object());
+        gen = chudware::cam::cam_generate(cam_id, json::object());
     } catch (const std::exception& e) {
         return json{{"ok", false}, {"error", std::string("generate: ") + e.what()}};
     }
     try {
-        sim = aicad::cam::cam_simulate(cam_id, json::object());
+        sim = chudware::cam::cam_simulate(cam_id, json::object());
     } catch (const std::exception& e) {
         // captured below into out["sim_error"]
         sim = json{{"_sim_error", e.what()}};
@@ -837,7 +837,7 @@ static json cam_program_from_part(const std::string& part_doc_id, const json& op
         sim = json{{"_sim_error", "unknown sim error"}};
     }
     try {
-        post = aicad::cam::cam_post(cam_id, json{{"dialect", dialect}, {"program_name", "AICAD"}});
+        post = chudware::cam::cam_post(cam_id, json{{"dialect", dialect}, {"program_name", "Chudware"}});
     } catch (const std::exception& e) {
         return json{{"ok", false}, {"error", std::string("post: ") + e.what()}};
     }
@@ -846,12 +846,12 @@ static json cam_program_from_part(const std::string& part_doc_id, const json& op
     std::string ncPath;
     try {
         std::filesystem::path nc = std::filesystem::temp_directory_path(ec) /
-                                   ("aicad_cam_" + part_doc_id + "." + dialect + ".nc");
+                                   ("chudware_cam_" + part_doc_id + "." + dialect + ".nc");
         std::ofstream f(nc);
         if (f) { f << gcode; ncPath = nc.string(); }
     } catch (...) {}
 
-    json tree = aicad::cam::cam_tree(cam_id);
+    json tree = chudware::cam::cam_tree(cam_id);
     int opCount = 0;
     if (tree.contains("tree") && tree["tree"].contains("setups"))
         for (auto& s : tree["tree"]["setups"])
@@ -890,9 +890,9 @@ static json cam_extract_from_doc(const std::string& part_doc_id, const json& par
     std::error_code ec;
     std::filesystem::path step =
         std::filesystem::temp_directory_path(ec) /
-        ("aicad_cam_extract_" + part_doc_id + ".step");
+        ("chudware_cam_extract_" + part_doc_id + ".step");
     try {
-        aicad::doc::doc_export_step(part_doc_id, step.string());
+        chudware::doc::doc_export_step(part_doc_id, step.string());
     } catch (const std::exception& e) {
         return json{{"error", std::string("export failed: ") + e.what()}};
     }
@@ -901,7 +901,7 @@ static json cam_extract_from_doc(const std::string& part_doc_id, const json& par
     // cam_extract only understands path/kind/z/... — drop the doc_id we were given.
     if (p.contains("doc_id")) p.erase("doc_id");
     try {
-        return aicad::cam::cam_extract(p);
+        return chudware::cam::cam_extract(p);
     } catch (const std::exception& e) {
         return json{{"error", std::string("cam_extract failed: ") + e.what()}};
     } catch (...) {
@@ -909,14 +909,14 @@ static json cam_extract_from_doc(const std::string& part_doc_id, const json& par
     }
 }
 
-// Real dispatch body. Extracted from aicad_call so the public entry can wrap it in a
+// Real dispatch body. Extracted from chudware_call so the public entry can wrap it in a
 // Windows structured-exception (SEH) guard WITHOUT this function — which is full of
 // C++ objects that require stack unwinding — having to host the __try/__except itself
 // (MSVC C2712: a function that needs C++ object unwinding can't contain __try). This
 // function keeps its own top-level C++ try/catch, so a thrown OpError / std::exception
 // becomes a clean JSON error with every lock_guard/DocLock already released by unwind.
 // Only a hardware fault (access violation) escapes as an SEH; that's caught one frame
-// up in aicad_call.
+// up in chudware_call.
 // Factored body of the parts_make dispatch — shared by the `parts_make` branch and
 // the PlaceSeams::parts_make injection (core/parts/place). rc mirrors the old emit codes.
 static json parts_make_impl(const json& params, int& rc) {
@@ -932,15 +932,15 @@ static json parts_make_impl(const json& params, int& rc) {
         const json opts = (params.contains("options") && params["options"].is_object())
                               ? params["options"]
                               : json::object();
-        aicad::parts::PartBuild pb = aicad::parts::build(family, size, length, opts);
+        chudware::parts::PartBuild pb = chudware::parts::build(family, size, length, opts);
         const std::string nm = params.value("name", pb.name);
-        json nresp = aicad::doc::doc_new("part", nm);
+        json nresp = chudware::doc::doc_new("part", nm);
         const std::string doc_id = nresp.value("doc_id", std::string());
         if (doc_id.empty()) {
             rc = 1;
             return json{{"ok", false}, {"error", "parts_make: doc_new failed"}};
         }
-        json aresp = aicad::doc::doc_apply_ops(doc_id, 0, pb.ops, false);
+        json aresp = chudware::doc::doc_apply_ops(doc_id, 0, pb.ops, false);
         json out;
         out["ok"] = true;
         out["doc_id"] = doc_id;
@@ -948,7 +948,7 @@ static json parts_make_impl(const json& params, int& rc) {
         out["meta"] = pb.meta;
         // Extents + placement datum (Bug A-1); standard parts seat at z=0, axis +Z.
         try {
-            json bb = aicad::doc::doc_bbox(doc_id);
+            json bb = chudware::doc::doc_bbox(doc_id);
             out["bbox"] = bb;
             const auto& mn = bb["min"]; const auto& mx = bb["max"];
             out["datum"] = {
@@ -965,7 +965,7 @@ static json parts_make_impl(const json& params, int& rc) {
         if (aresp.contains("rebuild")) out["rebuild"] = aresp["rebuild"];
         const std::string sp = params.value("save_path", std::string());
         if (!sp.empty()) {
-            json sresp = aicad::doc::doc_export_step(doc_id, sp);
+            json sresp = chudware::doc::doc_export_step(doc_id, sp);
             out["step_path"] = sp;
             out["step_ok"] = sresp.value("ok", true);
         }
@@ -982,18 +982,18 @@ static json parts_make_impl(const json& params, int& rc) {
 // parts+doc, and HTTP via the agent transport (8s cap; providers fail closed
 // without credentials). The LLM dims lane stays empty (spec_sheet_match degrades
 // per contract).
-static aicad::sourcing::Seams build_sourcing_seams() {
-    using aicad::sourcing::HttpResult;
-    using aicad::sourcing::Seams;
+static chudware::sourcing::Seams build_sourcing_seams() {
+    using chudware::sourcing::HttpResult;
+    using chudware::sourcing::Seams;
     Seams s;
     s.load_assembly = [](const std::string& doc_path) -> json {
-        json opened = aicad::doc::doc_open(doc_path);
+        json opened = chudware::doc::doc_open(doc_path);
         if (!opened.is_object() || !opened.contains("doc_id")) return json();
-        return aicad::doc::doc_tree(opened["doc_id"].get<std::string>());
+        return chudware::doc::doc_tree(opened["doc_id"].get<std::string>());
     };
     s.load_board = [](const std::string& path) -> json {
         try {
-            return aicad::ecad::ecad_container_open(path).doc;
+            return chudware::ecad::ecad_container_open(path).doc;
         } catch (...) {
             return json();
         }
@@ -1001,14 +1001,14 @@ static aicad::sourcing::Seams build_sourcing_seams() {
     s.vendor_lookup = [](const json& component) -> json {
         try {
             namespace fs = std::filesystem;
-            const fs::path idx = fs::path(aicad::sourcing::vendor_parts_dir()) / "index.json";
+            const fs::path idx = fs::path(chudware::sourcing::vendor_parts_dir()) / "index.json";
             if (!fs::exists(idx)) return json();
             std::ifstream in(idx);
             json index = json::parse(in);
             std::string mpn = component.value("mpn", std::string());
             if (mpn.empty()) mpn = component.value("part_number", std::string());
             if (mpn.empty()) return json();
-            auto it = index.find(aicad::sourcing::vendor_slug(mpn));
+            auto it = index.find(chudware::sourcing::vendor_slug(mpn));
             return it != index.end() ? *it : json();
         } catch (...) {
             return json();
@@ -1022,14 +1022,14 @@ static aicad::sourcing::Seams build_sourcing_seams() {
             const std::string family = match["family"].get<std::string>();
             const std::string size = match["size"].get<std::string>();
             const double length_mm = match.value("length_mm", 0.0);
-            auto pb = aicad::parts::build(family, size, length_mm, json::object());
-            json created = aicad::doc::doc_new("part", pb.name);
+            auto pb = chudware::parts::build(family, size, length_mm, json::object());
+            json created = chudware::doc::doc_new("part", pb.name);
             const std::string doc_id = created["doc_id"].get<std::string>();
-            aicad::doc::doc_apply_ops(doc_id, created.value("revision", 0L), pb.ops, false);
+            chudware::doc::doc_apply_ops(doc_id, created.value("revision", 0L), pb.ops, false);
             namespace fs = std::filesystem;
-            const fs::path dir = fs::temp_directory_path() / "aicad_spec_models";
+            const fs::path dir = fs::temp_directory_path() / "chudware_spec_models";
             fs::create_directories(dir);
-            json saved = aicad::doc::doc_export_step(doc_id, (dir / (family + "_" + size + ".step")).string());
+            json saved = chudware::doc::doc_export_step(doc_id, (dir / (family + "_" + size + ".step")).string());
             return saved.value("path", std::string());
         } catch (...) {
             return std::string();
@@ -1037,33 +1037,33 @@ static aicad::sourcing::Seams build_sourcing_seams() {
     };
     s.build_spec_model = [](const std::string& tmpl, const json& dims) -> std::string {
         try {
-            json ops = aicad::sourcing::template_build_ops(tmpl, dims);
-            json created = aicad::doc::doc_new("part", tmpl);
+            json ops = chudware::sourcing::template_build_ops(tmpl, dims);
+            json created = chudware::doc::doc_new("part", tmpl);
             const std::string doc_id = created["doc_id"].get<std::string>();
-            aicad::doc::doc_apply_ops(doc_id, created.value("revision", 0L), ops, false);
+            chudware::doc::doc_apply_ops(doc_id, created.value("revision", 0L), ops, false);
             namespace fs = std::filesystem;
-            const fs::path dir = fs::temp_directory_path() / "aicad_spec_models";
+            const fs::path dir = fs::temp_directory_path() / "chudware_spec_models";
             fs::create_directories(dir);
-            json saved = aicad::doc::doc_export_step(doc_id, (dir / (tmpl + ".step")).string());
+            json saved = chudware::doc::doc_export_step(doc_id, (dir / (tmpl + ".step")).string());
             return saved.value("path", std::string());
         } catch (...) {
             return std::string();
         }
     };
     // extract_dims: intentionally empty (LLM lane unported).
-    s.http_post = [](const std::string& url, const aicad::sourcing::HttpHeaders& headers,
+    s.http_post = [](const std::string& url, const chudware::sourcing::HttpHeaders& headers,
                      const std::string& body) -> HttpResult {
-        auto r = aicad::agent::http_post(url, headers, body, 8000);
+        auto r = chudware::agent::http_post(url, headers, body, 8000);
         return HttpResult{r.status, std::move(r.body), std::move(r.error)};
     };
-    s.http_get = [](const std::string& url, const aicad::sourcing::HttpHeaders& headers) -> HttpResult {
-        auto r = aicad::agent::http_get(url, headers, 8000);
+    s.http_get = [](const std::string& url, const chudware::sourcing::HttpHeaders& headers) -> HttpResult {
+        auto r = chudware::agent::http_get(url, headers, 8000);
         return HttpResult{r.status, std::move(r.body), std::move(r.error)};
     };
     return s;
 }
 
-static int aicad_call_inner(const char* method, const char* params_json, char** out_json) {
+static int chudware_call_inner(const char* method, const char* params_json, char** out_json) {
     if (out_json) *out_json = nullptr;
     if (!method) return emit_error("null method", out_json);
 
@@ -1105,25 +1105,25 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
         m = "agent_pm_assist";
     }
 
-    // Env-var auto-profile (AI_CAD_PROFILE=1): start the sampler on the first call so the
+    // Env-var auto-profile (CHUDWARE_PROFILE=1): start the sampler on the first call so the
     // whole session is covered; a report is written on process exit. No-op when unset.
     prof_env_init_once();
     // Register this thread as the profiler's sample target for the duration of the call when
     // the profiler is running AND this is a method we want sampled (modeling-only by default,
     // every method in "all" mode). RAII: target is cleared on every return/throw below.
-    aicad::prof::TargetScope _prof_scope(
-        aicad::prof::active() &&
-        (aicad::prof::mode() == "all" || prof_is_modeling_method(m)));
+    chudware::prof::TargetScope _prof_scope(
+        chudware::prof::active() &&
+        (chudware::prof::mode() == "all" || prof_is_modeling_method(m)));
     // Stamp the calling method so the g_mtx contention meters (DocLock) can attribute lock
     // wait/hold to this RPC (Phase 1b). `m` outlives the call; the pointer is cleared on return.
     struct RpcMethodScope {
-        explicit RpcMethodScope(const char* s) { aicad::doc::set_current_rpc_method(s); }
-        ~RpcMethodScope() { aicad::doc::set_current_rpc_method(nullptr); }
+        explicit RpcMethodScope(const char* s) { chudware::doc::set_current_rpc_method(s); }
+        ~RpcMethodScope() { chudware::doc::set_current_rpc_method(nullptr); }
     } _rpc_method_scope(m.c_str());
 
     try {
         if (m == "ping") {
-            return emit(json{{"ok", true}, {"abi", aicad_abi_version()}, {"echo", params}},
+            return emit(json{{"ok", true}, {"abi", chudware_abi_version()}, {"echo", params}},
                         out_json, 0);
         }
         // --- sampling profiler control (see core/prof/sampler.{h,cpp}) ----------
@@ -1137,39 +1137,39 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                 if (hz > 0) iv = 1000000u / static_cast<unsigned>(hz);
             }
             std::string md = params.value("mode", std::string("modeling"));
-            bool started = aicad::prof::start(iv, md);
+            bool started = chudware::prof::start(iv, md);
             return emit(json{{"ok", true},
                              {"started", started},
                              {"already_running", !started},
-                             {"interval_us", aicad::prof::interval_us()},
-                             {"mode", aicad::prof::mode()}},
+                             {"interval_us", chudware::prof::interval_us()},
+                             {"mode", chudware::prof::mode()}},
                         out_json, 0);
         }
         // prof_stop {top?, write_folded?, write_speedscope?, min_samples?} -> stop +
         // return the symbolized report (also writes the requested files).
         if (m == "prof_stop") {
-            aicad::prof::stop();
-            json r = aicad::prof::report(params);
+            chudware::prof::stop();
+            json r = chudware::prof::report(params);
             // Additive: per-study simulation phase timings (prof/phases.h). Attached even
             // when the sampler captured nothing (r.ok=false) — the phase registry is
             // independent of the sampler and often the only data a sim-only run has.
-            r["phases"] = aicad::prof::phases::report(false);
+            r["phases"] = chudware::prof::phases::report(false);
             return emit(std::move(r), out_json, 0);
         }
         // prof_report {...} -> symbolize + return the report WITHOUT stopping.
         if (m == "prof_report") {
-            json r = aicad::prof::report(params);
-            r["phases"] = aicad::prof::phases::report(false);  // additive (see prof_stop)
+            json r = chudware::prof::report(params);
+            r["phases"] = chudware::prof::phases::report(false);  // additive (see prof_stop)
             return emit(std::move(r), out_json, 0);
         }
         if (m == "prof_status") {
             return emit(json{{"ok", true},
-                             {"active", aicad::prof::active()},
-                             {"samples", aicad::prof::sample_count()},
-                             {"interval_us", aicad::prof::interval_us()},
-                             {"mode", aicad::prof::mode()},
+                             {"active", chudware::prof::active()},
+                             {"samples", chudware::prof::sample_count()},
+                             {"interval_us", chudware::prof::interval_us()},
+                             {"mode", chudware::prof::mode()},
                              // Additive: completed sim studies in the phase registry.
-                             {"phase_studies", aicad::prof::phases::completed_count()}},
+                             {"phase_studies", chudware::prof::phases::completed_count()}},
                         out_json, 0);
         }
         // prof_phases {reset?} -> per-study simulation phase timings (prof/phases.h):
@@ -1177,40 +1177,40 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
         // {domain, total_ms, phases:[{name,ms,count,pct}]}. Always-on (no start needed).
         // reset=true clears the registry AFTER building the report (call before a run).
         if (m == "prof_phases") {
-            return emit(aicad::prof::phases::report(params.value("reset", false)), out_json, 0);
+            return emit(chudware::prof::phases::report(params.value("reset", false)), out_json, 0);
         }
         // prof_tree {path?, depth?, top?} -> nested call-tree over the current sampling
         // aggregation (prof/tree.h). path drills into a subtree ("a/b/c"); depth caps
         // nesting (-1 unlimited); top caps children per level (hot-first). Additive —
         // folded/speedscope/flat report() is unchanged.
         if (m == "prof_tree") {
-            return emit(aicad::prof::tree_report(params), out_json, 0);
+            return emit(chudware::prof::tree_report(params), out_json, 0);
         }
         // prof_phases_tree {path?, depth?, top?, reset?} -> nested study->phase->subphase
         // tree with wall-clock self/total rollups (dotted phase names split on '.').
         // reset=true clears AFTER building (same as prof_phases).
         if (m == "prof_phases_tree") {
             const bool do_reset = params.value("reset", false);
-            return emit(aicad::prof::phases::report_tree(params, do_reset), out_json, 0);
+            return emit(chudware::prof::phases::report_tree(params, do_reset), out_json, 0);
         }
         // prof_contention {reset?} -> g_mtx lock wait/hold/queue-depth meters (Phase 1b).
         // The on-CPU sampler above sees only the ONE thread holding the lock; this reveals the
         // time OTHER threads spend BLOCKED on it — the dominant cost when many subagents drive
         // one engine. reset=true zeroes the counters + restarts the window (call before a run).
         if (m == "prof_contention") {
-            return emit(aicad::doc::contention_report(params.value("reset", false)), out_json, 0);
+            return emit(chudware::doc::contention_report(params.value("reset", false)), out_json, 0);
         }
         // prof_target_push / prof_target_pop {} -> persistently (un)register the CALLING
         // thread as the sampler's stack-walk target beyond this call (ref-counted, see
         // prof::set_target). Lets a GUI host sample its render thread: push at frame start,
-        // pop at frame end (the AI_CAD_SHOT=glassperf harness does exactly that). Harmless
+        // pop at frame end (the CHUDWARE_SHOT=glassperf harness does exactly that). Harmless
         // when the sampler is idle; pop without a matching push is a no-op at depth 0.
         if (m == "prof_target_push") {
-            aicad::prof::set_target();
+            chudware::prof::set_target();
             return emit(json{{"ok", true}}, out_json, 0);
         }
         if (m == "prof_target_pop") {
-            aicad::prof::clear_target();
+            chudware::prof::clear_target();
             return emit(json{{"ok", true}}, out_json, 0);
         }
         if (m == "doc_compile_cpp") {
@@ -1226,25 +1226,25 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             std::string system = params.value("system", std::string());
             int max_tokens = params.value("max_tokens", 8000);
             json messages = params.contains("messages") ? params["messages"] : json::array();
-            aicad::agent::BuiltRequest req;
+            chudware::agent::BuiltRequest req;
             if (provider == "anthropic") {
                 std::string model = params.value("model",
-                                                 std::string(aicad::agent::kAnthropicDefaultModel));
+                                                 std::string(chudware::agent::kAnthropicDefaultModel));
                 std::string effort = params.value("reasoning_effort", std::string());
-                req = aicad::agent::anthropic_build_request(model, system, messages, max_tokens,
+                req = chudware::agent::anthropic_build_request(model, system, messages, max_tokens,
                                                            effort);
             } else if (provider == "openai" || provider == "llamacpp") {
                 std::string def = provider == "llamacpp" ? std::string("local-gguf")
-                                                         : std::string(aicad::agent::kOpenAIDefaultModel);
+                                                         : std::string(chudware::agent::kOpenAIDefaultModel);
                 std::string model = params.value("model", def);
                 std::string base_url = params.value("base_url", std::string());
-                req = aicad::agent::openai_build_request(model, system, messages, max_tokens,
+                req = chudware::agent::openai_build_request(model, system, messages, max_tokens,
                                                          base_url);
             } else if (provider == "gemini") {
                 std::string model = params.value("model",
-                                                 std::string(aicad::agent::kGeminiDefaultModel));
+                                                 std::string(chudware::agent::kGeminiDefaultModel));
                 std::string effort = params.value("reasoning_effort", std::string());
-                req = aicad::agent::gemini_build_request(model, system, messages, max_tokens, effort);
+                req = chudware::agent::gemini_build_request(model, system, messages, max_tokens, effort);
             } else {
                 return emit_error("agent_build_request: unknown provider: " + provider, out_json);
             }
@@ -1258,15 +1258,15 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             std::string provider = params.value("provider", std::string());
             json resp = params.contains("response") ? params["response"] : json::object();
             if (provider == "anthropic") {
-                aicad::agent::ParsedReply pr = aicad::agent::anthropic_parse_response(resp);
+                chudware::agent::ParsedReply pr = chudware::agent::anthropic_parse_response(resp);
                 return emit(json{{"text", pr.text}, {"thinking", pr.thinking}}, out_json, 0);
             }
             if (provider == "openai" || provider == "llamacpp") {
-                aicad::agent::ParsedReply pr = aicad::agent::openai_parse_response(resp);
+                chudware::agent::ParsedReply pr = chudware::agent::openai_parse_response(resp);
                 return emit(json{{"text", pr.text}}, out_json, 0);
             }
             if (provider == "gemini") {
-                aicad::agent::ParsedReply pr = aicad::agent::gemini_parse_response(resp);
+                chudware::agent::ParsedReply pr = chudware::agent::gemini_parse_response(resp);
                 return emit(json{{"text", pr.text}, {"thinking", pr.thinking}}, out_json, 0);
             }
             return emit_error("agent_parse_response: unknown provider: " + provider, out_json);
@@ -1274,13 +1274,13 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
         if (m == "agent_b64_file") {
             // {path} -> {b64}. base64.standard_b64encode of the file bytes.
             std::string path = params.value("path", std::string());
-            std::string b64 = aicad::agent::base64_encode(aicad::agent::read_file_bytes(path));
+            std::string b64 = chudware::agent::base64_encode(chudware::agent::read_file_bytes(path));
             return emit(json{{"b64", b64}}, out_json, 0);
         }
         if (m == "agent_normalize_base_url") {
             // {base_url} -> {base_url} (the normalized form). Pure helper probe.
             std::string base_url = params.value("base_url", std::string());
-            return emit(json{{"base_url", aicad::agent::openai_normalize_base_url(base_url)}},
+            return emit(json{{"base_url", chudware::agent::openai_normalize_base_url(base_url)}},
                         out_json, 0);
         }
         if (m == "agent_complete") {
@@ -1293,8 +1293,8 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             std::string system = params.value("system", std::string());
             json messages = params.contains("messages") ? params["messages"] : json::array();
             int max_tokens = params.value("max_tokens", 8000);
-            aicad::agent::CompleteResult cr =
-                aicad::agent::complete(provider, cfg, system, messages, max_tokens);
+            chudware::agent::CompleteResult cr =
+                chudware::agent::complete(provider, cfg, system, messages, max_tokens);
             return emit(json{{"text", cr.text},
                              {"thinking", cr.thinking},
                              {"error", cr.error},
@@ -1311,7 +1311,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
         if (m == "agent_role_of") {
             // {system} -> {role}. RoleScriptedProvider role sniffer probe.
             std::string system = params.value("system", std::string());
-            return emit(json{{"role", aicad::agent::RoleScriptedProvider::role_of(system)}},
+            return emit(json{{"role", chudware::agent::RoleScriptedProvider::role_of(system)}},
                         out_json, 0);
         }
         // --- P52: agent SUPPORT layer diagnostics (paths/config/ops/events/roles) ---
@@ -1319,18 +1319,18 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
         if (m == "agent_extract_ops") {
             // {reply} -> {ops|null, error|null}.
             std::string reply = params.value("reply", std::string());
-            aicad::agent::OpsResult r = aicad::agent::extract_ops(reply);
+            chudware::agent::OpsResult r = chudware::agent::extract_ops(reply);
             return emit(json{{"ops", r.ops ? *r.ops : json(nullptr)},
                              {"error", r.error ? json(*r.error) : json(nullptr)}},
                         out_json, 0);
         }
         if (m == "agent_extract_revert") {
             std::string reply = params.value("reply", std::string());
-            return emit(json{{"revert", aicad::agent::extract_revert(reply)}}, out_json, 0);
+            return emit(json{{"revert", chudware::agent::extract_revert(reply)}}, out_json, 0);
         }
         if (m == "agent_extract_script") {
             std::string reply = params.value("reply", std::string());
-            auto s = aicad::agent::extract_script(reply);
+            auto s = chudware::agent::extract_script(reply);
             return emit(json{{"script", s ? json(*s) : json(nullptr)}}, out_json, 0);
         }
         if (m == "agent_first_balanced") {
@@ -1338,23 +1338,23 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             std::string text = params.value("text", std::string());
             std::string open = params.value("open", std::string("["));
             std::string close = params.value("close", std::string("]"));
-            auto s = aicad::agent::first_balanced(text, open.empty() ? '[' : open[0],
+            auto s = chudware::agent::first_balanced(text, open.empty() ? '[' : open[0],
                                                   close.empty() ? ']' : close[0]);
             return emit(json{{"span", s ? json(*s) : json(nullptr)}}, out_json, 0);
         }
         if (m == "agent_script_escape_op") {
             std::string code = params.value("code", std::string());
             std::string name = params.value("name", std::string("Script"));
-            return emit(aicad::agent::script_escape_op(code, name), out_json, 0);
+            return emit(chudware::agent::script_escape_op(code, name), out_json, 0);
         }
         if (m == "agent_offline_safe") {
             json provider = params.contains("provider") ? params["provider"] : json::object();
-            return emit(json{{"safe", aicad::agent::provider_offline_safe(provider)}},
+            return emit(json{{"safe", chudware::agent::provider_offline_safe(provider)}},
                         out_json, 0);
         }
         if (m == "agent_host_is_loopback") {
             std::string base_url = params.value("base_url", std::string());
-            return emit(json{{"loopback", aicad::agent::host_is_loopback(base_url)}},
+            return emit(json{{"loopback", chudware::agent::host_is_loopback(base_url)}},
                         out_json, 0);
         }
         if (m == "agent_resolve_provider") {
@@ -1364,7 +1364,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                 name = params["name"].get<std::string>();
             json cfg = params.contains("cfg") ? params["cfg"] : json::object();
             json env = params.contains("env") ? params["env"] : json::object();
-            return emit(aicad::agent::resolve_provider(name, cfg, env), out_json, 0);
+            return emit(chudware::agent::resolve_provider(name, cfg, env), out_json, 0);
         }
         if (m == "agent_list_models") {
             // {provider, base_url?, api_key?} -> {ok, models:[id...], model_rows?[{id,...}], error?}.
@@ -1443,14 +1443,14 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             };
 
             if (provider == "openai" || provider == "llamacpp" || provider == "xai") {
-                std::string root = aicad::agent::openai_normalize_base_url(base_url);
+                std::string root = chudware::agent::openai_normalize_base_url(base_url);
                 if (root.empty()) {
                     if (provider == "xai") root = "https://api.x.ai/v1";
                     else root = "https://api.openai.com/v1";
                 }
                 std::vector<std::pair<std::string, std::string>> hdrs;
                 if (!api_key.empty()) hdrs.push_back({"Authorization", "Bearer " + api_key});
-                aicad::agent::HttpResponse hr = aicad::agent::http_get(root + "/models", hdrs);
+                chudware::agent::HttpResponse hr = chudware::agent::http_get(root + "/models", hdrs);
                 if (!hr.error.empty())
                     return emit(json{{"ok", false}, {"models", models}, {"model_rows", model_rows},
                                      {"error", hr.error}},
@@ -1541,8 +1541,8 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                     std::string origin = root;
                     if (origin.size() >= 3 && origin.compare(origin.size() - 3, 3, "/v1") == 0)
                         origin.erase(origin.size() - 3);
-                    aicad::agent::HttpResponse lr =
-                        aicad::agent::http_get(origin + "/api/v0/models", hdrs);
+                    chudware::agent::HttpResponse lr =
+                        chudware::agent::http_get(origin + "/api/v0/models", hdrs);
                     if (lr.error.empty() && lr.status >= 200 && lr.status < 300) {
                         json lp = json::parse(lr.body, nullptr, false);
                         if (lp.is_object() && lp.contains("data") && lp["data"].is_array()) {
@@ -1567,7 +1567,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                                      {"error", "no api key"}},
                                 out_json, 0);
                 std::vector<std::pair<std::string, std::string>> hdrs = {{"x-goog-api-key", api_key}};
-                aicad::agent::HttpResponse hr = aicad::agent::http_get(
+                chudware::agent::HttpResponse hr = chudware::agent::http_get(
                     "https://generativelanguage.googleapis.com/v1beta/models", hdrs);
                 if (!hr.error.empty())
                     return emit(json{{"ok", false}, {"models", models}, {"model_rows", model_rows},
@@ -1621,7 +1621,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                              {"error", "unknown provider"}},
                         out_json, 0);
         }
-        // --- S-CORE: 12 libaicad proxies for the bridge auth/model/cost surface (frozen RPC
+        // --- S-CORE: 12 libchudware proxies for the bridge auth/model/cost surface (frozen RPC
         // CONTRACT in OMP_INTEGRATION_PLAN.md — every param name below is copied verbatim into
         // the bridge call; see omp_bridge_proxy() above and vendor/omp/bridge/src/{auth-context,
         // oauth-flow,models}.ts for the handlers each one reaches). ---
@@ -1706,14 +1706,14 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
         }
         if (m == "agent_cap_raw") {
             std::string text = params.value("text", std::string());
-            return emit(json{{"capped", aicad::agent::cap_raw(text)}}, out_json, 0);
+            return emit(json{{"capped", chudware::agent::cap_raw(text)}}, out_json, 0);
         }
         if (m == "agent_run_event") {
             // {run_id, kind, data} -> the emitted event (also persisted to jsonl).
             std::string run_id = params.value("run_id", std::string());
             std::string kind = params.value("kind", std::string());
             json data = params.contains("data") ? params["data"] : json::object();
-            aicad::agent::RunEvents ev(run_id);
+            chudware::agent::RunEvents ev(run_id);
             // NOTE: a fresh RunEvents truncates events.jsonl on construct. The gate
             // drives a multi-event run via agent_run_events_batch (below) instead.
             return emit(ev.emit(kind, data), out_json, 0);
@@ -1722,7 +1722,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             // {run_id, events:[{kind, data}]} -> [emitted events]. One RunEvents
             // (one truncate), then emit each — the realistic multi-event sequence.
             std::string run_id = params.value("run_id", std::string());
-            aicad::agent::RunEvents ev(run_id);
+            chudware::agent::RunEvents ev(run_id);
             json out = json::array();
             if (params.contains("events") && params["events"].is_array())
                 for (const auto& e : params["events"]) {
@@ -1736,7 +1736,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             // {run_id} -> [parsed events] read back from events.jsonl.
             std::string run_id = params.value("run_id", std::string());
             std::filesystem::path p =
-                aicad::agent::paths_cache() / "runs" / run_id / "events.jsonl";
+                chudware::agent::paths_cache() / "runs" / run_id / "events.jsonl";
             json out = json::array();
             std::ifstream fh(p, std::ios::binary);
             std::string line;
@@ -1750,30 +1750,30 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
         if (m == "agent_load_prompt") {
             std::string role = params.value("role", std::string());
             std::string pd = params.value("prompts_dir", std::string());
-            auto pr = aicad::agent::load_prompt(role, pd);
+            auto pr = chudware::agent::load_prompt(role, pd);
             return emit(json{{"text", pr.first}, {"source", pr.second}}, out_json, 0);
         }
         if (m == "agent_prompt_hash") {
             std::string text = params.value("text", std::string());
-            return emit(json{{"hash", aicad::agent::prompt_hash(text)}}, out_json, 0);
+            return emit(json{{"hash", chudware::agent::prompt_hash(text)}}, out_json, 0);
         }
         if (m == "agent_get_prompts_v2") {
             std::string pd = params.value("prompts_dir", std::string());
-            return emit(aicad::agent::get_prompts_v2(pd), out_json, 0);
+            return emit(chudware::agent::get_prompts_v2(pd), out_json, 0);
         }
         if (m == "agent_load_cheatsheet") {
             std::string ft = params.value("feature_type", std::string());
             std::string pd = params.value("prompts_dir", std::string());
-            return emit(json{{"text", aicad::agent::load_cheatsheet(ft, pd)}}, out_json, 0);
+            return emit(json{{"text", chudware::agent::load_cheatsheet(ft, pd)}}, out_json, 0);
         }
         // --- P53a: orchestrator state machine + state/context (agent/orchestrator) ---
         if (m == "agent_est_tokens") {
             std::string text = params.value("text", std::string());
-            return emit(json{{"n", aicad::agent::est_tokens(text)}}, out_json, 0);
+            return emit(json{{"n", chudware::agent::est_tokens(text)}}, out_json, 0);
         }
         if (m == "agent_err_sig") {
             std::string err = params.value("err", std::string());
-            return emit(json{{"sig", aicad::agent::err_sig(err)}}, out_json, 0);
+            return emit(json{{"sig", chudware::agent::err_sig(err)}}, out_json, 0);
         }
         if (m == "agent_digest_tree") {
             // Re-parse from the RAW request text as ordered_json so object key
@@ -1781,23 +1781,23 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             using ojson = nlohmann::ordered_json;
             ojson op = ojson::parse(params_json && params_json[0] ? params_json : "{}");
             ojson tree = op.contains("tree") ? op["tree"] : ojson::object();
-            return emit(json{{"digest", aicad::agent::digest_tree(tree)}}, out_json, 0);
+            return emit(json{{"digest", chudware::agent::digest_tree(tree)}}, out_json, 0);
         }
         if (m == "agent_digest_params") {
             using ojson = nlohmann::ordered_json;
             ojson op = ojson::parse(params_json && params_json[0] ? params_json : "{}");
             ojson p = op.contains("params") ? op["params"] : ojson::object();
-            return emit(json{{"s", aicad::agent::digest_params(p)}}, out_json, 0);
+            return emit(json{{"s", chudware::agent::digest_params(p)}}, out_json, 0);
         }
         if (m == "agent_looks_like_edit") {
             std::string req = params.value("request", std::string());
-            return emit(json{{"edit", aicad::agent::looks_like_edit(req)}}, out_json, 0);
+            return emit(json{{"edit", chudware::agent::looks_like_edit(req)}}, out_json, 0);
         }
         if (m == "agent_feature_status_errors") {
             using ojson = nlohmann::ordered_json;
             ojson op = ojson::parse(params_json && params_json[0] ? params_json : "{}");
             ojson fs = op.contains("feature_status") ? op["feature_status"] : ojson::array();
-            return emit(json{{"errors", aicad::agent::feature_status_errors(fs)}}, out_json, 0);
+            return emit(json{{"errors", chudware::agent::feature_status_errors(fs)}}, out_json, 0);
         }
         if (m == "agent_build_context") {
             // {state:{...}, role, prompts_dir?} -> {system, body, context_chars,
@@ -1807,7 +1807,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             ojson st = op.contains("state") ? op["state"] : ojson::object();
             std::string role = op.value("role", std::string());
             std::string pd = op.value("prompts_dir", std::string());
-            aicad::agent::DesignState ds;
+            chudware::agent::DesignState ds;
             ds.request = st.value("request", std::string());
             ds.doc_id = st.value("doc_id", std::string());
             ds.revision = st.value("revision", 0);
@@ -1821,7 +1821,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             ds.memory = (st.contains("memory") && st["memory"].is_object()) ? st["memory"]
                                                                             : ojson::object();
             ds.current_step = st.value("current_step", std::string());
-            aicad::agent::BuiltContext bc = aicad::agent::build_context(ds, role, pd);
+            chudware::agent::BuiltContext bc = chudware::agent::build_context(ds, role, pd);
             return emit(json{{"system", bc.system},
                              {"body", bc.body},
                              {"context_chars", bc.context_chars},
@@ -1840,10 +1840,10 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
 
             // Per-stage queues of scripted outcomes (popped in call order).
             auto build_queue = [&](const char* stage) {
-                std::vector<aicad::agent::StageOutcome> q;
+                std::vector<chudware::agent::StageOutcome> q;
                 if (script.contains(stage) && script[stage].is_array())
                     for (const auto& o : script[stage]) {
-                        aicad::agent::StageOutcome so;
+                        chudware::agent::StageOutcome so;
                         so.verdict = o.value("verdict", std::string("pass"));
                         so.reason = o.value("reason", std::string());
                         if (o.contains("error") && !o["error"].is_null()) {
@@ -1868,28 +1868,28 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                 return q;
             };
 
-            auto intake_q = std::make_shared<std::vector<aicad::agent::StageOutcome>>(
+            auto intake_q = std::make_shared<std::vector<chudware::agent::StageOutcome>>(
                 build_queue("intake"));
             auto plan_q =
-                std::make_shared<std::vector<aicad::agent::StageOutcome>>(build_queue("plan"));
+                std::make_shared<std::vector<chudware::agent::StageOutcome>>(build_queue("plan"));
             auto model_q =
-                std::make_shared<std::vector<aicad::agent::StageOutcome>>(build_queue("model"));
+                std::make_shared<std::vector<chudware::agent::StageOutcome>>(build_queue("model"));
             auto review_q =
-                std::make_shared<std::vector<aicad::agent::StageOutcome>>(build_queue("review"));
+                std::make_shared<std::vector<chudware::agent::StageOutcome>>(build_queue("review"));
             auto fix_q =
-                std::make_shared<std::vector<aicad::agent::StageOutcome>>(build_queue("fix"));
+                std::make_shared<std::vector<chudware::agent::StageOutcome>>(build_queue("fix"));
             auto memory_q =
-                std::make_shared<std::vector<aicad::agent::StageOutcome>>(build_queue("memory"));
+                std::make_shared<std::vector<chudware::agent::StageOutcome>>(build_queue("memory"));
 
             // Invocation counter for cancel_after (counts action calls = agent calls).
             auto invoked = std::make_shared<int>(0);
 
-            auto make_action = [&](std::shared_ptr<std::vector<aicad::agent::StageOutcome>> q) {
+            auto make_action = [&](std::shared_ptr<std::vector<chudware::agent::StageOutcome>> q) {
                 auto cursor = std::make_shared<size_t>(0);
-                return [q, cursor, invoked](aicad::agent::DesignState& s,
-                                            int) -> aicad::agent::StageOutcome {
+                return [q, cursor, invoked](chudware::agent::DesignState& s,
+                                            int) -> chudware::agent::StageOutcome {
                     (*invoked)++;
-                    aicad::agent::StageOutcome o;
+                    chudware::agent::StageOutcome o;
                     if (*cursor < q->size()) {
                         o = (*q)[*cursor];
                         (*cursor)++;
@@ -1903,7 +1903,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                 };
             };
 
-            aicad::agent::StageActions actions;
+            chudware::agent::StageActions actions;
             actions.intake = make_action(intake_q);
             actions.plan = make_action(plan_q);
             actions.model = make_action(model_q);
@@ -1913,9 +1913,9 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             std::vector<std::string> steps;
             if (plan_steps_j.is_array())
                 for (const auto& s : plan_steps_j) steps.push_back(s.get<std::string>());
-            actions.plan_steps = [steps](aicad::agent::DesignState&) { return steps; };
+            actions.plan_steps = [steps](chudware::agent::DesignState&) { return steps; };
 
-            aicad::agent::RunControl control;
+            chudware::agent::RunControl control;
             if (has_cancel) {
                 control.cancelled = [invoked, cancel_after] {
                     return *invoked >= cancel_after;
@@ -1927,12 +1927,12 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                                  std::to_string(reinterpret_cast<uintptr_t>(&actions));
             // Capture wrapper: subclass-free — we read back the jsonl after the run,
             // but to capture WITHOUT volatile run_id we just collect emitted events.
-            aicad::agent::RunEvents events(run_id);
+            chudware::agent::RunEvents events(run_id);
             // Drive the machine, then read the persisted events back (the source of
             // truth; identical to what emit() returned).
-            aicad::agent::DesignState ds;
+            chudware::agent::DesignState ds;
             ds.request = params.value("request", std::string("test request"));
-            json result = aicad::agent::run_machine(ds, actions, events, budgets, control);
+            json result = chudware::agent::run_machine(ds, actions, events, budgets, control);
 
             // Read back captured events from the jsonl.
             json captured = json::array();
@@ -1955,8 +1955,8 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             // runs so Stop still works when run_started has not landed yet.
             const std::string run_id = jstr(params, "run_id");
             if (run_id.empty())
-                return emit(aicad::agent::cancel_all_runs(), out_json, 0);
-            return emit(aicad::agent::cancel_run(run_id), out_json, 0);
+                return emit(chudware::agent::cancel_all_runs(), out_json, 0);
+            return emit(chudware::agent::cancel_run(run_id), out_json, 0);
         }
         if (m == "agent_steer") {
             // Mid-run steering: {run_id, text} -> {ok, steered:bool}. The run folds queued
@@ -1964,7 +1964,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             // never interrupts an in-flight provider call). Unknown/finished => steered:false.
             const std::string run_id = jstr(params, "run_id");
             const std::string text = jstr(params, "text");
-            return emit(aicad::agent::steer_run(run_id, text), out_json, 0);
+            return emit(chudware::agent::steer_run(run_id, text), out_json, 0);
         }
         if (m == "agent_run") {
             // HOST-ERGONOMIC entry: {request, doc_id, options?, provider?}.
@@ -2014,7 +2014,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                                      lc.find("drafting") != std::string::npos ||
                                      lc.find("drawing") != std::string::npos;
                 if (wants_drawing && !doc_id.empty()) {
-                    json t = aicad::doc::doc_tree(doc_id);
+                    json t = chudware::doc::doc_tree(doc_id);
                     bool has_geom = t.is_object() && t.contains("tree") && t["tree"].is_object() &&
                                     t["tree"].contains("features") && t["tree"]["features"].is_array() &&
                                     !t["tree"]["features"].empty();
@@ -2025,8 +2025,8 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                         if (!part_name.empty()) spec["title"] = json{{"title", part_name}};
                         json dr;
                         try {
-                            dr = aicad::doc::drawing_make(doc_id, spec);
-                        } catch (const aicad::doc::OpError& oe) {
+                            dr = chudware::doc::drawing_make(doc_id, spec);
+                        } catch (const chudware::doc::OpError& oe) {
                             return emit(json{{"ok", false}, {"error", oe.what()}}, out_json, 0);
                         }
                         json events = json::array();
@@ -2078,7 +2078,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                     has("g code") || has("cnc") || has("post") || has("machining") ||
                     has("mill") || has("router") || has("lathe") || has("nc ");
                 if ((cam_words || (wants_cam && cam_noun)) && !doc_id.empty()) {
-                    json t = aicad::doc::doc_tree(doc_id);
+                    json t = chudware::doc::doc_tree(doc_id);
                     bool has_geom = t.is_object() && t.contains("tree") && t["tree"].is_object() &&
                                     t["tree"].contains("features") &&
                                     t["tree"]["features"].is_array() &&
@@ -2132,21 +2132,21 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             const bool explicit_provider = params.contains("provider") &&
                                            params["provider"].is_object() &&
                                            !params["provider"].empty();
-            json cfg = aicad::agent::load_config();
+            json cfg = chudware::agent::load_config();
             if (explicit_provider) {
                 provider = params["provider"];  // pass-through (gate mock / host override)
             } else {
                 // Resolve from config.json over the live process env (the same inputs
                 // the Python agent uses). resolve_provider applies the offline guard.
                 // O1: params.provider as a NAME string (the GUI picker) pins the provider
-                // explicitly — it beats an ambient AI_CAD_PROVIDER env var; params.model /
+                // explicitly — it beats an ambient CHUDWARE_PROVIDER env var; params.model /
                 // params.reasoning_effort then refine the descriptor.
                 std::optional<std::string> pname;
                 if (params.contains("provider") && params["provider"].is_string() &&
                     !params["provider"].get<std::string>().empty())
                     pname = params["provider"].get<std::string>();
                 json resolved = apply_model_overrides(
-                    aicad::agent::resolve_provider(pname, cfg, json::object()), params);
+                    chudware::agent::resolve_provider(pname, cfg, json::object()), params);
                 if (resolved.is_object() && resolved.contains("error")) {
                     return emit(json{{"ok", false},
                                      {"status", "failed"},
@@ -2157,7 +2157,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                 }
                 // Attach the experimental knobs (separate vision review provider + cad-sequence
                 // mode) from config.json "experimental". No-op when the block is absent.
-                provider = aicad::agent::apply_experimental(resolved, cfg, json::object());
+                provider = chudware::agent::apply_experimental(resolved, cfg, json::object());
             }
 
             // ---- micro vs design ----
@@ -2172,25 +2172,25 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                 (options.contains("approved_plan") && !options["approved_plan"].is_null() &&
                  !(options["approved_plan"].is_string() &&
                    options["approved_plan"].get<std::string>().empty()));
-            bool micro = !force_design_path && aicad::agent::should_engage(provider, cfg);
+            bool micro = !force_design_path && chudware::agent::should_engage(provider, cfg);
 
             auto captured = std::make_shared<json>(json::array());
             json result;
             if (micro) {
-                aicad::agent::EmitFnMicro cb = [captured](const json& ev) {
+                chudware::agent::EmitFnMicro cb = [captured](const json& ev) {
                     captured->push_back(ev);
                 };
-                result = aicad::agent::run_micro_design(request, doc_id, provider, cb, options);
+                result = chudware::agent::run_micro_design(request, doc_id, provider, cb, options);
             } else if (force_design_path) {
                 // Skip assembly multi-part driver for plan_only / approved_plan so we get
                 // exactly one plan_ready (or one execute) instead of per-part side effects.
-                aicad::agent::EmitFn cb = [captured](const json& ev) { captured->push_back(ev); };
-                result = aicad::agent::run_design(request, doc_id, provider, cb, options);
+                chudware::agent::EmitFn cb = [captured](const json& ev) { captured->push_back(ev); };
+                result = chudware::agent::run_design(request, doc_id, provider, cb, options);
             } else {
-                aicad::agent::EmitFn cb = [captured](const json& ev) { captured->push_back(ev); };
+                chudware::agent::EmitFn cb = [captured](const json& ev) { captured->push_back(ev); };
                 // run_assembly_design plans first: a true multi-part assembly builds each part in
                 // its own doc + assembles; a single part delegates to run_design unchanged.
-                result = aicad::agent::run_assembly_design(request, doc_id, provider, cb, options);
+                result = chudware::agent::run_assembly_design(request, doc_id, provider, cb, options);
             }
             result["events"] = *captured;
             result["engaged"] = micro ? "micro" : "design";  // diagnostic: which profile ran
@@ -2212,7 +2212,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             const bool explicit_provider = params.contains("provider") &&
                                            params["provider"].is_object() &&
                                            !params["provider"].empty();
-            json cfg = aicad::agent::load_config();
+            json cfg = chudware::agent::load_config();
             if (explicit_provider) {
                 provider = params["provider"];
             } else {
@@ -2222,7 +2222,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                     !params["provider"].get<std::string>().empty())
                     pname = params["provider"].get<std::string>();
                 json resolved = apply_model_overrides(
-                    aicad::agent::resolve_provider(pname, cfg, json::object()), params);
+                    chudware::agent::resolve_provider(pname, cfg, json::object()), params);
                 if (resolved.is_object() && resolved.contains("error"))
                     return emit(json{{"ok", false},
                                      {"status", "failed"},
@@ -2230,16 +2230,16 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                                      {"error_detail", jstr(resolved, "error", "provider resolution failed")},
                                      {"error", jstr(resolved, "error", "provider resolution failed")}},
                                 out_json, 0);
-                provider = aicad::agent::apply_experimental(resolved, cfg, json::object());
+                provider = chudware::agent::apply_experimental(resolved, cfg, json::object());
             }
 
             auto captured = std::make_shared<json>(json::array());
-            aicad::agent::EmitFn cb = [captured](const json& ev) { captured->push_back(ev); };
-            aicad::agent::SimFn sim = [](const std::string& sim_doc, const std::string& sim_req,
+            chudware::agent::EmitFn cb = [captured](const json& ev) { captured->push_back(ev); };
+            chudware::agent::SimFn sim = [](const std::string& sim_doc, const std::string& sim_req,
                                          const json& sim_params) -> json {
                 return run_flow_sim(sim_doc, sim_req, sim_params);
             };
-            json result = aicad::agent::run_mission(request, doc_id, provider, cb, sim, options);
+            json result = chudware::agent::run_mission(request, doc_id, provider, cb, sim, options);
             result["events"] = *captured;
             result["engaged"] = "mission";
             return emit(std::move(result), out_json, 0);
@@ -2255,8 +2255,8 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             json options = params.contains("options") ? params["options"] : json::object();
             // Capture every emitted event (like agent_run_machine returns `events`).
             auto captured = std::make_shared<json>(json::array());
-            aicad::agent::EmitFn cb = [captured](const json& ev) { captured->push_back(ev); };
-            json result = aicad::agent::run_design(request, doc_id, provider, cb, options);
+            chudware::agent::EmitFn cb = [captured](const json& ev) { captured->push_back(ev); };
+            json result = chudware::agent::run_design(request, doc_id, provider, cb, options);
             result["events"] = *captured;
             return emit(std::move(result), out_json, 0);
         }
@@ -2269,11 +2269,11 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             json provider = params.contains("provider") ? params["provider"] : json::object();
             json options = params.contains("options") ? params["options"] : json::object();
             auto captured = std::make_shared<json>(json::array());
-            aicad::agent::EmitFnMicro cb = [captured](const json& ev) {
+            chudware::agent::EmitFnMicro cb = [captured](const json& ev) {
                 captured->push_back(ev);
             };
             json result =
-                aicad::agent::run_micro_design(request, doc_id, provider, cb, options);
+                chudware::agent::run_micro_design(request, doc_id, provider, cb, options);
             result["events"] = *captured;
             return emit(std::move(result), out_json, 0);
         }
@@ -2282,14 +2282,14 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             // context_tokens?}} -> {engage:bool}.
             json provider = params.contains("provider") ? params["provider"] : json::object();
             json cfg = params.contains("cfg") ? params["cfg"] : json::object();
-            return emit(json{{"engage", aicad::agent::should_engage(provider, cfg)}}, out_json, 0);
+            return emit(json{{"engage", chudware::agent::should_engage(provider, cfg)}}, out_json, 0);
         }
         if (m == "agent_micro_normalize_steps") {
             // Pure: {raw:[...]} -> {steps:[{type,desc,params}, ...]}.
-            aicad::agent::ojson raw = params.contains("raw")
-                                          ? aicad::agent::ojson::parse(params["raw"].dump())
-                                          : aicad::agent::ojson(nullptr);
-            std::vector<aicad::agent::Step> steps = aicad::agent::normalize_steps(raw);
+            chudware::agent::ojson raw = params.contains("raw")
+                                          ? chudware::agent::ojson::parse(params["raw"].dump())
+                                          : chudware::agent::ojson(nullptr);
+            std::vector<chudware::agent::Step> steps = chudware::agent::normalize_steps(raw);
             json out = json::array();
             for (const auto& s : steps)
                 out.push_back(json{{"type", s.type}, {"desc", s.desc},
@@ -2298,38 +2298,38 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
         }
         if (m == "agent_micro_summarize_doc") {
             // Pure: {tree, volume?} -> {summary}. volume present => "volume=N" head.
-            aicad::agent::ojson tree =
-                params.contains("tree") ? aicad::agent::ojson::parse(params["tree"].dump())
-                                        : aicad::agent::ojson::object();
+            chudware::agent::ojson tree =
+                params.contains("tree") ? chudware::agent::ojson::parse(params["tree"].dump())
+                                        : chudware::agent::ojson::object();
             std::optional<double> vol;
             if (params.contains("volume") && params["volume"].is_number())
                 vol = params["volume"].get<double>();
-            return emit(json{{"summary", aicad::agent::summarize_doc(tree, vol)}}, out_json, 0);
+            return emit(json{{"summary", chudware::agent::summarize_doc(tree, vol)}}, out_json, 0);
         }
         if (m == "agent_micro_verify_step") {
             // Pure: {step:{type,desc,params}, tree, feature_status, vol_before?, vol_after?}
             // -> {verified, notes}.
-            aicad::agent::Step step;
+            chudware::agent::Step step;
             if (params.contains("step") && params["step"].is_object()) {
                 const json& sp = params["step"];
                 step.type = sp.value("type", std::string());
                 step.desc = sp.value("desc", std::string());
                 if (sp.contains("params") && sp["params"].is_object())
-                    step.params = aicad::agent::ojson::parse(sp["params"].dump());
+                    step.params = chudware::agent::ojson::parse(sp["params"].dump());
             }
-            aicad::agent::ojson tree =
-                params.contains("tree") ? aicad::agent::ojson::parse(params["tree"].dump())
-                                        : aicad::agent::ojson::object();
-            aicad::agent::ojson fs =
+            chudware::agent::ojson tree =
+                params.contains("tree") ? chudware::agent::ojson::parse(params["tree"].dump())
+                                        : chudware::agent::ojson::object();
+            chudware::agent::ojson fs =
                 params.contains("feature_status")
-                    ? aicad::agent::ojson::parse(params["feature_status"].dump())
-                    : aicad::agent::ojson::array();
+                    ? chudware::agent::ojson::parse(params["feature_status"].dump())
+                    : chudware::agent::ojson::array();
             std::optional<double> vb, va;
             if (params.contains("vol_before") && params["vol_before"].is_number())
                 vb = params["vol_before"].get<double>();
             if (params.contains("vol_after") && params["vol_after"].is_number())
                 va = params["vol_after"].get<double>();
-            aicad::agent::VerifyResult vr = aicad::agent::verify_step(step, tree, fs, vb, va);
+            chudware::agent::VerifyResult vr = chudware::agent::verify_step(step, tree, fs, vb, va);
             return emit(json{{"verified", vr.verified}, {"notes", vr.notes}}, out_json, 0);
         }
         // --- P54b: in-app LLM assists (agent/ask.py + agent/pm_assist.py) ---
@@ -2344,7 +2344,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                            ? op["revision"].get<long>()
                            : 0;
             ojson fs = op.contains("feature_status") ? op["feature_status"] : ojson::array();
-            return emit(json{{"text", aicad::agent::build_doc_context(doc, doc_id, rev, fs)}},
+            return emit(json{{"text", chudware::agent::build_doc_context(doc, doc_id, rev, fs)}},
                         out_json, 0);
         }
         if (m == "agent_build_ask_prompt") {
@@ -2357,8 +2357,8 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                            ? op["revision"].get<long>()
                            : 0;
             ojson fs = op.contains("feature_status") ? op["feature_status"] : ojson::array();
-            aicad::agent::AskPrompt ap =
-                aicad::agent::build_ask_prompt(question, doc, doc_id, rev, fs);
+            chudware::agent::AskPrompt ap =
+                chudware::agent::build_ask_prompt(question, doc, doc_id, rev, fs);
             return emit(json{{"system", ap.system}, {"body", ap.body}}, out_json, 0);
         }
         if (m == "agent_answer_question") {
@@ -2382,8 +2382,8 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                                                 jstr(prov, "error", "provider unavailable")}},
                             out_json, 0);
             }
-            auto provider = aicad::agent::make_assist_provider(prov);
-            std::string answer = aicad::agent::answer_question(
+            auto provider = chudware::agent::make_assist_provider(prov);
+            std::string answer = chudware::agent::answer_question(
                 question, doc, doc_id, rev, fs,
                 [&](const std::string& sys, const std::string& body) {
                     std::string err;
@@ -2419,8 +2419,8 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                                  {"assumptions", json::array()}},
                             out_json, 0);
             }
-            auto provider = aicad::agent::make_assist_provider(prov);
-            aicad::agent::ojson result = aicad::agent::clarify(
+            auto provider = chudware::agent::make_assist_provider(prov);
+            chudware::agent::ojson result = chudware::agent::clarify(
                 request, doc, doc_id, rev, fs,
                 [&](const std::string& sys, const std::string& body) {
                     std::string err;
@@ -2430,7 +2430,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
         }
         if (m == "agent_pm_extract_json") {
             std::string reply = params.value("reply", std::string());
-            aicad::agent::ojson plan = aicad::agent::pm_extract_json(reply);
+            chudware::agent::ojson plan = chudware::agent::pm_extract_json(reply);
             return emit(json{{"plan", json::parse(plan.dump())}}, out_json, 0);
         }
         if (m == "agent_pm_coerce") {
@@ -2438,7 +2438,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             ojson op = ojson::parse(params_json && params_json[0] ? params_json : "{}");
             ojson field = op.contains("field") ? op["field"] : ojson::object();
             ojson value = op.contains("value") ? op["value"] : ojson(nullptr);
-            ojson v = aicad::agent::pm_coerce_patch_value(field, value);
+            ojson v = chudware::agent::pm_coerce_patch_value(field, value);
             return emit(json{{"value", json::parse(v.dump())}}, out_json, 0);
         }
         if (m == "agent_pm_validate_plan") {
@@ -2447,7 +2447,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             ojson plan = op.contains("plan") ? op["plan"] : ojson::object();
             ojson fs = op.contains("form_schema") ? op["form_schema"] : ojson::object();
             ojson cur = op.contains("current") ? op["current"] : ojson::object();
-            ojson v = aicad::agent::pm_validate_plan(plan, fs, cur);
+            ojson v = chudware::agent::pm_validate_plan(plan, fs, cur);
             return emit(json{{"validated", json::parse(v.dump())}}, out_json, 0);
         }
         if (m == "agent_pm_heuristic_plan") {
@@ -2456,7 +2456,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             ojson fs = op.contains("form_schema") ? op["form_schema"] : ojson::object();
             ojson cur = op.contains("current") ? op["current"] : ojson::object();
             std::string intent = op.value("intent", std::string());
-            ojson v = aicad::agent::pm_heuristic_plan(fs, cur, intent);
+            ojson v = chudware::agent::pm_heuristic_plan(fs, cur, intent);
             return emit(json{{"plan", json::parse(v.dump())}}, out_json, 0);
         }
         if (m == "agent_pm_build_prompt") {
@@ -2469,8 +2469,8 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                            ? op["revision"].get<long>()
                            : 0;
             ojson fs = op.contains("feature_status") ? op["feature_status"] : ojson::array();
-            aicad::agent::PmAssistPrompt pp =
-                aicad::agent::build_pm_assist_prompt(prm, doc, doc_id, rev, fs);
+            chudware::agent::PmAssistPrompt pp =
+                chudware::agent::build_pm_assist_prompt(prm, doc, doc_id, rev, fs);
             return emit(json{{"system", pp.system}, {"body", pp.body}}, out_json, 0);
         }
         if (m == "agent_pm_assist") {
@@ -2492,17 +2492,17 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             // the config-fallback path, a refusal/resolution failure ({error}) or an empty
             // descriptor leaves cb=nullptr so assist falls back to its heuristic plan.
             bool has_explicit = params.contains("provider") && !params["provider"].is_null();
-            aicad::agent::PmCompleteFn cb = nullptr;
+            chudware::agent::PmCompleteFn cb = nullptr;
             json prov = has_explicit ? params["provider"] : resolve_assist_provider(params);
             bool usable = has_explicit
                               ? !prov.is_null()
                               : (prov.is_object() && !prov.contains("error") && !prov.empty());
             if (usable) {
-                auto provider = aicad::agent::make_assist_provider(prov);
+                auto provider = chudware::agent::make_assist_provider(prov);
                 cb = [provider](const std::string& sys, const std::string& body,
                                 std::string* err) { return provider(sys, body, err); };
             }
-            ojson v = aicad::agent::assist_property_manager(prm, doc, doc_id, rev, fs, cb);
+            ojson v = chudware::agent::assist_property_manager(prm, doc, doc_id, rev, fs, cb);
             return emit(json{{"validated", json::parse(v.dump())}}, out_json, 0);
         }
         if (m == "sim_fea_static") {
@@ -2521,7 +2521,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                     for (const auto& x : params[k]) v.push_back(x.get<int>());
                 return v;
             };
-            aicad::sim::FeaStaticResult r = aicad::sim::fea_static_solve(
+            chudware::sim::FeaStaticResult r = chudware::sim::fea_static_solve(
                 getd("points"), geti("tets"), params.value("E_mpa", 0.0),
                 params.value("nu", 0.0), params.value("yield_mpa", 250.0),
                 geti("fixed_nodes"), getd("nodal_forces"),
@@ -2554,7 +2554,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                     for (const auto& x : params[k]) v.push_back(x.get<int>());
                 return v;
             };
-            aicad::sim::FeaModalResult r = aicad::sim::fea_modal_solve(
+            chudware::sim::FeaModalResult r = chudware::sim::fea_modal_solve(
                 getd("points"), geti("tets"), params.value("E_mpa", 0.0),
                 params.value("nu", 0.0), params.value("density_g_cm3", 0.0),
                 geti("fixed_nodes"), params.value("n_modes", 6),
@@ -2573,7 +2573,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             // now). Params: {circuit:{...}, study:{...}}. Returns the sim.md result shape.
             const json& circ = params.contains("circuit") ? params["circuit"] : json::object();
             const json& study = params.contains("study") ? params["study"] : json::object();
-            return emit(aicad::sim::spice_simulate(circ, study), out_json, 0);
+            return emit(chudware::sim::spice_simulate(circ, study), out_json, 0);
         }
         if (m == "sim_numpy_normal") {
             // DIAGNOSTIC: bit-exact-parity probe for the numpy RNG that drives the Monte-Carlo
@@ -2583,7 +2583,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                                  ? params["seed"].get<long long>() : 0;
             int n = params.contains("n") && params["n"].is_number()
                         ? params["n"].get<int>() : 0;
-            aicad::sim::NumpyGenerator rng(static_cast<uint64_t>(seed));
+            chudware::sim::NumpyGenerator rng(static_cast<uint64_t>(seed));
             json draws = json::array();
             for (int i = 0; i < n; ++i) draws.push_back(rng.standard_normal());
             return emit(json{{"draws", draws}}, out_json, 0);
@@ -2596,7 +2596,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             std::string deck = params.contains("netlist") && params["netlist"].is_string()
                                    ? params["netlist"].get<std::string>()
                                    : std::string();
-            return emit(aicad::sim::parse_netlist(deck), out_json, 0);
+            return emit(chudware::sim::parse_netlist(deck), out_json, 0);
         }
         if (m == "sim_netlist_to_circuit") {
             // DIAGNOSTIC: map a schematic netlist dict (engine/ecad/netlist.py
@@ -2606,7 +2606,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             // {"circuit": {...}, "warnings": [...]}.
             const json& nl = params.contains("netlist") ? params["netlist"] : json::object();
             const json& sp = params.contains("sim_params") ? params["sim_params"] : json(nullptr);
-            return emit(aicad::sim::netlist_to_spice_circuit(nl, sp), out_json, 0);
+            return emit(chudware::sim::netlist_to_spice_circuit(nl, sp), out_json, 0);
         }
         if (m == "sim_lbm") {
             // D3Q19 BGK LBM wind-tunnel kernel (engine/sim/lbm.py parity probe). The
@@ -2629,7 +2629,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                 solid.reserve(mask["solid"].size());
                 for (const auto& v : mask["solid"]) solid.push_back(v.get<int>() ? 1 : 0);
             }
-            aicad::sim::LbmParams lp;
+            chudware::sim::LbmParams lp;
             lp.u_lat = pp.value("u_lat", 0.05);
             lp.tau0 = pp.value("tau0", 1.0);
             lp.voxel_mm = pp.value("voxel_mm", 1.0);
@@ -2642,7 +2642,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             else if (params.contains("backend") && params["backend"].is_string())
                 lp.backend = params["backend"].get<std::string>();
             int n_steps = params.value("n_steps", 0);
-            aicad::sim::LbmResult r = aicad::sim::lbm_run(solid, nx, ny, nz, lp, n_steps);
+            chudware::sim::LbmResult r = chudware::sim::lbm_run(solid, nx, ny, nz, lp, n_steps);
             if (!r.ok) return emit(json{{"ok", false}, {"error", r.error}}, out_json, 0);
             return emit(json{{"ok", true},
                              {"nx", r.nx},
@@ -2662,7 +2662,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                              {"backend_fallback", r.backend_fallback}},
                         out_json, 0);
         }
-#ifdef AICAD_WITH_NETGEN  // Netgen/nglib FEA-mesh RPCs (mesh + meshing FEA runs)
+#ifdef CHUDWARE_WITH_NETGEN  // Netgen/nglib FEA-mesh RPCs (mesh + meshing FEA runs)
         if (m == "sim_mesh") {
             // Curvature-adaptive tet mesher (wraps Netgen / nglib). Params:
             //   {"step_path", "fineness"(0..1)|"density"(legacy), "order"|"mesh_order",
@@ -2679,7 +2679,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                                         : std::string();
             if (step_path.empty())
                 return emit_error("sim_mesh: 'step_path' (string) is required", out_json);
-            aicad::sim::MeshOptions opts;
+            chudware::sim::MeshOptions opts;
             opts.fineness = params.value("fineness", 0.5);
             opts.density = params.value("density", -1.0);  // legacy alias
             opts.order = params.value("order", params.value("mesh_order", 1));
@@ -2698,8 +2698,8 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             opts.thin_wall_layers = params.value("thin_wall_layers", 4.0);
             // P4: content+options-keyed cache — an unchanged geometry re-mesh (e.g. the GUI
             // re-requesting the preview mesh after a solve) is a hit instead of a Netgen run.
-            auto rp = aicad::sim::mesh_step_cached_ptr(step_path, opts);
-            const aicad::sim::MeshOut& r = *rp;
+            auto rp = chudware::sim::mesh_step_cached_ptr(step_path, opts);
+            const chudware::sim::MeshOut& r = *rp;
             if (!r.ok) return emit(json{{"ok", false}, {"error", r.error}}, out_json, 0);
             return emit(json{{"ok", true},
                              {"points", r.points},
@@ -2728,7 +2728,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             // Returns {ok, displacement, disp_magnitude, von_mises, n_dof, summary,
             // solver_notes}. (overlay/npz are display-only and out of scope here.)
             const json& study = params.contains("study") ? params["study"] : json::object();
-            json res = aicad::sim::fea_run_static(study);
+            json res = chudware::sim::fea_run_static(study);
             // P55b: when the study carries a STEP path, ALSO package a display overlay
             // (best-effort — mirrors the Python worker _static_overlay_path; an overlay
             // failure NEVER fails the solve). Existing result fields are untouched.
@@ -2744,7 +2744,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                         // AND the tet connectivity (the boundary-surface overlay needs the
                         // tets). The mesh is deterministic so node coords + tets match the
                         // solved result.
-                        aicad::sim::MeshOptions opts;
+                        chudware::sim::MeshOptions opts;
                         opts.fineness = study.value("fineness", 0.5);
                         opts.density = study.value("density", -1.0);  // legacy alias
                         opts.order = study.value("mesh_order", study.value("order", 1));
@@ -2766,7 +2766,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                         // the overlay no longer pays a full duplicate mesh (measured ~75% of
                         // sim_run_static wall time on a small part). Content+options keyed,
                         // so the recovered nodes/tets are exactly the solved mesh.
-                        auto mo = aicad::sim::mesh_step_cached_ptr(step_path, opts);
+                        auto mo = chudware::sim::mesh_step_cached_ptr(step_path, opts);
                         if (mo->ok) {
                             vol = mo->points;
                             tets = mo->tets;
@@ -2789,7 +2789,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                         yield_mpa = study["material"].value("yield_mpa", 250.0);
                     json summary = res.contains("summary") ? res["summary"] : json::object();
                     std::string ov =
-                        aicad::sim::static_overlay(step_path, vol, tets, npe, vm, dm, dv,
+                        chudware::sim::static_overlay(step_path, vol, tets, npe, vm, dm, dv,
                                                    p1, p3, ms, yield_mpa, summary);
                     if (!ov.empty()) res["overlay_aicm"] = ov;
                 }
@@ -2802,7 +2802,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             // case + strength overrides. The overlay (when a STEP path is present) is
             // packaged inside fea_run_fatigue and returned as "overlay_aicm".
             const json& study = params.contains("study") ? params["study"] : json::object();
-            json res = aicad::sim::fea_run_fatigue(study);
+            json res = chudware::sim::fea_run_fatigue(study);
             return emit(std::move(res), out_json, 0);
         }
         if (m == "sim_run_thermal") {
@@ -2813,7 +2813,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             // temperature, n_nodes, n_dof, n_elems, summary:{max_temp_c,min_temp_c},
             // flux_summary, solver_notes}. Transient is out of scope (steady-state only).
             const json& study = params.contains("study") ? params["study"] : json::object();
-            json res = aicad::sim::fea_run_thermal(study);
+            json res = chudware::sim::fea_run_thermal(study);
             return emit(std::move(res), out_json, 0);
         }
         if (m == "sim_run_modal") {
@@ -2822,7 +2822,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             // mode_shapes, n_modes, n_nodes, n_dof}.
             const json& study = params.contains("study") ? params["study"] : json::object();
             int n_modes = params.value("n_modes", 6);
-            json res = aicad::sim::fea_run_modal(study, n_modes);
+            json res = chudware::sim::fea_run_modal(study, n_modes);
             // P55b: when the study carries a STEP path, ALSO package a display overlay
             // for mode 0 (best-effort — mirrors the Python worker _modal_overlay_path;
             // an overlay failure NEVER fails the solve). Existing fields are untouched.
@@ -2839,7 +2839,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                     if (vol.empty() && study.contains("step_path")) {
                         // Inline points absent: re-mesh to get the volume node coords AND
                         // the tet connectivity (the boundary-surface overlay needs them).
-                        aicad::sim::MeshOptions opts;
+                        chudware::sim::MeshOptions opts;
                         opts.fineness = study.value("fineness", 0.5);
                         opts.density = study.value("density", -1.0);  // legacy alias
                         opts.order = 1;
@@ -2859,7 +2859,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                         // the overlay no longer pays a full duplicate mesh (measured ~75% of
                         // sim_run_static wall time on a small part). Content+options keyed,
                         // so the recovered nodes/tets are exactly the solved mesh.
-                        auto mo = aicad::sim::mesh_step_cached_ptr(step_path, opts);
+                        auto mo = chudware::sim::mesh_step_cached_ptr(step_path, opts);
                         if (mo->ok) {
                             vol = mo->points;
                             tets = mo->tets;
@@ -2871,7 +2871,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                     std::vector<double> mode0 = flat_doubles(res["mode_shapes"][0]);
                     double freq = res["freqs_hz"][0].get<double>();
                     std::string ov =
-                        aicad::sim::modal_overlay(step_path, vol, tets, npe, mode0, freq);
+                        chudware::sim::modal_overlay(step_path, vol, tets, npe, mode0, freq);
                     if (!ov.empty()) res["overlay_aicm"] = ov;
                 }
             }
@@ -2900,7 +2900,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             std::vector<uint8_t> bytes = aicm::disp_chunk(body_id, scale_hint, vec);
             return emit(json{{"hex", to_hex(bytes)}}, out_json, 0);
         }
-#endif  // AICAD_WITH_NETGEN
+#endif  // CHUDWARE_WITH_NETGEN
         if (m == "sim_map_to_surface") {
             // DIAGNOSTIC (map value-parity): nearest-volume-node mapping. Accepts
             // {surf:[[x,y,z]...], vol:[[x,y,z]...], values:[...]| [[...]...], dim?}.
@@ -2915,7 +2915,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                 dim = static_cast<int>(vj[0].size());
             }
             std::vector<double> values = flat_doubles(vj);
-            std::vector<double> mapped = aicad::sim::map_to_surface(surf, vol, values, dim);
+            std::vector<double> mapped = chudware::sim::map_to_surface(surf, vol, values, dim);
             return emit(json{{"mapped", mapped}, {"dim", dim}}, out_json, 0);
         }
         if (m == "sim_static_overlay") {
@@ -2935,7 +2935,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             double yield_mpa = params.value("yield_mpa", 250.0);
             json summary = params.contains("summary") ? params["summary"] : json::object();
             std::string ov =
-                aicad::sim::static_overlay(step_path, pts, tets, npe, vm, dm, dv, p1, p3,
+                chudware::sim::static_overlay(step_path, pts, tets, npe, vm, dm, dv, p1, p3,
                                            ms, yield_mpa, summary);
             if (ov.empty()) return emit_error("sim_static_overlay: overlay packaging failed", out_json);
             return emit(json{{"overlay_aicm", ov}}, out_json, 0);
@@ -2950,7 +2950,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             std::vector<double> shp = flat_doubles(params.value("mode_shape", json::array()));
             double freq_hz = params.value("freq_hz", 0.0);
             std::string ov =
-                aicad::sim::modal_overlay(step_path, pts, tets, npe, shp, freq_hz);
+                chudware::sim::modal_overlay(step_path, pts, tets, npe, shp, freq_hz);
             if (ov.empty()) return emit_error("sim_modal_overlay: overlay packaging failed", out_json);
             return emit(json{{"overlay_aicm", ov}}, out_json, 0);
         }
@@ -2961,20 +2961,20 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             if (params.contains("doc")) doc = params["doc"];
             else if (params.contains("features")) doc = params;
             else return emit_error("doc_validate: params need a 'doc' object", out_json);
-            std::vector<std::string> errs = aicad::doc::validate_document(doc);
+            std::vector<std::string> errs = chudware::doc::validate_document(doc);
             return emit(json{{"ok", errs.empty()}, {"errors", errs}}, out_json, 0);
         }
-        // --- stateful document session RPCs (aicad::doc::session) ---------------
+        // --- stateful document session RPCs (chudware::doc::session) ---------------
         // Each returns the host's ops-response JSON. An OpError becomes a nonzero
         // return carrying the {code,message,detail} envelope (so the host can treat
         // it as a structured error / fall back to Python).
         try {
             if (m == "doc_new")
-                return emit(aicad::doc::doc_new(params.value("kind", std::string("part")),
+                return emit(chudware::doc::doc_new(params.value("kind", std::string("part")),
                                                 params.value("name", std::string())),
                             out_json, 0);
             if (m == "doc_apply_ops")
-                return emit(aicad::doc::doc_apply_ops(
+                return emit(chudware::doc::doc_apply_ops(
                                 params.value("doc_id", std::string()),
                                 params.contains("base_revision") && params["base_revision"].is_number()
                                     ? params["base_revision"].get<long>() : -1,
@@ -2982,53 +2982,53 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                                 params.value("coalesce", false)),
                             out_json, 0);
             if (m == "doc_dry_run_ops")
-                return emit(aicad::doc::doc_dry_run_ops(
+                return emit(chudware::doc::doc_dry_run_ops(
                                 params.value("doc_id", std::string()),
                                 params.contains("ops") ? params["ops"] : json::array()),
                             out_json, 0);
             if (m == "doc_undo")
-                return emit(aicad::doc::doc_undo(params.value("doc_id", std::string())), out_json, 0);
+                return emit(chudware::doc::doc_undo(params.value("doc_id", std::string())), out_json, 0);
             if (m == "doc_redo")
-                return emit(aicad::doc::doc_redo(params.value("doc_id", std::string())), out_json, 0);
+                return emit(chudware::doc::doc_redo(params.value("doc_id", std::string())), out_json, 0);
             if (m == "doc_clear_history")
-                return emit(aicad::doc::doc_clear_history(params.value("doc_id", std::string())),
+                return emit(chudware::doc::doc_clear_history(params.value("doc_id", std::string())),
                             out_json, 0);
             if (m == "doc_tree")
-                return emit(aicad::doc::doc_tree(params.value("doc_id", std::string())), out_json, 0);
+                return emit(chudware::doc::doc_tree(params.value("doc_id", std::string())), out_json, 0);
             if (m == "doc_rebuild")
-                return emit(aicad::doc::doc_rebuild(params.value("doc_id", std::string())), out_json, 0);
+                return emit(chudware::doc::doc_rebuild(params.value("doc_id", std::string())), out_json, 0);
             if (m == "doc_activate")
-                return emit(aicad::doc::doc_activate(params.value("doc_id", std::string())), out_json, 0);
+                return emit(chudware::doc::doc_activate(params.value("doc_id", std::string())), out_json, 0);
             if (m == "doc_solve_mates")
-                return emit(aicad::doc::doc_solve_mates(
+                return emit(chudware::doc::doc_solve_mates(
                                 params.value("doc_id", std::string()),
                                 params.contains("drag") ? params["drag"] : json(nullptr)),
                             out_json, 0);
             if (m == "doc_set_explode_state")
-                return emit(aicad::doc::doc_set_explode_state(
+                return emit(chudware::doc::doc_set_explode_state(
                                 params.value("doc_id", std::string()),
                                 params.value("active", false),
                                 params.contains("factor") && params["factor"].is_number()
                                     ? params["factor"].get<double>() : 1.0),
                             out_json, 0);
             if (m == "asm_world_bodies")
-                return emit(aicad::doc::doc_asm_world_bodies(
+                return emit(chudware::doc::doc_asm_world_bodies(
                                 params.value("doc_id", std::string()),
                                 params.value("explode", false)),
                             out_json, 0);
             if (m == "doc_close")
-                return emit(json{{"closed", aicad::doc::doc_close(params.value("doc_id", std::string()))}},
+                return emit(json{{"closed", chudware::doc::doc_close(params.value("doc_id", std::string()))}},
                             out_json, 0);
             if (m == "doc_list")
-                return emit(aicad::doc::doc_list(), out_json, 0);
+                return emit(chudware::doc::doc_list(), out_json, 0);
             if (m == "doc_list_ops") {
                 // Closed vocabulary for add_features / doc_apply_ops — single source
                 // from op_registry (must match apply_one). Python MCP + agent middleware
                 // query this so they never hand-copy the list.
                 json ops = json::array();
-                for (const auto& k : aicad::doc::doc_op_kinds()) ops.push_back(k);
+                for (const auto& k : chudware::doc::doc_op_kinds()) ops.push_back(k);
                 json ftypes = json::array();
-                for (const auto& t : aicad::doc::feature_type_names()) ftypes.push_back(t);
+                for (const auto& t : chudware::doc::feature_type_names()) ftypes.push_back(t);
                 return emit(json{
                     {"ok", true},                    {"ops", ops},
                     {"feature_types", ftypes},
@@ -3044,42 +3044,42 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                             }},
                         }},
                     }},
-                    {"cheatsheet", aicad::doc::doc_ops_cheatsheet_snippet()},
+                    {"cheatsheet", chudware::doc::doc_ops_cheatsheet_snippet()},
                     {"hint", "Feature types (box/cylinder/sketch/…) are NOT ops — wrap with "
                              "op=add_feature. Call cad_guide() for worked examples."},
                 }, out_json, 0);
             }
             if (m == "doc_formats")
-                return emit(aicad::doc::doc_formats(), out_json, 0);
+                return emit(chudware::doc::doc_formats(), out_json, 0);
             if (m == "doc_checkpoint")
-                return emit(aicad::doc::doc_checkpoint(params.value("doc_id", std::string())), out_json, 0);
+                return emit(chudware::doc::doc_checkpoint(params.value("doc_id", std::string())), out_json, 0);
             if (m == "doc_revert")
-                return emit(aicad::doc::doc_revert(params.value("doc_id", std::string()),
+                return emit(chudware::doc::doc_revert(params.value("doc_id", std::string()),
                                                    params.value("checkpoint", std::string())),
                             out_json, 0);
             if (m == "doc_refresh_derived")
-                return emit(aicad::doc::doc_refresh_derived(params.value("doc_id", std::string()),
+                return emit(chudware::doc::doc_refresh_derived(params.value("doc_id", std::string()),
                                                             params.value("id", std::string())),
                             out_json, 0);
             if (m == "config_list")
-                return emit(aicad::doc::doc_config_list(params.value("doc_id", std::string())),
+                return emit(chudware::doc::doc_config_list(params.value("doc_id", std::string())),
                             out_json, 0);
             if (m == "config_add")
-                return emit(aicad::doc::doc_config_add(
+                return emit(chudware::doc::doc_config_add(
                                 params.value("doc_id", std::string()),
                                 params.value("name", std::string()),
                                 params.contains("copy_from") ? params["copy_from"] : json(nullptr)),
                             out_json, 0);
             if (m == "config_delete")
-                return emit(aicad::doc::doc_config_delete(params.value("doc_id", std::string()),
+                return emit(chudware::doc::doc_config_delete(params.value("doc_id", std::string()),
                                                           params.value("name", std::string())),
                             out_json, 0);
             if (m == "config_activate")
-                return emit(aicad::doc::doc_config_activate(params.value("doc_id", std::string()),
+                return emit(chudware::doc::doc_config_activate(params.value("doc_id", std::string()),
                                                             params.value("name", std::string())),
                             out_json, 0);
             if (m == "config_set_override")
-                return emit(aicad::doc::doc_config_set_override(
+                return emit(chudware::doc::doc_config_set_override(
                                 params.value("doc_id", std::string()),
                                 params.value("name", std::string()),
                                 params.value("feature_id", std::string()),
@@ -3088,55 +3088,55 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                                 params.value("clear", false)),
                             out_json, 0);
             if (m == "config_set_suppression")
-                return emit(aicad::doc::doc_config_set_suppression(
+                return emit(chudware::doc::doc_config_set_suppression(
                                 params.value("doc_id", std::string()),
                                 params.value("name", std::string()),
                                 params.value("feature_id", std::string()),
                                 params.value("suppressed", false)),
                             out_json, 0);
             if (m == "sim_study_list")
-                return emit(aicad::doc::doc_sim_study_list(params.value("doc_id", std::string())),
+                return emit(chudware::doc::doc_sim_study_list(params.value("doc_id", std::string())),
                             out_json, 0);
             if (m == "sim_study_add")
-                return emit(aicad::doc::doc_sim_study_add(
+                return emit(chudware::doc::doc_sim_study_add(
                                 params.value("doc_id", std::string()),
                                 params.contains("study") ? params["study"] : json(nullptr)),
                             out_json, 0);
             if (m == "sim_study_edit")
-                return emit(aicad::doc::doc_sim_study_edit(
+                return emit(chudware::doc::doc_sim_study_edit(
                                 params.value("doc_id", std::string()),
                                 params.value("study_id", std::string()),
                                 params.contains("study") ? params["study"] : json(nullptr)),
                             out_json, 0);
             if (m == "sim_study_delete")
-                return emit(aicad::doc::doc_sim_study_delete(
+                return emit(chudware::doc::doc_sim_study_delete(
                                 params.value("doc_id", std::string()),
                                 params.value("study_id", std::string())),
                             out_json, 0);
             if (m == "doc_save")
-                return emit(aicad::doc::doc_save(params.value("doc_id", std::string()),
+                return emit(chudware::doc::doc_save(params.value("doc_id", std::string()),
                                                  params.value("path", std::string())),
                             out_json, 0);
             if (m == "doc_open")
-                return emit(aicad::doc::doc_open(params.value("path", std::string()),
+                return emit(chudware::doc::doc_open(params.value("path", std::string()),
                                                  params.value("as_solid", false),
                                                  params.value("detach_path", false)),
                             out_json, 0);
             if (m == "doc_resolve_pick")
-                return emit(aicad::doc::doc_resolve_pick(
+                return emit(chudware::doc::doc_resolve_pick(
                                 params.value("doc_id", std::string()),
                                 params.value("body_id", 0),
                                 params.value("kind", std::string()),
                                 params.value("topo_id", 0)),
                             out_json, 0);
             if (m == "doc_face_edges")
-                return emit(aicad::doc::doc_face_edges(
+                return emit(chudware::doc::doc_face_edges(
                                 params.value("doc_id", std::string()),
                                 params.value("body_id", 0),
                                 params.value("topo_id", 0)),
                             out_json, 0);
             if (m == "doc_push_pull")
-                return emit(aicad::doc::doc_push_pull(
+                return emit(chudware::doc::doc_push_pull(
                                 params.value("doc_id", std::string()),
                                 params.value("body_id", 0),
                                 params.value("topo_id", 0),
@@ -3145,14 +3145,14 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                                 params.value("commit", false)),
                             out_json, 0);
             if (m == "doc_export_step")
-                return emit(aicad::doc::doc_export_step(
+                return emit(chudware::doc::doc_export_step(
                                 params.value("doc_id", std::string()),
                                 params.value("path", std::string())),
                             out_json, 0);
             if (m == "parts_catalog_list")
                 // The parametric standard-parts catalog (families + sizes + lengths)
                 // for the GUI library browser and the agent context. No doc needed.
-                return emit(aicad::parts::catalog_json(), out_json, 0);
+                return emit(chudware::parts::catalog_json(), out_json, 0);
             if (m == "parts_make") {
                 // {family, size, length_mm?, options?, name?, save_path?} -> build a
                 // NEW editable part doc from the catalog generator. With save_path,
@@ -3161,25 +3161,25 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                 return emit(parts_make_impl(params, rc), out_json, rc);
             }
             if (m == "doc_render_png")
-                return emit(aicad::doc::doc_render_png(
+                return emit(chudware::doc::doc_render_png(
                                 params.value("doc_id", std::string()),
                                 params.value("out_path", std::string()),
                                 params.value("annotate", true)),
                             out_json, 0);
             if (m == "doc_render_view")
-                return emit(aicad::doc::doc_render_view(
+                return emit(chudware::doc::doc_render_view(
                                 params.value("doc_id", std::string()),
                                 params.value("out_path", std::string()),
                                 params.contains("view") ? params.at("view") : json(nullptr)),
                             out_json, 0);
             if (m == "doc_render_contact_sheet")
-                return emit(aicad::doc::doc_render_contact_sheet(
+                return emit(chudware::doc::doc_render_contact_sheet(
                                 params.value("doc_id", std::string()),
                                 params.value("out_path", std::string()),
                                 params.contains("views") ? params.at("views") : json::array()),
                             out_json, 0);
             if (m == "drawing_render_png")
-                return emit(aicad::doc::drawing_render_png(
+                return emit(chudware::doc::drawing_render_png(
                                 params.value("doc_id", std::string()),
                                 params.value("out_path", std::string())),
                             out_json, 0);
@@ -3189,17 +3189,17 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                 // doc_id shape below tessellates a document instead.
                 if (params.contains("stl_path") && params["stl_path"].is_string() &&
                     !params["stl_path"].get<std::string>().empty())
-                    return emit(aicad::sim::run_flow_stl(params), out_json, 0);
+                    return emit(chudware::sim::run_flow_stl(params), out_json, 0);
                 // {doc_id, velocity, aoa?, fluid?, cells?, n_steps?} -> wind-tunnel LBM forces.
                 std::string doc_id = params.value("doc_id", std::string());
-                std::vector<aicm::AicmBody> bodies = aicad::doc::doc_tessellate_bodies(doc_id);
+                std::vector<aicm::AicmBody> bodies = chudware::doc::doc_tessellate_bodies(doc_id);
                 if (bodies.empty())
                     return emit(json{{"ok", false}, {"error", "no solid geometry to simulate"}},
                                 out_json, 0);
                 std::vector<std::vector<float>> bp;
                 std::vector<std::vector<uint32_t>> bi;
                 for (auto& b : bodies) { bp.push_back(b.pos); bi.push_back(b.idx); }
-                aicad::sim::FlowParams fp;
+                chudware::sim::FlowParams fp;
                 fp.velocity_ms = params.value("velocity", 10.0);
                 fp.aoa_deg = params.value("aoa", 0.0);
                 std::string fluid = params.value("fluid", std::string("air"));
@@ -3209,7 +3209,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                 fp.progress_path = params.value("progress_path", std::string());
                 fp.job_id = params.value("job_id", std::string());  // T-RF16: sim_cancel registry key
                 double re = 0.0;
-                aicad::sim::LbmResult r = aicad::sim::run_wind_tunnel(bp, bi, fp, &re);
+                chudware::sim::LbmResult r = chudware::sim::run_wind_tunnel(bp, bi, fp, &re);
                 if (!r.ok)
                     return emit(json{{"ok", false}, {"error", r.error}}, out_json, 0);
                 json flow{{"ok", true},
@@ -3236,7 +3236,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             if (m == "sim_cancel") {
                 // T-RF16: cancel a registered sim job (core/sim/sim_cancel.cpp — same
                 // registry semantics as agent cancel: idempotent, miss = cancelled:false).
-                return emit(aicad::sim::sim_cancel(params.value("job_id", std::string())),
+                return emit(chudware::sim::sim_cancel(params.value("job_id", std::string())),
                             out_json, 0);
             }
             if (m == "agent_simulate_v1") {
@@ -3249,60 +3249,60 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                             out_json, 0);
             }
             if (m == "doc_face_points")
-                return emit(aicad::doc::doc_face_points(
+                return emit(chudware::doc::doc_face_points(
                                 params.value("doc_id", std::string()),
                                 params.contains("selector") ? params["selector"] : json(nullptr),
                                 params.contains("max_n") && params["max_n"].is_number()
                                     ? params["max_n"].get<int>() : 400),
                             out_json, 0);
             if (m == "doc_query")
-                return emit(aicad::doc::doc_query(
+                return emit(chudware::doc::doc_query(
                                 params.value("doc_id", std::string()),
                                 params.contains("query") ? params["query"] : params),
                             out_json, 0);
             if (m == "doc_adjacency")
-                return emit(aicad::doc::doc_adjacency(params.value("doc_id", std::string())),
+                return emit(chudware::doc::doc_adjacency(params.value("doc_id", std::string())),
                             out_json, 0);
             if (m == "doc_set_meta")
-                return emit(aicad::doc::doc_set_meta(
+                return emit(chudware::doc::doc_set_meta(
                                 params.value("doc_id", std::string()),
                                 params.value("key", std::string()),
                                 params.contains("value") ? params["value"] : json(nullptr)),
                             out_json, 0);
             if (m == "doc_get_meta")
-                return emit(aicad::doc::doc_get_meta(
+                return emit(chudware::doc::doc_get_meta(
                                 params.value("doc_id", std::string()),
                                 params.value("key", std::string())),
                             out_json, 0);
             if (m == "doc_set_name") {
                 std::string did = jstr(params, "doc_id");
                 std::string nm = jstr(params, "name");
-                return emit(aicad::doc::doc_set_name(did, nm), out_json, 0);
+                return emit(chudware::doc::doc_set_name(did, nm), out_json, 0);
             }
             // --- C18 interactive sketch mode (engine/doc/session.py sketch_*) ---
             // The worker passes the sketch feature id under "sketch".
             if (m == "sketch_enter")
-                return emit(aicad::doc::doc_sketch_enter(
+                return emit(chudware::doc::doc_sketch_enter(
                                 params.value("doc_id", std::string()),
                                 params.value("sketch", std::string())),
                             out_json, 0);
             if (m == "sketch_solve")
-                return emit(aicad::doc::doc_sketch_solve(
+                return emit(chudware::doc::doc_sketch_solve(
                                 params.value("doc_id", std::string()),
                                 params.value("sketch", std::string())),
                             out_json, 0);
             if (m == "doc_sketch_overview")
-                return emit(aicad::doc::doc_sketch_overview(
+                return emit(chudware::doc::doc_sketch_overview(
                                 params.value("doc_id", std::string()),
                                 params.value("sketch", std::string())),
                             out_json, 0);
             if (m == "doc_sketch_regions")
-                return emit(aicad::doc::doc_sketch_regions(
+                return emit(chudware::doc::doc_sketch_regions(
                                 params.value("doc_id", std::string()),
                                 params.value("sketch", std::string())),
                             out_json, 0);
             if (m == "sketch_drag")
-                return emit(aicad::doc::doc_sketch_drag(
+                return emit(chudware::doc::doc_sketch_drag(
                                 params.value("doc_id", std::string()),
                                 params.value("sketch", std::string()),
                                 params.value("handle", std::string()),
@@ -3310,42 +3310,42 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                                 params.contains("targets") ? params["targets"] : json(nullptr)),
                             out_json, 0);
             if (m == "sketch_drag_commit")
-                return emit(aicad::doc::doc_sketch_drag_commit(
+                return emit(chudware::doc::doc_sketch_drag_commit(
                                 params.value("doc_id", std::string()),
                                 params.value("sketch", std::string())),
                             out_json, 0);
             if (m == "sketch_exit")
-                return emit(aicad::doc::doc_sketch_exit(
+                return emit(chudware::doc::doc_sketch_exit(
                                 params.value("doc_id", std::string()),
                                 params.value("sketch", std::string())),
                             out_json, 0);
             if (m == "sketch_probe")
-                return emit(aicad::doc::doc_sketch_probe(
+                return emit(chudware::doc::doc_sketch_probe(
                                 params.value("doc_id", std::string()),
                                 params.value("sketch", std::string()),
                                 params.contains("action") ? params["action"] : json::object()),
                             out_json, 0);
             // T-W2 sketch completion suite.
             if (m == "sketch_auto_constrain")
-                return emit(aicad::doc::doc_sketch_auto_constrain(
+                return emit(chudware::doc::doc_sketch_auto_constrain(
                                 params.value("doc_id", std::string()),
                                 params.value("sketch", std::string()),
                                 params.contains("opts") ? params["opts"] : json::object()),
                             out_json, 0);
             if (m == "sketch_health")
-                return emit(aicad::doc::doc_sketch_health(
+                return emit(chudware::doc::doc_sketch_health(
                                 params.value("doc_id", std::string()),
                                 params.value("sketch", std::string())),
                             out_json, 0);
             // 3D free-space sketch (feature type "sketch3d"). Same "sketch" param
             // carries the feature id; contract in contracts/sketch3d_gui_contract.md.
             if (m == "sketch3d_health")
-                return emit(aicad::doc::doc_sketch3d_health(
+                return emit(chudware::doc::doc_sketch3d_health(
                                 params.value("doc_id", std::string()),
                                 params.value("sketch", std::string())),
                             out_json, 0);
             if (m == "sketch3d_drag")
-                return emit(aicad::doc::doc_sketch3d_drag(
+                return emit(chudware::doc::doc_sketch3d_drag(
                                 params.value("doc_id", std::string()),
                                 params.value("sketch", std::string()),
                                 params.value("handle", std::string()),
@@ -3353,23 +3353,23 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                                 params.contains("targets") ? params["targets"] : json(nullptr)),
                             out_json, 0);
             if (m == "sketch_project_ref")
-                return emit(aicad::doc::doc_sketch_project_ref(
+                return emit(chudware::doc::doc_sketch_project_ref(
                                 params.value("doc_id", std::string()),
                                 params.value("sketch", std::string()),
                                 params.contains("ref") ? params["ref"] : json(nullptr)),
                             out_json, 0);
             if (m == "sketch_project_entities")
-                return emit(aicad::doc::doc_sketch_project_entities(
+                return emit(chudware::doc::doc_sketch_project_entities(
                                 params.value("doc_id", std::string()),
                                 params.value("sketch", std::string()),
                                 params.contains("refs") ? params["refs"] : json::array()),
                             out_json, 0);
             if (m == "weld_cut_list")
-                return emit(aicad::doc::doc_weld_cut_list(
+                return emit(chudware::doc::doc_weld_cut_list(
                                 params.value("doc_id", std::string())),
                             out_json, 0);
             if (m == "eval_mass")
-                return emit(aicad::doc::doc_eval_mass(
+                return emit(chudware::doc::doc_eval_mass(
                                 params.value("doc_id", std::string()),
                                 params.contains("body") && params["body"].is_number()
                                     ? params["body"].get<int>() : 0,
@@ -3377,42 +3377,42 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                                     ? params["density_g_cm3"].get<double>() : 7.85),
                             out_json, 0);
             if (m == "doc_bbox")
-                return emit(aicad::doc::doc_bbox(params.value("doc_id", std::string())),
+                return emit(chudware::doc::doc_bbox(params.value("doc_id", std::string())),
                             out_json, 0);
             if (m == "eval_check")
-                return emit(aicad::doc::doc_eval_check(
+                return emit(chudware::doc::doc_eval_check(
                                 params.value("doc_id", std::string()),
                                 params.contains("body") && params["body"].is_number()
                                     ? params["body"].get<int>() : 0),
                             out_json, 0);
             if (m == "eval_section_props")
-                return emit(aicad::doc::doc_eval_section_props(
+                return emit(chudware::doc::doc_eval_section_props(
                                 params.value("doc_id", std::string()),
                                 params.contains("plane") ? params["plane"] : json(nullptr)),
                             out_json, 0);
             if (m == "eval_symmetry")
-                return emit(aicad::doc::doc_eval_symmetry(
+                return emit(chudware::doc::doc_eval_symmetry(
                                 params.value("doc_id", std::string()),
                                 params.contains("body") && params["body"].is_number()
                                     ? params["body"].get<int>() : 0,
                                 params.contains("plane") ? params["plane"] : json(nullptr)),
                             out_json, 0);
             if (m == "eval_interference")
-                return emit(aicad::doc::doc_eval_interference(
+                return emit(chudware::doc::doc_eval_interference(
                                 params.value("doc_id", std::string()), params),
                             out_json, 0);
             if (m == "eval_feature_overlap")
-                return emit(aicad::doc::doc_eval_feature_overlap(
+                return emit(chudware::doc::doc_eval_feature_overlap(
                                 params.value("doc_id", std::string()), params),
                             out_json, 0);
             if (m == "eval_compare")
-                return emit(aicad::doc::doc_eval_compare(params), out_json, 0);
+                return emit(chudware::doc::doc_eval_compare(params), out_json, 0);
             if (m == "doc_face_wires")
-                return emit(aicad::doc::doc_face_wires(
+                return emit(chudware::doc::doc_face_wires(
                                 params.value("doc_id", std::string()), params),
                             out_json, 0);
             if (m == "eval_measure")
-                return emit(aicad::doc::doc_eval_measure(
+                return emit(chudware::doc::doc_eval_measure(
                                 params.value("doc_id", std::string()),
                                 params.contains("refs") ? params["refs"] : json::array()),
                             out_json, 0);
@@ -3422,7 +3422,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                     params["pull"].size() == 3) {
                     for (int i = 0; i < 3; ++i) pull[i] = params["pull"][i].get<double>();
                 }
-                return emit(aicad::doc::doc_eval_draft(
+                return emit(chudware::doc::doc_eval_draft(
                                 params.value("doc_id", std::string()),
                                 params.contains("body") && params["body"].is_number()
                                     ? params["body"].get<int>() : 0,
@@ -3432,20 +3432,20 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                             out_json, 0);
             }
             if (m == "eval_curvature")
-                return emit(aicad::doc::doc_eval_curvature(
+                return emit(chudware::doc::doc_eval_curvature(
                                 params.value("doc_id", std::string()),
                                 params.contains("body") && params["body"].is_number()
                                     ? params["body"].get<int>() : 0,
                                 params.value("kind", std::string("mean"))),
                             out_json, 0);
             if (m == "eval_thickness")
-                return emit(aicad::doc::doc_eval_thickness(
+                return emit(chudware::doc::doc_eval_thickness(
                                 params.value("doc_id", std::string()),
                                 params.contains("body") && params["body"].is_number()
                                     ? params["body"].get<int>() : 0),
                             out_json, 0);
             if (m == "export_file")
-                return emit(aicad::doc::doc_export_file(
+                return emit(chudware::doc::doc_export_file(
                                 params.value("doc_id", std::string()),
                                 params.value("path", std::string()),
                                 params.value("format", std::string()),
@@ -3456,7 +3456,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             // Live triangle/vertex estimate for the export dialog — tessellates in memory
             // at the requested quality and returns counts without writing a file.
             if (m == "export_tess_estimate")
-                return emit(aicad::doc::doc_export_estimate(
+                return emit(chudware::doc::doc_export_estimate(
                                 params.value("doc_id", std::string()),
                                 params.value("lin_deflection", 0.05),
                                 params.value("ang_deflection", 0.35),
@@ -3475,21 +3475,21 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                 }
                 const std::string doc_id = params.value("doc_id", std::string());
                 if (m == "export_drawing")
-                    return emit(aicad::doc::export_drawing(doc_id, path, fmt), out_json, 0);
-                return emit(aicad::doc::export_flat_dxf(doc_id, path, fmt), out_json, 0);
+                    return emit(chudware::doc::export_drawing(doc_id, path, fmt), out_json, 0);
+                return emit(chudware::doc::export_flat_dxf(doc_id, path, fmt), out_json, 0);
             }
             if (m == "import_file")
-                return emit(aicad::doc::doc_import_file(params.value("path", std::string()),
+                return emit(chudware::doc::doc_import_file(params.value("path", std::string()),
                                                         params.value("into", std::string()),
                                                         params.value("as_solid", false),
                                                         params.value("format", std::string())),
                             out_json, 0);
             if (m == "mesh_read_raw")
-                return emit(aicad::doc::mesh_read_raw(params.value("path", std::string()),
+                return emit(chudware::doc::mesh_read_raw(params.value("path", std::string()),
                                                       params.value("format", std::string())),
                             out_json, 0);
             if (m == "vendor_part_insert")
-                return emit(aicad::doc::doc_vendor_part_insert(
+                return emit(chudware::doc::doc_vendor_part_insert(
                                 params.contains("into") ? params.value("into", std::string())
                                                         : params.value("doc_id", std::string()),
                                 params.value("supplier", std::string()),
@@ -3503,21 +3503,21 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                 json doc;
                 if (params.contains("doc")) doc = params["doc"];
                 else if (params.contains("features")) doc = params;
-                else throw aicad::doc::OpError("invalid_op",
+                else throw chudware::doc::OpError("invalid_op",
                                                "doc_drawing_views: params need a 'doc' object");
                 json env = params.contains("env") ? params["env"] : json::object();
                 json views = params.contains("views") ? params["views"] : json::array();
-                return emit(aicad::doc::drawing_views(doc, env, views), out_json, 0);
+                return emit(chudware::doc::drawing_views(doc, env, views), out_json, 0);
             }
             if (m == "export2d_drawing") {
                 json doc;
                 if (params.contains("doc")) doc = params["doc"];
                 else if (params.contains("features")) doc = params;
-                else throw aicad::doc::OpError("invalid_op",
+                else throw chudware::doc::OpError("invalid_op",
                                                "export2d_drawing: params need a 'doc' object");
                 json env = params.contains("env") ? params["env"] : json::object();
                 json views = params.contains("views") ? params["views"] : json::array();
-                return emit(aicad::doc::export2d_drawing(doc, env, views,
+                return emit(chudware::doc::export2d_drawing(doc, env, views,
                                                          params.value("path", std::string()),
                                                          params.value("format", std::string())),
                             out_json, 0);
@@ -3539,11 +3539,11 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                 else if (params.contains("doc")) src = params["doc"];
                 else if (params.contains("features")) src = params;
                 else if (src_id.empty())
-                    throw aicad::doc::OpError(
+                    throw chudware::doc::OpError(
                         "invalid_op", "drawing_new: params need a 'source_doc' (or 'doc') or "
                                       "a 'source_doc_id'");
                 json env = params.contains("env") ? params["env"] : json::object();
-                return emit(aicad::doc::drawing_new(src, env, params.value("name", std::string()),
+                return emit(chudware::doc::drawing_new(src, env, params.value("name", std::string()),
                                                     src_id),
                             out_json, 0);
             }
@@ -3551,15 +3551,15 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                 json src;
                 if (params.contains("source_doc")) src = params["source_doc"];
                 else if (params.contains("doc")) src = params["doc"];
-                else throw aicad::doc::OpError("invalid_op",
+                else throw chudware::doc::OpError("invalid_op",
                                                "drawing_set_source: params need a 'source_doc'");
                 json env = params.contains("env") ? params["env"] : json::object();
-                return emit(aicad::doc::drawing_set_source(params.value("doc_id", std::string()),
+                return emit(chudware::doc::drawing_set_source(params.value("doc_id", std::string()),
                                                            src, env),
                             out_json, 0);
             }
             if (m == "drawing_add_view")
-                return emit(aicad::doc::drawing_add_view(
+                return emit(chudware::doc::drawing_add_view(
                                 params.value("doc_id", std::string()),
                                 params.value("type", std::string()),
                                 params.value("orientation", std::string("front")),
@@ -3571,7 +3571,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                                                                                    : json::object();
                 for (const char* k : {"mode", "depth", "reverse"})
                     if (params.contains(k)) sopts[k] = params[k];
-                return emit(aicad::doc::drawing_add_section(
+                return emit(chudware::doc::drawing_add_section(
                                 params.value("doc_id", std::string()),
                                 params.value("parent_view_id", std::string()),
                                 opt("plane"), opt("cut_line"), opt("label"), opt("scale"),
@@ -3580,7 +3580,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                             out_json, 0);
             }
             if (m == "drawing_add_detail")
-                return emit(aicad::doc::drawing_add_detail(
+                return emit(chudware::doc::drawing_add_detail(
                                 params.value("doc_id", std::string()),
                                 params.value("parent_view_id", std::string()),
                                 opt("center"),
@@ -3590,25 +3590,25 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                                 params.value("sheet_id", std::string()), opt("show_hidden")),
                             out_json, 0);
             if (m == "drawing_remove_view")
-                return emit(aicad::doc::drawing_remove_view(params.value("doc_id", std::string()),
+                return emit(chudware::doc::drawing_remove_view(params.value("doc_id", std::string()),
                                                             params.value("view_id", std::string())),
                             out_json, 0);
             if (m == "drawing_set_view")
-                return emit(aicad::doc::drawing_set_view(
+                return emit(chudware::doc::drawing_set_view(
                                 params.value("doc_id", std::string()),
                                 params.value("view_id", std::string()),
                                 opt("scale"), opt("position"), opt("orientation"),
                                 opt("show_hidden")),
                             out_json, 0);
             if (m == "drawing_add_dim")
-                return emit(aicad::doc::drawing_add_dim(
+                return emit(chudware::doc::drawing_add_dim(
                                 params.value("doc_id", std::string()),
                                 params.value("view_id", std::string()),
                                 params.value("type", std::string("linear_dim")),
                                 opt("a"), opt("b"), opt("c"), opt("d"), opt("pos"), opt("text")),
                             out_json, 0);
             if (m == "drawing_remove_annotation")
-                return emit(aicad::doc::drawing_remove_annotation(
+                return emit(chudware::doc::drawing_remove_annotation(
                                 params.value("doc_id", std::string()),
                                 params.value("view_id", std::string()),
                                 params.value("ann_id", std::string())),
@@ -3623,7 +3623,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                 for (const char* k : {"tol_type", "tol_upper", "tol_lower", "prefix", "suffix",
                                       "precision", "critical", "count", "pos", "value", "text"})
                     if (params.contains(k)) patch[k] = params[k];
-                return emit(aicad::doc::drawing_set_annotation(
+                return emit(chudware::doc::drawing_set_annotation(
                                 params.value("doc_id", std::string()),
                                 params.value("view_id", std::string()),
                                 params.value("ann_id", std::string()), patch),
@@ -3634,7 +3634,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                                                                                : json::object();
                 for (const char* k : {"pos", "item", "text", "suffix"})
                     if (params.contains(k)) o[k] = params[k];
-                return emit(aicad::doc::drawing_add_callout(
+                return emit(chudware::doc::drawing_add_callout(
                                 params.value("doc_id", std::string()),
                                 params.value("view_id", std::string()),
                                 params.value("kind", std::string("hole")), opt("a"), o),
@@ -3654,17 +3654,17 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                 std::string did = params.value("doc_id", std::string());
                 std::string vid = params.value("view_id", std::string());
                 if (m == "drawing_add_gdt")
-                    return emit(aicad::doc::drawing_add_gdt(did, vid, spec), out_json, 0);
+                    return emit(chudware::doc::drawing_add_gdt(did, vid, spec), out_json, 0);
                 if (m == "drawing_add_datum")
-                    return emit(aicad::doc::drawing_add_datum(did, vid, spec), out_json, 0);
+                    return emit(chudware::doc::drawing_add_datum(did, vid, spec), out_json, 0);
                 if (m == "drawing_add_datum_target")
-                    return emit(aicad::doc::drawing_add_datum_target(did, vid, spec), out_json, 0);
+                    return emit(chudware::doc::drawing_add_datum_target(did, vid, spec), out_json, 0);
                 if (m == "drawing_add_surface_finish")
-                    return emit(aicad::doc::drawing_add_surface_finish(did, vid, spec), out_json, 0);
-                return emit(aicad::doc::drawing_add_weld(did, vid, spec), out_json, 0);
+                    return emit(chudware::doc::drawing_add_surface_finish(did, vid, spec), out_json, 0);
+                return emit(chudware::doc::drawing_add_weld(did, vid, spec), out_json, 0);
             }
             if (m == "drawing_model_items")
-                return emit(aicad::doc::drawing_model_items(
+                return emit(chudware::doc::drawing_model_items(
                                 params.value("doc_id", std::string()),
                                 params.value("view_id", std::string())),
                             out_json, 0);
@@ -3672,13 +3672,13 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                 json fields = params.contains("fields") && params["fields"].is_object()
                                   ? params["fields"]
                                   : json::object();
-                return emit(aicad::doc::drawing_set_titleblock(
+                return emit(chudware::doc::drawing_set_titleblock(
                                 params.value("doc_id", std::string()),
                                 params.value("sheet_id", std::string()), fields),
                             out_json, 0);
             }
             if (m == "drawing_set_sheet")
-                return emit(aicad::doc::drawing_set_sheet(
+                return emit(chudware::doc::drawing_set_sheet(
                                 params.value("doc_id", std::string()),
                                 params.value("sheet_id", std::string()),
                                 params.value("size", std::string("A3"))),
@@ -3696,16 +3696,16 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                 for (const char* k : {"name", "sheet", "views", "model_items", "hole_callouts",
                                       "title"})
                     if (params.contains(k)) spec[k] = params[k];
-                return emit(aicad::doc::drawing_make(src, spec), out_json, 0);
+                return emit(chudware::doc::drawing_make(src, spec), out_json, 0);
             }
             if (m == "drawing_get")
-                return emit(aicad::doc::drawing_get(params.value("doc_id", std::string())),
+                return emit(chudware::doc::drawing_get(params.value("doc_id", std::string())),
                             out_json, 0);
             if (m == "drawing_bom")
-                return emit(aicad::doc::drawing_bom(params.value("doc_id", std::string())),
+                return emit(chudware::doc::drawing_bom(params.value("doc_id", std::string())),
                             out_json, 0);
             if (m == "drawing_close")
-                return emit(json{{"closed", aicad::doc::drawing_close(
+                return emit(json{{"closed", chudware::doc::drawing_close(
                                                 params.value("doc_id", std::string()))}},
                             out_json, 0);
 
@@ -3726,27 +3726,27 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                 // the kinematics-only result field-identical (regression contract).
                 const json   sm_dyn   = params.contains("dynamics") ? params["dynamics"]
                                                                     : json(nullptr);
-                return emit(aicad::doc::doc_simulate_motion(
+                return emit(chudware::doc::doc_simulate_motion(
                                 sm_doc, sm_mid, sm_start, sm_stop, sm_steps, sm_ci, sm_mcl,
                                 sm_dyn),
                             out_json, 0);
             }
 
-        } catch (const aicad::doc::OpError& oe) {
+        } catch (const chudware::doc::OpError& oe) {
             // Structured error envelope (matches the Python worker's doc_* errors).
             return emit(oe.envelope(), out_json, 3);
         }
-        // --- stateful ECAD document session RPCs (aicad::ecad::session) ----------
+        // --- stateful ECAD document session RPCs (chudware::ecad::session) ----------
         // Same contract as the doc_* block: an OpError becomes a nonzero return
         // carrying the {code,message,detail} envelope. The ECAD doc/ops layer is
         // pure JSON (no OCCT) — schematic + board document model + apply-ops.
         try {
             if (m == "ecad_new")
-                return emit(aicad::ecad::ecad_new(params.value("kind", std::string("sch")),
+                return emit(chudware::ecad::ecad_new(params.value("kind", std::string("sch")),
                                                   params.value("name", std::string())),
                             out_json, 0);
             if (m == "ecad_apply_ops")
-                return emit(aicad::ecad::ecad_apply_ops(
+                return emit(chudware::ecad::ecad_apply_ops(
                                 params.value("doc_id", std::string()),
                                 params.contains("base_revision") && params["base_revision"].is_number()
                                     ? params["base_revision"].get<long>() : -1,
@@ -3754,39 +3754,39 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                             out_json, 0);
             if (m == "ecad_list_ops") {
                 json ops = json::array();
-                for (const auto& k : aicad::ecad::ecad_op_kinds()) ops.push_back(k);
+                for (const auto& k : chudware::ecad::ecad_op_kinds()) ops.push_back(k);
                 return emit(json{{"ok", true}, {"ops", ops},
                                 {"hint", "see cad_guide() for ECAD tool workflows"}},
                             out_json, 0);
             }
             if (m == "ecad_undo")
-                return emit(aicad::ecad::ecad_undo(params.value("doc_id", std::string())), out_json, 0);
+                return emit(chudware::ecad::ecad_undo(params.value("doc_id", std::string())), out_json, 0);
             if (m == "ecad_redo")
-                return emit(aicad::ecad::ecad_redo(params.value("doc_id", std::string())), out_json, 0);
+                return emit(chudware::ecad::ecad_redo(params.value("doc_id", std::string())), out_json, 0);
             if (m == "ecad_tree")
-                return emit(aicad::ecad::ecad_tree(params.value("doc_id", std::string())), out_json, 0);
+                return emit(chudware::ecad::ecad_tree(params.value("doc_id", std::string())), out_json, 0);
             if (m == "ecad_rebuild")
-                return emit(aicad::ecad::ecad_rebuild(params.value("doc_id", std::string())), out_json, 0);
+                return emit(chudware::ecad::ecad_rebuild(params.value("doc_id", std::string())), out_json, 0);
             if (m == "ecad_swap_doc")
-                return emit(aicad::ecad::ecad_swap_doc(params.value("doc_id", std::string()),
+                return emit(chudware::ecad::ecad_swap_doc(params.value("doc_id", std::string()),
                                                        params.value("doc", json::object()),
                                                        params.value("base_revision", -1L),
                                                        params.value("warnings", json::array())),
                             out_json, 0);
             if (m == "ecad_close")
-                return emit(json{{"closed", aicad::ecad::ecad_close(params.value("doc_id", std::string()))}},
+                return emit(json{{"closed", chudware::ecad::ecad_close(params.value("doc_id", std::string()))}},
                             out_json, 0);
             if (m == "ecad_describe")
-                return emit(aicad::ecad::ecad_describe(params.value("doc_id", std::string())),
+                return emit(chudware::ecad::ecad_describe(params.value("doc_id", std::string())),
                             out_json, 0);
             if (m == "ecad_schema")
-                return emit(aicad::ecad::ecad_schema(params.value("kind", std::string("sch"))),
+                return emit(chudware::ecad::ecad_schema(params.value("kind", std::string("sch"))),
                             out_json, 0);
             if (m == "ecad_dfm") {
                 json rules = params.contains("rules") ? params["rules"] : json(nullptr);
                 if (params.contains("board") && params["board"].is_object())
-                    return emit(aicad::ecad::ecad_dfm_board(params["board"], rules), out_json, 0);
-                return emit(aicad::ecad::ecad_dfm(params.value("doc_id", std::string()), rules),
+                    return emit(chudware::ecad::ecad_dfm_board(params["board"], rules), out_json, 0);
+                return emit(chudware::ecad::ecad_dfm(params.value("doc_id", std::string()), rules),
                             out_json, 0);
             }
             auto base_rev = [&](void) -> long {
@@ -3799,22 +3799,22 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                 if (params.contains("board") && params["board"].is_object())
                     // Stateless inline-board path (parity harness): returns the PURE
                     // {tracks, vias, report} of engine.ecad.autoroute.autoroute(board, opts).
-                    return emit(aicad::ecad::autoroute(params["board"], opts), out_json, 0);
+                    return emit(chudware::ecad::autoroute(params["board"], opts), out_json, 0);
                 // Doc-id session path (the host's form): route the open board, apply the
                 // tracks/vias as ops, return the board ops-response + report.
-                return emit(aicad::ecad::ecad_autoroute(params.value("doc_id", std::string()), opts,
+                return emit(chudware::ecad::ecad_autoroute(params.value("doc_id", std::string()), opts,
                                                         base_rev()),
                             out_json, 0);
             }
             if (m == "ecad_route_diff_pair") {
                 json opts = params.contains("opts") ? params["opts"] : json(nullptr);
                 if (params.contains("board") && params["board"].is_object())
-                    return emit(aicad::ecad::route_diff_pair(params["board"],
+                    return emit(chudware::ecad::route_diff_pair(params["board"],
                                                              params.value("net_p", std::string()),
                                                              params.value("net_n", std::string()),
                                                              opts),
                                 out_json, 0);
-                return emit(aicad::ecad::ecad_route_diff_pair(
+                return emit(chudware::ecad::ecad_route_diff_pair(
                                 params.value("doc_id", std::string()),
                                 params.value("net_p", std::string()),
                                 params.value("net_n", std::string()), opts, base_rev()),
@@ -3822,14 +3822,14 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             }
             if (m == "ecad_fill_zones") {
                 json resolution = params.contains("resolution") ? params["resolution"] : json(nullptr);
-                return emit(aicad::ecad::ecad_fill_zones(params.value("doc_id", std::string()),
+                return emit(chudware::ecad::ecad_fill_zones(params.value("doc_id", std::string()),
                                                          resolution, base_rev()),
                             out_json, 0);
             }
             if (m == "ecad_simulate") {
                 json study = params.contains("study") ? params["study"] : json(nullptr);
                 json sim_params = params.contains("sim_params") ? params["sim_params"] : json(nullptr);
-                return emit(aicad::ecad::ecad_simulate(params.value("doc_id", std::string()), study,
+                return emit(chudware::ecad::ecad_simulate(params.value("doc_id", std::string()), study,
                                                        sim_params),
                             out_json, 0);
             }
@@ -3840,44 +3840,44 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                     // model (substrate extrude + drill cuts + analytic component proxies)
                     // and return the geometry summary + exact BRep volume stats. Mirrors
                     // engine.ecad.threed.board_to_step's summary; no STEP file is written.
-                    return emit(aicad::ecad::board_to_3d(params["board"], opts), out_json, 0);
+                    return emit(chudware::ecad::board_to_3d(params["board"], opts), out_json, 0);
                 // Doc-id session path (the host's form): fetch the open board doc, build
                 // the model, WRITE the STEP at `path`, and return {step_path, summary, ...}
                 // exactly like engine.ecad.threed.board_to_step.
-                json board = aicad::ecad::ecad_session_doc(params.value("doc_id", std::string()));
-                if (!aicad::ecad::schema::is_board(board))
-                    return emit(aicad::ecad::OpError("invalid_op",
+                json board = chudware::ecad::ecad_session_doc(params.value("doc_id", std::string()));
+                if (!chudware::ecad::schema::is_board(board))
+                    return emit(chudware::ecad::OpError("invalid_op",
                                                      "ecad_to_3d requires a pcb document",
                                                      json{{"reason", "wrong doc kind"}})
                                     .envelope(),
                                 out_json, 3);
-                return emit(aicad::ecad::board_to_3d_step(board, opts,
+                return emit(chudware::ecad::board_to_3d_step(board, opts,
                                                           params.value("path", std::string())),
                             out_json, 0);
             }
             if (m == "ecad_impedance")
-                return emit(aicad::ecad::ecad_impedance(params), out_json, 0);
+                return emit(chudware::ecad::ecad_impedance(params), out_json, 0);
             if (m == "ecad_export")
-                return emit(aicad::ecad::ecad_export(params), out_json, 0);
+                return emit(chudware::ecad::ecad_export(params), out_json, 0);
             if (m == "ecad_save")
-                return emit(aicad::ecad::ecad_save(params.value("doc_id", std::string()),
+                return emit(chudware::ecad::ecad_save(params.value("doc_id", std::string()),
                                                    params.value("path", std::string())),
                             out_json, 0);
             if (m == "ecad_open")
-                return emit(aicad::ecad::ecad_open(params.value("path", std::string())), out_json, 0);
+                return emit(chudware::ecad::ecad_open(params.value("path", std::string())), out_json, 0);
             if (m == "ecad_update_from_sch") {
                 // Stateless inline path (parity harness): {board, sch_netlist, prune?,
                 // place_origin?} -> sync's {mutated_board, report}. Else the stateful
                 // path over two open sessions.
                 json place = params.contains("place_origin") ? params["place_origin"] : json(nullptr);
                 if (params.contains("board") && params["board"].is_object())
-                    return emit(aicad::ecad::ecad_update_from_sch_inline(
+                    return emit(chudware::ecad::ecad_update_from_sch_inline(
                                     params["board"],
                                     params.contains("sch_netlist") ? params["sch_netlist"]
                                                                     : json::object(),
                                     params.value("prune", false), place),
                                 out_json, 0);
-                return emit(aicad::ecad::ecad_update_from_sch(
+                return emit(chudware::ecad::ecad_update_from_sch(
                                 params.value("board_doc_id", std::string()),
                                 params.value("sch_doc_id", std::string()),
                                 params.value("prune", false), place,
@@ -3889,83 +3889,83 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             // orchestrator (engine/ecad/orchestrator.py / the ecad_design RPC) is
             // DEFERRED to the agent/LLM epic; only the pure recipe builders are ported.
             if (m == "ecad_recipe")
-                return emit(aicad::ecad::recipes::build(
+                return emit(chudware::ecad::recipes::build(
                                 params.value("name", std::string()),
                                 params.contains("params") ? params["params"] : json::object()),
                             out_json, 0);
             if (m == "ecad_recipes_all")
-                return emit(aicad::ecad::recipes::all_recipes(), out_json, 0);
+                return emit(chudware::ecad::recipes::all_recipes(), out_json, 0);
             if (m == "ecad_closest_recipe")
-                return emit(aicad::ecad::recipes::closest_recipe(params.value("request", std::string())),
+                return emit(chudware::ecad::recipes::closest_recipe(params.value("request", std::string())),
                             out_json, 0);
-        } catch (const aicad::ecad::OpError& oe) {
+        } catch (const chudware::ecad::OpError& oe) {
             return emit(oe.envelope(), out_json, 3);
         }
 
         // --- CAM (computer-aided machining) document session RPCs --------------
         // Same OpError-envelope contract as the ecad block. The CAM job/ops/post/
         // sim layer is pure JSON (no OCCT); the OCCT extraction adapter (cam_extract)
-        // lives in geom/ and is dispatched below when AICAD_WITH_OCCT.
+        // lives in geom/ and is dispatched below when CHUDWARE_WITH_OCCT.
         try {
             auto cam_base_rev = [&](void) -> long {
                 return (params.contains("base_revision") && params["base_revision"].is_number())
                            ? params["base_revision"].get<long>() : -1;
             };
-            if (m == "cam_new") return emit(aicad::cam::cam_new(params), out_json, 0);
+            if (m == "cam_new") return emit(chudware::cam::cam_new(params), out_json, 0);
             if (m == "cam_apply_ops")
-                return emit(aicad::cam::cam_apply_ops(params.value("doc_id", std::string()),
+                return emit(chudware::cam::cam_apply_ops(params.value("doc_id", std::string()),
                                                       cam_base_rev(),
                                                       params.contains("ops") ? params["ops"] : json::array()),
                             out_json, 0);
-            if (m == "cam_undo") return emit(aicad::cam::cam_undo(params.value("doc_id", std::string())), out_json, 0);
-            if (m == "cam_redo") return emit(aicad::cam::cam_redo(params.value("doc_id", std::string())), out_json, 0);
-            if (m == "cam_tree") return emit(aicad::cam::cam_tree(params.value("doc_id", std::string())), out_json, 0);
+            if (m == "cam_undo") return emit(chudware::cam::cam_undo(params.value("doc_id", std::string())), out_json, 0);
+            if (m == "cam_redo") return emit(chudware::cam::cam_redo(params.value("doc_id", std::string())), out_json, 0);
+            if (m == "cam_tree") return emit(chudware::cam::cam_tree(params.value("doc_id", std::string())), out_json, 0);
             if (m == "cam_close")
-                return emit(json{{"closed", aicad::cam::cam_close(params.value("doc_id", std::string()))}}, out_json, 0);
-            if (m == "cam_describe") return emit(aicad::cam::cam_describe(params.value("doc_id", std::string())), out_json, 0);
-            if (m == "cam_generate") return emit(aicad::cam::cam_generate(params.value("doc_id", std::string()), params), out_json, 0);
-            if (m == "cam_simulate") return emit(aicad::cam::cam_simulate(params.value("doc_id", std::string()), params), out_json, 0);
-            if (m == "cam_post") return emit(aicad::cam::cam_post(params.value("doc_id", std::string()), params), out_json, 0);
-            if (m == "cam_setup_sheet") return emit(aicad::cam::cam_setup_sheet(params.value("doc_id", std::string()), params), out_json, 0);
-            if (m == "cam_generate_inline") return emit(aicad::cam::cam_generate_inline(params), out_json, 0);
-            if (m == "cam_post_inline") return emit(aicad::cam::cam_post_inline(params), out_json, 0);
-            if (m == "cam_post_dialects") return emit(aicad::cam::cam_post_dialects(), out_json, 0);
-            if (m == "cam_materials") return emit(aicad::cam::cam_materials(), out_json, 0);
-            if (m == "cam_tool_types") return emit(aicad::cam::cam_tool_types(), out_json, 0);
-            if (m == "cam_op_types") return emit(aicad::cam::cam_op_types(), out_json, 0);
-            if (m == "cam_machines") return emit(aicad::cam::cam_machines(), out_json, 0);
-            if (m == "cam_feeds") return emit(aicad::cam::cam_feeds(params.value("doc_id", std::string()), params), out_json, 0);
-            if (m == "cam_audit") return emit(aicad::cam::cam_audit(params.value("doc_id", std::string()), params), out_json, 0);
+                return emit(json{{"closed", chudware::cam::cam_close(params.value("doc_id", std::string()))}}, out_json, 0);
+            if (m == "cam_describe") return emit(chudware::cam::cam_describe(params.value("doc_id", std::string())), out_json, 0);
+            if (m == "cam_generate") return emit(chudware::cam::cam_generate(params.value("doc_id", std::string()), params), out_json, 0);
+            if (m == "cam_simulate") return emit(chudware::cam::cam_simulate(params.value("doc_id", std::string()), params), out_json, 0);
+            if (m == "cam_post") return emit(chudware::cam::cam_post(params.value("doc_id", std::string()), params), out_json, 0);
+            if (m == "cam_setup_sheet") return emit(chudware::cam::cam_setup_sheet(params.value("doc_id", std::string()), params), out_json, 0);
+            if (m == "cam_generate_inline") return emit(chudware::cam::cam_generate_inline(params), out_json, 0);
+            if (m == "cam_post_inline") return emit(chudware::cam::cam_post_inline(params), out_json, 0);
+            if (m == "cam_post_dialects") return emit(chudware::cam::cam_post_dialects(), out_json, 0);
+            if (m == "cam_materials") return emit(chudware::cam::cam_materials(), out_json, 0);
+            if (m == "cam_tool_types") return emit(chudware::cam::cam_tool_types(), out_json, 0);
+            if (m == "cam_op_types") return emit(chudware::cam::cam_op_types(), out_json, 0);
+            if (m == "cam_machines") return emit(chudware::cam::cam_machines(), out_json, 0);
+            if (m == "cam_feeds") return emit(chudware::cam::cam_feeds(params.value("doc_id", std::string()), params), out_json, 0);
+            if (m == "cam_audit") return emit(chudware::cam::cam_audit(params.value("doc_id", std::string()), params), out_json, 0);
             if (m == "cam_save")
-                return emit(aicad::cam::cam_save(params.value("doc_id", std::string()),
+                return emit(chudware::cam::cam_save(params.value("doc_id", std::string()),
                                                  params.value("path", std::string())), out_json, 0);
-            if (m == "cam_open") return emit(aicad::cam::cam_open(params.value("path", std::string())), out_json, 0);
+            if (m == "cam_open") return emit(chudware::cam::cam_open(params.value("path", std::string())), out_json, 0);
             // Cross-doc dependency registry (feat(xdoc)).
             if (m == "doc_dep_register")
-                return emit(aicad::doc::doc_dep_register(
+                return emit(chudware::doc::doc_dep_register(
                                 params.value("source_doc_id", std::string()),
                                 params.value("dep_doc_id", std::string()),
                                 params.value("kind", std::string()),
                                 params.value("linked_revision", (long)-1)),
                             out_json, 0);
             if (m == "doc_dep_query")
-                return emit(aicad::doc::doc_dep_query(
+                return emit(chudware::doc::doc_dep_query(
                                 params.value("source_doc_id", std::string()),
                                 params.value("kind", std::string())),
                             out_json, 0);
             if (m == "doc_dep_notify")
-                return emit(aicad::doc::doc_dep_notify(
+                return emit(chudware::doc::doc_dep_notify(
                                 params.value("source_doc_id", std::string()),
                                 params.value("new_revision", (long)-1)),
                             out_json, 0);
             if (m == "doc_dep_unregister")
-                return emit(aicad::doc::doc_dep_unregister(
+                return emit(chudware::doc::doc_dep_unregister(
                                 params.value("dep_doc_id", std::string()),
                                 params.value("kind", std::string())),
                             out_json, 0);
 
             // OCCT extraction adapter: live B-rep part -> CAM geometry inputs.
-            if (m == "cam_extract") return emit(aicad::cam::cam_extract(params), out_json, 0);
+            if (m == "cam_extract") return emit(chudware::cam::cam_extract(params), out_json, 0);
             // Server-side export+extract (web/daemon-safe; no client temp path).
             if (m == "cam_extract_from_doc")
                 return emit(cam_extract_from_doc(jstr(params, "doc_id"), params), out_json, 0);
@@ -3973,14 +3973,14 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             // (deterministic recipe; the in-app copilot's CAM fast-path calls the same fn).
             if (m == "cam_program")
                 return emit(cam_program_from_part(jstr(params, "doc_id"), params), out_json, 0);
-        } catch (const aicad::cam::OpError& oe) {
+        } catch (const chudware::cam::OpError& oe) {
             return emit(oe.envelope(), out_json, 3);
         }
         // --- T-RF18: sourcing/BOM/cost/spec-match (core/sourcing) ---
         // sourcing::call returns false for methods it does not own (fall through).
         {
             json src_result;
-            if (aicad::sourcing::call(m, params, build_sourcing_seams(), src_result)) {
+            if (chudware::sourcing::call(m, params, build_sourcing_seams(), src_result)) {
                 return emit(std::move(src_result), out_json, 0);
             }
         }
@@ -3988,18 +3988,18 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
         // The parts hub FTS stays Python — callers pass `record` (get_record seam is a
         // null fallback). parts_make/import_file/build_model wire to in-core paths.
         {
-            aicad::parts::PlaceSeams ps;
+            chudware::parts::PlaceSeams ps;
             ps.get_record = [](const std::string&) -> json { return json(); };
             ps.parts_make = [](const json& p) -> json { int rc = 0; return parts_make_impl(p, rc); };
             ps.import_file = [](const std::string& path, bool as_solid) -> json {
-                return aicad::doc::doc_import_file(path, std::string(), as_solid, std::string());
+                return chudware::doc::doc_import_file(path, std::string(), as_solid, std::string());
             };
             ps.build_model = [](const json& match) -> std::string {
                 return build_sourcing_seams().build_model(match);
             };
             json pl_result;
             std::string pl_err;
-            if (aicad::parts::place_call(m, params, pl_result, pl_err, ps)) {
+            if (chudware::parts::place_call(m, params, pl_result, pl_err, ps)) {
                 return emit(std::move(pl_result), out_json, 0);
             }
         }
@@ -4007,11 +4007,11 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
         // ojson preserves dict-insertion-order fidelity the Python envelopes rely on;
         // dump/parse conversion is shortest-round-trip exact.
         {
-            namespace py = aicad::pyutil;
+            namespace py = chudware::pyutil;
             py::ojson fp_params = py::ojson::parse(params.dump());
             py::ojson fp_result;
-            if (aicad::hydraulic::call(m, fp_params, fp_result) ||
-                aicad::piping::call(m, fp_params, fp_result)) {
+            if (chudware::hydraulic::call(m, fp_params, fp_result) ||
+                chudware::piping::call(m, fp_params, fp_result)) {
                 return emit(json::parse(fp_result.dump()), out_json, 0);
             }
         }
@@ -4019,7 +4019,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
         {
             json st_result;
             std::string st_err;
-            if (aicad::structural::call(m, params, st_result, st_err)) {
+            if (chudware::structural::call(m, params, st_result, st_err)) {
                 return emit(std::move(st_result), out_json, 0);
             }
         }
@@ -4027,10 +4027,10 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
         {
             json sm_result;
             std::string sm_err;
-            if (aicad::tolerance::call(m, params, sm_result, sm_err) ||
-                aicad::mechanical::call(m, params, sm_result, sm_err) ||
-                aicad::materials::call(m, params, sm_result, sm_err) ||
-                aicad::dfm::call(m, params, sm_result, sm_err)) {
+            if (chudware::tolerance::call(m, params, sm_result, sm_err) ||
+                chudware::mechanical::call(m, params, sm_result, sm_err) ||
+                chudware::materials::call(m, params, sm_result, sm_err) ||
+                chudware::dfm::call(m, params, sm_result, sm_err)) {
                 return emit(std::move(sm_result), out_json, 0);
             }
         }
@@ -4040,16 +4040,16 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
         {
             json fw_result;
             std::string fw_err;
-            if (aicad::firmware::call(m, params, fw_result, fw_err)) {
+            if (chudware::firmware::call(m, params, fw_result, fw_err)) {
                 return emit(std::move(fw_result), out_json, 0);
             }
         }
         // Unknown to the C++ core -> nonzero so the host falls back to Python.
         return emit(json{{"error", "unknown method: " + m}}, out_json, 2);
     } catch (const std::exception& e) {
-        return emit_error(std::string("aicad_call(") + m + ") threw: " + e.what(), out_json);
+        return emit_error(std::string("chudware_call(") + m + ") threw: " + e.what(), out_json);
     } catch (...) {
-        return emit_error("aicad_call(" + m + ") threw a non-std exception", out_json);
+        return emit_error("chudware_call(" + m + ") threw a non-std exception", out_json);
     }
 }
 
@@ -4058,10 +4058,10 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
 // escape as an unhandled structured exception and leave the session lock orphaned (the
 // P0 "resource deadlock would occur" bug). Access violation (the reported 0x60 null
 // deref), stack/array overrun, misalignment, page faults, illegal instruction. Real C++
-// exceptions are NOT routed here — they're already handled inside aicad_call_inner's
+// exceptions are NOT routed here — they're already handled inside chudware_call_inner's
 // try/catch and unwind their locks normally — so we EXCEPTION_CONTINUE_SEARCH anything
 // that isn't a hardware fault (a C++ throw surfaces to MSVC as code 0xE06D7363).
-static int aicad_seh_filter(unsigned int code) {
+static int chudware_seh_filter(unsigned int code) {
     switch (code) {
         case EXCEPTION_ACCESS_VIOLATION:
         case EXCEPTION_DATATYPE_MISALIGNMENT:
@@ -4087,7 +4087,7 @@ static char* dup_seh_error(const char* msg) {
     return p;
 }
 
-// Public entry. Thin SEH wrapper around aicad_call_inner. A hardware fault (e.g. an
+// Public entry. Thin SEH wrapper around chudware_call_inner. A hardware fault (e.g. an
 // access violation deep inside compile_document while the session mutex is held) is
 // caught HERE so that: (1) we drop the orphaned doc lock left by the skipped DocLock
 // destructor — without this, the SAME worker thread re-locks the still-held mutex on
@@ -4095,28 +4095,28 @@ static char* dup_seh_error(const char* msg) {
 // bricking every document; (2) we return a clean JSON error instead of crashing the
 // host or corrupting the JSON-RPC channel. This function deliberately holds NO C++
 // objects with destructors so MSVC permits __try/__except (C2712) even under /EHsc.
-AICAD_API int aicad_call(const char* method, const char* params_json, char** out_json) {
+CHUDWARE_API int chudware_call(const char* method, const char* params_json, char** out_json) {
     __try {
-        return aicad_call_inner(method, params_json, out_json);
-    } __except (aicad_seh_filter(GetExceptionCode())) {
-        // The structured-exception unwind skipped aicad_call_inner's C++ destructors,
+        return chudware_call_inner(method, params_json, out_json);
+    } __except (chudware_seh_filter(GetExceptionCode())) {
+        // The structured-exception unwind skipped chudware_call_inner's C++ destructors,
         // so any registry lock (doc / drawing / ecad) taken on this thread is still held
         // by it. Drop all three now (each call is a no-op if that registry's lock is not
         // held by this thread) so the next call on this worker thread doesn't deadlock.
-        aicad::doc::force_release_doc_lock();
-        aicad::doc::force_release_drawing_lock();
-        aicad::ecad::force_release_ecad_lock();
-        aicad::cam::force_release_cam_lock();
+        chudware::doc::force_release_doc_lock();
+        chudware::doc::force_release_drawing_lock();
+        chudware::ecad::force_release_ecad_lock();
+        chudware::cam::force_release_cam_lock();
         if (out_json) *out_json = dup_seh_error("{\"error\":\"internal error: access violation (the engine hit a hardware fault and recovered; the document is unchanged)\"}");
         return 1;
     }
 }
 #else
-// Non-Windows: no SEH. The C++ try/catch inside aicad_call_inner already releases locks
+// Non-Windows: no SEH. The C++ try/catch inside chudware_call_inner already releases locks
 // on any C++ exception; a hardware fault delivers a POSIX signal (SIGSEGV) which is a
 // separate, process-level concern, not a held-mutex deadlock.
-AICAD_API int aicad_call(const char* method, const char* params_json, char** out_json) {
-    return aicad_call_inner(method, params_json, out_json);
+CHUDWARE_API int chudware_call(const char* method, const char* params_json, char** out_json) {
+    return chudware_call_inner(method, params_json, out_json);
 }
 #endif
 

@@ -12,7 +12,7 @@
 #include "firmware/pinmap.h"
 #include "firmware/templates.h"
 
-namespace aicad::firmware {
+namespace chudware::firmware {
 namespace {
 
 namespace fs = std::filesystem;
@@ -90,12 +90,12 @@ Project Project::from_dict(const nlohmann::json& d, const fs::path& root_path) {
 
 fs::path firmware_root() {
     fs::path d;
-    if (const char* override_dir = std::getenv("AI_CAD_FIRMWARE_DIR"); override_dir && *override_dir) {
+    if (const char* override_dir = std::getenv("CHUDWARE_FIRMWARE_DIR"); override_dir && *override_dir) {
         d = fs::path(override_dir);
     } else {
         const char* appdata = std::getenv("APPDATA");
         fs::path base = (appdata && *appdata) ? fs::path(appdata) : fs::temp_directory_path();
-        d = base / "AI-CAD" / "firmware";
+        d = base / "Chudware" / "firmware";
     }
     std::error_code ec;
     fs::create_directories(d, ec);
@@ -207,4 +207,4 @@ Project new_project(const std::optional<std::string>& board_doc_ref,
     return p;
 }
 
-}  // namespace aicad::firmware
+}  // namespace chudware::firmware

@@ -61,5 +61,5 @@ provider layer (T-F9) when credentials exist; offline they stub. No license ledg
 ## Gate hook
 
 `scripts/gate.sh` stage 6 is env-gated SKIP (OCCT pattern): runs `--smoke` benches only
-when `AICAD_RUN_BENCH=1` and a Python runtime is present; otherwise records SKIP and the
+when `CHUDWARE_RUN_BENCH=1` and a Python runtime is present; otherwise records SKIP and the
 gate stays green.

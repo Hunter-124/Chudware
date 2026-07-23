@@ -18,8 +18,8 @@ namespace {
 
 // new part -> empty sketch on plane.top -> add ONE entity -> return expanded entities.
 json expand_rect_entity(const json& entity) {
-    using aicad::doc::doc_apply_ops;
-    using aicad::doc::doc_new;
+    using chudware::doc::doc_apply_ops;
+    using chudware::doc::doc_new;
     std::string id = doc_new("part", "RectTest").at("doc_id").get<std::string>();
 
     json sketch_feat = {{"type", "sketch"},
@@ -140,8 +140,8 @@ TEST_CASE("rectangle alias rect is accepted") {
 
 TEST_CASE("rectangle center-form extrudes to correct 200x120 area volume") {
     // Full op path: rectangle -> closed region -> extrude depth 10 => vol = 200*120*10.
-    using aicad::doc::doc_apply_ops;
-    using aicad::doc::doc_new;
+    using chudware::doc::doc_apply_ops;
+    using chudware::doc::doc_new;
     json nr = doc_new("part", "RectArea");
     const std::string id = nr.at("doc_id").get<std::string>();
     json ops = json::array({
@@ -179,7 +179,7 @@ TEST_CASE("rectangle center-form extrudes to correct 200x120 area volume") {
 }
 
 TEST_CASE("malformed rectangle is rejected with a clear message") {
-    using aicad::doc::OpError;
+    using chudware::doc::OpError;
     // Missing width/height (and no corners).
     try {
         expand_rect_entity_throwing({{"type", "rectangle"}, {"center", json::array({0.0, 0.0})}});

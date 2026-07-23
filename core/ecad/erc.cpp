@@ -14,7 +14,7 @@
 
 #include "ecad/schema.h"
 
-namespace aicad::ecad {
+namespace chudware::ecad {
 
 using nlohmann::json;
 
@@ -495,4 +495,4 @@ json run_erc(const json& sch, const json& netlist) {
     return out;
 }
 
-}  // namespace aicad::ecad
+}  // namespace chudware::ecad

@@ -1,4 +1,4 @@
-"""Generate AI-CAD icon atlases (light + dark) with Pillow.
+"""Generate Chudware icon atlases (light + dark) with Pillow.
 
 Run:  python host/assets/make_icons.py
 Outputs into host/assets/icons/:
@@ -275,7 +275,7 @@ def _iso_pts(cx, cy, r):
 
 
 def brand_cube(d, cx, cy, r, p, lw, notch=True, accent=True, spark=None):
-    """The AI-CAD brand mark in atlas line-art: isometric cube (2:1 projection)
+    """The Chudware brand mark in atlas line-art: isometric cube (2:1 projection)
     with a cubic corner notch boolean-cut out of the top corner and, optionally,
     a 4-point spark seated in the notch ("star", or "diamond" for tiny cells).
     notch=False draws the plain cube in the same style (assembly sub-bodies)."""
@@ -421,7 +421,7 @@ def _s(cell, frac):
 
 @icon("app")
 def draw_app(d, cell, p):
-    """The AI-CAD brand mark: iso cube, corner notch, spark in the notch."""
+    """The Chudware brand mark: iso cube, corner notch, spark in the notch."""
     s = cell * SS
     brand_cube(d, s * 0.5, s * 0.5, s * 0.36, p, stroke_width(cell),
                spark="star" if cell > 20 else "diamond")

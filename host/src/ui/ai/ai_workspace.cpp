@@ -1,23 +1,26 @@
-// AI workspace — full-page AI hub for the AI title-bar tab (v2 redesign, tracker M1-M8, M21).
+// AI workspace — full-page AI command center for the AI title-bar tab (v3 rework).
 //
 //   +----------------------------------------------------------------+
-//   | [rail] | chat        |  DAG pane [Workflow|Plan|Active|Docs|Board] | <- M21 layout
-//   |        | (narrow,    |                                         |
-//   |        |  full       +-----------------------------------------+
-//   |        |  height)    |  workflow options (re-flowed, M21)      |
+//   | MAIN CHAT (left, ~46%)        |  UTILITY PANEL (right)          |
+//   |  message log + composer       |  [nav]  Agent Hub | Plan | ...  |
+//   |  (SAME state/send path as the |  [nav]  <selected view>         |
+//   |   docked Copilot)             |                                 |
 //   +----------------------------------------------------------------+
 //
-// The conversation window is ALWAYS visible (M6 — no "Conversation" tab); it renders the SAME
-// state and send path as the docked Copilot (st.chat / st.conversations / st.prompt) via the
-// ui/copilot/copilot.h reuse hooks — single chat implementation, two hosts. The tab strip switches only
-// the DAG pane (M7): "Session Plan" is the existing buildgraph view (persisted run sidecars the
-// worker's dag_status serves — ~/.local/share/AI-CAD/runs/*.buildgraph.json, the ONLY run
-// enumeration source), steered via dag_status / dag_approve / dag_abort over st.rpc (async).
-// "Agent Workflow" is reserved for the Phase-2 live agent-execution DAG; in Phase 1 it renders
-// the same buildgraph view. The right pane keeps ONLY AI workflow knobs (M3); the inference
-// block (model/effort/tokens/API key/privacy/vision reviewer) was WIPED (M2) and now lives ONLY
-// on the main Settings page (Settings -> AI + Experimental). No fake data anywhere: every pane
-// degrades to an honest empty-state.
+// v3 (Hunter's UI directive): the main conversation owns the left; EVERYTHING else lives in
+// the right utility panel, switched by a vertical nav menu (Agent Hub | Session Plan |
+// Active Work | Documents | Sessions | Leaderboard | Options). No permanent sessions rail,
+// no bottom options strip. "Agent Hub" (OMP-style) lists every registered sub-agent as
+// role-color-coded rows; clicking a row POPS UP a floating, role-themed chat window for that
+// sub-agent (several can be open at once) — the main chat is never replaced. New live
+// sub-agents auto-pop their chat (agent.ui_follow_active_session).
+//
+// The conversation window renders the SAME state and send path as the docked Copilot
+// (st.chat / st.conversations / st.prompt) via the ui/copilot/copilot.h reuse hooks — single
+// chat implementation, two hosts. "Session Plan" is the plan board over persisted buildgraph
+// runs; inference settings (model/effort/tokens/API key/privacy/vision) live ONLY on the main
+// Settings page — the Options view keeps the run-behavior + workspace-visibility knobs.
+// No fake data anywhere: every pane degrades to an honest empty-state.
 #include "ai_workspace.h"
 
 #include <algorithm>
@@ -25,8 +28,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cstdint>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -63,12 +69,11 @@ struct DagRun {
 };
 
 struct AiWsState {
-    // Which view the upper pane shows (M7): 0 = Agent Workflow (live agent-execution DAG),
-    // 1 = Session Plan (plan board over persisted buildgraph runs), 2 = Active Work,
-    // 3 = Documents, 4 = Leaderboard. The conversation window is always visible below
-    // (M6), never a tab. Leaderboard reads benchmarks/leaderboard/leaderboard.json.
-    int  dagView      = 0;     // default to Agent Workflow (Phase 2 live execution DAG)
-    bool showSettings = true;
+    // Which view the right utility panel shows (v3 vertical nav): 0 = Agent Hub (sub-agent
+    // rows + live agent-execution DAG), 1 = Session Plan (plan board over persisted buildgraph
+    // runs), 2 = Active Work, 3 = Documents, 4 = Sessions, 5 = Leaderboard, 6 = Options.
+    // The conversation window is always visible on the left, never a tab.
+    int  view = 0;     // default to Agent Hub
 
     // M8 plumbing: the chat session whose plan the "Session Plan" view is scoped to. Set from
     // the active conversation each frame; the per-session run_id aggregation is Phase-2 backend
@@ -77,7 +82,7 @@ struct AiWsState {
     std::string selSession;
 
     // Autopopulate (agent.ui_follow_active_session): the last live run id that yanked the
-    // pane to the Agent Workflow view — a NEW run switches the view once, then the user is
+    // panel to the Agent Hub view — a NEW run switches the view once, then the user is
     // free to pick another tab.
     std::string lastAutoRun;
 
@@ -447,7 +452,7 @@ static bool viewChip(const char* label, bool active) {
 // ---- DAG run catalog (persisted sidecars — the store dag_status reads) ----------
 
 static std::string runsDir() {
-    // appdataAppDir() applies the AI-CAD/Billet alias rule on both platforms.
+    // appdataAppDir() applies the Chudware alias rule on both platforms.
     return appdataAppDir() + "/runs";
 }
 
@@ -618,13 +623,16 @@ static const float* statusColor(const std::string& s) {
 }
 
 // ==================================================================================
-// Phase 4 (M11/M15–M17) — sub-agent chat viewing + LIVE steering.
+// v3 Agent Hub — sub-agent rows + POPUP sub-agent chats.
 //
 // Data source: the file-backed sub-agent session registry served by the worker's
 // subagent_list / subagent_transcript / subagent_steer / subagent_terminate RPCs
 // (services/agent/subagent_rpc.py) — ALL async via st.rpc (never a sync worker.call
 // in a draw path). Steering semantics are queued-and-consumed-at-turn-boundary
 // (agent_turn.run_turn drains the queue before each model call); the UI says so.
+// Each OPEN sub-agent chat is an independent floating window keyed by sub-agent id —
+// several can be open at once ("have them all"), each themed by its role color.
+// Closing a window NEVER ends the sub-agent; terminate stays confirm-gated (M16).
 // HONESTY: with no spawned sub-agents the registry is empty and every surface shows
 // its empty-state — nothing is fabricated.
 // ==================================================================================
@@ -637,19 +645,27 @@ struct SubMsg {
 
 struct SubagentSession {
     std::string id, role, brief, status, model, spawnKind;
+    std::string createdTs, updatedTs;   // ISO-8601 UTC (registry created_ts / updated_ts)
     int budgetTokens = 0, pendingSteers = 0, transcriptLen = 0;
 };
 
-struct SubagentViewState {
-    // registry snapshot (sidebar list)
+// Registry snapshot (the Agent Hub row list) — global, one poll loop.
+struct SubagentRegistry {
     std::vector<SubagentSession> sessions;
     bool   listPending = false;
     bool   listedOnce  = false;
     double lastListT   = 0.0;
     std::string listErr;
+    // Ids seen by the auto-pop logic — a NEW live sub-agent pops its chat window once
+    // (agent.ui_follow_active_session); parked/finished ones never auto-pop.
+    std::set<std::string> seenIds;
+    int                 autoPopped  = 0;      // cap auto-popups so a big fan-out stays usable
+    bool                needAutoPop = false;  // set by the list callback; consumed on draw
+};
+static SubagentRegistry s_sub;
 
-    // the open sub-agent chat (replaces the conversation column content, M11)
-    bool            active = false;
+// One floating chat window per open sub-agent.
+struct SubChatState {
     SubagentSession cur;
     std::vector<SubMsg> msgs;
     bool   trPending = false;
@@ -663,8 +679,42 @@ struct SubagentViewState {
 
     bool termPending = false;
 };
+static std::unordered_map<std::string, SubChatState> s_subChats;
+static int s_popupCascade = 0;   // staggers newly-opened popup positions
 
-static SubagentViewState s_sub;
+// Role color (v3): a stable hue per role string so a sub-agent's row, popup chrome and chat
+// accents all share one identity color. FNV-1a -> hue; fixed sat/val keeps it legible on glass.
+static void roleColorRgb(const std::string& role, float out[3]) {
+    uint32_t h = 2166136261u;
+    for (unsigned char c : role) { h ^= c; h *= 16777619u; }
+    const float hue = (float)(h % 360u) / 360.0f;
+    ImGui::ColorConvertHSVtoRGB(hue, 0.58f, 0.92f, out[0], out[1], out[2]);
+}
+
+// "13m ago" from an ISO-8601 UTC timestamp (registry _now(): timespec=milliseconds).
+static std::string fmtAge(const std::string& iso) {
+    if (iso.size() < 19) return std::string();
+    int Y, M, D, h, m, s;
+    if (std::sscanf(iso.c_str(), "%d-%d-%dT%d:%d:%d", &Y, &M, &D, &h, &m, &s) != 6)
+        return std::string();
+    std::tm tm{};
+    tm.tm_year = Y - 1900; tm.tm_mon = M - 1; tm.tm_mday = D;
+    tm.tm_hour = h; tm.tm_min = m; tm.tm_sec = s;
+#ifdef _WIN32
+    const time_t tp = _mkgmtime(&tm);
+#else
+    const time_t tp = timegm(&tm);
+#endif
+    if (tp < 0) return std::string();
+    long long age = (long long)std::time(nullptr) - (long long)tp;
+    if (age < 0) age = 0;
+    char buf[32];
+    if (age < 60)        std::snprintf(buf, sizeof(buf), "%lds ago", (long)age);
+    else if (age < 3600) std::snprintf(buf, sizeof(buf), "%ldm ago", (long)(age / 60));
+    else if (age < 86400) std::snprintf(buf, sizeof(buf), "%ldh ago", (long)(age / 3600));
+    else                 std::snprintf(buf, sizeof(buf), "%ldd ago", (long)(age / 86400));
+    return buf;
+}
 
 static SubagentSession parseSubSession(const nlohmann::json& s) {
     SubagentSession o;
@@ -674,15 +724,44 @@ static SubagentSession parseSubSession(const nlohmann::json& s) {
     o.status        = s.value("status", "");
     o.model         = s.value("model", "");
     o.spawnKind     = s.value("spawn_kind", "");
+    o.createdTs     = s.value("created_ts", "");
+    o.updatedTs     = s.value("updated_ts", "");
     o.budgetTokens  = s.value("budget_tokens", 0);
     o.pendingSteers = s.value("pending_steers", 0);
     o.transcriptLen = s.value("transcript_len", 0);
     return o;
 }
 
-// Poll the registry snapshot (sidebar list). Cheap file-glob on the worker side;
+// fwd — the popup opener is defined with the popup windows below; the auto-pop pass in
+// pollSubagentList needs it.
+static void openSubagentView(AppState& st, const std::string& subagentId,
+                             const std::string& roleHint = std::string());
+
+// Auto-pop pass (runs on the draw thread after a completed list poll): a sub-agent that is
+// NEW since the last poll AND live pops its chat window on its own ("pop up chat views for
+// the active subagents … have them all"). Parked/finished history is only marked seen.
+static void autoPopNewSubagents(AppState& st) {
+    for (const auto& s : s_sub.sessions) {
+        if (s_sub.seenIds.count(s.id)) continue;
+        s_sub.seenIds.insert(s.id);
+        const bool live = s.status == "running" || s.status == "pending" ||
+                          s.status == "in_progress" || s.status == "waiting";
+        if (!live) continue;                      // parked history never auto-pops
+        if (!aiFollowActiveSession()) continue;   // user turned autopopulate off
+        if (s_subChats.count(s.id)) continue;     // already open
+        if (s_sub.autoPopped >= 6) continue;      // cap — a huge fan-out stays usable
+        ++s_sub.autoPopped;
+        openSubagentView(st, s.id, s.role);
+    }
+}
+
+// Poll the registry snapshot (Agent Hub rows). Cheap file-glob on the worker side;
 // throttled to one in-flight call every few seconds while the workspace is drawn.
 static void pollSubagentList(AppState& st) {
+    if (s_sub.needAutoPop && !s_sub.listPending) {
+        s_sub.needAutoPop = false;
+        autoPopNewSubagents(st);
+    }
     if (!st.workerStarted || s_sub.listPending) return;
     const double now = ImGui::GetTime();
     if (s_sub.listedOnce && now - s_sub.lastListT < 4.0) return;
@@ -702,34 +781,37 @@ static void pollSubagentList(AppState& st) {
         if (r.result.contains("sessions") && r.result["sessions"].is_array())
             for (const auto& s : r.result["sessions"])
                 if (s.is_object()) s_sub.sessions.push_back(parseSubSession(s));
+        s_sub.needAutoPop = true;   // auto-pop pass runs on the next draw (has AppState)
     });
 }
 
-// Fetch the open sub-agent's transcript (+ refreshed session meta). Throttled.
-static void fetchSubagentTranscript(AppState& st, bool force = false) {
-    if (!st.workerStarted || !s_sub.active || s_sub.trPending) return;
+// Fetch one open popup's transcript (+ refreshed session meta). Throttled per window.
+static void fetchSubagentTranscript(AppState& st, SubChatState& cs, bool force = false) {
+    if (!st.workerStarted || cs.trPending) return;
     const double now = ImGui::GetTime();
-    if (!force && now - s_sub.lastTrT < 2.0) return;
-    s_sub.trPending = true;
-    s_sub.lastTrT   = now;
+    if (!force && now - cs.lastTrT < 2.0) return;
+    cs.trPending = true;
+    cs.lastTrT   = now;
     nlohmann::json p;
-    p["subagent_id"] = s_sub.cur.id;
-    const std::string want = s_sub.cur.id;
+    p["subagent_id"] = cs.cur.id;
+    const std::string want = cs.cur.id;
     st.rpc.call("subagent_transcript", p, [want](const core::RpcResult& r) {
-        s_sub.trPending = false;
-        if (!s_sub.active || s_sub.cur.id != want) return;  // stale — user left/switched
-        if (!r.ok) { s_sub.viewErr = r.err.empty() ? "worker unreachable" : r.err; return; }
+        auto it = s_subChats.find(want);
+        if (it == s_subChats.end()) return;   // window closed while in flight
+        SubChatState& cs = it->second;
+        cs.trPending = false;
+        if (!r.ok) { cs.viewErr = r.err.empty() ? "worker unreachable" : r.err; return; }
         if (!r.result.value("ok", false)) {
-            s_sub.viewErr = r.result.value("reason", std::string("transcript unavailable"));
+            cs.viewErr = r.result.value("reason", std::string("transcript unavailable"));
             return;
         }
-        s_sub.viewErr.clear();
+        cs.viewErr.clear();
         if (r.result.contains("session") && r.result["session"].is_object())
-            s_sub.cur = parseSubSession(r.result["session"]);
-        s_sub.cur.pendingSteers = r.result.contains("pending_steers") &&
-                                  r.result["pending_steers"].is_array()
-                                      ? (int)r.result["pending_steers"].size() : 0;
-        s_sub.msgs.clear();
+            cs.cur = parseSubSession(r.result["session"]);
+        cs.cur.pendingSteers = r.result.contains("pending_steers") &&
+                               r.result["pending_steers"].is_array()
+                                   ? (int)r.result["pending_steers"].size() : 0;
+        cs.msgs.clear();
         if (r.result.contains("messages") && r.result["messages"].is_array())
             for (const auto& m : r.result["messages"]) {
                 if (!m.is_object()) continue;
@@ -737,71 +819,55 @@ static void fetchSubagentTranscript(AppState& st, bool force = false) {
                 sm.who    = m.value("who", "");
                 sm.text   = m.value("text", "");
                 sm.queued = m.value("queued", false);
-                s_sub.msgs.push_back(std::move(sm));
+                cs.msgs.push_back(std::move(sm));
             }
     });
 }
 
-// M11: open a sub-agent's chat in the main conversation column.
-static void openSubagentView(AppState& st, const std::string& subagentId,
-                             const std::string& roleHint = std::string()) {
-    if (subagentId.empty()) return;
-    s_sub.active = true;
-    if (s_sub.cur.id != subagentId) {
-        s_sub.cur = SubagentSession{};
-        s_sub.cur.id   = subagentId;
-        s_sub.cur.role = roleHint;
-        s_sub.msgs.clear();
-        s_sub.viewErr.clear();
-        s_sub.steerNote.clear();
-        s_sub.steerBuf[0] = '\0';
-    }
-    // Prefer the registry snapshot for instant header data.
-    for (const auto& s : s_sub.sessions)
-        if (s.id == subagentId) { s_sub.cur = s; break; }
-    fetchSubagentTranscript(st, /*force=*/true);
-}
-
-static void sendSubagentSteer(AppState& st) {
-    if (!st.workerStarted || s_sub.steerPending || !s_sub.active) return;
-    std::string text(s_sub.steerBuf);
+static void sendSubagentSteer(AppState& st, SubChatState& cs) {
+    if (!st.workerStarted || cs.steerPending) return;
+    std::string text(cs.steerBuf);
     if (text.find_first_not_of(" \t\r\n") == std::string::npos) return;
-    s_sub.steerPending = true;
+    cs.steerPending = true;
     nlohmann::json p;
-    p["subagent_id"] = s_sub.cur.id;
+    p["subagent_id"] = cs.cur.id;
     p["text"]        = text;
-    const std::string want = s_sub.cur.id;
+    const std::string want = cs.cur.id;
     st.rpc.call("subagent_steer", p, [want](const core::RpcResult& r) {
-        s_sub.steerPending = false;
-        if (!s_sub.active || s_sub.cur.id != want) return;
-        if (!r.ok) { s_sub.steerNote = r.err.empty() ? "worker unreachable" : r.err; return; }
+        auto it = s_subChats.find(want);
+        if (it == s_subChats.end()) return;
+        SubChatState& cs = it->second;
+        cs.steerPending = false;
+        if (!r.ok) { cs.steerNote = r.err.empty() ? "worker unreachable" : r.err; return; }
         if (!r.result.value("ok", false)) {
-            s_sub.steerNote = r.result.value("reason", std::string("steer failed"));
+            cs.steerNote = r.result.value("reason", std::string("steer failed"));
             return;
         }
-        s_sub.steerNote   = r.result.value("note", std::string("queued"));
-        s_sub.steerBuf[0] = '\0';
-        s_sub.lastTrT     = 0.0;   // refresh the transcript promptly (shows the queued steer)
+        cs.steerNote   = r.result.value("note", std::string("queued"));
+        cs.steerBuf[0] = '\0';
+        cs.lastTrT     = 0.0;   // refresh the transcript promptly (shows the queued steer)
     });
 }
 
-static void requestSubagentTerminate(AppState& st) {
-    if (!st.workerStarted || s_sub.termPending || !s_sub.active) return;
-    s_sub.termPending = true;
+static void requestSubagentTerminate(AppState& st, SubChatState& cs) {
+    if (!st.workerStarted || cs.termPending) return;
+    cs.termPending = true;
     nlohmann::json p;
-    p["subagent_id"] = s_sub.cur.id;
+    p["subagent_id"] = cs.cur.id;
     p["confirm"]     = true;   // the GUI confirm dialog IS the M16 gate; the RPC re-checks it
-    const std::string want = s_sub.cur.id;
+    const std::string want = cs.cur.id;
     st.rpc.call("subagent_terminate", p, [want](const core::RpcResult& r) {
-        s_sub.termPending = false;
-        if (!s_sub.active || s_sub.cur.id != want) return;
+        auto it = s_subChats.find(want);
+        if (it == s_subChats.end()) return;
+        SubChatState& cs = it->second;
+        cs.termPending = false;
         if (r.ok && r.result.value("ok", false))
-            s_sub.steerNote = r.result.value(
+            cs.steerNote = r.result.value(
                 "note", std::string("termination requested — honored at the next turn boundary"));
         else
-            s_sub.steerNote = r.ok ? r.result.value("reason", std::string("terminate failed"))
-                                   : (r.err.empty() ? "worker unreachable" : r.err);
-        s_sub.lastTrT = 0.0;
+            cs.steerNote = r.ok ? r.result.value("reason", std::string("terminate failed"))
+                                : (r.err.empty() ? "worker unreachable" : r.err);
+        cs.lastTrT = 0.0;
     });
 }
 

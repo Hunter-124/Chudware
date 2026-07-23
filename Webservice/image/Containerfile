@@ -1,7 +1,7 @@
-# billet-session — per-user streamed Billet CAD seat (Fedora 44)
+# chudware-session — per-user streamed Chudware CAD seat (Fedora 44)
 # Build (from repo root, after stage.sh):
 #   Webservice/image/stage.sh
-#   podman build -t localhost/billet-session:latest -f Webservice/image/Containerfile Webservice/image
+#   podman build -t localhost/chudware-session:latest -f Webservice/image/Containerfile Webservice/image
 #
 # Default stream backend is noVNC (x11vnc + websockify). Selkies is attempted at
 # image build time; if pip/selkies fails or lacks a working capture stack on
@@ -9,9 +9,9 @@
 
 FROM registry.fedoraproject.org/fedora:44
 
-LABEL org.opencontainers.image.title="billet-session" \
-      org.opencontainers.image.description="Per-user Billet CAD session (Xvfb + stream)" \
-      org.opencontainers.image.source="https://github.com/local/billet-web"
+LABEL org.opencontainers.image.title="chudware-session" \
+      org.opencontainers.image.description="Per-user Chudware CAD session (Xvfb + stream)" \
+      org.opencontainers.image.source="https://github.com/local/chudware-web"
 
 # Match host OCCT 7.9.3-2.fc44 packages (rpm -q --whatprovides /usr/lib64/libTKernel.so.7.9
 # → opencascade-foundation). Install runtime subsets only.
@@ -92,30 +92,30 @@ RUN python3 -m pip install --no-cache-dir --break-system-packages \
         'selkies==1.6.1' \
         websockets basicauth gputil prometheus-client msgpack \
         pynput psutil watchdog python-xlib \
-    && echo "SELKIES_PIP=ok" > /opt/billet-selkies.status \
-    || { echo "SELKIES_PIP=failed — defaulting to novnc" > /opt/billet-selkies.status; \
+    && echo "SELKIES_PIP=ok" > /opt/chudware-selkies.status \
+    || { echo "SELKIES_PIP=failed — defaulting to novnc" > /opt/chudware-selkies.status; \
          echo "WARNING: selkies pip install failed; STREAM_BACKEND=novnc is the default" >&2; true; }
 
 # Session user (uid 1000) — private HOME is bind-mounted by the gateway.
 RUN useradd -m -u 1000 -s /bin/bash user \
-    && mkdir -p /opt/billet /opt/billet/runtime /plm /home/user \
-    && chown -R user:user /home/user /opt/billet
+    && mkdir -p /opt/chudware /opt/chudware/runtime /plm /home/user \
+    && chown -R user:user /home/user /opt/chudware
 
 # Staged host build tree (produced by stage.sh → Webservice/image/stage/)
-# Includes bin/ (Billet+CEF+hostd), lib/, share/, and app/ (Python worker tree).
-COPY --chown=user:user stage/ /opt/billet/
-COPY entrypoint.sh /usr/local/bin/billet-entrypoint.sh
-RUN chmod 755 /usr/local/bin/billet-entrypoint.sh \
-    && chmod 755 /opt/billet/bin/Billet \
-    && ( [ -x /opt/billet/bin/aicad-hostd ] && chmod 755 /opt/billet/bin/aicad-hostd || true ) \
-    && ( [ -x /opt/billet/bin/ai_cad_cef_helper ] && chmod 755 /opt/billet/bin/ai_cad_cef_helper || true ) \
-    && test -f /opt/billet/app/requirements.txt \
-    && test -d /opt/billet/app/engine \
-    && test -d /opt/billet/app/agent/prompts \
-    && chown -R user:user /opt/billet \
+# Includes bin/ (Chudware+CEF+hostd), lib/, share/, and app/ (Python worker tree).
+COPY --chown=user:user stage/ /opt/chudware/
+COPY entrypoint.sh /usr/local/bin/chudware-entrypoint.sh
+RUN chmod 755 /usr/local/bin/chudware-entrypoint.sh \
+    && chmod 755 /opt/chudware/bin/chudware \
+    && ( [ -x /opt/chudware/bin/chudware-hostd ] && chmod 755 /opt/chudware/bin/chudware-hostd || true ) \
+    && ( [ -x /opt/chudware/bin/ai_cad_cef_helper ] && chmod 755 /opt/chudware/bin/ai_cad_cef_helper || true ) \
+    && test -f /opt/chudware/app/requirements.txt \
+    && test -d /opt/chudware/app/engine \
+    && test -d /opt/chudware/app/agent/prompts \
+    && chown -R user:user /opt/chudware \
     && fc-cache -f || true
 
-# Python worker venv — MUST live under /opt/billet (image layer). HOME is a
+# Python worker venv — MUST live under /opt/chudware (image layer). HOME is a
 # bind-mounted volume at runtime and would shadow anything under /home/user.
 # Playwright Chromium browsers are intentionally NOT installed (lean image);
 # the playwright *package* is still pip-installed so readiness imports succeed.
@@ -124,32 +124,32 @@ RUN chmod 755 /usr/local/bin/billet-entrypoint.sh \
 # native toolchain; neither is in the provision.py readiness probe, so drop
 # them for the session image (3DM import / pyamg FEA solver extras only).
 RUN set -eux; \
-    python3 -m venv /opt/billet/runtime/venv; \
-    /opt/billet/runtime/venv/bin/pip install --upgrade pip setuptools wheel; \
-    grep -vE '^(rhino3dm|pyamg)(==|>=|~=|<|>|!)' /opt/billet/app/requirements.txt \
+    python3 -m venv /opt/chudware/runtime/venv; \
+    /opt/chudware/runtime/venv/bin/pip install --upgrade pip setuptools wheel; \
+    grep -vE '^(rhino3dm|pyamg)(==|>=|~=|<|>|!)' /opt/chudware/app/requirements.txt \
         > /tmp/requirements-session.txt; \
-    /opt/billet/runtime/venv/bin/pip install --no-cache-dir \
+    /opt/chudware/runtime/venv/bin/pip install --no-cache-dir \
         -r /tmp/requirements-session.txt; \
-    /opt/billet/runtime/venv/bin/python -c \
+    /opt/chudware/runtime/venv/bin/python -c \
         'import build123d, pyvista, mcp, anthropic, openai, pptx, docx, openpyxl, matplotlib, reportlab, pypdfium2, dulwich, playwright; print("venv probe ok")'; \
-    chown -R user:user /opt/billet/runtime /opt/billet/app; \
-    find /opt/billet/runtime/venv -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true; \
+    chown -R user:user /opt/chudware/runtime /opt/chudware/app; \
+    find /opt/chudware/runtime/venv -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true; \
     rm -f /tmp/requirements-session.txt
 
-ENV BILLET_ROOT=/opt/billet \
-    PATH=/opt/billet/bin:/opt/billet/runtime/venv/bin:/usr/local/bin:/usr/bin:/bin \
-    LD_LIBRARY_PATH=/opt/billet/lib:/opt/billet/bin \
-    AI_CAD_LIBAICAD=/opt/billet/bin/libaicad.so \
-    AI_CAD_PYTHON=/opt/billet/runtime/venv/bin/python \
-    AI_CAD_REPO=/opt/billet/app \
-    AI_CAD_PROMPTS_DIR=/opt/billet/app/agent/prompts \
+ENV CHUDWARE_ROOT=/opt/chudware \
+    PATH=/opt/chudware/bin:/opt/chudware/runtime/venv/bin:/usr/local/bin:/usr/bin:/bin \
+    LD_LIBRARY_PATH=/opt/chudware/lib:/opt/chudware/bin \
+    CHUDWARE_LIBCHUDWARE=/opt/chudware/bin/libchudware.so \
+    CHUDWARE_PYTHON=/opt/chudware/runtime/venv/bin/python \
+    CHUDWARE_REPO=/opt/chudware/app \
+    CHUDWARE_PROMPTS_DIR=/opt/chudware/app/agent/prompts \
     HOME=/home/user \
     DISPLAY=:0 \
     STREAM_BACKEND=novnc \
     SELKIES_ENCODER=x264enc \
-    BILLET_HEAVY=0 \
-    BILLET_PLM_DIR=/plm \
-    AI_CAD_CEF_LAZY=1 \
+    CHUDWARE_HEAVY=0 \
+    CHUDWARE_PLM_DIR=/plm \
+    CHUDWARE_CEF_LAZY=1 \
     NVIDIA_DRIVER_CAPABILITIES=graphics,utility,video,compute,display \
     NVIDIA_VISIBLE_DEVICES=all
 
@@ -160,4 +160,4 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 \
     CMD curl -fsS http://127.0.0.1:8080/ >/dev/null 2>&1 || exit 1
 
-ENTRYPOINT ["/usr/local/bin/billet-entrypoint.sh"]
+ENTRYPOINT ["/usr/local/bin/chudware-entrypoint.sh"]

@@ -3,7 +3,7 @@
 // Generates real, EDITABLE geometry for common off-the-shelf hardware (fasteners,
 // nuts, washers, standoffs, bearings, inserts, dowels) as a list of DOCUMENT OPS —
 // the same closed vocabulary the modeler/GUI emit. The ops are fed to
-// aicad::doc::doc_new + doc_apply_ops, so a generated part is a normal feature tree
+// chudware::doc::doc_new + doc_apply_ops, so a generated part is a normal feature tree
 // (primitives + sketch/extrude + boolean-by-mode), not a frozen import. This keeps
 // the module OCCT-free (it only emits JSON); the doc engine compiles the geometry.
 //
@@ -17,7 +17,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad {
+namespace chudware {
 namespace parts {
 
 using nlohmann::json;
@@ -58,4 +58,4 @@ PartBuild build(const std::string& family, const std::string& size,
                 double length_mm, const json& options);
 
 }  // namespace parts
-}  // namespace aicad
+}  // namespace chudware

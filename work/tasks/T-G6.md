@@ -29,7 +29,7 @@ the G2 integrator gate.
 
 1. Read `docs/GUI_MIGRATION_DAG.md` S1-S6 + H5 + G2 and `docs/GLASS_DESIGN_SPEC.md`.
 2. Port from the CURRENT host/src (post T-G1/T-G2/T-G3 — includes transparent columns,
-   collapse-to-pill, doc-tab input fix, ShopCraft branding). The DAG's Source rows
+   collapse-to-pill, doc-tab input fix, Chudware branding). The DAG's Source rows
    predate those fixes; the live tree wins where they differ.
 3. Run leaves as parallel subagents with the DAG's write-sets and verify scenarios.
 4. G2 gate: screenshot-diff shell chrome vs `scratch/gui_baseline/` set.
@@ -41,14 +41,14 @@ the G2 integrator gate.
       offscreen deadlock — chrome itself renders)
 - [~] H5 compiles + sketch overlay draws (full done-gate is wave 4) — **compiles ✓**
       (all `ui/imgui/src/ui/sketch/*.cpp` TUs link into AI-CAD2); sketch-mode chrome +
-      DOF solver render live ("Fully Defined" in `ribbon`+`AI_CAD_TAB=1`); the 2D
-      entity-overlay screenshot (`AI_CAD_SHOT=sketch`) is blocked ONLY by the systemic
+      DOF solver render live ("Fully Defined" in `ribbon`+`CHUDWARE_TAB=1`); the 2D
+      entity-overlay screenshot (`CHUDWARE_SHOT=sketch`) is blocked ONLY by the systemic
       step-machine deadlock below, not by the overlay code
 - [~] `bash scripts/gate.sh` — **ui/imgui stage (this task's signal) PASS** (build + --shot).
       Overall RESULT: FAIL is driven ONLY by the known pre-existing reds: check.py
       `feature_surface_audit`+`parity_audit` (host-era manifest / absent SW_PARITY_SPEC);
       pytest "107 deselected" (issue #6 gate-venv 0-collected gap); `--selftest` non-fatal
-      "engine not ready" (gate runs it WITHOUT `AI_CAD_LIBAICAD` — with the .so it returns
+      "engine not ready" (gate runs it WITHOUT `CHUDWARE_LIBCHUDWARE` — with the .so it returns
       OK: save=1 open=1 features=3). Zero code changed on this branch → no regression possible.
       `graphify update .`: **no-op** (zero code change; graph unaffected; foreman regenerates
       at merge per established pattern — graphify-out/ lives in the foreman main checkout, not
@@ -63,23 +63,23 @@ eyeball-verifies each wave-2 scenario against the DAG verify rows + the AI hints
 
 Build: `cmake --preset linux-app && cmake --build build/linux-app` → `bin/AI-CAD2` links
 clean; `--selftest` OK (save=1 open=1 features=3 → OK). Shots via
-`AI_CAD_NO_FILE_DIALOGS=1 AI_CAD_LIBAICAD=<core .so> AI_CAD_REPO=<worktree> AI-CAD2 --shot`.
+`CHUDWARE_NO_FILE_DIALOGS=1 CHUDWARE_LIBCHUDWARE=<core .so> CHUDWARE_REPO=<worktree> AI-CAD2 --shot`.
 Screenshots in `scratch/tg6-shots/` (gitignored).
 
 | Node | DAG verify | Result |
 |------|-----------|--------|
-| S1 layout/dock/rail | `AI_CAD_SHOT=explorer` | ✓ dock + rail tab switch (Model Tree↔Files), glass pills |
-| S2 title/doc-tabs | `AI_CAD_SHOT=multidoc` | ✓ doc-tab band renders in viewport band (all shots); multi-tab *population* blocked by step-machine deadlock |
-| S3 ribbon+ctx | `AI_CAD_SHOT=ribbon`, `+AI_CAD_TAB=1` | ✓ full Model ribbon + sketch-tab ribbon (Line/Rect/Circle/…/Exit Sketch), `AI_CAD_TAB` honored |
-| S4 status/toast/palette | `AI_CAD_SHOT=settings` | ✓ status bar (Engine live, Shaded+Edges, MMGS, Editing Part) + Settings modal search seam |
+| S1 layout/dock/rail | `CHUDWARE_SHOT=explorer` | ✓ dock + rail tab switch (Model Tree↔Files), glass pills |
+| S2 title/doc-tabs | `CHUDWARE_SHOT=multidoc` | ✓ doc-tab band renders in viewport band (all shots); multi-tab *population* blocked by step-machine deadlock |
+| S3 ribbon+ctx | `CHUDWARE_SHOT=ribbon`, `+CHUDWARE_TAB=1` | ✓ full Model ribbon + sketch-tab ribbon (Line/Rect/Circle/…/Exit Sketch), `CHUDWARE_TAB` honored |
+| S4 status/toast/palette | `CHUDWARE_SHOT=settings` | ✓ status bar (Engine live, Shaded+Edges, MMGS, Editing Part) + Settings modal search seam |
 | S5 icons/cursors | glyphs render | ✓ all ribbon/FM glyphs are real atlas icons (no fallback boxes). NOTE: DAG's `check.py gui_lint icons` is not a wired subcommand in this tree (host-era) |
-| S6 files/settings/profiler | `AI_CAD_SHOT=settings`,`explorer` | ✓ Files explorer tab (Recent/Workspace tree) + Settings modal |
-| H5 sketch (wave-2 milestone) | `AI_CAD_SHOT=sketch` | compiles ✓; sketch chrome+DOF live ✓; 2D entity overlay shot blocked by deadlock (see below) |
+| S6 files/settings/profiler | `CHUDWARE_SHOT=settings`,`explorer` | ✓ Files explorer tab (Recent/Workspace tree) + Settings modal |
+| H5 sketch (wave-2 milestone) | `CHUDWARE_SHOT=sketch` | compiles ✓; sketch chrome+DOF live ✓; 2D entity overlay shot blocked by deadlock (see below) |
 | G2 gate | shell chrome vs baselines | ✓ eyeballed vs host `scratch/gui_baseline/{explorer,ribbon,multidoc,settings,sketch}.png` + AI hints |
 
 **AI-hints check:** transparent glass columns with per-element pills ✓ (no full-width
 fill); PropertyManager hosts inside FeatureManager tab, no separate PM tab ✓; doc-tab band
-inside viewport ✓; ShopCraft branding ✓ ("ShopCraft Copilot"). No host regressions
+inside viewport ✓; Chudware branding ✓ ("Chudware Copilot"). No host regressions
 reintroduced.
 
 **Systemic finding (pre-existing on master, NOT introduced by T-G6):** all ScenarioRunner

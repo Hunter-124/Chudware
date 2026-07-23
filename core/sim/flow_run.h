@@ -14,7 +14,7 @@
 
 #include "sim/lbm.h"
 
-namespace aicad {
+namespace chudware {
 namespace sim {
 
 struct FlowParams {
@@ -67,4 +67,4 @@ LbmResult run_wind_tunnel(const std::vector<std::vector<float>>& body_pos,
 nlohmann::json run_flow_stl(const nlohmann::json& params);
 
 }  // namespace sim
-}  // namespace aicad
+}  // namespace chudware

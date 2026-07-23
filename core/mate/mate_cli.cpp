@@ -1,4 +1,4 @@
-// mate_cli — tiny CLI wrapper around aicad::mate::solve_mates for the
+// mate_cli — tiny CLI wrapper around chudware::mate::solve_mates for the
 // differential-test harness (tools/mate_diff.py).
 //
 // Usage:
@@ -82,7 +82,7 @@ int main(int argc, char** argv) {
 
     json out;
     try {
-        out = aicad::mate::solve_mates_json(input);
+        out = chudware::mate::solve_mates_json(input);
     } catch (const std::exception& e) {
         return fail(std::string("solve_mates threw: ") + e.what());
     }

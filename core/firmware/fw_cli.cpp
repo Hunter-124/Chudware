@@ -1,6 +1,6 @@
 // fw_cli — differential-harness driver for the firmware RPC surface (T-RF15),
 // mirroring sketch/sketch_cli.cpp. Reads {"method": ..., "params": {...}} from
-// argv[1] (or stdin when "-") and prints the aicad::firmware::call result as
+// argv[1] (or stdin when "-") and prints the chudware::firmware::call result as
 // one JSON line (or {"unhandled": true} when the method falls through, so the
 // parity script can assert the Python oracle still owns it).
 #include "firmware/firmware_rpc.h"
@@ -32,7 +32,7 @@ int main(int argc, char** argv) {
                                 : nlohmann::json::object();
     nlohmann::json result;
     std::string err;
-    if (!aicad::firmware::call(method, params, result, err)) {
+    if (!chudware::firmware::call(method, params, result, err)) {
         std::cout << nlohmann::json{{"unhandled", true}, {"method", method}}.dump() << std::endl;
         return 0;
     }

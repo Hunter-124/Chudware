@@ -41,7 +41,7 @@
 #include <nlohmann/json.hpp>
 #include <TopoDS_Shape.hxx>
 
-namespace aicad::doc {
+namespace chudware::doc {
 
 // One feature's compile outcome, in tree order. `ok==false` carries a non-empty
 // `error` (mirrors compiler.py's per-feature status dicts).
@@ -244,4 +244,4 @@ std::vector<int> face_edges(const nlohmann::json& doc, const nlohmann::json& env
                             int body_id, int face_topo_id);
 std::vector<int> face_edges(const CompileResult& r, int body_id, int face_topo_id);
 
-}  // namespace aicad::doc
+}  // namespace chudware::doc

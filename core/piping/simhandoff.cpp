@@ -6,7 +6,7 @@
 #include <set>
 #include <stdexcept>
 
-namespace aicad::piping::simhandoff {
+namespace chudware::piping::simhandoff {
 namespace {
 
 using pyutil::py_repr;
@@ -289,4 +289,4 @@ ojson attach(ojson result, const ojson& env) {
     return result;
 }
 
-}  // namespace aicad::piping::simhandoff
+}  // namespace chudware::piping::simhandoff

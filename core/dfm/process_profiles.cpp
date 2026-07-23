@@ -13,7 +13,7 @@
 
 #include "materials/materials.h"
 
-namespace aicad {
+namespace chudware {
 namespace dfm {
 
 namespace {
@@ -815,4 +815,4 @@ bool call(const std::string& method, const json& params, json& result, std::stri
 }
 
 }  // namespace dfm
-}  // namespace aicad
+}  // namespace chudware

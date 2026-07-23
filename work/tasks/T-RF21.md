@@ -1,6 +1,6 @@
 ---
 id: T-RF21
-title: RF closeout — remove AI_CAD_CPP_* fallback flags, delete engine_oracle (node R5a)
+title: RF closeout — remove CHUDWARE_CPP_* fallback flags, delete engine_oracle (node R5a)
 workstream: RF
 owner: integrator
 status: done
@@ -14,7 +14,7 @@ priority: 4
 ## Context
 
 Once every subsystem routes C++-only, the escape hatches become dead weight:
-AI_CAD_CPP_DOCS / AI_CAD_CPP_AGENT / AI_CAD_CPP_SIM / AI_CAD_CPP_ECAD flags and the
+CHUDWARE_CPP_DOCS / CHUDWARE_CPP_AGENT / CHUDWARE_CPP_SIM / CHUDWARE_CPP_ECAD flags and the
 Python routing branches in services/worker/worker_client.cpp, plus the Python worker
 spawn path (python -m engine.worker) and the root `engine` symlink.
 

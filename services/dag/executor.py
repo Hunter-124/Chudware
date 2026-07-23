@@ -31,8 +31,8 @@ from .event_journal import EventJournal
 def default_runs_dir() -> Path:
     """Return the platform default runs directory.
 
-    - Linux/macOS: $XDG_DATA_HOME/AI-CAD/runs/  (default ~/.local/share/AI-CAD/runs/)
-    - Windows:     %APPDATA%\\AI-CAD\\runs\\
+    - Linux/macOS: $XDG_DATA_HOME/Chudware/runs/  (default ~/.local/share/Chudware/runs/)
+    - Windows:     %APPDATA%\\Chudware\\runs\\
 
     Note: services/paths.py does not have a Linux XDG branch (known issue, out of scope
     for T-A1).  This function is the authoritative runs-dir resolver for services/dag.
@@ -40,9 +40,9 @@ def default_runs_dir() -> Path:
     """
     if platform.system() == "Windows":
         appdata = os.environ.get("APPDATA") or os.path.expanduser(r"~\AppData\Roaming")
-        return Path(appdata) / "AI-CAD" / "runs"
+        return Path(appdata) / "Chudware" / "runs"
     xdg = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
-    return Path(xdg) / "AI-CAD" / "runs"
+    return Path(xdg) / "Chudware" / "runs"
 
 
 # ---------------------------------------------------------------------------

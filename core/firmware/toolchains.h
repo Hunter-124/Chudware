@@ -14,7 +14,7 @@
 
 #include "firmware/project.h"
 
-namespace aicad::firmware {
+namespace chudware::firmware {
 
 // contracts/firmware_rpc.md §3.
 struct BuildResult {
@@ -34,4 +34,4 @@ struct BuildResult {
 // (cmake | espidf | arduino).
 BuildResult build(const Project& project, double timeout_s = 300.0);
 
-}  // namespace aicad::firmware
+}  // namespace chudware::firmware

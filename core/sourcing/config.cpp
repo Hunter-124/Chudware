@@ -10,7 +10,7 @@
 
 namespace fs = std::filesystem;
 
-namespace aicad {
+namespace chudware {
 namespace sourcing {
 
 namespace {
@@ -31,11 +31,11 @@ fs::path expand_home_roaming() {
 }
 #endif
 
-// T-G10 alias rule (mirrors engine/paths.py active_root()): an existing legacy AI-CAD
-// dir wins while the new Billet dir holds no config.json; fresh installs get Billet.
+// T-G10 alias rule (mirrors engine/paths.py active_root()): an existing legacy Chudware
+// dir wins while the new Chudware dir holds no config.json; fresh installs get Chudware.
 fs::path pick_app_dir(const fs::path& base) {
-    const fs::path neu = base / "Billet";
-    const fs::path legacy = base / "AI-CAD";
+    const fs::path neu = base / "Chudware";
+    const fs::path legacy = base / "Chudware";
     std::error_code ec;
     if (fs::exists(legacy, ec) && !fs::exists(neu / "config.json", ec)) return legacy;
     return neu;
@@ -77,4 +77,4 @@ json load_config() {
 }
 
 }  // namespace sourcing
-}  // namespace aicad
+}  // namespace chudware

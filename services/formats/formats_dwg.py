@@ -10,7 +10,7 @@ degrades cleanly with an actionable error when no converter is present.
 Converters, in priority order (subprocess only, PATH/registry-discovered, never bundled):
   1. **ODA File Converter** (free, cross-platform) — wrapped by ``ezdxf.addons.odafc``.
   2. **LibreDWG ``dwg2dxf``** — GPL-3.0, so **subprocess-only** per the CONTRIBUTING license
-     guardrails (never linked into libaicad, never redistributed). Found on ``$PATH``.
+     guardrails (never linked into libchudware, never redistributed). Found on ``$PATH``.
 
 License posture: identical to the pandoc / LibreOffice converters already in
 ``contracts/licenses.md`` — optional, PATH-discovered, subprocess-only, never bundled; absence is

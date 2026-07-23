@@ -1,5 +1,5 @@
-// Structural RPC dispatch (T-RF19 leaf 5) — the single entry the libaicad
-// integrator wires into core/api/libaicad.cpp. Mirrors the frozen surface of
+// Structural RPC dispatch (T-RF19 leaf 5) — the single entry the libchudware
+// integrator wires into core/api/libchudware.cpp. Mirrors the frozen surface of
 // contracts/structural_schema.md §3 as implemented by
 // engine_oracle/structural/{analysis,checks,estimate}.py behind
 // services/mcp/structural_tools.py: dict in → dict out, expected failures come
@@ -15,7 +15,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad::structural {
+namespace chudware::structural {
 
 // Dispatch one struct_* method. Returns false when `method` is not a ported
 // structural method (caller falls through to the next dispatch layer / the
@@ -25,4 +25,4 @@ namespace aicad::structural {
 bool call(const std::string& method, const nlohmann::json& params, nlohmann::json& result,
           std::string& err);
 
-}  // namespace aicad::structural
+}  // namespace chudware::structural

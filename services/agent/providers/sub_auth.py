@@ -77,7 +77,7 @@ class CallbackServer:
                     body = (
                         "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">"
                         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-                        "<title>Billet — Login failed</title>"
+                        "<title>Chudware — Login failed</title>"
                         "<style>"
                         "*{box-sizing:border-box;margin:0;padding:0}"
                         "body{min-height:100vh;display:flex;align-items:center;justify-content:center;"
@@ -97,10 +97,10 @@ class CallbackServer:
                         "h1{font-size:1.35rem;font-weight:650;color:#f8fafc;margin-bottom:.5rem}"
                         "p{font-size:.95rem;line-height:1.5;color:#94a3b8}"
                         "</style></head><body><div class=\"card\">"
-                        "<div class=\"brand\">Billet</div>"
+                        "<div class=\"brand\">Chudware</div>"
                         "<div class=\"icon\" aria-hidden=\"true\">✕</div>"
                         "<h1>Login failed</h1>"
-                        "<p>Something went wrong during sign-in. You can close this tab and return to Billet to try again.</p>"
+                        "<p>Something went wrong during sign-in. You can close this tab and return to Chudware to try again.</p>"
                         "</div></body></html>"
                     ).encode("utf-8")
                 elif code:
@@ -108,7 +108,7 @@ class CallbackServer:
                     body = (
                         "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">"
                         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-                        "<title>Billet — Login successful</title>"
+                        "<title>Chudware — Login successful</title>"
                         "<style>"
                         "*{box-sizing:border-box;margin:0;padding:0}"
                         "body{min-height:100vh;display:flex;align-items:center;justify-content:center;"
@@ -128,10 +128,10 @@ class CallbackServer:
                         "h1{font-size:1.35rem;font-weight:650;color:#f8fafc;margin-bottom:.5rem}"
                         "p{font-size:.95rem;line-height:1.5;color:#94a3b8}"
                         "</style></head><body><div class=\"card\">"
-                        "<div class=\"brand\">Billet</div>"
+                        "<div class=\"brand\">Chudware</div>"
                         "<div class=\"icon\" aria-hidden=\"true\">✓</div>"
                         "<h1>Login successful</h1>"
-                        "<p>You can close this tab and return to Billet.</p>"
+                        "<p>You can close this tab and return to Chudware.</p>"
                         "</div></body></html>"
                     ).encode("utf-8")
                 else:
@@ -139,7 +139,7 @@ class CallbackServer:
                     body = (
                         "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">"
                         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-                        "<title>Billet — Missing code</title>"
+                        "<title>Chudware — Missing code</title>"
                         "<style>"
                         "*{box-sizing:border-box;margin:0;padding:0}"
                         "body{min-height:100vh;display:flex;align-items:center;justify-content:center;"
@@ -159,10 +159,10 @@ class CallbackServer:
                         "h1{font-size:1.35rem;font-weight:650;color:#f8fafc;margin-bottom:.5rem}"
                         "p{font-size:.95rem;line-height:1.5;color:#94a3b8}"
                         "</style></head><body><div class=\"card\">"
-                        "<div class=\"brand\">Billet</div>"
+                        "<div class=\"brand\">Chudware</div>"
                         "<div class=\"icon\" aria-hidden=\"true\">!</div>"
                         "<h1>Missing code</h1>"
-                        "<p>No authorization code was returned. You can close this tab and return to Billet to try again.</p>"
+                        "<p>No authorization code was returned. You can close this tab and return to Chudware to try again.</p>"
                         "</div></body></html>"
                     ).encode("utf-8")
                 self.send_response(200)

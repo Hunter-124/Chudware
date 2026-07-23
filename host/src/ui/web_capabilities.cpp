@@ -13,7 +13,7 @@ struct WebGap {
 };
 
 // Keep in sync with contracts/web_parity.md (web_unsupported — do not edit; the
-// integrator owns it) and with the CEF-less WASM build (AI_CAD_ENABLE_CEF off).
+// integrator owns it) and with the CEF-less WASM build (CHUDWARE_ENABLE_CEF off).
 constexpr WebGap kWebGaps[] = {
     // CEF-dependent: no embedded Chromium in the browser build.
     {"web_browser",

@@ -17,7 +17,7 @@
 #include <tuple>
 #include <utility>
 
-namespace aicad::mate {
+namespace chudware::mate {
 namespace {
 
 using json = nlohmann::json;
@@ -25,7 +25,7 @@ using Eigen::Matrix3d;
 using Eigen::MatrixXd;
 using Eigen::Vector3d;
 using Eigen::VectorXd;
-using aicad::solver::System;
+using chudware::solver::System;
 
 constexpr double kPi = 3.14159265358979323846;
 
@@ -1354,8 +1354,8 @@ MateSolveResult solve_mates(const json& components, const json& mates,
             // scale=0.6); to land on the SAME random restarts (and so the SAME basin) we must
             // reproduce that stream bit-for-bit — std::mt19937_64 is a DIFFERENT generator and
             // probes different points, so a coupled rotational chain that the oracle rescues
-            // here would otherwise stall. aicad::sim::NumpyGenerator is the validated clone.
-            aicad::sim::NumpyGenerator rng(12345);
+            // here would otherwise stall. chudware::sim::NumpyGenerator is the validated clone.
+            chudware::sim::NumpyGenerator rng(12345);
             VectorXd x0_base = system.init_vector();
             std::vector<int> w_indices;
             for (auto& cid : frame_order) {
@@ -1531,4 +1531,4 @@ json solve_mates_json(const json& input) {
     return out;
 }
 
-}  // namespace aicad::mate
+}  // namespace chudware::mate

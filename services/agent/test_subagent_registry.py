@@ -27,7 +27,7 @@ from services.agent.providers.mock_provider import MockProvider
 
 @pytest.fixture(autouse=True)
 def _tmp_registry(tmp_path, monkeypatch):
-    monkeypatch.setenv("AICAD_SUBAGENTS_DIR", str(tmp_path / "subagents"))
+    monkeypatch.setenv("CHUDWARE_SUBAGENTS_DIR", str(tmp_path / "subagents"))
     # Hermetic: delegate() rebuilds a per-role provider from model assignment
     # (WS2/mega-5) — ambient config.json ai_roles on a dev machine, or the
     # ollama default when config is empty. Either replaces the mock with a live

@@ -26,7 +26,7 @@ malformed .inp -> clean error not a fabricated result (ccx exits rc=0 with only
 *WARNINGs and a ZERO-BYTE .dat on an unparseable deck!), tiny timeout -> clean
 timeout error, no hang.
 
-Live ccx tests skip honestly when ccx is absent (AI_CAD_CCX or PATH). The engine
+Live ccx tests skip honestly when ccx is absent (CHUDWARE_CCX or PATH). The engine
 fatigue leg runs core_bridge in a fresh subprocess (one .so bind per process —
 same pattern as test_fea_live_bridge.py).
 """
@@ -49,11 +49,11 @@ from services.mcp import fea_advanced as fa
 # ---------------------------------------------------------------------------
 _DEFAULT_CCX = Path.home() / ".local" / "bin" / "ccx"
 if fa.ccx_path() is None and _DEFAULT_CCX.exists():
-    os.environ.setdefault("AI_CAD_CCX", str(_DEFAULT_CCX))
+    os.environ.setdefault("CHUDWARE_CCX", str(_DEFAULT_CCX))
 
 _HAS_CCX = fa.ccx_path() is not None
 needs_ccx = pytest.mark.skipif(
-    not _HAS_CCX, reason="CalculiX (ccx) not found — set AI_CAD_CCX or add to PATH")
+    not _HAS_CCX, reason="CalculiX (ccx) not found — set CHUDWARE_CCX or add to PATH")
 
 
 # ---------------------------------------------------------------------------
@@ -259,7 +259,7 @@ print(json.dumps(res))
 
 def _run_engine_fatigue(study: dict) -> dict:
     repo = str(Path(__file__).resolve().parents[2])
-    env = dict(os.environ, AI_CAD_ENGINE_DAEMON="0")
+    env = dict(os.environ, CHUDWARE_ENGINE_DAEMON="0")
     proc = subprocess.run(
         [sys.executable, "-X", "utf8", "-c", _DRIVER.format(repo=repo),
          json.dumps(study)],
@@ -269,7 +269,7 @@ def _run_engine_fatigue(study: dict) -> dict:
                     f"{(proc.stderr or '')[-300:]}")
     res = json.loads(proc.stdout.strip().splitlines()[-1])
     if res.get("unknown_method"):
-        pytest.skip("this libaicad.so lacks sim_run_fatigue (no FEA plugin)")
+        pytest.skip("this libchudware.so lacks sim_run_fatigue (no FEA plugin)")
     return res
 
 

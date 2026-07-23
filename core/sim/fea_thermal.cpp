@@ -22,11 +22,11 @@
 #include <Eigen/SparseCholesky>
 #include <Eigen/SparseCore>
 #include <Eigen/SparseLU>
-#ifdef AICAD_WITH_CHOLMOD
+#ifdef CHUDWARE_WITH_CHOLMOD
 #include <Eigen/CholmodSupport>  // Eigen::CholmodSupernodalLLT (SuiteSparse BLAS3 Cholesky)
 #endif
 
-namespace aicad::sim {
+namespace chudware::sim {
 
 namespace {
 
@@ -376,7 +376,7 @@ ThermalResult fea_thermal_solve(const std::vector<double>& points, const std::ve
 
     Eigen::VectorXd Tf;
     bool solved = false;
-#ifdef AICAD_WITH_CHOLMOD
+#ifdef CHUDWARE_WITH_CHOLMOD
     // P2: CHOLMOD supernodal LLT first — BLAS3 + multithreaded, 3-15x the scalar
     // single-threaded SimplicialLDLT on real conduction systems. Kff is SPD (reduced
     // Dirichlet system, or Neumann + convection surface terms anchoring the datum);
@@ -855,7 +855,7 @@ ThermalTransientResult fea_thermal_transient(
     // (BLAS3, multithreaded; A = Kff + Cff/dt is SPD) → SimplicialLDLT → SparseLU.
     // The one factorization is amortized over EVERY backward-Euler step, so this is
     // where the transient solver's wall-clock actually lives.
-#ifdef AICAD_WITH_CHOLMOD
+#ifdef CHUDWARE_WITH_CHOLMOD
     Eigen::CholmodSupernodalLLT<Eigen::SparseMatrix<double>> chol;
     bool use_chol = false;
     cap_solver_threads_for_host();
@@ -895,7 +895,7 @@ ThermalTransientResult fea_thermal_transient(
             if (s != 0.0) rhs += s * flux_vecs[k];
         }
         bool step_ok;
-#ifdef AICAD_WITH_CHOLMOD
+#ifdef CHUDWARE_WITH_CHOLMOD
         if (use_chol) {
             Tf = chol.solve(rhs);
             step_ok = (chol.info() == Eigen::Success);
@@ -939,4 +939,4 @@ ThermalTransientResult fea_thermal_transient(
     return res;
 }
 
-}  // namespace aicad::sim
+}  // namespace chudware::sim

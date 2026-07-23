@@ -6,7 +6,7 @@ Coverage:
   - Impact walk on a 3-level fixture:
       DIM7 (faulty) → DIM9 boss_od (linked → recompute+reverify) +
       2 node reverify; nothing else affected
-  - link_dimension round-trip: live engine (libaicad available) OR
+  - link_dimension round-trip: live engine (libchudware available) OR
     documented mock fallback (no all-skip; real code paths exercised)
   - Existing ledger regression suite stays green (independent test file)
 """
@@ -22,9 +22,9 @@ from unittest.mock import MagicMock
 _REPO = Path(__file__).resolve().parents[2]
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
-# Also probe the main checkout for libaicad: worktrees are siblings of the main checkout.
+# Also probe the main checkout for libchudware: worktrees are siblings of the main checkout.
 # Main checkout is at <parent of worktree parent>/<basename from .git/gitdir>, or we
-# check common sibling locations.  AI_CAD_LIBAICAD / AI_CAD_DIST env vars work too.
+# check common sibling locations.  CHUDWARE_LIBCHUDWARE / CHUDWARE_DIST env vars work too.
 for _candidate in [
     Path(__file__).resolve().parents[2].parent / "CAD",   # sibling worktree → main
     Path("/home/hunter/Repositories/CAD"),                  # known host path
@@ -34,7 +34,7 @@ for _candidate in [
         break
 
 _TMP_CACHE = tempfile.mkdtemp(prefix="test_derivation_cache_")
-os.environ.setdefault("AICAD_CACHE_ROOT", _TMP_CACHE)
+os.environ.setdefault("CHUDWARE_CACHE_ROOT", _TMP_CACHE)
 
 from services.agent.ledger import Ledger  # noqa: E402
 from services.agent.derivation import (  # noqa: E402
@@ -388,18 +388,18 @@ class TestMarkFaulty3Level(unittest.TestCase):
 
     def test_change_plan_flag_wraps_report(self):
         """When T-W13 flag set, report is wrapped in change-plan envelope."""
-        orig = os.environ.get("AICAD_CHANGE_PLAN_T_W13")
+        orig = os.environ.get("CHUDWARE_CHANGE_PLAN_T_W13")
         try:
-            os.environ["AICAD_CHANGE_PLAN_T_W13"] = "1"
+            os.environ["CHUDWARE_CHANGE_PLAN_T_W13"] = "1"
             wrapped = mark_faulty("DIM7", "why", self.ledger)
             self.assertEqual(wrapped["schema"], "aicad.change_plan/1")
             self.assertIn("impact", wrapped)
             self.assertEqual(wrapped["impact"]["schema"], "aicad.impact/1")
         finally:
             if orig is None:
-                os.environ.pop("AICAD_CHANGE_PLAN_T_W13", None)
+                os.environ.pop("CHUDWARE_CHANGE_PLAN_T_W13", None)
             else:
-                os.environ["AICAD_CHANGE_PLAN_T_W13"] = orig
+                os.environ["CHUDWARE_CHANGE_PLAN_T_W13"] = orig
 
 
 # ---------------------------------------------------------------------------
@@ -471,19 +471,19 @@ class TestExprParser(unittest.TestCase):
 # §8  link_dimension round-trip
 # ---------------------------------------------------------------------------
 
-# Detect libaicad availability.
+# Detect libchudware availability.
 # The worktree shares the core build tree with the main checkout.
-# Point AI_CAD_LIBAICAD at the known build artifact if not already set so that
+# Point CHUDWARE_LIBCHUDWARE at the known build artifact if not already set so that
 # core_bridge._load() can find the .so regardless of which sys.path entry wins.
-_LIBAICAD_AVAILABLE = False
-_KNOWN_SO = Path("/home/hunter/Repositories/CAD/core/build-linux/bin/libaicad.so")
-if _KNOWN_SO.exists() and not os.environ.get("AI_CAD_LIBAICAD"):
-    os.environ["AI_CAD_LIBAICAD"] = str(_KNOWN_SO)
+_LIBCHUDWARE_AVAILABLE = False
+_KNOWN_SO = Path("/home/hunter/Repositories/CAD/core/build-linux/bin/libchudware.so")
+if _KNOWN_SO.exists() and not os.environ.get("CHUDWARE_LIBCHUDWARE"):
+    os.environ["CHUDWARE_LIBCHUDWARE"] = str(_KNOWN_SO)
 try:
     from services.mcp.core_bridge import call as _core_call, CoreError
     # Try a no-op call to confirm availability
     _core_call("doc_new", {"kind": "part", "name": "link_dim_probe"})
-    _LIBAICAD_AVAILABLE = True
+    _LIBCHUDWARE_AVAILABLE = True
 except Exception:
     pass
 
@@ -492,13 +492,13 @@ class TestLinkDimensionRoundTrip(unittest.TestCase):
     """
     link_dimension round-trip test.
 
-    When libaicad is available (LIVE), we:
+    When libchudware is available (LIVE), we:
       1. Create a real engine doc with doc_new.
       2. Add equations bore=20 and boss_wall=4 via eq_set.
       3. Call link_dimension for DIM9 (expr "bore + 2*boss_wall").
       4. Read back doc_tree; verify the globals contain boss_od = 20 + 2*4 = 28.
 
-    When libaicad is NOT available (MOCK), we:
+    When libchudware is NOT available (MOCK), we:
       - Exercise the full code path (expr parse, op build, ledger update) using a
         mock cb that records calls and returns a plausible engine response.
       - Document the live recipe in the skip note.
@@ -522,11 +522,11 @@ class TestLinkDimensionRoundTrip(unittest.TestCase):
 
     def test_link_dimension_live(self):
         """Live round-trip: eq_set applied to real engine; geometry follows."""
-        if not _LIBAICAD_AVAILABLE:
+        if not _LIBCHUDWARE_AVAILABLE:
             self.skipTest(
-                "libaicad not available — see mock test and live recipe:\n"
-                "  1. Ensure libaicad.so is built: cd core && cmake --build build-linux\n"
-                "  2. Set AI_CAD_LIBAICAD or AI_CAD_DIST env var\n"
+                "libchudware not available — see mock test and live recipe:\n"
+                "  1. Ensure libchudware.so is built: cd core && cmake --build build-linux\n"
+                "  2. Set CHUDWARE_LIBCHUDWARE or CHUDWARE_DIST env var\n"
                 "  3. Run: .venv-mcp/bin/python -m pytest services/agent/test_derivation.py"
                 "::TestLinkDimensionRoundTrip::test_link_dimension_live -v"
             )
@@ -592,11 +592,11 @@ class TestLinkDimensionRoundTrip(unittest.TestCase):
         """Mock round-trip: exercises real parse + op-build + ledger code paths.
 
         The mock cb records the doc_apply_ops call and returns a plausible response.
-        This ensures the code path is correct even without libaicad.
+        This ensures the code path is correct even without libchudware.
 
-        Live recipe (for humans / CI with libaicad):
-          1. Build libaicad: cd core && cmake --build build-linux
-          2. Set AI_CAD_LIBAICAD=<path> or AI_CAD_DIST=<dist dir>
+        Live recipe (for humans / CI with libchudware):
+          1. Build libchudware: cd core && cmake --build build-linux
+          2. Set CHUDWARE_LIBCHUDWARE=<path> or CHUDWARE_DIST=<dist dir>
           3. Run test_link_dimension_live
         """
         ledger = self._make_link_ledger()

@@ -10,8 +10,8 @@ from services.agent import proactive_advisor as pa
 
 @pytest.fixture(autouse=True)
 def _clear_env(monkeypatch):
-    monkeypatch.delenv("AI_CAD_PROACTIVE_ADVISOR", raising=False)
-    monkeypatch.delenv("AI_CAD_ADVISOR", raising=False)
+    monkeypatch.delenv("CHUDWARE_PROACTIVE_ADVISOR", raising=False)
+    monkeypatch.delenv("CHUDWARE_ADVISOR", raising=False)
 
 
 def test_trigger_fail_streak():

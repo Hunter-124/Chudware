@@ -31,7 +31,7 @@
 #include "agent/state.h"
 #include "doc/session.h"
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 
 namespace {
@@ -284,8 +284,8 @@ std::string fallback_part_name(const std::string& request) {
 // version control / PLM sees a real file from the first feature, not only
 // after the run). Resolution order: options.save_dir (host override) →
 // config.json "workspace_dir" (Settings → General workspace folder) → the
-// host's default workspace root (Documents/AI-CAD when present, else
-// Documents/Billet — mirrors fs_backend defaultRoot()).
+// host's default workspace root (Documents/Chudware when present, else
+// Documents/Chudware — mirrors fs_backend defaultRoot()).
 std::string agent_workspace_dir(const json& options) {
     if (options.contains("save_dir") && options["save_dir"].is_string() &&
         !options["save_dir"].get<std::string>().empty())
@@ -304,9 +304,9 @@ std::string agent_workspace_dir(const json& options) {
 #endif
     if (base.empty()) return std::string();
     std::error_code ec;
-    const fs::path legacy = base / "AI-CAD";
+    const fs::path legacy = base / "Chudware";
     if (fs::exists(legacy, ec)) return legacy.string();
-    return (base / "Billet").string();
+    return (base / "Chudware").string();
 }
 
 // Filename stem from a part name — mirrors the host auto-save rule (app.cpp):
@@ -729,8 +729,8 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
     // Wrap with timing + sidecar logging (thin; never changes behaviour).
     // LoggingProviderState collects the most-recent sidecar paths so emit_ai_artifact
     // (below) can pass input_ref/output_ref instead of empty strings.
-    aicad::agent::LoggingProviderState lp_state;
-    provider = aicad::agent::wrap_logging(std::move(provider), run_id, run_consent, &lp_state);
+    chudware::agent::LoggingProviderState lp_state;
+    provider = chudware::agent::wrap_logging(std::move(provider), run_id, run_consent, &lp_state);
     // Output-token budget + INPUT context cap, jointly fitted to the model's context window so a
     // small local window is never overrun (which would truncate the prompt and break the chain).
     const CallBudget budget = fit_call_budget(provider_cfg, call_budget_for(provider_cfg));
@@ -818,7 +818,7 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
             if (!(pw_name == main_name && pw_model == main_model && !pw_model.empty())) {
                 implement_provider = make_provider(pw_desc);
                 implement_provider =
-                    aicad::agent::wrap_logging(std::move(implement_provider), run_id, run_consent,
+                    chudware::agent::wrap_logging(std::move(implement_provider), run_id, run_consent,
                                                &lp_state);
                 const CallBudget ib = fit_call_budget(pw_desc, call_budget_for(pw_desc));
                 implement_budget = ib.output;
@@ -4178,4 +4178,4 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
 
 
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware

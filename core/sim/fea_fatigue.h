@@ -15,7 +15,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad::sim {
+namespace chudware::sim {
 
 // Run a fatigue study. `study` carries the SAME mesh + material + fixtures + loads
 // fields as fea_run_static, PLUS an optional "fatigue" object. The ENGINE no longer
@@ -44,4 +44,4 @@ namespace aicad::sim {
 // sa_eq_mpa (max over nodes). On any failure returns {ok:false, error}. Never throws.
 nlohmann::json fea_run_fatigue(const nlohmann::json& study);
 
-}  // namespace aicad::sim
+}  // namespace chudware::sim

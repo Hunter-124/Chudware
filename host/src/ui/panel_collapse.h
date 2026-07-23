@@ -32,7 +32,7 @@ struct PanelCollapseAnim {
     }
 
     // Snap immediately to the collapsed or expanded target with no animation — use from code paths
-    // that force a state deterministically (e.g. AI_CAD_FM_COLLAPSED env var in screenshot mode)
+    // that force a state deterministically (e.g. CHUDWARE_FM_COLLAPSED env var in screenshot mode)
     // so headless captures don't depend on how many frames have elapsed.
     // For collapsed: sets h to headerH if already measured, otherwise to 1.0f (tiny, so bodyVisible()
     // returns false immediately) — tick() will hold near headerH once it's measured the next frame.

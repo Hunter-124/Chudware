@@ -6,7 +6,7 @@
 
 namespace fs = std::filesystem;
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 
 namespace {
@@ -29,17 +29,22 @@ fs::path expand_home_roaming() {
 }  // namespace
 
 namespace {
-// T-G10 alias rule (mirrors engine/paths.py active_root()): a machine with an
-// existing legacy AI-CAD dir (and no Billet dir yet) keeps using it wholesale;
-// fresh installs get Billet. No destructive migration.
+// Alias rule (mirrors engine/paths.py active_root() and app_state.cpp appdataAppDir()):
+// once Chudware holds a real install marker (config.json) it wins; otherwise an existing
+// legacy install dir is kept using wholesale (it holds the live venv/config — venvs do not
+// survive relocation), preferring the most recent legacy name (Billet) over the oldest
+// (AI-CAD). Fresh machines get Chudware. No destructive migration; the old dir is never moved.
 fs::path pick_app_dir(const fs::path& base) {
-    const fs::path neu = base / "Billet";
-    const fs::path legacy = base / "AI-CAD";
+    const fs::path neu = base / "Chudware";
     std::error_code ec;
-    // Legacy wins whenever it exists and the new dir holds no real install marker
-    // (config.json) — a stray cache-only Billet dir must not flip the root
-    // (mirrors engine/paths.py active_root(), hardened 2026-07-04).
-    if (fs::exists(legacy, ec) && !fs::exists(neu / "config.json", ec)) return legacy;
+    if (fs::exists(neu / "config.json", ec)) return neu;
+    // Prefer a legacy dir that holds a real install marker (config.json), newest name
+    // first — a stray cache-only dir must never shadow a real install.
+    for (const char* legacy : {"Billet", "AI-CAD"})
+        if (fs::exists(base / legacy / "config.json", ec)) return base / legacy;
+    // No marker anywhere: keep an existing legacy dir wholesale if present.
+    for (const char* legacy : {"Billet", "AI-CAD"})
+        if (fs::exists(base / legacy, ec)) return base / legacy;
     return neu;
 }
 }  // namespace
@@ -70,4 +75,4 @@ fs::path paths_cache() { return appdata_root() / "cache"; }
 fs::path paths_config() { return appdata_root() / "config.json"; }
 
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware

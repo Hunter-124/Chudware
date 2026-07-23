@@ -7,12 +7,12 @@
 # third_party/netgen/install and reused on every later configure.
 #
 # Building against OUR OCCT 7.9.3 is REQUIRED, not incidental: nglib.dll imports the OCCT
-# toolkit DLLs (TKernel.dll, ...) by name, so it MUST share the same OCCT libaicad.dll loads —
+# toolkit DLLs (TKernel.dll, ...) by name, so it MUST share the same OCCT libchudware.dll loads —
 # two different OCCT builds with identical DLL names would collide in-process. Sharing one OCCT
 # also lets Ng_OCC_Load_STEP read the STEP with the same kernel (no two-OCCT clash).
 #
 # LICENSE NOTE: Netgen/nglib is LGPL-2.1. We link it DYNAMICALLY (nglib.dll + ngcore.dll
-# shipped next to libaicad.dll) and offer the Netgen source, which satisfies the LGPL. This
+# shipped next to libchudware.dll) and offer the Netgen source, which satisfies the LGPL. This
 # replaced gmsh (GPL-2+, no linking exception) — the #1 commercialization blocker.
 
 include(ExternalProject)  # not used directly, but keeps the module self-describing
@@ -84,10 +84,10 @@ if(NOT EXISTS "${_ng_implib}")
   #    arrays right after the frees fixes it. Idempotent (guarded on the marker).
   set(_ng_meshclass "${_ng_src}/libsrc/meshing/meshclass.cpp")
   file(READ "${_ng_meshclass}" _ng_mc)
-  if(NOT _ng_mc MATCHES "AI-CAD patch")
+  if(NOT _ng_mc MATCHES "Chudware patch")
     string(REPLACE
       "    for (int i= 0; i< cd2names.Size(); i++)\n      if (cd2names[i]) delete cd2names[i];\n"
-      "    for (int i= 0; i< cd2names.Size(); i++)\n      if (cd2names[i]) delete cd2names[i];\n    // AI-CAD patch: clear the freed name arrays so ~Mesh cannot delete these pointers a\n    // second time (double-free that killed the process on Ng_DeleteMesh).\n    bcnames.SetSize(0);\n    cd2names.SetSize(0);\n"
+      "    for (int i= 0; i< cd2names.Size(); i++)\n      if (cd2names[i]) delete cd2names[i];\n    // Chudware patch: clear the freed name arrays so ~Mesh cannot delete these pointers a\n    // second time (double-free that killed the process on Ng_DeleteMesh).\n    bcnames.SetSize(0);\n    cd2names.SetSize(0);\n"
       _ng_mc_new "${_ng_mc}")
     if(_ng_mc_new STREQUAL _ng_mc)
       message(FATAL_ERROR "[netgen] could not apply the DeleteMesh double-free patch — "
@@ -158,7 +158,7 @@ endif()
 set(NETGEN_INCLUDE_DIRS "${_ng_install}/include" CACHE PATH "Netgen include dir" FORCE)
 set(NETGEN_IMPORT_LIB   "${_ng_implib}"          CACHE FILEPATH "nglib import lib" FORCE)
 
-# Runtime shared libs to stage next to libaicad: nglib + ngcore. On Windows also stage
+# Runtime shared libs to stage next to libchudware: nglib + ngcore. On Windows also stage
 # zlib.dll (nglib's dep, which OCCT's DLL staging does NOT copy); on ELF the system zlib
 # resolves via the loader, so NETGEN_ZLIB_DLL stays empty.
 if(WIN32)
@@ -175,9 +175,9 @@ message(STATUS "[netgen] ${NETGEN_VERSION}  include=${NETGEN_INCLUDE_DIRS}")
 message(STATUS "[netgen]   import lib=${NETGEN_IMPORT_LIB}")
 message(STATUS "[netgen]   runtime dlls=${NETGEN_DLLS} + ${NETGEN_ZLIB_DLL}")
 
-# Deploy the Netgen runtime DLLs (+ zlib) next to a target's binary so libaicad.dll's import
+# Deploy the Netgen runtime DLLs (+ zlib) next to a target's binary so libchudware.dll's import
 # of nglib.dll resolves when it is loaded from the same directory.
-function(aicad_netgen_copy_dlls tgt)
+function(chudware_netgen_copy_dlls tgt)
   foreach(_d ${NETGEN_DLLS} ${NETGEN_ZLIB_DLL})
     if(_d AND EXISTS "${_d}")
       add_custom_command(TARGET ${tgt} POST_BUILD

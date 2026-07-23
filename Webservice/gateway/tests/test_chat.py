@@ -28,8 +28,8 @@ class _User:
 def chat_env(tmp_path, monkeypatch):
     data = tmp_path / "data"
     data.mkdir()
-    monkeypatch.setenv("BILLET_WEB_DATA_ROOT", str(data))
-    monkeypatch.setenv("BILLET_WEB_DEV", "1")
+    monkeypatch.setenv("CHUDWARE_WEB_DATA_ROOT", str(data))
+    monkeypatch.setenv("CHUDWARE_WEB_DEV", "1")
 
     for mod in ("gateway.config", "gateway.chat", "config", "chat"):
         sys.modules.pop(mod, None)

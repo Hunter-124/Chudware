@@ -5,8 +5,8 @@
 Exploration confirmed the desktop↔web parity architecture **already exists and is the right one**:
 the web app at chudware.com is the *same* `host/src/ui` tree compiled to WASM
 (`host/CMakeLists.txt:244-268`), served by the FastAPI gateway (`Webservice/gateway/app.py`),
-talking to the same `aicad-hostd` daemon + `libaicad` (`core/hostd/`, `docs/reference/HOSTD.md`), with
-`billet-webd-sync.path` auto-redeploying on every green master rebuild. **So: no new UI
+talking to the same `chudware-hostd` daemon + `libchudware` (`core/hostd/`, `docs/reference/HOSTD.md`), with
+`chudware-webd-sync.path` auto-redeploying on every green master rebuild. **So: no new UI
 abstraction layer.** The old `ui/abstract` view-model effort was already built once and deleted
 (YAGNI won); this plan does not resurrect it. Parity work = closing the specific seams where web
 silently diverges, then making divergence structurally impossible via zero-Python.
@@ -54,7 +54,7 @@ Real gaps found, with evidence:
   refresh/auth into `core/agent` (C++)** so the per-run Python callback dies.
 - **Python endgame:** **full zero-Python push** — port the remaining `engine_oracle/` subsystems
   to `core/`, flip routing, delete the oracle. Python services that remain (MCP server, DAG
-  runner, advisor/mission tooling) become **thin clients over libaicad/hostd** with zero engine
+  runner, advisor/mission tooling) become **thin clients over libchudware/hostd** with zero engine
   logic (the old plan's accepted N5e fallback).
 - **Wave order:** Hygiene → Agent UX/harness → Perf, with the zero-Python cutover as a parallel
   long-running stream once hygiene lands (disjoint write-sets).
@@ -66,7 +66,7 @@ Real gaps found, with evidence:
 
 - **No worktree isolation**; all subagents run non-isolated in the main tree.
 - **One integrator** (this main session) owns all shared/append-only files — top-level CMake,
-  `contracts/`, `AGENTS.md`, `scripts/gate.sh`, `core/api/libaicad.h`, `contracts/worker_rpc.md`,
+  `contracts/`, `AGENTS.md`, `scripts/gate.sh`, `core/api/libchudware.h`, `contracts/worker_rpc.md`,
   `services/worker/worker_client.cpp` routing table, `work/` board files — and does **all git
   commits**. Leaf subagents never run git.
 - Every node lists its **write-set**; parallel nodes in a wave have disjoint write-sets.
@@ -85,7 +85,7 @@ Real gaps found, with evidence:
 ## The gate (every node)
 
 `bash scripts/gate.sh` — check.py audits, core build + ctest, host build, pytest suites,
-headless `AI_CAD_SHOT` smoke. This plan extends it (node R0c) with: WASM build smoke
+headless `CHUDWARE_SHOT` smoke. This plan extends it (node R0c) with: WASM build smoke
 (`./build.sh wasm`) and a **web parity probe** (headless scenario driven through hostd exactly as
 the WASM client drives it, asserting no `unsupported`/`python-worker-required` responses for the
 shipped feature set).
@@ -128,7 +128,7 @@ flowchart TD
         R4f["R4f MCP+DAG thin-client flip (no engine imports left in Python)"]
     end
     subgraph W5["Wave 5 — Closeout"]
-        R5a["R5a remove AI_CAD_CPP_* fallback flags; delete engine_oracle/ + engine symlink"]
+        R5a["R5a remove CHUDWARE_CPP_* fallback flags; delete engine_oracle/ + engine symlink"]
         R5b["R5b final docs: ARCHITECTURE/README/AGENTS + contract index; Windows build check"]
     end
     R0c --> R1a & R1c & R1d & R1e & R1f
@@ -188,7 +188,7 @@ flowchart TD
   `ui/copilot/` modules: chat_log, composer, activity_timeline, cards (plan/clarify/swarm/ai-vc),
   panel host. Reconcile with `ai/ai_workspace.cpp` per board task **T-DP16** (one chat
   implementation, two layouts). Rename away from "legacy". Pure moves + header splits, no
-  behavior change; screenshot gate (`AI_CAD_SHOT`) proves parity. Write-set:
+  behavior change; screenshot gate (`CHUDWARE_SHOT`) proves parity. Write-set:
   `host/src/ui/legacy_chat.*`, `host/src/ui/ai/`, new `host/src/ui/copilot/`.
 - **R1d — Single event-schema + prompt source.** `contracts/agent_events.md` stays the frozen
   vocabulary; make the schema machine-checkable (a JSON event-kind list in `contracts/` consumed
@@ -216,7 +216,7 @@ flowchart TD
   the pruned 2026-07-16 GUI session plan + pending `[~]` items in `docs/plans/GUI_OVERHAUL_SPEC.md`
   (ribbon icon artifacts, PM collapsed-sections/padding, washer extrude bug, RMB context-menu
   rework, zoom-to-fit timing, imperial-aware defaults). Split into 2–3 sub-nodes with disjoint
-  files (ribbon/icons · PropertyManager · viewport/menus). Each verified with `AI_CAD_SHOT`
+  files (ribbon/icons · PropertyManager · viewport/menus). Each verified with `CHUDWARE_SHOT`
   scenarios. Write-set: `host/src/ui/` per sub-node split; `assets/icons/` (integrator-owned
   atlas merge).
 - **R2b — Dispatch decomposition.** Replace the `app.cpp:1534` if-chain with per-workspace
@@ -240,14 +240,14 @@ flowchart TD
   `host/src/ui/viewport_panel.cpp` (HUD indicator), `Webservice/perf/`.
 - **R3b — (stretch, only if probe says so)** `doc_open` memmove floor → mmap/zero-copy read;
   tiny-op C-ABI marshalling fast path for `eval_*`/export. Write-set: `core/` doc io,
-  `core/api/libaicad.cpp`.
+  `core/api/libchudware.cpp`.
 
 ### Stream Z — Zero-Python cutover (starts after R0c; long-running parallel stream)
 
 Per-subsystem nodes, each: reach corpus parity → flip routing default in
 `services/worker/worker_client.cpp` (**integrator-owned append point**) → **delete the Python
 module in the same commit** → gate. Write-sets are disjoint `core/<sub>` + `engine_oracle/<sub>`
-pairs; `core/api/libaicad.h` is integrator-merged once per wave.
+pairs; `core/api/libchudware.h` is integrator-merged once per wave.
 
 - **R4a** firmware `fw_*` → `core/firmware` (contract `contracts/firmware_rpc.md` already frozen).
 - **R4b** CFD/LBM `sim_run_flow` + `sim_cancel` → `core/sim`.
@@ -258,14 +258,14 @@ pairs; `core/api/libaicad.h` is integrator-merged once per wave.
 - **R4e** long tail: hydraulic, piping, intake, vision, research, render, structural, tolerance,
   remaining `engine_oracle/doc` formats/export remnants. (Sub-split at dispatch; each leaf stays
   small enough for one subagent.)
-- **R4f — Thin-client flip.** `services/mcp` + `services/dag` call hostd/libaicad only; zero
+- **R4f — Thin-client flip.** `services/mcp` + `services/dag` call hostd/libchudware only; zero
   `engine_oracle` imports remain anywhere (`grep` proof in gate). Python `agent_turn.py`
   consumers (node_runner, plm/assist, ai_vc, subagent_rpc, mission_dispatch, reviewer_exec)
   either call the C++ agent over RPC or are deleted with their feature. Depends R1a/R1f.
 
 ### Wave 5 — Closeout
 
-- **R5a** Remove `AI_CAD_CPP_DOCS/SIM/ECAD/AGENT` fallback flags + Python routing branches from
+- **R5a** Remove `CHUDWARE_CPP_DOCS/SIM/ECAD/AGENT` fallback flags + Python routing branches from
   `worker_client.cpp`; delete `engine_oracle/`, the root `engine` symlink, and the Python worker
   spawn path. Web parity inventory is empty by construction; keep the probe as a regression gate.
 - **R5b** Rewrite `ARCHITECTURE.md`/`README.md`/per-module `AGENTS.md` to final state; contract
@@ -279,7 +279,7 @@ pairs; `core/api/libaicad.h` is integrator-merged once per wave.
 | W1 | R1a→R1b; R1c ∥ R1d ∥ R1e ∥ R1f | 4 leaves | jobs.cpp, contracts merges |
 | W2 | R2a(x2–3) ∥ R2b ∥ R2c | 4 leaves | app.cpp conflicts watch |
 | W3 | R3a → R3b(stretch) | 1 | perf probe |
-| Z  | R4a–R4d ∥, then R4e ∥, then R4f | 4 leaves/stream | routing table + libaicad.h |
+| Z  | R4a–R4d ∥, then R4e ∥, then R4f | 4 leaves/stream | routing table + libchudware.h |
 | W5 | R5a → R5b | sequential | all commits |
 
 Z-stream launches immediately after R0c (disjoint from W1/W2 write-sets) so it doesn't serialize

@@ -2272,7 +2272,7 @@ void SimManager::applyResultField(AppState &st, Study &s) {
   // every solve. Precheck existence ONLY for genuine file paths; shm URIs go
   // straight to the loader, which reports a clean error if the segment was
   // reclaimed.
-  if (!aicad::aicm_handoff::is_shm_uri(s.overlayPath)) {
+  if (!chudware::aicm_handoff::is_shm_uri(s.overlayPath)) {
     std::error_code ec;
     if (!std::filesystem::exists(s.overlayPath, ec)) {
       st.addLog("[sim] overlay file missing (re-run to regenerate): " +
@@ -2356,7 +2356,7 @@ void SimManager::previewMesh(AppState &st, Study &s) {
   }
   // T-PERF4: export + sim_mesh are long (up to 180s). AsyncRpc keeps the UI
   // live. Daemon/WASM: empty path → hostd picks a server temp under
-  // aicad_cpp_docs.
+  // chudware_cpp_docs.
   const std::string stepPath =
       engine::daemonMode() ? std::string()
                            : (appdataAppDir() + "/cache/sim_mesh_preview.step");
@@ -3236,7 +3236,7 @@ void SimManager::rebuildFlowLines(AppState &st, Study &s) {
   // Overlay is normally an aicm-shm:// URI (see applyResultField) —
   // filesystem::exists() would wrongly reject it and drop every streamline.
   // Precheck existence only for real file paths.
-  if (!aicad::aicm_handoff::is_shm_uri(s.overlayPath)) {
+  if (!chudware::aicm_handoff::is_shm_uri(s.overlayPath)) {
     std::error_code ec;
     if (!std::filesystem::exists(s.overlayPath, ec))
       return;
@@ -7497,7 +7497,7 @@ void SimManager::applyMotionFrame(AppState &st, Study &s, int frame) {
   st.renderer->setFramingFrozen(false);
 }
 
-// ---------- scripted-shot motion helpers (AI_CAD_SHOT=motion)
+// ---------- scripted-shot motion helpers (CHUDWARE_SHOT=motion)
 // -------------------------
 
 bool SimManager::motionHasResult() const {

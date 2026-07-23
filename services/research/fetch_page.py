@@ -16,7 +16,7 @@ from urllib.parse import urlparse
 from .cache import Cache, DEFAULT_TIER
 from .common import HIGH, MEDIUM, OFFLINE, envelope, fail, is_offline, now_ts
 
-_UA = "Mozilla/5.0 (compatible; AI-CAD-research/1.0)"
+_UA = "Mozilla/5.0 (compatible; Chudware-research/1.0)"
 _MAX_CONTENT = 200_000  # cap markdown to protect the model window (contract §3)
 _DROP_TAGS = {"script", "style", "nav", "footer", "aside", "noscript", "form",
               "svg", "iframe", "template"}

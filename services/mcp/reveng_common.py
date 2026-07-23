@@ -106,11 +106,11 @@ def _ingest_pdf(path: str, out_dir: str) -> dict:
 # ── session store ───────────────────────────────────────────────────────────
 
 def _reveng_dir() -> _Path:
-    base = _os.environ.get("AICAD_REVENG_DIR")
+    base = _os.environ.get("CHUDWARE_REVENG_DIR")
     if base:
         return _Path(base).expanduser()
     xdg = _os.environ.get("XDG_DATA_HOME", _os.path.expanduser("~/.local/share"))
-    return _Path(xdg) / "AI-CAD" / "reveng"
+    return _Path(xdg) / "Chudware" / "reveng"
 
 
 def _session_path(session_id: str) -> _Path:
@@ -270,8 +270,8 @@ def _load_template(name: str) -> dict:
 
 
 def _reveng_runs_dir() -> Optional[_Path]:
-    """Optional runs-dir override for hermetic tests (AICAD_REVENG_RUNS_DIR)."""
-    d = _os.environ.get("AICAD_REVENG_RUNS_DIR")
+    """Optional runs-dir override for hermetic tests (CHUDWARE_REVENG_RUNS_DIR)."""
+    d = _os.environ.get("CHUDWARE_REVENG_RUNS_DIR")
     return _Path(d).expanduser() if d else None
 
 

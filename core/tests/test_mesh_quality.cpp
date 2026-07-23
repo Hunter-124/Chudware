@@ -22,7 +22,7 @@
 #include <STEPControl_Writer.hxx>
 #include <TopoDS_Shape.hxx>
 
-using namespace aicad::sim;
+using namespace chudware::sim;
 
 namespace {
 
@@ -67,7 +67,7 @@ int circumferential_sectors(const std::vector<double>& pts, double r, int n_sect
 
 // ── Headline: a cylinder meshes EVENLY at the product-default settings ─────────────────────
 TEST_CASE("cylinder meshes evenly with healthy curvature resolution") {
-    const std::string step = write_cylinder(R, H, "aicad_mq_cyl.step");
+    const std::string step = write_cylinder(R, H, "chudware_mq_cyl.step");
 
     MeshOptions o;
     o.fineness = 0.5;     // the product default
@@ -108,7 +108,7 @@ TEST_CASE("cylinder meshes evenly with healthy curvature resolution") {
 
 // ── Curvature refinement actually ENGAGES (the elementspercurve conversion is live) ─────────
 TEST_CASE("curvature refinement increases circumferential resolution") {
-    const std::string step = write_cylinder(R, H, "aicad_mq_cyl_curv.step");
+    const std::string step = write_cylinder(R, H, "chudware_mq_cyl_curv.step");
 
     // At a COARSE base size the curvature control is the binding size constraint, so raising
     // curv_elems_per_circle MUST put more elements around the wall. This proves the curvature

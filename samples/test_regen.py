@@ -2,7 +2,7 @@
 samples/test_regen.py — T-Q3 DoD: regen + open + tree/solve asserts for all gallery samples.
 
 Usage (from repo root):
-  AI_CAD_LIBAICAD=<path>/libaicad.so python -m pytest samples/test_regen.py -v
+  CHUDWARE_LIBCHUDWARE=<path>/libchudware.so python -m pytest samples/test_regen.py -v
 
 Each sample's build.py exposes a regen_and_verify() entry point that:
   1. Rebuilds the sample from scratch via core_bridge (doc_new + add_features)
@@ -35,13 +35,13 @@ INDEX_FILE = SAMPLES_DIR / "index.json"
 
 @pytest.fixture(scope="session")
 def cb():
-    """core_bridge handle — skip entire session if libaicad is not available."""
+    """core_bridge handle — skip entire session if libchudware is not available."""
     try:
         from mcp_server import core_bridge as _cb
     except ImportError:
         pytest.skip("mcp_server not importable (PYTHONPATH not set?)")
     if not _cb.available():
-        pytest.skip("libaicad not available — set AI_CAD_LIBAICAD=<path>")
+        pytest.skip("libchudware not available — set CHUDWARE_LIBCHUDWARE=<path>")
     return _cb
 
 

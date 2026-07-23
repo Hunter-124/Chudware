@@ -15,7 +15,7 @@ priority: 3
 
 ECAD routes C++ by default on Linux/macOS. Probe-verified 2026-07-22
 (contracts/web_parity.md): `ecad_fill_zones` + `ecad_simulate` are ALREADY
-libaicad-dispatched. Remaining gaps: doc-id forms of ecad_autoroute / ecad_to_3d /
+libchudware-dispatched. Remaining gaps: doc-id forms of ecad_autoroute / ecad_to_3d /
 ecad_route_diff_pair, plus ecad_design and ecad_import_kicad*. On Windows ECAD still
 defaults Python.
 
@@ -27,6 +27,6 @@ the Python modules in the same commit. Unblocks web ECAD and the Windows default
 
 ## Definition of done
 
-- [x] All ecad_* served by libaicad on Linux; corpus + e2e parity green.
+- [x] All ecad_* served by libchudware on Linux; corpus + e2e parity green.
 - [x] Python ecad modules deleted same commit; routing flipped (integrator merge).
 - [x] gate.sh green; REFACTOR_LOG handoff; web_parity inventory shrinks.

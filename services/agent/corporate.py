@@ -200,11 +200,11 @@ def _runs_dir() -> Path:
     """Platform default runs directory (mirrors coordination._runs_dir)."""
     if platform.system() == "Windows":
         appdata = os.environ.get("APPDATA") or os.path.expanduser(r"~\AppData\Roaming")
-        return Path(appdata) / "AI-CAD" / "runs"
+        return Path(appdata) / "Chudware" / "runs"
     xdg = os.environ.get("XDG_DATA_HOME")
     if xdg:
-        return Path(xdg) / "AI-CAD" / "runs"
-    return Path.home() / ".local" / "share" / "AI-CAD" / "runs"
+        return Path(xdg) / "Chudware" / "runs"
+    return Path.home() / ".local" / "share" / "Chudware" / "runs"
 
 
 def corporate_event(

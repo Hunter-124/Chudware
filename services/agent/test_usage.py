@@ -923,7 +923,7 @@ def test_xai_api_userinfo_and_ratelimit_headers(tmp_config, monkeypatch):
 
     monkeypatch.setattr(usage, "XAI_USAGE_SOURCE", usage.XAI_SOURCE_API)
     monkeypatch.setattr(usage, "_http_get", fake_http)
-    monkeypatch.delenv("AICAD_XAI_USAGE_PROBE", raising=False)
+    monkeypatch.delenv("CHUDWARE_XAI_USAGE_PROBE", raising=False)
     usage.clear_cache()
 
     row = usage.fetch_account_usage("xai", "u-api-1", force=True)
@@ -997,7 +997,7 @@ def test_xai_billing_credits_primary(tmp_config, monkeypatch):
 
     monkeypatch.setattr(usage, "XAI_USAGE_SOURCE", usage.XAI_SOURCE_API)
     monkeypatch.setattr(usage, "_http_get", fake_http)
-    monkeypatch.delenv("AICAD_XAI_USAGE_PROBE", raising=False)
+    monkeypatch.delenv("CHUDWARE_XAI_USAGE_PROBE", raising=False)
     usage.clear_cache()
 
     row = usage.fetch_account_usage("xai", "u-bill-1", force=True)

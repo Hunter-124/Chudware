@@ -18,7 +18,7 @@
 #include "piping/catalog.h"
 #include "piping/schema.h"
 
-namespace aicad::piping {
+namespace chudware::piping {
 namespace {
 
 using pyutil::fmt_f;
@@ -1618,4 +1618,4 @@ ojson operating_point(const ojson& pump_curve, const ojson& system_in, const ojs
     return out;
 }
 
-}  // namespace aicad::piping
+}  // namespace chudware::piping

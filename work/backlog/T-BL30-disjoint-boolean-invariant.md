@@ -25,7 +25,7 @@ results fail.
 returns `feature_status.ok == true`, `eval_mass.body_count == 2`, `eval_check.issues == []`.
 The fuse silently no-ops; no error is raised.
 
-**Repro:** `AI_CAD_LIBAICAD=$PWD/core/build-occt-linux/bin/libaicad.so PYTHONPATH=$PWD
+**Repro:** `CHUDWARE_LIBCHUDWARE=$PWD/core/build-occt-linux/bin/libchudware.so PYTHONPATH=$PWD
 python3 scripts/modeling_battery.py` — case `nc_disjoint_fuse`. NOTE: only the OCCT build
 has the real geometry kernel; `core/build-linux` all-skips the battery.
 
@@ -94,7 +94,7 @@ Verification:
 - Battery: added `nc_disjoint_cut` (a full-cross-section tool slicing a body into two
   disconnected remnants) and `boolean_fuse_touching_face` (above), alongside flipping
   `nc_disjoint_fuse`'s `xfail=` marker off. Full run against this worktree's OCCT build
-  (`core/build-linux`, OCCT confirmed present via `cmake -DAICAD_WITH_OCCT=ON`):
+  (`core/build-linux`, OCCT confirmed present via `cmake -DCHUDWARE_WITH_OCCT=ON`):
   **52/52 PASS, 0 FAIL, 0 XFAIL, 0 ERROR** — every previously-passing case (including
   `boolean_fuse`, `boolean_cut`, `linear_pattern`, `circular_pattern`, `mirror`, `sm_*`,
   `weld_member`) still passes, confirming legitimate multi-body/pattern/mirror workflows

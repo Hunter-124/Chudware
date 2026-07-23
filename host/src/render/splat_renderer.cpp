@@ -227,7 +227,7 @@ void main(){
 
 unsigned int compile(unsigned int type, const char* src) {
     unsigned int s = glCreateShader(type);
-#ifdef BILLET_GLES3
+#ifdef CHUDWARE_GLES3
     const std::string rewritten = shaderSrc(src);
     const char* p = rewritten.c_str();
 #else

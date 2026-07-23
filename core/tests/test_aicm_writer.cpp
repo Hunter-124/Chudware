@@ -1,7 +1,7 @@
 // Standalone (OCCT-free) test of the AICM v1 writer geom/aicm.cpp. Hand-builds a
 // tiny AicmBody, serializes it, and round-trips through the HOST loader
 // (render::parseAicm) to prove byte compatibility without needing the geometry
-// kernel. Runs in the default AICAD_WITH_OCCT=OFF build.
+// kernel. Runs in the default CHUDWARE_WITH_OCCT=OFF build.
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 

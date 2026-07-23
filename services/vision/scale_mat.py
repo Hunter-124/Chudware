@@ -83,7 +83,7 @@ def _require_pillow():
 
         raise VisionUnavailable(
             reason="Pillow (PIL) is not installed",
-            hint="pip install Pillow (already an AI-CAD runtime dep)",
+            hint="pip install Pillow (already an Chudware runtime dep)",
         ) from exc
     from PIL import Image
 

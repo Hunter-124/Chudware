@@ -32,7 +32,7 @@
 #include <string>
 #include <vector>
 
-namespace aicad::doc::motiondyn {
+namespace chudware::doc::motiondyn {
 
 // Per-body mass properties + its prescribed world pose per frame.
 struct BodyProps {
@@ -103,4 +103,4 @@ DynResult solve_inverse_dynamics(const std::vector<BodyProps>& bodies,
                                  const std::vector<JointDef>& joints,
                                  const Options& opt);
 
-}  // namespace aicad::doc::motiondyn
+}  // namespace chudware::doc::motiondyn

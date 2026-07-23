@@ -19,7 +19,7 @@
 #include <functional>
 #include <vector>
 
-namespace aicad::util {
+namespace chudware::util {
 namespace {
 
 // Degrees-in / degrees-out trig, matching equations._deg_in / _deg_out.
@@ -312,4 +312,4 @@ double evaluate(const std::string& expr, const std::map<std::string, double>& en
     return result;
 }
 
-}  // namespace aicad::util
+}  // namespace chudware::util

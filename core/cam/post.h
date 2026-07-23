@@ -10,7 +10,7 @@
 
 #include "cam/model.h"
 
-namespace aicad {
+namespace chudware {
 namespace cam {
 
 // Number formatting for one axis/word class.
@@ -136,7 +136,7 @@ struct PostOptions {
     bool sequence_numbers = false;     // force line numbers on
     bool comments = true;
     bool metric = true;
-    std::string program_name = "AICAD";
+    std::string program_name = "Chudware";
     int program_number = 1000;
     bool separate_files_per_setup = false;
     json overrides = json::object();   // PostConfig field overrides
@@ -171,4 +171,4 @@ SheetResult setup_sheet(const Job&, const std::vector<std::vector<Toolpath>>& pe
                         const std::string& dialect_id);
 
 }  // namespace cam
-}  // namespace aicad
+}  // namespace chudware

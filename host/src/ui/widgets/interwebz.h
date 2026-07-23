@@ -1,4 +1,4 @@
-// Interwebz-style chrome widgets for Billet — clean-room Liquid Glass port.
+// Interwebz-style chrome widgets for Chudware — clean-room Liquid Glass port.
 // Visual structure + interaction patterns only (no upstream palette or code copy).
 // All geometry is uiScale-aware; colors come exclusively from ui::palette / glass helpers.
 // Draw-list based; does not mutate global ImGui style (scoped PushStyle* only).

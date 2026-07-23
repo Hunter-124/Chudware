@@ -175,7 +175,7 @@ def run_vision_fix(provider: Any, *, seed: int = 1) -> dict[str, Any]:
         )
 
     system = (
-        "You are an AI-CAD vision reviewer. Look at the attached render and the "
+        "You are an Chudware vision reviewer. Look at the attached render and the "
         "describe_part text. Decide if the part matches the intended design. "
         "If wrong, name the tool call that would fix it (add_features, edit_feature, "
         "undo, fillet, mirror, …). Be brief."

@@ -498,7 +498,7 @@ def test_post_power_success_force_cascades_wire(tmp_path, monkeypatch):
     from services.agent.ledger import Ledger
     from services.agent import agent_turn as at
 
-    monkeypatch.setenv("AICAD_CACHE_ROOT", str(tmp_path))
+    monkeypatch.setenv("CHUDWARE_CACHE_ROOT", str(tmp_path))
     ledger = Ledger("mega19_post_power", path=tmp_path / "ledger.json")
     seq = {"n": 0}
     refs = {"n": 0}

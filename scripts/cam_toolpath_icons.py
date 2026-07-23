@@ -5,7 +5,7 @@ Hunter directive (2026-07-04): the Manufacture icons must showcase the GENERATED
 TOOLPATHS the tools produce, not screenshots of the shape types they're used on.
 
 Each tile is produced by driving the actual CAM engine chain through the same
-libaicad RPC bridge the MCP server uses:
+libchudware RPC bridge the MCP server uses:
 
     cam_new -> cam_apply_ops(add_tool/add_setup/add_operation) -> cam_generate
             -> cam_simulate (smoke check)
@@ -38,12 +38,12 @@ SS = 4              # supersample factor for crisp polylines at 32/20 px
 sys.path.insert(0, str(REPO / "services" / "mcp"))
 
 
-def _resolve_libaicad() -> None:
-    """Point core_bridge at a built libaicad.so. Worktrees usually have no build
+def _resolve_libchudware() -> None:
+    """Point core_bridge at a built libchudware.so. Worktrees usually have no build
     dir, so fall back to the main checkout (git common dir) transparently."""
     import os
     import subprocess
-    if os.environ.get("AI_CAD_LIBAICAD"):
+    if os.environ.get("CHUDWARE_LIBCHUDWARE"):
         return
     roots = [REPO]
     try:
@@ -55,16 +55,16 @@ def _resolve_libaicad() -> None:
     except Exception:
         pass
     for root in roots:
-        for rel in ("core/build-linux/bin/libaicad.so",
-                    "host/build-linux/bin/libaicad.so",
-                    "core/build-occt-linux/bin/libaicad.so"):
+        for rel in ("core/build-linux/bin/libchudware.so",
+                    "host/build-linux/bin/libchudware.so",
+                    "core/build-occt-linux/bin/libchudware.so"):
             p = root / rel
             if p.exists():
-                os.environ["AI_CAD_LIBAICAD"] = str(p)
+                os.environ["CHUDWARE_LIBCHUDWARE"] = str(p)
                 return
 
 
-_resolve_libaicad()
+_resolve_libchudware()
 
 # ---------------------------------------------------------------------------
 # Backplot palette — dark-theme values from host/src/ui_theme.cpp L90-94 so the

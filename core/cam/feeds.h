@@ -13,7 +13,7 @@
 
 #include "cam/model.h"
 
-namespace aicad {
+namespace chudware {
 namespace cam {
 
 // One material group's machining data. `sfm_*` are baseline surface speeds for a
@@ -88,7 +88,7 @@ Feeds compute_feeds(const Machine&, const Tool&, const Operation&,
 void apply_feeds(Operation&, const Feeds&);
 
 // ──────────────────────────────────────────────────── machine profile DB ──
-// Built-in machine presets (aicad.machines/1) + optional AICAD_MACHINES_REGISTRY
+// Built-in machine presets (aicad.machines/1) + optional CHUDWARE_MACHINES_REGISTRY
 // override file that merges/replaces by id. Wire Machine fields map to the
 // contract JSON shape via machine_record_json / MachineDB::to_json.
 struct MachineRecord {
@@ -117,4 +117,4 @@ private:
 json machine_record_json(const MachineRecord& r);
 
 }  // namespace cam
-}  // namespace aicad
+}  // namespace chudware

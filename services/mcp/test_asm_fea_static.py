@@ -18,7 +18,7 @@ Root cause pair fixed here, witnessed end-to-end on a tiny 2-body doc:
       world position so facesets still resolve).
 
 Kept smoke-priced: two small overlapping boxes, coarse mesh. Skips honestly when the
-staged libaicad lacks the FEA RPCs (same probe idiom as test_fea_live_bridge).
+staged libchudware lacks the FEA RPCs (same probe idiom as test_fea_live_bridge).
 """
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ from mcp_server import core_bridge as cb
 
 pytestmark = pytest.mark.skipif(
     not cb.available(),
-    reason="libaicad not staged; engine-backed MCP tools unavailable",
+    reason="libchudware not staged; engine-backed MCP tools unavailable",
 )
 
 

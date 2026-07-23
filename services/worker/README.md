@@ -1,15 +1,15 @@
-# services/worker — engine routing seam (libaicad vs Python oracle)
+# services/worker — engine routing seam (libchudware vs Python oracle)
 
 The routing seam between the host GUI and the engine: every host→engine call
-funnels through here and is routed to in-process `libaicad` or the Python
+funnels through here and is routed to in-process `libchudware` or the Python
 oracle subprocess (`engine_oracle/` via JSON-RPC). The host compiles these
 sources directly (`host/CMakeLists.txt`).
 
 ## Sources (post-R0b: these four only)
 
-- `worker_client.{h,cpp}` — JSON-RPC to engine_oracle subprocess (+ libaicad routing)
+- `worker_client.{h,cpp}` — JSON-RPC to engine_oracle subprocess (+ libchudware routing)
 - `engine_backend.{h,cpp}` — backend seam: InProcCore vs daemon conn, IPC discovery
-- `cpp_core.{h,cpp}` — in-process libaicad via flat C ABI
+- `cpp_core.{h,cpp}` — in-process libchudware via flat C ABI
 - `worker_router.{h,cpp}` — method/doc routing policy (C++ vs Python)
 
 The stale duplicate copies of the host's live modules (async_rpc, doc_mirror,

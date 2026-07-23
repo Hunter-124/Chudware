@@ -358,10 +358,10 @@
     })();
 
     var Module = {
-      // Cache-bust wasm/data fetches so a browser never pairs a fresh Billet.js with a
-      // stale Billet.wasm/.data (fatal LinkError). __BILLET_VER__ is replaced at stage time
-      // (build.sh); the script-src URLs for Billet.js / coi-serviceworker.js are versioned there too.
-      locateFile: function(path, prefix){ return prefix + path + (/\.(wasm|data)$/.test(path) ? "?v=__BILLET_VER__" : ""); },
+      // Cache-bust wasm/data fetches so a browser never pairs a fresh Chudware.js with a
+      // stale Chudware.wasm/.data (fatal LinkError). __CHUDWARE_VER__ is replaced at stage time
+      // (build.sh); the script-src URLs for Chudware.js / coi-serviceworker.js are versioned there too.
+      locateFile: function(path, prefix){ return prefix + path + (/\.(wasm|data)$/.test(path) ? "?v=__CHUDWARE_VER__" : ""); },
       canvas: (function() {
         var c = document.getElementById('canvas');
         // Size the drawing buffer to CSS × DPR before first GL frame.

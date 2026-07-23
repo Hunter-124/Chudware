@@ -10,7 +10,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad::firmware {
+namespace chudware::firmware {
 
 // A named signal net that encodes no physical pin gets a deterministic logical
 // index offset by this base (mirrors mcu_pinouts.LOGICAL_PIN_BASE).
@@ -47,4 +47,4 @@ bool is_input_only_pin(const std::string& net_name, const std::string& mcu_famil
 std::optional<int> resolve_pin(const std::string& net_name,
                                const std::string& mcu_family = "");
 
-}  // namespace aicad::firmware
+}  // namespace chudware::firmware

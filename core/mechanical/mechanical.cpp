@@ -6,7 +6,7 @@
 #include <cctype>
 #include <cmath>
 
-namespace aicad {
+namespace chudware {
 namespace mechanical {
 
 const char* const kDisclaimer =
@@ -163,4 +163,4 @@ bool call(const std::string& method, const json& params, json& result, std::stri
 }
 
 }  // namespace mechanical
-}  // namespace aicad
+}  // namespace chudware

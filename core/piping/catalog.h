@@ -13,7 +13,7 @@
 
 #include "piping/pyutil.h"
 
-namespace aicad::piping {
+namespace chudware::piping {
 
 using pyutil::ojson;
 
@@ -30,4 +30,4 @@ ojson fitting_dims(const std::string& ftype, double nps, const ojson& nps2 = nul
 // Sorted NPS list catalogued for ftype (empty if none).
 std::vector<double> available_sizes(const std::string& ftype);
 
-}  // namespace aicad::piping
+}  // namespace chudware::piping

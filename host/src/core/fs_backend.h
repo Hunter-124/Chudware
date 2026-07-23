@@ -14,7 +14,7 @@
 #include <string>
 #include <vector>
 
-namespace billet {
+namespace chudware {
 
 struct FsEntry {
     std::string name;
@@ -54,7 +54,7 @@ public:
     // Stat a path. exists=false is not an error (err stays empty).
     virtual FsStat stat(const std::string& path, std::string& err) = 0;
 
-    // Workspace root. Desktop: Documents/AI-CAD or Documents/Billet.
+    // Workspace root. Desktop: Documents/Chudware or Documents/Chudware.
     // Web: server abs workspace root (from gateway list).
     virtual std::string defaultRoot() = 0;
 
@@ -101,4 +101,4 @@ std::string fsUpload(const std::string& dir, const std::string& filename,
 // Trigger a browser download of a server workspace path (GET /workspace/download).
 void fsTriggerDownload(const std::string& path);
 
-}  // namespace billet
+}  // namespace chudware

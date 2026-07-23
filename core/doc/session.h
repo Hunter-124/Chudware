@@ -27,11 +27,11 @@
 
 #include "geom/aicm.h"  // aicm::AicmBody (doc_tessellate_bodies)
 
-namespace aicad::doc {
+namespace chudware::doc {
 
 // A contract violation (mirrors engine.doc.ops.OpError) -> the host's structured
 // error envelope {code, message, detail}. Thrown across doc_* and converted at the
-// libaicad boundary into a nonzero return carrying that envelope.
+// libchudware boundary into a nonzero return carrying that envelope.
 struct OpError : std::runtime_error {
     std::string code;
     nlohmann::json detail;
@@ -52,7 +52,7 @@ struct OpError : std::runtime_error {
 // re-locks the still-held non-recursive mutex => std::system_error EDEADLK
 // ("resource deadlock would occur"), bricking that document until restart.
 //
-// The libaicad C dispatch boundary catches such a structured exception with an
+// The libchudware C dispatch boundary catches such a structured exception with an
 // __except filter and calls this to drop the orphaned lock(s) BEFORE returning
 // the error, so the thread can serve the next call cleanly. Idempotent and safe
 // to call when no lock is held by this thread. Returns true if it released any.
@@ -196,7 +196,7 @@ nlohmann::json doc_push_pull(const std::string& doc_id, int body_id, int topo_id
 // doc_export_step: write the surviving solid bodies to `path` for the mesher. The
 // format follows the extension (.stl -> binary STL, else STEP/AP214). Single body
 // exports as-is; multiple bodies combine into a compound. Returns {"path": <abs>}.
-// Empty or relative `path` → server temp under <tmp>/aicad_cpp_docs/export_<doc>_<ts>.ext
+// Empty or relative `path` → server temp under <tmp>/chudware_cpp_docs/export_<doc>_<ts>.ext
 // (absolute paths are honored unchanged). Throws OpError("export_failed", ...) on empty.
 nlohmann::json doc_export_step(const std::string& doc_id, const std::string& path);
 
@@ -428,7 +428,7 @@ nlohmann::json doc_import_file(const std::string& path, const std::string& into,
                                bool as_solid, const std::string& fmt);
 
 // Insert a registered supplier/vendor CAD part as an `import` feature. Reads the Python-written
-// vendor registry index (%APPDATA%/AI-CAD/vendor_parts/index.json), resolves the cached CAD path +
+// vendor registry index (%APPDATA%/Chudware/vendor_parts/index.json), resolves the cached CAD path +
 // metadata for slug(supplier)::slug(part_number), and applies an import op carrying the vendor_*
 // params. `into` empty -> mint a new part doc. Port of engine/vendor_parts.py::_vendor_part_insert.
 nlohmann::json doc_vendor_part_insert(const std::string& into, const std::string& supplier,
@@ -463,7 +463,7 @@ nlohmann::json doc_open(const std::string& path, bool as_solid = false,
                         bool detach_path = false);
 
 // C18 interactive sketch mode — port of engine/doc/session.py sketch_* (warm-started
-// over aicad::sketch::solve_sketch). One sketch is "entered" at a time (active_sketch
+// over chudware::sketch::solve_sketch). One sketch is "entered" at a time (active_sketch
 // on the session). enter/solve/drag/drag_commit/exit/overview/regions/probe.
 //
 // sketch_enter: resolve plane, cold-solve, store warm state -> {entities, statuses,
@@ -577,7 +577,7 @@ nlohmann::json doc_sketch_project_entities(const std::string& doc_id,
 // doc_dep_notify: internal — called automatically after every successful rebuild
 //   (doc_apply_ops, doc_undo, doc_redo). Stamps every registered dependent with a
 //   stale flag so the next doc_dep_query shows it. Returns {"notified": count}.
-//   Exposed here for testing and for the libaicad C ABI (cam_panel calls it
+//   Exposed here for testing and for the libchudware C ABI (cam_panel calls it
 //   indirectly via the pull-model doc_list_open polling, but explicit notify gives
 //   sub-frame latency for in-process callers).
 nlohmann::json doc_dep_register(const std::string& source_doc_id,
@@ -637,4 +637,4 @@ void set_current_rpc_method(const char* method);
 // the counters and restarts the window — call it right before a measured run.
 nlohmann::json contention_report(bool reset);
 
-}  // namespace aicad::doc
+}  // namespace chudware::doc

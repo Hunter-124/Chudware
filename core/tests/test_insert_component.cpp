@@ -18,11 +18,11 @@
 
 using nlohmann::json;
 namespace fs = std::filesystem;
-namespace doc = aicad::doc;
+namespace doc = chudware::doc;
 
 namespace {
 fs::path tmp(const std::string& name) {
-    return fs::temp_directory_path() / ("aicad_asmins_" + name);
+    return fs::temp_directory_path() / ("chudware_asmins_" + name);
 }
 }  // namespace
 

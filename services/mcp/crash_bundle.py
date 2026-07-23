@@ -1,7 +1,7 @@
 """Crash-bundle writer and consent-gated diagnostics dispatch.
 
 On an unhandled exception or fatal signal, we write a local crash bundle
-(JSON sidecar) into <appdata>/AI-CAD/crashes/ and – ONLY at consent
+(JSON sidecar) into <appdata>/Chudware/crashes/ and – ONLY at consent
 tier "full" – invoke an upload dispatch hook so diagnostics can be sent to
 the team.  Default consent is "off" (no data leaves the machine).
 
@@ -34,10 +34,10 @@ log = logging.getLogger(__name__)
 def _crash_dir() -> Path:
     """Return (and create) the directory where crash bundles are written.
 
-    Override with AI_CAD_CRASH_DIR for tests.  Falls through to the same
+    Override with CHUDWARE_CRASH_DIR for tests.  Falls through to the same
     XDG-aware appdata root that autosave uses so everything stays together.
     """
-    override = os.environ.get("AI_CAD_CRASH_DIR")
+    override = os.environ.get("CHUDWARE_CRASH_DIR")
     if override:
         d = Path(override)
     else:
@@ -45,7 +45,7 @@ def _crash_dir() -> Path:
             from services import paths as _paths
             d = _paths.ROOT / "crashes"  # alias-aware root, not the always-new dir
         except Exception:
-            d = Path(os.environ.get("APPDATA") or "/tmp") / "AI-CAD" / "crashes"
+            d = Path(os.environ.get("APPDATA") or "/tmp") / "Chudware" / "crashes"
     d.mkdir(parents=True, exist_ok=True)
     return d
 

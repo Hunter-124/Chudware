@@ -32,7 +32,7 @@
       "inputs": {
         "request": "Run focused simsuite quick/domain baselines and phase profiling. Record cold/warm mesh, setup, assemble, analyze, factorize, solve, recovery, overlay, LBM loop, wall time, peak memory, thread count, and accuracy against the 2026-07-13T012422Z 91-case baseline.",
         "commands": [
-          "AI_CAD_ENGINE_DAEMON=0 .venv-mcp/bin/python benchmarks/simsuite/run_all.py --quick --only fea_static,fea_modal_freq,fea_thermal,cfd,profiler",
+          "CHUDWARE_ENGINE_DAEMON=0 .venv-mcp/bin/python benchmarks/simsuite/run_all.py --quick --only fea_static,fea_modal_freq,fea_thermal,cfd,profiler",
           "engine_profile(action=reset_phases)",
           "engine_profile(action=phases)"
         ]

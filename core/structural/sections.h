@@ -13,7 +13,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad::structural {
+namespace chudware::structural {
 
 struct AiscShape {
     const char* name;  // designation, uppercase, no spaces (e.g. "W8X31")
@@ -35,4 +35,4 @@ std::optional<nlohmann::json> get_aisc_section(const std::string& name);
 // or std::nullopt when the nominal size is not in the table.
 std::optional<nlohmann::json> get_lumber_section(const std::string& nominal);
 
-}  // namespace aicad::structural
+}  // namespace chudware::structural

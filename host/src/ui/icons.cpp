@@ -1,4 +1,4 @@
-// AI-CAD icon loader — C14.
+// Chudware icon loader — C14.
 // Uses stb_image (already vendored via stb_impl.cpp).  nlohmann/json for atlas.json.
 // GOTCHA: never add host/src to the include path; use relative includes.
 #include "icons.h"

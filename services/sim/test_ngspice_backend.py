@@ -3,7 +3,7 @@
 Contract under test:
   * backend='mna' (default) is untouched and identical to the pre-seam behaviour.
   * When ngspice is ABSENT: backend='ngspice' degrades HONESTLY to mna with a
-    backend_note; nothing raises. (Forced via AI_CAD_NGSPICE=<bogus> so this gate
+    backend_note; nothing raises. (Forced via CHUDWARE_NGSPICE=<bogus> so this gate
     always runs.)
   * When ngspice is PRESENT: RC filter + resistor divider produce identical
     (within tolerance) results across backends for op/dc/tran/ac/tf, and a vendor
@@ -88,8 +88,8 @@ def _interp_mag(x_f: list, mag: list, f: float) -> float:
 # =============================================================================
 
 def test_degrade_without_ngspice() -> None:
-    old = os.environ.get("AI_CAD_NGSPICE")
-    os.environ["AI_CAD_NGSPICE"] = "/nonexistent/ngspice-not-here"
+    old = os.environ.get("CHUDWARE_NGSPICE")
+    os.environ["CHUDWARE_NGSPICE"] = "/nonexistent/ngspice-not-here"
     try:
         assert not ng.ngspice_available()
         st = ng.ngspice_status()
@@ -107,9 +107,9 @@ def test_degrade_without_ngspice() -> None:
         print("degrade: backend='ngspice' honestly fell back to mna with a note  OK")
     finally:
         if old is None:
-            os.environ.pop("AI_CAD_NGSPICE", None)
+            os.environ.pop("CHUDWARE_NGSPICE", None)
         else:
-            os.environ["AI_CAD_NGSPICE"] = old
+            os.environ["CHUDWARE_NGSPICE"] = old
 
 
 # =============================================================================
@@ -210,7 +210,7 @@ def test_vendor_opamp_demo() -> None:
         "Eout out 0 inp inn 100k\n"
         ".ends DEMO_OPAMP\n"
     )
-    with tempfile.TemporaryDirectory(prefix="aicad-ngtest-") as td:
+    with tempfile.TemporaryDirectory(prefix="chudware-ngtest-") as td:
         libp = os.path.join(td, "demo_opamp.lib")
         with open(libp, "w", encoding="utf-8") as f:
             f.write(lib_text)

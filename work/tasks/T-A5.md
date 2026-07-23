@@ -21,7 +21,7 @@ Day 5 is integration: run the sprint demo mission ("battery-powered soil-moistur
 - `services/dag/` — bug fixes throughout
 - `services/agent/prompts/dag_planner.md` — tune the demo mission graph
 - `contracts/dag_schema.md` — read-only reference; any needed changes require workstream consensus
-- Demo run artifacts written to `%APPDATA%/AI-CAD/runs/demo_<timestamp>/`
+- Demo run artifacts written to `%APPDATA%/Chudware/runs/demo_<timestamp>/`
 
 ## Steps
 

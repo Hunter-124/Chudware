@@ -13,7 +13,7 @@ kind: new
 
 ## Context
 
-Day 1 for the DAG orchestrator covers two separable deliverables: (AM) freezing the contract that all workstreams depend on, and (PM) standing up the LangGraph executor scaffold. The contract (`contracts/dag_schema.md`) defines node types, the node execution contract (inputs/tools/end_condition/verify/on_fail/autonomy), checkpoint format, and run states. The scaffold in `services/dag/` wires LangGraph + `langgraph-checkpoint-sqlite` and can load a graph JSON and persist run state to `%APPDATA%/AI-CAD/runs/`.
+Day 1 for the DAG orchestrator covers two separable deliverables: (AM) freezing the contract that all workstreams depend on, and (PM) standing up the LangGraph executor scaffold. The contract (`contracts/dag_schema.md`) defines node types, the node execution contract (inputs/tools/end_condition/verify/on_fail/autonomy), checkpoint format, and run states. The scaffold in `services/dag/` wires LangGraph + `langgraph-checkpoint-sqlite` and can load a graph JSON and persist run state to `%APPDATA%/Chudware/runs/`.
 
 ## Files / areas touched
 
@@ -29,7 +29,7 @@ Day 1 for the DAG orchestrator covers two separable deliverables: (AM) freezing 
 3. Get review sign-off from B/C/D — this contract is frozen after today.
 4. Create `services/dag/` Python package; install `langgraph` and `langgraph-checkpoint-sqlite` into `.venv-mcp`.
 5. Implement `graph_loader.py`: load a graph JSON (nodes + edges) into a LangGraph `StateGraph`.
-6. Implement `executor.py`: run the loaded graph, persist checkpoints to `%APPDATA%/AI-CAD/runs/<run_id>.db`; expose a minimal `run(graph_json, initial_state)` function.
+6. Implement `executor.py`: run the loaded graph, persist checkpoints to `%APPDATA%/Chudware/runs/<run_id>.db`; expose a minimal `run(graph_json, initial_state)` function.
 7. Write a smoke-test: create a two-node graph (plan → report), run it, assert checkpoint file created.
 
 ## Definition of done

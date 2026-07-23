@@ -2,7 +2,7 @@
 
 Renode is MIT-licensed and driven as a **subprocess only** (never linked / vendored
 into the C++ core — contracts/licenses.md). Discovery is PATH-first; known install
-roots and ``AICAD_RENODE`` / ``RENODE_ROOT`` are also accepted.
+roots and ``CHUDWARE_RENODE`` / ``RENODE_ROOT`` are also accepted.
 
 Usage:
     python -m tools.provision_renode            # report what's detected
@@ -10,13 +10,13 @@ Usage:
 
 Install layout (``--install``, user-space, no sudo):
     Linux:   ~/.local/opt/renode  + symlink ~/.local/bin/renode
-             (also mirrored under ~/.local/share/AI-CAD/renode for legacy docs)
+             (also mirrored under ~/.local/share/Chudware/renode for legacy docs)
     macOS:   ~/.local/opt/renode  + symlink ~/.local/bin/renode
     Windows: %LOCALAPPDATA%\\Programs\\renode  (portable zip) — put renode.exe on PATH
 
 Manual options (all auto-detected afterwards):
     * unpack a Renode portable tarball/zip anywhere and put ``renode`` on PATH
-    * set AICAD_RENODE or RENODE_ROOT to the install root (dir containing the binary)
+    * set CHUDWARE_RENODE or RENODE_ROOT to the install root (dir containing the binary)
 """
 
 from __future__ import annotations
@@ -37,20 +37,20 @@ from pathlib import Path
 from typing import Optional
 
 GITHUB_API = "https://api.github.com/repos/renode/renode/releases/latest"
-GITHUB_UA = "billet-provision-renode/1.0"
+GITHUB_UA = "chudware-provision-renode/1.0"
 
 # Well-known roots probed when PATH does not have `renode`.
 _KNOWN_ROOTS_POSIX = (
     Path.home() / ".local" / "opt" / "renode",
-    Path.home() / ".local" / "share" / "AI-CAD" / "renode",
-    Path.home() / ".local" / "share" / "Billet" / "renode",
+    Path.home() / ".local" / "share" / "Chudware" / "renode",
+    Path.home() / ".local" / "share" / "Chudware" / "renode",
     Path("/opt/renode"),
     Path("/usr/local/opt/renode"),
 )
 _KNOWN_ROOTS_WIN = (
     Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "renode",
-    Path(os.environ.get("APPDATA", "")) / "AI-CAD" / "renode",
-    Path(os.environ.get("APPDATA", "")) / "Billet" / "renode",
+    Path(os.environ.get("APPDATA", "")) / "Chudware" / "renode",
+    Path(os.environ.get("APPDATA", "")) / "Chudware" / "renode",
     Path("C:/Program Files/Renode"),
     Path("C:/renode"),
 )
@@ -59,7 +59,7 @@ _BINARY_NAMES = ("renode.exe", "renode") if os.name == "nt" else ("renode",)
 
 
 def _env_root() -> Optional[Path]:
-    for key in ("AICAD_RENODE", "RENODE_ROOT"):
+    for key in ("CHUDWARE_RENODE", "RENODE_ROOT"):
         raw = os.environ.get(key)
         if raw:
             p = Path(os.path.expanduser(os.path.expandvars(raw)))
@@ -353,7 +353,7 @@ def install() -> bool:
 
     # Legacy mirror path used by older demo docs.
     if os.name != "nt":
-        legacy = Path.home() / ".local" / "share" / "AI-CAD" / "renode"
+        legacy = Path.home() / ".local" / "share" / "Chudware" / "renode"
         try:
             if not legacy.exists():
                 legacy.parent.mkdir(parents=True, exist_ok=True)
@@ -380,11 +380,11 @@ def report() -> int:
     if os.name == "posix":
         print("            Run with --install for a user-space portable tarball (no sudo),")
         print("            or unpack a release under ~/.local/opt/renode and put renode on PATH,")
-        print("            or set AICAD_RENODE to an install root.")
+        print("            or set CHUDWARE_RENODE to an install root.")
     else:
         print("            Run with --install for the Windows portable zip,")
         print("            or install from https://renode.io/#downloads and put renode.exe on PATH,")
-        print("            or set %AICAD_RENODE% to the install root.")
+        print("            or set %CHUDWARE_RENODE% to the install root.")
     print(f"            hint: {st['hint']}")
     return 1
 

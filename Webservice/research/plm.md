@@ -1,6 +1,6 @@
 # PLM Multi-User Research Report
 
-**Scope:** Map `services/plm/` + contracts for shared multi-user use across N containerized Billet sessions. Read-only. Non-goals: GUI panels, doc schema internals.
+**Scope:** Map `services/plm/` + contracts for shared multi-user use across N containerized Chudware sessions. Read-only. Non-goals: GUI panels, doc schema internals.
 
 ---
 
@@ -36,8 +36,8 @@
 ## 2. Remote / sync protocol
 
 ### Contract (specified, not implemented)
-- Remote profiles in `manifest.remotes[]`: kinds `folder | ssh | https | aicad-cloud` (`plm.md:242-259`, `manifest.py:29,51-52`).
-- `aicad-cloud` reserved: tools must return `reserved_remote` (`plm.md:253-259`).
+- Remote profiles in `manifest.remotes[]`: kinds `folder | ssh | https | chudware-cloud` (`plm.md:242-259`, `manifest.py:29,51-52`).
+- `chudware-cloud` reserved: tools must return `reserved_remote` (`plm.md:253-259`).
 - Sync = fetch + linear replay of unpublished local commits + push with expected-old CAS; same-item collision → copy-as-new-item (`plm.md:280-310`).
 - Locks: blob under `refs/aicad/locks` (`lock_ref` in manifest), CAS push (`plm.md:271-288`).
 - Tools: `plm_add_remote`, `plm_sync`, `plm_lock`, `plm_unlock` (**T-R7**) (`plm.md:339-342`).
@@ -81,7 +81,7 @@
 - `remote.py`, `locks.py`, `conflict.py` NEW
 - Identity = per-machine display name (OS user prefill); reserve account-id
 - Two lock modes: (a) dumb remote soft chip + override; (b) leave transport seam for T-R8 live
-- DoD: two checkouts via bare SSH + folder remote; CAS lock races; aicad-cloud refuse
+- DoD: two checkouts via bare SSH + folder remote; CAS lock races; chudware-cloud refuse
 
 ### T-R8 planned deliverables (unbuilt)
 - `aicad.plm-live/1`: join/leave, authoritative op relay, presence, snapshot catch-up
@@ -115,7 +115,7 @@
 
 ## 6. N containers sharing one project bind-mount — what breaks
 
-Assume N Billet session containers all bind-mount the **same** project directory (working files + `.aicadvault`).
+Assume N Chudware session containers all bind-mount the **same** project directory (working files + `.aicadvault`).
 
 | Hazard | Why |
 |---|---|
@@ -135,7 +135,7 @@ Assume N Billet session containers all bind-mount the **same** project directory
 
 ### Central bare + per-session clones (fits contract better)
 Yes — this **is** the T-R7 design:
-- Host: bare repo (or folder remote) at e.g. `/var/billet/plm/<project>.git` (or shared `folder` kind path).
+- Host: bare repo (or folder remote) at e.g. `/var/chudware/plm/<project>.git` (or shared `folder` kind path).
 - Each session container: private clone/worktree of project + private `.aicadvault`.
 - Session mutates only its clone; `plm_sync` push/pull with CAS + copy-as-new-item.
 - Advisory locks on remote `refs/aicad/locks` for dumb remotes; T-R8 live server later for same-doc co-edit.

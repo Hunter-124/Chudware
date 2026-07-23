@@ -10,19 +10,19 @@
 
 #include <cmath>
 
-using aicad::solver::System;
+using chudware::solver::System;
 
 namespace {
 
 // Residual/Jacobian for "x_i - target" (a fix / dimension on a single var).
-aicad::solver::ResidualFunc fix_r(double target) {
+chudware::solver::ResidualFunc fix_r(double target) {
     return [target](const Eigen::VectorXd& xs) {
         Eigen::VectorXd r(1);
         r(0) = xs(0) - target;
         return r;
     };
 }
-aicad::solver::JacobianFunc fix_j() {
+chudware::solver::JacobianFunc fix_j() {
     return [](const Eigen::VectorXd&) {
         Eigen::MatrixXd j(1, 1);
         j(0, 0) = 1.0;

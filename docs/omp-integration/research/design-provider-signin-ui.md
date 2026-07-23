@@ -1,4 +1,4 @@
-# CAD (Billet) — LLM Provider Sign-In, Model Management & Cost UI
+# CAD (Chudware) — LLM Provider Sign-In, Model Management & Cost UI
 
 Design spec (read-only). Reuses OMP's provider/auth stack (`scratch/omp-src`, pinned `6ae7cdb`)
 via the proposed bun bridge sidecar (`docs/omp-integration/00-OPTIONS-AND-DECISIONS.md:189-197`
@@ -390,4 +390,4 @@ parity is structural, not a second implementation:
 | In-app CEF OAuth modal (multi-account, isolation) | host/src/ui/oauth_capture.h:1-105 |
 | Web parity gate + T-RF12 sign-in gating | contracts/web_parity.md:1-33; settings_modal.cpp:32 |
 | Existing Python auth RPC family (P0-P2 migration source) | services/agent/worker_rpc.py:47-280 |
-| Native provider resolution seam | core/agent/config.cpp `resolve_provider`; core/api/libaicad.cpp:1330,1339 |
+| Native provider resolution seam | core/agent/config.cpp `resolve_provider`; core/api/libchudware.cpp:1330,1339 |

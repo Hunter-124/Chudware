@@ -1,4 +1,4 @@
-"""billet-web gateway — portal, sessions, stream proxy, chat, transfer."""
+"""chudware-web gateway — portal, sessions, stream proxy, chat, transfer."""
 
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ except ImportError:  # uvicorn app:app from package dir
     from sessions import SessionBusy, PodmanError, manager, mem_available_bytes, mem_available_gib
     from chat import Presence, presence, router as chat_router  # noqa: F401
 
-log = logging.getLogger("billet-web")
+log = logging.getLogger("chudware-web")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -65,7 +65,7 @@ except ImportError:
 settings.ensure_data_dirs()  # users_file must exist before the directory loads
 user_directory = UserDirectory(settings.users_file)
 
-app = FastAPI(title="billet-web", version="1.0.0")
+app = FastAPI(title="chudware-web", version="1.0.0")
 app.add_middleware(AuthMiddleware, directory=user_directory)
 
 
@@ -105,7 +105,7 @@ async def _sync_access_policy() -> dict[str, Any]:
     Best-effort: a CF failure must not lose the local allowlist edit.
     """
     script = Path(__file__).resolve().parents[1] / "deploy" / "cf_provision.py"
-    env = dict(os.environ, BILLET_WEB_USERS_FILE=str(settings.users_file))
+    env = dict(os.environ, CHUDWARE_WEB_USERS_FILE=str(settings.users_file))
     proc = await asyncio.create_subprocess_exec(
         sys.executable, str(script), "--sync-users",
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=env,
@@ -258,7 +258,7 @@ def _gpu_info() -> dict[str, Any] | None:
         return None
 
 
-_OPS_UNITS = ("billet-cloudflared.service", "billet-monitor.timer", "billet-backup.timer")
+_OPS_UNITS = ("chudware-cloudflared.service", "chudware-monitor.timer", "chudware-backup.timer")
 
 
 def _unit_health() -> dict[str, str]:
@@ -270,7 +270,7 @@ def _unit_health() -> dict[str, str]:
         ).stdout.splitlines()
     except (OSError, subprocess.TimeoutExpired):
         return {}
-    return {u.removeprefix("billet-").split(".")[0]: (s.strip() or "unknown")
+    return {u.removeprefix("chudware-").split(".")[0]: (s.strip() or "unknown")
             for u, s in zip(_OPS_UNITS, out)}
 
 
@@ -391,7 +391,7 @@ async def admin_logs(request: Request, lines: int = 200) -> PlainTextResponse:
     lines = max(10, min(int(lines), 2000))
     try:
         out = subprocess.run(
-            ["journalctl", "--user", "-u", "billet-gateway", "-n", str(lines),
+            ["journalctl", "--user", "-u", "chudware-gateway", "-n", str(lines),
              "--no-pager", "-o", "short-iso"],
             capture_output=True, text=True, timeout=10,
         ).stdout

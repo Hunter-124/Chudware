@@ -1,7 +1,7 @@
 // ui::CefWebView — in-process CEF off-screen browser backend (IWebViewBackend).
 //
 // SCAFFOLDING for phase 2 of docs/cef_webview.md. Compiled ONLY when the build
-// is configured with AI_CAD_ENABLE_CEF (host/cmake/cef.cmake); the default build
+// is configured with CHUDWARE_ENABLE_CEF (host/cmake/cef.cmake); the default build
 // never sees this header. Not yet verified against a live CEF SDK — the OSR
 // paint/input/cookie bodies in cef_web_view.cpp carry TODO(cef) markers where a
 // real build/verify loop is required.

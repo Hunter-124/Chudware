@@ -20,8 +20,8 @@ Usage:
 Manual options (all detected automatically afterwards):
     Linux:   micromamba create -n openfoam -c conda-forge openfoam -y
              or unpack an openfoam.com tarball under ~/OpenFOAM/ (etc/bashrc detected),
-             or set AICAD_OPENFOAM to the install root.  No sudo required.
-    Windows: install blueCFD-Core (https://bluecfd.github.io/) and set %AICAD_OPENFOAM%,
+             or set CHUDWARE_OPENFOAM to the install root.  No sudo required.
+    Windows: install blueCFD-Core (https://bluecfd.github.io/) and set %CHUDWARE_OPENFOAM%,
              or copy it to third_party/openfoam/ in this repo.
 """
 
@@ -104,11 +104,11 @@ def report() -> int:
             print("[provision] No OpenFOAM detected on this Linux host.")
             print("            Run with --install for a user-space conda-forge env (no sudo),")
             print("            or unpack an openfoam.com tarball under ~/OpenFOAM/,")
-            print("            or set AICAD_OPENFOAM to an install root.")
+            print("            or set CHUDWARE_OPENFOAM to an install root.")
         else:
             print("[provision] No OpenFOAM detected (neither native Windows nor WSL).")
             print("            Run with --install to apt-install into WSL, or install blueCFD-Core")
-            print("            natively and set %AICAD_OPENFOAM% / drop it in third_party/openfoam/.")
+            print("            natively and set %CHUDWARE_OPENFOAM% / drop it in third_party/openfoam/.")
         return 1
     print(f"[provision] OpenFOAM detected: kind={r.kind}  version={r.version()}")
     return 0

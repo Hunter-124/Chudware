@@ -53,5 +53,5 @@ Files delivered:
 - application.cpp — panel wiring appended after requirements panel
 
 Erik-ratified rules honoured: consent default OFF, offline forces OFF, canary default OFF, no auto-promotion, serving_promote never wired.
-Screenshot AI_CAD_SHOT=transparency: panel renders fixture (PNG verified visually).
+Screenshot CHUDWARE_SHOT=transparency: panel renders fixture (PNG verified visually).
 ui_style_check: 0 findings. gate.sh: PASS.

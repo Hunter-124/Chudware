@@ -9,7 +9,7 @@ imports Playwright directly:
   (:mod:`services.browser.profiles`) and is LOCAL ONLY — never synced, never
   uploaded, never read by this module into logs or metadata.
 - :func:`browser_fetch` — loads a URL HEADLESS under the user's saved session
-  in our OWN CEF Chromium (:mod:`.cef_client` → the ``AI-CAD --cef-daemon``
+  in our OWN CEF Chromium (:mod:`.cef_client` → the ``Chudware --cef-daemon``
   host), rate-limited per site (:mod:`services.browser.ratelimit`). Returns
   rendered HTML. Driving CEF through its native C++ API leaves no CDP
   ``Runtime.enable`` handshake, so the automation-protocol fingerprint that bot
@@ -81,7 +81,7 @@ def _apply_staged_cookies(context: Any, site: str) -> None:
 def _import_sync_playwright() -> Callable[[], Any]:
     """Resolve residual sync Playwright factory via :mod:`.driver`.
 
-    Default ``BILLET_PW_BACKEND=cef`` keeps stock ``playwright`` (byte-identical
+    Default ``CHUDWARE_PW_BACKEND=cef`` keeps stock ``playwright`` (byte-identical
     to the pre-factory import). ``patchright`` / ``camoufox`` selected via env.
     """
     from . import driver as _driver

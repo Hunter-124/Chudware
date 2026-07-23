@@ -1,4 +1,4 @@
-// Interwebz-style chrome widgets — clean-room Billet port (Liquid Glass v2 tokens).
+// Interwebz-style chrome widgets — clean-room Chudware port (Liquid Glass v2 tokens).
 // Metrics inspired by hub-menu density; geometry rewritten against ui::palette / uiScale.
 // Zero global ImGui style mutation; zero hardcoded RGB outside palette helpers.
 #include "interwebz.h"

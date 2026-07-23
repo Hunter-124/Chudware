@@ -18,15 +18,15 @@ from services.agent import skills as sk
 @pytest.fixture()
 def skill_roots(tmp_path, monkeypatch):
     """Isolate project/user/builtin roots under tmp_path."""
-    project = tmp_path / "proj" / ".billet" / "skills"
+    project = tmp_path / "proj" / ".chudware" / "skills"
     user = tmp_path / "user_skills"
     builtin = tmp_path / "builtin"
     project.mkdir(parents=True)
     user.mkdir(parents=True)
     builtin.mkdir(parents=True)
-    monkeypatch.setenv("AICAD_SKILLS_PROJECT_DIR", str(project))
-    monkeypatch.setenv("AICAD_SKILLS_USER_DIR", str(user))
-    monkeypatch.setenv("AICAD_SKILLS_BUILTIN_DIR", str(builtin))
+    monkeypatch.setenv("CHUDWARE_SKILLS_PROJECT_DIR", str(project))
+    monkeypatch.setenv("CHUDWARE_SKILLS_USER_DIR", str(user))
+    monkeypatch.setenv("CHUDWARE_SKILLS_BUILTIN_DIR", str(builtin))
     sk.clear_cache()
     sk.reset_session()
     yield {"project": project, "user": user, "builtin": builtin}
@@ -68,7 +68,7 @@ def test_discover_builtins_from_repo():
     """Without env overrides, the real builtin set has the v1 + domain skills."""
     # Clear any test overrides from other tests in-process.
     import os
-    for k in ("AICAD_SKILLS_PROJECT_DIR", "AICAD_SKILLS_USER_DIR", "AICAD_SKILLS_BUILTIN_DIR"):
+    for k in ("CHUDWARE_SKILLS_PROJECT_DIR", "CHUDWARE_SKILLS_USER_DIR", "CHUDWARE_SKILLS_BUILTIN_DIR"):
         os.environ.pop(k, None)
     sk.clear_cache()
     skills = sk.discover_skills(force=True)
@@ -264,7 +264,7 @@ def test_save_and_delete_user_skill(skill_roots):
 def test_skills_rpc_list_nine_builtins():
     """RPC list returns the v1 + domain builtins when no overrides hide them."""
     import os
-    for k in ("AICAD_SKILLS_PROJECT_DIR", "AICAD_SKILLS_USER_DIR", "AICAD_SKILLS_BUILTIN_DIR"):
+    for k in ("CHUDWARE_SKILLS_PROJECT_DIR", "CHUDWARE_SKILLS_USER_DIR", "CHUDWARE_SKILLS_BUILTIN_DIR"):
         os.environ.pop(k, None)
     sk.clear_cache()
     from services.agent.worker_rpc import SKILLS_METHODS

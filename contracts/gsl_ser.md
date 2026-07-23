@@ -18,7 +18,7 @@ the numbers the deterministic describers already produce — it never recomputes
 *state* the learned layer narrates. It is produced from a **state dict** — the
 `_digest`-shaped payload (`services/mcp/gsl_tools.py:_digest`) extended with optional
 `sketch` / `cam` / `fea` / `ecad` sections — so it is engine-free and runs in CI with
-no `libaicad`. It is NOT a replacement for the human-facing narration in
+no `libchudware`. It is NOT a replacement for the human-facing narration in
 `contracts/narration.md`; it is the machine-parseable envelope the translator and the
 eval harness round-trip.
 

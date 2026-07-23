@@ -1,4 +1,4 @@
-// sketch_cli — tiny CLI wrapper around aicad::sketch::solve_sketch for the
+// sketch_cli — tiny CLI wrapper around chudware::sketch::solve_sketch for the
 // differential-test harness (tools/solver_diff.py).
 //
 // Usage:
@@ -81,7 +81,7 @@ int main(int argc, char** argv) {
         const json entity_coords = input.value("entity_coords", json::object());
         std::optional<double> v;
         try {
-            v = aicad::sketch::measure_constraint(constraint, entity_coords);
+            v = chudware::sketch::measure_constraint(constraint, entity_coords);
         } catch (const std::exception& e) {
             return fail(std::string("measure_constraint threw: ") + e.what());
         }
@@ -103,12 +103,12 @@ int main(int argc, char** argv) {
         const json after = input.contains("after") ? input["after"] : base;
         try {
             // 1) cold-solve the base sketch (no warm).
-            auto cold0 = aicad::sketch::solve_sketch(base, env);
+            auto cold0 = chudware::sketch::solve_sketch(base, env);
             // 2) cold-solve `after` standalone (the reference answer).
-            auto cold_after = aicad::sketch::solve_sketch(after, env);
+            auto cold_after = chudware::sketch::solve_sketch(after, env);
             // 3) warm-solve `after` from the base state.
-            auto warm = aicad::sketch::solve_sketch(after, env, cold0.state);
-            auto decision = aicad::sketch::warm_gate_decision(after, cold0.state);
+            auto warm = chudware::sketch::solve_sketch(after, env, cold0.state);
+            auto decision = chudware::sketch::warm_gate_decision(after, cold0.state);
 
             json out;
             out["warm"] = {{"entities", warm.entities}, {"converged", warm.converged}};
@@ -127,9 +127,9 @@ int main(int argc, char** argv) {
     const json sketch = input.value("sketch", json::object());
     const json env = input.value("env", json::object());
 
-    aicad::sketch::SketchSolution sol;
+    chudware::sketch::SketchSolution sol;
     try {
-        sol = aicad::sketch::solve_sketch(sketch, env);
+        sol = chudware::sketch::solve_sketch(sketch, env);
     } catch (const std::exception& e) {
         return fail(std::string("solve_sketch threw: ") + e.what());
     }

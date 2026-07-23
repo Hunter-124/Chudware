@@ -5,7 +5,7 @@ list + suggestion/error text in lockstep for:
 
   * offline unit tests
   * MCP / agent surfaces that prefer a pure-Python import
-  * parity checks against ``doc_list_ops`` when libaicad is loaded
+  * parity checks against ``doc_list_ops`` when libchudware is loaded
 
 If you add a handler in session.cpp, update BOTH ``core/doc/op_registry.cpp``
 and ``DOC_OP_KINDS`` here. ``test_op_vocab.py`` fails when they diverge from

@@ -58,7 +58,7 @@ in template-filling itself.
   directly off the `doc_sketch_solve` result for the actual pass/fail. Guarded
   skip-with-reason (falls back to fixture-mode scoring, `detail.live_error`) when the core
   is unavailable — resolution is entirely `core_bridge`'s own
-  (`$AI_CAD_LIBAICAD` / `$AI_CAD_DIST` / known build dirs); never a hardcoded sibling
+  (`$CHUDWARE_LIBCHUDWARE` / `$CHUDWARE_DIST` / known build dirs); never a hardcoded sibling
   worktree path.
 
 **Baselines:** `deterministic` (template filler, measured offline — 1.0 on every fixture by

@@ -1,8 +1,8 @@
 // CppCore — the host side of the strangler seam to the pure-C++ core.
 //
-// Loads libaicad.dll (the SEPARATE C++ core DLL; see docs/CPP_MIGRATION.md) at
+// Loads libchudware.dll (the SEPARATE C++ core DLL; see docs/CPP_MIGRATION.md) at
 // RUNTIME via LoadLibrary and dispatches JSON-RPC-style calls into it through the
-// flat C ABI in core/api/libaicad.h. The host build links NEITHER the core nor
+// flat C ABI in core/api/libchudware.h. The host build links NEITHER the core nor
 // OCCT — the DLL and its OCCT runtime DLLs are loaded lazily on first use, so the
 // host stays buildable/launchable even when the core isn't present.
 //
@@ -19,25 +19,25 @@ namespace core {
 
 class CppCore {
 public:
-    // Lazily load libaicad.{so,dll}. Resolve order (first hit wins):
-    //   1. $BILLET_LIBAICAD / $AI_CAD_LIBAICAD (explicit absolute path)
-    //   2. AICAD_DEFAULT_LIBAICAD (compile-time build-tree path, if set)
-    //   3. libaicad next to the running host/hostd executable (staged install)
+    // Lazily load libchudware.{so,dll}. Resolve order (first hit wins):
+    //   1. $CHUDWARE_LIBCHUDWARE / $CHUDWARE_LIBCHUDWARE (explicit absolute path)
+    //   2. CHUDWARE_DEFAULT_LIBCHUDWARE (compile-time build-tree path, if set)
+    //   3. libchudware next to the running host/hostd executable (staged install)
     //   4. bare name via the dynamic loader (rpath / LD_DIRECTORY / PATH)
-    // Logs the winner once to stderr: "[cpp_core] loaded libaicad ... path=...".
+    // Logs the winner once to stderr: "[cpp_core] loaded libchudware ... path=...".
     // Safe to call repeatedly; only loads once.
     bool ensureLoaded(std::string& err);
     bool available() const { return loaded_; }
     std::string abiVersion() const { return abi_; }
     // git-describe build id of the loaded engine ("" until loaded, or when the
-    // .so predates the aicad_build_id export — callers tolerate absence).
+    // .so predates the chudware_build_id export — callers tolerate absence).
     std::string buildId() const { return build_id_; }
     // Absolute path of the loaded library ("" until loaded). The hostd stale-
     // binary self-drain stats this file for mtime changes.
     std::string loadedPath() const { return path_; }
 
     // Dispatch a call into the C++ core. Returns true iff the core HANDLED the
-    // method (aicad_call returned 0); `result` then holds its result object. On
+    // method (chudware_call returned 0); `result` then holds its result object. On
     // false, `err` carries the reason (unknown method / load failure / throw) and
     // the caller should fall back to the Python worker. `result` still receives any
     // {"error":...} payload the core produced.
@@ -46,10 +46,10 @@ public:
 
     // Live event streaming (transparency): register a THREAD-LOCAL callback the core invokes
     // with each agent-run event's JSON (UTF-8) as it is emitted. Call with cb=nullptr to clear.
-    // No-op if the loaded engine predates the aicad_set_event_sink export. Set on the SAME
+    // No-op if the loaded engine predates the chudware_set_event_sink export. Set on the SAME
     // thread that then calls call() for an agent_* method.
     void setEventSink(void (*cb)(const char* event_json, void* ud), void* ud);
-    // True iff the loaded engine exports aicad_set_event_sink (live streaming supported).
+    // True iff the loaded engine exports chudware_set_event_sink (live streaming supported).
     // Callers use this to decide whether live events will fire (else fall back to batched).
     bool hasEventSink();
 

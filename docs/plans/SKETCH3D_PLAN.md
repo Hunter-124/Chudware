@@ -135,10 +135,10 @@ Extend the 2D handle grammar to 3D entities. Handles reference sub-points that a
 
 ### 3.1 Strategy: BUILD-OWN, clean-room, extend the existing 2D Newton solver to 3D
 
-The existing `aicad::sketch::solve_sketch` (`core/sketch/sketch.h`) parameterizes entities into a
+The existing `chudware::sketch::solve_sketch` (`core/sketch/sketch.h`) parameterizes entities into a
 variable vector, wires each constraint to residual blocks with **analytic Jacobians**, and runs a
 Newton loop over **Eigen**, with warm-start + constrained-drag support. The 3D solver
-(`aicad::sketch3d::solve_sketch3d`, new module `core/sketch3d/`) mirrors this pattern exactly, in
+(`chudware::sketch3d::solve_sketch3d`, new module `core/sketch3d/`) mirrors this pattern exactly, in
 3-space:
 
 - Each point contributes 3 variables `(x,y,z)` instead of 2.
@@ -245,7 +245,7 @@ placement are a Phase-3 extension.
 - The 2D cluster is in flight **today** (T-BL43 external refs, T-BL48 sketch-entry wiring,
   T-BL41/42/44). The `sketch3d` type touches **none** of their files — separate feature type,
   separate solver module (`core/sketch3d/`), separate UI entry. No write-set overlap.
-- Shared, append-only surfaces (`contracts/doc_schema.md`, `core/api/libaicad.h`) are extended in
+- Shared, append-only surfaces (`contracts/doc_schema.md`, `core/api/libchudware.h`) are extended in
   dedicated commits at build time (per CONTRIBUTING), not now.
 - The `on_plane` constraint (§3.2) lets a 3D sketch reuse 2D relation semantics inside a plane,
   giving a smooth conceptual bridge without code coupling.

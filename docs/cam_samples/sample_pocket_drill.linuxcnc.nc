@@ -1,5 +1,5 @@
 %
-( AICAD - S1)
+( Chudware - S1)
 ( post: LinuxCNC  machine: Generic 3-axis mill)
 G21
 G90

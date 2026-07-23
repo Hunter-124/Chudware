@@ -1,4 +1,4 @@
-# AI-CAD User Manual
+# Chudware User Manual
 
 Auto-generated from the ribbon command inventory, the
 in-app modeling guide, and the frozen contract set — see `tools/manual_gen.py`.

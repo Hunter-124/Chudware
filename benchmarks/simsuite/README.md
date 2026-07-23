@@ -43,7 +43,7 @@ Rules:
   `import resguard; resguard.install()` then `if not resguard.fits(est_peak_gb):`
   emit that case with `status="skip", detail="resguard: needs ~N GB"`.
   Between heavy cases, call `resguard.check()`.
-- Run the engine **in-process** (`AI_CAD_ENGINE_DAEMON=0`, services/dist lib via
+- Run the engine **in-process** (`CHUDWARE_ENGINE_DAEMON=0`, services/dist lib via
   `services.mcp.core_bridge`) — never against a live daemon/GUI.
 - No load-bearing constants from memory: analytic references carry a comment
   citing the formula (Euler-Bernoulli, Kirsch, Lamé, ...).

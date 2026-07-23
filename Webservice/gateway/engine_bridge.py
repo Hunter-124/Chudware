@@ -1,4 +1,4 @@
-"""WS /engine — bridge browser clients to the shared billet-webd unix socket.
+"""WS /engine — bridge browser clients to the shared chudware-webd unix socket.
 
 One WebSocket connection == one daemon IPC connection (newline-delimited
 JSON-RPC both ways; one WS text message == one JSON line). The bridge is a
@@ -21,7 +21,7 @@ try:
 except ImportError:  # uvicorn app:app from package dir
     from config import settings
 
-log = logging.getLogger("billet-web.engine")
+log = logging.getLogger("chudware-web.engine")
 
 router = APIRouter()
 
@@ -73,7 +73,7 @@ _AGENT_PROVIDER_METHODS = frozenset({
 # Secrets / server-owned endpoint config — never accept from the browser.
 _STRIP_SECRET_FIELDS = ("api_key", "base_url", "fallback_api_keys", "auth_mode")
 
-# agent_list_models is a C++ probe in libaicad — it does NOT load host config.json.
+# agent_list_models is a C++ probe in libchudware — it does NOT load host config.json.
 # The WASM client has empty/IDBFS keys, so without a server-side inject the probe
 # returns "no api key" / HTTP 401 and the picker looks disconnected from hostd.
 # Fill api_key + base_url from the host config when the client omitted them (or
@@ -100,7 +100,7 @@ def _load_host_keys() -> dict[str, str]:
             if isinstance(v, str) and v.strip():
                 out[str(k)] = v.strip()
 
-    # Fallback: ~/billet-web-data/ai_providers.env (shared session keys).
+    # Fallback: ~/chudware-web-data/ai_providers.env (shared session keys).
     # Map ENV names → keys.* slots used by list_models inject.
     env_to_slot = {
         "OPENROUTER_API_KEY": "openrouter",

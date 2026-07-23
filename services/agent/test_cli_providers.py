@@ -1,7 +1,7 @@
 """Unit tests for headless CLI-driving providers (claude-cli / codex-cli).
 
 Subprocess is mocked — no network, no real CLI required for the default suite.
-Optional live smoke: set AICAD_CLI_SMOKE=1 (skipped otherwise).
+Optional live smoke: set CHUDWARE_CLI_SMOKE=1 (skipped otherwise).
 """
 from __future__ import annotations
 
@@ -270,8 +270,8 @@ def test_routing_kind_maps_cli_providers():
 # --------------------------------------------------------------------------- optional live smoke (gated)
 
 @pytest.mark.skipif(
-    os.environ.get("AICAD_CLI_SMOKE") != "1",
-    reason="set AICAD_CLI_SMOKE=1 to run live CLI smoke",
+    os.environ.get("CHUDWARE_CLI_SMOKE") != "1",
+    reason="set CHUDWARE_CLI_SMOKE=1 to run live CLI smoke",
 )
 def test_live_claude_cli_smoke():
     if not __import__("shutil").which("claude"):
@@ -286,8 +286,8 @@ def test_live_claude_cli_smoke():
 
 
 @pytest.mark.skipif(
-    os.environ.get("AICAD_CLI_SMOKE") != "1",
-    reason="set AICAD_CLI_SMOKE=1 to run live CLI smoke",
+    os.environ.get("CHUDWARE_CLI_SMOKE") != "1",
+    reason="set CHUDWARE_CLI_SMOKE=1 to run live CLI smoke",
 )
 def test_live_codex_cli_smoke():
     if not __import__("shutil").which("codex"):

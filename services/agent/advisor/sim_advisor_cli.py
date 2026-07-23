@@ -18,7 +18,7 @@ The ``_anchor`` passthrough key is kept in precheck output so the caller can
 round-trip it back into postcheck (`precheck_items`) unchanged.
 
 Ledger (inspectability rule): when the caller supplies ``ledger_run_id`` (the GUI
-passes AI_CAD_MISSION_RUN_ID when a mission context exists), one ``artifact``
+passes CHUDWARE_MISSION_RUN_ID when a mission context exists), one ``artifact``
 event (kind ``study`` — contracts/advisor.md §2 shape) is appended to that run's
 design ledger recording the advisory outcome. Ledger failures never fail the
 advisory call (best-effort, mirrors Ledger._save()).

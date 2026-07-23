@@ -28,7 +28,7 @@
 
 #include "agent/events.h"   // run_dir(), cap_raw()
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 
 using nlohmann::json;
@@ -128,4 +128,4 @@ ProviderFn wrap_logging(
 }
 
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware

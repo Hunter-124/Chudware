@@ -160,7 +160,7 @@ def build_markdown(data: dict) -> dict[str, str]:
     docs: dict[str, str] = {}
 
     # ---- index.md ----
-    lines = ["# AI-CAD User Manual", "", "Auto-generated from the ribbon command inventory, the",
+    lines = ["# Chudware User Manual", "", "Auto-generated from the ribbon command inventory, the",
              "in-app modeling guide, and the frozen contract set — see `tools/manual_gen.py`.",
              "", "## Contents", "", "- [Overview](overview.md)", "- [Commands Reference](commands.md)"]
     for topic in GUIDE_TOPICS:
@@ -276,7 +276,7 @@ def build_report_spec(data: dict, fmt: str = "pdf") -> dict:
 
     outline = [
         {"type": "title", "body": [
-            "AI-CAD User Manual",
+            "Chudware User Manual",
             "Auto-generated from the ribbon command inventory, the in-app modeling guide, "
             "and the frozen contract set.",
         ]},
@@ -302,7 +302,7 @@ def build_report_spec(data: dict, fmt: str = "pdf") -> dict:
 
     return {
         "kind": "report",
-        "title": "AI-CAD User Manual",
+        "title": "Chudware User Manual",
         "template": "user_manual",
         "format": fmt,
         "outline": outline,

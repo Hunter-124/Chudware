@@ -155,7 +155,7 @@ def run_tool_validity(provider: Any, *, seed: int = 1) -> dict[str, Any]:
     )
 
     system = (
-        "You are an AI-CAD role agent. Allowed tools: "
+        "You are an Chudware role agent. Allowed tools: "
         + ", ".join(_ALLOWED)
         + ".\n\n"
         + _SYSTEM_BASE

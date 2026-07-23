@@ -19,7 +19,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad::ecad {
+namespace chudware::ecad {
 
 // The result of opening a .ecad+ container.
 struct EcadContainerDoc {
@@ -38,4 +38,4 @@ std::string ecad_container_save(const nlohmann::json& doc, const std::string& pa
 // Throws OpError("io_error", ...) if the file is missing/corrupt or not a .ecad+ .
 EcadContainerDoc ecad_container_open(const std::string& path);
 
-}  // namespace aicad::ecad
+}  // namespace chudware::ecad

@@ -13,7 +13,7 @@ LICENSE files, merged llama.cpp PRs). Items that could not be verified are marke
 
 - **Primary candidate: Qwen3-VL-4B-Instruct** (fallback up: **Qwen3-VL-8B-Instruct**) —
   Apache-2.0, best-in-class doc/OCR at size, native multi-image, llama.cpp vision
-  merged, first-class Unsloth SFT+GRPO support, and it keeps the whole ShopCraft ML
+  merged, first-class Unsloth SFT+GRPO support, and it keeps the whole Chudware ML
   stack on one tokenizer/tooling family with the planned Qwen3-4B text translator.
 - **Drawing-reading specialist: ibm-granite/granite-vision-4.1-4b** (or 3.3-2b) —
   Apache-2.0, document-extraction-specialized, official IBM GGUF **with mmproj**.

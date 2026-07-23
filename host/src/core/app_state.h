@@ -1,4 +1,4 @@
-// AI-CAD shared application state + data model (extracted from gui_app.cpp).
+// Chudware shared application state + data model (extracted from gui_app.cpp).
 //
 // Holds the structs the worker/agent loop produces (Settings, JobState, ChatMsg, AgentStep,
 // AgentEvent, PlanInfo, PartInfo, FitReport, ...) and the AppState aggregate that bundles every
@@ -72,7 +72,7 @@ enum JobKind { JOB_BUILD, JOB_DESIGN, JOB_CHAT };
 //   MMGS = millimeter / gram / second   IPS = inch / pound / second
 enum class Units { MMGS = 0, IPS = 1 };
 
-// ---------------- settings (AI provider) -> %APPDATA%/AI-CAD/config.json ----------------
+// ---------------- settings (AI provider) -> %APPDATA%/Chudware/config.json ----------------
 // Copilot composer interaction mode (Agent | Plan | Swarm | Edit | Ask | Eng. Firm).
 // Integer values match Settings::copilotMode / AppState::aiInteraction for persistence.
 enum class CopilotMode : int {
@@ -156,7 +156,7 @@ struct Settings {
     // Wave 3 (GUI rework): File Explorer workspace root + Recent files, persisted to config.json
     // ("workspace_dir" / "recent_files"). Mirrored onto AppState at startup; AppState is the live
     // copy the UI reads, Settings is what saveSettings serializes.
-    std::string workspaceDir;                  // "" = use the Documents/AI-CAD default
+    std::string workspaceDir;                  // "" = use the Documents/Chudware default
     std::vector<std::string> recentFiles;      // most-recent-first, capped at AppState::kRecentFilesMax
     // Chat model-picker visibility: ids the user has explicitly hidden (VS-Code-Copilot-style
     // "Manage models" toggle in Settings → AI). Default-empty = every available model shows;
@@ -192,9 +192,9 @@ struct Settings {
 };
 
 std::string appdataDir();
-// The app data dir itself (base + "/AI-CAD" or "/Billet" per the alias rule); logs once.
+// The app data dir itself (base + "/Chudware" or "/Chudware" per the alias rule); logs once.
 std::string appdataAppDir();
-// Default Documents workspace dir (Documents/AI-CAD if it exists, else Documents/Billet).
+// Default Documents workspace dir (Documents/Chudware if it exists, else Documents/Chudware).
 std::string defaultWorkspaceDir();
 std::string configPath();
 void loadSettings(Settings& s);
@@ -219,7 +219,7 @@ struct ProviderModels {
     // LM Studio's native endpoint reports which models are actually loaded (vs merely
     // downloaded). When loadedKnown is true, only ids in `loaded` can serve a request and the
     // picker hides the rest; when false (non-LM-Studio server) every listed model is assumed
-    // available. See agent_list_models in libaicad.cpp.
+    // available. See agent_list_models in libchudware.cpp.
     std::vector<std::string> loaded;
     bool loadedKnown = false;
     // Ids the endpoint prices at $0 (OpenRouter ":free" tiers etc.) — surfaced by agent_list_models
@@ -621,7 +621,7 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
 // One copilot conversation = its own tab. The ACTIVE conversation's live messages stay in
 // AppState::chat (so every existing st.chat user keeps working unchanged); an INACTIVE
 // conversation parks its messages here. Switching tabs swaps chat <-> msgs. Persisted per
-// document to %APPDATA%/AI-CAD/chat_history.json so conversations survive restarts.
+// document to %APPDATA%/Chudware/chat_history.json so conversations survive restarts.
 struct Conversation {
     std::string id;
     std::string title;             // shown on the tab; defaults to "Chat N", renamed to 1st prompt
@@ -700,16 +700,16 @@ struct AppState {
 
     // ---- document mirror (C16) — worker-backed document state ----
     core::DocMirror docMirror;
-    bool wantTree = false;   // AI_CAD_SHOT=tree: scripted doc-smoke flow + screenshot
+    bool wantTree = false;   // CHUDWARE_SHOT=tree: scripted doc-smoke flow + screenshot
     bool treeShotDone = false; // guard so doc smoke runs exactly once
-    bool wantEquations = false;   // AI_CAD_SHOT=equations: open the Equations editor + seed two globals
+    bool wantEquations = false;   // CHUDWARE_SHOT=equations: open the Equations editor + seed two globals
     bool equationsShotDone = false; // guard so the equations seed runs exactly once
-    bool wantPartsShot = false;   // AI_CAD_SHOT=parts: Parts Library with a seeded no-model result (RE-32)
+    bool wantPartsShot = false;   // CHUDWARE_SHOT=parts: Parts Library with a seeded no-model result (RE-32)
 
     // ---- Wave N: AI-ECAD document (worker ecad_* RPCs; the editor mirror lives in ecad_panel.cpp) ----
     std::string ecadDocId;          // open ECAD doc id ("" = none)
     int         ecadRevision = -1;  // last known ECAD revision (optimistic-concurrency base)
-    bool        wantEcad = false;   // AI_CAD_SHOT=ecad scripted scenario
+    bool        wantEcad = false;   // CHUDWARE_SHOT=ecad scripted scenario
     bool        ecadShotDone = false;
     int         wantFocusViewport = 0;      // frames to keep forcing the 3D Viewport tab forward
                                             // (set by the ECAD board->3D bridge so the board shows)
@@ -763,8 +763,8 @@ struct AppState {
         bool        isStarter = false;
         std::string path;           // last saved file path ("" = never saved)
 
-        // Live MCP handoff mirror: this tab shows the part the external AI-CAD MCP engine is
-        // building (pollAiCadHandoff opens it from %APPDATA%\AI-CAD\handoff\live.step+ and refreshes
+        // Live MCP handoff mirror: this tab shows the part the external Chudware MCP engine is
+        // building (pollAiCadHandoff opens it from %APPDATA%\Chudware\handoff\live.step+ and refreshes
         // it in place as the AI works). It is a READ-ONLY view of another process's doc — the user's
         // own tabs are never the handoff. Flagged so the refresh can find it without path-matching,
         // label it clearly, and avoid stealing focus / yanking an in-progress edit.
@@ -1401,7 +1401,7 @@ struct AppState {
         RT_Manufacture = 12,
     };
     bool showRibbon = true;        // View > Ribbon visibility toggle
-    bool profilerRunning = false;  // Evaluate > Profiler: sampling profiler active (libaicad prof_*)
+    bool profilerRunning = false;  // Evaluate > Profiler: sampling profiler active (libchudware prof_*)
     bool showProfilerWindow = false;  // in-app profiler results window (text report + flamegraph)
     bool showCommandSearch  = false;  // top-bar unified search popup (settings + modeling tools)
     bool showWeb            = false;  // "Web" title-bar chip: full-window in-app CEF browser overlay
@@ -1460,30 +1460,30 @@ struct AppState {
     // Sim display-unit mode: 0 = follow the document units (st.ips()), 1 = force SI (MPa·N·mm),
     // 2 = force US customary (psi·lbf·in). Engine stays canonical SI; this only affects display/input.
     int simUnits = 0;
-    bool wantFea = false;       // C19: AI_CAD_SHOT=fea scripted static-study scenario
+    bool wantFea = false;       // C19: CHUDWARE_SHOT=fea scripted static-study scenario
     bool feaShotDone = false;   // guard so the fea scenario runs exactly once
-    // T-FIN24: AI_CAD_SHOT=simdisc_mech|simdisc_ecad — Simulate-tab disclosure-matrix shots.
+    // T-FIN24: CHUDWARE_SHOT=simdisc_mech|simdisc_ecad — Simulate-tab disclosure-matrix shots.
     // mech: part only -> the "+ New Study" picker must show NO electronics options.
     // ecad: PCB tab + part -> electronics simulation + firmware emulation rows appear.
     bool wantSimDisc = false;
     int  simDiscKind = 0;          // 0 = mech-only, 1 = with a PCB open
     bool simDiscShotDone = false;
-    bool wantCam = false;       // AI_CAD_SHOT=cam: build a part, run the copilot CAM fast-path,
+    bool wantCam = false;       // CHUDWARE_SHOT=cam: build a part, run the copilot CAM fast-path,
     bool camShotDone = false;   //   adopt the job into the Manufacture panel — runs exactly once
-    bool wantFlow = false;      // AI_CAD_SHOT=flow scripted external-flow (wind-tunnel) study scenario
+    bool wantFlow = false;      // CHUDWARE_SHOT=flow scripted external-flow (wind-tunnel) study scenario
     bool flowShotDone = false;  // guard so the flow scenario runs exactly once
-    bool wantDrawing = false;   // W17: AI_CAD_SHOT=drawing scripted engineering-drawing scenario
+    bool wantDrawing = false;   // W17: CHUDWARE_SHOT=drawing scripted engineering-drawing scenario
     bool drawingShotDone = false;  // guard so the drawing scenario runs exactly once
-    bool wantEvalMass = false;  // C19: AI_CAD_SHOT=evalmass mass-properties window
+    bool wantEvalMass = false;  // C19: CHUDWARE_SHOT=evalmass mass-properties window
     bool evalMassShotDone = false;
-    bool wantIconPipe = false;  // T-G15: AI_CAD_SHOT=iconpipe — recipe-driven clean-viewport icon render
+    bool wantIconPipe = false;  // T-G15: CHUDWARE_SHOT=iconpipe — recipe-driven clean-viewport icon render
     bool iconPipeShotDone = false;  // guard: keeps the frame loop alive until every recipe is captured
 
     // ---- SketchMode (C18) — in-sketch tools/overlay; typed like the PropertyManager (W1-B) ----
     ui::SketchMode* sketchMode = nullptr;  // active doc's sketch (per DocSession; re-seated on switch)
-    bool wantSketch = false;           // AI_CAD_SHOT=sketch scripted flow
+    bool wantSketch = false;           // CHUDWARE_SHOT=sketch scripted flow
     bool sketchShotDone = false;       // guard so the sketch scenario runs once per shot
-    bool wantSketch3d = false;         // AI_CAD_SHOT=sketch3d scripted 3D-sketch flow
+    bool wantSketch3d = false;         // CHUDWARE_SHOT=sketch3d scripted 3D-sketch flow
     bool sketch3dShotDone = false;     // guard so the sketch3d scenario runs once per shot
 
     // ---- EvaluateDialogs (C19) — Measure / Mass / Section windows; per-document like the PM ----
@@ -1493,7 +1493,7 @@ struct AppState {
 
     // ---- AsmPanels (C20b) — assembly windows/forms; typed like the PropertyManager (W1-B) ----
     ui::AsmPanels* asmPanels = nullptr;  // owned by run_gui
-    bool wantAsm = false;              // AI_CAD_SHOT=asm scripted assembly flow
+    bool wantAsm = false;              // CHUDWARE_SHOT=asm scripted assembly flow
     bool asmShotDone = false;          // guard so the asm scenario runs once per shot
 
     // ---- C22b: Activity panel + prompt editor + orchestrator wiring ----
@@ -1552,27 +1552,27 @@ struct AppState {
     // knowing about the full dispatcher capture.
     std::function<void(const char*)> ribbonDispatch;
 
-    // ---- screenshot-mode flags (set from AI_CAD_SHOT in run_gui) ----
+    // ---- screenshot-mode flags (set from CHUDWARE_SHOT in run_gui) ----
     bool wantSettings = false, wantChat = false, wantAssembly = false, wantPlan = false;
     bool wantPick   = false;  // C15: load box.aicm, simulate a center pick, print + screenshot
     bool wantRibbon = false;  // C14: ribbon screenshot mode
     bool pickPrinted = false;  // guard so the "pick:" stdout line prints exactly once
-    bool wantM1 = false;       // C17: AI_CAD_SHOT=m1 scripted integration scenario
+    bool wantM1 = false;       // C17: CHUDWARE_SHOT=m1 scripted integration scenario
     bool m1ShotDone = false;   // guard so the m1 scenario runs exactly once per shot
-    bool wantMultidoc = false;     // AI_CAD_SHOT=multidoc scripted multi-document mid-edit scenario
+    bool wantMultidoc = false;     // CHUDWARE_SHOT=multidoc scripted multi-document mid-edit scenario
     bool multidocShotDone = false; // guard so the multidoc scenario runs exactly once per shot
-    // AI_CAD_SHOT=tabperf: open 2 parts and hammer A<->B tab switches for logTabPerf timings.
+    // CHUDWARE_SHOT=tabperf: open 2 parts and hammer A<->B tab switches for logTabPerf timings.
     bool wantTabPerf = false;
     bool tabPerfShotDone = false;
-    bool wantActivity = false;  // C22b: AI_CAD_SHOT=activity scripted orchestrator run + activity panel
+    bool wantActivity = false;  // C22b: CHUDWARE_SHOT=activity scripted orchestrator run + activity panel
     bool activityShotDone = false; // guard so the activity scenario runs exactly once
-    // [workspace-tabs seam] AI_CAD_SHOT=workspaces: cycle all 8 workspace tabs, one screenshot each.
-    bool wantWorkspace = false;     // AI_CAD_SHOT=workspaces: workspace cycle scenario
+    // [workspace-tabs seam] CHUDWARE_SHOT=workspaces: cycle all 8 workspace tabs, one screenshot each.
+    bool wantWorkspace = false;     // CHUDWARE_SHOT=workspaces: workspace cycle scenario
     bool workspaceShotDone = false; // guard so the workspaces scenario runs exactly once
-    // AI_CAD_SHOT=motion: kinematic motion study end-to-end (2-body assembly + angle mate + playback).
-    bool wantMotion = false;        // AI_CAD_SHOT=motion scripted motion study scenario
+    // CHUDWARE_SHOT=motion: kinematic motion study end-to-end (2-body assembly + angle mate + playback).
+    bool wantMotion = false;        // CHUDWARE_SHOT=motion scripted motion study scenario
     bool motionShotDone = false;    // guard so the motion scenario runs exactly once
-    // H2: AI_CAD_SHOT=daemon_h2 — kill hostd mid-session, capture the sticky
+    // H2: CHUDWARE_SHOT=daemon_h2 — kill hostd mid-session, capture the sticky
     // "Engine daemon unreachable" chip, respawn hostd, capture repopulated tabs.
     bool wantDaemonH2 = false;
     int  daemonH2Phase = 0;     // 0=seed 1=killed 2=notice 3=respawned 4=done
@@ -1585,7 +1585,7 @@ struct AppState {
     // GL thread. toast() and drawToasts() both take the lock.
     std::mutex toastsMtx;
     std::vector<ui::Toast> toasts;
-    // T-BL31 NEW-3: AI_CAD_SHOT=ribbon suppresses toasts (the Billet on-load toast otherwise
+    // T-BL31 NEW-3: CHUDWARE_SHOT=ribbon suppresses toasts (the Chudware on-load toast otherwise
     // occludes leftmost ribbon groups in per-tab icon-verification captures); real usage is
     // unaffected since toasts still auto-dismiss there. See app.cpp wantRibbon setup.
     bool suppressToasts = false;
@@ -1621,7 +1621,7 @@ struct AppState {
     Clipboard clipboard;
 
     // ---- Wave 3 (GUI rework): File Explorer + Recent files (APPEND-ONLY) ----
-    // workspaceDir: the root directory the Explorer tab browses. Defaults to Documents/AI-CAD
+    // workspaceDir: the root directory the Explorer tab browses. Defaults to Documents/Chudware
     // (created on first use); overridable and persisted to config.json ("workspace_dir").
     std::string workspaceDir;
     // plmProjectDir: the folder the PLM Project Hub (Workspace::PLM) treats as the current project

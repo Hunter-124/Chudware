@@ -24,7 +24,7 @@ if str(_REPO) not in sys.path:
 
 # Use a temp cache root so tests never touch real user data
 _TMP_CACHE = tempfile.mkdtemp(prefix="test_ledger_cache_")
-os.environ["AICAD_CACHE_ROOT"] = _TMP_CACHE
+os.environ["CHUDWARE_CACHE_ROOT"] = _TMP_CACHE
 
 from services.agent.ledger import (  # noqa: E402
     SCHEMA,

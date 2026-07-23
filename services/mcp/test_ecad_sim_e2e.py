@@ -509,7 +509,7 @@ def test_ngspice_backend_divider():
     _build_divider(doc)
     sim = _call("ecad_simulate", analysis="op", backend="ngspice", doc_id=doc)
     assert sim["ok"] and sim["converged"], sim
-    have_ng = bool(shutil.which("ngspice") or os.environ.get("AI_CAD_NGSPICE"))
+    have_ng = bool(shutil.which("ngspice") or os.environ.get("CHUDWARE_NGSPICE"))
     if have_ng:
         assert sim["backend"] == "ngspice", sim
     else:
@@ -588,7 +588,7 @@ def test_cpp_spice_parity_spot_checks():
         study = {"analyses": [{"type": "op"}], "probes": op_probe_sets[label]}
         cpp = _cpp_sim(circ, study)
         if cpp is None:
-            pytest.skip("libaicad core bridge unavailable — C++ parity skipped")
+            pytest.skip("libchudware core bridge unavailable — C++ parity skipped")
         ran_any = True
         py = sim_run(json.loads(json.dumps(circ)), study)
         assert cpp.get("convergence", {}).get("op"), f"{label}: C++ op did not converge"

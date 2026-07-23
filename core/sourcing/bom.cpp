@@ -11,7 +11,7 @@
 #include <set>
 #include <unordered_map>
 
-namespace aicad {
+namespace chudware {
 namespace sourcing {
 
 namespace {
@@ -496,4 +496,4 @@ json bom_price_lines(const json& asm_tree, const Seams& seams) {
 }
 
 }  // namespace sourcing
-}  // namespace aicad
+}  // namespace chudware

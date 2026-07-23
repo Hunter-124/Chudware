@@ -15,7 +15,7 @@
 //
 // The body lives in run.cpp so it can reuse that TU's file-local helpers (make_provider,
 // agent_call, extract_json_obj, call_budget_for). The simulate_flow capability is supplied
-// as a CALLBACK (SimFn) wired by the libaicad layer, so the agent library does not take a
+// as a CALLBACK (SimFn) wired by the libchudware layer, so the agent library does not take a
 // link dependency on the sim library.
 #pragma once
 
@@ -26,14 +26,14 @@
 
 #include "agent/run.h"  // EmitFn
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 
 using nlohmann::json;
 
 // A flow-sim backend: (doc_id, natural-language request, params) -> the CFD result object
 // {ok, answer, drag_n, lift_n, cd, frontal_area_mm2, reynolds, velocity_ms, aoa_deg} (or
-// {ok:false, answer} on no-geometry / failure). The libaicad layer passes a lambda over
+// {ok:false, answer} on no-geometry / failure). The libchudware layer passes a lambda over
 // run_flow_sim (the same path agent_simulate_v1 uses). May be empty: a simulate_flow task
 // then resolves to status "skipped".
 using SimFn = std::function<json(const std::string& doc_id, const std::string& request,
@@ -61,4 +61,4 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
                  EmitFn emit = nullptr, SimFn sim = nullptr, const json& options = json::object());
 
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware

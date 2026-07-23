@@ -9,7 +9,7 @@
 #include "agent/ask.h"        // build_doc_context (reused for the optional doc digest)
 #include "agent/ops_emit.h"   // first_balanced
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 
 const char* kClarifyRole = "clarify";
@@ -319,4 +319,4 @@ ojson clarify(const std::string& request, const ojson& doc, const std::string& d
 }
 
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware

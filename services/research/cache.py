@@ -6,7 +6,7 @@ always the *network* fetch time (not the cache-read time) so it can be surfaced 
 
 LEGAL (§4): this cache is **per-user local only**. Never sync it through a server or
 ship it — that turns caching into redistribution. The root sits under the same appdata
-root ``services.paths`` establishes (``AI_CAD_KNOWLEDGE_DIR`` overrides, e.g. for tests).
+root ``services.paths`` establishes (``CHUDWARE_KNOWLEDGE_DIR`` overrides, e.g. for tests).
 """
 from __future__ import annotations
 
@@ -29,10 +29,10 @@ DEFAULT_TIER = "datasheet"
 
 
 def knowledge_root() -> Path:
-    """Resolve the ``knowledge/`` cache root. ``AI_CAD_KNOWLEDGE_DIR`` wins (tests /
-    explicit control); otherwise ``<appdata>/AI-CAD/knowledge`` via ``services.paths`` —
+    """Resolve the ``knowledge/`` cache root. ``CHUDWARE_KNOWLEDGE_DIR`` wins (tests /
+    explicit control); otherwise ``<appdata>/Chudware/knowledge`` via ``services.paths`` —
     the same appdata convention the rest of the app uses."""
-    override = os.environ.get("AI_CAD_KNOWLEDGE_DIR")
+    override = os.environ.get("CHUDWARE_KNOWLEDGE_DIR")
     if override:
         return Path(override)
     from services import paths

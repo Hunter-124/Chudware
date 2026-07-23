@@ -22,7 +22,7 @@ T-V3..T-V5 follow-ups into one deliverable.
 
 ## Driver notes (foreman)
 
-1. Provision mcp-venv from requirements.txt (`~/.local/share/AI-CAD/mcp-venv/bin/pip
+1. Provision mcp-venv from requirements.txt (`~/.local/share/Chudware/mcp-venv/bin/pip
    install -r requirements.txt`), resolving pin conflicts conservatively (never
    downgrade an installed working package without noting it). Heavy packages
    (vtk/pyvista/OCP) are fine — disk is plentiful; watch RAM during any builds.
@@ -199,7 +199,7 @@ gaps remain — `trimesh, networkx, rhino3dm, olefile, pyvista, vtk, anthropic, 
 scikit-fem, meshio, pyamg, python-pptx, python-docx, openpyxl, reportlab, pypdfium2` —
 identical to the set the prior driver (fenn) already recorded, confirming nothing has
 drifted. Per fenn's already-sound reasoning (work/questions/T-V3.md Q1/Q2, unchanged by
-me): the shared `~/.local/share/AI-CAD/mcp-venv` shouldn't be bulk-`pip install`'d from
+me): the shared `~/.local/share/Chudware/mcp-venv` shouldn't be bulk-`pip install`'d from
 inside a worktree without coordinating every other concurrent session using it.
 Recommend a fresh T-V4 scoped exactly to that provisioning, serialized (flock) against
 concurrent use, with a fresh pip-list snapshot at claim time (this one may itself be

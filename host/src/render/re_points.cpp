@@ -38,7 +38,7 @@ void main() { frag = vColor; })";
 
 unsigned int compileShader(unsigned int type, const char* src) {
     unsigned int s = glCreateShader(type);
-#ifdef BILLET_GLES3
+#ifdef CHUDWARE_GLES3
     const std::string rewritten = shaderSrc(src);
     const char* p = rewritten.c_str();
 #else
@@ -177,7 +177,7 @@ void RePoints::draw(const Renderer::CameraXform& cam) {
     if (!ptVerts_.empty()) {
         glUniform1i(uUsePVC_, 1);
         glBindVertexArray(ptVao_);
-#ifndef BILLET_GLES3
+#ifndef CHUDWARE_GLES3
         glPointSize(pointSize_ * widthScale_);
 #endif
         glDrawArrays(GL_POINTS, 0, (GLsizei)(ptVerts_.size() / 6));

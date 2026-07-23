@@ -16,4 +16,4 @@ stdio MCP server exposing CAD tools to external agents (Claude Code, Cursor, etc
   family module (shared helpers to the `*_common.py`), never back into the facades.
 
 ## Migration
-- Thin client over `libaicad` at N5e; Python deleted when C++ agent/MCP land.
+- Thin client over `libchudware` at N5e; Python deleted when C++ agent/MCP land.

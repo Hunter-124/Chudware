@@ -20,14 +20,14 @@
 #include <unordered_set>
 #include <utility>
 
-namespace aicad::sketch {
+namespace chudware::sketch {
 namespace {
 
 using json = nlohmann::json;
 using Eigen::MatrixXd;
 using Eigen::Vector2d;
 using Eigen::VectorXd;
-using aicad::solver::System;
+using chudware::solver::System;
 
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kDeg = kPi / 180.0;
@@ -887,8 +887,8 @@ double resolve_dim(const json& c, const json& env) {
             // fall through to the literal `value` (forward-tolerant; the Python
             // would raise, but the host's solve path catches that the same way).
             try {
-                return aicad::util::evaluate(e, env_to_map(env));
-            } catch (const aicad::util::ExprError&) {
+                return chudware::util::evaluate(e, env_to_map(env));
+            } catch (const chudware::util::ExprError&) {
                 // fall through to literal value below
             }
         }
@@ -3466,4 +3466,4 @@ json drag(const SolveState& state, const std::string& handle,
                 {"budget_exceeded", res.budget_exceeded}};
 }
 
-}  // namespace aicad::sketch
+}  // namespace chudware::sketch

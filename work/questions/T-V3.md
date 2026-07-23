@@ -27,7 +27,7 @@ desired. Foreman to back-fill T-V3 task file at merge.
 
 ## Q2 — Venv provisioning: who owns it?
 
-The shared mcp-venv at `~/.local/share/AI-CAD/mcp-venv` cannot be safely
+The shared mcp-venv at `~/.local/share/Chudware/mcp-venv` cannot be safely
 touched from a worktree without coordinating with all other agents. The audit's
 "21 missing" list is now stale (venv already provisioned build123d etc. overnight).
 

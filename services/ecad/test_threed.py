@@ -1,7 +1,7 @@
 """ECAD → 3D bridge tests (fab_outputs.md §5). House style: main() + asserts.
 
 Run (from repo root):
-    & "$env:APPDATA\AI-CAD\runtime\venv\Scripts\python.exe" -m engine.ecad.test_threed
+    & "$env:APPDATA\Chudware\runtime\venv\Scripts\python.exe" -m engine.ecad.test_threed
 
 Uses OCP — a full run takes ~10-30s (STEP export/import + part-doc compile). That's expected.
 
@@ -149,7 +149,7 @@ def test_proxy_placement() -> None:
 def test_part_doc_compiles() -> None:
     """board_to_part_doc produces a re-importable STEP + a well-formed aicad.part/1 envelope.
 
-    The Python doc compiler/schema were rewritten into the C++ core (libaicad) and deleted; the
+    The Python doc compiler/schema were rewritten into the C++ core (libchudware) and deleted; the
     actual compile + schema validation of this part doc now happen there when the host opens it.
     This test keeps the closure-free half: the ECAD->STEP geometry round-trips, and the part-doc
     envelope is structurally correct (one `import` feature referencing the STEP)."""

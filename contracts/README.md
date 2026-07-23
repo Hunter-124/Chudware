@@ -1,7 +1,7 @@
 # contracts/ — frozen interface seams
 
-This directory holds the **frozen interface contracts** for AI-CAD. These are
-THE seams between layers: the C++ `core/` (`libaicad`), the Python `engine/`
+This directory holds the **frozen interface contracts** for Chudware. These are
+THE seams between layers: the C++ `core/` (`libchudware`), the Python `engine/`
 oracle, the `services/worker` routing layer, and the UI. They were promoted here
 from `docs/contracts/` in refactor node N0c so they sit at the top level next to
 the code they bind, not buried under `docs/`.

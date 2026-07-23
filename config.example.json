@@ -1,5 +1,5 @@
 {
-  "_comment": "Copy to %APPDATA%/AI-CAD/config.json and fill in. Providers: gemini, anthropic, openai, llamacpp.",
+  "_comment": "Copy to %APPDATA%/Chudware/config.json and fill in. Providers: gemini, anthropic, openai, llamacpp.",
   "provider": "gemini",
   "model": "gemini-2.5-flash",
   "api_key": "AIza... (Gemini) or sk-ant-... (Anthropic)",
@@ -14,7 +14,7 @@
   },
   "llamacpp": {
     "base_url": "http://127.0.0.1:1234/v1",
-    "model_path": "%APPDATA%/AI-CAD/models/model.gguf",
+    "model_path": "%APPDATA%/Chudware/models/model.gguf",
     "auto_start": true,
     "ctx_size": 8192,
     "gpu_layers": -1,

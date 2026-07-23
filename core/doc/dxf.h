@@ -16,7 +16,7 @@
 #include <string>
 #include <vector>
 
-namespace aicad::doc {
+namespace chudware::doc {
 
 // A polyline is a list of [x,y] points (mm). Layers map a layer name (VISIBLE /
 // HIDDEN / OUTLINE / BEND / CUTS / ...) to its polylines. We keep insertion order
@@ -73,4 +73,4 @@ std::string build_dxf(const DxfLayers& layers, const std::string& polyline_as,
 std::string write_dxf(const std::string& path, const DxfLayers& layers,
                       const std::string& polyline_as = "polyline");
 
-}  // namespace aicad::doc
+}  // namespace chudware::doc

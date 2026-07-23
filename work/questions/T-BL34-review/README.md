@@ -4,8 +4,8 @@
   (22 modeling + 19 Manufacture toolpath), review size + true-32px copy in each cell's
   corner. Regenerate any time: `xvfb-run -a python3 scripts/icon_pipeline.py --render`.
 - `ribbon_manufacture_dark.png` / `ribbon_manufacture_light.png` — in-context headless
-  captures (AI_CAD_SHOT=ribbon, manufacture tab) proving the C++ loader renders the 19
-  new cam_* cells from the extended atlas. NOTE: the first-run "ShopCraft" info toast
+  captures (CHUDWARE_SHOT=ribbon, manufacture tab) proving the C++ loader renders the 19
+  new cam_* cells from the extended atlas. NOTE: the first-run "Chudware" info toast
   overlays the Job group in every headless ribbon capture (pre-existing, all tabs).
 
 Manufacture tiles are REAL generated toolpaths (cam_new -> add_tool/add_setup/

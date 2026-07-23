@@ -6,7 +6,7 @@
 #include <utility>
 #include <vector>
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 
 namespace {
@@ -331,4 +331,4 @@ std::vector<std::string> context_sheets_for_domain(Domain d) {
 }
 
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware

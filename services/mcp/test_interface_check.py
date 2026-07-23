@@ -1,6 +1,6 @@
 """Regression tests for interface_check (T-BL49) — real engine geometry, asserted deltas.
 
-Drives the registered interface_check MCP tool end-to-end against the staged libaicad.so.
+Drives the registered interface_check MCP tool end-to-end against the staged libchudware.so.
 The worked example: a 4-hole plate stack (bracket + plate). A deliberately MISALIGNED version
 must be FLAGGED with the correct position delta; the CORRECTED (registered) version must PASS.
 
@@ -26,7 +26,7 @@ from mcp_server import core_bridge as cb
 
 pytestmark = pytest.mark.skipif(
     not cb.available(),
-    reason="libaicad not staged; engine-backed interface_check unavailable",
+    reason="libchudware not staged; engine-backed interface_check unavailable",
 )
 
 

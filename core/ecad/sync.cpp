@@ -11,7 +11,7 @@
 #include "ecad/ops.h"
 #include "ecad/schema.h"
 
-namespace aicad::ecad {
+namespace chudware::ecad {
 
 using nlohmann::json;
 
@@ -287,4 +287,4 @@ json update_board_from_sch(const json& board_in, const json& netlist, const json
     return json{{"mutated_board", work}, {"report", report}};
 }
 
-}  // namespace aicad::ecad
+}  // namespace chudware::ecad

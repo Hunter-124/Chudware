@@ -15,8 +15,8 @@ if str(GATEWAY_DIR.parent) not in sys.path:
     sys.path.insert(0, str(GATEWAY_DIR.parent))
 
 # Force dev mode BEFORE importing app
-os.environ["BILLET_WEB_DEV"] = "1"
-os.environ.setdefault("BILLET_WEB_DATA_ROOT", str(Path.home() / "billet-web-data-test"))
+os.environ["CHUDWARE_WEB_DEV"] = "1"
+os.environ.setdefault("CHUDWARE_WEB_DATA_ROOT", str(Path.home() / "chudware-web-data-test"))
 
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -179,7 +179,7 @@ def test_dev_user_cookie_authenticates(client):
 
 
 def test_dev_user_query_noop_when_not_dev(client, monkeypatch):
-    """Without BILLET_WEB_DEV / dev_mode, ?dev_user= is ignored (prod path)."""
+    """Without CHUDWARE_WEB_DEV / dev_mode, ?dev_user= is ignored (prod path)."""
     monkeypatch.setattr(settings, "dev_mode", False)
     r = client.get("/api/sessions", params={"dev_user": "demo@example.com"})
     assert r.status_code in {401, 500}
@@ -276,7 +276,7 @@ def test_session_refuse_new_flag(client, _isolate, monkeypatch, tmp_path):
 def _seed_session(mgr, email="demo@example.com"):
     sess = Session(
         sid="livesid", email=email, display="Demo User", slug="demo",
-        container="billet-sess-demo", host_port=8460, heavy=False, status="ready",
+        container="chudware-sess-demo", host_port=8460, heavy=False, status="ready",
     )
     mgr._sessions[sess.sid] = sess
     mgr._by_email[email] = sess.sid
@@ -291,7 +291,7 @@ def test_transfer_requires_running_session(client, _isolate):
 
 def test_transfer_upload_download(client, _isolate):
     _seed_session(_isolate)
-    content = b"hello billet"
+    content = b"hello chudware"
     files = {"file": ("part.step", io.BytesIO(content), "application/octet-stream")}
     r = client.post(
         "/transfer?path=uploads/part.step",
@@ -488,7 +488,7 @@ def test_admin_project_field_and_env(client, _admin_env, _isolate, monkeypatch):
     )
     assert r2.status_code == 400
 
-    # session env carries BILLET_DEFAULT_PROJECT
+    # session env carries CHUDWARE_DEFAULT_PROJECT
     calls = []
 
     async def fake_podman(args, timeout=120.0):
@@ -505,7 +505,7 @@ def test_admin_project_field_and_env(client, _admin_env, _isolate, monkeypatch):
     r3 = client.post("/api/sessions", headers=_auth("pal@ua.edu"))
     assert r3.status_code == 200, r3.text
     joined = " ".join(next(c for c in calls if c[0] == "run"))
-    assert "BILLET_DEFAULT_PROJECT=Demo" in joined
+    assert "CHUDWARE_DEFAULT_PROJECT=Demo" in joined
 
 
 def test_default_project_inherited(client, _admin_env, _isolate, monkeypatch):
@@ -538,7 +538,7 @@ def test_default_project_inherited(client, _admin_env, _isolate, monkeypatch):
     r3 = client.post("/api/sessions", headers=_auth("demo@example.com"))
     assert r3.status_code == 200, r3.text
     joined = " ".join(next(c for c in calls if c[0] == "run"))
-    assert "BILLET_DEFAULT_PROJECT=Demo" in joined
+    assert "CHUDWARE_DEFAULT_PROJECT=Demo" in joined
 
 
 def test_admin_browse_and_path_default(client, _admin_env, _isolate, monkeypatch, tmp_path):
@@ -582,8 +582,8 @@ def test_admin_browse_and_path_default(client, _admin_env, _isolate, monkeypatch
     run = next(c for c in calls if c[0] == "run")
     joined = " ".join(run)
     assert f"{proj}:/home/user/Projects/TeamParts:ro,z" in joined
-    assert "BILLET_DEFAULT_PROJECT=TeamParts" in joined
-    assert "BILLET_OPEN_DOC=Frame.step+" in joined
+    assert "CHUDWARE_DEFAULT_PROJECT=TeamParts" in joined
+    assert "CHUDWARE_OPEN_DOC=Frame.step+" in joined
 
 
 # ---------------------------------------------------------------- admin ops
@@ -592,7 +592,7 @@ def test_admin_ops_and_paste(client, _admin_env, _isolate, monkeypatch):
     # ops: admin-gated, reports host + limits even with no sessions
     assert client.get("/api/admin/ops", headers=_auth("demo@example.com")).status_code == 403
     async def fake_stats():
-        return {"billet-sess-demo": {"cpu": "3.0%", "mem": "1GB / 5GB"}}
+        return {"chudware-sess-demo": {"cpu": "3.0%", "mem": "1GB / 5GB"}}
     monkeypatch.setattr(mgr, "container_stats", fake_stats)
     r = client.get("/api/admin/ops", headers=_auth("boss@example.com"))
     assert r.status_code == 200
@@ -695,8 +695,8 @@ def _tmux_env(monkeypatch):
 
     if term._TMUX is None:
         pytest.skip("tmux not installed on host")
-    monkeypatch.setattr(term, "_SOCKET", "billet-pytest")
-    monkeypatch.setenv("BILLET_OMP_CMD", "true")
+    monkeypatch.setattr(term, "_SOCKET", "chudware-pytest")
+    monkeypatch.setenv("CHUDWARE_OMP_CMD", "true")
     # Start the tmux server directly (no systemd user scope) so the test is
     # hermetic on boxes without a user systemd bus.
     real_which = term.shutil.which
@@ -778,7 +778,7 @@ def test_users_yaml_emails_robust_parse(tmp_path, monkeypatch):
         "  - email: demo@example.com\n"           # dev-only, never synced
         "  - display: no-email-row\n"             # malformed row, ignored
     )
-    monkeypatch.setenv("BILLET_WEB_USERS_FILE", str(users))
+    monkeypatch.setenv("CHUDWARE_WEB_USERS_FILE", str(users))
     assert cf._users_yaml_emails() == ["quoted.user@gmail.com", "plain@ua.edu"]
 
 
@@ -786,7 +786,7 @@ def test_users_yaml_emails_flow_style(tmp_path, monkeypatch):
     cf = _load_cf_provision()
     users = tmp_path / "users.yaml"
     users.write_text("users: [{email: brother@gmail.com, role: user}]\n")
-    monkeypatch.setenv("BILLET_WEB_USERS_FILE", str(users))
+    monkeypatch.setenv("CHUDWARE_WEB_USERS_FILE", str(users))
     assert cf._users_yaml_emails() == ["brother@gmail.com"]
 
 
@@ -794,7 +794,7 @@ def test_include_list_never_quotes_email(tmp_path, monkeypatch):
     cf = _load_cf_provision()
     users = tmp_path / "users.yaml"
     users.write_text('users:\n  - email: "brother@gmail.com"\n')
-    monkeypatch.setenv("BILLET_WEB_USERS_FILE", str(users))
+    monkeypatch.setenv("CHUDWARE_WEB_USERS_FILE", str(users))
     inc = cf._include_list(cf._users_yaml_emails())
     emails = [r["email"]["email"] for r in inc if "email" in r]
     # A stray-quote email can never match in CF Access -> silently no OTP.

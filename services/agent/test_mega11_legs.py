@@ -348,7 +348,7 @@ def test_ecad_schematic_without_board_not_auto_done(tmp_path, monkeypatch):
     from services.agent.ledger import Ledger
     from services.agent import agent_turn as at
 
-    monkeypatch.setenv("AICAD_CACHE_ROOT", str(tmp_path))
+    monkeypatch.setenv("CHUDWARE_CACHE_ROOT", str(tmp_path))
     ledger = Ledger("mega11_ecad_boot", path=tmp_path / "ledger.json")
     seq = {"n": 0}
 
@@ -415,7 +415,7 @@ def test_ecad_schematic_then_board_auto_completes(tmp_path, monkeypatch):
     from services.agent.ledger import Ledger
     from services.agent import agent_turn as at
 
-    monkeypatch.setenv("AICAD_CACHE_ROOT", str(tmp_path))
+    monkeypatch.setenv("CHUDWARE_CACHE_ROOT", str(tmp_path))
     ledger = Ledger("mega11_ecad_ok", path=tmp_path / "ledger.json")
     seq = {"n": 0}
 
@@ -497,7 +497,7 @@ def test_ecad_force_chain_injects_board_after_place(tmp_path, monkeypatch):
     from services.agent.ledger import Ledger
     from services.agent import agent_turn as at
 
-    monkeypatch.setenv("AICAD_CACHE_ROOT", str(tmp_path))
+    monkeypatch.setenv("CHUDWARE_CACHE_ROOT", str(tmp_path))
     ledger = Ledger("mega13_ecad_chain", path=tmp_path / "ledger.json")
     seq = {"n": 0}
     seen_user = []
@@ -575,7 +575,7 @@ def test_ecad_wire_then_board_then_drc_chain(tmp_path, monkeypatch):
     from services.agent.ledger import Ledger
     from services.agent import agent_turn as at
 
-    monkeypatch.setenv("AICAD_CACHE_ROOT", str(tmp_path))
+    monkeypatch.setenv("CHUDWARE_CACHE_ROOT", str(tmp_path))
     ledger = Ledger("mega13_ecad_ok", path=tmp_path / "ledger.json")
     seq = {"n": 0}
 
@@ -707,7 +707,7 @@ def test_ecad_zero_tool_done_not_accepted(tmp_path, monkeypatch):
     from services.agent.ledger import Ledger
     from services.agent import agent_turn as at
 
-    monkeypatch.setenv("AICAD_CACHE_ROOT", str(tmp_path))
+    monkeypatch.setenv("CHUDWARE_CACHE_ROOT", str(tmp_path))
     ledger = Ledger("mega13_empty_done", path=tmp_path / "ledger.json")
     seq = {"n": 0}
 
@@ -769,7 +769,7 @@ def test_ecad_hard_gate_blocks_place_until_wire(tmp_path, monkeypatch):
     from services.agent.ledger import Ledger
     from services.agent import agent_turn as at
 
-    monkeypatch.setenv("AICAD_CACHE_ROOT", str(tmp_path))
+    monkeypatch.setenv("CHUDWARE_CACHE_ROOT", str(tmp_path))
     ledger = Ledger("mega13_hard_gate", path=tmp_path / "ledger.json")
     seq = {"n": 0}
 
@@ -826,7 +826,7 @@ def test_ecad_hard_gate_force_injects_wire_after_thrash(tmp_path, monkeypatch):
     from services.agent.ledger import Ledger
     from services.agent import agent_turn as at
 
-    monkeypatch.setenv("AICAD_CACHE_ROOT", str(tmp_path))
+    monkeypatch.setenv("CHUDWARE_CACHE_ROOT", str(tmp_path))
     ledger = Ledger("mega14_force_inject", path=tmp_path / "ledger.json")
     seq = {"n": 0}
     refs = {"n": 0}

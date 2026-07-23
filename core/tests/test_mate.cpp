@@ -1,4 +1,4 @@
-// Smoke tests for the C++ mate solver (aicad::mate). Mirrors the spirit of
+// Smoke tests for the C++ mate solver (chudware::mate). Mirrors the spirit of
 // engine/doc/test_mate_solver.py: rotation log/exp round-trips, the peg-in-hole
 // 1-DOF scenario, and align-flip. The full Python-vs-C++ parity lives in the
 // differential corpus harness (tools/mate_diff.py); this file just proves the
@@ -11,7 +11,7 @@
 #include <cmath>
 #include <random>
 
-using namespace aicad::mate;
+using namespace chudware::mate;
 using nlohmann::json;
 using Eigen::Vector3d;
 using Eigen::Matrix3d;

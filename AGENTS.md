@@ -13,18 +13,21 @@ built-in copilot, Claude Code, Cursor, …). Mechanical CAD, assemblies,
 drawings, sheet metal, CAM, ECAD/firmware, FEA/CFD, sourcing/BOM — one document
 model under all of it.
 
-Naming (compat rules live in README.md): the product **displays as Chudware**;
-the GUI binary/target stays `Billet` with an `AI-CAD` compat symlink beside it.
-`BILLET_*` env vars are canonical; `AI_CAD_*`/`AICAD_*` are still honored. The
-MCP server id is `billet` with `ai-cad` preserved.
+Naming (compat rules live in README.md): the product is **Chudware** (chudware.com). The
+GUI target is `Chudware` and the binary is `chudware`. `CHUDWARE_*` env vars are canonical;
+legacy `AI_CAD_*`/`AICAD_*`/`BILLET_*`/`SHOPCRAFT_*` are still honored (mapped at startup).
+The MCP server id is `chudware`. Back-compat that is NOT renamed (persisted on-disk / wire
+formats): the appdata dir reads a legacy `Billet`/`AI-CAD` install wholesale (new installs
+use `Chudware/`, no migration); PLM vault dir `.aicadvault`, mesh format `.aicm`, git refs
+`refs/aicad/*`, and `aicad.<x>/<n>` contract schema ids are kept for data compatibility.
 
-Architecture in one paragraph: the pure C++/CUDA kernel `libaicad` (under
+Architecture in one paragraph: the pure C++/CUDA kernel `libchudware` (under
 `core/`) IS the engine — the legacy Python engine (`engine_oracle/` + the root
 `engine` symlink) was fully strangled out and deleted in T-RF21 (zero-Python
 cutover, 2026-07-23); what Python remains lives under `services/` (MCP tools,
 agent, worker seam, pure-helper modules with no C++ counterpart). The C++ host
 under `host/` is the **sole GUI target** (~110k LOC under `host/src/ui/`); it
-talks to the shared `aicad-hostd` daemon (which dlopens `libaicad`) over a unix
+talks to the shared `chudware-hostd` daemon (which dlopens `libchudware`) over a unix
 socket, with `python -m services.worker_main` as the stdio worker for the
 services-side methods. The same `host/src/ui` tree compiles to WASM for the
 web app (`Webservice/README.md`), so desktop and web stay at parity by
@@ -63,16 +66,16 @@ Canonical references:
    modeling/CAM/ECAD-facing, refresh the touched `work/context/` section pack,
    and run `graphify update .`.
 4. **Verify before review.** `bash scripts/gate.sh` must show no new reds. GUI
-   work verifies via the headless screenshot harness (`AI_CAD_SHOT=<scenario>`).
+   work verifies via the headless screenshot harness (`CHUDWARE_SHOT=<scenario>`).
 
 ## Repo map (current on-disk reality)
 
 | Dir | Purpose |
 |-----|---------|
-| `core/` | Pure C++/CUDA kernel → `libaicad`: geom/doc/sketch/solver/cam/sim/ecad/mate/parts/agent/util/api/tests. **The engine** (zero-Python since T-RF21). |
-| `host/` | **The single GUI target.** Production C++ desktop host (~110k LOC under `host/src/ui/`), cross-platform (Linux GCC/Clang + Windows MSVC); the same tree compiles to WASM for the web app. Binary: `host/build-linux/bin/Billet` (`AI-CAD` compat symlink). Own GL pipeline under `host/src/render/`. |
+| `core/` | Pure C++/CUDA kernel → `libchudware`: geom/doc/sketch/solver/cam/sim/ecad/mate/parts/agent/util/api/tests. **The engine** (zero-Python since T-RF21). |
+| `host/` | **The single GUI target.** Production C++ desktop host (~110k LOC under `host/src/ui/`), cross-platform (Linux GCC/Clang + Windows MSVC); the same tree compiles to WASM for the web app. Binary: `host/build-linux/bin/Chudware` (`Chudware` compat symlink). Own GL pipeline under `host/src/render/`. |
 | `services/` | Python services: `agent/` (built-in agent loop; root `agent` symlink), `mcp/` (MCP server for external agents; root `mcp_server` symlink), `worker/` (C++ engine routing seam, four modules: worker_client / engine_backend / cpp_core / worker_router), `worker_main.py` (the stdio worker hostd spawns), `installer/` (provisioning, MCP registration, packaging), `ecad/`+`sim/`+`structural/`+`piping/`+`formats/` (pure-helper re-homes from the deleted Python engine), plus `dag/`, `deliverables/`, `plm/`, `browser/`, `ipc/`, `serving/` (LoRA adapter routing — not the webservice; the webservice is top-level `Webservice/`), `verify/`, `dist/`. |
-| `ui/viewport/` | AICM mesh-format loader (`render/aicm_loader.*`) consumed by `core/` (libaicad tests/tools). The rest of the former "shared renderer" extraction was orphaned (host builds its own pipeline in `host/src/render/`) and was purged in T-RF2. `ui/imgui`/`ui/abstract` (the AI-CAD2 shell) are retired and gone. |
+| `ui/viewport/` | AICM mesh-format loader (`render/aicm_loader.*`) consumed by `core/` (libchudware tests/tools). The rest of the former "shared renderer" extraction was orphaned (host builds its own pipeline in `host/src/render/`) and was purged in T-RF2. `ui/imgui`/`ui/abstract` (the AI-CAD2 shell) are retired and gone. |
 | `platform/` | Cross-OS shims (dialogs, DPI, paths, resources, window) with `_linux`/`_win32` implementations. |
 | `contracts/` | Frozen interface contracts — THE seams. Append-only, integrator-owned. |
 | `corpora/` | Consolidated test fixtures (`sketch/`, `render/`, `sw_parity/`, `sw_fixtures/`). Root `corpus*` symlinks preserve legacy paths. |
@@ -93,7 +96,7 @@ Canonical references:
   source. Per-OS bits (subprocess launch, file dialogs, GL loader) live behind
   CMake conditionals and the `platform/*_{linux,win32}.cpp` split.
 - Scripted GUI launches (gate.sh, tools/gui_parity/run_all.py) always use
-  `xvfb-run` when available unless `AI_CAD_SHOT_HEADED=1` is set. Set that env
+  `xvfb-run` when available unless `CHUDWARE_SHOT_HEADED=1` is set. Set that env
   var for interactive/walkthrough runs to see a real window.
 - **Derived-asset honesty:** screenshot-derived icons must show REAL engine
   output. CAM/Manufacture icons must render the real `cam_simulate` toolpath
@@ -109,43 +112,43 @@ green. It runs, in order:
    since T-RF3): `gui_lint` (icons exist in the atlas; no HiDPI-collapse theme bug),
    `feature_surface_audit` (every ribbon command routes to a real handler),
    `parity_audit` (SW_PARITY_SPEC claims resolve to real code).
-2. Core CMake/Ninja build — `libaicad` with `-DAICAD_WITH_OCCT=ON` (Linux
+2. Core CMake/Ninja build — `libchudware` with `-DCHUDWARE_WITH_OCCT=ON` (Linux
    `linux-core` preset). SKIPPED with a clear reason if system OCCT is absent —
    a SKIP is **not** a failure.
-3. Host GUI build: `cmake -S host -B host/build-linux -G Ninja` + `ninja Billet`;
+3. Host GUI build: `cmake -S host -B host/build-linux -G Ninja` + `ninja Chudware`;
    then a WASM build smoke (`./build.sh wasm` into a scratch dir — FATAL when
    emsdk is provisioned and the web build breaks).
-4. `ctest` on the core build, plus the `aicad-hostd` lifecycle smoke, plus the
+4. `ctest` on the core build, plus the `chudware-hostd` lifecycle smoke, plus the
    **web parity probe** (`scripts/web_parity_probe.py` enforcing
    `contracts/web_parity.md` over a scratch hostd with the Python worker bridge
    disabled — what the WASM client faces).
 5. Engine + agent pytest suites: `<venv>/python -X utf8 -m pytest engine/doc agent -q`.
    SKIPPED if the runtime venv/pytest is not provisioned on the box — again a
    SKIP, not a failure.
-6. `AI_CAD_SHOT=m1` headless screenshot smoke via `xvfb-run`, plus the
+6. `CHUDWARE_SHOT=m1` headless screenshot smoke via `xvfb-run`, plus the
    sensor-node golden demo, then a PASS/SKIP summary.
 
 Other entry points:
 
-- `./build.sh` — thin wrapper: builds core → `libaicad.so`, then the host GUI
-  → `host/build-linux/bin/Billet`. (`build.bat` on Windows.)
+- `./build.sh` — thin wrapper: builds core → `libchudware.so`, then the host GUI
+  → `host/build-linux/bin/Chudware`. (`build.bat` on Windows.)
 - Core presets (`CMakePresets.json`): `linux-core`, `windows-core` (MSVC,
   OCCT off, self-contained), `windows-occt` (auto-downloads OCCT 7.9.3 +
   Netgen, cached under `third_party/`). See `docs/reference/BUILD_WINDOWS.md`.
 - Host GUI has its own CMakeLists: `cmake -S host -B host/build-linux
-  -G Ninja -DCMAKE_BUILD_TYPE=Release && ninja -C host/build-linux Billet`.
+  -G Ninja -DCMAKE_BUILD_TYPE=Release && ninja -C host/build-linux Chudware`.
   CEF (embedded vendor sign-in browser) defaults ON and needs the SDK under
-  `extern/cef/` (`-DAI_CAD_ENABLE_CEF=OFF` for an SDK-less build).
+  `extern/cef/` (`-DCHUDWARE_ENABLE_CEF=OFF` for an SDK-less build).
 - Python runtime pins: `requirements.txt` (build123d, cadquery-ocp-novtk,
   numpy, scipy, pyvista/vtk, opencv-headless, …) — provisioned into the
-  managed runtime (`%APPDATA%\AI-CAD\runtime` on Windows).
+  managed runtime (`%APPDATA%\Chudware\runtime` on Windows).
 
 ## Swarm operating rules (binding during the refactor)
 
 - **No worktree isolation.** Worktrees here branch from a stale base and
   silently revert `master`. Run all subagents non-isolated in the main tree.
 - **One integrator agent** owns all shared / append-only files (top-level
-  CMake, `contracts/`, `AGENTS.md`, `scripts/gate.sh`, `core/api/libaicad.h`,
+  CMake, `contracts/`, `AGENTS.md`, `scripts/gate.sh`, `core/api/libchudware.h`,
   `contracts/worker_rpc.md`) and does **all git commits**. Leaf subagents
   never run git.
 - **Leaf subagents never touch files outside their assigned scope**; each node
@@ -205,8 +208,8 @@ Other entry points:
 - C++ core: `ctest --test-dir core/build-linux` (or the preset's build dir);
   GUI-adjacent unit tests build into `host/build-linux/bin/` (`test_aicm`,
   `test_camera_backend`, `test_splat_renderer`, …).
-- GUI verification: headless screenshot harness `AI_CAD_SHOT=<scenario>`; use
-  `xvfb-run` unless `AI_CAD_SHOT_HEADED=1`.
+- GUI verification: headless screenshot harness `CHUDWARE_SHOT=<scenario>`; use
+  `xvfb-run` unless `CHUDWARE_SHOT_HEADED=1`.
 - Test fixtures: `corpora/` (canonical) with root `corpus*` symlinks;
   SW-parity fixtures under `corpus_sw_parity/`.
 

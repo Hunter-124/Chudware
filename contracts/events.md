@@ -29,7 +29,7 @@ contact_sheet, stl_path, is_assembly, parts, fit}` · `plan {plan, raw}` — for
 | `run_finished` | `{run_id, status: "done"\|"failed"\|"cancelled", stop_reason, revision}` |
 
 Every orchestrator event is ALSO appended to
-`%APPDATA%\AI-CAD\cache\runs\<run_id>\events.jsonl` (one JSON per line, uncapped raw in
+`%APPDATA%\Chudware\cache\runs\<run_id>\events.jsonl` (one JSON per line, uncapped raw in
 sidecar files `attempt_<stage>_<n>.txt`) — the Activity panel replays from this after restart,
 and tests assert against it.
 

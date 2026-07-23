@@ -15,7 +15,7 @@
 
 #include "ecad/ops.h"  // OpError
 
-namespace aicad::ecad {
+namespace chudware::ecad {
 
 // ecad_new {kind: "sch"|"pcb", name?} -> ops-response + "doc_id".
 nlohmann::json ecad_new(const std::string& kind, const std::string& name);
@@ -134,17 +134,17 @@ nlohmann::json ecad_simulate(const std::string& doc_id, const nlohmann::json& st
                              const nlohmann::json& sim_params);
 
 // Return a deep COPY of an open session's document (for cross-target callers like
-// libaicad's OCCT-linked ecad_to_3d doc-id form, which lives outside aicad_ecad).
+// libchudware's OCCT-linked ecad_to_3d doc-id form, which lives outside chudware_ecad).
 // Throws OpError("unknown_doc") if no such session is open.
 nlohmann::json ecad_session_doc(const std::string& doc_id);
 
 // CRASH RECOVERY (P0 deadlock fix — mirrors force_release_doc_lock in doc/session.h).
 // Drop an orphaned ECAD session-store g_mtx lock left held by THIS thread after a
 // Windows structured exception (access violation) unwound past an EcadLock without
-// running its C++ destructor under /EHsc. Called from the libaicad C dispatch boundary's
+// running its C++ destructor under /EHsc. Called from the libchudware C dispatch boundary's
 // __except filter alongside force_release_doc_lock and force_release_drawing_lock so
 // ANY hardware fault releases ALL orphaned registry locks. Idempotent: no-ops if the
 // lock is not held by the current thread. Returns true if it released an orphaned lock.
 bool force_release_ecad_lock();
 
-}  // namespace aicad::ecad
+}  // namespace chudware::ecad

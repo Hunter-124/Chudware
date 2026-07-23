@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""aicad-hostd smoke gate (stdlib-only, check.py style).
+"""chudware-hostd smoke gate (stdlib-only, check.py style).
 
 Covers the daemon lifecycle contract from the hostd plan:
   1. spawn -> connect -> hello/ping -> engine call -> idle-exit within linger
@@ -8,9 +8,9 @@ Covers the daemon lifecycle contract from the hostd plan:
   3. --stop drains a running daemon
   4. kill -9 leaves a stale socket; the next connect-or-spawn recovers
 
-Usage: scripts/hostd_smoke.py [path/to/aicad-hostd]
-Defaults to core/build-occt-linux/bin/aicad-hostd, then core/build-linux.
-Exit 0 = all pass. Uses a scratch AICAD_INSTANCE_KEY so a real daemon (dev or
+Usage: scripts/hostd_smoke.py [path/to/chudware-hostd]
+Defaults to core/build-occt-linux/bin/chudware-hostd, then core/build-linux.
+Exit 0 = all pass. Uses a scratch CHUDWARE_INSTANCE_KEY so a real daemon (dev or
 installed) is never touched.
 """
 from __future__ import annotations
@@ -30,20 +30,20 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 def find_hostd() -> str:
     if len(sys.argv) > 1:
         return sys.argv[1]
-    for rel in ("core/build-occt-linux/bin/aicad-hostd", "core/build-linux/bin/aicad-hostd"):
+    for rel in ("core/build-occt-linux/bin/chudware-hostd", "core/build-linux/bin/chudware-hostd"):
         p = os.path.join(REPO, rel)
         if os.access(p, os.X_OK):
             return p
-    sys.exit("hostd_smoke: no aicad-hostd binary found (build core first)")
+    sys.exit("hostd_smoke: no chudware-hostd binary found (build core first)")
 
 
 def runtime_dir() -> str:
-    base = os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/aicad-{os.getuid()}"
-    return os.path.join(base, "aicad") if os.environ.get("XDG_RUNTIME_DIR") else base
+    base = os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/chudware-{os.getuid()}"
+    return os.path.join(base, "chudware") if os.environ.get("XDG_RUNTIME_DIR") else base
 
 
 class Client:
-    """Minimal mirror of aicad_ipc::EngineClient (connect-or-spawn + line RPC)."""
+    """Minimal mirror of chudware_ipc::EngineClient (connect-or-spawn + line RPC)."""
 
     def __init__(self, hostd: str, key: str, spawn: bool = True, budget_s: float = 15.0):
         self.sock_path = os.path.join(runtime_dir(), f"hostd-{key}.sock")
@@ -114,12 +114,12 @@ def wait_gone(pid: int, timeout_s: float) -> bool:
 def main() -> int:
     hostd = find_hostd()
     fails = []
-    env_linger = os.environ.get("AICAD_HOSTD_LINGER_SECS")
-    os.environ["AICAD_HOSTD_LINGER_SECS"] = "2"
-    if not os.environ.get("AI_CAD_LIBAICAD"):
-        lib = os.path.join(os.path.dirname(hostd), "libaicad.so")
+    env_linger = os.environ.get("CHUDWARE_HOSTD_LINGER_SECS")
+    os.environ["CHUDWARE_HOSTD_LINGER_SECS"] = "2"
+    if not os.environ.get("CHUDWARE_LIBCHUDWARE"):
+        lib = os.path.join(os.path.dirname(hostd), "libchudware.so")
         if os.path.exists(lib):
-            os.environ["AI_CAD_LIBAICAD"] = lib
+            os.environ["CHUDWARE_LIBCHUDWARE"] = lib
 
     def check(name: str, ok: bool, detail: str = ""):
         print(f"  {'PASS' if ok else 'FAIL'}  {name}{('  ' + detail) if detail else ''}")
@@ -128,7 +128,7 @@ def main() -> int:
 
     # --- 1. basic lifecycle -------------------------------------------------
     key = "smoke-" + uuid.uuid4().hex[:8]
-    os.environ["AICAD_INSTANCE_KEY"] = key
+    os.environ["CHUDWARE_INSTANCE_KEY"] = key
     c = Client(hostd, key)
     hello = c.call("hello", {"client": "test", "pid": os.getpid(), "proto": 1})
     check("hello", "result" in hello and hello["result"].get("proto") == 1)
@@ -148,7 +148,7 @@ def main() -> int:
 
     # --- 2. dual-client race ------------------------------------------------
     key = "smoke-" + uuid.uuid4().hex[:8]
-    os.environ["AICAD_INSTANCE_KEY"] = key
+    os.environ["CHUDWARE_INSTANCE_KEY"] = key
     import threading
     results: dict[int, int] = {}
     def racer(i: int):
@@ -172,7 +172,7 @@ def main() -> int:
 
     # --- 4. stale-socket recovery after kill -9 ------------------------------
     key = "smoke-" + uuid.uuid4().hex[:8]
-    os.environ["AICAD_INSTANCE_KEY"] = key
+    os.environ["CHUDWARE_INSTANCE_KEY"] = key
     c = Client(hostd, key)
     pid = c.call("daemon_status")["result"]["pid"]
     os.kill(pid, signal.SIGKILL)  # socket + lock files remain on disk
@@ -184,7 +184,7 @@ def main() -> int:
     wait_gone(pid2, 15.0)
 
     if env_linger is None:
-        os.environ.pop("AICAD_HOSTD_LINGER_SECS", None)
+        os.environ.pop("CHUDWARE_HOSTD_LINGER_SECS", None)
     print(f"hostd_smoke: {'OK' if not fails else 'FAILED: ' + ', '.join(fails)}")
     return 0 if not fails else 1
 

@@ -48,7 +48,7 @@ from deliverables import joins as J, project  # noqa: E402
 @pytest.fixture(autouse=True)
 def _project(tmp_path, monkeypatch):
     """Point the project dir at a fresh tmp dir for each test (project.py reads the env live)."""
-    monkeypatch.setenv("AICAD_PROJECT_DIR", str(tmp_path))
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(tmp_path))
     yield
 
 

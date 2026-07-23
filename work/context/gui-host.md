@@ -18,7 +18,7 @@ Liquid-glass v2 overlay design (docs/GLASS_DESIGN_SPEC.md, HANDOFF_GUI_OVERHAUL.
 
 ## Debugging playbook
 - Build (serialized): `flock /tmp/host-build-linux.lock -c "cmake --build host/build-linux -j$(nproc)"` (never run two builds against one dir concurrently)
-- Screenshot harness: `AI_CAD_SHOT=m1|sketch|appearance|fea|drawing|asm|multidoc AI_CAD_REPO="$PWD" host/build-linux/bin/Billet --ui-screenshot out.png` (per-step PNGs in scratch/<scn>_shots/). Binary renamed from AI-CAD; an `AI-CAD` compat symlink remains in bin/.
+- Screenshot harness: `CHUDWARE_SHOT=m1|sketch|appearance|fea|drawing|asm|multidoc CHUDWARE_REPO="$PWD" host/build-linux/bin/Chudware --ui-screenshot out.png` (per-step PNGs in scratch/<scn>_shots/). Binary renamed from Chudware; an `Chudware` compat symlink remains in bin/.
 - Gotcha: FeatureManager input regression (commit 043e752 added NoBringToFrontOnFocus — fixed by removal); watch FM collapse pill edge-publish
 - Gotcha: viewport HUD clip + sketch overlay dodge columns via `overlayColumnEdge(0/1)` (safe-area inset to inter-column bounds)
 - Gotcha: PropertyManager tab removed — PM commands now nested inside FeatureManager tab (header text switches to "Property Manager" when active)
@@ -29,8 +29,8 @@ Liquid-glass v2 overlay design (docs/GLASS_DESIGN_SPEC.md, HANDOFF_GUI_OVERHAUL.
 Note: graphify-out does NOT index host/src directly — use targeted grep/read for renderer.cpp details, panel editors, input dispatch.
 
 ## Related tasks/docs
-- work/tasks: grep T-G* (GUI workstream 1–10 tasks, landing liquid-glass, renaming to ShopCraft, migration DAG)
-- docs/HANDOFF_GUI_OVERHAUL.md (glass core API + styling wave audit), docs/HANDOFF_SHOPCRAFT_GUI_POLISH.md (FM input fix, transparent columns, Copilot header, sketch HUD dodge)
+- work/tasks: grep T-G* (GUI workstream 1–10 tasks, landing liquid-glass, renaming to Chudware, migration DAG)
+- docs/HANDOFF_GUI_OVERHAUL.md (glass core API + styling wave audit), docs/HANDOFF_CHUDWARE_GUI_POLISH.md (FM input fix, transparent columns, Copilot header, sketch HUD dodge)
 - docs/GUI_MIGRATION_DAG.md (node specs, write-sets, verify commands for porting to ui/imgui/)
 - host/DEPRECATED.md (deletion gate criteria: ui/imgui standalone build, feature-surface parity, headless screenshot smoke)
 - docs/GLASS_DESIGN_SPEC.md (design principles, 4 material levels, spacing grid, per-panel rules)

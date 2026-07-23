@@ -504,22 +504,22 @@ bool firmwareProjectsExistOnDisk() {
     if (now - lastProbe < 5.0) return cached;
     lastProbe = now;
     cached = false;
-    // Mirror engine.firmware.project.firmware_root(): AI_CAD_FIRMWARE_DIR override,
-    // else %APPDATA%/AI-CAD/firmware, else <tmp>/AI-CAD/firmware (Python
+    // Mirror engine.firmware.project.firmware_root(): CHUDWARE_FIRMWARE_DIR override,
+    // else %APPDATA%/Chudware/firmware, else <tmp>/Chudware/firmware (Python
     // tempfile.gettempdir() honors TMPDIR/TEMP/TMP, then /tmp).
     namespace fs = std::filesystem;
     std::error_code ec;
     fs::path root;
-    if (const char* ov = std::getenv("AI_CAD_FIRMWARE_DIR"); ov && *ov) {
+    if (const char* ov = std::getenv("CHUDWARE_FIRMWARE_DIR"); ov && *ov) {
         root = ov;
     } else if (const char* ad = std::getenv("APPDATA"); ad && *ad) {
-        root = fs::path(ad) / "AI-CAD" / "firmware";
+        root = fs::path(ad) / "Chudware" / "firmware";
     } else {
         const char* tmp = std::getenv("TMPDIR");
         if (!tmp || !*tmp) tmp = std::getenv("TEMP");
         if (!tmp || !*tmp) tmp = std::getenv("TMP");
         if (!tmp || !*tmp) tmp = "/tmp";
-        root = fs::path(tmp) / "AI-CAD" / "firmware";
+        root = fs::path(tmp) / "Chudware" / "firmware";
     }
     if (!fs::is_directory(root, ec) || ec) return false;
     for (fs::directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
@@ -1629,20 +1629,20 @@ static void drawBottomDock(AppState& st, float h) {
     ui::popGlassChildStyle();
 }
 
-// ---- AI_CAD_SHOT=firmware fixture ---------------------------------------------------------
+// ---- CHUDWARE_SHOT=firmware fixture ---------------------------------------------------------
 
 void seedFirmwareShotFixture() {
     FwState& s = S();
     FwProject p;
     p.id = "fw_canned"; p.name = "blinky (canned)"; p.mcu = "cortex-m4"; p.toolchain = "cmake";
-    p.srcs = {"src/main.c", "include/pinmap.h", "include/aicad_trace.h"};
-    p.rootDir = "/tmp/aicad-firmware/fw_canned";
+    p.srcs = {"src/main.c", "include/pinmap.h", "include/chudware_trace.h"};
+    p.rootDir = "/tmp/chudware-firmware/fw_canned";
     s.projects.push_back(std::move(p));
     s.selected = 0;
     s.listedOnce = true;
 
     s.buildDone = true; s.buildOk = true; s.buildMs = 1834.0;
-    s.elfPath = "/tmp/aicad-firmware/fw_canned/build/blinky.elf";
+    s.elfPath = "/tmp/chudware-firmware/fw_canned/build/blinky.elf";
     s.warnings = {
         "src/main.c:42:9: warning: unused variable 'tick' [-Wunused-variable]",
         "src/main.c:57:5: warning: implicit declaration of function 'delay_ms'",
@@ -1650,9 +1650,9 @@ void seedFirmwareShotFixture() {
 
     s.simDone = true; s.simPassed = true; s.simMs = 2210.0;
     s.uartLog = "boot: blinky v0.1\nhello from PA5 blink loop\nAICAD_GPIO_EVT PA5=1 t=100ms\n"
-                "AICAD_GPIO_EVT PA5=0 t=200ms\nloop tick 1\nloop tick 2\n";
+                "CHUDWARE_GPIO_EVT PA5=0 t=200ms\nloop tick 1\nloop tick 2\n";
     s.assertionLines = {"PASS  uart:hello", "PASS  gpio:PA5=1@>50ms"};
-    s.tracePath = "/tmp/aicad-firmware/fw_canned/build/blinky.elf.trace.json";
+    s.tracePath = "/tmp/chudware-firmware/fw_canned/build/blinky.elf.trace.json";
     for (int i = 0; i < 8; ++i) {
         GpioEvent e;
         e.pin = "PA5"; e.level = i % 2 == 0 ? 1 : 0;

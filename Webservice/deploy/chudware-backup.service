@@ -1,5 +1,5 @@
 [Unit]
-Description=billet-web data backup (PLM repos, users, chat, homes)
+Description=chudware-web data backup (PLM repos, users, chat, homes)
 
 [Service]
 Type=oneshot

@@ -34,8 +34,8 @@ from typing import Any
 
 # ------------------------------------------------------------------ constants
 
-_FEATURE_COUNT_LIMIT: int = int(os.environ.get("AI_CAD_PREFLIGHT_FEATURE_LIMIT", "200"))
-_CLONE_BUDGET_S: float = float(os.environ.get("AI_CAD_PREFLIGHT_BUDGET_S", "2.0"))
+_FEATURE_COUNT_LIMIT: int = int(os.environ.get("CHUDWARE_PREFLIGHT_FEATURE_LIMIT", "200"))
+_CLONE_BUDGET_S: float = float(os.environ.get("CHUDWARE_PREFLIGHT_BUDGET_S", "2.0"))
 
 # ------------------------------------------------------------------ ledger shim
 #
@@ -53,7 +53,7 @@ def _ledger_append(event: dict) -> None:
         pass
     # Local JSONL shim — same event shape as aicad.ledger/1.
     shim_path = os.environ.get(
-        "AI_CAD_PREFLIGHT_LEDGER",
+        "CHUDWARE_PREFLIGHT_LEDGER",
         str(_repo_root() / "preflight_events.jsonl"),
     )
     try:

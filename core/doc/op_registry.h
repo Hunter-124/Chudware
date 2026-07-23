@@ -14,7 +14,7 @@
 #include <string>
 #include <vector>
 
-namespace aicad::doc {
+namespace chudware::doc {
 
 // Canonical list of document op kinds accepted by apply_one.
 std::vector<std::string> doc_op_kinds();
@@ -37,8 +37,8 @@ std::string doc_ops_cheatsheet_snippet();
 
 // JSON payload for the doc_list_ops RPC / Python bridge:
 //   {ops:[...], feature_types:[...], example_add_feature:{...}}
-// Implemented in op_registry.cpp as nlohmann via free function in session/libaicad.
+// Implemented in op_registry.cpp as nlohmann via free function in session/libchudware.
 // Declared here as a string-building helper that does not pull json headers into
 // every TU; the JSON form is assembled at the RPC boundary.
 
-}  // namespace aicad::doc
+}  // namespace chudware::doc

@@ -1116,7 +1116,7 @@ void plmDrawSettingsPage(AppState& st) {
     plmPanelBegin("##set_ai", "AI assistance", "health_check", colW);
     dimText("How much the assistant helps with history. Manual controls are always "
             "available. Managed lets the AI record checkpoints itself at task "
-            "boundaries (no env flag needed; overrides AICAD_PLM_BRIDGE).");
+            "boundaries (no env flag needed; overrides CHUDWARE_PLM_BRIDGE).");
     struct Mode { const char* id; const char* label; };
     static const Mode kModes[] = {
         {"manual", "Manual"}, {"assisted", "Assisted"}, {"managed", "Managed"},

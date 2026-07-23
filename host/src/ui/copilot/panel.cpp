@@ -1,4 +1,4 @@
-// AI-CAD Copilot pane (T-RF6 split of legacy_chat.cpp — this file is the pane host).
+// Chudware Copilot pane (T-RF6 split of legacy_chat.cpp — this file is the pane host).
 //
 // A PINNED, full-height, rounded liquid-glass column overlaid on the viewport's right edge with
 // ~12dp margins (geometry from ui::viewportBackdrop(); invisible left-edge drag zone to resize;
@@ -864,12 +864,12 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
             saveSettings(st.settings);
         }
         if (s_paneW <= 0.0f) s_paneW = ui::metrics::dockRightTarget();
-        if (std::getenv("AI_CAD_COPILOT_NARROW"))       // T-G17 shot: capture the narrowest column
+        if (std::getenv("CHUDWARE_COPILOT_NARROW"))       // T-G17 shot: capture the narrowest column
             s_paneW = ui::metrics::dockRightMin();
-        // T-G21 shot: mirrors AI_CAD_FM_COLLAPSED — --ui-screenshot always resets the overlay
+        // T-G21 shot: mirrors CHUDWARE_FM_COLLAPSED — --ui-screenshot always resets the overlay
         // columns for determinism (see the reset branch above), which clobbers the persisted
         // collapse setting before it can render; force it back for the collapsed capture.
-        if (std::getenv("AI_CAD_COPILOT_COLLAPSED")) {
+        if (std::getenv("CHUDWARE_COPILOT_COLLAPSED")) {
             s_cpCollapsed = true;
             s_cpAnim.snap(true, colH);  // snap immediately — headless captures must not depend on frame count
         }
@@ -942,12 +942,12 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
     syncChatToDoc(st);
     maybePersistChatHistoryDebounced(st, /*force=*/false);
 
-    // T-G17 screenshot hook: AI_CAD_COPILOT_VIEW forces a Copilot sub-view (and tops up a couple of
+    // T-G17 screenshot hook: CHUDWARE_COPILOT_VIEW forces a Copilot sub-view (and tops up a couple of
     // demo sessions) so the sessions/settings layouts can be captured headless in both themes. Runs
     // AFTER syncChatToDoc (which rebinds st.conversations to the doc) and re-tops-up each frame so
     // the demo rows survive to the capture frame. Screenshot-only — gated on the env var, no effect
     // in a normal run.
-    if (const char* cpView = std::getenv("AI_CAD_COPILOT_VIEW")) {
+    if (const char* cpView = std::getenv("CHUDWARE_COPILOT_VIEW")) {
         ensureConversations(st);
         st.conversations[0].title = "Knurled hex standoff";
         while (st.conversations.size() < 3) {

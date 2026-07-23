@@ -1,4 +1,4 @@
-# T-WEB2 — billet-web finish-line consult (auth keys + PLM bootstrap + v1 DoD)
+# T-WEB2 — chudware-web finish-line consult (auth keys + PLM bootstrap + v1 DoD)
 
 Driver: web-service session. Hunter delegated decisions to the advisor.
 Context: T-WEB1 shipped and is live (cad.scootware.us behind CF Access; per-user
@@ -13,7 +13,7 @@ Friction: every friend does an email-OTP dance; Hunter must edit BOTH the Access
 policy and users.yaml.
 Proposal: keep CF Access at the edge, ADD gateway-minted invite links:
 `/join?k=<token>` where token = HMAC-SHA256(itsdangerous-style, secret in
-~/billet-web-data/secrets/gateway_secret) over {email, exp(default 30d)}; visit
+~/chudware-web-data/secrets/gateway_secret) over {email, exp(default 30d)}; visit
 sets a signed HttpOnly cookie (same signing); middleware accepts CF-JWT OR
 valid key cookie, both still requiring users.yaml membership. Admin mints via
 CLI (`python -m gateway.invite alice@x`) or admin-only /api/invites.
@@ -28,10 +28,10 @@ Built: services/plm/remote.py (seed/clone/sync/lock), /plm mount, author env.
 Missing: nothing seeds a shared project or clones into a session HOME.
 Proposal:
 1. Host-side (gateway setup or CLI `python -m gateway.plm_seed <name> [--from dir]`):
-   create ~/billet-web-data/plm/<name>.git bare via plm remote.seed_remote from
+   create ~/chudware-web-data/plm/<name>.git bare via plm remote.seed_remote from
    a template project (empty vault or a sample part from samples/).
 2. Session entrypoint: for each *.git in /plm, if ~/Projects/<name> absent →
-   remote.clone_from_remote into it (venv python, AI_CAD_REPO on path); if
+   remote.clone_from_remote into it (venv python, CHUDWARE_REPO on path); if
    present → remote.sync(pull-only fast-forward) at START. No sync on stop
    (user saves are explicit; a stop-time push could publish half-work — but
    T-WEB1 Q3.5 said auto-sync on start/end; re-rule with the CAS/variant
@@ -62,11 +62,11 @@ Candidates: (a) selkies/WebCodecs backend [defer?]; (b) warm seat pool [defer?];
 4. **Cookie theft / middleware risk.** Parsing another cookie is *structurally* easy (middleware already parses cookies; ASGI covers HTTP+WS), but OR-ing “CF-JWT **or** invite cookie” creates a durable second trust root that must never be weaker than Access (Secure; HttpOnly; SameSite=Lax; short TTL; no token in query after redeem). Unnecessary attack surface for zero friction win.
 5. **Dual-edit friction is real — fix the operator path, not auth.** Hunter still maintains Access policy **and** `users.yaml`. Keys do not collapse that. **Do:** one operator command that reads `users.yaml` and updates the Access include-email policy via existing `cf_provision.py` / Zero Trust API (emails already a first-class input there). That is the friction fix.
 
-**Token format if anyone reopens this later (not v1):** never leave long-lived secrets in `?k=`; one-time redeem → HttpOnly cookie; HMAC over `{email, exp, nonce}` with secret under `~/billet-web-data/secrets/` (mode 0600); default exp **7d** not 30d; single-use nonce store. Still only useful if Access policy is deliberately opened — which we refuse for v1.
+**Token format if anyone reopens this later (not v1):** never leave long-lived secrets in `?k=`; one-time redeem → HttpOnly cookie; HMAC over `{email, exp, nonce}` with secret under `~/chudware-web-data/secrets/` (mode 0600); default exp **7d** not 30d; single-use nonce store. Still only useful if Access policy is deliberately opened — which we refuse for v1.
 
 ### Q2 PLM bootstrap — **RATIFY with amendments**
 
-**Ratify direction:** host bare remotes under `~/billet-web-data/plm/<name>.git`; session private clones under `~/Projects/<name>`; `/plm` shared mount stays **bare-only** (already `:U` rw in `sessions.py` `_podman_run`). Concurrent dulwich CAS on bare refs is the contract model (`remote._cas_push` expected-old; §6.3) — **safe enough for v1** as long as nothing puts a working tree on `/plm`. No shared working-tree mount (T-WEB1 still holds).
+**Ratify direction:** host bare remotes under `~/chudware-web-data/plm/<name>.git`; session private clones under `~/Projects/<name>`; `/plm` shared mount stays **bare-only** (already `:U` rw in `sessions.py` `_podman_run`). Concurrent dulwich CAS on bare refs is the contract model (`remote._cas_push` expected-old; §6.3) — **safe enough for v1** as long as nothing puts a working tree on `/plm`. No shared working-tree mount (T-WEB1 still holds).
 
 **Amendments (binding):**
 
@@ -74,8 +74,8 @@ Candidates: (a) selkies/WebCodecs backend [defer?]; (b) warm seat pool [defer?];
    `seed_remote` *can* `Repo.init_bare` + symbolic HEAD only. But `clone_from_remote` only calls `add_remote(... origin ...)` when `tip is not None`. Empty bare → clone “succeeds”, **no origin in manifest**, later `sync` → `not_found`.  
    **DoD for seed:** host CLI `python -m gateway.plm_seed <name> [--from dir]` must (a) `plm_init`/vault a template (empty manifest commit **or** sample from `samples/`), (b) `seed_remote` so remote has a real `refs/heads/master` tip, (c) land at `settings.plm_dir / f"{name}.git"`. Prefer a **Demo** project with one sample part over a void vault.
 
-2. **Session entrypoint bootstrap (missing today).** `entrypoint.sh` exports `BILLET_PLM_DIR` but never clones. Add after HOME mkdir, before Billet:  
-   for each `/plm/*.git` → name=`basename .git`; dest=`$HOME/Projects/$name`; if no `$dest/.aicadvault` → `clone_from_remote`; elif present → `sync` **pull path only** (see §3). Use image venv: `"$AI_CAD_PYTHON" -c 'from services.plm import remote; …'` with `AI_CAD_REPO` on `PYTHONPATH`. Failures log + continue (seat still boots).
+2. **Session entrypoint bootstrap (missing today).** `entrypoint.sh` exports `CHUDWARE_PLM_DIR` but never clones. Add after HOME mkdir, before Chudware:  
+   for each `/plm/*.git` → name=`basename .git`; dest=`$HOME/Projects/$name`; if no `$dest/.aicadvault` → `clone_from_remote`; elif present → `sync` **pull path only** (see §3). Use image venv: `"$CHUDWARE_PYTHON" -c 'from services.plm import remote; …'` with `CHUDWARE_REPO` on `PYTHONPATH`. Failures log + continue (seat still boots).
 
 3. **Stop-time sync — RE-RULE: NO auto-push on stop.**  
    - **Start:** pull/FF only (fetch + materialize if behind; never push).  
@@ -88,11 +88,11 @@ Candidates: (a) selkies/WebCodecs backend [defer?]; (b) warm seat pool [defer?];
 ### Q3 v1 DoD — ordered
 
 #### MUST-DO-NOW (≤6)
-1. **PLM seed CLI + one Demo bare** with real tip under `~/billet-web-data/plm/` — empty seat is demo-fail (T-WEB1 §A3).
+1. **PLM seed CLI + one Demo bare** with real tip under `~/chudware-web-data/plm/` — empty seat is demo-fail (T-WEB1 §A3).
 2. **Entrypoint clone + start-only pull** for `/plm/*.git` → `~/Projects/<name>` — the unbuilt glue; no stop push.
 3. **`/transfer` live browser smoke** once (upload STEP → open in seat → download) — unit tests exist; path is demo-critical and unproven live.
 4. **Operator dual-list path** — script/RUNBOOK step: `users.yaml` emails → CF Access policy update (reuse `cf_provision.py`); documents that invite-keys are rejected.
-5. **`billet-monitor.timer` live-fire** — enable, one real sample, confirm JSONL + optional `REFUSE_NEW` dry path; host must not melt unattended.
+5. **`chudware-monitor.timer` live-fire** — enable, one real sample, confirm JSONL + optional `REFUSE_NEW` dry path; host must not melt unattended.
 6. **Stream honesty for demo** — ship/verify **novnc** path as default working stream (`entrypoint` already falls back; selkies pip is legacy/broken on Fedora). Portal/iframe must not assume WebCodecs Selkies.
 
 #### DEFERRED (one-line each)
@@ -103,7 +103,7 @@ Candidates: (a) selkies/WebCodecs backend [defer?]; (b) warm seat pool [defer?];
 - **(f) locks in `status()` / locks UI** — `plm_lock` CAS exists; Hub badges not demo-blocking for N small.
 - **Invite keys / Access path bypass** — rejected Q1.
 - **Stop-time auto `plm_sync` push** — rejected Q2.
-- **SSH/HTTPS remotes, merge UI, aicad-cloud** — out of `aicad.plm/1` folder subset.
+- **SSH/HTTPS remotes, merge UI, chudware-cloud** — out of `aicad.plm/1` folder subset.
 
 ### Top risks
 1. **Empty-bare seed + clone** ships a vault without `origin` → first sync fails; always seed a committed tip.

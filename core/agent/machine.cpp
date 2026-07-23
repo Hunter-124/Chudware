@@ -9,7 +9,7 @@
 #include <mutex>
 #include <vector>
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 
 const std::map<std::string, int> kDefaultBudgets = {
@@ -905,4 +905,4 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
 }
 
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware

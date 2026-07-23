@@ -1,6 +1,6 @@
 """Self-contained folded-stacks -> SVG flame graph (no Perl / Node / external deps).
 
-The AI-CAD sampling profiler (core/prof/sampler.cpp) emits Brendan-Gregg "folded" stacks:
+The Chudware sampling profiler (core/prof/sampler.cpp) emits Brendan-Gregg "folded" stacks:
 each line is ``root_frame;next;...;leaf_frame <sample_count>``. This renders them as an
 interactive-ish flame graph SVG (hover tooltips via <title>), so you can SEE where modeling
 time goes without uploading anything. (You can also drop the .folded or the .speedscope.json
@@ -67,7 +67,7 @@ def _module_of(frame: str) -> str:
 # A small fixed palette for the modules that matter, so the same subsystem keeps its colour
 # across runs. Everything else gets a stable hash-derived warm colour.
 _MODULE_COLORS = {
-    "libaicad": "#4e79a7",   # our dispatch / sketch solver / doc compile (cool = "us")
+    "libchudware": "#4e79a7",   # our dispatch / sketch solver / doc compile (cool = "us")
     "TKBO": "#e15759",       # booleans  (fuse/cut/common)  -> red
     "TKBRep": "#f28e2b",     # B-rep core
     "TKFillet": "#edc948",   # fillet / chamfer (blends)
@@ -98,7 +98,7 @@ MARGIN_X = 10
 PAD_TOP = 54
 
 
-def render_svg(folded_text: str, title: str = "AI-CAD modeling profile") -> str:
+def render_svg(folded_text: str, title: str = "Chudware modeling profile") -> str:
     root = _build_tree(folded_text)
     total = root.total
     if total <= 0:

@@ -15,7 +15,7 @@
 #include <nlohmann/json.hpp>
 #include "agent/firm_team.h"
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 
 using nlohmann::json;
@@ -24,7 +24,7 @@ extern const char* kDefaultLocalModel;     // "gemma-4-e4b"
 extern const char* kDefaultLocalBaseUrl;   // "http://localhost:1234/v1"
 extern const char* kOfflineSetting;        // "offline_mode"
 
-// Load the ambient user config (paths_config() == %APPDATA%/AI-CAD/config.json).
+// Load the ambient user config (paths_config() == %APPDATA%/Chudware/config.json).
 // Mirrors agent/config.py load_config(): parse the file if it exists, returning {}
 // on a missing file or any parse error (never throws). This is the SAME config the
 // Python agent reads, so a config-resolved provider matches the Python behavior.
@@ -45,7 +45,7 @@ bool host_is_loopback(const std::string& base_url);
 bool provider_offline_safe(const json& provider);
 
 // Resolve to a descriptor. `env` carries explicit overrides for determinism in
-// the gate: {AI_CAD_PROVIDER?, ANTHROPIC_API_KEY?, OPENAI_API_KEY?}. Absent keys
+// the gate: {CHUDWARE_PROVIDER?, ANTHROPIC_API_KEY?, OPENAI_API_KEY?}. Absent keys
 // fall back to the real getenv. Returns a descriptor; on an offline refusal (or
 // unknown provider) the returned object carries an "error" string instead.
 // `cfg` is taken by value: for subscription providers the resolver may refresh a
@@ -145,4 +145,4 @@ json resolve_eng_firm_provider(const EngFirmModelEntry& e, const json& cfg,
 std::string eng_firm_discipline_key(Discipline d);
 
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware

@@ -15,18 +15,18 @@
 #include "firmware/scenario.h"
 #include "firmware/subprocess.h"
 
-namespace aicad::firmware {
+namespace chudware::firmware {
 namespace {
 
 constexpr size_t kUartCap = 32000;
 
-// AICAD_GPIO_EVT <PIN>=<level>[ t=<num>[ms|us|s]] — emitted by BOTH backends.
+// CHUDWARE_GPIO_EVT <PIN>=<level>[ t=<num>[ms|us|s]] — emitted by BOTH backends.
 const std::regex kGpioEvtRe(
-    R"(AICAD_GPIO_EVT\s+([A-Za-z_][A-Za-z0-9_]*)=([01])(?:\s+t=([0-9]+(?:\.[0-9]+)?)(ms|us|s)?)?)");
-const std::regex kOdrBeginRe(R"(AICAD_GPIO_ODR_BEGIN\s+([A-K]))");
-const std::regex kOdrEndRe(R"(AICAD_GPIO_ODR_END\s+([A-K]))");
+    R"(CHUDWARE_GPIO_EVT\s+([A-Za-z_][A-Za-z0-9_]*)=([01])(?:\s+t=([0-9]+(?:\.[0-9]+)?)(ms|us|s)?)?)");
+const std::regex kOdrBeginRe(R"(CHUDWARE_GPIO_ODR_BEGIN\s+([A-K]))");
+const std::regex kOdrEndRe(R"(CHUDWARE_GPIO_ODR_END\s+([A-K]))");
 const std::regex kHexRe(R"(0x[0-9a-fA-F]+)");
-const std::regex kTMarkRe(R"(AICAD_T_MARK\s+([0-9]+(?:\.[0-9]+)?))");
+const std::regex kTMarkRe(R"(CHUDWARE_T_MARK\s+([0-9]+(?:\.[0-9]+)?))");
 const std::regex kStm32PinRe(R"(^P([A-K])(\d{1,2})$)");
 const std::regex kReplUartRe(R"(^(\w+)\s*:\s*UART\.)");
 
@@ -134,7 +134,7 @@ SimResult run_renode(const std::string& elf_path, const std::string& platform_fi
         }
         namespace fs = std::filesystem;
         fs::path dir = fs::temp_directory_path() /
-                       fs::path("aicad_scenario_" + std::to_string(
+                       fs::path("chudware_scenario_" + std::to_string(
                            std::chrono::steady_clock::now().time_since_epoch().count()));
         scenario_dir = dir.string();
         materialize_aux_files(plan, scenario_dir);
@@ -148,7 +148,7 @@ SimResult run_renode(const std::string& elf_path, const std::string& platform_fi
                                   scenario_setup, scenario_timeline);
     namespace fs = std::filesystem;
     fs::path resc_path = fs::temp_directory_path() /
-                         ("aicad_" + std::to_string(
+                         ("chudware_" + std::to_string(
                               std::chrono::steady_clock::now().time_since_epoch().count()) +
                           ".resc");
     {
@@ -317,8 +317,8 @@ nlohmann::json parse_uart_events(const std::string& text) {
             continue;
         }
         std::string s = trim(lines[i]);
-        if (s.empty() || s.find("AICAD_GPIO_EVT") != std::string::npos ||
-            s.find("AICAD_GPIO_ODR_") != std::string::npos)
+        if (s.empty() || s.find("CHUDWARE_GPIO_EVT") != std::string::npos ||
+            s.find("CHUDWARE_GPIO_ODR_") != std::string::npos)
             continue;
         events.push_back({{"type", "uart"},
                           {"seq", static_cast<long long>(i)},
@@ -526,7 +526,7 @@ nlohmann::json evaluate_assertions(const std::string& uart_log,
             if (stamped.empty()) {
                 results.push_back(assertion_result(
                     a, false, "no time-stamped uart events (uart timestamps come from the "
-                              "scenario timeline's AICAD_T_MARK markers)"));
+                              "scenario timeline's CHUDWARE_T_MARK markers)"));
                 continue;
             }
             const nlohmann::json* hit = nullptr;
@@ -694,7 +694,7 @@ std::string build_resc(const std::string& elf_path, const std::string& platform_
     if (!uart_name.empty()) lines.push_back("showAnalyzer sysbus." + uart_name);
     for (const auto& [port, num] : gpio_pins) {
         lines.push_back("sysbus.gpioPort" + std::string(1, port) + " AddStateChangedHook " +
-                        std::to_string(num) + " \"print('AICAD_GPIO_EVT P" + port +
+                        std::to_string(num) + " \"print('CHUDWARE_GPIO_EVT P" + port +
                         std::to_string(num) + "=%d' % (1 if state else 0))\"");
     }
     lines.push_back("start");
@@ -710,9 +710,9 @@ std::string build_resc(const std::string& elf_path, const std::string& platform_
     for (const auto& [p, _] : gpio_pins) ports.insert(p);
     for (char port : ports) {
         long long odr = base + stride * (port - 'A') + odr_offset;
-        lines.push_back("echo \"AICAD_GPIO_ODR_BEGIN " + std::string(1, port) + "\"");
+        lines.push_back("echo \"CHUDWARE_GPIO_ODR_BEGIN " + std::string(1, port) + "\"");
         lines.push_back("sysbus ReadDoubleWord " + fmt_hex(odr));
-        lines.push_back("echo \"AICAD_GPIO_ODR_END " + std::string(1, port) + "\"");
+        lines.push_back("echo \"CHUDWARE_GPIO_ODR_END " + std::string(1, port) + "\"");
     }
     std::string out;
     for (const auto& l : lines) {
@@ -802,4 +802,4 @@ SimResult run_simulation(const std::string& elf_path, const std::string& mcu_fam
     return r;
 }
 
-}  // namespace aicad::firmware
+}  // namespace chudware::firmware

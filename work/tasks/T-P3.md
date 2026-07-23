@@ -40,7 +40,7 @@ across every doc type, always R1-editable.
 - [x] cad_guide("parts") documents search→get→place for the agent — topic added to cad_tools.py
       with standard-before-custom bias, domain routing, editability guarantee, sourcing note.
       Aliases: parts | standard_parts | catalog | part_place | hardware | etc.
-- [x] End-to-end demo test green against the real engine (AI_CAD_LIBAICAD)
+- [x] End-to-end demo test green against the real engine (CHUDWARE_LIBCHUDWARE)
       test_demo_fastener_into_mech_assembly: search→pick→place fastener, assert editable doc_id
       test_demo_resistor_onto_schematic: search→place resistor on schematic, assert in doc.symbols
       test_demo_standard_parts_cross_domain_search: M8 returns multi-domain ranked results

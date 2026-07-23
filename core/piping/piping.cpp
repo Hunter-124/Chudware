@@ -9,7 +9,7 @@
 #include "piping/simhandoff.h"
 #include "piping/solve.h"
 
-namespace aicad::piping {
+namespace chudware::piping {
 namespace {
 
 using pyutil::jerr;
@@ -255,4 +255,4 @@ bool call(const std::string& method, const ojson& params, ojson& result) {
     return false;
 }
 
-}  // namespace aicad::piping
+}  // namespace chudware::piping

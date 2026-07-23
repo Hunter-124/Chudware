@@ -7,7 +7,7 @@ FeatureManager design tree — sketches (with entities, relations, dimensions), 
 and the solid features built on them — and emits two things:
 
   * an **intermediate representation** (IR): a plain list of feature dicts, COM-free and JSON-able;
-  * a translation of that IR into AI-CAD's native ``add_features`` op list (see
+  * a translation of that IR into Chudware's native ``add_features`` op list (see
     :func:`services.sw_import.sw_translate.translate`), so the imported part lands as an *editable* feature
     tree instead of one dead body.
 
@@ -67,7 +67,7 @@ SW_END_COND_NAME = {
 # swSelectType_e (used by ISketch.GetReferenceEntity to say what the sketch sits on).
 SEL_EDGES, SEL_FACES, SEL_VERTICES, SEL_DATUMPLANES = 1, 2, 3, 4
 
-MM = 1000.0  # SolidWorks API is metres; AI-CAD sketch coords are millimetres.
+MM = 1000.0  # SolidWorks API is metres; Chudware sketch coords are millimetres.
 
 
 # ---------------------------------------------------------------------------

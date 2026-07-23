@@ -40,7 +40,7 @@ def _config_path() -> Path:
         return Path(paths.CONFIG)
     except Exception:
         pass
-    return Path.home() / ".local" / "share" / "AI-CAD" / "config.json"
+    return Path.home() / ".local" / "share" / "Chudware" / "config.json"
 
 
 def scrub(text: str, n: int = 400) -> str:
@@ -340,7 +340,7 @@ def main() -> int:
         import os
 
         print("\n-- usage.fetch_account_usage (api path) --")
-        os.environ.setdefault("AICAD_XAI_USAGE_PROBE", "0")
+        os.environ.setdefault("CHUDWARE_XAI_USAGE_PROBE", "0")
         for aid in order:
             row = usage_mod.fetch_account_usage("xai", aid, force=True)
             print(

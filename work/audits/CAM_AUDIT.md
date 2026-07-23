@@ -39,7 +39,7 @@ All 18 MCP CAM tools are registered via `register_cam_tools()`:
 `cam_extract`, `cam_generate`, `cam_simulate`, `cam_post`, `cam_setup_sheet`,
 `cam_save`, `cam_open`, `cam_post_dialects`, `cam_materials`, `cam_tool_types`, `cam_op_types`
 
-### 1.3 Agent CAM Fast-Path (`core/api/libaicad.cpp:493`)
+### 1.3 Agent CAM Fast-Path (`core/api/libchudware.cpp:493`)
 
 `cam_program_from_part()` — deterministic, no-LLM "make me a CNC program" path.  
 Mines free-text request for strategy keywords (face/pocket/drill/adaptive/3d/lathe/chamfer/engrave), picks dialect (grbl/fanuc/haas/…) and material (aluminum/steel/…), calls `cam_extract`, auto-sizes tools, builds and posts the job in one shot. Exposed as `cam_program` MCP method.
@@ -145,7 +145,7 @@ Only GRBL, Fanuc, LinuxCNC, and Marlin have real output content tests. The other
 `stock_sim.cpp` uses a cylinder-masking path for cylindrical stock but there are no tests that verify turning removal against a known diameter reduction.
 
 **G5: `cam_program` fast-path has no test**  
-`cam_program_from_part` at `libaicad.cpp:493` is not covered by any test in `test_cam.cpp` or `test_cam_tools.py`. It is the primary user-facing "one-shot CNC program" path.
+`cam_program_from_part` at `libchudware.cpp:493` is not covered by any test in `test_cam.cpp` or `test_cam_tools.py`. It is the primary user-facing "one-shot CNC program" path.
 
 **G6: `check_holder` simulation flag is permanently unimplemented**  
 `SimOptions.check_holder=true` is a user-accessible parameter but is never acted upon in `stock_sim.cpp`. No warning is emitted either.

@@ -31,7 +31,7 @@ different material truths. Audit: work/audits/CAM_AUDIT.md §3.2, §T-M4.
       `cam_material_id`/`cam_materials`. Additive-only: zero mechanical/FEA fields touched.
 - [x] CuttingDB::builtin() loads from the registry with in-code fallback (headless build intact)
       — `CuttingDB::merge_cam()` + seed-then-merge `builtin()` reads registry.json (env
-      `AICAD_MATERIALS_REGISTRY`, else appdata `materials/registry.json`); absent/unparseable ⇒
+      `CHUDWARE_MATERIALS_REGISTRY`, else appdata `materials/registry.json`); absent/unparseable ⇒
       in-code table stands. Proven both directions in test_cam_tools (set ⇒ modified value 4321
       flows through; unset ⇒ in-code 900).
 - [x] cam_materials() reflects the registry's live material list; cam_add_setup accepts any
@@ -56,7 +56,7 @@ different material truths. Audit: work/audits/CAM_AUDIT.md §3.2, §T-M4.
   no-fabrication ruling (13 CuttingDB-only groups stay in-code, no invented FEA rows), and the one
   additive schema touch for the sim/FEA co-owners (zero mechanical fields changed).
 - **Gate** (`bash scripts/gate.sh`): see the REVIEW check-in line for the verdict. Byte-identical
-  + runtime-load verified against the real engine (`AI_CAD_LIBAICAD` set); cam ctest is inside the
+  + runtime-load verified against the real engine (`CHUDWARE_LIBCHUDWARE` set); cam ctest is inside the
   50/50 core ctest stage. Known pre-existing gate reds (check.py audits, pytest 0-collected venv
   gap) are not mine.
 - **Scope**: `core/cam/session.cpp` was listed in the task but needed no change — `cam_materials`

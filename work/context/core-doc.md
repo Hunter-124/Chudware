@@ -13,7 +13,7 @@ Contracts: contracts/doc_schema.md (aicad.part/1, aicad.asm/1, aicad.drawing/1),
 - core/doc/formats.cpp/.h, dxf.cpp, export2d.cpp, pdfvec.cpp — format import/export
 - core/doc/drawing.cpp, drawing_session.cpp, annot_draw.cpp — 2D drawing docs (aicad.drawing/1)
 - core/doc/assembly.cpp, sketch_geom.cpp, validate.cpp — assemblies, sketch geometry, doc validation
-- core/api/libaicad.cpp/.h, core/api/aicad_probe.cpp — C ABI exposing session.cpp to services/worker/
+- core/api/libchudware.cpp/.h, core/api/chudware_probe.cpp — C ABI exposing session.cpp to services/worker/
 
 ## How it connects
 This is the heart of the C++ strangler: GUI/agent commands become doc_ops (contracts/doc_ops.md) sent
@@ -25,7 +25,7 @@ Python oracle equivalent: engine/doc/session.py (frozen). contracts/ files above
 integrator-owned (AGENTS.md).
 
 ## Debugging playbook
-- Build: `cmake -S core -B core/build-occt -DAICAD_WITH_OCCT=ON && cmake --build core/build-occt`
+- Build: `cmake -S core -B core/build-occt -DCHUDWARE_WITH_OCCT=ON && cmake --build core/build-occt`
 - Tests: `ctest --test-dir core/build-occt -R "document|selectors|picks|sketch_on_face|sketch_drag_rpc|polygon|drawing_gdt|pattern|mirror|interference|hole" --output-on-failure` (document is OCCT-gated, core/CMakeLists.txt ~L872)
 - Gotcha: core/doc/picks.cpp resolve_geom_query hardcodes `ti.owner = std::nullopt` — ownership resolution is a known gap (REFACTOR_LOG L344)
 - Gotcha: view-spec normalization must match core/doc/session.cpp::resolve_view_spec (REFACTOR_LOG L366)

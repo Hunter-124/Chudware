@@ -22,7 +22,7 @@ try:
 except ImportError:  # uvicorn app:app from package dir
     from auth import get_current_user
 
-log = logging.getLogger("billet-web.providers")
+log = logging.getLogger("chudware-web.providers")
 
 router = APIRouter(tags=["providers"])
 

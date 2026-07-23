@@ -39,8 +39,8 @@ bugs this way — assume the sim surface hides similar surprises.
 - Deliverable: work/audits/SIM_AUDIT.md + a re-runnable scripts/sim_audit.py that
   executes the analytic checks (real counts, no all-skip); proposed task list for
   gaps, with priorities.
-- Verify against the REAL engine: AI_CAD_LIBAICAD=core/build-linux/bin/libaicad.so
-  via ~/.local/share/AI-CAD/mcp-venv/bin/python. No GUI windows.
+- Verify against the REAL engine: CHUDWARE_LIBCHUDWARE=core/build-linux/bin/libchudware.so
+  via ~/.local/share/Chudware/mcp-venv/bin/python. No GUI windows.
 
 ## Definition of done
 

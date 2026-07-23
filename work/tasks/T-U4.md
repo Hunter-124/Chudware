@@ -47,7 +47,7 @@ Delivered:
 - engine_oracle/sourcing_worker_rpc.py: new worker-RPC bridge (bom_rollup/bom_price/request_quote/match_part_number) over stdio seam — mirrors deliverables/worker_rpc.py pattern; keyless request_quote returns {ok:false, reason, hint} not a fabricated price
 - engine_oracle/worker.py: registers sourcing seam (try/except non-fatal)
 - application.cpp: BOM window wired after scaffold_demo block
-- scenarios.{h,cpp}: wantBom/bomShotDone worker one-shot; AI_CAD_SHOT=bom seeds fixture rows with null prices; captureFrameBudget=150
+- scenarios.{h,cpp}: wantBom/bomShotDone worker one-shot; CHUDWARE_SHOT=bom seeds fixture rows with null prices; captureFrameBudget=150
 - ui_style_check.py: 0 findings (all 3 rules clean)
 - gate.sh: PASS (build + --shot + --selftest + 100% ctest + FAIL-RECORDED entries are all pre-existing T-V2 owned)
-- AI_CAD_SHOT=bom headless shot: wrote PNG exit:0
+- CHUDWARE_SHOT=bom headless shot: wrote PNG exit:0

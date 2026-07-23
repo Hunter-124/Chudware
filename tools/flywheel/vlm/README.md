@@ -24,7 +24,7 @@ training runs.** The `recipes/` files may land but never execute in CI (`recipes
 ## Quick start
 
 ```bash
-py=~/.local/share/AI-CAD/mcp-venv/bin/python
+py=~/.local/share/Chudware/mcp-venv/bin/python
 # 1. generate the synthetic corpus
 $py -m tools.flywheel.vlm.corpus_gen training/corpora/vlm/v1 --seeds 3
 # 2. record the residual (offline -> deterministic ceiling MEASURED, candidates pending)

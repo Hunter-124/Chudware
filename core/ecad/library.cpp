@@ -11,7 +11,7 @@
 #include <mutex>
 #include <vector>
 
-namespace aicad::ecad::library {
+namespace chudware::ecad::library {
 
 using nlohmann::json;
 
@@ -397,4 +397,4 @@ json resolve_footprint(const std::string& fpid) {
     return it->second;  // returns a copy (nlohmann::json value semantics)
 }
 
-}  // namespace aicad::ecad::library
+}  // namespace chudware::ecad::library

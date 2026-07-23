@@ -1,4 +1,4 @@
-"""Env-driven gateway configuration (BILLET_WEB_* prefix)."""
+"""Env-driven gateway configuration (CHUDWARE_WEB_* prefix)."""
 
 from __future__ import annotations
 
@@ -44,8 +44,8 @@ def _normalize_team_domain(raw: str) -> str:
     return raw
 
 def _load_webd_env() -> dict[str, str]:
-    """KEY=VALUE defaults written by deploy/install_webd.sh (~/billet-web/webd.env)."""
-    path = Path(_env("BILLET_WEBD_ENV", "~/billet-web/webd.env") or "").expanduser()
+    """KEY=VALUE defaults written by deploy/install_webd.sh (~/chudware-web/webd.env)."""
+    path = Path(_env("CHUDWARE_WEBD_ENV", "~/chudware-web/webd.env") or "").expanduser()
     try:
         text = path.read_text()
     except OSError:
@@ -66,57 +66,57 @@ class Settings:
 
     data_root: Path = field(
         default_factory=lambda: _expand_path(
-            _env("BILLET_WEB_DATA_ROOT", "~/billet-web-data") or "~/billet-web-data"
+            _env("CHUDWARE_WEB_DATA_ROOT", "~/chudware-web-data") or "~/chudware-web-data"
         )
     )
-    host: str = field(default_factory=lambda: _env("BILLET_WEB_HOST", "127.0.0.1") or "127.0.0.1")
-    port: int = field(default_factory=lambda: _env_int("BILLET_WEB_PORT", 8300))
-    max_sessions: int = field(default_factory=lambda: _env_int("BILLET_WEB_MAX_SESSIONS", 3))
-    max_heavy: int = field(default_factory=lambda: _env_int("BILLET_WEB_MAX_HEAVY", 2))
+    host: str = field(default_factory=lambda: _env("CHUDWARE_WEB_HOST", "127.0.0.1") or "127.0.0.1")
+    port: int = field(default_factory=lambda: _env_int("CHUDWARE_WEB_PORT", 8300))
+    max_sessions: int = field(default_factory=lambda: _env_int("CHUDWARE_WEB_MAX_SESSIONS", 3))
+    max_heavy: int = field(default_factory=lambda: _env_int("CHUDWARE_WEB_MAX_HEAVY", 2))
     session_memory: str = field(
-        default_factory=lambda: _env("BILLET_WEB_SESSION_MEMORY", "5g") or "5g"
+        default_factory=lambda: _env("CHUDWARE_WEB_SESSION_MEMORY", "5g") or "5g"
     )
-    session_cpus: float = field(default_factory=lambda: _env_float("BILLET_WEB_SESSION_CPUS", 2.0))
+    session_cpus: float = field(default_factory=lambda: _env_float("CHUDWARE_WEB_SESSION_CPUS", 2.0))
     session_pids_limit: int = field(
-        default_factory=lambda: _env_int("BILLET_WEB_SESSION_PIDS", 2048)
+        default_factory=lambda: _env_int("CHUDWARE_WEB_SESSION_PIDS", 2048)
     )
     idle_timeout_sec: int = field(
-        default_factory=lambda: _env_int("BILLET_WEB_IDLE_TIMEOUT_SEC", 30 * 60)
+        default_factory=lambda: _env_int("CHUDWARE_WEB_IDLE_TIMEOUT_SEC", 30 * 60)
     )
     min_host_ram_gib: float = field(
-        default_factory=lambda: _env_float("BILLET_WEB_MIN_HOST_RAM_GIB", 8.0)
+        default_factory=lambda: _env_float("CHUDWARE_WEB_MIN_HOST_RAM_GIB", 8.0)
     )
     stream_port_base: int = field(
-        default_factory=lambda: _env_int("BILLET_WEB_STREAM_PORT_BASE", 8400)
+        default_factory=lambda: _env_int("CHUDWARE_WEB_STREAM_PORT_BASE", 8400)
     )
     session_image: str = field(
-        default_factory=lambda: _env("BILLET_WEB_SESSION_IMAGE", "localhost/billet-session:latest")
-        or "localhost/billet-session:latest"
+        default_factory=lambda: _env("CHUDWARE_WEB_SESSION_IMAGE", "localhost/chudware-session:latest")
+        or "localhost/chudware-session:latest"
     )
     stream_backend: str = field(
         # novnc is the VERIFIED stream path on the Fedora image; selkies pip is
         # broken there (evdev/kernel-headers) — opt in explicitly if that changes.
-        default_factory=lambda: _env("BILLET_WEB_STREAM_BACKEND", "novnc") or "novnc"
+        default_factory=lambda: _env("CHUDWARE_WEB_STREAM_BACKEND", "novnc") or "novnc"
     )
     cf_team_domain: str = field(
         # Accept "team.cloudflareaccess.com" or "https://team.cloudflareaccess.com";
         # the Access JWT `iss` claim and the JWKS URL both need the https:// form.
         default_factory=lambda: _normalize_team_domain(
-            _env("BILLET_WEB_CF_TEAM_DOMAIN", "") or ""
+            _env("CHUDWARE_WEB_CF_TEAM_DOMAIN", "") or ""
         )
     )
-    cf_aud: str = field(default_factory=lambda: _env("BILLET_WEB_CF_AUD", "") or "")
-    dev_mode: bool = field(default_factory=lambda: _env_bool("BILLET_WEB_DEV", False))
+    cf_aud: str = field(default_factory=lambda: _env("CHUDWARE_WEB_CF_AUD", "") or "")
+    dev_mode: bool = field(default_factory=lambda: _env_bool("CHUDWARE_WEB_DEV", False))
     users_file: Path = field(default_factory=Path)
     healthcheck_timeout_sec: float = field(
-        default_factory=lambda: _env_float("BILLET_WEB_HEALTHCHECK_TIMEOUT_SEC", 90.0)
+        default_factory=lambda: _env_float("CHUDWARE_WEB_HEALTHCHECK_TIMEOUT_SEC", 90.0)
     )
     healthcheck_interval_sec: float = field(
-        default_factory=lambda: _env_float("BILLET_WEB_HEALTHCHECK_INTERVAL_SEC", 1.5)
+        default_factory=lambda: _env_float("CHUDWARE_WEB_HEALTHCHECK_INTERVAL_SEC", 1.5)
     )
     # Web-native client: shared engine daemon socket + team workspace root.
     # Env overrides win; else webd.env (install_webd.sh); else deterministic
-    # defaults (instance key "billetweb" is verbatim => socket name is stable).
+    # defaults (instance key "chudwareweb" is verbatim => socket name is stable).
     webd_socket: Path = field(default_factory=Path)
     workspace_root: Path = field(default_factory=Path)
     # WASM web client static root (served at /app) + client perf traces.
@@ -125,30 +125,30 @@ class Settings:
 
     def __post_init__(self) -> None:
         if not self.users_file or str(self.users_file) in {".", ""}:
-            override = _env("BILLET_WEB_USERS_FILE")
+            override = _env("CHUDWARE_WEB_USERS_FILE")
             if override:
                 self.users_file = _expand_path(override)
             else:
                 self.users_file = Path(__file__).resolve().parent / "users.yaml"
         webd_env = _load_webd_env()
         if not self.webd_socket or str(self.webd_socket) in {".", ""}:
-            raw = _env("BILLET_WEBD_SOCKET") or webd_env.get("BILLET_WEBD_SOCKET")
+            raw = _env("CHUDWARE_WEBD_SOCKET") or webd_env.get("CHUDWARE_WEBD_SOCKET")
             if not raw:
-                run = os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/aicad-{os.getuid()}"
-                raw = f"{run}/aicad/hostd-billetweb.sock"
+                run = os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/chudware-{os.getuid()}"
+                raw = f"{run}/chudware/hostd-chudwareweb.sock"
             self.webd_socket = _expand_path(raw)
         if not self.workspace_root or str(self.workspace_root) in {".", ""}:
             raw = (
-                _env("BILLET_WORKSPACE_ROOT")
-                or webd_env.get("BILLET_WORKSPACE_ROOT")
+                _env("CHUDWARE_WORKSPACE_ROOT")
+                or webd_env.get("CHUDWARE_WORKSPACE_ROOT")
                 or "~/Documents/ME489/Crimson_Crankers_Program/01_Design_Package/CAD_Build"
             )
             self.workspace_root = _expand_path(raw)
         if not self.app_dir or str(self.app_dir) in {".", ""}:
-            raw = _env("BILLET_WEB_APP_DIR") or "~/billet-web/app"
+            raw = _env("CHUDWARE_WEB_APP_DIR") or "~/chudware-web/app"
             self.app_dir = _expand_path(raw)
         if not self.perf_traces_dir or str(self.perf_traces_dir) in {".", ""}:
-            raw = _env("BILLET_WEB_PERF_TRACES_DIR")
+            raw = _env("CHUDWARE_WEB_PERF_TRACES_DIR")
             if raw:
                 self.perf_traces_dir = _expand_path(raw)
             else:

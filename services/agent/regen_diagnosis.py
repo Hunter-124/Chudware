@@ -334,7 +334,7 @@ def _sidecar_dir() -> Path:
     """Telemetry sidecar dir resolved WITHOUT services.paths (whose Linux XDG branch is a known
     gap in this env) so LoggingProvider construction never crashes at the IP-18 call site."""
     base = os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share")
-    return Path(base) / "AI-CAD" / "telemetry" / "sidecars" / "regen_fix"
+    return Path(base) / "Chudware" / "telemetry" / "sidecars" / "regen_fix"
 
 
 SYSTEM_PROMPT = (

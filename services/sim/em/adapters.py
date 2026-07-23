@@ -116,7 +116,7 @@ class BuiltinFdfdAdapter(EmAdapter):
 
     name = "builtin-fdfd"
     kind = "fdfd"
-    license = "AI-CAD (in-repo, numpy/scipy BSD)"
+    license = "Chudware (in-repo, numpy/scipy BSD)"
     linkage = "builtin"
     capabilities = ("eigenmode",)
     install_hint = "always available (numpy + scipy)"
@@ -146,7 +146,7 @@ class AnalyticAdapter(EmAdapter):
 
     name = "analytic-uniform"
     kind = "analytic"
-    license = "AI-CAD (in-repo)"
+    license = "Chudware (in-repo)"
     linkage = "builtin"
     capabilities = ("eigenmode", "driven", "timedomain")
     install_hint = "always available"

@@ -13,7 +13,7 @@
 
 #include "cam/feeds.h"
 
-namespace aicad {
+namespace chudware {
 namespace cam {
 namespace {
 
@@ -568,4 +568,4 @@ json audit_program(const Job& job,
 }
 
 }  // namespace cam
-}  // namespace aicad
+}  // namespace chudware

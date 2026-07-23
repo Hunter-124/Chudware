@@ -20,8 +20,8 @@
 #include "prof/phases.h"
 #include "prof/tree.h"
 
-namespace tree = aicad::prof::tree;
-namespace phases = aicad::prof::phases;
+namespace tree = chudware::prof::tree;
+namespace phases = chudware::prof::phases;
 using nlohmann::json;
 
 namespace {

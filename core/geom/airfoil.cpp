@@ -10,7 +10,7 @@
 #include <fstream>
 #include <sstream>
 
-namespace aicad {
+namespace chudware {
 namespace geom {
 
 namespace {
@@ -227,4 +227,4 @@ AirfoilProfile airfoil_profile(const std::string& naca, const std::string& dat, 
 }
 
 }  // namespace geom
-}  // namespace aicad
+}  // namespace chudware

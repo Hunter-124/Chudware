@@ -10,7 +10,7 @@
 
 #include "piping/pyutil.h"
 
-namespace aicad::piping {
+namespace chudware::piping {
 
 using pyutil::ojson;
 
@@ -26,4 +26,4 @@ ojson verify_pressure_drop(const ojson& solve_result, const ojson& cfd_result,
                            double tolerance_pct = 20.0,
                            const ojson& run_id = nullptr);
 
-}  // namespace aicad::piping
+}  // namespace chudware::piping

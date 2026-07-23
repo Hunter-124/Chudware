@@ -1,14 +1,14 @@
 """Live regression gate: the shared daemon can resolve its agent role prompts.
 
-Guards the failure class fixed 2026-07-16 (git 0d8fb76f): the billet-hostd unit had
+Guards the failure class fixed 2026-07-16 (git 0d8fb76f): the chudware-hostd unit had
 no WorkingDirectory, so roles.cpp's relative "agent/prompts" fallback resolved against
 nothing and EVERY agent_run_v2 threw "role prompt unreadable/empty: agent/prompts/
 intake.md" — the web/local/agent part-builder was instant-fail on prod. install_webd.sh
-now deploys the prompt tree and stamps AI_CAD_PROMPTS_DIR into the unit.
+now deploys the prompt tree and stamps CHUDWARE_PROMPTS_DIR into the unit.
 
 This is a FAST gate (agent_load_prompt, no LLM call) so a prompts-deploy/env regression
 surfaces in CI instead of when a user asks the agent to build a part. Env-gated like
-live_smoke.py — needs a running daemon (BILLET_LIVE=1).
+live_smoke.py — needs a running daemon (CHUDWARE_LIVE=1).
 """
 
 from __future__ import annotations
@@ -25,11 +25,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from live_smoke import SOCK, HostdClient  # noqa: E402
 
-_LIVE = os.environ.get("BILLET_LIVE") == "1"
+_LIVE = os.environ.get("CHUDWARE_LIVE") == "1"
 
 pytestmark = pytest.mark.skipif(
     not _LIVE,
-    reason="set BILLET_LIVE=1 to run against live hostd socket",
+    reason="set CHUDWARE_LIVE=1 to run against live hostd socket",
 )
 
 # The ROLE prompts the C++ orchestrator (agent_run_v2) loads per stage. If any is

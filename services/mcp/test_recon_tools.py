@@ -1,7 +1,7 @@
 """Tests for the reverse-engineering MCP tools (services/mcp/recon_tools.py).
 
 The RE round-trip from the handoff spec, end-to-end through the registered MCP tools
-against the STAGED libaicad:
+against the STAGED libchudware:
 
   - plate 100x60x8 + r3 vertical-edge fillets + 4x d6 bolt-circle (pcd 50) -> STEP ->
     reverse_engineer recovers base extrude + seed hole + circular pattern (+ fillets
@@ -64,7 +64,7 @@ from mcp_server import core_bridge as cb  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
     not cb.available(),
-    reason="libaicad not staged (build the C++ core); engine-backed MCP tools unavailable",
+    reason="libchudware not staged (build the C++ core); engine-backed MCP tools unavailable",
 )
 
 
@@ -256,7 +256,7 @@ def test_reverse_engineer_stl_smoke_is_honest():
 
 if __name__ == "__main__":
     if not cb.available():
-        print("SKIP: libaicad not staged")
+        print("SKIP: libchudware not staged")
         sys.exit(0)
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0

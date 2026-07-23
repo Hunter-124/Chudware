@@ -21,7 +21,7 @@ mission execution failed at the PLAN phase with `No module named
 
 Root cause (integrator diagnosis 2026-07-05): the module is NOT missing — it is
 installed (langgraph-checkpoint-sqlite 3.1.0) and imports fine under the gate venv
-(~/.local/share/AI-CAD/mcp-venv/bin/python). services/dag/executor.py imports it and
+(~/.local/share/Chudware/mcp-venv/bin/python). services/dag/executor.py imports it and
 works in-process. The failure is an ENVIRONMENT/INTERPRETER mismatch in the gym's
 real-run path: the mission (run_mission → services/dag executor) is executed by a
 python that lacks the package (system python3, or a subprocess that doesn't inherit
@@ -36,7 +36,7 @@ requirements.txt so a fresh env installs it — T-DP10 follow-up commit.)
   run_cell → run_mission / services/dag executor). Determine whether it runs
   in-process or spawns a subprocess, and which interpreter that subprocess uses.
 - Make the real-run path use the SAME interpreter that has the deps (propagate
-  AI_CAD_PYTHON / sys.executable / the mcp-venv), so run_mission reaches BUILD/VERIFY
+  CHUDWARE_PYTHON / sys.executable / the mcp-venv), so run_mission reaches BUILD/VERIFY
   instead of dying at PLAN.
 - Re-run the tuning loop (≥2 scaffold configs over the C-suite, qwen3-4b CUDA
   llama-server) and record REAL per-class win rates. Honest numbers whatever they are
@@ -64,7 +64,7 @@ requirements.txt so a fresh env installs it — T-DP10 follow-up commit.)
    imports `services.dag.executor`, whose top-level `from langgraph.checkpoint.sqlite
    import SqliteSaver` raises under system python3 → mission dies, labeled PLAN, every
    cell ties 0.00. Fix: `ensure_capable_interpreter()` re-exec guard at each gym
-   entrypoint (tuning/cli/run_dp2_gym) re-execs into the mcp-venv (`AI_CAD_PYTHON` →
+   entrypoint (tuning/cli/run_dp2_gym) re-execs into the mcp-venv (`CHUDWARE_PYTHON` →
    mcp-venv, loop-sentinel, never hard-fails). `dag_deps` added to the ExecProbe so
    `can_run_real` is honest when the dep is absent. **Gotcha caught:** a venv python is
    a symlink to its base, so `os.path.realpath` collapsed the mcp-venv onto
@@ -74,7 +74,7 @@ requirements.txt so a fresh env installs it — T-DP10 follow-up commit.)
    still 0.00'd — a `local-24k` cell was routing to the ambient config.json provider
    (Gemini, HTTP 429/503), NOT the qwen3-4b the tier names. Fix: `_provider_for_tier()`
    — a `local-*` cell resolves the bundled qwen3-4b (llamacpp provider, GBNF), threaded
-   into `_run_mission_real(challenge, run_id, tier)`. Explicit `AI_CAD_PROVIDER` still
+   into `_run_mission_real(challenge, run_id, tier)`. Explicit `CHUDWARE_PROVIDER` still
    wins; non-local tiers unchanged.
 
 **Verified honest run** (C1 × {eco,maximum} × seed1, whole pipeline on qwen3-4b via a

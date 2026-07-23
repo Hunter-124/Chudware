@@ -52,7 +52,7 @@ def register_code_compliance_tools(mcp: FastMCP) -> None:
           schedule with IBC/NDS clause citations.
 
         Agentic RAG citations are retrieved from the user's local code corpus
-        (``AICAD_CODE_CORPUS_PATH`` env var or ``~/.local/share/AI-CAD/code_corpus/``).
+        (``CHUDWARE_CODE_CORPUS_PATH`` env var or ``~/.local/share/Chudware/code_corpus/``).
         Set ``rag_query`` to request jurisdiction-scoped citations.  No copyrighted text
         is scraped or cached; citations come from user-supplied licensed PDFs only.
 
@@ -152,7 +152,7 @@ def register_code_compliance_tools(mcp: FastMCP) -> None:
                         "disclaimer": DISCLAIMER,
                     })
                 except CoreError as exc:
-                    # C++ engine unavailable (libaicad not staged / stale lib without
+                    # C++ engine unavailable (libchudware not staged / stale lib without
                     # the struct_* dispatch) — record an advisory row instead of
                     # silently returning ok:true with no deflection result.
                     rule_results.append({
@@ -165,7 +165,7 @@ def register_code_compliance_tools(mcp: FastMCP) -> None:
                         "citation": "IBC 1604.3",
                         "detail": (
                             "deflection check skipped: structural solver unavailable "
-                            f"({exc}) — stage libaicad with the struct_* RPCs to enable "
+                            f"({exc}) — stage libchudware with the struct_* RPCs to enable "
                             "structural deflection analysis."
                         ),
                         "disclaimer": DISCLAIMER,

@@ -14,7 +14,7 @@
 
 #include "firmware/project.h"
 
-namespace aicad::firmware {
+namespace chudware::firmware {
 
 // {token: {"reads", "writes", "refs", "files"}} over {filename: text}.
 // Deterministic key order (std::map) mirrors Python's sorted(sources.items()).
@@ -38,4 +38,4 @@ nlohmann::json verify_board(const nlohmann::json& board,
 // {n, errors, warnings, rules} rollup.
 nlohmann::json summarize(const nlohmann::json& findings);
 
-}  // namespace aicad::firmware
+}  // namespace chudware::firmware

@@ -21,7 +21,7 @@ except ImportError:  # uvicorn app:app from package dir
     from auth import get_current_user
     from config import settings
 
-log = logging.getLogger("billet-web.perf")
+log = logging.getLogger("chudware-web.perf")
 
 router = APIRouter(tags=["perf"])
 

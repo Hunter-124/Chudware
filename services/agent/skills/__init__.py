@@ -8,8 +8,8 @@ metadata always in context (~1 line per skill), full body injected on
 activation only.
 
 Locations (precedence, first wins by name):
-  1. project  ``.billet/skills/<name>/SKILL.md``
-  2. user     ``~/.local/share/AI-CAD/skills/<name>/SKILL.md``
+  1. project  ``.chudware/skills/<name>/SKILL.md``
+  2. user     ``~/.local/share/Chudware/skills/<name>/SKILL.md``
   3. builtin  ``services/agent/skills/builtin/<name>/SKILL.md``
 
 Activation:
@@ -58,34 +58,34 @@ _catalog_lock = threading.Lock()
 
 
 def user_skills_dir() -> Path:
-    """``~/.local/share/AI-CAD/skills`` (Windows: %APPDATA%/AI-CAD/skills).
+    """``~/.local/share/Chudware/skills`` (Windows: %APPDATA%/Chudware/skills).
 
-    ``AICAD_SKILLS_USER_DIR`` overrides (tests).
+    ``CHUDWARE_SKILLS_USER_DIR`` overrides (tests).
     """
-    override = os.environ.get("AICAD_SKILLS_USER_DIR")
+    override = os.environ.get("CHUDWARE_SKILLS_USER_DIR")
     if override:
         return Path(override)
     if sys.platform.startswith("win"):
         base = os.environ.get("APPDATA") or os.path.expanduser(r"~\AppData\Roaming")
     else:
         base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
-    return Path(base) / "AI-CAD" / "skills"
+    return Path(base) / "Chudware" / "skills"
 
 
 def project_skills_dir(project_root: Path | str | None = None) -> Path:
-    """``<project>/.billet/skills``. ``AICAD_PROJECT_DIR`` or *project_root* or cwd."""
-    override = os.environ.get("AICAD_SKILLS_PROJECT_DIR")
+    """``<project>/.chudware/skills``. ``CHUDWARE_PROJECT_DIR`` or *project_root* or cwd."""
+    override = os.environ.get("CHUDWARE_SKILLS_PROJECT_DIR")
     if override:
         return Path(override)
     if project_root is not None:
-        return Path(project_root) / ".billet" / "skills"
-    env = os.environ.get("AICAD_PROJECT_DIR")
+        return Path(project_root) / ".chudware" / "skills"
+    env = os.environ.get("CHUDWARE_PROJECT_DIR")
     root = Path(env) if env else Path.cwd()
-    return root / ".billet" / "skills"
+    return root / ".chudware" / "skills"
 
 
 def builtin_skills_dir() -> Path:
-    override = os.environ.get("AICAD_SKILLS_BUILTIN_DIR")
+    override = os.environ.get("CHUDWARE_SKILLS_BUILTIN_DIR")
     if override:
         return Path(override)
     return _BUILTIN_DIR

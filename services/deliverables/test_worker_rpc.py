@@ -22,7 +22,7 @@ from deliverables import worker_rpc
 
 @pytest.fixture()
 def project(tmp_path, monkeypatch):
-    monkeypatch.setenv("AICAD_PROJECT_DIR", str(tmp_path))
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(tmp_path))
     return tmp_path
 
 

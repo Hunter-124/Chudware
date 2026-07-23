@@ -144,7 +144,7 @@ def test_new_part_without_add_features_not_auto_done(tmp_path, monkeypatch):
     from services.agent.ledger import Ledger
     from services.agent import agent_turn as at
 
-    monkeypatch.setenv("AICAD_CACHE_ROOT", str(tmp_path))
+    monkeypatch.setenv("CHUDWARE_CACHE_ROOT", str(tmp_path))
     ledger = Ledger("mega7_build_mut", path=tmp_path / "ledger.json")
 
     seq = {"n": 0}
@@ -196,7 +196,7 @@ def test_new_part_then_add_features_auto_completes(tmp_path, monkeypatch):
     from services.agent.ledger import Ledger
     from services.agent import agent_turn as at
 
-    monkeypatch.setenv("AICAD_CACHE_ROOT", str(tmp_path))
+    monkeypatch.setenv("CHUDWARE_CACHE_ROOT", str(tmp_path))
     ledger = Ledger("mega7_build_ok", path=tmp_path / "ledger.json")
     seq = {"n": 0}
 

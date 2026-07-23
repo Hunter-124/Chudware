@@ -21,7 +21,7 @@
 #include "firmware/sim_sensor_bridge.h"
 #include "firmware/toolchains.h"
 
-namespace aicad::firmware {
+namespace chudware::firmware {
 namespace {
 
 namespace fs = std::filesystem;
@@ -804,4 +804,4 @@ bool call(const std::string& method, const nlohmann::json& params, nlohmann::jso
     }
 }
 
-}  // namespace aicad::firmware
+}  // namespace chudware::firmware

@@ -50,7 +50,7 @@ The deterministic path for spec-sheet matching uses BOLTS (LGPL data, redistribu
   `engine_oracle/data/bolts/*.blt.yaml` transcribed from `hardware.md` / `core/parts/parts_data.h`
   (non-copyrightable dimensional standards; IPC-7351 precedent). Loader parses the documented
   BOLTS `.blt` format so a user's own BOLTS checkout also works. `contracts/licenses.md` rows added.
-- **KiCad (Q2):** `match_kicad` reads only the user's own libraries via `AICAD_KICAD_SYM_PATH`,
+- **KiCad (Q2):** `match_kicad` reads only the user's own libraries via `CHUDWARE_KICAD_SYM_PATH`,
   using the existing clean-room `.kicad_sym` parser; nothing KiCad vendored; `None` offline.
 - **Wiring (Q3):** new `services/mcp/spec_tools.py` + append-only `server.py` hunk (T-B3 idiom).
 - **T-B3 Q2 seam:** `match_part_number` is the real per-component spec→geometry resolver the

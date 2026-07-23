@@ -13,16 +13,16 @@ Contracts: contracts/doc_schema.md, contracts/doc_ops.md, contracts/worker_rpc.m
 - engine/doc/mesh_body.py:128 `MeshBody`, :101 `mesh_mass_props` — tessellation + mesh mass-property math shared by viewport/export paths
 - engine/doc/tessellate.py — B-rep → triangle mesh for the viewport
 - engine_oracle/parts_library.py, parts_providers.py, vendor_parts.py — standard/vendor parts catalog backing `make_standard_part`/`list_standard_parts`
-- engine_oracle/paths.py — `%APPDATA%\AI-CAD` runtime/cache path resolution
+- engine_oracle/paths.py — `%APPDATA%\Chudware` runtime/cache path resolution
 - engine_oracle/samples/ — feature-rich reference models used as smoke tests (e.g. `mounting_plate.py`)
 - Note: ARCHITECTURE.md references a `protocol.py` "result schema shared across kernel/worker/MCP/host" — **this file does not exist on disk** (verified via `find`); the schema is implicit in `kernel.ModelResult`/`AssemblyResult` dataclasses instead. Treat that ARCHITECTURE.md line as stale.
 
 ## How it connects
-`worker.py` is spawned by `services/worker/` (native host / new ui-imgui) over stdio and only exposes `ping`/`run_model`/`agent_design`/`shutdown` — it is deliberately thin, delegating to `kernel.run_code_multi`. The MCP layer (`services/mcp/`) and ECAD layer (`engine/ecad/`) mostly call `engine_oracle` modules **directly in-process**, not through the worker socket (see contracts/worker_rpc.md and contracts/ecad/ecad_rpc.md:43). `core/` (C++/libaicad) is strangling this module subsystem-by-subsystem — engine_oracle is explicitly "deleted LAST" per AGENTS.md, kept as the parity oracle. `services/worker/` decides whether a call routes to this Python worker or to libaicad.
+`worker.py` is spawned by `services/worker/` (native host / new ui-imgui) over stdio and only exposes `ping`/`run_model`/`agent_design`/`shutdown` — it is deliberately thin, delegating to `kernel.run_code_multi`. The MCP layer (`services/mcp/`) and ECAD layer (`engine/ecad/`) mostly call `engine_oracle` modules **directly in-process**, not through the worker socket (see contracts/worker_rpc.md and contracts/ecad/ecad_rpc.md:43). `core/` (C++/libchudware) is strangling this module subsystem-by-subsystem — engine_oracle is explicitly "deleted LAST" per AGENTS.md, kept as the parity oracle. `services/worker/` decides whether a call routes to this Python worker or to libchudware.
 
 ## Debugging playbook
-- `$py = "$env:APPDATA\AI-CAD\runtime\venv\Scripts\python.exe"` (Windows) — the managed runtime; on Linux check for an equivalent local venv (see linux-build-port memory / build-test.md)
-- `& $py -m engine.run_model mounting_plate` — build + render a sample to `%APPDATA%\AI-CAD\cache`
+- `$py = "$env:APPDATA\Chudware\runtime\venv\Scripts\python.exe"` (Windows) — the managed runtime; on Linux check for an equivalent local venv (see linux-build-port memory / build-test.md)
+- `& $py -m engine.run_model mounting_plate` — build + render a sample to `%APPDATA%\Chudware\cache`
 - `& $py -m engine.doc.test_sketch_solver` — run one engine test suite (house style: every `test_*.py` is a plain-`main()` runner, invoke as `-m engine.<pkg>.test_<name>`)
 - `& $py -m mcp_server.test_roundtrip` — MCP roundtrip self-test that exercises this layer end-to-end
 - `<venv>/python -X utf8 -m pytest engine/doc agent -q` — the pytest-style suites AGENTS.md's gate runs (SKIP, not fail, if the runtime venv is absent on Linux)

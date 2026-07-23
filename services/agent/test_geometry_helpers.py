@@ -11,7 +11,7 @@ Covers the Definition of Done:
   * the geometry_designer role loads + validates and its handoff schema compiles;
   * the GEOMETRY stage gate reads geometry_spec[] with provenance from the ledger.
 
-Headless: no FastMCP, no libaicad, no network, no LLM.
+Headless: no FastMCP, no libchudware, no network, no LLM.
 """
 from __future__ import annotations
 

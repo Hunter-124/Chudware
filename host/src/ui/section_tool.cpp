@@ -1,4 +1,4 @@
-// AI-CAD Section View — SolidWorks-style multi-plane section (C28-C).
+// Chudware Section View — SolidWorks-style multi-plane section (C28-C).
 #include "section_tool.h"
 
 #include <cmath>
@@ -21,7 +21,7 @@ const PresetDef kPresets[3] = {
     {"Right", {1, 0, 0}},
 };
 
-// Default axis-aligned normals for planes 0/1/2 (used by AI_CAD_SECTION=2/3).
+// Default axis-aligned normals for planes 0/1/2 (used by CHUDWARE_SECTION=2/3).
 const float kAxisNormals[3][3] = {{1,0,0}, {0,1,0}, {0,0,1}};
 const SectionTool::Preset kAxisPresets[3] = {
     SectionTool::Preset::Right, SectionTool::Preset::Front, SectionTool::Preset::Top
@@ -96,17 +96,17 @@ void SectionTool::pushPlanes(Renderer& renderer) {
 
 void SectionTool::updateAndDraw(AppState& st, Renderer& renderer, bool imgHovered, bool inSketch,
                                 ImVec2 vr0, ImVec2 vr1) {
-    // One-shot AI_CAD_SECTION knob: =1 → single default plane; =2/=3 → N axis-aligned planes.
+    // One-shot CHUDWARE_SECTION knob: =1 → single default plane; =2/=3 → N axis-aligned planes.
     if (!m_envChecked) {
         m_envChecked = true;
-        const char* e = std::getenv("AI_CAD_SECTION");
+        const char* e = std::getenv("CHUDWARE_SECTION");
         if (e) {
             int n = e[0] - '0';
             if (n >= 1 && n <= 3) {
                 m_active = true;
                 // Debug captures want the cut geometry visible, not the PM panel
-                // covering it. AI_CAD_SECTION_PANEL=1 forces the panel open.
-                const char* pe = std::getenv("AI_CAD_SECTION_PANEL");
+                // covering it. CHUDWARE_SECTION_PANEL=1 forces the panel open.
+                const char* pe = std::getenv("CHUDWARE_SECTION_PANEL");
                 m_collapsed = !(pe && pe[0] == '1');
                 m_planeCount = n;
                 for (int i = 0; i < kMaxPlanes; ++i) {

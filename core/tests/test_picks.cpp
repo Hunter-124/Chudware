@@ -44,8 +44,8 @@
 #include "aicm_loader.h"  // host loader (host/src/render on the include path)
 
 using json = nlohmann::json;
-using aicad::doc::CompileResult;
-using aicad::doc::compile_document;
+using chudware::doc::CompileResult;
+using chudware::doc::compile_document;
 
 namespace {
 
@@ -175,11 +175,11 @@ render::DocMesh parse(const CompileResult& r) {
 // so we filter to edges whose axis is +/-Z and dedup by rounded centroid to exactly 4.
 json vertical_edge_selectors(double W, double H, double D) {
     TopoDS_Shape box = geom::make_box(W, H, D);
-    std::vector<aicad::doc::TopoInfo> infos = aicad::doc::describe_edges(box);
+    std::vector<chudware::doc::TopoInfo> infos = chudware::doc::describe_edges(box);
 
     json sels = json::array();
     std::set<std::tuple<long long, long long, long long>> seen;
-    for (const aicad::doc::TopoInfo& info : infos) {
+    for (const chudware::doc::TopoInfo& info : infos) {
         if (!info.axis.has_value()) continue;
         if (std::abs(info.axis->z()) < 0.999) continue;  // not a vertical (+/-Z) edge
         // Dedup by rounded centroid (the two duplicate occurrences share geometry).
@@ -188,7 +188,7 @@ json vertical_edge_selectors(double W, double H, double D) {
             static_cast<long long>(std::llround(info.centroid.y() * 1e4)),
             static_cast<long long>(std::llround(info.centroid.z() * 1e4)));
         if (!seen.insert(key).second) continue;
-        sels.push_back(aicad::doc::make_selector(info));
+        sels.push_back(chudware::doc::make_selector(info));
     }
     return sels;
 }
@@ -204,8 +204,8 @@ TopoDS_Wire circle_wire(double r, double z) {
 
 // Count faces of `shape` whose query surf-type is curved (NOT plane) via a surf:"round"
 // face query — the I1 category match. Returns the QueryPicks so callers can assert .error.
-aicad::doc::QueryPicks round_faces(const TopoDS_Shape& shape) {
-    return aicad::doc::resolve_geom_query(shape, json{{"of", "face"}, {"surf", "round"}});
+chudware::doc::QueryPicks round_faces(const TopoDS_Shape& shape) {
+    return chudware::doc::resolve_geom_query(shape, json{{"of", "face"}, {"surf", "round"}});
 }
 
 }  // namespace
@@ -323,8 +323,8 @@ TEST_CASE("dangling edge selector: fillet errors, extrude body survives as a box
 //     assert analytic counts PLUS the centroid ORDERING that proves "top" is really the +Z
 //     face, "front" the -Y face, etc. — matching the host's named-view convention.
 TEST_CASE("geom query: direction/surf/size WORDS resolve like the precise forms") {
-    using aicad::doc::resolve_geom_query;
-    using aicad::doc::QueryPicks;
+    using chudware::doc::resolve_geom_query;
+    using chudware::doc::QueryPicks;
     const double DX = 40.0, DY = 30.0, DZ = 20.0;  // X longest, Z shortest
     TopoDS_Shape box = geom::make_box(DX, DY, DZ);
 
@@ -342,7 +342,7 @@ TEST_CASE("geom query: direction/surf/size WORDS resolve like the precise forms"
     // body with ~56 edges, which is what the tester actually measured — their analytic, not
     // the selector, was off.) Pin it explicitly so a regression here is unmistakable.
     {
-        aicad::doc::QueryPicks all_edges = q(json{{"of", "edge"}});
+        chudware::doc::QueryPicks all_edges = q(json{{"of", "edge"}});
         REQUIRE(all_edges.error.empty());
         CHECK_MESSAGE(all_edges.edges.size() == 12,
                       "bare {of:edge} must return ALL 12 box edges, got "
@@ -485,8 +485,8 @@ TEST_CASE("relational at: a cut cylinder centres on the queried top face") {
 //     with radius). The top rim likewise has an outer + inner circular edge. A radius pick
 //     on a body with no round geometry is a teaching error, not a silent empty.
 TEST_CASE("geom query: inner/outer tells the coaxial walls of a tube apart") {
-    using aicad::doc::resolve_geom_query;
-    using aicad::doc::QueryPicks;
+    using chudware::doc::resolve_geom_query;
+    using chudware::doc::QueryPicks;
     const double RO = 20.0, RI = 12.0, H = 50.0;
     TopoDS_Shape tube = geom::cut(geom::make_cylinder_centered(RO, H),
                                   geom::make_cylinder_centered(RI, H + 10.0));
@@ -530,8 +530,8 @@ TEST_CASE("geom query: inner/outer tells the coaxial walls of a tube apart") {
 //     We also verify that adding an explicit `pick:"largest"` on top of `side:"top"` still
 //     yields the same single face (existing `pick` logic is unaffected by the tie-break).
 TEST_CASE("B5 side tie-break: side:top on co-planar faces resolves to the LARGEST one") {
-    using aicad::doc::resolve_geom_query;
-    using aicad::doc::QueryPicks;
+    using chudware::doc::resolve_geom_query;
+    using chudware::doc::QueryPicks;
 
     // Build two separate (non-touching) boxes at the same top height.
     // Large box: 40x30x20 at origin. Small box: 5x30x20 at X=50 (gap of 10mm so they
@@ -585,8 +585,8 @@ TEST_CASE("B5 side tie-break: side:top on co-planar faces resolves to the LARGES
 //       pick:"inner" -> bore wall (R=5, concave, area ~2π*5*20 ≈ 628mm²)
 //       pick:"outer" -> corner fillet faces (R=2, convex, area ~π/2*2*20 ≈ 63mm² each)
 TEST_CASE("C5 inner/outer: picks bore (concave) not small-radius convex fillet") {
-    using aicad::doc::resolve_geom_query;
-    using aicad::doc::QueryPicks;
+    using chudware::doc::resolve_geom_query;
+    using chudware::doc::QueryPicks;
 
     // A box CENTERED at the origin with a CONCENTRIC through bore: make_box_centered spans
     // x,y,z in [-L/2,L/2]x[-W/2,W/2]x[-H/2,H/2]; make_cylinder_centered places the R=5 bore on
@@ -664,8 +664,8 @@ TEST_CASE("C5 inner/outer: picks bore (concave) not small-radius convex fillet")
 //          clamped to 0 (which returned no matches with no explanation).
 //          A valid count:1 must still work. count absent must not trigger the check.
 TEST_CASE("K10: invalid count in geom query returns a clear error") {
-    using aicad::doc::resolve_geom_query;
-    using aicad::doc::QueryPicks;
+    using chudware::doc::resolve_geom_query;
+    using chudware::doc::QueryPicks;
 
     // Build a simple 10×10×10 box — any solid with faces will do.
     TopoDS_Shape box = geom::make_box(10.0, 10.0, 10.0);
@@ -709,8 +709,8 @@ TEST_CASE("K10: invalid count in geom query returns a clear error") {
 //      a known lateral curved face that surf:"round"/"curved" must catch, and surf:"flat"
 //      must NOT. The specific type words (conical/spherical/toroidal) pick that one type.
 TEST_CASE("I1 surf:round broadened: matches cone/sphere/torus/loft curved faces") {
-    using aicad::doc::resolve_geom_query;
-    using aicad::doc::QueryPicks;
+    using chudware::doc::resolve_geom_query;
+    using chudware::doc::QueryPicks;
 
     // --- CONE (r1=10 base, r2=4 top, h=30): one conical lateral face + 2 planar caps. ----
     {
@@ -787,8 +787,8 @@ TEST_CASE("I1 surf:round broadened: matches cone/sphere/torus/loft curved faces"
 //      teaching error, which made an honest "no bores" look like a query bug. (The
 //      concavity logic is preserved when round faces DO exist — see test (i)/(g).)
 TEST_CASE("I2 pick:inner/outer with no round faces returns empty, not error") {
-    using aicad::doc::resolve_geom_query;
-    using aicad::doc::QueryPicks;
+    using chudware::doc::resolve_geom_query;
+    using chudware::doc::QueryPicks;
     TopoDS_Shape box = geom::make_box(30.0, 20.0, 10.0);
 
     for (const char* p : {"inner", "outer", "bore", "innermost", "outermost"}) {
@@ -811,8 +811,8 @@ TEST_CASE("I2 pick:inner/outer with no round faces returns empty, not error") {
 //      surf:round + side:front on a cone/sphere resolves (not EMPTY). describe_faces now
 //      assigns a representative direction to EVERY face (cone/sphere/torus included).
 TEST_CASE("I3 side on rounded parts: top cap wins, curved face faces the side") {
-    using aicad::doc::resolve_geom_query;
-    using aicad::doc::QueryPicks;
+    using chudware::doc::resolve_geom_query;
+    using chudware::doc::QueryPicks;
     auto cz = [](const QueryPicks& p, size_t i) {
         return p.selectors.at(i)["centroid"][2].get<double>();
     };

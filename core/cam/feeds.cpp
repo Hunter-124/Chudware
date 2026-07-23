@@ -11,7 +11,7 @@
 #include <filesystem>
 #include <fstream>
 
-namespace aicad {
+namespace chudware {
 namespace cam {
 
 static double clampd(double v, double lo, double hi) { return std::max(lo, std::min(hi, v)); }
@@ -145,29 +145,29 @@ json CuttingDB::to_json() const {
     return json{{"materials", a}};
 }
 // Resolve the engine materials registry.json location: env override first (tests + explicit
-// installs point at it), then the %APPDATA%/AI-CAD (XDG on *nix) data root — mirrors
-// core/agent/paths.cpp without linking aicad_agent (cam stays dependency-light). Empty path when
+// installs point at it), then the %APPDATA%/Chudware (XDG on *nix) data root — mirrors
+// core/agent/paths.cpp without linking chudware_agent (cam stays dependency-light). Empty path when
 // no root is discoverable -> the in-code table stands.
 namespace {
 std::filesystem::path resolve_registry_path() {
     namespace fs = std::filesystem;
-    if (const char* env = std::getenv("AICAD_MATERIALS_REGISTRY"); env && env[0])
+    if (const char* env = std::getenv("CHUDWARE_MATERIALS_REGISTRY"); env && env[0])
         return fs::path(env);
     fs::path root;
 #ifdef _WIN32
-    if (const char* base = std::getenv("APPDATA"); base && base[0]) root = fs::path(base) / "AI-CAD";
+    if (const char* base = std::getenv("APPDATA"); base && base[0]) root = fs::path(base) / "Chudware";
 #else
     if (const char* xdg = std::getenv("XDG_DATA_HOME"); xdg && xdg[0])
-        root = fs::path(xdg) / "AI-CAD";
+        root = fs::path(xdg) / "Chudware";
     else if (const char* home = std::getenv("HOME"); home && home[0])
-        root = fs::path(home) / ".local" / "share" / "AI-CAD";
+        root = fs::path(home) / ".local" / "share" / "Chudware";
 #endif
     if (!root.empty()) {
         const fs::path p = root / "materials" / "registry.json";
         if (fs::exists(p)) return p;
     }
-#ifdef AICAD_BUNDLED_MATERIALS_REGISTRY
-    return fs::path(AICAD_BUNDLED_MATERIALS_REGISTRY);  // bundled repo seed (last resort)
+#ifdef CHUDWARE_BUNDLED_MATERIALS_REGISTRY
+    return fs::path(CHUDWARE_BUNDLED_MATERIALS_REGISTRY);  // bundled repo seed (last resort)
 #endif
     return {};
 }
@@ -395,7 +395,7 @@ MachineRecord record_from_json(const json& j) {
 
 std::filesystem::path resolve_machines_registry_path() {
     namespace fs = std::filesystem;
-    if (const char* env = std::getenv("AICAD_MACHINES_REGISTRY"); env && env[0])
+    if (const char* env = std::getenv("CHUDWARE_MACHINES_REGISTRY"); env && env[0])
         return fs::path(env);
     return {};
 }
@@ -495,4 +495,4 @@ const Machine& MachineDB::fallback() {
 }
 
 }  // namespace cam
-}  // namespace aicad
+}  // namespace chudware

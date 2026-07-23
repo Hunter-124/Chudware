@@ -11,7 +11,7 @@
 
 #include "piping/pyutil.h"
 
-namespace aicad::hydraulic {
+namespace chudware::hydraulic {
 
 using pyutil::ojson;
 
@@ -63,4 +63,4 @@ ojson fea_handoff_envelope(double bore_mm, double rod_mm, double max_pressure_ba
 ojson verify_fea_envelope(const ojson& handoff, double tolerance_pct,
                           const ojson& fea_result = nullptr);
 
-}  // namespace aicad::hydraulic
+}  // namespace chudware::hydraulic

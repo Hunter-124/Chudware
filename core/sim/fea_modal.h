@@ -14,7 +14,7 @@
 #include <string>
 #include <vector>
 
-namespace aicad::sim {
+namespace chudware::sim {
 
 struct FeaModalResult {
     std::vector<double> freqs_hz;     // n_modes, sorted ascending
@@ -35,4 +35,4 @@ FeaModalResult fea_modal_solve(const std::vector<double>& points, const std::vec
                                const std::vector<int>& fixed_nodes, int n_modes,
                                int nodes_per_elem = 4);
 
-}  // namespace aicad::sim
+}  // namespace chudware::sim

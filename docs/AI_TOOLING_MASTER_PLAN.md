@@ -98,7 +98,7 @@ litigation history — official API is invite-only B2B, keep as link-out per WS-
 runtime-fetch caches stay **per-user local** — syncing caches through our servers or
 shipping them converts caching into redistribution.
 
-- Caching layer: `%APPDATA%/AI-CAD/knowledge/` — raw content keyed by URL+hash, tiered
+- Caching layer: `%APPDATA%/Chudware/knowledge/` — raw content keyed by URL+hash, tiered
   TTLs (pricing=hours, datasheets=days, standards≈immutable), `fetched_ts` always
   surfaced; offline/ITAR mode serves cache + bundled data only.
 - **Answer contract:** every helper returns `{answer, units, source_url, quote,
@@ -188,7 +188,7 @@ Finish what GSL started: **every domain state the app holds must have a determin
 One provider stack, subscription-friendly, governing every agent surface:
 
 - **MCP-first distribution:** users on Claude/Codex/Gemini/Cursor subscriptions drive
-  AI-CAD through the MCP server they already have — this is already true and stays the
+  Chudware through the MCP server they already have — this is already true and stays the
   flagship path. The user's agent client *is* the copilot brain riding their own
   subscription, 100% ToS-clean. Invest in a first-run "Connect to Claude Code / Cursor /
   Codex / Gemini CLI" wizard that writes the client config (extend
@@ -207,7 +207,7 @@ One provider stack, subscription-friendly, governing every agent surface:
     shipping).
   - **BYO API key** stays for pros/enterprise; local models (LM Studio/llama.cpp/Ollama
     endpoint) stay first-class; offline/ITAR mode preserved.
-- **AI-CAD Cloud (company-hosted relay):** for users who won't attach an account or key,
+- **Chudware Cloud (company-hosted relay):** for users who won't attach an account or key,
   we host our own model inference gateway — an OpenAI-compatible relay endpoint tied to
   the planned account system (limited trial quota → paid metering). It is just another
   provider adapter under `contracts/providers.md` (the contract makes it a config entry,
@@ -495,7 +495,7 @@ Proposed as **Workstream F** task files (claimable by autopilot agents) once app
 | T-F6 | 10 | Guided capture + phone handoff + photogrammetry subprocess → reverse_engineer | T-F5 |
 | T-F7 | 11 | `contracts/narration.md` + describe_toolpaths + describe_results | — |
 | T-F8 | 11 | describe_assembly + describe_board (GSL promotion) + describe_project | T-F7 |
-| T-F9 | 12 | `contracts/providers.md` + tool registry/allow-listing + session-auth spike + AI-CAD Cloud relay seam (config-only, human-gated) | — |
+| T-F9 | 12 | `contracts/providers.md` + tool registry/allow-listing + session-auth spike + Chudware Cloud relay seam (config-only, human-gated) | — |
 | T-F10 | 13 | `gsl-ser/v1` serialization freeze + eval harness (slot-based numeric fidelity) + dataset factory extension (no training yet) | T-F7 |
 | T-F11 | 13 | Translator SFT v0 (Qwen3-4B + Gemma 3 4B runs) + GRPO polish + LM Studio serving (gated on T-F10 eval) | T-F10 |
 | T-F13 | 13 | Micro-evaluator #1: feature-recognition hypothesis ranker (gated on RECOGNITION_RESIDUAL) | — |
@@ -576,7 +576,7 @@ default (Copilot drafts messages, flags stale refs) with an opt-in AI-managed ti
 manual-only floor — manual controls always primary. Architecture: snapshot-based on the
 T-H2 canonical serialization, per-project **hidden git vault** (containers exploded on
 check-in), local-first with the sharing spectrum local → shared folder → any self-hosted
-git remote → AI-CAD Cloud remote (seam only, Pillar-12 human gate). Team v1 = advisory
+git remote → Chudware Cloud remote (seam only, Pillar-12 human gate). Team v1 = advisory
 locks + one-button Sync + copy-as-variant, NO merge UI. GUI: history panel/rev badges/
 compare in every editor (T-U1 kit) + a full-screen **Project Hub** master workspace.
 Source of truth: [PLM_VERSION_CONTROL_PLAN.md](design/PLM_VERSION_CONTROL_PLAN.md); contract

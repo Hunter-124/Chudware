@@ -1,7 +1,7 @@
 // cef/cef_web_view.cpp — CefWebView (IWebViewBackend) off-screen render.
 //
 // In-process Chromium Embedded Framework off-screen browser (docs/cef_webview.md
-// phase 2). Compiled only with AI_CAD_ENABLE_CEF. Contract & threading mirror
+// phase 2). Compiled only with CHUDWARE_ENABLE_CEF. Contract & threading mirror
 // ScreencastWebView: GL-thread-only public API; CEF's OnPaint delivers BGRA on a
 // CEF thread, copied under a mutex and uploaded to the GL texture in draw().
 //
@@ -64,12 +64,12 @@ namespace {
 
 // Lifecycle tracing → stderr. Diagnoses "stuck on Loading" / freeze-on-open by
 // showing exactly which CEF lifecycle step fired (or didn't). Currently ON BY
-// DEFAULT while we chase the OSR open crash; set AI_CAD_CEF_TRACE=0 to silence.
+// DEFAULT while we chase the OSR open crash; set CHUDWARE_CEF_TRACE=0 to silence.
 // CEF's own [FATAL:…] DCHECK/CHECK aborts also print to this same stderr, so a
 // run captured with `2>&1 | tee` shows both our trace and any CEF fatal line.
 bool cefTrace() {
     static const bool on = [] {
-        const char* v = std::getenv("AI_CAD_CEF_TRACE");
+        const char* v = std::getenv("CHUDWARE_CEF_TRACE");
         return !(v && v[0] == '0');   // default on; only "0" disables
     }();
     return on;
@@ -103,7 +103,7 @@ inline void post_to_ui(std::function<void()> fn) {
 }
 
 // DIAGNOSTIC: capture the real reCAPTCHA / login network verdict. OFF by default
-// (opt-in AI_CAD_CEF_NETLOG=1) because it enables the CDP Network domain, which we
+// (opt-in CHUDWARE_CEF_NETLOG=1) because it enables the CDP Network domain, which we
 // otherwise keep quiet — it never touches Runtime.enable, so it does not reintroduce
 // the automation tell, but it is strictly a debugging aid. When on, OnDevToolsEvent
 // logs Network.responseReceived for the reCAPTCHA token exchange and login POST so we
@@ -111,7 +111,7 @@ inline void post_to_ui(std::function<void()> fn) {
 // blocked outright — instead of inferring the failure from an absent console error.
 bool cefNetLog() {
     static const bool on = [] {
-        const char* v = std::getenv("AI_CAD_CEF_NETLOG");
+        const char* v = std::getenv("CHUDWARE_CEF_NETLOG");
         return v && v[0] && v[0] != '0';   // default OFF; opt-in only
     }();
     return on;
@@ -200,9 +200,9 @@ std::string slug(const std::string& site) {
 // fetch via exportSession → browser_session_import → the daemon's "import_session"
 // (cookie re-injection, not dir-sharing — OSCrypt is per-process). See MEMORY
 // vendor-login-session-handoff and cef_daemon.cpp.
-// AI_CAD_CEF_PANEL_PROFILE_DIR overrides the location (tests / throwaway runs).
+// CHUDWARE_CEF_PANEL_PROFILE_DIR overrides the location (tests / throwaway runs).
 std::string panel_profile_dir() {
-    if (const char* ov = std::getenv("AI_CAD_CEF_PANEL_PROFILE_DIR"); ov && ov[0])
+    if (const char* ov = std::getenv("CHUDWARE_CEF_PANEL_PROFILE_DIR"); ov && ov[0])
         return ov;
     return cef_platform::cache_root() + "/_panel_profile";
 }
@@ -361,13 +361,13 @@ public:
     // challenge-gated vendor login. So default to nullptr (challenges work) and
     // only opt back into the proxy under an EXPLICIT, dedicated env var. Do NOT
     // gate this on cefTrace() — that flag is default-ON, which would silently
-    // reinstate the breakage for every normal run. AI_CAD_CEF_RESOURCE_HANDLER=1
+    // reinstate the breakage for every normal run. CHUDWARE_CEF_RESOURCE_HANDLER=1
     // re-enables the sub-resource failure logging when we're deliberately
     // diagnosing (and knowingly accept that challenge scripts break in that run).
     CefRefPtr<CefResourceRequestHandler> GetResourceRequestHandler(
         CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>, CefRefPtr<CefRequest>,
         bool, bool, const CefString&, bool&) override {
-        const char* v = std::getenv("AI_CAD_CEF_RESOURCE_HANDLER");
+        const char* v = std::getenv("CHUDWARE_CEF_RESOURCE_HANDLER");
         return (v && v[0] == '1') ? this : nullptr;
     }
 
@@ -563,7 +563,7 @@ public:
     }
 
     // DIAGNOSTICS (unconditional to stderr — one user run must yield the data;
-    // NOT gated on AI_CAD_CEF_TRACE). "Security verification failed to load" is a
+    // NOT gated on CHUDWARE_CEF_TRACE). "Security verification failed to load" is a
     // functional failure of the challenge widget, and its cause shows up as
     // either a page console error or a failed sub-resource fetch. Capture both so
     // we can tell detection (resources 200 then the widget bails) from a load
@@ -617,7 +617,7 @@ public:
         if (!text.empty()) s_->pendingClipboardOut = text;
     }
 
-    // DIAGNOSTIC (opt-in AI_CAD_CEF_NETLOG=1): surface the real bot-wall verdict.
+    // DIAGNOSTIC (opt-in CHUDWARE_CEF_NETLOG=1): surface the real bot-wall verdict.
     // With the Network domain enabled in OnAfterCreated, this fires for every
     // response; we log only the reCAPTCHA token exchange + the login endpoint so a
     // failed sign-in shows whether a token was issued and scored-low (recaptcha
@@ -672,7 +672,7 @@ private:
     std::shared_ptr<Shared> s_;
     CefRefPtr<CefBrowser> browser_;   // set in OnAfterCreated (CEF/UI thread)
     CefRefPtr<CefRegistration> devtoolsReg_;  // keeps the DevTools observer alive
-    bool tracedFirstPaint_ = false;   // AI_CAD_CEF_TRACE: log only the first OnPaint
+    bool tracedFirstPaint_ = false;   // CHUDWARE_CEF_TRACE: log only the first OnPaint
     IMPLEMENT_REFCOUNTING(Client);
 };
 
@@ -688,7 +688,7 @@ struct CefWebView::Impl {
     unsigned popupTex = 0;           // OSR <select> dropdown layer (composited over tex)
     int popupTexW = 0, popupTexH = 0;
     bool focused = false;
-    bool invalidatedOnce_ = false;   // AI_CAD_CEF_TRACE: log the first paint kick only
+    bool invalidatedOnce_ = false;   // CHUDWARE_CEF_TRACE: log the first paint kick only
 
     void createBrowser(const std::string& url, const std::string& cacheDir, bool startedAtAuth) {
         CEF_TRACE("createBrowser url=%s cache=%s onUiThread=%d",
@@ -832,7 +832,7 @@ CefWebView::~CefWebView() {
 
 void CefWebView::open(AppState& st, const std::string& siteOrUrl, bool isUrl) {
     // Prefer cold-start initialize() in main (before GLFW). This is a safety
-    // net for AI_CAD_CEF_LAZY=1 / re-open after shutdown — late init after
+    // net for CHUDWARE_CEF_LAZY=1 / re-open after shutdown — late init after
     // GLFW is unsupported for vendor sign-in on Linux.
     if (!cef::initialize()) {
         std::lock_guard<std::mutex> lk(impl_->s->mtx);

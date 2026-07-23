@@ -18,7 +18,7 @@ try:
 except ImportError:
     from config import Settings, settings
 
-log = logging.getLogger("billet-web.auth")
+log = logging.getLogger("chudware-web.auth")
 
 PUBLIC_PATHS = frozenset({"/healthz"})
 
@@ -156,7 +156,7 @@ class UserDirectory:
         }
         tmp = self.path.with_suffix(".yaml.tmp")
         with tmp.open("w", encoding="utf-8") as fh:
-            fh.write("# billet-web allowlist — managed via /admin; edits here are fine too.\n")
+            fh.write("# chudware-web allowlist — managed via /admin; edits here are fine too.\n")
             fh.write("# After manual edits run: python3 Webservice/deploy/cf_provision.py --sync-users\n")
             yaml.safe_dump(payload, fh, sort_keys=False)
         tmp.replace(self.path)
@@ -362,7 +362,7 @@ class AuthMiddleware:
         """
         if self.cfg.dev_mode:
             # Header preferred; cookie for sticky browser sessions; query for
-            # one-shot local smoke (BILLET_WEB_DEV=1 only).
+            # one-shot local smoke (CHUDWARE_WEB_DEV=1 only).
             from_query = False
             email = headers.get("x-dev-user") or cookies.get("dev_user")
             if not email:

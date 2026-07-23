@@ -10,7 +10,7 @@
 #include <string>
 #include <vector>
 
-namespace aicad::firmware {
+namespace chudware::firmware {
 
 struct RunResult {
     int returncode = -1;  // -1 = tool not found / timeout (Python parity)
@@ -31,4 +31,4 @@ std::string which(const std::string& name);
 RunResult run_capture(const std::vector<std::string>& argv, const std::string& cwd,
                       double timeout_s);
 
-}  // namespace aicad::firmware
+}  // namespace chudware::firmware

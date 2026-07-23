@@ -1,4 +1,4 @@
-// AI-CAD Viewport panel — 3D orbit view + parts list + fit readout + overlays.
+// Chudware Viewport panel — 3D orbit view + parts list + fit readout + overlays.
 #include <filesystem>
 
 #include <cctype>

@@ -14,16 +14,16 @@ Must-fix findings block T-G9/T-G11 sign-off until the fix is merged and a re-run
 flock /tmp/host-build-linux.lock -c "cmake --build host/build-linux -j$(nproc)"
 
 # Run a scenario (headless screenshot):
-AI_CAD_SHOT=m1      AI_CAD_REPO="$PWD" host/build-linux/bin/AI-CAD --ui-screenshot out.png
-AI_CAD_SHOT=sketch  AI_CAD_REPO="$PWD" host/build-linux/bin/AI-CAD --ui-screenshot out.png
-AI_CAD_SHOT=asm     AI_CAD_REPO="$PWD" host/build-linux/bin/AI-CAD --ui-screenshot out.png
-AI_CAD_SHOT=fea     AI_CAD_REPO="$PWD" host/build-linux/bin/AI-CAD --ui-screenshot out.png
-AI_CAD_SHOT=cam     AI_CAD_REPO="$PWD" host/build-linux/bin/AI-CAD --ui-screenshot out.png
-AI_CAD_SHOT=drawing AI_CAD_REPO="$PWD" host/build-linux/bin/AI-CAD --ui-screenshot out.png
-AI_CAD_SHOT=appearance AI_CAD_REPO="$PWD" host/build-linux/bin/AI-CAD --ui-screenshot out.png
+CHUDWARE_SHOT=m1      CHUDWARE_REPO="$PWD" host/build-linux/bin/Chudware --ui-screenshot out.png
+CHUDWARE_SHOT=sketch  CHUDWARE_REPO="$PWD" host/build-linux/bin/Chudware --ui-screenshot out.png
+CHUDWARE_SHOT=asm     CHUDWARE_REPO="$PWD" host/build-linux/bin/Chudware --ui-screenshot out.png
+CHUDWARE_SHOT=fea     CHUDWARE_REPO="$PWD" host/build-linux/bin/Chudware --ui-screenshot out.png
+CHUDWARE_SHOT=cam     CHUDWARE_REPO="$PWD" host/build-linux/bin/Chudware --ui-screenshot out.png
+CHUDWARE_SHOT=drawing CHUDWARE_REPO="$PWD" host/build-linux/bin/Chudware --ui-screenshot out.png
+CHUDWARE_SHOT=appearance CHUDWARE_REPO="$PWD" host/build-linux/bin/Chudware --ui-screenshot out.png
 
 # Run live (interactive):
-host/build-linux/bin/AI-CAD
+host/build-linux/bin/Chudware
 
 # Regenerate the checklist after code changes (for round 2+):
 python3 scripts/ui_inventory.py --repo . --out work/questions/T-G12-feedback-round<N>.md

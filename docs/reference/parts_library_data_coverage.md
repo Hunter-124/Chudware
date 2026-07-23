@@ -23,7 +23,7 @@ human-powered rover uses are already available first-party. **MatWeb is not
 required for this.** The opt-in external web lookup
 (`material_web_lookup.py`, MakeItFrom) built under the prior owner directive is
 therefore **redundant for property lookup** and stays **disabled by default**
-(`AI_CAD_ENABLE_MATERIAL_WEB` unset) — keep it only as an owner-opt-in
+(`CHUDWARE_ENABLE_MATERIAL_WEB` unset) — keep it only as an owner-opt-in
 cross-check, not a needed path. To add an alloy that's missing, extend
 `registry.json` (first-party, cited) rather than scraping.
 

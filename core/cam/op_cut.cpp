@@ -8,7 +8,7 @@
 
 #include "cam/op_common.h"
 
-namespace aicad {
+namespace chudware {
 namespace cam {
 
 // ──────────────────────────────────────────────── 2D cutting head ──
@@ -253,4 +253,4 @@ GenResult gen_probe(const Operation& opIn, const OpContext& ctx) {
 }
 
 }  // namespace cam
-}  // namespace aicad
+}  // namespace chudware

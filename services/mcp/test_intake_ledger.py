@@ -4,13 +4,13 @@ Contract: contracts/interaction.md §5 scope=doc — answers persist in the docu
 IntakeState record, round-tripped as JSON into the .step+, so a dimension confirmed
 in one session is never re-asked after the doc is saved and reopened.
 
-This suite drives the REAL engine (libaicad via core_bridge): no meta-store
+This suite drives the REAL engine (libchudware via core_bridge): no meta-store
 injection, no path injection — the production lookup (doc_get_meta/doc_set_meta
 through the .step+ save/open cycle) is what is exercised.  Critically, doc_open
 mints a FRESH doc_id (core/doc/session.cpp new_doc_id is a per-process counter),
 and the test asserts replay works anyway because the record travels with the doc.
 
-Run:  AI_CAD_LIBAICAD=$PWD/core/build-linux/bin/libaicad.so \
+Run:  CHUDWARE_LIBCHUDWARE=$PWD/core/build-linux/bin/libchudware.so \
       python -m pytest services/mcp/test_intake_ledger.py -v
 """
 from __future__ import annotations
@@ -31,7 +31,7 @@ from mcp_server import core_bridge as cb
 
 pytestmark = pytest.mark.skipif(
     not cb.available(),
-    reason="libaicad not staged; engine-backed IntakeLedger reopen test unavailable",
+    reason="libchudware not staged; engine-backed IntakeLedger reopen test unavailable",
 )
 
 

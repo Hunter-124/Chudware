@@ -1,5 +1,5 @@
 {
-  "engine": "/home/hunter/Repositories/CAD/core/build-occt-linux/bin/libaicad.so",
+  "engine": "/home/hunter/Repositories/CAD/core/build-occt-linux/bin/libchudware.so",
   "git_sha": "a2a2ac7f",
   "iters": 9,
   "metrics": {

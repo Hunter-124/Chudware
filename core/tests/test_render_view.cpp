@@ -39,15 +39,15 @@ bool is_png(const std::vector<unsigned char>& b) {
 std::string tmp_png(const char* tag) {
     static int n = 0;
     fs::path p = fs::temp_directory_path() /
-                 ("aicad_rv_" + std::string(tag) + "_" + std::to_string(n++) + ".png");
+                 ("chudware_rv_" + std::string(tag) + "_" + std::to_string(n++) + ".png");
     return p.string();
 }
 
 // Build a session part doc holding one asymmetric box (X=40, Y=24, Z=12). Distinct extents on every
 // axis => front (X*Z), right (Y*Z) and top (X*Y) projections are all different silhouettes.
 std::string make_box_doc() {
-    using aicad::doc::doc_new;
-    using aicad::doc::doc_apply_ops;
+    using chudware::doc::doc_new;
+    using chudware::doc::doc_apply_ops;
     json nr = doc_new("part", "RenderViewTest");
     std::string id = nr.at("doc_id").get<std::string>();
     auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
@@ -68,21 +68,21 @@ TEST_CASE("doc_render_view: named views render labelled PNGs and back-compat hol
     std::string id = make_box_doc();
 
     std::string pf = tmp_png("front");
-    json rf = aicad::doc::doc_render_view(id, pf, "front");
+    json rf = chudware::doc::doc_render_view(id, pf, "front");
     REQUIRE(rf.value("ok", false));
     CHECK(rf.value("view", std::string()) == "FRONT");
     CHECK_FALSE(rf.value("dims", std::string()).empty());  // bbox dims label present
     CHECK(is_png(read_bytes(pf)));
 
     std::string pt = tmp_png("top");
-    json rt = aicad::doc::doc_render_view(id, pt, "top");
+    json rt = chudware::doc::doc_render_view(id, pt, "top");
     REQUIRE(rt.value("ok", false));
     CHECK(rt.value("view", std::string()) == "TOP");
     CHECK(is_png(read_bytes(pt)));
 
     // doc_render_png (legacy iso) still works unchanged.
     std::string pi = tmp_png("iso");
-    json ri = aicad::doc::doc_render_png(id, pi);
+    json ri = chudware::doc::doc_render_png(id, pi);
     REQUIRE(ri.value("ok", false));
     CHECK(is_png(read_bytes(pi)));
 }
@@ -92,7 +92,7 @@ TEST_CASE("doc_render_view: distinct cameras produce distinct images, equivalent
 
     auto render = [&](const json& v, const char* tag) {
         std::string p = tmp_png(tag);
-        json r = aicad::doc::doc_render_view(id, p, v);
+        json r = chudware::doc::doc_render_view(id, p, v);
         REQUIRE(r.value("ok", false));
         return read_bytes(p);
     };
@@ -118,7 +118,7 @@ TEST_CASE("doc_render_view: parametric azimuth/elevation maps to the named-view 
     using doctest::Approx;
     // Helper: resolved camera dir (scene -> camera) the renderer used, from the response.
     auto dir = [&](const json& v, const char* tag) {
-        json r = aicad::doc::doc_render_view(id, tmp_png(tag), v);
+        json r = chudware::doc::doc_render_view(id, tmp_png(tag), v);
         REQUIRE(r.value("ok", false));
         const json& d = r.at("dir");
         return std::array<double, 3>{d[0].get<double>(), d[1].get<double>(), d[2].get<double>()};
@@ -142,13 +142,13 @@ TEST_CASE("doc_render_view: parametric azimuth/elevation maps to the named-view 
 
     // The header echoes the requested angle, and an explicit camera dir also renders.
     std::string pa = tmp_png("aehdr");
-    json ra = aicad::doc::doc_render_view(id, pa, json{{"azimuth", 30}, {"elevation", 20}});
+    json ra = chudware::doc::doc_render_view(id, pa, json{{"azimuth", 30}, {"elevation", 20}});
     REQUIRE(ra.value("ok", false));
     CHECK(ra.value("view", std::string()) == "AZ30 EL20");
     CHECK(is_png(read_bytes(pa)));
 
     std::string pd = tmp_png("dir");
-    json rd = aicad::doc::doc_render_view(id, pd, json{{"dir", json::array({1, 0, 0})}});
+    json rd = chudware::doc::doc_render_view(id, pd, json{{"dir", json::array({1, 0, 0})}});
     REQUIRE(rd.value("ok", false));
     CHECK(is_png(read_bytes(pd)));
 }
@@ -158,7 +158,7 @@ TEST_CASE("doc_render_contact_sheet: tiles multiple labelled views into one PNG"
 
     // Default set: front + right + top + iso.
     std::string ps = tmp_png("sheet");
-    json rs = aicad::doc::doc_render_contact_sheet(id, ps, json::array());
+    json rs = chudware::doc::doc_render_contact_sheet(id, ps, json::array());
     REQUIRE(rs.value("ok", false));
     REQUIRE(rs.at("views").is_array());
     CHECK(rs.at("views").size() == 4);
@@ -169,12 +169,12 @@ TEST_CASE("doc_render_contact_sheet: tiles multiple labelled views into one PNG"
 
     // A contact sheet is several tiles -> meaningfully larger than one single-view PNG.
     std::string p1 = tmp_png("single");
-    REQUIRE(aicad::doc::doc_render_view(id, p1, "front").value("ok", false));
+    REQUIRE(chudware::doc::doc_render_view(id, p1, "front").value("ok", false));
     CHECK(sheet.size() > read_bytes(p1).size());
 
     // Explicit view list is honoured.
     std::string ps2 = tmp_png("sheet2");
-    json rs2 = aicad::doc::doc_render_contact_sheet(
+    json rs2 = chudware::doc::doc_render_contact_sheet(
         id, ps2, json::array({"front", "top"}));
     REQUIRE(rs2.value("ok", false));
     CHECK(rs2.at("views").size() == 2);

@@ -1,7 +1,7 @@
 """Unit tests for T-BL04 advanced FEA — fatigue / thermal / buckling / contact.
 
 Split in two: the pure-Python `fea_advanced` math + .inp generators (always run,
-no CalculiX binary, no libaicad), and the MCP-tool degrade paths (need FastMCP
+no CalculiX binary, no libchudware), and the MCP-tool degrade paths (need FastMCP
 registration but assert only the honest ccx/backend-absent behaviour so they run
 green in CI without ccx installed).
 """

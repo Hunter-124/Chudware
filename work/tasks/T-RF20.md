@@ -13,15 +13,15 @@ priority: 3
 
 ## Context
 
-Endgame of zero-Python: services/mcp and services/dag must call hostd/libaicad only.
+Endgame of zero-Python: services/mcp and services/dag must call hostd/libchudware only.
 Python agent_turn.py consumers (services/dag/node_runner.py, services/plm/assist.py +
 ai_vc.py, subagent_rpc.py, mission_dispatch.py, reviewer_exec.py) either call the C++
 agent over RPC or are deleted with their feature. Accepted fallback per the old plan:
-thin Python clients over libaicad = still "zero Python ENGINE".
+thin Python clients over libchudware = still "zero Python ENGINE".
 
 ## Scope
 
-Flip services/mcp + services/dag to daemon/libaicad calls only; remove every
+Flip services/mcp + services/dag to daemon/libchudware calls only; remove every
 engine_oracle import from the Python tree (grep proof in gate); move/delete the
 agent_turn consumers. Advisor/ledger/mission tooling stays Python but engine-free.
 MCP freshness rule applies to any tool-surface change.

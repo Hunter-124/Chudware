@@ -26,7 +26,7 @@ Steering: `python3 work/tools/work.py set T-XX [--priority N] [--lane L]
 | Plan | What's parked | Seam that stays |
 |---|---|---|
 | ML / custom-model training (Hunter 2026-07-03) | training/fine-tuning tasks (e.g. T-BL14); no new ML-track tasks cut | telemetry capture, eval benches, adapter serving stay as shipped; capture-now-train-later stands |
-| SaaS / cloud hosting (Hunter 2026-07-03) | any server build-out | AI-CAD Cloud stays a config-only provider/remote seam behind the Pillar-12 human gate (providers, PLM T-R7) |
+| SaaS / cloud hosting (Hunter 2026-07-03) | any server build-out | Chudware Cloud stays a config-only provider/remote seam behind the Pillar-12 human gate (providers, PLM T-R7) |
 
 When cutting new tasks in a parked plan: create them `deferred: yes` so the
 ready queue stays honest.
@@ -59,7 +59,7 @@ shell is retired and deleted; the former T-G11 "delete host/" plan was reversed.
   (`Webservice/README.md`) — a desktop UI change ships to web by construction;
   never fork a web-only copy of a panel.
 - Scripted shot launches (gate.sh, tools/gui_parity/run_all.py) use `xvfb-run` unless
-  `AI_CAD_SHOT_HEADED=1` is set, even when `DISPLAY` is present. Set that env var for
+  `CHUDWARE_SHOT_HEADED=1` is set, even when `DISPLAY` is present. Set that env var for
   interactive/walkthrough runs.
 
 ## 4. Command crib sheet

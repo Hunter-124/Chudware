@@ -16,7 +16,7 @@ Contracts: contracts/doc_schema.md (entities/constraints §3), contracts/feature
 core/solver is a standalone numeric solver (knows nothing about geometry); core/sketch wraps it to solve 2D constraint problems (sketch entities → nsolve variables, constraints → residual blocks). core/geom provides OCCT-backed B-rep primitives for the 3D feature compiler. The feature tree (core/doc/session.cpp) uses core/sketch to resolve sketches on faces, then core/geom to build 3D solids. Sketch-plane lift (2D→3D) is in core/geom/plane.h. Python oracle: engine/doc/{nsolve,sketch_solver}.py (frozen). README reports 24/24 geometric-feature parity.
 
 ## Debugging playbook
-- Build: `cmake -S core -B core/build-linux -DAICAD_WITH_OCCT=ON && cmake --build core/build-linux`
+- Build: `cmake -S core -B core/build-linux -DCHUDWARE_WITH_OCCT=ON && cmake --build core/build-linux`
 - Tests: `ctest --test-dir core/build-linux -R "sketch|nsolve|polygon|drag|plane|profile" --output-on-failure` (doctest suite under core/tests/test_*.cpp)
 - Gotcha: sketch.h solve_sketch is 2D-only; face placement (sketch-on-face) is in core/doc/session.cpp / sketch_geom.cpp
 - Gotcha: nsolve.h has no Jacobian validation — supply analytic derivatives only; finite-diff will silently ignore mismatches

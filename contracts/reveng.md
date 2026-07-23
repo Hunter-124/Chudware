@@ -15,8 +15,8 @@
 
 ## 0. Conventions
 
-- **Session root:** `$AICAD_REVENG_DIR/<session_id>/` where `AICAD_REVENG_DIR` defaults to
-  `$XDG_DATA_HOME/AI-CAD/reveng` (Windows: `%LOCALAPPDATA%/AI-CAD/reveng`).
+- **Session root:** `$CHUDWARE_REVENG_DIR/<session_id>/` where `CHUDWARE_REVENG_DIR` defaults to
+  `$XDG_DATA_HOME/Chudware/reveng` (Windows: `%LOCALAPPDATA%/Chudware/reveng`).
 - **Degradation envelope:** every tool returns `{"ok": false, "reason": <str>, "hint": <str>}`
   on failure — never a traceback, never silent success.
 - **Fit-critical dimensions** route through the intake ledger (`confirm_dimensions`) with
@@ -32,18 +32,18 @@
 
 | Variable | Required | Meaning |
 |---|---|---|
-| `AICAD_REVENG_DIR` | no | Override session storage root |
+| `CHUDWARE_REVENG_DIR` | no | Override session storage root |
 | `OPENMVS_BIN` | for dense CPU mesh | OpenMVS `DensifyPointCloud` etc. (AGPL — subprocess ONLY) |
 | `BRUSH_BIN` | for 3DGS + mesh export | Brush trainer binary (Apache, subprocess) |
 | `MESHROOM_BIN` | no | Existing Meshroom path (unchanged from photogrammetry.py) |
-| `AICAD_TEST_CAMERA` | no | `1` enables Linux webcam ctest smoke |
+| `CHUDWARE_TEST_CAMERA` | no | `1` enables Linux webcam ctest smoke |
 
 ---
 
 ## 1. Session directory layout
 
 ```
-<AICAD_REVENG_DIR>/<session_id>/
+<CHUDWARE_REVENG_DIR>/<session_id>/
   session.json          # aicad.reveng_session/1 manifest
   images/               # user stills (JPEG/PNG)
   frames/               # video-extracted stills (blur-culled)
@@ -213,7 +213,7 @@ Extra columns ignored. Coordinate system: right-handed, millimetres after scale 
 Platform abstraction for webcam capture (`host/src/platform/camera.h`).
 
 ```cpp
-namespace aicad::platform {
+namespace chudware::platform {
 
 struct CameraInfo {
     std::string device_id;
@@ -239,7 +239,7 @@ public:
     virtual bool grabFrame(CameraFrame& out) = 0;  // stills-only; no continuous record
 };
 
-}  // namespace aicad::platform
+}  // namespace chudware::platform
 ```
 
 ---

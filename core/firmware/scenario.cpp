@@ -10,7 +10,7 @@
 
 #include "firmware/pyfmt.h"
 
-namespace aicad::firmware {
+namespace chudware::firmware {
 namespace {
 
 const std::regex kPinRe(R"(^P([A-K])(\d{1,2})$)");
@@ -338,7 +338,7 @@ std::vector<QuadratureEdge> quadrature_edges(const nlohmann::json& track) {
     return edges;
 }
 
-const char* kAdcScriptTemplate = R"SCRIPT(# AI-CAD ADC stub (aicad.fwscenario/1) — Python.PythonPeripheral script.
+const char* kAdcScriptTemplate = R"SCRIPT(# Chudware ADC stub (aicad.fwscenario/1) — Python.PythonPeripheral script.
 # Feeds programmed samples through the family's real ADC register window:
 # SR read returns the ready flags; each DR read pops the next sample (cycling).
 # Renode 1.16.1 request API: IsInit/IsRead/IsWrite/Offset/Value (capitalized).
@@ -602,7 +602,7 @@ ScenarioPlan build_scenario_plan(const nlohmann::json& scenario, const nlohmann:
                             continue;
                         }
                         plan.timeline.push_back(
-                            {t, "echo \"AICAD_I2C_SAMPLE " + bus + " " + fmt_hex(addr) +
+                            {t, "echo \"CHUDWARE_I2C_SAMPLE " + bus + " " + fmt_hex(addr) +
                                     " t_ms=" + fmt_g(t) + "\""});
                         for (const auto& b : s["response"])
                             plan.timeline.push_back({t, "sysbus." + bus + "." + name +
@@ -689,14 +689,14 @@ ScenarioPlan build_scenario_plan(const nlohmann::json& scenario, const nlohmann:
             replace_all(script, "{SR_VALUE}", fmt_hex(stub.sr_value));
             replace_all(script, "{DR_OFFSET}", fmt_hex(stub.dr_offset));
             // Aux .repl so the triple-quoted script survives intact.
-            std::string repl_name = "aicad_adc_stub.repl";
+            std::string repl_name = "chudware_adc_stub.repl";
             plan.aux_files[repl_name] =
                 "aicadAdc: Python.PythonPeripheral @ sysbus " + fmt_hex(stub.base) + "\n"
                 "    size: " + fmt_hex(stub.size) + "\n"
                 "    initable: true\n"
                 "    script: '''\n" + script + "'''\n";
             plan.setup_lines.push_back("machine LoadPlatformDescription "
-                                       "@{AICAD_SCENARIO_DIR}/" + repl_name);
+                                       "@{CHUDWARE_SCENARIO_DIR}/" + repl_name);
         }
     }
 
@@ -708,21 +708,21 @@ ScenarioPlan build_scenario_plan(const nlohmann::json& scenario, const nlohmann:
 
 std::vector<std::string> timeline_resc_lines(
     const std::vector<std::pair<double, std::string>>& timeline, double run_seconds) {
-    std::vector<std::string> lines = {"echo \"AICAD_T_MARK 0\""};
+    std::vector<std::string> lines = {"echo \"CHUDWARE_T_MARK 0\""};
     double now_ms = 0.0;
     for (const auto& [t_ms, action] : timeline) {
         double dt = std::max(0.0, t_ms - now_ms);
         if (dt > 0) {
             lines.push_back("sleep " + fmt_3f(dt / 1000.0));
             now_ms = t_ms;
-            lines.push_back("echo \"AICAD_T_MARK " + fmt_g(now_ms) + "\"");
+            lines.push_back("echo \"CHUDWARE_T_MARK " + fmt_g(now_ms) + "\"");
         }
         lines.push_back(action);
     }
     double remaining = run_seconds * 1000.0 - now_ms;
     if (remaining > 0) {
         lines.push_back("sleep " + fmt_3f(remaining / 1000.0));
-        lines.push_back("echo \"AICAD_T_MARK " + fmt_g(run_seconds * 1000.0) + "\"");
+        lines.push_back("echo \"CHUDWARE_T_MARK " + fmt_g(run_seconds * 1000.0) + "\"");
     }
     return lines;
 }
@@ -735,7 +735,7 @@ void materialize_aux_files(ScenarioPlan& plan, const std::string& directory) {
         std::ofstream out(fs::path(directory) / name, std::ios::binary | std::ios::trunc);
         out << content;
     }
-    for (auto& ln : plan.setup_lines) replace_all(ln, "{AICAD_SCENARIO_DIR}", directory);
+    for (auto& ln : plan.setup_lines) replace_all(ln, "{CHUDWARE_SCENARIO_DIR}", directory);
 }
 
-}  // namespace aicad::firmware
+}  // namespace chudware::firmware

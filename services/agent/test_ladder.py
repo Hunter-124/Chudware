@@ -15,7 +15,7 @@ FIRST and prove that rule two ways: (1) a planted sentinel from an upstream rung
 leaks into NO downstream rung's assembled context; (2) each rung's context
 contains exactly the artifacts §22 names for it and excludes the others.
 
-Runs headless: no FastMCP, no libaicad, no network, no live LLM (a scripted mock
+Runs headless: no FastMCP, no libchudware, no network, no live LLM (a scripted mock
 provider supplies rung artifacts). The fixture spec is a "bearing mount bracket".
 """
 from __future__ import annotations

@@ -18,7 +18,7 @@
 #include <string>
 #include <vector>
 
-namespace aicad::doc {
+namespace chudware::doc {
 namespace {
 
 using nlohmann::json;
@@ -2050,4 +2050,4 @@ std::vector<std::string> validate_document(const nlohmann::json& doc) {
     return {"schema: unknown '" + got + "'"};
 }
 
-}  // namespace aicad::doc
+}  // namespace chudware::doc

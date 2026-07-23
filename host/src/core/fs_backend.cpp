@@ -16,7 +16,7 @@
 #include <emscripten/fetch.h>
 #endif
 
-namespace billet {
+namespace chudware {
 namespace {
 
 namespace fs = std::filesystem;
@@ -148,8 +148,8 @@ public:
     }
 
     std::string defaultRoot() override {
-        // Mirrors defaultWorkspaceDir() in app_state.cpp (Documents/AI-CAD if present, else
-        // Documents/Billet). Kept local so fs_backend has no app_state dependency.
+        // Mirrors defaultWorkspaceDir() in app_state.cpp (a legacy Documents/Billet or Documents/AI-CAD if present, else
+        // Documents/Chudware). Kept local so fs_backend has no app_state dependency.
 #ifdef _WIN32
         const char* up = std::getenv("USERPROFILE");
         const fs::path base = up && *up ? fs::path(up) / "Documents" : fs::path(".");
@@ -158,9 +158,9 @@ public:
         const fs::path base = home && *home ? fs::path(home) / "Documents" : fs::path(".");
 #endif
         std::error_code ec;
-        const fs::path legacy = base / "AI-CAD";
-        if (fs::exists(legacy, ec)) return legacy.string();
-        return (base / "Billet").string();
+        for (const char* legacy : {"Billet", "AI-CAD"})
+            if (fs::exists(base / legacy, ec)) return (base / legacy).string();
+        return (base / "Chudware").string();
     }
 
     bool copy(const std::string& src, const std::string& dst, bool recursive,
@@ -796,4 +796,4 @@ void fsTriggerDownload(const std::string& path) {
 #endif
 }
 
-}  // namespace billet
+}  // namespace chudware

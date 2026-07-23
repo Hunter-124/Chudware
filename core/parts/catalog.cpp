@@ -2,7 +2,7 @@
 #include "parts/parts_data.h"
 #include "parts/parts.h"
 
-namespace aicad {
+namespace chudware {
 namespace parts {
 namespace data {
 
@@ -184,4 +184,4 @@ json catalog_json() {
 }
 
 }  // namespace parts
-}  // namespace aicad
+}  // namespace chudware

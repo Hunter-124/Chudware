@@ -11,7 +11,7 @@
 // CppDynamic binding, which dlopens lib3mf.dll at runtime (CWrapper::loadLibrary)
 // — no import lib on the link line, MSVC-safe, exactly like the Python lib3mf
 // wheel (both wrap the SAME lib3mf.dll C ABI 2.5.0, so the mesh extraction is
-// bit-identical). Guarded by AICAD_WITH_LIB3MF so a build without the SDK
+// bit-identical). Guarded by CHUDWARE_WITH_LIB3MF so a build without the SDK
 // provisioned still compiles (the 3MF paths then fall through to the loud "not
 // supported" errors below).
 //
@@ -20,7 +20,7 @@
 // CP_UTF8 (winnls.h), which the lean macro strips, and (2) OCCT headers define
 // WIN32_LEAN_AND_MEAN, which would poison a later include. Pulling it in first
 // guarantees the full Win32 surface for the binding.
-#ifdef AICAD_WITH_LIB3MF
+#ifdef CHUDWARE_WITH_LIB3MF
 #ifdef _WIN32
 // NOMINMAX: windows.h otherwise defines min()/max() macros that collide with
 // std::max({...}) in the PLY reader below.
@@ -29,7 +29,7 @@
 #endif
 #include <windows.h>
 #else
-#include <dlfcn.h>  // dladdr: locate lib3mf.so beside this module (libaicad.so)
+#include <dlfcn.h>  // dladdr: locate lib3mf.so beside this module (libchudware.so)
 #endif
 #include "lib3mf_dynamic.hpp"
 #endif
@@ -50,14 +50,14 @@
 #endif
 
 // openNURBS (Rhino .3dm read/write) — CONFINED to this TU, guarded by
-// AICAD_WITH_OPENNURBS. opennurbs.h is the single umbrella header; it pulls in
+// CHUDWARE_WITH_OPENNURBS. opennurbs.h is the single umbrella header; it pulls in
 // <windows.h> itself on Win32. NOMINMAX (so its includes don't redefine
 // min/max) is set above when lib3mf is enabled; set it here too for an
 // openNURBS-only build. The static lib (opennurbsStatic) carries the bundled
 // zlib + Win32 system libs. We read the STORED ON_Mesh (m_V float32 / m_F
 // quad/tri) — the SAME data the rhino3dm wheel exposes — so extraction is
 // bit-identical to the Python oracle.
-#ifdef AICAD_WITH_OPENNURBS
+#ifdef CHUDWARE_WITH_OPENNURBS
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -144,7 +144,7 @@
 
 #include "doc/session.h"  // OpError
 
-namespace aicad::doc {
+namespace chudware::doc {
 
 namespace {
 
@@ -272,7 +272,7 @@ std::string abs_path(const std::string& path) {
     return ec ? path : p.string();
 }
 
-#ifdef AICAD_WITH_LIB3MF
+#ifdef CHUDWARE_WITH_LIB3MF
 // A named mesh extracted from a 3MF mesh object — the C++ analogue of the
 // oracle's (name, MeshBody(verts, tris)) tuple. Vertices are float32 (Lib3MF
 // sPosition.m_Coordinates is Lib3MF_single == float), triangle indices uint32
@@ -285,7 +285,7 @@ struct NamedMesh {
 };
 
 // Load lib3mf.dll. The CppDynamic binding LoadLibraryW's the given filename; we
-// pass the DLL beside THIS module (libaicad.dll) so the staged copy is found
+// pass the DLL beside THIS module (libchudware.dll) so the staged copy is found
 // regardless of the process CWD. Falls back to the bare name (PATH search).
 Lib3MF::PWrapper load_lib3mf() {
 #ifdef _WIN32
@@ -305,7 +305,7 @@ Lib3MF::PWrapper load_lib3mf() {
         }
     }
 #else
-    // POSIX: prefer the lib3mf shared object staged beside this module (libaicad.so),
+    // POSIX: prefer the lib3mf shared object staged beside this module (libchudware.so),
     // located via dladdr; fall back to the loader search by bare soname.
     std::string dll_path = "lib3mf.so";
     Dl_info info;
@@ -410,7 +410,7 @@ void write_3mf_meshes(const std::vector<NamedMesh>& meshes, const std::string& p
                       {{"format", "3mf"}, {"path", path}});
     model->QueryWriter("3mf")->WriteToFile(path);
 }
-#endif  // AICAD_WITH_LIB3MF
+#endif  // CHUDWARE_WITH_LIB3MF
 
 // --------------------------------------------------------------------------- DXF import
 //
@@ -861,7 +861,7 @@ std::string dwg_to_temp_dxf(const std::string& path) {
                   {{"path", path}, {"format", "dwg"}});
 }
 
-#ifdef AICAD_WITH_OPENNURBS
+#ifdef CHUDWARE_WITH_OPENNURBS
 // A named mesh pulled out of a .3dm object — the C++ analogue of the oracle's
 // (name, MeshBody(verts float32, tris uint32)) tuple. verts live in MeshData as
 // doubles, but the source is ON_3fPoint (float32, m_V), so every value widens
@@ -1012,7 +1012,7 @@ void write_3dm_meshes(const std::vector<OnNamedMesh>& meshes, const std::string&
         throw OpError("export_failed", "openNURBS ONX_Model::Write returned failure",
                       {{"format", "3dm"}, {"path", path}});
 }
-#endif  // AICAD_WITH_OPENNURBS
+#endif  // CHUDWARE_WITH_OPENNURBS
 
 }  // namespace
 
@@ -1316,7 +1316,7 @@ MeshData shape_triangulations_to_mesh(const TopoDS_Shape& shape) {
 void write_obj(const MeshData& mesh, const std::string& path) {
     std::ofstream os(path, std::ios::out | std::ios::trunc);
     if (!os) throw OpError("export_failed", "OBJ: cannot open output", {{"path", path}});
-    os << "# aicad OBJ export\n";
+    os << "# chudware OBJ export\n";
     os.setf(std::ios::fixed);
     os.precision(6);
     const std::size_t nv = mesh.vertex_count();
@@ -1335,7 +1335,7 @@ void write_ply(const MeshData& mesh, const std::string& path) {
     if (!os) throw OpError("export_failed", "PLY: cannot open output", {{"path", path}});
     const std::size_t nv = mesh.vertex_count();
     const std::size_t nt = mesh.triangle_count();
-    os << "ply\nformat ascii 1.0\ncomment aicad PLY export\n";
+    os << "ply\nformat ascii 1.0\ncomment chudware PLY export\n";
     os << "element vertex " << nv << "\n";
     os << "property float x\nproperty float y\nproperty float z\n";
     os << "element face " << nt << "\n";
@@ -1595,7 +1595,7 @@ MeshData read_mesh(const std::string& path, const std::string& fmt) {
     if (fmt == "ply") return read_ply(path);
     if (fmt == "gltf" || fmt == "glb") return read_gltf(path);
     if (fmt == "3mf") {
-#ifdef AICAD_WITH_LIB3MF
+#ifdef CHUDWARE_WITH_LIB3MF
         // Concatenate every 3MF mesh object into one soup (re-basing indices) for
         // the generic single-mesh read_mesh contract; import_bodies handles 3mf
         // per-object to match the oracle's one-MeshBody-per-object naming.
@@ -1610,12 +1610,12 @@ MeshData read_mesh(const std::string& path, const std::string& fmt) {
 #else
         throw OpError("import_failed",
                       "3MF import requires lib3mf — rebuild core with the SDK provisioned "
-                      "(-DAICAD_WITH_OCCT=ON pulls in ProvisionLib3mf).",
+                      "(-DCHUDWARE_WITH_OCCT=ON pulls in ProvisionLib3mf).",
                       {{"format", fmt}, {"path", path}});
 #endif
     }
     if (fmt == "3dm") {
-#ifdef AICAD_WITH_OPENNURBS
+#ifdef CHUDWARE_WITH_OPENNURBS
         // Concatenate every 3dm mesh object into one soup (re-basing indices) for
         // the generic single-mesh read_mesh contract; import_bodies handles 3dm
         // per-object to match the oracle's one-MeshBody-per-object naming.
@@ -1630,7 +1630,7 @@ MeshData read_mesh(const std::string& path, const std::string& fmt) {
 #else
         throw OpError("import_failed",
                       "3DM import requires openNURBS — rebuild core with the SDK provisioned "
-                      "(-DAICAD_WITH_OCCT=ON pulls in ProvisionOpenNURBS).",
+                      "(-DCHUDWARE_WITH_OCCT=ON pulls in ProvisionOpenNURBS).",
                       {{"format", fmt}, {"path", path}});
 #endif
     }
@@ -1642,7 +1642,7 @@ std::vector<std::pair<std::string, MeshData>> read_mesh_raw(const std::string& p
                                                             const std::string& fmt) {
     std::vector<std::pair<std::string, MeshData>> out;
     if (fmt == "3mf") {
-#ifdef AICAD_WITH_LIB3MF
+#ifdef CHUDWARE_WITH_LIB3MF
         for (NamedMesh& nm : read_3mf_objects(path))
             out.emplace_back(nm.name, std::move(nm.mesh));
         return out;
@@ -1653,7 +1653,7 @@ std::vector<std::pair<std::string, MeshData>> read_mesh_raw(const std::string& p
 #endif
     }
     if (fmt == "3dm") {
-#ifdef AICAD_WITH_OPENNURBS
+#ifdef CHUDWARE_WITH_OPENNURBS
         for (OnNamedMesh& nm : read_3dm_objects(path))
             out.emplace_back(nm.name, std::move(nm.mesh));
         return out;
@@ -1875,7 +1875,7 @@ std::string export_bodies(const std::vector<TopoDS_Shape>& bodies, const std::st
             return out;
         }
         if (fmt == "3mf") {
-#ifdef AICAD_WITH_LIB3MF
+#ifdef CHUDWARE_WITH_LIB3MF
             // Tessellate each body (Python BRepMesh defaults via shape_to_mesh) into
             // one named 3MF mesh object, mirroring _export_3mf_lib3mf (one mesh object
             // + build item per body). Export parity is gated as a ROUND-TRIP (the OCCT
@@ -1893,12 +1893,12 @@ std::string export_bodies(const std::vector<TopoDS_Shape>& bodies, const std::st
 #else
             throw OpError("export_failed",
                           "3MF export requires lib3mf — rebuild core with the SDK provisioned "
-                          "(-DAICAD_WITH_OCCT=ON pulls in ProvisionLib3mf).",
+                          "(-DCHUDWARE_WITH_OCCT=ON pulls in ProvisionLib3mf).",
                           {{"format", fmt}, {"reason", "lib3mf not provisioned"}});
 #endif
         }
         if (fmt == "3dm") {
-#ifdef AICAD_WITH_OPENNURBS
+#ifdef CHUDWARE_WITH_OPENNURBS
             // Tessellate each body (Python BRepMesh defaults via shape_to_mesh) into
             // one named ON_Mesh object, mirroring _export_3dm (one AddMesh per body).
             // Export parity is gated as a ROUND-TRIP (the OCCT tessellation differs
@@ -1916,7 +1916,7 @@ std::string export_bodies(const std::vector<TopoDS_Shape>& bodies, const std::st
 #else
             throw OpError("export_failed",
                           "3DM export requires openNURBS — rebuild core with the SDK provisioned "
-                          "(-DAICAD_WITH_OCCT=ON pulls in ProvisionOpenNURBS).",
+                          "(-DCHUDWARE_WITH_OCCT=ON pulls in ProvisionOpenNURBS).",
                           {{"format", fmt}, {"reason", "openNURBS not provisioned"}});
 #endif
         }
@@ -2044,7 +2044,7 @@ std::vector<std::pair<std::string, TopoDS_Shape>> import_bodies(const std::strin
             return name_bodies(split_solids(shape));
         }
         if (fmt == "3mf") {
-#ifdef AICAD_WITH_LIB3MF
+#ifdef CHUDWARE_WITH_LIB3MF
             // 3MF via lib3mf: one body per mesh object (matching _import_3mf), each
             // sewn into a shell/solid (the same as_solid path as the other mesh
             // formats). Body names follow the oracle: the 3MF object name, else
@@ -2067,12 +2067,12 @@ std::vector<std::pair<std::string, TopoDS_Shape>> import_bodies(const std::strin
 #else
             throw OpError("import_failed",
                           "3MF import requires lib3mf — rebuild core with the SDK provisioned "
-                          "(-DAICAD_WITH_OCCT=ON pulls in ProvisionLib3mf).",
+                          "(-DCHUDWARE_WITH_OCCT=ON pulls in ProvisionLib3mf).",
                           {{"format", fmt}, {"reason", "lib3mf not provisioned"}});
 #endif
         }
         if (fmt == "3dm") {
-#ifdef AICAD_WITH_OPENNURBS
+#ifdef CHUDWARE_WITH_OPENNURBS
             // 3dm via openNURBS: one body per mesh object (matching _import_3dm),
             // each sewn into a shell/solid (the same as_solid path as the other mesh
             // formats). Body names follow the oracle: the object attribute name, else
@@ -2095,7 +2095,7 @@ std::vector<std::pair<std::string, TopoDS_Shape>> import_bodies(const std::strin
 #else
             throw OpError("import_failed",
                           "3DM import requires openNURBS — rebuild core with the SDK provisioned "
-                          "(-DAICAD_WITH_OCCT=ON pulls in ProvisionOpenNURBS).",
+                          "(-DCHUDWARE_WITH_OCCT=ON pulls in ProvisionOpenNURBS).",
                           {{"format", fmt}, {"reason", "openNURBS not provisioned"}});
 #endif
         }
@@ -2206,4 +2206,4 @@ TopoDS_Shape brep_b64_to_shape(const std::string& b64) {
     return shape;
 }
 
-}  // namespace aicad::doc
+}  // namespace chudware::doc

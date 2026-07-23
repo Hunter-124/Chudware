@@ -1,4 +1,4 @@
-"""Pack AI-generated icon PNGs into the AI-CAD atlases.
+"""Pack AI-generated icon PNGs into the Chudware atlases.
 
 This is the AI-icon counterpart to the legacy procedural `make_icons.py`. Instead of
 drawing glyphs, it composites pre-rendered source PNGs (one per icon name, produced from
@@ -84,7 +84,7 @@ def pack(src: Path, out: Path, atlas_json: Path) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="Pack AI icon PNGs into the AI-CAD atlases.")
+    ap = argparse.ArgumentParser(description="Pack AI icon PNGs into the Chudware atlases.")
     ap.add_argument("--src", type=Path, default=ICON_DIR / "src", help="source PNG dir")
     ap.add_argument("--out", type=Path, default=ICON_DIR, help="output dir for atlases")
     ap.add_argument("--atlas", type=Path, default=ICON_DIR / "atlas.json", help="layout json")

@@ -18,14 +18,14 @@
 #endif
 
 #include "../ipc/ipc_client.h"
-#include <cstdio> // T-G9 parity trace (AI_CAD_RPC_TRACE) file append
+#include <cstdio> // T-G9 parity trace (CHUDWARE_RPC_TRACE) file append
 #include <cstdlib>
 #include <functional> // T-G9 parity trace secret redaction
 #include <string>
 
 #include "bootstrap.h"
-#include "cpp_core.h" // P16: legacy in-process libaicad (InProcCore backend)
-#include "engine_backend.h" // Phase 4: InProcCore vs DaemonConn seam (AI_CAD_ENGINE_DAEMON)
+#include "cpp_core.h" // P16: legacy in-process libchudware (InProcCore backend)
+#include "engine_backend.h" // Phase 4: InProcCore vs DaemonConn seam (CHUDWARE_ENGINE_DAEMON)
 
 using nlohmann::json;
 
@@ -91,17 +91,17 @@ bool callAgentStreaming(const std::string &coreMethod, const json &p,
   return engine::call(coreMethod, p, cppResult, cerr, timeoutMs);
 }
 
-// --- Per-document routing to the pure-C++ core (libaicad) --------------------
+// --- Per-document routing to the pure-C++ core (libchudware) --------------------
 // A document CREATED in the C++ core gets a "doc-cpp..." id, so every
 // subsequent doc_* call carrying that id routes to the C++ core too — the id
 // prefix IS the commit-at-doc_new marker, giving an all-or-nothing-per-document
 // cutover with no separate routing state. R5a (T-RF21): unconditional — the C++
 // doc engine is the only backend (parity-complete since 2026-06-19: 24/24
-// differential gate vs the retired Python oracle; the AI_CAD_CPP_DOCS escape
+// differential gate vs the retired Python oracle; the CHUDWARE_CPP_DOCS escape
 // hatch is gone). cppAgentFlag() follows, so the agent also routes C++ (it
 // drives the same doc session it edits). doc-cpp session it edits).
 bool cppDocsFlag() {
-  // R5a (T-RF21): the AI_CAD_CPP_DOCS escape hatch is removed — the pure-C++
+  // R5a (T-RF21): the CHUDWARE_CPP_DOCS escape hatch is removed — the pure-C++
   // doc engine is the only backend (the Python oracle is deleted at closeout).
   return true;
 }
@@ -143,7 +143,7 @@ bool routeDocToCpp(const std::string &method, const json &params) {
   }
   // T-RF19 leaves 4-6:
   // hydraulic/piping/structural/tolerance/mechanical/materials/dfm ported to
-  // core/ (dispatch in libaicad.cpp). Route the ported sets.
+  // core/ (dispatch in libchudware.cpp). Route the ported sets.
   static const char *const kR4e6[] = {
       // hydraulic (core/hydraulic)
       "hydraulic_new",
@@ -211,7 +211,7 @@ bool routeDocToCpp(const std::string &method, const json &params) {
     }
   }
   // T-RF18: sourcing/BOM/cost/spec-match ported to core/sourcing (dispatch in
-  // libaicad.cpp with production seams). Route the ported set; the vendor
+  // libchudware.cpp with production seams). Route the ported set; the vendor
   // registry read methods and parts_hub stay Python until their cutover.
   if (method == "bom_rollup" || method == "bom_price" ||
       method == "request_quote" || method == "match_part_number" ||
@@ -295,14 +295,14 @@ bool routeDocToCpp(const std::string &method, const json &params) {
 }
 // --- C++ AGENT routing (opt-in, default OFF) --------------------------------
 // Route the in-app AI-agent RPCs (agent_run_v2 / agent_ask_v2 /
-// agent_pm_assist_v1 / get_prompts_v2) to the pure-C++ core (libaicad) instead
+// agent_pm_assist_v1 / get_prompts_v2) to the pure-C++ core (libchudware) instead
 // of the Python worker. This MIRRORS the doc_* seam and is unconditional since
 // R5a (T-RF21). (agent_design was deleted in T-RF5 — the v2 run is the only
 // agent path.) The C++ agent drives a C++-backed ("doc-cpp") doc session, so we
 // only route when the active doc is C++-backed; a Python doc (e.g. an assembly)
 // falls through to Python.
 bool cppAgentFlag() {
-  // R5a (T-RF21): the AI_CAD_CPP_AGENT escape hatch is removed — the C++ agent
+  // R5a (T-RF21): the CHUDWARE_CPP_AGENT escape hatch is removed — the C++ agent
   // is the only agent backend. The agent still drives the SAME doc session it
   // edits (C++ agent <-> doc-cpp), so it follows the (unconditional) doc
   // engine.
@@ -366,8 +366,8 @@ bool routeAgentToCpp(const std::string &method, const json &params) {
 // --- C++ SIM (FEA) routing (opt-in, default OFF) ----------------------------
 // Route the host's FEA simulation RPCs (sim_mesh / sim_run_static /
 // sim_run_modal / sim_run_fatigue / sim_run_thermal) to the pure-C++ core
-// (libaicad) instead of the Python sim worker. MIRRORS the agent seam but is
-// DEFAULT OFF: unless AI_CAD_CPP_SIM is set (and != "0") every sim call goes to
+// (libchudware) instead of the Python sim worker. MIRRORS the agent seam but is
+// DEFAULT OFF: unless CHUDWARE_CPP_SIM is set (and != "0") every sim call goes to
 // the Python sim worker exactly as today. sim_run_flow (LBM/CFD) stays Python
 // for the host panel path (stl-shaped params); the C++ core owns doc_id-shaped
 // flow runs directly. sim_cancel is now C++-dispatched in core (T-RF16,
@@ -383,7 +383,7 @@ bool routeAgentToCpp(const std::string &method, const json &params) {
 // reads results_npz/solve_time_s, the two fields the C++ result omits) — so the
 // result is byte-compatible for display.
 bool cppSimFlag() {
-  // R5a (T-RF21): the AI_CAD_CPP_SIM escape hatch is removed — FEA/flow run on
+  // R5a (T-RF21): the CHUDWARE_CPP_SIM escape hatch is removed — FEA/flow run on
   // the C++ core only.
   return true;
 }
@@ -406,9 +406,9 @@ bool routeSimToCpp(const std::string &method, const json & /*params*/) {
   return true;
 }
 // --- C++ ECAD routing (opt-in, default OFF) ---------------------------------
-// Route the host's ECAD RPCs (ecad_*) to the pure-C++ core (libaicad) instead
+// Route the host's ECAD RPCs (ecad_*) to the pure-C++ core (libchudware) instead
 // of the Python worker. MIRRORS the doc_* seam exactly, but is DEFAULT OFF:
-// unless AI_CAD_CPP_ECAD is set (and != "0") every ecad_* call goes to the
+// unless CHUDWARE_CPP_ECAD is set (and != "0") every ecad_* call goes to the
 // Python worker exactly as today. An ECAD doc CREATED in the C++ core mints an
 // "ecadcpp..." id (core/ecad/session.cpp new_doc_id()), so every subsequent
 // ecad_* call carrying that doc_id routes to the C++ core too — the id prefix
@@ -416,8 +416,8 @@ bool routeSimToCpp(const std::string &method, const json & /*params*/) {
 // ECAD analogue of "doc-cpp").
 //
 // Coverage gaps (updated 2026-07-22, T-RF17): the C++ core handles the stateful
-// doc-id ecad methods in libaicad.cpp AND the doc-id forms of ecad_autoroute /
-// ecad_to_3d / ecad_route_diff_pair (libaicad.cpp:3557-3616), plus
+// doc-id ecad methods in libchudware.cpp AND the doc-id forms of ecad_autoroute /
+// ecad_to_3d / ecad_route_diff_pair (libchudware.cpp:3557-3616), plus
 // ecad_fill_zones, ecad_simulate, and KiCad import (ecad_open dispatches
 // .kicad_sch/.kicad_pcb to core/ecad/kicad.cpp). The only remaining Python
 // method is ecad_design (an LLM state machine — deferred to the agent seam; its
@@ -425,7 +425,7 @@ bool routeSimToCpp(const std::string &method, const json & /*params*/) {
 // that hits ecad_design fails loud (no Python doc to fall back to) — exactly
 // the doc-cpp seam's behavior.
 bool cppEcadFlag() {
-  // R5a (T-RF21): the AI_CAD_CPP_ECAD escape hatch is removed — the C++ core is
+  // R5a (T-RF21): the CHUDWARE_CPP_ECAD escape hatch is removed — the C++ core is
   // the only ECAD backend on every platform (the Python ECAD worker is deleted
   // at closeout; Windows' Python default goes with it).
   return true;
@@ -465,13 +465,13 @@ bool routeEcadToCpp(const std::string &method, const json &params) {
   return true;
 }
 // --- C++ firmware routing (T-RF15) ------------------------------------------
-// Route the ported fw_* methods to core/firmware (libaicad). DEFAULT ON on
+// Route the ported fw_* methods to core/firmware (libchudware). DEFAULT ON on
 // Linux/macOS (the platforms the C++ module is verified on);
-// AI_CAD_CPP_FIRMWARE overrides. The three emulator-leg methods (fw_sim_run /
+// CHUDWARE_CPP_FIRMWARE overrides. The three emulator-leg methods (fw_sim_run /
 // fw_power_profile / fw_sensor_scenario) stay Python until the Renode leg
 // lands.
 bool cppFirmwareFlag() {
-  // R5a (T-RF21): the AI_CAD_CPP_FIRMWARE escape hatch is removed —
+  // R5a (T-RF21): the CHUDWARE_CPP_FIRMWARE escape hatch is removed —
   // core/firmware owns the fw_* surface (POSIX-verified; Windows path is
   // best-effort C++).
   return true;
@@ -558,7 +558,7 @@ bool WorkerClient::start(std::string &err, const std::string &module) {
   // runtime never surfaces as a cryptic "CreateProcess failed".
   if (!fileExists(python)) {
     err = "Python runtime not installed.\nExpected: " + python +
-          "\nUse AI-CAD \xe2\x96\xb8 Repair runtime to install it.";
+          "\nUse Chudware \xe2\x96\xb8 Repair runtime to install it.";
     return false;
   }
 
@@ -599,7 +599,7 @@ bool WorkerClient::start(std::string &err, const std::string &module) {
   CloseHandle(inRd);
   if (!ok) {
     err = "Could not launch the Python runtime (" + win32Error(gle) + ").\n" +
-          python + "\nUse AI-CAD \xe2\x96\xb8 Repair runtime to reinstall it.";
+          python + "\nUse Chudware \xe2\x96\xb8 Repair runtime to reinstall it.";
     CloseHandle(outRd);
     CloseHandle(inWr);
     return false;
@@ -716,7 +716,7 @@ void WorkerClient::abortPending() {
   abort_.store(true);
   // Wake a blocked daemon agent_run so AsyncRpc::shutdown / app quit cannot
   // hang on a multi-minute modeling call. In-proc path still relies on
-  // agent_cancel (libaicad cooperative flag) which requestStopRun already
+  // agent_cancel (libchudware cooperative flag) which requestStopRun already
   // fired.
   if (engine::daemonMode()) {
     if (auto *c = engine::client())
@@ -832,17 +832,17 @@ bool WorkerClient::readLine(std::string &line, int timeoutMs) {
 #endif // platform
 }
 
-// T-G9 parity trace: with AI_CAD_RPC_TRACE=<file> set, every call() appends one
+// T-G9 parity trace: with CHUDWARE_RPC_TRACE=<file> set, every call() appends one
 // JSONL record {method, params, ok, result|err}. This is the single funnel all
 // panel RPCs pass through regardless of routing (Python worker subprocess,
-// in-process libaicad doc/CAM core, ECAD/agent C++ paths), so tools/gui_parity/
+// in-process libchudware doc/CAM core, ECAD/agent C++ paths), so tools/gui_parity/
 // can capture byte-comparable request/ response streams from BOTH GUI binaries
 // (host links services/worker directly too). Env unset (the default, incl. all
 // production runs) = the wrapper is a tail call.
 bool WorkerClient::call(const std::string &method, const json &params,
                         json &result, std::string &err, int timeoutMs,
                         const EventFn &onEvent) {
-  static const char *tracePath = std::getenv("AI_CAD_RPC_TRACE");
+  static const char *tracePath = std::getenv("CHUDWARE_RPC_TRACE");
   if (!tracePath || !*tracePath)
     return callImpl(method, params, result, err, timeoutMs, onEvent);
 
@@ -912,8 +912,8 @@ bool WorkerClient::callViaSideClient(const std::string &method,
   // hostdBin hint is REQUIRED: an empty hint hashes "default" in instanceKey(),
   // which is a different socket than the running daemon's (hostd binds
   // instanceKey(selfPath())) — the connect then fails ENOENT mid-session.
-  aicad_ipc::EngineClient side;
-  aicad_ipc::EngineClient::Options opts;
+  chudware_ipc::EngineClient side;
+  chudware_ipc::EngineClient::Options opts;
   opts.clientKind = "gui";
   opts.hostdBin = engine::hostdBinHint();
   opts.allowSpawn = false;
@@ -989,8 +989,8 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
     err = "aborted";
     return false;
   }
-  // C++ AGENT routing (opt-in via AI_CAD_CPP_AGENT, default OFF). Translate the
-  // in-app agent RPCs to the libaicad agent methods and run them in-process.
+  // C++ AGENT routing (opt-in via CHUDWARE_CPP_AGENT, default OFF). Translate the
+  // in-app agent RPCs to the libchudware agent methods and run them in-process.
   // Default OFF => routeAgentToCpp() returns false and this whole block is
   // skipped (today's behavior).
   if (routeAgentToCpp(method, params)) {
@@ -1119,12 +1119,12 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
     } else if (method == "agent_steer") {
       // Mid-run steering: queue `text` for the run to consume at the next
       // stage/attempt boundary. Same transport shape as agent_cancel:
-      // in-process calls libaicad directly; daemon mode uses a SHORT-LIVED
+      // in-process calls libchudware directly; daemon mode uses a SHORT-LIVED
       // second EngineClient so the steer never queues behind the in-flight
       // agent_run on the shared socket.
       if (engine::daemonMode()) {
-        aicad_ipc::EngineClient side;
-        aicad_ipc::EngineClient::Options opts;
+        chudware_ipc::EngineClient side;
+        chudware_ipc::EngineClient::Options opts;
         opts.clientKind = "gui";
         opts.hostdBin =
             engine::hostdBinHint(); // same instance key as the live daemon
@@ -1140,13 +1140,13 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
         ok = engine::call("agent_steer", params, cppResult, cerr, timeoutMs);
       }
     } else if (method == "agent_cancel") {
-      // Best-effort stop. In-process: call libaicad directly (no mutex
+      // Best-effort stop. In-process: call libchudware directly (no mutex
       // contention with the blocked agent_run). Daemon: open a SHORT-LIVED
       // second EngineClient so we don't queue behind the in-flight agent_run on
       // the shared socket.
       if (engine::daemonMode()) {
-        aicad_ipc::EngineClient side;
-        aicad_ipc::EngineClient::Options opts;
+        chudware_ipc::EngineClient side;
+        chudware_ipc::EngineClient::Options opts;
         opts.clientKind = "gui";
         opts.hostdBin =
             engine::hostdBinHint(); // same instance key as the live daemon
@@ -1190,8 +1190,8 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
     // else: fall through to the Python worker path below (list_models tolerates
     // failure).
   }
-  // C++ SIM (FEA) routing (opt-in via AI_CAD_CPP_SIM, default OFF). Run the FEA
-  // mesh / static / modal RPCs in-process against libaicad. The host already
+  // C++ SIM (FEA) routing (opt-in via CHUDWARE_CPP_SIM, default OFF). Run the FEA
+  // mesh / static / modal RPCs in-process against libchudware. The host already
   // sends the C++ {study:{...}} contract verbatim, so params pass through
   // unchanged; the result carries summary + overlay_aicm (what sim_panel
   // reads). Default OFF => routeSimToCpp() returns false and this block is
@@ -1218,13 +1218,13 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
     // hard-break sim — fall through to the Python sim worker path below so
     // analysis keeps working.
   }
-  // C++ ECAD routing (opt-in via AI_CAD_CPP_ECAD, default OFF). MIRRORS the
+  // C++ ECAD routing (opt-in via CHUDWARE_CPP_ECAD, default OFF). MIRRORS the
   // doc_* seam below: an ecad_new/ecad_open mints an "ecadcpp" doc and binds
   // the whole doc lifetime to C++; any later ecad_* carrying that ecadcpp
   // doc_id routes here. Default OFF => routeEcadToCpp() returns false (and no
   // ecadcpp doc exists) so this block is skipped entirely — byte-for-byte
   // today's Python ECAD path. No params translation: the host's ecad_*
-  // send-shape IS the libaicad contract (kind/name, doc_id, base_revision,
+  // send-shape IS the libchudware contract (kind/name, doc_id, base_revision,
   // ops...).
   if (routeEcadToCpp(method, params)) {
     // ecad_new / ecad_open MINT a new ECAD doc; everything else operates on an
@@ -1261,7 +1261,7 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
     // on Python).
   }
   // CAM (computer-aided machining): every cam_* RPC lives ONLY in the C++ core
-  // (libaicad); there is no Python CAM engine. Route them all to cpp_core and
+  // (libchudware); there is no Python CAM engine. Route them all to cpp_core and
   // report its result (an OpError surfaces as {code,message,detail}); never
   // fall back to Python.
   if (method.rfind("cam_", 0) == 0) {
@@ -1278,7 +1278,7 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
     return false;
   }
   // Firmware (fw_*): the whole surface lives in the C++ core (core/firmware,
-  // dispatched in libaicad.cpp; hostd serves it in daemon mode). The Python
+  // dispatched in libchudware.cpp; hostd serves it in daemon mode). The Python
   // worker no longer registers fw_* methods — calls that reach the pipe come
   // back "unknown method". Route like cam_*: structured error envelopes
   // round-trip in `result`; hard failures surface via errorSink.
@@ -1295,7 +1295,7 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
       errorSink_(method, err);
     return false;
   }
-  // P16: route C++-backed documents to the in-process core (libaicad) instead
+  // P16: route C++-backed documents to the in-process core (libchudware) instead
   // of the Python worker. All-or-nothing per document (NO mid-doc Python
   // fallback — Python never created this doc), so an unported method surfaces a
   // clear error rather than silently misrouting. The diagnostic parity probe in
@@ -1304,7 +1304,7 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
     const bool minting = isMintingMethod(method, params);
     std::string cerr;
     if (engine::call(method, params, result, cerr, timeoutMs))
-      return true; // handled (aicad_call rc==0); `result` holds the
+      return true; // handled (chudware_call rc==0); `result` holds the
                    // ops-response
     // Nonzero rc: a structured OpError carries {code,message,detail} in
     // `result`.

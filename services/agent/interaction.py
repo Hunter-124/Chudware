@@ -276,17 +276,17 @@ def _validate(batch: QuestionBatch) -> None:
 # --------------------------------------------------------------------------- #
 
 def cache_root() -> Path:
-    """Resolve ``<appdata>/AI-CAD/cache`` the way the C++ run machine does
+    """Resolve ``<appdata>/Chudware/cache`` the way the C++ run machine does
     (``core/agent/paths.cpp``): APPDATA on Windows, ``$XDG_DATA_HOME`` else
-    ``~/.local/share`` on Linux/macOS. ``AICAD_CACHE_ROOT`` overrides (tests)."""
-    override = os.environ.get("AICAD_CACHE_ROOT")
+    ``~/.local/share`` on Linux/macOS. ``CHUDWARE_CACHE_ROOT`` overrides (tests)."""
+    override = os.environ.get("CHUDWARE_CACHE_ROOT")
     if override:
         return Path(override)
     if sys.platform.startswith("win"):
         base = os.environ.get("APPDATA") or os.path.expanduser(r"~\AppData\Roaming")
     else:
         base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
-    return Path(base) / "AI-CAD" / "cache"
+    return Path(base) / "Chudware" / "cache"
 
 
 def run_dir(run_id: str) -> Path:
@@ -367,7 +367,7 @@ def _default_doc_ledger(doc_id: str) -> "Ledger":
     survive save/reopen regardless of the per-process doc_id the engine mints).
 
     Lazy import keeps this module stdlib-only at load time; when the engine
-    bridge is unavailable (pure-Python test runs without libaicad) we fall back
+    bridge is unavailable (pure-Python test runs without libchudware) we fall back
     to a session-local :class:`MemoryLedger`, same as before the doc path existed.
     """
     try:

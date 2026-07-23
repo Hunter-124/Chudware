@@ -23,8 +23,8 @@
 #include "geom/profile3d.h"
 
 using json = nlohmann::json;
-using aicad::doc::CompileResult;
-using aicad::doc::compile_document;
+using chudware::doc::CompileResult;
+using chudware::doc::compile_document;
 
 namespace {
 
@@ -102,7 +102,7 @@ TEST_CASE("wires_from_sketch3d chains contiguous edges, splits disconnected ones
     ents["e6"] = json{{"type", "point"}, {"construction", false},
                       {"p", json::array({50, 50, 50})}};
 
-    std::vector<TopoDS_Wire> wires = aicad::geom::wires_from_sketch3d(ents);
+    std::vector<TopoDS_Wire> wires = chudware::geom::wires_from_sketch3d(ents);
     REQUIRE(wires.size() == 2);
     int n0 = 0, n1 = 0;
     for (TopExp_Explorer ex(wires[0], TopAbs_EDGE); ex.More(); ex.Next()) ++n0;
@@ -232,7 +232,7 @@ TEST_CASE("sketch3d guide curve scales a swept profile end-to-end") {
 //    the GUI consumes): create a doc via ops, add a sketch3d, read health, drag
 //    a handle, commit via edit_feature, re-read health.
 TEST_CASE("sketch3d health + drag RPCs through the session layer") {
-    json newdoc = aicad::doc::doc_new("part", "sketch3d-rpc-test");
+    json newdoc = chudware::doc::doc_new("part", "sketch3d-rpc-test");
     const std::string doc_id = newdoc["doc_id"].get<std::string>();
 
     json sk3 = json{{"type", "sketch3d"},
@@ -241,11 +241,11 @@ TEST_CASE("sketch3d health + drag RPCs through the session layer") {
                                     {"constraints", json::array({
                                          rel("c1", "fix", {"e1.p1"})})}}}};
     json ops = json::array({json{{"op", "add_feature"}, {"feature", sk3}}});
-    json r = aicad::doc::doc_apply_ops(doc_id, -1, ops, false);
+    json r = chudware::doc::doc_apply_ops(doc_id, -1, ops, false);
     const std::string fid = r["id_map"]["$0"].get<std::string>();
     REQUIRE(!fid.empty());
 
-    json h = aicad::doc::doc_sketch3d_health(doc_id, fid);
+    json h = chudware::doc::doc_sketch3d_health(doc_id, fid);
     CHECK(h["ok"].get<bool>());
     CHECK(h["converged"].get<bool>());
     CHECK(h["dof"].get<int>() == 3);  // e1.p2 free in x/y/z
@@ -261,7 +261,7 @@ TEST_CASE("sketch3d health + drag RPCs through the session layer") {
     CHECK(saw_p2);
 
     // Drag e1.p2 to (0, 25, 5): p1 stays pinned, p2 follows the target.
-    json d = aicad::doc::doc_sketch3d_drag(doc_id, fid, "e1.p2",
+    json d = chudware::doc::doc_sketch3d_drag(doc_id, fid, "e1.p2",
                                            json::array({0.0, 25.0, 5.0}), json());
     REQUIRE(d["ok"].get<bool>());
     const json* e1 = nullptr;
@@ -277,10 +277,10 @@ TEST_CASE("sketch3d health + drag RPCs through the session layer") {
     for (const auto& e : d["entities"]) solved_entities.push_back(e);
     json commit = json::array({json{{"op", "edit_feature"}, {"id", fid},
                                     {"params", json{{"entities", solved_entities}}}}});
-    json rc = aicad::doc::doc_apply_ops(doc_id, -1, commit, false);
+    json rc = chudware::doc::doc_apply_ops(doc_id, -1, commit, false);
     CHECK(rc.contains("revision"));
 
-    json h2 = aicad::doc::doc_sketch3d_health(doc_id, fid);
+    json h2 = chudware::doc::doc_sketch3d_health(doc_id, fid);
     CHECK(h2["ok"].get<bool>());
     const json* e1b = nullptr;
     for (const auto& e : h2["entities"])
@@ -289,20 +289,20 @@ TEST_CASE("sketch3d health + drag RPCs through the session layer") {
     CHECK((*e1b)["p2"][1].get<double>() == doctest::Approx(25.0).epsilon(1e-2));
 
     // A bogus handle is rejected loudly, entities preserved.
-    json bad = aicad::doc::doc_sketch3d_drag(doc_id, fid, "e9.p1",
+    json bad = chudware::doc::doc_sketch3d_drag(doc_id, fid, "e9.p1",
                                              json::array({0.0, 0.0, 0.0}), json());
     CHECK_FALSE(bad["ok"].get<bool>());
     CHECK(bad["entities"].size() == 1);
 
-    aicad::doc::doc_close(doc_id);
+    chudware::doc::doc_close(doc_id);
 }
 
 // ---- T-3DXREF: sketch3d external vertex references -------------------------
 
 TEST_CASE("sketch3d external vertex ref: resolves, grounds a coincident constraint, "
          "follows an upstream edit, goes stale (kept) when the source is deleted") {
-    using aicad::doc::doc_new;
-    using aicad::doc::doc_apply_ops;
+    using chudware::doc::doc_new;
+    using chudware::doc::doc_apply_ops;
     json nr = doc_new("part", "sketch3d-xref-test");
     const std::string doc_id = nr["doc_id"].get<std::string>();
 
@@ -323,7 +323,7 @@ TEST_CASE("sketch3d external vertex ref: resolves, grounds a coincident constrai
     for (int tid = 1; tid <= 64; ++tid) {
         json pick;
         try {
-            pick = aicad::doc::doc_resolve_pick(doc_id, 1, "vertex", tid);
+            pick = chudware::doc::doc_resolve_pick(doc_id, 1, "vertex", tid);
         } catch (...) { break; }
         const json& sel = pick["selector"];
         if (!sel.contains("centroid")) continue;
@@ -348,7 +348,7 @@ TEST_CASE("sketch3d external vertex ref: resolves, grounds a coincident constrai
     const std::string fid = r2["id_map"]["$0"].get<std::string>();
     REQUIRE(!fid.empty());
 
-    json h = aicad::doc::doc_sketch3d_health(doc_id, fid);
+    json h = chudware::doc::doc_sketch3d_health(doc_id, fid);
     REQUIRE(h["ok"].get<bool>());
     const json* e1 = nullptr;
     for (const auto& e : h["entities"]) if (e["id"] == "e1") e1 = &e;
@@ -365,7 +365,7 @@ TEST_CASE("sketch3d external vertex ref: resolves, grounds a coincident constrai
                          {"params", {{"height", dimv(35)}}}};
     json r3 = doc_apply_ops(doc_id, -1, json::array({edit_box}), false);
     REQUIRE(r3.contains("revision"));
-    json h2 = aicad::doc::doc_sketch3d_health(doc_id, fid);
+    json h2 = chudware::doc::doc_sketch3d_health(doc_id, fid);
     REQUIRE(h2["ok"].get<bool>());
     const json* e1b = nullptr;
     for (const auto& e : h2["entities"]) if (e["id"] == "e1") e1b = &e;
@@ -377,7 +377,7 @@ TEST_CASE("sketch3d external vertex ref: resolves, grounds a coincident constrai
     json del_box = json{{"op", "delete_feature"}, {"id", box_fid}};
     json r4 = doc_apply_ops(doc_id, -1, json::array({del_box}), false);
     REQUIRE(r4.contains("revision"));
-    json h3 = aicad::doc::doc_sketch3d_health(doc_id, fid);
+    json h3 = chudware::doc::doc_sketch3d_health(doc_id, fid);
     REQUIRE(h3["ok"].get<bool>());
     const json* e1c = nullptr;
     for (const auto& e : h3["entities"]) if (e["id"] == "e1") e1c = &e;
@@ -385,5 +385,5 @@ TEST_CASE("sketch3d external vertex ref: resolves, grounds a coincident constrai
     // Last-good position (from the height=35 state) kept, not silently zeroed.
     CHECK((*e1c)["p2"][2].get<double>() == doctest::Approx(-17.5).epsilon(1e-4));
 
-    aicad::doc::doc_close(doc_id);
+    chudware::doc::doc_close(doc_id);
 }

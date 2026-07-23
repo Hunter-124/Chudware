@@ -18,7 +18,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
-namespace aicad_ipc {
+namespace chudware_ipc {
 
 IpcListener& IpcListener::operator=(IpcListener&& o) noexcept {
     if (this != &o) {
@@ -201,7 +201,7 @@ IpcConn IpcListener::accept(int timeoutMs) {
     // consumer could stall the whole daemon. On timeout the write fails
     // (EAGAIN) and the connection is dropped. Configurable; 0 disables.
     static const int sndTimeoutS = [] {
-        if (const char* s = std::getenv("AICAD_HOSTD_WRITE_TIMEOUT_S"); s && *s)
+        if (const char* s = std::getenv("CHUDWARE_HOSTD_WRITE_TIMEOUT_S"); s && *s)
             return std::max(0, std::atoi(s));
         return 10;  // headroom for a merely-busy GUI; a dropped client reconnects
     }();
@@ -247,6 +247,6 @@ IpcConn connectTo(const std::string& path, std::string& err) {
     return IpcConn(fd);
 }
 
-}  // namespace aicad_ipc
+}  // namespace chudware_ipc
 
 #endif  // !_WIN32

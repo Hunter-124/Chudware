@@ -19,18 +19,18 @@ charger/controller:
 ## Run
 
 ```bash
-AI_CAD_LIBAICAD=$PWD/core/build-occt-linux/bin/libaicad.so \
-  /home/hunter/.local/share/AI-CAD/mcp-venv/bin/python \
+CHUDWARE_LIBCHUDWARE=$PWD/core/build-occt-linux/bin/libchudware.so \
+  /home/hunter/.local/share/Chudware/mcp-venv/bin/python \
   scripts/bench_battery_charger.py
 ```
 
 Env:
 
-- `AICAD_BC_OUT` — output dir (default `benchmarks/battery_charger`)
-- `AICAD_BC_MARKERS` — marker dir
-- `AICAD_BC_SEED` — fixed seed (default 0)
-- `AICAD_BC_SIM_BUDGET_S` — Renode wall budget (default 120)
-- `AI_CAD_ECAD_HEAVY_BUDGET_S` — board_from_schematic budget (default 180)
+- `CHUDWARE_BC_OUT` — output dir (default `benchmarks/battery_charger`)
+- `CHUDWARE_BC_MARKERS` — marker dir
+- `CHUDWARE_BC_SEED` — fixed seed (default 0)
+- `CHUDWARE_BC_SIM_BUDGET_S` — Renode wall budget (default 120)
+- `CHUDWARE_ECAD_HEAVY_BUDGET_S` — board_from_schematic budget (default 180)
 
 Exit 0 when no leg is FAIL (SKIP/WARN allowed).
 

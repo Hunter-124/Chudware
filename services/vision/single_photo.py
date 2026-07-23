@@ -138,7 +138,7 @@ def reconstruct_single_photo(
                  ``"high"`` → TRELLIS.2 (slower, higher fidelity).
                  Falls back to whichever backend is provisioned.
         output_dir: Directory to write the output mesh.  Defaults to
-            ``$AICAD_REVENG_DIR/<session_id>/mesh/``.
+            ``$CHUDWARE_REVENG_DIR/<session_id>/mesh/``.
 
     Returns:
         On success::
@@ -181,10 +181,10 @@ def reconstruct_single_photo(
     # Resolve output directory
     if output_dir is None:
         reveng_dir = os.environ.get(
-            "AICAD_REVENG_DIR",
+            "CHUDWARE_REVENG_DIR",
             os.path.join(
                 os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")),
-                "AI-CAD", "reveng",
+                "Chudware", "reveng",
             ),
         )
         out_dir = Path(reveng_dir) / session_id / "mesh"

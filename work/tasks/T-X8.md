@@ -17,7 +17,7 @@ Hunter directive 2026-07-05 (priority #4): "some way to login via a built in bro
 web accounts for popular vendors … non headless browser integration for account logins."
 T-X1's session service already persists per-site Playwright profiles; what is missing is
 the USER-FACING flow: a visible (headed) browser window the user opens from inside
-AI-CAD to log in to a vendor, which then persists that session for the headless
+Chudware to log in to a vendor, which then persists that session for the headless
 adapters (T-X2/T-X7) to reuse.
 
 ## Definition of done
@@ -46,4 +46,4 @@ adapters (T-X2/T-X7) to reuse.
 - Branch task/T-X8-headed-login-window, worktree ../CAD-T-X8. Stop at status: review.
 - Security posture is contract-level: no credential storage, no captcha/2FA automation,
   profiles local-only and gitignored. Restate this in module docstrings.
-- Python venv for gate: `~/.local/share/AI-CAD/mcp-venv/bin/python`.
+- Python venv for gate: `~/.local/share/Chudware/mcp-venv/bin/python`.

@@ -1,4 +1,4 @@
-// Cross-OS path helpers. Most callers append "/AI-CAD/..." to appdataDir().
+// Cross-OS path helpers. Most callers append "/Chudware/..." to appdataDir().
 #pragma once
 
 #include <string>
@@ -7,13 +7,13 @@ namespace platform {
 
 std::string exeDir();
 
-// Parent of the AI-CAD data dir (Windows: %APPDATA%; Linux: $XDG_DATA_HOME or ~/.local/share).
+// Parent of the Chudware data dir (Windows: %APPDATA%; Linux: $XDG_DATA_HOME or ~/.local/share).
 std::string appdataDir();
 
 // Alias kept for early scaffold call sites.
 inline std::string userDataDir() { return appdataDir(); }
 
-// Full AI-CAD data root (forward slashes — valid on Windows too).
+// Full Chudware data root (forward slashes — valid on Windows too).
 std::string appdataRoot();
 inline std::string appDataRoot() { return appdataRoot(); }
 

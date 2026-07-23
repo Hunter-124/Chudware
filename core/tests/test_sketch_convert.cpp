@@ -8,7 +8,7 @@
 // OBLIQUE circular edge was rejected outright.
 //
 // THE FIX (see doc_ops.md's dated T-BL43 amendment): op_sketch_convert (session.cpp) +
-// aicad::doc::project_edges_to_plane (recon.cpp) — true orthographic projection along the
+// chudware::doc::project_edges_to_plane (recon.cpp) — true orthographic projection along the
 // sketch normal via GeomProjLib::ProjectOnPlane, then classification of the PROJECTED curve,
 // so the result is correct by construction:
 //   * oblique circle -> "ellipse" (rx = R, ry = R*cos(theta));
@@ -40,12 +40,12 @@
 #include "geom/plane.h"
 
 using json = nlohmann::json;
-using aicad::doc::doc_apply_ops;
-using aicad::doc::doc_new;
-using aicad::doc::doc_query;
-using aicad::doc::doc_sketch_enter;
-using aicad::doc::project_edges_to_plane;
-using aicad::doc::ProjectedEntity;
+using chudware::doc::doc_apply_ops;
+using chudware::doc::doc_new;
+using chudware::doc::doc_query;
+using chudware::doc::doc_sketch_enter;
+using chudware::doc::project_edges_to_plane;
+using chudware::doc::ProjectedEntity;
 
 namespace {
 
@@ -98,7 +98,7 @@ TEST_CASE("kernel: oblique circle projects to an analytic ellipse (rx=R, ry=R*co
     // Circle of radius 10 in the XY plane (normal +Z); target plane normal 45 deg off Z.
     gp_Circ c(gp_Ax2(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1)), 10.0);
     TopoDS_Edge e = BRepBuilderAPI_MakeEdge(c);
-    auto plane = aicad::geom::SketchPlane::from(Eigen::Vector3d(0, 0, 0),
+    auto plane = chudware::geom::SketchPlane::from(Eigen::Vector3d(0, 0, 0),
                                                 Eigen::Vector3d(0, 1, 1));  // 45 deg
     bool approx = false;
     std::vector<ProjectedEntity> out = project_edges_to_plane({e}, plane, approx);
@@ -119,7 +119,7 @@ TEST_CASE("kernel: in-plane circle stays a circle; perpendicular line collapses 
     gp_Circ c(gp_Ax2(gp_Pnt(3, 4, 7), gp_Dir(0, 0, 1)), 5.0);
     TopoDS_Edge circle_edge = BRepBuilderAPI_MakeEdge(c);
     TopoDS_Edge vertical_edge = BRepBuilderAPI_MakeEdge(gp_Pnt(2, 2, 0), gp_Pnt(2, 2, 9));
-    auto top = aicad::geom::SketchPlane::top();
+    auto top = chudware::geom::SketchPlane::top();
 
     bool approx = false;
     std::vector<ProjectedEntity> ents =
@@ -190,7 +190,7 @@ TEST_CASE("op: sketch_convert projects a face loop as REAL entities and they ext
             }
     }
     CHECK(real_converted == 4);
-    aicad::doc::doc_sketch_exit(doc_id, fid);
+    chudware::doc::doc_sketch_exit(doc_id, fid);
 
     // And they are a usable profile: extrude the converted loop (region centroid at the
     // face-frame origin (0,0) — the top face's centroid frame).
@@ -435,5 +435,5 @@ TEST_CASE("op: sketch_convert rejects empty refs with invalid_op") {
 
     json bad = json::array({json{{"op", "sketch_convert"}, {"sketch", fid},
                                  {"refs", json::array()}}});
-    CHECK_THROWS_AS(doc_apply_ops(doc_id, -1, bad, false), aicad::doc::OpError);
+    CHECK_THROWS_AS(doc_apply_ops(doc_id, -1, bad, false), chudware::doc::OpError);
 }

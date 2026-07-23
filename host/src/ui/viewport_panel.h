@@ -1,4 +1,4 @@
-// AI-CAD Viewport panel: 3D orbit view + parts list + fit readout + live/dimension overlays.
+// Chudware Viewport panel: 3D orbit view + parts list + fit readout + live/dimension overlays.
 #pragma once
 
 #include "imgui.h"

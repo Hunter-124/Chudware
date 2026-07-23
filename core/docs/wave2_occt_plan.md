@@ -3,7 +3,7 @@
 > Status: **PLAN** (not yet installed). Review this doc, then execute the checklist.
 > Wave 2 goal (from `~/.claude/plans/im-planning-on-doing-noble-glacier.md`): link OCCT into the
 > process, port feature compilers → `core/geom/`, port the tessellation/AICM emitter, and replace
-> the Python modeling worker with in-process `libaicad` calls.
+> the Python modeling worker with in-process `libchudware` calls.
 
 ---
 
@@ -147,18 +147,18 @@ their plain `TK*` names (the prebuilt config exports them without a namespace pr
 `occt::TK*` form used by Hunter/vcpkg comes from those package managers wrapping the targets).
 
 ```cmake
-# --- libaicad_geom: OCCT-backed geometry + tessellation ---------------------
-add_library(aicad_geom_occt STATIC
+# --- libchudware_geom: OCCT-backed geometry + tessellation ---------------------
+add_library(chudware_geom_occt STATIC
   geom/occt_box.cpp          # smoke test first
   geom/tessellate.cpp        # port of engine/doc/tessellate.py
   # ... feature compilers added incrementally
 )
 
-target_include_directories(aicad_geom_occt PUBLIC
+target_include_directories(chudware_geom_occt PUBLIC
   ${OpenCASCADE_INCLUDE_DIR}  # set by find_package → typically OCCT_ROOT/inc
   ${CMAKE_CURRENT_SOURCE_DIR})
 
-target_link_libraries(aicad_geom_occt PUBLIC
+target_link_libraries(chudware_geom_occt PUBLIC
   # --- kernel / math ---
   TKernel           # Standard (handles, memory) + math foundation
   TKMath            # gp_*, Bnd_*, math primitives
@@ -232,15 +232,15 @@ endif()
 find_package(OpenCASCADE REQUIRED)
 message(STATUS "OpenCASCADE ${OpenCASCADE_VERSION} found; include=${OpenCASCADE_INCLUDE_DIR}")
 
-# --- libaicad_geom_occt (smoke test + tessellate) ----------------------------
-add_library(aicad_geom_occt STATIC
+# --- libchudware_geom_occt (smoke test + tessellate) ----------------------------
+add_library(chudware_geom_occt STATIC
   geom/occt_smoke.cpp)
 
-target_include_directories(aicad_geom_occt PUBLIC
+target_include_directories(chudware_geom_occt PUBLIC
   ${OpenCASCADE_INCLUDE_DIR}
   ${CMAKE_CURRENT_SOURCE_DIR})
 
-target_link_libraries(aicad_geom_occt PUBLIC
+target_link_libraries(chudware_geom_occt PUBLIC
   TKernel TKMath
   TKBRep TKG2d TKG3d TKGeomBase TKGeomAlgo TKTopAlgo TKShHealing
   TKPrim TKBO TKBool TKFillet TKOffset
@@ -250,7 +250,7 @@ target_link_libraries(aicad_geom_occt PUBLIC
 # --- smoke test executable ---------------------------------------------------
 add_executable(test_occt_smoke geom/test_occt_smoke.cpp)
 target_include_directories(test_occt_smoke PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_occt_smoke PRIVATE aicad_geom_occt)
+target_link_libraries(test_occt_smoke PRIVATE chudware_geom_occt)
 set_target_properties(test_occt_smoke PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME occt_smoke COMMAND test_occt_smoke)
@@ -324,8 +324,8 @@ if(NOT OCCT_3RDPARTY_ROOT STREQUAL "")
 endif()
 ```
 
-When the `AI-CAD` host target eventually links `libaicad_geom_occt`, attach the same
-`add_custom_command` to `AI-CAD` as a `POST_BUILD` step (identical pattern to the existing
+When the `Chudware` host target eventually links `libchudware_geom_occt`, attach the same
+`add_custom_command` to `Chudware` as a `POST_BUILD` step (identical pattern to the existing
 `"Copying assets"` command in `host/CMakeLists.txt` lines 168–172).
 
 ---

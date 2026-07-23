@@ -17,7 +17,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace aicad::util {
+namespace chudware::util {
 
 // Thrown for syntax errors, unknown names/functions, disallowed constructs,
 // division by zero, math-domain errors, and non-finite results — mirroring
@@ -31,4 +31,4 @@ class ExprError : public std::runtime_error {
 // Throws ExprError on any failure. Matches engine/doc/equations.evaluate().
 double evaluate(const std::string& expr, const std::map<std::string, double>& env);
 
-}  // namespace aicad::util
+}  // namespace chudware::util

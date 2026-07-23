@@ -48,14 +48,14 @@ from mcp_server.gsl_tools import _axis_order
 # ---------------------------------------------------------------------------
 # T-F13: hypothesis-ranker hook (flag-gated, default OFF)
 #
-# Set env var AICAD_RECON_RANKER=1 to enable.  The ranker re-orders the
+# Set env var CHUDWARE_RECON_RANKER=1 to enable.  The ranker re-orders the
 # `candidates` list only — it never generates new candidates.  Falls back to
 # deterministic order whenever weights are missing or the import fails.
 # ---------------------------------------------------------------------------
 
 import os as _os
 
-_RANKER_ENABLED: bool = _os.environ.get("AICAD_RECON_RANKER", "0").strip() == "1"
+_RANKER_ENABLED: bool = _os.environ.get("CHUDWARE_RECON_RANKER", "0").strip() == "1"
 _RANKER_WEIGHTS: dict = {}  # loaded lazily on first use
 
 
@@ -736,7 +736,7 @@ def _cylinder_boss_specs(hints: Optional[dict],
                          claimed_cyl_axes: list) -> list:
     """Pure-Python: turn an ``aicad.reveng_fits/1`` doc (contracts/reveng.md §3) into a
     list of candidate cylinder-BOSS specs, dropping fits the deterministic passes already
-    explain. Engine-free and side-effect-free so it is unit-testable without libaicad.
+    explain. Engine-free and side-effect-free so it is unit-testable without libchudware.
 
     hints             : the fits doc, or None (returns []).
     claimed_cyl_axes  : (axis_unit, origin) pairs the passes already own (base/holes) —
@@ -1699,7 +1699,7 @@ def register_photo_recon_tools(mcp: FastMCP) -> None:
                 return _dumps(result)
 
             # Run photogrammetry reconstruction
-            recon_dir = tempfile.mkdtemp(prefix="aicad_recon_")
+            recon_dir = tempfile.mkdtemp(prefix="chudware_recon_")
             scale_mm = getattr(session, "_scale_marker_mm", None)
             recon = _pg.reconstruct(
                 image_dir=work_dir,

@@ -21,7 +21,7 @@ plug into **`core/agent/providers.cpp`** (C++, libcurl), not `services/agent/con
 - `run.cpp:372-397` — `make_provider(provider_cfg)` returns a `ProviderFn` closure. For a real
   provider it is: `return [name, cfg](system, messages, max_tokens) { CompleteResult cr =
   complete(name, cfg, system, messages, max_tokens); ... }` (`:385-389`) — i.e. it calls
-  `aicad::agent::complete` (declared `core/agent/providers.h:176`) directly, **in-process, no RPC**.
+  `chudware::agent::complete` (declared `core/agent/providers.h:176`) directly, **in-process, no RPC**.
   Role-scripted mock replies (`:374-384`) are the only branch that skips `complete()`.
   **CONFIRMED**, corrects the "python worker RPC in the loop" framing.
 - `run.cpp:722/2411/3028` — `run_design`, `run_assembly_design`, `run_mission` each call
@@ -34,14 +34,14 @@ plug into **`core/agent/providers.cpp`** (C++, libcurl), not `services/agent/con
   clamped ≥512) else derives a base budget (4096 local / 8192 cloud) keyed on `provider_cfg["name"]`
   and bumped by `provider_cfg["reasoning_effort"]`. **CONFIRMED** exact `max_tokens` contract.
 
-## 2. Where the C++ core enters — RPC surface (`core/api/libaicad.cpp`)
+## 2. Where the C++ core enters — RPC surface (`core/api/libchudware.cpp`)
 
-- `libaicad.cpp:1856` `agent_run`, `:2134` `agent_run_design`, `:2150` `agent_run_micro` —
+- `libchudware.cpp:1856` `agent_run`, `:2134` `agent_run_design`, `:2150` `agent_run_micro` —
   HOST-ergonomic entries `{request, doc_id, provider?, options?}`. These are the ONLY
   worker-RPC methods a GUI Design/Micro send reaches (host aliases `agent_run_v2`→`agent_run`
   at `:1061-1062`).
-- `libaicad.cpp:1330-1337` `agent_resolve_provider` — `{name?, cfg, env}` → calls
-  `aicad::agent::resolve_provider(name, cfg, env)` (native C++, `core/agent/config.cpp`), NOT a
+- `libchudware.cpp:1330-1337` `agent_resolve_provider` — `{name?, cfg, env}` → calls
+  `chudware::agent::resolve_provider(name, cfg, env)` (native C++, `core/agent/config.cpp`), NOT a
   Python worker call. Used by the host to preview/validate a provider descriptor before a run
   (and by `agent_run` internally to resolve `provider_cfg` when the host passes bare config).
 - **CORRECTION to plan's "worker RPC" framing**: `worker_rpc.py`/`services/agent/worker_rpc.py`
@@ -98,7 +98,7 @@ call sites (advisor, MCP tools, tests, subscription usage).
 |---|---|---|
 | `name` | CONFIRMED | `provider_cfg.value("name", ...)` read throughout run.cpp (`:108,809,935,939,982,2253,2379,2383`) and dispatched on in `providers.cpp::complete()` (`:1107,1334,1468,1522`) and `config.cpp::resolve_provider` (`if (name == "anthropic")...`, `:370-533`). |
 | `supports_vision` | CONFIRMED | `run.cpp:740` (`provider_cfg.value("supports_vision", false)`), `run.cpp:752/756-ish` (review_provider vision flag from nested descriptor), set by `config.cpp` per-provider (e.g. `:482` xai `true`, `:513` moonshot `oai_vision`, `:529` llamacpp `false`). Python `Provider.supports_vision` class attr (`base.py:33`) is the Python-side mirror, unused by the live C++ path. |
-| catalog meta (context/vision/tools/reasoning_efforts) | CONFIRMED, but lives in **`agent_list_models`** (`libaicad.cpp:1339-1413`, `heuristic_meta` lambda), a SEPARATE RPC from completion — used by the GUI model picker, not by the run loop itself. Not part of `provider_cfg` at call time. |
+| catalog meta (context/vision/tools/reasoning_efforts) | CONFIRMED, but lives in **`agent_list_models`** (`libchudware.cpp:1339-1413`, `heuristic_meta` lambda), a SEPARATE RPC from completion — used by the GUI model picker, not by the run loop itself. Not part of `provider_cfg` at call time. |
 | `temperature` kwarg | **CORRECTED — does not exist.** Grepped whole repo: no provider (`complete`/`complete_ex` in Python, or `complete()` in C++) takes or forwards a `temperature` parameter. Anthropic "adaptive" models explicitly **reject** temperature/top_p (`core/agent/providers.cpp:509-511`: "Adaptive models reject temperature/top_p/budget_tokens; effort rides on output_config"). The only tunable is `reasoning_effort` (string: off/low/medium/high/max/xhigh), mapped per-backend. A bridge implementation MUST NOT assume a `temperature` kwarg is threaded through. |
 | `_mega6_degraded` | **CORRECTED — does not exist anywhere in the repo.** Zero grep hits for `_mega6_degraded` (or `mega6`) in CAD or vendored OMP paths searched. This looks like a fabricated/misremembered symbol from the earlier research round; drop it from the contract. |
 | `max_tokens` | CONFIRMED | `provider_cfg["max_tokens"]` explicit override in `call_budget_for` (`run.cpp:104-107`, clamped ≥512, no ceiling) and threaded as the last positional arg through `complete(name, cfg, system, messages, max_tokens)` (`providers.h:176-177`). Python mirror: `Provider.complete(..., max_tokens: int = 8000)` (`base.py:35`) — same name, same units (output tokens), separate implementation. |

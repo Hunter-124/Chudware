@@ -53,7 +53,7 @@ void writeBackbufferPng(const char* path, int dw, int dh, const char* mirrorPath
 namespace ui {
 
 void ScenarioRunner::tick(AppState& st) {
-    // ---------- C17 M1 integration scenario (AI_CAD_SHOT=m1) ----------
+    // ---------- C17 M1 integration scenario (CHUDWARE_SHOT=m1) ----------
     // Frame-driven state machine: each step issues scripted ops through the REAL worker
     // (DocMirror), loads the rebuilt mesh, and requests a screenshot into scratch/m1_shots/.
     // Steps: New Part -> Box 60x40x10 -> Fillet r=4 (2 picked vertical edges) -> Shell t=2
@@ -63,7 +63,7 @@ void ScenarioRunner::tick(AppState& st) {
         // Resolve repo-relative scratch dir for screenshots.
         if (!m1DirReady) {
             m1DirReady = true;
-            const char* repo = std::getenv("AI_CAD_REPO");
+            const char* repo = std::getenv("CHUDWARE_REPO");
             std::string base = repo ? std::string(repo) : std::string(".");
             m1SavePath = base + "/scratch/m1_shots";
             // W1-B (item 12): create the output dir robustly. The old code left a dead `mk`
@@ -144,10 +144,10 @@ void ScenarioRunner::tick(AppState& st) {
                     std::printf("m1: box ok=%d rev=%d id=%s ms=%.2f\n",
                                 (int)r.ok, r.revision, boxId.c_str(), statusMs(r, boxId));
                     std::fflush(stdout);
-                    // C32-A material proof: AI_CAD_MATERIAL=<plastic|aluminum|steel|brass|dark>
+                    // C32-A material proof: CHUDWARE_MATERIAL=<plastic|aluminum|steel|brass|dark>
                     // applies the matching RealView preset to body b1 so a headless shot can be
                     // judged for metallic realism (clear env reflection + tinted fresnel).
-                    if (const char* mat = std::getenv("AI_CAD_MATERIAL")) {
+                    if (const char* mat = std::getenv("CHUDWARE_MATERIAL")) {
                         struct P { const char* k; float m, rough, rgb[3]; };
                         static const P kP[] = {
                             {"plastic",  0.00f, 0.50f, {0.71f, 0.76f, 0.82f}},
@@ -273,7 +273,7 @@ void ScenarioRunner::tick(AppState& st) {
         }
     }
 
-    // ---------- C18 sketch scenario (AI_CAD_SHOT=sketch) ----------
+    // ---------- C18 sketch scenario (CHUDWARE_SHOT=sketch) ----------
     // new part -> sketch on plane.top -> corner rect (ops + h/v + fix + 2 dims) -> sketch_enter
     // -> screenshot (entities + status) -> drag a corner + commit -> set width 80->100 -> shot
     // -> exit -> extrude the region depth 10 -> shot of the solid. Per-step captures use the
@@ -284,7 +284,7 @@ void ScenarioRunner::tick(AppState& st) {
         auto* sk = st.sketchMode;
         if (!skDirReady) {
             skDirReady = true;
-            const char* repo = std::getenv("AI_CAD_REPO");
+            const char* repo = std::getenv("CHUDWARE_REPO");
             std::string base = repo ? std::string(repo) : std::string(".");
             skSavePath = base + "/scratch/sketch_shots";
             std::error_code ec; std::filesystem::create_directories(skSavePath, ec);  // W1-B (item 12)
@@ -407,7 +407,7 @@ void ScenarioRunner::tick(AppState& st) {
         }
     }
 
-    // ---------- 3D sketch scenario (AI_CAD_SHOT=sketch3d) ----------
+    // ---------- 3D sketch scenario (CHUDWARE_SHOT=sketch3d) ----------
     // new part -> add a sketch3d feature (Z-axis line chained into a 3-pt arc; fix + along_axis
     // + coincident constraints) -> enter the 3D sketcher (overlay + toolbar + working-plane grid)
     // -> screenshot -> constrained drag of the arc end via sketch3d_drag + edit_feature commit
@@ -415,7 +415,7 @@ void ScenarioRunner::tick(AppState& st) {
     if (st.wantSketch3d && st.workerStarted && !st.sketch3dShotDone && st.frame >= 5) {
         if (!s3DirReady) {
             s3DirReady = true;
-            const char* repo = std::getenv("AI_CAD_REPO");
+            const char* repo = std::getenv("CHUDWARE_REPO");
             std::string base = repo ? std::string(repo) : std::string(".");
             s3SavePath = base + "/scratch/sketch3d_shots";
             std::error_code ec; std::filesystem::create_directories(s3SavePath, ec);
@@ -486,7 +486,7 @@ void ScenarioRunner::tick(AppState& st) {
         }
     }
 
-    // ---------- C20b assembly scenario (AI_CAD_SHOT=asm) ----------
+    // ---------- C20b assembly scenario (CHUDWARE_SHOT=asm) ----------
     // Mirrors engine/doc/test_worker_asm.py through the C++ DocMirror/AsmPanels stack:
     //   author + save base.step+ (40x40x10 plate, 8mm hole) and peg.step+ (r=3.9, h=20),
     //   new assembly, insert both, concentric (hole<->peg) + coincident ANTI (plate top<->peg
@@ -497,7 +497,7 @@ void ScenarioRunner::tick(AppState& st) {
         auto* ap = st.asmPanels;
         if (!asmDirReady) {
             asmDirReady = true;
-            const char* repo = std::getenv("AI_CAD_REPO");
+            const char* repo = std::getenv("CHUDWARE_REPO");
             std::string base = repo ? std::string(repo) : std::string(".");
             asmSavePath = base + "/scratch/asm_shots";
             asmBasePath = asmSavePath + "/base.step+";
@@ -676,7 +676,7 @@ void ScenarioRunner::tick(AppState& st) {
         }
     }
 
-    // ---------- C19 FEA scenario (AI_CAD_SHOT=fea) ----------
+    // ---------- C19 FEA scenario (CHUDWARE_SHOT=fea) ----------
     // new part -> box 60x40x10 -> static study: fix the -X end face, 100 N -Z on the +X end,
     // steel (index 0), density 0.4 -> wait for completion (cap ~90 s) -> von Mises colormap.
     if (st.wantFea && st.workerStarted && !st.feaShotDone) {
@@ -764,7 +764,7 @@ void ScenarioRunner::tick(AppState& st) {
         (void)sim;
     }
 
-    // ---------- T-FIN24 disclosure-matrix scenario (AI_CAD_SHOT=simdisc_mech|simdisc_ecad) ----------
+    // ---------- T-FIN24 disclosure-matrix scenario (CHUDWARE_SHOT=simdisc_mech|simdisc_ecad) ----------
     // Proves the Simulate tab's progressive disclosure: mech-only -> no electronics study
     // kinds in the "+ New Study" picker; with a PCB tab open -> electronics simulation +
     // firmware emulation rows appear. The picker is held open for the capture via the
@@ -820,7 +820,7 @@ void ScenarioRunner::tick(AppState& st) {
         }
     }
 
-    // ---------- CAM copilot fast-path scenario (AI_CAD_SHOT=cam) ----------
+    // ---------- CAM copilot fast-path scenario (CHUDWARE_SHOT=cam) ----------
     // new part -> box 80x60x15 + 4 corner through-holes -> run the copilot CAM fast-path
     // (agent_run options.cam) -> adopt the built job into the Manufacture panel (exactly as the
     // app.cpp drain does) -> capture the populated CAM workspace (Setup1 -> face/contour/drill,
@@ -887,7 +887,7 @@ void ScenarioRunner::tick(AppState& st) {
         st.camShotDone = true;
     }
 
-    // ---------- external-flow scenario (AI_CAD_SHOT=flow) ----------
+    // ---------- external-flow scenario (CHUDWARE_SHOT=flow) ----------
     // new part -> fuselage-ish bar 80x20x20 -> Flow study (water, 10 deg AoA, coarse) -> run ->
     // wait for the result colormap (Cp on the model + streamlines over it) -> capture.
     if (st.wantFlow && st.workerStarted && !st.flowShotDone) {
@@ -945,7 +945,7 @@ void ScenarioRunner::tick(AppState& st) {
         }
     }
 
-    // ---------- C19 evalmass scenario (AI_CAD_SHOT=evalmass) ----------
+    // ---------- C19 evalmass scenario (CHUDWARE_SHOT=evalmass) ----------
     if (st.wantEvalMass && st.workerStarted && !st.evalMassShotDone) {
         if (evalSettle > 0) { --evalSettle; }
         else switch (evalStep) {
@@ -981,11 +981,11 @@ void ScenarioRunner::tick(AppState& st) {
         }
     }
 
-    // --- C22b activity scenario (AI_CAD_SHOT=activity) ---
+    // --- C22b activity scenario (CHUDWARE_SHOT=activity) ---
     if (st.wantActivity && st.workerStarted && !st.activityShotDone && st.frame >= 5) {
         if (!actDirReady) {
             actDirReady = true;
-            const char* repo = std::getenv("AI_CAD_REPO");
+            const char* repo = std::getenv("CHUDWARE_REPO");
             std::string base = repo ? std::string(repo) : std::string(".");
             actSavePath = base + "/scratch/activity_shots";
             std::error_code ec; std::filesystem::create_directories(actSavePath, ec);  // W1-B (item 12)
@@ -1049,33 +1049,33 @@ void ScenarioRunner::tick(AppState& st) {
     }
     // --- end C22b activity scenario ---
 
-    // ---------- multi-document scenario (AI_CAD_SHOT=multidoc) ----------
+    // ---------- multi-document scenario (CHUDWARE_SHOT=multidoc) ----------
     runMultidoc(st);
 
-    // ---------- tab-switch perf scenario (AI_CAD_SHOT=tabperf) ----------
+    // ---------- tab-switch perf scenario (CHUDWARE_SHOT=tabperf) ----------
     runTabPerf(st);
 
-    // ---------- W17 engineering-drawing scenario (AI_CAD_SHOT=drawing) ----------
+    // ---------- W17 engineering-drawing scenario (CHUDWARE_SHOT=drawing) ----------
     runDrawing(st);
 
-    // ---------- appearance scenario (AI_CAD_SHOT=appearance) ----------
+    // ---------- appearance scenario (CHUDWARE_SHOT=appearance) ----------
     runAppearance(st);
 
-    // ---------- T-G15 icon pipeline (AI_CAD_SHOT=iconpipe) ----------
+    // ---------- T-G15 icon pipeline (CHUDWARE_SHOT=iconpipe) ----------
     runIconPipe(st);
 
-    // ---------- RE-28 3DGS splat scenario (AI_CAD_SHOT=reveng_splat) ----------
+    // ---------- RE-28 3DGS splat scenario (CHUDWARE_SHOT=reveng_splat) ----------
     runRevengSplat(st);
 
-    // ---------- workspaces scenario (AI_CAD_SHOT=workspaces) ----------
+    // ---------- workspaces scenario (CHUDWARE_SHOT=workspaces) ----------
     runWorkspaces(st);
 
-    // ---------- motion scenario (AI_CAD_SHOT=motion) ----------
+    // ---------- motion scenario (CHUDWARE_SHOT=motion) ----------
     runMotion(st);
 }
 
-// T-G15 icon pipeline (AI_CAD_SHOT=iconpipe). Recipe-driven clean-viewport icon generator: reads a
-// JSON recipe list from AI_CAD_ICON_RECIPES { out_dir?, px?, recipes:[{name,yaw,pitch,ops:[...]}] }
+// T-G15 icon pipeline (CHUDWARE_SHOT=iconpipe). Recipe-driven clean-viewport icon generator: reads a
+// JSON recipe list from CHUDWARE_ICON_RECIPES { out_dir?, px?, recipes:[{name,yaw,pitch,ops:[...]}] }
 // and, one recipe per pass, builds the demo part (newPart + applyOps — the SAME engine contract the
 // other scenarios use) then renders it through the renderer's transparent thumbnail path (no chrome,
 // no gizmo, no datum planes, alpha=0 background) at the recipe camera, writing out_dir/<name>.png.
@@ -1084,13 +1084,13 @@ void ScenarioRunner::tick(AppState& st) {
 void ScenarioRunner::runIconPipe(AppState& st) {
     if (!ipInit) {
         ipInit = true;
-        const char* sm = std::getenv("AI_CAD_SHOT");
+        const char* sm = std::getenv("CHUDWARE_SHOT");
         ipWant = st.wantIconPipe && sm && std::strcmp(sm, "iconpipe") == 0;
         if (ipWant) {
-            const char* repo = std::getenv("AI_CAD_REPO");
+            const char* repo = std::getenv("CHUDWARE_REPO");
             std::string base = repo ? std::string(repo) : std::string(".");
             ipOutDir = base + "/scratch/icon_render";
-            const char* rp = std::getenv("AI_CAD_ICON_RECIPES");
+            const char* rp = std::getenv("CHUDWARE_ICON_RECIPES");
             if (rp) {
                 try {
                     std::ifstream f(rp);
@@ -1106,7 +1106,7 @@ void ScenarioRunner::runIconPipe(AppState& st) {
                     std::fflush(stdout);
                 }
             } else {
-                std::printf("iconpipe: AI_CAD_ICON_RECIPES not set — nothing to render\n");
+                std::printf("iconpipe: CHUDWARE_ICON_RECIPES not set — nothing to render\n");
                 std::fflush(stdout);
             }
             std::error_code ec; std::filesystem::create_directories(ipOutDir, ec);
@@ -1118,7 +1118,7 @@ void ScenarioRunner::runIconPipe(AppState& st) {
     if (!(ipWant && st.workerStarted && !st.iconPipeShotDone)) return;
 
     // Drain EVERY recipe in this single tick. Everything on the recipe path is synchronous on this
-    // thread (applyOps -> in-process libaicad; loadDocMesh -> AICM parse + setMeshes GL upload;
+    // thread (applyOps -> in-process libchudware; loadDocMesh -> AICM parse + setMeshes GL upload;
     // renderThumbnail -> immediate FBO draw; readThumbnailRGBA -> glReadPixels), so no settle
     // frames or per-frame stepping are needed. This matters headless: full GUI frames are
     // pathologically slow on an unattended desktop (the compositor can starve a hidden/occluded
@@ -1233,7 +1233,7 @@ ScenarioRunner::ScenarioRunner(ActivityPanel& activityPanel)
     : activityPanel(activityPanel) {}
 ScenarioRunner::~ScenarioRunner() = default;
 
-// RE-28 3DGS splat scenario (AI_CAD_SHOT=reveng_splat). Self-contained: loads the canned gaussian
+// RE-28 3DGS splat scenario (CHUDWARE_SHOT=reveng_splat). Self-contained: loads the canned gaussian
 // .ply fixture and draws it through the real render::SplatRenderer into its OWN offscreen FBO, reads
 // it back, and writes the PNG directly — the iconpipe drain pattern (see runIconPipe lines ~1040).
 //
@@ -1245,12 +1245,12 @@ ScenarioRunner::~ScenarioRunner() = default;
 void ScenarioRunner::runRevengSplat(AppState& st) {
     if (!rsInit) {
         rsInit = true;
-        const char* sm = std::getenv("AI_CAD_SHOT");
+        const char* sm = std::getenv("CHUDWARE_SHOT");
         rsWant = st.shot && sm && std::strcmp(sm, "reveng_splat") == 0;
     }
     if (!(rsWant && st.workerStarted && !rsDone && st.frame >= 5)) return;
 
-    const char* repo = std::getenv("AI_CAD_REPO");
+    const char* repo = std::getenv("CHUDWARE_REPO");
     std::string base = repo ? std::string(repo) : std::string(".");
     rsSavePath = base + "/scratch/reveng_splat_shots";
     std::error_code ec; std::filesystem::create_directories(rsSavePath, ec);
@@ -1330,22 +1330,22 @@ void ScenarioRunner::runRevengSplat(AppState& st) {
     rsDone = true;  // one-tick drain complete; frame loop exits at the generic shot gate (frame 6)
 }
 
-// Appearance scenario (AI_CAD_SHOT=appearance). Same frame-driven step machine + kSettle
+// Appearance scenario (CHUDWARE_SHOT=appearance). Same frame-driven step machine + kSettle
 // settling + per-step backbuffer capture (apCapture) as evalmass/m1. Flow: new part + box
 // (a modeled part so the Appearance tab's live glass preview frosts real geometry) -> open the
 // Settings modal jumped to the Appearance tab (index 0) -> settle -> capture. Unlike the older
-// scenarios this one has no AppState want-flag: the runner reads AI_CAD_SHOT itself (gated on
+// scenarios this one has no AppState want-flag: the runner reads CHUDWARE_SHOT itself (gated on
 // st.shot so a stray env var in an interactive run can't hijack the frame loop).
 void ScenarioRunner::runAppearance(AppState& st) {
     if (!apInit) {
         apInit = true;
-        const char* sm = std::getenv("AI_CAD_SHOT");
+        const char* sm = std::getenv("CHUDWARE_SHOT");
         apWant = st.shot && sm && std::strcmp(sm, "appearance") == 0;
     }
     if (!(apWant && st.workerStarted && !apDone && st.frame >= 5)) return;
     if (!apDirReady) {
         apDirReady = true;
-        const char* repo = std::getenv("AI_CAD_REPO");
+        const char* repo = std::getenv("CHUDWARE_REPO");
         std::string base = repo ? std::string(repo) : std::string(".");
         apSavePath = base + "/scratch/appearance_shots";
         std::error_code ec; std::filesystem::create_directories(apSavePath, ec);
@@ -1394,7 +1394,7 @@ void ScenarioRunner::runAppearance(AppState& st) {
     }
 }
 
-// Multi-document mid-edit verification (AI_CAD_SHOT=multidoc). Same frame-driven step machine +
+// Multi-document mid-edit verification (CHUDWARE_SHOT=multidoc). Same frame-driven step machine +
 // kSettle settling + per-step backbuffer capture (mdCapture) as m1. The flow:
 //   A: new Part A -> box + fillet (m1's ops) -> record A's tab index + doc id.
 //   B (mid-edit on A): seed a viewport selection + hide a body, then open a feature-edit PM form
@@ -1409,7 +1409,7 @@ void ScenarioRunner::runMultidoc(AppState& st) {
     if (!(st.wantMultidoc && st.workerStarted && !st.multidocShotDone)) return;
     if (!mdDirReady) {
         mdDirReady = true;
-        const char* repo = std::getenv("AI_CAD_REPO");
+        const char* repo = std::getenv("CHUDWARE_REPO");
         std::string base = repo ? std::string(repo) : std::string(".");
         mdSavePath = base + "/scratch/multidoc_shots";
         std::error_code ec; std::filesystem::create_directories(mdSavePath, ec);
@@ -1674,7 +1674,7 @@ void ScenarioRunner::runMultidoc(AppState& st) {
     }
 }
 
-// Tab-switch latency harness (AI_CAD_SHOT=tabperf). Builds two real box parts, then hammers
+// Tab-switch latency harness (CHUDWARE_SHOT=tabperf). Builds two real box parts, then hammers
 // A<->B via the same switchToTab path the doc-tab strip uses. logTabPerf in core/doc_tabs.cpp
 // prints "[perf] tab_switch ..." to stderr for each switch; collect those lines after the run.
 // Intentionally measurement-only — no UI assertions, no per-step screenshots.
@@ -1753,7 +1753,7 @@ void ScenarioRunner::runTabPerf(AppState& st) {
     }
 }
 
-// W17 engineering-drawing scenario (AI_CAD_SHOT=drawing). Build a plate with a through hole, Make
+// W17 engineering-drawing scenario (CHUDWARE_SHOT=drawing). Build a plate with a through hole, Make
 // Drawing (standard views), then exercise the new detailing engine: Model Items auto-dimensioning,
 // a smart hole callout, a critical ±toleranced dimension, and the title block — with the contextual
 // View Layout / Annotation ribbon visible. One capture (drawing_01_detailed.png).
@@ -1761,7 +1761,7 @@ void ScenarioRunner::runDrawing(AppState& st) {
     if (!(st.wantDrawing && st.workerStarted && !st.drawingShotDone && st.frame >= 5)) return;
     if (!dwgDirReady) {
         dwgDirReady = true;
-        const char* repo = std::getenv("AI_CAD_REPO");
+        const char* repo = std::getenv("CHUDWARE_REPO");
         std::string base = repo ? std::string(repo) : std::string(".");
         dwgSavePath = base + "/scratch/drawing_shots";
         std::error_code ec; std::filesystem::create_directories(dwgSavePath, ec);
@@ -2160,7 +2160,7 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(AppState& st, int dw, int d
     return FrameAction::None;
 }
 
-// ---------- workspaces scenario (AI_CAD_SHOT=workspaces) ----------
+// ---------- workspaces scenario (CHUDWARE_SHOT=workspaces) ----------
 // Cycles all 8 workspace tabs (Model, Drawing, Simulate, Electronics, Manufacture, PLM,
 // PartsLibrary, AI), letting the frame settle for kSettle frames after each switch, then
 // capturing one PNG per workspace. Validates that the workspace routing switch produces a
@@ -2171,7 +2171,7 @@ void ScenarioRunner::runWorkspaces(AppState& st) {
 
     if (!wsDirReady) {
         wsDirReady = true;
-        const char* repo = std::getenv("AI_CAD_REPO");
+        const char* repo = std::getenv("CHUDWARE_REPO");
         std::string base  = repo ? std::string(repo) : std::string(".");
         wsSavePath = base + "/scratch/workspace_shots";
         std::error_code ec;
@@ -2222,7 +2222,7 @@ void ScenarioRunner::runWorkspaces(AppState& st) {
     }
 }
 
-// ---------- motion scenario (AI_CAD_SHOT=motion) ----------
+// ---------- motion scenario (CHUDWARE_SHOT=motion) ----------
 // Kinematic motion study end-to-end. Steps:
 //   0: Build two parts (base box + arm box), author them as AICM files.
 //   1: new_assembly, insert both components.
@@ -2244,7 +2244,7 @@ void ScenarioRunner::runMotion(AppState& st) {
 
     if (!mtDirReady) {
         mtDirReady = true;
-        const char* repo = std::getenv("AI_CAD_REPO");
+        const char* repo = std::getenv("CHUDWARE_REPO");
         std::string base = repo ? std::string(repo) : std::string(".");
         mtSavePath = base + "/scratch/motion_shots";
         std::error_code ec;

@@ -1,6 +1,6 @@
-"""Headless driver for the AI-CAD sampling profiler — reproduce + localize MODELING slowness.
+"""Headless driver for the Chudware sampling profiler — reproduce + localize MODELING slowness.
 
-Loads the staged libaicad.dll (the same engine the app uses), runs a deliberately heavy,
+Loads the staged libchudware.dll (the same engine the app uses), runs a deliberately heavy,
 deterministic modeling workload, samples it with the in-process profiler, and writes a flame
 graph + a hotspot report. No GUI, no LLM — just the geometry kernel under load, so the
 numbers are reproducible and the slow op is easy to spot.
@@ -125,7 +125,7 @@ def _fmt_table(rows, cols):
 
 
 def main(argv):
-    ap = argparse.ArgumentParser(description="Sampling-profile the AI-CAD modeling kernel.")
+    ap = argparse.ArgumentParser(description="Sampling-profile the Chudware modeling kernel.")
     ap.add_argument("--workload", default="all")
     ap.add_argument("--seconds", type=float, default=5.0, help="how long to sample")
     ap.add_argument("--hz", type=int, default=1000, help="sample rate (samples/sec)")
@@ -147,13 +147,13 @@ def main(argv):
     ops = _heavy_build() if interactive else wls[args.workload]
 
     if not cb.available():
-        print("ERROR: libaicad.dll not found/loadable. Build + stage the core first "
-              "(see docs/PROFILER.md). Set AI_CAD_DIST to override the dist dir.")
+        print("ERROR: libchudware.dll not found/loadable. Build + stage the core first "
+              "(see docs/PROFILER.md). Set CHUDWARE_DIST to override the dist dir.")
         return 1
 
-    print(f"AI-CAD modeling profiler  ·  workload={args.workload}  hz={args.hz}  "
+    print(f"Chudware modeling profiler  ·  workload={args.workload}  hz={args.hz}  "
           f"seconds={args.seconds}")
-    print(f"  dll: {cb.dist_dir() / 'libaicad.dll'}")
+    print(f"  dll: {cb.dist_dir() / 'libchudware.dll'}")
 
     # Sanity build once so we can report the feature status / catch a bad workload early.
     d0 = cb.call("doc_new", {"kind": "part", "name": "prof_probe"}).get("doc_id")
@@ -178,7 +178,7 @@ def main(argv):
                      "kind": ("face", "edge")[i % 2], "topo_id": 1 + (i % 6)})
     elif args.workload == "open":
         import tempfile
-        open_path = str(Path(tempfile.gettempdir()) / "aicad_prof_open.step+")
+        open_path = str(Path(tempfile.gettempdir()) / "chudware_prof_open.step+")
         db = cb.call("doc_new", {"kind": "part", "name": "prof_open"}).get("doc_id")
         cb.call("doc_apply_ops", {"doc_id": db, "ops": ops})
         cb.call("doc_save", {"doc_id": db, "path": open_path})
@@ -261,7 +261,7 @@ def main(argv):
     svg_path = f"{args.out}.svg"
     try:
         svg = flamegraph.render_svg(rep["folded"],
-                                    title=f"AI-CAD modeling · {args.workload}")
+                                    title=f"Chudware modeling · {args.workload}")
         with open(svg_path, "w", encoding="utf-8") as f:
             f.write(svg)
         wrote = rep.get("wrote", [])

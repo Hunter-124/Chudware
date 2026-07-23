@@ -11,10 +11,10 @@
 
 #ifdef _WIN32
 #include <process.h>  // _getpid
-#define AICAD_GETPID _getpid
+#define CHUDWARE_GETPID _getpid
 #else
 #include <unistd.h>
-#define AICAD_GETPID getpid
+#define CHUDWARE_GETPID getpid
 #endif
 
 #include "../../services/worker/cpp_core.h"
@@ -81,13 +81,13 @@ void Autosave::start(const std::string& baseDir, const std::atomic<int>* engineS
     baseDir_ = baseDir;
     orphanDir_ = baseDir_ + "/orphaned";
     engineState_ = engineState;
-    if (const char* v = std::getenv("AI_CAD_AUTOSAVE_INTERVAL_S"); v && *v)
+    if (const char* v = std::getenv("CHUDWARE_AUTOSAVE_INTERVAL_S"); v && *v)
         intervalS_ = std::atof(v);
     const long long startMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                                   std::chrono::system_clock::now().time_since_epoch())
                                   .count();
     char sid[64];
-    std::snprintf(sid, sizeof sid, "%015lld-%ld", startMs, (long)AICAD_GETPID());
+    std::snprintf(sid, sizeof sid, "%015lld-%ld", startMs, (long)CHUDWARE_GETPID());
     sessionDir_ = baseDir_ + "/" + sid;
     thread_ = std::thread([this] { loop(); });
 }
@@ -446,9 +446,9 @@ void Autosave::sweepOrphans() {
     // button loads every listed entry synchronously (attach + tree + mesh per
     // doc), so a very deep tier would reproduce the original "loading a pile of
     // garbage freezes the app" symptom. 50 keeps a generous disk history while
-    // capping a worst-case Recover-all. Raise AICAD_ORPHAN_KEEP if you accept that.
+    // capping a worst-case Recover-all. Raise CHUDWARE_ORPHAN_KEEP if you accept that.
     int keep = 50;
-    if (const char* v = std::getenv("AICAD_ORPHAN_KEEP"); v && *v)
+    if (const char* v = std::getenv("CHUDWARE_ORPHAN_KEEP"); v && *v)
         keep = std::max(0, std::atoi(v));
     std::lock_guard<std::mutex> lk(orphanMtx_);
     std::error_code ec;

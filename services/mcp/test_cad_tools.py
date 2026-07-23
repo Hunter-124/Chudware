@@ -1,6 +1,6 @@
 """Smoke tests for the C++ feature-engine MCP tools (mcp_server/cad_tools.py).
 
-These drive the registered MCP tools end-to-end against the STAGED libaicad.dll (the same
+These drive the registered MCP tools end-to-end against the STAGED libchudware.dll (the same
 engine the app loads) — build a part, render it, run FEA + CFD. They are skipped cleanly
 when the DLL isn't built/staged, so a checkout without a build still passes.
 
@@ -32,7 +32,7 @@ from mcp_server import core_bridge as cb
 
 pytestmark = pytest.mark.skipif(
     not cb.available(),
-    reason="libaicad.dll not staged (run build.bat); engine-backed MCP tools unavailable",
+    reason="libchudware.dll not staged (run build.bat); engine-backed MCP tools unavailable",
 )
 
 
@@ -55,7 +55,7 @@ def _solve(name: str, args: dict, timeout_s: float = 300.0):
     """Call a heavy solve tool and honor its async contract.
 
     A solve (run_fea_*/run_cfd_*) runs on a worker thread and AUTO-HANDS-OFF to the
-    background if it overruns AI_CAD_MCP_SYNC_BUDGET_S (default 45s) — a small plate
+    background if it overruns CHUDWARE_MCP_SYNC_BUDGET_S (default 45s) — a small plate
     FEA sits right on that edge, so the reply is non-deterministically either the
     inline result or {status:"running", auto_backgrounded:True, job_id}. When it's
     backgrounded we poll get_job() until it completes and return the solve `result`,
@@ -83,11 +83,11 @@ _SIM_AVAILABLE: bool | None = None
 def _require_sim() -> None:
     """Skip (not fail) when the loaded engine has no Netgen FEA solver compiled in.
 
-    On Linux ``AICAD_WITH_NETGEN`` defaults OFF, so a slim ``build-linux`` libaicad links +
+    On Linux ``CHUDWARE_WITH_NETGEN`` defaults OFF, so a slim ``build-linux`` libchudware links +
     loads fine but dispatches ``sim_run_static``/``sim_run_modal`` to "unknown method" — the
     FEA/CFD-mesher RPCs are #ifdef-compiled-out. That's a build-config state, not a solver
     regression, so the Netgen-dependent tests must SKIP with a clear reason rather than
-    hard-fail. The gate itself points AI_CAD_LIBAICAD at the full ``build-occt-linux`` engine
+    hard-fail. The gate itself points CHUDWARE_LIBCHUDWARE at the full ``build-occt-linux`` engine
     (see scripts/gate.sh), so this skip only fires on a genuinely sim-less checkout — it is a
     net *under* the gate, never the sole path to green. Mirrors test_fea_live_bridge.py.
     """
@@ -102,8 +102,8 @@ def _require_sim() -> None:
             _SIM_AVAILABLE = "unknown method" not in str(exc).lower()
     if not _SIM_AVAILABLE:
         pytest.skip(
-            "engine has no FEA solver (sim-less build: AICAD_WITH_NETGEN=OFF); "
-            "point AI_CAD_LIBAICAD at core/build-occt-linux/bin/libaicad.so"
+            "engine has no FEA solver (sim-less build: CHUDWARE_WITH_NETGEN=OFF); "
+            "point CHUDWARE_LIBCHUDWARE at core/build-occt-linux/bin/libchudware.so"
         )
 
 
@@ -961,7 +961,7 @@ def test_solve_mates_rejects_a_part_but_world_bodies_lists_it():
 # ---------------------------------------------------------------- inspection suite
 # These exercise the three INSPECTION RPCs that were filled in C++ (section area+moments,
 # numeric wall thickness, moldability draft). They need the REBUILT DLL — the math was 0/empty
-# before. After `build.bat` rebuilds + stages libaicad.dll they pass.
+# before. After `build.bat` rebuilds + stages libchudware.dll they pass.
 
 def test_inspect_section_real_area():
     """inspect_section cuts the part and returns the REAL cross-section area (not 0).
@@ -1622,7 +1622,7 @@ if __name__ == "__main__":
     import sys
 
     if not cb.available():
-        print("SKIP: libaicad.dll not staged")
+        print("SKIP: libchudware.dll not staged")
         sys.exit(0)
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0

@@ -24,7 +24,7 @@
 #include <string>
 #include <vector>
 
-namespace aicad {
+namespace chudware {
 namespace sim {
 
 namespace {
@@ -181,7 +181,7 @@ std::string cfd_input_hash(const std::vector<std::vector<float>>& body_pos,
         {"cells", fp.cells},
         {"n_steps", fp.n_steps},
     };
-    return aicad::sim::cache::hash_cfd(inputs);
+    return chudware::sim::cache::hash_cfd(inputs);
 }
 
 }  // namespace
@@ -204,7 +204,7 @@ LbmResult run_wind_tunnel(const std::vector<std::vector<float>>& body_pos,
 
     const std::string input_hash = cfd_input_hash(body_pos, body_idx, fp);
     {
-        auto hit = aicad::sim::cache::lookup(aicad::sim::cache::Kind::Cfd, input_hash);
+        auto hit = chudware::sim::cache::lookup(chudware::sim::cache::Kind::Cfd, input_hash);
         if (hit.hit) {
             R = lbm_from_json(hit.result);
             // Reynolds is a pure function of inputs; recompute cheaply for the out-param.
@@ -229,10 +229,10 @@ LbmResult run_wind_tunnel(const std::vector<std::vector<float>>& body_pos,
 
     // Per-phase record (prof/phases.h): setup+voxelize / solve (the nested lbm_run also
     // opens its own "lbm" study with the init/loop/output split) / post.
-    aicad::prof::phases::StudyScope _study("flow_run");
+    chudware::prof::phases::StudyScope _study("flow_run");
     const auto t_setup0 = std::chrono::steady_clock::now();
 
-    // Axis convention: the LBM kernel measures DRAG along its X and LIFT along its Y. AI-CAD is
+    // Axis convention: the LBM kernel measures DRAG along its X and LIFT along its Y. Chudware is
     // Z-up, so we want lift to come out along CAD +Z. Map CAD (x,y,z) -> LBM (x, z, y): flow on X,
     // CAD-up(Z) -> LBM-Y(lift), CAD-Y(span) -> LBM-Z. Angle of attack is a pitch about the span
     // axis (CAD-Y) applied in the CAD X-Z plane BEFORE the swap, so +AoA tilts the nose up and
@@ -293,7 +293,7 @@ LbmResult run_wind_tunnel(const std::vector<std::vector<float>>& body_pos,
     std::string governor_note;
     {
         constexpr double kBytesPerCell = 256.0;
-        const uint64_t mem_budget = aicad::governor::budget_bytes();
+        const uint64_t mem_budget = chudware::governor::budget_bytes();
         for (int tries = 0; tries < 4; ++tries) {
             const double need = (double)Nx * Ny * Nz * kBytesPerCell;
             if (mem_budget == UINT64_MAX || need <= (double)mem_budget) break;
@@ -301,7 +301,7 @@ LbmResult run_wind_tunnel(const std::vector<std::vector<float>>& body_pos,
                 16, (int)std::floor(cells * std::cbrt((double)mem_budget / need)));
             if (cells_new >= cells) {  // at the floor and still over budget: refuse clearly
                 std::string why;
-                aicad::governor::admit((uint64_t)need, "CFD flow lattice", why);
+                chudware::governor::admit((uint64_t)need, "CFD flow lattice", why);
                 R.ok = false;
                 R.error = why;
                 return R;
@@ -310,7 +310,7 @@ LbmResult run_wind_tunnel(const std::vector<std::vector<float>>& body_pos,
                 char buf[192];
                 std::snprintf(buf, sizeof buf,
                               "governor: grid reduced %d->%d cells to fit this machine's "
-                              "memory budget (raise AICAD_MEM_FRAC for more resolution)",
+                              "memory budget (raise CHUDWARE_MEM_FRAC for more resolution)",
                               cells, cells_new);
                 governor_note = buf;
             }
@@ -376,10 +376,10 @@ LbmResult run_wind_tunnel(const std::vector<std::vector<float>>& body_pos,
         };
     }
     const auto t_solve0 = std::chrono::steady_clock::now();
-    aicad::prof::phases::add("voxelize", std::chrono::duration<double, std::milli>(
+    chudware::prof::phases::add("voxelize", std::chrono::duration<double, std::milli>(
                                              t_solve0 - t_setup0).count());
     R = lbm_run(mask, Nx, Ny, Nz, lp, std::max(1, fp.n_steps), on_progress, should_cancel);
-    aicad::prof::phases::add("solve", std::chrono::duration<double, std::milli>(
+    chudware::prof::phases::add("solve", std::chrono::duration<double, std::milli>(
                                           std::chrono::steady_clock::now() - t_solve0).count());
 
     // Resolution diagnostics. The grid pitch is set from the DOMAIN's longest span, so a thin
@@ -402,7 +402,7 @@ LbmResult run_wind_tunnel(const std::vector<std::vector<float>>& body_pos,
     }
     if (!governor_note.empty())
         R.warning = R.warning.empty() ? governor_note : (R.warning + "; " + governor_note);
-    if (R.ok) aicad::sim::cache::store(aicad::sim::cache::Kind::Cfd, input_hash, lbm_to_json(R));
+    if (R.ok) chudware::sim::cache::store(chudware::sim::cache::Kind::Cfd, input_hash, lbm_to_json(R));
     return R;
 }
 
@@ -706,4 +706,4 @@ nlohmann::json run_flow_stl(const nlohmann::json& params) {
 }
 
 }  // namespace sim
-}  // namespace aicad
+}  // namespace chudware

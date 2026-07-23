@@ -128,7 +128,7 @@ Mesh10 to_tet10(const Mesh& m4) {
 // would corrupt the rigid-body null space. This is the formulation check behind Bug N-1.
 TEST_CASE("modal: free-free body has 6 rigid-body modes then a positive elastic mode") {
     Mesh m = beam_mesh(100.0, 12.0, 10, 2, 2);
-    auto r = aicad::sim::fea_modal_solve(m.pts, m.tets, 210000.0, 0.30, 7.85,
+    auto r = chudware::sim::fea_modal_solve(m.pts, m.tets, 210000.0, 0.30, 7.85,
                                          /*fixed*/ {}, /*n_modes*/ 9);
     REQUIRE(r.ok);
     REQUIRE(r.freqs_hz.size() >= 8);
@@ -144,7 +144,7 @@ TEST_CASE("modal: free-free body has 6 rigid-body modes then a positive elastic 
 // it here. The consistent mass removes the lumped-mass low bias, which this band checks.)
 TEST_CASE("modal: square cantilever bending modes are sane") {
     Mesh m = beam_mesh(100.0, 12.0, 20, 3, 3);
-    auto r = aicad::sim::fea_modal_solve(m.pts, m.tets, 210000.0, 0.30, 7.85,
+    auto r = chudware::sim::fea_modal_solve(m.pts, m.tets, 210000.0, 0.30, 7.85,
                                          m.fixed, /*n_modes*/ 4);
     REQUIRE(r.ok);
     REQUIRE(r.freqs_hz.size() >= 2);
@@ -163,7 +163,7 @@ TEST_CASE("modal: square cantilever bending modes are sane") {
 TEST_CASE("modal: tet10 reads near Euler-Bernoulli with a tight bending pair (N-1)") {
     Mesh m4 = beam_mesh(100.0, 12.0, 16, 2, 2);
     Mesh10 m = to_tet10(m4);
-    auto r = aicad::sim::fea_modal_solve(m.pts, m.tets, 210000.0, 0.30, 7.85,
+    auto r = chudware::sim::fea_modal_solve(m.pts, m.tets, 210000.0, 0.30, 7.85,
                                          m.fixed, /*n_modes*/ 4, /*nodes_per_elem*/ 10);
     REQUIRE(r.ok);
     REQUIRE(r.freqs_hz.size() >= 2);
@@ -174,7 +174,7 @@ TEST_CASE("modal: tet10 reads near Euler-Bernoulli with a tight bending pair (N-
     CHECK(f2 < 1.06 * f1);  // first bending PAIR near-degenerate — the N-1 split is gone
 
     // Same geometry, tet4: more over-stiff than tet10 (so its f1 sits higher).
-    auto r4 = aicad::sim::fea_modal_solve(m4.pts, m4.tets, 210000.0, 0.30, 7.85,
+    auto r4 = chudware::sim::fea_modal_solve(m4.pts, m4.tets, 210000.0, 0.30, 7.85,
                                           m4.fixed, /*n_modes*/ 4, /*nodes_per_elem*/ 4);
     REQUIRE(r4.ok);
     CHECK(r4.freqs_hz[0] >= f1);  // tet4 stiffer => not below the tet10 reading
@@ -192,7 +192,7 @@ TEST_CASE("modal: tet10 reads near Euler-Bernoulli with a tight bending pair (N-
 TEST_CASE("modal: non-square cantilever f1 near Euler-Bernoulli (~209 Hz) (F3)") {
     Mesh m4 = beam_mesh_rect(200.0, 20.0, 10.0, 24, 3, 2);
     Mesh10 m = to_tet10(m4);
-    auto r = aicad::sim::fea_modal_solve(m.pts, m.tets, 210000.0, 0.30, 7.85,
+    auto r = chudware::sim::fea_modal_solve(m.pts, m.tets, 210000.0, 0.30, 7.85,
                                          m.fixed, /*n_modes*/ 3, /*nodes_per_elem*/ 10);
     REQUIRE(r.ok);
     REQUIRE(r.freqs_hz.size() >= 2);
@@ -214,7 +214,7 @@ TEST_CASE("modal: non-square cantilever f1 near Euler-Bernoulli (~209 Hz) (F3)")
 // factorable); this pins that contract for a rectangular section too.
 TEST_CASE("modal: free-free non-square body returns rigid-body modes, not an error (F6)") {
     Mesh m = beam_mesh_rect(120.0, 20.0, 10.0, 12, 2, 1);
-    auto r = aicad::sim::fea_modal_solve(m.pts, m.tets, 210000.0, 0.30, 7.85,
+    auto r = chudware::sim::fea_modal_solve(m.pts, m.tets, 210000.0, 0.30, 7.85,
                                          /*fixed*/ {}, /*n_modes*/ 9);
     REQUIRE(r.ok);                       // empty fixtures is NOT an error
     REQUIRE(r.freqs_hz.size() >= 8);
@@ -231,7 +231,7 @@ TEST_CASE("modal: free-free non-square body returns rigid-body modes, not an err
 TEST_CASE("modal: free-free tet10 slender beam resolves ALL 6 rigid modes at n_modes=8 (C4)") {
     Mesh m4 = beam_mesh(100.0, 12.0, 16, 2, 2);
     Mesh10 m = to_tet10(m4);
-    auto r = aicad::sim::fea_modal_solve(m.pts, m.tets, 210000.0, 0.30, 7.85,
+    auto r = chudware::sim::fea_modal_solve(m.pts, m.tets, 210000.0, 0.30, 7.85,
                                          /*fixed*/ {}, /*n_modes*/ 8, /*npe*/ 10);
     REQUIRE(r.ok);
     REQUIRE(r.freqs_hz.size() == 8);  // truncated back to the caller's count
@@ -244,7 +244,7 @@ TEST_CASE("modal: free-free tet10 slender beam resolves ALL 6 rigid modes at n_m
 
 TEST_CASE("modal: free-free rigid cluster survives even when n_modes < 6") {
     Mesh m = beam_mesh(100.0, 12.0, 10, 2, 2);
-    auto r = aicad::sim::fea_modal_solve(m.pts, m.tets, 210000.0, 0.30, 7.85,
+    auto r = chudware::sim::fea_modal_solve(m.pts, m.tets, 210000.0, 0.30, 7.85,
                                          /*fixed*/ {}, /*n_modes*/ 4);
     REQUIRE(r.ok);
     REQUIRE(r.freqs_hz.size() == 4);

@@ -8,7 +8,7 @@
 #include "parts/parts.h"
 #include "parts/parts_data.h"
 
-using namespace aicad::parts;
+using namespace chudware::parts;
 
 // Find the first add_feature op of a given primitive/feature type.
 static const json* find_feat(const json& ops, const std::string& type) {

@@ -4,7 +4,7 @@ aicad.simhandoff/1 seam (contracts/sim_handoff.md).
 Groups:
   1. Translators — the hoses→piping network with exact hose bores (driven through
      the flipped tool: the translator lives in the C++ core since T-RF20, so these
-     need libaicad and skip cleanly without it); estimate_line_dp physics sanity.
+     need libchudware and skip cleanly without it); estimate_line_dp physics sanity.
   2. Envelopes — handoff/verify envelopes for both couplings validate structurally
      and cross-checks fire correctly on mock solve results (the pure-Python
      envelope compositions in hydraulic_tools, mirroring test_simhandoff.py).
@@ -13,7 +13,7 @@ Groups:
      solve (the old fluids-absent "solve_pending" stage is gone).
   5. piping_solve consumer — network_from_handoff extracts doc/boundary/fluid.
 
-The tool-driven groups need libaicad (the tool bodies are core_bridge wrappers
+The tool-driven groups need libchudware (the tool bodies are core_bridge wrappers
 now); the envelope/margin/estimate groups stay pure Python.
 
 Run: pytest services/mcp/test_hydraulic_handoff.py -q
@@ -86,7 +86,7 @@ def _net(doc=None, **kw):
     translator lives in the C++ core (core/hydraulic/handoff.cpp) and
     hydraulic_piping_handoff's base payload IS the net."""
     if not _HAVE_CORE:
-        pytest.skip("libaicad not staged — hoses_to_piping lives in the C++ core")
+        pytest.skip("libchudware not staged — hoses_to_piping lives in the C++ core")
     kw.setdefault("flow_lpm", 30.0)
     kw.setdefault("supply_pressure_bar", 200.0)
     tools = _tools()
@@ -277,7 +277,7 @@ def test_tool_piping_handoff_engine_less_or_live():
         supply_pressure_bar=200.0, flow_lpm=30.0, load_pressure_bar=180.0,
         doc=json.dumps(doc)))
     if not _HAVE_CORE:
-        # no libaicad staged: the wrapper degrades contract-shaped, never raises
+        # no libchudware staged: the wrapper degrades contract-shaped, never raises
         assert res["ok"] is False and "core engine unavailable" in res["reason"]
         return
     assert res["ok"]
@@ -292,7 +292,7 @@ def test_tool_piping_handoff_engine_less_or_live():
     assert res["verify"]["checks"]
 
 
-@pytest.mark.skipif(not _HAVE_CORE, reason="libaicad not staged — tool bodies are core RPCs")
+@pytest.mark.skipif(not _HAVE_CORE, reason="libchudware not staged — tool bodies are core RPCs")
 def test_tool_verify_piping_with_mock_solve():
     tools = _tools()
     doc = _circuit()
@@ -311,7 +311,7 @@ def test_tool_verify_piping_with_mock_solve():
     assert res["margin"]["pump_margin_solved_bar"] is not None
 
 
-@pytest.mark.skipif(not _HAVE_CORE, reason="libaicad not staged — tool bodies are core RPCs")
+@pytest.mark.skipif(not _HAVE_CORE, reason="libchudware not staged — tool bodies are core RPCs")
 def test_tool_fea_handoff_and_verify_roundtrip():
     tools = _tools()
     res = json.loads(tools["hydraulic_fea_handoff"](
@@ -331,7 +331,7 @@ def test_tool_fea_handoff_and_verify_roundtrip():
     assert v["simhandoff"]["handoff_id"] == res["simhandoff"]["id"]
 
 
-@pytest.mark.skipif(not _HAVE_CORE, reason="libaicad not staged — tool bodies are core RPCs")
+@pytest.mark.skipif(not _HAVE_CORE, reason="libchudware not staged — tool bodies are core RPCs")
 def test_tool_fea_handoff_input_guards():
     tools = _tools()
     assert not json.loads(tools["hydraulic_fea_handoff"](
@@ -371,7 +371,7 @@ def test_network_from_handoff_rejects_bad_envelopes():
     assert any("boundary missing" in e for e in errs)
 
 
-@pytest.mark.skipif(not _HAVE_CORE, reason="libaicad not staged — live 1D solve skipped")
+@pytest.mark.skipif(not _HAVE_CORE, reason="libchudware not staged — live 1D solve skipped")
 def test_live_solve_estimate_vs_solve_within_tolerance():
     """With fluids installed the whole loop runs live: solve the generated network
     and require the per-hose Darcy estimate to agree with the solver within 30%."""

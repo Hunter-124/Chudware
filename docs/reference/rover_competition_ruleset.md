@@ -18,7 +18,7 @@ marked "not found in fetched source" rather than invented.
 
 ## Key Engineering Constraints
 
-There are two divisions: **Human-Powered (HP)** and **Remote-Controlled (RC)**. AI-CAD design
+There are two divisions: **Human-Powered (HP)** and **Remote-Controlled (RC)**. Chudware design
 work is primarily the HP rover; RC numbers are included for completeness.
 
 ### Size / stowed-dimension limits
@@ -95,11 +95,11 @@ work is primarily the HP rover; RC numbers are included for completeness.
 
 ---
 
-## How to use this in AI-CAD
+## How to use this in Chudware
 
 Map competition constraints to concrete part-choice checks:
 
-| Constraint (source) | AI-CAD check on part choices |
+| Constraint (source) | Chudware check on part choices |
 |---|---|
 | **5×5×5 ft stowed cube** (§5.5.3) | When sizing frame extrusions / fold geometry, verify the *folded* bounding box ≤ 60 in on every axis. Drives max member length + hinge/fold count. |
 | **Assembled width ≤ 5 ft** (§6.3.3) | Check overall model width in deployed configuration ≤ 60 in. |

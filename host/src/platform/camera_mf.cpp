@@ -5,7 +5,7 @@
 #include <string>
 #include <vector>
 
-namespace aicad::platform {
+namespace chudware::platform {
 
 class MFCameraBackend : public CameraBackend {
     bool opened_ = false;
@@ -21,5 +21,5 @@ std::unique_ptr<CameraBackend> createMFCamera() {
     return std::make_unique<MFCameraBackend>();
 }
 
-}  // namespace aicad::platform
+}  // namespace chudware::platform
 #endif  // _WIN32

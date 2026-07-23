@@ -12,7 +12,7 @@
 
 #include "tolerance/stackup.h"
 
-using namespace aicad::tolerance;
+using namespace chudware::tolerance;
 using nlohmann::json;
 
 TEST_CASE("textbook 3-dim chain (Fischer Ch. 3 hand-calc)") {
@@ -90,8 +90,8 @@ TEST_CASE("dispatch: method ownership, mode scoping, error envelopes") {
 }
 
 TEST_CASE("golden parity: every oracle fixture deep-equals (tests/data/tolerance.json)") {
-    std::ifstream f(std::string(AICAD_TEST_DATA_DIR) + "/tolerance.json");
-    REQUIRE_MESSAGE(f.good(), "tolerance.json golden not found at AICAD_TEST_DATA_DIR");
+    std::ifstream f(std::string(CHUDWARE_TEST_DATA_DIR) + "/tolerance.json");
+    REQUIRE_MESSAGE(f.good(), "tolerance.json golden not found at CHUDWARE_TEST_DATA_DIR");
     const json cases = json::parse(f);
     for (const json& c : cases) {
         CAPTURE(c["name"]);

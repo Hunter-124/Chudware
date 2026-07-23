@@ -1,10 +1,10 @@
 """Tests for services/agent/advisor/preflight.py (T-W12).
 
 Run with:
-    AI_CAD_LIBAICAD=$PWD/core/build-linux/bin/libaicad.so PYTHONPATH=$PWD pytest \
+    CHUDWARE_LIBCHUDWARE=$PWD/core/build-linux/bin/libchudware.so PYTHONPATH=$PWD pytest \
         services/agent/advisor/test_preflight.py -v
 
-Tests that require the engine are skipped when libaicad is unavailable
+Tests that require the engine are skipped when libchudware is unavailable
 (pytest.importorskip / skip marker on CoreError import failure).
 """
 from __future__ import annotations
@@ -533,19 +533,19 @@ class TestPerfGuard:
 
 
 # ---------------------------------------------------------------------------
-# Live engine tests (skipped when libaicad unavailable)
+# Live engine tests (skipped when libchudware unavailable)
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="module")
 def live_engine():
-    """Skip if libaicad is not loadable."""
+    """Skip if libchudware is not loadable."""
     try:
         import services.mcp.core_bridge as cb
         if not cb.available():
-            pytest.skip("libaicad not available")
+            pytest.skip("libchudware not available")
         return cb
     except Exception:
-        pytest.skip("libaicad not importable")
+        pytest.skip("libchudware not importable")
 
 
 class TestLiveEngineIntegration:

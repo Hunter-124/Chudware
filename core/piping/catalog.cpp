@@ -11,7 +11,7 @@
 #include "piping/fittings_data.h"
 #include "piping/pipe_tables.h"
 
-namespace aicad::piping {
+namespace chudware::piping {
 namespace {
 
 using pyutil::jerr;
@@ -224,4 +224,4 @@ std::vector<double> available_sizes(const std::string& ftype) {
     return out;
 }
 
-}  // namespace aicad::piping
+}  // namespace chudware::piping

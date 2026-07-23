@@ -13,7 +13,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad::sim::cache {
+namespace chudware::sim::cache {
 
 // Contract cap for a single studies/<id>/results.* payload (stepplus.md §1).
 constexpr std::size_t kMaxStudyResultBytes = 20ull * 1024ull * 1024ull;
@@ -56,7 +56,7 @@ struct Lookup {
 Lookup lookup(Kind kind, const std::string& input_hash);
 bool store(Kind kind, const std::string& input_hash, const nlohmann::json& result);
 
-// Optional disk sidecar (under set_sidecar_dir, or $AICAD_SIM_CACHE_DIR, or a
+// Optional disk sidecar (under set_sidecar_dir, or $CHUDWARE_SIM_CACHE_DIR, or a
 // process temp dir). Same keying; used so SPICE/EM/CFD results survive the
 // process without a .step+ container. Disabled when low_memory_now().
 void set_sidecar_dir(const std::string& dir);
@@ -102,4 +102,4 @@ bool get_study_result(const std::map<std::string, std::string>& extra,
                       const std::string& study_id, Kind& kind_out,
                       std::string& input_hash_out, nlohmann::json& result_out);
 
-}  // namespace aicad::sim::cache
+}  // namespace chudware::sim::cache

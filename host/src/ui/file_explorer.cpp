@@ -2,14 +2,14 @@
 //
 // Workspace file browser for the left task pane's "Explorer" tab. Renders a "Recent" section
 // (AppState::recentFiles) plus a recursive, lazy-expand directory tree rooted at the workspace dir
-// (AppState::workspaceDir, default <Documents>/AI-CAD), filtered to known CAD/ECAD extensions.
+// (AppState::workspaceDir, default <Documents>/Chudware), filtered to known CAD/ECAD extensions.
 //
 // Double-click opens a file (CAD -> featureTreeOpenPath via st.requestOpenPath; ECAD/KiCad files
 // route through the same request flag and app.cpp's pump dispatches them to the ECAD open path).
 // Right-click yields Open / Rename / Copy / Paste / Delete / New Folder. F2 renames inline,
 // Del deletes (with a confirm modal). All filesystem mutations are clamped to the workspace root.
 //
-// Filesystem ops go through billet::FsBackend (desktop = std::filesystem; web = gateway
+// Filesystem ops go through chudware::FsBackend (desktop = std::filesystem; web = gateway
 // /workspace/*) so the WASM client browses the server workspace.
 #include <algorithm>
 #include <cctype>
@@ -180,10 +180,10 @@ static const char* fileIconFallback(const std::string& ext) {
 
 // ---- workspace resolution ------------------------------------------------
 void ensureWorkspaceDir(AppState& st) {
-    auto& fsb = billet::fsBackend();
+    auto& fsb = chudware::fsBackend();
     if (st.workspaceDir.empty()) {
-        // Prefer the persisted setting, else the backend default (desktop Documents/AI-CAD
-        // or Documents/Billet; web = server workspace abs root).
+        // Prefer the persisted setting, else the backend default (desktop Documents/Chudware
+        // or Documents/Chudware; web = server workspace abs root).
         if (!st.settings.workspaceDir.empty()) {
             st.workspaceDir = st.settings.workspaceDir;
         } else {
@@ -206,7 +206,7 @@ void ensureWorkspaceDir(AppState& st) {
 // ---- inline rename commit -------------------------------------------------
 static void commitRename(AppState& st, const std::string& root) {
     if (s_renameId.empty()) return;
-    auto& fsb = billet::fsBackend();
+    auto& fsb = chudware::fsBackend();
     std::string oldP = s_renameId;
     std::string newName = s_renameBuf;
     // trim
@@ -238,7 +238,7 @@ static void commitRename(AppState& st, const std::string& root) {
 // Build a collision-free destination by appending " (copy)" (then " (copy 2)", ...) before the
 // extension until the name is free.
 static std::string uniqueDest(const std::string& dir, const std::string& src) {
-    auto& fsb = billet::fsBackend();
+    auto& fsb = chudware::fsBackend();
     std::string fname = pathFilename(src);
     std::string stem = pathStem(fname);
     std::string ext  = pathExtension(fname);
@@ -253,7 +253,7 @@ static std::string uniqueDest(const std::string& dir, const std::string& src) {
 }
 
 static bool doPaste(AppState& st, const std::string& root, const std::string& destDir) {
-    auto& fsb = billet::fsBackend();
+    auto& fsb = chudware::fsBackend();
     if (s_clipboardPath.empty()) { st.toast(ui::ToastLevel::Info, "Nothing copied"); return false; }
     std::string src = s_clipboardPath;
     if (!fsb.exists(src)) { st.toast(ui::ToastLevel::Warn, "Copied file no longer exists"); return false; }
@@ -274,7 +274,7 @@ static bool doPaste(AppState& st, const std::string& root, const std::string& de
 }
 
 static void createNewFolder(AppState& st, const std::string& root, const std::string& dir) {
-    auto& fsb = billet::fsBackend();
+    auto& fsb = chudware::fsBackend();
     if (!withinWorkspace(root, dir)) {
         st.toast(ui::ToastLevel::Warn, "New Folder blocked outside the workspace");
         return;
@@ -377,7 +377,7 @@ static void drawFileRow(AppState& st, const std::string& root, const std::string
 // skipped. Children come from s_dirListCache (TTL + mutation bust) so open folders don't re-stat
 // every frame.
 static void drawDirNode(AppState& st, const std::string& root, const std::string& dir, bool isRoot) {
-    auto& fsb = billet::fsBackend();
+    auto& fsb = chudware::fsBackend();
     // The "Workspace" section rule above the tree already names the section; the root row just
     // shows the workspace folder's own name (FM-style: divider carries the section label).
     std::string label = pathFilename(dir);
@@ -494,7 +494,7 @@ static void drawDirNode(AppState& st, const std::string& root, const std::string
 // ---- Recent section -------------------------------------------------------
 static void drawRecentSection(AppState& st) {
     if (st.recentFiles.empty()) return;
-    auto& fsb = billet::fsBackend();
+    auto& fsb = chudware::fsBackend();
     // FM-style section rule (the "Reference"/"Features" treatment) instead of a CollapsingHeader.
     ui::fmSectionDivider("Recent");
     if (ImGui::GetTime() - s_recentExistsAt > 2.0) {
@@ -539,7 +539,7 @@ static void drawRecentSection(AppState& st) {
 
 // ---- delete confirm modal -------------------------------------------------
 static void drawDeleteModal(AppState& st, const std::string& root) {
-    auto& fsb = billet::fsBackend();
+    auto& fsb = chudware::fsBackend();
     if (!s_pendingDelete.empty() && !ImGui::IsPopupOpen("Delete?"))
         ImGui::OpenPopup("Delete?");
     bool open = !s_pendingDelete.empty();
@@ -577,7 +577,7 @@ static void drawDeleteModal(AppState& st, const std::string& root) {
 
 // ---- body -----------------------------------------------------------------
 void drawFileExplorerBody(AppState& st) {
-    auto& fsb = billet::fsBackend();
+    auto& fsb = chudware::fsBackend();
     ui::fmRowStripeReset();   // restart the FM stripe phase + refresh the shared FM palette
 
     // Compact vertical rhythm (the FeatureManager convention): tighten ItemSpacing.y only so
@@ -697,7 +697,7 @@ bool fileExplorerCopySelection(AppState& st) {
 
 bool fileExplorerPaste(AppState& st) {
     if (s_clipboardPath.empty()) return false;
-    auto& fsb = billet::fsBackend();
+    auto& fsb = chudware::fsBackend();
     ensureWorkspaceDir(st);
     std::string root = st.workspaceDir;
     std::string dest = s_currentFolder.empty() ? root : s_currentFolder;

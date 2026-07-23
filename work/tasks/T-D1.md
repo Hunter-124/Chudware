@@ -68,7 +68,7 @@ Day 1 establishes the structural pillar following the ECAD precedent: a frozen c
 
 ```
 check.py     FAIL-RECORDED  (pre-existing, non-fatal)
-core build   PASS  (libaicad, OCCT ON)
+core build   PASS  (libchudware, OCCT ON)
 ui/abstract  PASS
 ctest        PASS  (100%)
 pytest       SKIP  (no provisioned venv; structural suite verified separately — 10 passed)

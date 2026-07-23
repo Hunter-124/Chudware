@@ -5,7 +5,7 @@
 #include <cctype>
 #include <set>
 
-namespace aicad::piping {
+namespace chudware::piping {
 namespace {
 
 using pyutil::py_repr;
@@ -323,4 +323,4 @@ std::vector<std::string> validate_piping(const ojson& doc) {
     return errs;
 }
 
-}  // namespace aicad::piping
+}  // namespace chudware::piping

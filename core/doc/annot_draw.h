@@ -27,7 +27,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad::doc {
+namespace chudware::doc {
 
 // Compile one annotation into draw primitives. `units` is the drawing's unit system
 // ("MMGS"|"IPS"), used only to format a fallback display string when the annotation has
@@ -53,4 +53,4 @@ nlohmann::json compile_hatch(const nlohmann::json& polygon, double spacing, doub
 // pass-through / legacy kinds). Cheap string check, no allocation of primitives.
 bool annot_is_known(const std::string& kind);
 
-}  // namespace aicad::doc
+}  // namespace chudware::doc

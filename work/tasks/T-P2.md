@@ -65,7 +65,7 @@ Both domains present in top-20 unfiltered results.
 
 2. **MountingHole_3.2mm_M3 added to starter** — clean-room IPC-7251 geometry (3.2 mm drill,
    NPTH, courtyard 4 mm, silkscreen 3.4 mm circle). Required so "M3" surfaces an ecad hit
-   even without AICAD_KICAD_SYM_PATH configured.
+   even without CHUDWARE_KICAD_SYM_PATH configured.
 
 3. **Live-vendor fallback in hub.search()** — when FTS5 index has no hits AND domain matches
    a live provider, live providers are queried directly (not blended with index results).

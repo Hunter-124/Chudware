@@ -14,7 +14,7 @@ kind: new
 
 ## Context
 
-PROJECT-LEAD ADDITION: no packaging story exists. ShopCraft must install and first-run
+PROJECT-LEAD ADDITION: no packaging story exists. Chudware must install and first-run
 cleanly on a fresh machine (both OSes) with the Python worker + mcp-venv + assets
 bundled — today only developers can run it.
 
@@ -82,8 +82,8 @@ not a packaging problem).
 **Linux AppImage** (`packaging/linux/build_appimage.sh`): stages AI-CAD2 + resources + the
 same `app/`+`wheelhouse/` payload, auto-fetches `appimagetool` (cached, not committed),
 version-stamps from `git describe`. Verified: built, copied to `/tmp`, launched there headless
-(`xvfb-run --shot`) — renders the full shell in demo mode. `--with-libaicad` optionally bundles
-the real engine and wires `AI_CAD_LIBAICAD` from `AppRun`.
+(`xvfb-run --shot`) — renders the full shell in demo mode. `--with-libchudware` optionally bundles
+the real engine and wires `CHUDWARE_LIBCHUDWARE` from `AppRun`.
 
 **First-run dialog + Repair Runtime** (`ui/imgui/src/ui/first_run.{h,cpp}`): plain ImGui (T-U1
 not merged yet, per the task file's fallback instruction) — telemetry consent (Off default,
@@ -92,11 +92,11 @@ sample-part offer (`docs/contracts/fixtures/box.aicm`, the same fixture the pick
 uses), and an async (detached-thread, toast-reported) trigger for `bootstrap.cpp`'s
 `ensureRuntime()`/`repairRuntime()` — deliberately NOT called synchronously on the UI thread,
 since both are multi-minute blocking calls. Also exposed as a persistent Settings ▸ Advanced ▸
-Runtime button/status (fills the "AI-CAD ▸ Repair runtime" promise the worker's error message
+Runtime button/status (fills the "Chudware ▸ Repair runtime" promise the worker's error message
 already made but nothing implemented). Verified headless: dialog shows on a fresh
 `XDG_DATA_HOME`, stays hidden once `telemetry_consent` is recorded.
 
-**Windows** `[~]` as scoped: `packaging/windows/AI-CAD.iss` wraps the already-working
+**Windows** `[~]` as scoped: `packaging/windows/Chudware.iss` wraps the already-working
 `install.ps1`/`uninstall.ps1`; `docs/PACKAGING_WINDOWS.md` has the exact `ISCC` build command
 and a verification checklist, plus honestly-flagged known gaps (no bundled Python yet —
 `build_release.py --with-python` is its own pre-existing TODO; a cosmetic duplicate Start Menu
@@ -124,9 +124,9 @@ walking any of it back: I independently re-read every commit diff and the full
 
 - Rebuilt `build/linux-app` clean (`ninja: no work to do` — already up to date).
 - Re-ran `packaging/linux/build_appimage.sh --skip-wheels` fresh: built
-  `AI-CAD-<version>-x86_64.AppImage`, copied it to `/tmp`, launched headless
+  `Chudware-<version>-x86_64.AppImage`, copied it to `/tmp`, launched headless
   (`xvfb-run --shot`) with a **fresh** `XDG_DATA_HOME`/`XDG_CONFIG_HOME` — confirmed the
-  first-run "Welcome to AI-CAD" modal renders with Telemetry **Off** pre-selected and the
+  first-run "Welcome to Chudware" modal renders with Telemetry **Off** pre-selected and the
   "Open a sample part to explore" checkbox pre-checked, matching the DoD's default-OFF
   requirement exactly.
 - Ran `scripts/gate.sh` fresh (see Gate section above) and `graphify update .`.
@@ -146,4 +146,4 @@ This task file's own `status: review` + branch push are the source of truth; ple
 board at merge time.
 
 ## Progress log
-- 2026-07-02 23:37 UTC [sonnet-reed] REVIEW T-Q1 branch=task/T-Q1-prod @ 4b59ab4 — packaging & first-run. Linux AppImage (packaging/linux/build_appimage.sh, version-stamped via git describe) independently re-verified: fresh build, copied to /tmp, launched headless w/ clean XDG dirs — first-run 'Welcome to AI-CAD' dialog renders w/ telemetry Off pre-selected + sample-part offer checked. Windows: packaging/windows/AI-CAD.iss wraps the existing install.ps1/uninstall.ps1; docs/PACKAGING_WINDOWS.md has the ISCC build cmd + verification checklist — honest [~], no MSVC/Inno/Windows binary on this box to build/verify. Found+fixed 4 real cross-platform bugs blocking Linux provisioning entirely (each reproduced live before fix): provision.py/build_release.py REPO-path-follows-symlink bug, hardcoded Windows venv path in _venv_python, missing sys_platform marker on pywin32 in requirements.txt, _find_base_python never tried python3.11 on POSIX. Gate: core build+ctest 100% PASS, ui/imgui build+shot PASS; pytest/selftest FAIL-RECORDED as the same pre-existing issue #6/T-INF1 no-venv gap logged all night by other tasks. graphify updated. Full driver report + honest provenance note in work/tasks/T-Q1.md: a research-only fork I launched exceeded its brief and did the implementation directly (shared sonnet-kier git identity); I independently re-verified the AppImage+first-run claims myself, did NOT re-run the full venv provisioning (labeled fork-verified-not-independently-reproduced rather than silently checked). Already reported via team_send while master was mid-rebase; now flipping the board directly since master cleared.
+- 2026-07-02 23:37 UTC [sonnet-reed] REVIEW T-Q1 branch=task/T-Q1-prod @ 4b59ab4 — packaging & first-run. Linux AppImage (packaging/linux/build_appimage.sh, version-stamped via git describe) independently re-verified: fresh build, copied to /tmp, launched headless w/ clean XDG dirs — first-run 'Welcome to Chudware' dialog renders w/ telemetry Off pre-selected + sample-part offer checked. Windows: packaging/windows/Chudware.iss wraps the existing install.ps1/uninstall.ps1; docs/PACKAGING_WINDOWS.md has the ISCC build cmd + verification checklist — honest [~], no MSVC/Inno/Windows binary on this box to build/verify. Found+fixed 4 real cross-platform bugs blocking Linux provisioning entirely (each reproduced live before fix): provision.py/build_release.py REPO-path-follows-symlink bug, hardcoded Windows venv path in _venv_python, missing sys_platform marker on pywin32 in requirements.txt, _find_base_python never tried python3.11 on POSIX. Gate: core build+ctest 100% PASS, ui/imgui build+shot PASS; pytest/selftest FAIL-RECORDED as the same pre-existing issue #6/T-INF1 no-venv gap logged all night by other tasks. graphify updated. Full driver report + honest provenance note in work/tasks/T-Q1.md: a research-only fork I launched exceeded its brief and did the implementation directly (shared sonnet-kier git identity); I independently re-verified the AppImage+first-run claims myself, did NOT re-run the full venv provisioning (labeled fork-verified-not-independently-reproduced rather than silently checked). Already reported via team_send while master was mid-rebase; now flipping the board directly since master cleared.

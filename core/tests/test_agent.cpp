@@ -14,7 +14,7 @@
 #include "agent/iface_plan.h"
 
 
-using namespace aicad::agent;
+using namespace chudware::agent;
 
 TEST_CASE("base64 standard encoding") {
     CHECK(base64_encode("") == "");
@@ -2362,7 +2362,7 @@ TEST_CASE("interface advisory present in modeler context via advisory seam") {
 }
 
 TEST_CASE("cancel_run cascades to mission sub-runs") {
-    using namespace aicad::agent;
+    using namespace chudware::agent;
     RunControl parent, child, other;
     register_run_control("mission-1", parent);
     register_run_control("mission-1-t0", child);

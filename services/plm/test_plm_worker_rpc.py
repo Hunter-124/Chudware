@@ -263,7 +263,7 @@ def _clear_hook():
 
 
 def test_draft_manual_fallback_without_local_model(project, monkeypatch):
-    monkeypatch.setenv("AICAD_PLM_DRAFT_LOCAL", "0")  # simulate: not provisioned
+    monkeypatch.setenv("CHUDWARE_PLM_DRAFT_LOCAL", "0")  # simulate: not provisioned
     _write(project, "Bracket.step+", _part(6.0))
     out = _call("plm_draft", path=str(project))
     assert out["ok"]

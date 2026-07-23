@@ -348,7 +348,7 @@ def register_plm_tools(mcp: FastMCP) -> None:
             if visual:
                 import tempfile
 
-                od = out_dir or tempfile.mkdtemp(prefix="aicad_plm_compare_")
+                od = out_dir or tempfile.mkdtemp(prefix="chudware_plm_compare_")
                 fields["eval_compare"] = plm_compare_mod.visual_compare(doc_a, doc_b, od)
         except VaultError as e:
             return _err(e.reason, e.hint)
@@ -431,7 +431,7 @@ def register_plm_tools(mcp: FastMCP) -> None:
     def plm_add_remote(path: str, kind: str = "folder", name: str = "origin",
                        url: str = "") -> str:
         """Register a remote profile for team sync. ``kind`` ∈ ``folder`` |
-        ``ssh`` | ``https`` | ``aicad-cloud`` (config-only). Folder remotes use
+        ``ssh`` | ``https`` | ``chudware-cloud`` (config-only). Folder remotes use
         a bare repo path. Returns ``{ok, remote}``."""
         try:
             from services.plm import remote as remote_mod

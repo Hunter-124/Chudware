@@ -1,6 +1,6 @@
-"""Register Billet (formerly AI-CAD) as an MCP server in the machine's Claude install(s).
+"""Register Chudware (formerly Chudware) as an MCP server in the machine's Claude install(s).
 
-Adds a "billet" entry to the `mcpServers` map of (any legacy "ai-cad" entry is left
+Adds a "chudware" entry to the `mcpServers` map of (any legacy "ai-cad" entry is left
 in place on register — existing tooling references it — and removed on --unregister):
   * Claude Desktop : %APPDATA%/Claude/claude_desktop_config.json
   * Claude Code     : ~/.claude.json
@@ -22,7 +22,7 @@ from pathlib import Path
 
 from services import paths
 
-SERVER_NAME = "billet"
+SERVER_NAME = "chudware"
 SERVER_NAME_LEGACY = "ai-cad"  # left in place on register; removed on --unregister
 
 
@@ -45,7 +45,7 @@ def server_entry(python_exe: Path, cwd: Path, hostd_bin: Path | None = None) -> 
         # Pin the installed engine-host daemon so MCP sessions and the GUI share ONE
         # daemon (same binary path -> same instance key -> same socket/pipe). Without
         # this the MCP venv would resolve a dev-tree hostd and mint a separate daemon.
-        env["AICAD_HOSTD_BIN"] = str(hostd_bin)
+        env["CHUDWARE_HOSTD_BIN"] = str(hostd_bin)
     return {
         "command": str(python_exe),
         "args": ["-m", "mcp_server.server"],
@@ -86,7 +86,7 @@ def apply(python_exe: Path, cwd: Path, targets: list[str], dry_run: bool,
         if changed and not dry_run:
             path.parent.mkdir(parents=True, exist_ok=True)
             if path.exists():
-                shutil.copy2(path, path.with_suffix(path.suffix + ".aicad-bak"))
+                shutil.copy2(path, path.with_suffix(path.suffix + ".chudware-bak"))
             path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
             wrote = True
         out[name] = {"path": str(path), "exists": path.exists(),
@@ -95,15 +95,15 @@ def apply(python_exe: Path, cwd: Path, targets: list[str], dry_run: bool,
 
 
 def main(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(description="Register AI-CAD MCP server with Claude.")
+    ap = argparse.ArgumentParser(description="Register Chudware MCP server with Claude.")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--unregister", action="store_true")
     ap.add_argument("--python", type=Path, default=default_python())
     ap.add_argument("--cwd", type=Path, default=Path(__file__).resolve().parent.parent)
     ap.add_argument("--target", choices=["desktop", "code", "both"], default="both")
     ap.add_argument("--hostd-bin", type=Path, default=None,
-                    help="installed aicad-hostd binary; written into the server env as "
-                         "AICAD_HOSTD_BIN so MCP sessions attach to the installed daemon")
+                    help="installed chudware-hostd binary; written into the server env as "
+                         "CHUDWARE_HOSTD_BIN so MCP sessions attach to the installed daemon")
     args = ap.parse_args(argv)
 
     targets = ["desktop", "code"] if args.target == "both" else [args.target]

@@ -22,7 +22,7 @@
 
 #include "ipc_transport.h"
 
-namespace aicad_ipc {
+namespace chudware_ipc {
 
 class EngineClient {
 public:
@@ -138,4 +138,4 @@ private:
     std::atomic<uint64_t> reconnectGen_{0};  // bumped by reconnectLocked (see accessor)
 };
 
-}  // namespace aicad_ipc
+}  // namespace chudware_ipc

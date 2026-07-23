@@ -22,7 +22,7 @@ for the length-match rule. Every pre-fab / physics pack is then driven against i
 
 Physics/3D packs skip cleanly when build123d/OCP is unavailable.
 
-Run: AI_CAD_ENGINE_DAEMON=0 .venv-mcp/bin/python -X utf8 -m pytest services/mcp/test_ecad_packs.py -q
+Run: CHUDWARE_ENGINE_DAEMON=0 .venv-mcp/bin/python -X utf8 -m pytest services/mcp/test_ecad_packs.py -q
 """
 from __future__ import annotations
 

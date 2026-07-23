@@ -1,4 +1,4 @@
-"""Translate a SolidWorks feature IR (:mod:`services.sw_import.sw_feature_import`) into AI-CAD's native
+"""Translate a SolidWorks feature IR (:mod:`services.sw_import.sw_feature_import`) into Chudware's native
 ``add_features`` op list, so an imported SolidWorks part lands as an *editable* feature tree.
 
 Strict-fidelity contract: every feature this can rebuild is emitted as real ops; every feature it
@@ -6,7 +6,7 @@ cannot is appended to ``unsupported`` (carried over from extraction + anything f
 caller can refuse the import with a precise punch-list. We never silently approximate.
 
 Geometry addressing:
-  * SolidWorks parts are Y-up; AI-CAD is Z-up. A sketch's plane is classified upstream into a
+  * SolidWorks parts are Y-up; Chudware is Z-up. A sketch's plane is classified upstream into a
     principal orientation ('top'/'front'/'right'), mapped here to ``plane.top``/``plane.front``/
     ``plane.right``. A parallel offset plane (e.g. a loft section's RefPlane) is folded into the
     sketch's ``refs.offset``. Tilted / non-principal planes are reported unsupported.

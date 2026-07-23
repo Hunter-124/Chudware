@@ -112,7 +112,7 @@ inline std::string resolvePath() {
         if (fs::is_regular_file(p, ec)) return p.string();
         return {};
     };
-    if (const char* repo = std::getenv("AI_CAD_REPO")) {
+    if (const char* repo = std::getenv("CHUDWARE_REPO")) {
         std::string hit = tryPath(fs::path(repo) / "benchmarks" / "leaderboard" / "leaderboard.json");
         if (!hit.empty()) return hit;
     }

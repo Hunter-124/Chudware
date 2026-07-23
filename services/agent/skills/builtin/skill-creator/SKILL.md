@@ -14,8 +14,8 @@ Skills are folders: `<root>/<name>/SKILL.md` with YAML frontmatter + markdown bo
 
 ## Locations (precedence)
 
-1. Project: `.billet/skills/<name>/SKILL.md`
-2. User: `~/.local/share/AI-CAD/skills/<name>/SKILL.md` (writable via `skills_save`)
+1. Project: `.chudware/skills/<name>/SKILL.md`
+2. User: `~/.local/share/Chudware/skills/<name>/SKILL.md` (writable via `skills_save`)
 3. Builtin: `services/agent/skills/builtin/<name>/SKILL.md` (shipped)
 
 ## Frontmatter (required)

@@ -35,7 +35,7 @@ Design notes
 Usage
 -----
     # point at a CUDA llama-server binary (built separately; bundled one is CPU-only)
-    export TOKENMAXX_LLAMA_SERVER=~/.local/share/AI-CAD/llamacpp/build-cuda/bin/llama-server
+    export TOKENMAXX_LLAMA_SERVER=~/.local/share/Chudware/llamacpp/build-cuda/bin/llama-server
     python3 benchmarks/tokenmaxx/bench.py --models qwen3-4b gemma3-4b-qat gemma4-e4b
     python3 benchmarks/tokenmaxx/bench.py --quick        # 1 model, N in {1,2}, smoke
     python3 benchmarks/tokenmaxx/bench.py --list          # show known models + presence
@@ -80,10 +80,10 @@ else:
 
 DEFAULT_LLAMA_SERVER = os.environ.get(
     "TOKENMAXX_LLAMA_SERVER",
-    str(Path.home() / ".local/share/AI-CAD/llamacpp/build/bin/llama-server"),
+    str(Path.home() / ".local/share/Chudware/llamacpp/build/bin/llama-server"),
 )
 HEADROOM_MB = int(os.environ.get("TOKENMAXX_HEADROOM_MB", "2048"))
-MODELS_DIR = Path.home() / ".local/share/AI-CAD/models"
+MODELS_DIR = Path.home() / ".local/share/Chudware/models"
 
 # Registry of GGUFs this bench knows how to load. Diffusion Gemma is listed but
 # marked not_runnable_here with the reason (see report / provision()).

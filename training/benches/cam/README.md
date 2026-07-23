@@ -75,7 +75,7 @@ run.
   .verify(None, ["cam_simulate"])`) against the same in-process current job and its score
   recorded alongside as the through-battery signal. Guarded skip-if-no-core: resolution of
   the core library goes entirely through `mcp_server.core_bridge`'s own
-  `$AI_CAD_LIBAICAD` / `$AI_CAD_DIST` / platform search — no sibling worktree `.so` path is
+  `$CHUDWARE_LIBCHUDWARE` / `$CHUDWARE_DIST` / platform search — no sibling worktree `.so` path is
   ever hardcoded.
 
 ## Run
@@ -91,5 +91,5 @@ the runner's owner since this task does not edit `runner.py`.)
 
 Tests: `tools/flywheel/bench/tests/test_cam.py` —
 ```
-~/.local/share/AI-CAD/mcp-venv/bin/pytest tools/flywheel/bench/tests/test_cam.py -q
+~/.local/share/Chudware/mcp-venv/bin/pytest tools/flywheel/bench/tests/test_cam.py -q
 ```

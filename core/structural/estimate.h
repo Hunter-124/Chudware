@@ -4,7 +4,7 @@
 //
 // All costs are preliminary budget figures from a rate table — NOT vendor
 // prices (bom_price owns those). The rate table is user-overridable: an
-// explicit rates_path / $AICAD_STRUCTURAL_RATES JSON file is merged over the
+// explicit rates_path / $CHUDWARE_STRUCTURAL_RATES JSON file is merged over the
 // embedded defaults (core/structural/enr_rates.json is the shipped copy).
 #pragma once
 
@@ -15,7 +15,7 @@
 
 #include "structural/model.h"
 
-namespace aicad::structural {
+namespace chudware::structural {
 
 extern const char* kEstimateDisclaimer;  // byte-exact DISCLAIMER
 
@@ -34,7 +34,7 @@ struct RateTable {
     double install_hour(const std::string& element_type) const;
 };
 
-// Load the rate table: explicit path → $AICAD_STRUCTURAL_RATES → embedded
+// Load the rate table: explicit path → $CHUDWARE_STRUCTURAL_RATES → embedded
 // defaults. A found file is merged over the defaults (per-key override).
 RateTable load_rates(const std::string& rates_path = "");
 
@@ -50,4 +50,4 @@ int fastener_count(const StructureDoc& doc);
 // rate_table_date, disclaimer}.
 nlohmann::json estimate(const StructureDoc& doc, const RateTable& rates);
 
-}  // namespace aicad::structural
+}  // namespace chudware::structural

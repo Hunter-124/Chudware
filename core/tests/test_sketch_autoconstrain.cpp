@@ -28,13 +28,13 @@
 #include "doc/session.h"
 
 using json = nlohmann::json;
-using aicad::doc::doc_new;
-using aicad::doc::doc_apply_ops;
-using aicad::doc::doc_set_meta;
-using aicad::doc::doc_tree;
-using aicad::doc::doc_sketch_auto_constrain;
-using aicad::doc::doc_sketch_health;
-using aicad::doc::doc_sketch_regions;
+using chudware::doc::doc_new;
+using chudware::doc::doc_apply_ops;
+using chudware::doc::doc_set_meta;
+using chudware::doc::doc_tree;
+using chudware::doc::doc_sketch_auto_constrain;
+using chudware::doc::doc_sketch_health;
+using chudware::doc::doc_sketch_regions;
 
 namespace {
 

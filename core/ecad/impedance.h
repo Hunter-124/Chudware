@@ -10,7 +10,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace aicad::ecad {
+namespace chudware::ecad {
 
 // All geometry in mm; er dimensionless. Each returns {z0, eeff, delay_ps_per_mm, model}.
 nlohmann::json microstrip_z0(double w, double h, double t, double er);
@@ -27,4 +27,4 @@ nlohmann::json diff_pair_z0(double w, double s, double h, double t, double er,
 // length_mm, delay_ps}. Throws OpError("invalid_op") if no track resolves.
 nlohmann::json track_impedance(const nlohmann::json& board, const nlohmann::json& track_or_net);
 
-}  // namespace aicad::ecad
+}  // namespace chudware::ecad

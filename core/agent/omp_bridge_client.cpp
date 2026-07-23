@@ -8,7 +8,7 @@
 
 #ifdef _WIN32
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 
 OmpBridgeClient& OmpBridgeClient::instance() {
@@ -27,7 +27,7 @@ bool OmpBridgeClient::call(const std::string& /*method*/, const nlohmann::json& 
 }
 
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware
 
 #else  // !_WIN32
 
@@ -42,7 +42,7 @@ bool OmpBridgeClient::call(const std::string& /*method*/, const nlohmann::json& 
 #include <sys/wait.h>
 #include <unistd.h>
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 
 using nlohmann::json;
@@ -83,7 +83,7 @@ std::string findRepoRootFrom(std::filesystem::path start) {
 
 std::string resolveRepoRoot() {
     // 1) explicit override — same convention worker_bridge.cpp / host/src/bootstrap.cpp use.
-    if (const char* env = std::getenv("AI_CAD_REPO"); env && *env) {
+    if (const char* env = std::getenv("CHUDWARE_REPO"); env && *env) {
         std::string root(env);
         if (fileExists(root + "/vendor/omp/bridge/src/bridge.ts")) return root;
     }
@@ -110,7 +110,7 @@ std::string resolveRepoRoot() {
 // bun resolution order: explicit override, common curl-installer/package-manager locations,
 // else bare "bun" (PATH search via execvp inside the forked child).
 std::string resolveBunExe() {
-    if (const char* env = std::getenv("AI_CAD_BUN"); env && *env) return std::string(env);
+    if (const char* env = std::getenv("CHUDWARE_BUN"); env && *env) return std::string(env);
     const std::string home = homeDir();
     if (!home.empty() && fileExists(home + "/.bun/bin/bun")) return home + "/.bun/bin/bun";
     if (fileExists("/usr/local/bin/bun")) return "/usr/local/bin/bun";
@@ -192,10 +192,10 @@ void OmpBridgeClient::reap() {
 bool OmpBridgeClient::resolvePaths(std::string& err) {
     if (pathsResolved_) return true;
     bunExe_ = resolveBunExe();
-    bridgeScript_ = envOr("AI_CAD_OMP_BRIDGE", resolveRepoRoot() + "/vendor/omp/bridge/src/bridge.ts");
+    bridgeScript_ = envOr("CHUDWARE_OMP_BRIDGE", resolveRepoRoot() + "/vendor/omp/bridge/src/bridge.ts");
     if (!fileExists(bridgeScript_)) {
         err = "OMP bridge script not found: " + bridgeScript_ +
-              " (set AI_CAD_OMP_BRIDGE to the script path, or AI_CAD_REPO to a checkout "
+              " (set CHUDWARE_OMP_BRIDGE to the script path, or CHUDWARE_REPO to a checkout "
               "containing vendor/omp/)";
         return false;
     }
@@ -414,6 +414,6 @@ bool OmpBridgeClient::call(const std::string& method, const json& params, json& 
 }
 
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware
 
 #endif  // !_WIN32

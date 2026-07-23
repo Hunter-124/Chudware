@@ -10,7 +10,7 @@
 
 #include "mechanical/mechanical.h"
 
-using namespace aicad::mechanical;
+using namespace chudware::mechanical;
 using nlohmann::json;
 
 TEST_CASE("gear_check: Shigley Ch. 14 worked example") {
@@ -95,8 +95,8 @@ TEST_CASE("dispatch: ownership + ok envelope") {
 }
 
 TEST_CASE("golden parity: every oracle fixture deep-equals (tests/data/mechanical.json)") {
-    std::ifstream f(std::string(AICAD_TEST_DATA_DIR) + "/mechanical.json");
-    REQUIRE_MESSAGE(f.good(), "mechanical.json golden not found at AICAD_TEST_DATA_DIR");
+    std::ifstream f(std::string(CHUDWARE_TEST_DATA_DIR) + "/mechanical.json");
+    REQUIRE_MESSAGE(f.good(), "mechanical.json golden not found at CHUDWARE_TEST_DATA_DIR");
     const json cases = json::parse(f);
     for (const json& c : cases) {
         CAPTURE(c["name"]);

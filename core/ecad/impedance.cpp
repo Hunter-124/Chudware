@@ -13,7 +13,7 @@
 
 #include "ecad/ops.h"  // OpError
 
-namespace aicad::ecad {
+namespace chudware::ecad {
 
 using nlohmann::json;
 
@@ -316,4 +316,4 @@ json track_impedance(const json& board, const json& track_or_net) {
                 {"delay_ps", delay_ps}};
 }
 
-}  // namespace aicad::ecad
+}  // namespace chudware::ecad

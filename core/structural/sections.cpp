@@ -9,7 +9,7 @@
 #include "structural/data_aisc.h"
 #include "structural/data_lumber.h"
 
-namespace aicad::structural {
+namespace chudware::structural {
 namespace {
 
 std::string key_upper(const std::string& s) {
@@ -65,4 +65,4 @@ std::optional<nlohmann::json> get_lumber_section(const std::string& nominal) {
     return std::nullopt;
 }
 
-}  // namespace aicad::structural
+}  // namespace chudware::structural

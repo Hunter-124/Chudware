@@ -13,7 +13,7 @@ no matter what the user toggles off — see services/mcp/tool_registry.py:deny_r
 How it works:
   1. Import services.mcp.server (real import, no stubs — core_bridge only loads the
      C++ core lazily inside call(), never at module import time, so this needs
-     neither libaicad nor a running daemon). This runs every register_*_tools(...)
+     neither libchudware nor a running daemon). This runs every register_*_tools(...)
      call site for real and populates tool_registry's process-wide catalog.
   2. Snapshot the live FastMCP tool names + catalog immediately after import, at
      MODULE level, before any other test module's fixtures get a chance to run.
@@ -126,7 +126,7 @@ class TestRegistrationCatalog(unittest.TestCase):
             enabled=True, timeout_s=None, max_calls_per_turn=None,
             param_defaults={}, prompt_note="",
         )
-        with patch.dict(os.environ, {"AI_CAD_TOOLS_ALLOW": "", "AI_CAD_TOOLS_DENY_RISK": ""}), \
+        with patch.dict(os.environ, {"CHUDWARE_TOOLS_ALLOW": "", "CHUDWARE_TOOLS_DENY_RISK": ""}), \
              patch.object(_cfg, "get_tool_options", lambda cfg, name: dict(default_opts)):
             # Baseline: family enabled (default) -> allowed.
             with patch.object(_cfg, "is_tool_family_enabled", lambda fam, cfg=None: True):

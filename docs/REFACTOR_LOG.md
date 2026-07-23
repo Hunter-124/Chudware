@@ -56,7 +56,7 @@ line was preserved as historical prose. `scripts/parity_audit.py` references
 Added `scripts/gate.sh` (executable, `set -euo pipefail`): runs `scripts/check.py`
 (recorded; pre-existing red is non-fatal via `CHECK_PY_FATAL=0` until the
 ribbon/parity gaps close), then the core CMake/Ninja build with
-`-DAICAD_WITH_OCCT=ON` + `ctest` (SKIP if system OCCT cmake config not found),
+`-DCHUDWARE_WITH_OCCT=ON` + `ctest` (SKIP if system OCCT cmake config not found),
 then engine+agent pytest (SKIP if no venv/pytest). Prints a PASS/SKIP summary
 and exits 0 on environment SKIPs. Added `CMakePresets.json` (`linux-core`,
 `linux-app`, Ninja) plus a minimal root `CMakeLists.txt` dispatcher so the
@@ -71,47 +71,47 @@ venv / pytest installed).
 
 **GUI cleanup — Feature Manager + Copilot (both shells):** Reworked the Copilot pane in `host/src/ui/legacy_chat.cpp` with a **Sessions** toggle (replaces New chat/Chats), per-session state (`Conversation.lastContextTokens`, `queuedPrompts`), a top bar for agent mode / permissions (offline + supervised + thoughts) / model-specific thinking effort, a single canonical model picker in the composer (footer provider chip removed), and `defaultContextWindowForModel()` for the context meter. Added `glassRowBackground()` in `host/src/ui_theme.*`, increased panel transparency (glass alpha 0.38), nested default planes under **Origin** in `host/src/ui/feature_tree.cpp`, and unified datum-plane icon mapping to `ref_plane` (feature tree, ribbon, PM forms, `surf_planar`). Mirrored the glass + Sessions UX in `app/src/ui/agent_panel.cpp`, `app/src/theme/theme.*`, and `app/src/ui/left_dock.cpp`. Regenerated procedural icon atlas via `make_icons.py` (refined `origin` + `ref_plane` glyphs; atlas PNGs updated). **Deferred:** true multi-worker concurrent agent runs (UI shows per-session running state but one worker job), Windows visual verify, full AI PNG icon set (`pack_icons.py` still 4/189 sources). **Gotcha:** `scripts/check.py` may FAIL-RECORD pre-existing ribbon/parity audits.
 
-**FM + Copilot GUI rectification (integrator wave):** Completed row-only transparency across host + `ui/imgui/`: removed full-panel `windowBg`+`glassBackground` washes from `layout.cpp` and Copilot (`legacy_chat.cpp`); added `glassRowAtCursor()` / `fmRowPill()` row pills on FM toolbar, tree chrome (Origin/planes/bodies/assembly), Explorer file rows, left-pane title + tab rail, and Copilot composer prelude/toolbar rows. Dock overlap fix: transparent `DockingEmptyBg` in `app.cpp`. Agent 2 delivered composer prelude (Design|Permissions + context meter) and toolbar (model|thinking|gear|send) in host + `agent_panel.cpp`. Agent 3 refreshed 68 FM/ribbon glyphs via `FM_REFRESH_MANIFEST` in `make_icons.py`, regenerated atlas PNGs/JSON, deduped `featureIcon` datum aliases, and nested Origin→planes in `app_state.cpp`. Added `docs/GUI_FM_COPILOT_OBJECTIVES.md` (acceptance criteria A–E). **Gate:** `bash scripts/gate.sh` PASS (check.py FAIL-RECORDED pre-existing). **Build:** `cmake -S host -B build/host && cmake --build build/host` PASS → `build/host/bin/AI-CAD`. **Deferred:** manual visual screenshot checklist, AI Settings pane full-panel wash (sibling tab; not in scope A).
+**FM + Copilot GUI rectification (integrator wave):** Completed row-only transparency across host + `ui/imgui/`: removed full-panel `windowBg`+`glassBackground` washes from `layout.cpp` and Copilot (`legacy_chat.cpp`); added `glassRowAtCursor()` / `fmRowPill()` row pills on FM toolbar, tree chrome (Origin/planes/bodies/assembly), Explorer file rows, left-pane title + tab rail, and Copilot composer prelude/toolbar rows. Dock overlap fix: transparent `DockingEmptyBg` in `app.cpp`. Agent 2 delivered composer prelude (Design|Permissions + context meter) and toolbar (model|thinking|gear|send) in host + `agent_panel.cpp`. Agent 3 refreshed 68 FM/ribbon glyphs via `FM_REFRESH_MANIFEST` in `make_icons.py`, regenerated atlas PNGs/JSON, deduped `featureIcon` datum aliases, and nested Origin→planes in `app_state.cpp`. Added `docs/GUI_FM_COPILOT_OBJECTIVES.md` (acceptance criteria A–E). **Gate:** `bash scripts/gate.sh` PASS (check.py FAIL-RECORDED pre-existing). **Build:** `cmake -S host -B build/host && cmake --build build/host` PASS → `build/host/bin/Chudware`. **Deferred:** manual visual screenshot checklist, AI Settings pane full-panel wash (sibling tab; not in scope A).
 
-**FM + Copilot follow-up (viewport HUD + readability):** Replaced the viewport heads-up toolbar's single `glassBackground` bar with per-button `glassRowBackground` pills, moved it to the top-right, shrunk icons (22dp), and added idle auto-fade (ramps on hover / zoom-area / open popups) in `host/src/ui/viewport_panel.cpp`. Boosted row readability: `glassRowBackground` default wash 0.28→0.42 with a faint border, brighter dark-theme `textDim`/`proseText`/`assistantName`, and assistant chat body copy now sits on a frosted row pill in `legacy_chat.cpp`. Mirrored wash/border in `app/src/theme/theme.*` + `ui/imgui/src/theme/theme.*`. **Build:** host `AI-CAD` PASS. **Check:** `scripts/check.py gui_lint theme` PASS. **Deferred:** manual screenshot verify of fade + chat contrast on bright viewport bleed.
+**FM + Copilot follow-up (viewport HUD + readability):** Replaced the viewport heads-up toolbar's single `glassBackground` bar with per-button `glassRowBackground` pills, moved it to the top-right, shrunk icons (22dp), and added idle auto-fade (ramps on hover / zoom-area / open popups) in `host/src/ui/viewport_panel.cpp`. Boosted row readability: `glassRowBackground` default wash 0.28→0.42 with a faint border, brighter dark-theme `textDim`/`proseText`/`assistantName`, and assistant chat body copy now sits on a frosted row pill in `legacy_chat.cpp`. Mirrored wash/border in `app/src/theme/theme.*` + `ui/imgui/src/theme/theme.*`. **Build:** host `Chudware` PASS. **Check:** `scripts/check.py gui_lint theme` PASS. **Deferred:** manual screenshot verify of fade + chat contrast on bright viewport bleed.
 
 **FM glass regression fix (undo/redo + rail + tree pills):** Root cause of broken undo/redo: `glassRowAtCursor()` before the FM toolbar is draw-only and never advanced the layout cursor, so the full-width `##fm_filter` InputText was placed at the same Y and stole hit-tests from the toolbar (undo/redo last). Fixed in `host/src/ui/feature_tree.cpp` by reserving the toolbar row with explicit screen-space button placement + `Dummy` advance; filter row gets the same reserved-height pattern. `fmRowPill()` now uses `GetFrameHeightWithSpacing()` + explicit `glassRowBackground()` wash (0.26 idle / 0.42 selected) so tree icon rows read consistently. Toolbar icon buttons always show a subtle pill (stronger on hover). Left tab rail (`layout.cpp`) and `ui/imgui` activity rail now draw persistent frosted pills on every icon (0.20 idle, 0.32 hover, 0.40 selected). **Build:** `cmake --build build/host` PASS. **Check:** `gui_lint --rule theme` PASS.
 
 ### F3 — platform layer
-Consolidated OS shims into `platform/`: `dialogs.h` + `dialogs_win32.cpp` / `dialogs_linux.cpp` (ported from `host/src/ui/file_dialog.*`, incl. `AI_CAD_NO_FILE_DIALOGS` stub + kdialog/zenity POSIX backend); `window.h` + `window_win32.cpp` / `window_linux.cpp` (borderless chrome from `host/src/win_chrome.*`, GLFW X11 init hint on Linux); `paths.h` + per-OS `paths_*.cpp` (`exeDir`, `userDataDir`, `appDataRoot`, `configPath`, `imguiIniPath`, `documentsDir`, `resourcesDir`); `dpi.h`/`dpi.cpp` (`contentScale` + `AI_CAD_SCALE`); `resources.h`/`resources.cpp` (`setWindowIcon` via stb). Replaced inline Win32 in `ui/imgui/src/platform/file_dialog.*` with thin CAD-filter wrappers delegating to `platform/dialogs.h` — zero `#ifdef _WIN32` outside `platform/` and `ui/imgui/src/platform/`. **Deferred:** CMake static lib + include paths (G1); `main.cpp`/`application.cpp` still duplicate `exeDir`/GLFW init/DPI until G1 wires `platform::*`. **Gotcha:** `ui/imgui` will not link until G1 adds `platform/*.cpp` to the target and `${REPO}` to `target_include_directories`.
+Consolidated OS shims into `platform/`: `dialogs.h` + `dialogs_win32.cpp` / `dialogs_linux.cpp` (ported from `host/src/ui/file_dialog.*`, incl. `CHUDWARE_NO_FILE_DIALOGS` stub + kdialog/zenity POSIX backend); `window.h` + `window_win32.cpp` / `window_linux.cpp` (borderless chrome from `host/src/win_chrome.*`, GLFW X11 init hint on Linux); `paths.h` + per-OS `paths_*.cpp` (`exeDir`, `userDataDir`, `appDataRoot`, `configPath`, `imguiIniPath`, `documentsDir`, `resourcesDir`); `dpi.h`/`dpi.cpp` (`contentScale` + `CHUDWARE_SCALE`); `resources.h`/`resources.cpp` (`setWindowIcon` via stb). Replaced inline Win32 in `ui/imgui/src/platform/file_dialog.*` with thin CAD-filter wrappers delegating to `platform/dialogs.h` — zero `#ifdef _WIN32` outside `platform/` and `ui/imgui/src/platform/`. **Deferred:** CMake static lib + include paths (G1); `main.cpp`/`application.cpp` still duplicate `exeDir`/GLFW init/DPI until G1 wires `platform::*`. **Gotcha:** `ui/imgui` will not link until G1 adds `platform/*.cpp` to the target and `${REPO}` to `target_include_directories`.
 
 ### G0 — GUI unification integrator prep
-Local baseline commit before Wave 1: added `ui/imgui/build/` to `.gitignore`; committed untracked `ui/viewport/**` scaffold (`renderer.h`, `mesh.*`, `camera_anim.*`, `render/{aicm_loader,id_pass,overlays}.*`, `vec_math.h`) plus MSVC 14.51 `/FI extern/fix_math.h` fix in `host/CMakeLists.txt` and incidental tools/docs path edits. Wrote monolithic swarm spec `docs/GUI_MIGRATION_DAG.md` (all nodes G0→X1 with write-sets, sources, verify commands) and `docs/GLASS_DESIGN_SPEC.md` (4 material levels, 8pt grid, `glassPanel`/`adaptiveSurface`, per-panel rules, P1 acceptance criteria). Captured 21/21 host `AI_CAD_SHOT` baselines into `scratch/gui_baseline/*.png` via `host/build-linux/bin/AI-CAD` (`flow` needs ~240s timeout for CFD frames; all others <120s). **Deferred:** Wave 1 leaves (F1–F4), `ui/viewport/renderer.cpp` + CMakeLists, Kawase blur. **Gotcha:** `ui/viewport/render/id_pass.*` and `overlays.*` still `#include` host `renderer.h` — F1 must break this first; `ui/imgui` still leeches `host/build-linux/_deps`.
+Local baseline commit before Wave 1: added `ui/imgui/build/` to `.gitignore`; committed untracked `ui/viewport/**` scaffold (`renderer.h`, `mesh.*`, `camera_anim.*`, `render/{aicm_loader,id_pass,overlays}.*`, `vec_math.h`) plus MSVC 14.51 `/FI extern/fix_math.h` fix in `host/CMakeLists.txt` and incidental tools/docs path edits. Wrote monolithic swarm spec `docs/GUI_MIGRATION_DAG.md` (all nodes G0→X1 with write-sets, sources, verify commands) and `docs/GLASS_DESIGN_SPEC.md` (4 material levels, 8pt grid, `glassPanel`/`adaptiveSurface`, per-panel rules, P1 acceptance criteria). Captured 21/21 host `CHUDWARE_SHOT` baselines into `scratch/gui_baseline/*.png` via `host/build-linux/bin/Chudware` (`flow` needs ~240s timeout for CFD frames; all others <120s). **Deferred:** Wave 1 leaves (F1–F4), `ui/viewport/renderer.cpp` + CMakeLists, Kawase blur. **Gotcha:** `ui/viewport/render/id_pass.*` and `overlays.*` still `#include` host `renderer.h` — F1 must break this first; `ui/imgui` still leeches `host/build-linux/_deps`.
 
 ### F1 — viewport library (`ui/viewport/**`)
-Ported `host/src/renderer.cpp` (1618 LOC) to `ui/viewport/renderer.cpp`; added framework-neutral `worldToScreen` / `screenRay` (+ `ViewportScreen` / `ScreenPt`) on `renderer.h`. Fixed `render/id_pass.h` and `render/overlays.h` to include local `../renderer.h` (zero `host/src` includes under `ui/viewport/`). Added standalone `CMakeLists.txt` static lib `aicad_ui_viewport` (glad from `host/extern/glad`, OpenGL). Implemented `GlViewport` (`viewport_impl.*`) as `aicad::ui::IViewport` adapter over `Renderer` + `render::IdPass`. NEW: Kawase-blur backdrop FBO chain (¼-res downsample + 4 passes) on the resolve target, exported via `Renderer::backdrop()` / `GlViewport::backdrop()`; `averageLuminance(ViewportRect)` samples the resolve FBO (Rec.709, capped readback). **Verify:** `CCACHE_DISABLE=1 cmake -S ui/viewport -B build/viewport && cmake --build build/viewport` PASS → `libaicad_ui_viewport.a`. **Deferred:** G1 CMake rewire (`ui/imgui` link + glad FetchContent), `IViewport::backdrop()` on abstract seam (F2 consumes via `GlViewport`), runtime GL smoke. **Gotcha:** sandbox `ccache` may block builds — use `CCACHE_DISABLE=1`; glad path still references `host/extern/glad` until G1 vendors it under `ui/viewport/`.
+Ported `host/src/renderer.cpp` (1618 LOC) to `ui/viewport/renderer.cpp`; added framework-neutral `worldToScreen` / `screenRay` (+ `ViewportScreen` / `ScreenPt`) on `renderer.h`. Fixed `render/id_pass.h` and `render/overlays.h` to include local `../renderer.h` (zero `host/src` includes under `ui/viewport/`). Added standalone `CMakeLists.txt` static lib `chudware_ui_viewport` (glad from `host/extern/glad`, OpenGL). Implemented `GlViewport` (`viewport_impl.*`) as `chudware::ui::IViewport` adapter over `Renderer` + `render::IdPass`. NEW: Kawase-blur backdrop FBO chain (¼-res downsample + 4 passes) on the resolve target, exported via `Renderer::backdrop()` / `GlViewport::backdrop()`; `averageLuminance(ViewportRect)` samples the resolve FBO (Rec.709, capped readback). **Verify:** `CCACHE_DISABLE=1 cmake -S ui/viewport -B build/viewport && cmake --build build/viewport` PASS → `libchudware_ui_viewport.a`. **Deferred:** G1 CMake rewire (`ui/imgui` link + glad FetchContent), `IViewport::backdrop()` on abstract seam (F2 consumes via `GlViewport`), runtime GL smoke. **Gotcha:** sandbox `ccache` may block builds — use `CCACHE_DISABLE=1`; glad path still references `host/extern/glad` until G1 vendors it under `ui/viewport/`.
 
 ### F3 — platform layer
-Consolidated OS-specific GUI shims into `platform/` + thin AI-CAD2 wrappers. Added `platform/dialogs.h` + `dialogs_win32.cpp` / `dialogs_linux.cpp` (ported from `host/src/ui/file_dialog.*`, including `AI_CAD_NO_FILE_DIALOGS` headless stub), `platform/window.h` + `window_win32.cpp` / `window_linux.cpp` (from `host/src/win_chrome.*` + Linux X11 GLFW hints from `host/src/app.cpp`), `platform/paths.h` + `paths_win32.cpp` / `paths_linux.cpp` (`exeDir`, `appdataDir`/`appdataRoot`, `configPath`, `cacheDir`, `tempDir`, `imguiIniPath`, `documentsDir`, `resourcesDir`), `platform/resources.h` + `resources.cpp` (`setWindowIcon` from `host/src/core/app_state.cpp`), `platform/dpi.h` + `dpi.cpp` (GLFW content scale + `AI_CAD_SCALE`), and `platform/CMakeLists.txt` (`aicad_platform` static lib). Rewrote `ui/imgui/src/platform/file_dialog.*` as CAD filter wrappers with zero OS `#ifdef`. **Deferred (G1):** wire `add_subdirectory(platform)` + `target_link_libraries(AI-CAD2 aicad_platform glfw)` in `ui/imgui/CMakeLists.txt`; add `-I${REPO}/platform` include path; migrate `main.cpp`/`application.cpp` off local `exeDir`/`#ifdef _WIN32` to `paths.h`/`window.h`/`dpi.h`; host panels still call `host/src/ui/file_dialog.h` until shell migration (S6+). **Gotcha:** Linux file dialogs still require `kdialog` or `zenity` on PATH; macOS `exeDir` uses `_NSGetExecutablePath`.
+Consolidated OS-specific GUI shims into `platform/` + thin AI-CAD2 wrappers. Added `platform/dialogs.h` + `dialogs_win32.cpp` / `dialogs_linux.cpp` (ported from `host/src/ui/file_dialog.*`, including `CHUDWARE_NO_FILE_DIALOGS` headless stub), `platform/window.h` + `window_win32.cpp` / `window_linux.cpp` (from `host/src/win_chrome.*` + Linux X11 GLFW hints from `host/src/app.cpp`), `platform/paths.h` + `paths_win32.cpp` / `paths_linux.cpp` (`exeDir`, `appdataDir`/`appdataRoot`, `configPath`, `cacheDir`, `tempDir`, `imguiIniPath`, `documentsDir`, `resourcesDir`), `platform/resources.h` + `resources.cpp` (`setWindowIcon` from `host/src/core/app_state.cpp`), `platform/dpi.h` + `dpi.cpp` (GLFW content scale + `CHUDWARE_SCALE`), and `platform/CMakeLists.txt` (`chudware_platform` static lib). Rewrote `ui/imgui/src/platform/file_dialog.*` as CAD filter wrappers with zero OS `#ifdef`. **Deferred (G1):** wire `add_subdirectory(platform)` + `target_link_libraries(AI-CAD2 chudware_platform glfw)` in `ui/imgui/CMakeLists.txt`; add `-I${REPO}/platform` include path; migrate `main.cpp`/`application.cpp` off local `exeDir`/`#ifdef _WIN32` to `paths.h`/`window.h`/`dpi.h`; host panels still call `host/src/ui/file_dialog.h` until shell migration (S6+). **Gotcha:** Linux file dialogs still require `kdialog` or `zenity` on PATH; macOS `exeDir` uses `_NSGetExecutablePath`.
 
 ### F4 — worker / state seam
-Ported `host/src/core/{doc_mirror,async_rpc,selection,jobs,sim_client}.*` + `host/src/bootstrap.*` into `services/worker/` with GL-free `pick_hit.h`, shared `worker_types.h` (JobState/AgentEvent/parseParts), `doc_session.h`, `doc_tabs.{h,cpp}`, and `worker_command_dispatcher.{h,cpp}` (`ICommandDispatcher` → WorkerClient+DocMirror). Fixed includes (`worker_client.h`, `cpp_core.h`, no `host/render/id_pass.h`). Replaced `ui/imgui` direct `cpp_core` shortcut with `app/doc_engine.{h,cpp}` — `eng::Engine` facade over WorkerClient (libaicad routing + Python-oracle fallback). `app_state.*` now owns WorkerClient, DocMirror, AsyncRpc, SimClient, JobState, Selection, core::DocTab sessions; wires `DocViewModel`/`ActionBus`/`WorkerCommandDispatcher`; `application.cpp` drains `rpc` each frame and shuts down worker on exit. **Deferred (G1):** CMake — add all `services/worker/*.cpp` + `app/doc_engine.cpp` to `AI-CAD2`, `-I${REPO}/services/worker`, drop duplicate `engine/engine.cpp` cpp_core path or keep as dead code until panel migration; `AI_CAD_SHOT=tree|m1` smoke. **Gotcha:** `ui/imgui/src/engine/engine.cpp` still exists and is still in the CMake glob — G1 should exclude it or delete to avoid duplicate `eng::Engine` symbols; panels still call `s.engine.*` via the new facade header included from `app_state.h`.
+Ported `host/src/core/{doc_mirror,async_rpc,selection,jobs,sim_client}.*` + `host/src/bootstrap.*` into `services/worker/` with GL-free `pick_hit.h`, shared `worker_types.h` (JobState/AgentEvent/parseParts), `doc_session.h`, `doc_tabs.{h,cpp}`, and `worker_command_dispatcher.{h,cpp}` (`ICommandDispatcher` → WorkerClient+DocMirror). Fixed includes (`worker_client.h`, `cpp_core.h`, no `host/render/id_pass.h`). Replaced `ui/imgui` direct `cpp_core` shortcut with `app/doc_engine.{h,cpp}` — `eng::Engine` facade over WorkerClient (libchudware routing + Python-oracle fallback). `app_state.*` now owns WorkerClient, DocMirror, AsyncRpc, SimClient, JobState, Selection, core::DocTab sessions; wires `DocViewModel`/`ActionBus`/`WorkerCommandDispatcher`; `application.cpp` drains `rpc` each frame and shuts down worker on exit. **Deferred (G1):** CMake — add all `services/worker/*.cpp` + `app/doc_engine.cpp` to `AI-CAD2`, `-I${REPO}/services/worker`, drop duplicate `engine/engine.cpp` cpp_core path or keep as dead code until panel migration; `CHUDWARE_SHOT=tree|m1` smoke. **Gotcha:** `ui/imgui/src/engine/engine.cpp` still exists and is still in the CMake glob — G1 should exclude it or delete to avoid duplicate `eng::Engine` symbols; panels still call `s.engine.*` via the new facade header included from `app_state.h`.
 
 ### F2 — theme / liquid glass
 Ported host `ui_theme.*` glass system into `ui/imgui/src/theme/{tokens.h,theme.h,theme.cpp}` per `docs/GLASS_DESIGN_SPEC.md`. **tokens.h:** `MaterialLevel` (4 materials with tintAlpha + blurPasses), 8pt `Space` grid (`Metrics.grid=8`), SF-like `TypeScale`, `rowWash` constants (0.26/0.32/0.42), glass roles (`glassBg/Border/Highlight/Shadow`), vibrancy light/dark text tokens, `accentSoft`/`accentMid`, `roleU32` helpers. **theme.h/cpp:** 5-layer `glassBackground()` (+ alpha variant), `pushGlass{Tooltip,Window,Child}Style` pops, host-faithful `glassRowBackground`/`glassRowAtCursor`, `adaptiveSurface(luminance)` (thresholds 0.35/0.65), `glassPanel(level,rect)` (Kawase via `setViewportBackdrop` when valid, else layered fallback), `ViewportBackdrop` stub. `apply()` maps `PopupBg→glassBg`, `DockingEmptyBg` transparent, font sizes from type scale. **Verify:** `python3 scripts/gui_lint.py --rule theme ui/imgui/src` clean; `theme.cpp.o` builds. **Deferred:** F1 Kawase blur + `averageLuminance(rect)` wiring, ~40 host palette roles (sketch/console/diff/viewport-edge), panel consumption of `glassPanel`/`adaptiveSurface` (S*/C*/P1), `loadFonts` CADSymbols merge. **Gotcha:** `U()` is now 8px units (was 4px); default row wash 0.26 idle — explicit wash callers (rail 0.20/0.32/0.40) unchanged.
 
 ### S3 — ribbon + context toolbar
-Ported `host/src/ui/widgets/ribbon.cpp` + `ribbon_def.cpp` into registry-driven `ui/imgui/src/ui/{ribbon,context_toolbar}.*` (~520 LOC). **No `ribbon_def`** — all verbs/flyouts come from `ui/abstract/command_registry.*` (Top + Flyout kinds; Variants palette-only). `workspace_bar.cpp` owns the old ribbon tab strip (workspaces); `ribbon::drawBody` renders SolidWorks-style grouped 52dp big buttons with split-arrow flyouts, last-used variant memory, sketch_exit↔sketch_new swap, group captions, priority overflow chevron, and `mat.thin` `glassPanel` background per GLASS_DESIGN_SPEC §6. `ribbon::applyShotEnv` maps host `AI_CAD_TAB` 0..12 → workspace/sketch/drawing doc-type for screenshot parity. **Coverage vs host `ribbon_def`:** 181/225 cmd_ids present in registry (80%); 44 host-only gaps — Manufacture/CAM tab (26 cmds), Appearance material presets + display styles (12), polygon flyout variants (6); registry adds 9 ids host ribbon lacked (`prim_*`, consolidated `appearance_edit`/`view_style`). **Deferred (G2/C6):** CMake source list for `ribbon.cpp`; `AI_CAD_SHOT=ribbon` scenario harness; small-button column layout + material swatches + rich tooltips; registry append for CAM/appearance cmds.
+Ported `host/src/ui/widgets/ribbon.cpp` + `ribbon_def.cpp` into registry-driven `ui/imgui/src/ui/{ribbon,context_toolbar}.*` (~520 LOC). **No `ribbon_def`** — all verbs/flyouts come from `ui/abstract/command_registry.*` (Top + Flyout kinds; Variants palette-only). `workspace_bar.cpp` owns the old ribbon tab strip (workspaces); `ribbon::drawBody` renders SolidWorks-style grouped 52dp big buttons with split-arrow flyouts, last-used variant memory, sketch_exit↔sketch_new swap, group captions, priority overflow chevron, and `mat.thin` `glassPanel` background per GLASS_DESIGN_SPEC §6. `ribbon::applyShotEnv` maps host `CHUDWARE_TAB` 0..12 → workspace/sketch/drawing doc-type for screenshot parity. **Coverage vs host `ribbon_def`:** 181/225 cmd_ids present in registry (80%); 44 host-only gaps — Manufacture/CAM tab (26 cmds), Appearance material presets + display styles (12), polygon flyout variants (6); registry adds 9 ids host ribbon lacked (`prim_*`, consolidated `appearance_edit`/`view_style`). **Deferred (G2/C6):** CMake source list for `ribbon.cpp`; `CHUDWARE_SHOT=ribbon` scenario harness; small-button column layout + material swatches + rich tooltips; registry append for CAM/appearance cmds.
 
 ### S6 — files / settings / profiler
 Ported `host/src/ui/file_explorer.*`, `settings_modal.*`, and `profiler_window.*` into `ui/imgui/src/ui/` with `theme::` glass row pills (Explorer), `mat.thick` settings sheet, and profiler flame graph. Explorer uses `platform::documentsDir`/`appdataRoot` for workspace default (no OS `#ifdef`); settings persist via `platform::configPath()` into module `AppSettings`/`settingsUi()` until G2 lifts flags onto `AppState`. File open dispatches through `takeExplorerOpenRequest()`; `left_dock.cpp` calls `drawFileExplorerBody` when `railTab == kFilesRailTab`. Profiler drives `core::cpp_core()` `prof_*` RPCs. AI settings tab uses a simplified provider picker (full `drawProviderModelPicker` + `model_registry.h` land with C3). **Deferred (G2):** wire `drawSettingsModal`/`drawProfilerWindow` in `application.cpp`, CMake source list, `AppState` fields (`openSettings`, `showAbout`, …), Ctrl+C/V explorer routing, viewport file-drop target (`kFileDragPayload`). **Gotcha:** `settings_modal.cpp` owns config.json read/write — merge with F4 if worker settings move to `services/worker/`.
 
 ### G1 — integrator: CMake rewire (Wave 1)
-Integrated F1–F4 into AI-CAD2: root `CMakeLists.txt` now builds `glad` + `ui/viewport` + `ui/imgui` under `linux-app` preset; `ui/imgui/CMakeLists.txt` owns FetchContent for glfw/imgui/json/stb (no `host/build/_deps`), links `aicad_platform`, `aicad_ui_viewport`, and all `services/worker/*.cpp`; excludes duplicate `engine/engine{,_pick,_sketch}.cpp` (F4 `doc_engine.cpp` is the sole `eng::Engine`). `platform/CMakeLists.txt` wires glfw + stb includes + `${REPO}` for `#include <platform/...>`; fixed `window.h`/`dpi.h` API drift vs implementations. `main.cpp` migrated to `platform::{initGlfwPlatform,applyBorderlessWindowHints,contentScale,resourcesDir,installWindowChrome,tickWindowChrome}`; `application.cpp` owns `GlViewport` and feeds F2 `theme::setViewportBackdrop()` from Kawase backdrop each frame (legacy `viewport::Scene` still drives the ImGui texture until C4). `scripts/gate.sh` stage 5 builds `linux-app` + `AI-CAD2 --shot` (xvfb-run when headless) + `--selftest` when libaicad built. Bounce-fix: `PlanInfo`/`parsePlan` in `worker_types.*` for `jobs.cpp`; `theme.h` `<cstdint>` + `ImTextureID` cast; stb impl consolidated in `stb_impl.cpp`. **Verify:** `cmake --preset linux-app && cmake --build build/linux-app` PASS → `build/linux-app/bin/AI-CAD2`; `AI_CAD_NO_FILE_DIALOGS=1 AI-CAD2 --shot /tmp/aicad2-g1.png --frames 12` PASS; `--selftest` PASS (libaicad); `bash scripts/gate.sh` PASS (check.py FAIL-RECORDED pre-existing, pytest SKIP). **Deferred (Wave 2):** replace `viewport::Scene` with `GlViewport` in `viewport.cpp`; shell panels (S1–S6); glad still vendored from `host/extern/glad`; `AI_CAD_SHOT=*` scenario harness (C6); Windows preset (X1). **Gotcha:** headless shot needs `xvfb-run` or a real DISPLAY; standalone `cmake -S ui/imgui` works but reuses its own FetchContent cache.
+Integrated F1–F4 into AI-CAD2: root `CMakeLists.txt` now builds `glad` + `ui/viewport` + `ui/imgui` under `linux-app` preset; `ui/imgui/CMakeLists.txt` owns FetchContent for glfw/imgui/json/stb (no `host/build/_deps`), links `chudware_platform`, `chudware_ui_viewport`, and all `services/worker/*.cpp`; excludes duplicate `engine/engine{,_pick,_sketch}.cpp` (F4 `doc_engine.cpp` is the sole `eng::Engine`). `platform/CMakeLists.txt` wires glfw + stb includes + `${REPO}` for `#include <platform/...>`; fixed `window.h`/`dpi.h` API drift vs implementations. `main.cpp` migrated to `platform::{initGlfwPlatform,applyBorderlessWindowHints,contentScale,resourcesDir,installWindowChrome,tickWindowChrome}`; `application.cpp` owns `GlViewport` and feeds F2 `theme::setViewportBackdrop()` from Kawase backdrop each frame (legacy `viewport::Scene` still drives the ImGui texture until C4). `scripts/gate.sh` stage 5 builds `linux-app` + `AI-CAD2 --shot` (xvfb-run when headless) + `--selftest` when libchudware built. Bounce-fix: `PlanInfo`/`parsePlan` in `worker_types.*` for `jobs.cpp`; `theme.h` `<cstdint>` + `ImTextureID` cast; stb impl consolidated in `stb_impl.cpp`. **Verify:** `cmake --preset linux-app && cmake --build build/linux-app` PASS → `build/linux-app/bin/AI-CAD2`; `CHUDWARE_NO_FILE_DIALOGS=1 AI-CAD2 --shot /tmp/aicad2-g1.png --frames 12` PASS; `--selftest` PASS (libchudware); `bash scripts/gate.sh` PASS (check.py FAIL-RECORDED pre-existing, pytest SKIP). **Deferred (Wave 2):** replace `viewport::Scene` with `GlViewport` in `viewport.cpp`; shell panels (S1–S6); glad still vendored from `host/extern/glad`; `CHUDWARE_SHOT=*` scenario harness (C6); Windows preset (X1). **Gotcha:** headless shot needs `xvfb-run` or a real DISPLAY; standalone `cmake -S ui/imgui` works but reuses its own FetchContent cache.
 
 ### S5 — icons atlas + cursors
 Ported host icon loader (`host/src/ui/icons.cpp`) into `ui/imgui/src/theme/icons.{h,cpp}`: `ui::loadIcons`/`getIcon`/`IconUV` with dual-theme atlases, `@32`/`@20` cell keys, size fallback, and `theme::ctx().dark` texture selection; retained `icons::` shell wrappers (`initAtlas`, `draw`, `inlineIcon`) with alias map + hand-drawn chrome glyphs + monogram fallback. Regenerated atlas via `host/assets/make_icons.py` (189 names × 2 sizes = 378 cells, 56×6426 px) and copied `atlas_dark.png`, `atlas_light.png`, `atlas.json` to `ui/imgui/resources/icons/` (parity with host manifest). Ported `host/src/ui/cursors.{h,cpp}` → `ui/imgui/src/ui/cursors.*` with module-local `requestCursor`/`applyCursorRequest` (host used `AppState` fields). **Deferred:** wire `initCursors`/`applyCursorRequest` in `application.cpp`; add `cursors.cpp` to CMake glob; `AppState::requestCursor` shim optional. **Gotcha:** `gui_lint icons` still reads `host/assets/icons/atlas.json`; runtime loads from `platform::resourcesDir()/icons/`.
 
 ### S2 — title bar + doc tabs
-Ported `host/src/ui/title_bar.*` and `host/src/ui/doc_tabs.*` into `ui/imgui/src/ui/{title_bar,doc_tabs}.{h,cpp}`. **title_bar:** SolidWorks-style File/Edit/View/Insert/Help menus inside `BeginMenuBar` child (no doc tabs — those moved to viewport band per host latest); caption min/max/close with palette tokens; narrow-window Menu rollup; Search opens command palette. **doc_tabs:** Browser-style strip with deferred switch/close/save; `glassPanel(Thin)` full band over viewport, per-tab `Regular`/`UltraThin`/`Thin` pills with accent underline + group borders; "+" New chooser popup; unsaved-changes modal; `createNewDoc`/`saveDocTab`/`openNewDocChooser` bound to F4 `core::DocTab` + `AppState::{switchToTab,addDocTab,doSave}`. Updated `panels.h` exports. **Deferred (G2/C4):** wire `drawDocTabs` at top of `viewport.cpp` (hide dock tab bar via `ImGuiDockNodeFlags_NoTabBar`); `ui/imgui/CMakeLists.txt` add `doc_tabs.cpp`; Ctrl+N → `openNewDocChooser()` in `application.cpp`; `averageLuminance(rect)` per-tab adaptive tint when GlViewport replaces Scene; full host menu parity (Export/Recent/Save All, Insert/Tools/Window stubs). **Gotcha:** doc tabs removed from title bar — integrator must hook viewport before `AI_CAD_SHOT=multidoc` verify.
+Ported `host/src/ui/title_bar.*` and `host/src/ui/doc_tabs.*` into `ui/imgui/src/ui/{title_bar,doc_tabs}.{h,cpp}`. **title_bar:** SolidWorks-style File/Edit/View/Insert/Help menus inside `BeginMenuBar` child (no doc tabs — those moved to viewport band per host latest); caption min/max/close with palette tokens; narrow-window Menu rollup; Search opens command palette. **doc_tabs:** Browser-style strip with deferred switch/close/save; `glassPanel(Thin)` full band over viewport, per-tab `Regular`/`UltraThin`/`Thin` pills with accent underline + group borders; "+" New chooser popup; unsaved-changes modal; `createNewDoc`/`saveDocTab`/`openNewDocChooser` bound to F4 `core::DocTab` + `AppState::{switchToTab,addDocTab,doSave}`. Updated `panels.h` exports. **Deferred (G2/C4):** wire `drawDocTabs` at top of `viewport.cpp` (hide dock tab bar via `ImGuiDockNodeFlags_NoTabBar`); `ui/imgui/CMakeLists.txt` add `doc_tabs.cpp`; Ctrl+N → `openNewDocChooser()` in `application.cpp`; `averageLuminance(rect)` per-tab adaptive tint when GlViewport replaces Scene; full host menu parity (Export/Recent/Save All, Insert/Tools/Window stubs). **Gotcha:** doc tabs removed from title bar — integrator must hook viewport before `CHUDWARE_SHOT=multidoc` verify.
 
 ### S4 — status / toast / shortcut / palette
-Ported `host/src/ui/{status_bar,toast,shortcut_bar,command_search}.*` into `ui/imgui/src/ui/` with Glass styling per `docs/GLASS_DESIGN_SPEC.md`. **status_bar.cpp:** solid `bg0` bar (not glass); pulsing status dot (good/warn/bad inferred from status text); agent live-phase + sim progress chips on `glassBackground` pills; SW-style right cluster (view style, MMGS/IPS toggle, editing mode, provider/model stub); sim chip click switches to `Simulate` workspace; `AI_CAD_SIMPROG` smoke hook. **toast.{h,cpp}:** module-local queue + `postToast()`/`drawToasts()`; `glassPanel(Regular)` cards with fade-out alpha + accent bar; click copies to clipboard. **shortcut_bar.{h,cpp}:** 'S' key floating toolbar (model vs sketch command tables); `glassPanel(Regular)` pill + per-button hover row pills; dispatches via `AppState::dispatch`. **command_search.{h,cpp}:** centered glass search popup with `icontains` filter over `cmd::palette()` + `kSettingsEntries`; `requestOpenSettings`/`takeOpenSettingsRequest` seam for S6. **command_palette.cpp:** extended Ctrl+K palette with host search patterns (label/id/workspace/group/keywords scoring + settings section), glass window + row pills, unified command+settings results. **Deferred (G2):** wire `drawToasts`, `drawCommandSearch`, `ShortcutBar` in `application.cpp`; move toast queue onto `AppState` for worker errorSink; `panels.h` exports; settings modal consumes `takeOpenSettingsRequest`; full provider/model from settings; sketch DOF status line when H5 lands. **Gotcha:** no CMake/build this node — new `.cpp` files need G2 glob; title-bar Search still opens palette not command_search until integrator switches it.
+Ported `host/src/ui/{status_bar,toast,shortcut_bar,command_search}.*` into `ui/imgui/src/ui/` with Glass styling per `docs/GLASS_DESIGN_SPEC.md`. **status_bar.cpp:** solid `bg0` bar (not glass); pulsing status dot (good/warn/bad inferred from status text); agent live-phase + sim progress chips on `glassBackground` pills; SW-style right cluster (view style, MMGS/IPS toggle, editing mode, provider/model stub); sim chip click switches to `Simulate` workspace; `CHUDWARE_SIMPROG` smoke hook. **toast.{h,cpp}:** module-local queue + `postToast()`/`drawToasts()`; `glassPanel(Regular)` cards with fade-out alpha + accent bar; click copies to clipboard. **shortcut_bar.{h,cpp}:** 'S' key floating toolbar (model vs sketch command tables); `glassPanel(Regular)` pill + per-button hover row pills; dispatches via `AppState::dispatch`. **command_search.{h,cpp}:** centered glass search popup with `icontains` filter over `cmd::palette()` + `kSettingsEntries`; `requestOpenSettings`/`takeOpenSettingsRequest` seam for S6. **command_palette.cpp:** extended Ctrl+K palette with host search patterns (label/id/workspace/group/keywords scoring + settings section), glass window + row pills, unified command+settings results. **Deferred (G2):** wire `drawToasts`, `drawCommandSearch`, `ShortcutBar` in `application.cpp`; move toast queue onto `AppState` for worker errorSink; `panels.h` exports; settings modal consumes `takeOpenSettingsRequest`; full provider/model from settings; sketch DOF status line when H5 lands. **Gotcha:** no CMake/build this node — new `.cpp` files need G2 glob; title-bar Search still opens palette not command_search until integrator switches it.
 
 ### S1 — layout / dock / rail
 Ported `host/src/ui/layout.cpp` `buildDefaultLayout()` into `ui/imgui/src/ui/{layout.h,layout.cpp}` with pixel-clamped left/right fractions (`theme::S()` panel scale), `NoUndocking` on the left node, AI-CAD2 window names (`Browser###left`, `Viewport###viewport`, `Assistant###agent`), ECAD/CAM central pre-registration, and host task-pane dialog names in the lower-right slot. Added `ui::drawDockSplitters()` — recursive dock-node walk drawing 1px `palette.line` at 0.35 alpha (fixes invisible splitters, no accent/yellow ImGui separator bleed). **application.cpp:** replaced inline `buildDockLayout` with `buildDefaultLayout` + per-frame `drawDockSplitters`; transparent `DockingEmptyBg`/`WindowBg` plus zero-alpha `Separator*` during dock host; dock size passed as content width × `midH`. **Deferred (G2):** `AppState::resetLayout` + title-bar “Reset layout” → rebuild; port `drawLeftPane()` (tab strip + PM auto-switch) when C1/S6 panels land — activity rail glass pills remain in `left_dock.cpp` (0.20/0.32/0.40); merge external `##rail` with in-pane SW tab strip or keep dual chrome per integrator choice; `drawConfigurationsBody` stub. **Gotcha:** `layout.cpp` picked up by CMake GLOB — no list edit needed; `application.h` dropped dead `buildDockLayout` decl (minimal bounce); host `FeatureManager##LeftPane` name not used — G2 may alias Browser window if screenshot parity requires it.
@@ -120,25 +120,25 @@ Ported `host/src/ui/layout.cpp` `buildDefaultLayout()` into `ui/imgui/src/ui/{la
 Split `host/src/ui/sketch_mode.cpp` (8216 LOC) + `sketch_mode.h` + `airfoil.*` into `ui/imgui/src/ui/sketch/{sketch_mode.h,sketch_mode.cpp,sketch_tools.cpp,sketch_constraints.cpp,sketch_overlay.cpp,sketch_edit.cpp,sketch_internal.*,sketch_seam.*,sketch_palette.h,airfoil.*}` (~7913 LOC implementation + seam). **Camera:** removed host-local `worldToScreen`/`screenRay`/`invert4x4`; all projection goes through `ui/viewport/renderer.h` via `sketch_internal.h` ImVec2 wrappers (`::worldToScreen` / `::screenRay` on `Renderer::CameraXform` + `ViewportScreen`). **F4 seam:** `ui::sketch::SketchHost` bridges `app::AppState` + `WorkerClient`/`DocMirror` + `Renderer*` (toast→status, `loadDocMesh`→`scene::loadAicm`, clipboard/camera/pick fields local until AppState grows them); `SketchPmSeam` stub until C2 PropertyManager. **Core tools:** enter/exit/solve/drag, ribbon dispatch, line/rect/circle/arc/slot/smart-dim overlay path, constraints/dims, ghosts/region pickers — all present in split TUs. **Deferred (G2/G4):** wire `SketchMode::drawOverlay` in `application.cpp` + pass F1 `Renderer*` from viewport; full `pmParseDim` expr parser; `camera_anim` restore; id-buffer hover for convert/smart-dim; `selectionItems()` from `core::Selection`; IPS units; CMake integrator only; compile bounce-fixes expected. **Gotcha:** `port_h5.py` retained for re-sync from host; no build this node per DAG.
 
 ### C6 — scenarios + screenshot harness
-Ported `host/src/ui/scenarios.{h,cpp}` + `AI_CAD_SHOT` wiring into AI-CAD2. **New:** `ui/imgui/src/ui/scenarios.{h,cpp}` — `ShotConfig` (all 21 scenario flags + frame budgets), `configureShot()` (reads `AI_CAD_SHOT`, seeds static UI for settings/chat/plan/assembly/pick/ribbon/explorer/pmform, calls `ribbon::applyShotEnv` for tab selection), `ScenarioRunner` step machines for m1/sketch/asm/fea/flow/cam/drawing/multidoc/activity/evalmass + worker one-shots for tree/equations/ecad. **main.cpp:** after init, `configureShot` + `setScenarioContext`; shot loop calls `endFrame` (per-step PNG mirrors + scenario Break/Continue) then generic capture at `ShotConfig::captureFrameBudget()` (tree/equations/ecad/cam timing; **flow cap 14400 frames ≈ 240 s @ 60 Hz**). **application.cpp:** `scenarioTick()` before UI each frame. **Deferred (G3/P2):** full host parity for asm mates/explode/interference, sketch rect+drag+dim chain, SimManager-colormap overlay, ecad mirror, PM `AI_CAD_PMSET`, property-manager edit forms on m1/multidoc; integrator screenshot battery vs `scratch/gui_baseline/*.png`. **Gotcha:** no build this node; complex scenarios use DocMirror/worker/simClient directly until C1–C5/H1–H4 panels land; `AI_CAD_REPO` required for worker-driven shots.
+Ported `host/src/ui/scenarios.{h,cpp}` + `CHUDWARE_SHOT` wiring into AI-CAD2. **New:** `ui/imgui/src/ui/scenarios.{h,cpp}` — `ShotConfig` (all 21 scenario flags + frame budgets), `configureShot()` (reads `CHUDWARE_SHOT`, seeds static UI for settings/chat/plan/assembly/pick/ribbon/explorer/pmform, calls `ribbon::applyShotEnv` for tab selection), `ScenarioRunner` step machines for m1/sketch/asm/fea/flow/cam/drawing/multidoc/activity/evalmass + worker one-shots for tree/equations/ecad. **main.cpp:** after init, `configureShot` + `setScenarioContext`; shot loop calls `endFrame` (per-step PNG mirrors + scenario Break/Continue) then generic capture at `ShotConfig::captureFrameBudget()` (tree/equations/ecad/cam timing; **flow cap 14400 frames ≈ 240 s @ 60 Hz**). **application.cpp:** `scenarioTick()` before UI each frame. **Deferred (G3/P2):** full host parity for asm mates/explode/interference, sketch rect+drag+dim chain, SimManager-colormap overlay, ecad mirror, PM `CHUDWARE_PMSET`, property-manager edit forms on m1/multidoc; integrator screenshot battery vs `scratch/gui_baseline/*.png`. **Gotcha:** no build this node; complex scenarios use DocMirror/worker/simClient directly until C1–C5/H1–H4 panels land; `CHUDWARE_REPO` required for worker-driven shots.
 
 ### C1 — feature tree
-Ported `host/src/ui/feature_tree.*` (~3k LOC) into `ui/imgui/src/ui/feature_tree.{h,cpp}` with Glass `fmRowPill()` row pills (`glassRowBackground` + `GetFrameHeightWithSpacing`), FM toolbar explicit row reservation (undo/redo hit-test fix), Origin→nested Front/Top/Right planes per host latest, deferred `applyTreeOps` queue, feature history from F4 `DocMirror`/`WorkerClient`, status badges, rollback bar, sketch nesting, copy/cut/paste, and bottom save/open strip. **FmState adapter** (`detail::FmState`) bridges lean `app::AppState` until G3 lifts `selectedFeatureId`, plane visibility, body slots, highlight faces, and clipboard onto AppState; routes doc ops through `docMirror.applyOps` + `scene::loadAicm`. Inlined `appearance_common` picker/material tables. **left_dock.cpp:** rail tab 0 calls `drawFeatureTreeBody` (demo `drawNode` removed). Sketch enter / PM plane-path picks / `consumePlanePick` deferred until H5/C2 wire `SketchHost` + PropertyManager. **Deferred (G2/G3):** `ui/imgui/CMakeLists.txt` already GLOBs new TU; lift FmState fields to `AppState`; `AI_CAD_SHOT=tree` verify; sketch+PM tree interactions; `pollAiCadHandoff` full tab lifecycle; body visibility sync from mesh load. **Gotcha:** no build this node — integrator compile bounce expected on `fmPalette()`/`FmState` seams and any remaining host-only `AppState` helpers.
+Ported `host/src/ui/feature_tree.*` (~3k LOC) into `ui/imgui/src/ui/feature_tree.{h,cpp}` with Glass `fmRowPill()` row pills (`glassRowBackground` + `GetFrameHeightWithSpacing`), FM toolbar explicit row reservation (undo/redo hit-test fix), Origin→nested Front/Top/Right planes per host latest, deferred `applyTreeOps` queue, feature history from F4 `DocMirror`/`WorkerClient`, status badges, rollback bar, sketch nesting, copy/cut/paste, and bottom save/open strip. **FmState adapter** (`detail::FmState`) bridges lean `app::AppState` until G3 lifts `selectedFeatureId`, plane visibility, body slots, highlight faces, and clipboard onto AppState; routes doc ops through `docMirror.applyOps` + `scene::loadAicm`. Inlined `appearance_common` picker/material tables. **left_dock.cpp:** rail tab 0 calls `drawFeatureTreeBody` (demo `drawNode` removed). Sketch enter / PM plane-path picks / `consumePlanePick` deferred until H5/C2 wire `SketchHost` + PropertyManager. **Deferred (G2/G3):** `ui/imgui/CMakeLists.txt` already GLOBs new TU; lift FmState fields to `AppState`; `CHUDWARE_SHOT=tree` verify; sketch+PM tree interactions; `pollAiCadHandoff` full tab lifecycle; body visibility sync from mesh load. **Gotcha:** no build this node — integrator compile bounce expected on `fmPalette()`/`FmState` seams and any remaining host-only `AppState` helpers.
 
 ### G2 — integrator: wire Wave 2 shell chrome + sketch scaffold
-Integrated S1–S6 + H5 into AI-CAD2 build and frame loop. **CMake:** `GLOB_RECURSE` already picks up all new `ui/imgui/src/ui/*` TUs (layout, doc_tabs, ribbon, toast, shortcut_bar, command_search, cursors, file_explorer, settings_modal, profiler_window, `ui/sketch/*.cpp` except `port_h5.py`). **application.cpp:** S1 `buildDefaultLayout` + `drawDockSplitters` verified; S2 Ctrl+N → `openNewDocChooser`; S4 end-of-frame `drawToasts`/`drawCommandSearch` + palette; S5 `initCursors`/`applyCursorRequest`; S6 `drawSettingsModal`/`drawProfilerWindow` + `takeOpenSettingsRequest`/`takeExplorerOpenRequest` dispatch; S4 settings search seam honored. **viewport.cpp:** doc tab strip at top of central node (`NoTabBar`), `ShortcutBar`, H5 `SketchMode::drawGhosts`/`drawOverlay` via `setViewportPipeline(Renderer*, IdPass*)`. **panels.h:** exports for new draw entry points. **Bounce-fixes (integrator + seam):** `command_search.h` deduped `SettingsEntry` vs `settings_modal.h`; `profiler_window.cpp` `pushText` rgba fix; H5 seam expanded (`SketchHost::rpc()`, `docUndo`/`docRedo`, `hiddenFeatures`, `IdPass*`, `SketchPmSeam` PM stubs); `sketch_internal` shared helpers (`parseEntities`, geometry, `fmtLen`/`fmtAng`/`arrowHead`, `toWorkerPick`); missing `entIndexById`/`hitTestEntity`/`addProjectedDimRef` added to `sketch_mode.cpp`; `smartDimPicking` syntax fix. **Verify:** `cmake --preset linux-app && cmake --build build/linux-app` PASS; `bash scripts/gate.sh` PASS (check.py FAIL-RECORDED pre-existing, pytest SKIP); `AI-CAD2 --shot /tmp/aicad2-g2.png --frames 12` + `--selftest` PASS. **Deferred (Wave 3):** `workspace_bar`→`ribbon::drawBody`; PropertyManager/C1 panels; replace `viewport::Scene` with full `GlViewport` render path; `AppState` lift of settings/toast/cursor flags; sketch `selectionItems()` + camera_anim; Ctrl+C/V explorer routing; `AI_CAD_SHOT=*` scenario harness (C6). **Gotcha:** sketch overlay compiles with PM/route stubs (no-op until C2); unknown icon `grp_pattern` in viewport toolbar (registry gap); headless shot needs DISPLAY or xvfb-run.
+Integrated S1–S6 + H5 into AI-CAD2 build and frame loop. **CMake:** `GLOB_RECURSE` already picks up all new `ui/imgui/src/ui/*` TUs (layout, doc_tabs, ribbon, toast, shortcut_bar, command_search, cursors, file_explorer, settings_modal, profiler_window, `ui/sketch/*.cpp` except `port_h5.py`). **application.cpp:** S1 `buildDefaultLayout` + `drawDockSplitters` verified; S2 Ctrl+N → `openNewDocChooser`; S4 end-of-frame `drawToasts`/`drawCommandSearch` + palette; S5 `initCursors`/`applyCursorRequest`; S6 `drawSettingsModal`/`drawProfilerWindow` + `takeOpenSettingsRequest`/`takeExplorerOpenRequest` dispatch; S4 settings search seam honored. **viewport.cpp:** doc tab strip at top of central node (`NoTabBar`), `ShortcutBar`, H5 `SketchMode::drawGhosts`/`drawOverlay` via `setViewportPipeline(Renderer*, IdPass*)`. **panels.h:** exports for new draw entry points. **Bounce-fixes (integrator + seam):** `command_search.h` deduped `SettingsEntry` vs `settings_modal.h`; `profiler_window.cpp` `pushText` rgba fix; H5 seam expanded (`SketchHost::rpc()`, `docUndo`/`docRedo`, `hiddenFeatures`, `IdPass*`, `SketchPmSeam` PM stubs); `sketch_internal` shared helpers (`parseEntities`, geometry, `fmtLen`/`fmtAng`/`arrowHead`, `toWorkerPick`); missing `entIndexById`/`hitTestEntity`/`addProjectedDimRef` added to `sketch_mode.cpp`; `smartDimPicking` syntax fix. **Verify:** `cmake --preset linux-app && cmake --build build/linux-app` PASS; `bash scripts/gate.sh` PASS (check.py FAIL-RECORDED pre-existing, pytest SKIP); `AI-CAD2 --shot /tmp/aicad2-g2.png --frames 12` + `--selftest` PASS. **Deferred (Wave 3):** `workspace_bar`→`ribbon::drawBody`; PropertyManager/C1 panels; replace `viewport::Scene` with full `GlViewport` render path; `AppState` lift of settings/toast/cursor flags; sketch `selectionItems()` + camera_anim; Ctrl+C/V explorer routing; `CHUDWARE_SHOT=*` scenario harness (C6). **Gotcha:** sketch overlay compiles with PM/route stubs (no-op until C2); unknown icon `grp_pattern` in viewport toolbar (registry gap); headless shot needs DISPLAY or xvfb-run.
 
 ### C3 — copilot + activity + console
-Ported `host/src/ui/{legacy_chat,activity_panel,console_panel,model_registry.h}` into `ui/imgui/src/ui/{agent_panel,activity_panel,console_panel,model_registry.h}`. **agent_panel:** expanded from demo stub to host-faithful Copilot — slim header (logo + Sessions toggle + settings gear + status dot), Chat/Console/Activity tab bar, per-doc session list with running indicators + delete, glass user bubbles (`pushGlassChildStyle` + accent border) and assistant body on `glassRowAtCursor`, action cards on frosted child pills, composer prelude row (Design|Edit|Ask + Permissions offline/supervised/thoughts + context meter), toolbar row (model dropdown from `model_registry` + reasoning-effort + send/stop icons) on `glassRowBackground` pills, message queue while busy, F4 seam via `tryStartWorker`/`job.running`/`startDemoAgent`/`engineReady`, routes `run_started` to `activityPanel()`. **activity_panel:** full run→stage→attempt tree from orchestrator events + `%APPDATA%/AI-CAD/cache/runs/*/events.jsonl` replay combo (`platform::appdataDir`), verdict chips, prompt-editor jump to Settings Agents tab. **console_panel:** module-local log with `[tag]` color coding via theme tokens; `appendConsoleLog`/`drawConsoleBody`. **model_registry.h:** header-only catalog (providers, builtin/cloud/local presets, reasoning-effort + context-window helpers). **Verify:** `python3 scripts/check.py gui_lint theme` PASS (zero literal colors in new panel files). **Deferred (G3/C6):** full `ChatMsg`/`Conversation` persistence to `chat_history.json`, `refreshModelAvailability` worker probe, `submitTurn`→`agent_run_v2`/`agent_mission_v1` (still `startDemoAgent` + engine facade), `drawProviderModelPicker` shared with settings, `pollChatOpenFoam`, activity `onEvent` drain from `JobState::events`, `AI_CAD_SHOT=chat|activity` scenario wiring. **Gotcha:** no build this node; CMake GLOB picks up new TUs; integrator should wire `activityPanel().onEvent` in job drain when agent RPC lands.
+Ported `host/src/ui/{legacy_chat,activity_panel,console_panel,model_registry.h}` into `ui/imgui/src/ui/{agent_panel,activity_panel,console_panel,model_registry.h}`. **agent_panel:** expanded from demo stub to host-faithful Copilot — slim header (logo + Sessions toggle + settings gear + status dot), Chat/Console/Activity tab bar, per-doc session list with running indicators + delete, glass user bubbles (`pushGlassChildStyle` + accent border) and assistant body on `glassRowAtCursor`, action cards on frosted child pills, composer prelude row (Design|Edit|Ask + Permissions offline/supervised/thoughts + context meter), toolbar row (model dropdown from `model_registry` + reasoning-effort + send/stop icons) on `glassRowBackground` pills, message queue while busy, F4 seam via `tryStartWorker`/`job.running`/`startDemoAgent`/`engineReady`, routes `run_started` to `activityPanel()`. **activity_panel:** full run→stage→attempt tree from orchestrator events + `%APPDATA%/Chudware/cache/runs/*/events.jsonl` replay combo (`platform::appdataDir`), verdict chips, prompt-editor jump to Settings Agents tab. **console_panel:** module-local log with `[tag]` color coding via theme tokens; `appendConsoleLog`/`drawConsoleBody`. **model_registry.h:** header-only catalog (providers, builtin/cloud/local presets, reasoning-effort + context-window helpers). **Verify:** `python3 scripts/check.py gui_lint theme` PASS (zero literal colors in new panel files). **Deferred (G3/C6):** full `ChatMsg`/`Conversation` persistence to `chat_history.json`, `refreshModelAvailability` worker probe, `submitTurn`→`agent_run_v2`/`agent_mission_v1` (still `startDemoAgent` + engine facade), `drawProviderModelPicker` shared with settings, `pollChatOpenFoam`, activity `onEvent` drain from `JobState::events`, `CHUDWARE_SHOT=chat|activity` scenario wiring. **Gotcha:** no build this node; CMake GLOB picks up new TUs; integrator should wire `activityPanel().onEvent` in job drain when agent RPC lands.
 
 ### C4 — viewport panel + HUD + tools
-Ported `host/src/ui/{viewport_panel HUD/tools,view_selector,section_tool,legend,mouse_gestures,camera_anim}` into split `ui/imgui/src/ui/{viewport,view_selector,section_tool,legend,mouse_gestures,camera_anim}.*`. **Render path:** `viewport::Scene` replaced by `GlViewport` as primary — `setViewportPipeline(GlViewport*)`, per-frame `renderViewport()` loads AICM via `render::loadAicmFile` + `GlViewport::setDoc/render`, displays `colorTextureId()`, picking via `GlViewport::pick()`. Module-local `ViewportState` holds yaw/pitch/zoom/pan, animation tween, display style, legend, HUD flags until AppState lift. **HUD (GLASS_DESIGN_SPEC §6):** top-right per-button `glassPanel(UltraThin)` pills with `averageLuminance` adaptive tint + idle fade (0.20→1.0 on hover/popup); groups zoom-fit/area/pan/rotate, view-orientation ▾, display-style ▾, hide/show ▾, section toggle. **Tools:** `camera_anim` smoothstep tweens; `mouse_gestures` 8-segment RMB wheel; `ViewSelector` glass-box (Space) with hover-preview thumbnail; `SectionTool` multi-plane clip + PM panel + `AI_CAD_SECTION` env; `drawLegend` jet ramp. **application.cpp:** `setViewportPipeline(glViewport_)`, `updateViewportBackdrop` → `ui::refreshViewportBackdrop`. **Deferred (G3/C6):** full host viewport_panel parity (push-pull, dim-drag, asm drag, pick readout, normal-to/zoom-to-selection, appearance picker, lens-shift full-bleed, overlay/id-pass selection highlights, `AppState` camera/legend/renderer fields); CMake integrator only; `AI_CAD_SHOT=pick` scenario. **Gotcha:** no build this node; legacy `viewport::Scene` still owned by Application but unused for display; sketch `requestCameraAnimation` in seam still snaps (wire to `ui::requestCameraAnimation` in G3).
+Ported `host/src/ui/{viewport_panel HUD/tools,view_selector,section_tool,legend,mouse_gestures,camera_anim}` into split `ui/imgui/src/ui/{viewport,view_selector,section_tool,legend,mouse_gestures,camera_anim}.*`. **Render path:** `viewport::Scene` replaced by `GlViewport` as primary — `setViewportPipeline(GlViewport*)`, per-frame `renderViewport()` loads AICM via `render::loadAicmFile` + `GlViewport::setDoc/render`, displays `colorTextureId()`, picking via `GlViewport::pick()`. Module-local `ViewportState` holds yaw/pitch/zoom/pan, animation tween, display style, legend, HUD flags until AppState lift. **HUD (GLASS_DESIGN_SPEC §6):** top-right per-button `glassPanel(UltraThin)` pills with `averageLuminance` adaptive tint + idle fade (0.20→1.0 on hover/popup); groups zoom-fit/area/pan/rotate, view-orientation ▾, display-style ▾, hide/show ▾, section toggle. **Tools:** `camera_anim` smoothstep tweens; `mouse_gestures` 8-segment RMB wheel; `ViewSelector` glass-box (Space) with hover-preview thumbnail; `SectionTool` multi-plane clip + PM panel + `CHUDWARE_SECTION` env; `drawLegend` jet ramp. **application.cpp:** `setViewportPipeline(glViewport_)`, `updateViewportBackdrop` → `ui::refreshViewportBackdrop`. **Deferred (G3/C6):** full host viewport_panel parity (push-pull, dim-drag, asm drag, pick readout, normal-to/zoom-to-selection, appearance picker, lens-shift full-bleed, overlay/id-pass selection highlights, `AppState` camera/legend/renderer fields); CMake integrator only; `CHUDWARE_SHOT=pick` scenario. **Gotcha:** no build this node; legacy `viewport::Scene` still owned by Application but unused for display; sketch `requestCameraAnimation` in seam still snaps (wire to `ui::requestCameraAnimation` in G3).
 
 ### C5 — asm / config / tables / equations / evaluate
-Ported `host/src/ui/{asm_panels,config_panel,design_table_panel,equations_dialog,cutlist_panel,appearance_common,evaluate_dialogs}.*` (~3.5k LOC) into `ui/imgui/src/ui/` with `theme::` glass (`pushGlassWindowStyle` on floating asm/evaluate windows) and `ui::c5::*` seam in `appearance_common.{h,cpp}` bridging lean `app::AppState` (toast→`postToast`, `loadDocMesh`→`scene::loadAicm`, `ips`/`activeTabIsDrawing`/`busy`, simplified `pmParseDim`/`pmFormatDim`, module `showEquationsDialog`/`showDesignTablePanel`/`showCutListPanel` flags, `EvaluateDialogs` legend/colormap via `setEvaluateRenderer`). **asm_panels:** full mate/pattern/explode/interference/BOM/parts-library flow through `DocMirror` + async `rpc`. **config_panel:** read-only ConfigurationManager embedded body. **design_table_panel:** editable config grid (override columns from cache; add-column candidates stub until C2 `pmFindForm`). **equations_dialog:** global-variable editor (`eq_set`/`eq_delete`). **cutlist_panel:** weldment cut list. **evaluate_dialogs:** mass/measure/section/check/interference/symmetry + field overlays (draft/thickness/curvature) + zebra. **Deferred (G3):** wire `AsmPanels`/`EvaluateDialogs`/`ConfigPanel` instances in `application.cpp` + ribbon dispatch; lift visibility flags onto `AppState`; `setEvaluateRenderer` from viewport pipeline; full `pmFindForm` for design-table add-column; `AI_CAD_SHOT=equations|evalmass|asm` verify. **Gotcha:** no build this node; evaluate_dialogs still has a few host literal status colors (P1 sweep); integrator compile bounce expected on `c5::` seam + `PMFieldKind` bridge.
+Ported `host/src/ui/{asm_panels,config_panel,design_table_panel,equations_dialog,cutlist_panel,appearance_common,evaluate_dialogs}.*` (~3.5k LOC) into `ui/imgui/src/ui/` with `theme::` glass (`pushGlassWindowStyle` on floating asm/evaluate windows) and `ui::c5::*` seam in `appearance_common.{h,cpp}` bridging lean `app::AppState` (toast→`postToast`, `loadDocMesh`→`scene::loadAicm`, `ips`/`activeTabIsDrawing`/`busy`, simplified `pmParseDim`/`pmFormatDim`, module `showEquationsDialog`/`showDesignTablePanel`/`showCutListPanel` flags, `EvaluateDialogs` legend/colormap via `setEvaluateRenderer`). **asm_panels:** full mate/pattern/explode/interference/BOM/parts-library flow through `DocMirror` + async `rpc`. **config_panel:** read-only ConfigurationManager embedded body. **design_table_panel:** editable config grid (override columns from cache; add-column candidates stub until C2 `pmFindForm`). **equations_dialog:** global-variable editor (`eq_set`/`eq_delete`). **cutlist_panel:** weldment cut list. **evaluate_dialogs:** mass/measure/section/check/interference/symmetry + field overlays (draft/thickness/curvature) + zebra. **Deferred (G3):** wire `AsmPanels`/`EvaluateDialogs`/`ConfigPanel` instances in `application.cpp` + ribbon dispatch; lift visibility flags onto `AppState`; `setEvaluateRenderer` from viewport pipeline; full `pmFindForm` for design-table add-column; `CHUDWARE_SHOT=equations|evalmass|asm` verify. **Gotcha:** no build this node; evaluate_dialogs still has a few host literal status colors (P1 sweep); integrator compile bounce expected on `c5::` seam + `PMFieldKind` bridge.
 
 ### C2 — property manager + 44 forms
-Expanded `ui/abstract/panel_spec.{h,cpp}` from 4 stub forms to all **44** feature tables ported from `host/src/ui/pm_forms.cpp` (`PanelField`/`PanelSpec`/`SelectorKinds`, `panelFormForCommand` ribbon routing). Ported `host/src/ui/property_manager.cpp` logic into `ui/imgui/src/ui/property_manager.{h,cpp}` — data-driven `drawBody` (grouped glass cards, dim parse/format, selector wells, live debounced preview via `docMirror.applyOps`, checkpoint/revert cancel, `presetFieldForShot` for `AI_CAD_PMSET`). **left_dock.cpp:** replaced hardcoded inspector with `propertyManager().openForCommand` + `drawBody` inside `mat.regular` glass card; appearance editor unchanged. **sketch_seam.{h,cpp}:** `SketchPmSeam` delegates PM hooks (`wantsRegionPicker`, `routeDatumPlane/Axis`, `setProfilePicks`, …) to `ui::propertyManager()`. **Shot env:** `pmApplyShotEnv` reads `AI_CAD_PMCMD`/`AI_CAD_PMSET` on first inspector draw (pmform scenario). **Deferred (G3):** integrator CMake already GLOBs new TU; viewport pick routing into `routePick`, callout overlays, Select-with-AI, left-pane PM tab auto-switch (S1 layout), `prim_*` commands without panel_spec entries; compile bounce on theme token renames (`txt0`/`bg3` vs host palette). **Gotcha:** no build this node; AI assist stripped; sketch exit on PM open clears `inSketch` only (no `SketchMode::exitSketch` yet).
+Expanded `ui/abstract/panel_spec.{h,cpp}` from 4 stub forms to all **44** feature tables ported from `host/src/ui/pm_forms.cpp` (`PanelField`/`PanelSpec`/`SelectorKinds`, `panelFormForCommand` ribbon routing). Ported `host/src/ui/property_manager.cpp` logic into `ui/imgui/src/ui/property_manager.{h,cpp}` — data-driven `drawBody` (grouped glass cards, dim parse/format, selector wells, live debounced preview via `docMirror.applyOps`, checkpoint/revert cancel, `presetFieldForShot` for `CHUDWARE_PMSET`). **left_dock.cpp:** replaced hardcoded inspector with `propertyManager().openForCommand` + `drawBody` inside `mat.regular` glass card; appearance editor unchanged. **sketch_seam.{h,cpp}:** `SketchPmSeam` delegates PM hooks (`wantsRegionPicker`, `routeDatumPlane/Axis`, `setProfilePicks`, …) to `ui::propertyManager()`. **Shot env:** `pmApplyShotEnv` reads `CHUDWARE_PMCMD`/`CHUDWARE_PMSET` on first inspector draw (pmform scenario). **Deferred (G3):** integrator CMake already GLOBs new TU; viewport pick routing into `routePick`, callout overlays, Select-with-AI, left-pane PM tab auto-switch (S1 layout), `prim_*` commands without panel_spec entries; compile bounce on theme token renames (`txt0`/`bg3` vs host palette). **Gotcha:** no build this node; AI assist stripped; sketch exit on PM open clears `inSketch` only (no `SketchMode::exitSketch` yet).
 
 
 ## Liquid-glass v2 restyle (AI-CAD2) — 2026-07-01
@@ -159,9 +159,9 @@ rule now also covers ui/imgui/src and icons::draw/inlineIcon/drawGlass; ICONS.md
 channels, per-doc session parking in syncChatToDoc), doc tabs, toasts, HUD/overlays on adaptive
 surfaces; chrome stays theme-colored; single scene render/frame (window-sized backdrop pre-render
 deleted); backdrop invalidated when the Viewport tab is hidden.
-**N8/N9 (perf)** — `AI_CAD_SHOT=glassperf` scenario (orbit + chat seeds + fixture mesh) prints
+**N8/N9 (perf)** — `CHUDWARE_SHOT=glassperf` scenario (orbit + chat seeds + fixture mesh) prints
 frame/GPU metrics and captures a sampling-profiler report; new `prof_target_push/pop` RPCs let the
-GUI thread register with the libaicad sampler (2891 samples @997 Hz over the 3 s window). Measured
+GUI thread register with the libchudware sampler (2891 samples @997 Hz over the 3 s window). Measured
 on the RTX 3080 Ti: glass GPU cost ≈ 0.07–0.17 ms (blur 0.02–0.06, luma 0.05–0.11), frames
 vsync-locked (avg 16.9 ms, p99 17.9).
 **Integrator extras** — `ui::viewportLoadAicm()` harness + the missing shaded-mesh upload path
@@ -228,7 +228,7 @@ public references (ISO 286-2, ISO 261/262, ANSI/ASME B1.1, SKF bearing/fit table
 typical values) and are 39–60 lines each.
 ## Liquid-glass v2 → HOST port (production binary) — 2026-07-01
 
-Follow-up to the AI-CAD2 restyle: the user launches `./build.sh` → host/build-linux/bin/AI-CAD
+Follow-up to the AI-CAD2 restyle: the user launches `./build.sh` → host/build-linux/bin/Chudware
 (host/DEPRECATED.md: "host/ remains the production binary"), so the full glass system was ported
 to host/src via a second 7-node wave against local://glass_host.md (H1 renderer backdrop/Kawase/
 async PBO luminance grid/GL timers; H2 ui_theme AdaptiveSurface/adaptivePanel/panelId/GlassLevel/
@@ -264,7 +264,7 @@ templates (`plate_bolt_circle`, `pocketed_block`, `turned_shaft`, `ribbed_bracke
 rib-gusset-or-second-boss, `shelled_enclosure`, `bladed_disk`, `swept_pipe`), each grounded
 directly against `services/agent/prompts/shared/ops_cheatsheet.md` +
 `services/agent/prompts/shared/cheatsheets/sweep.md` and built with `core_bridge.dim`/`feat`.
-Every op batch was smoke-tested live against the engine (`core/build-linux/bin/libaicad.so`)
+Every op batch was smoke-tested live against the engine (`core/build-linux/bin/libchudware.so`)
 before being committed to the script; **all 7 families built 100% of samples on this engine
 build — zero failures** across a 2-sample acceptance run and a 50-sample-per-family stress run
 (350/350). No family needed the "report and continue" degraded path, so there is nothing to
@@ -290,7 +290,7 @@ inspected and confirmed correctly labelled, e.g. `plate_bolt_circle` faces split
 
 ### CORE-OVERLAP — intra-part feature-overlap detection (AI-experience wave, WS-B/B1+B2+B4)
 Write-set: `core/doc/document.h`, `core/doc/document.cpp`, `core/doc/session.h`,
-`core/doc/session.cpp`, `core/api/libaicad.cpp`. **B1** — added `ToolRec{feature_id, role,
+`core/doc/session.cpp`, `core/api/libchudware.cpp`. **B1** — added `ToolRec{feature_id, role,
 tool}` + `CompileResult::tool_recs` (`document.h`) and captured the actual pre-boolean tool
 solid (+ "add"/"cut" role) at every boolean callsite in `compile_document`: both primitive
 boolean branches, extrude (cut and boss/base), revolve, sweep, rib, the explicit `boolean`
@@ -313,7 +313,7 @@ surviving face/edge per the owner map — fully consumed downstream). `ok` is fa
 `boss_swallowed` pair. `params.features` restricts pairing to combinations touching at least one
 listed id (bounds add_features' future latency); `params.min_volume_mm3` floors reportable
 overlap (default 1e-3, mirrors `INTERFERENCE_EPS`). Dispatched as `eval_feature_overlap` in
-`libaicad.cpp` beside `eval_interference`. **B4** — `interference_report`/`doc_eval_interference`
+`libchudware.cpp` beside `eval_interference`. **B4** — `interference_report`/`doc_eval_interference`
 gained `include_coincident` (near-zero-clearance pairs, distance <= 1e-6, go to a new `contacts`
 array instead of `clearances`) and `min_clearance_mm` (tags a `clearances` entry below it with
 `"warning":"below min clearance"`); `contacts` is always present (empty by default) so the
@@ -325,7 +325,7 @@ write-set) and core tests (`core/tests/test_interference.cpp` — WS-B/B5, also 
 node). **Verify:** `cmake --build core/build-linux -j12` — clean, no new warnings in touched
 files (pre-existing `ctest` flakiness on `appearance`/`drawing_gdt`/`hole` under the parallel
 harness is unrelated — all three pass 100% run standalone). Live smoke via
-`core/build-linux/bin/libaicad.so` + Python `ctypes`: a 40mm cube + a d10h10 boss fused on top +
+`core/build-linux/bin/libchudware.so` + Python `ctypes`: a 40mm cube + a d10h10 boss fused on top +
 a 20mm cube cut centered on the boss → `eval_feature_overlap` returns exactly the two expected
 pairs (`Base`<->`SwallowCut` = `cut_into_boss` 2000 mm³, `Boss`<->`SwallowCut` = `boss_swallowed`
 785.4 mm³, `ok:false`, `dead_features:["f2"]` since the boss's geometry is fully swallowed); a
@@ -352,7 +352,7 @@ composing `doc_sketch_overview` + `doc_sketch_regions` + the authored sketch fea
 `doc_tree` into plane/entity-roster/constraint-roster/regions/DOF-verdict text. Two RPC param
 gotchas found only by running them: both `doc_sketch_overview` and `doc_sketch_regions` take the
 sketch feature id under the JSON key **`sketch`**, not `sketch_fid` (that's only the C++
-parameter name; `libaicad.cpp`'s dispatch reads `params.value("sketch", ...)`) — the plan's RPC
+parameter name; `libchudware.cpp`'s dispatch reads `params.value("sketch", ...)`) — the plan's RPC
 shorthand was misleading here. `doc_sketch_overview` carries no `constraints`/`measured` field
 (only `entities`/`statuses`/`dof`/`plane_frame`/`status`/`skipped_constraints`), so driving-
 dimension values are read from the authored params as the plan's fallback anticipated, and the
@@ -365,7 +365,7 @@ dependency-free `_scene_caption(doc_id, views)` helper (one paragraph; exported 
 documented convention exactly (front=-Y, back=+Y, right=+X, left=-X, top=+Z, bottom=-Z,
 iso=normalize(1,1,0.8)) — cross-checked against `core/doc/session.cpp::resolve_view_spec`.
 **Verify:** `python3 -m py_compile services/mcp/gsl_tools.py` clean; live smoke against
-`libaicad.so` (box 40x30x20 + a d8 through-hole): `describe_part` outline correctly reports
+`libchudware.so` (box 40x30x20 + a d8 through-hole): `describe_part` outline correctly reports
 "f1 Base [box] (4 face(s)): on right face of f2, centered 15 mm from -Y edge / 10 mm from -Z
 edge" and "f2 Bore [hole] (3 face(s)): on bottom face of f1, centered 20 mm from -X edge / 15 mm
 from -Y edge"; `describe_scene` iso view lists the 3 faces whose normals actually face
@@ -402,8 +402,8 @@ list gsl/reverse alongside overview/simulation/review/intake/cam. `server.py`'s 
 instructions string gained one sentence pointing at the non-vision describe_* path and at
 check_feature_overlap (intra-part) vs check_interference (assemblies) — the ECAD closing
 sentence was preserved. **Verify:** `python3 -m py_compile services/mcp/cad_tools.py
-services/mcp/server.py` clean. Live smoke against a freshly built `libaicad.so`
-(`core/build-linux/bin`, staged via `AI_CAD_LIBAICAD` since `core_bridge`'s default Linux
+services/mcp/server.py` clean. Live smoke against a freshly built `libchudware.so`
+(`core/build-linux/bin`, staged via `CHUDWARE_LIBCHUDWARE` since `core_bridge`'s default Linux
 candidate `core/build-occt-linux/bin` was stale and lacked the new RPC — a real repo issue for
 whoever restages the default candidate list, not touched here since `core_bridge.py` is outside
 this node's write-set): built a 40³ box + a d10h10 top boss (deliberately half-embedded, so
@@ -424,8 +424,8 @@ other files touched; `gsl_tools.py` was read-only (imported, never edited).
 ### CORE-RECON — eval_compare + doc_face_wires (AI-experience wave, WS-C C1+C2)
 Write-set: new `core/doc/recon.h`/`core/doc/recon.cpp`; appended wrappers in
 `core/doc/session.h`/`core/doc/session.cpp`; appended dispatch lines in
-`core/api/libaicad.cpp` beside `eval_feature_overlap`; `core/CMakeLists.txt` (added
-`doc/recon.cpp` to the `aicad_doc` source list only). `recon.{h,cpp}` are Session-free — pure
+`core/api/libchudware.cpp` beside `eval_feature_overlap`; `core/CMakeLists.txt` (added
+`doc/recon.cpp` to the `chudware_doc` source list only). `recon.{h,cpp}` are Session-free — pure
 OCCT geometry (`compare_shapes(TopoDS_Shape,TopoDS_Shape)`, `face_wires(TopoDS_Face)`) — so the
 doc-resolving glue (require_session, body/face selector resolution) stays in session.cpp's
 `doc_eval_compare`/`doc_face_wires` wrappers, dispatched as RPC methods `eval_compare` and
@@ -439,12 +439,12 @@ centroid_dist_mm}` instead of throwing. `doc_face_wires`: `{doc_id,{face:<select
 or {"sid":...}>}}` resolves against the last body's faces (sid matched via `make_selector`'s sid,
 else the same `eval_resolve_ref` predicate path `doc_eval_measure` uses), converts a planar
 face's wires into doc-schema §3.1 entities in the face's own plane frame (built via
-`aicad::geom::SketchPlane::from(origin,normal)` — byte-identical convention to
+`chudware::geom::SketchPlane::from(origin,normal)` — byte-identical convention to
 `resolve_sketch_plane`'s face-sketch branch): line/circle/arc (ccw resolved from an actual
 traversal-midpoint sample)/ellipse/ellipse_arc, anything else sampled to a 24-segment polyline
 with `approx:true`. Non-planar face throws `OpError("invalid_op", "convert entities requires a
 planar face")`. **Verify:** `cmake --build core/build-linux -j12` clean. Live ctypes smoke
-(`AI_CAD_LIBAICAD` pointed at the fresh `core/build-linux/bin/libaicad.so` — same stale-default
+(`CHUDWARE_LIBCHUDWARE` pointed at the fresh `core/build-linux/bin/libchudware.so` — same stale-default
 candidate-list gotcha MCP-SURFACE already flagged): two independently-built 40×30×20 box docs ->
 `eval_compare` match_pct 100.0 (0 residual regions); a third box translated +10mm in X ->
 match_pct 75.0 with exactly one 6000 mm³ `missing` region at `[-15,0,0]` and one 6000 mm³
@@ -508,12 +508,12 @@ touched, git untouched.
 
 ### TESTS-CORE — ctest coverage for eval_feature_overlap/eval_compare/interference params (AI-experience wave, WS-B B5-core)
 Write-set: new `core/tests/test_interference.cpp`; appended one test-target block to
-`core/CMakeLists.txt` (after `test_mirror`, inside the existing `if(AICAD_WITH_OCCT)` region,
+`core/CMakeLists.txt` (after `test_mirror`, inside the existing `if(CHUDWARE_WITH_OCCT)` region,
 registering `add_test(NAME interference ...)`). Unlike `test_document.cpp`/`test_mirror.cpp`
 this file never touches the host AICM loader — every case calls `doc_new`/`doc_apply_ops`/
 `doc_eval_interference`/`doc_eval_feature_overlap`/`doc_eval_compare` (`core/doc/session.h`)
-directly and asserts on the returned JSON, so the target links only `aicad_doc`/
-`aicad_geom_occt`/`aicad_sketch`/`aicad_geom` with no OCCT include dir or render sources.
+directly and asserts on the returned JSON, so the target links only `chudware_doc`/
+`chudware_geom_occt`/`chudware_sketch`/`chudware_geom` with no OCCT include dir or render sources.
 Geometry is built entirely from primitive `box`/`cylinder` features placed via
 `params.at`+`params.centered:false` (corner/base-center convention, confirmed by reading
 `document.cpp`'s primitive branch) so every expected volume is closed-form exact, not a
@@ -575,7 +575,7 @@ reviewer/fixer prompt templates (`services/agent/prompts/`, not in this write-se
 them to read an injected compare block — disproportionate blast radius for one capability
 branch. The delivered version still does a REAL comparison (never a canned number), just
 once per mission rather than once per stage. Verified: `cmake --build core/build-linux -j12
---target aicad_agent` clean (both incrementally and from the edit point forward). No
+--target chudware_agent` clean (both incrementally and from the edit point forward). No
 `app/build*`/`build/linux-app` build attempted for E3 since no E3 code was written under
 this node — the app was left untouched. No git commands run by this node (the integrator
 owns commits per `AGENTS.md`).
@@ -586,11 +586,11 @@ RESULT: PASS — only `check.py` FAIL-RECORDED (`feature_surface_audit` + `parit
 which is the documented PRE-EXISTING baseline; core build (OCCT ON), ui/abstract,
 core ctest (100%), ui/imgui build+shot+selftest all PASS; gate's engine/agent pytest
 step SKIPs (no runtime venv) as usual. **ctest**: `-R interference` 1/1 Passed.
-**MCP pytest** (`~/.local/share/AI-CAD/mcp-venv/bin/python -m pytest`, mcp 1.27.2 +
+**MCP pytest** (`~/.local/share/Chudware/mcp-venv/bin/python -m pytest`, mcp 1.27.2 +
 pytest 9.1.1): `test_gsl_tools.py + test_recon_tools.py` 13 passed;
 `test_cad_tools.py -k "overlap or coincident or caption"` 6 passed — run BOTH before and
-after restaging. **Restage**: `core/build-linux/bin/libaicad.so` (relinked 21:50 after the
-E4 `core/agent/run.cpp` capability work) was newer than `services/dist/AI-CAD/libaicad.so`
+after restaging. **Restage**: `core/build-linux/bin/libchudware.so` (relinked 21:50 after the
+E4 `core/agent/run.cpp` capability work) was newer than `services/dist/Chudware/libchudware.so`
 (21:19) → recopied; all 19 lane tests re-green against the staged lib. No breakage found
 in this lane's new files, nothing fixed. **Lane consolidated — files landed across the
 TODO nodes**: `services/mcp/recon_tools.py` (`_recognize` 5-pass + `reverse_engineer` /
@@ -601,7 +601,7 @@ served by `cad_guide('reverse')`), `services/mcp/test_gsl_tools.py` (9 tests),
 `services/mcp/test_cad_tools.py` (5, before the `__main__` runner), `tools/gsl_eval.py`,
 `docs/RECOGNITION_RESIDUAL.md` (full 14-sample run), plus this node's doc touches
 (`docs/REFACTOR_LOG.md`, status note atop `docs/GEOMETRY_LLM_REPRESENTATION_REVIEW.md`,
-restaged `services/dist/AI-CAD/libaicad.so`). **Deferred/open**: E3 in-app hooks belong to
+restaged `services/dist/Chudware/libchudware.so`). **Deferred/open**: E3 in-app hooks belong to
 the GUI session (HANDOFF §TODO-4); GNN adapter training remains gated — RECOGNITION_RESIDUAL
 says GO only for ribbed_bracket / shelled_enclosure / swept_pipe, NO-GO elsewhere;
 `corpora/sw_fixtures` has no `*.step` yet (eval path dormant until files appear);
@@ -612,7 +612,7 @@ mcp SDK — each test file carries a no-op-when-unshadowed reload shim; recon ho
 uses a 2-position checkpointed probe because hole positions live in the face's `gp_Pln`
 parameter axes; fillet-candidate bound is 20% of MEDIAN bbox dim (documented deviation —
 the spec's own r3-on-8mm acceptance part violates the min-dim rule); ALWAYS restage
-`services/dist/AI-CAD/libaicad.so` after a core rebuild or new RPCs report
+`services/dist/Chudware/libchudware.so` after a core rebuild or new RPCs report
 "unknown method".
 ---
 
@@ -638,7 +638,7 @@ document/paper representation (like the 3D viewport), not chrome, and its dark-o
 must stay per the sketchInk contract. All `ImVec2` math done via explicit constructors (not
 `operator+`) to avoid the `IMGUI_DEFINE_MATH_OPERATORS` trap. **Verify:** both files compile
 cleanly under `flock /tmp/host-build-linux.lock` (section_tool + drawing_panel objects build
-with zero errors); full link + `AI_CAD_SHOT=drawing` screenshot are BLOCKED only by concurrent
+with zero errors); full link + `CHUDWARE_SHOT=drawing` screenshot are BLOCKED only by concurrent
 sibling agents' in-flight `ImVec2 operator+` errors in cutlist_panel.cpp / equations_dialog.cpp
 / design_table_panel.cpp / evaluate_dialogs.cpp (all outside this write-set) — retry the link +
 shot once those land. **Touched:** host/src/ui/section_tool.cpp, host/src/ui/drawing_panel.cpp.
@@ -723,7 +723,7 @@ the Copilot top was raised by the `colY` edit above. **(4) Collapse chevron.** `
 `##lp_collapse` block: was hover-only background (read as a stray mark); now a persistent glass chip
 (`glassRowBackground` at 0.22 idle / 0.42 hover, 26dp square) parked at the column's top-right corner
 and reserved out of the horizontal rail's width (`chevRsv`) so it never collides with the relocated
-icon row. **Verify:** built green under `flock /tmp/host-build-linux.lock`; re-shot `AI_CAD_SHOT=
+icon row. **Verify:** built green under `flock /tmp/host-build-linux.lock`; re-shot `CHUDWARE_SHOT=
 m1|sketch|fea|appearance|multidoc` → `scratch/gui-overhaul-shots/fix4_*.png`, all clean (dead gap
 gone, doc tab + chevron coexist, icon row full-width bodies, FEA legend + Settings + multi-tab strip
 unregressed); `grep -rc panelsOverlay host/src/` still all-zero (docked layout stays deleted, locked
@@ -759,9 +759,9 @@ wash via `TableSetBgColor(ImGuiTableBgTarget_RowBg0, ...)` (grid-honoring, not a
 `Selectable`'s own opaque highlight suppressed (passed `selected=false`). Standard `ImGui::Button`s
 left themed (consistent with settings_modal — only custom icon-buttons get pills). **Verify:** built
 green under `flock /tmp/host-build-linux.lock -c "cmake --build host/build-linux -j$(nproc)"`; re-shot
-`AI_CAD_SHOT=equations` and `AI_CAD_SHOT=evalmass` → `scratch/gui-overhaul-shots/dlg_equations.png` +
+`CHUDWARE_SHOT=equations` and `CHUDWARE_SHOT=evalmass` → `scratch/gui-overhaul-shots/dlg_equations.png` +
 `dlg_evalmass.png` (zoom crops confirm crisp title/X on the glass strip + legible frosted content).
-Design Table and Cut List have NO `AI_CAD_SHOT` scenario, so they are build-verified only (they share
+Design Table and Cut List have NO `CHUDWARE_SHOT` scenario, so they are build-verified only (they share
 the identical, screenshot-proven pattern). **Touched:** host/src/ui/evaluate_dialogs.cpp,
 host/src/ui/equations_dialog.cpp, host/src/ui/design_table_panel.cpp, host/src/ui/cutlist_panel.cpp.
 
@@ -799,9 +799,9 @@ remaps them to `surf.textPrimary`/`textSecondary` when a frosted window surface 
 bar — title text bleeds through the translucent glass legibly, per the original evaluate_dialogs
 pattern; a sibling agent later refined dialogs to frost only the content region below the title, but
 the asm windows keep the simpler verified full-rect approach.) **Verify:** built green under
-`flock /tmp/host-build-linux.lock -c "cmake --build host/build-linux -j$(nproc)"`; `AI_CAD_SHOT=asm`
+`flock /tmp/host-build-linux.lock -c "cmake --build host/build-linux -j$(nproc)"`; `CHUDWARE_SHOT=asm`
 → `scratch/gui-overhaul-shots/asm_interference_after.png` (zoom crop confirms the Interference window
-is frosted with crisp dark-on-light content text over the light model); `AI_CAD_SHOT=fea` runs the sim
+is frosted with crisp dark-on-light content text over the light model); `CHUDWARE_SHOT=fea` runs the sim
 path (`studyCount>0` forces `drawTreeBody`; `newStudy` sets `sel_>=0` so `drawForm`→`drawStudyChecklist`
 →`beginCheckCard` all execute) to clean completion with no ImGui stack assertion — the study tree +
 checklist render just below the headless left-pane fold, using the identical screenshot-proven
@@ -818,12 +818,12 @@ modernization across `feature_tree.*`, `settings_modal.*`, `title_bar/toast/lege
 view_selector/shortcut_bar/icons_sdf`, renderer/overlay support (`renderer.*`,
 `render/overlays.*`), scenario harness updates, plus pre-existing header diffs
 (`layout.h`, `legacy_chat.h`, `property_manager.h`, `sim_manager.h`, `metrics.h`); (2) the
-2026-07-02 polish set on the seven files from `docs/HANDOFF_SHOPCRAFT_GUI_POLISH.md` —
+2026-07-02 polish set on the seven files from `docs/HANDOFF_CHUDWARE_GUI_POLISH.md` —
 FM input fix (NoBringToFrontOnFocus removal), fully transparent columns (pills only),
 columns hugging the ribbon, Copilot collapse-to-pill, PropertyManager-inside-FeatureManager,
 sketch top-center DOF island + ribbon accept/deny cluster, feature readout panel, overlay
 column-dodging, PM FrameBg translucency fix. **Verify:** build green (flock'd ninja,
-exit 0); `AI_CAD_SHOT=m1` + `AI_CAD_SHOT=sketch` re-shot and eyeballed
+exit 0); `CHUDWARE_SHOT=m1` + `CHUDWARE_SHOT=sketch` re-shot and eyeballed
 (`scratch/land_verify/`). **Known open item:** the m1 scenario's reopen step reports
 `rev=0 features=0 (TREE MISMATCH)` — save/reopen feature-tree restore, suspected
 pre-existing (kernel-worker side, untouched by this work); filed for investigation.
@@ -833,7 +833,7 @@ Remaining NEEDS-LIVE click-tests are tracked as T-G2.
 Resumed T-G5 (claimed via `357860e`, no branch had been created). Established that Wave 1
 (F1 viewport, F2 theme, F3 platform, F4 worker seam) + the G1 CMake rewire are **already
 landed on master** (via `9d0d445` G1-integrate + `0c20c37` liquid-glass v2), so T-G5 is a
-verify-and-close, not a from-scratch port. **Verified DoD:** `aicad_ui_viewport` builds +
+verify-and-close, not a from-scratch port. **Verified DoD:** `chudware_ui_viewport` builds +
 links standalone (`cmake -S ui/viewport -B build/viewport && cmake --build build/viewport`,
 exit 0; `grep -r host/src ui/viewport` → only comments/AGENTS.md, no `#include`); F1 Kawase
 blur + `averageLuminance()` present (`renderer.h`/`viewport_impl.cpp`); zero OS `#ifdef` in
@@ -844,7 +844,7 @@ does not build AI-CAD2 because `property_manager.cpp` (committed) references
 `PanelField::selMulti`/`label` but the matching `ui/abstract/panel_spec.{h,cpp}` rewrite is
 **uncommitted in the main checkout**. Ephemerally applying that staged panel_spec (reverted
 after, not this branch's write-set) → AI-CAD2 links clean (exit 0) and
-`AI_CAD_NO_FILE_DIALOGS=1 AI-CAD2 --shot scratch/smoke.png` renders the full shell (ribbon +
+`CHUDWARE_NO_FILE_DIALOGS=1 AI-CAD2 --shot scratch/smoke.png` renders the full shell (ribbon +
 Model Tree + liquid-glass + Copilot, 1600×1000). **Blocker filed:** `work/questions/T-G5.md`
 — recommend committing the staged `panel_spec.{cpp,h}` to unbreak every AI-CAD2 build
 (team-wide, not T-G5-specific). **Gotcha:** headless `--shot` works without xvfb on this box
@@ -858,13 +858,13 @@ task changed **zero code** (branch = `origin/master` + claim commit) and instead
 AI-CAD2 from master and eyeball-verified each DAG verify scenario against the AI hints.
 **Build:** `cmake --preset linux-app` → `bin/AI-CAD2` links clean; `--selftest` OK.
 **Renders (scratch/tg6-shots/, gitignored):** `ribbon` (full Model ribbon, all cmds+glyphs,
-group labels), `ribbon`+`AI_CAD_TAB=1` (sketch-context ribbon Line/Rect/…/Exit Sketch,
+group labels), `ribbon`+`CHUDWARE_TAB=1` (sketch-context ribbon Line/Rect/…/Exit Sketch,
 "Sketch1"/"Fully Defined"), `explorer` (Files tab: Recent/Workspace tree), `settings`
 (Settings modal General/AI/Prompts/Advanced/Experimental), `tree` (real worker-built
 Base/Fillet/Shell FM tree). All show glass transparent columns w/ per-element pills,
-doc-tab band inside viewport, ShopCraft branding, "Engine live (WorkerClient, rev 3)".
+doc-tab band inside viewport, Chudware branding, "Engine live (WorkerClient, rev 3)".
 **S1** dock+rail (Model Tree↔Files switch) ✓; **S2** doc-tab band ✓ (multi-tab population
-blocked by deadlock below); **S3** ribbon + `AI_CAD_TAB` ✓✓; **S4** status bar + toast +
+blocked by deadlock below); **S3** ribbon + `CHUDWARE_TAB` ✓✓; **S4** status bar + toast +
 palette + settings search seam ✓; **S5** atlas glyphs render (real, no fallback boxes) ✓;
 **S6** explorer + settings ✓; **H5** compiles ✓ + sketch chrome/DOF solver live ✓ (2D
 entity-overlay shot blocked by deadlock). **Systemic pre-existing finding:** ScenarioRunner
@@ -881,9 +881,9 @@ known pre-existing reds (host-era ribbon manifest / absent SW_PARITY_SPEC). **To
 Chained off task/T-G6-migration-wave2 (merge order T-G6 → T-G7). C1–C6 already ported to
 master by the prior overhaul run (§§ C1–C6); this task verified they render on AI-CAD2 and
 fixed the C2 PropertyManager-form path. **Verified render** (scratch/tg7-shots/): C1 `tree`
-(real worker-built Base/Fillet/Shell), C3 `chat` (glass bubbles + action card + ShopCraft
+(real worker-built Base/Fillet/Shell), C3 `chat` (glass bubbles + action card + Chudware
 branding), C4 `pick`, C5 `equations`/`assembly`/`plan`, one-shot `ecad`. **C2 FIX (real
-bug):** `AI_CAD_SHOT=pmform AI_CAD_PMCMD=extrude` rendered the Model Tree, not the Extrude
+bug):** `CHUDWARE_SHOT=pmform CHUDWARE_PMCMD=extrude` rendered the Model Tree, not the Extrude
 form. Root cause: the pmform scenario `st.dispatch(cmd)`'d the command — which routes to
 `actionBus.submit()` and *executes* it (sets status, returns) without setting `activeTool` —
 so `drawInspector` (only called when `activeTool` non-empty, application.cpp:159; and host of
@@ -891,7 +891,7 @@ so `drawInspector` (only called when `activeTool` non-empty, application.cpp:159
 `ui/imgui/src/ui/scenarios.cpp` pmform sets `st.activeTool = cmd` (opens the data-driven form
 instead of executing); (2) `ui/abstract/panel_spec.cpp` `panelFormForCommand` now falls back to
 a bare spec NAME (explicit ribbon-command mappings still win), so the DoD's literal
-`AI_CAD_PMCMD=extrude` resolves the same form `extrude_boss` does. Reverified: the full Extrude
+`CHUDWARE_PMCMD=extrude` resolves the same form `extrude_boss` does. Reverified: the full Extrude
 PM form renders inside the FeatureManager tab (From/Direction1/Direction2/Thin Feature/Options,
 selector wells, dropdowns, depth+draft steppers, checkboxes, green✓/red✗ accept-deny), no
 separate PM tab — per AI hint. **G3-gate BLOCKER:** the "all 21 scenarios" DoD is gated on
@@ -900,10 +900,10 @@ issue #7 — 10/21 are ScenarioRunner step machines that deadlock offscreen on m
 re-scope decision requested from the foreman in work/questions/T-G7.md. **Touched:**
 ui/imgui/src/ui/scenarios.cpp, ui/abstract/panel_spec.cpp (+docs/task/question files).
 
-## 2026-07-06 — sim perf root cause: libaicad was built -O0 (FEA ~16x slow)
+## 2026-07-06 — sim perf root cause: libchudware was built -O0 (FEA ~16x slow)
 
 **Symptom:** simple FEA simulations "extremely long" on Linux despite powerful hardware.
-**Root cause:** the core library (`libaicad.so`) was compiled **unoptimized (-O0)**. All
+**Root cause:** the core library (`libchudware.so`) was compiled **unoptimized (-O0)**. All
 `core/build-*` dirs had an EMPTY `CMAKE_BUILD_TYPE`; the `-O3 -DNDEBUG` flags live only in
 `CMAKE_CXX_FLAGS_RELEASE`, applied solely for a Release build type. `scripts/gate.sh`
 configured `core/build-linux` without `-DCMAKE_BUILD_TYPE=Release`, and its
@@ -914,8 +914,8 @@ Ninja** — so the gate produced an -O0 core while printing "PASS (Release)".
 -O0-sensitive (lost inlining/vectorization).
 **Fix:** (1) `scripts/gate.sh` now configures with `-DCMAKE_BUILD_TYPE=Release`. (2) Reconfigured
 + rebuilt the in-use dirs `core/build-linux` AND `core/build-occt-linux` (the GUI's in-process
-`.so` via `cpp_core.cpp` -> baked `AICAD_DEFAULT_LIBAICAD`) at Release. **Note:** the stale
-`services/dist/AI-CAD/libaicad.so` (2026-07-02, -O0, predates `sim_run_static`) still shadows
+`.so` via `cpp_core.cpp` -> baked `CHUDWARE_DEFAULT_LIBCHUDWARE`) at Release. **Note:** the stale
+`services/dist/Chudware/libchudware.so` (2026-07-02, -O0, predates `sim_run_static`) still shadows
 `core/build-linux` in `core_bridge` resolution order — refresh or remove it so tool/worker
 paths don't load stale -O0 code. Secondary levers (not yet done): single-threaded Netgen
 mesher, no mesh caching (re-meshes every solve), double STEP parse, tet10-by-default.
@@ -929,14 +929,14 @@ The interactive CEF panel (`cef_web_view.cpp`, app process) and the headless
 which corrupts it, and a login in the panel did not carry into headless fetch
 (OSCrypt is per-process, so raw dir-sharing can't move a session). Fix: the panel
 now uses its OWN persistent dir `panel_profile_dir()` = `_warm_profile`→`_panel_profile`
-(env `AI_CAD_CEF_PANEL_PROFILE_DIR`); the daemon stays sole owner of `_warm_profile`.
+(env `CHUDWARE_CEF_PANEL_PROFILE_DIR`); the daemon stays sole owner of `_warm_profile`.
 Login carry rides the existing `exportSession → browser_session_import` seam: the
 worker handler (`engine_oracle/embed_rpc.py`) now also pushes the exported jar to a
 new daemon `import_session` RPC (`cef_client.import_session` → `headless_import_cookies`
 in `cef_headless.cpp`, `CefCookieManager::SetCookie` + `FlushStore` into `_warm_profile`),
 off-thread so a cold daemon spawn never stalls the login chip. Files: `cef_headless.{h,cpp}`,
 `cef_daemon.cpp`, `cef_web_view.cpp`, `services/browser/cef_client.py`, `embed_rpc.py`.
-Verified: CEF build (`ninja -C host/build-cef AI-CAD`) links; `cef_client` ping + a
+Verified: CEF build (`ninja -C host/build-cef Chudware`) links; `cef_client` ping + a
 login-carry smoke (inject cookie via `import_session`, `fetch` a local echo server,
 cookie carried) PASS; embed pytest 39 passed/1 skip. **Deferred fast-follow** (only if
 in-panel challenge rates warrant it): bidirectional seed — on panel open, pull the
@@ -949,7 +949,7 @@ ribbon handlers (untouched here).
 
 ## 2026-07-10 — T-SIM5: OpenFOAM accurate-CFD live path (branch task/T-SIM5-openfoam)
 run_cfd_accurate is now production-real on Linux: new `LinuxRunner` in
-engine_oracle/sim/foam_runner.py (sourced-env / AICAD_OPENFOAM / system / user-space
+engine_oracle/sim/foam_runner.py (sourced-env / CHUDWARE_OPENFOAM / system / user-space
 conda detection, strict subprocess exec — GPL isolation, license_debt.md row 18);
 tools/provision_openfoam.py gained a no-sudo conda-forge install path (installed live:
 OpenFOAM v2412); foam_cht.py grew the T-FIN19 multi-solid seam
@@ -957,9 +957,9 @@ OpenFOAM v2412); foam_cht.py grew the T-FIN19 multi-solid seam
 heat sources, coupled BCs; openfoam.py passes thermal["solids"], foam_post aggregates
 per-region temperatures). Live-verified: foam_validation sphere/cube Cd PASS in-band,
 2-solid board+chip CHT end-to-end. sim_audit.py gained an opt-in live validation leg
-(AICAD_SIM_AUDIT_LIVE_FOAM=1). Gotchas: OpenFOAM case files must stay ASCII (`_w` writes
+(CHUDWARE_SIM_AUDIT_LIVE_FOAM=1). Gotchas: OpenFOAM case files must stay ASCII (`_w` writes
 ascii); conda env bashrc lives at <env>/etc/bashrc and MUST be sourced (bare exe fails on
-etc/controlDict lookup); mcp test suite legs needing libaicad were skipped here (worktree
+etc/controlDict lookup); mcp test suite legs needing libchudware were skipped here (worktree
 has no staged dist). Deferred: MCP-level exposure of the CHT variant (T-FIN19 will wire
 board solids + heat sources into thermal["solids"]).
 
@@ -1059,7 +1059,7 @@ Files: `core/sketch/sketch.cpp`, `core/doc/session.{h,cpp}`, `core/doc/document.
 `core/util/aicm_handoff.{h,cpp}`: POSIX shm / Win named mapping publish+map with
 `aicm-shm://` URIs; session tess + assembly AICM publish via handoff (file fallback);
 host/`ui/viewport` `loadAicmFile` maps URIs; `doc_close` + keep-last-3 revs free objects.
-CEF: cold GUI no longer calls `CefInitialize` (opt-in `AI_CAD_CEF_EARLY=1`); first
+CEF: cold GUI no longer calls `CefInitialize` (opt-in `CHUDWARE_CEF_EARLY=1`); first
 `CefWebView::open` initializes. Profiler: absolute-time cadence (~1 kHz under load),
 ucontext leaf PC (no longer 100% self-time in `sample_handler`), ELF `.symtab`
 symbolization fallback; summary ticks/dropped diagnostics. Verified: shm lifecycle
@@ -1069,15 +1069,15 @@ symbolization fallback; summary ticks/dropped diagnostics. Verified: shm lifecyc
 **2026-07-10 — T-PERF10 AICM handoff coverage follow-up.** Cold-open step+ cache
 path, field-eval SCLR AICMs, and sim overlay AICMs now publish via `aicm_handoff`
 (same `aicm-shm://` consumer path as live rebuilds) instead of always writing
-`/tmp/aicad_cpp_docs` / `aicad_overlay_*` files. `aicad_geom_occt` links
-`aicad_util` for overlay publish. Joint re-verify: lifecycle still 0→10→0 with
-0 new `/tmp/aicad_cpp_docs` files; m1 smoke no CEF init lines; profiler ~2k/2s.
+`/tmp/chudware_cpp_docs` / `chudware_overlay_*` files. `chudware_geom_occt` links
+`chudware_util` for overlay publish. Joint re-verify: lifecycle still 0→10→0 with
+0 new `/tmp/chudware_cpp_docs` files; m1 smoke no CEF init lines; profiler ~2k/2s.
 
 **2026-07-10 — joint-verify fixes (CEF eager + mesh join + FPS).** Vendor
 browser open crashed (`terminate called without an active exception` /
 `std::thread::~thread` on exit): CEF lazy-after-GLFW is not viable on this
 stack — restore eager `CefInitialize` before `run_gui` (opt-out
-`AI_CAD_CEF_LAZY=1` only). Join T-PERF3 mesh-loader thread on `run_gui`
+`CHUDWARE_CEF_LAZY=1` only). Join T-PERF3 mesh-loader thread on `run_gui`
 teardown. Performance profiler window shows labeled live FPS (header +
 top-right overlay) while open.
 
@@ -1211,7 +1211,7 @@ gated on doc-hash + engine key + per-component `{path,size,mtime}` fingerprints 
 (only ever written after a fully-ok build; atomic tmp+rename ⇒ crash-safe). `doc_open`'s assembly
 branch replays it display-only (asm_result stays null; every consumer already lazy-rebuilds).
 (4) `compile_assembly` prefetches component loads on a thread pool (per-key shared_future dedup
-in `load_component`; kill switch `AICAD_ASM_PARALLEL_LOAD=0`). Contract §4 appended
+in `load_component`; kill switch `CHUDWARE_ASM_PARALLEL_LOAD=0`). Contract §4 appended
 (contracts/stepplus.md). Measured (rocket-plane, 29 parts): cold 14.3s→8.3s, warm 2.7s→18ms,
 component-changed reopen →3.1s, unchanged reopen →51ms. Deferred: seed the assembly tess cache
 from a part's `cache.aicm` (needs a core-side AICM reader); LRU caps on the component/tess caches.
@@ -1229,8 +1229,8 @@ assembled K + factorization and re-solves just the RHS — key excludes loads/yi
 load-sweep is a factor-cache HIT (`FeaStaticResult.factor_cache_hit`, `fea_factor_cache_stats()`).
 (3) `fea_run` faceset membership now uses a deterministic spatial hash + per-mesh faceset→nodes
 cache (analytic-surface path and empty-fixture hard-fail preserved). (4) Optional CUDA D3Q19 LBM
-(`lbm_cuda.cu`, `-DAICAD_WITH_CUDA=ON`, default OFF; CUDA 13.3): runtime backend `auto|cpu|cuda`
-via `LbmParams.backend` / `AI_CAD_LBM_BACKEND`, CPU OpenMP path is the guaranteed fallback,
+(`lbm_cuda.cu`, `-DCHUDWARE_WITH_CUDA=ON`, default OFF; CUDA 13.3): runtime backend `auto|cpu|cuda`
+via `LbmParams.backend` / `CHUDWARE_LBM_BACKEND`, CPU OpenMP path is the guaranteed fallback,
 float32 reduction parity kept, backend+fallback surfaced in `LbmResult`. CPU-only `./build.sh core`
 green; ctest `sim|tet10|modal|thermal|studies|prof_phases|governor|overlay` 9/9; CUDA build
 `test_sim` 13/13. **ECAD MCP** (`services/mcp/*ecad*`, `engine_oracle/ecad/orchestrator.py`):
@@ -1241,7 +1241,7 @@ finder (shared `_ECAD`/`_THERMAL`); monotonic warm recovery; `power_budget` unde
 added a pytest `tools` fixture that fixed 40 collection errors (→0). ECAD suite 91 passed; main
 harness ALL PASS. **Parts** (`engine_oracle/parts_hub/*`, `services/mcp/parts_tools.py`,
 `services/browser/health.py`): bounded the deadline-less synchronous live-vendor fan-out in
-`PartsHub.search` (concurrent + `AI_CAD_PARTS_LIVE_BUDGET_S`, default 4s; partial results + honest
+`PartsHub.search` (concurrent + `CHUDWARE_PARTS_LIVE_BUDGET_S`, default 4s; partial results + honest
 timeout notices; `include_live=False` does zero network) — this was the root cause of the
 `part_search` 30s hangs; facet alias parity in `gui_rpc._filter_items` (bore↔bore_mm); `part_source`
 now passes taxonomy route sites; new `LocalLibraryAdapter` federates the watched vendor_parts library
@@ -1282,7 +1282,7 @@ Product v4 (OAuth2 client-credentials + keyword search → VendorPart) and Mouse
 narrow-MPN product drill-down and fixed the dfrobot search route; vendors_health honesty confirmed.
 **Compact MCP serving** (new `services/mcp/result_serving.py`): summary/list/full detail + pagination +
 priority-drop that never drops ok/summary/counts/erc-drc/hint/next_actions, compact JSON by default
-(`AICAD_MCP_PRETTY=1` to pretty). Applied to `ecad_status` (33-comp board: **784 tokens** summary vs
+(`CHUDWARE_MCP_PRETTY=1` to pretty). Applied to `ecad_status` (33-comp board: **784 tokens** summary vs
 ~5.6k before; `detail=full` retains full ref+net sets), `part_search` (row projection, 947 tok vs 4.4k;
 full record still via `part_get`), and `ecad_simulate` (default probe cap + always-summarized tran/ac,
 no per-timestep arrays). Gates: ECAD MCP suite 115 passed; parts/providers/library/EM 367 passed/7
@@ -1324,7 +1324,7 @@ and the user (decisions D1–D4). Executed off master in subagent waves, commit+
   the-loop LIVE via Renode) and `scripts/bench_battery_charger.py` (10/10 PASS: real MNA CC→CV + LVD
   disconnect + OVP/OCP/OTP trips, safety-in-the-loop over-temp FAULT injection LIVE). Both governed +
   solve-state-cached + per-stage PASS/WARN/FAIL/SKIP cards with wall-times; opt-in gate.sh stages
-  (`AICAD_RUN_BENCH_FC` / `AICAD_RUN_BENCH_CHG`).
+  (`CHUDWARE_RUN_BENCH_FC` / `CHUDWARE_RUN_BENCH_CHG`).
 - **Renode 1.16.1 port:** curated flat platforms (`stm32f4_discovery.repl`, `stm32f103.repl`) ported to
   1.16.1 types (`STM32_GPIOPort`, `STM32F4_I2C`); ADC PythonPeripheral stub ported to inline `script:` +
   `request.IsInit/IsRead/Value`; live hello-uart test firmware now enables USART TE.
@@ -1368,26 +1368,26 @@ tests/return packets); cost/latency medians null until real ledger usage events;
 camera still stub; continuous phone-photo polling; splat overlay in app.cpp keeps its own fixed
 perspective preview camera (deliberate).
 
-## 2026-07-14 — billet-web: multi-user streamed web sessions (T-WEB1)
-Turned Billet into a self-hostable web service: per-user rootless-podman session containers (Fedora 44 base staging the host build, Xvfb + noVNC verified / Selkies documented-blocked on pip evdev, VirtualGL EGL for ≤2 GPU seats via CDI) streamed into a FastAPI portal (`Webservice/gateway/`: CF Access JWT auth w/ JWKS, session manager with mem/cpu/pids caps + idle reaper + RAM guard + container adoption-on-restart, HTTP/WS reverse proxy, `/transfer`, collapsible shoutbox w/ SQLite+presence). Edge = Cloudflare Tunnel + Access on cad.scootware.us (provisioned via `Webservice/deploy/cf_provision.py`; Google IdP manual, OTP live). PLM sharing = T-R7 folder-remote subset in `services/plm/remote.py` (seed/clone/sync CAS push, §6.4 copy-as-variant, lock CAS) + author injection from `AICAD_USER_ID` env; wired into worker_rpc + MCP. Deploy = systemd user units + monitor timer (`Webservice/deploy/`). Gotchas: podman run -d hangs pipe-based subprocess capture (conmon inherits fds — use temp files); Fedora-built binaries need glibc 2.43 (Ubuntu bases DOA); noVNC `path` param must carry the proxy prefix. Advisor Q&A: work/questions/T-WEB1.md. SECURITY: Cloudflare token+R2 keys were pushed to public GitHub — untracked now, ROTATION REQUIRED (RUNBOOK §SECURITY). Deferred: selkies/WebCodecs backend, Entra IdP (needs UA IT or oauth2-proxy phase-2), locks surfacing in status(), warm-seat pool.
+## 2026-07-14 — chudware-web: multi-user streamed web sessions (T-WEB1)
+Turned Chudware into a self-hostable web service: per-user rootless-podman session containers (Fedora 44 base staging the host build, Xvfb + noVNC verified / Selkies documented-blocked on pip evdev, VirtualGL EGL for ≤2 GPU seats via CDI) streamed into a FastAPI portal (`Webservice/gateway/`: CF Access JWT auth w/ JWKS, session manager with mem/cpu/pids caps + idle reaper + RAM guard + container adoption-on-restart, HTTP/WS reverse proxy, `/transfer`, collapsible shoutbox w/ SQLite+presence). Edge = Cloudflare Tunnel + Access on cad.scootware.us (provisioned via `Webservice/deploy/cf_provision.py`; Google IdP manual, OTP live). PLM sharing = T-R7 folder-remote subset in `services/plm/remote.py` (seed/clone/sync CAS push, §6.4 copy-as-variant, lock CAS) + author injection from `CHUDWARE_USER_ID` env; wired into worker_rpc + MCP. Deploy = systemd user units + monitor timer (`Webservice/deploy/`). Gotchas: podman run -d hangs pipe-based subprocess capture (conmon inherits fds — use temp files); Fedora-built binaries need glibc 2.43 (Ubuntu bases DOA); noVNC `path` param must carry the proxy prefix. Advisor Q&A: work/questions/T-WEB1.md. SECURITY: Cloudflare token+R2 keys were pushed to public GitHub — untracked now, ROTATION REQUIRED (RUNBOOK §SECURITY). Deferred: selkies/WebCodecs backend, Entra IdP (needs UA IT or oauth2-proxy phase-2), locks surfacing in status(), warm-seat pool.
 
-## 2026-07-15 — billet-web finish-line (T-WEB2)
+## 2026-07-15 — chudware-web finish-line (T-WEB2)
 Advisor consult (work/questions/T-WEB2.md) closed v1: invite-key auth REJECTED (strict CF Access + users.yaml stays the only trust root; operator friction solved by `cf_provision.py --sync-users` pushing users.yaml emails into the Access policy — example.com entries never synced). PLM bootstrap glue landed: `gateway/plm_seed.py` seeds bare remotes WITH a real tip (Demo = samples/mech_part Bracket; empty-bare clones break origin registration), session entrypoint clones `/plm/*.git` → `~/Projects/<name>` and does pull-only sync on restart — auto-push on stop is advisor-overruled (unrehearsed saves would spam the shared timeline). Fixed two live bugs: (1) session volumes lacked SELinux relabel — container_t vs user_home_t AVC meant NOTHING persisted in seats; now `:U,Z` (home) / `:U,z` (plm). (2) /transfer wrote host-side into subuid-owned volumes (PermissionError) — rewritten through `podman cp` on the running seat (labels+userns correct, 409 without a session). novnc is now the declared default stream backend (selkies pip broken on Fedora). monitor.timer live-fired. Desktop app untouched — webservice remains an additive deployment of the same binaries.
 
-## 2026-07-15 - billet-web ops wave (autonomous)
+## 2026-07-15 - chudware-web ops wave (autonomous)
 Admin /admin gains a live-ops layer: GET /api/admin/ops (sessions merged with
 podman stats + host RAM/VRAM/load), POST /api/admin/sessions/{sid}/stop,
 GET /api/admin/screenshot/{sid} (xwd|magick thumbnail, podman_bytes helper),
 GET /api/admin/logs (journal tail). Portal gains "Paste text..." ->
 POST /api/sessions/paste (xdotool type, argv-only, 20k cap). Security headers
-middleware (nosniff/same-origin/SAMEORIGIN). Nightly billet-backup.timer tars
-~/billet-web-data under podman unshare (subuid homes), keep-14, wired into
+middleware (nosniff/same-origin/SAMEORIGIN). Nightly chudware-backup.timer tars
+~/chudware-web-data under podman unshare (subuid homes), keep-14, wired into
 setup.sh; RUNBOOK section (f). Gateway tests 24/24; live-verified: ops JSON,
 560px PNG thumbnail, paste typed into seat prompt, dashboard rendered, backup
 tarball restored listing. Gotcha: host tar cannot read :U-chowned homes -
 anything touching them must run inside podman unshare.
 
-## 2026-07-15 - billet-web ops wave 2
+## 2026-07-15 - chudware-web ops wave 2
 Admin spectate: stream proxy (HTTP+WS) now admits role=admin alongside the
 owner; /admin thumbnails open view-only noVNC popouts of any live seat.
 PATCH /api/admin/users/{email} edits display/role/heavy/project/doc in place
@@ -1395,17 +1395,17 @@ PATCH /api/admin/users/{email} edits display/role/heavy/project/doc in place
 (role, GPU seat) and project cell is click-to-edit. Tests 26/26; live-verified
 spectate popup ("Connected", 1920x1080 canvas) + PATCH round-trip. Note: dev
 gateway upsert rewrites the repo users.yaml template - restored via checkout;
-prod uses ~/billet-web-data/users.yaml so this only affects dev smoke.
+prod uses ~/chudware-web-data/users.yaml so this only affects dev smoke.
 
-## 2026-07-15 - billet-web ops wave 3
+## 2026-07-15 - chudware-web ops wave 3
 Admin ops bar gains sibling-unit health chips (systemctl is-active for
-billet-cloudflared/monitor/backup) and a pause-new-sessions switch backed by
+chudware-cloudflared/monitor/backup) and a pause-new-sessions switch backed by
 PUT /api/admin/refuse-new (same REFUSE_NEW flag the disk monitor owns, so the
 monitor can re-assert it under disk pressure). Tests 27/27; live ops payload
 showed all three units active. RUNBOOK (f) updated for waves 2+3.
 
 ## 2026-07-15 — daemon lifecycle + GUI reconnect + config merge (lane1 / mega-20)
-`aicad-hostd --stop` now escalates when the control socket is dead but the pidfile process still lives: 2 s RPC timeout → pidfile `SIGTERM` → 3 s wait → `SIGKILL` (`core/hostd/main.cpp`; `--stop --force` still stops agent children first). Doc-GC keeps agent/mcp-origin docs open longer so finished mission parts stay openable from the GUI: base orphan grace `AICAD_DOC_GC_GRACE_S` (default 90 s), agent floor `AICAD_DOC_GC_AGENT_GRACE_S` (default 1800 s / 30 min), `AICAD_DOC_GC=0` disables (`core/hostd/doc_registry.{h,cpp}`). GUI: sticky status-bar chip "Engine daemon unreachable — retrying" while `AppState::daemonUnreachable`, proactive reconnect with 1s/2s/5s/10s backoff, and re-bootstrap on `reconnectGeneration` bump so tabs re-subscribe/re-mirror after drain-replace (`host/src/core/engine_events.cpp`, `host/src/ui/status_bar.cpp`, `AI_CAD_SHOT=daemon_h2`). `saveSettings` is merge-not-replace and now merge-overlays `keys`/`experimental` so harness-written entries (e.g. `keys.openrouter`) survive a load→save round-trip (`host/src/core/app_state.cpp`). **Gotcha:** bare `--stop` refuses while agent children run; use `--force`. **Deferred:** none in this lane.
+`chudware-hostd --stop` now escalates when the control socket is dead but the pidfile process still lives: 2 s RPC timeout → pidfile `SIGTERM` → 3 s wait → `SIGKILL` (`core/hostd/main.cpp`; `--stop --force` still stops agent children first). Doc-GC keeps agent/mcp-origin docs open longer so finished mission parts stay openable from the GUI: base orphan grace `CHUDWARE_DOC_GC_GRACE_S` (default 90 s), agent floor `CHUDWARE_DOC_GC_AGENT_GRACE_S` (default 1800 s / 30 min), `CHUDWARE_DOC_GC=0` disables (`core/hostd/doc_registry.{h,cpp}`). GUI: sticky status-bar chip "Engine daemon unreachable — retrying" while `AppState::daemonUnreachable`, proactive reconnect with 1s/2s/5s/10s backoff, and re-bootstrap on `reconnectGeneration` bump so tabs re-subscribe/re-mirror after drain-replace (`host/src/core/engine_events.cpp`, `host/src/ui/status_bar.cpp`, `CHUDWARE_SHOT=daemon_h2`). `saveSettings` is merge-not-replace and now merge-overlays `keys`/`experimental` so harness-written entries (e.g. `keys.openrouter`) survive a load→save round-trip (`host/src/core/app_state.cpp`). **Gotcha:** bare `--stop` refuses while agent children run; use `--force`. **Deferred:** none in this lane.
 
 ## 2026-07-15 — mission-terminal autosave/close (Lane S / mega-22)
 At every mission terminal (`done` / `deliver_partial` / `needs_correction` / `blocked` / `failed`), `_terminal_autosave_close_docs` saves mission-minted geometry docs as native `.step+` into `reports/runs/<run_id>/parts/` plus a GUI workspace copy, writes `saved_parts_manifest.json` / ledger `terminal_autosave_close`, then closes them (`services/agent/loop.py`; GUI-adopted `origin_kind=gui` exempt; best-effort, never blocks return). Tests: `services/agent/test_autosave_close.py`. **Gotcha:** empty/no-geometry docs are skipped, not failed. Live smoke under `reports/runs/lane-s-live-smoke/`.
@@ -1420,7 +1420,7 @@ Router clearance halo is floored by opts `min_clearance` / `min_clearance_mm` in
 Any edit to `services/agent/agent_turn.py` (or planning-node thrash logic in the turn loop) must clear the mega-24 offline planning-node repro before live spend: force-first on junk-JSON, bare handoff, and typed-refusal gate (U24/V24). Look for `FINAL_OFFLINE_OK` / the offline suite in `services/agent/test_mega24_fixes.py` plus the mega regression suites. Live symptom without the gate: DAG nodes burn budgets on `no_code` / `max_iters` / `delegate_required` with zero tools (mega-23 class). Grading remains authoritative over terminal labels — a 9/9 verify must not stick as `deliver_partial`/`blocked` (Lane T terminal-status fix is the companion).
 
 ## 2026-07-15 — viewport doc-switch perf: `doc_activate` + GUI event-storm guards
-Tab switching onto docs the shared daemon already built (the audit-the-AI's-part flow) no longer forces a full recompile: new read-only RPC `doc_activate` (`core/doc/session.cpp/.h`, dispatch `core/api/libaicad.cpp`, ro-viewer allowlist `core/hostd/doc_registry.cpp`, contract row `contracts/worker_rpc.md`) serves the session's warm read-cache compile (`compiled@compiled_rev==revision` — every mutating op leaves it warm) as a full ops-response with a republished `tess.aicm_path`; cold/stale cache falls back to the forced-rebuild body. All GUI activation callers switched: `switchToTabCore` (extracted to `AppState::activateTabDocAsync`, `host/src/core/doc_tabs.cpp`), `DocMirror::activate` (both `host/src/core/` and `services/worker/` copies), post-open mesh fetch (`feature_tree.cpp`), post-agent-run refresh (`app.cpp`), `legacy_chat.cpp`. Stale-daemon compat: `engine::call` (`services/worker/engine_backend.cpp`) retries `doc_activate`→`doc_rebuild` once on "unknown method" — a long-lived hostd predating the RPC degrades to slow, not broken. GUI swarm-storm guards: `openMirrorTab`'s per-doc `doc_tree` (title fetch) went async on `st.rpc` — it took the doc's engine lock and parked the GL thread whenever an agent was mid-op (×N docs at bootstrap); the mesh-loader thread now serves VISIBLE loads ahead of queued background prewarm parses; `drainMeshLoads` caps background prewarm GPU uploads at 2/frame (rest re-queued). Verified: C-ABI parity smoke (doc_activate ≡ doc_rebuild response, revision unchanged), live-daemon swarm smoke (6 docs churning, GUI mirrors + first-switch total 102 ms), `AI_CAD_SHOT=tabperf` sub-ms warm switches, core ctest `document`/`selectors` green. **Gotcha:** `doc_rebuild` keeps its forced semantics (Convert-Entities re-sync etc.) — don't "optimize" callers that rely on the recompile onto `doc_activate`. Oracle untouched (doc-cpp ids never route to Python).
+Tab switching onto docs the shared daemon already built (the audit-the-AI's-part flow) no longer forces a full recompile: new read-only RPC `doc_activate` (`core/doc/session.cpp/.h`, dispatch `core/api/libchudware.cpp`, ro-viewer allowlist `core/hostd/doc_registry.cpp`, contract row `contracts/worker_rpc.md`) serves the session's warm read-cache compile (`compiled@compiled_rev==revision` — every mutating op leaves it warm) as a full ops-response with a republished `tess.aicm_path`; cold/stale cache falls back to the forced-rebuild body. All GUI activation callers switched: `switchToTabCore` (extracted to `AppState::activateTabDocAsync`, `host/src/core/doc_tabs.cpp`), `DocMirror::activate` (both `host/src/core/` and `services/worker/` copies), post-open mesh fetch (`feature_tree.cpp`), post-agent-run refresh (`app.cpp`), `legacy_chat.cpp`. Stale-daemon compat: `engine::call` (`services/worker/engine_backend.cpp`) retries `doc_activate`→`doc_rebuild` once on "unknown method" — a long-lived hostd predating the RPC degrades to slow, not broken. GUI swarm-storm guards: `openMirrorTab`'s per-doc `doc_tree` (title fetch) went async on `st.rpc` — it took the doc's engine lock and parked the GL thread whenever an agent was mid-op (×N docs at bootstrap); the mesh-loader thread now serves VISIBLE loads ahead of queued background prewarm parses; `drainMeshLoads` caps background prewarm GPU uploads at 2/frame (rest re-queued). Verified: C-ABI parity smoke (doc_activate ≡ doc_rebuild response, revision unchanged), live-daemon swarm smoke (6 docs churning, GUI mirrors + first-switch total 102 ms), `CHUDWARE_SHOT=tabperf` sub-ms warm switches, core ctest `document`/`selectors` green. **Gotcha:** `doc_rebuild` keeps its forced semantics (Convert-Entities re-sync etc.) — don't "optimize" callers that rely on the recompile onto `doc_activate`. Oracle untouched (doc-cpp ids never route to Python).
 
 ## 2026-07-16 — empty AI-part recovery auto-discard
 Recover? prompt was filling with dozens of blank "AI part" tabs (no features/sketches). Empty docs are now discarded at every recovery boundary: `doc_list` exposes `empty`/`feature_count`/`component_count`; autosave skips empties; `retireDoc`/doc-GC refuse to orphan them; crash-tier register + `recovery_list` purge empty `.step+` via miniz document.json peek. Files: `core/doc/session.cpp`, `core/hostd/autosave.{h,cpp}`, `core/hostd/server.cpp`, `core/CMakeLists.txt` (hostd↔miniz), `contracts/worker_rpc.md`. Verified with a disposable hostd instance (empty orphan purged, real retained; new part reports `empty:true`). Restart hostd/GUI to pick up the new binary.
@@ -1464,7 +1464,7 @@ Files Open, Settings auto-record toggle, History save pill). Contracts:
 button, not a live watcher. Gotcha: a concurrent repo process swept the worktree
 into master mid-session — all work landed on `origin/master` regardless.
 
-## 2026-07-17 — billet-web stability: reconnect deadlock + restart-flapping
+## 2026-07-17 — chudware-web stability: reconnect deadlock + restart-flapping
 
 Two root-caused stability fixes for the shared web service (chudware.com) plus a
 portal tweak. **(1) Render-thread reconnect deadlock (`services/ipc/ipc_client.*`,
@@ -1479,23 +1479,23 @@ froze permanently (the latency-amplified "page stops responding"). New
 runs connect+hello inline under that single held lock; on contention it sets
 `*deferred` and returns so the frame loop skips the tick (no backoff) and keeps the
 event loop alive. Native path (`tryReconnect`) unchanged. **(2) Restart-flapping
-(`Webservice/deploy/install_webd.sh`, `billet-webd-sync.service`,
-`Webservice/gateway/engine_bridge.py` + `app.py`).** `billet-webd-sync.path`
+(`Webservice/deploy/install_webd.sh`, `chudware-webd-sync.service`,
+`Webservice/gateway/engine_bridge.py` + `app.py`).** `chudware-webd-sync.path`
 restarted the live shared daemon on EVERY dev/harness rebuild (10+ restarts/2h),
 dropping every connected user. `install_webd.sh --restart` now sha-skips redundant
 re-fires and defers the restart while the gateway reports live engine bridges
-(polls `/healthz.engine_bridges`, up to `BILLET_WEBD_RESTART_MAX_WAIT=600s`); sync
+(polls `/healthz.engine_bridges`, up to `CHUDWARE_WEBD_RESTART_MAX_WAIT=600s`); sync
 `.service` `TimeoutStartSec=900` covers the wait. Verified: browser survived a live
 daemon restart with 8–192ms poll latency (no freeze) + `daemon reconnected (gen=2)`.
 Provider-sharing confirmed already-correct: the shared daemon reads Hunter's
-`~/.local/share/AI-CAD/config.json` per turn with no per-user isolation — a web
+`~/.local/share/Chudware/config.json` per turn with no per-user isolation — a web
 user's `agent_ask_v2` spends his provider creds (verified live, `xai-sub`). Caveat:
 `xai-sub` is OAuth and C++ never refreshes it (`core/agent/config.cpp:438`), so a
 long desktop-offline stretch could stale the token; stable `keys.xai` exists but
 the active `xai-sub` name doesn't fall back to it. Portal: removed the
 `@ua.edu`/`@crimson.ua.edu` sign-in footer (`gateway/static/index.html`).
 
-## 2026-07-17 — billet-web: main-thread engine-call deadlock (drag/interactive freeze)
+## 2026-07-17 — chudware-web: main-thread engine-call deadlock (drag/interactive freeze)
 
 Follow-up to the reconnect-deadlock fix, same class, broader trigger. Dragging an
 on-canvas manipulator (push-pull face arrow, Instant3D dim handles) — and "many
@@ -1539,7 +1539,7 @@ Tasks button (legacy_chat.cpp). Wave 2: AI-Settings Model-Role tooltips + Vision
 in the overlay + a dormant Moonshot/Kimi key field (legacy_chat.cpp, settings_modal.cpp,
 model_registry.h); webservice — full file-action routing on the WASM client (workspace Open/
 SaveAs/folder browser, recursive copy, durable recents; the browse dialog JS lives in
-host/wasm/billet_web_dialogs.js via --js-library to dodge the EM_ASM CPP quote/comma trap),
+host/wasm/chudware_web_dialogs.js via --js-library to dodge the EM_ASM CPP quote/comma trap),
 local provider sign-in sharing (engine_bridge forwards provider/model selection but strips
 secrets; new read-only GET /api/providers), and a mobile version (responsive gateway pages +
 WASM touch HUD/multitouch orbit-pan-pinch + narrow-viewport layout, all under #ifdef
@@ -1550,10 +1550,10 @@ EM_ASM top-level commas in app.cpp (GCC tolerated, clang/em++ errored). Verified
 crash-check smokes. Deferred to user: live-turn visuals (forging anim, tool-image expansion,
 routing card) need a real model; gateway pytest needs the deploy venv (fastapi absent here).
 
-## 2026-07-17 — billet-web /admin terminal: shared, saved, concurrent (tmux)
+## 2026-07-17 — chudware-web /admin terminal: shared, saved, concurrent (tmux)
 The `/admin` browser terminal is no longer a private, ephemeral per-connection shell.
 It's now backed by named **tmux** sessions on the gateway host (socket
-`$BILLET_TMUX_SOCKET`, default `billet`): sessions survive browser disconnects *and*
+`$CHUDWARE_TMUX_SOCKET`, default `chudware`): sessions survive browser disconnects *and*
 gateway restarts, and multiple admins can attach to the same session at once and drive
 the same `omp` — so the team can watch/pick up the actual work in flight. Each WS is one
 `tmux attach` client (its own PTY); closing a tab only detaches (SIGHUP the client), the
@@ -1608,10 +1608,10 @@ extrude HexBody + hole M3ClearanceBore, vol ≈ 277 mm³). Before the modeler.md
 failed the model stage 5× (over-constraining the hex primitive with dangling/duplicate
 constraint refs) — the prompt fix cured that at the root.
 
-**Gotchas / deferred:** (1) `core/build-linux/bin/libaicad.so` is a SLIM (no-OCCT)
+**Gotchas / deferred:** (1) `core/build-linux/bin/libchudware.so` is a SLIM (no-OCCT)
 build that `./build.sh core` does NOT relink — it was stale from a prior day and
 rejected the (already-supported) flat `add_feature` form, which cost a wasted debug
-cycle; the PRODUCTION lib is `host/build-linux/bin/libaicad.so` staged from
+cycle; the PRODUCTION lib is `host/build-linux/bin/libchudware.so` staged from
 `core/build-occt-linux` — always test against that. (2) grok-4.5 is slow per call
 (~100-150 s with reasoning); a full solo run including the review/refine loop can exceed
 700 s even though the geometry builds on the first model pass — this is model latency,
@@ -1627,8 +1627,8 @@ bubble-streaming compile clean but want a human visual pass in the running app.
 ### AI part naming (memory stage repurposed) + name propagation + context meter
 Repurposed the C++ design run's final MEMORY stage into a lightweight PART-NAMING step
 (`core/agent/run.cpp`): one model call now returns a short name (`services/agent/prompts/memory.md`),
-applied in-engine via new `doc_set_name(doc_id,name)` (`core/doc/session.{h,cpp}` + `aicad_call`
-dispatch in `core/api/libaicad.cpp`); the stage emits a `part_named` event and threads `part_name`
+applied in-engine via new `doc_set_name(doc_id,name)` (`core/doc/session.{h,cpp}` + `chudware_call`
+dispatch in `core/api/libchudware.cpp`); the stage emits a `part_named` event and threads `part_name`
 into the run result. It NO LONGER writes `cache/runs/<run_id>/memory.json` — that summary was never
 reloaded (`state.memory` starts empty), so it was pure per-build token waste. Host side
 (`host/src/app.cpp` run-finish drain, `jobs.cpp`, `feature_tree.{h,cpp}`, `app_state.h`): on finish it
@@ -1639,7 +1639,7 @@ events always have `tokens:null`, which is why 0/500k never moved); label "Savin
 Verified e2e on a scratch daemon built from `build/linux-core`: `doc_set_name` renames the doc,
 `agent_run_v2` returns `part_name`, emits `part_named`, renames the doc, writes no memory.json.
 Deferred/gotchas: (1) the HOST/WASM half needs a web WASM rebuild+deploy to reach chudware.com — the
-native `./build.sh` auto-synced only the daemon (libaicad) to `~/billet-web/bin` via billet-webd-sync,
+native `./build.sh` auto-synced only the daemon (libchudware) to `~/chudware-web/bin` via chudware-webd-sync,
 so the core naming is live but the tab-title/auto-save/meter changes are not until WASM ships. (2) The
 `ai/memory.json` entry in `contracts/stepplus.md` is now aspirational-only for the C++ path (optional
 field, readers tolerate absence) — left in place per append-only. (3) `contracts/doc_ops.md` was NOT
@@ -1664,7 +1664,7 @@ showed a frozen "Classifying request…" box for the whole (multi-minute) run wi
 inspect. Now events stream LIVE and each stage is expandable to show the exact prompt sent + raw
 reply received. Mechanism (one C-ABI seam serves both desktop in-proc and web daemon):
 `RunEvents::emit` fires a thread-local stream sink for every event (core/agent/events.*); new
-append-only export `aicad_set_event_sink(cb,ud)` (core/api/libaicad.*) registers it; `agent_output`
+append-only export `chudware_set_event_sink(cb,ud)` (core/api/libchudware.*) registers it; `agent_output`
 events gained `sent` (system+prompt, capped) beside `raw`. Daemon (core/hostd/server.cpp) sets the
 sink around agent-turn calls and pushes each event as `{"event":"agent.event","data":…}` to the
 calling client, then strips the redundant batched `result["events"]` (gated on
@@ -1825,7 +1825,7 @@ unchanged contract) and `tools/scrape_knowledge.py` (dropped its single-key path
 `tools/firecrawl_pool.py` CLI (`search`/`scrape`/`keys`) exposes the pool to shells;
 `~/.omp/agent/tools/firecrawl.js` (omp custom tools: `firecrawl_search`,
 `firecrawl_scrape`) lets omp sessions research through the pool; keys merged into
-`~/.local/share/AI-CAD/config.json` `keys.firecrawl` (existing key entries preserved)
+`~/.local/share/Chudware/config.json` `keys.firecrawl` (existing key entries preserved)
 and exported in `~/.bashrc`. Live-verified scrape + search; 18 new pool tests
 (`engine_oracle/research/test_firecrawl_pool.py`, transport-injected, no network),
 195/195 research pytest green. Gotcha: keys state file stores sha256 hashes, never raw
@@ -1833,7 +1833,7 @@ keys; `pool_status()` masks to `fc-xxx…last4`.
 
 ### kimi-sub subscription provider (Kimi For Coding OAuth) — 2026-07-18
 Ported Moonshot Kimi Code OAuth (device authorization grant) from omp
-(`packages/ai/src/registry/oauth/kimi.ts`, provider/dialect/usage shims) into Billet
+(`packages/ai/src/registry/oauth/kimi.ts`, provider/dialect/usage shims) into Chudware
 as subscription-auth provider `kimi-sub` alongside anthropic-sub / codex-sub /
 cursor-sub / xai-sub. Files: `services/agent/providers/kimi_sub_provider.py`
 (`KimiSubProvider`, `login_device` device-code flow only, `get_kimi_common_headers`,
@@ -1857,7 +1857,7 @@ box collapsed); `run_finished` promote guarded by `m.text.empty()`.
 **Stop freeze (web):** load-time persistent `AgentControlChannel` thread for
 cancel+steer — no per-click `std::thread` (WASM pthread pool exhaustion blocked main).
 **Steer:** new `agent_steer {run_id,text}` RPC (worker_client side-socket like cancel,
-libaicad dispatch, `RunControl::SteerQueue` drained at stage/attempt boundaries into
+libchudware dispatch, `RunControl::SteerQueue` drained at stage/attempt boundaries into
 `[User steering]` request text); composer submit-while-active steers when runId known
 and records a chat bubble; queue fallback only without runId.
 **2x quota:** on agent_run_v2 transport failure with known runId, auto-cancel the
@@ -1908,7 +1908,7 @@ DocMirror (one undo step), deduped against `cons_`. **app_state.{h,cpp} /
 settings_modal.cpp**: new Settings > Modeling tab (jump id 8, non-linear —
 legacy 2/3/4-7 indices untouched) holding the master toggle
 `sketch_drag_snap_relations` (default on). **Verify:** host build green;
-`AI_CAD_SHOT=sketch` scenario complete; gui_lint theme clean. **Deferred:**
+`CHUDWARE_SHOT=sketch` scenario complete; gui_lint theme clean. **Deferred:**
 rim-snap and parallel inference for group drags (keypoint/alignment/collinear
 only); point_on glyph renders as the neutral dot (no dedicated glyph).
 
@@ -1921,7 +1921,7 @@ best screen-px radius delta wins. `groupDragSnap` step 2b: circle/arc body
 translates snap to tangency vs. static lines and circles (gap closed along the
 normal / center line), so a circle dragged to a square's edge snaps tangent.
 `applyDragSnapRelations` extended: tangent/equal emit {ent, other}, point_on
-emits {pointHandle, ent}. **Verify:** host build green; AI_CAD_SHOT=sketch
+emits {pointHandle, ent}. **Verify:** host build green; CHUDWARE_SHOT=sketch
 complete. **Deferred:** arc angle-handle snapping (no matching relation type);
 ellipse rim handles don't exist yet.
 
@@ -1933,7 +1933,7 @@ triangulated with vendored mapbox earcut (`host/extern/mapbox/earcut.hpp`,
 ISC — `host/third_party` is gitignored) from outer + hole-child loops, leaving
 true transparent holes (donut). Legacy fill+punch remains as triangulator
 fallback. `groupDragSnap` 2b gained the dragged-line → static-circle tangency
-dual. **Verify:** host build green; AI_CAD_SHOT=sketch complete; earcut
+dual. **Verify:** host build green; CHUDWARE_SHOT=sketch complete; earcut
 fuzz-validated standalone 0/2000. **Gotcha:** naive ear-clipping over
 bridge-spliced weakly-simple polygons fails on multi-hole inputs — don't
 reintroduce a hand-rolled clipper here.
@@ -1947,7 +1947,7 @@ heightfields (64-frame cap, 128-grid downsample, final-frame guarantee), and
 `cam_tree` setups now carry `machine_detail` (full Machine JSON) — host reads
 rapid rates from it. (2) Deterministic verification: `core/cam/audit.{h,cpp}`
 modal-parses posted G-code (units/envelope/feeds/tools/round-trip/clearance
-checks) into `aicad.cam_audit/1`; `MachineDB` (5 presets + `AICAD_MACHINES_REGISTRY`
+checks) into `aicad.cam_audit/1`; `MachineDB` (5 presets + `CHUDWARE_MACHINES_REGISTRY`
 override, canonical copy `engine_oracle/research/data/machines.json`) backs new
 `cam_machines`/`cam_feeds` core RPCs; MCP `cam_audit` is a thin wrapper plus
 MCP-only `cam_job_diff`; `feeds_speeds` gained `thread=`/`machine=`; the
@@ -1962,7 +1962,7 @@ gaps: `heightfield_to_mesh` + `set_stock from_sim` rest-stock handoff between
 setups, post-processor tool re-change warnings, `sim_error` surfaced on the
 surface fast path.
 **Verify:** core ctest (cam) green incl. wave-1/2/5 test cases; host build green;
-AI_CAD_SHOT=cam exercises cam_simulate(frames:8) + playhead; pytest
+CHUDWARE_SHOT=cam exercises cam_simulate(frames:8) + playhead; pytest
 services/mcp/test_cam_audit.py + freshness + mega4 green (test_roles has 6
 pre-existing failures unrelated to CAM: drawing_detailer/sourcing/GBNF).
 **Deferred:** 5-axis and region-limited rest roughing; GUI machine-profile
@@ -2016,7 +2016,7 @@ silently degraded) — installed.
 **Verify:** `pytest agent engine/doc` 2300+ green; host ninja + ctest green.
 **Deferred/gotchas:** `scripts/check.py` feature_surface_audit is still RED
 (pre-existing since N0b: missing ribbon handlers for Sketch3D/ReverseEng —
-untouched by this wave); in-proc mode (AI_CAD_ENGINE_DAEMON=0) still serializes
+untouched by this wave); in-proc mode (CHUDWARE_ENGINE_DAEMON=0) still serializes
 everything behind callMtx_ (daemon is the default); xAI re-login + credits are
 user actions, not code.
 
@@ -2036,9 +2036,9 @@ doctor guidance/flash results render as tinted `glassCardWash` banners
 dots are glow-halo circles; consoles + sources + GPIO pin labels use
 `st.fonts.mono`; GPIO waveforms got a soft accent glow pass + alternating lane
 washes. **No behavior change** — all RPC payloads, throttling, honest-gating
-rules, and the `AI_CAD_SHOT=firmware` fixture are untouched. **Verify:** host
+rules, and the `CHUDWARE_SHOT=firmware` fixture are untouched. **Verify:** host
 ninja build green; `gui_lint icons/theme/scale` clean; headless
-`AI_CAD_SHOT=firmware` screenshot renders all panels. **Gotchas:**
+`CHUDWARE_SHOT=firmware` screenshot renders all panels. **Gotchas:**
 `scripts/check.py` feature_surface_audit remains RED for the pre-existing
 Sketch3D/RevEng ribbon-handler gap (recorded since N0b; unrelated).
 
@@ -2053,7 +2053,7 @@ so `listedOnce && !projects.empty()` never became true. Electronics short-circui
 `firmwareProjectsExistOnDisk()` — a throttled (5s) read-only scan of
 `firmware_root()` for `<id>/project.json` sidecars, mirroring
 `engine.firmware.project.firmware_root()` env resolution
-(`AI_CAD_FIRMWARE_DIR` → `%APPDATA%` → `TMPDIR/TEMP/TMP` → `/tmp`); the tab now
+(`CHUDWARE_FIRMWARE_DIR` → `%APPDATA%` → `TMPDIR/TEMP/TMP` → `/tmp`); the tab now
 discloses on `workerListing || diskProbe`. **Verify:** host ninja green;
 headless shots at 2400x900 — with a seeded project the Firmware chip renders at
 startup (on a box with NO Python worker), with no projects the chip is absent
@@ -2074,13 +2074,13 @@ it now resolves to `host/src/bootstrap.h` via include-path order (host/src
 precedes services/worker); only `runtimePython()` is used, defined by
 `host/src/bootstrap.cpp` (native) and `host/src/wasm_stubs.cpp` (wasm). Note:
 the deleted services/worker bootstrap had diverged (exported `appdataRoot()`,
-different AI-CAD/Billet dir-alias rule) — proof the copies had drifted.
+different Chudware dir-alias rule) — proof the copies had drifted.
 In `ui/viewport/`: deleted the orphaned shared-GL pipeline (`renderer.*`,
 `mesh.*`, `camera_anim.*`, `viewport_impl.*`, `vec_math.h`,
 `render/id_pass.*`, `render/overlays.*`) — no parent `add_subdirectory`
 exists and the host builds its own copies from `host/src` + `host/src/render`.
 Kept `render/aicm_loader.{h,cpp}`: `core/CMakeLists.txt` compiles it into ~13
-libaicad test/tool targets (depends only on `core/util/aicm_handoff.h`).
+libchudware test/tool targets (depends only on `core/util/aicm_handoff.h`).
 **Gotchas for the integrator:** (1) `ui/viewport/CMakeLists.txt` is orphaned
 and references the deleted sources + the retired `ui/abstract` include dir —
 its removal is a CMake edit, deferred to the integrator. (2)
@@ -2090,7 +2090,7 @@ deliberately not merged here. (3) `work/context/worker-bridge.md` and
 refresh (outside R0b write-set). (4) `docs/PACKAGING_WINDOWS.md` and
 `scratch/worker_client_agent_repro.cpp` mention the deleted
 `services/worker/bootstrap.cpp` (stale, non-blocking). **Verify:** host
-reconfigure + `ninja Billet` green (374 steps, links); `cmake --build
+reconfigure + `ninja Chudware` green (374 steps, links); `cmake --build
 core/build-linux` green (105 steps); repo grep shows zero live build/code
 references to any deleted basename. AGENTS.md updated in both purged dirs +
 `services/worker/README.md`.
@@ -2103,7 +2103,7 @@ references to any deleted basename. AGENTS.md updated in both purged dirs +
 **Kickoff.** New monolithic refactor DAG approved by Hunter and filed as workstream
 `T-RF1`–`T-RF22` on the board; full plan at
 `docs/plans/2026-07-22-consolidation-refactor-dag.md`. Locked decisions: keep the
-single-source UI compiled twice (native + WASM on the shared aicad-hostd daemon) — NO
+single-source UI compiled twice (native + WASM on the shared chudware-hostd daemon) — NO
 view-model/UI-framework abstraction (the ui/abstract effort was built once and deleted);
 keep CLI-subscription providers but port token auth into `core/agent` (C++); full
 zero-Python push (engine_oracle deleted at closeout); wave order hygiene → agent harness →
@@ -2161,14 +2161,14 @@ no-guess contract with a non-snapshot equal-area tie that still dangles via the 
 ## 2026-07-22 — node R0c: gate hardening (WASM smoke + web parity probe + check.py fatal)
 
 **R0c (T-RF3).** `scripts/gate.sh` grew two stages and a policy flip. (1) **WASM build
-smoke**: runs `./build.sh wasm` with `BILLET_WEB_APP=$GATE_TMP/wasm-app` (never clobbers
-the live `~/billet-web/app`); SKIP when emsdk is absent, FATAL when provisioned and the
+smoke**: runs `./build.sh wasm` with `CHUDWARE_WEB_APP=$GATE_TMP/wasm-app` (never clobbers
+the live `~/chudware-web/app`); SKIP when emsdk is absent, FATAL when provisioned and the
 web build breaks — a native-only break of the WASM build is a web-parity regression.
 (2) **Web parity probe** (`scripts/web_parity_probe.py`, new): parses the
 ```web-parity block in `contracts/web_parity.md` (new, aicad.webparity/1), spawns a
-scratch aicad-hostd **with the Python worker bridge disabled** (`AI_CAD_PYTHON=/nonexistent`
+scratch chudware-hostd **with the Python worker bridge disabled** (`CHUDWARE_PYTHON=/nonexistent`
 — exactly what the WASM client faces), and asserts `web_required` methods are
-libaicad-served while `web_unsupported` methods fail loud; an inventoried gap that starts
+libchudware-served while `web_unsupported` methods fail loud; an inventoried gap that starts
 succeeding fails the probe until the inventory is shrunk (Z-stream nodes do this as they
 land). (3) **check.py is FATAL again** (`CHECK_PY_FATAL=1`): the last red was
 `feature_surface_audit`, which simply didn't know `host/src/ui/sketch3d_mode.cpp`
@@ -2176,11 +2176,11 @@ land). (3) **check.py is FATAL again** (`CHECK_PY_FATAL=1`): the last red was
 `reveng/reveng_workspace.cpp` — both taught to `scripts/feature_surface_audit.py`;
 check.py now reports all 4 gates PASS. **Discoveries the probe surfaced** (inventory
 seeded from reality, not docs): `sim_run_flow` (LBM), `ecad_fill_zones`, `ecad_simulate`
-are ALREADY libaicad-dispatched (T-RF16/T-RF17 scopes shrink — board updated);
+are ALREADY libchudware-dispatched (T-RF16/T-RF17 scopes shrink — board updated);
 `agent_design`, `fw_*`, `ecad_design`, `ecad_import_kicad`, `bom_*`, `spec_sheet_match`,
 hydraulic/piping/structural/tolerance/render/intake are confirmed python-only web holes.
 hostd's Python fallback is `core/hostd/worker_bridge.cpp` (lazy `-m engine.worker` spawn,
-honors `AI_CAD_PYTHON`). **Deferred:** none. **Gotchas:** probe classification keys on
+honors `CHUDWARE_PYTHON`). **Deferred:** none. **Gotchas:** probe classification keys on
 error KIND (unknown-method / worker-bridge class), never on side effects — methods are
 called with `{}` against a scratch daemon. **Verify:** probe green standalone (13
 required + 14 unsupported); WASM smoke green (~4 min incremental); ctest 65/65 after the
@@ -2198,7 +2198,7 @@ abort right after the demo — every gate run had been dying silently at the fin
 header with exit 1, never reaching the shot smoke or the summary. Fixed with `|| true` on
 all six pipelines (verified: fin25 now prints `PASS pass=13 fail=0 skip=0`).
 **(2) --ui-screenshot never exits:** the m1 scenario completes and run_gui's teardown runs
-to completion (verified with new `AI_CAD_DEBUG_SHUTDOWN=1` teardown tracing in app.cpp),
+to completion (verified with new `CHUDWARE_DEBUG_SHUTDOWN=1` teardown tracing in app.cpp),
 but the process then hangs in post-main static/AtExit destruction with ~30 live Chromium
 threads (ThreadPoolForeg / Chrome_InProcGp / ANGLE-GC / NetworkService / CrShutdownDetec)
 — CEF threads outlive `CefShutdown()` on this build. Scoped fix: the `--ui-screenshot`
@@ -2251,7 +2251,7 @@ Tests: 3 new doctests in `core/tests/test_sim.cpp` (registry transitions, determ
 16/16 pass. Files touched: `core/sim/sim_cancel.{h,cpp}` (new), `core/sim/lbm.{h,cpp}`,
 `core/sim/lbm_cuda.{h,cu}`, `core/sim/flow_run.{h,cpp}`, `core/tests/test_sim.cpp`,
 `core/CMakeLists.txt` (one source line). Deferred to the integrator: the `sim_cancel`
-dispatch line in `core/api/libaicad.cpp` + `fp.job_id` wiring in `sim_run_flow`, the
+dispatch line in `core/api/libchudware.cpp` + `fp.job_id` wiring in `sim_run_flow`, the
 `services/worker/worker_client.cpp` routing flip, and the `contracts/web_parity.md` move of
 `sim_cancel` to web_required. Gotchas: the CUDA path (`.cu`) is compile-unverified here (no
 toolkit on this box) — the change is small but should get a CUDA-build smoke on a CUDA box;
@@ -2291,11 +2291,11 @@ reconciliation T-DP16 depends on is now explicit in the module layout. Files tou
 `host/src/ui/copilot/*` (new, 11 files), `host/src/ui/legacy_chat.{cpp,h}` (deleted),
 `host/CMakeLists.txt` (one source line → nine), `host/src/app.cpp` + `host/src/ui/settings_modal.cpp`
 (include line only), `host/src/ui/ai/ai_workspace.{cpp,h}` (include + two comment references).
-Verify: `ninja -C host/build-linux Billet` green (full rebuild); `AI_CAD_SHOT=m1` headless
+Verify: `ninja -C host/build-linux Chudware` green (full rebuild); `CHUDWARE_SHOT=m1` headless
 screenshot smoke exits 0, PNG written, pane chrome (header + composer) renders;
 `python3 scripts/check.py` all 5 gates PASS. Gotchas: emsdk is NOT provisioned on this box,
 so the WASM compile of the new TUs is unverified — the sources are the shared
-BILLET_CORE_SOURCES list with no new platform APIs (the __EMSCRIPTEN__ shared-chat/providers
+CHUDWARE_CORE_SOURCES list with no new platform APIs (the __EMSCRIPTEN__ shared-chat/providers
 blocks moved verbatim), but the gate's WASM smoke should catch any surprise on an emsdk box.
 Stale "legacy_chat" mentions remain in comments of files outside this node's write-set
 (metrics.h, layout.h/.cpp, model_registry.h, app_state.h) — cosmetic, for a later hygiene pass.
@@ -2304,7 +2304,7 @@ Stale "legacy_chat" mentions remain in comments of files outside this node's wri
 
 Probe-verified the claimed gaps first: the doc-id forms of `ecad_autoroute` /
 `ecad_route_diff_pair` / `ecad_to_3d` named in the T-RF17 brief were ALREADY ported
-(`core/ecad/session.{h,cpp}` + `core/api/libaicad.cpp:3557-3616` dispatch both the
+(`core/ecad/session.{h,cpp}` + `core/api/libchudware.cpp:3557-3616` dispatch both the
 inline-board and doc-id forms; the `services/worker/worker_client.cpp:285-294` comment
 listing them as gaps is stale and should be refreshed at merge). `ecad_fill_zones` /
 `ecad_simulate` were already C++ (web_parity notes 2026-07-22). The REAL remaining gaps
@@ -2332,16 +2332,16 @@ the io_error envelope, sexpr error shapes), wired in `core/CMakeLists.txt`
 (one source line + one test block, integrator reviews). Deferred/remainder:
 `ecad_design` — `engine_oracle/ecad/orchestrator.py` (926 lines) is an LLM state
 machine whose PLAN stage calls an agent provider (`agent.config.get_provider()`);
-libaicad has no provider seam and `libaicad.cpp` already documents it as deferred
+libchudware has no provider seam and `libchudware.cpp` already documents it as deferred
 to the agent/LLM epic (the deterministic recipe builders it falls back to ARE in
 core: `ecad_recipe` / `ecad_recipes_all` / `ecad_closest_recipe`). Gotchas: none —
-the port is pure JSON/OCCT-free and slots into aicad_ecad.
+the port is pure JSON/OCCT-free and slots into chudware_ecad.
 
 ## 2026-07-22 — node R4a (T-RF15): firmware cutover — fw_* engine surface ported to core/firmware
 
 New `core/firmware/` module (~3.4k LOC C++ + 9.5kB embedded template data)
 ports the firmware engine surface of `engine_oracle/firmware/` behind a single
-dispatch entry `aicad::firmware::call(method, params, result, err)`
+dispatch entry `chudware::firmware::call(method, params, result, err)`
 (`core/firmware/firmware_rpc.{h,cpp}`, returns false = unported/unknown so
 routing can keep the Python oracle per-method). Ported methods:
 `fw_new_project` (template scaffold + BOM mcu auto-select + pinmap.h seed +
@@ -2363,11 +2363,11 @@ mcu_pinouts,pinmap,project,toolchains,hardware,platform_db,provision,coverify,
 firmware_rpc}.{h,cpp}` + `fw_cli.cpp` (sketch_cli-style parity driver);
 `core/tests/test_firmware.cpp` (14 doctest cases) + fixtures in
 `core/tests/data/firmware/` (board/schematic/trace JSON + Python-generated
-golden pinmap header); `core/CMakeLists.txt` (aicad_firmware lib linking
-aicad_ecad, test_firmware, fw_cli — integrator reviews). Board refs resolve
-via `aicad::ecad::ecad_session_doc` → `.ecad+` container → plain JSON;
+golden pinmap header); `core/CMakeLists.txt` (chudware_firmware lib linking
+chudware_ecad, test_firmware, fw_cli — integrator reviews). Board refs resolve
+via `chudware::ecad::ecad_session_doc` → `.ecad+` container → plain JSON;
 schematic net names + direction-clash pin types reuse
-`aicad::ecad::build_netlist`; the T-FIN8 eng supply-rail lookup is a minimal
+`chudware::ecad::build_netlist`; the T-FIN8 eng supply-rail lookup is a minimal
 embedded table (only `MCU:Generic_QFP48` carries rails among starter MCU
 symbols — probed at cutover). Parity: 37-check JSON diff vs the Python oracle
 (project scaffold, sources ops, real arm-none-eabi build, verify_board
@@ -2465,9 +2465,9 @@ revoked-sibling rotation + marker persistence, all-revoked error, 4-thread
 single-POST lock race, malformed store, skew margin, cursor JWT expiry,
 ensure_fresh_for_run reload/refusal, API-key fallback) — ALL against a scratch
 XDG dir with an injectable HTTP seam (`set_http_post_for_testing`). Registered
-as ctest `agent_auth`; `agent/auth.cpp` added to `aicad_agent`.
+as ctest `agent_auth`; `agent/auth.cpp` added to `chudware_agent`.
 `cmake --build core/build-linux --config Release` green;
-`ctest -R agent` 2/2 green; `ninja -C host/build-linux Billet` green (jobs.cpp
+`ctest -R agent` 2/2 green; `ninja -C host/build-linux Chudware` green (jobs.cpp
 recompiled). Full-suite ctest: 69/69 green (55s) — re-verified after the
 concurrent firmware/sourcing leaves settled. Gotcha for the
 integrator: the firmware leaf deleted/recreated `core/tests/test_firmware.cpp`
@@ -2505,7 +2505,7 @@ Python oracle (timestamps masked). Build+ctest green in core/build-z-r4d
 test, mid-work at fw_status doctor shape, not this change).
 Gotchas / remainders: (1) KiCad-lane of match_part_number NOT ported (needs the
 deferred .kicad_sym parser — returns no-match; only diverges when
-AICAD_KICAD_SYM_PATH is configured); (2) spec_sheet_match LLM extraction lane
+CHUDWARE_KICAD_SYM_PATH is configured); (2) spec_sheet_match LLM extraction lane
 NOT ported — C++ accepts pre-extracted `dims` (additive param) or the
 `extract_dims` seam; without them it returns the contract "unknown" shape with a
 reason naming the unported lane (web probe only needs a served response);
@@ -2513,11 +2513,11 @@ reason naming the unported lane (web probe only needs a served response);
 (4) parts_hub (part_search/get/place, gui_rpc, source.py FTS), the vendor-scan
 worker methods (vendor_part_register_local_cad/list/context/scan_library), and
 MCP cam_cost_estimate's doc-measurement glue remain Python — exact file list in
-the R4d report; (5) CMakeLists edits needing integrator review: aicad_sourcing
-lib+test, `aicad_sourcing` AND `aicad_firmware` on the `aicad` DLL link line
-(firmware was undefined-referenced via the integrator's own libaicad.cpp
+the R4d report; (5) CMakeLists edits needing integrator review: chudware_sourcing
+lib+test, `chudware_sourcing` AND `chudware_firmware` on the `chudware` DLL link line
+(firmware was undefined-referenced via the integrator's own libchudware.cpp
 firmware routing — transient race), `firmware/eng_rails.cpp` added to
-aicad_firmware sources (same race — the firmware leaf added the file but not
+chudware_firmware sources (same race — the firmware leaf added the file but not
 the source-list entry; drop if they land it first); (6) ecad fabformats
 write_bom in C++ has DRIFTED from the current oracle (group key lacks MPN,
 reads only fields-dict MPN) — sourcing ports the current oracle grouping
@@ -2533,7 +2533,7 @@ end-state + timeline forms/toggles:/period:/uart_within:), `scenario.{h,cpp}`
 (aicad.fwscenario/1 validation with Python-repr error text, all 9 track kinds
 compiled to Renode monitor lines, ADC PythonPeripheral stub repl, the 5-fixture
 library incl. the NTC thermistor generator), `powerprofile.{h,cpp}`
-(aicad.powerprofile/1 — CPU residency via AICAD_CPU_EVT markers, per-pin duty,
+(aicad.powerprofile/1 — CPU residency via CHUDWARE_CPU_EVT markers, per-pin duty,
 per-rail currents via the new `eng_rails.{h,cpp}` shared starter-library eng
 table with instance-override precedence; coverify now consumes the same table),
 `sensor_models.{h,cpp}` (MPU6050/BMP280/LIS3MDL/NEO-6M-NMEA/pitot physics,
@@ -2541,7 +2541,7 @@ FlightProfile.from_dict), `sim_sensor_bridge.{h,cpp}` (uniform-grid resample +
 track packing), `pyfmt.{h,cpp}` (Python :g/:.3f/!r/#x formatting parity).
 `platform_db` gained get_capabilities (with gpio_regmap) + get_platform_file
 (materializes the now-embedded renode_platforms .repl set to
-$TMP/aicad_renode_platforms). firmware_rpc now handles ALL 13 fw_* methods
+$TMP/chudware_renode_platforms). firmware_rpc now handles ALL 13 fw_* methods
 plus fw_projects; fw_verify_board(emulate=true) takes the live run_simulation
 path (no more "not ported yet" degrade). One cross-cutting fix: run_capture
 now applies Python subprocess text=True universal-newline translation
@@ -2608,10 +2608,10 @@ AppState& at call time (re-seated per tab switch); the dispatchCmd shadowing loc
 are gone. AppState untouched; st.ribbonDispatch exposure unchanged.
 Files touched: host/src/app.cpp (dispatchCmd lambda ~155 → ~50 lines; +cmd* handlers;
 5207 → 5206 total), host/src/app_commands.{h,cpp} (new, 61+162 lines),
-host/CMakeLists.txt (new source line). Verify: ninja Billet green; check.py all 5
+host/CMakeLists.txt (new source line). Verify: ninja Chudware green; check.py all 5
 gates PASS (feature_surface_audit harvests the app-level ids from the cmd* bodies in
 app.cpp — `cmd == "id"` POSITIVE comparisons only, the audit regex does not match
-`!=`); AI_CAD_SHOT=m1 headless run exits 0 (sketch_new/extrude/fillet/shell/edit/
+`!=`); CHUDWARE_SHOT=m1 headless run exits 0 (sketch_new/extrude/fillet/shell/edit/
 reopen all through the router). Gotchas: (1) the router is a function-local static
 inside dispatchCmd — rules are stateless std::functions capturing only the hooks
 struct by value; (2) edit_* handlers dereference st.sketchMode unconditionally,
@@ -2630,9 +2630,9 @@ Part 1 — mode gating single-sourced. The Agent|Plan|Swarm|Edit|Ask tool allowl
 twice (services/agent/copilot_mode_tools.py for MCP/DAG; inline checks in core/agent/run.cpp
 for the in-app loop). Now contracts/copilot_modes.json (aicad.copilot_modes/1) + one-paragraph
 prose contracts/copilot_modes.md are the canonical source BOTH runtimes load at runtime:
-Python reads it at import (AI_CAD_COPILOT_MODES_JSON → <repo>/contracts via parents[2]);
-new core/agent/copilot_modes.{h,cpp} loads it (AI_CAD_COPILOT_MODES_JSON →
-AI_CAD_CONTRACTS_DIR → repo-relative contracts/, same CWD convention as roles.cpp's
+Python reads it at import (CHUDWARE_COPILOT_MODES_JSON → <repo>/contracts via parents[2]);
+new core/agent/copilot_modes.{h,cpp} loads it (CHUDWARE_COPILOT_MODES_JSON →
+CHUDWARE_CONTRACTS_DIR → repo-relative contracts/, same CWD convention as roles.cpp's
 agent/prompts) and implements the exact apply_mode_tools/is_tool_allowed semantics.
 run.cpp's delegate mode gate now consults the contract (legacy inline gate kept only as
 the contract-unreadable packaged fallback). BEHAVIOR CHANGE (parity fix, intended):
@@ -2657,7 +2657,7 @@ core/agent/copilot_modes.{h,cpp} (new), core/agent/run.cpp, core/tests/test_copi
 (new), services/agent/test_copilot_modes_parity.py (new), services/agent/workspace.py,
 services/agent/advisor/overseer.py, services/agent/advisor/overseer_tools.py.
 WRITE-SET OVERFLOW for the integrator: core/CMakeLists.txt (added copilot_modes.cpp to
-aicad_agent + test_copilot_modes target/ctest) — unavoidable to build/test the new
+chudware_agent + test_copilot_modes target/ctest) — unavoidable to build/test the new
 module; merge carefully if another leaf touched it. Gotchas: (1) core/CMake test uses
 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/.. so the repo-relative contracts/
 fallback resolves, mirroring test_agent; (2) C++ is_tool_allowed strips but does NOT
@@ -2673,7 +2673,7 @@ tracked as mission-glue work, not this node.
 ## 2026-07-22 — node R2a part 1 (T-RF10): GUI_OVERHAUL_SPEC closure — title-bar + ribbon cluster (leaf)
 
 All 11 cluster items verified as ALREADY DONE in the current build; no code fixes were needed —
-the July `[~]` statuses were stale. Verification per item: headless shots (AI_CAD_SHOT=m1 /
+the July `[~]` statuses were stale. Verification per item: headless shots (CHUDWARE_SHOT=m1 /
 workspaces / sketch / settings light+dark), a live Xvfb+xdotool session (Ctrl+P Search popout
 capture + functional Linux title-bar drag test: empty caption moves the window, chip/tab spans
 do not — chrome::tick + HitLayout window-relative spans, win_chrome.cpp:164-218), and code
@@ -2681,7 +2681,7 @@ reading (title_bar.cpp chips/centered tabs; ribbon.cpp ribbon_tabVisible per-wor
 ribbon_btnRest liquid-glass tiles, ribbon_btnActive bold box; settings_modal.cpp:3461-3475 opaque
 TitleBg*; command_search.cpp:68-89 opaque settings-style popout). Files touched (docs only):
 docs/GUI_OVERHAUL_SPEC.md (11 items `[~]`→`[x]` with one-line evidence each), this log. Build
-`ninja -C host/build-linux Billet` green; `python3 scripts/check.py` all 5 gates PASS;
+`ninja -C host/build-linux Chudware` green; `python3 scripts/check.py` all 5 gates PASS;
 `python3 scripts/gui_lint.py` clean. Shot evidence: /tmp/r2a1-m1.png (title bar, FM undo/redo
 line-art glyphs), /tmp/r2a1-search.png (Search popout + ribbon tiles at native res),
 /tmp/r2a1-settings-{light,dark}.png (opaque strip both themes), scratch/workspace_shots/*.png
@@ -2708,7 +2708,7 @@ feature_tree.cpp / doc_tabs.cpp / sim_manager.cpp verified, not modified). Spec 
 §4 FM row centering+padding and doc-tab-strip centering marked [x] (code evidence:
 feature_tree.cpp:159-615 (rowH-content)*0.5f centering + polish-G2 padding, fmPaneHeaderChip;
 doc_tabs.cpp:569-572 band-hugs-pills centering fix, :187-210 icon/label/× centering;
-eyeball: native-res crops of /tmp/r2a2-fm-doctabs.png from AI_CAD_SHOT=m1). §5 EM tab marked
+eyeball: native-res crops of /tmp/r2a2-fm-doctabs.png from CHUDWARE_SHOT=m1). §5 EM tab marked
 [x] on the GUI side — the em_* RPC contract is final and worker-registered
 (engine_oracle/worker.py:155, T-SIM11), ribbon rows + async em_status probe +
 setRibbonDisabledPrefix + real RPC-dispatching setup forms all live (ribbon_def.cpp:624-640,
@@ -2720,14 +2720,14 @@ login/download-queue, ai_workspace.cpp; eyeball: scratch/workspace_shots/workspa
 deliberately flips the ribbon to the Sketch tab IN Model instead of hopping workspace —
 needs Hunter's call, owner is the title-bar/workspace seam. §7 repo-unification items marked
 [x] (ui/imgui+ui/abstract+app/ gone from disk; build.sh app -> host; gate.sh stages 2b+5).
-Verify: ninja -C host/build-linux Billet green; python3 scripts/check.py all 5 gates PASS;
+Verify: ninja -C host/build-linux Chudware green; python3 scripts/check.py all 5 gates PASS;
 shots /tmp/r2a2-fm-doctabs.png (m1) + /tmp/r2a2-em-simulate.png (simdisc_mech — EM tab chip
 visible in the Simulate tab row). Gotchas: (1) docs/GUI_OVERHAUL_SPEC.md is edited
-CONCURRENTLY by the sibling R2a-1 leaf — re-read before every Edit; (2) AI_CAD_SHOT=
+CONCURRENTLY by the sibling R2a-1 leaf — re-read before every Edit; (2) CHUDWARE_SHOT=
 git/parts/aiws workspace shots get forced back to the Model workspace by restored AI-handoff
 part tabs (doc_tabs.cpp:346-434 forces Model for part tabs) — use the sibling's
-scratch/workspace_shots/*.png (AI_CAD_SHOT=workspaces) for workspace-body evidence;
-(3) no headless path selects ribbon tab 19 (EM) — AI_CAD_TAB clamps at RT_Manufacture=12,
+scratch/workspace_shots/*.png (CHUDWARE_SHOT=workspaces) for workspace-body evidence;
+(3) no headless path selects ribbon tab 19 (EM) — CHUDWARE_TAB clamps at RT_Manufacture=12,
 so EM-tab content was verified in code + the tab-row chip shot, not a selected-tab capture.
 
 ## 2026-07-22 — node R1b (T-RF5): single agent entry — legacy agent_design path killed (leaf)
@@ -2753,10 +2753,10 @@ tests across test_pipeline.py, test_eta_estimator.py, test_roles.py, advisor/tes
 and test_mega{1_top5,3_fixes,4_fixes,5_fixes,7_fixes,8_rolesurface,9_fixes,10_fixes,
 11_grading,17_fixes,24_fixes,28_terminal}.py.
 Docs refreshed: services/agent/AGENTS.md, README.md, work/context/services-agent.md.
-Verification: ninja -C host/build-linux Billet green; scripts/check.py all 5 gates PASS;
+Verification: ninja -C host/build-linux Chudware green; scripts/check.py all 5 gates PASS;
 mcp-venv imports engine.worker/services.agent.loop/agent_turn OK; pytest services/agent
 2276 passed 0 failed (was 44 failed mid-trim, all deleted-surface), -k 'loop or design'
-37/37; engine_oracle/test_worker_stream.py + test_compaction.py 15/15; AI_CAD_SHOT=m1
+37/37; engine_oracle/test_worker_stream.py + test_compaction.py 15/15; CHUDWARE_SHOT=m1
 headless smoke exit 0. Gotchas: (1) cursor-picked Design now fails with the core's
 classified provider_error card instead of running — intended, Cursor Connect-RPC has no
 C++ transport; (2) engine_oracle suite shows 37 failed + 10 errors in research/ecad/sim/
@@ -2795,7 +2795,7 @@ if-chain order), dispatchCmd 155→50 lines, host+WASM builds green. **Z-stream 
 R4a firmware FULL surface C++ (13 methods + projects; Renode+QEMU emulator leg, 24
 doctests, 60-check parity), R4b sim_cancel registry, R4c KiCad import (byte-parity),
 R4d sourcing (7 methods, 25 doctests, 34/34 parity).
-**Integrator merges:** libaicad.cpp dispatch blocks (firmware::call, sourcing::call with
+**Integrator merges:** libchudware.cpp dispatch blocks (firmware::call, sourcing::call with
 production Seams glue — doc/ecad/parts/http), sim_cancel dispatch + include; routing in
 worker_client.cpp (routeFirmwareToCpp + 13-method allowlist, sourcing 7-method set, stale
 ECAD/sim gap comments refreshed); contracts/web_parity.md updated (sim_cancel, fw_new_project,
@@ -2818,7 +2818,7 @@ system-prompt override inert — row needs rewiring or deletion; gym runner stay
 per the deferred training plan), R4e long tail, R4f thin-client flip.
 
 T-RF19 (sourcing MCP flip, leaf): flipped the five sourcing/BOM-facing MCP modules off the
-engine_oracle sourcing modules onto the C++ core bridge (core/sourcing via libaicad, T-RF18
+engine_oracle sourcing modules onto the C++ core bridge (core/sourcing via libchudware, T-RF18
 dispatch), following the cam_tools.py / firmware_tools.py pattern. services/mcp/sourcing_tools.py:
 bom_rollup/bom_price now `_dumps(cb.call("bom_rollup"|"bom_price", {"doc_path": ...}))` — the C++
 envelope {ok, bom} is byte-identical to the old {ok:True, bom:to_dicts(lines)} tool output.
@@ -2882,7 +2882,7 @@ services/, do NOT port to core/.** Pure stdlib decision logic over plain dicts (
 confidence tiers, critical-dim ledger/gate, fit report) whose only production consumer is
 `services/mcp/intake_tools.py:26` (8 MCP tools); the host GUI never calls it (no intake RPC
 exists — `intake_status` is an MCP tool name, absent from `contracts/worker_rpc.md` and the
-libaicad dispatch, so the `contracts/web_parity.md` `web_unsupported` entry is a mis-listed
+libchudware dispatch, so the `contracts/web_parity.md` `web_unsupported` entry is a mis-listed
 MCP tool the probe will trivially fail forever; remove it at leaf-7 closeout with the same
 justification as `ecad_import_kicad`). Coupling flag for the integrator: intake imports
 `engine.dfm.process_profiles` (leaf 6) — sequence leaf 7 after leaf 6's port/re-home decision;
@@ -2932,7 +2932,7 @@ scrape_knowledge}.py and tools/flywheel/bench/roundtrip_pipeline.py. services/da
 research (board-prompt assumption wrong; only reveng mission-template keyword strings).
 Coupling flag: `core/cam/feeds.cpp` is already the C++ port of `research/machining.py`, and
 `core/tests/test_cam.cpp` byte-parity-reads `engine_oracle/research/data/machines.json` via
-`AICAD_TEST_MACHINES` (`core/CMakeLists.txt:471`) — the re-home must update that one CMake path
+`CHUDWARE_TEST_MACHINES` (`core/CMakeLists.txt:471`) — the re-home must update that one CMake path
 (data/*.json travels with the module). Neither module appears in `contracts/web_parity.md` or
 `scripts/web_parity_probe.py`: both run server-side (research behind the MCP stdio server,
 vision behind MCP + hostd worker RPC), so the web story needs no port — only import fixups
@@ -2945,11 +2945,11 @@ vision behind MCP + hostd worker RPC), so the web story needs no port — only i
 Inventory: `engine_oracle/doc/formats.py::WORKER_METHODS` registers exactly ONE worker
 method — `doc_formats` (the import/export format matrix, D4). `import_file` /
 `export_file` were already removed from the Python surface when the doc engine went
-C++ (dispatch `core/api/libaicad.cpp:3311,3345`; minting routing
+C++ (dispatch `core/api/libchudware.cpp:3311,3345`; minting routing
 `services/worker/worker_client.cpp:112`). Ported `doc_formats` to C++:
-`aicad::doc::FormatInfo` + `format_registry()` in `core/doc/formats.{h,cpp}`
+`chudware::doc::FormatInfo` + `format_registry()` in `core/doc/formats.{h,cpp}`
 (byte-parity with the oracle's `FORMAT_REGISTRY`, all 16 rows in order),
-`aicad::doc::doc_formats()` payload builder in `core/doc/session.{h,cpp}` returning
+`chudware::doc::doc_formats()` payload builder in `core/doc/session.{h,cpp}` returning
 `{"formats":[...]}`. Parity pinned by `core/tests/test_formats_registry.cpp`
 (registered in `core/CMakeLists.txt` as test `formats_registry`): semantic equality
 of the payload against the captured oracle `list_formats()` dump, per-row field
@@ -2957,8 +2957,8 @@ compare, `detect_format` ⇐ registry lockstep, unknown-extension OpError. Files
 touched: `core/doc/formats.{h,cpp}`, `core/doc/session.{h,cpp}`,
 `core/tests/test_formats_registry.cpp` (new), `core/CMakeLists.txt`. INTEGRATOR
 WIRING (integrator-owned files, not done by this leaf): (1) dispatch arm in
-`core/api/libaicad.cpp` next to `doc_list_ops` — `if (m == "doc_formats") return
-emit(aicad::doc::doc_formats(), out_json, 0);` (2) routing in
+`core/api/libchudware.cpp` next to `doc_list_ops` — `if (m == "doc_formats") return
+emit(chudware::doc::doc_formats(), out_json, 0);` (2) routing in
 `services/worker/worker_client.cpp::routeDocToCpp` — `doc_formats` carries no doc_id,
 so add `if (method == "doc_formats") return true;` beside the `parts_catalog_list`
 rule (with the same engine::ensureLoaded guard pattern as the T-RF18 block).
@@ -2969,7 +2969,7 @@ but `import_path`/`export_document` and the mesh/3dm/3mf lanes must STAY:
 `engine_oracle/ecad/threed.py:547` imports `import_path` (ECAD leaf's cutover), and
 `engine_oracle/doc/tessellate.py` stays for `engine_oracle/sim/{worker,foam_post,
 overlay}.py` (sim leaf). `engine_oracle/doc/op_registry.py` stays only as the
-offline fallback in `services/mcp/op_vocab.py:20-26` (prefers libaicad
+offline fallback in `services/mcp/op_vocab.py:20-26` (prefers libchudware
 `doc_list_ops`) and `services/agent/test_mega8_op_vocab.py` — deletable when MCP
 fallbacks are retired (integrator scope). No method is dead: `doc_formats` has no
 first-party caller today (host `feature_tree.cpp:3124` calls it "the future dynamic
@@ -2980,7 +2980,7 @@ byte-identical to the oracle anyway (capability honesty lives at the call sites,
 same as today).
 
 T-RF12 (node R2c) — web degradation UX. Added the web-build capability seam:
-`host/src/ui/web_capabilities.{h,cpp}` (new, in `BILLET_CORE_SOURCES` so native
+`host/src/ui/web_capabilities.{h,cpp}` (new, in `CHUDWARE_CORE_SOURCES` so native
 and WASM share it) — `ui::webBuild()` is constexpr on `__EMSCRIPTEN__`, and
 `ui::webGapReason(surfaceId)` answers from ONE static table (`kWebGaps`): panel
 surface ids `web_browser` / `vendor_signin` / `account_signin` (CEF- or
@@ -3000,10 +3000,10 @@ per-vendor "Sign in") funnels here, so one early return + toast covers the
 wizard on web; (d) `host/src/ui/settings_modal.cpp` `drawSubscriptionAccounts` —
 Sign in / Add-another-account button renders `BeginDisabled` + the gap reason
 as tooltip (AllowWhenDisabled) on web. Verified: `ninja -C host/build-linux
-Billet` green (one rebuild needed after a T-RF13 leaf raced renderer.cpp
+Chudware` green (one rebuild needed after a T-RF13 leaf raced renderer.cpp
 mid-edit — `Renderer::initQualityPolicy` undefined at link, gone on rebuild);
 `python3 scripts/check.py` all 5 gates PASS; m1 shot exit 0 (native unchanged);
-WASM `cmake --build host/build-wasm --target Billet` exit 0, Billet.wasm links
+WASM `cmake --build host/build-wasm --target Chudware` exit 0, Chudware.wasm links
 with web_capabilities.cpp in the target. DEFERRED (outside leaf write-set,
 recommend integrator follow-up): the title-bar Web chip click itself
 (`host/src/ui/title_bar.cpp:759` — currently opens the panel, which now shows
@@ -3027,13 +3027,13 @@ web_parity.md web_unsupported). (2) `mechanical/` PORTED to
 services/mcp/cad_common.py FEA `_MATERIALS`/`_MATERIAL_ALIASES` seam,
 engine_oracle/research/material_lookup.py, engine_oracle/dfm density defaults;
 core/cam/feeds.cpp already reads the same registry.json — the C++ lib resolves the
-path EXACTLY like feeds.cpp: `AICAD_MATERIALS_REGISTRY` env, then appdata
+path EXACTLY like feeds.cpp: `CHUDWARE_MATERIALS_REGISTRY` env, then appdata
 materials/registry.json, so there is still ONE seed file). `materials/
 export_sim_json.py` is dev codegen (regenerates the host-GUI sim mirror), not an
 engine port target — re-home to tools/ at oracle deletion. (4) `dfm/` PORTED to
 `core/dfm/process_profiles.{h,cpp}` (live: services/mcp/intake_tools.py,
 services/mcp/dimension_scheme_tools.py, services/agent/geometry_helpers.py;
-links aicad_materials for the T-F2 density defaults). (5) `requirements/` NOT
+links chudware_materials for the T-F2 density defaults). (5) `requirements/` NOT
 PORTED — services-side concern: pure aicad.req/1 doc-CRUD/schema layer whose only
 consumers are services-side Python (services/mcp/req_tools.py +
 layout_plan_tools.py, services/dag/verify.py via req_tools, services/verify/
@@ -3049,10 +3049,10 @@ fixtures generated from the LIVE oracle (`core/tests/data/gen_r4e6_fixtures.py`
 through the C++ dispatch in core/tests/test_{tolerance,mechanical,materials,dfm}.cpp
 with deep JSON equality — all green, plus unit suites mirroring the oracle's own
 pytest vectors. CMake: four static libs + four ctests added after the sourcing
-block; the four libs appended to the `aicad` SHARED link line. INTEGRATOR WIRING:
-route the new methods in core/api/libaicad.cpp dispatch (pattern: `json r; std::
-string err; if (aicad::tolerance::call(m, params, r, err)) {...}` chained like the
-T-RF18 sourcing glue at libaicad.cpp:3837), then flip services/worker routing and
+block; the four libs appended to the `chudware` SHARED link line. INTEGRATOR WIRING:
+route the new methods in core/api/libchudware.cpp dispatch (pattern: `json r; std::
+string err; if (chudware::tolerance::call(m, params, r, err)) {...}` chained like the
+T-RF18 sourcing glue at libchudware.cpp:3837), then flip services/worker routing and
 the four MCP call-sites (tolerance_tools, mechanical_tools, cam_tools `_resolve_
 cam_material`, cad_common `_MATERIALS`) to the core RPC; dfm consumers
 (intake_tools, dimension_scheme_tools, geometry_helpers) follow. Python subtleties
@@ -3063,7 +3063,7 @@ configure raced its mid-write file creation; re-running configure fixed it, no
 edit made). Verified: full ninja build (358 targets) green; ctest 74/76 — the
 only reds are EXTERNAL to this leaf: `structural` (leaf 5's own in-flight
 numeric asserts, tests/test_structural.cpp:56) and `cam` (pre-existing
-AICAD_TEST_MACHINES define at HEAD points at engine_oracle/research/data/
+CHUDWARE_TEST_MACHINES define at HEAD points at engine_oracle/research/data/
 machines.json, which another T-RF19 leaf deleted mid-flight with
 engine_oracle/research/ — test_cam.cpp:1574 missing-file REQUIRE; both fail
 identically with my changes reverted). `ctest -E '^(cam|structural)$'` =
@@ -3082,9 +3082,9 @@ the render/resolve/blur targets (new `rw_/rh_` presentation size; the ImGui
 image stretch upscales), and Kawase backdrop blur passes are quality-indexed
 (4/4/2/1). Policy: WASM = adaptive starting at MED (climbs to FULL if fast),
 native desktop = pinned FULL (zero behavior change). Env overrides read once in
-`initQualityPolicy()`: `AI_CAD_QUALITY_ADAPTIVE=0|1`,
-`AI_CAD_QUALITY_STEP=full|high|med|low` (pin), `AI_CAD_QUALITY_FORCE_MS=<f>`
-(synthetic frame time for deterministic ladder tests), `AI_CAD_QUALITY_LOG=1`
+`initQualityPolicy()`: `CHUDWARE_QUALITY_ADAPTIVE=0|1`,
+`CHUDWARE_QUALITY_STEP=full|high|med|low` (pin), `CHUDWARE_QUALITY_FORCE_MS=<f>`
+(synthetic frame time for deterministic ladder tests), `CHUDWARE_QUALITY_LOG=1`
 (stderr transitions + periodic status). `host/src/ui/viewport_panel.cpp`:
 `noteFrame()` hook after `renderer.resize`, overlay width scale now folds in
 `renderScale()` so authored line widths stay constant under upscale, and a
@@ -3095,7 +3095,7 @@ forced-adaptive native runs prove the ladder both directions (FORCE_MS=40:
 MED→LOW; FORCE_MS=5: MED→HIGH→FULL, periodic status lines stable at FULL);
 pinned-LOW m1 shot exit 0 with the HUD chip visible and edge-picking intact at
 0.6 scale (render-scale + id-pass consistency proven); `python3 scripts/check.py`
-all 5 gates PASS; WASM `cmake --build host/build-wasm --target Billet` green.
+all 5 gates PASS; WASM `cmake --build host/build-wasm --target Chudware` green.
 Gotchas: id-pass picking, `cam_.vpWidth/Height`, and `averageLuminance` all map
 by ratio so they are render-scale invariant — do NOT "fix" them to rw_/rh_.
 `readRGBA()` now returns rw_×rh_ (== w_×h_ at FULL); the CLI render tools in
@@ -3106,7 +3106,7 @@ shell emits beacons today, and the gateway whitelist (`boot_ms/fps/rpc_ms/ua`)
 lives outside this leaf's write-set; adding a `quality` field is a one-line
 gateway edit + a new client emitter (integrator follow-up). (2)
 `Webservice/perf/baseline.json` untouched — the perf_probe measures WS RPC
-latency (needs BILLET_LIVE=1 against the live deployment) and cannot observe
+latency (needs CHUDWARE_LIVE=1 against the live deployment) and cannot observe
 client-side GPU fill. (3) No real weak-iGPU hardware here — ladder thresholds
 (20/12.5 ms, 0.25/1.0 s dwell) and the LOW scale (0.60) are reasoned defaults,
 validated only under llvmpipe with synthetic frame times; tune on a real
@@ -3125,7 +3125,7 @@ worker RPC only, never direct. MCP side (services/mcp/parts_tools.py:98-989) imp
 hub directly (search/get/taxonomy/source/place/model_matcher); the copilot
 (services/agent/mission_dispatch.py:1246-1428) reuses those *_impl functions. ENGINE vs
 SERVICES: place.py (543 ln) is doc mutation — core_family/generate_model/import_file route
-through `services.mcp.core_bridge` (already libaicad) while symbol_footprint/section/
+through `services.mcp.core_bridge` (already libchudware) while symbol_footprint/section/
 fitting/FMU legs reach engine_oracle ecad_ops/structural/piping/hydraulic (T-RF19 family);
 hub.py+index.py+registry.py+taxonomy+source.py+model_matcher+product_media (~2,100 ln) are
 catalog orchestration (SQLite FTS5, JSON taxonomy, no geometry) → services, never core.
@@ -3158,7 +3158,7 @@ parts_tools, reveng seeding at services/mcp/test_reveng_parts_roundtrip.py:96-15
 
 ## T-RF19 leaf 5 (structural cutover — core/structural)
 
-Ported the PyNite-based structural engine surface to C++ as `aicad_structural`
+Ported the PyNite-based structural engine surface to C++ as `chudware_structural`
 under `core/structural/`: `model.{h,cpp}` (aicad.structure/1 doc model +
 materials + section-property grammar + ASCE 7 combo presets),
 `solver.{h,cpp}` (from-scratch direct-stiffness 3D frame solver — a
@@ -3173,13 +3173,13 @@ lumber lookups against generated embedded tables `data_aisc.h`/`data_lumber.h`
 from the oracle's curated JSON), `checks.{h,cpp}` (AISC-LRFD / NDS-ASD D/C
 ratios, byte-exact disclaimer), `estimate.{h,cpp}` (board-feet / steel lbs /
 fasteners / ENR-rate takeoff; rates resolved explicit path →
-`AICAD_STRUCTURAL_RATES` → embedded defaults, merged per-key),
-`structural_rpc.{h,cpp}` (single-dispatch `aicad::structural::call` for
+`CHUDWARE_STRUCTURAL_RATES` → embedded defaults, merged per-key),
+`structural_rpc.{h,cpp}` (single-dispatch `chudware::structural::call` for
 `struct_analyze` / `struct_check` / `struct_estimate`, {code,message,detail}
 error envelopes), plus `struct_cli.cpp` (parity driver) and a shipped copy of
-`enr_rates.json`. CMake: `aicad_structural` static lib + `test_structural`
+`enr_rates.json`. CMake: `chudware_structural` static lib + `test_structural`
 doctest + `struct_cli` wired in `core/CMakeLists.txt` (integrator review),
-`aicad_structural` added to the `aicad` DLL link line. Fixtures in
+`chudware_structural` added to the `chudware` DLL link line. Fixtures in
 `core/tests/data/structural/` (cantilever, axial post, portal, truss,
 steel_frame w/ wind, mixed estimate doc); parity harness in
 `scratch/struct_parity/` (regenerate oracle dumps with gen_fixtures.py, diff
@@ -3203,7 +3203,7 @@ Python corpus retrieval), jurisdiction_meta.py, brep.py (OCCT B-rep for
 viewport), bom_bridge.py (integrator-patched), parts_hub/place.py's elements
 import, benchmarks/simsuite/multiphysics_misc_bench.py (imports analyze_doc).
 Integrator wiring: route the three struct_* methods to
-`aicad::structural::call` in core/api/libaicad.cpp + services/worker routing;
+`chudware::structural::call` in core/api/libchudware.cpp + services/worker routing;
 struct_analyze is in contracts/web_parity.md web_unsupported until then.
 Verified: full build green, ctest 76/76 green in core/build-z-r4e5, oracle
 pytest suite (83 tests) still green.
@@ -3232,7 +3232,7 @@ flywheel/bench/roundtrip_pipeline + categories.py target path).
 `engine_oracle/worker.py` (integrator exception): the ONE reveng import line
 now reads `from services.reveng.worker_rpc import REVENG_WORKER_METHODS`
 (+ warning string). `core/CMakeLists.txt` (integrator exception):
-AICAD_TEST_MACHINES → `services/research/data/machines.json`.
+CHUDWARE_TEST_MACHINES → `services/research/data/machines.json`.
 Gotchas: (1) `research/calcs/{snap_fit,press_fit,thread_engagement}.py`
 resolved `engine_oracle/sim/materials.json` as `__file__.parents[2]/"sim"` —
 re-pointed to `parents[3]/"engine_oracle"/"sim"` (sim/ has NOT moved); this
@@ -3264,7 +3264,7 @@ parity-sensitive data). graphify update NOT run (integrator).
 ## T-RF19 leaf 4 (hydraulic + piping cutover — core/hydraulic, core/piping)
 
 Ported the pure-computation half of both fluid families to C++.
-`core/piping/` (aicad_piping, OCCT-free): `fluid_properties.{h,cpp}`
+`core/piping/` (chudware_piping, OCCT-free): `fluid_properties.{h,cpp}`
 (properties.py — built-in cited backend only: IAPWS/NIST water table +
 ideal-gas/Sutherland gases; CoolProp/thermo are NOT in requirements.txt, so
 "builtin" is the production answer), `schema.{h,cpp}` (aicad.piping/1
@@ -3283,8 +3283,8 @@ verify_pressure_drop), `simhandoff.{h,cpp}` (aicad.simhandoff/1 builders +
 validator, shared with hydraulic), `piping.{h,cpp}` (single dispatch
 `piping::call` owning piping_solve / piping_report / piping_operating_point /
 piping_fluid / piping_cfd_boundary / piping_verify_cfd — the
-piping_tools.py tool envelopes). `core/hydraulic/` (aicad_hydraulic, links
-aicad_piping): `schema.{h,cpp}` (aicad.hydraulic/1), `solve.{h,cpp}`
+piping_tools.py tool envelopes). `core/hydraulic/` (chudware_hydraulic, links
+chudware_piping): `schema.{h,cpp}` (aicad.hydraulic/1), `solve.{h,cpp}`
 (size_cylinder/pump/accumulator/valve_flow + fmu_simulate as the always-
 skipped soft-fail envelope — no FMI runtime in the core), `bom.{h,cpp}`,
 `handoff.{h,cpp}` (estimate_line_dp, hoses_to_piping, the hydraulic_to_piping
@@ -3301,8 +3301,8 @@ uuid/timestamp normalisation (covers both Newton solves end-to-end incl.
 iteration counts, gas demands in kg/h + Nm³/h, pump curves, NPSH, derived
 system curves, all error envelopes). Unit tests: core/tests/test_piping.cpp
 (24 cases) + test_hydraulic.cpp (13 cases) mirror the oracle suites; both
-green. CMake: aicad_piping/aicad_hydraulic static libs + tests + rpc_cli in
-core/CMakeLists.txt (integrator review) and on the aicad DLL link line.
+green. CMake: chudware_piping/chudware_hydraulic static libs + tests + rpc_cli in
+core/CMakeLists.txt (integrator review) and on the chudware DLL link line.
 DEFERRED (kernel/orchestration, stays Python until a later leaf):
 engine_oracle/piping/threed.py (piping_to_step / piping_to_part_doc — OCCT
 sweep) and cfd_handoff.internal_volume (bore STEP extraction), plus the
@@ -3313,7 +3313,7 @@ core methods take explicit docs/results; hydraulic_add_component/add_hose
 return the updated doc under an ADDITIVE "doc" key for T-RF20 to store.
 Oracle deletion: engine_oracle/hydraulic/* and engine_oracle/piping/*
 (schema, properties, catalog, solve, cfd_handoff) can be deleted once the
-integrator wires the libaicad dispatch + worker routing and T-RF20 flips
+integrator wires the libchudware dispatch + worker routing and T-RF20 flips
 services/mcp/{hydraulic_tools,piping_tools}.py to core_bridge; threed.py +
 internal_volume need a kernel leaf first. graphify update NOT run
 (integrator).
@@ -3321,7 +3321,7 @@ internal_volume need a kernel leaf first. graphify update NOT run
 ## 2026-07-22 — T-RF20 leaf (structural MCP flip to core_bridge)
 
 Flipped the structural MCP surface off the legacy Python oracle onto the C++
-`struct_*` RPCs (T-RF19's `core/structural`, dispatched via libaicad and routed
+`struct_*` RPCs (T-RF19's `core/structural`, dispatched via libchudware and routed
 in worker_client.cpp). `services/mcp/structural_tools.py`: all three tools
 (struct_analyze / struct_check / struct_estimate) now go through one
 `_struct_rpc()` helper (`from . import core_bridge as cb` + `cb.call`), passing
@@ -3359,7 +3359,7 @@ missing-doc leg). pytest `services/mcp -q -k 'struct or compliance'`
 (mcp-venv): BEFORE 11 passed / 5 skipped / 978 deselected → AFTER identical
 (11/5/978); the 2 struct tests run green against the engine (no env override
 needed — a hostd with the T-RF19 dispatch was live; with
-`AI_CAD_ENGINE_DAEMON=0 AI_CAD_LIBAICAD=core/build-linux/bin/libaicad.so` also
+`CHUDWARE_ENGINE_DAEMON=0 CHUDWARE_LIBCHUDWARE=core/build-linux/bin/libchudware.so` also
 green in-process). Grep proof: remaining `engine.structural` references outside
 engine_oracle are only the documented stay-Python imports in
 code_compliance_tools.py (code_check + jurisdiction_meta),
@@ -3367,9 +3367,9 @@ code_compliance_tools.py (code_check + jurisdiction_meta),
 owned by a later parts_hub leaf), and `scripts/sim_audit.py` FAMILY 7
 (`from engine.structural import analysis` — audit script, NOT in this leaf's
 write-set; flag for the deletion leaf: either flip it to cb or retire FAMILY 7
-with the oracle). ENV CAVEAT: `core/build-occt-linux/bin/libaicad.so` (17:17)
+with the oracle). ENV CAVEAT: `core/build-occt-linux/bin/libchudware.so` (17:17)
 and `host/build-linux/bin` are stale — they predate T-RF19 and answer
-"unknown method: struct_analyze"; only `core/build-linux/bin/libaicad.so`
+"unknown method: struct_analyze"; only `core/build-linux/bin/libchudware.so`
 (19:01) has the dispatch. The integrator's per-wave rebuild resolves this; the
 handlers degrade to `solver_unavailable` (not a crash) until then. Mid-run the
 parallel intake leaf's deletion of `engine_oracle/intake/` briefly broke
@@ -3387,7 +3387,7 @@ family, all consumers evidence-grepped. SIM: `sim/worker.py` is LIVE — spawned
 sim_run_flow (LBM) / sim_cancel; its deps `lbm.py` + `overlay.py` (+`doc/tessellate.py`)
 stay until the host flow path flips to `core/sim/lbm.cpp` (already ported, stl-shape gap).
 `circuit/spice/devices/subckt/analysis_ext` — the MNA solver — is PORTED
-(`core/sim/spice.cpp`, `spice_sweep.cpp`, `netlist.cpp`; `ecad_simulate` libaicad-dispatched)
+(`core/sim/spice.cpp`, `spice_sweep.cpp`, `netlist.cpp`; `ecad_simulate` libchudware-dispatched)
 but still directly imported by services/mcp (ecad_sim_tools, ecad_common, ascii2d,
 server.py warmup) + `services/ecad_design/orchestrator.py` + installer/provision.py
 (`ngspice_status`) → delete after T-RF20 flip. `vibration.py` (NOT ported — no C++
@@ -3540,13 +3540,13 @@ T-RF19 leaf 8 (2026-07-22): flipped every MCP/agent call site of the leaf-6
 C++ ports (tolerance / mechanical / materials / dfm) off the Python oracle and
 onto core_bridge, and re-homed engine_oracle/intake → services/intake.
 FLIP MAP (all response shapes unchanged — the C++ dispatch emits the same
-envelopes, verified live against libaicad): services/mcp/tolerance_tools.py
+envelopes, verified live against libchudware): services/mcp/tolerance_tools.py
 (stackup_analyze → cb.call("stackup_analyze"); mode/input validation now done
 in core, engine_unavailable envelope kept on CoreError);
 services/mcp/mechanical_tools.py (gear_check, bearing_life → cb.call,
 pass-through envelopes); services/mcp/cam_tools.py (_resolve_cam_material →
 material_cam_id + material_resolve_key; _wire_materials_registry no longer
-imports engine.materials — it now defaults $AICAD_MATERIALS_REGISTRY to the
+imports engine.materials — it now defaults $CHUDWARE_MATERIALS_REGISTRY to the
 bundled engine_oracle/materials/registry.json via a literal path, shared impl
 in cad_common._wire_materials_registry, called at IMPORT time in both modules
 because the core caches the registry once per process and a daemon spawned
@@ -3573,7 +3573,7 @@ test imports retargeted (services/mcp/test_intake_ledger.py:137,
 services/dag/test_intake_gate_ledger.py:421, services/vision/test_vision.py:138,
 the two moved test files); stale doc references swept in services/vision/
 __init__.py + services/mcp/intake_ledger.py. VERIFY (mcp-venv, daemon isolated
-via AICAD_INSTANCE_KEY): all touched modules import clean; scoped pytest
+via CHUDWARE_INSTANCE_KEY): all touched modules import clean; scoped pytest
 (services/{mcp,agent,intake,dag} -k 'tolerance or mechanical or material or
 dfm or intake or dimension_scheme or geometry_helpers') **166 passed / 2
 skipped / 0 failed** vs pre-flip baseline 129 passed / 2 skipped / 0 failed
@@ -3588,13 +3588,13 @@ material_lookup.py:15 + machining.py:122, and parity-test imports
 services/mcp/test_cam_tools.py:99, test_dimension_scheme.py:127,377 (valid
 until engine_oracle/dfm+materials are deleted). GOTCHAS for the integrator:
 (1) **materials registry provisioning** — core/materials resolves
-registry.json ONLY via $AICAD_MATERIALS_REGISTRY or the AI-CAD data root; the
+registry.json ONLY via $CHUDWARE_MATERIALS_REGISTRY or the Chudware data root; the
 in-repo copy is still engine_oracle/materials/registry.json, so when that dir
 dies the data file must be re-homed AND the installer must provision the
 data-root copy (a hostd started without the env serves material_fea_table={}
 — CAM feeds have an in-code fallback, the FEA table does not). (2) A stale
 env-less repo hostd (spawned mid-session before the import-time wiring) was
-left running at $XDG_RUNTIME_DIR/aicad/hostd-cea6d8a5b788c9ca.sock — if the
+left running at $XDG_RUNTIME_DIR/chudware/hostd-cea6d8a5b788c9ca.sock — if the
 GUI/MCP reports empty material tables, restart hostd. (3) engine_oracle/
 {tolerance,mechanical,materials,dfm} modules are now unreachable from services
 and can be deleted by the next node (their own oracle tests +
@@ -3635,7 +3635,7 @@ as the engine-less test seam (same shapes the core emits). Deleted from
 piping_tools: `_node_menu` (the core adds it). Tests:
 `services/mcp/test_hydraulic_handoff.py` retargeted to the new seam — engine
 schema imports replaced with inline aicad.hydraulic/1 fixtures, `_net()` now
-drives the flipped tool (skips cleanly without libaicad), the fluids-absent
+drives the flipped tool (skips cleanly without libchudware), the fluids-absent
 "solve_pending" branch is gone (the core always solves live), tool tests
 guarded on `core_bridge.available()`. Verify (mcp-venv): both modules import
 clean and register the same tool names; `pytest services/mcp -q --tb=short -k
@@ -3658,27 +3658,27 @@ graphify update NOT run (integrator).
 T-RF19 (place.py port — last parts-hub engine piece): ported
 engine_oracle/parts_hub/place.py (543 lines, the part_place universal
 insertion router + _place_import_file) to core/parts/place.{h,cpp} behind
-`bool aicad::parts::place_call(method, params, result, err, seams)` owning
+`bool chudware::parts::place_call(method, params, result, err, seams)` owning
 methods `part_place` {part_id, record?, doc?, params?} and `part_import_file`
 {path, as_solid?}. Leg mapping: core_family/generate_model/import_file stay
 RPC legs (PlaceSeams: get_record/parts_make/import_file/build_model — the
-sourcing Seams pattern; libaicad wires production defaults), symbol_footprint
-runs REAL aicad::ecad::apply_ops (sch_add_symbol), section_profile appends the
+sourcing Seams pattern; libchudware wires production defaults), symbol_footprint
+runs REAL chudware::ecad::apply_ops (sch_add_symbol), section_profile appends the
 StructuralElement dict inline (elements.py to_dict, identity 4x4), fitting_id
-and fmu_component use the aicad_piping/aicad_hydraulic schema factories
+and fmu_component use the chudware_piping/chudware_hydraulic schema factories
 (new_fitting/new_component/next_id). Doc-mutating legs return the updated doc
 under result["doc"] (ADDITIVE key — the oracle mutates the caller's dict in
 place, impossible across an RPC). FILES: core/parts/place.{h,cpp} (new),
 core/tests/test_parts_place.cpp (new, 16 cases + `--parity-dump` mode),
 core/tests/parts_place_parity.py (new Python↔C++ diff harness, 12 scenarios,
-0 mismatches), core/CMakeLists.txt (place.cpp into aicad_parts, which now
-PUBLIC-links aicad_ecad + aicad_hydraulic — all still pure-JSON/OCCT-free).
+0 mismatches), core/CMakeLists.txt (place.cpp into chudware_parts, which now
+PUBLIC-links chudware_ecad + chudware_hydraulic — all still pure-JSON/OCCT-free).
 VERIFY: build-z-place full build + ctest green; parity harness PASS on all 7
 legs + 5 error envelopes (uuids/hex12 ids/paths masked). INTEGRATOR WIRING:
-(1) libaicad.cpp — dispatch `part_place`/`part_import_file` to
-aicad::parts::place_call with seams: parts_make → the existing parts_make
+(1) libchudware.cpp — dispatch `part_place`/`part_import_file` to
+chudware::parts::place_call with seams: parts_make → the existing parts_make
 dispatch body (factor it into a callable), import_file →
-aicad::doc::doc_import_file, build_model → the identical lambda already in
+chudware::doc::doc_import_file, build_model → the identical lambda already in
 build_sourcing_seams (s.build_model); get_record has NO C++ hub — the MCP
 flip must pass the PartRecord pre-fetched as params.record (services/parts
 stays Python), the seam is a tests-only hook. (2) worker_client.cpp — route
@@ -3713,12 +3713,12 @@ vision+research+reveng_rpc → services/{vision,research,reveng}, kernel.py →
 services/kernel_exec.py (run_model keeps working — build123d needs an interpreter by
 nature), ecad_design → services/ecad_design/ (verified end-to-end). **place.py →
 core/parts/place.{h,cpp}** (12/12 parity scenarios, all 7 legs); `parts_make_impl`
-factored in libaicad.cpp and shared with the PlaceSeams; `part_place`/`part_import_file`
+factored in libchudware.cpp and shared with the PlaceSeams; `part_place`/`part_import_file`
 dispatched + routed + MCP-flipped; **engine_oracle/parts_hub deleted**.
 **render_part needed NO port** — MCP render tools already route to C++
 `doc_render_*` (software rasterizer in core/doc/session.cpp); the web_parity entry was
 an MCP tool name, removed like intake_status. **Materials hazard closed:** registry.json
-seed moved to `core/data/materials/` + `AICAD_BUNDLED_MATERIALS_REGISTRY` compile-time
+seed moved to `core/data/materials/` + `CHUDWARE_BUNDLED_MATERIALS_REGISTRY` compile-time
 fallback in both resolvers (env → appdata → bundled; env-less resolution verified).
 **Deletions:** engine_oracle/{firmware (earlier), bom/cost/quote/parts_providers/
 spec_sheet_matcher/sourcing_worker_rpc/bolts_loader(tests), parts_hub, tolerance,
@@ -3758,7 +3758,7 @@ services/mcp/op_registry. **Worker transition:** engine_oracle/worker.py is now 
 shim over the new `services/worker_main.py` (dual-path registrations for every
 surviving services-side table); hostd worker_bridge + WorkerClient default spawn
 flipped to `services.worker_main`; both entry points boot-identical (protocol 2).
-**Gotchas:** `pkill -f aicad-hostd` matched my own shell once (use pgrep+kill by pid);
+**Gotchas:** `pkill -f chudware-hostd` matched my own shell once (use pgrep+kill by pid);
 the live web daemon keeps its old lib until the next webd-sync reinstall — expected
 by design. **Remaining:** ecad+sim flip leaf, then ecad/ + sim MNA deletions,
 vibration/fea_thermal disposition, R5a (flags, symlink, conftest alias, tree delete),
@@ -3795,7 +3795,7 @@ suite (all in ecad_common, each commented):** (1) `_attach_lib_defs` — the C++
 stub when an add-symbol/footprint op carries no `def` (no library server-side); the facade
 inlines resolved defs like the Python op fallback did; (2) swap_doc re-mint — NO
 ecad_swap_doc RPC exists (swap_doc_locked at core/ecad/session.cpp:507 is not dispatched in
-libaicad.cpp) — temp .ecad+ container + ecad_open + doc_id aliasing (revision/undo restart,
+libchudware.cpp) — temp .ecad+ container + ecad_open + doc_id aliasing (revision/undo restart,
 tracked as an RPC-surface gap); (3) netlist enrichment — C++ netlist.cpp drops pin-name
 aliases (Bug E3 op-amp/555 subckt pins), ac_mag/ac_phase (Bug E-1), eng_overrides (T-FIN8),
 and per-comp `sim` (the Python translator's starter-library fallback); (4) sync backfill —
@@ -3853,7 +3853,7 @@ ngspice leg); `services/ecad_design/recipes.py` for the LLM orchestrator;
 (resolve_backend consulted for EVERY backend choice, so mna-with-vendor-attachments
 carries the same backend_note the oracle emitted).
 **Core additions (integrator-owned):** `ecad_swap_doc` RPC (core/ecad/session.{h,cpp}
-public wrapper over swap_doc_locked + libaicad.cpp dispatch + contracts/ecad/ecad_rpc.md
+public wrapper over swap_doc_locked + libchudware.cpp dispatch + contracts/ecad/ecad_rpc.md
 row) — the facade's swap_doc no longer re-mints, so doc_id/undo/revision survive a
 wholesale swap; spice.cpp probe resolution made case/format-tolerant
 (resolve_node_tolerant: exact→ground-alias→bare→case-insensitive; is_ground now covers
@@ -3888,7 +3888,7 @@ C++-side vendor-xdevices warning in sim_spice (today only the facade emits the n
 ### Docs prune (2026-07-23) — post-T-RF23 documentation consolidation
 Pruned and reorganized `docs/` now that the consolidation DAG (T-RF1..T-RF23) and the
 zero-Python cutover are done. **Deleted as stale:** the five `HANDOFF_*` session notes
-(AI_EXPERIENCE, GUI_GLASS_POLISH, GUI_OVERHAUL, pipeline_benchmarking, SHOPCRAFT_GUI_POLISH),
+(AI_EXPERIENCE, GUI_GLASS_POLISH, GUI_OVERHAUL, pipeline_benchmarking, CHUDWARE_GUI_POLISH),
 `GUI_MIGRATION_DAG.md` (targeted the retired `ui/imgui` shell), `SPRINT_5DAY_PLAN.md` (sprint
 executed), `SIM_FW_FINALIZE_PLAN_2026-07-10.md` (FIN wave shipped), `FIN_CAPABILITY_MAP_2026-07-10.md`
 (point-in-time snapshot), `vendor_adapter_audit_2026-07-10.md`, `SESSION_VERIFY_2026-07-10_PERF.md`,
@@ -3946,7 +3946,7 @@ xdotool windowclose on the interactive GUI → process exits within ~8s (previou
 lingered on orphaned Chromium threads after CefShutdown).
 **T-RF22 (Windows verification).** No MSVC toolchain exists on this box (both Windows
 presets are MSVC-only) — all wave-touched C++ (core/ecad/session.cpp, core/sim/spice.cpp,
-core/api/libaicad.cpp, host/src/main.cpp) passes `x86_64-w64-mingw32-g++ -fsyntax-only`
+core/api/libchudware.cpp, host/src/main.cpp) passes `x86_64-w64-mingw32-g++ -fsyntax-only`
 for the Windows target with zero errors. A real MSVC build still needs a Windows host;
 recorded on the task (work.py note) instead of faked.
 **Docs wave (user request, agents 44+45).** docs/ pruned 80→55 files (24 stale docs +

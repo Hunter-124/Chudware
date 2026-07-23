@@ -1,6 +1,6 @@
-"""AI-CAD MCP server.
+"""Chudware MCP server.
 
-Exposes the AI-CAD modeling engine — the SAME C++ core (`libaicad.dll`) the desktop app
+Exposes the Chudware modeling engine — the SAME C++ core (`libchudware.dll`) the desktop app
 runs — as MCP tools, so an MCP client (Claude in cowork/chat or Claude Code) can drive
 real parametric CAD and simulation: build an editable feature tree with the plain-English
 geometry vocabulary, render an annotated image to self-review, run FEA (static/modal) and
@@ -31,25 +31,25 @@ from mcp.server.fastmcp import FastMCP
 # families. `lite` is for capable models (e.g. mythos) that drive themselves: it keeps EVERY
 # capability + calculator + sourcing helper but drops the orchestration/supervision families
 # and swaps in a short, non-prescriptive instruction block, so the model runs freer and we
-# don't spend input tokens on a workflow it won't follow.  Switch with AICAD_MCP_PROFILE=lite.
+# don't spend input tokens on a workflow it won't follow.  Switch with CHUDWARE_MCP_PROFILE=lite.
 # WI-16: capability letter also influences the default — C (frontier) prefers lite; A/B full.
-# Explicit AICAD_MCP_PROFILE always wins. AICAD_CAPABILITY=A|B|C or AI_CAD_TIER can select.
-_PROFILE_ENV = os.environ.get("AICAD_MCP_PROFILE", "").strip().lower()
+# Explicit CHUDWARE_MCP_PROFILE always wins. CHUDWARE_CAPABILITY=A|B|C or CHUDWARE_TIER can select.
+_PROFILE_ENV = os.environ.get("CHUDWARE_MCP_PROFILE", "").strip().lower()
 
 
 def _resolve_mcp_profile() -> str:
     """full | lite — explicit env wins; else capability letter C → lite (WI-16)."""
     if _PROFILE_ENV in ("full", "lite"):
         return _PROFILE_ENV
-    letter = (os.environ.get("AICAD_CAPABILITY")
-              or os.environ.get("AI_CAD_CAPABILITY")
+    letter = (os.environ.get("CHUDWARE_CAPABILITY")
+              or os.environ.get("CHUDWARE_CAPABILITY")
               or "").strip().upper()
     if letter not in ("A", "B", "C"):
         # Best-effort: map active tier → capability letter without hard-importing
         # the full agent package at MCP import time when unavailable.
         try:
             from services.agent.capability import resolve_capability  # noqa: PLC0415
-            tier = (os.environ.get("AI_CAD_TIER") or "").strip()
+            tier = (os.environ.get("CHUDWARE_TIER") or "").strip()
             if tier:
                 letter = resolve_capability(tier).letter
         except Exception:  # noqa: BLE001
@@ -66,7 +66,7 @@ _LITE = _PROFILE == "lite"
 
 # WI-16 SOFT phrasing tails (capability dial). Lite carries C (minimal); full
 # carries A mandatory discipline when the server is in supervised mode. B uses
-# full + suggestive block when AICAD_CAPABILITY=B.
+# full + suggestive block when CHUDWARE_CAPABILITY=B.
 _SOFT_A = (
     "\n[CAPABILITY_SOFT] A — MANDATORY DISCIPLINE (local scaffold)\n"
     "calculate-before-model: never invent load-bearing numbers — run fit_calc / "
@@ -89,8 +89,8 @@ _SOFT_C = (
 
 
 def _soft_tail_for_profile() -> str:
-    letter = (os.environ.get("AICAD_CAPABILITY")
-              or os.environ.get("AI_CAD_CAPABILITY")
+    letter = (os.environ.get("CHUDWARE_CAPABILITY")
+              or os.environ.get("CHUDWARE_CAPABILITY")
               or "").strip().upper()
     if letter not in ("A", "B", "C"):
         letter = "C" if _LITE else "A"
@@ -102,7 +102,7 @@ def _soft_tail_for_profile() -> str:
 
 
 _LITE_INSTRUCTIONS = (
-    "Real parametric CAD + simulation on the AI-CAD C++ engine (same kernel as the desktop "
+    "Real parametric CAD + simulation on the Chudware C++ engine (same kernel as the desktop "
     "app). You are the design brain and you drive yourself — these tools are helpers, not a "
     "script; call whatever you need, in whatever order the task wants, and skip what you don't.\n"
     "ENTRY: call cad_guide() for the engine's op vocabulary + worked examples, and "
@@ -131,7 +131,7 @@ _LITE_INSTRUCTIONS = (
 )
 
 _FULL_INSTRUCTIONS = (
-        "Real parametric CAD + simulation on the AI-CAD C++ engine (same kernel as the "
+        "Real parametric CAD + simulation on the Chudware C++ engine (same kernel as the "
         "desktop app). You are the design brain.\n"
         "START by calling cad_guide() — it returns the engine's modeling op vocabulary and "
         "worked examples; cad_guide('simulation') and cad_guide('review') cover FEA/CFD and "
@@ -261,7 +261,7 @@ mcp = FastMCP(
 # policy = everything allowed, so this is behavior-neutral until a DAG node / env sets a list.
 from mcp_server import tool_registry as _reg
 
-# Mechanical CAD + simulation (C++ feature engine via libaicad.dll).
+# Mechanical CAD + simulation (C++ feature engine via libchudware.dll).
 # Per-family modules (T-RF8 split of the former cad_tools.py god file); all register
 # under the stable registry family "cad" EXCEPT cad_sim_tools (FEA/CFD solves), which
 # is genuinely "sim" so the Settings -> AI -> Tools toggle matches real ownership.
@@ -604,7 +604,7 @@ def _install_clean_stdout():
 
 
 def _warm_core() -> None:
-    """Load libaicad.dll up front (in the background) so the FIRST tool call doesn't eat the
+    """Load libchudware.dll up front (in the background) so the FIRST tool call doesn't eat the
     cold load (DLL + OCCT/gmsh deps can take many seconds) inside the client's call timeout."""
     # Arm ECAD autosave + recover any ECAD docs from a previous (possibly killed) session FIRST.
     # ECAD sessions live in the C++ core now (T-RF20), but recovery reads plain-JSON autosave files
@@ -662,14 +662,14 @@ def _reexec_with_fast_malloc() -> None:
 
     OCCT's booleans/meshing are allocation-heavy; tcmalloc cuts modeling time ~5-10% vs glibc
     malloc (measured, tools/perf_regression.py) with no logic change and ctest still green. The
-    engine is dlopened via ctypes, so linking an allocator into libaicad wouldn't override the
+    engine is dlopened via ctypes, so linking an allocator into libchudware wouldn't override the
     already-resolved glibc malloc — LD_PRELOAD before the process allocates is the only reliable
-    way, hence this early self-reexec. Opt out with AICAD_NO_FAST_MALLOC=1. Loop-guarded + fully
+    way, hence this early self-reexec. Opt out with CHUDWARE_NO_FAST_MALLOC=1. Loop-guarded + fully
     best-effort: any problem just continues on the default allocator.
     """
     if os.name == "nt":
         return
-    if os.environ.get("AICAD_NO_FAST_MALLOC") or os.environ.get("_AICAD_MALLOC_REEXEC"):
+    if os.environ.get("CHUDWARE_NO_FAST_MALLOC") or os.environ.get("_CHUDWARE_MALLOC_REEXEC"):
         return
     pre = os.environ.get("LD_PRELOAD", "")
     if "tcmalloc" in pre or "jemalloc" in pre:
@@ -689,7 +689,7 @@ def _reexec_with_fast_malloc() -> None:
     try:
         env = dict(os.environ)
         env["LD_PRELOAD"] = (lib + (":" + pre if pre else ""))
-        env["_AICAD_MALLOC_REEXEC"] = "1"  # sentinel: never re-exec twice
+        env["_CHUDWARE_MALLOC_REEXEC"] = "1"  # sentinel: never re-exec twice
         os.execve(sys.executable, [sys.executable] + sys.argv, env)
     except Exception:  # noqa: BLE001
         pass  # exec failed -> fall through and run on the default allocator
@@ -701,13 +701,13 @@ def _start_orphan_watchdog() -> None:
     stdio MCP servers are children of their client (Claude Desktop/Code, Cursor,
     the GUI copilot). When that parent dies without closing our pipes cleanly —
     crash, SIGKILL, session teardown bugs — this process used to linger forever,
-    holding a live connection into aicad-hostd: the daemon never idle-exited,
+    holding a live connection into chudware-hostd: the daemon never idle-exited,
     its docs never GC'd, and orphaned bridges piled up one per dead session
     (observed: 5 on one box). The parent can't be relied on to clean us up, so
     we watch it ourselves: if our ppid changes (parent died; we were reparented
     to init/a subreaper), exit. The engine state lives in hostd, not here, so
-    an abrupt exit loses nothing. Opt out with AICAD_ORPHAN_WATCHDOG=0."""
-    if os.name == "nt" or os.environ.get("AICAD_ORPHAN_WATCHDOG") == "0":
+    an abrupt exit loses nothing. Opt out with CHUDWARE_ORPHAN_WATCHDOG=0."""
+    if os.name == "nt" or os.environ.get("CHUDWARE_ORPHAN_WATCHDOG") == "0":
         return  # Windows has no reparenting signal; Job Objects handle teardown
     parent = os.getppid()
     if parent <= 1:
@@ -721,7 +721,7 @@ def _start_orphan_watchdog() -> None:
                       file=sys.stderr)
                 os._exit(0)
 
-    threading.Thread(target=_watch, name="aicad-orphan-watchdog", daemon=True).start()
+    threading.Thread(target=_watch, name="chudware-orphan-watchdog", daemon=True).start()
 
 
 def main() -> None:
@@ -730,7 +730,7 @@ def main() -> None:
     real_stream = _install_clean_stdout()
     # Warm the core only AFTER fd 1 is redirected, so its load-time prints land in the log,
     # never on the protocol pipe.
-    threading.Thread(target=_warm_core, name="aicad-warm", daemon=True).start()
+    threading.Thread(target=_warm_core, name="chudware-warm", daemon=True).start()
 
     if real_stream is None:
         mcp.run()  # fallback (fd redirect unsupported) — stdio transport on sys.stdout

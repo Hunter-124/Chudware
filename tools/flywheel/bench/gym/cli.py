@@ -54,9 +54,9 @@ from .runner import run_cycle, REPORTS_DIR
 def _apply_council_threshold_dial(new_threshold: int) -> dict:
     """The one dial we can adjust AND measure deterministically here: the build-strategy
     council feature threshold (env-config, no prompt change). Returns the change record."""
-    old = os.environ.get("AI_CAD_COUNCIL_FEATURE_THRESHOLD", "5")
-    os.environ["AI_CAD_COUNCIL_FEATURE_THRESHOLD"] = str(new_threshold)
-    return {"knob": "AI_CAD_COUNCIL_FEATURE_THRESHOLD", "from": old,
+    old = os.environ.get("CHUDWARE_COUNCIL_FEATURE_THRESHOLD", "5")
+    os.environ["CHUDWARE_COUNCIL_FEATURE_THRESHOLD"] = str(new_threshold)
+    return {"knob": "CHUDWARE_COUNCIL_FEATURE_THRESHOLD", "from": old,
             "to": str(new_threshold),
             "change": f"lower council feature threshold {old} -> {new_threshold} "
                       "(more parts get the four-seat review before build)"}

@@ -8,7 +8,7 @@
 
 #include <string>
 
-namespace aicad {
+namespace chudware {
 namespace agent {
 
 enum class Complexity {
@@ -54,4 +54,4 @@ ExecStructure recommend_structure(Complexity level, bool cross_discipline = fals
 const char* structure_label(ExecStructure s);
 
 }  // namespace agent
-}  // namespace aicad
+}  // namespace chudware

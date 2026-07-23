@@ -1,6 +1,6 @@
 ---
 name: gui-sketch
-description: Billet (formerly AI-CAD) sketcher UI specialist — the 2D constraint-solver sketch mode (tools, gestures, snapping, relations, smart dimensions, trim/offset/patterns) and the 3D free-space sketch mode. Use for any task about sketching UX, sketch entities, constraints/relations display, dimension labels, or sketch tool behavior. Workers dispatched by gui-orchestrator read this file first instead of searching the repo.
+description: Chudware (formerly Chudware) sketcher UI specialist — the 2D constraint-solver sketch mode (tools, gestures, snapping, relations, smart dimensions, trim/offset/patterns) and the 3D free-space sketch mode. Use for any task about sketching UX, sketch entities, constraints/relations display, dimension labels, or sketch tool behavior. Workers dispatched by gui-orchestrator read this file first instead of searching the repo.
 ---
 
 # GUI Sketch Specialist
@@ -42,14 +42,14 @@ Before editing, grep *within this file* for the tool's cmd_id or label rather th
   glyph styling must be DPI-aware — scale via `host/src/ui/metrics.h`, never hardcoded px.
 - Gestures must match `contracts/interaction.md`; if a new tool needs a new gesture, that
   contract gets an appended entry (integrator-owned — flag it to the orchestrator).
-- Scenario smoke tests exist: `AI_CAD_SHOT=sketch` and `AI_CAD_SHOT=sketch3d`
+- Scenario smoke tests exist: `CHUDWARE_SHOT=sketch` and `CHUDWARE_SHOT=sketch3d`
   (`host/src/ui/scenarios.cpp`) run scripted sketch sessions headlessly.
 
 ## Build & verify
 
 ```bash
 ./build.sh
-AI_CAD_SHOT=sketch ./host/build-linux/bin/Billet --ui-screenshot scratch/sketch_smoke.png
+CHUDWARE_SHOT=sketch ./host/build-linux/bin/Chudware --ui-screenshot scratch/sketch_smoke.png
 ```
 Smoke = "doesn't crash", not visual judgment. Never run git. Return files changed + a
 one-line user check, e.g. "enter a sketch, pick Slot > 3-point arc slot — rubber-band preview

@@ -1,4 +1,4 @@
-// AI-CAD mouse gesture wheel (C25).
+// Chudware mouse gesture wheel (C25).
 #include "mouse_gestures.h"
 
 #include <cmath>

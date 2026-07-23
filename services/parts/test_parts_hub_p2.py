@@ -3,8 +3,8 @@
 All tests are CI-safe: no network, no core binary, no vendor credentials required.
 Live vendor tests mock the ProviderChain at the HTTP seam.
 
-Run: AI_CAD_LIBAICAD=$PWD/core/build-linux/bin/libaicad.so
-     ~/.local/share/AI-CAD/mcp-venv/bin/python -m pytest services/parts/test_parts_hub_p2.py -q
+Run: CHUDWARE_LIBCHUDWARE=$PWD/core/build-linux/bin/libchudware.so
+     ~/.local/share/Chudware/mcp-venv/bin/python -m pytest services/parts/test_parts_hub_p2.py -q
 """
 from __future__ import annotations
 
@@ -301,10 +301,10 @@ class TestEcadKicadAdapter:
         assert results == []
 
     def test_user_lib_path_env_not_set(self):
-        """Without AICAD_KICAD_SYM_PATH, iter_records uses only starter — no crash."""
+        """Without CHUDWARE_KICAD_SYM_PATH, iter_records uses only starter — no crash."""
         from services.parts.adapters.ecad_kicad_adapter import EcadKicadAdapter
         env = os.environ.copy()
-        env.pop("AICAD_KICAD_SYM_PATH", None)
+        env.pop("CHUDWARE_KICAD_SYM_PATH", None)
         adapter = EcadKicadAdapter()
         with patch.dict(os.environ, {}, clear=True):
             records = list(adapter.iter_records())
@@ -437,7 +437,7 @@ class TestFederation:
             f"Expected ecad domain in M3 results (MountingHole_3.2mm_M3); "
             f"got domains: {domains}"
         )
-        # Exact-designation hits must outrank the BM25-only ecad row. With libaicad
+        # Exact-designation hits must outrank the BM25-only ecad row. With libchudware
         # present the core-families adapter also contributes M3-designated fastener
         # FAMILIES (domain mech_family) that legitimately share the +1000 boost, so
         # the env-robust invariant is: first result is an exact M3 designation from a

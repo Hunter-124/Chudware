@@ -213,7 +213,7 @@ the split per-family modules, `cad_tools.py:1-8,142`).
 
 `services/mcp/server.py` (748 lines) is the FastMCP app entrypoint: builds
 instructions text with a **capability-dial profile** system (`full` vs `lite`,
-`AICAD_MCP_PROFILE` / capability-letter-derived, `server.py:28-101`) that tunes
+`CHUDWARE_MCP_PROFILE` / capability-letter-derived, `server.py:28-101`) that tunes
 how prescriptive the tool-usage instructions are per model tier (A/B/C
 capability letters) — a concept with no OMP analogue.
 
@@ -234,8 +234,8 @@ capability letters) — a concept with no OMP analogue.
 - **Policy enforcement** (`is_allowed`/`deny_reason`, lines 162-221): layered
   checks in order — meta-tools always pass → per-tool `enabled` flag
   (Settings→AI→Tools) → `agent.tool_families` config (family disable) →
-  risk-class deny-list (`AI_CAD_TOOLS_DENY_RISK`) → explicit allow-list
-  (`AI_CAD_TOOLS_ALLOW`, or DAG-node `tools:` list via `set_policy()`).
+  risk-class deny-list (`CHUDWARE_TOOLS_DENY_RISK`) → explicit allow-list
+  (`CHUDWARE_TOOLS_ALLOW`, or DAG-node `tools:` list via `set_policy()`).
   Default policy = everything allowed (fail-open by default, deny-by-exception).
 - **Workspace write-lease integration** (`_workspace_lease_refusal`, lines
   225-243): mutating tools carrying a `doc_id` kwarg are checked against a
@@ -316,7 +316,7 @@ also used for some providers; only the fenced-JSON path was directly observed.]
 OMP tools are declared as `{name, parameters: ZodSchema, execute(...): Promise<
 AgentToolResult>, approval, tier}` TypeScript objects running in a Bun/Node
 process. CAD tools are Python functions decorated `@mcp.tool()`, running
-in-process with `libaicad` (native C++ core via ctypes `core_bridge`), addressed
+in-process with `libchudware` (native C++ core via ctypes `core_bridge`), addressed
 either via FastMCP stdio/HTTP or via the in-process `_get_fn` bypass.
 
 **Two integration paths exist, both already partially proven by existing code:**
@@ -391,11 +391,11 @@ RPC endpoint that ultimately calls `_get_fn`-resolved functions, not a second
 Python entrypoint, to preserve this guarantee.
 
 ### 5.5 Native-binary / bun-only risk
-CAD's engine work happens through `core_bridge` (ctypes → `libaicad` native
+CAD's engine work happens through `core_bridge` (ctypes → `libchudware` native
 DLL/so, single-process-affinity likely — same process the desktop app runs).
 OMP tools run in Bun. Any FORK where OMP drives CAD tools MUST go through IPC
 (the already-decided bun-sidecar bridge) rather than attempting to load
-`libaicad` into Bun directly — ctypes bindings, GPU/rendering, and any
+`libchudware` into Bun directly — ctypes bindings, GPU/rendering, and any
 thread-affinity in the native core make in-process reuse from Bun infeasible
 without a full native N-API/FFI rewrite (out of scope; not attempted by
 anything observed in either repo).
@@ -416,7 +416,7 @@ anything observed in either repo).
 | Tool schema for prompt | Zod/JSON-Schema native (`packages/ai/src/schema/*`) | `tool_schemas.py` text-signature renderer (separate from FastMCP's auto schema) | KEEP CAD's FastMCP-derived JSON Schema as the ONE schema (drop `tool_schemas.py`'s redundant text renderer once native function-calling used) | S | only if CAD's turn loop moves off fenced-JSON to native calling |
 | MCP client (consuming 3rd-party servers) | `packages/coding-agent/src/mcp/*` (full manager, OAuth, discovery, `/mcp` UX) | not found (CAD is MCP-server-only) [INFERENCE, needs deeper search] | FORK — reuse OMP's MCP client wholesale; CAD gains 3rd-party MCP consumption for free | S | none — pure gain |
 | MCP server-authoring template | `packages/mnemopi/src/mcp-server.ts` | `services/mcp/server.py` (CAD's own, more mature) | KEEP CAD's FastMCP server | KEEP | none |
-| Domain tool families (drawing/sim/ecad/cam/plm) | none native | `cad_drawing_tools.py`, `cad_sim_tools.py`, `ecad_*_tools.py`, `cam_tools.py`, `plm_bridge.py` | KEEP CAD's Python implementations; expose via path (A) or (B) above | — | native engine coupling (`core_bridge`/`libaicad`), see §5.5 |
+| Domain tool families (drawing/sim/ecad/cam/plm) | none native | `cad_drawing_tools.py`, `cad_sim_tools.py`, `ecad_*_tools.py`, `cam_tools.py`, `plm_bridge.py` | KEEP CAD's Python implementations; expose via path (A) or (B) above | — | native engine coupling (`core_bridge`/`libchudware`), see §5.5 |
 | Write-lease / multi-agent doc concurrency | none | `workspace.py` (`check_write_lease`), wired into `tool_registry._guard` | KEEP CAD's; OMP fork must call through the same guard, not bypass it | — | any OMP-native tool wrapper (path B) MUST NOT skip this check |
 
 ---

@@ -940,7 +940,7 @@
           "runs_dir_override": null
         },
         "ok": true,
-        "result": "{\n  \"ok\": false,\n  \"reason\": \"Build graph run 'gym_C1_local-24k_s1' not found\",\n  \"hint\": \"Check run_id (from buildgraph_plan) and runs_dir (default: /home/hunter/.local/share/AI-CAD/runs).\"\n}"
+        "result": "{\n  \"ok\": false,\n  \"reason\": \"Build graph run 'gym_C1_local-24k_s1' not found\",\n  \"hint\": \"Check run_id (from buildgraph_plan) and runs_dir (default: /home/hunter/.local/share/Chudware/runs).\"\n}"
       }
     },
     {
@@ -1246,7 +1246,7 @@
           }
         },
         "ok": true,
-        "result": "{\n  \"ok\": true,\n  \"run_id\": \"a514a3dc-0618-45bf-bd99-d7e0ba26e367\",\n  \"graph\": {\n    \"schema\": \"aicad.buildgraph/1\",\n    \"mission\": \"\",\n    \"nodes\": []\n  },\n  \"advisories\": [\n    {\n      \"schema\": \"aicad.advisory/1\",\n      \"seq\": 3,\n      \"stage\": \"build_plan\",\n      \"items\": [\n        {\n          \"id\": \"adv_2e9d583c\",\n          \"severity\": \"hint\",\n          \"check\": \"empty_graph\",\n          \"finding\": \"Build graph has no nodes; nothing to validate.\",\n          \"refs\": {},\n          \"numbers\": {},\n          \"candidate_fixes\": [],\n          \"helper_tools\": [],\n          \"source\": {\n            \"kind\": \"calc\",\n            \"detail\": \"buildgraph_validator\"\n          }\n        }\n      ]\n    }\n  ],\n  \"sidecar_path\": \"/home/hunter/.local/share/AI-CAD/runs/a514a3dc-0618-45bf-bd99-d7e0ba26e367.buildgraph.json\",\n  \"node_count\": 0,\n  \"advisory_count\": 1,\n  \"blocker_count\": 0,\n  \"hint\": \"Use buildgraph_status(run_id) to inspect node statuses. Review any advisory findings before executing \\u2014 bl…"
+        "result": "{\n  \"ok\": true,\n  \"run_id\": \"a514a3dc-0618-45bf-bd99-d7e0ba26e367\",\n  \"graph\": {\n    \"schema\": \"aicad.buildgraph/1\",\n    \"mission\": \"\",\n    \"nodes\": []\n  },\n  \"advisories\": [\n    {\n      \"schema\": \"aicad.advisory/1\",\n      \"seq\": 3,\n      \"stage\": \"build_plan\",\n      \"items\": [\n        {\n          \"id\": \"adv_2e9d583c\",\n          \"severity\": \"hint\",\n          \"check\": \"empty_graph\",\n          \"finding\": \"Build graph has no nodes; nothing to validate.\",\n          \"refs\": {},\n          \"numbers\": {},\n          \"candidate_fixes\": [],\n          \"helper_tools\": [],\n          \"source\": {\n            \"kind\": \"calc\",\n            \"detail\": \"buildgraph_validator\"\n          }\n        }\n      ]\n    }\n  ],\n  \"sidecar_path\": \"/home/hunter/.local/share/Chudware/runs/a514a3dc-0618-45bf-bd99-d7e0ba26e367.buildgraph.json\",\n  \"node_count\": 0,\n  \"advisory_count\": 1,\n  \"blocker_count\": 0,\n  \"hint\": \"Use buildgraph_status(run_id) to inspect node statuses. Review any advisory findings before executing \\u2014 bl…"
       }
     },
     {
@@ -1299,7 +1299,7 @@
           }
         },
         "ok": true,
-        "result": "{\n  \"ok\": true,\n  \"run_id\": \"7df55765-116c-443c-adb6-64e4e96418b0\",\n  \"graph\": {\n    \"schema\": \"aicad.buildgraph/1\",\n    \"mission\": \"\",\n    \"nodes\": []\n  },\n  \"advisories\": [\n    {\n      \"schema\": \"aicad.advisory/1\",\n      \"seq\": 4,\n      \"stage\": \"build_plan\",\n      \"items\": [\n        {\n          \"id\": \"adv_75c922aa\",\n          \"severity\": \"hint\",\n          \"check\": \"empty_graph\",\n          \"finding\": \"Build graph has no nodes; nothing to validate.\",\n          \"refs\": {},\n          \"numbers\": {},\n          \"candidate_fixes\": [],\n          \"helper_tools\": [],\n          \"source\": {\n            \"kind\": \"calc\",\n            \"detail\": \"buildgraph_validator\"\n          }\n        }\n      ]\n    }\n  ],\n  \"sidecar_path\": \"/home/hunter/.local/share/AI-CAD/runs/7df55765-116c-443c-adb6-64e4e96418b0.buildgraph.json\",\n  \"node_count\": 0,\n  \"advisory_count\": 1,\n  \"blocker_count\": 0,\n  \"hint\": \"Use buildgraph_status(run_id) to inspect node statuses. Review any advisory findings before executing \\u2014 bl…"
+        "result": "{\n  \"ok\": true,\n  \"run_id\": \"7df55765-116c-443c-adb6-64e4e96418b0\",\n  \"graph\": {\n    \"schema\": \"aicad.buildgraph/1\",\n    \"mission\": \"\",\n    \"nodes\": []\n  },\n  \"advisories\": [\n    {\n      \"schema\": \"aicad.advisory/1\",\n      \"seq\": 4,\n      \"stage\": \"build_plan\",\n      \"items\": [\n        {\n          \"id\": \"adv_75c922aa\",\n          \"severity\": \"hint\",\n          \"check\": \"empty_graph\",\n          \"finding\": \"Build graph has no nodes; nothing to validate.\",\n          \"refs\": {},\n          \"numbers\": {},\n          \"candidate_fixes\": [],\n          \"helper_tools\": [],\n          \"source\": {\n            \"kind\": \"calc\",\n            \"detail\": \"buildgraph_validator\"\n          }\n        }\n      ]\n    }\n  ],\n  \"sidecar_path\": \"/home/hunter/.local/share/Chudware/runs/7df55765-116c-443c-adb6-64e4e96418b0.buildgraph.json\",\n  \"node_count\": 0,\n  \"advisory_count\": 1,\n  \"blocker_count\": 0,\n  \"hint\": \"Use buildgraph_status(run_id) to inspect node statuses. Review any advisory findings before executing \\u2014 bl…"
       }
     },
     {

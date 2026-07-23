@@ -33,7 +33,7 @@
 #include <gp_Pnt.hxx>
 #include <gp_Trsf.hxx>
 
-using namespace aicad::sim;
+using namespace chudware::sim;
 
 namespace {
 
@@ -81,7 +81,7 @@ int count_z_layers(const std::vector<double>& points, double bin_mm) {
 }  // namespace
 
 TEST_CASE("structured hex falls back to tet on non-box geometry") {
-    const std::string step = write_rotated_box(40.0, 24.0, 16.0, "aicad_ap_rotbox.step");
+    const std::string step = write_rotated_box(40.0, 24.0, 16.0, "chudware_ap_rotbox.step");
 
     // fallback_to_tet (the new default) -> a clean tet mesh + an explanatory note, NOT a hard
     // failure and NOT a bogus hex on the rotated solid.
@@ -105,7 +105,7 @@ TEST_CASE("structured hex falls back to tet on non-box geometry") {
 }
 
 TEST_CASE("auto_type picks hex8 for an axis-aligned box") {
-    const std::string step = write_box(50.0, 30.0, 20.0, "aicad_ap_box.step");
+    const std::string step = write_box(50.0, 30.0, 20.0, "chudware_ap_box.step");
 
     MeshOptions o;
     o.auto_type = true;
@@ -121,7 +121,7 @@ TEST_CASE("auto_type picks hex8 for an axis-aligned box") {
 }
 
 TEST_CASE("auto_type picks tet for a non-box solid (cylinder)") {
-    const std::string step = write_cylinder(10.0, 40.0, "aicad_ap_cyl.step");
+    const std::string step = write_cylinder(10.0, 40.0, "chudware_ap_cyl.step");
 
     MeshOptions o;
     o.auto_type = true;
@@ -139,7 +139,7 @@ TEST_CASE("auto_type thin-wall sizes enough tet layers through the thickness") {
     // A thin disc (round plate) is a NON-box thin-wall part: the min dimension (2mm thickness)
     // is a small fraction of the bbox diagonal, so auto-pick routes it to layered tet meshing.
     // (A perfect axis-aligned box would instead — and correctly — mesh as structured hex.)
-    const std::string step = write_cylinder(10.0, 2.0, "aicad_ap_disc.step");
+    const std::string step = write_cylinder(10.0, 2.0, "chudware_ap_disc.step");
 
     MeshOptions o;
     o.auto_type = true;
@@ -158,7 +158,7 @@ TEST_CASE("auto_type thin-wall sizes enough tet layers through the thickness") {
 }
 
 TEST_CASE("quad_surface keeps a valid tetrahedral volume mesh") {
-    const std::string step = write_box(40.0, 20.0, 10.0, "aicad_ap_quad.step");
+    const std::string step = write_box(40.0, 20.0, 10.0, "chudware_ap_quad.step");
 
     MeshOptions o;
     o.quad_surface = true;
@@ -178,7 +178,7 @@ TEST_CASE("quad_surface keeps a valid tetrahedral volume mesh") {
 }
 
 TEST_CASE("detect_box_geometry classifies boxes and non-boxes") {
-    const std::string box = write_box(30.0, 20.0, 10.0, "aicad_ap_detbox.step");
+    const std::string box = write_box(30.0, 20.0, 10.0, "chudware_ap_detbox.step");
     BoxGeomInfo bi = detect_box_geometry(box);
     CHECK(bi.is_box);
     CHECK(bi.Lx == doctest::Approx(30.0));
@@ -186,12 +186,12 @@ TEST_CASE("detect_box_geometry classifies boxes and non-boxes") {
     CHECK(bi.Lz == doctest::Approx(10.0));
     CHECK(bi.error.empty());
 
-    const std::string cyl = write_cylinder(10.0, 20.0, "aicad_ap_detcyl.step");
+    const std::string cyl = write_cylinder(10.0, 20.0, "chudware_ap_detcyl.step");
     BoxGeomInfo ci = detect_box_geometry(cyl);
     CHECK_FALSE(ci.is_box);
     CHECK_FALSE(ci.error.empty());
 
-    const std::string rot = write_rotated_box(30.0, 20.0, 10.0, "aicad_ap_detrot.step");
+    const std::string rot = write_rotated_box(30.0, 20.0, 10.0, "chudware_ap_detrot.step");
     BoxGeomInfo ri = detect_box_geometry(rot);
     CHECK_FALSE(ri.is_box);  // volume != axis-aligned bbox volume
     CHECK_FALSE(ri.error.empty());

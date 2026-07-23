@@ -705,7 +705,7 @@ _PROVIDER_PLAN_BUSY = {"v": False}
 # that overruns the MCP client's transport timeout gets the server KILLED, and without on-disk
 # backing every open schematic/board is lost — unlike C++ part docs, which autosave + recover
 # (cad_tools). The engine.ecad.autosave module (no C++ counterpart — STAYS) persists each doc to
-# %APPDATA%/AI-CAD/ecad_autosave; here we arm it and expose recovery to server._warm_core.
+# %APPDATA%/Chudware/ecad_autosave; here we arm it and expose recovery to server._warm_core.
 
 _ECAD_SESSION_ID = _uuid_ecad.uuid4().hex[:12]
 
@@ -845,7 +845,7 @@ def _autosave_all_open_ecad() -> None:
 # so the abandoned (daemon) worker can keep running harmlessly.
 
 try:
-    _ECAD_HEAVY_BUDGET_S = float(os.environ.get("AI_CAD_ECAD_HEAVY_BUDGET_S", "") or 30.0)
+    _ECAD_HEAVY_BUDGET_S = float(os.environ.get("CHUDWARE_ECAD_HEAVY_BUDGET_S", "") or 30.0)
 except (TypeError, ValueError):
     _ECAD_HEAVY_BUDGET_S = 30.0
 if not (_ECAD_HEAVY_BUDGET_S > 0.0):
@@ -927,7 +927,7 @@ def _budget_timeout_err(what: str, *, simplify: str,
 
 
 def _dumps(payload: dict) -> str:
-    """Compact JSON by default (AICAD_MCP_PRETTY=1 for indent=2)."""
+    """Compact JSON by default (CHUDWARE_MCP_PRETTY=1 for indent=2)."""
     return _rs.dumps(payload)
 
 

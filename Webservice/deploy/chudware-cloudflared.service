@@ -1,12 +1,12 @@
 [Unit]
-Description=billet-web cloudflared tunnel (token from gateway.env)
+Description=chudware-web cloudflared tunnel (token from gateway.env)
 Documentation=file://%h/Repositories/CAD/Webservice/deploy/RUNBOOK.md
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-EnvironmentFile=-%h/billet-web-data/gateway.env
+EnvironmentFile=-%h/chudware-web-data/gateway.env
 # TUNNEL_TOKEN must be set in gateway.env (never commit the token)
 ExecStart=/usr/local/bin/cloudflared tunnel run --token ${TUNNEL_TOKEN}
 Restart=on-failure

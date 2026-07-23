@@ -3,7 +3,7 @@
 These exercise the REAL adapter code paths (search/acquire → browser_fetch under a
 saved login) against the REAL sites. They are OPT-IN only:
 
-    AICAD_BROWSER_INTEGRATION_TESTS=1  +  a real logged-in profile per source
+    CHUDWARE_BROWSER_INTEGRATION_TESTS=1  +  a real logged-in profile per source
 
 CI never sets the flag and never has profiles, so the live cases skip with a clear
 "provision required" message — never a real login, never a committed credential.
@@ -30,10 +30,10 @@ EXPECTED_SITES = ("amazon", "grabcad", "jlcpcb", "mcmaster", "pcbway", "tracepar
                   "homedepot", "lowes", "acehardware", "grainger", "fastenal",
                   "harborfreight", "tractorsupply", "onlinemetals", "metalsdepot")
 
-_ENABLED = os.environ.get("AICAD_BROWSER_INTEGRATION_TESTS") == "1"
+_ENABLED = os.environ.get("CHUDWARE_BROWSER_INTEGRATION_TESTS") == "1"
 _gated = pytest.mark.skipif(
     not _ENABLED,
-    reason="opt-in only: set AICAD_BROWSER_INTEGRATION_TESTS=1 and provide a logged-in "
+    reason="opt-in only: set CHUDWARE_BROWSER_INTEGRATION_TESTS=1 and provide a logged-in "
            "profile per source — see services/browser/integration/README.md",
 )
 

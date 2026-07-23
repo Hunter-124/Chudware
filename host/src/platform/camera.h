@@ -4,7 +4,7 @@
 #include <vector>
 #include <cstdint>
 
-namespace aicad::platform {
+namespace chudware::platform {
 
 struct CameraInfo {
     std::string device_id;
@@ -30,4 +30,4 @@ public:
     virtual bool grabFrame(CameraFrame& out) = 0;  // stills-only; no continuous record
 };
 
-}  // namespace aicad::platform
+}  // namespace chudware::platform

@@ -18,7 +18,7 @@ T-W10 (tiers.yaml) is not yet merged.  Default deliberation dial = ``full``
 (councils always on), per the 2026-07-04 advisor amendment.
 
 T-W19 (buildgraph pipeline) is not yet merged.  Phase-3 gate is feature-flagged
-behind ``AI_CAD_COUNCIL_BUILDGRAPH`` (default on).
+behind ``CHUDWARE_COUNCIL_BUILDGRAPH`` (default on).
 
 ## Public API
 
@@ -70,16 +70,16 @@ COUNCIL_SCHEMA = "aicad.council/1"
 ADVISORY_SCHEMA = "aicad.advisory/1"
 
 # Feature-count threshold above which a build-strategy council is required.
-# Configurable via AI_CAD_COUNCIL_FEATURE_THRESHOLD env var.
+# Configurable via CHUDWARE_COUNCIL_FEATURE_THRESHOLD env var.
 _DEFAULT_FEATURE_THRESHOLD = 5
 
 # Phase-3 buildgraph seam feature-flag (default on; off = disable must_have
 # injection into buildgraph, e.g. while T-W19 is integrating).
-_BUILDGRAPH_SEAM_ENABLED = os.environ.get("AI_CAD_COUNCIL_BUILDGRAPH", "1") != "0"
+_BUILDGRAPH_SEAM_ENABLED = os.environ.get("CHUDWARE_COUNCIL_BUILDGRAPH", "1") != "0"
 
 # Deliberation dial: "full" = always on, "minimal" = risk-trigger only.
 # Read from T-W10 tiers.yaml when merged; else default full per 2026-07-04 amendment.
-_DELIBERATION_DEFAULT = os.environ.get("AI_CAD_COUNCIL_DELIBERATION", "full")
+_DELIBERATION_DEFAULT = os.environ.get("CHUDWARE_COUNCIL_DELIBERATION", "full")
 
 # Seat personas YAML (authored, canonical — loaded verbatim, never rewritten here).
 _SEATS_YAML = (
@@ -847,13 +847,13 @@ def _synthesize(
 def build_strategy_needed(feature_count: int) -> bool:
     """True if a build-strategy council is required before Phase 3 execution.
 
-    Threshold configured via AI_CAD_COUNCIL_FEATURE_THRESHOLD env var
+    Threshold configured via CHUDWARE_COUNCIL_FEATURE_THRESHOLD env var
     (default 5).  Also checks the deliberation dial: 'minimal' skips unless
     threshold exceeded AND a risk trigger has fired (risk trigger not implemented
     here — callers pass the result of their own risk check in that mode).
     """
     threshold = int(
-        os.environ.get("AI_CAD_COUNCIL_FEATURE_THRESHOLD", str(_DEFAULT_FEATURE_THRESHOLD))
+        os.environ.get("CHUDWARE_COUNCIL_FEATURE_THRESHOLD", str(_DEFAULT_FEATURE_THRESHOLD))
     )
     return feature_count >= threshold
 

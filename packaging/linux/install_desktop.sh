@@ -6,7 +6,7 @@
 # entry's StartupWMClass=chudware binds the live window to it — so the taskbar icon
 # resolves even for a window launched outside the launcher.
 #
-# The binary is named chudware (deep rename); a Billet compat symlink ships beside
+# The binary is named chudware (deep rename); a Chudware compat symlink ships beside
 # it for legacy scripts, but Exec points at the canonical host/build-linux/bin/chudware.
 #
 # Usage:  packaging/linux/install_desktop.sh
@@ -17,25 +17,25 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BIN="$REPO/host/build-linux/bin/chudware"
 ICON_SRC="$REPO/assets/logo_icon.png"
 DOC_ICON_SRC="$REPO/assets/doc_icon.png"
-# freedesktop icon name for the native document MIME type (application/vnd.billet.stepplus,
+# freedesktop icon name for the native document MIME type (application/vnd.chudware.stepplus,
 # registered by services/installer/setup_file_assoc.py): the MIME with '/' -> '-'.
-MIME_ICON_NAME="application-vnd.billet.stepplus"
+MIME_ICON_NAME="application-vnd.chudware.stepplus"
 
-[ -x "$BIN" ] || { echo "error: binary not found/executable: $BIN"; echo "build it: cmake -S host -B host/build-linux && ninja -C host/build-linux Billet"; exit 1; }
+[ -x "$BIN" ] || { echo "error: binary not found/executable: $BIN"; echo "build it: cmake -S host -B host/build-linux && ninja -C host/build-linux Chudware"; exit 1; }
 [ -f "$ICON_SRC" ] || { echo "error: icon not found: $ICON_SRC"; exit 1; }
 
 APPS="$HOME/.local/share/applications"
 ICONS="$HOME/.local/share/icons/hicolor"
 mkdir -p "$APPS"
 
-# Install the icon under the theme name "Billet" at several sizes so the shell can
+# Install the icon under the theme name "Chudware" at several sizes so the shell can
 # pick a crisp one. Prefer ImageMagick; fall back to Python/Pillow; last resort
 # copy the 256px source only into the 256 slot.
 install_icon() {
   local size="$1"
   local dir="$ICONS/${size}x${size}/apps"
   mkdir -p "$dir"
-  local dest="$dir/Billet.png"
+  local dest="$dir/Chudware.png"
   if command -v magick >/dev/null 2>&1; then
     magick "$ICON_SRC" -resize "${size}x${size}" "$dest"
   elif command -v convert >/dev/null 2>&1; then
@@ -53,7 +53,7 @@ PY
 }
 for s in 16 32 48 64 128 256; do install_icon "$s"; done
 
-# Install the branded DOCUMENT icon for the Billet MIME type so Dolphin/Nautilus
+# Install the branded DOCUMENT icon for the Chudware MIME type so Dolphin/Nautilus
 # show .step+ files with the doc page icon (not a blank page). Same resize
 # mechanism as install_icon, but into the theme's mimetypes/ dirs.
 install_mime_icon() {
@@ -89,21 +89,21 @@ Type=Application
 Name=Chudware
 Comment=Chudware — AI-native parametric CAD
 Exec=$BIN %F
-Icon=Billet
+Icon=Chudware
 Categories=Graphics;Engineering;
 Terminal=false
 StartupWMClass=chudware
 EOF
 
-# Migration cleanup: retire the pre-rename AI-CAD entry + hicolor icons, the
+# Migration cleanup: retire the pre-rename Chudware entry + hicolor icons, the
 # stale ui/imgui entry (Exec pointed at the removed aicad2-dev binary), and the
-# pre-chudware-rename Billet.desktop (superseded by chudware.desktop above) so
+# pre-chudware-rename Chudware.desktop (superseded by chudware.desktop above) so
 # old installs don't show a duplicate launcher entry.
-for STALE in "$APPS/AI-CAD.desktop" "$APPS/aicad2-dev.desktop" "$APPS/Billet.desktop"; do
+for STALE in "$APPS/Chudware.desktop" "$APPS/aicad2-dev.desktop" "$APPS/Chudware.desktop"; do
   [ -f "$STALE" ] && { rm -f "$STALE"; echo "removed stale $STALE"; }
 done
 for s in 16 32 48 64 128 256; do
-  OLD_ICON="$ICONS/${s}x${s}/apps/AI-CAD.png"
+  OLD_ICON="$ICONS/${s}x${s}/apps/Chudware.png"
   [ -f "$OLD_ICON" ] && { rm -f "$OLD_ICON"; echo "removed stale $OLD_ICON"; }
   # Old MIME icon name (application/vnd.aicad.stepplus, pre-rename).
   OLD_MIME_ICON="$ICONS/${s}x${s}/mimetypes/application-vnd.aicad.stepplus.png"
@@ -114,4 +114,4 @@ command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$
 command -v gtk-update-icon-cache   >/dev/null 2>&1 && gtk-update-icon-cache -f -t "$ICONS" 2>/dev/null || true
 
 echo "installed chudware.desktop + icon."
-echo "If you have a pinned taskbar launcher, un-pin and re-pin it (it may cache the old AI-CAD/aicad2-dev/Billet entry)."
+echo "If you have a pinned taskbar launcher, un-pin and re-pin it (it may cache the old Chudware/aicad2-dev/Chudware entry)."

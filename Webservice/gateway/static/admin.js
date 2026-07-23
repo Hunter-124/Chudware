@@ -1,4 +1,4 @@
-/* billet-web /admin — allowlist management */
+/* chudware-web /admin — allowlist management */
 (function () {
   "use strict";
 
@@ -399,7 +399,7 @@
           "<button type='button' class='btn primary' id='deploy-rebuild'>Rebuild</button>" +
           "<button type='button' class='btn ghost' id='deploy-redeploy'>Redeploy gateway</button>" +
         "</div>" +
-        "<p class='deploy-note'>Redeploy restarts billet-gateway — this page and terminals/WS will briefly reconnect.</p>" +
+        "<p class='deploy-note'>Redeploy restarts chudware-gateway — this page and terminals/WS will briefly reconnect.</p>" +
       "</div>" +
       "<div class='deploy-status-row'>" +
         "<span class='dep-pill dep-idle' id='deploy-status'>idle</span>" +

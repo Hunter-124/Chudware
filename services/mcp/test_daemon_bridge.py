@@ -1,7 +1,7 @@
 """daemon_bridge tests — the MCP side of the shared engine-host daemon.
 
-Each test uses a scratch AICAD_INSTANCE_KEY so a live dev/installed daemon is
-never touched. Skips when no aicad-hostd binary is built (mirrors the gate's
+Each test uses a scratch CHUDWARE_INSTANCE_KEY so a live dev/installed daemon is
+never touched. Skips when no chudware-hostd binary is built (mirrors the gate's
 hostd_smoke SKIP semantics).
 """
 from __future__ import annotations
@@ -18,16 +18,16 @@ from mcp_server.daemon_bridge import DaemonClient, DaemonError
 
 HOSTD = daemon_bridge.resolve_hostd_bin()
 
-pytestmark = pytest.mark.skipif(HOSTD is None, reason="aicad-hostd not built")
+pytestmark = pytest.mark.skipif(HOSTD is None, reason="chudware-hostd not built")
 
 
 @pytest.fixture()
 def scratch_daemon(monkeypatch):
     """Fresh instance key + fast linger; kills the daemon on teardown."""
     key = "pytest-" + uuid.uuid4().hex[:8]
-    monkeypatch.setenv("AICAD_INSTANCE_KEY", key)
-    monkeypatch.setenv("AICAD_HOSTD_LINGER_SECS", "2")
-    monkeypatch.delenv("AICAD_HOSTD_SOCKET", raising=False)
+    monkeypatch.setenv("CHUDWARE_INSTANCE_KEY", key)
+    monkeypatch.setenv("CHUDWARE_HOSTD_LINGER_SECS", "2")
+    monkeypatch.delenv("CHUDWARE_HOSTD_SOCKET", raising=False)
     pids = []
     yield pids
     for pid in pids:
@@ -89,7 +89,7 @@ def test_rpc_error_maps_to_is_error(scratch_daemon):
 
 
 def test_core_bridge_daemon_mode_raises_coreerror(scratch_daemon, monkeypatch):
-    monkeypatch.setenv("AI_CAD_ENGINE_DAEMON", "1")
+    monkeypatch.setenv("CHUDWARE_ENGINE_DAEMON", "1")
     # Reset the daemon_bridge singleton so it picks up the scratch key.
     monkeypatch.setattr(daemon_bridge, "_client", None)
     from mcp_server import core_bridge

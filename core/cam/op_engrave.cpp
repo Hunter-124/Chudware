@@ -7,7 +7,7 @@
 
 #include "cam/op_common.h"
 
-namespace aicad {
+namespace chudware {
 namespace cam {
 
 GenResult gen_engrave(const Operation& opIn, const OpContext& ctx) {
@@ -49,4 +49,4 @@ GenResult gen_engrave(const Operation& opIn, const OpContext& ctx) {
 }
 
 }  // namespace cam
-}  // namespace aicad
+}  // namespace chudware

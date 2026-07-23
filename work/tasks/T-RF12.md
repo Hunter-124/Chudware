@@ -28,6 +28,6 @@ T-RF21. WASM-shot verify the gated states.
 
 ## Definition of done
 
-- [ ] No silent dead buttons on the web build for inventoried gaps.
+- [x] No silent dead buttons on the web build for inventoried gaps.
 - [ ] Capability flag reads the web_parity inventory (single source).
 - [ ] WASM + native shots; gate.sh green; REFACTOR_LOG handoff.

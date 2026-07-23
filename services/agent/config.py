@@ -564,6 +564,43 @@ def tool_max_calls_default(cfg: dict | None = None) -> int:
         return 0
 
 
+def tool_loop_guard_enabled(cfg: dict | None = None) -> bool:
+    """Repeated-identical-tool-call detector kill-switch (``agent.tool_loop_guard_enabled``).
+
+    Default True (ported from OMP's ToolCallLoopGuard — see tool_loop_guard.py).
+    Precedence: env ``CHUDWARE_TOOL_LOOP_GUARD`` > config.json > default (True).
+    """
+    try:
+        env = os.environ.get("CHUDWARE_TOOL_LOOP_GUARD")
+        if env is not None and str(env).strip() != "":
+            return str(env).strip().lower() not in ("0", "false", "no", "off")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        agent = _agent_block(cfg)
+        return bool(agent.get("tool_loop_guard_enabled", True))
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def tool_loop_guard_threshold(cfg: dict | None = None) -> int:
+    """Consecutive identical (tool, args) repeats that trip the loop guard
+    (``agent.tool_loop_guard_threshold``). Default 3; clamped to >= 1.
+    Precedence: env ``CHUDWARE_TOOL_LOOP_GUARD_THRESHOLD`` > config.json > default (3).
+    """
+    try:
+        env = os.environ.get("CHUDWARE_TOOL_LOOP_GUARD_THRESHOLD")
+        if env is not None and str(env).strip() != "":
+            return max(1, int(str(env).strip()))
+    except (TypeError, ValueError):
+        pass
+    try:
+        agent = _agent_block(cfg)
+        return max(1, int(agent.get("tool_loop_guard_threshold", 3)))
+    except Exception:  # noqa: BLE001
+        return 3
+
+
 def supervision_interval_calls(cfg: dict | None = None) -> int:
     """Tool calls between forced advisor checks (``agent.supervision_interval_calls``).
 

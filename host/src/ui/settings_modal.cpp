@@ -5355,6 +5355,8 @@ void drawSettingsModal(AppState& st, bool busy) {
                         static int s_globalTimeout = 0;
                         static int s_globalMaxCalls = 0;
                         static int s_globalSupervision = 4;
+                        static bool s_loopGuardEnabled = true;
+                        static int s_loopGuardThreshold = 3;
                         static bool s_globalLoaded = false;
                         static double s_globalLast = -1e9;
                         static bool s_globalDirty = false;
@@ -5372,14 +5374,19 @@ void drawSettingsModal(AppState& st, bool busy) {
                                     s_globalTimeout = ag.value("tool_timeout_s_default", 0);
                                     s_globalMaxCalls = ag.value("tool_max_calls_default", 0);
                                     s_globalSupervision = ag.value("supervision_interval_calls", 4);
+                                    s_loopGuardEnabled = ag.value("tool_loop_guard_enabled", true);
+                                    s_loopGuardThreshold = ag.value("tool_loop_guard_threshold", 3);
                                 } catch (...) {
                                     s_globalTimeout = 0;
                                     s_globalMaxCalls = 0;
                                     s_globalSupervision = 4;
+                                    s_loopGuardEnabled = true;
+                                    s_loopGuardThreshold = 3;
                                 }
                                 if (s_globalTimeout < 0) s_globalTimeout = 0;
                                 if (s_globalMaxCalls < 0) s_globalMaxCalls = 0;
                                 if (s_globalSupervision < 0) s_globalSupervision = 4;
+                                if (s_loopGuardThreshold < 1) s_loopGuardThreshold = 1;
                             }
                         }
                         const float gLabelW = 160.0f * sc;
@@ -5412,6 +5419,27 @@ void drawSettingsModal(AppState& st, bool busy) {
                         if (ImGui::IsItemHovered())
                             ImGui::SetTooltip("Force an advisor verification pass every N tool "
                                               "calls. 0 = never.");
+                        ImGui::AlignTextToFramePadding();
+                        ImGui::TextUnformatted("Loop guard");
+                        ImGui::SameLine(gLabelW);
+                        if (ImGui::Checkbox("##loop_guard_enabled", &s_loopGuardEnabled))
+                            s_globalDirty = true;
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("Refuse a tool call that repeats the exact same "
+                                              "tool + arguments too many times in a row instead "
+                                              "of dispatching it again (a real stuck loop, not "
+                                              "just \"used this tool a lot\").");
+                        if (s_loopGuardEnabled) {
+                            ImGui::SameLine();
+                            ImGui::SetNextItemWidth(gFieldW);
+                            if (ImGui::InputInt("##loop_guard_threshold", &s_loopGuardThreshold)) {
+                                if (s_loopGuardThreshold < 1) s_loopGuardThreshold = 1;
+                                s_globalDirty = true;
+                            }
+                            if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("Consecutive identical calls before refusal "
+                                                  "(default 3).");
+                        }
                         if (s_globalDirty) {
                             ImGui::Dummy(ImVec2(0, 4.0f * sc));
                             if (!s_globalErr.empty())
@@ -5433,6 +5461,9 @@ void drawSettingsModal(AppState& st, bool busy) {
                                     j["agent"]["tool_max_calls_default"] = std::max(0, s_globalMaxCalls);
                                     j["agent"]["supervision_interval_calls"] =
                                         std::max(0, s_globalSupervision);
+                                    j["agent"]["tool_loop_guard_enabled"] = s_loopGuardEnabled;
+                                    j["agent"]["tool_loop_guard_threshold"] =
+                                        std::max(1, s_loopGuardThreshold);
                                     std::ofstream outf(configPath(), std::ios::trunc);
                                     outf << j.dump(2);
                                     s_globalDirty = false;

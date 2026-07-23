@@ -597,17 +597,32 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
     budget = int(_budget_in)
     completion_cap = int(max_tokens) if max_tokens else 2048
     _tool_call_counts: dict[str, int] = {}
+    from services.agent.tool_loop_guard import ToolCallLoopGuard  # noqa: PLC0415
+    _loop_guard = None
+    try:
+        from services.agent.config import (  # noqa: PLC0415
+            tool_loop_guard_enabled, tool_loop_guard_threshold,
+        )
+        if tool_loop_guard_enabled():
+            _loop_guard = ToolCallLoopGuard(threshold=tool_loop_guard_threshold())
+    except Exception:  # noqa: BLE001
+        _loop_guard = ToolCallLoopGuard()
     if tool_dispatch is not None:
         _inner_dispatch = tool_dispatch
 
         def dispatch(tool: str, args: dict) -> Any:
             return _dispatch_tool(
-                tool, args, _call_counts=_tool_call_counts, _inner=_inner_dispatch
+                tool, args, _call_counts=_tool_call_counts, _inner=_inner_dispatch,
+                _loop_guard=_loop_guard,
             )
     elif mission_dispatch is not None:
         def dispatch(tool: str, args: dict) -> Any:
             fn = mission_dispatch.resolve(tool)
             if fn is not None:
+                if _loop_guard is not None:
+                    detection = _loop_guard.check(tool, args)
+                    if detection is not None:
+                        raise RuntimeError(ToolCallLoopGuard.message(detection))
                 # Still count toward per-tool caps when resolved via mission.
                 try:
                     from services.agent.config import get_tool_options  # noqa: PLC0415
@@ -648,10 +663,12 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                     if hint:
                         raise type(exc)(f"{exc} Hint: {hint}") from exc
                     raise
-            return _dispatch_tool(tool, args, _call_counts=_tool_call_counts)
+            return _dispatch_tool(tool, args, _call_counts=_tool_call_counts,
+                                  _loop_guard=_loop_guard)
     else:
         def dispatch(tool: str, args: dict) -> Any:
-            return _dispatch_tool(tool, args, _call_counts=_tool_call_counts)
+            return _dispatch_tool(tool, args, _call_counts=_tool_call_counts,
+                                  _loop_guard=_loop_guard)
     allow = set(allowed_tools or [])
     # Copilot mode → tools: intersect caller allowlist with mode policy.
     # Precedence: explicit arg → options key if present → mission_dispatch → default.
@@ -2603,6 +2620,7 @@ def _dispatch_tool(
     *,
     _call_counts: dict | None = None,
     _inner: Any | None = None,
+    _loop_guard: Any | None = None,
 ) -> Any:
     """Dispatch a tool call against the live MCP registry (battery singleton).
 
@@ -2612,8 +2630,17 @@ def _dispatch_tool(
     appends tool_hints on failure. Raises on unresolved tool or dispatch failure —
     the caller feeds the error back to the model (never a fabricated success).
     If *_inner* is provided it is called instead of the default resolver (used when
-    the turn supplied a custom tool_dispatch)."""
+    the turn supplied a custom tool_dispatch). If *_loop_guard* (a ToolCallLoopGuard,
+    see tool_loop_guard.py) is provided and this exact (tool, args) pair repeats the
+    immediately-prior successful call past its threshold, the call is refused
+    (RuntimeError with a corrective message) rather than dispatched again."""
     from services.agent.reviewer_exec import _resolve_fn
+
+    if _loop_guard is not None:
+        detection = _loop_guard.check(tool, args)
+        if detection is not None:
+            from services.agent.tool_loop_guard import ToolCallLoopGuard  # noqa: PLC0415
+            raise RuntimeError(ToolCallLoopGuard.message(detection))
 
     # Per-tool options (Settings → AI → Tools).
     opts: dict = {}

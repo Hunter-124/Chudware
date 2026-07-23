@@ -663,6 +663,22 @@ def build_graph(
             resolved_edges.append(e)
     edges = resolved_edges
 
+    # Propagate instance world positions (meta.wp) onto the docs they
+    # instance — first instance wins (edges are in deterministic load
+    # order). Lets the 3D graph view place PART/ASM docs at their real
+    # model coordinates, not just instance nodes.
+    node_by_id = {n["id"]: n for n in nodes}
+    for e in edges:
+        if e["kind"] != "INSTANCE_OF":
+            continue
+        src_n = node_by_id.get(e["src"])
+        dst_n = node_by_id.get(e["dst"])
+        if not src_n or not dst_n:
+            continue
+        wp = (src_n.get("meta") or {}).get("wp")
+        if wp and "wp" not in (dst_n.get("meta") or {}):
+            dst_n.setdefault("meta", {})["wp"] = list(wp)
+
     # --- shared dims / layouts → REFERENCES --------------------------------
     for ename, owners in eq_index.items():
         # group by (value, unit) — same name+value across docs = shared

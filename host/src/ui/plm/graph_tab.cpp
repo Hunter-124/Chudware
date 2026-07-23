@@ -156,6 +156,10 @@ struct GraphTabState {
   bool view3d = false;
   float orbitYaw = 0.55f;
   float orbitPitch = -0.30f;
+  // Depth normalization for 3D: raw seed z (containment depth) is scaled so
+  // the deepest node sits at a bounded fraction of the focal distance. Keeps
+  // perspective sane (no clamp/blow-up) and depth readable for ANY tree size.
+  float zScale = 1.0f;
   // In-session per-view position stashes — toggling views swaps these in so
   // each view keeps its own arrangement without clobbering the other's.
   std::unordered_map<std::string, Pos3> projPosStash;
@@ -2622,14 +2626,29 @@ void projectPoint(const GraphTabState &G, const Proj3 &P, float lx, float ly,
     perspOut = 1.0f;
     return;
   }
-  const float x1 = lx * P.cy + lz * P.sy;
-  const float z1 = -lx * P.sy + lz * P.cy;
+  const float lzs = lz * G.zScale;
+  const float x1 = lx * P.cy + lzs * P.sy;
+  const float z1 = -lx * P.sy + lzs * P.cy;
   const float y1 = ly * P.cp - z1 * P.sp;
   const float z2 = ly * P.sp + z1 * P.cp;
   const float persp = P.focal / std::max(200.0f * ui::uiScale, P.focal + z2);
   px = x1 * persp;
   py = y1 * persp;
   perspOut = persp;
+}
+
+// Recompute the 3D depth normalization so the deepest node sits at a bounded
+// fraction of the focal distance. Without this, deep hierarchies push z past
+// the focal plane and the perspective divide clamps/explodes (nodes fly off
+// screen, Fit can't frame them). Called after any layout/position change.
+void updateZScale(GraphTabState &G) {
+  float maxAbsZ = 0.0f;
+  for (int vi : G.visibleIdx)
+    maxAbsZ = std::max(maxAbsZ, std::fabs(G.nodes[vi].lz));
+  // Target: deepest node at ~0.6 * focal — strong parallax + perspective
+  // without ever crossing the near clamp. focal = 2400 * uiScale.
+  const float target = 0.6f * 2400.0f * ui::uiScale;
+  G.zScale = maxAbsZ > 1.0f ? target / maxAbsZ : 1.0f;
 }
 
 void fitView(GraphTabState &G, ImVec2 canvasSz) {
@@ -3220,6 +3239,14 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
 
   if (G.layoutDirty)
     rebuildForce(G);
+
+  // 3D depth normalization: keep the deepest node within the focal frustum so
+  // perspective never clamps/explodes (the "3D stopped rendering / can't fit"
+  // regression). Cheap O(visible); only meaningful in 3D.
+  if (G.view3d)
+    updateZScale(G);
+  else
+    G.zScale = 1.0f;
 
   // Fit ONLY on explicit request (Fit button). Polls/relayouts never refit.
   if (G.fitRequested && !G.visibleIdx.empty()) {

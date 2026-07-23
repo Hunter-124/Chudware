@@ -521,6 +521,190 @@ nlohmann::json rpc_debug_read_mem(const nlohmann::json& params) {
     }
 }
 
+// --- avrdude flash (S-FW-CORE) ------------------------------------------------
+
+nlohmann::json rpc_avr_flash(const nlohmann::json& params) {
+    std::string hex_path = jstr(params, "hex_path");
+    if (hex_path.empty()) hex_path = jstr(params, "elf_path");
+    if (hex_path.empty()) return err_env("invalid_request", "fw_avr_flash requires 'hex_path'");
+    std::string mcu = jstr(params, "mcu");
+    if (mcu.empty()) return err_env("invalid_request", "fw_avr_flash requires 'mcu'");
+    std::string programmer = jstr(params, "programmer");
+    std::string port = jstr(params, "port");
+    int baud = params.value("baud", 115200);
+    double timeout_s = params.value("timeout_s", 60.0);
+    return avrdude_flash(hex_path, mcu, programmer, port, baud, timeout_s).to_dict();
+}
+
+// --- openocd + gdb/MI debug (S-FW-CORE) ---------------------------------------
+
+std::vector<std::string> jstrvec(const nlohmann::json& params, const char* key) {
+    std::vector<std::string> out;
+    auto it = params.find(key);
+    if (it == params.end() || !it->is_array()) return out;
+    for (const auto& v : *it)
+        if (v.is_string()) out.push_back(v.get<std::string>());
+    return out;
+}
+
+nlohmann::json rpc_debug_gdb_reset(const nlohmann::json& params) {
+    std::string cfg = jstr(params, "openocd_cfg");
+    if (cfg.empty()) return err_env("invalid_request", "fw_debug_gdb_reset requires 'openocd_cfg'");
+    bool halt = params.value("halt", true);
+    return openocd_gdb_reset(cfg, halt, params.value("timeout_s", 30.0)).to_dict();
+}
+
+nlohmann::json rpc_debug_gdb_halt(const nlohmann::json& params) {
+    std::string cfg = jstr(params, "openocd_cfg");
+    if (cfg.empty()) return err_env("invalid_request", "fw_debug_gdb_halt requires 'openocd_cfg'");
+    return openocd_gdb_halt(cfg, params.value("timeout_s", 30.0)).to_dict();
+}
+
+nlohmann::json rpc_debug_gdb_step(const nlohmann::json& params) {
+    std::string cfg = jstr(params, "openocd_cfg");
+    if (cfg.empty()) return err_env("invalid_request", "fw_debug_gdb_step requires 'openocd_cfg'");
+    bool step_over = params.value("step_over", false);
+    return openocd_gdb_step(cfg, step_over, params.value("timeout_s", 30.0)).to_dict();
+}
+
+nlohmann::json rpc_debug_gdb_set_breakpoint(const nlohmann::json& params) {
+    std::string cfg = jstr(params, "openocd_cfg");
+    if (cfg.empty())
+        return err_env("invalid_request", "fw_debug_gdb_set_breakpoint requires 'openocd_cfg'");
+    std::string address = jstr(params, "address");
+    if (address.empty())
+        return err_env("invalid_request", "fw_debug_gdb_set_breakpoint requires 'address'");
+    return openocd_gdb_set_breakpoint(cfg, address, params.value("timeout_s", 30.0)).to_dict();
+}
+
+nlohmann::json rpc_debug_gdb_read_mem(const nlohmann::json& params) {
+    std::string cfg = jstr(params, "openocd_cfg");
+    if (cfg.empty())
+        return err_env("invalid_request", "fw_debug_gdb_read_mem requires 'openocd_cfg'");
+    std::string address = jstr(params, "address");
+    if (address.empty())
+        return err_env("invalid_request", "fw_debug_gdb_read_mem requires 'address'");
+    if (!params.contains("length") || params["length"].is_null())
+        return err_env("invalid_request", "fw_debug_gdb_read_mem requires 'length'");
+    long long length = params["length"].is_number()
+                            ? params["length"].get<long long>()
+                            : std::stoll(params["length"].get<std::string>());
+    return openocd_gdb_read_mem(cfg, address, length, params.value("timeout_s", 30.0)).to_dict();
+}
+
+// --- simavr / renode emulation (S-FW-CORE) -------------------------------------
+
+nlohmann::json rpc_emulate_simavr(const nlohmann::json& params) {
+    std::string elf_path = jstr(params, "elf_path");
+    if (elf_path.empty()) return err_env("invalid_request", "fw_emulate_simavr requires 'elf_path'");
+    std::string mcu = jstr(params, "mcu");
+    if (mcu.empty()) return err_env("invalid_request", "fw_emulate_simavr requires 'mcu'");
+    double run_s = params.value("run_s", 2.0);
+    int gdb_port = params.value("gdb_port", 1234);
+    double timeout_s = params.value("timeout_s", run_s + 10.0);
+    std::vector<std::string> mi_commands =
+        params.value("gdb", false) ? jstrvec(params, "mi_commands") : std::vector<std::string>{};
+    std::string gdb_binary = jstr(params, "gdb_binary");
+    if (gdb_binary.empty()) gdb_binary = "avr-gdb";
+    return simavr_run(elf_path, mcu, run_s, gdb_port, mi_commands, timeout_s, gdb_binary).to_dict();
+}
+
+nlohmann::json rpc_emulate_renode(const nlohmann::json& params) {
+    std::string resc_path = jstr(params, "resc_path");
+    if (resc_path.empty())
+        return err_env("invalid_request", "fw_emulate_renode requires 'resc_path'");
+    double run_s = params.value("run_s", 2.0);
+    int gdb_port = params.value("gdb_port", 3333);
+    double timeout_s = params.value("timeout_s", run_s + 10.0);
+    std::vector<std::string> mi_commands =
+        params.value("gdb", false) ? jstrvec(params, "mi_commands") : std::vector<std::string>{};
+    std::string gdb_binary = jstr(params, "gdb_binary");
+    if (gdb_binary.empty()) gdb_binary = "arm-none-eabi-gdb";
+    return renode_run(resc_path, run_s, gdb_port, mi_commands, timeout_s, gdb_binary).to_dict();
+}
+
+// --- live serial monitor (S-FW-CORE) --------------------------------------------
+
+std::string bytes_to_hex(const std::string& data) {
+    static const char* hexd = "0123456789abcdef";
+    std::string hex;
+    hex.reserve(data.size() * 2);
+    for (unsigned char b : data) {
+        hex += hexd[b >> 4];
+        hex += hexd[b & 0xF];
+    }
+    return hex;
+}
+
+bool hex_to_bytes(const std::string& hex, std::string& out) {
+    if (hex.size() % 2) return false;
+    out.clear();
+    out.reserve(hex.size() / 2);
+    auto nib = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+        int hi = nib(hex[i]), lo = nib(hex[i + 1]);
+        if (hi < 0 || lo < 0) return false;
+        out.push_back(static_cast<char>((hi << 4) | lo));
+    }
+    return true;
+}
+
+nlohmann::json rpc_serial_open(const nlohmann::json& params) {
+    std::string port = jstr(params, "port");
+    if (port.empty()) return err_env("invalid_request", "fw_serial_open requires 'port'");
+    int baud = params.value("baud", 115200);
+    std::string open_err;
+    int handle = serial_open(port, baud, open_err);
+    if (handle < 0) return {{"success", false}, {"reason", open_err}};
+    return {{"success", true}, {"handle", handle}, {"port", port}, {"baud", baud}};
+}
+
+nlohmann::json rpc_serial_read(const nlohmann::json& params) {
+    if (!params.contains("handle") || !params["handle"].is_number())
+        return err_env("invalid_request", "fw_serial_read requires 'handle'");
+    int handle = params["handle"].get<int>();
+    size_t max_bytes = static_cast<size_t>(params.value("max_bytes", 4096));
+    try {
+        std::string data = serial_read(handle, max_bytes);
+        return {{"success", true}, {"data_hex", bytes_to_hex(data)}, {"bytes", data.size()}};
+    } catch (const std::exception& e) {
+        return {{"success", false}, {"reason", e.what()}};
+    }
+}
+
+nlohmann::json rpc_serial_write(const nlohmann::json& params) {
+    if (!params.contains("handle") || !params["handle"].is_number())
+        return err_env("invalid_request", "fw_serial_write requires 'handle'");
+    int handle = params["handle"].get<int>();
+    if (!has(params, "data_hex") && !has(params, "text"))
+        return err_env("invalid_request", "fw_serial_write requires 'data_hex' or 'text'");
+    std::string payload;
+    if (has(params, "data_hex")) {
+        if (!hex_to_bytes(jstr(params, "data_hex"), payload))
+            return err_env("invalid_request", "fw_serial_write: 'data_hex' is not valid hex");
+    } else {
+        payload = jstr(params, "text");
+    }
+    try {
+        size_t n = serial_write(handle, payload);
+        return {{"success", true}, {"bytes_written", n}};
+    } catch (const std::exception& e) {
+        return {{"success", false}, {"reason", e.what()}};
+    }
+}
+
+nlohmann::json rpc_serial_close(const nlohmann::json& params) {
+    if (!params.contains("handle") || !params["handle"].is_number())
+        return err_env("invalid_request", "fw_serial_close requires 'handle'");
+    int handle = params["handle"].get<int>();
+    return {{"success", serial_close(handle)}};
+}
+
 // --- fw_projects (worker/GUI convenience) ------------------------------------
 
 nlohmann::json rpc_projects() {
@@ -580,6 +764,30 @@ bool call(const std::string& method, const nlohmann::json& params, nlohmann::jso
             result = rpc_debug_halt(params);
         } else if (method == "fw_debug_read_mem") {
             result = rpc_debug_read_mem(params);
+        } else if (method == "fw_avr_flash") {
+            result = rpc_avr_flash(params);
+        } else if (method == "fw_debug_gdb_reset") {
+            result = rpc_debug_gdb_reset(params);
+        } else if (method == "fw_debug_gdb_halt") {
+            result = rpc_debug_gdb_halt(params);
+        } else if (method == "fw_debug_gdb_step") {
+            result = rpc_debug_gdb_step(params);
+        } else if (method == "fw_debug_gdb_set_breakpoint") {
+            result = rpc_debug_gdb_set_breakpoint(params);
+        } else if (method == "fw_debug_gdb_read_mem") {
+            result = rpc_debug_gdb_read_mem(params);
+        } else if (method == "fw_emulate_simavr") {
+            result = rpc_emulate_simavr(params);
+        } else if (method == "fw_emulate_renode") {
+            result = rpc_emulate_renode(params);
+        } else if (method == "fw_serial_open") {
+            result = rpc_serial_open(params);
+        } else if (method == "fw_serial_read") {
+            result = rpc_serial_read(params);
+        } else if (method == "fw_serial_write") {
+            result = rpc_serial_write(params);
+        } else if (method == "fw_serial_close") {
+            result = rpc_serial_close(params);
         } else if (method == "fw_status") {
             result = fw_status();
         } else if (method == "fw_projects") {

@@ -9,8 +9,12 @@
 // trace artifact + §9 scenarios + §11 power-profile sidecar), fw_verify_board
 // (static + trace/emulation dynamic passes), fw_power_profile,
 // fw_sensor_scenario, fw_flash, fw_debug_start, fw_debug_halt,
-// fw_debug_read_mem, fw_status, fw_projects. The whole live surface — the
-// dispatch returns false only for genuinely unknown methods.
+// fw_debug_read_mem, fw_status, fw_projects, fw_avr_flash, fw_debug_gdb_reset,
+// fw_debug_gdb_halt, fw_debug_gdb_step, fw_debug_gdb_set_breakpoint,
+// fw_debug_gdb_read_mem, fw_emulate_simavr, fw_emulate_renode, fw_serial_open,
+// fw_serial_read, fw_serial_write, fw_serial_close (contracts/firmware_rpc.md
+// §12). The whole live surface — the dispatch returns false only for
+// genuinely unknown methods.
 #pragma once
 
 #include <string>

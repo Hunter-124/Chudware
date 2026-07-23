@@ -47,6 +47,18 @@ const std::vector<std::pair<std::string, ToolDescriptor>> kToolDescriptors = {
                 "then `. ./export.sh` so idf.py is on PATH."}},
     {"arduino-cli", {{"arduino-cli"}, {"version"}, {"build:avr"},
                      "Install arduino-cli: https://arduino.github.io/arduino-cli/ (GPL-3, subprocess-only)."}},
+    {"avrdude", {{"avrdude"}, {"-v"}, {"flash:avr"},
+                 "Install avrdude: `sudo dnf install avrdude` (or `sudo apt install avrdude`)."}},
+    {"openocd", {{"openocd"}, {"--version"}, {"debug:cortex-m (via gdb/MI)"},
+                 "Install OpenOCD: `sudo dnf install openocd` (or `sudo apt install openocd`)."}},
+    {"arm-none-eabi-gdb", {{"arm-none-eabi-gdb"}, {"--version"}, {"debug:cortex-m (via gdb/MI)"},
+                           "Install the ARM gdb: `sudo dnf install arm-none-eabi-gdb` (or "
+                           "`sudo apt install gdb-multiarch` as a cross-capable fallback)."}},
+    {"avr-gdb", {{"avr-gdb"}, {"--version"}, {"debug:avr (via simavr + gdb/MI)"},
+                "Install avr-gdb: `sudo dnf install avr-gdb` (or `sudo apt install gdb-avr`)."}},
+    {"simavr", {{"simavr"}, {"--version"}, {"emulate:avr", "debug:avr (via simavr + gdb/MI)"},
+               "Install simavr: `sudo dnf install simavr` (or `sudo apt install simavr`); "
+               "GPL/LGPL dual-licensed per-file, subprocess-only here."}},
 };
 
 // MCU family capability rules (mirrors provision.FW_FAMILY_RULES).
@@ -59,20 +71,22 @@ const std::vector<std::pair<std::string, std::vector<std::pair<std::string, Fami
         {"cortex-m",
          {{"can_build", {{"cmake", "arm-none-eabi-gcc"}, {}}},
           {"can_emulate", {{}, {"renode", "qemu-system-arm"}}},
-          {"can_flash", {{"probe-rs"}, {}}}}},
+          {"can_flash", {{"probe-rs"}, {}}},
+          {"can_debug_gdb", {{"openocd", "arm-none-eabi-gdb"}, {}}}}},
         {"esp32",
          {{"can_build", {{"idf.py"}, {}}},
           {"can_emulate", {{}, {}}},  // no emulation path for ESP32 (T-FIN2 decision)
           {"can_flash", {{"esptool"}, {}}}}},
         {"avr",
          {{"can_build", {{"arduino-cli"}, {}}},
-          {"can_emulate", {{}, {}}},
-          {"can_flash", {{}, {}}}}},
+          {"can_emulate", {{}, {"simavr"}}},
+          {"can_flash", {{"avrdude"}, {}}},
+          {"can_debug_gdb", {{"simavr", "avr-gdb"}, {}}}}},
 };
 
-// The 7 core tools that drive `missing` + banners.
+// The 8 core tools that drive `missing` + banners.
 const char* kCoreTools[] = {"cmake", "ninja", "arm-none-eabi-gcc", "renode",
-                            "qemu-system-arm", "probe-rs", "esptool"};
+                            "qemu-system-arm", "probe-rs", "esptool", "avrdude"};
 
 const ToolDescriptor* descriptor_for(const std::string& name) {
     for (const auto& [n, d] : kToolDescriptors)
@@ -176,6 +190,9 @@ nlohmann::json fw_status() {
         banners.push_back("Cortex-M flashing unavailable: `cargo install probe-rs-tools`.");
     if (!families["esp32"].value("can_flash", false))
         banners.push_back("ESP32 flashing unavailable: `pip install esptool`.");
+    if (!families["avr"].value("can_flash", false))
+        banners.push_back("AVR flashing unavailable: install avrdude "
+                          "(`sudo dnf install avrdude` / `sudo apt install avrdude`).");
 
     return {
         {"ok", true},

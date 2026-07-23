@@ -402,3 +402,227 @@ def register_firmware_tools(mcp) -> None:
                 return _dumps(parsed)
             p["sim_result"] = parsed
         return _dumps(cb.call("fw_sensor_scenario", p))
+
+    # -----------------------------------------------------------------------
+    # Hardware path (S-FW-CORE): avrdude AVR flash, OpenOCD/GDB-MI debug,
+    # simavr/Renode emulation, live serial monitor (contracts/firmware_rpc.md §12)
+    # -----------------------------------------------------------------------
+
+    @mcp.tool()
+    def fw_avr_flash(hex_path: str, mcu: str, programmer: str = "arduino", port: str = "",
+                     baud: int = 115200) -> str:
+        """Flash an AVR target via avrdude and return FlashResult.
+
+        ``avrdude -c <programmer> -p <mcu> [-P <port>] [-b <baud>] -U flash:w:<hex_path>:i``.
+        Default ``programmer="arduino"`` matches the arduino-cli build backend (the AVR
+        family's toolchain); pass e.g. ``"usbasp"``/``"stk500v1"``/``"avrispmkii"`` for other
+        programmers. ``port`` empty omits ``-P`` (programmer-default, e.g. USB HID
+        programmers like usbasp); pass 0 for ``baud`` to omit ``-b``.
+
+        FlashResult fields: ``{success, output, returncode, cmd, ms}``. ``success=False``
+        with a descriptive ``output`` when avrdude is absent — never an error envelope.
+        Install hint: ``sudo dnf install avrdude`` / ``sudo apt install avrdude``.
+
+        [~] Live flash requires a connected AVR programmer.
+        """
+        p: dict = {"hex_path": hex_path, "mcu": mcu}
+        if programmer and programmer != "arduino":
+            p["programmer"] = programmer
+        if port:
+            p["port"] = port
+        if baud != 115200:
+            p["baud"] = baud
+        return _dumps(cb.call("fw_avr_flash", p))
+
+    @mcp.tool()
+    def fw_debug_gdb_reset(openocd_cfg: str, halt: bool = True) -> str:
+        """Reset an ARM target via a fresh OpenOCD + gdb/MI session; returns FlashResult.
+
+        Launches OpenOCD as a background GDB server (``openocd -f <openocd_cfg>``, default
+        port 3333), attaches ``arm-none-eabi-gdb --batch --interpreter=mi2``, issues
+        ``monitor reset halt`` (or ``monitor reset run`` when ``halt=False``), then detaches
+        and stops OpenOCD. ``openocd_cfg`` is the ``-f`` argument — usually a board config
+        that pulls in both interface and target (e.g. ``"board/stm32f4discovery.cfg"``).
+
+        This is the GDB-remote fallback debug path (embedded-landscape.md): use it for chips
+        probe-rs's target registry doesn't cover. FlashResult ``output`` carries the raw
+        gdb/MI transcript. Each call is a fresh attach/detach cycle — safe for reset/halt
+        because Cortex-M halt state is a hardware flag that survives disconnecting, but a
+        breakpoint set in one call is not guaranteed to still be programmed in a later call.
+
+        [~] Requires a connected SWD/JTAG probe supported by OpenOCD.
+        """
+        p: dict = {"openocd_cfg": openocd_cfg}
+        if not halt:
+            p["halt"] = False
+        return _dumps(cb.call("fw_debug_gdb_reset", p))
+
+    @mcp.tool()
+    def fw_debug_gdb_halt(openocd_cfg: str) -> str:
+        """Interrupt/halt an ARM target via OpenOCD + gdb/MI (``-exec-interrupt`` +
+        ``monitor halt``); returns FlashResult. See fw_debug_gdb_reset for the session shape.
+
+        [~] Requires a connected SWD/JTAG probe supported by OpenOCD.
+        """
+        return _dumps(cb.call("fw_debug_gdb_halt", {"openocd_cfg": openocd_cfg}))
+
+    @mcp.tool()
+    def fw_debug_gdb_step(openocd_cfg: str, step_over: bool = False) -> str:
+        """Single-instruction step a halted ARM target via OpenOCD + gdb/MI
+        (``-exec-step-instruction``, or ``-exec-next-instruction`` when ``step_over=True``
+        to step over a call). Returns FlashResult with the raw ``*stopped`` MI record in
+        ``output``. Call fw_debug_gdb_halt (or a breakpoint hit) first.
+
+        [~] Requires a connected SWD/JTAG probe supported by OpenOCD.
+        """
+        p: dict = {"openocd_cfg": openocd_cfg}
+        if step_over:
+            p["step_over"] = True
+        return _dumps(cb.call("fw_debug_gdb_step", p))
+
+    @mcp.tool()
+    def fw_debug_gdb_set_breakpoint(openocd_cfg: str, address: str) -> str:
+        """Set a breakpoint at ``address`` via OpenOCD + gdb/MI (``-break-insert *<address>``);
+        returns FlashResult. ``address`` accepts any gdb-recognized location (a raw
+        hex/decimal address, e.g. ``"0x8000100"`` — no symbol table is loaded, so symbolic
+        locations won't resolve).
+
+        [~] Requires a connected SWD/JTAG probe supported by OpenOCD.
+        """
+        return _dumps(cb.call("fw_debug_gdb_set_breakpoint",
+                              {"openocd_cfg": openocd_cfg, "address": address}))
+
+    @mcp.tool()
+    def fw_debug_gdb_read_mem(openocd_cfg: str, address: str, length: int) -> str:
+        """Read *length* bytes from *address* via OpenOCD + gdb/MI
+        (``-data-read-memory-bytes <address> <length>``); returns FlashResult whose
+        ``output`` carries the raw MI memory-read record (a ``begin,end,contents`` tuple with
+        the bytes as an MI-escaped hex string) — unlike fw_debug_read_mem (probe-rs), this is
+        NOT decoded into a ``data_hex`` field.
+
+        [~] Requires a connected SWD/JTAG probe supported by OpenOCD and a halted target.
+        """
+        return _dumps(cb.call("fw_debug_gdb_read_mem",
+                              {"openocd_cfg": openocd_cfg, "address": address, "length": length}))
+
+    @mcp.tool()
+    def fw_emulate_simavr(elf_path: str, mcu: str, run_s: float = 2.0, gdb: bool = False,
+                          gdb_port: int = 1234,
+                          mi_commands: Optional[list[str]] = None) -> str:
+        """Run an AVR ELF under simavr (``simavr -m <mcu> <elf_path>``) and return FlashResult.
+
+        Free-run mode (``gdb=False``, default): emulates for ``run_s`` seconds and captures
+        stdout/stderr (simavr's UART trace etc.). simavr never self-exits, so the scheduled
+        stop after ``run_s`` is reported as ``success=True`` (not a timeout failure).
+
+        GDB-attach mode (``gdb=True``): launches simavr with ``-g`` (built-in GDB server on
+        ``gdb_port``, default 1234) and drives ``avr-gdb --batch --interpreter=mi2`` with
+        ``mi_commands`` (e.g. ``["-break-insert main", "-exec-continue"]``); ``output``
+        carries the raw MI transcript.
+
+        Practical fallback for AVR *debug* per embedded-landscape.md: modern UPDI-part debug
+        protocols (EDBG/mEDBG/PKOB nano) aren't GDB-exposed by an open tool, so simavr's own
+        GDB server is the universal AVR debug path (real-hardware debugWIRE via avarice is
+        legacy/rare, out of scope here).
+
+        [~] Software-only — no hardware required, but needs `simavr` (and `avr-gdb` for
+        gdb=True) on PATH.
+        """
+        p: dict = {"elf_path": elf_path, "mcu": mcu}
+        if run_s != 2.0:
+            p["run_s"] = run_s
+        if gdb:
+            p["gdb"] = True
+            if gdb_port != 1234:
+                p["gdb_port"] = gdb_port
+            if mi_commands:
+                p["mi_commands"] = mi_commands
+        return _dumps(cb.call("fw_emulate_simavr", p))
+
+    @mcp.tool()
+    def fw_emulate_renode(resc_path: str, run_s: float = 2.0, gdb: bool = False,
+                          gdb_port: int = 3333,
+                          mi_commands: Optional[list[str]] = None) -> str:
+        """Run an ARM machine under Renode (``renode --disable-xwt --console <resc_path>``,
+        same invocation shape as fw_sim_run's Renode backend) and return FlashResult.
+
+        ``resc_path`` is a pre-generated Renode script (schema/generation matches
+        fw_sim_run's emulator.cpp path — this tool runs an EXISTING .resc rather than
+        building one, so pass the same script fw_sim_run would use, or a hand-authored one
+        for scenarios fw_sim_run doesn't cover).
+
+        Free-run mode (``gdb=False``): emulates for ``run_s`` seconds; the scheduled stop is
+        reported as ``success=True`` (Renode doesn't self-exit either).
+
+        GDB-attach mode (``gdb=True``): expects the .resc to start Renode's built-in GDB
+        server on ``gdb_port`` (``machine StartGdbServer <port>``, Renode default 3333) and
+        drives ``arm-none-eabi-gdb --batch --interpreter=mi2`` with ``mi_commands``.
+
+        [~] Software-only — no hardware required, but needs `renode` (.NET runtime) on PATH.
+        """
+        p: dict = {"resc_path": resc_path}
+        if run_s != 2.0:
+            p["run_s"] = run_s
+        if gdb:
+            p["gdb"] = True
+            if gdb_port != 3333:
+                p["gdb_port"] = gdb_port
+            if mi_commands:
+                p["mi_commands"] = mi_commands
+        return _dumps(cb.call("fw_emulate_renode", p))
+
+    @mcp.tool()
+    def fw_serial_open(port: str, baud: int = 115200) -> str:
+        """Open a live serial/UART port (raw termios 8N1) for the physical-device monitor.
+
+        Returns ``{success, handle, port, baud}`` on success, or ``{success:false, reason}``
+        (e.g. the port doesn't exist or is already claimed by another process) — never an
+        error envelope. The handle is process-local (valid for the hosting process's
+        lifetime); pass it to fw_serial_read/fw_serial_write/fw_serial_close.
+
+        This is the LIVE physical-device counterpart to fw_sim_run's emulator UART capture —
+        there is no serial framing/protocol assumed, just a raw byte pipe.
+
+        [~] Requires a connected device presenting a serial port (e.g. `/dev/ttyUSB0`,
+        `/dev/ttyACM0`).
+        """
+        p: dict = {"port": port}
+        if baud != 115200:
+            p["baud"] = baud
+        return _dumps(cb.call("fw_serial_open", p))
+
+    @mcp.tool()
+    def fw_serial_read(handle: int, max_bytes: int = 4096) -> str:
+        """Non-blocking read of up to ``max_bytes`` currently buffered on an open serial
+        handle (immediate return, no wait — poll this repeatedly for a live console).
+
+        Returns ``{success, data_hex, bytes}`` — raw bytes as lowercase hex (never assumes
+        text encoding; decode client-side). ``data_hex=""`` / ``bytes=0`` means nothing was
+        buffered, not an error. ``{success:false, reason}`` for an unknown/closed handle.
+        """
+        p: dict = {"handle": handle}
+        if max_bytes != 4096:
+            p["max_bytes"] = max_bytes
+        return _dumps(cb.call("fw_serial_read", p))
+
+    @mcp.tool()
+    def fw_serial_write(handle: int, data_hex: str = "", text: str = "") -> str:
+        """Write to an open serial handle. Pass ``data_hex`` (hex-encoded raw bytes) for
+        binary payloads, or ``text`` for a plain string (e.g. typing a command into a serial
+        console); ``data_hex`` wins if both are given. Returns ``{success, bytes_written}``
+        or ``{success:false, reason}``.
+        """
+        p: dict = {"handle": handle}
+        if data_hex:
+            p["data_hex"] = data_hex
+        elif text:
+            p["text"] = text
+        return _dumps(cb.call("fw_serial_write", p))
+
+    @mcp.tool()
+    def fw_serial_close(handle: int) -> str:
+        """Close and release a serial handle opened by fw_serial_open. Returns
+        ``{success}`` — ``success=false`` if the handle was already closed/unknown (not an
+        error).
+        """
+        return _dumps(cb.call("fw_serial_close", {"handle": handle}))

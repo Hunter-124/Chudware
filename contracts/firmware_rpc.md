@@ -339,3 +339,154 @@ Surfaces:
   window_ms?}` → the profile dict (or the §1 error envelope for a missing/unreadable
   trace or unknown project). Explicit `board_doc_ref` beats the project link; with no
   board the activity half still returns (`rails: []`, coverage note).
+
+## 12. Embedded debugger/programmer/serial backends — avrdude, OpenOCD+GDB/MI, simavr, Renode, live serial monitor (S-FW-CORE, appended)
+
+Closes the three gaps `docs/omp-integration/research/verify-firmware-seam.md` and
+`embedded-landscape.md` identified: no AVR flash backend, no real GDB protocol/stub attach
+point, no live physical-device serial/UART monitor (as opposed to the §7 emulator UART
+capture). Same toolchain posture as §1: every backend below is invoked as an **unmodified
+subprocess only** (avrdude GPL-2.0+, OpenOCD GPL-2.0, gdb/`arm-none-eabi-gdb`/`avr-gdb`
+GPL-3.0, simavr dual GPL/LGPL, Renode MIT) — never linked into `libaicad`. Attach point:
+`core/firmware/hardware.{h,cpp}` (mirrors the existing `probe_rs_*`/`esptool_flash`
+wrappers around `subprocess.cpp`'s `run_capture()`); dispatched via
+`core/firmware/firmware_rpc.cpp`'s `call()`; MCP tools registered inside the SAME
+`register_firmware_tools(mcp)` used for both the live agent surface (`server.py`, family
+`"ecad"`) and the DAG-verify battery surface (`verify.py`'s private `battery-firmware`
+FastMCP instance) — dual registration is automatic, no extra wiring, per
+`docs/omp-integration/research/verify-tool-gate.md` §4.
+
+### 12.1 GDB/MI as the uniform non-DAP adapter shape
+
+None of OpenOCD, simavr, or Renode speak Microsoft DAP (only probe-rs does, already wired
+via §5/§8) — they expose the older GDB remote-serial protocol. Per
+`embedded-landscape.md`'s "DAP/GDB Integration Notes," every one of them is driven the SAME
+way: launch the tool as a background GDB server, then run `<gdb> --batch --interpreter=mi2`
+against it with a list of MI commands, capture the text output, tear the server down. This
+is `hardware.cpp`'s `gdb_mi_session()` primitive, shared by `openocd_gdb_mi`, `simavr_run`
+(gdb-attach mode), and `renode_run` (gdb-attach mode) — one adapter shape instead of a
+bespoke shim per tool. **POSIX-only** in this pass (fork/exec background-process
+management + SIGTERM/SIGKILL teardown); a non-POSIX build returns
+`FlashResult{success:false, output:"unsupported_platform: ..."}`, never a crash.
+
+Each debug RPC call is a **fresh** server+gdb attach/detach cycle (stateless, mirroring
+`probe_rs_reset`/`probe_rs_halt`'s existing statelessness) — safe for reset/halt/read-mem on
+real Cortex-M hardware because halt state (DHCSR `C_HALT`) is a hardware flag that survives
+the host tool disconnecting, but a breakpoint programmed in one call is **not** guaranteed
+still active by the time a later call's step/continue runs (no session persists the
+OpenOCD/gdb process across calls yet — a future iteration would add a session-id registry
+keeping the server resident).
+
+### 12.2 `FlashResult` reuse
+
+Every new backend below returns the SAME `FlashResult` shape §5 already defines for
+`fw_flash`/`fw_debug_start`/`fw_debug_halt`: `{success, output, returncode, cmd, ms}`.
+`output` is the raw captured tool text (gdb/MI transcripts included verbatim — register/
+memory values from `fw_debug_gdb_read_mem` arrive as MI tuples, NOT decoded to a `data_hex`
+field the way `fw_debug_read_mem`/probe-rs's memory read is).
+
+### 12.3 AVR flash — `fw_avr_flash`
+
+`avrdude -c <programmer> -p <mcu> [-P <port>] [-b <baud>] -U flash:w:<hex_path>:i`.
+
+| params | result |
+|---|---|
+| `{hex_path, mcu, programmer?="arduino", port?, baud?=115200, timeout_s?=60}` | `FlashResult` |
+
+Default `programmer="arduino"` matches the AVR family's arduino-cli build backend
+(`provision.cpp`); `port` empty omits `-P` (programmer-default, e.g. USB HID programmers
+like usbasp); `baud<=0` omits `-b`. Populates the previously-empty AVR `can_flash`
+capability (`provision.cpp` `kFamilyRules["avr"]`, was `{[], []}` — now `{["avrdude"], []}`).
+
+### 12.4 ARM debug via OpenOCD + GDB/MI — `fw_debug_gdb_*`
+
+`openocd_cfg` is the OpenOCD `-f` argument (usually a board config pulling in both
+interface and target, e.g. `"board/stm32f4discovery.cfg"`); the GDB server defaults to
+OpenOCD's standard port 3333.
+
+| method | params | result |
+|---|---|---|
+| `fw_debug_gdb_reset` | `{openocd_cfg, halt?=true, timeout_s?=30}` | `FlashResult` (`monitor reset halt\|run`) |
+| `fw_debug_gdb_halt` | `{openocd_cfg, timeout_s?=30}` | `FlashResult` (`-exec-interrupt` + `monitor halt`) |
+| `fw_debug_gdb_step` | `{openocd_cfg, step_over?=false, timeout_s?=30}` | `FlashResult` (`-exec-step-instruction`\|`-exec-next-instruction`) |
+| `fw_debug_gdb_set_breakpoint` | `{openocd_cfg, address, timeout_s?=30}` | `FlashResult` (`-break-insert *<address>`) |
+| `fw_debug_gdb_read_mem` | `{openocd_cfg, address, length, timeout_s?=30}` | `FlashResult` (`-data-read-memory-bytes <address> <length>`) |
+
+Populates the new `can_debug_gdb` capability on the `cortex-m` family
+(`kFamilyRules["cortex-m"]`, `all_of: ["openocd", "arm-none-eabi-gdb"]`) — the first tracked
+debug capability for any family (`can_flash` previously covered probe-rs flashing only, with
+no equivalent `can_debug*` key at all).
+
+### 12.5 AVR emulation + debug via simavr — `fw_emulate_simavr`
+
+`{elf_path, mcu, run_s?=2.0, gdb?=false, gdb_port?=1234, mi_commands?:string[],
+timeout_s?=run_s+10, gdb_binary?="avr-gdb"}` → `FlashResult`.
+
+Free-run mode (`gdb=false`): `simavr -m <mcu> <elf_path>` for `run_s` wall-clock seconds.
+simavr never self-exits, so the scheduled stop is `success=true` (output notes `"[stopped
+after <run_s>s run window]"`) — only an absent binary or an early non-zero exit is a
+failure. GDB-attach mode (`gdb=true`): `simavr -m <mcu> -g <elf_path>` (built-in GDB server,
+simavr default port 1234) driven via `avr-gdb --batch --interpreter=mi2` with `mi_commands`.
+Practical universal AVR *debug* path per `embedded-landscape.md`: modern UPDI-part debug
+protocols (EDBG/mEDBG/PKOB nano) aren't GDB-exposed by an open tool, so simavr's own GDB
+server substitutes; real-hardware debugWIRE via avarice stays out of scope (legacy/rare).
+Populates `can_debug_gdb` (`all_of: ["simavr", "avr-gdb"]`) and `can_emulate`
+(`any_of` now includes `"simavr"`) on the `avr` family.
+
+### 12.6 ARM emulation via Renode — `fw_emulate_renode`
+
+`{resc_path, run_s?=2.0, gdb?=false, gdb_port?=3333, mi_commands?:string[],
+timeout_s?=run_s+10, gdb_binary?="arm-none-eabi-gdb"}` → `FlashResult`.
+
+`renode --disable-xwt --console <resc_path>` (identical invocation shape to `fw_sim_run`'s
+existing Renode backend, `emulator.cpp`). `resc_path` is a pre-generated Renode script —
+this tool runs an EXISTING `.resc` rather than authoring one; pass the same script
+`fw_sim_run` would use, or a hand-authored one for scenarios `fw_sim_run` doesn't cover.
+Free-run/GDB-attach semantics mirror §12.5 (scheduled stop = success; `gdb=true` expects the
+`.resc` to start Renode's GDB server via `machine StartGdbServer <gdb_port>`).
+
+### 12.7 Live serial/UART monitor (physical device) — `fw_serial_*`
+
+The LIVE physical-device counterpart to §7's emulator UART capture — a raw byte pipe, no
+framing/protocol assumed. Implemented with raw POSIX termios (8N1, non-canonical,
+non-blocking reads) directly in `hardware.cpp` — no pyserial/serialport-rs dependency added
+to the C++ core (the "minimal robust path" the landscape dossier flags for the serial
+transport layer). Handles are a process-local registry (mutex-guarded
+`unordered_map<int, fd>` in `hardware.cpp`), valid for the hosting process's lifetime.
+
+| method | params | result |
+|---|---|---|
+| `fw_serial_open` | `{port, baud?=115200}` | `{success, handle, port, baud}` \| `{success:false, reason}` |
+| `fw_serial_read` | `{handle, max_bytes?=4096}` | `{success, data_hex, bytes}` \| `{success:false, reason}` |
+| `fw_serial_write` | `{handle, data_hex?, text?}` | `{success, bytes_written}` \| `{success:false, reason}` |
+| `fw_serial_close` | `{handle}` | `{success}` |
+
+`fw_serial_read` is non-blocking (immediate return, poll it repeatedly for a live console);
+bytes are always hex-encoded (`data_hex`), never assumed text, matching the `data_hex`
+convention `fw_debug_read_mem` already established. `fw_serial_write` accepts either
+`data_hex` (raw bytes) or `text` (a plain string convenience); `data_hex` wins if both are
+given. Non-POSIX builds: `fw_serial_open` always returns `{success:false, reason:
+"unsupported_platform: ..."}`.
+
+### 12.8 Tool registry tagging
+
+All twelve tools above register through the same `register_firmware_tools(mcp)` closures as
+the rest of the firmware surface, so `_reg.view(mcp, "ecad")` (`server.py`) tags them family
+`"ecad"` and auto-classifies risk via `tool_registry.classify_risk()`: none of the new names
+match a `_READ_*`/`_EXTERNAL_*` pattern, so every one — including the two read-shaped ops,
+`fw_debug_gdb_read_mem` and `fw_serial_read` — defaults to `RISK_WRITE` (fail-safe;
+`fw_debug_read_mem`/probe-rs's existing memory read is tagged the same way for the same
+reason: a live probe/port attach is treated as mutating, not a free read). Flash/erase ops
+(`fw_avr_flash`) and every debug/emulate/serial op are therefore all `write` risk, gated by
+the standard `_guard` allow-list exactly like the rest of the firmware family — no
+`tool_registry.py` edit required (module docstring: individual `*_tools.py` modules are
+never edited to add tags).
+
+### 12.9 External binaries assumed on PATH
+
+`avrdude`, `openocd`, `arm-none-eabi-gdb` (or `gdb-multiarch` as a cross-capable fallback),
+`avr-gdb`, `simavr`. All graceful-missing per §1: `fw_status`'s `tools`/`families` rollup
+(`provision.cpp`) now also probes these five and reports `can_flash`/`can_debug_gdb`/
+`can_emulate` per family, plus a new AVR-flashing banner alongside the existing
+cortex-m/esp32 banners. `avrdude` was additionally added to the "core" tool list that drives
+`fw_status`'s top-level `missing` array (was 7 tools, now 8).

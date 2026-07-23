@@ -108,17 +108,118 @@ void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
     const float bw = ImGui::GetContentRegionAvail().x;
     GlassBubble gb = beginGlassBubble(bw, ui::GlassLevel::Regular, 8.0f);
     // Tighter in-bubble padding than the theme default — slimmer message box.
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f * sc, 7.0f * sc));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f * sc, 5.0f * sc));
     ImGui::BeginChild("##umsg", ImVec2(bw, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
-    // Body, then the author meta row INSIDE the bubble bottom ("You" left, age
-    // right; hover the age for the absolute time).
+    // Body, then ONE meta bar INSIDE the bubble bottom: "You" (left) + AI-VC
+    // rewind/edit buttons + age (right; hover for the absolute time).
     // Same selectable read-only InputText treatment as assistant prose (soft-wrap +
     // click-drag + Ctrl+C toast + right-click Copy).
     const std::string userBody = stripMdMarks(m.text);
     const ImGuiID textId = chatDrawSelectableText("##umsg_sel", userBody, chatSurf().textPrimary);
-    ImGui::Dummy(ImVec2(0, 2.0f * sc));
-    drawMsgMetaRow(fonts, "You", accentCol, m.ts);
+    ImGui::Dummy(ImVec2(0, 1.5f * sc));
+
+    // ---- meta bar: You [rewind edit] ......... age ----
+    const double now = ImGui::GetTime();
+    if (s_aiVc.confirmMsgIdx >= 0 && now > s_aiVc.confirmUntil) {
+        s_aiVc.confirmMsgIdx = -1;
+        s_aiVc.confirmKind = 0;
+    }
+    const bool pending = (s_aiVc.confirmMsgIdx == msgIdx && s_aiVc.confirmKind == 3);
+    const bool showBtns = s_aiVc.available && msgIdx >= 0 && !s_aiVc.busy;
+    const float btnSz = ImGui::GetFrameHeight() * 0.78f;
+    const float gap = 4.0f * sc;
+    const float lineH = ImGui::GetTextLineHeight();
+    const float rowH = showBtns ? std::max(lineH, btnSz) : lineH;
+    const float textOff = (rowH - lineH) * 0.5f;
+    const float rowY = ImGui::GetCursorPosY();
+    const ui::AdaptiveSurface& surf = chatSurf();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+
+    ImGui::SetCursorPosY(rowY + textOff);
+    ImGui::PushFont(fonts.medium);
+    ImGui::TextColored(accentCol, "You");
+    ImGui::PopFont();
+
+    if (showBtns) {
+        float bx = (ImGui::GetItemRectMax().x - ImGui::GetWindowPos().x) + 8.0f * sc;
+        // Rewind glyph button
+        ImGui::SetCursorPos(ImVec2(bx, rowY));
+        {
+            if (pending) {
+                ImGui::PushStyleColor(ImGuiCol_Button,
+                    ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 0.55f));
+            }
+            const bool clicked = ImGui::InvisibleButton("##umsg_rw", ImVec2(btnSz, btnSz));
+            const ImVec2 bmn = ImGui::GetItemRectMin(), bmx = ImGui::GetItemRectMax();
+            if (pending || ImGui::IsItemHovered())
+                dl->AddRectFilled(bmn, bmx,
+                    ImGui::ColorConvertFloat4ToU32(ImVec4(surf.textPrimary.x, surf.textPrimary.y,
+                                                          surf.textPrimary.z, pending ? 0.18f : 0.10f)),
+                    ui::metrics::rounding(4.0f));
+            drawDoubleRewindGlyph(dl, bmn, bmx,
+                ImGui::ColorConvertFloat4ToU32(pending ? surf.textPrimary : surf.textSecondary));
+            if (pending) ImGui::PopStyleColor();
+            if (clicked) {
+                if (!pending) {
+                    s_aiVc.confirmMsgIdx = msgIdx;
+                    s_aiVc.confirmKind = 3;
+                    s_aiVc.confirmUntil = now + 4.0;
+                } else {
+                    aiVcRollback(st, "msg:" + std::to_string(msgIdx),
+                                 "Rewound to before this message");
+                }
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(pending ? "Click again to confirm rewind."
+                                          : "Rewind — restore the part to before this message.");
+        }
+
+        // Pencil edit — atlas icon (msg_edit) with filled-glyph fallback.
+        ImGui::SameLine(0, gap);
+        {
+            const bool clicked = ImGui::InvisibleButton("##umsg_edit", ImVec2(btnSz, btnSz));
+            const ImVec2 bmn = ImGui::GetItemRectMin(), bmx = ImGui::GetItemRectMax();
+            if (ImGui::IsItemHovered())
+                dl->AddRectFilled(bmn, bmx,
+                    ImGui::ColorConvertFloat4ToU32(ImVec4(surf.textPrimary.x, surf.textPrimary.y,
+                                                          surf.textPrimary.z, 0.10f)),
+                    ui::metrics::rounding(4.0f));
+            const ImU32 ink = ImGui::ColorConvertFloat4ToU32(surf.textSecondary);
+            IconUV editIcon = ui::getIcon("msg_edit", 20);
+            if (editIcon.valid) {
+                const float pad = btnSz * 0.18f;
+                dl->AddImage(editIcon.texId,
+                             ImVec2(bmn.x + pad, bmn.y + pad),
+                             ImVec2(bmx.x - pad, bmx.y - pad),
+                             editIcon.uv0, editIcon.uv1,
+                             ink);
+            } else {
+                drawPencilGlyph(dl, bmn, bmx, ink);
+            }
+            if (clicked) beginEditStage(st, msgIdx);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Edit this message — Esc cancels without changing the part.");
+        }
+    }
+
+    // Age at the bar's right edge (hover = absolute time).
+    const std::string age = chatAgeLabel(m.ts);
+    if (!age.empty()) {
+        const float ageW = ImGui::CalcTextSize(age.c_str()).x;
+        const float rx = ImGui::GetWindowContentRegionMax().x - ageW;
+        ImGui::SetCursorPos(ImVec2(std::max(ImGui::GetCursorPosX(), rx), rowY + textOff));
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+        ImGui::TextUnformatted(age.c_str());
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered()) {
+            const std::string tip = chatTimeTooltip(m.ts);
+            if (!tip.empty()) ImGui::SetTooltip("%s", tip.c_str());
+        }
+    }
+    // Guarantee the cursor advances past the bar even when the age was left of the buttons.
+    ImGui::SetCursorPosY(rowY + rowH);
+    ImGui::Dummy(ImVec2(1.0f, 0.0f));
     ImGui::EndChild();
     ImGui::PopStyleVar();  // ##umsg WindowPadding
     ImRect bubble = endGlassBubble(gb);
@@ -135,109 +236,6 @@ void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
     const std::string sel = chatInputSelection(textId);
     chatCopyContext(bubble, "##umsg_copy", userBody, userBody, sel);
     chatHoverCopyGlyph(bubble, userBody);
-
-
-    // Footer row: rewind / pencil edit buttons only (the "You" label moved inside
-    // the bubble). Skipped entirely when AI-VC is unavailable — no dead strip.
-    {
-        const double now = ImGui::GetTime();
-        if (s_aiVc.confirmMsgIdx >= 0 && now > s_aiVc.confirmUntil) {
-            s_aiVc.confirmMsgIdx = -1;
-            s_aiVc.confirmKind = 0;
-        }
-        const bool pending = (s_aiVc.confirmMsgIdx == msgIdx && s_aiVc.confirmKind == 3);
-        const bool showBtns = s_aiVc.available && msgIdx >= 0 && !s_aiVc.busy;
-
-        const float btnSz = ImGui::GetFrameHeight() * 0.78f;
-        const float gap = 4.0f * sc;
-        const float totalBtnW = showBtns ? (btnSz + gap + btnSz) : 0.0f;
-
-        if (showBtns) {
-        // Nearly touch the bubble bottom (~2-3px * uiScale) — no default ItemSpacing gap.
-        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
-                            ImVec2(ImGui::GetStyle().ItemSpacing.x, 0.0f));
-        // Pin the footer flush under the bubble in screen space so scroll/layout can't open a gap.
-        ImGui::SetCursorScreenPos(ImVec2(bubble.Min.x, bubble.Max.y + 2.5f * sc));
-
-        const float winX = ImGui::GetWindowPos().x - ImGui::GetCurrentWindow()->Scroll.x;
-        // Capture the start of the row so we can place buttons on the same line, right-aligned.
-        const float rowStartY = ImGui::GetCursorPosY();
-        const float rowStartX = ImGui::GetCursorPosX();
-        // Reserve the row's height (the buttons are absolutely positioned below).
-        ImGui::Dummy(ImVec2(1.0f, ImGui::GetTextLineHeight()));
-
-        {
-            // Right-align buttons under the bubble's right edge.
-            const float rowX = bubble.Max.x - totalBtnW - winX;
-            ImGui::SetCursorPos(ImVec2(std::max(rowStartX, rowX),
-                                      rowStartY + (ImGui::GetTextLineHeight() - btnSz) * 0.5f));
-
-            ImDrawList* dl = ImGui::GetWindowDrawList();
-            const ui::AdaptiveSurface& surf = chatSurf();
-
-            // Rewind glyph button
-            {
-                if (pending) {
-                    ImGui::PushStyleColor(ImGuiCol_Button,
-                        ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 0.55f));
-                }
-                const bool clicked = ImGui::InvisibleButton("##umsg_rw", ImVec2(btnSz, btnSz));
-                const ImVec2 bmn = ImGui::GetItemRectMin(), bmx = ImGui::GetItemRectMax();
-                if (pending || ImGui::IsItemHovered())
-                    dl->AddRectFilled(bmn, bmx,
-                        ImGui::ColorConvertFloat4ToU32(ImVec4(surf.textPrimary.x, surf.textPrimary.y,
-                                                              surf.textPrimary.z, pending ? 0.18f : 0.10f)),
-                        ui::metrics::rounding(4.0f));
-                drawDoubleRewindGlyph(dl, bmn, bmx,
-                    ImGui::ColorConvertFloat4ToU32(pending ? surf.textPrimary : surf.textSecondary));
-                if (pending) ImGui::PopStyleColor();
-                if (clicked) {
-                    if (!pending) {
-                        s_aiVc.confirmMsgIdx = msgIdx;
-                        s_aiVc.confirmKind = 3;
-                        s_aiVc.confirmUntil = now + 4.0;
-                    } else {
-                        aiVcRollback(st, "msg:" + std::to_string(msgIdx),
-                                     "Rewound to before this message");
-                    }
-                }
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip(pending ? "Click again to confirm rewind."
-                                              : "Rewind — restore the part to before this message.");
-            }
-
-            // Pencil edit — atlas icon (msg_edit) with filled-glyph fallback.
-            ImGui::SameLine(0, gap);
-            {
-                const bool clicked = ImGui::InvisibleButton("##umsg_edit", ImVec2(btnSz, btnSz));
-                const ImVec2 bmn = ImGui::GetItemRectMin(), bmx = ImGui::GetItemRectMax();
-                if (ImGui::IsItemHovered())
-                    dl->AddRectFilled(bmn, bmx,
-                        ImGui::ColorConvertFloat4ToU32(ImVec4(surf.textPrimary.x, surf.textPrimary.y,
-                                                              surf.textPrimary.z, 0.10f)),
-                        ui::metrics::rounding(4.0f));
-                const ImU32 ink = ImGui::ColorConvertFloat4ToU32(surf.textSecondary);
-                // Prefer dedicated msg_edit atlas tile (integrator regenerates make_icons);
-                // until then, use the filled pencil glyph (never a bare slash).
-                IconUV editIcon = ui::getIcon("msg_edit", 20);
-                if (editIcon.valid) {
-                    const float pad = btnSz * 0.18f;
-                    dl->AddImage(editIcon.texId,
-                                 ImVec2(bmn.x + pad, bmn.y + pad),
-                                 ImVec2(bmx.x - pad, bmx.y - pad),
-                                 editIcon.uv0, editIcon.uv1,
-                                 ink);
-                } else {
-                    drawPencilGlyph(dl, bmn, bmx, ink);
-                }
-                if (clicked) beginEditStage(st, msgIdx);
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("Edit this message — Esc cancels without changing the part.");
-            }
-        }
-        ImGui::PopStyleVar();  // ItemSpacing.y = 0 for the tight footer
-        }  // showBtns
-    }
 
     ImGui::Dummy(ImVec2(0, 4 * ui::uiScale));
 }
@@ -361,27 +359,29 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
     const ui::AdaptiveSurface& turnSurf = chatSurf();
     const float sc = ui::uiScale;
 
-    // Author label. When the turn renders a prose card (plain Q&A reply), the
-    // label moves INSIDE that card (top row: model left, age right) — see (3).
-    // Otherwise (activity-only / error / VC-restore turns) it stays as a tight row
-    // above the turn content with the age appended inline.
+    // Author label. Each card that CAN host it (prose / partial / error) draws the
+    // model+age INSIDE itself as the top row (first card wins via metaDrawn).
+    // Activity-only turns and VC-restore turns keep the tight label row above the
+    // turn content with the age appended inline.
     // Prefer the model stamped on the turn at run start; only fall back to the
     // live picker for an in-flight turn that somehow has no stamp. No model →
     // omit label (never bare "Assistant").
     const bool proseCard = !m.text.empty() && m.errKind == ERR_NONE;
     const bool vcRestore = msgIdx >= 0 && turnNum > 0 && chatMsgMutatedDoc(m);
-    const bool metaInProse = proseCard && !vcRestore;
+    const bool metaInCard = !vcRestore &&
+        (proseCard || m.errKind != ERR_NONE || m.resultPartial);
+    bool metaDrawn = false;
+    const char* mid = nullptr;
+    if (!m.model.empty()) mid = m.model.c_str();
+    else if (m.running && st.settings.model[0]) mid = st.settings.model;
+    const bool haveModel = mid && mid[0];
+    const std::string modelLabel = haveModel ? shortModelName(mid) : std::string();
     {
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
                             ImVec2(ImGui::GetStyle().ItemSpacing.x, 0.0f));
-        const char* mid = nullptr;
-        if (!m.model.empty()) mid = m.model.c_str();
-        else if (m.running && st.settings.model[0]) mid = st.settings.model;
-        const bool haveModel = mid && mid[0];
-        if (haveModel && !metaInProse) {
-            const std::string label = shortModelName(mid);
+        if (haveModel && !metaInCard) {
             ImGui::PushFont(fonts.medium);
-            ImGui::TextColored(turnSurf.textSecondary, "%s", label.c_str());
+            ImGui::TextColored(turnSurf.textSecondary, "%s", modelLabel.c_str());
             ImGui::PopFont();
             // Inline age next to the above-card label (in-card rows right-align it).
             const std::string age = chatAgeLabel(m.ts);
@@ -398,10 +398,10 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
         }
         // Subtle restore affordance on mutating turns (hover / inline confirm — no modal).
         if (vcRestore) {
-            if (haveModel && !metaInProse) ImGui::SameLine(0, 8 * sc);
+            if (haveModel && !metaInCard) ImGui::SameLine(0, 8 * sc);
             drawAiVcTurnRestore(st, msgIdx, turnNum);
         }
-        if ((haveModel && !metaInProse) || vcRestore)
+        if ((haveModel && !metaInCard) || vcRestore)
             ImGui::Dummy(ImVec2(0, 2.5f * sc));
         ImGui::PopStyleVar();
     }
@@ -449,13 +449,10 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
                           ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
         // Author meta row INSIDE the card top (model left, age right) when it
         // wasn't drawn above the turn (VC-restore turns keep the top row).
-        if (metaInProse) {
-            const char* mid = nullptr;
-            if (!m.model.empty()) mid = m.model.c_str();
-            else if (m.running && st.settings.model[0]) mid = st.settings.model;
-            const std::string label = (mid && mid[0]) ? shortModelName(mid) : std::string();
-            drawMsgMetaRow(fonts, label.empty() ? nullptr : label.c_str(),
+        if (metaInCard && !metaDrawn) {
+            drawMsgMetaRow(fonts, modelLabel.empty() ? nullptr : modelLabel.c_str(),
                            turnSurf.textSecondary, m.ts);
+            metaDrawn = true;
             ImGui::Dummy(ImVec2(0, 2.0f * sc));
         }
         const ImGuiID textId = chatDrawSelectableText("##prose_sel", prose, chatSurf().textPrimary);
@@ -528,6 +525,12 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
         ImGui::BeginChild("##partialcard", ImVec2(0, 0),
                           ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
         const ImVec4 warnCol = semanticOnGlass(pal.statusWarn, chatSurf());
+        if (metaInCard && !metaDrawn) {
+            drawMsgMetaRow(fonts, modelLabel.empty() ? nullptr : modelLabel.c_str(),
+                           turnSurf.textSecondary, m.ts);
+            metaDrawn = true;
+            ImGui::Dummy(ImVec2(0, 2.0f * sc));
+        }
         ImGui::PushFont(fonts.medium);
         ImGui::TextColored(warnCol, "Partially complete");
         ImGui::PopFont();
@@ -615,6 +618,12 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
             // Error tone retuned for the frost so the reason stays readable over any model.
             const float* ec = (m.errKind == ERR_SYSTEM) ? pal.errSystem : pal.errCad;
             const ImVec4 errCol = semanticOnGlass(ec, chatSurf());
+            if (metaInCard && !metaDrawn) {
+                drawMsgMetaRow(fonts, modelLabel.empty() ? nullptr : modelLabel.c_str(),
+                               turnSurf.textSecondary, m.ts);
+                metaDrawn = true;
+                ImGui::Dummy(ImVec2(0, 2.0f * sc));
+            }
             const ImGuiID textId = chatDrawSelectableText("##err_sel", body, errCol);
             ImGui::EndChild();
             ImRect cardRect = endGlassBubble(gb);
@@ -625,6 +634,25 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
             chatHoverCopyGlyph(cardRect, body);
         }
         } // has something to show
+    }
+
+    // (8b) Fallback: an error/partial turn whose card ended up with no body renders
+    // no card at all — don't lose the model label; draw it here (above-style, inline age).
+    if (metaInCard && !metaDrawn && haveModel) {
+        ImGui::PushFont(fonts.medium);
+        ImGui::TextColored(turnSurf.textSecondary, "%s", modelLabel.c_str());
+        ImGui::PopFont();
+        const std::string age = chatAgeLabel(m.ts);
+        if (!age.empty()) {
+            ImGui::SameLine(0, 6 * sc);
+            ImGui::PushStyleColor(ImGuiCol_Text, turnSurf.textTertiary);
+            ImGui::TextUnformatted(age.c_str());
+            ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered()) {
+                const std::string tip = chatTimeTooltip(m.ts);
+                if (!tip.empty()) ImGui::SetTooltip("%s", tip.c_str());
+            }
+        }
     }
 
     // (9) Provider HTTP call log — always expanded on fail; collapsed toggle on success.

@@ -80,7 +80,9 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     const float sessW = measureBtn("Sessions", "history");
     const float gearW = measureBtn("Settings", "settings");
     const float minGap = style.ItemSpacing.x;
-    const float rightInset = ui::metrics::U(0.5f);
+    // Zero extra right inset — the window padding (7px) is the only gap between the
+    // Artifacts/Settings buttons and the column edge, which itself hugs the program edge.
+    const float rightInset = 0.0f;
     // Collapse chip sits on the left, vertically centered between row 1's
     // 0/0 tasks chip and row 2's Chat button. Row content shifts right past
     // it via contentLeftInset; right side keeps the plain rightInset so the
@@ -852,7 +854,10 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
     const float bubbleDp = (rsCp.rounding >= 0.f) ? rsCp.rounding : 12.0f;
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoBackground;
     if (overlay) {
-        const float margin = ui::metrics::px(12.0f);
+        // Slimmer right-edge margin than the 12dp bottom margin: the pinned column
+        // hugs the program edge so header buttons/chat bubbles use the full width.
+        const float marginX = ui::metrics::px(6.0f);
+        const float margin  = ui::metrics::px(12.0f);
         // The doc-tab strip now floats over the viewport (fix 2), not above these columns, so the
         // Copilot column starts flush at the top of the viewport band — same rule as drawLeftPane,
         // keeping the two pinned columns sharing their top edge.
@@ -883,7 +888,7 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         // instead of shrinking to a pill in both axes (mirrors the FeatureManager column; see
         // ui::PanelCollapseAnim). Width is unaffected by collapse.
         const float winH = s_cpAnim.tick(s_cpCollapsed, colH);
-        ImGui::SetNextWindowPos(ImVec2(band.maxX - margin - s_paneW, colY), ImGuiCond_Always);
+        ImGui::SetNextWindowPos(ImVec2(band.maxX - marginX - s_paneW, colY), ImGuiCond_Always);
         ImGui::SetNextWindowSize(ImVec2(s_paneW, winH), ImGuiCond_Always);
         flags |= ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                  ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |

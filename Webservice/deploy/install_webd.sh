@@ -47,6 +47,11 @@ elif [ -f "$ROOT/services/dist/Chudware/libchudware.so" ]; then
 elif [ -f "$ROOT/core/build-linux/bin/libchudware.so" ]; then
     SRC="$ROOT/core/build-linux/bin"
     echo "[webd] WARNING: slim engine (no OCCT/Netgen) — FEA/CFD RPCs unavailable"
+elif [ -f "$ROOT/build/linux-core/bin/libchudware.so" ]; then
+    # `./build.sh core` (cmake preset linux-core) outputs HERE, not core/build-linux —
+    # without this leg a fresh host that only ran `./build.sh core` cannot install at all.
+    SRC="$ROOT/build/linux-core/bin"
+    echo "[webd] WARNING: slim engine (preset linux-core; no OCCT/Netgen) — FEA/CFD RPCs unavailable"
 else
     echo "[webd] ERROR: no built libchudware.so (run ./build.sh core / configure core/build-occt-linux)"
     exit 1

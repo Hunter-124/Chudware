@@ -58,9 +58,9 @@ except ImportError:
     from engine_bridge import router as engine_router, active_bridge_count
     from workspace import router as workspace_router
     from appserve import router as appserve_router
-    from perf import router as perf_router
+    from perf_client import router as perf_router
     from providers import router as providers_router
-    from terminal_ops import router as terminal_router
+    from terminal import router as terminal_router
     from deploy_ops import router as deploy_router
     from releases import router as releases_router
 

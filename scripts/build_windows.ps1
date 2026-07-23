@@ -42,7 +42,7 @@ echo === host GUI ===
 "$cmake" --build host\build-win --parallel || exit /b 1
 exit /b 0
 "@
-$tmp = Join-Path $env:TEMP "billet_build_windows.bat"
+$tmp = Join-Path $env:TEMP "chudware_build_windows.bat"
 Set-Content -Path $tmp -Value $bat -Encoding ASCII
 Write-Host "=== build (core+host) ==="
 & cmd /c $tmp

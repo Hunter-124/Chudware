@@ -998,22 +998,24 @@ void toggleAsmView(GraphTabState &G) {
 
 // ---- deterministic seeds ----------------------------------------------------
 
-// Harmonic-style embedding per connected component, HDE-initialized: nodes
-// start at their BFS distances (da, db) from the two pseudo-diameter ends —
-// graph-theoretic coordinates that already separate clusters — then relax
-// through Gauss-Seidel barycenter iterations into a smooth, low-crossing
-// embedding. The previous 3-anchor scheme collapsed into a ring at scale
-// (under-iterated barycenter + normalization blow-up); BFS init converges in
-// tens of iterations regardless of component size. Deterministic (fixed
-// orders, no RNG), one-time O(K * E) per rebuild. Also emits a depth (z)
-// coordinate per node — BFS hops from a third pivot — which seeds the 3D
-// physics mode.
-void harmonicSeed(GraphTabState &G, const std::vector<std::vector<int>> &adj,
-                  const std::vector<int> &comp, int nComp,
-                  const std::vector<std::pair<float, float>> &well,
-                  const std::vector<char> &isFresh, float spacing,
-                  std::vector<float> &outX, std::vector<float> &outY,
-                  std::vector<float> &outZ) {
+// Structural seed per connected component, phyllotaxis + neighbor anchoring.
+// Sized components (binding-edge graphs) start as a compact golden-angle
+// spiral disc at their component well — the v2 behavior, which never
+// collapses (unlike harmonic embeddings, which implode on tree-dominated
+// graphs: observed live as wedge/ring artifacts). Reference-only singles
+// (no binding edges) anchor at the centroid of their already-placed
+// neighbors over any edge kind, so the REFERENCES web starts NEXT to what
+// it references instead of fanning in from remote wells. Deterministic
+// (fixed orders, golden angle, no RNG). Depth (z) = BFS level gradient
+// from each component's max-degree root — seeds the 3D physics mode.
+void structuralSeed(GraphTabState &G, const std::vector<std::vector<int>> &adj,
+                    const std::vector<std::vector<int>> &adjAll,
+                    const std::vector<int> &comp,
+                    const std::vector<int> &compSize, int nComp,
+                    const std::vector<std::pair<float, float>> &well,
+                    const std::vector<char> &isFresh, float spacing,
+                    std::vector<float> &outX, std::vector<float> &outY,
+                    std::vector<float> &outZ) {
   const int V = (int)adj.size();
   outX.assign(static_cast<size_t>(V), 0.0f);
   outY.assign(static_cast<size_t>(V), 0.0f);
@@ -1021,203 +1023,101 @@ void harmonicSeed(GraphTabState &G, const std::vector<std::vector<int>> &adj,
   if (V == 0 || nComp <= 0)
     return;
 
+  constexpr float GOLDEN = 2.39996323f; // golden angle (rad)
   std::vector<std::vector<int>> members(static_cast<size_t>(nComp));
   for (int i = 0; i < V; ++i)
     if (comp[static_cast<size_t>(i)] >= 0)
       members[static_cast<size_t>(comp[static_cast<size_t>(i)])].push_back(i);
 
-  std::vector<int> loc(static_cast<size_t>(V), -1); // visOrd → local index
+  std::vector<char> placed(static_cast<size_t>(V), 0);
 
   for (int c = 0; c < nComp; ++c) {
     const auto &mem = members[static_cast<size_t>(c)];
     const int m = (int)mem.size();
-    if (m == 0)
-      continue;
+    if (m <= 1)
+      continue; // singles anchored below
     const float wx = well[static_cast<size_t>(c)].first;
     const float wy = well[static_cast<size_t>(c)].second;
-    for (int i = 0; i < m; ++i)
-      loc[static_cast<size_t>(mem[i])] = i;
 
-    if (m == 1) {
-      const int v = mem[0];
-      if (isFresh[static_cast<size_t>(v)]) {
-        outX[static_cast<size_t>(v)] = wx;
-        outY[static_cast<size_t>(v)] = wy;
+    // Phyllotaxis disc for fresh members (visOrd order → deterministic).
+    std::vector<float> px(static_cast<size_t>(m), 0.0f),
+        py(static_cast<size_t>(m), 0.0f);
+    int cached = 0;
+    float ancX = 0.0f, ancY = 0.0f;
+    for (int i = 0; i < m; ++i) {
+      const int gv = mem[i];
+      if (!isFresh[static_cast<size_t>(gv)]) {
+        const GNode &n = G.nodes[G.visibleIdx[static_cast<size_t>(gv)]];
+        px[static_cast<size_t>(i)] = n.lx;
+        py[static_cast<size_t>(i)] = n.ly;
+        ancX += n.lx;
+        ancY += n.ly;
+        ++cached;
+      } else {
+        const float r = spacing * 0.9f * std::sqrt((float)i + 0.5f);
+        const float a = (float)i * GOLDEN;
+        px[static_cast<size_t>(i)] = wx + r * std::cos(a);
+        py[static_cast<size_t>(i)] = wy + r * std::sin(a);
       }
-      loc[static_cast<size_t>(v)] = -1;
-      continue;
     }
-
-    // BFS over the component (neighbors share the component by construction).
-    auto bfs = [&](int start) {
-      std::vector<int> dist(static_cast<size_t>(m), -1);
+    // Mixed component: pull the fresh disc onto the cached anchors' centroid.
+    if (cached > 0 && cached < m) {
+      float mx = 0.0f, my = 0.0f;
+      int nf = 0;
+      for (int i = 0; i < m; ++i) {
+        if (!isFresh[static_cast<size_t>(mem[i])])
+          continue;
+        mx += px[static_cast<size_t>(i)];
+        my += py[static_cast<size_t>(i)];
+        ++nf;
+      }
+      if (nf > 0) {
+        const float ox = ancX / (float)cached - mx / (float)nf;
+        const float oy = ancY / (float)cached - my / (float)nf;
+        for (int i = 0; i < m; ++i) {
+          if (!isFresh[static_cast<size_t>(mem[i])])
+            continue;
+          px[static_cast<size_t>(i)] += ox;
+          py[static_cast<size_t>(i)] += oy;
+        }
+      }
+    }
+    // Depth gradient: BFS level from the max-degree root (deterministic).
+    {
+      int root = mem[0];
+      for (int gv : mem)
+        if (adj[static_cast<size_t>(gv)].size() >
+            adj[static_cast<size_t>(root)].size())
+          root = gv;
+      std::vector<int> dist(static_cast<size_t>(V), -1);
       std::vector<int> q;
       q.reserve(static_cast<size_t>(m));
-      dist[static_cast<size_t>(start)] = 0;
-      q.push_back(start);
+      dist[static_cast<size_t>(root)] = 0;
+      q.push_back(root);
       for (size_t qi = 0; qi < q.size(); ++qi) {
         const int u = q[qi];
-        for (int gv : adj[static_cast<size_t>(mem[u])]) {
-          const int v = loc[static_cast<size_t>(gv)];
-          if (v < 0 || dist[static_cast<size_t>(v)] >= 0)
+        for (int v : adj[static_cast<size_t>(u)]) {
+          if (dist[static_cast<size_t>(v)] >= 0)
             continue;
           dist[static_cast<size_t>(v)] = dist[static_cast<size_t>(u)] + 1;
           q.push_back(v);
         }
       }
-      return dist;
-    };
-    auto farthest = [](const std::vector<int> &d) {
-      int best = 0;
-      for (int i = 1; i < (int)d.size(); ++i)
-        if (d[static_cast<size_t>(i)] > d[static_cast<size_t>(best)])
-          best = i;
-      return best;
-    };
-
-    const int a = farthest(bfs(0));
-    const std::vector<int> da = bfs(a);
-    const int b = farthest(da);
-    const std::vector<int> db = bfs(b);
-    // Third pivot for depth: node farthest from BOTH diameter ends.
-    int cA = -1, bestScore = -1;
-    for (int i = 0; i < m; ++i) {
-      if (i == a || i == b)
-        continue;
-      const int ra = da[static_cast<size_t>(i)];
-      const int rb = db[static_cast<size_t>(i)];
-      const int di = std::min(ra < 0 ? 0 : ra, rb < 0 ? 0 : rb);
-      if (di > bestScore) {
-        bestScore = di;
-        cA = i;
-      }
-    }
-
-    const float hop = spacing * 0.8f; // hop → pixel scale
-    std::vector<float> px(static_cast<size_t>(m), 0.0f),
-        py(static_cast<size_t>(m), 0.0f), pz(static_cast<size_t>(m), 0.0f);
-    std::vector<char> fixed(static_cast<size_t>(m), 0);
-    int cached = 0;
-    float ancX = 0.0f, ancY = 0.0f;
-    for (int i = 0; i < m; ++i) {
-      const int gv = mem[i];
-      const GNode &n = G.nodes[G.visibleIdx[static_cast<size_t>(gv)]];
-      const int ra =
-          da[static_cast<size_t>(i)] < 0 ? 0 : da[static_cast<size_t>(i)];
-      const int rb =
-          db[static_cast<size_t>(i)] < 0 ? 0 : db[static_cast<size_t>(i)];
-      px[static_cast<size_t>(i)] = (float)ra * hop;
-      py[static_cast<size_t>(i)] = (float)rb * hop;
-      if (!isFresh[static_cast<size_t>(gv)]) {
-        // Cached nodes anchor at their persisted positions (never warped).
-        px[static_cast<size_t>(i)] = n.lx;
-        py[static_cast<size_t>(i)] = n.ly;
-        pz[static_cast<size_t>(i)] = n.lz;
-        fixed[static_cast<size_t>(i)] = 1;
-        ancX += n.lx;
-        ancY += n.ly;
-        ++cached;
-      }
-    }
-    // Pin the diameter ends (keeps the embedding oriented + spread).
-    fixed[static_cast<size_t>(a)] = 1;
-    fixed[static_cast<size_t>(b)] = 1;
-    // Mixed component: align the fresh init cloud with the cached anchors so
-    // the two coordinate frames don't relax across a jump.
-    if (cached > 0) {
-      float mx = 0.0f, my = 0.0f;
-      for (int i = 0; i < m; ++i) {
-        mx += px[static_cast<size_t>(i)];
-        my += py[static_cast<size_t>(i)];
-      }
-      const float ox = ancX / (float)cached - mx / (float)m;
-      const float oy = ancY / (float)cached - my / (float)m;
-      for (int i = 0; i < m; ++i) {
-        if (fixed[static_cast<size_t>(i)])
-          continue;
-        px[static_cast<size_t>(i)] += ox;
-        py[static_cast<size_t>(i)] += oy;
-      }
-    }
-    // Depth init: BFS hops from the third pivot, mean-centred.
-    {
-      const std::vector<int> dc = cA >= 0 ? bfs(cA) : da;
-      float mz = 0.0f;
-      for (int i = 0; i < m; ++i) {
-        if (fixed[static_cast<size_t>(i)]) {
-          mz += pz[static_cast<size_t>(i)];
-          continue;
-        }
-        const int rc =
-            dc[static_cast<size_t>(i)] < 0 ? 0 : dc[static_cast<size_t>(i)];
-        pz[static_cast<size_t>(i)] = (float)rc * hop;
-        mz += pz[static_cast<size_t>(i)];
-      }
-      mz /= (float)m;
-      for (int i = 0; i < m; ++i)
-        if (!fixed[static_cast<size_t>(i)])
-          pz[static_cast<size_t>(i)] -= mz;
-    }
-    // Gauss-Seidel barycenter relax (fixed iteration order → deterministic).
-    constexpr int K = 48;
-    for (int it = 0; it < K; ++it) {
-      for (int i = 0; i < m; ++i) {
-        if (fixed[static_cast<size_t>(i)])
-          continue;
-        float sx = 0.0f, sy = 0.0f, sz = 0.0f;
-        int cnt = 0;
-        for (int gv : adj[static_cast<size_t>(mem[i])]) {
-          const int v = loc[static_cast<size_t>(gv)];
-          if (v < 0)
-            continue;
-          sx += px[static_cast<size_t>(v)];
-          sy += py[static_cast<size_t>(v)];
-          sz += pz[static_cast<size_t>(v)];
-          ++cnt;
-        }
-        if (cnt > 0) {
-          px[static_cast<size_t>(i)] = sx / (float)cnt;
-          py[static_cast<size_t>(i)] = sy / (float)cnt;
-          pz[static_cast<size_t>(i)] = sz / (float)cnt;
-        }
-      }
-    }
-    // Fully-fresh components: normalize mean edge → hop and recentre on the
-    // component well. Mixed components keep cached anchors exactly.
-    if (cached == 0) {
-      double sum = 0.0;
+      float mean = 0.0f;
       int cnt = 0;
-      for (int i = 0; i < m; ++i) {
-        for (int gv : adj[static_cast<size_t>(mem[i])]) {
-          const int v = loc[static_cast<size_t>(gv)];
-          if (v <= i)
-            continue;
-          const float dx =
-              px[static_cast<size_t>(v)] - px[static_cast<size_t>(i)];
-          const float dy =
-              py[static_cast<size_t>(v)] - py[static_cast<size_t>(i)];
-          sum += std::sqrt((double)(dx * dx + dy * dy));
+      for (int gv : mem)
+        if (dist[static_cast<size_t>(gv)] >= 0) {
+          mean += (float)dist[static_cast<size_t>(gv)];
           ++cnt;
         }
-      }
-      float scale = 1.0f;
-      if (cnt > 0) {
-        const float mean = (float)(sum / cnt);
-        if (mean > 1.0f)
-          scale = std::clamp(hop / mean, 0.25f, 4.0f);
-      }
-      float cx = 0.0f, cy = 0.0f;
-      for (int i = 0; i < m; ++i) {
-        cx += px[static_cast<size_t>(i)];
-        cy += py[static_cast<size_t>(i)];
-      }
-      cx /= (float)m;
-      cy /= (float)m;
-      for (int i = 0; i < m; ++i) {
-        px[static_cast<size_t>(i)] =
-            wx + (px[static_cast<size_t>(i)] - cx) * scale;
-        py[static_cast<size_t>(i)] =
-            wy + (py[static_cast<size_t>(i)] - cy) * scale;
+      if (cnt > 0)
+        mean /= (float)cnt;
+      for (int gv : mem) {
+        if (!isFresh[static_cast<size_t>(gv)])
+          continue;
+        const int d = dist[static_cast<size_t>(gv)];
+        outZ[static_cast<size_t>(gv)] =
+            d >= 0 ? ((float)d - mean) * spacing * 0.5f : 0.0f;
       }
     }
     for (int i = 0; i < m; ++i) {
@@ -1226,10 +1126,61 @@ void harmonicSeed(GraphTabState &G, const std::vector<std::vector<int>> &adj,
         continue;
       outX[static_cast<size_t>(gv)] = px[static_cast<size_t>(i)];
       outY[static_cast<size_t>(gv)] = py[static_cast<size_t>(i)];
-      outZ[static_cast<size_t>(gv)] = pz[static_cast<size_t>(i)];
+      placed[static_cast<size_t>(gv)] = 1;
     }
-    for (int i = 0; i < m; ++i)
-      loc[static_cast<size_t>(mem[i])] = -1;
+  }
+  // Cached nodes count as placed anchors for the single-anchoring sweeps.
+  for (int i = 0; i < V; ++i)
+    if (!isFresh[static_cast<size_t>(i)])
+      placed[static_cast<size_t>(i)] = 1;
+
+  // Anchor reference-only singles to the centroid of their placed neighbors
+  // (ANY edge kind — REFERENCES/DOCUMENTS included). 3 sweeps lets short
+  // chains settle; leftovers fall back to their component well with a tiny
+  // golden-angle offset so exact stacks never occur.
+  for (int sweep = 0; sweep < 3; ++sweep) {
+    bool moved = false;
+    for (int i = 0; i < V; ++i) {
+      if (placed[static_cast<size_t>(i)] || !isFresh[static_cast<size_t>(i)])
+        continue;
+      float cx = 0.0f, cy = 0.0f;
+      int cnt = 0;
+      for (int v : adjAll[static_cast<size_t>(i)]) {
+        if (!placed[static_cast<size_t>(v)])
+          continue;
+        float nx = outX[static_cast<size_t>(v)],
+              ny = outY[static_cast<size_t>(v)];
+        if (!isFresh[static_cast<size_t>(v)]) {
+          const GNode &nn = G.nodes[G.visibleIdx[static_cast<size_t>(v)]];
+          nx = nn.lx;
+          ny = nn.ly;
+        }
+        cx += nx;
+        cy += ny;
+        ++cnt;
+      }
+      if (cnt == 0)
+        continue;
+      const float ja = (float)i * GOLDEN;
+      outX[static_cast<size_t>(i)] =
+          cx / (float)cnt + spacing * 0.35f * std::cos(ja);
+      outY[static_cast<size_t>(i)] =
+          cy / (float)cnt + spacing * 0.35f * std::sin(ja);
+      placed[static_cast<size_t>(i)] = 1;
+      moved = true;
+    }
+    if (!moved)
+      break;
+  }
+  for (int i = 0; i < V; ++i) {
+    if (placed[static_cast<size_t>(i)] || !isFresh[static_cast<size_t>(i)])
+      continue;
+    const int c = comp[static_cast<size_t>(i)];
+    const float wx = c >= 0 ? well[static_cast<size_t>(c)].first : 0.0f;
+    const float wy = c >= 0 ? well[static_cast<size_t>(c)].second : 0.0f;
+    const float ja = (float)i * GOLDEN;
+    outX[static_cast<size_t>(i)] = wx + spacing * 0.35f * std::cos(ja);
+    outY[static_cast<size_t>(i)] = wy + spacing * 0.35f * std::sin(ja);
   }
 }
 
@@ -1386,6 +1337,10 @@ void rebuildForce(GraphTabState &G) {
   G.force.setRepulsion(1600.0f * S * S * (190.0f / 60.0f) * (190.0f / 60.0f));
   G.force.setCollision(11.0f, collPad);
   G.force.setVelocityDecay(0.55f);
+  // Slower cooling than the d3 default: at ~4k nodes 300 substeps freezes
+  // mid-organization; ~740 substeps reaches equilibrium (~4 s visible
+  // animation at 3 substeps/frame, proportionally less from small reheats).
+  G.force.setAlphaDecay(0.009f);
   G.force.setCentering(0.015f);
   // Cluster gravity — O(N) pull toward connected-component centroids.
   G.force.setGroupPull(0.08f);
@@ -1425,11 +1380,17 @@ void rebuildForce(GraphTabState &G) {
     visOrd[G.nodes[G.visibleIdx[i]].id] = i;
   const int V = (int)G.visibleIdx.size();
   std::vector<std::vector<int>> adj(static_cast<size_t>(V));
+  std::vector<std::vector<int>> adjAll(
+      static_cast<size_t>(V)); // every edge kind
   for (const auto &e : G.visibleEdges) {
-    if (G.hiddenKinds.count(e.kind) || !bindingKind(e.kind))
+    if (G.hiddenKinds.count(e.kind))
       continue;
     auto a = visOrd.find(e.src), b = visOrd.find(e.dst);
     if (a == visOrd.end() || b == visOrd.end())
+      continue;
+    adjAll[static_cast<size_t>(a->second)].push_back(b->second);
+    adjAll[static_cast<size_t>(b->second)].push_back(a->second);
+    if (!bindingKind(e.kind))
       continue;
     adj[static_cast<size_t>(a->second)].push_back(b->second);
     adj[static_cast<size_t>(b->second)].push_back(a->second);
@@ -1522,8 +1483,8 @@ void rebuildForce(GraphTabState &G) {
   // Fresh nodes (no persisted/stashed position) get placed by a deterministic
   // algorithm; cached positions are never touched.
   //  - Assembly view: layered tree (Sugiyama-lite) — reads top-down.
-  //  - Mostly-fresh web: harmonic spectral-lite embedding per component —
-  //    far fewer edge crossings than a radial seed. Cached nodes anchor.
+  //  - Mostly-fresh web: phyllotaxis discs per component + neighbor-anchored
+  //    reference singles (structuralSeed) — no collapse modes.
   //  - A few new nodes on a warm layout: cheap golden-angle append (below).
   std::vector<float> seedX, seedY, seedZ;
   bool haveSeed = false;
@@ -1531,8 +1492,8 @@ void rebuildForce(GraphTabState &G) {
     layeredAsmSeed(G, collROrd, S, seedX, seedY, seedZ);
     haveSeed = true;
   } else if (fresh * 2 > V) {
-    harmonicSeed(G, adj, comp, nComp, well, isFresh, 190.0f * S, seedX, seedY,
-                 seedZ);
+    structuralSeed(G, adj, adjAll, comp, compSize, nComp, well, isFresh,
+                   190.0f * S, seedX, seedY, seedZ);
     haveSeed = true;
   }
 
@@ -1748,7 +1709,7 @@ void drawArcSpinner(ImDrawList *dl, ImVec2 c, float radius, ImU32 col) {
 // Bump kLayoutVersion whenever seed/clustering/force policy changes enough that
 // old positions would re-open as a hairball. Missing/mismatched version →
 // ignore the file and re-seed from the current algorithm (cluster wells).
-constexpr int kLayoutVersion = 4;
+constexpr int kLayoutVersion = 5;
 
 std::filesystem::path layoutCachePath(const GraphTabState &G) {
   return std::filesystem::path(G.projectDir) / ".plm" / "graph_layout.json";

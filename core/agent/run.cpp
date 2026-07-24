@@ -2691,6 +2691,26 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
     // Probe path: emit routing events BEFORE the two LLM calls so the UI is not
     // silent for ~20s. Classification is free (already computed above).
     RunEvents events(run_id, emit);
+    // Cooperative cancel for the assembly ORCHESTRATION itself (the intake/planner probe LLM
+    // calls and the per-part loop run on THIS thread, not inside a registered sub-run). Without
+    // registering here, agent_cancel(run_id) found nothing in the registry and Stop was a no-op
+    // during the probe/plan phase — the run kept building (engine_inflight stuck at 1). Mirror
+    // run_design / run_mission: register the run so cancel_run flips the flag, set it as the
+    // provider cancel flag so in-flight HTTP aborts, and check cancelled() at stage boundaries.
+    // Per-part sub-runs (run_design below) still register their own children; cancel_run cascades
+    // to "<run_id>-*", and run_design's save/restore hands this flag back after each sub-run.
+    RunControl run_ctl;
+    register_run_control(run_id, run_ctl);
+    struct RunCtlGuard {
+        std::string id;
+        ~RunCtlGuard() { unregister_run_control(id); }
+    } run_ctl_guard{run_id};
+    const std::atomic<bool>* prev_cancel_flag = provider_cancel_flag();
+    set_provider_cancel_flag(run_ctl.flag.get());
+    struct ProvCancelGuard {
+        const std::atomic<bool>* prev;
+        ~ProvCancelGuard() { set_provider_cancel_flag(prev); }
+    } prov_cancel_guard{prev_cancel_flag};
     events.emit("run_started",
                 json{{"request", request},
                      {"doc_id", doc_id},
@@ -2980,6 +3000,9 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
 
     int built_count = 0;
     for (size_t oi = 0; oi < build_order.size(); ++oi) {
+        // User Stop mid-build: don't start another part. In-flight sub-run HTTP already
+        // aborted via the cascaded cancel flag; just stop orchestrating.
+        if (run_ctl.cancelled()) break;
         const size_t idx = build_order[oi];
         const auto& p = parts[idx];
         std::string name = part_names[idx];
@@ -3111,6 +3134,16 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
                              {"reason", "doc_save failed"}});
         }
         ++built_count;
+    }
+
+    // Stopped by the user: report honestly and skip the (expensive) interface verify +
+    // assembly creation. Any parts already built are left as saved .step+ files.
+    if (run_ctl.cancelled()) {
+        events.emit("run_finished", json{{"status", "cancelled"},
+                                         {"stop_reason", "cancelled"},
+                                         {"revision", 0}});
+        return json{{"run_id", run_id}, {"status", "cancelled"}, {"stop_reason", "cancelled"},
+                    {"revision", 0}, {"doc_id", doc_id}};
     }
 
     // 2b) Assembly-time interface verification — seed dims win; route fix to DEPENDENT.

@@ -898,8 +898,11 @@ void freeChatTextures(std::vector<ChatMsg>& chat) {
 
 // ---------------- AppState methods (formerly run_gui lambdas) ----------------
 void AppState::addLog(const std::string& s) {
-    log.push_back(s);
-    if (log.size() > 500) log.erase(log.begin());
+    {
+        std::lock_guard<std::mutex> lk(logMtx);
+        log.push_back(s);
+        if (log.size() > 500) log.erase(log.begin());
+    }
     // C40: tee to a file when CHUDWARE_LOG_FILE is set — the in-app console is hard to reach
     // when diagnosing interaction bugs (and stdout is lost for a windowed exe).
     static FILE* tee = [] {

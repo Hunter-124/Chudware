@@ -14,7 +14,14 @@ void drawConsoleBody(AppState& st) {
         ImGui::PushStyleColor(ImGuiCol_ChildBg,
             ImVec4(pal.codeBg[0], pal.codeBg[1], pal.codeBg[2], pal.codeBg[3]));
         ImGui::BeginChild("##log", ImVec2(0, 0), ImGuiChildFlags_None);
-        for (auto& line : st.log) {
+        // Snapshot under the lock — addLog() mutates st.log from background threads (worker
+        // errorSink); iterating it live raced push_back/erase and crashed. Copy is ≤500 lines.
+        std::vector<std::string> lines;
+        {
+            std::lock_guard<std::mutex> lk(st.logMtx);
+            lines = st.log;
+        }
+        for (auto& line : lines) {
             ImVec4 col(pal.consoleDefault[0], pal.consoleDefault[1],
                        pal.consoleDefault[2], 1);
             if (line.rfind("[err]", 0) == 0 || line.rfind("[!]", 0) == 0)

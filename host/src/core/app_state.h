@@ -1225,6 +1225,12 @@ struct AppState {
     std::vector<char> spBuf{std::vector<char>(16384, 0)};
 
     // ---- console log ----
+    // C39/stop-crash: guarded by logMtx — the worker errorSink calls addLog() from background
+    // threads (jobs.cpp agent run thread, the AgentControlChannel cancel worker, AsyncRpc
+    // dispatch) while drawConsoleBody iterates it on the GL thread. addLog() and the console
+    // reader both take the lock; a bare push_back racing the render loop corrupted the heap
+    // (intermittent SIGABRT on Stop).
+    std::mutex logMtx;
     std::vector<std::string> log;
 
     // ---- runtime + worker ----

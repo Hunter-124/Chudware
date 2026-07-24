@@ -2717,9 +2717,20 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // parts_*, etc.) hit "worker not started" on every boot probe. Don't toast
     // those — panels already degrade inline. Real daemon/CAD failures surface
     // via their own call sites.
+    //
+    // "not connected to hostd" (exact, no suffix — see ipc_client.cpp
+    // reconnectLocked) fires only when the very first RPC (e.g. the
+    // agent_list_models model-picker probe) races the async WebSocket
+    // connect to hostd and loses; sockPath_ is set for the rest of the
+    // session the instant that connect resolves, so this exact string can
+    // never recur later. A genuine ongoing outage produces a DIFFERENT,
+    // longer message ("...(reconnect failed: <reason>)") that this
+    // intentionally does NOT match, so real connectivity problems still
+    // toast.
     (void)method;
     if (err.find("worker not started") != std::string::npos ||
-        err.find("WASM: worker pipe") != std::string::npos)
+        err.find("WASM: worker pipe") != std::string::npos ||
+        err == "not connected to hostd")
       return;
 #endif
     // Stop/steer when hostd is already down is a quiet local finalize — log

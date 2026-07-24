@@ -260,8 +260,24 @@ bool Server::gcCloseDoc(const std::string& docId, const char* reason) {
             return false;  // never close a doc we could not preserve
         }
     }
-    if (!core::cpp_core().call("doc_close", json{{"doc_id", docId}}, result, err))
-        log().line("doc-gc: doc_close(%s) failed: %s", docId.c_str(), err.c_str());
+    // WHY: the isReapable() check above (and needRetire's doc_list + retireDoc I/O just
+    // above, both unlocked) can go stale — a client's attach_doc / implicit-attach
+    // (Server::dispatch -> DocRegistry::preCall) races in during that gap and starts a
+    // legitimate op on a doc this function is about to destroy. reapUnderLock() re-verifies
+    // abandonment AND dispatches doc_close in the SAME registry-mutex hold as that attach
+    // path, so the two can never interleave: whichever gets the lock first wins outright.
+    bool closed = false;
+    const bool ranClose = registry_.reapUnderLock(docId, [&] {
+        closed = core::cpp_core().call("doc_close", json{{"doc_id", docId}}, result, err);
+        if (!closed)
+            log().line("doc-gc: doc_close(%s) failed: %s", docId.c_str(), err.c_str());
+    });
+    if (!ranClose) {
+        log().line("doc-gc: aborting close of %s — a client (re)attached since the last "
+                   "reapable check", docId.c_str());
+        return false;
+    }
+    if (!closed) return false;  // engine declined (e.g. a cross-doc op still holds it) — leave it open
     if (discard && autosave_) autosave_->onDocClosed(docId);  // deliberately dropped -> purge
     registry_.onDaemonClosedDoc(docId, reason);
     log().line("doc-gc: %s doc %s (reason %s)", discard ? "discarded" : "retired",

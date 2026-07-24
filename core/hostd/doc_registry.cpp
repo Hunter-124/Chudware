@@ -200,6 +200,15 @@ bool DocRegistry::isReapable(const std::string& docId) {
     return it->second.attach.empty();     // a re-attach since tick() cancels GC
 }
 
+bool DocRegistry::reapUnderLock(const std::string& docId, const std::function<void()>& closeFn) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    auto it = docs_.find(docId);
+    if (it == docs_.end()) return false;           // already closed elsewhere
+    if (!it->second.attach.empty()) return false;  // (re)attached since the last check — abort
+    closeFn();
+    return true;
+}
+
 void DocRegistry::onDaemonClosedDoc(const std::string& docId, const std::string& reason) {
     std::vector<PendingEvent> pending;
     {

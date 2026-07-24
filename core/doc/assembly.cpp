@@ -201,8 +201,11 @@ const LoadedComponent& load_component(const std::string& path, const std::string
     const std::string abspath = resolve_source_path(path, base_dir);
     const std::string key = component_cache_key(abspath);
 
-    // First caller for this key installs a promise and loads OUTSIDE the lock; concurrent
-    // callers for the same key wait on the shared future instead of loading twice.
+    // WHY: find-or-install-a-placeholder happens in ONE g_cache_mtx acquisition below (no
+    // check-then-insert gap) — the first caller for this key installs a promise and loads
+    // OUTSIDE the lock; every concurrent caller for the SAME key copies the shared_future
+    // (never a bare reference into the map) WHILE STILL HOLDING the lock, then waits on
+    // that copy instead of loading twice. Loads of DIFFERENT keys still run fully in parallel.
     std::shared_future<std::shared_ptr<const LoadedComponent>> fut;
     std::shared_ptr<std::promise<std::shared_ptr<const LoadedComponent>>> mine;
     {

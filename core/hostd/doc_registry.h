@@ -118,6 +118,17 @@ public:
     // an attachment or already vanished; the Server then aborts the GC close.
     bool isReapable(const std::string& docId);
 
+    // Re-check reapability AND dispatch `closeFn` atomically under mtx_ — the SAME lock
+    // attach_doc/detach_doc/preCall's implicit-attach all take. WHY: isReapable() alone only
+    // proves the doc was abandoned at the instant it ran; the retire-tier I/O between that
+    // check and the actual engine doc_close call (doc_list + retireDoc, both unlocked) gives
+    // a racing client's attach a window to land right before the doc is torn down. Holding
+    // mtx_ across the recheck AND closeFn closes that window: a concurrent attach either
+    // lands first (recheck sees it, closeFn never runs) or blocks until closeFn returns.
+    // Returns false (closeFn NOT invoked) if the doc gained an attachment or already vanished.
+    // closeFn MUST NOT call back into DocRegistry — mtx_ is non-recursive.
+    bool reapUnderLock(const std::string& docId, const std::function<void()>& closeFn);
+
 private:
     struct Attach {
         std::string mode;       // "rw" | "ro"

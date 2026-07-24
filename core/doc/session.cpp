@@ -19,6 +19,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -3974,8 +3975,12 @@ std::pair<std::string, json> write_aicm_assembly(Session& s,
         static std::mutex s_asm_tess_mtx;
         struct AsmTessEntry {
             TopoDS_Shape shape;  // pins the TShape so the pointer key can't be recycled (ABA)
-            std::shared_ptr<const aicm::AicmBody> body;
+            std::shared_future<std::shared_ptr<const aicm::AicmBody>> body;
         };
+        // WHY: lookup-or-install-placeholder happens under ONE s_asm_tess_mtx acquisition
+        // below (no unlock/relock gap) so two threads racing the SAME uncached TShape key
+        // can never both miss and both pay for a duplicate tessellate_body pass — the loser
+        // waits on the winner's shared_future instead of redoing the (expensive) mesh work.
         static std::map<const void*, AsmTessEntry> s_asm_tess_cache;
         for (const AsmBodyOut& body : ares->bodies) {
             std::optional<Eigen::Vector3d> off;
@@ -3987,20 +3992,33 @@ std::pair<std::string, json> write_aicm_assembly(Session& s,
             aicm::AicmBody bt;
             if (rigid) {
                 const void* key = body.shape_local.TShape().get();
-                std::shared_ptr<const aicm::AicmBody> local;
+                std::shared_future<std::shared_ptr<const aicm::AicmBody>> fut;
+                std::shared_ptr<std::promise<std::shared_ptr<const aicm::AicmBody>>> mine;
                 {
                     std::lock_guard<std::mutex> lk(s_asm_tess_mtx);
                     auto it = s_asm_tess_cache.find(key);
-                    if (it != s_asm_tess_cache.end()) local = it->second.body;
+                    if (it != s_asm_tess_cache.end()) {
+                        fut = it->second.body;
+                    } else {
+                        mine = std::make_shared<std::promise<std::shared_ptr<const aicm::AicmBody>>>();
+                        fut = mine->get_future().share();
+                        s_asm_tess_cache[key] = AsmTessEntry{body.shape_local, fut};
+                    }
                 }
-                if (!local) {
-                    // Tessellate at IDENTITY location so the mesh is reusable for every
-                    // instance/placement of this component.
-                    local = std::make_shared<const aicm::AicmBody>(::geom::tessellate_body(
-                        body.shape_local.Located(TopLoc_Location()), 0, std::string(), color));
-                    std::lock_guard<std::mutex> lk(s_asm_tess_mtx);
-                    s_asm_tess_cache[key] = AsmTessEntry{body.shape_local, local};
+                if (mine) {
+                    try {
+                        // Tessellate at IDENTITY location so the mesh is reusable for every
+                        // instance/placement of this component.
+                        mine->set_value(std::make_shared<const aicm::AicmBody>(::geom::tessellate_body(
+                            body.shape_local.Located(TopLoc_Location()), 0, std::string(), color)));
+                    } catch (...) {
+                        mine->set_exception(std::current_exception());
+                        // A failed tessellation is NOT cached — the next caller for this key retries.
+                        std::lock_guard<std::mutex> lk(s_asm_tess_mtx);
+                        s_asm_tess_cache.erase(key);
+                    }
                 }
+                std::shared_ptr<const aicm::AicmBody> local = fut.get();  // rethrows for every waiter
                 bt = *local;  // COW buffers — O(1) until the transform detaches
                 bt.body_id = static_cast<uint32_t>(body.body_id);
                 bt.name = body.name;
@@ -5290,25 +5308,39 @@ json doc_asm_bom_components(const std::string& doc_id) {
 }
 
 bool doc_close(const std::string& doc_id) {
-    // Erase from the registry first (so new lookups fail), then acquire the
-    // session mutex to wait out any in-flight op before the shared_ptr drops.
+    // Pin the session WITHOUT erasing it yet — the erase only happens once we know the
+    // session isn't mid-operation (see try_lock below).
     std::shared_ptr<Session> pin;
     {
         std::lock_guard<std::mutex> reg(g_registry_mtx);
         auto it = g_sessions.find(doc_id);
         if (it == g_sessions.end()) return false;
         pin = it->second;
+    }
+    // WHY: the old code took a BLOCKING lock on pin->mtx, then unconditionally erased and
+    // tore the session down the instant it woke — so a genuinely in-flight op (e.g. a
+    // cross-doc dependency resolve via resolve_source_session, invisible to hostd's
+    // attach-based reapability check) only DELAYED the close instead of preventing it, and
+    // the caller's just-finished work was destroyed anyway. try_lock instead: if the session
+    // is busy, doc_close makes NO change (never erases, never tears down) and reports a
+    // typed error so the caller can treat this doc as still open.
+    std::unique_lock<std::mutex> doc(pin->mtx, std::try_to_lock);
+    if (!doc.owns_lock())
+        throw OpError("doc_busy", "document " + doc_id + " has an operation in flight",
+                      {{"doc_id", doc_id}});
+    {
+        std::lock_guard<std::mutex> reg(g_registry_mtx);
+        auto it = g_sessions.find(doc_id);
+        if (it == g_sessions.end()) return false;  // closed by a racing caller meanwhile
         g_sessions.erase(it);
     }
-    {
-        std::lock_guard<std::mutex> doc(pin->mtx);
-        // Drop any on-disk undo journal stubs for this doc before the session dies.
-        for (const std::string& e : pin->undo_stack) drop_history_entry(e);
-        for (const std::string& e : pin->redo_stack) drop_history_entry(e);
-        pin->undo_stack.clear();
-        pin->redo_stack.clear();
-        // Session teardown happens when `pin` goes out of scope after this unlock.
-    }
+    // Drop any on-disk undo journal stubs for this doc before the session dies.
+    for (const std::string& e : pin->undo_stack) drop_history_entry(e);
+    for (const std::string& e : pin->redo_stack) drop_history_entry(e);
+    pin->undo_stack.clear();
+    pin->redo_stack.clear();
+    doc.unlock();
+    // Session teardown happens when `pin` goes out of scope below.
     wipe_undo_journal(doc_id);
     // T-PERF10: free AICM shared-memory objects for this doc (all revisions).
     chudware::aicm_handoff::release_doc(doc_id);

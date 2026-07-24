@@ -1123,14 +1123,15 @@ namespace {
 // top-level keys == `getBundledProviders()`'s return value, verified by reading the JSON
 // directly rather than round-tripping the bridge at static-init time) MINUS every id that has
 // a native libcurl/WinHTTP branch in complete() below or in config.cpp::resolve_provider:
-// anthropic, openai, google (CAD's native "gemini"/"gemini-sub" branch — same service, CAD's
+// openai, google (CAD's native "gemini"/"gemini-sub" branch — same service, CAD's
 // own name), xai + xai-oauth (CAD's native "xai"/"xai-sub"), moonshot, cursor. llamacpp/mock
 // aren't OMP catalog ids at all. Re-derive with
 // `python3 -c "import json;print(sorted(json.load(open('vendor/omp/packages/catalog/src/
 // models.json')).keys()))"` if the vendored catalog is re-pulled and provider coverage shifts.
 const std::unordered_set<std::string>& omp_bridge_provider_ids() {
     static const std::unordered_set<std::string> kOmpBridgeProviders = {
-        "aimlapi", "alibaba-coding-plan", "amazon-bedrock", "azure", "baseten", "cerebras",
+        "aimlapi", "alibaba-coding-plan", "amazon-bedrock", "anthropic", "anthropic-sub",
+        "azure", "baseten", "cerebras",
         "cloudflare-ai-gateway", "coreweave", "deepseek", "devin", "firepass", "fireworks",
         "github-copilot", "gitlab-duo", "gitlab-duo-agent", "google-antigravity",
         "google-gemini-cli", "google-vertex", "groq", "huggingface", "kilo", "kimi-code",
@@ -1744,10 +1745,6 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
 
     std::string api_key = str_or(cfg, "api_key");
     std::string base_url = str_or(cfg, "base_url");
-    std::string auth_mode = str_or(cfg, "auth_mode");
-    auto is_oauth_key = [](const std::string& k) {
-        return k.rfind("sk-ant-oat", 0) == 0;
-    };
 
     // OMP bridge — providers routed to the bun sidecar (core/agent/omp_bridge_client.h)
     // instead of a native branch below. See is_omp_bridge_provider()'s TODO for how the
@@ -1757,8 +1754,13 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
     if (is_omp_bridge_provider(provider)) {
         std::string model = str_or(cfg, "model");
         std::string effort = str_or(cfg, "reasoning_effort");
+        // anthropic-sub is CAD's OAuth-subscription id; OMP's catalog has a single
+        // top-level "anthropic" key and auto-detects OAuth vs API-key from the token
+        // shape (isAnthropicOAuthToken), so both CAD ids must speak as "anthropic".
+        const std::string wire_provider =
+            (provider == "anthropic-sub") ? std::string("anthropic") : provider;
         json params = {
-            {"provider", provider},
+            {"provider", wire_provider},
             {"model", model},
             {"system", eff_system},
             {"messages", omp_bridge_messages(eff_messages)},
@@ -1802,232 +1804,6 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
         }
         // (usage threaded above from bridge.ts collapse()'s result.usage; cost accounting on
         // top of it — 01-DECISIONS.md "Cost + cache" — is a later phase.)
-        return finish(std::move(res));
-    }
-
-    // Anthropic Messages API — classic x-api-key OR Claude Pro/Max OAuth bearer.
-    // OAuth requires the Claude-Code-shaped system array + CCH billing hash + betas.
-    // OAuth tokens arrive already refreshed (auth::ensure_fresh_for_run, T-RF4).
-    if (provider == "anthropic" || provider == "anthropic-sub") {
-        std::string model = str_or(cfg, "model", std::string(kAnthropicDefaultModel));
-        std::string effort = str_or(cfg, "reasoning_effort");
-        const bool oauth = (provider == "anthropic-sub") || auth_mode == "oauth" ||
-                           is_oauth_key(api_key);
-        if (api_key.empty()) {
-            res.error = oauth ? "anthropic-sub: no access_token (sign in via Settings → Accounts)"
-                              : "anthropic: missing api_key";
-            res.model = model;
-            res.endpoint = "https://api.anthropic.com/v1/messages";
-            return finish(std::move(res));
-        }
-
-        BuiltRequest req =
-            anthropic_build_request(model, eff_system, eff_messages, max_tokens, effort);
-
-        if (oauth) {
-            // OAuth: Authorization Bearer + Claude Code betas (not x-api-key).
-            // System must be the 3-block array with billing header + CCH integrity.
-            std::string first_user;
-            for (const auto& m : eff_messages) {
-                if (m.value("role", std::string()) != "user") continue;
-                if (!m.contains("content") || !m["content"].is_array()) break;
-                for (const auto& p : m["content"]) {
-                    if (pstr(p, "type") == "text") first_user += pstr(p, "text");
-                }
-                break;
-            }
-            // billing suffix + CCH (mirrors anthropic_sub_provider.py)
-            auto ch = [&](size_t i) -> char {
-                return i < first_user.size() ? first_user[i] : '0';
-            };
-            const char* kClaudeCodeVer = "2.1.165";
-            std::string k;
-            k.push_back(ch(4));
-            k.push_back(ch(7));
-            k.push_back(ch(20));
-            // SHA-256 truncated — use a simple FNV-ish fallback if we lack OpenSSL;
-            // match Python: sha256("59cf53e54c78"+k+ver).hexdigest()[:3]
-            std::string suffix_src = std::string("59cf53e54c78") + k + kClaudeCodeVer;
-            // Portable SHA-256 via openssl command is too heavy; use the same
-            // xxh-independent approach as a compact FNV64 then hex[:3] only if
-            // needed. Prefer real sha256 when available via system crypto.
-            // Inline SHA-256 (public domain compact).
-            auto sha256_hex = [](const std::string& s) -> std::string {
-                // Minimal SHA-256 implementation.
-                static const uint32_t K[64] = {
-                    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
-                    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
-                    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
-                    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
-                    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
-                    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
-                    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
-                    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2};
-                auto rotr = [](uint32_t x, uint32_t n) { return (x >> n) | (x << (32 - n)); };
-                uint32_t h0=0x6a09e667,h1=0xbb67ae85,h2=0x3c6ef372,h3=0xa54ff53a,
-                         h4=0x510e527f,h5=0x9b05688c,h6=0x1f83d9ab,h7=0x5be0cd19;
-                std::vector<uint8_t> data(s.begin(), s.end());
-                uint64_t bitlen = static_cast<uint64_t>(data.size()) * 8;
-                data.push_back(0x80);
-                while ((data.size() % 64) != 56) data.push_back(0);
-                for (int i = 7; i >= 0; --i) data.push_back(static_cast<uint8_t>((bitlen >> (i * 8)) & 0xff));
-                for (size_t chunk = 0; chunk < data.size(); chunk += 64) {
-                    uint32_t w[64];
-                    for (int i = 0; i < 16; ++i)
-                        w[i] = (data[chunk+i*4]<<24)|(data[chunk+i*4+1]<<16)|(data[chunk+i*4+2]<<8)|data[chunk+i*4+3];
-                    for (int i = 16; i < 64; ++i) {
-                        uint32_t s0 = rotr(w[i-15],7)^rotr(w[i-15],18)^(w[i-15]>>3);
-                        uint32_t s1 = rotr(w[i-2],17)^rotr(w[i-2],19)^(w[i-2]>>10);
-                        w[i] = w[i-16] + s0 + w[i-7] + s1;
-                    }
-                    uint32_t a=h0,b=h1,c=h2,d=h3,e=h4,f=h5,g=h6,h=h7;
-                    for (int i = 0; i < 64; ++i) {
-                        uint32_t S1 = rotr(e,6)^rotr(e,11)^rotr(e,25);
-                        uint32_t chv = (e&f)^((~e)&g);
-                        uint32_t t1 = h + S1 + chv + K[i] + w[i];
-                        uint32_t S0 = rotr(a,2)^rotr(a,13)^rotr(a,22);
-                        uint32_t maj = (a&b)^(a&c)^(b&c);
-                        uint32_t t2 = S0 + maj;
-                        h=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
-                    }
-                    h0+=a; h1+=b; h2+=c; h3+=d; h4+=e; h5+=f; h6+=g; h7+=h;
-                }
-                char buf[65];
-                std::snprintf(buf, sizeof(buf), "%08x%08x%08x%08x%08x%08x%08x%08x",
-                              h0,h1,h2,h3,h4,h5,h6,h7);
-                return std::string(buf);
-            };
-            std::string suffix = sha256_hex(suffix_src).substr(0, 3);
-
-            // xxhash64 CCH with seed 0x4D659218E32A3268 (Anthropic subscription integrity).
-            auto xxh64 = [](const std::string& input, uint64_t seed) -> uint64_t {
-                const uint64_t PRIME1 = 11400714785074694791ULL;
-                const uint64_t PRIME2 = 14029467366897019727ULL;
-                const uint64_t PRIME3 = 1609587929392839161ULL;
-                const uint64_t PRIME4 = 9650029242287828579ULL;
-                const uint64_t PRIME5 = 2870177450012600261ULL;
-                auto rotl = [](uint64_t x, int r) { return (x << r) | (x >> (64 - r)); };
-                const uint8_t* p = reinterpret_cast<const uint8_t*>(input.data());
-                const uint8_t* const end = p + input.size();
-                uint64_t h;
-                if (input.size() >= 32) {
-                    uint64_t v1 = seed + PRIME1 + PRIME2;
-                    uint64_t v2 = seed + PRIME2;
-                    uint64_t v3 = seed + 0;
-                    uint64_t v4 = seed - PRIME1;
-                    const uint8_t* const limit = end - 32;
-                    do {
-                        auto get64 = [](const uint8_t* q) {
-                            uint64_t r;
-                            std::memcpy(&r, q, 8);
-                            return r;
-                        };
-                        v1 = rotl(v1 + get64(p) * PRIME2, 31) * PRIME1; p += 8;
-                        v2 = rotl(v2 + get64(p) * PRIME2, 31) * PRIME1; p += 8;
-                        v3 = rotl(v3 + get64(p) * PRIME2, 31) * PRIME1; p += 8;
-                        v4 = rotl(v4 + get64(p) * PRIME2, 31) * PRIME1; p += 8;
-                    } while (p <= limit);
-                    h = rotl(v1,1)+rotl(v2,7)+rotl(v3,12)+rotl(v4,18);
-                    auto round_merge = [&](uint64_t acc, uint64_t v) {
-                        v = rotl(v * PRIME2, 31) * PRIME1;
-                        acc ^= v;
-                        return acc * PRIME1 + PRIME4;
-                    };
-                    h = round_merge(h, v1);
-                    h = round_merge(h, v2);
-                    h = round_merge(h, v3);
-                    h = round_merge(h, v4);
-                } else {
-                    h = seed + PRIME5;
-                }
-                h += static_cast<uint64_t>(input.size());
-                auto get64 = [](const uint8_t* q) {
-                    uint64_t r; std::memcpy(&r, q, 8); return r;
-                };
-                auto get32 = [](const uint8_t* q) {
-                    uint32_t r; std::memcpy(&r, q, 4); return r;
-                };
-                while (p + 8 <= end) {
-                    uint64_t k1 = rotl(get64(p) * PRIME2, 31) * PRIME1;
-                    h = rotl(h ^ k1, 27) * PRIME1 + PRIME4;
-                    p += 8;
-                }
-                if (p + 4 <= end) {
-                    h = rotl(h ^ (static_cast<uint64_t>(get32(p)) * PRIME1), 23) * PRIME2 + PRIME3;
-                    p += 4;
-                }
-                while (p < end) {
-                    h = rotl(h ^ (*p * PRIME5), 11) * PRIME1;
-                    ++p;
-                }
-                h ^= h >> 33; h *= PRIME2; h ^= h >> 29; h *= PRIME3; h ^= h >> 32;
-                return h;
-            };
-
-            // Rebuild body: system as array with billing placeholder, adaptive thinking.
-            json body = req.body_json;
-            body["system"] = json::array({
-                {{"type", "text"},
-                 {"text", std::string("x-anthropic-billing-header: cc_version=") + kClaudeCodeVer +
-                              "." + suffix + "; cc_entrypoint=local-agent; cch=00000;"}},
-                {{"type", "text"},
-                 {"text", "You are a Claude agent, built on Anthropic's Claude Agent SDK."}},
-                {{"type", "text"}, {"text", eff_system}},
-            });
-            // OAuth path: adaptive thinking (budget_tokens 400s on opus 4.8).
-            // Object, not array — see anthropic_build_request note.
-            body["thinking"] = json::object({{"type", "adaptive"}});
-            body.erase("output_config");  // optional; adaptive alone is valid
-
-            std::string body_str = body.dump();  // compact? nlohmann default is compact
-            // nlohmann dump() is compact by default (no spaces) — matches separators=(',',':')
-            uint64_t cch_val = xxh64(body_str, 0x4D659218E32A3268ULL);
-            char cch_buf[8];
-            std::snprintf(cch_buf, sizeof(cch_buf), "%05x",
-                          static_cast<unsigned>((cch_val & 0xFFFFFULL)));
-            std::string patched = body_str;
-            auto pos = patched.find("cch=00000;");
-            if (pos != std::string::npos)
-                patched.replace(pos, 10, std::string("cch=") + cch_buf + ";");
-            req.body = patched;
-            req.body_json = json::parse(patched, nullptr, false);
-            req.headers = {
-                {"Authorization", "Bearer " + api_key},
-                {"anthropic-version", "2023-06-01"},
-                {"content-type", "application/json"},
-                {"anthropic-beta", "interleaved-thinking-2025-05-14,oauth-2025-04-20"},
-                {"anthropic-dangerous-direct-browser-access", "true"},
-                {"x-app", "cli"},
-                {"User-Agent",
-                 "claude-cli/2.1.165 (external, local-agent, agent-sdk/0.3.165)"},
-                {"X-Stainless-Retry-Count", "0"},
-                {"X-Stainless-Timeout", "900"},
-            };
-        } else {
-            for (auto& h : req.headers)
-                if (h.first == "x-api-key") h.second = api_key;
-        }
-
-        RetryResult rr = http_post_retry(req.url, req.headers, req.body);
-        res.endpoint = req.url;
-        res.model = model;
-        res.attempt = rr.attempt;
-        res.http_status = static_cast<int>(rr.hr.status);
-        res.request_id = request_id_from_body(rr.hr.body);
-        if (!rr.hr.error.empty()) {
-            res.error = rr.hr.error;
-            res.error_excerpt = truncate_excerpt(rr.hr.error);
-            return finish(std::move(res));
-        }
-        if (rr.hr.status < 200 || rr.hr.status >= 300) {
-            res.error = concise_http_error(oauth ? "anthropic-sub" : "anthropic", rr.hr.status,
-                                           rr.hr.body);
-            res.error_excerpt = truncate_excerpt(rr.hr.body.empty() ? res.error : rr.hr.body);
-            return finish(std::move(res));
-        }
-        ParsedReply pr = anthropic_parse_response(json::parse(rr.hr.body, nullptr, false));
-        res.text = pr.text;
-        res.thinking = pr.thinking;
         return finish(std::move(res));
     }
 

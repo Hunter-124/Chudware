@@ -35,9 +35,10 @@
 import { readFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 
-import { stream } from "@oh-my-pi/pi-ai";
-import type { AssistantMessage, Context, Message, StreamOptions } from "@oh-my-pi/pi-ai";
+import { stream, streamSimple } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, Context, Message, SimpleStreamOptions, StreamOptions } from "@oh-my-pi/pi-ai";
 import { getBundledModels, getBundledProviders } from "@oh-my-pi/pi-catalog";
+import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import {
 	getAuthContext,
 	handleAuthListProviders,
@@ -152,6 +153,16 @@ async function resolveAuthApiKey(provider: string): Promise<string | undefined> 
 	}
 }
 
+/** Wire-string -> Effort for the six levels the C++ side may send in `reasoningEffort`. */
+const EFFORT_BY_NAME: Readonly<Record<string, Effort>> = {
+	minimal: Effort.Minimal,
+	low: Effort.Low,
+	medium: Effort.Medium,
+	high: Effort.High,
+	xhigh: Effort.XHigh,
+	max: Effort.Max,
+};
+
 async function handleComplete(params: Json): Promise<Json> {
 	const provider = str(params.provider);
 	const modelId = str(params.model);
@@ -162,7 +173,7 @@ async function handleComplete(params: Json): Promise<Json> {
 	const system = str(params.system);
 	if (system) context.systemPrompt = [system];
 
-	const options: StreamOptions = {};
+	const options: SimpleStreamOptions = {};
 	if (params.apiKey) options.apiKey = str(params.apiKey);
 	else {
 		const stored = await resolveAuthApiKey(provider);
@@ -170,7 +181,12 @@ async function handleComplete(params: Json): Promise<Json> {
 	}
 	if (typeof params.maxTokens === "number") options.maxTokens = params.maxTokens;
 
-	const result = await stream(model, context, options).result();
+	const effort = str(params.reasoningEffort);
+	const reasoning = EFFORT_BY_NAME[effort];
+	if (reasoning !== undefined) options.reasoning = reasoning;
+	else if (effort === "off" || effort === "none" || effort === "") options.disableReasoning = true;
+
+	const result = await streamSimple(model, context, options).result();
 	return collapse(result);
 }
 

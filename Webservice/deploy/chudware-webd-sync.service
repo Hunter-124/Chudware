@@ -1,6 +1,8 @@
 # chudware-webd-sync.service — triggered by chudware-webd-sync.path when the
 # engine build tree writes a new chudware-hostd. Sleeps briefly so sibling .so
-# files finish writing, then re-runs install_webd.sh --restart.
+# files finish writing, then re-runs install_webd.sh --restart, which also
+# rebuilds + restages the WASM web UI bundle (host/src/ui, same tree as
+# desktop) so the browser app never drifts behind a local dev rebuild.
 [Unit]
 Description=Re-install chudware-webd after engine rebuild
 

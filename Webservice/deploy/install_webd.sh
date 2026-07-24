@@ -181,3 +181,24 @@ if [ "$RESTART" = 1 ]; then
 else
     echo "[webd] start it with: systemctl --user start chudware-hostd.service"
 fi
+
+
+# --- keep the web UI bundle in lockstep with the daemon --------------------
+# chudware-webd-sync.path fires this script on every green rebuild of
+# chudware-hostd, but that only ever redeployed the daemon side — host/src/ui
+# changes (the same tree, compiled to WASM) never got restaged, so the browser
+# app silently drifted from desktop until someone remembered to run
+# `./build.sh wasm` by hand. Rebuild + restage here too so a single dev build
+# on this box republishes both halves. Best-effort: skip quietly if emsdk
+# isn't provisioned, never fail the daemon install over a UI rebuild issue.
+EMSDK_DIR="${EMSDK:-$HOME/.emsdk}"
+if [ -f "$EMSDK_DIR/emsdk_env.sh" ]; then
+    echo "[webd] rebuilding + restaging web UI bundle (./build.sh wasm)..."
+    if EMSDK="$EMSDK_DIR" "$ROOT/build.sh" wasm >/tmp/chudware-webd-sync-wasm.log 2>&1; then
+        echo "[webd] web UI bundle restaged (log: /tmp/chudware-webd-sync-wasm.log)"
+    else
+        echo "[webd] WARNING: wasm rebuild failed, web UI bundle left stale (see /tmp/chudware-webd-sync-wasm.log)"
+    fi
+else
+    echo "[webd] emsdk not found at $EMSDK_DIR — skipping web UI bundle rebuild"
+fi

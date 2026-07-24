@@ -437,21 +437,31 @@ static ChipResult drawChipAt(const char* btnId,
 //     drops arbitrary files. The Team Bucket (/bucket) is that place, so on
 //     web this opens the SAME centered-overlay treatment the workspace picker
 //     uses (see chudware_web_dialogs.js's #chudware-ws-browse: dark panel,
-//     backdrop, middle of the screen) but with the bucket page embedded in an
-//     iframe as its content instead of a bespoke re-implementation — reuses
-//     bucket.html/bucket.js/the /api/bucket/* surface wholesale, so upload,
-//     drag-drop, rename, mkdir, download all just work with zero duplicated
-//     logic. Fire-and-forget (no path is picked/returned), so no Asyncify and
-//     no setActiveProjectDir() call — the bucket is independent of the CAD
-//     workspace. /bucket itself is no longer a directly-linked destination
-//     (dropped from the portal nav) — this modal is the only way in now.
+//     backdrop, middle of the screen) with the bucket UI mounted as content.
+//     NOT an <iframe src="/bucket">: Cloudflare Access refuses to let its own
+//     protected app be framed at all — even same-origin — which is the
+//     "chudware.com refused to connect" error an iframe here produces.
+//     Instead this does a normal same-page fetch('/bucket') (a plain AJAX
+//     request, not a nested browsing context, so Access allows it exactly
+//     like every other /api/* call this app already makes), pulls out
+//     bucket.html's <main> markup + <style> rules (scoped under our own
+//     container id so they can't leak into/collide with the rest of the
+//     app's page), mounts them, then loads bucket.js fresh against that
+//     mounted DOM. Reuses bucket.html/bucket.js/the /api/bucket/* surface
+//     wholesale — zero duplicated upload/drag-drop/rename/mkdir logic.
+//     Built once and toggled visible/hidden on repeat opens (not torn down
+//     each time) so bucket.js's IIFE — and its document-level drag/drop
+//     listeners — only ever run once. Fire-and-forget (no path is picked/
+//     returned), so no Asyncify and no setActiveProjectDir() call — the
+//     bucket is independent of the CAD workspace.
 static void openProjectFolderAction(AppState& st) {
 #ifdef __EMSCRIPTEN__
     (void)st;
     EM_ASM({
-        var old = document.getElementById('chudware-bucket-modal');
-        if (old) { try { old.remove(); } catch (e) {} }
-        var overlay = document.createElement('div');
+        var overlay = document.getElementById('chudware-bucket-modal');
+        if (overlay) { overlay.style.display = 'flex'; return; }
+
+        overlay = document.createElement('div');
         overlay.id = 'chudware-bucket-modal';
         overlay.style.cssText =
             'position:fixed;inset:0;z-index:999999;background:rgba(0,0,0,0.45);' +
@@ -478,19 +488,65 @@ static void openProjectFolderAction(AppState& st) {
             'line-height:1;cursor:pointer;padding:2px 9px;border-radius:6px;';
         closeBtn.onmouseenter = function () { closeBtn.style.background = '#2a2a38'; };
         closeBtn.onmouseleave = function () { closeBtn.style.background = 'transparent'; };
-        closeBtn.onclick = function () { overlay.remove(); };
+        closeBtn.onclick = function () { overlay.style.display = 'none'; };
         titleBar.appendChild(titleLbl);
         titleBar.appendChild(closeBtn);
-        var frame = document.createElement('iframe');
-        frame.src = '/bucket';
-        frame.style.cssText = 'flex:1 1 auto;border:0;width:100%;background:#fff;';
+
+        var body = document.createElement('div');
+        body.id = 'chudware-bucket-body';
+        body.style.cssText = 'flex:1 1 auto;overflow:auto;background:#0f1418;';
+        body.textContent = 'Loading\u2026';
+
         panel.appendChild(titleBar);
-        panel.appendChild(frame);
+        panel.appendChild(body);
         overlay.appendChild(panel);
         overlay.addEventListener('mousedown', function (e) {
-            if (e.target === overlay) overlay.remove();
+            if (e.target === overlay) overlay.style.display = 'none';
         });
         document.body.appendChild(overlay);
+
+        fetch('/bucket').then(function (r) {
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            return r.text();
+        }).then(function (html) {
+            var doc = new DOMParser().parseFromString(html, 'text/html');
+            var mainEl = doc.querySelector('main');
+            if (!mainEl) throw new Error('bucket page markup missing <main>');
+            var styleText = Array.prototype.map.call(
+                doc.querySelectorAll('style'), function (s) { return s.textContent; }
+            ).join('\n');
+
+            // Scope every rule under #chudware-bucket-body so it can't leak
+            // into (or collide with) the rest of the app's own page styles.
+            // No @media/nested rules in this stylesheet, so a flat
+            // "selector { decl }" pass is safe.
+            var scoped = styleText.replace(/([^{}]+)\{([^{}]*)\}/g, function (m, sel, decl) {
+                sel = sel.trim();
+                if (sel === ':root') return '#chudware-bucket-body{' + decl + '}';
+                var out = sel.split(',').map(function (s) {
+                    s = s.trim();
+                    return (s === 'html' || s === 'body')
+                        ? '#chudware-bucket-body' : '#chudware-bucket-body ' + s;
+                }).join(', ');
+                return out + '{' + decl + '}';
+            });
+            var styleTag = document.createElement('style');
+            styleTag.textContent = scoped;
+            document.head.appendChild(styleTag);
+
+            body.textContent = '';
+            body.style.background = '';
+            var mount = document.createElement('div');
+            mount.innerHTML = mainEl.innerHTML;
+            body.appendChild(mount);
+
+            var script = document.createElement('script');
+            script.src = '/static/bucket.js?v=2';
+            document.body.appendChild(script);
+        }).catch(function (err) {
+            body.textContent = 'Failed to load Team Bucket: ' + err.message;
+            body.style.cssText += 'padding:20px;color:#e07a8a;';
+        });
     });
 #else
     std::string abs = ui::openFolderDialog();

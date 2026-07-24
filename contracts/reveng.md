@@ -435,12 +435,34 @@ Every v1 key is preserved. Geometry stays inside `params_mm`; semantics are entr
 | `params_mm.base[3]` | cylinder fit | axis point at the low-`t` end of the patch (`origin` keeps its v1 meaning), so hole placement is expressible |
 | `role` | plane fit | `pocket` \| `pad` \| `unknown` |
 | `sections` | top level, sibling of `fits` | `[{station_mm, axis[3], polylines: [[[x,y],…]], area_mm2, closed, frame:{origin,e1,e2}}]` |
+| `residual_mm` | any fit | RMS deviation of the inliers from the fitted primitive, in mm |
+| `inliers` | any fit | absolute count of points supporting the fit |
 
 `sections` replaces the v1 hardcoded `[]`. The slice plane is `{p : p·axis == station_mm}`;
 lift a 2-D point back to world as `origin + x·e1 + y·e2`. Areas are shoelace sums signed by
 nesting parity, so an internal bore subtracts from its enclosing loop.
 
 Multiple cylinders are now returned (iterative RANSAC peel), where v1 fitted exactly one.
+
+### `confidence` is a mesh SHARE, not a fit QUALITY
+
+§3's example shows `confidence: 0.92` for a lone cylinder, which reads like a quality score. It is
+not: `segment_fit` computes `confidence = inliers / total_points`, i.e. the fraction of the sampled
+cloud a fit owns. It is therefore **scale-dependent** — a small bore in a large bracket legitimately
+scores 0.03–0.31 — and **MUST NOT be compared against a quality threshold**. Doing exactly that
+(`_HINT_MIN_CONFIDENCE = 0.5`) silently discarded every real fit hint before it reached
+`reverse_engineer`, so the mesh→CAD hint path looked wired and did nothing on real data.
+
+Consumers gate on `residual_mm` (how well the primitive actually fits) and `inliers` (whether
+enough evidence supports it) instead.
+
+### Roles are reported, never guessed
+
+`role` is `unknown` whenever normals are absent or the orientation test is ambiguous. A consumer
+MUST NOT bucket `unknown` into either additive or subtractive geometry — turning an unclassified
+cylinder into a boss is how a recognised bore becomes a protrusion, which is worse than omitting
+it. Sphere and cone entries carry **no** `role` at all (there is no dome-vs-socket or
+countersink-vs-taper signal), so per §0 they must be surfaced to the user rather than applied.
 
 ## 12.3 Scale — `reveng_set_scale` now computes
 
@@ -554,9 +576,104 @@ Consequences that are now contract, not accident:
   differing default is a pinned argument — the GUI pins `run_reconstruction=false`; the MCP tool
   keeps its historical `true` for agents.
 
-## 12.9 Stage-event coverage
+## 12.9 Stage-event coverage — now complete
 
-§4's `stage` enum declares `dense`, `splat` and `mesh`, but the wired stage map emitted only
-`capture|scale|sparse|fit|parametric|review|deliver` — the dense/splat/mesh work happened
-silently inside the `sparse` node. Clients rendering a sub-step track MUST tolerate a stage
-listed in §4 never being emitted, and MUST NOT infer failure from its absence.
+§4's `stage` enum declared `dense`, `splat` and `mesh`, but the wired stage map emitted only
+`capture|scale|sparse|fit|parametric|review|deliver` — all of the dense/splat/mesh work happened
+silently inside one `sparse`-stage node. The scan template's reconstruction node has since been
+split (§12.10), and all three stages are now genuinely emitted.
+
+Two rules consumers may rely on:
+
+- **`stage` carries a BARE enum token.** Prose belongs in `msg`. A GUI sub-step track that
+  substring-matches the stage field would otherwise bind the wrong step.
+- **A node spanning several stages opens on the first and closes on the last**, so the observed
+  sequence is monotone and never rewinds: `capture, sparse, scale, dense, mesh, fit, parametric,
+  review, deliver`.
+
+## 12.10 Scan mission — reconstruction split, and the ordering deadlock it fixes
+
+`services/dag/templates/reveng_scan.json` ran `n_capture -> n_scale_gate -> n_reconstruct`. Once
+`reveng_set_scale` began really solving (§12.3), that order became a **deadlock**: `aruco_mat` and
+`two_point` both need a registered sparse model, which only `n_reconstruct` produces — downstream
+of the gate that required it. The primary ArUco path could never be satisfied where it was asked.
+
+`n_reconstruct` is split into `n_sparse` (SfM, plus the feed-forward fallback below 60%
+registration) and `n_dense` (OpenMVS / Brush + mesh cleanup), with the gate between them:
+
+```
+n_capture -> n_sparse -> n_scale_gate -> n_dense -> n_fit -> n_parametric
+          -> n_dim_gate -> n_verify_deviation <-> n_iterate -> n_deliver
+n_sparse -> n_capture   (retry_budget 1 — too few views registered: go shoot more)
+```
+
+This is also the correct photogrammetry order: scale is solved from the sparse model and confirmed
+by a human BEFORE the expensive dense pass, and `n_dense` then applies the confirmed
+`mm_per_unit` so the delivered mesh is genuinely in millimetres.
+
+- The ArUco solve runs at the TAIL of `n_sparse`, not inside the gate node: gates run their
+  approval BEFORE the node body, so solving inside the gate would ask the human to approve a
+  blank. It never overwrites an existing scale, and a solve failure is reported, not fatal.
+- With no scale solved, the gate records `confirmed: false` and the mission continues UNSCALED
+  (`artifacts.mesh_units: "reconstruction"`). It never confirms a number that does not exist.
+- `n_reconstruct` is retained as an alias that composes both halves, so existing callers keep
+  working.
+
+## 12.11 `session.run` — async missions
+
+§0 promised long jobs return `run_id` immediately; `reveng_reconstruct` did not — it invoked the
+executor inline and returned only once the mission finished or hit its first gate. That is now
+true rather than aspirational.
+
+`reveng_reconstruct` returns `{ok, run_id, status: "running", async: true, session_id, template,
+strategy}` immediately and runs the mission on a background thread. The `run_id`'s EventJournal is
+created before the thread is spawned, so the advertised `run_id` always addresses a real journal.
+`reveng_build_parametric`'s no-mesh fallback is async on the same terms.
+
+New optional session key — the documented progress source of truth:
+
+```json
+"run": {
+  "run_id": "…", "template": "reveng_scan",
+  "status": "running" | "paused" | "done" | "failed" | "rejected",
+  "gate": {"node_id", "node_name", "gate_kind", "autonomy", "prompt", "proposal"} | null,
+  "started_at": "…", "updated_at": "…", "error": "…"
+}
+```
+
+Stage names in §2 are unchanged: `n_sparse` sets `stages.reconstruct = "running"`, `n_dense` sets
+it `"done"`, `n_scale_gate` sets `stages.scale = "done"`.
+
+New refusal: **`mission_already_running`** — a second mission on a session that already has one in
+flight is refused with the live `run_id`.
+
+## 12.12 Gate tools — additions to §8.2
+
+Approve-gates paused the mission and **nothing in the product could resume them**, so a
+GUI-initiated reconstruction stopped after capture forever.
+
+#### `reveng_gate_status(session_id) → {ok, run_id, session_id, template, status, started_at, updated_at, live, gate}`
+
+`gate` is `{node_id, node_name, gate_kind, autonomy, prompt, proposal, pending}`. `pending` is
+gate-kind specific:
+- `scale_confirm`: `{mm_per_unit, residual_pct, method, confirmed, detail, mesh_units_if_approved, hint}`
+- `dimension_confirm`: `{dims, n_outstanding, scale_confirmed, hint}` — the outstanding fit-critical rows
+
+#### `reveng_resolve_gate(session_id, decision) → {ok, …}`
+
+`decision` is REQUIRED and must be exactly `"approve"` or `"reject"`; anything else is an honest
+invalid-decision envelope. **There is deliberately no default** — a scale gate defaulting to
+approve would destroy the only guarantee this pipeline makes about its millimetres. `approve`
+resumes in the background; `reject` leaves the checkpoint suspended (stopped but resumable).
+
+## 12.13 Verify-node predicates
+
+`services/dag/verify.py` `eval()`s a verify node's `end_condition` as a Python predicate.
+`n_verify_deviation` carried the prose *"Deviation within tolerance or user accepts fallback mesh
+body."*, which raised `SyntaxError` -> `predicate_error` -> ESCALATE on **every** run, so the scan
+mission could never pass verification even on a perfect scan. It now carries a real predicate
+(`result.get('max_mm', 9e9) <= result.get('tol_mm', 0.5)`) with the human sentence preserved as
+`inputs.intent`.
+
+> Repo-wide: every other DAG template still has prose in a verify node's `end_condition` and is
+> escalating the same way. Out of scope here — tracked separately.

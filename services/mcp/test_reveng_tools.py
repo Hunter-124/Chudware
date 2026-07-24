@@ -53,8 +53,14 @@ def _build_fake_mcp_modules() -> dict:
 # patcher so setUpClass/tearDownClass can install/remove without re-creating.
 _FAKE_MCP_MODULES: dict = _build_fake_mcp_modules()
 
-# core_bridge stub keys this module inserted (popped after the import window).
+# Stub keys this module inserted into sys.modules (popped after the import window).
+# Anything installed here MUST be tracked, or it leaks into every later test module in the
+# same process: the untracked `mcp_server.cad_tools` stub used to survive, and because it
+# only carries _dumps/_err any later `from .cad_tools import _CUR` failed with
+# "cannot import name '_CUR' (unknown location)" — which in turn made recon_tools
+# unimportable and the reveng worker bridge answer `reveng_unavailable`.
 _STUBBED_CORE_BRIDGE_KEYS: list = []
+_STUBBED_MODULE_KEYS: list = []
 
 
 def _install_stubs():
@@ -106,6 +112,7 @@ def _install_stubs():
         ct_mod._dumps = _dumps
         ct_mod._err = _err
         sys.modules["mcp_server.cad_tools"] = ct_mod
+        _STUBBED_MODULE_KEYS.append("mcp_server.cad_tools")
 
 
 _install_stubs()
@@ -178,6 +185,8 @@ with (
 for _key in list(_FAKE_MCP_MODULES):
     sys.modules.pop(_key, None)
 for _key in _STUBBED_CORE_BRIDGE_KEYS:
+    sys.modules.pop(_key, None)
+for _key in _STUBBED_MODULE_KEYS:
     sys.modules.pop(_key, None)
 
 
@@ -600,9 +609,17 @@ class TestRevengLongJobStubs(_FakeMCPTestBase):
         shutil.rmtree(self.tmp, ignore_errors=True)
         os.environ.pop("CHUDWARE_REVENG_DIR", None)
 
+    # This class models an UNPROVISIONED environment, but the assertion has to survive a dev
+    # box that actually has the vision stack installed. `reveng_fit_primitives` is handed an
+    # empty PLY here: with no backend the honest answer is backend_not_provisioned, and with
+    # trimesh/open3d present it is mesh_unreadable. Both are correct refusals of the same
+    # input — pinning only the first made the test pass or fail on whether numpy happened to
+    # be importable. What actually matters is that it refuses honestly and says why.
+    _HONEST_REFUSALS = {"backend_not_provisioned", "mesh_unreadable"}
+
     def _assert_not_provisioned(self, result: dict):
         self.assertFalse(result["ok"])
-        self.assertEqual(result["reason"], "backend_not_provisioned")
+        self.assertIn(result["reason"], self._HONEST_REFUSALS)
         self.assertIn("hint", result)
 
     def test_reveng_reconstruct_stub(self):

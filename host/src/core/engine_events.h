@@ -27,18 +27,21 @@ namespace core {
 // poll of the daemon socket).
 void engineEventsTick(AppState& st);
 
-// Follow a reveng reconstruction's live progress (contracts/reveng.md §4).
+// Follow a reveng mission's live progress (contracts/reveng.md §4).
 //
-// ui::reveng::kickReconstruct() calls this the moment it fires reveng_reconstruct. Until the
-// launch RPC lands, engineEventsTick() tails the mission's EventJournal (events.jsonl) and
-// translates each aicad.reveng_events/1 record into ui::reveng::feedRevEngEvent(), so the
-// Reconstruct stage's progress bar / sub-step track / elapsed clock advance DURING the run
-// instead of only when the coarse stage-badge poll next fires. See engine_events.cpp for why
-// the journal — and not the agent.event push or WorkerClient::EventFn streaming — is the only
-// channel that can carry these events today.
+// ui::reveng::kickReconstruct() calls this with the run_id reveng_reconstruct hands back
+// (~200 ms, status "running", mission on a worker thread). engineEventsTick() then tails that
+// run's EventJournal — <data>/Chudware/cache/runs/<run_id>/events.jsonl — and translates each
+// aicad.reveng_events/1 record into ui::reveng::feedRevEngEvent(), so the Reconstruct stage's
+// progress bar / sub-step track / elapsed clock advance DURING the run instead of only when the
+// coarse stage-badge poll next fires. See engine_events.cpp for why the journal beats both push
+// channels and a status poll.
 //
-// An empty sessionId stops the tail. Cheap when idle (one empty-string test per frame).
-void watchRevEngReconstruct(const std::string& sessionId);
+// The tail ends itself on the journal's terminal record (dag.run.done other than "paused"); it
+// deliberately stays armed across a gate pause, because reveng_resolve_gate resumes the same
+// run_id onto the same journal. An empty runId stops it. Cheap when idle (one empty-string test
+// per frame).
+void watchRevEngReconstruct(const std::string& runId);
 
 // Reveal read-only mirror tabs for docs the GUI itself just caused the daemon to
 // open (recovery_open). The daemon's doc.opened fanout deliberately EXCLUDES the

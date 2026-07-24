@@ -728,45 +728,223 @@ def _calibrate_face_frame(doc_id: str, face_query: dict, origin) -> Optional[dic
 # A hinted primitive is only worth trying when the deterministic passes did NOT already
 # recover the geometry it describes. Cylinder fits are the useful case: a large convex
 # boss (r > pass-5's fillet bound, not a bore so not a hole) falls through every frozen
-# pass and lands in `unclaimed` — exactly the gap a RANSAC cylinder fit fills.
+# pass and lands in `unclaimed`, and a scanned bore the passes never saw is a real hole —
+# exactly the gaps a RANSAC cylinder fit fills.
+#
+# ---- WHY `confidence` IS NOT THE QUALITY GATE -----------------------------------------
+# `services/vision/segment_fit.py` computes `confidence = inliers / total_points`: the
+# share of the MESH a fit owns, NOT how well its inliers match the primitive. On a real
+# multi-feature scan one cylinder owns roughly 3-31% of the cloud, so ANY quality
+# threshold compared against `confidence` silently discards every genuine fit and passes
+# only synthetic single-primitive fixtures (~0.9). A 4 mm bore in a 200 mm bracket is an
+# excellent fit with a tiny mesh share — mesh share must never decide acceptance.
+#
+# contracts/reveng.md §3's example shows `confidence: 0.92` for a lone cylinder, which
+# reads as a fit-quality score; the contract wording and the producer therefore disagree.
+# Until the contract redefines the field, treat `confidence` here as a mesh-share ratio
+# and NEVER compare it to a quality threshold.
+#
+# The gate instead uses the two signals that do measure quality, both emitted per entry
+# from `fits_revision: 2` onwards (contracts/reveng.md §12.2 / segment_fit `_emit_*`):
+#   `residual_mm` — RMS deviation of the inliers from the fitted primitive, in mm
+#   `inliers`     — absolute count of points supporting the fit
+
+_HINT_MAX_RESIDUAL_MM = 0.6
+"""Absolute residual ceiling (mm). segment_fit's RANSAC inlier band defaults to 0.3 mm, so
+a well-conditioned patch sits well inside it; 2x that is the slop a hand-held scan can
+carry and still yield a printable feature. Above it the primitive is not that surface."""
+
+_HINT_MAX_RESIDUAL_FRAC = 0.05
+"""Residual ceiling relative to the feature's own radius — the scale-free companion to the
+absolute cap. 0.5 mm of wobble is nothing on a 60 mm boss and fatal on a 4 mm bore."""
+
+_HINT_MIN_INLIERS = 24
+"""Absolute support floor. A cylinder has 5 DOF; two dozen points over-determine it many
+times over. Fewer is noise that happened to satisfy RANSAC, not a recognised feature."""
+
 _HINT_MIN_CONFIDENCE = 0.5
+"""LEGACY-ONLY confidence gate. A `fits_revision: 1` doc (or a hand-authored hints dict)
+carries no `residual_mm`/`inliers` at all, and under v1 semantics `confidence` WAS the
+quality score — so for those docs, and only those, it stays the gate. It is never applied
+to an entry that ships a real quality signal."""
+
+_HINT_THROUGH_OVERSHOOT_MM = 0.5
+_HINT_THROUGH_OVERSHOOT_FRAC = 0.05
+"""Per-end overshoot for a THROUGH bore (max of the two). A through cut must actually
+penetrate: OCCT booleans on coincident faces are the classic "cut removed no material"
+failure, and the fitted patch stops a threshold short of the wall by construction (the
+plane peel claims the bore points nearest the end faces first). Material outside the body
+is not removed, so overshooting a through bore cannot over-cut. A BLIND bore gets no
+overshoot at all — there, extra length is extra depth, i.e. a wrong part."""
+
+_HINT_ADDITIVE_ROLES = ("boss", "shaft")
+_HINT_SUBTRACTIVE_ROLES = ("hole",)
 
 
-def _cylinder_boss_specs(hints: Optional[dict],
-                         claimed_cyl_axes: list) -> list:
-    """Pure-Python: turn an ``aicad.reveng_fits/1`` doc (contracts/reveng.md §3) into a
-    list of candidate cylinder-BOSS specs, dropping fits the deterministic passes already
+def _hint_skip(fit: dict, code: str, reason: str) -> dict:
+    """One entry for the `skipped` report: a fit that was RECOGNISED but not authored."""
+    p = fit.get("params_mm")
+    p = p if isinstance(p, dict) else {}
+    out = {"fit_kind": fit.get("kind"), "code": code, "reason": reason}
+    role = fit.get("role")
+    if isinstance(role, str) and role:
+        out["role"] = role
+    for key in ("radius", "height"):
+        v = p.get(key)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            out[key] = round(float(v), 6)
+    return out
+
+
+def _num(rec: dict, key: str) -> Optional[float]:
+    """`rec[key]` as a float when it is a real number (bools are not numbers here)."""
+    v = rec.get(key)
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    return float(v)
+
+
+def _hint_quality(fit: dict, radius: float) -> tuple:
+    """Is this fit good enough to author geometry from? Returns ``(ok, reason)``.
+
+    Gates on FIT QUALITY (`residual_mm`, `inliers`), never on `confidence` — see the block
+    comment above for why the latter is a mesh-share ratio. An entry carrying neither
+    quality signal is a `fits_revision: 1` / hand-written doc, where `confidence` was the
+    documented quality score, so that (and only that) falls back to `_HINT_MIN_CONFIDENCE`.
+    """
+    graded = False
+    residual = _num(fit, "residual_mm")
+    if residual is not None:
+        graded = True
+        if residual > _HINT_MAX_RESIDUAL_MM:
+            return False, (f"fit residual {residual:.3f} mm exceeds the "
+                           f"{_HINT_MAX_RESIDUAL_MM} mm quality tolerance")
+        if radius > 0.0 and residual > _HINT_MAX_RESIDUAL_FRAC * radius:
+            return False, (f"fit residual {residual:.3f} mm is more than "
+                           f"{_HINT_MAX_RESIDUAL_FRAC:.0%} of the {radius:.3f} mm radius")
+    inliers = _num(fit, "inliers")
+    if inliers is not None:
+        graded = True
+        if inliers < _HINT_MIN_INLIERS:
+            return False, (f"only {int(inliers)} point(s) support the fit — "
+                           f"{_HINT_MIN_INLIERS} are needed to trust it")
+    if graded:
+        return True, ""
+    conf = _num(fit, "confidence") or 0.0
+    if conf < _HINT_MIN_CONFIDENCE:
+        return False, (f"legacy fit carries no residual_mm/inliers and its confidence "
+                       f"{conf:.2f} is below {_HINT_MIN_CONFIDENCE}")
+    return True, ""
+
+
+def _fit_hint_specs(hints: Optional[dict], claimed_cyl_axes: list) -> tuple:
+    """Pure-Python: turn an ``aicad.reveng_fits/1`` doc (contracts/reveng.md §3, additions
+    in §12.2) into authorable feature specs, dropping fits the deterministic passes already
     explain. Engine-free and side-effect-free so it is unit-testable without libchudware.
 
-    hints             : the fits doc, or None (returns []).
+    hints             : the fits doc, or None (returns ``([], [])``).
     claimed_cyl_axes  : (axis_unit, origin) pairs the passes already own (base/holes) —
                         a fit coaxial+coincident with one of these is a duplicate, skipped.
 
-    Returns [{radius, height, axis, origin, confidence, face_ids}] — additive candidates,
-    NOT yet verified. reverse_engineer routes each through apply_batch (keep-or-revert), so
-    a bad hint can only revert, never regress the match. hints=None -> [] -> no behavior
-    change (this is what keeps the frozen recognizer and every existing test untouched)."""
-    if not hints:
-        return []
-    fits = hints.get("fits") if isinstance(hints, dict) else None
-    if not isinstance(fits, list):
-        return []
+    Returns ``(specs, skipped)``.
+
+    ``specs`` are candidate features, NOT yet verified — reverse_engineer routes each
+    through apply_batch (checkpoint -> eval_compare -> keep/revert), so a bad hint can only
+    revert, never regress the match. Each spec is::
+
+        {kind: "cylinder", mode: "boss" | "cut", role, radius, height, axis, start,
+         origin, through, depth_mm, fit_height_mm, confidence, residual_mm, inliers,
+         face_ids}
+
+    ``mode`` is the point of the role routing. A fit classified ``role: "hole"`` is a BORE
+    and is emitted subtractive. Emitting it additively (what this helper did before
+    ``fits_revision: 2`` existed) INVERTS the geometry — a recess becomes a protrusion,
+    which prints as an unusable part. ``boss``/``shaft`` stay additive; ``unknown`` is
+    excluded and reported, never guessed into a bucket (contracts/reveng.md §0).
+
+    ``height`` is the length of the primitive to author and is NOT always the fitted patch
+    extent: a through bore is grown past both wall faces so the cut actually penetrates,
+    and a blind bore runs exactly ``depth_mm``. The raw patch extent stays on
+    ``fit_height_mm``. ``start`` is the axial START of the authored feature — ``params_mm
+    .base`` (the low-t end of the patch) when the producer supplies it, else the v1
+    ``origin``; ``origin`` is passed through unchanged and is NOT the same point.
+
+    ``skipped`` is every fit recognised but deliberately NOT authored, as
+    ``{fit_kind, code, reason, role?, radius?, height?}``, so the caller can report it
+    rather than let the user believe it was applied. Codes: ``already_recovered``,
+    ``degenerate``, ``low_quality``, ``role_unknown``, ``kind_unsupported``.
+
+    Deliberately not hints at all: ``plane`` and ``box`` fits. Those are the deterministic
+    prismatic / turned-base passes' own domain, and hinting them would double-build the
+    body. hints=None -> ``([], [])`` -> no behaviour change.
+    """
     specs: list = []
+    skipped: list = []
+    if not isinstance(hints, dict) or not hints:
+        return specs, skipped
+    fits = hints.get("fits")
+    if not isinstance(fits, list):
+        return specs, skipped
+    revision = _num(hints, "fits_revision") or 1.0
+
     for fit in fits:
-        if not isinstance(fit, dict) or fit.get("kind") != "cylinder":
+        if not isinstance(fit, dict):
             continue
-        if float(fit.get("confidence") or 0.0) < _HINT_MIN_CONFIDENCE:
+        kind = fit.get("kind")
+        if kind == "sphere":
+            # A real `sphere` primitive exists in the engine, but a sphere fit carries no
+            # `role` (contracts/reveng.md §12.2): a scanned ball-end and a spherical socket
+            # produce the SAME fit, and choosing between them is exactly the silent guess
+            # §0 forbids. Reported, not applied, not funnelled into the cylinder path.
+            skipped.append(_hint_skip(fit, "kind_unsupported",
+                                      "sphere fits carry no role — a dome and a spherical "
+                                      "socket are indistinguishable here, so it is not "
+                                      "applied; author it by hand"))
             continue
-        p = fit.get("params_mm") or {}
-        r = float(p.get("radius") or 0.0)
-        h = float(p.get("height") or 0.0)
+        if kind == "cone":
+            skipped.append(_hint_skip(fit, "kind_unsupported",
+                                      "cone fits carry no role — a countersink/chamfer "
+                                      "(subtractive) and a taper (additive) are "
+                                      "indistinguishable here, so it is not applied; "
+                                      "author it by hand"))
+            continue
+        if kind != "cylinder":
+            continue
+
+        p = fit.get("params_mm")
+        p = p if isinstance(p, dict) else {}
+        r = _num(p, "radius") or 0.0
+        h = _num(p, "height") or 0.0
         ax = _f3(p, "axis")
         origin = _f3(p, "origin")
         if r <= 0.0 or h <= 0.0 or ax is None or origin is None:
+            skipped.append(_hint_skip(fit, "degenerate",
+                                      "radius/height/axis/origin missing or non-positive"))
             continue
         a = _unit(ax)
         if _norm(a) < 0.5:
+            skipped.append(_hint_skip(fit, "degenerate", "fit axis is not a direction"))
             continue
+
+        ok, why = _hint_quality(fit, r)
+        if not ok:
+            skipped.append(_hint_skip(fit, "low_quality", why))
+            continue
+
+        role = fit.get("role")
+        if not isinstance(role, str) or not role:
+            # A revision-1 producer never CLASSIFIED anything, and v1's only hint semantics
+            # were "a cylinder the passes missed is a boss candidate" — honour that so a
+            # legacy doc behaves exactly as before. From revision 2 on, a missing role is
+            # the producer declining to classify, i.e. `unknown`, which is never guessed.
+            role = "boss" if revision < 2.0 else "unknown"
+        if role not in _HINT_ADDITIVE_ROLES and role not in _HINT_SUBTRACTIVE_ROLES:
+            skipped.append(_hint_skip(fit, "role_unknown",
+                                      f"role {role!r}: the fitter could not tell a bore "
+                                      "from a protrusion, and guessing would invert the "
+                                      "geometry — not applied (contracts/reveng.md §0)"))
+            continue
+
         # skip a fit the passes already recovered: coaxial (parallel axes) AND the fit's
         # origin sits on that axis line (perpendicular offset ~0).
         dup = False
@@ -778,11 +956,39 @@ def _cylinder_boss_specs(hints: Optional[dict],
                 dup = True
                 break
         if dup:
+            skipped.append(_hint_skip(fit, "already_recovered",
+                                      "coaxial with a feature the deterministic passes "
+                                      "already rebuilt"))
             continue
-        specs.append({"radius": r, "height": h, "axis": a, "origin": list(origin),
-                      "confidence": float(fit.get("confidence") or 0.0),
+
+        # `base` is the axial start of the patch; `origin` is only an axis point, so it is
+        # the wrong anchor whenever the producer gives us `base`.
+        start = _f3(p, "base") or origin
+        through = bool(fit.get("through"))
+        depth = _num(fit, "depth_mm")
+        depth = depth if depth is not None and depth > 0.0 else h
+        if role in _HINT_SUBTRACTIVE_ROLES:
+            mode = "cut"
+            if through:
+                over = max(_HINT_THROUGH_OVERSHOOT_MM,
+                           _HINT_THROUGH_OVERSHOOT_FRAC * depth)
+                start = _sub(start, _scale(a, over))
+                length = depth + 2.0 * over
+            else:
+                length = depth
+        else:
+            mode = "boss"
+            length = h
+
+        specs.append({"kind": "cylinder", "mode": mode, "role": role,
+                      "radius": r, "height": length, "axis": a,
+                      "start": list(start), "origin": list(origin),
+                      "through": through, "depth_mm": depth, "fit_height_mm": h,
+                      "confidence": _num(fit, "confidence") or 0.0,
+                      "residual_mm": _num(fit, "residual_mm"),
+                      "inliers": _num(fit, "inliers"),
                       "face_ids": fit.get("face_ids") or []})
-    return specs
+    return specs, skipped
 
 
 # ---------------------------------------------------------------- registration
@@ -799,13 +1005,19 @@ def register_recon_tools(mcp: FastMCP) -> None:
         source : a file path (imported first; meshes are sewn to a solid) OR the doc_id of an
                  already-open document (e.g. from import_part).
         name   : optional name for the NEW rebuilt part (default "<source>-rebuilt").
-        hints  : OPTIONAL ``aicad.reveng_fits/1`` doc (contracts/reveng.md §3) from
+        hints  : OPTIONAL ``aicad.reveng_fits/1`` doc (contracts/reveng.md §3, §12.2) from
                  reveng_fit_primitives — RANSAC/segmentation primitive fits. When present,
-                 cylinder fits the deterministic passes could NOT recover (a convex boss that
-                 fell through into `recognition.unclaimed`) are tried as ADDITIVE boss batches
-                 AFTER the deterministic rebuild, each verified by the same eval_compare
-                 keep-or-revert gate — so a hint can only improve or be reverted, never
-                 regress the match. Omitting hints leaves the pipeline byte-for-byte unchanged.
+                 cylinder fits the deterministic passes could NOT recover are authored AFTER
+                 the deterministic rebuild, ROUTED BY the fit's `role`: `boss`/`shaft` become
+                 additive bosses, `hole` becomes a subtractive bore (with `through`/
+                 `depth_mm` deciding its extent), and `unknown` is reported, never guessed
+                 into either — see `candidates[kind="fit_hint_skipped"]`. Sphere and cone
+                 fits carry no role and are likewise reported, not applied. Each authored
+                 hint is verified by the same eval_compare keep-or-revert gate, so a hint can
+                 only improve or be reverted, never regress the match. Fits are accepted on
+                 FIT QUALITY (`residual_mm`, `inliers`), not on `confidence` — segment_fit
+                 computes that as a mesh-share ratio. Omitting hints leaves the pipeline
+                 byte-for-byte unchanged.
 
         Pipeline: import -> deterministic recognition (prismatic/turned base, holes, patterns,
         fillet/chamfer candidates) -> rebuild in batches (base -> holes -> patterns -> dress-
@@ -1177,13 +1389,22 @@ def register_recon_tools(mcp: FastMCP) -> None:
                                            "note": "applied but the match regressed — "
                                                    "reverted (see rejected)"})
 
-            # ---------------- batch 5 (RE-14): fitted-primitive HINTS — additive only.
-            # Cylinder fits the frozen passes could not recover (convex bosses that fell into
-            # `unclaimed`) are tried as boss extrudes AFTER the deterministic rebuild. Each
-            # goes through apply_batch (checkpoint -> eval_compare -> keep/revert), so this can
+            # ---------------- batch 5 (RE-14): fitted-primitive HINTS.
+            # Cylinder fits the frozen passes could not recover are authored AFTER the
+            # deterministic rebuild, ROUTED BY ROLE: a `boss`/`shaft` fit is an additive
+            # boss, a `hole` fit is a subtractive bore (authoring a bore additively would
+            # invert real geometry), and `unknown` is reported, never guessed. Each goes
+            # through apply_batch (checkpoint -> eval_compare -> keep/revert), so this can
             # only raise or leave match_pct — never lower it. hints=None -> no specs -> no-op.
             claimed_cyl_axes: list = []
-            for hl in plan["holes"]:
+            for hi, hl in enumerate(plan["holes"]):
+                # Only a hole the pass actually DRILLED claims its axis (`hole_ids` is
+                # populated on apply). A hole that was merely recognised and then failed to
+                # build — the "entry face not found on the rebuilt body" candidate — leaves
+                # that geometry unrecovered, so a fit hint on its axis is filling a real gap,
+                # not double-building; treating it as claimed silently swallowed the hint.
+                if hi not in hole_ids:
+                    continue
                 a_h, o_h = _f3(hl, "axis"), _f3(hl, "center")
                 if a_h is not None and o_h is not None:
                     claimed_cyl_axes.append((a_h, o_h))
@@ -1192,43 +1413,78 @@ def register_recon_tools(mcp: FastMCP) -> None:
                 w = _AXES.get(base.get("axis"))
                 if w is not None:
                     claimed_cyl_axes.append((list(w), [0.0, 0.0, 0.0]))
-            hint_specs = _cylinder_boss_specs(hints, claimed_cyl_axes)
+            hint_specs, hint_skipped = _fit_hint_specs(hints, claimed_cyl_axes)
+            # Bosses before bores: add material, then remove it — the order a human authors
+            # the tree, and the only order in which a bore through a hinted boss can cut.
+            hint_specs.sort(key=lambda s: 0 if s["mode"] == "boss" else 1)
             if hint_specs:
+                n_cut = sum(1 for s in hint_specs if s["mode"] == "cut")
                 notes.append(f"{len(hint_specs)} fitted cylinder hint(s) not already "
-                             "recovered — trying as additive boss batches")
+                             f"recovered — trying {len(hint_specs) - n_cut} additive boss "
+                             f"and {n_cut} subtractive bore batch(es)")
+            n_dup = 0
+            for sk in hint_skipped:
+                if sk.get("code") == "already_recovered":
+                    n_dup += 1
+                    continue  # not a candidate: a deterministic pass already built it
+                candidates.append({"kind": "fit_hint_skipped", **sk,
+                                   "note": "recognised in the fit hints but NOT applied — "
+                                           + sk["reason"]})
+            if n_dup:
+                notes.append(f"{n_dup} fitted cylinder hint(s) already recovered by the "
+                             "deterministic passes — not re-applied")
             for si, spec in enumerate(hint_specs):
                 letter = _principal_axis(spec["axis"])
                 # The `cylinder` primitive is Z-aligned and centered, placed by an absolute
-                # `at:[x,y,z]` (core/doc/document.cpp) — so only a Z-axis fit is authorable as
-                # a boss primitive today. Non-Z fits are surfaced as candidates, not applied.
+                # `at:[x,y,z]` (core/doc/document.cpp) — so only a Z-axis fit is authorable
+                # today. Non-Z fits are surfaced as candidates, not applied.
                 if letter != "z":
-                    candidates.append({"kind": "cylinder_hint", "radius": spec["radius"],
+                    candidates.append({"kind": "cylinder_hint", "mode": spec["mode"],
+                                       "role": spec["role"], "radius": spec["radius"],
                                        "height": spec["height"], "axis": spec["axis"],
-                                       "note": "fit axis is not +Z — the boss primitive is "
-                                               "Z-aligned; author this cylinder by hand"})
+                                       "note": "fit axis is not +Z — the cylinder primitive "
+                                               "is Z-aligned; author this feature by hand"})
+                    continue
+                if spec["mode"] == "cut" and not applied:
+                    # `cut` needs a running body (document.cpp: "cut mode requires an
+                    # existing body"). Nothing was rebuilt, so report the bore instead of
+                    # provoking a confusing rejected-batch error.
+                    candidates.append({"kind": "cylinder_hint", "mode": "cut",
+                                       "role": spec["role"], "radius": spec["radius"],
+                                       "height": spec["height"], "axis": spec["axis"],
+                                       "note": "a bore was recognised but nothing was "
+                                               "rebuilt to bore into — author it by hand"})
                     continue
                 w = _AXES[letter]
-                o = spec["origin"]
-                # Centered cylinder: `at` is the mid-point = fit origin + axis*(height/2).
+                o = spec["start"]
+                # Centered cylinder: `at` is the mid-point = the feature's axial START
+                # (params_mm.base when the fitter supplied it) + axis*(height/2).
                 mid = [o[i] + w[i] * spec["height"] / 2.0 for i in range(3)]
+                nm = f"HintBore{si + 1}" if spec["mode"] == "cut" else f"HintBoss{si + 1}"
                 ops = [{"op": "add_feature", "feature": {
-                    "type": "cylinder", "name": f"HintBoss{si + 1}",
+                    "type": "cylinder", "name": nm,
                     "params": {"radius": _dim(spec["radius"]),
-                               "height": _dim(spec["height"]), "mode": "boss",
+                               "height": _dim(spec["height"]), "mode": spec["mode"],
                                "at": [round(x, 6) for x in mid]}}}]
-                r = apply_batch(f"hint boss r{spec['radius']:g}", ops)
+                r = apply_batch(f"hint {spec['mode']} r{spec['radius']:g}", ops)
                 if r:
                     applied.append({"id": (r.get("id_map") or {}).get("$0"),
-                                    "type": "cylinder", "name": f"HintBoss{si + 1}",
-                                    "role": "hint", "radius_mm": spec["radius"],
+                                    "type": "cylinder", "name": nm,
+                                    "role": "hint", "hint_role": spec["role"],
+                                    "mode": spec["mode"], "radius_mm": spec["radius"],
                                     "height_mm": spec["height"],
-                                    "confidence": spec["confidence"]})
+                                    "through": spec["through"],
+                                    "depth_mm": spec["depth_mm"],
+                                    "confidence": spec["confidence"],
+                                    "residual_mm": spec["residual_mm"]})
                 else:
-                    candidates.append({"kind": "cylinder_hint", "radius": spec["radius"],
+                    candidates.append({"kind": "cylinder_hint", "mode": spec["mode"],
+                                       "role": spec["role"], "radius": spec["radius"],
                                        "height": spec["height"], "axis": spec["axis"],
                                        "confidence": spec["confidence"],
-                                       "note": "hint boss did not build or regressed the "
-                                               "match — reverted (see rejected)"})
+                                       "note": f"hint {spec['mode']} did not build or "
+                                               "regressed the match — reverted "
+                                               "(see rejected)"})
 
             # ---------------- final verification + report
             if applied:

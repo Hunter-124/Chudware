@@ -21,12 +21,28 @@
       "autonomy": "auto"
     },
     {
+      "id": "n_sparse",
+      "type": "plan",
+      "name": "Sparse reconstruction (SfM)",
+      "inputs": {
+        "request": "Run sparse SfM (pycolmap/GLOMAP, feed-forward fallback on weak registration), then attempt the ArUco-mat scale solve against the new sparse model.",
+        "session_id": "$inputs.session_id",
+        "tools": ["reveng_reconstruct", "reveng_set_scale", "reveng_status", "mission_status"]
+      },
+      "tools": ["reveng_reconstruct", "reveng_set_scale", "reveng_status", "mission_status"],
+      "end_condition": "A registered COLMAP sparse model exists in the session dir.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
       "id": "n_scale_gate",
       "type": "gate",
       "name": "Confirm scale",
       "inputs": {
         "gate_kind": "scale_confirm",
-        "request": "Confirm ArUco mat or two-point scale before reconstruction.",
+        "request": "Confirm the mm_per_unit solved against the sparse model (ArUco mat or two-point) before the dense/mesh pass consumes it.",
+        "session_id": "$inputs.session_id",
         "tools": ["reveng_set_scale", "reveng_print_scale_mat", "measure_from_photo"]
       },
       "tools": ["reveng_set_scale", "reveng_print_scale_mat", "measure_from_photo"],
@@ -36,16 +52,16 @@
       "autonomy": "approve"
     },
     {
-      "id": "n_reconstruct",
+      "id": "n_dense",
       "type": "plan",
-      "name": "Sparse + dense + splat reconstruction",
+      "name": "Dense + splat + mesh cleanup",
       "inputs": {
-        "request": "Run sparse (pycolmap/GLOMAP, ffwd fallback), dense mesh, optional splat.",
+        "request": "Run dense MVS (OpenMVS) and/or Brush splat from the sparse model, then clean the mesh applying the confirmed mm_per_unit.",
         "session_id": "$inputs.session_id",
         "tools": ["reveng_reconstruct", "reveng_status", "mission_status"]
       },
       "tools": ["reveng_reconstruct", "reveng_status", "mission_status"],
-      "end_condition": "Scaled mesh artifact available in session dir.",
+      "end_condition": "Cleaned mesh artifact available in session dir with an honest mesh_units tag.",
       "verify": null,
       "on_fail": "pause",
       "autonomy": "auto"
@@ -88,6 +104,7 @@
       "name": "Confirm fit-critical dimensions",
       "inputs": {
         "gate_kind": "dimension_confirm",
+        "session_id": "$inputs.session_id",
         "tools": ["confirm_dimensions", "intake_status", "fit_report"]
       },
       "tools": ["confirm_dimensions", "intake_status", "fit_report"],
@@ -102,10 +119,11 @@
       "name": "Mesh vs B-rep deviation check",
       "inputs": {
         "check_type": "reveng_deviation",
-        "session_id": "$inputs.session_id"
+        "session_id": "$inputs.session_id",
+        "intent": "Deviation within tolerance, or the user accepts the fallback mesh body at the deliver gate."
       },
       "tools": ["get_reveng_deviation", "compare_parts"],
-      "end_condition": "Deviation within tolerance or user accepts fallback mesh body.",
+      "end_condition": "result.get('max_mm', 9e9) <= result.get('tol_mm', 0.5)",
       "verify": null,
       "on_fail": "pause",
       "autonomy": "auto"
@@ -140,15 +158,16 @@
     }
   ],
   "edges": [
-    {"from": "n_capture",          "to": "n_scale_gate"},
-    {"from": "n_scale_gate",       "to": "n_reconstruct"},
-    {"from": "n_reconstruct",      "to": "n_fit"},
+    {"from": "n_capture",          "to": "n_sparse"},
+    {"from": "n_sparse",           "to": "n_scale_gate"},
+    {"from": "n_scale_gate",       "to": "n_dense"},
+    {"from": "n_dense",            "to": "n_fit"},
     {"from": "n_fit",              "to": "n_parametric"},
     {"from": "n_parametric",       "to": "n_dim_gate"},
     {"from": "n_dim_gate",         "to": "n_verify_deviation"},
     {"from": "n_verify_deviation", "to": "n_iterate",     "retry_budget": 2},
     {"from": "n_iterate",          "to": "n_verify_deviation"},
     {"from": "n_verify_deviation", "to": "n_deliver"},
-    {"from": "n_reconstruct",      "to": "n_capture",     "retry_budget": 1}
+    {"from": "n_sparse",           "to": "n_capture",     "retry_budget": 1}
   ]
 }

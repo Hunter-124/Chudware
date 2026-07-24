@@ -1269,7 +1269,7 @@ def register_reveng_session_tools(mcp: FastMCP) -> None:
         return str(p) if p.is_dir() else None
 
     def _scale_images_dir(session_id: str) -> str:
-        """``images/`` when it holds files, else ``frames/`` — mirrors the n_reconstruct node."""
+        """``images/`` when it holds files, else ``frames/`` — mirrors the n_sparse node."""
         root = _session_path(session_id)
         imgs = root / "images"
         if imgs.is_dir() and any(p.is_file() for p in imgs.iterdir()):

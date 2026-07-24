@@ -573,14 +573,14 @@ bool tryBootstrap(AppState& st, chudware_ipc::EngineClient& c) {
 // Reverse-Engineering reconstruction progress (contracts/reveng.md §4)
 // ---------------------------------------------------------------------------
 //
-// WHY A JOURNAL TAIL AND NOT ONE OF THE TWO STREAMING CHANNELS
+// WHY A JOURNAL TAIL AND NOT A PUSH CHANNEL OR A POLL
 //
 //   * The agent.event push above cannot carry these. hostd arms the streaming sink
 //     (core::cpp_core().setEventSink) only for agent_* / session_btw / session_handoff, and it
 //     is fed by the C++ core (core/hostd/server.cpp). A reveng mission runs inside the PYTHON
 //     worker — services/mcp/reveng_common.py::_launch_reveng_mission -> services/dag/executor
-//     .run() — and never touches that sink, so no reveng record ever reaches this client as an
-//     agent.event.
+//     .run() on a daemon thread — and never touches that sink, so no reveng record ever reaches
+//     this client as an agent.event.
 //
 //   * WorkerClient::EventFn streaming cannot carry them either, at three independent breaks:
 //     the transport adapter's handlers ignore their emit argument (services/reveng/
@@ -588,58 +588,52 @@ bool tryBootstrap(AppState& st, chudware_ipc::EngineClient& c) {
 //     {"id",…,"event":…} frame the worker writes (core/hostd/worker_bridge.cpp), and AsyncRpc —
 //     what the reveng GUI uses for every call — drops onEvent entirely (core/async_rpc.cpp).
 //
-//   * A mission_status(run_id) poll is impossible twice over. reveng_reconstruct is a BLOCKING
-//     tool (executor.run() invokes the graph inline and returns only once it finishes or hits
-//     its first approve gate), so its run_id does not exist until the work is already over; and
-//     services/worker_main.py is a single read-line/dispatch/write-response loop behind one
-//     mutex-serialized stdio channel, so any poll issued mid-run just queues behind the run it
-//     is trying to observe.
+//   * Polling is now *possible* (reveng_reconstruct returns in ~200 ms and the mission runs on
+//     its own thread) but it cannot draw this UI. The only pollable mirror is session.run, and
+//     _run_summary() puts exactly {run_id, template, status, gate, started_at, updated_at,
+//     error} on it — no stage, no pct — refreshed only at launch, at a gate pause, and at the
+//     end. That is the coarse badge the Reconstruct stage already had. A progress bar needs the
+//     per-stage records, and those exist only on the journal.
 //
-// What DOES work with zero backend change: EventJournal.emit() flushes AND fsyncs every record
-// before returning (services/dag/event_journal.py), so the run's events.jsonl is a live,
-// ordered, crash-consistent progress feed sitting on local disk while the mission executes.
-// Tailing it is plain bounded file I/O — it holds no worker/engine mutex and cannot park the GL
-// thread the way a sync RPC would.
+// The journal is push-quality without the push: EventJournal.emit() flushes AND fsyncs every
+// record before returning (services/dag/event_journal.py), so events.jsonl is a live, ordered,
+// crash-consistent feed on local disk carrying every stage the mission passes through —
+// including the intra-node dense/splat/mesh records make_reveng_stage_emitter writes, which no
+// RPC surface exposes at all. Tailing it is plain bounded file I/O: no worker round-trip per
+// frame, no engine mutex, and it cannot park the GL thread the way a sync RPC would.
+//
+// ADDRESSING: direct, by the run_id reveng_reconstruct returns. _launch_reveng_mission builds
+// the emitters and writes its first record ("capture", 0, "mission … queued") on the CALLING
+// thread before spawning, so <cache>/runs/<run_id>/events.jsonl provably exists the instant the
+// GUI holds the run_id. There is no discovery heuristic and no window to cover.
 
 namespace fs = std::filesystem;
 
 constexpr std::chrono::milliseconds kRevEngPollInterval{400};
-// Longest we keep hunting for the run's journal. A mission that has written nothing this far in
-// wrote nothing at all (blocked pre-flight, launch error) — stop scanning.
-constexpr std::chrono::seconds kRevEngAdoptWindow{180};
-// Filesystem-timestamp slack when deciding "this journal is newer than our kick". Wide enough
-// for coarse mtime granularity, far too narrow to adopt a previous run of the same session.
-constexpr std::chrono::seconds kRevEngJournalSlack{10};
+// The journal is written before the run_id is handed out, so a file that never appears means
+// the GUI and the worker disagree about the data dir (different XDG_DATA_HOME / APPDATA) — a
+// deployment fault, not a slow mission. Stop stat-ing rather than poll a path forever.
+constexpr std::chrono::seconds kRevEngJournalWaitWindow{30};
 // Never read more than this per tick. A bigger backlog means only the tail still matters.
 constexpr std::uintmax_t kRevEngMaxTailBytes = 1u << 20;
-// How long a watch that already saw its terminal record waits for the launch RPC to land before
-// giving up on the settling pass. reveng_reconstruct journals dag.run.done and only THEN
-// serialises its reply, so the reply is milliseconds behind; this only bounds a lost reply.
-constexpr std::chrono::seconds kRevEngSettleWindow{30};
 
 struct RevEngWatch {
-    std::string sessionId;        // "" = idle; the whole feature then costs one compare/frame
-    fs::path journal;             // adopted run's events.jsonl; empty until adopted
+    std::string runId;            // "" = idle; the whole feature then costs one compare/frame
+    fs::path journal;             // <cache>/runs/<run_id>/events.jsonl
+    bool opened = false;          // the journal has been read at least once
     std::uintmax_t consumed = 0;  // bytes of `journal` already parsed
     std::string carry;            // trailing partial line from the previous read
     std::string errMsg;           // most specific failure text seen so far (beats run status)
-    // Last event we fed. kickReconstruct's rpc callback seeds a placeholder ("queued", 2%) when
-    // the launch RPC lands, which is the right answer ONLY when the tail found nothing — with a
-    // journal in hand, its last word outranks the placeholder, so we can restore it.
+    // Last event we fed. The Reconstruct stage has other writers — the kick callback's initial
+    // seed, and the 3 s get_reveng_session badge poll, which flips recon.done/pct=100 as soon as
+    // session.stages.reconstruct reads "done" even though the mission is still running fit /
+    // parametric / review. While this watch is armed the journal outranks both, so a state that
+    // no longer matches what we fed is restored on the next tick.
     std::string lastKind;
     int lastPct = 0;
     std::string lastMsg;
-    // The last PROGRESS point specifically. feedRevEngEvent's error branch carries no pct, so
-    // restoring a failure over the placeholder needs the stage/pct the run actually died at
-    // replayed first — otherwise the bar reads the placeholder's 2% instead of (say) 35%/sparse.
-    int progressPct = 0;
-    std::string progressMsg;
-    bool hadProgress = false;
-    fs::file_time_type armedAt{};                     // for "is this journal newer than us?"
-    std::chrono::steady_clock::time_point armedMono{};
+    std::chrono::steady_clock::time_point armedAt{};
     std::chrono::steady_clock::time_point lastPoll{};
-    std::chrono::steady_clock::time_point terminalAt{};
-    bool terminal = false;
 };
 RevEngWatch revengWatch;
 
@@ -660,55 +654,11 @@ fs::path revengCacheRunsDir() {
     return {};
 }
 
-// Does this journal belong to OUR session? Only aicad.reveng_events/1 records carry a
-// session_id, and make_reveng_emit writes one for the mission's very first node, so the answer
-// is available within a record or two of the run starting. A quoted substring probe is enough:
-// the needle is our own session id, so a hit cannot be about anyone else's run.
-bool revengJournalNamesSession(const fs::path& p, const std::string& sessionId) {
-    std::FILE* f = std::fopen(p.string().c_str(), "rb");
-    if (!f) return false;
-    const std::string needle = "\"" + sessionId + "\"";
-    std::string text;
-    char chunk[8192];
-    size_t got = 0;
-    while (text.size() < (size_t)kRevEngMaxTailBytes &&
-           (got = std::fread(chunk, 1, sizeof(chunk), f)) > 0)
-        text.append(chunk, got);
-    std::fclose(f);
-    return text.find(needle) != std::string::npos;
-}
-
-// Find the newest events.jsonl that was written at/after our kick AND names our session.
-// reveng_reconstruct does not hand back its run_id until the mission has already finished, so
-// the live run must be DISCOVERED rather than addressed. Newest-wins keeps an immediate re-run
-// of a failed session on the right journal; the mtime floor keeps us off the older one.
-bool revengAdoptJournal(RevEngWatch& w) {
+// The run's journal, addressed directly.
+fs::path revengJournalPath(const std::string& runId) {
     const fs::path runs = revengCacheRunsDir();
-    if (runs.empty()) return false;
-    std::error_code ec;
-    fs::directory_iterator it(runs, fs::directory_options::skip_permission_denied, ec);
-    if (ec) return false;
-    const fs::file_time_type floor = w.armedAt - kRevEngJournalSlack;
-    fs::path best;
-    fs::file_time_type bestT{};
-    while (it != fs::directory_iterator()) {
-        const fs::path p = it->path() / "events.jsonl";
-        std::error_code fec;
-        const fs::file_time_type t = fs::last_write_time(p, fec);
-        // One stat rejects almost every historical run before we ever open a file.
-        if (!fec && t >= floor && (best.empty() || t > bestT) &&
-            revengJournalNamesSession(p, w.sessionId)) {
-            best = p;
-            bestT = t;
-        }
-        it.increment(ec);
-        if (ec) break;
-    }
-    if (best.empty()) return false;
-    w.journal = std::move(best);
-    w.consumed = 0;
-    w.carry.clear();
-    return true;
+    if (runs.empty() || runId.empty()) return {};
+    return runs / runId / "events.jsonl";
 }
 
 void revengFeed(RevEngWatch& w, const std::string& kind, int pct, const std::string& msg) {
@@ -720,16 +670,11 @@ void revengFeed(RevEngWatch& w, const std::string& kind, int pct, const std::str
     w.lastKind = kind;   // self-assignment-safe: these may alias w's own members
     w.lastPct = pct;
     w.lastMsg = msg;
-    if (kind == "reconstruct_progress") {  // the point the run had reached, for error replay
-        w.progressPct = pct;
-        w.progressMsg = msg;
-        w.hadProgress = true;
-    }
 }
 
 // Does RevEngState still show what we last fed? feedRevEngEvent's assignments are mirrored
-// exactly, so a false here means something else (the kick callback's placeholder seed) wrote
-// over the journal's answer.
+// exactly, so a false here means another writer (the kick seed, the badge poll) overwrote the
+// journal's answer.
 bool revengStateMatchesLast(const RevEngWatch& w) {
     const ui::reveng::ReconstructState& r = ui::reveng::S().recon;
     if (w.lastKind == "reconstruct_progress")
@@ -743,31 +688,35 @@ bool revengStateMatchesLast(const RevEngWatch& w) {
     return true;  // nothing fed yet — the seed is the only information there is
 }
 
-// One events.jsonl record -> at most one RevEngEvent:
+// One events.jsonl record -> at most one RevEngEvent. Returns true when the record ENDS the
+// run. Terminality comes from the journal alone: the launch RPC now returns in ~200 ms with
+// status "running", so the RPC lifecycle says nothing about whether the mission is over.
 //
 //   aicad.reveng_events/1  -> "reconstruct_progress". pct verbatim (clamped); msg = the §4
 //                             `stage` word (capture|scale|sparse|dense|splat|mesh|fit|
 //                             parametric|review|deliver) and NOTHING ELSE. The Reconstruct
 //                             sub-step track substring-matches "mesh"/"dense"/"sparse" against
-//                             recon.phase in that order, so appending the record's own prose
-//                             ("dense: started (n_mesh_cleanup)") would bind the wrong sub-step.
+//                             recon.phase in that order, so carrying the record's own prose
+//                             ("dense MVS complete") could bind the wrong sub-step. The worker
+//                             writes `stage` bare for the same reason; `msg` holds the prose.
+//                             No session filter: the run_id IS the address, and one journal
+//                             belongs to exactly one run.
 //   dag.node.failed        -> "reconstruct_error" with the node's escalation text. This is the
 //                             ONLY failure signal on the journal: make_reveng_emit translates
-//                             dag.node.started/done/paused and nothing else. Not terminal — a
-//                             retry edge can still route back and resume progress, which the
-//                             next progress event clears the error for.
-//   dag.run.done           -> terminal. "done" -> "reconstruct_done"; "paused" is NOT terminal
-//                             for the user (an approve gate is waiting) and is ignored; any
-//                             other status -> "reconstruct_error", preferring the specific node
-//                             failure text over the generic run status.
-void revengApplyRecord(RevEngWatch& w, const json& r) {
+//                             dag.node.started/done/paused and nothing else. NOT terminal — a
+//                             retry edge can route back and resume progress, which the next
+//                             progress event clears the error for.
+//   dag.run.done           -> terminal, EXCEPT status "paused". A pause is an approve gate
+//                             waiting on the human; reveng_resolve_gate resumes the SAME run_id
+//                             onto the SAME journal, so the tail must stay armed across it or
+//                             it would go blind exactly when the run comes back to life.
+bool revengApplyRecord(RevEngWatch& w, const json& r) {
     const std::string kind = r.value("kind", std::string());
     if (kind == "aicad.reveng_events/1") {
-        if (r.value("session_id", std::string()) != w.sessionId) return;
         int pct = r.value("pct", 0);
         pct = pct < 0 ? 0 : (pct > 100 ? 100 : pct);
         revengFeed(w, "reconstruct_progress", pct, r.value("stage", std::string()));
-        return;
+        return false;
     }
     if (kind == "dag.node.failed") {
         const std::string node = r.value("node_id", std::string());
@@ -775,36 +724,38 @@ void revengApplyRecord(RevEngWatch& w, const json& r) {
         if (text.empty()) text = "node failed";
         w.errMsg = node.empty() ? text : (node + ": " + text);
         revengFeed(w, "reconstruct_error", 0, w.errMsg);
-        return;
+        return false;
     }
     if (kind == "dag.run.done") {
         const std::string status = r.value("status", std::string());
-        if (status == "paused") return;
-        w.terminal = true;
-        w.terminalAt = std::chrono::steady_clock::now();
+        if (status == "paused") return false;
         if (status == "done")
             revengFeed(w, "reconstruct_done", 100, std::string());
         else
             revengFeed(w, "reconstruct_error", 0,
                        w.errMsg.empty() ? ("reconstruction run " + status) : w.errMsg);
+        return true;
     }
+    return false;
 }
 
 // Apply whatever the mission appended since the last tick. Bounded, non-blocking file I/O.
-void revengConsume(RevEngWatch& w) {
+// Returns true when a terminal record landed.
+bool revengConsume(RevEngWatch& w) {
     std::error_code ec;
     const std::uintmax_t size = fs::file_size(w.journal, ec);
-    if (ec || size > (std::uintmax_t)LONG_MAX) return;
+    if (ec || size > (std::uintmax_t)LONG_MAX) return false;
+    w.opened = true;
     if (size < w.consumed) { w.consumed = 0; w.carry.clear(); }  // rotated / truncated
-    if (size == w.consumed) return;
+    if (size == w.consumed) return false;
     std::uintmax_t from = w.consumed;
     if (size - from > kRevEngMaxTailBytes) {  // absurd backlog: only the newest state matters
         from = size - kRevEngMaxTailBytes;
         w.carry.clear();
     }
     std::FILE* f = std::fopen(w.journal.string().c_str(), "rb");
-    if (!f) return;
-    if (std::fseek(f, (long)from, SEEK_SET) != 0) { std::fclose(f); return; }
+    if (!f) return false;
+    if (std::fseek(f, (long)from, SEEK_SET) != 0) { std::fclose(f); return false; }
     std::string buf = std::move(w.carry);
     w.carry.clear();
     char chunk[16384];
@@ -818,6 +769,7 @@ void revengConsume(RevEngWatch& w) {
     std::fclose(f);
     w.consumed = from + got;
 
+    bool terminal = false;
     size_t start = 0;
     for (;;) {
         const size_t nl = buf.find('\n', start);
@@ -828,64 +780,62 @@ void revengConsume(RevEngWatch& w) {
         // A half-written or foreign line is not a reason to stop draining the rest.
         try {
             const json rec = json::parse(line);
-            if (rec.is_object()) revengApplyRecord(w, rec);
+            if (rec.is_object() && revengApplyRecord(w, rec)) terminal = true;
         } catch (...) {
         }
     }
     if (start < buf.size()) w.carry = buf.substr(start);  // partial trailing line
+    return terminal;
 }
 
 // Once per frame. Cheap when idle: one empty-string test.
 void revengReconstructTick() {
     RevEngWatch& w = revengWatch;
-    if (w.sessionId.empty()) return;
+    if (w.runId.empty()) return;
 
-    // kickReconstruct() holds kickPending for exactly as long as the launch RPC is in flight,
-    // and reveng_reconstruct BLOCKS for the whole mission — so the flag going false means the
-    // journal has already said its last word. st.rpc.drain() runs earlier in the same frame
-    // than engineEventsTick(), so this settling pass lands AFTER the kick callback's own
-    // seeding and leaves the journal's truth (not "queued 2%") on screen.
-    const bool settled = !ui::reveng::S().recon.kickPending;
-
+    // Only the file read is throttled.
     const auto now = std::chrono::steady_clock::now();
-    if (!settled && now - w.lastPoll < kRevEngPollInterval) return;
-    w.lastPoll = now;
+    if (now - w.lastPoll >= kRevEngPollInterval) {
+        w.lastPoll = now;
+        if (revengConsume(w)) {      // dag.run.done (not "paused") — the mission is over
+            w = RevEngWatch{};
+            return;
+        }
+        if (!w.opened && now - w.armedAt > kRevEngJournalWaitWindow) {
+            // The journal is written before the run_id is handed out, so it should be readable
+            // on the very first tick. Still absent after the window = the GUI and the worker
+            // resolve different data dirs; stop rather than stat a path that never appears.
+            std::fprintf(stderr,
+                "[engine_events] reveng: no journal at %s — GUI and worker disagree on the "
+                "Chudware data dir; Reconstruct progress will fall back to the stage badge\n",
+                w.journal.string().c_str());
+            std::fflush(stderr);
+            w = RevEngWatch{};
+            return;
+        }
+    }
+    if (!w.opened) return;
 
-    if (w.journal.empty() && !revengAdoptJournal(w)) {
-        if (settled || now - w.armedMono > kRevEngAdoptWindow) w = RevEngWatch{};
-        return;
-    }
-    revengConsume(w);
-    if (!settled) {
-        // A terminal record can land BEFORE the launch RPC returns: reveng_reconstruct journals
-        // dag.run.done inside executor.run() and only then serialises its reply. Hold the watch
-        // open for the settling pass below so the callback's placeholder cannot have the last
-        // word — but never indefinitely, in case that reply is lost.
-        if (w.terminal && now - w.terminalAt > kRevEngSettleWindow) w = RevEngWatch{};
-        return;
-    }
-    // The launch RPC landed; its callback ran earlier THIS frame in st.rpc.drain(). If it
-    // overwrote the journal's answer with its placeholder seed, replay the journal over it —
-    // for a failure that means the progress point it died at AND the error, in that order.
-    if (!revengStateMatchesLast(w)) {
-        const std::string kind = w.lastKind;   // revengFeed rewrites these as it goes
-        const int pct = w.lastPct;
-        const std::string msg = w.lastMsg;
-        if (kind == "reconstruct_error" && w.hadProgress)
-            revengFeed(w, "reconstruct_progress", w.progressPct, w.progressMsg);
-        revengFeed(w, kind, pct, msg);
-    }
-    w = RevEngWatch{};
+    // While this watch is armed the journal outranks every other writer of ReconstructState —
+    // the kick callback's initial seed and, more importantly, the 3 s get_reveng_session badge
+    // poll, which flips recon.done/pct=100 the moment session.stages.reconstruct reads "done"
+    // even though the mission still has fit / parametric / review to run. This is deliberately
+    // NOT throttled with the read above: it is three comparisons, and st.rpc.drain() runs
+    // earlier in the frame than engineEventsTick(), so correcting here means a foreign write is
+    // gone before anything draws instead of flickering "complete / 100%" for up to a poll
+    // interval. It only feeds when something actually overwrote us.
+    if (!revengStateMatchesLast(w)) revengFeed(w, w.lastKind, w.lastPct, w.lastMsg);
 }
 
 }  // namespace
 
-void watchRevEngReconstruct(const std::string& sessionId) {
+void watchRevEngReconstruct(const std::string& runId) {
     revengWatch = RevEngWatch{};
-    if (sessionId.empty()) return;  // explicit stop
-    revengWatch.sessionId = sessionId;
-    revengWatch.armedAt = fs::file_time_type::clock::now();
-    revengWatch.armedMono = std::chrono::steady_clock::now();
+    if (runId.empty()) return;  // explicit stop
+    revengWatch.runId = runId;
+    revengWatch.journal = revengJournalPath(runId);
+    revengWatch.armedAt = std::chrono::steady_clock::now();
+    if (revengWatch.journal.empty()) revengWatch = RevEngWatch{};  // no resolvable data dir
     // lastPoll stays at the clock epoch so the very first tick polls without waiting.
 }
 

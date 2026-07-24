@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import json as _json
 import os as _os
+import platform as _platform
 import shutil as _shutil
 import secrets as _secrets
+import threading as _threading
 import time as _time
 from pathlib import Path as _Path
 from typing import Any, Optional
@@ -227,15 +229,21 @@ def _not_provisioned(hint: str) -> str:
 
 _TEMPLATES_DIR = _Path(__file__).resolve().parent.parent / "dag" / "templates"
 
-# node_id → (stage, pct) for the reveng_scan template. Stages are the
-# aicad.reveng_events/1 §4 vocabulary. pct is a coarse monotone progress hint.
-_SCAN_NODE_STAGE: dict[str, tuple[str, int]] = {
+# node_id → (stage, pct), or (start_stage, done_stage, pct) for a node that spans more
+# than one stage. Stages are the aicad.reveng_events/1 §4 vocabulary; pct is a coarse
+# monotone progress hint.
+#
+# ``n_dense`` passes through three §4 stages (dense → splat → mesh) and emits the
+# intermediate ones itself via the progress emitter from make_reveng_stage_emitter();
+# it opens on ``dense`` and closes on ``mesh`` so the GUI sub-step track never rewinds.
+_SCAN_NODE_STAGE: dict[str, tuple] = {
     "n_capture":          ("capture", 5),
-    "n_scale_gate":       ("scale", 15),
-    "n_reconstruct":      ("sparse", 40),
-    "n_fit":              ("fit", 60),
-    "n_parametric":       ("parametric", 75),
-    "n_dim_gate":         ("parametric", 80),
+    "n_sparse":           ("sparse", 25),
+    "n_scale_gate":       ("scale", 35),
+    "n_dense":            ("dense", "mesh", 55),
+    "n_fit":              ("fit", 65),
+    "n_parametric":       ("parametric", 78),
+    "n_dim_gate":         ("parametric", 82),
     "n_verify_deviation": ("review", 90),
     "n_iterate":          ("parametric", 92),
     "n_deliver":          ("deliver", 100),
@@ -294,7 +302,16 @@ def make_reveng_emit(run_id: str, session_id: str, stage_map: dict):
             if event_type not in ("dag.node.started", "dag.node.done", "dag.node.paused"):
                 return
             node_id = payload.get("node_id", "")
-            stage, pct = stage_map.get(node_id, ("parametric", 50))
+            entry = stage_map.get(node_id) or ("parametric", 50)
+            # A node whose work spans several §4 stages declares (start, done, pct) so
+            # its completion event does not rewind the GUI sub-step track to the stage
+            # it opened with; the 2-tuple form means start and done share one stage.
+            if len(entry) == 3:
+                start_stage, done_stage, pct = entry
+            else:
+                start_stage, pct = entry
+                done_stage = start_stage
+            stage = start_stage
             if event_type == "dag.node.started":
                 msg = f"{stage}: started ({node_id})"
                 epct = max(0, pct - 5)
@@ -303,6 +320,7 @@ def make_reveng_emit(run_id: str, session_id: str, stage_map: dict):
                 msg = f"{stage}: paused for {reason} ({node_id})"
                 epct = pct
             else:  # dag.node.done
+                stage = done_stage
                 msg = f"{stage}: done ({node_id})"
                 epct = pct
             journal.emit("aicad.reveng_events/1", {
@@ -317,6 +335,41 @@ def make_reveng_emit(run_id: str, session_id: str, stage_map: dict):
             return
 
     return _emit
+
+
+def make_reveng_stage_emitter(run_id: str, session_id: str):
+    """Return ``progress(stage, pct, msg, artifact=None)`` for INTRA-node stages.
+
+    make_reveng_emit() translates one dag.node.* event into one stage, which is all a
+    node whose work maps 1:1 onto a stage needs.  ``n_dense`` is not one of those: it
+    runs dense MVS, then optionally a splat, then mesh cleanup — three distinct
+    ``aicad.reveng_events/1`` §4 stages (``dense``, ``splat``, ``mesh``) that were
+    declared in the contract but never emitted while all of that hid inside a single
+    ``sparse``-stage node.  This handle writes them to the SAME run journal, so the GUI
+    sub-step track (which substring-matches ``sparse``/``dense``/``mesh`` on the
+    ``stage`` field, in that order) actually lights up.
+
+    ``stage`` is written bare — never a prose sentence — so that match stays exact;
+    human-readable detail belongs in ``msg``.  Never raises: progress is best-effort.
+    """
+    from services.dag.event_journal import EventJournal
+
+    journal = EventJournal(run_id)
+
+    def _progress(stage: str, pct: int, msg: str, artifact: Any = None) -> None:
+        try:
+            journal.emit("aicad.reveng_events/1", {
+                "schema": "aicad.reveng_events/1",
+                "session_id": session_id,
+                "stage": stage,
+                "pct": int(max(0, min(100, int(pct)))),
+                "msg": msg,
+                "artifact": artifact,
+            })
+        except Exception:  # noqa: BLE001 — progress emission is best-effort
+            return
+
+    return _progress
 
 
 def _call_reverse_engineer(
@@ -376,7 +429,69 @@ def _registration_ratio(sparse_result: dict, n_images: int) -> float:
         return 0.0
 
 
-def _make_pipeline_agent_fn(session_id: str, *, strategy: str = "deterministic"):
+def _autosolve_scale(session_id: str) -> dict:
+    """Attempt the ArUco-mat scale solve now that a sparse model exists.
+
+    The primary scale path is fully automatic: a printed ArUco mat in frame plus a
+    registered sparse model is everything ``solve_scale_aruco`` needs.  Running it at
+    the tail of ``n_sparse`` — immediately before the scale-confirm gate — is what puts
+    real numbers (``mm_per_unit`` + ``residual_pct``) in front of the human at the
+    pause, instead of asking them to approve a blank.  It never overwrites a scale the
+    session already carries (a caliper ``known_dim``, or an earlier solve), and a
+    failure is reported rather than fatal: the gate still runs, and the mission may
+    proceed unscaled with an honest ``mesh_units: "reconstruction"``.
+    """
+    s = _load_session(session_id) or {}
+    existing = (s.get("scale") or {}).get("mm_per_unit")
+    try:
+        if existing is not None and float(existing) > 0.0:
+            return {
+                "attempted": False,
+                "reason": "scale_already_set",
+                "mm_per_unit": float(existing),
+                "residual_pct": (s.get("scale") or {}).get("residual_pct"),
+                "method": (s.get("scale") or {}).get("method"),
+            }
+    except (TypeError, ValueError):
+        pass
+    try:
+        from mcp.server.fastmcp import FastMCP  # noqa: PLC0415
+        from .reveng_session_tools import (  # noqa: PLC0415
+            register_reveng_session_tools,
+        )
+
+        mcp = FastMCP("_reveng_scale_internal")
+        register_reveng_session_tools(mcp)
+        tool = mcp._tool_manager.get_tool("reveng_set_scale")
+        fn = getattr(tool, "fn", None) if tool is not None else None
+        if fn is None:
+            return {"attempted": False, "reason": "reveng_set_scale not registered"}
+        raw = fn(session_id=session_id, method="aruco_mat", params={})
+        out = _json.loads(raw) if isinstance(raw, str) else raw
+    except Exception as exc:  # noqa: BLE001
+        return {"attempted": True, "ok": False,
+                "reason": f"aruco_autosolve_error: {exc}"}
+    if not isinstance(out, dict):
+        return {"attempted": True, "ok": False,
+                "reason": "bad reveng_set_scale result"}
+    scale = out.get("scale") or {}
+    return {
+        "attempted": True,
+        "ok": bool(out.get("ok")),
+        "method": "aruco_mat",
+        "mm_per_unit": scale.get("mm_per_unit"),
+        "residual_pct": scale.get("residual_pct"),
+        "reason": out.get("reason"),
+        "hint": out.get("hint"),
+    }
+
+
+def _make_pipeline_agent_fn(
+    session_id: str,
+    *,
+    strategy: str = "deterministic",
+    progress: Optional[Any] = None,
+):
     """Return a deterministic node ``agent_fn`` that runs the RE pipeline stages.
 
     ``agent_fn(request, context_pack) -> AgentResult`` is the seam node_runner
@@ -389,6 +504,12 @@ def _make_pipeline_agent_fn(session_id: str, *, strategy: str = "deterministic")
     strategy:
         ``deterministic`` (default) — reverse_engineer with fit hints.
         ``ml`` — lazy-import services.vision.cad_recode.build_parametric.
+
+    progress:
+        Optional ``(stage, pct, msg, artifact=None)`` callback from
+        make_reveng_stage_emitter(), used by ``n_dense`` to emit the ``dense`` /
+        ``splat`` / ``mesh`` sub-stages that a node-level stage map cannot express.
+        Absent (direct calls, unit tests) it is a no-op.
     """
     class _Result:
         def __init__(self, ok: bool, reason: str, data: Optional[dict] = None):
@@ -401,6 +522,11 @@ def _make_pipeline_agent_fn(session_id: str, *, strategy: str = "deterministic")
     if strat in ("override_approximate",):
         # override is a honesty gate on the MCP tool, not a rebuild strategy
         strat = "deterministic"
+
+    def _noop_progress(stage: str, pct: int, msg: str, artifact: Any = None) -> None:
+        return None
+
+    _progress = progress if callable(progress) else _noop_progress
 
     def _agent_fn(request: str, context_pack: dict):
         node_id = context_pack.get("node_id") or context_pack.get("node_name", "")
@@ -415,15 +541,24 @@ def _make_pipeline_agent_fn(session_id: str, *, strategy: str = "deterministic")
         if node_id == "n_capture":
             return _Result(True, "capture sources ingested")
 
-        # ── Reconstruction: sparse → (ffwd fallback) → dense → mesh cleanup ──
-        if node_id in ("n_reconstruct",):
+        # ── Reconstruction, split at the scale gate ──────────────────────────
+        #
+        # RE-40: this used to be ONE ``n_reconstruct`` node running sparse → dense →
+        # mesh, sitting DOWNSTREAM of the scale-confirm gate.  That deadlocked: both
+        # real scale solvers (aruco_mat, two_point) resolve against a registered COLMAP
+        # sparse model and answer ``scale_needs_sparse`` without one, so the gate could
+        # never be satisfied at the point the template asked for it.  Sparse now lands
+        # BEFORE the gate and dense AFTER it — which is also the right photogrammetry
+        # order: never pay for dense/mesh reconstruction of a part whose millimetres a
+        # human has not signed off, and clean the mesh with that confirmed factor.
+
+        def _run_sparse() -> tuple[bool, str, dict]:
+            """Sparse SfM (+ feed-forward fallback). Returns ``(ok, reason, payload)``."""
             images = _session_image_paths(session_id)
             if not images:
-                return _Result(
-                    False,
-                    "no_images",
-                    {"detail": "session has no images/ or frames/ for reconstruction"},
-                )
+                return False, "no_images", {
+                    "detail": "session has no images/ or frames/ for reconstruction",
+                }
             session_dir = str(_session_path(session_id))
             image_dir = str(_session_path(session_id) / "images")
             # Prefer images/ when present; otherwise point at frames/.
@@ -482,7 +617,7 @@ def _make_pipeline_agent_fn(session_id: str, *, strategy: str = "deterministic")
                         }
 
             if not sparse_result.get("ok"):
-                return _Result(
+                return (
                     False,
                     sparse_result.get("reason") or "backend_not_provisioned: sparse",
                     sparse_result,
@@ -497,6 +632,40 @@ def _make_pipeline_agent_fn(session_id: str, *, strategy: str = "deterministic")
             s["artifacts"]["sparse_dir"] = sparse_dir
             s["stages"]["reconstruct"] = "running"
             _save_session(s)
+            return True, "sparse model registered", {
+                "sparse": sparse_result,
+                "sparse_dir": sparse_dir,
+                "used_ffwd": used_ffwd,
+            }
+
+        def _run_dense(
+            sparse_result: dict,
+            sparse_dir: Optional[str],
+            used_ffwd: bool,
+            *,
+            require_confirmed_scale: bool,
+            provenance_step: str,
+        ) -> tuple[bool, str, dict]:
+            """Dense MVS / splat + mesh cleanup. Returns ``(ok, reason, payload)``.
+
+            ``require_confirmed_scale`` decides which scales may touch the geometry.
+            On the gated template path the scale-confirm gate is immediately upstream,
+            so only a scale a human actually confirmed is applied — that gate is the
+            product's guarantee that the delivered millimetres were validated.  The
+            ungated ``n_reconstruct`` compatibility path has no such gate, so it keeps
+            the historical rule (apply any solved ratio).  Neither path ever invents a
+            factor: with nothing usable the mesh stays in reconstruction units and
+            ``artifacts.mesh_units`` says exactly that.
+            """
+            session_dir = str(_session_path(session_id))
+            s = _load_session(session_id) or _make_session(session_id, session_id, None)
+            if not sparse_dir:
+                sparse_dir = (s.get("artifacts") or {}).get("sparse_dir")
+            if not sparse_dir:
+                return False, "no_sparse", {
+                    "detail": "dense reconstruction consumes the COLMAP sparse model",
+                    "hint": "run the n_sparse node (reveng_reconstruct) first",
+                }
 
             # Dense: OpenMVS and/or Brush — first success wins for mesh_path.
             mesh_path: Optional[str] = None
@@ -505,6 +674,7 @@ def _make_pipeline_agent_fn(session_id: str, *, strategy: str = "deterministic")
             dense_ok = False
 
             if _os.environ.get("OPENMVS_BIN"):
+                _progress("dense", 45, "dense MVS (OpenMVS) started")
                 try:
                     from services.vision.dense_backends import run_openmvs  # noqa: PLC0415
                     omvs = run_openmvs(sparse_dir, session_dir) or {}
@@ -512,6 +682,7 @@ def _make_pipeline_agent_fn(session_id: str, *, strategy: str = "deterministic")
                         mesh_path = omvs["mesh_path"]
                         dense_ok = True
                         dense_notes.append("openmvs")
+                        _progress("dense", 55, "dense MVS complete", mesh_path)
                     else:
                         dense_notes.append(
                             f"openmvs:{omvs.get('reason') or 'failed'}"
@@ -521,6 +692,7 @@ def _make_pipeline_agent_fn(session_id: str, *, strategy: str = "deterministic")
 
             # Brush when provisioned (BRUSH_BIN) — also yields splat.
             if _os.environ.get("BRUSH_BIN") or caps.get("splat"):
+                _progress("splat", 58, "gaussian splat (Brush) started")
                 try:
                     from services.vision.dense_backends import run_brush  # noqa: PLC0415
                     brush = run_brush(sparse_dir, session_dir) or {}
@@ -531,6 +703,7 @@ def _make_pipeline_agent_fn(session_id: str, *, strategy: str = "deterministic")
                             splat_path = brush["splat_path"]
                         if not mesh_path and brush.get("mesh_path"):
                             mesh_path = brush["mesh_path"]
+                        _progress("splat", 60, "gaussian splat complete", splat_path)
                     else:
                         dense_notes.append(
                             f"brush:{brush.get('reason') or 'failed'}"
@@ -547,26 +720,23 @@ def _make_pipeline_agent_fn(session_id: str, *, strategy: str = "deterministic")
                 if splat_path:
                     s["artifacts"]["splat_path"] = splat_path
                 _save_session(s)
-                return _Result(
-                    False,
-                    "backend_not_provisioned: dense",
-                    {
-                        "sparse": sparse_result,
-                        "dense_notes": dense_notes,
-                        "used_ffwd": used_ffwd,
-                        "hint": "set OPENMVS_BIN and/or BRUSH_BIN; check reveng_status()",
-                    },
-                )
+                return False, "backend_not_provisioned: dense", {
+                    "sparse": sparse_result,
+                    "dense_notes": dense_notes,
+                    "used_ffwd": used_ffwd,
+                    "hint": "set OPENMVS_BIN and/or BRUSH_BIN; check reveng_status()",
+                }
 
             # Mesh cleanup when we have a mesh.
             #
             # session.scale.mm_per_unit is a RATIO (multiply reconstruction-space lengths
-            # by it to get mm) — exactly what cleanup_mesh's mm_per_unit means. When the
-            # scale stage has not run yet it is None/0: leave the mesh in reconstruction
-            # units rather than inventing a factor, and say so on the session.
+            # by it to get mm) — exactly what cleanup_mesh's mm_per_unit means. When no
+            # usable scale is on the session, leave the mesh in reconstruction units
+            # rather than inventing a factor, and say so on the session.
             cleaned = mesh_path
             mesh_unscaled = True
             if mesh_path:
+                _progress("mesh", 62, "mesh cleanup started", mesh_path)
                 try:
                     from services.vision.mesh_cleanup import cleanup_mesh  # noqa: PLC0415
                     out_clean = str(
@@ -574,13 +744,20 @@ def _make_pipeline_agent_fn(session_id: str, *, strategy: str = "deterministic")
                     )
                     _Path(out_clean).parent.mkdir(parents=True, exist_ok=True)
                     mm_per_unit = None
+                    scale_block = (_load_session(session_id) or {}).get("scale") or {}
                     try:
-                        raw_scale = (_load_session(session_id) or {}).get(
-                            "scale", {}
-                        ).get("mm_per_unit")
+                        raw_scale = scale_block.get("mm_per_unit")
                         if raw_scale is not None:
                             mm_per_unit = float(raw_scale)
                     except (TypeError, ValueError):
+                        mm_per_unit = None
+                    if mm_per_unit and mm_per_unit > 0.0 and require_confirmed_scale \
+                            and not scale_block.get("confirmed"):
+                        dense_notes.append(
+                            "cleanup:unconfirmed — a scale of "
+                            f"{mm_per_unit} mm/unit is solved but the scale-confirm gate "
+                            "has not approved it; mesh stays in reconstruction units"
+                        )
                         mm_per_unit = None
                     if not mm_per_unit or mm_per_unit <= 0.0:
                         mm_per_unit = None
@@ -599,6 +776,7 @@ def _make_pipeline_agent_fn(session_id: str, *, strategy: str = "deterministic")
                 except Exception as exc:  # noqa: BLE001
                     dense_notes.append(f"cleanup_import:{exc}")
 
+            mesh_units = "reconstruction" if mesh_unscaled else "mm"
             s = _load_session(session_id) or s
             s.setdefault("artifacts", {})
             s["artifacts"]["sparse_dir"] = sparse_dir
@@ -606,31 +784,122 @@ def _make_pipeline_agent_fn(session_id: str, *, strategy: str = "deterministic")
                 s["artifacts"]["mesh_path"] = cleaned
                 # Honest units tag: consumers (fit / parametric / GUI) must not read a
                 # reconstruction-unit mesh as millimetres.
-                s["artifacts"]["mesh_units"] = "reconstruction" if mesh_unscaled else "mm"
+                s["artifacts"]["mesh_units"] = mesh_units
             if splat_path:
                 s["artifacts"]["splat_path"] = splat_path
             s["stages"]["reconstruct"] = "done"
             s["provenance"].append({
-                "step": "n_reconstruct",
+                "step": provenance_step,
                 "sparse_backend": sparse_result.get("backend"),
                 "used_ffwd": used_ffwd,
                 "dense": dense_notes,
-                "mesh_units": "reconstruction" if mesh_unscaled else "mm",
+                "mesh_units": mesh_units,
                 "ts": _now_iso(),
             })
             _save_session(s)
-            return _Result(
-                True,
-                "reconstruction complete",
-                {
-                    "sparse": sparse_result,
-                    "mesh_path": cleaned,
-                    "mesh_units": "reconstruction" if mesh_unscaled else "mm",
-                    "splat_path": splat_path,
-                    "used_ffwd": used_ffwd,
-                    "dense_notes": dense_notes,
-                },
+            _progress("mesh", 64, f"mesh ready ({mesh_units})", cleaned)
+            return True, "reconstruction complete", {
+                "sparse": sparse_result,
+                "mesh_path": cleaned,
+                "mesh_units": mesh_units,
+                "splat_path": splat_path,
+                "used_ffwd": used_ffwd,
+                "dense_notes": dense_notes,
+            }
+
+        # ── n_sparse: SfM only, then solve scale off the fresh sparse model ──
+        if node_id == "n_sparse":
+            ok, reason, payload = _run_sparse()
+            if not ok:
+                return _Result(False, reason, payload)
+            payload["scale"] = _autosolve_scale(session_id)
+            return _Result(True, reason, payload)
+
+        # ── n_scale_gate: the human already approved by the time we run ──────
+        #
+        # graph_loader runs gate.run_gate() BEFORE the node body, so reaching here
+        # means the interrupt returned "approve".  Recording confirmed=True is
+        # therefore the human's decision, never an assumption — a reject never gets
+        # here (the handler returns paused without dispatching the agent).
+        if node_id == "n_scale_gate":
+            s = _load_session(session_id)
+            if s is None:
+                return _Result(False, f"session {session_id!r} not found")
+            scale = s.setdefault("scale", {})
+            mm = scale.get("mm_per_unit")
+            try:
+                usable = mm is not None and float(mm) > 0.0
+            except (TypeError, ValueError):
+                usable = False
+            if not usable:
+                # Approving a gate whose payload showed mm_per_unit: null is an
+                # informed decision to continue UNSCALED — record it as such rather
+                # than confirming a number that does not exist.
+                scale["confirmed"] = False
+                s.setdefault("provenance", []).append({
+                    "step": "n_scale_gate",
+                    "confirmed": False,
+                    "scale_state": "unsolved",
+                    "ts": _now_iso(),
+                })
+                _save_session(s)
+                return _Result(True, "scale gate passed unscaled", {
+                    "confirmed": False,
+                    "scale_state": "unsolved",
+                    "mm_per_unit": None,
+                    "hint": "no scale solved — the mesh will stay in reconstruction "
+                            "units (artifacts.mesh_units='reconstruction'); run "
+                            "reveng_set_scale() and re-run to get millimetres",
+                })
+            scale["confirmed"] = True
+            s.setdefault("stages", {})["scale"] = "done"
+            s.setdefault("provenance", []).append({
+                "step": "n_scale_gate",
+                "confirmed": True,
+                "method": scale.get("method"),
+                "mm_per_unit": scale.get("mm_per_unit"),
+                "residual_pct": scale.get("residual_pct"),
+                "ts": _now_iso(),
+            })
+            _save_session(s)
+            return _Result(True, "scale confirmed", {
+                "confirmed": True,
+                "mm_per_unit": scale.get("mm_per_unit"),
+                "residual_pct": scale.get("residual_pct"),
+                "method": scale.get("method"),
+            })
+
+        # ── n_dense: dense/splat/mesh with the CONFIRMED scale ───────────────
+        if node_id == "n_dense":
+            s = _load_session(session_id) or {}
+            sparse_dir = (s.get("artifacts") or {}).get("sparse_dir")
+            ok, reason, payload = _run_dense(
+                {}, sparse_dir, False,
+                require_confirmed_scale=True,
+                provenance_step="n_dense",
             )
+            return _Result(ok, reason, payload)
+
+        # ── n_reconstruct: pre-split compatibility alias ─────────────────────
+        #
+        # The frozen template no longer has this node; direct callers that still ask
+        # for it get the historical composite (sparse then dense in one call) with the
+        # historical ungated scale rule, so nothing that addressed it by name breaks.
+        if node_id == "n_reconstruct":
+            ok, reason, payload = _run_sparse()
+            if not ok:
+                return _Result(False, reason, payload)
+            ok, reason, dense_payload = _run_dense(
+                payload.get("sparse") or {},
+                payload.get("sparse_dir"),
+                bool(payload.get("used_ffwd")),
+                require_confirmed_scale=False,
+                provenance_step="n_reconstruct",
+            )
+            if not ok:
+                dense_payload.setdefault("sparse", payload.get("sparse") or {})
+                dense_payload.setdefault("used_ffwd", bool(payload.get("used_ffwd")))
+            return _Result(ok, reason, dense_payload)
 
         # ── Primitive fit ────────────────────────────────────────────────────
         if node_id in ("n_fit",):
@@ -839,6 +1108,196 @@ def _make_pipeline_agent_fn(session_id: str, *, strategy: str = "deterministic")
 
 
 
+# ── Mission run bookkeeping: async launch, gate pause/resume ─────────────────
+#
+# contracts/reveng.md §0 promises a long job returns a run_id immediately. The scan
+# mission is minutes of COLMAP/OpenMVS work and services/worker_main.py is a SINGLE
+# threaded request loop, so running it inline blocks every other RPC — including the
+# gate-status polls that exist to unblock the very run being polled. Missions therefore
+# run on a daemon worker thread and everything a later call needs is read back from
+# disk, never from memory:
+#
+#   session.json["run"]           — progress, the source of truth the GUI/session tools read
+#   <runs>/<run_id>.reveng.json   — launch parameters resume() needs to rebuild the emit +
+#                                   agent_fn seams, plus the pending gate description
+#
+# The executor already persists the topology (<run_id>.graph.json) and the LangGraph
+# checkpoint (<run_id>.db) beside them, so resuming needs nothing that died with the
+# process. The in-process thread table below is only used to refuse a SECOND concurrent
+# mission on one session — it is authoritative for "running right now" in a way a stale
+# manifest can never be.
+
+_MISSION_THREADS: dict[str, tuple[str, Any]] = {}
+_MISSION_LOCK = _threading.Lock()
+
+
+def _runs_base_dir() -> _Path:
+    """Directory holding <run_id>.db / .graph.json / .reveng.json for reveng runs."""
+    override = _reveng_runs_dir()
+    if override is not None:
+        return override
+    try:
+        from services.dag.executor import default_runs_dir  # noqa: PLC0415
+        return default_runs_dir()
+    except Exception:  # noqa: BLE001 — executor pulls langgraph in; keep bookkeeping alive
+        if _platform.system() == "Windows":
+            appdata = _os.environ.get("APPDATA") or _os.path.expanduser(
+                r"~\AppData\Roaming"
+            )
+            return _Path(appdata) / "Chudware" / "runs"
+        xdg = _os.environ.get("XDG_DATA_HOME") or _os.path.expanduser("~/.local/share")
+        return _Path(xdg) / "Chudware" / "runs"
+
+
+def _run_record_path(run_id: str) -> _Path:
+    return _runs_base_dir() / f"{run_id}.reveng.json"
+
+
+def _write_run_record(rec: dict) -> None:
+    """Persist the aicad.reveng_run/1 sidecar (best-effort; never breaks a run)."""
+    try:
+        path = _run_record_path(rec["run_id"])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_json.dumps(rec, indent=2))
+    except Exception:  # noqa: BLE001
+        return
+
+
+def _read_run_record(run_id: str) -> Optional[dict]:
+    path = _run_record_path(run_id)
+    if not path.is_file():
+        return None
+    try:
+        rec = _json.loads(path.read_text())
+    except Exception:  # noqa: BLE001
+        return None
+    return rec if isinstance(rec, dict) else None
+
+
+def _run_summary(rec: dict) -> dict:
+    """The subset of the run record that belongs on the session manifest."""
+    return {
+        "run_id": rec.get("run_id"),
+        "template": rec.get("template"),
+        "status": rec.get("status"),
+        "gate": rec.get("gate"),
+        "started_at": rec.get("started_at"),
+        "updated_at": rec.get("updated_at"),
+        "error": rec.get("error"),
+    }
+
+
+def _record_session_run(rec: dict) -> None:
+    """Mirror the run record onto session.json — the progress source of truth."""
+    try:
+        s = _load_session(rec.get("session_id") or "")
+        if s is None:
+            return
+        s["run"] = _run_summary(rec)
+        _save_session(s)
+    except Exception:  # noqa: BLE001
+        return
+
+
+def _gate_from_result(graph: Optional[dict], result: dict) -> Optional[dict]:
+    """Describe the gate a paused executor result is suspended on, or None."""
+    payloads = [p for p in (result.get("interrupted") or []) if isinstance(p, dict)]
+    if not payloads:
+        return None
+    nodes = {n.get("id"): n for n in ((graph or {}).get("nodes") or [])}
+    payload = payloads[0]
+    node_id = payload.get("node_id") or ""
+    node = nodes.get(node_id) or {}
+    question = (payload.get("questions") or [{}])[0]
+    return {
+        "node_id": node_id,
+        "node_name": node.get("name") or node_id,
+        "gate_kind": (node.get("inputs") or {}).get("gate_kind") or "",
+        "autonomy": payload.get("autonomy") or node.get("autonomy") or "approve",
+        "prompt": question.get("prompt") or "",
+        "proposal": question.get("proposal") or "",
+    }
+
+
+def _apply_run_result(rec: dict, result: dict, graph: Optional[dict]) -> dict:
+    """Fold an executor result into the run record + session manifest."""
+    rec["status"] = result.get("status") or "running"
+    rec["gate"] = _gate_from_result(graph, result)
+    rec["updated_at"] = _now_iso()
+    if result.get("error"):
+        rec["error"] = result["error"]
+    else:
+        rec.pop("error", None)
+    _write_run_record(rec)
+    _record_session_run(rec)
+    return rec
+
+
+def _slot_busy(entry: Optional[tuple]) -> bool:
+    """True while a session's mission slot is claimed (reserved or thread alive)."""
+    if entry is None:
+        return False
+    thread = entry[1]
+    return thread is None or thread.is_alive()
+
+
+def _mission_running(session_id: str) -> Optional[str]:
+    """The run_id of the mission in flight for *session_id*, else None."""
+    with _MISSION_LOCK:
+        entry = _MISSION_THREADS.get(session_id)
+        if _slot_busy(entry):
+            return entry[0]
+        if entry is not None:
+            _MISSION_THREADS.pop(session_id, None)
+    return None
+
+
+def _reserve_mission(session_id: str, run_id: str) -> Optional[str]:
+    """Atomically claim the session's mission slot; return the busy run_id on refusal."""
+    with _MISSION_LOCK:
+        entry = _MISSION_THREADS.get(session_id)
+        if _slot_busy(entry):
+            return entry[0]
+        _MISSION_THREADS[session_id] = (run_id, None)
+    return None
+
+
+def _release_mission(session_id: str, run_id: str) -> None:
+    with _MISSION_LOCK:
+        entry = _MISSION_THREADS.get(session_id)
+        if entry is not None and entry[0] == run_id:
+            _MISSION_THREADS.pop(session_id, None)
+
+
+def _busy_envelope(session_id: str, run_id: str) -> dict:
+    return {
+        "ok": False,
+        "reason": "mission_already_running",
+        "hint": f"session {session_id!r} already has mission {run_id} in flight — "
+                "poll reveng_gate_status() for its stage/gate, or wait for it to finish",
+        "session_id": session_id,
+        "run_id": run_id,
+    }
+
+
+def _spawn_mission(session_id: str, run_id: str, invoke, rec: dict, graph: dict) -> None:
+    """Run *invoke* on a daemon thread, folding its result into the run record."""
+    def _body() -> None:
+        try:
+            result = invoke()
+        except Exception as exc:  # noqa: BLE001 — a crashed mission must still be reported
+            result = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
+        try:
+            _apply_run_result(rec, result, graph)
+        finally:
+            _release_mission(session_id, run_id)
+
+    thread = _threading.Thread(target=_body, name=f"reveng-{run_id}", daemon=True)
+    with _MISSION_LOCK:
+        _MISSION_THREADS[session_id] = (run_id, thread)
+    thread.start()
+
+
 def _launch_reveng_mission(
     session_id: str,
     template_name: str,
@@ -846,6 +1305,7 @@ def _launch_reveng_mission(
     *,
     autonomy_default: str = "auto",
     strategy: str = "deterministic",
+    background: bool = False,
 ) -> dict:
     """Load a frozen template, start it via the executor, translate progress.
 
@@ -853,10 +1313,17 @@ def _launch_reveng_mission(
     ``session_id`` and ``template``. Runs at ``autonomy_default="auto"`` so only the
     template's own ``approve`` nodes pause the run — the scale-confirm and
     dimension-confirm gates (declared ``autonomy: "approve"``) PAUSE for human
-    approval while the auto reconstruction/fit/parametric/verify nodes execute
-    without interruption; the GUI/human resumes each gate via the DAG resume path.
+    approval while the auto sparse/dense/fit/parametric/verify nodes execute
+    without interruption; the GUI/human resumes each gate via
+    ``_resume_reveng_mission`` (the ``reveng_resolve_gate`` tool).
     (Promoting to ``autonomy_default="approve"`` would gate *every* auto node,
     pausing immediately at ``n_capture`` — not what the template intends.)
+
+    ``background=True`` returns as soon as the run_id exists and finishes the mission
+    on a daemon thread; the caller then reads progress from the session manifest and
+    the run's ``aicad.reveng_events/1`` journal. A second background mission on a
+    session that already has one in flight is REFUSED with an honest envelope rather
+    than racing it for session.json.
 
     strategy is forwarded to the pipeline agent_fn for n_parametric
     (``deterministic`` | ``ml``).
@@ -865,18 +1332,226 @@ def _launch_reveng_mission(
 
     graph = _load_template(template_name)
     run_id = "run_" + _secrets.token_hex(4)
+    rec = {
+        "schema": "aicad.reveng_run/1",
+        "run_id": run_id,
+        "session_id": session_id,
+        "template": template_name,
+        "strategy": strategy,
+        "autonomy_default": autonomy_default,
+        "stage_map": {k: list(v) for k, v in (stage_map or {}).items()},
+        "status": "running",
+        "gate": None,
+        "started_at": _now_iso(),
+        "updated_at": _now_iso(),
+    }
+
+    # Build the emitters on the CALLING thread so the run's events.jsonl exists the
+    # moment reveng_reconstruct hands back the run_id: the GUI tails that file to draw
+    # progress, and a background mission would otherwise leave a window where the
+    # advertised run_id addresses nothing.
     emit = make_reveng_emit(run_id, session_id, stage_map)
-    agent_fn = _make_pipeline_agent_fn(session_id, strategy=strategy)
-    result = executor.run(
-        graph,
-        initial_state={"inputs": {"session_id": session_id, "strategy": strategy}},
-        run_id=run_id,
-        runs_dir=_reveng_runs_dir(),
-        emit=emit,
-        agent_fn=agent_fn,
-        autonomy_default=autonomy_default,
+    progress = make_reveng_stage_emitter(run_id, session_id)
+    agent_fn = _make_pipeline_agent_fn(
+        session_id, strategy=strategy, progress=progress,
     )
-    result["session_id"] = session_id
-    result["template"] = template_name
-    result["strategy"] = strategy
-    return result
+
+    def _invoke() -> dict:
+        return executor.run(
+            graph,
+            initial_state={"inputs": {"session_id": session_id, "strategy": strategy}},
+            run_id=run_id,
+            runs_dir=_reveng_runs_dir(),
+            emit=emit,
+            agent_fn=agent_fn,
+            autonomy_default=autonomy_default,
+        )
+
+    if not background:
+        _write_run_record(rec)
+        _record_session_run(rec)
+        result = _invoke()
+        _apply_run_result(rec, result, graph)
+        result["session_id"] = session_id
+        result["template"] = template_name
+        result["strategy"] = strategy
+        return result
+
+    busy = _reserve_mission(session_id, run_id)
+    if busy:
+        return _busy_envelope(session_id, busy)
+    _write_run_record(rec)
+    _record_session_run(rec)
+    progress("capture", 0, f"mission {template_name} queued")
+    _spawn_mission(session_id, run_id, _invoke, rec, graph)
+    return {
+        "run_id": run_id,
+        "name": graph.get("name", ""),
+        "status": "running",
+        "async": True,
+        "session_id": session_id,
+        "template": template_name,
+        "strategy": strategy,
+    }
+
+
+def _find_session_run(session_id: str) -> Optional[dict]:
+    """The run record for *session_id*'s current mission, or None.
+
+    Reads the session manifest's ``run`` pointer first (source of truth), then falls
+    back to scanning the runs dir so a mission launched before the pointer existed is
+    still addressable.
+    """
+    s = _load_session(session_id)
+    run_id = ((s or {}).get("run") or {}).get("run_id")
+    if run_id:
+        rec = _read_run_record(str(run_id))
+        if rec is not None:
+            return rec
+    base = _runs_base_dir()
+    if not base.is_dir():
+        return None
+    newest: Optional[tuple[float, dict]] = None
+    for path in base.glob("*.reveng.json"):
+        try:
+            rec = _json.loads(path.read_text())
+        except Exception:  # noqa: BLE001
+            continue
+        if not isinstance(rec, dict) or rec.get("session_id") != session_id:
+            continue
+        mtime = path.stat().st_mtime
+        if newest is None or mtime > newest[0]:
+            newest = (mtime, rec)
+    return newest[1] if newest else None
+
+
+def _resume_reveng_mission(
+    run_id: str,
+    decision: Any = "approve",
+    *,
+    background: bool = True,
+) -> dict:
+    """Resume a gate-paused reveng mission with a human decision.
+
+    Rebuilds the emit + agent_fn seams from the run record and calls
+    ``executor.resume``, which feeds the decision back into the suspended
+    ``interrupt()`` and continues from the gate.
+
+    Only ``approve`` is ever handed to the executor. A REJECT is honoured by NOT
+    resuming: graph_loader's reject branch returns a plain state patch, so LangGraph
+    would happily walk on to the next node with the gate merely marked paused — which
+    for a scale-confirm gate would mean dense reconstruction proceeding on scale a
+    human just refused. Leaving the checkpoint suspended is what actually stops the
+    mission, and it stays resumable if the rejection was a mistake.
+    """
+    rec = _read_run_record(run_id)
+    if rec is None:
+        return {
+            "ok": False,
+            "reason": "run_not_found",
+            "hint": f"no run record for {run_id!r}; call reveng_gate_status(session_id) "
+                    "for the session's current mission",
+        }
+    session_id = rec.get("session_id") or ""
+    if rec.get("status") not in ("paused", "rejected"):
+        return {
+            "ok": False,
+            "reason": f"run_not_paused: {rec.get('status')}",
+            "hint": "only a mission suspended at an approve gate can be resumed",
+            "run_id": run_id,
+            "session_id": session_id,
+        }
+
+    from services.dag import executor
+
+    graph = _load_template(rec.get("template") or "reveng_scan")
+    stage_map = {
+        k: (tuple(v) if isinstance(v, (list, tuple)) else v)
+        for k, v in (rec.get("stage_map") or {}).items()
+    }
+    strategy = rec.get("strategy") or "deterministic"
+
+    # Same as the launch path: emitters on the calling thread so the resumed run keeps
+    # writing to the run's existing journal from the instant this call returns.
+    emit = make_reveng_emit(run_id, session_id, stage_map)
+    agent_fn = _make_pipeline_agent_fn(
+        session_id,
+        strategy=strategy,
+        progress=make_reveng_stage_emitter(run_id, session_id),
+    )
+
+    def _invoke() -> dict:
+        return executor.resume(
+            run_id,
+            graph_json=graph,
+            decision=decision,
+            runs_dir=_reveng_runs_dir(),
+            emit=emit,
+            agent_fn=agent_fn,
+            autonomy_default=rec.get("autonomy_default") or "auto",
+        )
+
+    if not background:
+        result = _invoke()
+        _apply_run_result(rec, result, graph)
+        result["session_id"] = session_id
+        result["template"] = rec.get("template")
+        return result
+
+    busy = _reserve_mission(session_id, run_id)
+    if busy:
+        return _busy_envelope(session_id, busy)
+    rec["status"] = "running"
+    rec["gate"] = None
+    rec["updated_at"] = _now_iso()
+    _write_run_record(rec)
+    _record_session_run(rec)
+    _spawn_mission(session_id, run_id, _invoke, rec, graph)
+    return {
+        "run_id": run_id,
+        "status": "running",
+        "async": True,
+        "session_id": session_id,
+        "template": rec.get("template"),
+    }
+
+
+def _reject_reveng_gate(run_id: str, note: str = "") -> dict:
+    """Stop a gate-paused mission because the human rejected the gate.
+
+    The LangGraph checkpoint is left suspended at the interrupt — that is what makes
+    the stop real: nothing downstream of the gate runs. The record says why, and a
+    later ``approve`` can still resume the same checkpoint.
+    """
+    rec = _read_run_record(run_id)
+    if rec is None:
+        return {"ok": False, "reason": "run_not_found",
+                "hint": f"no run record for {run_id!r}"}
+    if rec.get("status") != "paused":
+        return {
+            "ok": False,
+            "reason": f"run_not_paused: {rec.get('status')}",
+            "hint": "only a mission suspended at an approve gate can be rejected",
+            "run_id": run_id,
+            "session_id": rec.get("session_id"),
+        }
+    gate = rec.get("gate") or {}
+    rec["status"] = "rejected"
+    rec["updated_at"] = _now_iso()
+    rec["error"] = (
+        f"gate {gate.get('gate_kind') or gate.get('node_id') or 'unknown'} rejected"
+        + (f": {note}" if note else "")
+    )
+    _write_run_record(rec)
+    _record_session_run(rec)
+    return {
+        "ok": True,
+        "run_id": run_id,
+        "session_id": rec.get("session_id"),
+        "status": "rejected",
+        "gate": gate,
+        "reason": rec["error"],
+        "hint": "the mission is stopped at the gate and nothing downstream ran; "
+                "fix the input and call reveng_resolve_gate(decision='approve') to "
+                "continue from the same checkpoint",
+    }

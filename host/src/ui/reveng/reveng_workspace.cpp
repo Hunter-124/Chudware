@@ -250,10 +250,15 @@ RevEngState& S() {
 void feedRevEngEvent(const RevEngEvent& ev) {
     RevEngState& s = S();
     if (ev.kind == "reconstruct_progress") {
+        // A progress bar that walks backwards reads as a fault. The stage map assigns each node
+        // a nominal pct, so a node whose intra-node records already reported 62-64 can be
+        // followed by the next node's nominal 55. Hold the high-water mark within a run; a
+        // fresh run resets it via kickReconstruct, and done/error below set their own values.
+        if (!s.recon.active) s.recon.pct = 0;   // first event of this run
         s.recon.active = true;
         s.recon.done   = false;
         s.recon.err.clear();
-        s.recon.pct    = ev.pct;
+        if (ev.pct > s.recon.pct) s.recon.pct = ev.pct;
         s.recon.phase  = ev.msg;
     } else if (ev.kind == "reconstruct_done") {
         s.recon.active = false;
@@ -676,12 +681,6 @@ void kickReconstruct(AppState& st) {
     s.recon.kickPending = true;
     s.recon.kickErr.clear();
     SH().reconStartT = ImGui::GetTime();
-    // Arm the live progress feed BEFORE the launch RPC goes out: core::engineEventsTick tails
-    // the mission's EventJournal from here on, so the bar / sub-steps / clock advance during
-    // the run instead of waiting on the 3 s stage-badge poll. reveng_reconstruct blocks for
-    // the whole mission and only reports its run_id once that is over, so the tail discovers
-    // the run by session id (see engine_events.cpp).
-    core::watchRevEngReconstruct(s.sessions[s.selected].session_id);
     nlohmann::json args = nlohmann::json::object();
     args["session_id"] = s.sessions[s.selected].session_id;
     args["quality"]    = kQuality[std::clamp(s.recon.quality, 0, 2)];
@@ -707,6 +706,12 @@ void kickReconstruct(AppState& st) {
         s2.recon.pct    = 2;
         s2.recon.phase  = "queued";
         s2.recon.err.clear();
+        // Arm the live progress feed on the run_id the launch just returned:
+        // core::engineEventsTick tails that run's EventJournal, so the bar / sub-steps / clock
+        // advance during the mission instead of waiting on the 3 s stage-badge poll. This runs
+        // inside st.rpc.drain(), earlier in the frame than engineEventsTick, so the first
+        // journal record replaces the "queued" seed above before anything draws.
+        core::watchRevEngReconstruct(s2.recon.runId);
     });
 }
 
@@ -833,9 +838,18 @@ void drawReconSubSteps(const RevEngState& s) {
         if (p.find("mesh") != std::string::npos)        active = 2;
         else if (p.find("dense") != std::string::npos)  active = 1;
         else if (p.find("sparse") != std::string::npos) active = 0;
+        // Stages AFTER reconstruction (the mission continues into fit/parametric/review/
+        // deliver) are all "past" this three-step track. Without this they fell through to the
+        // pct ladder below, and `fit` at pct 60-65 landed in the Dense bucket — a visible
+        // Mesh -> Dense -> Mesh rewind.
+        else if (p == "fit" || p == "parametric" || p == "review" || p == "deliver")
+                                                        active = 2;
         else if (s.recon.pct >= 67)                     active = 2;
         else if (s.recon.pct >= 34)                     active = 1;
         else                                            active = 0;
+        // The track never walks backwards inside one run: a stage map that reports a lower pct
+        // for a later node must not un-complete a step the user already watched finish.
+        if (sh.lastSubStep > active) active = sh.lastSubStep;
         sh.lastSubStep = active;
     }
 

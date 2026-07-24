@@ -12,14 +12,19 @@ from .reveng_common import (
     _SCAN_NODE_STAGE,
     _dumps,
     _err,
+    _find_session_run,
     _launch_reveng_mission,
     _load_session,
     _make_pipeline_agent_fn,
     _make_session,
+    _mission_running,
     _new_session_id,
     _not_provisioned,
     _now_iso,
+    _read_run_record,
+    _reject_reveng_gate,
     _research_ingest,
+    _resume_reveng_mission,
     _reveng_status,
     _save_session,
     _session_image_paths,
@@ -95,17 +100,25 @@ def register_reveng_build_tools(mcp: FastMCP) -> None:
         quality: str = "normal",
         backend: Optional[str] = None,
     ) -> str:
-        """Launch sparse + dense reconstruction for *session_id*.
+        """Launch sparse + dense reconstruction for *session_id* — returns immediately.
 
         ``quality`` is one of ``draft`` | ``normal`` | ``high``.
-        When a reconstruction backend is provisioned this launches the
-        ``reveng_scan`` DAG mission and returns ``{ok, run_id, status, ...}``;
-        progress streams as ``aicad.reveng_events/1`` on the run's EventJournal
-        (drain via the GUI stepper / ``mission_status``). The scale-confirm and
-        dimension-confirm gates PAUSE the run for human approval; resume via the
-        DAG resume path. When no reconstruction backend is provisioned, returns
-        the honest ``backend_not_provisioned`` envelope — check ``reveng_status()``
-        for availability and install COLMAP (COLMAP_BIN).
+        When a reconstruction backend is provisioned this starts the ``reveng_scan``
+        DAG mission on a worker thread and returns ``{ok, run_id, status: "running"}``
+        straight away (contracts/reveng.md §0 — a multi-minute job never blocks the
+        single-threaded worker loop). Progress streams as ``aicad.reveng_events/1`` on
+        the run's EventJournal (GUI stepper) and is mirrored onto
+        ``session.run`` for polling via ``get_reveng_session``.
+
+        The mission runs capture → sparse SfM → **scale-confirm gate** → dense/splat/
+        mesh → fit → parametric → **dimension-confirm gate** → verify → deliver. Both
+        gates PAUSE the run; inspect the pending one with ``reveng_gate_status`` and
+        continue (or stop) it with ``reveng_resolve_gate``.
+
+        A session that already has a mission in flight is refused with
+        ``mission_already_running``. With no reconstruction backend provisioned this
+        returns the honest ``backend_not_provisioned`` envelope — check
+        ``reveng_status()`` and install COLMAP (COLMAP_BIN).
         """
         s = _load_session(session_id)
         if s is None:
@@ -120,8 +133,182 @@ def register_reveng_build_tools(mcp: FastMCP) -> None:
                 "Check reveng_status() and install COLMAP (COLMAP_BIN) / OpenMVS."
             )
         try:
-            result = _launch_reveng_mission(session_id, "reveng_scan", _SCAN_NODE_STAGE)
+            result = _launch_reveng_mission(
+                session_id, "reveng_scan", _SCAN_NODE_STAGE, background=True,
+            )
+            if result.get("ok") is False:
+                return _dumps(result)
             return _dumps({"ok": True, **result})
+        except Exception as e:
+            return _err(e)
+
+
+
+    # ── §8.2 WRITE — human gates on a running mission ───────────────────────
+    #
+    # The scan mission suspends at its two approve gates. Without these two tools the
+    # pause is a dead end: executor.run() returns "paused" and nothing in the product
+    # ever calls executor.resume(), so a GUI-started reconstruction stops at the scale
+    # gate forever. They are deliberately NOT one auto-approving call — the
+    # scale-confirm gate existing at all is the guarantee that a human validated the
+    # millimetres before dense reconstruction consumed them.
+
+    def _gate_pending(session_id: str, gate: dict) -> dict:
+        """The data a human needs to judge *gate*, read live off the session."""
+        kind = (gate or {}).get("gate_kind") or ""
+        if kind == "scale_confirm":
+            s = _load_session(session_id) or {}
+            scale = dict(s.get("scale") or {})
+            mm = scale.get("mm_per_unit")
+            try:
+                usable = mm is not None and float(mm) > 0.0
+            except (TypeError, ValueError):
+                usable = False
+            return {
+                "mm_per_unit": scale.get("mm_per_unit"),
+                "residual_pct": scale.get("residual_pct"),
+                "method": scale.get("method"),
+                "confirmed": bool(scale.get("confirmed")),
+                "detail": scale.get("detail"),
+                "mesh_units_if_approved": "mm" if usable else "reconstruction",
+                "hint": (
+                    "approve to scale the dense mesh by this ratio"
+                    if usable else
+                    "no scale solved — approving continues UNSCALED (mesh stays in "
+                    "reconstruction units); solve one first with reveng_set_scale()"
+                ),
+            }
+        if kind == "dimension_confirm":
+            from .reveng_session_tools import collect_session_dims  # noqa: PLC0415
+            ledger = collect_session_dims(session_id)
+            rows = [
+                d for d in (ledger.get("dims") or [])
+                if d.get("fit_critical") and not d.get("confirmed")
+            ]
+            return {
+                "dims": rows,
+                "n_outstanding": len(rows),
+                "scale_confirmed": bool(ledger.get("scale_confirmed")),
+                "hint": (
+                    "confirm these with confirm_dimensions before approving"
+                    if rows else
+                    "no outstanding fit-critical rows — safe to approve"
+                ),
+            }
+        return {}
+
+    def _resolve_run(session_id: str, run_id: str):
+        """(run_record, error_envelope) for the addressed mission."""
+        if run_id:
+            rec = _read_run_record(run_id)
+            if rec is None:
+                return None, {
+                    "ok": False,
+                    "reason": "run_not_found",
+                    "hint": f"no reveng mission recorded for run_id {run_id!r}",
+                }
+            return rec, None
+        if not session_id:
+            return None, {
+                "ok": False,
+                "reason": "missing_param: session_id or run_id",
+                "hint": "address the mission by its session_id or its run_id",
+            }
+        rec = _find_session_run(session_id)
+        if rec is None:
+            return None, {
+                "ok": False,
+                "reason": "no_mission",
+                "hint": f"session {session_id!r} has no reveng mission on record — "
+                        "start one with reveng_reconstruct()",
+                "session_id": session_id,
+            }
+        return rec, None
+
+    @mcp.tool()
+    def reveng_gate_status(session_id: str = "", run_id: str = "") -> str:
+        """Report a reveng mission's status and the human gate it is waiting on.
+
+        Address the mission by ``session_id`` (its current run) or by ``run_id``.
+
+        Returns ``{ok, run_id, session_id, status, template, gate}`` where ``status`` is
+        ``running`` | ``paused`` | ``done`` | ``failed`` | ``rejected``, and ``gate`` is
+        null unless the run is suspended. A pending gate carries ``node_id``,
+        ``gate_kind`` (``scale_confirm`` | ``dimension_confirm`` | ``final_accept``),
+        the prompt, and a ``pending`` block with exactly what the human must judge:
+        the solved ``mm_per_unit`` + ``residual_pct`` for a scale gate, the outstanding
+        fit-critical dimension rows for a dimension gate.
+
+        Answer it with ``reveng_resolve_gate``.
+        """
+        try:
+            rec, err = _resolve_run(session_id, run_id)
+            if err is not None:
+                return _dumps(err)
+            sid = rec.get("session_id") or session_id
+            gate = rec.get("gate")
+            out = {
+                "ok": True,
+                "run_id": rec.get("run_id"),
+                "session_id": sid,
+                "template": rec.get("template"),
+                "status": rec.get("status"),
+                "started_at": rec.get("started_at"),
+                "updated_at": rec.get("updated_at"),
+                "live": bool(_mission_running(sid)),
+                "gate": None,
+            }
+            if rec.get("error"):
+                out["error"] = rec["error"]
+            if gate:
+                out["gate"] = {**gate, "pending": _gate_pending(sid, gate)}
+                out["hint"] = (
+                    "call reveng_resolve_gate(session_id, decision='approve'|'reject')"
+                )
+            return _dumps(out)
+        except Exception as e:
+            return _err(e)
+
+
+
+    @mcp.tool()
+    def reveng_resolve_gate(
+        session_id: str,
+        decision: str,
+        run_id: str = "",
+        note: str = "",
+    ) -> str:
+        """Answer the human gate a reveng mission is suspended on.
+
+        ``decision`` is required and must be ``approve`` or ``reject`` — there is no
+        default, because a scale-confirm gate silently defaulting to approve would
+        destroy the only guarantee the pipeline offers about its millimetres.
+
+        ``approve`` resumes the mission from the gate on a worker thread and returns
+        ``{ok, run_id, status: "running"}`` immediately (the work past a scale gate is
+        the whole dense/mesh pass). ``reject`` stops it: the checkpoint stays suspended
+        at the gate so nothing downstream runs, and the run reports
+        ``status: "rejected"`` with the reason. A rejected run remains resumable —
+        approve it later to continue from the same checkpoint.
+        """
+        try:
+            choice = (decision or "").strip().lower()
+            if choice not in ("approve", "reject"):
+                return _dumps({
+                    "ok": False,
+                    "reason": f"invalid decision {decision!r}",
+                    "hint": "decision must be 'approve' or 'reject'",
+                })
+            rec, err = _resolve_run(session_id, run_id)
+            if err is not None:
+                return _dumps(err)
+            rid = str(rec.get("run_id") or "")
+            if choice == "reject":
+                return _dumps(_reject_reveng_gate(rid, note=note))
+            result = _resume_reveng_mission(rid, "approve")
+            if result.get("ok") is False:
+                return _dumps(result)
+            return _dumps({"ok": True, "decision": "approve", **result})
         except Exception as e:
             return _err(e)
 
@@ -309,10 +496,13 @@ def register_reveng_build_tools(mcp: FastMCP) -> None:
             try:
                 result = _launch_reveng_mission(
                     session_id, "reveng_scan", _SCAN_NODE_STAGE,
-                    strategy=rebuild_strategy,
+                    strategy=rebuild_strategy, background=True,
                 )
-                # Async lane: record the strategy now so describe_reveng_result can say
-                # "running" instead of "never built". The score lands when it finishes.
+                if result.get("ok") is False:
+                    return _dumps(result)
+                # Async lane: the mission runs on a worker thread, so record the
+                # strategy now — describe_reveng_result says "running" instead of
+                # "never built", and the score lands on the session when it finishes.
                 _persist_build_result(
                     session_id, strategy=rebuild_strategy, state="running",
                     run_id=result.get("run_id"),

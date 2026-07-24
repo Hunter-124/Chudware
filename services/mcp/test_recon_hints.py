@@ -2,19 +2,25 @@
 
 Two layers of proof (per the RE-14 acceptance):
 
-  1. PURE-PYTHON, engine-free — runs everywhere. Exercises `_cylinder_boss_specs`, the
-     side-effect-free helper that turns an `aicad.reveng_fits/1` doc into additive
-     cylinder-boss candidates. Proves: None/empty hints are a no-op; a convex cylinder fit
-     that the deterministic passes could NOT recover becomes a boss spec; a fit already
-     coaxial with a recovered feature (hole/turned base) is dropped as a duplicate;
-     confidence and axis gates fire.
+  1. PURE-PYTHON, engine-free — runs everywhere. Exercises `_fit_hint_specs`, the
+     side-effect-free helper that turns an `aicad.reveng_fits/1` doc into authorable
+     feature specs. Proves: None/empty hints are a no-op; a convex cylinder fit that the
+     deterministic passes could NOT recover becomes a boss spec; a fit already coaxial
+     with a recovered feature (hole/turned base) is dropped as a duplicate; the axis gate
+     fires. Plus the two `fits_revision: 2` seams: acceptance is graded on FIT QUALITY
+     (`residual_mm` / `inliers`), never on `confidence` (which segment_fit computes as a
+     mesh-share ratio, ~0.03-0.31 for a genuine feature); and a `role: "hole"` fit is
+     authored SUBTRACTIVELY while `unknown` / sphere / cone are reported, never guessed.
 
   2. ENGINE-BACKED — skips cleanly when libchudware isn't staged (mirrors
      test_recon_tools.py's skipif). A plate with a large convex Z cylinder boss: the boss
      radius > pass-5's fillet bound and it is not a bore, so every frozen pass leaves it
      `unclaimed`. Reverse-engineered WITHOUT hints it stays unrecovered; WITH the fit hint
      the additive boss batch recovers it, so hinted match_pct >= unhinted (by construction:
-     hints route through the same eval_compare keep-or-revert gate).
+     hints route through the same eval_compare keep-or-revert gate). A second fixture adds
+     a BLIND BORE down that boss and feeds a `fits_revision: 2` doc at a realistic 0.05
+     mesh-share confidence: the boss is fused, the `role: "hole"` fit is CUT, and the
+     rebuild reaches 100% — the whole scan -> editable, dimensionally-correct CAD claim.
 
 Run:  python3 -m pytest services/mcp/test_recon_hints.py -q
 """
@@ -57,36 +63,69 @@ import json  # noqa: E402
 import pytest  # noqa: E402
 
 from mcp_server import core_bridge as cb  # noqa: E402
-from mcp_server.recon_tools import _cylinder_boss_specs  # noqa: E402
+from mcp_server.recon_tools import (  # noqa: E402
+    _HINT_MIN_CONFIDENCE,
+    _HINT_MIN_INLIERS,
+    _HINT_THROUGH_OVERSHOOT_FRAC,
+    _HINT_THROUGH_OVERSHOOT_MM,
+    _fit_hint_specs,
+)
 
 
 # ---------------------------------------------------------------- pure-Python (always runs)
 
 
-def _fits(*fits: dict) -> dict:
-    return {"schema": "aicad.reveng_fits/1", "session_id": "re_test", "fits": list(fits)}
+def _fits(*fits: dict, revision=None) -> dict:
+    doc = {"schema": "aicad.reveng_fits/1", "session_id": "re_test", "fits": list(fits)}
+    if revision is not None:
+        doc["fits_revision"] = revision
+    return doc
 
 
 def _cyl(radius=8.0, height=12.0, axis=(0, 0, 1), origin=(0, 0, 0), conf=0.9):
+    """A LEGACY (`fits_revision` 1) cylinder fit: no role, no residual_mm, no inliers."""
     return {"kind": "cylinder", "confidence": conf,
             "params_mm": {"radius": radius, "height": height,
                           "axis": list(axis), "origin": list(origin)},
             "source": "ransac", "face_ids": ["f1"]}
 
 
+def _cyl2(role="boss", radius=8.0, height=12.0, axis=(0, 0, 1), origin=(0, 0, 0),
+          base=None, conf=0.05, residual=0.04, inliers=900, through=False, depth=None):
+    """A `fits_revision: 2` cylinder entry shaped exactly as segment_fit `_emit_cylinder`
+    writes it: mesh-share `confidence`, quality via `residual_mm`/`inliers`, semantics via
+    `role`/`through`/`depth_mm`, and `params_mm.base` as the axial start."""
+    return {"kind": "cylinder", "confidence": conf, "source": "ransac",
+            "params_mm": {"radius": radius, "height": height, "axis": list(axis),
+                          "origin": list(origin),
+                          "base": list(origin if base is None else base)},
+            "inliers": inliers, "residual_mm": residual, "face_ids": ["cyl_0"],
+            "role": role, "through": through,
+            "depth_mm": height if depth is None else depth}
+
+
+def _specs(*fits, claimed=(), revision=None):
+    return _fit_hint_specs(_fits(*fits, revision=revision), list(claimed))[0]
+
+
+def _skips(*fits, claimed=(), revision=None):
+    return _fit_hint_specs(_fits(*fits, revision=revision), list(claimed))[1]
+
+
 def test_no_hints_is_a_noop():
-    assert _cylinder_boss_specs(None, []) == []
-    assert _cylinder_boss_specs({}, []) == []
-    assert _cylinder_boss_specs({"schema": "aicad.reveng_fits/1", "fits": []}, []) == []
+    assert _fit_hint_specs(None, []) == ([], [])
+    assert _fit_hint_specs({}, []) == ([], [])
+    assert _fit_hint_specs({"schema": "aicad.reveng_fits/1", "fits": []}, []) == ([], [])
 
 
 def test_unrecovered_cylinder_becomes_a_boss_spec():
-    specs = _cylinder_boss_specs(_fits(_cyl(radius=8.0, height=12.0)), [])
+    specs = _specs(_cyl(radius=8.0, height=12.0))
     assert len(specs) == 1
     s = specs[0]
     assert abs(s["radius"] - 8.0) < 1e-9 and abs(s["height"] - 12.0) < 1e-9
     assert list(s["axis"]) == [0.0, 0.0, 1.0]
     assert list(s["origin"]) == [0.0, 0.0, 0.0]
+    assert s["mode"] == "boss"
 
 
 def test_only_cylinder_fits_are_used():
@@ -94,26 +133,145 @@ def test_only_cylinder_fits_are_used():
            "params_mm": {"dx": 40, "dy": 30, "dz": 10, "origin": [0, 0, 0]}}
     plane = {"kind": "plane", "confidence": 0.9,
              "params_mm": {"normal": [0, 0, 1], "origin": [0, 0, 0]}}
-    assert _cylinder_boss_specs(_fits(box, plane), []) == []
+    assert _specs(box, plane) == []
 
 
-def test_low_confidence_fit_is_dropped():
-    assert _cylinder_boss_specs(_fits(_cyl(conf=0.2)), []) == []
+def test_low_confidence_legacy_fit_is_dropped():
+    # A revision-1 doc ships no residual_mm/inliers, so `confidence` is the ONLY signal and
+    # v1 semantics (it was the quality score) still apply.
+    assert _specs(_cyl(conf=0.2)) == []
 
 
 def test_degenerate_fit_is_dropped():
-    assert _cylinder_boss_specs(_fits(_cyl(radius=0.0)), []) == []
-    assert _cylinder_boss_specs(_fits(_cyl(height=0.0)), []) == []
+    assert _specs(_cyl(radius=0.0)) == []
+    assert _specs(_cyl(height=0.0)) == []
 
 
 def test_fit_coaxial_with_a_recovered_feature_is_a_duplicate():
     # A hole/turned base the passes already own at axis Z through the origin: a coaxial,
     # on-axis cylinder fit describes the SAME geometry -> dropped so we never double-build.
     claimed = [([0.0, 0.0, 1.0], [0.0, 0.0, 0.0])]
-    assert _cylinder_boss_specs(_fits(_cyl(axis=(0, 0, 1), origin=(0, 0, 0))), claimed) == []
+    assert _specs(_cyl(axis=(0, 0, 1), origin=(0, 0, 0)), claimed=claimed) == []
     # ...but a cylinder OFF that axis (a boss elsewhere on the part) is still kept.
-    off = _cylinder_boss_specs(_fits(_cyl(axis=(0, 0, 1), origin=(30, 0, 0))), claimed)
+    off = _specs(_cyl(axis=(0, 0, 1), origin=(30, 0, 0)), claimed=claimed)
     assert len(off) == 1
+    # ...and the duplicate is REPORTED, not silently swallowed.
+    dup = _skips(_cyl(axis=(0, 0, 1), origin=(0, 0, 0)), claimed=claimed)
+    assert len(dup) == 1 and dup[0]["code"] == "already_recovered"
+
+
+# ---------------------------------------------------------------- defect 1: quality gate
+# segment_fit sets `confidence = inliers / total_points`. On a real multi-feature scan one
+# cylinder owns a small slice of the mesh, so a 0.5 confidence gate discarded EVERY genuine
+# hint and kept only synthetic ~0.9 fixtures. Acceptance is now graded on fit quality.
+
+
+def test_realistic_low_mesh_share_fit_reaches_reverse_engineer():
+    """A 6 mm boss on a big scanned bracket: mesh share 0.05, residual 0.04 mm, 1200
+    supporting points. That is an excellent fit and MUST become a hint."""
+    specs = _specs(_cyl2(role="boss", radius=6.0, conf=0.05, residual=0.04, inliers=1200),
+                   revision=2)
+    assert len(specs) == 1, specs
+    assert specs[0]["confidence"] == 0.05  # low mesh share, kept anyway
+    assert specs[0]["mode"] == "boss"
+
+
+def test_a_genuinely_bad_fit_is_still_rejected():
+    """Same mesh share and point count, but the inliers are 2.5 mm off the cylinder — that
+    surface is not a cylinder, so it must NOT be authored."""
+    bad = _cyl2(role="boss", radius=6.0, conf=0.05, residual=2.5, inliers=1200)
+    assert _specs(bad, revision=2) == []
+    sk = _skips(bad, revision=2)
+    assert len(sk) == 1 and sk[0]["code"] == "low_quality"
+    assert "residual" in sk[0]["reason"]
+
+
+def test_residual_is_graded_against_the_feature_size():
+    # 0.45 mm is under the absolute cap but is >5% of a 4 mm bore -> reject...
+    assert _specs(_cyl2(role="hole", radius=4.0, residual=0.45, inliers=400),
+                  revision=2) == []
+    # ...while the same 0.45 mm on a 40 mm boss is 1.1% -> keep.
+    assert len(_specs(_cyl2(role="boss", radius=40.0, residual=0.45, inliers=400),
+                      revision=2)) == 1
+
+
+def test_too_few_inliers_is_rejected():
+    thin = _cyl2(role="boss", residual=0.01, inliers=_HINT_MIN_INLIERS - 1)
+    assert _specs(thin, revision=2) == []
+    assert _skips(thin, revision=2)[0]["code"] == "low_quality"
+
+
+def test_confidence_never_gates_a_fit_that_carries_quality_signals():
+    """Belt and braces: mesh share 0.0 still passes when the fit itself is good."""
+    assert len(_specs(_cyl2(role="boss", conf=0.0, residual=0.02, inliers=500),
+                      revision=2)) == 1
+
+
+# ---------------------------------------------------------------- defect 2: role routing
+# Every cylinder used to become an ADDITIVE boss. Once segment_fit started classifying
+# bores, that turned a hole in the scanned part into a protrusion — inverted geometry.
+
+
+def test_hole_role_is_a_cut_and_never_an_additive_boss():
+    specs = _specs(_cyl2(role="hole", radius=5.0, height=10.0, origin=(0, 0, 0),
+                         base=(0, 0, -5.0), depth=10.0), revision=2)
+    assert len(specs) == 1
+    s = specs[0]
+    assert s["mode"] == "cut", "a scanned bore must be subtractive"
+    assert s["role"] == "hole"
+    assert not any(x["mode"] == "boss" for x in specs)
+    # placement anchors on params_mm.base (the axial START), NOT on the v1 origin.
+    assert list(s["start"]) == [0.0, 0.0, -5.0]
+    assert list(s["origin"]) == [0.0, 0.0, 0.0]
+    # blind bore: exactly depth_mm deep, no overshoot (overshoot = a deeper, wrong hole).
+    assert abs(s["height"] - 10.0) < 1e-9 and s["through"] is False
+
+
+def test_through_bore_overshoots_both_ends_but_a_blind_bore_does_not():
+    thru = _specs(_cyl2(role="hole", radius=5.0, height=9.5, base=(0, 0, 0),
+                        through=True, depth=10.0), revision=2)[0]
+    over = max(_HINT_THROUGH_OVERSHOOT_MM, _HINT_THROUGH_OVERSHOOT_FRAC * 10.0)
+    assert abs(thru["height"] - (10.0 + 2.0 * over)) < 1e-9
+    assert abs(thru["start"][2] - (-over)) < 1e-9
+    assert thru["through"] is True
+    blind = _specs(_cyl2(role="hole", radius=5.0, height=9.5, base=(0, 0, 0),
+                         through=False, depth=9.5), revision=2)[0]
+    assert abs(blind["height"] - 9.5) < 1e-9 and abs(blind["start"][2]) < 1e-9
+
+
+def test_boss_and_shaft_roles_stay_additive():
+    for role in ("boss", "shaft"):
+        s = _specs(_cyl2(role=role, radius=10.0, height=50.0), revision=2)[0]
+        assert s["mode"] == "boss" and s["role"] == role
+
+
+def test_unknown_role_is_never_guessed_into_either_bucket():
+    unk = _cyl2(role="unknown")
+    assert _specs(unk, revision=2) == []
+    sk = _skips(unk, revision=2)
+    assert len(sk) == 1 and sk[0]["code"] == "role_unknown"
+    assert sk[0]["role"] == "unknown"
+
+
+def test_revision_2_entry_with_no_role_at_all_is_not_guessed_either():
+    fit = _cyl2(role="boss")
+    fit.pop("role")
+    assert _specs(fit, revision=2) == []
+    assert _skips(fit, revision=2)[0]["code"] == "role_unknown"
+
+
+def test_sphere_and_cone_are_reported_not_dropped_and_never_cylinders():
+    sphere = {"kind": "sphere", "confidence": 0.1, "inliers": 500, "residual_mm": 0.02,
+              "params_mm": {"center": [1, 2, 3], "radius": 5.0, "origin": [1, 2, 3]},
+              "source": "ransac", "face_ids": ["sphere_0"]}
+    cone = {"kind": "cone", "confidence": 0.1, "inliers": 500, "residual_mm": 0.02,
+            "params_mm": {"apex": [0, 0, 9], "axis": [0, 0, 1], "half_angle_rad": 0.5,
+                          "radius_at_base": 4.0, "height": 8.0, "origin": [0, 0, 9]},
+            "source": "lsq", "face_ids": ["cone_0"]}
+    specs, skipped = _fit_hint_specs(_fits(sphere, cone, revision=2), [])
+    assert specs == []
+    assert [s["fit_kind"] for s in skipped] == ["sphere", "cone"]
+    assert all(s["code"] == "kind_unsupported" for s in skipped)
 
 
 # ---------------------------------------------------------------- engine-backed (skips clean)
@@ -189,12 +347,90 @@ def test_hinted_match_pct_ge_unhinted_on_a_cylinder_boss():
     assert mh > mu, (mh, mu, "hint boss did not improve the match")
 
 
+def _boss_bore_plate_step() -> str:
+    """A plate + a big convex Z boss + a BLIND BORE down that boss — what a scanned part
+    actually looks like. The deterministic hole pass RECOGNISES the bore but cannot drill
+    it (its entry face lives on the boss, which no frozen pass rebuilds), so it lands in
+    `candidates` and its axis stays unclaimed: exactly the gap a role-routed fit hint
+    fills. Returns an exported STEP path (caller unlinks)."""
+    r, _ = _call("new_part", {"name": "re_boss_bore_plate"})
+    doc = r["doc_id"]
+    ops = [
+        cb.feat("box", "Plate",
+                {"length": cb.dim(80), "width": cb.dim(60), "height": cb.dim(10)}),
+        cb.feat("cylinder", "Boss",
+                {"radius": cb.dim(13), "height": cb.dim(15), "mode": "boss",
+                 "at": [0.0, 0.0, 12.5]}),
+        # Blind bore z=+12..+20 — 8 mm down from the boss top face.
+        cb.feat("cylinder", "Bore",
+                {"radius": cb.dim(5), "height": cb.dim(8), "mode": "cut",
+                 "at": [0.0, 0.0, 16.0]}),
+    ]
+    rb, _ = _call("add_features", {"ops": ops, "doc_id": doc})
+    assert rb["ok"], rb
+    ex, _ = _call("export_part", {"fmt": "step", "doc_id": doc})
+    assert ex["ok"], ex
+    return ex["path"]
+
+
+def _rev2_cyl(role, radius, height, base, depth, through=False, conf=0.05, fid="cyl_0"):
+    """A `fits_revision: 2` entry shaped as segment_fit emits it: MESH-SHARE confidence,
+    quality via residual_mm/inliers, semantics via role/through/depth_mm, axial start via
+    `params_mm.base` (`origin` keeps its v1 meaning and is a different point)."""
+    return {"kind": "cylinder", "confidence": conf, "source": "ransac",
+            "params_mm": {"radius": radius, "height": height, "axis": [0, 0, 1],
+                          "origin": [0, 0, 0], "base": list(base)},
+            "inliers": 1400, "residual_mm": 0.05, "face_ids": [fid],
+            "role": role, "through": through, "depth_mm": depth}
+
+
+@_needs_engine
+def test_hinted_role_hole_is_bored_never_bossed():
+    """The scan->CAD point, end to end. Every cylinder carries a realistic mesh-share
+    `confidence` of 0.05 — under the old 0.5 gate all of them were discarded and the
+    feature did nothing on real data. The bore fit is `role: "hole"`; before role routing
+    it would have been authored as an additive boss, turning a recess into a protrusion
+    (an unusable printed part)."""
+    path = _boss_bore_plate_step()
+    try:
+        unhinted, _ = _call("reverse_engineer", {"source": path})
+        fits = {"schema": "aicad.reveng_fits/1", "fits_revision": 2,
+                "session_id": "re_test", "sections": [], "notes": [],
+                # Bore first on purpose: ordering boss-before-bore is the caller's job.
+                "fits": [_rev2_cyl("hole", 5.0, 8.0, (0, 0, 12.0), 8.0, fid="cyl_1"),
+                         _rev2_cyl("boss", 13.0, 15.0, (0, 0, 5.0), 15.0, fid="cyl_0")]}
+        assert all(f["confidence"] < _HINT_MIN_CONFIDENCE for f in fits["fits"])
+        hinted, _ = _call("reverse_engineer", {"source": path, "hints": fits})
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+    assert unhinted["ok"] and hinted["ok"], (unhinted, hinted)
+    hint_feats = [f for f in hinted["features"] if f.get("role") == "hint"]
+    # 1. the bore reached reverse_engineer despite its 0.05 mesh share, and was SUBTRACTIVE
+    bores = [f for f in hint_feats if f.get("hint_role") == "hole"]
+    assert bores and all(f["mode"] == "cut" for f in bores), hinted["features"]
+    # 2. ...and never additive — the inverted-geometry regression.
+    assert not any(f.get("hint_role") == "hole" and f.get("mode") == "boss"
+                   for f in hint_feats), hinted["features"]
+    # 3. the boss stayed additive.
+    assert [f["mode"] for f in hint_feats if f.get("hint_role") == "boss"] == ["boss"]
+    # 4. bosses are authored before bores, so the cut has a body to bore into.
+    assert [f["name"] for f in hint_feats] == ["HintBoss1", "HintBore2"]
+    # 5. the rebuild IS the source now. Measured on the staged libchudware: 86.743 -> 100.0
+    mu, mh = unhinted["match_pct"], hinted["match_pct"]
+    assert mh > mu, (mh, mu, "role-routed hints did not improve the match")
+    assert mh > 99.5, (mh, "boss + bore should reconstruct the source exactly")
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items())
            if k.startswith("test_") and callable(v)]
     failed = 0
     for fn in fns:
-        if not cb.available() and "hinted" in fn.__name__:
+        if not cb.available() and getattr(fn, "pytestmark", None):
             print(f"[SKIP] {fn.__name__} (libchudware not staged)")
             continue
         try:

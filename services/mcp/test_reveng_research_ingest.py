@@ -358,20 +358,34 @@ class TestRevengResearchSourceTool:
 # Freshness smoke — ensure the module imports cleanly
 # ---------------------------------------------------------------------------
 
+# Both smokes force a FRESH import to prove the module still loads standalone. Re-importing
+# leaves a SECOND module object in sys.modules, and the original is what every already-imported
+# test module still holds a reference to — services/mcp/__init__.py deliberately unifies
+# `mcp_server.*` and `services.mcp.*` onto ONE object, so replacing it silently splits that
+# identity for the rest of the process. That is why a later suite could see a reveng/cad module
+# that was not the one it had bound to. Restore the original object once the check is done.
+def _fresh_import_restoring(name: str):
+    import importlib
+    saved = sys.modules.get(name)
+    sys.modules.pop(name, None)
+    try:
+        return importlib.import_module(name)
+    finally:
+        if saved is not None:
+            sys.modules[name] = saved
+        else:
+            sys.modules.pop(name, None)
+
+
 def test_reveng_research_ingest_module_importable():
     """Smoke: research_ingest module loads without error (seams may be absent)."""
-    import importlib
-    # Remove cached copy to force fresh import
-    sys.modules.pop("services.vision.research_ingest", None)
-    mod = importlib.import_module("services.vision.research_ingest")
+    mod = _fresh_import_restoring("services.vision.research_ingest")
     assert hasattr(mod, "research_and_ingest")
     assert callable(mod.research_and_ingest)
 
 
 def test_reveng_tools_module_importable():
     """Smoke: reveng_tools still imports cleanly after RE-29 additions."""
-    import importlib
-    sys.modules.pop("services.mcp.reveng_tools", None)
-    mod = importlib.import_module("services.mcp.reveng_tools")
+    mod = _fresh_import_restoring("services.mcp.reveng_tools")
     assert hasattr(mod, "register_reveng_tools")
     assert callable(mod.register_reveng_tools)

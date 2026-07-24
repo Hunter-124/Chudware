@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <thread>
 
@@ -34,6 +35,26 @@ static long long monoMs() {
         .count();
 }
 
+// LONG-tier engine-call ceiling: the one that applies to the deliberately slow RPCs the fast
+// watchdog exempts (doc_open/doc_save, import_*/export_*, cam_*, run_fea/run_cfd, agent_*).
+// 60 min — the top of the sane range, chosen because the two error costs are wildly asymmetric:
+// tripping this mid-solve or mid-agent-run destroys live work, while a genuinely wedged call
+// only needs to be reclaimed EVENTUALLY, not promptly. agent_run in particular is a synchronous
+// dispatch-thread call whose length is mission-driven with no in-tree bound, so the ceiling is
+// set well past anything we expect to finish rather than tuned to a workload. It is still
+// exactly 40x the interactive ceiling and, crucially, FINITE: without it a hung call holds
+// status_.inflight above 0 forever and idleExpired() can never fire again — the daemon becomes
+// unkillable by its own self-healing. 0 disables the tier (for a deployment that really does
+// run >1 h solves on a dispatch thread). Env: CHUDWARE_HOSTD_ENGINE_WATCHDOG_LONG_S.
+static long long engineWatchdogLongMs() {
+    static const long long ms = [] {
+        if (const char* w = std::getenv("CHUDWARE_HOSTD_ENGINE_WATCHDOG_LONG_S"); w && *w)
+            return (long long)std::max(0, std::atoi(w)) * 1000;
+        return 60LL * 60 * 1000;  // 60 min
+    }();
+    return ms;
+}
+
 Server::Server(chudware_ipc::IpcListener listener, std::string buildId)
     : listener_(std::move(listener)), buildId_(std::move(buildId)) {
     registry_.setEventSender(
@@ -43,7 +64,8 @@ Server::Server(chudware_ipc::IpcListener listener, std::string buildId)
         touch();  // a child exit restarts the linger countdown
     });
     touch();
-    // Engine-call watchdog ceiling (interactive RPCs only; see engine_watchdog.h). 0 disables.
+    // Fast-tier (interactive RPC) watchdog ceiling; 0 disables that tier. The long tier's far
+    // more generous ceiling is engineWatchdogLongMs() above; see engine_watchdog.h for the split.
     if (const char* w = std::getenv("CHUDWARE_HOSTD_ENGINE_WATCHDOG_S"); w && *w)
         engineWatchdogMs_ = (long long)std::max(0, std::atoi(w)) * 1000;
 }
@@ -170,15 +192,37 @@ void Server::staleBinaryTick() {
 bool Server::idleExpired(int lingerSecs) {
     if (status_.clients > 0 || status_.inflight > 0) return false;
     // Never idle-exit under a running mission: children are the daemon's work
-    // even with zero clients (GUI-close continuity). Dirty docs do NOT pin the
-    // daemon — the final autosave on exit covers them.
+    // even with zero clients (GUI-close continuity).
     if (children_.aliveCount() > 0) return false;
+    // Nor while a doc is still inside its GC grace. Idle-exit takes the CLEAN exit path, and a
+    // clean exit purges the entire autosave session dir (Autosave::stop) on the assumption that
+    // the final save covered everything. It does not cover this: a doc whose grace has NOT
+    // elapsed was deliberately kept openable (agent/mcp-origin docs get 30 min — gcAgentGraceMs,
+    // doc_registry.cpp) and has not been retired to the orphan tier yet, so exiting first would
+    // delete exactly the mission work the grace exists to protect, leaving the next start's
+    // recoverPriorSession() nothing to find. Docs already PAST their deadline are excluded on
+    // purpose: the accept loop retires + closes those, and a retire that keeps failing must
+    // never pin the daemon forever.
+    const int gcPending = registry_.pendingGcCount();
+    // Transition only — this runs every 500 ms and the state can last the whole 30-min grace;
+    // "why is the daemon still up?" deserves exactly one answer in the log. run() is the sole
+    // caller (accept-loop thread), so the static needs no synchronisation.
+    static int loggedGcPending = 0;
+    if (gcPending != loggedGcPending) {
+        if (gcPending > 0)
+            log().line("idle, but %d doc(s) are still inside their GC grace — staying up so the "
+                       "clean-exit autosave purge cannot discard them", gcPending);
+        loggedGcPending = gcPending;
+    }
+    if (gcPending > 0) return false;
     return monoMs() - status_.lastActivityMs > (long long)lingerSecs * 1000;
 }
 
 void Server::run(int lingerSecs) {
     children_.start();
-    if (engineWatchdogMs_ > 0)
+    // Either tier being enabled is reason enough to run the thread: the ceilings are tuned
+    // independently, so disabling the interactive one must not silently disable the long one.
+    if (engineWatchdogMs_ > 0 || engineWatchdogLongMs() > 0)
         watchdog_ = std::thread([this] { watchdogLoop(); });
     while (!stopping_) {
         chudware_ipc::IpcConn conn = listener_.accept(500);
@@ -285,33 +329,99 @@ bool Server::gcCloseDoc(const std::string& docId, const char* reason) {
     return true;
 }
 
+// RAII tally for Status::inflight. A bare ++/-- pair around dispatch() leaks the counter when
+// dispatch throws, and that leak is PERMANENT: idleExpired() gates on inflight == 0, so a single
+// leaked increment locks the daemon out of its own idle-exit for the rest of the process.
+namespace {
+struct InflightTally {
+    std::atomic<int>& n;
+    explicit InflightTally(std::atomic<int>& c) : n(c) { ++n; }
+    ~InflightTally() { --n; }
+};
+}  // namespace
+
 void Server::clientLoop(std::shared_ptr<ClientConn> c) {
-    std::string line;
-    while (!stopping_ && c->conn.readLine(line, -1)) {
-        json msg = json::parse(line, nullptr, false);
-        if (msg.is_discarded()) continue;
-        const int id = msg.value("id", -1);
-        const std::string method = msg.value("method", "");
-        ++status_.inflight;
-        bool isError = false;
-        json payload = dispatch(*c, method, msg.value("params", json::object()), isError);
-        --status_.inflight;
+    // An exception escaping a std::thread entry function is an instant std::terminate() of the
+    // WHOLE daemon — every other client's session gone, and none of the clean-shutdown tail
+    // (final autosave, child shutdown, sidecar reap) runs. Nothing in this loop may propagate
+    // out, and the disconnect tail below must run whatever happens in it.
+    try {
+        std::string line;
+        while (!stopping_ && c->conn.readLine(line, -1)) {
+            json msg = json::parse(line, nullptr, false);
+            if (msg.is_discarded()) continue;
+            // The envelope is client-supplied too: msg.value("id", -1) throws on a string id
+            // exactly like a bad param does, and we need the id to answer with an error at all.
+            // Type-check both instead of relying on value()'s conversion.
+            const int id =
+                msg.contains("id") && msg["id"].is_number_integer() ? msg["id"].get<int>() : -1;
+            const std::string method = msg.contains("method") && msg["method"].is_string()
+                                           ? msg["method"].get<std::string>()
+                                           : std::string();
+            bool isError = false;
+            json payload;
+            try {
+                InflightTally tally(status_.inflight);
+                payload = dispatch(*c, method, msg.value("params", json::object()), isError);
+            } catch (const std::exception& e) {
+                // Canonical case: a field of the wrong JSON type ({"force":1} instead of
+                // {"force":true}) throws nlohmann::json::type_error out of one of dispatch()'s
+                // dozens of typed accessors. One bad request must cost exactly one request.
+                isError = true;
+                payload = json{{"code", "bad_request"}, {"message", e.what()}};
+                log().line("client #%d: '%s' threw (%s) — rejected that request; the daemon and "
+                           "every other client are unaffected", c->id, method.c_str(), e.what());
+            } catch (...) {
+                isError = true;
+                payload = json{{"code", "bad_request"},
+                               {"message", "dispatch threw a non-standard exception"}};
+                log().line("client #%d: '%s' threw a non-standard exception — rejected that "
+                           "request", c->id, method.c_str());
+            }
+            touch();
+            json resp = {{"id", id}};
+            resp[isError ? "error" : "result"] = std::move(payload);
+            // dump() is this loop's other throw site: it rejects invalid UTF-8 (type_error.316),
+            // which an engine message quoting raw bytes can carry. Answer with something
+            // serialisable rather than silently dropping a client that is blocked on this reply.
+            std::string out;
+            try {
+                out = resp.dump();
+            } catch (const std::exception& e) {
+                log().line("client #%d: response to '%s' is not serialisable (%s)", c->id,
+                           method.c_str(), e.what());
+                out = json{{"id", id},
+                           {"error", {{"code", "encoding_error"}, {"message", e.what()}}}}
+                          .dump();
+            }
+            std::lock_guard<std::mutex> wlk(c->writeMtx);
+            if (!c->conn.writeLine(out)) break;
+        }
+    } catch (const std::exception& e) {
+        log().line("client #%d: connection loop aborted (%s) — dropping this client only", c->id,
+                   e.what());
+    } catch (...) {
+        log().line("client #%d: connection loop aborted (non-standard exception) — dropping "
+                   "this client only", c->id);
+    }
+    // Disconnect tail: runs on EVERY path out of the loop, including the guarded ones. Skipping
+    // it would leak this client's slot and the clients_ count — and a stuck count is itself one
+    // of the things that stops the daemon ever idle-exiting. It must not throw out of the thread
+    // either, hence the guard around it.
+    try {
+        {
+            std::lock_guard<std::mutex> lk(clientsMtx_);
+            c->thread.detach();  // we're on this thread; the map drop releases the struct
+            clients_.erase(c->id);
+        }
+        --status_.clients;
         touch();
-        json resp = {{"id", id}};
-        resp[isError ? "error" : "result"] = std::move(payload);
-        std::lock_guard<std::mutex> wlk(c->writeMtx);
-        if (!c->conn.writeLine(resp.dump())) break;
+        log().line("client #%d (%s) disconnected (%d left)", c->id, c->kind.c_str(),
+                   status_.clients.load());
+        registry_.onDisconnect(c->id, c->kind);
+    } catch (...) {
+        log().line("client #%d: disconnect cleanup threw — daemon continues", c->id);
     }
-    {
-        std::lock_guard<std::mutex> lk(clientsMtx_);
-        c->thread.detach();  // we're on this thread; the map drop releases the struct
-        clients_.erase(c->id);
-    }
-    --status_.clients;
-    touch();
-    log().line("client #%d (%s) disconnected (%d left)", c->id, c->kind.c_str(),
-               status_.clients.load());
-    registry_.onDisconnect(c->id, c->kind);
 }
 
 json Server::dispatch(ClientConn& c, const std::string& method, const json& params,
@@ -640,34 +750,48 @@ int Server::engineInflightCount() const {
     return (int)inflight_.size();
 }
 
-// Background watchdog: force-restart the daemon if a watchdogged interactive engine call runs
-// past engineWatchdogMs_. An OCCT call cannot be interrupted in-process, so a genuine hang is
-// only recoverable by ending the process; systemd (Restart=on-failure) respawns and docs recover
-// from autosave (explicit/user-gated — no auto-replay loop). Only interactive rebuilds are
-// guarded; sims/agents/exports/imports/opens/saves run long by design and are exempt.
+// Background watchdog: force-restart the daemon when a tracked engine call blows its tier's
+// ceiling (engine_watchdog.h). An OCCT call cannot be interrupted in-process, so a genuine hang
+// is only recoverable by ending the process; systemd (Restart=on-failure) respawns and docs
+// recover from autosave (explicit/user-gated — no auto-replay loop). Interactive rebuilds trip
+// the fast ceiling. Sims/agents/exports/imports/opens/saves are still exempt from THAT, but no
+// longer from every ceiling: they answer to the far more generous long ceiling, whose only job
+// is to make sure a call that will never return cannot hold inflight above 0 and lock the
+// daemon out of idle-exit permanently.
 void Server::watchdogLoop() {
+    const long long longCeilingMs = engineWatchdogLongMs();
     while (!stopping_.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
         if (stopping_.load()) break;
         const long long now = monoMs();
         std::string method;
+        const char* tier = nullptr;
         long long elapsed = 0;
+        long long ceiling = 0;
         int clientId = 0;
         {
             std::lock_guard<std::mutex> lk(inflightMtx_);
             for (const auto& [cid, call] : inflight_) {
-                if (engineCallOverdue(call.method, now - call.startMs, engineWatchdogMs_)) {
-                    method = call.method;
-                    elapsed = now - call.startMs;
-                    clientId = cid;
-                    break;
+                const long long ms = now - call.startMs;
+                if (engineCallOverdue(call.method, ms, engineWatchdogMs_)) {
+                    tier = "interactive";
+                    ceiling = engineWatchdogMs_;
+                } else if (engineCallOverdueLong(call.method, ms, longCeilingMs)) {
+                    tier = "long-running";
+                    ceiling = longCeilingMs;
+                } else {
+                    continue;
                 }
+                method = call.method;
+                elapsed = ms;
+                clientId = cid;
+                break;
             }
         }
-        if (!method.empty()) {
-            log().line("FATAL: engine call '%s' (client #%d) stuck %lldms > %lldms ceiling — "
+        if (tier) {
+            log().line("FATAL: %s engine call '%s' (client #%d) stuck %lldms > %lldms ceiling — "
                        "self-healing via restart; docs recover from autosave on next start",
-                       method.c_str(), clientId, elapsed, engineWatchdogMs_);
+                       tier, method.c_str(), clientId, elapsed, ceiling);
             std::fflush(stdout);
             std::fflush(stderr);
             std::_Exit(70);

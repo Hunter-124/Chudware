@@ -16,6 +16,8 @@
 #include <GLFW/glfw3.h>
 #include <stb_image_write.h>
 
+#include <atomic>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -25,9 +27,13 @@
 #include <string>
 #include <system_error>
 #include <vector>
+#ifndef _WIN32
+#include <unistd.h>  // environ (glibc declares it at global scope)
+#endif
 
 #include "bootstrap.h"
 #include "core/app_state.h"  // appstateInitPersist (WASM IDBFS)
+#include "ipc_discovery.h"   // chudware_ipc::SingleInstance/instanceKey/guiLockPath (services/ipc)
 #include "mesh.h"
 #include "renderer.h"
 #include "worker_client.h"
@@ -43,6 +49,11 @@
 #include <windows.h>
 #include <dbghelp.h>
 #include <ctime>
+#endif
+
+#ifndef _WIN32
+#include <fcntl.h>   // single-instance guard: lock-file pid read
+#include <unistd.h>
 #endif
 
 int run_gui(const char* screenshotPath, const char* openPath = nullptr);  // gui_app.cpp
@@ -161,11 +172,7 @@ void installCrashHandler() { SetUnhandledExceptionFilter(chudwareCrashFilter); }
 void installCrashHandler() {}
 #endif
 
-#ifndef _WIN32
-// Declared extern "C" at namespace scope so it keeps external linkage even inside an
-// unnamed namespace (a plain `extern` in the function got internal linkage -> link error).
-extern "C" char** environ;
-#endif
+
 
 // ---- Chudware env-var shim -------------------------------------------------------------------
 // CHUDWARE_* is the canonical public env-var prefix (deep-rename); CHUDWARE_* / CHUDWARE_* remain the
@@ -378,6 +385,199 @@ static void applyLegacyEnvCompat() {
     }
 }
 
+// ---- single-instance guard (desktop GUI) -----------------------------------------------------
+// One install, one window. This reuses the daemon's own primitive — chudware_ipc::SingleInstance
+// (flock on POSIX, named mutex on Windows) — keyed on THIS binary's path, exactly the way
+// chudware-hostd guards itself (core/hostd/main.cpp). Keying on the binary keeps a dev tree and
+// an installed build independent singletons, matching how they already get separate daemons.
+//
+// Losing the race is not an error: the user double-clicked expecting a window, so poke the
+// incumbent to surface itself and exit 0. The poke is one bit — SIGUSR1 on POSIX (addressed to the
+// pid SingleInstance::acquire already records in the lock file), an auto-reset named event on
+// Windows — consumed by the frame loop in app.cpp. The handler only sets an atomic; every GLFW
+// call stays on the render thread.
+//
+// The guard FAILS OPEN by design. A lock we could not even establish (unwritable runtime dir,
+// denied kernel namespace) must never be the reason the app refuses to start, so we stand down
+// only after confirming a live incumbent really holds it.
+//
+// AUTOMATION EXEMPTIONS — load-bearing. scripts/gate.sh stage 5, scripts/icon_pipeline.py and the
+// CHUDWARE_SHOT=* scenarios launch this binary headlessly, sometimes back-to-back or concurrently;
+// a blanket guard would fail the build gate. The guard is skipped when:
+//   * "--ui-screenshot" appears anywhere in argv (the headless capture-then-exit mode), or
+//   * $CHUDWARE_SHOT is set (a scripted scenario), or
+//   * $CHUDWARE_ALLOW_MULTI is set to anything but 0 (explicit power-user escape hatch).
+#ifndef __EMSCRIPTEN__
+namespace {
+
+#ifdef _WIN32
+HANDLE g_activateEvent = nullptr;
+#else
+std::atomic<bool> g_activateRequested{false};
+
+void onActivateSignal(int) { g_activateRequested.store(true, std::memory_order_relaxed); }
+
+// The pid SingleInstance::acquire writes into the lock file — same convention, and the same
+// liveness re-check, as the daemon's readLockPid. 0 = unreadable or not a live process.
+long readGuiLockPid(const std::string& lockFile) {
+    const int fd = ::open(lockFile.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    char buf[64] = {0};
+    const ssize_t n = ::read(fd, buf, sizeof buf - 1);
+    ::close(fd);
+    if (n <= 0) return 0;
+    char* end = nullptr;
+    const long pid = std::strtol(buf, &end, 10);
+    if (pid <= 1 || end == buf) return 0;
+    return ::kill(static_cast<pid_t>(pid), 0) == 0 ? pid : 0;
+}
+#endif
+
+std::string selfExePath() {
+#ifdef _WIN32
+    char buf[MAX_PATH];
+    const DWORD n = GetModuleFileNameA(nullptr, buf, MAX_PATH);
+    return n ? std::string(buf, n) : std::string();
+#else
+    char buf[4096];
+    const ssize_t n = ::readlink("/proc/self/exe", buf, sizeof buf - 1);
+    if (n <= 0) return "";
+    buf[n] = 0;
+    return buf;
+#endif
+}
+
+bool automationLaunch(int argc, char** argv) {
+    for (int i = 1; i < argc; ++i)
+        if (argv[i] && std::strcmp(argv[i], "--ui-screenshot") == 0) return true;
+    if (const char* s = std::getenv("CHUDWARE_SHOT"); s && *s) return true;
+    const char* multi = std::getenv("CHUDWARE_ALLOW_MULTI");
+    return multi && multi[0] && multi[0] != '0';
+}
+
+// The document a bare (non-flag) argv[1] names, when it exists on disk — the "Open with" verb the
+// OS invokes on a double-clicked .step+/.ecad+. nullptr = plain launch, or an argument naming
+// nothing. Shared by the guard's hand-off below and the file-association path in main().
+const char* documentArg(int argc, char** argv) {
+    if (argc < 2 || !argv[1] || argv[1][0] == '-') return nullptr;
+    std::error_code ec;
+    return std::filesystem::exists(argv[1], ec) ? argv[1] : nullptr;
+}
+
+// Sibling of the lock file, in the same runtime dir. "" when there is no usable runtime dir.
+std::string g_activationDoc;
+
+// False = another GUI already owns this install; it has been asked to raise itself and this
+// process must exit 0 without touching CEF, GLFW or the daemon.
+bool claimSingleInstance(int argc, char** argv) {
+    if (automationLaunch(argc, argv)) return true;
+
+    const std::string key = chudware_ipc::instanceKey(selfExePath());
+    const std::string lock = chudware_ipc::guiLockPath(key);
+    if (lock.empty()) return true;  // no usable runtime dir — fail open
+    // "Open with" hand-off note: the app opens documents from argv, so a second launch carrying
+    // one must not have it silently swallowed by the guard. Not a queue and not a protocol —
+    // one pending doc, last writer wins, unlinked the moment it is read.
+    if (const std::string dir = chudware_ipc::runtimeDir(); !dir.empty())
+        g_activationDoc = dir + "/gui-" + key + ".open";
+
+#ifdef _WIN32
+    // Create the wake event BEFORE claiming the mutex so "mutex taken" always implies "event
+    // exists". CreateEventA on an existing name just opens it, so winner and loser end up holding
+    // the same object and the loser needs no second lookup.
+    g_activateEvent = CreateEventA(nullptr, /*manual reset*/ FALSE, /*initially set*/ FALSE,
+                                   (lock + "-activate").c_str());
+#endif
+
+    // Process-lifetime claim. Every GUI exit path ends in std::_Exit, so this is never released
+    // explicitly — which is the point: flock/mutex die with the process, so a crashed instance
+    // leaves nothing to clean up and the next launch simply wins the lock.
+    static chudware_ipc::SingleInstance instance;
+    std::string err;
+    if (instance.acquire(lock, err)) {
+        // A fresh incumbent owns no hand-off: discard anything a previous, dead instance left.
+        if (!g_activationDoc.empty()) {
+            std::error_code ec;
+            std::filesystem::remove(g_activationDoc, ec);
+        }
+#ifndef _WIN32
+        // sigaction, not signal(): SA_RESTART. SIGUSR1 lands on an arbitrary thread, and the
+        // worker/IPC threads sit in blocking reads that must not come back EINTR.
+        struct sigaction sa {};
+        sa.sa_handler = onActivateSignal;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = SA_RESTART;
+        ::sigaction(SIGUSR1, &sa, nullptr);
+#endif
+        return true;
+    }
+
+    // Confirm a LIVE incumbent before standing down — see "fails open" above.
+#ifdef _WIN32
+    const HANDLE held = OpenMutexA(SYNCHRONIZE, FALSE, lock.c_str());
+    const bool incumbent = held != nullptr;
+    if (held) CloseHandle(held);
+#else
+    const long pid = readGuiLockPid(lock);
+    const bool incumbent = pid > 1;
+#endif
+    if (!incumbent) {
+        std::fprintf(stderr,
+                     "Chudware: single-instance guard unavailable (%s) — starting anyway\n",
+                     err.c_str());
+        return true;
+    }
+
+    // Hand the document over BEFORE the poke, so the incumbent's activation branch always sees
+    // both in the same frame. Absolute: the incumbent's cwd is not ours.
+    if (const char* doc = documentArg(argc, argv); doc && !g_activationDoc.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(
+            std::filesystem::path(g_activationDoc).parent_path(), ec);
+        std::ofstream f(g_activationDoc, std::ios::binary | std::ios::trunc);
+        if (f) f << std::filesystem::absolute(doc, ec).string() << "\n";
+    }
+
+#ifdef _WIN32
+    if (g_activateEvent) {
+        // We are the foreground process (the user just launched us). Hand that right over, or the
+        // incumbent's SetForegroundWindow is vetoed by the foreground lock and only flashes.
+        AllowSetForegroundWindow(ASFW_ANY);
+        SetEvent(g_activateEvent);
+    }
+#else
+    ::kill(static_cast<pid_t>(pid), SIGUSR1);
+#endif
+    std::fprintf(stderr, "Chudware: already running — raising the existing window\n");
+    return false;
+}
+
+}  // namespace
+
+// app.cpp frame loop: true exactly once per activation poke from a second launch.
+bool guiConsumeActivationRequest() {
+#ifdef _WIN32
+    return g_activateEvent && WaitForSingleObject(g_activateEvent, 0) == WAIT_OBJECT_0;
+#else
+    return g_activateRequested.exchange(false, std::memory_order_relaxed);
+#endif
+}
+
+// app.cpp frame loop: the document a second launch handed over with its poke ("Open with" on an
+// already-running app), or "" when there is none. Read-and-forget.
+std::string guiTakeActivationDoc() {
+    if (g_activationDoc.empty()) return "";
+    std::string path;
+    {
+        std::ifstream f(g_activationDoc, std::ios::binary);
+        std::getline(f, path);
+    }
+    std::error_code ec;
+    std::filesystem::remove(g_activationDoc, ec);
+    return path;
+}
+#endif  // !__EMSCRIPTEN__
+
 int main(int argc, char** argv) {
     applyLegacyEnvCompat();  // legacy env-var back-compat (pre-Chudware rename)
 #ifdef __EMSCRIPTEN__
@@ -487,6 +687,10 @@ int main(int argc, char** argv) {
         std::printf("%s\n", log.c_str());
         return ok ? 0 : 1;
     }
+    // One window per install. Deliberately before CEF init below, so a duplicate launch exits
+    // without spinning Chromium up (and then having to tear it down); every headless CLI mode
+    // above has already returned, and --ui-screenshot is exempted inside the guard itself.
+    if (!claimSingleInstance(argc, argv)) return 0;
 #ifdef CHUDWARE_ENABLE_CEF
     // GUI path always boots CEF here — before run_gui / GLFW. Chromium must own
     // display + signal setup first; initializing after GLFW (true "lazy" first-
@@ -532,11 +736,8 @@ int main(int argc, char** argv) {
         std::_Exit(rc);
         return rc;  // unreachable; satisfies the compiler
     };
-    if (argc >= 2 && argv[1] && argv[1][0] != '-') {
-        std::error_code ec;
-        const char* openArg = std::filesystem::exists(argv[1], ec) ? argv[1] : nullptr;
-        return hard_exit(run_gui(nullptr, openArg));
-    }
+    if (argc >= 2 && argv[1] && argv[1][0] != '-')
+        return hard_exit(run_gui(nullptr, documentArg(argc, argv)));
     // GUI opens immediately and provisions the runtime in-app (with progress) if needed.
 #ifdef __EMSCRIPTEN__
     std::fprintf(stderr, "[wasm-boot] calling run_gui\n");

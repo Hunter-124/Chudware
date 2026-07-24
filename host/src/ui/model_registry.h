@@ -132,10 +132,18 @@ inline const std::vector<ModelInfo>& builtinModels() {
         {PROV_GEMINI, "gemini-2.5-pro", "Gemini 2.5 Pro", true, true},
         {PROV_GEMINI, "gemini-2.5-flash", "Gemini 2.5 Flash", true, true},
         {PROV_GEMINI, "gemini-2.0-flash", "Gemini 2.0 Flash", true, false},
-        // Anthropic.
-        {PROV_ANTHROPIC, "claude-opus-4-8", "Claude Opus 4.8", true, true},
+        // Anthropic — FALLBACK ONLY, in live-API order (newest first). The real list comes from
+        // the agent_list_models probe (libchudware.cpp), which asks the OMP bridge / Anthropic's
+        // GET /v1/models and wins whenever it answers; these rows are what the picker shows
+        // before/without a successful probe. Do NOT treat this as the source of truth — a new
+        // Claude release needs no edit here to appear, only a reachable credential.
+        {PROV_ANTHROPIC, "claude-opus-5", "Claude Opus 5", true, true},
         {PROV_ANTHROPIC, "claude-sonnet-5", "Claude Sonnet 5", true, true},
         {PROV_ANTHROPIC, "claude-fable-5", "Claude Fable 5", true, true},
+        {PROV_ANTHROPIC, "claude-opus-4-8", "Claude Opus 4.8", true, true},
+        {PROV_ANTHROPIC, "claude-opus-4-7", "Claude Opus 4.7", true, true},
+        {PROV_ANTHROPIC, "claude-sonnet-4-6", "Claude Sonnet 4.6", true, true},
+        {PROV_ANTHROPIC, "claude-opus-4-6", "Claude Opus 4.6", true, true},
         {PROV_ANTHROPIC, "claude-haiku-4-5", "Claude Haiku 4.5", true, false},
         // OpenAI cloud (gpt-5.6-sol is current; older ≤ gpt-5.5 and o3 purged).
         {PROV_OPENAI, "gpt-5.6-sol", "GPT-5.6 Sol", true, true},

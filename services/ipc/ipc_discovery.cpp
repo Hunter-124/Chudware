@@ -93,6 +93,14 @@ std::string lockPath(const std::string& key) {
     return dir.empty() ? "" : dir + "/hostd-" + key + ".lock";
 }
 
+std::string guiLockPath(const std::string& key) {
+    // Deliberately NOT named "hostd-*": the daemon's stale-endpoint sweep (core/hostd/main.cpp)
+    // only reaps hostd-*.lock pairs, and this file must survive it — as with every lock here the
+    // flock, not the file's existence, is the claim.
+    std::string dir = runtimeDir();
+    return dir.empty() ? "" : dir + "/gui-" + key + ".lock";
+}
+
 std::string resolveHostdBin(const std::string& hint) {
     if (const char* b = std::getenv("CHUDWARE_HOSTD_BIN"); b && *b) return b;
     if (!hint.empty() && ::access(hint.c_str(), X_OK) == 0) return hint;

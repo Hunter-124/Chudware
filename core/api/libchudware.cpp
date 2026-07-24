@@ -1617,16 +1617,127 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                             out_json, 0);
             }
             if (provider == "anthropic") {
-                // No keyless list endpoint; report availability by key presence + a static set.
-                bool ok = !api_key.empty();
-                if (ok) {
-                    json meta = heuristic_meta("claude-opus-4-8");
-                    meta["label"] = "Claude Opus 4.8";
-                    meta["auto_source"] = "heuristic";
-                    push_row("claude-opus-4-8", std::move(meta));
+                // Anthropic DOES publish a list endpoint (GET /v1/models) — the old
+                // "no keyless list endpoint" note here was simply wrong, which is why this
+                // branch reported exactly one hardcoded id and new Claude releases never
+                // showed up in the picker. Three tiers, best first:
+                //   1. the OMP bun bridge (models_list) — the ONLY path that works for
+                //      subscription/OAuth users, whose token lives in the bridge auth db and
+                //      never reaches this RPC as `api_key`. Its rows carry `source`:
+                //      "live" (discovered from the provider now) or "bundled" (catalog only).
+                //   2. a direct GET /v1/models with the raw api_key, when the bridge had no
+                //      LIVE list to give but the caller passed a key.
+                //   3. a static set of known ids, so the picker is never empty offline.
+                // Ordering is preserved from whichever tier answered (newest model first).
+                auto str_of = [](const json& o, const char* k) -> std::string {
+                    if (!o.is_object()) return {};
+                    auto it = o.find(k);
+                    return it != o.end() && it->is_string() ? it->get<std::string>() : std::string();
+                };
+                bool live = false;                     // a live endpoint actually answered
+                bool credentialed = !api_key.empty();  // drives `ok` (provider selectable)
+                std::string err;
+                // --- tier 1: bridge ---
+                json bridge = omp_bridge_proxy("models_list", json{{"provider", "anthropic"}});
+                const bool bridge_ok = bridge.is_object() && bridge.value("ok", false);
+                if (bridge_ok && bridge.contains("models") && bridge["models"].is_array()) {
+                    const bool bridge_live = str_of(bridge, "source") == "live";
+                    for (const auto& e : bridge["models"]) {
+                        std::string id = str_of(e, "id");
+                        if (id.empty()) continue;
+                        json meta = heuristic_meta(id);
+                        std::string name = str_of(e, "name");
+                        if (!name.empty()) meta["label"] = name;
+                        if (e.contains("contextWindow") && e["contextWindow"].is_number())
+                            meta["context"] = static_cast<int>(e["contextWindow"].get<double>());
+                        if (e.contains("maxTokens") && e["maxTokens"].is_number())
+                            meta["max_output"] = static_cast<int>(e["maxTokens"].get<double>());
+                        if (e.contains("vision") && e["vision"].is_boolean())
+                            meta["vision"] = e["vision"].get<bool>();
+                        if (e.contains("supportsTools") && e["supportsTools"].is_boolean())
+                            meta["tools"] = e["supportsTools"].get<bool>();
+                        meta["auto_source"] = str_of(e, "source") == "live" ? "live" : "bundled";
+                        push_row(id, std::move(meta));
+                    }
+                    live = bridge_live && !models.empty();
+                    credentialed = credentialed || live;
+                } else if (!bridge_ok) {
+                    err = str_of(bridge, "error");
                 }
-                return emit(json{{"ok", ok}, {"models", models}, {"model_rows", model_rows}},
-                            out_json, 0);
+                // --- tier 2: direct probe with a raw key (only when the bridge had no live list;
+                // a successful probe REPLACES the bridge's bundled rows, a failed one keeps them) ---
+                if (!live && !api_key.empty()) {
+                    std::vector<std::pair<std::string, std::string>> hdrs = {
+                        {"x-api-key", api_key}, {"anthropic-version", "2023-06-01"}};
+                    chudware::agent::HttpResponse hr = chudware::agent::http_get(
+                        "https://api.anthropic.com/v1/models?limit=1000", hdrs);
+                    if (hr.error.empty() && hr.status >= 200 && hr.status < 300) {
+                        json parsed = json::parse(hr.body, nullptr, false);
+                        const json* data = nullptr;
+                        if (parsed.is_object()) {
+                            auto it = parsed.find("data");
+                            if (it != parsed.end() && it->is_array() && !it->empty()) data = &*it;
+                        }
+                        if (data) {
+                            models = json::array();
+                            model_rows = json::array();
+                            for (const auto& d : *data) {
+                                std::string id = str_of(d, "id");
+                                if (id.empty()) continue;
+                                json meta = heuristic_meta(id);
+                                std::string disp = str_of(d, "display_name");
+                                if (!disp.empty()) meta["label"] = disp;
+                                meta["auto_source"] = "live";
+                                push_row(id, std::move(meta));
+                            }
+                            live = !models.empty();
+                            credentialed = credentialed || live;
+                        }
+                    } else if (err.empty()) {
+                        err = hr.error.empty() ? ("HTTP " + std::to_string(hr.status)) : hr.error;
+                    }
+                }
+                // --- tier 3: static set (mirrors host/src/ui/model_registry.h builtinModels();
+                // both are FALLBACKS — the live list above is the source of truth) ---
+                if (models.empty()) {
+                    static const std::pair<const char*, const char*> kStatic[] = {
+                        {"claude-opus-5", "Claude Opus 5"},
+                        {"claude-sonnet-5", "Claude Sonnet 5"},
+                        {"claude-fable-5", "Claude Fable 5"},
+                        {"claude-opus-4-8", "Claude Opus 4.8"},
+                        {"claude-opus-4-7", "Claude Opus 4.7"},
+                        {"claude-sonnet-4-6", "Claude Sonnet 4.6"},
+                        {"claude-opus-4-6", "Claude Opus 4.6"},
+                        {"claude-haiku-4-5", "Claude Haiku 4.5"}};
+                    for (const auto& sm : kStatic) {
+                        json meta = heuristic_meta(sm.first);
+                        meta["label"] = sm.second;
+                        meta["auto_source"] = "heuristic";
+                        push_row(sm.first, std::move(meta));
+                    }
+                }
+                // Availability: a raw api_key OR a live list proves a credential. Without either
+                // (offline subscription user), ask the bridge whether it HOLDS an Anthropic
+                // credential — OAuth/subscription tokens live in its auth db and never appear as
+                // `api_key` here, and keying availability off api_key alone is exactly what hid
+                // Anthropic from those users' pickers. auth_list_providers is a local read.
+                if (!credentialed) {
+                    json provs = omp_bridge_proxy("auth_list_providers", json::object());
+                    if (provs.is_object() && provs.value("ok", false) &&
+                        provs.contains("providers") && provs["providers"].is_array())
+                        for (const auto& p : provs["providers"]) {
+                            if (str_of(p, "id") != "anthropic") continue;
+                            std::string st = str_of(p, "state");
+                            if (st == "oauth_connected" || st == "key_set") credentialed = true;
+                        }
+                }
+                json out = json::object();
+                out["ok"] = credentialed;
+                out["models"] = std::move(models);
+                out["model_rows"] = std::move(model_rows);
+                if (!credentialed)
+                    out["error"] = err.empty() ? std::string("no Anthropic credential") : err;
+                return emit(std::move(out), out_json, 0);
             }
             return emit(json{{"ok", false}, {"models", models}, {"model_rows", model_rows},
                              {"error", "unknown provider"}},

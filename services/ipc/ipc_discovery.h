@@ -28,6 +28,13 @@ std::string instanceKey(const std::string& hostdBin);
 std::string socketPath(const std::string& key);
 std::string lockPath(const std::string& key);
 
+// Single-instance lock name for the DESKTOP GUI, keyed the same way (instanceKey of the
+// GUI binary). A sibling of lockPath() that can never collide with it: the daemon and the
+// window are independent singletons — one daemon may legitimately outlive/precede its GUI.
+// POSIX -> a lock file next to the daemon's in the runtime dir; Windows -> a named-mutex
+// name. Same shape as lockPath(), so SingleInstance takes either one verbatim.
+std::string guiLockPath(const std::string& key);
+
 // Runtime dir ($XDG_RUNTIME_DIR/chudware or /tmp/chudware-<uid>), created 0700 with
 // ownership verified (refuses a dir owned by someone else). "" on failure.
 std::string runtimeDir();

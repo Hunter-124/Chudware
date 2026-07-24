@@ -165,6 +165,14 @@ inline void wasmBootDom(const char *msg) {
 
 #include <filesystem> // Wave N: ecad export output dir + W14: flat-pattern DXF export
 
+#ifndef __EMSCRIPTEN__
+// main.cpp — single-instance guard. True exactly once per "raise yourself" poke sent by a second
+// launch of this install (SIGUSR1 on POSIX, a named event on Windows).
+bool guiConsumeActivationRequest();
+// main.cpp — the document that second launch carried, if it was an "Open with" ("" = none).
+std::string guiTakeActivationDoc();
+#endif
+
 // =====================================================================================
 // Wave N: AI-ECAD GUI command wiring. Creates/routes ECAD documents through the
 // worker ecad_* RPCs (engine/ecad/rpc.py) and feeds the
@@ -2822,6 +2830,13 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   const char *shotMode =
       std::getenv("CHUDWARE_SHOT"); // screenshot-only:
                                   // settings|chat|assembly|plan|ribbon|pmform
+  // Headless captures are single-frame: a transient toast pinned over the top-right
+  // occludes whatever panel the shot is verifying (the Copilot header, the ribbon's
+  // first group, ...). Suppress toasts for EVERY --ui-screenshot capture unless
+  // CHUDWARE_SHOT_KEEPTOAST=1 asks for them (used to verify the toast itself).
+  if (shot && !(std::getenv("CHUDWARE_SHOT_KEEPTOAST") &&
+                *std::getenv("CHUDWARE_SHOT_KEEPTOAST")))
+    st.suppressToasts = true;
   st.wantSettings = shot && shotMode && std::strcmp(shotMode, "settings") == 0;
   st.wantChat = shot && shotMode && std::strcmp(shotMode, "chat") == 0;
   st.wantAssembly = shot && shotMode && std::strcmp(shotMode, "assembly") == 0;
@@ -3108,15 +3123,10 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   if (st.wantRibbon) {
     st.showRibbon = true;
     st.ribbonTab = AppState::RT_Features;
-    // T-BL31 NEW-3: the Chudware on-load toast pins over the ribbon's top-left
-    // and occluded icon verification (weld_gusset, appr_mat_aluminum/steel in
-    // the T-G12 round-2 walkthrough). Suppress toasts for per-tab ribbon
-    // captures by default; CHUDWARE_SHOT_KEEPTOAST=1 re-enables them (for
-    // verifying the toast's own position/theming against the ribbon).
-    if (!(std::getenv("CHUDWARE_SHOT_KEEPTOAST") &&
-          *std::getenv("CHUDWARE_SHOT_KEEPTOAST")))
-      st.suppressToasts = true;
-    else
+    // Toasts are already suppressed for every headless capture (see the shotMode
+    // block above). CHUDWARE_SHOT_KEEPTOAST=1 re-enables them AND seeds this one,
+    // so the toast's own position/theming can be verified against the ribbon.
+    if (!st.suppressToasts)
       st.toast(
           ui::ToastLevel::Info,
           "Chudware: live view of the AI's part — it updates as it builds");
@@ -3578,6 +3588,26 @@ int run_gui(const char *screenshotPath, const char *openPath) {
 #endif // 20 Hz idle floor
       }
     }
+#ifndef __EMSCRIPTEN__
+    // A second launch stood down and handed us its turn (single-instance guard, main.cpp). The
+    // user double-clicked expecting a window, so surface this one. Restore ONLY when iconified:
+    // glfwRestoreWindow also un-maximizes, and the app starts maximized. glfwFocusWindow is a
+    // focus STEAL, which many window managers refuse — RequestWindowAttention then flashes the
+    // taskbar entry instead of silently doing nothing.
+    if (guiConsumeActivationRequest()) {
+      if (glfwGetWindowAttrib(win, GLFW_ICONIFIED))
+        glfwRestoreWindow(win);
+      glfwShowWindow(win);
+      glfwFocusWindow(win);
+      glfwRequestWindowAttention(win);
+      // ...and if that launch was an "Open with", adopt its document instead of swallowing it.
+      // Same deferred open pump the launch-arg path and the File menu use.
+      if (std::string doc = guiTakeActivationDoc(); !doc.empty()) {
+        st.requestOpenPath = doc;
+        st.addLog("[open-with] second launch -> " + doc);
+      }
+    }
+#endif
 #ifdef CHUDWARE_ENABLE_CEF
     ui::cef::pump_if_due(); // drive CEF's message loop when its deadline is due
     {

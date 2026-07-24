@@ -138,6 +138,19 @@ std::string lockPath(const std::string& key) {
     return "Global\\chudware-hostd-" + currentUserSid() + "-" + key;
 }
 
+std::string guiLockPath(const std::string& key) {
+    // "Local\" — NOT "Global\" like lockPath() — for two independent reasons:
+    //   1. Creating a name in the global namespace needs SeCreateGlobalPrivilege, which a plain
+    //      interactive user does not hold. The denial would come back as a CreateMutexW failure,
+    //      indistinguishable from "someone else has it", and the app would refuse to start at all.
+    //      The daemon can afford Global\ (it is a background service); a desktop window cannot.
+    //   2. The guard's whole job on losing is to RAISE the incumbent's window, and a window can
+    //      only be raised from inside its own interactive session — cross-session exclusion would
+    //      suppress the second session's window and have nothing to show for it.
+    // The SID stays for symmetry with lockPath()/socketPath() (and costs nothing).
+    return "Local\\chudware-gui-" + currentUserSid() + "-" + key;
+}
+
 std::string resolveHostdBin(const std::string& hint) {
     if (const char* b = std::getenv("CHUDWARE_HOSTD_BIN"); b && *b) return b;
     if (!hint.empty()) {

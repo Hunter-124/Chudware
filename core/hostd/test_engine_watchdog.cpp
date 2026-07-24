@@ -18,12 +18,32 @@ int main() {
                           "doc_activate", "doc_regen"})
         assert(engineMethodWatchdogged(m));
 
-    // Legitimately long-running RPCs are EXEMPT — never overdue no matter how long they run.
+    // Legitimately long-running RPCs stay OUT of the fast tier: the interactive ceiling never
+    // applies to them, no matter how long they run.
     for (const char* m : {"run_fea_static", "run_cfd_flow", "agent_run", "cam_generate",
                           "doc_save", "doc_open", "export_part", "import_part"}) {
         assert(!engineMethodWatchdogged(m));
         assert(!engineCallOverdue(m, 3600000, 180000));
     }
+
+    // ...but they are no longer exempt from EVERY ceiling. The second, far more generous tier
+    // catches the call that will NEVER return, so a hung one can no longer pin the daemon
+    // forever (its inflight count would never drop back to 0 and idle-exit could never fire).
+    const long long longCeiling = 3600000;  // 60 min — the daemon default
+    for (const char* m : {"run_fea_static", "run_cfd_flow", "agent_run", "cam_generate",
+                          "doc_save", "doc_open", "export_part", "import_part"}) {
+        assert(engineCallOverdueLong(m, longCeiling + 1, longCeiling));
+        assert(!engineCallOverdueLong(m, 600000, longCeiling));       // 10 min: normal, not overdue
+        assert(!engineCallOverdueLong(m, longCeiling, longCeiling));  // exactly at ceiling: not yet
+        assert(!engineCallOverdueLong(m, 999999999, 0));              // tier disabled
+        assert(!engineCallOverdueLong(m, 999999999, -1));
+    }
+
+    // The tiers are disjoint: an interactive RPC is judged ONLY by the fast ceiling, so the
+    // generous tier can never fire for one (and so can never weaken the fast tier).
+    for (const char* m : {"doc_apply_ops", "doc_rebuild", "doc_undo", "doc_redo",
+                          "doc_activate", "doc_regen", "__hostd_test_stall"})
+        assert(!engineCallOverdueLong(m, 999999999, longCeiling));
 
     // Daemon-only methods (never engine calls) are not guarded.
     assert(!engineMethodWatchdogged("hello"));

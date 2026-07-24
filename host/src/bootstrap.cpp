@@ -43,16 +43,36 @@ bool dirExists(const std::string &p) {
   DWORD a = GetFileAttributesA(p.c_str());
   return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
 }
+// Pre-rename data-root names, newest first. MUST stay in sync with
+// services/paths.py APP_NAMES_LEGACY — that module is the reference implementation
+// of this rule and the Python worker resolves the same root independently.
+const char *const kLegacyAppNames[] = {"Billet", "AI-CAD"};
+
 std::string appdataRoot() {
-  // Chudware alias rule (mirrors engine/paths.py active_root()): an existing
-  // legacy Chudware dir wins (it holds the live runtime venv) unless the Chudware
-  // dir already has a real install marker (config.json); fresh installs get
-  // Chudware.
+  // Chudware alias rule, mirroring services/paths.py active_root(): read-both,
+  // NEVER migrate. A machine whose live data still sits under a pre-rename root
+  // keeps using that root for both reads and writes — the managed runtime venv
+  // lives inside it and does not survive relocation, and a split root (reads old,
+  // writes new) loses the user's config and chat history. Fresh installs get
+  // Chudware. Nothing here creates a legacy root: it is only ever returned when it
+  // already exists on disk.
   const std::string base = env_or("APPDATA", "");
-  const std::string legacy = base + "\\Chudware";
   const std::string neu = base + "\\Chudware";
-  if (dirExists(legacy) && !fileExists(neu + "\\config.json"))
-    return legacy;
+  if (fileExists(neu + "\\config.json"))
+    return neu;
+  // A legacy root with a REAL install marker wins; a stray empty or cache-only
+  // legacy dir must not flip the root away from live data.
+  for (const char *name : kLegacyAppNames) {
+    const std::string old = base + "\\" + name;
+    if (fileExists(old + "\\config.json"))
+      return old;
+  }
+  // No marker anywhere: keep an existing legacy dir wholesale if present.
+  for (const char *name : kLegacyAppNames) {
+    const std::string old = base + "\\" + name;
+    if (dirExists(old))
+      return old;
+  }
   return neu;
 }
 
@@ -385,10 +405,18 @@ std::string shq(const std::string &s) {
   o += "'";
   return o;
 }
+// Pre-rename data-root names, newest first. MUST stay in sync with
+// services/paths.py APP_NAMES_LEGACY — that module is the reference implementation
+// of this rule and the Python worker resolves the same root independently.
+const char *const kLegacyAppNames[] = {"Billet", "AI-CAD"};
+
 // XDG data root for the managed runtime/cache (mirrors %APPDATA% on Windows).
-// Chudware alias rule (mirrors engine/paths.py active_root()): an existing legacy
-// Chudware dir wins (it holds the live runtime venv) unless the Chudware dir
-// already has a real install marker (config.json); fresh installs get Chudware.
+// Chudware alias rule, mirroring services/paths.py active_root(): read-both, NEVER
+// migrate. A machine whose live data still sits under a pre-rename root keeps using
+// that root for both reads and writes — the managed runtime venv lives inside it and
+// does not survive relocation, and a split root (reads old, writes new) loses the
+// user's config and chat history. Fresh installs get Chudware. Nothing here creates
+// a legacy root: it is only ever returned when it already exists on disk.
 std::string appdataRoot() {
   fs::path base;
   std::string xdg = env_or("XDG_DATA_HOME", "");
@@ -399,11 +427,19 @@ std::string appdataRoot() {
     base = fs::path(home) / ".local" / "share";
   else
     base = fs::path(".");
-  const fs::path legacy = base / "Chudware";
   const fs::path neu = base / "Chudware";
   std::error_code ec;
-  if (fs::exists(legacy, ec) && !fs::exists(neu / "config.json", ec))
-    return legacy.string();
+  if (fs::exists(neu / "config.json", ec))
+    return neu.string();
+  // A legacy root with a REAL install marker wins; a stray empty or cache-only
+  // legacy dir must not flip the root away from live data.
+  for (const char *name : kLegacyAppNames)
+    if (fs::exists(base / name / "config.json", ec))
+      return (base / name).string();
+  // No marker anywhere: keep an existing legacy dir wholesale if present.
+  for (const char *name : kLegacyAppNames)
+    if (fs::is_directory(base / name, ec))
+      return (base / name).string();
   return neu.string();
 }
 std::string runCapture(const std::string &cmd) {

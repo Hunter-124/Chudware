@@ -12,9 +12,11 @@
 //   chudware-hostd --status        print daemon_status of the running instance
 //   chudware-hostd --stop          ask the running instance to drain and exit
 //                               (refused while agent children run; add --force
-//                               to stop them first). If the socket is dead but
-//                               the pidfile process still lives, escalate:
-//                               SIGTERM, wait 3s, then SIGKILL.
+//                               to stop them first). If the transport is dead but
+//                               the recorded pid still lives, escalate: POSIX
+//                               SIGTERM, wait 3s, then SIGKILL; Windows
+//                               TerminateProcess (no console-ctrl route to a
+//                               DETACHED_PROCESS daemon), same JSON output.
 //   chudware-hostd --version       print build id + engine ABI
 //
 // Startup order matters: acquire instance lock -> bind socket -> THEN load the
@@ -37,6 +39,7 @@
 #endif
 #include <windows.h>
 
+#include <cwctype>  // towlower — pidfile image-name validation in stopViaPidfile
 #include <process.h>  // _getpid
 #else
 #include <limits.h>
@@ -285,16 +288,121 @@ static int stopViaPidfile(const std::string& reason) {
     return 0;
 }
 #else
-// Windows lock is a named mutex (no pidfile). Socket-dead escalation is a
-// no-op beyond reporting the original connect failure.
+// The Windows instance lock is a named MUTEX (ipc_discovery_win.cpp lockPath) — a
+// kernel object with no PID inside it, so there is no POSIX-style lock file to read
+// a pid back out of. --stop's pipe-dead escalation still needs one, so the daemon
+// drops a tiny side file in its state dir once it wins the single-instance claim.
+// The file is ADVISORY only: every reader re-validates the pid against a live
+// chudware-hostd.exe image before touching it, so a file orphaned by a crash — or a
+// pid Windows has since recycled onto an unrelated process — can never make us kill
+// the wrong thing.
+static std::string pidFilePath(const std::string& key) {
+    const std::string dir = chudware_ipc::runtimeDir();
+    if (dir.empty() || key.empty()) return "";
+    return dir + "\\hostd-" + key + ".pid";
+}
+
+static void writePidFile(const std::string& path) {
+    if (path.empty()) return;
+    std::error_code ec;
+    std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
+    if (FILE* f = std::fopen(path.c_str(), "w")) {
+        std::fprintf(f, "%ld\n", selfPid());
+        std::fclose(f);
+    }
+}
+
+static void removePidFile(const std::string& path) {
+    if (!path.empty()) std::remove(path.c_str());
+}
+
+// Open the recorded process with terminate rights, but ONLY if it really is a
+// chudware-hostd. nullptr = nothing live and ours behind that pid.
+static HANDLE openRecordedHostd(const std::string& pidFile, long& pidOut) {
+    pidOut = 0;
+    if (pidFile.empty()) return nullptr;
+    FILE* f = std::fopen(pidFile.c_str(), "r");
+    if (!f) return nullptr;
+    char buf[64] = {0};
+    const size_t n = std::fread(buf, 1, sizeof buf - 1, f);
+    std::fclose(f);
+    if (n == 0) return nullptr;
+    char* end = nullptr;
+    const long pid = std::strtol(buf, &end, 10);
+    if (pid <= 1 || end == buf) return nullptr;
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | SYNCHRONIZE,
+                           FALSE, (DWORD)pid);
+    if (!h) return nullptr;  // already exited, or not ours to touch
+    wchar_t img[MAX_PATH];
+    DWORD len = MAX_PATH;
+    bool ours = QueryFullProcessImageNameW(h, 0, img, &len) && len > 0;
+    if (ours) {
+        std::wstring p(img, len);
+        const size_t slash = p.find_last_of(L"\\/");
+        std::wstring base = slash == std::wstring::npos ? p : p.substr(slash + 1);
+        for (wchar_t& c : base) c = (wchar_t)std::towlower(c);
+        ours = base == L"chudware-hostd.exe";
+    }
+    if (!ours) {
+        CloseHandle(h);
+        return nullptr;
+    }
+    pidOut = pid;
+    return h;
+}
+
+// Pipe-dead fallback for --stop: mirrors the POSIX escalation above, minus its
+// graceful first step. The daemon is spawned DETACHED_PROCESS (ipc_discovery_win.cpp
+// spawnDetached) so it owns no console and no console-ctrl event can reach it —
+// there is no Windows SIGTERM analogue to try. The graceful path IS the pipe drain
+// that just failed, so escalation goes straight to TerminateProcess, the analogue of
+// the POSIX SIGKILL. Same return contract (0 killed/already gone, 1 nothing to kill)
+// and the same JSON shape, so callers and scripts cannot tell the platforms apart.
 static int stopViaPidfile(const std::string& reason) {
-    std::fprintf(stderr, "chudware-hostd: no running instance (%s)\n", reason.c_str());
-    return 1;
+    const std::string key = chudware_ipc::instanceKey(selfPath());
+    const std::string pidFile = pidFilePath(key);
+    long pid = 0;
+    HANDLE h = openRecordedHostd(pidFile, pid);
+    if (!h) {
+        std::fprintf(stderr,
+                     "chudware-hostd: no running instance (%s); no live pid in %s\n",
+                     reason.c_str(),
+                     pidFile.empty() ? "(no pidfile path)" : pidFile.c_str());
+        removePidFile(pidFile);  // orphaned by a crash, or a recycled pid — sweep it
+        return 1;
+    }
+    std::fprintf(stderr,
+                 "chudware-hostd: pipe dead (%s); escalating --stop to pid %ld via pidfile\n",
+                 reason.c_str(), pid);
+    if (!TerminateProcess(h, 1)) {
+        const DWORD e = GetLastError();
+        // It raced us and exited between the image check and here.
+        if (WaitForSingleObject(h, 0) == WAIT_OBJECT_0) {
+            CloseHandle(h);
+            removePidFile(pidFile);
+            std::printf("{\"stopped\":true,\"via\":\"pidfile\",\"pid\":%ld,"
+                        "\"signal\":\"none\",\"note\":\"already gone\"}\n",
+                        pid);
+            return 0;
+        }
+        CloseHandle(h);
+        std::fprintf(stderr, "chudware-hostd: TerminateProcess pid %ld failed (%lu)\n", pid,
+                     (unsigned long)e);
+        return 1;
+    }
+    // Brief wait so callers see the process gone (the POSIX SIGKILL path waits 2 s).
+    WaitForSingleObject(h, 2000);
+    CloseHandle(h);
+    removePidFile(pidFile);
+    std::printf("{\"stopped\":true,\"via\":\"pidfile\",\"pid\":%ld,"
+                "\"signal\":\"TerminateProcess\"}\n",
+                pid);
+    return 0;
 }
 #endif
 
 // --status / --stop [--force]: attach-only client against the same instance key.
-// --stop falls back to pidfile SIGTERM/SIGKILL when the socket is dead but the
+// --stop falls back to the pidfile kill path when the socket/pipe is dead but the
 // process still holds the lock (wedged accept loop / half-dead daemon).
 static int controlCommand(const char* method,
                           const nlohmann::json& params = nlohmann::json::object(),
@@ -417,6 +525,16 @@ int main(int argc, char** argv) {
     }
 #endif
 
+#ifdef _WIN32
+    // 1b (Windows). We now own the instance mutex, so record our pid for --stop's
+    // pipe-dead escalation (stopViaPidfile). Only the winner writes it, so the file
+    // always names the daemon that actually holds the name. No stale-file sweep is
+    // needed here: the reader validates the pid against a live chudware-hostd.exe
+    // image and deletes the file when it does not resolve.
+    const std::string pidFile = pidFilePath(key);
+    writePidFile(pidFile);
+#endif
+
     // 2. Bind before engine load.
     chudware_ipc::IpcListener listener;
     if (!listener.listen(sock, err)) {
@@ -507,6 +625,11 @@ int main(int argc, char** argv) {
     // (instance is destroyed after server, so order is: close fd → release flock
     // → unlink sock). Clients never observe lock-held-with-no-sock.
     instance.setSockPathToUnlink(server.detachSocketForFlockRelease());
+#ifdef _WIN32
+    // Clean exit: drop our pid record so a later --stop reports "no running
+    // instance" instead of doing an OpenProcess probe on a dead pid.
+    removePidFile(pidFile);
+#endif
     hostd::log().line("hostd exiting");
     return 0;
 }

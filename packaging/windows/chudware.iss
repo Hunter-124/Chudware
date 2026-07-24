@@ -24,7 +24,17 @@ AppId={{6B9E2E6B-6B7B-4B7B-9B7B-AICADSETUP01}
 AppName=Chudware
 AppVersion={#AppVersion}
 AppPublisher=Chudware
-DefaultDirName={autopf}\Chudware
+; MUST stay byte-identical to install.ps1's -InstallDir default. Instance identity hashes
+; the realpath of chudware-hostd.exe (services/ipc/ipc_discovery.cpp instanceKey), so two
+; installs at two different directories are two independent daemons with two tray icons —
+; the disagreement between this script and install.ps1 reproduced that bug by construction.
+; Per-user wins over {autopf}: the whole product is already per-user (install.ps1 provisions
+; the runtime venv into %APPDATA%\Chudware, the daemon is spawn-on-demand per logon, the MCP
+; registration and file associations are HKCU), so Program Files bought nothing but a UAC
+; prompt. PrivilegesRequired=lowest is REQUIRED here: without it Inno elevates and
+; {localappdata} would expand to the ADMIN's profile, not the installing user's.
+PrivilegesRequired=lowest
+DefaultDirName={localappdata}\Programs\Chudware
 DefaultGroupName=Chudware
 DisableProgramGroupPage=yes
 OutputDir=..\..\dist

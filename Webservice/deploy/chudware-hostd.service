@@ -13,6 +13,13 @@ ExecStart=@BIN@/chudware-hostd --foreground
 Environment=CHUDWARE_INSTANCE_KEY=chudwareweb
 # A shared team daemon must not self-exit between working sessions.
 Environment=CHUDWARE_HOSTD_LINGER_SECS=86400
+# This is a HEADLESS server-tier daemon, but a systemd --user unit inherits the
+# desktop session's imported DISPLAY/WAYLAND_DISPLAY, so tray_icon.cpp's
+# hasDisplay() gate passes and it draws its own AppIndicator — visually identical
+# to the desktop daemon's, hence the "two Chudware tray icons" report. Nobody can
+# act on a tray icon for a shared team daemon anyway (its Quit would cut every web
+# user off), so turn it off explicitly. Mechanism: core/hostd/tray_icon.cpp:53.
+Environment=CHUDWARE_HOSTD_TRAY=0
 # The C++ agent (agent_run_v2) reads its role prompts (intake/decomposer/executor/...)
 # from CHUDWARE_PROMPTS_DIR; without it the daemon resolves the relative "agent/prompts"
 # against its CWD (none here) and every agent run throws "role prompt unreadable/empty".

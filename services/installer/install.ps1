@@ -10,21 +10,94 @@ $ErrorActionPreference = "Stop"
 $src = $PSScriptRoot
 Write-Host "==> Installing Chudware to $InstallDir"
 
-# Stop any engine-host daemon that was spawned from THIS install dir before we copy
-# over its binaries (a running chudware-hostd.exe would hold locks on the payload files).
-# --stop drains cleanly; the scoped taskkill only touches processes whose image path is
-# under $InstallDir, so a dev-tree daemon on the same machine is never killed.
-$hostdExe = Join-Path $InstallDir "chudware-hostd.exe"
-if (Test-Path $hostdExe) {
-    Write-Host "==> Stopping engine daemon from previous install ..."
-    try { & $hostdExe --stop 2>$null | Out-Null } catch {}
-    Start-Sleep -Seconds 2
-    Get-Process -Name "chudware-hostd" -ErrorAction SilentlyContinue | Where-Object {
-        $_.Path -and $_.Path.StartsWith($InstallDir, [System.StringComparison]::OrdinalIgnoreCase)
-    } | ForEach-Object {
-        Write-Warning "force-killing lingering daemon pid $($_.Id) ($($_.Path))"
-        taskkill /PID $_.Id /F /T 2>$null | Out-Null
+# ---------------------------------------------------------------------------
+# Pre-copy cleanup helpers. Shared shape with uninstall.ps1 (deliberately
+# duplicated: uninstall.ps1 is staged on its own by chudware.iss and must keep
+# working from {app} with no sibling module to dot-source).
+# ---------------------------------------------------------------------------
+
+# Every directory a Chudware install has ever defaulted to, current name and both
+# pre-rename names. This matters because instance identity hashes the REALPATH of
+# chudware-hostd.exe (services/ipc/ipc_discovery.cpp instanceKey): a daemon left
+# running from any other directory is a wholly separate daemon — own pipe, own
+# mutex, own tray icon — that this install neither replaces nor stops.
+function Get-ChudwareInstallDirs {
+    $roots = @()
+    if ($env:LOCALAPPDATA) { $roots += (Join-Path $env:LOCALAPPDATA "Programs") }
+    if ($env:ProgramFiles) { $roots += $env:ProgramFiles }
+    if (${env:ProgramFiles(x86)}) { $roots += ${env:ProgramFiles(x86)} }
+    $out = @()
+    foreach ($r in $roots) {
+        foreach ($n in @("Chudware", "Billet", "AI-CAD")) { $out += (Join-Path $r $n) }
     }
+    $out | Select-Object -Unique
+}
+
+# Best-effort: drain then kill any engine-host daemon whose image lives under $dir.
+# --stop --force drains cleanly (and, when the pipe is wedged, escalates to
+# TerminateProcess via its pidfile — core/hostd/main.cpp stopViaPidfile); the
+# taskkill sweep is the backstop and is scoped by image path, so a dev-tree daemon
+# on the same machine is never touched. Never throws: a daemon we cannot stop must
+# degrade to a warning, not a failed install.
+function Stop-ChudwareDaemon([string]$dir) {
+    if (-not $dir) { return }
+    $stopped = $false
+    foreach ($exe in @("chudware-hostd.exe", "billet-hostd.exe")) {
+        $p = Join-Path $dir $exe
+        if (-not (Test-Path $p)) { continue }
+        Write-Host "==> Stopping engine daemon in $dir ..."
+        try { & $p --stop --force 2>$null | Out-Null } catch {}
+        $stopped = $true
+    }
+    if (-not $stopped) { return }
+    Start-Sleep -Seconds 2
+    foreach ($name in @("chudware-hostd", "billet-hostd")) {
+        Get-Process -Name $name -ErrorAction SilentlyContinue | Where-Object {
+            $_.Path -and $_.Path.StartsWith($dir, [System.StringComparison]::OrdinalIgnoreCase)
+        } | ForEach-Object {
+            Write-Warning "force-killing lingering daemon pid $($_.Id) ($($_.Path))"
+            taskkill /PID $_.Id /F /T 2>$null | Out-Null
+        }
+    }
+}
+
+# Retire pre-rename Start Menu entries and install trees (the Windows counterpart of
+# packaging/linux/install_desktop.sh's Billet.desktop/AI-CAD.desktop sweep), so an
+# upgraded machine shows exactly one launcher and hosts exactly one daemon binary.
+# NOTE: %APPDATA%\Billet and %APPDATA%\AI-CAD are DATA roots, not install dirs, and
+# are deliberately left alone — host/src/bootstrap.cpp appdataRoot() still reads them
+# as a back-compat fallback and they hold the user's config/chat history.
+function Remove-LegacyBranding([string]$keepDir) {
+    $programs = [Environment]::GetFolderPath('Programs')
+    foreach ($n in @("Billet", "AI-CAD")) {
+        if ($programs) {
+            Remove-Item (Join-Path $programs "$n.lnk") -Force -ErrorAction SilentlyContinue
+            # Inno DefaultGroupName folder from a pre-rename setup.exe.
+            Remove-Item (Join-Path $programs $n) -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    foreach ($d in (Get-ChudwareInstallDirs)) {
+        if ($d -eq $keepDir) { continue }
+        if (-not (Test-Path $d)) { continue }
+        if ((Split-Path $d -Leaf) -eq "Chudware") {
+            # A second CURRENT-branded install (e.g. an old machine-wide
+            # {autopf}\Chudware from before chudware.iss moved to {localappdata}).
+            # Its daemon is already stopped; deleting someone's deliberate
+            # machine-wide deployment is not ours to do, so just say so.
+            Write-Warning "another Chudware install exists at $d - remove it to avoid two independent daemons"
+            continue
+        }
+        Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue
+        if (Test-Path $d) { Write-Warning "could not remove legacy install dir $d (in use or needs admin)" }
+        else { Write-Host "==> Removed legacy install dir $d" }
+    }
+}
+
+# Stop daemons from THIS install dir (their binaries are about to be overwritten and
+# a live chudware-hostd.exe holds file locks on them) AND from every other known
+# install location, since those keep running and re-serving clients otherwise.
+foreach ($d in ((@($InstallDir) + @(Get-ChudwareInstallDirs)) | Select-Object -Unique)) {
+    Stop-ChudwareDaemon $d
 }
 
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
@@ -108,5 +181,8 @@ try {
     $lnk.WorkingDirectory = $InstallDir
     $lnk.Save()
 } catch { Write-Warning "shortcut creation skipped: $_" }
+
+# Last, so a failure here can never cost us a working install.
+try { Remove-LegacyBranding $InstallDir } catch { Write-Warning "legacy cleanup skipped: $_" }
 
 Write-Host "==> Chudware installed. Launch from the Start Menu or $InstallDir\chudware.exe"

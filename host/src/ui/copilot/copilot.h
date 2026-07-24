@@ -23,6 +23,8 @@
 #include <string>
 #include <vector>
 
+#include "../model_registry.h"  // ui::ModelInfo — providerPickerModels() rows
+
 struct AppState;
 
 namespace ui {
@@ -46,14 +48,21 @@ bool drawAiSettingsSection(AppState& state, bool busy, AiSettingsSection section
 // Full form: Provider + Generation. (Single-call convenience; slim is a legacy no-op flag.)
 bool drawProviderModelPicker(AppState& state, bool busy, bool slim = false);
 
-// Probe local-endpoint model availability (agent_list_models) into state.providerModels.
-// Throttled internally; pass force=true to probe immediately (e.g. on a base-URL change).
+// Probe model availability (agent_list_models) into state.providerModels: always the LOCAL
+// endpoint, plus the ACTIVE provider when it is a cloud one (so a newly released cloud model
+// shows up without a catalog edit). Throttled PER PROVIDER; pass force=true to skip the
+// cooldown (base-URL edit, provider switch). Never blocks — one async probe at a time.
 void refreshModelAvailability(AppState& state, bool force);
 
 // True when the provider has a key, signed-in subscription, host-shared account (web),
 // or reachable local endpoint — shared by the composer model picker, Settings role/Eng.Firm
 // combos, and Manage models.
 bool providerUsable(AppState& state, int provider);
+
+// The model rows the picker should show for ONE provider: that provider's live probe rows when
+// a probe succeeded (order preserved — newest first), else the static builtinModels() catalog
+// filtered to it. Cloud providers only; local/llama.cpp keep their own flat `models` path.
+std::vector<ModelInfo> providerPickerModels(AppState& state, int provider);
 
 // ---- OMP bridge-backed model catalog + session cost (S-UI-PROV) -------------------
 // Static OMP catalog metadata (capabilities + cost) for bridge-routed providers, fetched via

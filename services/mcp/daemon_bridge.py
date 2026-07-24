@@ -326,6 +326,12 @@ class DaemonClient:
     """One connection to chudware-hostd. Thread-safe; reconnects once on EOF."""
 
     ENGINE_READY_BUDGET_S = 300.0  # cold OCCT load headroom
+    # Spawn gate (see connect()): once a spawn+connect cycle has failed, refuse to
+    # fork another hostd until this window closes, doubling per consecutive
+    # failure. 5 s is long enough that a tool-call loop can't out-run it, 60 s
+    # short enough that a user who fixes the cause isn't locked out for long.
+    SPAWN_COOLDOWN_S = 5.0
+    SPAWN_COOLDOWN_MAX_S = 60.0
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -337,6 +343,8 @@ class DaemonClient:
         self.server_info: dict = {}
         self._sock_path: Optional[str] = None
         self._stale_retry_done = False  # one drain-replace attempt per client
+        self._spawn_block_until = 0.0  # monotonic deadline; 0 = spawning allowed
+        self._spawn_fail_streak = 0
 
     # ---------------------------------------------------------------- connect
 
@@ -354,59 +362,103 @@ class DaemonClient:
         backoff = 0.05
         child = None
         child_gone_at = 0.0
-        while True:
-            try:
-                if sys.platform == "win32":
-                    # FileNotFoundError = no server instance yet (spawn/retry);
-                    # ERROR_PIPE_BUSY surfaces as OSError and is retried the same
-                    # way — the daemon creates the next instance right after each
-                    # accept, so busy is a sub-millisecond window.
-                    self._sock = _PipeIO(self._sock_path)
-                else:
-                    s = socket.socket(socket.AF_UNIX)
-                    s.connect(self._sock_path)
-                    self._sock = s
-                self._buf = b""
-                break
-            except OSError as e:
-                if not spawn:
-                    raise DaemonError(f"hostd not running ({e})") from e
-                if child is None:
-                    if not hostd:
-                        raise DaemonError(
-                            "chudware-hostd binary not found (set CHUDWARE_HOSTD_BIN or build core)"
-                        ) from e
-                    try:
-                        child = _spawn_hostd_detached(hostd)
-                    except OSError as se:
-                        raise DaemonError(f"cannot spawn {hostd}: {se}") from se
-                    child_spawned_at = time.monotonic()
-                else:
-                    # Broken-rendezvous fast-fail (observed in the wild: a daemon
-                    # holds the singleton flock but serves no socket). Two shapes:
-                    # our spawn EXITED (lost the flock race) and the incumbent's
-                    # socket still refuses after a 2 s grace, or our spawn is
-                    # ALIVE but stuck waiting on the flock — a healthy cold spawn
-                    # binds its socket well under 5 s (bind precedes OCCT load).
-                    now = time.monotonic()
-                    exited = child.poll() is not None
-                    if exited and not child_gone_at:
-                        child_gone_at = now
-                    if (exited and now - child_gone_at > 2.0) or (
-                            not exited and now - child_spawned_at > 5.0):
-                        raise DaemonError(
-                            "hostd rendezvous broken: a daemon holds the singleton "
-                            f"lock but its socket is unreachable ({e}). "
-                            "`pkill chudware-hostd` and retry."
-                        ) from e
-                if time.monotonic() > deadline:
-                    raise DaemonError(f"hostd spawn timed out ({e})") from e
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 0.5)
+        spawn_tried = False
+        try:
+            while True:
+                try:
+                    if sys.platform == "win32":
+                        # FileNotFoundError = no server instance yet (spawn/retry);
+                        # ERROR_PIPE_BUSY surfaces as OSError and is retried the same
+                        # way — the daemon creates the next instance right after each
+                        # accept, so busy is a sub-millisecond window.
+                        self._sock = _PipeIO(self._sock_path)
+                    else:
+                        s = socket.socket(socket.AF_UNIX)
+                        s.connect(self._sock_path)
+                        self._sock = s
+                    self._buf = b""
+                    break
+                except OSError as e:
+                    if not spawn:
+                        raise DaemonError(f"hostd not running ({e})") from e
+                    if child is None:
+                        # Spawn gate. call() re-enters connect(spawn=True) for EVERY
+                        # RPC whose socket is None, and the budget/backoff in this
+                        # loop is per-call — so an agent loop hammering MCP tools at
+                        # a hostd that dies on startup used to fork a fresh daemon
+                        # per tool call. Once a spawn has failed, fail the call fast
+                        # until the cooldown expires instead of forking again.
+                        # Attaching to a healthy daemon is never gated: this branch
+                        # is only reached when the plain connect already failed.
+                        left = self._spawn_block_until - time.monotonic()
+                        if left > 0:
+                            raise DaemonError(
+                                f"chudware-hostd failed to start "
+                                f"{self._spawn_fail_streak}x; not retrying for another "
+                                f"{left:.0f}s ({e}). See "
+                                "~/.local/share/Chudware/logs/hostd.log"
+                            ) from e
+                        if not hostd:
+                            raise DaemonError(
+                                "chudware-hostd binary not found (set CHUDWARE_HOSTD_BIN or build core)"
+                            ) from e
+                        spawn_tried = True
+                        try:
+                            child = _spawn_hostd_detached(hostd)
+                        except OSError as se:
+                            raise DaemonError(f"cannot spawn {hostd}: {se}") from se
+                        child_spawned_at = time.monotonic()
+                    else:
+                        # Broken-rendezvous fast-fail (observed in the wild: a daemon
+                        # holds the singleton flock but serves no socket). Two shapes:
+                        # our spawn EXITED (lost the flock race) and the incumbent's
+                        # socket still refuses after a 2 s grace, or our spawn is
+                        # ALIVE but stuck waiting on the flock — a healthy cold spawn
+                        # binds its socket well under 5 s (bind precedes OCCT load).
+                        now = time.monotonic()
+                        exited = child.poll() is not None
+                        if exited and not child_gone_at:
+                            child_gone_at = now
+                        if (exited and now - child_gone_at > 2.0) or (
+                                not exited and now - child_spawned_at > 5.0):
+                            raise DaemonError(
+                                "hostd rendezvous broken: a daemon holds the singleton "
+                                f"lock but its socket is unreachable ({e}). "
+                                "`pkill chudware-hostd` and retry."
+                            ) from e
+                    if time.monotonic() > deadline:
+                        raise DaemonError(f"hostd spawn timed out ({e})") from e
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 0.5)
+        except DaemonError:
+            # Only a cycle that actually forked a daemon arms the cooldown. An
+            # attach-only failure (spawn=False, no binary, or the gate itself)
+            # must never extend it, or the gate could never reopen.
+            if spawn_tried:
+                self._note_spawn_failed()
+            raise
+        # Any accepted socket — spawned or attached — proves the daemon is up, so
+        # disarm the gate: a much later death should get the full 5 s window back,
+        # not the remainder of a stale one. Safe by construction (the gate only
+        # ever guards a path reached after a connect FAILED).
+        self._spawn_fail_streak = 0
+        self._spawn_block_until = 0.0
         self.server_info = self._call_raw(
             "hello", {"client": "mcp", "pid": os.getpid(), "proto": 1}
         )
         self._drain_replace_if_stale(hostd, spawn)
+
+    def _note_spawn_failed(self) -> None:
+        """Arm/extend the spawn cooldown after a spawn+connect cycle failed."""
+        self._spawn_fail_streak += 1
+        wait = min(self.SPAWN_COOLDOWN_S * 2 ** (self._spawn_fail_streak - 1),
+                   self.SPAWN_COOLDOWN_MAX_S)
+        self._spawn_block_until = time.monotonic() + wait
+        print(
+            f"[daemon_bridge] chudware-hostd spawn failed ({self._spawn_fail_streak}x) "
+            f"— refusing further spawn attempts for {wait:.0f}s",
+            file=sys.stderr,
+        )
 
     def _drain_replace_if_stale(self, hostd: Optional[Path], spawn: bool) -> None:
         """Version drain-replace (Phase 8): the running daemon predates the hostd

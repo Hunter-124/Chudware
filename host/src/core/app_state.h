@@ -35,6 +35,7 @@
 
 #include "../ui/toast.h"    // W1-B: ToastLevel / Toast (toast queue lives on AppState)
 #include "../ui/cursors.h"  // W1-B: CursorKind (per-frame cursor request)
+#include "../ui/model_registry.h"  // ui::ModelInfo / ui::PROV_COUNT — ProviderModels::rows below
 
 struct GLFWwindow;
 class Renderer;
@@ -230,6 +231,11 @@ struct ProviderModels {
     bool checked = false;             // probe returned at least once
     bool ok = false;                  // reachable + (cloud) keyed
     std::vector<std::string> models;  // all discovered ids (local: every downloaded model)
+    // The same probe's richer `model_rows` (id/label/context/max_output/vision/tools/
+    // reasoning_efforts/auto_source), in the ORDER the endpoint returned — cloud APIs list
+    // newest first, so a just-released model lands at the TOP of the picker. Empty when the
+    // backend answered with flat ids only; the picker then falls back to the static catalog.
+    std::vector<ui::ModelInfo> rows;
     // LM Studio's native endpoint reports which models are actually loaded (vs merely
     // downloaded). When loadedKnown is true, only ids in `loaded` can serve a request and the
     // picker hides the rest; when false (non-LM-Studio server) every listed model is assumed
@@ -1349,7 +1355,7 @@ struct AppState {
     int selectedPart = -1;            // -1 = whole assembly; >=0 = index into asmParts
 
     // ---- model picker availability (filled by the agent_list_models probe) ----
-    ProviderModels providerModels[10];       // indexed by ui::ProviderIndex (PROV_COUNT=10; PROV_ZENMUX=9). Literal: model_registry.h not included here.
+    ProviderModels providerModels[ui::PROV_COUNT];  // indexed by ui::ProviderIndex
     std::atomic<bool> modelProbeInFlight{false};
     // Bridge (OMP) provider ids currently signed in (state != signed_out), populated by the
     // Settings->Providers poll (settings_modal.cpp pollOmpProviderList). Read by the composer

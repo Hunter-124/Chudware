@@ -129,6 +129,13 @@ public:
     // closeFn MUST NOT call back into DocRegistry — mtx_ is non-recursive.
     bool reapUnderLock(const std::string& docId, const std::function<void()>& closeFn);
 
+    // How many docs are still counting DOWN their GC grace (orphaned, deadline not yet
+    // reached). Read-only; Server::idleExpired refuses the idle-exit path while this is
+    // non-zero — see the invariant spelled out there. Docs already PAST their deadline are
+    // deliberately excluded: tick() retires + closes those, and a retire that keeps failing
+    // must never pin the daemon forever.
+    int pendingGcCount();
+
 private:
     struct Attach {
         std::string mode;       // "rw" | "ro"

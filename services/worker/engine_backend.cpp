@@ -309,21 +309,49 @@ static int reconnectBackoffMs(int failedAttempts) {
     return kMs[failedAttempts - 1];
 }
 
+#ifndef __EMSCRIPTEN__
+// Consecutive failed connect-only attempts before we conclude the daemon is
+// really GONE (not just briefly restarting) and start one. On the 1s/2s ladder
+// the third failure lands at t≈3s, so the respawn goes out then and the next
+// (1s) tick reconnects: recovery in ~4s, still past any drain-replace or
+// accept hiccup. With a hostd that dies on every start the doubling cooldown
+// below caps this at 15 spawns/hour.
+static const int kRespawnAfterFailures = 3;
+
+// Cooldown before another respawn is allowed: 30s doubling to a 5-minute cap, so
+// a hostd that dies on every start settles at ~12 spawns/hour instead of one per
+// backoff tick. Deliberately NO hard cap on the escalation count: the cause is
+// usually fixable mid-session (rebuild, freed RAM, repaired install) and a
+// permanently disarmed GUI could never notice.
+static int respawnCooldownSecs(int escalations) {
+    int s = 30;
+    for (int i = 1; i < escalations && s < 300; ++i) s *= 2;
+    return s > 300 ? 300 : s;
+}
+#endif
+
 DaemonConnState maintainConnection() {
     if (!daemonMode() || !g_client) return DaemonConnState::InProc;
     // Backoff state lives for the process lifetime; reset whenever the socket is
     // healthy so a call()-driven reconnect doesn't leave a stale nextTry delay.
     static int failedAttempts = 0;
     static std::chrono::steady_clock::time_point nextTry{};
+    // Respawn escalation state, reset alongside the backoff: a connection that
+    // actually came back proves the last spawn worked, so a later death starts
+    // over at the 30s cooldown instead of inheriting the 5-minute one.
+    static int respawns = 0;
+    static std::chrono::steady_clock::time_point nextRespawn{};
     // pollAlive surfaces peer death (HUP/EOF) without waiting for the next RPC —
     // connected() alone stays true until something reads the dead socket.
     if (g_client->pollAlive()) {
         failedAttempts = 0;
         nextTry = {};
+        respawns = 0;
+        nextRespawn = {};
         return DaemonConnState::Connected;
     }
     // Dead socket: bounded reconnect (connect-only; no spawn — matches EngineClient
-    // call()-driven reconnect).
+    // call()-driven reconnect). Spawning is escalated to separately, below.
     const auto now = std::chrono::steady_clock::now();
     if (nextTry.time_since_epoch().count() != 0 && now < nextTry)
         return DaemonConnState::Unreachable;
@@ -348,12 +376,49 @@ DaemonConnState maintainConnection() {
     if (ok) {
         failedAttempts = 0;
         nextTry = {};
+        respawns = 0;
+        nextRespawn = {};
         std::fprintf(stderr, "[engine] daemon reconnected (gen=%llu)\n",
                      (unsigned long long)g_client->reconnectGeneration());
         return DaemonConnState::Connected;
     }
     ++failedAttempts;
-    const int waitMs = reconnectBackoffMs(failedAttempts);
+    int waitMs = reconnectBackoffMs(failedAttempts);
+#ifndef __EMSCRIPTEN__
+    // Nothing above can ever bring back a hostd that actually DIED (crash,
+    // SIGKILL, its own watchdog _Exit(70)): every reconnect path in EngineClient
+    // is connect-only, and the desktop daemon has no OS supervisor on either
+    // platform. Without this the GUI polls a dead socket forever behind a sticky
+    // "unreachable" chip. So: start one ourselves, rate-limited.
+    //
+    // Spawn-and-let-the-ladder-reconnect rather than calling connectOrSpawn()
+    // here, deliberately. hostd binds its socket BEFORE the (slow) OCCT load, so
+    // the very next 1s tick normally connects — while connectOrSpawn() would
+    // stall this frame-loop thread for its whole connect budget AND poke
+    // EngineClient::conn_ from outside mtx_ (connectInner->tryConnect) while a
+    // worker-thread call() may still be unwinding on the dead socket.
+    if (failedAttempts >= kRespawnAfterFailures && now >= nextRespawn) {
+        ++respawns;
+        const int cooldownS = respawnCooldownSecs(respawns);
+        nextRespawn = now + std::chrono::seconds(cooldownS);
+        const std::string bin = chudware_ipc::resolveHostdBin(hostdBinHint());
+        std::string serr;
+        if (!bin.empty() && chudware_ipc::spawnDetached(bin, "", serr)) {
+            waitMs = 1000;  // back to the fast rung: it should be listening within ~1s
+            std::fprintf(stderr,
+                         "[engine] hostd gone after %d failed reconnects — respawned "
+                         "'%s' (escalation #%d; next respawn no sooner than %ds)\n",
+                         failedAttempts, bin.c_str(), respawns, cooldownS);
+        } else {
+            std::fprintf(stderr,
+                         "[engine] hostd gone and respawn failed (%s) — next respawn "
+                         "in %ds\n",
+                         bin.empty() ? "hostd binary not found (set CHUDWARE_HOSTD_BIN)"
+                                     : serr.c_str(),
+                         cooldownS);
+        }
+    }
+#endif
     nextTry = now + std::chrono::milliseconds(waitMs);
     if (failedAttempts == 1 || failedAttempts % 5 == 0) {
         std::fprintf(stderr,

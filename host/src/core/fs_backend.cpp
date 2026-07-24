@@ -673,7 +673,7 @@ std::string fsUpload(const std::string& dir, const std::string& filename,
 #ifdef __EMSCRIPTEN__
     // Multipart form: dir (form field) + file (file field).
     // ASYNCIFY-yielding upload — never EMSCRIPTEN_FETCH_SYNCHRONOUS on main thread.
-    const std::string boundary = "----BilletBoundary7MA4YWxkTrZu0gW";
+    const std::string boundary = "----ChudwareBoundary7MA4YWxkTrZu0gW";
     std::string body;
     body.reserve(len + 512);
     auto append = [&](const std::string& s) { body.append(s); };

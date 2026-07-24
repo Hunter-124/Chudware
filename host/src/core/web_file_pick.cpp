@@ -34,7 +34,7 @@ struct BrowseState {
 static BrowseState g_browse;
 
 // Called from JS on the main thread once the user picks or cancels.
-extern "C" EMSCRIPTEN_KEEPALIVE void billet_file_pick_done(
+extern "C" EMSCRIPTEN_KEEPALIVE void chudware_file_pick_done(
     int ok, const char* name, const uint8_t* data, int len, const char* errMsg) {
     if (g_pick.data) {
         free(g_pick.data);
@@ -68,7 +68,7 @@ extern "C" EMSCRIPTEN_KEEPALIVE void billet_file_pick_done(
 }
 
 // Called from JS when the workspace browser finishes (ok=1 + path, or cancel).
-extern "C" EMSCRIPTEN_KEEPALIVE void billet_ws_browse_done(int ok, const char* path) {
+extern "C" EMSCRIPTEN_KEEPALIVE void chudware_ws_browse_done(int ok, const char* path) {
     if (ok && path && path[0]) {
         std::strncpy(g_browse.path, path, sizeof(g_browse.path) - 1);
         g_browse.path[sizeof(g_browse.path) - 1] = '\0';
@@ -80,7 +80,7 @@ extern "C" EMSCRIPTEN_KEEPALIVE void billet_ws_browse_done(int ok, const char* p
 }
 
 // JS-library entry (host/wasm/chudware_web_dialogs.js) — runs on main thread via __proxy:sync.
-extern "C" void billet_ws_browse(int mode, const char* accept, const char* suggested);
+extern "C" void chudware_ws_browse(int mode, const char* accept, const char* suggested);
 
 
 // Take a pick result already posted by JS (upload button / external deliver).
@@ -139,11 +139,11 @@ bool pickFile(const char* accept, PickedFile& out, std::string& err) {
             finished = true;
             try { document.body.removeChild(input); } catch (e) {}
             try { window.removeEventListener('focus', onFocus); } catch (e) {}
-            if (typeof Module === 'undefined' || !Module._billet_file_pick_done) return;
+            if (typeof Module === 'undefined' || !Module._chudware_file_pick_done) return;
             if (ok && data && len > 0) {
                 var ptr = Module._malloc(len);
                 if (!ptr) {
-                    Module._billet_file_pick_done(0, 0, 0, 0, 0);
+                    Module._chudware_file_pick_done(0, 0, 0, 0, 0);
                     return;
                 }
                 var heap = Module.HEAPU8;
@@ -159,7 +159,7 @@ bool pickFile(const char* accept, PickedFile& out, std::string& err) {
                     namePtr = Module._malloc(nb);
                     stringToUTF8(name, namePtr, nb);
                 }
-                Module._billet_file_pick_done(1, namePtr, ptr, len, 0);
+                Module._chudware_file_pick_done(1, namePtr, ptr, len, 0);
                 if (namePtr) Module._free(namePtr);
                 Module._free(ptr);
             } else {
@@ -169,7 +169,7 @@ bool pickFile(const char* accept, PickedFile& out, std::string& err) {
                     errPtr = Module._malloc(eb);
                     stringToUTF8(errStr, errPtr, eb);
                 }
-                Module._billet_file_pick_done(0, 0, 0, 0, errPtr);
+                Module._chudware_file_pick_done(0, 0, 0, 0, errPtr);
                 if (errPtr) Module._free(errPtr);
             }
         }
@@ -244,7 +244,7 @@ std::string browseWorkspace(WorkspaceBrowseMode mode,
     const char* acc = (accept && *accept) ? accept : "";
     const char* sug = (suggestedName && *suggestedName) ? suggestedName : "";
 
-    billet_ws_browse(modeInt, acc, sug);
+    chudware_ws_browse(modeInt, acc, sug);
 
     // ASYNCIFY yield: let the overlay's fetch()/click handlers run on the main thread.
     while (g_browse.done == 0) {

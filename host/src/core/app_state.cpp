@@ -108,7 +108,7 @@ void appstateInitPersist() {
     EM_ASM({
         try {
             var root = '/persist';
-            Module.__billetPersistReady = false;
+            Module.__chudwarePersistReady = false;
             try { FS.mkdir(root); } catch (e) {}
             try { FS.mount(IDBFS, {}, root); } catch (e) {
                 // Already mounted on a hot restart — keep going and re-populate.
@@ -119,16 +119,16 @@ void appstateInitPersist() {
                 else console.log('[chudware] IDBFS populated at /persist');
                 // Ensure Chudware appdata subdir exists after populate (empty store).
                 try { FS.mkdir(root + '/Chudware'); } catch (e2) {}
-                Module.__billetPersistReady = true;
+                Module.__chudwarePersistReady = true;
             });
         } catch (e) {
             console.error('[chudware] IDBFS init failed:', e);
-            Module.__billetPersistReady = true;  // fail open so boot continues
+            Module.__chudwarePersistReady = true;  // fail open so boot continues
         }
     });
     // ASYNCIFY: spin until the populate callback fires so loadSettings/chat never
     // race an empty in-memory mount and clobber IndexedDB on the first write.
-    while (!EM_ASM_INT({ return Module.__billetPersistReady ? 1 : 0; })) {
+    while (!EM_ASM_INT({ return Module.__chudwarePersistReady ? 1 : 0; })) {
         emscripten_sleep(10);
     }
     g_persistReady.store(true, std::memory_order_release);
@@ -142,9 +142,9 @@ void appstatePersistSync() {
     if (!g_persistReady.load(std::memory_order_acquire)) return;
     // Debounce in JS: coalesce rapid saveSettings/persistChatHistory bursts.
     EM_ASM({
-        if (Module.__billetPersistSyncTimer) clearTimeout(Module.__billetPersistSyncTimer);
-        Module.__billetPersistSyncTimer = setTimeout(function() {
-            Module.__billetPersistSyncTimer = null;
+        if (Module.__chudwarePersistSyncTimer) clearTimeout(Module.__chudwarePersistSyncTimer);
+        Module.__chudwarePersistSyncTimer = setTimeout(function() {
+            Module.__chudwarePersistSyncTimer = null;
             FS.syncfs(false, function(err) {
                 if (err) console.warn('[chudware] IDBFS flush failed:', err);
             });

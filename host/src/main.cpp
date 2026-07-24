@@ -54,7 +54,7 @@ namespace {
 // On any unhandled SEH fault (access violation, etc.) write a symbolized call stack + a minidump
 // next to the exe (and append the stack to $CHUDWARE_LOG_FILE when set) so an "instant hard crash"
 // reported in the field gives us the exact faulting frame instead of a silent window-close.
-LONG WINAPI aicadCrashFilter(EXCEPTION_POINTERS* ep) {
+LONG WINAPI chudwareCrashFilter(EXCEPTION_POINTERS* ep) {
     char dir[MAX_PATH] = {0};
     GetModuleFileNameA(nullptr, dir, MAX_PATH);
     std::string base(dir);
@@ -64,8 +64,8 @@ LONG WINAPI aicadCrashFilter(EXCEPTION_POINTERS* ep) {
     char stamp[32];
     std::time_t now = std::time(nullptr);
     std::strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", std::localtime(&now));
-    std::string stackPath = base + "\\Billet_crash_" + stamp + ".txt";
-    std::string dmpPath   = base + "\\Billet_crash_" + stamp + ".dmp";
+    std::string stackPath = base + "\\Chudware_crash_" + stamp + ".txt";
+    std::string dmpPath   = base + "\\Chudware_crash_" + stamp + ".dmp";
 
     std::ofstream out(stackPath, std::ios::binary);
     auto emit = [&](const std::string& line) {
@@ -156,7 +156,7 @@ LONG WINAPI aicadCrashFilter(EXCEPTION_POINTERS* ep) {
     return EXCEPTION_EXECUTE_HANDLER;  // let the process die after we've recorded the fault
 }
 
-void installCrashHandler() { SetUnhandledExceptionFilter(aicadCrashFilter); }
+void installCrashHandler() { SetUnhandledExceptionFilter(chudwareCrashFilter); }
 #else
 void installCrashHandler() {}
 #endif
@@ -172,7 +172,7 @@ extern "C" char** environ;
 // internal transport read throughout the codebase. For every CHUDWARE_X present in the
 // environment, set CHUDWARE_X and CHUDWARE_X when not already set, so a user exporting only the new
 // names reaches every legacy read site. Never overwrites an explicitly-set legacy var.
-void propagateBilletEnv() {
+void propagateChudwareEnv() {
 #ifdef _WIN32
     char** envp = _environ;
 #else
@@ -386,8 +386,8 @@ int main(int argc, char** argv) {
     EM_ASM({
         try {
             if (Module.setStatus) Module.setStatus('main enter');
-            if (!window.__billetLogs) window.__billetLogs = [];
-            window.__billetLogs.push('boot: main enter');
+            if (!window.__chudwareLogs) window.__chudwareLogs = [];
+            window.__chudwareLogs.push('boot: main enter');
             console.log('boot: main enter');
         } catch (e) { console.error(e); }
     });
@@ -396,13 +396,13 @@ int main(int argc, char** argv) {
     // Mount IDBFS at /persist and populate from IndexedDB BEFORE any appdata
     // read (loadSettings / chat_history). Blocks via ASYNCIFY until ready.
     appstateInitPersist();
-    propagateBilletEnv();
+    propagateChudwareEnv();
     ensurePromptsDir();
     EM_ASM({
         try {
             if (Module.setStatus) Module.setStatus('calling run_gui');
-            if (!window.__billetLogs) window.__billetLogs = [];
-            window.__billetLogs.push('boot: calling run_gui');
+            if (!window.__chudwareLogs) window.__chudwareLogs = [];
+            window.__chudwareLogs.push('boot: calling run_gui');
             console.log('boot: calling run_gui');
         } catch (e) { console.error(e); }
     });
@@ -410,15 +410,15 @@ int main(int argc, char** argv) {
     EM_ASM({
         try {
             if (Module.setStatus) Module.setStatus('run_gui returned ' + $0);
-            if (!window.__billetLogs) window.__billetLogs = [];
-            window.__billetLogs.push('boot: run_gui returned ' + $0);
+            if (!window.__chudwareLogs) window.__chudwareLogs = [];
+            window.__chudwareLogs.push('boot: run_gui returned ' + $0);
         } catch (e) {}
     }, rc);
     return rc;
 #else
     // FIRST: mirror CHUDWARE_* env vars onto the legacy CHUDWARE_*/CHUDWARE_* names every
     // subsystem (and every child process we spawn) actually reads.
-    propagateBilletEnv();
+    propagateChudwareEnv();
 #ifdef CHUDWARE_ENABLE_CEF
     // A separate subprocess executable (ai_cad_cef_helper) is configured via
     // CefSettings.browser_subprocess_path, so this main binary is ALWAYS the
@@ -544,8 +544,8 @@ int main(int argc, char** argv) {
     EM_ASM({
         var el = document.getElementById('status');
         if (el) el.textContent = 'calling run_gui';
-        if (!window.__billetLogs) window.__billetLogs = [];
-        window.__billetLogs.push('boot: calling run_gui');
+        if (!window.__chudwareLogs) window.__chudwareLogs = [];
+        window.__chudwareLogs.push('boot: calling run_gui');
         console.log('boot: calling run_gui');
     });
 #endif

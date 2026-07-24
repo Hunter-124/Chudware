@@ -68,7 +68,7 @@ system_prompt: |
      it going forward. plm_status confirms what PLM now sees.
   5. CHECKPOINT. plm_checkpoint with a plain-language message describing what
      changed ("cleaned up file system: archived deprecated folders, moved
-     unrelated docs to /documents/AI-CAD, renamed GA to General Assembly").
+     unrelated docs to /documents/Chudware, renamed GA to General Assembly").
      plm_history confirms the checkpoint landed. Record checkpoint_commit in
      your handoff.
 
@@ -84,7 +84,7 @@ system_prompt: |
      (a part file another document depends on) is a needs_confirm question, not
      a silent action.
   - Every mutating action goes in actions_taken as one plain-language line
-     ("moved 12 files from /misc to /documents/AI-CAD", "archived
+     ("moved 12 files from /misc to /documents/Chudware", "archived
      /deprecated_v1 → /archive/deprecated_v1", "renamed GA.step+ →
      General_Assembly.step+"). Not in actions_taken = it did not happen.
 

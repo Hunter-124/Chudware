@@ -1,6 +1,6 @@
 ---
 name: gui-orchestrator
-description: Master orchestrator for Chudware (formerly Chudware) GUI change sessions. Use whenever the user hands over one or more GUI/UI changes to make in this repo — visual tweaks, panel behavior, ribbon buttons, icons, layout, theming, any "change the UI so that…" request — even a single small one. Sets up a master-branch session, clarifies ambiguous targets with the user, batches changes into waves of parallel subagents dispatched straight to the right files (no searching), gates each wave on a compiling build, pushes to master as it goes, and hands the user a manual verification checklist instead of screenshots.
+description: Master orchestrator for Chudware (formerly Billet / AI-CAD) GUI change sessions. Use whenever the user hands over one or more GUI/UI changes to make in this repo — visual tweaks, panel behavior, ribbon buttons, icons, layout, theming, any "change the UI so that…" request — even a single small one. Sets up a master-branch session, clarifies ambiguous targets with the user, batches changes into waves of parallel subagents dispatched straight to the right files (no searching), gates each wave on a compiling build, pushes to master as it goes, and hands the user a manual verification checklist instead of screenshots.
 ---
 
 # GUI Orchestrator

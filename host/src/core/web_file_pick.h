@@ -26,7 +26,7 @@ struct PickedFile {
 bool pickFile(const char* accept, PickedFile& out, std::string& err);
 
 // Non-blocking: take bytes already delivered by JS into the pick buffer
-// (billet_file_pick_done). Used after browseWorkspace returns "__UPLOAD__".
+// (chudware_file_pick_done). Used after browseWorkspace returns "__UPLOAD__".
 // Returns true and fills out on success; false if nothing pending / cancel / error.
 bool consumePickedFile(PickedFile& out, std::string& err);
 

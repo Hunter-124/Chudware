@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/gate.sh — the Linux build + test gate for Chudware (formerly Chudware).
+# scripts/gate.sh — the Linux build + test gate for Chudware (formerly Billet / AI-CAD).
 #
 # Every DAG node must leave this gate green before close (see AGENTS.md swarm
 # rules + the plan file). It runs, in order:

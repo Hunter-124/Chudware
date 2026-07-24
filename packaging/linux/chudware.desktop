@@ -3,7 +3,7 @@ Type=Application
 Name=Chudware
 Comment=Chudware — AI-native parametric CAD
 Exec=chudware %F
-Icon=Billet
+Icon=chudware
 Categories=Graphics;Engineering;
 Terminal=false
 # Must match the window class set via glfwWindowHintString(GLFW_X11_CLASS_NAME/…) in
@@ -13,7 +13,7 @@ Terminal=false
 # or the taskbar icon binding breaks.
 StartupWMClass=chudware
 X-BinaryName=chudware
-# NOTE: binary is built from host/ — cmake -S host -B host/build-linux + ninja -C host/build-linux Billet (target name unchanged; output file is chudware).
+# NOTE: binary is built from host/ — cmake -S host -B host/build-linux + ninja -C host/build-linux Chudware (CMake target Chudware; output file is chudware).
 # In the AppImage this is staged to usr/bin/chudware and launched via AppRun.
 # For system installs, install host/build-linux/bin/chudware to a PATH directory.
 # ui/imgui (AI-CAD2) is retired; host/ is the single cross-platform GUI (see docs/PORT_LEDGER.md).

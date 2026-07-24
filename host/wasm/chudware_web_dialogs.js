@@ -1,7 +1,7 @@
 mergeInto(LibraryManager.library, {
-  billet_ws_browse__proxy: 'sync',
-  billet_ws_browse__deps: ['$UTF8ToString', '$stringToUTF8', '$lengthBytesUTF8'],
-  billet_ws_browse: function(mode, acceptPtr, sugPtr) {
+  chudware_ws_browse__proxy: 'sync',
+  chudware_ws_browse__deps: ['$UTF8ToString', '$stringToUTF8', '$lengthBytesUTF8'],
+  chudware_ws_browse: function(mode, acceptPtr, sugPtr) {
     var accept = acceptPtr ? UTF8ToString(acceptPtr) : '';
     var suggested = sugPtr ? UTF8ToString(sugPtr) : '';
 
@@ -23,7 +23,7 @@ mergeInto(LibraryManager.library, {
         pathPtr = Module._malloc(nb);
         stringToUTF8(path, pathPtr, nb);
       }
-      Module._billet_ws_browse_done(ok ? 1 : 0, pathPtr);
+      Module._chudware_ws_browse_done(ok ? 1 : 0, pathPtr);
       if (pathPtr) Module._free(pathPtr);
     }
 
@@ -290,7 +290,7 @@ mergeInto(LibraryManager.library, {
       // user gesture. Returning "__UPLOAD__" to C++ and opening the picker later
       // (after ASYNCIFY resume) loses the gesture — browsers block input.click()
       // and/or the focus-cancel timer races FileReader, wedging or silently
-      // cancelling the Open flow. Fill g_pick via billet_file_pick_done, then
+      // cancelling the Open flow. Fill g_pick via chudware_file_pick_done, then
       // finish browse with "__UPLOAD__" so C++ can consume bytes + fsUpload.
       uploadBtn.onclick = function() {
         if (finished) return;
@@ -310,7 +310,7 @@ mergeInto(LibraryManager.library, {
         }
 
         function deliverPick(ok, name, data, len, errStr) {
-          if (typeof Module === 'undefined' || !Module._billet_file_pick_done) {
+          if (typeof Module === 'undefined' || !Module._chudware_file_pick_done) {
             showUploadStatus('Upload unavailable (module not ready)', true);
             return false;
           }
@@ -335,7 +335,7 @@ mergeInto(LibraryManager.library, {
                 namePtr = Module._malloc(nb);
                 stringToUTF8(name, namePtr, nb);
               }
-              Module._billet_file_pick_done(1, namePtr, ptr, len, 0);
+              Module._chudware_file_pick_done(1, namePtr, ptr, len, 0);
               if (namePtr) Module._free(namePtr);
               Module._free(ptr);
               return true;
@@ -346,7 +346,7 @@ mergeInto(LibraryManager.library, {
               errPtr = Module._malloc(eb);
               stringToUTF8(errStr, errPtr, eb);
             }
-            Module._billet_file_pick_done(0, 0, 0, 0, errPtr);
+            Module._chudware_file_pick_done(0, 0, 0, 0, errPtr);
             if (errPtr) Module._free(errPtr);
             return false;
           } catch (ex) {
@@ -410,13 +410,13 @@ mergeInto(LibraryManager.library, {
     loadDir('');
   },
 
-  // Canvas HTML5 file drop → Module._billet_web_drop_done (app.cpp).
+  // Canvas HTML5 file drop → Module._chudware_web_drop_done (app.cpp).
   // Installed once from C++ after GL/canvas is ready. Does not block;
   // FileReader completion posts into the C++ pending slot drained per frame.
-  billet_install_canvas_drop__deps: ['$UTF8ToString', '$stringToUTF8', '$lengthBytesUTF8'],
-  billet_install_canvas_drop: function() {
-    if (typeof window === 'undefined' || window.__billetDropInstalled) return;
-    window.__billetDropInstalled = true;
+  chudware_install_canvas_drop__deps: ['$UTF8ToString', '$stringToUTF8', '$lengthBytesUTF8'],
+  chudware_install_canvas_drop: function() {
+    if (typeof window === 'undefined' || window.__chudwareDropInstalled) return;
+    window.__chudwareDropInstalled = true;
 
     function canvasEl() {
       return document.getElementById('canvas') ||
@@ -425,7 +425,7 @@ mergeInto(LibraryManager.library, {
     }
 
     function finishDrop(ok, name, data, len, errStr) {
-      if (typeof Module === 'undefined' || !Module._billet_web_drop_done) return;
+      if (typeof Module === 'undefined' || !Module._chudware_web_drop_done) return;
       if (ok && data && len > 0) {
         var ptr = Module._malloc(len);
         HEAPU8.set(data, ptr);
@@ -435,7 +435,7 @@ mergeInto(LibraryManager.library, {
           namePtr = Module._malloc(nb);
           stringToUTF8(name, namePtr, nb);
         }
-        Module._billet_web_drop_done(1, namePtr, ptr, len, 0);
+        Module._chudware_web_drop_done(1, namePtr, ptr, len, 0);
         if (namePtr) Module._free(namePtr);
         Module._free(ptr);
       } else {
@@ -445,7 +445,7 @@ mergeInto(LibraryManager.library, {
           errPtr = Module._malloc(eb);
           stringToUTF8(errStr, errPtr, eb);
         }
-        Module._billet_web_drop_done(0, 0, 0, 0, errPtr);
+        Module._chudware_web_drop_done(0, 0, 0, 0, errPtr);
         if (errPtr) Module._free(errPtr);
       }
     }

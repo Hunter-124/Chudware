@@ -1,9 +1,9 @@
 ---
 name: chudware-dev
-description: Generalist skill for ANY change to the Chudware program (formerly Chudware) in this repo — engine/kernel work, agent loop, MCP server, contracts, scripts, tests, docs, bug fixes, features — whenever the task isn't purely GUI (purely-GUI batches go to gui-orchestrator, which this skill points to). Carries the verified repo map, build/test commands, git workflow, and Hunter's working preferences, so read this before searching the repo or asking basics.
+description: Generalist skill for ANY change to the Chudware program (formerly Billet / AI-CAD) in this repo — engine/kernel work, agent loop, MCP server, contracts, scripts, tests, docs, bug fixes, features — whenever the task isn't purely GUI (purely-GUI batches go to gui-orchestrator, which this skill points to). Carries the verified repo map, build/test commands, git workflow, and Hunter's working preferences, so read this before searching the repo or asking basics.
 ---
 
-# Chudware Generalist Dev (formerly Chudware)
+# Chudware Generalist Dev (formerly Billet / AI-CAD)
 
 How to work in this repo, regardless of which part you're changing. GUI-heavy batches:
 hand off to `.claude/skills/gui-orchestrator/SKILL.md` (it has the panel-level map and

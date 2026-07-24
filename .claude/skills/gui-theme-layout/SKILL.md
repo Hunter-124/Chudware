@@ -1,6 +1,6 @@
 ---
 name: gui-theme-layout
-description: Chudware (formerly Chudware) theming and layout specialist — the Liquid Glass v2 visual system, dark/light palettes, glass window helpers, elevation levels, DPI-aware metrics, the dockspace/pinned-column layout, overlay band, and app-level modals (Settings, file dialog, equations, profiler). Use for any task about colors, styling, glass effects, panel docking/collapse, window layout, DPI scaling, or app dialogs. Workers dispatched by gui-orchestrator read this file first instead of searching the repo.
+description: Chudware (formerly Billet / AI-CAD) theming and layout specialist — the Liquid Glass v2 visual system, dark/light palettes, glass window helpers, elevation levels, DPI-aware metrics, the dockspace/pinned-column layout, overlay band, and app-level modals (Settings, file dialog, equations, profiler). Use for any task about colors, styling, glass effects, panel docking/collapse, window layout, DPI scaling, or app dialogs. Workers dispatched by gui-orchestrator read this file first instead of searching the repo.
 ---
 
 # GUI Theme & Layout Specialist

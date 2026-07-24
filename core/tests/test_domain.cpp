@@ -156,7 +156,7 @@ TEST_CASE("admin/PLM cleanup brief is non-geometry, never modeling work") {
         "cleaned up & put into the plm system properly, and clean up the file system "
         "while your at it too. lets have it all well organized and have all the "
         "depricated stuff in specified \"depricated\" folders, move the unrelated work "
-        "into /documents/AI-CAD, and keep the .step files seperate as well. you need to "
+        "into /documents/Chudware, and keep the .step files seperate as well. you need to "
         "rename a lot of the parts too and just make the names simpler.";
     CHECK(chudware::agent::is_admin_request(brief));
     CHECK(chudware::agent::capability_kind(brief) ==

@@ -156,8 +156,8 @@ def sync_users(host: str) -> None:
     pols = api("GET", f"/accounts/{ACCOUNT_ID}/access/apps/{app['id']}/policies")
     allow_pols = [p for p in pols if p.get("decision") == "allow"]
     # Reuse whatever allow policy already governs this app instead of creating a second
-    # one at precedence 1 — deployments get relabeled (e.g. "billet-users" instead of
-    # "chudware-users") and a name-only lookup used to miss the existing policy, then
+    # one at precedence 1 — older deployments may carry a legacy policy name (e.g.
+    # "billet-users"/"aicad-users") and a name-only lookup used to miss the existing policy, then
     # collide on precedence with a hard "policy precedences must be unique" 400.
     pol = find(pols, "name", "chudware-users") or (allow_pols[0] if len(allow_pols) == 1 else None)
     name = pol["name"] if pol else "chudware-users"

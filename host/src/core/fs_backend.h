@@ -65,7 +65,7 @@ public:
     virtual bool copy(const std::string& src, const std::string& dst, bool recursive,
                       std::string& err) = 0;
 
-    // Web-only: load/save durable recents from workspace .billet_recents.json.
+    // Web-only: load/save durable recents from workspace .chudware_recents.json.
     // Desktop no-ops (returns empty / true) — desktop uses config.json.
     virtual std::vector<std::string> loadRecents(std::string& err) {
         (void)err;

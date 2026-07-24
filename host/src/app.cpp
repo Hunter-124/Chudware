@@ -26,11 +26,11 @@ inline void wasmBootDom(const char *msg) {
         if (el)
           el.textContent = UTF8ToString($0);
         try {
-          if (!window.__billetLogs)
-            window.__billetLogs = [];
-          window.__billetLogs.push('boot: ' + UTF8ToString($0));
-          if (window.__billetLogs.length > 400)
-            window.__billetLogs.shift();
+          if (!window.__chudwareLogs)
+            window.__chudwareLogs = [];
+          window.__chudwareLogs.push('boot: ' + UTF8ToString($0));
+          if (window.__chudwareLogs.length > 400)
+            window.__chudwareLogs.shift();
           console.log('boot: ' + UTF8ToString($0));
         } catch (e) {
         }
@@ -1164,7 +1164,7 @@ static void onFileDrop(GLFWwindow *win, int count, const char **paths) {
     return;
 #ifdef __EMSCRIPTEN__
   // Web: GLFW/browser "paths" are not host filesystem paths the daemon can
-  // open. Canvas HTML5 drops are handled by billet_install_canvas_drop +
+  // open. Canvas HTML5 drops are handled by chudware_install_canvas_drop +
   // drainWebFileDrop.
   (void)stp;
   (void)paths;
@@ -1211,7 +1211,7 @@ struct WebDropPending {
 static WebDropPending g_webDrop;
 
 extern "C" EMSCRIPTEN_KEEPALIVE void
-billet_web_drop_done(int ok, const char *name, const uint8_t *data, int len,
+chudware_web_drop_done(int ok, const char *name, const uint8_t *data, int len,
                      const char *errMsg) {
   if (g_webDrop.data) {
     free(g_webDrop.data);
@@ -1244,7 +1244,7 @@ billet_web_drop_done(int ok, const char *name, const uint8_t *data, int len,
 }
 
 // JS library (chudware_web_dialogs.js) — installs dragover/drop on the canvas.
-extern "C" void billet_install_canvas_drop(void);
+extern "C" void chudware_install_canvas_drop(void);
 
 static void drainWebFileDrop(AppState &st) {
   if (g_webDrop.ready == 0)
@@ -1564,7 +1564,7 @@ static void wasmProcessMultitouch(AppState &st, GLFWwindow *win) {
   double x0 = 0, y0 = 0, x1 = 0, y1 = 0;
   n = EM_ASM_INT(
       {
-        var t = window.__billetTouches;
+        var t = window.__chudwareTouches;
         if (!t || !t.length)
           return 0;
         var a = t[0];
@@ -1647,17 +1647,17 @@ static void wasmProcessMultitouch(AppState &st, GLFWwindow *win) {
 // JS touch tracker used by wasmProcessMultitouch (installed once).
 static void wasmInstallTouchTracker() {
   EM_ASM({
-    if (window.__billetTouchTracker)
+    if (window.__chudwareTouchTracker)
       return;
-    window.__billetTouchTracker = true;
-    window.__billetTouches = [];
+    window.__chudwareTouchTracker = true;
+    window.__chudwareTouches = [];
     function sync(ev) {
       var list = [];
       for (var i = 0; i < ev.touches.length; ++i) {
         var t = ev.touches[i];
         list.push({id : t.identifier, x : t.clientX, y : t.clientY});
       }
-      window.__billetTouches = list;
+      window.__chudwareTouches = list;
     }
     var opts = {};
     opts.passive = true;
@@ -1671,18 +1671,18 @@ static void wasmInstallTouchTracker() {
 
 extern "C" {
 
-EMSCRIPTEN_KEEPALIVE void billet_mobile_set_drag_mode(int mode) {
+EMSCRIPTEN_KEEPALIVE void chudware_mobile_set_drag_mode(int mode) {
   g_wasmHudCmd =
       (mode == 1) ? (int)WasmHudCmd::SetDragPan : (int)WasmHudCmd::SetDragOrbit;
 }
-EMSCRIPTEN_KEEPALIVE void billet_mobile_zoom_step(int dir) {
+EMSCRIPTEN_KEEPALIVE void chudware_mobile_zoom_step(int dir) {
   g_wasmHudCmd =
       (dir >= 0) ? (int)WasmHudCmd::ZoomIn : (int)WasmHudCmd::ZoomOut;
 }
-EMSCRIPTEN_KEEPALIVE void billet_mobile_undo(void) {
+EMSCRIPTEN_KEEPALIVE void chudware_mobile_undo(void) {
   g_wasmHudCmd = (int)WasmHudCmd::Undo;
 }
-EMSCRIPTEN_KEEPALIVE void billet_mobile_toggle_menu(void) {
+EMSCRIPTEN_KEEPALIVE void chudware_mobile_toggle_menu(void) {
   g_wasmHudCmd = (int)WasmHudCmd::ToggleMenu;
 }
 
@@ -1968,7 +1968,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   glfwSetWindowUserPointer(win, &st);
   g_prevDropCallback = glfwSetDropCallback(win, onFileDrop);
 #ifdef __EMSCRIPTEN__
-  billet_install_canvas_drop();
+  chudware_install_canvas_drop();
 #endif
 
   // Multi-document FALLBACK singletons. PropertyManager / SketchMode /
@@ -3697,7 +3697,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     st.drainMeshLoads();
 #ifdef __EMSCRIPTEN__
     // Browser canvas drop → fsUpload → requestOpenPath (set by
-    // billet_web_drop_done).
+    // chudware_web_drop_done).
     drainWebFileDrop(st);
 #endif
     // Phase 4 (shared engine daemon): drain hostd push events — foreign-edit

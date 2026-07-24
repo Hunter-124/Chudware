@@ -95,16 +95,17 @@ Terminal=false
 StartupWMClass=chudware
 EOF
 
-# Migration cleanup: retire the pre-rename Chudware entry + hicolor icons, the
-# stale ui/imgui entry (Exec pointed at the removed aicad2-dev binary), and the
-# pre-chudware-rename Chudware.desktop (superseded by chudware.desktop above) so
-# old installs don't show a duplicate launcher entry.
-for STALE in "$APPS/Chudware.desktop" "$APPS/aicad2-dev.desktop" "$APPS/Chudware.desktop"; do
+# Migration cleanup: retire the pre-rename launcher entries (Billet.desktop, AI-CAD.desktop)
+# and the stale ui/imgui entry (Exec pointed at the removed aicad2-dev binary) so old
+# installs don't show a duplicate launcher entry alongside chudware.desktop above.
+for STALE in "$APPS/Billet.desktop" "$APPS/AI-CAD.desktop" "$APPS/aicad2-dev.desktop"; do
   [ -f "$STALE" ] && { rm -f "$STALE"; echo "removed stale $STALE"; }
 done
 for s in 16 32 48 64 128 256; do
-  OLD_ICON="$ICONS/${s}x${s}/apps/Chudware.png"
-  [ -f "$OLD_ICON" ] && { rm -f "$OLD_ICON"; echo "removed stale $OLD_ICON"; }
+  for OLD in Billet AI-CAD; do
+    OLD_ICON="$ICONS/${s}x${s}/apps/${OLD}.png"
+    [ -f "$OLD_ICON" ] && { rm -f "$OLD_ICON"; echo "removed stale $OLD_ICON"; }
+  done
   # Old MIME icon name (application/vnd.aicad.stepplus, pre-rename).
   OLD_MIME_ICON="$ICONS/${s}x${s}/mimetypes/application-vnd.aicad.stepplus.png"
   [ -f "$OLD_MIME_ICON" ] && { rm -f "$OLD_MIME_ICON"; echo "removed stale $OLD_MIME_ICON"; }
@@ -114,4 +115,4 @@ command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$
 command -v gtk-update-icon-cache   >/dev/null 2>&1 && gtk-update-icon-cache -f -t "$ICONS" 2>/dev/null || true
 
 echo "installed chudware.desktop + icon."
-echo "If you have a pinned taskbar launcher, un-pin and re-pin it (it may cache the old Chudware/aicad2-dev/Chudware entry)."
+echo "If you have a pinned taskbar launcher, un-pin and re-pin it (it may cache the old Billet/AI-CAD/aicad2-dev entry)."

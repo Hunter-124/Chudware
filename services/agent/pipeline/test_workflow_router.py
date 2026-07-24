@@ -358,7 +358,7 @@ class TestProjectAdmin:
         transcript = (
             "I want you to look at all documents... clean up & put into PLM... "
             "clean up file system... deprecated folders... move unrelated to "
-            "/documents/AI-CAD... init PLM... rename GA to general assembly"
+            "/documents/Chudware... init PLM... rename GA to general assembly"
         )
         assert classify_task(transcript) == TaskClass.PROJECT_ADMIN
 

@@ -2010,7 +2010,7 @@ def _normalize_questions(raw: Any) -> list[dict]:
 # first "linear" class: routing it into the geometry BUILD swarm hands the
 # model geometry-only role tools and it fabricates a dummy part instead of
 # doing the file/PLM work the user actually asked for (4 live runs — see
-# ~/.local/share/AI-CAD/chat_history.json).
+# ~/.local/share/Chudware/chat_history.json).
 #
 # route_request() is the entry a mission caller should run BEFORE compiling a
 # manifest/DAG: "dag" classes get back the router decision so the caller

@@ -125,7 +125,7 @@ std::string openFileDialog(const char* filter) {
         return chosen;
     }
 
-    // Bytes already delivered by chudware_web_dialogs.js → billet_file_pick_done.
+    // Bytes already delivered by chudware_web_dialogs.js → chudware_file_pick_done.
     chudware::PickedFile picked;
     std::string err;
     if (!chudware::consumePickedFile(picked, err) || picked.name.empty() || picked.data.empty()) {

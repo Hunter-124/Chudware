@@ -2,7 +2,7 @@
 # ===========================================================================
 #  Chudware build script (Linux) — thin wrapper around CMake/Ninja.
 # ---------------------------------------------------------------------------
-#  Builds the native CMake/Ninja projects that make up Chudware (formerly Chudware):
+#  Builds the native CMake/Ninja projects that make up Chudware (formerly Billet / AI-CAD):
 #    core -> the C++ OCCT kernel (libchudware.so)
 #    app  -> Chudware host GUI (cmake -S host -B host/build-linux + ninja Chudware)
 #

@@ -1,4 +1,4 @@
-"""Canonical filesystem locations for Chudware (formerly Chudware).
+"""Canonical filesystem locations for Chudware (formerly Billet / AI-CAD).
 
 Everything the app produces or installs lives under ``%APPDATA%\\Chudware`` so the
 shipped (non-sandboxed) binary and this dev environment converge on the same layout.

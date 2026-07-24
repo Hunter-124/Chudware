@@ -1,4 +1,4 @@
-"""Register Chudware (formerly Chudware) as an MCP server in the machine's Claude install(s).
+"""Register Chudware (formerly Billet / AI-CAD) as an MCP server in the machine's Claude install(s).
 
 Adds a "chudware" entry to the `mcpServers` map of (any legacy "ai-cad" entry is left
 in place on register — existing tooling references it — and removed on --unregister):

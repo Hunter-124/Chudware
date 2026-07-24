@@ -7,6 +7,7 @@ from typing import Optional
 from typing import Union
 import json
 import os
+import re
 
 from .cad_common import (
     _CUR,
@@ -37,6 +38,202 @@ from .cad_common import (
 from .cad_guide import (
     cad_guide_text,
 )
+
+# ---------------------------------------------------------------------------
+# Sketch-op shape normalizer (model-robustness).
+#
+# The engine's sketch schema is strict: entities under params with e<N> ids and
+# p1/p2 point fields, constraints with c<N> ids + `refs` handles (eN.pM), the
+# sketch plane under refs.plane. LLMs (esp. smaller ones) very naturally emit a
+# flatter form instead — L1/L2 ids, start/end keys, a `constraints` list keyed on
+# `entities`, a separate `dimensions` array, and a top-level `plane:"XY"`. That
+# form is REJECTED wholesale by validate.cpp (invalid_op), which surfaces as a red
+# "add_features failed" card mid-build. Normalize the common deviations into the
+# canonical shape BEFORE doc_apply_ops so a natural sketch just works. Conservative:
+# only rewrites a feature that shows the deviant form; canonical ops pass through
+# untouched (byte-identical), and any failure falls back to the original op.
+_PLANE_ALIASES = {
+    "xy": "plane.top", "yx": "plane.top", "top": "plane.top",
+    "xz": "plane.front", "zx": "plane.front", "front": "plane.front",
+    "yz": "plane.right", "zy": "plane.right", "right": "plane.right",
+}
+_CID_RE = re.compile(r"^c\d+$")
+_EID_RE = re.compile(r"^e\d+$")
+_DIM_CTYPES = frozenset({"distance", "length", "angle", "radius", "diameter"})
+
+
+def _xy(v: Any) -> Any:
+    """Coerce a coordinate to the engine's 2D [x, y]; pass anything else through."""
+    if isinstance(v, list) and len(v) >= 2 and all(isinstance(x, (int, float)) for x in v[:2]):
+        return [v[0], v[1]]
+    return v
+
+
+def _norm_plane(v: Any) -> Optional[str]:
+    if not isinstance(v, str) or not v.strip():
+        return None
+    s = v.strip()
+    if s.startswith("plane.") or s.startswith("f") or "." in s:
+        return s  # already a datum/handle-ish token — leave it
+    return _PLANE_ALIASES.get(s.lower(), s)
+
+
+def _norm_dim_value(c: dict) -> dict:
+    """Wrap a bare numeric dimension value in the engine's {value, expr} literal."""
+    if c.get("type") in _DIM_CTYPES:
+        val = c.get("value")
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            c["value"] = {"value": val, "expr": None}
+        elif isinstance(val, dict) and "value" in val and "expr" not in val:
+            c["value"] = {"value": val["value"], "expr": val.get("expr")}
+        c.setdefault("driven", False)
+    return c
+
+
+def _sketch_needs_norm(feat: dict, params: dict) -> bool:
+    ents = params.get("entities") if isinstance(params.get("entities"), list) else feat.get("entities")
+    cons = params.get("constraints") if isinstance(params.get("constraints"), list) else feat.get("constraints")
+    if "entities" in feat or "constraints" in feat or "dimensions" in feat or "plane" in feat:
+        return True
+    if "dimensions" in params or "plane" in params:
+        return True
+    if not (feat.get("refs") or {}).get("plane"):
+        return True
+    for e in (ents or []):
+        if not isinstance(e, dict):
+            continue
+        if not (isinstance(e.get("id"), str) and _EID_RE.match(e["id"])):
+            return True
+        if not isinstance(e.get("construction"), bool):
+            return True
+        if e.get("type") == "line" and ("p1" not in e or "p2" not in e):
+            return True
+    for c in (cons or []):
+        if not isinstance(c, dict):
+            continue
+        if "entities" in c or "handles" in c:
+            return True
+        if not (isinstance(c.get("id"), str) and _CID_RE.match(c["id"])):
+            return True
+    return False
+
+
+def _normalize_sketch_feature(feat: dict) -> dict:
+    """Rewrite a natural/flat sketch add_feature into the engine's canonical shape."""
+    params = feat.get("params") if isinstance(feat.get("params"), dict) else {}
+
+    def _pick(key: str) -> Any:
+        if isinstance(params.get(key), list):
+            return params[key]
+        if isinstance(feat.get(key), list):
+            return feat[key]
+        return None
+
+    ents_in = _pick("entities")
+    if not isinstance(ents_in, list):
+        return feat  # nothing sketch-shaped to work with
+    if not _sketch_needs_norm(feat, params):
+        return feat  # already canonical — leave byte-identical
+
+    cons_in = _pick("constraints") or []
+    dims_in = _pick("dimensions") or []
+
+    id_map: dict[str, str] = {}
+    norm_ents = []
+    for idx, e in enumerate(ents_in, start=1):
+        if not isinstance(e, dict):
+            norm_ents.append(e)
+            continue
+        new_id = f"e{idx}"
+        if isinstance(e.get("id"), str) and e["id"]:
+            id_map[e["id"]] = new_id
+        ne = dict(e)
+        ne["id"] = new_id
+        ne["construction"] = bool(ne.get("construction", False))
+        etype = ne.get("type")
+        if etype == "line":
+            p1 = ne.get("p1", ne.get("start", ne.get("from")))
+            p2 = ne.get("p2", ne.get("end", ne.get("to")))
+            if p1 is not None:
+                ne["p1"] = _xy(p1)
+            if p2 is not None:
+                ne["p2"] = _xy(p2)
+            for k in ("start", "end", "from", "to"):
+                ne.pop(k, None)
+        elif etype in ("circle", "arc"):
+            if "center" in ne:
+                ne["center"] = _xy(ne["center"])
+            for k in ("start", "end"):
+                if isinstance(ne.get(k), list):
+                    ne[k] = _xy(ne[k])
+            if etype == "arc" and "ccw" not in ne:
+                ne["ccw"] = True
+        norm_ents.append(ne)
+
+    def _remap(h: Any) -> Any:
+        if not isinstance(h, str) or h in ("origin", "origin.p"):
+            return h
+        base, _, sub = h.partition(".")
+        base = id_map.get(base, base)
+        return base + ("." + sub if sub else "")
+
+    norm_cons = []
+    cn = 0
+    for c in list(cons_in) + list(dims_in):
+        if not isinstance(c, dict):
+            norm_cons.append(c)
+            continue
+        nc = dict(c)
+        refs = nc.get("refs", nc.get("entities", nc.get("handles")))
+        if isinstance(refs, list):
+            nc["refs"] = [_remap(x) for x in refs]
+        nc.pop("entities", None)
+        nc.pop("handles", None)
+        cid = nc.get("id")
+        if isinstance(cid, str) and _CID_RE.match(cid):
+            cn = max(cn, int(cid[1:]))
+        else:
+            cn += 1
+            nc["id"] = f"c{cn}"
+        norm_cons.append(_norm_dim_value(nc))
+
+    refs_out = dict(feat.get("refs") or {})
+    plane = None
+    for src in (refs_out.get("plane"), params.get("plane"), feat.get("plane")):
+        p = _norm_plane(src) if src is not None else None
+        if p:
+            plane = p
+            break
+    refs_out["plane"] = plane or "plane.top"
+
+    new_feat = dict(feat)
+    for k in ("entities", "constraints", "dimensions", "plane"):
+        new_feat.pop(k, None)
+    new_params = dict(params)
+    new_params.pop("plane", None)
+    new_params.pop("dimensions", None)
+    new_params["entities"] = norm_ents
+    new_params["constraints"] = norm_cons
+    new_feat["params"] = new_params
+    new_feat["refs"] = refs_out
+    return new_feat
+
+
+def _normalize_sketch_ops(ops: Any) -> Any:
+    """Normalize any sketch add_feature ops in-place-safe; return a new list."""
+    if not isinstance(ops, list):
+        return ops
+    out = []
+    for op in ops:
+        try:
+            if (isinstance(op, dict) and op.get("op") == "add_feature"
+                    and isinstance(op.get("feature"), dict)
+                    and op["feature"].get("type") == "sketch"):
+                op = {**op, "feature": _normalize_sketch_feature(op["feature"])}
+        except Exception:  # noqa: BLE001 — never let normalization break a valid call
+            pass
+        out.append(op)
+    return out
 
 def register_cad_doc_tools(mcp: FastMCP) -> None:
     """CAD document-lifecycle MCP tools (T-RF8 split of cad_tools.py): new_part, add_features, get_part, undo/redo, save/close/recover, configurations, material, engine_profile, cad_guide."""
@@ -245,6 +442,10 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         """
         try:
             d = _doc(doc_id)
+            # Model-robustness: accept the natural/flat sketch shape LLMs emit
+            # (L1 ids, start/end, dimensions[], top-level plane) by normalizing it
+            # to the engine's canonical schema before validation.
+            ops = _normalize_sketch_ops(ops)
 
             def _apply() -> dict:
                 # Transactional batch: snapshot first so a partial failure rolls the WHOLE batch

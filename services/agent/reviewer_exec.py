@@ -107,9 +107,9 @@ def _resolve_fn(tool: str) -> Callable[..., Any] | None:
     # part_search also resolves mission-scoped) and the ledger tools (ledger_get/
     # ledger_note with an explicit run_id) — none of which the battery singleton
     # builds.  Same one-FastMCP-per-module pattern; still ONE process-wide registry.
-    for module_key in ("gsl", "parts", "ledger", "preflight", "regen", "buildgraph",
-                       "intake", "designreview", "req", "cost", "structural",
-                       "dimscheme", "workspace", "firmware", "em", "antenna"):
+    for module_key in ("files", "shell", "plm", "gsl", "parts", "ledger", "preflight",
+                       "regen", "buildgraph", "intake", "designreview", "req", "cost",
+                       "structural", "dimscheme", "workspace", "firmware", "em", "antenna"):
         fn = _resolve_extra(module_key, tool)
         if fn is not None:
             return fn
@@ -209,6 +209,20 @@ def _resolve_extra(module_key: str, fn_name: str) -> Callable[..., Any] | None:
                 # mega-2: ecad_antenna_design / ecad_antenna_analyze (family:em/ecad).
                 from mcp_server.antenna_tools import register_antenna_tools
                 register_antenna_tools(mcp)
+            elif module_key == "files":
+                # Harness overhaul 2026-07-23: fs_read/fs_write/fs_edit/fs_list/
+                # fs_glob/fs_grep — the agent_default/subagent_default floors and
+                # the project_organizer card dispatch through this resolver.
+                from mcp_server.fs_tools import register_fs_tools
+                register_fs_tools(mcp)
+            elif module_key == "shell":
+                # run_shell — main-agent floor (agent_default_tools).
+                from mcp_server.fs_tools import register_shell_tools
+                register_shell_tools(mcp)
+            elif module_key == "plm":
+                # plm_* — the project_organizer role card (contract §7 envelope).
+                from mcp_server.plm_tools import register_plm_tools
+                register_plm_tools(mcp)
             else:
                 return None
             _EXTRA_MCP[module_key] = mcp

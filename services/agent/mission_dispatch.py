@@ -2060,6 +2060,18 @@ def run_linear_role_turn(
     card = load_role(role)
     allowed = sorted(set(card.concrete_tools) | SUBAGENT_DEFAULT_TOOLS)
 
+    # Meta-tool coverage (live admin path passes no dispatcher): ask_user &
+    # the other coordination tools resolve only via MissionDispatch.resolve,
+    # so a bare linear turn gets a run-scoped dispatcher of its own.
+    if mission_dispatch is None and tool_dispatch is None:
+        try:
+            import uuid as _uuid  # noqa: PLC0415
+            mission_dispatch = MissionDispatch(
+                run_id=run_id or f"linear-{_uuid.uuid4().hex[:8]}",
+                ledger=ledger, provider=provider, on_event=on_event)
+        except Exception:  # noqa: BLE001 — dispatcher is best-effort
+            mission_dispatch = None
+
     system_prompt = card.system_prompt
     try:
         from services.agent.prompt_tiers import (  # noqa: PLC0415

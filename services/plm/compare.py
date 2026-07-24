@@ -36,11 +36,16 @@ from services.plm import snapshot
 def semantic_compare(doc_a: dict[str, Any], doc_b: dict[str, Any]) -> dict[str, Any]:
     """Semantic change list between two parsed documents: raw ``doc_diff``
     plus the deterministic plain-language summary (numerals copied from the
-    diff — Pillar 13)."""
+    diff — Pillar 13). ECAD documents (aicad.pcb/1, aicad.sch/1, aicad.ecad/1)
+    get the id-based nets/components/footprints/tracks delta instead
+    (services.plm.ecad_diff), with a matching plain-language summary."""
     from services.mcp.doc_diff_tools import doc_diff
+    from services.plm import ecad_diff as ecad_diff_mod
     from services.plm import summarize
 
     diff = doc_diff(doc_a, doc_b)
+    if ecad_diff_mod.is_ecad_schema(doc_a) or ecad_diff_mod.is_ecad_schema(doc_b):
+        return {"doc_diff": diff, "summary": ecad_diff_mod.summarize_ecad_diff(diff)}
     return {"doc_diff": diff,
             "summary": summarize.summarize_diff(diff, doc_a, doc_b)}
 
@@ -62,7 +67,11 @@ def generic_compare(vault: Any, commit_a: str, commit_b: str,
                     item_id: str) -> dict[str, Any]:
     """Compare a generic item between two history points (contract §2 sibling
     content). Returns ``{mode:"generic", summary, text_diff?}`` — a plain-language
-    line always, plus a unified text diff when both versions are text.
+    line always, plus a unified text diff for a single-file item: verbatim text,
+    or (docx/xlsx/xlsm/pptx/pdf/doc) the frozen office_extract text — capped and
+    truncation-noted per the context-safe rule. A binary item with no extractor
+    (or whose extraction fails/is unavailable) keeps the plain-language summary
+    only — this never raises.
     """
     import difflib
 
@@ -83,7 +92,7 @@ def generic_compare(vault: Any, commit_a: str, commit_b: str,
                                                                  "item_id": item_id}
     out: dict[str, Any] = {"mode": "generic",
                            "summary": generic_snapshot.summarize(item, old, new)}
-    # a single-file text item gets a readable unified diff
+    # a single-file item gets a readable unified diff
     if len(old) <= 1 and len(new) <= 1:
         a_bytes = next(iter(old.values()), b"")
         b_bytes = next(iter(new.values()), b"")
@@ -94,6 +103,11 @@ def generic_compare(vault: Any, commit_a: str, commit_b: str,
                 a_txt.splitlines(), b_txt.splitlines(),
                 fromfile="before", tofile="after", lineterm="")
             out["text_diff"] = "\n".join(diff)
+        else:
+            name = next(iter(old), "") or next(iter(new), "")
+            office_diff = _office_text_diff(name, a_bytes, b_bytes)
+            if office_diff is not None:
+                out["text_diff"] = office_diff
     return out
 
 
@@ -105,6 +119,58 @@ def _as_text(data: bytes) -> str | None:
     if "\x00" in text:
         return None
     return text
+
+
+# .docx/.xlsx/.xlsm/.pptx/.pdf/.doc items have no plain-text form but do have a
+# frozen extractor (services/mcp/office_tools.py extract_office); every other
+# binary item keeps the one-line summary above.
+_OFFICE_EXT_KINDS = frozenset({"docx", "xlsx", "xlsm", "pptx", "pdf", "doc"})
+_MAX_DIFF_LINES = 400
+
+
+def _cap_diff_lines(lines: list[str]) -> str:
+    """Join unified-diff *lines*, capped at ``_MAX_DIFF_LINES`` with a
+    truncation note (context-safe rule — mirrors fs_tools.py fs_read's
+    offset/limit cap)."""
+    if len(lines) > _MAX_DIFF_LINES:
+        omitted = len(lines) - _MAX_DIFF_LINES
+        lines = lines[:_MAX_DIFF_LINES] + [
+            f"... (truncated — {omitted} more diff lines omitted)"]
+    return "\n".join(lines)
+
+
+def _office_text_diff(name: str, a_bytes: bytes, b_bytes: bytes) -> str | None:
+    """Unified diff of two revisions' ``office_extract`` text, or ``None``
+    when *name*'s extension has no extractor, or extraction fails/is
+    unavailable — the caller then falls back to the plain-language summary.
+    Never raises.
+    """
+    ext = Path(name).suffix.lower().lstrip(".")
+    if ext not in _OFFICE_EXT_KINDS:
+        return None
+    try:
+        import difflib
+        import tempfile
+
+        from services.mcp.office_tools import extract_office
+
+        with tempfile.TemporaryDirectory(prefix="chudware_plm_office_diff_") as td:
+            path_a = Path(td) / f"before.{ext}"
+            path_b = Path(td) / f"after.{ext}"
+            path_a.write_bytes(a_bytes)
+            path_b.write_bytes(b_bytes)
+            res_a = extract_office(str(path_a))
+            res_b = extract_office(str(path_b))
+        if not res_a.get("ok") or not res_b.get("ok"):
+            return None
+        text_a = str(res_a.get("text", ""))
+        text_b = str(res_b.get("text", ""))
+        diff = list(difflib.unified_diff(
+            text_a.splitlines(), text_b.splitlines(),
+            fromfile="before", tofile="after", lineterm=""))
+    except Exception:  # noqa: BLE001 — extraction is best-effort, never fatal
+        return None
+    return _cap_diff_lines(diff)
 
 
 def docs_at(vault: Any, commit_a: str, commit_b: str,

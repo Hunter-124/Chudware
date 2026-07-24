@@ -1,7 +1,18 @@
-"""services.plm.remote — folder remotes, sync, and advisory locks (T-R7, contract §6).
+"""services.plm.remote — folder/ssh/https remotes, sync, and advisory locks (T-R7, contract §6).
 
 Team concurrency v1 = advisory locks + sync, no merging (``aicad.plm/1`` §6).
-Folder kind only in this subset: a bare git repo on a filesystem path.
+The vault (``.aicadvault/``) is a plain git repo (dulwich primary), so every
+non-``chudware-cloud`` remote kind — ``folder`` (bare repo on a filesystem
+path), ``ssh``, and ``https`` — shares one fetch/CAS-push implementation built
+on ``dulwich.client.get_transport_and_path``: dulwich already dispatches the
+wire protocol (local, git+ssh, smart-http) purely from the URL string, so the
+manifest's ``kind`` field is a user-facing label only, never a transport
+switch (see ``_fetch_folder``/``_cas_push`` below). Auth is ambient
+(ssh-agent/keys for ssh; URL-embedded or netrc credentials for https, both
+dulwich defaults) — there is no credential store here (YAGNI). Auth failures
+surface as ``{ok:false, reason:"remote_auth"}``, never a traceback.
+``chudware-cloud`` stays reserved/config-only (contract §6.1): every sync/lock
+call against it returns ``{ok:false, reason:"reserved_remote"}``.
 
 Public surface (used by MCP / worker_rpc and by chudware-web session bootstrap)::
 
@@ -25,7 +36,6 @@ from pathlib import Path
 from typing import Any
 
 from dulwich import porcelain
-from dulwich.errors import NotGitRepository
 from dulwich.objects import Blob, Commit, Tree
 from dulwich.repo import Repo
 
@@ -306,8 +316,53 @@ def _ensure_dulwich_remote(repo: Repo, name: str, url: str) -> None:
             pass
 
 
+def _classify_transport_error(e: Exception, remote_url: str) -> VaultError:
+    """Map a dulwich transport failure to a typed reason (contract §6 remotes).
+
+    https gives an unambiguous signal: dulwich raises its own typed
+    ``HTTPUnauthorized``/``HTTPProxyUnauthorized`` straight from a 401/407
+    response. ssh has no equivalent typed exception — the default
+    ``SubprocessSSHVendor`` shells out to the system ``ssh`` binary, so a
+    rejected or missing key surfaces only as a ``HangupException``/
+    ``GitProtocolError`` whose message embeds the ssh client's stderr (e.g.
+    "Permission denied (publickey)."). We pattern-match that text; anything
+    else (host down, DNS failure, bad path, ...) stays a generic
+    ``remote_unreachable``.
+    """
+    from dulwich.client import HTTPProxyUnauthorized, HTTPUnauthorized
+
+    if isinstance(e, (HTTPUnauthorized, HTTPProxyUnauthorized)):
+        return VaultError(
+            "remote_auth", f"authentication failed for the shared project: {e}"
+        )
+    msg = str(e).lower()
+    if any(
+        hint in msg
+        for hint in (
+            "permission denied",
+            "publickey",
+            "authentication failed",
+            "auth fail",
+            "401 unauthorized",
+            "403 forbidden",
+            " unauthorized",
+        )
+    ):
+        return VaultError(
+            "remote_auth", f"authentication failed for the shared project: {e}"
+        )
+    return VaultError("remote_unreachable", f"could not reach the shared project: {e}")
+
+
 def _fetch_folder(repo: Repo, remote_url: str, remote_name: str = "origin") -> dict[bytes, bytes]:
-    """Fetch all refs from a folder remote; return remote ref map {ref: sha}.
+    """Fetch all refs from a remote; return remote ref map {ref: sha}.
+
+    ``remote_url`` may be a folder path, an ``ssh://``/``git@host:path``
+    location, or an ``https://`` location — ``porcelain.fetch`` resolves the
+    transport via ``dulwich.client.get_transport_and_path`` purely from the
+    URL string, so this one implementation already covers contract §6.1's
+    ``folder | ssh | https`` remote kinds. (``chudware-cloud`` never reaches
+    here; callers gate it before calling in.)
 
     Also imports tracking refs under ``refs/remotes/<name>/`` and ensures
     ``refs/heads/*`` + HEAD are present after the fetch (advisor Q3.3).
@@ -320,8 +375,8 @@ def _fetch_folder(repo: Repo, remote_url: str, remote_name: str = "origin") -> d
             errstream=io.BytesIO(),
             outstream=io.StringIO(),
         )
-    except (NotGitRepository, OSError, Exception) as e:
-        raise VaultError("remote_unreachable", f"could not reach the shared project: {e}")
+    except Exception as e:
+        raise _classify_transport_error(e, remote_url)
     refs: dict[bytes, bytes] = {}
     for ref, sha in (result.refs or {}).items():
         if sha is None:
@@ -360,6 +415,29 @@ def _cas_push(
 
     Uses dulwich ``send_pack`` directly so lock refs (blob tips) work — porcelain
     ``push`` calls ``can_fast_forward`` which asserts Commit objects.
+
+    Atomicity actually delivered (contract §6.3 requires this work
+    "identically on dulwich and subprocess-git" — verified below, not assumed):
+
+    * **ssh / https / git** (``TraditionalGitClient`` / smart-HTTP) — real
+      server-side CAS. The ``old_refs`` seen by *update_refs* come from the
+      server's live ref advertisement on *this* connection, not a value we
+      cached earlier; when we detect our ``expected_old`` no longer matches,
+      *update_refs* returns a no-op and no update command is even sent. If a
+      command IS sent, it still carries the server's own just-advertised old
+      value, and receive-pack rejects an update whose old value no longer
+      matches current state — compare and swap happen in one server-side
+      transaction.
+    * **folder** (local path, ``LocalGitClient``) — same guarantee, different
+      mechanism: ``target.refs.set_if_equals(ref, old, new)`` is a
+      lockfile-guarded compare-and-swap on the on-disk ref, so a concurrent
+      local/NFS writer racing us fails exactly like a remote push would.
+
+    Either way the *real* compare happens inside the transport call; our own
+    ``expected_old`` snapshot only lets us skip an already-doomed round trip
+    (the ``cas_fail`` no-op path below) and lets the retry loops in
+    :func:`sync` / :func:`_lock_mutate` tell "definitely raced" apart from
+    "server unreachable".
     """
     from dulwich.client import get_transport_and_path
 
@@ -374,7 +452,7 @@ def _cas_push(
         client, path = get_transport_and_path(str(remote_url))
         path_b = path.encode("utf-8") if isinstance(path, str) else path
     except Exception as e:
-        raise VaultError("remote_unreachable", f"could not reach the shared project: {e}")
+        raise _classify_transport_error(e, remote_url)
 
     cas_fail = {"v": False}
 
@@ -403,7 +481,7 @@ def _cas_push(
         msg = str(e).lower()
         if "non-fast-forward" in msg or "diverged" in msg or "rejected" in msg:
             return False
-        raise VaultError("remote_unreachable", f"could not update the shared project: {e}")
+        raise _classify_transport_error(e, remote_url)
 
     if cas_fail["v"]:
         return False
@@ -422,7 +500,7 @@ def _ls_remote(remote_url: str) -> dict[bytes, bytes]:
         refs = getattr(result, "refs", result)
         return {k: v for k, v in dict(refs).items() if v is not None and k != b"HEAD"}
     except Exception as e:
-        raise VaultError("remote_unreachable", f"could not reach the shared project: {e}")
+        raise _classify_transport_error(e, remote_url)
 
 
 # ---------------------------------------------------------------------------
@@ -598,7 +676,9 @@ def add_remote(
                 return _err("invalid_mode", "a folder remote needs a path")
             remote_url = str(Path(remote_url))
         else:
-            # ssh/https accepted in config; sync not implemented for them in this subset
+            # ssh/https: sync/lock route through the same dulwich transport
+            # layer as folder remotes (kind is a UI label; dulwich dispatches
+            # the wire protocol purely from the URL string — see _fetch_folder).
             if not remote_url:
                 return _err("invalid_mode", "this remote needs a location")
 
@@ -630,7 +710,7 @@ def add_remote(
                 m["lock_ref"] = "refs/aicad/locks"
             v._commit_manifest_change(m)
 
-            if kind == "folder" and remote_url:
+            if kind in ("folder", "ssh", "https") and remote_url:
                 repo = _open_vault_repo(project_dir)
                 try:
                     _ensure_dulwich_remote(repo, name, remote_url)
@@ -671,13 +751,11 @@ def sync(project_dir: str | os.PathLike, remote: str = "origin") -> dict[str, An
                     break
         if entry is None:
             return _err("not_found", f"no remote named {remote!r}")
-        if entry.get("kind") == "chudware-cloud":
+        remote_kind = entry.get("kind")
+        if remote_kind == "chudware-cloud":
             return _err("reserved_remote", "Chudware Cloud is not available yet")
-        if entry.get("kind") != "folder":
-            return _err(
-                "invalid_mode",
-                "only folder remotes can sync in this version",
-            )
+        if remote_kind not in ("folder", "ssh", "https"):
+            return _err("invalid_mode", f"unknown remote kind: {remote_kind}")
         remote_url = entry.get("url")
         if not remote_url:
             return _err("remote_unreachable", "this remote has no location")
@@ -1011,10 +1089,11 @@ def _lock_mutate(
                         break
             if entry is None:
                 return _err("not_found", f"no remote named {remote!r}")
-            if entry.get("kind") == "chudware-cloud":
+            remote_kind = entry.get("kind")
+            if remote_kind == "chudware-cloud":
                 return _err("reserved_remote", "Chudware Cloud is not available yet")
-            if entry.get("kind") != "folder":
-                return _err("invalid_mode", "only folder remotes support locks in this version")
+            if remote_kind not in ("folder", "ssh", "https"):
+                return _err("invalid_mode", f"unknown remote kind: {remote_kind}")
             remote_url = entry.get("url")
             if not remote_url:
                 return _err("remote_unreachable", "this remote has no location")

@@ -131,6 +131,85 @@ def test_plm_compare_reuses_doc_diff(tmp_path, tools):
     assert any(p["param"] == "wall" for p in params)
 
 
+def test_plm_compare_routes_generic_item_to_generic_compare(tmp_path, tools, monkeypatch):
+    """A non-CAD item (docs/code/link) must route through compare.generic_compare,
+    not the geometric doc_diff path — parity with worker_rpc._plm_compare."""
+    (tmp_path / "Bracket.step+").write_bytes(_container(_part()))
+    st = _j(tools["plm_open"](str(tmp_path)))
+    iid = st["manifest"]["items"][0]["item_id"]
+    a = _j(tools["plm_checkpoint"](str(tmp_path), "a"))
+    b = _j(tools["plm_checkpoint"](str(tmp_path), "b"))
+
+    from services.plm import compare as compare_mod
+
+    def fake_is_generic(vault, item_id):
+        return True
+
+    def fake_generic_compare(vault, commit_a, commit_b, item_id):
+        assert (commit_a, commit_b, item_id) == (a["commit"], b["commit"], iid)
+        return {"mode": "generic", "summary": "renamed field.txt",
+               "text_diff": "--- before\n+++ after\n"}
+
+    def fail_docs_at(*a, **k):
+        raise AssertionError("generic item must not call docs_at")
+
+    def fail_semantic_compare(*a, **k):
+        raise AssertionError("generic item must not call semantic_compare")
+
+    monkeypatch.setattr(compare_mod, "is_generic_item", fake_is_generic)
+    monkeypatch.setattr(compare_mod, "generic_compare", fake_generic_compare)
+    monkeypatch.setattr(compare_mod, "docs_at", fail_docs_at)
+    monkeypatch.setattr(compare_mod, "semantic_compare", fail_semantic_compare)
+
+    res = _j(tools["plm_compare"](str(tmp_path), a["commit"], b["commit"], iid))
+    assert res["ok"] is True
+    assert res["mode"] == "generic"
+    assert res["summary"] == "renamed field.txt"
+    assert res["text_diff"] == "--- before\n+++ after\n"
+    assert "doc_diff" not in res
+
+
+def test_plm_compare_routes_cad_item_through_semantic_compare(tmp_path, tools, monkeypatch):
+    """A CAD item — including an ECAD board/schematic, since semantic_compare
+    now routes those internally — must go through docs_at + semantic_compare,
+    never generic_compare."""
+    (tmp_path / "Bracket.step+").write_bytes(_container(_part()))
+    st = _j(tools["plm_open"](str(tmp_path)))
+    iid = st["manifest"]["items"][0]["item_id"]
+    a = _j(tools["plm_checkpoint"](str(tmp_path), "a"))
+    b = _j(tools["plm_checkpoint"](str(tmp_path), "b"))
+
+    from services.plm import compare as compare_mod
+
+    ecad_doc_a = {"schema": "aicad.pcb/1", "id": "board1", "nets": []}
+    ecad_doc_b = {"schema": "aicad.pcb/1", "id": "board1", "nets": [{"id": "n1"}]}
+
+    def fake_is_generic(vault, item_id):
+        return False
+
+    def fake_docs_at(vault, commit_a, commit_b, item_id):
+        assert (commit_a, commit_b, item_id) == (a["commit"], b["commit"], iid)
+        return ecad_doc_a, ecad_doc_b
+
+    def fake_semantic_compare(doc_a, doc_b):
+        assert (doc_a, doc_b) == (ecad_doc_a, ecad_doc_b)
+        return {"doc_diff": {"nets_added": ["n1"]}, "summary": "added net n1"}
+
+    def fail_generic_compare(*a, **k):
+        raise AssertionError("CAD/ECAD item must not call generic_compare")
+
+    monkeypatch.setattr(compare_mod, "is_generic_item", fake_is_generic)
+    monkeypatch.setattr(compare_mod, "docs_at", fake_docs_at)
+    monkeypatch.setattr(compare_mod, "semantic_compare", fake_semantic_compare)
+    monkeypatch.setattr(compare_mod, "generic_compare", fail_generic_compare)
+
+    res = _j(tools["plm_compare"](str(tmp_path), a["commit"], b["commit"], iid))
+    assert res["ok"] is True
+    assert res["doc_diff"] == {"nets_added": ["n1"]}
+    assert res["summary"] == "added net n1"
+    assert "mode" not in res
+
+
 def test_tool_error_hints_no_git_vocab(tmp_path, tools):
     # a not-found restore returns a plain-language hint (contract §8.1)
     (tmp_path / "Bracket.step+").write_bytes(_container(_part()))

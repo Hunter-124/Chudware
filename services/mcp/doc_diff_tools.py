@@ -13,6 +13,11 @@ Refs churn (re-numbered selector strings after paste/undo) is suppressed when th
 resolved target ID is unchanged — callers must NOT treat a refs key rename as a
 semantic change.
 
+ECAD documents (``aicad.pcb/1``, ``aicad.sch/1``, ``aicad.ecad/1``) are detected by
+schema and delegated to :func:`services.plm.ecad_diff.ecad_diff`, which returns the
+id-keyed nets/components/footprints/tracks shape documented there instead of the
+feature-tree shape above.
+
 Consumers: T-H1 correction traces, T-F17 change cards, T-BL10 PDM-lite, GSL diff().
 
 Registration: register_doc_diff_tools(mcp) → adds tool ``doc_diff``.
@@ -25,6 +30,7 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from services.plm.canonical import canonical_dump, round_floats_doc
+from services.plm.ecad_diff import ecad_diff as _ecad_semantic_diff, is_ecad_schema
 
 
 # ---------------------------------------------------------------------------
@@ -112,10 +118,17 @@ def doc_diff(rev_a: dict, rev_b: dict) -> dict:
     The function applies round_floats_doc internally to tolerate minor float noise
     in inputs that haven't been through canonical_dump yet.
 
+    ECAD documents (schema head aicad.pcb/aicad.sch/aicad.ecad) are delegated to
+    services.plm.ecad_diff.ecad_diff, which returns an id-keyed nets/components/
+    footprints/tracks shape instead of the keys documented below.
+
     Returns a dict with keys:
         features_added, features_removed, features_changed,
         params_changed, sketch_deltas, mate_deltas, suppression_flips.
     """
+    if is_ecad_schema(rev_a) or is_ecad_schema(rev_b):
+        return _ecad_semantic_diff(rev_a, rev_b)
+
     # Canonicalize floats so float noise doesn't produce false positives
     a = round_floats_doc(rev_a)
     b = round_floats_doc(rev_b)
@@ -192,9 +205,9 @@ def register_doc_diff_tools(mcp: FastMCP) -> None:
     ) -> str:
         """Compute a semantic feature-level diff between two document JSON revisions.
 
-        Both ``rev_a`` and ``rev_b`` must be JSON strings containing a full
-        ``aicad.part/1`` or ``aicad.asm/1`` document.  Returns a JSON object
-        with the following keys:
+        Both ``rev_a`` and ``rev_b`` must be JSON strings containing a full document.
+        For a part/asm document (``aicad.part/1`` / ``aicad.asm/1``) returns a JSON
+        object with the following keys:
 
         - ``features_added`` / ``features_removed`` / ``features_changed``: lists
           of feature ids.
@@ -203,6 +216,11 @@ def register_doc_diff_tools(mcp: FastMCP) -> None:
           entities_changed, constraints_added, constraints_removed, constraints_changed}``.
         - ``mate_deltas``: list of ``{id, kind, old, new}`` for assembly mates.
         - ``suppression_flips``: list of ``{id, old, new}`` suppression state changes.
+
+        For an ECAD document (``aicad.pcb/1`` / ``aicad.sch/1`` / ``aicad.ecad/1``)
+        returns ``{nets,components,footprints,tracks}_{added,removed,changed}``
+        instead (services.plm.ecad_diff) — each entry carries ``id`` + ``summary``,
+        and changed entries also carry a ``changes`` list of ``{field, old, new}``.
 
         Float noise below µm (6 dp) is suppressed so rebuilt-but-unchanged
         geometry produces an empty diff.

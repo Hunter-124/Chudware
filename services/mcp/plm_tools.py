@@ -324,12 +324,18 @@ def register_plm_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     def plm_compare(path: str, commit_a: str, commit_b: str, item_id: str,
                     visual: bool = False, out_dir: str = "") -> str:
-        """Compare an item between two history points: a plain-language change
-        list plus the semantic detail, and — when ``visual`` is true — a
-        side-by-side visual of the two versions (match percentage + rendered
-        images; drawings also get a 2D overlay). The visual half degrades
-        gracefully on machines without the 3D engine.
-        Returns ``{ok, doc_diff, summary, eval_compare?}``."""
+        """Compare an item between two history points.
+
+        Generic (non-CAD) items — docs, code, links — route to a
+        content/text diff (``mode:"generic"``, plain-language summary, and a
+        unified/office text diff when the item is single-file). CAD items
+        (including ECAD boards/schematics) route to the semantic ``doc_diff``
+        comparison, and — when ``visual`` is true — a side-by-side visual of
+        the two versions (match percentage + rendered images; drawings also
+        get a 2D overlay). The visual half degrades gracefully on machines
+        without the 3D engine.
+        Returns ``{ok, mode, summary, text_diff?}`` for generic items or
+        ``{ok, doc_diff, summary, eval_compare?}`` for CAD items."""
         try:
             Vault, VaultError = _vault_module()
         except ImportError:
@@ -339,17 +345,20 @@ def register_plm_tools(mcp: FastMCP) -> None:
 
             v = Vault.open(path)
             try:
-                doc_a, doc_b = plm_compare_mod.docs_at(v, commit_a, commit_b, item_id)
+                if plm_compare_mod.is_generic_item(v, item_id):
+                    fields: dict[str, Any] = dict(plm_compare_mod.generic_compare(
+                        v, commit_a, commit_b, item_id))
+                else:
+                    doc_a, doc_b = plm_compare_mod.docs_at(v, commit_a, commit_b, item_id)
+                    sem = plm_compare_mod.semantic_compare(doc_a, doc_b)
+                    fields = {"doc_diff": sem["doc_diff"], "summary": sem["summary"]}
+                    if visual:
+                        import tempfile
+
+                        od = out_dir or tempfile.mkdtemp(prefix="chudware_plm_compare_")
+                        fields["eval_compare"] = plm_compare_mod.visual_compare(doc_a, doc_b, od)
             finally:
                 v.close()
-            sem = plm_compare_mod.semantic_compare(doc_a, doc_b)
-            fields: dict[str, Any] = {"doc_diff": sem["doc_diff"],
-                                      "summary": sem["summary"]}
-            if visual:
-                import tempfile
-
-                od = out_dir or tempfile.mkdtemp(prefix="chudware_plm_compare_")
-                fields["eval_compare"] = plm_compare_mod.visual_compare(doc_a, doc_b, od)
         except VaultError as e:
             return _err(e.reason, e.hint)
         return _ok(**fields)

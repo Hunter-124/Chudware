@@ -1,7 +1,9 @@
 #include "engine_events.h"
 
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <mutex>
 #include <map>
 #include <set>
@@ -61,6 +63,40 @@ std::chrono::steady_clock::time_point lastBootstrapTry{};
 // otherwise leave the GUI permanently deaf to doc events (frozen live previews).
 // A generation bump re-arms bootstrap so we re-subscribe + re-mirror open docs.
 uint64_t bootstrapGen = 0;
+
+// Reconnect-brake (crash-loop guard): ring of recent reconnect timestamps, pruned to the
+// trailing 60s window on every reconnect event. >=3 reconnects in that window means the
+// engine is crash-looping (almost always the SAME doc's cold-cache doc_activate crashing
+// hostd on every re-bootstrap) — engage the brake so openMirrorTab's auto-focus stops
+// re-issuing doc_activate on the newly-revealed tab (a manual tab click still activates
+// normally; switchToTab never consults this). Disengages after 120s with no further
+// reconnect (checked once per tick in engineEventsTick).
+constexpr int kCrashLoopReconnectThreshold = 3;
+constexpr std::chrono::seconds kCrashLoopWindow{60};
+constexpr std::chrono::seconds kCrashLoopStableReset{120};
+std::deque<std::chrono::steady_clock::time_point> reconnectTimestamps;
+bool crashLoopBraked = false;
+std::chrono::steady_clock::time_point lastReconnectAt{};
+
+// Record one reconnect event, prune the window, and (re-)evaluate the brake. Returns the
+// brake's state AFTER this event (true = hold automatic activation).
+bool noteReconnectAndCheckBrake() {
+    const auto now = std::chrono::steady_clock::now();
+    lastReconnectAt = now;
+    reconnectTimestamps.push_back(now);
+    while (!reconnectTimestamps.empty() &&
+           now - reconnectTimestamps.front() > kCrashLoopWindow)
+        reconnectTimestamps.pop_front();
+    if (!crashLoopBraked && (int)reconnectTimestamps.size() >= kCrashLoopReconnectThreshold) {
+        crashLoopBraked = true;
+        std::fprintf(stderr,
+            "[engine_events] crash-loop brake engaged: %d reconnects within %llds — "
+            "holding automatic doc_activate on newly revealed tabs (manual switch still works)\n",
+            (int)reconnectTimestamps.size(), (long long)kCrashLoopWindow.count());
+        std::fflush(stderr);
+    }
+    return crashLoopBraked;
+}
 
 // doc_ids with a doc.opened seen but not yet revealed as a tab (deferred while
 // the user is mid-edit, exactly like the poller's `pending`), and the latest
@@ -123,12 +159,19 @@ void openMirrorTab(AppState& st, const std::string& docId) {
     st.docTabs.push_back(std::move(t));
     const int idx = (int)st.docTabs.size() - 1;
     st.addLog("[daemon] mirror tab opened for " + docId);
-    if (takeFocus) {
+    if (takeFocus && !crashLoopBraked) {
         st.switchToTab(idx);  // activates: doc_activate (ro-allowed) -> tree + mesh
         st.toast(ui::ToastLevel::Info,
                  "Live view of the AI's part — it updates as it builds");
     } else {
         st.docTabs[idx].aiPulse = true;  // background reveal; switch-in activates
+        if (takeFocus) {
+            // Crash-loop brake: would have taken focus and auto-activated, but repeated
+            // engine reconnects mean this doc's activation keeps crashing hostd. Leave the
+            // tab open and unfocused — the status-bar unreachable chip stays up (see
+            // engineEventsTick) as the recovery affordance; a manual click still activates.
+            st.docTabs[idx].activationHeldByBrake = true;
+        }
     }
     pendingOpen.erase(docId);
 }
@@ -499,6 +542,23 @@ void engineEventsTick(AppState& st) {
     auto* c = engine::client();
     if (!c) return;
 
+    // Crash-loop brake stability reset: 120s with no further reconnect clears the brake and
+    // releases the sticky unreachable notice we were holding open for it (if still held).
+    if (crashLoopBraked &&
+        std::chrono::steady_clock::now() - lastReconnectAt >= kCrashLoopStableReset) {
+        crashLoopBraked = false;
+        reconnectTimestamps.clear();
+        std::fprintf(stderr,
+            "[engine_events] crash-loop brake disengaged after %llds of stability\n",
+            (long long)kCrashLoopStableReset.count());
+        std::fflush(stderr);
+        if (st.daemonUnreachable) {
+            st.daemonUnreachable = false;
+            st.toast(ui::ToastLevel::Success, "Engine daemon stable — reconnected");
+            st.addLog("[daemon] crash-loop brake cleared — daemon stable");
+        }
+    }
+
     // H2: proactive reconnect with backoff when the socket is dead (daemon crash,
     // hostd --stop, transient EOF). Without this the GUI only reconnects on the
     // next RPC and otherwise looks empty (no tabs, no status).
@@ -516,13 +576,24 @@ void engineEventsTick(AppState& st) {
         return;
     }
     if (st.daemonUnreachable) {
-        st.daemonUnreachable = false;
-        st.toast(ui::ToastLevel::Success, "Engine daemon reconnected");
-        st.addLog("[daemon] reconnected — re-bootstrapping doc list");
-        // Force bootstrap re-arm even if reconnectGeneration already advanced
-        // mid-call: the unreachable window may have missed the gen edge.
+        const bool braked = noteReconnectAndCheckBrake();
+        // Force bootstrap re-arm even if reconnectGeneration already advanced mid-call: the
+        // unreachable window may have missed the gen edge. Re-arm regardless of the brake —
+        // we still want a fresh doc list / subscriptions; the brake only holds back the
+        // auto-focus doc_activate inside openMirrorTab.
         bootstrapped = false;
         lastBootstrapTry = {};
+        if (!braked) {
+            st.daemonUnreachable = false;
+            st.toast(ui::ToastLevel::Success, "Engine daemon reconnected");
+            st.addLog("[daemon] reconnected — re-bootstrapping doc list");
+        } else {
+            // Keep the sticky "unreachable" notice up instead of a misleading "reconnected" —
+            // the socket is back, but repeated crashes mean the engine itself is still in
+            // trouble. Cleared once the brake disengages after 120s of stability (above).
+            st.addLog("[daemon] reconnected but crash-loop brake engaged (>=3 reconnects/60s) "
+                      "— holding unreachable notice, skipping auto-activation");
+        }
     }
 
     // A silent reconnect (new daemon clientId, subscriptions lost) re-arms the

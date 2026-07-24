@@ -822,6 +822,12 @@ struct AppState {
         // True after doc.history_cleared for this doc (human save wiped undo/redo). Greys the
         // undo/redo toolbar until a local edit re-enables history. Cleared on local mutation.
         bool        historyCleared = false;
+        // Reconnect-brake (crash-loop guard, engine_events.cpp): this mirror tab's automatic
+        // doc_activate-on-reveal was skipped because >=3 engine reconnects happened within 60s
+        // (the doc's activation is crashing hostd every re-bootstrap). The tab stays open but
+        // unfocused; cleared the moment any switchToTab targets it — a manual click still
+        // activates normally, brake or not.
+        bool        activationHeldByBrake = false;
 
         // Display label for the tab strip + viewport title. Prefers the on-disk file name (the
         // thing the user actually opened/saved) over the internal tree "name" — an opened .step+
@@ -983,7 +989,7 @@ struct AppState {
     // doc_activate on st.rpc and adopts the ops-response on drain (mirror + mesh + selection +
     // camera). doc_activate serves the engine's warm read-cache compile without recompiling;
     // a stale daemon predating it is translated to doc_rebuild inside engine::call.
-    void activateTabDocAsync(const std::string& docId, int tabIdx,
+    void activateTabDocAsync(const std::string& docId, int tabIdx, uint64_t generation,
                              std::chrono::steady_clock::time_point queuedAt);
     // Close docTabs[idx] (with the worker doc_close). If it was active, activates a neighbor; if it
     // was the last tab, returns to the empty start state. Does NOT prompt — the caller decides.
@@ -1290,6 +1296,18 @@ struct AppState {
     // progress (feature N/M / ops-in-flight); the old viewport "Rebuilding..." HUD is gone.
     // Bump at every st.rpc.call that mutates/evaluates the model; drop in its drain callback.
     int rebuildsInFlight = 0;
+    // Activation coalescing (doc_tabs.cpp switchToTabCore/activateTabDocAsync): a monotonically
+    // increasing generation bumped for every switch that needs an async doc_activate. While one
+    // such RPC is already in flight, a newer switch does NOT queue a second one — it overwrites
+    // the pending slot below; the in-flight completion dispatches the LATEST pending tab instead
+    // of every intermediate one it was superseded by. Net effect: N rapid switches while one
+    // activation is in flight produce at most 2 engine activations, never N. GL-thread-only
+    // (touched only from switchToTabCore / the rpc.drain() completion callback).
+    uint64_t activationGeneration = 0;
+    bool activationInFlight = false;      // a doc_activate is currently in flight
+    int pendingActivateTab = -1;          // -1 = no coalesced switch waiting; else docTabs index
+    std::string pendingActivateDocId;     // pendingActivateTab's doc id (staleness check on drain)
+    uint64_t pendingActivateGeneration = 0;
     // T-PERF3: mesh loader generation — bumped on every loadDocMeshAsync; drain drops
     // completions whose gen != meshGen_ (latest-wins; keep-last-good on screen meanwhile).
     std::atomic<uint64_t> meshGen_{0};

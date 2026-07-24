@@ -227,6 +227,7 @@ void AppState::switchToTabCore(int idx) {
     const auto switchStarted = std::chrono::steady_clock::now();
     const bool cacheInvalidated = docTabs[idx].meshCacheInvalidated;
     docTabs[idx].aiPulse = false;   // the user is now looking at it — stop the AI-activity glow
+    docTabs[idx].activationHeldByBrake = false;  // any switch (incl. manual) resolves the mark
     // Already-active no-op early-out (part/asm: also require the mirror to match; drawing/ECAD: by
     // index, since they don't drive the DocMirror — their id lives in a separate worker registry).
     if (idx == activeTab) {
@@ -401,7 +402,6 @@ void AppState::switchToTabCore(int idx) {
         const int rebuildTabIdx = idx;
         if (loadingToastInFlight.insert(rebuildDocId).second)   // dedup: one toast per rebuild
             toast(ui::ToastLevel::Info, "Loading " + dst.title + "…");
-        ++rebuildsInFlight;
         // Select the shell immediately but never show another document's stale geometry under it.
         // Park the leaving doc's active GPU buffers first so its own next bind stays O(1).
         if (renderer) renderer->parkActiveMeshes();
@@ -415,12 +415,33 @@ void AppState::switchToTabCore(int idx) {
         zoomToBBoxRequested = false;
         suppressTabDirty = false;
         unloadDocMesh();
+        // Activation coalescing: bump the generation for every switch that needs an async
+        // doc_activate. While one is already in flight, don't queue a second RPC — overwrite
+        // the pending slot so N rapid switches during that one in-flight call collapse to a
+        // single follow-up activation for the FINAL tab (at most 2 engine activations total,
+        // never N). The in-flight completion callback drains the pending slot (see
+        // activateTabDocAsync below).
+        const uint64_t gen = ++activationGeneration;
+        if (activationInFlight) {
+            pendingActivateTab = rebuildTabIdx;
+            pendingActivateDocId = rebuildDocId;
+            pendingActivateGeneration = gen;
+            const double shellMs = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - switchStarted).count();
+            logTabPerf(*this, "[perf] tab_switch doc=" + rebuildDocId +
+                       " path=async-rebuild-coalesced gen=" + std::to_string(gen) +
+                       " shell=" + std::to_string(shellMs) + "ms");
+            return;
+        }
+        activationInFlight = true;
+        ++rebuildsInFlight;
         const auto rebuildQueuedAt = std::chrono::steady_clock::now();
         const double shellMs = std::chrono::duration<double, std::milli>(
             rebuildQueuedAt - switchStarted).count();
         logTabPerf(*this, "[perf] tab_switch doc=" + rebuildDocId +
-                   " path=async-rebuild shell=" + std::to_string(shellMs) + "ms");
-        activateTabDocAsync(rebuildDocId, rebuildTabIdx, rebuildQueuedAt);
+                   " path=async-rebuild gen=" + std::to_string(gen) +
+                   " shell=" + std::to_string(shellMs) + "ms");
+        activateTabDocAsync(rebuildDocId, rebuildTabIdx, gen, rebuildQueuedAt);
         return;
     }
 
@@ -504,17 +525,41 @@ void AppState::switchToTabCore(int idx) {
                        std::to_string(meshBindMs) + "ms total=" + std::to_string(totalMs) + "ms");
 }
 
-void AppState::activateTabDocAsync(const std::string& docId, int tabIdx,
+void AppState::activateTabDocAsync(const std::string& docId, int tabIdx, uint64_t generation,
                                    std::chrono::steady_clock::time_point queuedAt) {
     // doc_activate serves the engine's warm read-cache compile (no recompile / re-tess when
     // the doc is unchanged); a stale hostd that predates the method is handled below this
     // layer — engine::call falls back to the forced doc_rebuild on "unknown method".
     rpc.call("doc_activate", nlohmann::json{{"doc_id", docId}},
-             [this, docId, tabIdx, queuedAt](const core::RpcResult& r) {
+             [this, docId, tabIdx, generation, queuedAt](const core::RpcResult& r) {
+                 activationInFlight = false;
                  --rebuildsInFlight;
+                 // Activation coalescing: this was the one in-flight doc_activate. If newer
+                 // switches queued behind it while it ran, dispatch the LATEST pending tab now
+                 // (never every intermediate one) — the "N rapid switches -> at most 2 engine
+                 // activations" guarantee. Runs unconditionally, before any early return below,
+                 // so a closed/errored tab never strands a coalesced switch.
+                 if (pendingActivateTab >= 0) {
+                     const int nextIdx = pendingActivateTab;
+                     const std::string nextDocId = pendingActivateDocId;
+                     const uint64_t nextGen = pendingActivateGeneration;
+                     pendingActivateTab = -1;
+                     pendingActivateDocId.clear();
+                     if (nextIdx < 0 || nextIdx >= (int)docTabs.size() ||
+                         docTabs[nextIdx].docId != nextDocId) {
+                         addLog("[tabs] coalesced async activation for " + nextDocId +
+                                " dropped — tab closed/changed");
+                     } else {
+                         activationInFlight = true;
+                         ++rebuildsInFlight;
+                         activateTabDocAsync(nextDocId, nextIdx, nextGen,
+                                              std::chrono::steady_clock::now());
+                     }
+                 }
                  const double rebuildMs = std::chrono::duration<double, std::milli>(
                      std::chrono::steady_clock::now() - queuedAt).count();
                  logTabPerf(*this, "[perf] tab_switch_rebuild doc=" + docId +
+                                  " gen=" + std::to_string(generation) +
                                   " total=" + std::to_string(rebuildMs) + "ms");
                  loadingToastInFlight.erase(docId);
                  if (tabIdx < 0 || tabIdx >= (int)docTabs.size() ||

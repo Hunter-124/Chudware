@@ -41,6 +41,9 @@ _RETRY = "max_iters"
 _NOCODE = "no_code"
 _FAILED = "failed"
 _PROVIDER_AUTH = "provider_auth"  # non-retryable auth/bad-request (mega-1 TOP-4)
+# Prompt outgrew the model's context window: structural and FIXABLE (trim +
+# retry), never a credential failure — must not land in the provider_auth bucket.
+_CONTEXT_OVERFLOW = "context_overflow"
 
 # Human-facing error_detail scrubbers (never leak keys/tokens to the GUI).
 _SECRET_RE = re.compile(
@@ -135,6 +138,11 @@ def error_detail_for_stop(
         return format_provider_error_detail(exc, provider)
     if stop_reason == "terminated_by_user":
         return format_error_detail("Run cancelled by user.")
+    if stop_reason == _CONTEXT_OVERFLOW:
+        return format_error_detail(
+            extra or "Conversation outgrew the model's context window "
+                     "(trimmed and retried once)."
+        )
     if stop_reason in ("provider_error", "provider_auth", "provider_unavailable"):
         # Prefer caller-supplied detail (already formatted); never "budget exhausted".
         if extra:
@@ -324,6 +332,32 @@ def _force_first_tool(
     return calls, tool_calls_made, True
 
 
+def _drop_oldest_tool_results(messages: list[dict], *, keep_recent: int = 6) -> int:
+    """Drop the oldest tool-result echoes in place → number of messages removed.
+
+    Context-overflow recovery. ``messages[0]`` (the original user request) and the
+    last *keep_recent* entries always survive; the system prompt is a separate
+    provider argument and is never touched. Only harness-generated tool result
+    echoes are eligible — model output and steering/enablement nudges stay put.
+    """
+    drop: list[int] = []
+    for i in range(1, max(1, len(messages) - keep_recent)):
+        m = messages[i]
+        if not isinstance(m, dict) or m.get("role") != "user":
+            continue
+        content = m.get("content")
+        text = ""
+        if isinstance(content, list) and content and isinstance(content[0], dict):
+            text = str(content[0].get("text") or "")
+        elif isinstance(content, str):
+            text = content
+        if text.startswith(("Result of ", "Tool result (")):
+            drop.append(i)
+    for i in reversed(drop):
+        del messages[i]
+    return len(drop)
+
+
 def classify_provider_error(exc: BaseException) -> tuple[str, bool]:
     """Classify a provider exception → ``(stop_reason, retryable)``.
 
@@ -334,6 +368,11 @@ def classify_provider_error(exc: BaseException) -> tuple[str, bool]:
     mega-16: spending-limit / SuperGrok tier-denied is ``provider_unavailable``
     (non-retryable) so callers mark the provider dead and auto_pick falls through
     rather than retry-looping xai on every hard node.
+
+    Context-window overflow is a 400 too, but it is a STRUCTURAL problem the
+    harness can fix: it classifies as ``context_overflow`` (retryable) so
+    run_turn trims tool results and retries instead of aborting the mission with
+    a bogus credential failure.
 
     Rate limits (429) and 5xx remain retryable (map to ``failed`` so the node can
     still escalate, but callers that inspect ``retryable`` may back off).
@@ -370,6 +409,19 @@ def classify_provider_error(exc: BaseException) -> tuple[str, bool]:
     )
     if any(m in text for m in spending_markers):
         return "provider_unavailable", False
+
+    # Context overflow BEFORE the 400→provider_auth bucket: a prompt that outgrew
+    # the window is fixable by trimming, not a credential problem, and must stay
+    # out of node_runner._ESCALATE_REASONS' hard-abort path.
+    overflow_markers = (
+        "context_length_exceeded",
+        "maximum context length",
+        "prompt is too long",
+        "too many tokens",
+        "request too large",
+    )
+    if any(m in text for m in overflow_markers):
+        return _CONTEXT_OVERFLOW, True
 
     auth_markers = (
         "incorrect api key",
@@ -930,6 +982,8 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
     _trig_seq = 0
     _trig_prev_text = ""
     _trig_prev_calls_idx = 0
+    # One trim-and-retry per turn on context overflow, then fail honestly.
+    _ctx_overflow_retried = False
     for _ in range(budget + 1):
         # Phase 4 (M11/M16/M17): the sub-agent turn boundary.  When this turn IS a
         # sub-agent session (subagent_id set), drain the cross-process steering queue
@@ -1052,7 +1106,33 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                 )
             )
             recovered = False
-            if localish and not getattr(provider, "_mega6_degraded", False):
+            # Context overflow is structural, not fatal: drop the oldest tool
+            # results (system prompt is a separate arg; original request and the
+            # most recent exchanges are preserved) and retry ONCE. One trim, one
+            # retry, then fail honestly.
+            if stop == _CONTEXT_OVERFLOW and not _ctx_overflow_retried:
+                _ctx_overflow_retried = True
+                dropped = _drop_oldest_tool_results(messages)
+                if dropped:
+                    _log(ledger, actor, {
+                        "event": "context_overflow_trim",
+                        "dropped_messages": dropped,
+                        "remaining_messages": len(messages),
+                        "error": str(exc)[:200],
+                    })
+                    try:
+                        reply = provider.complete(
+                            system, messages, max_tokens=completion_cap)
+                        recovered = True
+                    except Exception as trim_exc:  # noqa: BLE001
+                        exc = trim_exc
+                        stop, retryable = classify_provider_error(exc)
+                        _log_mod.error(
+                            "context-overflow retry failed stop_reason=%s: %s\n%s",
+                            stop, exc, traceback.format_exc(),
+                        )
+            if (not recovered and localish
+                    and not getattr(provider, "_mega6_degraded", False)):
                 try:
                     from services.agent import config as agent_config  # noqa: PLC0415
                     import os as _os  # noqa: PLC0415
@@ -2675,8 +2755,6 @@ def _dispatch_tool(
     if args:
         merged.update(args)  # call args win
 
-    import time as _time
-    t0 = _time.monotonic()
     timeout_s = opts.get("timeout_s")
     if timeout_s is None:
         try:
@@ -2684,6 +2762,10 @@ def _dispatch_tool(
             timeout_s = tool_timeout_s_default() or None
         except Exception:  # noqa: BLE001
             timeout_s = None
+    try:
+        timeout_f = float(timeout_s) if timeout_s is not None else 0.0
+    except (TypeError, ValueError):
+        timeout_f = 0.0
 
     def _call() -> Any:
         if _inner is not None:
@@ -2697,8 +2779,47 @@ def _dispatch_tool(
             raise KeyError(f"tool {tool!r} could not be resolved")
         return fn(**(merged or {}))
 
+    def _call_with_timeout() -> Any:
+        """Run ``_call`` on a worker thread and give up after *timeout_f*.
+
+        A hung tool must not wedge the whole turn (agent.tool_options timeout_s,
+        Settings → AI → Tools). Python cannot force-kill the worker, so an expiry
+        becomes a FAILURE RESULT fed back to the model as data (same shape as the
+        dispatch-error path below) while the abandoned call keeps running — the
+        message says exactly that instead of pretending it was cancelled.
+        The orphan is still a normal executor thread, so a clean interpreter exit
+        joins it (SIGTERM/SIGKILL does not) — the turn itself never waits.
+        """
+        from concurrent.futures import (  # noqa: PLC0415
+            ThreadPoolExecutor,
+            TimeoutError as _FutureTimeout,
+        )
+        ex = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"tool-{tool}")
+        try:
+            fut = ex.submit(_call)
+            try:
+                return fut.result(timeout=timeout_f)
+            except _FutureTimeout:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"tool '{tool}' exceeded its configured "
+                        f"timeout_s={timeout_f:g} and was abandoned. The call is "
+                        f"STILL RUNNING in the background (a tool thread cannot be "
+                        f"killed) and may still complete or mutate state — do not "
+                        f"assume it failed. Continue with a cheaper/narrower call, "
+                        f"or ask the user to raise the timeout in "
+                        f"Settings → AI → Tools."
+                    ),
+                    "timed_out": True,
+                    "timeout_s": timeout_f,
+                }
+        finally:
+            # Never wait — handing control back to the turn is the whole point.
+            ex.shutdown(wait=False)
+
     try:
-        result = _call()
+        result = _call_with_timeout() if timeout_f > 0 else _call()
     except Exception as exc:  # noqa: BLE001
         hint = None
         try:
@@ -2709,18 +2830,6 @@ def _dispatch_tool(
         if hint:
             raise type(exc)(f"{exc} Hint: {hint}") from exc
         raise
-
-    # Soft timeout: measure only (sync path — no new threads).
-    if timeout_s is not None:
-        elapsed = _time.monotonic() - t0
-        if elapsed > float(timeout_s):
-            tag = f"(exceeded configured timeout_s={timeout_s})"
-            if isinstance(result, str):
-                return f"{result} {tag}"
-            if isinstance(result, dict):
-                out = dict(result)
-                out["_timeout_note"] = tag
-                return out
     return result
 
 

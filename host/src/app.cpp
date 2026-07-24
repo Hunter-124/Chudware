@@ -3790,16 +3790,24 @@ int run_gui(const char *screenshotPath, const char *openPath) {
           std::string orchKind = e.kind.substr(5); // strip "orch_"
           try {
             nlohmann::json data = nlohmann::json::parse(e.text);
-            if (st.activityPanel) {
-              auto *ap = st.activityPanel;
-              ap->onEvent(orchKind, data);
-            }
-            // Phase 2 (M9/M10): feed the live Agent Workflow DAG store.
-            // Ungated — it must capture agent.* span events even when no chat
-            // bubble is active (a subagent branch can outlive the trunk
-            // turn). GL-thread only; the store is a plain static in
+            // The panel keeps a SINGLE global live tree and clears it on
+            // run_started, so feeding it from every conversation's run makes
+            // two concurrent chats shred each other's tree. Feed it from the
+            // VIEWED conversation only, and only while the window is actually
+            // open — it is reachable solely via View > Activity and the
+            // CHUDWARE_SHOT=activity scenario, so closed costs nothing.
+            if (st.activityPanel && st.showActivityPanel &&
+                runConvId == st.activeConvId())
+              st.activityPanel->onEvent(orchKind, data);
+            // Phase 2 (M9/M10): feed the owning conversation's Agent Workflow
+            // DAG store. Keyed by runConvId, so every chat builds its OWN
+            // execution trace and two concurrent runs never blank or hijack
+            // each other's; the Agent Hub renders the viewed conversation's.
+            // Otherwise ungated — it must capture agent.* span events even
+            // when no chat bubble is active (a subagent branch can outlive the
+            // trunk turn). GL-thread only; the stores are plain statics in
             // ai_workspace.cpp.
-            ui::feedAgentDagEvent(orchKind, data);
+            ui::feedAgentDagEvent(runConvId, orchKind, data);
             ui::activeWorkFeedEvent(orchKind, data);
             // Fold the event into the running turn's inline activity timeline
             // so the conversation transparently shows what the AI is
@@ -4011,6 +4019,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         job.runId.clear();
         job.error.clear();
         job.errorDetail.clear();
+        job.errorHuman.clear();
         st.addLog("[..] run result discarded (stopped by user)");
       } else {
         // --- C22b: if this was a v2 run, resync the DocMirror tree + reload
@@ -4246,6 +4255,9 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         }
         // --- end C22b ---
         std::string assistant;
+        // The actionable one-liner (core/agent error_human) and the WHOLE raw failure text.
+        // Both ride onto the assistant ChatMsg: headline + expandable "Error details" body.
+        std::string assistantErrHuman, assistantErrFull;
         int assistantErr = ERR_NONE;
         if (!job.error.empty() && job.errorIsCad) {
           // The CAD script didn't build. That's normal territory for an AI
@@ -4260,6 +4272,9 @@ int run_gui(const char *screenshotPath, const char *openPath) {
             st.buildErrSummary = cause;
             st.buildErrFull = job.error;
           } else {
+            // errSummary() clips the trace; keep the whole thing on the card so
+            // "Error details" reaches it without hunting through the timeline.
+            assistantErrFull = job.error;
             assistant =
                 "I couldn't get this design to build cleanly - the CAD code "
                 "kept "
@@ -4278,7 +4293,19 @@ int run_gui(const char *screenshotPath, const char *openPath) {
           if (!job.stopReason.empty() &&
               full.find(job.stopReason) == std::string::npos)
             full = job.stopReason + " — " + full;
-          std::string e = full.substr(0, 400);
+          // The 400-char cut feeds the log line, the toast and the collapsed
+          // card prose ONLY. `full` is kept whole on the message (same deal as
+          // st.buildErrFull for CAD build errors) so the card's "Error details"
+          // box can show every byte instead of losing the tail forever.
+          size_t cut = full.size() > 400 ? 400 : full.size();
+          while (cut > 0 && cut < full.size() &&
+                 ((unsigned char)full[cut] & 0xC0) == 0x80)
+            --cut; // never split a UTF-8 sequence
+          std::string e = full.substr(0, cut);
+          if (cut < full.size())
+            e += "\xe2\x80\xa6";
+          assistantErrFull = full;
+          assistantErrHuman = job.errorHuman;
           st.addLog("[err] " + e);
           st.toast(ui::ToastLevel::Error,
                    "System error: " + errSummary(full)); // W1-B
@@ -4304,7 +4331,9 @@ int run_gui(const char *screenshotPath, const char *openPath) {
             // Point at Settings only for credential-shaped failures; other
             // errors (connection refused, model missing) carry their own
             // guidance.
-            std::string low = e;
+            // Match against the WHOLE text, not the collapsed excerpt — the
+            // provider's status code often sits past the 400-char cut.
+            std::string low = full;
             for (auto &c : low)
               c = (char)std::tolower((unsigned char)c);
             static const char *kAuthMarks[] = {
@@ -4315,6 +4344,27 @@ int run_gui(const char *screenshotPath, const char *openPath) {
               if (low.find(mark) != std::string::npos) {
                 assistant += "\n(This looks like an authentication problem - "
                              "set your provider/API key in Settings.)";
+                break;
+              }
+            }
+            static const char *kRateMarks[] = {"429", "rate limit", "rate_limit",
+                                               "too many requests"};
+            for (const char *mark : kRateMarks) {
+              if (low.find(mark) != std::string::npos) {
+                assistant += "\n(The provider is rate-limiting you - wait a "
+                             "moment and resend, or switch to a different model "
+                             "in Settings.)";
+                break;
+              }
+            }
+            static const char *kContextMarks[] = {
+                "context_length_exceeded", "maximum context length",
+                "prompt is too long", "too many tokens"};
+            for (const char *mark : kContextMarks) {
+              if (low.find(mark) != std::string::npos) {
+                assistant += "\n(This turn outgrew the model's context window - "
+                             "start a new session or trim the attached files / "
+                             "history, then try again.)";
                 break;
               }
             }
@@ -4453,6 +4503,8 @@ int run_gui(const char *screenshotPath, const char *openPath) {
             if (!job.stopReason.empty() && !job.errorDetail.empty() &&
                 job.stopReason != job.errorDetail)
               why = job.stopReason + " — " + job.errorDetail;
+            assistantErrHuman = job.errorHuman;
+            assistantErrFull = why;
             assistant = "I stopped before fully finishing (" + why +
                         "). Whatever was built "
                         "so far is in the FeatureManager tree - check the "
@@ -4473,6 +4525,13 @@ int run_gui(const char *screenshotPath, const char *openPath) {
             active->running = false;
             active->liveStatus.clear();
             active->errKind = assistantErr;
+            // Headline + untruncated raw text for the error card. The streamed
+            // run_finished event may already have set errorHuman — don't wipe
+            // it with an empty final-result value.
+            if (!assistantErrHuman.empty())
+              active->errorHuman = assistantErrHuman;
+            if (!assistantErrFull.empty())
+              active->errorFull = assistantErrFull;
             active->resultPartial =
                 job.missionPartial && (assistantErr == ERR_PARTIAL);
             // User-facing plan gate only (manual Plan / needs_user_decision).

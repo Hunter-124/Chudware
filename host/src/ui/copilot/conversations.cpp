@@ -451,6 +451,13 @@ void persistChatHistory(AppState& st) {
             if (m.ts > 0.0) entry["ts"] = m.ts;   // send/receive time for the in-bubble age label
             if (!m.fromUser && !m.model.empty()) entry["m"] = m.model;
             if (m.copilotMode >= 0) entry["cm"] = m.copilotMode;
+            // Error card fields — the humanized headline and the raw failure text (capped like
+            // an activity detail). Without these a reloaded error turn loses its guidance.
+            if (!m.errorHuman.empty()) entry["eh"] = m.errorHuman;
+            if (!m.errorFull.empty())
+                entry["ef"] = m.errorFull.size() > 8000u
+                                  ? m.errorFull.substr(0, 7999) + "\xe2\x80\xa6"
+                                  : m.errorFull;
             if (m.planState.present) entry["plan_state"] = planStateToJson(m.planState);
             // Persist activity timeline (capped) so thoughts/tools survive reload.
             if (!m.fromUser && !m.activity.empty()) {
@@ -527,13 +534,11 @@ void persistChatHistory(AppState& st) {
                                  {"msgs", jm}};
         convObj["scope"] = st.conversations[i].scopeClass;  // rail color-code (-1 = unassessed)
         if (st.conversations[i].archived) convObj["archived"] = true;
-        if (i == st.activeConv) {
-            // The live agent-execution DAG belongs to the active session's run — save it as a
-            // session artifact so the workflow trace survives a reopen.
-            nlohmann::json dag = ui::agentDagToJson();
-            if (dag.is_object() && dag.contains("nodes") && !dag["nodes"].empty())
-                convObj["agent_dag"] = std::move(dag);
-        }
+        // Every session owns its agent-execution DAG (the live store is conversation-keyed) —
+        // save each one as a session artifact so the workflow trace survives a reopen.
+        nlohmann::json dag = ui::agentDagToJson(st.conversations[i].id);
+        if (dag.is_object() && dag.contains("nodes") && !dag["nodes"].empty())
+            convObj["agent_dag"] = std::move(dag);
         const int lct = (i == st.activeConv) ? st.lastContextTokens
                                              : st.conversations[i].lastContextTokens;
         if (lct > 0) convObj["last_context_tokens"] = lct;
@@ -730,6 +735,9 @@ static void applyChatEntry(AppState& st, const std::string& key, const nlohmann:
         c.docKey = key;
         c.scopeClass = jc.value("scope", -1);  // legacy sessions omit the key
         c.archived = jc.value("archived", false);
+        // This session's own saved execution trace, straight into its conversation-keyed store
+        // (no active/parked special case — switching sessions just reads the other tree).
+        if (jc.contains("agent_dag")) ui::agentDagFromJson(c.id, jc["agent_dag"]);
         for (const auto& m : jc.value("msgs", nlohmann::json::array())) {
             ChatMsg cm;
             cm.fromUser = m.value("u", false);
@@ -737,6 +745,8 @@ static void applyChatEntry(AppState& st, const std::string& key, const nlohmann:
             cm.errKind = m.value("e", 0);
             if (!cm.fromUser) cm.model = m.value("m", std::string());
             cm.copilotMode = m.value("cm", -1);  // -1 when absent (legacy sessions)
+            cm.errorHuman = m.value("eh", std::string());
+            cm.errorFull = m.value("ef", std::string());
             cm.ts = m.value("ts", 0.0);          // 0 = legacy (constructed with now) — no age label
             // Restore plan/task-list state when present (legacy sessions omit the key).
             if (m.contains("plan_state") && m["plan_state"].is_object()) {
@@ -817,13 +827,6 @@ static void applyChatEntry(AppState& st, const std::string& key, const nlohmann:
     const int groupSize = (int)st.conversations.size() - base;
     if (act < 0 || act >= groupSize) act = 0;
     st.activeConv = base + act;
-    {
-        // Restore the active session's saved agent-execution DAG into the live store.
-        const auto& convsJson = e.value("conversations", nlohmann::json::array());
-        if (act < (int)convsJson.size() && convsJson[act].is_object() &&
-            convsJson[act].contains("agent_dag"))
-            ui::agentDagFromJson(convsJson[act]["agent_dag"]);
-    }
     st.chat = std::move(st.conversations[st.activeConv].msgs);
     st.lastContextTokens = st.conversations[st.activeConv].lastContextTokens;
     st.queuedPrompts = std::move(st.conversations[st.activeConv].queuedPrompts);
@@ -1150,6 +1153,10 @@ void switchConversation(AppState& st, int idx) {
                                                    // conversation's docKey, even if a future
                                                    // caller passes a cross-doc-key index
     restoreActiveConversation(st);  // restores chat + draft for target
+    // The incoming log is a different document: without this the outgoing conversation's
+    // scrolled-up state (and its stale scroll offset) carries over and new streaming replies
+    // silently never scroll into view.
+    chatLogResetStick();
     st.showSessionsPicker = false;
     // Force disk so both sessions' msgs + drafts survive kill mid-switch.
     persistChatHistory(st);

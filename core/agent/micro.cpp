@@ -1103,14 +1103,20 @@ json run_micro_design(const std::string& request, const std::string& doc_id,
                 if (resp.contains("rebuild") && resp["rebuild"].contains("feature_status"))
                     fs = resp["rebuild"]["feature_status"];
                 ok = true;
+                std::string errText;
                 for (const auto& s : fs)
                     if (!(s.is_object() && s.contains("ok") && s["ok"].is_boolean() &&
                           s["ok"].get<bool>())) {
                         ok = false;
-                        break;
+                        if (s.is_object() && s.contains("error") && !s["error"].is_null()) {
+                            if (!errText.empty()) errText += "\n";
+                            errText += s["error"].is_string()
+                                           ? s["error"].get<std::string>()
+                                           : s["error"].dump();
+                        }
                     }
                 emit_agent_tool_call(events, /*tool_name=*/"", /*target=*/"", ops, ok, lat,
-                                     /*parent_id=*/"", /*actor=*/"executor");
+                                     /*parent_id=*/"", /*actor=*/"executor", errText);
                 std::string aicm_path;
                 if (resp.contains("tess") && resp["tess"].is_object())
                     aicm_path = resp["tess"].value("aicm_path", std::string());

@@ -118,6 +118,58 @@ std::string stripMdMarks(const std::string& in) {
     return out;
 }
 
+// C45b: stripMdMarks eats backticks one at a time, so a ``` fenced block collapsed into
+// proportional body copy with its language tag stranded as a stray word. Split the raw text on
+// fence LINES and render the code spans through drawCodeBox, prose spans as before. Fence-only:
+// this is deliberately not a markdown parser, and inline `code` still goes through stripMdMarks.
+// An unterminated fence (the common case mid-stream) renders as code to the end of the text.
+// Returns the last prose segment's InputText id so the caller keeps its selection-aware copy
+// menu; 0 when the text is entirely code.
+ImGuiID drawMdProse(const char* id, const std::string& in, const ImVec4& col, ImFont* mono) {
+    if (in.find("```") == std::string::npos)
+        return chatDrawSelectableText(id, stripMdMarks(in), col);
+
+    ImGuiID     lastTextId = 0;
+    int         seg = 0;
+    bool        inFence = false;
+    std::string buf;
+    // Emits the segment that just ENDED — hence flush() before the inFence flip below.
+    auto flush = [&]() {
+        size_t b = 0;
+        while (b < buf.size() && buf[b] == '\n') ++b;   // no stray blank line where a fence sat
+        if (b) buf.erase(0, b);
+        while (!buf.empty() && buf.back() == '\n') buf.pop_back();
+        if (!buf.empty()) {
+            const std::string sid = std::string(id) + "_" + std::to_string(seg++);
+            if (inFence)
+                drawCodeBox(sid.c_str(), buf, mono, ui::metrics::copilotProseMaxH());
+            else
+                lastTextId = chatDrawSelectableText(sid.c_str(), stripMdMarks(buf), col);
+        }
+        buf.clear();
+    };
+    for (size_t i = 0; i <= in.size();) {
+        size_t e = in.find('\n', i);
+        const bool last = (e == std::string::npos);
+        if (last) e = in.size();
+        const std::string line = in.substr(i, e - i);
+        std::string probe = line;
+        while (!probe.empty() && (probe.back() == ' ' || probe.back() == '\t' || probe.back() == '\r'))
+            probe.pop_back();
+        if (probe.rfind("```", 0) == 0) {
+            flush();
+            inFence = !inFence;   // the fence line itself (incl. its ```lang tag) is never content
+        } else {
+            buf += line;
+            buf += '\n';
+        }
+        if (last) break;
+        i = e + 1;
+    }
+    flush();
+    return lastTextId;
+}
+
 
 // ============================ typed-block agent timeline ============================
 // The orchestrator event stream (feedTurnActivity -> ChatMsg::activity) is rendered as the
@@ -127,18 +179,18 @@ std::string stripMdMarks(const std::string& in) {
 
 // Atlas icon for a stage key (string-keyed: a missing name just falls back to no glyph).
 static const char* stageIconName(const std::string& stage, bool missionHeader) {
-    if (missionHeader) return "list";
+    if (missionHeader) return "plan_board";
     std::string s = stage;
     size_t colon = s.find(':');           // strip the "<taskIdx>:" mission namespace prefix
     if (colon != std::string::npos) s = s.substr(colon + 1);
-    if (s == "intake") return "search";
-    if (s == "plan")   return "list";
-    if (s == "model")  return "cpu";
-    if (s == "edit")   return "edit";
-    if (s == "review") return "eye";
-    if (s == "fix")    return "wrench";
-    if (s == "memory") return "bookmark";
-    return "cpu";
+    if (s == "intake") return "ask";
+    if (s == "plan")   return "plan_board";
+    if (s == "model")  return "part";
+    if (s == "edit")   return "prompt_edit";
+    if (s == "review") return "health_check";
+    if (s == "fix")    return "fix";
+    if (s == "memory") return "history";
+    return "activity";
 }
 
 // Classify a row: reasoning-only stages (no CAD ops, with captured detail) render as a thinking
@@ -665,8 +717,9 @@ void chatArtifactActions(AppState& st, const std::string& path) {
 }
 
 // M14 — one inline row per tool call ("Doing"): ok/fail glyph + tool icon + tool name + latency,
-// with the human-readable target as a dim wrapped line. Args preview + image artifacts expand
-// on click. Artifact image paths are packed into detail after "\n\x1eART\x1e\n" by feedTurnActivity.
+// with the human-readable target as a dim wrapped line. Args preview + failure text + image
+// artifacts expand on click. feedTurnActivity packs the capped error_preview after
+// "\n\x1eERR\x1e\n" and artifact image paths after "\n\x1eART\x1e\n".
 void drawToolCallRow(AppState& st, ActivityItem& a, const ui::Fonts& fonts) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
@@ -708,7 +761,20 @@ void drawToolCallRow(AppState& st, ActivityItem& a, const ui::Fonts& fonts) {
             argsBody.clear();
         }
     }
-    const bool hasDrawer = !argsBody.empty() || !artsBlob.empty();
+    std::string errBody;
+    {
+        const char* kErrMark = "\n\x1e" "ERR\x1e\n";
+        const char* kErrMarkBare = "\x1e" "ERR\x1e\n";
+        size_t mark = argsBody.find(kErrMark);
+        if (mark != std::string::npos) {
+            errBody = argsBody.substr(mark + std::strlen(kErrMark));
+            argsBody = argsBody.substr(0, mark);
+        } else if (argsBody.rfind(kErrMarkBare, 0) == 0) {
+            errBody = argsBody.substr(std::strlen(kErrMarkBare));
+            argsBody.clear();
+        }
+    }
+    const bool hasDrawer = !argsBody.empty() || !errBody.empty() || !artsBlob.empty();
     if (hasDrawer) {
         if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
         if (ImGui::IsItemClicked()) a.expanded = !a.expanded;
@@ -735,6 +801,20 @@ void drawToolCallRow(AppState& st, ActivityItem& a, const ui::Fonts& fonts) {
     }
     if (!a.reason.empty()) dimText(a.reason.c_str());   // the human target — "what it acts on"
     if (a.expanded && hasDrawer) {
+        // Why it failed, first: red summary line + the full text in a red-outlined code box.
+        if (fail && !errBody.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, semanticOnGlass(pal.statusErr, surf));
+            ImGui::TextWrapped("%s", errSummary(errBody).c_str());
+            ImGui::PopStyleColor();
+            const ImVec2 errMin = ImGui::GetCursorScreenPos();
+            const float errW = ImGui::GetContentRegionAvail().x;
+            drawCodeBox("##toolerr", errBody, fonts.mono, ui::metrics::px(200.0f));
+            const ImVec2 errMax(errMin.x + errW,
+                                ImGui::GetCursorScreenPos().y - ImGui::GetStyle().ItemSpacing.y);
+            ImGui::GetWindowDrawList()->AddRect(errMin, errMax,
+                                                ui::Palette::toU32(pal.statusErr),
+                                                4.0f * sc, 0, ui::metrics::stroke(1.0f));
+        }
         if (!argsBody.empty())
             drawProseBox("##tooldetail", stripMdMarks(argsBody), ui::metrics::copilotProseMaxH());
         // Inline image artifacts (lazy GL upload; same path as drawAgentStep contact sheets).

@@ -305,11 +305,15 @@ void handleEvent(AppState& st, const json& evt) {
             const std::string sr = d.value("stop_reason", std::string());
             std::string ed = d.value("error_detail", std::string());
             if (ed.empty()) ed = d.value("error", std::string());
-            if (ed.empty()) ed = d.value("error_human", std::string());
-            if (!sr.empty() || !ed.empty()) {
+            // error_human is the actionable one-liner, NOT a stand-in for the raw detail —
+            // keep both so the card can headline the guidance and still show the body.
+            const std::string eh = d.value("error_human", std::string());
+            if (ed.empty()) ed = eh;
+            if (!sr.empty() || !ed.empty() || !eh.empty()) {
                 std::lock_guard<std::mutex> jlk(job->mtx);
                 if (!sr.empty() && job->stopReason.empty()) job->stopReason = sr;
                 if (!ed.empty() && job->errorDetail.empty()) job->errorDetail = ed;
+                if (!eh.empty() && job->errorHuman.empty()) job->errorHuman = eh;
             }
         } else if (origKind == "provider_call") {
             const std::string prov = d.value("provider", std::string());

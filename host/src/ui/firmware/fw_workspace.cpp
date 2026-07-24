@@ -1445,7 +1445,7 @@ static void drawCopilotPane(AppState& st, float w) {
                             "same conversation as the docked panel.");
     } else {
         ui::chatDrawLog(st);
-        ui::chatLogStickToBottom();
+        ui::chatLogStickToBottom("firmware.workspace");
     }
     ImGui::EndChild();
 

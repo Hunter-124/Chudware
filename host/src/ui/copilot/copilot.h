@@ -138,7 +138,10 @@ bool chatTurnActive(AppState& st);                            // an assistant tu
 void chatDrawLog(AppState& st);                               // the active conversation's turns
 // Stick-to-bottom autoscroll for the chat scroll region — call right after chatDrawLog inside
 // the scrolling child. Pins the view to the tail while streaming unless the user scrolled up.
-void chatLogStickToBottom();
+// regionId scopes the stick state to ONE surface: several chat surfaces can render the same
+// conversation in the same frame, and they must not share (and fight over) one flag.
+void chatLogStickToBottom(const char* regionId);
+void chatLogResetStick();  // re-engage autoscroll everywhere (conversation switch)
 void chatDrawComposer(AppState& st, bool busy, bool canRun);  // prelude + input + toolbar (real send path)
 void chatDrawSessionsList(AppState& st, bool busy);           // session rows + "+ New session"
 

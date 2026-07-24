@@ -1452,13 +1452,15 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             }
         }
         // Capture additive early-stop fields (ErrorDetail / contracts): stop_reason +
-        // error_detail. Prefer error_detail over legacy `error`. Stashed as a meta activity
-        // row so the error card can render "stopped: <reason> — <detail>" without touching
-        // ChatMsg (app_state.h is integrator-owned).
+        // error_detail + error_human. Reason/detail are stashed as a meta activity row so the
+        // error card can render "stopped: <reason> — <detail>"; error_human is the short
+        // actionable sentence and lands on the message itself as the card's headline.
         {
             std::string sr = jstr(data, "stop_reason");
             std::string ed = jstr(data, "error_detail");
             if (ed.empty()) ed = jstr(data, "error");  // soft alias
+            const std::string eh = jstr(data, "error_human");
+            if (!eh.empty()) m.errorHuman = eh;
             if (!sr.empty() || !ed.empty()) {
                 ActivityItem* meta = nullptr;
                 for (auto& a : m.activity)
@@ -1496,6 +1498,8 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             std::string sr = jstr(data, "stop_reason");
             std::string ed = jstr(data, "error_detail");
             if (ed.empty()) ed = jstr(data, "error");
+            const std::string eh = jstr(data, "error_human");
+            if (!eh.empty()) m.errorHuman = eh;
             if (!sr.empty() || !ed.empty()) {
                 ActivityItem* meta = nullptr;
                 for (auto& a : m.activity)
@@ -1714,6 +1718,17 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         ni.durationMs = jint(data, "latency_ms");
         const bool ok = !data.is_object() || data.value("ok", true);
         ni.status     = ok ? "done" : "fail";
+        // Optional error_preview (capped failure text) — packed after the args body with the
+        // same delimiter convention as artifacts below so drawToolCallRow can split it back
+        // out without a new ActivityItem field (app_state.h is integrator-owned).
+        if (!ok) {
+            const std::string errText = jstr(data, "error_preview");
+            if (!errText.empty()) {
+                if (!ni.detail.empty()) ni.detail += "\n\x1e" "ERR\x1e\n";
+                else ni.detail = "\x1e" "ERR\x1e\n";
+                ni.detail += errText;
+            }
+        }
         // Optional artifacts:[{path,kind}] — pack image paths into detail after a delimiter so
         // drawToolCallRow can expand them without new ActivityItem fields (app_state.h is
         // integrator-owned). Delimiter is unlikely in args JSON: "\n\x1eART\x1e\n".

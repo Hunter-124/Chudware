@@ -1194,7 +1194,7 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
             drawSessionsPanel(st, busy);
         } else {
             drawChatLogWindowed(st);   // M19: render-windowed endless scroll-back
-            chatLogStickToBottom();
+            chatLogStickToBottom("copilot.panel");
         }
         const bool  logScrolled = !overlayOpen && ImGui::GetScrollY() > 0.5f;
         const ImVec2 logP0 = ImGui::GetWindowPos();

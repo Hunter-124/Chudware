@@ -1575,8 +1575,14 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         if (resp.contains("rebuild") && resp["rebuild"].contains("feature_status"))
             fs = resp["rebuild"]["feature_status"];
         std::vector<std::string> errs = status_errors(fs);
+        std::string errText;
+        for (const auto& e : errs) {
+            if (!errText.empty()) errText += "\n";
+            errText += e;
+        }
         emit_agent_tool_call(events, /*tool_name=*/"", /*target=*/"", ops,
-                             /*ok=*/errs.empty(), lat, /*parent_id=*/"", /*actor=*/"modeler");
+                             /*ok=*/errs.empty(), lat, /*parent_id=*/"", /*actor=*/"modeler",
+                             errText);
         std::string aicm_path;
         if (resp.contains("tess") && resp["tess"].is_object())
             aicm_path = resp["tess"].value("aicm_path", std::string());

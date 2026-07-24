@@ -147,6 +147,41 @@ def _linkage(node_id: str, *, span_id: str, parent_id: str | None, actor: str | 
     return d
 
 
+def _error_text(result: Any) -> str:
+    """Human-readable failure text from a tool result.
+
+    ``agent_turn`` builds ``{"ok": False, "error": ...}`` for raised dispatch
+    errors; tools themselves may return the same shape, a JSON-encoded string,
+    or plain text. Returns "" when nothing legible.
+    """
+    if result is None:
+        return ""
+    if isinstance(result, BaseException):
+        return f"{type(result).__name__}: {result}"
+    payload = result
+    if isinstance(payload, str):
+        s = payload.strip()
+        if not s:
+            return ""
+        try:
+            payload = json.loads(s)
+        except Exception:  # noqa: BLE001
+            return s
+    if isinstance(payload, dict):
+        for key in ("error", "message", "detail"):
+            v = payload.get(key)
+            if v:
+                return v if isinstance(v, str) else json.dumps(v, default=str,
+                                                               ensure_ascii=False)
+        errs = payload.get("errors")
+        if isinstance(errs, list) and errs:
+            return "\n".join(str(e) for e in errs)
+    try:
+        return json.dumps(payload, default=str, ensure_ascii=False)
+    except Exception:  # noqa: BLE001
+        return str(payload)
+
+
 def tool_call_event(
     node_id: str, tool_name: str, args: dict | None, result: Any, *,
     ok: bool, latency_ms: float, span_id: str | None = None,
@@ -173,6 +208,13 @@ def tool_call_event(
             preview = str(args)
     if preview:
         payload["args_preview"] = _cap(preview, 2048)
+    # Additive (2026-07-24): capped failure text so the GUI can show WHY a tool
+    # call failed instead of only a red border. Omitted on success — successful
+    # events stay lean.
+    if not ok:
+        err = _error_text(result)
+        if err:
+            payload["error_preview"] = _cap(err, 2048)
     # Additive (2026-07-17): filesystem paths of render/export deliverables so the
     # GUI can expand a tool-call row inline. Cap 8; omit when none.
     arts = artifacts

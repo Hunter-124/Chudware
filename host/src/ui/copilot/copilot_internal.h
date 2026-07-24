@@ -146,6 +146,9 @@ int         effectiveContextWindow(const Settings& s);
 // ---- activity timeline (activity_timeline) ----
 void        drawAgentStep(AgentStep& s, const ui::Fonts& fonts, float logW);
 std::string stripMdMarks(const std::string& in);
+// Fence-aware assistant prose: ``` spans render via drawCodeBox, everything else through
+// stripMdMarks + chatDrawSelectableText. Returns the last prose segment's InputText id.
+ImGuiID     drawMdProse(const char* id, const std::string& in, const ImVec4& col, ImFont* mono);
 void        drawActionCard(ActivityItem& a, AgentStep* step, const ui::Fonts& fonts, float logW,
                            bool turnRunning = false);
 void        chatArtifactReveal(AppState& st, const std::string& path);

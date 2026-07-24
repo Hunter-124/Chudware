@@ -526,7 +526,7 @@ stage_pytest() {
 # binary is absent.
 stage_ui_imgui() {
     echo "=== [5/6] host GUI shot smoke (CHUDWARE_SHOT=m1) ==="
-    local bin="$REPO/host/build-linux/bin/Chudware"
+    local bin="$REPO/host/build-linux/bin/chudware"
     if [ ! -x "$bin" ]; then
         if [ "${HOST_BUILD_OK:-0}" -eq 1 ]; then
             record "host shot           FAIL    binary missing at $bin after successful build"

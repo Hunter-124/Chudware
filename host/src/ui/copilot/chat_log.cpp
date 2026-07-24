@@ -474,7 +474,10 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
             metaDrawn = true;
             ImGui::Dummy(ImVec2(0, 2.0f * sc));
         }
-        const ImGuiID textId = chatDrawSelectableText("##prose_sel", prose, chatSurf().textPrimary);
+        // Raw m.text (not `prose`): the renderer needs the ``` fences intact to route code
+        // spans into the mono box. `prose` stays the copy payload, as before.
+        const ImGuiID textId = drawMdProse("##prose_sel", m.text, chatSurf().textPrimary,
+                                           fonts.mono);
         // Submitted before EndChild — see the comment on the user-bubble copy glyph in
         // drawUserBlock() for why an after-EndChild button silently eats no clicks here.
         {
@@ -518,8 +521,21 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
             ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
             const ui::AdaptiveSurface& surf = chatSurf();
             std::string say = m.liveStatus;
-            if (say.empty() || say == "Working" || say == "working...")
-                say = "\xe2\x80\xa6";  // minimal ellipsis — never "Saying · Working"
+            if (say == "Working" || say == "working...")
+                say.clear();               // never "Saying · Working" — the dots carry it
+            // The silent window is the one place with NO streamed content, so a static glyph
+            // makes a slow provider and a hung app look identical. Cycle the dot count off
+            // GetTime() (same technique as drawForgingAnimation) and, once the wait is long
+            // enough to worry about, add an elapsed readout. Dots are padded to a fixed width
+            // so only the dots move, not the readout after them.
+            const int dots = 1 + (int)((long long)(ImGui::GetTime() * 2.5) % 3);
+            const double elapsed = (m.ts > 0.0) ? (chatNowEpoch() - m.ts) : 0.0;
+            const bool showElapsed = elapsed >= 3.0;
+            say.append((size_t)dots, '.');
+            if (showElapsed) {
+                say.append((size_t)(3 - dots), ' ');
+                say += " \xc2\xb7 " + std::to_string((long long)elapsed) + "s";
+            }
             ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
             ImGui::TextWrapped("%s", say.c_str());
             ImGui::PopStyleColor();
@@ -583,8 +599,8 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
             errorDetail = !a.detail.empty() ? a.detail : a.reason;
             break;
         }
-        // Nothing to show if the turn has no prose AND no stop fields.
-        if (!(m.text.empty() && stopReason.empty() && errorDetail.empty())) {
+        // Nothing to show if the turn has no prose, no stop fields and no humanized line.
+        if (!(m.text.empty() && stopReason.empty() && errorDetail.empty() && m.errorHuman.empty())) {
         // Also surface any failed activity reason strings (phase errors) that aren't already
         // folded into the meta row — keeps "budget exhausted (1)" from being the only line.
         std::string phaseErr;
@@ -610,7 +626,9 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
         if (!stopReason.empty() || !errorDetail.empty()) {
             body = "stopped: ";
             body += stopReason.empty() ? "unknown" : stopReason;
-            if (!errorDetail.empty()) {
+            // Skip the detail when it IS the headline verbatim — core emits
+            // error_human == error_detail for failures that are already human-readable.
+            if (!errorDetail.empty() && errorDetail != m.errorHuman) {
                 body += "\n";
                 body += errorDetail;
             }
@@ -640,7 +658,19 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
             body += phaseErr;
         }
 
-        if (!body.empty()) {
+        // The whole raw failure text lives on the message (the drain stopped throwing the
+        // tail away). Keep the card body short and put every byte behind "Error details".
+        constexpr size_t kErrBodyCap = 600;
+        size_t cut = body.size() > kErrBodyCap ? kErrBodyCap : body.size();
+        while (cut > 0 && cut < body.size() && ((unsigned char)body[cut] & 0xC0) == 0x80)
+            --cut;  // never split a UTF-8 sequence
+        std::string shown = body.substr(0, cut);
+        const bool clipped = cut < body.size();
+        if (clipped) shown += "\xe2\x80\xa6";
+        const std::string& fullErr = !m.errorFull.empty() ? m.errorFull : body;
+        const bool haveFull = !fullErr.empty() && (clipped || fullErr != shown);
+
+        if (!shown.empty() || !m.errorHuman.empty()) {
             ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
             GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin,
                                               8.0f);
@@ -655,20 +685,42 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
                 metaDrawn = true;
                 ImGui::Dummy(ImVec2(0, 2.0f * sc));
             }
-            const ImGuiID textId = chatDrawSelectableText("##err_sel", body, errCol);
+            // Headline: the short actionable sentence core/agent derived from this same
+            // failure ("Provider not signed in. Open Settings > AI > Accounts."). The stop
+            // fields below are supporting detail, not the lede.
+            if (!m.errorHuman.empty()) {
+                ImGui::PushFont(fonts.medium);
+                ImGui::PushStyleColor(ImGuiCol_Text, errCol);
+                ImGui::TextWrapped("%s", m.errorHuman.c_str());
+                ImGui::PopStyleColor();
+                ImGui::PopFont();
+                ImGui::Dummy(ImVec2(0, 3.0f * sc));
+            }
+            // Headline-only card (humanized line, no stop fields) skips the body widget.
+            ImGuiID textId = 0;
+            if (!shown.empty()) textId = chatDrawSelectableText("##err_sel", shown, errCol);
+            if (haveFull) {
+                ImGui::Dummy(ImVec2(0, 2.0f * sc));
+                if (toggleChip("Error details", m.errFullOpen)) {
+                    m.errFullOpen = !m.errFullOpen;
+                    m.uiCachedH = -1.0f;  // the card just changed height
+                }
+                if (m.errFullOpen)
+                    drawCodeBox("##err_full", fullErr, fonts.mono, ui::metrics::px(220.0f));
+            }
             // Submitted before EndChild — see the comment on the user-bubble copy glyph in
             // drawUserBlock() for why an after-EndChild button silently eats no clicks here.
             {
                 const ImVec2 wp = ImGui::GetWindowPos();
                 const ImVec2 ws = ImGui::GetWindowSize();
-                chatHoverCopyGlyph(ImRect(wp, ImVec2(wp.x + ws.x, wp.y + ws.y)), body);
+                chatHoverCopyGlyph(ImRect(wp, ImVec2(wp.x + ws.x, wp.y + ws.y)), fullErr);
             }
             ImGui::EndChild();
             ImRect cardRect = endGlassBubble(gb);
             ImGui::GetWindowDrawList()->AddRect(cardRect.Min, cardRect.Max, ui::Palette::toU32(pal.statusErr),
                                                 8.0f * ui::uiScale, 0, ui::metrics::stroke(1.5f));
             const std::string sel = chatInputSelection(textId);
-            chatCopyContext(cardRect, "##err_copy", body, body, sel);
+            chatCopyContext(cardRect, "##err_copy", fullErr, fullErr, sel);
         }
         } // has something to show
     }
@@ -780,20 +832,36 @@ void drawChatLogWindowed(AppState& st) {
 // within a few px of the bottom re-engages. The old "if scrollY >= maxY - 12 snap" check
 // evaluated AFTER the frame's growth, so one >12px growth frame dropped stickiness forever —
 // this instead detects a user scroll (position moved UP vs. last frame) and otherwise snaps.
-void chatLogStickToBottom() {
-    static bool  s_stick = true;
-    static float s_prevScrollY = -1.0f;
+// The state is PER-CALLER: the docked column, the full-page AI-tab chat and the firmware
+// workspace can render the same conversation in the same frame, so one shared function-local
+// static let scrolling up in one surface silently kill autoscroll in the others.
+namespace {
+struct StickState {
+    bool  stick = true;
+    float prevScrollY = -1.0f;
+};
+std::unordered_map<std::string, StickState> s_stickByRegion;
+}  // namespace
+
+void chatLogStickToBottom(const char* regionId) {
+    StickState& s = s_stickByRegion[regionId ? regionId : ""];
     const float sy   = ImGui::GetScrollY();
     const float smax = ImGui::GetScrollMaxY();
     const float thresh = 24.0f * ui::uiScale;
-    if (s_prevScrollY >= 0.0f && sy < s_prevScrollY - 0.5f)
-        s_stick = false;                       // user scrolled up this frame
+    if (s.prevScrollY >= 0.0f && sy < s.prevScrollY - 0.5f)
+        s.stick = false;                       // user scrolled up this frame
     if (sy >= smax - thresh)
-        s_stick = true;                        // at/near the bottom — re-engage
-    if (s_stick && smax > sy)
+        s.stick = true;                        // at/near the bottom — re-engage
+    if (s.stick && smax > sy)
         ImGui::SetScrollY(smax);
-    s_prevScrollY = ImGui::GetScrollY();
+    s.prevScrollY = ImGui::GetScrollY();
 }
+
+// Re-engage stick-to-bottom on every chat surface (conversation switch). Dropping the entries
+// also clears prevScrollY: the incoming log is usually a different height, and ImGui clamping
+// the carried-over offset down would otherwise look exactly like a user scroll-up and unstick
+// the very first frame of the new conversation.
+void chatLogResetStick() { s_stickByRegion.clear(); }
 
 
 // ---- unified AI Copilot pane: header -> conversation -> bottom composer ----

@@ -258,7 +258,8 @@ json emit_agent_tool_call(RunEvents& ev,
                           bool ok,
                           int latency_ms,
                           const std::string& parent_id,
-                          const std::string& actor) {
+                          const std::string& actor,
+                          const std::string& error_preview) {
     std::string name = tool_name.empty() ? derive_tool_name(args) : tool_name;
     std::string tgt = target.empty() ? derive_ops_target(args) : target;
     std::string preview;
@@ -278,6 +279,9 @@ json emit_agent_tool_call(RunEvents& ev,
     data["ok"] = ok;
     data["latency_ms"] = latency_ms;
     if (!preview.empty()) data["args_preview"] = preview;
+    // Failure text only — successful rows stay lean (mirrors Python tool_call_event).
+    if (!ok && !error_preview.empty())
+        data["error_preview"] = cap_text(error_preview, kArgsPreviewCap);
     if (!parent_id.empty()) data["parent_id"] = parent_id;
     if (!actor.empty()) data["actor"] = actor;
     return ev.emit("agent.tool_call", data);

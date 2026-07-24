@@ -31,8 +31,6 @@
 #include <cstring>
 #include <cstdint>
 #include <ctime>
-#include <filesystem>
-#include <fstream>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -57,20 +55,6 @@ namespace ui {
 // ---- local state ----------------------------------------------------------------
 namespace {
 
-struct DagNode {
-    std::string id, label, kind, status, assigned;
-    std::vector<std::string> requires;
-    int layer = 0, row = 0;
-};
-
-struct DagRun {
-    std::string runId;
-    std::string path;      // absolute path to the .buildgraph.json sidecar
-    std::string mission;   // graph.mission ("" for older runs)
-    long long   mtime = 0;
-    int         nodeCount = 0;
-};
-
 struct AiWsState {
     // Which view the right utility panel shows (v3 vertical nav): 0 = Agent Hub (sub-agent
     // rows + live agent-execution DAG), 1 = Session Plan (plan board over persisted buildgraph
@@ -79,32 +63,10 @@ struct AiWsState {
     // The conversation window is always visible on the left, never a tab.
     int  view = 0;     // default to Agent Hub
 
-    // M8 plumbing: the chat session whose plan the "Session Plan" view is scoped to. Set from
-    // the active conversation each frame; the per-session run_id aggregation is Phase-2 backend
-    // data (Conversation has no run_id yet — see AI_WORKSPACE_V2_PLAN.md §2.1), so today the
-    // view still lists every persisted run. Kept here so the scoping wiring is already in place.
-    std::string selSession;
-
     // Autopopulate (agent.ui_follow_active_session): the last live run id that yanked the
     // panel to the Agent Hub view — a NEW run switches the view once, then the user is
     // free to pick another tab.
     std::string lastAutoRun;
-
-    // DAG run catalog (scanned from the persisted runs dir; Refresh re-scans).
-    bool                runsScanned = false;
-    std::vector<DagRun> runs;
-    int                 selRun = -1;
-
-    // Loaded graph for the selected run.
-    std::string          loadedRun;
-    std::vector<DagNode> nodes;
-    std::string          loadErr;
-
-    // dag_status worker probe for the selected run.
-    std::string statusRun;      // run id the probe/last steer was issued for
-    bool        statusPending = false;
-    bool        statusOk      = false;
-    std::string statusLine;
 
     // canvas pan/zoom
     ImVec2 pan{0.0f, 0.0f};
@@ -150,6 +112,7 @@ struct AgNode {
     std::vector<int>   children;
     int   depth = 0;        // BFS depth from a root (for indent/layout)
     bool  collapsed = false;// M10: user-collapsed — hides the subtree
+    bool  descFailed = false;// M10: a DESCENDANT failed — surfaced on a COLLAPSED ancestor
 };
 
 struct AgentDagStore {
@@ -168,7 +131,12 @@ struct AgentDagStore {
     bool empty() const { return nodes.empty(); }
 };
 
-static AgentDagStore s_agdag;
+// The live DAG is PER CONVERSATION: two chats can run at once, so each owns its own execution
+// trace instead of one global tree that the other run blanks or hijacks on every run boundary.
+static std::unordered_map<std::string, AgentDagStore> s_agdags;   // conversation id -> tree
+
+// The tree for `convId`, created empty on first touch. GL thread only (no mutex).
+static AgentDagStore& agStore(const std::string& convId) { return s_agdags[convId]; }
 
 static std::string agEnvStr(const nlohmann::json& d, const char* k) {
     auto it = d.find(k);
@@ -181,20 +149,20 @@ static int agEnvInt(const nlohmann::json& d, const char* k, int def) {
 
 // Insert or update a node keyed by span id. Events without an `id` (legacy /1 records) get a
 // synthesized per-run id from actor+seq so they still land as leaves (§2.1 consumer fallback).
-static AgNode& agUpsert(const std::string& id, const std::string& parentId) {
-    auto it = s_agdag.byId.find(id);
-    if (it != s_agdag.byId.end()) {
-        AgNode& n = s_agdag.nodes[it->second];
+static AgNode& agUpsert(AgentDagStore& dag, const std::string& id, const std::string& parentId) {
+    auto it = dag.byId.find(id);
+    if (it != dag.byId.end()) {
+        AgNode& n = dag.nodes[it->second];
         if (n.parentId.empty() && !parentId.empty()) n.parentId = parentId;
         return n;
     }
     AgNode n;
     n.id = id;
     n.parentId = parentId;
-    n.seq = s_agdag.seqCtr++;
-    s_agdag.byId[id] = (int)s_agdag.nodes.size();
-    s_agdag.nodes.push_back(std::move(n));
-    return s_agdag.nodes.back();
+    n.seq = dag.seqCtr++;
+    dag.byId[id] = (int)dag.nodes.size();
+    dag.nodes.push_back(std::move(n));
+    return dag.nodes.back();
 }
 
 // Stable serialization names for AgKind (distinct from the display tags in agKindTag below).
@@ -221,20 +189,25 @@ static AgKind agKindFromName(const std::string& s) {
 
 }  // close the file-level anonymous namespace so feedAgentDagEvent has external ui:: linkage
 
-// Feed one drained orchestrator event into the live Agent Workflow DAG (GL thread only).
-void feedAgentDagEvent(const std::string& kind, const nlohmann::json& data) {
+// Feed one drained orchestrator event into the OWNING conversation's Agent Workflow DAG (GL
+// thread only). `convId` is the conversation whose run emitted the event — every chat builds
+// its own tree, so a second concurrent run never resets or hijacks the visible one.
+void feedAgentDagEvent(const std::string& convId, const std::string& kind,
+                       const nlohmann::json& data) {
     if (!data.is_object()) return;
+    AgentDagStore& dag = agStore(convId);
 
-    // Run boundary: a fresh run replaces the previous tree (mirrors the context-meter reset).
+    // Run boundary: a fresh run replaces THIS conversation's previous tree (mirrors the
+    // context-meter reset).
     const std::string runId = agEnvStr(data, "run_id");
     if (kind == "run_started" || kind == "dag.run.started") {
-        s_agdag.reset(runId);
+        dag.reset(runId);
         return;
     }
     // If a new run_id arrives without a start marker (e.g. we joined mid-run), roll over cleanly.
-    if (!runId.empty() && !s_agdag.runId.empty() && runId != s_agdag.runId)
-        s_agdag.reset(runId);
-    if (s_agdag.runId.empty() && !runId.empty()) s_agdag.runId = runId;
+    if (!runId.empty() && !dag.runId.empty() && runId != dag.runId)
+        dag.reset(runId);
+    if (dag.runId.empty() && !runId.empty()) dag.runId = runId;
 
     // Only agent-level kinds carry §2.1 span linkage; everything else is ignored by this store
     // (the buildgraph/Session Plan view owns the dag.* lifecycle).
@@ -247,10 +220,10 @@ void feedAgentDagEvent(const std::string& kind, const nlohmann::json& data) {
     // the record is still visible without a parent join.
     const std::string key = !id.empty()
         ? id
-        : ("_leaf" + std::to_string(s_agdag.seqCtr) + agEnvStr(data, "node_id"));
+        : ("_leaf" + std::to_string(dag.seqCtr) + agEnvStr(data, "node_id"));
 
     if (kind == "agent.tool_call") {
-        AgNode& n = agUpsert(key, parentId);
+        AgNode& n = agUpsert(dag, key, parentId);
         n.kind   = AgKind::Tool;
         n.actor  = actor;
         n.title  = agEnvStr(data, "tool_name");
@@ -259,28 +232,28 @@ void feedAgentDagEvent(const std::string& kind, const nlohmann::json& data) {
         bool ok  = data.value("ok", true);
         n.status = ok ? "ok" : "failed";
         n.latencyMs = agEnvInt(data, "latency_ms", -1);
-        ++s_agdag.toolCount;
+        ++dag.toolCount;
     } else if (kind == "agent.thought") {
-        AgNode& n = agUpsert(key, parentId);
+        AgNode& n = agUpsert(dag, key, parentId);
         n.kind   = AgKind::Thought;
         n.actor  = actor;
         n.title  = "thought";
         n.detail = agEnvStr(data, "text");          // completed reasoning block (not streamed)
-        ++s_agdag.thoughtCount;
+        ++dag.thoughtCount;
     } else if (kind == "agent.context_injected") {
-        AgNode& n = agUpsert(key, parentId);
+        AgNode& n = agUpsert(dag, key, parentId);
         n.kind   = AgKind::Context;
         n.actor  = actor;
         n.title  = "context: " + agEnvStr(data, "source");
         n.detail = agEnvStr(data, "label");
         int tok  = agEnvInt(data, "token_est", 0);
         if (tok > 0) n.detail += (n.detail.empty() ? "" : "  ") + ("~" + std::to_string(tok) + " tok");
-        ++s_agdag.ctxCount;
+        ++dag.ctxCount;
     } else if (kind == "agent.spawn") {
         // Subagent / worker branch. Emit-wired backend, no production sink today (M20) — but if a
         // real one arrives we build the branch: the spawner span is `parent_id`, and the child's
         // own execution root is `subagent_id`.
-        AgNode& n = agUpsert(key, parentId);
+        AgNode& n = agUpsert(dag, key, parentId);
         n.kind   = AgKind::Spawn;
         n.actor  = actor.empty() ? agEnvStr(data, "role") : actor;
         n.title  = "spawn: " + agEnvStr(data, "role");
@@ -292,37 +265,41 @@ void feedAgentDagEvent(const std::string& kind, const nlohmann::json& data) {
         const std::string spawnActor = n.actor;
         const std::string childId = agEnvStr(data, "subagent_id");
         if (!childId.empty()) {
-            s_agdag.nodes[s_agdag.byId[key]].refId = childId;  // M11: click → open its chat
-            AgNode& c = agUpsert(childId, key);
+            dag.nodes[dag.byId[key]].refId = childId;  // M11: click → open its chat
+            AgNode& c = agUpsert(dag, childId, key);
             if (c.title.empty()) {
                 c.kind = AgKind::Root; c.actor = spawnActor; c.title = "subagent " + spawnActor;
             }
             c.refId = childId;
         }
-        s_agdag.sawSpawn = true;
+        dag.sawSpawn = true;
     } else if (kind == "agent.advisor") {
-        AgNode& n = agUpsert(key, parentId);
+        AgNode& n = agUpsert(dag, key, parentId);
         n.kind   = AgKind::Advisor;
         n.actor  = actor;
         n.title  = "advisor: " + agEnvStr(data, "advisor_kind");
         n.detail = agEnvStr(data, "verdict_summary");
-        s_agdag.sawAdvisor = true;
+        dag.sawAdvisor = true;
     }
     // Any other agent.* kind (artifact/question/answer) is tolerated but not graphed here.
 }
 
-// Serialize the live Agent Workflow DAG store (s_agdag) — every field the canvas draws.
-nlohmann::json agentDagToJson() {
+// Serialize one conversation's Agent Workflow DAG — every field the canvas draws. Null json
+// when that conversation never ran, so there is nothing to snapshot.
+nlohmann::json agentDagToJson(const std::string& convId) {
+    auto sit = s_agdags.find(convId);
+    if (sit == s_agdags.end()) return nlohmann::json();
+    const AgentDagStore& dag = sit->second;
     nlohmann::json j;
-    j["runId"]        = s_agdag.runId;
-    j["seqCtr"]       = s_agdag.seqCtr;
-    j["sawSpawn"]     = s_agdag.sawSpawn;
-    j["sawAdvisor"]   = s_agdag.sawAdvisor;
-    j["toolCount"]    = s_agdag.toolCount;
-    j["thoughtCount"] = s_agdag.thoughtCount;
-    j["ctxCount"]     = s_agdag.ctxCount;
+    j["runId"]        = dag.runId;
+    j["seqCtr"]       = dag.seqCtr;
+    j["sawSpawn"]     = dag.sawSpawn;
+    j["sawAdvisor"]   = dag.sawAdvisor;
+    j["toolCount"]    = dag.toolCount;
+    j["thoughtCount"] = dag.thoughtCount;
+    j["ctxCount"]     = dag.ctxCount;
     nlohmann::json arr = nlohmann::json::array();
-    for (const AgNode& n : s_agdag.nodes) {
+    for (const AgNode& n : dag.nodes) {
         nlohmann::json jn;
         jn["id"]        = n.id;
         jn["parentId"]  = n.parentId;
@@ -340,16 +317,17 @@ nlohmann::json agentDagToJson() {
     return j;
 }
 
-// Restore a serialized tree (agentDagToJson) into the store. Rebuilds the id index; tree
-// links (children/depth) are re-derived by agResolveTree at draw time.
-void agentDagFromJson(const nlohmann::json& j) {
+// Restore a serialized tree (agentDagToJson) into `convId`'s store. Rebuilds the id index; tree
+// links (children/depth/failure roll-up) are re-derived by agResolveTree at draw time.
+void agentDagFromJson(const std::string& convId, const nlohmann::json& j) {
     if (!j.is_object()) return;
-    s_agdag.reset(j.value("runId", std::string()));
-    s_agdag.sawSpawn     = j.value("sawSpawn", false);
-    s_agdag.sawAdvisor   = j.value("sawAdvisor", false);
-    s_agdag.toolCount    = j.value("toolCount", 0);
-    s_agdag.thoughtCount = j.value("thoughtCount", 0);
-    s_agdag.ctxCount     = j.value("ctxCount", 0);
+    AgentDagStore& dag = agStore(convId);
+    dag.reset(j.value("runId", std::string()));
+    dag.sawSpawn     = j.value("sawSpawn", false);
+    dag.sawAdvisor   = j.value("sawAdvisor", false);
+    dag.toolCount    = j.value("toolCount", 0);
+    dag.thoughtCount = j.value("thoughtCount", 0);
+    dag.ctxCount     = j.value("ctxCount", 0);
     if (j.contains("nodes") && j["nodes"].is_array()) {
         for (const auto& jn : j["nodes"]) {
             if (!jn.is_object()) continue;
@@ -365,15 +343,15 @@ void agentDagFromJson(const nlohmann::json& j) {
             n.latencyMs = jn.value("latencyMs", -1);
             n.seq       = jn.value("seq", (long long)0);
             if (n.id.empty()) n.id = "_leaf" + std::to_string(n.seq);
-            if (s_agdag.byId.count(n.id)) continue;   // corrupt duplicate id — skip
-            s_agdag.byId[n.id] = (int)s_agdag.nodes.size();
-            s_agdag.nodes.push_back(std::move(n));
+            if (dag.byId.count(n.id)) continue;   // corrupt duplicate id — skip
+            dag.byId[n.id] = (int)dag.nodes.size();
+            dag.nodes.push_back(std::move(n));
         }
     }
     // Restore the arrival counter past every restored seq so new events keep ordering.
     long long maxSeq = -1;
-    for (const AgNode& n : s_agdag.nodes) maxSeq = std::max(maxSeq, n.seq);
-    s_agdag.seqCtr = std::max(j.value("seqCtr", (long long)0), maxSeq + 1);
+    for (const AgNode& n : dag.nodes) maxSeq = std::max(maxSeq, n.seq);
+    dag.seqCtr = std::max(j.value("seqCtr", (long long)0), maxSeq + 1);
 }
 
 // Reopen the file-level anonymous namespace for the remaining internal helpers/renderers.
@@ -435,171 +413,6 @@ static void emptyState(const char* icon, const char* msg, const char* sub = null
         ImGui::PopStyleColor();
     }
     ImGui::Dummy(ImVec2(0, 8.0f * S));
-}
-
-// ---- DAG run catalog (persisted sidecars — the store dag_status reads) ----------
-
-static std::string runsDir() {
-    // appdataAppDir() applies the Chudware alias rule on both platforms.
-    return appdataAppDir() + "/runs";
-}
-
-static bool loadRunGraph(const DagRun& run);   // fwd
-
-static void scanRuns() {
-    namespace fs = std::filesystem;
-    s_ai.runsScanned = true;
-    s_ai.runs.clear();
-    s_ai.selRun = -1;
-
-    std::error_code ec;
-    fs::path dir(runsDir());
-    if (dir.empty() || !fs::exists(dir, ec)) return;
-
-    static const char kSuffix[] = ".buildgraph.json";
-    for (const auto& e : fs::directory_iterator(dir, ec)) {
-        if (!e.is_regular_file(ec)) continue;
-        std::string name = e.path().filename().string();
-        if (name.size() <= sizeof(kSuffix) - 1 ||
-            name.compare(name.size() - (sizeof(kSuffix) - 1), sizeof(kSuffix) - 1,
-                         kSuffix) != 0)
-            continue;
-        DagRun r;
-        r.runId = name.substr(0, name.size() - (sizeof(kSuffix) - 1));
-        r.path  = e.path().string();
-        auto t  = fs::last_write_time(e.path(), ec);
-        r.mtime = (long long)t.time_since_epoch().count();
-        r.nodeCount = -1;  // unknown until parsed
-        s_ai.runs.push_back(std::move(r));
-    }
-    std::sort(s_ai.runs.begin(), s_ai.runs.end(),
-              [](const DagRun& a, const DagRun& b) { return a.mtime > b.mtime; });
-    if (s_ai.runs.size() > 25) s_ai.runs.resize(25);
-
-    // Fill node counts (sidecars are small) and default-select the newest non-empty plan.
-    for (size_t i = 0; i < s_ai.runs.size(); ++i) {
-        try {
-            std::ifstream f(s_ai.runs[i].path);
-            if (!f) continue;
-            nlohmann::json j = nlohmann::json::parse(f, nullptr, false);
-            if (j.is_discarded()) continue;
-            const auto& g = j.contains("graph") ? j["graph"] : j;
-            if (g.is_object()) {
-                s_ai.runs[i].mission   = g.value("mission", "");
-                s_ai.runs[i].nodeCount = g.contains("nodes") && g["nodes"].is_array()
-                                             ? (int)g["nodes"].size() : 0;
-            }
-        } catch (...) { /* corrupt sidecar — leave unknown */ }
-        if (s_ai.selRun < 0 && s_ai.runs[i].nodeCount > 0) s_ai.selRun = (int)i;
-    }
-    if (s_ai.selRun >= 0) loadRunGraph(s_ai.runs[s_ai.selRun]);
-}
-
-// Longest-path layering (requires -> deps left of dependents), rows per layer.
-static void layoutDag(std::vector<DagNode>& nodes) {
-    std::unordered_map<std::string, int> idx;
-    for (size_t i = 0; i < nodes.size(); ++i) idx[nodes[i].id] = (int)i;
-    for (auto& n : nodes) n.layer = 0;
-    // Relaxation passes (bounded — plan graphs are small; cycles just stop improving).
-    for (size_t pass = 0; pass < nodes.size() + 1; ++pass) {
-        bool changed = false;
-        for (auto& n : nodes)
-            for (const auto& dep : n.requires) {
-                auto it = idx.find(dep);
-                if (it == idx.end()) continue;
-                int want = nodes[it->second].layer + 1;
-                if (n.layer < want) { n.layer = want; changed = true; }
-            }
-        if (!changed) break;
-    }
-    std::unordered_map<int, int> rowInLayer;
-    for (auto& n : nodes) n.row = rowInLayer[n.layer]++;
-}
-
-static bool loadRunGraph(const DagRun& run) {
-    s_ai.loadedRun = run.runId;
-    s_ai.nodes.clear();
-    s_ai.loadErr.clear();
-    s_ai.pan  = ImVec2(0, 0);
-    s_ai.zoom = 1.0f;
-    try {
-        std::ifstream f(run.path);
-        if (!f) { s_ai.loadErr = "Cannot open " + run.path; return false; }
-        nlohmann::json j = nlohmann::json::parse(f, nullptr, false);
-        if (j.is_discarded()) { s_ai.loadErr = "Corrupt plan sidecar."; return false; }
-        const auto& g = j.contains("graph") ? j["graph"] : j;
-        if (!g.is_object() || !g.contains("nodes") || !g["nodes"].is_array()) {
-            s_ai.loadErr = "Plan sidecar has no nodes.";
-            return false;
-        }
-        for (const auto& jn : g["nodes"]) {
-            DagNode n;
-            n.id     = jn.value("id",     "");
-            n.kind   = jn.value("kind",   "");
-            n.label  = jn.value("label",  n.id);
-            n.status = jn.value("status", "pending");
-            if (jn.contains("assigned") && jn["assigned"].is_string())
-                n.assigned = jn["assigned"].get<std::string>();
-            if (jn.contains("requires") && jn["requires"].is_array())
-                for (const auto& r : jn["requires"])
-                    if (r.is_string()) n.requires.push_back(r.get<std::string>());
-            s_ai.nodes.push_back(std::move(n));
-        }
-        layoutDag(s_ai.nodes);
-        return true;
-    } catch (const std::exception& e) {
-        s_ai.loadErr = std::string("Plan load failed: ") + e.what();
-        return false;
-    }
-}
-
-// Ask the worker about the selected run (proves the dag_status seam; surfaces the
-// events trail + checkpoint presence). Async — result lands in s_ai.statusLine.
-static void probeDagStatus(AppState& st, const std::string& runId) {
-    if (!st.workerStarted || s_ai.statusPending) return;
-    s_ai.statusRun     = runId;
-    s_ai.statusPending = true;
-    s_ai.statusOk      = false;
-    s_ai.statusLine    = "Asking worker (dag_status)...";
-    nlohmann::json p;
-    p["run_id"] = runId;
-    st.rpc.call("dag_status", p, [runId](const core::RpcResult& r) {
-        if (s_ai.statusRun != runId) return;  // stale — user switched runs
-        s_ai.statusPending = false;
-        if (!r.ok) { s_ai.statusLine = "Worker: " + (r.err.empty() ? "unreachable" : r.err); return; }
-        if (r.result.value("ok", false)) {
-            s_ai.statusOk = true;
-            int n = r.result.value("node_count", 0);
-            bool trail = !r.result.value("events_jsonl", std::string()).empty();
-            char buf[160];
-            std::snprintf(buf, sizeof(buf), "Worker: run live — %d node%s%s", n,
-                          n == 1 ? "" : "s", trail ? ", event trail on disk" : "");
-            s_ai.statusLine = buf;
-        } else {
-            s_ai.statusLine = "Worker: " + r.result.value("reason", std::string("unknown run"));
-        }
-    });
-}
-
-static void steerRun(AppState& st, const std::string& runId, bool approve) {
-    if (!st.workerStarted) return;
-    s_ai.statusRun  = runId;
-    s_ai.statusLine = approve ? "Approving gate..." : "Aborting run...";
-    nlohmann::json p;
-    p["run_id"] = runId;
-    st.rpc.call(approve ? "dag_approve" : "dag_abort", p,
-                [runId](const core::RpcResult& r) {
-        if (s_ai.statusRun != runId) return;
-        if (r.ok && r.result.value("ok", false))
-            s_ai.statusLine = "Worker: " + r.result.value("status", std::string("resumed"));
-        else {
-            std::string why = r.ok ? r.result.value("reason", std::string("steer failed"))
-                                   : r.err;
-            s_ai.statusLine = "Worker: " + (why.empty() ? "steer failed" : why);
-        }
-        // Statuses may have advanced on disk — reload the sidecar next frame.
-        s_ai.loadedRun.clear();
-    });
 }
 
 static const float* statusColor(const std::string& s) {
@@ -1100,9 +913,9 @@ static void drawSubagentPopups(AppState& st) {
 }
 
 // ---- Agent Workflow DAG (Phase 2, M9/M10) ---------------------------------------
-// A collapsible, scalable execution tree built from the live event store (s_agdag). Reuses the
-// pan/zoom/clip/Bézier scaffolding grammar of drawDagCanvas but with its OWN layout so M10 can
-// hide collapsed subtrees BEFORE laying out (the buildgraph canvas has no collapse concept).
+// A collapsible, scalable execution tree over the VIEWED conversation's event store
+// (s_agdags[convId]). Its own layout so M10 can hide collapsed subtrees BEFORE laying out —
+// and roll a descendant failure up onto the collapsed ancestor that hides it.
 
 static const float* agNodeColor(const AgNode& n) {
     switch (n.kind) {
@@ -1129,52 +942,64 @@ static const char* agKindTag(AgKind k) {
 }
 
 // Resolve parent->children links + depth from the flat node list (join parent_id -> id, §2.1).
-// Nodes whose parent is absent become roots. Cheap enough to run every frame (tens of nodes).
-static void agResolveTree(std::vector<int>& roots) {
-    for (auto& n : s_agdag.nodes) { n.children.clear(); n.depth = 0; }
+// Nodes whose parent is absent become roots. Also rolls a "something under me failed" bit up
+// every ancestor chain, so a COLLAPSED branch can still show the failure hiding inside it.
+// Cheap enough to run every frame (tens of nodes).
+static void agResolveTree(AgentDagStore& dag, std::vector<int>& roots) {
+    for (auto& n : dag.nodes) { n.children.clear(); n.depth = 0; n.descFailed = false; }
     roots.clear();
-    for (size_t i = 0; i < s_agdag.nodes.size(); ++i) {
-        const std::string& pid = s_agdag.nodes[i].parentId;
-        auto it = pid.empty() ? s_agdag.byId.end() : s_agdag.byId.find(pid);
-        if (it == s_agdag.byId.end() || it->second == (int)i) roots.push_back((int)i);
-        else s_agdag.nodes[it->second].children.push_back((int)i);
+    for (size_t i = 0; i < dag.nodes.size(); ++i) {
+        const std::string& pid = dag.nodes[i].parentId;
+        auto it = pid.empty() ? dag.byId.end() : dag.byId.find(pid);
+        if (it == dag.byId.end() || it->second == (int)i) roots.push_back((int)i);
+        else dag.nodes[it->second].children.push_back((int)i);
     }
     // Depth via BFS from roots (advisory ordering; ts/seq keep siblings stable).
     std::vector<int> stack(roots.begin(), roots.end());
-    std::vector<char> seen(s_agdag.nodes.size(), 0);
+    std::vector<char> seen(dag.nodes.size(), 0);
     for (int r : roots) seen[r] = 1;
     while (!stack.empty()) {
         int cur = stack.back(); stack.pop_back();
-        for (int c : s_agdag.nodes[cur].children) {
+        for (int c : dag.nodes[cur].children) {
             if (seen[c]) continue;
             seen[c] = 1;
-            s_agdag.nodes[c].depth = s_agdag.nodes[cur].depth + 1;
+            dag.nodes[c].depth = dag.nodes[cur].depth + 1;
             stack.push_back(c);
+        }
+    }
+    // Failure roll-up: walk each failed node's ancestor chain, stopping at the first ancestor
+    // already marked — which is also what terminates a malformed cyclic parent chain.
+    for (const AgNode& n : dag.nodes) {
+        if (n.status != "failed") continue;
+        std::string pid = n.parentId;
+        while (!pid.empty()) {
+            auto it = dag.byId.find(pid);
+            if (it == dag.byId.end()) break;
+            AgNode& p = dag.nodes[it->second];
+            if (p.descFailed) break;
+            p.descFailed = true;
+            pid = p.parentId;
         }
     }
 }
 
 // M10: flatten to the VISIBLE set (stop descending at a collapsed node) in tree order, assigning
 // each visible node a (layer=depth, row=running counter) grid slot. Returns visible node indices.
-static void agFlattenVisible(const std::vector<int>& roots, std::vector<int>& visible,
-                             std::unordered_map<int,int>& rowOf) {
+static void agFlattenVisible(const AgentDagStore& dag, const std::vector<int>& roots,
+                             std::vector<int>& visible, std::unordered_map<int,int>& rowOf) {
     visible.clear(); rowOf.clear();
-    // Sort roots + children by seq for stable, arrival-ordered rows.
-    auto bySeq = [](const std::vector<int>&) {};
-    (void)bySeq;
-    std::vector<int> order;
-    // Iterative pre-order DFS honoring collapse.
+    // Iterative pre-order DFS honoring collapse; children in seq order (arrival-ordered rows).
     std::vector<int> stack(roots.rbegin(), roots.rend());
     int row = 0;
     while (!stack.empty()) {
         int cur = stack.back(); stack.pop_back();
         visible.push_back(cur);
         rowOf[cur] = row++;
-        if (!s_agdag.nodes[cur].collapsed) {
+        if (!dag.nodes[cur].collapsed) {
             // push children in reverse-seq so they pop in seq order
-            std::vector<int> kids = s_agdag.nodes[cur].children;
-            std::sort(kids.begin(), kids.end(), [](int a, int b) {
-                return s_agdag.nodes[a].seq < s_agdag.nodes[b].seq;
+            std::vector<int> kids = dag.nodes[cur].children;
+            std::sort(kids.begin(), kids.end(), [&dag](int a, int b) {
+                return dag.nodes[a].seq < dag.nodes[b].seq;
             });
             for (auto rit = kids.rbegin(); rit != kids.rend(); ++rit) stack.push_back(*rit);
         }
@@ -1183,16 +1008,16 @@ static void agFlattenVisible(const std::vector<int>& roots, std::vector<int>& vi
 
 // verbosity (agent.ui_verbosity): 0 = title only, 1 = + detail line, 2 = + actor / latency /
 // generous detail budget (the footer counts live in the view header above the canvas).
-static void drawAgentDagCanvas(AppState& st, int verbosity) {
+static void drawAgentDagCanvas(AppState& st, AgentDagStore& dag, int verbosity) {
     const float S = ui::uiScale;
 
     std::vector<int> roots;
-    agResolveTree(roots);
+    agResolveTree(dag, roots);
     std::sort(roots.begin(), roots.end(),
-              [](int a, int b) { return s_agdag.nodes[a].seq < s_agdag.nodes[b].seq; });
+              [&dag](int a, int b) { return dag.nodes[a].seq < dag.nodes[b].seq; });
     std::vector<int> visible;
     std::unordered_map<int,int> rowOf;
-    agFlattenVisible(roots, visible, rowOf);
+    agFlattenVisible(dag, roots, visible, rowOf);
 
     ImGui::BeginChild("##ag_dag_canvas", ImVec2(0, 0), ImGuiChildFlags_None,
                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
@@ -1202,7 +1027,7 @@ static void drawAgentDagCanvas(AppState& st, int verbosity) {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     dl->PushClipRect(cMin, cMax, true);
 
-    // Whole-canvas pan/zoom surface (reuses the s_ai.pan/zoom camera — shared between DAG views).
+    // Whole-canvas pan/zoom surface (s_ai.pan/zoom is the shared canvas camera).
     ImGui::InvisibleButton("##ag_dag_nav", cSz,
                            ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonMiddle);
     bool navActive = ImGui::IsItemActive();
@@ -1227,7 +1052,7 @@ static void drawAgentDagCanvas(AppState& st, int verbosity) {
     const float gapX  = 46.0f * S * z,  gapY  = 12.0f * S * z;
     // layer = depth (indent by tree level), row = pre-order counter.
     auto slotPos = [&](int nodeIdx) {
-        const AgNode& n = s_agdag.nodes[nodeIdx];
+        const AgNode& n = dag.nodes[nodeIdx];
         int rr = rowOf.count(nodeIdx) ? rowOf[nodeIdx] : 0;
         return ImVec2(cMin.x + s_ai.pan.x + 16.0f * S + n.depth * (32.0f * S * z),
                       cMin.y + s_ai.pan.y + 16.0f * S + rr * (nodeH + gapY));
@@ -1237,9 +1062,9 @@ static void drawAgentDagCanvas(AppState& st, int verbosity) {
     const ImU32 edgeCol = ImGui::ColorConvertFloat4ToU32(
         ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 0.55f));
     for (int idx : visible) {
-        const AgNode& n = s_agdag.nodes[idx];
-        auto pit = n.parentId.empty() ? s_agdag.byId.end() : s_agdag.byId.find(n.parentId);
-        if (pit == s_agdag.byId.end()) continue;
+        const AgNode& n = dag.nodes[idx];
+        auto pit = n.parentId.empty() ? dag.byId.end() : dag.byId.find(n.parentId);
+        if (pit == dag.byId.end()) continue;
         if (!rowOf.count(pit->second)) continue;   // parent not visible (shouldn't happen)
         ImVec2 pC = slotPos(idx);
         ImVec2 pP = slotPos(pit->second);
@@ -1253,11 +1078,14 @@ static void drawAgentDagCanvas(AppState& st, int verbosity) {
     // Nodes.
     (void)navActive;
     for (int idx : visible) {
-        const AgNode& n = s_agdag.nodes[idx];
+        const AgNode& n = dag.nodes[idx];
         ImVec2 p0 = slotPos(idx);
         ImVec2 p1(p0.x + nodeW, p0.y + nodeH);
         if (p1.y < cMin.y || p0.y > cMax.y) continue;   // vertical cull
-        const float* sc = agNodeColor(n);
+        // A COLLAPSED branch hiding a failed step takes the error accent (and the "!" badge
+        // below), so a failure deep inside it stays visible without expanding.
+        const bool hidFail = n.collapsed && n.descFailed;
+        const float* sc = hidFail ? palette.statusErr : agNodeColor(n);
         const float rr  = 6.0f * S * z;
         dl->AddRectFilled(p0, p1,
             ImGui::ColorConvertFloat4ToU32(
@@ -1280,7 +1108,7 @@ static void drawAgentDagCanvas(AppState& st, int verbosity) {
             dl->AddText(ImVec2(tg0.x + 4.0f * S * z, tg0.y + 1.0f * S * z),
                 ImGui::ColorConvertFloat4ToU32(ImVec4(palette.text[0], palette.text[1],
                                                       palette.text[2], 1.0f)),
-                s_agdag.nodes[idx].collapsed ? "+" : "-");
+                n.collapsed ? "+" : "-");
             // Toggle on RELEASE of a tap (not press): the full-canvas nav InvisibleButton claims
             // the click on press, so `navActive` is true the same frame IsMouseClicked fires —
             // gating on click-down can never pass. A release with near-zero drag = a tap (a drag
@@ -1288,7 +1116,7 @@ static void drawAgentDagCanvas(AppState& st, int verbosity) {
             if (hov && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
                 ImVec2 dd = ImGui::GetMouseDragDelta(ImGuiMouseButton_Left, 0.0f);
                 if (dd.x * dd.x + dd.y * dd.y < (4.0f * S) * (4.0f * S))
-                    s_agdag.nodes[idx].collapsed = !s_agdag.nodes[idx].collapsed;
+                    dag.nodes[idx].collapsed = !dag.nodes[idx].collapsed;
             }
         }
 
@@ -1309,10 +1137,17 @@ static void drawAgentDagCanvas(AppState& st, int verbosity) {
             // thought) with a wider budget at full verbosity (tooltip always carries ALL text)
             std::string lbl = n.title;
             if (verbosity >= 1 && !n.detail.empty()) lbl += "  " + n.detail;
-            if (s_agdag.nodes[idx].collapsed && hasKids)
-                lbl += "  (+" + std::to_string((int)n.children.size()) + ")";
-            const size_t maxCh = (size_t)std::max(10.0f, (verbosity >= 2 ? 72.0f : 34.0f) * z);
-            if (lbl.size() > maxCh) lbl = lbl.substr(0, maxCh - 1) + "\xE2\x80\xA6";
+            // The collapse marker is budgeted OUT of the ellipsis so "(+N)" and the failure
+            // badge survive truncation of a long title.
+            std::string tail;
+            if (n.collapsed && hasKids) {
+                tail = "  (+" + std::to_string((int)n.children.size()) + ")";
+                if (n.descFailed) tail += " !";
+            }
+            const size_t maxCh  = (size_t)std::max(10.0f, (verbosity >= 2 ? 72.0f : 34.0f) * z);
+            const size_t budget = maxCh > tail.size() ? maxCh - tail.size() : 1;
+            if (lbl.size() > budget) lbl = lbl.substr(0, budget - 1) + "\xE2\x80\xA6";
+            lbl += tail;
             dl->AddText(ImVec2(p0.x + 10.0f * S * z, p0.y + nodeH * 0.46f),
                 ImGui::ColorConvertFloat4ToU32(
                     ImVec4(palette.text[0], palette.text[1], palette.text[2], 1.0f)), lbl.c_str());
@@ -1324,6 +1159,8 @@ static void drawAgentDagCanvas(AppState& st, int verbosity) {
             ImGui::TextDisabled("%s%s%s%s", agKindTag(n.kind),
                 n.actor.empty() ? "" : " · ", n.actor.c_str(),
                 n.latencyMs >= 0 ? (" · " + std::to_string(n.latencyMs) + " ms").c_str() : "");
+            if (hidFail)
+                ImGui::TextDisabled("a step inside this collapsed branch failed");
             if (!n.refId.empty())
                 ImGui::TextDisabled("click to open this sub-agent's chat");
             ImGui::EndTooltip();
@@ -1478,8 +1315,12 @@ static void drawAgentHubRows(AppState& st, const AdaptiveSurface& surf, float li
 //   0 = node titles only · 1 = + detail lines · 2 = + actor/latency, counts, full text.
 static void drawAgentHubView(AppState& st) {
     const float S = ui::uiScale;
-    const bool  busy = st.convRunning(st.activeConvId());
+    const std::string convId = st.activeConvId();
+    const bool  busy = st.convRunning(convId);
     const int   verbosity = aiUiVerbosity();
+    // The execution trace is scoped to the VIEWED conversation: a background chat's run builds
+    // its own tree and never blanks or hijacks this one.
+    AgentDagStore& dag = agStore(convId);
 
     pollSubagentList(st);   // registry snapshot + auto-pop (throttled, single in-flight)
 
@@ -1510,19 +1351,19 @@ static void drawAgentHubView(AppState& st) {
         else
             ImGui::Text("— %d active · %d parked", live, total - live);
         ImGui::PopStyleColor();
-        if (verbosity >= 2 && !s_agdag.empty()) {
+        if (verbosity >= 2 && !dag.empty()) {
             ImGui::SameLine(0, 14.0f * S);
             ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
             ImGui::Text("%d tool call%s · %d thought%s · %d context inject%s",
-                        s_agdag.toolCount,   s_agdag.toolCount == 1 ? "" : "s",
-                        s_agdag.thoughtCount,s_agdag.thoughtCount == 1 ? "" : "s",
-                        s_agdag.ctxCount,    s_agdag.ctxCount == 1 ? "" : "s");
+                        dag.toolCount,   dag.toolCount == 1 ? "" : "s",
+                        dag.thoughtCount,dag.thoughtCount == 1 ? "" : "s",
+                        dag.ctxCount,    dag.ctxCount == 1 ? "" : "s");
             ImGui::PopStyleColor();
         }
     }
     ImGui::Spacing();
 
-    const bool haveDag  = !s_agdag.empty();
+    const bool haveDag  = !dag.empty();
     const bool haveSubs = !s_sub.sessions.empty();
 
     if (!haveDag && !haveSubs) {
@@ -1549,210 +1390,12 @@ static void drawAgentHubView(AppState& st) {
     }
     if (haveDag) {
         sectionHeader("Execution trace");
-        drawAgentDagCanvas(st, verbosity);
+        drawAgentDagCanvas(st, dag, verbosity);
     } else if (!haveSubs) {
         // Registry has agents but the event stream hasn't produced spans yet — honest, not blank.
         emptyState("[>]", busy ? "Agent is starting\xE2\x80\xA6" : "No agent events yet",
                    "Tool calls, thoughts and context injections appear here as the run streams.");
     }
-}
-
-// ---- DAG canvas ------------------------------------------------------------------
-
-static void drawDagCanvas(AppState& st) {
-    const float S = ui::uiScale;
-    ImGui::BeginChild("##ai_dag_canvas", ImVec2(0, 0), ImGuiChildFlags_None,
-                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-    const ImVec2 cMin = ImGui::GetWindowPos();
-    const ImVec2 cSz  = ImGui::GetWindowSize();
-    const ImVec2 cMax(cMin.x + cSz.x, cMin.y + cSz.y);
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    dl->PushClipRect(cMin, cMax, true);
-
-    // Whole-canvas interaction surface: drag pans, wheel zooms (about the cursor).
-    ImGui::InvisibleButton("##dag_nav", cSz,
-                           ImGuiButtonFlags_MouseButtonLeft |
-                           ImGuiButtonFlags_MouseButtonMiddle);
-    if (ImGui::IsItemActive()) {
-        s_ai.pan.x += ImGui::GetIO().MouseDelta.x;
-        s_ai.pan.y += ImGui::GetIO().MouseDelta.y;
-    }
-    if (ImGui::IsItemHovered()) {
-        float wheel = ImGui::GetIO().MouseWheel;
-        if (wheel != 0.0f) {
-            float oldZ = s_ai.zoom;
-            s_ai.zoom = std::min(2.5f, std::max(0.35f, s_ai.zoom * (1.0f + wheel * 0.1f)));
-            // Keep the point under the cursor fixed while zooming.
-            ImVec2 m = ImGui::GetIO().MousePos;
-            ImVec2 local(m.x - cMin.x - s_ai.pan.x, m.y - cMin.y - s_ai.pan.y);
-            s_ai.pan.x -= local.x * (s_ai.zoom / oldZ - 1.0f);
-            s_ai.pan.y -= local.y * (s_ai.zoom / oldZ - 1.0f);
-        }
-    }
-
-    const float z     = s_ai.zoom;
-    const float nodeW = 190.0f * S * z, nodeH = 46.0f * S * z;
-    const float gapX  = 70.0f * S * z,  gapY  = 22.0f * S * z;
-    auto nodePos = [&](const DagNode& n) {
-        return ImVec2(cMin.x + s_ai.pan.x + 16.0f * S + n.layer * (nodeW + gapX),
-                      cMin.y + s_ai.pan.y + 16.0f * S + n.row   * (nodeH + gapY));
-    };
-
-    std::unordered_map<std::string, const DagNode*> byId;
-    for (const auto& n : s_ai.nodes) byId[n.id] = &n;
-
-    // Edges first (behind the boxes): dependency right-edge -> dependent left-edge beziers.
-    const ImU32 edgeCol = ImGui::ColorConvertFloat4ToU32(
-        ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 0.55f));
-    for (const auto& n : s_ai.nodes) {
-        ImVec2 pN = nodePos(n);
-        for (const auto& dep : n.requires) {
-            auto it = byId.find(dep);
-            if (it == byId.end()) continue;
-            ImVec2 pD = nodePos(*it->second);
-            ImVec2 a(pD.x + nodeW, pD.y + nodeH * 0.5f);   // out of the dependency
-            ImVec2 b(pN.x,         pN.y + nodeH * 0.5f);   // into the dependent
-            float  cx = std::max(24.0f * S * z, (b.x - a.x) * 0.5f);
-            dl->AddBezierCubic(a, ImVec2(a.x + cx, a.y), ImVec2(b.x - cx, b.y), b,
-                               edgeCol, 1.5f * S * z);
-        }
-    }
-
-    // Nodes: rounded status-colored boxes with kind + label.
-    for (const auto& n : s_ai.nodes) {
-        ImVec2 p0 = nodePos(n);
-        ImVec2 p1(p0.x + nodeW, p0.y + nodeH);
-        if (p1.x < cMin.x || p0.x > cMax.x || p1.y < cMin.y || p0.y > cMax.y) continue;
-        const float* sc = statusColor(n.status);
-        const float rr  = 6.0f * S * z;
-        dl->AddRectFilled(p0, p1,
-            ImGui::ColorConvertFloat4ToU32(
-                ImVec4(palette.panelBg[0], palette.panelBg[1], palette.panelBg[2], 0.92f)), rr);
-        dl->AddRectFilled(p0, ImVec2(p0.x + 4.0f * S * z, p1.y),
-            ImGui::ColorConvertFloat4ToU32(ImVec4(sc[0], sc[1], sc[2], 0.95f)), rr,
-            ImDrawFlags_RoundCornersLeft);
-        dl->AddRect(p0, p1,
-            ImGui::ColorConvertFloat4ToU32(ImVec4(sc[0], sc[1], sc[2], 0.65f)), rr, 0,
-            1.2f * S * z);
-
-        if (z > 0.55f) {
-            char head[64];
-            std::snprintf(head, sizeof(head), "%s  ·  %s",
-                          n.kind.empty() ? "node" : n.kind.c_str(), n.status.c_str());
-            dl->AddText(ImVec2(p0.x + 10.0f * S * z, p0.y + 5.0f * S * z),
-                ImGui::ColorConvertFloat4ToU32(ImVec4(sc[0], sc[1], sc[2], 1.0f)), head);
-            std::string lbl = n.label;
-            const size_t maxCh = (size_t)std::max(8.0f, 30.0f * z);
-            if (lbl.size() > maxCh) lbl = lbl.substr(0, maxCh - 1) + "\xE2\x80\xA6";
-            dl->AddText(ImVec2(p0.x + 10.0f * S * z, p0.y + nodeH * 0.48f),
-                ImGui::ColorConvertFloat4ToU32(
-                    ImVec4(palette.text[0], palette.text[1], palette.text[2], 1.0f)),
-                lbl.c_str());
-        }
-        // Full label + assignee on hover.
-        if (ImGui::IsMouseHoveringRect(p0, p1)) {
-            ImGui::BeginTooltip();
-            ImGui::TextUnformatted(n.label.c_str());
-            ImGui::TextDisabled("%s · %s%s%s", n.kind.c_str(), n.status.c_str(),
-                                n.assigned.empty() ? "" : " · agent: ",
-                                n.assigned.c_str());
-            ImGui::EndTooltip();
-        }
-    }
-
-    // Hint (bottom-left of the canvas).
-    dl->AddText(ImVec2(cMin.x + 8.0f * S, cMax.y - ImGui::GetTextLineHeight() - 6.0f * S),
-        ImGui::ColorConvertFloat4ToU32(
-            ImVec4(palette.textDisabled[0], palette.textDisabled[1],
-                   palette.textDisabled[2], 0.8f)),
-        "drag to pan · wheel to zoom");
-
-    dl->PopClipRect();
-    ImGui::EndChild();
-}
-
-// Kept for reference: the legacy buildgraph canvas view. The Session Plan tab now dispatches
-// to drawPlanBoardView (ui/ai/plan_board.h); this path is no longer wired into the tab strip.
-[[maybe_unused]] static void drawDagView(AppState& st) {
-    const float S = ui::uiScale;
-    if (!s_ai.runsScanned) scanRuns();
-
-    // M8 (per-session scoping): the Session Plan should show only the run(s) belonging to the
-    // active chat session. The selection plumbing is here (s_ai.selSession tracks the active
-    // conversation), but Conversation has no run_id yet (AI_WORKSPACE_V2_PLAN.md §2.1), so there
-    // is no session->run index to filter on. Until Phase 2 adds it, the picker still lists every
-    // persisted run.  TODO(Phase 2): filter s_ai.runs to runs whose session == s_ai.selSession.
-
-    // ---- toolbar: run picker + refresh + steer + worker status ----
-    ImGui::SetNextItemWidth(300.0f * S);
-    const char* preview = "No plans found";
-    std::string previewStr;
-    if (s_ai.selRun >= 0 && s_ai.selRun < (int)s_ai.runs.size()) {
-        const DagRun& r = s_ai.runs[s_ai.selRun];
-        previewStr = (r.mission.empty() ? r.runId.substr(0, 8) : r.mission);
-        preview = previewStr.c_str();
-    }
-    if (ImGui::BeginCombo("##ai_dag_run", preview)) {
-        for (int i = 0; i < (int)s_ai.runs.size(); ++i) {
-            const DagRun& r = s_ai.runs[i];
-            char item[192];
-            std::snprintf(item, sizeof(item), "%s  (%d node%s)##run%d",
-                          r.mission.empty() ? r.runId.substr(0, 8).c_str()
-                                            : r.mission.c_str(),
-                          std::max(0, r.nodeCount), r.nodeCount == 1 ? "" : "s", i);
-            if (ImGui::Selectable(item, i == s_ai.selRun)) {
-                s_ai.selRun = i;
-                loadRunGraph(r);
-                probeDagStatus(st, r.runId);
-            }
-        }
-        ImGui::EndCombo();
-    }
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Refresh")) { s_ai.runsScanned = false; s_ai.loadedRun.clear(); }
-    if (s_ai.selRun >= 0) {
-        const std::string& rid = s_ai.runs[s_ai.selRun].runId;
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Approve gate")) steerRun(st, rid, true);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("dag_approve — resume a gate-paused run");
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Abort")) steerRun(st, rid, false);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("dag_abort — reject the pending gate");
-        if (s_ai.statusRun != rid && !s_ai.statusPending) probeDagStatus(st, rid);
-    }
-    if (!s_ai.statusLine.empty()) {
-        const float* c = s_ai.statusOk ? palette.statusOk : palette.textDim;
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(c[0], c[1], c[2], 1.0f));
-        ImGui::TextUnformatted(s_ai.statusLine.c_str());
-        ImGui::PopStyleColor();
-    }
-    ImGui::Spacing();
-
-    // Reload the sidecar if selection changed or a steer invalidated it.
-    if (s_ai.selRun >= 0 && s_ai.loadedRun != s_ai.runs[s_ai.selRun].runId)
-        loadRunGraph(s_ai.runs[s_ai.selRun]);
-
-    if (s_ai.runs.empty()) {
-        emptyState("[#]", "No session plan yet",
-                   "Start a build in the conversation — this session's plan appears here as it runs.");
-        return;
-    }
-    if (!s_ai.loadErr.empty()) {
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(palette.statusErr[0], palette.statusErr[1],
-                   palette.statusErr[2], 1.0f));
-        ImGui::TextWrapped("%s", s_ai.loadErr.c_str());
-        ImGui::PopStyleColor();
-        return;
-    }
-    if (s_ai.nodes.empty()) {
-        emptyState("[#]", "This plan has no nodes",
-                   "Pick another run, or start a new mission from Copilot.");
-        return;
-    }
-    drawDagCanvas(st);
 }
 
 // ---- right-panel vertical nav ----------------------------------------------------
@@ -1876,7 +1519,7 @@ static void drawChatCenter(AppState& st, bool busy, bool canRun) {
                    "Describe what to build — the copilot plans, models and verifies it.");
     } else {
         chatDrawLog(st);
-        chatLogStickToBottom();
+        chatLogStickToBottom("ai.workspace");
     }
     ImGui::EndChild();
     ImGui::PopStyleColor();
@@ -2007,11 +1650,12 @@ static void drawViewPane(AppState& st, bool busy) {
         glassPanel(dl, wRect, GlassLevel::Thin, 10.0f * S, surf);
     }
 
-    // Autopopulate (agent.ui_follow_active_session): a NEW live run yanks the panel to the
-    // Agent Hub view so the streaming roster + execution trace show without manual picking.
-    if (aiFollowActiveSession() && !s_agdag.runId.empty() &&
-        s_agdag.runId != s_ai.lastAutoRun) {
-        s_ai.lastAutoRun = s_agdag.runId;
+    // Autopopulate (agent.ui_follow_active_session): a NEW live run in the VIEWED conversation
+    // yanks the panel to the Agent Hub view so the streaming roster + execution trace show
+    // without manual picking (a background chat's run never steals the panel).
+    const std::string& liveRun = agStore(st.activeConvId()).runId;
+    if (aiFollowActiveSession() && !liveRun.empty() && liveRun != s_ai.lastAutoRun) {
+        s_ai.lastAutoRun = liveRun;
         s_ai.view        = 0;
     }
 
@@ -2086,11 +1730,6 @@ void drawAiWorkspace(AppState& st) {
     // drawn while the AI tab is active, so flush streaming chat here too — a crash mid-turn
     // keeps the assistant text on disk (drafts ride the shared composer's savePromptDraft).
     maybePersistChatHistoryDebounced(st, /*force=*/false);
-
-    // M8 plumbing: bind the Session Plan scope to the active chat session's id.
-    s_ai.selSession = (st.activeConv >= 0 && st.activeConv < (int)st.conversations.size())
-                          ? st.conversations[st.activeConv].id
-                          : std::string();
 
     // v3 layout (Hunter's directive): MAIN CHAT on the left, everything else in the right
     // utility panel — a vertical nav menu + the selected view. No sessions rail, no bottom

@@ -387,6 +387,11 @@ struct JobState {
     // Provider/loop failure detail (HTTP body excerpt, auth message, etc.). Prefer this over
     // a bare stopReason when composing the chat error card — empty on clean finishes.
     std::string errorDetail;
+    // The short actionable sentence core/agent derives from the SAME failure
+    // (humanize_provider_error) — e.g. "Provider not signed in. Open Settings > AI > Accounts."
+    // Carried ALONGSIDE errorDetail, never as a fallback for it: errorDetail is the raw
+    // supporting text, this is the headline the error card leads with.
+    std::string errorHuman;
     // WS3: a true-assembly design run builds the parts in their own docs and saves a fresh
     // assembly .step+ rather than mutating the active doc. createdDocPath is that file (absolute);
     // the drain opens it as a NEW tab via the requestOpenPath pump (assembly opens route to Python).
@@ -616,6 +621,13 @@ struct ChatMsg {
     std::string model;             // assistant turn: model id at run start (label); empty = plain "Assistant"
     int errKind = ERR_NONE;        // ERR_CAD = generated code didn't build (calm, amber);
                                    // ERR_SYSTEM = app/runtime/provider failure (red)
+    // Error card fields (errKind != ERR_NONE). errorHuman is the short actionable sentence
+    // core/agent emits as error_human — rendered as the card HEADLINE. errorFull is the
+    // untruncated raw failure text (the drain keeps the whole thing; only the prose in `text`
+    // is shortened), shown in a code box behind the "Error details" chip.
+    std::string errorHuman;
+    std::string errorFull;
+    bool errFullOpen = false;      // user expanded the raw-detail box on this card
     std::string liveStatus;        // transient "Iteration N: building..." while running
     PlanInfo plan;                 // the build plan drafted before the code (plan mode)
     PlanState planState;           // multi-shape Plan/Objectives section (plan_state + normalizers)

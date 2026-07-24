@@ -47,6 +47,7 @@ void launchAgentRunV2(WorkerClient& w, std::shared_ptr<JobState> job,
         job->error.clear(); job->stl.clear(); job->info.clear();
         job->errorIsCad = false;
         job->converged = true; job->stopReason.clear(); job->errorDetail.clear();
+        job->errorHuman.clear();
         job->isMission = false; job->missionVerdict.clear();
         job->missionPartial = false;
         job->missionTasksCompleted = 0;
@@ -104,11 +105,15 @@ void launchAgentRunV2(WorkerClient& w, std::shared_ptr<JobState> job,
                 std::string sr = jstr(d, "stop_reason");
                 std::string ed = jstr(d, "error_detail");
                 if (ed.empty()) ed = jstr(d, "error");
-                if (ed.empty()) ed = jstr(d, "error_human");
-                if (!sr.empty() || !ed.empty()) {
+                // error_human is the actionable one-liner, NOT a stand-in for the raw detail —
+                // keep both so the card can headline the guidance and still show the body.
+                const std::string eh = jstr(d, "error_human");
+                if (ed.empty()) ed = eh;
+                if (!sr.empty() || !ed.empty() || !eh.empty()) {
                     std::lock_guard<std::mutex> jlk(job->mtx);
                     if (!sr.empty() && job->stopReason.empty()) job->stopReason = sr;
                     if (!ed.empty() && job->errorDetail.empty()) job->errorDetail = ed;
+                    if (!eh.empty() && job->errorHuman.empty()) job->errorHuman = eh;
                 }
             } else if (origKind == "provider_call") {
                 // Compact live status: "xai · grok-4.5 HTTP 200 412ms"
@@ -240,8 +245,12 @@ void launchAgentRunV2(WorkerClient& w, std::shared_ptr<JobState> job,
                     if (!sr.empty()) job->stopReason = sr;
                     std::string ed = result.value("error_detail", std::string());
                     if (ed.empty()) ed = result.value("error", std::string());
-                    if (ed.empty()) ed = result.value("error_human", std::string());
+                    // error_human is the actionable one-liner, NOT a stand-in for the raw
+                    // detail — keep both (headline + supporting body on the chat card).
+                    const std::string eh = result.value("error_human", std::string());
+                    if (ed.empty()) ed = eh;
                     if (!ed.empty()) job->errorDetail = ed;
+                    if (!eh.empty()) job->errorHuman = eh;
                     // Failed run with detail but no hard error string — still surface it so
                     // the chat card prefers errorDetail over the generic early-stop prose.
                     if (!job->converged && job->error.empty() && !job->errorDetail.empty()) {
@@ -317,6 +326,7 @@ void launchMissionRun(WorkerClient& w, std::shared_ptr<JobState> job,
         job->error.clear(); job->stl.clear(); job->info.clear();
         job->errorIsCad = false;
         job->converged = true; job->stopReason.clear(); job->errorDetail.clear();
+        job->errorHuman.clear();
         job->createdDocPath.clear();
         job->isMission = true; job->missionVerdict.clear();
         job->missionPartial = false;
@@ -550,7 +560,10 @@ void launchMissionRun(WorkerClient& w, std::shared_ptr<JobState> job,
                     if (!sr.empty()) job->stopReason = sr;
                     std::string ed = result.value("error_detail", std::string());
                     if (ed.empty()) ed = result.value("error", std::string());
+                    const std::string eh = result.value("error_human", std::string());
+                    if (ed.empty()) ed = eh;
                     if (!ed.empty()) job->errorDetail = ed;
+                    if (!eh.empty()) job->errorHuman = eh;
                     // Full mission failure (status failed) — surface as error so the drain
                     // doesn't treat empty verdict as a soft early-stop.
                     if (status == "failed") {

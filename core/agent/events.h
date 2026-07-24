@@ -71,8 +71,9 @@ json emit_agent_thought(RunEvents& ev,
                         const std::string& parent_id = "",
                         const std::string& actor = "");
 
-// Synthetic agent.tool_call after a successful op apply (Doing row with args_preview).
+// Synthetic agent.tool_call after an op apply (Doing row with args_preview).
 // args may be an ops array or a single-op object; tool_name/target may be empty to derive.
+// error_preview is the failure text (capped, emitted only when !ok) so the GUI can show WHY.
 json emit_agent_tool_call(RunEvents& ev,
                           const std::string& tool_name,
                           const std::string& target,
@@ -80,7 +81,8 @@ json emit_agent_tool_call(RunEvents& ev,
                           bool ok,
                           int latency_ms,
                           const std::string& parent_id = "",
-                          const std::string& actor = "");
+                          const std::string& actor = "",
+                          const std::string& error_preview = "");
 
 // Live viewport preview after a successful ops apply. Emits kind "doc.preview" with
 // {doc_id, revision, aicm_path}. No-op (returns null) when aicm_path is empty.

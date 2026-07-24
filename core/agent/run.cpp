@@ -14,6 +14,21 @@
 #include <set>
 #include <sstream>
 
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
+#include <cerrno>
+#include <cstring>
+#include <filesystem>
+#include <thread>
+#endif
+
 #include "agent/complexity.h"
 #include "agent/config.h"
 #include "agent/copilot_modes.h"
@@ -521,6 +536,218 @@ struct ProviderDeltaGuard {
     }
 };
 
+// ---- Admin turn seam: python worker "agent_admin_turn" RPC --------------------
+// core/hostd/worker_bridge.cpp already owns a persistent "spawn python -m
+// services.worker_main, stdio JSON-RPC" bridge — but it lives in the hostd
+// EXECUTABLE, which dlopens this agent code as a shared library (never the
+// other way around), so nothing in core/agent can reach that singleton across
+// the link boundary. This is a minimal, single-shot client for the ONE method
+// the admin branch needs (services/agent/worker_rpc.py:_agent_admin_turn),
+// mirroring the fork/pipe/PDEATHSIG idiom already used in this same static
+// library by OmpBridgeClient (agent/omp_bridge_client.cpp) and by hostd's
+// WorkerBridge. POSIX only; Windows always reports unavailable so the caller
+// falls back to the existing blocked response (never a build break, never a
+// crash — see call sites below).
+#if !defined(_WIN32)
+bool admin_worker_file_exists(const std::string& p) {
+    std::error_code ec;
+    return std::filesystem::is_regular_file(p, ec);
+}
+
+// Resolves the same way hostd's WorkerBridge does (CHUDWARE_PYTHON override ->
+// provisioned runtime venv -> system python3 -> bare "python3" for execlp's PATH
+// search) so behaviour is identical whether the worker is reached from hostd or
+// from here.
+std::string admin_worker_python_bin() {
+    if (const char* env = std::getenv("CHUDWARE_PYTHON"); env && *env) return std::string(env);
+    const char* home_c = std::getenv("HOME");
+    const std::string home = home_c ? home_c : "";
+    if (!home.empty()) {
+        const std::string venv = home + "/.local/share/Chudware/runtime/venv/bin/python";
+        if (admin_worker_file_exists(venv)) return venv;
+    }
+    for (const char* cand : {"/usr/bin/python3", "/usr/local/bin/python3", "/usr/bin/python"})
+        if (admin_worker_file_exists(cand)) return cand;
+    return "python3";  // execlp PATH search in the forked child
+}
+
+std::string admin_worker_repo_root() {
+    if (const char* env = std::getenv("CHUDWARE_REPO"); env && *env) return std::string(env);
+    const char* home_c = std::getenv("HOME");
+    return home_c ? std::string(home_c) + "/Repositories/CAD" : std::string(".");
+}
+
+// Spawns `python -m services.worker_main`, sends ONE {"id":1,"method":
+// "agent_admin_turn",...} line, relays every streamed {"event":...,"data":...}
+// notification onto `events` as it arrives (same live stream the rest of the
+// run uses), and fills `turn_out` with the handler's `turn` object on success.
+// Returns false (with `err` set) on ANY transport failure, timeout, or a
+// worker-reported ok:false (offline mode, no provider, turn exception, ...) —
+// the caller's contract is to treat every false return identically: fall back
+// to the blocked response.
+bool call_admin_worker_turn(const std::string& request, const std::string& run_id,
+                            RunEvents& events, json& turn_out, std::string& err) {
+    const std::string python = admin_worker_python_bin();
+    if (python.find('/') != std::string::npos && !admin_worker_file_exists(python)) {
+        err = "python runtime not found at " + python;
+        return false;
+    }
+    const std::string repo = admin_worker_repo_root();
+
+    int out_pipe[2], in_pipe[2];
+    if (::pipe(out_pipe) != 0 || ::pipe(in_pipe) != 0) {
+        err = std::string("pipe() failed: ") + std::strerror(errno);
+        return false;
+    }
+    const pid_t parent_pid = ::getpid();
+    pid_t pid = ::fork();
+    if (pid < 0) {
+        err = std::string("fork() failed: ") + std::strerror(errno);
+        ::close(out_pipe[0]); ::close(out_pipe[1]); ::close(in_pipe[0]); ::close(in_pipe[1]);
+        return false;
+    }
+    if (pid == 0) {
+        ::setpgid(0, 0);
+#if defined(__linux__)
+        ::prctl(PR_SET_PDEATHSIG, SIGKILL);
+        if (::getppid() != parent_pid) _exit(1);
+#else
+        (void)parent_pid;
+#endif
+        ::dup2(in_pipe[0], STDIN_FILENO);
+        ::dup2(out_pipe[1], STDOUT_FILENO);
+        ::close(in_pipe[0]); ::close(in_pipe[1]); ::close(out_pipe[0]); ::close(out_pipe[1]);
+#if defined(__linux__)
+        ::close_range(3, ~0U, 0);  // never leak the host process's own fds into the worker
+#endif
+        if (!repo.empty()) { if (::chdir(repo.c_str()) != 0) { /* exec from cwd; worker import fails clearly */ } }
+        ::execlp(python.c_str(), python.c_str(), "-m", "services.worker_main", (char*)nullptr);
+        _exit(127);
+    }
+    ::setpgid(pid, pid);
+    ::close(in_pipe[0]);
+    ::close(out_pipe[1]);
+    ::fcntl(out_pipe[0], F_SETFL, O_NONBLOCK);
+    const int rd = out_pipe[0];
+    const int wr = in_pipe[1];
+
+    auto reap = [&](bool graceful) {
+        if (graceful) {
+            for (int i = 0; i < 100; ++i) {
+                int status = 0;
+                pid_t r = ::waitpid(pid, &status, WNOHANG);
+                if (r == pid || (r < 0 && errno == ECHILD)) return;
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+        }
+        ::kill(pid, SIGKILL);
+        ::waitpid(pid, nullptr, 0);
+    };
+
+    const json req = {{"id", 1}, {"method", "agent_admin_turn"},
+                      {"params", json{{"request", request}, {"run_id", run_id}}}};
+    const std::string line = req.dump() + "\n";
+    bool wrote = true;
+    {
+        const char* p = line.data();
+        size_t left = line.size();
+        while (left > 0) {
+            ssize_t n = ::write(wr, p, left);
+            if (n < 0) { if (errno == EINTR) continue; wrote = false; break; }
+            if (n == 0) { wrote = false; break; }
+            p += n; left -= static_cast<size_t>(n);
+        }
+    }
+    ::close(wr);  // EOF once we're answered -> the worker's `for line in sys.stdin` loop exits cleanly
+    if (!wrote) {
+        err = "write to admin worker failed";
+        ::close(rd);
+        reap(false);
+        return false;
+    }
+
+    // A bounded project_organizer turn (up to 30 tool calls) genuinely needs
+    // minutes, not the sub-second budget of a status/list RPC — 5 min ceiling.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(5);
+    std::string read_buf;
+    bool got_final = false;
+    bool ok_final = false;
+    for (;;) {
+        size_t nl = read_buf.find('\n');
+        if (nl == std::string::npos) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                err = "timeout waiting for admin worker response";
+                break;
+            }
+            struct pollfd pfd { rd, POLLIN, 0 };
+            int pr = ::poll(&pfd, 1, 200);
+            if (pr < 0) { if (errno == EINTR) continue; err = "poll() failed"; break; }
+            if (pr == 0) {
+                int status = 0;
+                pid_t r = ::waitpid(pid, &status, WNOHANG);
+                if (r == pid || (r < 0 && errno == ECHILD)) { err = "admin worker exited early"; break; }
+                continue;
+            }
+            char chunk[4096];
+            ssize_t got = ::read(rd, chunk, sizeof(chunk));
+            if (got > 0) { read_buf.append(chunk, static_cast<size_t>(got)); continue; }
+            if (got == 0) { err = "admin worker closed stdout"; break; }
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;
+            err = std::string("read() failed: ") + std::strerror(errno);
+            break;
+        }
+        const std::string resp_line = read_buf.substr(0, nl);
+        read_buf.erase(0, nl + 1);
+        if (resp_line.empty()) continue;
+        json j;
+        try {
+            j = json::parse(resp_line);
+        } catch (...) {
+            continue;  // ignore stray non-JSON noise on stdout
+        }
+        if (!j.is_object() || !j.contains("id") || !j["id"].is_number_integer() ||
+            j["id"].get<int>() != 1)
+            continue;
+        if (j.contains("event") && !j.contains("ok")) {
+            // Streamed agent-turn notification: {"id":1,"event":kind,"data":payload}.
+            // Relay onto THIS run's event stream so the GUI renders the turn live,
+            // the same way every other stage's events already do.
+            json payload = j.value("data", json::object());
+            std::string kind = payload.is_object() ? payload.value("kind", std::string("agent.admin_event"))
+                                                    : std::string("agent.admin_event");
+            if (payload.is_object()) payload.erase("kind");
+            events.emit(kind, payload);
+            continue;
+        }
+        got_final = true;
+        if (j.value("ok", false)) {
+            json result = j.value("result", json::object());
+            if (result.is_object() && result.value("ok", false) && result.contains("turn")) {
+                turn_out = result["turn"];
+                ok_final = true;
+            } else {
+                err = result.is_object() ? result.value("reason", std::string("agent_admin_turn declined"))
+                                         : std::string("agent_admin_turn declined");
+            }
+        } else {
+            const auto it = j.find("error");
+            err = (it != j.end() && it->is_string()) ? it->get<std::string>()
+                                                      : std::string("agent_admin_turn transport error");
+        }
+        break;
+    }
+    ::close(rd);
+    reap(got_final);
+    return ok_final;
+}
+#else   // _WIN32
+bool call_admin_worker_turn(const std::string&, const std::string&, RunEvents&, json&,
+                            std::string& err) {
+    err = "admin worker bridge unavailable on this platform";
+    return false;
+}
+#endif  // !_WIN32
+
 }  // namespace
 
 json run_design(const std::string& request, const std::string& doc_id, const json& provider_cfg,
@@ -700,14 +927,18 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
 
     RunEvents events(run_id, emit);
 
-    // ---- PRE-FLIGHT: refuse non-modeling work before anything is created ----
-    // Deterministic, LLM-independent. A request dominated by project/file/PLM
+    // ---- PRE-FLIGHT: route project/file/PLM admin work to a real turn, not the ----
+    // ---- geometry pipeline (or refuse it, if nothing can execute it) ----
+    // Deterministic, LLM-independent detection. A request dominated by project/file/PLM
     // administration cues ("clean up the folders, move the unrelated .step files out,
-    // deprecate the old parts, track it in PLM") has no geometry in it. Historically
-    // it fell through to the default Modeling domain and the planner turned each admin
-    // step into an extruded plate. Bail out here — before the FILE-FIRST doc save —
-    // so no document, no feature and no file is created. Sub-runs are exempt: their
-    // request text is a parent-authored task, already vetted.
+    // deprecate the old parts, track it in PLM") has no geometry in it. Historically it
+    // fell through to the default Modeling domain and the planner turned each admin step
+    // into an extruded plate. Caught here — before the FILE-FIRST doc save — so no
+    // document, no feature and no file is created by the modeling pipeline for it.
+    // Offline / worker-unreachable degrades to a blocked refusal (see below); otherwise
+    // it now actually runs (project_organizer role turn via the python worker) instead of
+    // just telling the user to do it manually. Sub-runs are exempt: their request text is
+    // a parent-authored task, already vetted.
     if (!is_sub_run && is_admin_request(request)) {
         const std::string why = capability_request_reason(request);
         const std::string human =
@@ -720,14 +951,49 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
                                        {"reason", why},
                                        {"tool_classes", json::array()},
                                        {"context_sheets", json::array()}});
-        events.emit("run_finished", json{{"status", "blocked"},
-                                         {"stop_reason", "non_modeling_request"},
-                                         {"error_detail", why}});
+
+        auto blocked_response = [&]() -> json {
+            events.emit("run_finished", json{{"status", "blocked"},
+                                             {"stop_reason", "non_modeling_request"},
+                                             {"error_detail", why}});
+            return json{{"run_id", run_id},
+                        {"status", "blocked"},
+                        {"stop_reason", "non_modeling_request"},
+                        {"error_detail", why},
+                        {"error_human", human},
+                        {"doc_id", doc_id}};
+        };
+
+        // Offline runs never attempt the worker bridge — same refusal as before.
+        if (offline) return blocked_response();
+
+        // Execute instead of refuse: hand the request to a bounded
+        // project_organizer role turn (fs/plm/shell tools) over the python
+        // worker's agent_admin_turn RPC (services/agent/worker_rpc.py). Any
+        // failure to reach/complete it (worker unavailable, spawn failure,
+        // timeout, the worker's OWN offline check, ...) falls back to the
+        // EXACT same blocked response as before — never a crash, never a
+        // silent hang.
+        json turn;
+        std::string worker_err;
+        if (!call_admin_worker_turn(request, run_id, events, turn, worker_err)) {
+            events.emit("run_note", json{{"note", "admin worker turn unavailable"},
+                                         {"reason", worker_err}});
+            return blocked_response();
+        }
+
+        const bool turn_ok = turn.value("success", false);
+        const std::string stop_reason = turn.value("stop_reason", std::string("unknown"));
+        const std::string status = turn_ok ? "completed" : "failed";
+        const std::string role = turn.value("role", std::string("project_organizer"));
+        events.emit("run_finished", json{{"status", status},
+                                         {"stop_reason", stop_reason},
+                                         {"role", role}});
         return json{{"run_id", run_id},
-                    {"status", "blocked"},
-                    {"stop_reason", "non_modeling_request"},
-                    {"error_detail", why},
-                    {"error_human", human},
+                    {"status", status},
+                    {"stop_reason", stop_reason},
+                    {"result", turn.value("result", json::object())},
+                    {"role", role},
                     {"doc_id", doc_id}};
     }
 

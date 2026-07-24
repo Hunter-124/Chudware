@@ -1355,6 +1355,67 @@ OFFICE_METHODS: dict[str, Callable] = {
 }
 
 
+# ──── agent_admin_turn worker RPC (harness overhaul: live-path admin execution) ────
+# core/agent/run.cpp's admin pre-flight branch detects a project/file/PLM
+# administration request (is_admin_request) but has no tool-calling loop of its
+# own (its pipeline is intake/plan/model — geometry only). This RPC is the seam
+# it calls out to: ONE bounded ``project_organizer`` role turn via
+# ``mission_dispatch.run_linear_role_turn`` (T-W32) — the same machinery a
+# "linear" ``route_request`` dispatch and every sub-agent spawn already use — so
+# fs/plm/shell tools resolve through the normal global tool registry instead of
+# refusing the request.
+
+
+def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
+    """``agent_admin_turn {request, run_id?} -> {ok, turn:{success, stop_reason,
+    result, role, allowed_tools}} | {ok:false, reason}``.
+
+    Streams turn events through ``_emit`` — worker_main.py's serve loop tags each
+    one with this request's id and pushes it as a ``{"event":...}`` line
+    interleaved with the final response, so a live caller (core/agent/run.cpp's
+    admin branch) relays them onto its own run-event stream exactly like the
+    provider_call / stage_* events any other run emits. Never raises: a
+    worker-unreachable/offline caller MUST get a clean ``ok:false`` to fall back
+    on, not a crash.
+    """
+    request = (params or {}).get("request", "")
+    if not isinstance(request, str) or not request.strip():
+        return {"ok": False, "reason": "agent_admin_turn: empty request"}
+    run_id = (params or {}).get("run_id") or None
+
+    try:
+        from services.agent import config as agent_config  # noqa: PLC0415
+        from services.agent.mission_dispatch import run_linear_role_turn  # noqa: PLC0415
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"agent_admin_turn: import failed: {exc}"}
+
+    try:
+        provider = agent_config.get_provider(role="project_organizer")
+    except agent_config.OfflineModeError as exc:
+        return {"ok": False, "reason": f"offline: {exc}"}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"agent_admin_turn: no provider: {exc}"}
+
+    def _on_event(kind: str, payload) -> None:
+        data = dict(payload) if isinstance(payload, dict) else {"payload": payload}
+        data["kind"] = kind
+        _emit(data)
+
+    try:
+        turn = run_linear_role_turn(
+            request, "project_organizer", provider,
+            on_event=_on_event, run_id=run_id,
+        )
+        return {"ok": True, "turn": turn}
+    except Exception as exc:  # noqa: BLE001 — never raise across the worker seam
+        return {"ok": False, "reason": f"agent_admin_turn failed: {type(exc).__name__}: {exc}"}
+
+
+ADMIN_METHODS: dict[str, Callable] = {
+    "agent_admin_turn": _agent_admin_turn,
+}
+
+
 # Merged registration table (engine_oracle/worker.py does ``_METHODS.update``).
 WORKER_METHODS: dict[str, Callable] = {}
 WORKER_METHODS.update(SUBSCRIPTION_METHODS)
@@ -1364,3 +1425,4 @@ WORKER_METHODS.update(TRIGGERS_METHODS)
 WORKER_METHODS.update(ROLE_MODELS_METHODS)
 WORKER_METHODS.update(BENCH_METHODS)
 WORKER_METHODS.update(OFFICE_METHODS)
+WORKER_METHODS.update(ADMIN_METHODS)

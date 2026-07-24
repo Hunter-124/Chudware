@@ -4,15 +4,18 @@ Behaviour
 ---------
 - If pycolmap is NOT installed: assert graceful skip envelope (ok=False,
   reason="backend_not_provisioned").  Test PASSES — does not error.
-- If pycolmap IS installed: run on the bracket_fixture renders and assert
-  ≥6/8 images registered.
+- If pycolmap IS installed: run on the bracket_fixture renders and assert all
+  but one of them registered.
 
-The bracket_fixture is at corpora/reveng/bracket_fixture/ (8 PNG renders +
-camera_poses.json).  The test locates it relative to the repo root via
-CHUDWARE_ROOT env var (defaults to two levels above this file).
+The bracket_fixture is at corpora/reveng/bracket_fixture/ (render_*.png plus
+camera_poses.json and ground_truth.json).  The render count is read from
+ground_truth.json so it cannot drift away from what is committed.  The test
+locates the corpus relative to the repo root via the CHUDWARE_ROOT env var
+(defaults to three levels above this file).
 """
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -31,8 +34,25 @@ def _repo_root() -> Path:
 
 
 FIXTURE_DIR = _repo_root() / "corpora" / "reveng" / "bracket_fixture"
-RENDER_COUNT = 8  # render_000.png … render_007.png (8 images in fixture)
-MIN_REGISTERED = 6
+
+
+def _fixture_render_count() -> int:
+    """Renders the committed fixture actually ships.
+
+    Read from ground_truth.json rather than hardcoded: this constant was pinned at 8
+    while the fixture only ever shipped 6 renders, so the guard below self-skipped and
+    the reconstruction assertion never ran against the committed corpus.
+    """
+    gt = FIXTURE_DIR / "ground_truth.json"
+    try:
+        with gt.open() as fh:
+            return int(json.load(fh)["render_count"])
+    except (OSError, ValueError, KeyError):
+        return len(sorted(FIXTURE_DIR.glob("render_*.png")))
+
+
+RENDER_COUNT = _fixture_render_count()
+MIN_REGISTERED = max(RENDER_COUNT - 1, 2)  # allow one view to genuinely fail SfM
 
 
 # ---------------------------------------------------------------------------
@@ -77,7 +97,7 @@ def test_availability_flag_matches_import():
 
 @pytest.mark.skipif(not PYCOLMAP_AVAILABLE, reason="pycolmap not installed")
 def test_sparse_reconstruction_on_fixture(tmp_path):
-    """With pycolmap installed, ≥6/8 bracket_fixture images must register."""
+    """With pycolmap installed, all-but-one bracket_fixture image must register."""
     if not FIXTURE_DIR.exists():
         pytest.skip(f"bracket_fixture not found at {FIXTURE_DIR}")
 

@@ -26,6 +26,63 @@ from .reveng_common import (
     _session_path,
 )
 
+
+def _extract_match_pct(payload):
+    """Dig the boolean-compare score out of a parametric-build payload.
+
+    ``reverse_engineer`` reports ``match_pct`` at the top level; the ML lane nests its
+    reverse_engineer result and cad_recode may report its own ``compare`` block, so probe
+    all three rather than silently persisting ``None`` for a build that WAS scored.
+    Returns ``None`` only when no lane produced a number (degraded compare).
+    """
+    if not isinstance(payload, dict):
+        return None
+    nested = [payload.get("match_pct")]
+    for key in ("compare", "reverse_engineer"):
+        sub = payload.get(key)
+        if isinstance(sub, dict):
+            nested.append(sub.get("match_pct"))
+    for probe in nested:
+        if isinstance(probe, (int, float)) and not isinstance(probe, bool):
+            return round(float(probe), 3)
+    return None
+
+
+def _persist_build_result(session_id: str, *, strategy: str, state: str,
+                          payload=None, reason=None, run_id=None) -> dict:
+    """Record what the parametric build actually produced under ``session["result"]``.
+
+    ``describe_reveng_result`` reads exactly this block — it is the ONLY place the
+    strategy and the compare score are written, so a build that ran unscored stays
+    visibly unscored (``scored: false``) instead of reporting a fabricated number.
+    """
+    s = _load_session(session_id)
+    if s is None:
+        return {}
+    payload = payload if isinstance(payload, dict) else {}
+    match_pct = _extract_match_pct(payload)
+    block = s.setdefault("result", {})
+    block.update({
+        "strategy": strategy,
+        "state": state,
+        "match_pct": match_pct,
+        "scored": match_pct is not None,
+        "doc_id": payload.get("doc_id") or (s.get("artifacts") or {}).get("doc_id"),
+        "built_at": _now_iso(),
+    })
+    if run_id:
+        block["run_id"] = run_id
+    if reason:
+        block["reason"] = str(reason)
+    else:
+        block.pop("reason", None)
+    if payload.get("summary"):
+        block["summary"] = payload["summary"]
+    else:
+        block.pop("summary", None)
+    _save_session(s)
+    return block
+
 def register_reveng_build_tools(mcp: FastMCP) -> None:
     """Reverse-engineering reconstruction MCP tools (T-RF8 split of reveng_tools.py): reconstruct, single_photo, fit_primitives, build_parametric, attach_result, scan-mesh import, bundle export, make_part_from_library, research_source."""
 
@@ -254,6 +311,12 @@ def register_reveng_build_tools(mcp: FastMCP) -> None:
                     session_id, "reveng_scan", _SCAN_NODE_STAGE,
                     strategy=rebuild_strategy,
                 )
+                # Async lane: record the strategy now so describe_reveng_result can say
+                # "running" instead of "never built". The score lands when it finishes.
+                _persist_build_result(
+                    session_id, strategy=rebuild_strategy, state="running",
+                    run_id=result.get("run_id"),
+                )
                 return _dumps({"ok": True, **result})
             except Exception as e:
                 return _err(e)
@@ -281,6 +344,13 @@ def register_reveng_build_tools(mcp: FastMCP) -> None:
                     payload.get("detail") if isinstance(payload, dict)
                     else "parametric build failed"
                 )
+            built = _persist_build_result(
+                session_id, strategy=rebuild_strategy,
+                state="built" if ok else "failed", payload=payload,
+                reason=None if ok else (out.get("reason") or out.get("error")),
+            )
+            out["match_pct"] = built.get("match_pct")
+            out["scored"] = bool(built.get("scored"))
             return _dumps(out)
         except Exception as e:
             return _err(e)
@@ -321,6 +391,9 @@ def register_reveng_build_tools(mcp: FastMCP) -> None:
             geometry_ref = doc_id or mesh_path  # best available geometry handle
 
             # RE-23: write sidecar so RevengResultAdapter can serve this PartRecord.
+            # Carries the build's own verdict (strategy + boolean-compare score) so a
+            # consumer of the sidecar alone knows how trustworthy this geometry is.
+            built = s.get("result") or {}
             sidecar = {
                 "schema": "aicad.reveng_result/1",
                 "session_id": session_id,
@@ -328,6 +401,10 @@ def register_reveng_build_tools(mcp: FastMCP) -> None:
                 "name": s.get("name", part_ref),
                 "doc_id": doc_id,
                 "mesh_path": mesh_path,
+                "strategy": built.get("strategy"),
+                "match_pct": built.get("match_pct"),
+                "scored": bool(built.get("scored")),
+                "mesh_fallback": bool((s.get("honesty") or {}).get("approximate")),
                 "attached_at": _now_iso(),
             }
             sidecar_path = _session_path(session_id) / "reveng_result.json"

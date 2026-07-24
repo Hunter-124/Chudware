@@ -27,6 +27,19 @@ namespace core {
 // poll of the daemon socket).
 void engineEventsTick(AppState& st);
 
+// Follow a reveng reconstruction's live progress (contracts/reveng.md §4).
+//
+// ui::reveng::kickReconstruct() calls this the moment it fires reveng_reconstruct. Until the
+// launch RPC lands, engineEventsTick() tails the mission's EventJournal (events.jsonl) and
+// translates each aicad.reveng_events/1 record into ui::reveng::feedRevEngEvent(), so the
+// Reconstruct stage's progress bar / sub-step track / elapsed clock advance DURING the run
+// instead of only when the coarse stage-badge poll next fires. See engine_events.cpp for why
+// the journal — and not the agent.event push or WorkerClient::EventFn streaming — is the only
+// channel that can carry these events today.
+//
+// An empty sessionId stops the tail. Cheap when idle (one empty-string test per frame).
+void watchRevEngReconstruct(const std::string& sessionId);
+
 // Reveal read-only mirror tabs for docs the GUI itself just caused the daemon to
 // open (recovery_open). The daemon's doc.opened fanout deliberately EXCLUDES the
 // calling client — the RPC return value is how the caller learns what it opened —

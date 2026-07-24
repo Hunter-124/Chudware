@@ -52,14 +52,23 @@ so workers load only their own subsystem's knowledge.
 | 3D viewport, rendering, picking, camera, overlays/HUD | `host/src/ui/viewport_panel.cpp`, `host/src/renderer.cpp`, `host/src/render/` | `.claude/skills/gui-viewport/SKILL.md` |
 | Ribbon tabs/buttons, feature tree, PropertyManager forms, command routing | `host/src/ui/ribbon_def.cpp`, `ui/widgets/ribbon.cpp`, `ui/feature_tree.cpp`, `ui/property_manager.cpp`, `ui/pm_forms.cpp` | `.claude/skills/gui-ribbon-commands/SKILL.md` |
 | 2D sketcher, 3D sketcher, constraints UI, dimensions | `host/src/ui/sketch_mode.cpp` (8.9k LOC), `ui/sketch3d_mode.cpp` | `.claude/skills/gui-sketch/SKILL.md` |
-| Workspace tabs: Parts Library, Assembly, CAM, ECAD, PLM, RevEng, AI/Activity, Drawing, Simulation | `host/src/ui/parts/`, `ui/asm_panels.cpp`, `ui/cam/`, `ui/ecad/`, `ui/plm/`, `ui/reveng/`, `ui/ai/`, `ui/drawing_panel.cpp`, `ui/sim_manager.cpp` | `.claude/skills/gui-workspaces/SKILL.md` |
+| Workspace tabs: Parts Library, Assembly, CAM, ECAD, PLM, RevEng, AI/Activity, Drawing, Simulation | `host/src/ui/parts/`, `ui/asm_panels.cpp`, `ui/cam/`, `ui/ecad/`, `ui/plm/`, `ui/reveng/` (RevEng also reaches `host/src/platform/camera*.cpp` for capture work; its shared kit `ui/reveng/reveng_widgets.h` is frozen — see below), `ui/ai/`, `ui/drawing_panel.cpp`, `ui/sim_manager.cpp` | `.claude/skills/gui-workspaces/SKILL.md` |
 | Theme/colors/glass styling, dock layout, DPI/metrics, dialogs/modals, status bar, title bar, toasts | `host/src/ui_theme.cpp`, `ui/layout.cpp`, `ui/metrics.h`, `ui/settings_modal.cpp` | `.claude/skills/gui-theme-layout/SKILL.md` |
 
 **Shared/hot files — integrator-owned.** `host/src/app.cpp` (frame loop / panel dispatch),
 `host/src/core/app_state.h` (central data model), `host/src/ui/ribbon_def.cpp` (append-only
-command table), `ui_theme.cpp/.h`, and anything in `contracts/`. At most ONE agent per wave
-may touch a given shared file; if several changes need the same one, either merge them into
-one agent or apply the shared-file edit yourself between waves. `contracts/` is append-only.
+command table), `host/src/ui/metrics.h` (append-only sizing tokens — now carries the `re*()`
+block the Reverse Engineering workspace sizes itself from; RE panel agents CALL `metrics::re*()`
+and never write pixel literals, but adding a token is an integrator edit), `ui_theme.cpp/.h`, and
+anything in `contracts/`. At most ONE agent per wave may touch a given shared file; if several
+changes need the same one, either merge them into one agent or apply the shared-file edit
+yourself between waves. `contracts/` is append-only.
+
+**Frozen shared contract — `host/src/ui/reveng/reveng_widgets.h`** (`ui::reveng::kit`). Every
+Reverse Engineering panel draws with this kit; its header is the vocabulary all RE agents code
+against. Panel agents CONSUME it and MUST NOT edit it — if a wave genuinely needs a new kit
+widget, that is one dedicated agent owning `reveng_widgets.h/.cpp` in an earlier wave, exactly
+like the icon-before-ribbon-button ordering.
 
 ## Waves
 

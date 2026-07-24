@@ -336,3 +336,227 @@ Added to `services/agent/routing.yaml` (and symlink `agent/routing.yaml`):
 ## 11. Embedded contract examples (for pytest validation)
 
 See `services/mcp/test_reveng_contract.py` — examples MUST validate against §2–§5 shapes.
+
+---
+
+# Contract: Reverse Engineering — v2 (RE-40, 2026-07-24)
+
+> Append-only extension of v1 per `contracts/README.md`. Everything in §0–§11 above still
+> holds **except** §7, which v2 supersedes (see §12.1 — the v1 `CameraBackend` no longer
+> compiles). Nothing else is renamed or removed; every addition below is additive.
+>
+> Motive: v1 described an honest pipeline but several seams were declared and never wired.
+> v2 records the seams as they are now actually implemented, and corrects two documented
+> shapes that did not match the code.
+
+## 12.1 `CameraBackend` v2 — SUPERSEDES §7
+
+`host/src/platform/camera.h`. The v1 interface was stills-only, negotiated no format, and
+exposed a single `lockExposure`. It could not serve photogrammetry: SfM needs the sensor's
+full resolution, and needs autofocus / auto-exposure / auto-white-balance **locked** so the
+intrinsics and colour response stay constant across a capture set.
+
+```cpp
+namespace chudware::platform {
+
+struct CameraInfo { std::string device_id, label, bus; };
+struct CameraMode { int width, height; double fps; uint32_t fourcc;
+                    std::string format_label; bool compressed; };
+struct OpenRequest { int width, height; double fps; bool prefer_max_resolution; };
+
+struct CameraFrame {
+    int width, height;
+    std::vector<uint8_t> rgba;   // row-major RGBA8, tightly packed
+    double timestamp_sec;
+    bool   synthetic;            // software-generated — MUST NOT be persisted as a capture
+    double sharpness;            // variance-of-Laplacian; -1 = unscored
+};
+
+enum class GrabResult { ok, again, device_lost, decode_failed, not_open };
+enum class CameraControl { Focus, Exposure, WhiteBalance, Gain, Zoom, Brightness };
+struct ControlState { bool supported, auto_capable, automatic; double value; /* 0..1 */ };
+
+class CameraBackend {
+public:
+    static std::unique_ptr<CameraBackend> create();      // V4L2 / MF / stub
+    virtual std::vector<CameraInfo> listDevices() = 0;
+    virtual std::vector<CameraMode> listModes(const std::string& device_id) = 0;
+    virtual bool open(const std::string& device_id, const OpenRequest&) = 0;
+    virtual void close() = 0;
+    virtual bool isOpen() const = 0;
+    virtual CameraMode activeMode() const = 0;
+    virtual std::string lastError() const = 0;
+    virtual GrabResult grabFrame(CameraFrame& out) = 0;
+    virtual ControlState getControl(CameraControl) = 0;
+    virtual bool setControl(CameraControl, double normalized_value) = 0;
+    virtual bool setControlAuto(CameraControl, bool automatic) = 0;
+    virtual bool lockForCapture() = 0;   // freeze focus+exposure+WB+gain
+};
+
+double frameSharpness(const CameraFrame&);
+inline constexpr double kSharpnessBlurThreshold = 100.0;
+}
+```
+
+Binding rules:
+
+- **`GrabResult::again` is the steady state**, not an error. It means the driver has no new
+  buffer queued. Callers MUST NOT reopen the device on `again`; reopen only on `device_lost`.
+- **`synthetic` is a hard gate.** A frame with `synthetic == true` MUST NOT be written into a
+  session, and MUST be visibly marked in any preview. Fail closed: treat a frame as synthetic
+  until a backend returns `ok` with `synthetic == false`.
+- `frameSharpness` is BT.601 luma on the 0–255 scale through the 3×3 Laplacian
+  `[0 1 0; 1 -4 1; 0 1 0]`, population variance — the same quantity as
+  `services/vision/frames.py:blur_score()`, so `kSharpnessBlurThreshold` (100.0) and
+  `frames.DEFAULT_BLUR_THRESHOLD` (100.0) mean the same thing on both sides of the seam.
+- Backend status: `camera_v4l2.cpp` is real (mmap streaming — `REQBUFS`/`QBUF`/`DQBUF`/
+  `STREAMON` — with YUYV/UYVY/YVYU/NV12/NV21/I420/YV12/GREY/RGB24/BGR24/MJPG decode).
+  `camera_mf.cpp` is real (Media Foundation source reader, `IAMCameraControl` +
+  `IAMVideoProcAmp`). `camera_stub.cpp` is the fallback, always sets `synthetic = true`, and
+  owns both the cross-platform `create()` factory and the `frameSharpness` definition.
+- MJPEG frames from UVC cameras that omit Huffman tables get a standard Annex-K DHT spliced in
+  before decode. This is load-bearing, not defensive: stb_image neither supplies default tables
+  nor rejects a DHT-less JPEG — it returns success with ~75% of the pixels wrong.
+
+## 12.2 `aicad.reveng_fits/1` additions — `fits_revision: 2`
+
+The schema string stays `aicad.reveng_fits/1`; the payload declares `fits_revision: 2`.
+Every v1 key is preserved. Geometry stays inside `params_mm`; semantics are entry-level.
+
+| addition | where | meaning |
+|---|---|---|
+| `fits_revision: 2` | top level | presence of the keys below |
+| `notes: [{stage, reason, hint}]` | top level | per-stage degradation (missing optional dep, unorientable normals) — never swallowed, never fatal |
+| `kind: "sphere"` | fit | `params_mm{center[3], radius, origin[3]}` |
+| `kind: "cone"` | fit | `params_mm{apex[3], axis[3], half_angle_rad, radius_at_base, height, origin[3]}` |
+| `role` | cylinder fit | `hole` \| `boss` \| `shaft` \| `unknown` — from radial normal orientation; `unknown` when normals are absent or ambiguous, never guessed |
+| `through` | cylinder fit | bool — does the bore span the local wall |
+| `depth_mm` | cylinder fit | axial run; for a through bore, the full local wall thickness |
+| `params_mm.base[3]` | cylinder fit | axis point at the low-`t` end of the patch (`origin` keeps its v1 meaning), so hole placement is expressible |
+| `role` | plane fit | `pocket` \| `pad` \| `unknown` |
+| `sections` | top level, sibling of `fits` | `[{station_mm, axis[3], polylines: [[[x,y],…]], area_mm2, closed, frame:{origin,e1,e2}}]` |
+
+`sections` replaces the v1 hardcoded `[]`. The slice plane is `{p : p·axis == station_mm}`;
+lift a 2-D point back to world as `origin + x·e1 + y·e2`. Areas are shoelace sums signed by
+nesting parity, so an internal bore subtracts from its enclosing loop.
+
+Multiple cylinders are now returned (iterative RANSAC peel), where v1 fitted exactly one.
+
+## 12.3 Scale — `reveng_set_scale` now computes
+
+v1 documented three `method` values but the implementation ignored `method` for all three and
+simply recorded the caller's number, so "automatic ArUco scale" and "type a number in" were the
+same code path. v2:
+
+| method | behaviour |
+|---|---|
+| `aruco_mat` | runs `services/vision/scale_solver.py:solve_scale_aruco()` — detects the marker across registered COLMAP views, triangulates its corners, derives `mm_per_unit` with a real `residual_pct` (corner-edge coefficient of variation). Marker spec defaults match what `reveng_print_scale_mat` prints. |
+| `two_point` | runs `solve_scale_two_point()` against the posed model. Refuses rather than silently picking view 0 when >1 image is registered and none is selected. |
+| `known_dim` | genuinely caller-supplied. `residual_pct` is `null`; `params.source` ∈ `caliper` \| `datasheet` \| `photo_fiducial` \| `guessed`. An absent source defaults to `guessed` **and** returns a `warnings[]` entry — §0 forbids silent guessing on fit-critical dimensions. |
+
+New failure reason: **`scale_needs_sparse`** — `aruco_mat` and `two_point` both require a
+registered sparse model. Clients MUST route the user to Reconstruct (or to `known_dim`) rather
+than rendering it as a generic error.
+
+All three write `session.scale = {method, mm_per_unit, residual_pct, detail, confirmed: false}`
+and append a provenance record. `detail` is a new solver passthrough.
+
+## 12.4 Mesh scale units — a corrected seam
+
+`session.scale.mm_per_unit` is, and always was, a **ratio**: reconstruction units × it = mm.
+`services/vision/mesh_cleanup.py:cleanup_mesh()` took `scale_mm`, which it implemented as
+"stretch the mesh's longest bbox dimension to equal this many mm" — a different quantity. Both
+call sites fed it the wrong one (a ratio in one, a fiducial marker's edge length in the other),
+so every mesh through the real pipeline was mis-scaled.
+
+`scale_mm` is **removed** (clean cutover, no alias). Replaced by two mutually-exclusive keyword
+parameters — supplying both is an error:
+
+- `mm_per_unit` — `factor = mm_per_unit`.
+- `target_longest_mm` — `factor = target_longest_mm / max(bbox_extent)` (the v1 behaviour, now
+  named for what it does).
+
+Result gains `scale_mode: "mm_per_unit" | "target_longest_mm" | null`. When neither is supplied
+the mesh is left in reconstruction units and the session records
+`artifacts.mesh_units: "reconstruction"` (vs `"mm"`), which also lands in provenance. **A mesh
+tagged `reconstruction` is not dimensionally usable** — clients MUST say so.
+
+## 12.5 `get_reveng_coverage` — measured vs estimated
+
+v1 returned a count proxy with `blur_flags` hardcoded to all-`false`. v2 adds:
+
+| key | meaning |
+|---|---|
+| `method` | `"pose_binned"` when camera poses were available and each registered view was binned into the nearest of the 11 shot-plan slots; `"count_proxy"` when only an image count was available |
+| `images` | `[{path, blur_score, blurred, index}]` — real variance-of-Laplacian scores, threshold 100.0 |
+| `mean_bin_error_deg`, per-image `bin_error_deg` | how well the plan fitted the observed views (`pose_binned` only) |
+| `notes` | why a pose bin was not possible (e.g. `.bin`-only COLMAP model, <2 registered views) |
+
+`blur_flags[i]` is true only where a still was actually measured below threshold; an unscored
+image is never reported as sharp. **Clients MUST surface `method`** — an estimated ring must not
+read as a measurement. `quality` is now derived from slot coverage and sharp fraction.
+
+A COLMAP world frame has arbitrary gauge, so slot binning first recovers the orbit centre, then
+fits the plan's rotation to the observed view directions before assigning slots.
+
+## 12.6 New tools — additions to §8
+
+These shipped without being recorded in §8. They are real, registered and user-reachable.
+
+#### `list_reveng_dims(session_id) → {ok, session_id, dims: [dim_row], sources: [str], scale_confirmed: bool, notes?: [str], hint?}`
+
+The Review stage's dimension ledger. `dim_row`:
+`{id, key, label, value_mm, tolerance_mm, source, provenance_method, honesty_tier, confirmed, fit_critical, required, note?, fit_summary?, image_index?, image_path?, photo_value_mm?}`
+
+- **`key`, not `id`, is the `confirm_dimensions` ledger key** to round-trip. `id` is positional.
+  Keys are lane-prefixed so they cannot collide: `datasheet.<label>[_N]`, `<feature>.<dim>_mm`,
+  `fit.<face_id>.diameter|length`, `fit.<a>_<b>.thickness`.
+- Rows are collected from datasheet candidates (`high`), web-scraped prose (`low`),
+  photo-fiducial measurements (whatever `measure.py` scored), user-typed confirmations (`high`,
+  superseding the photo read while preserving it as `photo_value_mm`), and primitive fits
+  (`medium` on a scaled mesh; `approximate` with `tolerance_mm: null` on an unscaled or
+  single-photo session).
+- A session with no dimensions returns `{ok: true, dims: []}` plus a `hint`. **Rows are never
+  fabricated.**
+
+#### `reveng_make_part_from_library(part_ref, part_number?, query?, auto_confirm_non_critical=true) → {ok, …}`
+
+Seed → research → run the `reveng_datasheet` mission → attach.
+
+#### `reveng_research_source(session_id, query?, part_number?, url?) → {ok, …}`
+
+Pull a datasheet/spec bundle into the session from the web.
+
+## 12.7 `describe_reveng_result` — `match_pct` is now written
+
+v1 always returned `match_pct: null` and `strategy: null` because no code ever wrote them.
+`reveng_build_parametric` now persists the strategy it used and the achieved `match_pct` into
+the session manifest and the `reveng_result.json` sidecar; `describe_reveng_result` reads them
+back and adds `scored: bool`.
+
+Clients MUST distinguish three states: **not built yet**, **built but unscored**
+(`scored: false`), and **built and scored**. A missing score is not a passing score.
+
+## 12.8 Transport — one tool surface, two transports
+
+`services/reveng/worker_rpc.py` was a hand-maintained 8-method subset **reimplementation**, so 13
+of the tools the desktop GUI called dead-ended at `"unknown method: X"` and most of the Reverse
+Engineering tab did nothing. It is now a thin adapter over the reveng MCP tool registry:
+`REVENG_WORKER_METHODS` is generated from a declared tool-name tuple, and every handler bridges
+to the same `@mcp.tool()` implementation the agent calls.
+
+Consequences that are now contract, not accident:
+
+- **Adding a reveng MCP tool exposes it to BOTH transports** via a one-line addition. There is no
+  second implementation to keep in sync.
+- `start_capture_session` / `stop_capture_session` share ONE session registry across the agent
+  and GUI transports (previously two process-local dicts that could not see each other). The
+  differing default is a pinned argument — the GUI pins `run_reconstruction=false`; the MCP tool
+  keeps its historical `true` for agents.
+
+## 12.9 Stage-event coverage
+
+§4's `stage` enum declares `dense`, `splat` and `mesh`, but the wired stage map emitted only
+`capture|scale|sparse|fit|parametric|review|deliver` — the dense/splat/mesh work happened
+silently inside the `sparse` node. Clients rendering a sub-step track MUST tolerate a stage
+listed in §4 never being emitted, and MUST NOT infer failure from its absence.

@@ -1700,11 +1700,16 @@ def register_photo_recon_tools(mcp: FastMCP) -> None:
 
             # Run photogrammetry reconstruction
             recon_dir = tempfile.mkdtemp(prefix="chudware_recon_")
-            scale_mm = getattr(session, "_scale_marker_mm", None)
+            # The marker's own physical edge length. It is NOT a mm-per-reconstruction-unit
+            # ratio and NOT the part's longest dimension, so it cannot be handed to
+            # cleanup_mesh as either — recovering scale from it needs the marker triangulated
+            # against the sparse model, which is what reveng_set_scale(method="aruco_mat")
+            # does. reconstruct() only records it alongside the result.
+            scale_marker_mm = getattr(session, "_scale_marker_mm", None)
             recon = _pg.reconstruct(
                 image_dir=work_dir,
                 out_dir=recon_dir,
-                scale_mm=scale_mm,
+                scale_mm=scale_marker_mm,
             )
             result["reconstruction"] = recon
 
@@ -1712,7 +1717,12 @@ def register_photo_recon_tools(mcp: FastMCP) -> None:
             if recon.get("ok") and recon.get("mesh_path"):
                 raw_mesh = recon["mesh_path"]
                 cleaned_path = _os.path.join(recon_dir, "cleaned_mesh.obj")
-                cleanup = _mc.cleanup_mesh(raw_mesh, cleaned_path, scale_mm=scale_mm)
+                cleanup = _mc.cleanup_mesh(
+                    raw_mesh,
+                    cleaned_path,
+                    mm_per_unit=None,
+                    target_longest_mm=None,
+                )
                 result["cleanup"] = cleanup
                 if cleanup.get("ok"):
                     mesh_path = cleanup["mesh_path"]
@@ -1724,9 +1734,16 @@ def register_photo_recon_tools(mcp: FastMCP) -> None:
                     result["cleanup_skipped"] = cleanup.get("reason")
 
             result["mesh_path"] = mesh_path
+            result["mesh_units"] = "reconstruction"
+            result["scale_marker_mm"] = scale_marker_mm
 
             steps = []
             if mesh_path:
+                steps.append(
+                    "the mesh is in reconstruction units, NOT millimetres — start a reveng "
+                    "session and call reveng_set_scale(method='aruco_mat') (or 'two_point' / "
+                    "'known_dim') before using any dimension off it"
+                )
                 steps.append(
                     f"call reverse_engineer(source={mesh_path!r}) to convert the mesh "
                     "into an editable parametric feature tree"

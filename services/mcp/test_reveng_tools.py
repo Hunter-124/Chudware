@@ -404,7 +404,35 @@ class TestRevengSessionLifecycle(_FakeMCPTestBase):
         self.assertIsInstance(r["crops"], list)
         self.assertIn("session", r)
 
-    def test_set_scale_two_point(self):
+    def _write_sparse_model(self, sid):
+        """Write a minimal COLMAP text model whose geometry has a known metric answer.
+
+        One PINHOLE camera (f=500, c=320/240) at the origin looking down +Z. Two sparse
+        points 2.0 reconstruction-units apart project to pixels (270, 240) and (370, 240),
+        so clicking those two with a real separation of 50 mm must solve mm_per_unit = 25.
+        """
+        sparse = Path(self.tmp) / sid / "sparse" / "0"
+        sparse.mkdir(parents=True, exist_ok=True)
+        (sparse / "cameras.txt").write_text(
+            "# Camera list\n1 PINHOLE 640 480 500 500 320 240\n"
+        )
+        (sparse / "images.txt").write_text(
+            "# Image list\n1 1 0 0 0 0 0 0 1 img_001.jpg\n100 200 -1\n"
+        )
+        (sparse / "points3D.txt").write_text(
+            "# 3D point list\n"
+            "1 -1.0 0.0 10.0 255 0 0 0.5 1 0\n"
+            "2 1.0 0.0 10.0 0 255 0 0.5 1 1\n"
+            "3 5.0 5.0 10.0 0 0 255 0.5 1 2\n"
+        )
+        sess_json = Path(self.tmp) / sid / "session.json"
+        doc = json.loads(sess_json.read_text())
+        doc["artifacts"]["sparse_dir"] = str(sparse)
+        sess_json.write_text(json.dumps(doc, indent=2))
+        return sparse
+
+    def test_set_scale_two_point_needs_sparse(self):
+        """Without a reconstruction there is nothing to scale — refuse, never echo the input."""
         create = _call(self.tools, "reveng_start_session", name="Bracket")
         sid = create["session_id"]
         r = _call(self.tools, "reveng_set_scale",
@@ -413,10 +441,40 @@ class TestRevengSessionLifecycle(_FakeMCPTestBase):
                   params={"image": "img_001.jpg",
                           "p1": [100, 200], "p2": [300, 200],
                           "distance_mm": 40.0})
-        self.assertTrue(r["ok"])
-        self.assertEqual(r["scale"]["method"], "two_point")
-        self.assertEqual(r["scale"]["mm_per_unit"], 40.0)
-        self.assertFalse(r["scale"]["confirmed"])  # gate not confirmed yet
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["reason"], "scale_needs_sparse")
+        self.assertIn("hint", r)
+        # The old bug: distance_mm copied straight into mm_per_unit.
+        session = _call(self.tools, "get_reveng_session", session_id=sid)["session"]
+        self.assertIsNone(session["scale"]["mm_per_unit"])
+
+    def test_set_scale_two_point_solves(self):
+        """Positive path: the tool really runs solve_scale_two_point over the sparse model."""
+        try:
+            import numpy  # noqa: F401
+        except ImportError:  # pragma: no cover - numpy rides with opencv
+            self.skipTest("numpy not installed")
+        create = _call(self.tools, "reveng_start_session", name="Bracket")
+        sid = create["session_id"]
+        self._write_sparse_model(sid)
+        r = _call(self.tools, "reveng_set_scale",
+                  session_id=sid,
+                  method="two_point",
+                  params={"image": "img_001.jpg",
+                          "p1": [270, 240], "p2": [370, 240],
+                          "distance_mm": 50.0})
+        self.assertTrue(r["ok"], r)
+        scale = r["scale"]
+        self.assertEqual(scale["method"], "two_point")
+        # 50 mm over a 2.0-unit span — solved, not echoed (the echo would be 50.0).
+        self.assertAlmostEqual(scale["mm_per_unit"], 25.0, places=6)
+        self.assertAlmostEqual(scale["residual_pct"], 0.0, places=6)
+        self.assertFalse(scale["confirmed"])  # gate not confirmed yet
+        self.assertEqual(scale["detail"]["image"], "img_001.jpg")
+        self.assertAlmostEqual(scale["detail"]["dist_units"], 2.0, places=6)
+        prov = r["session"]["provenance"][-1]
+        self.assertEqual(prov["step"], "set_scale")
+        self.assertEqual(prov["source"], "photo_fiducial")
 
     def test_set_scale_invalid_method(self):
         create = _call(self.tools, "reveng_start_session", name="Bracket")
@@ -427,15 +485,19 @@ class TestRevengSessionLifecycle(_FakeMCPTestBase):
         self.assertIn("reason", r)
         self.assertIn("hint", r)
 
-    def test_set_scale_aruco_mat(self):
+    def test_set_scale_aruco_mat_needs_sparse(self):
+        """aruco_mat triangulates the marker against the sparse model — no model, no scale."""
         create = _call(self.tools, "reveng_start_session", name="Bracket")
         sid = create["session_id"]
         r = _call(self.tools, "reveng_set_scale",
                   session_id=sid,
                   method="aruco_mat",
                   params={"board": "A4"})
-        self.assertTrue(r["ok"])
-        self.assertEqual(r["scale"]["method"], "aruco_mat")
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["reason"], "scale_needs_sparse")
+        self.assertIn("hint", r)
+        session = _call(self.tools, "get_reveng_session", session_id=sid)["session"]
+        self.assertIsNone(session["scale"]["mm_per_unit"])
 
     def test_set_scale_known_dim(self):
         create = _call(self.tools, "reveng_start_session", name="Bracket")

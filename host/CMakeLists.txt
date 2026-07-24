@@ -246,6 +246,7 @@ set(CHUDWARE_CORE_SOURCES
   src/ui/reveng/image_gallery.cpp    # RE-19 thumbnail grid + drag-drop gallery
   src/ui/reveng/sources_panel.cpp    # RE-30 source-mode entry panel (Scan/Datasheet/Web/Library)
   src/ui/reveng/stage_panels.cpp     # Scale / Model / Deliver stage panels
+  src/ui/reveng/reveng_widgets.cpp   # RE-40 shared visual kit (cards/chips/previews/steps)
   # --- end [parts-plm sources] ---
   # --- FsBackend + browser fetch/pick (native + web) ---
   src/core/fs_backend.cpp
@@ -445,6 +446,7 @@ add_test(NAME test_img_tex
 # --- RE-07: CameraBackend platform abstraction (V4L2 / MF / stub) ---
 add_executable(test_camera_backend
   src/platform/camera_stub.cpp
+  src/stb_impl.cpp          # RE-40: V4L2 MJPEG frames decode via stb_image
   tests/test_camera_backend.cpp)
 if(NOT WIN32)
   target_sources(test_camera_backend PRIVATE src/platform/camera_v4l2.cpp)
@@ -452,7 +454,8 @@ else()
   target_sources(test_camera_backend PRIVATE src/platform/camera_mf.cpp)
 endif()
 target_include_directories(test_camera_backend PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${stb_SOURCE_DIR})
 set_target_properties(test_camera_backend PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME test_camera_backend

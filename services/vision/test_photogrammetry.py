@@ -168,53 +168,115 @@ class TestCleanupMeshNoOpen3d:
 
 
 class TestCleanupMeshOpen3dMocked:
-    def test_cleanup_mesh_open3d_mocked(self, monkeypatch, tmp_path):
-        """Mock open3d, assert cleanup routines called + returns ok."""
-        # Build a fake mesh object
+    @staticmethod
+    def _fake_open3d(monkeypatch, *, extent, n_vertices, n_triangles):
+        """Wire a mocked open3d whose mesh has the given bbox extent and counts."""
         fake_aabb = MagicMock()
-        fake_aabb.get_extent.return_value = [150.0, 100.0, 80.0]
+        fake_aabb.get_extent.return_value = list(extent)
         fake_aabb.get_center.return_value = [0.0, 0.0, 0.0]
 
         fake_mesh = MagicMock()
         fake_mesh.get_axis_aligned_bounding_box.return_value = fake_aabb
-        fake_mesh.vertices = [None] * 1200  # above LOW_VERTEX_THRESHOLD
-        fake_mesh.triangles = [None] * 2400
+        fake_mesh.vertices = [None] * n_vertices
+        fake_mesh.triangles = [None] * n_triangles
 
         fake_o3d = MagicMock()
         fake_o3d.io.read_triangle_mesh.return_value = fake_mesh
 
         monkeypatch.setattr(mesh_cleanup, "o3d", fake_o3d)
         monkeypatch.setattr(mesh_cleanup, "HAVE_OPEN3D", True)
+        return fake_o3d, fake_mesh
+
+    def test_cleanup_mesh_open3d_mocked(self, monkeypatch, tmp_path):
+        """Mock open3d, assert cleanup routines called + returns ok."""
+        fake_o3d, fake_mesh = self._fake_open3d(
+            monkeypatch, extent=[150.0, 100.0, 80.0], n_vertices=1200, n_triangles=2400
+        )
 
         out_path = str(tmp_path / "cleaned.obj")
-        result = cleanup_mesh("/fake/input.obj", out_path, scale_mm=150.0)
+        result = cleanup_mesh("/fake/input.obj", out_path, target_longest_mm=300.0)
 
         assert result["ok"] is True
         assert result["n_vertices"] == 1200
         assert result["n_triangles"] == 2400
         assert result["scale_applied"] is True
+        assert result["scale_mode"] == "target_longest_mm"
         fake_mesh.remove_degenerate_triangles.assert_called_once()
         fake_mesh.remove_duplicated_vertices.assert_called_once()
         fake_mesh.remove_unreferenced_vertices.assert_called_once()
         fake_mesh.scale.assert_called_once()
         fake_o3d.io.write_triangle_mesh.assert_called_once()
+        # target_longest_mm normalises: 300 mm target / 150-unit longest extent = 2x.
+        assert fake_mesh.scale.call_args[0][0] == pytest.approx(2.0)
+
+    def test_cleanup_mesh_mm_per_unit_multiplies(self, monkeypatch, tmp_path):
+        """mm_per_unit is a ratio: it multiplies, it does NOT normalise the bbox."""
+        _fake_o3d, fake_mesh = self._fake_open3d(
+            monkeypatch, extent=[150.0, 100.0, 80.0], n_vertices=1200, n_triangles=2400
+        )
+
+        out_path = str(tmp_path / "cleaned.obj")
+        result = cleanup_mesh("/fake/input.obj", out_path, mm_per_unit=2.5)
+
+        assert result["ok"] is True
+        assert result["scale_applied"] is True
+        assert result["scale_mode"] == "mm_per_unit"
+        # The factor is the ratio itself — never 2.5 / 150 (the normalising semantic).
+        assert fake_mesh.scale.call_args[0][0] == pytest.approx(2.5)
+
+    def test_cleanup_mesh_rejects_both_scale_params(self, monkeypatch, tmp_path):
+        """The two units are mutually exclusive — supplying both is a caller bug."""
+        fake_o3d, fake_mesh = self._fake_open3d(
+            monkeypatch, extent=[150.0, 100.0, 80.0], n_vertices=1200, n_triangles=2400
+        )
+
+        result = cleanup_mesh(
+            "/fake/input.obj",
+            str(tmp_path / "cleaned.obj"),
+            mm_per_unit=2.5,
+            target_longest_mm=300.0,
+        )
+
+        assert result["ok"] is False
+        assert "mutually exclusive" in result["reason"]
+        assert "hint" in result
+        # Rejected before any geometry was touched or written.
+        fake_o3d.io.read_triangle_mesh.assert_not_called()
+        fake_mesh.scale.assert_not_called()
+        fake_o3d.io.write_triangle_mesh.assert_not_called()
+
+    def test_cleanup_mesh_no_scale_keeps_input_units(self, monkeypatch, tmp_path):
+        """Neither unit supplied → no scaling, and the result says so out loud."""
+        _fake_o3d, fake_mesh = self._fake_open3d(
+            monkeypatch, extent=[150.0, 100.0, 80.0], n_vertices=1200, n_triangles=2400
+        )
+
+        result = cleanup_mesh("/fake/input.obj", str(tmp_path / "cleaned.obj"))
+
+        assert result["ok"] is True
+        assert result["scale_applied"] is False
+        assert result["scale_mode"] is None
+        fake_mesh.scale.assert_not_called()
+        assert any("input units" in n for n in result["notes"])
+
+    def test_cleanup_mesh_rejects_nonpositive_scale(self, monkeypatch, tmp_path):
+        """A zero/negative factor would collapse or mirror the mesh — refuse it."""
+        fake_o3d, _fake_mesh = self._fake_open3d(
+            monkeypatch, extent=[150.0, 100.0, 80.0], n_vertices=1200, n_triangles=2400
+        )
+
+        result = cleanup_mesh("/fake/input.obj", str(tmp_path / "cleaned.obj"), mm_per_unit=0.0)
+
+        assert result["ok"] is False
+        assert "positive" in result["reason"]
+        assert "hint" in result
+        fake_o3d.io.write_triangle_mesh.assert_not_called()
 
     def test_cleanup_mesh_low_confidence_note(self, monkeypatch, tmp_path):
         """Vertex count below threshold triggers low-confidence note."""
-        fake_aabb = MagicMock()
-        fake_aabb.get_extent.return_value = [10.0, 8.0, 5.0]
-        fake_aabb.get_center.return_value = [0.0, 0.0, 0.0]
-
-        fake_mesh = MagicMock()
-        fake_mesh.get_axis_aligned_bounding_box.return_value = fake_aabb
-        fake_mesh.vertices = [None] * 50  # below threshold
-        fake_mesh.triangles = [None] * 80
-
-        fake_o3d = MagicMock()
-        fake_o3d.io.read_triangle_mesh.return_value = fake_mesh
-
-        monkeypatch.setattr(mesh_cleanup, "o3d", fake_o3d)
-        monkeypatch.setattr(mesh_cleanup, "HAVE_OPEN3D", True)
+        self._fake_open3d(
+            monkeypatch, extent=[10.0, 8.0, 5.0], n_vertices=50, n_triangles=80
+        )
 
         out_path = str(tmp_path / "cleaned.obj")
         result = cleanup_mesh("/fake/input.obj", out_path)

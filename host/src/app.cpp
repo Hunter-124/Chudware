@@ -130,6 +130,7 @@ inline void wasmBootDom(const char *msg) {
 #include "ui/property_manager.h"
 #include "ui/reveng/dim_review.h" // RE-22 dimension-confirm review + deviation panels
 #include "ui/reveng/reveng_internal.h" // RE-22: S() + Stage enum for shot seeding
+#include "ui/reveng/reveng_widgets.h" // RE-40: kit::previewSlotRect (3D preview slots)
 #include "ui/reveng/reveng_workspace.h" // Reverse Engineering workspace full-body shell (RE-03)
 #include "ui/ribbon_def.h"
 #include "ui/settings_modal.h"
@@ -3061,6 +3062,18 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     seedRevengCanned("re_canned_done", "Bracket scan (canned)", "done", 12);
     ui::reveng::S().stage = ui::reveng::Stage::Deliver;
   }
+  // RE-40: pin the RE workspace for the whole reveng_* shot family.
+  //
+  // Setting st.activeWorkspace above is NOT enough: startup doc restore runs
+  // activateTab afterwards, and that pulls any workspace which cannot host a 3D
+  // part back to Model (core/doc_tabs.cpp). The parts shot already worked around
+  // this with st.wantPartsShot (see the re-assert near the top of the frame
+  // loop); every reveng_* shot silently lost the same race and captured the
+  // Model workspace instead of the tab under test — so these scenarios were
+  // reporting exit 0 while verifying nothing. Re-assert until the RE body has
+  // actually drawn a frame.
+  const bool wantRevengShot =
+      shot && shotMode && std::strncmp(shotMode, "reveng", 6) == 0;
   // CHUDWARE_SHOT=parts: open the Parts Library workspace with a synthetic
   // no-model result row so the "Generate 3D model" action (RE-32) is visible in
   // the shot.
@@ -5768,8 +5781,32 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // pane and viewport in favour of their own full-screen layout; the docked
     // Copilot column is always drawn so it stays available in non-AI workspaces
     // exactly as today.
+    // CHUDWARE_SHOT=parts: the scenario selects the Parts Library workspace before the
+    // frame loop, but startup doc restore runs activateTab, which pulls any workspace
+    // that can't host a 3D part back to Model (core/doc_tabs.cpp) — so the scenario
+    // never reached its own workspace and the capture silently showed Model instead.
+    // Re-assert it until the parts body actually draws (it clears wantPartsShot on its
+    // first frame, so this self-terminates).
+    if (st.wantPartsShot) st.activeWorkspace = AppState::Workspace::PartsLibrary;
+    // RE-40: same race, same fix, for the reveng_* shot family. Unconditional
+    // for the whole run: the RE workspace is full-body and hosts no 3D part, so
+    // any later activateTab would yank it back to Model mid-capture too.
+    if (wantRevengShot) st.activeWorkspace = AppState::Workspace::ReverseEng;
+
     using WS = AppState::Workspace;
     const WS ws = st.activeWorkspace;
+    // RE-40: release the webcam fd + preview/thumbnail GL textures the moment
+    // the user leaves the Reverse Engineering tab. drawRevEngWorkspace simply
+    // stops being called on a workspace switch, so without this the /dev/video
+    // handle stayed open and blocked every other app on the machine from using
+    // the camera. Tracked on the transition edge so it fires exactly once, no
+    // matter which of the many activeWorkspace assignment sites caused it.
+    {
+      static WS prevWs = ws;
+      if (prevWs == WS::ReverseEng && ws != WS::ReverseEng)
+        ui::revengWorkspaceTeardown();
+      prevWs = ws;
+    }
     // The "Web" chip's full-window in-app browser overlay (title_bar.cpp
     // toggles st.showWeb). It is NOT a workspace — activeWorkspace stays put
     // underneath — so it composes with any workspace and toggles straight back
@@ -6214,6 +6251,12 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // keeps the entries, so the prompt returns on the next app start.
     {
       static int s_recoveryCount = 0;
+      // Never raise it during a headless capture: this modal is centred and app-modal, so it
+      // covered the very panel every CHUDWARE_SHOT scenario exists to photograph (the reveng_*
+      // captures were all screenshotting this dialog). Shot runs are throwaway processes and
+      // must not answer recover/discard on the user's behalf, so just leave the entries alone —
+      // "Later" is the daemon-side no-op and this is equivalent to it.
+      if (st.recoveryPromptCount > 0 && shot) st.recoveryPromptCount = 0;
       if (st.recoveryPromptCount > 0) {
         s_recoveryCount = st.recoveryPromptCount;
         st.recoveryPromptCount = 0;
@@ -6505,36 +6548,81 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     glClear(GL_COLOR_BUFFER_BIT);
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
-    // RE-27: Splat GL overlay — draw 3DGS splat over the RE Reconstruct panel
-    // when splatLoaded. Runs after ImGui to composite over the workspace (same
-    // overlay pattern as re_points). Guard: ReverseEng workspace + Reconstruct
-    // stage + splat ready.
-    {
+    // RE-40: Reverse-Engineering 3D preview slots. The RE panels reserve screen
+    // rects via ui::reveng::kit::Viewport3DPreview() during the ImGui pass and
+    // publish them per-frame; we render into those rects here, after ImGui, so
+    // the GL content composites over the reserved (empty-framed) region.
+    //
+    // Previously the splat was drawn with a full-window viewport and a fixed
+    // look-at, so it ignored where the panel actually was and smeared across the
+    // whole workspace. Now each slot draws inside its own scissored rect.
+    if (st.activeWorkspace == AppState::Workspace::ReverseEng) {
       ui::reveng::RevEngState &rs = ui::reveng::S();
-      if (st.activeWorkspace == AppState::Workspace::ReverseEng &&
-          rs.stage == ui::reveng::Stage::Reconstruct && rs.splatLoaded &&
-          rs.splat.hasSplats()) {
-        // Lazily build a neutral CameraXform (no live camera in 2D workspace
-        // mode). We just want the billboard draw to run and composite into the
-        // overlay area.
-        Renderer::CameraXform splatCam;
-        splatCam.ssWidth = dw;
-        splatCam.ssHeight = dh;
-        // Use a fixed look-at that frames the fixture: eye behind/above,
-        // looking at origin.
+      const ImGuiIO &pio = ImGui::GetIO();
+      const float sx =
+          pio.DisplaySize.x > 0.0f ? (float)dw / pio.DisplaySize.x : 1.0f;
+      const float sy =
+          pio.DisplaySize.y > 0.0f ? (float)dh / pio.DisplaySize.y : 1.0f;
+
+      // Map an ImGui screen rect (top-left origin, logical px) onto the GL
+      // viewport (bottom-left origin, framebuffer px). Returns false when the
+      // rect is degenerate or fully off-screen.
+      auto slotViewport = [&](const ImRect &r, int &vx, int &vy, int &vw,
+                              int &vh) -> bool {
+        vx = (int)(r.Min.x * sx);
+        vw = (int)((r.Max.x - r.Min.x) * sx);
+        vh = (int)((r.Max.y - r.Min.y) * sy);
+        vy = dh - (int)(r.Max.y * sy);  // flip Y
+        return vw > 1 && vh > 1 && vx < dw && vy < dh;
+      };
+
+      // Neutral framing camera for a reserved preview rect. There is no live
+      // orbit camera in a 2D workspace, so we frame the origin from a fixed
+      // three-quarter eye and let the rect's own aspect drive the projection.
+      auto slotCamera = [](int vw, int vh) {
+        Renderer::CameraXform cam;
+        cam.ssWidth = vw;
+        cam.ssHeight = vh;
         Vec3 eye{22.0f, 18.0f, 38.0f};
         Vec3 center{0.0f, 0.0f, 7.5f};
         Vec3 up{0.0f, 0.0f, 1.0f};
-        float aspect = dh > 0 ? (float)dw / (float)dh : 1.0f;
+        float aspect = vh > 0 ? (float)vw / (float)vh : 1.0f;
         Mat4 proj =
             perspective(35.0f * 3.14159265f / 180.0f, aspect, 1.0f, 500.0f);
-        Mat4 view = lookAt(eye, center, up);
-        splatCam.mvp = mul(proj, view);
-        splatCam.eye = eye;
-        splatCam.center = center;
-        splatCam.radius = 20.0f;
-        rs.splat.draw(splatCam);
+        cam.mvp = mul(proj, lookAt(eye, center, up));
+        cam.eye = eye;
+        cam.center = center;
+        cam.radius = 20.0f;
+        return cam;
+      };
+
+      auto drawSlot = [&](ui::reveng::kit::PreviewSlot slot,
+                          const std::function<void(const Renderer::CameraXform &)>
+                              &render) {
+        ImRect r;
+        if (!ui::reveng::kit::previewSlotRect(slot, r)) return;
+        int vx = 0, vy = 0, vw = 0, vh = 0;
+        if (!slotViewport(r, vx, vy, vw, vh)) return;
+        glViewport(vx, vy, vw, vh);
+        glEnable(GL_SCISSOR_TEST);
+        glScissor(vx, vy, vw, vh);
+        render(slotCamera(vw, vh));
+        glDisable(GL_SCISSOR_TEST);
+      };
+
+      // RE-27: 3DGS splat (Brush export) — the Reconstruct stage's splat slot.
+      if (rs.splatLoaded && rs.splat.hasSplats()) {
+        drawSlot(ui::reveng::kit::PreviewSlot::Splat,
+                 [&](const Renderer::CameraXform &cam) { rs.splat.draw(cam); });
       }
+      // RE-21/RE-40: sparse point cloud + camera frusta. RevEngState::rePoints
+      // has been populated since RE-21 but had NO draw call anywhere in the
+      // tree, so the sparse preview was always empty. It is drawn here now.
+      if (rs.rePoints.hasPoints() || rs.rePoints.hasFrusta()) {
+        drawSlot(ui::reveng::kit::PreviewSlot::SparseCloud,
+                 [&](const Renderer::CameraXform &cam) { rs.rePoints.draw(cam); });
+      }
+      glViewport(0, 0, dw, dh);
     }
 
     // Scripted-scenario per-step captures + frame-loop control
@@ -6693,6 +6781,9 @@ int run_gui(const char *screenshotPath, const char *openPath) {
 #endif
   if (std::getenv("CHUDWARE_DEBUG_SHUTDOWN"))
     std::fprintf(stderr, "[td] imgui/glfw shutdown\n");
+  // RE-40: release the RE workspace's camera + GL textures while the context is
+  // still current (must precede ImGui_ImplOpenGL3_Shutdown / glfwDestroyWindow).
+  ui::revengWorkspaceTeardown();
   ImGui_ImplOpenGL3_Shutdown();
   ImGui_ImplGlfw_Shutdown();
   ImGui::DestroyContext();

@@ -558,8 +558,14 @@ def _make_pipeline_agent_fn(session_id: str, *, strategy: str = "deterministic")
                     },
                 )
 
-            # Mesh cleanup when we have a mesh
+            # Mesh cleanup when we have a mesh.
+            #
+            # session.scale.mm_per_unit is a RATIO (multiply reconstruction-space lengths
+            # by it to get mm) — exactly what cleanup_mesh's mm_per_unit means. When the
+            # scale stage has not run yet it is None/0: leave the mesh in reconstruction
+            # units rather than inventing a factor, and say so on the session.
             cleaned = mesh_path
+            mesh_unscaled = True
             if mesh_path:
                 try:
                     from services.vision.mesh_cleanup import cleanup_mesh  # noqa: PLC0415
@@ -567,18 +573,25 @@ def _make_pipeline_agent_fn(session_id: str, *, strategy: str = "deterministic")
                         _Path(session_dir) / "mesh" / "cleaned.ply"
                     )
                     _Path(out_clean).parent.mkdir(parents=True, exist_ok=True)
-                    scale_mm = None
+                    mm_per_unit = None
                     try:
-                        scale_mm = (_load_session(session_id) or {}).get(
+                        raw_scale = (_load_session(session_id) or {}).get(
                             "scale", {}
                         ).get("mm_per_unit")
-                        if scale_mm is not None:
-                            scale_mm = float(scale_mm)
+                        if raw_scale is not None:
+                            mm_per_unit = float(raw_scale)
                     except (TypeError, ValueError):
-                        scale_mm = None
-                    cl = cleanup_mesh(mesh_path, out_clean, scale_mm=scale_mm) or {}
+                        mm_per_unit = None
+                    if not mm_per_unit or mm_per_unit <= 0.0:
+                        mm_per_unit = None
+                        dense_notes.append(
+                            "cleanup:unscaled — session.scale.mm_per_unit is unset; mesh stays "
+                            "in reconstruction units until reveng_set_scale() solves the scale"
+                        )
+                    cl = cleanup_mesh(mesh_path, out_clean, mm_per_unit=mm_per_unit) or {}
                     if cl.get("ok") and cl.get("mesh_path"):
                         cleaned = cl["mesh_path"]
+                        mesh_unscaled = not bool(cl.get("scale_applied"))
                     else:
                         dense_notes.append(
                             f"cleanup:{cl.get('reason') or 'skipped'}"
@@ -591,6 +604,9 @@ def _make_pipeline_agent_fn(session_id: str, *, strategy: str = "deterministic")
             s["artifacts"]["sparse_dir"] = sparse_dir
             if cleaned:
                 s["artifacts"]["mesh_path"] = cleaned
+                # Honest units tag: consumers (fit / parametric / GUI) must not read a
+                # reconstruction-unit mesh as millimetres.
+                s["artifacts"]["mesh_units"] = "reconstruction" if mesh_unscaled else "mm"
             if splat_path:
                 s["artifacts"]["splat_path"] = splat_path
             s["stages"]["reconstruct"] = "done"
@@ -599,6 +615,7 @@ def _make_pipeline_agent_fn(session_id: str, *, strategy: str = "deterministic")
                 "sparse_backend": sparse_result.get("backend"),
                 "used_ffwd": used_ffwd,
                 "dense": dense_notes,
+                "mesh_units": "reconstruction" if mesh_unscaled else "mm",
                 "ts": _now_iso(),
             })
             _save_session(s)
@@ -608,6 +625,7 @@ def _make_pipeline_agent_fn(session_id: str, *, strategy: str = "deterministic")
                 {
                     "sparse": sparse_result,
                     "mesh_path": cleaned,
+                    "mesh_units": "reconstruction" if mesh_unscaled else "mm",
                     "splat_path": splat_path,
                     "used_ffwd": used_ffwd,
                     "dense_notes": dense_notes,

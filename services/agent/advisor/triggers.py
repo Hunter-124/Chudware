@@ -466,23 +466,34 @@ _BUILTIN_TRIGGERS: list[dict] = [
         "cooldown_turns": 10,
     },
     {
+        # Mirror of triggers.yaml `- id: reveng_flow` — keep both in sync (tools must also
+        # match the reveng_flow context pack's `# Tools:` header).
         "id": "reveng_flow",
         "match": {
             "keywords": [
-                r"reverse.engineer", r"\bscan\b", r"\bpoint cloud\b",
-                r"\bmesh\b.*\b(part|model)", r"\bphotogrammetry\b",
+                r"reverse.engineer", r"\bscan\b", r"\bscan\b.*\b(part|to cad)\b",
+                r"\bpoint cloud\b", r"\bmesh\b.*\b(part|model)", r"\bphotogrammetry\b",
+                r"\bwebcam\b", r"\bcaliper\b", r"\bcalipers\b", r"\breplacement part\b",
+                r"\bcopy\b.*\b(part|bracket)\b", r"3d print",
                 r"\bSTEP\b.*\bimport|import.*\bSTEP\b", r"\bdatasheet\b",
             ],
             "tools": [
-                "reverse_engineer", "compare_parts", "convert_face_to_sketch",
-                "project_into_sketch", "measure_from_photo", "start_capture_session",
+                "reverse_engineer", "compare_parts", "reveng_status",
+                "reveng_start_session", "reveng_add_images", "reveng_ingest_datasheet",
+                "reveng_reconstruct", "reveng_set_scale", "reveng_fit_primitives",
+                "reveng_build_parametric", "get_reveng_deviation", "reveng_attach_result",
             ],
             "events": [],
         },
         "inject": {
             "context_pack": "reveng_flow",
             "prerun_calcs": [],
-            "exemplar": "Import/capture → reverse_engineer → compare_parts loop → verify_battery (reveng_flow pack)",
+            "exemplar": (
+                "Lane A (file/doc_id): reverse_engineer → compare_parts loop. "
+                "Lane B (physical part): reveng_status → reveng_start_session → capture → "
+                "reveng_reconstruct → reveng_set_scale [scale gate] → reveng_fit_primitives → "
+                "[dim gate] → reveng_build_parametric (reveng_flow pack)"
+            ),
         },
         "budget_tokens": 250,
         "cooldown_turns": 8,

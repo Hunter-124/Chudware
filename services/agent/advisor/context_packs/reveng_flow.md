@@ -1,10 +1,12 @@
 # Reverse-engineering context pack
-# Tools: reverse_engineer, compare_parts, convert_face_to_sketch, project_into_sketch,
-#        measure_from_photo, start_capture_session, submit_part_photos, import_part
-
-## Sequence
-1. Capture/import first: STEP/mesh import_part, or photo session (start_capture_session → submit_part_photos).
-2. reverse_engineer → parametric feature tree; do not freehand over a mesh.
-3. compare_parts loop until deviation acceptable; measure_from_photo / datasheet dims for critical features.
-4. convert_face_to_sketch / project_into_sketch when a face must become an editable profile.
-5. verify_battery before done; ledger source artifact + deviation summary.
+# Tools: reverse_engineer, compare_parts, reveng_status, reveng_start_session,
+#  reveng_add_images, reveng_ingest_datasheet, reveng_reconstruct, reveng_set_scale,
+#  reveng_fit_primitives, reveng_build_parametric, get_reveng_deviation, reveng_attach_result
+LANE FIRST: file or doc_id (STEP/STL/OBJ) -> A; physical part + camera -> B.
+A: reverse_engineer -> compare_parts loop per residual -> verify_battery; no mesh freehand.
+B: reveng_status FIRST - backends absent in stock installs (backend_not_provisioned).
+reveng_start_session -> reveng_print_scale_mat (print 100%, ArUco mat in frame) ->
+reveng_add_images/_add_video/_ingest_datasheet -> reveng_reconstruct -> reveng_set_scale ->
+[SCALE-CONFIRM GATE] -> reveng_fit_primitives -> list_reveng_dims/confirm_dimensions ->
+[DIM-CONFIRM GATE] -> reveng_build_parametric -> get_reveng_deviation -> reveng_attach_result.
+approximate (single-photo) = preview only, never a dimension. Tiers 2%/5%/10% hi/med/low.

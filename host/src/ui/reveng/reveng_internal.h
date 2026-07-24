@@ -25,6 +25,16 @@ namespace reveng {
 //   FromLibrary : seeded externally; auto-routed to Scan or Datasheet/Web
 enum class SourceMode { Scan, Datasheet, Web, FromLibrary };
 
+// RE-40: one-shot deep-link target for the three DISTINCT Sources entry points. The ribbon
+// buttons reveng_add_photos / reveng_add_video / reveng_webcam used to collapse into one
+// identical handler (switch to Source + Scan), so three differently-labelled buttons did the
+// same thing. Each now sets this before switching, and sources_panel.cpp expands / scrolls to /
+// keyboard-focuses the matching sub-widget.
+//
+// CONTRACT: one-shot. The consumer (sources_panel.cpp) MUST reset it to SourceFocus::None after
+// acting on it — same consume-and-clear discipline as RevEngState::focusNewName.
+enum class SourceFocus { None, Photos, Video, Webcam };
+
 // The six pipeline stages in canonical order (contracts/reveng.md §2 session.stages).
 // The adaptive stepper shows only the stages relevant to the active SourceMode.
 enum class Stage { Source, Scale, Reconstruct, Model, Review, Deliver };
@@ -43,11 +53,18 @@ struct SessionSummary {
     std::string status;   // capturing|reconstructing|modeling|review|done|error
     bool approximate = false;
     int images = 0;
+    // RE-40: the rest of what list_reveng_sessions already returns. The rail cards and the
+    // properties Details tab show these instead of re-fetching the full manifest per row.
+    std::string createdAt;   // ISO-8601
+    std::string updatedAt;   // ISO-8601
+    std::string partRef;     // parts-hub part_id when seeded from the library; empty otherwise
 };
 
-// RE-21: Reconstruct-stage progress event (mirrors aicad.reveng_events/1 subset).
-// Drained by feedRevEngEvent() in app.cpp via the orch event journal; events arrive
-// async and are applied on the GL thread only (no mutex — GL-thread-only singleton).
+// RE-21/RE-40: Reconstruct-stage progress event (mirrors aicad.reveng_events/1 subset).
+// Fed by core::engineEventsTick() (host/src/core/engine_events.cpp), which tails the reveng
+// mission's EventJournal (<cache>/runs/<run_id>/events.jsonl) and translates each record.
+// app.cpp only feeds it on the CHUDWARE_SHOT=reveng_recon canned path. Events arrive async and
+// are applied on the GL thread only (no mutex — GL-thread-only singleton).
 struct RevEngEvent {
     std::string kind;     // "reconstruct_progress" | "reconstruct_done" | "reconstruct_error"
     int         pct  = 0; // 0..100 for progress events
@@ -142,6 +159,44 @@ struct DeliverState {
     std::string matPath;
 };
 
+// RE-40: mirror of reveng_status() — capability + provisioning probe (contracts/reveng.md §8.1).
+// Fetched once per workspace entry (and on demand) so the UI can tell the user COLMAP is missing
+// BEFORE they click Reconstruct, instead of surfacing backend_not_provisioned after the fact.
+struct CapabilityState {
+    bool loaded  = false;
+    bool pending = false;
+    double lastT = -100.0;
+    std::string err;
+
+    // capabilities{} — what the pipeline can actually do right now.
+    bool sparse = false;
+    bool dense = false;
+    bool splat = false;
+    bool singlePhoto = false;
+    bool webcam = false;
+    bool gpu = false;
+
+    // provisioning{} — per-backend availability, name -> present.
+    struct Artifact {
+        std::string key;      // "colmap" | "openmvs" | "brush" | "triposr" | "vggt" | "docling"
+        bool present = false;
+        std::string hint;     // fix-it text ("set OPENMVS_BIN to …")
+    };
+    std::vector<Artifact> artifacts;
+    std::vector<std::string> banners;   // license / degradation notices
+};
+
+// RE-40: one entry of session.provenance[] (contracts/reveng.md §2). The backend appends a free
+// dict per pipeline step (`{"step": "n_reconstruct", "sparse_backend": …, "ts": …}`), so only
+// `step` and `ts` are structural — everything else is flattened into `detail` for display.
+// Rendered as the properties column's Provenance timeline: this is the audit trail that makes a
+// photo-derived model defensible ("where did this number come from?").
+struct ProvenanceRecord {
+    std::string step;    // "set_scale" | "n_reconstruct" | "n_fit" | "attach_result" | …
+    std::string ts;      // ISO-8601 when the record carries one; empty otherwise
+    std::string detail;  // remaining fields flattened to "k=v · k=v"
+};
+
 // File-static store for the whole workspace. Async-load bookkeeping mirrors the parts /
 // ai-workspace idiom (throttle by ImGui::GetTime, pending flag, listedOnce, sticky error).
 struct RevEngState {
@@ -220,15 +275,58 @@ struct RevEngState {
     bool        detailPending = false;
     double      lastDetailT = -100.0;
     std::string detailErr;
+    // RE-40: session.honesty mirror (contracts/reveng.md §2). `honestyPipeline` is the pipeline
+    // label ("scan_mesh_ai_parametric" | "single_photo" | …); `honestyTier` is
+    // honesty.single_photo_tier ("high"|"medium"|"low"|"approximate", empty when not single-photo).
+    // Feeds the properties column's HonestyTag so photo-derived geometry is never shown as exact.
+    std::string honestyPipeline;
+    std::string honestyTier;
 
     // RE-21: Canned fixture loaded flag (true once buildCannedSparseFixture has been applied).
     bool cannedFixtureLoaded = false;
+
+    // ---- RE-40 overhaul: shell + preview state -------------------------------------------------
+    // Capability probe (reveng_status). Drives the properties-column capability panel, the
+    // Reconstruct stage's pre-flight gate, and the Sources stage's webcam availability copy.
+    CapabilityState caps;
+
+    // Session rail filter (substring match over name + session_id).
+    char railFilterBuf[128] = {};
+
+    // Contact-sheet selection — the gallery drives the Scale stage's two-point picker and the
+    // hero preview, so the selected index is shared workspace state rather than panel-local.
+    int selectedImage = -1;
+
+    // Right column view: 0 = Session details, 1 = Capabilities, 2 = Provenance log.
+    int propsTab = 0;
+
+    // Collapse states for the three top-level columns (rail / properties). The stage body always
+    // stays visible; collapsing rolls a column to a header strip + chevron (T-G21 affordance).
+    bool railCollapsed  = false;
+    bool propsCollapsed = false;
+
+    // RE-40: per-stage badge mirror of session.stages (contracts/reveng.md §2), indexed by
+    // (int)Stage. Stage::Source maps to the manifest's "capture" key; the other five match their
+    // enum name lowercased. Populated by the get_reveng_session detail poll and cleared on
+    // session switch. Drives the TOP stage stepper's per-step colour + reachability, so the
+    // wizard's progress indicator reflects real backend state instead of just where you clicked.
+    StageState stages[kStageCount];
+
+    // RE-40: session.provenance[] mirror — the Provenance tab's timeline. Same lifetime as the
+    // stage mirror (filled by the detail poll, cleared on session switch).
+    std::vector<ProvenanceRecord> provenance;
+
+    // RE-40: one-shot ribbon deep-link (see SourceFocus above). Set by handleRevEngCommand for
+    // reveng_add_photos / reveng_add_video / reveng_webcam; CONSUMED AND CLEARED by
+    // sources_panel.cpp, which expands + focuses the matching sub-widget.
+    SourceFocus sourceFocus = SourceFocus::None;
 };
 
 RevEngState& S();
 
-// RE-21: Apply one aicad.reveng_events/1 event to the singleton state.
-// Called from the app.cpp orch event drain — GL thread only, no mutex.
+// RE-21/RE-40: Apply one aicad.reveng_events/1 event to the singleton state.
+// Called from core::engineEventsTick()'s EventJournal tail (and from app.cpp's canned
+// CHUDWARE_SHOT=reveng_recon path) — GL thread only, no mutex.
 void feedRevEngEvent(const RevEngEvent& ev);
 
 // RE-27: Seed the splat renderer with the canned fixture (for shot modes that need it without
